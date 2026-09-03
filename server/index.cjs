@@ -32,7 +32,7 @@ const DATA_DIR = process.env.UI_DATA_DIR || path.join(__dirname, 'ui-data');
 const PROJECTS_FILE = path.join(DATA_DIR, 'projects.json');
 const HISTORY_CAP = 40;
 const SPAFallbacks = ['/', '/chat', '/diary', '/projects', '/settings'];
-const DEFAULT_MODEL = process.env.UI_DEFAULT_MODEL || 'Gemma-4-E4B-it-GGUF';
+const PROVIDERS_FILE = path.join(DATA_DIR, 'providers.json');
 
 // Claude-style projects (v4 rework, user feedback 2026-09-03): the fixed demo
 // spaces were deleted per user request — projects are user-created only.
@@ -98,6 +98,48 @@ let PROJECTS = loadProjects();
 
 function getProject(id) {
   return PROJECTS.find((p) => p.id === id) || null;
+}
+
+// ── Provider registry (step 9): generic OpenAI-compatible endpoints ────────
+// One adapter covers all of them (same /chat/completions shape). Seeded with
+// lemonade so existing behavior is byte-identical; projects without a
+// provider field are treated as lemonade.
+function loadProviders() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(PROVIDERS_FILE, 'utf8'));
+    if (Array.isArray(parsed.providers)) return parsed.providers;
+  } catch {
+    /* first boot */
+  }
+  return [];
+}
+
+function saveProviders(providers) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  const tmp = `${PROVIDERS_FILE}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify({ providers }, null, 2));
+  fs.renameSync(tmp, PROVIDERS_FILE);
+}
+
+let PROVIDERS = loadProviders();
+if (!PROVIDERS.some((pr) => pr.id === 'lemonade')) {
+  PROVIDERS.unshift({ id: 'lemonade', label: 'Local (Lemonade)', baseUrl: LEMONADE, apiKey: LEMONADE_KEY });
+  saveProviders(PROVIDERS);
+}
+
+function getProvider(id) {
+  return PROVIDERS.find((pr) => pr.id === id) || PROVIDERS.find((pr) => pr.id === 'lemonade') || null;
+}
+
+function maskKey(key) {
+  if (!key || key === 'local') return null;
+  return key.length > 8 ? `${key.slice(0, 3)}…${key.slice(-4)}` : `…${key.slice(-4)}`;
+}
+
+function providerHeaders(provider, extra) {
+  const h = { 'Content-Type': 'application/json', ...(extra || {}) };
+  if (provider.apiKey && provider.apiKey !== 'local') h.Authorization = `Bearer ${provider.apiKey}`;
+  return h;
 }
 
 // Chats are history keys, Claude-style: each project holds ordered chat metas.
@@ -193,6 +235,11 @@ function writeHistory(spaceId, history) {
 
 // ── Model manager (fronts Lemonade /api/v1 + /v1 mgmt verbs) ───────────────
 
+// The last model Lemonade reported as loaded — the non-hardcoded default for
+// projects that have not picked a model yet (replaces the old DEFAULT_MODEL
+// literal per feature doc Item 0 / step 9).
+let LAST_LOADED_MODEL = null;
+
 async function modelsInstalled() {
   const [list, health] = await Promise.allSettled([
     fetchJson(`${LEMONADE}/api/v1/models`, { headers: lemonadeHeaders() }, 8000),
@@ -207,7 +254,7 @@ async function modelsInstalled() {
       if (m.loaded && m.model_name) loadedNames.add(m.model_name);
     }
   }
-  return (list.value.body.data || [])
+  const installed = (list.value.body.data || [])
     // Lemonade registers cosmetic hash-ID duplicates of some models (noted in
     // MIGRATION.md) — hide bare hex-hash names (32/40-char SHA-like) from the UI.
     .filter((m) => !/^[0-9a-f]{32,40}$/i.test(m.id || m.model_name || ''))
@@ -219,6 +266,11 @@ async function modelsInstalled() {
       maxContext: m.max_context_window || null,
       suggested: !!m.suggested,
     }));
+  if (!LAST_LOADED_MODEL) {
+    const firstLoaded = installed.find((m) => m.loaded);
+    if (firstLoaded) LAST_LOADED_MODEL = firstLoaded.name;
+  }
+  return installed;
 }
 
 async function searchModels(query) {
@@ -374,24 +426,46 @@ async function handleChat(req, res, body) {
     return;
   }
 
-  // ── Ordinary space / project chat: Lemonade direct ──
+  // ── Ordinary space / project chat: routed via the project's provider ──
   const sys = sysParts.join('\n\n');
   const wire = sys ? [{ role: 'system', content: sys }, ...msgs] : msgs;
-  const model = (project && project.model) || DEFAULT_MODEL;
+
+  // Projects without a provider field are lemonade (seeded default), so every
+  // existing project behaves exactly as before (feature doc Item 0 guardrail).
+  const provider = getProvider((project && project.provider) || 'lemonade');
+  let model = (project && project.model) || null;
+  if (!model && provider.id === 'lemonade') {
+    // No hardcoded model name (step 9): default to whatever Lemonade currently
+    // reports as loaded.
+    try {
+      await modelsInstalled();
+    } catch {
+      /* fall through to the no-model error below */
+    }
+    model = LAST_LOADED_MODEL;
+  }
+  if (!model) {
+    return json(res, 400, { error: 'no model selected and none loaded — pick one in the model popup' });
+  }
+
+  // Accept both bare-host and conventional /v1-suffixed base URLs (cloud
+  // providers like OpenRouter use https://host/api/v1).
+  const upstreamUrl = `${provider.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`;
+  const upstreamHeaders = providerHeaders(provider);
 
   let upstream;
   try {
-    upstream = await fetch(`${LEMONADE}/v1/chat/completions`, {
+    upstream = await fetch(upstreamUrl, {
       method: 'POST',
-      headers: lemonadeHeaders(),
+      headers: upstreamHeaders,
       body: JSON.stringify({ model, messages: wire, stream: true }),
     });
   } catch (err) {
-    return json(res, 502, { error: `lemonade unreachable: ${err.message}` });
+    return json(res, 502, { error: `${provider.label} unreachable: ${err.message}` });
   }
   if (!upstream.ok || !upstream.body) {
     const detail = await upstream.text().catch(() => '');
-    return json(res, 502, { error: `lemonade ${upstream.status}: ${detail.slice(0, 200)}` });
+    return json(res, 502, { error: `${provider.label} ${upstream.status}: ${detail.slice(0, 200)}` });
   }
 
   res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
@@ -445,8 +519,8 @@ async function handleChat(req, res, body) {
   if (!sawAnything) {
     try {
       const full = await fetchJson(
-        `${LEMONADE}/v1/chat/completions`,
-        { method: 'POST', headers: lemonadeHeaders(), body: JSON.stringify({ model, messages: wire }) },
+        upstreamUrl,
+        { method: 'POST', headers: upstreamHeaders, body: JSON.stringify({ model, messages: wire }) },
         300000,
       );
       const msg = full.body?.choices?.[0]?.message;
@@ -473,6 +547,50 @@ async function handleRequest(req, res) {
   try {
     if (p === '/api/workspace') {
       return json(res, 200, { projects: PROJECTS, freeChats: FREE_CHATS });
+    }
+
+    // ── Provider registry (step 9): list / connect / remove. GET never returns
+    // a saved apiKey in plaintext — masked, e.g. sk-…last4.
+    if (p === '/api/providers' && req.method === 'GET') {
+      return json(res, 200, {
+        providers: PROVIDERS.map((pr) => ({ id: pr.id, label: pr.label, baseUrl: pr.baseUrl, apiKeyMasked: maskKey(pr.apiKey) })),
+      });
+    }
+    if (p === '/api/providers' && req.method === 'POST') {
+      let raw = '';
+      for await (const c of req) raw += c;
+      let body;
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        return json(res, 400, { error: 'invalid JSON' });
+      }
+      const label = String(body.label || '').trim().slice(0, 80);
+      let baseUrl = String(body.baseUrl || '').trim().replace(/\/+$/, '');
+      const apiKey = String(body.apiKey || '').trim();
+      if (!label) return json(res, 400, { error: 'label required' });
+      if (!/^https?:\/\//.test(baseUrl)) return json(res, 400, { error: 'baseUrl must be an http(s) URL' });
+      const id = `prov-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      PROVIDERS.push({ id, label, baseUrl, apiKey });
+      saveProviders(PROVIDERS);
+      return json(res, 200, { id, label, baseUrl, apiKeyMasked: maskKey(apiKey) });
+    }
+    const provDel = p.match(/^\/api\/providers\/([^/]+)$/);
+    if (provDel && req.method === 'DELETE') {
+      const id = decodeURIComponent(provDel[1]);
+      if (id === 'lemonade') return json(res, 400, { error: 'the lemonade provider cannot be removed' });
+      const before = PROVIDERS.length;
+      PROVIDERS = PROVIDERS.filter((pr) => pr.id !== id);
+      if (PROVIDERS.length === before) return json(res, 404, { error: 'no such provider' });
+      saveProviders(PROVIDERS);
+      // Projects pointing at the removed provider fall back to lemonade.
+      for (const pr of PROJECTS) {
+        if (pr.provider === id) {
+          delete pr.provider;
+        }
+      }
+      saveProjects(PROJECTS);
+      return json(res, 200, { ok: true });
     }
 
     // ── Live stats (Lemonade /v1/stats + /v1/system-stats passthrough, trimmed).
@@ -524,7 +642,8 @@ async function handleRequest(req, res) {
               .slice(0, 20)
               .map((f) => ({ name: f.name.slice(0, 200), content: f.content.slice(0, 200000) }))
           : [],
-        model: typeof body.model === 'string' && body.model ? body.model : DEFAULT_MODEL,
+        model: typeof body.model === 'string' && body.model ? body.model : undefined,
+        provider: typeof body.provider === 'string' && body.provider ? body.provider : undefined,
         chats: [],
         createdAt: Date.now(),
         updatedAt: Date.now(),
@@ -561,6 +680,10 @@ async function handleRequest(req, res) {
       if (typeof patch.goal === 'string') project.goal = patch.goal.slice(0, 2000);
       if (typeof patch.instructions === 'string') project.instructions = patch.instructions.slice(0, 8000);
       if (typeof patch.model === 'string' && patch.model) project.model = patch.model;
+      if (typeof patch.provider === 'string' && patch.provider) {
+        if (!getProvider(patch.provider)) return json(res, 400, { error: 'no such provider' });
+        project.provider = patch.provider;
+      }
       if (Array.isArray(patch.memories)) {
         project.memories = patch.memories.filter((m) => typeof m === 'string' && m.trim()).map((m) => m.trim().slice(0, 500)).slice(0, 50);
       }
