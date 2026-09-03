@@ -296,14 +296,122 @@ function ensureRolesLoaded() {
   })();
 }
 
+// ── Built-in tools (Pi-style JSON-Schema schema, master step 13) ──────────
+// Two safe built-ins to start. The schema follows the OpenAI-compatible
+// function-calling format every provider speaks (and pi-ai uses TypeBox to
+// produce exactly this shape). Results return to the model as role:'tool'
+// messages keyed by tool_call_id — the wire form of pi's toolResult.
+const TOOL_DEFS = [
+  {
+    type: 'function',
+    function: {
+      name: 'get_current_time',
+      description:
+        'Get the current date and time on the server, optionally in a specific IANA timezone (e.g. Europe/Berlin). Use whenever freshness, "today", or a timezone matters.',
+      parameters: {
+        type: 'object',
+        properties: { timezone: { type: 'string', description: 'Optional IANA timezone name' } },
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'read_project_file',
+      description:
+        'Read the full content of a knowledge file attached to this project, by exact file name. Use when a retrieved excerpt is not enough.',
+      parameters: {
+        type: 'object',
+        properties: { name: { type: 'string', description: 'Exact file name, e.g. notes.md' } },
+        required: ['name'],
+      },
+    },
+  },
+];
+
+const TOOL_RESULT_CAP = 8000; // chars — protect the context window
+
+// ── SKILL.md awareness (Hermes-style convention, master step 13) ─────────
+// A project knowledge file that starts with SKILL.md frontmatter is treated
+// as a skill: its name/description go into the system prompt as a always-on
+// index (L0), and the model is told it can request the full body through the
+// read_project_file tool (L1) — progressive disclosure, zero extra deps.
+function parseSkillFrontmatter(content) {
+  const m = /^---\r?\n([\s\S]*?)\r?\n---/.exec(String(content || ''));
+  if (!m) return null;
+  const meta = {};
+  for (const line of m[1].split(/\r?\n/)) {
+    const kv = /^([A-Za-z_][\w-]*):\s*(.*)$/.exec(line.trim());
+    if (kv) meta[kv[1].toLowerCase()] = kv[2].trim().replace(/^['"]|['"]$/g, '');
+  }
+  if (!meta.name && !meta.description) return null;
+  return { name: meta.name || '', description: meta.description || '', version: meta.version || '' };
+}
+
+function skillsIndexFor(project) {
+  const files = (project && Array.isArray(project.files)) ? project.files : [];
+  const skills = [];
+  for (const f of files) {
+    const skill = parseSkillFrontmatter(f.content);
+    if (skill) skills.push({ file: f.name, ...skill });
+  }
+  return skills;
+}
+
+function executeToolCall(project, name, rawArgs) {
+  let args = {};
+  try {
+    args = rawArgs ? JSON.parse(rawArgs) : {};
+  } catch {
+    return `ERROR: tool arguments were not valid JSON: ${String(rawArgs).slice(0, 200)}`;
+  }
+  if (name === 'get_current_time') {
+    const tz = typeof args.timezone === 'string' && args.timezone ? args.timezone : undefined;
+    const now = new Date();
+    try {
+      const formatted = tz
+        ? new Intl.DateTimeFormat('en-GB', { timeZone: tz, dateStyle: 'full', timeStyle: 'long' }).format(now)
+        : now.toString();
+      return `Current time: ${formatted}${tz ? ` (${tz})` : ''} | ISO: ${now.toISOString()}`;
+    } catch {
+      return `ERROR: unknown IANA timezone "${tz}"`;
+    }
+  }
+  if (name === 'read_project_file') {
+    const wanted = typeof args.name === 'string' ? args.name : '';
+    const files = (project && Array.isArray(project.files)) ? project.files : [];
+    const f = files.find((x) => x.name === wanted);
+    if (!f) {
+      const names = files.map((x) => x.name).join(', ') || '(none attached)';
+      return `ERROR: no project file named "${wanted}". Available: ${names}`;
+    }
+    return `File "${f.name}" (${f.content.length} chars):\n\n${f.content.slice(0, TOOL_RESULT_CAP)}${f.content.length > TOOL_RESULT_CAP ? '\n…[truncated]' : ''}`;
+  }
+  return `ERROR: unknown tool "${name}"`;
+}
+
 // Deterministic pre-escalation: obviously complex messages go to the smart
 // role without burning a classifier round-trip (zero false negatives on the
 // patterns below; everything else falls through to the classifier).
+// Tuned against an 8-message battery (2026-09-03): the two misses were a
+// multi-step word problem (5 numbers, no keywords) and an explicit
+// "write 600 words" request — hence the numbers>=3 and effort-phrase rules.
 function heuristicWantsSmart(message) {
   const m = String(message);
   if (m.length > 600) return true;
   if (m.includes('```')) return true;
-  return /\b(function|algorithm|debug|refactor|implement|optimize|architecture|regex|sql|migration)\b/i.test(m);
+  if (/\b(function|algorithm|debug|refactor|implement|optimize|architecture|regex|sql|migration)\b/i.test(m)) return true;
+  // Multi-step quantitative asks: several numbers in one message rarely
+  // reduce to single-step arithmetic (e.g. chase/rate problems). False
+  // positives just get a better model — cheap; false negatives are the
+  // costly direction.
+  const numbers = m.match(/\d+(?:[.,]\d+)?/g);
+  if (numbers && numbers.length >= 3) return true;
+  // Explicit effort/length requests ("600 words", "step by step", ...).
+  if (/\b\d{2,}\s*(words?|paragraphs?|pages?|sentences?)\b/i.test(m)) return true;
+  if (/\b(step[- ]by[- ]step|in detail|detailed|thoroughly|comprehensive|deep dive|prove|derive)\b/i.test(m)) return true;
+  return false;
 }
 
 // One cheap classification call before an auto-routed message. Mirrors the
@@ -518,6 +626,15 @@ async function handleChat(req, res, body) {
     if (filesBlock) {
       sysParts.push(`Relevant knowledge-file excerpts for this message:\n${filesBlock}`);
     }
+    // Skills index (L0): name+description only, always visible. The model
+    // pulls the full SKILL.md body on demand via read_project_file (L1).
+    const skills = skillsIndexFor(project);
+    if (skills.length) {
+      sysParts.push(
+        `Available skills (load the full file with the read_project_file tool when a task matches; do not guess their contents):\n` +
+          skills.map((s) => `- ${s.name || s.file}${s.version ? ` (v${s.version})` : ''}: ${s.description || '(no description)'}`).join('\n'),
+      );
+    }
   }
 
   const send = (obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
@@ -581,84 +698,120 @@ async function handleChat(req, res, body) {
   const upstreamUrl = `${provider.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`;
   const upstreamHeaders = providerHeaders(provider);
 
-  let upstream;
-  try {
-    upstream = await fetch(upstreamUrl, {
-      method: 'POST',
-      headers: upstreamHeaders,
-      body: JSON.stringify({ model, messages: wire, stream: true }),
-    });
-  } catch (err) {
-    return json(res, 502, { error: `${provider.label} unreachable: ${err.message}` });
-  }
-  if (!upstream.ok || !upstream.body) {
-    const detail = await upstream.text().catch(() => '');
-    return json(res, 502, { error: `${provider.label} ${upstream.status}: ${detail.slice(0, 200)}` });
-  }
-
   res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
   send({ type: 'meta', model, chatId: chatId || undefined, route: routedRole || undefined });
 
+  // ── Tool rounds (Pi-style loop, master step 13): stream a completion; if
+  // the model called built-in tools, execute them, append role:'tool'
+  // results, and stream a continuation. Max 3 rounds so a broken model can
+  // never loop forever. No tool-calling-capable model in the roster yet, so
+  // this is dormant plumbing until one lands — the loop simply never fires.
   const decoder = new TextDecoder();
-  let buffer = '';
-  let sawAnything = false;
-  try {
-    for await (const chunk of upstream.body) {
-      buffer += decoder.decode(chunk, { stream: true });
-      let idx;
-      while ((idx = buffer.indexOf('\n')) !== -1) {
-        const line = buffer.slice(0, idx).trim();
-        buffer = buffer.slice(idx + 1);
-        if (!line.startsWith('data:')) continue;
-        const payload = line.slice(5).trim();
-        if (payload === '[DONE]') continue;
-        try {
-          const evt = JSON.parse(payload);
-          const delta = evt.choices?.[0]?.delta || {};
-          if (delta.reasoning_content) {
-            sawAnything = true;
-            send({ type: 'reasoning', text: delta.reasoning_content });
-          }
-          if (delta.reasoning) {
-            sawAnything = true;
-            send({ type: 'reasoning', text: delta.reasoning });
-          }
-          if (delta.content) {
-            sawAnything = true;
-            send({ type: 'delta', text: delta.content });
-          }
-          if (Array.isArray(delta.tool_calls)) {
-            for (const tc of delta.tool_calls) {
-              sawAnything = true;
-              send({ type: 'tool', name: tc.function?.name || '', args: tc.function?.arguments || '' });
-            }
-          }
-        } catch {
-          /* keepalive or partial line */
-        }
-      }
-    }
-  } catch (err) {
-    send({ type: 'error', text: String(err?.message || err) });
-  }
-
-  // Fallback: some models/non-streaming paths return nothing on stream. One
-  // non-streaming retry is safe for generation (no side effects, unlike diary).
-  if (!sawAnything) {
+  let roundMessages = wire;
+  for (let round = 0; round < 3; round++) {
+    let upstream;
     try {
-      const full = await fetchJson(
-        upstreamUrl,
-        { method: 'POST', headers: upstreamHeaders, body: JSON.stringify({ model, messages: wire }) },
-        300000,
-      );
-      const msg = full.body?.choices?.[0]?.message;
-      if (msg?.reasoning_content) send({ type: 'reasoning', text: msg.reasoning_content });
-      if (msg?.content) send({ type: 'delta', text: msg.content });
-      if (Array.isArray(msg?.tool_calls)) {
-        for (const tc of msg.tool_calls) send({ type: 'tool', name: tc.function?.name || '', args: tc.function?.arguments || '' });
+      upstream = await fetch(upstreamUrl, {
+        method: 'POST',
+        headers: upstreamHeaders,
+        body: JSON.stringify({ model, messages: roundMessages, stream: true, tools: TOOL_DEFS }),
+      });
+    } catch (err) {
+      if (round === 0) return json(res, 502, { error: `${provider.label} unreachable: ${err.message}` });
+      send({ type: 'error', text: `${provider.label} unreachable: ${err.message}` });
+      break;
+    }
+    if (!upstream.ok || !upstream.body) {
+      const detail = await upstream.text().catch(() => '');
+      const msg = `${provider.label} ${upstream.status}: ${detail.slice(0, 200)}`;
+      if (round === 0) return json(res, 502, { error: msg });
+      send({ type: 'error', text: msg });
+      break;
+    }
+
+    const toolCalls = new Map(); // index -> {id, name, args}
+    let sawAnything = false;
+    try {
+      for await (const chunk of upstream.body) {
+        let buffer = '';
+        buffer += decoder.decode(chunk, { stream: true });
+        let idx;
+        while ((idx = buffer.indexOf('\n')) !== -1) {
+          const line = buffer.slice(0, idx).trim();
+          buffer = buffer.slice(idx + 1);
+          if (!line.startsWith('data:')) continue;
+          const payload = line.slice(5).trim();
+          if (payload === '[DONE]') continue;
+          try {
+            const evt = JSON.parse(payload);
+            const delta = evt.choices?.[0]?.delta || {};
+            if (delta.reasoning_content) {
+              sawAnything = true;
+              send({ type: 'reasoning', text: delta.reasoning_content });
+            }
+            if (delta.reasoning) {
+              sawAnything = true;
+              send({ type: 'reasoning', text: delta.reasoning });
+            }
+            if (delta.content) {
+              sawAnything = true;
+              send({ type: 'delta', text: delta.content });
+            }
+            if (Array.isArray(delta.tool_calls)) {
+              sawAnything = true;
+              for (const tc of delta.tool_calls) {
+                const i = typeof tc.index === 'number' ? tc.index : 0;
+                const slot = toolCalls.get(i) || { id: tc.id || `call-${i}`, name: '', args: '' };
+                if (tc.id) slot.id = tc.id;
+                if (tc.function?.name) slot.name += tc.function.name;
+                if (tc.function?.arguments) slot.args += tc.function.arguments;
+                toolCalls.set(i, slot);
+                send({ type: 'tool', name: tc.function?.name || '', args: tc.function?.arguments || '' });
+              }
+            }
+          } catch {
+            /* keepalive or partial line */
+          }
+        }
       }
     } catch (err) {
       send({ type: 'error', text: String(err?.message || err) });
+      break;
+    }
+
+    // Fallback: some models/non-streaming paths return nothing on stream. One
+    // non-streaming retry is safe for generation (no side effects, unlike diary).
+    if (!sawAnything) {
+      try {
+        const full = await fetchJson(
+          upstreamUrl,
+          { method: 'POST', headers: upstreamHeaders, body: JSON.stringify({ model, messages: roundMessages, tools: TOOL_DEFS }) },
+          300000,
+        );
+        const msg = full.body?.choices?.[0]?.message;
+        if (msg?.reasoning_content) send({ type: 'reasoning', text: msg.reasoning_content });
+        if (msg?.content) send({ type: 'delta', text: msg.content });
+        if (Array.isArray(msg?.tool_calls)) {
+          for (const tc of msg.tool_calls) {
+            toolCalls.set(toolCalls.size, { id: tc.id || `call-${toolCalls.size}`, name: tc.function?.name || '', args: tc.function?.arguments || '' });
+            send({ type: 'tool', name: tc.function?.name || '', args: tc.function?.arguments || '' });
+          }
+        }
+        sawAnything = true;
+      } catch (err) {
+        send({ type: 'error', text: String(err?.message || err) });
+      }
+    }
+
+    if (round === 2 || toolCalls.size === 0) break; // last round or no tools requested
+
+    // Execute each requested tool and append assistant tool_calls + results.
+    const assistantMsg = { role: 'assistant', content: null, tool_calls: [...toolCalls.entries()].map(([i, tc]) => ({ id: tc.id, type: 'function', function: { name: tc.name, arguments: tc.args } })) };
+    roundMessages = [...roundMessages, assistantMsg];
+    for (const [, tc] of toolCalls) {
+      const result = executeToolCall(project, tc.name, tc.args);
+      send({ type: 'tool_result', name: tc.name, text: result.slice(0, 300) });
+      roundMessages.push({ role: 'tool', tool_call_id: tc.id, content: result });
     }
   }
 
