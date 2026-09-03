@@ -164,15 +164,6 @@ function deleteFreeChat(chatId) {
   return true;
 }
 
-// ── Spaces config (model / persona / memories per space) — legacy shape kept
-// for /api/workspace compatibility; the Diary pipeline and future spaces read it.
-
-let SPACES = [];
-
-function getSpace(id) {
-  return SPACES.find((s) => s.id === id) || null;
-}
-
 // ── History persistence (atomic write, JSON per space) ─────────────────────
 
 function historyPath(spaceId) {
@@ -297,15 +288,6 @@ const corpusSource =
 
 // ── Chat ────────────────────────────────────────────────────────────────────
 
-function systemMessage(space) {
-  const parts = [];
-  if (space.systemPrompt) parts.push(space.systemPrompt);
-  if (space.memories && space.memories.length) {
-    parts.push(`Things you know about the user (persistent memory, apply silently):\n${space.memories.map((m) => `- ${m}`).join('\n')}`);
-  }
-  return parts.join('\n\n');
-}
-
 async function handleChat(req, res, body) {
   const { spaceId, message, history } = body || {};
   if (!message || typeof message !== 'string') return json(res, 400, { error: 'message required' });
@@ -369,14 +351,9 @@ async function handleChat(req, res, body) {
   }
 
   // ── Ordinary space / project chat: Lemonade direct ──
-  const space = getSpace(spaceId) || { id: spaceId, name: spaceId, model: DEFAULT_MODEL, systemPrompt: '', memories: [] };
-  if (sysParts.length) {
-    const legacy = systemMessage(space);
-    if (legacy) sysParts.push(legacy);
-  }
   const sys = sysParts.join('\n\n');
   const wire = sys ? [{ role: 'system', content: sys }, ...msgs] : msgs;
-  const model = (project && project.model) || space.model;
+  const model = (project && project.model) || DEFAULT_MODEL;
 
   let upstream;
   try {
@@ -471,7 +448,7 @@ async function handleRequest(req, res) {
 
   try {
     if (p === '/api/workspace') {
-      return json(res, 200, { spaces: SPACES, projects: PROJECTS, freeChats: FREE_CHATS });
+      return json(res, 200, { projects: PROJECTS, freeChats: FREE_CHATS });
     }
 
     // ── Live stats (Lemonade /v1/stats + /v1/system-stats passthrough, trimmed).
@@ -641,28 +618,6 @@ async function handleRequest(req, res) {
       return json(res, removed ? 200 : 404, removed ? { ok: true } : { error: 'no such chat' });
     }
 
-    const cfgMatch = p.match(/^\/api\/spaces\/([^/]+)\/config$/);
-    if (cfgMatch && req.method === 'POST') {
-      const id = decodeURIComponent(cfgMatch[1]);
-      let raw = '';
-      for await (const c of req) raw += c;
-      let patch;
-      try {
-        patch = JSON.parse(raw);
-      } catch {
-        return json(res, 400, { error: 'invalid JSON' });
-      }
-      const space = getSpace(id);
-      if (!space) return json(res, 404, { error: 'no such space' });
-      if (typeof patch.model === 'string' && patch.model) space.model = patch.model;
-      if (typeof patch.systemPrompt === 'string') space.systemPrompt = patch.systemPrompt.slice(0, 4000);
-      if (Array.isArray(patch.memories)) {
-        space.memories = patch.memories.filter((m) => typeof m === 'string' && m.trim()).map((m) => m.trim().slice(0, 500)).slice(0, 50);
-      }
-      saveSpaces(SPACES);
-      return json(res, 200, { ok: true });
-    }
-
     if (p === '/api/health') {
       const [lemonade, diary] = await Promise.allSettled([
         fetchJson(`${LEMONADE}/api/v1/models`, { headers: lemonadeHeaders() }, 5000),
@@ -785,9 +740,9 @@ async function handleRequest(req, res) {
 
     // Unused legacy spaces endpoints removed with the spaces UI (v4).
 
-    const historyMatch = p.match(/^\/api\/(?:spaces|chats)\/([^/]+)\/history$/);
+    const historyMatch = p.match(/^\/api\/chats\/([^/]+)\/history$/);
     if (historyMatch) {
-      const spaceId = decodeURIComponent(historyMatch[1]); // chat ids and legacy space ids share the keyspace
+      const spaceId = decodeURIComponent(historyMatch[1]);
       if (req.method === 'GET') return json(res, 200, { history: readHistory(spaceId) });
       if (req.method === 'POST') {
         let raw = '';
