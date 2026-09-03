@@ -104,7 +104,11 @@ function getProject(id) {
 // Each meta: { id, title, updatedAt } — the title is the first user message.
 function loadChats(projectId) {
   const p = getProject(projectId);
-  return p ? p.chats || [] : [];
+  if (!p) return [];
+  // Self-heal orphaned placeholder entries: a bare chat-id string (or any
+  // non-object) can land in chats[] if the follow-up POST /chats never fires
+  // (tab closed mid-send). Skip them here; the next saveChats drops them.
+  return (p.chats || []).filter((c) => c && typeof c === 'object' && typeof c.id === 'string');
 }
 
 function saveChats(projectId, chats) {
