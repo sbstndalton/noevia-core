@@ -242,6 +242,116 @@ function writeHistory(spaceId, history) {
 // literal per feature doc Item 0 / step 9).
 let LAST_LOADED_MODEL = null;
 
+// ── Auto model router (feature doc Item 4 / master step 12) ───────────────
+// Roles are config, never hardcoded model names: role→model mapping lives in
+// ui/server/auto-roles.json (created on first use; never ships a default
+// model string). Auto mode keeps BOTH role models loaded — no unload/swap.
+const AUTO_ROLES_FILE = path.join(DATA_DIR, 'auto-roles.json');
+let AUTO_ROLES = null; // { fast, smart } | null until first read
+
+function autoRoles() {
+  if (AUTO_ROLES) return AUTO_ROLES;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(AUTO_ROLES_FILE, 'utf8'));
+    if (parsed && typeof parsed.fast === 'string' && typeof parsed.smart === 'string') {
+      AUTO_ROLES = { fast: parsed.fast, smart: parsed.smart };
+    }
+  } catch {
+    /* not written yet */
+  }
+  return AUTO_ROLES;
+}
+
+function setAutoRoles(next) {
+  AUTO_ROLES = { fast: String(next.fast), smart: String(next.smart) };
+  const tmp = `${AUTO_ROLES_FILE}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(AUTO_ROLES, null, 2));
+  fs.renameSync(tmp, AUTO_ROLES_FILE);
+}
+
+async function ensureModelLoaded(name) {
+  const installed = await modelsInstalled();
+  const m = installed.find((x) => x.name === name);
+  if (!m) throw new Error(`model not installed: ${name}`);
+  if (!m.loaded) {
+    await fetchJson(
+      `${LEMONADE}/api/v1/load`,
+      { method: 'POST', headers: lemonadeHeaders(), body: JSON.stringify({ model_name: name }) },
+      120000,
+    );
+  }
+}
+
+function ensureRolesLoaded() {
+  const roles = autoRoles();
+  if (!roles) return;
+  void (async () => {
+    for (const role of ['fast', 'smart']) {
+      try {
+        await ensureModelLoaded(roles[role]);
+      } catch (err) {
+        console.warn(`[router] could not load ${role} model (${roles[role]}):`, err?.message || err);
+      }
+    }
+  })();
+}
+
+// Deterministic pre-escalation: obviously complex messages go to the smart
+// role without burning a classifier round-trip (zero false negatives on the
+// patterns below; everything else falls through to the classifier).
+function heuristicWantsSmart(message) {
+  const m = String(message);
+  if (m.length > 600) return true;
+  if (m.includes('```')) return true;
+  return /\b(function|algorithm|debug|refactor|implement|optimize|architecture|regex|sql|migration)\b/i.test(m);
+}
+
+// One cheap classification call before an auto-routed message. Mirrors the
+// fail-open philosophy of diary-companion's pipeline.py skip_classifier: any
+// error or unparseable reply defaults to the fast role — the classifier must
+// never block the chat.
+async function classifyFastOrSmart(message) {
+  const roles = autoRoles();
+  if (!roles) return 'fast';
+  if (heuristicWantsSmart(message)) return 'smart';
+  try {
+    const r = await fetchJson(
+      `${LEMONADE}/v1/chat/completions`,
+      {
+        method: 'POST',
+        headers: lemonadeHeaders(),
+        body: JSON.stringify({
+          model: roles.fast,
+          messages: [
+            {
+              role: 'system',
+              content:
+                'You classify a user message for a model router. Reply with exactly one word: FAST for short simple questions or small talk, SMART for complex reasoning, multi-step work, code, or analysis. No other text.',
+            },
+            { role: 'user', content: String(message).slice(0, 1000) },
+          ],
+          max_tokens: 64,
+          temperature: 0,
+          stream: false,
+        }),
+      },
+      20000,
+    );
+    if (!r.ok) throw new Error(`classifier ${r.status}`);
+    const msg = r.body?.choices?.[0]?.message || {};
+    // Scan the whole reply (some small models spend tokens on preamble before
+    // the verdict, or put it in the reasoning channel): last FAST/SMART wins.
+    const text = `${msg.content || ''} ${msg.reasoning_content || ''}`.toUpperCase();
+    const hits = text.match(/\b(SMART|FAST)\b/g);
+    const verdict = hits ? hits[hits.length - 1].toLowerCase() : 'fast';
+    console.log(`[router] classified -> ${verdict}${hits ? '' : ' (no verdict found, fail-open)'}`);
+    return verdict;
+  } catch (err) {
+    console.warn('[router] classify failed, failing open to fast:', err?.message || err);
+    return 'fast';
+  }
+}
+
 async function modelsInstalled() {
   const [list, health] = await Promise.allSettled([
     fetchJson(`${LEMONADE}/api/v1/models`, { headers: lemonadeHeaders() }, 8000),
@@ -440,9 +550,19 @@ async function handleChat(req, res, body) {
 
   // Projects without a provider field are lemonade (seeded default), so every
   // existing project behaves exactly as before (feature doc Item 0 guardrail).
-  const provider = getProvider((project && project.provider) || 'lemonade');
+  const wantsAuto = !!(project && project.routing === 'auto' && (!project.provider || project.provider === 'lemonade'));
+  const provider = getProvider(wantsAuto ? 'lemonade' : (project && project.provider) || 'lemonade');
+
   let model = (project && project.model) || null;
-  if (!model && provider.id === 'lemonade') {
+  let routedRole = null;
+  if (wantsAuto) {
+    const roles = autoRoles();
+    if (!roles) {
+      return json(res, 400, { error: 'Auto routing is not configured yet — pick Fast and Smart models in the model popup first.' });
+    }
+    routedRole = await classifyFastOrSmart(message); // fail-open inside
+    model = roles[routedRole];
+  } else if (!model && provider.id === 'lemonade') {
     // No hardcoded model name (step 9): default to whatever Lemonade currently
     // reports as loaded.
     try {
@@ -477,7 +597,7 @@ async function handleChat(req, res, body) {
   }
 
   res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
-  send({ type: 'meta', model, chatId: chatId || undefined });
+  send({ type: 'meta', model, chatId: chatId || undefined, route: routedRole || undefined });
 
   const decoder = new TextDecoder();
   let buffer = '';
@@ -627,6 +747,29 @@ async function handleRequest(req, res) {
     }
 
     // ── Projects CRUD (Claude-style) ──
+    if (p === '/api/auto-roles') {
+      if (req.method === 'GET') {
+        const roles = autoRoles();
+        return json(res, 200, { configured: !!roles, roles: roles || null });
+      }
+      if (req.method === 'PUT') {
+        let raw = '';
+        for await (const c of req) raw += c;
+        let body;
+        try {
+          body = JSON.parse(raw);
+        } catch {
+          return json(res, 400, { error: 'invalid JSON' });
+        }
+        const fast = typeof body.fast === 'string' ? body.fast.trim() : '';
+        const smart = typeof body.smart === 'string' ? body.smart.trim() : '';
+        if (!fast || !smart) return json(res, 400, { error: 'both fast and smart model names are required' });
+        setAutoRoles({ fast, smart });
+        ensureRolesLoaded(); // warm both models; never blocks the response
+        return json(res, 200, { configured: true, roles: AUTO_ROLES });
+      }
+    }
+
     if (p === '/api/projects' && req.method === 'POST') {
       let raw = '';
       for await (const c of req) raw += c;
@@ -652,6 +795,7 @@ async function handleRequest(req, res) {
           : [],
         model: typeof body.model === 'string' && body.model ? body.model : undefined,
         provider: typeof body.provider === 'string' && body.provider ? body.provider : undefined,
+        routing: body.routing === 'auto' ? 'auto' : 'manual', // default manual (step 12 guardrail)
         // (files normalization below is shared with the config route's RAG bookkeeping)
         chats: [],
         createdAt: Date.now(),
@@ -702,6 +846,13 @@ async function handleRequest(req, res) {
       if (typeof patch.goal === 'string') project.goal = patch.goal.slice(0, 2000);
       if (typeof patch.instructions === 'string') project.instructions = patch.instructions.slice(0, 8000);
       if (typeof patch.model === 'string' && patch.model) project.model = patch.model;
+      if (typeof patch.routing === 'string') {
+        if (patch.routing !== 'auto' && patch.routing !== 'manual') {
+          return json(res, 400, { error: "routing must be 'auto' or 'manual'" });
+        }
+        project.routing = patch.routing;
+        if (patch.routing === 'auto') ensureRolesLoaded(); // no-op if unconfigured
+      }
       if (typeof patch.provider === 'string' && patch.provider) {
         if (!getProvider(patch.provider)) return json(res, 400, { error: 'no such provider' });
         project.provider = patch.provider;
