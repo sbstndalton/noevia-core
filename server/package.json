@@ -1,0 +1,10 @@
+{
+  "name": "cowork-ui-server",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Runtime deps for the Cowork UI proxy (project RAG index). The proxy itself stays zero-dep; these load optionally and the server degrades gracefully without them.",
+  "dependencies": {
+    "better-sqlite3": "^12.4.1",
+    "sqlite-vec": "^0.1.7-alpha.2"
+  }
+}

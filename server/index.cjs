@@ -20,6 +20,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { URL } = require('url');
+const rag = require('./rag.cjs');
 
 const PORT = Number(process.env.UI_PORT || 8021);
 const HOST = process.env.UI_HOST || '0.0.0.0';
@@ -33,6 +34,7 @@ const PROJECTS_FILE = path.join(DATA_DIR, 'projects.json');
 const HISTORY_CAP = 40;
 const SPAFallbacks = ['/', '/chat', '/diary', '/projects', '/settings'];
 const PROVIDERS_FILE = path.join(DATA_DIR, 'providers.json');
+rag.init({ dataDir: DATA_DIR, lemonadeUrl: LEMONADE, headersFn: () => lemonadeHeaders() });
 
 // Claude-style projects (v4 rework, user feedback 2026-09-03): the fixed demo
 // spaces were deleted per user request — projects are user-created only.
@@ -387,6 +389,14 @@ async function handleChat(req, res, body) {
     }
   }
 
+  // Project knowledge files: RAG retrieval replaces whole-file pasting (step 10).
+  // rag.filesContext never throws; on any RAG failure it falls back to verbatim
+  // injection (small files whole, big files capped) — the old behavior.
+  let filesBlock = null;
+  if (project && Array.isArray(project.files) && project.files.length) {
+    filesBlock = await rag.filesContext(project.id, project.files, message);
+  }
+
   const sysParts = [];
   if (project) {
     if (project.name) sysParts.push(`You are working inside the user's project "${project.name}".`);
@@ -395,10 +405,8 @@ async function handleChat(req, res, body) {
     if (Array.isArray(project.memories) && project.memories.length) {
       sysParts.push(`Things you know about the user (persistent memory, apply silently):\n${project.memories.map((m) => `- ${m}`).join('\n')}`);
     }
-    if (Array.isArray(project.files) && project.files.length) {
-      for (const f of project.files) {
-        sysParts.push(`Knowledge file "${f.name}":\n${String(f.content || '').slice(0, 24000)}`);
-      }
+    if (filesBlock) {
+      sysParts.push(`Relevant knowledge-file excerpts for this message:\n${filesBlock}`);
     }
   }
 
@@ -644,12 +652,20 @@ async function handleRequest(req, res) {
           : [],
         model: typeof body.model === 'string' && body.model ? body.model : undefined,
         provider: typeof body.provider === 'string' && body.provider ? body.provider : undefined,
+        // (files normalization below is shared with the config route's RAG bookkeeping)
         chats: [],
         createdAt: Date.now(),
         updatedAt: Date.now(),
       };
       PROJECTS.unshift(project);
       saveProjects(PROJECTS);
+      // Index any files that arrived with the create call (same RAG bookkeeping
+      // as the config route).
+      for (const f of project.files) {
+        rag.indexProjectFile(project.id, f.name, f.content)
+          .then((r) => console.log(`[rag] indexed ${project.id}/${f.name}:`, JSON.stringify(r)))
+          .catch((err) => console.warn(`[rag] index failed for ${project.id}/${f.name}:`, err?.message || err));
+      }
       return json(res, 200, project);
     }
 
@@ -660,6 +676,12 @@ async function handleRequest(req, res) {
       PROJECTS = PROJECTS.filter((pr) => pr.id !== id);
       if (PROJECTS.length === before) return json(res, 404, { error: 'no such project' });
       saveProjects(PROJECTS);
+      // Drop the project's RAG index too (best-effort).
+      try {
+        for (const suffix of ['.db', '.db-wal', '.db-shm']) {
+          fs.rmSync(path.join(DATA_DIR, 'rag', `${id}${suffix}`), { force: true });
+        }
+      } catch { /* best effort */ }
       return json(res, 200, { ok: true });
     }
 
@@ -688,10 +710,27 @@ async function handleRequest(req, res) {
         project.memories = patch.memories.filter((m) => typeof m === 'string' && m.trim()).map((m) => m.trim().slice(0, 500)).slice(0, 50);
       }
       if (Array.isArray(patch.files)) {
+        const prevFiles = Array.isArray(project.files) ? project.files : [];
         project.files = patch.files
           .filter((f) => f && typeof f.name === 'string' && typeof f.content === 'string')
           .slice(0, 20)
           .map((f) => ({ name: f.name.slice(0, 200), content: f.content.slice(0, 200000) }));
+        // RAG bookkeeping (step 10): drop chunks for removed files; index
+        // new/changed ones. Fire-and-forget — upload latency must not depend
+        // on embedding round-trips.
+        const prevByName = new Map(prevFiles.map((f) => [f.name, f]));
+        const nextNames = new Set(project.files.map((f) => f.name));
+        for (const prev of prevFiles) {
+          if (!nextNames.has(prev.name)) rag.deleteProjectFile(id, prev.name);
+        }
+        for (const next of project.files) {
+          const prev = prevByName.get(next.name);
+          if (!prev || prev.content !== next.content) {
+            rag.indexProjectFile(id, next.name, next.content)
+              .then((r) => console.log(`[rag] indexed ${id}/${next.name}:`, JSON.stringify(r)))
+              .catch((err) => console.warn(`[rag] index failed for ${id}/${next.name}:`, err?.message || err));
+          }
+        }
       }
       project.updatedAt = Date.now();
       saveProjects(PROJECTS);
