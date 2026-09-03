@@ -129,6 +129,41 @@ function deleteChat(projectId, chatId) {
   return true;
 }
 
+// Free (non-project) chat metas — persisted server-side so recent chats
+// survive across browsers/devices (localStorage was the only home before).
+const FREE_CHATS_FILE = path.join(DATA_DIR, 'free-chats.json');
+
+function loadFreeChats() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(FREE_CHATS_FILE, 'utf8'));
+    return Array.isArray(raw) ? raw : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveFreeChats(list) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  const tmp = `${FREE_CHATS_FILE}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(list, null, 2));
+  fs.renameSync(tmp, FREE_CHATS_FILE);
+}
+
+let FREE_CHATS = loadFreeChats();
+
+function deleteFreeChat(chatId) {
+  const before = FREE_CHATS.length;
+  FREE_CHATS = FREE_CHATS.filter((c) => c.id !== chatId);
+  if (FREE_CHATS.length === before) return false;
+  saveFreeChats(FREE_CHATS);
+  try {
+    fs.unlinkSync(path.join(DATA_DIR, `history-${chatId.replace(/[^a-zA-Z0-9_-]/g, '')}.json`));
+  } catch {
+    /* no history file — fine */
+  }
+  return true;
+}
+
 // ── Spaces config (model / persona / memories per space) — legacy shape kept
 // for /api/workspace compatibility; the Diary pipeline and future spaces read it.
 
@@ -436,7 +471,7 @@ async function handleRequest(req, res) {
 
   try {
     if (p === '/api/workspace') {
-      return json(res, 200, { spaces: SPACES, projects: PROJECTS });
+      return json(res, 200, { spaces: SPACES, projects: PROJECTS, freeChats: FREE_CHATS });
     }
 
     // ── Live stats (Lemonade /v1/stats + /v1/system-stats passthrough, trimmed).
@@ -572,6 +607,37 @@ async function handleRequest(req, res) {
       const projectId = decodeURIComponent(chatDel[1]);
       const chatId = decodeURIComponent(chatDel[2]);
       const removed = deleteChat(projectId, chatId);
+      return json(res, removed ? 200 : 404, removed ? { ok: true } : { error: 'no such chat' });
+    }
+
+    // ── Free-chat metas (server-side so they survive browser switches) ──
+    if (p === '/api/freechats') {
+      if (req.method === 'GET') return json(res, 200, { chats: FREE_CHATS });
+      if (req.method === 'POST') {
+        let raw = '';
+        for await (const c of req) raw += c;
+        try {
+          const body = JSON.parse(raw);
+          if (!Array.isArray(body.chats)) return json(res, 400, { error: 'chats array required' });
+          FREE_CHATS = body.chats
+            .filter((c) => c && typeof c.id === 'string')
+            .slice(0, 200)
+            .map((c) => ({
+              id: c.id.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80),
+              title: String(c.title || 'New chat').slice(0, 120),
+              updatedAt: typeof c.updatedAt === 'number' ? c.updatedAt : Date.now(),
+            }));
+          saveFreeChats(FREE_CHATS);
+          return json(res, 200, { ok: true });
+        } catch {
+          return json(res, 400, { error: 'invalid JSON' });
+        }
+      }
+    }
+
+    const freeDel = p.match(/^\/api\/freechats\/([^/]+)$/);
+    if (freeDel && req.method === 'DELETE') {
+      const removed = deleteFreeChat(decodeURIComponent(freeDel[1]));
       return json(res, removed ? 200 : 404, removed ? { ok: true } : { error: 'no such chat' });
     }
 
