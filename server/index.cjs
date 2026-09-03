@@ -267,13 +267,33 @@ const corpusSource =
     ? {
         name: 'sidecar',
         async listMonths() {
+          // Real month list from the sidecar (PROPFIND over the corpus dir).
+          // Tolerant: on failure, fall back to just the current month so the
+          // Diary tab still renders today's file.
           const now = new Date();
-          return [{ id: `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`, label: now.toLocaleString('en-US', { month: 'long', year: 'numeric' }) }];
+          const currentId = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+          const currentLabel = now.toLocaleString('en-US', { month: 'long', year: 'numeric' });
+          try {
+            const r = await fetchJson(`${DIARY_BASE}/api/months`, { headers: diaryHeaders() }, 15000);
+            const months = (r.ok && Array.isArray(r.body?.months) ? r.body.months : [])
+              .filter((m) => m && typeof m.id === 'string' && /^\d{4}-\d{2}$/.test(m.id))
+              .map((m) => ({ id: m.id, label: m.label || m.id }));
+            if (!months.some((m) => m.id === currentId)) {
+              months.push({ id: currentId, label: currentLabel });
+            }
+            months.sort((a, b) => a.id.localeCompare(b.id));
+            return months;
+          } catch {
+            return [{ id: currentId, label: currentLabel }];
+          }
         },
-        async readMonth() {
-          const r = await fetchJson(`${DIARY_BASE}/api/day`, { headers: diaryHeaders() }, 15000);
+        async readMonth(monthId) {
+          const q = monthId ? `?month=${encodeURIComponent(monthId)}` : '';
+          const r = await fetchJson(`${DIARY_BASE}/api/day${q}`, { headers: diaryHeaders() }, 15000);
           if (!r.ok) throw new Error(`sidecar ${r.status}`);
-          return { todayLog: (r.body && r.body.today_log) || '', standing: (r.body && r.body.standing) || '' };
+          // Whole-month mode returns { month, log }; today mode returns { today_log }.
+          const log = (r.body && (r.body.log ?? r.body.today_log)) || '';
+          return { todayLog: log, standing: (r.body && r.body.standing) || '' };
         },
       }
     : {
@@ -722,7 +742,8 @@ async function handleRequest(req, res) {
     }
 
     if (p === '/api/diary/today' || p === '/api/diary/history') {
-      const data = await corpusSource.readMonth();
+      const monthId = url.searchParams.get('month');
+      const data = await corpusSource.readMonth(monthId);
       return json(res, 200, data);
     }
 
