@@ -17,6 +17,7 @@
 'use strict';
 
 const http = require('http');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { URL } = require('url');
@@ -28,6 +29,7 @@ const LEMONADE = process.env.LEMONADE_BASE_URL || 'http://lemonade:13305';
 const LEMONADE_KEY = process.env.LEMONADE_API_KEY || 'local';
 const DIARY_BASE = process.env.DIARY_BASE_URL || 'http://cowork-diary-companion:8010';
 const DIARY_TOKEN = process.env.DIARY_AUTH_TOKEN || '';
+const UI_AUTH_TOKEN = (process.env.UI_AUTH_TOKEN || DIARY_TOKEN).trim();
 const DIST_DIR = path.join(__dirname, '..', 'dist');
 const DATA_DIR = process.env.UI_DATA_DIR || path.join(__dirname, 'ui-data');
 const PROJECTS_FILE = path.join(DATA_DIR, 'projects.json');
@@ -45,6 +47,32 @@ rag.init({ dataDir: DATA_DIR, lemonadeUrl: LEMONADE, headersFn: () => lemonadeHe
 function json(res, code, body) {
   res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
   res.end(JSON.stringify(body));
+}
+
+function clientToken(req) {
+  const auth = String(req.headers.authorization || '');
+  if (auth.toLowerCase().startsWith('bearer ')) return auth.slice(7).trim();
+  return String(req.headers['x-cowork-token'] || req.headers['x-diary-token'] || '').trim();
+}
+
+function checkAuth(req) {
+  // Match diary-companion's single-user model: an empty token keeps local-dev
+  // open, while every /api/* request is protected when a token is configured.
+  if (!UI_AUTH_TOKEN) return true;
+  const supplied = clientToken(req);
+  if (!supplied) return false;
+  const expectedBytes = Buffer.from(UI_AUTH_TOKEN);
+  const suppliedBytes = Buffer.from(supplied);
+  return expectedBytes.length === suppliedBytes.length && crypto.timingSafeEqual(expectedBytes, suppliedBytes);
+}
+
+function unauthorized(res) {
+  res.writeHead(401, {
+    'Content-Type': 'application/json',
+    'Cache-Control': 'no-store',
+    'WWW-Authenticate': 'Bearer realm="cowork"',
+  });
+  res.end(JSON.stringify({ error: 'unauthorized' }));
 }
 
 async function fetchJson(url, opts, timeoutMs) {
@@ -826,6 +854,8 @@ async function handleRequest(req, res) {
   const p = url.pathname;
 
   try {
+    if (p.startsWith('/api/') && !checkAuth(req)) return unauthorized(res);
+
     if (p === '/api/workspace') {
       return json(res, 200, { projects: PROJECTS, freeChats: FREE_CHATS });
     }
@@ -1275,9 +1305,12 @@ async function handleRequest(req, res) {
 
 if (require.main === module) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
+  if (!UI_AUTH_TOKEN) {
+    console.warn('WARNING: cowork-ui API authentication is disabled; set DIARY_AUTH_TOKEN or UI_AUTH_TOKEN before tunnel exposure.');
+  }
   http.createServer(handleRequest).listen(PORT, HOST, () => {
     console.log(`cowork-ui listening on http://${HOST}:${PORT} (lemonade: ${LEMONADE}, diary: ${DIARY_BASE})`);
   });
 }
 
-module.exports = { handleRequest };
+module.exports = { checkAuth, handleRequest };
