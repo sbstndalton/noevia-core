@@ -16,15 +16,15 @@ const crypto = require('crypto');
 
 // Injected by init() from index.cjs (keeps this module testable standalone).
 let RAG_DIR = null;
-let EMBED_MODEL = 'nomic-embed-text-v1-GGUF';
-let lemonadeBase = null;
-let lemonadeHeaders = () => ({ 'Content-Type': 'application/json' });
+let EMBED_MODEL = 'default';
+let inferenceBase = null;
+let inferenceHeaders = () => ({ 'Content-Type': 'application/json' });
 
-function init({ dataDir, embedModel, lemonadeUrl, headersFn }) {
+function init({ dataDir, embedModel, inferenceUrl, headersFn }) {
   RAG_DIR = process.env.RAG_DIR || path.join(dataDir, 'rag');
-  EMBED_MODEL = process.env.EMBED_MODEL || embedModel || EMBED_MODEL;
-  lemonadeBase = lemonadeUrl;
-  if (headersFn) lemonadeHeaders = headersFn;
+  EMBED_MODEL = process.env.EMBEDDING_MODEL || process.env.EMBED_MODEL || embedModel || EMBED_MODEL;
+  inferenceBase = inferenceUrl;
+  if (headersFn) inferenceHeaders = headersFn;
 }
 // Chunk sizing starts from diary-companion's shape (subsection-scale bodies).
 // ~1200 chars with a 150-char overlap keeps chunks coherent.
@@ -93,9 +93,9 @@ function serializeF32(vec) {
 }
 
 async function embedOnce(texts) {
-  const res = await fetch(`${lemonadeBase.replace(/\/+$/, '')}/v1/embeddings`, {
+  const res = await fetch(`${inferenceBase.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/embeddings`, {
     method: 'POST',
-    headers: lemonadeHeaders(),
+    headers: inferenceHeaders(),
     body: JSON.stringify({ model: EMBED_MODEL, input: texts }),
   });
   if (!res.ok) throw new Error(`embeddings ${res.status}: ${(await res.text()).slice(0, 120)}`);
@@ -110,7 +110,7 @@ async function embed(texts) {
     if (items.length !== 1 || !items[0]?.embedding) throw new Error('embeddings returned no vector');
     return [items[0].embedding];
   }
-  // Lemonade sometimes answers a multi-input batch with an empty data array —
+  // Some OpenAI-compatible providers answer a multi-input batch with an empty data array —
   // fall back to one call per text (cheap on local hardware).
   const items = await embedOnce(texts);
   if (items.length === texts.length && items.every((it) => it?.embedding)) {

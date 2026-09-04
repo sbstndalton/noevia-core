@@ -1,12 +1,12 @@
 // Cowork UI proxy server — zero-dependency Node http server.
 //
 // This server IS the app's backend:
-//   - Router: space → model dispatch. Ordinary spaces chat with Lemonade
-//     directly (OpenAI-compatible /v1/chat/completions) with the space's
+//   - Router: space → model dispatch through OpenAI-compatible providers
+//     (/v1/chat/completions) with the space's
 //     system prompt + memories injected; the Diary tab routes through the
 //     diary-companion sidecar (called exactly ONCE per exchange — it logs
 //     every call, no retry).
-//   - Model manager: front for Lemonade's /api/v1 + /v1 management verbs
+//   - Optional model manager: adapter for provider-specific management verbs
 //     (list installed + loaded, HF search, variant enumeration, pull with
 //     progress, delete, load, unload). DANGEROUS verbs (delete/pull) are
 //     proxied verbatim; the UI is the only client on this network.
@@ -22,11 +22,16 @@ const fs = require('fs');
 const path = require('path');
 const { URL } = require('url');
 const rag = require('./rag.cjs');
+const { createModelManager } = require('./model-manager.cjs');
 
 const PORT = Number(process.env.UI_PORT || 8021);
 const HOST = process.env.UI_HOST || '0.0.0.0';
-const LEMONADE = process.env.LEMONADE_BASE_URL || 'http://lemonade:13305';
-const LEMONADE_KEY = process.env.LEMONADE_API_KEY || 'local';
+const INFERENCE_BASE = process.env.INFERENCE_BASE_URL || process.env.LEMONADE_BASE_URL || 'http://host.docker.internal:11434';
+const INFERENCE_KEY = process.env.INFERENCE_API_KEY || process.env.LEMONADE_API_KEY || '';
+const DEFAULT_PROVIDER_ID = process.env.DEFAULT_PROVIDER_ID || 'default';
+const DEFAULT_PROVIDER_LABEL = process.env.DEFAULT_PROVIDER_LABEL || 'Local inference';
+const MODEL_MANAGER_KIND = process.env.MODEL_MANAGER_KIND || (process.env.LEMONADE_BASE_URL ? 'lemonade' : 'none');
+const MODEL_MANAGER_BASE = process.env.MODEL_MANAGER_BASE_URL || process.env.LEMONADE_BASE_URL || INFERENCE_BASE;
 const DIARY_BASE = process.env.DIARY_BASE_URL || 'http://cowork-diary-companion:8010';
 const DIARY_TOKEN = process.env.DIARY_AUTH_TOKEN || '';
 const UI_AUTH_TOKEN = (process.env.UI_AUTH_TOKEN || DIARY_TOKEN).trim();
@@ -36,11 +41,13 @@ const PROJECTS_FILE = path.join(DATA_DIR, 'projects.json');
 const HISTORY_CAP = 40;
 const SPAFallbacks = ['/', '/chat', '/diary', '/projects', '/settings'];
 const PROVIDERS_FILE = path.join(DATA_DIR, 'providers.json');
-rag.init({ dataDir: DATA_DIR, lemonadeUrl: LEMONADE, headersFn: () => lemonadeHeaders() });
+if (process.env.LEMONADE_BASE_URL && !process.env.INFERENCE_BASE_URL) console.warn('LEMONADE_BASE_URL is deprecated; use INFERENCE_BASE_URL');
+if (process.env.LEMONADE_API_KEY && !process.env.INFERENCE_API_KEY) console.warn('LEMONADE_API_KEY is deprecated; use INFERENCE_API_KEY');
+rag.init({ dataDir: DATA_DIR, inferenceUrl: INFERENCE_BASE, headersFn: () => inferenceHeaders() });
 
-// Claude-style projects (v4 rework, user feedback 2026-09-03): the fixed demo
+// User-created projects; the earlier fixed demo spaces were removed.
 // spaces were deleted per user request — projects are user-created only.
-// Each project: goal/description, instructions (Claude's "custom instructions"),
+// Each project: goal/description, custom instructions,
 // and text files (pasted/uploaded text injected into context; true doc-RAG is a
 // later feature — flagged in MIGRATION.md).
 
@@ -93,9 +100,16 @@ async function fetchJson(url, opts, timeoutMs) {
   }
 }
 
-function lemonadeHeaders(extra) {
+const modelManager = createModelManager({
+  kind: MODEL_MANAGER_KIND,
+  baseUrl: MODEL_MANAGER_BASE,
+  apiKey: process.env.MODEL_MANAGER_API_KEY || INFERENCE_KEY,
+  fetchJson,
+});
+
+function inferenceHeaders(extra) {
   const h = { 'Content-Type': 'application/json' };
-  if (LEMONADE_KEY && LEMONADE_KEY !== 'local') h.Authorization = `Bearer ${LEMONADE_KEY}`;
+  if (INFERENCE_KEY && INFERENCE_KEY !== 'local') h.Authorization = `Bearer ${INFERENCE_KEY}`;
   return { ...h, ...extra };
 }
 
@@ -105,7 +119,7 @@ function diaryHeaders() {
   return h;
 }
 
-// ── Projects config (Claude-style: instructions, files, memories, model) ───
+// ── Projects config: instructions, files, memories, model ─────────────────
 
 function loadProjects() {
   try {
@@ -131,9 +145,8 @@ function getProject(id) {
 }
 
 // ── Provider registry (step 9): generic OpenAI-compatible endpoints ────────
-// One adapter covers all of them (same /chat/completions shape). Seeded with
-// lemonade so existing behavior is byte-identical; projects without a
-// provider field are treated as lemonade.
+// One adapter covers all of them (same /chat/completions shape). Projects
+// without a provider field use the environment-configured default provider.
 function loadProviders() {
   try {
     const parsed = JSON.parse(fs.readFileSync(PROVIDERS_FILE, 'utf8'));
@@ -152,13 +165,56 @@ function saveProviders(providers) {
 }
 
 let PROVIDERS = loadProviders();
-if (!PROVIDERS.some((pr) => pr.id === 'lemonade')) {
-  PROVIDERS.unshift({ id: 'lemonade', label: 'Local (Lemonade)', baseUrl: LEMONADE, apiKey: LEMONADE_KEY });
+
+function backupOnce(file) {
+  if (!fs.existsSync(file)) return;
+  const backup = `${file}.pre-neutral-provider.bak`;
+  if (!fs.existsSync(backup)) fs.copyFileSync(file, backup, fs.constants.COPYFILE_EXCL);
+}
+
+function migrateLegacyProviderIds() {
+  let changedProviders = false;
+  let changedProjects = false;
+  for (const provider of PROVIDERS) {
+    if (provider.id === 'lemonade') {
+      provider.id = DEFAULT_PROVIDER_ID;
+      provider.label = DEFAULT_PROVIDER_LABEL;
+      changedProviders = true;
+    }
+  }
+  if (changedProviders) {
+    const seen = new Set();
+    PROVIDERS = PROVIDERS.filter((provider) => {
+      if (seen.has(provider.id)) return false;
+      seen.add(provider.id);
+      return true;
+    });
+  }
+  for (const project of PROJECTS) {
+    if (project.provider === 'lemonade') {
+      project.provider = DEFAULT_PROVIDER_ID;
+      changedProjects = true;
+    }
+  }
+  if (changedProviders) {
+    backupOnce(PROVIDERS_FILE);
+    saveProviders(PROVIDERS);
+  }
+  if (changedProjects) {
+    backupOnce(PROJECTS_FILE);
+    saveProjects(PROJECTS);
+  }
+}
+
+migrateLegacyProviderIds();
+if (!PROVIDERS.some((provider) => provider.id === DEFAULT_PROVIDER_ID)) {
+  PROVIDERS.unshift({ id: DEFAULT_PROVIDER_ID, label: DEFAULT_PROVIDER_LABEL, baseUrl: INFERENCE_BASE, apiKey: INFERENCE_KEY });
   saveProviders(PROVIDERS);
 }
 
 function getProvider(id) {
-  return PROVIDERS.find((pr) => pr.id === id) || PROVIDERS.find((pr) => pr.id === 'lemonade') || null;
+  const normalized = id === 'lemonade' ? DEFAULT_PROVIDER_ID : id;
+  return PROVIDERS.find((pr) => pr.id === normalized) || PROVIDERS.find((pr) => pr.id === DEFAULT_PROVIDER_ID) || null;
 }
 
 function maskKey(key) {
@@ -172,7 +228,7 @@ function providerHeaders(provider, extra) {
   return h;
 }
 
-// Chats are history keys, Claude-style: each project holds ordered chat metas.
+// Chats are history keys; each project holds ordered chat metadata.
 // Each meta: { id, title, updatedAt } — the title is the first user message.
 function loadChats(projectId) {
   const p = getProject(projectId);
@@ -263,9 +319,9 @@ function writeHistory(spaceId, history) {
   fs.renameSync(tmp, file);
 }
 
-// ── Model manager (fronts Lemonade /api/v1 + /v1 mgmt verbs) ───────────────
+// ── Optional model manager ─────────────────────────────────────────────────
 
-// The last model Lemonade reported as loaded — the non-hardcoded default for
+// The last model the manager reported as loaded — the non-hardcoded default for
 // projects that have not picked a model yet (replaces the old DEFAULT_MODEL
 // literal per feature doc Item 0 / step 9).
 let LAST_LOADED_MODEL = null;
@@ -302,11 +358,7 @@ async function ensureModelLoaded(name) {
   const m = installed.find((x) => x.name === name);
   if (!m) throw new Error(`model not installed: ${name}`);
   if (!m.loaded) {
-    await fetchJson(
-      `${LEMONADE}/api/v1/load`,
-      { method: 'POST', headers: lemonadeHeaders(), body: JSON.stringify({ model_name: name }) },
-      120000,
-    );
+    await modelManager.load(name);
   }
 }
 
@@ -451,11 +503,12 @@ async function classifyFastOrSmart(message) {
   if (!roles) return 'fast';
   if (heuristicWantsSmart(message)) return 'smart';
   try {
+    const defaultProvider = getProvider(DEFAULT_PROVIDER_ID);
     const r = await fetchJson(
-      `${LEMONADE}/v1/chat/completions`,
+      `${defaultProvider.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`,
       {
         method: 'POST',
-        headers: lemonadeHeaders(),
+        headers: providerHeaders(defaultProvider),
         body: JSON.stringify({
           model: roles.fast,
           messages: [
@@ -489,12 +542,13 @@ async function classifyFastOrSmart(message) {
 }
 
 async function modelsInstalled() {
+  modelManager.requireEnabled();
   const [list, health] = await Promise.allSettled([
-    fetchJson(`${LEMONADE}/api/v1/models`, { headers: lemonadeHeaders() }, 8000),
-    fetchJson(`${LEMONADE}/api/v1/health`, { headers: lemonadeHeaders() }, 8000),
+    modelManager.listModels(),
+    modelManager.health(),
   ]);
   if (list.status !== 'fulfilled' || !list.value.ok) {
-    throw new Error(`lemonade list failed: ${list.status === 'fulfilled' ? list.value.status : 'unreachable'}`);
+    throw new Error(`model list failed: ${list.status === 'fulfilled' ? list.value.status : 'unreachable'}`);
   }
   const loadedNames = new Set();
   if (health.status === 'fulfilled' && health.value.ok) {
@@ -503,8 +557,7 @@ async function modelsInstalled() {
     }
   }
   const installed = (list.value.body.data || [])
-    // Lemonade registers cosmetic hash-ID duplicates of some models (noted in
-    // MIGRATION.md) — hide bare hex-hash names (32/40-char SHA-like) from the UI.
+    // Some managers register cosmetic hash-ID duplicates; hide bare hash names.
     .filter((m) => !/^[0-9a-f]{32,40}$/i.test(m.id || m.model_name || ''))
     .map((m) => ({
       name: m.id || m.model_name,
@@ -522,9 +575,8 @@ async function modelsInstalled() {
 }
 
 async function searchModels(query) {
-  // Hugging Face's public search API, called server-side. (Lemonade's newer
-  // builds add /v1/registry/search; the deployed image predates it — this
-  // works regardless and keeps the UI contract stable.)
+  modelManager.requireEnabled();
+  // Hugging Face's public search API, called server-side for the Lemonade adapter.
   const r = await fetchJson(
     `https://huggingface.co/api/models?search=${encodeURIComponent(`${query} gguf`)}&sort=downloads&limit=12`,
     {},
@@ -542,13 +594,10 @@ async function searchModels(query) {
 }
 
 async function modelVariants(repo) {
-  // Param name is `checkpoint` per the deployed Lemonade; each variant's id is
+  modelManager.requireEnabled();
+  // Param name is `checkpoint` for the Lemonade adapter; each variant's id is
   // `<repo>/<variant-name>`-style GGUF filename reference the pull verb accepts.
-  const r = await fetchJson(
-    `${LEMONADE}/api/v1/pull/variants?checkpoint=${encodeURIComponent(repo)}`,
-    { headers: lemonadeHeaders() },
-    20000,
-  );
+  const r = await modelManager.variants(repo);
   if (!r.ok) throw new Error(`variants failed: ${r.status}`);
   const suggested = r.body?.suggested_name;
   const arr = Array.isArray(r.body?.variants) ? r.body.variants : [];
@@ -622,7 +671,7 @@ async function handleChat(req, res, body) {
     .map((h) => ({ role: h.role, content: h.content }));
   msgs.push({ role: 'user', content: message });
 
-  // ── Project context (Claude-style): instructions + knowledge files prepend
+  // ── Project context: instructions + knowledge files prepend
   // the system message for every chat in the project.
   let projectId = body.projectId || null;
   let chatId = body.chatId || null;
@@ -693,10 +742,10 @@ async function handleChat(req, res, body) {
   const sys = sysParts.join('\n\n');
   const wire = sys ? [{ role: 'system', content: sys }, ...msgs] : msgs;
 
-  // Projects without a provider field are lemonade (seeded default), so every
-  // existing project behaves exactly as before (feature doc Item 0 guardrail).
-  const wantsAuto = !!(project && project.routing === 'auto' && (!project.provider || project.provider === 'lemonade'));
-  const provider = getProvider(wantsAuto ? 'lemonade' : (project && project.provider) || 'lemonade');
+  // Projects without a provider field use the configured default provider.
+  const projectProvider = project?.provider === 'lemonade' ? DEFAULT_PROVIDER_ID : project?.provider;
+  const wantsAuto = !!(project && project.routing === 'auto' && (!projectProvider || projectProvider === DEFAULT_PROVIDER_ID));
+  const provider = getProvider(wantsAuto ? DEFAULT_PROVIDER_ID : projectProvider || DEFAULT_PROVIDER_ID);
 
   let model = (project && project.model) || null;
   let routedRole = null;
@@ -707,9 +756,8 @@ async function handleChat(req, res, body) {
     }
     routedRole = await classifyFastOrSmart(message); // fail-open inside
     model = roles[routedRole];
-  } else if (!model && provider.id === 'lemonade') {
-    // No hardcoded model name (step 9): default to whatever Lemonade currently
-    // reports as loaded.
+  } else if (!model && provider.id === DEFAULT_PROVIDER_ID && modelManager.enabled) {
+    // No hardcoded model name: default to whatever the manager reports as loaded.
     try {
       await modelsInstalled();
     } catch {
@@ -864,7 +912,14 @@ async function handleRequest(req, res) {
     // a saved apiKey in plaintext — masked, e.g. sk-…last4.
     if (p === '/api/providers' && req.method === 'GET') {
       return json(res, 200, {
-        providers: PROVIDERS.map((pr) => ({ id: pr.id, label: pr.label, baseUrl: pr.baseUrl, apiKeyMasked: maskKey(pr.apiKey) })),
+        providers: PROVIDERS.map((pr) => ({
+          id: pr.id,
+          label: pr.label,
+          baseUrl: pr.baseUrl,
+          apiKeyMasked: maskKey(pr.apiKey),
+          isDefault: pr.id === DEFAULT_PROVIDER_ID,
+          managed: pr.id === DEFAULT_PROVIDER_ID && modelManager.enabled,
+        })),
       });
     }
     if (p === '/api/providers' && req.method === 'POST') {
@@ -889,12 +944,12 @@ async function handleRequest(req, res) {
     const provDel = p.match(/^\/api\/providers\/([^/]+)$/);
     if (provDel && req.method === 'DELETE') {
       const id = decodeURIComponent(provDel[1]);
-      if (id === 'lemonade') return json(res, 400, { error: 'the lemonade provider cannot be removed' });
+      if (id === DEFAULT_PROVIDER_ID || id === 'lemonade') return json(res, 400, { error: 'the default provider cannot be removed' });
       const before = PROVIDERS.length;
       PROVIDERS = PROVIDERS.filter((pr) => pr.id !== id);
       if (PROVIDERS.length === before) return json(res, 404, { error: 'no such provider' });
       saveProviders(PROVIDERS);
-      // Projects pointing at the removed provider fall back to lemonade.
+      // Projects pointing at the removed provider fall back to the configured default.
       for (const pr of PROJECTS) {
         if (pr.provider === id) {
           delete pr.provider;
@@ -904,12 +959,11 @@ async function handleRequest(req, res) {
       return json(res, 200, { ok: true });
     }
 
-    // ── Live stats (Lemonade /v1/stats + /v1/system-stats passthrough, trimmed).
-    // Tolerant: returns nulls per key rather than failing when Lemonade is down.
+    // ── Optional model-manager statistics.
     if (p === '/api/stats') {
       const [gen, sys] = await Promise.allSettled([
-        fetchJson(`${LEMONADE}/v1/stats`, { headers: lemonadeHeaders() }, 6000),
-        fetchJson(`${LEMONADE}/v1/system-stats`, { headers: lemonadeHeaders() }, 6000),
+        modelManager.enabled ? modelManager.stats() : Promise.resolve({ ok: false }),
+        modelManager.enabled ? modelManager.systemStats() : Promise.resolve({ ok: false }),
       ]);
       const g = gen.status === 'fulfilled' && gen.value.ok ? gen.value.body : {};
       const s = sys.status === 'fulfilled' && sys.value.ok ? sys.value.body : {};
@@ -929,7 +983,7 @@ async function handleRequest(req, res) {
       });
     }
 
-    // ── Projects CRUD (Claude-style) ──
+    // ── Projects CRUD ──
     if (p === '/api/auto-roles') {
       if (req.method === 'GET') {
         const roles = autoRoles();
@@ -1139,12 +1193,14 @@ async function handleRequest(req, res) {
     }
 
     if (p === '/api/health') {
-      const [lemonade, diary] = await Promise.allSettled([
-        fetchJson(`${LEMONADE}/api/v1/models`, { headers: lemonadeHeaders() }, 5000),
+      const defaultProvider = getProvider(DEFAULT_PROVIDER_ID);
+      const [inference, diary] = await Promise.allSettled([
+        fetchJson(`${defaultProvider.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/models`, { headers: providerHeaders(defaultProvider) }, 5000),
         fetchJson(`${DIARY_BASE}/api/health`, { headers: diaryHeaders() }, 5000),
       ]);
       return json(res, 200, {
-        lemonadeUp: lemonade.status === 'fulfilled' && lemonade.value.ok,
+        inferenceUp: inference.status === 'fulfilled' && inference.value.ok,
+        lemonadeUp: inference.status === 'fulfilled' && inference.value.ok,
         diaryUp: diary.status === 'fulfilled' && diary.value.ok,
       });
     }
@@ -1183,11 +1239,8 @@ async function handleRequest(req, res) {
         return json(res, 400, { error: 'invalid JSON' });
       }
       if (!body.checkpoint) return json(res, 400, { error: 'checkpoint required' });
-      const r = await fetchJson(
-        `${LEMONADE}/api/v1/pull`,
-        { method: 'POST', headers: lemonadeHeaders(), body: JSON.stringify({ checkpoint: body.checkpoint }) },
-        600000,
-      );
+      if (!modelManager.enabled) return json(res, 404, { error: 'model management is disabled' });
+      const r = await modelManager.pull(body.checkpoint);
       return json(res, r.ok ? 200 : 502, r.ok ? { jobId: r.body?.job_id || r.body?.id || 'pull' } : { error: `pull failed: ${r.status}` });
     }
 
@@ -1201,11 +1254,8 @@ async function handleRequest(req, res) {
         return json(res, 400, { error: 'invalid JSON' });
       }
       if (!body.name) return json(res, 400, { error: 'name required' });
-      const r = await fetchJson(
-        `${LEMONADE}/api/v1/delete`,
-        { method: 'POST', headers: lemonadeHeaders(), body: JSON.stringify({ model_name: body.name }) },
-        60000,
-      );
+      if (!modelManager.enabled) return json(res, 404, { error: 'model management is disabled' });
+      const r = await modelManager.deleteModel(body.name);
       return json(res, r.ok ? 200 : 502, r.ok ? { ok: true } : { error: `delete failed: ${r.status}` });
     }
 
@@ -1220,17 +1270,15 @@ async function handleRequest(req, res) {
           return json(res, 400, { error: 'invalid JSON' });
         }
         if (!body.name) return json(res, 400, { error: 'name required' });
-        const r = await fetchJson(
-          `${LEMONADE}/api/v1/${verb}`,
-          { method: 'POST', headers: lemonadeHeaders(), body: JSON.stringify({ model_name: body.name }) },
-          120000,
-        );
+        if (!modelManager.enabled) return json(res, 404, { error: 'model management is disabled' });
+        const r = await modelManager[verb](body.name);
         return json(res, r.ok ? 200 : 502, r.ok ? { ok: true } : { error: `${verb} failed: ${r.status}` });
       }
     }
 
     if (p === '/api/models/downloads') {
-      const r = await fetchJson(`${LEMONADE}/api/v1/downloads`, { headers: lemonadeHeaders() }, 8000);
+      if (!modelManager.enabled) return json(res, 200, []);
+      const r = await modelManager.downloads();
       if (!r.ok) return json(res, 200, []);
       const arr = Array.isArray(r.body) ? r.body : r.body?.jobs || r.body?.downloads || [];
       return json(res, 200, arr.map((j) => ({ id: j.id || j.job_id || '', model: j.model || j.model_name || j.checkpoint || '', progress: typeof j.progress === 'number' ? j.progress : null, status: j.status || j.state || '' })));
@@ -1309,7 +1357,7 @@ if (require.main === module) {
     console.warn('WARNING: cowork-ui API authentication is disabled; set DIARY_AUTH_TOKEN or UI_AUTH_TOKEN before tunnel exposure.');
   }
   http.createServer(handleRequest).listen(PORT, HOST, () => {
-    console.log(`cowork-ui listening on http://${HOST}:${PORT} (lemonade: ${LEMONADE}, diary: ${DIARY_BASE})`);
+    console.log(`cowork-ui listening on http://${HOST}:${PORT} (inference: ${INFERENCE_BASE}, manager: ${modelManager.kind}, diary: ${DIARY_BASE})`);
   });
 }
 
