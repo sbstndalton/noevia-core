@@ -901,7 +901,7 @@ async function handleChat(req, res, body) {
 async function handleRequest(req, res) {
   const preAuth = authService.authenticate(req);
   const workspace = preAuth ? workspaceStore.get(preAuth.user.id, { claim: preAuth.user.role === 'admin' }) : null;
-  if (workspace && preAuth.user.role === 'admin' && fs.existsSync(path.join(workspace.dir, 'migration.json')) &&
+  if (workspace && preAuth.user.role === 'admin' && authService.diaryEnabled(preAuth.user.id) && fs.existsSync(path.join(workspace.dir, 'migration.json')) &&
       process.env.CORPUS_BACKEND === 'webdav' && authService.getStorage(preAuth.user.id).kind === 'local') {
     authService.saveStorage(preAuth.user.id, { kind: 'webdav', baseUrl: process.env.WEBDAV_BASE_URL || '', username: process.env.WEBDAV_USERNAME || '', secret: process.env.WEBDAV_PASSWORD || '', corpusRoot: process.env.CORPUS_ROOT || '' });
   }
@@ -956,6 +956,9 @@ async function handleRequestScoped(req, res) {
     if (p === '/api/profile' && req.method === 'PATCH') {
       const body = await readJson(req); authService.updateProfile(authn.user.id, body.displayName);
       return json(res, 200, { ok: true });
+    }
+    if (p === '/api/profile/features' && req.method === 'PUT') {
+      return json(res, 200, authService.setDiaryEnabled(authn.user.id, !!(await readJson(req)).diaryEnabled));
     }
     if (p === '/api/integrations/storage' && req.method === 'GET') return json(res, 200, authService.getStorage(authn.user.id));
     if (p === '/api/integrations/storage' && req.method === 'PUT') {
@@ -1351,14 +1354,15 @@ async function handleRequestScoped(req, res) {
 
     if (p === '/api/health') {
       const defaultProvider = getProvider(DEFAULT_PROVIDER_ID);
+      const diaryEnabled = authService.diaryEnabled(authn.user.id);
       const [inference, diary] = await Promise.allSettled([
         fetchJson(`${defaultProvider.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/models`, { headers: providerHeaders(defaultProvider) }, 5000),
-        fetchJson(`${DIARY_BASE}/api/health`, { headers: diaryHeaders() }, 5000),
+        diaryEnabled ? fetchJson(`${DIARY_BASE}/api/health`, { headers: diaryHeaders() }, 5000) : Promise.resolve({ ok: false }),
       ]);
       return json(res, 200, {
         inferenceUp: inference.status === 'fulfilled' && inference.value.ok,
         lemonadeUp: inference.status === 'fulfilled' && inference.value.ok,
-        diaryUp: diary.status === 'fulfilled' && diary.value.ok,
+        diaryUp: diaryEnabled ? diary.status === 'fulfilled' && diary.value.ok : null,
       });
     }
 
@@ -1442,11 +1446,13 @@ async function handleRequestScoped(req, res) {
     }
 
     if (p === '/api/diary/source') {
+      if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
       const months = await corpusSource.listMonths();
       return json(res, 200, { source: corpusSource.name, months });
     }
 
     if (p === '/api/diary/today' || p === '/api/diary/history') {
+      if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
       const monthId = url.searchParams.get('month');
       const data = await corpusSource.readMonth(monthId);
       return json(res, 200, data);
@@ -1460,6 +1466,9 @@ async function handleRequestScoped(req, res) {
         body = JSON.parse(raw);
       } catch {
         return json(res, 400, { error: 'invalid JSON' });
+      }
+      if (body.spaceId === 'diary' && !authService.diaryEnabled(authn.user.id)) {
+        return json(res, 404, { error: 'Diary add-on is disabled' });
       }
       return handleChat(req, res, body);
     }

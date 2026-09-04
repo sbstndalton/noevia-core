@@ -19,8 +19,9 @@ test('bootstrap, password login, invitations, and workspace isolation', async (t
   const auth = createAuth({ dataDir: root, publicOrigin: 'https://cowork.example.test', rpId: 'cowork.example.test', secrets });
   const setupCode = fs.readFileSync(path.join(root, 'first-run-setup-code'), 'utf8').trim();
   const setupRes = response();
-  const setup = await auth.setup(request(), setupRes, { setupCode, publicOrigin: 'https://cowork.example.test', username: 'Owner', displayName: 'Owner', password: 'correct horse battery staple' });
+  const setup = await auth.setup(request(), setupRes, { setupCode, publicOrigin: 'https://cowork.example.test', username: 'Owner', displayName: 'Owner', password: 'correct horse battery staple', diaryEnabled: true });
   assert.equal(setup.status, 201); assert.equal(setup.body.user.role, 'admin');
+  assert.equal(setup.body.user.diaryEnabled, true);
   assert.equal(fs.existsSync(path.join(root, 'first-run-setup-code')), false);
   assert.doesNotMatch(auth.db.prepare('SELECT password_hash FROM users').get().password_hash, /correct horse/);
   const login = await auth.passwordLogin(request(), response(), { username: 'owner', password: 'correct horse battery staple' });
@@ -29,8 +30,11 @@ test('bootstrap, password login, invitations, and workspace isolation', async (t
   assert.ok(registration.options.challenge); assert.ok(registration.challengeToken);
 
   const invitation = auth.createInvite(setup.body.user.id, 'member');
-  const member = await auth.acceptInvite(request(), response(), { token: invitation.token, username: 'member', displayName: 'Member', password: 'another correct horse battery' });
+  const member = await auth.acceptInvite(request(), response(), { token: invitation.token, username: 'member', displayName: 'Member', password: 'another correct horse battery', diaryEnabled: false });
   assert.equal(member.status, 201);
+  assert.equal(member.body.user.diaryEnabled, false);
+  assert.deepEqual(auth.setDiaryEnabled(member.body.user.id, true), { diaryEnabled: true });
+  assert.equal(auth.diaryEnabled(member.body.user.id), true);
   const store = createWorkspaceStore(root, { id: 'default', label: 'Default', baseUrl: 'http://localhost', apiKey: '' }, secrets);
   const ownerSpace = store.get(setup.body.user.id); const memberSpace = store.get(member.body.user.id);
   ownerSpace.projects.push({ id: 'private-project', name: 'Private' }); ownerSpace.saveProjects();

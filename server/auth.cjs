@@ -85,7 +85,14 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       kind TEXT NOT NULL, base_url TEXT NOT NULL DEFAULT '', username TEXT NOT NULL DEFAULT '',
       secret TEXT NOT NULL DEFAULT '', corpus_root TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS user_features(
+      user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      diary_enabled INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL
+    );
     INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(1, unixepoch() * 1000);
+    INSERT OR IGNORE INTO user_features(user_id, diary_enabled, updated_at)
+      SELECT id, 1, unixepoch() * 1000 FROM users;
+    INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(2, unixepoch() * 1000);
   `);
 
   const configuredOrigin = db.prepare("SELECT value FROM settings WHERE key='public_origin'").get()?.value;
@@ -119,7 +126,9 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
 
   function publicUser(row) {
     if (!row) return null;
-    return { id: row.id, username: row.username, displayName: row.display_name, role: row.role, disabled: !!row.disabled_at };
+    const feature = db.prepare('SELECT diary_enabled FROM user_features WHERE user_id=?').get(row.id);
+    return { id: row.id, username: row.username, displayName: row.display_name, role: row.role,
+      disabled: !!row.disabled_at, diaryEnabled: !!feature?.diary_enabled };
   }
 
   function issueSession(req, res, user) {
@@ -213,6 +222,8 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       const tx = db.transaction(() => {
         db.prepare('INSERT INTO users(id,username,username_norm,display_name,role,password_hash,webauthn_user_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)')
           .run(id, body.username, body.username.toLowerCase(), String(body.displayName || body.username).trim().slice(0, 80), 'admin', passwordHash, randomToken(32), now, now);
+        db.prepare('INSERT INTO user_features(user_id,diary_enabled,updated_at) VALUES(?,?,?)')
+          .run(id, body.diaryEnabled ? 1 : 0, now);
         db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('public_origin',?)").run(selectedOrigin);
         db.prepare("DELETE FROM settings WHERE key='setup_code_hash'").run();
       });
@@ -309,6 +320,8 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
         db.transaction(() => {
           db.prepare('INSERT INTO users(id,username,username_norm,display_name,role,password_hash,webauthn_user_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)')
             .run(id, body.username, body.username.toLowerCase(), String(body.displayName || body.username).slice(0,80), invite.role, passwordHash, randomToken(32), now, now);
+          db.prepare('INSERT INTO user_features(user_id,diary_enabled,updated_at) VALUES(?,?,?)')
+            .run(id, body.diaryEnabled ? 1 : 0, now);
           db.prepare('UPDATE invitations SET used_at=? WHERE token_hash=?').run(now, invite.token_hash);
         })();
       } catch { return { status: 409, body: { error: 'username is unavailable' } }; }
@@ -335,6 +348,16 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       audit('recovery.complete', row.user_id, row.user_id); return true;
     },
     updateProfile(userId, displayName) { db.prepare('UPDATE users SET display_name=?,updated_at=? WHERE id=?').run(String(displayName).trim().slice(0,80), Date.now(), userId); },
+    diaryEnabled(userId) {
+      return !!db.prepare('SELECT diary_enabled FROM user_features WHERE user_id=?').get(userId)?.diary_enabled;
+    },
+    setDiaryEnabled(userId, enabled) {
+      db.prepare(`INSERT INTO user_features(user_id,diary_enabled,updated_at) VALUES(?,?,?)
+        ON CONFLICT(user_id) DO UPDATE SET diary_enabled=excluded.diary_enabled,updated_at=excluded.updated_at`)
+        .run(userId, enabled ? 1 : 0, Date.now());
+      audit('feature.diary', userId, userId, { enabled: !!enabled });
+      return { diaryEnabled: !!enabled };
+    },
     deleteUser(actorId, userId, username) {
       const user = db.prepare('SELECT * FROM users WHERE id=?').get(userId); if (!user || user.username !== username) return false;
       if (user.role === 'admin' && db.prepare("SELECT count(*) AS n FROM users WHERE role='admin'").get().n <= 1) throw new Error('cannot delete the last administrator');
