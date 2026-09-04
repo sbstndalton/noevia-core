@@ -14,21 +14,17 @@ fs.writeFileSync(path.join(dataDir, 'projects.json'), JSON.stringify({
   projects: [{ id: 'project-1', provider: 'lemonade', chats: [] }],
 }));
 
-process.env.UI_DATA_DIR = dataDir;
-process.env.DEFAULT_PROVIDER_ID = 'primary';
-process.env.DEFAULT_PROVIDER_LABEL = 'Primary inference';
-process.env.INFERENCE_BASE_URL = 'http://inference.invalid';
-
-require('./index.cjs');
+const { createWorkspaceStore } = require('./workspace.cjs');
+const userId = '11111111-1111-4111-8111-111111111111';
+const workspace = createWorkspaceStore(dataDir, { id: 'primary', label: 'Primary inference', baseUrl: 'http://inference.invalid', apiKey: '' }).get(userId, { claim: true });
 
 test.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
 
 test('legacy provider and project IDs migrate atomically with backups', () => {
-  const providers = JSON.parse(fs.readFileSync(path.join(dataDir, 'providers.json'), 'utf8')).providers;
-  const projects = JSON.parse(fs.readFileSync(path.join(dataDir, 'projects.json'), 'utf8')).projects;
+  const providers = workspace.providers;
+  const projects = workspace.projects;
   assert.equal(providers[0].id, 'primary');
   assert.equal(providers[0].label, 'Primary inference');
   assert.equal(projects[0].provider, 'primary');
-  assert.ok(fs.existsSync(path.join(dataDir, 'providers.json.pre-neutral-provider.bak')));
-  assert.ok(fs.existsSync(path.join(dataDir, 'projects.json.pre-neutral-provider.bak')));
+  assert.ok(fs.existsSync(path.join(workspace.dir, 'migration.json')));
 });

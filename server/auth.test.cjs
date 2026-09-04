@@ -10,6 +10,8 @@ const test = require('node:test');
 const testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cowork-auth-test-'));
 process.env.DIARY_AUTH_TOKEN = 'test-cowork-token';
 process.env.UI_DATA_DIR = testDataDir;
+process.env.LEGACY_AUTH_COMPAT = 'true';
+process.env.PUBLIC_ORIGIN = 'http://localhost';
 
 const { handleRequest } = require('./index.cjs');
 
@@ -33,6 +35,7 @@ async function request(url, { method = 'GET', headers = {}, body = '' } = {}) {
   });
   res.statusCode = 200;
   res.headersSent = false;
+  res.setHeader = (name, value) => { responseHeaders[name] = value; };
   res.writeHead = (status, nextHeaders = {}) => {
     res.statusCode = status;
     res.headersSent = true;
@@ -52,6 +55,15 @@ async function request(url, { method = 'GET', headers = {}, body = '' } = {}) {
     text: Buffer.concat(chunks).toString('utf8'),
   };
 }
+
+test.before(async () => {
+  const setupCode = fs.readFileSync(path.join(testDataDir, 'first-run-setup-code'), 'utf8').trim();
+  const response = await request('/api/setup/complete', {
+    method: 'POST', headers: { origin: 'http://localhost' },
+    body: JSON.stringify({ setupCode, publicOrigin: 'http://localhost', username: 'admin', displayName: 'Admin', password: 'correct horse battery staple' }),
+  });
+  assert.equal(response.status, 201);
+});
 
 test('rejects API requests without a token', async () => {
   const response = await request('/api/workspace');

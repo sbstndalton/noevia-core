@@ -19,9 +19,11 @@ let RAG_DIR = null;
 let EMBED_MODEL = 'default';
 let inferenceBase = null;
 let inferenceHeaders = () => ({ 'Content-Type': 'application/json' });
+let dataDirForUser = null;
 
-function init({ dataDir, embedModel, inferenceUrl, headersFn }) {
+function init({ dataDir, embedModel, inferenceUrl, headersFn, userDataDirFn }) {
   RAG_DIR = process.env.RAG_DIR || path.join(dataDir, 'rag');
+  dataDirForUser = userDataDirFn || null;
   EMBED_MODEL = process.env.EMBEDDING_MODEL || process.env.EMBED_MODEL || embedModel || EMBED_MODEL;
   inferenceBase = inferenceUrl;
   if (headersFn) inferenceHeaders = headersFn;
@@ -121,12 +123,13 @@ async function embed(texts) {
   return out;
 }
 
-function openIndex(projectId) {
+function openIndex(projectId, userId) {
   const { Database, sqliteVec } = loadDeps();
   if (!Database || !sqliteVec) return null;
   try {
-    fs.mkdirSync(RAG_DIR, { recursive: true });
-    const db = new Database(path.join(RAG_DIR, `${projectId}.db`));
+    const ragDir = userId && dataDirForUser ? path.join(dataDirForUser(userId), 'rag') : RAG_DIR;
+    fs.mkdirSync(ragDir, { recursive: true });
+    const db = new Database(path.join(ragDir, `${projectId}.db`));
     db.pragma('journal_mode = WAL');
     sqliteVec.load(db);
     db.exec(`
@@ -190,8 +193,8 @@ async function embedBatchAndStore(index, rows) {
 
 // Index (or re-index) one project file. Returns counts for logging; throws on
 // hard failures is deliberately avoided — callers log the result.
-async function indexProjectFile(projectId, fileName, text) {
-  const index = openIndex(projectId);
+async function indexProjectFile(projectId, fileName, text, userId) {
+  const index = openIndex(projectId, userId);
   if (!index) return { ok: false, reason: 'rag-unavailable' };
   try {
     index.db.prepare('DELETE FROM chunks WHERE file = ?').run(fileName);
@@ -229,8 +232,8 @@ async function indexProjectFile(projectId, fileName, text) {
 }
 
 // Drop one file's chunks (called when a file is removed from a project).
-function deleteProjectFile(projectId, fileName) {
-  const index = openIndex(projectId);
+function deleteProjectFile(projectId, fileName, userId) {
+  const index = openIndex(projectId, userId);
   if (!index) return;
   try {
     index.db.prepare('DELETE FROM chunks WHERE file = ?').run(fileName);
@@ -241,8 +244,8 @@ function deleteProjectFile(projectId, fileName) {
 
 // Top-K chunks for a query, this project's index only. Empty array on any
 // failure — chat falls back to direct injection of small files.
-async function searchProject(projectId, query) {
-  const index = openIndex(projectId);
+async function searchProject(projectId, query, userId) {
+  const index = openIndex(projectId, userId);
   if (!index || !index.dim) return [];
   try {
     const [qvec] = await embed([query]);
@@ -269,14 +272,14 @@ async function searchProject(projectId, query) {
 // The files-context for one chat message: retrieved chunks when the index has
 // vectors, otherwise the verbatim small files (old behavior, still the path
 // for anything <= DIRECT_INJECT_MAX). Never throws.
-async function filesContext(projectId, files, query) {
+async function filesContext(projectId, files, query, userId) {
   if (!Array.isArray(files) || files.length === 0) return null;
   const small = files.filter((f) => String(f.content || '').length <= DIRECT_INJECT_MAX);
   const large = files.filter((f) => String(f.content || '').length > DIRECT_INJECT_MAX);
 
   const parts = [];
   if (ragAvailable() && large.length > 0) {
-    const hits = await searchProject(projectId, query);
+    const hits = await searchProject(projectId, query, userId);
     if (hits.length > 0) {
       for (const h of hits) parts.push(`[from ${h.file}] ${h.body}`);
     }

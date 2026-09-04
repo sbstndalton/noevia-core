@@ -21,8 +21,12 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { URL } = require('url');
+const { AsyncLocalStorage } = require('async_hooks');
 const rag = require('./rag.cjs');
 const { createModelManager } = require('./model-manager.cjs');
+const { createAuth } = require('./auth.cjs');
+const { createWorkspaceStore } = require('./workspace.cjs');
+const { createSecretStore } = require('./secrets.cjs');
 
 const PORT = Number(process.env.UI_PORT || 8021);
 const HOST = process.env.UI_HOST || '0.0.0.0';
@@ -37,13 +41,39 @@ const DIARY_TOKEN = process.env.DIARY_AUTH_TOKEN || '';
 const UI_AUTH_TOKEN = (process.env.UI_AUTH_TOKEN || DIARY_TOKEN).trim();
 const DIST_DIR = path.join(__dirname, '..', 'dist');
 const DATA_DIR = process.env.UI_DATA_DIR || path.join(__dirname, 'ui-data');
-const PROJECTS_FILE = path.join(DATA_DIR, 'projects.json');
 const HISTORY_CAP = 40;
 const SPAFallbacks = ['/', '/chat', '/diary', '/projects', '/settings'];
-const PROVIDERS_FILE = path.join(DATA_DIR, 'providers.json');
+const secretStore = createSecretStore(DATA_DIR);
+const authService = createAuth({
+  dataDir: DATA_DIR,
+  publicOrigin: process.env.PUBLIC_ORIGIN || '',
+  rpId: process.env.WEBAUTHN_RP_ID || '',
+  legacyToken: UI_AUTH_TOKEN,
+  legacyCompat: process.env.LEGACY_AUTH_COMPAT === 'true',
+  secrets: secretStore,
+});
 if (process.env.LEMONADE_BASE_URL && !process.env.INFERENCE_BASE_URL) console.warn('LEMONADE_BASE_URL is deprecated; use INFERENCE_BASE_URL');
 if (process.env.LEMONADE_API_KEY && !process.env.INFERENCE_API_KEY) console.warn('LEMONADE_API_KEY is deprecated; use INFERENCE_API_KEY');
-rag.init({ dataDir: DATA_DIR, inferenceUrl: INFERENCE_BASE, headersFn: () => inferenceHeaders() });
+const workspaceStore = createWorkspaceStore(DATA_DIR, { id: DEFAULT_PROVIDER_ID, label: DEFAULT_PROVIDER_LABEL, baseUrl: INFERENCE_BASE, apiKey: INFERENCE_KEY, shared: true }, secretStore);
+const requestScope = new AsyncLocalStorage();
+const nextcloudFlows = new Map();
+function currentWorkspace() {
+  const workspace = requestScope.getStore()?.workspace;
+  if (!workspace) throw new Error('authenticated workspace context required');
+  return workspace;
+}
+function arrayProxy(field) {
+  return new Proxy([], {
+    get(_target, property) {
+      const value = currentWorkspace()[field][property];
+      return typeof value === 'function' ? value.bind(currentWorkspace()[field]) : value;
+    },
+    set(_target, property, value) { currentWorkspace()[field][property] = value; return true; },
+    ownKeys() { return Reflect.ownKeys(currentWorkspace()[field]); },
+    getOwnPropertyDescriptor() { return { enumerable: true, configurable: true }; },
+  });
+}
+rag.init({ dataDir: DATA_DIR, inferenceUrl: INFERENCE_BASE, headersFn: () => inferenceHeaders(), userDataDirFn: workspaceStore.userDir });
 
 // User-created projects; the earlier fixed demo spaces were removed.
 // spaces were deleted per user request — projects are user-created only.
@@ -63,14 +93,7 @@ function clientToken(req) {
 }
 
 function checkAuth(req) {
-  // Match diary-companion's single-user model: an empty token keeps local-dev
-  // open, while every /api/* request is protected when a token is configured.
-  if (!UI_AUTH_TOKEN) return true;
-  const supplied = clientToken(req);
-  if (!supplied) return false;
-  const expectedBytes = Buffer.from(UI_AUTH_TOKEN);
-  const suppliedBytes = Buffer.from(supplied);
-  return expectedBytes.length === suppliedBytes.length && crypto.timingSafeEqual(expectedBytes, suppliedBytes);
+  return !!authService.authenticate(req);
 }
 
 function unauthorized(res) {
@@ -100,6 +123,19 @@ async function fetchJson(url, opts, timeoutMs) {
   }
 }
 
+async function readJson(req) {
+  let raw = '';
+  for await (const chunk of req) {
+    raw += chunk;
+    if (raw.length > 1024 * 1024) throw new Error('request too large');
+  }
+  return raw ? JSON.parse(raw) : {};
+}
+
+function authResult(res, result) {
+  return json(res, result.status || 200, result.body ?? result);
+}
+
 const modelManager = createModelManager({
   kind: MODEL_MANAGER_KIND,
   baseUrl: MODEL_MANAGER_BASE,
@@ -116,29 +152,28 @@ function inferenceHeaders(extra) {
 function diaryHeaders() {
   const h = { 'Content-Type': 'application/json' };
   if (DIARY_TOKEN) h.Authorization = `Bearer ${DIARY_TOKEN}`;
+  const workspace = requestScope.getStore()?.workspace;
+  if (workspace) {
+    h['X-Cowork-User-ID'] = workspace.userId;
+    if (fs.existsSync(path.join(workspace.dir, 'migration.json'))) h['X-Cowork-Legacy-Owner'] = '1';
+    const storage = authService.getStorage(workspace.userId, true);
+    h['X-Cowork-Storage'] = Buffer.from(JSON.stringify(storage)).toString('base64url');
+  }
   return h;
 }
 
 // ── Projects config: instructions, files, memories, model ─────────────────
 
 function loadProjects() {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(PROJECTS_FILE, 'utf8'));
-    if (Array.isArray(parsed.projects)) return parsed.projects;
-  } catch {
-    /* first boot */
-  }
-  return [];
+  return currentWorkspace().projects;
 }
 
 function saveProjects(projects) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  const tmp = `${PROJECTS_FILE}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify({ projects }, null, 2));
-  fs.renameSync(tmp, PROJECTS_FILE);
+  currentWorkspace().projects = Array.from(projects);
+  currentWorkspace().saveProjects();
 }
 
-let PROJECTS = loadProjects();
+const PROJECTS = arrayProxy('projects');
 
 function getProject(id) {
   return PROJECTS.find((p) => p.id === id) || null;
@@ -148,25 +183,18 @@ function getProject(id) {
 // One adapter covers all of them (same /chat/completions shape). Projects
 // without a provider field use the environment-configured default provider.
 function loadProviders() {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(PROVIDERS_FILE, 'utf8'));
-    if (Array.isArray(parsed.providers)) return parsed.providers;
-  } catch {
-    /* first boot */
-  }
-  return [];
+  return currentWorkspace().providers;
 }
 
 function saveProviders(providers) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  const tmp = `${PROVIDERS_FILE}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify({ providers }, null, 2));
-  fs.renameSync(tmp, PROVIDERS_FILE);
+  currentWorkspace().providers = Array.from(providers);
+  currentWorkspace().saveProviders();
 }
 
-let PROVIDERS = loadProviders();
+const PROVIDERS = arrayProxy('providers');
 
-function backupOnce(file) {
+function backupOnce(name) {
+  const file = path.join(currentWorkspace().dir, name);
   if (!fs.existsSync(file)) return;
   const backup = `${file}.pre-neutral-provider.bak`;
   if (!fs.existsSync(backup)) fs.copyFileSync(file, backup, fs.constants.COPYFILE_EXCL);
@@ -184,11 +212,12 @@ function migrateLegacyProviderIds() {
   }
   if (changedProviders) {
     const seen = new Set();
-    PROVIDERS = PROVIDERS.filter((provider) => {
+    const filtered = Array.from(PROVIDERS).filter((provider) => {
       if (seen.has(provider.id)) return false;
       seen.add(provider.id);
       return true;
     });
+    PROVIDERS.splice(0, PROVIDERS.length, ...filtered);
   }
   for (const project of PROJECTS) {
     if (project.provider === 'lemonade') {
@@ -197,19 +226,13 @@ function migrateLegacyProviderIds() {
     }
   }
   if (changedProviders) {
-    backupOnce(PROVIDERS_FILE);
+    backupOnce('providers.json');
     saveProviders(PROVIDERS);
   }
   if (changedProjects) {
-    backupOnce(PROJECTS_FILE);
+    backupOnce('projects.json');
     saveProjects(PROJECTS);
   }
-}
-
-migrateLegacyProviderIds();
-if (!PROVIDERS.some((provider) => provider.id === DEFAULT_PROVIDER_ID)) {
-  PROVIDERS.unshift({ id: DEFAULT_PROVIDER_ID, label: DEFAULT_PROVIDER_LABEL, baseUrl: INFERENCE_BASE, apiKey: INFERENCE_KEY });
-  saveProviders(PROVIDERS);
 }
 
 function getProvider(id) {
@@ -254,7 +277,7 @@ function deleteChat(projectId, chatId) {
   if (p.chats.length === before) return false;
   saveProjects(PROJECTS);
   try {
-    fs.unlinkSync(path.join(DATA_DIR, `history-${chatId.replace(/[^a-zA-Z0-9_-]/g, '')}.json`));
+    fs.unlinkSync(currentWorkspace().historyPath(chatId));
   } catch {
     /* no history file — fine */
   }
@@ -263,33 +286,25 @@ function deleteChat(projectId, chatId) {
 
 // Free (non-project) chat metas — persisted server-side so recent chats
 // survive across browsers/devices (localStorage was the only home before).
-const FREE_CHATS_FILE = path.join(DATA_DIR, 'free-chats.json');
-
 function loadFreeChats() {
-  try {
-    const raw = JSON.parse(fs.readFileSync(FREE_CHATS_FILE, 'utf8'));
-    return Array.isArray(raw) ? raw : [];
-  } catch {
-    return [];
-  }
+  return currentWorkspace().freeChats;
 }
 
 function saveFreeChats(list) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  const tmp = `${FREE_CHATS_FILE}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(list, null, 2));
-  fs.renameSync(tmp, FREE_CHATS_FILE);
+  currentWorkspace().freeChats = Array.from(list);
+  currentWorkspace().saveFreeChats();
 }
 
-let FREE_CHATS = loadFreeChats();
+const FREE_CHATS = arrayProxy('freeChats');
 
 function deleteFreeChat(chatId) {
   const before = FREE_CHATS.length;
-  FREE_CHATS = FREE_CHATS.filter((c) => c.id !== chatId);
+  const filtered = Array.from(FREE_CHATS).filter((c) => c.id !== chatId);
+  FREE_CHATS.splice(0, FREE_CHATS.length, ...filtered);
   if (FREE_CHATS.length === before) return false;
   saveFreeChats(FREE_CHATS);
   try {
-    fs.unlinkSync(path.join(DATA_DIR, `history-${chatId.replace(/[^a-zA-Z0-9_-]/g, '')}.json`));
+    fs.unlinkSync(currentWorkspace().historyPath(chatId));
   } catch {
     /* no history file — fine */
   }
@@ -300,7 +315,7 @@ function deleteFreeChat(chatId) {
 
 function historyPath(spaceId) {
   const safe = String(spaceId).replace(/[^a-zA-Z0-9_-]/g, '');
-  return path.join(DATA_DIR, `history-${safe}.json`);
+  return currentWorkspace().historyPath(safe);
 }
 
 function readHistory(spaceId) {
@@ -312,7 +327,7 @@ function readHistory(spaceId) {
 }
 
 function writeHistory(spaceId, history) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.mkdirSync(currentWorkspace().dir, { recursive: true });
   const file = historyPath(spaceId);
   const tmp = `${file}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify({ history }, null, 2));
@@ -330,27 +345,13 @@ let LAST_LOADED_MODEL = null;
 // Roles are config, never hardcoded model names: role→model mapping lives in
 // ui/server/auto-roles.json (created on first use; never ships a default
 // model string). Auto mode keeps BOTH role models loaded — no unload/swap.
-const AUTO_ROLES_FILE = path.join(DATA_DIR, 'auto-roles.json');
-let AUTO_ROLES = null; // { fast, smart } | null until first read
-
 function autoRoles() {
-  if (AUTO_ROLES) return AUTO_ROLES;
-  try {
-    const parsed = JSON.parse(fs.readFileSync(AUTO_ROLES_FILE, 'utf8'));
-    if (parsed && typeof parsed.fast === 'string' && typeof parsed.smart === 'string') {
-      AUTO_ROLES = { fast: parsed.fast, smart: parsed.smart };
-    }
-  } catch {
-    /* not written yet */
-  }
-  return AUTO_ROLES;
+  return currentWorkspace().autoRoles;
 }
 
 function setAutoRoles(next) {
-  AUTO_ROLES = { fast: String(next.fast), smart: String(next.smart) };
-  const tmp = `${AUTO_ROLES_FILE}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(AUTO_ROLES, null, 2));
-  fs.renameSync(tmp, AUTO_ROLES_FILE);
+  currentWorkspace().autoRoles = { fast: String(next.fast), smart: String(next.smart) };
+  currentWorkspace().saveAutoRoles();
 }
 
 async function ensureModelLoaded(name) {
@@ -689,7 +690,7 @@ async function handleChat(req, res, body) {
   // injection (small files whole, big files capped) — the old behavior.
   let filesBlock = null;
   if (project && Array.isArray(project.files) && project.files.length) {
-    filesBlock = await rag.filesContext(project.id, project.files, message);
+    filesBlock = await rag.filesContext(project.id, project.files, message, currentWorkspace().userId);
   }
 
   const sysParts = [];
@@ -898,11 +899,145 @@ async function handleChat(req, res, body) {
 // ── Routing ────────────────────────────────────────────────────────────────
 
 async function handleRequest(req, res) {
+  const preAuth = authService.authenticate(req);
+  const workspace = preAuth ? workspaceStore.get(preAuth.user.id, { claim: preAuth.user.role === 'admin' }) : null;
+  if (workspace && preAuth.user.role === 'admin' && fs.existsSync(path.join(workspace.dir, 'migration.json')) &&
+      process.env.CORPUS_BACKEND === 'webdav' && authService.getStorage(preAuth.user.id).kind === 'local') {
+    authService.saveStorage(preAuth.user.id, { kind: 'webdav', baseUrl: process.env.WEBDAV_BASE_URL || '', username: process.env.WEBDAV_USERNAME || '', secret: process.env.WEBDAV_PASSWORD || '', corpusRoot: process.env.CORPUS_ROOT || '' });
+  }
+  return requestScope.run({ workspace }, () => handleRequestScoped(req, res));
+}
+
+async function handleRequestScoped(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const p = url.pathname;
 
   try {
-    if (p.startsWith('/api/') && !checkAuth(req)) return unauthorized(res);
+    const publicAuthRoutes = new Set([
+      '/api/setup/status', '/api/setup/complete', '/api/auth/login/password',
+      '/api/auth/login/passkey/options', '/api/auth/login/passkey/verify',
+      '/api/auth/invitations/accept', '/api/auth/recovery/complete',
+    ]);
+    if (p === '/api/setup/status' && req.method === 'GET') {
+      return json(res, 200, { configured: authService.userCount() > 0, publicOrigin: authService.origin || process.env.PUBLIC_ORIGIN || '' });
+    }
+    if (publicAuthRoutes.has(p) && req.method !== 'GET' && !authService.originValid(req)) {
+      return json(res, 403, { error: 'origin not allowed' });
+    }
+    if (p === '/api/setup/complete' && req.method === 'POST') return authResult(res, await authService.setup(req, res, await readJson(req)));
+    if (p === '/api/auth/login/password' && req.method === 'POST') return authResult(res, await authService.passwordLogin(req, res, await readJson(req)));
+    if (p === '/api/auth/login/passkey/options' && req.method === 'POST') {
+      return json(res, 200, await authService.authenticationOptions((await readJson(req)).username));
+    }
+    if (p === '/api/auth/login/passkey/verify' && req.method === 'POST') {
+      try { return json(res, 200, await authService.authenticationVerify(req, res, await readJson(req))); }
+      catch { return json(res, 401, { error: 'sign-in failed' }); }
+    }
+    if (p === '/api/auth/invitations/accept' && req.method === 'POST') return authResult(res, await authService.acceptInvite(req, res, await readJson(req)));
+    if (p === '/api/auth/recovery/complete' && req.method === 'POST') {
+      try { const ok = await authService.completeRecovery(await readJson(req)); return json(res, ok ? 200 : 400, ok ? { ok: true } : { error: 'recovery link is invalid or expired' }); }
+      catch (e) { return json(res, 400, { error: e.message }); }
+    }
+
+    const authn = p.startsWith('/api/') ? authService.authenticate(req) : null;
+    if (p.startsWith('/api/') && !publicAuthRoutes.has(p) && !authn) return unauthorized(res);
+    if (authn && !['GET', 'HEAD', 'OPTIONS'].includes(req.method || 'GET') && (!authService.originValid(req) || !authService.csrfValid(req, authn))) {
+      return json(res, 403, { error: 'invalid CSRF token' });
+    }
+    if (p === '/api/auth/session' && req.method === 'GET') {
+      const csrfCookie = String(req.headers.cookie || '').split(';').map(x => x.trim()).find(x => x.startsWith('cowork_csrf='));
+      return json(res, 200, { user: authn.user, csrfToken: authn.legacy ? null : decodeURIComponent((csrfCookie || '').slice(12)), legacy: authn.legacy });
+    }
+    if (p === '/api/auth/logout' && req.method === 'POST') return authResult(res, authService.logout(req, res, authn));
+    if (p.startsWith('/api/models/') && !['GET', 'HEAD'].includes(req.method || 'GET') && authn.user.role !== 'admin') {
+      return json(res, 403, { error: 'administrator required' });
+    }
+    if (p === '/api/profile' && req.method === 'GET') return json(res, 200, { user: authn.user, passkeys: authService.listPasskeys(authn.user.id), sessions: authService.listSessions(authn.user.id) });
+    if (p === '/api/profile' && req.method === 'PATCH') {
+      const body = await readJson(req); authService.updateProfile(authn.user.id, body.displayName);
+      return json(res, 200, { ok: true });
+    }
+    if (p === '/api/integrations/storage' && req.method === 'GET') return json(res, 200, authService.getStorage(authn.user.id));
+    if (p === '/api/integrations/storage' && req.method === 'PUT') {
+      const body = await readJson(req);
+      if (body.kind !== 'local' && (!/^https?:\/\//.test(String(body.baseUrl || '')) || !body.username || !body.secret)) {
+        return json(res, 400, { error: 'server URL, username, and app password are required' });
+      }
+      return json(res, 200, authService.saveStorage(authn.user.id, body));
+    }
+    if (p === '/api/integrations/storage/test' && req.method === 'POST') {
+      const body = await readJson(req);
+      if (body.kind === 'local') return json(res, 200, { ok: true });
+      const saved = body.useSaved ? authService.getStorage(authn.user.id, true) : body;
+      try {
+        const target = `${String(saved.baseUrl).replace(/\/+$/, '')}/${String(saved.corpusRoot || '').split('/').map(encodeURIComponent).join('/')}`;
+        const response = await fetch(target, { method: 'PROPFIND', headers: { Authorization: `Basic ${Buffer.from(`${saved.username}:${saved.secret}`).toString('base64')}`, Depth: '0' }, signal: AbortSignal.timeout(10000) });
+        return json(res, response.ok || response.status === 207 ? 200 : 502, response.ok || response.status === 207 ? { ok: true } : { error: `WebDAV returned ${response.status}` });
+      } catch (e) { return json(res, 502, { error: e.message }); }
+    }
+    if (p === '/api/integrations/storage/nextcloud/start' && req.method === 'POST') {
+      const baseUrl = String((await readJson(req)).baseUrl || '').replace(/\/+$/, '');
+      if (!/^https:\/\//.test(baseUrl)) return json(res, 400, { error: 'HTTPS Nextcloud URL required' });
+      try {
+        const response = await fetch(`${baseUrl}/index.php/login/v2`, { method: 'POST', signal: AbortSignal.timeout(10000) });
+        if (!response.ok) return json(res, 502, { error: `Nextcloud returned ${response.status}` });
+        const payload = await response.json(); const flowId = crypto.randomUUID();
+        nextcloudFlows.set(flowId, { userId: authn.user.id, endpoint: payload.poll.endpoint, token: payload.poll.token, expires: Date.now() + 10 * 60 * 1000 });
+        return json(res, 200, { flowId, loginUrl: payload.login, expiresAt: Date.now() + 10 * 60 * 1000 });
+      } catch (e) { return json(res, 502, { error: e.message }); }
+    }
+    if (p === '/api/integrations/storage/nextcloud/poll' && req.method === 'POST') {
+      const body = await readJson(req); const flow = nextcloudFlows.get(String(body.flowId || ''));
+      if (!flow || flow.userId !== authn.user.id || flow.expires < Date.now()) return json(res, 400, { error: 'login flow expired' });
+      const response = await fetch(flow.endpoint, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ token: flow.token }), signal: AbortSignal.timeout(10000) });
+      if (response.status === 404) return json(res, 202, { pending: true });
+      if (!response.ok) return json(res, 502, { error: `Nextcloud returned ${response.status}` });
+      const credentials = await response.json(); nextcloudFlows.delete(String(body.flowId));
+      const baseUrl = `${String(credentials.server).replace(/\/+$/, '')}/remote.php/dav/files/${encodeURIComponent(credentials.loginName)}`;
+      return json(res, 200, authService.saveStorage(authn.user.id, { kind: 'nextcloud', baseUrl, username: credentials.loginName, secret: credentials.appPassword, corpusRoot: body.corpusRoot || 'Cowork/Diary' }));
+    }
+    if (p === '/api/auth/passkeys/register/options' && req.method === 'POST') return json(res, 200, await authService.registrationOptions(authn.user.id));
+    if (p === '/api/auth/passkeys/register/verify' && req.method === 'POST') {
+      try { return json(res, 200, await authService.registrationVerify(authn.user.id, await readJson(req))); }
+      catch (e) { return json(res, 400, { error: e.message }); }
+    }
+    const passkeyRoute = p.match(/^\/api\/auth\/passkeys\/([^/]+)$/);
+    if (passkeyRoute && req.method === 'DELETE') return json(res, authService.deletePasskey(authn.user.id, decodeURIComponent(passkeyRoute[1])) ? 200 : 404, { ok: true });
+    if (passkeyRoute && req.method === 'PATCH') {
+      const ok = authService.renamePasskey(authn.user.id, decodeURIComponent(passkeyRoute[1]), (await readJson(req)).name);
+      return json(res, ok ? 200 : 404, { ok });
+    }
+    const sessionRoute = p.match(/^\/api\/auth\/sessions\/([^/]+)$/);
+    if (sessionRoute && req.method === 'DELETE') return json(res, authService.revokeSession(authn.user.id, decodeURIComponent(sessionRoute[1])) ? 200 : 404, { ok: true });
+    if (p.startsWith('/api/admin/')) {
+      if (authn.user.role !== 'admin') return json(res, 403, { error: 'administrator required' });
+      if (p === '/api/admin/users' && req.method === 'GET') return json(res, 200, { users: authService.listUsers() });
+      if (p === '/api/admin/invitations' && req.method === 'POST') return json(res, 201, authService.createInvite(authn.user.id, (await readJson(req)).role));
+      const disabledRoute = p.match(/^\/api\/admin\/users\/([^/]+)\/disabled$/);
+      if (disabledRoute && req.method === 'PUT') {
+        try { return json(res, authService.setDisabled(authn.user.id, decodeURIComponent(disabledRoute[1]), !!(await readJson(req)).disabled) ? 200 : 404, { ok: true }); }
+        catch (e) { return json(res, 400, { error: e.message }); }
+      }
+      const recoveryRoute = p.match(/^\/api\/admin\/users\/([^/]+)\/recovery$/);
+      if (recoveryRoute && req.method === 'POST') {
+        const result = authService.createRecovery(authn.user.id, decodeURIComponent(recoveryRoute[1]));
+        return json(res, result ? 201 : 404, result || { error: 'no such user' });
+      }
+      const userRoute = p.match(/^\/api\/admin\/users\/([^/]+)$/);
+      if (userRoute && req.method === 'DELETE') {
+        try {
+          const id = decodeURIComponent(userRoute[1]); const ok = authService.deleteUser(authn.user.id, id, (await readJson(req)).username);
+          if (ok) {
+            workspaceStore.remove(id);
+            const headers = { 'X-Cowork-User-ID': id };
+            if (DIARY_TOKEN) headers.Authorization = `Bearer ${DIARY_TOKEN}`;
+            await fetchJson(`${DIARY_BASE}/api/internal/tenant`, { method: 'DELETE', headers }, 15000).catch(() => null);
+          }
+          return json(res, ok ? 200 : 400, { ok });
+        } catch (e) { return json(res, 400, { error: e.message }); }
+      }
+      return json(res, 404, { error: 'not found' });
+    }
 
     if (p === '/api/workspace') {
       return json(res, 200, { projects: PROJECTS, freeChats: FREE_CHATS });
@@ -919,6 +1054,8 @@ async function handleRequest(req, res) {
           apiKeyMasked: maskKey(pr.apiKey),
           isDefault: pr.id === DEFAULT_PROVIDER_ID,
           managed: pr.id === DEFAULT_PROVIDER_ID && modelManager.enabled,
+          shared: !!pr.shared,
+          defaultModel: pr.defaultModel || undefined,
         })),
       });
     }
@@ -934,19 +1071,37 @@ async function handleRequest(req, res) {
       const label = String(body.label || '').trim().slice(0, 80);
       let baseUrl = String(body.baseUrl || '').trim().replace(/\/+$/, '');
       const apiKey = String(body.apiKey || '').trim();
+      const defaultModel = String(body.defaultModel || '').trim().slice(0, 200);
+      const shared = body.shared === true;
+      if (shared && authn.user.role !== 'admin') return json(res, 403, { error: 'administrator required for shared providers' });
       if (!label) return json(res, 400, { error: 'label required' });
       if (!/^https?:\/\//.test(baseUrl)) return json(res, 400, { error: 'baseUrl must be an http(s) URL' });
       const id = `prov-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      PROVIDERS.push({ id, label, baseUrl, apiKey });
+      PROVIDERS.push({ id, label, baseUrl, apiKey, defaultModel, shared });
       saveProviders(PROVIDERS);
-      return json(res, 200, { id, label, baseUrl, apiKeyMasked: maskKey(apiKey) });
+      return json(res, 200, { id, label, baseUrl, defaultModel, apiKeyMasked: maskKey(apiKey) });
+    }
+    if (p === '/api/providers/test' && req.method === 'POST') {
+      const body = await readJson(req);
+      const baseUrl = String(body.baseUrl || '').trim().replace(/\/+$/, '');
+      if (!/^https?:\/\//.test(baseUrl)) return json(res, 400, { error: 'valid baseUrl required' });
+      const headers = { 'Content-Type': 'application/json' };
+      if (body.apiKey) headers.Authorization = `Bearer ${String(body.apiKey)}`;
+      try {
+        const result = await fetchJson(`${baseUrl.replace(/\/v1$/, '')}/v1/models`, { headers }, 8000);
+        const models = Array.isArray(result.body?.data) ? result.body.data.map(m => m.id).filter(Boolean).slice(0, 100) : [];
+        return json(res, result.ok ? 200 : 502, result.ok ? { ok: true, models } : { error: `provider returned ${result.status}` });
+      } catch (e) { return json(res, 502, { error: e.message }); }
     }
     const provDel = p.match(/^\/api\/providers\/([^/]+)$/);
     if (provDel && req.method === 'DELETE') {
       const id = decodeURIComponent(provDel[1]);
       if (id === DEFAULT_PROVIDER_ID || id === 'lemonade') return json(res, 400, { error: 'the default provider cannot be removed' });
+      const selectedProvider = getProvider(id);
+      if (selectedProvider?.shared && authn.user.role !== 'admin') return json(res, 403, { error: 'administrator required' });
       const before = PROVIDERS.length;
-      PROVIDERS = PROVIDERS.filter((pr) => pr.id !== id);
+      const keptProviders = Array.from(PROVIDERS).filter((pr) => pr.id !== id);
+      PROVIDERS.splice(0, PROVIDERS.length, ...keptProviders);
       if (PROVIDERS.length === before) return json(res, 404, { error: 'no such provider' });
       saveProviders(PROVIDERS);
       // Projects pointing at the removed provider fall back to the configured default.
@@ -1003,7 +1158,7 @@ async function handleRequest(req, res) {
         if (!fast || !smart) return json(res, 400, { error: 'both fast and smart model names are required' });
         setAutoRoles({ fast, smart });
         ensureRolesLoaded(); // warm both models; never blocks the response
-        return json(res, 200, { configured: true, roles: AUTO_ROLES });
+        return json(res, 200, { configured: true, roles: autoRoles() });
       }
     }
 
@@ -1043,7 +1198,7 @@ async function handleRequest(req, res) {
       // Index any files that arrived with the create call (same RAG bookkeeping
       // as the config route).
       for (const f of project.files) {
-        rag.indexProjectFile(project.id, f.name, f.content)
+        rag.indexProjectFile(project.id, f.name, f.content, currentWorkspace().userId)
           .then((r) => console.log(`[rag] indexed ${project.id}/${f.name}:`, JSON.stringify(r)))
           .catch((err) => console.warn(`[rag] index failed for ${project.id}/${f.name}:`, err?.message || err));
       }
@@ -1054,13 +1209,14 @@ async function handleRequest(req, res) {
     if (projMatch && req.method === 'DELETE') {
       const id = decodeURIComponent(projMatch[1]);
       const before = PROJECTS.length;
-      PROJECTS = PROJECTS.filter((pr) => pr.id !== id);
+      const keptProjects = Array.from(PROJECTS).filter((pr) => pr.id !== id);
+      PROJECTS.splice(0, PROJECTS.length, ...keptProjects);
       if (PROJECTS.length === before) return json(res, 404, { error: 'no such project' });
       saveProjects(PROJECTS);
       // Drop the project's RAG index too (best-effort).
       try {
         for (const suffix of ['.db', '.db-wal', '.db-shm']) {
-          fs.rmSync(path.join(DATA_DIR, 'rag', `${id}${suffix}`), { force: true });
+          fs.rmSync(path.join(currentWorkspace().ragDir(), `${id}${suffix}`), { force: true });
         }
       } catch { /* best effort */ }
       return json(res, 200, { ok: true });
@@ -1109,12 +1265,12 @@ async function handleRequest(req, res) {
         const prevByName = new Map(prevFiles.map((f) => [f.name, f]));
         const nextNames = new Set(project.files.map((f) => f.name));
         for (const prev of prevFiles) {
-          if (!nextNames.has(prev.name)) rag.deleteProjectFile(id, prev.name);
+          if (!nextNames.has(prev.name)) rag.deleteProjectFile(id, prev.name, currentWorkspace().userId);
         }
         for (const next of project.files) {
           const prev = prevByName.get(next.name);
           if (!prev || prev.content !== next.content) {
-            rag.indexProjectFile(id, next.name, next.content)
+            rag.indexProjectFile(id, next.name, next.content, currentWorkspace().userId)
               .then((r) => console.log(`[rag] indexed ${id}/${next.name}:`, JSON.stringify(r)))
               .catch((err) => console.warn(`[rag] index failed for ${id}/${next.name}:`, err?.message || err));
           }
@@ -1170,7 +1326,7 @@ async function handleRequest(req, res) {
         try {
           const body = JSON.parse(raw);
           if (!Array.isArray(body.chats)) return json(res, 400, { error: 'chats array required' });
-          FREE_CHATS = body.chats
+          const nextFreeChats = body.chats
             .filter((c) => c && typeof c.id === 'string')
             .slice(0, 200)
             .map((c) => ({
@@ -1178,6 +1334,7 @@ async function handleRequest(req, res) {
               title: String(c.title || 'New chat').slice(0, 120),
               updatedAt: typeof c.updatedAt === 'number' ? c.updatedAt : Date.now(),
             }));
+          FREE_CHATS.splice(0, FREE_CHATS.length, ...nextFreeChats);
           saveFreeChats(FREE_CHATS);
           return json(res, 200, { ok: true });
         } catch {
