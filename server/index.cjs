@@ -1445,6 +1445,9 @@ async function handleRequestScoped(req, res) {
         inferenceUp: inference.status === 'fulfilled' && inference.value.ok,
         lemonadeUp: inference.status === 'fulfilled' && inference.value.ok,
         diaryUp: diaryEnabled ? diary.status === 'fulfilled' && diary.value.ok : null,
+        // True when project-file retrieval can run (native deps present).
+        // False means RAG is silently degraded to keyword-only context.
+        ragAvailable: rag.ragAvailable(),
       });
     }
 
