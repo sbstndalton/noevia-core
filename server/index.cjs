@@ -1590,6 +1590,55 @@ async function handleRequestScoped(req, res) {
       return json(res, 200, data);
     }
 
+    // Insights: on-demand AI commentary over the diary. Proxied to the
+    // sidecar, which guarantees the output is rendered-only — never written
+    // to the corpus, journal, or retrieval index.
+    if (p === '/api/diary/insights' && req.method === 'GET') {
+      if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
+      const r = await fetchJson(`${DIARY_BASE}/api/insights`, { headers: diaryHeaders() }, 30000);
+      if (!r.ok) return json(res, r.status >= 500 ? 502 : r.status, { error: `diary sidecar ${r.status}` });
+      return json(res, 200, r.body);
+    }
+
+    if (p === '/api/diary/insights/reflect' && req.method === 'POST') {
+      if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
+      let raw = '';
+      for await (const c of req) raw += c;
+      let body;
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        body = {};
+      }
+      const r = await fetchJson(
+        `${DIARY_BASE}/api/insights/reflect`,
+        { method: 'POST', headers: diaryHeaders(), body: JSON.stringify({ focus: (body && body.focus) || null }) },
+        120000,
+      );
+      if (!r.ok) return json(res, r.status >= 500 ? 502 : r.status, { error: (r.body && r.body.error) || (r.body && r.body.detail) || `diary sidecar ${r.status}` });
+      return json(res, 200, r.body);
+    }
+
+    if (p === '/api/diary/insights/about-question' && req.method === 'POST') {
+      if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
+      let raw = '';
+      for await (const c of req) raw += c;
+      let body;
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        return json(res, 400, { error: 'invalid JSON' });
+      }
+      if (!body || typeof body.question !== 'string' || !body.question.trim()) return json(res, 400, { error: 'question required' });
+      const r = await fetchJson(
+        `${DIARY_BASE}/api/insights/about-question`,
+        { method: 'POST', headers: diaryHeaders(), body: JSON.stringify({ question: body.question.trim() }) },
+        120000,
+      );
+      if (!r.ok) return json(res, r.status >= 500 ? 502 : r.status, { error: (r.body && r.body.error) || (r.body && r.body.detail) || `diary sidecar ${r.status}` });
+      return json(res, 200, r.body);
+    }
+
     // External diary-like sources: read-only detection + explicit one-file
     // import, proxied to the sidecar (which enforces the same per-user
     // tenancy as the rest of the diary routes).
