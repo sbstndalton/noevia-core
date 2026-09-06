@@ -190,9 +190,22 @@ function loadProviders() {
   return currentWorkspace().providers;
 }
 
-function saveProviders(providers) {
-  currentWorkspace().providers = Array.from(providers);
-  currentWorkspace().saveProviders();
+// Syncs the private half of the registry from the current merged view and
+// persists ONLY the user's private provider file. Shared rows are excluded:
+// a per-user save must never rewrite shared-providers.json (checkpoint 1c —
+// a stale snapshot could erase another admin's shared provider).
+function saveProviders() {
+  const ws = currentWorkspace();
+  ws.privateProviders = Array.from(ws.providers).filter((p) => !p.shared && p.id !== DEFAULT_PROVIDER_ID);
+  ws.saveProviders();
+}
+
+// Admin path: persists the shared half of the registry from the current
+// merged view (private rows are synced in memory only, untouched on disk).
+function saveSharedProviders() {
+  const ws = currentWorkspace();
+  ws.privateProviders = Array.from(ws.providers).filter((p) => !p.shared && p.id !== DEFAULT_PROVIDER_ID);
+  ws.saveShared();
 }
 
 const PROVIDERS = arrayProxy('providers');
@@ -231,7 +244,9 @@ function migrateLegacyProviderIds() {
   }
   if (changedProviders) {
     backupOnce('providers.json');
-    saveProviders(PROVIDERS);
+    const renamed = Array.from(PROVIDERS).filter((p) => p.id === DEFAULT_PROVIDER_ID);
+    if (renamed.some((p) => p.shared)) saveSharedProviders();
+    if (renamed.some((p) => !p.shared)) saveProviders();
   }
   if (changedProjects) {
     backupOnce('projects.json');
@@ -1139,7 +1154,7 @@ async function handleRequestScoped(req, res) {
       }
       const id = `prov-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       PROVIDERS.push({ id, label, baseUrl, apiKey, defaultModel, shared });
-      saveProviders(PROVIDERS);
+      if (shared) saveSharedProviders(); else saveProviders();
       return json(res, 200, { id, label, baseUrl, defaultModel, apiKeyMasked: maskKey(apiKey) });
     }
     if (p === '/api/providers/test' && req.method === 'POST') {
@@ -1169,7 +1184,11 @@ async function handleRequestScoped(req, res) {
       const keptProviders = Array.from(PROVIDERS).filter((pr) => pr.id !== id);
       PROVIDERS.splice(0, PROVIDERS.length, ...keptProviders);
       if (PROVIDERS.length === before) return json(res, 404, { error: 'no such provider' });
-      saveProviders(PROVIDERS);
+      // Deletion is admin-only for shared providers and owner/admin-only for
+      // private ones, so persisting both halves from the current view is safe
+      // and keeps the private and shared files in sync with the registry.
+      saveProviders();
+      saveSharedProviders();
       // Projects pointing at the removed provider fall back to the configured default.
       for (const pr of PROJECTS) {
         if (pr.provider === id) {

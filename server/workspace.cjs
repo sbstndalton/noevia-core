@@ -15,6 +15,11 @@ function atomicJson(file, value) {
 }
 
 function createWorkspaceStore(rootDir, defaultProvider, secrets) {
+  // Per-user workspaces are cached, but shared providers are NEVER baked
+  // into the cached object: the shared file is re-read and re-merged on
+  // every workspace access. This closes the load-time-merge race where a
+  // user with a long-cached workspace could rewrite shared-providers.json
+  // from a stale snapshot and silently erase an admin's shared provider.
   const cache = new Map();
   const usersDir = path.join(rootDir, 'users');
   const sharedFile = path.join(rootDir, 'shared-providers.json');
@@ -24,6 +29,12 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets) {
     for (const row of rows) row.apiKey = secrets ? secrets.decrypt(row.apiKey) : row.apiKey;
     if (!rows.some(p => p.id === defaultProvider.id)) rows.unshift({ ...defaultProvider, shared: true });
     return rows;
+  }
+
+  // Merge order mirrors the original load-time merge: shared rows first,
+  // then the user's private providers, de-duplicated against the default.
+  function mergeProviders(privateProviders) {
+    return [...loadShared(), ...privateProviders.filter(p => !p.shared && p.id !== defaultProvider.id)];
   }
 
   function userDir(userId) {
@@ -51,7 +62,12 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets) {
 
   function get(userId, { claim = false } = {}) {
     if (claim) claimLegacy(userId);
-    if (cache.has(userId)) return cache.get(userId);
+    const cached = cache.get(userId);
+    if (cached) {
+      cached.providers = mergeProviders(cached.privateProviders);
+      return cached;
+    }
+
     const dir = userDir(userId); fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     const projects = readJson(path.join(dir, 'projects.json'), { projects: [] }).projects || [];
     const providerFile = path.join(dir, 'providers.json');
@@ -66,22 +82,49 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets) {
     }
     const uniqueProviders = savedProviders.filter((provider, index, all) => all.findIndex(p => p.id === provider.id) === index);
     for (const project of projects) if (project.provider === 'lemonade') project.provider = defaultProvider.id;
-    const allProviders = [...loadShared(), ...uniqueProviders.filter(p => p.id !== defaultProvider.id)];
     const workspace = {
-      userId, dir, projects, providers: allProviders,
+      userId, dir, projects,
+      // `privateProviders` is the cached per-user truth; `providers` is the
+      // merged view rebuilt from disk on every get() so it always reflects
+      // the current shared set.
+      privateProviders: uniqueProviders.filter(p => p.id !== defaultProvider.id),
+      providers: [],
       freeChats: readJson(path.join(dir, 'free-chats.json'), []),
       autoRoles: readJson(path.join(dir, 'auto-roles.json'), null),
       saveProjects() { atomicJson(path.join(dir, 'projects.json'), { projects: this.projects }); },
       saveProviders() {
         const encode = p => ({ ...p, apiKey: secrets ? secrets.encrypt(p.apiKey) : p.apiKey });
-        atomicJson(providerFile, { providers: this.providers.filter(p => !p.shared).map(encode) });
-        atomicJson(sharedFile, { providers: this.providers.filter(p => p.shared).map(encode) });
+        // Adopt rows a consumer pushed directly onto the merged `providers`
+        // view (the historical push-then-save contract). Existing rows are
+        // shared by reference between the view and privateProviders, so
+        // edits to them are already visible here.
+        const sharedIds = new Set(loadShared().map(p => p.id));
+        for (const p of this.providers) {
+          if (!p.shared && !sharedIds.has(p.id) && p.id !== defaultProvider.id &&
+              !this.privateProviders.some(q => q.id === p.id)) {
+            this.privateProviders.push(p);
+          }
+        }
+        // Writes ONLY this user's private provider file. Never touches
+        // shared-providers.json — shared rows are managed exclusively via
+        // saveShared(), so a stale private save can't erase another
+        // admin's shared provider.
+        atomicJson(providerFile, { providers: this.privateProviders.map(encode) });
+        this.providers = mergeProviders(this.privateProviders);
+      },
+      // Admin path for shared-provider changes: persists the shared rows
+      // from the (freshly merged) current view, then re-merges from disk.
+      saveShared() {
+        const encode = p => ({ ...p, apiKey: secrets ? secrets.encrypt(p.apiKey) : p.apiKey });
+        atomicJson(sharedFile, { providers: this.providers.filter(p => p.shared && p.id !== defaultProvider.id).map(encode) });
+        this.providers = mergeProviders(this.privateProviders);
       },
       saveFreeChats() { atomicJson(path.join(dir, 'free-chats.json'), this.freeChats); },
       saveAutoRoles() { atomicJson(path.join(dir, 'auto-roles.json'), this.autoRoles); },
       historyPath(id) { return path.join(dir, `history-${String(id).replace(/[^a-zA-Z0-9_-]/g, '')}.json`); },
       ragDir() { return path.join(dir, 'rag'); },
     };
+    workspace.providers = mergeProviders(workspace.privateProviders);
     cache.set(userId, workspace);
     if (needsEncryption) workspace.saveProviders();
     return workspace;
