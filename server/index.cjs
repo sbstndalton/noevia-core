@@ -1540,6 +1540,41 @@ async function handleRequestScoped(req, res) {
       return json(res, 200, data);
     }
 
+    // External diary-like sources: read-only detection + explicit one-file
+    // import, proxied to the sidecar (which enforces the same per-user
+    // tenancy as the rest of the diary routes).
+    if (p === '/api/diary/external-sources') {
+      if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
+      const r = await fetchJson(`${DIARY_BASE}/api/external-sources`, { headers: diaryHeaders() }, 30000);
+      if (!r.ok) return json(res, r.status >= 500 ? 502 : r.status, { error: `diary sidecar ${r.status}` });
+      return json(res, 200, r.body);
+    }
+
+    if (p === '/api/diary/external-sources/import' && req.method === 'POST') {
+      if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
+      let raw = '';
+      for await (const c of req) raw += c;
+      let body;
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        return json(res, 400, { error: 'invalid JSON' });
+      }
+      if (!body || typeof body.sourcePath !== 'string' || typeof body.relPath !== 'string') {
+        return json(res, 400, { error: 'sourcePath and relPath required' });
+      }
+      const r = await fetchJson(
+        `${DIARY_BASE}/api/external-sources/import`,
+        { method: 'POST', headers: diaryHeaders(), body: JSON.stringify({ source_path: body.sourcePath, rel_path: body.relPath }) },
+        60000,
+      );
+      if (!r.ok) {
+        const detail = r.body?.detail || `diary sidecar ${r.status}`;
+        return json(res, r.status >= 500 ? 502 : r.status, { error: String(detail) });
+      }
+      return json(res, 200, r.body);
+    }
+
     if (p === '/api/chat' && req.method === 'POST') {
       let raw = '';
       for await (const c of req) raw += c;
