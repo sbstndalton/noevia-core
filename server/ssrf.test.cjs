@@ -198,3 +198,80 @@ test('admin can still test a private target (same exemption)', async () => {
   });
   assert.equal(response.status, 502);
 });
+
+// ── storage endpoints: same policy, more fetch points ────────────────────────
+
+const Database = require('better-sqlite3');
+const { createSecretStore } = require('./secrets.cjs');
+
+async function putStorage(headers, body) {
+  return request('/api/integrations/storage', {
+    method: 'PUT', headers: { ...headers, 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+test('admin is exempt from the storage denylist (LAN NAS / in-network Nextcloud)', async () => {
+  // Saving never fetches, so a private baseUrl must simply be accepted.
+  const response = await putStorage(adminHeaders, {
+    kind: 'webdav', baseUrl: 'http://192.168.1.50:5005/dav', username: 'admin', secret: 'pw', corpusRoot: 'Cowork',
+  });
+  assert.equal(response.status, 200);
+  assert.equal(JSON.parse(response.text).kind, 'webdav');
+});
+
+test('member cannot save a private-range storage connection', async () => {
+  const response = await putStorage(memberHeaders(), {
+    kind: 'webdav', baseUrl: 'http://10.0.0.5:5005/dav', username: 'u', secret: 'p', corpusRoot: 'Cowork',
+  });
+  assert.equal(response.status, 400);
+  assert.match(JSON.parse(response.text).error, /public endpoint/);
+  // Nothing was saved for the member.
+  const stored = await request('/api/integrations/storage', { headers: memberHeaders() });
+  assert.equal(JSON.parse(stored.text).kind, 'local');
+});
+
+test('member cannot run the storage connection test against a private target', async () => {
+  const response = await request('/api/integrations/storage/test', {
+    method: 'POST', headers: { ...memberHeaders(), 'content-type': 'application/json' },
+    body: JSON.stringify({ kind: 'webdav', baseUrl: 'http://169.254.169.254/remote.php/dav', username: 'u', secret: 'p', corpusRoot: '' }),
+  });
+  assert.equal(response.status, 400);
+  assert.match(JSON.parse(response.text).error, /public endpoint/);
+});
+
+test('member cannot browse or read through a saved private connection', async () => {
+  // Seed a connection bypassing saveStorage: simulates a connection saved by
+  // an admin account that was later demoted to member.
+  const secrets = createSecretStore(testDataDir);
+  const db = new Database(path.join(testDataDir, 'cowork.db'));
+  const admin = db.prepare("SELECT id FROM users WHERE username='admin'").get();
+  const member = db.prepare("SELECT id FROM users WHERE username='member'").get();
+  const adminRow = db.prepare('SELECT * FROM storage_connections WHERE user_id=?').get(admin.id);
+  assert.ok(adminRow, 'admin storage row exists for the ciphertext copy');
+  db.prepare('INSERT INTO storage_connections(user_id,kind,base_url,bucket,username,secret,corpus_root,updated_at) VALUES(?,?,?,?,?,?,?,?)')
+    .run(member.id, 'webdav', 'http://169.254.169.254/dav', '', 'u', adminRow.secret, 'Cowork', Date.now());
+
+  const browse = await request('/api/integrations/storage/files', { headers: memberHeaders() });
+  assert.equal(browse.status, 400);
+  assert.match(JSON.parse(browse.text).error, /public endpoint/);
+
+  const read = await request('/api/integrations/storage/file', {
+    method: 'POST', headers: { ...memberHeaders(), 'content-type': 'application/json' },
+    body: JSON.stringify({ path: 'notes.md' }),
+  });
+  assert.equal(read.status, 400);
+  assert.match(JSON.parse(read.text).error, /public endpoint/);
+
+  db.prepare('DELETE FROM storage_connections WHERE user_id=?').run(member.id);
+  db.close();
+});
+
+test('member cannot start a Nextcloud login flow against a private host', async () => {
+  const response = await request('/api/integrations/storage/nextcloud/start', {
+    method: 'POST', headers: { ...memberHeaders(), 'content-type': 'application/json' },
+    body: JSON.stringify({ baseUrl: 'https://10.1.2.3:8080' }),
+  });
+  assert.equal(response.status, 400);
+  assert.match(JSON.parse(response.text).error, /public endpoint/);
+});

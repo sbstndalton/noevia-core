@@ -2,12 +2,11 @@
 
 // Private-network denylist for user-supplied outbound URL targets.
 //
-// The provider registry lets authenticated members connect arbitrary
-// OpenAI-compatible endpoints. Without a guard, a member can point a
-// provider at an internal/RFC1918 address or a cloud metadata endpoint
-// and trigger outbound requests to it (via the connection test or a
-// chat), using the server's network position for SSRF. Administrators
-// are exempt: local-inference deployments legitimately target
+// Authenticated members can register outbound targets: OpenAI-compatible
+// providers (connection test + chat) and storage connections (test, browse,
+// read, diary corpus sync). Without a guard, a member can point any of those
+// at an internal/RFC1918 address or a cloud metadata endpoint and use the
+// server's network position for SSRF. Administrators are exempt:
 // loopback/host.docker.internal addresses, and only an admin can
 // configure those.
 

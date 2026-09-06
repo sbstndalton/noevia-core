@@ -168,6 +168,17 @@ function diaryHeaders() {
   return h;
 }
 
+// SSRF guard for storage endpoints. A member must not aim the server's
+// outbound traffic — connection tests, file browsing, diary corpus sync — at
+// internal addresses (RFC1918, link-local metadata, …). Admins are exempt: a
+// self-hosted administrator legitimately connects LAN storage (a home NAS,
+// an in-network Nextcloud). Same policy as the provider registry.
+const STORAGE_PRIVATE_URL_ERROR = 'storage URL must be a public endpoint (contact an administrator to connect a private or local server)';
+async function storageEndpointAllowed(authn, rawUrl) {
+  if (authn.user.role === 'admin') return true;
+  return isPublicUrl(String(rawUrl || ''));
+}
+
 // ── Projects config: instructions, files, memories, model ─────────────────
 
 function loadProjects() {
@@ -1043,6 +1054,9 @@ async function handleRequestScoped(req, res) {
     if (storageBrowse && req.method === 'GET') {
       const connection = authService.getStorage(authn.user.id, true);
       if (!storageClient.isBrowsable(connection)) return json(res, 400, { error: 'no browsable storage connected (local storage needs no browsing — upload files directly)' });
+      // Defense in depth: also guard connections saved before the save-time
+      // guard existed, and saved by an admin that has since been demoted.
+      if (!(await storageEndpointAllowed(authn, connection.baseUrl))) return json(res, 400, { error: STORAGE_PRIVATE_URL_ERROR });
       try {
         const entries = await storageClient.listFiles(connection, decodeURIComponent(storageBrowse[1] || ''));
         return json(res, 200, { entries });
@@ -1055,6 +1069,7 @@ async function handleRequestScoped(req, res) {
       const body = await readJson(req);
       const connection = authService.getStorage(authn.user.id, true);
       if (!storageClient.isBrowsable(connection)) return json(res, 400, { error: 'no browsable storage connected' });
+      if (!(await storageEndpointAllowed(authn, connection.baseUrl))) return json(res, 400, { error: STORAGE_PRIVATE_URL_ERROR });
       try {
         const file = await storageClient.readTextFile(connection, body.path);
         return json(res, 200, file);
@@ -1068,12 +1083,20 @@ async function handleRequestScoped(req, res) {
       if (body.kind !== 'local' && (!/^https?:\/\//.test(String(body.baseUrl || '')) || !body.username || !body.secret)) {
         return json(res, 400, { error: 'server URL, username, and app password are required' });
       }
+      // This is the choke point: everything downstream (tests, browsing,
+      // diary corpus sync to the sidecar) fetches the *saved* baseUrl.
+      if (body.kind !== 'local' && !(await storageEndpointAllowed(authn, body.baseUrl))) {
+        return json(res, 400, { error: STORAGE_PRIVATE_URL_ERROR });
+      }
       return json(res, 200, authService.saveStorage(authn.user.id, body));
     }
     if (p === '/api/integrations/storage/test' && req.method === 'POST') {
       const body = await readJson(req);
       if (body.kind === 'local') return json(res, 200, { ok: true });
       const saved = body.useSaved ? authService.getStorage(authn.user.id, true) : body;
+      if (saved.kind !== 'local' && !(await storageEndpointAllowed(authn, saved.baseUrl))) {
+        return json(res, 400, { error: STORAGE_PRIVATE_URL_ERROR });
+      }
       if (saved.kind === 's3') {
         // S3 probe: a signed bucket listing proves endpoint reachability,
         // bucket existence, and the credentials in one shot.
@@ -1102,6 +1125,7 @@ async function handleRequestScoped(req, res) {
     if (p === '/api/integrations/storage/nextcloud/start' && req.method === 'POST') {
       const baseUrl = String((await readJson(req)).baseUrl || '').replace(/\/+$/, '');
       if (!/^https:\/\//.test(baseUrl)) return json(res, 400, { error: 'HTTPS Nextcloud URL required' });
+      if (!(await storageEndpointAllowed(authn, baseUrl))) return json(res, 400, { error: STORAGE_PRIVATE_URL_ERROR });
       try {
         const response = await fetch(`${baseUrl}/index.php/login/v2`, { method: 'POST', signal: AbortSignal.timeout(10000) });
         if (!response.ok) return json(res, 502, { error: `Nextcloud returned ${response.status}` });
@@ -1113,6 +1137,9 @@ async function handleRequestScoped(req, res) {
     if (p === '/api/integrations/storage/nextcloud/poll' && req.method === 'POST') {
       const body = await readJson(req); const flow = nextcloudFlows.get(String(body.flowId || ''));
       if (!flow || flow.userId !== authn.user.id || flow.expires < Date.now()) return json(res, 400, { error: 'login flow expired' });
+      // The poll endpoint comes from the remote server's own response, so a
+      // malicious Nextcloud could redirect it inward — guard it too.
+      if (!(await storageEndpointAllowed(authn, flow.endpoint))) return json(res, 400, { error: STORAGE_PRIVATE_URL_ERROR });
       const response = await fetch(flow.endpoint, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ token: flow.token }), signal: AbortSignal.timeout(10000) });
       if (response.status === 404) return json(res, 202, { pending: true });
       if (!response.ok) return json(res, 502, { error: `Nextcloud returned ${response.status}` });
