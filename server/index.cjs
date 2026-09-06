@@ -108,6 +108,9 @@ function unauthorized(res) {
 async function fetchJson(url, opts, timeoutMs) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs || 15000);
+  // Honor a caller-supplied signal (e.g. client disconnect) in addition to the timeout.
+  const external = opts && opts.signal;
+  if (external) external.addEventListener('abort', () => ctrl.abort(), { once: true });
   try {
     const res = await fetch(url, { ...opts, signal: ctrl.signal });
     const text = await res.text();
@@ -666,6 +669,21 @@ async function handleChat(req, res, body) {
   const { spaceId, message, history } = body || {};
   if (!message || typeof message !== 'string') return json(res, 400, { error: 'message required' });
 
+  // Client-disconnect handling: if the browser goes away mid-generation,
+  // abort the upstream fetches and stop the tool-round loop instead of
+  // streaming into a dead socket. ServerResponse 'close' fires both when the
+  // response completes and when the connection terminates prematurely — only
+  // the premature case (end() never called) means the client is gone.
+  // (IncomingMessage 'close' is not usable here: it fires as soon as the
+  // request body has been read, long before the response finishes.)
+  const chatSignal = new AbortController();
+  res.on('close', () => {
+    if (!res.writableEnded) chatSignal.abort();
+  });
+  // A write to a socket the client already killed must not surface as an
+  // unhandled 'error' and crash the (single) server process.
+  res.on('error', () => {});
+
   const msgs = (Array.isArray(history) ? history : [])
     .filter((h) => h && (h.role === 'user' || h.role === 'assistant') && typeof h.content === 'string' && h.content)
     .slice(-HISTORY_CAP)
@@ -719,11 +737,18 @@ async function handleChat(req, res, body) {
 
   // ── Diary tab: sidecar pipeline, called exactly once (no retry, no stream) ──
   if (spaceId === 'diary') {
-    const full = await fetchJson(
-      `${DIARY_BASE}/v1/chat/completions`,
-      { method: 'POST', headers: diaryHeaders(), body: JSON.stringify({ messages: msgs }) },
-      300000,
-    );
+    let full;
+    try {
+      full = await fetchJson(
+        `${DIARY_BASE}/v1/chat/completions`,
+        { method: 'POST', headers: diaryHeaders(), body: JSON.stringify({ messages: msgs }), signal: chatSignal.signal },
+        300000,
+      );
+    } catch (err) {
+      if (chatSignal.signal.aborted) return; // client went away mid-generation
+      throw err;
+    }
+    if (chatSignal.signal.aborted) return;
     if (!full.ok) {
       const detail = typeof full.body === 'string' ? full.body.slice(0, 200) : JSON.stringify(full.body || {}).slice(0, 200);
       return json(res, 502, { error: `diary sidecar ${full.status}: ${detail}` });
@@ -792,8 +817,10 @@ async function handleChat(req, res, body) {
         method: 'POST',
         headers: upstreamHeaders,
         body: JSON.stringify({ model, messages: roundMessages, stream: true, tools: TOOL_DEFS }),
+        signal: chatSignal.signal,
       });
     } catch (err) {
+      if (chatSignal.signal.aborted) break; // client went away; stop quietly
       if (round === 0) return json(res, 502, { error: `${provider.label} unreachable: ${err.message}` });
       send({ type: 'error', text: `${provider.label} unreachable: ${err.message}` });
       break;
@@ -808,9 +835,12 @@ async function handleChat(req, res, body) {
 
     const toolCalls = new Map(); // index -> {id, name, args}
     let sawAnything = false;
+    // SSE line reassembly must live outside the chunk loop so a `data: {...}`
+    // line split across a chunk boundary keeps its leading fragment
+    // (same pattern as the client-side reader in src/api.ts).
+    let buffer = '';
     try {
       for await (const chunk of upstream.body) {
-        let buffer = '';
         buffer += decoder.decode(chunk, { stream: true });
         let idx;
         while ((idx = buffer.indexOf('\n')) !== -1) {
@@ -852,6 +882,7 @@ async function handleChat(req, res, body) {
         }
       }
     } catch (err) {
+      if (chatSignal.signal.aborted) break; // client went away; stop quietly
       send({ type: 'error', text: String(err?.message || err) });
       break;
     }
@@ -862,7 +893,7 @@ async function handleChat(req, res, body) {
       try {
         const full = await fetchJson(
           upstreamUrl,
-          { method: 'POST', headers: upstreamHeaders, body: JSON.stringify({ model, messages: roundMessages, tools: TOOL_DEFS }) },
+          { method: 'POST', headers: upstreamHeaders, body: JSON.stringify({ model, messages: roundMessages, tools: TOOL_DEFS }), signal: chatSignal.signal },
           300000,
         );
         const msg = full.body?.choices?.[0]?.message;
@@ -880,18 +911,26 @@ async function handleChat(req, res, body) {
       }
     }
 
-    if (round === 2 || toolCalls.size === 0) break; // last round or no tools requested
-
     // Execute each requested tool and append assistant tool_calls + results.
-    const assistantMsg = { role: 'assistant', content: null, tool_calls: [...toolCalls.entries()].map(([i, tc]) => ({ id: tc.id, type: 'function', function: { name: tc.name, arguments: tc.args } })) };
-    roundMessages = [...roundMessages, assistantMsg];
-    for (const [, tc] of toolCalls) {
-      const result = executeToolCall(project, tc.name, tc.args);
-      send({ type: 'tool_result', name: tc.name, text: result.slice(0, 300) });
-      roundMessages.push({ role: 'tool', tool_call_id: tc.id, content: result });
+    // This runs even on the final round: the client has already received the
+    // `tool` events, so leaving the calls unexecuted would strand them with no
+    // result ever arriving. After the last round the loop ends (the results
+    // cannot be fed back to the model), but they are still streamed to the
+    // user instead of dangling.
+    if (toolCalls.size > 0) {
+      const assistantMsg = { role: 'assistant', content: null, tool_calls: [...toolCalls.entries()].map(([i, tc]) => ({ id: tc.id, type: 'function', function: { name: tc.name, arguments: tc.args } })) };
+      roundMessages = [...roundMessages, assistantMsg];
+      for (const [, tc] of toolCalls) {
+        const result = executeToolCall(project, tc.name, tc.args);
+        send({ type: 'tool_result', name: tc.name, text: result.slice(0, 300) });
+        roundMessages.push({ role: 'tool', tool_call_id: tc.id, content: result });
+      }
     }
+
+    if (round === 2 || toolCalls.size === 0) break; // last round or no tools requested
   }
 
+  if (chatSignal.signal.aborted) return; // client gone — nothing more to write
   send({ type: 'done', model });
   res.end();
 }
