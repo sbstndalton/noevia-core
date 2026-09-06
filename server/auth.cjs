@@ -2,6 +2,7 @@
 
 const crypto = require('crypto');
 const fs = require('fs');
+const net = require('net');
 const path = require('path');
 const Database = require('better-sqlite3');
 const { hash, verify, Algorithm } = require('@node-rs/argon2');
@@ -16,6 +17,63 @@ const USERNAME_RE = /^[A-Za-z0-9._-]{3,32}$/;
 const IDLE_MS = 7 * 24 * 60 * 60 * 1000;
 const ABSOLUTE_MS = 30 * 24 * 60 * 60 * 1000;
 const CHALLENGE_MS = 5 * 60 * 1000;
+
+// Client IP resolution. By default the direct socket address is used.
+// Behind a reverse proxy (a documented first-class deployment), every
+// request would otherwise appear to come from the proxy IP, collapsing
+// per-IP rate limiting into one shared bucket and making audit-log IPs
+// useless. When trustProxy is enabled, the rightmost X-Forwarded-For
+// entry is used: it is the value the trusted proxy appended, so a client
+// cannot spoof it via its own leftmost XFF entries. The header is only
+// consulted when trustProxy is on, and its value must parse as an IP.
+function clientAddress(req, trustProxy = false) {
+  const remote = String(req.socket?.remoteAddress || 'unknown');
+  if (!trustProxy) return remote;
+  const forwarded = String(req.headers['x-forwarded-for'] || '');
+  const entries = forwarded.split(',').map((s) => s.trim()).filter(Boolean);
+  const candidate = entries[entries.length - 1] || '';
+  if (candidate && net.isIP(candidate)) return candidate;
+  return remote;
+}
+
+// Fixed-window rate limiter with bounded memory: expired entries are swept
+// periodically, and a hard cap plus eviction bound the map even under a
+// flood of unique keys (the old map grew forever, one permanent entry per
+// distinct key). Exported for tests.
+function createRateLimiter({ sweepMs = 60 * 1000, maxEntries = 10000 } = {}) {
+  const map = new Map();
+  let lastSweep = Date.now();
+  function sweep(now) {
+    for (const [key, entry] of map) {
+      if (entry.reset <= now) map.delete(key);
+    }
+  }
+  return {
+    rateLimited(key, limit = 5, windowMs = 15 * 60 * 1000) {
+      const now = Date.now();
+      if (now - lastSweep >= sweepMs) {
+        lastSweep = now;
+        sweep(now);
+      }
+      if (!map.has(key) && map.size >= maxEntries) sweep(now); // reclaim space first
+      if (!map.has(key) && map.size >= maxEntries) {
+        // Still full after sweeping: hard-evict oldest-inserted entries.
+        for (const oldest of map.keys()) {
+          map.delete(oldest);
+          if (map.size < maxEntries) break;
+        }
+      }
+      const current = map.get(key);
+      if (!current || current.reset <= now) {
+        map.set(key, { count: 1, reset: now + windowMs });
+        return false;
+      }
+      current.count += 1;
+      return current.count > limit;
+    },
+    size: () => map.size,
+  };
+}
 
 function randomToken(bytes = 32) {
   return crypto.randomBytes(bytes).toString('base64url');
@@ -34,11 +92,7 @@ function parseCookies(req) {
   return out;
 }
 
-function clientAddress(req) {
-  return String(req.socket?.remoteAddress || 'unknown');
-}
-
-function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompat = false, secrets = null }) {
+function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompat = false, secrets = null, trustProxy = false }) {
   fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   const db = new Database(path.join(dataDir, 'cowork.db'));
   db.pragma('journal_mode = WAL');
@@ -112,16 +166,9 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
     console.warn(`Setup code file: ${setupFile} (deleted after setup)`);
   }
 
-  const rate = new Map();
+  const rate = createRateLimiter();
   function rateLimited(key, limit = 5, windowMs = 15 * 60 * 1000) {
-    const now = Date.now();
-    const current = rate.get(key);
-    if (!current || current.reset <= now) {
-      rate.set(key, { count: 1, reset: now + windowMs });
-      return false;
-    }
-    current.count += 1;
-    return current.count > limit;
+    return rate.rateLimited(key, limit, windowMs);
   }
 
   function publicUser(row) {
@@ -136,7 +183,7 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
     const csrf = randomToken();
     const now = Date.now();
     db.prepare('INSERT INTO sessions(id_hash,user_id,csrf_hash,created_at,last_seen_at,expires_at,user_agent,ip) VALUES(?,?,?,?,?,?,?,?)')
-      .run(digest(raw), user.id, digest(csrf), now, now, now + ABSOLUTE_MS, String(req.headers['user-agent'] || '').slice(0, 300), clientAddress(req));
+      .run(digest(raw), user.id, digest(csrf), now, now, now + ABSOLUTE_MS, String(req.headers['user-agent'] || '').slice(0, 300), clientAddress(req, trustProxy));
     const secure = origin.startsWith('https://') ? '; Secure' : '';
     res.setHeader('Set-Cookie', [
       `cowork_session=${raw}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${ABSOLUTE_MS / 1000}${secure}`,
@@ -208,7 +255,7 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
     db, get origin() { return origin; }, get rpId() { return relyingPartyId; }, userCount, authenticate, csrfValid, originValid, publicUser, issueSession,
     async setup(req, res, body) {
       if (userCount() !== 0) return { status: 409, body: { error: 'setup already complete' } };
-      if (rateLimited(`setup:${clientAddress(req)}`)) return { status: 429, body: { error: 'try again later' } };
+      if (rateLimited(`setup:${clientAddress(req, trustProxy)}`)) return { status: 429, body: { error: 'try again later' } };
       const expected = db.prepare("SELECT value FROM settings WHERE key='setup_code_hash'").get()?.value;
       if (!expected || digest(body.setupCode || '') !== expected) return { status: 401, body: { error: 'setup could not be completed' } };
       if (!USERNAME_RE.test(String(body.username || ''))) return { status: 400, body: { error: 'invalid username' } };
@@ -234,7 +281,7 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       return { status: 201, body: { user: publicUser(user), csrfToken: issueSession(req, res, user), migrationRequired: true } };
     },
     async passwordLogin(req, res, body) {
-      const key = `login:${clientAddress(req)}:${String(body.username || '').toLowerCase()}`;
+      const key = `login:${clientAddress(req, trustProxy)}:${String(body.username || '').toLowerCase()}`;
       if (rateLimited(key)) return { status: 429, body: { error: 'sign-in failed' } };
       const row = db.prepare('SELECT * FROM users WHERE username_norm=?').get(String(body.username || '').toLowerCase());
       const ok = row && !row.disabled_at ? await verify(row.password_hash, String(body.password || '')).catch(() => false) : false;
@@ -383,4 +430,4 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
   };
 }
 
-module.exports = { createAuth, USERNAME_RE, digest };
+module.exports = { createAuth, USERNAME_RE, digest, createRateLimiter, clientAddress };

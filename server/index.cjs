@@ -52,6 +52,7 @@ const authService = createAuth({
   legacyToken: UI_AUTH_TOKEN,
   legacyCompat: process.env.LEGACY_AUTH_COMPAT === 'true',
   secrets: secretStore,
+  trustProxy: process.env.TRUST_PROXY === 'true',
 });
 if (process.env.LEMONADE_BASE_URL && !process.env.INFERENCE_BASE_URL) console.warn('LEMONADE_BASE_URL is deprecated; use INFERENCE_BASE_URL');
 if (process.env.LEMONADE_API_KEY && !process.env.INFERENCE_API_KEY) console.warn('LEMONADE_API_KEY is deprecated; use INFERENCE_API_KEY');
