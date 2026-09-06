@@ -642,23 +642,19 @@ const corpusSource =
         name: 'sidecar',
         async listMonths() {
           // Real month list from the sidecar (PROPFIND over the corpus dir).
-          // Tolerant: on failure, fall back to just the current month so the
-          // Diary tab still renders today's file.
-          const now = new Date();
-          const currentId = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
-          const currentLabel = now.toLocaleString('en-US', { month: 'long', year: 'numeric' });
+          // Returns only months that actually have a corpus file — the client
+          // synthesizes a "Today" entry itself, and a first-run user must see
+          // an empty list so the diary zero-state can trigger. Tolerant: on
+          // failure, return an empty list (today's file still renders when
+          // navigated to directly).
           try {
             const r = await fetchJson(`${DIARY_BASE}/api/months`, { headers: diaryHeaders() }, 15000);
-            const months = (r.ok && Array.isArray(r.body?.months) ? r.body.months : [])
+            return (r.ok && Array.isArray(r.body?.months) ? r.body.months : [])
               .filter((m) => m && typeof m.id === 'string' && /^\d{4}-\d{2}$/.test(m.id))
-              .map((m) => ({ id: m.id, label: m.label || m.id }));
-            if (!months.some((m) => m.id === currentId)) {
-              months.push({ id: currentId, label: currentLabel });
-            }
-            months.sort((a, b) => a.id.localeCompare(b.id));
-            return months;
+              .map((m) => ({ id: m.id, label: m.label || m.id }))
+              .sort((a, b) => a.id.localeCompare(b.id));
           } catch {
-            return [{ id: currentId, label: currentLabel }];
+            return [];
           }
         },
         async readMonth(monthId) {
