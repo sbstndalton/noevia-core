@@ -23,6 +23,7 @@ const path = require('path');
 const { URL } = require('url');
 const { AsyncLocalStorage } = require('async_hooks');
 const rag = require('./rag.cjs');
+const storageClient = require('./storage-client.cjs');
 const { createModelManager } = require('./model-manager.cjs');
 const { createAuth } = require('./auth.cjs');
 const { createWorkspaceStore } = require('./workspace.cjs');
@@ -1028,6 +1029,33 @@ async function handleRequestScoped(req, res) {
       return json(res, 200, authService.markOnboarded(authn.user.id));
     }
     if (p === '/api/integrations/storage' && req.method === 'GET') return json(res, 200, authService.getStorage(authn.user.id));
+    // Browse/read over the user's own connected storage (project knowledge
+    // intake; read-only). The saved connection's own credentials are used
+    // server-side and never returned to the client.
+    const storageBrowse = p.match(/^\/api\/integrations\/storage\/files(?:\/(.*))?$/);
+    if (storageBrowse && req.method === 'GET') {
+      const connection = authService.getStorage(authn.user.id, true);
+      if (!storageClient.isBrowsable(connection)) return json(res, 400, { error: 'no browsable storage connected (local storage needs no browsing — upload files directly)' });
+      try {
+        const entries = await storageClient.listFiles(connection, decodeURIComponent(storageBrowse[1] || ''));
+        return json(res, 200, { entries });
+      } catch (e) {
+        return json(res, 502, { error: e?.message || 'storage browse failed' });
+      }
+    }
+    const storageRead = p.match(/^\/api\/integrations\/storage\/file$/);
+    if (storageRead && req.method === 'POST') {
+      const body = await readJson(req);
+      const connection = authService.getStorage(authn.user.id, true);
+      if (!storageClient.isBrowsable(connection)) return json(res, 400, { error: 'no browsable storage connected' });
+      try {
+        const file = await storageClient.readTextFile(connection, body.path);
+        return json(res, 200, file);
+      } catch (e) {
+        const status = e && e.status ? e.status : 502;
+        return json(res, status, { error: e?.message || 'storage read failed' });
+      }
+    }
     if (p === '/api/integrations/storage' && req.method === 'PUT') {
       const body = await readJson(req);
       if (body.kind !== 'local' && (!/^https?:\/\//.test(String(body.baseUrl || '')) || !body.username || !body.secret)) {
