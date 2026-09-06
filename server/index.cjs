@@ -27,6 +27,7 @@ const { createModelManager } = require('./model-manager.cjs');
 const { createAuth } = require('./auth.cjs');
 const { createWorkspaceStore } = require('./workspace.cjs');
 const { createSecretStore } = require('./secrets.cjs');
+const { isPublicUrl } = require('./ssrf.cjs');
 
 const PORT = Number(process.env.UI_PORT || 8021);
 const HOST = process.env.UI_HOST || '0.0.0.0';
@@ -665,7 +666,7 @@ const corpusSource =
 
 // ── Chat ────────────────────────────────────────────────────────────────────
 
-async function handleChat(req, res, body) {
+async function handleChat(req, res, body, authn) {
   const { spaceId, message, history } = body || {};
   if (!message || typeof message !== 'string') return json(res, 400, { error: 'message required' });
 
@@ -799,6 +800,18 @@ async function handleChat(req, res, body) {
   // providers like OpenRouter use https://host/api/v1).
   const upstreamUrl = `${provider.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`;
   const upstreamHeaders = providerHeaders(provider);
+
+  // SSRF guard for member-registered providers (see the /api/providers POST
+  // guard): a member must not reach internal addresses through a chat pinned
+  // to a provider they registered themselves. Admin-configured providers
+  // (the env default, or shared ones) may legitimately point at private
+  // addresses (local inference), and member chat through them is the normal
+  // default-deployment path — so only the member's own private providers
+  // are subject to the denylist here.
+  const memberOwnProvider = authn && authn.user.role !== 'admin' && !provider.shared && provider.id !== DEFAULT_PROVIDER_ID;
+  if (memberOwnProvider && !(await isPublicUrl(upstreamUrl))) {
+    return json(res, 400, { error: 'provider URL must be a public endpoint (contact an administrator to connect a local or private endpoint)' });
+  }
 
   res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
   send({ type: 'meta', model, chatId: chatId || undefined, route: routedRole || undefined });
@@ -1118,6 +1131,12 @@ async function handleRequestScoped(req, res) {
       if (shared && authn.user.role !== 'admin') return json(res, 403, { error: 'administrator required for shared providers' });
       if (!label) return json(res, 400, { error: 'label required' });
       if (!/^https?:\/\//.test(baseUrl)) return json(res, 400, { error: 'baseUrl must be an http(s) URL' });
+      // SSRF guard: a member must not register an endpoint the server can
+      // only reach from its own internal network (RFC1918, metadata, etc.).
+      // Admins are exempt — local-inference setups legitimately do this.
+      if (authn.user.role !== 'admin' && !(await isPublicUrl(baseUrl))) {
+        return json(res, 400, { error: 'provider URL must be a public endpoint (contact an administrator to connect a local or private endpoint)' });
+      }
       const id = `prov-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       PROVIDERS.push({ id, label, baseUrl, apiKey, defaultModel, shared });
       saveProviders(PROVIDERS);
@@ -1127,6 +1146,11 @@ async function handleRequestScoped(req, res) {
       const body = await readJson(req);
       const baseUrl = String(body.baseUrl || '').trim().replace(/\/+$/, '');
       if (!/^https?:\/\//.test(baseUrl)) return json(res, 400, { error: 'valid baseUrl required' });
+      // Same SSRF guard as registration: the test route must not become a
+      // prober for internal addresses on behalf of a member.
+      if (authn.user.role !== 'admin' && !(await isPublicUrl(baseUrl))) {
+        return json(res, 400, { error: 'provider URL must be a public endpoint (contact an administrator to connect a local or private endpoint)' });
+      }
       const headers = { 'Content-Type': 'application/json' };
       if (body.apiKey) headers.Authorization = `Bearer ${String(body.apiKey)}`;
       try {
@@ -1509,7 +1533,7 @@ async function handleRequestScoped(req, res) {
       if (body.spaceId === 'diary' && !authService.diaryEnabled(authn.user.id)) {
         return json(res, 404, { error: 'Diary add-on is disabled' });
       }
-      return handleChat(req, res, body);
+      return handleChat(req, res, body, authn);
     }
 
     // Unused legacy spaces endpoints removed with the spaces UI (v4).
@@ -1533,7 +1557,9 @@ async function handleRequestScoped(req, res) {
 
     // Static files with SPA fallback.
     let filePath = path.normalize(path.join(DIST_DIR, p === '/' ? 'index.html' : p));
-    if (!filePath.startsWith(DIST_DIR)) return json(res, 403, { error: 'forbidden' });
+    // path.sep suffix check: a bare startsWith(DIST_DIR) would also accept a
+    // sibling directory like `${DIST_DIR}-evil`.
+    if (filePath !== DIST_DIR && !filePath.startsWith(DIST_DIR + path.sep)) return json(res, 403, { error: 'forbidden' });
     if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
       if (!SPAFallbacks.includes(p)) return json(res, 404, { error: 'not found' });
       filePath = path.join(DIST_DIR, 'index.html');
