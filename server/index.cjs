@@ -1625,6 +1625,35 @@ async function handleRequestScoped(req, res) {
       return json(res, 200, r.body);
     }
 
+    if (p === '/api/diary/entries/edit' && req.method === 'POST') {
+      // Diary integrity guarantee: editing past entries is an explicit,
+      // human-initiated correction routed to the sidecar's guarded, journaled
+      // edit endpoint. The assistant never rewrites the user's own words on
+      // its own; the xid identifies exactly one logged exchange.
+      if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
+      let raw = '';
+      for await (const c of req) raw += c;
+      let body;
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        return json(res, 400, { error: 'invalid JSON' });
+      }
+      if (!body || typeof body.xid !== 'string' || typeof body.me !== 'string' || (body.assistant !== undefined && typeof body.assistant !== 'string')) {
+        return json(res, 400, { error: 'xid and me required' });
+      }
+      const r = await fetchJson(
+        `${DIARY_BASE}/api/entries/edit`,
+        { method: 'POST', headers: diaryHeaders(), body: JSON.stringify({ xid: body.xid, me: body.me, assistant: body.assistant || '', month: body.month || null }) },
+        60000,
+      );
+      if (!r.ok) {
+        const detail = r.body?.detail || r.body?.error || `diary sidecar ${r.status}`;
+        return json(res, r.status >= 500 ? 502 : r.status, { error: String(detail) });
+      }
+      return json(res, 200, r.body);
+    }
+
     if (p === '/api/chat' && req.method === 'POST') {
       let raw = '';
       for await (const c of req) raw += c;
