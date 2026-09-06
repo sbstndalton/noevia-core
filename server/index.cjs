@@ -1017,13 +1017,20 @@ async function handleRequestScoped(req, res) {
     if (p.startsWith('/api/models/') && !['GET', 'HEAD'].includes(req.method || 'GET') && authn.user.role !== 'admin') {
       return json(res, 403, { error: 'administrator required' });
     }
-    if (p === '/api/profile' && req.method === 'GET') return json(res, 200, { user: authn.user, passkeys: authService.listPasskeys(authn.user.id), sessions: authService.listSessions(authn.user.id) });
+    if (p === '/api/profile' && req.method === 'GET') return json(res, 200, { user: authn.user, passkeys: authService.listPasskeys(authn.user.id), sessions: authService.listSessions(authn.user.id), insightsBadge: authService.insightsBadgeEnabled(authn.user.id) });
     if (p === '/api/profile' && req.method === 'PATCH') {
       const body = await readJson(req); authService.updateProfile(authn.user.id, body.displayName);
       return json(res, 200, { ok: true });
     }
     if (p === '/api/profile/features' && req.method === 'PUT') {
       return json(res, 200, authService.setDiaryEnabled(authn.user.id, !!(await readJson(req)).diaryEnabled));
+    }
+    if (p === '/api/profile/insights-badge' && req.method === 'PUT') {
+      return json(res, 200, authService.setInsightsBadge(authn.user.id, !!(await readJson(req)).enabled));
+    }
+    if (p === '/api/profile/insights-badge' && req.method === 'DELETE') {
+      authService.markInsightsSeen(authn.user.id);
+      return json(res, 200, { ok: true });
     }
     if (p === '/api/profile/onboarding' && req.method === 'POST') {
       return json(res, 200, authService.markOnboarded(authn.user.id));
@@ -1484,10 +1491,23 @@ async function handleRequestScoped(req, res) {
     if (p === '/api/health') {
       const defaultProvider = getProvider(DEFAULT_PROVIDER_ID);
       const diaryEnabled = authService.diaryEnabled(authn.user.id);
-      const [inference, diary] = await Promise.allSettled([
+      const [inference, diary, insightsMeta] = await Promise.allSettled([
         fetchJson(`${defaultProvider.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/models`, { headers: providerHeaders(defaultProvider) }, 5000),
         diaryEnabled ? fetchJson(`${DIARY_BASE}/api/health`, { headers: diaryHeaders() }, 5000) : Promise.resolve({ ok: false }),
+        diaryEnabled && authService.insightsBadgeEnabled(authn.user.id)
+          ? fetchJson(`${DIARY_BASE}/api/insights`, { headers: diaryHeaders() }, 5000)
+          : Promise.resolve({ ok: false }),
       ]);
+      // Opt-in badge: a subtle "standing sections have new activity" dot, only
+      // for users who asked for it. Fires when the diary's last standing-section
+      // journal update is newer than the user's last Insights visit, capped at
+      // two weeks so a long-dormant corpus never looks permanently un-read.
+      let insightsFresh = false;
+      if (insightsMeta.status === 'fulfilled' && insightsMeta.value.ok && typeof insightsMeta.value.body?.last_change === 'number') {
+        const seen = authService.insightsSeenAt(authn.user.id) || 0;
+        const twoWeeks = 14 * 24 * 3600 * 1000;
+        insightsFresh = insightsMeta.value.body.last_change * 1000 > Math.max(seen, Date.now() - twoWeeks);
+      }
       return json(res, 200, {
         inferenceUp: inference.status === 'fulfilled' && inference.value.ok,
         lemonadeUp: inference.status === 'fulfilled' && inference.value.ok,
@@ -1495,6 +1515,7 @@ async function handleRequestScoped(req, res) {
         // True when project-file retrieval can run (native deps present).
         // False means RAG is silently degraded to keyword-only context.
         ragAvailable: rag.ragAvailable(),
+        insightsFresh,
       });
     }
 

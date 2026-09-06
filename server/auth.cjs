@@ -165,6 +165,18 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
     db.exec("ALTER TABLE storage_connections ADD COLUMN bucket TEXT NOT NULL DEFAULT ''");
   }
   db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(4, unixepoch() * 1000)').run();
+  // v5: opt-in Insights badge. insights_badge is the user's preference (off by
+  // default — proactive surfacing must never be assumed for something this
+  // personal); insights_seen_at is the epoch-ms timestamp of the last time the
+  // user looked at the Insights view, so the badge only fires on genuinely new
+  // standing-section activity. Both guarded column adds.
+  if (!db.prepare('PRAGMA table_info(user_features)').all().some((c) => c.name === 'insights_badge')) {
+    db.exec('ALTER TABLE user_features ADD COLUMN insights_badge INTEGER NOT NULL DEFAULT 0');
+  }
+  if (!db.prepare('PRAGMA table_info(user_features)').all().some((c) => c.name === 'insights_seen_at')) {
+    db.exec('ALTER TABLE user_features ADD COLUMN insights_seen_at INTEGER');
+  }
+  db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(5, unixepoch() * 1000)').run();
 
   const configuredOrigin = db.prepare("SELECT value FROM settings WHERE key='public_origin'").get()?.value;
   let origin = publicOrigin || configuredOrigin || '';
@@ -421,6 +433,25 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
         .run(userId, enabled ? 1 : 0, Date.now());
       audit('feature.diary', userId, userId, { enabled: !!enabled });
       return { diaryEnabled: !!enabled };
+    },
+    insightsBadgeEnabled(userId) {
+      return !!db.prepare('SELECT insights_badge FROM user_features WHERE user_id=?').get(userId)?.insights_badge;
+    },
+    setInsightsBadge(userId, enabled) {
+      // UPSERT preserving the row's existing diary_enabled (read fresh rather
+      // than trusting the caller to send it).
+      db.prepare(`INSERT INTO user_features(user_id,diary_enabled,insights_badge,updated_at) VALUES(?,?,?,?)
+        ON CONFLICT(user_id) DO UPDATE SET insights_badge=excluded.insights_badge,updated_at=excluded.updated_at`)
+        .run(userId, this.diaryEnabled(userId) ? 1 : 0, enabled ? 1 : 0, Date.now());
+      audit('feature.insights_badge', userId, userId, { enabled: !!enabled });
+      return { insightsBadge: !!enabled };
+    },
+    markInsightsSeen(userId) {
+      db.prepare('UPDATE user_features SET insights_seen_at=?,updated_at=? WHERE user_id=?')
+        .run(Date.now(), Date.now(), userId);
+    },
+    insightsSeenAt(userId) {
+      return db.prepare('SELECT insights_seen_at FROM user_features WHERE user_id=?').get(userId)?.insights_seen_at ?? null;
     },
     markOnboarded(userId) {
       db.prepare(`INSERT INTO user_features(user_id,diary_enabled,onboarded,updated_at) VALUES(?,?,1,?)
