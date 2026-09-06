@@ -136,7 +136,8 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
     );
     CREATE TABLE IF NOT EXISTS storage_connections(
       user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-      kind TEXT NOT NULL, base_url TEXT NOT NULL DEFAULT '', username TEXT NOT NULL DEFAULT '',
+      kind TEXT NOT NULL, base_url TEXT NOT NULL DEFAULT '', bucket TEXT NOT NULL DEFAULT '',
+      username TEXT NOT NULL DEFAULT '',
       secret TEXT NOT NULL DEFAULT '', corpus_root TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS user_features(
@@ -158,6 +159,12 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       UPDATE user_features SET onboarded = 1;`);
   }
   db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(3, unixepoch() * 1000)').run();
+  // v4: bucket column for S3-compatible storage connections. Column add is
+  // guarded because fresh databases already include it in the CREATE TABLE.
+  if (!db.prepare('PRAGMA table_info(storage_connections)').all().some((c) => c.name === 'bucket')) {
+    db.exec("ALTER TABLE storage_connections ADD COLUMN bucket TEXT NOT NULL DEFAULT ''");
+  }
+  db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(4, unixepoch() * 1000)').run();
 
   const configuredOrigin = db.prepare("SELECT value FROM settings WHERE key='public_origin'").get()?.value;
   let origin = publicOrigin || configuredOrigin || '';
@@ -425,21 +432,21 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       const user = db.prepare('SELECT * FROM users WHERE id=?').get(userId); if (!user || user.username !== username) return false;
       if (user.role === 'admin' && db.prepare("SELECT count(*) AS n FROM users WHERE role='admin'").get().n <= 1) throw new Error('cannot delete the last administrator');
       db.prepare('DELETE FROM users WHERE id=?').run(userId); audit('user.delete', actorId, userId); return true;
-    },
-    getStorage(userId, includeSecret = false) {
+    },    getStorage(userId, includeSecret = false) {
       const row = db.prepare('SELECT * FROM storage_connections WHERE user_id=?').get(userId);
-      if (!row) return { kind: 'local', baseUrl: '', username: '', corpusRoot: '' };
+      if (!row) return { kind: 'local', baseUrl: '', bucket: '', username: '', corpusRoot: '' };
       const plain = secrets ? secrets.decrypt(row.secret) : row.secret;
-      return { kind: row.kind, baseUrl: row.base_url, username: row.username, corpusRoot: row.corpus_root,
+      return { kind: row.kind, baseUrl: row.base_url, bucket: row.bucket || '', username: row.username, corpusRoot: row.corpus_root,
         secret: includeSecret ? plain : undefined, secretConfigured: !!plain };
     },
     saveStorage(userId, value) {
-      const kind = ['local', 'nextcloud', 'webdav'].includes(value.kind) ? value.kind : 'local';
+      const kind = ['local', 'nextcloud', 'webdav', 's3'].includes(value.kind) ? value.kind : 'local';
       const encrypted = secrets ? secrets.encrypt(value.secret || '') : (value.secret || '');
-      db.prepare(`INSERT INTO storage_connections(user_id,kind,base_url,username,secret,corpus_root,updated_at)
-        VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET kind=excluded.kind,base_url=excluded.base_url,
-        username=excluded.username,secret=excluded.secret,corpus_root=excluded.corpus_root,updated_at=excluded.updated_at`)
-        .run(userId, kind, String(value.baseUrl || '').replace(/\/+$/, ''), String(value.username || ''), encrypted, String(value.corpusRoot || ''), Date.now());
+      db.prepare(`INSERT INTO storage_connections(user_id,kind,base_url,bucket,username,secret,corpus_root,updated_at)
+        VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET kind=excluded.kind,base_url=excluded.base_url,
+        bucket=excluded.bucket,username=excluded.username,secret=excluded.secret,corpus_root=excluded.corpus_root,updated_at=excluded.updated_at`)
+        .run(userId, kind, String(value.baseUrl || '').replace(/\/+$/, ''), String(value.bucket || '').replace(/\/+$/, ''),
+          String(value.username || ''), encrypted, String(value.corpusRoot || ''), Date.now());
       audit('storage.update', userId, userId, { kind });
       return this.getStorage(userId);
     },

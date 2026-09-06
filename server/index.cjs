@@ -1039,6 +1039,25 @@ async function handleRequestScoped(req, res) {
       const body = await readJson(req);
       if (body.kind === 'local') return json(res, 200, { ok: true });
       const saved = body.useSaved ? authService.getStorage(authn.user.id, true) : body;
+      if (saved.kind === 's3') {
+        // S3 probe: a signed bucket listing proves endpoint reachability,
+        // bucket existence, and the credentials in one shot.
+        try {
+          const { signS3Request } = require('./s3-sign.cjs');
+          const endpoint = String(saved.baseUrl || '').replace(/\/+$/, '');
+          if (!/^https?:\/\//.test(endpoint)) return json(res, 400, { error: 'Endpoint URL must start with http:// or https://' });
+          const bucket = String(saved.bucket || '').trim();
+          if (!bucket) return json(res, 400, { error: 'Bucket is required' });
+          const target = `${endpoint}/${encodeURIComponent(bucket)}?list-type=2&max-keys=1`;
+          const signed = signS3Request('GET', new URL(target), '', saved.username || '', saved.secret || '');
+          const response = await fetch(target, { headers: signed, signal: AbortSignal.timeout(10000) });
+          if (response.ok) return json(res, 200, { ok: true });
+          const detail = response.status === 403 ? ' — check the access key and secret'
+            : response.status === 404 ? ' — no such bucket'
+            : response.status === 400 ? ' — server rejected the request (unsupported endpoint?)' : '';
+          return json(res, 502, { error: `S3 returned ${response.status}${detail}` });
+        } catch (e) { return json(res, 502, { error: e.message }); }
+      }
       try {
         const target = `${String(saved.baseUrl).replace(/\/+$/, '')}/${String(saved.corpusRoot || '').split('/').map(encodeURIComponent).join('/')}`;
         const response = await fetch(target, { method: 'PROPFIND', headers: { Authorization: `Basic ${Buffer.from(`${saved.username}:${saved.secret}`).toString('base64')}`, Depth: '0' }, signal: AbortSignal.timeout(10000) });
