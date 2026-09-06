@@ -141,13 +141,23 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
     );
     CREATE TABLE IF NOT EXISTS user_features(
       user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-      diary_enabled INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL
+      diary_enabled INTEGER NOT NULL DEFAULT 0, onboarded INTEGER NOT NULL DEFAULT 1, updated_at INTEGER NOT NULL
     );
     INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(1, unixepoch() * 1000);
     INSERT OR IGNORE INTO user_features(user_id, diary_enabled, updated_at)
       SELECT id, 1, unixepoch() * 1000 FROM users;
     INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(2, unixepoch() * 1000);
   `);
+  // v3: per-user onboarding flag. Default 1 = pre-wizard (legacy, invited, or
+  // already-completed) users are never bounced into the setup wizard; the
+  // first-run wizard explicitly sets 0 for the account it creates and flips it
+  // back to 1 when onboarding finishes. Column add is guarded because fresh
+  // databases already include it in the CREATE TABLE above.
+  if (!db.prepare('PRAGMA table_info(user_features)').all().some((c) => c.name === 'onboarded')) {
+    db.exec(`ALTER TABLE user_features ADD COLUMN onboarded INTEGER NOT NULL DEFAULT 1;
+      UPDATE user_features SET onboarded = 1;`);
+  }
+  db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(3, unixepoch() * 1000)').run();
 
   const configuredOrigin = db.prepare("SELECT value FROM settings WHERE key='public_origin'").get()?.value;
   let origin = publicOrigin || configuredOrigin || '';
@@ -173,9 +183,9 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
 
   function publicUser(row) {
     if (!row) return null;
-    const feature = db.prepare('SELECT diary_enabled FROM user_features WHERE user_id=?').get(row.id);
+    const feature = db.prepare('SELECT diary_enabled, onboarded FROM user_features WHERE user_id=?').get(row.id);
     return { id: row.id, username: row.username, displayName: row.display_name, role: row.role,
-      disabled: !!row.disabled_at, diaryEnabled: !!feature?.diary_enabled };
+      disabled: !!row.disabled_at, diaryEnabled: !!feature?.diary_enabled, onboarded: !!(feature?.onboarded ?? 1) };
   }
 
   function issueSession(req, res, user) {
@@ -269,8 +279,8 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       const tx = db.transaction(() => {
         db.prepare('INSERT INTO users(id,username,username_norm,display_name,role,password_hash,webauthn_user_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)')
           .run(id, body.username, body.username.toLowerCase(), String(body.displayName || body.username).trim().slice(0, 80), 'admin', passwordHash, randomToken(32), now, now);
-        db.prepare('INSERT INTO user_features(user_id,diary_enabled,updated_at) VALUES(?,?,?)')
-          .run(id, body.diaryEnabled ? 1 : 0, now);
+        db.prepare('INSERT INTO user_features(user_id,diary_enabled,onboarded,updated_at) VALUES(?,?,?,?)')
+          .run(id, body.diaryEnabled ? 1 : 0, 0, now);
         db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('public_origin',?)").run(selectedOrigin);
         db.prepare("DELETE FROM settings WHERE key='setup_code_hash'").run();
       });
@@ -404,6 +414,12 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
         .run(userId, enabled ? 1 : 0, Date.now());
       audit('feature.diary', userId, userId, { enabled: !!enabled });
       return { diaryEnabled: !!enabled };
+    },
+    markOnboarded(userId) {
+      db.prepare(`INSERT INTO user_features(user_id,diary_enabled,onboarded,updated_at) VALUES(?,?,1,?)
+        ON CONFLICT(user_id) DO UPDATE SET onboarded=1,updated_at=excluded.updated_at`)
+        .run(userId, 0, Date.now());
+      return { onboarded: true };
     },
     deleteUser(actorId, userId, username) {
       const user = db.prepare('SELECT * FROM users WHERE id=?').get(userId); if (!user || user.username !== username) return false;

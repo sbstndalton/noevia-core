@@ -1028,6 +1028,9 @@ async function handleRequestScoped(req, res) {
     if (p === '/api/profile/features' && req.method === 'PUT') {
       return json(res, 200, authService.setDiaryEnabled(authn.user.id, !!(await readJson(req)).diaryEnabled));
     }
+    if (p === '/api/profile/onboarding' && req.method === 'POST') {
+      return json(res, 200, authService.markOnboarded(authn.user.id));
+    }
     if (p === '/api/integrations/storage' && req.method === 'GET') return json(res, 200, authService.getStorage(authn.user.id));
     if (p === '/api/integrations/storage' && req.method === 'PUT') {
       const body = await readJson(req);
