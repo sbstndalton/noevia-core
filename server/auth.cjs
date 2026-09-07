@@ -79,6 +79,22 @@ function randomToken(bytes = 32) {
   return crypto.randomBytes(bytes).toString('base64url');
 }
 
+// Mirrors apps/web/src/browser-support.ts's classifyOrigin() — keep in sync.
+// A private-network http:// origin is accepted so first-run setup works by
+// just loading the app at a bare LAN IP; a public http:// domain is not —
+// that must use https.
+function isAcceptablePublicOrigin(originStr) {
+  let u;
+  try { u = new URL(originStr); } catch { return false; }
+  if (u.protocol === 'https:') return true;
+  if (u.protocol !== 'http:') return false;
+  const host = u.hostname;
+  if (host === 'localhost' || host === '127.0.0.1' || host === '::1') return true;
+  if (/^10\./.test(host) || /^192\.168\./.test(host) || /^172\.(1[6-9]|2\d|3[01])\./.test(host)) return true;
+  if (host !== '' && !host.includes('.') && !host.includes(':')) return true; // bare LAN hostname
+  return false;
+}
+
 function digest(value) {
   return crypto.createHash('sha256').update(String(value)).digest('hex');
 }
@@ -300,7 +316,9 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       if (!expected || digest(body.setupCode || '') !== expected) return { status: 401, body: { error: 'setup could not be completed' } };
       if (!USERNAME_RE.test(String(body.username || ''))) return { status: 400, body: { error: 'invalid username' } };
       const selectedOrigin = String(body.publicOrigin || origin || '').replace(/\/$/, '');
-      if (!/^https:\/\/[^/]+$/.test(selectedOrigin) && !/^http:\/\/localhost(?::\d+)?$/.test(selectedOrigin)) return { status: 400, body: { error: 'a secure public origin is required' } };
+      if (!isAcceptablePublicOrigin(selectedOrigin)) {
+        return { status: 400, body: { error: 'use https://, or a private-network address (a LAN IP, a bare LAN hostname, or localhost) over http://' } };
+      }
       let passwordHash;
       try { passwordHash = await createPasswordHash(body.password); } catch (e) { return { status: 400, body: { error: e.message } }; }
       const now = Date.now(); const id = crypto.randomUUID();

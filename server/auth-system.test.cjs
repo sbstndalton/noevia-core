@@ -82,6 +82,39 @@ test('additionalOrigins allows password login from a second origin (e.g. a LAN I
   fs.rmSync(root, { recursive: true, force: true });
 });
 
+test('setup() accepts private-network http origins so first-run works at a bare LAN IP', async (t) => {
+  // Regression for: "pull the container, load the host's LAN IP, set up there"
+  // failed at account creation because setup() only accepted https:// or
+  // http://localhost. A private-network address is now accepted (the wizard
+  // warns that passkeys will not work there); a public http:// domain is not.
+  const cases = [
+    { origin: 'http://10.0.0.5:8021', status: 201, why: 'private LAN IP' },
+    { origin: 'http://192.168.1.20:8021', status: 201, why: 'private LAN IP (192.168/16)' },
+    { origin: 'http://172.16.4.4:8021', status: 201, why: 'private LAN IP (172.16/12)' },
+    { origin: 'http://myserver:8021', status: 201, why: 'bare LAN hostname' },
+    { origin: 'http://localhost:8021', status: 201, why: 'loopback (regression check)' },
+    { origin: 'https://cowork.example.test', status: 201, why: 'public https' },
+    { origin: 'http://example.com', status: 400, why: 'public http domain' },
+    { origin: 'http://172.32.0.1:8021', status: 400, why: 'public IP outside 172.16/12' },
+    { origin: 'ftp://myserver', status: 400, why: 'non-http scheme' },
+    { origin: 'not a url', status: 400, why: 'unparseable' },
+  ];
+  for (const { origin, status, why } of cases) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cowork-origin-'));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    // The server boots with a valid configured origin; what is under test is
+    // the origin the wizard submits, so only the setup body varies.
+    const auth = createAuth({ dataDir: root, publicOrigin: 'http://localhost:8021', secrets: createSecretStore(root) });
+    const setupCode = fs.readFileSync(path.join(root, 'first-run-setup-code'), 'utf8').trim();
+    const result = await auth.setup(request(), response(), {
+      setupCode, publicOrigin: origin, username: 'Owner', displayName: 'Owner',
+      password: 'correct horse battery staple', diaryEnabled: false,
+    });
+    assert.equal(result.status, status, `${why}: ${origin}`);
+    if (status === 201) assert.equal(auth.origin, origin);
+  }
+});
+
 test('provider secrets are encrypted on disk and decrypt for their owner', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cowork-secrets-'));
   const secrets = createSecretStore(root); const id = '22222222-2222-4222-8222-222222222222';
