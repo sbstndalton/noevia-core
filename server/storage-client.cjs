@@ -83,10 +83,15 @@ function davHeaders(conn, extra) {
 async function davList(conn, fullPath) {
   // fullPath is the complete DAV path (corpusRoot included) of the dir to list.
   const target = davUrl(conn, fullPath, true);
+  // redirect:'error' everywhere in this module: a compromised or malicious
+  // endpoint must not be able to bounce a request inward (to RFC1918 or the
+  // cloud metadata address) and have us follow it. A server that redirects
+  // should be configured by its final URL instead.
   const response = await withRetry(() => fetch(target, {
     method: 'PROPFIND',
     headers: davHeaders(conn, { Depth: '1', 'Content-Type': 'application/xml' }),
     signal: AbortSignal.timeout(15000),
+    redirect: 'error',
   }));
   if (response.status === 404) return [];
   if (!response.ok && response.status !== 207) throw new Error(`storage returned ${response.status}`);
@@ -119,6 +124,7 @@ async function davRead(conn, fullPath) {
     method: 'GET',
     headers: davHeaders(conn, {}),
     signal: AbortSignal.timeout(20000),
+    redirect: 'error',
   }));
   if (!response.ok) throw new Error(`storage returned ${response.status}`);
   return response.text();
@@ -143,6 +149,7 @@ async function s3List(conn, connectionPath) {
   const response = await withRetry(() => fetch(url, {
     headers: signS3Request('GET', url, '', conn.username || '', conn.secret || ''),
     signal: AbortSignal.timeout(15000),
+    redirect: 'error',
   }));
   if (!response.ok) throw new Error(`storage returned ${response.status}`);
   const body = await response.text();
@@ -169,6 +176,7 @@ async function s3Read(conn, connectionPath) {
   const response = await withRetry(() => fetch(url, {
     headers: signS3Request('GET', url, '', conn.username || '', conn.secret || ''),
     signal: AbortSignal.timeout(20000),
+    redirect: 'error',
   }));
   if (!response.ok) throw new Error(`storage returned ${response.status}`);
   return response.text();

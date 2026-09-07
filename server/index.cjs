@@ -855,6 +855,7 @@ async function handleChat(req, res, body, authn) {
         headers: upstreamHeaders,
         body: JSON.stringify({ model, messages: roundMessages, stream: true, tools: TOOL_DEFS }),
         signal: chatSignal.signal,
+        redirect: 'error', // see the provider test route: no inward bounces
       });
     } catch (err) {
       if (chatSignal.signal.aborted) break; // client went away; stop quietly
@@ -1108,7 +1109,7 @@ async function handleRequestScoped(req, res) {
           if (!bucket) return json(res, 400, { error: 'Bucket is required' });
           const target = `${endpoint}/${encodeURIComponent(bucket)}?list-type=2&max-keys=1`;
           const signed = signS3Request('GET', new URL(target), '', saved.username || '', saved.secret || '');
-          const response = await fetch(target, { headers: signed, signal: AbortSignal.timeout(10000) });
+          const response = await fetch(target, { headers: signed, signal: AbortSignal.timeout(10000), redirect: 'error' });
           if (response.ok) return json(res, 200, { ok: true });
           const detail = response.status === 403 ? ' — check the access key and secret'
             : response.status === 404 ? ' — no such bucket'
@@ -1118,7 +1119,7 @@ async function handleRequestScoped(req, res) {
       }
       try {
         const target = `${String(saved.baseUrl).replace(/\/+$/, '')}/${String(saved.corpusRoot || '').split('/').map(encodeURIComponent).join('/')}`;
-        const response = await fetch(target, { method: 'PROPFIND', headers: { Authorization: `Basic ${Buffer.from(`${saved.username}:${saved.secret}`).toString('base64')}`, Depth: '0' }, signal: AbortSignal.timeout(10000) });
+        const response = await fetch(target, { method: 'PROPFIND', headers: { Authorization: `Basic ${Buffer.from(`${saved.username}:${saved.secret}`).toString('base64')}`, Depth: '0' }, signal: AbortSignal.timeout(10000), redirect: 'error' });
         return json(res, response.ok || response.status === 207 ? 200 : 502, response.ok || response.status === 207 ? { ok: true } : { error: `WebDAV returned ${response.status}` });
       } catch (e) { return json(res, 502, { error: e.message }); }
     }
@@ -1127,7 +1128,7 @@ async function handleRequestScoped(req, res) {
       if (!/^https:\/\//.test(baseUrl)) return json(res, 400, { error: 'HTTPS Nextcloud URL required' });
       if (!(await storageEndpointAllowed(authn, baseUrl))) return json(res, 400, { error: STORAGE_PRIVATE_URL_ERROR });
       try {
-        const response = await fetch(`${baseUrl}/index.php/login/v2`, { method: 'POST', signal: AbortSignal.timeout(10000) });
+        const response = await fetch(`${baseUrl}/index.php/login/v2`, { method: 'POST', signal: AbortSignal.timeout(10000), redirect: 'error' });
         if (!response.ok) return json(res, 502, { error: `Nextcloud returned ${response.status}` });
         const payload = await response.json(); const flowId = crypto.randomUUID();
         nextcloudFlows.set(flowId, { userId: authn.user.id, endpoint: payload.poll.endpoint, token: payload.poll.token, expires: Date.now() + 10 * 60 * 1000 });
@@ -1140,7 +1141,7 @@ async function handleRequestScoped(req, res) {
       // The poll endpoint comes from the remote server's own response, so a
       // malicious Nextcloud could redirect it inward — guard it too.
       if (!(await storageEndpointAllowed(authn, flow.endpoint))) return json(res, 400, { error: STORAGE_PRIVATE_URL_ERROR });
-      const response = await fetch(flow.endpoint, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ token: flow.token }), signal: AbortSignal.timeout(10000) });
+      const response = await fetch(flow.endpoint, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ token: flow.token }), signal: AbortSignal.timeout(10000), redirect: 'error' });
       if (response.status === 404) return json(res, 202, { pending: true });
       if (!response.ok) return json(res, 502, { error: `Nextcloud returned ${response.status}` });
       const credentials = await response.json(); nextcloudFlows.delete(String(body.flowId));
@@ -1250,7 +1251,9 @@ async function handleRequestScoped(req, res) {
       const headers = { 'Content-Type': 'application/json' };
       if (body.apiKey) headers.Authorization = `Bearer ${String(body.apiKey)}`;
       try {
-        const result = await fetchJson(`${baseUrl.replace(/\/v1$/, '')}/v1/models`, { headers }, 8000);
+        // redirect:'error' — same rationale as the storage client: a member-
+        // registered endpoint must not bounce the request inward.
+        const result = await fetchJson(`${baseUrl.replace(/\/v1$/, '')}/v1/models`, { headers, redirect: 'error' }, 8000);
         const models = Array.isArray(result.body?.data) ? result.body.data.map(m => m.id).filter(Boolean).slice(0, 100) : [];
         return json(res, result.ok ? 200 : 502, result.ok ? { ok: true, models } : { error: `provider returned ${result.status}` });
       } catch (e) { return json(res, 502, { error: e.message }); }
