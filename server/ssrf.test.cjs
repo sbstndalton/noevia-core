@@ -158,7 +158,7 @@ test('member cannot register a private-range provider', async () => {
     body: JSON.stringify({ label: 'Evil', baseUrl: 'http://169.254.169.254/v1' }),
   });
   assert.equal(response.status, 400);
-  assert.match(JSON.parse(response.text).error, /public endpoint/);
+  assert.match(JSON.parse(response.text).error, /approved/i);
 });
 
 test('member cannot probe a private target through the provider test route', async () => {
@@ -167,17 +167,16 @@ test('member cannot probe a private target through the provider test route', asy
     body: JSON.stringify({ baseUrl: 'http://10.9.8.7:8080/v1' }),
   });
   assert.equal(response.status, 400);
-  assert.match(JSON.parse(response.text).error, /public endpoint/);
+  assert.match(JSON.parse(response.text).error, /approved/i);
 });
 
-test('member can register a public-IP provider', async () => {
+test('member cannot register an unapproved public-IP provider', async () => {
   // IP literal: no DNS, fully deterministic offline.
   const response = await request('/api/providers', {
     method: 'POST', headers: memberHeaders(),
     body: JSON.stringify({ label: 'Cloud provider', baseUrl: 'https://93.184.216.34/v1' }),
   });
-  assert.equal(response.status, 200);
-  assert.ok(JSON.parse(response.text).id);
+  assert.equal(response.status, 400);
 });
 
 test('admin is exempt from the denylist (local inference targets private addresses)', async () => {
@@ -225,7 +224,7 @@ test('member cannot save a private-range storage connection', async () => {
     kind: 'webdav', baseUrl: 'http://10.0.0.5:5005/dav', username: 'u', secret: 'p', corpusRoot: 'Cowork',
   });
   assert.equal(response.status, 400);
-  assert.match(JSON.parse(response.text).error, /public endpoint/);
+  assert.match(JSON.parse(response.text).error, /approved/i);
   // Nothing was saved for the member.
   const stored = await request('/api/integrations/storage', { headers: memberHeaders() });
   assert.equal(JSON.parse(stored.text).kind, 'local');
@@ -237,7 +236,7 @@ test('member cannot run the storage connection test against a private target', a
     body: JSON.stringify({ kind: 'webdav', baseUrl: 'http://169.254.169.254/remote.php/dav', username: 'u', secret: 'p', corpusRoot: '' }),
   });
   assert.equal(response.status, 400);
-  assert.match(JSON.parse(response.text).error, /public endpoint/);
+  assert.match(JSON.parse(response.text).error, /approved/i);
 });
 
 test('member cannot browse or read through a saved private connection', async () => {
@@ -254,14 +253,14 @@ test('member cannot browse or read through a saved private connection', async ()
 
   const browse = await request('/api/integrations/storage/files', { headers: memberHeaders() });
   assert.equal(browse.status, 400);
-  assert.match(JSON.parse(browse.text).error, /public endpoint/);
+  assert.match(JSON.parse(browse.text).error, /approved/i);
 
   const read = await request('/api/integrations/storage/file', {
     method: 'POST', headers: { ...memberHeaders(), 'content-type': 'application/json' },
     body: JSON.stringify({ path: 'notes.md' }),
   });
   assert.equal(read.status, 400);
-  assert.match(JSON.parse(read.text).error, /public endpoint/);
+  assert.match(JSON.parse(read.text).error, /approved/i);
 
   db.prepare('DELETE FROM storage_connections WHERE user_id=?').run(member.id);
   db.close();
@@ -273,5 +272,21 @@ test('member cannot start a Nextcloud login flow against a private host', async 
     body: JSON.stringify({ baseUrl: 'https://10.1.2.3:8080' }),
   });
   assert.equal(response.status, 400);
-  assert.match(JSON.parse(response.text).error, /public endpoint/);
+  assert.match(JSON.parse(response.text).error, /approved/i);
+});
+
+
+test('member can connect an operator-approved origin, but not a lookalike origin', async () => {
+  process.env.MEMBER_OUTBOUND_ORIGINS = 'https://approved.example.com';
+  try {
+    for (const [baseUrl, status] of [['https://approved.example.com/v1', 200], ['https://approved.example.com.evil.test/v1', 400], ['https://approved.example.com:8443/v1', 400]]) {
+      const response = await request('/api/providers', {method:'POST', headers:memberHeaders(), body:JSON.stringify({label:'Approved', baseUrl})});
+      assert.equal(response.status, status);
+    }
+  } finally { delete process.env.MEMBER_OUTBOUND_ORIGINS; }
+});
+
+test('member cannot read operator import folders', async () => {
+  const response = await request('/api/diary/external-sources', {headers:memberHeaders()});
+  assert.equal(response.status, 403);
 });

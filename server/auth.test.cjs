@@ -37,6 +37,7 @@ async function request(url, { method = 'GET', headers = {}, body = '' } = {}) {
   res.headersSent = false;
   res.setHeader = (name, value) => { responseHeaders[name] = value; };
   res.writeHead = (status, nextHeaders = {}) => {
+    if (res.headersSent) throw Object.assign(new Error('headers already sent'), {code:'ERR_HTTP_HEADERS_SENT'});
     res.statusCode = status;
     res.headersSent = true;
     Object.assign(responseHeaders, nextHeaders);
@@ -110,4 +111,58 @@ test('protects provider creation with the same API guard', async () => {
 test('does not require auth for the static application shell', async () => {
   const response = await request('/');
   assert.notEqual(response.status, 401);
+});
+
+const adminHeaders = { authorization: 'Bearer test-cowork-token', 'content-type': 'application/json' };
+
+test('provider DELETE removes private and shared providers through the real route', async () => {
+  for (const shared of [false, true]) {
+    const created = await request('/api/providers', {method:'POST', headers:adminHeaders, body:JSON.stringify({label:'Disposable', baseUrl:'https://example.invalid', shared})});
+    const id = JSON.parse(created.text).id;
+    assert.ok(id);
+    const deleted = await request(`/api/providers/${id}`, {method:'DELETE', headers:adminHeaders});
+    assert.equal(deleted.status, 200);
+    const listed = await request('/api/providers', {headers:adminHeaders});
+    assert.ok(!JSON.parse(listed.text).providers.some(p => p.id === id));
+  }
+});
+
+test('chat reports upstream errors in SSE without writing headers twice', async (t) => {
+  const project = await request('/api/projects', {method:'POST', headers:adminHeaders, body:JSON.stringify({name:'Failure test', model:'model'})});
+  const projectId = JSON.parse(project.text).id;
+  for (const fetchStub of [async () => { throw new Error('offline'); }, async () => new Response('unavailable', {status:503})]) {
+    t.mock.method(global, 'fetch', fetchStub);
+    const result = await request('/api/chat', {method:'POST', headers:adminHeaders, body:JSON.stringify({projectId, chatId:'test', message:'hello'})});
+    assert.equal(result.status, 200);
+    assert.match(result.text, /"type":"error"/);
+    assert.match(result.text, /"type":"done"/);
+    t.mock.restoreAll();
+  }
+});
+
+test('empty SSE fallback refuses redirects and reconstructs split SSE lines', async (t) => {
+  const created = await request('/api/projects', {method:'POST', headers:adminHeaders, body:JSON.stringify({name:'Stream test', model:'model'})});
+  const projectId = JSON.parse(created.text).id;
+  let calls = 0;
+  t.mock.method(global, 'fetch', async (_url, opts) => {
+    assert.equal(opts.redirect, 'error');
+    calls++;
+    return calls === 1 ? new Response('') : Response.json({choices:[{message:{content:'fallback answer'}}]});
+  });
+  const result = await request('/api/chat', {method:'POST', headers:adminHeaders, body:JSON.stringify({projectId, chatId:'test', message:'hello'})});
+  assert.equal(calls, 2);
+  assert.match(result.text, /fallback answer/);
+  t.mock.restoreAll();
+  t.mock.method(global, 'fetch', async () => new Response(new ReadableStream({start(controller) {
+    const line = 'data: '+JSON.stringify({choices:[{delta:{content:'split answer'}}]})+'\n\n';
+    controller.enqueue(new TextEncoder().encode(line.slice(0, 17)));
+    controller.enqueue(new TextEncoder().encode(line.slice(17))); controller.close();
+  }})));
+  const split = await request('/api/chat', {method:'POST', headers:adminHeaders, body:JSON.stringify({projectId, chatId:'test', message:'hello'})});
+  assert.match(split.text, /split answer/);
+});
+
+test('large authenticated request is bounded before JSON parsing', async () => {
+  const result = await request('/api/projects', {method:'POST', headers:adminHeaders, body:'x'.repeat(1024*1024+1)});
+  assert.equal(result.status, 413);
 });

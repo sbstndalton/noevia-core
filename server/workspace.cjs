@@ -119,6 +119,20 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets) {
         atomicJson(sharedFile, { providers: this.providers.filter(p => p.shared && p.id !== defaultProvider.id).map(encode) });
         this.providers = mergeProviders(this.privateProviders);
       },
+      removeProvider(id) {
+        const selected = this.providers.find(p => p.id === id);
+        if (!selected || id === defaultProvider.id) return false;
+        if (selected.shared) {
+          const encode = p => ({ ...p, apiKey: secrets ? secrets.encrypt(p.apiKey) : p.apiKey });
+          atomicJson(sharedFile, { providers: loadShared().filter(p => p.id !== id).map(encode) });
+        } else {
+          this.privateProviders = this.privateProviders.filter(p => p.id !== id);
+          this.providers = this.providers.filter(p => p.id !== id);
+          this.saveProviders();
+        }
+        this.providers = mergeProviders(this.privateProviders);
+        return true;
+      },
       saveFreeChats() { atomicJson(path.join(dir, 'free-chats.json'), this.freeChats); },
       saveAutoRoles() { atomicJson(path.join(dir, 'auto-roles.json'), this.autoRoles); },
       historyPath(id) { return path.join(dir, `history-${String(id).replace(/[^a-zA-Z0-9_-]/g, '')}.json`); },

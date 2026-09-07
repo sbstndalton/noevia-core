@@ -89,9 +89,9 @@ test('LLM-backed routes throttle per user after the configured limit', async () 
   assert.match(JSON.parse(third.text).error, /Too many requests/);
 });
 
-test('the same user is throttled on the Insights reflection route too (shared bucket)', async () => {
+test('the removed Insights reflection route is unavailable', async () => {
   const response = await request('/api/diary/insights/reflect', { method: 'POST', headers: mutationHeaders(), body: JSON.stringify({}) });
-  assert.equal(response.status, 429);
+  assert.equal(response.status, 404);
 });
 
 test('other routes are unaffected by the LLM throttle', async () => {

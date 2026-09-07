@@ -62,9 +62,9 @@ const workspaceStore = createWorkspaceStore(DATA_DIR, { id: DEFAULT_PROVIDER_ID,
 // Per-user throttle for LLM-backed routes. Every hit is a full model call
 // against the shared inference endpoint, so one member (or a runaway client)
 // must not be able to hog it. Fixed window, shared bucket across chat and
-// Insights reflections. Admins are throttled like everyone else. Raise
+// diary conversations. Admins are throttled like everyone else. Raise
 // LLM_RATE_LIMIT for a beefier inference host.
-const LLM_RATE_ROUTES = new Set(['/api/chat', '/api/diary/insights/reflect', '/api/diary/insights/about-question']);
+const LLM_RATE_ROUTES = new Set(['/api/chat']);
 const LLM_RATE_LIMIT = Math.max(1, Number(process.env.LLM_RATE_LIMIT || 60));
 const LLM_RATE_WINDOW_MS = 60 * 1000;
 const llmRateLimiter = createRateLimiter();
@@ -126,9 +126,11 @@ async function fetchJson(url, opts, timeoutMs) {
   const timer = setTimeout(() => ctrl.abort(), timeoutMs || 15000);
   // Honor a caller-supplied signal (e.g. client disconnect) in addition to the timeout.
   const external = opts && opts.signal;
-  if (external) external.addEventListener('abort', () => ctrl.abort(), { once: true });
+  const onAbort = () => ctrl.abort();
+  if (external?.aborted) ctrl.abort();
+  else external?.addEventListener('abort', onAbort, { once: true });
   try {
-    const res = await fetch(url, { ...opts, signal: ctrl.signal });
+    const res = await fetch(url, { ...opts, redirect: 'error', signal: ctrl.signal });
     const text = await res.text();
     let body = null;
     try {
@@ -139,15 +141,23 @@ async function fetchJson(url, opts, timeoutMs) {
     return { ok: res.ok, status: res.status, body };
   } finally {
     clearTimeout(timer);
+    external?.removeEventListener('abort', onAbort);
   }
 }
 
-async function readJson(req) {
-  let raw = '';
+async function readBody(req) {
+  const chunks = [];
+  let size = 0;
   for await (const chunk of req) {
-    raw += chunk;
-    if (raw.length > 1024 * 1024) throw new Error('request too large');
+    const bytes = Buffer.from(chunk);
+    size += bytes.length;
+    if (size > 1024 * 1024) throw Object.assign(new Error('Request exceeds 1 MiB'), { status: 413 });
+    chunks.push(bytes);
   }
+  return Buffer.concat(chunks).toString('utf8');
+}
+async function readJson(req) {
+  const raw = await readBody(req);
   return raw ? JSON.parse(raw) : {};
 }
 
@@ -176,6 +186,9 @@ function diaryHeaders() {
     h['X-Cowork-User-ID'] = workspace.userId;
     if (fs.existsSync(path.join(workspace.dir, 'migration.json'))) h['X-Cowork-Legacy-Owner'] = '1';
     const storage = authService.getStorage(workspace.userId, true);
+    if (storage.kind !== 'local' && !endpointApproved(requestScope.getStore()?.authn, storage.baseUrl)) {
+      throw Object.assign(new Error(STORAGE_PRIVATE_URL_ERROR), { status: 403 });
+    }
     h['X-Cowork-Storage'] = Buffer.from(JSON.stringify(storage)).toString('base64url');
   }
   return h;
@@ -186,10 +199,16 @@ function diaryHeaders() {
 // internal addresses (RFC1918, link-local metadata, …). Admins are exempt: a
 // self-hosted administrator legitimately connects LAN storage (a home NAS,
 // an in-network Nextcloud). Same policy as the provider registry.
-const STORAGE_PRIVATE_URL_ERROR = 'storage URL must be a public endpoint (contact an administrator to connect a private or local server)';
+const STORAGE_PRIVATE_URL_ERROR = 'An http(s) server URL is required. This server is not approved for member connections. Ask an administrator to add its origin to MEMBER_OUTBOUND_ORIGINS.';
+function endpointApproved(authn, rawUrl) {
+  try {
+    const u = new URL(rawUrl);
+    if (!['http:', 'https:'].includes(u.protocol) || u.username || u.password) return false;
+    return authn?.user.role === 'admin' || (process.env.MEMBER_OUTBOUND_ORIGINS || '').split(',').map(x => x.trim()).includes(u.origin);
+  } catch { return false; }
+}
 async function storageEndpointAllowed(authn, rawUrl) {
-  if (authn.user.role === 'admin') return true;
-  return isPublicUrl(String(rawUrl || ''));
+  return endpointApproved(authn, rawUrl);
 }
 
 // ── Projects config: instructions, files, memories, model ─────────────────
@@ -771,7 +790,7 @@ async function handleChat(req, res, body, authn) {
     }
   }
 
-  const send = (obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
+  const send = (obj) => { if (!res.destroyed && !chatSignal.signal.aborted) res.write(`data: ${JSON.stringify(obj)}\n\n`); };
 
   // ── Diary tab: sidecar pipeline, called exactly once (no retry, no stream) ──
   if (spaceId === 'diary') {
@@ -779,7 +798,7 @@ async function handleChat(req, res, body, authn) {
     try {
       full = await fetchJson(
         `${DIARY_BASE}/v1/chat/completions`,
-        { method: 'POST', headers: diaryHeaders(), body: JSON.stringify({ messages: msgs }), signal: chatSignal.signal },
+        { method: 'POST', headers: diaryHeaders(), body: JSON.stringify({ messages: msgs, session_id: body.sessionId }), signal: chatSignal.signal },
         300000,
       );
     } catch (err) {
@@ -846,8 +865,8 @@ async function handleChat(req, res, body, authn) {
   // default-deployment path — so only the member's own private providers
   // are subject to the denylist here.
   const memberOwnProvider = authn && authn.user.role !== 'admin' && !provider.shared && provider.id !== DEFAULT_PROVIDER_ID;
-  if (memberOwnProvider && !(await isPublicUrl(upstreamUrl))) {
-    return json(res, 400, { error: 'provider URL must be a public endpoint (contact an administrator to connect a local or private endpoint)' });
+  if (memberOwnProvider && !endpointApproved(authn, upstreamUrl)) {
+    return json(res, 400, { error: 'Provider origin is not approved for member connections; contact an administrator.' });
   }
 
   res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
@@ -860,7 +879,7 @@ async function handleChat(req, res, body, authn) {
   // this is dormant plumbing until one lands — the loop simply never fires.
   const decoder = new TextDecoder();
   let roundMessages = wire;
-  for (let round = 0; round < 3; round++) {
+  for (let round = 0; round < 3 && !chatSignal.signal.aborted; round++) {
     let upstream;
     try {
       upstream = await fetch(upstreamUrl, {
@@ -872,14 +891,14 @@ async function handleChat(req, res, body, authn) {
       });
     } catch (err) {
       if (chatSignal.signal.aborted) break; // client went away; stop quietly
-      if (round === 0) return json(res, 502, { error: `${provider.label} unreachable: ${err.message}` });
+
       send({ type: 'error', text: `${provider.label} unreachable: ${err.message}` });
       break;
     }
     if (!upstream.ok || !upstream.body) {
       const detail = await upstream.text().catch(() => '');
       const msg = `${provider.label} ${upstream.status}: ${detail.slice(0, 200)}`;
-      if (round === 0) return json(res, 502, { error: msg });
+
       send({ type: 'error', text: msg });
       break;
     }
@@ -947,6 +966,7 @@ async function handleChat(req, res, body, authn) {
           { method: 'POST', headers: upstreamHeaders, body: JSON.stringify({ model, messages: roundMessages, tools: TOOL_DEFS }), signal: chatSignal.signal },
           300000,
         );
+        if (!full.ok) throw new Error(`Provider returned ${full.status}`);
         const msg = full.body?.choices?.[0]?.message;
         if (msg?.reasoning_content) send({ type: 'reasoning', text: msg.reasoning_content });
         if (msg?.content) send({ type: 'delta', text: msg.content });
@@ -995,12 +1015,16 @@ async function handleRequest(req, res) {
       process.env.CORPUS_BACKEND === 'webdav' && authService.getStorage(preAuth.user.id).kind === 'local') {
     authService.saveStorage(preAuth.user.id, { kind: 'webdav', baseUrl: process.env.WEBDAV_BASE_URL || '', username: process.env.WEBDAV_USERNAME || '', secret: process.env.WEBDAV_PASSWORD || '', corpusRoot: process.env.CORPUS_ROOT || '' });
   }
-  return requestScope.run({ workspace }, () => handleRequestScoped(req, res));
+  return requestScope.run({ workspace, authn: preAuth }, () => handleRequestScoped(req, res));
 }
 
 async function handleRequestScoped(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const p = url.pathname;
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'same-origin');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");
 
   try {
     const publicAuthRoutes = new Set([
@@ -1042,20 +1066,13 @@ async function handleRequestScoped(req, res) {
     if (p.startsWith('/api/models/') && !['GET', 'HEAD'].includes(req.method || 'GET') && authn.user.role !== 'admin') {
       return json(res, 403, { error: 'administrator required' });
     }
-    if (p === '/api/profile' && req.method === 'GET') return json(res, 200, { user: authn.user, passkeys: authService.listPasskeys(authn.user.id), sessions: authService.listSessions(authn.user.id), insightsBadge: authService.insightsBadgeEnabled(authn.user.id) });
+    if (p === '/api/profile' && req.method === 'GET') return json(res, 200, { user: authn.user, passkeys: authService.listPasskeys(authn.user.id), sessions: authService.listSessions(authn.user.id) });
     if (p === '/api/profile' && req.method === 'PATCH') {
       const body = await readJson(req); authService.updateProfile(authn.user.id, body.displayName);
       return json(res, 200, { ok: true });
     }
     if (p === '/api/profile/features' && req.method === 'PUT') {
       return json(res, 200, authService.setDiaryEnabled(authn.user.id, !!(await readJson(req)).diaryEnabled));
-    }
-    if (p === '/api/profile/insights-badge' && req.method === 'PUT') {
-      return json(res, 200, authService.setInsightsBadge(authn.user.id, !!(await readJson(req)).enabled));
-    }
-    if (p === '/api/profile/insights-badge' && req.method === 'DELETE') {
-      authService.markInsightsSeen(authn.user.id);
-      return json(res, 200, { ok: true });
     }
     if (p === '/api/profile/onboarding' && req.method === 'POST') {
       return json(res, 200, authService.markOnboarded(authn.user.id));
@@ -1144,6 +1161,9 @@ async function handleRequestScoped(req, res) {
         const response = await fetch(`${baseUrl}/index.php/login/v2`, { method: 'POST', signal: AbortSignal.timeout(10000), redirect: 'error' });
         if (!response.ok) return json(res, 502, { error: `Nextcloud returned ${response.status}` });
         const payload = await response.json(); const flowId = crypto.randomUUID();
+        for (const [id, flow] of nextcloudFlows) if (flow.expires < Date.now() || flow.userId === authn.user.id) nextcloudFlows.delete(id);
+        if (nextcloudFlows.size >= 100) return json(res, 429, { error: 'Too many pending connections' });
+        if (!endpointApproved(authn, payload.poll?.endpoint) || new URL(payload.login).protocol !== 'https:') return json(res, 400, { error: 'Invalid connection URLs' });
         nextcloudFlows.set(flowId, { userId: authn.user.id, endpoint: payload.poll.endpoint, token: payload.poll.token, expires: Date.now() + 10 * 60 * 1000 });
         return json(res, 200, { flowId, loginUrl: payload.login, expiresAt: Date.now() + 10 * 60 * 1000 });
       } catch (e) { return json(res, 502, { error: e.message }); }
@@ -1159,6 +1179,7 @@ async function handleRequestScoped(req, res) {
       if (!response.ok) return json(res, 502, { error: `Nextcloud returned ${response.status}` });
       const credentials = await response.json(); nextcloudFlows.delete(String(body.flowId));
       const baseUrl = `${String(credentials.server).replace(/\/+$/, '')}/remote.php/dav/files/${encodeURIComponent(credentials.loginName)}`;
+      if (!endpointApproved(authn, baseUrl)) return json(res, 403, { error: STORAGE_PRIVATE_URL_ERROR });
       return json(res, 200, authService.saveStorage(authn.user.id, { kind: 'nextcloud', baseUrl, username: credentials.loginName, secret: credentials.appPassword, corpusRoot: body.corpusRoot || 'Cowork/Diary' }));
     }
     if (p === '/api/auth/passkeys/register/options' && req.method === 'POST') return json(res, 200, await authService.registrationOptions(authn.user.id));
@@ -1225,8 +1246,7 @@ async function handleRequestScoped(req, res) {
       });
     }
     if (p === '/api/providers' && req.method === 'POST') {
-      let raw = '';
-      for await (const c of req) raw += c;
+      const raw = await readBody(req);
       let body;
       try {
         body = JSON.parse(raw);
@@ -1244,8 +1264,8 @@ async function handleRequestScoped(req, res) {
       // SSRF guard: a member must not register an endpoint the server can
       // only reach from its own internal network (RFC1918, metadata, etc.).
       // Admins are exempt — local-inference setups legitimately do this.
-      if (authn.user.role !== 'admin' && !(await isPublicUrl(baseUrl))) {
-        return json(res, 400, { error: 'provider URL must be a public endpoint (contact an administrator to connect a local or private endpoint)' });
+      if (!endpointApproved(authn, baseUrl)) {
+        return json(res, 400, { error: 'Provider origin is not approved for member connections; contact an administrator.' });
       }
       const id = `prov-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       PROVIDERS.push({ id, label, baseUrl, apiKey, defaultModel, shared });
@@ -1258,8 +1278,8 @@ async function handleRequestScoped(req, res) {
       if (!/^https?:\/\//.test(baseUrl)) return json(res, 400, { error: 'valid baseUrl required' });
       // Same SSRF guard as registration: the test route must not become a
       // prober for internal addresses on behalf of a member.
-      if (authn.user.role !== 'admin' && !(await isPublicUrl(baseUrl))) {
-        return json(res, 400, { error: 'provider URL must be a public endpoint (contact an administrator to connect a local or private endpoint)' });
+      if (!endpointApproved(authn, baseUrl)) {
+        return json(res, 400, { error: 'Provider origin is not approved for member connections; contact an administrator.' });
       }
       const headers = { 'Content-Type': 'application/json' };
       if (body.apiKey) headers.Authorization = `Bearer ${String(body.apiKey)}`;
@@ -1275,17 +1295,9 @@ async function handleRequestScoped(req, res) {
     if (provDel && req.method === 'DELETE') {
       const id = decodeURIComponent(provDel[1]);
       if (id === DEFAULT_PROVIDER_ID || id === 'lemonade') return json(res, 400, { error: 'the default provider cannot be removed' });
-      const selectedProvider = getProvider(id);
+      const selectedProvider = Array.from(PROVIDERS).find(p => p.id === id);
       if (selectedProvider?.shared && authn.user.role !== 'admin') return json(res, 403, { error: 'administrator required' });
-      const before = PROVIDERS.length;
-      const keptProviders = Array.from(PROVIDERS).filter((pr) => pr.id !== id);
-      PROVIDERS.splice(0, PROVIDERS.length, ...keptProviders);
-      if (PROVIDERS.length === before) return json(res, 404, { error: 'no such provider' });
-      // Deletion is admin-only for shared providers and owner/admin-only for
-      // private ones, so persisting both halves from the current view is safe
-      // and keeps the private and shared files in sync with the registry.
-      saveProviders();
-      saveSharedProviders();
+      if (!currentWorkspace().removeProvider(id)) return json(res, 404, { error: 'no such provider' });
       // Projects pointing at the removed provider fall back to the configured default.
       for (const pr of PROJECTS) {
         if (pr.provider === id) {
@@ -1327,8 +1339,7 @@ async function handleRequestScoped(req, res) {
         return json(res, 200, { configured: !!roles, roles: roles || null });
       }
       if (req.method === 'PUT') {
-        let raw = '';
-        for await (const c of req) raw += c;
+        const raw = await readBody(req);
         let body;
         try {
           body = JSON.parse(raw);
@@ -1345,8 +1356,7 @@ async function handleRequestScoped(req, res) {
     }
 
     if (p === '/api/projects' && req.method === 'POST') {
-      let raw = '';
-      for await (const c of req) raw += c;
+      const raw = await readBody(req);
       let body;
       try {
         body = JSON.parse(raw);
@@ -1407,8 +1417,7 @@ async function handleRequestScoped(req, res) {
     const projCfg = p.match(/^\/api\/projects\/([^/]+)\/config$/);
     if (projCfg && req.method === 'POST') {
       const id = decodeURIComponent(projCfg[1]);
-      let raw = '';
-      for await (const c of req) raw += c;
+      const raw = await readBody(req);
       let patch;
       try {
         patch = JSON.parse(raw);
@@ -1468,8 +1477,7 @@ async function handleRequestScoped(req, res) {
       const id = decodeURIComponent(projChats[1]);
       if (req.method === 'GET') return json(res, 200, { chats: loadChats(id) });
       if (req.method === 'POST') {
-        let raw = '';
-        for await (const c of req) raw += c;
+        const raw = await readBody(req);
         try {
           const body = JSON.parse(raw);
           if (!Array.isArray(body.chats)) return json(res, 400, { error: 'chats array required' });
@@ -1503,8 +1511,7 @@ async function handleRequestScoped(req, res) {
     if (p === '/api/freechats') {
       if (req.method === 'GET') return json(res, 200, { chats: FREE_CHATS });
       if (req.method === 'POST') {
-        let raw = '';
-        for await (const c of req) raw += c;
+        const raw = await readBody(req);
         try {
           const body = JSON.parse(raw);
           if (!Array.isArray(body.chats)) return json(res, 400, { error: 'chats array required' });
@@ -1534,23 +1541,10 @@ async function handleRequestScoped(req, res) {
     if (p === '/api/health') {
       const defaultProvider = getProvider(DEFAULT_PROVIDER_ID);
       const diaryEnabled = authService.diaryEnabled(authn.user.id);
-      const [inference, diary, insightsMeta] = await Promise.allSettled([
+      const [inference, diary] = await Promise.allSettled([
         fetchJson(`${defaultProvider.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/models`, { headers: providerHeaders(defaultProvider) }, 5000),
         diaryEnabled ? fetchJson(`${DIARY_BASE}/api/health`, { headers: diaryHeaders() }, 5000) : Promise.resolve({ ok: false }),
-        diaryEnabled && authService.insightsBadgeEnabled(authn.user.id)
-          ? fetchJson(`${DIARY_BASE}/api/insights`, { headers: diaryHeaders() }, 5000)
-          : Promise.resolve({ ok: false }),
       ]);
-      // Opt-in badge: a subtle "standing sections have new activity" dot, only
-      // for users who asked for it. Fires when the diary's last standing-section
-      // journal update is newer than the user's last Insights visit, capped at
-      // two weeks so a long-dormant corpus never looks permanently un-read.
-      let insightsFresh = false;
-      if (insightsMeta.status === 'fulfilled' && insightsMeta.value.ok && typeof insightsMeta.value.body?.last_change === 'number') {
-        const seen = authService.insightsSeenAt(authn.user.id) || 0;
-        const twoWeeks = 14 * 24 * 3600 * 1000;
-        insightsFresh = insightsMeta.value.body.last_change * 1000 > Math.max(seen, Date.now() - twoWeeks);
-      }
       return json(res, 200, {
         inferenceUp: inference.status === 'fulfilled' && inference.value.ok,
         lemonadeUp: inference.status === 'fulfilled' && inference.value.ok,
@@ -1558,7 +1552,6 @@ async function handleRequestScoped(req, res) {
         // True when project-file retrieval can run (native deps present).
         // False means RAG is silently degraded to keyword-only context.
         ragAvailable: rag.ragAvailable(),
-        insightsFresh,
       });
     }
 
@@ -1587,8 +1580,7 @@ async function handleRequestScoped(req, res) {
     }
 
     if (p === '/api/models/pull' && req.method === 'POST') {
-      let raw = '';
-      for await (const c of req) raw += c;
+      const raw = await readBody(req);
       let body;
       try {
         body = JSON.parse(raw);
@@ -1602,8 +1594,7 @@ async function handleRequestScoped(req, res) {
     }
 
     if (p === '/api/models/delete' && req.method === 'POST') {
-      let raw = '';
-      for await (const c of req) raw += c;
+      const raw = await readBody(req);
       let body;
       try {
         body = JSON.parse(raw);
@@ -1618,8 +1609,7 @@ async function handleRequestScoped(req, res) {
 
     for (const verb of ['load', 'unload']) {
       if (p === `/api/models/${verb}` && req.method === 'POST') {
-        let raw = '';
-        for await (const c of req) raw += c;
+        const raw = await readBody(req);
         let body;
         try {
           body = JSON.parse(raw);
@@ -1654,61 +1644,8 @@ async function handleRequestScoped(req, res) {
       return json(res, 200, data);
     }
 
-    // Insights: on-demand AI commentary over the diary. Proxied to the
-    // sidecar, which guarantees the output is rendered-only — never written
-    // to the corpus, journal, or retrieval index.
-    if (p === '/api/diary/insights' && req.method === 'GET') {
-      if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
-      const r = await fetchJson(`${DIARY_BASE}/api/insights`, { headers: diaryHeaders() }, 30000);
-      if (!r.ok) return json(res, r.status >= 500 ? 502 : r.status, { error: `diary sidecar ${r.status}` });
-      return json(res, 200, r.body);
-    }
-
-    if (p === '/api/diary/insights/reflect' && req.method === 'POST') {
-      if (llmRateLimited(authn.user.id)) return json(res, 429, { error: 'Too many requests — the model endpoint is shared; wait a moment and try again' });
-      if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
-      let raw = '';
-      for await (const c of req) raw += c;
-      let body;
-      try {
-        body = JSON.parse(raw);
-      } catch {
-        body = {};
-      }
-      const r = await fetchJson(
-        `${DIARY_BASE}/api/insights/reflect`,
-        { method: 'POST', headers: diaryHeaders(), body: JSON.stringify({ focus: (body && body.focus) || null }) },
-        120000,
-      );
-      if (!r.ok) return json(res, r.status >= 500 ? 502 : r.status, { error: (r.body && r.body.error) || (r.body && r.body.detail) || `diary sidecar ${r.status}` });
-      return json(res, 200, r.body);
-    }
-
-    if (p === '/api/diary/insights/about-question' && req.method === 'POST') {
-      if (llmRateLimited(authn.user.id)) return json(res, 429, { error: 'Too many requests — the model endpoint is shared; wait a moment and try again' });
-      if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
-      let raw = '';
-      for await (const c of req) raw += c;
-      let body;
-      try {
-        body = JSON.parse(raw);
-      } catch {
-        return json(res, 400, { error: 'invalid JSON' });
-      }
-      if (!body || typeof body.question !== 'string' || !body.question.trim()) return json(res, 400, { error: 'question required' });
-      const r = await fetchJson(
-        `${DIARY_BASE}/api/insights/about-question`,
-        { method: 'POST', headers: diaryHeaders(), body: JSON.stringify({ question: body.question.trim() }) },
-        120000,
-      );
-      if (!r.ok) return json(res, r.status >= 500 ? 502 : r.status, { error: (r.body && r.body.error) || (r.body && r.body.detail) || `diary sidecar ${r.status}` });
-      return json(res, 200, r.body);
-    }
-
-    // External diary-like sources: read-only detection + explicit one-file
-    // import, proxied to the sidecar (which enforces the same per-user
-    // tenancy as the rest of the diary routes).
     if (p === '/api/diary/external-sources') {
+      if (authn.user.role !== 'admin') return json(res, 403, { error: 'Administrator required for server import folders' });
       if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
       const r = await fetchJson(`${DIARY_BASE}/api/external-sources`, { headers: diaryHeaders() }, 30000);
       if (!r.ok) return json(res, r.status >= 500 ? 502 : r.status, { error: `diary sidecar ${r.status}` });
@@ -1716,9 +1653,9 @@ async function handleRequestScoped(req, res) {
     }
 
     if (p === '/api/diary/external-sources/import' && req.method === 'POST') {
+      if (authn.user.role !== 'admin') return json(res, 403, { error: 'Administrator required for server import folders' });
       if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
-      let raw = '';
-      for await (const c of req) raw += c;
+      const raw = await readBody(req);
       let body;
       try {
         body = JSON.parse(raw);
@@ -1746,8 +1683,7 @@ async function handleRequestScoped(req, res) {
       // edit endpoint. The assistant never rewrites the user's own words on
       // its own; the xid identifies exactly one logged exchange.
       if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
-      let raw = '';
-      for await (const c of req) raw += c;
+      const raw = await readBody(req);
       let body;
       try {
         body = JSON.parse(raw);
@@ -1771,8 +1707,7 @@ async function handleRequestScoped(req, res) {
 
     if (p === '/api/chat' && req.method === 'POST') {
       if (llmRateLimited(authn.user.id)) return json(res, 429, { error: 'Too many requests — the model endpoint is shared; wait a moment and try again' });
-      let raw = '';
-      for await (const c of req) raw += c;
+      const raw = await readBody(req);
       let body;
       try {
         body = JSON.parse(raw);
@@ -1782,7 +1717,7 @@ async function handleRequestScoped(req, res) {
       if (body.spaceId === 'diary' && !authService.diaryEnabled(authn.user.id)) {
         return json(res, 404, { error: 'Diary add-on is disabled' });
       }
-      return handleChat(req, res, body, authn);
+      return await handleChat(req, res, body, authn);
     }
 
     // Unused legacy spaces endpoints removed with the spaces UI (v4).
@@ -1792,8 +1727,7 @@ async function handleRequestScoped(req, res) {
       const spaceId = decodeURIComponent(historyMatch[1]);
       if (req.method === 'GET') return json(res, 200, { history: readHistory(spaceId) });
       if (req.method === 'POST') {
-        let raw = '';
-        for await (const c of req) raw += c;
+        const raw = await readBody(req);
         try {
           const body = JSON.parse(raw);
           writeHistory(spaceId, Array.isArray(body.history) ? body.history.slice(-HISTORY_CAP) : []);
@@ -1827,16 +1761,19 @@ async function handleRequestScoped(req, res) {
     });
     stream.pipe(res);
   } catch (err) {
-    json(res, 500, { error: String((err && err.message) || err) });
+    if (res.destroyed || res.writableEnded) return;
+    if (res.headersSent) {
+      res.end(`data: ${JSON.stringify({ type: 'error', text: 'The request could not be completed. Please retry.' })}\n\n`);
+    } else json(res, err.status || 500, { error: String((err && err.message) || err) });
   }
 }
 
 if (require.main === module) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
   if (!UI_AUTH_TOKEN) {
-    console.warn('WARNING: cowork-ui API authentication is disabled; set DIARY_AUTH_TOKEN or UI_AUTH_TOKEN before tunnel exposure.');
+    console.warn('WARNING: Set DIARY_AUTH_TOKEN to protect the internal diary connection. Browser accounts remain authenticated.');
   }
-  http.createServer(handleRequest).listen(PORT, HOST, () => {
+  http.createServer((req, res) => { handleRequest(req, res).catch(() => { if (!res.destroyed) res.destroy(); }); }).listen(PORT, HOST, () => {
     console.log(`cowork-ui listening on http://${HOST}:${PORT} (inference: ${INFERENCE_BASE}, manager: ${modelManager.kind}, diary: ${DIARY_BASE})`);
   });
 }
