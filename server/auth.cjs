@@ -330,7 +330,7 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
     async registrationOptions(userId) {
       const user = db.prepare('SELECT * FROM users WHERE id=?').get(userId);
       const keys = db.prepare('SELECT * FROM passkeys WHERE user_id=?').all(userId);
-      const options = await generateRegistrationOptions({ rpName: 'Cowork', rpID: relyingPartyId, userName: user.username,
+      const options = await generateRegistrationOptions({ rpName: 'noevia', rpID: relyingPartyId, userName: user.username,
         userDisplayName: user.display_name, userID: Buffer.from(user.webauthn_user_id, 'base64url'), attestationType: 'none',
         excludeCredentials: keys.map(k => ({ id: k.id, transports: JSON.parse(k.transports) })),
         authenticatorSelection: { residentKey: 'preferred', userVerification: 'required' } });
