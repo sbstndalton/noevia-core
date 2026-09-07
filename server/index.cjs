@@ -145,13 +145,13 @@ async function fetchJson(url, opts, timeoutMs) {
   }
 }
 
-async function readBody(req) {
+async function readBody(req, limit = 1024 * 1024) {
   const chunks = [];
   let size = 0;
   for await (const chunk of req) {
     const bytes = Buffer.from(chunk);
     size += bytes.length;
-    if (size > 1024 * 1024) throw Object.assign(new Error('Request exceeds 1 MiB'), { status: 413 });
+    if (size > limit) throw Object.assign(new Error('Request exceeds size limit'), { status: 413 });
     chunks.push(bytes);
   }
   return Buffer.concat(chunks).toString('utf8');
@@ -798,7 +798,7 @@ async function handleChat(req, res, body, authn) {
     try {
       full = await fetchJson(
         `${DIARY_BASE}/v1/chat/completions`,
-        { method: 'POST', headers: diaryHeaders(), body: JSON.stringify({ messages: msgs, session_id: body.sessionId }), signal: chatSignal.signal },
+        { method: 'POST', headers: diaryHeaders(), body: JSON.stringify({ messages: msgs, session_id: body.sessionId, entryTime: body.entryTime, entryDay: body.entryDay }), signal: chatSignal.signal },
         300000,
       );
     } catch (err) {
@@ -1629,6 +1629,18 @@ async function handleRequestScoped(req, res) {
       if (!r.ok) return json(res, 200, []);
       const arr = Array.isArray(r.body) ? r.body : r.body?.jobs || r.body?.downloads || [];
       return json(res, 200, arr.map((j) => ({ id: j.id || j.job_id || '', model: j.model || j.model_name || j.checkpoint || '', progress: typeof j.progress === 'number' ? j.progress : null, status: j.status || j.state || '' })));
+    }
+
+    if (['/api/diary/files', '/api/diary/file', '/api/diary/local-exchange'].includes(p)) {
+      if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
+      const local = p.endsWith('/local-exchange');
+      const listing = p.endsWith('/files');
+      if (!(listing ? req.method === 'GET' : local ? req.method === 'POST' : ['POST', 'PUT'].includes(req.method))) return json(res, 405, { error: 'Method not allowed' });
+      if (local && llmRateLimited(authn.user.id)) return json(res, 429, { error: 'Please wait before sending another message' });
+      const body = listing ? undefined : await readBody(req, local ? 16 * 1024 * 1024 : 1024 * 1024);
+      const suffix = listing ? '/files?path=' + encodeURIComponent(url.searchParams.get('path') || '') : local ? '/local-exchange' : '/file';
+      const r = await fetchJson(`${DIARY_BASE}/api${suffix}`, { method: req.method, headers: diaryHeaders(), body }, local ? 600000 : 60000);
+      return json(res, r.status, r.ok ? r.body : { error: r.body?.detail || r.body?.error || 'Diary storage request failed' });
     }
 
     if (p === '/api/diary/source') {

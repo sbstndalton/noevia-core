@@ -166,3 +166,25 @@ test('large authenticated request is bounded before JSON parsing', async () => {
   const result = await request('/api/projects', {method:'POST', headers:adminHeaders, body:'x'.repeat(1024*1024+1)});
   assert.equal(result.status, 413);
 });
+
+test('diary file routes require auth and forward conflicts without losing the error', async (t) => {
+  assert.equal((await request('/api/diary/files')).status, 401);
+  assert.equal((await request('/api/profile/features', { method: 'PUT', headers: adminHeaders, body: JSON.stringify({diaryEnabled:true}) })).status, 200);
+  t.mock.method(globalThis, 'fetch', async (url, opts) => {
+    assert.match(String(url), /\/api\/file$/);
+    assert.ok(opts.headers['X-Cowork-User-ID']);
+    assert.equal(opts.redirect, 'error');
+    return Response.json({ detail: 'File changed elsewhere' }, { status: 409 });
+  });
+  const r = await request('/api/diary/file', { method: 'PUT', headers: adminHeaders, body: JSON.stringify({path:'MEMORY.md',content:'edited',version:'old'}) });
+  assert.equal(r.status,409);assert.match(r.text,/changed elsewhere/);
+});
+test('diary forwards browser date and selected day to the pipeline', async (t) => {
+  let sent;
+  t.mock.method(globalThis, 'fetch', async (_url, opts) => {
+    sent = JSON.parse(opts.body);
+    return Response.json({ choices:[{message:{content:'Reply'}}], diary:{decision:'logged'} });
+  });
+  const r = await request('/api/chat', { method:'POST',headers:adminHeaders,body:JSON.stringify({spaceId:'diary',message:'Past day note',history:[],entryTime:'2026-09-07T10:00:00-04:00',entryDay:'2026-07-08'}) });
+  assert.equal(r.status,200);assert.equal(sent.entryDay,'2026-07-08');assert.equal(sent.entryTime,'2026-09-07T10:00:00-04:00');
+});
