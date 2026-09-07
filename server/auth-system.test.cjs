@@ -42,6 +42,46 @@ test('bootstrap, password login, invitations, and workspace isolation', async (t
   assert.notEqual(ownerSpace.dir, memberSpace.dir);
 });
 
+test('additionalOrigins allows password login from a second origin (e.g. a LAN IP) without weakening the primary cookie', async () => {
+  // Regression for: password login 403s with "origin not allowed" when a
+  // deployment is reachable from both a Cloudflare Tunnel hostname (the
+  // configured publicOrigin) and a bare LAN IP.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cowork-multi-origin-'));
+  const secrets = createSecretStore(root);
+  const auth = createAuth({
+    dataDir: root,
+    publicOrigin: 'https://cowork.example.test',
+    rpId: 'cowork.example.test',
+    secrets,
+    additionalOrigins: ['http://10.0.0.5:8021'],
+  });
+  const setupCode = fs.readFileSync(path.join(root, 'first-run-setup-code'), 'utf8').trim();
+  const setup = await auth.setup(request(), response(), {
+    setupCode, publicOrigin: 'https://cowork.example.test', username: 'Owner', displayName: 'Owner',
+    password: 'correct horse battery staple', diaryEnabled: false,
+  });
+  assert.equal(setup.status, 201);
+
+  const untrustedReq = { headers: { origin: 'http://evil.example.test', 'user-agent': 'test' }, socket: { remoteAddress: '127.0.0.1' } };
+  assert.equal(auth.originValid(untrustedReq), false);
+
+  const lanReq = { headers: { origin: 'http://10.0.0.5:8021', 'user-agent': 'test' }, socket: { remoteAddress: '10.0.0.5' } };
+  assert.equal(auth.originValid(lanReq), true);
+  const lanRes = response();
+  const lanLogin = await auth.passwordLogin(lanReq, lanRes, { username: 'owner', password: 'correct horse battery staple' });
+  assert.equal(lanLogin.status, 200);
+  // Plain-HTTP trusted origin must not get a Secure cookie, or the browser drops it.
+  assert.ok(lanRes.headers['Set-Cookie'].every((c) => !c.includes('; Secure')));
+
+  const tunnelRes = response();
+  const tunnelLogin = await auth.passwordLogin(request(), tunnelRes, { username: 'owner', password: 'correct horse battery staple' });
+  assert.equal(tunnelLogin.status, 200);
+  // The primary HTTPS origin keeps Secure as before.
+  assert.ok(tunnelRes.headers['Set-Cookie'].every((c) => c.includes('; Secure')));
+
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
 test('provider secrets are encrypted on disk and decrypt for their owner', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cowork-secrets-'));
   const secrets = createSecretStore(root); const id = '22222222-2222-4222-8222-222222222222';

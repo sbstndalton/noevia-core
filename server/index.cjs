@@ -54,6 +54,15 @@ const authService = createAuth({
   legacyCompat: process.env.LEGACY_AUTH_COMPAT === 'true',
   secrets: secretStore,
   trustProxy: process.env.TRUST_PROXY === 'true',
+  // Lets password/session login also work from e.g. a bare LAN IP alongside
+  // the primary (tunnel/HTTPS) origin. Passkeys are exempt from this: the RP
+  // ID is fixed to the primary origin's hostname and WebAuthn refuses
+  // IP-address origins outright, so passkey sign-in only ever works from the
+  // primary origin.
+  additionalOrigins: String(process.env.ADDITIONAL_TRUSTED_ORIGINS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean),
 });
 if (process.env.LEMONADE_BASE_URL && !process.env.INFERENCE_BASE_URL) console.warn('LEMONADE_BASE_URL is deprecated; use INFERENCE_BASE_URL');
 if (process.env.LEMONADE_API_KEY && !process.env.INFERENCE_API_KEY) console.warn('LEMONADE_API_KEY is deprecated; use INFERENCE_API_KEY');
@@ -656,6 +665,18 @@ async function searchModels(query) {
       name: (h.id || '').split('/').pop() || h.id,
       downloads: typeof h.downloads === 'number' ? h.downloads : null,
     }));
+}
+
+// Lemonade's /pull needs a namespaced model_name for any checkpoint it
+// doesn't already know about; derive one from the repo/variant the user
+// picked (variants() below always hands us `<repo>:<variant>` or a bare
+// repo). Lemonade requires the `user.` prefix to avoid colliding with its
+// built-in registry.
+function deriveUserModelName(checkpoint) {
+  const [repo, variant] = String(checkpoint).split(':');
+  const base = (repo.split('/').pop() || repo).replace(/[^A-Za-z0-9._-]/g, '-');
+  const safeVariant = variant ? variant.replace(/[^A-Za-z0-9._-]/g, '-') : '';
+  return `user.${base}${safeVariant ? `-${safeVariant}` : ''}`;
 }
 
 async function modelVariants(repo) {
@@ -1589,8 +1610,13 @@ async function handleRequestScoped(req, res) {
       }
       if (!body.checkpoint) return json(res, 400, { error: 'checkpoint required' });
       if (!modelManager.enabled) return json(res, 404, { error: 'model management is disabled' });
-      const r = await modelManager.pull(body.checkpoint);
-      return json(res, r.ok ? 200 : 502, r.ok ? { jobId: r.body?.job_id || r.body?.id || 'pull' } : { error: `pull failed: ${r.status}` });
+      const modelName = body.modelName || deriveUserModelName(body.checkpoint);
+      const r = await modelManager.pull({ modelName, checkpoint: body.checkpoint, recipe: body.recipe || 'llamacpp' });
+      return json(
+        res,
+        r.ok ? 200 : 502,
+        r.ok ? { jobId: r.body?.id || r.body?.job_id || 'pull', modelName } : { error: r.body?.error || `pull failed: ${r.status}` },
+      );
     }
 
     if (p === '/api/models/delete' && req.method === 'POST') {
@@ -1628,7 +1654,13 @@ async function handleRequestScoped(req, res) {
       const r = await modelManager.downloads();
       if (!r.ok) return json(res, 200, []);
       const arr = Array.isArray(r.body) ? r.body : r.body?.jobs || r.body?.downloads || [];
-      return json(res, 200, arr.map((j) => ({ id: j.id || j.job_id || '', model: j.model || j.model_name || j.checkpoint || '', progress: typeof j.progress === 'number' ? j.progress : null, status: j.status || j.state || '' })));
+      // Lemonade reports `percent` as 0-100; the UI expects a 0-1 fraction.
+      return json(res, 200, arr.map((j) => ({
+        id: j.id || j.job_id || '',
+        model: j.model_name || j.model || j.checkpoint || '',
+        progress: typeof j.percent === 'number' ? j.percent / 100 : typeof j.progress === 'number' ? j.progress : null,
+        status: j.status || j.state || '',
+      })));
     }
 
     if (['/api/diary/files', '/api/diary/file', '/api/diary/local-exchange'].includes(p)) {

@@ -33,7 +33,12 @@ function createModelManager({ kind, baseUrl, apiKey, fetchJson }) {
     stats: () => get('/v1/stats', 6000),
     systemStats: () => get('/v1/system-stats', 6000),
     variants: (checkpoint) => get(`/api/v1/pull/variants?checkpoint=${encodeURIComponent(checkpoint)}`, 20000),
-    pull: (checkpoint) => post('/api/v1/pull', { checkpoint }, 600000),
+    // Lemonade requires model_name + recipe to register a not-yet-known HF
+    // checkpoint (checkpoint alone 400s). stream+subscribe=false makes it
+    // hand back a job snapshot immediately instead of blocking on the whole
+    // download, so /api/v1/downloads has something to poll.
+    pull: ({ modelName, checkpoint, recipe }) =>
+      post('/api/v1/pull', { model_name: modelName, checkpoint, recipe, stream: true, subscribe: false }, 600000),
     deleteModel: (modelName) => post('/api/v1/delete', { model_name: modelName }, 60000),
     load: (modelName) => post('/api/v1/load', { model_name: modelName }, 120000),
     unload: (modelName) => post('/api/v1/unload', { model_name: modelName }, 120000),

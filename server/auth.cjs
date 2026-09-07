@@ -92,7 +92,7 @@ function parseCookies(req) {
   return out;
 }
 
-function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompat = false, secrets = null, trustProxy = false }) {
+function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompat = false, secrets = null, trustProxy = false, additionalOrigins = [] }) {
   fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   const db = new Database(path.join(dataDir, 'cowork.db'));
   db.pragma('journal_mode = WAL');
@@ -181,6 +181,12 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
   const configuredOrigin = db.prepare("SELECT value FROM settings WHERE key='public_origin'").get()?.value;
   let origin = publicOrigin || configuredOrigin || '';
   let relyingPartyId = rpId || (origin ? new URL(origin).hostname : 'localhost');
+  // Password/session login can be reachable from more than one origin (e.g. a
+  // Cloudflare Tunnel hostname plus a bare LAN IP for local access) even
+  // though only one origin can ever be the WebAuthn RP — passkeys are bound to
+  // `origin`/`relyingPartyId` and will never work from an IP-address origin
+  // regardless of this list, per the WebAuthn spec (RP ID must be a domain).
+  const trustedOrigins = new Set(additionalOrigins.filter(Boolean));
   const setupFile = path.join(dataDir, 'first-run-setup-code');
 
   function userCount() {
@@ -213,7 +219,12 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
     const now = Date.now();
     db.prepare('INSERT INTO sessions(id_hash,user_id,csrf_hash,created_at,last_seen_at,expires_at,user_agent,ip) VALUES(?,?,?,?,?,?,?,?)')
       .run(digest(raw), user.id, digest(csrf), now, now, now + ABSOLUTE_MS, String(req.headers['user-agent'] || '').slice(0, 300), clientAddress(req, trustProxy));
-    const secure = origin.startsWith('https://') ? '; Secure' : '';
+    // Cookies are host-scoped (no Domain= is set), so this is safe to key off
+    // whichever origin the request actually came from: a plain-HTTP trusted
+    // origin (e.g. a LAN IP) needs a non-Secure cookie or the browser drops
+    // it, while the primary/tunnel origin keeps Secure as before.
+    const requestOrigin = String(req.headers.origin || '');
+    const secure = (requestOrigin || origin).startsWith('https://') ? '; Secure' : '';
     res.setHeader('Set-Cookie', [
       `cowork_session=${raw}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${ABSOLUTE_MS / 1000}${secure}`,
       `cowork_csrf=${csrf}; Path=/; SameSite=Lax; Max-Age=${ABSOLUTE_MS / 1000}${secure}`,
@@ -254,7 +265,7 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
   function originValid(req) {
     if (!origin) return true;
     const supplied = String(req.headers.origin || '');
-    return !supplied || supplied === origin;
+    return !supplied || supplied === origin || trustedOrigins.has(supplied);
   }
 
   async function createPasswordHash(password) {
