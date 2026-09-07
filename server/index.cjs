@@ -26,7 +26,7 @@ const rag = require('./rag.cjs');
 const storageClient = require('./storage-client.cjs');
 const { createModelManager } = require('./model-manager.cjs');
 const { createAuth, createRateLimiter } = require('./auth.cjs');
-const { createWorkspaceStore } = require('./workspace.cjs');
+const { createWorkspaceStore, atomicJson } = require('./workspace.cjs');
 const { createSecretStore } = require('./secrets.cjs');
 const { isPublicUrl } = require('./ssrf.cjs');
 
@@ -413,6 +413,66 @@ function writeHistory(spaceId, history) {
 // projects that have not picked a model yet (replaces the old DEFAULT_MODEL
 // literal per feature doc Item 0 / step 9).
 let LAST_LOADED_MODEL = null;
+
+// ── Usage accounting ──────────────────────────────────────────────────────
+// Daily rollup buckets rather than a per-reply log: the dashboard only ever
+// asks day-level questions (totals, a heat map, active days, per-model split),
+// and a bucket file is bounded — one small record per day, capped at a year —
+// where an append-only log on a self-hosted box grows until someone notices.
+// Per-message detail is not lost; it already lives in each chat's history.
+const USAGE_RETENTION_DAYS = 365;
+
+// Local civil date, not UTC: "today" on the dashboard should mean the
+// operator's today, and an evening request must not land in tomorrow's bucket.
+function usageDayKey(at = new Date()) {
+  const y = at.getFullYear();
+  const m = String(at.getMonth() + 1).padStart(2, '0');
+  const d = String(at.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+function readUsage(workspace) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(workspace.usagePath(), 'utf8'));
+    return parsed && typeof parsed.days === 'object' && parsed.days ? parsed : { days: {} };
+  } catch {
+    return { days: {} };
+  }
+}
+
+// Called once per completed reply, from the point the provider reports its
+// usage chunk. Recording here rather than from the browser means the numbers
+// survive a client that navigated away mid-reply, and cannot be shaped by
+// anything the client sends.
+function recordUsage(workspace, model, usage) {
+  if (!workspace || !usage) return;
+  const input = Number(usage.promptTokens) || 0;
+  const output = Number(usage.completionTokens) || 0;
+  if (!input && !output) return;
+  try {
+    const store = readUsage(workspace);
+    const key = usageDayKey();
+    const day = store.days[key] || { input: 0, output: 0, replies: 0, models: {} };
+    day.input += input;
+    day.output += output;
+    day.replies += 1;
+    const name = String(model || 'unknown');
+    const perModel = day.models[name] || { input: 0, output: 0, replies: 0 };
+    perModel.input += input;
+    perModel.output += output;
+    perModel.replies += 1;
+    day.models[name] = perModel;
+    store.days[key] = day;
+    // Drop anything past the window on write, so the file cannot creep upward
+    // even on a deployment that runs for years.
+    const cutoff = usageDayKey(new Date(Date.now() - USAGE_RETENTION_DAYS * 86400000));
+    for (const k of Object.keys(store.days)) if (k < cutoff) delete store.days[k];
+    atomicJson(workspace.usagePath(), store);
+  } catch (err) {
+    // Accounting must never break a reply that already succeeded.
+    console.warn('[usage] could not record:', err?.message || err);
+  }
+}
 
 // ── Auto model router (feature doc Item 4 / master step 12) ───────────────
 // Roles are config, never hardcoded model names: role→model mapping lives in
@@ -812,6 +872,12 @@ async function handleChat(req, res, body, authn) {
   // unhandled 'error' and crash the (single) server process.
   res.on('error', () => {});
 
+  // Captured up front rather than resolved inside the stream loop: usage is
+  // recorded after the upstream response has been iterated, and pinning the
+  // workspace here keeps that write bound to the requesting user no matter
+  // what the async context looks like by then.
+  const chatWorkspace = (() => { try { return currentWorkspace(); } catch { return null; } })();
+
   const msgs = (Array.isArray(history) ? history : [])
     .filter((h) => h && (h.role === 'user' || h.role === 'assistant') && typeof h.content === 'string' && h.content)
     .slice(-HISTORY_CAP)
@@ -1006,13 +1072,14 @@ async function handleChat(req, res, body, authn) {
             // The include_usage chunk carries no choices — only totals. Emit it
             // as its own event so the client can label the finished reply.
             if (evt.usage) {
-              send({
-                type: 'usage',
+              const reported = {
                 promptTokens: Number(evt.usage.prompt_tokens) || 0,
                 completionTokens: Number(evt.usage.completion_tokens) || 0,
                 totalTokens: Number(evt.usage.total_tokens) || 0,
                 tokensPerSecond: Number(evt.timings?.predicted_per_second) || 0,
-              });
+              };
+              recordUsage(chatWorkspace, model, reported);
+              send({ type: 'usage', ...reported });
             }
             const delta = evt.choices?.[0]?.delta || {};
             if (delta.reasoning_content) {
@@ -1426,6 +1493,64 @@ async function handleRequestScoped(req, res) {
     }
 
     // ── Projects CRUD ──
+    if (p === '/api/usage' && req.method === 'GET') {
+      const store = readUsage(currentWorkspace());
+      const today = usageDayKey();
+      // The heat map wants a dense year: every day present, zeros included,
+      // so the client never has to reconstruct the calendar itself.
+      const days = [];
+      const cursor = new Date();
+      cursor.setHours(12, 0, 0, 0); // midday avoids DST days shifting the key
+      for (let i = USAGE_RETENTION_DAYS - 1; i >= 0; i--) {
+        const at = new Date(cursor.getTime() - i * 86400000);
+        const key = usageDayKey(at);
+        const bucket = store.days[key];
+        days.push({
+          day: key,
+          input: bucket?.input || 0,
+          output: bucket?.output || 0,
+          replies: bucket?.replies || 0,
+        });
+      }
+      const windowTotals = (n) => days.slice(-n).reduce(
+        (acc, d) => ({ input: acc.input + d.input, output: acc.output + d.output, replies: acc.replies + d.replies }),
+        { input: 0, output: 0, replies: 0 },
+      );
+      const models = {};
+      for (const bucket of Object.values(store.days)) {
+        for (const [name, m] of Object.entries(bucket.models || {})) {
+          const entry = models[name] || { input: 0, output: 0, replies: 0 };
+          entry.input += m.input || 0;
+          entry.output += m.output || 0;
+          entry.replies += m.replies || 0;
+          models[name] = entry;
+        }
+      }
+      // Streak counts back from today, but a day with no usage yet does not
+      // break it — otherwise every streak reads 0 until the first reply.
+      let streak = 0;
+      for (let i = days.length - 1; i >= 0; i--) {
+        if (days[i].replies > 0) streak++;
+        else if (days[i].day !== today) break;
+      }
+      let longest = 0;
+      let run = 0;
+      for (const d of days) { run = d.replies > 0 ? run + 1 : 0; if (run > longest) longest = run; }
+      return json(res, 200, {
+        days,
+        allTime: windowTotals(days.length),
+        last7: windowTotals(7),
+        last30: windowTotals(30),
+        activeDays: days.filter((d) => d.replies > 0).length,
+        currentStreak: streak,
+        longestStreak: longest,
+        models: Object.entries(models)
+          .map(([name, m]) => ({ name, ...m }))
+          .sort((a, b) => b.input + b.output - (a.input + a.output)),
+        retentionDays: USAGE_RETENTION_DAYS,
+        timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'server local time',
+      });
+    }
     if (p === '/api/auto-roles') {
       if (req.method === 'GET') {
         const roles = autoRoles();
@@ -1894,4 +2019,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { checkAuth, handleRequest, classifierVerdict, heuristicWantsSmart, CLASSIFIER_MAX_TOKENS };
+module.exports = { checkAuth, handleRequest, classifierVerdict, heuristicWantsSmart, CLASSIFIER_MAX_TOKENS, recordUsage, readUsage, usageDayKey, USAGE_RETENTION_DAYS };

@@ -136,6 +136,7 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets) {
       saveFreeChats() { atomicJson(path.join(dir, 'free-chats.json'), this.freeChats); },
       saveAutoRoles() { atomicJson(path.join(dir, 'auto-roles.json'), this.autoRoles); },
       historyPath(id) { return path.join(dir, `history-${String(id).replace(/[^a-zA-Z0-9_-]/g, '')}.json`); },
+      usagePath() { return path.join(dir, 'usage.json'); },
       ragDir() { return path.join(dir, 'rag'); },
     };
     workspace.providers = mergeProviders(workspace.privateProviders);
