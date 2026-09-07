@@ -956,7 +956,18 @@ async function handleChat(req, res, body, authn) {
       upstream = await fetch(upstreamUrl, {
         method: 'POST',
         headers: upstreamHeaders,
-        body: JSON.stringify({ model, messages: roundMessages, stream: true, tools: TOOL_DEFS }),
+        // include_usage adds one final chunk carrying token counts (and, on
+        // llama.cpp, timings) after the content is done. It is the only way to
+        // report real usage for a streamed reply instead of guessing from
+        // character counts client-side. Providers that do not know the field
+        // ignore it; the chunk simply never arrives and the UI omits the stats.
+        body: JSON.stringify({
+          model,
+          messages: roundMessages,
+          stream: true,
+          stream_options: { include_usage: true },
+          tools: TOOL_DEFS,
+        }),
         signal: chatSignal.signal,
         redirect: 'error', // see the provider test route: no inward bounces
       });
@@ -992,6 +1003,17 @@ async function handleChat(req, res, body, authn) {
           if (payload === '[DONE]') continue;
           try {
             const evt = JSON.parse(payload);
+            // The include_usage chunk carries no choices — only totals. Emit it
+            // as its own event so the client can label the finished reply.
+            if (evt.usage) {
+              send({
+                type: 'usage',
+                promptTokens: Number(evt.usage.prompt_tokens) || 0,
+                completionTokens: Number(evt.usage.completion_tokens) || 0,
+                totalTokens: Number(evt.usage.total_tokens) || 0,
+                tokensPerSecond: Number(evt.timings?.predicted_per_second) || 0,
+              });
+            }
             const delta = evt.choices?.[0]?.delta || {};
             if (delta.reasoning_content) {
               sawAnything = true;
