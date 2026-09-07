@@ -25,7 +25,7 @@ const { AsyncLocalStorage } = require('async_hooks');
 const rag = require('./rag.cjs');
 const storageClient = require('./storage-client.cjs');
 const { createModelManager } = require('./model-manager.cjs');
-const { createAuth } = require('./auth.cjs');
+const { createAuth, createRateLimiter } = require('./auth.cjs');
 const { createWorkspaceStore } = require('./workspace.cjs');
 const { createSecretStore } = require('./secrets.cjs');
 const { isPublicUrl } = require('./ssrf.cjs');
@@ -58,6 +58,19 @@ const authService = createAuth({
 if (process.env.LEMONADE_BASE_URL && !process.env.INFERENCE_BASE_URL) console.warn('LEMONADE_BASE_URL is deprecated; use INFERENCE_BASE_URL');
 if (process.env.LEMONADE_API_KEY && !process.env.INFERENCE_API_KEY) console.warn('LEMONADE_API_KEY is deprecated; use INFERENCE_API_KEY');
 const workspaceStore = createWorkspaceStore(DATA_DIR, { id: DEFAULT_PROVIDER_ID, label: DEFAULT_PROVIDER_LABEL, baseUrl: INFERENCE_BASE, apiKey: INFERENCE_KEY, shared: true }, secretStore);
+
+// Per-user throttle for LLM-backed routes. Every hit is a full model call
+// against the shared inference endpoint, so one member (or a runaway client)
+// must not be able to hog it. Fixed window, shared bucket across chat and
+// Insights reflections. Admins are throttled like everyone else. Raise
+// LLM_RATE_LIMIT for a beefier inference host.
+const LLM_RATE_ROUTES = new Set(['/api/chat', '/api/diary/insights/reflect', '/api/diary/insights/about-question']);
+const LLM_RATE_LIMIT = Math.max(1, Number(process.env.LLM_RATE_LIMIT || 60));
+const LLM_RATE_WINDOW_MS = 60 * 1000;
+const llmRateLimiter = createRateLimiter();
+function llmRateLimited(userId) {
+  return llmRateLimiter.rateLimited(`llm:${userId}`, LLM_RATE_LIMIT, LLM_RATE_WINDOW_MS);
+}
 const requestScope = new AsyncLocalStorage();
 const nextcloudFlows = new Map();
 function currentWorkspace() {
@@ -1652,6 +1665,7 @@ async function handleRequestScoped(req, res) {
     }
 
     if (p === '/api/diary/insights/reflect' && req.method === 'POST') {
+      if (llmRateLimited(authn.user.id)) return json(res, 429, { error: 'Too many requests — the model endpoint is shared; wait a moment and try again' });
       if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
       let raw = '';
       for await (const c of req) raw += c;
@@ -1671,6 +1685,7 @@ async function handleRequestScoped(req, res) {
     }
 
     if (p === '/api/diary/insights/about-question' && req.method === 'POST') {
+      if (llmRateLimited(authn.user.id)) return json(res, 429, { error: 'Too many requests — the model endpoint is shared; wait a moment and try again' });
       if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
       let raw = '';
       for await (const c of req) raw += c;
@@ -1755,6 +1770,7 @@ async function handleRequestScoped(req, res) {
     }
 
     if (p === '/api/chat' && req.method === 'POST') {
+      if (llmRateLimited(authn.user.id)) return json(res, 429, { error: 'Too many requests — the model endpoint is shared; wait a moment and try again' });
       let raw = '';
       for await (const c of req) raw += c;
       let body;
