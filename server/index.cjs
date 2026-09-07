@@ -572,42 +572,92 @@ function heuristicWantsSmart(message) {
 // fail-open philosophy of diary-companion's pipeline.py skip_classifier: any
 // error or unparseable reply defaults to the fast role — the classifier must
 // never block the chat.
+const CLASSIFIER_SYSTEM_PROMPT =
+  'You classify a user message for a model router. Reply with exactly one word: FAST for short simple questions or small talk, SMART for complex reasoning, multi-step work, code, or analysis. No other text.';
+
+// Budget for the classifier reply. A non-reasoning answer is 1-3 tokens; this
+// only has to be large enough for a reasoning model that ignores the
+// no-thinking hint below to finish its chain of thought and still emit the
+// verdict. Measured against the local roster (2026-09-07): gemma-4-E2B needs
+// ~162 tokens thinking, Qwen3.5-9B ~427. The old value of 64 truncated both —
+// finish_reason came back 'length' with an empty content field, no verdict was
+// ever found, and every message silently fell open to fast. That is why auto
+// mode looked biased rather than broken.
+const CLASSIFIER_MAX_TOKENS = 512;
+
+function classifierBody(model, message, suppressThinking) {
+  const body = {
+    model,
+    messages: [
+      { role: 'system', content: CLASSIFIER_SYSTEM_PROMPT },
+      { role: 'user', content: String(message).slice(0, 1000) },
+    ],
+    max_tokens: CLASSIFIER_MAX_TOKENS,
+    temperature: 0,
+    stream: false,
+  };
+  // Routing is a mechanical label, not a reasoning task, so ask the model to
+  // skip its chain of thought. llama.cpp/vLLM honour this; on the local
+  // roster it cuts the call from ~162-427 tokens (12-31s on an iGPU, paid
+  // before every single auto-routed message) to 2-3 tokens under 80ms.
+  // Providers that reject unknown fields get a retry without it — see below.
+  if (suppressThinking) body.chat_template_kwargs = { enable_thinking: false };
+  return JSON.stringify(body);
+}
+
+// Read the verdict out of a classifier reply. content is authoritative when
+// present; the reasoning channel is only a fallback, and deliberately a
+// last-resort one: a thinking model restates the prompt's own FAST/SMART
+// wording while deliberating, so scanning it can pick up the prompt's words
+// rather than the model's conclusion.
+function classifierVerdict(msg) {
+  const content = String(msg.content || '').toUpperCase();
+  const direct = content.match(/\b(SMART|FAST)\b/g);
+  if (direct) return direct[direct.length - 1].toLowerCase();
+  const reasoning = String(msg.reasoning_content || '').toUpperCase();
+  const hits = reasoning.match(/\b(SMART|FAST)\b/g);
+  return hits ? hits[hits.length - 1].toLowerCase() : null;
+}
+
 async function classifyFastOrSmart(message) {
   const roles = autoRoles();
   if (!roles) return 'fast';
   if (heuristicWantsSmart(message)) return 'smart';
   try {
     const defaultProvider = getProvider(DEFAULT_PROVIDER_ID);
-    const r = await fetchJson(
-      `${defaultProvider.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`,
-      {
-        method: 'POST',
-        headers: providerHeaders(defaultProvider),
-        body: JSON.stringify({
-          model: roles.fast,
-          messages: [
-            {
-              role: 'system',
-              content:
-                'You classify a user message for a model router. Reply with exactly one word: FAST for short simple questions or small talk, SMART for complex reasoning, multi-step work, code, or analysis. No other text.',
-            },
-            { role: 'user', content: String(message).slice(0, 1000) },
-          ],
-          max_tokens: 64,
-          temperature: 0,
-          stream: false,
-        }),
-      },
-      20000,
-    );
+    const url = `${defaultProvider.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`;
+    const call = (suppressThinking) =>
+      fetchJson(
+        url,
+        {
+          method: 'POST',
+          headers: providerHeaders(defaultProvider),
+          body: classifierBody(roles.fast, message, suppressThinking),
+        },
+        20000,
+      );
+    let r = await call(true);
+    // chat_template_kwargs is a llama.cpp/vLLM extension. A strict provider
+    // (or a gateway in front of one) may 400 on the unknown field; retry once
+    // plainly rather than degrading to fast, which is the failure this whole
+    // function exists to avoid.
+    if (r.status === 400) {
+      console.warn('[router] classifier rejected chat_template_kwargs (400), retrying without it');
+      r = await call(false);
+    }
     if (!r.ok) throw new Error(`classifier ${r.status}`);
-    const msg = r.body?.choices?.[0]?.message || {};
-    // Scan the whole reply (some small models spend tokens on preamble before
-    // the verdict, or put it in the reasoning channel): last FAST/SMART wins.
-    const text = `${msg.content || ''} ${msg.reasoning_content || ''}`.toUpperCase();
-    const hits = text.match(/\b(SMART|FAST)\b/g);
-    const verdict = hits ? hits[hits.length - 1].toLowerCase() : 'fast';
-    console.log(`[router] classified -> ${verdict}${hits ? '' : ' (no verdict found, fail-open)'}`);
+    const choice = r.body?.choices?.[0] || {};
+    const verdict = classifierVerdict(choice.message || {});
+    if (!verdict) {
+      // Distinguish "ran out of room mid-thought" from "answered something
+      // unparseable" — the first is a budget problem, the second a prompt one.
+      const truncated = choice.finish_reason === 'length';
+      console.warn(
+        `[router] no verdict in classifier reply${truncated ? ` (truncated at ${CLASSIFIER_MAX_TOKENS} tokens)` : ''}, failing open to fast`,
+      );
+      return 'fast';
+    }
+    console.log(`[router] classified -> ${verdict}`);
     return verdict;
   } catch (err) {
     console.warn('[router] classify failed, failing open to fast:', err?.message || err);
@@ -1822,4 +1872,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { checkAuth, handleRequest };
+module.exports = { checkAuth, handleRequest, classifierVerdict, heuristicWantsSmart, CLASSIFIER_MAX_TOKENS };
