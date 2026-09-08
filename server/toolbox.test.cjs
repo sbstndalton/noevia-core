@@ -115,13 +115,13 @@ test('toolbox summaries carry the per-turn cost the UI shows', () => {
   assert.equal(core.id, 'core');
   assert.equal(core.source, 'builtin');
   assert.equal(core.toolCount, 2);
-  // Calibrated against a live measurement: the two core tools cost 386 prompt
-  // tokens on Qwen3.5-9B (456 with the box, 70 without). Hold the estimate to
-  // within 25% of that, so a future edit to a tool description cannot quietly
-  // drift the number the UI shows.
+  // Pinned to a live measurement: the two core tools cost 390 prompt tokens on
+  // Qwen3.5-9B, of which ~240 is the fixed tool-calling preamble charged once
+  // per request. estimateToolTokens reports only the MARGINAL cost, so per-box
+  // numbers stay additive — hence ~150-250 here, not 390.
   assert.ok(
-    Math.abs(core.estTokens - 386) / 386 < 0.25,
-    `estimate drifted from the measured 386: ${core.estTokens}`,
+    core.estTokens > 120 && core.estTokens < 280,
+    `core box marginal estimate looks wrong: ${core.estTokens}`,
   );
   assert.equal(estimateToolTokens([]), 0);
 });

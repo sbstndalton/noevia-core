@@ -574,26 +574,42 @@ function allToolboxes() {
   return [...TOOLBOXES, ...mcpState.boxes];
 }
 
-// A tool definition is re-sent on EVERY turn, so its size is a recurring cost
-// and the count is the budget that matters.
+// A tool definition is re-sent on EVERY turn, so its size is a recurring cost.
 //
-// The naive ~4 chars/token rule badly undercounts here, because the provider
-// does not put the JSON on the wire as-is: llama.cpp's chat template re-renders
-// every tool into its own scaffolding before the model ever sees it. Measured
-// against the live endpoint on 2026-09-08 with Qwen3.5-9B — the identical
-// message cost 456 prompt tokens with the core box and 70 without it, so the
-// two core tools really cost 386, against a naive estimate of 180. Hence the
-// calibration factor, which is deliberately tuned to the heavier template:
-// the same box on Gemma-4-E4B cost only 232 prompt tokens for the whole
-// request, so the real factor is template-dependent and this one is closer to
-// a worst case than an average. Treat the output as an order-of-magnitude hint
-// — it is labelled "~" in the UI — but an estimate that is 2x LOW is worse
-// than useless when the point is deciding what a 14 tok/s box can afford, and
-// erring high fails safe.
-const TOOL_TOKEN_CALIBRATION = 2.1;
+// Estimating it as chars/4 is wrong twice over. The provider does not put the
+// JSON on the wire as-is — llama.cpp's chat template re-renders every tool —
+// and there is a FIXED preamble for enabling tool calling at all, which a flat
+// multiplier cannot express. That fixed cost is why a tiny box looks wildly
+// expensive per character while a large one looks cheap.
+//
+// Measured directly against the live endpoint on 2026-09-08 (same message,
+// only `tools` differing, so nothing else contaminates the comparison):
+//
+//   box        chars   actual   model    err
+//   core         719      390     440   +13%
+//   notes      2,349      883     892    +1%
+//   talk       2,749      895   1,004   +12%
+//   calendar  15,535    4,512   4,555    +1%
+//   files      8,170    2,190   2,509   +15%
+//   contacts   6,038    1,650   1,917   +16%
+//   deck       8,415    2,533   2,578    +2%
+//
+// So: tokens ≈ TOOL_PREAMBLE_TOKENS + chars/3.6. It never under-predicts and
+// is at worst 16% high, which is the right direction for a budget — but only
+// just. An earlier version of this used a flat 2.1x factor derived from the
+// core box alone, which over-predicted the MCP boxes by up to 2x and made
+// nc_calendar_create_event unreachable despite it fitting comfortably. An
+// estimate that is too high silently withholds tools the hardware can afford,
+// which is a quieter failure than one that is too low, not a safer one.
+const TOOL_PREAMBLE_TOKENS = 240; // paid once per request that sends any tool
+const TOOL_CHARS_PER_TOKEN = 3.6;
+
+// The MARGINAL cost of these tools — the fixed preamble is deliberately not
+// included, so per-box numbers stay additive and the caller adds the preamble
+// exactly once for the whole request.
 function estimateToolTokens(tools) {
   if (!Array.isArray(tools) || tools.length === 0) return 0; // no tools, no cost
-  return Math.round((JSON.stringify(tools).length / 4) * TOOL_TOKEN_CALIBRATION);
+  return Math.round(JSON.stringify(tools).length / TOOL_CHARS_PER_TOKEN);
 }
 
 // How many tools a model can be handed before the catalogue crowds out the
@@ -628,11 +644,12 @@ const TOOL_CAP_SMALL = 12;
 //    30 tools   6,895 tok   21.2 s
 //
 // So the budget is really a latency target, and these numbers are it:
-// ~4,500 tokens is about 12 seconds of silence before the first word, which is
-// the most a small local model can spend and still feel like a conversation.
+// ~5,000 tokens is about 14 seconds of silence before the first word. That is
+// a lot, and it is the honest price of the full calendar box on this hardware
+// (measured: 4,512 tokens, 14.1 s). It is the dial to turn if turns feel slow.
 // Larger/remote models are not prefill-bound in the same way and get more.
 const TOOL_TOKEN_BUDGET_DEFAULT = 8000;
-const TOOL_TOKEN_BUDGET_SMALL = 4500;
+const TOOL_TOKEN_BUDGET_SMALL = 5000;
 function toolTokenBudgetFor(model) {
   const m = /(\d+(?:\.\d+)?)\s*[bB]\b/.exec(String(model || ''));
   if (m && Number(m[1]) <= 12) return TOOL_TOKEN_BUDGET_SMALL;
@@ -682,7 +699,9 @@ function resolveTools(project, model) {
   const budget = toolTokenBudgetFor(model);
   const tools = [];
   const dropped = [];
-  let spent = 0;
+  // Enabling tool calling at all costs a fixed preamble, so it is charged once
+  // up front rather than smeared across the tools.
+  let spent = candidates.length ? TOOL_PREAMBLE_TOKENS : 0;
   for (const tool of candidates) {
     const cost = estimateToolTokens([tool]);
     if (tools.length >= cap) { dropped.push(`${tool.function.name} (over ${cap}-tool cap)`); continue; }

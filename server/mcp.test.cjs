@@ -120,18 +120,20 @@ test('the token budget drops expensive tools that the count cap would admit', ()
     type: 'function',
     function: { name: n, description: 'x'.repeat(chars), parameters: { type: 'object', properties: {}, required: [] } },
   });
-  // ~2,700 calibrated tokens each, i.e. a realistic create_event.
-  const box = { id: 'test-fat', label: 'Fat', description: 'd', source: 'mcp', tools: [fat('a', 5100), fat('b', 5100), fat('c', 5100)] };
+  // ~2,700 marginal tokens each at chars/3.6, i.e. a realistic create_event.
+  const box = { id: 'test-fat', label: 'Fat', description: 'd', source: 'mcp', tools: [fat('a', 9700), fat('b', 9700), fat('c', 9700)] };
   const { TOOLBOXES } = require('./index.cjs');
   TOOLBOXES.push(box);
   try {
     const r = resolveTools({ toolboxes: ['test-fat'] }, 'Qwen3.5-9B');
-    assert.equal(r.budget, 4500);
+    assert.equal(r.budget, 5000);
     assert.equal(r.cap, 12); // the count cap would have admitted all three
     assert.equal(r.tools.length, 1); // the budget admits one
     assert.equal(r.dropped.length, 2);
-    assert.match(r.dropped[0], /over 4500 budget/);
+    assert.match(r.dropped[0], /over 5000 budget/);
     assert.ok(r.estTokens <= r.budget, `spent ${r.estTokens} over budget ${r.budget}`);
+    // The fixed preamble is charged once, so the total exceeds the tools alone.
+    assert.ok(r.estTokens > 2700, `preamble not charged: ${r.estTokens}`);
     // Selection order decides who survives, so the result is explainable.
     assert.equal(r.tools[0].function.name, 'a');
   } finally {
@@ -157,8 +159,8 @@ test('a single tool larger than the whole budget is dropped, not forced through'
 });
 
 test('budget scales with model size, like the count cap', () => {
-  assert.equal(toolTokenBudgetFor('Qwen3.5-9B-GGUF'), 4500);
-  assert.equal(toolTokenBudgetFor('Gemma-4-E4B-it-GGUF-4b'), 4500);
+  assert.equal(toolTokenBudgetFor('Qwen3.5-9B-GGUF'), 5000);
+  assert.equal(toolTokenBudgetFor('Gemma-4-E4B-it-GGUF-4b'), 5000);
   assert.equal(toolTokenBudgetFor('claude-sonnet-4-5'), 8000);
 });
 
