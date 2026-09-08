@@ -2296,6 +2296,7 @@ async function handleRequestScoped(req, res) {
         instructions: String(body.instructions || '').slice(0, 8000),
         pinned: false,
         archived: false,
+        sourceFolders: [],
         memories: [],
         files: Array.isArray(body.files)
           ? body.files
@@ -2360,6 +2361,13 @@ async function handleRequestScoped(req, res) {
       // Pin and archive are plain booleans rather than a status enum: a project
       // can be both pinned and archived, and collapsing them would lose that.
       if (typeof patch.pinned === 'boolean') project.pinned = patch.pinned;
+      if (Array.isArray(patch.sourceFolders)) {
+        project.sourceFolders = patch.sourceFolders
+          .filter((f) => typeof f === 'string' && f.trim())
+          .map((f) => storageClient.safeRelativePath(f))
+          .filter(Boolean)
+          .slice(0, 10);
+      }
       if (typeof patch.archived === 'boolean') project.archived = patch.archived;
       if (typeof patch.routing === 'string') {
         if (patch.routing !== 'auto' && patch.routing !== 'manual') {
@@ -2385,7 +2393,11 @@ async function handleRequestScoped(req, res) {
         project.files = patch.files
           .filter((f) => f && typeof f.name === 'string' && typeof f.content === 'string')
           .slice(0, 20)
-          .map((f) => ({ name: f.name.slice(0, 200), content: f.content.slice(0, 200000) }));
+          .map((f) => ({
+            name: f.name.slice(0, 200),
+            content: f.content.slice(0, 200000),
+            ...(typeof f.source === 'string' && f.source ? { source: f.source.slice(0, 300) } : {}),
+          }));
         // RAG bookkeeping (step 10): drop chunks for removed files; index
         // new/changed ones. Fire-and-forget — upload latency must not depend
         // on embedding round-trips.
@@ -2435,6 +2447,65 @@ async function handleRequestScoped(req, res) {
           return json(res, 400, { error: 'invalid JSON' });
         }
       }
+    }
+
+    // Re-read every attached storage folder and refresh the project's sources
+    // from it. Folder-derived files carry `source`; uploaded ones do not, so a
+    // sync replaces what came from folders and never touches an upload. This
+    // is what makes an attached folder live rather than a one-time copy.
+    const projSync = p.match(/^\/api\/projects\/([^/]+)\/sources\/sync$/);
+    if (projSync && req.method === 'POST') {
+      const id = decodeURIComponent(projSync[1]);
+      const project = getProject(id);
+      if (!project) return json(res, 404, { error: 'no such project' });
+      const folders = Array.isArray(project.sourceFolders) ? project.sourceFolders : [];
+      const connection = authService.getStorage(authn.user.id, true);
+      if (folders.length && !storageClient.isBrowsable(connection)) {
+        return json(res, 400, { error: 'no browsable storage connection is configured' });
+      }
+      const uploaded = (project.files || []).filter((f) => !f.source);
+      const fromFolders = [];
+      const skipped = [];
+      for (const folder of folders) {
+        let entries;
+        try {
+          entries = await storageClient.listFiles(connection, folder);
+        } catch (e) {
+          skipped.push({ folder, reason: e && e.message ? e.message : 'could not list folder' });
+          continue;
+        }
+        for (const entry of entries) {
+          if (entry.isDir) continue; // one level: recursing could pull a whole drive in
+          if (!storageClient.TEXT_EXTENSIONS.has((entry.ext || '').toLowerCase())) continue;
+          if (fromFolders.length >= 40) break; // a cap, so one big folder cannot blow up a project
+          try {
+            const file = await storageClient.readTextFile(connection, entry.path);
+            fromFolders.push({ name: entry.path, content: file.content, source: folder });
+          } catch (e) {
+            skipped.push({ folder, file: entry.path, reason: e && e.message ? e.message : 'could not read' });
+          }
+        }
+      }
+      const prev = Array.isArray(project.files) ? project.files : [];
+      project.files = [...uploaded, ...fromFolders].slice(0, 60);
+      saveProjects(PROJECTS);
+      // Same RAG bookkeeping the config patch does: drop chunks for files that
+      // are gone, re-index the ones that arrived or changed.
+      const prevByName = new Map(prev.map((f) => [f.name, f]));
+      const nextNames = new Set(project.files.map((f) => f.name));
+      for (const old of prev) {
+        if (!nextNames.has(old.name)) rag.deleteProjectFile(id, old.name, currentWorkspace().userId);
+      }
+      for (const next of project.files) {
+        const before = prevByName.get(next.name);
+        if (!before || before.content !== next.content) {
+          rag.indexProjectFile(id, next.name, next.content, currentWorkspace().userId);
+        }
+      }
+      return json(res, 200, {
+        files: project.files.map((f) => ({ name: f.name, source: f.source || null, bytes: f.content.length })),
+        skipped,
+      });
     }
 
     const chatDel = p.match(/^\/api\/projects\/([^/]+)\/chats\/([^/]+)$/);
