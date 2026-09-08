@@ -792,6 +792,27 @@ const MCP_TOOLBOX_MANIFEST = [
   // nc_cookbook_reindex administer the app itself rather than doing anything
   // with a recipe, and nothing a chat asks for should reach them.
   {
+    id: 'web-search',
+    server: 'tavily',
+    label: 'Web search',
+    description: 'Search the web, read a page, and research a topic.',
+    // Every one of these is a read, and none of them touch your data — but
+    // they do reach the public internet and spend metered credits, which is a
+    // different kind of consequence from reading a local file.
+    tools: ['tavily_search', 'tavily_extract', 'tavily_research'],
+    reads: ['tavily_search', 'tavily_extract', 'tavily_research'],
+  },
+  {
+    id: 'web-crawl',
+    server: 'tavily',
+    label: 'Web crawl',
+    description: 'Map a site’s structure and crawl it page by page.',
+    // Separated because a crawl is many requests from one call: it can spend a
+    // month of credits on a single large site, which a search cannot.
+    tools: ['tavily_crawl', 'tavily_map'],
+    reads: ['tavily_crawl', 'tavily_map'],
+  },
+  {
     id: 'nextcloud-notes',
     server: 'nextcloud',
     label: 'Nextcloud Notes',
@@ -1099,12 +1120,31 @@ const MCP_SERVERS = (() => {
       if (!id || !rawUrl) { console.warn(`[mcp] ignoring malformed MCP_SERVERS entry "${entry}"`); continue; }
       if (seen.has(id)) { console.warn(`[mcp] ignoring duplicate MCP server id "${id}"`); continue; }
       if (!shapeOk(rawUrl, `MCP server "${id}"`)) continue;
-      const auth = rawAuth === 'nextcloud' ? 'nextcloud' : 'none';
-      if (rawAuth && rawAuth !== 'nextcloud' && rawAuth !== 'none') {
+      // `bearer:ENV_NAME` reads a static token from that environment variable.
+      // The name, not the value, goes in the config: a key belongs in its own
+      // variable, never in a URL that gets logged, and never inline here where
+      // it would be printed by anything that echoes the server list.
+      let auth = 'none';
+      let tokenEnv = null;
+      if (rawAuth === 'nextcloud') {
+        auth = 'nextcloud';
+      } else if (rawAuth && rawAuth.startsWith('bearer:')) {
+        const envName = rawAuth.slice('bearer:'.length).trim();
+        if (!/^[A-Z0-9_]+$/.test(envName)) {
+          console.warn(`[mcp] server "${id}": bearer needs an environment variable name, got "${envName}" — treating as none`);
+        } else if (!process.env[envName]) {
+          console.warn(`[mcp] server "${id}": ${envName} is not set, so its tools will not authenticate`);
+          auth = 'bearer';
+          tokenEnv = envName;
+        } else {
+          auth = 'bearer';
+          tokenEnv = envName;
+        }
+      } else if (rawAuth && rawAuth !== 'none') {
         console.warn(`[mcp] server "${id}": unknown auth "${rawAuth}", treating as none`);
       }
       seen.add(id);
-      out.push({ id, url: rawUrl, auth });
+      out.push({ id, url: rawUrl, auth, ...(tokenEnv ? { tokenEnv } : {}) });
     }
     return out;
   }
@@ -1161,11 +1201,12 @@ const mcpState = {
 const MCP_DISCOVERY_TTL_MS = 10 * 60 * 1000;
 
 async function discoverOneServer(server) {
-  // Discovery lists the catalogue only; it carries no user credential, so the
-  // shape of the toolbox is identical for everyone. The per-user credential is
-  // attached at CALL time instead — see mcpAuthHeaders().
-  const { session } = await mcp.connect(server.url);
-  const discovered = await mcp.listTools(server.url, session);
+  // Discovery lists the catalogue only. A per-USER credential is attached at
+  // call time instead (see mcpAuthHeaders), but a static service token has to
+  // be present here or the server has nothing to list.
+  const headers = mcpStaticAuth(server);
+  const { session } = await mcp.connect(server.url, headers);
+  const discovered = await mcp.listTools(server.url, session, headers);
   const byName = new Map();
   const dropped = [];
   for (const t of discovered) {
@@ -1297,6 +1338,15 @@ function mcpCredentialOriginAllowed(baseUrl) {
 // is the same secret whichever way the user attached it, and in practice the
 // generic WebDAV form is common. The origin allowlist above, not the `kind`
 // label, is what makes this safe.
+/** A server's own service token, if it was configured with one. Distinct from
+ *  mcpAuthHeaders, which forwards the USER's Nextcloud credential — this is a
+ *  single key belonging to noevia's deployment, identical for everyone. */
+function mcpStaticAuth(server) {
+  if (!server || server.auth !== 'bearer' || !server.tokenEnv) return null;
+  const token = process.env[server.tokenEnv];
+  return token ? { Authorization: `Bearer ${token}` } : null;
+}
+
 function mcpAuthHeaders() {
   const store = requestScope.getStore();
   const workspace = store && store.workspace;
@@ -1507,7 +1557,10 @@ async function executeMcpToolCall(name, args) {
   // somebody else's service, so only a server the operator marked
   // auth=nextcloud gets it — and then only if the origin allowlist agrees.
   let auth = null;
-  if (server.auth === 'nextcloud') {
+  if (server.auth === 'bearer') {
+    auth = mcpStaticAuth(server);
+    if (!auth) return `ERROR: ${name} needs ${server.tokenEnv}, which is not configured on this deployment.`;
+  } else if (server.auth === 'nextcloud') {
     auth = mcpAuthHeaders();
     if (!auth) {
       // Actionable on purpose: the model relays this to the user, and the fix

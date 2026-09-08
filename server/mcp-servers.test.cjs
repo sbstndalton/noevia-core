@@ -57,14 +57,25 @@ test('no MCP configuration at all is a supported state', () => {
   assert.deepEqual(parseWith({}), []);
 });
 
-test('every curated box names a server that exists', () => {
+test('every box names a server, and boxes for an unconfigured one are not offered', () => {
+  // The manifest is a catalogue, not a deployment: it may curate boxes for a
+  // server this instance does not run (Tavily is optional). What must hold is
+  // that every box names SOME server, and that a box whose server is absent is
+  // filtered out rather than offered as a promise nothing can keep.
   parseWith({ MCP_SERVER_URL: 'http://nextcloud-mcp:8000/mcp' });
   const { MCP_TOOLBOX_MANIFEST, MCP_SERVERS } = require('./index.cjs');
-  const ids = new Set(MCP_SERVERS.map((s) => s.id));
+  const configured = new Set(MCP_SERVERS.map((s) => s.id));
+  assert.deepEqual([...configured], ['nextcloud']);
+
   for (const box of MCP_TOOLBOX_MANIFEST) {
-    assert.ok(box.server, `box ${box.id} declares no server`);
-    assert.ok(ids.has(box.server), `box ${box.id} names unknown server "${box.server}"`);
+    assert.ok(typeof box.server === 'string' && box.server, `box ${box.id} declares no server`);
   }
+
+  // Discovery only binds a box against its own server's tools, so a box for an
+  // unconfigured server can never acquire any and never reaches the picker.
+  const orphaned = MCP_TOOLBOX_MANIFEST.filter((b) => !configured.has(b.server));
+  assert.ok(orphaned.length > 0, 'expected at least one optional-server box to exist');
+  assert.ok(orphaned.every((b) => b.server !== 'nextcloud'));
 });
 
 // ── which boxes are offered ──────────────────────────────────────────────

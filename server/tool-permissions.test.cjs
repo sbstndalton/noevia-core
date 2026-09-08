@@ -43,6 +43,10 @@ test('the read classification matches what each box actually claims', () => {
   // silently removes its approval prompt, so it must be changed here too and
   // reviewed alongside the manifest.
   const expected = {
+    // Web tools are all reads: none of them change anything. They do reach the
+    // public internet and spend metered credits, which the box split reflects.
+    'web-search': ['tavily_search', 'tavily_extract', 'tavily_research'],
+    'web-crawl': ['tavily_crawl', 'tavily_map'],
     'nextcloud-notes': ['nc_notes_search_notes', 'nc_notes_get_note', 'nc_notes_get_attachment'],
     'nextcloud-calendar': [
       'nc_calendar_list_calendars', 'nc_calendar_list_events', 'nc_calendar_get_event',
