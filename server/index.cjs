@@ -2438,6 +2438,7 @@ async function handleRequestScoped(req, res) {
                 id: c.id.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80),
                 title: String(c.title || 'New task').slice(0, 120),
                 updatedAt: typeof c.updatedAt === 'number' ? c.updatedAt : Date.now(),
+                preview: String(c.preview || '').slice(0, 200),
                 pinned: c.pinned === true,
                 archived: c.archived === true,
               })),
@@ -2531,6 +2532,7 @@ async function handleRequestScoped(req, res) {
               id: c.id.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80),
               title: String(c.title || 'New chat').slice(0, 120),
               updatedAt: typeof c.updatedAt === 'number' ? c.updatedAt : Date.now(),
+              preview: String(c.preview || '').slice(0, 200),
               pinned: c.pinned === true,
               archived: c.archived === true,
             }));
