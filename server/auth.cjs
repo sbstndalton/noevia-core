@@ -309,6 +309,10 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
 
   return {
     db, get origin() { return origin; }, get rpId() { return relyingPartyId; }, userCount, authenticate, csrfValid, originValid, publicUser, issueSession,
+    // Exposed for the tool permission gate (step 16): every write tool call is
+    // recorded here, so "what did the model actually do on my behalf" is
+    // answerable from the same log as logins and storage changes.
+    audit,
     async setup(req, res, body) {
       if (userCount() !== 0) return { status: 409, body: { error: 'setup already complete' } };
       if (rateLimited(`setup:${clientAddress(req, trustProxy)}`)) return { status: 429, body: { error: 'try again later' } };

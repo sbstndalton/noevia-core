@@ -561,6 +561,7 @@ const TOOLBOXES = [
     description: 'Always-safe built-ins: the server clock, and full reads of this project\'s knowledge files.',
     source: 'builtin',
     tools: CORE_TOOLS,
+    reads: ['get_current_time', 'read_project_file'],
   },
 ];
 
@@ -694,6 +695,7 @@ const MCP_TOOLBOX_MANIFEST = [
       'nc_notes_search_notes', 'nc_notes_get_note', 'nc_notes_create_note',
       'nc_notes_append_content', 'nc_notes_update_note', 'nc_notes_delete_note',
     ],
+    reads: ['nc_notes_search_notes', 'nc_notes_get_note'],
   },
   {
     id: 'nextcloud-calendar',
@@ -703,6 +705,7 @@ const MCP_TOOLBOX_MANIFEST = [
       'nc_calendar_list_calendars', 'nc_calendar_list_events', 'nc_calendar_get_upcoming_events',
       'nc_calendar_create_event', 'nc_calendar_update_event', 'nc_calendar_delete_event',
     ],
+    reads: ['nc_calendar_list_calendars', 'nc_calendar_list_events', 'nc_calendar_get_upcoming_events'],
   },
   {
     id: 'nextcloud-files',
@@ -712,6 +715,7 @@ const MCP_TOOLBOX_MANIFEST = [
       'nc_webdav_list_directory', 'nc_webdav_read_file', 'nc_webdav_write_file',
       'nc_webdav_search_files', 'nc_webdav_find_by_name',
     ],
+    reads: ['nc_webdav_list_directory', 'nc_webdav_read_file', 'nc_webdav_search_files', 'nc_webdav_find_by_name'],
   },
   {
     id: 'nextcloud-contacts',
@@ -721,12 +725,14 @@ const MCP_TOOLBOX_MANIFEST = [
       'nc_contacts_list_contacts', 'nc_contacts_search_contacts',
       'nc_contacts_create_contact', 'nc_contacts_update_contact',
     ],
+    reads: ['nc_contacts_list_contacts', 'nc_contacts_search_contacts'],
   },
   {
     id: 'nextcloud-talk',
     label: 'Nextcloud Talk',
     description: 'Read conversations and send messages.',
     tools: ['talk_list_conversations', 'talk_get_messages', 'talk_send_message'],
+    reads: ['talk_list_conversations', 'talk_get_messages'],
   },
   {
     id: 'nextcloud-deck',
@@ -736,6 +742,7 @@ const MCP_TOOLBOX_MANIFEST = [
       'deck_get_boards', 'deck_get_board_overview', 'deck_get_cards',
       'deck_create_card', 'deck_update_card', 'deck_move_card_to_board',
     ],
+    reads: ['deck_get_boards', 'deck_get_board_overview', 'deck_get_cards'],
   },
 ];
 
@@ -876,6 +883,101 @@ function mcpAuthHeaders() {
   }
   const basic = Buffer.from(`${storage.username}:${storage.secret}`).toString('base64');
   return { Authorization: `Basic ${basic}`, 'X-Cowork-User-ID': workspace.userId };
+}
+
+// ── Tool permissions (master step 16) ────────────────────────────────────
+//
+// Once a tool can create a calendar event or send a Talk message, a small
+// local model that hallucinates an argument has consequences that a wrong
+// sentence does not. Reads run automatically; writes need a human.
+//
+// The classification lives HERE, per toolbox, not in the MCP server, because
+// MCP cannot be trusted to supply it: annotations.readOnlyHint is present on
+// only 70 of the reference server's 160 tools and absent on 90. It is a useful
+// signal and a useless guarantee.
+//
+// So the rule is: a tool is a WRITE unless noevia explicitly says otherwise.
+// A new or unrecognised tool is therefore gated by default — the failure mode
+// of an unnecessary prompt is an annoyed user, and the failure mode of a
+// missing one is deleted data.
+function readOnlyToolNames() {
+  const names = new Set();
+  for (const box of allToolboxes()) {
+    for (const n of (box.reads || [])) names.add(n);
+  }
+  return names;
+}
+
+function isWriteTool(name) {
+  if (!readOnlyToolNames().has(name)) return true; // unknown ⇒ write
+  // Our manifest says read-only. If the server itself claims the tool writes,
+  // believe the server: the hint is unreliable when it is ABSENT, but a
+  // positive "this is not read-only" is information we should not override.
+  const known = mcpState.tools.get(name);
+  if (known && known.readOnly === false) {
+    console.warn(`[tools] ${name} is listed read-only in noevia but the MCP server reports it writes; treating as a write`);
+    return true;
+  }
+  return false;
+}
+
+// Pending approvals, keyed by a single-use id. In memory on purpose: an
+// approval that outlives the request it belongs to is not useful, and a
+// restart should re-ask rather than silently honour a decision made against a
+// conversation that no longer exists.
+const pendingApprovals = new Map();
+const APPROVAL_TIMEOUT_MS = 5 * 60 * 1000;
+
+// "Approve everything in this chat" — the escape hatch. Scoped to one chat for
+// one user and held only in memory, so it expires with the process. A global
+// "never ask" default is deliberately NOT offered: the whole point of the gate
+// is that someone saw the arguments at least once.
+const chatWideApprovals = new Map(); // `${userId}:${chatId}` -> expiresAt
+const CHAT_APPROVAL_TTL_MS = 60 * 60 * 1000;
+
+function chatApprovalKey(userId, chatId) { return `${userId}:${chatId || '-'}`; }
+
+function chatWideApproved(userId, chatId) {
+  const until = chatWideApprovals.get(chatApprovalKey(userId, chatId));
+  if (!until) return false;
+  if (Date.now() > until) { chatWideApprovals.delete(chatApprovalKey(userId, chatId)); return false; }
+  return true;
+}
+
+// Ask the human. Resolves to 'approve' | 'deny', never rejects: the caller
+// turns a denial into a tool result the model can read, so a refused call is
+// a normal conversational turn rather than a broken stream.
+function awaitApproval({ id, userId, chatId, abortSignal }) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (decision) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      abortSignal.removeEventListener('abort', onAbort);
+      pendingApprovals.delete(id);
+      resolve(decision);
+    };
+    // A request that waits forever is a leaked connection. Timing out as a
+    // DENIAL rather than an approval is the only safe default.
+    const timer = setTimeout(() => finish('timeout'), APPROVAL_TIMEOUT_MS);
+    // The user closed the tab or hit stop: nothing was approved.
+    const onAbort = () => finish('aborted');
+    abortSignal.addEventListener('abort', onAbort, { once: true });
+    pendingApprovals.set(id, {
+      userId,
+      chatId,
+      decide(decision) {
+        if (decision === 'approve_all') {
+          chatWideApprovals.set(chatApprovalKey(userId, chatId), Date.now() + CHAT_APPROVAL_TTL_MS);
+          finish('approve');
+          return true;
+        }
+        if (decision === 'approve' || decision === 'deny') { finish(decision); return true; }
+        return false;
+      },
+    });
+  });
 }
 
 // Accept only ids that name a real box, so a stale selection persisted by an
@@ -1565,8 +1667,47 @@ async function handleChat(req, res, body, authn) {
     if (toolCalls.size > 0) {
       const assistantMsg = { role: 'assistant', content: null, tool_calls: [...toolCalls.entries()].map(([i, tc]) => ({ id: tc.id, type: 'function', function: { name: tc.name, arguments: tc.args } })) };
       roundMessages = [...roundMessages, assistantMsg];
-      for (const [, tc] of toolCalls) {
-        const result = await executeToolCall(project, tc.name, tc.args, allowedToolNames);
+      for (const [toolIndex, tc] of toolCalls) {
+        // ── Permission gate (step 16) ──────────────────────────────────
+        // Reads run straight through. A write stops here and waits for a
+        // human, which is why this loop is `for … of` and awaited rather
+        // than a Promise.all: the round genuinely blocks on a person.
+        let result;
+        const userId = requestScope.getStore()?.workspace?.userId || null;
+        if (isWriteTool(tc.name) && !chatWideApproved(userId, chatId)) {
+          const approvalId = `ap-${crypto.randomUUID()}`;
+          send({
+            type: 'tool_pending',
+            id: approvalId,
+            index: toolIndex, // same index the `tool` events used, so the UI updates that chip
+            name: tc.name,
+            args: tc.args,
+          });
+          const decision = await awaitApproval({ id: approvalId, userId, chatId, abortSignal: chatSignal.signal });
+          if (decision !== 'approve') {
+            // A refusal is a normal conversational turn: the model is told
+            // plainly so it can offer an alternative, rather than the stream
+            // dying or the chip hanging with no result.
+            result = decision === 'timeout'
+              ? `ERROR: the user did not respond in time, so ${tc.name} was not run. Ask before trying again.`
+              : `ERROR: the user declined to run ${tc.name}. Do not retry it; ask what they would prefer.`;
+            authService.audit('tool.denied', userId, userId, { tool: tc.name, reason: decision });
+            send({ type: 'tool_result', name: tc.name, text: result.slice(0, 300) });
+            roundMessages.push({ role: 'tool', tool_call_id: tc.id, content: result });
+            continue;
+          }
+        }
+        result = await executeToolCall(project, tc.name, tc.args, allowedToolNames);
+        // Audit AFTER the fact and only for writes: "what did the model
+        // actually do on my behalf" is the question this log has to answer,
+        // and it lives beside logins and storage changes.
+        if (isWriteTool(tc.name)) {
+          authService.audit('tool.write', userId, userId, {
+            tool: tc.name,
+            args: String(tc.args || '').slice(0, 500),
+            failed: result.startsWith('ERROR') || undefined,
+          });
+        }
         send({ type: 'tool_result', name: tc.name, text: result.slice(0, 300) });
         roundMessages.push({ role: 'tool', tool_call_id: tc.id, content: result });
       }
@@ -1804,6 +1945,26 @@ async function handleRequestScoped(req, res) {
         } catch (e) { return json(res, 400, { error: e.message }); }
       }
       return json(res, 404, { error: 'not found' });
+    }
+
+    const approvalMatch = p.match(/^\/api\/tool-approvals\/([^/]+)$/);
+    if (approvalMatch && req.method === 'POST') {
+      const id = decodeURIComponent(approvalMatch[1]);
+      const raw = await readBody(req);
+      let body;
+      try { body = JSON.parse(raw); } catch { return json(res, 400, { error: 'invalid JSON' }); }
+      const pending = pendingApprovals.get(id);
+      // Already decided, timed out, or never existed — all the same answer, so
+      // a stale id cannot be used to probe which approvals are outstanding.
+      if (!pending) return json(res, 404, { error: 'no such pending approval' });
+      // The approval must come from the user whose conversation it is. Without
+      // this, any signed-in member could approve another member's write.
+      const userId = requestScope.getStore()?.workspace?.userId || null;
+      if (!userId || pending.userId !== userId) return json(res, 404, { error: 'no such pending approval' });
+      if (!pending.decide(String(body.decision || ''))) {
+        return json(res, 400, { error: "decision must be 'approve', 'deny' or 'approve_all'" });
+      }
+      return json(res, 200, { ok: true });
     }
 
     if (p === '/api/toolboxes' && req.method === 'GET') {
@@ -2454,7 +2615,16 @@ if (require.main === module) {
   if (!UI_AUTH_TOKEN) {
     console.warn('WARNING: Set DIARY_AUTH_TOKEN to protect the internal diary connection. Browser accounts remain authenticated.');
   }
-  http.createServer((req, res) => { handleRequest(req, res).catch(() => { if (!res.destroyed) res.destroy(); }); }).listen(PORT, HOST, () => {
+  const server = http.createServer((req, res) => { handleRequest(req, res).catch(() => { if (!res.destroyed) res.destroy(); }); });
+  // A chat waiting on a write approval is a legitimately long request. Node's
+  // default requestTimeout is 5 minutes measured from the START of the request,
+  // so a reply that spent two minutes generating would leave only three for the
+  // human — and the connection would be cut mid-decision. Raised to 20 minutes,
+  // comfortably past APPROVAL_TIMEOUT_MS, which is the limit that should
+  // actually bite. headersTimeout still guards the slow-header attack this
+  // setting otherwise protects against.
+  server.requestTimeout = 20 * 60 * 1000;
+  server.listen(PORT, HOST, () => {
     console.log(`cowork-ui listening on http://${HOST}:${PORT} (inference: ${INFERENCE_BASE}, manager: ${modelManager.kind}, diary: ${DIARY_BASE}, mcp: ${MCP_SERVER_URL || 'disabled'})`);
     // Warm the tool catalogue so the first chat does not pay for discovery.
     // Never blocks startup: a side-car that is still booting must not stop
@@ -2463,4 +2633,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { checkAuth, handleRequest, resolveTools, allToolboxes, mcpCredentialOriginAllowed, toolTokenBudgetFor, MCP_TOOLBOX_MANIFEST, toolboxSummaries, estimateToolTokens, toolCapFor, sanitizeToolboxes, executeToolCall, TOOLBOXES, classifierVerdict, heuristicWantsSmart, CLASSIFIER_MAX_TOKENS, recordUsage, readUsage, usageDayKey, USAGE_RETENTION_DAYS };
+module.exports = { checkAuth, handleRequest, isWriteTool, chatWideApproved, pendingApprovals, resolveTools, allToolboxes, mcpCredentialOriginAllowed, toolTokenBudgetFor, MCP_TOOLBOX_MANIFEST, toolboxSummaries, estimateToolTokens, toolCapFor, sanitizeToolboxes, executeToolCall, TOOLBOXES, classifierVerdict, heuristicWantsSmart, CLASSIFIER_MAX_TOKENS, recordUsage, readUsage, usageDayKey, USAGE_RETENTION_DAYS };
