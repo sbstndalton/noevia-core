@@ -327,14 +327,21 @@ function providerHeaders(provider, extra) {
 }
 
 // Chats are history keys; each project holds ordered chat metadata.
+// Self-heal orphaned placeholder entries: a bare chat-id string (or any
+// non-object) can land in chats[] if the follow-up POST /chats never fires
+// (tab closed mid-send). Every path that hands chat metas to a client must go
+// through this — the client spreads these into objects and reads .title, so a
+// bare string reaches the sidebar as a title-less record and throws, blanking
+// the whole app. The next saveChats drops them from disk for good.
+function sanitizeChats(chats) {
+  return (chats || []).filter((c) => c && typeof c === 'object' && typeof c.id === 'string');
+}
+
 // Each meta: { id, title, updatedAt } — the title is the first user message.
 function loadChats(projectId) {
   const p = getProject(projectId);
   if (!p) return [];
-  // Self-heal orphaned placeholder entries: a bare chat-id string (or any
-  // non-object) can land in chats[] if the follow-up POST /chats never fires
-  // (tab closed mid-send). Skip them here; the next saveChats drops them.
-  return (p.chats || []).filter((c) => c && typeof c === 'object' && typeof c.id === 'string');
+  return sanitizeChats(p.chats);
 }
 
 function saveChats(projectId, chats) {
@@ -2080,7 +2087,12 @@ async function handleRequestScoped(req, res) {
     }
 
     if (p === '/api/workspace') {
-      return json(res, 200, { projects: PROJECTS, freeChats: FREE_CHATS });
+      // PROJECTS is served raw everywhere else; here it crosses to the client,
+      // so chats[] must be sanitized exactly as loadChats does.
+      return json(res, 200, {
+        projects: PROJECTS.map((proj) => ({ ...proj, chats: sanitizeChats(proj.chats) })),
+        freeChats: sanitizeChats(FREE_CHATS),
+      });
     }
 
     // ── Provider registry (step 9): list / connect / remove. GET never returns
@@ -2732,4 +2744,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { checkAuth, handleRequest, prefill, TOOL_PREFILL_TARGET_MS, isWriteTool, chatWideApproved, pendingApprovals, resolveTools, allToolboxes, mcpCredentialOriginAllowed, toolTokenBudgetFor, MCP_TOOLBOX_MANIFEST, toolboxSummaries, estimateToolTokens, toolCapFor, sanitizeToolboxes, executeToolCall, TOOLBOXES, classifierVerdict, heuristicWantsSmart, CLASSIFIER_MAX_TOKENS, recordUsage, readUsage, usageDayKey, USAGE_RETENTION_DAYS };
+module.exports = { checkAuth, handleRequest, sanitizeChats, prefill, TOOL_PREFILL_TARGET_MS, isWriteTool, chatWideApproved, pendingApprovals, resolveTools, allToolboxes, mcpCredentialOriginAllowed, toolTokenBudgetFor, MCP_TOOLBOX_MANIFEST, toolboxSummaries, estimateToolTokens, toolCapFor, sanitizeToolboxes, executeToolCall, TOOLBOXES, classifierVerdict, heuristicWantsSmart, CLASSIFIER_MAX_TOKENS, recordUsage, readUsage, usageDayKey, USAGE_RETENTION_DAYS };
