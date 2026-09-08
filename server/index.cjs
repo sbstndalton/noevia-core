@@ -26,6 +26,7 @@ const rag = require('./rag.cjs');
 const mcp = require('./mcp.cjs');
 const prefill = require('./prefill.cjs');
 const storageClient = require('./storage-client.cjs');
+const documents = require('./documents.cjs');
 const { createModelManager } = require('./model-manager.cjs');
 const { createAuth, createRateLimiter } = require('./auth.cjs');
 const { createWorkspaceStore, atomicJson } = require('./workspace.cjs');
@@ -630,6 +631,7 @@ const IMAGE_MIME = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif'
 // is the right cadence: a model's modality does not change under us.
 const visionSupport = new Map();
 const IMAGE_UPLOAD_CAP = 8 * 1024 * 1024;
+const DOCUMENT_UPLOAD_CAP = 25 * 1024 * 1024;
 const MAX_PROJECT_IMAGES = 12;
 
 const TOOL_CAP_DEFAULT = 24;
@@ -2923,6 +2925,43 @@ async function handleRequestScoped(req, res) {
     // ever read. Images are different: the model can genuinely see them, so
     // they are stored as bytes and attached to the conversation as image
     // parts rather than being decoded into replacement characters.
+    // A document uploaded from disk. It is converted to text on arrival and
+    // stored as an ordinary source, so everything downstream — RAG, the
+    // read_project_file tool, the manifest — treats it like any other file.
+    const projDocs = p.match(/^\/api\/projects\/([^/]+)\/documents$/);
+    if (projDocs && req.method === 'POST') {
+      const id = decodeURIComponent(projDocs[1]);
+      const project = getProject(id);
+      if (!project) return json(res, 404, { error: 'no such project' });
+      let body;
+      try {
+        body = JSON.parse(await readBody(req, DOCUMENT_UPLOAD_CAP + 512 * 1024));
+      } catch (e) {
+        if (e && e.status === 413) return json(res, 413, { error: `That document is larger than the ${Math.round(DOCUMENT_UPLOAD_CAP / (1024 * 1024))} MB limit.` });
+        return json(res, 400, { error: 'invalid JSON' });
+      }
+      const name = String(body.name || '').slice(0, 200);
+      if (!documents.isDocument(name)) return json(res, 400, { error: `${name || 'that file'} is not a supported document (PDF).` });
+      let bytes;
+      try { bytes = Buffer.from(String(body.dataBase64 || ''), 'base64'); } catch { bytes = null; }
+      if (!bytes || !bytes.length) return json(res, 400, { error: 'document data was empty' });
+      if (bytes.length > DOCUMENT_UPLOAD_CAP) {
+        return json(res, 413, { error: `That document is ${Math.round(bytes.length / 1024 / 1024)} MB, over the ${Math.round(DOCUMENT_UPLOAD_CAP / (1024 * 1024))} MB limit.` });
+      }
+      let out;
+      try {
+        out = await documents.extractDocumentText(name, bytes);
+      } catch (e) {
+        return json(res, (e && e.status) || 422, { error: `Could not read ${name}: ${(e && e.message) || 'extraction failed'}` });
+      }
+      const uploads = (project.files || []).filter((f) => !f.source);
+      if (uploads.length >= 20) return json(res, 400, { error: 'A project holds at most 20 uploaded sources.' });
+      project.files = [...(project.files || []).filter((f) => f.name !== name), { name, content: out.text }];
+      saveProjects(PROJECTS);
+      rag.indexProjectFile(id, name, out.text, currentWorkspace().userId);
+      return json(res, 200, { name, pages: out.pages, characters: out.text.length, truncated: out.truncated });
+    }
+
     const projAssets = p.match(/^\/api\/projects\/([^/]+)\/assets$/);
     if (projAssets && req.method === 'POST') {
       const id = decodeURIComponent(projAssets[1]);
@@ -3016,11 +3055,22 @@ async function handleRequestScoped(req, res) {
         }
         for (const entry of entries) {
           if (entry.isDir) continue; // one level: recursing could pull a whole drive in
-          if (!storageClient.TEXT_EXTENSIONS.has((entry.ext || '').toLowerCase())) continue;
+          const ext = (entry.ext || '').toLowerCase();
+          const isText = storageClient.TEXT_EXTENSIONS.has(ext);
+          const isDoc = documents.isDocument(entry.name);
+          if (!isText && !isDoc) continue;
           if (fromFolders.length >= 40) break; // a cap, so one big folder cannot blow up a project
           try {
-            const file = await storageClient.readTextFile(connection, entry.path);
-            fromFolders.push({ name: entry.path, content: file.content, source: folder });
+            if (isDoc) {
+              // A document is converted to text here, so a PDF in an attached
+              // folder becomes a readable source rather than being skipped.
+              const bytes = await storageClient.readBinaryFile(connection, entry.path);
+              const out = await documents.extractDocumentText(entry.name, bytes);
+              fromFolders.push({ name: entry.path, content: out.text, source: folder });
+            } else {
+              const file = await storageClient.readTextFile(connection, entry.path);
+              fromFolders.push({ name: entry.path, content: file.content, source: folder });
+            }
           } catch (e) {
             skipped.push({ folder, file: entry.path, reason: e && e.message ? e.message : 'could not read' });
           }

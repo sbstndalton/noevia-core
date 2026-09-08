@@ -7,6 +7,7 @@
     "@node-rs/argon2": "^2.2.0",
     "@simplewebauthn/server": "^14.0.0",
     "better-sqlite3": "^12.4.1",
-    "sqlite-vec": "^0.1.7-alpha.2"
+    "sqlite-vec": "^0.1.7-alpha.2",
+    "unpdf": "^1.8.1"
   }
 }

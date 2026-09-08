@@ -261,4 +261,34 @@ async function createFolder(conn, rawPath) {
   return { path, existed: false };
 }
 
-module.exports = { listFiles, readTextFile, createFolder, isBrowsable, safeRelativePath, TEXT_EXTENSIONS, READ_CAP };
+/** Read one file as bytes, for a type that must be parsed rather than decoded
+ *  (a PDF). No extension gate here: the caller decides what it can parse, and
+ *  the cap is larger because a document compresses to text far smaller than
+ *  its own size. */
+async function readBinaryFile(conn, rawPath, opts) {
+  const scoped = !!(opts && opts.scope === 'corpus');
+  const cap = (opts && opts.cap) || 25 * 1024 * 1024;
+  const path = safeRelativePath(rawPath);
+  if (!path) throw Object.assign(new Error('invalid path'), { status: 400 });
+  if (connectionKind(conn) === 's3') {
+    const text = await s3Read(conn, path);
+    return Buffer.from(text, 'binary');
+  }
+  const full = scoped ? joinRoot(conn.corpusRoot, path) : path;
+  const response = await withRetry(() => fetch(davUrl(conn, full), {
+    method: 'GET',
+    headers: davHeaders(conn, {}),
+    signal: AbortSignal.timeout(30000),
+    redirect: 'error',
+  }));
+  if (!response.ok) {
+    throw Object.assign(new Error(`storage returned ${response.status}`), { status: response.status === 404 ? 404 : 502 });
+  }
+  const buf = Buffer.from(await response.arrayBuffer());
+  if (buf.length > cap) {
+    throw Object.assign(new Error(`file is ${Math.round(buf.length / 1024 / 1024)} MB, over the ${Math.round(cap / 1024 / 1024)} MB limit`), { status: 413 });
+  }
+  return buf;
+}
+
+module.exports = { listFiles, readTextFile, readBinaryFile, createFolder, isBrowsable, safeRelativePath, TEXT_EXTENSIONS, READ_CAP };
