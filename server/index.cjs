@@ -605,13 +605,34 @@ const TOOL_CAP_SMALL = 12;
 
 // A COUNT cap alone is the wrong unit, which only became clear once real MCP
 // tools arrived. Measured against the reference server: nc_calendar_create_event
-// is 7,355 chars (~3,900 calibrated tokens) while nc_notes_search_notes is 449.
-// "12 tools" therefore describes anything between ~250 and ~47,000 tokens of
-// prompt. The count cap still guards against overwhelming a small model with
-// too many CHOICES; this budget guards the context window, which is the
-// constraint that actually bites at ~14 tok/s. Both apply, whichever binds first.
+// is ~2,739 calibrated tokens while nc_notes_search_notes is 449. "12 tools"
+// therefore describes anything between ~250 and ~47,000 tokens of prompt. The
+// count cap still guards against overwhelming a small model with too many
+// CHOICES; this budget guards latency, which is the constraint that bites.
+//
+// The budget is NOT about running out of context. Measured 2026-09-08 on this
+// deployment: the model advertises a 262,144-token window and llama-server is
+// configured with n_ctx=32,768 — so context only becomes the limit at the full
+// 160-tool catalogue (39,791 tokens, which does 400). Everything below that
+// fits comfortably.
+//
+// What actually degrades is TIME TO FIRST TOKEN. Prefill runs at roughly
+// 360 tok/s (~2.75 ms/token) on this hardware, and the tool catalogue is
+// re-sent on EVERY message, so its cost is paid on every turn before the model
+// says a word:
+//
+//     0 tools      17 tok    0.2 s
+//     6 tools     924 tok    3.1 s
+//    12 tools   1,500 tok    4.5 s
+//    20 tools   4,161 tok   11.7 s
+//    30 tools   6,895 tok   21.2 s
+//
+// So the budget is really a latency target, and these numbers are it:
+// ~4,500 tokens is about 12 seconds of silence before the first word, which is
+// the most a small local model can spend and still feel like a conversation.
+// Larger/remote models are not prefill-bound in the same way and get more.
 const TOOL_TOKEN_BUDGET_DEFAULT = 8000;
-const TOOL_TOKEN_BUDGET_SMALL = 3000;
+const TOOL_TOKEN_BUDGET_SMALL = 4500;
 function toolTokenBudgetFor(model) {
   const m = /(\d+(?:\.\d+)?)\s*[bB]\b/.exec(String(model || ''));
   if (m && Number(m[1]) <= 12) return TOOL_TOKEN_BUDGET_SMALL;

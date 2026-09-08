@@ -150,6 +150,64 @@ function resultToText(result) {
 // (431,621 chars raw vs 161,643 converted, measured 2026-09-08).
 const TOOL_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
+// llama.cpp builds a grammar from each tool's schema and CANNOT resolve
+// $ref/$defs while doing it. It does not skip the offending tool either — it
+// rejects the entire request:
+//
+//   HTTP 400 … "Unable to generate parser for this template.
+//               JSON schema conversion failed:
+//               Error resolving ref #/$defs/Reminder: $defs not in {…}"
+//
+// So a single such tool silently breaks every other tool in the box, and the
+// user sees a chat that answers nothing at all. Four tools on the reference
+// server carry $defs (nc_calendar_create_event, _update_event, _create_todo,
+// _update_todo), two of them in the curated calendar box — measured against
+// the live endpoint 2026-09-08.
+//
+// Inlining is preferred to dropping: these are exactly the tools that make
+// Calendar worth having. A ref that cannot be inlined — external, or circular,
+// which would expand forever — drops the tool instead, which is the whole
+// point of validating rather than assuming.
+// Two separate limits, because they catch different things. MAX_REF_DEPTH
+// bounds how many times a ref may expand into another ref — that is the one
+// that stops runaway expansion, and cycles are caught by the name stack
+// regardless. MAX_NODE_DEPTH only stops a hostile or absurd schema from
+// blowing the JS stack, so it is generous: real schemas nest a dozen levels
+// through anyOf/items/properties without anything being wrong.
+const MAX_REF_DEPTH = 8;
+const MAX_NODE_DEPTH = 64;
+
+function inlineRefs(node, defs, stack, depth) {
+  if (depth > MAX_NODE_DEPTH) throw new Error('schema nests deeper than we will walk');
+  if (stack.length > MAX_REF_DEPTH) throw new Error('refs expand deeper than we will inline');
+  if (Array.isArray(node)) return node.map((n) => inlineRefs(n, defs, stack, depth + 1));
+  if (!node || typeof node !== 'object') return node;
+  const ref = node.$ref;
+  if (typeof ref === 'string') {
+    const m = /^#\/(\$defs|definitions)\/(.+)$/.exec(ref);
+    if (!m) throw new Error(`cannot resolve non-local ref ${ref}`);
+    const key = m[2];
+    if (stack.includes(key)) throw new Error(`circular ref ${ref}`);
+    const target = defs[key];
+    if (!target) throw new Error(`ref ${ref} points at a definition that is not present`);
+    // Sibling keys alongside a $ref (a description, say) are kept, with the
+    // resolved body underneath them.
+    const { $ref: _drop, ...siblings } = node;
+    return { ...inlineRefs(target, defs, [...stack, key], depth + 1), ...siblings };
+  }
+  const out = {};
+  for (const [k, v] of Object.entries(node)) {
+    if (k === '$defs' || k === 'definitions') continue; // consumed by inlining
+    out[k] = inlineRefs(v, defs, stack, depth + 1);
+  }
+  return out;
+}
+
+function resolveSchemaRefs(schema) {
+  const defs = { ...(schema.$defs || {}), ...(schema.definitions || {}) };
+  return inlineRefs(schema, defs, [], 0);
+}
+
 function convertTool(mcpTool) {
   const name = mcpTool && mcpTool.name;
   if (typeof name !== 'string' || !TOOL_NAME_RE.test(name)) {
@@ -170,6 +228,12 @@ function convertTool(mcpTool) {
   if (schema.required !== undefined && !Array.isArray(schema.required)) {
     return { ok: false, reason: 'inputSchema.required is not an array' };
   }
+  let resolved;
+  try {
+    resolved = resolveSchemaRefs(schema);
+  } catch (err) {
+    return { ok: false, reason: `unresolvable schema: ${err.message}` };
+  }
   const description = typeof mcpTool.description === 'string' && mcpTool.description
     ? mcpTool.description
     : (typeof mcpTool.title === 'string' ? mcpTool.title : '');
@@ -182,8 +246,8 @@ function convertTool(mcpTool) {
         description,
         parameters: {
           type: 'object',
-          properties: schema.properties || {},
-          required: schema.required || [],
+          properties: resolved.properties || {},
+          required: resolved.required || [],
         },
       },
     },
@@ -200,4 +264,4 @@ function readOnlyHint(mcpTool) {
   return typeof a.readOnlyHint === 'boolean' ? a.readOnlyHint : null;
 }
 
-module.exports = { connect, listTools, callTool, resultToText, convertTool, readOnlyHint, parseRpcBody, PROTOCOL_VERSION };
+module.exports = { connect, listTools, callTool, resultToText, convertTool, resolveSchemaRefs, readOnlyHint, parseRpcBody, PROTOCOL_VERSION };

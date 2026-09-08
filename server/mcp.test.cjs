@@ -126,11 +126,11 @@ test('the token budget drops expensive tools that the count cap would admit', ()
   TOOLBOXES.push(box);
   try {
     const r = resolveTools({ toolboxes: ['test-fat'] }, 'Qwen3.5-9B');
-    assert.equal(r.budget, 3000);
+    assert.equal(r.budget, 4500);
     assert.equal(r.cap, 12); // the count cap would have admitted all three
     assert.equal(r.tools.length, 1); // the budget admits one
     assert.equal(r.dropped.length, 2);
-    assert.match(r.dropped[0], /over 3000 budget/);
+    assert.match(r.dropped[0], /over 4500 budget/);
     assert.ok(r.estTokens <= r.budget, `spent ${r.estTokens} over budget ${r.budget}`);
     // Selection order decides who survives, so the result is explainable.
     assert.equal(r.tools[0].function.name, 'a');
@@ -157,8 +157,8 @@ test('a single tool larger than the whole budget is dropped, not forced through'
 });
 
 test('budget scales with model size, like the count cap', () => {
-  assert.equal(toolTokenBudgetFor('Qwen3.5-9B-GGUF'), 3000);
-  assert.equal(toolTokenBudgetFor('Gemma-4-E4B-it-GGUF-4b'), 3000);
+  assert.equal(toolTokenBudgetFor('Qwen3.5-9B-GGUF'), 4500);
+  assert.equal(toolTokenBudgetFor('Gemma-4-E4B-it-GGUF-4b'), 4500);
   assert.equal(toolTokenBudgetFor('claude-sonnet-4-5'), 8000);
 });
 
@@ -198,4 +198,83 @@ test('a credential is forwarded only to a declared Nextcloud origin', () => {
   assert.equal(mcpCredentialOriginAllowed('not a url'), false);
   assert.equal(mcpCredentialOriginAllowed(''), false);
   assert.equal(mcpCredentialOriginAllowed(undefined), false);
+});
+
+// ── $ref / $defs inlining ────────────────────────────────────────────────
+//
+// Regression for a defect that shipped in 3cb9305 and broke the calendar box
+// completely. llama.cpp builds a grammar per tool and cannot resolve $ref; it
+// answers HTTP 400 for the WHOLE request rather than skipping the tool, so one
+// such tool silently takes out every other tool in the box and the user gets a
+// chat that never replies. Confirmed against the live endpoint 2026-09-08:
+// the six-tool calendar box returned 400, and the same box minus
+// nc_calendar_create_event/_update_event returned 200.
+
+test('a local $defs ref is inlined and the $defs block removed', () => {
+  const r = convertTool({
+    name: 'nc_calendar_create_event',
+    description: 'Create an event.',
+    inputSchema: {
+      type: 'object',
+      properties: { reminders: { anyOf: [{ items: { $ref: '#/$defs/Reminder' }, type: 'array' }, { type: 'null' }] } },
+      required: [],
+      $defs: { Reminder: { type: 'object', properties: { action: { type: 'string', enum: ['DISPLAY'] } } } },
+    },
+  });
+  assert.equal(r.ok, true);
+  const p = r.tool.function.parameters;
+  assert.deepEqual(p.properties.reminders.anyOf[0].items, {
+    type: 'object', properties: { action: { type: 'string', enum: ['DISPLAY'] } },
+  });
+  // Nothing may survive that llama.cpp cannot parse.
+  assert.equal(JSON.stringify(p).includes('$ref'), false);
+  assert.equal(JSON.stringify(p).includes('$defs'), false);
+});
+
+test('sibling keys beside a $ref are preserved', () => {
+  const r = convertTool({
+    name: 'x',
+    inputSchema: {
+      type: 'object',
+      properties: { a: { $ref: '#/$defs/T', description: 'the a field' } },
+      $defs: { T: { type: 'string' } },
+    },
+  });
+  assert.equal(r.tool.function.parameters.properties.a.type, 'string');
+  assert.equal(r.tool.function.parameters.properties.a.description, 'the a field');
+});
+
+test('legacy "definitions" is resolved as well as "$defs"', () => {
+  const r = convertTool({
+    name: 'x',
+    inputSchema: { type: 'object', properties: { a: { $ref: '#/definitions/T' } }, definitions: { T: { type: 'number' } } },
+  });
+  assert.equal(r.ok, true);
+  assert.equal(r.tool.function.parameters.properties.a.type, 'number');
+});
+
+test('a ref that cannot be inlined drops the tool rather than shipping it broken', () => {
+  const cases = [
+    // Circular: inlining would expand forever.
+    [{ type: 'object', properties: { a: { $ref: '#/$defs/T' } }, $defs: { T: { properties: { b: { $ref: '#/$defs/T' } } } } }, /circular ref/],
+    // Points at nothing.
+    [{ type: 'object', properties: { a: { $ref: '#/$defs/Missing' } }, $defs: {} }, /not present/],
+    // External refs are not ours to fetch.
+    [{ type: 'object', properties: { a: { $ref: 'https://example.com/s.json' } } }, /non-local ref/],
+  ];
+  for (const [inputSchema, re] of cases) {
+    const r = convertTool({ name: 'x', inputSchema });
+    assert.equal(r.ok, false, `expected ${JSON.stringify(inputSchema).slice(0, 60)} to drop`);
+    assert.match(r.reason, re);
+  }
+});
+
+test('an ordinary deeply-nested schema is NOT mistaken for a runaway ref', () => {
+  // The first cut of the depth guard counted structural nesting rather than
+  // ref expansion, so it dropped all four calendar tools as "too deep" — a
+  // fix that silently reintroduced the bug it was meant to solve.
+  let deep = { type: 'string' };
+  for (let i = 0; i < 20; i++) deep = { type: 'object', properties: { nested: deep } };
+  const r = convertTool({ name: 'x', inputSchema: { type: 'object', properties: { a: deep }, required: [] } });
+  assert.equal(r.ok, true, r.reason);
 });
