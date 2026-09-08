@@ -138,6 +138,12 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets) {
       historyPath(id) { return path.join(dir, `history-${String(id).replace(/[^a-zA-Z0-9_-]/g, '')}.json`); },
       usagePath() { return path.join(dir, 'usage.json'); },
       ragDir() { return path.join(dir, 'rag'); },
+      // Image sources live on disk, not in projects.json: base64 in the
+      // workspace file would be re-read and re-parsed on every request that
+      // touches a project, for bytes nothing but the model ever looks at.
+      assetDir(projectId) {
+        return path.join(dir, 'project-assets', String(projectId).replace(/[^a-zA-Z0-9_-]/g, ''));
+      },
     };
     workspace.providers = mergeProviders(workspace.privateProviders);
     cache.set(userId, workspace);

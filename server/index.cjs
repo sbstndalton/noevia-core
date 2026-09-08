@@ -624,6 +624,14 @@ function estimateToolTokens(tools) {
 // conversation. This is a hardware/capability question, not a "what does this
 // work need" question — which is precisely why box *selection* is per-project
 // and only the cap looks at the model.
+// An image source is bytes, not text, and needs its own limits.
+const IMAGE_MIME = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
+// model name -> whether it accepted an image. Cleared only by a restart, which
+// is the right cadence: a model's modality does not change under us.
+const visionSupport = new Map();
+const IMAGE_UPLOAD_CAP = 8 * 1024 * 1024;
+const MAX_PROJECT_IMAGES = 12;
+
 const TOOL_CAP_DEFAULT = 24;
 const TOOL_CAP_SMALL = 12;
 
@@ -1875,8 +1883,62 @@ async function handleChat(req, res, body, authn) {
 
   // ── Ordinary space / project chat: routed via the project's provider ──
   const sys = sysParts.join('\n\n');
-  const wire = sys ? [{ role: 'system', content: sys }, ...msgs] : msgs;
+  let wire = sys ? [{ role: 'system', content: sys }, ...msgs] : msgs;
 
+  // Whether a model can actually see an image, asked once per model and
+  // remembered. Attaching images to a model that cannot read them fails the
+  // whole request, so the question is settled with a throwaway 1x1 probe
+  // rather than with the user's real message.
+  const visionProbe = async (baseUrl, headers, modelName) => {
+    if (visionSupport.has(modelName)) return visionSupport.get(modelName);
+    const url = `${String(baseUrl).replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`;
+    const PIXEL = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+    let ok = false;
+    try {
+      const r = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...headers },
+        body: JSON.stringify({
+          model: modelName,
+          max_tokens: 1,
+          messages: [{ role: 'user', content: [
+            { type: 'text', text: 'ok' },
+            { type: 'image_url', image_url: { url: `data:image/png;base64,${PIXEL}` } },
+          ] }],
+        }),
+        signal: AbortSignal.timeout(20000),
+      });
+      ok = r.ok;
+      if (!ok) console.warn(`[vision] ${modelName} rejected an image probe (${r.status}); images will not be attached`);
+      else console.log(`[vision] ${modelName} accepts images`);
+    } catch (err) {
+      console.warn(`[vision] probe for ${modelName} failed: ${String((err && err.message) || err)}`);
+      ok = false;
+    }
+    visionSupport.set(modelName, ok);
+    return ok;
+  };
+
+  // A project's image sources ride along with the latest user turn, as image
+  // parts. Only the last turn carries them: repeating every image on every
+  // turn re-sends the same megabytes each message and crowds out the
+  // conversation, and the model has already been told what it saw.
+  const projectImages = project ? (project.assets || []) : [];
+  let attachedImages = [];
+  if (projectImages.length) {
+    const dir = currentWorkspace().assetDir(project.id);
+    for (const asset of projectImages) {
+      try {
+        const bytes = fs.readFileSync(path.join(dir, asset.id));
+        attachedImages.push({
+          type: 'image_url',
+          image_url: { url: `data:${asset.mime};base64,${bytes.toString('base64')}` },
+        });
+      } catch {
+        console.warn(`[assets] ${asset.id} is listed on project ${project.id} but its bytes are missing`);
+      }
+    }
+  }
   // Projects without a provider field use the configured default provider.
   const projectProvider = project?.provider === 'lemonade' ? DEFAULT_PROVIDER_ID : project?.provider;
   const wantsAuto = !!(project && project.routing === 'auto' && (!projectProvider || projectProvider === DEFAULT_PROVIDER_ID));
@@ -1908,6 +1970,34 @@ async function handleChat(req, res, body, authn) {
   // providers like OpenRouter use https://host/api/v1).
   const upstreamUrl = `${provider.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`;
   const upstreamHeaders = providerHeaders(provider);
+
+  // Attach the project's images to the last user turn, but only to a model
+  // that can read them. A model that cannot answers 400 for the WHOLE request,
+  // so an unchecked attachment would turn "what is in this picture" into a
+  // chat that never replies — and would do it to every message in the project,
+  // not just the one asking about an image.
+  if (attachedImages.length) {
+    const canSee = await visionProbe(provider.baseUrl, upstreamHeaders, model);
+    if (canSee) {
+      const lastUser = [...wire].reverse().find((m) => m.role === 'user');
+      if (lastUser) {
+        const text = typeof lastUser.content === 'string' ? lastUser.content : '';
+        lastUser.content = [
+          { type: 'text', text: `${text}\n\n(Attached images: ${projectImages.map((a) => a.name).join(', ')})` },
+          ...attachedImages,
+        ];
+      }
+    } else {
+      // Say so in the transcript rather than silently ignoring them: a project
+      // holding images whose model cannot see them should not look like the
+      // images were read and found uninteresting.
+      attachedImages = [];
+      wire = wire.map((m) => (m.role === 'system'
+        ? { ...m, content: `${m.content}\n\nThis project has image sources (${projectImages.map((a) => a.name).join(', ')}) but ${model} cannot read images. Say so if asked about them; do not guess at their contents.` }
+        : m));
+      if (!sys) wire = [{ role: 'system', content: `This project has image sources (${projectImages.map((a) => a.name).join(', ')}) but ${model} cannot read images. Say so if asked about them; do not guess at their contents.` }, ...wire];
+    }
+  }
 
   // SSRF guard for member-registered providers (see the /api/providers POST
   // guard): a member must not reach internal addresses through a chat pinned
@@ -2827,6 +2917,82 @@ async function handleRequestScoped(req, res) {
     // from it. Folder-derived files carry `source`; uploaded ones do not, so a
     // sync replaces what came from folders and never touches an upload. This
     // is what makes an attached folder live rather than a one-time copy.
+    // ── Image sources ────────────────────────────────────────────────────
+    //
+    // A project source is otherwise text, because that is all a chat could
+    // ever read. Images are different: the model can genuinely see them, so
+    // they are stored as bytes and attached to the conversation as image
+    // parts rather than being decoded into replacement characters.
+    const projAssets = p.match(/^\/api\/projects\/([^/]+)\/assets$/);
+    if (projAssets && req.method === 'POST') {
+      const id = decodeURIComponent(projAssets[1]);
+      const project = getProject(id);
+      if (!project) return json(res, 404, { error: 'no such project' });
+      let body;
+      try {
+        // Images do not fit the 1 MB default that text sources live under.
+        body = JSON.parse(await readBody(req, IMAGE_UPLOAD_CAP + 512 * 1024));
+      } catch (e) {
+        if (e && e.status === 413) return json(res, 413, { error: `That image is larger than the ${Math.round(IMAGE_UPLOAD_CAP / (1024 * 1024))} MB limit.` });
+        return json(res, 400, { error: 'invalid JSON' });
+      }
+      const name = String(body.name || '').slice(0, 200);
+      const mime = String(body.mime || '').toLowerCase();
+      if (!IMAGE_MIME.has(mime)) {
+        return json(res, 400, { error: `${mime || 'that file'} is not a supported image (png, jpeg, webp or gif).` });
+      }
+      let bytes;
+      try {
+        bytes = Buffer.from(String(body.dataBase64 || ''), 'base64');
+      } catch {
+        return json(res, 400, { error: 'image data was not valid base64' });
+      }
+      if (!bytes.length) return json(res, 400, { error: 'image data was empty' });
+      if (bytes.length > IMAGE_UPLOAD_CAP) {
+        return json(res, 413, { error: `That image is ${Math.round(bytes.length / 1024)} KB, over the ${Math.round(IMAGE_UPLOAD_CAP / (1024 * 1024))} MB limit.` });
+      }
+      const assets = Array.isArray(project.assets) ? project.assets : [];
+      if (assets.length >= MAX_PROJECT_IMAGES) {
+        return json(res, 400, { error: `A project holds at most ${MAX_PROJECT_IMAGES} images.` });
+      }
+      const assetId = `img-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+      const dir = currentWorkspace().assetDir(id);
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(path.join(dir, assetId), bytes, { mode: 0o600 });
+      project.assets = [...assets, { id: assetId, name, mime, bytes: bytes.length }];
+      saveProjects(PROJECTS);
+      return json(res, 200, { asset: { id: assetId, name, mime, bytes: bytes.length } });
+    }
+
+    const projAssetOne = p.match(/^\/api\/projects\/([^/]+)\/assets\/([^/]+)$/);
+    if (projAssetOne) {
+      const id = decodeURIComponent(projAssetOne[1]);
+      const assetId = decodeURIComponent(projAssetOne[2]).replace(/[^a-zA-Z0-9_-]/g, '');
+      const project = getProject(id);
+      if (!project) return json(res, 404, { error: 'no such project' });
+      const asset = (project.assets || []).find((a) => a.id === assetId);
+      if (!asset) return json(res, 404, { error: 'no such image' });
+      const file = path.join(currentWorkspace().assetDir(id), assetId);
+      if (req.method === 'GET') {
+        let bytes;
+        try { bytes = fs.readFileSync(file); } catch { return json(res, 404, { error: 'image data is missing' }); }
+        res.writeHead(200, {
+          'Content-Type': asset.mime,
+          'Content-Length': bytes.length,
+          'Cache-Control': 'private, max-age=86400',
+          'Content-Security-Policy': "default-src 'none'; sandbox",
+          'X-Content-Type-Options': 'nosniff',
+        });
+        return res.end(bytes);
+      }
+      if (req.method === 'DELETE') {
+        project.assets = (project.assets || []).filter((a) => a.id !== assetId);
+        saveProjects(PROJECTS);
+        try { fs.unlinkSync(file); } catch { /* already gone */ }
+        return json(res, 200, { ok: true });
+      }
+    }
+
     const projSync = p.match(/^\/api\/projects\/([^/]+)\/sources\/sync$/);
     if (projSync && req.method === 'POST') {
       const id = decodeURIComponent(projSync[1]);
