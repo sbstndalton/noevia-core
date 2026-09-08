@@ -515,7 +515,7 @@ function ensureRolesLoaded() {
 // function-calling format every provider speaks (and pi-ai uses TypeBox to
 // produce exactly this shape). Results return to the model as role:'tool'
 // messages keyed by tool_call_id — the wire form of pi's toolResult.
-const TOOL_DEFS = [
+const CORE_TOOLS = [
   {
     type: 'function',
     function: {
@@ -546,6 +546,113 @@ const TOOL_DEFS = [
 
 const TOOL_RESULT_CAP = 8000; // chars — protect the context window
 
+// ── Toolboxes (master step 14) ────────────────────────────────────────────
+// Tools are no longer one flat global list. A *toolbox* is a named, selectable
+// set; a project picks which boxes it wants and the active list is resolved
+// per request. The seam exists so MCP-sourced tools can arrive as further
+// boxes without the chat loop changing shape — but it already earns its keep:
+// on the target hardware (a 9B model at ~14 tok/s) the catalogue is a real
+// per-turn cost paid on every message, not a rounding error.
+const TOOLBOXES = [
+  {
+    id: 'core',
+    label: 'Core',
+    description: 'Always-safe built-ins: the server clock, and full reads of this project\'s knowledge files.',
+    source: 'builtin',
+    tools: CORE_TOOLS,
+  },
+];
+
+const DEFAULT_TOOLBOXES = ['core'];
+
+// A tool definition is re-sent on EVERY turn, so its size is a recurring cost
+// and the count is the budget that matters.
+//
+// The naive ~4 chars/token rule badly undercounts here, because the provider
+// does not put the JSON on the wire as-is: llama.cpp's chat template re-renders
+// every tool into its own scaffolding before the model ever sees it. Measured
+// against the live endpoint on 2026-09-08 with Qwen3.5-9B — the identical
+// message cost 456 prompt tokens with the core box and 70 without it, so the
+// two core tools really cost 386, against a naive estimate of 180. Hence the
+// calibration factor, which is deliberately tuned to the heavier template:
+// the same box on Gemma-4-E4B cost only 232 prompt tokens for the whole
+// request, so the real factor is template-dependent and this one is closer to
+// a worst case than an average. Treat the output as an order-of-magnitude hint
+// — it is labelled "~" in the UI — but an estimate that is 2x LOW is worse
+// than useless when the point is deciding what a 14 tok/s box can afford, and
+// erring high fails safe.
+const TOOL_TOKEN_CALIBRATION = 2.1;
+function estimateToolTokens(tools) {
+  if (!Array.isArray(tools) || tools.length === 0) return 0; // no tools, no cost
+  return Math.round((JSON.stringify(tools).length / 4) * TOOL_TOKEN_CALIBRATION);
+}
+
+// How many tools a model can be handed before the catalogue crowds out the
+// conversation. This is a hardware/capability question, not a "what does this
+// work need" question — which is precisely why box *selection* is per-project
+// and only the cap looks at the model.
+const TOOL_CAP_DEFAULT = 24;
+const TOOL_CAP_SMALL = 12;
+function toolCapFor(model) {
+  // Parameter count in the model id (…-9B-…, …-4b-it…) is the only signal
+  // available here, and local GGUF names carry it by convention. An
+  // unrecognised name gets the roomier default: wrongly withholding tools is
+  // a worse failure than sending a few more than ideal.
+  const m = /(\d+(?:\.\d+)?)\s*[bB]\b/.exec(String(model || ''));
+  if (m && Number(m[1]) <= 12) return TOOL_CAP_SMALL;
+  return TOOL_CAP_DEFAULT;
+}
+
+// Resolve a project's selection into the list actually sent upstream. Unknown
+// box ids are ignored rather than fatal — a box can vanish when an MCP server
+// goes away, and that must degrade to fewer tools, not to a broken chat. Over
+// the cap the list is truncated, but never silently: the dropped names come
+// back so the caller can log them.
+function resolveTools(project, model) {
+  // An absent key means a project predating toolboxes: fall back to core so
+  // upgrading does not silently disarm existing projects. An empty ARRAY is a
+  // deliberate choice — the operator unticked every box — and must be honoured,
+  // or the UI checkbox would lie about what it does.
+  const wanted = Array.isArray(project && project.toolboxes) ? project.toolboxes : DEFAULT_TOOLBOXES;
+  const boxes = [];
+  const tools = [];
+  const seen = new Set();
+  for (const id of wanted) {
+    const box = TOOLBOXES.find((b) => b.id === id);
+    if (!box) continue;
+    boxes.push(box.id);
+    for (const tool of box.tools) {
+      const name = tool && tool.function && tool.function.name;
+      if (!name || seen.has(name)) continue; // first box wins a name clash
+      seen.add(name);
+      tools.push(tool);
+    }
+  }
+  const cap = toolCapFor(model);
+  const dropped = tools.slice(cap).map((t) => t.function.name);
+  return { tools: tools.slice(0, cap), dropped, boxes, cap };
+}
+
+// Shape for the UI: what boxes exist, how big each is, and what it costs.
+// Accept only ids that name a real box, so a stale selection persisted by an
+// older client cannot accumulate junk in the project record.
+function sanitizeToolboxes(value) {
+  if (!Array.isArray(value)) return null;
+  const ids = value.filter((v) => typeof v === 'string' && TOOLBOXES.some((b) => b.id === v));
+  return [...new Set(ids)];
+}
+
+function toolboxSummaries() {
+  return TOOLBOXES.map((b) => ({
+    id: b.id,
+    label: b.label,
+    description: b.description,
+    source: b.source,
+    toolCount: b.tools.length,
+    estTokens: estimateToolTokens(b.tools),
+  }));
+}
+
 // ── SKILL.md awareness (Hermes-style convention, master step 13) ─────────
 // A project knowledge file that starts with SKILL.md frontmatter is treated
 // as a skill: its name/description go into the system prompt as a always-on
@@ -573,7 +680,14 @@ function skillsIndexFor(project) {
   return skills;
 }
 
-async function executeToolCall(project, name, rawArgs) {
+async function executeToolCall(project, name, rawArgs, allowed) {
+  // A model can name a tool it was never offered — by hallucination, or from
+  // a box the project has since deselected mid-conversation. Enforce the
+  // resolved list here rather than trusting that whatever was sent upstream is
+  // still what came back.
+  if (allowed instanceof Set && !allowed.has(name)) {
+    return `ERROR: tool "${name}" is not enabled for this project`;
+  }
   let args = {};
   try {
     args = rawArgs ? JSON.parse(rawArgs) : {};
@@ -1010,11 +1124,20 @@ async function handleChat(req, res, body, authn) {
   send({ type: 'meta', model, chatId: chatId || undefined, route: routedRole || undefined });
 
   // ── Tool rounds (Pi-style loop, master step 13): stream a completion; if
-  // the model called built-in tools, execute them, append role:'tool'
-  // results, and stream a continuation. Max 3 rounds so a broken model can
-  // never loop forever. No tool-calling-capable model in the roster yet, so
-  // this is dormant plumbing until one lands — the loop simply never fires.
+  // the model called a tool, execute it, append role:'tool' results, and
+  // stream a continuation. Max 3 rounds so a broken model can never loop
+  // forever. Verified end to end against Qwen3.5-9B on 2026-09-08; the tool
+  // list is resolved per request from the project's toolboxes (step 14).
   const decoder = new TextDecoder();
+  // Resolve the project's toolboxes once for the whole exchange: every round
+  // must offer the same list, or the model gets told a tool exists and then
+  // punished for calling it.
+  const resolved = resolveTools(project, model);
+  const activeTools = resolved.tools;
+  const allowedToolNames = new Set(activeTools.map((t) => t.function.name));
+  if (resolved.dropped.length) {
+    console.warn(`[tools] ${model}: cap ${resolved.cap} exceeded, dropped ${resolved.dropped.length}: ${resolved.dropped.join(', ')}`);
+  }
   let roundMessages = wire;
   // After a tool result, a reasoning model often emits its whole continuation
   // on the reasoning channel and never opens a content block — the answer is
@@ -1039,7 +1162,7 @@ async function handleChat(req, res, body, authn) {
           messages: roundMessages,
           stream: true,
           stream_options: { include_usage: true },
-          tools: TOOL_DEFS,
+          ...(activeTools.length ? { tools: activeTools } : {}),
         }),
         signal: chatSignal.signal,
         redirect: 'error', // see the provider test route: no inward bounces
@@ -1140,7 +1263,7 @@ async function handleChat(req, res, body, authn) {
       try {
         const full = await fetchJson(
           upstreamUrl,
-          { method: 'POST', headers: upstreamHeaders, body: JSON.stringify({ model, messages: roundMessages, tools: TOOL_DEFS }), signal: chatSignal.signal },
+          { method: 'POST', headers: upstreamHeaders, body: JSON.stringify({ model, messages: roundMessages, ...(activeTools.length ? { tools: activeTools } : {}) }), signal: chatSignal.signal },
           300000,
         );
         if (!full.ok) throw new Error(`Provider returned ${full.status}`);
@@ -1170,7 +1293,7 @@ async function handleChat(req, res, body, authn) {
       const assistantMsg = { role: 'assistant', content: null, tool_calls: [...toolCalls.entries()].map(([i, tc]) => ({ id: tc.id, type: 'function', function: { name: tc.name, arguments: tc.args } })) };
       roundMessages = [...roundMessages, assistantMsg];
       for (const [, tc] of toolCalls) {
-        const result = await executeToolCall(project, tc.name, tc.args);
+        const result = await executeToolCall(project, tc.name, tc.args, allowedToolNames);
         send({ type: 'tool_result', name: tc.name, text: result.slice(0, 300) });
         roundMessages.push({ role: 'tool', tool_call_id: tc.id, content: result });
       }
@@ -1410,6 +1533,10 @@ async function handleRequestScoped(req, res) {
       return json(res, 404, { error: 'not found' });
     }
 
+    if (p === '/api/toolboxes' && req.method === 'GET') {
+      return json(res, 200, { toolboxes: toolboxSummaries() });
+    }
+
     if (p === '/api/workspace') {
       return json(res, 200, { projects: PROJECTS, freeChats: FREE_CHATS });
     }
@@ -1623,6 +1750,7 @@ async function handleRequestScoped(req, res) {
         model: typeof body.model === 'string' && body.model ? body.model : undefined,
         provider: typeof body.provider === 'string' && body.provider ? body.provider : undefined,
         routing: body.routing === 'auto' ? 'auto' : 'manual', // default manual (step 12 guardrail)
+        toolboxes: sanitizeToolboxes(body.toolboxes) || [...DEFAULT_TOOLBOXES], // step 14: core only by default
         // (files normalization below is shared with the config route's RAG bookkeeping)
         chats: [],
         createdAt: Date.now(),
@@ -1683,6 +1811,11 @@ async function handleRequestScoped(req, res) {
       if (typeof patch.provider === 'string' && patch.provider) {
         if (!getProvider(patch.provider)) return json(res, 400, { error: 'no such provider' });
         project.provider = patch.provider;
+      }
+      if (patch.toolboxes !== undefined) {
+        const boxes = sanitizeToolboxes(patch.toolboxes);
+        if (!boxes) return json(res, 400, { error: 'toolboxes must be an array of toolbox ids' });
+        project.toolboxes = boxes;
       }
       if (Array.isArray(patch.memories)) {
         project.memories = patch.memories.filter((m) => typeof m === 'string' && m.trim()).map((m) => m.trim().slice(0, 500)).slice(0, 50);
@@ -2044,4 +2177,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { checkAuth, handleRequest, classifierVerdict, heuristicWantsSmart, CLASSIFIER_MAX_TOKENS, recordUsage, readUsage, usageDayKey, USAGE_RETENTION_DAYS };
+module.exports = { checkAuth, handleRequest, resolveTools, toolboxSummaries, estimateToolTokens, toolCapFor, sanitizeToolboxes, executeToolCall, TOOLBOXES, classifierVerdict, heuristicWantsSmart, CLASSIFIER_MAX_TOKENS, recordUsage, readUsage, usageDayKey, USAGE_RETENTION_DAYS };
