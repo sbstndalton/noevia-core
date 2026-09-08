@@ -129,31 +129,33 @@ test('a sync with no attached folders keeps uploads and drops folder-derived fil
 
 // ── deleting a project source ────────────────────────────────────────────
 
-test('only a file directly inside the project folder may be deleted', () => {
-  // Deleting removes the file from the user's storage, not just the project,
-  // so the guard has to be exact. A source read from a folder the user
-  // attached belongs to them, not to the project.
+test('a file may be deleted from any attached folder, and nowhere else', () => {
+  // Deleting removes the file from the user's storage. Attached folders are
+  // fair game — they are the user's own files and they attached them — but a
+  // project must never be a route to a path it was never given.
   const { ownsFile } = require('./index.cjs');
-  const project = { projectFolder: 'noevia projects/Research' };
+  const project = {
+    projectFolder: 'noevia projects/Research',
+    sourceFolders: ['noevia projects/Research', 'Documents/Diary/Raw Sources'],
+  };
 
   assert.equal(ownsFile(project, 'noevia projects/Research/notes.md'), true);
+  assert.equal(ownsFile(project, 'Documents/Diary/Raw Sources/a.md'), true);
 
-  // Another project's folder, and the shared root itself.
+  // Never a folder this project does not have attached.
   assert.equal(ownsFile(project, 'noevia projects/Other/notes.md'), false);
+  assert.equal(ownsFile(project, 'Documents/Taxes/2026.md'), false);
+
+  // Never the folder itself, a nested path, or traversal.
   assert.equal(ownsFile(project, 'noevia projects/Research'), false);
-
-  // A folder the user attached for reading is never deletable from here.
-  assert.equal(ownsFile(project, 'Documents/Important Documents/Diary/Raw Sources/a.md'), false);
-
-  // Nested paths and traversal.
   assert.equal(ownsFile(project, 'noevia projects/Research/sub/deep.md'), false);
   assert.equal(ownsFile(project, 'noevia projects/Research/..'), false);
   assert.equal(ownsFile(project, 'noevia projects/Research/'), false);
 
-  // A prefix that merely looks similar must not match.
+  // A lookalike prefix must not match.
   assert.equal(ownsFile(project, 'noevia projects/Research2/notes.md'), false);
+  assert.equal(ownsFile(project, 'Documents/Diary/Raw Sources Extra/a.md'), false);
 
-  // No folder at all means nothing is owned.
   assert.equal(ownsFile({}, 'anything.md'), false);
 });
 

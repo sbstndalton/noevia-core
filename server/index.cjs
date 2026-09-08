@@ -493,7 +493,11 @@ function autoRoles() {
 }
 
 function setAutoRoles(next) {
-  currentWorkspace().autoRoles = { fast: String(next.fast), smart: String(next.smart) };
+  // `vision` is optional: a deployment with no vision-capable model should not
+  // be forced to name one, and an existing config without it keeps working.
+  const roles = { fast: String(next.fast), smart: String(next.smart) };
+  if (next.vision) roles.vision = String(next.vision);
+  currentWorkspace().autoRoles = roles;
   currentWorkspace().saveAutoRoles();
 }
 
@@ -510,7 +514,8 @@ function ensureRolesLoaded() {
   const roles = autoRoles();
   if (!roles) return;
   void (async () => {
-    for (const role of ['fast', 'smart']) {
+    for (const role of ['fast', 'smart', 'vision']) {
+      if (!roles[role]) continue;
       try {
         await ensureModelLoaded(roles[role]);
       } catch (err) {
@@ -630,6 +635,8 @@ const IMAGE_MIME = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif'
 // model name -> whether it accepted an image. Cleared only by a restart, which
 // is the right cadence: a model's modality does not change under us.
 const visionSupport = new Map();
+// Cached image descriptions, keyed by model + images + question.
+const visionDescriptions = new Map();
 const IMAGE_UPLOAD_CAP = 8 * 1024 * 1024;
 const DOCUMENT_UPLOAD_CAP = 25 * 1024 * 1024;
 
@@ -652,18 +659,27 @@ function projectFolderName(name, id) {
   return cleaned || id;
 }
 
-/** Whether `target` is a file sitting directly in this project's own folder.
- *  The guard on deletion: a source pulled from a folder the user attached for
- *  reading is somebody else's file, and removing it from the project must not
- *  remove it from their storage. Sub-paths are refused too, so a nested
- *  directory cannot be reached through a project that merely contains it. */
+/** Whether `target` is a file this project may delete: one sitting directly in
+ *  a folder the project has attached, including its own.
+ *
+ *  Bounded to attached folders rather than the project's own, because an
+ *  attached folder's files are the user's and deleting them is their call —
+ *  but a project must not be a way to delete a path it was never given.
+ *  Sub-paths are refused, so a nested directory cannot be reached through a
+ *  folder that merely contains it. */
 function ownsFile(project, target) {
-  const own = project && project.projectFolder;
-  if (!own || typeof target !== 'string') return false;
-  const prefix = `${own}/`;
-  if (!target.startsWith(prefix)) return false;
-  const rel = target.slice(prefix.length);
-  return !!rel && !rel.includes('/') && rel !== '.' && rel !== '..';
+  if (!project || typeof target !== 'string' || !target) return false;
+  const folders = [
+    ...(project.projectFolder ? [project.projectFolder] : []),
+    ...(Array.isArray(project.sourceFolders) ? project.sourceFolders : []),
+  ];
+  return folders.some((folder) => {
+    if (!folder) return false;
+    const prefix = `${folder}/`;
+    if (!target.startsWith(prefix)) return false;
+    const rel = target.slice(prefix.length);
+    return !!rel && !rel.includes('/') && rel !== '.' && rel !== '..';
+  });
 }
 
 /** Create this project's folder, returning its path, or null when there is no
@@ -1996,6 +2012,60 @@ async function handleChat(req, res, body, authn) {
   const sys = sysParts.join('\n\n');
   let wire = sys ? [{ role: 'system', content: sys }, ...msgs] : msgs;
 
+  // A dedicated vision pass: the vision model describes the project's images,
+  // and the answering model reasons over that description as text.
+  //
+  // This exists because seeing and reasoning are not the same capability and
+  // are rarely the same model here. A model that reads an image well may be
+  // poor at the question being asked about it, and the model that answers best
+  // may be blind. Describing once and passing text along lets each do the part
+  // it is good at — and lets the answering model be one that cannot see at all.
+  //
+  // The description is cached per image AND per question, because "what is in
+  // this picture" and "what is the serial number in this picture" want
+  // different descriptions of the same bytes.
+  const describeImages = async (visionModel, baseUrl, headers, question) => {
+    const key = `${visionModel}::${project.id}::${projectImages.map((a) => a.id).join(',')}::${question.slice(0, 200)}`;
+    const cached = visionDescriptions.get(key);
+    if (cached) return cached;
+    const url = `${String(baseUrl).replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`;
+    const prompt = [
+      'Describe these images in detail, so someone who cannot see them can answer questions about them.',
+      'Transcribe any text exactly, including numbers, labels and headings. If text is unclear, say so rather than guessing.',
+      'Do not answer the question yourself; only describe.',
+      `The question that will be asked is: ${question.slice(0, 500)}`,
+    ].join(' ');
+    try {
+      const r = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...headers },
+        body: JSON.stringify({
+          model: visionModel,
+          max_tokens: 900,
+          messages: [{ role: 'user', content: [{ type: 'text', text: prompt }, ...attachedImages] }],
+        }),
+        signal: AbortSignal.timeout(180000),
+      });
+      if (!r.ok) {
+        console.warn(`[vision] ${visionModel} could not describe (${r.status})`);
+        return null;
+      }
+      const body = await r.json();
+      const text = String(body?.choices?.[0]?.message?.content || '').trim();
+      if (!text) return null;
+      visionDescriptions.set(key, text);
+      // Bounded: descriptions are large and a long session must not grow
+      // without limit.
+      if (visionDescriptions.size > 64) {
+        visionDescriptions.delete(visionDescriptions.keys().next().value);
+      }
+      return text;
+    } catch (err) {
+      console.warn(`[vision] describe failed: ${String((err && err.message) || err)}`);
+      return null;
+    }
+  };
+
   // Whether a model can actually see an image, asked once per model and
   // remembered. Attaching images to a model that cannot read them fails the
   // whole request, so the question is settled with a throwaway 1x1 probe
@@ -2088,25 +2158,45 @@ async function handleChat(req, res, body, authn) {
   // chat that never replies — and would do it to every message in the project,
   // not just the one asking about an image.
   if (attachedImages.length) {
-    const canSee = await visionProbe(provider.baseUrl, upstreamHeaders, model);
-    if (canSee) {
-      const lastUser = [...wire].reverse().find((m) => m.role === 'user');
-      if (lastUser) {
-        const text = typeof lastUser.content === 'string' ? lastUser.content : '';
-        lastUser.content = [
-          { type: 'text', text: `${text}\n\n(Attached images: ${projectImages.map((a) => a.name).join(', ')})` },
-          ...attachedImages,
-        ];
-      }
-    } else {
-      // Say so in the transcript rather than silently ignoring them: a project
-      // holding images whose model cannot see them should not look like the
-      // images were read and found uninteresting.
+    const roles = autoRoles();
+    const visionModel = roles && roles.vision;
+    let described = null;
+
+    // A configured vision model always does the looking, even when the
+    // answering model could see for itself: it was chosen for this job, and
+    // one model reading the image consistently beats whichever model the
+    // router happened to pick reading it differently each turn.
+    if (visionModel) {
+      described = await describeImages(visionModel, provider.baseUrl, upstreamHeaders, message);
+    }
+
+    if (described) {
+      const note = `Description of this project's images (${projectImages.map((a) => a.name).join(', ')}), produced by ${visionModel}:\n${described}`;
+      wire = wire.map((m) => (m.role === 'system' ? { ...m, content: `${m.content}\n\n${note}` } : m));
+      if (!sys) wire = [{ role: 'system', content: note }, ...wire];
       attachedImages = [];
-      wire = wire.map((m) => (m.role === 'system'
-        ? { ...m, content: `${m.content}\n\nThis project has image sources (${projectImages.map((a) => a.name).join(', ')}) but ${model} cannot read images. Say so if asked about them; do not guess at their contents.` }
-        : m));
-      if (!sys) wire = [{ role: 'system', content: `This project has image sources (${projectImages.map((a) => a.name).join(', ')}) but ${model} cannot read images. Say so if asked about them; do not guess at their contents.` }, ...wire];
+    } else {
+      // No vision role, or the description failed. Fall back to handing the
+      // images to the answering model directly, if it can read them at all.
+      const canSee = await visionProbe(provider.baseUrl, upstreamHeaders, model);
+      if (canSee) {
+        const lastUser = [...wire].reverse().find((m) => m.role === 'user');
+        if (lastUser) {
+          const text = typeof lastUser.content === 'string' ? lastUser.content : '';
+          lastUser.content = [
+            { type: 'text', text: `${text}\n\n(Attached images: ${projectImages.map((a) => a.name).join(', ')})` },
+            ...attachedImages,
+          ];
+        }
+      } else {
+        // Say so in the transcript rather than silently ignoring them: a
+        // project holding images whose model cannot see them should not look
+        // like the images were read and found uninteresting.
+        attachedImages = [];
+        const blind = `This project has image sources (${projectImages.map((a) => a.name).join(', ')}) but ${model} cannot read images${visionModel ? ' and the vision model could not describe them' : ''}. Say so if asked about them; do not guess at their contents.`;
+        wire = wire.map((m) => (m.role === 'system' ? { ...m, content: `${m.content}\n\n${blind}` } : m));
+        if (!sys) wire = [{ role: 'system', content: blind }, ...wire];
+      }
     }
   }
 
@@ -2844,8 +2934,9 @@ async function handleRequestScoped(req, res) {
         }
         const fast = typeof body.fast === 'string' ? body.fast.trim() : '';
         const smart = typeof body.smart === 'string' ? body.smart.trim() : '';
+        const vision = typeof body.vision === 'string' ? body.vision.trim() : '';
         if (!fast || !smart) return json(res, 400, { error: 'both fast and smart model names are required' });
-        setAutoRoles({ fast, smart });
+        setAutoRoles({ fast, smart, vision });
         ensureRolesLoaded(); // warm both models; never blocks the response
         return json(res, 200, { configured: true, roles: autoRoles() });
       }
@@ -3131,7 +3222,7 @@ async function handleRequestScoped(req, res) {
       const target = String(body.path || '');
       if (!target) return json(res, 400, { error: 'a path is required' });
       if (!ownsFile(project, target)) {
-        return json(res, 400, { error: "That file is not in this project's own folder, so it cannot be deleted from here." });
+        return json(res, 400, { error: 'That file is not in any folder attached to this project, so it cannot be deleted from here.' });
       }
       const connection = authService.getStorage(authn.user.id, true);
       if (!storageClient.isBrowsable(connection)) return json(res, 400, { error: 'no browsable storage connected' });
