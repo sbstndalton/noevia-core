@@ -73,7 +73,10 @@ test('the cap truncates and reports every dropped tool by name', () => {
     assert.equal(small.cap, 12);
     assert.equal(small.tools.length, 12);
     assert.equal(small.dropped.length, 8);
-    assert.deepEqual(small.dropped, ['t12', 't13', 't14', 't15', 't16', 't17', 't18', 't19']);
+    // Each dropped entry names the tool AND why it went, so a truncated
+    // catalogue is diagnosable from the log alone.
+    assert.deepEqual(small.dropped.map((d) => d.split(' ')[0]), ['t12', 't13', 't14', 't15', 't16', 't17', 't18', 't19']);
+    assert.match(small.dropped[0], /over 12-tool cap/);
 
     // Same selection, roomier model: nothing is dropped.
     const large = resolveTools({ toolboxes: ['test-big'] }, 'claude-sonnet-4-5');

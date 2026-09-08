@@ -23,6 +23,7 @@ const path = require('path');
 const { URL } = require('url');
 const { AsyncLocalStorage } = require('async_hooks');
 const rag = require('./rag.cjs');
+const mcp = require('./mcp.cjs');
 const storageClient = require('./storage-client.cjs');
 const { createModelManager } = require('./model-manager.cjs');
 const { createAuth, createRateLimiter } = require('./auth.cjs');
@@ -565,6 +566,13 @@ const TOOLBOXES = [
 
 const DEFAULT_TOOLBOXES = ['core'];
 
+// Built-ins plus whatever MCP discovery found. Everything downstream — the
+// picker, the validator, the resolver — goes through here so an MCP box is
+// indistinguishable from a built-in one once it exists.
+function allToolboxes() {
+  return [...TOOLBOXES, ...mcpState.boxes];
+}
+
 // A tool definition is re-sent on EVERY turn, so its size is a recurring cost
 // and the count is the budget that matters.
 //
@@ -593,6 +601,21 @@ function estimateToolTokens(tools) {
 // and only the cap looks at the model.
 const TOOL_CAP_DEFAULT = 24;
 const TOOL_CAP_SMALL = 12;
+
+// A COUNT cap alone is the wrong unit, which only became clear once real MCP
+// tools arrived. Measured against the reference server: nc_calendar_create_event
+// is 7,355 chars (~3,900 calibrated tokens) while nc_notes_search_notes is 449.
+// "12 tools" therefore describes anything between ~250 and ~47,000 tokens of
+// prompt. The count cap still guards against overwhelming a small model with
+// too many CHOICES; this budget guards the context window, which is the
+// constraint that actually bites at ~14 tok/s. Both apply, whichever binds first.
+const TOOL_TOKEN_BUDGET_DEFAULT = 8000;
+const TOOL_TOKEN_BUDGET_SMALL = 3000;
+function toolTokenBudgetFor(model) {
+  const m = /(\d+(?:\.\d+)?)\s*[bB]\b/.exec(String(model || ''));
+  if (m && Number(m[1]) <= 12) return TOOL_TOKEN_BUDGET_SMALL;
+  return TOOL_TOKEN_BUDGET_DEFAULT;
+}
 function toolCapFor(model) {
   // Parameter count in the model id (…-9B-…, …-4b-it…) is the only signal
   // available here, and local GGUF names carry it by convention. An
@@ -614,36 +637,257 @@ function resolveTools(project, model) {
   // deliberate choice — the operator unticked every box — and must be honoured,
   // or the UI checkbox would lie about what it does.
   const wanted = Array.isArray(project && project.toolboxes) ? project.toolboxes : DEFAULT_TOOLBOXES;
+  const available = allToolboxes();
   const boxes = [];
-  const tools = [];
+  const candidates = [];
   const seen = new Set();
   for (const id of wanted) {
-    const box = TOOLBOXES.find((b) => b.id === id);
+    const box = available.find((b) => b.id === id);
     if (!box) continue;
     boxes.push(box.id);
     for (const tool of box.tools) {
       const name = tool && tool.function && tool.function.name;
       if (!name || seen.has(name)) continue; // first box wins a name clash
       seen.add(name);
-      tools.push(tool);
+      candidates.push(tool);
     }
   }
+  // Two independent limits; whichever binds first stops the list. Tools are
+  // taken in selection order, so the box a user picked first keeps its tools
+  // when the budget runs out — a stable, explainable rule beats picking the
+  // cheapest tools and silently reshaping what the model can do.
   const cap = toolCapFor(model);
-  const dropped = tools.slice(cap).map((t) => t.function.name);
-  return { tools: tools.slice(0, cap), dropped, boxes, cap };
+  const budget = toolTokenBudgetFor(model);
+  const tools = [];
+  const dropped = [];
+  let spent = 0;
+  for (const tool of candidates) {
+    const cost = estimateToolTokens([tool]);
+    if (tools.length >= cap) { dropped.push(`${tool.function.name} (over ${cap}-tool cap)`); continue; }
+    if (spent + cost > budget) { dropped.push(`${tool.function.name} (~${cost} tok, over ${budget} budget)`); continue; }
+    tools.push(tool);
+    spent += cost;
+  }
+  return { tools, dropped, boxes, cap, budget, estTokens: spent };
 }
 
 // Shape for the UI: what boxes exist, how big each is, and what it costs.
+// ── MCP toolboxes (master step 15) ───────────────────────────────────────
+//
+// Curation is by explicit tool NAME, not by app prefix, and that is not
+// fussiness — it is forced by measurement. Against the reference server on
+// 2026-09-08 the full catalogue is 160 tools / ~40k prompt tokens converted,
+// but the cost is wildly uneven: nc_calendar_create_event alone is 7,355
+// chars (~3,900 tokens), twenty times the entire core box, while
+// nc_notes_search_notes is 449. A whole-app box is therefore still far too
+// expensive — "Calendar" as a unit is ~20k tokens, unusable at ~14 tok/s.
+//
+// So each box is a hand-picked working set: the smallest group of tools that
+// makes the app genuinely useful, and nothing else. Tools not listed here are
+// simply never offered; adding one is a deliberate, costed decision.
+const MCP_TOOLBOX_MANIFEST = [
+  {
+    id: 'nextcloud-notes',
+    label: 'Nextcloud Notes',
+    description: 'Search, read, create and edit notes.',
+    tools: [
+      'nc_notes_search_notes', 'nc_notes_get_note', 'nc_notes_create_note',
+      'nc_notes_append_content', 'nc_notes_update_note', 'nc_notes_delete_note',
+    ],
+  },
+  {
+    id: 'nextcloud-calendar',
+    label: 'Nextcloud Calendar',
+    description: 'Read the calendar and create, change or cancel events.',
+    tools: [
+      'nc_calendar_list_calendars', 'nc_calendar_list_events', 'nc_calendar_get_upcoming_events',
+      'nc_calendar_create_event', 'nc_calendar_update_event', 'nc_calendar_delete_event',
+    ],
+  },
+  {
+    id: 'nextcloud-files',
+    label: 'Nextcloud Files',
+    description: 'Browse, search, read and write files in Nextcloud.',
+    tools: [
+      'nc_webdav_list_directory', 'nc_webdav_read_file', 'nc_webdav_write_file',
+      'nc_webdav_search_files', 'nc_webdav_find_by_name',
+    ],
+  },
+  {
+    id: 'nextcloud-contacts',
+    label: 'Nextcloud Contacts',
+    description: 'Look up and maintain contacts.',
+    tools: [
+      'nc_contacts_list_contacts', 'nc_contacts_search_contacts',
+      'nc_contacts_create_contact', 'nc_contacts_update_contact',
+    ],
+  },
+  {
+    id: 'nextcloud-talk',
+    label: 'Nextcloud Talk',
+    description: 'Read conversations and send messages.',
+    tools: ['talk_list_conversations', 'talk_get_messages', 'talk_send_message'],
+  },
+  {
+    id: 'nextcloud-deck',
+    label: 'Nextcloud Deck',
+    description: 'Read boards and move or edit cards.',
+    tools: [
+      'deck_get_boards', 'deck_get_board_overview', 'deck_get_cards',
+      'deck_create_card', 'deck_update_card', 'deck_move_card_to_board',
+    ],
+  },
+];
+
+// An MCP server URL is the same class of thing as a member-supplied provider
+// or storage endpoint, so it reuses the existing policy rather than inventing
+// a third. It is admin/deployment configuration (an env var, not something a
+// member can set), which under endpointApproved() is exactly the admin case —
+// pointing at a private address such as another container is legitimate and
+// expected. The guard that matters here is the shape check: http/https only,
+// and no credentials smuggled into the URL.
+const MCP_SERVER_URL = (() => {
+  const raw = (process.env.MCP_SERVER_URL || '').trim();
+  if (!raw) return '';
+  try {
+    const u = new URL(raw);
+    if (!['http:', 'https:'].includes(u.protocol) || u.username || u.password) {
+      console.warn(`[mcp] ignoring MCP_SERVER_URL: must be http(s) with no embedded credentials`);
+      return '';
+    }
+    return raw;
+  } catch {
+    console.warn('[mcp] ignoring MCP_SERVER_URL: not a valid URL');
+    return '';
+  }
+})();
+
+// Discovered MCP tools, keyed by name, plus the boxes that survived curation.
+// Discovery is a network round trip against a server that may be down, so it
+// is lazy, cached, and failure is non-fatal: no MCP boxes simply means the
+// built-in ones are all a project can choose. Chat must never break because a
+// side-car is restarting.
+const mcpState = { tools: new Map(), boxes: [], discoveredAt: 0, error: null, inflight: null };
+const MCP_DISCOVERY_TTL_MS = 10 * 60 * 1000;
+
+async function discoverMcpTools(force = false) {
+  if (!MCP_SERVER_URL) return mcpState;
+  const fresh = Date.now() - mcpState.discoveredAt < MCP_DISCOVERY_TTL_MS;
+  if (!force && fresh && mcpState.boxes.length) return mcpState;
+  if (mcpState.inflight) return mcpState.inflight;
+  mcpState.inflight = (async () => {
+    try {
+      // Discovery lists the catalogue only; it carries no user credential, so
+      // the shape of the toolbox is identical for everyone. The per-user
+      // credential is attached at CALL time instead — see mcpAuthHeaders().
+      const { session } = await mcp.connect(MCP_SERVER_URL);
+      const discovered = await mcp.listTools(MCP_SERVER_URL, session);
+      const byName = new Map();
+      const dropped = [];
+      for (const t of discovered) {
+        const conv = mcp.convertTool(t);
+        if (!conv.ok) { dropped.push(`${(t && t.name) || '(unnamed)'}: ${conv.reason}`); continue; }
+        byName.set(conv.tool.function.name, { tool: conv.tool, readOnly: mcp.readOnlyHint(t) });
+      }
+      if (dropped.length) console.warn(`[mcp] dropped ${dropped.length} unconvertible tools: ${dropped.join(' | ')}`);
+      const boxes = [];
+      for (const box of MCP_TOOLBOX_MANIFEST) {
+        const tools = [];
+        const missing = [];
+        for (const name of box.tools) {
+          const hit = byName.get(name);
+          if (hit) tools.push(hit.tool); else missing.push(name);
+        }
+        if (missing.length) console.warn(`[mcp] box ${box.id}: ${missing.length} curated tools not offered by the server: ${missing.join(', ')}`);
+        // A box that lost every tool is not shown at all — an empty box in the
+        // picker is a promise the server cannot keep.
+        if (tools.length) boxes.push({ ...box, source: 'mcp', tools });
+      }
+      mcpState.tools = byName;
+      mcpState.boxes = boxes;
+      mcpState.discoveredAt = Date.now();
+      mcpState.error = null;
+      console.log(`[mcp] discovered ${byName.size} tools at ${MCP_SERVER_URL}; ${boxes.length} curated boxes available`);
+    } catch (err) {
+      mcpState.error = String((err && err.message) || err);
+      mcpState.discoveredAt = Date.now(); // back off; do not hammer a dead server
+      console.warn(`[mcp] discovery failed for ${MCP_SERVER_URL}: ${mcpState.error}`);
+    } finally {
+      mcpState.inflight = null;
+    }
+    return mcpState;
+  })();
+  return mcpState.inflight;
+}
+
+// Per-user credential pass-through, following the diaryHeaders() precedent.
+//
+// The MCP server runs in multi_user_basic mode: it stores no credential of its
+// own and builds a Nextcloud client per request from the Authorization header.
+// noevia already holds exactly the credential that wants — the per-user
+// Nextcloud app password obtained through Login Flow v2 for diary storage — so
+// the consent flow the user already completed is reused rather than rebuilt.
+// Origins whose stored credential may be forwarded to the MCP server.
+//
+// This guard exists because the two ends can disagree. The MCP server talks to
+// ONE Nextcloud, fixed by its own NEXTCLOUD_HOST. noevia stores whatever
+// server each user happened to connect for diary storage — which may be a
+// different host entirely. Forwarding a credential across that gap would hand
+// a user's password for their server to somebody else's, so pass-through is
+// allowed only for origins the operator has explicitly declared to be the same
+// Nextcloud the MCP server uses.
+//
+// It is a LIST because one Nextcloud legitimately has several origins: this
+// deployment reaches it as http://10.69.0.130:11000 over the LAN and
+// https://drive.daserver.work from outside. Unset means no pass-through at
+// all — MCP tools then return an actionable error instead of silently
+// leaking, which is the correct way to fail.
+const MCP_NEXTCLOUD_ORIGINS = (process.env.MCP_NEXTCLOUD_ORIGINS || '')
+  .split(',').map((x) => x.trim().replace(/\/+$/, '')).filter(Boolean);
+
+function mcpCredentialOriginAllowed(baseUrl) {
+  try {
+    return MCP_NEXTCLOUD_ORIGINS.includes(new URL(baseUrl).origin);
+  } catch { return false; }
+}
+
+// Per-user credential pass-through, following the diaryHeaders() precedent.
+//
+// The MCP server runs in multi_user_basic mode: it stores no credential of its
+// own and builds a Nextcloud client per request from the Authorization header.
+// noevia already holds exactly the credential that wants — the per-user
+// Nextcloud app password obtained for storage — so the consent the user has
+// already given is reused rather than asked for a second time.
+//
+// Both 'nextcloud' and 'webdav' connections qualify: a Nextcloud app password
+// is the same secret whichever way the user attached it, and in practice the
+// generic WebDAV form is common. The origin allowlist above, not the `kind`
+// label, is what makes this safe.
+function mcpAuthHeaders() {
+  const store = requestScope.getStore();
+  const workspace = store && store.workspace;
+  if (!workspace) return null;
+  const storage = authService.getStorage(workspace.userId, true);
+  if (!['nextcloud', 'webdav'].includes(storage.kind)) return null;
+  if (!storage.username || !storage.secret) return null;
+  if (!mcpCredentialOriginAllowed(storage.baseUrl)) {
+    console.warn(`[mcp] refusing to forward credentials for ${storage.baseUrl}: origin not in MCP_NEXTCLOUD_ORIGINS`);
+    return null;
+  }
+  const basic = Buffer.from(`${storage.username}:${storage.secret}`).toString('base64');
+  return { Authorization: `Basic ${basic}`, 'X-Cowork-User-ID': workspace.userId };
+}
+
 // Accept only ids that name a real box, so a stale selection persisted by an
 // older client cannot accumulate junk in the project record.
 function sanitizeToolboxes(value) {
   if (!Array.isArray(value)) return null;
-  const ids = value.filter((v) => typeof v === 'string' && TOOLBOXES.some((b) => b.id === v));
+  const ids = value.filter((v) => typeof v === 'string' && allToolboxes().some((b) => b.id === v));
   return [...new Set(ids)];
 }
 
 function toolboxSummaries() {
-  return TOOLBOXES.map((b) => ({
+  return allToolboxes().map((b) => ({
     id: b.id,
     label: b.label,
     description: b.description,
@@ -716,7 +960,33 @@ async function executeToolCall(project, name, rawArgs, allowed) {
     }
     return `File "${f.name}" (${f.content.length} chars):\n\n${f.content.slice(0, TOOL_RESULT_CAP)}${f.content.length > TOOL_RESULT_CAP ? '\n…[truncated]' : ''}`;
   }
+  // Not a built-in: if the name came from a discovered MCP box, execute it
+  // there. The per-user credential is attached here rather than at discovery,
+  // so two users sharing a project each act as themselves.
+  if (mcpState.tools.has(name)) return executeMcpToolCall(name, args);
   return `ERROR: unknown tool "${name}"`;
+}
+
+async function executeMcpToolCall(name, args) {
+  if (!MCP_SERVER_URL) return 'ERROR: no MCP server is configured';
+  const auth = mcpAuthHeaders();
+  if (!auth) {
+    // Actionable on purpose: the model relays this to the user, and the fix is
+    // something only the user can do.
+    return 'ERROR: this tool needs your Nextcloud account. Connect Nextcloud in Settings → Storage, then try again. (If it is already connected, the administrator has not listed its address in MCP_NEXTCLOUD_ORIGINS.)';
+  }
+  try {
+    const { session } = await mcp.connect(MCP_SERVER_URL, auth);
+    const result = await mcp.callTool(MCP_SERVER_URL, session, name, args, auth);
+    const text = mcp.resultToText(result);
+    return text.length > TOOL_RESULT_CAP
+      ? `${text.slice(0, TOOL_RESULT_CAP)}\n…[truncated]`
+      : (text || '(the tool returned no output)');
+  } catch (err) {
+    // Returned, not thrown: a failed tool call is information the model can
+    // act on or relay, and throwing would strand the chip with no result.
+    return `ERROR calling ${name}: ${String((err && err.message) || err).slice(0, 300)}`;
+  }
 }
 
 // Deterministic pre-escalation: obviously complex messages go to the smart
@@ -1534,7 +1804,16 @@ async function handleRequestScoped(req, res) {
     }
 
     if (p === '/api/toolboxes' && req.method === 'GET') {
-      return json(res, 200, { toolboxes: toolboxSummaries() });
+      // Await discovery: on a cold start the picker would otherwise show only
+      // the built-in box and the user would think MCP was broken. Cached for
+      // MCP_DISCOVERY_TTL_MS, so this is one round trip every ten minutes.
+      await discoverMcpTools();
+      return json(res, 200, {
+        toolboxes: toolboxSummaries(),
+        mcp: MCP_SERVER_URL
+          ? { configured: true, error: mcpState.error, discovered: mcpState.tools.size }
+          : { configured: false },
+      });
     }
 
     if (p === '/api/workspace') {
@@ -2173,8 +2452,12 @@ if (require.main === module) {
     console.warn('WARNING: Set DIARY_AUTH_TOKEN to protect the internal diary connection. Browser accounts remain authenticated.');
   }
   http.createServer((req, res) => { handleRequest(req, res).catch(() => { if (!res.destroyed) res.destroy(); }); }).listen(PORT, HOST, () => {
-    console.log(`cowork-ui listening on http://${HOST}:${PORT} (inference: ${INFERENCE_BASE}, manager: ${modelManager.kind}, diary: ${DIARY_BASE})`);
+    console.log(`cowork-ui listening on http://${HOST}:${PORT} (inference: ${INFERENCE_BASE}, manager: ${modelManager.kind}, diary: ${DIARY_BASE}, mcp: ${MCP_SERVER_URL || 'disabled'})`);
+    // Warm the tool catalogue so the first chat does not pay for discovery.
+    // Never blocks startup: a side-car that is still booting must not stop
+    // noevia from serving.
+    discoverMcpTools().catch(() => undefined);
   });
 }
 
-module.exports = { checkAuth, handleRequest, resolveTools, toolboxSummaries, estimateToolTokens, toolCapFor, sanitizeToolboxes, executeToolCall, TOOLBOXES, classifierVerdict, heuristicWantsSmart, CLASSIFIER_MAX_TOKENS, recordUsage, readUsage, usageDayKey, USAGE_RETENTION_DAYS };
+module.exports = { checkAuth, handleRequest, resolveTools, allToolboxes, mcpCredentialOriginAllowed, toolTokenBudgetFor, MCP_TOOLBOX_MANIFEST, toolboxSummaries, estimateToolTokens, toolCapFor, sanitizeToolboxes, executeToolCall, TOOLBOXES, classifierVerdict, heuristicWantsSmart, CLASSIFIER_MAX_TOKENS, recordUsage, readUsage, usageDayKey, USAGE_RETENTION_DAYS };
