@@ -772,6 +772,7 @@ function resolveTools(project, model) {
 const MCP_TOOLBOX_MANIFEST = [
   {
     id: 'nextcloud-notes',
+    server: 'nextcloud',
     label: 'Nextcloud Notes',
     description: 'Search, read, create and edit notes.',
     tools: [
@@ -782,6 +783,7 @@ const MCP_TOOLBOX_MANIFEST = [
   },
   {
     id: 'nextcloud-calendar',
+    server: 'nextcloud',
     label: 'Nextcloud Calendar',
     description: 'Read the calendar and create, change or cancel events.',
     tools: [
@@ -792,6 +794,7 @@ const MCP_TOOLBOX_MANIFEST = [
   },
   {
     id: 'nextcloud-files',
+    server: 'nextcloud',
     label: 'Nextcloud Files',
     description: 'Browse, search, read and write files in Nextcloud.',
     tools: [
@@ -802,6 +805,7 @@ const MCP_TOOLBOX_MANIFEST = [
   },
   {
     id: 'nextcloud-contacts',
+    server: 'nextcloud',
     label: 'Nextcloud Contacts',
     description: 'Look up and maintain contacts.',
     tools: [
@@ -812,6 +816,7 @@ const MCP_TOOLBOX_MANIFEST = [
   },
   {
     id: 'nextcloud-talk',
+    server: 'nextcloud',
     label: 'Nextcloud Talk',
     description: 'Read conversations and send messages.',
     tools: ['talk_list_conversations', 'talk_get_messages', 'talk_send_message'],
@@ -819,6 +824,7 @@ const MCP_TOOLBOX_MANIFEST = [
   },
   {
     id: 'nextcloud-deck',
+    server: 'nextcloud',
     label: 'Nextcloud Deck',
     description: 'Read boards and move or edit cards.',
     tools: [
@@ -836,72 +842,169 @@ const MCP_TOOLBOX_MANIFEST = [
 // pointing at a private address such as another container is legitimate and
 // expected. The guard that matters here is the shape check: http/https only,
 // and no credentials smuggled into the URL.
-const MCP_SERVER_URL = (() => {
-  const raw = (process.env.MCP_SERVER_URL || '').trim();
-  if (!raw) return '';
-  try {
-    const u = new URL(raw);
-    if (!['http:', 'https:'].includes(u.protocol) || u.username || u.password) {
-      console.warn(`[mcp] ignoring MCP_SERVER_URL: must be http(s) with no embedded credentials`);
-      return '';
+// One or more MCP servers.
+//
+// MCP_SERVERS is a comma-separated list of `id|url|auth` entries; auth is
+// either `nextcloud` (forward the user's Nextcloud app password, subject to
+// the origin allowlist below) or `none`. MCP_SERVER_URL remains supported and
+// means exactly what it always did: a single Nextcloud MCP server.
+//
+// auth is per server and not optional-by-default for a reason. The credential
+// pass-through hands a user's Nextcloud password to the server being called.
+// That is correct for the Nextcloud MCP and a credential leak for anything
+// else, so a server gets it only when the operator says so by name.
+const MCP_SERVERS = (() => {
+  const shapeOk = (raw, label) => {
+    try {
+      const u = new URL(raw);
+      if (!['http:', 'https:'].includes(u.protocol) || u.username || u.password) {
+        console.warn(`[mcp] ignoring ${label}: must be http(s) with no embedded credentials`);
+        return false;
+      }
+      return true;
+    } catch {
+      console.warn(`[mcp] ignoring ${label}: not a valid URL`);
+      return false;
     }
-    return raw;
-  } catch {
-    console.warn('[mcp] ignoring MCP_SERVER_URL: not a valid URL');
-    return '';
+  };
+
+  const list = (process.env.MCP_SERVERS || '').trim();
+  if (list) {
+    const out = [];
+    const seen = new Set();
+    for (const entry of list.split(',').map((e) => e.trim()).filter(Boolean)) {
+      const [rawId, rawUrl, rawAuth] = entry.split('|').map((x) => (x || '').trim());
+      const id = (rawId || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40);
+      if (!id || !rawUrl) { console.warn(`[mcp] ignoring malformed MCP_SERVERS entry "${entry}"`); continue; }
+      if (seen.has(id)) { console.warn(`[mcp] ignoring duplicate MCP server id "${id}"`); continue; }
+      if (!shapeOk(rawUrl, `MCP server "${id}"`)) continue;
+      const auth = rawAuth === 'nextcloud' ? 'nextcloud' : 'none';
+      if (rawAuth && rawAuth !== 'nextcloud' && rawAuth !== 'none') {
+        console.warn(`[mcp] server "${id}": unknown auth "${rawAuth}", treating as none`);
+      }
+      seen.add(id);
+      out.push({ id, url: rawUrl, auth });
+    }
+    return out;
   }
+
+  const single = (process.env.MCP_SERVER_URL || '').trim();
+  if (!single) return [];
+  if (!shapeOk(single, 'MCP_SERVER_URL')) return [];
+  // The historical single-server deployment is the Nextcloud MCP, and it has
+  // always received the credential — keep that exactly.
+  return [{ id: 'nextcloud', url: single, auth: 'nextcloud' }];
 })();
 
+const MCP_SERVER_BY_ID = new Map(MCP_SERVERS.map((sv) => [sv.id, sv]));
+const MCP_ENABLED = MCP_SERVERS.length > 0;
+
 // Discovered MCP tools, keyed by name, plus the boxes that survived curation.
-// Discovery is a network round trip against a server that may be down, so it
-// is lazy, cached, and failure is non-fatal: no MCP boxes simply means the
-// built-in ones are all a project can choose. Chat must never break because a
+// Discovery is a network round trip against servers that may be down, so it is
+// lazy, cached, and failure is non-fatal and PER SERVER: one dead side-car must
+// not remove the tools of a healthy one. Chat must never break because a
 // side-car is restarting.
-const mcpState = { tools: new Map(), boxes: [], discoveredAt: 0, error: null, inflight: null };
+//
+// `tools` maps a tool name to the server that offers it, because a call has to
+// be routed back to the right one — and because a box may only bind tools from
+// the server it declares, so a second server cannot quietly take over a
+// curated box by offering a tool of the same name.
+const mcpState = {
+  tools: new Map(), // name -> { tool, readOnly, serverId }
+  boxes: [],
+  servers: new Map(), // id -> { id, url, auth, error, discoveredAt, toolCount }
+  discoveredAt: 0,
+  error: null,
+  inflight: null,
+};
 const MCP_DISCOVERY_TTL_MS = 10 * 60 * 1000;
 
+async function discoverOneServer(server) {
+  // Discovery lists the catalogue only; it carries no user credential, so the
+  // shape of the toolbox is identical for everyone. The per-user credential is
+  // attached at CALL time instead — see mcpAuthHeaders().
+  const { session } = await mcp.connect(server.url);
+  const discovered = await mcp.listTools(server.url, session);
+  const byName = new Map();
+  const dropped = [];
+  for (const t of discovered) {
+    const conv = mcp.convertTool(t);
+    if (!conv.ok) { dropped.push(`${(t && t.name) || '(unnamed)'}: ${conv.reason}`); continue; }
+    byName.set(conv.tool.function.name, { tool: conv.tool, readOnly: mcp.readOnlyHint(t), serverId: server.id });
+  }
+  if (dropped.length) console.warn(`[mcp:${server.id}] dropped ${dropped.length} unconvertible tools: ${dropped.join(' | ')}`);
+  return byName;
+}
+
 async function discoverMcpTools(force = false) {
-  if (!MCP_SERVER_URL) return mcpState;
+  if (!MCP_ENABLED) return mcpState;
   const fresh = Date.now() - mcpState.discoveredAt < MCP_DISCOVERY_TTL_MS;
   if (!force && fresh && mcpState.boxes.length) return mcpState;
   if (mcpState.inflight) return mcpState.inflight;
   mcpState.inflight = (async () => {
     try {
-      // Discovery lists the catalogue only; it carries no user credential, so
-      // the shape of the toolbox is identical for everyone. The per-user
-      // credential is attached at CALL time instead — see mcpAuthHeaders().
-      const { session } = await mcp.connect(MCP_SERVER_URL);
-      const discovered = await mcp.listTools(MCP_SERVER_URL, session);
+      const perServer = new Map();
+      const servers = new Map();
+      await Promise.all(MCP_SERVERS.map(async (server) => {
+        try {
+          const found = await discoverOneServer(server);
+          perServer.set(server.id, found);
+          servers.set(server.id, { ...server, error: null, discoveredAt: Date.now(), toolCount: found.size });
+          console.log(`[mcp:${server.id}] discovered ${found.size} tools at ${server.url}`);
+        } catch (err) {
+          const message = String((err && err.message) || err);
+          perServer.set(server.id, new Map());
+          servers.set(server.id, { ...server, error: message, discoveredAt: Date.now(), toolCount: 0 });
+          console.warn(`[mcp:${server.id}] discovery failed for ${server.url}: ${message}`);
+        }
+      }));
+
+      // Flatten into one registry. A name offered by two servers keeps the
+      // first — declaration order in MCP_SERVERS is the tie-break, and the
+      // collision is logged rather than silently resolved.
       const byName = new Map();
-      const dropped = [];
-      for (const t of discovered) {
-        const conv = mcp.convertTool(t);
-        if (!conv.ok) { dropped.push(`${(t && t.name) || '(unnamed)'}: ${conv.reason}`); continue; }
-        byName.set(conv.tool.function.name, { tool: conv.tool, readOnly: mcp.readOnlyHint(t) });
+      for (const server of MCP_SERVERS) {
+        for (const [name, entry] of perServer.get(server.id) || []) {
+          const held = byName.get(name);
+          if (held) {
+            console.warn(`[mcp] "${name}" offered by both "${held.serverId}" and "${server.id}"; keeping "${held.serverId}"`);
+            continue;
+          }
+          byName.set(name, entry);
+        }
       }
-      if (dropped.length) console.warn(`[mcp] dropped ${dropped.length} unconvertible tools: ${dropped.join(' | ')}`);
+
       const boxes = [];
       for (const box of MCP_TOOLBOX_MANIFEST) {
+        // A box binds only tools from its own server, so a rogue or merely
+        // careless second server cannot inject a tool into a curated box.
+        const owned = perServer.get(box.server) || new Map();
         const tools = [];
         const missing = [];
         for (const name of box.tools) {
-          const hit = byName.get(name);
+          const hit = owned.get(name);
           if (hit) tools.push(hit.tool); else missing.push(name);
         }
-        if (missing.length) console.warn(`[mcp] box ${box.id}: ${missing.length} curated tools not offered by the server: ${missing.join(', ')}`);
+        const serverState = servers.get(box.server);
+        if (!serverState) {
+          console.warn(`[mcp] box ${box.id} names unknown server "${box.server}"; skipping`);
+          continue;
+        }
+        if (missing.length && !serverState.error) {
+          console.warn(`[mcp:${box.server}] box ${box.id}: ${missing.length} curated tools not offered: ${missing.join(', ')}`);
+        }
         // A box that lost every tool is not shown at all — an empty box in the
         // picker is a promise the server cannot keep.
         if (tools.length) boxes.push({ ...box, source: 'mcp', tools });
       }
+
       mcpState.tools = byName;
       mcpState.boxes = boxes;
+      mcpState.servers = servers;
       mcpState.discoveredAt = Date.now();
-      mcpState.error = null;
-      console.log(`[mcp] discovered ${byName.size} tools at ${MCP_SERVER_URL}; ${boxes.length} curated boxes available`);
-    } catch (err) {
-      mcpState.error = String((err && err.message) || err);
-      mcpState.discoveredAt = Date.now(); // back off; do not hammer a dead server
-      console.warn(`[mcp] discovery failed for ${MCP_SERVER_URL}: ${mcpState.error}`);
+      // Kept for the single-server status shape: the first error, if any.
+      mcpState.error = [...servers.values()].map((sv) => sv.error).find(Boolean) || null;
+      console.log(`[mcp] ${byName.size} tools across ${MCP_SERVERS.length} server(s); ${boxes.length} curated boxes available`);
     } finally {
       mcpState.inflight = null;
     }
@@ -1153,16 +1256,28 @@ async function executeToolCall(project, name, rawArgs, allowed) {
 }
 
 async function executeMcpToolCall(name, args) {
-  if (!MCP_SERVER_URL) return 'ERROR: no MCP server is configured';
-  const auth = mcpAuthHeaders();
-  if (!auth) {
-    // Actionable on purpose: the model relays this to the user, and the fix is
-    // something only the user can do.
-    return 'ERROR: this tool needs your Nextcloud account. Connect Nextcloud in Settings → Storage, then try again. (If it is already connected, the administrator has not listed its address in MCP_NEXTCLOUD_ORIGINS.)';
+  const known = mcpState.tools.get(name);
+  if (!known) return `ERROR: unknown tool "${name}"`;
+  const server = MCP_SERVER_BY_ID.get(known.serverId);
+  if (!server) return `ERROR: tool "${name}" belongs to MCP server "${known.serverId}", which is no longer configured`;
+
+  // Credentials are per server. Forwarding the user's Nextcloud password to a
+  // server that merely happens to be configured would hand their password to
+  // somebody else's service, so only a server the operator marked
+  // auth=nextcloud gets it — and then only if the origin allowlist agrees.
+  let auth = null;
+  if (server.auth === 'nextcloud') {
+    auth = mcpAuthHeaders();
+    if (!auth) {
+      // Actionable on purpose: the model relays this to the user, and the fix
+      // is something only the user can do.
+      return 'ERROR: this tool needs your Nextcloud account. Connect Nextcloud in Settings → Storage, then try again. (If it is already connected, the administrator has not listed its address in MCP_NEXTCLOUD_ORIGINS.)';
+    }
   }
+
   try {
-    const { session } = await mcp.connect(MCP_SERVER_URL, auth);
-    const result = await mcp.callTool(MCP_SERVER_URL, session, name, args, auth);
+    const { session } = await mcp.connect(server.url, auth);
+    const result = await mcp.callTool(server.url, session, name, args, auth);
     const text = mcp.resultToText(result);
     return text.length > TOOL_RESULT_CAP
       ? `${text.slice(0, TOOL_RESULT_CAP)}\n…[truncated]`
@@ -2097,8 +2212,16 @@ async function handleRequestScoped(req, res) {
         // What has actually been measured about this hardware, so a slow box
         // is diagnosable without reading logs.
         prefill: { targetMs: TOOL_PREFILL_TARGET_MS, models: prefill.stats() },
-        mcp: MCP_SERVER_URL
-          ? { configured: true, error: mcpState.error, discovered: mcpState.tools.size }
+        mcp: MCP_ENABLED
+          ? {
+              configured: true,
+              error: mcpState.error,
+              discovered: mcpState.tools.size,
+              servers: MCP_SERVERS.map((sv) => {
+                const st = mcpState.servers.get(sv.id);
+                return { id: sv.id, auth: sv.auth, error: (st && st.error) || null, discovered: (st && st.toolCount) || 0 };
+              }),
+            }
           : { configured: false },
       });
     }
@@ -2838,7 +2961,7 @@ if (require.main === module) {
   // setting otherwise protects against.
   server.requestTimeout = 20 * 60 * 1000;
   server.listen(PORT, HOST, () => {
-    console.log(`cowork-ui listening on http://${HOST}:${PORT} (inference: ${INFERENCE_BASE}, manager: ${modelManager.kind}, diary: ${DIARY_BASE}, mcp: ${MCP_SERVER_URL || 'disabled'})`);
+    console.log(`cowork-ui listening on http://${HOST}:${PORT} (inference: ${INFERENCE_BASE}, manager: ${modelManager.kind}, diary: ${DIARY_BASE}, mcp: ${MCP_ENABLED ? MCP_SERVERS.map((sv) => sv.id).join('+') : 'disabled'})`);
     // Warm the tool catalogue so the first chat does not pay for discovery.
     // Never blocks startup: a side-car that is still booting must not stop
     // noevia from serving.
@@ -2846,4 +2969,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { checkAuth, handleRequest, sanitizeChats, prefill, TOOL_PREFILL_TARGET_MS, isWriteTool, chatWideApproved, pendingApprovals, resolveTools, allToolboxes, mcpCredentialOriginAllowed, toolTokenBudgetFor, MCP_TOOLBOX_MANIFEST, toolboxSummaries, estimateToolTokens, toolCapFor, sanitizeToolboxes, executeToolCall, TOOLBOXES, classifierVerdict, heuristicWantsSmart, CLASSIFIER_MAX_TOKENS, recordUsage, readUsage, usageDayKey, USAGE_RETENTION_DAYS };
+module.exports = { checkAuth, handleRequest, sanitizeChats, MCP_SERVERS, prefill, TOOL_PREFILL_TARGET_MS, isWriteTool, chatWideApproved, pendingApprovals, resolveTools, allToolboxes, mcpCredentialOriginAllowed, toolTokenBudgetFor, MCP_TOOLBOX_MANIFEST, toolboxSummaries, estimateToolTokens, toolCapFor, sanitizeToolboxes, executeToolCall, TOOLBOXES, classifierVerdict, heuristicWantsSmart, CLASSIFIER_MAX_TOKENS, recordUsage, readUsage, usageDayKey, USAGE_RETENTION_DAYS };
