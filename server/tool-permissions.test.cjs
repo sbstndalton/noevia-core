@@ -39,13 +39,55 @@ test('every curated tool is classified, and destructive verbs are never reads', 
 });
 
 test('the read classification matches what each box actually claims', () => {
+  // A drift guard, deliberately explicit: reclassifying a write as a read
+  // silently removes its approval prompt, so it must be changed here too and
+  // reviewed alongside the manifest.
   const expected = {
-    'nextcloud-notes': ['nc_notes_search_notes', 'nc_notes_get_note'],
-    'nextcloud-calendar': ['nc_calendar_list_calendars', 'nc_calendar_list_events', 'nc_calendar_get_upcoming_events'],
-    'nextcloud-files': ['nc_webdav_list_directory', 'nc_webdav_read_file', 'nc_webdav_search_files', 'nc_webdav_find_by_name'],
-    'nextcloud-contacts': ['nc_contacts_list_contacts', 'nc_contacts_search_contacts'],
-    'nextcloud-talk': ['talk_list_conversations', 'talk_get_messages'],
-    'nextcloud-deck': ['deck_get_boards', 'deck_get_board_overview', 'deck_get_cards'],
+    'nextcloud-notes': ['nc_notes_search_notes', 'nc_notes_get_note', 'nc_notes_get_attachment'],
+    'nextcloud-calendar': [
+      'nc_calendar_list_calendars', 'nc_calendar_list_events', 'nc_calendar_get_event',
+      'nc_calendar_get_upcoming_events', 'nc_calendar_find_availability',
+    ],
+    'nextcloud-calendar-admin': [],
+    'nextcloud-tasks': ['nc_calendar_list_todos', 'nc_calendar_search_todos'],
+    'nextcloud-files': [
+      'nc_webdav_list_directory', 'nc_webdav_read_file', 'nc_webdav_search_files',
+      'nc_webdav_find_by_name', 'nc_webdav_find_by_type', 'nc_webdav_list_favorites',
+    ],
+    'nextcloud-file-comments': ['nc_webdav_list_comments'],
+    'nextcloud-sharing': ['nc_share_list', 'nc_share_get'],
+    'nextcloud-mail': [
+      'nc_mail_list_accounts', 'nc_mail_list_mailboxes', 'nc_mail_list_messages',
+      'nc_mail_get_message', 'nc_mail_get_message_source', 'nc_mail_get_attachment',
+    ],
+    'nextcloud-mail-send': [],
+    'nextcloud-contacts': ['nc_contacts_list_addressbooks', 'nc_contacts_list_contacts', 'nc_contacts_search_contacts'],
+    'nextcloud-talk': [
+      'talk_list_conversations', 'talk_get_conversation', 'talk_get_messages',
+      'talk_list_participants', 'talk_list_reactions',
+    ],
+    'nextcloud-tables': ['nc_tables_list_tables', 'nc_tables_get_schema', 'nc_tables_read_table'],
+    'nextcloud-deck': [
+      'deck_get_boards', 'deck_get_board', 'deck_get_board_overview', 'deck_get_stacks',
+      'deck_get_stack', 'deck_get_cards', 'deck_get_card',
+    ],
+    'nextcloud-deck-workflow': ['deck_get_archived_stacks'],
+    'nextcloud-deck-structure': ['deck_get_labels', 'deck_get_label'],
+    'nextcloud-deck-notes': ['deck_get_card_comments', 'deck_list_attachments'],
+    'nextcloud-collectives': [
+      'collectives_get_collectives', 'collectives_get_pages', 'collectives_get_page',
+      'collectives_search_pages', 'collectives_get_tags',
+    ],
+    'nextcloud-collectives-admin': ['collectives_get_trashed_pages', 'collectives_get_trashed_collectives'],
+    'nextcloud-news': [
+      'nc_news_list_folders', 'nc_news_list_feeds', 'nc_news_list_items', 'nc_news_get_item',
+      'nc_news_get_starred_items', 'nc_news_get_unread_items', 'nc_news_get_feed_health', 'nc_news_get_status',
+    ],
+    'nextcloud-cookbook': [
+      'nc_cookbook_list_recipes', 'nc_cookbook_get_recipe', 'nc_cookbook_search_recipes',
+      'nc_cookbook_list_categories', 'nc_cookbook_get_recipes_in_category',
+      'nc_cookbook_list_keywords', 'nc_cookbook_get_recipes_with_keywords',
+    ],
   };
   for (const box of MCP_TOOLBOX_MANIFEST) {
     assert.deepEqual(box.reads, expected[box.id], `${box.id} read list drifted`);
@@ -53,13 +95,25 @@ test('the read classification matches what each box actually claims', () => {
     // text that silently gates a tool the user thinks is free.
     for (const r of box.reads) assert.ok(box.tools.includes(r), `${box.id}: ${r} is classified but not curated`);
   }
+  assert.equal(Object.keys(expected).length, MCP_TOOLBOX_MANIFEST.length, 'a box was added or removed without updating this guard');
 });
 
-test('writes outnumber reads in no box by accident — each box has both', () => {
+test('a box is never entirely writes without saying so in its name', () => {
+  // The old assertion here demanded every box hold both reads and writes.
+  // That was wrong: a read-only box (News) is a good thing, and isolating a
+  // single irreversible action (sending mail) into its own box is the whole
+  // point of the split. What actually matters is that an all-write box is one
+  // of the few deliberately named as such, so nobody adds one by accident.
+  const allowedAllWrite = new Set(['nextcloud-calendar-admin', 'nextcloud-mail-send']);
   for (const box of MCP_TOOLBOX_MANIFEST) {
     const writes = box.tools.filter((t) => !box.reads.includes(t));
-    assert.ok(box.reads.length > 0, `${box.id} has no read-only tools`);
-    assert.ok(writes.length > 0, `${box.id} has no write tools — is the classification real?`);
+    if (!box.reads.length) {
+      assert.ok(allowedAllWrite.has(box.id), `${box.id} has no reads and is not a declared write-only box`);
+    }
+    if (!writes.length) {
+      // A read-only box must be genuinely read-only, not a misclassification.
+      assert.equal(box.reads.length, box.tools.length, `${box.id} claims every tool is a read`);
+    }
   }
 });
 

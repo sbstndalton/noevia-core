@@ -166,13 +166,17 @@ test('budget scales with model size, like the count cap', () => {
 
 // ── curation ─────────────────────────────────────────────────────────────
 
-test('every curated box is affordable on the small-model budget', () => {
-  // The whole point of curation. If a box cannot fit the budget alone, the
-  // user can never actually use it and it should not be offered.
-  const { estimateToolTokens } = require('./index.cjs');
+test('a box fits entirely on the smallest supported model, or it is not atomic', () => {
+  // A box is the unit of selection, so it has to be all-or-nothing: if it
+  // exceeds the count cap, the user picks it and silently receives part of it.
+  // Asserted against the cap the code actually uses rather than a literal, so
+  // this tracks the cap instead of encoding one model generation's limits.
+  const { estimateToolTokens, toolCapFor } = require('./index.cjs');
+  const smallestCap = toolCapFor('some-4B-model');
   for (const box of MCP_TOOLBOX_MANIFEST) {
-    assert.ok(box.tools.length > 0 && box.tools.length <= 8, `${box.id}: ${box.tools.length} tools`);
-    assert.ok(box.id && box.label && box.description, `${box.id} is missing metadata`);
+    assert.ok(box.tools.length > 0, `${box.id} is empty`);
+    assert.ok(box.tools.length <= smallestCap, `${box.id}: ${box.tools.length} tools exceeds the ${smallestCap} cap`);
+    assert.ok(box.id && box.label && box.description && box.server, `${box.id} is missing metadata`);
   }
   assert.equal(typeof estimateToolTokens, 'function');
 });

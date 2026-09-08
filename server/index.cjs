@@ -770,70 +770,281 @@ function resolveTools(project, model) {
 // makes the app genuinely useful, and nothing else. Tools not listed here are
 // simply never offered; adding one is a deliberate, costed decision.
 const MCP_TOOLBOX_MANIFEST = [
+  // Boxes are task-shaped, not app-shaped. An app with seventeen tools becomes
+  // two or three boxes, because the budget is spent per selection: a project
+  // that wants to read a calendar should not also pay for bulk deletion.
+  //
+  // `reads` is the allowlist that runs without asking. Everything absent from
+  // it is a write and is gated, so a tool omitted here by mistake costs an
+  // extra prompt rather than unreviewed data loss.
+  //
+  // Two offered tools are deliberately absent: nc_cookbook_set_config and
+  // nc_cookbook_reindex administer the app itself rather than doing anything
+  // with a recipe, and nothing a chat asks for should reach them.
   {
     id: 'nextcloud-notes',
     server: 'nextcloud',
     label: 'Nextcloud Notes',
     description: 'Search, read, create and edit notes.',
     tools: [
-      'nc_notes_search_notes', 'nc_notes_get_note', 'nc_notes_create_note',
-      'nc_notes_append_content', 'nc_notes_update_note', 'nc_notes_delete_note',
+      'nc_notes_search_notes', 'nc_notes_get_note', 'nc_notes_get_attachment',
+      'nc_notes_create_note', 'nc_notes_append_content', 'nc_notes_update_note', 'nc_notes_delete_note',
     ],
-    reads: ['nc_notes_search_notes', 'nc_notes_get_note'],
+    reads: ['nc_notes_search_notes', 'nc_notes_get_note', 'nc_notes_get_attachment'],
   },
   {
     id: 'nextcloud-calendar',
     server: 'nextcloud',
     label: 'Nextcloud Calendar',
-    description: 'Read the calendar and create, change or cancel events.',
+    description: 'Read the calendar, find free slots, and create, change or cancel events.',
     tools: [
-      'nc_calendar_list_calendars', 'nc_calendar_list_events', 'nc_calendar_get_upcoming_events',
+      'nc_calendar_list_calendars', 'nc_calendar_list_events', 'nc_calendar_get_event',
+      'nc_calendar_get_upcoming_events', 'nc_calendar_find_availability',
       'nc_calendar_create_event', 'nc_calendar_update_event', 'nc_calendar_delete_event',
+      'nc_calendar_create_meeting',
     ],
-    reads: ['nc_calendar_list_calendars', 'nc_calendar_list_events', 'nc_calendar_get_upcoming_events'],
+    reads: [
+      'nc_calendar_list_calendars', 'nc_calendar_list_events', 'nc_calendar_get_event',
+      'nc_calendar_get_upcoming_events', 'nc_calendar_find_availability',
+    ],
+  },
+  {
+    id: 'nextcloud-calendar-admin',
+    server: 'nextcloud',
+    label: 'Calendar management',
+    description: 'Create and delete whole calendars, and change many events at once.',
+    // Separated deliberately: bulk_operations can delete every event matching a
+    // filter, which is not something a project asking "what is on Tuesday"
+    // should be carrying.
+    tools: ['nc_calendar_manage_calendar', 'nc_calendar_bulk_operations'],
+    reads: [],
+  },
+  {
+    id: 'nextcloud-tasks',
+    server: 'nextcloud',
+    label: 'Nextcloud Tasks',
+    description: 'Read and manage todos in your calendars.',
+    tools: [
+      'nc_calendar_list_todos', 'nc_calendar_search_todos', 'nc_calendar_create_todo',
+      'nc_calendar_update_todo', 'nc_calendar_complete_todo', 'nc_calendar_delete_todo',
+    ],
+    reads: ['nc_calendar_list_todos', 'nc_calendar_search_todos'],
   },
   {
     id: 'nextcloud-files',
     server: 'nextcloud',
     label: 'Nextcloud Files',
-    description: 'Browse, search, read and write files in Nextcloud.',
+    description: 'Browse, search and read files; write, move, copy and delete them.',
     tools: [
-      'nc_webdav_list_directory', 'nc_webdav_read_file', 'nc_webdav_write_file',
-      'nc_webdav_search_files', 'nc_webdav_find_by_name',
+      'nc_webdav_list_directory', 'nc_webdav_read_file', 'nc_webdav_search_files',
+      'nc_webdav_find_by_name', 'nc_webdav_find_by_type', 'nc_webdav_list_favorites',
+      'nc_webdav_write_file', 'nc_webdav_create_directory', 'nc_webdav_move_resource',
+      'nc_webdav_copy_resource', 'nc_webdav_delete_resource',
     ],
-    reads: ['nc_webdav_list_directory', 'nc_webdav_read_file', 'nc_webdav_search_files', 'nc_webdav_find_by_name'],
+    reads: [
+      'nc_webdav_list_directory', 'nc_webdav_read_file', 'nc_webdav_search_files',
+      'nc_webdav_find_by_name', 'nc_webdav_find_by_type', 'nc_webdav_list_favorites',
+    ],
+  },
+  {
+    id: 'nextcloud-file-comments',
+    server: 'nextcloud',
+    label: 'File comments',
+    description: 'Read and post comments on files.',
+    tools: ['nc_webdav_list_comments', 'nc_webdav_create_comment'],
+    reads: ['nc_webdav_list_comments'],
+  },
+  {
+    id: 'nextcloud-sharing',
+    server: 'nextcloud',
+    label: 'Nextcloud Sharing',
+    description: 'See who a file is shared with, and create or revoke shares.',
+    // Every write here changes who can reach a file, so none of them run
+    // unattended — a public link is a disclosure, not a convenience.
+    tools: ['nc_share_list', 'nc_share_get', 'nc_share_create', 'nc_share_create_public_link', 'nc_share_update', 'nc_share_delete'],
+    reads: ['nc_share_list', 'nc_share_get'],
+  },
+  {
+    id: 'nextcloud-mail',
+    server: 'nextcloud',
+    label: 'Nextcloud Mail',
+    description: 'Read mail, and file, flag or delete it.',
+    tools: [
+      'nc_mail_list_accounts', 'nc_mail_list_mailboxes', 'nc_mail_list_messages',
+      'nc_mail_get_message', 'nc_mail_get_message_source', 'nc_mail_get_attachment',
+      'nc_mail_set_flags', 'nc_mail_move_message', 'nc_mail_delete_message',
+      'nc_mail_create_tag', 'nc_mail_set_tag', 'nc_mail_remove_tag',
+    ],
+    reads: [
+      'nc_mail_list_accounts', 'nc_mail_list_mailboxes', 'nc_mail_list_messages',
+      'nc_mail_get_message', 'nc_mail_get_message_source', 'nc_mail_get_attachment',
+    ],
+  },
+  {
+    id: 'nextcloud-mail-send',
+    server: 'nextcloud',
+    label: 'Send mail',
+    description: 'Send email from a configured account.',
+    // Its own box because sending is irreversible and reaches other people.
+    // Reading your inbox should not imply the ability to mail from it.
+    tools: ['nc_mail_send_message'],
+    reads: [],
   },
   {
     id: 'nextcloud-contacts',
     server: 'nextcloud',
     label: 'Nextcloud Contacts',
-    description: 'Look up and maintain contacts.',
+    description: 'Search and manage contacts and address books.',
     tools: [
-      'nc_contacts_list_contacts', 'nc_contacts_search_contacts',
-      'nc_contacts_create_contact', 'nc_contacts_update_contact',
+      'nc_contacts_list_addressbooks', 'nc_contacts_list_contacts', 'nc_contacts_search_contacts',
+      'nc_contacts_create_contact', 'nc_contacts_update_contact', 'nc_contacts_delete_contact',
+      'nc_contacts_create_addressbook', 'nc_contacts_delete_addressbook',
     ],
-    reads: ['nc_contacts_list_contacts', 'nc_contacts_search_contacts'],
+    reads: ['nc_contacts_list_addressbooks', 'nc_contacts_list_contacts', 'nc_contacts_search_contacts'],
   },
   {
     id: 'nextcloud-talk',
     server: 'nextcloud',
     label: 'Nextcloud Talk',
-    description: 'Read conversations and send messages.',
-    tools: ['talk_list_conversations', 'talk_get_messages', 'talk_send_message'],
-    reads: ['talk_list_conversations', 'talk_get_messages'],
+    description: 'Read conversations and post messages and reactions.',
+    tools: [
+      'talk_list_conversations', 'talk_get_conversation', 'talk_get_messages',
+      'talk_list_participants', 'talk_list_reactions',
+      'talk_send_message', 'talk_mark_as_read', 'talk_react', 'talk_remove_reaction',
+      'talk_create_conversation', 'talk_add_participant',
+    ],
+    reads: [
+      'talk_list_conversations', 'talk_get_conversation', 'talk_get_messages',
+      'talk_list_participants', 'talk_list_reactions',
+    ],
+  },
+  {
+    id: 'nextcloud-tables',
+    server: 'nextcloud',
+    label: 'Nextcloud Tables',
+    description: 'Read table schemas and rows, and insert, update or delete rows.',
+    tools: [
+      'nc_tables_list_tables', 'nc_tables_get_schema', 'nc_tables_read_table',
+      'nc_tables_insert_row', 'nc_tables_update_row', 'nc_tables_delete_row',
+    ],
+    reads: ['nc_tables_list_tables', 'nc_tables_get_schema', 'nc_tables_read_table'],
   },
   {
     id: 'nextcloud-deck',
     server: 'nextcloud',
     label: 'Nextcloud Deck',
-    description: 'Read boards and move or edit cards.',
+    description: 'Read boards and create, edit or delete cards.',
     tools: [
-      'deck_get_boards', 'deck_get_board_overview', 'deck_get_cards',
-      'deck_create_card', 'deck_update_card', 'deck_move_card_to_board',
+      'deck_get_boards', 'deck_get_board', 'deck_get_board_overview', 'deck_get_stacks',
+      'deck_get_stack', 'deck_get_cards', 'deck_get_card',
+      'deck_create_card', 'deck_update_card', 'deck_delete_card',
     ],
-    reads: ['deck_get_boards', 'deck_get_board_overview', 'deck_get_cards'],
+    reads: [
+      'deck_get_boards', 'deck_get_board', 'deck_get_board_overview', 'deck_get_stacks',
+      'deck_get_stack', 'deck_get_cards', 'deck_get_card',
+    ],
+  },
+  {
+    id: 'nextcloud-deck-workflow',
+    server: 'nextcloud',
+    label: 'Deck workflow',
+    description: 'Move, archive, assign and link cards.',
+    tools: [
+      'deck_get_archived_stacks',
+      'deck_archive_card', 'deck_unarchive_card', 'deck_reorder_card', 'deck_move_card_to_board',
+      'deck_assign_user_to_card', 'deck_unassign_user_from_card',
+      'deck_assign_dependent_card', 'deck_remove_dependent_card',
+    ],
+    reads: ['deck_get_archived_stacks'],
+  },
+  {
+    id: 'nextcloud-deck-structure',
+    server: 'nextcloud',
+    label: 'Deck structure',
+    description: 'Create and delete boards, stacks and labels.',
+    tools: [
+      'deck_get_labels', 'deck_get_label',
+      'deck_create_board', 'deck_create_stack', 'deck_update_stack', 'deck_delete_stack',
+      'deck_create_label', 'deck_update_label', 'deck_delete_label',
+      'deck_assign_label_to_card', 'deck_remove_label_from_card',
+    ],
+    reads: ['deck_get_labels', 'deck_get_label'],
+  },
+  {
+    id: 'nextcloud-deck-notes',
+    server: 'nextcloud',
+    label: 'Deck comments & files',
+    description: 'Comment on cards and attach existing files or notes.',
+    tools: [
+      'deck_get_card_comments', 'deck_list_attachments',
+      'deck_create_card_comment', 'deck_update_card_comment', 'deck_delete_card_comment',
+      'deck_attach_file', 'deck_attach_note', 'deck_delete_attachment',
+    ],
+    reads: ['deck_get_card_comments', 'deck_list_attachments'],
+  },
+  {
+    id: 'nextcloud-collectives',
+    server: 'nextcloud',
+    label: 'Nextcloud Collectives',
+    description: 'Read and write collective wiki pages.',
+    tools: [
+      'collectives_get_collectives', 'collectives_get_pages', 'collectives_get_page',
+      'collectives_search_pages', 'collectives_get_tags',
+      'collectives_create_page', 'collectives_move_page', 'collectives_set_page_emoji',
+      'collectives_create_tag', 'collectives_assign_tag', 'collectives_remove_tag',
+    ],
+    reads: [
+      'collectives_get_collectives', 'collectives_get_pages', 'collectives_get_page',
+      'collectives_search_pages', 'collectives_get_tags',
+    ],
+  },
+  {
+    id: 'nextcloud-collectives-admin',
+    server: 'nextcloud',
+    label: 'Collectives management',
+    description: 'Create, trash, restore and permanently delete collectives and pages.',
+    tools: [
+      'collectives_get_trashed_pages', 'collectives_get_trashed_collectives',
+      'collectives_create_collective', 'collectives_set_collective_emoji',
+      'collectives_trash_collective', 'collectives_restore_collective', 'collectives_delete_collective',
+      'collectives_trash_page', 'collectives_restore_page',
+    ],
+    reads: ['collectives_get_trashed_pages', 'collectives_get_trashed_collectives'],
+  },
+  {
+    id: 'nextcloud-news',
+    server: 'nextcloud',
+    label: 'Nextcloud News',
+    description: 'Read feeds and articles. Read-only.',
+    tools: [
+      'nc_news_list_folders', 'nc_news_list_feeds', 'nc_news_list_items', 'nc_news_get_item',
+      'nc_news_get_starred_items', 'nc_news_get_unread_items', 'nc_news_get_feed_health', 'nc_news_get_status',
+    ],
+    reads: [
+      'nc_news_list_folders', 'nc_news_list_feeds', 'nc_news_list_items', 'nc_news_get_item',
+      'nc_news_get_starred_items', 'nc_news_get_unread_items', 'nc_news_get_feed_health', 'nc_news_get_status',
+    ],
+  },
+  {
+    id: 'nextcloud-cookbook',
+    server: 'nextcloud',
+    label: 'Nextcloud Cookbook',
+    description: 'Search recipes, and import, create or edit them.',
+    tools: [
+      'nc_cookbook_list_recipes', 'nc_cookbook_get_recipe', 'nc_cookbook_search_recipes',
+      'nc_cookbook_list_categories', 'nc_cookbook_get_recipes_in_category',
+      'nc_cookbook_list_keywords', 'nc_cookbook_get_recipes_with_keywords',
+      'nc_cookbook_import_recipe', 'nc_cookbook_create_recipe', 'nc_cookbook_update_recipe',
+      'nc_cookbook_delete_recipe',
+    ],
+    reads: [
+      'nc_cookbook_list_recipes', 'nc_cookbook_get_recipe', 'nc_cookbook_search_recipes',
+      'nc_cookbook_list_categories', 'nc_cookbook_get_recipes_in_category',
+      'nc_cookbook_list_keywords', 'nc_cookbook_get_recipes_with_keywords',
+    ],
   },
 ];
+
 
 // An MCP server URL is the same class of thing as a member-supplied provider
 // or storage endpoint, so it reuses the existing policy rather than inventing
