@@ -13,9 +13,15 @@
 // user's chosen root folder). The corpusRoot itself is joined in here and is
 // never part of any path crossing this boundary.
 //
-// Deliberately read-only: the diary sidecar owns all corpus writes through its
-// journaled backend; this module exists so the web server can *fetch* text for
-// ingestion and nothing else.
+// Reads are unrestricted within the connection; the only write is creating a
+// directory. The diary sidecar still owns every corpus *content* write through
+// its journaled backend — nothing here creates, edits or deletes a file.
+//
+// Browsing is rooted at the connection, not at corpusRoot. corpusRoot is a
+// diary concept (where journal entries live) and scoping general file browsing
+// to it meant a project could only ever attach sources from inside the diary
+// folder. The diary reads its own tree through /api/diary/files, so it is
+// unaffected by this.
 
 const { signS3Request } = require('./s3-sign.cjs');
 
@@ -193,7 +199,8 @@ function isBrowsable(conn) {
 }
 
 /** List one directory level. `rawPath` is connection-absolute ('' = root). */
-async function listFiles(conn, rawPath) {
+async function listFiles(conn, rawPath, opts) {
+  const scoped = !!(opts && opts.scope === 'corpus');
   const path = safeRelativePath(rawPath);
   // Deterministic order regardless of what the server returns, and every
   // entry's `path` must be connection-absolute (browsed dir prefixed) so it
@@ -201,13 +208,16 @@ async function listFiles(conn, rawPath) {
   const sort = (entries) => entries.sort((a, b) => a.name.toLowerCase() < b.name.toLowerCase() ? -1 : a.name.toLowerCase() > b.name.toLowerCase() ? 1 : 0)
     .map((e) => ({ ...e, path: path ? `${path}/${e.name}` : e.name }));
   if (connectionKind(conn) === 's3') return sort(await s3List(conn, path));
-  const fullPath = joinRoot(conn.corpusRoot, path);
-  if (!fullPath) return []; // a connection without a corpusRoot has no root dir to list
+  const fullPath = scoped ? joinRoot(conn.corpusRoot, path) : path;
+  // An unscoped browse of "" is the connection root, which is a real directory
+  // — only a corpus-scoped browse needs a configured root to stand on.
+  if (scoped && !fullPath) return [];
   return sort(await davList(conn, fullPath));
 }
 
 /** Read one text file. `rawPath` is connection-absolute. */
-async function readTextFile(conn, rawPath) {
+async function readTextFile(conn, rawPath, opts) {
+  const scoped = !!(opts && opts.scope === 'corpus');
   const path = safeRelativePath(rawPath);
   if (!path) throw Object.assign(new Error('invalid path'), { status: 400 });
   const name = path.split('/').pop();
@@ -216,8 +226,39 @@ async function readTextFile(conn, rawPath) {
   }
   const text = connectionKind(conn) === 's3'
     ? await s3Read(conn, path)
-    : await davRead(conn, joinRoot(conn.corpusRoot, path));
+    : await davRead(conn, scoped ? joinRoot(conn.corpusRoot, path) : path);
   return { name, content: text.slice(0, READ_CAP), truncated: text.length > READ_CAP };
 }
 
-module.exports = { listFiles, readTextFile, isBrowsable, safeRelativePath, TEXT_EXTENSIONS, READ_CAP };
+/** Create one directory. The only write this module performs: MKCOL creates a
+ *  collection and nothing else — it cannot overwrite or delete, and 405 back
+ *  from the server means the directory already exists, which is not a failure
+ *  worth surfacing as one. S3 has no directories (a "folder" is just a key
+ *  prefix), so there is nothing to create there and saying so is more honest
+ *  than writing a zero-byte marker object. */
+async function createFolder(conn, rawPath) {
+  const path = safeRelativePath(rawPath);
+  if (!path) throw Object.assign(new Error('invalid folder path'), { status: 400 });
+  if (connectionKind(conn) === 's3') {
+    throw Object.assign(
+      new Error('S3 has no folders — a prefix appears once a file is stored under it'),
+      { status: 400 },
+    );
+  }
+  const response = await withRetry(() => fetch(davUrl(conn, path, true), {
+    method: 'MKCOL',
+    headers: davHeaders(conn, {}),
+    signal: AbortSignal.timeout(15000),
+    redirect: 'error',
+  }));
+  if (response.status === 405) return { path, existed: true };
+  if (!response.ok) {
+    throw Object.assign(
+      new Error(`could not create "${path}" (${response.status})`),
+      { status: response.status === 409 ? 400 : 502 },
+    );
+  }
+  return { path, existed: false };
+}
+
+module.exports = { listFiles, readTextFile, createFolder, isBrowsable, safeRelativePath, TEXT_EXTENSIONS, READ_CAP };

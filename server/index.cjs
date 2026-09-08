@@ -1920,6 +1920,23 @@ async function handleRequestScoped(req, res) {
         return json(res, 502, { error: e?.message || 'storage browse failed' });
       }
     }
+    // Creating a directory is the one write this integration performs. It is
+    // deliberately narrow: MKCOL only, no file writes, no overwrite, no delete.
+    const storageMkdir = p.match(/^\/api\/integrations\/storage\/folder$/);
+    if (storageMkdir && req.method === 'POST') {
+      const body = await readJson(req);
+      const connection = authService.getStorage(authn.user.id, true);
+      if (!storageClient.isBrowsable(connection)) return json(res, 400, { error: 'no browsable storage connected' });
+      if (!(await storageEndpointAllowed(authn, connection.baseUrl))) return json(res, 400, { error: STORAGE_PRIVATE_URL_ERROR });
+      try {
+        const made = await storageClient.createFolder(connection, body.path);
+        return json(res, 200, made);
+      } catch (e) {
+        const status = e && e.status ? e.status : 502;
+        return json(res, status, { error: e?.message || 'could not create folder' });
+      }
+    }
+
     const storageRead = p.match(/^\/api\/integrations\/storage\/file$/);
     if (storageRead && req.method === 'POST') {
       const body = await readJson(req);

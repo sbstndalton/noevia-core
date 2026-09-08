@@ -8,7 +8,7 @@ const path = require('node:path');
 const { Readable, Writable } = require('node:stream');
 const test = require('node:test');
 
-const { listFiles, readTextFile, isBrowsable, safeRelativePath } = require('./storage-client.cjs');
+const { listFiles, readTextFile, createFolder, isBrowsable, safeRelativePath } = require('./storage-client.cjs');
 
 // ── pure helpers ─────────────────────────────────────────────────────────────
 
@@ -33,9 +33,10 @@ test('isBrowsable covers remote kinds only', () => {
 // ── fake servers ─────────────────────────────────────────────────────────────
 
 function startFakeDav() {
-  // Paths are nested under the users' corpusRoot (Cowork) — the client always
-  // requests full DAV paths that include it.
+  // The connection root is a real directory now that browsing is no longer
+  // prefixed with corpusRoot, so the fixture has to model it.
   const tree = {
+    '': ['Cowork'],
     Cowork: ['Docs', '2026-09.md'],
     'Cowork/Docs': ['notes.md', 'huge.md', 'image.png'],
   };
@@ -47,7 +48,7 @@ function startFakeDav() {
   };
   const server = http.createServer((req, res) => {
     const decoded = decodeURIComponent(req.url.split('?')[0]).replace(/\/+$/, '');
-    const relative = decoded.replace(/^\/dav\//, '');
+    const relative = decoded.replace(/^\/dav\/?/, '');
     if (req.method === 'PROPFIND') {
       const children = tree[relative] || [];
       const self = relative ? relative.split('/').pop() : 'root';
@@ -67,6 +68,15 @@ function startFakeDav() {
       if (body === undefined) { res.writeHead(404); res.end(); return; }
       res.writeHead(200, { 'Content-Length': Buffer.byteLength(body) });
       res.end(body);
+      return;
+    }
+    if (req.method === 'MKCOL') {
+      if (tree[relative]) { res.writeHead(405); res.end(); return; } // already exists
+      tree[relative] = [];
+      const parent = relative.split('/').slice(0, -1).join('/');
+      if (tree[parent]) tree[parent].push(relative.split('/').pop());
+      res.writeHead(201);
+      res.end();
       return;
     }
     res.writeHead(405);
@@ -125,28 +135,65 @@ function startFakeS3() {
 
 // ── client-level tests against the fakes ─────────────────────────────────────
 
-test('webdav listFiles and readTextFile honor the corpusRoot-relative contract', async (t) => {
+test('webdav browsing is rooted at the connection, not at corpusRoot', async (t) => {
   const { server, port } = await startFakeDav();
   t.after(() => server.close());
   const conn = { kind: 'webdav', baseUrl: `http://127.0.0.1:${port}/dav`, username: 'u', secret: 'p', corpusRoot: 'Cowork' };
 
+  // corpusRoot is where the diary keeps journal entries. Scoping every browse
+  // to it meant a project could only attach sources from inside the diary
+  // folder, so the whole connection is visible now and corpusRoot appears as
+  // just another directory in it.
   const root = await listFiles(conn, '');
-  assert.deepEqual(root.map((e) => [e.name, e.isDir]), [['2026-09.md', false], ['Docs', true]]);
+  assert.deepEqual(root.map((e) => [e.name, e.isDir]), [['Cowork', true]]);
 
-  const docs = await listFiles(conn, 'Docs');
+  const docs = await listFiles(conn, 'Cowork/Docs');
   assert.deepEqual(docs.filter((e) => !e.isDir).map((e) => e.name), ['huge.md', 'image.png', 'notes.md']); // sorted
 
-  const notes = await readTextFile(conn, 'Docs/notes.md');
+  const notes = await readTextFile(conn, 'Cowork/Docs/notes.md');
   assert.equal(notes.name, 'notes.md');
   assert.equal(notes.content, '# notes\n\nremote knowledge');
 
   // Oversized file is truncated to the cap, flagged.
-  const huge = await readTextFile(conn, 'Docs/huge.md');
+  const huge = await readTextFile(conn, 'Cowork/Docs/huge.md');
   assert.equal(huge.truncated, true);
   assert.ok(huge.content.length <= 200_000);
 
   // Non-text extension rejected.
-  await assert.rejects(() => readTextFile(conn, 'Docs/image.png'), /not a supported text file/);
+  await assert.rejects(() => readTextFile(conn, 'Cowork/Docs/image.png'), /not a supported text file/);
+});
+
+test('corpus scoping is still available for callers that want it', async (t) => {
+  const { server, port } = await startFakeDav();
+  t.after(() => server.close());
+  const conn = { kind: 'webdav', baseUrl: `http://127.0.0.1:${port}/dav`, username: 'u', secret: 'p', corpusRoot: 'Cowork' };
+
+  const scoped = await listFiles(conn, '', { scope: 'corpus' });
+  assert.deepEqual(scoped.map((e) => [e.name, e.isDir]), [['2026-09.md', false], ['Docs', true]]);
+
+  const notes = await readTextFile(conn, 'Docs/notes.md', { scope: 'corpus' });
+  assert.equal(notes.content, '# notes\n\nremote knowledge');
+});
+
+test('createFolder makes a directory, tolerates one that exists, and refuses S3', async (t) => {
+  const { server, port } = await startFakeDav();
+  t.after(() => server.close());
+  const conn = { kind: 'webdav', baseUrl: `http://127.0.0.1:${port}/dav`, username: 'u', secret: 'p', corpusRoot: 'Cowork' };
+
+  const made = await createFolder(conn, 'Cowork/Fresh');
+  assert.deepEqual(made, { path: 'Cowork/Fresh', existed: false });
+  assert.ok((await listFiles(conn, 'Cowork')).some((e) => e.name === 'Fresh' && e.isDir));
+
+  // MKCOL on an existing collection answers 405; that is not a failure.
+  assert.deepEqual(await createFolder(conn, 'Cowork/Fresh'), { path: 'Cowork/Fresh', existed: true });
+
+  // Traversal cannot escape, and an empty path is rejected outright.
+  await assert.rejects(() => createFolder(conn, '../escape'), /invalid folder path/);
+  await assert.rejects(() => createFolder(conn, ''), /invalid folder path/);
+
+  // S3 has no directories, so claiming to have made one would be a lie.
+  const s3 = { kind: 's3', baseUrl: 'http://127.0.0.1:1', bucket: 'b', username: 'ak', secret: 'sk' };
+  await assert.rejects(() => createFolder(s3, 'anything'), /S3 has no folders/);
 });
 
 test('s3 listFiles and readTextFile honor the connection-relative contract', async (t) => {
@@ -245,11 +292,11 @@ test('browse route lists the connected WebDAV root through the proxy', async (t)
   const response = await request('/api/integrations/storage/files', { headers: { cookie } });
   assert.equal(response.status, 200);
   const body = JSON.parse(response.text);
-  assert.deepEqual(body.entries.map((e) => [e.name, e.isDir]), [['2026-09.md', false], ['Docs', true]]);
+  assert.deepEqual(body.entries.map((e) => [e.name, e.isDir]), [['Cowork', true]]);
 });
 
 test('browse route serves a nested directory and rejects traversal', async () => {
-  const nested = await request('/api/integrations/storage/files/Docs', { headers: { cookie } });
+  const nested = await request('/api/integrations/storage/files/Cowork/Docs', { headers: { cookie } });
   assert.equal(nested.status, 200);
   assert.ok(JSON.parse(nested.text).entries.some((e) => e.name === 'notes.md'));
 
@@ -261,7 +308,7 @@ test('browse route serves a nested directory and rejects traversal', async () =>
 test('file-read route returns content and enforces the text-extension rule', async () => {
   const good = await request('/api/integrations/storage/file', {
     method: 'POST', headers: mutationHeaders(),
-    body: JSON.stringify({ path: 'Docs/notes.md' }),
+    body: JSON.stringify({ path: 'Cowork/Docs/notes.md' }),
   });
   assert.equal(good.status, 200);
   assert.equal(JSON.parse(good.text).content, '# notes\n\nremote knowledge');
