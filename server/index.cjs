@@ -1406,7 +1406,10 @@ async function handleChat(req, res, body, authn) {
   const activeTools = resolved.tools;
   const allowedToolNames = new Set(activeTools.map((t) => t.function.name));
   if (resolved.dropped.length) {
-    console.warn(`[tools] ${model}: cap ${resolved.cap} exceeded, dropped ${resolved.dropped.length}: ${resolved.dropped.join(', ')}`);
+    // Each entry carries its own reason (count cap or token budget), so do not
+    // assert a cause in the header — the two limits are independent and either
+    // may be the one that bit.
+    console.warn(`[tools] ${model}: ${resolved.tools.length} tools ~${resolved.estTokens} tok (cap ${resolved.cap}, budget ${resolved.budget}); dropped ${resolved.dropped.length}: ${resolved.dropped.join(', ')}`);
   }
   let roundMessages = wire;
   // After a tool result, a reasoning model often emits its whole continuation
