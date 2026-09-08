@@ -2294,6 +2294,8 @@ async function handleRequestScoped(req, res) {
         name,
         goal: String(body.goal || '').slice(0, 2000),
         instructions: String(body.instructions || '').slice(0, 8000),
+        pinned: false,
+        archived: false,
         memories: [],
         files: Array.isArray(body.files)
           ? body.files
@@ -2355,6 +2357,10 @@ async function handleRequestScoped(req, res) {
       if (typeof patch.goal === 'string') project.goal = patch.goal.slice(0, 2000);
       if (typeof patch.instructions === 'string') project.instructions = patch.instructions.slice(0, 8000);
       if (typeof patch.model === 'string' && patch.model) project.model = patch.model;
+      // Pin and archive are plain booleans rather than a status enum: a project
+      // can be both pinned and archived, and collapsing them would lose that.
+      if (typeof patch.pinned === 'boolean') project.pinned = patch.pinned;
+      if (typeof patch.archived === 'boolean') project.archived = patch.archived;
       if (typeof patch.routing === 'string') {
         if (patch.routing !== 'auto' && patch.routing !== 'manual') {
           return json(res, 400, { error: "routing must be 'auto' or 'manual'" });
@@ -2420,6 +2426,8 @@ async function handleRequestScoped(req, res) {
                 id: c.id.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80),
                 title: String(c.title || 'New task').slice(0, 120),
                 updatedAt: typeof c.updatedAt === 'number' ? c.updatedAt : Date.now(),
+                pinned: c.pinned === true,
+                archived: c.archived === true,
               })),
           );
           return json(res, 200, { ok: true });
@@ -2452,6 +2460,8 @@ async function handleRequestScoped(req, res) {
               id: c.id.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80),
               title: String(c.title || 'New chat').slice(0, 120),
               updatedAt: typeof c.updatedAt === 'number' ? c.updatedAt : Date.now(),
+              pinned: c.pinned === true,
+              archived: c.archived === true,
             }));
           FREE_CHATS.splice(0, FREE_CHATS.length, ...nextFreeChats);
           saveFreeChats(FREE_CHATS);
