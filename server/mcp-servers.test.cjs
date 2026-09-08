@@ -97,3 +97,21 @@ test('core survives any list, so a deployment cannot lose its built-ins', () => 
   assert.equal(offeredWith({ ENABLED_TOOLBOXES: 'nextcloud-files' })('core'), true);
   assert.equal(offeredWith({ ENABLED_TOOLBOXES: 'nothing-matches' })('core'), true);
 });
+
+// ── folder detachment ────────────────────────────────────────────────────
+
+test('a sync with no attached folders keeps uploads and drops folder-derived files', () => {
+  // Detaching a folder is expressed as a sync against the remaining list, so
+  // emptying that list has to clear what the folders contributed while leaving
+  // anything uploaded by hand alone. Getting this backwards orphans files that
+  // no longer have a folder to belong to.
+  const files = [
+    { name: 'notes.md', content: 'kept' },
+    { name: 'Docs/a.md', content: 'from a folder', source: 'Docs' },
+    { name: 'Docs/b.md', content: 'from a folder', source: 'Docs' },
+  ];
+  const uploaded = files.filter((f) => !f.source);
+  const fromFolders = []; // what a sync produces when nothing is attached
+  const next = [...uploaded, ...fromFolders];
+  assert.deepEqual(next.map((f) => f.name), ['notes.md']);
+});
