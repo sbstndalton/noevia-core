@@ -573,7 +573,7 @@ function skillsIndexFor(project) {
   return skills;
 }
 
-function executeToolCall(project, name, rawArgs) {
+async function executeToolCall(project, name, rawArgs) {
   let args = {};
   try {
     args = rawArgs ? JSON.parse(rawArgs) : {};
@@ -1016,6 +1016,13 @@ async function handleChat(req, res, body, authn) {
   // this is dormant plumbing until one lands — the loop simply never fires.
   const decoder = new TextDecoder();
   let roundMessages = wire;
+  // After a tool result, a reasoning model often emits its whole continuation
+  // on the reasoning channel and never opens a content block — the answer is
+  // real and correct, it is just filed as thinking. Rendering that as an empty
+  // reply with a collapsed "Thought process" makes tool calling look broken.
+  // Track both so the stream can never end with nothing shown.
+  let sentContent = false;
+  let roundReasoning = '';
   for (let round = 0; round < 3 && !chatSignal.signal.aborted; round++) {
     let upstream;
     try {
@@ -1053,6 +1060,7 @@ async function handleChat(req, res, body, authn) {
 
     const toolCalls = new Map(); // index -> {id, name, args}
     let sawAnything = false;
+    roundReasoning = '';
     // SSE line reassembly must live outside the chunk loop so a `data: {...}`
     // line split across a chunk boundary keeps its leading fragment
     // (same pattern as the client-side reader in src/api.ts).
@@ -1084,14 +1092,17 @@ async function handleChat(req, res, body, authn) {
             const delta = evt.choices?.[0]?.delta || {};
             if (delta.reasoning_content) {
               sawAnything = true;
+              roundReasoning += delta.reasoning_content;
               send({ type: 'reasoning', text: delta.reasoning_content });
             }
             if (delta.reasoning) {
               sawAnything = true;
+              roundReasoning += delta.reasoning;
               send({ type: 'reasoning', text: delta.reasoning });
             }
             if (delta.content) {
               sawAnything = true;
+              sentContent = true;
               send({ type: 'delta', text: delta.content });
             }
             if (Array.isArray(delta.tool_calls)) {
@@ -1103,7 +1114,13 @@ async function handleChat(req, res, body, authn) {
                 if (tc.function?.name) slot.name += tc.function.name;
                 if (tc.function?.arguments) slot.args += tc.function.arguments;
                 toolCalls.set(i, slot);
-                send({ type: 'tool', name: tc.function?.name || '', args: tc.function?.arguments || '' });
+                // Emit the accumulated slot, keyed by index — not the raw
+                // fragment. A single call arrives in many deltas (name once,
+                // then arguments a few characters at a time), so forwarding
+                // fragments made the client render one chip per delta, most
+                // of them nameless with partial args like `/T`. The client
+                // upserts on index and always sees the best-known state.
+                send({ type: 'tool', index: i, name: slot.name, args: slot.args });
               }
             }
           } catch {
@@ -1128,12 +1145,13 @@ async function handleChat(req, res, body, authn) {
         );
         if (!full.ok) throw new Error(`Provider returned ${full.status}`);
         const msg = full.body?.choices?.[0]?.message;
-        if (msg?.reasoning_content) send({ type: 'reasoning', text: msg.reasoning_content });
-        if (msg?.content) send({ type: 'delta', text: msg.content });
+        if (msg?.reasoning_content) { roundReasoning += msg.reasoning_content; send({ type: 'reasoning', text: msg.reasoning_content }); }
+        if (msg?.content) { sentContent = true; send({ type: 'delta', text: msg.content }); }
         if (Array.isArray(msg?.tool_calls)) {
           for (const tc of msg.tool_calls) {
-            toolCalls.set(toolCalls.size, { id: tc.id || `call-${toolCalls.size}`, name: tc.function?.name || '', args: tc.function?.arguments || '' });
-            send({ type: 'tool', name: tc.function?.name || '', args: tc.function?.arguments || '' });
+            const index = toolCalls.size;
+            toolCalls.set(index, { id: tc.id || `call-${index}`, name: tc.function?.name || '', args: tc.function?.arguments || '' });
+            send({ type: 'tool', index, name: tc.function?.name || '', args: tc.function?.arguments || '' });
           }
         }
         sawAnything = true;
@@ -1152,7 +1170,7 @@ async function handleChat(req, res, body, authn) {
       const assistantMsg = { role: 'assistant', content: null, tool_calls: [...toolCalls.entries()].map(([i, tc]) => ({ id: tc.id, type: 'function', function: { name: tc.name, arguments: tc.args } })) };
       roundMessages = [...roundMessages, assistantMsg];
       for (const [, tc] of toolCalls) {
-        const result = executeToolCall(project, tc.name, tc.args);
+        const result = await executeToolCall(project, tc.name, tc.args);
         send({ type: 'tool_result', name: tc.name, text: result.slice(0, 300) });
         roundMessages.push({ role: 'tool', tool_call_id: tc.id, content: result });
       }
@@ -1162,6 +1180,13 @@ async function handleChat(req, res, body, authn) {
   }
 
   if (chatSignal.signal.aborted) return; // client gone — nothing more to write
+  // Nothing was ever emitted as content, but the model did think — most often
+  // after a tool result, where the continuation arrives entirely on the
+  // reasoning channel. The thinking IS the answer in that case, so promote it
+  // rather than leaving the user with a tool chip and an empty bubble.
+  if (!sentContent && roundReasoning.trim()) {
+    send({ type: 'delta', text: roundReasoning.trim() });
+  }
   send({ type: 'done', model });
   res.end();
 }
