@@ -632,6 +632,62 @@ const IMAGE_MIME = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif'
 const visionSupport = new Map();
 const IMAGE_UPLOAD_CAP = 8 * 1024 * 1024;
 const DOCUMENT_UPLOAD_CAP = 25 * 1024 * 1024;
+
+// Where a project's own folder lives in the user's storage. One folder per
+// project under a single root, so uploads land somewhere the user can open,
+// edit and back up like any other folder — rather than inside projects.json
+// where only noevia can reach them.
+const PROJECT_ROOT_FOLDER = (process.env.PROJECT_ROOT_FOLDER || 'noevia projects').replace(/^\/+|\/+$/g, '');
+
+// A folder name from a project name. Nextcloud tolerates most characters, but
+// the separator and the traversal forms cannot survive, and a trailing dot or
+// space is invisible and confusing.
+function projectFolderName(name, id) {
+  const cleaned = String(name || '')
+    .replace(/[\/\\:*?"<>|]/g, '-')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^\.+|[.\s]+$/g, '')
+    .slice(0, 80);
+  return cleaned || id;
+}
+
+/** Whether `target` is a file sitting directly in this project's own folder.
+ *  The guard on deletion: a source pulled from a folder the user attached for
+ *  reading is somebody else's file, and removing it from the project must not
+ *  remove it from their storage. Sub-paths are refused too, so a nested
+ *  directory cannot be reached through a project that merely contains it. */
+function ownsFile(project, target) {
+  const own = project && project.projectFolder;
+  if (!own || typeof target !== 'string') return false;
+  const prefix = `${own}/`;
+  if (!target.startsWith(prefix)) return false;
+  const rel = target.slice(prefix.length);
+  return !!rel && !rel.includes('/') && rel !== '.' && rel !== '..';
+}
+
+/** Create this project's folder, returning its path, or null when there is no
+ *  browsable storage to put it in. Never throws: a project must still be
+ *  creatable when storage is down or unconfigured. */
+async function ensureProjectFolder(project) {
+  let connection;
+  try {
+    connection = authService.getStorage(currentWorkspace().userId, true);
+  } catch {
+    return null;
+  }
+  if (!storageClient.isBrowsable(connection)) return null;
+  const folder = `${PROJECT_ROOT_FOLDER}/${projectFolderName(project.name, project.id)}`;
+  try {
+    await storageClient.createFolder(connection, PROJECT_ROOT_FOLDER);
+    await storageClient.createFolder(connection, folder);
+    return folder;
+  } catch (err) {
+    console.warn(`[projects] could not create "${folder}": ${String((err && err.message) || err)}`);
+    return null;
+  }
+}
+
 const MAX_PROJECT_IMAGES = 12;
 
 const TOOL_CAP_DEFAULT = 24;
@@ -2829,6 +2885,14 @@ async function handleRequestScoped(req, res) {
         createdAt: Date.now(),
         updatedAt: Date.now(),
       };
+      // Its own folder in the user's storage, and attached as a source so
+      // anything dropped in it — by noevia or by the user, from any device —
+      // is picked up on the next sync.
+      const ownFolder = await ensureProjectFolder(project);
+      if (ownFolder) {
+        project.projectFolder = ownFolder;
+        project.sourceFolders = [ownFolder];
+      }
       PROJECTS.unshift(project);
       saveProjects(PROJECTS);
       // Index any files that arrived with the create call (same RAG bookkeeping
@@ -3013,6 +3077,73 @@ async function handleRequestScoped(req, res) {
       saveProjects(PROJECTS);
       rag.indexProjectFile(id, name, out.text, currentWorkspace().userId);
       return json(res, 200, { name, pages: out.pages, characters: out.text.length, truncated: out.truncated });
+    }
+
+    // Upload a file into the project's own folder. Text and PDFs both land as
+    // real files in the user's storage; the sync that follows converts them
+    // into sources, so there is exactly one path from a file to a source
+    // regardless of whether it arrived from this machine or was dropped into
+    // the folder from anywhere else.
+    const projUpload = p.match(/^\/api\/projects\/([^/]+)\/upload$/);
+    if (projUpload && req.method === 'POST') {
+      const id = decodeURIComponent(projUpload[1]);
+      const project = getProject(id);
+      if (!project) return json(res, 404, { error: 'no such project' });
+      if (!project.projectFolder) {
+        return json(res, 400, { error: 'This project has no storage folder. Connect Nextcloud in Settings → Storage, then recreate the project.' });
+      }
+      let body;
+      try {
+        body = JSON.parse(await readBody(req, DOCUMENT_UPLOAD_CAP + 512 * 1024));
+      } catch (e) {
+        if (e && e.status === 413) return json(res, 413, { error: `That file is larger than the ${Math.round(DOCUMENT_UPLOAD_CAP / (1024 * 1024))} MB limit.` });
+        return json(res, 400, { error: 'invalid JSON' });
+      }
+      const rawName = String(body.name || '').split('/').pop().slice(0, 200);
+      if (!rawName) return json(res, 400, { error: 'a filename is required' });
+      const isText = storageClient.TEXT_EXTENSIONS.has((rawName.slice(rawName.lastIndexOf('.')) || '').toLowerCase());
+      if (!isText && !documents.isDocument(rawName)) {
+        return json(res, 400, { error: `${rawName} is not a supported source (text file or PDF).` });
+      }
+      let bytes;
+      try { bytes = Buffer.from(String(body.dataBase64 || ''), 'base64'); } catch { bytes = null; }
+      if (!bytes || !bytes.length) return json(res, 400, { error: 'file was empty' });
+      const connection = authService.getStorage(authn.user.id, true);
+      if (!storageClient.isBrowsable(connection)) return json(res, 400, { error: 'no browsable storage connected' });
+      try {
+        await storageClient.writeFile(connection, `${project.projectFolder}/${rawName}`, bytes);
+      } catch (e) {
+        return json(res, (e && e.status) || 502, { error: (e && e.message) || 'could not save the file' });
+      }
+      return json(res, 200, { name: rawName, path: `${project.projectFolder}/${rawName}`, bytes: bytes.length });
+    }
+
+    // Delete one source file from the project's folder. This removes the file
+    // from the user's storage, not merely from the project, so it is confined
+    // to the project's OWN folder: a source pulled from a folder the user
+    // attached for reading must never be deletable from here.
+    const projFileDel = p.match(/^\/api\/projects\/([^/]+)\/files$/);
+    if (projFileDel && req.method === 'DELETE') {
+      const id = decodeURIComponent(projFileDel[1]);
+      const project = getProject(id);
+      if (!project) return json(res, 404, { error: 'no such project' });
+      const body = await readJson(req);
+      const target = String(body.path || '');
+      if (!target) return json(res, 400, { error: 'a path is required' });
+      if (!ownsFile(project, target)) {
+        return json(res, 400, { error: "That file is not in this project's own folder, so it cannot be deleted from here." });
+      }
+      const connection = authService.getStorage(authn.user.id, true);
+      if (!storageClient.isBrowsable(connection)) return json(res, 400, { error: 'no browsable storage connected' });
+      try {
+        await storageClient.deleteFile(connection, target);
+      } catch (e) {
+        return json(res, (e && e.status) || 502, { error: (e && e.message) || 'could not delete the file' });
+      }
+      project.files = (project.files || []).filter((f) => f.name !== target);
+      saveProjects(PROJECTS);
+      rag.deleteProjectFile(id, target, currentWorkspace().userId);
+      return json(res, 200, { ok: true, path: target });
     }
 
     const projAssets = p.match(/^\/api\/projects\/([^/]+)\/assets$/);
@@ -3469,4 +3600,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { checkAuth, handleRequest, sanitizeChats, MCP_SERVERS, toolboxOffered, prefill, TOOL_PREFILL_TARGET_MS, isWriteTool, chatWideApproved, pendingApprovals, resolveTools, allToolboxes, mcpCredentialOriginAllowed, toolTokenBudgetFor, MCP_TOOLBOX_MANIFEST, toolboxSummaries, estimateToolTokens, toolCapFor, sanitizeToolboxes, executeToolCall, TOOLBOXES, classifierVerdict, heuristicWantsSmart, CLASSIFIER_MAX_TOKENS, recordUsage, readUsage, usageDayKey, USAGE_RETENTION_DAYS };
+module.exports = { checkAuth, handleRequest, sanitizeChats, MCP_SERVERS, toolboxOffered, ownsFile, projectFolderName, prefill, TOOL_PREFILL_TARGET_MS, isWriteTool, chatWideApproved, pendingApprovals, resolveTools, allToolboxes, mcpCredentialOriginAllowed, toolTokenBudgetFor, MCP_TOOLBOX_MANIFEST, toolboxSummaries, estimateToolTokens, toolCapFor, sanitizeToolboxes, executeToolCall, TOOLBOXES, classifierVerdict, heuristicWantsSmart, CLASSIFIER_MAX_TOKENS, recordUsage, readUsage, usageDayKey, USAGE_RETENTION_DAYS };

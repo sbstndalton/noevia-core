@@ -126,3 +126,41 @@ test('a sync with no attached folders keeps uploads and drops folder-derived fil
   const next = [...uploaded, ...fromFolders];
   assert.deepEqual(next.map((f) => f.name), ['notes.md']);
 });
+
+// ── deleting a project source ────────────────────────────────────────────
+
+test('only a file directly inside the project folder may be deleted', () => {
+  // Deleting removes the file from the user's storage, not just the project,
+  // so the guard has to be exact. A source read from a folder the user
+  // attached belongs to them, not to the project.
+  const { ownsFile } = require('./index.cjs');
+  const project = { projectFolder: 'noevia projects/Research' };
+
+  assert.equal(ownsFile(project, 'noevia projects/Research/notes.md'), true);
+
+  // Another project's folder, and the shared root itself.
+  assert.equal(ownsFile(project, 'noevia projects/Other/notes.md'), false);
+  assert.equal(ownsFile(project, 'noevia projects/Research'), false);
+
+  // A folder the user attached for reading is never deletable from here.
+  assert.equal(ownsFile(project, 'Documents/Important Documents/Diary/Raw Sources/a.md'), false);
+
+  // Nested paths and traversal.
+  assert.equal(ownsFile(project, 'noevia projects/Research/sub/deep.md'), false);
+  assert.equal(ownsFile(project, 'noevia projects/Research/..'), false);
+  assert.equal(ownsFile(project, 'noevia projects/Research/'), false);
+
+  // A prefix that merely looks similar must not match.
+  assert.equal(ownsFile(project, 'noevia projects/Research2/notes.md'), false);
+
+  // No folder at all means nothing is owned.
+  assert.equal(ownsFile({}, 'anything.md'), false);
+});
+
+test('a project folder name survives characters a path cannot', () => {
+  const { projectFolderName } = require('./index.cjs');
+  assert.equal(projectFolderName('Research: Q4/2026', 'p-1'), 'Research- Q4-2026');
+  assert.equal(projectFolderName('  ..  ', 'p-2'), 'p-2');       // nothing usable left
+  assert.equal(projectFolderName('trailing dot.', 'p-3'), 'trailing dot');
+  assert.equal(projectFolderName('', 'p-4'), 'p-4');
+});

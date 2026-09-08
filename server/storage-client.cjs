@@ -291,4 +291,49 @@ async function readBinaryFile(conn, rawPath, opts) {
   return buf;
 }
 
-module.exports = { listFiles, readTextFile, readBinaryFile, createFolder, isBrowsable, safeRelativePath, TEXT_EXTENSIONS, READ_CAP };
+/** Write one file, creating or replacing it. Used for a project's own folder,
+ *  where noevia owns the contents — not a general "write anywhere" primitive,
+ *  though nothing here enforces that beyond the caller. */
+async function writeFile(conn, rawPath, bytes) {
+  const path = safeRelativePath(rawPath);
+  if (!path) throw Object.assign(new Error('invalid path'), { status: 400 });
+  if (connectionKind(conn) === 's3') {
+    throw Object.assign(new Error('writing to S3 is not supported'), { status: 400 });
+  }
+  const response = await withRetry(() => fetch(davUrl(conn, path), {
+    method: 'PUT',
+    headers: davHeaders(conn, { 'Content-Type': 'application/octet-stream' }),
+    body: bytes,
+    signal: AbortSignal.timeout(60000),
+    redirect: 'error',
+  }));
+  if (!response.ok) {
+    throw Object.assign(new Error(`could not write "${path}" (${response.status})`), { status: response.status === 409 ? 400 : 502 });
+  }
+  return { path };
+}
+
+/** Delete one file. Deliberately refuses a directory path: removing a file
+ *  from a project must never be able to take a folder — and everything under
+ *  it — with it. */
+async function deleteFile(conn, rawPath) {
+  const path = safeRelativePath(rawPath);
+  if (!path) throw Object.assign(new Error('invalid path'), { status: 400 });
+  if (path.endsWith('/')) throw Object.assign(new Error('refusing to delete a directory'), { status: 400 });
+  if (connectionKind(conn) === 's3') {
+    throw Object.assign(new Error('deleting from S3 is not supported'), { status: 400 });
+  }
+  const response = await withRetry(() => fetch(davUrl(conn, path), {
+    method: 'DELETE',
+    headers: davHeaders(conn, {}),
+    signal: AbortSignal.timeout(30000),
+    redirect: 'error',
+  }));
+  if (response.status === 404) return { path, missing: true };
+  if (!response.ok) {
+    throw Object.assign(new Error(`could not delete "${path}" (${response.status})`), { status: 502 });
+  }
+  return { path, missing: false };
+}
+
+module.exports = { listFiles, readTextFile, readBinaryFile, writeFile, deleteFile, createFolder, isBrowsable, safeRelativePath, TEXT_EXTENSIONS, READ_CAP };
