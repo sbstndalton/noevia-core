@@ -5,6 +5,9 @@ const fs = require('fs');
 const path = require('path');
 
 function createSecretStore(dataDir) {
+  // A fresh install has no state directory yet. Create it before the key,
+  // rather than relying on a later database initializer to do so.
+  fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   const keyFile = path.join(dataDir, 'secrets.key');
   let key;
   if (fs.existsSync(keyFile)) key = fs.readFileSync(keyFile);

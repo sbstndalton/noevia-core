@@ -27,6 +27,7 @@ const mcp = require('./mcp.cjs');
 const prefill = require('./prefill.cjs');
 const storageClient = require('./storage-client.cjs');
 const documents = require('./documents.cjs');
+const { createVisionProbe } = require('./vision.cjs');
 const { createModelManager } = require('./model-manager.cjs');
 const { createAuth, createRateLimiter } = require('./auth.cjs');
 const { createWorkspaceStore, atomicJson } = require('./workspace.cjs');
@@ -632,9 +633,9 @@ function estimateToolTokens(tools) {
 // and only the cap looks at the model.
 // An image source is bytes, not text, and needs its own limits.
 const IMAGE_MIME = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
-// model name -> whether it accepted an image. Cleared only by a restart, which
-// is the right cadence: a model's modality does not change under us.
-const visionSupport = new Map();
+// Endpoint-scoped probes expire, so repairing a model or its projector does
+// not require restarting noevia before images work again.
+const visionProbe = createVisionProbe();
 // Cached image descriptions, keyed by model + images + question.
 const visionDescriptions = new Map();
 const IMAGE_UPLOAD_CAP = 8 * 1024 * 1024;
@@ -656,7 +657,7 @@ function projectFolderName(name, id) {
     .trim()
     .replace(/^\.+|[.\s]+$/g, '')
     .slice(0, 80);
-  return cleaned || id;
+  return cleaned ? `${cleaned}--${id}` : id;
 }
 
 /** Whether `target` is a file this project may delete: one sitting directly in
@@ -695,8 +696,10 @@ async function ensureProjectFolder(project) {
   if (!storageClient.isBrowsable(connection)) return null;
   const folder = `${PROJECT_ROOT_FOLDER}/${projectFolderName(project.name, project.id)}`;
   try {
-    await storageClient.createFolder(connection, PROJECT_ROOT_FOLDER);
-    await storageClient.createFolder(connection, folder);
+    if (connection.kind !== 's3') {
+      await storageClient.createFolder(connection, PROJECT_ROOT_FOLDER);
+      await storageClient.createFolder(connection, folder);
+    }
     return folder;
   } catch (err) {
     console.warn(`[projects] could not create "${folder}": ${String((err && err.message) || err)}`);
@@ -2025,7 +2028,7 @@ async function handleChat(req, res, body, authn) {
   // this picture" and "what is the serial number in this picture" want
   // different descriptions of the same bytes.
   const describeImages = async (visionModel, baseUrl, headers, question) => {
-    const key = `${visionModel}::${project.id}::${projectImages.map((a) => a.id).join(',')}::${question.slice(0, 200)}`;
+    const key = JSON.stringify([currentWorkspace().userId, baseUrl, visionModel, project.id, projectImages.map((a) => a.id), question]);
     const cached = visionDescriptions.get(key);
     if (cached) return cached;
     const url = `${String(baseUrl).replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`;
@@ -2044,7 +2047,8 @@ async function handleChat(req, res, body, authn) {
           max_tokens: 900,
           messages: [{ role: 'user', content: [{ type: 'text', text: prompt }, ...attachedImages] }],
         }),
-        signal: AbortSignal.timeout(180000),
+        signal: AbortSignal.any([chatSignal.signal, AbortSignal.timeout(180000)]),
+        redirect: 'error',
       });
       if (!r.ok) {
         console.warn(`[vision] ${visionModel} could not describe (${r.status})`);
@@ -2064,40 +2068,6 @@ async function handleChat(req, res, body, authn) {
       console.warn(`[vision] describe failed: ${String((err && err.message) || err)}`);
       return null;
     }
-  };
-
-  // Whether a model can actually see an image, asked once per model and
-  // remembered. Attaching images to a model that cannot read them fails the
-  // whole request, so the question is settled with a throwaway 1x1 probe
-  // rather than with the user's real message.
-  const visionProbe = async (baseUrl, headers, modelName) => {
-    if (visionSupport.has(modelName)) return visionSupport.get(modelName);
-    const url = `${String(baseUrl).replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`;
-    const PIXEL = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
-    let ok = false;
-    try {
-      const r = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...headers },
-        body: JSON.stringify({
-          model: modelName,
-          max_tokens: 1,
-          messages: [{ role: 'user', content: [
-            { type: 'text', text: 'ok' },
-            { type: 'image_url', image_url: { url: `data:image/png;base64,${PIXEL}` } },
-          ] }],
-        }),
-        signal: AbortSignal.timeout(20000),
-      });
-      ok = r.ok;
-      if (!ok) console.warn(`[vision] ${modelName} rejected an image probe (${r.status}); images will not be attached`);
-      else console.log(`[vision] ${modelName} accepts images`);
-    } catch (err) {
-      console.warn(`[vision] probe for ${modelName} failed: ${String((err && err.message) || err)}`);
-      ok = false;
-    }
-    visionSupport.set(modelName, ok);
-    return ok;
   };
 
   // A project's image sources ride along with the latest user turn, as image
@@ -2152,11 +2122,24 @@ async function handleChat(req, res, body, authn) {
   const upstreamUrl = `${provider.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`;
   const upstreamHeaders = providerHeaders(provider);
 
+  // SSRF guard for member-registered providers (see the /api/providers POST
+  // guard): a member must not reach internal addresses through a chat pinned
+  // to a provider they registered themselves. Admin-configured providers
+  // (the env default, or shared ones) may legitimately point at private
+  // addresses (local inference), and member chat through them is the normal
+  // default-deployment path — so only the member's own private providers
+  // are subject to the denylist here.
+  const memberOwnProvider = authn && authn.user.role !== 'admin' && !provider.shared && provider.id !== DEFAULT_PROVIDER_ID;
+  if (memberOwnProvider && !endpointApproved(authn, upstreamUrl)) {
+    return json(res, 400, { error: 'Provider origin is not approved for member connections; contact an administrator.' });
+  }
+
   // Attach the project's images to the last user turn, but only to a model
   // that can read them. A model that cannot answers 400 for the WHOLE request,
   // so an unchecked attachment would turn "what is in this picture" into a
   // chat that never replies — and would do it to every message in the project,
   // not just the one asking about an image.
+  let visionWarning = '';
   if (attachedImages.length) {
     const roles = autoRoles();
     const visionModel = roles && roles.vision;
@@ -2178,8 +2161,8 @@ async function handleChat(req, res, body, authn) {
     } else {
       // No vision role, or the description failed. Fall back to handing the
       // images to the answering model directly, if it can read them at all.
-      const canSee = await visionProbe(provider.baseUrl, upstreamHeaders, model);
-      if (canSee) {
+      const vision = await visionProbe(provider.baseUrl, upstreamHeaders, model);
+      if (vision.supported) {
         const lastUser = [...wire].reverse().find((m) => m.role === 'user');
         if (lastUser) {
           const text = typeof lastUser.content === 'string' ? lastUser.content : '';
@@ -2193,27 +2176,17 @@ async function handleChat(req, res, body, authn) {
         // project holding images whose model cannot see them should not look
         // like the images were read and found uninteresting.
         attachedImages = [];
-        const blind = `This project has image sources (${projectImages.map((a) => a.name).join(', ')}) but ${model} cannot read images${visionModel ? ' and the vision model could not describe them' : ''}. Say so if asked about them; do not guess at their contents.`;
+        visionWarning = `Images were not read. ${vision.reason}`;
+        const blind = `This project has image sources (${projectImages.map((a) => a.name).join(', ')}) but image input is currently unavailable for ${model}: ${vision.reason}${visionModel ? '; the configured vision model also could not describe them' : ''}. Say so if asked about them; do not guess at their contents.`;
         wire = wire.map((m) => (m.role === 'system' ? { ...m, content: `${m.content}\n\n${blind}` } : m));
         if (!sys) wire = [{ role: 'system', content: blind }, ...wire];
       }
     }
   }
 
-  // SSRF guard for member-registered providers (see the /api/providers POST
-  // guard): a member must not reach internal addresses through a chat pinned
-  // to a provider they registered themselves. Admin-configured providers
-  // (the env default, or shared ones) may legitimately point at private
-  // addresses (local inference), and member chat through them is the normal
-  // default-deployment path — so only the member's own private providers
-  // are subject to the denylist here.
-  const memberOwnProvider = authn && authn.user.role !== 'admin' && !provider.shared && provider.id !== DEFAULT_PROVIDER_ID;
-  if (memberOwnProvider && !endpointApproved(authn, upstreamUrl)) {
-    return json(res, 400, { error: 'Provider origin is not approved for member connections; contact an administrator.' });
-  }
-
   res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
   send({ type: 'meta', model, chatId: chatId || undefined, route: routedRole || undefined });
+  if (visionWarning) send({ type: 'warning', text: visionWarning });
 
   // ── Tool rounds (Pi-style loop, master step 13): stream a completion; if
   // the model called a tool, execute it, append role:'tool' results, and
@@ -2247,6 +2220,7 @@ async function handleChat(req, res, body, authn) {
   // Track both so the stream can never end with nothing shown.
   let sentContent = false;
   let roundReasoning = '';
+  let toolOffset = 0;
   for (let round = 0; round < 3 && !chatSignal.signal.aborted; round++) {
     let upstream;
     roundStartedAt = Date.now();
@@ -2358,7 +2332,7 @@ async function handleChat(req, res, body, authn) {
                 // fragments made the client render one chip per delta, most
                 // of them nameless with partial args like `/T`. The client
                 // upserts on index and always sees the best-known state.
-                send({ type: 'tool', index: i, name: slot.name, args: slot.args });
+                send({ type: 'tool', index: toolOffset + i, name: slot.name, args: slot.args });
               }
             }
           } catch {
@@ -2389,7 +2363,7 @@ async function handleChat(req, res, body, authn) {
           for (const tc of msg.tool_calls) {
             const index = toolCalls.size;
             toolCalls.set(index, { id: tc.id || `call-${index}`, name: tc.function?.name || '', args: tc.function?.arguments || '' });
-            send({ type: 'tool', index, name: tc.function?.name || '', args: tc.function?.arguments || '' });
+            send({ type: 'tool', index: toolOffset + index, name: tc.function?.name || '', args: tc.function?.arguments || '' });
           }
         }
         sawAnything = true;
@@ -2419,7 +2393,7 @@ async function handleChat(req, res, body, authn) {
           send({
             type: 'tool_pending',
             id: approvalId,
-            index: toolIndex, // same index the `tool` events used, so the UI updates that chip
+            index: toolOffset + toolIndex, // same index the `tool` events used, so the UI updates that chip
             name: tc.name,
             args: tc.args,
           });
@@ -2432,7 +2406,7 @@ async function handleChat(req, res, body, authn) {
               ? `ERROR: the user did not respond in time, so ${tc.name} was not run. Ask before trying again.`
               : `ERROR: the user declined to run ${tc.name}. Do not retry it; ask what they would prefer.`;
             authService.audit('tool.denied', userId, userId, { tool: tc.name, reason: decision });
-            send({ type: 'tool_result', name: tc.name, text: result.slice(0, 300) });
+            send({ type: 'tool_result', index: toolOffset + toolIndex, name: tc.name, text: result.slice(0, 300) });
             roundMessages.push({ role: 'tool', tool_call_id: tc.id, content: result });
             continue;
           }
@@ -2448,11 +2422,12 @@ async function handleChat(req, res, body, authn) {
             failed: result.startsWith('ERROR') || undefined,
           });
         }
-        send({ type: 'tool_result', name: tc.name, text: result.slice(0, 300) });
+        send({ type: 'tool_result', index: toolOffset + toolIndex, name: tc.name, text: result.slice(0, 300) });
         roundMessages.push({ role: 'tool', tool_call_id: tc.id, content: result });
       }
     }
 
+    if (toolCalls.size) toolOffset += Math.max(...toolCalls.keys()) + 1;
     if (round === 2 || toolCalls.size === 0) break; // last round or no tools requested
   }
 
@@ -3023,8 +2998,9 @@ async function handleRequestScoped(req, res) {
       } catch {
         return json(res, 400, { error: 'invalid JSON' });
       }
-      const project = getProject(id);
-      if (!project) return json(res, 404, { error: 'no such project' });
+      const storedProject = getProject(id);
+      if (!storedProject) return json(res, 404, { error: 'no such project' });
+      const project = { ...storedProject };
       if (typeof patch.name === 'string' && patch.name.trim()) project.name = patch.name.trim().slice(0, 120);
       if (typeof patch.goal === 'string') project.goal = patch.goal.slice(0, 2000);
       if (typeof patch.instructions === 'string') project.instructions = patch.instructions.slice(0, 8000);
@@ -3089,6 +3065,7 @@ async function handleRequestScoped(req, res) {
         }
       }
       project.updatedAt = Date.now();
+      Object.assign(storedProject, project);
       saveProjects(PROJECTS);
       return json(res, 200, { ok: true });
     }
@@ -3143,7 +3120,7 @@ async function handleRequestScoped(req, res) {
       if (!project) return json(res, 404, { error: 'no such project' });
       let body;
       try {
-        body = JSON.parse(await readBody(req, DOCUMENT_UPLOAD_CAP + 512 * 1024));
+        body = JSON.parse(await readBody(req, Math.ceil(DOCUMENT_UPLOAD_CAP / 3) * 4 + 512 * 1024));
       } catch (e) {
         if (e && e.status === 413) return json(res, 413, { error: `That document is larger than the ${Math.round(DOCUMENT_UPLOAD_CAP / (1024 * 1024))} MB limit.` });
         return json(res, 400, { error: 'invalid JSON' });
@@ -3166,7 +3143,7 @@ async function handleRequestScoped(req, res) {
       if (uploads.length >= 20) return json(res, 400, { error: 'A project holds at most 20 uploaded sources.' });
       project.files = [...(project.files || []).filter((f) => f.name !== name), { name, content: out.text }];
       saveProjects(PROJECTS);
-      rag.indexProjectFile(id, name, out.text, currentWorkspace().userId);
+      rag.indexProjectFile(id, name, out.text, currentWorkspace().userId).catch((e) => console.warn('[rag] document indexing failed:', e.message));
       return json(res, 200, { name, pages: out.pages, characters: out.text.length, truncated: out.truncated });
     }
 
@@ -3180,12 +3157,9 @@ async function handleRequestScoped(req, res) {
       const id = decodeURIComponent(projUpload[1]);
       const project = getProject(id);
       if (!project) return json(res, 404, { error: 'no such project' });
-      if (!project.projectFolder) {
-        return json(res, 400, { error: 'This project has no storage folder. Connect Nextcloud in Settings → Storage, then recreate the project.' });
-      }
       let body;
       try {
-        body = JSON.parse(await readBody(req, DOCUMENT_UPLOAD_CAP + 512 * 1024));
+        body = JSON.parse(await readBody(req, Math.ceil(DOCUMENT_UPLOAD_CAP / 3) * 4 + 512 * 1024));
       } catch (e) {
         if (e && e.status === 413) return json(res, 413, { error: `That file is larger than the ${Math.round(DOCUMENT_UPLOAD_CAP / (1024 * 1024))} MB limit.` });
         return json(res, 400, { error: 'invalid JSON' });
@@ -3199,8 +3173,37 @@ async function handleRequestScoped(req, res) {
       let bytes;
       try { bytes = Buffer.from(String(body.dataBase64 || ''), 'base64'); } catch { bytes = null; }
       if (!bytes || !bytes.length) return json(res, 400, { error: 'file was empty' });
+      if (bytes.length > DOCUMENT_UPLOAD_CAP) return json(res, 413, { error: 'File exceeds the 25 MB limit.' });
       const connection = authService.getStorage(authn.user.id, true);
-      if (!storageClient.isBrowsable(connection)) return json(res, 400, { error: 'no browsable storage connected' });
+      if (!storageClient.isBrowsable(connection)) {
+        // Remote storage is optional. Keep local uploads as project sources,
+        // including PDF extraction, for installations without a cloud account.
+        const uploads = (project.files || []).filter((f) => !f.source);
+        if (uploads.length >= 20 && !uploads.some((f) => f.name === rawName)) {
+          return json(res, 400, { error: 'A project holds at most 20 uploaded sources.' });
+        }
+        let content;
+        try {
+          content = documents.isDocument(rawName)
+            ? (await documents.extractDocumentText(rawName, bytes)).text
+            : bytes.toString('utf8').slice(0, 200000);
+        } catch (e) {
+          return json(res, (e && e.status) || 422, { error: `Could not read ${rawName}: ${e.message || 'extraction failed'}` });
+        }
+        project.files = [...(project.files || []).filter((f) => f.source || f.name !== rawName), { name: rawName, content }];
+        project.updatedAt = Date.now();
+        saveProjects(PROJECTS);
+        rag.indexProjectFile(id, rawName, content, currentWorkspace().userId)
+          .catch((e) => console.warn('[rag] upload indexing failed:', e.message));
+        return json(res, 200, { name: rawName, path: rawName, bytes: bytes.length });
+      }
+      if (!project.projectFolder) {
+        const folder = await ensureProjectFolder(project);
+        if (!folder) return json(res, 502, { error: 'Could not create the project storage folder. Check your storage connection and retry.' });
+        project.projectFolder = folder;
+      }
+      project.sourceFolders = [...new Set([...(project.sourceFolders || []), project.projectFolder])];
+      saveProjects(PROJECTS);
       try {
         await storageClient.writeFile(connection, `${project.projectFolder}/${rawName}`, bytes);
       } catch (e) {
@@ -3245,7 +3248,7 @@ async function handleRequestScoped(req, res) {
       let body;
       try {
         // Images do not fit the 1 MB default that text sources live under.
-        body = JSON.parse(await readBody(req, IMAGE_UPLOAD_CAP + 512 * 1024));
+        body = JSON.parse(await readBody(req, Math.ceil(IMAGE_UPLOAD_CAP / 3) * 4 + 512 * 1024));
       } catch (e) {
         if (e && e.status === 413) return json(res, 413, { error: `That image is larger than the ${Math.round(IMAGE_UPLOAD_CAP / (1024 * 1024))} MB limit.` });
         return json(res, 400, { error: 'invalid JSON' });
@@ -3317,7 +3320,7 @@ async function handleRequestScoped(req, res) {
       if (folders.length && !storageClient.isBrowsable(connection)) {
         return json(res, 400, { error: 'no browsable storage connection is configured' });
       }
-      const uploaded = (project.files || []).filter((f) => !f.source);
+
       const fromFolders = [];
       const skipped = [];
       for (const folder of folders) {
@@ -3325,6 +3328,7 @@ async function handleRequestScoped(req, res) {
         try {
           entries = await storageClient.listFiles(connection, folder);
         } catch (e) {
+          fromFolders.push(...(project.files || []).filter((f) => f.source === folder));
           skipped.push({ folder, reason: e && e.message ? e.message : 'could not list folder' });
           continue;
         }
@@ -3347,12 +3351,20 @@ async function handleRequestScoped(req, res) {
               fromFolders.push({ name: entry.path, content: file.content, source: folder });
             }
           } catch (e) {
+            const previous = (project.files || []).find((f) => f.source === folder && f.name === entry.path);
+            if (previous) fromFolders.push(previous);
             skipped.push({ folder, file: entry.path, reason: e && e.message ? e.message : 'could not read' });
           }
         }
       }
       const prev = Array.isArray(project.files) ? project.files : [];
-      project.files = [...uploaded, ...fromFolders].slice(0, 60);
+      // An upload or folder edit may have completed while storage was being
+      // read. Preserve current uploads and never reattach a detached folder.
+      const currentFolders = new Set(project.sourceFolders || []);
+      const uploaded = prev.filter((f) => !f.source);
+      const untouched = prev.filter((f) => f.source && currentFolders.has(f.source) && !folders.includes(f.source));
+      const synced = fromFolders.filter((f) => currentFolders.has(f.source));
+      project.files = [...uploaded, ...untouched, ...synced].slice(0, 60);
       saveProjects(PROJECTS);
       // Same RAG bookkeeping the config patch does: drop chunks for files that
       // are gone, re-index the ones that arrived or changed.
@@ -3364,7 +3376,7 @@ async function handleRequestScoped(req, res) {
       for (const next of project.files) {
         const before = prevByName.get(next.name);
         if (!before || before.content !== next.content) {
-          rag.indexProjectFile(id, next.name, next.content, currentWorkspace().userId);
+          rag.indexProjectFile(id, next.name, next.content, currentWorkspace().userId).catch((e) => console.warn('[rag] source indexing failed:', e.message));
         }
       }
       return json(res, 200, {

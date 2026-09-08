@@ -50,6 +50,7 @@ function startFakeDav() {
     const decoded = decodeURIComponent(req.url.split('?')[0]).replace(/\/+$/, '');
     const relative = decoded.replace(/^\/dav\/?/, '');
     if (req.method === 'PROPFIND') {
+      if (relative === 'Unavailable') { res.writeHead(503); res.end(); return; }
       const children = tree[relative] || [];
       const self = relative ? relative.split('/').pop() : 'root';
       const xml = children.map((name) => {
@@ -68,6 +69,18 @@ function startFakeDav() {
       if (body === undefined) { res.writeHead(404); res.end(); return; }
       res.writeHead(200, { 'Content-Length': Buffer.byteLength(body) });
       res.end(body);
+      return;
+    }
+    if (req.method === 'PUT') {
+      const chunks = [];
+      req.on('data', (chunk) => chunks.push(chunk));
+      req.on('end', () => {
+        bodies[relative] = Buffer.concat(chunks).toString('utf8');
+        const parent = relative.split('/').slice(0, -1).join('/');
+        const name = relative.split('/').pop();
+        if (tree[parent] && !tree[parent].includes(name)) tree[parent].push(name);
+        res.writeHead(201); res.end();
+      });
       return;
     }
     if (req.method === 'MKCOL') {
@@ -324,4 +337,118 @@ test('file-read route returns content and enforces the text-extension rule', asy
 test('browse route requires authentication', async () => {
   const response = await request('/api/integrations/storage/files');
   assert.equal(response.status, 401);
+});
+
+
+async function createTestProject(name, extra = {}) {
+  const result = await request('/api/projects', { method: 'POST', headers: mutationHeaders(), body: JSON.stringify({ name, ...extra }) });
+  assert.equal(result.status, 200, result.text);
+  return JSON.parse(result.text);
+}
+
+async function workspaceProject(id) {
+  const result = await request('/api/workspace', { headers: { cookie } });
+  return JSON.parse(result.text).projects.find((p) => p.id === id);
+}
+
+test('same-name projects receive distinct storage folders', async () => {
+  const one = await createTestProject('Same name');
+  const two = await createTestProject('Same name');
+  assert.notEqual(one.projectFolder, two.projectFolder);
+});
+
+test('a rejected config patch leaves every previous field unchanged', async () => {
+  const project = await createTestProject('Atomic settings');
+  const result = await request(`/api/projects/${project.id}/config`, { method: 'POST', headers: mutationHeaders(), body: JSON.stringify({ name: 'Should not save', routing: 'invalid' }) });
+  assert.equal(result.status, 400);
+  assert.equal((await workspaceProject(project.id)).name, 'Atomic settings');
+});
+
+test('a temporary folder failure preserves its sources, while explicit detachment removes them', async () => {
+  const project = await createTestProject('Resilient sources');
+  await request(`/api/projects/${project.id}/config`, { method: 'POST', headers: mutationHeaders(), body: JSON.stringify({ sourceFolders: ['Cowork/Docs'] }) });
+  const syncUrl = `/api/projects/${project.id}/sources/sync`;
+  assert.equal((await request(syncUrl, { method: 'POST', headers: mutationHeaders() })).status, 200);
+  const before = await workspaceProject(project.id);
+  assert.ok(before.files.some((f) => f.name.endsWith('notes.md')));
+  // Inject a transient transport failure at the storage boundary, not in the route.
+  const client = require('./storage-client.cjs');
+  const list = client.listFiles;
+  client.listFiles = async () => { throw new Error('storage offline'); };
+  try {
+    const sync = JSON.parse((await request(syncUrl, { method: 'POST', headers: mutationHeaders() })).text);
+    assert.equal(sync.skipped.length, 1);
+    assert.deepEqual((await workspaceProject(project.id)).files, before.files);
+  } finally { client.listFiles = list; }
+  await request(`/api/projects/${project.id}/config`, { method: 'POST', headers: mutationHeaders(), body: JSON.stringify({ sourceFolders: [] }) });
+  await request(syncUrl, { method: 'POST', headers: mutationHeaders() });
+  assert.deepEqual((await workspaceProject(project.id)).files, []);
+});
+
+test('uploads work without remote storage and gain a folder after connecting it', async () => {
+  const client = require('./storage-client.cjs');
+  const browsable = client.isBrowsable;
+  client.isBrowsable = () => false;
+  let project;
+  try {
+    project = await createTestProject('Local uploads');
+    assert.equal(project.projectFolder, undefined);
+    const result = await request(`/api/projects/${project.id}/upload`, { method: 'POST', headers: mutationHeaders(), body: JSON.stringify({ name: 'local.txt', dataBase64: Buffer.from('local knowledge').toString('base64') }) });
+    assert.equal(result.status, 200, result.text);
+    assert.equal((await workspaceProject(project.id)).files[0].content, 'local knowledge');
+  } finally { client.isBrowsable = browsable; }
+  const result = await request(`/api/projects/${project.id}/upload`, { method: 'POST', headers: mutationHeaders(), body: JSON.stringify({ name: 'remote.txt', dataBase64: Buffer.from('remote knowledge').toString('base64') }) });
+  assert.equal(result.status, 200, result.text);
+  const after = await workspaceProject(project.id);
+  assert.ok(after.projectFolder);
+  assert.ok(after.sourceFolders.includes(after.projectFolder));
+  assert.ok(after.files.some((f) => f.name === 'local.txt'));
+});
+
+test('repeated tool calls in separate inference rounds keep distinct UI identities', async () => {
+  const project = await createTestProject('Multi-round tools', { model: 'test-model' });
+  const originalFetch = global.fetch;
+  let rounds = 0;
+  global.fetch = async () => {
+    rounds++;
+    const delta = rounds <= 2
+      ? { tool_calls: [{ index: 0, id: `call-${rounds}`, function: { name: 'get_current_time', arguments: '{}' } }] }
+      : { content: 'Both calls completed.' };
+    return new Response(`data: ${JSON.stringify({ choices: [{ delta }] })}\n\ndata: [DONE]\n\n`, { headers: { 'Content-Type': 'text/event-stream' } });
+  };
+  try {
+    const response = await request('/api/chat', { method: 'POST', headers: mutationHeaders(), body: JSON.stringify({ projectId: project.id, spaceId: project.id, message: 'Use the clock twice', history: [] }) });
+    assert.equal(response.status, 200, response.text);
+    const events = response.text.split('\n').filter((l) => l.startsWith('data: ')).map((l) => JSON.parse(l.slice(6)));
+    assert.deepEqual(events.filter((e) => e.type === 'tool').map((e) => e.index), [0, 1]);
+    assert.deepEqual(events.filter((e) => e.type === 'tool_result').map((e) => e.index), [0, 1]);
+    assert.ok(events.some((e) => e.type === 'delta' && e.text === 'Both calls completed.'));
+  } finally { global.fetch = originalFetch; }
+});
+
+test('an in-flight sync preserves concurrent uploads and does not restore detached folders', async () => {
+  const project = await createTestProject('Concurrent sources');
+  const config = (patch) => request(`/api/projects/${project.id}/config`, { method: 'POST', headers: mutationHeaders(), body: JSON.stringify(patch) });
+  await config({ sourceFolders: ['Cowork/Docs'] });
+  const client = require('./storage-client.cjs');
+  const list = client.listFiles;
+  let release; let started;
+  const blocked = new Promise((r) => { release = r; });
+  const entered = new Promise((r) => { started = r; });
+  client.listFiles = async (...args) => { started(); await blocked; return list(...args); };
+  try {
+    const syncing = request(`/api/projects/${project.id}/sources/sync`, { method: 'POST', headers: mutationHeaders() });
+    await entered;
+    await config({ sourceFolders: [], files: [{ name: 'during.txt', content: 'uploaded while syncing' }] });
+    release();
+    assert.equal((await syncing).status, 200);
+    assert.deepEqual((await workspaceProject(project.id)).files, [{ name: 'during.txt', content: 'uploaded while syncing' }]);
+  } finally { release(); client.listFiles = list; }
+});
+
+test('base64 overhead does not reject images below the advertised 8 MB cap', async () => {
+  const project = await createTestProject('Large image');
+  const response = await request(`/api/projects/${project.id}/assets`, { method: 'POST', headers: mutationHeaders(), body: JSON.stringify({ name: 'large.png', mime: 'image/png', dataBase64: Buffer.alloc(7 * 1024 * 1024).toString('base64') }) });
+  assert.equal(response.status, 200, response.text);
+  assert.equal(JSON.parse(response.text).asset.bytes, 7 * 1024 * 1024);
 });
