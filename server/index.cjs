@@ -24,6 +24,7 @@ const { URL } = require('url');
 const { AsyncLocalStorage } = require('async_hooks');
 const rag = require('./rag.cjs');
 const mcp = require('./mcp.cjs');
+const prefill = require('./prefill.cjs');
 const storageClient = require('./storage-client.cjs');
 const { createModelManager } = require('./model-manager.cjs');
 const { createAuth, createRateLimiter } = require('./auth.cjs');
@@ -619,6 +620,19 @@ function estimateToolTokens(tools) {
 const TOOL_CAP_DEFAULT = 24;
 const TOOL_CAP_SMALL = 12;
 
+// The count cap is a separate question from the token budget: it guards
+// against handing a small model too many CHOICES, which degrades tool
+// selection accuracy regardless of how cheap the definitions are.
+function toolCapFor(model) {
+  // Parameter count in the model id (…-9B-…, …-4b-it…) is the only signal
+  // available here, and local GGUF names carry it by convention. An
+  // unrecognised name gets the roomier default: wrongly withholding tools is
+  // a worse failure than sending a few more than ideal.
+  const m = /(\d+(?:\.\d+)?)\s*[bB]\b/.exec(String(model || ''));
+  if (m && Number(m[1]) <= 12) return TOOL_CAP_SMALL;
+  return TOOL_CAP_DEFAULT;
+}
+
 // A COUNT cap alone is the wrong unit, which only became clear once real MCP
 // tools arrived. Measured against the reference server: nc_calendar_create_event
 // is ~2,739 calibrated tokens while nc_notes_search_notes is 449. "12 tools"
@@ -650,19 +664,41 @@ const TOOL_CAP_SMALL = 12;
 // Larger/remote models are not prefill-bound in the same way and get more.
 const TOOL_TOKEN_BUDGET_DEFAULT = 8000;
 const TOOL_TOKEN_BUDGET_SMALL = 5000;
+
+// What the budget is really expressing: how long the user waits, before the
+// model says anything, for the privilege of having tools available. The
+// catalogue is re-read on every message, so this is paid every turn.
+//
+// 14 seconds is a lot. It is the honest price of the full calendar box on this
+// hardware (4,512 tokens measured at ~360 tok/s prefill), and it is the dial to
+// turn if turns feel sluggish.
+const TOOL_PREFILL_TARGET_MS = 14000;
+
+// Log the fallback→measured switch once per model, not once per request.
+const announcedMeasured = new Set();
+
 function toolTokenBudgetFor(model) {
+  // Measured, if we have watched enough real traffic for this model. This is
+  // the honest answer: a budget in tokens derived from how fast THIS model on
+  // THIS hardware actually reads, rather than from what its filename says.
+  const measured = prefill.budgetFor(model, TOOL_PREFILL_TARGET_MS);
+  if (measured) {
+    if (!announcedMeasured.has(model)) {
+      announcedMeasured.add(model);
+      const rate = Math.round(prefill.rateFor(model) * 1000);
+      console.log(`[prefill] ${model}: measured ~${rate} tok/s; tool budget is now ${measured} tokens for a ${TOOL_PREFILL_TARGET_MS}ms target (was a filename guess)`);
+    }
+    // Clamped so a freak measurement cannot hand a small model the whole
+    // catalogue or starve a fast one down to nothing.
+    return Math.max(1500, Math.min(measured, 16000));
+  }
+  // Fallback until measured: parameter count in the model id is the only
+  // signal available, and local GGUF names carry it by convention. It is a
+  // guess, and it is why the measurement above exists — but it has to be
+  // something on the very first request, before any traffic has been seen.
   const m = /(\d+(?:\.\d+)?)\s*[bB]\b/.exec(String(model || ''));
   if (m && Number(m[1]) <= 12) return TOOL_TOKEN_BUDGET_SMALL;
   return TOOL_TOKEN_BUDGET_DEFAULT;
-}
-function toolCapFor(model) {
-  // Parameter count in the model id (…-9B-…, …-4b-it…) is the only signal
-  // available here, and local GGUF names carry it by convention. An
-  // unrecognised name gets the roomier default: wrongly withholding tools is
-  // a worse failure than sending a few more than ideal.
-  const m = /(\d+(?:\.\d+)?)\s*[bB]\b/.exec(String(model || ''));
-  if (m && Number(m[1]) <= 12) return TOOL_CAP_SMALL;
-  return TOOL_CAP_DEFAULT;
 }
 
 // Resolve a project's selection into the list actually sent upstream. Unknown
@@ -1554,6 +1590,12 @@ async function handleChat(req, res, body, authn) {
     console.warn(`[tools] ${model}: ${resolved.tools.length} tools ~${resolved.estTokens} tok (cap ${resolved.cap}, budget ${resolved.budget}); dropped ${resolved.dropped.length}: ${resolved.dropped.join(', ')}`);
   }
   let roundMessages = wire;
+  // Prefill measurement (step 17). Timed per ROUND, because each round is its
+  // own upstream request with its own prompt — and the later rounds are the
+  // interesting ones, since they carry the tool results and so span a wider
+  // range of prompt sizes than the first round ever would.
+  let roundStartedAt = 0;
+  let roundFirstTokenMs = 0;
   // After a tool result, a reasoning model often emits its whole continuation
   // on the reasoning channel and never opens a content block — the answer is
   // real and correct, it is just filed as thinking. Rendering that as an empty
@@ -1563,6 +1605,8 @@ async function handleChat(req, res, body, authn) {
   let roundReasoning = '';
   for (let round = 0; round < 3 && !chatSignal.signal.aborted; round++) {
     let upstream;
+    roundStartedAt = Date.now();
+    roundFirstTokenMs = 0;
     try {
       upstream = await fetch(upstreamUrl, {
         method: 'POST',
@@ -1625,9 +1669,21 @@ async function handleChat(req, res, body, authn) {
                 tokensPerSecond: Number(evt.timings?.predicted_per_second) || 0,
               };
               recordUsage(chatWorkspace, model, reported);
+              // One free observation of (prompt size -> time to first token).
+              // Only when a first token was actually seen this round: a round
+              // that errored or returned nothing says nothing about prefill.
+              if (roundFirstTokenMs > 0 && reported.promptTokens > 0) {
+                prefill.recordSample(model, reported.promptTokens, roundFirstTokenMs);
+              }
               send({ type: 'usage', ...reported });
             }
             const delta = evt.choices?.[0]?.delta || {};
+            // First token of this round, whatever channel it arrives on —
+            // content, reasoning or a tool-call fragment are all equally "the
+            // model has finished reading and started writing".
+            if (!roundFirstTokenMs && (delta.content || delta.reasoning_content || delta.tool_calls)) {
+              roundFirstTokenMs = Date.now() - roundStartedAt;
+            }
             if (delta.reasoning_content) {
               sawAnything = true;
               roundReasoning += delta.reasoning_content;
@@ -2014,6 +2070,9 @@ async function handleRequestScoped(req, res) {
       await discoverMcpTools();
       return json(res, 200, {
         toolboxes: toolboxSummaries(),
+        // What has actually been measured about this hardware, so a slow box
+        // is diagnosable without reading logs.
+        prefill: { targetMs: TOOL_PREFILL_TARGET_MS, models: prefill.stats() },
         mcp: MCP_SERVER_URL
           ? { configured: true, error: mcpState.error, discovered: mcpState.tools.size }
           : { configured: false },
@@ -2673,4 +2732,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { checkAuth, handleRequest, isWriteTool, chatWideApproved, pendingApprovals, resolveTools, allToolboxes, mcpCredentialOriginAllowed, toolTokenBudgetFor, MCP_TOOLBOX_MANIFEST, toolboxSummaries, estimateToolTokens, toolCapFor, sanitizeToolboxes, executeToolCall, TOOLBOXES, classifierVerdict, heuristicWantsSmart, CLASSIFIER_MAX_TOKENS, recordUsage, readUsage, usageDayKey, USAGE_RETENTION_DAYS };
+module.exports = { checkAuth, handleRequest, prefill, TOOL_PREFILL_TARGET_MS, isWriteTool, chatWideApproved, pendingApprovals, resolveTools, allToolboxes, mcpCredentialOriginAllowed, toolTokenBudgetFor, MCP_TOOLBOX_MANIFEST, toolboxSummaries, estimateToolTokens, toolCapFor, sanitizeToolboxes, executeToolCall, TOOLBOXES, classifierVerdict, heuristicWantsSmart, CLASSIFIER_MAX_TOKENS, recordUsage, readUsage, usageDayKey, USAGE_RETENTION_DAYS };
