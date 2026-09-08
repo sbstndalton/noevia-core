@@ -277,6 +277,15 @@ async function filesContext(projectId, files, query, userId) {
   const small = files.filter((f) => String(f.content || '').length <= DIRECT_INJECT_MAX);
   const large = files.filter((f) => String(f.content || '').length > DIRECT_INJECT_MAX);
 
+  // Name every source, always. Retrieval injects excerpts of the large files
+  // chosen for THIS question, so a question about the sources themselves —
+  // "what have you got?", "is my file attached?" — was answered from whatever
+  // happened to be retrieved, and looked exactly like a file that had not
+  // attached. The manifest costs a few tokens and settles it.
+  const manifest = `Sources attached to this project (${files.length}): ${files
+    .map((f) => `"${f.name}"`)
+    .join(', ')}. Excerpts of the relevant ones follow; ask to read a file in full if you need more of it.`;
+
   const parts = [];
   if (ragAvailable() && large.length > 0) {
     const hits = await searchProject(projectId, query, userId);
@@ -293,7 +302,7 @@ async function filesContext(projectId, files, query, userId) {
     // Always keep small files present — they are cheap and usually key context.
     for (const f of small) parts.push(`File "${f.name}":\n${f.content}`);
   }
-  return parts.length ? parts.join('\n\n') : null;
+  return parts.length ? [manifest, ...parts].join('\n\n') : manifest;
 }
 
 module.exports = { init, indexProjectFile, deleteProjectFile, searchProject, filesContext, chunkText, ragAvailable };
