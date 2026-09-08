@@ -2407,14 +2407,16 @@ async function handleRequestScoped(req, res) {
       }
       if (Array.isArray(patch.files)) {
         const prevFiles = Array.isArray(project.files) ? project.files : [];
-        project.files = patch.files
-          .filter((f) => f && typeof f.name === 'string' && typeof f.content === 'string')
+        // Folder-derived files belong to the sync, not to this patch. The
+        // client only ever sends uploads, and a patch that dropped the
+        // folder-derived ones would silently detach every synced source (or,
+        // if the client echoed them back with empty content, blank them).
+        const fromFolders = prevFiles.filter((f) => f && f.source);
+        const uploads = patch.files
+          .filter((f) => f && typeof f.name === 'string' && typeof f.content === 'string' && !f.source)
           .slice(0, 20)
-          .map((f) => ({
-            name: f.name.slice(0, 200),
-            content: f.content.slice(0, 200000),
-            ...(typeof f.source === 'string' && f.source ? { source: f.source.slice(0, 300) } : {}),
-          }));
+          .map((f) => ({ name: f.name.slice(0, 200), content: f.content.slice(0, 200000) }));
+        project.files = [...fromFolders, ...uploads];
         // RAG bookkeeping (step 10): drop chunks for removed files; index
         // new/changed ones. Fire-and-forget — upload latency must not depend
         // on embedding round-trips.
