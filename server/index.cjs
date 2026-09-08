@@ -579,7 +579,7 @@ const DEFAULT_TOOLBOXES = ['core'];
 // picker, the validator, the resolver — goes through here so an MCP box is
 // indistinguishable from a built-in one once it exists.
 function allToolboxes() {
-  return [...TOOLBOXES, ...mcpState.boxes];
+  return [...TOOLBOXES, ...mcpState.boxes].filter((b) => toolboxOffered(b.id));
 }
 
 // A tool definition is re-sent on EVERY turn, so its size is a recurring cost.
@@ -1106,6 +1106,26 @@ const MCP_SERVERS = (() => {
   // always received the credential — keep that exactly.
   return [{ id: 'nextcloud', url: single, auth: 'nextcloud' }];
 })();
+
+// Which curated boxes are actually offered. Curation says what a box WOULD
+// contain; this says whether anyone wants it. Unset means all of them.
+//
+// Separate from the manifest on purpose: a deployment that has no use for
+// Cookbook should not have to delete its curation to stop seeing it, and
+// turning it back on should be one environment variable rather than a commit.
+const ENABLED_TOOLBOXES = (() => {
+  const raw = (process.env.ENABLED_TOOLBOXES || '').trim();
+  if (!raw) return null; // null means "no opinion" — offer everything
+  const ids = raw.split(',').map((x) => x.trim()).filter(Boolean);
+  return ids.length ? new Set(ids) : null;
+})();
+
+function toolboxOffered(id) {
+  // core is built-in and always safe, so it is never filtered out — a
+  // deployment that named only MCP boxes should not lose the clock.
+  if (id === 'core') return true;
+  return !ENABLED_TOOLBOXES || ENABLED_TOOLBOXES.has(id);
+}
 
 const MCP_SERVER_BY_ID = new Map(MCP_SERVERS.map((sv) => [sv.id, sv]));
 const MCP_ENABLED = MCP_SERVERS.length > 0;
@@ -3180,4 +3200,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { checkAuth, handleRequest, sanitizeChats, MCP_SERVERS, prefill, TOOL_PREFILL_TARGET_MS, isWriteTool, chatWideApproved, pendingApprovals, resolveTools, allToolboxes, mcpCredentialOriginAllowed, toolTokenBudgetFor, MCP_TOOLBOX_MANIFEST, toolboxSummaries, estimateToolTokens, toolCapFor, sanitizeToolboxes, executeToolCall, TOOLBOXES, classifierVerdict, heuristicWantsSmart, CLASSIFIER_MAX_TOKENS, recordUsage, readUsage, usageDayKey, USAGE_RETENTION_DAYS };
+module.exports = { checkAuth, handleRequest, sanitizeChats, MCP_SERVERS, toolboxOffered, prefill, TOOL_PREFILL_TARGET_MS, isWriteTool, chatWideApproved, pendingApprovals, resolveTools, allToolboxes, mcpCredentialOriginAllowed, toolTokenBudgetFor, MCP_TOOLBOX_MANIFEST, toolboxSummaries, estimateToolTokens, toolCapFor, sanitizeToolboxes, executeToolCall, TOOLBOXES, classifierVerdict, heuristicWantsSmart, CLASSIFIER_MAX_TOKENS, recordUsage, readUsage, usageDayKey, USAGE_RETENTION_DAYS };

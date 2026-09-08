@@ -66,3 +66,34 @@ test('every curated box names a server that exists', () => {
     assert.ok(ids.has(box.server), `box ${box.id} names unknown server "${box.server}"`);
   }
 });
+
+// ── which boxes are offered ──────────────────────────────────────────────
+
+function offeredWith(env) {
+  for (const key of ['ENABLED_TOOLBOXES']) delete process.env[key];
+  Object.assign(process.env, env);
+  delete require.cache[require.resolve('./index.cjs')];
+  return require('./index.cjs').toolboxOffered;
+}
+
+test('unset ENABLED_TOOLBOXES offers every box', () => {
+  const offered = offeredWith({});
+  assert.equal(offered('nextcloud-cookbook'), true);
+  assert.equal(offered('nextcloud-files'), true);
+  assert.equal(offered('core'), true);
+});
+
+test('a named list offers only those boxes', () => {
+  const offered = offeredWith({ ENABLED_TOOLBOXES: 'nextcloud-files, nextcloud-sharing' });
+  assert.equal(offered('nextcloud-files'), true);
+  assert.equal(offered('nextcloud-sharing'), true);
+  assert.equal(offered('nextcloud-cookbook'), false);
+  assert.equal(offered('nextcloud-mail-send'), false);
+});
+
+test('core survives any list, so a deployment cannot lose its built-ins', () => {
+  // core is built-in and always safe; filtering it out would take the clock
+  // and project-file reads away for no benefit.
+  assert.equal(offeredWith({ ENABLED_TOOLBOXES: 'nextcloud-files' })('core'), true);
+  assert.equal(offeredWith({ ENABLED_TOOLBOXES: 'nothing-matches' })('core'), true);
+});
