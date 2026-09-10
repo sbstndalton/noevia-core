@@ -12,6 +12,40 @@ const { createWorkspaceStore } = require('./workspace.cjs');
 function request() { return { headers: { origin: 'https://cowork.example.test', 'user-agent': 'test' }, socket: { remoteAddress: '127.0.0.1' } }; }
 function response() { return { headers: {}, setHeader(k, v) { this.headers[k] = v; } }; }
 
+async function deletionFixture(t) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cowork-delete-admin-'));
+  const auth = createAuth({ dataDir: root, publicOrigin: 'https://cowork.example.test' });
+  t.after(() => { auth.db.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  const password = 'synthetic account deletion password';
+  const first = await auth.setup(request(), response(), { setupCode: fs.readFileSync(path.join(root, 'first-run-setup-code'), 'utf8').trim(), publicOrigin: 'https://cowork.example.test', username: 'first', password });
+  const firstId = first.body.user.id;
+  const second = await auth.acceptInvite(request(), response(), { token: auth.createInvite(firstId, 'admin').token, username: 'second', password });
+  return { auth, firstId, secondId: second.body.user.id, password };
+}
+
+test('deleting an administrator revokes issued invite/recovery tokens but preserves other users and audit history', async t => {
+  const { auth, firstId, secondId, password } = await deletionFixture(t);
+  const invitation = auth.createInvite(secondId);
+  const recovery = auth.createRecovery(secondId, firstId);
+  assert.equal(auth.deleteUser(firstId, secondId, 'wrong-name'), false);
+  assert.equal(auth.deleteUser(firstId, secondId, 'second'), true);
+  assert.deepEqual(auth.listUsers().map(u => u.id), [firstId]);
+  assert.equal((await auth.acceptInvite(request(), response(), { token: invitation.token, username: 'third', password })).status, 400);
+  assert.equal(await auth.completeRecovery({ token: recovery.token, password }), false);
+  assert.equal(auth.db.prepare('SELECT count(*) AS n FROM sessions WHERE user_id=?').get(secondId).n, 0);
+  assert.ok(auth.db.prepare("SELECT 1 FROM audit_events WHERE actor_user_id=? AND action='invite.create'").get(secondId));
+  assert.ok(auth.db.prepare("SELECT 1 FROM audit_events WHERE target_user_id=? AND action='user.delete'").get(secondId));
+});
+
+test('a disabled administrator cannot make deletion of the last active administrator safe', async t => {
+  const { auth, firstId, secondId } = await deletionFixture(t);
+  auth.setDisabled(firstId, secondId, true);
+  assert.throws(() => auth.deleteUser(firstId, firstId, 'first'), /last active administrator/);
+  assert.equal(auth.listUsers().length, 2);
+  assert.equal(auth.deleteUser(firstId, secondId, 'second'), true);
+  assert.throws(() => auth.deleteUser(firstId, firstId, 'first'), /last active administrator/);
+});
+
 test('bootstrap, password login, invitations, and workspace isolation', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cowork-system-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

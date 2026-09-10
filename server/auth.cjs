@@ -494,8 +494,17 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
     },
     deleteUser(actorId, userId, username) {
       const user = db.prepare('SELECT * FROM users WHERE id=?').get(userId); if (!user || user.username !== username) return false;
-      if (user.role === 'admin' && db.prepare("SELECT count(*) AS n FROM users WHERE role='admin'").get().n <= 1) throw new Error('cannot delete the last administrator');
-      db.prepare('DELETE FROM users WHERE id=?').run(userId); audit('user.delete', actorId, userId); return true;
+      if (user.role === 'admin' && (db.prepare("SELECT count(*) AS n FROM users WHERE role='admin'").get().n <= 1 ||
+          (!user.disabled_at && db.prepare("SELECT count(*) AS n FROM users WHERE role='admin' AND disabled_at IS NULL").get().n <= 1))) throw new Error('cannot delete the last active administrator');
+      db.transaction(() => {
+        // Issued tokens reference their creator without ON DELETE CASCADE.
+        // Revoke them with the account, retaining provenance in audit_events.
+        db.prepare('DELETE FROM invitations WHERE created_by=?').run(userId);
+        db.prepare('DELETE FROM recoveries WHERE created_by=?').run(userId);
+        db.prepare('DELETE FROM users WHERE id=?').run(userId);
+        audit('user.delete', actorId, userId);
+      })();
+      return true;
     },    getStorage(userId, includeSecret = false) {
       const row = db.prepare('SELECT * FROM storage_connections WHERE user_id=?').get(userId);
       if (!row) return { kind: 'local', baseUrl: '', bucket: '', username: '', corpusRoot: '' };
