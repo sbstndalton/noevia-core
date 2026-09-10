@@ -3,6 +3,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const documents = require('./documents.cjs');
+const docx = require('./docx.cjs');
 const sources = require('./document-sources.cjs');
 const storage = require('./storage-client.cjs');
 const CAP = 25 * 1024 * 1024;
@@ -29,7 +30,7 @@ function original(workspace, id, file) {
   if (!/^[a-f0-9]{64}$/.test(file.attachment?.id || '')) throw new Error('Original not available');
   return path.join(directory(workspace, id), file.attachment.id);
 }
-async function ingest(workspace, project, name, bytes, { connection, source, remotePath, progress = () => {}, storageImpl = storage } = {}) {
+async function ingest(workspace, project, name, bytes, { connection, source, remotePath, progress = () => {}, storageImpl = storage, extractDocx = docx.extract } = {}) {
   validate(name, bytes);
   const group = classify(name), mime = bytes.length <= 8 * 1024 * 1024 ? images[path.extname(name).toLowerCase()] : undefined;
   const fullName = remotePath || (connection ? `${project.projectFolder}/${group}/${name}` : name);
@@ -47,16 +48,29 @@ async function ingest(workspace, project, name, bytes, { connection, source, rem
   const temp = path.join(dir, id + '.' + crypto.randomUUID());
   fs.writeFileSync(temp, bytes, { mode: 0o600 }); fs.renameSync(temp, path.join(dir, id));
   let file = { name: fullName, content: '' };
-  let state = 'stored';
+  let state = 'stored', reason, readerVersion;
   if (documents.isDocument(name)) {
     progress('Extracting PDF text / OCR');
     file = await sources.ingest(workspace, project.id, fullName, bytes, previous);
     state = file.document.state;
+  } else if (/\.docx$/i.test(name)) {
+    progress('Reading DOCX body text and tables');
+    if (previous?.attachment?.id === id && previous.attachment.readerVersion === docx.VERSION && previous.content) {
+      file.content = previous.content; state = previous.attachment.state;
+      reason = previous.attachment.reason; readerVersion = docx.VERSION;
+    } else try {
+      const result = await extractDocx(bytes);
+      if (!result.text.trim()) throw Error('No body text was recovered from this DOCX. The original is kept.');
+      reason = 'DOCX body text and tables only; layout, images, headers, footers, comments and footnotes are not interpreted.';
+      file.content = (`[${reason}]\n\n` + result.text).slice(0,200000);
+      state = 'partial'; readerVersion = docx.VERSION;
+      if (result.truncated || result.text.length + reason.length + 4 > 200000) reason += ' Text extraction limit reached.';
+    } catch (err) { reason = String(err.message || 'DOCX reader unavailable').slice(0,300); }
   } else if (group === 'Text') {
     const text = new TextDecoder('utf-8', { fatal: true });
     try { file.content = text.decode(bytes).slice(0, 200000); state = bytes.length > 200000 ? 'partial' : 'ready'; } catch { state = 'stored'; }
   } else if (mime) state = 'vision';
-  file.attachment = { id, bytes: bytes.length, group, state, ...(group === 'Images' && bytes.length > 8 * 1024 * 1024 ? { reason: 'Original stored; resize below 8 MB for model image input.' } : {}) };
+  file.attachment = { id, bytes: bytes.length, group, state, ...(reason ? {reason} : {}), ...(readerVersion ? {readerVersion} : {}), ...(group === 'Images' && bytes.length > 8 * 1024 * 1024 ? { reason: 'Original stored; resize below 8 MB for model image input.' } : {}) };
   if (source || connection) file.source = source || project.projectFolder;
   // Replacing a vision image with a stored-only original must also retire its
   // old model input. Otherwise chat silently describes the previous bytes.

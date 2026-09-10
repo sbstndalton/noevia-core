@@ -723,8 +723,8 @@ function pruneDocuments(project) {
 }
 function indexSource(project, file) {
   const workspace = currentWorkspace();
-  if (file.document && !file.content) {
-    file.document.indexing = 'unavailable';
+  if (!file.content) {
+    if (file.document) file.document.indexing = 'unavailable';
     rag.deleteProjectFile(project.id, file.name, workspace.userId);
     return;
   }
@@ -1646,7 +1646,7 @@ async function executeToolCall(project, name, rawArgs, allowed) {
       const names = files.map((x) => x.name).join(', ') || '(none attached)';
       return `ERROR: no project file named "${wanted}". Available: ${names}`;
     }
-    if (f.attachment?.state === 'stored') return `${f.name}: original stored, but no reader is available. Contents have not been read.`;
+    if (f.attachment?.state === 'stored') return `${f.name}: original stored; readable contents are unavailable. Contents have not been read.`;
     if (f.document && args.startPage !== undefined) {
       try {
         const out = documentSources.readPages(currentWorkspace(), project.id, f, args.startPage, args.endPage ?? args.startPage, args.offset ?? 0, TOOL_RESULT_CAP);
@@ -2065,7 +2065,7 @@ async function handleChat(req, res, body, authn) {
   }
 
   // ── Ordinary space / project chat: routed via the project's provider ──
-  if (project?.files?.some(f => f.attachment?.state === 'stored')) sysParts.push('These sources are stored only; their contents have NOT been read because no reader is available: ' + project.files.filter(f => f.attachment?.state === 'stored').map(f => f.name).join(', ') + '. Do not claim to know their contents.');
+  if (project?.files?.some(f => f.attachment?.state === 'stored')) sysParts.push('These sources are stored only; their contents are NOT available to the model: ' + project.files.filter(f => f.attachment?.state === 'stored').map(f => f.name).join(', ') + '. Do not claim to know their contents.');
   const sys = sysParts.join('\n\n');
   let wire = sys ? [{ role: 'system', content: sys }, ...msgs] : msgs;
 
@@ -3334,7 +3334,7 @@ async function handleRequestScoped(req, res) {
           project.files = [...(project.files || []).filter(f => f.name !== file.name), file];
           project.updatedAt = Date.now();
           progress('Indexing extracted text');
-          if (file.content) indexSource(project, file);
+          indexSource(project, file);
           saveProjects(PROJECTS);
           return json(res, 200, { name, path: file.name, bytes: bytes.length, document: file.document, attachment: file.attachment });
         });
@@ -3561,11 +3561,12 @@ async function handleRequestScoped(req, res) {
             const ext = (entry.ext || '').toLowerCase();
             const isText = storageClient.TEXT_EXTENSIONS.has(ext);
             const isDoc = documents.isDocument(entry.name);
+            const isDocx = /\.docx$/i.test(entry.name);
             const managed = folder === project.projectFolder && require('./uploads.cjs').GROUPS.some(g => entry.path.startsWith(`${folder}/${g}/`));
-            if (!isText && !isDoc && !managed) continue;
+            if (!isText && !isDoc && !isDocx && !managed) continue;
             if (fromFolders.length >= sourceLimit) { skipped.push({ folder, file: entry.path, reason: '60-source project limit reached; this file was not read.', retained: false }); continue; } // a cap, so one big folder cannot blow up a project
             try {
-              if (managed) {
+              if (managed || isDocx) {
                 const bytes = await storageClient.readBinaryFile(connection, entry.path);
                 const file = await require('./uploads.cjs').ingest(currentWorkspace(), project, entry.name, bytes, { source: folder, remotePath: entry.path, progress: requestScope.getStore()?.sourceProgress });
                 fromFolders.push(file);

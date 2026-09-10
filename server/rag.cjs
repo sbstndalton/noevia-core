@@ -293,7 +293,7 @@ async function filesContext(projectId, files, query, userId) {
     .map((f) => `"${f.name}"`)
     .join(', ')}. Excerpts of the relevant ones follow; ask to read a file in full if you need more of it.`;
 
-  const notices = files.map(documentNotice).filter(Boolean);
+  const notices = files.map(f => documentNotice(f) || (f.attachment?.reason ? `${f.name}: ${f.attachment.reason}` : '')).filter(Boolean);
   const parts = [];
   if (ragAvailable() && large.length > 0) {
     const hits = await searchProject(projectId, query, userId);

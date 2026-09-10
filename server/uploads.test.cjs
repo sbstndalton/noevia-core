@@ -65,3 +65,21 @@ test('replacing an image above the vision limit retires old model input and can 
   assert.equal(project.assets.length, 1);
   assert.notEqual(project.assets[0].id, oldAsset);
 });
+test('DOCX extracts bounded body text while keeping tenant-owned originals and honest limitations', async t => {
+  const {workspace,project}=setup(t),bytes=Buffer.from('synthetic docx');let calls=0;
+  const extractDocx=async data=>{calls++;assert.deepEqual(data,bytes);return {text:'Synthetic refund -7.20',truncated:false};};
+  const file=await uploads.ingest(workspace,project,'fixture.docx',bytes,{extractDocx});
+  assert.equal(file.attachment.state,'partial');assert.match(file.content,/Synthetic refund -7.20/);
+  assert.match(file.content,/page|layout/);assert.match(file.attachment.reason,/footnotes/);
+  assert.deepEqual(fs.readFileSync(uploads.original(workspace,project.id,file)),bytes);
+  project.files.push(file);
+  const cached=await uploads.ingest(workspace,project,'fixture.docx',bytes,{extractDocx});
+  assert.equal(calls,1);assert.equal(cached.content,file.content);
+});
+test('failed DOCX replacement retains its original and clears previous readable content', async t => {
+  const {workspace,project}=setup(t);
+  project.files.push(await uploads.ingest(workspace,project,'fixture.docx',Buffer.from('old'),{extractDocx:async()=>({text:'OLD PRIVATE TEXT',truncated:false})}));
+  const file=await uploads.ingest(workspace,project,'fixture.docx',Buffer.from('new invalid'),{extractDocx:async()=>{throw Error('Synthetic parse failure');}});
+  assert.equal(file.content,'');assert.equal(file.attachment.state,'stored');assert.match(file.attachment.reason,/parse failure/);
+  assert.equal(fs.readFileSync(uploads.original(workspace,project.id,file),'utf8'),'new invalid');
+});
