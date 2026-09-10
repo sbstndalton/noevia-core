@@ -2037,34 +2037,13 @@ async function handleChat(req, res, body, authn) {
 
   const send = (obj) => { if (!res.destroyed && !chatSignal.signal.aborted) res.write(`data: ${JSON.stringify(obj)}\n\n`); };
 
-  // ── Diary tab: sidecar pipeline, called exactly once (no retry, no stream) ──
+  // One streamed journaled exchange; never retry implicitly after a disconnect.
   if (spaceId === 'diary') {
-    let full;
-    try {
-      full = await fetchJson(
-        `${DIARY_BASE}/v1/chat/completions`,
-        { method: 'POST', headers: diaryHeaders(), body: JSON.stringify({ messages: msgs, session_id: body.sessionId, entryTime: body.entryTime, entryDay: body.entryDay, extrasEnabled: body.extrasEnabled === true, extraContext: diaryExtras.reference(body) }), signal: chatSignal.signal },
-        300000,
-      );
-    } catch (err) {
-      if (chatSignal.signal.aborted) return; // client went away mid-generation
-      throw err;
-    }
-    if (chatSignal.signal.aborted) return;
-    if (!full.ok) {
-      const detail = typeof full.body === 'string' ? full.body.slice(0, 200) : JSON.stringify(full.body || {}).slice(0, 200);
-      return json(res, 502, { error: `diary sidecar ${full.status}: ${detail}` });
-    }
-    const choice = full.body?.choices?.[0]?.message;
-    if (!choice?.content) return json(res, 502, { error: 'diary sidecar returned no content' });
-    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
-    send({ type: 'meta', model: 'diary' });
-    if (typeof choice.reasoning_content === 'string' && choice.reasoning_content) send({ type: 'reasoning', text: choice.reasoning_content });
-    send({ type: 'delta', text: choice.content });
-    if (full.body.diary) send({ type: 'diary', decision: full.body.diary.decision, xid: full.body.diary.xid });
-    send({ type: 'done', model: 'diary' });
-    res.end();
-    return;
+    return require('./diary-stream.cjs').proxyDiaryStream(res, `${DIARY_BASE}/v1/chat/completions`, {
+      method: 'POST', headers: diaryHeaders(), body: JSON.stringify({stream:true, diary_events:true, messages:msgs,
+        session_id:body.sessionId, entryTime:body.entryTime, entryDay:body.entryDay,
+        extrasEnabled:body.extrasEnabled === true, extraContext:diaryExtras.reference(body)})
+    });
   }
 
   // ── Ordinary space / project chat: routed via the project's provider ──
@@ -3798,6 +3777,11 @@ async function handleRequestScoped(req, res) {
       if (local && llmRateLimited(authn.user.id)) return json(res, 429, { error: 'Please wait before sending another message' });
       const body = listing ? undefined : await readBody(req, local ? 16 * 1024 * 1024 : 1024 * 1024);
       const suffix = listing ? '/files?path=' + encodeURIComponent(url.searchParams.get('path') || '') : local ? '/local-exchange' : '/file';
+      if (local && JSON.parse(body).stream === true) {
+        return require('./diary-stream.cjs').proxyDiaryStream(res, `${DIARY_BASE}/api${suffix}`, {
+          method:'POST', headers:diaryHeaders(), body,
+        });
+      }
       const r = await fetchJson(`${DIARY_BASE}/api${suffix}`, { method: req.method, headers: diaryHeaders(), body }, local ? 600000 : 60000);
       return json(res, r.status, r.ok ? r.body : { error: r.body?.detail || r.body?.error || 'Diary storage request failed' });
     }
