@@ -1,3 +1,4 @@
+const { reportedTokenRate } = require('./engine-stats.cjs');
 const reasoningEffort = require('./reasoning-effort.cjs');
 const diaryExtras = require('./diary-extras.cjs');
 const { projectAppearance } = require('./project-appearance.cjs');
@@ -2888,7 +2889,7 @@ async function handleRequestScoped(req, res) {
       const s = sys.status === 'fulfilled' && sys.value.ok ? sys.value.body : {};
       return json(res, 200, {
         up: gen.status === 'fulfilled' && gen.value.ok,
-        tokensPerSecond: typeof g.tokens_per_second === 'number' ? g.tokens_per_second : null,
+        tokensPerSecond: reportedTokenRate(g),
         timeToFirstToken: typeof g.time_to_first_token === 'number' ? g.time_to_first_token : null,
         inputTokens: typeof g.input_tokens === 'number' ? g.input_tokens : null,
         outputTokens: typeof g.output_tokens === 'number' ? g.output_tokens : null,
