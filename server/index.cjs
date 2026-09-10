@@ -2572,6 +2572,19 @@ async function handleRequestScoped(req, res) {
       return json(res, 403, { error: 'administrator required' });
     }
     if (p === '/api/profile' && req.method === 'GET') return json(res, 200, { user: authn.user, passkeys: authService.listPasskeys(authn.user.id), sessions: authService.listSessions(authn.user.id) });
+    if (p === '/api/profile/app-passwords' && req.method === 'GET') {
+      res.setHeader('Cache-Control', 'no-store');
+      return json(res, 200, { appPasswords: authService.appPasswords.list(authn.user.id), sharingAvailable: false });
+    }
+    if (p === '/api/profile/app-passwords' && req.method === 'POST') {
+      res.setHeader('Cache-Control', 'no-store');
+      try { return json(res, 201, await authService.appPasswords.create(authn.user.id, await readJson(req))); }
+      catch (e) { return json(res, 400, { error: e.message }); }
+    }
+    const appPasswordRoute = p.match(/^\/api\/profile\/app-passwords\/([a-f0-9]{32})$/);
+    if (appPasswordRoute && req.method === 'DELETE') {
+      return json(res, authService.appPasswords.revoke(authn.user.id, appPasswordRoute[1]) ? 200 : 404, { ok: true });
+    }
     if (p === '/api/profile' && req.method === 'PATCH') {
       const body = await readJson(req); authService.updateProfile(authn.user.id, body.displayName);
       return json(res, 200, { ok: true });

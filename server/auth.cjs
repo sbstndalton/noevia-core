@@ -309,6 +309,7 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
   }
 
   return {
+    appPasswords: require('./app-passwords.cjs').createAppPasswords({ db, audit, rateLimited }),
     db, get origin() { return origin; }, get rpId() { return relyingPartyId; }, userCount, authenticate, csrfValid, originValid, publicUser, issueSession,
     // Exposed for the tool permission gate (step 16): every write tool call is
     // recorded here, so "what did the model actually do on my behalf" is
