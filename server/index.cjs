@@ -1845,6 +1845,7 @@ async function modelsInstalled() {
       sizeGB: typeof m.size === 'number' ? Math.round(m.size * 10) / 10 : null,
       loaded: loadedNames.has(m.id || m.model_name),
       labels: Array.isArray(m.labels) ? m.labels : [],
+      mtp: require('./mtp.cjs').capability(m),
       maxContext: m.max_context_window || null,
       suggested: !!m.suggested,
     }));
@@ -2881,14 +2882,18 @@ async function handleRequestScoped(req, res) {
 
     // ── Optional model-manager statistics.
     if (p === '/api/stats') {
-      const [gen, sys] = await Promise.allSettled([
+      const [gen, sys, mtpHealth, mtpMetrics, mtpModels] = await Promise.allSettled([
         modelManager.enabled ? modelManager.stats() : Promise.resolve({ ok: false }),
         modelManager.enabled ? modelManager.systemStats() : Promise.resolve({ ok: false }),
+        modelManager.enabled ? modelManager.health() : Promise.resolve({ok:false}),
+        modelManager.enabled ? modelManager.metrics() : Promise.resolve({ok:false}),
+        modelManager.enabled ? modelManager.listModels() : Promise.resolve({ok:false}),
       ]);
       const g = gen.status === 'fulfilled' && gen.value.ok ? gen.value.body : {};
       const s = sys.status === 'fulfilled' && sys.value.ok ? sys.value.body : {};
       return json(res, 200, {
         up: gen.status === 'fulfilled' && gen.value.ok,
+        mtp: require('./mtp.cjs').acceptance(mtpMetrics.status === 'fulfilled' && mtpMetrics.value.ok ? mtpMetrics.value.body : '', mtpHealth.status === 'fulfilled' && mtpHealth.value.ok ? mtpHealth.value.body.all_models_loaded : [], mtpModels.status === 'fulfilled' && mtpModels.value.ok ? mtpModels.value.body.data : []),
         tokensPerSecond: reportedTokenRate(g),
         timeToFirstToken: typeof g.time_to_first_token === 'number' ? g.time_to_first_token : null,
         inputTokens: typeof g.input_tokens === 'number' ? g.input_tokens : null,
@@ -3750,6 +3755,19 @@ async function handleRequestScoped(req, res) {
         }
         if (!body.name) return json(res, 400, { error: 'name required' });
         if (!modelManager.enabled) return json(res, 404, { error: 'model management is disabled' });
+        if (verb === 'load' && body.mtp !== undefined) {
+          const listing = await modelManager.listModels();
+          if (!listing.ok) return json(res,502,{error:'Could not verify MTP support'});
+          const model = (listing.body.data || []).find(m=>(m.id || m.model_name)===body.name);
+          if (!model) return json(res,404,{error:'Model not installed'});
+          let options;
+          try { options = require('./mtp.cjs').loadOptions(model,body.mtp); }
+          catch(error) { return json(res,400,{error:error.message}); }
+          const loaded = await modelManager.load(body.name,options);
+          if (!loaded.ok) return json(res,502,{error:'Model could not load with that MTP setting. Previous saved settings were kept.'});
+          const saved = await modelManager.load(body.name,{...options,save_options:true});
+          return json(res,saved.ok?200:502,saved.ok?{ok:true}:{error:'Model loaded, but its MTP preference could not be saved. Check before reloading.'});
+        }
         const r = await modelManager[verb](body.name);
         return json(res, r.ok ? 200 : 502, r.ok ? { ok: true } : { error: `${verb} failed: ${r.status}` });
       }

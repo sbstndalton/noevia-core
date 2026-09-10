@@ -40,7 +40,8 @@ function createModelManager({ kind, baseUrl, apiKey, fetchJson }) {
     pull: ({ modelName, checkpoint, recipe }) =>
       post('/api/v1/pull', { model_name: modelName, checkpoint, recipe, stream: true, subscribe: false }, 600000),
     deleteModel: (modelName) => post('/api/v1/delete', { model_name: modelName }, 60000),
-    load: (modelName) => post('/api/v1/load', { model_name: modelName }, 120000),
+    load: (modelName, options = {}) => post('/api/v1/load', { ...options, model_name: modelName }, 120000),
+    metrics: () => get('/metrics', 6000),
     unload: (modelName) => post('/api/v1/unload', { model_name: modelName }, 120000),
     downloads: () => get('/api/v1/downloads', 8000),
   };
