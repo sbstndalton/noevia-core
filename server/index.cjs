@@ -1,3 +1,4 @@
+const diaryExtras = require('./diary-extras.cjs');
 const { projectAppearance } = require('./project-appearance.cjs');
 // Cowork UI proxy server — zero-dependency Node http server.
 //
@@ -1947,6 +1948,13 @@ const corpusSource =
 
 async function handleChat(req, res, body, authn) {
   const { spaceId, message, history } = body || {};
+  if (spaceId === 'diary-extras') {
+    if (body.extrasEnabled !== true) return json(res, 400, { error: 'Extra attachments and tools are off' });
+    if (!authn || !authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
+    if (!getProject(diaryExtras.PROJECT_ID)) return json(res, 400, { error: 'Enable diary extras first' });
+    body = { ...body, projectId: diaryExtras.PROJECT_ID, chatId: 'diary-extra-' + String(body.sessionId || '').slice(0, 80) };
+  }
+
   if (!message || typeof message !== 'string') return json(res, 400, { error: 'message required' });
 
   // Client-disconnect handling: if the browser goes away mid-generation,
@@ -1979,6 +1987,10 @@ async function handleChat(req, res, body, authn) {
   // ── Project context: instructions + knowledge files prepend
   // the system message for every chat in the project.
   let projectId = body.projectId || null;
+  if (!projectId && spaceId === 'free' && body.chatId) {
+    const contextId = diaryExtras.chatProjectId(body.chatId);
+    if (contextId && getProject(contextId)) projectId = contextId;
+  }
   let chatId = body.chatId || null;
   let project = null;
   if (projectId && spaceId !== 'diary') {
@@ -2027,7 +2039,7 @@ async function handleChat(req, res, body, authn) {
     try {
       full = await fetchJson(
         `${DIARY_BASE}/v1/chat/completions`,
-        { method: 'POST', headers: diaryHeaders(), body: JSON.stringify({ messages: msgs, session_id: body.sessionId, entryTime: body.entryTime, entryDay: body.entryDay }), signal: chatSignal.signal },
+        { method: 'POST', headers: diaryHeaders(), body: JSON.stringify({ messages: msgs, session_id: body.sessionId, entryTime: body.entryTime, entryDay: body.entryDay, extrasEnabled: body.extrasEnabled === true, extraContext: diaryExtras.reference(body) }), signal: chatSignal.signal },
         300000,
       );
     } catch (err) {
@@ -2801,7 +2813,7 @@ async function handleRequestScoped(req, res) {
       // PROJECTS is served raw everywhere else; here it crosses to the client,
       // so chats[] must be sanitized exactly as loadChats does.
       return json(res, 200, {
-        projects: PROJECTS.map((proj) => ({ ...proj, chats: sanitizeChats(proj.chats) })),
+        projects: PROJECTS.filter(proj => !diaryExtras.internalProject(proj)).map((proj) => ({ ...proj, chats: sanitizeChats(proj.chats) })),
         freeChats: sanitizeChats(FREE_CHATS),
       });
     }
@@ -2989,6 +3001,29 @@ async function handleRequestScoped(req, res) {
         ensureRolesLoaded(); // warm both models; never blocks the response
         return json(res, 200, { configured: true, roles: autoRoles() });
       }
+    }
+
+    const freeContext = /^\/api\/chats\/([^/]+)\/context$/.exec(p);
+    if (freeContext && ['GET', 'POST'].includes(req.method)) {
+      const id = diaryExtras.chatProjectId(decodeURIComponent(freeContext[1]));
+      if (!id) return json(res, 400, { error: 'Invalid chat identifier' });
+      let project = getProject(id);
+      if (!project && req.method === 'POST') {
+        project = { ...diaryExtras.newProject(), id, name: 'Chat attachments ' + freeContext[1], instructions: '', toolboxes: [...DEFAULT_TOOLBOXES] };
+        PROJECTS.push(project); saveProjects(PROJECTS);
+      }
+      return json(res, 200, { project });
+    }
+
+    if (p === '/api/diary/context' && ['GET', 'POST'].includes(req.method)) {
+      if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
+      let project = getProject(diaryExtras.PROJECT_ID);
+      if (!project && req.method === 'POST') {
+        // Publish synchronously before awaiting storage to prevent duplicate contexts.
+        project = diaryExtras.newProject();
+        PROJECTS.push(project); saveProjects(PROJECTS);
+      }
+      return json(res, 200, { project });
     }
 
     if (p === '/api/projects' && req.method === 'POST') {

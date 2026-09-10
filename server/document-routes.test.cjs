@@ -181,3 +181,25 @@ test('unified uploads accept DOCX, preserve opaque bytes, protect metadata and e
   const bad=await post(`/api/projects/${p.id}/upload`,{organized:true,name:'fixture.zip',dataBase64:bytes.toString('base64')});
   assert.equal(bad.status,400);
 });
+
+test('diary extras are lazy, private to the tenant, and hidden from ordinary projects', async () => {
+  await request('/api/profile/features', { method:'PUT', headers:mutationHeaders(), body:JSON.stringify({diaryEnabled:true}) });
+  assert.equal(JSON.parse((await request('/api/diary/context', {headers:{cookie}})).text).project, null);
+  assert.equal((await post('/api/chat', {spaceId:'diary-extras',message:'fixture'})).status,400);
+  assert.equal((await request('/api/diary/context')).status,401);
+  const result = await post('/api/diary/context', {});
+  assert.equal(result.status,200);
+  const p = JSON.parse(result.text).project;
+  assert.deepEqual(p.toolboxes,[]);
+  const uploaded = await post(`/api/projects/${p.id}/upload`, {organized:true,name:'context.txt',dataBase64:Buffer.from('Synthetic optional source').toString('base64')});
+  assert.equal(uploaded.status,200);
+  const workspace = JSON.parse((await request('/api/workspace',{headers:{cookie}})).text);
+  assert.ok(!workspace.projects.some(item=>item.id===p.id));
+  assert.equal(JSON.parse((await post('/api/diary/context',{})).text).project.files.length,1);
+  const login = await post('/api/auth/login/password', {username:'reader',password:'correct horse battery staple'}, {origin:'http://localhost','content-type':'application/json'});
+  const otherCookie = (login.headers['set-cookie'] || login.headers['Set-Cookie'] || []).map(c=>c.split(';')[0]).join('; ');
+  assert.equal((await request('/api/diary/context',{headers:{cookie:otherCookie}})).status,404);
+  assert.equal((await request(`/api/projects/${p.id}/uploads/original?name=context.txt`,{headers:{cookie:otherCookie}})).status,404);
+  assert.equal((await post('/api/chats/c-fixture/context',{})).status,200);
+  assert.equal(JSON.parse((await request('/api/chats/c-fixture/context',{headers:{cookie:otherCookie}})).text).project,null);
+});
