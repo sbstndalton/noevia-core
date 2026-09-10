@@ -29,6 +29,7 @@ const prefill = require('./prefill.cjs');
 const { createToolExchange } = require('./tool-exchange.cjs');
 const storageClient = require('./storage-client.cjs');
 const documents = require('./documents.cjs');
+const documentSources = require('./document-sources.cjs');
 const { createVisionProbe } = require('./vision.cjs');
 const { createModelManager } = require('./model-manager.cjs');
 const { createAuth, createRateLimiter } = require('./auth.cjs');
@@ -552,10 +553,10 @@ const CORE_TOOLS = [
     function: {
       name: 'read_project_file',
       description:
-        'Read the full content of a knowledge file attached to this project, by exact file name. Use when a retrieved excerpt is not enough.',
+        'Read an attached source by exact name. For PDFs use startPage/endPage (up to 5 pages) and offset to read beyond summaries; results include page and version references.',
       parameters: {
         type: 'object',
-        properties: { name: { type: 'string', description: 'Exact file name, e.g. notes.md' } },
+        properties: { name: { type: 'string', description: 'Exact file name, e.g. notes.md' }, startPage: { type: 'integer', minimum: 1 }, endPage: { type: 'integer', minimum: 1 }, offset: { type: 'integer', minimum: 0 } },
         required: ['name'],
       },
     },
@@ -691,6 +692,47 @@ async function ensureProjectFolder(project) {
     console.warn(`[projects] could not create folder for project ${project.id}: ${String((err && err.message) || err)}`);
     return null;
   }
+}
+
+// Serialize source operations within one authenticated project. Config edits
+// and deletion can still happen while waiting; recheck ownership before commit.
+const sourceOperations = new WeakMap();
+async function withSourceLock(project, operation) {
+  const previous = sourceOperations.get(project) || Promise.resolve();
+  const next = previous.catch(() => {}).then(operation);
+  sourceOperations.set(project, next);
+  try { return await next; }
+  finally {
+    if (sourceOperations.get(project) === next) {
+      sourceOperations.delete(project);
+      pruneDocuments(project);
+    }
+  }
+}
+function pruneDocuments(project) {
+  if (sourceOperations.has(project)) return;
+  const workspace = currentWorkspace();
+  try { documentSources.prune(workspace, workspace.projects.includes(project) ? project : { id: project.id, files: [] }); }
+  catch (err) { console.warn('[documents] cleanup failed:', err.message); }
+}
+function indexSource(project, file) {
+  const workspace = currentWorkspace();
+  if (file.document && !file.content) {
+    file.document.indexing = 'unavailable';
+    rag.deleteProjectFile(project.id, file.name, workspace.userId);
+    return;
+  }
+  if (file.document) file.document.indexing = 'pending';
+  rag.indexProjectFile(project.id, file.name, file.content, workspace.userId).then(result => {
+    if (!workspace.projects.includes(project) || !project.files.includes(file) || !file.document) return;
+    file.document.indexing = !result?.ok ? 'unavailable' : result.direct ? 'direct' : result.embedded < result.stored ? 'partial' : 'ready';
+    workspace.saveProjects();
+  }).catch(() => {
+    if (workspace.projects.includes(project) && project.files.includes(file) && file.document) {
+      file.document.indexing = 'failed';
+      try { workspace.saveProjects(); } catch (err) { console.warn('[documents] could not save index state:', err.message); }
+    }
+  });
 }
 
 const MAX_PROJECT_IMAGES = 12;
@@ -1598,7 +1640,14 @@ async function executeToolCall(project, name, rawArgs, allowed) {
       const names = files.map((x) => x.name).join(', ') || '(none attached)';
       return `ERROR: no project file named "${wanted}". Available: ${names}`;
     }
-    return `File "${f.name}" (${f.content.length} chars):\n\n${f.content.slice(0, TOOL_RESULT_CAP)}${f.content.length > TOOL_RESULT_CAP ? '\n…[truncated]' : ''}`;
+    if (f.document && args.startPage !== undefined) {
+      try {
+        const out = documentSources.readPages(currentWorkspace(), project.id, f, args.startPage, args.endPage ?? args.startPage, args.offset ?? 0, TOOL_RESULT_CAP);
+        return `${out.notice}\n${out.text}${out.nextOffset !== null ? '\nContinue with offset ' + out.nextOffset : ''}`;
+      } catch (err) { return 'ERROR: ' + err.message; }
+    }
+    const warning = documentSources.notice(f);
+    return `${warning ? warning + "\n" : ""}File "${f.name}" (${f.content.length} chars):\n\n${f.content.slice(0, TOOL_RESULT_CAP)}${f.content.length > TOOL_RESULT_CAP ? '\n…[truncated]' : ''}`;
   }
   // Not a built-in: if the name came from a discovered MCP box, execute it
   // there. The per-user credential is attached here rather than at discovery,
@@ -2968,10 +3017,12 @@ async function handleRequestScoped(req, res) {
     const projMatch = p.match(/^\/api\/projects\/([^/]+)$/);
     if (projMatch && req.method === 'DELETE') {
       const id = decodeURIComponent(projMatch[1]);
+      const removedProject = getProject(id);
       const before = PROJECTS.length;
       const keptProjects = Array.from(PROJECTS).filter((pr) => pr.id !== id);
       PROJECTS.splice(0, PROJECTS.length, ...keptProjects);
       if (PROJECTS.length === before) return json(res, 404, { error: 'no such project' });
+      if (removedProject) pruneDocuments(removedProject);
       saveProjects(PROJECTS);
       // Drop the project's RAG index too (best-effort).
       try {
@@ -3041,7 +3092,10 @@ async function handleRequestScoped(req, res) {
         const uploads = patch.files
           .filter((f) => f && typeof f.name === 'string' && typeof f.content === 'string' && !f.source)
           .slice(0, 20)
-          .map((f) => ({ name: f.name.slice(0, 200), content: f.content.slice(0, 200000) }));
+          .map((f) => {
+            const existing = prevFiles.find(p => !p.source && p.name === f.name);
+            return existing?.document ? existing : { name: f.name.slice(0, 200), content: f.content.slice(0, 200000) };
+          });
         project.files = [...fromFolders, ...uploads];
         // RAG bookkeeping (step 10): drop chunks for removed files; index
         // new/changed ones. Fire-and-forget — upload latency must not depend
@@ -3063,6 +3117,7 @@ async function handleRequestScoped(req, res) {
       project.updatedAt = Date.now();
       Object.assign(storedProject, project);
       saveProjects(PROJECTS);
+      pruneDocuments(storedProject);
       return json(res, 200, { ok: true });
     }
 
@@ -3129,18 +3184,36 @@ async function handleRequestScoped(req, res) {
       if (bytes.length > DOCUMENT_UPLOAD_CAP) {
         return json(res, 413, { error: `That document is ${Math.round(bytes.length / 1024 / 1024)} MB, over the ${Math.round(DOCUMENT_UPLOAD_CAP / (1024 * 1024))} MB limit.` });
       }
-      let out;
+      return await withSourceLock(project, async () => {
+        if (getProject(id) !== project) return json(res, 409, { error: 'Project changed; retry.' });
+        const uploads = (project.files || []).filter(f => !f.source);
+        if (uploads.length >= 20 && !uploads.some(f => f.name === name)) return json(res, 400, { error: 'A project holds at most 20 uploaded sources.' });
+        const previous = uploads.find(f => f.name === name);
+        const file = await documentSources.ingest(currentWorkspace(), id, name, bytes, previous);
+        if (getProject(id) !== project || project.files.find(f => !f.source && f.name === name) !== previous) return json(res, 409, { error: 'Project changed; retry.' });
+        project.files = [...(project.files || []).filter(f => f.source || f.name !== name), file];
+        indexSource(project, file); saveProjects(PROJECTS);
+        return json(res, 200, { name, pages: file.document.pages, characters: file.content.length, truncated: file.document.truncated, document: file.document });
+      });
+    }
+
+    const docRead = p.match(/^\/api\/projects\/([^/]+)\/documents\/(pages|original)$/);
+    if (docRead && req.method === 'GET') {
+      const id = decodeURIComponent(docRead[1]);
+      const project = getProject(id);
+      const file = project?.files?.find(f => f.name === url.searchParams.get('name'));
+      if (!file?.document) return json(res, 404, { error: 'no such document' });
       try {
-        out = await documents.extractDocumentText(name, bytes);
-      } catch (e) {
-        return json(res, (e && e.status) || 422, { error: `Could not read ${name}: ${(e && e.message) || 'extraction failed'}` });
-      }
-      const uploads = (project.files || []).filter((f) => !f.source);
-      if (uploads.length >= 20) return json(res, 400, { error: 'A project holds at most 20 uploaded sources.' });
-      project.files = [...(project.files || []).filter((f) => f.name !== name), { name, content: out.text }];
-      saveProjects(PROJECTS);
-      rag.indexProjectFile(id, name, out.text, currentWorkspace().userId).catch((e) => console.warn('[rag] document indexing failed:', e.message));
-      return json(res, 200, { name, pages: out.pages, characters: out.text.length, truncated: out.truncated });
+        if (docRead[2] === 'pages') {
+          const start = Number(url.searchParams.get('startPage') || 1);
+          return json(res, 200, documentSources.readPages(currentWorkspace(), id, file, start,
+            Number(url.searchParams.get('endPage') || start), Number(url.searchParams.get('offset') || 0)));
+        }
+        const bytes = documentSources.readOriginal(currentWorkspace(), id, file);
+        res.writeHead(200, { 'Content-Type': 'application/pdf', 'Content-Disposition': "attachment; filename*=UTF-8''" + encodeURIComponent(file.name.split('/').pop()),
+          'Content-Length': bytes.length, 'Cache-Control': 'private, no-store' });
+        return res.end(bytes);
+      } catch (err) { return json(res, err.status || 422, { error: err.status ? err.message : 'Saved document data is unavailable; upload or refresh again.' }); }
     }
 
     // Upload a file into the project's own folder. Text and PDFs both land as
@@ -3170,42 +3243,50 @@ async function handleRequestScoped(req, res) {
       try { bytes = Buffer.from(String(body.dataBase64 || ''), 'base64'); } catch { bytes = null; }
       if (!bytes || !bytes.length) return json(res, 400, { error: 'file was empty' });
       if (bytes.length > DOCUMENT_UPLOAD_CAP) return json(res, 413, { error: 'File exceeds the 25 MB limit.' });
-      const connection = authService.getStorage(authn.user.id, true);
-      if (!storageClient.isBrowsable(connection)) {
-        // Remote storage is optional. Keep local uploads as project sources,
-        // including PDF extraction, for installations without a cloud account.
-        const uploads = (project.files || []).filter((f) => !f.source);
-        if (uploads.length >= 20 && !uploads.some((f) => f.name === rawName)) {
-          return json(res, 400, { error: 'A project holds at most 20 uploaded sources.' });
+      return await withSourceLock(project, async () => {
+        if (getProject(id) !== project) return json(res, 409, { error: 'Project changed; retry.' });
+        const connection = authService.getStorage(authn.user.id, true);
+        if (!storageClient.isBrowsable(connection)) {
+          // Remote storage is optional. Keep local uploads as project sources,
+          // including PDF extraction, for installations without a cloud account.
+          const uploads = (project.files || []).filter((f) => !f.source);
+          if (uploads.length >= 20 && !uploads.some((f) => f.name === rawName)) {
+            return json(res, 400, { error: 'A project holds at most 20 uploaded sources.' });
+          }
+          const previous = uploads.find(f => f.name === rawName);
+          const file = documents.isDocument(rawName)
+            ? await documentSources.ingest(currentWorkspace(), id, rawName, bytes, previous)
+            : { name: rawName, content: bytes.toString('utf8').slice(0, 200000) };
+          if (getProject(id) !== project || (project.files || []).find(f => !f.source && f.name === rawName) !== previous) return json(res, 409, { error: 'Source changed; retry.' });
+          project.files = [...(project.files || []).filter(f => f.source || f.name !== rawName), file];
+          project.updatedAt = Date.now();
+          indexSource(project, file); saveProjects(PROJECTS);
+          return json(res, 200, { name: rawName, path: rawName, bytes: bytes.length, document: file.document });
         }
-        let content;
-        try {
-          content = documents.isDocument(rawName)
-            ? (await documents.extractDocumentText(rawName, bytes)).text
-            : bytes.toString('utf8').slice(0, 200000);
-        } catch (e) {
-          return json(res, (e && e.status) || 422, { error: `Could not read ${rawName}: ${e.message || 'extraction failed'}` });
+        if (!project.projectFolder) {
+          const folder = await ensureProjectFolder(project);
+          if (!folder) return json(res, 502, { error: 'Could not create the project storage folder. Check your storage connection and retry.' });
+          project.projectFolder = folder;
         }
-        project.files = [...(project.files || []).filter((f) => f.source || f.name !== rawName), { name: rawName, content }];
-        project.updatedAt = Date.now();
+        project.sourceFolders = [...new Set([...(project.sourceFolders || []), project.projectFolder])];
         saveProjects(PROJECTS);
-        rag.indexProjectFile(id, rawName, content, currentWorkspace().userId)
-          .catch((e) => console.warn('[rag] upload indexing failed:', e.message));
-        return json(res, 200, { name: rawName, path: rawName, bytes: bytes.length });
-      }
-      if (!project.projectFolder) {
-        const folder = await ensureProjectFolder(project);
-        if (!folder) return json(res, 502, { error: 'Could not create the project storage folder. Check your storage connection and retry.' });
-        project.projectFolder = folder;
-      }
-      project.sourceFolders = [...new Set([...(project.sourceFolders || []), project.projectFolder])];
-      saveProjects(PROJECTS);
-      try {
-        await storageClient.writeFile(connection, `${project.projectFolder}/${rawName}`, bytes);
-      } catch (e) {
-        return json(res, (e && e.status) || 502, { error: (e && e.message) || 'could not save the file' });
-      }
-      return json(res, 200, { name: rawName, path: `${project.projectFolder}/${rawName}`, bytes: bytes.length });
+        try {
+          await storageClient.writeFile(connection, `${project.projectFolder}/${rawName}`, bytes);
+        } catch (e) {
+          return json(res, (e && e.status) || 502, { error: (e && e.message) || 'could not save the file' });
+        }
+        let file;
+        if (documents.isDocument(rawName)) {
+          const name = `${project.projectFolder}/${rawName}`;
+          const previous = project.files.find(f => f.name === name && f.source === project.projectFolder);
+          file = await documentSources.ingest(currentWorkspace(), id, name, bytes, previous);
+          file.source = project.projectFolder;
+          if (getProject(id) !== project || !project.sourceFolders.includes(file.source)) return json(res, 409, { error: 'Source changed; refresh again.' });
+          project.files = [...project.files.filter(f => f.name !== name || f.source !== file.source), file];
+          indexSource(project, file); saveProjects(PROJECTS);
+        }
+        return json(res, 200, { name: rawName, path: `${project.projectFolder}/${rawName}`, bytes: bytes.length, document: file?.document });
+      });
     }
 
     // Delete one source file from the project's folder. This removes the file
@@ -3223,17 +3304,21 @@ async function handleRequestScoped(req, res) {
       if (!ownsFile(project, target)) {
         return json(res, 400, { error: 'That file is not in any folder attached to this project, so it cannot be deleted from here.' });
       }
-      const connection = authService.getStorage(authn.user.id, true);
-      if (!storageClient.isBrowsable(connection)) return json(res, 400, { error: 'no browsable storage connected' });
-      try {
-        await storageClient.deleteFile(connection, target);
-      } catch (e) {
-        return json(res, (e && e.status) || 502, { error: (e && e.message) || 'could not delete the file' });
-      }
-      project.files = (project.files || []).filter((f) => f.name !== target);
-      saveProjects(PROJECTS);
-      rag.deleteProjectFile(id, target, currentWorkspace().userId);
-      return json(res, 200, { ok: true, path: target });
+      return await withSourceLock(project, async () => {
+        if (getProject(id) !== project || !ownsFile(project, target)) return json(res, 409, { error: 'Source changed; retry.' });
+        const connection = authService.getStorage(authn.user.id, true);
+        if (!storageClient.isBrowsable(connection)) return json(res, 400, { error: 'no browsable storage connected' });
+        try {
+          await storageClient.deleteFile(connection, target);
+        } catch (e) {
+          return json(res, (e && e.status) || 502, { error: (e && e.message) || 'could not delete the file' });
+        }
+        project.files = (project.files || []).filter((f) => f.name !== target);
+        pruneDocuments(project);
+        saveProjects(PROJECTS);
+        rag.deleteProjectFile(id, target, currentWorkspace().userId);
+        return json(res, 200, { ok: true, path: target });
+      });
     }
 
     const projAssets = p.match(/^\/api\/projects\/([^/]+)\/assets$/);
@@ -3311,73 +3396,83 @@ async function handleRequestScoped(req, res) {
       const id = decodeURIComponent(projSync[1]);
       const project = getProject(id);
       if (!project) return json(res, 404, { error: 'no such project' });
-      const folders = Array.isArray(project.sourceFolders) ? project.sourceFolders : [];
-      const connection = authService.getStorage(authn.user.id, true);
-      if (folders.length && !storageClient.isBrowsable(connection)) {
-        return json(res, 400, { error: 'no browsable storage connection is configured' });
-      }
-
-      const fromFolders = [];
-      const skipped = [];
-      for (const folder of folders) {
-        let entries;
-        try {
-          entries = await storageClient.listFiles(connection, folder);
-        } catch (e) {
-          fromFolders.push(...(project.files || []).filter((f) => f.source === folder));
-          skipped.push({ folder, reason: e && e.message ? e.message : 'could not list folder' });
-          continue;
+      return await withSourceLock(project, async () => {
+        if (getProject(id) !== project) return json(res, 409, { error: 'Project changed; retry.' });
+        const folders = Array.isArray(project.sourceFolders) ? project.sourceFolders : [];
+        const connection = authService.getStorage(authn.user.id, true);
+        if (folders.length && !storageClient.isBrowsable(connection)) {
+          return json(res, 400, { error: 'no browsable storage connection is configured' });
         }
-        for (const entry of entries) {
-          if (entry.isDir) continue; // one level: recursing could pull a whole drive in
-          const ext = (entry.ext || '').toLowerCase();
-          const isText = storageClient.TEXT_EXTENSIONS.has(ext);
-          const isDoc = documents.isDocument(entry.name);
-          if (!isText && !isDoc) continue;
-          if (fromFolders.length >= 40) break; // a cap, so one big folder cannot blow up a project
+
+        const fromFolders = [];
+        const skipped = [];
+        for (const folder of folders) {
+          let entries;
           try {
-            if (isDoc) {
-              // A document is converted to text here, so a PDF in an attached
-              // folder becomes a readable source rather than being skipped.
-              const bytes = await storageClient.readBinaryFile(connection, entry.path);
-              const out = await documents.extractDocumentText(entry.name, bytes);
-              fromFolders.push({ name: entry.path, content: out.text, source: folder });
-            } else {
-              const file = await storageClient.readTextFile(connection, entry.path);
-              fromFolders.push({ name: entry.path, content: file.content, source: folder });
-            }
+            entries = await storageClient.listFiles(connection, folder);
           } catch (e) {
-            const previous = (project.files || []).find((f) => f.source === folder && f.name === entry.path);
-            if (previous) fromFolders.push(previous);
-            skipped.push({ folder, file: entry.path, reason: e && e.message ? e.message : 'could not read' });
+            const reason = e?.message || 'could not list folder';
+            const previous = (project.files || []).filter(f => f.source === folder);
+            fromFolders.push(...previous.map(f => documents.isDocument(f.name) ? { ...documentSources.failed(f, f.name, reason), source: folder } : f));
+            skipped.push({ folder, reason, retained: previous.some(f => !!f.content) });
+            continue;
+          }
+          for (const entry of entries) {
+            if (entry.isDir) continue; // one level: recursing could pull a whole drive in
+            const ext = (entry.ext || '').toLowerCase();
+            const isText = storageClient.TEXT_EXTENSIONS.has(ext);
+            const isDoc = documents.isDocument(entry.name);
+            if (!isText && !isDoc) continue;
+            if (fromFolders.length >= 40) { skipped.push({ folder, file: entry.path, reason: '40-source refresh limit reached; this file was not read.', retained: false }); continue; } // a cap, so one big folder cannot blow up a project
+            try {
+              if (isDoc) {
+                // A document is converted to text here, so a PDF in an attached
+                // folder becomes a readable source rather than being skipped.
+                const bytes = await storageClient.readBinaryFile(connection, entry.path);
+                const previous = (project.files || []).find(f => f.source === folder && f.name === entry.path);
+                const file = await documentSources.ingest(currentWorkspace(), id, entry.path, bytes, previous);
+                fromFolders.push({ ...file, source: folder });
+                if (file.document.state !== 'ready') skipped.push({ folder, file: entry.path, reason: documentSources.problem(file), retained: file.document.stale });
+              } else {
+                const file = await storageClient.readTextFile(connection, entry.path);
+                fromFolders.push({ name: entry.path, content: file.content, source: folder });
+              }
+            } catch (e) {
+              const previous = (project.files || []).find((f) => f.source === folder && f.name === entry.path);
+              const reason = e?.message || 'could not read';
+              if (isDoc) fromFolders.push({ ...documentSources.failed(previous, entry.path, reason), source: folder });
+              else if (previous) fromFolders.push(previous);
+              skipped.push({ folder, file: entry.path, reason, retained: !!previous?.content });
+            }
           }
         }
-      }
-      const prev = Array.isArray(project.files) ? project.files : [];
-      // An upload or folder edit may have completed while storage was being
-      // read. Preserve current uploads and never reattach a detached folder.
-      const currentFolders = new Set(project.sourceFolders || []);
-      const uploaded = prev.filter((f) => !f.source);
-      const untouched = prev.filter((f) => f.source && currentFolders.has(f.source) && !folders.includes(f.source));
-      const synced = fromFolders.filter((f) => currentFolders.has(f.source));
-      project.files = [...uploaded, ...untouched, ...synced].slice(0, 60);
-      saveProjects(PROJECTS);
-      // Same RAG bookkeeping the config patch does: drop chunks for files that
-      // are gone, re-index the ones that arrived or changed.
-      const prevByName = new Map(prev.map((f) => [f.name, f]));
-      const nextNames = new Set(project.files.map((f) => f.name));
-      for (const old of prev) {
-        if (!nextNames.has(old.name)) rag.deleteProjectFile(id, old.name, currentWorkspace().userId);
-      }
-      for (const next of project.files) {
-        const before = prevByName.get(next.name);
-        if (!before || before.content !== next.content) {
-          rag.indexProjectFile(id, next.name, next.content, currentWorkspace().userId).catch((e) => console.warn('[rag] source indexing failed:', e.message));
+        if (getProject(id) !== project) return json(res, 409, { error: 'Project changed; retry.' });
+        const prev = Array.isArray(project.files) ? project.files : [];
+        // An upload or folder edit may have completed while storage was being
+        // read. Preserve current uploads and never reattach a detached folder.
+        const currentFolders = new Set(project.sourceFolders || []);
+        const uploaded = prev.filter((f) => !f.source);
+        const untouched = prev.filter((f) => f.source && currentFolders.has(f.source) && !folders.includes(f.source));
+        const synced = fromFolders.filter((f) => currentFolders.has(f.source));
+        project.files = [...uploaded, ...untouched, ...synced].slice(0, 60);
+        saveProjects(PROJECTS);
+        // Same RAG bookkeeping the config patch does: drop chunks for files that
+        // are gone, re-index the ones that arrived or changed.
+        const prevByName = new Map(prev.map((f) => [f.name, f]));
+        const nextNames = new Set(project.files.map((f) => f.name));
+        for (const old of prev) {
+          if (!nextNames.has(old.name)) rag.deleteProjectFile(id, old.name, currentWorkspace().userId);
         }
-      }
-      return json(res, 200, {
-        files: project.files.map((f) => ({ name: f.name, source: f.source || null, bytes: f.content.length })),
-        skipped,
+        for (const next of project.files) {
+          const before = prevByName.get(next.name);
+          if (!before || before.content !== next.content || (next.document && ['pending', 'failed', 'unavailable', 'partial'].includes(next.document.indexing))) {
+            indexSource(project, next);
+          }
+        }
+        return json(res, 200, {
+          files: project.files.map((f) => ({ name: f.name, source: f.source || null, bytes: f.content.length, document: f.document })),
+          skipped,
+        });
       });
     }
 

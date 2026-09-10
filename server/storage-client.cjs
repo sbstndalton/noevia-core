@@ -270,25 +270,37 @@ async function readBinaryFile(conn, rawPath, opts) {
   const cap = (opts && opts.cap) || 25 * 1024 * 1024;
   const path = safeRelativePath(rawPath);
   if (!path) throw Object.assign(new Error('invalid path'), { status: 400 });
-  if (connectionKind(conn) === 's3') {
-    const text = await s3Read(conn, path);
-    return Buffer.from(text, 'binary');
-  }
-  const full = scoped ? joinRoot(conn.corpusRoot, path) : path;
-  const response = await withRetry(() => fetch(davUrl(conn, full), {
+  const s3 = connectionKind(conn) === 's3';
+  const full = s3 || scoped ? joinRoot(conn.corpusRoot, path) : path;
+  const url = s3 ? s3Url(conn, full) : davUrl(conn, full);
+  const response = await withRetry(() => fetch(url, {
     method: 'GET',
-    headers: davHeaders(conn, {}),
+    headers: s3 ? signS3Request('GET', url, '', conn.username || '', conn.secret || '') : davHeaders(conn, {}),
     signal: AbortSignal.timeout(30000),
     redirect: 'error',
   }));
   if (!response.ok) {
     throw Object.assign(new Error(`storage returned ${response.status}`), { status: response.status === 404 ? 404 : 502 });
   }
-  const buf = Buffer.from(await response.arrayBuffer());
-  if (buf.length > cap) {
-    throw Object.assign(new Error(`file is ${Math.round(buf.length / 1024 / 1024)} MB, over the ${Math.round(cap / 1024 / 1024)} MB limit`), { status: 413 });
+  const tooLarge = () => Object.assign(new Error(`file exceeds the ${cap} byte limit`), { status: 413 });
+  if (Number(response.headers.get('content-length')) > cap) {
+    await response.body?.cancel();
+    throw tooLarge();
   }
-  return buf;
+  if (!response.body) return Buffer.alloc(0);
+  const reader = response.body.getReader();
+  const chunks = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > cap) { await reader.cancel(); throw tooLarge(); }
+      chunks.push(Buffer.from(value));
+    }
+  } finally { reader.releaseLock(); }
+  return Buffer.concat(chunks, size);
 }
 
 /** Write one file, creating or replacing it. Used for a project's own folder,

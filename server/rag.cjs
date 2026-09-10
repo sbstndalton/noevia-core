@@ -13,6 +13,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { notice: documentNotice } = require('./document-sources.cjs');
 
 // Injected by init() from index.cjs (keeps this module testable standalone).
 let RAG_DIR = null;
@@ -56,7 +57,13 @@ function ragAvailable() {
   return !loadDeps().broken;
 }
 
-function chunkText(text) {
+function chunkText(text, pagePart = false) {
+  if (!pagePart && /^\[Page \d+\]/.test(String(text))) {
+    return String(text).split(/(?=\[Page \d+\]\n)/).filter(Boolean).flatMap(part => {
+      const marker = part.match(/^\[Page \d+\]/)?.[0] || '';
+      return chunkText(part.slice(marker.length), true).map(chunk => marker + '\n' + chunk);
+    });
+  }
   const clean = String(text || '').replace(/\r\n/g, '\n').trim();
   if (!clean) return [];
   if (clean.length <= CHUNK_SIZE) return [clean];
@@ -286,6 +293,7 @@ async function filesContext(projectId, files, query, userId) {
     .map((f) => `"${f.name}"`)
     .join(', ')}. Excerpts of the relevant ones follow; ask to read a file in full if you need more of it.`;
 
+  const notices = files.map(documentNotice).filter(Boolean);
   const parts = [];
   if (ragAvailable() && large.length > 0) {
     const hits = await searchProject(projectId, query, userId);
@@ -302,7 +310,8 @@ async function filesContext(projectId, files, query, userId) {
     // Always keep small files present — they are cheap and usually key context.
     for (const f of small) parts.push(`File "${f.name}":\n${f.content}`);
   }
-  return parts.length ? [manifest, ...parts].join('\n\n') : manifest;
+  const coverage = 'Source completeness: ' + (notices.join('\n') || 'Legacy text sources have no page completeness metadata.') + '\nContext may contain excerpts only. Use read_project_file with PDF startPage/endPage and offset for pages beyond the summary. Do not treat missing excerpts or failed/partial sources as evidence of absence.';
+  return parts.length ? [manifest, coverage, ...parts].join('\n\n') : [manifest, coverage].join("\n");
 }
 
 module.exports = { init, indexProjectFile, deleteProjectFile, searchProject, filesContext, chunkText, ragAvailable };
