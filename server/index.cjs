@@ -2030,7 +2030,7 @@ async function handleChat(req, res, body, authn) {
     if (skills.length) {
       sysParts.push(
         `Available skills (load the full file with the read_project_file tool when a task matches; do not guess their contents):\n` +
-          skills.map((s) => `- ${s.name || s.file}${s.version ? ` (v${s.version})` : ''}: ${s.description || '(no description)'}`).join('\n'),
+          require('./skill-index.cjs').formatSkillIndex(skills),
       );
     }
   }

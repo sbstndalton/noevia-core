@@ -12,7 +12,7 @@ const { createToolExchange } = require('./tool-exchange.cjs');
 const source = fs.readFileSync(require.resolve('./index.cjs'), 'utf8');
 const handler = source.slice(source.indexOf('async function handleChat('), source.indexOf('// ── Routing'));
 
-function fixture({ rounds, decision = 'approve', execute, fallback = false, cancel = false, effort, reasoningOnly = false } = {}) {
+function fixture({ rounds, decision = 'approve', execute, fallback = false, cancel = false, effort, reasoningOnly = false, skills = [] } = {}) {
   const events = [], executions = [], approvals = [], requests = [], audits = [];
   let round = 0, allApproved = false;
   const res = new EventEmitter();
@@ -24,13 +24,13 @@ function fixture({ rounds, decision = 'approve', execute, fallback = false, canc
     return rounds[round++] || [];
   }
   const context = {
-    reasoningEffort: require('./reasoning-effort.cjs'),
+    require, reasoningEffort: require('./reasoning-effort.cjs'),
     AbortController, AbortSignal, TextDecoder, console, createToolExchange,
     crypto: require('node:crypto'), HISTORY_CAP: 20, DEFAULT_PROVIDER_ID: 'default',
     currentWorkspace: () => ({ userId: 'synthetic-user' }),
     requestScope: { getStore: () => ({ workspace: { userId: 'synthetic-user' } }) },
     getProject: (id) => ({ id, model: 'synthetic-model', reasoningEffort: effort }),
-    skillsIndexFor: () => [], getProvider: () => ({ id: 'default', baseUrl: 'http://fixture.invalid', label: 'Mock' }),
+    skillsIndexFor: () => skills, getProvider: () => ({ id: 'default', baseUrl: 'http://fixture.invalid', label: 'Mock' }),
     providerHeaders: () => ({}),
     resolveTools: () => ({ tools: ['read', 'write'].map(name => ({ function: { name } })), dropped: [] }),
     isWriteTool: name => name !== 'read',
@@ -221,4 +221,14 @@ test('reasoning-only tool continuation preserves completed tool results without 
  assert.equal(f.executions.length,1);assert.ok(f.events.some(e=>e.type==='tool_result'));
  assert.ok(f.events.some(e=>e.type==='delta'&&e.text.includes('without a final answer')));
  assert.ok(!f.events.some(e=>e.type==='delta'&&e.text.includes('Synthetic internal plan')));
+});
+
+
+test('actual chat request indexes the exact skill filename even when its display name differs',async()=>{
+ const f=fixture({skills:[{file:'weekly-review.md',name:'Project summary',description:'Review notes',version:'2'}],rounds:[[]]});await f.run();
+ const prompt=f.requests[0].messages.filter(m=>m.role==='system').map(m=>m.content).join('\n');
+ assert.ok(prompt.includes('"file":"weekly-review.md"'));
+ assert.ok(prompt.includes('"name":"Project summary"'));
+ assert.ok(prompt.includes('read_project_file'));
+ assert.equal(f.executions.length,0);
 });
