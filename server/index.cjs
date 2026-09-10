@@ -2059,6 +2059,7 @@ async function handleChat(req, res, body, authn) {
     if (!choice?.content) return json(res, 502, { error: 'diary sidecar returned no content' });
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
     send({ type: 'meta', model: 'diary' });
+    if (typeof choice.reasoning_content === 'string' && choice.reasoning_content) send({ type: 'reasoning', text: choice.reasoning_content });
     send({ type: 'delta', text: choice.content });
     if (full.body.diary) send({ type: 'diary', decision: full.body.diary.decision, xid: full.body.diary.xid });
     send({ type: 'done', model: 'diary' });

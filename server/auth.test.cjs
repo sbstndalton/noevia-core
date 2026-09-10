@@ -183,8 +183,9 @@ test('diary forwards browser date and selected day to the pipeline', async (t) =
   let sent;
   t.mock.method(globalThis, 'fetch', async (_url, opts) => {
     sent = JSON.parse(opts.body);
-    return Response.json({ choices:[{message:{content:'Reply'}}], diary:{decision:'logged'} });
+    return Response.json({ choices:[{message:{content:'Reply',reasoning_content:'Synthetic provider reasoning'}}], diary:{decision:'logged'} });
   });
   const r = await request('/api/chat', { method:'POST',headers:adminHeaders,body:JSON.stringify({spaceId:'diary',message:'Past day note',history:[],entryTime:'2026-09-07T10:00:00-04:00',entryDay:'2026-07-08'}) });
   assert.equal(r.status,200);assert.equal(sent.entryDay,'2026-07-08');assert.equal(sent.entryTime,'2026-09-07T10:00:00-04:00');
+  assert.match(r.text, /"type":"reasoning","text":"Synthetic provider reasoning"/);
 });
