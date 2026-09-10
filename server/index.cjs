@@ -2476,6 +2476,23 @@ async function handleChat(req, res, body, authn) {
 
 // ── Routing ────────────────────────────────────────────────────────────────
 
+const diaryConnectors = require('./diary-connectors.cjs').createCredentials(authService);
+const connectorRate = require('./auth.cjs').createRateLimiter();
+async function callDiaryFile(userId, endpoint, method, body) {
+  const workspace = workspaceStore.get(userId);
+  const user = authService.publicUser(authService.db.prepare('SELECT * FROM users WHERE id=? AND disabled_at IS NULL').get(userId));
+  if(!user || !authService.diaryEnabled(userId))throw Object.assign(Error('Diary unavailable'),{status:403});
+  return requestScope.run({workspace,authn:{user,legacy:false}},async()=>{
+    const r=await fetchJson(`${DIARY_BASE}/api${endpoint}`,{method,headers:diaryHeaders(),body:body===undefined?undefined:JSON.stringify(body)},60000);
+    if(!r.ok)throw Object.assign(Error(r.body?.detail || 'Diary request interrupted; read the current version before retrying a write'),{status:r.status||502});
+    return r.body;
+  });
+}
+const connectorFiles={
+  list:async(id,path)=>(await callDiaryFile(id,'/files?path='+encodeURIComponent(path),'GET')).files,
+  read:(id,path)=>callDiaryFile(id,'/file','POST',{path}),
+  write:(id,body)=>callDiaryFile(id,'/file','PUT',body),
+};
 async function handleRequest(req, res) {
   const preAuth = authService.authenticate(req);
   const workspace = preAuth ? workspaceStore.get(preAuth.user.id, { claim: preAuth.user.role === 'admin' }) : null;
@@ -2495,6 +2512,19 @@ async function handleRequestScoped(req, res) {
   res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");
 
   try {
+    if(p==='/api/diary-connector') {
+      res.setHeader('Cache-Control','no-store');
+      if(req.method!=='POST')return json(res,405,{error:'POST required'});
+      if(req.headers.origin)return json(res,403,{error:'Use the authenticated connector client'});
+      if(connectorRate.rateLimited('diary-connector:'+String(req.socket?.remoteAddress),120,60000))return json(res,429,{error:'Try later'});
+      const token=String(req.headers.authorization||'').replace(/^Bearer /,'');
+      const identity=diaryConnectors.verify(token);
+      if(!identity)return json(res,401,{error:'Diary connector credential required'});
+      const body=JSON.parse(await readBody(req,4*1024*1024));
+      const result=await require('./diary-connectors.cjs').operate(identity,body,connectorFiles,()=>!!diaryConnectors.verify(token));
+      if(body.action==='write')authService.audit('diary-connector.write',identity.userId,identity.userId,{credentialId:identity.id,path:body.path,bytes:Buffer.byteLength(body.content)});
+      return json(res,200,result);
+    }
     const publicAuthRoutes = new Set([
       '/api/setup/status', '/api/setup/complete', '/api/auth/login/password',
       '/api/auth/login/passkey/options', '/api/auth/login/passkey/verify',
@@ -2526,6 +2556,10 @@ async function handleRequestScoped(req, res) {
     if (authn && !['GET', 'HEAD', 'OPTIONS'].includes(req.method || 'GET') && (!authService.originValid(req) || !authService.csrfValid(req, authn))) {
       return json(res, 403, { error: 'invalid CSRF token' });
     }
+    if(p==='/api/profile/diary-connectors' && req.method==='GET')return json(res,200,{connectors:diaryConnectors.list(authn.user.id)});
+    if(p==='/api/profile/diary-connectors' && req.method==='POST')return json(res,201,diaryConnectors.create(authn.user.id,(await readJson(req)).name));
+    const revokeConnector=p.match(/^\/api\/profile\/diary-connectors\/([a-f0-9]{32})$/);
+    if(revokeConnector && req.method==='DELETE')return json(res,200,{revoked:diaryConnectors.revoke(authn.user.id,revokeConnector[1])});
     // Opt-in asynchronous source processing; the synchronous API remains compatible.
     const sourceJob = p.match(/^\/api\/projects\/([^/]+)\/source-jobs\/([^/]+)$/);
     if (sourceJob && req.method === 'GET') {
