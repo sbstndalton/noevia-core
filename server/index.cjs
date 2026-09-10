@@ -1,3 +1,4 @@
+const { projectAppearance } = require('./project-appearance.cjs');
 // Cowork UI proxy server — zero-dependency Node http server.
 //
 // This server IS the app's backend:
@@ -2927,7 +2928,10 @@ async function handleRequestScoped(req, res) {
       }
       const name = String(body.name || '').trim().slice(0, 120);
       if (!name) return json(res, 400, { error: 'name required' });
+      let appearance;
+      try { appearance = projectAppearance(body); } catch (e) { return json(res, 400, { error: e.message }); }
       const project = {
+        ...appearance,
         id: `proj-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         name,
         goal: String(body.goal || '').slice(0, 2000),
@@ -3000,7 +3004,9 @@ async function handleRequestScoped(req, res) {
       }
       const storedProject = getProject(id);
       if (!storedProject) return json(res, 404, { error: 'no such project' });
-      const project = { ...storedProject };
+      let appearance;
+      try { appearance = projectAppearance(patch); } catch (e) { return json(res, 400, { error: e.message }); }
+      const project = { ...storedProject, ...appearance };
       if (typeof patch.name === 'string' && patch.name.trim()) project.name = patch.name.trim().slice(0, 120);
       if (typeof patch.goal === 'string') project.goal = patch.goal.slice(0, 2000);
       if (typeof patch.instructions === 'string') project.instructions = patch.instructions.slice(0, 8000);
