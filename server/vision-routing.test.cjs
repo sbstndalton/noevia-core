@@ -10,13 +10,13 @@ const { createVisionProbe } = require('./vision.cjs');
 const source = fs.readFileSync(path.join(__dirname, 'index.cjs'), 'utf8');
 const handler = source.slice(source.indexOf('async function handleChat('), source.indexOf('// ── Routing'));
 
-async function run({ visionModel, probeStatus = 200, descriptionStatus = 200, missingAsset = false } = {}) {
+async function run({ visionModel, probeStatus = 200, descriptionStatus = 200, missingAsset = false, finishReason = 'stop', cache = new Map(), headers = {}, replacementBytes, userId = 'synthetic-user', projectId = 'fixture-project' } = {}) {
   const events = [], requests = [];
   const res = new EventEmitter();
   res.writeHead = () => {};
   res.write = line => events.push(JSON.parse(line.slice(6)));
   res.end = () => { res.writableEnded = true; };
-  const bytes = fs.readFileSync(path.join(__dirname, 'fixtures/documents/statement.png'));
+  const bytes = replacementBytes || fs.readFileSync(path.join(__dirname, 'fixtures/documents/statement.png'));
   const fetch = async (url, opts) => {
     assert.equal(url, 'http://fixture.invalid/v1/chat/completions');
     const body = JSON.parse(opts.body); requests.push(body);
@@ -25,19 +25,19 @@ async function run({ visionModel, probeStatus = 200, descriptionStatus = 200, mi
     })() };
     if (body.max_tokens === 1) return new Response(probeStatus === 200 ? '{}' : 'provide the mmproj', { status: probeStatus });
     assert.equal(body.model, visionModel);
-    return new Response(JSON.stringify({ choices: [{ message: { content: 'Fixture image: invoice INV-2042 total 34.95' } }] }), { status: descriptionStatus });
+    return new Response(JSON.stringify({ choices: [{ finish_reason: finishReason, message: { content: 'Fixture image: invoice INV-2042 total 34.95' } }] }), { status: descriptionStatus });
   };
   const context = {
-    AbortController, AbortSignal, TextDecoder, console: { ...console, warn: () => {} }, path, fetch,
+    crypto: require('node:crypto'), AbortController, AbortSignal, TextDecoder, console: { ...console, warn: () => {} }, path, fetch,
     fs: { readFileSync: () => { if (missingAsset) throw new Error('missing fixture'); return bytes; } },
     HISTORY_CAP: 20, DEFAULT_PROVIDER_ID: 'default', createToolExchange,
-    currentWorkspace: () => ({ userId: 'synthetic-user', assetDir: () => '/synthetic-only' }),
-    getProject: () => ({ id: 'fixture-project', model: 'answer-model', assets: [
+    currentWorkspace: () => ({ userId, assetDir: () => '/synthetic-only' }),
+    getProject: () => ({ id: projectId, model: 'answer-model', assets: [
       { id: 'image-a', name: 'statement.png', mime: 'image/png' }, { id: 'image-b', name: 'copy.png', mime: 'image/png' },
     ] }),
     skillsIndexFor: () => [], getProvider: () => ({ id: 'default', baseUrl: 'http://fixture.invalid' }),
-    providerHeaders: () => ({}), autoRoles: () => visionModel ? { vision: visionModel } : null,
-    visionDescriptions: new Map(), visionProbe: createVisionProbe({ fetchImpl: fetch }),
+    providerHeaders: () => headers, autoRoles: () => visionModel ? { vision: visionModel } : null,
+    visionDescriptions: cache, visionProbe: createVisionProbe({ fetchImpl: fetch }),
     resolveTools: () => ({ tools: [], dropped: [] }), isWriteTool: () => true,
   };
   vm.createContext(context); vm.runInContext(handler, context);
@@ -74,8 +74,25 @@ test('failed description falls back to direct vision or an explicit unavailable 
   }
 });
 
-test('audit: missing asset bytes currently produce no user-facing image warning', async () => {
+test('missing asset bytes produce a user-facing warning and a no-guess instruction', async () => {
   const out = await run({ missingAsset: true });
-  assert.equal(out.events.some(e => e.type === 'warning'), false);
+  assert.match(out.events.find(e => e.type === 'warning').text, /missing.*statement.png/);
+  assert.match(out.answer.messages[0].content, /Do not guess/);
   assert.equal(JSON.stringify(out.answer).includes('data:image'), false);
+});
+
+test('truncated descriptions fall back to direct vision instead of presenting partial transcription as complete', async () => {
+  const out = await run({ visionModel: 'vision-model', finishReason: 'length' });
+  assert.equal(JSON.stringify(out.answer).includes('data:image'), true);
+});
+
+
+test('description cache reuses exact inputs but isolates credential, content, user and project changes', async () => {
+  const cache = new Map(); const opts = { cache, visionModel: 'vision-model' };
+  const descriptions = out => out.requests.filter(r => !r.stream && r.max_tokens !== 1).length;
+  assert.equal(descriptions(await run(opts)), 1);
+  assert.equal(descriptions(await run(opts)), 0);
+  for (const change of [{ headers: { Authorization: 'synthetic-new-credential' } }, { replacementBytes: Buffer.from('different synthetic bytes') }, { userId: 'other' }, { projectId: 'other' }]) {
+    assert.equal(descriptions(await run({ ...opts, ...change })), 1);
+  }
 });

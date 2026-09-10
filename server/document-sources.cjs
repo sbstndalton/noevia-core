@@ -29,7 +29,7 @@ async function ingest(workspace, projectId, name, bytes, previous) {
   if (!fs.existsSync(original)) writeOnce(original, bytes);
   const resultFile = versionPath(workspace, projectId, version, '.json');
   let out;
-  try { out = JSON.parse(fs.readFileSync(resultFile, 'utf8')); } catch {
+  try { out = JSON.parse(fs.readFileSync(resultFile, 'utf8')); if (out.retryable) throw new Error('retry OCR'); } catch {
     try { out = await documents.extractDocumentText(name, bytes); }
     catch (err) { out = { text: '', pages: 0, pageTexts: [], state: 'failed', truncated: false, error: err.message }; }
     writeOnce(resultFile, JSON.stringify(out));
@@ -51,7 +51,7 @@ function failed(previous, name, reason) {
 function problem(file) {
   const d = file.document;
   if (!d) return '';
-  const issues = (d.pageStatus || []).filter(p => !['native', 'blank'].includes(p.status));
+  const issues = (d.pageStatus || []).filter(p => !['native', 'blank', 'ocr'].includes(p.status));
   return `${d.state}${d.stale ? '; using STALE text from the last readable version' : ''}` +
     `${d.pages ? '; ' + d.pages + ' pages' : ''}${d.truncated ? '; summary/page extraction limits reached' : ''}` +
     `${issues.length ? '; incomplete pages ' + issues.slice(0, 20).map(p => p.number + ' (' + p.status + ')').join(', ') + (issues.length > 20 ? '…' : '') : ''}` +

@@ -140,3 +140,23 @@ test('document originals and pages are inaccessible to another authenticated use
     assert.equal((await request(docUrl(p.id, kind), { headers: { cookie: otherCookie } })).status, 404);
   }
 });
+
+
+test('background upload survives a short response and polling remains authenticated and project scoped', async () => {
+  const p = await project('Background synthetic upload');
+  const other = await project('Other background project');
+  const up = await post(`/api/projects/${p.id}/upload?background=1`, { name: 'statement.pdf', dataBase64: fixture('text.pdf').toString('base64') });
+  assert.equal(up.status, 202);
+  const { poll } = JSON.parse(up.text);
+  assert.equal((await request(poll)).status, 401);
+  assert.equal((await request(poll.replace(p.id, other.id), { headers: { cookie } })).status, 404);
+  let job;
+  for (let i = 0; i < 100; i++) {
+    job = JSON.parse((await request(poll, { headers: { cookie } })).text);
+    if (job.done) break;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  assert.equal(job.done, true); assert.equal(job.status, 200, JSON.stringify(job));
+  assert.equal(job.body.document.state, 'ready');
+  assert.deepEqual((await request(docUrl(p.id, 'original'), { headers: { cookie } })).bytes, fixture('text.pdf'));
+});

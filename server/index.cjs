@@ -2063,9 +2063,9 @@ async function handleChat(req, res, body, authn) {
   // this picture" and "what is the serial number in this picture" want
   // different descriptions of the same bytes.
   const describeImages = async (visionModel, baseUrl, headers, question) => {
-    const key = JSON.stringify([currentWorkspace().userId, baseUrl, visionModel, project.id, projectImages.map((a) => a.id), question]);
+    const key = crypto.createHash('sha256').update(JSON.stringify([currentWorkspace().userId, baseUrl, visionModel, project.id, headers, attachedImages, question])).digest('hex');
     const cached = visionDescriptions.get(key);
-    if (cached) return cached;
+    if (cached && cached.until > Date.now()) return cached.text;
     const url = `${String(baseUrl).replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`;
     const prompt = [
       'Describe these images in detail, so someone who cannot see them can answer questions about them.',
@@ -2079,7 +2079,7 @@ async function handleChat(req, res, body, authn) {
         headers: { 'Content-Type': 'application/json', ...headers },
         body: JSON.stringify({
           model: visionModel,
-          max_tokens: 900,
+          max_tokens: 4096,
           messages: [{ role: 'user', content: [{ type: 'text', text: prompt }, ...attachedImages] }],
         }),
         signal: AbortSignal.any([chatSignal.signal, AbortSignal.timeout(180000)]),
@@ -2091,8 +2091,8 @@ async function handleChat(req, res, body, authn) {
       }
       const body = await r.json();
       const text = String(body?.choices?.[0]?.message?.content || '').trim();
-      if (!text) return null;
-      visionDescriptions.set(key, text);
+      if (!text || body?.choices?.[0]?.finish_reason === 'length') return null;
+      visionDescriptions.set(key, { text, until: Date.now() + 300000 });
       // Bounded: descriptions are large and a long session must not grow
       // without limit.
       if (visionDescriptions.size > 64) {
@@ -2111,16 +2111,20 @@ async function handleChat(req, res, body, authn) {
   // conversation, and the model has already been told what it saw.
   const projectImages = project ? (project.assets || []) : [];
   let attachedImages = [];
+  const missingImages = [];
+  const loadedImageNames = [];
   if (projectImages.length) {
     const dir = currentWorkspace().assetDir(project.id);
     for (const asset of projectImages) {
       try {
         const bytes = fs.readFileSync(path.join(dir, asset.id));
+        loadedImageNames.push(asset.name);
         attachedImages.push({
           type: 'image_url',
           image_url: { url: `data:${asset.mime};base64,${bytes.toString('base64')}` },
         });
       } catch {
+        missingImages.push(asset.name);
         console.warn(`[assets] ${asset.id} is listed on project ${project.id} but its bytes are missing`);
       }
     }
@@ -2174,7 +2178,8 @@ async function handleChat(req, res, body, authn) {
   // so an unchecked attachment would turn "what is in this picture" into a
   // chat that never replies — and would do it to every message in the project,
   // not just the one asking about an image.
-  let visionWarning = '';
+  let visionWarning = missingImages.length ? `Images were not read because their stored files are missing: ${missingImages.join(', ')}. Re-upload them.` : '';
+  if (visionWarning) wire = [{ role: 'system', content: visionWarning + ' Do not guess their contents.' }, ...wire];
   if (attachedImages.length) {
     const roles = autoRoles();
     const visionModel = roles && roles.vision;
@@ -2189,7 +2194,7 @@ async function handleChat(req, res, body, authn) {
     }
 
     if (described) {
-      const note = `Description of this project's images (${projectImages.map((a) => a.name).join(', ')}), produced by ${visionModel}:\n${described}`;
+      const note = `Description of this project's images (${loadedImageNames.join(', ')}), produced by ${visionModel}:\n${described}`;
       wire = wire.map((m) => (m.role === 'system' ? { ...m, content: `${m.content}\n\n${note}` } : m));
       if (!sys) wire = [{ role: 'system', content: note }, ...wire];
       attachedImages = [];
@@ -2202,7 +2207,7 @@ async function handleChat(req, res, body, authn) {
         if (lastUser) {
           const text = typeof lastUser.content === 'string' ? lastUser.content : '';
           lastUser.content = [
-            { type: 'text', text: `${text}\n\n(Attached images: ${projectImages.map((a) => a.name).join(', ')})` },
+            { type: 'text', text: `${text}\n\n(Attached images: ${loadedImageNames.join(', ')})` },
             ...attachedImages,
           ];
         }
@@ -2211,8 +2216,8 @@ async function handleChat(req, res, body, authn) {
         // project holding images whose model cannot see them should not look
         // like the images were read and found uninteresting.
         attachedImages = [];
-        visionWarning = `Images were not read. ${vision.reason}`;
-        const blind = `This project has image sources (${projectImages.map((a) => a.name).join(', ')}) but image input is currently unavailable for ${model}: ${vision.reason}${visionModel ? '; the configured vision model also could not describe them' : ''}. Say so if asked about them; do not guess at their contents.`;
+        visionWarning += `${visionWarning ? ' ' : ''}Images were not read. ${vision.reason}`;
+        const blind = `This project has image sources (${loadedImageNames.join(', ')}) but image input is currently unavailable for ${model}: ${vision.reason}${visionModel ? '; the configured vision model also could not describe them' : ''}. Say so if asked about them; do not guess at their contents.`;
         wire = wire.map((m) => (m.role === 'system' ? { ...m, content: `${m.content}\n\n${blind}` } : m));
         if (!sys) wire = [{ role: 'system', content: blind }, ...wire];
       }
@@ -2534,6 +2539,28 @@ async function handleRequestScoped(req, res) {
     if (p.startsWith('/api/') && !publicAuthRoutes.has(p) && !authn) return unauthorized(res);
     if (authn && !['GET', 'HEAD', 'OPTIONS'].includes(req.method || 'GET') && (!authService.originValid(req) || !authService.csrfValid(req, authn))) {
       return json(res, 403, { error: 'invalid CSRF token' });
+    }
+    // Opt-in asynchronous source processing; the synchronous API remains compatible.
+    const sourceJob = p.match(/^\/api\/projects\/([^/]+)\/source-jobs\/([^/]+)$/);
+    if (sourceJob && req.method === 'GET') {
+      const projectId = decodeURIComponent(sourceJob[1]);
+      if (!getProject(projectId)) return json(res, 404, { error: 'project not found' });
+      const job = require('./source-jobs.cjs').read(currentWorkspace(), projectId, sourceJob[2]);
+      return json(res, job ? 200 : 404, job || { error: 'Processing status expired or the server restarted; refresh or re-upload to retry.' });
+    }
+    const backgroundSource = p.match(/^\/api\/projects\/([^/]+)\/(upload|documents|sources\/sync)$/);
+    if (backgroundSource && req.method === 'POST' && url.searchParams.get('background') === '1') {
+      const projectId = decodeURIComponent(backgroundSource[1]);
+      if (!getProject(projectId)) return json(res, 404, { error: 'project not found' });
+      const body = await readJson(req);
+      const jobId = require('./source-jobs.cjs').start(currentWorkspace(), projectId, async () => {
+        const inner = require('node:stream').Readable.from([Buffer.from(JSON.stringify(body))]);
+        Object.assign(inner, { method: req.method, url: p, headers: req.headers, socket: req.socket });
+        let status = 500, data = '';
+        await handleRequestScoped(inner, { setHeader() {}, writeHead(code) { status = code; }, end(value) { data = String(value || '{}'); } });
+        return { status, body: JSON.parse(data) };
+      });
+      return json(res, 202, { poll: `/api/projects/${encodeURIComponent(projectId)}/source-jobs/${jobId}` });
     }
     if (p === '/api/auth/session' && req.method === 'GET') {
       const csrfCookie = String(req.headers.cookie || '').split(';').map(x => x.trim()).find(x => x.startsWith('cowork_csrf='));
