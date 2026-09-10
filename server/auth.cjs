@@ -162,10 +162,11 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
     );
     INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(1, unixepoch() * 1000);
     INSERT OR IGNORE INTO user_features(user_id, diary_enabled, updated_at)
-      SELECT id, 1, unixepoch() * 1000 FROM users;
+      SELECT id, 1, unixepoch() * 1000 FROM users
+      WHERE NOT EXISTS (SELECT 1 FROM schema_migrations WHERE version=2);
     INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(2, unixepoch() * 1000);
   `);
-  // v3: per-user onboarding flag. Default 1 = pre-wizard (legacy, invited, or
+  // v3: per-user onboarding flag. Default 1 = pre-wizard (legacy or
   // already-completed) users are never bounced into the setup wizard; the
   // first-run wizard explicitly sets 0 for the account it creates and flips it
   // back to 1 when onboarding finishes. Column add is guarded because fresh
@@ -429,7 +430,7 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
         db.transaction(() => {
           db.prepare('INSERT INTO users(id,username,username_norm,display_name,role,password_hash,webauthn_user_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)')
             .run(id, body.username, body.username.toLowerCase(), String(body.displayName || body.username).slice(0,80), invite.role, passwordHash, randomToken(32), now, now);
-          db.prepare('INSERT INTO user_features(user_id,diary_enabled,updated_at) VALUES(?,?,?)')
+          db.prepare('INSERT INTO user_features(user_id,diary_enabled,onboarded,updated_at) VALUES(?,?,0,?)')
             .run(id, body.diaryEnabled ? 1 : 0, now);
           db.prepare('UPDATE invitations SET used_at=? WHERE token_hash=?').run(now, invite.token_hash);
         })();
@@ -487,6 +488,8 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       return db.prepare('SELECT insights_seen_at FROM user_features WHERE user_id=?').get(userId)?.insights_seen_at ?? null;
     },
     markOnboarded(userId) {
+      // Completion is not consent: preserve the latest stored choice atomically.
+      // With no feature row there is no recorded opt-in, so Diary stays off.
       db.prepare(`INSERT INTO user_features(user_id,diary_enabled,onboarded,updated_at) VALUES(?,?,1,?)
         ON CONFLICT(user_id) DO UPDATE SET onboarded=1,updated_at=excluded.updated_at`)
         .run(userId, 0, Date.now());
