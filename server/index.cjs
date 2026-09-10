@@ -648,18 +648,7 @@ const DOCUMENT_UPLOAD_CAP = 25 * 1024 * 1024;
 // where only noevia can reach them.
 const PROJECT_ROOT_FOLDER = (process.env.PROJECT_ROOT_FOLDER || 'noevia projects').replace(/^\/+|\/+$/g, '');
 
-// A folder name from a project name. Nextcloud tolerates most characters, but
-// the separator and the traversal forms cannot survive, and a trailing dot or
-// space is invisible and confusing.
-function projectFolderName(name, id) {
-  const cleaned = String(name || '')
-    .replace(/[\/\\:*?"<>|]/g, '-')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .replace(/^\.+|[.\s]+$/g, '')
-    .slice(0, 80);
-  return cleaned ? `${cleaned}--${id}` : id;
-}
+const { projectFolderName, createProjectFolder } = require('./project-folders.cjs');
 
 /** Whether `target` is a file this project may delete: one sitting directly in
  *  a folder the project has attached, including its own.
@@ -695,15 +684,10 @@ async function ensureProjectFolder(project) {
     return null;
   }
   if (!storageClient.isBrowsable(connection)) return null;
-  const folder = `${PROJECT_ROOT_FOLDER}/${projectFolderName(project.name, project.id)}`;
   try {
-    if (connection.kind !== 's3') {
-      await storageClient.createFolder(connection, PROJECT_ROOT_FOLDER);
-      await storageClient.createFolder(connection, folder);
-    }
-    return folder;
+    return await createProjectFolder(storageClient, connection, PROJECT_ROOT_FOLDER, project);
   } catch (err) {
-    console.warn(`[projects] could not create "${folder}": ${String((err && err.message) || err)}`);
+    console.warn(`[projects] could not create folder for project ${project.id}: ${String((err && err.message) || err)}`);
     return null;
   }
 }

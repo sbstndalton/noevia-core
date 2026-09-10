@@ -161,8 +161,8 @@ test('a file may be deleted from any attached folder, and nowhere else', () => {
 
 test('a project folder name survives characters a path cannot', () => {
   const { projectFolderName } = require('./index.cjs');
-  assert.equal(projectFolderName('Research: Q4/2026', 'p-1'), 'Research- Q4-2026--p-1');
-  assert.equal(projectFolderName('  ..  ', 'p-2'), 'p-2');       // nothing usable left
-  assert.equal(projectFolderName('trailing dot.', 'p-3'), 'trailing dot--p-3');
-  assert.equal(projectFolderName('', 'p-4'), 'p-4');
+  assert.equal(projectFolderName('Research: Q4/2026', 'p-1'), 'Research- Q4-2026');
+  assert.equal(projectFolderName('  ..  ', 'p-2'), 'Untitled project');       // nothing usable left
+  assert.equal(projectFolderName('trailing dot.', 'p-3'), 'trailing dot');
+  assert.equal(projectFolderName('', 'p-4'), 'Untitled project');
 });
