@@ -48,3 +48,21 @@ test('unverified output-budget rejection falls back once without breaking hint c
  assert.equal(response.status,200);assert.equal(requests.length,2);assert.equal(requests[1].max_tokens,undefined);
  assert.equal(requests[1].messages[0].content,'Think through this step by step before answering.');
 });
+
+
+test('configured local Qwen uses actual template thinking switches, preserves options and default', async()=>{
+ const prior={kind:process.env.MODEL_MANAGER_KIND,url:process.env.INFERENCE_BASE_URL};
+ process.env.MODEL_MANAGER_KIND='lemonade';process.env.INFERENCE_BASE_URL='http://synthetic-lemonade/v1';
+ try {
+  const p={id:'local',baseUrl:process.env.INFERENCE_BASE_URL};
+  const b={...body,model:'Qwen3.5-9B-GGUF-UD-Q4_K_XL',chat_template_kwargs:{custom:'keep'}};
+  assert.equal(modeFor(p,b.model,'high'),'real');
+  assert.deepEqual(requestBody(b,'high','real',p).chat_template_kwargs,{custom:'keep',enable_thinking:true});
+  assert.equal(requestBody(b,'low','real',p).chat_template_kwargs.enable_thinking,false);
+  assert.equal(requestBody(b,'default','off',p),b);
+  assert.equal(modeFor({...p,baseUrl:'http://another-host/v1'},b.model,'high'),'hint');
+  assert.equal(modeFor(p,'Gemma-unverified','high'),'hint');
+  const sent=[];await requestWithEffort(async(_,opts)=>{sent.push(JSON.parse(opts.body));return new Response('{}');},p.baseUrl,{},b,p,b.model,'low',()=>{});
+  assert.equal(sent[0].chat_template_kwargs.enable_thinking,false);assert.equal(sent[0].reasoning_effort,undefined);
+ } finally {for(const [key,val] of [['MODEL_MANAGER_KIND',prior.kind],['INFERENCE_BASE_URL',prior.url]]){if(val===undefined)delete process.env[key];else process.env[key]=val;}}
+});
