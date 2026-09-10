@@ -12,7 +12,7 @@ const { createToolExchange } = require('./tool-exchange.cjs');
 const source = fs.readFileSync(require.resolve('./index.cjs'), 'utf8');
 const handler = source.slice(source.indexOf('async function handleChat('), source.indexOf('// ── Routing'));
 
-function fixture({ rounds, decision = 'approve', execute, fallback = false, cancel = false } = {}) {
+function fixture({ rounds, decision = 'approve', execute, fallback = false, cancel = false, effort } = {}) {
   const events = [], executions = [], approvals = [], requests = [], audits = [];
   let round = 0, allApproved = false;
   const res = new EventEmitter();
@@ -24,11 +24,12 @@ function fixture({ rounds, decision = 'approve', execute, fallback = false, canc
     return rounds[round++] || [];
   }
   const context = {
-    AbortController, TextDecoder, console, createToolExchange,
+    reasoningEffort: require('./reasoning-effort.cjs'),
+    AbortController, AbortSignal, TextDecoder, console, createToolExchange,
     crypto: require('node:crypto'), HISTORY_CAP: 20, DEFAULT_PROVIDER_ID: 'default',
     currentWorkspace: () => ({ userId: 'synthetic-user' }),
     requestScope: { getStore: () => ({ workspace: { userId: 'synthetic-user' } }) },
-    getProject: (id) => ({ id, model: 'synthetic-model' }),
+    getProject: (id) => ({ id, model: 'synthetic-model', reasoningEffort: effort }),
     skillsIndexFor: () => [], getProvider: () => ({ id: 'default', baseUrl: 'http://fixture.invalid', label: 'Mock' }),
     providerHeaders: () => ({}),
     resolveTools: () => ({ tools: ['read', 'write'].map(name => ({ function: { name } })), dropped: [] }),
@@ -48,7 +49,8 @@ function fixture({ rounds, decision = 'approve', execute, fallback = false, canc
     },
     fetch: async (url, options) => {
       assert.equal(url, 'http://fixture.invalid/v1/chat/completions');
-      if (fallback) return { ok: true, body: (async function* () {})() };
+      if (fallback && JSON.parse(options.body).stream) return { ok: true, body: (async function* () {})() };
+      if (fallback) { const calls=completion(options); return {ok:true,status:200,json:async()=>({choices:[{message:{tool_calls:calls.map(tc=>({id:tc.id,function:{name:tc.name,arguments:tc.args}}))}}]})}; }
       const calls = completion(options);
       // Split both argument deltas and SSE transport chunks.
       const deltas = calls.flatMap((tc, index) => [
@@ -194,4 +196,15 @@ test('failed reads reuse their error until an attempted write allows a fresh rea
     execute: name => name === 'read' ? 'ERROR: temporarily unavailable' : 'written' });
   await f.run();
   assert.equal(f.executions.filter(c => c.name === 'read').length, 2);
+});
+
+for (const fallback of [false,true]) test(`high hints reach every real handler tool round and fallback body (${fallback})`, async()=>{
+  const result=fixture({effort:'high',fallback,rounds:[[{id:'r1',name:'read',args:'{}'}],[]]});
+  await result.run();
+  assert.ok(result.requests.length >= 2);
+  for(const request of result.requests){
+    assert.equal(request.max_tokens,8192);
+    assert.equal(request.reasoning_effort,undefined);
+    assert.equal(request.messages[0].content,'Think through this step by step before answering.');
+  }
 });

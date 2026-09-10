@@ -1,3 +1,4 @@
+const reasoningEffort = require('./reasoning-effort.cjs');
 const diaryExtras = require('./diary-extras.cjs');
 const { projectAppearance } = require('./project-appearance.cjs');
 // Cowork UI proxy server — zero-dependency Node http server.
@@ -2177,6 +2178,7 @@ async function handleChat(req, res, body, authn) {
   // providers like OpenRouter use https://host/api/v1).
   const upstreamUrl = `${provider.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`;
   const upstreamHeaders = providerHeaders(provider);
+  const effort = reasoningEffort.resolveEffort(project, authService?.db?.prepare("SELECT value FROM settings WHERE key='reasoning_effort_default'").get()?.value);
 
   // SSRF guard for member-registered providers (see the /api/providers POST
   // guard): a member must not reach internal addresses through a chat pinned
@@ -2286,24 +2288,10 @@ async function handleChat(req, res, body, authn) {
     roundStartedAt = Date.now();
     roundFirstTokenMs = 0;
     try {
-      upstream = await fetch(upstreamUrl, {
-        method: 'POST',
-        headers: upstreamHeaders,
-        // include_usage adds one final chunk carrying token counts (and, on
-        // llama.cpp, timings) after the content is done. It is the only way to
-        // report real usage for a streamed reply instead of guessing from
-        // character counts client-side. Providers that do not know the field
-        // ignore it; the chunk simply never arrives and the UI omits the stats.
-        body: JSON.stringify({
-          model,
-          messages: roundMessages,
-          stream: true,
-          stream_options: { include_usage: true },
-          ...(activeTools.length ? { tools: activeTools } : {}),
-        }),
-        signal: chatSignal.signal,
-        redirect: 'error', // see the provider test route: no inward bounces
-      });
+      upstream = await reasoningEffort.requestWithEffort(fetch, upstreamUrl, {
+        method: 'POST', headers: upstreamHeaders, signal: chatSignal.signal, redirect: 'error',
+      }, {model,messages:roundMessages,stream:true,stream_options:{include_usage:true},
+        ...(activeTools.length ? {tools:activeTools} : {})}, provider, model, effort, send);
     } catch (err) {
       if (chatSignal.signal.aborted) break; // client went away; stop quietly
 
@@ -2410,11 +2398,10 @@ async function handleChat(req, res, body, authn) {
     // non-streaming retry is safe for generation (no side effects, unlike diary).
     if (!sawAnything) {
       try {
-        const full = await fetchJson(
-          upstreamUrl,
-          { method: 'POST', headers: upstreamHeaders, body: JSON.stringify({ model, messages: roundMessages, ...(activeTools.length ? { tools: activeTools } : {}) }), signal: chatSignal.signal },
-          300000,
-        );
+        const response = await reasoningEffort.requestWithEffort(fetch, upstreamUrl, {
+          method:'POST',headers:upstreamHeaders,signal:AbortSignal.any([chatSignal.signal,AbortSignal.timeout(300000)]),redirect:'error',
+        }, {model,messages:roundMessages,stream:false,...(activeTools.length ? {tools:activeTools} : {})}, provider, model, effort, send);
+        const full = {ok:response.ok,status:response.status,body:await response.json()};
         if (!full.ok) throw new Error(`Provider returned ${full.status}`);
         const msg = full.body?.choices?.[0]?.message;
         if (msg?.reasoning_content) { roundReasoning += msg.reasoning_content; send({ type: 'reasoning', text: msg.reasoning_content }); }
@@ -2980,6 +2967,26 @@ async function handleRequestScoped(req, res) {
         timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'server local time',
       });
     }
+    if (p === '/api/reasoning-settings') {
+      const globalDefault = () => authService.db.prepare("SELECT value FROM settings WHERE key='reasoning_effort_default'").get()?.value || 'default';
+      if (req.method === 'GET') {
+        const project = url.searchParams.has('projectId') ? getProject(url.searchParams.get('projectId')) : null;
+        if (url.searchParams.has('projectId') && !project) return json(res,404,{error:'no such project'});
+        const effort = reasoningEffort.resolveEffort(project,globalDefault());
+        const provider = getProvider(project?.provider || DEFAULT_PROVIDER_ID);
+        return json(res,200,{default:globalDefault(),effort,mode:reasoningEffort.modeFor(provider,project?.model || '',effort),admin:authn.user.role === 'admin'});
+      }
+      if (req.method === 'PUT') {
+        if (authn.user.role !== 'admin') return json(res,403,{error:'Administrator required'});
+        let body; try { body = JSON.parse(await readBody(req)); } catch { return json(res,400,{error:'invalid JSON'}); }
+        if (!reasoningEffort.validEffort(body.default)) return json(res,400,{error:'default must be default, low or high'});
+        authService.db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('reasoning_effort_default',?)").run(body.default);
+        authService.audit('reasoning.default',authn.user.id,null,{effort:body.default});
+        return json(res,200,{default:body.default});
+      }
+      return json(res,405,{error:'Method not allowed'});
+    }
+
     if (p === '/api/auto-roles') {
       if (req.method === 'GET') {
         const roles = autoRoles();
@@ -3034,6 +3041,7 @@ async function handleRequestScoped(req, res) {
       } catch {
         return json(res, 400, { error: 'invalid JSON' });
       }
+      if (body.reasoningEffort !== undefined && !reasoningEffort.validEffort(body.reasoningEffort)) return json(res,400,{error:'Invalid reasoning effort'});
       const name = String(body.name || '').trim().slice(0, 120);
       if (!name) return json(res, 400, { error: 'name required' });
       let appearance;
@@ -3056,6 +3064,7 @@ async function handleRequestScoped(req, res) {
           : [],
         model: typeof body.model === 'string' && body.model ? body.model : undefined,
         provider: typeof body.provider === 'string' && body.provider ? body.provider : undefined,
+        reasoningEffort: body.reasoningEffort,
         routing: body.routing === 'auto' ? 'auto' : 'manual', // default manual (step 12 guardrail)
         toolboxes: sanitizeToolboxes(body.toolboxes) || [...DEFAULT_TOOLBOXES], // step 14: core only by default
         // (files normalization below is shared with the config route's RAG bookkeeping)
@@ -3116,7 +3125,10 @@ async function handleRequestScoped(req, res) {
       if (!storedProject) return json(res, 404, { error: 'no such project' });
       let appearance;
       try { appearance = projectAppearance(patch); } catch (e) { return json(res, 400, { error: e.message }); }
+      if (patch.reasoningEffort !== undefined && patch.reasoningEffort !== null && !reasoningEffort.validEffort(patch.reasoningEffort)) return json(res,400,{error:'Invalid reasoning effort'});
       const project = { ...storedProject, ...appearance };
+      if (patch.reasoningEffort === null) delete project.reasoningEffort;
+      else if (patch.reasoningEffort !== undefined) project.reasoningEffort = patch.reasoningEffort;
       if (typeof patch.name === 'string' && patch.name.trim()) project.name = patch.name.trim().slice(0, 120);
       if (typeof patch.goal === 'string') project.goal = patch.goal.slice(0, 2000);
       if (typeof patch.instructions === 'string') project.instructions = patch.instructions.slice(0, 8000);
