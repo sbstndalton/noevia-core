@@ -257,3 +257,11 @@ test('refresh migrates legacy local images into managed storage without losing t
   assert.equal(h.project.assets.length, 1); assert.equal(h.project.assets[0].storagePath, 'fixture/Images/fixture-img-legacy.png');
   assert.equal(h.project.files.length, 1);
 });
+
+
+test('refresh retains unified batches larger than the retired 40-source folder cap', async () => {
+  const h = harness(true);
+  for (let i=0; i<41; i++) assert.equal((await h.upload(`fixture-${i}.bin`, Buffer.from('synthetic'), h.project.id, true)).status, 200);
+  const out = await h.sync(); assert.equal(out.status, 200);
+  assert.equal(h.project.files.length, 41); assert.equal(out.body.skipped.length, 0);
+});

@@ -3472,6 +3472,7 @@ async function handleRequestScoped(req, res) {
         if (getProject(id) !== project) return json(res, 409, { error: 'Project changed; retry.' });
         const connection = authService.getStorage(authn.user.id, true);
         const fromFolders = [];
+        const sourceLimit = Math.max(0, 60 - (project.files || []).filter(f => !f.source).length);
         const skipped = [];
         if (storageClient.isBrowsable(connection) && (project.assets || []).some(a => !a.sourceName)) {
           if (!project.projectFolder) project.projectFolder = await ensureProjectFolder(project);
@@ -3520,7 +3521,7 @@ async function handleRequestScoped(req, res) {
             const isDoc = documents.isDocument(entry.name);
             const managed = folder === project.projectFolder && require('./uploads.cjs').GROUPS.some(g => entry.path.startsWith(`${folder}/${g}/`));
             if (!isText && !isDoc && !managed) continue;
-            if (fromFolders.length >= 40) { skipped.push({ folder, file: entry.path, reason: '40-source refresh limit reached; this file was not read.', retained: false }); continue; } // a cap, so one big folder cannot blow up a project
+            if (fromFolders.length >= sourceLimit) { skipped.push({ folder, file: entry.path, reason: '60-source project limit reached; this file was not read.', retained: false }); continue; } // a cap, so one big folder cannot blow up a project
             try {
               if (managed) {
                 const bytes = await storageClient.readBinaryFile(connection, entry.path);
