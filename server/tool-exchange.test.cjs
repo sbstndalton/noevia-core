@@ -12,7 +12,7 @@ const { createToolExchange } = require('./tool-exchange.cjs');
 const source = fs.readFileSync(require.resolve('./index.cjs'), 'utf8');
 const handler = source.slice(source.indexOf('async function handleChat('), source.indexOf('// ── Routing'));
 
-function fixture({ rounds, decision = 'approve', execute, fallback = false, cancel = false, effort } = {}) {
+function fixture({ rounds, decision = 'approve', execute, fallback = false, cancel = false, effort, reasoningOnly = false } = {}) {
   const events = [], executions = [], approvals = [], requests = [], audits = [];
   let round = 0, allApproved = false;
   const res = new EventEmitter();
@@ -50,14 +50,14 @@ function fixture({ rounds, decision = 'approve', execute, fallback = false, canc
     fetch: async (url, options) => {
       assert.equal(url, 'http://fixture.invalid/v1/chat/completions');
       if (fallback && JSON.parse(options.body).stream) return { ok: true, body: (async function* () {})() };
-      if (fallback) { const calls=completion(options); return {ok:true,status:200,json:async()=>({choices:[{message:{tool_calls:calls.map(tc=>({id:tc.id,function:{name:tc.name,arguments:tc.args}}))}}]})}; }
+      if (fallback) { const calls=completion(options); return {ok:true,status:200,json:async()=>({choices:[{message:{...(reasoningOnly && !calls.length ? {reasoning_content:'Synthetic internal plan: maybe search, then consider alternatives.'} : {}),tool_calls:calls.map(tc=>({id:tc.id,function:{name:tc.name,arguments:tc.args}}))}}]})}; }
       const calls = completion(options);
       // Split both argument deltas and SSE transport chunks.
       const deltas = calls.flatMap((tc, index) => [
         { index, id: tc.id, function: { name: tc.name, arguments: tc.args.slice(0, 2) } },
         { index, function: { arguments: tc.args.slice(2) } },
       ]);
-      const wire = !calls.length ? 'data: ' + JSON.stringify({ choices: [{ delta: { content: 'Finished.' } }] }) + '\n\n' : deltas.map(tc => 'data: ' + JSON.stringify({ choices: [{ delta: { tool_calls: [tc] } }] }) + '\n\n').join('');
+      const wire = !calls.length ? 'data: ' + JSON.stringify({ choices: [{ delta: { ...(reasoningOnly ? {reasoning_content:'Synthetic internal plan: maybe search, then consider alternatives.'} : {content:'Finished.'}) } }] }) + '\n\n' : deltas.map(tc => 'data: ' + JSON.stringify({ choices: [{ delta: { tool_calls: [tc] } }] }) + '\n\n').join('');
       return { ok: true, body: (async function* () {
         yield Buffer.from(wire.slice(0, 17)); yield Buffer.from(wire.slice(17));
       })() };
@@ -207,4 +207,18 @@ for (const fallback of [false,true]) test(`high hints reach every real handler t
     assert.equal(request.reasoning_effort,undefined);
     assert.equal(request.messages[0].content,'Think through this step by step before answering.');
   }
+});
+
+for(const fallback of [false,true])test(`reasoning-only output stays separate from the final answer (${fallback})`,async()=>{
+ const f=fixture({fallback,reasoningOnly:true,rounds:[[],[]]});await f.run();
+ assert.ok(f.events.some(e=>e.type==='reasoning' && e.text.includes('Synthetic internal plan')));
+ const final=f.events.filter(e=>e.type==='delta').map(e=>e.text).join('');
+ assert.ok(final.includes('without a final answer'));
+ assert.ok(!final.includes('Synthetic internal plan'));
+});
+test('reasoning-only tool continuation preserves completed tool results without promoting narration',async()=>{
+ const f=fixture({reasoningOnly:true,rounds:[[call('read1','read','{}')],[]]});await f.run();
+ assert.equal(f.executions.length,1);assert.ok(f.events.some(e=>e.type==='tool_result'));
+ assert.ok(f.events.some(e=>e.type==='delta'&&e.text.includes('without a final answer')));
+ assert.ok(!f.events.some(e=>e.type==='delta'&&e.text.includes('Synthetic internal plan')));
 });

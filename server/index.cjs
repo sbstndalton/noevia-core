@@ -2275,12 +2275,9 @@ async function handleChat(req, res, body, authn) {
   // range of prompt sizes than the first round ever would.
   let roundStartedAt = 0;
   let roundFirstTokenMs = 0;
-  // After a tool result, a reasoning model often emits its whole continuation
-  // on the reasoning channel and never opens a content block — the answer is
-  // real and correct, it is just filed as thinking. Rendering that as an empty
-  // reply with a collapsed "Thought process" makes tool calling look broken.
-  // Track both so the stream can never end with nothing shown.
-  let sentContent = false;
+  // Track final-answer content separately for each round. Reasoning may contain
+  // internal planning or unfinished narration; it is never promoted to an answer.
+  let roundHasContent = false;
   let roundReasoning = '';
   let toolOffset = 0;
   for (let round = 0; round < 3 && !chatSignal.signal.aborted; round++) {
@@ -2309,6 +2306,7 @@ async function handleChat(req, res, body, authn) {
     const toolCalls = new Map(); // index -> {id, name, args}
     let sawAnything = false;
     roundReasoning = '';
+    roundHasContent = false;
     // SSE line reassembly must live outside the chunk loop so a `data: {...}`
     // line split across a chunk boundary keeps its leading fragment
     // (same pattern as the client-side reader in src/api.ts).
@@ -2362,7 +2360,7 @@ async function handleChat(req, res, body, authn) {
             }
             if (delta.content) {
               sawAnything = true;
-              sentContent = true;
+              roundHasContent = true;
               send({ type: 'delta', text: delta.content });
             }
             if (Array.isArray(delta.tool_calls)) {
@@ -2405,7 +2403,7 @@ async function handleChat(req, res, body, authn) {
         if (!full.ok) throw new Error(`Provider returned ${full.status}`);
         const msg = full.body?.choices?.[0]?.message;
         if (msg?.reasoning_content) { roundReasoning += msg.reasoning_content; send({ type: 'reasoning', text: msg.reasoning_content }); }
-        if (msg?.content) { sentContent = true; send({ type: 'delta', text: msg.content }); }
+        if (msg?.content) { roundHasContent = true; send({ type: 'delta', text: msg.content }); }
         if (Array.isArray(msg?.tool_calls)) {
           for (const tc of msg.tool_calls) {
             const index = toolCalls.size;
@@ -2483,12 +2481,8 @@ async function handleChat(req, res, body, authn) {
   }
 
   if (chatSignal.signal.aborted) return; // client gone — nothing more to write
-  // Nothing was ever emitted as content, but the model did think — most often
-  // after a tool result, where the continuation arrives entirely on the
-  // reasoning channel. The thinking IS the answer in that case, so promote it
-  // rather than leaving the user with a tool chip and an empty bubble.
-  if (!sentContent && roundReasoning.trim()) {
-    send({ type: 'delta', text: roundReasoning.trim() });
+  if (!roundHasContent && roundReasoning.trim()) {
+    send({ type: 'delta', text: '\n\nThe model returned reasoning without a final answer. Try again or choose another model.' });
   }
   send({ type: 'done', model });
   res.end();
