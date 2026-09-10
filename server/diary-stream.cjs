@@ -1,5 +1,5 @@
 // Keep the browser/proxy connection alive throughout one journaled operation.
-async function proxyDiaryStream(res, url, options, { heartbeatMs = 5000 } = {}) {
+async function proxyDiaryStream(res, url, options, { heartbeatMs = 5000, onEvent } = {}) {
   const controller = new AbortController();
   const close = () => { if (!res.writableEnded) controller.abort(); };
   res.on('close', close);
@@ -21,7 +21,9 @@ async function proxyDiaryStream(res, url, options, { heartbeatMs = 5000 } = {}) 
         let boundary;
         // Heartbeats must never be inserted inside a fragmented JSON event.
         while ((boundary = buffer.indexOf('\n\n')) !== -1) {
-          res.write(buffer.slice(0,boundary + 2));
+          const frame=buffer.slice(0,boundary + 2);
+          if(onEvent){try{const line=frame.split('\n').find(l=>l.startsWith('data: '));if(line)onEvent(JSON.parse(line.slice(6)));}catch{ /* Optional telemetry must never break diary capture. */ }}
+          res.write(frame);
           buffer = buffer.slice(boundary + 2);
         }
       }

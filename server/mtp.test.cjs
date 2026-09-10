@@ -26,3 +26,12 @@ test('quoted argument values containing flag text are preserved verbatim',()=>{
  const options=loadOptions({...model,recipe_options:{llamacpp_args:args}},true);
  assert.equal(options.llamacpp_args,'--chat-template "literal --spec-type none text"  --tensor-split 1,1 --spec-type draft-mtp');
 });
+test('older backend response timings provide a tenant/model-scoped last-response fallback',()=>{
+ const {record}=require('./mtp.cjs');record('owner','native',{draft_n:40,draft_n_accepted:30});
+ assert.equal(acceptance('',[loaded],[model],'owner')[0].rate,.75);
+ assert.equal(acceptance('',[loaded],[model],'owner')[0].source,'last response');
+ assert.equal(acceptance('',[loaded],[model],'other')[0].rate,null);
+ assert.equal(acceptance(metrics(100,50),[loaded],[model],'owner')[0].rate,.5);
+ record('owner','native',{draft_n:0,draft_n_accepted:0});
+ assert.equal(acceptance('',[loaded],[model],'owner')[0].rate,null);
+});

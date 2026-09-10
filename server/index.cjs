@@ -2044,7 +2044,7 @@ async function handleChat(req, res, body, authn) {
       method: 'POST', headers: diaryHeaders(), body: JSON.stringify({stream:true, diary_events:true, messages:msgs,
         session_id:body.sessionId, entryTime:body.entryTime, entryDay:body.entryDay,
         extrasEnabled:body.extrasEnabled === true, extraContext:diaryExtras.reference(body)})
-    });
+    }, {onEvent:event=>{if(event.type==='mtp')require('./mtp.cjs').record(chatWorkspace?.userId,event.model,event.timings);}});
   }
 
   // ── Ordinary space / project chat: routed via the project's provider ──
@@ -2307,6 +2307,7 @@ async function handleChat(req, res, body, authn) {
           if (payload === '[DONE]') continue;
           try {
             const evt = JSON.parse(payload);
+            require('./mtp.cjs').record(chatWorkspace?.userId,model,evt.timings);
             // The include_usage chunk carries no choices — only totals. Emit it
             // as its own event so the client can label the finished reply.
             if (evt.usage) {
@@ -2385,6 +2386,7 @@ async function handleChat(req, res, body, authn) {
         }, {model,messages:roundMessages,stream:false,...(activeTools.length ? {tools:activeTools} : {})}, provider, model, effort, send);
         const full = {ok:response.ok,status:response.status,body:await response.json()};
         if (!full.ok) throw new Error(`Provider returned ${full.status}`);
+        require('./mtp.cjs').record(chatWorkspace?.userId,model,full.body?.timings);
         const msg = full.body?.choices?.[0]?.message;
         if (msg?.reasoning_content) { roundReasoning += msg.reasoning_content; send({ type: 'reasoning', text: msg.reasoning_content }); }
         if (msg?.content) { roundHasContent = true; send({ type: 'delta', text: msg.content }); }
@@ -2893,7 +2895,7 @@ async function handleRequestScoped(req, res) {
       const s = sys.status === 'fulfilled' && sys.value.ok ? sys.value.body : {};
       return json(res, 200, {
         up: gen.status === 'fulfilled' && gen.value.ok,
-        mtp: require('./mtp.cjs').acceptance(mtpMetrics.status === 'fulfilled' && mtpMetrics.value.ok ? mtpMetrics.value.body : '', mtpHealth.status === 'fulfilled' && mtpHealth.value.ok ? mtpHealth.value.body.all_models_loaded : [], mtpModels.status === 'fulfilled' && mtpModels.value.ok ? mtpModels.value.body.data : []),
+        mtp: require('./mtp.cjs').acceptance(mtpMetrics.status === 'fulfilled' && mtpMetrics.value.ok ? mtpMetrics.value.body : '', mtpHealth.status === 'fulfilled' && mtpHealth.value.ok ? mtpHealth.value.body.all_models_loaded : [], mtpModels.status === 'fulfilled' && mtpModels.value.ok ? mtpModels.value.body.data : [], currentWorkspace().userId),
         tokensPerSecond: reportedTokenRate(g),
         timeToFirstToken: typeof g.time_to_first_token === 'number' ? g.time_to_first_token : null,
         inputTokens: typeof g.input_tokens === 'number' ? g.input_tokens : null,
@@ -3798,7 +3800,7 @@ async function handleRequestScoped(req, res) {
       if (local && JSON.parse(body).stream === true) {
         return require('./diary-stream.cjs').proxyDiaryStream(res, `${DIARY_BASE}/api${suffix}`, {
           method:'POST', headers:diaryHeaders(), body,
-        });
+        }, {onEvent:event=>{if(event.type==='mtp')require('./mtp.cjs').record(authn.user.id,event.model,event.timings);}});
       }
       const r = await fetchJson(`${DIARY_BASE}/api${suffix}`, { method: req.method, headers: diaryHeaders(), body }, local ? 600000 : 60000);
       return json(res, r.status, r.ok ? r.body : { error: r.body?.detail || r.body?.error || 'Diary storage request failed' });

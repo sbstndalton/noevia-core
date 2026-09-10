@@ -52,7 +52,7 @@ function loadOptions(model, enabled) {
   options.llamacpp_args=`${args} --spec-type ${enabled?'draft-mtp':'none'}`.trim();
   return options;
 }
-function acceptance(metrics, models, installed=[]) {
+function acceptance(metrics, models, installed=[], owner) {
   const rows=[];
   for(const m of models || []) {
     const registered=installed.find(row=>(row.id || row.model_name)===m.model_name);
@@ -70,8 +70,19 @@ function acceptance(metrics, models, installed=[]) {
     }
     const drafted=counters.draft,accepted=counters.accepted;
     const rate=Number.isFinite(drafted)&&drafted>0&&Number.isFinite(accepted)&&accepted<=drafted ? accepted/drafted : null;
-    rows.push({model:m.model_name,rate,drafted:drafted??null,accepted:accepted??null});
+    const last=samples.get(`${owner}:${m.model_name}`);
+    const fallback=last && Date.now()-last.at < 10*60*1000 ? last : null;
+    rows.push(rate===null && fallback ? {model:m.model_name,rate:fallback.accepted/fallback.drafted,drafted:fallback.drafted,accepted:fallback.accepted,source:'last response'} : {model:m.model_name,rate,drafted:drafted??null,accepted:accepted??null,source:'backend total'});
   }
   return rows;
 }
-module.exports={capability,loadOptions,acceptance,specType};
+const samples=new Map();
+function record(owner,model,timings) {
+  const drafted=timings?.draft_n,accepted=timings?.draft_n_accepted;
+  if(!owner || typeof model!=='string' || !model || drafted===undefined)return;
+  const key=`${owner}:${model}`;
+  if(!Number.isFinite(drafted) || drafted<=0 || !Number.isFinite(accepted) || accepted<0 || accepted>drafted){samples.delete(key);return;}
+  samples.delete(key);samples.set(key,{drafted,accepted,at:Date.now()});
+  while(samples.size>200)samples.delete(samples.keys().next().value);
+}
+module.exports={capability,loadOptions,acceptance,specType,record};

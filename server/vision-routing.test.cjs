@@ -29,6 +29,7 @@ async function run({ visionModel, probeStatus = 200, descriptionStatus = 200, mi
     return new Response(JSON.stringify({ choices: [{ finish_reason: finishReason, message: { content: 'Fixture image: invoice INV-2042 total 34.95' } }] }), { status: descriptionStatus });
   };
   const context = {
+    require,
     reasoningEffort: require('./reasoning-effort.cjs'),
     authService: {},
     crypto: require('node:crypto'), AbortController, AbortSignal, TextDecoder, console: { ...console, warn: () => {} }, path, fetch,
