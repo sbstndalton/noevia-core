@@ -2538,7 +2538,7 @@ async function handleRequestScoped(req, res) {
     if (backgroundSource && req.method === 'POST' && url.searchParams.get('background') === '1') {
       const projectId = decodeURIComponent(backgroundSource[1]);
       if (!getProject(projectId)) return json(res, 404, { error: 'project not found' });
-      const body = JSON.parse(await readBody(req, Math.ceil(DOCUMENT_UPLOAD_CAP / 3) * 4 + 512 * 1024));
+      const body = JSON.parse(await readBody(req, Math.ceil((backgroundSource[2] === 'upload' ? require('./pdf-reduce.cjs').INPUT_CAP : DOCUMENT_UPLOAD_CAP) / 3) * 4 + 512 * 1024));
       const jobId = require('./source-jobs.cjs').start(currentWorkspace(), projectId, async (progress) => {
         const inner = require('node:stream').Readable.from([Buffer.from(JSON.stringify(body))]);
         Object.assign(inner, { method: req.method, url: p, headers: req.headers, socket: req.socket });
@@ -3312,7 +3312,7 @@ async function handleRequestScoped(req, res) {
       if (!project) return json(res, 404, { error: 'no such project' });
       let body;
       try {
-        body = JSON.parse(await readBody(req, Math.ceil(DOCUMENT_UPLOAD_CAP / 3) * 4 + 512 * 1024));
+        body = JSON.parse(await readBody(req, Math.ceil(require('./pdf-reduce.cjs').INPUT_CAP / 3) * 4 + 512 * 1024));
       } catch (e) {
         if (e && e.status === 413) return json(res, 413, { error: `That file is larger than the ${Math.round(DOCUMENT_UPLOAD_CAP / (1024 * 1024))} MB limit.` });
         return json(res, 400, { error: 'invalid JSON' });
@@ -3322,20 +3322,24 @@ async function handleRequestScoped(req, res) {
       const isText = storageClient.TEXT_EXTENSIONS.has((rawName.slice(rawName.lastIndexOf('.')) || '').toLowerCase());
       if (body.organized === true) {
         const uploads = require('./uploads.cjs');
-        const name = String(body.name || '');
-        const bytes = Buffer.from(String(body.dataBase64 || ''), 'base64');
-        uploads.validate(name, bytes);
+        const inputName = String(body.name || '');
+        const inputBytes = Buffer.from(String(body.dataBase64 || ''), 'base64');
+        // Validate the filename before contacting the document processor.
+        uploads.validate(inputName, inputBytes.subarray(0,1));
         return await withSourceLock(project, async () => {
           if (getProject(id) !== project) return json(res, 409, { error: 'Project changed; retry.' });
           const connection = authService.getStorage(authn.user.id, true);
           const remote = storageClient.isBrowsable(connection) ? connection : null;
           const progress = requestScope.getStore()?.sourceProgress || (() => {});
+          const {name,bytes,reduction} = await require('./pdf-reduce.cjs').prepare(inputName,inputBytes,{progress});
+          uploads.validate(name,bytes);
           if (remote && !project.projectFolder) {
             progress('Creating upload folder');
             project.projectFolder = await ensureProjectFolder(project);
             if (!project.projectFolder) return json(res, 502, { error: 'Could not create the storage folder; retry.' });
           }
           const file = await uploads.ingest(currentWorkspace(), project, name, bytes, { connection: remote, progress });
+          if(reduction){file.attachment.reduction=reduction;file.attachment.reason=[file.attachment.reason,reduction.note].filter(Boolean).join(' ');}
           if (getProject(id) !== project) return json(res, 409, { error: 'Project removed during upload.' });
           if (remote) project.sourceFolders = [...new Set([...(project.sourceFolders || []), project.projectFolder])];
           project.files = [...(project.files || []).filter(f => f.name !== file.name), file];
