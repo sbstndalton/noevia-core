@@ -74,6 +74,8 @@ const authService = createAuth({
     .map((s) => s.trim())
     .filter(Boolean),
 });
+const davConfig = require('./dav-settings.cjs').configuration(process.env, authService.origin);
+const davSettings = require('./dav-settings.cjs').createDavSettings({ auth: authService, config: davConfig });
 if (process.env.LEMONADE_BASE_URL && !process.env.INFERENCE_BASE_URL) console.warn('LEMONADE_BASE_URL is deprecated; use INFERENCE_BASE_URL');
 if (process.env.LEMONADE_API_KEY && !process.env.INFERENCE_API_KEY) console.warn('LEMONADE_API_KEY is deprecated; use INFERENCE_API_KEY');
 const workspaceStore = createWorkspaceStore(DATA_DIR, { id: DEFAULT_PROVIDER_ID, label: DEFAULT_PROVIDER_LABEL, baseUrl: INFERENCE_BASE, apiKey: INFERENCE_KEY, shared: true }, secretStore);
@@ -2572,9 +2574,14 @@ async function handleRequestScoped(req, res) {
       return json(res, 403, { error: 'administrator required' });
     }
     if (p === '/api/profile' && req.method === 'GET') return json(res, 200, { user: authn.user, passkeys: authService.listPasskeys(authn.user.id), sessions: authService.listSessions(authn.user.id) });
+    if (p === '/api/profile/sharing' && req.method === 'GET') return json(res, 200, davSettings.get(authn.user));
+    if (p === '/api/profile/sharing' && req.method === 'PUT') {
+      try { return json(res, 200, davSettings.save(authn.user, await readJson(req))); }
+      catch (e) { return json(res, 400, { error: e.message }); }
+    }
     if (p === '/api/profile/app-passwords' && req.method === 'GET') {
       res.setHeader('Cache-Control', 'no-store');
-      return json(res, 200, { appPasswords: authService.appPasswords.list(authn.user.id), sharingAvailable: false });
+      return json(res, 200, { appPasswords: authService.appPasswords.list(authn.user.id), sharingAvailable: davConfig.available });
     }
     if (p === '/api/profile/app-passwords' && req.method === 'POST') {
       res.setHeader('Cache-Control', 'no-store');
@@ -3944,6 +3951,26 @@ if (require.main === module) {
   // comfortably past APPROVAL_TIMEOUT_MS, which is the limit that should
   // actually bite. headersTimeout still guards the slow-header attack this
   // setting otherwise protects against.
+  if (davConfig.available) {
+    const call = async (userId, endpoint, method, body) => {
+      const workspace = workspaceStore.get(userId);
+      const user = authService.publicUser(authService.db.prepare('SELECT * FROM users WHERE id=?').get(userId));
+      return requestScope.run({ workspace, authn: { user, legacy: false } }, async () => {
+        const r = await fetchJson(`${DIARY_BASE}/api${endpoint}`, { method, headers: diaryHeaders(), body: body === undefined ? undefined : JSON.stringify(body) }, 15000);
+        if (!r.ok) throw Object.assign(Error(r.body?.detail || 'Diary file request failed'), { status: r.status });
+        return r.body;
+      });
+    };
+    const handler = require('./dav.cjs').createDavHandler({ auth: authService, settings: davSettings, config: davConfig, files: {
+      list: async (id, path) => (await call(id, '/files?path='+encodeURIComponent(path), 'GET')).files,
+      read: (id, path) => call(id, '/file', 'POST', { path }),
+      write: (id, body) => call(id, '/file', 'PUT', body),
+    } });
+    const davServer = http.createServer((req, res) => { handler(req, res).catch(() => res.destroy()); });
+    davServer.requestTimeout = 60000; davServer.headersTimeout = 15000;
+    davServer.setTimeout(60000, socket => socket.destroy());
+    davServer.listen(davConfig.port, HOST, () => console.log(`Diary file sharing listener on port ${davConfig.port}; scope ${davConfig.scope}; per-user opt-in required`));
+  }
   server.requestTimeout = 20 * 60 * 1000;
   server.listen(PORT, HOST, () => {
     console.log(`cowork-ui listening on http://${HOST}:${PORT} (inference: ${INFERENCE_BASE}, manager: ${modelManager.kind}, diary: ${DIARY_BASE}, mcp: ${MCP_ENABLED ? MCP_SERVERS.map((sv) => sv.id).join('+') : 'disabled'})`);
