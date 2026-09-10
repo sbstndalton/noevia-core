@@ -47,3 +47,21 @@ test('local originals are project-scoped and pruning preserves referenced data o
   project.files = []; uploads.prune(workspace, project);
   assert.equal(fs.existsSync(uploads.original(workspace, project.id, file)), false); assert.equal(project.assets.length, 0);
 });
+
+test('replacing an image above the vision limit retires old model input and can later restore vision', async t => {
+  const { workspace, project } = setup(t);
+  const small = await uploads.ingest(workspace, project, 'fixture.png', Buffer.from('synthetic small image'));
+  project.files = [small];
+  const oldAsset = project.assets[0].id;
+  const large = await uploads.ingest(workspace, project, 'fixture.png', Buffer.alloc(9 * 1024 * 1024, 1));
+  project.files = [large];
+  assert.equal(large.attachment.state, 'stored');
+  assert.deepEqual(project.assets, []);
+  uploads.prune(workspace, project);
+  assert.equal(fs.existsSync(path.join(workspace.assetDir(project.id), oldAsset)), false);
+  const replacement = await uploads.ingest(workspace, project, 'fixture.png', Buffer.from('synthetic replacement image'));
+  project.files = [replacement];
+  assert.equal(replacement.attachment.state, 'vision');
+  assert.equal(project.assets.length, 1);
+  assert.notEqual(project.assets[0].id, oldAsset);
+});

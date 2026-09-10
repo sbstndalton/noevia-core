@@ -28,3 +28,28 @@ test('legacy provider and project IDs migrate atomically with backups', () => {
   assert.equal(projects[0].provider, 'primary');
   assert.ok(fs.existsSync(path.join(workspace.dir, 'migration.json')));
 });
+
+test('retained legacy data cannot be claimed by a later administrator, even after owner removal', () => {
+  const store = createWorkspaceStore(dataDir, { id: 'primary' });
+  const secondId = '22222222-2222-4222-8222-222222222222';
+  const second = store.get(secondId, { claim: true });
+  assert.deepEqual(second.projects, []);
+  assert.equal(fs.existsSync(path.join(second.dir, 'migration.json')), false);
+  fs.rmSync(workspace.dir, { recursive: true, force: true });
+  const third = store.get('33333333-3333-4333-8333-333333333333', { claim: true });
+  assert.deepEqual(third.projects, []);
+});
+
+test('existing deployments recover the original owner from the migration marker', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cowork-existing-migration-'));
+  try {
+    fs.writeFileSync(path.join(root, 'projects.json'), JSON.stringify({ projects: [{ id: 'private-old-project' }] }));
+    const first = path.join(root, 'users', userId);
+    fs.mkdirSync(first, { recursive: true });
+    fs.writeFileSync(path.join(first, 'migration.json'), '{}');
+    const store = createWorkspaceStore(root, { id: 'primary' });
+    const second = store.get('22222222-2222-4222-8222-222222222222', { claim: true });
+    assert.deepEqual(second.projects, []);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'legacy-owner.json'))).userId, userId);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});

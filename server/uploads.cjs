@@ -58,12 +58,15 @@ async function ingest(workspace, project, name, bytes, { connection, source, rem
   } else if (mime) state = 'vision';
   file.attachment = { id, bytes: bytes.length, group, state, ...(group === 'Images' && bytes.length > 8 * 1024 * 1024 ? { reason: 'Original stored; resize below 8 MB for model image input.' } : {}) };
   if (source || connection) file.source = source || project.projectFolder;
+  // Replacing a vision image with a stored-only original must also retire its
+  // old model input. Otherwise chat silently describes the previous bytes.
+  project.assets = (project.assets || []).filter(a => a.sourceName !== fullName);
   if (mime) {
     const assetId = 'img-' + hash(fullName + ':' + id).slice(0,40);
     fs.mkdirSync(workspace.assetDir(project.id), { recursive: true, mode: 0o700 });
     fs.writeFileSync(path.join(workspace.assetDir(project.id), assetId), bytes, { mode: 0o600 });
     file.attachment.assetId = assetId;
-    project.assets = [...(project.assets || []).filter(a => a.sourceName !== fullName), { id: assetId, name, mime, bytes: bytes.length, sourceName: fullName, storagePath: file.source ? fullName : undefined }];
+    project.assets.push({ id: assetId, name, mime, bytes: bytes.length, sourceName: fullName, storagePath: file.source ? fullName : undefined });
   }
   return file;
 }
