@@ -16,12 +16,12 @@ function start(workspace, projectId, operation) {
   const id = crypto.randomUUID();
   const job = { projectId, done: false };
   jobs.set(id, job);
-  Promise.resolve().then(operation).then(result => Object.assign(job, result), err => Object.assign(job, { status: err.status || 500, body: { error: 'Source processing failed; refresh or re-upload to retry.' } })).finally(() => { job.done = true; job.finished = Date.now(); });
+  Promise.resolve().then(() => operation(stage => { job.stage = stage; })).then(result => Object.assign(job, result), err => Object.assign(job, { status: err.status || 500, body: { error: 'Source processing failed; refresh or re-upload to retry.' } })).finally(() => { job.done = true; job.finished = Date.now(); });
   return id;
 }
 function read(workspace, projectId, id) {
   const job = workspaces.get(workspace)?.get(id);
   if (!job || job.projectId !== projectId || (job.done && Date.now() - job.finished > 900000)) return null;
-  return job.done ? { done: true, status: job.status, body: job.body } : { done: false };
+  return job.done ? { done: true, status: job.status, body: job.body } : { done: false, ...(job.stage ? { stage: job.stage } : {}) };
 }
 module.exports = { start, read };

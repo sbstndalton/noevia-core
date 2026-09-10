@@ -662,6 +662,7 @@ const { projectFolderName, createProjectFolder } = require('./project-folders.cj
  *  folder that merely contains it. */
 function ownsFile(project, target) {
   if (!project || typeof target !== 'string' || !target) return false;
+  if ((project.files || []).some(f => f.name === target && f.attachment && f.source === project.projectFolder && require('./uploads.cjs').GROUPS.some(g => target.startsWith(`${project.projectFolder}/${g}/`) && !target.slice(`${project.projectFolder}/${g}/`.length).includes('/')))) return true;
   const folders = [
     ...(project.projectFolder ? [project.projectFolder] : []),
     ...(Array.isArray(project.sourceFolders) ? project.sourceFolders : []),
@@ -714,6 +715,8 @@ function pruneDocuments(project) {
   const workspace = currentWorkspace();
   try { documentSources.prune(workspace, workspace.projects.includes(project) ? project : { id: project.id, files: [] }); }
   catch (err) { console.warn('[documents] cleanup failed:', err.message); }
+  try { require('./uploads.cjs').prune(workspace, workspace.projects.includes(project) ? project : { id: project.id, files: [] }); }
+  catch (err) { console.warn('[uploads] cleanup failed:', err.message); }
 }
 function indexSource(project, file) {
   const workspace = currentWorkspace();
@@ -1640,6 +1643,7 @@ async function executeToolCall(project, name, rawArgs, allowed) {
       const names = files.map((x) => x.name).join(', ') || '(none attached)';
       return `ERROR: no project file named "${wanted}". Available: ${names}`;
     }
+    if (f.attachment?.state === 'stored') return `${f.name}: original stored, but no reader is available. Contents have not been read.`;
     if (f.document && args.startPage !== undefined) {
       try {
         const out = documentSources.readPages(currentWorkspace(), project.id, f, args.startPage, args.endPage ?? args.startPage, args.offset ?? 0, TOOL_RESULT_CAP);
@@ -2047,6 +2051,7 @@ async function handleChat(req, res, body, authn) {
   }
 
   // ── Ordinary space / project chat: routed via the project's provider ──
+  if (project?.files?.some(f => f.attachment?.state === 'stored')) sysParts.push('These sources are stored only; their contents have NOT been read because no reader is available: ' + project.files.filter(f => f.attachment?.state === 'stored').map(f => f.name).join(', ') + '. Do not claim to know their contents.');
   const sys = sysParts.join('\n\n');
   let wire = sys ? [{ role: 'system', content: sys }, ...msgs] : msgs;
 
@@ -2178,6 +2183,9 @@ async function handleChat(req, res, body, authn) {
   // so an unchecked attachment would turn "what is in this picture" into a
   // chat that never replies — and would do it to every message in the project,
   // not just the one asking about an image.
+  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+  send({ type: 'meta', model, chatId: chatId || undefined, route: routedRole || undefined });
+  send({ type: 'status', text: attachedImages.length ? 'Reading image sources — model loading and visual processing may take a moment…' : 'Preparing response…' });
   let visionWarning = missingImages.length ? `Images were not read because their stored files are missing: ${missingImages.join(', ')}. Re-upload them.` : '';
   if (visionWarning) wire = [{ role: 'system', content: visionWarning + ' Do not guess their contents.' }, ...wire];
   if (attachedImages.length) {
@@ -2224,8 +2232,7 @@ async function handleChat(req, res, body, authn) {
     }
   }
 
-  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
-  send({ type: 'meta', model, chatId: chatId || undefined, route: routedRole || undefined });
+  send({ type: 'status', text: 'Generating response…' });
   if (visionWarning) send({ type: 'warning', text: visionWarning });
 
   // ── Tool rounds (Pi-style loop, master step 13): stream a completion; if
@@ -2552,12 +2559,12 @@ async function handleRequestScoped(req, res) {
     if (backgroundSource && req.method === 'POST' && url.searchParams.get('background') === '1') {
       const projectId = decodeURIComponent(backgroundSource[1]);
       if (!getProject(projectId)) return json(res, 404, { error: 'project not found' });
-      const body = await readJson(req);
-      const jobId = require('./source-jobs.cjs').start(currentWorkspace(), projectId, async () => {
+      const body = JSON.parse(await readBody(req, Math.ceil(DOCUMENT_UPLOAD_CAP / 3) * 4 + 512 * 1024));
+      const jobId = require('./source-jobs.cjs').start(currentWorkspace(), projectId, async (progress) => {
         const inner = require('node:stream').Readable.from([Buffer.from(JSON.stringify(body))]);
         Object.assign(inner, { method: req.method, url: p, headers: req.headers, socket: req.socket });
         let status = 500, data = '';
-        await handleRequestScoped(inner, { setHeader() {}, writeHead(code) { status = code; }, end(value) { data = String(value || '{}'); } });
+        await requestScope.run({ ...requestScope.getStore(), sourceProgress: progress }, () => handleRequestScoped(inner, { setHeader() {}, writeHead(code) { status = code; }, end(value) { data = String(value || '{}'); } }));
         return { status, body: JSON.parse(data) };
       });
       return json(res, 202, { poll: `/api/projects/${encodeURIComponent(projectId)}/source-jobs/${jobId}` });
@@ -3118,10 +3125,10 @@ async function handleRequestScoped(req, res) {
         const fromFolders = prevFiles.filter((f) => f && f.source);
         const uploads = patch.files
           .filter((f) => f && typeof f.name === 'string' && typeof f.content === 'string' && !f.source)
-          .slice(0, 20)
+          .slice(0, Math.max(0, 60 - fromFolders.length))
           .map((f) => {
             const existing = prevFiles.find(p => !p.source && p.name === f.name);
-            return existing?.document ? existing : { name: f.name.slice(0, 200), content: f.content.slice(0, 200000) };
+            return existing?.document || existing?.attachment ? existing : { name: f.name.slice(0, 200), content: f.content.slice(0, 200000) };
           });
         project.files = [...fromFolders, ...uploads];
         // RAG bookkeeping (step 10): drop chunks for removed files; index
@@ -3129,6 +3136,7 @@ async function handleRequestScoped(req, res) {
         // on embedding round-trips.
         const prevByName = new Map(prevFiles.map((f) => [f.name, f]));
         const nextNames = new Set(project.files.map((f) => f.name));
+        project.assets = (project.assets || []).filter(a => !a.sourceName || nextNames.has(a.sourceName));
         for (const prev of prevFiles) {
           if (!nextNames.has(prev.name)) rag.deleteProjectFile(id, prev.name, currentWorkspace().userId);
         }
@@ -3263,6 +3271,32 @@ async function handleRequestScoped(req, res) {
       const rawName = String(body.name || '').split('/').pop().slice(0, 200);
       if (!rawName) return json(res, 400, { error: 'a filename is required' });
       const isText = storageClient.TEXT_EXTENSIONS.has((rawName.slice(rawName.lastIndexOf('.')) || '').toLowerCase());
+      if (body.organized === true) {
+        const uploads = require('./uploads.cjs');
+        const name = String(body.name || '');
+        const bytes = Buffer.from(String(body.dataBase64 || ''), 'base64');
+        uploads.validate(name, bytes);
+        return await withSourceLock(project, async () => {
+          if (getProject(id) !== project) return json(res, 409, { error: 'Project changed; retry.' });
+          const connection = authService.getStorage(authn.user.id, true);
+          const remote = storageClient.isBrowsable(connection) ? connection : null;
+          const progress = requestScope.getStore()?.sourceProgress || (() => {});
+          if (remote && !project.projectFolder) {
+            progress('Creating upload folder');
+            project.projectFolder = await ensureProjectFolder(project);
+            if (!project.projectFolder) return json(res, 502, { error: 'Could not create the storage folder; retry.' });
+          }
+          const file = await uploads.ingest(currentWorkspace(), project, name, bytes, { connection: remote, progress });
+          if (getProject(id) !== project) return json(res, 409, { error: 'Project removed during upload.' });
+          if (remote) project.sourceFolders = [...new Set([...(project.sourceFolders || []), project.projectFolder])];
+          project.files = [...(project.files || []).filter(f => f.name !== file.name), file];
+          project.updatedAt = Date.now();
+          progress('Indexing extracted text');
+          if (file.content) indexSource(project, file);
+          saveProjects(PROJECTS);
+          return json(res, 200, { name, path: file.name, bytes: bytes.length, document: file.document, attachment: file.attachment });
+        });
+      }
       if (!isText && !documents.isDocument(rawName)) {
         return json(res, 400, { error: `${rawName} is not a supported source (text file or PDF).` });
       }
@@ -3342,10 +3376,21 @@ async function handleRequestScoped(req, res) {
         }
         project.files = (project.files || []).filter((f) => f.name !== target);
         pruneDocuments(project);
+        require('./uploads.cjs').prune(currentWorkspace(), project);
         saveProjects(PROJECTS);
         rag.deleteProjectFile(id, target, currentWorkspace().userId);
         return json(res, 200, { ok: true, path: target });
       });
+    }
+
+    const originalUpload = p.match(/^\/api\/projects\/([^/]+)\/uploads\/original$/);
+    if (originalUpload && req.method === 'GET') {
+      const project = getProject(decodeURIComponent(originalUpload[1]));
+      const file = project?.files.find(f => f.name === url.searchParams.get('name') && f.attachment);
+      if (!file) return json(res, 404, { error: 'No such original' });
+      const bytes = fs.readFileSync(require('./uploads.cjs').original(currentWorkspace(), project.id, file));
+      res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(file.name.split('/').pop())}`, 'Cache-Control': 'private, no-store', 'Content-Length': bytes.length });
+      return res.end(bytes);
     }
 
     const projAssets = p.match(/^\/api\/projects\/([^/]+)\/assets$/);
@@ -3425,14 +3470,30 @@ async function handleRequestScoped(req, res) {
       if (!project) return json(res, 404, { error: 'no such project' });
       return await withSourceLock(project, async () => {
         if (getProject(id) !== project) return json(res, 409, { error: 'Project changed; retry.' });
-        const folders = Array.isArray(project.sourceFolders) ? project.sourceFolders : [];
         const connection = authService.getStorage(authn.user.id, true);
-        if (folders.length && !storageClient.isBrowsable(connection)) {
-          return json(res, 400, { error: 'no browsable storage connection is configured' });
-        }
-
         const fromFolders = [];
         const skipped = [];
+        if (storageClient.isBrowsable(connection) && (project.assets || []).some(a => !a.sourceName)) {
+          if (!project.projectFolder) project.projectFolder = await ensureProjectFolder(project);
+          if (project.projectFolder) {
+            for (const asset of [...(project.assets || [])].filter(a => !a.sourceName)) {
+              try {
+                const bytes = fs.readFileSync(path.join(currentWorkspace().assetDir(id), asset.id));
+                // A stable suffix prevents overwriting a file already placed there outside noevia.
+                const dot = asset.name.lastIndexOf('.');
+                const name = dot > 0 ? `${asset.name.slice(0,dot)}-${asset.id}${asset.name.slice(dot)}` : `${asset.name}-${asset.id}`;
+                const file = await require('./uploads.cjs').ingest(currentWorkspace(), project, name, bytes, { connection, progress: requestScope.getStore()?.sourceProgress });
+                project.files = [...(project.files || []).filter(f => f.name !== file.name), file];
+                project.assets = project.assets.filter(a => a.id !== asset.id);
+                project.sourceFolders = [...new Set([...(project.sourceFolders || []), project.projectFolder])];
+                saveProjects(PROJECTS);
+              } catch (err) { skipped.push({ folder: project.projectFolder, file: asset.name, reason: 'Image remains in noevia: ' + err.message, retained: true }); }
+            }
+          }
+        }
+        const folders = Array.isArray(project.sourceFolders) ? project.sourceFolders : [];
+        if (folders.length && !storageClient.isBrowsable(connection)) return json(res, 400, { error: 'no browsable storage connection is configured' });
+
         for (const folder of folders) {
           let entries;
           try {
@@ -3444,15 +3505,29 @@ async function handleRequestScoped(req, res) {
             skipped.push({ folder, reason, retained: previous.some(f => !!f.content) });
             continue;
           }
+          if (folder === project.projectFolder) {
+            for (const entry of [...entries]) {
+              if (entry.isDir && require('./uploads.cjs').GROUPS.includes(entry.name)) {
+                try { entries.push(...await storageClient.listFiles(connection, entry.path)); }
+                catch (err) { fromFolders.push(...(project.files || []).filter(f => f.source === folder && f.name.startsWith(entry.path + '/'))); skipped.push({ folder, file: entry.path, reason: 'Could not refresh this category; previous sources retained.', retained: true }); }
+              }
+            }
+          }
           for (const entry of entries) {
             if (entry.isDir) continue; // one level: recursing could pull a whole drive in
             const ext = (entry.ext || '').toLowerCase();
             const isText = storageClient.TEXT_EXTENSIONS.has(ext);
             const isDoc = documents.isDocument(entry.name);
-            if (!isText && !isDoc) continue;
+            const managed = folder === project.projectFolder && require('./uploads.cjs').GROUPS.some(g => entry.path.startsWith(`${folder}/${g}/`));
+            if (!isText && !isDoc && !managed) continue;
             if (fromFolders.length >= 40) { skipped.push({ folder, file: entry.path, reason: '40-source refresh limit reached; this file was not read.', retained: false }); continue; } // a cap, so one big folder cannot blow up a project
             try {
-              if (isDoc) {
+              if (managed) {
+                const bytes = await storageClient.readBinaryFile(connection, entry.path);
+                const file = await require('./uploads.cjs').ingest(currentWorkspace(), project, entry.name, bytes, { source: folder, remotePath: entry.path, progress: requestScope.getStore()?.sourceProgress });
+                fromFolders.push(file);
+                if (file.document && file.document.state !== 'ready') skipped.push({ folder, file: entry.path, reason: documentSources.problem(file), retained: file.document.stale });
+              } else if (isDoc) {
                 // A document is converted to text here, so a PDF in an attached
                 // folder becomes a readable source rather than being skipped.
                 const bytes = await storageClient.readBinaryFile(connection, entry.path);
@@ -3482,6 +3557,7 @@ async function handleRequestScoped(req, res) {
         const untouched = prev.filter((f) => f.source && currentFolders.has(f.source) && !folders.includes(f.source));
         const synced = fromFolders.filter((f) => currentFolders.has(f.source));
         project.files = [...uploaded, ...untouched, ...synced].slice(0, 60);
+        require('./uploads.cjs').prune(currentWorkspace(), project);
         saveProjects(PROJECTS);
         // Same RAG bookkeeping the config patch does: drop chunks for files that
         // are gone, re-index the ones that arrived or changed.

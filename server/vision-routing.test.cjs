@@ -20,6 +20,7 @@ async function run({ visionModel, probeStatus = 200, descriptionStatus = 200, mi
   const fetch = async (url, opts) => {
     assert.equal(url, 'http://fixture.invalid/v1/chat/completions');
     const body = JSON.parse(opts.body); requests.push(body);
+    if (!missingAsset) assert.ok(events.some(e => e.type === 'status' && /Reading image/.test(e.text)), 'image preparation must be visible before waiting for inference');
     if (body.stream) return { ok: true, body: (async function* () {
       yield Buffer.from('data: ' + JSON.stringify({ choices: [{ delta: { content: 'Synthetic answer' } }] }) + '\n\n');
     })() };

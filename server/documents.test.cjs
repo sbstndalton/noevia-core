@@ -52,21 +52,23 @@ const sync = source.slice(source.indexOf('    const projSync ='), source.indexOf
 function harness(remote = false) {
   const project = { id: 'fixture-project', files: [], projectFolder: 'fixture', sourceFolders: remote ? ['fixture'] : [] };
   const stored = new Map();
-  const workspace = { dir: path.join(testDir, String(++workspaceNumber)), userId: 'fixture-user', projects: [project], saveProjects: () => {} };
+  const workspace = { assetDir: id => path.join(testDir, 'assets', id), dir: path.join(testDir, String(++workspaceNumber)), userId: 'fixture-user', projects: [project], saveProjects: () => {} };
   let extracts = 0;
   const context = {
-    Buffer, console, Date, DOCUMENT_UPLOAD_CAP: 25 * 1024 * 1024,
+    Buffer, console, Date, fs, path, DOCUMENT_UPLOAD_CAP: 25 * 1024 * 1024,
     documentSources, readJson: async req => req.body,
     ownsFile: (project, target) => project.sourceFolders.some(folder => target.startsWith(folder + '/') && !target.slice(folder.length + 1).includes('/')),
     PROJECTS: [project], getProject: id => id === project.id ? project : null,
     saveProjects: () => {}, currentWorkspace: () => workspace,
     authService: { getStorage: () => ({}) },
+    require: name => name === './uploads.cjs' ? { ...require(name), ingest: (...args) => { args[4] = { ...args[4], storageImpl: context.storageClient }; return require(name).ingest(...args); } } : require(name), requestScope: { getStore: () => ({}) },
     readBody: async req => JSON.stringify(req.body),
     json: (_res, status, body) => ({ status, body }),
     documents: { ...documents, extractDocumentText: async (...args) => { extracts++; return documents.extractDocumentText(...args); } },
     rag: { indexProjectFile: async () => {}, deleteProjectFile: () => {} },
     storageClient: {
       TEXT_EXTENSIONS: new Set(['.txt']), isBrowsable: () => remote,
+      createFolder: async () => {},
       writeFile: async (_conn, name, bytes) => stored.set(name, bytes),
       listFiles: async () => [...stored.keys()].map(p => ({ name: p.split('/').pop(), path: p, ext: '.pdf' })),
       readBinaryFile: async (_conn, name) => stored.get(name),
@@ -74,10 +76,11 @@ function harness(remote = false) {
     },
   };
   vm.createContext(context);
+  vm.runInContext(source.slice(source.indexOf('function ownsFile('), source.indexOf('/** Create this project')), context);
   vm.runInContext(source.slice(source.indexOf('const sourceOperations ='), source.indexOf('const MAX_PROJECT_IMAGES =')), context);
   const run = vm.runInContext('(async function(p, req) { const res = {}; const authn = {user:{id:"fixture-user"}};\n' + upload + sync + deletion + '\n})', context);
   return { project, stored, workspace, extracts: () => extracts,
-    upload: (name, bytes, id = project.id) => run('/api/projects/' + id + '/upload', { method: 'POST', body: { name, dataBase64: bytes.toString('base64') } }),
+    upload: (name, bytes, id = project.id, organized = false) => run('/api/projects/' + id + '/upload', { method: 'POST', body: { name, organized, dataBase64: bytes.toString('base64') } }),
     remove: name => run('/api/projects/' + project.id + '/files', { method: 'DELETE', body: { path: name } }),
     sync: () => run('/api/projects/' + project.id + '/sources/sync', { method: 'POST' }),
   };
@@ -153,7 +156,8 @@ test('audit: retrieval fallback retains source names but supplies only the head 
       throw new Error('Optional index intentionally unavailable in synthetic test');
     },
   };
-  vm.createContext(context); vm.runInContext(ragSource, context);
+  vm.createContext(context);
+  vm.runInContext(source.slice(source.indexOf('function ownsFile('), source.indexOf('/** Create this project')), context); vm.runInContext(ragSource, context);
   const out = await context.module.exports.filesContext('fixture-project', [
     { name: 'small.pdf', content: 'TOTAL 34.95' },
     { name: 'large.pdf', content: 'HEAD-MARKER ' + 'x'.repeat(30000) + ' TAIL-MARKER' },
@@ -222,4 +226,34 @@ test('file deletion waits for refresh and removes the source and cached original
     assert.equal(h.project.files.length, 0); assert.equal(h.stored.size, 0);
     assert.equal(fs.readdirSync(documentSources.directory(h.workspace, h.project.id)).length, 0);
   } finally { documentSources.ingest = ingest; }
+});
+
+
+test('organized remote refresh preserves opaque files and images, and exact managed paths can be deleted', async () => {
+  const h = harness(true);
+  for (const name of ['fixture.docx', 'fixture.png', 'fixture.txt']) {
+    const out = await h.upload(name, Buffer.from('synthetic bytes'), h.project.id, true);
+    assert.equal(out.status, 200, JSON.stringify(out));
+  }
+  assert.equal(h.project.files.length, 3);
+  const refreshed = await h.sync();
+  assert.equal(refreshed.status, 200);
+  assert.equal(h.project.files.length, 3);
+  assert.equal(h.project.files.find(f => f.name.endsWith('.docx')).attachment.state, 'stored');
+  assert.equal(h.project.assets.length, 1);
+  const image = h.project.files.find(f => f.name.endsWith('.png'));
+  assert.equal((await h.remove(image.name)).status, 200);
+  assert.equal(h.project.assets.length, 0);
+});
+
+
+test('refresh migrates legacy local images into managed storage without losing their bytes', async () => {
+  const h = harness(true);
+  const dir = h.workspace.assetDir(h.project.id); fs.mkdirSync(dir, { recursive: true });
+  const bytes = Buffer.from('synthetic legacy image'); fs.writeFileSync(path.join(dir, 'img-legacy'), bytes);
+  h.project.assets = [{ id: 'img-legacy', name: 'fixture.png', mime: 'image/png', bytes: bytes.length }];
+  const out = await h.sync(); assert.equal(out.status, 200);
+  assert.deepEqual(h.stored.get('fixture/Images/fixture-img-legacy.png'), bytes);
+  assert.equal(h.project.assets.length, 1); assert.equal(h.project.assets[0].storagePath, 'fixture/Images/fixture-img-legacy.png');
+  assert.equal(h.project.files.length, 1);
 });

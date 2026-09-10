@@ -160,3 +160,24 @@ test('background upload survives a short response and polling remains authentica
   assert.equal(job.body.document.state, 'ready');
   assert.deepEqual((await request(docUrl(p.id, 'original'), { headers: { cookie } })).bytes, fixture('text.pdf'));
 });
+
+test('unified uploads accept DOCX, preserve opaque bytes, protect metadata and expose authenticated downloads', async () => {
+  const p = await project('Opaque synthetic uploads');
+  // Larger than the old background wrapper's accidental 1 MB limit.
+  const bytes = Buffer.alloc(2 * 1024 * 1024, 65); bytes.set([0x50,0x4b,3,4]);
+  const up = await post(`/api/projects/${p.id}/upload?background=1`, { organized: true, name: 'fixture.docx', dataBase64: bytes.toString('base64') });
+  assert.equal(up.status, 202);
+  const poll = JSON.parse(up.text).poll;
+  let job;
+  for (let i=0;i<100;i++) { job=JSON.parse((await request(poll,{headers:{cookie}})).text); if(job.done) break; await new Promise(r=>setTimeout(r,10)); }
+  assert.equal(job.status,200,JSON.stringify(job)); assert.equal(job.body.attachment.state,'stored');
+  const url = `/api/projects/${p.id}/uploads/original?name=fixture.docx`;
+  assert.equal((await request(url)).status,401);
+  const other = await project('No access through other project');
+  assert.equal((await request(url.replace(p.id,other.id),{headers:{cookie}})).status,404);
+  await post(`/api/projects/${p.id}/config`, { files: [{ name:'fixture.docx',content:'forged',attachment:{id:'../escape'} }] });
+  const original=await request(url,{headers:{cookie}});
+  assert.deepEqual(original.bytes,bytes); assert.equal(original.headers['Content-Type'],'application/octet-stream');
+  const bad=await post(`/api/projects/${p.id}/upload`,{organized:true,name:'fixture.zip',dataBase64:bytes.toString('base64')});
+  assert.equal(bad.status,400);
+});
