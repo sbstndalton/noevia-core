@@ -26,6 +26,7 @@ const { AsyncLocalStorage } = require('async_hooks');
 const rag = require('./rag.cjs');
 const mcp = require('./mcp.cjs');
 const prefill = require('./prefill.cjs');
+const { createToolExchange } = require('./tool-exchange.cjs');
 const storageClient = require('./storage-client.cjs');
 const documents = require('./documents.cjs');
 const { createVisionProbe } = require('./vision.cjs');
@@ -2191,6 +2192,7 @@ async function handleChat(req, res, body, authn) {
     // may be the one that bit.
     console.warn(`[tools] ${model}: ${resolved.tools.length} tools ~${resolved.estTokens} tok (cap ${resolved.cap}, budget ${resolved.budget}); dropped ${resolved.dropped.length}: ${resolved.dropped.join(', ')}`);
   }
+  const runTool = createToolExchange({ allowed: allowedToolNames, isWrite: isWriteTool, signal: chatSignal.signal });
   let roundMessages = wire;
   // Prefill measurement (step 17). Timed per ROUND, because each round is its
   // own upstream request with its own prompt — and the later rounds are the
@@ -2367,46 +2369,50 @@ async function handleChat(req, res, body, authn) {
       const assistantMsg = { role: 'assistant', content: null, tool_calls: [...toolCalls.entries()].map(([i, tc]) => ({ id: tc.id, type: 'function', function: { name: tc.name, arguments: tc.args } })) };
       roundMessages = [...roundMessages, assistantMsg];
       for (const [toolIndex, tc] of toolCalls) {
-        // ── Permission gate (step 16) ──────────────────────────────────
-        // Reads run straight through. A write stops here and waits for a
-        // human, which is why this loop is `for … of` and awaited rather
-        // than a Promise.all: the round genuinely blocks on a person.
-        let result;
-        const userId = requestScope.getStore()?.workspace?.userId || null;
-        if (isWriteTool(tc.name) && !chatWideApproved(userId, chatId)) {
-          const approvalId = `ap-${crypto.randomUUID()}`;
-          send({
-            type: 'tool_pending',
-            id: approvalId,
-            index: toolOffset + toolIndex, // same index the `tool` events used, so the UI updates that chip
-            name: tc.name,
-            args: tc.args,
-          });
-          const decision = await awaitApproval({ id: approvalId, userId, chatId, abortSignal: chatSignal.signal });
-          if (decision !== 'approve') {
-            // A refusal is a normal conversational turn: the model is told
-            // plainly so it can offer an alternative, rather than the stream
-            // dying or the chip hanging with no result.
-            result = decision === 'timeout'
-              ? `ERROR: the user did not respond in time, so ${tc.name} was not run. Ask before trying again.`
-              : `ERROR: the user declined to run ${tc.name}. Do not retry it; ask what they would prefer.`;
-            authService.audit('tool.denied', userId, userId, { tool: tc.name, reason: decision });
-            send({ type: 'tool_result', index: toolOffset + toolIndex, name: tc.name, text: result.slice(0, 300) });
-            roundMessages.push({ role: 'tool', tool_call_id: tc.id, content: result });
-            continue;
+        if (chatSignal.signal.aborted) break;
+        const result = await runTool(tc, async (markWriteAttempt) => {
+          // ── Permission gate (step 16) ──────────────────────────────────
+          // Reads run straight through. A write stops here and waits for a
+          // human, which is why this loop is `for … of` and awaited rather
+          // than a Promise.all: the round genuinely blocks on a person.
+          let result;
+          const userId = requestScope.getStore()?.workspace?.userId || null;
+          if (isWriteTool(tc.name) && !chatWideApproved(userId, chatId)) {
+            const approvalId = `ap-${crypto.randomUUID()}`;
+            send({
+              type: 'tool_pending',
+              id: approvalId,
+              index: toolOffset + toolIndex, // same index the `tool` events used, so the UI updates that chip
+              name: tc.name,
+              args: tc.args,
+            });
+            const decision = await awaitApproval({ id: approvalId, userId, chatId, abortSignal: chatSignal.signal });
+            if (decision !== 'approve') {
+              // A refusal is a normal conversational turn: the model is told
+              // plainly so it can offer an alternative, rather than the stream
+              // dying or the chip hanging with no result.
+              result = decision === 'timeout'
+                ? `ERROR: the user did not respond in time, so ${tc.name} was not run. Ask before trying again.`
+                : `ERROR: the user declined to run ${tc.name}. Do not retry it; ask what they would prefer.`;
+              authService.audit('tool.denied', userId, userId, { tool: tc.name, reason: decision });
+              return result;
+            }
           }
-        }
-        result = await executeToolCall(project, tc.name, tc.args, allowedToolNames);
-        // Audit AFTER the fact and only for writes: "what did the model
-        // actually do on my behalf" is the question this log has to answer,
-        // and it lives beside logins and storage changes.
-        if (isWriteTool(tc.name)) {
-          authService.audit('tool.write', userId, userId, {
-            tool: tc.name,
-            args: String(tc.args || '').slice(0, 500),
-            failed: result.startsWith('ERROR') || undefined,
-          });
-        }
+          if (chatSignal.signal.aborted) return 'ERROR: exchange cancelled; tool was not run.';
+          markWriteAttempt();
+          result = await executeToolCall(project, tc.name, tc.args, allowedToolNames);
+          // Audit AFTER the fact and only for writes: "what did the model
+          // actually do on my behalf" is the question this log has to answer,
+          // and it lives beside logins and storage changes.
+          if (isWriteTool(tc.name)) {
+            authService.audit('tool.write', userId, userId, {
+              tool: tc.name,
+              args: String(tc.args || '').slice(0, 500),
+              failed: result.startsWith('ERROR') || undefined,
+            });
+          }
+          return result;
+        });
         send({ type: 'tool_result', index: toolOffset + toolIndex, name: tc.name, text: result.slice(0, 300) });
         roundMessages.push({ role: 'tool', tool_call_id: tc.id, content: result });
       }
