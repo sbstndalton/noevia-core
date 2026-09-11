@@ -9,13 +9,15 @@ const { createToolExchange } = require('./tool-exchange.cjs');
 const { createVisionProbe } = require('./vision.cjs');
 const source = fs.readFileSync(path.join(__dirname, 'index.cjs'), 'utf8');
 const handler = source.slice(source.indexOf('async function handleChat('), source.indexOf('// ── Routing'));
+const contextDir=fs.mkdtempSync(require('node:path').join(require('node:os').tmpdir(),'chat-handler-test-'));
+test.after(()=>fs.rmSync(contextDir,{recursive:true,force:true}));
 
 async function run({ visionModel, probeStatus = 200, descriptionStatus = 200, missingAsset = false, finishReason = 'stop', cache = new Map(), headers = {}, replacementBytes, userId = 'synthetic-user', projectId = 'fixture-project' } = {}) {
   const events = [], requests = [];
   const res = new EventEmitter();
   res.writeHead = () => {};
   res.write = line => events.push(JSON.parse(line.slice(6)));
-  res.end = () => { res.writableEnded = true; };
+  res.end = () => { res.writableEnded = true; res.emit('finish'); };
   const bytes = replacementBytes || fs.readFileSync(path.join(__dirname, 'fixtures/documents/statement.png'));
   const fetch = async (url, opts) => {
     assert.equal(url, 'http://fixture.invalid/v1/chat/completions');
@@ -29,13 +31,15 @@ async function run({ visionModel, probeStatus = 200, descriptionStatus = 200, mi
     return new Response(JSON.stringify({ choices: [{ finish_reason: finishReason, message: { content: 'Fixture image: invoice INV-2042 total 34.95' } }] }), { status: descriptionStatus });
   };
   const context = {
+    setInterval, clearInterval,
+    modelManager:{enabled:true,health:async()=>({ok:true,body:{all_models_loaded:[{model_name:'answer-model',loaded:true,recipe_options:{ctx_size:32768}}]}})},
     require,
     reasoningEffort: require('./reasoning-effort.cjs'),
     authService: {},
     crypto: require('node:crypto'), AbortController, AbortSignal, TextDecoder, console: { ...console, warn: () => {} }, path, fetch,
     fs: { readFileSync: () => { if (missingAsset) throw new Error('missing fixture'); return bytes; } },
     HISTORY_CAP: 20, DEFAULT_PROVIDER_ID: 'default', createToolExchange,
-    currentWorkspace: () => ({ userId, assetDir: () => '/synthetic-only' }),
+    currentWorkspace: () => ({ userId, dir:contextDir, assetDir: () => '/synthetic-only' }),
     getProject: () => ({ id: projectId, model: 'answer-model', assets: [
       { id: 'image-a', name: 'statement.png', mime: 'image/png' }, { id: 'image-b', name: 'copy.png', mime: 'image/png' },
     ] }),

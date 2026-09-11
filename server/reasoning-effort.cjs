@@ -40,14 +40,16 @@ function requestBody(body, effort, mode, provider) {
     : { ...body, reasoning_effort: effort };
   const budgetField = provider?.baseUrl && new URL(provider.baseUrl).origin === 'https://api.openai.com' ? 'max_completion_tokens' : 'max_tokens';
   return { ...body, messages: [{ role: 'system', content: HINTS[effort] }, ...body.messages],
-    ...(effort === 'high' ? { [budgetField]: Math.max(body[budgetField] || 0, 8192) } : {}) };
+    ...(effort === 'high' ? { [budgetField]: body[budgetField] || body.max_tokens || 8192 } : {}) };
 }
 async function requestWithEffort(fetcher, url, options, body, provider, model, effort, report) {
+  const explicitBudget=!!(body.max_tokens || body.max_completion_tokens);
+  if(body.max_tokens && new URL(provider.baseUrl).origin==='https://api.openai.com'){body={...body,max_completion_tokens:body.max_tokens};delete body.max_tokens;}
   let mode = modeFor(provider, model, effort);
   const key = capabilityKey(provider,model);
   const prepare = () => {
     const value=requestBody(body,effort,mode,provider);
-    if (mode === 'hint' && rejectedBudget.has(key)) {delete value.max_tokens;delete value.max_completion_tokens;}
+    if (mode === 'hint' && !explicitBudget && rejectedBudget.has(key)) {delete value.max_tokens;delete value.max_completion_tokens;}
     return value;
   };
   let request=prepare();
@@ -59,7 +61,7 @@ async function requestWithEffort(fetcher, url, options, body, provider, model, e
       report({type:'warning',text:'This provider rejected reasoning effort. Using a best-effort hint instead.'});
       request=prepare();
       response=await fetcher(url,{...options,body:JSON.stringify(request)});
-    } else if (mode === 'hint' && effort === 'high' && /max_(?:completion_)?tokens/i.test(detail)) {
+    } else if (mode === 'hint' && !explicitBudget && effort === 'high' && /max_(?:completion_)?tokens/i.test(detail)) {
       rejectedBudget.add(key);
       report({type:'warning',text:'This provider rejected the output budget. The effort hint remains active with the provider’s default budget.'});
       request=prepare();

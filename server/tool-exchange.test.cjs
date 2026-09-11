@@ -11,6 +11,8 @@ const { createToolExchange } = require('./tool-exchange.cjs');
 // are mocked; the streaming loop, permission gate and SSE pairing are real.
 const source = fs.readFileSync(require.resolve('./index.cjs'), 'utf8');
 const handler = source.slice(source.indexOf('async function handleChat('), source.indexOf('// ── Routing'));
+const contextDir=fs.mkdtempSync(require('node:path').join(require('node:os').tmpdir(),'chat-handler-test-'));
+test.after(()=>fs.rmSync(contextDir,{recursive:true,force:true}));
 
 function fixture({ rounds, decision = 'approve', execute, fallback = false, cancel = false, effort, reasoningOnly = false, skills = [] } = {}) {
   const events = [], executions = [], approvals = [], requests = [], audits = [];
@@ -18,16 +20,18 @@ function fixture({ rounds, decision = 'approve', execute, fallback = false, canc
   const res = new EventEmitter();
   res.writeHead = () => {};
   res.write = (line) => events.push(JSON.parse(line.slice(6)));
-  res.end = () => { res.writableEnded = true; };
+  res.end = () => { res.writableEnded = true; res.emit('finish'); };
   function completion(options) {
     requests.push(JSON.parse(options.body));
     return rounds[round++] || [];
   }
   const context = {
+    setInterval, clearInterval,
+    modelManager:{enabled:true,health:async()=>({ok:true,body:{all_models_loaded:[{model_name:'synthetic-model',loaded:true,recipe_options:{ctx_size:32768}}]}})},
     require, reasoningEffort: require('./reasoning-effort.cjs'),
     AbortController, AbortSignal, TextDecoder, console, createToolExchange,
     crypto: require('node:crypto'), HISTORY_CAP: 20, DEFAULT_PROVIDER_ID: 'default',
-    currentWorkspace: () => ({ userId: 'synthetic-user' }),
+    currentWorkspace: () => ({ userId: 'synthetic-user',dir:contextDir }),
     requestScope: { getStore: () => ({ workspace: { userId: 'synthetic-user' } }) },
     getProject: (id) => ({ id, model: 'synthetic-model', reasoningEffort: effort }),
     skillsIndexFor: () => skills, getProvider: () => ({ id: 'default', baseUrl: 'http://fixture.invalid', label: 'Mock' }),
@@ -203,7 +207,7 @@ for (const fallback of [false,true]) test(`high hints reach every real handler t
   await result.run();
   assert.ok(result.requests.length >= 2);
   for(const request of result.requests){
-    assert.equal(request.max_tokens,8192);
+    assert.equal(request.max_tokens,4096);
     assert.equal(request.reasoning_effort,undefined);
     assert.equal(request.messages[0].content,'Think through this step by step before answering.');
   }

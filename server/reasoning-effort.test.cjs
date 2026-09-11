@@ -66,3 +66,9 @@ test('configured local Qwen uses actual template thinking switches, preserves op
   assert.equal(sent[0].chat_template_kwargs.enable_thinking,false);assert.equal(sent[0].reasoning_effort,undefined);
  } finally {for(const [key,val] of [['MODEL_MANAGER_KIND',prior.kind],['INFERENCE_BASE_URL',prior.url]]){if(val===undefined)delete process.env[key];else process.env[key]=val;}}
 });
+
+test('explicit context budget is never raised or removed by high effort',async()=>{
+ const p={id:'budget-test',baseUrl:'https://fixture.invalid'}, requests=[];
+ const response=await requestWithEffort(async(_,options)=>{requests.push(JSON.parse(options.body));return new Response('max_tokens unsupported',{status:400});},p.baseUrl,{}, {model:'synthetic',messages:[],max_tokens:2048},p,'synthetic','high',()=>{});
+ assert.equal(response.status,400);assert.equal(requests.length,1);assert.equal(requests[0].max_tokens,2048);
+});
