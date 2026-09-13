@@ -25,3 +25,24 @@ test('continues collecting a single synthetic exchange after browser disconnect'
  const controller=new AbortController();const response=await fetch(`http://127.0.0.1:${proxy.address().port}`,{signal:controller.signal});await response.body.getReader().read();controller.abort();
  release();await done;const [row]=jobs.list(w,data.entryDay);assert.equal(row.content,'RECOVERED-ANSWER');assert.equal(row.state,'complete');assert.equal(calls,1);
 });
+test('optional preparation survives interruption without retaining approval actions',t=>{
+ const w=fixture(t),j=jobs.start(w,{...data,kind:'preparation'});
+ j.event({type:'tool_pending',index:0,name:'synthetic_write',args:'{"text":"fixture"}',id:'live-approval-secret'});j.finish();
+ const [row]=jobs.list(w,data.entryDay);assert.equal(row.kind,'preparation');assert.equal(row.state,'uncertain');
+ assert.equal(row.tools[0].status,'denied');assert.equal(JSON.stringify(row).includes('live-approval-secret'),false);
+ assert.throws(()=>jobs.start(w,{...data,exchangeId:'capture-synthetic-12345',preparationId:data.exchangeId}),e=>e.status===409);
+});
+test('completed preparation links only within its tenant, day and matching message',t=>{
+ const w=fixture(t),j=jobs.start(w,{...data,kind:'preparation'});
+ j.event({type:'tool_result',index:0,name:'synthetic_read',text:'Synthetic result'});j.event({type:'done'});j.finish();
+ assert.equal(jobs.list(w,data.entryDay)[0].state,'complete');
+ assert.throws(()=>jobs.start(w,{...data,exchangeId:'capture-synthetic-12345',preparationId:data.exchangeId,message:'different'}),e=>e.status===409);
+ assert.throws(()=>jobs.start(fixture(t),{...data,exchangeId:'capture-synthetic-12345',preparationId:data.exchangeId}));
+ const capture=jobs.start(w,{...data,exchangeId:'capture-synthetic-12345',preparationId:data.exchangeId});capture.finish();
+ assert.equal(jobs.list(w,data.entryDay)[1].preparationId,data.exchangeId);
+});
+test('preparation history is bounded and explicitly marks truncated results',t=>{
+ const w=fixture(t),j=jobs.start(w,{...data,kind:'preparation'});
+ for(let index=0;index<96;index++)j.event({type:'tool_result',index,name:'synthetic',text:'x'.repeat(20000)});
+ j.finish();const [row]=jobs.list(w,data.entryDay);assert.equal(row.truncated,true);assert.ok(row.tools.reduce((n,t)=>n+t.args.length,0)<=64000);
+});

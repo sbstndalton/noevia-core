@@ -1942,6 +1942,18 @@ const corpusSource =
 // ── Chat ────────────────────────────────────────────────────────────────────
 
 async function handleChat(req, res, body, authn) {
+  let preparation;
+  if(body?.spaceId==='diary-extras'&&body.recoveryId){
+    if(body.extrasEnabled!==true || !authn || !authService.diaryEnabled(authn.user.id) || !getProject(diaryExtras.PROJECT_ID))return json(res,400,{error:'Diary extras are not enabled.'});
+    if(typeof body.message!=='string'||!body.message)return json(res,400,{error:'message required'});
+    try{preparation=require('./diary-jobs.cjs').start(currentWorkspace(),{entryDay:body.entryDay,exchangeId:body.recoveryId,message:body.message,kind:'preparation'});}
+    catch(error){return json(res,error.status||500,{error:error.status?error.message:'Could not save preparation recovery; no tools were run.'});}
+  }
+  try{return await handleChatInner(req,res,body,authn,preparation);}
+  finally{preparation?.finish();}
+}
+
+async function handleChatInner(req, res, body, authn, preparation) {
   const { spaceId, message, history } = body || {};
   if (spaceId === 'diary-extras') {
     if (body.extrasEnabled !== true) return json(res, 400, { error: 'Extra attachments and tools are off' });
@@ -2029,12 +2041,12 @@ async function handleChat(req, res, body, authn) {
     }
   }
 
-  const send = (obj) => { if (!res.destroyed && !chatSignal.signal.aborted) res.write(`data: ${JSON.stringify(obj)}\n\n`); };
+  const send = (obj) => { preparation?.event(obj); if (!res.destroyed && !chatSignal.signal.aborted) res.write(`data: ${JSON.stringify(obj)}\n\n`); };
 
   // One streamed journaled exchange; never retry implicitly after a disconnect.
   if (spaceId === 'diary') {
     let job;
-    if(body.exchangeId){try{job=require('./diary-jobs.cjs').start(chatWorkspace,{entryDay:body.entryDay,exchangeId:body.exchangeId,message});}catch(e){return json(res,e.status||500,{error:e.status?e.message:'Could not create recovery record; no diary request was sent.'});}}
+    if(body.exchangeId){try{job=require('./diary-jobs.cjs').start(chatWorkspace,{entryDay:body.entryDay,exchangeId:body.exchangeId,message,preparationId:body.preparationId});}catch(e){return json(res,e.status||500,{error:e.status?e.message:'Could not create recovery record; no diary request was sent.'});}}
     return require('./diary-stream.cjs').proxyDiaryStream(res, `${DIARY_BASE}/v1/chat/completions`, {
       method: 'POST', headers: diaryHeaders(), body: JSON.stringify({stream:true, diary_events:true, messages:msgs,
         session_id:body.sessionId, entryTime:body.entryTime, entryDay:body.entryDay,
