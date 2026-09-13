@@ -4039,6 +4039,7 @@ if (require.main === module) {
       list: async (id, path) => (await call(id, '/files?path='+encodeURIComponent(path), 'GET')).files,
       read: (id, path) => call(id, '/file', 'POST', { path }),
       write: (id, body) => call(id, '/file', 'PUT', body),
+      mkdir: (id, path) => call(id, '/directory', 'POST', { path }),
     } });
     const davServer = http.createServer((req, res) => { handler(req, res).catch(() => res.destroy()); });
     davServer.requestTimeout = 60000; davServer.headersTimeout = 15000;

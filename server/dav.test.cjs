@@ -78,3 +78,21 @@ test('DAV rejects oversized writes and fails storage errors without leaking inte
  assert.equal((await request('PUT','large.md','x'.repeat(512*1024+1),{'If-None-Match':'*'})).status,413);
  f.files.list=async()=>{throw Error('private backend detail');};const r=await request('GET','entry.md');assert.equal(r.status,502);assert.equal(await r.text(),'Diary storage is unavailable');
 });
+test('MKCOL is create-only, scoped and refuses bodies and unsupported conditions',async t=>{
+ const f=fixture(t),made=[];
+ f.files.mkdir=async(id,path)=>{if(path==='missing/child')throw Object.assign(Error('Missing parent'),{status:409});if(made.includes(path)||path==='entry.md')throw Object.assign(Error('Exists'),{status:405});assert.equal(id,'alice');made.push(path);};
+ const request=await server(t,f);
+ assert.equal((await request('MKCOL','folder/')).status,403);
+ f.settings.save(f.user('alice'),{scope:'lan',acknowledgeCleartext:true});
+ assert.match((await request('OPTIONS')).headers.get('allow'),/MKCOL/);
+ assert.equal((await request('MKCOL','folder/')).status,201);
+ assert.equal((await request('MKCOL','folder/')).status,405);
+ assert.equal((await request('MKCOL','entry.md')).status,405);
+ assert.equal((await request('MKCOL','missing/child/')).status,409);
+ assert.equal((await request('MKCOL','')).status,405);
+ assert.equal((await request('MKCOL','body','<collection/>')).status,415);
+ assert.equal((await request('MKCOL','conditional',undefined,{'If-None-Match':'*'})).status,400);
+ assert.equal((await request('MKCOL','%2e%2e/escape')).status,400);
+ f.storage.alice='webdav';assert.equal((await request('MKCOL','remote')).status,403);
+ assert.deepEqual(made,['folder']);assert.equal(f.events.filter(e=>e[0]==='dav.mkdir').length,1);
+});

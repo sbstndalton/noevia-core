@@ -46,6 +46,7 @@ async function readBody(req, limit) {
 }
 function createDavHandler({ auth, settings, config, files }) {
   const rate=createRateLimiter(); let active=0;
+  const allow=ALLOW+(files.mkdir?', MKCOL':'');
   return async function handleDav(req,res) {
     res.setHeader('Cache-Control','no-store');res.setHeader('X-Content-Type-Options','nosniff');
     const send=(status,text='',type='text/plain; charset=utf-8')=>{res.statusCode=status;res.setHeader('Content-Type',type);res.setHeader('Content-Length',Buffer.byteLength(text));res.end(req.method==='HEAD'?'':text);};
@@ -78,8 +79,8 @@ function createDavHandler({ auth, settings, config, files }) {
         if(!identity)return challenge();
         const allowed=()=>auth.appPasswords.list(identity.userId).some(p=>p.id===identity.credentialId) && !!auth.db.prepare('SELECT id FROM users WHERE id=? AND disabled_at IS NULL').get(identity.userId) && settings.scope(identity.userId)===config.scope && auth.diaryEnabled(identity.userId) && auth.getStorage(identity.userId).kind==='local';
         if(!allowed())return send(403,'Sharing is off for this account or storage');
-        if(!ALLOW.split(', ').includes(req.method)){res.setHeader('Allow',ALLOW);return send(405,'This Markdown endpoint does not support that operation');}
-        if(req.method==='OPTIONS'){res.setHeader('Allow',ALLOW);return send(200);}
+        if(!allow.split(', ').includes(req.method)){res.setHeader('Allow',allow);return send(405,'This Markdown endpoint does not support that operation');}
+        if(req.method==='OPTIONS'){res.setHeader('Allow',allow);return send(200);}
         const base='/dav/'+encodeURIComponent(username)+'/';
         const href=(p,dir)=>base+p.split('/').filter(Boolean).map(encodeURIComponent).join('/')+(dir&&p?'/':'');
         const lookup=async p=>{
@@ -87,6 +88,16 @@ function createDavHandler({ auth, settings, config, files }) {
           const parent=p.includes('/')?p.slice(0,p.lastIndexOf('/')):'';
           return (await files.list(identity.userId,parent)).find(x=>x.path===p)||null;
         };
+        if(req.method==='MKCOL'){
+          if(!path)return send(405,'The diary root already exists');
+          if(req.headers['content-encoding'] && req.headers['content-encoding']!=='identity')return send(415,'Encoded bodies are unsupported');
+          if(req.headers['if'] || req.headers['if-match'] || req.headers['if-none-match'])return send(400,'Conditional MKCOL is unsupported');
+          if((await readBody(req,8192)).length)return send(415,'MKCOL request bodies are unsupported');
+          if(!allowed())return send(403,'Sharing was disabled');
+          await files.mkdir(identity.userId,path);
+          auth.audit('dav.mkdir',identity.userId,identity.userId,{credentialId:identity.credentialId,path});
+          return send(201);
+        }
         if(req.method==='PUT'){
           if(!path.toLowerCase().endsWith('.md') || raw.endsWith('/'))return send(415,'Only Markdown files can be written');
           if(req.headers['content-encoding'] && req.headers['content-encoding']!=='identity')return send(415,'Encoded bodies are unsupported');
@@ -138,7 +149,7 @@ function createDavHandler({ auth, settings, config, files }) {
         }
         return send(207,`<?xml version="1.0" encoding="utf-8"?><d:multistatus xmlns:d="DAV:">${rows.join('')}</d:multistatus>`,'application/xml; charset=utf-8');
       } finally { active--; }
-    } catch(e) { return send(e.status===409?412:e.status||502,e.status?e.message:'Diary storage is unavailable'); }
+    } catch(e) { return send(e.status===409&&req.method==='PUT'?412:e.status||502,e.status?e.message:'Diary storage is unavailable'); }
   };
 }
 module.exports={createDavHandler,properties};
