@@ -65,3 +65,11 @@ test('a corrupt or missing usage file reads as empty rather than throwing', (t) 
   recordUsage(ws, 'm', { promptTokens: 1, completionTokens: 1 });
   assert.equal(readUsage(ws).days[usageDayKey()].input, 1);
 });
+
+test('invalid provider counts are ignored and prototype-shaped model names remain ordinary own keys',t=>{
+ const ws=workspace(t);recordUsage(ws,'bad',{promptTokens:-1,completionTokens:20});recordUsage(ws,'bad',{promptTokens:Infinity});
+ assert.deepEqual(readUsage(ws).days,{});
+ recordUsage(ws,'__proto__',{promptTokens:3,completionTokens:4});
+ const models=readUsage(ws).days[usageDayKey()].models;
+ assert.equal(Object.hasOwn(models,'__proto__'),true);assert.equal(models.__proto__.input,3);assert.equal({}.input,undefined);
+});

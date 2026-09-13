@@ -472,7 +472,7 @@ function recordUsage(workspace, model, usage) {
   if (!workspace || !usage) return;
   const input = Number(usage.promptTokens) || 0;
   const output = Number(usage.completionTokens) || 0;
-  if (!input && !output) return;
+  if (!Number.isFinite(input) || !Number.isFinite(output) || input<0 || output<0 || (!input && !output)) return;
   try {
     const store = readUsage(workspace);
     const key = usageDayKey();
@@ -481,6 +481,7 @@ function recordUsage(workspace, model, usage) {
     day.output += output;
     day.replies += 1;
     const name = String(model || 'unknown');
+    day.models=Object.assign(Object.create(null),day.models||{});
     const perModel = day.models[name] || { input: 0, output: 0, replies: 0 };
     perModel.input += input;
     perModel.output += output;
@@ -2843,10 +2844,7 @@ async function handleRequestScoped(req, res) {
               configured: true,
               error: mcpState.error,
               discovered: mcpState.tools.size,
-              servers: MCP_SERVERS.map((sv) => {
-                const st = mcpState.servers.get(sv.id);
-                return { id: sv.id, auth: sv.auth, error: (st && st.error) || null, discovered: (st && st.toolCount) || 0 };
-              }),
+              servers: require('./mcp-status.cjs').describeMcpServers(MCP_SERVERS,mcpState.servers,mcpState.tools,MCP_TOOLBOX_MANIFEST),
             }
           : { configured: false },
       });
@@ -2969,63 +2967,31 @@ async function handleRequestScoped(req, res) {
     }
 
     // ── Projects CRUD ──
-    if (p === '/api/usage' && req.method === 'GET') {
-      const store = readUsage(currentWorkspace());
-      const today = usageDayKey();
-      // The heat map wants a dense year: every day present, zeros included,
-      // so the client never has to reconstruct the calendar itself.
-      const days = [];
-      const cursor = new Date();
-      cursor.setHours(12, 0, 0, 0); // midday avoids DST days shifting the key
-      for (let i = USAGE_RETENTION_DAYS - 1; i >= 0; i--) {
-        const at = new Date(cursor.getTime() - i * 86400000);
-        const key = usageDayKey(at);
-        const bucket = store.days[key];
-        days.push({
-          day: key,
-          input: bucket?.input || 0,
-          output: bucket?.output || 0,
-          replies: bucket?.replies || 0,
-        });
+    const usageSummary = require('./usage-summary.cjs');
+    const usageRates = () => {
+      try { return usageSummary.validateRates(JSON.parse(authService.db.prepare("SELECT value FROM settings WHERE key='usage_rates'").get()?.value || '{"currency":"USD","rates":[]}')); }
+      catch { return {currency:'USD',rates:[]}; }
+    };
+    if (p === '/api/usage/rates') {
+      if(req.method==='GET')return json(res,200,{...usageRates(),admin:authn.user.role==='admin'});
+      if(req.method==='PUT'){
+        if(authn.user.role!=='admin')return json(res,403,{error:'administrator required'});
+        try{
+          const rates=usageSummary.validateRates(await readJson(req));
+          authService.db.prepare("INSERT INTO settings(key,value) VALUES('usage_rates',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(JSON.stringify(rates));
+          return json(res,200,{...rates,admin:true});
+        }catch(error){return json(res,400,{error:error.message||'Invalid rates'});}
       }
-      const windowTotals = (n) => days.slice(-n).reduce(
-        (acc, d) => ({ input: acc.input + d.input, output: acc.output + d.output, replies: acc.replies + d.replies }),
-        { input: 0, output: 0, replies: 0 },
-      );
-      const models = {};
-      for (const bucket of Object.values(store.days)) {
-        for (const [name, m] of Object.entries(bucket.models || {})) {
-          const entry = models[name] || { input: 0, output: 0, replies: 0 };
-          entry.input += m.input || 0;
-          entry.output += m.output || 0;
-          entry.replies += m.replies || 0;
-          models[name] = entry;
-        }
-      }
-      // Streak counts back from today, but a day with no usage yet does not
-      // break it — otherwise every streak reads 0 until the first reply.
-      let streak = 0;
-      for (let i = days.length - 1; i >= 0; i--) {
-        if (days[i].replies > 0) streak++;
-        else if (days[i].day !== today) break;
-      }
-      let longest = 0;
-      let run = 0;
-      for (const d of days) { run = d.replies > 0 ? run + 1 : 0; if (run > longest) longest = run; }
-      return json(res, 200, {
-        days,
-        allTime: windowTotals(days.length),
-        last7: windowTotals(7),
-        last30: windowTotals(30),
-        activeDays: days.filter((d) => d.replies > 0).length,
-        currentStreak: streak,
-        longestStreak: longest,
-        models: Object.entries(models)
-          .map(([name, m]) => ({ name, ...m }))
-          .sort((a, b) => b.input + b.output - (a.input + a.output)),
-        retentionDays: USAGE_RETENTION_DAYS,
-        timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'server local time',
-      });
+      return json(res,405,{error:'method not allowed'});
+    }
+    if ((p === '/api/usage' || p === '/api/usage/aggregate') && req.method === 'GET') {
+      if(p==='/api/usage/aggregate'&&authn.user.role!=='admin')return json(res,403,{error:'administrator required'});
+      let store,aggregate;
+      if(p==='/api/usage/aggregate'){
+        try {const result=await usageSummary.aggregateUsage(authService.listUsers(),workspaceStore.userDir);store=result.store;aggregate={accounts:result.accounts,unreadableAccounts:result.unreadableAccounts,checkedAt:result.checkedAt};}
+        catch{return json(res,503,{error:'Aggregate usage could not be read within its limits.'});}
+      }else store=readUsage(currentWorkspace());
+      return json(res,200,{...usageSummary.summarizeUsage(store,{dayKey:usageDayKey,retentionDays:USAGE_RETENTION_DAYS,pricing:usageRates()}),...(aggregate?{aggregate}:{})});
     }
     const windowMatch=p.match(/^\/api\/chats\/([^/]+)\/context-window$/);
     if(windowMatch && req.method==='GET') return json(res,200,{meter:require('./chat-context.cjs').read(currentWorkspace().dir,decodeURIComponent(windowMatch[1])).meter||null});
