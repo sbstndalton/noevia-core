@@ -1,0 +1,27 @@
+'use strict';
+const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),os=require('node:os'),path=require('node:path'),http=require('node:http');
+const jobs=require('./diary-jobs.cjs'),{proxyDiaryStream}=require('./diary-stream.cjs');
+const data={entryDay:'2026-09-12',exchangeId:'synthetic-exchange-12345',message:'SYNTHETIC diary request'};
+function fixture(t){const dir=fs.mkdtempSync(path.join(os.tmpdir(),'diary-jobs-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));return{dir};}
+test('records before dispatch, blocks duplicate IDs, scopes by tenant and day',t=>{
+ const w=fixture(t),other=fixture(t),j=jobs.start(w,data);
+ assert.equal(jobs.list(w,data.entryDay)[0].state,'running');assert.deepEqual(jobs.list(other,data.entryDay),[]);
+ assert.throws(()=>jobs.start(w,data),e=>e.status===409);assert.throws(()=>jobs.start(w,{...data,exchangeId:'../../x'}),e=>e.status===400);
+ assert.equal(jobs.validDay('2026-99-99'),false);
+ j.event({type:'answer',text:'Synthetic answer'});j.event({type:'diary',decision:'logged'});j.event({type:'done'});j.finish();
+ assert.equal(jobs.list(w,data.entryDay)[0].state,'complete');
+});
+test('missing completion, saving errors and orphaned running files recover as uncertain',t=>{
+ const w=fixture(t),j=jobs.start(w,data);j.event({type:'answer',text:'Answer without save acknowledgement'});j.finish();assert.equal(jobs.list(w,data.entryDay)[0].state,'uncertain');
+ const file=path.join(w.dir,'diary-conversations',data.entryDay,data.exchangeId+'.json');const row=JSON.parse(fs.readFileSync(file));row.state='running';fs.writeFileSync(file,JSON.stringify(row));assert.equal(jobs.list(w,data.entryDay)[0].state,'uncertain');
+});
+test('continues collecting a single synthetic exchange after browser disconnect',async t=>{
+ const w=fixture(t);let calls=0,release;const gate=new Promise(r=>release=r);
+ const upstream=http.createServer(async(req,res)=>{calls++;res.writeHead(200,{'Content-Type':'text/event-stream'});res.write('data: {"type":"status","text":"Synthetic processing"}\n\n');await gate;res.end('data: {"type":"answer","text":"RECOVERED-ANSWER"}\n\ndata: {"type":"diary","decision":"logged"}\n\ndata: {"type":"done"}\n\n');});
+ await new Promise(r=>upstream.listen(0,'127.0.0.1',r));t.after(()=>upstream.close());
+ let complete;const done=new Promise(r=>complete=r);
+ const proxy=http.createServer(async(req,res)=>{await proxyDiaryStream(res,`http://127.0.0.1:${upstream.address().port}`,{}, {job:jobs.start(w,data),heartbeatMs:50});complete();});
+ await new Promise(r=>proxy.listen(0,'127.0.0.1',r));t.after(()=>proxy.close());
+ const controller=new AbortController();const response=await fetch(`http://127.0.0.1:${proxy.address().port}`,{signal:controller.signal});await response.body.getReader().read();controller.abort();
+ release();await done;const [row]=jobs.list(w,data.entryDay);assert.equal(row.content,'RECOVERED-ANSWER');assert.equal(row.state,'complete');assert.equal(calls,1);
+});

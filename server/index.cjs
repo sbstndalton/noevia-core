@@ -2032,11 +2032,13 @@ async function handleChat(req, res, body, authn) {
 
   // One streamed journaled exchange; never retry implicitly after a disconnect.
   if (spaceId === 'diary') {
+    let job;
+    if(body.exchangeId){try{job=require('./diary-jobs.cjs').start(chatWorkspace,{entryDay:body.entryDay,exchangeId:body.exchangeId,message});}catch(e){return json(res,e.status||500,{error:e.status?e.message:'Could not create recovery record; no diary request was sent.'});}}
     return require('./diary-stream.cjs').proxyDiaryStream(res, `${DIARY_BASE}/v1/chat/completions`, {
       method: 'POST', headers: diaryHeaders(), body: JSON.stringify({stream:true, diary_events:true, messages:msgs,
         session_id:body.sessionId, entryTime:body.entryTime, entryDay:body.entryDay,
         extrasEnabled:body.extrasEnabled === true, extraContext:diaryExtras.reference(body)})
-    }, {onEvent:event=>{if(event.type==='mtp')require('./mtp.cjs').record(chatWorkspace?.userId,event.model,event.timings);}});
+    }, {job,onEvent:event=>{if(event.type==='mtp')require('./mtp.cjs').record(chatWorkspace?.userId,event.model,event.timings);}});
   }
 
   // ── Ordinary space / project chat: routed via the project's provider ──
@@ -3870,6 +3872,12 @@ async function handleRequestScoped(req, res) {
         progress: typeof j.percent === 'number' ? j.percent / 100 : typeof j.progress === 'number' ? j.progress : null,
         status: j.status || j.state || '',
       })));
+    }
+
+    if(p==='/api/diary/exchanges' && req.method==='GET') {
+      if(!authService.diaryEnabled(authn.user.id))return json(res,404,{error:'Diary add-on is disabled'});
+      try{return json(res,200,{exchanges:require('./diary-jobs.cjs').list(currentWorkspace(),url.searchParams.get('day'))});}
+      catch(e){return json(res,e.status||500,{error:e.status?e.message:'Could not read recovery records'});}
     }
 
     if (['/api/diary/files', '/api/diary/file', '/api/diary/local-exchange'].includes(p)) {
