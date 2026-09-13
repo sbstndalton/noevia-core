@@ -39,7 +39,7 @@ test('completed preparation links only within its tenant, day and matching messa
  assert.throws(()=>jobs.start(w,{...data,exchangeId:'capture-synthetic-12345',preparationId:data.exchangeId,message:'different'}),e=>e.status===409);
  assert.throws(()=>jobs.start(fixture(t),{...data,exchangeId:'capture-synthetic-12345',preparationId:data.exchangeId}));
  const capture=jobs.start(w,{...data,exchangeId:'capture-synthetic-12345',preparationId:data.exchangeId});capture.finish();
- assert.equal(jobs.list(w,data.entryDay)[1].preparationId,data.exchangeId);
+ assert.equal(jobs.list(w,data.entryDay).find(row=>row.id==='capture-synthetic-12345').preparationId,data.exchangeId);
 });
 test('preparation history is bounded and explicitly marks truncated results',t=>{
  const w=fixture(t),j=jobs.start(w,{...data,kind:'preparation'});
