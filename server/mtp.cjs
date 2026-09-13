@@ -41,7 +41,7 @@ function capability(model) {
   const supported=model.recipe==='llamacpp' && model.labels?.includes('mtp');
   const type=specType(model.recipe_options?.llamacpp_args);
   return {supported:!!supported, enabled:supported ? (type===null || type.split(',').includes('draft-mtp')) : false,
-    reason:supported ? 'Native MTP detected. Applies to this shared model when loaded.' : 'This installed file does not report MTP weights. Even if the original model supports MTP, its GGUF must include the MTP head. Use an MTP-enabled checkpoint.'};
+    reason:supported ? 'Native MTP detected. Applies to this shared model when loaded.' : 'MTP head presence is unverified: the model manager does not report native MTP for this installation. Check the exact download files; a missing label is not proof that the head is absent.'};
 }
 function loadOptions(model, enabled) {
   if(typeof enabled!=='boolean') throw new Error('MTP must be Yes or No');
