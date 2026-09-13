@@ -11,6 +11,8 @@ test('cold auto-selected fast model is loaded before resolving its own allocatio
  assert.equal(result.limit,131072);assert.deepEqual(calls,['health',['load','fast'],'health']);
  const records=fs.readdirSync(dir).map(f=>JSON.parse(fs.readFileSync(path.join(dir,f))));
  assert.equal(records[0].current.model,'fast');assert.equal(records[0].current.limit,131072);
+ assert.equal(records[0].current.managerVersion,'1');assert.equal(records[0].current.engineVersion,null);
+ assert.equal(records[0].current.qualification,'allocation-observation-only');assert.equal(records[0].current.backendVersion,undefined);
 });
 test('remembered contexts are per provider/model and never override smaller live allocations',async t=>{
  const dir=fixture(t);let health=loadedHealth('fast',131072);

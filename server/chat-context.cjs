@@ -39,7 +39,7 @@ async function resolveRuntimeLimit({manager,model,dir,scope,onStatus=()=>{},sign
     const id='runtime-model:'+fingerprint([scope,model]);
     const previous=read(dir,id);
     const configuration=fingerprint([health.version,entry.checkpoint,entry.recipe_options]);
-    const observation={model,limit:result.limit,source:result.limitSource,configuration,backendVersion:health.version,observedAt:Date.now()};
+    const observation={model,limit:result.limit,source:result.limitSource,configuration,managerVersion:health.version,engineVersion:null,qualification:'allocation-observation-only',observedAt:Date.now()};
     const history=Array.isArray(previous.history)?previous.history:[];
     if (previous.current && previous.current.configuration!==configuration) history.push(previous.current);
     save(dir,id,{current:observation,history:history.slice(-20)});
