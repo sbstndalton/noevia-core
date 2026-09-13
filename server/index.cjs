@@ -239,6 +239,7 @@ function loadProjects() {
 }
 
 function saveProjects(projects) {
+  for (const project of projects) require("./instruction-skills.cjs").reconcile(project);
   currentWorkspace().projects = Array.from(projects);
   currentWorkspace().saveProjects();
 }
@@ -246,7 +247,9 @@ function saveProjects(projects) {
 const PROJECTS = arrayProxy('projects');
 
 function getProject(id) {
-  return PROJECTS.find((p) => p.id === id) || null;
+  const project = PROJECTS.find((p) => p.id === id) || null;
+  if (project && require('./instruction-skills.cjs').reconcile(project)) currentWorkspace().saveProjects();
+  return project;
 }
 
 // ── Provider registry (step 9): generic OpenAI-compatible endpoints ────────
@@ -560,7 +563,7 @@ const CORE_TOOLS = [
     function: {
       name: 'read_project_file',
       description:
-        'Read an attached source by exact name. For PDFs use startPage/endPage (up to 5 pages) and offset to read beyond summaries; results include page and version references.',
+        'Read an attached source or enabled instruction skill by exact name. Skills support offset pagination. For PDFs use startPage/endPage (up to 5 pages) and offset to read beyond summaries; results include page and version references.',
       parameters: {
         type: 'object',
         properties: { name: { type: 'string', description: 'Exact file name, e.g. notes.md' }, startPage: { type: 'integer', minimum: 1 }, endPage: { type: 'integer', minimum: 1 }, offset: { type: 'integer', minimum: 0 } },
@@ -727,7 +730,7 @@ function pruneDocuments(project) {
 }
 function indexSource(project, file) {
   const workspace = currentWorkspace();
-  if (!file.content) {
+  if (require('./instruction-skills.cjs').inspect(file, project) || !file.content) {
     if (file.document) file.document.indexing = 'unavailable';
     rag.deleteProjectFile(project.id, file.name, workspace.userId);
     return;
@@ -1594,26 +1597,8 @@ function toolboxSummaries() {
 // as a skill: its name/description go into the system prompt as a always-on
 // index (L0), and the model is told it can request the full body through the
 // read_project_file tool (L1) — progressive disclosure, zero extra deps.
-function parseSkillFrontmatter(content) {
-  const m = /^---\r?\n([\s\S]*?)\r?\n---/.exec(String(content || ''));
-  if (!m) return null;
-  const meta = {};
-  for (const line of m[1].split(/\r?\n/)) {
-    const kv = /^([A-Za-z_][\w-]*):\s*(.*)$/.exec(line.trim());
-    if (kv) meta[kv[1].toLowerCase()] = kv[2].trim().replace(/^['"]|['"]$/g, '');
-  }
-  if (!meta.name && !meta.description) return null;
-  return { name: meta.name || '', description: meta.description || '', version: meta.version || '' };
-}
-
 function skillsIndexFor(project) {
-  const files = (project && Array.isArray(project.files)) ? project.files : [];
-  const skills = [];
-  for (const f of files) {
-    const skill = parseSkillFrontmatter(f.content);
-    if (skill) skills.push({ file: f.name, ...skill });
-  }
-  return skills;
+  return require('./instruction-skills.cjs').enabled(project);
 }
 
 async function executeToolCall(project, name, rawArgs, allowed) {
@@ -1650,6 +1635,8 @@ async function executeToolCall(project, name, rawArgs, allowed) {
       const names = files.map((x) => x.name).join(', ') || '(none attached)';
       return `ERROR: no project file named "${wanted}". Available: ${names}`;
     }
+    const instructionSkills = require('./instruction-skills.cjs');
+    if (instructionSkills.inspect(f, project)) return instructionSkills.read(project, f, getProject(project.id), args.offset ?? 0, TOOL_RESULT_CAP);
     if (f.attachment?.state === 'stored') return `${f.name}: original stored; readable contents are unavailable. Contents have not been read.`;
     if (f.document && args.startPage !== undefined) {
       try {
@@ -2009,12 +1996,14 @@ async function handleChat(req, res, body, authn) {
     }
   }
 
+  if (project) project = require('./instruction-skills.cjs').snapshot(project); // Pin reviewed skill bodies/config for this exchange.
+
   // Project knowledge files: RAG retrieval replaces whole-file pasting (step 10).
   // rag.filesContext never throws; on any RAG failure it falls back to verbatim
   // injection (small files whole, big files capped) — the old behavior.
   let filesBlock = null;
   if (project && Array.isArray(project.files) && project.files.length) {
-    filesBlock = await rag.filesContext(project.id, project.files, message, currentWorkspace().userId);
+    filesBlock = await rag.filesContext(project.id, require('./instruction-skills.cjs').sources(project), message, currentWorkspace().userId);
   }
 
   const sysParts = [];
@@ -3157,9 +3146,7 @@ async function handleRequestScoped(req, res) {
       // Index any files that arrived with the create call (same RAG bookkeeping
       // as the config route).
       for (const f of project.files) {
-        rag.indexProjectFile(project.id, f.name, f.content, currentWorkspace().userId)
-          .then((r) => console.log(`[rag] indexed ${project.id}/${f.name}:`, JSON.stringify(r)))
-          .catch((err) => console.warn(`[rag] index failed for ${project.id}/${f.name}:`, err?.message || err));
+        indexSource(project, f);
       }
       return json(res, 200, project);
     }
@@ -3181,6 +3168,20 @@ async function handleRequestScoped(req, res) {
         }
       } catch { /* best effort */ }
       return json(res, 200, { ok: true });
+    }
+
+    const skillRoute = p.match(/^\/api\/projects\/([^/]+)\/instruction-skills$/);
+    if (skillRoute && ['GET', 'PUT'].includes(req.method)) {
+      const project = getProject(decodeURIComponent(skillRoute[1]));
+      if (!project) return json(res, 404, {error: 'No such project'});
+      const skills = require('./instruction-skills.cjs');
+      if (req.method === 'PUT') {
+        try { skills.setSelection(project, await readJson(req)); }
+        catch (err) { return json(res, err.status || 400, {error: err.message}); }
+        project.updatedAt = Date.now();
+        saveProjects(PROJECTS);
+      }
+      return json(res, 200, {skills: skills.list(project)});
     }
 
     const projCfg = p.match(/^\/api\/projects\/([^/]+)\/config$/);
@@ -3262,9 +3263,7 @@ async function handleRequestScoped(req, res) {
         for (const next of project.files) {
           const prev = prevByName.get(next.name);
           if (!prev || prev.content !== next.content) {
-            rag.indexProjectFile(id, next.name, next.content, currentWorkspace().userId)
-              .then((r) => console.log(`[rag] indexed ${id}/${next.name}:`, JSON.stringify(r)))
-              .catch((err) => console.warn(`[rag] index failed for ${id}/${next.name}:`, err?.message || err));
+            indexSource(project, next);
           }
         }
       }

@@ -298,7 +298,8 @@ async function filesContext(projectId, files, query, userId) {
   if (ragAvailable() && large.length > 0) {
     const hits = await searchProject(projectId, query, userId);
     if (hits.length > 0) {
-      for (const h of hits) parts.push(`[from ${h.file}] ${h.body}`);
+      const permitted = new Set(files.map(f => f.name));
+      for (const h of hits) if (permitted.has(h.file)) parts.push(`[from ${h.file}] ${h.body}`);
     }
   }
   if (parts.length === 0) {

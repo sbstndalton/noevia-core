@@ -24,7 +24,7 @@ test('page reads reach the last page beyond the project summary cap and paginate
   const next = sources.readPages(w, 'p', f, 1, 5, 100, 100);
   assert.notEqual(first.text, next.text);
   const server = fs.readFileSync(path.join(__dirname, 'index.cjs'), 'utf8');
-  const context = { documents, documentSources: sources, currentWorkspace: () => w, TOOL_RESULT_CAP: 8000 };
+  const context = { require, documents, documentSources: sources, currentWorkspace: () => w, TOOL_RESULT_CAP: 8000 };
   vm.createContext(context);
   vm.runInContext(server.slice(server.indexOf('async function executeToolCall('), server.indexOf('async function executeMcpToolCall(')), context);
   const out = await context.executeToolCall({ id: 'p', files: [f] }, 'read_project_file', JSON.stringify({ name: 'long.pdf', startPage: 110 }));
