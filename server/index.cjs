@@ -2259,14 +2259,14 @@ async function handleChat(req, res, body, authn) {
   }
   const runTool = createToolExchange({ allowed: allowedToolNames, isWrite: isWriteTool, signal: chatSignal.signal });
   const context = require('./chat-context.cjs');
-  let health=null;
-  if (provider.id === DEFAULT_PROVIDER_ID && modelManager.enabled) {
-    try { const result=await modelManager.health(); if(result.ok)health=result.body; } catch { /* labelled fallback */ }
-  }
-  const {limit,limitSource}=context.runtimeLimit(health,model);
   const contextId=chatId || spaceId;
-  let prepared;
+  let prepared,limit,limitSource;
   try {
+    ({limit,limitSource}=await context.resolveRuntimeLimit({
+      manager:provider.id===DEFAULT_PROVIDER_ID?modelManager:null,model,dir:chatWorkspace.dir,
+      scope:require('node:crypto').createHash('sha256').update(JSON.stringify([provider.baseUrl,provider.apiKey,modelManager.baseUrl])).digest('hex'),
+      signal:chatSignal.signal,onStatus:text=>send({type:'status',text}),
+    }));
     prepared=await context.prepare({dir:chatWorkspace.dir,id:contextId,messages:wire,tools:activeTools,limit,limitSource,model,force:body.compactOnly===true,
       onStatus:text=>send({type:'status',text}),
       summarize:async(summary,older,maxTokens)=>{

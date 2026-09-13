@@ -7,9 +7,44 @@ function stateFile(dir, id) { return path.join(dir, 'context-' + fingerprint(Str
 function read(dir, id) { try { return JSON.parse(fs.readFileSync(stateFile(dir,id),'utf8')); } catch { return {}; } }
 function save(dir,id,state) { fs.mkdirSync(dir,{recursive:true}); const file=stateFile(dir,id),tmp=file+'.'+crypto.randomUUID(); fs.writeFileSync(tmp,JSON.stringify(state),{mode:0o600}); fs.renameSync(tmp,file); }
 function runtimeLimit(health, model) {
-  const entry=health?.all_models_loaded?.find(m=>m.model_name===model && m.loaded);
+  const entry=health?.all_models_loaded?.find(m=>m.model_name===model && m.loaded && m.backend_alive!==false);
   const configured=Number(entry?.recipe_options?.ctx_size);
   return Number.isFinite(configured)&&configured>=2048 ? {limit:Math.floor(configured),limitSource:'Configured backend context'} : {limit:8192,limitSource:'Conservative fallback; backend limit unavailable'};
+}
+async function resolveRuntimeLimit({manager,model,dir,scope,onStatus=()=>{},signal}) {
+  if (!manager?.enabled) return runtimeLimit(null,model);
+  signal?.throwIfAborted();
+  let response=await manager.health();
+  if (!response.ok) throw Error('Could not read the model backend context. Try again when the backend is available.');
+  let health=response.body;
+  if (!health?.all_models_loaded?.some(m=>m.model_name===model && m.loaded && m.backend_alive!==false)) {
+    onStatus('Loading the selected model and checking its context allocation…');
+    signal?.throwIfAborted();
+    const loaded=await manager.load(model);
+    if (!loaded.ok) throw Error('The selected model could not load. Its context allocation was not changed.');
+    signal?.throwIfAborted();
+    response=await manager.health();
+    if (!response.ok) throw Error('The model loaded, but its context allocation could not be checked. Try again.');
+    health=response.body;
+    if (!health?.all_models_loaded?.some(m=>m.model_name===model && m.loaded && m.backend_alive!==false)) {
+      throw Error('The selected model is no longer loaded. Another request may have switched models; try again.');
+    }
+  }
+  signal?.throwIfAborted();
+  const result=runtimeLimit(health,model);
+  const entry=health?.all_models_loaded?.find(m=>m.model_name===model && m.loaded);
+  // Observations are per tenant/provider/model, never a guessed architecture maximum.
+  // Recheck the live backend every time; past allocations do not prove current capacity.
+  if (dir && scope && entry && Number(entry.recipe_options?.ctx_size)>=2048) {
+    const id='runtime-model:'+fingerprint([scope,model]);
+    const previous=read(dir,id);
+    const configuration=fingerprint([health.version,entry.checkpoint,entry.recipe_options]);
+    const observation={model,limit:result.limit,source:result.limitSource,configuration,backendVersion:health.version,observedAt:Date.now()};
+    const history=Array.isArray(previous.history)?previous.history:[];
+    if (previous.current && previous.current.configuration!==configuration) history.push(previous.current);
+    save(dir,id,{current:observation,history:history.slice(-20)});
+  }
+  return result;
 }
 function applySummary(messages,state) {
   const n=state.covered||0;
@@ -59,4 +94,4 @@ function providerError(value) {const text=typeof value==='string'?value:JSON.str
 const busy=new Set();
 async function prepare(options){const key=stateFile(options.dir,options.id);if(busy.has(key))throw Error('This chat is already preparing context. Wait for that request to finish.');busy.add(key);try{return await prepareUnlocked(options);}finally{busy.delete(key);}}
 function remove(dir,id){fs.rmSync(stateFile(dir,id),{force:true});}
-module.exports={remove,tokens,read,save,runtimeLimit,applySummary,measure,prepare,providerError};
+module.exports={remove,tokens,read,save,runtimeLimit,resolveRuntimeLimit,applySummary,measure,prepare,providerError};
