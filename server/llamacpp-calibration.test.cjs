@@ -44,9 +44,17 @@ function fixture(t,{loadCap=40960,longCap=Infinity,native=131072,memory=()=>20,o
         yield enc.encode(`data: ${JSON.stringify({prompt_progress:{total,cache:0,processed,time_ms:processed/speed*1000}})}\n\n`);
         if(processed>=total)break;
       }
-      yield enc.encode(`data: ${JSON.stringify({choices:[{delta:{content:ctx<=longCap?marker:'I do not know'}}],timings:{prompt_n:total,prompt_per_second:speed}})}\n\ndata: [DONE]\n\n`);
+      yield enc.encode(`data: ${JSON.stringify({choices:[{delta:{content:ctx<=longCap?marker:'I do not know'}}],timings:{prompt_n:total,prompt_ms:total/speed*1000,prompt_per_second:speed}})}\n\ndata: [DONE]\n\n`);
     }
-    return new Response(ReadableStream.from(events()),{status:200});
+    // Like Node's fetch body: aborting errors the stream, so leaving a read loop after an
+    // abort re-throws. A stop must therefore exit the loop before aborting.
+    const iterator=events();
+    const readable=new ReadableStream({
+      start(ctl){opts.signal?.addEventListener('abort',()=>{try{ctl.error(Object.assign(Error('aborted'),{name:'AbortError'}));}catch{}},{once:true});},
+      async pull(ctl){const {value,done}=await iterator.next();if(done)ctl.close();else ctl.enqueue(value);},
+      async cancel(){await iterator.return?.();},
+    });
+    return new Response(readable,{status:200});
   };
   const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',presetPath:ini,fetchJson,fetchStream,calibrationStatePath:stateFile,autoconfig:{},calibrationOptions:{sleep:async()=>{},readMemory:memory,now:()=>clock.t,timeouts:{memoryPoll:5}}});
   return {manager,ini,stateFile,original,router,ctxOf};
@@ -70,6 +78,12 @@ test('load checks bound the search; long prompts start mid-range and stop at the
   // 17 sizes from 8K to 128K: the first long test is the middle one, then it moves up.
   assert.deepEqual(long.map(s=>[s.ctx,s.status]),[[65536,'passed'],[98304,'failed'],[81920,'failed'],[73728,'failed']]);
   for(const s of long.filter(s=>s.status==='failed'))assert.match(s.reason,/over the 60 s limit/);
+  // 98K and 80K are clearly over and stop on the forecast; 72K is close, so it runs to
+  // the end and fails on the engine's measured time (66 s).
+  assert.match(long[1].reason,/would take about/);assert.match(long[3].reason,/took 66 s, over the 60 s limit/);
+  assert.ok(long[0].promptSeconds>50&&long[0].promptSeconds<=60,String(long[0].promptSeconds));
+  // The calibrated profile is loaded and ready when the run ends.
+  assert.equal(job.result.loaded,true);assert.equal(router.status.synthetic,'loaded');assert.equal(router.loads.at(-1),65536);
   assert.equal(long[0].promptPerSecond,1000);
   assert.equal(job.result.loadCtx,131072);assert.equal(job.result.verifiedCtx,65536);assert.equal(job.result.appliedCtx,65536);
   assert.equal(ctxOf(),65536);

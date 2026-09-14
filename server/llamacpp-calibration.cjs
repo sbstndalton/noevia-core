@@ -144,6 +144,21 @@ function createCalibrator(deps) {
     return 16; // overestimate so the prompt undershoots rather than overflows
   }
 
+  async function loadAndWait(model) {
+    try {
+      const started = await request('/models/load', { method: 'POST', body: JSON.stringify({ model }) }, 120000);
+      if (!started.ok) return false;
+      const deadline = now() + limits.load;
+      for (let polls = 0; now() <= deadline && polls < 2400; polls++) {
+        const row = (await listing()).find(m => m.id === model);
+        if (row?.status?.value === 'loaded') return true;
+        if (!row || row.status?.failed || row.status?.value === 'unloaded') return false;
+        await sleep(limits.poll);
+      }
+    } catch {}
+    return false;
+  }
+
   // Streams a chat completion with prompt progress. Resolves with the generated text and
   // timing, or overBudget with the predicted total when the prompt would take too long.
   async function streamLong(model, content, controller, record, budgetMs) {
@@ -154,8 +169,10 @@ function createCalibrator(deps) {
     } catch (e) { if (controller.signal.aborted) throw e; return { ok: false, error: 'The long prompt could not be sent.' }; }
     if (!response.ok || !response.body) return { ok: false, error: `The engine rejected the long prompt (HTTP ${response.status}).` };
     const decoder = new TextDecoder();
-    let buffer = '', text = '', promptTokens = null, promptPerSecond = null, lastSave = 0;
-    for await (const chunk of response.body) {
+    let buffer = '', text = '', promptTokens = null, promptPerSecond = null, promptMs = null, lastSave = 0, stopped = null;
+    // Leave the read loop before aborting: exiting a for-await over an already-aborted
+    // body re-throws the abort, which would misreport a deliberate stop as a failure.
+    read: for await (const chunk of response.body) {
       buffer += decoder.decode(chunk, { stream: true });
       let cut;
       while ((cut = buffer.indexOf('\n\n')) >= 0) {
@@ -165,7 +182,7 @@ function createCalibrator(deps) {
           const data = line.slice(5).trim();
           if (!data || data === '[DONE]') continue;
           let value; try { value = JSON.parse(data); } catch { continue; }
-          if (value.error) return { ok: false, error: value.error.message || 'The engine reported an error.' };
+          if (value.error) { stopped = { ok: false, error: value.error.message || 'The engine reported an error.' }; break read; }
           const progress = value.prompt_progress;
           if (progress && progress.total > 0) {
             const done = Math.max(0, progress.processed - (progress.cache || 0)), remaining = progress.total - progress.processed;
@@ -176,21 +193,25 @@ function createCalibrator(deps) {
             if (done >= 512 && progress.time_ms >= 500) {
               const etaMs = elapsed + remaining * (progress.time_ms / done);
               record.etaSeconds = Math.round(Math.max(0, etaMs - elapsed) / 1000);
-              // Allow a grace period so the first, slower batches do not decide alone.
-              if (etaMs > budgetMs && (elapsed > 5000 || etaMs > budgetMs * 2)) { controller.abort(); return { ok: false, overBudget: true, etaMs }; }
+              // Stop early only when clearly over; a size near the limit runs to the end and
+              // is judged by the engine's measured prompt time instead of a forecast.
+              if ((elapsed > 5000 && etaMs > budgetMs * 1.15) || etaMs > budgetMs * 2) { stopped = { ok: false, overBudget: true, predicted: true, etaMs }; break read; }
             }
             if (now() - lastSave > 1500) { lastSave = now(); save(); }
           }
-          if (now() - startedAt > budgetMs * 1.5) { controller.abort(); return { ok: false, overBudget: true, etaMs: now() - startedAt }; }
+          if (now() - startedAt > budgetMs * 1.5) { stopped = { ok: false, overBudget: true, predicted: false, etaMs: now() - startedAt }; break read; }
           const delta = value.choices?.[0]?.delta || {};
           text += `${delta.content || ''}${delta.reasoning_content || ''}`;
-          if (value.timings) { promptTokens = Number(value.timings.prompt_n) || promptTokens; promptPerSecond = Number(value.timings.prompt_per_second) || promptPerSecond; }
+          if (value.timings) { promptTokens = Number(value.timings.prompt_n) || promptTokens; promptPerSecond = Number(value.timings.prompt_per_second) || promptPerSecond; promptMs = Number(value.timings.prompt_ms) || promptMs; }
           if (value.usage?.prompt_tokens) promptTokens = Number(value.usage.prompt_tokens);
         }
       }
     }
+    if (stopped) { controller.abort(); delete record.etaSeconds; return stopped; }
     delete record.etaSeconds;
-    return { ok: true, text, promptTokens, promptPerSecond };
+    const tookMs = promptMs || (now() - startedAt);
+    if (tookMs > budgetMs) return { ok: false, overBudget: true, predicted: false, etaMs: tookMs };
+    return { ok: true, text, promptTokens, promptPerSecond, promptSeconds: Math.round(tookMs / 100) / 10 };
   }
 
   // One measured step: write the context, load, and test. Returns true when it passed.
@@ -242,10 +263,13 @@ function createCalibrator(deps) {
       const budgetMs = job.promptBudgetSeconds * 1000;
       const result = await streamLong(job.model, `Remember the start marker: ${marker}.\n${PAD.repeat(repeats)}\nReturn only the start marker.`, controller, record, budgetMs);
       if (record.memoryFloorHit) return finish('failed', `Available memory fell below ${memoryFloorGib} GiB.`);
-      if (result.overBudget) return finish('failed', `Filling this context would take about ${Math.round(result.etaMs / 1000)} s, over the ${job.promptBudgetSeconds} s limit.`);
+      if (result.overBudget) return finish('failed', result.predicted
+        ? `Filling this context would take about ${Math.ceil(result.etaMs / 1000)} s, over the ${job.promptBudgetSeconds} s limit.`
+        : `Filling this context took ${Math.ceil(result.etaMs / 1000)} s, over the ${job.promptBudgetSeconds} s limit.`);
       if (!result.ok) return finish('failed', result.error || 'The long prompt failed.');
       record.promptTokens = result.promptTokens;
       if (result.promptPerSecond) record.promptPerSecond = Math.round(result.promptPerSecond);
+      if (result.promptSeconds) record.promptSeconds = result.promptSeconds;
       if (!result.text.includes(marker)) return finish('failed', 'The model did not recall the marker from the start of the prompt.');
       if (record.promptTokens && record.promptTokens < target * 0.8) return finish('failed', 'The engine accepted fewer prompt tokens than requested.');
       return finish('passed');
@@ -305,6 +329,10 @@ function createCalibrator(deps) {
       const applied = await applyUnlocked({ model: job.model, baseRevision: presets.get(job.model).revision, options: { ...job.base, 'ctx-size': String(chosen) } });
       if (!applied.ok) throw Object.assign(Error(applied.body?.error || 'Could not save the calibrated profile.'), { fatal: true });
       job.result.appliedCtx = chosen;
+      // Leave the model loaded with its calibrated profile, ready for the next chat.
+      job.phase = 'Loading the calibrated profile';
+      save();
+      job.result.loaded = await loadAndWait(job.model);
       job.status = 'passed';
       job.phase = 'Done';
       const props = await request('/props', {}, 8000).catch(() => null);
