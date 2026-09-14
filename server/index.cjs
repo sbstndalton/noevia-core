@@ -3904,6 +3904,12 @@ async function handleRequestScoped(req, res) {
       catch(e){return json(res,e.status||500,{error:e.status?e.message:'Could not read recovery records'});}
     }
 
+    if (p === '/api/diary/workspace-export') {
+      if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
+      if (req.method !== 'GET') return json(res, 405, { error: 'Method not allowed' });
+      return require('./workspace-export.cjs').proxyWorkspaceExport(res, `${DIARY_BASE}/api/workspace-export`, diaryHeaders());
+    }
+
     if (['/api/diary/storage-status', '/api/diary/storage-import'].includes(p)) {
       if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
       const status = p.endsWith('storage-status');
