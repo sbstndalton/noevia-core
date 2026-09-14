@@ -21,13 +21,15 @@ let EMBED_MODEL = 'default';
 let inferenceBase = null;
 let inferenceHeaders = () => ({ 'Content-Type': 'application/json' });
 let dataDirForUser = null;
+let enterInference = () => () => {};
 
-function init({ dataDir, embedModel, inferenceUrl, headersFn, userDataDirFn }) {
+function init({ dataDir, embedModel, inferenceUrl, headersFn, userDataDirFn, inferenceGuard }) {
   RAG_DIR = process.env.RAG_DIR || path.join(dataDir, 'rag');
   dataDirForUser = userDataDirFn || null;
   EMBED_MODEL = process.env.EMBEDDING_MODEL || process.env.EMBED_MODEL || embedModel || EMBED_MODEL;
   inferenceBase = inferenceUrl;
   if (headersFn) inferenceHeaders = headersFn;
+  if (inferenceGuard) enterInference = inferenceGuard;
 }
 // Chunk sizing starts from diary-companion's shape (subsection-scale bodies).
 // ~1200 chars with a 150-char overlap keeps chunks coherent.
@@ -102,6 +104,8 @@ function serializeF32(vec) {
 }
 
 async function embedOnce(texts) {
+  const leave=enterInference();
+  try {
   const res = await fetch(`${inferenceBase.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/embeddings`, {
     method: 'POST',
     headers: inferenceHeaders(),
@@ -110,6 +114,7 @@ async function embedOnce(texts) {
   if (!res.ok) throw new Error(`embeddings ${res.status}: ${(await res.text()).slice(0, 120)}`);
   const body = await res.json();
   return Array.isArray(body?.data) ? body.data : [];
+  } finally {leave();}
 }
 
 async function embed(texts) {

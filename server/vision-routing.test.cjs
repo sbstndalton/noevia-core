@@ -12,8 +12,8 @@ const handler = source.slice(source.indexOf('async function handleChat('), sourc
 const contextDir=fs.mkdtempSync(require('node:path').join(require('node:os').tmpdir(),'chat-handler-test-'));
 test.after(()=>fs.rmSync(contextDir,{recursive:true,force:true}));
 
-async function run({ visionModel, probeStatus = 200, descriptionStatus = 200, missingAsset = false, finishReason = 'stop', cache = new Map(), headers = {}, replacementBytes, userId = 'synthetic-user', projectId = 'fixture-project' } = {}) {
-  const events = [], requests = [];
+async function run({ visionModel, probeStatus = 200, descriptionStatus = 200, missingAsset = false, finishReason = 'stop', cache = new Map(), headers = {}, replacementBytes, userId = 'synthetic-user', projectId = 'fixture-project', native = false } = {}) {
+  const events = [], requests = [], nativeCalls=[];let nativeLoaded=null;
   const res = new EventEmitter();
   res.writeHead = () => {};
   res.write = line => events.push(JSON.parse(line.slice(6)));
@@ -21,7 +21,7 @@ async function run({ visionModel, probeStatus = 200, descriptionStatus = 200, mi
   const bytes = replacementBytes || fs.readFileSync(path.join(__dirname, 'fixtures/documents/statement.png'));
   const fetch = async (url, opts) => {
     assert.equal(url, 'http://fixture.invalid/v1/chat/completions');
-    const body = JSON.parse(opts.body); requests.push(body);
+    const body = JSON.parse(opts.body); requests.push(body);nativeLoaded=body.model;
     if (!missingAsset) assert.ok(events.some(e => e.type === 'status' && /Reading image/.test(e.text)), 'image preparation must be visible before waiting for inference');
     if (body.stream) return { ok: true, body: (async function* () {
       yield Buffer.from('data: ' + JSON.stringify({ choices: [{ delta: { content: 'Synthetic answer' } }] }) + '\n\n');
@@ -48,10 +48,16 @@ async function run({ visionModel, probeStatus = 200, descriptionStatus = 200, mi
     visionDescriptions: cache, visionProbe: createVisionProbe({ fetchImpl: fetch }),
     resolveTools: () => ({ tools: [], dropped: [] }), isWriteTool: () => true,
   };
+  if(native)context.modelManager=require('./model-manager.cjs').createModelManager({kind:'llamacpp',baseUrl:'http://fixture.invalid',fetchJson:async(url,options)=>{
+    nativeCalls.push(url);
+    if(url.endsWith('/models/load'))nativeLoaded=JSON.parse(options.body).model;
+    if(url.includes('/props?'))assert.equal(new URL(url).searchParams.get('autoload'),'false');
+    return {ok:true,status:200,body:url.includes('/props?')?{default_generation_settings:{n_ctx:32768},total_slots:1}:{data:['answer-model','vision-model'].map(id=>({id,status:{value:id===nativeLoaded?'loaded':'unloaded'}}))}};
+  }});
   vm.createContext(context); vm.runInContext(handler, context);
   await context.handleChat({}, res, { projectId: 'fixture-project', chatId: 'fixture-chat', message: 'Read the synthetic total' });
   assert.ok(events.some(e => e.type === 'done'));
-  return { events, requests, answer: requests.find(r => r.stream) };
+  return { events, requests, nativeCalls, answer: requests.find(r => r.stream) };
 }
 
 test('image rejection explains mmproj, omits bytes and tells answering model not to guess', async () => {
@@ -103,4 +109,9 @@ test('description cache reuses exact inputs but isolates credential, content, us
   for (const change of [{ headers: { Authorization: 'synthetic-new-credential' } }, { replacementBytes: Buffer.from('different synthetic bytes') }, { userId: 'other' }, { projectId: 'other' }]) {
     assert.equal(descriptions(await run({ ...opts, ...change })), 1);
   }
+});
+
+test('native one-model router can switch from vision description to answer context',async()=>{
+ const out=await run({native:true,visionModel:'vision-model'});
+ assert.match(out.answer.messages[0].content,/INV-2042 total 34.95/);assert.equal(out.answer.model,'answer-model');assert.ok(out.nativeCalls.some(url=>url.endsWith('/models/load')));assert.equal(out.events.find(e=>e.type==='context').limit,32768);
 });

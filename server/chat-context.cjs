@@ -20,7 +20,7 @@ async function resolveRuntimeLimit({manager,model,dir,scope,onStatus=()=>{},sign
   if (!health?.all_models_loaded?.some(m=>m.model_name===model && m.loaded && m.backend_alive!==false)) {
     onStatus('Loading the selected model and checking its context allocation…');
     signal?.throwIfAborted();
-    const loaded=await manager.load(model);
+    const loaded=await manager.load(model,{},signal);
     if (!loaded.ok) throw Error('The selected model could not load. Its context allocation was not changed.');
     signal?.throwIfAborted();
     response=await manager.health();
@@ -38,8 +38,8 @@ async function resolveRuntimeLimit({manager,model,dir,scope,onStatus=()=>{},sign
   if (dir && scope && entry && Number(entry.recipe_options?.ctx_size)>=2048) {
     const id='runtime-model:'+fingerprint([scope,model]);
     const previous=read(dir,id);
-    const configuration=fingerprint([health.version,entry.checkpoint,entry.recipe_options]);
-    const observation={model,limit:result.limit,source:result.limitSource,configuration,managerVersion:health.version,engineVersion:null,qualification:'allocation-observation-only',observedAt:Date.now()};
+    const configuration=fingerprint([health.manager,health.version,entry.engineVersion,entry.checkpoint,entry.recipe_options,entry.slots]);
+    const observation={model,limit:result.limit,source:result.limitSource,configuration,managerVersion:health.version ?? null,engineVersion:entry.engineVersion ?? null,qualification:'allocation-observation-only',observedAt:Date.now()};
     const history=Array.isArray(previous.history)?previous.history:[];
     if (previous.current && previous.current.configuration!==configuration) history.push(previous.current);
     save(dir,id,{current:observation,history:history.slice(-20)});

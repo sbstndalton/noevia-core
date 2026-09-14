@@ -22,10 +22,10 @@ function documented(provider, model) {
   } catch { return false; }
 }
 function nativeThinking(provider, model) {
-  // Only the configured Lemonade endpoint and documented Qwen3 templates.
+  // Only the configured local llama.cpp/Lemonade endpoint and documented Qwen3 templates.
   try {
     const normalize = value => new URL(value).href.replace(/\/+$/, '');
-    return process.env.MODEL_MANAGER_KIND === 'lemonade' &&
+    return ['lemonade','llamacpp'].includes(process.env.MODEL_MANAGER_KIND) &&
       normalize(provider.baseUrl) === normalize(process.env.INFERENCE_BASE_URL) &&
       /(?:^|[/_])qwen3(?:\.5)?[-_]/i.test(model);
   } catch { return false; }

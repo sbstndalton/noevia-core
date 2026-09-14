@@ -14,7 +14,7 @@ const handler = source.slice(source.indexOf('async function handleChat('), sourc
 const contextDir=fs.mkdtempSync(require('node:path').join(require('node:os').tmpdir(),'chat-handler-test-'));
 test.after(()=>fs.rmSync(contextDir,{recursive:true,force:true}));
 
-function fixture({ rounds, decision = 'approve', execute, fallback = false, cancel = false, effort, reasoningOnly = false, skills = [] } = {}) {
+function fixture({ rounds, decision = 'approve', execute, fallback = false, cancel = false, effort, reasoningOnly = false, skills = [], native = false } = {}) {
   const events = [], executions = [], approvals = [], requests = [], audits = [];
   let round = 0, allApproved = false;
   const res = new EventEmitter();
@@ -73,6 +73,13 @@ function fixture({ rounds, decision = 'approve', execute, fallback = false, canc
       })) } }] } };
     },
   };
+  if(native){
+    let loaded=false;
+    context.modelManager=require('./model-manager.cjs').createModelManager({kind:'llamacpp',baseUrl:'http://fixture.invalid',fetchJson:async url=>{
+      if(url.endsWith('/models/load'))loaded=true;
+      return {ok:true,status:200,body:url.includes('/props?')?{default_generation_settings:{n_ctx:32768},total_slots:1,build_info:'synthetic-native'}:{data:[{id:'synthetic-model',status:{value:loaded?'loaded':'unloaded'}}]}};
+    }});
+  }
   vm.createContext(context);
   vm.runInContext(handler, context);
   return {
@@ -235,4 +242,9 @@ test('actual chat request indexes the exact skill filename even when its display
  assert.ok(prompt.includes('"name":"Project summary"'));
  assert.ok(prompt.includes('read_project_file'));
  assert.equal(f.executions.length,0);
+});
+
+for(const decision of ['approve','deny','approve_all'])test(`native manager preserves write approval action ${decision}`,async()=>{
+ const f=fixture({native:true,decision,rounds:[[call('native-a'),call('native-b','write','{"a":2}')]]});
+ await f.run();assert.equal(f.executions.length,decision==='deny'?0:2);assert.equal(f.approvals.length,decision==='approve_all'?1:2);assert.equal(f.events.find(e=>e.type==='context').limit,32768);
 });

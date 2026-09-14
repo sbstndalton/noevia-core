@@ -110,7 +110,7 @@ function arrayProxy(field) {
     getOwnPropertyDescriptor() { return { enumerable: true, configurable: true }; },
   });
 }
-rag.init({ dataDir: DATA_DIR, inferenceUrl: INFERENCE_BASE, headersFn: () => inferenceHeaders(), userDataDirFn: workspaceStore.userDir });
+rag.init({ dataDir: DATA_DIR, inferenceUrl: INFERENCE_BASE, headersFn: () => inferenceHeaders(), userDataDirFn: workspaceStore.userDir, inferenceGuard: () => modelManager.enterInference?.() || (() => {}) });
 
 // User-created projects; the earlier fixed demo spaces were removed.
 // spaces were deleted per user request — projects are user-created only.
@@ -188,6 +188,8 @@ function authResult(res, result) {
 
 const modelManager = createModelManager({
   kind: MODEL_MANAGER_KIND,
+  presetPath: process.env.LLAMACPP_PRESET_PATH,
+  downloadStatePath: path.join(DATA_DIR,'native-downloads-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)+'.json'),
   baseUrl: MODEL_MANAGER_BASE,
   apiKey: process.env.MODEL_MANAGER_API_KEY || INFERENCE_KEY,
   fetchJson,
@@ -506,7 +508,7 @@ function recordUsage(workspace, model, usage) {
 // ── Auto model router (feature doc Item 4 / master step 12) ───────────────
 // Roles are config, never hardcoded model names: role→model mapping lives in
 // ui/server/auto-roles.json (created on first use; never ships a default
-// model string). Auto mode keeps BOTH role models loaded — no unload/swap.
+// model string). Native llama.cpp owns role-model loading and eviction.
 function autoRoles() {
   return currentWorkspace().autoRoles;
 }
@@ -525,11 +527,14 @@ async function ensureModelLoaded(name) {
   const m = installed.find((x) => x.name === name);
   if (!m) throw new Error(`model not installed: ${name}`);
   if (!m.loaded) {
-    await modelManager.load(name);
+    const result = await modelManager.load(name);
+    if (!result.ok) throw new Error(`model could not load: ${name}`);
   }
 }
 
 function ensureRolesLoaded() {
+  // Native router owns on-demand loading and eviction (including models-max=1).
+  if (modelManager.capabilities?.routing) return;
   const roles = autoRoles();
   if (!roles) return;
   void (async () => {
@@ -1842,6 +1847,10 @@ async function modelsInstalled() {
       mtp: require('./mtp.cjs').capability(m),
       maxContext: m.max_context_window || null,
       suggested: !!m.suggested,
+      status: m.status?.value || (loadedNames.has(m.id || m.model_name) ? 'loaded' : 'unloaded'),
+      failed: m.status?.failed === true,
+      canDelete: m.can_remove !== false,
+      source: m.source || null,
     }));
   if (!LAST_LOADED_MODEL) {
     const firstLoaded = installed.find((m) => m.loaded);
@@ -1889,7 +1898,7 @@ async function modelVariants(repo) {
   if (!r.ok) throw new Error(`variants failed: ${r.status}`);
   const suggested = r.body?.suggested_name;
   const arr = Array.isArray(r.body?.variants) ? r.body.variants : [];
-  return arr.slice(0, 20).map((v) => ({
+  return arr.slice(0, 100).map((v) => ({
     id: suggested ? `${repo}:${v.name}` : String(v.primary_file || v.name),
     label: String(v.name || v.primary_file || 'default'),
     sizeGB: typeof v.size_bytes === 'number' ? Math.round((v.size_bytes / 1e9) * 10) / 10 : null,
@@ -2534,7 +2543,7 @@ const connectorFiles={
   read:(id,path)=>callDiaryFile(id,'/file','POST',{path}),
   write:(id,body)=>callDiaryFile(id,'/file','PUT',body),
 };
-async function handleRequest(req, res) {
+async function handleRequestInner(req, res) {
   const preAuth = authService.authenticate(req);
   const workspace = preAuth ? workspaceStore.get(preAuth.user.id, { claim: preAuth.user.role === 'admin' }) : null;
   if (workspace && preAuth.user.role === 'admin' && authService.diaryEnabled(preAuth.user.id) && fs.existsSync(path.join(workspace.dir, 'migration.json')) &&
@@ -2976,7 +2985,8 @@ async function handleRequestScoped(req, res) {
       const s = sys.status === 'fulfilled' && sys.value.ok ? sys.value.body : {};
       return json(res, 200, {
         up: gen.status === 'fulfilled' && gen.value.ok,
-        mtp: require('./mtp.cjs').acceptance(mtpMetrics.status === 'fulfilled' && mtpMetrics.value.ok ? mtpMetrics.value.body : '', mtpHealth.status === 'fulfilled' && mtpHealth.value.ok ? mtpHealth.value.body.all_models_loaded : [], mtpModels.status === 'fulfilled' && mtpModels.value.ok ? mtpModels.value.body.data : [], currentWorkspace().userId),
+        telemetryScope: g.scope || null,
+        mtp: modelManager.kind === 'llamacpp' ? (g.mtp || []) : require('./mtp.cjs').acceptance(mtpMetrics.status === 'fulfilled' && mtpMetrics.value.ok ? mtpMetrics.value.body : '', mtpHealth.status === 'fulfilled' && mtpHealth.value.ok ? mtpHealth.value.body.all_models_loaded : [], mtpModels.status === 'fulfilled' && mtpModels.value.ok ? mtpModels.value.body.data : [], currentWorkspace().userId),
         tokensPerSecond: reportedTokenRate(g),
         timeToFirstToken: typeof g.time_to_first_token === 'number' ? g.time_to_first_token : null,
         inputTokens: typeof g.input_tokens === 'number' ? g.input_tokens : null,
@@ -3059,7 +3069,7 @@ async function handleRequestScoped(req, res) {
         const vision = typeof body.vision === 'string' ? body.vision.trim() : '';
         if (!fast || !smart) return json(res, 400, { error: 'both fast and smart model names are required' });
         setAutoRoles({ fast, smart, vision });
-        ensureRolesLoaded(); // warm both models; never blocks the response
+        ensureRolesLoaded(); // optional adapter warm-up; native routing stays on demand
         return json(res, 200, { configured: true, roles: autoRoles() });
       }
     }
@@ -3755,6 +3765,18 @@ async function handleRequestScoped(req, res) {
       });
     }
 
+    if (p === '/api/models/preset') {
+      if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
+      if(!modelManager.getPreset)return json(res,404,{error:'Native presets are unavailable'});
+      if(!['GET','PUT'].includes(req.method))return json(res,405,{error:'Method not allowed'});
+      const result=req.method==='GET' ? await modelManager.getPreset(url.searchParams.get('model') || '') : await modelManager.applyPreset(await readJson(req));
+      return json(res,result.status,result.body);
+    }
+
+    if (p === '/api/models/capabilities' && req.method === 'GET') {
+      return json(res,200,{kind:modelManager.kind,enabled:modelManager.enabled,admin:authn.user.role==='admin',...modelManager.capabilities});
+    }
+
     if (p === '/api/models/hardware') {
       if(req.method!=='GET')return json(res,405,{error:'Method not allowed'});
       if(!modelManager.enabled)return json(res,404,{error:'Model manager is disabled. Enter a memory plan manually.'});
@@ -3814,7 +3836,7 @@ async function handleRequestScoped(req, res) {
       return json(
         res,
         r.ok ? 200 : 502,
-        r.ok ? { jobId: r.body?.id || r.body?.job_id || 'pull', modelName } : { error: r.body?.error || `pull failed: ${r.status}` },
+        r.ok ? { jobId: r.body?.id || r.body?.job_id || 'pull', modelName: r.body?.modelName || modelName } : { error: r.body?.error || `pull failed: ${r.status}` },
       );
     }
 
@@ -3843,6 +3865,7 @@ async function handleRequestScoped(req, res) {
         }
         if (!body.name) return json(res, 400, { error: 'name required' });
         if (!modelManager.enabled) return json(res, 404, { error: 'model management is disabled' });
+        if (verb === 'load' && body.mtp !== undefined && modelManager.kind === 'llamacpp') return json(res,400,{error:'Use the native preset editor to configure speculative decoding.'});
         if (verb === 'load' && body.mtp !== undefined) {
           const listing = await modelManager.listModels();
           if (!listing.ok) return json(res,502,{error:'Could not verify MTP support'});
@@ -3864,7 +3887,7 @@ async function handleRequestScoped(req, res) {
     if (p === '/api/models/downloads') {
       if (!modelManager.enabled) return json(res, 200, []);
       const r = await modelManager.downloads();
-      if (!r.ok) return json(res, 200, []);
+      if (!r.ok) return json(res, 502, {error:'Download status unavailable'});
       const arr = Array.isArray(r.body) ? r.body : r.body?.jobs || r.body?.downloads || [];
       // Lemonade reports `percent` as 0-100; the UI expects a 0-1 fraction.
       return json(res, 200, arr.map((j) => ({
@@ -4042,6 +4065,16 @@ async function handleRequestScoped(req, res) {
       res.end(`data: ${JSON.stringify({ type: 'error', text: 'The request could not be completed. Please retry.' })}\n\n`);
     } else json(res, err.status || 500, { error: String((err && err.message) || err) });
   }
+}
+
+async function handleRequest(req,res) {
+  const pathname=new URL(req.url,'http://localhost').pathname;
+  const inference=req.method!=='GET' && (pathname==='/api/chat' || pathname.startsWith('/api/diary/'));
+  let leave;
+  try {if(inference && modelManager.enterInference)leave=modelManager.enterInference();}
+  catch(error){return json(res,error.status||503,{error:error.message});}
+  if(leave){res.once('finish',leave);res.once('close',leave);}
+  try {return await handleRequestInner(req,res);}finally{if(leave && (res.writableEnded||res.destroyed))leave();}
 }
 
 if (require.main === module) {

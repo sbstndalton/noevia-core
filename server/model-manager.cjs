@@ -1,7 +1,8 @@
 'use strict';
 
-function createModelManager({ kind, baseUrl, apiKey, fetchJson }) {
+function createModelManager({ kind, baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream }) {
   const normalizedKind = String(kind || 'none').toLowerCase();
+  if (normalizedKind === 'llamacpp') return require('./llamacpp-manager.cjs').createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream });
   const enabled = normalizedKind === 'lemonade';
   if (!enabled && normalizedKind !== 'none') {
     throw new Error(`unsupported MODEL_MANAGER_KIND: ${normalizedKind}`);
@@ -13,7 +14,7 @@ function createModelManager({ kind, baseUrl, apiKey, fetchJson }) {
     return value;
   }
   function requireEnabled() {
-    if (!enabled) throw new Error('model management is disabled; set MODEL_MANAGER_KIND=lemonade to enable it');
+    if (!enabled) throw new Error('model management is disabled; configure MODEL_MANAGER_KIND to enable it');
   }
   async function request(path, options, timeout) {
     requireEnabled();
@@ -24,6 +25,7 @@ function createModelManager({ kind, baseUrl, apiKey, fetchJson }) {
   return {
     kind: normalizedKind,
     enabled,
+    capabilities: { routing: false, load: enabled, unload: enabled, download: enabled, deleteCached: enabled, runtimeOptions: enabled, hardware: enabled, presets: false },
     baseUrl: base,
     headers,
     requireEnabled,
