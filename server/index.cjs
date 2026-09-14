@@ -208,7 +208,11 @@ function diaryHeaders() {
     if (fs.existsSync(path.join(workspace.dir, 'migration.json'))) h['X-Cowork-Legacy-Owner'] = '1';
     const storage = authService.getStorage(workspace.userId, true);
     if (storage.kind !== 'local' && !endpointApproved(requestScope.getStore()?.authn, storage.baseUrl)) {
-      throw Object.assign(new Error(STORAGE_PRIVATE_URL_ERROR), { status: 403 });
+      // The sidecar may serve an already-active app diary, but must never
+      // resolve a legacy remote or send credentials to this rejected endpoint.
+      h['X-Cowork-Storage-Blocked'] = '1';
+      h['X-Cowork-Storage'] = Buffer.from(JSON.stringify({ kind: 'blocked' })).toString('base64url');
+      return h;
     }
     h['X-Cowork-Storage'] = Buffer.from(JSON.stringify(storage)).toString('base64url');
   }
@@ -3877,6 +3881,15 @@ async function handleRequestScoped(req, res) {
       catch(e){return json(res,e.status||500,{error:e.status?e.message:'Could not read recovery records'});}
     }
 
+    if (['/api/diary/storage-status', '/api/diary/storage-import'].includes(p)) {
+      if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
+      const status = p.endsWith('storage-status');
+      if (req.method !== (status ? 'GET' : 'POST')) return json(res, 405, { error: 'Method not allowed' });
+      const body = status ? undefined : await readBody(req, 4096);
+      const r = await fetchJson(`${DIARY_BASE}/api/${status ? 'storage-status' : 'storage-import'}`, { method: req.method, headers: diaryHeaders(), body }, status ? 60000 : 300000);
+      return json(res, r.status, r.ok ? r.body : { error: r.body?.detail || 'Diary storage request failed' });
+    }
+
     if (['/api/diary/files', '/api/diary/file', '/api/diary/local-exchange'].includes(p)) {
       if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
       const local = p.endsWith('/local-exchange');
@@ -4065,6 +4078,13 @@ if (require.main === module) {
     davServer.setTimeout(60000, socket => socket.destroy());
     davServer.listen(davConfig.port, HOST, () => console.log(`Diary file sharing listener on port ${davConfig.port}; scope ${davConfig.scope}; per-user opt-in required`));
   }
+  require('./diary-backup-worker.cjs').startDiaryBackupWorker({
+    users: () => authService.listUsers(),
+    enabled: id => authService.diaryEnabled(id),
+    run: user => requestScope.run({ workspace: workspaceStore.get(user.id), authn: { user, legacy: false } }, async () => {
+      await fetchJson(`${DIARY_BASE}/api/storage-backup`, { method: 'POST', headers: diaryHeaders() }, 300000);
+    }),
+  });
   server.requestTimeout = 20 * 60 * 1000;
   server.listen(PORT, HOST, () => {
     console.log(`cowork-ui listening on http://${HOST}:${PORT} (inference: ${INFERENCE_BASE}, manager: ${modelManager.kind}, diary: ${DIARY_BASE}, mcp: ${MCP_ENABLED ? MCP_SERVERS.map((sv) => sv.id).join('+') : 'disabled'})`);
