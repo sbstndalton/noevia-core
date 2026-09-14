@@ -186,6 +186,8 @@ function authResult(res, result) {
   return json(res, result.status || 200, result.body ?? result);
 }
 
+const modelLoaderProxy = process.env.MODEL_LOADER_URL ? require('./model-loader-proxy.cjs').createModelLoaderProxy({ target: process.env.MODEL_LOADER_URL }) : null;
+
 const modelManager = createModelManager({
   kind: MODEL_MANAGER_KIND,
   presetPath: process.env.LLAMACPP_PRESET_PATH,
@@ -2609,6 +2611,19 @@ async function handleRequestScoped(req, res) {
       catch (e) { return json(res, 400, { error: e.message }); }
     }
 
+    // Model Loader: a separate service without its own login, for administrators only.
+    if (p === '/model-loader' || p.startsWith('/model-loader/')) {
+      if (!modelLoaderProxy) return json(res, 404, { error: 'Model Loader is not configured' });
+      const who = authService.authenticate(req);
+      if (!who) { res.writeHead(302, { Location: '/', 'Cache-Control': 'no-store' }); return res.end(); }
+      if (who.user.role !== 'admin') return json(res, 403, { error: 'Administrator required for Model Loader' });
+      // Its forms and htmx calls carry no noevia CSRF token; require a same-origin request.
+      const sameOrigin = req.headers.origin ? authService.originValid(req) : req.headers['sec-fetch-site'] === 'same-origin';
+      if (!['GET', 'HEAD'].includes(req.method || 'GET') && !sameOrigin) return json(res, 403, { error: 'origin not allowed' });
+      if (p === '/model-loader') { res.writeHead(302, { Location: '/model-loader/' + url.search }); return res.end(); }
+      return modelLoaderProxy(req, res, url);
+    }
+
     const authn = p.startsWith('/api/') ? authService.authenticate(req) : null;
     if (p.startsWith('/api/') && !publicAuthRoutes.has(p) && !authn) return unauthorized(res);
     if (authn && !['GET', 'HEAD', 'OPTIONS'].includes(req.method || 'GET') && (!authService.originValid(req) || !authService.csrfValid(req, authn))) {
@@ -3802,7 +3817,7 @@ async function handleRequestScoped(req, res) {
     }
 
     if (p === '/api/models/capabilities' && req.method === 'GET') {
-      return json(res,200,{kind:modelManager.kind,enabled:modelManager.enabled,admin:authn.user.role==='admin',...modelManager.capabilities});
+      return json(res,200,{kind:modelManager.kind,enabled:modelManager.enabled,admin:authn.user.role==='admin',...modelManager.capabilities,modelLoader:!!modelLoaderProxy&&authn.user.role==='admin'});
     }
 
     if (p === '/api/models/hardware') {
