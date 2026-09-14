@@ -2627,6 +2627,15 @@ async function handleRequestScoped(req, res) {
     if (p.startsWith('/api/models/') && !['GET', 'HEAD'].includes(req.method || 'GET') && authn.user.role !== 'admin') {
       return json(res, 403, { error: 'administrator required' });
     }
+    if (p === '/api/profile/appearance') {
+      if(req.method==='GET')return json(res,200,authService.getAppearance(authn.user.id));
+      if(req.method==='PUT') {
+        const body=await readJson(req);
+        try { return json(res,200,authService.setAppearance(authn.user.id,body)); }
+        catch(error) { return json(res,400,{error:error.message}); }
+      }
+      return json(res,405,{error:'method not allowed'});
+    }
     if (p === '/api/profile' && req.method === 'GET') return json(res, 200, { user: authn.user, passkeys: authService.listPasskeys(authn.user.id), sessions: authService.listSessions(authn.user.id) });
     if (p === '/api/profile/sharing' && req.method === 'GET') return json(res, 200, davSettings.get(authn.user));
     if (p === '/api/profile/sharing' && req.method === 'PUT') {

@@ -189,3 +189,29 @@ test('diary forwards browser date and selected day to the pipeline', async (t) =
   assert.equal(r.status,200);assert.equal(sent.entryDay,'2026-07-08');assert.equal(sent.entryTime,'2026-09-07T10:00:00-04:00');
   assert.match(r.text, /"type":"reasoning","text":"Synthetic provider reasoning"/);
 });
+
+test('profile name and Diary preference persist through real authenticated routes', async () => {
+  const before = JSON.parse((await request('/api/profile', {headers:adminHeaders})).text).user;
+  try {
+    assert.equal((await request('/api/profile', {method:'PATCH',headers:adminHeaders,body:JSON.stringify({displayName:'Synthetic Settings Review'})})).status,200);
+    for (const enabled of [false,true]) {
+      assert.equal((await request('/api/profile/features', {method:'PUT',headers:adminHeaders,body:JSON.stringify({diaryEnabled:enabled})})).status,200);
+      const saved = JSON.parse((await request('/api/profile', {headers:adminHeaders})).text).user;
+      assert.equal(saved.displayName,'Synthetic Settings Review');
+      assert.equal(saved.diaryEnabled,enabled);
+    }
+    assert.equal((await request('/api/profile', {method:'PATCH',body:JSON.stringify({displayName:'Denied'})})).status,401);
+  } finally {
+    await request('/api/profile',{method:'PATCH',headers:adminHeaders,body:JSON.stringify({displayName:before.displayName})});
+    await request('/api/profile/features',{method:'PUT',headers:adminHeaders,body:JSON.stringify({diaryEnabled:before.diaryEnabled})});
+  }
+});
+
+test('appearance API persists both mode palettes and rejects invalid or unauthenticated writes',async()=>{
+  const value={theme:'light',light:'sage',dark:'iris'};
+  assert.equal((await request('/api/profile/appearance',{method:'PUT',body:JSON.stringify(value)})).status,401);
+  assert.equal((await request('/api/profile/appearance',{method:'PUT',headers:adminHeaders,body:JSON.stringify(value)})).status,200);
+  assert.deepEqual(JSON.parse((await request('/api/profile/appearance',{headers:adminHeaders})).text),value);
+  assert.equal((await request('/api/profile/appearance',{method:'PUT',headers:adminHeaders,body:JSON.stringify({...value,light:'bogus'})})).status,400);
+  assert.deepEqual(JSON.parse((await request('/api/profile/appearance',{headers:adminHeaders})).text),value);
+});

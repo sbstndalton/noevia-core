@@ -158,3 +158,23 @@ test('provider secrets are encrypted on disk and decrypt for their owner', () =>
   assert.doesNotMatch(raw, /super-secret-key/); assert.match(raw, /enc:v1:/);
   fs.rmSync(root, { recursive: true, force: true });
 });
+
+test('appearance stays account-owned and survives reopening the database', async t => {
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'cowork-appearance-'));
+  const auth=createAuth({dataDir:root,publicOrigin:'https://cowork.example.test'});
+  t.after(()=>{auth.db.close();fs.rmSync(root,{recursive:true,force:true});});
+  const owner=await auth.setup(request(),response(),{setupCode:fs.readFileSync(path.join(root,'first-run-setup-code'),'utf8').trim(),publicOrigin:'https://cowork.example.test',username:'owner',password:'synthetic appearance test password'});
+  const ownerId=owner.body.user.id;
+  const other=await auth.acceptInvite(request(),response(),{token:auth.createInvite(ownerId).token,username:'other',password:'synthetic other test password'});
+  const otherId=other.body.user.id;
+  const value={theme:'dark',light:'sage',dark:'iris'};
+  assert.equal(auth.getAppearance(ownerId),null);
+  auth.setAppearance(ownerId,value);
+  assert.equal(auth.getAppearance(otherId),null);
+  auth.setAppearance(otherId,{theme:'light',light:'warm',dark:'neutral'});
+  assert.throws(()=>auth.setAppearance(ownerId,{...value,dark:'invalid'}));
+  const reopened=createAuth({dataDir:root,publicOrigin:'https://cowork.example.test'});
+  assert.deepEqual(reopened.getAppearance(ownerId),value);
+  assert.equal(reopened.getAppearance(otherId).dark,'neutral');
+  reopened.db.close();
+});

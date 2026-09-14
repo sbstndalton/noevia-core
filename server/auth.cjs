@@ -156,6 +156,10 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       username TEXT NOT NULL DEFAULT '',
       secret TEXT NOT NULL DEFAULT '', corpus_root TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS user_appearance(
+      user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      value TEXT NOT NULL, updated_at INTEGER NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS user_features(
       user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
       diary_enabled INTEGER NOT NULL DEFAULT 0, onboarded INTEGER NOT NULL DEFAULT 1, updated_at INTEGER NOT NULL
@@ -457,6 +461,15 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       if (!row) return false; const passwordHash = await createPasswordHash(body.password);
       db.transaction(() => { db.prepare('UPDATE users SET password_hash=?,updated_at=? WHERE id=?').run(passwordHash, Date.now(), row.user_id); db.prepare('DELETE FROM sessions WHERE user_id=?').run(row.user_id); db.prepare('UPDATE recoveries SET used_at=? WHERE token_hash=?').run(Date.now(), row.token_hash); })();
       audit('recovery.complete', row.user_id, row.user_id); return true;
+    },
+    getAppearance(userId) {
+      const row=db.prepare('SELECT value FROM user_appearance WHERE user_id=?').get(userId);
+      return row ? JSON.parse(row.value) : null;
+    },
+    setAppearance(userId, input) {
+      const value=require('./appearance.cjs').validateAppearance(input);
+      db.prepare('INSERT INTO user_appearance(user_id,value,updated_at) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at').run(userId,JSON.stringify(value),Date.now());
+      return value;
     },
     updateProfile(userId, displayName) { db.prepare('UPDATE users SET display_name=?,updated_at=? WHERE id=?').run(String(displayName).trim().slice(0,80), Date.now(), userId); },
     diaryEnabled(userId) {
