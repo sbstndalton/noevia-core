@@ -3779,7 +3779,7 @@ async function handleRequestScoped(req, res) {
       let result;
       if(p.endsWith('/cancel')){if(req.method!=='POST')return json(res,405,{error:'Method not allowed'});result=modelManager.calibration.cancel();}
       else if(req.method==='GET')result=modelManager.calibration.status(url.searchParams.get('model')||'');
-      else if(req.method==='POST'){const body=await readJson(req);result=await modelManager.calibration.start(String(body?.model||''),{mode:body?.mode,confirmPause:body?.confirmPause});}
+      else if(req.method==='POST'){const body=await readJson(req);result=await modelManager.calibration.start(String(body?.model||''),{promptBudgetSeconds:body?.promptBudgetSeconds,confirmPause:body?.confirmPause});}
       else return json(res,405,{error:'Method not allowed'});
       res.setHeader('Cache-Control','no-store');
       return json(res,result.status,result.body);
