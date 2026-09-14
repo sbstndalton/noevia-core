@@ -12,7 +12,7 @@ function nativeLabels(model) {
     ...(model.architecture?.input_modalities?.includes('image') ? ['vision'] : []),
   ];
 }
-function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig = {} }) {
+function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig = {}, calibrationStatePath, calibrationOptions = {} }) {
   const base = String(baseUrl || '').replace(/\/+$/, '').replace(/\/v1$/, '');
   const url = new URL(base);
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw Error('Invalid llama.cpp router URL');
@@ -110,56 +110,83 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
   async function applyPreset(body) {
     if(!presets)return unsupported('Native preset editing; configure LLAMACPP_PRESET_PATH');
     if(body?.confirmReload!==true) return {ok:false,status:400,body:{error:'Confirm that other clients and Diary background inference are stopped before reloading.'}};
-    return maintenance.exclusive(async()=>{
-      const listing=await rawModels();
-      if(!listing.ok) return listing;
-      const models=listing.body?.data;
-      if(!Array.isArray(models))throw Error('Invalid router model listing');
-      if(!models.some(m=>m.id===body.model))return {ok:false,status:404,body:{error:'Choose an installed model'}};
-      if(models.some(m=>!['unloaded'].includes(m.status?.value)))return {ok:false,status:409,body:{error:'Unload all router models and finish downloads before applying a profile. Other clients must remain stopped.'}};
-      const candidate=presets.prepare(body);
-      presets.commit(candidate);
-      try {
-        const result=await request('/models?reload=1',{},120000);
-        if(!result.ok)throw Error('Native reload failed');
-        return {ok:true,status:200,body:{...presets.get(body.model),applied:true,qualification:'unqualified; load and test this profile before relying on its capacity'}};
-      } catch {
-        // Restore only our own version; never overwrite an operator's later edit.
-        try {presets.commit({baseRevision:candidate.revision,text:candidate.before});}
-        catch {return {ok:false,status:503,body:{error:'Reload outcome is uncertain and the file changed again. Stop inference and inspect native presets before retrying.'}};}
-        try {await request('/models?reload=1',{},120000);}catch {}
-        return {ok:false,status:503,body:{error:'Reload failed or timed out. Previous preset file restored; check router health before retrying.'}};
-      }
-    });
+    return maintenance.exclusive(()=>applyUnlocked(body));
   }
-  // Size-based preset suggestion. Reads model file headers through a read-only mount and
-  // never writes; the admin reviews and applies it through applyPreset.
+  // Caller must hold the maintenance gate (applyPreset or a calibration job).
+  async function applyUnlocked(body) {
+    const listing=await rawModels();
+    if(!listing.ok) return listing;
+    const models=listing.body?.data;
+    if(!Array.isArray(models))throw Error('Invalid router model listing');
+    if(!models.some(m=>m.id===body.model))return {ok:false,status:404,body:{error:'Choose an installed model'}};
+    if(models.some(m=>!['unloaded'].includes(m.status?.value)))return {ok:false,status:409,body:{error:'Unload all router models and finish downloads before applying a profile. Other clients must remain stopped.'}};
+    const candidate=presets.prepare(body);
+    presets.commit(candidate);
+    try {
+      const result=await request('/models?reload=1',{},120000);
+      if(!result.ok)throw Error('Native reload failed');
+      return {ok:true,status:200,body:{...presets.get(body.model),applied:true,qualification:'unqualified; load and test this profile before relying on its capacity'}};
+    } catch {
+      // Restore only our own version; never overwrite an operator's later edit.
+      try {presets.commit({baseRevision:candidate.revision,text:candidate.before});}
+      catch {return {ok:false,status:503,body:{error:'Reload outcome is uncertain and the file changed again. Stop inference and inspect native presets before retrying.'}};}
+      try {await request('/models?reload=1',{},120000);}catch {}
+      return {ok:false,status:503,body:{error:'Reload failed or timed out. Previous preset file restored; check router health before retrying.'}};
+    }
+  }
+  // Maps an engine-side path (/models/..., /cache/...) onto noevia's read-only mounts.
+  function localFile(containerPath) {
+    const fs=require('node:fs'),path=require('node:path');
+    const roots=[['/models/',autoconfig.modelsPath],['/cache/',autoconfig.cachePath]];
+    for(const [prefix,root] of roots){
+      if(!root||typeof containerPath!=='string'||!containerPath.startsWith(prefix))continue;
+      let real,base;
+      try{base=fs.realpathSync(root);real=fs.realpathSync(path.join(root,containerPath.slice(prefix.length)));}catch{return null;}
+      if(!real.startsWith(base+path.sep))return null;
+      const stat=fs.statSync(real);return stat.isFile()?{file:real,size:stat.size}:null;
+    }
+    return null;
+  }
+  // The router reports each model's effective argv, which names its files even when the
+  // model came from the download cache and has no preset section of its own.
+  async function modelFiles(model) {
+    let args=[];
+    try {const listing=await rawModels();args=listing.body?.data?.find(m=>m.id===model)?.status?.args||[];}catch {}
+    const flag=names=>{const i=args.findIndex(a=>names.includes(a));return i>=0?args[i+1]:undefined;};
+    const fromPreset=presets?presets.files(model):{};
+    return {model:flag(['--model','-m'])||fromPreset.model,mmproj:flag(['--mmproj','-mm'])||fromPreset.mmproj};
+  }
+  async function readModel(model) {
+    const files=await modelFiles(model);
+    const modelFile=localFile(files.model);
+    if(!modelFile)return {error:'The model file is not visible under noevia\'s read-only model mounts.',status:404};
+    const mmproj=files.mmproj?localFile(files.mmproj):null;
+    if(files.mmproj&&!mmproj)return {error:'The vision projector is not visible under noevia\'s read-only model mounts.',status:404};
+    const {readGguf,summarize}=require('./gguf-meta.cjs');
+    try{return {meta:summarize(readGguf(modelFile.file)),modelFile,mmproj};}catch(e){return {error:'Could not read model metadata: '+e.message,status:422};}
+  }
+  // Size-based preset suggestion. Never writes; the admin applies it through applyPreset.
   async function suggestPreset(model) {
     if(!presets)return unsupported('Native preset suggestions; configure LLAMACPP_PRESET_PATH');
     const {modelsPath,budgetGib,cacheRamMaxMib}=autoconfig;
     if(!modelsPath)return {ok:false,status:501,body:{error:'Suggestions need the model directory mounted read-only; set LLAMACPP_MODELS_PATH.'}};
     if(!(budgetGib>0))return {ok:false,status:501,body:{error:'Suggestions need an inference memory budget; set LLAMACPP_AUTOCONFIG_MEMORY_GIB or LLAMACPP_MEMORY_LIMIT.'}};
     const profile=presets.get(model);
-    if(!profile.exists)return {ok:false,status:404,body:{error:'This model has no preset section to size.'}};
-    const files=presets.files(model);
-    const resolve=containerPath=>{
-      // Preset paths are llama-container paths under /models; map onto our mount.
-      if(typeof containerPath!=='string'||!containerPath.startsWith('/models/'))return null;
-      const fs=require('node:fs'),path=require('node:path');
-      const root=fs.realpathSync(modelsPath),candidate=path.join(modelsPath,containerPath.slice('/models/'.length));
-      let real;try{real=fs.realpathSync(candidate);}catch{return null;}
-      if(!real.startsWith(root+path.sep))return null;
-      const stat=fs.statSync(real);return stat.isFile()?{file:real,size:stat.size}:null;
-    };
-    const modelFile=resolve(files.model);
-    if(!modelFile)return {ok:false,status:404,body:{error:'The preset\'s model file is not visible under the read-only model mount.'}};
-    const mmproj=files.mmproj?resolve(files.mmproj):null;
-    if(files.mmproj&&!mmproj)return {ok:false,status:404,body:{error:'The preset\'s vision projector is not visible under the read-only model mount.'}};
-    const {readGguf,summarize}=require('./gguf-meta.cjs');
-    let meta;try{meta=summarize(readGguf(modelFile.file));}catch(e){return {ok:false,status:422,body:{error:'Could not read model metadata: '+e.message}};}
-    const result=require('./llamacpp-autoconfig.cjs').suggest({meta,modelBytes:modelFile.size,mmprojBytes:mmproj?.size||0,budgetGib,current:{...profile.defaults,...profile.options},cacheRamMaxMib});
-    return {ok:true,status:200,body:{model,revision:profile.revision,arch:meta.arch,...result}};
+    const read=await readModel(model);
+    if(read.error)return {ok:false,status:read.status,body:{error:read.error}};
+    const result=require('./llamacpp-autoconfig.cjs').suggest({meta:read.meta,modelBytes:read.modelFile.size,mmprojBytes:read.mmproj?.size||0,budgetGib,current:{...profile.defaults,...profile.options},cacheRamMaxMib});
+    return {ok:true,status:200,body:{model,revision:profile.revision,arch:read.meta.arch,...result}};
   }
+  // Starting settings for calibration: structural values from the model file; the context
+  // itself is measured, so an unconfigured memory budget is not an obstacle here.
+  async function conservativeFor(model) {
+    const read=await readModel(model);
+    if(read.error)return null;
+    const profile=presets.get(model);
+    const result=require('./llamacpp-autoconfig.cjs').suggest({meta:read.meta,modelBytes:read.modelFile.size,mmprojBytes:read.mmproj?.size||0,budgetGib:autoconfig.budgetGib>0?autoconfig.budgetGib:1e6,current:{...profile.defaults,...profile.options},cacheRamMaxMib:autoconfig.cacheRamMaxMib});
+    return {native:read.meta.contextLength||0,values:result.values||null};
+  }
+  const calibrator=presets?require('./llamacpp-calibration.cjs').createCalibrator({request,rawModels,presets,maintenance,applyUnlocked,conservativeFor,stateFile:calibrationStatePath,memoryFloorGib:autoconfig.memoryFloorGib||2,...calibrationOptions}):null;
   return {
     kind: 'llamacpp', enabled: true, baseUrl: base, headers, request,
     capabilities: { routing: true, load: true, unload: true, download: true, deleteCached: true, runtimeOptions: false, hardware: false, presets: !!presets },
@@ -170,6 +197,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     getPreset: model => presets ? Promise.resolve({ok:true,status:200,body:presets.get(model)}) : unsupported('Native preset editing'),
     applyPreset,
     suggestPreset,
+    calibration: calibrator ? { start: calibrator.start, cancel: calibrator.cancel, status: calibrator.status, recover: calibrator.recover } : null,
     unload: model => mutate(()=>post('/models/unload', { model })),
     pull: ({ checkpoint }) => mutate(async () => {
       if (!/^[\w.-]+\/[\w.-]+(?::[\w.-]+)?$/.test(checkpoint || '')) return { ok: false, status: 400, body: { error: 'Choose a Hugging Face repository and quantization' } };

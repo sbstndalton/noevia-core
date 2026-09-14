@@ -193,7 +193,10 @@ const modelManager = createModelManager({
     modelsPath: process.env.LLAMACPP_MODELS_PATH || '',
     budgetGib: Number(process.env.LLAMACPP_AUTOCONFIG_MEMORY_GIB) || require('./llamacpp-autoconfig.cjs').parseMemoryLimit(process.env.LLAMACPP_MEMORY_LIMIT) || 0,
     cacheRamMaxMib: Number(process.env.LLAMACPP_AUTOCONFIG_CACHE_RAM_MAX_MIB) || 1024,
+    cachePath: process.env.LLAMACPP_CACHE_PATH || '',
+    memoryFloorGib: Number(process.env.LLAMACPP_CALIBRATION_MEMORY_FLOOR_GIB) || 2,
   },
+  calibrationStatePath: path.join(DATA_DIR,'native-calibration-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)+'.json'),
   downloadStatePath: path.join(DATA_DIR,'native-downloads-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)+'.json'),
   baseUrl: MODEL_MANAGER_BASE,
   apiKey: process.env.MODEL_MANAGER_API_KEY || INFERENCE_KEY,
@@ -3770,6 +3773,18 @@ async function handleRequestScoped(req, res) {
       });
     }
 
+    if (p === '/api/models/calibration' || p === '/api/models/calibration/cancel') {
+      if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
+      if(!modelManager.calibration)return json(res,404,{error:'Native calibration is unavailable'});
+      let result;
+      if(p.endsWith('/cancel')){if(req.method!=='POST')return json(res,405,{error:'Method not allowed'});result=modelManager.calibration.cancel();}
+      else if(req.method==='GET')result=modelManager.calibration.status(url.searchParams.get('model')||'');
+      else if(req.method==='POST'){const body=await readJson(req);result=await modelManager.calibration.start(String(body?.model||''),{mode:body?.mode,confirmPause:body?.confirmPause});}
+      else return json(res,405,{error:'Method not allowed'});
+      res.setHeader('Cache-Control','no-store');
+      return json(res,result.status,result.body);
+    }
+
     if (p === '/api/models/preset/suggest') {
       if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
       if(req.method!=='GET')return json(res,405,{error:'Method not allowed'});
@@ -4160,6 +4175,8 @@ if (require.main === module) {
     // Never blocks startup: a side-car that is still booting must not stop
     // noevia from serving.
     discoverMcpTools().catch(() => undefined);
+    // A calibration interrupted by a restart restores the preset it was testing.
+    modelManager.calibration?.recover().catch(() => undefined);
   });
 }
 

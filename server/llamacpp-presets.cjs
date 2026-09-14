@@ -97,6 +97,7 @@ function createPresetStore(file) {
     }
     return out;
   }
-  return {get,prepare,commit,files};
+  const snapshot=()=>{const data=read();return {text:data.text,revision:data.revision};};
+  return {get,prepare,commit,files,snapshot};
 }
 module.exports={createPresetStore,parse,fields};

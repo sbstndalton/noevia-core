@@ -83,7 +83,7 @@ test('invited member can finish only its own onboarding, with CSRF required', as
   assert.equal(owner.onboarded, false); assert.equal(owner.diaryEnabled, true);
 });
 test('onboarding does not grant members administrator or global model access', async () => {
-  for (const url of ['/api/admin/users', '/api/admin/invitations', '/api/models/download', '/api/models/preset/suggest?model=synthetic']) {
+  for (const url of ['/api/admin/users', '/api/admin/invitations', '/api/models/download', '/api/models/preset/suggest?model=synthetic', '/api/models/calibration', '/api/models/calibration/cancel']) {
     const method = url === '/api/admin/users' || url.startsWith('/api/models/preset/suggest') ? 'GET' : 'POST';
     assert.equal((await request(url, { method, headers: headers(member), body: method === 'POST' ? '{}' : '' })).status, 403, url);
   }
