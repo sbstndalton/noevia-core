@@ -3751,6 +3751,16 @@ async function handleRequestScoped(req, res) {
       });
     }
 
+    if (p === '/api/models/hardware') {
+      if(req.method!=='GET')return json(res,405,{error:'Method not allowed'});
+      if(!modelManager.enabled)return json(res,404,{error:'Model manager is disabled. Enter a memory plan manually.'});
+      try {
+        const result=await modelManager.systemInfo();
+        if(!result.ok)return json(res,502,{error:'Inference hardware is unavailable. Enter a memory plan manually or retry.'});
+        return json(res,200,require('./model-hardware.cjs').modelHardware(result.body));
+      } catch { return json(res,502,{error:'Could not read inference hardware. Enter a memory plan manually or retry.'}); }
+    }
+
     if (p === '/api/models/installed') {
       try {
         return json(res, 200, await modelsInstalled());

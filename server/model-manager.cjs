@@ -32,6 +32,7 @@ function createModelManager({ kind, baseUrl, apiKey, fetchJson }) {
     health: () => get('/api/v1/health', 8000),
     stats: () => get('/v1/stats', 6000),
     systemStats: () => get('/v1/system-stats', 6000),
+    systemInfo: () => get('/v1/system-info', 8000),
     variants: (checkpoint) => get(`/api/v1/pull/variants?checkpoint=${encodeURIComponent(checkpoint)}`, 20000),
     // Lemonade requires model_name + recipe to register a not-yet-known HF
     // checkpoint (checkpoint alone 400s). stream+subscribe=false makes it
