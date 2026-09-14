@@ -2,6 +2,16 @@
 
 // Native llama-server router API. Model processes, routing and eviction remain
 // owned by llama.cpp; noevia never launches a process through this adapter.
+// Router status.args is effective argv, available before a model is loaded.
+// Match complete flag tokens only; paths and model names are not capabilities.
+function nativeLabels(model) {
+  const args = Array.isArray(model.status?.args) ? model.status.args : [];
+  return [
+    ...(args.some(arg => ['--embedding', '--embeddings'].includes(arg)) ? ['embeddings'] : []),
+    ...(args.some(arg => ['--rerank', '--reranking'].includes(arg)) ? ['reranking'] : []),
+    ...(model.architecture?.input_modalities?.includes('image') ? ['vision'] : []),
+  ];
+}
 function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream }) {
   const base = String(baseUrl || '').replace(/\/+$/, '').replace(/\/v1$/, '');
   const url = new URL(base);
@@ -27,7 +37,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
       status: { value: model.status?.value || 'unknown', failed: model.status?.failed === true },
       source: model.source || null, can_remove: model.can_remove === true,
       loaded: model.status?.value === 'loaded',
-      labels: [...(model.architecture?.input_modalities?.includes('image') ? ['vision'] : [])],
+      labels: nativeLabels(model),
       // Router metadata is an architecture ceiling, never a live allocation.
       max_context_window: Number.isFinite(model.meta?.n_ctx_train) ? model.meta.n_ctx_train : null,
       size: Number.isFinite(model.meta?.size) ? model.meta.size / 1e9 : null,

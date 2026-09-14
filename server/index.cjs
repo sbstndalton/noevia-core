@@ -1853,7 +1853,7 @@ async function modelsInstalled() {
       source: m.source || null,
     }));
   if (!LAST_LOADED_MODEL) {
-    const firstLoaded = installed.find((m) => m.loaded);
+    const firstLoaded = installed.find((m) => m.loaded && !m.labels.some(label => /^(embedding|embeddings|rerank|reranking|reranker)$/i.test(label)));
     if (firstLoaded) LAST_LOADED_MODEL = firstLoaded.name;
   }
   return installed;

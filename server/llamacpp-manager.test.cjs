@@ -68,3 +68,16 @@ test('cancelling a pending native load stops waiting without unloading shared mo
  const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async url=>{calls.push(url);if(url.endsWith('/models'))abort.abort();return {ok:true,status:200,body:{data:[{id:'fixture',status:{value:'loading'}}]}};}});
  await assert.rejects(manager.load('fixture',{},abort.signal),{name:'AbortError'});assert.ok(!calls.some(c=>c.includes('unload')));
 });
+
+test('native loaded and cold capability labels use effective flags without leaking argv',async()=>{
+ const data=['loaded','unloaded'].flatMap(value=>[
+  {id:'opaque-embedding-'+value,status:{value,args:['--embeddings','--model','/private/weights.gguf','--api-key','PRIVATE-CANARY']}},
+  {id:'opaque-ranker-'+value,status:{value,args:['--reranking']}},
+  {id:'nomic-name-is-not-a-capability-'+value,status:{value,args:['--model','/models/embedding.gguf']},architecture:{input_modalities:['text','image']}},
+ ]);
+ const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async()=>({ok:true,status:200,body:{data}})});
+ const rows=(await manager.listModels()).body.data;
+ assert.deepEqual(rows.map(m=>m.id),data.map(m=>m.id));
+ for(let i=0;i<rows.length;i+=3){assert.deepEqual(rows[i].labels,['embeddings']);assert.deepEqual(rows[i+1].labels,['reranking']);assert.deepEqual(rows[i+2].labels,['vision']);}
+ assert.doesNotMatch(JSON.stringify(rows),/PRIVATE-CANARY|private\/weights|status.*args/);
+});
