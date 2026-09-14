@@ -3904,6 +3904,16 @@ async function handleRequestScoped(req, res) {
       catch(e){return json(res,e.status||500,{error:e.status?e.message:'Could not read recovery records'});}
     }
 
+    if (p === '/api/diary/workspace-trash') {
+      if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
+      if (!['GET', 'POST'].includes(req.method)) return json(res, 405, { error: 'Method not allowed' });
+      const body = req.method === 'POST' ? await readBody(req, 4096) : undefined;
+      const query = req.method === 'GET' ? '?after=' + encodeURIComponent(url.searchParams.get('after') || '') : '';
+      const r = await fetchJson(`${DIARY_BASE}/api/workspace-trash${query}`, { method: req.method, headers: diaryHeaders(), body }, 60000);
+      res.setHeader('Cache-Control', 'no-store');
+      return json(res, r.status, r.ok ? r.body : { error: r.body?.detail || 'Diary recovery request failed. Retry or refresh Trash.' });
+    }
+
     if (p === '/api/diary/workspace-import') {
       if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
       if (req.method !== 'POST') return json(res, 405, { error: 'Method not allowed' });
