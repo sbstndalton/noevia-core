@@ -2,6 +2,9 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
+// Each test file gets its own data dir so parallel runs never race on the
+// default server/ui-data/secrets.key (EEXIST). Set before any index.cjs require.
+process.env.UI_DATA_DIR = require('node:fs').mkdtempSync(require('node:path').join(require('node:os').tmpdir(), 'cowork-mcpservers-test-'));
 
 // The parser is the security boundary for credential pass-through, so it is
 // exercised directly rather than through a live server. Each case re-requires

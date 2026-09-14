@@ -2,7 +2,13 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 
+// Each test file gets its own data dir so parallel runs never race on the
+// default server/ui-data/secrets.key (EEXIST).
+process.env.UI_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'cowork-chatsanitize-test-'));
 const { sanitizeChats } = require('./index.cjs');
 
 // Regression: a bare chat-id string in a project's chats[] reached the browser

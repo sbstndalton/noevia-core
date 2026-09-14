@@ -2,6 +2,9 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
+// Each test file gets its own data dir so parallel runs never race on the
+// default server/ui-data/secrets.key (EEXIST).
+process.env.UI_DATA_DIR = require('node:fs').mkdtempSync(require('node:path').join(require('node:os').tmpdir(), 'cowork-mcp-test-'));
 const { convertTool, parseRpcBody, resultToText, readOnlyHint } = require('./mcp.cjs');
 const { resolveTools, toolTokenBudgetFor, MCP_TOOLBOX_MANIFEST } = require('./index.cjs');
 

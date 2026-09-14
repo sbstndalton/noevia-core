@@ -2,6 +2,9 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
+// Each test file gets its own data dir so parallel runs never race on the
+// default server/ui-data/secrets.key (EEXIST). Set before index.cjs is required.
+process.env.UI_DATA_DIR = require('node:fs').mkdtempSync(require('node:path').join(require('node:os').tmpdir(), 'cowork-prefill-test-'));
 const prefill = require('./prefill.cjs');
 
 // This replaces a regex on the model's FILENAME as the way noevia decides how
