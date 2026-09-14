@@ -87,6 +87,16 @@ function createPresetStore(file) {
       const fdDir=fs.openSync(path.dirname(file),'r');try{fs.fsyncSync(fdDir);}finally{fs.closeSync(fdDir);}
     } finally {fs.rmSync(temporary,{force:true});}
   }
-  return {get,prepare,commit};
+  // Container paths of the files a section loads. Read-only; used for size estimates.
+  function files(model) {
+    const data=read(),section=data.sections.get(model),out={};
+    if(!section)return out;
+    for(const line of data.lines.slice(section.start+1,section.end)){
+      const match=/^\s*(model|mmproj|m)\s*=\s*(.*?)\s*$/.exec(line);
+      if(match)out[match[1]==='m'?'model':match[1]]=match[2];
+    }
+    return out;
+  }
+  return {get,prepare,commit,files};
 }
 module.exports={createPresetStore,parse,fields};

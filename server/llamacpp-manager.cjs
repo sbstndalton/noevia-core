@@ -12,7 +12,7 @@ function nativeLabels(model) {
     ...(model.architecture?.input_modalities?.includes('image') ? ['vision'] : []),
   ];
 }
-function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream }) {
+function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig = {} }) {
   const base = String(baseUrl || '').replace(/\/+$/, '').replace(/\/v1$/, '');
   const url = new URL(base);
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw Error('Invalid llama.cpp router URL');
@@ -132,6 +132,34 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
       }
     });
   }
+  // Size-based preset suggestion. Reads model file headers through a read-only mount and
+  // never writes; the admin reviews and applies it through applyPreset.
+  async function suggestPreset(model) {
+    if(!presets)return unsupported('Native preset suggestions; configure LLAMACPP_PRESET_PATH');
+    const {modelsPath,budgetGib,cacheRamMaxMib}=autoconfig;
+    if(!modelsPath)return {ok:false,status:501,body:{error:'Suggestions need the model directory mounted read-only; set LLAMACPP_MODELS_PATH.'}};
+    if(!(budgetGib>0))return {ok:false,status:501,body:{error:'Suggestions need an inference memory budget; set LLAMACPP_AUTOCONFIG_MEMORY_GIB or LLAMACPP_MEMORY_LIMIT.'}};
+    const profile=presets.get(model);
+    if(!profile.exists)return {ok:false,status:404,body:{error:'This model has no preset section to size.'}};
+    const files=presets.files(model);
+    const resolve=containerPath=>{
+      // Preset paths are llama-container paths under /models; map onto our mount.
+      if(typeof containerPath!=='string'||!containerPath.startsWith('/models/'))return null;
+      const fs=require('node:fs'),path=require('node:path');
+      const root=fs.realpathSync(modelsPath),candidate=path.join(modelsPath,containerPath.slice('/models/'.length));
+      let real;try{real=fs.realpathSync(candidate);}catch{return null;}
+      if(!real.startsWith(root+path.sep))return null;
+      const stat=fs.statSync(real);return stat.isFile()?{file:real,size:stat.size}:null;
+    };
+    const modelFile=resolve(files.model);
+    if(!modelFile)return {ok:false,status:404,body:{error:'The preset\'s model file is not visible under the read-only model mount.'}};
+    const mmproj=files.mmproj?resolve(files.mmproj):null;
+    if(files.mmproj&&!mmproj)return {ok:false,status:404,body:{error:'The preset\'s vision projector is not visible under the read-only model mount.'}};
+    const {readGguf,summarize}=require('./gguf-meta.cjs');
+    let meta;try{meta=summarize(readGguf(modelFile.file));}catch(e){return {ok:false,status:422,body:{error:'Could not read model metadata: '+e.message}};}
+    const result=require('./llamacpp-autoconfig.cjs').suggest({meta,modelBytes:modelFile.size,mmprojBytes:mmproj?.size||0,budgetGib,current:{...profile.defaults,...profile.options},cacheRamMaxMib});
+    return {ok:true,status:200,body:{model,revision:profile.revision,arch:meta.arch,...result}};
+  }
   return {
     kind: 'llamacpp', enabled: true, baseUrl: base, headers, request,
     capabilities: { routing: true, load: true, unload: true, download: true, deleteCached: true, runtimeOptions: false, hardware: false, presets: !!presets },
@@ -141,6 +169,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     enterInference: maintenance.enter,
     getPreset: model => presets ? Promise.resolve({ok:true,status:200,body:presets.get(model)}) : unsupported('Native preset editing'),
     applyPreset,
+    suggestPreset,
     unload: model => mutate(()=>post('/models/unload', { model })),
     pull: ({ checkpoint }) => mutate(async () => {
       if (!/^[\w.-]+\/[\w.-]+(?::[\w.-]+)?$/.test(checkpoint || '')) return { ok: false, status: 400, body: { error: 'Choose a Hugging Face repository and quantization' } };

@@ -189,6 +189,11 @@ function authResult(res, result) {
 const modelManager = createModelManager({
   kind: MODEL_MANAGER_KIND,
   presetPath: process.env.LLAMACPP_PRESET_PATH,
+  autoconfig: {
+    modelsPath: process.env.LLAMACPP_MODELS_PATH || '',
+    budgetGib: Number(process.env.LLAMACPP_AUTOCONFIG_MEMORY_GIB) || require('./llamacpp-autoconfig.cjs').parseMemoryLimit(process.env.LLAMACPP_MEMORY_LIMIT) || 0,
+    cacheRamMaxMib: Number(process.env.LLAMACPP_AUTOCONFIG_CACHE_RAM_MAX_MIB) || 1024,
+  },
   downloadStatePath: path.join(DATA_DIR,'native-downloads-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)+'.json'),
   baseUrl: MODEL_MANAGER_BASE,
   apiKey: process.env.MODEL_MANAGER_API_KEY || INFERENCE_KEY,
@@ -3763,6 +3768,14 @@ async function handleRequestScoped(req, res) {
         // False means RAG is silently degraded to keyword-only context.
         ragAvailable: rag.ragAvailable(),
       });
+    }
+
+    if (p === '/api/models/preset/suggest') {
+      if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
+      if(req.method!=='GET')return json(res,405,{error:'Method not allowed'});
+      if(!modelManager.suggestPreset)return json(res,404,{error:'Native preset suggestions are unavailable'});
+      const result=await modelManager.suggestPreset(url.searchParams.get('model') || '');
+      return json(res,result.status,result.body);
     }
 
     if (p === '/api/models/preset') {
