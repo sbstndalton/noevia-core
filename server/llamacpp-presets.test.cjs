@@ -18,3 +18,14 @@ test('preset reload excludes concurrent native lifecycle mutations',async t=>{
  release();assert.equal((await applying).ok,true);
  const leave=manager.enterInference();leave();
 });
+
+test('reloading presets refuses while a model is loaded unless asked to unload it first',async t=>{
+ const {file}=fixture(t);let loaded=true;const calls=[];
+ const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',presetPath:file,fetchJson:async(url,opts={})=>{calls.push(`${opts.method||'GET'} ${new URL(url).pathname}${new URL(url).search}`);if(url.endsWith('/models/unload'))loaded=false;return {ok:true,status:200,body:{data:[{id:'synthetic',status:{value:loaded?'loaded':'unloaded'}}]}};}});
+ const refused=await manager.reloadPresets();
+ assert.equal(refused.status,409);assert.deepEqual(refused.body.loaded,['synthetic']);assert.ok(!calls.some(c=>c.includes('reload=1')));
+ const applied=await manager.reloadPresets({unload:true});
+ assert.equal(applied.status,200);assert.deepEqual(applied.body.unloaded,['synthetic']);
+ assert.ok(calls.indexOf('POST /models/unload')<calls.indexOf('GET /models?reload=1'));
+ const leave=manager.enterInference();await assert.rejects(manager.reloadPresets({unload:true}),{status:409});leave();
+});

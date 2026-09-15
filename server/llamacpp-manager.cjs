@@ -134,6 +134,20 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
       return {ok:false,status:503,body:{error:'Reload failed or timed out. Previous preset file restored; check router health before retrying.'}};
     }
   }
+  // Re-read models.ini after an edit made outside noevia's own preset editor. With a model
+  // loaded this refuses unless the caller asked to unload it: the router must not swap the
+  // settings under a running instance.
+  async function reloadPresets({unload=false}={}) {
+    return maintenance.exclusive(async()=>{
+      const listing=await rawModels();
+      if(!listing.ok)return listing;
+      const loaded=(listing.body?.data||[]).filter(m=>['loaded','loading'].includes(m.status?.value));
+      if(loaded.length&&!unload)return {ok:false,status:409,body:{error:'A model is loaded. Unload it to apply the new settings.',loaded:loaded.map(m=>m.id)}};
+      for(const m of loaded)await post('/models/unload',{model:m.id},60000).catch(()=>null);
+      const result=await request('/models?reload=1',{},120000);
+      return result.ok?{ok:true,status:200,body:{reloaded:true,unloaded:loaded.map(m=>m.id)}}:{ok:false,status:502,body:{error:'The engine did not reload its settings. Check the Hardware tab.'}};
+    });
+  }
   // Maps an engine-side path (/models/..., /cache/...) onto noevia's read-only mounts.
   function localFile(containerPath) {
     const fs=require('node:fs'),path=require('node:path');
@@ -197,6 +211,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     getPreset: model => presets ? Promise.resolve({ok:true,status:200,body:presets.get(model)}) : unsupported('Native preset editing'),
     applyPreset,
     suggestPreset,
+    reloadPresets,
     calibration: calibrator ? { start: calibrator.start, cancel: calibrator.cancel, status: calibrator.status, recover: calibrator.recover } : null,
     unload: model => mutate(()=>post('/models/unload', { model })),
     pull: ({ checkpoint }) => mutate(async () => {
