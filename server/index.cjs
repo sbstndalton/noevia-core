@@ -55,6 +55,7 @@ const DIST_DIR = path.join(__dirname, '..', 'dist');
 const DATA_DIR = process.env.UI_DATA_DIR || path.join(__dirname, 'ui-data');
 const HISTORY_CAP = 40;
 const SPAFallbacks = ['/', '/chat', '/diary', '/projects', '/settings'];
+const staticFiles = require('./static-files.cjs').createStaticFiles(DIST_DIR);
 const secretStore = createSecretStore(DATA_DIR);
 const authService = createAuth({
   dataDir: DATA_DIR,
@@ -4111,27 +4112,15 @@ async function handleRequestScoped(req, res) {
     }
 
     // Static files with SPA fallback.
-    let filePath = path.normalize(path.join(DIST_DIR, p === '/' ? 'index.html' : p));
-    // path.sep suffix check: a bare startsWith(DIST_DIR) would also accept a
-    // sibling directory like `${DIST_DIR}-evil`.
-    if (filePath !== DIST_DIR && !filePath.startsWith(DIST_DIR + path.sep)) return json(res, 403, { error: 'forbidden' });
-    if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
-      if (!SPAFallbacks.includes(p)) return json(res, 404, { error: 'not found' });
-      filePath = path.join(DIST_DIR, 'index.html');
+    const found = staticFiles.resolve(p);
+    if (found && found.forbidden) return json(res, 403, { error: 'forbidden' });
+    if (!found && !SPAFallbacks.includes(p)) return json(res, 404, { error: 'not found' });
+    try {
+      return staticFiles.send(req, res, found ? found.filePath : path.join(DIST_DIR, 'index.html'), found ? p : '/');
+    } catch {
+      if (!res.headersSent) return json(res, 500, { error: 'read error' });
+      return res.end();
     }
-    const ext = path.extname(filePath);
-    const types = {
-      '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css',
-      '.svg': 'image/svg+xml', '.png': 'image/png', '.woff2': 'font/woff2',
-      '.woff': 'font/woff', '.ico': 'image/x-icon', '.json': 'application/json',
-    };
-    res.writeHead(200, { 'Content-Type': types[ext] || 'application/octet-stream' });
-    const stream = fs.createReadStream(filePath);
-    stream.on('error', () => {
-      if (!res.headersSent) json(res, 500, { error: 'read error' });
-      else res.end();
-    });
-    stream.pipe(res);
   } catch (err) {
     if (res.destroyed || res.writableEnded) return;
     if (res.headersSent) {
@@ -4156,6 +4145,7 @@ if (require.main === module) {
     console.warn('WARNING: Set DIARY_AUTH_TOKEN to protect the internal diary connection. Browser accounts remain authenticated.');
   }
   const server = http.createServer((req, res) => { handleRequest(req, res).catch(() => { if (!res.destroyed) res.destroy(); }); });
+  staticFiles.warm();
   // A chat waiting on a write approval is a legitimately long request. Node's
   // default requestTimeout is 5 minutes measured from the START of the request,
   // so a reply that spent two minutes generating would leave only three for the
