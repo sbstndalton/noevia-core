@@ -169,3 +169,52 @@ test('a project folder name survives characters a path cannot', () => {
   assert.equal(projectFolderName('trailing dot.', 'p-3'), 'trailing dot');
   assert.equal(projectFolderName('', 'p-4'), 'Untitled project');
 });
+
+// ── `internal`: noevia's own in-process server ───────────────────────────
+//
+// This one is different in kind from the others. It is not a remote service
+// the operator trusts; it is this process, and the thing being handed over is
+// a capability to act as the current user. So the parser is strict about where
+// it may point, and drops rather than downgrades on any doubt.
+
+test('internal is accepted only for a loopback IP literal', () => {
+  const ok = parseWith({ MCP_SERVERS: 'noevia|http://127.0.0.1:8022/mcp|internal' });
+  assert.deepEqual(ok.map((s) => [s.id, s.auth]), [['noevia', 'internal']]);
+
+  const v6 = parseWith({ MCP_SERVERS: 'noevia|http://[::1]:8022/mcp|internal' });
+  assert.equal(v6[0].auth, 'internal');
+
+  const alt = parseWith({ MCP_SERVERS: 'noevia|http://127.0.0.53:8022/mcp|internal' });
+  assert.equal(alt[0].auth, 'internal');
+});
+
+test('an internal entry that is not loopback is dropped, never downgraded', () => {
+  // Downgrading to `none` would leave a configured-but-useless server and an
+  // off-box URL that later looks deliberate. Dropping makes its boxes vanish,
+  // which is the ordinary unconfigured state.
+  for (const url of [
+    'http://localhost:8022/mcp',        // a NAME, which can be made to resolve anywhere
+    'http://noevia.example.com/mcp',
+    'http://10.69.0.130:8022/mcp',
+    'http://169.254.169.254/mcp',       // link-local metadata, the classic SSRF target
+    'http://0.0.0.0:8022/mcp',
+    'http://[::ffff:127.0.0.1]:8022/mcp', // v4-mapped: not a literal we accept
+  ]) {
+    const servers = parseWith({ MCP_SERVERS: `noevia|${url}|internal` });
+    assert.deepEqual(servers, [], `accepted ${url}`);
+  }
+});
+
+test('only one internal server exists, so a second entry is dropped', () => {
+  const servers = parseWith({ MCP_SERVERS: 'noevia|http://127.0.0.1:8022/mcp|internal, other|http://127.0.0.1:8023/mcp|internal' });
+  assert.deepEqual(servers.map((s) => s.id), ['noevia']);
+});
+
+test('internal coexists with the remote servers and does not disturb them', () => {
+  const servers = parseWith({
+    MCP_SERVERS: 'nextcloud|http://nextcloud-mcp:8000/mcp|nextcloud, noevia|http://127.0.0.1:8022/mcp|internal, tavily|https://mcp.tavily.com/mcp|bearer:TAVILY_API_KEY',
+  });
+  assert.deepEqual(servers.map((s) => [s.id, s.auth]), [['nextcloud', 'nextcloud'], ['noevia', 'internal'], ['tavily', 'bearer']]);
+  // The internal entry carries no token env: its credential is minted per call.
+  assert.equal(servers[1].tokenEnv, undefined);
+});

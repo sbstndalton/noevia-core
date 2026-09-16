@@ -31,7 +31,15 @@ function createSecretStore(dataDir) {
     decipher.setAuthTag(raw.subarray(12, 28));
     return Buffer.concat([decipher.update(raw.subarray(28)), decipher.final()]).toString('utf8');
   }
-  return { encrypt, decrypt, keyFile };
+  // A separate key per purpose, derived rather than reused: signing a
+  // capability token with the same bytes that encrypt stored credentials
+  // would make a signing-oracle bug a credential-disclosure bug. HKDF gives
+  // an independent key per label from the one file operators already back up.
+  function derive(label, bytes = 32) {
+    if (!label || typeof label !== 'string') throw new Error('derive needs a label');
+    return Buffer.from(crypto.hkdfSync('sha256', key, Buffer.alloc(0), Buffer.from(`noevia:${label}`, 'utf8'), bytes));
+  }
+  return { encrypt, decrypt, derive, keyFile };
 }
 
 module.exports = { createSecretStore };

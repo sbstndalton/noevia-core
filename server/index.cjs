@@ -915,6 +915,38 @@ function resolveTools(project, model) {
 // makes the app genuinely useful, and nothing else. Tools not listed here are
 // simply never offered; adding one is a deliberate, costed decision.
 const MCP_TOOLBOX_MANIFEST = [
+  // ── noevia's own capabilities (server `noevia`, the in-process one) ────
+  //
+  // These bind like any other MCP box, so they are opt-in per project, they
+  // obey the same cap and token budget, and their writes go through the same
+  // approval card. When MCP_INTERNAL_PORT is unset the server is not
+  // configured, both boxes lose every tool and neither is offered.
+  {
+    id: 'diary',
+    server: 'noevia',
+    label: 'Diary',
+    description: 'Read your diary: today, a whole month, or which months exist.',
+    // Read-only, and not by oversight. The sidecar has no append endpoint —
+    // /api/entries/edit corrects one already-logged exchange by its xid, and
+    // /api/chat is the only route that creates entries, which AGENTS.md puts
+    // out of bounds. Writing to the user's real journal needs a deliberate
+    // decision and a sidecar change, not a tool quietly added here.
+    tools: ['diary_read_today', 'diary_read_month', 'diary_list_months'],
+    reads: ['diary_read_today', 'diary_read_month', 'diary_list_months'],
+  },
+  {
+    id: 'project-docs',
+    server: 'noevia',
+    label: 'Project documents',
+    description: 'List, read, search and edit the files attached to this project.',
+    tools: [
+      'project_list_files', 'project_read_file', 'project_search',
+      'project_create_file', 'project_append_file', 'project_replace_text',
+    ],
+    // The three writes are absent, so the default-deny rule makes them writes
+    // and each one stops for a human with its arguments shown in full.
+    reads: ['project_list_files', 'project_read_file', 'project_search'],
+  },
   // Boxes are task-shaped, not app-shaped. An app with seventeen tools becomes
   // two or three boxes, because the budget is spent per selection: a project
   // that wants to read a calendar should not also pay for bulk deletion.
@@ -1230,6 +1262,19 @@ const MCP_TOOLBOX_MANIFEST = [
 // pass-through hands a user's Nextcloud password to the server being called.
 // That is correct for the Nextcloud MCP and a credential leak for anything
 // else, so a server gets it only when the operator says so by name.
+// `internal` names noevia's own in-process MCP server. It is accepted only for
+// a loopback IP LITERAL: a DNS name — including `localhost` — can be made to
+// resolve somewhere else, and this listener answers to a capability token
+// rather than a session cookie, so pointing it off-box would hand that
+// capability to a stranger. No rebinding, no surprises.
+function isLoopbackLiteral(hostname) {
+  const h = String(hostname || '').replace(/^\[|\]$/g, '');
+  if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h)) {
+    return h.split('.').every((part) => Number(part) >= 0 && Number(part) <= 255);
+  }
+  return h === '::1' || h === '0:0:0:0:0:0:0:1';
+}
+
 const MCP_SERVERS = (() => {
   const shapeOk = (raw, label) => {
     try {
@@ -1261,7 +1306,23 @@ const MCP_SERVERS = (() => {
       // it would be printed by anything that echoes the server list.
       let auth = 'none';
       let tokenEnv = null;
-      if (rawAuth === 'nextcloud') {
+      if (rawAuth === 'internal') {
+        // Dropped rather than downgraded on any doubt. Silently demoting this
+        // to `none` would leave a server configured and unusable; leaving it
+        // out makes its two boxes disappear, which is the documented
+        // unconfigured state and is at least honest.
+        let host = '';
+        try { host = new URL(rawUrl).hostname; } catch { host = ''; }
+        if (!isLoopbackLiteral(host)) {
+          console.warn(`[mcp] ignoring internal server "${id}": ${host || 'that host'} is not a loopback IP literal. Use 127.0.0.1, not a name.`);
+          continue;
+        }
+        if (out.some((sv) => sv.auth === 'internal')) {
+          console.warn(`[mcp] ignoring internal server "${id}": there is only one in-process server and it is already configured`);
+          continue;
+        }
+        auth = 'internal';
+      } else if (rawAuth === 'nextcloud') {
         auth = 'nextcloud';
       } else if (rawAuth && rawAuth.startsWith('bearer:')) {
         const envName = rawAuth.slice('bearer:'.length).trim();
@@ -1312,6 +1373,17 @@ function toolboxOffered(id) {
   return !ENABLED_TOOLBOXES || ENABLED_TOOLBOXES.has(id);
 }
 
+// noevia's own capabilities, offered over the same MCP path as everything
+// else. Default 0 means the listener never binds, no `internal` entry can
+// work, both boxes lose every tool and vanish — the ordinary unconfigured
+// state, identical to today for every existing deployment.
+const mcpInternal = require('./mcp-internal.cjs');
+const MCP_INTERNAL_PORT = Number(process.env.MCP_INTERNAL_PORT || 0);
+const MCP_INTERNAL_SERVER = MCP_SERVERS.find((sv) => sv.auth === 'internal') || null;
+// Derived, not the storage key itself: a signing bug must not become a
+// credential-disclosure bug.
+const MCP_INTERNAL_KEY = secretStore.derive('mcp-internal-token');
+
 const MCP_SERVER_BY_ID = new Map(MCP_SERVERS.map((sv) => [sv.id, sv]));
 const MCP_ENABLED = MCP_SERVERS.length > 0;
 
@@ -1349,7 +1421,7 @@ async function discoverOneServer(server) {
   // Discovery lists the catalogue only. A per-USER credential is attached at
   // call time instead (see mcpAuthHeaders), but a static service token has to
   // be present here or the server has nothing to list.
-  const headers = mcpStaticAuth(server);
+  const headers = mcpDiscoveryAuth(server);
   const { session } = await mcp.connect(server.url, headers);
   const discovered = await mcp.listTools(server.url, session, headers);
   const byName = new Map();
@@ -1428,7 +1500,12 @@ async function discoverMcpTools(force = false) {
       mcpState.tools = byName;
       mcpState.boxes = boxes;
       mcpState.servers = servers;
-      mcpState.discoveredAt = Date.now();
+      // The internal server is this process. If it did not answer, something
+      // is starting up or broken here, not on a remote host that needs ten
+      // minutes of backoff — retry on the next request instead of hiding its
+      // boxes for the whole TTL.
+      const internalDown = [...servers.values()].some((sv) => sv.auth === 'internal' && sv.error);
+      mcpState.discoveredAt = internalDown ? 0 : Date.now();
       // Kept for the single-server status shape: the first error, if any.
       mcpState.error = [...servers.values()].map((sv) => sv.error).find(Boolean) || null;
       console.log(`[mcp] ${byName.size} tools across ${MCP_SERVERS.length} server(s); ${boxes.length} curated boxes available`);
@@ -1505,6 +1582,45 @@ function mcpAuthHeaders() {
   }
   const basic = Buffer.from(`${storage.username}:${storage.secret}`).toString('base64');
   return { Authorization: `Basic ${basic}`, 'X-Cowork-User-ID': workspace.userId };
+}
+
+/** A capability token for one call to noevia's own MCP server.
+ *
+ *  Unlike the other two modes this is not a credential at all — the caller is
+ *  this process. What it carries is WHICH user and project the call acts for,
+ *  bound by an HMAC so the call cannot claim a different one, and whether a
+ *  write has been approved. Fresh per call, valid for 30 seconds.
+ *
+ *  `w` is safe to derive from isWriteTool here because this is only reached
+ *  from executeToolCall, which the permission gate has already let through:
+ *  a write that was declined returns before ever getting here. */
+function mcpInternalAuth(name) {
+  const workspace = requestScope.getStore()?.workspace;
+  if (!workspace) return null;
+  const token = mcpInternal.mintToken(MCP_INTERNAL_KEY, {
+    uid: workspace.userId,
+    pid: internalCallProject ? internalCallProject.id : null,
+    w: isWriteTool(name) ? 1 : 0,
+  });
+  return { Authorization: `Bearer ${token}` };
+}
+
+/** Which project the in-flight tool call belongs to. executeMcpToolCall is
+ *  reached from executeToolCall, which knows; rather than changing the
+ *  signature of a function three other call sites share, the project is parked
+ *  here for the length of one await. Single-threaded, set immediately before
+ *  the call and cleared after. */
+let internalCallProject = null;
+
+/** Discovery runs with no user in scope, so it gets a token that can list the
+ *  catalogue and can never call anything. The catalogue is static and
+ *  identical for everyone, so this leaks nothing. Longer-lived than a call
+ *  token because listTools paginates, and harmless because it cannot act. */
+function mcpDiscoveryAuth(server) {
+  if (server && server.auth === 'internal') {
+    return { Authorization: `Bearer ${mcpInternal.mintToken(MCP_INTERNAL_KEY, { discovery: true, ttlMs: 120000 })}` };
+  }
+  return mcpStaticAuth(server);
 }
 
 // ── Tool permissions (master step 16) ────────────────────────────────────
@@ -1679,7 +1795,10 @@ async function executeToolCall(project, name, rawArgs, allowed) {
   // Not a built-in: if the name came from a discovered MCP box, execute it
   // there. The per-user credential is attached here rather than at discovery,
   // so two users sharing a project each act as themselves.
-  if (mcpState.tools.has(name)) return executeMcpToolCall(name, args);
+  if (mcpState.tools.has(name)) {
+    internalCallProject = project || null;
+    try { return await executeMcpToolCall(name, args); } finally { internalCallProject = null; }
+  }
   return `ERROR: unknown tool "${name}"`;
 }
 
@@ -1697,6 +1816,9 @@ async function executeMcpToolCall(name, args) {
   if (server.auth === 'bearer') {
     auth = mcpStaticAuth(server);
     if (!auth) return `ERROR: ${name} needs ${server.tokenEnv}, which is not configured on this deployment.`;
+  } else if (server.auth === 'internal') {
+    auth = mcpInternalAuth(name);
+    if (!auth) return `ERROR: ${name} needs a signed-in session and there is none.`;
   } else if (server.auth === 'nextcloud') {
     auth = mcpAuthHeaders();
     if (!auth) {
@@ -4184,6 +4306,73 @@ if (require.main === module) {
     davServer.setTimeout(60000, socket => socket.destroy());
     davServer.listen(davConfig.port, HOST, () => console.log(`Diary file sharing listener on port ${davConfig.port}; scope ${davConfig.scope}; per-user opt-in required`));
   }
+  // ── noevia's own MCP server ──────────────────────────────────────────
+  //
+  // Second listener, loopback only, started only when a port is configured
+  // AND MCP_SERVERS actually names it. Configuring one without the other is a
+  // half-built setup, so say which half is missing rather than binding a port
+  // nothing will call or advertising a server that will not answer.
+  if (MCP_INTERNAL_PORT && !MCP_INTERNAL_SERVER) {
+    console.warn(`[mcp] MCP_INTERNAL_PORT=${MCP_INTERNAL_PORT} is set but no MCP_SERVERS entry uses |internal, so nothing will call it. Add: noevia|http://127.0.0.1:${MCP_INTERNAL_PORT}/mcp|internal`);
+  } else if (!MCP_INTERNAL_PORT && MCP_INTERNAL_SERVER) {
+    console.warn('[mcp] an MCP_SERVERS entry uses |internal but MCP_INTERNAL_PORT is not set, so noevia\'s own tools will not answer.');
+  } else if (MCP_INTERNAL_PORT && MCP_INTERNAL_SERVER) {
+    if (MCP_INTERNAL_PORT === PORT || MCP_INTERNAL_PORT === Number(process.env.COWORK_DAV_PORT || 0)) {
+      throw new Error('MCP_INTERNAL_PORT must differ from UI_PORT and COWORK_DAV_PORT');
+    }
+    const definitions = require('./mcp-internal-tools.cjs').createInternalTools({
+      cap: TOOL_RESULT_CAP,
+      getProject,
+      // Reads only. diaryHeaders() carries the tenant header and the storage
+      // descriptor, so the sidecar resolves the SAME corpus it would for this
+      // user's own browser session and no other.
+      diary: async (endpoint) => {
+        const userId = requestScope.getStore()?.workspace?.userId;
+        if (!userId || !authService.diaryEnabled(userId)) throw new Error('the Diary add-on is not enabled for this account');
+        const r = await fetchJson(`${DIARY_BASE}/api${endpoint}`, { headers: diaryHeaders() }, 15000);
+        if (!r.ok) throw new Error(String(r.body?.detail || r.body?.error || `diary sidecar ${r.status}`));
+        return r.body || {};
+      },
+      readProjectFile: (project, args) => executeToolCall(project, 'read_project_file', JSON.stringify(args), null),
+      ragAvailable: () => rag.ragAvailable(),
+      search: (projectId, query, userId) => rag.searchProject(projectId, query, userId),
+      // One write path, the same one a browser upload takes: the file lands in
+      // the project's storage folder and is re-indexed identically, rather
+      // than a second kind of file that only the model can make.
+      writeTextFile: (project, name, text) => withSourceLock(project, async () => {
+        if (getProject(project.id) !== project) throw new Error('the project changed while writing; nothing was saved');
+        const uploads = require('./uploads.cjs');
+        const bytes = Buffer.from(text, 'utf8');
+        uploads.validate(name, bytes);
+        const connection = authService.getStorage(currentWorkspace().userId, true);
+        const remote = storageClient.isBrowsable(connection) ? connection : null;
+        if (remote && !project.projectFolder) project.projectFolder = await ensureProjectFolder(project);
+        const file = await uploads.ingest(currentWorkspace(), project, name, bytes, { connection: remote });
+        if (remote) project.sourceFolders = [...new Set([...(project.sourceFolders || []), project.projectFolder])];
+        project.files = [...(project.files || []).filter((f) => f.name !== file.name), file];
+        project.updatedAt = Date.now();
+        indexSource(project, file);
+        saveProjects(PROJECTS);
+        return file;
+      }),
+    });
+    const internalServer = mcpInternal.startInternalServer({
+      port: MCP_INTERNAL_PORT,
+      key: MCP_INTERNAL_KEY,
+      definitions,
+      // The scope comes from the token, never from whatever request happens to
+      // be in flight. Same construction the diary backup worker uses.
+      runAs: (userId, fn) => {
+        const user = authService.listUsers().find((u) => u.id === userId);
+        if (!user) throw new Error('that account no longer exists');
+        return requestScope.run({ workspace: workspaceStore.get(userId), authn: { user, legacy: false } }, fn);
+      },
+      path: (() => { try { return new URL(MCP_INTERNAL_SERVER.url).pathname || '/mcp'; } catch { return '/mcp'; } })(),
+    });
+    internalServer.requestTimeout = 120000;
+    internalServer.headersTimeout = 15000;
+  }
+
   require('./diary-backup-worker.cjs').startDiaryBackupWorker({
     users: () => authService.listUsers(),
     enabled: id => authService.diaryEnabled(id),

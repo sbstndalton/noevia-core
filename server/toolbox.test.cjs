@@ -16,6 +16,8 @@ const {
   sanitizeToolboxes,
   executeToolCall,
   TOOLBOXES,
+  toolTokenBudgetFor,
+  MCP_TOOLBOX_MANIFEST,
 } = require('./index.cjs');
 
 // Step 14 turned a module-scope TOOL_DEFS constant into a per-request resolved
@@ -152,4 +154,61 @@ test('a tool outside the resolved list cannot be executed', () => {
     executeToolCall({}, 'get_current_time', '{}')
       .then((r) => assert.match(r, /^Current time:/)),
   ]);
+});
+
+
+// ── noevia's own boxes ───────────────────────────────────────────────────
+//
+// A box is all-or-nothing: exceeding the cap delivers PART of it, silently.
+// These two are the only boxes whose tools this repository writes, so they are
+// the only ones a change here can break — and they are aimed at exactly the
+// small models where both limits actually bind.
+test("noevia's own boxes fit a small model's cap and token budget", () => {
+  const internal = require('./mcp-internal-tools.cjs').createInternalTools({ getProject: () => null });
+  const catalogue = require('./mcp-internal.cjs').catalogueOf(internal);
+  const byName = new Map(catalogue.map((t) => {
+    const conv = require('./mcp.cjs').convertTool(t);
+    assert.ok(conv.ok, `${t.name}: ${conv.reason}`);
+    return [t.name, conv.tool];
+  }));
+
+  const CORE = TOOLBOXES.find((b) => b.id === 'core');
+  const SMALL = 'Qwen3.5-9B-GGUF-UD-Q4_K_XL';
+  assert.equal(toolCapFor(SMALL), 12);
+  const boxes = MCP_TOOLBOX_MANIFEST.filter((b) => b.server === 'noevia');
+  assert.deepEqual(boxes.map((b) => b.id), ['diary', 'project-docs']);
+
+  for (const box of boxes) {
+    assert.ok(box.tools.length <= toolCapFor(SMALL), `${box.id} alone exceeds the cap`);
+  }
+  // The realistic worst case a user can select: both boxes plus core.
+  const together = [...new Set(boxes.flatMap((b) => b.tools))];
+  assert.ok(together.length + CORE.tools.length <= toolCapFor(SMALL),
+    `both boxes plus core is ${together.length + CORE.tools.length} tools, over the cap of ${toolCapFor(SMALL)}`);
+
+  const tools = [...together.map((n) => byName.get(n)), ...CORE.tools];
+  assert.ok(estimateToolTokens(tools) <= toolTokenBudgetFor(SMALL),
+    `both boxes plus core costs ${estimateToolTokens(tools)} tokens, over the budget of ${toolTokenBudgetFor(SMALL)}`);
+});
+
+test("every tool noevia offers is curated, and every write is gated", () => {
+  const internal = require('./mcp-internal-tools.cjs').createInternalTools({ getProject: () => null });
+  const boxes = MCP_TOOLBOX_MANIFEST.filter((b) => b.server === 'noevia');
+  const curated = new Set(boxes.flatMap((b) => b.tools));
+  // A tool that exists but is in no box is unreachable; one in a box but not
+  // implemented is a broken box. Both are silent, so assert both directions.
+  assert.deepEqual([...curated].sort(), Object.keys(internal).sort());
+
+  const declaredReads = new Set(boxes.flatMap((b) => b.reads || []));
+  for (const [name, definition] of Object.entries(internal)) {
+    if (definition.write) {
+      assert.ok(!declaredReads.has(name), `${name} writes but is listed as a read, which would remove its approval prompt`);
+    }
+  }
+  // …and the gate agrees. isWriteTool defaults unknown names to write, so this
+  // is only meaningful alongside the assertion above that reads ARE listed.
+  const { isWriteTool } = require('./index.cjs');
+  for (const [name, definition] of Object.entries(internal)) {
+    if (definition.write) assert.equal(isWriteTool(name), true, `${name} is not gated`);
+  }
 });

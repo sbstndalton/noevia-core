@@ -46,6 +46,11 @@ test('the read classification matches what each box actually claims', () => {
   // silently removes its approval prompt, so it must be changed here too and
   // reviewed alongside the manifest.
   const expected = {
+    // noevia's own server. The Diary box is entirely reads because the sidecar
+    // has no append endpoint and /api/chat is off limits; project-docs gates
+    // its three writes by leaving them out of this list.
+    diary: ['diary_read_today', 'diary_read_month', 'diary_list_months'],
+    'project-docs': ['project_list_files', 'project_read_file', 'project_search'],
     // Web tools are all reads: none of them change anything. They do reach the
     // public internet and spend metered credits, which the box split reflects.
     'web-search': ['tavily_search', 'tavily_extract', 'tavily_research'],
