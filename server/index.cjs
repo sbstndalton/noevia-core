@@ -1315,6 +1315,16 @@ function toolboxOffered(id) {
 const MCP_SERVER_BY_ID = new Map(MCP_SERVERS.map((sv) => [sv.id, sv]));
 const MCP_ENABLED = MCP_SERVERS.length > 0;
 
+// Being unconfigured is a healthy state, but it is indistinguishable from a
+// broken one from the outside: a curated box that loses every tool is not
+// rendered at all, so the toolboxes simply are not there and it reads as the
+// feature having been removed. On 2026-09-15 that was a real outage — the live
+// Compose file had been copied without the MCP keys. Name the variable, so the
+// log says what to set rather than only that something is off.
+if (!MCP_ENABLED) {
+  console.warn('[mcp] disabled: neither MCP_SERVERS nor MCP_SERVER_URL is set, so only the built-in `core` toolbox is offered. Set MCP_SERVERS to `id|url|auth` entries to enable connected tools.');
+}
+
 // Discovered MCP tools, keyed by name, plus the boxes that survived curation.
 // Discovery is a network round trip against servers that may be down, so it is
 // lazy, cached, and failure is non-fatal and PER SERVER: one dead side-car must
