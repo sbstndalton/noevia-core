@@ -3144,22 +3144,6 @@ async function handleRequestScoped(req, res) {
 
     // ── Projects CRUD ──
     const usageSummary = require('./usage-summary.cjs');
-    const usageRates = () => {
-      try { return usageSummary.validateRates(JSON.parse(authService.db.prepare("SELECT value FROM settings WHERE key='usage_rates'").get()?.value || '{"currency":"USD","rates":[]}')); }
-      catch { return {currency:'USD',rates:[]}; }
-    };
-    if (p === '/api/usage/rates') {
-      if(req.method==='GET')return json(res,200,{...usageRates(),admin:authn.user.role==='admin'});
-      if(req.method==='PUT'){
-        if(authn.user.role!=='admin')return json(res,403,{error:'administrator required'});
-        try{
-          const rates=usageSummary.validateRates(await readJson(req));
-          authService.db.prepare("INSERT INTO settings(key,value) VALUES('usage_rates',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(JSON.stringify(rates));
-          return json(res,200,{...rates,admin:true});
-        }catch(error){return json(res,400,{error:error.message||'Invalid rates'});}
-      }
-      return json(res,405,{error:'method not allowed'});
-    }
     if ((p === '/api/usage' || p === '/api/usage/aggregate') && req.method === 'GET') {
       if(p==='/api/usage/aggregate'&&authn.user.role!=='admin')return json(res,403,{error:'administrator required'});
       let store,aggregate;
@@ -3167,7 +3151,7 @@ async function handleRequestScoped(req, res) {
         try {const result=await usageSummary.aggregateUsage(authService.listUsers(),workspaceStore.userDir);store=result.store;aggregate={accounts:result.accounts,unreadableAccounts:result.unreadableAccounts,checkedAt:result.checkedAt};}
         catch{return json(res,503,{error:'Aggregate usage could not be read within its limits.'});}
       }else store=readUsage(currentWorkspace());
-      return json(res,200,{...usageSummary.summarizeUsage(store,{dayKey:usageDayKey,retentionDays:USAGE_RETENTION_DAYS,pricing:usageRates()}),...(aggregate?{aggregate}:{})});
+      return json(res,200,{...usageSummary.summarizeUsage(store,{dayKey:usageDayKey,retentionDays:USAGE_RETENTION_DAYS}),...(aggregate?{aggregate}:{})});
     }
     const windowMatch=p.match(/^\/api\/chats\/([^/]+)\/context-window$/);
     if(windowMatch && req.method==='GET') return json(res,200,{meter:require('./chat-context.cjs').read(currentWorkspace().dir,decodeURIComponent(windowMatch[1])).meter||null});
