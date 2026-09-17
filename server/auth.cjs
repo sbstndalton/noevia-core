@@ -289,6 +289,8 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
     return !supplied || supplied === origin || trustedOrigins.has(supplied);
   }
 
+  let dummyHash = null;
+  const timingHash = () => (dummyHash ||= createPasswordHash(randomToken()));
   async function createPasswordHash(password) {
     if (typeof password !== 'string' || password.length < 12 || password.length > 128) throw new Error('password must be 12-128 characters');
     return hash(password, { algorithm: Algorithm.Argon2id, memoryCost: 19456, timeCost: 2, parallelism: 1 });
@@ -349,10 +351,14 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       return { status: 201, body: { user: publicUser(user), csrfToken: issueSession(req, res, user), migrationRequired: true } };
     },
     async passwordLogin(req, res, body) {
-      const key = `login:${clientAddress(req, trustProxy)}:${String(body.username || '').toLowerCase()}`;
-      if (rateLimited(key)) return { status: 429, body: { error: 'sign-in failed' } };
+      const address = clientAddress(req, trustProxy);
+      const key = `login:${address}:${String(body.username || '').toLowerCase()}`;
+      // Per address across all usernames too, so one client cannot spray passwords over many accounts.
+      if (rateLimited(`login-address:${address}`, 30) || rateLimited(key)) return { status: 429, body: { error: 'sign-in failed' } };
       const row = db.prepare('SELECT * FROM users WHERE username_norm=?').get(String(body.username || '').toLowerCase());
-      const ok = row && !row.disabled_at ? await verify(row.password_hash, String(body.password || '')).catch(() => false) : false;
+      // Always pay for one Argon2 verification, so response time doesn't reveal whether a username exists.
+      const usable = row && !row.disabled_at;
+      const ok = await verify(usable ? row.password_hash : await timingHash(), String(body.password || '')).catch(() => false) && usable;
       if (!ok) return { status: 401, body: { error: 'sign-in failed' } };
       audit('auth.password', row.id, row.id);
       return { status: 200, body: { user: publicUser(row), csrfToken: issueSession(req, res, row) } };
