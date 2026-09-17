@@ -53,7 +53,9 @@ const DIARY_TOKEN = process.env.DIARY_AUTH_TOKEN || '';
 const UI_AUTH_TOKEN = (process.env.UI_AUTH_TOKEN || DIARY_TOKEN).trim();
 const DIST_DIR = path.join(__dirname, '..', 'dist');
 const DATA_DIR = process.env.UI_DATA_DIR || path.join(__dirname, 'ui-data');
-const HISTORY_CAP = 40; // messages replayed to the model per request
+// Messages offered to the context projection per request. Compaction summarizes whatever does not
+// fit (and refuses beyond 1000), so this is a safety bound, not a silent cut at 20 exchanges.
+const HISTORY_CAP = 1000;
 // The saved transcript is the record, not the model window: keep it whole within generous bounds.
 const STORED_HISTORY_CAP = 5000;
 const STORED_HISTORY_BYTES = 32 * 1024 * 1024;
@@ -4339,7 +4341,9 @@ async function handleRequestScoped(req, res) {
 
     if (p === '/api/chat' && req.method === 'POST') {
       if (llmRateLimited(authn.user.id)) return json(res, 429, { error: 'Too many requests — the model endpoint is shared; wait a moment and try again' });
-      const raw = await readBody(req);
+      let raw;
+      try { raw = await readBody(req, STORED_HISTORY_BYTES); }
+      catch (e) { return json(res, e.status || 400, { error: e.status === 413 ? 'This chat is too large to continue; start a new chat.' : 'could not read the request' }); }
       let body;
       try {
         body = JSON.parse(raw);
