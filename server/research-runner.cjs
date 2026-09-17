@@ -43,7 +43,7 @@ function createResearchRunner({ jobs, search, extract, projectRetrieve = async (
     return rs.capExcerpts(bySource, cfg.perQuestionTokens);
   }
 
-  async function section(question, capped, ctx) {
+  async function section(question, capped, ctx, budget) {
     const notes = [];
     for (const { id, excerpts } of capped) {
       const messages = [{ role: 'system', content: NOTE_SYSTEM }, { role: 'user', content: `Question: ${question}\n\n<SOURCE id="${id}">\n${excerpts.join('\n\n')}\n</SOURCE>` }];
@@ -51,7 +51,11 @@ function createResearchRunner({ jobs, search, extract, projectRetrieve = async (
       const note = String(await complete(messages, { signal: ctx.signal, maxTokens: cfg.replyTokens })).trim();
       if (note && note !== 'NONE') notes.push({ id, note });
     }
-    if (!notes.length) return { text: '_No source had relevant information for this question._', used: [] };
+    if (!notes.length) {
+      // Only claim "nothing relevant" when this question was actually searched.
+      if (!capped.length && budget.exhaustedBefore) return { text: '_Not researched: the web-call budget was used up before this question._', used: [], skipped: true };
+      return { text: '_No source had relevant information for this question._', used: [] };
+    }
     const messages = [{ role: 'system', content: SECTION_SYSTEM }, { role: 'user', content: `Question: ${question}\n\n${notes.map((n) => `Note [${n.id}]:\n${n.note}`).join('\n\n')}` }];
     preflight(messages, cfg.windowTokens, cfg.replyTokens);
     return { text: String(await complete(messages, { signal: ctx.signal, maxTokens: cfg.replyTokens })).trim(), used: notes.map((n) => n.id) };
@@ -78,8 +82,9 @@ function createResearchRunner({ jobs, search, extract, projectRetrieve = async (
         ctx.progress(`Researching ${i + 1} of ${questions.length}: ${sub}`);
         let capped, drafted;
         try {
+          budget.exhaustedBefore = budget.webCalls >= cfg.maxWebCalls;
           capped = await gather(sub, ctx, registry, budget);
-          drafted = await section(sub, capped, ctx);
+          drafted = await section(sub, capped, ctx, budget);
         } catch (error) {
           // A cancel mid-call keeps every completed section for an explicit partial save.
           if (ctx.signal.aborted) break;
@@ -88,14 +93,15 @@ function createResearchRunner({ jobs, search, extract, projectRetrieve = async (
         // Verification uses the excerpts the model saw, never the model's own notes.
         const checked = rs.verifyCitations(drafted.text, registry, drafted.used);
         total += checked.total; valid += checked.valid;
-        parts.push({ question: sub, markdown: checked.markdown, unsupported: checked.unsupported });
+        parts.push({ question: sub, markdown: checked.markdown, unsupported: checked.unsupported, skipped: !!drafted.skipped });
         ctx.checkpoint({ step: i + 1, question: sub, sources: drafted.used, webCalls: budget.webCalls });
       }
       const body = parts.map((p) => (questions.length > 1 ? `## ${p.question}\n\n` : '') + p.markdown).join('\n\n');
-      const partial = ctx.signal.aborted || timedOut || parts.length < questions.length;
-      const note = partial ? `> Partial report: ${parts.length} of ${questions.length} questions were researched.\n\n` : '';
+      const partial = ctx.signal.aborted || timedOut || parts.length < questions.length || parts.some((p) => p.skipped);
+      const researched = parts.filter((p) => !p.skipped).length;
+      const note = partial ? `> Partial report: ${researched} of ${questions.length} questions were researched.\n\n` : '';
       const markdown = `# ${q}\n\n${note}${body || '_Nothing was researched._'}\n\n## Sources\n\n${rs.sourcesFooter(registry) || '_None._'}\n`;
-      const result = { question: q, markdown, sources: registry.list(), citationValidity: total ? valid / total : 1, citations: total, webCalls: budget.webCalls, sections: parts.length, questions: questions.length, partial };
+      const result = { question: q, markdown, sources: registry.list(), citationValidity: total ? valid / total : 1, citations: total, webCalls: budget.webCalls, sections: researched, questions: questions.length, partial };
       if (!ctx.signal.aborted && finish) await finish(result, ctx);
       return result;
     });

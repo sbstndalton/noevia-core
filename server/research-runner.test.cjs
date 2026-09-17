@@ -81,3 +81,14 @@ test('cancel stops the job and an empty question is refused', async (t) => {
   assert.ok(release);
   await assert.rejects(runner.start({ question: '  ' }), /Write a research question/);
 });
+
+test('a sub-question skipped because the web budget ran out says so instead of "no relevant source"', async (t) => {
+  const { runner } = setup(t, { projectRetrieve: async () => [], options: { maxWebCalls: 3 } });
+  const job = await (await runner.start({ question: 'Zephyr cell', subQuestions: ['Zephyr cell energy per kilogram', 'Who makes the Zephyr cell?'] })).done;
+  const second = job.result.markdown.split('## Who makes the Zephyr cell?')[1];
+  assert.match(second, /web-call budget was used up/);
+  assert.doesNotMatch(second, /No source had relevant information/);
+  assert.equal(job.result.partial, true, 'an unresearched question makes the report partial');
+  assert.match(job.result.markdown, /Partial report: 1 of 2 questions were researched/);
+  assert.equal(job.result.sections, 1);
+});
