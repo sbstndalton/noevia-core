@@ -256,3 +256,35 @@ test('the identity separates a sandboxed run from one spawned beside noevia', as
   const b = await run({ script: async () => {}, agent: { name: 'opencode', version: '1.18.31' }, sandboxKind: 'sandbox' });
   assert.notEqual(a.job.result.identityHash, b.job.result.identityHash);
 });
+
+test('a failure before the harness starts still gives back the workspace and the network', async () => {
+  // Writing the first checkpoint touches the disk, so it can fail for ordinary reasons: a full
+  // volume, a read-only mount. Before the fix that write sat outside the try/finally, and when
+  // it threw the egress token stayed valid and the branch stayed claimed for good.
+  const dir = temp('noevia-hjobs-');
+  const jobs = createJobs({ dir });
+  const workspaces = createCodeWorkspaces({ dir, epoch: 'test' });
+  const revoked = [];
+  const egress = { grant: () => ({ token: 'secret' }), revoke: (id) => { revoked.push(id); return 1; } };
+  const brokenJobs = {
+    ...jobs,
+    run: (id, work) => jobs.run(id, (ctx) => work({
+      ...ctx,
+      checkpoint: () => { throw new Error('ENOSPC: no space left on device'); },
+    })),
+  };
+  const harness = createCodeHarness({ jobs: brokenJobs, workspaces, egress, askApproval: async () => 'deny' });
+  const started = await harness.start({
+    repoPath: repo(), prompt: 'fix', capabilities: [ACTIONS.NETWORK], domains: ['a.test'],
+    connect: async () => ({ agent: {}, prompt: async () => ({ stopReason: 'end_turn' }) }),
+  });
+  for (let i = 0; i < 200 && !['completed', 'failed', 'cancelled'].includes(jobs.get(started.taskId)?.status); i++) {
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  assert.equal(jobs.get(started.taskId).status, 'failed');
+  assert.deepEqual(revoked, [started.taskId], 'the proxy token must not outlive the task');
+  assert.equal(workspaces.get(started.taskId).status, 'released');
+  // And the branch is claimable again, rather than blocked for good by a task that never ran.
+  const held = workspaces.get(started.taskId);
+  assert.ok(workspaces.claim({ taskId: '00000000-0000-4000-8000-000000000002', repoPath: held.repo, branch: held.branch }));
+});

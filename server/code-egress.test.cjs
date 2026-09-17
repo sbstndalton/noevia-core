@@ -169,3 +169,47 @@ test('a new grant for the same task replaces the old token', async () => {
   assert.equal((await p.check({ header: basic(first.token), target: 'a.test:443', defaultPort: 443 })).status, 407);
   assert.equal((await p.check({ header: basic(second.token), target: 'b.test:443', defaultPort: 443 })).ok, true);
 });
+
+test('a client that disconnects mid-check does not take the proxy down with it', async () => {
+  // The verdict does a DNS lookup, so there is a real window between accepting a connection and
+  // answering it. An 'error' on the client socket with no listener attached is an uncaught
+  // exception — and this proxy runs inside the web process, so that is the whole server.
+  let release;
+  const slow = new Promise((r) => { release = r; });
+  const { p } = proxy({ lookup: async () => { await slow; return ['127.0.0.1']; } });
+  const { token } = p.grant({ taskId: 't1', domains: ['example.com'] });
+  await p.listen();
+  const port = p.server.address().port;
+
+  const crashes = [];
+  const onCrash = (e) => crashes.push(e);
+  process.on('uncaughtException', onCrash);
+  try {
+    for (const verb of ['CONNECT', 'GET']) {
+      const socket = net.connect(port, '127.0.0.1', () => {
+        socket.write(verb === 'CONNECT'
+          ? `CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProxy-Authorization: ${basic(token)}\r\n\r\n`
+          : `GET http://example.com/x HTTP/1.1\r\nHost: example.com\r\nProxy-Authorization: ${basic(token)}\r\n\r\n`);
+        // Gone before the lookup comes back, the way a cancelled task's container is — and
+        // hung up with a reset, not a polite FIN, which is what a killed container sends.
+        setTimeout(() => { socket.resetAndDestroy ? socket.resetAndDestroy() : socket.destroy(); }, 20);
+      });
+      socket.on('error', () => {});
+      await new Promise((r) => setTimeout(r, 60));
+    }
+    release();
+    await new Promise((r) => setTimeout(r, 80));
+    assert.deepEqual(crashes.map((e) => e.message), [], 'the proxy must survive a client hanging up');
+
+    // Still serving afterwards.
+    const status = await new Promise((resolve, reject) => {
+      const req = http.request({ host: '127.0.0.1', port, method: 'GET', path: 'http://nope.test/x',
+        headers: { 'proxy-authorization': basic(token) } }, (res) => { res.resume(); resolve(res.statusCode); });
+      req.on('error', reject); req.end();
+    });
+    assert.equal(status, 403);
+  } finally {
+    process.off('uncaughtException', onCrash);
+    await p.close();
+  }
+});

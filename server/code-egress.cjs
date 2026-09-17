@@ -105,6 +105,12 @@ function createEgressProxy({ now = Date.now, log = () => {}, lookup = defaultLoo
 
   // Plain HTTP: the client sends an absolute URL. Forwarded to the address we checked.
   server.on('request', async (req, res) => {
+    // Attached before anything can await: deciding a verdict involves a DNS lookup, and a task's
+    // container being killed mid-request resets the connection. An 'error' with no listener is
+    // an uncaught exception, and this proxy runs inside the web process — so that is the whole
+    // server, taken down by a cancelled coding task.
+    req.on('error', () => {});
+    res.on('error', () => {});
     const url = (() => { try { return new URL(req.url); } catch { return null; } })();
     const verdict = await check({ header: req.headers['proxy-authorization'],
       target: url ? url.host : null, defaultPort: 80 });
@@ -127,7 +133,11 @@ function createEgressProxy({ now = Date.now, log = () => {}, lookup = defaultLoo
   // HTTPS: CONNECT tunnel. The proxy never sees the plaintext; it only decides where the
   // tunnel may go, which is the whole point of enforcing here rather than in a tool.
   server.on('connect', async (req, clientSocket, head) => {
+    // Same reason as above, and more so: a CONNECT socket is detached from the HTTP server's own
+    // error handling, so nothing else is watching it.
+    clientSocket.on('error', () => {});
     const verdict = await check({ header: req.headers['proxy-authorization'], target: req.url, defaultPort: 443 });
+    if (clientSocket.destroyed) return;
     if (!verdict.ok) {
       record({ event: 'egress.refused', ...verdict, ok: undefined });
       // A refused CONNECT is answered as a normal HTTP response on the same socket, which is
@@ -150,6 +160,7 @@ function createEgressProxy({ now = Date.now, log = () => {}, lookup = defaultLoo
     const drop = () => { upstream.destroy(); clientSocket.destroy(); };
     upstream.on('error', drop);
     clientSocket.on('error', drop);
+    clientSocket.on('close', () => upstream.destroy());
   });
 
   return { server, grant, revoke, check, hostAllowed,

@@ -51,11 +51,15 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
     const wantsNetwork = capabilities.includes(ACTIONS.NETWORK) || capabilities.includes(ACTIONS.INSTALL);
     const grant = egress && wantsNetwork && domains.length ? egress.grant({ taskId, domains }) : null;
 
+    // The whole body is inside the try: the grant and the worktree have to come back even when
+    // something fails before the harness ever starts. Writing that first checkpoint touches the
+    // disk, so it can fail for ordinary reasons — a full volume, a read-only mount — and leaving
+    // it outside meant a live proxy token and a branch claimed for good.
     jobs.run(taskId, async (ctx) => {
-      const session = createSession({ taskId, ctx, workspace, domains, capabilities, harness, model });
-      // Recorded first so a running task is identifiable in the list, not just once it ends.
-      ctx.checkpoint({ branch: workspace.branch, task: String(prompt).slice(0, 120) });
       try {
+        const session = createSession({ taskId, ctx, workspace, domains, capabilities, harness, model });
+        // Recorded first so a running task is identifiable in the list, not just once it ends.
+        ctx.checkpoint({ branch: workspace.branch, task: String(prompt).slice(0, 120) });
         const agent = await connect({
           taskId, harness, model, cwd: workspace.path,
           // The adapter pins the agent's own permission config: the spike showed OpenCode's
