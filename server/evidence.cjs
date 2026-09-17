@@ -51,7 +51,14 @@ function createStore(dir) {
     if (newest && newest.result === record.result && JSON.stringify(newest.value ?? null) === JSON.stringify(record.value ?? null)) return newest;
     return append(record);
   }
-  return { list, append, appendIfChanged, file };
+  // Reported rates drift a little on every reply; keep one record per meaningful change or per day.
+  function appendReportedRate(record, { minDelta = 0.05, maxAgeMs = 86400000, now = Date.now() } = {}) {
+    const newest = list().filter((r) => r.model === record.model && r.category === record.category && r.identityHash === record.identityHash).at(-1);
+    const rate = Number(record.value?.rate), prev = Number(newest?.value?.rate);
+    if (newest && Number.isFinite(rate) && Number.isFinite(prev) && Math.abs(rate - prev) < minDelta && now - newest.at < maxAgeMs) return newest;
+    return append(record);
+  }
+  return { list, append, appendIfChanged, appendReportedRate, file };
 }
 
 const CATEGORIES = ['context_capacity', 'vision', 'mtp_acceptance', 'throughput'];

@@ -2522,6 +2522,10 @@ async function handleChatInner(req, res, body, authn, preparation) {
                 tokensPerSecond: Number(evt.timings?.predicted_per_second) || 0,
               };
               recordUsage(chatWorkspace, model, reported);
+              const drafted = Number(evt.timings?.draft_n), accepted = Number(evt.timings?.draft_n_accepted);
+              if (provider.id === DEFAULT_PROVIDER_ID && modelManager.recordEvidence && drafted > 0 && accepted >= 0 && accepted <= drafted) {
+                modelManager.recordEvidence(model, { category: 'mtp_acceptance', result: 'reported', value: { rate: Math.round((accepted / drafted) * 100) / 100, drafted, accepted }, suite: { name: 'chat-reply', version: 1 }, source: 'observation', limitations: ['single reply; depends on content'] }).catch(() => undefined);
+              }
               // One free observation of (prompt size -> time to first token).
               // Only when a first token was actually seen this round: a round
               // that errored or returned nothing says nothing about prefill.

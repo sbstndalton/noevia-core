@@ -204,7 +204,16 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
   // the engine or the model file cannot be read: evidence is then `unavailable`.
   const evidenceLib=require('./evidence.cjs');
   const evidenceStore=evidenceDir?evidenceLib.createStore(evidenceDir):null;
+  const identityCache=new Map();
   async function evidenceIdentity(model) {
+    const hit=identityCache.get(model);
+    if(hit&&Date.now()-hit.at<30000)return hit.value;
+    const value=await computeIdentity(model);
+    identityCache.set(model,{at:Date.now(),value});
+    if(identityCache.size>64)identityCache.delete(identityCache.keys().next().value);
+    return value;
+  }
+  async function computeIdentity(model) {
     const files=await modelFiles(model);
     const artifact=evidenceLib.fileFingerprint(localFile(files.model)?.file);
     if(!artifact)return null;
@@ -220,12 +229,16 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
   }
   async function recordEvidence(model,record){
     if(!evidenceStore)return null;
-    const live=await evidenceIdentity(model);
+    // Only frequent reported rates may use the cached identity; results right after a
+    // configuration change (calibration) must be filed under the new configuration.
+    const live=record.result==='reported'?await evidenceIdentity(model):await computeIdentity(model);
     if(!live)return null;
-    return evidenceStore.appendIfChanged({model,identityHash:live.identityHash,identity:live.identity,...record});
+    const entry={model,identityHash:live.identityHash,identity:live.identity,...record};
+    return record.result==='reported'&&Number.isFinite(Number(record.value?.rate))?evidenceStore.appendReportedRate(entry):evidenceStore.appendIfChanged(entry);
   }
   async function evidence(model){
-    const live=evidenceStore?await evidenceIdentity(model):null;
+    const live=evidenceStore?await computeIdentity(model):null;
+    if(evidenceStore)identityCache.set(model,{at:Date.now(),value:live});
     const records=evidenceStore?evidenceStore.list():[];
     return {ok:true,status:200,body:{model,tracked:!!evidenceStore,identityHash:live?.identityHash||null,
       categories:evidenceLib.CATEGORIES.map(category=>{const d=evidenceLib.derive(records,{model,category,liveHash:live?.identityHash||null});

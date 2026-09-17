@@ -50,3 +50,18 @@ test('store is append-only, skips unchanged repeats, private and refuses credent
     assert.throws(() => store.append({ model: 'm', category: 'vision', result: 'maybe' }));
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('reported rates are throttled to meaningful changes or a daily refresh', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-evidence-rate-'));
+  try {
+    const store = ev.createStore(dir);
+    const rec = (rate) => ({ model: 'm', category: 'mtp_acceptance', identityHash: 'h', result: 'reported', value: { rate } });
+    store.appendReportedRate(rec(0.70));
+    store.appendReportedRate(rec(0.72));
+    assert.equal(store.list().length, 1);
+    store.appendReportedRate(rec(0.80));
+    assert.equal(store.list().length, 2);
+    store.appendReportedRate(rec(0.80), { now: Date.now() + 2 * 86400000 });
+    assert.equal(store.list().length, 3);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
