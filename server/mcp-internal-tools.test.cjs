@@ -124,9 +124,7 @@ test('diary reads pass through the sidecar shapes, and there is no diary write t
   assert.deepEqual(calls, ['/day', '/day?month=2026-09', '/months']);
 
   await assert.rejects(() => tools.diary_read_month.handler({ month: 'September' }, CTX), /2026-09/);
-  // The sidecar has no append endpoint and /api/chat is off limits, so v1 is
-  // read-only. If a write tool is added, this test should be the thing that
-  // makes someone justify it.
+  // Without the D10 feature port the Diary box stays read-only.
   assert.deepEqual(Object.keys(tools).filter((n) => n.startsWith('diary_') && tools[n].write), []);
 });
 
@@ -139,4 +137,24 @@ test('every tool converts for the model, and only the three writes are writes', 
   }
   assert.deepEqual(Object.entries(tools).filter(([, d]) => d.write).map(([n]) => n).sort(),
     ['project_append_file', 'project_create_file', 'project_replace_text']);
+});
+
+test('diary_append exists only with the feature port, is a write, and passes only text/title/timezone', async () => {
+  const appended = [];
+  const { tools } = harness({ diaryAppend: async (body) => { appended.push(body); return { day: '2026-09-17' }; } });
+  assert.deepEqual(Object.keys(tools).filter((n) => n.startsWith('diary_') && tools[n].write), ['diary_append']);
+  assert.equal(await tools.diary_append.handler({ text: '  a calm walk ', title: 'Walk', timezone: 'Europe/Berlin', day: '2020-01-01', xid: 'x' }, CTX), 'Added a note to the diary for 2026-09-17.');
+  assert.deepEqual(appended, [{ text: 'a calm walk', title: 'Walk', timezone: 'Europe/Berlin' }]);
+  await assert.rejects(() => tools.diary_append.handler({ text: '   ' }, CTX), /nothing to add/);
+  await assert.rejects(() => tools.diary_append.handler({ text: 'x'.repeat(8001) }, CTX), /too long/);
+  assert.deepEqual(Object.keys(tools.diary_append.schema.properties), ['text', 'title', 'timezone'], 'no day/xid argument to aim at');
+});
+
+test('isoWithOffset keeps the instant and uses the zone offset', () => {
+  const { isoWithOffset } = require('./mcp-internal-tools.cjs');
+  const when = new Date('2026-09-17T22:30:00Z');
+  assert.equal(isoWithOffset(when, 'Europe/Berlin'), '2026-09-18T00:30:00+02:00');
+  assert.equal(isoWithOffset(when, 'America/New_York'), '2026-09-17T18:30:00-04:00');
+  assert.equal(new Date(isoWithOffset(when, 'Asia/Kolkata')).getTime(), when.getTime());
+  assert.throws(() => isoWithOffset(when, 'Mars/Base'), /unknown IANA/);
 });

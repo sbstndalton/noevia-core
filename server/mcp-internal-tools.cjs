@@ -54,14 +54,12 @@ function createInternalTools(ports) {
   };
 
   return {
-    // ── Diary (reads only, v1) ───────────────────────────────────────────
+    // ── Diary ────────────────────────────────────────────────────────────
     //
-    // There is deliberately no write tool here. The sidecar has no append
-    // endpoint: /api/entries/edit corrects ONE already-logged exchange matched
-    // by its xid, and a new entry has no xid, while /api/chat is the one route
-    // that creates entries and AGENTS.md forbids sending it prompts. Adding a
-    // sidecar write path is a change to the user's real journal and is not
-    // something to slip in behind a tool call.
+    // Reads always. One write, diary_append, exists only when the deployment turns on
+    // features.diaryMcpWrite (D10) and passes ports.diaryAppend: it adds a new note to
+    // TODAY through the sidecar's journaled append endpoint. It cannot edit, delete or
+    // target a past day, and like every write it runs only after the approval card.
     diary_read_today: {
       description: "Read today's diary entries.",
       schema: { type: 'object', properties: {}, required: [] },
@@ -93,6 +91,26 @@ function createInternalTools(ports) {
         return clip(months.map((m) => (typeof m === 'string' ? m : m.month)).filter(Boolean).join(', '));
       },
     },
+
+    ...(typeof ports.diaryAppend === 'function' ? {
+      diary_append: {
+        description: "Add a new note to today's diary entry. Cannot change earlier entries.",
+        write: true,
+        schema: { type: 'object', properties: {
+          text: { type: 'string', description: 'the note, plain text' },
+          title: { type: 'string', description: 'short one-line heading' },
+          timezone: { type: 'string', description: "IANA timezone for today's date" },
+        }, required: ['text'] },
+        handler: async (args) => {
+          const text = String(args.text == null ? '' : args.text).trim();
+          if (!text) throw new Error('there is nothing to add');
+          if (text.length > 8000) throw new Error('that note is too long; keep it under 8000 characters');
+          const title = args.title == null ? undefined : String(args.title).trim().slice(0, 80) || undefined;
+          const out = await ports.diaryAppend({ text, title, timezone: args.timezone ? String(args.timezone) : undefined });
+          return `Added a note to the diary for ${out.day}.`;
+        },
+      },
+    } : {}),
 
     // ── Project documents ────────────────────────────────────────────────
     project_list_files: {
@@ -215,4 +233,24 @@ function createInternalTools(ports) {
   };
 }
 
-module.exports = { createInternalTools, MAX_TEXT_BYTES };
+/** An ISO timestamp for `date` carrying the UTC offset of an IANA zone (server zone if absent). */
+function isoWithOffset(date, timeZone) {
+  if (!timeZone) {
+    const offset = -date.getTimezoneOffset();
+    return formatIso(date, offset);
+  }
+  let parts;
+  try { parts = new Intl.DateTimeFormat('en-US', { timeZone, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }).formatToParts(date); }
+  catch { throw new Error(`unknown IANA timezone "${timeZone}"`); }
+  const get = (t) => Number(parts.find((p) => p.type === t).value);
+  const asUtc = Date.UTC(get('year'), get('month') - 1, get('day'), get('hour'), get('minute'), get('second'));
+  return formatIso(date, Math.round((asUtc - Math.floor(date.getTime() / 1000) * 1000) / 60000));
+}
+function formatIso(date, offsetMinutes) {
+  const local = new Date(date.getTime() + offsetMinutes * 60000);
+  const sign = offsetMinutes >= 0 ? '+' : '-';
+  const abs = Math.abs(offsetMinutes);
+  return `${local.toISOString().slice(0, 19)}${sign}${String(Math.floor(abs / 60)).padStart(2, '0')}:${String(abs % 60).padStart(2, '0')}`;
+}
+
+module.exports = { createInternalTools, MAX_TEXT_BYTES, isoWithOffset };

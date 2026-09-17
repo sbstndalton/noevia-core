@@ -947,7 +947,9 @@ const MCP_TOOLBOX_MANIFEST = [
     // /api/chat is the only route that creates entries, which AGENTS.md puts
     // out of bounds. Writing to the user's real journal needs a deliberate
     // decision and a sidecar change, not a tool quietly added here.
-    tools: ['diary_read_today', 'diary_read_month', 'diary_list_months'],
+    // diary_append (D10) is listed only when features.diaryMcpWrite is on; it is not in
+    // `reads`, so every call stops at the approval card.
+    tools: ['diary_read_today', 'diary_read_month', 'diary_list_months', ...(features.enabled('diaryMcpWrite') ? ['diary_append'] : [])],
     reads: ['diary_read_today', 'diary_read_month', 'diary_list_months'],
   },
   {
@@ -4389,6 +4391,15 @@ if (require.main === module) {
         if (!r.ok) throw new Error(String(r.body?.detail || r.body?.error || `diary sidecar ${r.status}`));
         return r.body || {};
       },
+      ...(features.enabled('diaryMcpWrite') ? { diaryAppend: async ({ text, title, timezone }) => {
+        const userId = requestScope.getStore()?.workspace?.userId;
+        if (!userId || !authService.diaryEnabled(userId)) throw new Error('the Diary add-on is not enabled for this account');
+        const body = { text, title, requestId: crypto.randomUUID(), entryTime: require('./mcp-internal-tools.cjs').isoWithOffset(new Date(), timezone) };
+        const r = await fetchJson(`${DIARY_BASE}/api/entries/append`, { method: 'POST', headers: diaryHeaders(), body: JSON.stringify(body) }, 30000);
+        if (!r.ok) throw new Error(String(r.body?.error || r.body?.detail || `diary sidecar ${r.status}`));
+        authService.audit('diary.append', userId, userId, { xid: r.body.xid, chars: text.length });
+        return r.body;
+      } } : {}),
       readProjectFile: (project, args) => executeToolCall(project, 'read_project_file', JSON.stringify(args), null),
       ragAvailable: () => rag.ragAvailable(),
       search: (projectId, query, userId) => rag.searchProject(projectId, query, userId),
