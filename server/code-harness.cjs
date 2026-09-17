@@ -21,6 +21,7 @@
 // process; the container, the worktree and the egress proxy are what contain it.
 const fs = require('node:fs'), nodePath = require('node:path');
 const { classify, decide, pickOption, ACTIONS } = require('./code-actions.cjs');
+const { readUsage, readExitCode, codingIdentity, summarize } = require('./code-meta.cjs');
 
 const MAX_TEXT = 4000;                  // what a job event keeps, as chat keeps of a tool result
 const MAX_FILE_BYTES = 8 * 1024 * 1024; // one source file, not a database the agent found
@@ -37,7 +38,7 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
    * every later decision is taken against this list, not against anything the agent claims.
    */
   async function start({ projectId = null, repoPath, prompt, capabilities = [], domains = [],
-    harness = 'opencode', connect, model = null }) {
+    harness = 'opencode', connect, model = null, sandboxKind = 'spawn' }) {
     if (!prompt || !String(prompt).trim()) throw Object.assign(Error('A task needs a prompt'), { status: 400 });
     if (typeof connect !== 'function') throw Object.assign(Error('No harness transport'), { status: 500 });
     const taskId = jobs.create({ kind: 'code', projectId, capabilities: [...new Set(capabilities)] });
@@ -67,7 +68,17 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
         });
         ctx.progress('running');
         const outcome = await agent.prompt(String(prompt));
-        return { stopReason: outcome?.stopReason || 'end_turn', branch: workspace.branch, ...session.summary() };
+        // What the run can say about itself, and — just as much — what it could not (§1).
+        const meta = session.meta(agent.agent, readUsage(outcome?._meta));
+        const scope = codingIdentity({
+          harness: meta.harness || harness, harnessVersion: meta.harnessVersion,
+          model, protocolVersion: meta.protocolVersion, capabilities,
+          sandbox: sandboxKind,
+        });
+        ctx.event('checkpoint.created', { branch: workspace.branch, task: String(prompt).slice(0, 120),
+          identityHash: scope.identityHash, identity: scope.identity, meta });
+        return { stopReason: outcome?.stopReason || 'end_turn', branch: workspace.branch,
+          identityHash: scope.identityHash, meta, ...session.summary() };
       } finally {
         // Whatever happened, the task stops being able to reach anything.
         if (grant) egress.revoke(taskId);
@@ -83,6 +94,11 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
     // "Allow for this task", per action class. Scoped to this job, in memory, gone when it ends.
     const blanket = new Map(); // action -> 'allow' | 'deny'
     const counts = { tools: 0, approvals: 0, allowed: 0, refused: 0, denied: 0 };
+    // Exit codes per finished command, when the harness bothers to report one. Bounded: a long
+    // task should not be able to grow this without limit.
+    const exits = [];
+    const names = new Map(); // toolCallId -> what it was, so an exit code has a label
+    let turns = 0;
 
     const record = (entry) => log({ at: now(), taskId, harness, model, ...entry });
 
@@ -172,15 +188,23 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
       if (kind === 'tool_call') {
         counts.tools++;
         const classified = classify(update);
+        if (update.toolCallId) names.set(update.toolCallId, update.title || update.kind || 'tool');
         ctx.event('tool.started', { id: update.toolCallId, name: update.title || update.kind || 'tool',
           action: classified.action, kind: update.kind || null });
       } else if (kind === 'tool_call_update') {
         const done = update.status === 'completed' || update.status === 'failed';
-        if (done) ctx.event(update.status === 'failed' ? 'tool.completed' : 'tool.completed',
-          { id: update.toolCallId, failed: update.status === 'failed', content: summarize(update.content) });
+        if (done) {
+          const exitCode = readExitCode(update);
+          if (exitCode !== null && exits.length < 200) {
+            exits.push({ id: update.toolCallId ?? null, name: names.get(update.toolCallId) || null, exitCode });
+          }
+          ctx.event('tool.completed', { id: update.toolCallId, failed: update.status === 'failed',
+            exitCode, content: summarizeContent(update.content) });
+        }
       } else if (kind === 'plan') {
         ctx.event('plan.proposed', { question: null, subQuestions: (update.entries || []).map((e) => String(e.content || '').slice(0, 200)) });
       } else if (kind === 'agent_message_chunk' || kind === 'agent_thought_chunk') {
+        if (kind === 'agent_message_chunk') turns++;
         // Thoughts are progress, not stored reasoning: the spec keeps hidden reasoning out.
         ctx.event('progress', { stage: kind === 'agent_thought_chunk' ? 'thinking' : 'writing' });
       }
@@ -189,6 +213,7 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
     return {
       handlers: { requestPermission, readTextFile, writeTextFile, sessionUpdate },
       summary: () => ({ ...counts, workspace: workspace.path }),
+      meta: (agentInfo, usage) => summarize({ agent: agentInfo || {}, usage, exits, turns }),
     };
   }
 
@@ -204,7 +229,7 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
     return found ? { path: found.path, oldText: clip(found.oldText), newText: clip(found.newText) } : null;
   }
   const clip = (text) => (typeof text === 'string' ? text.slice(0, MAX_TEXT) : null);
-  function summarize(content) {
+  function summarizeContent(content) {
     if (!Array.isArray(content)) return null;
     return clip(content.map((b) => (b && typeof b.text === 'string' ? b.text : '')).filter(Boolean).join('\n')) || null;
   }

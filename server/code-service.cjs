@@ -41,6 +41,9 @@ function view(job, pending = null) {
   return {
     id: job.id, status: job.status, stage: job.stage, error: job.error,
     task: job.checkpoint?.task || null, branch: job.checkpoint?.branch || null,
+    // What the run could say about itself, and what it could not (§1). The identity hash is
+    // what a later evidence record would be scoped to.
+    meta: job.checkpoint?.meta || null, identityHash: job.checkpoint?.identityHash || null,
     createdAt: job.createdAt, updatedAt: job.updatedAt,
     capabilities: job.capabilities,
     steps: job.steps, plan: job.plan,
@@ -54,7 +57,7 @@ function view(job, pending = null) {
  *           log?: Function, timeoutMs?: number }} deps
  */
 function createCodeService({ repos, connect, egress = null, now = Date.now, log = () => {},
-  timeoutMs = APPROVAL_TIMEOUT_MS }) {
+  timeoutMs = APPROVAL_TIMEOUT_MS, sandboxKind = process.env.CODE_HARNESS_ENDPOINT ? 'sandbox' : 'spawn' }) {
   const repositories = Array.isArray(repos) ? repos : parseRepos(repos);
   // Approvals live in memory on purpose, exactly as the chat gate does: a decision that
   // outlives the request it belongs to is not a decision, and a restart must re-ask.
@@ -132,7 +135,7 @@ function createCodeService({ repos, connect, egress = null, now = Date.now, log 
         throw fail(409, 'This project already has a task running.');
       }
       const started = await harness.start({ projectId: project.id, repoPath: repo.path, prompt,
-        capabilities, domains, connect, model: body.model ? String(body.model) : null });
+        capabilities, domains, connect, model: body.model ? String(body.model) : null, sandboxKind });
       return { ...started, repository: repo.id, capabilities, domains };
     },
     decide(workspace, project, taskId, decision) {

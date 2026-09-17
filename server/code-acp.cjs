@@ -34,6 +34,7 @@
 // harness that ignores cancellation is not left running with a worktree checked out.
 const { spawn } = require('node:child_process');
 const net = require('node:net');
+const { readAgent } = require('./code-meta.cjs');
 
 const PROTOCOL_VERSION = 1;
 const CLIENT_INFO = { name: 'noevia', version: '1' };
@@ -148,12 +149,15 @@ async function connectAcp({ command, args = [], endpoint = null, cwd, env = {}, 
   signal?.addEventListener('abort', onAbort, { once: true });
   if (signal?.aborted) { onAbort(); throw closed; }
 
+  let agentInfo = { name: null, version: null, protocolVersion: null };
   const handshake = async () => {
-    await request('initialize', {
+    // Whatever the agent says about itself here is the only version noevia ever learns, and §1
+    // needs it to scope coding evidence to a configuration.
+    agentInfo = readAgent(await request('initialize', {
       protocolVersion: PROTOCOL_VERSION,
       clientCapabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: false },
       clientInfo: CLIENT_INFO,
-    });
+    }));
     // `mcpServers: []` on purpose: a coding task's tools are the harness's own, gated here.
     // Anything noevia offers through MCP would arrive outside this gate.
     return request('session/new', { cwd, mcpServers: [], ...(permission ? { _meta: { noevia: { permission } } } : {}) });
@@ -170,6 +174,7 @@ async function connectAcp({ command, args = [], endpoint = null, cwd, env = {}, 
 
   return {
     sessionId,
+    get agent() { return agentInfo; },
     async prompt(text) {
       try {
         return await request('session/prompt', {

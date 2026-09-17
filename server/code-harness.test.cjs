@@ -25,7 +25,8 @@ const OPTIONS = [{ optionId: 'y', kind: 'allow_once' }, { optionId: 'ya', kind: 
  * Drive one task with a scripted agent. `script` receives the session handlers and plays the
  * part of the harness; `answers` is what the human says, in order.
  */
-async function run({ script, answers = [], capabilities = [], domains = [], egress = null }) {
+async function run({ script, answers = [], capabilities = [], domains = [], egress = null,
+  agent = {}, promptResult = { stopReason: 'end_turn' }, sandboxKind = 'spawn' }) {
   const dir = temp('noevia-hjobs-');
   const jobs = createJobs({ dir });
   const workspaces = createCodeWorkspaces({ dir, epoch: 'test' });
@@ -36,10 +37,10 @@ async function run({ script, answers = [], capabilities = [], domains = [], egre
   });
   let handlers;
   const started = await harness.start({
-    repoPath: repo(), prompt: 'fix the bug', capabilities, domains,
+    repoPath: repo(), prompt: 'fix the bug', capabilities, domains, sandboxKind,
     connect: async ({ handlers: h, cwd }) => {
       handlers = h;
-      return { prompt: async () => { await script(h, cwd); return { stopReason: 'end_turn' }; } };
+      return { agent, prompt: async () => { await script(h, cwd); return promptResult; } };
     },
   });
   // jobs.run is started without being awaited, so wait for the job to reach a terminal state.
@@ -215,3 +216,43 @@ test('the job records what happened, and the proxy token never reaches the recor
 
 const rawLog = (r) => fs.readFileSync(path.join(r.dir, 'jobs', r.taskId + '.jsonl'), 'utf8');
 const events = (r) => rawLog(r).split('\n').filter(Boolean).map((l) => JSON.parse(l));
+
+test('a finished task records what the harness reported, and what it did not', async () => {
+  const r = await run({
+    script: async (h) => {
+      h.sessionUpdate({ sessionUpdate: 'tool_call', toolCallId: '1', kind: 'execute', title: 'npm test' });
+      h.sessionUpdate({ sessionUpdate: 'tool_call_update', toolCallId: '1', status: 'completed', _meta: { exitCode: 0 } });
+      h.sessionUpdate({ sessionUpdate: 'tool_call', toolCallId: '2', kind: 'execute', title: 'npm run lint' });
+      h.sessionUpdate({ sessionUpdate: 'tool_call_update', toolCallId: '2', status: 'failed', _meta: { exitCode: 1 } });
+      h.sessionUpdate({ sessionUpdate: 'agent_message_chunk', content: { text: 'done' } });
+    },
+    agent: { name: 'opencode', version: '1.18.31', protocolVersion: 1 },
+    promptResult: { stopReason: 'end_turn', _meta: { usage: { inputTokens: 1200, outputTokens: 300 } } },
+  });
+  const meta = r.job.result.meta;
+  assert.equal(meta.harness, 'opencode');
+  assert.equal(meta.harnessVersion, '1.18.31');
+  assert.deepEqual(meta.usage, { input: 1200, output: 300, total: 1500 });
+  assert.equal(meta.commands, 2);
+  assert.equal(meta.failedCommands, 1);
+  assert.deepEqual(meta.exitCodes.map((e) => [e.name, e.exitCode]), [['npm test', 0], ['npm run lint', 1]]);
+  assert.deepEqual(meta.limitations, [], 'a harness that reports everything has nothing to disclaim');
+  assert.match(r.job.result.identityHash, /^[0-9a-f]{64}$/);
+});
+
+test('a silent harness produces an honest record rather than zeroes', async () => {
+  const r = await run({ script: async () => {} });
+  const meta = r.job.result.meta;
+  assert.equal(meta.usage, null);
+  assert.equal(meta.harnessVersion, null);
+  assert.equal(meta.limitations.length, 3);
+  // It still gets an identity — one that says the harness version is unknown, so a later run
+  // from a named version is correctly NOT treated as the same configuration.
+  assert.match(r.job.result.identityHash, /^[0-9a-f]{64}$/);
+});
+
+test('the identity separates a sandboxed run from one spawned beside noevia', async () => {
+  const a = await run({ script: async () => {}, agent: { name: 'opencode', version: '1.18.31' } });
+  const b = await run({ script: async () => {}, agent: { name: 'opencode', version: '1.18.31' }, sandboxKind: 'sandbox' });
+  assert.notEqual(a.job.result.identityHash, b.job.result.identityHash);
+});
