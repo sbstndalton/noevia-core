@@ -19,6 +19,7 @@ const { projectAppearance } = require('./project-appearance.cjs');
 // Secrets enter only via environment (ui.env on the server). Never hardcoded.
 
 'use strict';
+const { hintTool } = require('./tool-hints.cjs');
 
 const http = require('http');
 const crypto = require('crypto');
@@ -1190,11 +1191,22 @@ const MCP_TOOLBOX_MANIFEST = [
     id: 'nextcloud-tasks',
     server: 'nextcloud',
     label: 'Nextcloud Tasks',
-    description: 'Read and manage todos in your calendars.',
+    description: "Tasks, to-dos, reminders and checklists — add one, tick one off, or see what's outstanding.",
     tools: [
       'nc_calendar_list_todos', 'nc_calendar_search_todos', 'nc_calendar_create_todo',
       'nc_calendar_update_todo', 'nc_calendar_complete_todo', 'nc_calendar_delete_todo',
     ],
+    // Every tool here is named `nc_calendar_*` and described in calendar words, because that is
+    // where Nextcloud keeps to-dos. A small model asked to "add a task" does not make that leap
+    // on its own, so noevia says it in the user's vocabulary (tool-hints.cjs).
+    hints: {
+      nc_calendar_list_todos: 'Use this for tasks, to-dos, reminders or a checklist: it lists them.',
+      nc_calendar_search_todos: 'Use this to find a task, to-do or reminder by its text.',
+      nc_calendar_create_todo: 'Use this to add a task, to-do or reminder.',
+      nc_calendar_update_todo: 'Use this to change a task, to-do or reminder.',
+      nc_calendar_complete_todo: 'Use this to tick off or finish a task, to-do or reminder.',
+      nc_calendar_delete_todo: 'Use this to remove a task, to-do or reminder.',
+    },
     reads: ['nc_calendar_list_todos', 'nc_calendar_search_todos'],
   },
   {
@@ -1704,7 +1716,9 @@ async function discoverMcpTools(force = false) {
         const missing = [];
         for (const name of box.tools) {
           const hit = owned.get(name);
-          if (hit) tools.push(hit.tool); else missing.push(name);
+          // A box may add a sentence in the user's vocabulary to a tool whose own description
+          // is written in the server's (see tool-hints.cjs). Appended, never a replacement.
+          if (hit) tools.push(hintTool(box, hit.tool)); else missing.push(name);
         }
         const serverState = servers.get(box.server);
         if (!serverState) {
