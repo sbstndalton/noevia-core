@@ -2157,6 +2157,9 @@ async function handleChatInner(req, res, body, authn, preparation) {
   let project = null;
   if (projectId && spaceId !== 'diary') {
     project = getProject(projectId);
+    if (project && body.projectId && !require('./project-modes.cjs').enabled(project, 'chat')) {
+      return json(res, 409, { error: `${project.name} is not enabled for Chat. Turn Chat on in the project's settings.` });
+    }
     if (project && !chatId) {
       chatId = `p-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       saveChats(projectId, [...loadChats(projectId), chatId]);
@@ -3233,6 +3236,8 @@ async function handleRequestScoped(req, res) {
       if (body.reasoningEffort !== undefined && !reasoningEffort.validEffort(body.reasoningEffort)) return json(res,400,{error:'Invalid reasoning effort'});
       const name = String(body.name || '').trim().slice(0, 120);
       if (!name) return json(res, 400, { error: 'name required' });
+      let modes = ['chat'];
+      if (body.modes !== undefined) { try { modes = require('./project-modes.cjs').sanitize(body.modes); } catch (e) { return json(res, 400, { error: e.message }); } }
       let appearance;
       try { appearance = projectAppearance(body); } catch (e) { return json(res, 400, { error: e.message }); }
       const project = {
@@ -3255,6 +3260,7 @@ async function handleRequestScoped(req, res) {
         provider: typeof body.provider === 'string' && body.provider ? body.provider : undefined,
         reasoningEffort: body.reasoningEffort,
         routing: body.routing === 'auto' ? 'auto' : 'manual', // default manual (step 12 guardrail)
+        modes,
         toolboxes: sanitizeToolboxes(body.toolboxes) || [...DEFAULT_TOOLBOXES], // step 14: core only by default
         // (files normalization below is shared with the config route's RAG bookkeeping)
         chats: [],
@@ -3345,6 +3351,9 @@ async function handleRequestScoped(req, res) {
           .slice(0, 10);
       }
       if (typeof patch.archived === 'boolean') project.archived = patch.archived;
+      if (patch.modes !== undefined) {
+        try { project.modes = require('./project-modes.cjs').sanitize(patch.modes); } catch (e) { return json(res, 400, { error: e.message }); }
+      }
       if (typeof patch.routing === 'string') {
         if (patch.routing !== 'auto' && patch.routing !== 'manual') {
           return json(res, 400, { error: "routing must be 'auto' or 'manual'" });
