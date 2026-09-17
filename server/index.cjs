@@ -1468,6 +1468,7 @@ function researchModel(project) {
 // work, both boxes lose every tool and vanish — the ordinary unconfigured
 // state, identical to today for every existing deployment.
 const mcpInternal = require('./mcp-internal.cjs');
+const { missingRoles, staleRolesError } = require('./auto-roles-check.cjs');
 const MCP_INTERNAL_PORT = Number(process.env.MCP_INTERNAL_PORT || 0);
 const MCP_INTERNAL_SERVER = MCP_SERVERS.find((sv) => sv.auth === 'internal') || null;
 // Derived, not the storage key itself: a signing bug must not become a
@@ -2053,6 +2054,12 @@ async function classifyFastOrSmart(message) {
   }
 }
 
+// The served model list, or null when it cannot be read (never treat an outage as "nothing installed").
+async function servedCatalogue() {
+  if (!modelManager.enabled) return null;
+  try { return await modelsInstalled(); } catch { return null; }
+}
+
 async function modelsInstalled() {
   modelManager.requireEnabled();
   const [list, health] = await Promise.allSettled([
@@ -2403,6 +2410,8 @@ async function handleChatInner(req, res, body, authn, preparation) {
     if (!roles) {
       return json(res, 400, { error: 'Auto routing is not configured yet — pick Fast and Smart models in the model popup first.' });
     }
+    const staleRoles = staleRolesError(missingRoles(roles, await servedCatalogue()));
+    if (staleRoles) return json(res, 409, { error: staleRoles });
     routedRole = await classifyFastOrSmart(message); // fail-open inside
     model = roles[routedRole];
   } else if (!model && provider.id === DEFAULT_PROVIDER_ID && modelManager.enabled) {
@@ -3296,7 +3305,7 @@ async function handleRequestScoped(req, res) {
     if (p === '/api/auto-roles') {
       if (req.method === 'GET') {
         const roles = autoRoles();
-        return json(res, 200, { configured: !!roles, roles: roles || null });
+        return json(res, 200, { configured: !!roles, roles: roles || null, missing: missingRoles(roles, await servedCatalogue()) });
       }
       if (req.method === 'PUT') {
         const raw = await readBody(req);
