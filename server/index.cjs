@@ -3927,6 +3927,10 @@ async function handleRequestScoped(req, res) {
       res.setHeader('Cache-Control','no-store');
       if(!result)return json(res,502,{error:'The model management service is not responding.'});
       const detail=result.body&&typeof result.body==='object'?result.body:{error:String(result.body||'')};
+      // A finished benchmark run viewed in the manager becomes throughput evidence (best-effort, throttled).
+      if(result.ok&&method==='GET'&&/^benchmark\/runs\/\d+$/.test(rest)&&modelManager.recordEvidence){
+        for(const {model,record} of require('./benchmark-evidence.cjs').throughputRecords(detail))modelManager.recordEvidence(model,record).catch(()=>undefined);
+      }
       return json(res,result.status,result.ok?detail:{error:detail.detail||detail.error||'Model management request failed.'});
     }
 
