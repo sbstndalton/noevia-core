@@ -634,6 +634,11 @@ const DEFAULT_TOOLBOXES = ['core'];
 // Built-ins plus whatever MCP discovery found. Everything downstream — the
 // picker, the validator, the resolver — goes through here so an MCP box is
 // indistinguishable from a built-in one once it exists.
+// Roadmap E: narrows each message's toolboxes to the matching ones when features.toolRouter is on.
+const chatToolRouter = require('./chat-tool-routing.cjs').createChatToolRouter({
+  enabled: () => features.enabled('toolRouter'), boxes: () => allToolboxes(), embed: (texts) => rag.embed(texts),
+});
+
 function allToolboxes() {
   return [...TOOLBOXES, ...mcpState.boxes].filter((b) => toolboxOffered(b.id));
 }
@@ -2519,7 +2524,10 @@ async function handleChatInner(req, res, body, authn, preparation) {
   // Resolve the project's toolboxes once for the whole exchange: every round
   // must offer the same list, or the model gets told a tool exists and then
   // punished for calling it.
-  const resolved = resolveTools(project, model);
+  const selectedBoxes = Array.isArray(project && project.toolboxes) ? project.toolboxes : DEFAULT_TOOLBOXES;
+  const routing = await chatToolRouter.select(selectedBoxes, message);
+  if (routing.routed) console.log(`[tools] routed ${selectedBoxes.length} toolboxes to ${routing.ids.join(', ')}`);
+  const resolved = resolveTools(routing.routed ? { ...project, toolboxes: routing.ids } : project, model);
   const activeTools = resolved.tools;
   const allowedToolNames = new Set(activeTools.map((t) => t.function.name));
   if (resolved.dropped.length) {

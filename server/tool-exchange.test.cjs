@@ -14,7 +14,8 @@ const handler = source.slice(source.indexOf('async function handleChat('), sourc
 const contextDir=fs.mkdtempSync(require('node:path').join(require('node:os').tmpdir(),'chat-handler-test-'));
 test.after(()=>fs.rmSync(contextDir,{recursive:true,force:true}));
 
-function fixture({ rounds, decision = 'approve', execute, fallback = false, cancel = false, effort, reasoningOnly = false, skills = [], native = false, preambleText = '' } = {}) {
+function fixture({ rounds, decision = 'approve', execute, fallback = false, cancel = false, effort, reasoningOnly = false, skills = [], native = false, preambleText = '', routedIds = null } = {}) {
+  const resolvedFor = [];
   const events = [], executions = [], approvals = [], requests = [], audits = [];
   let round = 0, allApproved = false;
   const res = new EventEmitter();
@@ -36,7 +37,8 @@ function fixture({ rounds, decision = 'approve', execute, fallback = false, canc
     getProject: (id) => ({ id, model: 'synthetic-model', reasoningEffort: effort }),
     skillsIndexFor: () => skills, getProvider: () => ({ id: 'default', baseUrl: 'http://fixture.invalid', label: 'Mock' }),
     providerHeaders: () => ({}),
-    resolveTools: () => ({ tools: ['read', 'write'].map(name => ({ function: { name } })), dropped: [] }),
+    chatToolRouter: { select: async (ids) => (routedIds ? { ids: routedIds, routed: true } : { ids, routed: false }) }, DEFAULT_TOOLBOXES: ['core'],
+    resolveTools: (project) => { resolvedFor.push(project.toolboxes); return { tools: ['read', 'write'].map(name => ({ function: { name } })), dropped: [] }; },
     isWriteTool: name => name !== 'read',
     chatWideApproved: () => allApproved,
     awaitApproval: async (request) => {
@@ -83,7 +85,7 @@ function fixture({ rounds, decision = 'approve', execute, fallback = false, canc
   vm.createContext(context);
   vm.runInContext(handler, context);
   return {
-    events, executions, approvals, requests, audits,
+    events, executions, approvals, requests, audits, resolvedFor,
     async run(projectId = 'synthetic-project') {
       round = 0; res.writableEnded = false;
       await context.handleChat({}, res, { message: 'synthetic fixture', projectId, chatId: 'synthetic-chat' });
@@ -257,4 +259,13 @@ test('text streamed before a tool call is marked as preamble, the final answer i
   assert.equal(pre[0].text, 'Let me look that up.');
   const idx = f.events.findIndex(e => e.type === 'preamble');
   assert.ok(f.events.slice(idx).some(e => e.type === 'delta' && e.text !== 'Let me look that up.'));
+});
+
+test('routed toolboxes replace the project selection for this exchange only when the router routed', async () => {
+  const routed = fixture({ rounds: [[]], routedIds: ['offline-wikipedia'] });
+  await routed.run();
+  assert.deepEqual(routed.resolvedFor, [['offline-wikipedia']]);
+  const plain = fixture({ rounds: [[]] });
+  await plain.run();
+  assert.deepEqual(plain.resolvedFor, [undefined]);
 });

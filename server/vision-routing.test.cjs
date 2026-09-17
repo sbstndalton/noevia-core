@@ -46,6 +46,7 @@ async function run({ visionModel, probeStatus = 200, descriptionStatus = 200, mi
     skillsIndexFor: () => [], getProvider: () => ({ id: 'default', baseUrl: 'http://fixture.invalid' }),
     providerHeaders: () => headers, autoRoles: () => visionModel ? { vision: visionModel } : null,
     visionDescriptions: cache, visionProbe: createVisionProbe({ fetchImpl: fetch }),
+    chatToolRouter: { select: async (ids) => ({ ids, routed: false }) }, DEFAULT_TOOLBOXES: [],
     resolveTools: () => ({ tools: [], dropped: [] }), isWriteTool: () => true,
   };
   if(native)context.modelManager=require('./model-manager.cjs').createModelManager({kind:'llamacpp',baseUrl:'http://fixture.invalid',fetchJson:async(url,options)=>{

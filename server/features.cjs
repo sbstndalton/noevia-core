@@ -11,6 +11,7 @@ const REGISTRY = Object.freeze({
   diaryMcpWrite: { env: 'NOEVIA_FEATURE_DIARY_MCP_WRITE', restart: true, label: 'Diary append tool', description: 'Offer an approval-gated, append-only Diary tool through the in-app MCP server.' },
   deepResearch: { env: 'NOEVIA_FEATURE_DEEP_RESEARCH', label: 'Deep research', description: 'Administrators can run bounded research jobs that save a cited report to a project.' },
   offsiteBackup: { env: 'NOEVIA_FEATURE_OFFSITE_BACKUP', label: 'Off-site backups', description: 'Encrypted snapshots to an S3-compatible target the operator configures.' },
+  toolRouter: { env: 'NOEVIA_FEATURE_TOOL_ROUTER', label: 'Tool routing', description: "Send only the project's toolboxes that match each message (needs an embedding model); falls back to all of them." },
   kiwix: { env: 'NOEVIA_FEATURE_KIWIX', restart: true, label: 'Offline Wikipedia', description: 'A read-only lookup tool backed by an internal kiwix-serve.' },
 });
 
