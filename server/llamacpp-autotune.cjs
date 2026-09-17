@@ -111,7 +111,24 @@ function createAutotuner(deps) {
   // model file or engine build starts fresh.
   const partialKey = (model, identity, base) => [model, identity.arch, identity.quant, identity.hardware,
     crypto.createHash('sha256').update(JSON.stringify(Object.entries(base).filter(([k]) => !TUNED_KEYS.includes(k)).sort())).digest('hex').slice(0, 12)].join('|');
-  const partialFor = (key) => { const hit = state.partial[key]; return hit && Date.now() - hit.at < PARTIAL_TTL_MS ? hit : { at: Date.now(), spec: {}, batch: {} }; };
+  // A partial older than the TTL is not reused: the hardware, the build or the model may have
+  // changed under it. Expired entries are DROPPED rather than left in the state file, and the
+  // caller is told whether anything was actually resumed — asking to resume and silently
+  // re-running every measurement is the kind of quiet difference that wastes an hour.
+  const partialFor = (key) => {
+    const hit = state.partial[key];
+    if (hit && Date.now() - hit.at < PARTIAL_TTL_MS) return hit;
+    if (hit) delete state.partial[key];
+    return { at: Date.now(), spec: {}, batch: {} };
+  };
+  /** Sweep every partial whose TTL has passed, so the state file cannot grow without bound. */
+  const prunePartials = () => {
+    let removed = 0;
+    for (const [key, hit] of Object.entries(state.partial || {})) {
+      if (!hit || Date.now() - hit.at >= PARTIAL_TTL_MS) { delete state.partial[key]; removed++; }
+    }
+    return removed;
+  };
   const save = () => { if (!stateFile) return; const tmp = `${stateFile}.${crypto.randomUUID()}`; fs.writeFileSync(tmp, JSON.stringify(state), { mode: 0o600 }); fs.renameSync(tmp, stateFile); };
   const publicJob = (job) => job && (({ originalText, ...rest }) => rest)(job);
   // Steps are known up front, so progress is honest: finished steps out of the planned total.
@@ -197,7 +214,12 @@ function createAutotuner(deps) {
       job.identity = identity;
       const base = { ...presets.get(job.model).options };
       const key = partialKey(job.model, identity, base);
+      prunePartials();
       const partial = job.resume ? partialFor(key) : { at: Date.now(), spec: {}, batch: {} };
+      // Say plainly whether resuming found anything. `false` after asking to resume means the
+      // saved measurements had expired (or this configuration changed), and everything is
+      // being measured again.
+      job.resumed = job.resume && (Object.keys(partial.spec).length > 0 || Object.keys(partial.batch).length > 0);
       state.partial[key] = partial;
       const keep = (kind, id, value) => { partial[kind][id] = value; partial.at = Date.now(); save(); };
 
@@ -344,7 +366,8 @@ function createAutotuner(deps) {
     delete job.originalText; save();
   }
   load();
-  return { start, cancel, status, recover, table, _state: () => state };
+  // `_partialFor`/`_state` are exposed for tests only, like `_state` already was.
+  return { start, cancel, status, recover, table, _state: () => state, _partialFor: partialFor, _prunePartials: prunePartials };
 }
 
 module.exports = { createAutotuner, createTable, extensions, geomean, SPEC_CANDIDATES, WORKLOADS, MIN_GAIN };

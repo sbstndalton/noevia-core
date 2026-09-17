@@ -198,3 +198,23 @@ test('a model that cannot run with its saved settings says so and can start the 
   for (let i = 0; i < 100 && !calls.length; i++) await new Promise((r) => setImmediate(r));
   assert.deepEqual(calls, ['synthetic']);
 });
+
+test('an expired partial is dropped, and resuming says it found nothing to reuse', () => {
+  const { createAutotuner } = require('./llamacpp-autotune.cjs');
+  const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-autotune-'));
+  try {
+    const stateFile = path.join(dir, 'autotune.json');
+    const day = 86400000;
+    const fresh = { at: Date.now(), spec: { a: { record: { status: 'measured' } } }, batch: {} };
+    const stale = { at: Date.now() - 8 * day, spec: { a: { record: { status: 'measured' } } }, batch: {} };
+    fs.writeFileSync(stateFile, JSON.stringify({ job: null, history: {}, partial: { keep: fresh, drop: stale } }));
+    const tuner = createAutotuner({ stateFile });
+    const state = tuner._state();
+    // Reading a stale key drops it and hands back an empty partial.
+    assert.ok(state.partial.drop, 'the stale entry is loaded before anything runs');
+    tuner._partialFor('drop');
+    assert.equal(state.partial.drop, undefined, 'an expired partial is removed, not merely ignored');
+    assert.ok(tuner._partialFor('keep').spec.a, 'a fresh partial is still reused');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
