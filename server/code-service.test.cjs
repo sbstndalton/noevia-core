@@ -1,0 +1,144 @@
+'use strict';
+const test = require('node:test'), assert = require('node:assert/strict');
+const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
+const { execFileSync } = require('node:child_process');
+const { createCodeService, parseRepos, GRANTABLE } = require('./code-service.cjs');
+
+const temps = [];
+const temp = (p) => { const d = fs.mkdtempSync(path.join(os.tmpdir(), p)); temps.push(d); return d; };
+test.after(() => { for (const d of temps) fs.rmSync(d, { recursive: true, force: true }); });
+
+function repo(name = 'noevia-srepo-') {
+  const dir = temp(name);
+  const git = (...a) => execFileSync('git', a, { cwd: dir, stdio: 'ignore' });
+  git('init', '-q', '-b', 'main'); git('config', 'user.email', 'qa@example.invalid'); git('config', 'user.name', 'QA');
+  fs.writeFileSync(path.join(dir, 'a.txt'), 'a'); git('add', '.'); git('commit', '-qm', 'first');
+  return dir;
+}
+const project = { id: 'p1' };
+const settle = async (service, ws, id) => {
+  for (let i = 0; i < 300 && !['completed', 'failed', 'cancelled'].includes(service.get(ws, project, id)?.status); i++) {
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  return service.get(ws, project, id);
+};
+
+test('only repositories the operator registered are offered, and only real ones', () => {
+  const good = repo();
+  const notGit = temp('noevia-plain-');
+  const parsed = parseRepos(`noevia|${good},plain|${notGit},relative|not/absolute,broken|/does/not/exist,dupe|${good},noevia|${good}`);
+  assert.deepEqual(parsed.map((r) => r.id), ['noevia', 'dupe'], 'non-git, relative, missing and duplicate entries are dropped');
+  assert.equal(parsed[0].path, fs.realpathSync(good));
+  assert.deepEqual(parseRepos(''), []);
+  assert.deepEqual(parseRepos(undefined), []);
+});
+
+function service(extra = {}) {
+  const dir = temp('noevia-sws-');
+  const ws = { dir };
+  const repoPath = repo();
+  const svc = createCodeService({ repos: [{ id: 'noevia', path: repoPath }],
+    connect: async () => ({ prompt: async () => ({ stopReason: 'end_turn' }) }), timeoutMs: 50, ...extra });
+  return { svc, ws, repoPath };
+}
+
+test('a task cannot name a path the operator did not register', async () => {
+  const { svc, ws } = service();
+  await assert.rejects(() => svc.start(ws, project, { repository: '/etc', prompt: 'x' }), /registered/);
+  await assert.rejects(() => svc.start(ws, project, { repository: '../../etc', prompt: 'x' }), /registered/);
+  await assert.rejects(() => svc.start(ws, project, { prompt: 'x' }), /registered/);
+  await assert.rejects(() => svc.start(ws, project, { repository: 'noevia', prompt: '  ' }), /Describe the task/);
+  await assert.rejects(() => svc.start(ws, project, { repository: 'noevia', prompt: 'x'.repeat(8001) }), /too long/);
+});
+
+test('capabilities and domains are filtered to what noevia will grant at all', async () => {
+  const { svc, ws } = service();
+  const started = await svc.start(ws, project, { repository: 'noevia', prompt: 'fix',
+    capabilities: ['edit_file', 'open_browser', 'external_account', 'not_a_thing'],
+    domains: ['Registry.NPMJS.org', 'not a domain', 'localhost', '../evil', 'x.test'] });
+  assert.deepEqual(started.capabilities, ['edit_file'], 'browser and external account belong to the node, not here');
+  assert.deepEqual(started.domains, ['registry.npmjs.org', 'x.test'], 'bare names and junk are dropped');
+  assert.ok(GRANTABLE.every((c) => typeof c === 'string'));
+  await settle(svc, ws, started.taskId);
+});
+
+test('one task at a time per project', async () => {
+  let release;
+  const { svc, ws } = service({ connect: async () => ({ prompt: () => new Promise((r) => { release = () => r({ stopReason: 'end_turn' }); }) }) });
+  const first = await svc.start(ws, project, { repository: 'noevia', prompt: 'one' });
+  await assert.rejects(() => svc.start(ws, project, { repository: 'noevia', prompt: 'two' }), /already has a task running/);
+  release();
+  await settle(svc, ws, first.taskId);
+  // Once it has finished, the next task starts.
+  const second = await svc.start(ws, project, { repository: 'noevia', prompt: 'three' });
+  assert.ok(second.taskId);
+  await settle(svc, ws, second.taskId);
+});
+
+test('a task from another project is not found, rather than forbidden', async () => {
+  const { svc, ws } = service();
+  const started = await svc.start(ws, project, { repository: 'noevia', prompt: 'fix' });
+  await settle(svc, ws, started.taskId);
+  assert.throws(() => svc.get(ws, { id: 'other' }, started.taskId), /Task not found/);
+  assert.throws(() => svc.get(ws, project, '00000000-0000-4000-8000-000000000000'), /Task not found/);
+});
+
+test('an approval reaches the waiting task, and an unknown decision is refused', async () => {
+  let ask;
+  const { svc, ws } = service({
+    connect: async ({ handlers }) => ({ prompt: async () => {
+      ask = handlers.requestPermission({ toolCall: { kind: 'edit', locations: [] }, options: [{ optionId: 'y', kind: 'allow_once' }, { optionId: 'n', kind: 'reject_once' }] });
+      await ask; return { stopReason: 'end_turn' };
+    } }),
+  });
+  const started = await svc.start(ws, project, { repository: 'noevia', prompt: 'fix', capabilities: ['edit_file'] });
+  for (let i = 0; i < 200 && !svc.get(ws, project, started.taskId)?.approval; i++) await new Promise((r) => setTimeout(r, 5));
+  const waiting = svc.get(ws, project, started.taskId);
+  assert.ok(waiting.approval, 'the task reports what it is waiting for');
+  assert.equal(waiting.approval.action, 'edit_file');
+  assert.throws(() => svc.decide(ws, project, started.taskId, 'maybe'), /Unknown decision/);
+  assert.deepEqual(svc.decide(ws, project, started.taskId, 'approve'), { ok: true });
+  assert.deepEqual(await ask, { outcome: 'selected', optionId: 'y' });
+  assert.throws(() => svc.decide(ws, project, started.taskId, 'approve'), /no longer waiting/);
+  await settle(svc, ws, started.taskId);
+});
+
+test('an unanswered approval times out as a refusal', async () => {
+  let ask;
+  const { svc, ws } = service({
+    timeoutMs: 20,
+    connect: async ({ handlers }) => ({ prompt: async () => {
+      ask = handlers.requestPermission({ toolCall: { kind: 'edit', locations: [] }, options: [{ optionId: 'y', kind: 'allow_once' }, { optionId: 'n', kind: 'reject_once' }] });
+      await ask; return { stopReason: 'end_turn' };
+    } }),
+  });
+  const started = await svc.start(ws, project, { repository: 'noevia', prompt: 'fix', capabilities: ['edit_file'] });
+  await settle(svc, ws, started.taskId);
+  assert.deepEqual(await ask, { outcome: 'selected', optionId: 'n' });
+});
+
+test('cancelling refuses whatever was waiting, so no card can be answered afterwards', async () => {
+  let ask;
+  const { svc, ws } = service({
+    timeoutMs: 60000,
+    connect: async ({ handlers }) => ({ prompt: async () => {
+      ask = handlers.requestPermission({ toolCall: { kind: 'edit', locations: [] }, options: [{ optionId: 'y', kind: 'allow_once' }, { optionId: 'n', kind: 'reject_once' }] });
+      await ask; return { stopReason: 'end_turn' };
+    } }),
+  });
+  const started = await svc.start(ws, project, { repository: 'noevia', prompt: 'fix', capabilities: ['edit_file'] });
+  for (let i = 0; i < 200 && !svc.get(ws, project, started.taskId)?.approval; i++) await new Promise((r) => setTimeout(r, 5));
+  svc.cancel(ws, project, started.taskId);
+  assert.deepEqual(await ask, { outcome: 'selected', optionId: 'n' }, 'the harness is told no, not left hanging');
+  assert.equal(svc.get(ws, project, started.taskId).approval, null);
+  assert.throws(() => svc.decide(ws, project, started.taskId, 'approve'), /no longer waiting/);
+});
+
+test('the listed task carries no host path and no repository location', async () => {
+  const { svc, ws, repoPath } = service();
+  const started = await svc.start(ws, project, { repository: 'noevia', prompt: 'fix' });
+  await settle(svc, ws, started.taskId);
+  const [listed] = svc.list(ws, project);
+  assert.equal(JSON.stringify(listed).includes(repoPath), false);
+  assert.deepEqual(svc.repositories(), [{ id: 'noevia' }], 'the browser learns the name, never the path');
+});

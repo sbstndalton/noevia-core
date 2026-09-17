@@ -1542,6 +1542,19 @@ function toolboxOffered(id) {
   return !ENABLED_TOOLBOXES || ENABLED_TOOLBOXES.has(id);
 }
 
+// ── Code mode (spec-agent-execution §3): service in code-service.cjs, routes in routes/code.cjs ──
+// `CODE_REPOS=name|/abs/path,...` is the only way a repository becomes reachable: a task can
+// never name a host path. The transport is supplied separately, so a deployment without a
+// coding harness installed simply has nothing to start.
+const codeRoutes = require('./routes/code.cjs').createCodeRoutes({
+  features, getProject, workspace: () => currentWorkspace(), json, readJson,
+  service: require('./code-service.cjs').createCodeService({
+    repos: process.env.CODE_REPOS,
+    log: (entry) => console.log('[code]', JSON.stringify(entry)),
+    connect: async () => { throw Object.assign(Error('No coding harness is configured on this server.'), { status: 409, publicMessage: 'No coding harness is configured on this server.' }); },
+  }),
+});
+
 // ── Deep research (D12): module in research-service.cjs, routes in routes/research.cjs ──
 const researchRoutes = require('./routes/research.cjs').createResearchRoutes({
   features, getProject, workspace: () => currentWorkspace(), json, readJson,
@@ -2999,6 +3012,7 @@ async function handleRequestScoped(req, res) {
     if (authn && await accountRoutes(req, res, { path: p, authn })) return;
     if (authn && await offsiteRoutes(req, res, { path: p, authn })) return;
     if (authn && p.startsWith('/api/projects/') && await researchRoutes(req, res, { path: p, authn })) return;
+    if (authn && p.startsWith('/api/projects/') && await codeRoutes(req, res, { path: p, authn })) return;
     if(p==='/api/profile/diary-connectors' && req.method==='GET')return json(res,200,{connectors:diaryConnectors.list(authn.user.id)});
     if(p==='/api/profile/diary-connectors' && req.method==='POST')return json(res,201,diaryConnectors.create(authn.user.id,(await readJson(req)).name));
     const revokeConnector=p.match(/^\/api\/profile\/diary-connectors\/([a-f0-9]{32})$/);
