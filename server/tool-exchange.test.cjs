@@ -269,3 +269,17 @@ test('routed toolboxes replace the project selection for this exchange only when
   await plain.run();
   assert.deepEqual(plain.resolvedFor, [undefined]);
 });
+
+test('account-wide custom instructions reach the system message; removing them removes them', async () => {
+  const file = require('node:path').join(contextDir, 'account-instructions.json');
+  fs.writeFileSync(file, JSON.stringify({ text: 'Answer in British English.', updatedAt: 1 }));
+  try {
+    const f = fixture({ rounds: [[]] });
+    await f.run();
+    const system = f.requests[0].messages.find((m) => m.role === 'system');
+    assert.match(system.content, /custom instructions for all chats[\s\S]*Answer in British English\./);
+  } finally { fs.rmSync(file, { force: true }); }
+  const plain = fixture({ rounds: [[]] });
+  await plain.run();
+  assert.doesNotMatch(JSON.stringify(plain.requests[0].messages), /British English/);
+});

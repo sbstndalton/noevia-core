@@ -84,6 +84,7 @@ const features = require('./features.cjs').createFeatures({ store: require('./fe
 const featureRoutes = require('./routes/features.cjs').createFeatureRoutes({ features, json, readJson });
 // Settings → Data: the signed-in user's conversations as a ZIP (routes/export.cjs).
 const exportRoutes = require('./routes/export.cjs').createExportRoutes({ json, workspace: () => ({ freeChats: Array.from(FREE_CHATS), projects: PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)) }), readHistory: (id) => readHistory(id), audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) });
+const accountRoutes = require('./routes/account.cjs').createAccountRoutes({ json, readJson, dir: () => currentWorkspace().dir });
 const importRoutes = require('./routes/import.cjs').createImportRoutes({
   json, readBody: (req, limit) => readBody(req, limit), newId: () => `c-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
   audit: (action, actor, detail) => authService.audit(action, actor, actor, detail),
@@ -2359,6 +2360,8 @@ async function handleChatInner(req, res, body, authn, preparation) {
   }
 
   const sysParts = [];
+  const accountPart = require('./account-instructions.cjs').systemPart(require('./account-instructions.cjs').read(currentWorkspace().dir).text);
+  if (accountPart) sysParts.push(accountPart);
   if (project) {
     if (project.name) sysParts.push(`You are working inside the user's project "${project.name}".`);
     if (project.goal) sysParts.push(`Project goal: ${project.goal}`);
@@ -2955,6 +2958,7 @@ async function handleRequestScoped(req, res) {
     if (authn && await featureRoutes(req, res, { path: p, authn })) return;
     if (authn && await exportRoutes(req, res, { path: p, authn })) return;
     if (authn && await importRoutes(req, res, { path: p, authn })) return;
+    if (authn && await accountRoutes(req, res, { path: p, authn })) return;
     if (authn && await offsiteRoutes(req, res, { path: p, authn })) return;
     if (authn && p.startsWith('/api/projects/') && await researchRoutes(req, res, { path: p, authn })) return;
     if(p==='/api/profile/diary-connectors' && req.method==='GET')return json(res,200,{connectors:diaryConnectors.list(authn.user.id)});
