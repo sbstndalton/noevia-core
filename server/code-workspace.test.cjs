@@ -204,3 +204,84 @@ test('without an owner nothing is chowned', () => {
   ws.claim({ taskId: ids(1), repoPath: repo });
   assert.deepEqual(handed, [], 'a deployment with no separate sandbox user has nothing to hand over');
 });
+
+// ── Clone mode: what the sandbox needs, because a handed-over worktree cannot commit ──
+
+test('a clone gives the task a repository it owns, and the work comes back on release', () => {
+  const repo = repoWith();
+  const dir = temp('noevia-ws-');
+  const ws = createCodeWorkspaces({ dir, treeRoot: temp('noevia-shared-'), mode: 'clone', epoch: 'test' });
+  const claim = ws.claim({ taskId: ids(1), repoPath: repo });
+  assert.equal(claim.mode, 'clone');
+  // It is a repository of its own, not a pointer into the source's .git.
+  assert.ok(fs.statSync(path.join(claim.path, '.git')).isDirectory(), 'a worktree would leave a .git FILE here');
+  assert.ok(fs.existsSync(path.join(claim.path, 'a.txt')));
+
+  // The task commits, the way a harness would.
+  const git = (...args) => execFileSync('git', args, { cwd: claim.path, stdio: 'ignore' });
+  fs.writeFileSync(path.join(claim.path, 'a.txt'), 'fixed');
+  git('config', 'user.email', 'harness@example.invalid');
+  git('config', 'user.name', 'harness');
+  git('add', '-A'); git('commit', '-qm', 'the task did its job');
+
+  const released = ws.release({ taskId: ids(1) });
+  assert.equal(released.status, 'released');
+  assert.equal(fs.existsSync(claim.path), false, 'the clone is gone');
+  // And the work is in the source repository, on the task's branch.
+  const log = execFileSync('git', ['log', '--oneline', '-1', claim.branch], { cwd: repo, encoding: 'utf8' });
+  assert.match(log, /the task did its job/);
+  const body = execFileSync('git', ['show', `${claim.branch}:a.txt`], { cwd: repo, encoding: 'utf8' });
+  assert.equal(body, 'fixed');
+});
+
+test('a clone shares the source objects rather than copying them', () => {
+  const repo = repoWith({ 'big.txt': 'x'.repeat(2 * 1024 * 1024) });
+  const ws = createCodeWorkspaces({ dir: temp('noevia-ws-'), treeRoot: temp('noevia-shared-'), mode: 'clone', epoch: 'test' });
+  const claim = ws.claim({ taskId: ids(1), repoPath: repo });
+  assert.ok(fs.existsSync(path.join(claim.path, '.git', 'objects', 'info', 'alternates')),
+    'without alternates every task would copy the whole history');
+});
+
+test('a task that committed nothing releases cleanly', () => {
+  const repo = repoWith();
+  const ws = createCodeWorkspaces({ dir: temp('noevia-ws-'), treeRoot: temp('noevia-shared-'), mode: 'clone', epoch: 'test' });
+  const claim = ws.claim({ taskId: ids(1), repoPath: repo });
+  const released = ws.release({ taskId: ids(1) });
+  assert.equal(released.status, 'released', 'no commits is not a failure');
+  assert.equal(fs.existsSync(claim.path), false);
+});
+
+test('work that cannot be saved keeps the clone and says so', () => {
+  const repo = repoWith();
+  const real = require('node:child_process').execFileSync;
+  const ws = createCodeWorkspaces({
+    dir: temp('noevia-ws-'), treeRoot: temp('noevia-shared-'), mode: 'clone', epoch: 'test',
+    run: (args, cwd) => {
+      if (args[0] === 'fetch') throw new Error('fatal: the disk is full');
+      return real('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    },
+  });
+  const claim = ws.claim({ taskId: ids(1), repoPath: repo });
+  const released = ws.release({ taskId: ids(1) });
+  assert.equal(released.status, 'stuck');
+  assert.match(released.error, /Could not save the task’s branch/);
+  assert.equal(fs.existsSync(claim.path), true, "a task's work is not ours to discard quietly");
+});
+
+test('the mode follows whether the harness runs as someone else', () => {
+  const repo = repoWith();
+  // An owner means a separate sandbox user, which means a worktree could not commit.
+  const sandboxed = createCodeWorkspaces({ dir: temp('noevia-ws-'), owner: { uid: 1000, gid: 1000 }, chown: () => {}, epoch: 'test' });
+  assert.equal(sandboxed.claim({ taskId: ids(1), repoPath: repo }).mode, 'clone');
+  const local = createCodeWorkspaces({ dir: temp('noevia-ws-'), epoch: 'test' });
+  assert.equal(local.claim({ taskId: ids(2), repoPath: repoWith() }).mode, 'worktree');
+});
+
+test('a failed handover leaves nothing behind', () => {
+  const repo = repoWith();
+  const shared = temp('noevia-shared-');
+  const ws = createCodeWorkspaces({ dir: temp('noevia-ws-'), treeRoot: shared, owner: { uid: 1000, gid: 1000 },
+    epoch: 'test', chown: () => { throw new Error('EPERM'); } });
+  assert.throws(() => ws.claim({ taskId: ids(1), repoPath: repo }), /Could not hand the workspace/);
+  assert.deepEqual(fs.readdirSync(shared), [], 'a half-made workspace is not left on the volume');
+});

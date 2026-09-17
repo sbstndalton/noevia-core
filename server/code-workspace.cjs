@@ -11,6 +11,18 @@
 // not exist yet (a file about to be created) is judged by its nearest existing ancestor, so a
 // symlinked parent cannot smuggle a write out of the worktree.
 //
+// Two shapes, because the sandbox changes what is possible:
+//
+//   * `worktree` (default) — a git worktree of the repository. Cheap, and right when the harness
+//     runs as the same user as noevia.
+//   * `clone` — a `git clone --shared`, used when the harness runs as a DIFFERENT user in its own
+//     container. A worktree keeps its objects and refs in the source repository's `.git`, so a
+//     harness that cannot write there can read, edit and run tests but **cannot commit**; proven
+//     on DaServer, where `git commit` failed on a handed-over worktree. A shared clone gives the
+//     task a repository it fully owns, leaves the source read-only to it, and still copies no
+//     objects (120 KB for a clone of the scratch fixture). noevia fetches the branch back when
+//     the task is released, so the work survives and the source's history stays noevia's.
+//
 // This module decides and records ownership. It is NOT the sandbox: the harness still runs
 // unprivileged, in a container, with no credentials and no egress unless granted.
 const fs = require('node:fs'), path = require('node:path'), { execFileSync } = require('node:child_process');
@@ -19,7 +31,7 @@ const TASK_ID = /^[0-9a-f-]{36}$/;
 const BRANCH_PREFIX = 'noevia/task-';
 
 function defaultRun(args, cwd) {
-  return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000 }).trim();
+  return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000 }).trim();
 }
 
 /**
@@ -38,7 +50,8 @@ function defaultRun(args, cwd) {
  * interrupted rather than silently reused.
  */
 function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaultRun,
-  now = Date.now, epoch = String(process.pid), chown = defaultChown } = {}) {
+  now = Date.now, epoch = String(process.pid), chown = defaultChown, mode = owner ? 'clone' : 'worktree',
+  rm = (target) => fs.rmSync(target, { recursive: true, force: true }) } = {}) {
   const root = path.join(dir, 'code-workspaces');
   const trees = treeRoot || root;
   const recordFile = (taskId) => path.join(root, taskId + '.json');
@@ -90,14 +103,27 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
     const tree = treeDir(id);
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
     if (trees !== root) fs.mkdirSync(trees, { recursive: true, mode: 0o755 });
-    // -B so a branch left behind by an earlier, released task does not block a new one; the
-    // worktree path itself must be new, which `git worktree add` enforces.
-    run(['worktree', 'add', '-B', name, tree], repo);
-    // Hand it to whoever runs the harness. Done after the worktree exists so git's own files
-    // (including .git) are covered, and best-effort: a deployment without a separate sandbox
-    // user has nothing to hand over.
-    if (owner) { try { chown(tree, owner.uid, owner.gid); } catch (e) { throw Object.assign(Error(`Could not hand the workspace to the harness user: ${e.message}`), { status: 500 }); } }
-    return write({ taskId: id, repo, branch: name, path: fs.realpathSync(tree), status: 'held',
+    if (mode === 'clone') {
+      // --shared: the clone reads the source's objects instead of copying them, so this costs
+      // kilobytes. The source must therefore outlive the task, which it does.
+      run(['clone', '--quiet', '--shared', repo, tree], undefined);
+      run(['checkout', '--quiet', '-B', name], tree);
+    } else {
+      // -B so a branch left behind by an earlier, released task does not block a new one; the
+      // worktree path itself must be new, which `git worktree add` enforces.
+      run(['worktree', 'add', '-B', name, tree], repo);
+    }
+    // Hand it to whoever runs the harness. Done after the tree exists so git's own files are
+    // covered. A deployment whose harness runs as noevia has nothing to hand over.
+    if (owner) {
+      try { chown(tree, owner.uid, owner.gid); }
+      catch (e) {
+        // Better to refuse than to start a harness that cannot write the tree it was given.
+        try { rm(tree); } catch { /* the refusal is what matters */ }
+        throw Object.assign(Error(`Could not hand the workspace to the harness user: ${e.message}`), { status: 500 });
+      }
+    }
+    return write({ taskId: id, repo, branch: name, path: fs.realpathSync(tree), status: 'held', mode,
       capabilities: [...capabilities], domains: [...domains], epoch, claimedAt: now() });
   }
 
@@ -132,16 +158,38 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
     return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
   }
 
-  /** Give the workspace back. The branch survives by default: the work is the point. */
+  /**
+   * Give the workspace back. The branch survives by default: the work is the point.
+   *
+   * For a clone that means fetching the branch into the source repository FIRST — the commits
+   * live only in the clone until then, so removing it first would throw the work away. A fetch
+   * that fails keeps the tree and marks the claim stuck, because a task's work is not ours to
+   * discard quietly.
+   */
   function release({ taskId, removeBranch = false } = {}) {
     const record = read(taskId);
     if (!record) return null;
     let removed = true, error = null;
-    try { run(['worktree', 'remove', '--force', record.path], record.repo); }
-    catch (e) { removed = false; error = e.message; }
-    try { run(['worktree', 'prune'], record.repo); } catch { /* best effort */ }
-    if (removed && removeBranch) { try { run(['branch', '-D', record.branch], record.repo); } catch { /* keep going */ } }
-    // An unremovable worktree is recorded, not hidden: it still holds the branch, so the next
+    if ((record.mode || 'worktree') === 'clone') {
+      try {
+        // Never forced: a branch that would not fast-forward is a conflict for a human, not
+        // something to overwrite. Nothing is fetched if the task never committed.
+        run(['fetch', '--quiet', record.path, `${record.branch}:${record.branch}`], record.repo);
+      } catch (e) {
+        // "Couldn't find remote ref" simply means the task made no commits — not a failure.
+        if (!/couldn't find remote ref|not found in upstream/i.test(String(e.message))) {
+          return write({ ...record, status: 'stuck', releasedAt: now(), error: `Could not save the task’s branch: ${e.message}` });
+        }
+      }
+      try { rm(record.path); } catch (e) { removed = false; error = e.message; }
+      if (removed && removeBranch) { try { run(['branch', '-D', record.branch], record.repo); } catch { /* keep going */ } }
+    } else {
+      try { run(['worktree', 'remove', '--force', record.path], record.repo); }
+      catch (e) { removed = false; error = e.message; }
+      try { run(['worktree', 'prune'], record.repo); } catch { /* best effort */ }
+      if (removed && removeBranch) { try { run(['branch', '-D', record.branch], record.repo); } catch { /* keep going */ } }
+    }
+    // An unremovable tree is recorded, not hidden: it may still hold the branch, so the next
     // claim on it must keep failing until someone looks.
     return write({ ...record, status: removed ? 'released' : 'stuck', releasedAt: now(), error });
   }

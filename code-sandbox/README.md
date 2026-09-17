@@ -44,10 +44,20 @@ before any harness run:
 - **The worktrees must be on the shared volume**, not in the tenant's state directory. noevia
   sends an absolute path and the supervisor resolves that same path, so they have to be the same
   path: one volume, one mount point, both containers. `CODE_WORKSPACE_ROOT` does this.
-- **A fresh worktree is root-owned and the sandbox is not root**, so the harness could not write
+- **A fresh workspace is root-owned and the sandbox is not root**, so the harness could not write
   the tree it was given (`write /workspaces: Permission denied` in the probes).
-  `CODE_HARNESS_USER=1000:1000` hands each worktree over as it is created, and a handover that
-  fails refuses the task rather than starting a harness that cannot work.
+  `CODE_HARNESS_USER=1000:1000` hands each one over as it is created, and a handover that fails
+  refuses the task rather than starting a harness that cannot work.
+- **A handed-over git *worktree* cannot commit.** A worktree keeps its objects and refs in the
+  source repository's `.git`, which the harness cannot write — proven here: read, edit and `git
+  status` all worked, `git commit` failed. So with a separate harness user noevia gives the task a
+  `git clone --shared` instead: a repository it fully owns, with the source read-only to it and no
+  objects copied (120 KB for the scratch fixture). On release noevia fetches the branch back into
+  the source, never forced — a branch that would not fast-forward is a conflict for a human. A
+  fetch that fails keeps the clone and marks the claim stuck, because a task's work is not ours to
+  discard quietly.
+- **The `$HOME` tmpfs needs `uid=1000,gid=1000`** or the harness cannot write its own
+  `.gitconfig`; a bare `mode=0700` tmpfs belongs to root.
 
 ## Running it
 
