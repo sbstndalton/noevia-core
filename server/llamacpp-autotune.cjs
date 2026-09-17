@@ -35,6 +35,9 @@ const SPEC_CANDIDATES = [
 ];
 const UBATCH_CANDIDATES = [512, 1024, 2048];
 const HISTORY_PER_MODEL = 10;
+const PARTIAL_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const TUNED_KEYS = ['spec-type', 'spec-draft-n-max', 'spec-draft-p-min', 'ubatch-size', 'batch-size'];
+const TOTAL_STEPS = SPEC_CANDIDATES.length + 3;
 
 function geomean(values) {
   const v = values.filter((x) => x > 0);
@@ -78,6 +81,10 @@ function extensions({ options, native, promptPerSecond, budgetSeconds, calibrate
     const target = Math.min(native || byTime, byTime);
     if (target > ctx * 1.25) out.push({ id: 'context', action: 'calibrate', from: ctx, to: target,
       why: `measured prompt speed (${Math.round(promptPerSecond)} tokens/s) fills about ${target.toLocaleString('en-US')} tokens within ${budgetSeconds} s` });
+    // The configured context is only real if it can be filled: an unmeasured maximum is worse than
+    // a smaller measured one, because every long chat then stalls or fails.
+    else if (ctx > byTime * 1.1) out.push({ id: 'context-too-large', action: 'calibrate', from: ctx, to: byTime,
+      why: `at the measured ${Math.round(promptPerSecond)} tokens/s a full ${ctx.toLocaleString('en-US')}-token prompt needs about ${Math.round(ctx / promptPerSecond)} s, over the ${budgetSeconds} s budget` });
   }
   const k = options['cache-type-k'] || 'f16';
   if (calibratedCtx && native && calibratedCtx < native && ['f16', 'f32', 'bf16'].includes(k)) {
@@ -98,9 +105,20 @@ function createAutotuner(deps) {
   const table = createTable(tableFile);
   let state = { job: null, history: {} };
   let cancelRequested = false;
-  const load = () => { try { state = JSON.parse(fs.readFileSync(stateFile, 'utf8')); } catch { state = { job: null, history: {} }; } if (!state.history) state.history = {}; };
+  const load = () => { try { state = JSON.parse(fs.readFileSync(stateFile, 'utf8')); } catch { state = { job: null, history: {} }; } if (!state.history) state.history = {}; if (!state.partial) state.partial = {}; };
+  // Measured results survive a cancel or a restart: a later run continues instead of repeating
+  // tests. Keyed by model plus the configuration they were measured under, so a changed preset,
+  // model file or engine build starts fresh.
+  const partialKey = (model, identity, base) => [model, identity.arch, identity.quant, identity.hardware,
+    crypto.createHash('sha256').update(JSON.stringify(Object.entries(base).filter(([k]) => !TUNED_KEYS.includes(k)).sort())).digest('hex').slice(0, 12)].join('|');
+  const partialFor = (key) => { const hit = state.partial[key]; return hit && Date.now() - hit.at < PARTIAL_TTL_MS ? hit : { at: Date.now(), spec: {}, batch: {} }; };
   const save = () => { if (!stateFile) return; const tmp = `${stateFile}.${crypto.randomUUID()}`; fs.writeFileSync(tmp, JSON.stringify(state), { mode: 0o600 }); fs.renameSync(tmp, stateFile); };
   const publicJob = (job) => job && (({ originalText, ...rest }) => rest)(job);
+  // Steps are known up front, so progress is honest: finished steps out of the planned total.
+  function progress(job) {
+    const done = job.steps.filter((s) => s.status !== 'running').length;
+    job.progress = { done, total: Math.max(TOTAL_STEPS, job.steps.length), percent: Math.min(99, Math.round((done / Math.max(TOTAL_STEPS, job.steps.length)) * 100)) };
+  }
   const cancelled = () => Object.assign(Error('cancelled'), { cancelled: true });
   const fatal = (message) => Object.assign(Error(message), { fatal: true });
 
@@ -150,7 +168,7 @@ function createAutotuner(deps) {
   async function measure(job, kind, candidate, options, run) {
     if (cancelRequested) throw cancelled();
     const record = { kind, id: candidate.id, label: candidate.label, status: 'running', startedAt: now() };
-    job.steps.push(record); job.phase = `${kind === 'spec' ? 'Generation' : 'Prompt'} test: ${candidate.label}`; save();
+    job.steps.push(record); job.phase = `${kind === 'spec' ? 'Generation' : 'Prompt'} test: ${candidate.label}`; progress(job); save();
     try {
       const applied = await applyUnlocked({ model: job.model, baseRevision: presets.get(job.model).revision, options });
       if (!applied.ok) throw fatal(applied.body?.error || 'Could not write the test profile.');
@@ -164,7 +182,7 @@ function createAutotuner(deps) {
       record.status = 'failed'; record.reason = 'The engine failed during this test.'; return record;
     } finally {
       record.seconds = Math.round((now() - record.startedAt) / 1000);
-      save();
+      progress(job); save();
       await unload(job.model).catch(() => {});
     }
   }
@@ -178,11 +196,17 @@ function createAutotuner(deps) {
       const identity = await identityFor(job.model).catch(() => ({})) || {};
       job.identity = identity;
       const base = { ...presets.get(job.model).options };
+      const key = partialKey(job.model, identity, base);
+      const partial = job.resume ? partialFor(key) : { at: Date.now(), spec: {}, batch: {} };
+      state.partial[key] = partial;
+      const keep = (kind, id, value) => { partial[kind][id] = value; partial.at = Date.now(); save(); };
 
       // 1. Generation.
-      let reference = null;
+      let reference = partial.spec.off?.reference || null;
       const spec = [];
       for (const candidate of table.order(identity, SPEC_CANDIDATES)) {
+        const cached = partial.spec[candidate.id];
+        if (cached) { const rec = { kind: 'spec', id: candidate.id, label: candidate.label, ...cached.record, reused: true }; job.steps.push(rec); spec.push(rec); progress(job); save(); continue; }
         const rec = await measure(job, 'spec', candidate, candidate.options, async () => {
           const rows = [];
           for (const w of WORKLOADS) {
@@ -192,17 +216,24 @@ function createAutotuner(deps) {
           }
           return { status: 'measured', workloads: rows, score: Math.round(geomean(rows.map((x) => x.gen)) * 10) / 10 };
         });
-        if (rec.status !== 'measured') { spec.push(rec); continue; }
+        if (rec.status !== 'measured') { keep('spec', candidate.id, { record: { status: rec.status, reason: rec.reason } }); spec.push(rec); continue; }
         const byId = Object.fromEntries(rec.workloads.map((w) => [w.workload, w]));
         // Copy the reference answers: the step record drops its texts below to stay small.
         if (candidate.id === 'off') reference = Object.fromEntries(Object.entries(byId).map(([k, w]) => [k, { text: w.text }]));
         if (candidate.needsHead && !rec.workloads.some((w) => w.drafted > 0)) { rec.status = 'rejected'; rec.reason = 'No MTP head: nothing was drafted.'; }
         else if (reference && candidate.id !== 'off' && byId.list?.text !== reference.list?.text) { rec.status = 'rejected'; rec.reason = 'Changed the deterministic list output.'; }
         for (const w of rec.workloads) delete w.text;
+        keep('spec', candidate.id, { record: { status: rec.status, reason: rec.reason, score: rec.score, workloads: rec.workloads }, ...(candidate.id === 'off' ? { reference } : {}) });
         spec.push(rec);
       }
       const off = spec.find((s) => s.id === 'off' && s.status === 'measured');
-      if (!off) throw fatal('The model did not run with speculative decoding off, so nothing could be compared.');
+      if (!off) {
+        // Usually the saved context is too large to load at all: measuring it is the way out, so
+        // say that plainly and offer the calibration rather than a bare failure.
+        job.baselineFailed = true;
+        if (job.extendContext) calibrateAfter = job.model;
+        throw fatal(`This model did not run with its current settings (context ${presets.get(job.model).options['ctx-size'] || 'unset'}), so there was nothing to compare. ${job.extendContext ? 'Measuring the largest context it can actually load has been started.' : 'Run Measure context first, then auto-tune.'}`);
+      }
       const bestSpec = spec.filter((s) => s.status === 'measured').sort((a, b) => b.score - a.score)[0];
       const specWinner = bestSpec.id !== 'off' && bestSpec.score >= off.score * (1 + MIN_GAIN) ? bestSpec : off;
       const perWorkload = Object.fromEntries(WORKLOADS.map((w) => {
@@ -218,11 +249,14 @@ function createAutotuner(deps) {
       for (const ub of UBATCH_CANDIDATES) {
         const candidate = { id: `ubatch-${ub}`, label: `Micro-batch ${ub}` };
         const options = { ...winnerOptions, 'ubatch-size': String(ub), 'batch-size': String(Math.max(2048, ub)) };
+        const cached = partial.batch[candidate.id];
+        if (cached && cached.spec === specWinner.id) { const rec = { kind: 'prompt', id: candidate.id, label: candidate.label, ...cached.record, options, reused: true }; job.steps.push(rec); batch.push(rec); progress(job); save(); continue; }
         const rec = await measure(job, 'prompt', candidate, options, async () => {
           const r = await chat(job.model, prompt, 16);
           return r && r.prompt > 0 ? { status: 'measured', promptPerSecond: Math.round(r.prompt) } : { status: 'failed', reason: 'The long prompt failed.' };
         });
         rec.options = options;
+        keep('batch', candidate.id, { spec: specWinner.id, record: { status: rec.status, reason: rec.reason, promptPerSecond: rec.promptPerSecond } });
         batch.push(rec);
       }
       const bestBatch = batch.filter((b) => b.status === 'measured').sort((a, b) => b.promptPerSecond - a.promptPerSecond)[0];
@@ -244,7 +278,8 @@ function createAutotuner(deps) {
       table.record(identity, { spec: specWinner.id, perWorkload, generation: specWinner.score, generationOff: off.score, ubatch: job.result.ubatch, promptPerSecond: job.result.promptPerSecond, model: job.model });
       job.phase = 'Loading the tuned profile'; save();
       job.result.loaded = await loadAndWait(job.model).catch(() => false);
-      job.status = 'passed'; job.phase = 'Done';
+      delete state.partial[key];
+      job.status = 'passed'; job.phase = 'Done'; job.progress = { done: job.steps.length, total: job.steps.length, percent: 100 };
       state.history[job.model] = [{ at: now(), ...job.result }, ...(state.history[job.model] || [])].slice(0, HISTORY_PER_MODEL);
       if (job.extendContext && ext.some((e) => e.id === 'context')) calibrateAfter = job.model;
     } catch (e) {
@@ -273,7 +308,7 @@ function createAutotuner(deps) {
     }
   }
 
-  async function start(model, { confirmPause, promptBudgetSeconds = 120, extendContext = false } = {}) {
+  async function start(model, { confirmPause, promptBudgetSeconds = 120, extendContext = false, resume = true } = {}) {
     if (confirmPause !== true) return { ok: false, status: 400, body: { error: 'Confirm that chat can pause and that Diary background jobs and other clients are stopped.' } };
     promptBudgetSeconds = Number(promptBudgetSeconds);
     if (!Number.isInteger(promptBudgetSeconds) || promptBudgetSeconds < 15 || promptBudgetSeconds > 1800) return { ok: false, status: 400, body: { error: 'Choose a prompt time limit between 15 and 1800 seconds.' } };
@@ -287,7 +322,7 @@ function createAutotuner(deps) {
     try { release = maintenance.hold(`Chat is paused while noevia auto-tunes ${model}. It will be available again when tuning finishes or is cancelled.`); }
     catch { return { ok: false, status: 409, body: { error: 'Requests are in progress. Wait for them to finish, then start auto-tune.' } }; }
     cancelRequested = false;
-    const job = { id: crypto.randomUUID(), model, promptBudgetSeconds, extendContext: extendContext === true, native: Number(row.meta?.n_ctx_train) || 0, status: 'running', phase: 'Preparing', startedAt: now(), steps: [] };
+    const job = { id: crypto.randomUUID(), model, promptBudgetSeconds, extendContext: extendContext === true, resume: resume !== false, native: Number(row.meta?.n_ctx_train) || 0, status: 'running', phase: 'Preparing', startedAt: now(), steps: [], progress: { done: 0, total: TOTAL_STEPS, percent: 0 } };
     state.job = job; save();
     run(job, release).catch(() => {});
     return { ok: true, status: 202, body: publicJob(job) };

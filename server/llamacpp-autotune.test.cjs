@@ -125,8 +125,76 @@ test('measured prompt speed proposes a longer context and starts calibration onl
 });
 
 test('extension rules: q8_0 KV only when an f16 cache stopped context short of native', () => {
-  assert.deepEqual(extensions({ options: { 'ctx-size': '32768', 'cache-type-k': 'q8_0' }, native: 262144, promptPerSecond: 100, budgetSeconds: 120, calibratedCtx: 12288 }), []);
+  // 32K at 100 tokens/s needs 328 s: flagged as too large, and a q8_0 cache is already in use.
+  assert.deepEqual(extensions({ options: { 'ctx-size': '32768', 'cache-type-k': 'q8_0' }, native: 262144, promptPerSecond: 100, budgetSeconds: 120, calibratedCtx: 12288 }).map((e) => e.id), ['context-too-large']);
+  assert.deepEqual(extensions({ options: { 'ctx-size': '8192', 'cache-type-k': 'q8_0' }, native: 262144, promptPerSecond: 100, budgetSeconds: 120, calibratedCtx: 12288 }).map((e) => e.id), ['context']);
+  assert.deepEqual(extensions({ options: { 'ctx-size': '11000', 'cache-type-k': 'q8_0' }, native: 262144, promptPerSecond: 100, budgetSeconds: 120, calibratedCtx: 12288 }), [], 'a context close to what fits needs no change');
   const out = extensions({ options: { 'ctx-size': '8192' }, native: 131072, promptPerSecond: 0, budgetSeconds: 120, calibratedCtx: 16384 });
   assert.deepEqual(out.map((e) => e.id), ['kv-q8']);
   assert.ok(Math.abs(geomean([10, 40]) - 20) < 1e-9);
+});
+
+test('progress counts finished steps out of the planned total and ends at 100', async (t) => {
+  const seen = [];
+  const f = fixture(t, { onChat: async () => { const j = f.manager.autotune.status().body.job; if (j?.progress) seen.push(j.progress.percent); } });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const job = await finished(f.manager);
+  assert.equal(job.progress.percent, 100);
+  assert.equal(job.progress.done, job.steps.length);
+  assert.ok(seen.some((p) => p > 0 && p < 100), `saw ${seen.join(',')}`);
+  assert.ok(seen.every((p) => p <= 99));
+});
+
+test('a cancelled run resumes from the measurements it already made', async (t) => {
+  let f;
+  f = fixture(t, { onChat: async (router) => { if (router.chats === 9) f.manager.autotune.cancel(); } });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const first = await finished(f.manager);
+  assert.equal(first.status, 'cancelled');
+  const measured = first.steps.filter((s) => s.status === 'measured').map((s) => s.id);
+  assert.ok(measured.length >= 1, 'something was measured before cancelling');
+  const before = f.router.chats;
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const second = await finished(f.manager);
+  assert.equal(second.status, 'passed', second.error);
+  for (const id of measured) assert.equal(second.steps.find((s) => s.id === id).reused, true, `${id} re-measured`);
+  assert.ok(f.router.chats - before < 24, 'fewer requests than a full run');
+  assert.equal(second.result.spec, 'mtp-deep');
+  // A finished run clears its saved progress, so the next one starts fresh.
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const third = await finished(f.manager);
+  assert.ok(third.steps.every((s) => !s.reused));
+});
+
+test('resume can be turned off to force a full re-measure', async (t) => {
+  let f;
+  f = fixture(t, { onChat: async (router) => { if (router.chats === 9) f.manager.autotune.cancel(); } });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  await finished(f.manager);
+  await f.manager.autotune.start('synthetic', { confirmPause: true, resume: false });
+  const job = await finished(f.manager);
+  assert.ok(job.steps.every((s) => !s.reused));
+});
+
+test('a context too large to fill in the budget is reported, not only one too small', () => {
+  const big = extensions({ options: { 'ctx-size': '131072' }, native: 131072, promptPerSecond: 559, budgetSeconds: 120, calibratedCtx: 0 });
+  assert.deepEqual(big.map((e) => e.id), ['context-too-large']);
+  assert.equal(big[0].to, 559 * 120);
+  assert.match(big[0].why, /needs about 234 s, over the 120 s budget/);
+  assert.deepEqual(extensions({ options: { 'ctx-size': '32768' }, native: 131072, promptPerSecond: 559, budgetSeconds: 120, calibratedCtx: 0 }).map((e) => e.id), ['context']);
+  assert.deepEqual(extensions({ options: { 'ctx-size': '60000' }, native: 131072, promptPerSecond: 559, budgetSeconds: 120, calibratedCtx: 0 }), []);
+});
+
+test('a model that cannot run with its saved settings says so and can start the context measurement', async (t) => {
+  const calls = [];
+  const f = fixture(t, { calibrateSpy: async (m) => { calls.push(m); return { ok: true, status: 202 }; }, onChat: async () => { throw Error('engine refused'); } });
+  await f.manager.autotune.start('synthetic', { confirmPause: true, extendContext: true });
+  const job = await finished(f.manager);
+  assert.equal(job.status, 'failed');
+  assert.equal(job.baselineFailed, true);
+  assert.match(job.error, /did not run with its current settings \(context 16384\)/);
+  assert.match(job.error, /Measuring the largest context/);
+  assert.equal(job.restored, true);
+  for (let i = 0; i < 100 && !calls.length; i++) await new Promise((r) => setImmediate(r));
+  assert.deepEqual(calls, ['synthetic']);
 });

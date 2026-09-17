@@ -226,6 +226,29 @@ function authResult(res, result) {
   return json(res, result.status || 200, result.body ?? result);
 }
 
+// One call to the model management service, with its token. Same path the proxy route uses.
+function managerFetch(rest, method = 'GET') {
+  return fetchJson(`${process.env.MODEL_LOADER_URL.replace(/\/+$/, '')}/api/v1/${rest}`,
+    { method, headers: { 'Content-Type': 'application/json', ...(process.env.MODEL_LOADER_TOKEN ? { 'X-Model-Loader-Token': process.env.MODEL_LOADER_TOKEN } : {}) }, ...(method === 'POST' ? { body: '{}' } : {}) }, 120000).catch(() => null);
+}
+
+// Model files that appear in the models folder get safe defaults on their own (roadmap C3).
+// Needs the model management service; the engine's own preset file is edited through it.
+const folderSync = process.env.MODEL_LOADER_URL ? require('./model-folder-sync.cjs').createFolderSync({
+  stateFile: path.join(DATA_DIR, 'model-folder-sync.json'),
+  listUnregistered: async () => {
+    const r = await managerFetch('models');
+    if (!r?.ok) throw Object.assign(Error(r?.body?.error || `model manager HTTP ${r?.status || 'unreachable'}`), { status: r?.status });
+    return Array.isArray(r.body?.unregistered) ? r.body.unregistered : [];
+  },
+  register: async (stem) => {
+    const r = await managerFetch(`sections/${encodeURIComponent(stem)}/safe-defaults`, 'POST');
+    if (!r?.ok) throw Object.assign(Error(r?.body?.error || `model manager HTTP ${r?.status || 'unreachable'}`), { status: r?.status });
+  },
+  reloadPresets: () => modelManager.reloadPresets ? modelManager.reloadPresets({ unload: false }) : { ok: false },
+  log: (message) => console.log(message),
+}) : null;
+
 const modelManager = createModelManager({
   kind: MODEL_MANAGER_KIND,
   presetPath: process.env.LLAMACPP_PRESET_PATH,
@@ -4138,7 +4161,7 @@ async function handleRequestScoped(req, res) {
       let result;
       if(p.endsWith('/cancel')){if(req.method!=='POST')return json(res,405,{error:'Method not allowed'});result=modelManager.autotune.cancel();}
       else if(req.method==='GET')result=modelManager.autotune.status(url.searchParams.get('model')||'');
-      else if(req.method==='POST'){const body=await readJson(req);result=await modelManager.autotune.start(String(body?.model||''),{confirmPause:body?.confirmPause,promptBudgetSeconds:body?.promptBudgetSeconds,extendContext:body?.extendContext});}
+      else if(req.method==='POST'){const body=await readJson(req);result=await modelManager.autotune.start(String(body?.model||''),{confirmPause:body?.confirmPause,promptBudgetSeconds:body?.promptBudgetSeconds,extendContext:body?.extendContext,resume:body?.resume});}
       else return json(res,405,{error:'Method not allowed'});
       res.setHeader('Cache-Control','no-store');
       return json(res,result.status,result.body);
@@ -4615,6 +4638,8 @@ if (require.main === module) {
     // A calibration interrupted by a restart restores the preset it was testing.
     modelManager.calibration?.recover().catch(() => undefined);
     modelManager.autotune?.recover().catch(() => undefined);
+    // A GGUF that appears in the models folder becomes usable without anyone opening a page.
+    folderSync?.start();
   });
 }
 
