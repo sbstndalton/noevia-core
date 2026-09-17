@@ -57,3 +57,12 @@ test('unknown selected ids are ignored, not fatal', async () => {
   const out = await router.select(['gone-box', 'calendar', 'nextcloud-files'], 'my calendar');
   assert.deepEqual(out.ids, ['calendar']);
 });
+
+test('routed ids come back best match first, so the token budget keeps the best box', async () => {
+  // Occurrence-count embedding: "file" twice beats "calendar" once; both clear the threshold.
+  const counts = (text) => AXES.map((k) => (String(text).toLowerCase().match(new RegExp(k, 'g')) || []).length).concat([0.01]);
+  const { router } = make({ embed: async (texts) => texts.map(counts) });
+  const out = await router.select(['calendar', 'nextcloud-files'], 'file file, and the calendar');
+  assert.equal(out.routed, true);
+  assert.deepEqual(out.ids, ['nextcloud-files', 'calendar']);
+});

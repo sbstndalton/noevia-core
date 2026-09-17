@@ -50,8 +50,9 @@ function createChatToolRouter({ enabled, boxes, embed, topK = 3, threshold = 0.3
     const inSelection = new Set(rows.map((box) => box.id));
     const result = route({ boxes: ranked, taskEmbedding, offered: (id) => inSelection.has(id), userSelection: [], fallback: [...inSelection], maxTools: Infinity, topK, threshold });
     if (!result.routed || !result.boxes.length) return keep('no toolbox matched');
-    const chosen = new Set(result.boxes);
-    return { ids: rows.map((box) => box.id).filter((id) => chosen.has(id)), routed: true, reasons: result.reasons };
+    // Best match first: resolveTools spends the tool budget in this order, so a large box the user
+    // happened to select earlier must not crowd out the box that matched the message.
+    return { ids: result.boxes.filter((id) => inSelection.has(id)), routed: true, reasons: result.reasons };
   }
 
   return { select };
