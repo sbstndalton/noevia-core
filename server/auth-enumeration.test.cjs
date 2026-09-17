@@ -41,3 +41,19 @@ test('one address cannot spray passwords across many usernames', async (t) => {
   const other = await auth.passwordLogin(request('203.0.113.10'), response(), { username: 'realuser', password: 'synthetic enumeration password' });
   assert.equal(other.status, 200, 'another address is unaffected');
 });
+
+test('passkey sign-in options look the same for known and unknown usernames', async (t) => {
+  const auth = await fixture(t);
+  const user = auth.listUsers()[0];
+  auth.db.prepare('INSERT INTO passkeys(id,user_id,name,public_key,webauthn_user_id,counter,device_type,backed_up,transports,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)')
+    .run('real-credential-id', user.id, 'Synthetic key', Buffer.from('pk'), 'w', 0, 'singleDevice', 0, JSON.stringify(['internal']), Date.now());
+  const shape = (o) => o.options.allowCredentials.map((c) => [typeof c.id, c.id.length > 0, JSON.stringify(c.transports || [])]).length;
+  const known = await auth.authenticationOptions('realuser');
+  const unknown = await auth.authenticationOptions('ghost-user');
+  assert.equal(shape(known), shape(unknown), 'the number of offered credentials reveals whether the account exists');
+  assert.ok(known.options.allowCredentials.some((c) => c.id === 'real-credential-id'), 'the real passkey is still offered');
+  const again = await auth.authenticationOptions('ghost-user');
+  assert.deepEqual(again.options.allowCredentials.map((c) => c.id), unknown.options.allowCredentials.map((c) => c.id), 'decoys are stable per username');
+  const other = await auth.authenticationOptions('ghost-two');
+  assert.notDeepEqual(other.options.allowCredentials.map((c) => c.id), unknown.options.allowCredentials.map((c) => c.id));
+});

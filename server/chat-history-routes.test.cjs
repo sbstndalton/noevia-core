@@ -95,3 +95,19 @@ test('a history larger than 1 MB (long reasoning and tool results) still saves',
   assert.equal(saved.status, 200, saved.text);
   assert.equal(JSON.parse((await request('/api/chats/c-big-history/history', { headers: mutationHeaders() })).text).history.length, 60);
 });
+
+test('history saves carry a revision; a save based on a stale revision is refused with the current copy', async () => {
+  const first = [{ role: 'user', content: 'phone question' }];
+  await post('/api/chats/c-two-devices/history', { history: first });
+  const read = JSON.parse((await request('/api/chats/c-two-devices/history', { headers: mutationHeaders() })).text);
+  assert.match(read.revision, /^[a-f0-9]{64}$/);
+  const laptop = [...first, { role: 'assistant', content: 'laptop answer' }];
+  assert.equal((await post('/api/chats/c-two-devices/history', { history: laptop, baseRevision: read.revision })).status, 200);
+  const phone = [...first, { role: 'assistant', content: 'phone answer' }];
+  const stale = await post('/api/chats/c-two-devices/history', { history: phone, baseRevision: read.revision });
+  assert.equal(stale.status, 409);
+  const body = JSON.parse(stale.text);
+  assert.deepEqual(body.history.map((m) => m.content), ['phone question', 'laptop answer']);
+  assert.match(body.revision, /^[a-f0-9]{64}$/);
+  assert.equal((await post('/api/chats/c-two-devices/history', { history: phone })).status, 200, 'saves without a base revision still work (older clients)');
+});

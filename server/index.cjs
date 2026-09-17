@@ -4370,7 +4370,8 @@ async function handleRequestScoped(req, res) {
     const historyMatch = p.match(/^\/api\/chats\/([^/]+)\/history$/);
     if (historyMatch) {
       const spaceId = decodeURIComponent(historyMatch[1]);
-      if (req.method === 'GET') return json(res, 200, { history: readHistory(spaceId) });
+      const revisionOf = (history) => crypto.createHash('sha256').update(JSON.stringify(history)).digest('hex');
+      if (req.method === 'GET') { const history = readHistory(spaceId); return json(res, 200, { history, revision: revisionOf(history) }); }
       if (req.method === 'POST') {
         // A reply that finishes after its chat was deleted must not write the transcript back.
         if (require('./chat-lists.cjs').readTombstones(currentWorkspace().dir).has(spaceId)) return json(res, 410, { error: 'This chat was deleted.' });
@@ -4379,8 +4380,16 @@ async function handleRequestScoped(req, res) {
         catch (e) { return json(res, e.status || 400, { error: e.status === 413 ? 'This chat is too large to save; start a new chat to keep going.' : 'could not read the chat' }); }
         try {
           const body = JSON.parse(raw);
-          writeHistory(spaceId, Array.isArray(body.history) ? body.history.slice(-STORED_HISTORY_CAP) : []);
-          return json(res, 200, { ok: true });
+          // Optimistic concurrency: a save based on an older copy (another device saved meanwhile)
+          // gets the current copy back to merge. Saves without a base revision are accepted as before.
+          if (typeof body.baseRevision === 'string') {
+            const current = readHistory(spaceId);
+            const revision = revisionOf(current);
+            if (body.baseRevision !== revision) return json(res, 409, { error: 'This chat changed on another device.', history: current, revision });
+          }
+          const next = Array.isArray(body.history) ? body.history.slice(-STORED_HISTORY_CAP) : [];
+          writeHistory(spaceId, next);
+          return json(res, 200, { ok: true, revision: revisionOf(next) });
         } catch {
           return json(res, 400, { error: 'invalid JSON' });
         }

@@ -289,6 +289,14 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
     return !supplied || supplied === origin || trustedOrigins.has(supplied);
   }
 
+  const PASSKEY_LIST_SIZE = 5;
+  let decoySecret = null;
+  const decoyKey = () => {
+    if (decoySecret) return decoySecret;
+    let value = db.prepare("SELECT value FROM settings WHERE key='passkey_decoy_key'").get()?.value;
+    if (!value) { value = crypto.randomBytes(32).toString('hex'); db.prepare("INSERT OR IGNORE INTO settings(key,value) VALUES('passkey_decoy_key',?)").run(value); value = db.prepare("SELECT value FROM settings WHERE key='passkey_decoy_key'").get().value; }
+    return (decoySecret = Buffer.from(value, 'hex'));
+  };
   let dummyHash = null;
   const timingHash = () => (dummyHash ||= createPasswordHash(randomToken()));
   async function createPasswordHash(password) {
@@ -397,10 +405,18 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       return { verified: true };
     },
     async authenticationOptions(username) {
-      const user = db.prepare('SELECT * FROM users WHERE username_norm=? AND disabled_at IS NULL').get(String(username || '').toLowerCase());
+      const norm = String(username || '').toLowerCase();
+      const user = db.prepare('SELECT * FROM users WHERE username_norm=? AND disabled_at IS NULL').get(norm);
       const keys = user ? db.prepare('SELECT * FROM passkeys WHERE user_id=?').all(user.id) : [];
-      const options = await generateAuthenticationOptions({ rpID: relyingPartyId, userVerification: 'required',
-        allowCredentials: keys.map(k => ({ id: k.id, transports: JSON.parse(k.transports) })) });
+      // Pad every list with stable decoy ids so known and unknown usernames get the same shape.
+      // Authenticators ignore credential ids they do not hold, so real sign-in is unaffected.
+      const real = keys.map(k => ({ id: k.id, transports: JSON.parse(k.transports) }));
+      const decoys = [];
+      for (let i = 0; real.length + decoys.length < PASSKEY_LIST_SIZE; i++) {
+        decoys.push({ id: crypto.createHmac('sha256', decoyKey()).update(`${norm}:${i}`).digest('base64url'), transports: ['internal', 'hybrid'] });
+      }
+      const allowCredentials = [...real, ...decoys].sort((a, b) => (a.id < b.id ? -1 : 1));
+      const options = await generateAuthenticationOptions({ rpID: relyingPartyId, userVerification: 'required', allowCredentials });
       return { options, challengeToken: saveChallenge(user?.id || null, 'authenticate', options.challenge) };
     },
     async authenticationVerify(req, res, body) {
