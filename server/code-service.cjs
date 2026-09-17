@@ -7,7 +7,7 @@
 // registered.** A member — or a prompt-injected instruction — cannot name a path on the host and
 // have noevia open it. `CODE_REPOS` is deployment configuration, read at startup, the same way
 // model download targets are.
-const path = require('node:path'), fs = require('node:fs');
+const path = require('node:path'), fs = require('node:fs'), crypto = require('node:crypto');
 const { createJobs } = require('./jobs.cjs');
 const { createCodeHarness } = require('./code-harness.cjs');
 const { createCodeWorkspaces } = require('./code-workspace.cjs');
@@ -77,7 +77,10 @@ function createCodeService({ repos, connect, egress = null, now = Date.now, log 
 
   function askApproval(request) {
     return new Promise((resolve) => {
-      const id = `${request.taskId}:${pending.size}:${now()}`;
+      // A random id, not one derived from the map's size and the clock: two approvals raised in
+      // the same millisecond would otherwise collide, and the overwritten one would hang until
+      // its timeout with nobody able to answer it.
+      const id = crypto.randomUUID();
       let settled = false;
       const finish = (decision) => {
         if (settled) return;

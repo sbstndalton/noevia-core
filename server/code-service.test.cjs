@@ -142,3 +142,30 @@ test('the listed task carries no host path and no repository location', async ()
   assert.equal(JSON.stringify(listed).includes(repoPath), false);
   assert.deepEqual(svc.repositories(), [{ id: 'noevia' }], 'the browser learns the name, never the path');
 });
+
+test('two tasks waiting at once each get their own answer', async () => {
+  // Same workspace, different projects: both wait, and answering one must not touch the other.
+  const asks = {};
+  const dir = temp('noevia-sws-');
+  const ws = { dir };
+  const repoPath = repo();
+  const svc = createCodeService({ repos: [{ id: 'noevia', path: repoPath }], timeoutMs: 60000,
+    connect: async ({ handlers }) => ({ prompt: async () => {
+      const key = Object.keys(asks).length ? 'b' : 'a';
+      asks[key] = handlers.requestPermission({ toolCall: { kind: 'edit', locations: [] },
+        options: [{ optionId: 'y', kind: 'allow_once' }, { optionId: 'n', kind: 'reject_once' }] });
+      await asks[key]; return { stopReason: 'end_turn' };
+    } }) });
+  const one = { id: 'one' }, two = { id: 'two' };
+  const a = await svc.start(ws, one, { repository: 'noevia', prompt: 'first', capabilities: ['edit_file'] });
+  const b = await svc.start(ws, two, { repository: 'noevia', prompt: 'second', capabilities: ['edit_file'] });
+  for (let i = 0; i < 300 && !(svc.get(ws, one, a.taskId)?.approval && svc.get(ws, two, b.taskId)?.approval); i++) {
+    await new Promise((r) => setTimeout(r, 5));
+  }
+  assert.ok(svc.get(ws, one, a.taskId).approval && svc.get(ws, two, b.taskId).approval, 'both are waiting');
+  svc.decide(ws, one, a.taskId, 'approve');
+  assert.deepEqual(await asks.a, { outcome: 'selected', optionId: 'y' });
+  assert.ok(svc.get(ws, two, b.taskId).approval, 'the other task is still waiting for its own answer');
+  svc.decide(ws, two, b.taskId, 'deny');
+  assert.deepEqual(await asks.b, { outcome: 'selected', optionId: 'n' });
+});
