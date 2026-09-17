@@ -1551,7 +1551,9 @@ const codeRoutes = require('./routes/code.cjs').createCodeRoutes({
   service: require('./code-service.cjs').createCodeService({
     repos: process.env.CODE_REPOS,
     log: (entry) => console.log('[code]', JSON.stringify(entry)),
-    connect: async () => { throw Object.assign(Error('No coding harness is configured on this server.'), { status: 409, publicMessage: 'No coding harness is configured on this server.' }); },
+    // `CODE_HARNESS_COMMAND` is the ACP agent to run (for example `opencode acp`). Unset, a
+    // task cannot start and says so.
+    connect: require('./code-acp.cjs').createAcpTransport({ log: (entry) => console.log('[code]', JSON.stringify(entry)) }),
   }),
 });
 

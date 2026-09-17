@@ -143,7 +143,9 @@ test('the write path is checked again at write time, not only at approval time',
     capabilities: [ACTIONS.EDIT], answers: ['approve'],
     script: async (h, cwd) => {
       await h.requestPermission(editCall(path.join(cwd, 'a.txt')));
-      await h.writeTextFile({ path: path.join(cwd, 'a.txt'), content: 'ok' });
+      assert.equal(await h.writeTextFile({ path: path.join(cwd, 'a.txt'), content: 'ok' }), null);
+      assert.equal(fs.readFileSync(path.join(cwd, 'a.txt'), 'utf8'), 'ok', 'the write actually happened');
+      assert.deepEqual(await h.readTextFile({ path: path.join(cwd, 'a.txt') }), { content: 'ok' });
       // Approval was for a path inside; this write is not.
       await assert.rejects(() => h.writeTextFile({ path: '/tmp/elsewhere.txt', content: 'no' }), /Outside/);
       await assert.rejects(() => h.readTextFile({ path: '/etc/passwd' }), /Outside/);
@@ -151,6 +153,17 @@ test('the write path is checked again at write time, not only at approval time',
   });
   assert.equal(r.job.status, 'completed');
   assert.ok(events(r).some((e) => e.type === 'tool.completed' && e.data.name === 'write_file'));
+});
+
+test('a read is served from the worktree, and a line window is honoured', async () => {
+  await run({
+    script: async (h, cwd) => {
+      fs.writeFileSync(path.join(cwd, 'many.txt'), 'one\ntwo\nthree\nfour');
+      assert.deepEqual(await h.readTextFile({ path: path.join(cwd, 'many.txt'), line: 2, limit: 2 }), { content: 'two\nthree' });
+      await assert.rejects(() => h.readTextFile({ path: path.join(cwd, 'missing.txt') }), /ENOENT/);
+      await assert.rejects(() => h.readTextFile({ path: cwd }), /Not a file/);
+    },
+  });
 });
 
 test('the workspace is released and the egress grant revoked however the task ends', async () => {

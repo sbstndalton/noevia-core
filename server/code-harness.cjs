@@ -19,16 +19,19 @@
 //
 // It is not the sandbox. The spike showed an agent writing and running commands in its own
 // process; the container, the worktree and the egress proxy are what contain it.
+const fs = require('node:fs'), nodePath = require('node:path');
 const { classify, decide, pickOption, ACTIONS } = require('./code-actions.cjs');
 
-const MAX_TEXT = 4000; // what a job event keeps of a chunk, as chat keeps of a tool result
+const MAX_TEXT = 4000;                  // what a job event keeps, as chat keeps of a tool result
+const MAX_FILE_BYTES = 8 * 1024 * 1024; // one source file, not a database the agent found
 
 /**
  * @param {{jobs: object, workspaces: object, egress?: object, now?: () => number,
  *          askApproval: (request: object) => Promise<'approve'|'approve_all'|'deny'|'timeout'|'aborted'>,
  *          log?: (entry: object) => void}} deps
  */
-function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now = Date.now, log = () => {} }) {
+function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now = Date.now, log = () => {},
+  files = defaultFiles }) {
   /**
    * Start a task. `capabilities` is fixed here and never widens (§4): the job records it, and
    * every later decision is taken against this list, not against anything the agent claims.
@@ -133,17 +136,33 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
       return pickOption(options, 'reject_once');
     }
 
-    /** noevia's file API for the agent: inside the worktree or not at all. */
-    const readTextFile = async ({ path: target } = {}) => {
-      if (workspaces.contains(taskId, target) !== true) throw Object.assign(Error('Outside this task’s workspace'), { code: -32602 });
-      return { path: target };
+    /**
+     * noevia's file API for the agent: inside the worktree or not at all. The spike showed an
+     * approved write being carried out through this path, which is what lets noevia contain it
+     * and record it — so the containment check is repeated HERE, not trusted from approval
+     * time. The path approved and the path written are two different facts, and only this one
+     * is the write.
+     */
+    const inside = (target) => {
+      if (workspaces.contains(taskId, target) !== true) {
+        record({ event: 'code.refused', reason: 'path outside the workspace' });
+        throw Object.assign(Error('Outside this task’s workspace'), { code: -32602 });
+      }
+      return target;
+    };
+    const readTextFile = async ({ path: target, line = null, limit = null } = {}) => {
+      const content = files.read(inside(target), MAX_FILE_BYTES);
+      if (line === null && limit === null) return { content };
+      const all = content.split('\n');
+      const from = Math.max(0, (Number(line) || 1) - 1);
+      return { content: all.slice(from, limit ? from + Number(limit) : undefined).join('\n') };
     };
     const writeTextFile = async ({ path: target, content } = {}) => {
-      // Checked again here, not only at approval time: the path approved and the path written
-      // are two different facts, and only this one is the write.
-      if (workspaces.contains(taskId, target) !== true) throw Object.assign(Error('Outside this task’s workspace'), { code: -32602 });
-      ctx.event('tool.completed', { name: 'write_file', path: target, bytes: String(content ?? '').length });
-      return { path: target };
+      const text = String(content ?? '');
+      if (Buffer.byteLength(text) > MAX_FILE_BYTES) throw Object.assign(Error('File too large'), { code: -32602 });
+      files.write(inside(target), text);
+      ctx.event('tool.completed', { name: 'write_file', path: target, bytes: Buffer.byteLength(text) });
+      return null;
     };
 
     function sessionUpdate(update = {}) {
@@ -193,4 +212,18 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
   return { start, cancel, canStand };
 }
 
-module.exports = { createCodeHarness, MAX_TEXT };
+/** Real file I/O, injectable so the policy above can be tested without a disk. */
+const defaultFiles = {
+  read(target, max) {
+    const stat = fs.statSync(target);
+    if (!stat.isFile()) throw Object.assign(Error('Not a file'), { code: -32602 });
+    if (stat.size > max) throw Object.assign(Error('File too large'), { code: -32602 });
+    return fs.readFileSync(target, 'utf8');
+  },
+  write(target, text) {
+    fs.mkdirSync(nodePath.dirname(target), { recursive: true });
+    fs.writeFileSync(target, text);
+  },
+};
+
+module.exports = { createCodeHarness, defaultFiles, MAX_TEXT, MAX_FILE_BYTES };
