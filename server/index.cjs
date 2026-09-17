@@ -4367,6 +4367,8 @@ async function handleRequestScoped(req, res) {
       const spaceId = decodeURIComponent(historyMatch[1]);
       if (req.method === 'GET') return json(res, 200, { history: readHistory(spaceId) });
       if (req.method === 'POST') {
+        // A reply that finishes after its chat was deleted must not write the transcript back.
+        if (require('./chat-lists.cjs').readTombstones(currentWorkspace().dir).has(spaceId)) return json(res, 410, { error: 'This chat was deleted.' });
         let raw;
         try { raw = await readBody(req, STORED_HISTORY_BYTES); }
         catch (e) { return json(res, e.status || 400, { error: e.status === 413 ? 'This chat is too large to save; start a new chat to keep going.' : 'could not read the chat' }); }

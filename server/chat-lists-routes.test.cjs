@@ -104,3 +104,13 @@ test('project chat lists merge the same way', async () => {
   await post(`/api/projects/${project.id}/chats`, { chats: [meta('p-one'), meta('p-two')] });
   assert.deepEqual(await ids(), ['p-two']);
 });
+
+test('a late history save for a deleted chat does not write the transcript back', async () => {
+  await post('/api/freechats', { chats: [meta('c-deleted-while-streaming')] });
+  await post('/api/chats/c-deleted-while-streaming/history', { history: [{ role: 'user', content: 'first' }] });
+  assert.equal((await request('/api/freechats/c-deleted-while-streaming', { method: 'DELETE', headers: mutationHeaders() })).status, 200);
+  const late = await post('/api/chats/c-deleted-while-streaming/history', { history: [{ role: 'user', content: 'first' }, { role: 'assistant', content: 'late reply' }] });
+  assert.equal(late.status, 410);
+  const read = JSON.parse((await request('/api/chats/c-deleted-while-streaming/history', { headers: mutationHeaders() })).text).history;
+  assert.deepEqual(read, []);
+});
