@@ -334,17 +334,18 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       let passwordHash;
       try { passwordHash = await createPasswordHash(body.password); } catch (e) { return { status: 400, body: { error: e.message } }; }
       const now = Date.now(); const id = crypto.randomUUID();
-      origin = selectedOrigin;
-      if (!rpId) relyingPartyId = new URL(selectedOrigin).hostname;
       const tx = db.transaction(() => {
+        // Hashing above is asynchronous: a concurrent setup may have finished meanwhile.
+        if (userCount() !== 0 || db.prepare("DELETE FROM settings WHERE key='setup_code_hash' AND value=?").run(expected).changes !== 1) throw Object.assign(Error('setup already complete'), { raced: true });
         db.prepare('INSERT INTO users(id,username,username_norm,display_name,role,password_hash,webauthn_user_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)')
           .run(id, body.username, body.username.toLowerCase(), String(body.displayName || body.username).trim().slice(0, 80), 'admin', passwordHash, randomToken(32), now, now);
         db.prepare('INSERT INTO user_features(user_id,diary_enabled,onboarded,updated_at) VALUES(?,?,?,?)')
           .run(id, body.diaryEnabled ? 1 : 0, 0, now);
         db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('public_origin',?)").run(selectedOrigin);
-        db.prepare("DELETE FROM settings WHERE key='setup_code_hash'").run();
       });
-      tx();
+      try { tx(); } catch (e) { if (e.raced) return { status: 409, body: { error: 'setup already complete' } }; throw e; }
+      origin = selectedOrigin;
+      if (!rpId) relyingPartyId = new URL(selectedOrigin).hostname;
       try { fs.unlinkSync(setupFile); } catch {}
       const user = db.prepare('SELECT * FROM users WHERE id=?').get(id);
       audit('setup.complete', id, id);
@@ -439,13 +440,14 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       const id = crypto.randomUUID(); const now = Date.now();
       try {
         db.transaction(() => {
+          // Claim the invitation first; a concurrent accept that got here earlier wins.
+          if (db.prepare('UPDATE invitations SET used_at=? WHERE token_hash=? AND used_at IS NULL AND expires_at>?').run(now, invite.token_hash, now).changes !== 1) throw Object.assign(Error('used'), { raced: true });
           db.prepare('INSERT INTO users(id,username,username_norm,display_name,role,password_hash,webauthn_user_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)')
             .run(id, body.username, body.username.toLowerCase(), String(body.displayName || body.username).slice(0,80), invite.role, passwordHash, randomToken(32), now, now);
           db.prepare('INSERT INTO user_features(user_id,diary_enabled,onboarded,updated_at) VALUES(?,?,0,?)')
             .run(id, body.diaryEnabled ? 1 : 0, now);
-          db.prepare('UPDATE invitations SET used_at=? WHERE token_hash=?').run(now, invite.token_hash);
         })();
-      } catch { return { status: 409, body: { error: 'username is unavailable' } }; }
+      } catch (e) { return e.raced ? { status: 400, body: { error: 'invitation is invalid or expired' } } : { status: 409, body: { error: 'username is unavailable' } }; }
       const user = db.prepare('SELECT * FROM users WHERE id=?').get(id); audit('invite.accept', id, id);
       return { status: 201, body: { user: publicUser(user), csrfToken: issueSession(req, res, user) } };
     },
@@ -465,7 +467,12 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
     async completeRecovery(body) {
       const row = db.prepare('SELECT * FROM recoveries WHERE token_hash=? AND used_at IS NULL AND expires_at>?').get(digest(body.token || ''), Date.now());
       if (!row) return false; const passwordHash = await createPasswordHash(body.password);
-      db.transaction(() => { db.prepare('UPDATE users SET password_hash=?,updated_at=? WHERE id=?').run(passwordHash, Date.now(), row.user_id); db.prepare('DELETE FROM sessions WHERE user_id=?').run(row.user_id); db.prepare('UPDATE recoveries SET used_at=? WHERE token_hash=?').run(Date.now(), row.token_hash); })();
+      const claimed = db.transaction(() => {
+        if (db.prepare('UPDATE recoveries SET used_at=? WHERE token_hash=? AND used_at IS NULL').run(Date.now(), row.token_hash).changes !== 1) return false;
+        db.prepare('UPDATE users SET password_hash=?,updated_at=? WHERE id=?').run(passwordHash, Date.now(), row.user_id); db.prepare('DELETE FROM sessions WHERE user_id=?').run(row.user_id);
+        return true;
+      })();
+      if (!claimed) return false;
       audit('recovery.complete', row.user_id, row.user_id); return true;
     },
     getAppearance(userId) {
