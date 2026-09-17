@@ -53,7 +53,10 @@ const DIARY_TOKEN = process.env.DIARY_AUTH_TOKEN || '';
 const UI_AUTH_TOKEN = (process.env.UI_AUTH_TOKEN || DIARY_TOKEN).trim();
 const DIST_DIR = path.join(__dirname, '..', 'dist');
 const DATA_DIR = process.env.UI_DATA_DIR || path.join(__dirname, 'ui-data');
-const HISTORY_CAP = 40;
+const HISTORY_CAP = 40; // messages replayed to the model per request
+// The saved transcript is the record, not the model window: keep it whole within generous bounds.
+const STORED_HISTORY_CAP = 5000;
+const STORED_HISTORY_BYTES = 32 * 1024 * 1024;
 const SPAFallbacks = ['/', '/chat', '/diary', '/projects', '/settings'];
 const staticFiles = require('./static-files.cjs').createStaticFiles(DIST_DIR);
 const secretStore = createSecretStore(DATA_DIR);
@@ -4356,10 +4359,12 @@ async function handleRequestScoped(req, res) {
       const spaceId = decodeURIComponent(historyMatch[1]);
       if (req.method === 'GET') return json(res, 200, { history: readHistory(spaceId) });
       if (req.method === 'POST') {
-        const raw = await readBody(req);
+        let raw;
+        try { raw = await readBody(req, STORED_HISTORY_BYTES); }
+        catch (e) { return json(res, e.status || 400, { error: e.status === 413 ? 'This chat is too large to save; start a new chat to keep going.' : 'could not read the chat' }); }
         try {
           const body = JSON.parse(raw);
-          writeHistory(spaceId, Array.isArray(body.history) ? body.history.slice(-HISTORY_CAP) : []);
+          writeHistory(spaceId, Array.isArray(body.history) ? body.history.slice(-STORED_HISTORY_CAP) : []);
           return json(res, 200, { ok: true });
         } catch {
           return json(res, 400, { error: 'invalid JSON' });
