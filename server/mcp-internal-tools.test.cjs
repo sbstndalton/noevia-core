@@ -146,6 +146,8 @@ test('diary_append exists only with the feature port, is a write, and passes onl
   assert.equal(await tools.diary_append.handler({ text: '  a calm walk ', title: 'Walk', timezone: 'Europe/Berlin', day: '2020-01-01', xid: 'x' }, CTX), 'Added a note to the diary for 2026-09-17.');
   assert.deepEqual(appended, [{ text: 'a calm walk', title: 'Walk', timezone: 'Europe/Berlin' }]);
   await assert.rejects(() => tools.diary_append.handler({ text: '   ' }, CTX), /nothing to add/);
+  const queued = harness({ diaryAppend: async () => ({ day: '2026-09-17', queued: true }) }).tools;
+  assert.match(await queued.diary_append.handler({ text: 'x' }, CTX), /write queue/);
   await assert.rejects(() => tools.diary_append.handler({ text: 'x'.repeat(8001) }, CTX), /too long/);
   assert.deepEqual(Object.keys(tools.diary_append.schema.properties), ['text', 'title', 'timezone'], 'no day/xid argument to aim at');
 });

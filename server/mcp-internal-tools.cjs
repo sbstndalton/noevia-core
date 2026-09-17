@@ -107,7 +107,9 @@ function createInternalTools(ports) {
           if (text.length > 8000) throw new Error('that note is too long; keep it under 8000 characters');
           const title = args.title == null ? undefined : String(args.title).trim().slice(0, 80) || undefined;
           const out = await ports.diaryAppend({ text, title, timezone: args.timezone ? String(args.timezone) : undefined });
-          return `Added a note to the diary for ${out.day}.`;
+          return out.queued
+            ? `The note for ${out.day} is saved in the Diary's write queue and will be added when storage accepts writes.`
+            : `Added a note to the diary for ${out.day}.`;
         },
       },
     } : {}),
