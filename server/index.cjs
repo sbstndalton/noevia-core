@@ -75,6 +75,8 @@ const authService = createAuth({
     .map((s) => s.trim())
     .filter(Boolean),
 });
+const features = require('./features.cjs').createFeatures({ store: require('./features.cjs').settingsStore(authService.db), audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) });
+const featureRoutes = require('./routes/features.cjs').createFeatureRoutes({ features, json, readJson });
 const davConfig = require('./dav-settings.cjs').configuration(process.env, authService.origin);
 const davSettings = require('./dav-settings.cjs').createDavSettings({ auth: authService, config: davConfig });
 if (process.env.LEMONADE_BASE_URL && !process.env.INFERENCE_BASE_URL) console.warn('LEMONADE_BASE_URL is deprecated; use INFERENCE_BASE_URL');
@@ -2766,6 +2768,7 @@ async function handleRequestScoped(req, res) {
     if (authn && !['GET', 'HEAD', 'OPTIONS'].includes(req.method || 'GET') && (!authService.originValid(req) || !authService.csrfValid(req, authn))) {
       return json(res, 403, { error: 'invalid CSRF token' });
     }
+    if (authn && await featureRoutes(req, res, { path: p, authn })) return;
     if(p==='/api/profile/diary-connectors' && req.method==='GET')return json(res,200,{connectors:diaryConnectors.list(authn.user.id)});
     if(p==='/api/profile/diary-connectors' && req.method==='POST')return json(res,201,diaryConnectors.create(authn.user.id,(await readJson(req)).name));
     const revokeConnector=p.match(/^\/api\/profile\/diary-connectors\/([a-f0-9]{32})$/);

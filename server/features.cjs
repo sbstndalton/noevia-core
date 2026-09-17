@@ -1,0 +1,74 @@
+'use strict';
+// One registry for optional capabilities (master-prompt § Decisions). Every feature is off
+// unless an operator env var or an admin setting turns it on. An env var, when set, is
+// authoritative and locks the admin toggle, so a deployment can pin a feature either way.
+// Values are read once at creation and cached; admin changes update the cache.
+
+const REGISTRY = Object.freeze({
+  previews: { env: 'NOEVIA_FEATURE_PREVIEWS', label: 'Preview surfaces', description: 'Show the unbuilt Scheduled, Plugins, Explore and Code previews.' },
+  diaryMcpWrite: { env: 'NOEVIA_FEATURE_DIARY_MCP_WRITE', label: 'Diary append tool', description: 'Offer an approval-gated, append-only Diary tool through the in-app MCP server.' },
+  deepResearch: { env: 'NOEVIA_FEATURE_DEEP_RESEARCH', label: 'Deep research', description: 'Administrators can run bounded research jobs that save a cited report to a project.' },
+  offsiteBackup: { env: 'NOEVIA_FEATURE_OFFSITE_BACKUP', label: 'Off-site backups', description: 'Encrypted snapshots to an S3-compatible target the operator configures.' },
+  kiwix: { env: 'NOEVIA_FEATURE_KIWIX', label: 'Offline Wikipedia', description: 'A read-only lookup tool backed by an internal kiwix-serve.' },
+});
+
+const SETTING_PREFIX = 'feature:';
+
+function parseEnv(raw) {
+  if (raw === undefined || raw === null || String(raw).trim() === '') return undefined;
+  const value = String(raw).trim().toLowerCase();
+  if (['1', 'true', 'on', 'yes'].includes(value)) return true;
+  if (['0', 'false', 'off', 'no'].includes(value)) return false;
+  throw new Error(`Invalid boolean in feature env var: expected true/false`);
+}
+
+/**
+ * @param {{ env?: Record<string,string|undefined>, store?: { get(key:string): string|undefined, set(key:string, value:string): void },
+ *           audit?: (action:string, actor:string, detail:object)=>void, registry?: object }} deps
+ */
+function createFeatures({ env = process.env, store = null, audit = () => {}, registry = REGISTRY } = {}) {
+  const state = new Map();
+  for (const [name, spec] of Object.entries(registry)) {
+    const fromEnv = parseEnv(env[spec.env]);
+    let value = false;
+    let source = 'default';
+    if (fromEnv !== undefined) { value = fromEnv; source = 'env'; }
+    else {
+      const saved = store?.get(SETTING_PREFIX + name);
+      if (saved === 'true' || saved === 'false') { value = saved === 'true'; source = 'admin'; }
+    }
+    state.set(name, { value, source });
+  }
+  const known = name => state.has(name);
+  return {
+    names: () => [...state.keys()],
+    enabled(name) {
+      if (!known(name)) throw new Error(`Unknown feature: ${name}`);
+      return state.get(name).value;
+    },
+    /** Booleans only: safe to send to any signed-in user. */
+    flags: () => Object.fromEntries([...state].map(([name, s]) => [name, s.value])),
+    describe: () => [...state].map(([name, s]) => ({ name, label: registry[name].label, description: registry[name].description,
+      enabled: s.value, source: s.source, locked: s.source === 'env', env: registry[name].env })),
+    set(name, enabled, actorId) {
+      if (!known(name)) throw Object.assign(new Error('Unknown feature'), { status: 404 });
+      if (typeof enabled !== 'boolean') throw Object.assign(new Error('enabled must be true or false'), { status: 400 });
+      if (state.get(name).source === 'env') throw Object.assign(new Error(`Set by the operator (${registry[name].env}); change it in the deployment configuration.`), { status: 409 });
+      if (!store) throw Object.assign(new Error('Feature settings are not persistent here'), { status: 409 });
+      store.set(SETTING_PREFIX + name, String(enabled));
+      state.set(name, { value: enabled, source: 'admin' });
+      audit('feature.set', actorId, { name, enabled });
+      return enabled;
+    },
+  };
+}
+
+/** The auth database's key/value settings table as a feature store. */
+function settingsStore(db) {
+  return {
+    get: key => db.prepare('SELECT value FROM settings WHERE key=?').get(key)?.value,
+    set: (key, value) => db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run(key, value),
+  };
+}
+
+module.exports = { REGISTRY, createFeatures, settingsStore, parseEnv };
