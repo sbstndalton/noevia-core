@@ -71,6 +71,11 @@ function createRateLimiter({ sweepMs = 60 * 1000, maxEntries = 10000 } = {}) {
       current.count += 1;
       return current.count > limit;
     },
+    /** Whether `key` is over `limit` in its current window, without counting this call. */
+    blocked(key, limit = 5) {
+      const current = map.get(key);
+      return !!current && current.reset > Date.now() && current.count > limit;
+    },
     size: () => map.size,
   };
 }
@@ -362,9 +367,13 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
     async passwordLogin(req, res, body) {
       const address = clientAddress(req, trustProxy);
       const key = `login:${address}:${String(body.username || '').toLowerCase()}`;
-      // Per address across all usernames too, so one client cannot spray passwords over many accounts.
-      if (rateLimited(`login-address:${address}`, 30) || rateLimited(key)) return { status: 429, body: { error: 'sign-in failed' } };
+      // Probing many usernames from one address (password spraying, enumeration) blocks that address.
+      // Only attempts on usernames that do not exist count, because a whole household can share one
+      // address behind a tunnel; once blocked, every attempt from it gets the same answer.
+      const probes = `login-unknown:${address}`;
+      if (rate.blocked(probes, 30) || rateLimited(key)) return { status: 429, body: { error: 'sign-in failed' } };
       const row = db.prepare('SELECT * FROM users WHERE username_norm=?').get(String(body.username || '').toLowerCase());
+      if (!row) rateLimited(probes, 30);
       // Always pay for one Argon2 verification, so response time doesn't reveal whether a username exists.
       const usable = row && !row.disabled_at;
       const ok = await verify(usable ? row.password_hash : await timingHash(), String(body.password || '')).catch(() => false) && usable;

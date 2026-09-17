@@ -33,6 +33,15 @@ test('a wrong password for an unknown username costs the same password hashing a
   assert.ok(median(unknown) > median(known) * 0.4, `unknown ${median(unknown).toFixed(2)} ms vs known ${median(known).toFixed(2)} ms reveals which usernames exist`);
 });
 
+test('ordinary sign-ins from a shared address (tunnel) are not throttled together', async (t) => {
+  const auth = await fixture(t);
+  const owner = auth.listUsers()[0].id;
+  for (let u = 0; u < 8; u++) await auth.acceptInvite(request(`10.9.0.${u}`), response(), { token: auth.createInvite(owner).token, username: `member${u}`, password: 'synthetic member password' });
+  const statuses = [];
+  for (let round = 0; round < 4; round++) for (let u = 0; u < 8; u++) statuses.push((await auth.passwordLogin(request('172.18.0.2'), response(), { username: `member${u}`, password: 'synthetic member password' })).status);
+  assert.deepEqual([...new Set(statuses)], [200], 'household members behind one tunnel address were locked out');
+});
+
 test('one address cannot spray passwords across many usernames', async (t) => {
   const auth = await fixture(t);
   const statuses = [];
