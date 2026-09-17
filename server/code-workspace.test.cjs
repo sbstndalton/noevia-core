@@ -158,3 +158,49 @@ test('claims from an earlier process are interrupted, never silently reused', ()
   assert.equal(fs.existsSync(recovered[0].path), true);
   assert.equal(afterRestart.recover().length, 0, 'recovery is idempotent');
 });
+
+test('worktrees can live on a shared root, at one path both containers see', () => {
+  // The harness runs in another container, so it must see the worktree at the SAME absolute
+  // path noevia sends it. That means a shared volume, not the tenant's own directory.
+  const repo = repoWith();
+  const dir = temp('noevia-ws-');
+  const shared = temp('noevia-shared-');
+  const ws = createCodeWorkspaces({ dir, treeRoot: shared, epoch: 'test' });
+  const claim = ws.claim({ taskId: ids(1), repoPath: repo });
+  assert.equal(path.dirname(claim.path), fs.realpathSync(shared), 'the tree is on the shared root');
+  assert.ok(fs.existsSync(path.join(claim.path, 'a.txt')));
+  // The ownership record stays tenant-side: the shared volume holds work, not who owns what.
+  assert.ok(fs.existsSync(path.join(dir, 'code-workspaces', ids(1) + '.json')));
+  assert.equal(ws.contains(ids(1), path.join(claim.path, 'new.txt')), true);
+  assert.equal(ws.contains(ids(1), path.join(shared, 'elsewhere', 'x.txt')), false, 'a sibling task’s tree is still outside');
+  ws.release({ taskId: ids(1) });
+  assert.equal(fs.existsSync(claim.path), false);
+});
+
+test('a new worktree is handed to the user the harness runs as', () => {
+  const repo = repoWith();
+  const dir = temp('noevia-ws-');
+  const handed = [];
+  const ws = createCodeWorkspaces({ dir, owner: { uid: 1000, gid: 1000 }, epoch: 'test',
+    chown: (target, uid, gid) => handed.push([path.basename(target), uid, gid]) });
+  const claim = ws.claim({ taskId: ids(1), repoPath: repo });
+  assert.deepEqual(handed, [[ids(1), 1000, 1000]], 'noevia runs as root and the sandbox does not');
+  assert.ok(claim.path);
+});
+
+test('a workspace that cannot be handed over is a failed claim, not a silent one', () => {
+  // Better to refuse the task than to start a harness that cannot write the tree it was given.
+  const repo = repoWith();
+  const dir = temp('noevia-ws-');
+  const ws = createCodeWorkspaces({ dir, owner: { uid: 1000, gid: 1000 }, epoch: 'test',
+    chown: () => { throw new Error('EPERM: operation not permitted'); } });
+  assert.throws(() => ws.claim({ taskId: ids(1), repoPath: repo }), /Could not hand the workspace/);
+});
+
+test('without an owner nothing is chowned', () => {
+  const repo = repoWith();
+  const handed = [];
+  const ws = createCodeWorkspaces({ dir: temp('noevia-ws-'), epoch: 'test', chown: () => handed.push(1) });
+  ws.claim({ taskId: ids(1), repoPath: repo });
+  assert.deepEqual(handed, [], 'a deployment with no separate sandbox user has nothing to hand over');
+});

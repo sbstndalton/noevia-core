@@ -23,14 +23,26 @@ function defaultRun(args, cwd) {
 }
 
 /**
- * @param {{dir: string, run?: (args: string[], cwd?: string) => string, now?: () => number,
- *          epoch?: string}} deps `epoch` identifies this process: claims from an earlier one
- *          are reported as interrupted rather than silently reused.
+ * @param {{dir: string, treeRoot?: string|null, owner?: {uid: number, gid: number}|null,
+ *          run?: (args: string[], cwd?: string) => string, now?: () => number, epoch?: string,
+ *          chown?: (target: string, uid: number, gid: number) => void}} deps
+ *
+ * `treeRoot` puts the worktrees somewhere other than the tenant's own directory. That matters
+ * for the sandbox: the harness runs in a different container and must see the worktree at the
+ * SAME absolute path, which means a shared volume mounted identically in both. The ownership
+ * records stay tenant-side either way — only the working trees move.
+ *
+ * `owner` hands each new worktree to the uid the sandbox runs as. noevia runs as root and the
+ * sandbox deliberately does not, so without this the harness cannot write the tree it was
+ * given. `epoch` identifies this process: claims from an earlier one are reported as
+ * interrupted rather than silently reused.
  */
-function createCodeWorkspaces({ dir, run = defaultRun, now = Date.now, epoch = String(process.pid) } = {}) {
+function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaultRun,
+  now = Date.now, epoch = String(process.pid), chown = defaultChown } = {}) {
   const root = path.join(dir, 'code-workspaces');
+  const trees = treeRoot || root;
   const recordFile = (taskId) => path.join(root, taskId + '.json');
-  const treeDir = (taskId) => path.join(root, taskId);
+  const treeDir = (taskId) => path.join(trees, taskId);
 
   const checkId = (taskId) => {
     if (!TASK_ID.test(String(taskId || ''))) throw Object.assign(Error('Invalid task id'), { status: 400 });
@@ -77,9 +89,14 @@ function createCodeWorkspaces({ dir, run = defaultRun, now = Date.now, epoch = S
 
     const tree = treeDir(id);
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+    if (trees !== root) fs.mkdirSync(trees, { recursive: true, mode: 0o755 });
     // -B so a branch left behind by an earlier, released task does not block a new one; the
     // worktree path itself must be new, which `git worktree add` enforces.
     run(['worktree', 'add', '-B', name, tree], repo);
+    // Hand it to whoever runs the harness. Done after the worktree exists so git's own files
+    // (including .git) are covered, and best-effort: a deployment without a separate sandbox
+    // user has nothing to hand over.
+    if (owner) { try { chown(tree, owner.uid, owner.gid); } catch (e) { throw Object.assign(Error(`Could not hand the workspace to the harness user: ${e.message}`), { status: 500 }); } }
     return write({ taskId: id, repo, branch: name, path: fs.realpathSync(tree), status: 'held',
       capabilities: [...capabilities], domains: [...domains], epoch, claimedAt: now() });
   }
@@ -142,4 +159,15 @@ function createCodeWorkspaces({ dir, run = defaultRun, now = Date.now, epoch = S
   return { claim, release, recover, contains, get: read, list, root, BRANCH_PREFIX };
 }
 
-module.exports = { createCodeWorkspaces, BRANCH_PREFIX };
+/** Recursive chown, so the harness owns the tree and git's own files inside it. */
+function defaultChown(target, uid, gid) {
+  const walk = (entry) => {
+    fs.lchownSync(entry, uid, gid);
+    let stat; try { stat = fs.lstatSync(entry); } catch { return; }
+    if (!stat.isDirectory()) return;
+    for (const name of fs.readdirSync(entry)) walk(path.join(entry, name));
+  };
+  walk(target);
+}
+
+module.exports = { createCodeWorkspaces, defaultChown, BRANCH_PREFIX };

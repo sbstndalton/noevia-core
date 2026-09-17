@@ -36,10 +36,23 @@ socket. `docs/research-master-container.md` recorded a socket holder reachable w
 authentication as the highest-severity finding open on this deployment. A sidecar on an internal
 network gives the same isolation and adds no such power.
 
+## Two things staging this proved
+
+Both were found by building the image on DaServer and running the escape probes against it,
+before any harness run:
+
+- **The worktrees must be on the shared volume**, not in the tenant's state directory. noevia
+  sends an absolute path and the supervisor resolves that same path, so they have to be the same
+  path: one volume, one mount point, both containers. `CODE_WORKSPACE_ROOT` does this.
+- **A fresh worktree is root-owned and the sandbox is not root**, so the harness could not write
+  the tree it was given (`write /workspaces: Permission denied` in the probes).
+  `CODE_HARNESS_USER=1000:1000` hands each worktree over as it is created, and a handover that
+  fails refuses the task rather than starting a harness that cannot work.
+
 ## Running it
 
-Built and started only with the `code` profile; see the override file's header for the two
-environment variables the web container needs. `CODE_HARNESS_ENDPOINT` takes precedence over
+Built and started only with the `code` profile; see the override file's header for the
+environment the web container needs. `CODE_HARNESS_ENDPOINT` takes precedence over
 `CODE_HARNESS_COMMAND`, so a deployment that has a sandbox cannot silently fall back to running
 the agent beside noevia's own state.
 

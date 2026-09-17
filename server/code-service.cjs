@@ -73,7 +73,8 @@ function view(job, pending = null) {
  */
 function createCodeService({ repos, connect, egress = null, now = Date.now, log = () => {},
   timeoutMs = APPROVAL_TIMEOUT_MS, sandboxKind = process.env.CODE_HARNESS_ENDPOINT ? 'sandbox' : 'spawn',
-  harnesses = defaultHarnesses() }) {
+  harnesses = defaultHarnesses(), treeRoot = process.env.CODE_WORKSPACE_ROOT || null,
+  harnessUser = parseUser(process.env.CODE_HARNESS_USER) }) {
   const repositories = Array.isArray(repos) ? repos : parseRepos(repos);
   // Approvals live in memory on purpose, exactly as the chat gate does: a decision that
   // outlives the request it belongs to is not a decision, and a restart must re-ask.
@@ -85,7 +86,10 @@ function createCodeService({ repos, connect, egress = null, now = Date.now, log 
     if (!store) {
       store = createJobs({ dir: workspace.dir, kinds: ['code'], maxJobs: 50, retainMs: 14 * 86400000, now });
       store.recover();
-      const workspaces = createCodeWorkspaces({ dir: workspace.dir, now });
+      // With a sandbox the worktrees live on a volume mounted at the same path in both
+      // containers, and are handed to the uid the harness runs as (noevia runs as root; the
+      // sandbox deliberately does not).
+      const workspaces = createCodeWorkspaces({ dir: workspace.dir, treeRoot, owner: harnessUser, now });
       workspaces.recover();
       const harness = createCodeHarness({ jobs: store, workspaces, egress, log, now, askApproval });
       store = { jobs: store, workspaces, harness };
@@ -188,10 +192,16 @@ function createCodeService({ repos, connect, egress = null, now = Date.now, log 
   };
 }
 
+/** `CODE_HARNESS_USER=1000:1000` — who the sandbox runs as, so a worktree can be handed over. */
+function parseUser(raw) {
+  const match = /^(\d{1,7}):(\d{1,7})$/.exec(String(raw || '').trim());
+  return match ? { uid: Number(match[1]), gid: Number(match[2]) } : null;
+}
+
 /** What this deployment runs. One entry today; the sandbox pins its version at build time. */
 function defaultHarnesses(env = process.env) {
   const id = String(env.CODE_HARNESS_NAME || 'opencode').trim() || 'opencode';
   return [{ id, label: id === 'opencode' ? 'OpenCode' : id, version: env.CODE_HARNESS_VERSION || null }];
 }
 
-module.exports = { createCodeService, parseRepos, view, defaultHarnesses, GRANTABLE, DEFAULT_CAPABILITIES, PROMPT_PREPARATION, APPROVAL_TIMEOUT_MS };
+module.exports = { createCodeService, parseRepos, view, defaultHarnesses, parseUser, GRANTABLE, DEFAULT_CAPABILITIES, PROMPT_PREPARATION, APPROVAL_TIMEOUT_MS };

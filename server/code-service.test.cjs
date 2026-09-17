@@ -207,3 +207,12 @@ test('the deployment names its harness, and whether it is sandboxed', () => {
   const { svc: sandboxed } = service({ sandboxKind: 'sandbox' });
   assert.equal(sandboxed.sandboxed(), true);
 });
+
+test('the harness user is read only in the form that can be acted on', () => {
+  const { parseUser } = require('./code-service.cjs');
+  assert.deepEqual(parseUser('1000:1000'), { uid: 1000, gid: 1000 });
+  assert.deepEqual(parseUser(' 65534:65534 '), { uid: 65534, gid: 65534 });
+  for (const bad of ['1000', 'node:node', '', undefined, '-1:0', '1000:1000:1000', '99999999:1']) {
+    assert.equal(parseUser(bad), null, JSON.stringify(bad));
+  }
+});
