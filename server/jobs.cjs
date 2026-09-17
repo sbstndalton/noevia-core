@@ -25,8 +25,8 @@ function derive(events) {
       case 'approval.decided': job.pendingApproval = null; if (!TERMINAL.has(job.status)) job.status = 'running'; break;
       case 'tool.uncertain': job.uncertain.push(d); break;
       case 'artifact.created': job.artifacts.push(d); break;
-      case 'plan.proposed': case 'plan.edited': job.plan = { status: e.type.slice(5), subQuestions: d.subQuestions || [] }; break;
-      case 'plan.skipped': job.plan = { status: 'skipped', subQuestions: [] }; break;
+      case 'plan.proposed': case 'plan.edited': job.plan = { status: e.type.slice(5), question: d.question ?? null, subQuestions: d.subQuestions || [] }; break;
+      case 'plan.skipped': job.plan = { status: 'skipped', question: d.question ?? null, subQuestions: [] }; break;
       case 'checkpoint.created': job.checkpoint = d; break;
       case 'job.completed': job.status = 'completed'; job.result = d.result ?? null; job.pendingApproval = null; break;
       case 'job.failed': job.status = 'failed'; job.error = d.error ?? 'failed'; job.result = d.result ?? null; job.pendingApproval = null; break;

@@ -65,8 +65,8 @@ function createResearchRunner({ jobs, search, extract, projectRetrieve = async (
     if (!q) throw readable('Write a research question first.');
     const id = jobs.create({ kind: 'deep_research', projectId, capabilities: ['web.read', 'project.sources.read'] });
     const questions = subQuestions?.length ? subQuestions : [q];
-    if (plan === 'proposed' || plan === 'edited') jobs.append(id, `plan.${plan}`, { subQuestions: questions });
-    else jobs.append(id, 'plan.skipped');
+    if (plan === 'proposed' || plan === 'edited') jobs.append(id, `plan.${plan}`, { question: q, subQuestions: questions });
+    else jobs.append(id, 'plan.skipped', { question: q });
     const done = jobs.run(id, async (ctx) => {
       const registry = rs.createRegistry();
       const budget = { webCalls: 0, deadline: now() + cfg.maxMs };

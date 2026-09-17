@@ -48,7 +48,7 @@ test('a completed job saves the report and sources as project files, once', asyn
   const started = await service.start(workspace, project, { question: 'What is the Zephyr cell?', plan: 'edited', subQuestions: ['What is the Zephyr cell?', 'Energy?'] });
   const job = await settle(service, workspace, project, started.id);
   assert.equal(job.status, 'completed');
-  assert.deepEqual(job.plan, { status: 'edited', subQuestions: ['What is the Zephyr cell?', 'Energy?'] });
+  assert.deepEqual(job.plan, { status: 'edited', question: 'What is the Zephyr cell?', subQuestions: ['What is the Zephyr cell?', 'Energy?'] });
   assert.deepEqual(saved.map((f) => f.name), ['Research 2026-09-17 what-is-the-zephyr-cell.md', 'Research 2026-09-17 what-is-the-zephyr-cell.sources.json']);
   assert.match(saved[0].text, /410 Wh per kilogram \[1\]/);
   assert.equal(JSON.parse(saved[1].text).sources[0].url, 'https://fixture.test/z');
