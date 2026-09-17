@@ -6,12 +6,12 @@ const fs = require('node:fs'), path = require('node:path'), crypto = require('no
 
 const TYPES = new Set(['job.created', 'job.started', 'step.started', 'step.completed', 'progress', 'approval.requested',
   'approval.decided', 'tool.started', 'tool.completed', 'tool.uncertain', 'artifact.created', 'checkpoint.created',
-  'job.completed', 'job.failed', 'job.cancelled', 'job.interrupted']);
+  'job.completed', 'job.failed', 'job.cancelled', 'job.interrupted', 'plan.proposed', 'plan.edited', 'plan.skipped']);
 const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
 
 function derive(events) {
   const job = { id: null, kind: null, projectId: null, parentId: null, capabilities: [], status: 'queued', stage: null,
-    steps: [], artifacts: [], checkpoint: null, pendingApproval: null, uncertain: [], result: null, error: null, createdAt: null, updatedAt: null };
+    steps: [], artifacts: [], plan: null, checkpoint: null, pendingApproval: null, uncertain: [], result: null, error: null, createdAt: null, updatedAt: null };
   for (const e of events) {
     job.updatedAt = e.at;
     const d = e.data || {};
@@ -25,10 +25,12 @@ function derive(events) {
       case 'approval.decided': job.pendingApproval = null; if (!TERMINAL.has(job.status)) job.status = 'running'; break;
       case 'tool.uncertain': job.uncertain.push(d); break;
       case 'artifact.created': job.artifacts.push(d); break;
+      case 'plan.proposed': case 'plan.edited': job.plan = { status: e.type.slice(5), subQuestions: d.subQuestions || [] }; break;
+      case 'plan.skipped': job.plan = { status: 'skipped', subQuestions: [] }; break;
       case 'checkpoint.created': job.checkpoint = d; break;
       case 'job.completed': job.status = 'completed'; job.result = d.result ?? null; job.pendingApproval = null; break;
       case 'job.failed': job.status = 'failed'; job.error = d.error ?? 'failed'; job.result = d.result ?? null; job.pendingApproval = null; break;
-      case 'job.cancelled': job.status = 'cancelled'; job.pendingApproval = null; break;
+      case 'job.cancelled': job.status = 'cancelled'; job.result = d.result ?? null; job.pendingApproval = null; break;
       case 'job.interrupted': job.status = 'interrupted'; job.error = d.reason ?? 'interrupted'; job.pendingApproval = null; break;
       default: break;
     }
@@ -52,7 +54,10 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
     if (!TYPES.has(type)) throw Error(`Unknown job event type: ${type}`);
     const current = events(id);
     if (!current.length && type !== 'job.created') throw Object.assign(Error('No such job'), { status: 404 });
-    if (current.length && TERMINAL.has(derive(current).status)) throw Object.assign(Error('Job already finished'), { status: 409 });
+    // One exception: a partial result the user explicitly saves after a cancel is recorded on the
+    // cancelled job (spec-deep-research §4 — never saved automatically).
+    const finished = current.length ? derive(current) : null;
+    if (finished && TERMINAL.has(finished.status) && !(type === 'artifact.created' && finished.status === 'cancelled')) throw Object.assign(Error('Job already finished'), { status: 409 });
     const event = { job: id, seq: current.length + 1, type, at: now(), data };
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
     fs.appendFileSync(file(id), JSON.stringify(event) + '\n', { mode: 0o600 });
@@ -85,7 +90,9 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
     controllers.set(id, controller);
     append(id, 'job.started');
     const ctx = {
+      id,
       signal: controller.signal,
+      event: (type, data) => append(id, type, data),
       progress: (stage) => { if (!controller.signal.aborted) append(id, 'progress', { stage }); },
       checkpoint: (data) => append(id, 'checkpoint.created', data),
       artifact: (data) => append(id, 'artifact.created', data),
@@ -93,7 +100,7 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
     };
     try {
       const result = await work(ctx);
-      if (controller.signal.aborted) append(id, 'job.cancelled');
+      if (controller.signal.aborted) append(id, 'job.cancelled', result === undefined ? {} : { result });
       else append(id, 'job.completed', { result });
     } catch (error) {
       if (controller.signal.aborted) append(id, 'job.cancelled');
@@ -115,7 +122,7 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
     let count = 0;
     for (const id of ids()) {
       const job = get(id);
-      if (!job || TERMINAL.has(job.status) || controllers.has(id)) continue;
+      if (!job || TERMINAL.has(job.status) || controllers.has(id) || (kinds && !kinds.includes(job.kind))) continue;
       append(id, 'job.interrupted', { reason: job.status === 'waiting_approval' ? 'The server restarted while waiting for approval; start again to be asked again.' : 'The server restarted before this finished.' });
       count++;
     }

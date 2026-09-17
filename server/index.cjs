@@ -750,6 +750,27 @@ function pruneDocuments(project) {
   try { require('./uploads.cjs').prune(workspace, workspace.projects.includes(project) ? project : { id: project.id, files: [] }); }
   catch (err) { console.warn('[uploads] cleanup failed:', err.message); }
 }
+// One write path for server-authored project text files (MCP writes, research reports), the
+// same one a browser upload takes: the file lands in the project's storage folder and is
+// re-indexed identically.
+function writeProjectTextFile(project, name, text) {
+  return withSourceLock(project, async () => {
+    if (getProject(project.id) !== project) throw new Error('the project changed while writing; nothing was saved');
+    const uploads = require('./uploads.cjs');
+    const bytes = Buffer.from(text, 'utf8');
+    uploads.validate(name, bytes);
+    const connection = authService.getStorage(currentWorkspace().userId, true);
+    const remote = storageClient.isBrowsable(connection) ? connection : null;
+    if (remote && !project.projectFolder) project.projectFolder = await ensureProjectFolder(project);
+    const file = await uploads.ingest(currentWorkspace(), project, name, bytes, { connection: remote });
+    if (remote) project.sourceFolders = [...new Set([...(project.sourceFolders || []), project.projectFolder])];
+    project.files = [...(project.files || []).filter((f) => f.name !== file.name), file];
+    project.updatedAt = Date.now();
+    indexSource(project, file);
+    saveProjects(PROJECTS);
+    return file;
+  });
+}
 const projectSweep = require('./project-sweep.cjs').createProjectSweep({ storage: storageClient, log: event => console.log('[projects]', JSON.stringify(event)) });
 // D8: runs after the delete is saved; empty-only, tenant-scoped, never recursive.
 function sweepDeletedProject(project) {
@@ -1389,6 +1410,43 @@ function toolboxOffered(id) {
   // deployment that named only MCP boxes should not lose the clock.
   if (id === 'core') return true;
   return !ENABLED_TOOLBOXES || ENABLED_TOOLBOXES.has(id);
+}
+
+// ── Deep research (D12): module in research-service.cjs, routes in routes/research.cjs ──
+const researchRoutes = require('./routes/research.cjs').createResearchRoutes({
+  features, getProject, workspace: () => currentWorkspace(), json, readJson,
+  available: () => {
+    if (!toolboxOffered('web-search') || !mcpState.tools.has('tavily_search') || !mcpState.tools.has('tavily_extract')) return 'Deep research needs the web-search toolbox (tavily_search and tavily_extract) on this server.';
+    if (!researchModel()) return 'Pick a Smart model for Auto routing, or load a model, before starting research.';
+    return null;
+  },
+  service: require('./research-service.cjs').createResearchService({
+    saveFile: (project, name, text) => writeProjectTextFile(project, name, text),
+    tools: (workspace, project) => ({
+      complete: async (messages, { signal, maxTokens }) => {
+        const provider = getProvider(DEFAULT_PROVIDER_ID), model = researchModel(project);
+        const r = await fetch(`${provider.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`, { method: 'POST', redirect: 'error',
+          headers: providerHeaders(provider, { 'Content-Type': 'application/json' }), signal: AbortSignal.any([signal, AbortSignal.timeout(120000)]),
+          body: JSON.stringify({ model, stream: false, max_tokens: maxTokens, messages }) });
+        if (!r.ok) throw Object.assign(Error(`The model provider answered ${r.status}.`), { publicMessage: `The model provider answered ${r.status}.` });
+        const choice = (await r.json()).choices?.[0];
+        if (choice?.finish_reason === 'length') throw Object.assign(Error('A research step was cut off by the output limit.'), { publicMessage: 'A research step was cut off by the output limit.' });
+        return String(choice?.message?.content || '');
+      },
+      search: async (query) => require('./routes/research.cjs').parseSearchResults(await executeMcpToolCall('tavily_search', { query, max_results: 5 })),
+      extract: async (url) => {
+        const text = await executeMcpToolCall('tavily_extract', { urls: [url] });
+        if (/^ERROR/.test(text)) throw Error(text);
+        return text;
+      },
+      projectRetrieve: async (question) => rag.ragAvailable()
+        ? (await rag.searchProject(project.id, question, workspace.userId)).slice(0, 5).map((h) => ({ file: h.file, text: h.body }))
+        : [],
+    }),
+  }),
+});
+function researchModel(project) {
+  return autoRoles()?.smart || project?.model || LAST_LOADED_MODEL || null;
 }
 
 // noevia's own capabilities, offered over the same MCP path as everything
@@ -2784,6 +2842,7 @@ async function handleRequestScoped(req, res) {
       return json(res, 403, { error: 'invalid CSRF token' });
     }
     if (authn && await featureRoutes(req, res, { path: p, authn })) return;
+    if (authn && p.startsWith('/api/projects/') && await researchRoutes(req, res, { path: p, authn })) return;
     if(p==='/api/profile/diary-connectors' && req.method==='GET')return json(res,200,{connectors:diaryConnectors.list(authn.user.id)});
     if(p==='/api/profile/diary-connectors' && req.method==='POST')return json(res,201,diaryConnectors.create(authn.user.id,(await readJson(req)).name));
     const revokeConnector=p.match(/^\/api\/profile\/diary-connectors\/([a-f0-9]{32})$/);
@@ -4406,22 +4465,7 @@ if (require.main === module) {
       // One write path, the same one a browser upload takes: the file lands in
       // the project's storage folder and is re-indexed identically, rather
       // than a second kind of file that only the model can make.
-      writeTextFile: (project, name, text) => withSourceLock(project, async () => {
-        if (getProject(project.id) !== project) throw new Error('the project changed while writing; nothing was saved');
-        const uploads = require('./uploads.cjs');
-        const bytes = Buffer.from(text, 'utf8');
-        uploads.validate(name, bytes);
-        const connection = authService.getStorage(currentWorkspace().userId, true);
-        const remote = storageClient.isBrowsable(connection) ? connection : null;
-        if (remote && !project.projectFolder) project.projectFolder = await ensureProjectFolder(project);
-        const file = await uploads.ingest(currentWorkspace(), project, name, bytes, { connection: remote });
-        if (remote) project.sourceFolders = [...new Set([...(project.sourceFolders || []), project.projectFolder])];
-        project.files = [...(project.files || []).filter((f) => f.name !== file.name), file];
-        project.updatedAt = Date.now();
-        indexSource(project, file);
-        saveProjects(PROJECTS);
-        return file;
-      }),
+      writeTextFile: writeProjectTextFile,
     });
     const internalServer = mcpInternal.startInternalServer({
       port: MCP_INTERNAL_PORT,

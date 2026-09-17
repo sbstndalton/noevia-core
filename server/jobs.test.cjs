@@ -91,3 +91,18 @@ test('a store scoped to its kinds never prunes another kind sharing the director
     assert.equal(research.get(kept).status, 'completed', 'other kind untouched');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('recover is scoped to the store kinds: another store in the same directory cannot interrupt a running job', async (t) => {
+  const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-jobs-kinds-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const { createJobs } = require('./jobs.cjs');
+  const research = createJobs({ dir, kinds: ['deep_research'] });
+  const id = research.create({ kind: 'deep_research' });
+  let release;
+  const done = research.run(id, () => new Promise((r) => { release = r; }));
+  const sources = createJobs({ dir, kinds: ['source'] });
+  assert.equal(sources.recover(), 0);
+  release('ok');
+  assert.equal((await done).status, 'completed');
+});
