@@ -84,7 +84,17 @@ const features = require('./features.cjs').createFeatures({ store: require('./fe
 const featureRoutes = require('./routes/features.cjs').createFeatureRoutes({ features, json, readJson });
 // Settings → Data: the signed-in user's conversations as a ZIP (routes/export.cjs).
 const exportRoutes = require('./routes/export.cjs').createExportRoutes({ json, workspace: () => ({ freeChats: Array.from(FREE_CHATS), projects: PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)) }), readHistory: (id) => readHistory(id), audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) });
-const accountRoutes = require('./routes/account.cjs').createAccountRoutes({ json, readJson, dir: () => currentWorkspace().dir });
+const retentionLists = () => ({ freeChats: Array.from(FREE_CHATS), projects: PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)) });
+const removeRetainedChat = ({ projectId, id }) => (projectId ? deleteChat(projectId, id) : deleteFreeChat(id));
+const accountRoutes = require('./routes/account.cjs').createAccountRoutes({ json, readJson, dir: () => currentWorkspace().dir, chatLists: retentionLists, removeChat: removeRetainedChat });
+// Delete-old-chats sweep (chat-retention.cjs): runs as the user's workspace loads, at most hourly.
+function sweepRetention() {
+  const retention = require('./chat-retention.cjs');
+  const dir = currentWorkspace().dir, settings = retention.read(dir);
+  if (!retention.sweepDue(settings)) return;
+  for (const chat of retention.expired({ ...retentionLists(), days: settings.days })) removeRetainedChat(chat);
+  retention.markSwept(dir);
+}
 const importRoutes = require('./routes/import.cjs').createImportRoutes({
   json, readBody: (req, limit) => readBody(req, limit), newId: () => `c-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
   audit: (action, actor, detail) => authService.audit(action, actor, actor, detail),
@@ -3241,6 +3251,7 @@ async function handleRequestScoped(req, res) {
     }
 
     if (p === '/api/workspace') {
+      try { sweepRetention(); } catch (e) { console.warn('[retention] sweep failed:', e?.message || e); }
       // PROJECTS is served raw everywhere else; here it crosses to the client,
       // so chats[] must be sanitized exactly as loadChats does.
       return json(res, 200, {
