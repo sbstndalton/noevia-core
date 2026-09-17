@@ -82,6 +82,8 @@ const authService = createAuth({
 });
 const features = require('./features.cjs').createFeatures({ store: require('./features.cjs').settingsStore(authService.db), audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) });
 const featureRoutes = require('./routes/features.cjs').createFeatureRoutes({ features, json, readJson });
+// Settings → Data: the signed-in user's conversations as a ZIP (routes/export.cjs).
+const exportRoutes = require('./routes/export.cjs').createExportRoutes({ json, workspace: () => ({ freeChats: Array.from(FREE_CHATS), projects: PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)) }), readHistory: (id) => readHistory(id), audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) });
 const offsiteBackup = require('./offsite-service.cjs').createOffsiteService({ features, dataDir: DATA_DIR, log: (event) => console.log('[backup]', JSON.stringify(event)) });
 const offsiteRoutes = require('./routes/offsite-backup.cjs').createOffsiteRoutes({ service: offsiteBackup, json });
 const davConfig = require('./dav-settings.cjs').configuration(process.env, authService.origin);
@@ -2879,6 +2881,7 @@ async function handleRequestScoped(req, res) {
       return json(res, 403, { error: 'invalid CSRF token' });
     }
     if (authn && await featureRoutes(req, res, { path: p, authn })) return;
+    if (authn && await exportRoutes(req, res, { path: p, authn })) return;
     if (authn && await offsiteRoutes(req, res, { path: p, authn })) return;
     if (authn && p.startsWith('/api/projects/') && await researchRoutes(req, res, { path: p, authn })) return;
     if(p==='/api/profile/diary-connectors' && req.method==='GET')return json(res,200,{connectors:diaryConnectors.list(authn.user.id)});
