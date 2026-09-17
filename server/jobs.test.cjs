@@ -76,3 +76,18 @@ test('finished jobs are pruned by age and count; unfinished ones never are', () 
     assert.equal(jobs.list({ active: true }).length, 1);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('a store scoped to its kinds never prunes another kind sharing the directory', () => {
+  const dir = tmp();
+  try {
+    let clock = 1_000_000;
+    const research = createJobs({ dir, now: () => clock });
+    const kept = research.create({ kind: 'research' }); research.append(kept, 'job.completed', {});
+    const sources = createJobs({ dir, now: () => clock, retainMs: 1000, maxJobs: 1, kinds: ['source'] });
+    const s1 = sources.create({ kind: 'source' }); sources.append(s1, 'job.completed', {});
+    clock += 5000;
+    sources.create({ kind: 'source' });
+    assert.equal(sources.get(s1), null, 'own kind aged out');
+    assert.equal(research.get(kept).status, 'completed', 'other kind untouched');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});

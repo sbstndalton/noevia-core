@@ -7,7 +7,7 @@ const stores = new WeakMap();
 function storeFor(workspace) {
   let store = stores.get(workspace);
   if (!store) {
-    store = createJobs({ dir: workspace.dir, retainMs: 15 * 60000, maxJobs: 16 });
+    store = createJobs({ dir: workspace.dir, retainMs: 15 * 60000, maxJobs: 16, kinds: ['source'] });
     store.recover();
     stores.set(workspace, store);
   }

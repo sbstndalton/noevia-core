@@ -36,7 +36,8 @@ function derive(events) {
   return job;
 }
 
-function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 200 } = {}) {
+// `kinds` scopes retention: stores sharing one jobs/ directory each prune only their own kinds.
+function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 200, kinds = null } = {}) {
   const root = path.join(dir, 'jobs');
   const controllers = new Map();
   const file = (id) => {
@@ -122,7 +123,7 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
   }
   function prune() {
     const all = ids().map(get).filter(Boolean);
-    const done = all.filter((j) => TERMINAL.has(j.status)).sort((a, b) => b.updatedAt - a.updatedAt);
+    const done = all.filter((j) => TERMINAL.has(j.status) && (!kinds || kinds.includes(j.kind))).sort((a, b) => b.updatedAt - a.updatedAt);
     for (const [i, j] of done.entries()) if (now() - j.updatedAt > retainMs || i >= maxJobs) fs.rmSync(file(j.id), { force: true });
   }
   return { create, run, append, get, list, cancel, recover, can, prune };
