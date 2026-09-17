@@ -68,3 +68,20 @@ test('reported rates are throttled to meaningful changes or a daily refresh', ()
     assert.equal(store.list().length, 3);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('the evidence log stays bounded and keeps the newest records per model, category and identity', () => {
+  const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
+  const { createStore } = require('./evidence.cjs');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-evidence-bound-'));
+  try {
+    const store = createStore(dir, { maxBytes: 20_000, keepPerKey: 3 });
+    for (let i = 0; i < 400; i++) store.append({ category: 'mtp_acceptance', model: i % 2 ? 'a' : 'b', identityHash: 'h' + (i % 4 < 2 ? 1 : 2), result: 'reported', value: { rate: i / 400 } });
+    assert.ok(fs.statSync(store.file).size <= 20_000 * 1.5, `log grew to ${fs.statSync(store.file).size} bytes`);
+    const records = store.list();
+    const newest = records.filter((r) => r.model === 'a').map((r) => r.value.rate);
+    assert.ok(newest.includes(399 / 400), 'the newest record survives compaction');
+    const perKey = {}; for (const r of records) { const k = `${r.model}|${r.category}|${r.identityHash}`; perKey[k] = (perKey[k] || 0) + 1; }
+    assert.ok(Object.values(perKey).every((n) => n <= 3 + 50), JSON.stringify(perKey));
+    assert.ok(Object.keys(perKey).length >= 4, 'every identity keeps its evidence');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});

@@ -31,8 +31,23 @@ function presetHash(options) {
   return identityHash(clean);
 }
 
-function createStore(dir) {
+// Append-only in normal use. When the log passes maxBytes it is rewritten keeping the newest
+// keepPerKey records for each model/category/identity, so per-reply producers (MTP acceptance)
+// cannot grow it without bound while every identity keeps its latest evidence.
+function createStore(dir, { maxBytes = 1024 * 1024, keepPerKey = 50 } = {}) {
   const file = path.join(dir, 'evidence.jsonl');
+  function compact() {
+    const records = list();
+    const counts = new Map(), keep = new Array(records.length).fill(false);
+    for (let i = records.length - 1; i >= 0; i--) {
+      const r = records[i], key = `${r.model}|${r.category}|${r.identityHash}`;
+      const n = counts.get(key) || 0;
+      if (n < keepPerKey) { keep[i] = true; counts.set(key, n + 1); }
+    }
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, records.filter((_, i) => keep[i]).map((r) => JSON.stringify(r) + '\n').join(''), { mode: 0o600 });
+    fs.renameSync(tmp, file);
+  }
   function list() {
     try { return fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean); }
     catch { return []; }
@@ -43,6 +58,7 @@ function createStore(dir) {
     if (/Bearer\s+[A-Za-z0-9._~+/=-]{8,}|\bhf_[A-Za-z0-9]{20,}|\bsk-[A-Za-z0-9_-]{16,}|"(?:api_?key|password|secret|access_?token|authorization)"\s*:/i.test(JSON.stringify(entry))) throw Error('Evidence must not contain credentials');
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     fs.appendFileSync(file, JSON.stringify(entry) + '\n', { mode: 0o600 });
+    try { if (fs.statSync(file).size > maxBytes) compact(); } catch { /* compaction is best-effort */ }
     return entry;
   }
   // Skip a record when the newest one for the same category and identity already says the same.
