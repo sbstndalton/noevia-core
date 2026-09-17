@@ -344,7 +344,6 @@ function createCalibrator(deps) {
       job.status = e.cancelled ? 'cancelled' : 'failed';
       job.phase = e.cancelled ? 'Cancelled' : 'Failed';
       if (!e.cancelled) job.error = e.message || 'Calibration failed.';
-      if (!e.cancelled && e.fatal) { try { await onResult({ model: job.model, status: 'failed', entry: { at: now(), promptBudgetSeconds: job.promptBudgetSeconds, error: job.error } }); } catch { /* best-effort */ } }
       // Put the original profile back; never overwrite a file someone else changed since.
       try {
         if (job.originalText != null && job.lastRevision && presets.snapshot().revision === job.lastRevision) {
@@ -353,6 +352,8 @@ function createCalibrator(deps) {
           job.restored = true;
         }
       } catch { job.restored = false; }
+      // Evidence identity must reflect the restored profile, so record only after restoring.
+      if (!e.cancelled && e.fatal) { try { await onResult({ model: job.model, status: 'failed', entry: { at: now(), promptBudgetSeconds: job.promptBudgetSeconds, error: job.error } }); } catch { /* best-effort */ } }
     } finally {
       job.finishedAt = now();
       delete job.originalText;

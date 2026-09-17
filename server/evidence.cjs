@@ -40,7 +40,7 @@ function createStore(dir) {
   function append(record) {
     const entry = { id: 'ev_' + crypto.randomUUID(), at: Date.now(), limitations: [], ...record };
     if (!entry.category || !entry.model || !['passed', 'failed', 'reported'].includes(entry.result)) throw Error('Invalid evidence record');
-    if (JSON.stringify(entry).match(/Bearer |apiKey|password|token/i)) throw Error('Evidence must not contain credentials');
+    if (/Bearer\s+[A-Za-z0-9._~+/=-]{8,}|\bhf_[A-Za-z0-9]{20,}|\bsk-[A-Za-z0-9_-]{16,}|"(?:api_?key|password|secret|access_?token|authorization)"\s*:/i.test(JSON.stringify(entry))) throw Error('Evidence must not contain credentials');
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     fs.appendFileSync(file, JSON.stringify(entry) + '\n', { mode: 0o600 });
     return entry;

@@ -2378,7 +2378,7 @@ async function handleChatInner(req, res, body, authn, preparation) {
       const vision = await visionProbe(provider.baseUrl, upstreamHeaders, model);
       // A projector error is a capability result for this configuration; an unreachable
       // engine or timeout is not, so it records nothing.
-      if (provider.id === DEFAULT_PROVIDER_ID && modelManager.recordEvidence && (vision.supported || /projector|mmproj|rejected/i.test(vision.reason || ''))) {
+      if (provider.id === DEFAULT_PROVIDER_ID && modelManager.recordEvidence && (vision.supported || /projector|mmproj/i.test(vision.reason || ''))) {
         modelManager.recordEvidence(model, { category: 'vision', result: vision.supported ? 'passed' : 'failed', value: null, suite: { name: 'vision-probe', version: 1 }, source: 'probe', limitations: vision.supported ? ['1×1 image accepted; not an accuracy test'] : [String(vision.reason || '').slice(0, 200)] }).catch(() => undefined);
       }
       if (vision.supported) {

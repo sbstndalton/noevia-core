@@ -46,7 +46,10 @@ test('store is append-only, skips unchanged repeats, private and refuses credent
     store.appendIfChanged(rec); store.appendIfChanged(rec); store.appendIfChanged({ ...rec, result: 'failed' });
     assert.equal(store.list().length, 2);
     assert.equal(fs.statSync(store.file).mode & 0o777, 0o600);
-    assert.throws(() => store.append({ ...rec, limitations: ['Bearer abc'] }));
+    assert.throws(() => store.append({ ...rec, limitations: ['Authorization: Bearer abcdefgh12345'] }));
+    assert.throws(() => store.append({ ...rec, limitations: ['hf_abcdefghijklmnopqrstuvwxyz'] }));
+    // Ordinary measurement words are not credentials.
+    store.append({ ...rec, limitations: ['60 tokens per prompt', 'max_tokens 1'], suite: { name: 'token-throughput' } });
     assert.throws(() => store.append({ model: 'm', category: 'vision', result: 'maybe' }));
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
