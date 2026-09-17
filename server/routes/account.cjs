@@ -1,10 +1,13 @@
 'use strict';
 // GET /api/account/instructions            -> { text, updatedAt, maxChars }
 // PUT /api/account/instructions { text }   -> { text, updatedAt, maxChars }   own account only
+// GET /api/account/memory                 -> { memories, useProjectMemories, updatedAt, maxItems, maxItemChars }
+// PUT /api/account/memory { memories, useProjectMemories }   own account only
 // GET /api/account/retention               -> { days, periods, preview: { 30: n, 90: n, 365: n } }
 // PUT /api/account/retention { days }      -> { days, deleted }   deletes due chats right away
 const instructions = require('../account-instructions.cjs');
 const retention = require('../chat-retention.cjs');
+const memory = require('../account-memory.cjs');
 
 function createAccountRoutes({ json, readJson, dir, chatLists = null, removeChat = null, now = Date.now }) {
   return async function accountRoutes(req, res, { path, authn }) {
@@ -28,6 +31,16 @@ function createAccountRoutes({ json, readJson, dir, chatLists = null, removeChat
       for (const chat of due) removeChat(chat);
       if (saved.days) retention.markSwept(dir(), now());
       return json(res, 200, { days: saved.days, deleted: due.length }), true;
+    }
+    if (path === '/api/account/memory') {
+      if (!authn) return json(res, 401, { error: 'Sign in first' }), true;
+      const out = (record) => json(res, 200, { ...record, maxItems: memory.MAX_ITEMS, maxItemChars: memory.MAX_ITEM_CHARS });
+      if (req.method === 'GET') return out(memory.read(dir())), true;
+      if (req.method !== 'PUT') return json(res, 405, { error: 'method not allowed' }), true;
+      let body;
+      try { body = await readJson(req); } catch { return json(res, 400, { error: 'invalid JSON' }), true; }
+      try { return out(memory.write(dir(), body, now())), true; }
+      catch (e) { return json(res, e.status || 500, { error: e.publicMessage || 'Could not save your memory' }), true; }
     }
     if (path !== '/api/account/instructions') return false;
     if (!authn) return json(res, 401, { error: 'Sign in first' }), true;

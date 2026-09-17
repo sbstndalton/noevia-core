@@ -2373,13 +2373,14 @@ async function handleChatInner(req, res, body, authn, preparation) {
   const accountSettings = require('./account-instructions.cjs').read(currentWorkspace().dir);
   const accountPart = require('./account-instructions.cjs').systemPart(accountSettings.text, accountSettings.style);
   if (accountPart) sysParts.push(accountPart);
+  const accountMemory = require('./account-memory.cjs');
+  const memoryPart = accountMemory.systemPart(accountMemory.read(currentWorkspace().dir), project?.memories);
+  if (!project && memoryPart) sysParts.push(memoryPart);
   if (project) {
     if (project.name) sysParts.push(`You are working inside the user's project "${project.name}".`);
     if (project.goal) sysParts.push(`Project goal: ${project.goal}`);
     if (project.instructions) sysParts.push(`Project instructions (follow closely):\n${project.instructions}`);
-    if (Array.isArray(project.memories) && project.memories.length) {
-      sysParts.push(`Things you know about the user (persistent memory, apply silently):\n${project.memories.map((m) => `- ${m}`).join('\n')}`);
-    }
+    if (memoryPart) sysParts.push(memoryPart);
     if (filesBlock) {
       sysParts.push(`Relevant knowledge-file excerpts for this message:\n${filesBlock}`);
     }
