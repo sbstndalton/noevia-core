@@ -17,9 +17,12 @@ function slug(text) {
 }
 
 /** The two files a report is saved as. Plain names: uploads place them in the project's Text folder. */
-function reportFiles(result, when) {
+function reportFiles(result, when, taken = () => false) {
   const date = new Date(when).toISOString().slice(0, 10);
-  const base = `Research ${date} ${slug(result.question)}`;
+  const stem = `Research ${date} ${slug(result.question)}`;
+  let base = stem;
+  // Never overwrite an earlier report: the same question on the same day gets a numbered name.
+  for (let n = 2; taken(`${base}.md`) || taken(`${base}.sources.json`); n++) base = `${stem} (${n})`;
   const sources = result.sources.map(({ id, kind, url, file, title, retrievedAt, excerpts }) => ({ id, kind, url, file, title, retrievedAt, excerpts }));
   return [
     { name: `${base}.md`, text: result.markdown },
@@ -61,7 +64,8 @@ function createResearchService({ tools, saveFile, now = Date.now }) {
   };
   async function save(workspace, project, id, result) {
     const jobs = storeFor(workspace);
-    for (const file of reportFiles(result, now())) {
+    const names = new Set((project.files || []).map((f) => String(f.name).split('/').pop()));
+    for (const file of reportFiles(result, now(), (name) => names.has(name))) {
       await saveFile(project, file.name, file.text);
       jobs.append(id, 'artifact.created', { name: file.name, bytes: Buffer.byteLength(file.text) });
     }

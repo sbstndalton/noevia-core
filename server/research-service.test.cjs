@@ -94,3 +94,16 @@ test('report files and slugs', () => {
   const files = reportFiles({ question: 'Q', markdown: '# Q', sources: [], citationValidity: 1, webCalls: 0 }, Date.parse('2026-01-02T00:00:00Z'));
   assert.deepEqual(files.map((f) => f.name), ['Research 2026-01-02 q.md', 'Research 2026-01-02 q.sources.json']);
 });
+
+test('a second report on the same question and day gets its own files instead of overwriting', async (t) => {
+  const { service, workspace, project, saved } = setup(t);
+  project.files = [];
+  const run = async () => { const s = await service.start(workspace, project, { question: 'What is the Zephyr cell?' }); await settle(service, workspace, project, s.id); };
+  await run();
+  for (const f of saved) project.files.push({ name: `noevia projects/P/Text/${f.name}` });
+  await run();
+  const names = saved.map((f) => f.name);
+  assert.equal(new Set(names).size, 4, `report files collided: ${names.join(' | ')}`);
+  assert.ok(names.includes('Research 2026-09-17 what-is-the-zephyr-cell (2).md'));
+  assert.ok(names.includes('Research 2026-09-17 what-is-the-zephyr-cell (2).sources.json'));
+});
