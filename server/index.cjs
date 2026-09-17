@@ -3923,7 +3923,7 @@ async function handleRequestScoped(req, res) {
       if(!/^[\w./%:+@-]*$/.test(rest)||rest.includes('..'))return json(res,400,{error:'Invalid path'});
       const method=req.method||'GET';
       const body=['GET','HEAD','DELETE'].includes(method)?undefined:await readBody(req,1024*1024);
-      const result=await fetchJson(`${process.env.MODEL_LOADER_URL.replace(/\/+$/,'')}/api/v1/${rest}${url.search}`,{method,headers:{'Content-Type':'application/json'},body},10*60*1000).catch(()=>null);
+      const result=await fetchJson(`${process.env.MODEL_LOADER_URL.replace(/\/+$/,'')}/api/v1/${rest}${url.search}`,{method,headers:{'Content-Type':'application/json',...(process.env.MODEL_LOADER_TOKEN?{'X-Model-Loader-Token':process.env.MODEL_LOADER_TOKEN}:{})},body},10*60*1000).catch(()=>null);
       res.setHeader('Cache-Control','no-store');
       if(!result)return json(res,502,{error:'The model management service is not responding.'});
       const detail=result.body&&typeof result.body==='object'?result.body:{error:String(result.body||'')};
