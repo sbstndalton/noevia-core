@@ -19,7 +19,7 @@ const { projectAppearance } = require('./project-appearance.cjs');
 // Secrets enter only via environment (ui.env on the server). Never hardcoded.
 
 'use strict';
-const { hintTool } = require('./tool-hints.cjs');
+const { bindBoxes } = require('./mcp-boxes.cjs');
 
 const http = require('http');
 const crypto = require('crypto');
@@ -1707,31 +1707,9 @@ async function discoverMcpTools(force = false) {
         }
       }
 
-      const boxes = [];
-      for (const box of MCP_TOOLBOX_MANIFEST) {
-        // A box binds only tools from its own server, so a rogue or merely
-        // careless second server cannot inject a tool into a curated box.
-        const owned = perServer.get(box.server) || new Map();
-        const tools = [];
-        const missing = [];
-        for (const name of box.tools) {
-          const hit = owned.get(name);
-          // A box may add a sentence in the user's vocabulary to a tool whose own description
-          // is written in the server's (see tool-hints.cjs). Appended, never a replacement.
-          if (hit) tools.push(hintTool(box, hit.tool)); else missing.push(name);
-        }
-        const serverState = servers.get(box.server);
-        if (!serverState) {
-          console.warn(`[mcp] box ${box.id} names unknown server "${box.server}"; skipping`);
-          continue;
-        }
-        if (missing.length && !serverState.error) {
-          console.warn(`[mcp:${box.server}] box ${box.id}: ${missing.length} curated tools not offered: ${missing.join(', ')}`);
-        }
-        // A box that lost every tool is not shown at all — an empty box in the
-        // picker is a promise the server cannot keep.
-        if (tools.length) boxes.push({ ...box, source: 'mcp', tools });
-      }
+      // A box binds only tools from its own server, so a rogue or merely careless second
+      // server cannot inject a tool into a curated box. See mcp-boxes.cjs.
+      const boxes = bindBoxes({ manifest: MCP_TOOLBOX_MANIFEST, perServer, servers, warn: (line) => console.warn(line) });
 
       mcpState.tools = byName;
       mcpState.boxes = boxes;
