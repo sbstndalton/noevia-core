@@ -2360,7 +2360,8 @@ async function handleChatInner(req, res, body, authn, preparation) {
   }
 
   const sysParts = [];
-  const accountPart = require('./account-instructions.cjs').systemPart(require('./account-instructions.cjs').read(currentWorkspace().dir).text);
+  const accountSettings = require('./account-instructions.cjs').read(currentWorkspace().dir);
+  const accountPart = require('./account-instructions.cjs').systemPart(accountSettings.text, accountSettings.style);
   if (accountPart) sysParts.push(accountPart);
   if (project) {
     if (project.name) sysParts.push(`You are working inside the user's project "${project.name}".`);
