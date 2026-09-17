@@ -2195,7 +2195,12 @@ async function handleChat(req, res, body, authn) {
     catch(error){return json(res,error.status||500,{error:error.status?error.message:'Could not save preparation recovery; no tools were run.'});}
   }
   try{return await handleChatInner(req,res,body,authn,preparation);}
-  finally{preparation?.finish();}
+  finally{
+    preparation?.finish();
+    // A chat deleted while this reply ran leaves no context state (summaries hold conversation text).
+    const id=typeof body?.chatId==='string'?body.chatId:null;
+    try{const dir=currentWorkspace().dir;if(id&&require('./chat-lists.cjs').readTombstones(dir).has(id))require('./chat-context.cjs').remove(dir,id);}catch{/* best effort */}
+  }
 }
 
 async function handleChatInner(req, res, body, authn, preparation) {
