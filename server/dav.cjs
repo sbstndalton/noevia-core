@@ -46,7 +46,9 @@ async function readBody(req, limit) {
 }
 function createDavHandler({ auth, settings, config, files }) {
   const rate=createRateLimiter(); let active=0;
-  const allow=ALLOW+(files.mkdir?', MKCOL':'');
+  // D6: DELETE/MOVE/COPY only when the companion's guarded operations are wired in.
+  const davOps=files.ops?require('./dav-ops.cjs').createDavOps({ops:files.ops}):null;
+  const allow=ALLOW+(files.mkdir?', MKCOL':'')+(davOps?', '+davOps.methods.join(', '):'');
   return async function handleDav(req,res) {
     res.setHeader('Cache-Control','no-store');res.setHeader('X-Content-Type-Options','nosniff');
     const send=(status,text='',type='text/plain; charset=utf-8')=>{res.statusCode=status;res.setHeader('Content-Type',type);res.setHeader('Content-Length',Buffer.byteLength(text));res.end(req.method==='HEAD'?'':text);};
@@ -80,7 +82,7 @@ function createDavHandler({ auth, settings, config, files }) {
         const allowed=()=>auth.appPasswords.list(identity.userId).some(p=>p.id===identity.credentialId) && !!auth.db.prepare('SELECT id FROM users WHERE id=? AND disabled_at IS NULL').get(identity.userId) && settings.scope(identity.userId)===config.scope && auth.diaryEnabled(identity.userId) && auth.getStorage(identity.userId).kind==='local';
         if(!allowed())return send(403,'Sharing is off for this account or storage');
         if(!allow.split(', ').includes(req.method)){res.setHeader('Allow',allow);return send(405,'This Markdown endpoint does not support that operation');}
-        if(req.method==='OPTIONS'){res.setHeader('Allow',allow);return send(200);}
+        if(req.method==='OPTIONS'){res.setHeader('Allow',allow);if(davOps)res.setHeader('DAV','1');return send(200);}
         const base='/dav/'+encodeURIComponent(username)+'/';
         const href=(p,dir)=>base+p.split('/').filter(Boolean).map(encodeURIComponent).join('/')+(dir&&p?'/':'');
         const lookup=async p=>{
@@ -114,6 +116,11 @@ function createDavHandler({ auth, settings, config, files }) {
           auth.audit('dav.write',identity.userId,identity.userId,{credentialId:identity.credentialId,path,bytes:Buffer.byteLength(content)});
           return send(none?201:204);
         }
+        if(davOps && davOps.methods.includes(req.method)){
+          const result=await davOps.handle({req,method:req.method,path,identity,username,origin:config.origin,allowed,readBody,
+            audit:(action,detail)=>auth.audit(action,identity.userId,identity.userId,{credentialId:identity.credentialId,...detail})});
+          return send(result.status);
+        }
         const item=await lookup(path);if(!item)return send(404,'File or folder not found');
         if(req.method==='GET'||req.method==='HEAD'){
           if(item.isDir)return send(405,'Use PROPFIND to list this folder');
@@ -132,7 +139,10 @@ function createDavHandler({ auth, settings, config, files }) {
         for(const entry of items){
           if(Date.now()>deadline || res.destroyed)throw fail(504,'Property read timed out');
           if(!allowed())return send(403,'Sharing was disabled or credential revoked');
+          const wantsTag=!selected||selected.some(p=>p.uri==='DAV:'&&p.local==='getetag');
+          const folderTag=entry.isDir&&davOps&&wantsTag&&entry.path?await davOps.folderTag(identity.userId,entry.path):null;
           const props={displayname:xml(entry.name),resourcetype:entry.isDir?'<d:collection/>':'',getcontenttype:entry.isDir?'httpd/unix-directory':'text/markdown; charset=utf-8'};
+          if(folderTag)props.getetag=xml(`"${folderTag}"`);
           if(!entry.isDir && (!selected||selected.some(p=>p.uri==='DAV:'&&['getetag','getcontentlength'].includes(p.local)))){
             const r=await files.read(identity.userId,entry.path);
             if(r.content===null)continue;
@@ -149,7 +159,7 @@ function createDavHandler({ auth, settings, config, files }) {
         }
         return send(207,`<?xml version="1.0" encoding="utf-8"?><d:multistatus xmlns:d="DAV:">${rows.join('')}</d:multistatus>`,'application/xml; charset=utf-8');
       } finally { active--; }
-    } catch(e) { return send(e.status===409&&req.method==='PUT'?412:e.status||502,e.status?e.message:'Diary storage is unavailable'); }
+    } catch(e) { if(e.retryAfter)res.setHeader('Retry-After',String(e.retryAfter)); return send(e.status===409&&req.method==='PUT'?412:e.status||502,e.status?e.message:'Diary storage is unavailable'); }
   };
 }
 module.exports={createDavHandler,properties};

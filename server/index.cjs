@@ -4355,6 +4355,7 @@ if (require.main === module) {
       read: (id, path) => call(id, '/file', 'POST', { path }),
       write: (id, body) => call(id, '/file', 'PUT', body),
       mkdir: (id, path) => call(id, '/directory', 'POST', { path }),
+      ops: (id, body) => call(id, '/workspace-ops', 'POST', body),
     } });
     const davServer = http.createServer((req, res) => { handler(req, res).catch(() => res.destroy()); });
     davServer.requestTimeout = 60000; davServer.headersTimeout = 15000;
