@@ -750,6 +750,19 @@ function pruneDocuments(project) {
   try { require('./uploads.cjs').prune(workspace, workspace.projects.includes(project) ? project : { id: project.id, files: [] }); }
   catch (err) { console.warn('[uploads] cleanup failed:', err.message); }
 }
+const projectSweep = require('./project-sweep.cjs').createProjectSweep({ storage: storageClient, log: event => console.log('[projects]', JSON.stringify(event)) });
+// D8: runs after the delete is saved; empty-only, tenant-scoped, never recursive.
+function sweepDeletedProject(project) {
+  const workspace = currentWorkspace();
+  let connection = null;
+  try { connection = project.projectFolder ? authService.getStorage(workspace.userId, true) : null; } catch { connection = null; }
+  projectSweep.afterDelete({
+    projectId: project.id,
+    tenantRoot: workspace.dir,
+    localDirs: [require('./uploads.cjs').directory(workspace, project.id), documentSources.directory(workspace, project.id), workspace.assetDir(project.id)],
+    connection, folder: project.projectFolder || '', root: PROJECT_ROOT_FOLDER, groups: require('./uploads.cjs').GROUPS,
+  }).catch(error => console.warn('[projects] sweep failed:', error.message));
+}
 function indexSource(project, file) {
   const workspace = currentWorkspace();
   if (require('./instruction-skills.cjs').inspect(file, project) || !file.content) {
@@ -3320,6 +3333,7 @@ async function handleRequestScoped(req, res) {
           fs.rmSync(path.join(currentWorkspace().ragDir(), `${id}${suffix}`), { force: true });
         }
       } catch { /* best effort */ }
+      if (removedProject) sweepDeletedProject(removedProject);
       return json(res, 200, { ok: true });
     }
 

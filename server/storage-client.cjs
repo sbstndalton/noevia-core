@@ -348,4 +348,52 @@ async function deleteFile(conn, rawPath) {
   return { path, missing: false };
 }
 
-module.exports = { listFiles, readTextFile, readBinaryFile, writeFile, deleteFile, createFolder, isBrowsable, safeRelativePath, TEXT_EXTENSIONS, READ_CAP };
+/** Remove one WebDAV collection only if it is empty right now. PROPFIND Depth 1 must list no
+ *  children; DELETE then carries If-Match with the collection's ETag, so a child added in
+ *  between changes the ETag and the server refuses (412) instead of deleting it. A server that
+ *  reports no ETag gets no DELETE: without the precondition the check would be a race. */
+async function removeEmptyFolder(conn, rawPath) {
+  const path = safeRelativePath(rawPath);
+  if (!path) throw Object.assign(new Error('invalid folder path'), { status: 400 });
+  if (!['webdav', 'nextcloud'].includes(connectionKind(conn))) return { removed: false, reason: 'unsupported' };
+  const target = davUrl(conn, path, true);
+  const response = await withRetry(() => fetch(target, {
+    method: 'PROPFIND',
+    headers: davHeaders(conn, { Depth: '1', 'Content-Type': 'application/xml' }),
+    body: '<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/><d:getetag/></d:prop></d:propfind>',
+    signal: AbortSignal.timeout(15000),
+    redirect: 'error',
+  }));
+  if (response.status === 404) return { removed: false, reason: 'missing' };
+  if (response.status !== 207) return { removed: false, reason: 'error' };
+  const body = await response.text();
+  const requestDir = decodeURIComponent(new URL(target).pathname).replace(/\/+$/, '');
+  let etag = '', isCollection = false, children = 0;
+  for (const match of body.matchAll(/<(?:[a-zA-Z0-9]+:)?response>([\s\S]*?)<\/(?:[a-zA-Z0-9]+:)?response>/g)) {
+    const block = match[1];
+    const hrefMatch = block.match(/<(?:[a-zA-Z0-9]+:)?href>([\s\S]*?)<\/(?:[a-zA-Z0-9]+:)?href>/);
+    if (!hrefMatch) continue;
+    let href;
+    try { href = decodeURIComponent(new URL(hrefMatch[1].trim(), target).pathname).replace(/\/+$/, ''); } catch { children++; continue; }
+    if (href === requestDir) {
+      isCollection = /<(?:[a-zA-Z0-9]+:)?collection\s*\/?>/.test(block);
+      etag = (block.match(/<(?:[a-zA-Z0-9]+:)?getetag>([\s\S]*?)<\/(?:[a-zA-Z0-9]+:)?getetag>/)?.[1] || '').trim()
+        .replace(/&quot;/g, '"').replace(/&amp;/g, '&');
+    } else children++;
+  }
+  if (!isCollection) return { removed: false, reason: 'not-directory' };
+  if (children) return { removed: false, reason: 'not-empty' };
+  if (!etag || /[\r\n]/.test(etag)) return { removed: false, reason: 'no-etag' };
+  const del = await fetch(target, {
+    method: 'DELETE',
+    headers: davHeaders(conn, { 'If-Match': etag.startsWith('"') || etag.startsWith('W/') ? etag : `"${etag}"` }),
+    signal: AbortSignal.timeout(15000),
+    redirect: 'error',
+  });
+  if (del.status === 404) return { removed: false, reason: 'missing' };
+  if (del.status === 412) return { removed: false, reason: 'changed' };
+  if (!del.ok) return { removed: false, reason: 'error' };
+  return { removed: true };
+}
+
+module.exports = { removeEmptyFolder, listFiles, readTextFile, readBinaryFile, writeFile, deleteFile, createFolder, isBrowsable, safeRelativePath, TEXT_EXTENSIONS, READ_CAP };
