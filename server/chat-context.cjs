@@ -118,5 +118,7 @@ async function prepareUnlocked({dir,id,messages,tools,limit,limitSource,model,fo
 function providerError(value) {const text=typeof value==='string'?value:JSON.stringify(value);return /context.*(exceed|full|length)|too many tokens|maximum context/i.test(text)?'The model ran out of context space. Compact this chat or reduce its sources before retrying.':'The model stream failed. Partial output was preserved; check the backend before retrying.';}
 const busy=new Set();
 async function prepare(options){const key=stateFile(options.dir,options.id);if(busy.has(key))throw Error('This chat is already preparing context. Wait for that request to finish.');busy.add(key);try{return await prepareUnlocked(options);}finally{busy.delete(key);}}
+// R1 measurement, opt-in with CONTEXT_LOG=1; never breaks a chat.
+function logRound({dir,...entry}){if(process.env.CONTEXT_LOG!=='1')return;try{const log=require('./context-log.cjs');log.append(dir,log.record(entry));}catch(e){console.warn('[context-log] write failed:',e.message);}}
 function remove(dir,id){fs.rmSync(stateFile(dir,id),{force:true});}
-module.exports={remove,tokens,read,save,runtimeLimit,resolveRuntimeLimit,applySummary,measure,prepare,providerError};
+module.exports={logRound,remove,tokens,read,save,runtimeLimit,resolveRuntimeLimit,applySummary,measure,prepare,providerError};

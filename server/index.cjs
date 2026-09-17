@@ -2421,7 +2421,7 @@ async function handleChatInner(req, res, body, authn, preparation) {
   const runTool = createToolExchange({ allowed: allowedToolNames, isWrite: isWriteTool, signal: chatSignal.signal });
   const context = require('./chat-context.cjs');
   const contextId=chatId || spaceId;
-  let prepared,limit,limitSource;
+  let prepared,limit,limitSource,requestStartedAt=Date.now();
   try {
     ({limit,limitSource}=await context.resolveRuntimeLimit({
       manager:provider.id===DEFAULT_PROVIDER_ID?modelManager:null,model,dir:chatWorkspace.dir,
@@ -2455,6 +2455,7 @@ async function handleChatInner(req, res, body, authn, preparation) {
   let toolOffset = 0;
   for (let round = 0; round < 3 && !chatSignal.signal.aborted; round++) {
     const roundBudget=context.measure(roundMessages,activeTools,limit,limitSource,model);
+    context.logRound({dir:chatWorkspace.dir,chatId:contextId,model,limit,round,compacted:!!prepared.meter.compactedAt&&prepared.meter.compactedAt>=requestStartedAt,messages:roundMessages,tools:activeTools});
     if(roundBudget.used>roundBudget.threshold){send({type:'error',text:'Tool results filled the available context. Compact the chat or reduce sources before retrying.'});break;}
     const snapshot=context.read(chatWorkspace.dir,contextId);snapshot.meter={...roundBudget,historyCount:prepared.meter.historyCount,compactedAt:prepared.meter.compactedAt,covered:prepared.meter.covered};context.save(chatWorkspace.dir,contextId,snapshot);
     let upstream;
