@@ -84,6 +84,23 @@ const features = require('./features.cjs').createFeatures({ store: require('./fe
 const featureRoutes = require('./routes/features.cjs').createFeatureRoutes({ features, json, readJson });
 // Settings → Data: the signed-in user's conversations as a ZIP (routes/export.cjs).
 const exportRoutes = require('./routes/export.cjs').createExportRoutes({ json, workspace: () => ({ freeChats: Array.from(FREE_CHATS), projects: PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)) }), readHistory: (id) => readHistory(id), audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) });
+const importRoutes = require('./routes/import.cjs').createImportRoutes({
+  json, readBody: (req, limit) => readBody(req, limit), newId: () => `c-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+  audit: (action, actor, detail) => authService.audit(action, actor, actor, detail),
+  context: () => {
+    const lists = require('./chat-lists.cjs');
+    const visible = () => PROJECTS.filter((proj) => !diaryExtras.internalProject(proj));
+    return {
+      projects: () => visible().map((proj) => ({ id: proj.id, name: proj.name })),
+      existingChatIds: () => new Set([...Array.from(FREE_CHATS), ...PROJECTS.flatMap((proj) => proj.chats || [])].map((c) => c.id)),
+      tombstones: () => lists.readTombstones(currentWorkspace().dir),
+      writeHistory: (id, history) => writeHistory(id, history),
+      addFreeChats: (chats) => { FREE_CHATS.splice(0, FREE_CHATS.length, ...lists.mergeChats(Array.from(FREE_CHATS), chats, lists.readTombstones(currentWorkspace().dir))); saveFreeChats(FREE_CHATS); },
+      addProjectChats: (projectId, chats) => saveChats(projectId, chats),
+      createProject: (body) => createProject(body),
+    };
+  },
+});
 const offsiteBackup = require('./offsite-service.cjs').createOffsiteService({ features, dataDir: DATA_DIR, log: (event) => console.log('[backup]', JSON.stringify(event)) });
 const offsiteRoutes = require('./routes/offsite-backup.cjs').createOffsiteRoutes({ service: offsiteBackup, json });
 const davConfig = require('./dav-settings.cjs').configuration(process.env, authService.origin);
@@ -436,6 +453,61 @@ function deleteFreeChat(chatId) {
     /* no history file — fine */
   }
   return true;
+}
+
+// Creates, saves and indexes a project from a create request body. Throws { status: 400 } on
+// invalid input. Shared by POST /api/projects and conversation import.
+async function createProject(body) {
+  if (body.reasoningEffort !== undefined && !reasoningEffort.validEffort(body.reasoningEffort)) throw Object.assign(Error('Invalid reasoning effort'), { status: 400 });
+  const name = String(body.name || '').trim().slice(0, 120);
+  if (!name) throw Object.assign(Error('name required'), { status: 400 });
+  let modes = ['chat'];
+  if (body.modes !== undefined) { try { modes = require('./project-modes.cjs').sanitize(body.modes); } catch (e) { throw Object.assign(Error(e.message), { status: 400 }); } }
+  let appearance;
+  try { appearance = projectAppearance(body); } catch (e) { throw Object.assign(Error(e.message), { status: 400 }); }
+  const project = {
+    ...appearance,
+    id: `proj-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    name,
+    goal: String(body.goal || '').slice(0, 2000),
+    instructions: String(body.instructions || '').slice(0, 8000),
+    pinned: false,
+    archived: false,
+    sourceFolders: [],
+    memories: [],
+    files: Array.isArray(body.files)
+      ? body.files
+          .filter((f) => f && typeof f.name === 'string' && typeof f.content === 'string')
+          .slice(0, 20)
+          .map((f) => ({ name: f.name.slice(0, 200), content: f.content.slice(0, 200000) }))
+      : [],
+    model: typeof body.model === 'string' && body.model ? body.model : undefined,
+    provider: typeof body.provider === 'string' && body.provider ? body.provider : undefined,
+    reasoningEffort: body.reasoningEffort,
+    routing: body.routing === 'auto' ? 'auto' : 'manual', // default manual (step 12 guardrail)
+    modes,
+    toolboxes: sanitizeToolboxes(body.toolboxes) || [...DEFAULT_TOOLBOXES], // step 14: core only by default
+    // (files normalization below is shared with the config route's RAG bookkeeping)
+    chats: [],
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+  // Its own folder in the user's storage, and attached as a source so
+  // anything dropped in it — by noevia or by the user, from any device —
+  // is picked up on the next sync.
+  const ownFolder = await ensureProjectFolder(project);
+  if (ownFolder) {
+    project.projectFolder = ownFolder;
+    project.sourceFolders = [ownFolder];
+  }
+  PROJECTS.unshift(project);
+  saveProjects(PROJECTS);
+  // Index any files that arrived with the create call (same RAG bookkeeping
+  // as the config route).
+  for (const f of project.files) {
+    indexSource(project, f);
+  }
+  return project;
 }
 
 // ── History persistence (atomic write, JSON per space) ─────────────────────
@@ -2882,6 +2954,7 @@ async function handleRequestScoped(req, res) {
     }
     if (authn && await featureRoutes(req, res, { path: p, authn })) return;
     if (authn && await exportRoutes(req, res, { path: p, authn })) return;
+    if (authn && await importRoutes(req, res, { path: p, authn })) return;
     if (authn && await offsiteRoutes(req, res, { path: p, authn })) return;
     if (authn && p.startsWith('/api/projects/') && await researchRoutes(req, res, { path: p, authn })) return;
     if(p==='/api/profile/diary-connectors' && req.method==='GET')return json(res,200,{connectors:diaryConnectors.list(authn.user.id)});
@@ -3367,56 +3440,8 @@ async function handleRequestScoped(req, res) {
       } catch {
         return json(res, 400, { error: 'invalid JSON' });
       }
-      if (body.reasoningEffort !== undefined && !reasoningEffort.validEffort(body.reasoningEffort)) return json(res,400,{error:'Invalid reasoning effort'});
-      const name = String(body.name || '').trim().slice(0, 120);
-      if (!name) return json(res, 400, { error: 'name required' });
-      let modes = ['chat'];
-      if (body.modes !== undefined) { try { modes = require('./project-modes.cjs').sanitize(body.modes); } catch (e) { return json(res, 400, { error: e.message }); } }
-      let appearance;
-      try { appearance = projectAppearance(body); } catch (e) { return json(res, 400, { error: e.message }); }
-      const project = {
-        ...appearance,
-        id: `proj-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        name,
-        goal: String(body.goal || '').slice(0, 2000),
-        instructions: String(body.instructions || '').slice(0, 8000),
-        pinned: false,
-        archived: false,
-        sourceFolders: [],
-        memories: [],
-        files: Array.isArray(body.files)
-          ? body.files
-              .filter((f) => f && typeof f.name === 'string' && typeof f.content === 'string')
-              .slice(0, 20)
-              .map((f) => ({ name: f.name.slice(0, 200), content: f.content.slice(0, 200000) }))
-          : [],
-        model: typeof body.model === 'string' && body.model ? body.model : undefined,
-        provider: typeof body.provider === 'string' && body.provider ? body.provider : undefined,
-        reasoningEffort: body.reasoningEffort,
-        routing: body.routing === 'auto' ? 'auto' : 'manual', // default manual (step 12 guardrail)
-        modes,
-        toolboxes: sanitizeToolboxes(body.toolboxes) || [...DEFAULT_TOOLBOXES], // step 14: core only by default
-        // (files normalization below is shared with the config route's RAG bookkeeping)
-        chats: [],
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-      };
-      // Its own folder in the user's storage, and attached as a source so
-      // anything dropped in it — by noevia or by the user, from any device —
-      // is picked up on the next sync.
-      const ownFolder = await ensureProjectFolder(project);
-      if (ownFolder) {
-        project.projectFolder = ownFolder;
-        project.sourceFolders = [ownFolder];
-      }
-      PROJECTS.unshift(project);
-      saveProjects(PROJECTS);
-      // Index any files that arrived with the create call (same RAG bookkeeping
-      // as the config route).
-      for (const f of project.files) {
-        indexSource(project, f);
-      }
-      return json(res, 200, project);
+      try { return json(res, 200, await createProject(body)); }
+      catch (e) { if (e.status === 400) return json(res, 400, { error: e.message }); throw e; }
     }
 
     const projMatch = p.match(/^\/api\/projects\/([^/]+)$/);
