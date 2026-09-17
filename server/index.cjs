@@ -3951,6 +3951,22 @@ async function handleRequestScoped(req, res) {
       return json(res, result.status, result.body);
     }
 
+    // Re-run the cheap image probe for one model and record the result. It may load the model.
+    if (p === '/api/models/evidence/recheck') {
+      if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model evidence'});
+      if(req.method!=='POST')return json(res,405,{error:'Method not allowed'});
+      if(!modelManager.recordEvidence)return json(res,404,{error:'Qualification evidence needs the native engine'});
+      const body=await readJson(req).catch(()=>null);
+      const model=typeof body?.model==='string'?body.model:'';
+      if(!model||model.length>200)return json(res,400,{error:'Choose a model'});
+      if(body.category!=='vision')return json(res,400,{error:'Only image input can be rechecked here; use Measure context for context capacity.'});
+      const provider=getProvider(DEFAULT_PROVIDER_ID);
+      const vision=await createVisionProbe()(provider.baseUrl,providerHeaders(provider),model);
+      if(!vision.supported&&!/projector|mmproj/i.test(vision.reason||''))return json(res,503,{error:vision.reason||'The engine could not run the image probe.'});
+      await modelManager.recordEvidence(model,{category:'vision',result:vision.supported?'passed':'failed',value:null,suite:{name:'vision-probe',version:1},source:'recheck',limitations:vision.supported?['1×1 image accepted; not an accuracy test']:[String(vision.reason||'').slice(0,200)]});
+      return json(res,200,(await modelManager.evidence(model)).body);
+    }
+
     if (p === '/api/models/calibration' || p === '/api/models/calibration/cancel') {
       if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
       if(!modelManager.calibration)return json(res,404,{error:'Native calibration is unavailable'});
