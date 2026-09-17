@@ -617,6 +617,10 @@ const TOOLBOXES = [
   },
 ];
 
+// D9: read-only offline Wikipedia box, only with features.kiwix and an internal KIWIX_URL.
+const kiwixTools = features.enabled('kiwix') && process.env.KIWIX_URL ? require('./kiwix.cjs').createKiwixTools({ baseUrl: process.env.KIWIX_URL, cap: TOOL_RESULT_CAP }) : null;
+if (kiwixTools) TOOLBOXES.push(kiwixTools.box);
+
 const DEFAULT_TOOLBOXES = ['core'];
 
 // Built-ins plus whatever MCP discovery found. Everything downstream — the
@@ -1838,6 +1842,7 @@ async function executeToolCall(project, name, rawArgs, allowed) {
   } catch {
     return `ERROR: tool arguments were not valid JSON: ${String(rawArgs).slice(0, 200)}`;
   }
+  if (kiwixTools?.names.has(name)) return kiwixTools.execute(name, args);
   if (name === 'get_current_time') {
     const tz = typeof args.timezone === 'string' && args.timezone ? args.timezone : undefined;
     const now = new Date();
