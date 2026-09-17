@@ -178,6 +178,9 @@ test('an interrupted run is restored on startup only if the file is still the jo
   fs.writeFileSync(stateFile,JSON.stringify({job:{model:'synthetic',status:'running',steps:[],originalText:original,lastRevision:revision},history:{}}));
   await manager.calibration.recover();
   assert.equal(fs.readFileSync(ini,'utf8'),edited);
+  // ...and the admin is told the calibration size may still be in the profile.
+  const kept=manager.calibration.status().body.job;
+  assert.equal(kept.restored,false);assert.match(kept.error,/not restored/);
 });
 
 test('memory that stays low with the model unloaded stops the run instead of failing every size',async t=>{
