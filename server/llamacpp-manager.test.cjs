@@ -81,3 +81,29 @@ test('native loaded and cold capability labels use effective flags without leaki
  for(let i=0;i<rows.length;i+=3){assert.deepEqual(rows[i].labels,['embeddings']);assert.deepEqual(rows[i+1].labels,['reranking']);assert.deepEqual(rows[i+2].labels,['vision']);}
  assert.doesNotMatch(JSON.stringify(rows),/PRIVATE-CANARY|private\/weights|status.*args/);
 });
+test('qualification evidence is tied to the live configuration and goes stale when it changes',async()=>{
+ const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'noevia-evidence-mgr-'));
+ try{
+  const models=path.join(root,'models'),ev=path.join(root,'evidence');fs.mkdirSync(path.join(models,'fx'),{recursive:true});
+  fs.writeFileSync(path.join(models,'fx','fx.gguf'),Buffer.alloc(2048,7));
+  const ini=path.join(root,'models.ini');
+  fs.writeFileSync(ini,'version = 1\n\n[fx]\nmodel = /models/fx/fx.gguf\nctx-size = 8192\n');
+  const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic-router/v1/',presetPath:ini,evidenceDir:ev,autoconfig:{modelsPath:models},fetchStream:async()=>({ok:false}),
+   fetchJson:async(url)=>{const p=new URL(url).pathname;return {ok:true,status:200,body:p==='/models'?{data:[{id:'fx',status:{value:'unloaded',args:[]}}]}:p==='/props'?{build_info:'b-synthetic'}:{}};}});
+  const unverified=(await manager.evidence('fx')).body;
+  assert.equal(unverified.categories.find(c=>c.category==='context_capacity').state,'unverified');
+  await manager.recordEvidence('fx',{category:'context_capacity',result:'passed',value:{ctx:8192},suite:{name:'native-calibration',version:1},source:'calibration'});
+  const verified=(await manager.evidence('fx')).body.categories.find(c=>c.category==='context_capacity');
+  assert.equal(verified.state,'verified');assert.equal(verified.value.ctx,8192);
+  assert.ok(!fs.readFileSync(path.join(ev,'evidence.jsonl'),'utf8').includes('synthetic-router'),'raw endpoint must not be stored');
+  fs.writeFileSync(ini,'version = 1\n\n[fx]\nmodel = /models/fx/fx.gguf\nctx-size = 16384\n');
+  assert.equal((await manager.evidence('fx')).body.categories.find(c=>c.category==='context_capacity').state,'stale','preset change');
+  fs.writeFileSync(ini,'version = 1\n\n[fx]\nmodel = /models/fx/fx.gguf\nctx-size = 8192\n');
+  assert.equal((await manager.evidence('fx')).body.categories.find(c=>c.category==='context_capacity').state,'verified','restored preset matches again');
+  fs.writeFileSync(path.join(models,'fx','fx.gguf'),Buffer.alloc(4096,9));
+  assert.equal((await manager.evidence('fx')).body.categories.find(c=>c.category==='context_capacity').state,'stale','replaced artifact');
+  fs.rmSync(path.join(models,'fx','fx.gguf'));
+  assert.equal((await manager.evidence('fx')).body.categories.find(c=>c.category==='context_capacity').state,'unavailable','missing file');
+ }finally{fs.rmSync(root,{recursive:true,force:true});}
+});

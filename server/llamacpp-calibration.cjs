@@ -41,6 +41,7 @@ function createCalibrator(deps) {
     conservativeFor = async () => null,
     readMemory = readMemAvailableGib,
     memoryFloorGib = 2,
+    onResult = () => {},
     sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
     now = () => Date.now(),
     timeouts = {},
@@ -338,10 +339,12 @@ function createCalibrator(deps) {
       const props = await request('/props', {}, 8000).catch(() => null);
       const entry = { at: now(), promptBudgetSeconds: job.promptBudgetSeconds, ...job.result, build: props?.body?.build_info || null, slots: Math.max(1, Number(presets.get(job.model).options.parallel) || 1) };
       state.history[job.model] = [entry, ...(state.history[job.model] || [])].slice(0, HISTORY_PER_MODEL);
+      try { await onResult({ model: job.model, status: 'passed', entry }); } catch { /* evidence is best-effort */ }
     } catch (e) {
       job.status = e.cancelled ? 'cancelled' : 'failed';
       job.phase = e.cancelled ? 'Cancelled' : 'Failed';
       if (!e.cancelled) job.error = e.message || 'Calibration failed.';
+      if (!e.cancelled && e.fatal) { try { await onResult({ model: job.model, status: 'failed', entry: { at: now(), promptBudgetSeconds: job.promptBudgetSeconds, error: job.error } }); } catch { /* best-effort */ } }
       // Put the original profile back; never overwrite a file someone else changed since.
       try {
         if (job.originalText != null && job.lastRevision && presets.snapshot().revision === job.lastRevision) {

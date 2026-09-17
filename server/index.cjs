@@ -197,6 +197,7 @@ const modelManager = createModelManager({
     cachePath: process.env.LLAMACPP_CACHE_PATH || '',
     memoryFloorGib: Number(process.env.LLAMACPP_CALIBRATION_MEMORY_FLOOR_GIB) || 2,
   },
+  evidenceDir: path.join(DATA_DIR,'evidence-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)),
   calibrationStatePath: path.join(DATA_DIR,'native-calibration-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)+'.json'),
   downloadStatePath: path.join(DATA_DIR,'native-downloads-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)+'.json'),
   baseUrl: MODEL_MANAGER_BASE,
@@ -2375,6 +2376,11 @@ async function handleChatInner(req, res, body, authn, preparation) {
       // No vision role, or the description failed. Fall back to handing the
       // images to the answering model directly, if it can read them at all.
       const vision = await visionProbe(provider.baseUrl, upstreamHeaders, model);
+      // A projector error is a capability result for this configuration; an unreachable
+      // engine or timeout is not, so it records nothing.
+      if (provider.id === DEFAULT_PROVIDER_ID && modelManager.recordEvidence && (vision.supported || /projector|mmproj|rejected/i.test(vision.reason || ''))) {
+        modelManager.recordEvidence(model, { category: 'vision', result: vision.supported ? 'passed' : 'failed', value: null, suite: { name: 'vision-probe', version: 1 }, source: 'probe', limitations: vision.supported ? ['1×1 image accepted; not an accuracy test'] : [String(vision.reason || '').slice(0, 200)] }).catch(() => undefined);
+      }
       if (vision.supported) {
         const lastUser = [...wire].reverse().find((m) => m.role === 'user');
         if (lastUser) {
@@ -3926,6 +3932,15 @@ async function handleRequestScoped(req, res) {
       if(!modelManager.reloadPresets)return json(res,404,{error:'This engine does not use a preset file'});
       try { const result=await modelManager.reloadPresets({unload:(await readJson(req))?.unload===true}); return json(res,result.status,result.body); }
       catch(e){ return json(res,e.status||500,{error:e.status===409?'Requests are in progress. Try again when chats finish.':e.message}); }
+    }
+
+    if (p === '/api/models/evidence' && req.method === 'GET') {
+      if (!modelManager.evidence) return json(res, 404, { error: 'Qualification evidence needs the native engine' });
+      const model = url.searchParams.get('model') || '';
+      if (!model || model.length > 200) return json(res, 400, { error: 'Choose a model' });
+      const result = await modelManager.evidence(model);
+      res.setHeader('Cache-Control', 'no-store');
+      return json(res, result.status, result.body);
     }
 
     if (p === '/api/models/calibration' || p === '/api/models/calibration/cancel') {
