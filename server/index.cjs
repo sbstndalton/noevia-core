@@ -238,6 +238,9 @@ const modelManager = createModelManager({
   },
   evidenceDir: path.join(DATA_DIR,'evidence-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)),
   calibrationStatePath: path.join(DATA_DIR,'native-calibration-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)+'.json'),
+  autotuneStatePath: path.join(DATA_DIR,'native-autotune-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)+'.json'),
+  // Measured settings per architecture, quantisation and hardware; shared across models on this server.
+  autotuneTablePath: path.join(DATA_DIR,'native-tuning-table.json'),
   downloadStatePath: path.join(DATA_DIR,'native-downloads-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)+'.json'),
   baseUrl: MODEL_MANAGER_BASE,
   apiKey: process.env.MODEL_MANAGER_API_KEY || INFERENCE_KEY,
@@ -4129,6 +4132,17 @@ async function handleRequestScoped(req, res) {
       return json(res,200,(await modelManager.evidence(model)).body);
     }
 
+    if (p === '/api/models/autotune' || p === '/api/models/autotune/cancel') {
+      if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
+      if(!modelManager.autotune)return json(res,404,{error:'Auto-tune is unavailable'});
+      let result;
+      if(p.endsWith('/cancel')){if(req.method!=='POST')return json(res,405,{error:'Method not allowed'});result=modelManager.autotune.cancel();}
+      else if(req.method==='GET')result=modelManager.autotune.status(url.searchParams.get('model')||'');
+      else if(req.method==='POST'){const body=await readJson(req);result=await modelManager.autotune.start(String(body?.model||''),{confirmPause:body?.confirmPause,promptBudgetSeconds:body?.promptBudgetSeconds,extendContext:body?.extendContext});}
+      else return json(res,405,{error:'Method not allowed'});
+      res.setHeader('Cache-Control','no-store');
+      return json(res,result.status,result.body);
+    }
     if (p === '/api/models/calibration' || p === '/api/models/calibration/cancel') {
       if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
       if(!modelManager.calibration)return json(res,404,{error:'Native calibration is unavailable'});
@@ -4600,6 +4614,7 @@ if (require.main === module) {
     discoverMcpTools().catch(() => undefined);
     // A calibration interrupted by a restart restores the preset it was testing.
     modelManager.calibration?.recover().catch(() => undefined);
+    modelManager.autotune?.recover().catch(() => undefined);
   });
 }
 

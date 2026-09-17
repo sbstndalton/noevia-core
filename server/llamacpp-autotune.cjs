@@ -1,0 +1,315 @@
+'use strict';
+// Measured auto-tune for native llama.cpp models: tune first, then extend.
+//
+// 1. Generation: at the model's current context, try speculative decoding off, the built-in or
+//    beside-the-model MTP head (three draft profiles) and n-gram drafting on fixed short workloads
+//    (list, prose, code), thinking off, temperature 0. A config counts only if it loads, drafts
+//    when it claims to, and reproduces the "off" answer on the deterministic list workload.
+//    The winner must beat "off" by MIN_GAIN on the geometric mean of tokens/s.
+// 2. Prompt: micro-batch sizes on a ~3K-token prompt, keeping the fastest by prompt tokens/s.
+// 3. The winning settings are saved to the preset and recorded in a lookup table keyed by
+//    architecture, quantisation and hardware. The table orders what to try first next time and
+//    proposes extensions (longer context from measured prompt speed, a quantised KV cache when
+//    context is memory-bound); each extension is only applied through a measurement: context
+//    goes through the existing calibration, which starts automatically when asked.
+//
+// Safety mirrors calibration: holds the maintenance gate (chat pauses), refuses to start with
+// requests in flight, restores the original preset on cancel or failure, stops a step when
+// available memory falls below the floor, and aborts if another client loads a model.
+const fs = require('node:fs');
+const crypto = require('node:crypto');
+
+const MIN_GAIN = 0.05;
+const PAD = 'The garden committee reviewed irrigation, seed orders, volunteer rotas and pump maintenance. ';
+const WORKLOADS = [
+  { id: 'list', max: 160, prompt: 'List the whole numbers from 1 to 60, separated by commas, and nothing else.' },
+  { id: 'prose', max: 160, prompt: 'Write one paragraph explaining why community gardens matter to a neighbourhood.' },
+  { id: 'code', max: 200, prompt: 'Write a JavaScript function median(values) that returns the median of an array without modifying it. Code only.' },
+];
+const SPEC_CANDIDATES = [
+  { id: 'off', label: 'Off', options: { 'spec-type': 'none', 'spec-draft-n-max': '', 'spec-draft-p-min': '' } },
+  { id: 'mtp', label: 'MTP (engine defaults)', needsHead: true, options: { 'spec-type': 'draft-mtp', 'spec-draft-n-max': '', 'spec-draft-p-min': '' } },
+  { id: 'mtp-deep', label: 'MTP deep drafts', needsHead: true, options: { 'spec-type': 'draft-mtp', 'spec-draft-n-max': '8', 'spec-draft-p-min': '0.05' } },
+  { id: 'mtp-shallow', label: 'MTP shallow drafts', needsHead: true, options: { 'spec-type': 'draft-mtp', 'spec-draft-n-max': '2', 'spec-draft-p-min': '0.6' } },
+  { id: 'ngram', label: 'N-gram', options: { 'spec-type': 'ngram-simple', 'spec-draft-n-max': '', 'spec-draft-p-min': '' } },
+];
+const UBATCH_CANDIDATES = [512, 1024, 2048];
+const HISTORY_PER_MODEL = 10;
+
+function geomean(values) {
+  const v = values.filter((x) => x > 0);
+  return v.length ? Math.exp(v.reduce((a, x) => a + Math.log(x), 0) / v.length) : 0;
+}
+
+// ── lookup table ──────────────────────────────────────────────────────────
+function createTable(file) {
+  const read = () => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return { entries: {} }; } };
+  const keyOf = ({ arch, quant, hardware }) => [arch || '?', quant || '?', hardware || '?'].join('|');
+  function record(identity, result) {
+    const data = read();
+    data.entries[keyOf(identity)] = { ...identity, ...result, at: Date.now() };
+    const tmp = `${file}.${crypto.randomUUID()}`;
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 1), { mode: 0o600 });
+    fs.renameSync(tmp, file);
+  }
+  // Exact match first, then same architecture on this hardware, then same architecture anywhere.
+  function lookup({ arch, quant, hardware }) {
+    const all = Object.values(read().entries);
+    return all.find((e) => e.arch === arch && e.quant === quant && e.hardware === hardware)
+      || all.filter((e) => e.arch === arch && e.hardware === hardware).sort((a, b) => b.at - a.at)[0]
+      || all.filter((e) => e.arch === arch).sort((a, b) => b.at - a.at)[0] || null;
+  }
+  // Candidates in the order most likely to win, so a cancelled run still learned the best one.
+  function order(identity, candidates) {
+    const hit = lookup(identity);
+    if (!hit?.spec) return candidates;
+    const off = candidates.filter((c) => c.id === 'off'), prior = candidates.filter((c) => c.id === hit.spec && c.id !== 'off');
+    return [...off, ...prior, ...candidates.filter((c) => c.id !== 'off' && c.id !== hit.spec)];
+  }
+  return { record, lookup, order, read };
+}
+
+// Extensions the measurements justify. Each is a proposal the tuner or the user then verifies.
+function extensions({ options, native, promptPerSecond, budgetSeconds, calibratedCtx }) {
+  const out = [];
+  const ctx = Number(options['ctx-size']) || 0;
+  if (promptPerSecond > 0) {
+    const byTime = Math.floor(promptPerSecond * budgetSeconds);
+    const target = Math.min(native || byTime, byTime);
+    if (target > ctx * 1.25) out.push({ id: 'context', action: 'calibrate', from: ctx, to: target,
+      why: `measured prompt speed (${Math.round(promptPerSecond)} tokens/s) fills about ${target.toLocaleString('en-US')} tokens within ${budgetSeconds} s` });
+  }
+  const k = options['cache-type-k'] || 'f16';
+  if (calibratedCtx && native && calibratedCtx < native && ['f16', 'f32', 'bf16'].includes(k)) {
+    out.push({ id: 'kv-q8', action: 'apply-then-calibrate', options: { 'cache-type-k': 'q8_0', 'cache-type-v': 'q8_0' },
+      why: 'context stopped below the trained length; a q8_0 KV cache halves its memory at a small quality cost' });
+  }
+  return out;
+}
+
+function createAutotuner(deps) {
+  const {
+    request, rawModels, presets, maintenance, applyUnlocked, stateFile, tableFile,
+    identityFor = async () => ({}), calibrate = async () => null,
+    readMemory = require('./llamacpp-calibration.cjs').readMemAvailableGib, memoryFloorGib = 2,
+    sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = () => Date.now(), timeouts = {},
+  } = deps;
+  const limits = { load: 600000, chat: 180000, unload: 60000, poll: 500, ...timeouts };
+  const table = createTable(tableFile);
+  let state = { job: null, history: {} };
+  let cancelRequested = false;
+  const load = () => { try { state = JSON.parse(fs.readFileSync(stateFile, 'utf8')); } catch { state = { job: null, history: {} }; } if (!state.history) state.history = {}; };
+  const save = () => { if (!stateFile) return; const tmp = `${stateFile}.${crypto.randomUUID()}`; fs.writeFileSync(tmp, JSON.stringify(state), { mode: 0o600 }); fs.renameSync(tmp, stateFile); };
+  const publicJob = (job) => job && (({ originalText, ...rest }) => rest)(job);
+  const cancelled = () => Object.assign(Error('cancelled'), { cancelled: true });
+  const fatal = (message) => Object.assign(Error(message), { fatal: true });
+
+  async function listing() {
+    const r = await rawModels();
+    if (!r.ok || !Array.isArray(r.body?.data)) throw fatal('The model server is not responding.');
+    return r.body.data;
+  }
+  async function unload(model) {
+    await request('/models/unload', { method: 'POST', body: JSON.stringify({ model }) }, limits.unload).catch(() => {});
+    for (const until = now() + limits.unload; now() < until;) {
+      const row = (await listing().catch(() => [])).find((m) => m.id === model);
+      if (!row || !['loaded', 'loading'].includes(row.status?.value)) return;
+      await sleep(limits.poll);
+    }
+  }
+  async function unloadAll() {
+    for (const m of await listing()) if (['loaded', 'loading'].includes(m.status?.value)) await unload(m.id);
+  }
+  async function loadAndWait(model) {
+    const started = await request('/models/load', { method: 'POST', body: JSON.stringify({ model }) }, 120000).catch(() => null);
+    if (!started?.ok) return false;
+    for (const until = now() + limits.load; now() <= until;) {
+      if (cancelRequested) throw cancelled();
+      const memory = readMemory();
+      if (memory != null && memory < memoryFloorGib) return false;
+      const rows = await listing();
+      if (rows.some((m) => m.id !== model && ['loaded', 'loading'].includes(m.status?.value))) throw fatal('Another client loaded a model during auto-tune. Stop Diary background jobs and other clients, then retry.');
+      const row = rows.find((m) => m.id === model);
+      if (row?.status?.value === 'loaded') return true;
+      if (!row || row.status?.failed || row.status?.value === 'unloaded') return false;
+      await sleep(limits.poll);
+    }
+    return false;
+  }
+  async function chat(model, prompt, max) {
+    const r = await request('/v1/chat/completions', { method: 'POST', body: JSON.stringify({
+      model, stream: false, temperature: 0, max_tokens: max, cache_prompt: false,
+      chat_template_kwargs: { enable_thinking: false }, messages: [{ role: 'user', content: prompt }] }) }, limits.chat);
+    if (!r.ok || !Array.isArray(r.body?.choices)) return null;
+    const t = r.body.timings || {};
+    return { text: r.body.choices[0]?.message?.content || '', gen: Number(t.predicted_per_second) || 0, prompt: Number(t.prompt_per_second) || 0,
+      drafted: Number(t.draft_n) || 0, accepted: Number(t.draft_n_accepted) || 0 };
+  }
+
+  // Write options, load, measure, unload. Returns the step record.
+  async function measure(job, kind, candidate, options, run) {
+    if (cancelRequested) throw cancelled();
+    const record = { kind, id: candidate.id, label: candidate.label, status: 'running', startedAt: now() };
+    job.steps.push(record); job.phase = `${kind === 'spec' ? 'Generation' : 'Prompt'} test: ${candidate.label}`; save();
+    try {
+      const applied = await applyUnlocked({ model: job.model, baseRevision: presets.get(job.model).revision, options });
+      if (!applied.ok) throw fatal(applied.body?.error || 'Could not write the test profile.');
+      job.lastRevision = presets.get(job.model).revision;
+      if (!await loadAndWait(job.model)) { record.status = 'failed'; record.reason = 'Did not load with these settings.'; return record; }
+      await chat(job.model, 'Reply with OK.', 8); // warm-up: first request pays graph setup
+      Object.assign(record, await run());
+      return record;
+    } catch (e) {
+      if (e.cancelled || e.fatal) { record.status = e.cancelled ? 'skipped' : 'failed'; record.reason = e.message; throw e; }
+      record.status = 'failed'; record.reason = 'The engine failed during this test.'; return record;
+    } finally {
+      record.seconds = Math.round((now() - record.startedAt) / 1000);
+      save();
+      await unload(job.model).catch(() => {});
+    }
+  }
+
+  async function run(job, release) {
+    let calibrateAfter = null;
+    try {
+      await unloadAll();
+      const snapshot = presets.snapshot();
+      job.originalText = snapshot.text; job.originalRevision = snapshot.revision; save();
+      const identity = await identityFor(job.model).catch(() => ({})) || {};
+      job.identity = identity;
+      const base = { ...presets.get(job.model).options };
+
+      // 1. Generation.
+      let reference = null;
+      const spec = [];
+      for (const candidate of table.order(identity, SPEC_CANDIDATES)) {
+        const rec = await measure(job, 'spec', candidate, candidate.options, async () => {
+          const rows = [];
+          for (const w of WORKLOADS) {
+            const r = await chat(job.model, w.prompt, w.max);
+            if (!r) return { status: 'failed', reason: `No answer on the ${w.id} workload.` };
+            rows.push({ workload: w.id, gen: Math.round(r.gen * 10) / 10, drafted: r.drafted, accepted: r.accepted, text: r.text });
+          }
+          return { status: 'measured', workloads: rows, score: Math.round(geomean(rows.map((x) => x.gen)) * 10) / 10 };
+        });
+        if (rec.status !== 'measured') { spec.push(rec); continue; }
+        const byId = Object.fromEntries(rec.workloads.map((w) => [w.workload, w]));
+        // Copy the reference answers: the step record drops its texts below to stay small.
+        if (candidate.id === 'off') reference = Object.fromEntries(Object.entries(byId).map(([k, w]) => [k, { text: w.text }]));
+        if (candidate.needsHead && !rec.workloads.some((w) => w.drafted > 0)) { rec.status = 'rejected'; rec.reason = 'No MTP head: nothing was drafted.'; }
+        else if (reference && candidate.id !== 'off' && byId.list?.text !== reference.list?.text) { rec.status = 'rejected'; rec.reason = 'Changed the deterministic list output.'; }
+        for (const w of rec.workloads) delete w.text;
+        spec.push(rec);
+      }
+      const off = spec.find((s) => s.id === 'off' && s.status === 'measured');
+      if (!off) throw fatal('The model did not run with speculative decoding off, so nothing could be compared.');
+      const bestSpec = spec.filter((s) => s.status === 'measured').sort((a, b) => b.score - a.score)[0];
+      const specWinner = bestSpec.id !== 'off' && bestSpec.score >= off.score * (1 + MIN_GAIN) ? bestSpec : off;
+      const perWorkload = Object.fromEntries(WORKLOADS.map((w) => {
+        const best = spec.filter((s) => s.status === 'measured').map((s) => ({ id: s.id, gen: s.workloads.find((x) => x.workload === w.id)?.gen || 0 })).sort((a, b) => b.gen - a.gen)[0];
+        return [w.id, best?.id || 'off'];
+      }));
+      const winnerOptions = SPEC_CANDIDATES.find((c) => c.id === specWinner.id).options;
+
+      // 2. Prompt throughput (micro-batch), on top of the generation winner.
+      const tokensTarget = 3000;
+      const prompt = `${PAD.repeat(Math.ceil(tokensTarget / 18))}\nIn one sentence, what did the committee review?`;
+      const batch = [];
+      for (const ub of UBATCH_CANDIDATES) {
+        const candidate = { id: `ubatch-${ub}`, label: `Micro-batch ${ub}` };
+        const options = { ...winnerOptions, 'ubatch-size': String(ub), 'batch-size': String(Math.max(2048, ub)) };
+        const rec = await measure(job, 'prompt', candidate, options, async () => {
+          const r = await chat(job.model, prompt, 16);
+          return r && r.prompt > 0 ? { status: 'measured', promptPerSecond: Math.round(r.prompt) } : { status: 'failed', reason: 'The long prompt failed.' };
+        });
+        rec.options = options;
+        batch.push(rec);
+      }
+      const bestBatch = batch.filter((b) => b.status === 'measured').sort((a, b) => b.promptPerSecond - a.promptPerSecond)[0];
+      const finalOptions = bestBatch ? bestBatch.options : winnerOptions;
+
+      // 3. Save the winner and leave it loaded.
+      const applied = await applyUnlocked({ model: job.model, baseRevision: presets.get(job.model).revision, options: finalOptions });
+      if (!applied.ok) throw fatal(applied.body?.error || 'Could not save the tuned profile.');
+      job.lastRevision = presets.get(job.model).revision;
+      const tuned = { ...base, ...Object.fromEntries(Object.entries(finalOptions).filter(([, v]) => v !== '')) };
+      for (const [k, v] of Object.entries(finalOptions)) if (v === '') delete tuned[k];
+      const ext = extensions({ options: tuned, native: job.native, promptPerSecond: bestBatch?.promptPerSecond || 0, budgetSeconds: job.promptBudgetSeconds, calibratedCtx: 0 });
+      job.result = {
+        spec: specWinner.id, specLabel: specWinner.label, generation: specWinner.score, generationOff: off.score,
+        gain: off.score > 0 ? Math.round((specWinner.score / off.score - 1) * 100) : 0, perWorkload,
+        ubatch: bestBatch ? Number(bestBatch.options['ubatch-size']) : null, promptPerSecond: bestBatch?.promptPerSecond || null,
+        applied: finalOptions, extensions: ext,
+      };
+      table.record(identity, { spec: specWinner.id, perWorkload, generation: specWinner.score, generationOff: off.score, ubatch: job.result.ubatch, promptPerSecond: job.result.promptPerSecond, model: job.model });
+      job.phase = 'Loading the tuned profile'; save();
+      job.result.loaded = await loadAndWait(job.model).catch(() => false);
+      job.status = 'passed'; job.phase = 'Done';
+      state.history[job.model] = [{ at: now(), ...job.result }, ...(state.history[job.model] || [])].slice(0, HISTORY_PER_MODEL);
+      if (job.extendContext && ext.some((e) => e.id === 'context')) calibrateAfter = job.model;
+    } catch (e) {
+      job.status = e.cancelled ? 'cancelled' : 'failed';
+      job.phase = e.cancelled ? 'Cancelled' : 'Failed';
+      if (!e.cancelled) job.error = e.message || 'Auto-tune failed.';
+      try {
+        if (job.originalText != null && job.lastRevision && presets.snapshot().revision === job.lastRevision) {
+          presets.commit({ baseRevision: job.lastRevision, text: job.originalText });
+          await request('/models?reload=1', {}, 120000).catch(() => {});
+          job.restored = true;
+        } else if (job.originalText != null && job.lastRevision) job.restored = false;
+      } catch { job.restored = false; }
+    } finally {
+      job.finishedAt = now();
+      delete job.originalText;
+      cancelRequested = false;
+      save();
+      release();
+    }
+    // Extension step: context is only raised through the measured calibration, after the gate is free.
+    if (calibrateAfter) {
+      const started = await calibrate(calibrateAfter, job.promptBudgetSeconds).catch((e) => ({ ok: false, body: { error: e.message } }));
+      job.calibration = started?.ok ? 'started' : `not started: ${started?.body?.error || 'unavailable'}`;
+      save();
+    }
+  }
+
+  async function start(model, { confirmPause, promptBudgetSeconds = 120, extendContext = false } = {}) {
+    if (confirmPause !== true) return { ok: false, status: 400, body: { error: 'Confirm that chat can pause and that Diary background jobs and other clients are stopped.' } };
+    promptBudgetSeconds = Number(promptBudgetSeconds);
+    if (!Number.isInteger(promptBudgetSeconds) || promptBudgetSeconds < 15 || promptBudgetSeconds > 1800) return { ok: false, status: 400, body: { error: 'Choose a prompt time limit between 15 and 1800 seconds.' } };
+    if (state.job?.status === 'running') return { ok: false, status: 409, body: { error: 'Auto-tune is already running.' } };
+    let rows;
+    try { rows = await listing(); } catch { return { ok: false, status: 502, body: { error: 'The model server is not responding.' } }; }
+    const row = rows.find((m) => m.id === model);
+    if (!row) return { ok: false, status: 404, body: { error: 'Choose an installed model.' } };
+    if (!presets.get(model).exists) return { ok: false, status: 409, body: { error: 'Set up this model first; auto-tune starts from its saved settings.' } };
+    let release;
+    try { release = maintenance.hold(`Chat is paused while noevia auto-tunes ${model}. It will be available again when tuning finishes or is cancelled.`); }
+    catch { return { ok: false, status: 409, body: { error: 'Requests are in progress. Wait for them to finish, then start auto-tune.' } }; }
+    cancelRequested = false;
+    const job = { id: crypto.randomUUID(), model, promptBudgetSeconds, extendContext: extendContext === true, native: Number(row.meta?.n_ctx_train) || 0, status: 'running', phase: 'Preparing', startedAt: now(), steps: [] };
+    state.job = job; save();
+    run(job, release).catch(() => {});
+    return { ok: true, status: 202, body: publicJob(job) };
+  }
+  function cancel() {
+    if (state.job?.status !== 'running') return { ok: false, status: 409, body: { error: 'No auto-tune is running.' } };
+    cancelRequested = true;
+    return { ok: true, status: 202, body: publicJob(state.job) };
+  }
+  function status(model) {
+    return { ok: true, status: 200, body: { job: publicJob(state.job), history: model ? state.history[model] || [] : undefined, table: model ? null : undefined } };
+  }
+  async function recover() {
+    load();
+    const job = state.job;
+    if (!job || job.status !== 'running') return;
+    job.status = 'interrupted'; job.finishedAt = now(); job.error = 'noevia stopped during auto-tune.';
+    try { if (job.originalText != null && job.lastRevision) { presets.commit({ baseRevision: job.lastRevision, text: job.originalText }); job.restored = true; await request('/models?reload=1', {}, 120000).catch(() => {}); } } catch { job.restored = false; }
+    delete job.originalText; save();
+  }
+  load();
+  return { start, cancel, status, recover, table, _state: () => state };
+}
+
+module.exports = { createAutotuner, createTable, extensions, geomean, SPEC_CANDIDATES, WORKLOADS, MIN_GAIN };

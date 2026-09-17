@@ -12,7 +12,7 @@ function nativeLabels(model) {
     ...(model.architecture?.input_modalities?.includes('image') ? ['vision'] : []),
   ];
 }
-function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig = {}, calibrationStatePath, calibrationOptions = {}, evidenceDir }) {
+function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig = {}, calibrationStatePath, calibrationOptions = {}, evidenceDir, autotuneStatePath, autotuneTablePath, autotuneOptions = {} }) {
   const base = String(baseUrl || '').replace(/\/+$/, '').replace(/\/v1$/, '');
   const url = new URL(base);
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw Error('Invalid llama.cpp router URL');
@@ -244,7 +244,19 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
       categories:evidenceLib.CATEGORIES.map(category=>{const d=evidenceLib.derive(records,{model,category,liveHash:live?.identityHash||null});
         return {category,state:d.state,value:d.record?.value??null,result:d.record?.result??null,at:d.record?.at??null,suite:d.record?.suite??null,limitations:d.record?.limitations||[]};})}};
   }
+  // Identity for the auto-tune lookup table: architecture, quantisation and hardware class.
+  async function tuneIdentity(model){
+    const read=await readModel(model);
+    const file=read.modelFile?.file||'';
+    const quant=(/(?:^|[-_.])((?:UD-)?(?:IQ\d[\w]*|Q\d(?:_[\dKSMLX]+)*|F16|BF16|F32|MXFP4))(?:[-_.]|\.gguf$)/i.exec(require('node:path').basename(file))||[])[1]||null;
+    let build=null;try{build=(await request('/props',{},8000))?.body?.build_info||null;}catch{}
+    let memGiB=null;try{memGiB=Math.round(Number(/^MemTotal:\s+(\d+)/m.exec(require('node:fs').readFileSync('/proc/meminfo','utf8'))[1])/1048576);}catch{}
+    return {arch:read.meta?.arch||null,quant:quant&&quant.toUpperCase(),hardware:[autoconfig.hardwareLabel||null,memGiB?`${memGiB}GiB`:null,build].filter(Boolean).join(' ')||null};
+  }
   const calibrator=presets?require('./llamacpp-calibration.cjs').createCalibrator({request,rawModels,presets,maintenance,applyUnlocked,conservativeFor,onResult:({model,status,entry})=>recordEvidence(model,status==='passed'?{category:'context_capacity',result:'passed',value:{ctx:entry.verifiedCtx,appliedCtx:entry.appliedCtx,slots:entry.slots},suite:{name:'native-calibration',version:1},source:'calibration',limitations:[`prompt budget ${entry.promptBudgetSeconds} s`]}:{category:'context_capacity',result:'failed',value:null,suite:{name:'native-calibration',version:1},source:'calibration',limitations:[String(entry.error||'').slice(0,200)]}),stream:(path,opts={})=>(fetchStream||fetch)(base+path,{...opts,headers:headers(opts.headers),redirect:'error'}),stateFile:calibrationStatePath,memoryFloorGib:autoconfig.memoryFloorGib||2,...calibrationOptions}):null;
+  const autotuner=presets&&autotuneStatePath?require('./llamacpp-autotune.cjs').createAutotuner({request,rawModels,presets,maintenance,applyUnlocked,identityFor:tuneIdentity,
+    calibrate:(model,promptBudgetSeconds)=>calibrator.start(model,{confirmPause:true,promptBudgetSeconds}),
+    stateFile:autotuneStatePath,tableFile:autotuneTablePath,memoryFloorGib:autoconfig.memoryFloorGib||2,...(calibrationOptions.readMemory?{readMemory:calibrationOptions.readMemory}:{}),...autotuneOptions}):null;
   return {
     kind: 'llamacpp', enabled: true, baseUrl: base, headers, request,
     capabilities: { routing: true, load: true, unload: true, download: true, deleteCached: true, runtimeOptions: false, hardware: false, presets: !!presets },
@@ -258,6 +270,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     reloadPresets,
     evidence, recordEvidence,
     calibration: calibrator ? { start: calibrator.start, cancel: calibrator.cancel, status: calibrator.status, recover: calibrator.recover } : null,
+    autotune: autotuner ? { start: autotuner.start, cancel: autotuner.cancel, status: autotuner.status, recover: autotuner.recover } : null,
     unload: model => mutate(()=>post('/models/unload', { model })),
     pull: ({ checkpoint }) => mutate(async () => {
       if (!/^[\w.-]+\/[\w.-]+(?::[\w.-]+)?$/.test(checkpoint || '')) return { ok: false, status: 400, body: { error: 'Choose a Hugging Face repository and quantization' } };
