@@ -385,7 +385,8 @@ function loadChats(projectId) {
 function saveChats(projectId, chats) {
   const p = getProject(projectId);
   if (!p) return;
-  p.chats = chats.slice(0, 200);
+  const lists = require('./chat-lists.cjs');
+  p.chats = lists.mergeChats(p.chats, chats, lists.readTombstones(currentWorkspace().dir));
   saveProjects(PROJECTS);
 }
 
@@ -395,6 +396,7 @@ function deleteChat(projectId, chatId) {
   const before = (p.chats || []).length;
   p.chats = (p.chats || []).filter((c) => c.id !== chatId);
   if (p.chats.length === before) return false;
+  require('./chat-lists.cjs').addTombstone(currentWorkspace().dir, chatId);
   saveProjects(PROJECTS);
   try {
     require('./chat-context.cjs').remove(currentWorkspace().dir,chatId);
@@ -423,6 +425,7 @@ function deleteFreeChat(chatId) {
   const filtered = Array.from(FREE_CHATS).filter((c) => c.id !== chatId);
   FREE_CHATS.splice(0, FREE_CHATS.length, ...filtered);
   if (FREE_CHATS.length === before) return false;
+  require('./chat-lists.cjs').addTombstone(currentWorkspace().dir, chatId);
   saveFreeChats(FREE_CHATS);
   try {
     require('./chat-context.cjs').remove(currentWorkspace().dir,chatId);
@@ -2250,7 +2253,7 @@ async function handleChatInner(req, res, body, authn, preparation) {
     }
     if (project && !chatId) {
       chatId = `p-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      saveChats(projectId, [...loadChats(projectId), chatId]);
+      saveChats(projectId, [{ id: chatId, title: 'New task', updatedAt: Date.now(), preview: '' }]);
     }
   }
 
@@ -3531,7 +3534,7 @@ async function handleRequestScoped(req, res) {
             id,
             body.chats
               .filter((c) => c && typeof c.id === 'string')
-              .slice(0, 200)
+              .slice(0, require('./chat-lists.cjs').LIST_CAP)
               .map((c) => ({
                 id: c.id.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80),
                 title: String(c.title || 'New task').slice(0, 120),
@@ -3965,7 +3968,7 @@ async function handleRequestScoped(req, res) {
           if (!Array.isArray(body.chats)) return json(res, 400, { error: 'chats array required' });
           const nextFreeChats = body.chats
             .filter((c) => c && typeof c.id === 'string')
-            .slice(0, 200)
+            .slice(0, require('./chat-lists.cjs').LIST_CAP)
             .map((c) => ({
               id: c.id.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80),
               title: String(c.title || 'New chat').slice(0, 120),
@@ -3974,7 +3977,8 @@ async function handleRequestScoped(req, res) {
               pinned: c.pinned === true,
               archived: c.archived === true,
             }));
-          FREE_CHATS.splice(0, FREE_CHATS.length, ...nextFreeChats);
+          const lists = require('./chat-lists.cjs');
+          FREE_CHATS.splice(0, FREE_CHATS.length, ...lists.mergeChats(Array.from(FREE_CHATS), nextFreeChats, lists.readTombstones(currentWorkspace().dir)));
           saveFreeChats(FREE_CHATS);
           return json(res, 200, { ok: true });
         } catch {
