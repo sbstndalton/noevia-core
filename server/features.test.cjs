@@ -54,3 +54,18 @@ test('flags() exposes booleans only', () => {
   const flags = createFeatures({ env: {}, store: memoryStore() }).flags();
   for (const v of Object.values(flags)) assert.equal(typeof v, 'boolean');
 });
+
+test('features wired at startup report a pending restart instead of pretending to be live', () => {
+  const m = new Map();
+  const features = createFeatures({ env: {}, store: { get: (k) => m.get(k), set: (k, v) => m.set(k, v) } });
+  features.set('kiwix', true, 'admin');
+  assert.equal(features.enabled('kiwix'), false, 'the running server still has no Kiwix tools');
+  const row = features.describe().find((f) => f.name === 'kiwix');
+  assert.deepEqual([row.enabled, row.pendingRestart], [true, true]);
+  features.set('kiwix', false, 'admin');
+  assert.equal(features.describe().find((f) => f.name === 'kiwix').pendingRestart, false);
+  features.set('previews', true, 'admin');
+  assert.equal(features.enabled('previews'), true, 'live features apply at once');
+  assert.equal(features.describe().find((f) => f.name === 'previews').pendingRestart, false);
+  assert.equal(createFeatures({ env: {}, store: { get: (k) => m.get(k), set() {} } }).enabled('previews'), true);
+});
