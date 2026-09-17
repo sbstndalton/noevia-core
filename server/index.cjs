@@ -2451,6 +2451,8 @@ async function handleChatInner(req, res, body, authn, preparation) {
   // Track final-answer content separately for each round. Reasoning may contain
   // internal planning or unfinished narration; it is never promoted to an answer.
   let roundHasContent = false;
+  // Text streamed in a round that then calls tools is narration, not the answer.
+  let roundContent = '';
   let roundReasoning = '';
   let toolOffset = 0;
   for (let round = 0; round < 3 && !chatSignal.signal.aborted; round++) {
@@ -2484,6 +2486,7 @@ async function handleChatInner(req, res, body, authn, preparation) {
     let sawAnything = false;
     roundReasoning = '';
     roundHasContent = false;
+    roundContent = '';
     // SSE line reassembly must live outside the chunk loop so a `data: {...}`
     // line split across a chunk boundary keeps its leading fragment
     // (same pattern as the client-side reader in src/api.ts).
@@ -2541,6 +2544,7 @@ async function handleChatInner(req, res, body, authn, preparation) {
             if (delta.content) {
               sawAnything = true;
               roundHasContent = true;
+              roundContent += delta.content;
               send({ type: 'delta', text: delta.content });
             }
             if (Array.isArray(delta.tool_calls)) {
@@ -2584,7 +2588,7 @@ async function handleChatInner(req, res, body, authn, preparation) {
         require('./mtp.cjs').record(chatWorkspace?.userId,model,full.body?.timings);
         const msg = full.body?.choices?.[0]?.message;
         if (msg?.reasoning_content) { roundReasoning += msg.reasoning_content; send({ type: 'reasoning', text: msg.reasoning_content }); }
-        if (msg?.content) { roundHasContent = true; send({ type: 'delta', text: msg.content }); }
+        if (msg?.content) { roundHasContent = true; roundContent += msg.content; send({ type: 'delta', text: msg.content }); }
         if (Array.isArray(msg?.tool_calls)) {
           for (const tc of msg.tool_calls) {
             const index = toolCalls.size;
@@ -2605,6 +2609,7 @@ async function handleChatInner(req, res, body, authn, preparation) {
     // cannot be fed back to the model), but they are still streamed to the
     // user instead of dangling.
     if (toolCalls.size > 0) {
+      if (roundContent.trim()) { send({ type: 'preamble', text: roundContent }); roundHasContent = false; }
       const assistantMsg = { role: 'assistant', content: null, tool_calls: [...toolCalls.entries()].map(([i, tc]) => ({ id: tc.id, type: 'function', function: { name: tc.name, arguments: tc.args } })) };
       roundMessages = [...roundMessages, assistantMsg];
       for (const [toolIndex, tc] of toolCalls) {

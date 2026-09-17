@@ -14,7 +14,7 @@ const handler = source.slice(source.indexOf('async function handleChat('), sourc
 const contextDir=fs.mkdtempSync(require('node:path').join(require('node:os').tmpdir(),'chat-handler-test-'));
 test.after(()=>fs.rmSync(contextDir,{recursive:true,force:true}));
 
-function fixture({ rounds, decision = 'approve', execute, fallback = false, cancel = false, effort, reasoningOnly = false, skills = [], native = false } = {}) {
+function fixture({ rounds, decision = 'approve', execute, fallback = false, cancel = false, effort, reasoningOnly = false, skills = [], native = false, preambleText = '' } = {}) {
   const events = [], executions = [], approvals = [], requests = [], audits = [];
   let round = 0, allApproved = false;
   const res = new EventEmitter();
@@ -61,7 +61,7 @@ function fixture({ rounds, decision = 'approve', execute, fallback = false, canc
         { index, id: tc.id, function: { name: tc.name, arguments: tc.args.slice(0, 2) } },
         { index, function: { arguments: tc.args.slice(2) } },
       ]);
-      const wire = !calls.length ? 'data: ' + JSON.stringify({ choices: [{ delta: { ...(reasoningOnly ? {reasoning_content:'Synthetic internal plan: maybe search, then consider alternatives.'} : {content:'Finished.'}) } }] }) + '\n\n' : deltas.map(tc => 'data: ' + JSON.stringify({ choices: [{ delta: { tool_calls: [tc] } }] }) + '\n\n').join('');
+      const wire = !calls.length ? 'data: ' + JSON.stringify({ choices: [{ delta: { ...(reasoningOnly ? {reasoning_content:'Synthetic internal plan: maybe search, then consider alternatives.'} : {content:'Finished.'}) } }] }) + '\n\n' : (preambleText ? 'data: ' + JSON.stringify({ choices: [{ delta: { content: preambleText } }] }) + '\n\n' : '') + deltas.map(tc => 'data: ' + JSON.stringify({ choices: [{ delta: { tool_calls: [tc] } }] }) + '\n\n').join('');
       return { ok: true, body: (async function* () {
         yield Buffer.from(wire.slice(0, 17)); yield Buffer.from(wire.slice(17));
       })() };
@@ -247,4 +247,14 @@ test('actual chat request indexes the exact skill filename even when its display
 for(const decision of ['approve','deny','approve_all'])test(`native manager preserves write approval action ${decision}`,async()=>{
  const f=fixture({native:true,decision,rounds:[[call('native-a'),call('native-b','write','{"a":2}')]]});
  await f.run();assert.equal(f.executions.length,decision==='deny'?0:2);assert.equal(f.approvals.length,decision==='approve_all'?1:2);assert.equal(f.events.find(e=>e.type==='context').limit,32768);
+});
+
+test('text streamed before a tool call is marked as preamble, the final answer is not', async () => {
+  const f = fixture({ rounds: [[call('p1', 'read', '{}')], []], preambleText: 'Let me look that up.' });
+  await f.run();
+  const pre = f.events.filter(e => e.type === 'preamble');
+  assert.equal(pre.length, 1);
+  assert.equal(pre[0].text, 'Let me look that up.');
+  const idx = f.events.findIndex(e => e.type === 'preamble');
+  assert.ok(f.events.slice(idx).some(e => e.type === 'delta' && e.text !== 'Let me look that up.'));
 });
