@@ -79,18 +79,26 @@ function codingIdentity({ harness, harnessVersion = null, model = null, provider
  * Fold what a run reported into one summary, naming what the harness did not say.
  * `limitations` is the honest part: it is what stops this being read as a measurement.
  */
-function summarize({ agent = {}, usage = null, exits = [], turns = 0 } = {}) {
+function summarize(input = {}) {
+  // Defaults only fill in `undefined`, and every caller here is handling values that came from
+  // somewhere else. A module whose whole job is reading unknown shapes must not crash on `null`.
+  const source = input && typeof input === 'object' ? input : {};
+  const agent = source.agent && typeof source.agent === 'object' ? source.agent : {};
+  const usage = source.usage && typeof source.usage === 'object' ? source.usage : null;
+  const exits = Array.isArray(source.exits) ? source.exits.filter((e) => e && typeof e === 'object') : [];
+  const turns = Number.isFinite(source.turns) ? source.turns : 0;
+
   const limitations = [];
   if (!agent.version) limitations.push('The harness did not report its version, so this cannot be scoped to one.');
-  if (!usage || usage.total === null) limitations.push('The harness did not report token usage.');
+  if (!usage || usage.total === null || usage.total === undefined) limitations.push('The harness did not report token usage.');
   if (!exits.length) limitations.push('No command exit codes were reported.');
   return {
-    harness: agent.name || null,
-    harnessVersion: agent.version || null,
-    protocolVersion: agent.protocolVersion ?? null,
-    usage: usage && usage.total !== null ? usage : null,
+    harness: typeof agent.name === 'string' ? agent.name : null,
+    harnessVersion: typeof agent.version === 'string' ? agent.version : null,
+    protocolVersion: Number.isFinite(agent.protocolVersion) ? agent.protocolVersion : null,
+    usage: usage && usage.total !== null && usage.total !== undefined ? usage : null,
     commands: exits.length,
-    failedCommands: exits.filter((e) => e.exitCode !== null && e.exitCode !== 0).length,
+    failedCommands: exits.filter((e) => Number.isInteger(e.exitCode) && e.exitCode !== 0).length,
     exitCodes: exits.slice(0, 50),
     turns,
     limitations,

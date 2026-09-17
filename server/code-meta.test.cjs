@@ -83,3 +83,18 @@ test('the exit-code list is bounded in the summary', () => {
   assert.equal(out.commands, 80);
   assert.equal(out.exitCodes.length, 50);
 });
+
+test('a summary survives whatever it is handed', () => {
+  // Found by fuzzing: `agent: null` crashed, because a default only fills in `undefined`. This
+  // module exists to read shapes nobody has verified, so it must not be the thing that throws.
+  for (const input of [null, undefined, {}, 'nope', 42, { agent: null }, { agent: 'opencode' },
+    { usage: null }, { usage: 'lots' }, { exits: null }, { exits: 'none' }, { exits: [null, 3] }, { turns: NaN }]) {
+    const out = summarize(input);
+    assert.equal(typeof out.commands, 'number', JSON.stringify(input));
+    assert.equal(out.turns >= 0, true);
+    assert.ok(Array.isArray(out.limitations));
+    assert.ok(out.harness === null || typeof out.harness === 'string');
+  }
+  assert.equal(summarize({ agent: { name: 42, version: [] } }).harness, null, 'a name that is not a name is absent');
+  assert.equal(summarize({ exits: [{ exitCode: 0 }, { exitCode: 2 }, { exitCode: null }] }).failedCommands, 1);
+});
