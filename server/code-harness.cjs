@@ -52,6 +52,8 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
 
     jobs.run(taskId, async (ctx) => {
       const session = createSession({ taskId, ctx, workspace, domains, capabilities, harness, model });
+      // Recorded first so a running task is identifiable in the list, not just once it ends.
+      ctx.checkpoint({ branch: workspace.branch, task: String(prompt).slice(0, 120) });
       try {
         const agent = await connect({
           taskId, harness, model, cwd: workspace.path,

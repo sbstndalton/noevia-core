@@ -40,6 +40,7 @@ function view(job, pending = null) {
   if (!job) return null;
   return {
     id: job.id, status: job.status, stage: job.stage, error: job.error,
+    task: job.checkpoint?.task || null, branch: job.checkpoint?.branch || null,
     createdAt: job.createdAt, updatedAt: job.updatedAt,
     capabilities: job.capabilities,
     steps: job.steps, plan: job.plan,
