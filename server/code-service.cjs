@@ -14,6 +14,21 @@ const { createCodeWorkspaces } = require('./code-workspace.cjs');
 const { ACTIONS } = require('./code-actions.cjs');
 
 const APPROVAL_TIMEOUT_MS = 5 * 60 * 1000;
+
+/**
+ * Prompt preparation (spec §2). Direct is the default and the only one offered, and the others
+ * carry the reason they are not — which is a measurement, not an opinion. There is deliberately
+ * no `Auto`: §2 allows one only after paired fixtures prove a benefit, and the 4B-as-architect
+ * run scored 0/18 on the schema.
+ */
+const PROMPT_PREPARATION = Object.freeze([
+  { id: 'direct', label: 'Direct', available: true,
+    reason: 'Your request goes to the model as you wrote it.' },
+  { id: 'local', label: 'Local architect', available: false,
+    reason: 'Not offered yet: as an architect the 4B returned 0 of 18 usable execution prompts (list fields came back as strings). Direct stays the default until that changes.' },
+  { id: 'frontier', label: 'Frontier architect', available: false,
+    reason: 'Not built: it needs a provider, official authentication and the outbound allowlist enforced in code (spec §2).' },
+]);
 // What a task may be granted at all. Browser and external-account actions have no home here
 // yet: they belong to the execution node (§5), so a task cannot be given one by mistake.
 const GRANTABLE = Object.freeze([ACTIONS.READ, ACTIONS.EDIT, ACTIONS.EXECUTE, ACTIONS.INSTALL,
@@ -57,7 +72,8 @@ function view(job, pending = null) {
  *           log?: Function, timeoutMs?: number }} deps
  */
 function createCodeService({ repos, connect, egress = null, now = Date.now, log = () => {},
-  timeoutMs = APPROVAL_TIMEOUT_MS, sandboxKind = process.env.CODE_HARNESS_ENDPOINT ? 'sandbox' : 'spawn' }) {
+  timeoutMs = APPROVAL_TIMEOUT_MS, sandboxKind = process.env.CODE_HARNESS_ENDPOINT ? 'sandbox' : 'spawn',
+  harnesses = defaultHarnesses() }) {
   const repositories = Array.isArray(repos) ? repos : parseRepos(repos);
   // Approvals live in memory on purpose, exactly as the chat gate does: a decision that
   // outlives the request it belongs to is not a decision, and a restart must re-ask.
@@ -110,6 +126,12 @@ function createCodeService({ repos, connect, egress = null, now = Date.now, log 
     repositories: () => repositories.map((r) => ({ id: r.id })),
     grantable: GRANTABLE,
     defaultCapabilities: DEFAULT_CAPABILITIES,
+    // One harness is configured per deployment today. It is reported as a list anyway, because
+    // the shape is what changes when a second one is adapted — and an `Auto` that picks between
+    // them is only allowed once there is measured evidence to pick on (§3).
+    harnesses: () => harnesses.map((h) => ({ ...h })),
+    promptPreparation: () => PROMPT_PREPARATION.map((p) => ({ ...p })),
+    sandboxed: () => sandboxKind === 'sandbox',
 
     list(workspace, project) {
       const { jobs } = storeFor(workspace);
@@ -126,6 +148,13 @@ function createCodeService({ repos, connect, egress = null, now = Date.now, log 
       if (prompt.length > 8000) throw fail(400, 'That task description is too long.');
       const asked = Array.isArray(body.capabilities) ? body.capabilities : DEFAULT_CAPABILITIES;
       const capabilities = GRANTABLE.filter((c) => asked.includes(c));
+      // A harness or a preparation mode noevia does not offer is refused here, not passed on:
+      // the browser's list is a convenience, never the authority.
+      const harnessId = String(body.harness || harnesses[0]?.id || '');
+      if (!harnesses.some((h) => h.id === harnessId)) throw fail(400, 'That coding harness is not configured on this server.');
+      const preparation = PROMPT_PREPARATION.find((p) => p.id === String(body.promptPreparation || 'direct'));
+      if (!preparation) throw fail(400, 'Unknown prompt preparation.');
+      if (!preparation.available) throw fail(409, preparation.reason);
       const domains = (Array.isArray(body.domains) ? body.domains : [])
         .map((d) => String(d || '').trim().toLowerCase()).filter((d) => /^[a-z0-9.-]+\.[a-z]{2,}$/.test(d)).slice(0, 20);
       const { harness, jobs } = storeFor(workspace);
@@ -135,8 +164,9 @@ function createCodeService({ repos, connect, egress = null, now = Date.now, log 
         throw fail(409, 'This project already has a task running.');
       }
       const started = await harness.start({ projectId: project.id, repoPath: repo.path, prompt,
-        capabilities, domains, connect, model: body.model ? String(body.model) : null, sandboxKind });
-      return { ...started, repository: repo.id, capabilities, domains };
+        capabilities, domains, connect, model: body.model ? String(body.model) : null, sandboxKind,
+        harness: harnessId, promptPreparation: preparation.id });
+      return { ...started, repository: repo.id, capabilities, domains, harness: harnessId, promptPreparation: preparation.id };
     },
     decide(workspace, project, taskId, decision) {
       owned(workspace, project, taskId);
@@ -158,4 +188,10 @@ function createCodeService({ repos, connect, egress = null, now = Date.now, log 
   };
 }
 
-module.exports = { createCodeService, parseRepos, view, GRANTABLE, DEFAULT_CAPABILITIES, APPROVAL_TIMEOUT_MS };
+/** What this deployment runs. One entry today; the sandbox pins its version at build time. */
+function defaultHarnesses(env = process.env) {
+  const id = String(env.CODE_HARNESS_NAME || 'opencode').trim() || 'opencode';
+  return [{ id, label: id === 'opencode' ? 'OpenCode' : id, version: env.CODE_HARNESS_VERSION || null }];
+}
+
+module.exports = { createCodeService, parseRepos, view, defaultHarnesses, GRANTABLE, DEFAULT_CAPABILITIES, PROMPT_PREPARATION, APPROVAL_TIMEOUT_MS };

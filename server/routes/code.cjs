@@ -23,7 +23,9 @@ function createCodeRoutes({ service, features, getProject, workspace, json, read
       if (!taskId) {
         if (req.method === 'GET') {
           return send(200, { repositories: service.repositories(), capabilities: service.grantable,
-            defaultCapabilities: service.defaultCapabilities, tasks: service.list(ws, project) });
+            defaultCapabilities: service.defaultCapabilities, harnesses: service.harnesses(),
+            promptPreparation: service.promptPreparation(), sandboxed: service.sandboxed(),
+            tasks: service.list(ws, project) });
         }
         if (req.method !== 'POST') return send(405, { error: 'method not allowed' });
         return send(202, await service.start(ws, project, await readJson(req)));

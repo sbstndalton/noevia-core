@@ -38,7 +38,7 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
    * every later decision is taken against this list, not against anything the agent claims.
    */
   async function start({ projectId = null, repoPath, prompt, capabilities = [], domains = [],
-    harness = 'opencode', connect, model = null, sandboxKind = 'spawn' }) {
+    harness = 'opencode', connect, model = null, sandboxKind = 'spawn', promptPreparation = 'direct' }) {
     if (!prompt || !String(prompt).trim()) throw Object.assign(Error('A task needs a prompt'), { status: 400 });
     if (typeof connect !== 'function') throw Object.assign(Error('No harness transport'), { status: 500 });
     const taskId = jobs.create({ kind: 'code', projectId, capabilities: [...new Set(capabilities)] });
@@ -73,7 +73,7 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
         const scope = codingIdentity({
           harness: meta.harness || harness, harnessVersion: meta.harnessVersion,
           model, protocolVersion: meta.protocolVersion, capabilities,
-          sandbox: sandboxKind,
+          promptPreparation, sandbox: sandboxKind,
         });
         ctx.event('checkpoint.created', { branch: workspace.branch, task: String(prompt).slice(0, 120),
           identityHash: scope.identityHash, identity: scope.identity, meta });

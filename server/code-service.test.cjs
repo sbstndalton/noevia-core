@@ -169,3 +169,41 @@ test('two tasks waiting at once each get their own answer', async () => {
   svc.decide(ws, two, b.taskId, 'deny');
   assert.deepEqual(await asks.b, { outcome: 'selected', optionId: 'n' });
 });
+
+test('a harness or preparation mode noevia does not offer is refused at the server', async () => {
+  const { svc, ws } = service();
+  assert.deepEqual(svc.harnesses(), [{ id: 'opencode', label: 'OpenCode', version: null }]);
+  await assert.rejects(() => svc.start(ws, project, { repository: 'noevia', prompt: 'x', harness: 'claude-code' }),
+    /not configured on this server/, 'the browser list is a convenience, not the authority');
+  await assert.rejects(() => svc.start(ws, project, { repository: 'noevia', prompt: 'x', promptPreparation: 'invented' }),
+    /Unknown prompt preparation/);
+  // Unavailable modes are refused with the measured reason, not silently downgraded to Direct.
+  await assert.rejects(() => svc.start(ws, project, { repository: 'noevia', prompt: 'x', promptPreparation: 'local' }),
+    /0 of 18/);
+  await assert.rejects(() => svc.start(ws, project, { repository: 'noevia', prompt: 'x', promptPreparation: 'frontier' }),
+    /outbound allowlist/);
+});
+
+test('prompt preparation offers Direct and nothing that lacks evidence', async () => {
+  const { svc, ws } = service();
+  const modes = svc.promptPreparation();
+  assert.deepEqual(modes.filter((m) => m.available).map((m) => m.id), ['direct']);
+  assert.equal(modes.some((m) => m.id === 'auto'), false, 'Auto needs evidence first (spec §2)');
+  for (const mode of modes) assert.ok(mode.reason.length > 20, `${mode.id} should say why`);
+  // The default start is Direct, and it is recorded on the run.
+  const started = await svc.start(ws, project, { repository: 'noevia', prompt: 'fix' });
+  assert.equal(started.promptPreparation, 'direct');
+  assert.equal(started.harness, 'opencode');
+  await settle(svc, ws, started.taskId);
+});
+
+test('the deployment names its harness, and whether it is sandboxed', () => {
+  const { defaultHarnesses } = require('./code-service.cjs');
+  assert.deepEqual(defaultHarnesses({ CODE_HARNESS_NAME: 'claude-code', CODE_HARNESS_VERSION: '2.0' }),
+    [{ id: 'claude-code', label: 'claude-code', version: '2.0' }]);
+  assert.deepEqual(defaultHarnesses({ CODE_HARNESS_NAME: '  ' })[0].id, 'opencode');
+  const { svc } = service();
+  assert.equal(svc.sandboxed(), false);
+  const { svc: sandboxed } = service({ sandboxKind: 'sandbox' });
+  assert.equal(sandboxed.sandboxed(), true);
+});

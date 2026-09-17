@@ -7,6 +7,9 @@ function harness({ enabled = true } = {}) {
   const service = {
     repositories: () => [{ id: 'noevia' }],
     grantable: ['read_repository', 'edit_file'], defaultCapabilities: ['read_repository'],
+    harnesses: () => [{ id: 'opencode', label: 'OpenCode', version: null }],
+    promptPreparation: () => [{ id: 'direct', label: 'Direct', available: true, reason: 'As you wrote it.' }],
+    sandboxed: () => true,
     list: () => [], get: (ws, p, id) => ({ id }),
     start: async (ws, p, body) => { calls.push(['start', p.id, body]); return { taskId: 't', branch: 'noevia/task-t' }; },
     decide: (ws, p, id, decision) => { calls.push(['decide', id, decision]); return { ok: true }; },
@@ -37,6 +40,9 @@ test('an admin lists, starts, reads, approves and cancels', async () => {
   const listed = await call('GET', '/api/projects/p1/code');
   assert.deepEqual(listed.body.repositories, [{ id: 'noevia' }]);
   assert.deepEqual(listed.body.capabilities, ['read_repository', 'edit_file']);
+  assert.deepEqual(listed.body.harnesses, [{ id: 'opencode', label: 'OpenCode', version: null }]);
+  assert.deepEqual(listed.body.promptPreparation.map((p) => p.id), ['direct']);
+  assert.equal(listed.body.sandboxed, true, 'the page says whether the harness is contained');
   assert.equal((await call('POST', '/api/projects/p1/code', 'admin', '{"repository":"noevia","prompt":"fix"}')).status, 202);
   assert.equal((await call('GET', `/api/projects/p1/code/${TASK}`)).body.id, TASK);
   assert.deepEqual((await call('POST', `/api/projects/p1/code/${TASK}/approve`, 'admin', '{"decision":"approve"}')).body, { ok: true });
