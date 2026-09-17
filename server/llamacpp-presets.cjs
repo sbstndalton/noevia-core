@@ -14,7 +14,9 @@ const fields={
   'ubatch-size':{aliases:['ub','LLAMA_ARG_UBATCH'],valid:integer(32,8192)},
   'cache-ram':{aliases:['LLAMA_ARG_CACHE_RAM'],valid:integer(0,16384)},
   'image-max-tokens':{aliases:['LLAMA_ARG_IMAGE_MAX_TOKENS'],valid:integer(64,16384)},
-  'spec-type':{aliases:['LLAMA_ARG_SPEC_TYPE'],valid:choice('none','draft-mtp')},
+  'spec-type':{aliases:['LLAMA_ARG_SPEC_TYPE'],valid:choice('none','draft-mtp','ngram-simple','draft-mtp,ngram-simple')},
+  'spec-draft-n-max':{aliases:['LLAMA_ARG_SPEC_DRAFT_N_MAX'],valid:integer(1,32)},
+  'spec-draft-p-min':{aliases:['LLAMA_ARG_SPEC_DRAFT_P_MIN'],valid:v=>/^(0(\.\d{1,3})?|1(\.0{1,3})?)$/.test(v)},
 };
 const canonical=key=>Object.keys(fields).find(k=>k===key||fields[k].aliases.includes(key));
 const error=(status,message)=>Object.assign(Error(message),{status});

@@ -71,6 +71,11 @@ function createRateLimiter({ sweepMs = 60 * 1000, maxEntries = 10000 } = {}) {
       current.count += 1;
       return current.count > limit;
     },
+    /** Whether `key` is over `limit` in its current window, without counting this call. */
+    blocked(key, limit = 5) {
+      const current = map.get(key);
+      return !!current && current.reset > Date.now() && current.count > limit;
+    },
     size: () => map.size,
   };
 }
@@ -289,6 +294,16 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
     return !supplied || supplied === origin || trustedOrigins.has(supplied);
   }
 
+  const PASSKEY_LIST_SIZE = 5;
+  let decoySecret = null;
+  const decoyKey = () => {
+    if (decoySecret) return decoySecret;
+    let value = db.prepare("SELECT value FROM settings WHERE key='passkey_decoy_key'").get()?.value;
+    if (!value) { value = crypto.randomBytes(32).toString('hex'); db.prepare("INSERT OR IGNORE INTO settings(key,value) VALUES('passkey_decoy_key',?)").run(value); value = db.prepare("SELECT value FROM settings WHERE key='passkey_decoy_key'").get().value; }
+    return (decoySecret = Buffer.from(value, 'hex'));
+  };
+  let dummyHash = null;
+  const timingHash = () => (dummyHash ||= createPasswordHash(randomToken()));
   async function createPasswordHash(password) {
     if (typeof password !== 'string' || password.length < 12 || password.length > 128) throw new Error('password must be 12-128 characters');
     return hash(password, { algorithm: Algorithm.Argon2id, memoryCost: 19456, timeCost: 2, parallelism: 1 });
@@ -332,27 +347,36 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       let passwordHash;
       try { passwordHash = await createPasswordHash(body.password); } catch (e) { return { status: 400, body: { error: e.message } }; }
       const now = Date.now(); const id = crypto.randomUUID();
-      origin = selectedOrigin;
-      if (!rpId) relyingPartyId = new URL(selectedOrigin).hostname;
       const tx = db.transaction(() => {
+        // Hashing above is asynchronous: a concurrent setup may have finished meanwhile.
+        if (userCount() !== 0 || db.prepare("DELETE FROM settings WHERE key='setup_code_hash' AND value=?").run(expected).changes !== 1) throw Object.assign(Error('setup already complete'), { raced: true });
         db.prepare('INSERT INTO users(id,username,username_norm,display_name,role,password_hash,webauthn_user_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)')
           .run(id, body.username, body.username.toLowerCase(), String(body.displayName || body.username).trim().slice(0, 80), 'admin', passwordHash, randomToken(32), now, now);
         db.prepare('INSERT INTO user_features(user_id,diary_enabled,onboarded,updated_at) VALUES(?,?,?,?)')
           .run(id, body.diaryEnabled ? 1 : 0, 0, now);
         db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('public_origin',?)").run(selectedOrigin);
-        db.prepare("DELETE FROM settings WHERE key='setup_code_hash'").run();
       });
-      tx();
+      try { tx(); } catch (e) { if (e.raced) return { status: 409, body: { error: 'setup already complete' } }; throw e; }
+      origin = selectedOrigin;
+      if (!rpId) relyingPartyId = new URL(selectedOrigin).hostname;
       try { fs.unlinkSync(setupFile); } catch {}
       const user = db.prepare('SELECT * FROM users WHERE id=?').get(id);
       audit('setup.complete', id, id);
       return { status: 201, body: { user: publicUser(user), csrfToken: issueSession(req, res, user), migrationRequired: true } };
     },
     async passwordLogin(req, res, body) {
-      const key = `login:${clientAddress(req, trustProxy)}:${String(body.username || '').toLowerCase()}`;
-      if (rateLimited(key)) return { status: 429, body: { error: 'sign-in failed' } };
+      const address = clientAddress(req, trustProxy);
+      const key = `login:${address}:${String(body.username || '').toLowerCase()}`;
+      // Probing many usernames from one address (password spraying, enumeration) blocks that address.
+      // Only attempts on usernames that do not exist count, because a whole household can share one
+      // address behind a tunnel; once blocked, every attempt from it gets the same answer.
+      const probes = `login-unknown:${address}`;
+      if (rate.blocked(probes, 30) || rateLimited(key)) return { status: 429, body: { error: 'sign-in failed' } };
       const row = db.prepare('SELECT * FROM users WHERE username_norm=?').get(String(body.username || '').toLowerCase());
-      const ok = row && !row.disabled_at ? await verify(row.password_hash, String(body.password || '')).catch(() => false) : false;
+      if (!row) rateLimited(probes, 30);
+      // Always pay for one Argon2 verification, so response time doesn't reveal whether a username exists.
+      const usable = row && !row.disabled_at;
+      const ok = await verify(usable ? row.password_hash : await timingHash(), String(body.password || '')).catch(() => false) && usable;
       if (!ok) return { status: 401, body: { error: 'sign-in failed' } };
       audit('auth.password', row.id, row.id);
       return { status: 200, body: { user: publicUser(row), csrfToken: issueSession(req, res, row) } };
@@ -390,10 +414,18 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       return { verified: true };
     },
     async authenticationOptions(username) {
-      const user = db.prepare('SELECT * FROM users WHERE username_norm=? AND disabled_at IS NULL').get(String(username || '').toLowerCase());
+      const norm = String(username || '').toLowerCase();
+      const user = db.prepare('SELECT * FROM users WHERE username_norm=? AND disabled_at IS NULL').get(norm);
       const keys = user ? db.prepare('SELECT * FROM passkeys WHERE user_id=?').all(user.id) : [];
-      const options = await generateAuthenticationOptions({ rpID: relyingPartyId, userVerification: 'required',
-        allowCredentials: keys.map(k => ({ id: k.id, transports: JSON.parse(k.transports) })) });
+      // Pad every list with stable decoy ids so known and unknown usernames get the same shape.
+      // Authenticators ignore credential ids they do not hold, so real sign-in is unaffected.
+      const real = keys.map(k => ({ id: k.id, transports: JSON.parse(k.transports) }));
+      const decoys = [];
+      for (let i = 0; real.length + decoys.length < PASSKEY_LIST_SIZE; i++) {
+        decoys.push({ id: crypto.createHmac('sha256', decoyKey()).update(`${norm}:${i}`).digest('base64url'), transports: ['internal', 'hybrid'] });
+      }
+      const allowCredentials = [...real, ...decoys].sort((a, b) => (a.id < b.id ? -1 : 1));
+      const options = await generateAuthenticationOptions({ rpID: relyingPartyId, userVerification: 'required', allowCredentials });
       return { options, challengeToken: saveChallenge(user?.id || null, 'authenticate', options.challenge) };
     },
     async authenticationVerify(req, res, body) {
@@ -433,13 +465,14 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       const id = crypto.randomUUID(); const now = Date.now();
       try {
         db.transaction(() => {
+          // Claim the invitation first; a concurrent accept that got here earlier wins.
+          if (db.prepare('UPDATE invitations SET used_at=? WHERE token_hash=? AND used_at IS NULL AND expires_at>?').run(now, invite.token_hash, now).changes !== 1) throw Object.assign(Error('used'), { raced: true });
           db.prepare('INSERT INTO users(id,username,username_norm,display_name,role,password_hash,webauthn_user_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)')
             .run(id, body.username, body.username.toLowerCase(), String(body.displayName || body.username).slice(0,80), invite.role, passwordHash, randomToken(32), now, now);
           db.prepare('INSERT INTO user_features(user_id,diary_enabled,onboarded,updated_at) VALUES(?,?,0,?)')
             .run(id, body.diaryEnabled ? 1 : 0, now);
-          db.prepare('UPDATE invitations SET used_at=? WHERE token_hash=?').run(now, invite.token_hash);
         })();
-      } catch { return { status: 409, body: { error: 'username is unavailable' } }; }
+      } catch (e) { return e.raced ? { status: 400, body: { error: 'invitation is invalid or expired' } } : { status: 409, body: { error: 'username is unavailable' } }; }
       const user = db.prepare('SELECT * FROM users WHERE id=?').get(id); audit('invite.accept', id, id);
       return { status: 201, body: { user: publicUser(user), csrfToken: issueSession(req, res, user) } };
     },
@@ -459,7 +492,12 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
     async completeRecovery(body) {
       const row = db.prepare('SELECT * FROM recoveries WHERE token_hash=? AND used_at IS NULL AND expires_at>?').get(digest(body.token || ''), Date.now());
       if (!row) return false; const passwordHash = await createPasswordHash(body.password);
-      db.transaction(() => { db.prepare('UPDATE users SET password_hash=?,updated_at=? WHERE id=?').run(passwordHash, Date.now(), row.user_id); db.prepare('DELETE FROM sessions WHERE user_id=?').run(row.user_id); db.prepare('UPDATE recoveries SET used_at=? WHERE token_hash=?').run(Date.now(), row.token_hash); })();
+      const claimed = db.transaction(() => {
+        if (db.prepare('UPDATE recoveries SET used_at=? WHERE token_hash=? AND used_at IS NULL').run(Date.now(), row.token_hash).changes !== 1) return false;
+        db.prepare('UPDATE users SET password_hash=?,updated_at=? WHERE id=?').run(passwordHash, Date.now(), row.user_id); db.prepare('DELETE FROM sessions WHERE user_id=?').run(row.user_id);
+        return true;
+      })();
+      if (!claimed) return false;
       audit('recovery.complete', row.user_id, row.user_id); return true;
     },
     getAppearance(userId) {

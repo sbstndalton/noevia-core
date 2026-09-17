@@ -53,7 +53,12 @@ const DIARY_TOKEN = process.env.DIARY_AUTH_TOKEN || '';
 const UI_AUTH_TOKEN = (process.env.UI_AUTH_TOKEN || DIARY_TOKEN).trim();
 const DIST_DIR = path.join(__dirname, '..', 'dist');
 const DATA_DIR = process.env.UI_DATA_DIR || path.join(__dirname, 'ui-data');
-const HISTORY_CAP = 40;
+// Messages offered to the context projection per request. Compaction summarizes whatever does not
+// fit (and refuses beyond 1000), so this is a safety bound, not a silent cut at 20 exchanges.
+const HISTORY_CAP = 1000;
+// The saved transcript is the record, not the model window: keep it whole within generous bounds.
+const STORED_HISTORY_CAP = 5000;
+const STORED_HISTORY_BYTES = 32 * 1024 * 1024;
 const SPAFallbacks = ['/', '/chat', '/diary', '/projects', '/settings'];
 const staticFiles = require('./static-files.cjs').createStaticFiles(DIST_DIR);
 const secretStore = createSecretStore(DATA_DIR);
@@ -75,6 +80,40 @@ const authService = createAuth({
     .map((s) => s.trim())
     .filter(Boolean),
 });
+const features = require('./features.cjs').createFeatures({ store: require('./features.cjs').settingsStore(authService.db), audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) });
+const featureRoutes = require('./routes/features.cjs').createFeatureRoutes({ features, json, readJson });
+// Settings → Data: the signed-in user's conversations as a ZIP (routes/export.cjs).
+const exportRoutes = require('./routes/export.cjs').createExportRoutes({ json, workspace: () => ({ freeChats: Array.from(FREE_CHATS), projects: PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)) }), readHistory: (id) => readHistory(id), audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) });
+const retentionLists = () => ({ freeChats: Array.from(FREE_CHATS), projects: PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)) });
+const removeRetainedChat = ({ projectId, id }) => (projectId ? deleteChat(projectId, id) : deleteFreeChat(id));
+const accountRoutes = require('./routes/account.cjs').createAccountRoutes({ json, readJson, dir: () => currentWorkspace().dir, chatLists: retentionLists, removeChat: removeRetainedChat });
+// Delete-old-chats sweep (chat-retention.cjs): runs as the user's workspace loads, at most hourly.
+function sweepRetention() {
+  const retention = require('./chat-retention.cjs');
+  const dir = currentWorkspace().dir, settings = retention.read(dir);
+  if (!retention.sweepDue(settings)) return;
+  for (const chat of retention.expired({ ...retentionLists(), days: settings.days })) removeRetainedChat(chat);
+  retention.markSwept(dir);
+}
+const importRoutes = require('./routes/import.cjs').createImportRoutes({
+  json, readBody: (req, limit) => readBody(req, limit), newId: () => `c-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+  audit: (action, actor, detail) => authService.audit(action, actor, actor, detail),
+  context: () => {
+    const lists = require('./chat-lists.cjs');
+    const visible = () => PROJECTS.filter((proj) => !diaryExtras.internalProject(proj));
+    return {
+      projects: () => visible().map((proj) => ({ id: proj.id, name: proj.name })),
+      existingChatIds: () => new Set([...Array.from(FREE_CHATS), ...PROJECTS.flatMap((proj) => proj.chats || [])].map((c) => c.id)),
+      tombstones: () => lists.readTombstones(currentWorkspace().dir),
+      writeHistory: (id, history) => writeHistory(id, history),
+      addFreeChats: (chats) => { FREE_CHATS.splice(0, FREE_CHATS.length, ...lists.mergeChats(Array.from(FREE_CHATS), chats, lists.readTombstones(currentWorkspace().dir))); saveFreeChats(FREE_CHATS); },
+      addProjectChats: (projectId, chats) => saveChats(projectId, chats),
+      createProject: (body) => createProject(body),
+    };
+  },
+});
+const offsiteBackup = require('./offsite-service.cjs').createOffsiteService({ features, dataDir: DATA_DIR, log: (event) => console.log('[backup]', JSON.stringify(event)) });
+const offsiteRoutes = require('./routes/offsite-backup.cjs').createOffsiteRoutes({ service: offsiteBackup, json });
 const davConfig = require('./dav-settings.cjs').configuration(process.env, authService.origin);
 const davSettings = require('./dav-settings.cjs').createDavSettings({ auth: authService, config: davConfig });
 if (process.env.LEMONADE_BASE_URL && !process.env.INFERENCE_BASE_URL) console.warn('LEMONADE_BASE_URL is deprecated; use INFERENCE_BASE_URL');
@@ -187,6 +226,29 @@ function authResult(res, result) {
   return json(res, result.status || 200, result.body ?? result);
 }
 
+// One call to the model management service, with its token. Same path the proxy route uses.
+function managerFetch(rest, method = 'GET') {
+  return fetchJson(`${process.env.MODEL_LOADER_URL.replace(/\/+$/, '')}/api/v1/${rest}`,
+    { method, headers: { 'Content-Type': 'application/json', ...(process.env.MODEL_LOADER_TOKEN ? { 'X-Model-Loader-Token': process.env.MODEL_LOADER_TOKEN } : {}) }, ...(method === 'POST' ? { body: '{}' } : {}) }, 120000).catch(() => null);
+}
+
+// Model files that appear in the models folder get safe defaults on their own (roadmap C3).
+// Needs the model management service; the engine's own preset file is edited through it.
+const folderSync = process.env.MODEL_LOADER_URL ? require('./model-folder-sync.cjs').createFolderSync({
+  stateFile: path.join(DATA_DIR, 'model-folder-sync.json'),
+  listUnregistered: async () => {
+    const r = await managerFetch('models');
+    if (!r?.ok) throw Object.assign(Error(r?.body?.error || `model manager HTTP ${r?.status || 'unreachable'}`), { status: r?.status });
+    return Array.isArray(r.body?.unregistered) ? r.body.unregistered : [];
+  },
+  register: async (stem) => {
+    const r = await managerFetch(`sections/${encodeURIComponent(stem)}/safe-defaults`, 'POST');
+    if (!r?.ok) throw Object.assign(Error(r?.body?.error || `model manager HTTP ${r?.status || 'unreachable'}`), { status: r?.status });
+  },
+  reloadPresets: () => modelManager.reloadPresets ? modelManager.reloadPresets({ unload: false }) : { ok: false },
+  log: (message) => console.log(message),
+}) : null;
+
 const modelManager = createModelManager({
   kind: MODEL_MANAGER_KIND,
   presetPath: process.env.LLAMACPP_PRESET_PATH,
@@ -197,7 +259,11 @@ const modelManager = createModelManager({
     cachePath: process.env.LLAMACPP_CACHE_PATH || '',
     memoryFloorGib: Number(process.env.LLAMACPP_CALIBRATION_MEMORY_FLOOR_GIB) || 2,
   },
+  evidenceDir: path.join(DATA_DIR,'evidence-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)),
   calibrationStatePath: path.join(DATA_DIR,'native-calibration-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)+'.json'),
+  autotuneStatePath: path.join(DATA_DIR,'native-autotune-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)+'.json'),
+  // Measured settings per architecture, quantisation and hardware; shared across models on this server.
+  autotuneTablePath: path.join(DATA_DIR,'native-tuning-table.json'),
   downloadStatePath: path.join(DATA_DIR,'native-downloads-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)+'.json'),
   baseUrl: MODEL_MANAGER_BASE,
   apiKey: process.env.MODEL_MANAGER_API_KEY || INFERENCE_KEY,
@@ -375,7 +441,8 @@ function loadChats(projectId) {
 function saveChats(projectId, chats) {
   const p = getProject(projectId);
   if (!p) return;
-  p.chats = chats.slice(0, 200);
+  const lists = require('./chat-lists.cjs');
+  p.chats = lists.mergeChats(p.chats, chats, lists.readTombstones(currentWorkspace().dir));
   saveProjects(PROJECTS);
 }
 
@@ -385,6 +452,7 @@ function deleteChat(projectId, chatId) {
   const before = (p.chats || []).length;
   p.chats = (p.chats || []).filter((c) => c.id !== chatId);
   if (p.chats.length === before) return false;
+  require('./chat-lists.cjs').addTombstone(currentWorkspace().dir, chatId);
   saveProjects(PROJECTS);
   try {
     require('./chat-context.cjs').remove(currentWorkspace().dir,chatId);
@@ -413,6 +481,7 @@ function deleteFreeChat(chatId) {
   const filtered = Array.from(FREE_CHATS).filter((c) => c.id !== chatId);
   FREE_CHATS.splice(0, FREE_CHATS.length, ...filtered);
   if (FREE_CHATS.length === before) return false;
+  require('./chat-lists.cjs').addTombstone(currentWorkspace().dir, chatId);
   saveFreeChats(FREE_CHATS);
   try {
     require('./chat-context.cjs').remove(currentWorkspace().dir,chatId);
@@ -421,6 +490,61 @@ function deleteFreeChat(chatId) {
     /* no history file — fine */
   }
   return true;
+}
+
+// Creates, saves and indexes a project from a create request body. Throws { status: 400 } on
+// invalid input. Shared by POST /api/projects and conversation import.
+async function createProject(body) {
+  if (body.reasoningEffort !== undefined && !reasoningEffort.validEffort(body.reasoningEffort)) throw Object.assign(Error('Invalid reasoning effort'), { status: 400 });
+  const name = String(body.name || '').trim().slice(0, 120);
+  if (!name) throw Object.assign(Error('name required'), { status: 400 });
+  let modes = ['chat'];
+  if (body.modes !== undefined) { try { modes = require('./project-modes.cjs').sanitize(body.modes); } catch (e) { throw Object.assign(Error(e.message), { status: 400 }); } }
+  let appearance;
+  try { appearance = projectAppearance(body); } catch (e) { throw Object.assign(Error(e.message), { status: 400 }); }
+  const project = {
+    ...appearance,
+    id: `proj-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    name,
+    goal: String(body.goal || '').slice(0, 2000),
+    instructions: String(body.instructions || '').slice(0, 8000),
+    pinned: false,
+    archived: false,
+    sourceFolders: [],
+    memories: [],
+    files: Array.isArray(body.files)
+      ? body.files
+          .filter((f) => f && typeof f.name === 'string' && typeof f.content === 'string')
+          .slice(0, 20)
+          .map((f) => ({ name: f.name.slice(0, 200), content: f.content.slice(0, 200000) }))
+      : [],
+    model: typeof body.model === 'string' && body.model ? body.model : undefined,
+    provider: typeof body.provider === 'string' && body.provider ? body.provider : undefined,
+    reasoningEffort: body.reasoningEffort,
+    routing: body.routing === 'auto' ? 'auto' : 'manual', // default manual (step 12 guardrail)
+    modes,
+    toolboxes: sanitizeToolboxes(body.toolboxes) || [...DEFAULT_TOOLBOXES], // step 14: core only by default
+    // (files normalization below is shared with the config route's RAG bookkeeping)
+    chats: [],
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+  // Its own folder in the user's storage, and attached as a source so
+  // anything dropped in it — by noevia or by the user, from any device —
+  // is picked up on the next sync.
+  const ownFolder = await ensureProjectFolder(project);
+  if (ownFolder) {
+    project.projectFolder = ownFolder;
+    project.sourceFolders = [ownFolder];
+  }
+  PROJECTS.unshift(project);
+  saveProjects(PROJECTS);
+  // Index any files that arrived with the create call (same RAG bookkeeping
+  // as the config route).
+  for (const f of project.files) {
+    indexSource(project, f);
+  }
+  return project;
 }
 
 // ── History persistence (atomic write, JSON per space) ─────────────────────
@@ -612,11 +736,20 @@ const TOOLBOXES = [
   },
 ];
 
+// D9: read-only offline Wikipedia box, only with features.kiwix and an internal KIWIX_URL.
+const kiwixTools = features.enabled('kiwix') && process.env.KIWIX_URL ? require('./kiwix.cjs').createKiwixTools({ baseUrl: process.env.KIWIX_URL, cap: TOOL_RESULT_CAP }) : null;
+if (kiwixTools) TOOLBOXES.push(kiwixTools.box);
+
 const DEFAULT_TOOLBOXES = ['core'];
 
 // Built-ins plus whatever MCP discovery found. Everything downstream — the
 // picker, the validator, the resolver — goes through here so an MCP box is
 // indistinguishable from a built-in one once it exists.
+// Roadmap E: narrows each message's toolboxes to the matching ones when features.toolRouter is on.
+const chatToolRouter = require('./chat-tool-routing.cjs').createChatToolRouter({
+  enabled: () => features.enabled('toolRouter'), boxes: () => allToolboxes(), embed: (texts) => rag.embed(texts),
+});
+
 function allToolboxes() {
   return [...TOOLBOXES, ...mcpState.boxes].filter((b) => toolboxOffered(b.id));
 }
@@ -746,6 +879,40 @@ function pruneDocuments(project) {
   catch (err) { console.warn('[documents] cleanup failed:', err.message); }
   try { require('./uploads.cjs').prune(workspace, workspace.projects.includes(project) ? project : { id: project.id, files: [] }); }
   catch (err) { console.warn('[uploads] cleanup failed:', err.message); }
+}
+// One write path for server-authored project text files (MCP writes, research reports), the
+// same one a browser upload takes: the file lands in the project's storage folder and is
+// re-indexed identically.
+function writeProjectTextFile(project, name, text) {
+  return withSourceLock(project, async () => {
+    if (getProject(project.id) !== project) throw new Error('the project changed while writing; nothing was saved');
+    const uploads = require('./uploads.cjs');
+    const bytes = Buffer.from(text, 'utf8');
+    uploads.validate(name, bytes);
+    const connection = authService.getStorage(currentWorkspace().userId, true);
+    const remote = storageClient.isBrowsable(connection) ? connection : null;
+    if (remote && !project.projectFolder) project.projectFolder = await ensureProjectFolder(project);
+    const file = await uploads.ingest(currentWorkspace(), project, name, bytes, { connection: remote });
+    if (remote) project.sourceFolders = [...new Set([...(project.sourceFolders || []), project.projectFolder])];
+    project.files = [...(project.files || []).filter((f) => f.name !== file.name), file];
+    project.updatedAt = Date.now();
+    indexSource(project, file);
+    saveProjects(PROJECTS);
+    return file;
+  });
+}
+const projectSweep = require('./project-sweep.cjs').createProjectSweep({ storage: storageClient, log: event => console.log('[projects]', JSON.stringify(event)) });
+// D8: runs after the delete is saved; empty-only, tenant-scoped, never recursive.
+function sweepDeletedProject(project) {
+  const workspace = currentWorkspace();
+  let connection = null;
+  try { connection = project.projectFolder ? authService.getStorage(workspace.userId, true) : null; } catch { connection = null; }
+  projectSweep.afterDelete({
+    projectId: project.id,
+    tenantRoot: workspace.dir,
+    localDirs: [require('./uploads.cjs').directory(workspace, project.id), documentSources.directory(workspace, project.id), workspace.assetDir(project.id)],
+    connection, folder: project.projectFolder || '', root: PROJECT_ROOT_FOLDER, groups: require('./uploads.cjs').GROUPS,
+  }).catch(error => console.warn('[projects] sweep failed:', error.message));
 }
 function indexSource(project, file) {
   const workspace = currentWorkspace();
@@ -915,6 +1082,40 @@ function resolveTools(project, model) {
 // makes the app genuinely useful, and nothing else. Tools not listed here are
 // simply never offered; adding one is a deliberate, costed decision.
 const MCP_TOOLBOX_MANIFEST = [
+  // ── noevia's own capabilities (server `noevia`, the in-process one) ────
+  //
+  // These bind like any other MCP box, so they are opt-in per project, they
+  // obey the same cap and token budget, and their writes go through the same
+  // approval card. When MCP_INTERNAL_PORT is unset the server is not
+  // configured, both boxes lose every tool and neither is offered.
+  {
+    id: 'diary',
+    server: 'noevia',
+    label: 'Diary',
+    description: 'Read your diary: today, a whole month, or which months exist.',
+    // Read-only, and not by oversight. The sidecar has no append endpoint —
+    // /api/entries/edit corrects one already-logged exchange by its xid, and
+    // /api/chat is the only route that creates entries, which AGENTS.md puts
+    // out of bounds. Writing to the user's real journal needs a deliberate
+    // decision and a sidecar change, not a tool quietly added here.
+    // diary_append (D10) is listed only when features.diaryMcpWrite is on; it is not in
+    // `reads`, so every call stops at the approval card.
+    tools: ['diary_read_today', 'diary_read_month', 'diary_list_months', ...(features.enabled('diaryMcpWrite') ? ['diary_append'] : [])],
+    reads: ['diary_read_today', 'diary_read_month', 'diary_list_months'],
+  },
+  {
+    id: 'project-docs',
+    server: 'noevia',
+    label: 'Project documents',
+    description: 'List, read, search and edit the files attached to this project.',
+    tools: [
+      'project_list_files', 'project_read_file', 'project_search',
+      'project_create_file', 'project_append_file', 'project_replace_text',
+    ],
+    // The three writes are absent, so the default-deny rule makes them writes
+    // and each one stops for a human with its arguments shown in full.
+    reads: ['project_list_files', 'project_read_file', 'project_search'],
+  },
   // Boxes are task-shaped, not app-shaped. An app with seventeen tools becomes
   // two or three boxes, because the budget is spent per selection: a project
   // that wants to read a calendar should not also pay for bulk deletion.
@@ -1230,6 +1431,19 @@ const MCP_TOOLBOX_MANIFEST = [
 // pass-through hands a user's Nextcloud password to the server being called.
 // That is correct for the Nextcloud MCP and a credential leak for anything
 // else, so a server gets it only when the operator says so by name.
+// `internal` names noevia's own in-process MCP server. It is accepted only for
+// a loopback IP LITERAL: a DNS name — including `localhost` — can be made to
+// resolve somewhere else, and this listener answers to a capability token
+// rather than a session cookie, so pointing it off-box would hand that
+// capability to a stranger. No rebinding, no surprises.
+function isLoopbackLiteral(hostname) {
+  const h = String(hostname || '').replace(/^\[|\]$/g, '');
+  if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h)) {
+    return h.split('.').every((part) => Number(part) >= 0 && Number(part) <= 255);
+  }
+  return h === '::1' || h === '0:0:0:0:0:0:0:1';
+}
+
 const MCP_SERVERS = (() => {
   const shapeOk = (raw, label) => {
     try {
@@ -1261,7 +1475,23 @@ const MCP_SERVERS = (() => {
       // it would be printed by anything that echoes the server list.
       let auth = 'none';
       let tokenEnv = null;
-      if (rawAuth === 'nextcloud') {
+      if (rawAuth === 'internal') {
+        // Dropped rather than downgraded on any doubt. Silently demoting this
+        // to `none` would leave a server configured and unusable; leaving it
+        // out makes its two boxes disappear, which is the documented
+        // unconfigured state and is at least honest.
+        let host = '';
+        try { host = new URL(rawUrl).hostname; } catch { host = ''; }
+        if (!isLoopbackLiteral(host)) {
+          console.warn(`[mcp] ignoring internal server "${id}": ${host || 'that host'} is not a loopback IP literal. Use 127.0.0.1, not a name.`);
+          continue;
+        }
+        if (out.some((sv) => sv.auth === 'internal')) {
+          console.warn(`[mcp] ignoring internal server "${id}": there is only one in-process server and it is already configured`);
+          continue;
+        }
+        auth = 'internal';
+      } else if (rawAuth === 'nextcloud') {
         auth = 'nextcloud';
       } else if (rawAuth && rawAuth.startsWith('bearer:')) {
         const envName = rawAuth.slice('bearer:'.length).trim();
@@ -1312,8 +1542,67 @@ function toolboxOffered(id) {
   return !ENABLED_TOOLBOXES || ENABLED_TOOLBOXES.has(id);
 }
 
+// ── Deep research (D12): module in research-service.cjs, routes in routes/research.cjs ──
+const researchRoutes = require('./routes/research.cjs').createResearchRoutes({
+  features, getProject, workspace: () => currentWorkspace(), json, readJson,
+  available: () => {
+    if (!toolboxOffered('web-search') || !mcpState.tools.has('tavily_search') || !mcpState.tools.has('tavily_extract')) return 'Deep research needs the web-search toolbox (tavily_search and tavily_extract) on this server.';
+    if (!researchModel()) return 'Pick a Smart model for Auto routing, or load a model, before starting research.';
+    return null;
+  },
+  service: require('./research-service.cjs').createResearchService({
+    saveFile: (project, name, text) => writeProjectTextFile(project, name, text),
+    tools: (workspace, project) => ({
+      complete: async (messages, { signal, maxTokens }) => {
+        const provider = getProvider(DEFAULT_PROVIDER_ID), model = researchModel(project);
+        const r = await fetch(`${provider.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`, { method: 'POST', redirect: 'error',
+          headers: providerHeaders(provider, { 'Content-Type': 'application/json' }), signal: AbortSignal.any([signal, AbortSignal.timeout(120000)]),
+          body: JSON.stringify({ model, stream: false, max_tokens: maxTokens, messages }) });
+        if (!r.ok) throw Object.assign(Error(`The model provider answered ${r.status}.`), { publicMessage: `The model provider answered ${r.status}.` });
+        const choice = (await r.json()).choices?.[0];
+        if (choice?.finish_reason === 'length') throw Object.assign(Error('A research step was cut off by the output limit.'), { publicMessage: 'A research step was cut off by the output limit.' });
+        return String(choice?.message?.content || '');
+      },
+      search: async (query) => require('./routes/research.cjs').parseSearchResults(await executeMcpToolCall('tavily_search', { query, max_results: 5 })),
+      extract: async (url) => {
+        const text = await executeMcpToolCall('tavily_extract', { urls: [url] });
+        if (/^ERROR/.test(text)) throw Error(text);
+        return text;
+      },
+      projectRetrieve: async (question) => rag.ragAvailable()
+        ? (await rag.searchProject(project.id, question, workspace.userId)).slice(0, 5).map((h) => ({ file: h.file, text: h.body }))
+        : [],
+    }),
+  }),
+});
+function researchModel(project) {
+  return autoRoles()?.smart || project?.model || LAST_LOADED_MODEL || null;
+}
+
+// noevia's own capabilities, offered over the same MCP path as everything
+// else. Default 0 means the listener never binds, no `internal` entry can
+// work, both boxes lose every tool and vanish — the ordinary unconfigured
+// state, identical to today for every existing deployment.
+const mcpInternal = require('./mcp-internal.cjs');
+const { missingRoles, staleRolesError } = require('./auto-roles-check.cjs');
+const MCP_INTERNAL_PORT = Number(process.env.MCP_INTERNAL_PORT || 0);
+const MCP_INTERNAL_SERVER = MCP_SERVERS.find((sv) => sv.auth === 'internal') || null;
+// Derived, not the storage key itself: a signing bug must not become a
+// credential-disclosure bug.
+const MCP_INTERNAL_KEY = secretStore.derive('mcp-internal-token');
+
 const MCP_SERVER_BY_ID = new Map(MCP_SERVERS.map((sv) => [sv.id, sv]));
 const MCP_ENABLED = MCP_SERVERS.length > 0;
+
+// Being unconfigured is a healthy state, but it is indistinguishable from a
+// broken one from the outside: a curated box that loses every tool is not
+// rendered at all, so the toolboxes simply are not there and it reads as the
+// feature having been removed. On 2026-09-15 that was a real outage — the live
+// Compose file had been copied without the MCP keys. Name the variable, so the
+// log says what to set rather than only that something is off.
+if (!MCP_ENABLED) {
+  console.warn('[mcp] disabled: neither MCP_SERVERS nor MCP_SERVER_URL is set, so only the built-in `core` toolbox is offered. Set MCP_SERVERS to `id|url|auth` entries to enable connected tools.');
+}
 
 // Discovered MCP tools, keyed by name, plus the boxes that survived curation.
 // Discovery is a network round trip against servers that may be down, so it is
@@ -1339,7 +1628,7 @@ async function discoverOneServer(server) {
   // Discovery lists the catalogue only. A per-USER credential is attached at
   // call time instead (see mcpAuthHeaders), but a static service token has to
   // be present here or the server has nothing to list.
-  const headers = mcpStaticAuth(server);
+  const headers = mcpDiscoveryAuth(server);
   const { session } = await mcp.connect(server.url, headers);
   const discovered = await mcp.listTools(server.url, session, headers);
   const byName = new Map();
@@ -1418,7 +1707,12 @@ async function discoverMcpTools(force = false) {
       mcpState.tools = byName;
       mcpState.boxes = boxes;
       mcpState.servers = servers;
-      mcpState.discoveredAt = Date.now();
+      // The internal server is this process. If it did not answer, something
+      // is starting up or broken here, not on a remote host that needs ten
+      // minutes of backoff — retry on the next request instead of hiding its
+      // boxes for the whole TTL.
+      const internalDown = [...servers.values()].some((sv) => sv.auth === 'internal' && sv.error);
+      mcpState.discoveredAt = internalDown ? 0 : Date.now();
       // Kept for the single-server status shape: the first error, if any.
       mcpState.error = [...servers.values()].map((sv) => sv.error).find(Boolean) || null;
       console.log(`[mcp] ${byName.size} tools across ${MCP_SERVERS.length} server(s); ${boxes.length} curated boxes available`);
@@ -1495,6 +1789,45 @@ function mcpAuthHeaders() {
   }
   const basic = Buffer.from(`${storage.username}:${storage.secret}`).toString('base64');
   return { Authorization: `Basic ${basic}`, 'X-Cowork-User-ID': workspace.userId };
+}
+
+/** A capability token for one call to noevia's own MCP server.
+ *
+ *  Unlike the other two modes this is not a credential at all — the caller is
+ *  this process. What it carries is WHICH user and project the call acts for,
+ *  bound by an HMAC so the call cannot claim a different one, and whether a
+ *  write has been approved. Fresh per call, valid for 30 seconds.
+ *
+ *  `w` is safe to derive from isWriteTool here because this is only reached
+ *  from executeToolCall, which the permission gate has already let through:
+ *  a write that was declined returns before ever getting here. */
+function mcpInternalAuth(name) {
+  const workspace = requestScope.getStore()?.workspace;
+  if (!workspace) return null;
+  const token = mcpInternal.mintToken(MCP_INTERNAL_KEY, {
+    uid: workspace.userId,
+    pid: internalCallProject ? internalCallProject.id : null,
+    w: isWriteTool(name) ? 1 : 0,
+  });
+  return { Authorization: `Bearer ${token}` };
+}
+
+/** Which project the in-flight tool call belongs to. executeMcpToolCall is
+ *  reached from executeToolCall, which knows; rather than changing the
+ *  signature of a function three other call sites share, the project is parked
+ *  here for the length of one await. Single-threaded, set immediately before
+ *  the call and cleared after. */
+let internalCallProject = null;
+
+/** Discovery runs with no user in scope, so it gets a token that can list the
+ *  catalogue and can never call anything. The catalogue is static and
+ *  identical for everyone, so this leaks nothing. Longer-lived than a call
+ *  token because listTools paginates, and harmless because it cannot act. */
+function mcpDiscoveryAuth(server) {
+  if (server && server.auth === 'internal') {
+    return { Authorization: `Bearer ${mcpInternal.mintToken(MCP_INTERNAL_KEY, { discovery: true, ttlMs: 120000 })}` };
+  }
+  return mcpStaticAuth(server);
 }
 
 // ── Tool permissions (master step 16) ────────────────────────────────────
@@ -1634,6 +1967,7 @@ async function executeToolCall(project, name, rawArgs, allowed) {
   } catch {
     return `ERROR: tool arguments were not valid JSON: ${String(rawArgs).slice(0, 200)}`;
   }
+  if (kiwixTools?.names.has(name)) return kiwixTools.execute(name, args);
   if (name === 'get_current_time') {
     const tz = typeof args.timezone === 'string' && args.timezone ? args.timezone : undefined;
     const now = new Date();
@@ -1669,7 +2003,10 @@ async function executeToolCall(project, name, rawArgs, allowed) {
   // Not a built-in: if the name came from a discovered MCP box, execute it
   // there. The per-user credential is attached here rather than at discovery,
   // so two users sharing a project each act as themselves.
-  if (mcpState.tools.has(name)) return executeMcpToolCall(name, args);
+  if (mcpState.tools.has(name)) {
+    internalCallProject = project || null;
+    try { return await executeMcpToolCall(name, args); } finally { internalCallProject = null; }
+  }
   return `ERROR: unknown tool "${name}"`;
 }
 
@@ -1687,6 +2024,9 @@ async function executeMcpToolCall(name, args) {
   if (server.auth === 'bearer') {
     auth = mcpStaticAuth(server);
     if (!auth) return `ERROR: ${name} needs ${server.tokenEnv}, which is not configured on this deployment.`;
+  } else if (server.auth === 'internal') {
+    auth = mcpInternalAuth(name);
+    if (!auth) return `ERROR: ${name} needs a signed-in session and there is none.`;
   } else if (server.auth === 'nextcloud') {
     auth = mcpAuthHeaders();
     if (!auth) {
@@ -1828,6 +2168,12 @@ async function classifyFastOrSmart(message) {
     console.warn('[router] classify failed, failing open to fast:', err?.message || err);
     return 'fast';
   }
+}
+
+// The served model list, or null when it cannot be read (never treat an outage as "nothing installed").
+async function servedCatalogue() {
+  if (!modelManager.enabled) return null;
+  try { return await modelsInstalled(); } catch { return null; }
 }
 
 async function modelsInstalled() {
@@ -1972,7 +2318,12 @@ async function handleChat(req, res, body, authn) {
     catch(error){return json(res,error.status||500,{error:error.status?error.message:'Could not save preparation recovery; no tools were run.'});}
   }
   try{return await handleChatInner(req,res,body,authn,preparation);}
-  finally{preparation?.finish();}
+  finally{
+    preparation?.finish();
+    // A chat deleted while this reply ran leaves no context state (summaries hold conversation text).
+    const id=typeof body?.chatId==='string'?body.chatId:null;
+    try{const dir=currentWorkspace().dir;if(id&&require('./chat-lists.cjs').readTombstones(dir).has(id))require('./chat-context.cjs').remove(dir,id);}catch{/* best effort */}
+  }
 }
 
 async function handleChatInner(req, res, body, authn, preparation) {
@@ -2025,9 +2376,12 @@ async function handleChatInner(req, res, body, authn, preparation) {
   let project = null;
   if (projectId && spaceId !== 'diary') {
     project = getProject(projectId);
+    if (project && body.projectId && !require('./project-modes.cjs').enabled(project, 'chat')) {
+      return json(res, 409, { error: `${project.name} is not enabled for Chat. Turn Chat on in the project's settings.` });
+    }
     if (project && !chatId) {
       chatId = `p-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      saveChats(projectId, [...loadChats(projectId), chatId]);
+      saveChats(projectId, [{ id: chatId, title: 'New task', updatedAt: Date.now(), preview: '' }]);
     }
   }
 
@@ -2042,13 +2396,17 @@ async function handleChatInner(req, res, body, authn, preparation) {
   }
 
   const sysParts = [];
+  const accountSettings = require('./account-instructions.cjs').read(currentWorkspace().dir);
+  const accountPart = require('./account-instructions.cjs').systemPart(accountSettings.text, accountSettings.style);
+  if (accountPart) sysParts.push(accountPart);
+  const accountMemory = require('./account-memory.cjs');
+  const memoryPart = accountMemory.systemPart(accountMemory.read(currentWorkspace().dir), project?.memories);
+  if (!project && memoryPart) sysParts.push(memoryPart);
   if (project) {
     if (project.name) sysParts.push(`You are working inside the user's project "${project.name}".`);
     if (project.goal) sysParts.push(`Project goal: ${project.goal}`);
     if (project.instructions) sysParts.push(`Project instructions (follow closely):\n${project.instructions}`);
-    if (Array.isArray(project.memories) && project.memories.length) {
-      sysParts.push(`Things you know about the user (persistent memory, apply silently):\n${project.memories.map((m) => `- ${m}`).join('\n')}`);
-    }
+    if (memoryPart) sysParts.push(memoryPart);
     if (filesBlock) {
       sysParts.push(`Relevant knowledge-file excerpts for this message:\n${filesBlock}`);
     }
@@ -2172,6 +2530,8 @@ async function handleChatInner(req, res, body, authn, preparation) {
     if (!roles) {
       return json(res, 400, { error: 'Auto routing is not configured yet — pick Fast and Smart models in the model popup first.' });
     }
+    const staleRoles = staleRolesError(missingRoles(roles, await servedCatalogue()));
+    if (staleRoles) return json(res, 409, { error: staleRoles });
     routedRole = await classifyFastOrSmart(message); // fail-open inside
     model = roles[routedRole];
   } else if (!model && provider.id === DEFAULT_PROVIDER_ID && modelManager.enabled) {
@@ -2240,6 +2600,11 @@ async function handleChatInner(req, res, body, authn, preparation) {
       // No vision role, or the description failed. Fall back to handing the
       // images to the answering model directly, if it can read them at all.
       const vision = await visionProbe(provider.baseUrl, upstreamHeaders, model);
+      // A projector error is a capability result for this configuration; an unreachable
+      // engine or timeout is not, so it records nothing.
+      if (provider.id === DEFAULT_PROVIDER_ID && modelManager.recordEvidence && (vision.supported || /projector|mmproj/i.test(vision.reason || ''))) {
+        modelManager.recordEvidence(model, { category: 'vision', result: vision.supported ? 'passed' : 'failed', value: null, suite: { name: 'vision-probe', version: 1 }, source: 'probe', limitations: vision.supported ? ['1×1 image accepted; not an accuracy test'] : [String(vision.reason || '').slice(0, 200)] }).catch(() => undefined);
+      }
       if (vision.supported) {
         const lastUser = [...wire].reverse().find((m) => m.role === 'user');
         if (lastUser) {
@@ -2274,7 +2639,10 @@ async function handleChatInner(req, res, body, authn, preparation) {
   // Resolve the project's toolboxes once for the whole exchange: every round
   // must offer the same list, or the model gets told a tool exists and then
   // punished for calling it.
-  const resolved = resolveTools(project, model);
+  const selectedBoxes = Array.isArray(project && project.toolboxes) ? project.toolboxes : DEFAULT_TOOLBOXES;
+  const routing = await chatToolRouter.select(selectedBoxes, message);
+  if (routing.routed) console.log(`[tools] routed ${selectedBoxes.length} toolboxes to ${routing.ids.join(', ')}`);
+  const resolved = resolveTools(routing.routed ? { ...project, toolboxes: routing.ids } : project, model);
   const activeTools = resolved.tools;
   const allowedToolNames = new Set(activeTools.map((t) => t.function.name));
   if (resolved.dropped.length) {
@@ -2286,7 +2654,7 @@ async function handleChatInner(req, res, body, authn, preparation) {
   const runTool = createToolExchange({ allowed: allowedToolNames, isWrite: isWriteTool, signal: chatSignal.signal });
   const context = require('./chat-context.cjs');
   const contextId=chatId || spaceId;
-  let prepared,limit,limitSource;
+  let prepared,limit,limitSource,requestStartedAt=Date.now();
   try {
     ({limit,limitSource}=await context.resolveRuntimeLimit({
       manager:provider.id===DEFAULT_PROVIDER_ID?modelManager:null,model,dir:chatWorkspace.dir,
@@ -2316,10 +2684,13 @@ async function handleChatInner(req, res, body, authn, preparation) {
   // Track final-answer content separately for each round. Reasoning may contain
   // internal planning or unfinished narration; it is never promoted to an answer.
   let roundHasContent = false;
+  // Text streamed in a round that then calls tools is narration, not the answer.
+  let roundContent = '';
   let roundReasoning = '';
   let toolOffset = 0;
   for (let round = 0; round < 3 && !chatSignal.signal.aborted; round++) {
     const roundBudget=context.measure(roundMessages,activeTools,limit,limitSource,model);
+    context.logRound({dir:chatWorkspace.dir,chatId:contextId,model,limit,round,compacted:!!prepared.meter.compactedAt&&prepared.meter.compactedAt>=requestStartedAt,messages:roundMessages,tools:activeTools});
     if(roundBudget.used>roundBudget.threshold){send({type:'error',text:'Tool results filled the available context. Compact the chat or reduce sources before retrying.'});break;}
     const snapshot=context.read(chatWorkspace.dir,contextId);snapshot.meter={...roundBudget,historyCount:prepared.meter.historyCount,compactedAt:prepared.meter.compactedAt,covered:prepared.meter.covered};context.save(chatWorkspace.dir,contextId,snapshot);
     let upstream;
@@ -2348,6 +2719,7 @@ async function handleChatInner(req, res, body, authn, preparation) {
     let sawAnything = false;
     roundReasoning = '';
     roundHasContent = false;
+    roundContent = '';
     // SSE line reassembly must live outside the chunk loop so a `data: {...}`
     // line split across a chunk boundary keeps its leading fragment
     // (same pattern as the client-side reader in src/api.ts).
@@ -2377,6 +2749,10 @@ async function handleChatInner(req, res, body, authn, preparation) {
                 tokensPerSecond: Number(evt.timings?.predicted_per_second) || 0,
               };
               recordUsage(chatWorkspace, model, reported);
+              const drafted = Number(evt.timings?.draft_n), accepted = Number(evt.timings?.draft_n_accepted);
+              if (provider.id === DEFAULT_PROVIDER_ID && modelManager.recordEvidence && drafted > 0 && accepted >= 0 && accepted <= drafted) {
+                modelManager.recordEvidence(model, { category: 'mtp_acceptance', result: 'reported', value: { rate: Math.round((accepted / drafted) * 100) / 100, drafted, accepted }, suite: { name: 'chat-reply', version: 1 }, source: 'observation', limitations: ['single reply; depends on content'] }).catch(() => undefined);
+              }
               // One free observation of (prompt size -> time to first token).
               // Only when a first token was actually seen this round: a round
               // that errored or returned nothing says nothing about prefill.
@@ -2405,6 +2781,7 @@ async function handleChatInner(req, res, body, authn, preparation) {
             if (delta.content) {
               sawAnything = true;
               roundHasContent = true;
+              roundContent += delta.content;
               send({ type: 'delta', text: delta.content });
             }
             if (Array.isArray(delta.tool_calls)) {
@@ -2448,7 +2825,7 @@ async function handleChatInner(req, res, body, authn, preparation) {
         require('./mtp.cjs').record(chatWorkspace?.userId,model,full.body?.timings);
         const msg = full.body?.choices?.[0]?.message;
         if (msg?.reasoning_content) { roundReasoning += msg.reasoning_content; send({ type: 'reasoning', text: msg.reasoning_content }); }
-        if (msg?.content) { roundHasContent = true; send({ type: 'delta', text: msg.content }); }
+        if (msg?.content) { roundHasContent = true; roundContent += msg.content; send({ type: 'delta', text: msg.content }); }
         if (Array.isArray(msg?.tool_calls)) {
           for (const tc of msg.tool_calls) {
             const index = toolCalls.size;
@@ -2469,6 +2846,7 @@ async function handleChatInner(req, res, body, authn, preparation) {
     // cannot be fed back to the model), but they are still streamed to the
     // user instead of dangling.
     if (toolCalls.size > 0) {
+      if (roundContent.trim()) { send({ type: 'preamble', text: roundContent }); roundHasContent = false; }
       const assistantMsg = { role: 'assistant', content: null, tool_calls: [...toolCalls.entries()].map(([i, tc]) => ({ id: tc.id, type: 'function', function: { name: tc.name, arguments: tc.args } })) };
       roundMessages = [...roundMessages, assistantMsg];
       for (const [toolIndex, tc] of toolCalls) {
@@ -2615,6 +2993,12 @@ async function handleRequestScoped(req, res) {
     if (authn && !['GET', 'HEAD', 'OPTIONS'].includes(req.method || 'GET') && (!authService.originValid(req) || !authService.csrfValid(req, authn))) {
       return json(res, 403, { error: 'invalid CSRF token' });
     }
+    if (authn && await featureRoutes(req, res, { path: p, authn })) return;
+    if (authn && await exportRoutes(req, res, { path: p, authn })) return;
+    if (authn && await importRoutes(req, res, { path: p, authn })) return;
+    if (authn && await accountRoutes(req, res, { path: p, authn })) return;
+    if (authn && await offsiteRoutes(req, res, { path: p, authn })) return;
+    if (authn && p.startsWith('/api/projects/') && await researchRoutes(req, res, { path: p, authn })) return;
     if(p==='/api/profile/diary-connectors' && req.method==='GET')return json(res,200,{connectors:diaryConnectors.list(authn.user.id)});
     if(p==='/api/profile/diary-connectors' && req.method==='POST')return json(res,201,diaryConnectors.create(authn.user.id,(await readJson(req)).name));
     const revokeConnector=p.match(/^\/api\/profile\/diary-connectors\/([a-f0-9]{32})$/);
@@ -2894,6 +3278,7 @@ async function handleRequestScoped(req, res) {
     }
 
     if (p === '/api/workspace') {
+      try { sweepRetention(); } catch (e) { console.warn('[retention] sweep failed:', e?.message || e); }
       // PROJECTS is served raw everywhere else; here it crosses to the client,
       // so chats[] must be sanitized exactly as loadChats does.
       return json(res, 200, {
@@ -3012,22 +3397,6 @@ async function handleRequestScoped(req, res) {
 
     // ── Projects CRUD ──
     const usageSummary = require('./usage-summary.cjs');
-    const usageRates = () => {
-      try { return usageSummary.validateRates(JSON.parse(authService.db.prepare("SELECT value FROM settings WHERE key='usage_rates'").get()?.value || '{"currency":"USD","rates":[]}')); }
-      catch { return {currency:'USD',rates:[]}; }
-    };
-    if (p === '/api/usage/rates') {
-      if(req.method==='GET')return json(res,200,{...usageRates(),admin:authn.user.role==='admin'});
-      if(req.method==='PUT'){
-        if(authn.user.role!=='admin')return json(res,403,{error:'administrator required'});
-        try{
-          const rates=usageSummary.validateRates(await readJson(req));
-          authService.db.prepare("INSERT INTO settings(key,value) VALUES('usage_rates',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(JSON.stringify(rates));
-          return json(res,200,{...rates,admin:true});
-        }catch(error){return json(res,400,{error:error.message||'Invalid rates'});}
-      }
-      return json(res,405,{error:'method not allowed'});
-    }
     if ((p === '/api/usage' || p === '/api/usage/aggregate') && req.method === 'GET') {
       if(p==='/api/usage/aggregate'&&authn.user.role!=='admin')return json(res,403,{error:'administrator required'});
       let store,aggregate;
@@ -3035,7 +3404,7 @@ async function handleRequestScoped(req, res) {
         try {const result=await usageSummary.aggregateUsage(authService.listUsers(),workspaceStore.userDir);store=result.store;aggregate={accounts:result.accounts,unreadableAccounts:result.unreadableAccounts,checkedAt:result.checkedAt};}
         catch{return json(res,503,{error:'Aggregate usage could not be read within its limits.'});}
       }else store=readUsage(currentWorkspace());
-      return json(res,200,{...usageSummary.summarizeUsage(store,{dayKey:usageDayKey,retentionDays:USAGE_RETENTION_DAYS,pricing:usageRates()}),...(aggregate?{aggregate}:{})});
+      return json(res,200,{...usageSummary.summarizeUsage(store,{dayKey:usageDayKey,retentionDays:USAGE_RETENTION_DAYS}),...(aggregate?{aggregate}:{})});
     }
     const windowMatch=p.match(/^\/api\/chats\/([^/]+)\/context-window$/);
     if(windowMatch && req.method==='GET') return json(res,200,{meter:require('./chat-context.cjs').read(currentWorkspace().dir,decodeURIComponent(windowMatch[1])).meter||null});
@@ -3063,7 +3432,7 @@ async function handleRequestScoped(req, res) {
     if (p === '/api/auto-roles') {
       if (req.method === 'GET') {
         const roles = autoRoles();
-        return json(res, 200, { configured: !!roles, roles: roles || null });
+        return json(res, 200, { configured: !!roles, roles: roles || null, missing: missingRoles(roles, await servedCatalogue()) });
       }
       if (req.method === 'PUT') {
         const raw = await readBody(req);
@@ -3114,53 +3483,8 @@ async function handleRequestScoped(req, res) {
       } catch {
         return json(res, 400, { error: 'invalid JSON' });
       }
-      if (body.reasoningEffort !== undefined && !reasoningEffort.validEffort(body.reasoningEffort)) return json(res,400,{error:'Invalid reasoning effort'});
-      const name = String(body.name || '').trim().slice(0, 120);
-      if (!name) return json(res, 400, { error: 'name required' });
-      let appearance;
-      try { appearance = projectAppearance(body); } catch (e) { return json(res, 400, { error: e.message }); }
-      const project = {
-        ...appearance,
-        id: `proj-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        name,
-        goal: String(body.goal || '').slice(0, 2000),
-        instructions: String(body.instructions || '').slice(0, 8000),
-        pinned: false,
-        archived: false,
-        sourceFolders: [],
-        memories: [],
-        files: Array.isArray(body.files)
-          ? body.files
-              .filter((f) => f && typeof f.name === 'string' && typeof f.content === 'string')
-              .slice(0, 20)
-              .map((f) => ({ name: f.name.slice(0, 200), content: f.content.slice(0, 200000) }))
-          : [],
-        model: typeof body.model === 'string' && body.model ? body.model : undefined,
-        provider: typeof body.provider === 'string' && body.provider ? body.provider : undefined,
-        reasoningEffort: body.reasoningEffort,
-        routing: body.routing === 'auto' ? 'auto' : 'manual', // default manual (step 12 guardrail)
-        toolboxes: sanitizeToolboxes(body.toolboxes) || [...DEFAULT_TOOLBOXES], // step 14: core only by default
-        // (files normalization below is shared with the config route's RAG bookkeeping)
-        chats: [],
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-      };
-      // Its own folder in the user's storage, and attached as a source so
-      // anything dropped in it — by noevia or by the user, from any device —
-      // is picked up on the next sync.
-      const ownFolder = await ensureProjectFolder(project);
-      if (ownFolder) {
-        project.projectFolder = ownFolder;
-        project.sourceFolders = [ownFolder];
-      }
-      PROJECTS.unshift(project);
-      saveProjects(PROJECTS);
-      // Index any files that arrived with the create call (same RAG bookkeeping
-      // as the config route).
-      for (const f of project.files) {
-        indexSource(project, f);
-      }
-      return json(res, 200, project);
+      try { return json(res, 200, await createProject(body)); }
+      catch (e) { if (e.status === 400) return json(res, 400, { error: e.message }); throw e; }
     }
 
     const projMatch = p.match(/^\/api\/projects\/([^/]+)$/);
@@ -3179,6 +3503,7 @@ async function handleRequestScoped(req, res) {
           fs.rmSync(path.join(currentWorkspace().ragDir(), `${id}${suffix}`), { force: true });
         }
       } catch { /* best effort */ }
+      if (removedProject) sweepDeletedProject(removedProject);
       return json(res, 200, { ok: true });
     }
 
@@ -3229,6 +3554,9 @@ async function handleRequestScoped(req, res) {
           .slice(0, 10);
       }
       if (typeof patch.archived === 'boolean') project.archived = patch.archived;
+      if (patch.modes !== undefined) {
+        try { project.modes = require('./project-modes.cjs').sanitize(patch.modes); } catch (e) { return json(res, 400, { error: e.message }); }
+      }
       if (typeof patch.routing === 'string') {
         if (patch.routing !== 'auto' && patch.routing !== 'manual') {
           return json(res, 400, { error: "routing must be 'auto' or 'manual'" });
@@ -3299,7 +3627,7 @@ async function handleRequestScoped(req, res) {
             id,
             body.chats
               .filter((c) => c && typeof c.id === 'string')
-              .slice(0, 200)
+              .slice(0, require('./chat-lists.cjs').LIST_CAP)
               .map((c) => ({
                 id: c.id.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80),
                 title: String(c.title || 'New task').slice(0, 120),
@@ -3733,7 +4061,7 @@ async function handleRequestScoped(req, res) {
           if (!Array.isArray(body.chats)) return json(res, 400, { error: 'chats array required' });
           const nextFreeChats = body.chats
             .filter((c) => c && typeof c.id === 'string')
-            .slice(0, 200)
+            .slice(0, require('./chat-lists.cjs').LIST_CAP)
             .map((c) => ({
               id: c.id.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80),
               title: String(c.title || 'New chat').slice(0, 120),
@@ -3742,7 +4070,8 @@ async function handleRequestScoped(req, res) {
               pinned: c.pinned === true,
               archived: c.archived === true,
             }));
-          FREE_CHATS.splice(0, FREE_CHATS.length, ...nextFreeChats);
+          const lists = require('./chat-lists.cjs');
+          FREE_CHATS.splice(0, FREE_CHATS.length, ...lists.mergeChats(Array.from(FREE_CHATS), nextFreeChats, lists.readTombstones(currentWorkspace().dir)));
           saveFreeChats(FREE_CHATS);
           return json(res, 200, { ok: true });
         } catch {
@@ -3782,10 +4111,14 @@ async function handleRequestScoped(req, res) {
       if(!/^[\w./%:+@-]*$/.test(rest)||rest.includes('..'))return json(res,400,{error:'Invalid path'});
       const method=req.method||'GET';
       const body=['GET','HEAD','DELETE'].includes(method)?undefined:await readBody(req,1024*1024);
-      const result=await fetchJson(`${process.env.MODEL_LOADER_URL.replace(/\/+$/,'')}/api/v1/${rest}${url.search}`,{method,headers:{'Content-Type':'application/json'},body},10*60*1000).catch(()=>null);
+      const result=await fetchJson(`${process.env.MODEL_LOADER_URL.replace(/\/+$/,'')}/api/v1/${rest}${url.search}`,{method,headers:{'Content-Type':'application/json',...(process.env.MODEL_LOADER_TOKEN?{'X-Model-Loader-Token':process.env.MODEL_LOADER_TOKEN}:{})},body},10*60*1000).catch(()=>null);
       res.setHeader('Cache-Control','no-store');
       if(!result)return json(res,502,{error:'The model management service is not responding.'});
       const detail=result.body&&typeof result.body==='object'?result.body:{error:String(result.body||'')};
+      // A finished benchmark run viewed in the manager becomes throughput evidence (best-effort, throttled).
+      if(result.ok&&method==='GET'&&/^benchmark\/runs\/\d+$/.test(rest)&&modelManager.recordEvidence){
+        for(const {model,record} of require('./benchmark-evidence.cjs').throughputRecords(detail))modelManager.recordEvidence(model,record).catch(()=>undefined);
+      }
       return json(res,result.status,result.ok?detail:{error:detail.detail||detail.error||'Model management request failed.'});
     }
 
@@ -3797,6 +4130,42 @@ async function handleRequestScoped(req, res) {
       catch(e){ return json(res,e.status||500,{error:e.status===409?'Requests are in progress. Try again when chats finish.':e.message}); }
     }
 
+    if (p === '/api/models/evidence' && req.method === 'GET') {
+      if (!modelManager.evidence) return json(res, 404, { error: 'Qualification evidence needs the native engine' });
+      const model = url.searchParams.get('model') || '';
+      if (!model || model.length > 200) return json(res, 400, { error: 'Choose a model' });
+      const result = await modelManager.evidence(model);
+      res.setHeader('Cache-Control', 'no-store');
+      return json(res, result.status, result.body);
+    }
+
+    // Re-run the cheap image probe for one model and record the result. It may load the model.
+    if (p === '/api/models/evidence/recheck') {
+      if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model evidence'});
+      if(req.method!=='POST')return json(res,405,{error:'Method not allowed'});
+      if(!modelManager.recordEvidence)return json(res,404,{error:'Qualification evidence needs the native engine'});
+      const body=await readJson(req).catch(()=>null);
+      const model=typeof body?.model==='string'?body.model:'';
+      if(!model||model.length>200)return json(res,400,{error:'Choose a model'});
+      if(body.category!=='vision')return json(res,400,{error:'Only image input can be rechecked here; use Measure context for context capacity.'});
+      const provider=getProvider(DEFAULT_PROVIDER_ID);
+      const vision=await createVisionProbe()(provider.baseUrl,providerHeaders(provider),model);
+      if(!vision.supported&&!/projector|mmproj/i.test(vision.reason||''))return json(res,503,{error:vision.reason||'The engine could not run the image probe.'});
+      await modelManager.recordEvidence(model,{category:'vision',result:vision.supported?'passed':'failed',value:null,suite:{name:'vision-probe',version:1},source:'recheck',limitations:vision.supported?['1×1 image accepted; not an accuracy test']:[String(vision.reason||'').slice(0,200)]});
+      return json(res,200,(await modelManager.evidence(model)).body);
+    }
+
+    if (p === '/api/models/autotune' || p === '/api/models/autotune/cancel') {
+      if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
+      if(!modelManager.autotune)return json(res,404,{error:'Auto-tune is unavailable'});
+      let result;
+      if(p.endsWith('/cancel')){if(req.method!=='POST')return json(res,405,{error:'Method not allowed'});result=modelManager.autotune.cancel();}
+      else if(req.method==='GET')result=modelManager.autotune.status(url.searchParams.get('model')||'');
+      else if(req.method==='POST'){const body=await readJson(req);result=await modelManager.autotune.start(String(body?.model||''),{confirmPause:body?.confirmPause,promptBudgetSeconds:body?.promptBudgetSeconds,extendContext:body?.extendContext,resume:body?.resume});}
+      else return json(res,405,{error:'Method not allowed'});
+      res.setHeader('Cache-Control','no-store');
+      return json(res,result.status,result.body);
+    }
     if (p === '/api/models/calibration' || p === '/api/models/calibration/cancel') {
       if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
       if(!modelManager.calibration)return json(res,404,{error:'Native calibration is unavailable'});
@@ -4080,7 +4449,9 @@ async function handleRequestScoped(req, res) {
 
     if (p === '/api/chat' && req.method === 'POST') {
       if (llmRateLimited(authn.user.id)) return json(res, 429, { error: 'Too many requests — the model endpoint is shared; wait a moment and try again' });
-      const raw = await readBody(req);
+      let raw;
+      try { raw = await readBody(req, STORED_HISTORY_BYTES); }
+      catch (e) { return json(res, e.status || 400, { error: e.status === 413 ? 'This chat is too large to continue; start a new chat.' : 'could not read the request' }); }
       let body;
       try {
         body = JSON.parse(raw);
@@ -4098,13 +4469,26 @@ async function handleRequestScoped(req, res) {
     const historyMatch = p.match(/^\/api\/chats\/([^/]+)\/history$/);
     if (historyMatch) {
       const spaceId = decodeURIComponent(historyMatch[1]);
-      if (req.method === 'GET') return json(res, 200, { history: readHistory(spaceId) });
+      const revisionOf = (history) => crypto.createHash('sha256').update(JSON.stringify(history)).digest('hex');
+      if (req.method === 'GET') { const history = readHistory(spaceId); return json(res, 200, { history, revision: revisionOf(history) }); }
       if (req.method === 'POST') {
-        const raw = await readBody(req);
+        // A reply that finishes after its chat was deleted must not write the transcript back.
+        if (require('./chat-lists.cjs').readTombstones(currentWorkspace().dir).has(spaceId)) return json(res, 410, { error: 'This chat was deleted.' });
+        let raw;
+        try { raw = await readBody(req, STORED_HISTORY_BYTES); }
+        catch (e) { return json(res, e.status || 400, { error: e.status === 413 ? 'This chat is too large to save; start a new chat to keep going.' : 'could not read the chat' }); }
         try {
           const body = JSON.parse(raw);
-          writeHistory(spaceId, Array.isArray(body.history) ? body.history.slice(-HISTORY_CAP) : []);
-          return json(res, 200, { ok: true });
+          // Optimistic concurrency: a save based on an older copy (another device saved meanwhile)
+          // gets the current copy back to merge. Saves without a base revision are accepted as before.
+          if (typeof body.baseRevision === 'string') {
+            const current = readHistory(spaceId);
+            const revision = revisionOf(current);
+            if (body.baseRevision !== revision) return json(res, 409, { error: 'This chat changed on another device.', history: current, revision });
+          }
+          const next = Array.isArray(body.history) ? body.history.slice(-STORED_HISTORY_CAP) : [];
+          writeHistory(spaceId, next);
+          return json(res, 200, { ok: true, revision: revisionOf(next) });
         } catch {
           return json(res, 400, { error: 'invalid JSON' });
         }
@@ -4168,12 +4552,75 @@ if (require.main === module) {
       read: (id, path) => call(id, '/file', 'POST', { path }),
       write: (id, body) => call(id, '/file', 'PUT', body),
       mkdir: (id, path) => call(id, '/directory', 'POST', { path }),
+      ops: (id, body) => call(id, '/workspace-ops', 'POST', body),
     } });
     const davServer = http.createServer((req, res) => { handler(req, res).catch(() => res.destroy()); });
     davServer.requestTimeout = 60000; davServer.headersTimeout = 15000;
     davServer.setTimeout(60000, socket => socket.destroy());
     davServer.listen(davConfig.port, HOST, () => console.log(`Diary file sharing listener on port ${davConfig.port}; scope ${davConfig.scope}; per-user opt-in required`));
   }
+  // ── noevia's own MCP server ──────────────────────────────────────────
+  //
+  // Second listener, loopback only, started only when a port is configured
+  // AND MCP_SERVERS actually names it. Configuring one without the other is a
+  // half-built setup, so say which half is missing rather than binding a port
+  // nothing will call or advertising a server that will not answer.
+  if (MCP_INTERNAL_PORT && !MCP_INTERNAL_SERVER) {
+    console.warn(`[mcp] MCP_INTERNAL_PORT=${MCP_INTERNAL_PORT} is set but no MCP_SERVERS entry uses |internal, so nothing will call it. Add: noevia|http://127.0.0.1:${MCP_INTERNAL_PORT}/mcp|internal`);
+  } else if (!MCP_INTERNAL_PORT && MCP_INTERNAL_SERVER) {
+    console.warn('[mcp] an MCP_SERVERS entry uses |internal but MCP_INTERNAL_PORT is not set, so noevia\'s own tools will not answer.');
+  } else if (MCP_INTERNAL_PORT && MCP_INTERNAL_SERVER) {
+    if (MCP_INTERNAL_PORT === PORT || MCP_INTERNAL_PORT === Number(process.env.COWORK_DAV_PORT || 0)) {
+      throw new Error('MCP_INTERNAL_PORT must differ from UI_PORT and COWORK_DAV_PORT');
+    }
+    const definitions = require('./mcp-internal-tools.cjs').createInternalTools({
+      cap: TOOL_RESULT_CAP,
+      getProject,
+      // Reads only. diaryHeaders() carries the tenant header and the storage
+      // descriptor, so the sidecar resolves the SAME corpus it would for this
+      // user's own browser session and no other.
+      diary: async (endpoint) => {
+        const userId = requestScope.getStore()?.workspace?.userId;
+        if (!userId || !authService.diaryEnabled(userId)) throw new Error('the Diary add-on is not enabled for this account');
+        const r = await fetchJson(`${DIARY_BASE}/api${endpoint}`, { headers: diaryHeaders() }, 15000);
+        if (!r.ok) throw new Error(String(r.body?.detail || r.body?.error || `diary sidecar ${r.status}`));
+        return r.body || {};
+      },
+      ...(features.enabled('diaryMcpWrite') ? { diaryAppend: async ({ text, title, timezone }) => {
+        const userId = requestScope.getStore()?.workspace?.userId;
+        if (!userId || !authService.diaryEnabled(userId)) throw new Error('the Diary add-on is not enabled for this account');
+        const body = { text, title, requestId: crypto.randomUUID(), entryTime: require('./mcp-internal-tools.cjs').isoWithOffset(new Date(), timezone) };
+        const r = await fetchJson(`${DIARY_BASE}/api/entries/append`, { method: 'POST', headers: diaryHeaders(), body: JSON.stringify(body) }, 30000);
+        if (!r.ok) throw new Error(String(r.body?.error || r.body?.detail || `diary sidecar ${r.status}`));
+        authService.audit('diary.append', userId, userId, { xid: r.body.xid, chars: text.length });
+        return r.body;
+      } } : {}),
+      readProjectFile: (project, args) => executeToolCall(project, 'read_project_file', JSON.stringify(args), null),
+      ragAvailable: () => rag.ragAvailable(),
+      search: (projectId, query, userId) => rag.searchProject(projectId, query, userId),
+      // One write path, the same one a browser upload takes: the file lands in
+      // the project's storage folder and is re-indexed identically, rather
+      // than a second kind of file that only the model can make.
+      writeTextFile: writeProjectTextFile,
+    });
+    const internalServer = mcpInternal.startInternalServer({
+      port: MCP_INTERNAL_PORT,
+      key: MCP_INTERNAL_KEY,
+      definitions,
+      // The scope comes from the token, never from whatever request happens to
+      // be in flight. Same construction the diary backup worker uses.
+      runAs: (userId, fn) => {
+        const user = authService.listUsers().find((u) => u.id === userId);
+        if (!user) throw new Error('that account no longer exists');
+        return requestScope.run({ workspace: workspaceStore.get(userId), authn: { user, legacy: false } }, fn);
+      },
+      path: (() => { try { return new URL(MCP_INTERNAL_SERVER.url).pathname || '/mcp'; } catch { return '/mcp'; } })(),
+    });
+    internalServer.requestTimeout = 120000;
+    internalServer.headersTimeout = 15000;
+  }
+
+  offsiteBackup.schedule();
   require('./diary-backup-worker.cjs').startDiaryBackupWorker({
     users: () => authService.listUsers(),
     enabled: id => authService.diaryEnabled(id),
@@ -4190,6 +4637,9 @@ if (require.main === module) {
     discoverMcpTools().catch(() => undefined);
     // A calibration interrupted by a restart restores the preset it was testing.
     modelManager.calibration?.recover().catch(() => undefined);
+    modelManager.autotune?.recover().catch(() => undefined);
+    // A GGUF that appears in the models folder becomes usable without anyone opening a page.
+    folderSync?.start();
   });
 }
 

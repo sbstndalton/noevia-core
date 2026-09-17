@@ -19,6 +19,9 @@ const { notice: documentNotice } = require('./document-sources.cjs');
 let RAG_DIR = null;
 let EMBED_MODEL = 'default';
 let inferenceBase = null;
+// Optional separate embeddings endpoint (e.g. a CPU-only llama-server) so retrieval never
+// evicts the chat model on a single-slot engine. Inference credentials are not sent there.
+let embeddingBase = null;
 let inferenceHeaders = () => ({ 'Content-Type': 'application/json' });
 let dataDirForUser = null;
 let enterInference = () => () => {};
@@ -28,6 +31,7 @@ function init({ dataDir, embedModel, inferenceUrl, headersFn, userDataDirFn, inf
   dataDirForUser = userDataDirFn || null;
   EMBED_MODEL = process.env.EMBEDDING_MODEL || process.env.EMBED_MODEL || embedModel || EMBED_MODEL;
   inferenceBase = inferenceUrl;
+  embeddingBase = (process.env.EMBEDDING_BASE_URL || '').trim() || null;
   if (headersFn) inferenceHeaders = headersFn;
   if (inferenceGuard) enterInference = inferenceGuard;
 }
@@ -106,9 +110,10 @@ function serializeF32(vec) {
 async function embedOnce(texts) {
   const leave=enterInference();
   try {
-  const res = await fetch(`${inferenceBase.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/embeddings`, {
+  const base = embeddingBase || inferenceBase;
+  const res = await fetch(`${base.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/embeddings`, {
     method: 'POST',
-    headers: inferenceHeaders(),
+    headers: embeddingBase ? { 'Content-Type': 'application/json' } : inferenceHeaders(),
     body: JSON.stringify({ model: EMBED_MODEL, input: texts }),
   });
   if (!res.ok) throw new Error(`embeddings ${res.status}: ${(await res.text()).slice(0, 120)}`);
@@ -320,4 +325,4 @@ async function filesContext(projectId, files, query, userId) {
   return parts.length ? [manifest, coverage, ...parts].join('\n\n') : [manifest, coverage].join("\n");
 }
 
-module.exports = { init, indexProjectFile, deleteProjectFile, searchProject, filesContext, chunkText, ragAvailable };
+module.exports = { init, indexProjectFile, deleteProjectFile, searchProject, filesContext, chunkText, ragAvailable, embed };

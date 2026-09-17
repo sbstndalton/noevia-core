@@ -1,27 +1,35 @@
 'use strict';
-const crypto = require('node:crypto');
-// Result polling keeps long OCR/refresh requests below reverse-proxy timeouts.
-// Jobs contain no durable data; source originals/results use the existing store.
-const workspaces = new WeakMap();
-function start(workspace, projectId, operation) {
-  let jobs = workspaces.get(workspace);
-  if (!jobs) workspaces.set(workspace, jobs = new Map());
-  for (const [id, job] of jobs) if (job.done && Date.now() - job.finished > 900000) jobs.delete(id);
-  if ([...jobs.values()].filter(j => !j.done).length >= 2) throw Object.assign(new Error('Source processing is busy; wait for the current operation and retry.'), { status: 429 });
-  while (jobs.size >= 16) {
-    const old = [...jobs].find(([, j]) => j.done);
-    if (!old) break;
-    jobs.delete(old[0]);
+// Result polling keeps long OCR/refresh requests below reverse-proxy timeouts. Built on the
+// durable job store, so a poll after a restart gets a clear answer instead of "no such job".
+// Source originals and results still live in the existing store; jobs hold status only.
+const { createJobs } = require('./jobs.cjs');
+const stores = new WeakMap();
+function storeFor(workspace) {
+  let store = stores.get(workspace);
+  if (!store) {
+    store = createJobs({ dir: workspace.dir, retainMs: 15 * 60000, maxJobs: 16, kinds: ['source'] });
+    store.recover();
+    stores.set(workspace, store);
   }
-  const id = crypto.randomUUID();
-  const job = { projectId, done: false };
-  jobs.set(id, job);
-  Promise.resolve().then(() => operation(stage => { job.stage = stage; })).then(result => Object.assign(job, result), err => Object.assign(job, { status: err.status || 500, body: { error: 'Source processing failed; refresh or re-upload to retry.' } })).finally(() => { job.done = true; job.finished = Date.now(); });
+  return store;
+}
+function start(workspace, projectId, operation) {
+  const jobs = storeFor(workspace);
+  if (jobs.list({ kind: 'source', active: true }).length >= 2) throw Object.assign(new Error('Source processing is busy; wait for the current operation and retry.'), { status: 429 });
+  const id = jobs.create({ kind: 'source', projectId, capabilities: ['project.sources.write'] });
+  jobs.run(id, async (ctx) => {
+    try { return await operation((stage) => ctx.progress(stage)); }
+    catch (err) { throw Object.assign(new Error('Source processing failed; refresh or re-upload to retry.'), { result: { status: err.status || 500 } }); }
+  }).catch(() => undefined);
   return id;
 }
 function read(workspace, projectId, id) {
-  const job = workspaces.get(workspace)?.get(id);
-  if (!job || job.projectId !== projectId || (job.done && Date.now() - job.finished > 900000)) return null;
-  return job.done ? { done: true, status: job.status, body: job.body } : { done: false, ...(job.stage ? { stage: job.stage } : {}) };
+  let job;
+  try { job = storeFor(workspace).get(id); } catch { return null; }
+  if (!job || job.kind !== 'source' || job.projectId !== projectId) return null;
+  if (job.status === 'completed') return { done: true, status: job.result?.status, body: job.result?.body };
+  if (job.status === 'failed') return { done: true, status: job.result?.status || 500, body: { error: job.error } };
+  if (job.status === 'interrupted' || job.status === 'cancelled') return { done: true, status: 503, body: { error: 'The server restarted before processing finished; refresh or re-upload to retry.' } };
+  return { done: false, ...(job.stage ? { stage: job.stage } : {}) };
 }
 module.exports = { start, read };

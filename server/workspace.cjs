@@ -94,6 +94,8 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets) {
     }
     const uniqueProviders = savedProviders.filter((provider, index, all) => all.findIndex(p => p.id === provider.id) === index);
     for (const project of projects) if (project.provider === 'lemonade') project.provider = defaultProvider.id;
+    let modesMigrated = false;
+    for (const project of projects) if (require('./project-modes.cjs').migrate(project)) modesMigrated = true;
     const workspace = {
       userId, dir, projects,
       // `privateProviders` is the cached per-user truth; `providers` is the
@@ -160,6 +162,7 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets) {
     workspace.providers = mergeProviders(workspace.privateProviders);
     cache.set(userId, workspace);
     if (needsEncryption) workspace.saveProviders();
+    if (modesMigrated) workspace.saveProjects();
     return workspace;
   }
 

@@ -57,6 +57,22 @@ function measure(messages,tools,limit,source,model) {
  const used=parts.reduce((n,p)=>n+p.tokens,0), reserve=Math.min(4096,Math.floor(limit*.25)), safety=Math.ceil(limit*.15);
  return {model,limit,limitSource:source,estimated:true,used,reserve,safety,parts,free:Math.max(0,limit-used-reserve-safety),threshold:limit-reserve-safety,updatedAt:Date.now()};
 }
+function biggestPart(parts) { return parts.reduce((a,b)=>b.tokens>a.tokens?b:a); }
+// Structural + fit validation for a compaction candidate, run before it is ever
+// merged into state or saved. Returns null when the candidate may be committed,
+// otherwise a user-readable reason to keep the previous state untouched.
+function validateCandidate({next,system,protectedTail,tools,limit,limitSource,model}) {
+ const expectedLength=system.length+1+protectedTail.length;
+ if(next.length!==expectedLength) return 'Compaction produced an invalid message sequence.';
+ for(let i=0;i<system.length;i++) if(next[i]!==system[i]) return 'Compaction reordered pinned instructions.';
+ const summaryMsg=next[system.length];
+ if(!summaryMsg || summaryMsg.role!=='assistant') return 'Compaction summary was not positioned correctly.';
+ const tail=next.slice(system.length+1);
+ if(fingerprint(tail)!==fingerprint(protectedTail)) return 'Compaction altered protected messages.';
+ const nextMeter=measure(next,tools,limit,limitSource,model);
+ if(nextMeter.used>nextMeter.threshold) return 'Compaction still does not fit the available context.';
+ return null;
+}
 async function prepareUnlocked({dir,id,messages,tools,limit,limitSource,model,force=false,summarize,onStatus=()=>{}}) {
  const state=read(dir,id), system=messages.filter(m=>m.role==='system'), original=messages.filter(m=>m.role!=='system');
  let applied=applySummary(original,state), wire=[...system,...applied.messages];
@@ -66,6 +82,13 @@ async function prepareUnlocked({dir,id,messages,tools,limit,limitSource,model,fo
   // Keep two recent exchanges intact; never split a user/assistant exchange.
   let cut=Math.max(0,original.length-4);while(cut>0 && original[cut]?.role!=='user')cut--;
   if(cut>applied.covered) {
+   const protectedTail=original.slice(cut);
+   const summaryAllowance=Math.min(1800,Math.floor(limit*.2));
+   const protectedMeter=measure([...system,...protectedTail],tools,limit,limitSource,model);
+   if(protectedMeter.used+summaryAllowance>protectedMeter.threshold) {
+    const biggest=biggestPart([...protectedMeter.parts,{name:'Summary allowance',tokens:summaryAllowance}]);
+    throw Error(`Even with older messages compacted, ${biggest.name} alone (${biggest.tokens} tokens) will not fit this model's context. Reduce ${biggest.name.toLowerCase()} or choose a model with more context. No inference call was made.`);
+   }
    onStatus('Compacting older messages… Your full transcript stays available.');
    let summary=applied.covered?state.summary:'', batch=[];
    const budget=Math.max(512,Math.floor(limit*.45));
@@ -82,6 +105,8 @@ async function prepareUnlocked({dir,id,messages,tools,limit,limitSource,model,fo
    const candidate={summary,covered:cut,prefix:fingerprint(original.slice(0,cut)),compactedAt:Date.now()};
    const next=[...system,...applySummary(original,candidate).messages];
    if(tokens(next)>=tokens(wire))throw Error('Compaction did not reduce the context. Your previous context is retained.');
+   const invalid=validateCandidate({next,system,protectedTail,tools,limit,limitSource,model});
+   if(invalid) throw Error(invalid+' Your previous context is retained.');
    Object.assign(state,candidate);wire=next;meter=measure(wire,tools,limit,limitSource,model);
   } else if(force) throw Error('Not enough older messages to compact. Recent exchanges are kept intact.');
  }
@@ -93,5 +118,7 @@ async function prepareUnlocked({dir,id,messages,tools,limit,limitSource,model,fo
 function providerError(value) {const text=typeof value==='string'?value:JSON.stringify(value);return /context.*(exceed|full|length)|too many tokens|maximum context/i.test(text)?'The model ran out of context space. Compact this chat or reduce its sources before retrying.':'The model stream failed. Partial output was preserved; check the backend before retrying.';}
 const busy=new Set();
 async function prepare(options){const key=stateFile(options.dir,options.id);if(busy.has(key))throw Error('This chat is already preparing context. Wait for that request to finish.');busy.add(key);try{return await prepareUnlocked(options);}finally{busy.delete(key);}}
+// R1 measurement, opt-in with CONTEXT_LOG=1; never breaks a chat.
+function logRound({dir,...entry}){if(process.env.CONTEXT_LOG!=='1')return;try{const log=require('./context-log.cjs');log.append(dir,log.record(entry));}catch(e){console.warn('[context-log] write failed:',e.message);}}
 function remove(dir,id){fs.rmSync(stateFile(dir,id),{force:true});}
-module.exports={remove,tokens,read,save,runtimeLimit,resolveRuntimeLimit,applySummary,measure,prepare,providerError};
+module.exports={logRound,remove,tokens,read,save,runtimeLimit,resolveRuntimeLimit,applySummary,measure,prepare,providerError};

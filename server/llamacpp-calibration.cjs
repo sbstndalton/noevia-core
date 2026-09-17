@@ -41,6 +41,7 @@ function createCalibrator(deps) {
     conservativeFor = async () => null,
     readMemory = readMemAvailableGib,
     memoryFloorGib = 2,
+    onResult = () => {},
     sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
     now = () => Date.now(),
     timeouts = {},
@@ -63,6 +64,7 @@ function createCalibrator(deps) {
 
   // A run that was still marked running when noevia stopped: put the preset back if the
   // file is still exactly what the job last wrote, so an operator's later edit survives.
+  const NOT_RESTORED = ' The original profile was not restored because models.ini changed since the run started; check this model\'s context size.';
   async function recover() {
     load();
     const job = state.job;
@@ -77,6 +79,7 @@ function createCalibrator(deps) {
         await request('/models?reload=1', {}, 120000).catch(() => {});
       }
     } catch { job.restored = false; }
+    if (job.restored === false) job.error += NOT_RESTORED;
     delete job.originalText;
     save();
   }
@@ -338,6 +341,7 @@ function createCalibrator(deps) {
       const props = await request('/props', {}, 8000).catch(() => null);
       const entry = { at: now(), promptBudgetSeconds: job.promptBudgetSeconds, ...job.result, build: props?.body?.build_info || null, slots: Math.max(1, Number(presets.get(job.model).options.parallel) || 1) };
       state.history[job.model] = [entry, ...(state.history[job.model] || [])].slice(0, HISTORY_PER_MODEL);
+      try { await onResult({ model: job.model, status: 'passed', entry }); } catch { /* evidence is best-effort */ }
     } catch (e) {
       job.status = e.cancelled ? 'cancelled' : 'failed';
       job.phase = e.cancelled ? 'Cancelled' : 'Failed';
@@ -348,8 +352,11 @@ function createCalibrator(deps) {
           presets.commit({ baseRevision: job.lastRevision, text: job.originalText });
           await request('/models?reload=1', {}, 120000).catch(() => {});
           job.restored = true;
-        }
+        } else if (job.originalText != null && job.lastRevision) job.restored = false;
       } catch { job.restored = false; }
+      if (job.restored === false) job.error = (job.error || (e.cancelled ? 'Calibration cancelled.' : 'Calibration failed.')) + NOT_RESTORED;
+      // Evidence identity must reflect the restored profile, so record only after restoring.
+      if (!e.cancelled && e.fatal) { try { await onResult({ model: job.model, status: 'failed', entry: { at: now(), promptBudgetSeconds: job.promptBudgetSeconds, error: job.error } }); } catch { /* best-effort */ } }
     } finally {
       job.finishedAt = now();
       delete job.originalText;

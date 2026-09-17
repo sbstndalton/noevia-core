@@ -98,4 +98,4 @@ function prune(workspace, project) {
     if (fs.existsSync(assetDir)) for (const name of fs.readdirSync(assetDir)) if (!keep.has(name)) fs.rmSync(path.join(assetDir, name), { force: true });
   }
 }
-module.exports = { CAP, GROUPS, classify, validate, ingest, original, prune };
+module.exports = { CAP, GROUPS, directory, classify, validate, ingest, original, prune };
