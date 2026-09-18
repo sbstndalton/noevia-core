@@ -24,7 +24,13 @@ process.stdin.on('data', async (chunk) => {
       const seen = [];
       for (const step of script) {
         if (step.update) send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'session-1', update: step.update } });
-        if (step.permission) seen.push(await ask('session/request_permission', step.permission));
+        if (step.permission) {
+          const reply = await ask('session/request_permission', step.permission);
+          // Read it as OpenCode does: the outcome is nested. A client that answers with the
+          // inner object looks, from here, exactly like a rejection.
+          const outcome = reply?.result?.outcome;
+          seen.push({ ...reply, noeviaSaid: outcome && typeof outcome === 'object' ? outcome.outcome : 'unreadable' });
+        }
         if (step.read) seen.push(await ask('fs/read_text_file', step.read));
         if (step.write) seen.push(await ask('fs/write_text_file', step.write));
         if (step.unknown) seen.push(await ask('something/unsupported', {}));

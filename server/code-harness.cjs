@@ -61,7 +61,7 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
         // Recorded first so a running task is identifiable in the list, not just once it ends.
         ctx.checkpoint({ branch: workspace.branch, task: String(prompt).slice(0, 120) });
         const agent = await connect({
-          taskId, harness, model, cwd: workspace.path,
+          taskId, harness, model, cwd: workspace.path, home: workspace.home || null,
           // The adapter pins the agent's own permission config: the spike showed OpenCode's
           // defaults writing silently, and noevia refuses to run a harness whose effective
           // config it cannot pin.

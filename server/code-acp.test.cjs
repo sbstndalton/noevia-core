@@ -64,7 +64,10 @@ test('the agent’s permission request is answered by noevia’s handler, verbat
   const result = await agent.prompt('edit');
   assert.equal(seen.permissions.length, 1);
   assert.equal(seen.permissions[0].toolCall.kind, 'edit');
-  assert.deepEqual(result.seen[0].result, { outcome: 'selected', optionId: 'y' });
+  // Nested, as ACP requires — see "an approval reaches the agent as an approval" below. This
+  // assertion used to encode the bug: it accepted the unwrapped shape a real harness reads as a
+  // rejection.
+  assert.deepEqual(result.seen[0].result, { outcome: { outcome: 'selected', optionId: 'y' } });
 });
 
 test('a handler refusal reaches the agent as a JSON-RPC error, not as a result', async () => {
@@ -96,10 +99,20 @@ test('the agent inherits no ambient environment, and gets the proxy only when gr
   } finally { delete process.env.NOEVIA_ACP_SECRET_PROBE; }
 });
 
-test('HOME is the worktree, so the agent writes its own state inside the sandbox', async () => {
-  const { agent, seen, cwd } = await connect([{ env: 'HOME' }]);
+test('HOME is the task\u2019s own directory, never the workspace', async () => {
+  // With HOME inside the repository a real run committed the harness's whole cache and database
+  // onto the task's branch.
+  const home = temp();
+  const { agent, seen, cwd } = await connect([{ env: 'HOME' }], { home });
   await agent.prompt('x');
-  assert.equal(seen.updates[0].env, cwd);
+  assert.equal(seen.updates[0].env, home);
+  assert.notEqual(seen.updates[0].env, cwd);
+});
+
+test('with no HOME given, none is invented', async () => {
+  const { agent, seen } = await connect([{ env: 'HOME' }]);
+  await agent.prompt('x');
+  assert.equal(seen.updates[0].env, null, 'the sandbox supervisor supplies its own instead');
 });
 
 test('the pinned permission config is what the session is opened with', async () => {
@@ -152,4 +165,32 @@ test('a signal already aborted never starts a prompt at all', async () => {
 
 test('a missing command is a clear configuration error, not a crash', async () => {
   await assert.rejects(() => connectAcp({ command: '', cwd: temp(), handlers: handlers()[0] }), /No coding harness is configured/);
+});
+
+test('an approval reaches the agent as an approval, not as a rejection', async () => {
+  // Found by running real OpenCode: ACP nests the outcome, and sending the inner object is read
+  // as "the user rejected permission". noevia said allow; the harness heard no; the edit never
+  // happened. Fail-safe, and invisible until a real harness was on the other end.
+  const { agent } = await connect([{ permission: { toolCall: { kind: 'edit' }, options: [{ optionId: 'y', kind: 'allow_once' }] } }]);
+  const result = await agent.prompt('edit');
+  const reply = result.seen[0];
+  assert.deepEqual(reply.result, { outcome: { outcome: 'selected', optionId: 'y' } },
+    'the outcome must be nested exactly once');
+  assert.equal(reply.noeviaSaid, 'selected', 'read back the way OpenCode reads it');
+});
+
+test('a refusal is also nested, so it reads as a refusal and not as nonsense', async () => {
+  const { agent } = await connect([{ permission: { toolCall: { kind: 'delete' }, options: [{ optionId: 'n', kind: 'reject_once' }] } }], {
+    handlers: { requestPermission: async () => ({ outcome: 'selected', optionId: 'n' }) },
+  });
+  const result = await agent.prompt('delete');
+  assert.deepEqual(result.seen[0].result, { outcome: { outcome: 'selected', optionId: 'n' } });
+});
+
+test('a cancelled permission is nested too', async () => {
+  const { agent } = await connect([{ permission: { toolCall: { kind: 'edit' }, options: [] } }], {
+    handlers: { requestPermission: async () => ({ outcome: 'cancelled' }) },
+  });
+  const result = await agent.prompt('edit');
+  assert.deepEqual(result.seen[0].result, { outcome: { outcome: 'cancelled' } });
 });

@@ -184,7 +184,8 @@ test('a new worktree is handed to the user the harness runs as', () => {
   const ws = createCodeWorkspaces({ dir, owner: { uid: 1000, gid: 1000 }, epoch: 'test',
     chown: (target, uid, gid) => handed.push([path.basename(target), uid, gid]) });
   const claim = ws.claim({ taskId: ids(1), repoPath: repo });
-  assert.deepEqual(handed, [[ids(1), 1000, 1000]], 'noevia runs as root and the sandbox does not');
+  // The workspace and the harness's own state directory both change hands.
+  assert.deepEqual(handed, [[ids(1), 1000, 1000], [ids(1), 1000, 1000]], 'noevia runs as root and the sandbox does not');
   assert.ok(claim.path);
 });
 
@@ -283,7 +284,9 @@ test('a failed handover leaves nothing behind', () => {
   const ws = createCodeWorkspaces({ dir: temp('noevia-ws-'), treeRoot: shared, owner: { uid: 1000, gid: 1000 },
     epoch: 'test', chown: () => { throw new Error('EPERM'); } });
   assert.throws(() => ws.claim({ taskId: ids(1), repoPath: repo }), /Could not hand the workspace/);
-  assert.deepEqual(fs.readdirSync(shared), [], 'a half-made workspace is not left on the volume');
+  const left = fs.readdirSync(shared).filter((n) => n !== '.harness-home');
+  assert.deepEqual(left, [], 'a half-made workspace is not left on the volume');
+  assert.deepEqual(fs.existsSync(path.join(shared, '.harness-home', ids(1))), false, 'nor its state directory');
 });
 
 test('the clone is taken back before reading from it, or git refuses', () => {
@@ -302,20 +305,127 @@ test('the clone is taken back before reading from it, or git refuses', () => {
   });
   ws.claim({ taskId: ids(1), repoPath: repo });
   ws.release({ taskId: ids(1) });
-  assert.deepEqual(order, ['chown:1000', `chown:${process.getuid()}`, 'fetch'],
+  // Workspace and state directory handed over, workspace taken back, then read.
+  assert.deepEqual(order, ['chown:1000', 'chown:1000', `chown:${process.getuid()}`, 'fetch'],
     'handed to the harness, taken back, then read');
 });
 
 test('a clone that cannot be taken back is stuck, and keeps the work', () => {
   const repo = repoWith();
-  let claimed = false;
+  let claimed = 0;
   const ws = createCodeWorkspaces({
     dir: temp('noevia-ws-'), treeRoot: temp('noevia-shared-'), owner: { uid: 1000, gid: 1000 }, epoch: 'test',
-    chown: () => { if (claimed) throw new Error('EPERM: operation not permitted'); claimed = true; },
+    // Both claim-time chowns succeed; the one at release (taking it back) fails.
+    chown: () => { if (claimed >= 2) throw new Error('EPERM: operation not permitted'); claimed++; },
   });
   const claim = ws.claim({ taskId: ids(1), repoPath: repo });
   const released = ws.release({ taskId: ids(1) });
   assert.equal(released.status, 'stuck');
   assert.match(released.error, /Could not take the workspace back/);
   assert.equal(fs.existsSync(claim.path), true, 'the work stays on disk for a human');
+});
+
+test('uncommitted work is saved, not deleted with the clone', () => {
+  // Found by a real run: OpenCode edited the file through noevia's own file API and never
+  // committed. Only commits can be fetched back, so the change would have gone in the bin with
+  // the clone — the opposite of the point.
+  const repo = repoWith();
+  const ws = createCodeWorkspaces({ dir: temp('noevia-ws-'), treeRoot: temp('noevia-shared-'), mode: 'clone', epoch: 'test' });
+  const claim = ws.claim({ taskId: ids(1), repoPath: repo });
+  fs.writeFileSync(path.join(claim.path, 'a.txt'), 'the harness fixed this and walked away');
+  fs.writeFileSync(path.join(claim.path, 'new-file.txt'), 'and added this');
+
+  const released = ws.release({ taskId: ids(1) });
+  assert.equal(released.status, 'released');
+  assert.equal(fs.existsSync(claim.path), false);
+
+  const show = (file) => execFileSync('git', ['show', `${claim.branch}:${file}`], { cwd: repo, encoding: 'utf8' });
+  assert.equal(show('a.txt'), 'the harness fixed this and walked away', 'the edit survived');
+  assert.equal(show('new-file.txt'), 'and added this', 'so did the new file');
+  const log = execFileSync('git', ['log', '--format=%an%n%s', '-1', claim.branch], { cwd: repo, encoding: 'utf8' });
+  assert.match(log, /^noevia\n/, 'committed in noevia’s name, not the harness’s');
+  assert.match(log, /work in progress from task/);
+});
+
+test('a clean clone produces no empty commit', () => {
+  const repo = repoWith();
+  const ws = createCodeWorkspaces({ dir: temp('noevia-ws-'), treeRoot: temp('noevia-shared-'), mode: 'clone', epoch: 'test' });
+  const claim = ws.claim({ taskId: ids(1), repoPath: repo });
+  ws.release({ taskId: ids(1) });
+  const count = execFileSync('git', ['rev-list', '--count', claim.branch], { cwd: repo, encoding: 'utf8' }).trim();
+  assert.equal(count, '1', 'a task that changed nothing adds nothing');
+});
+
+test("work that cannot be committed keeps the clone rather than losing it", () => {
+  const repo = repoWith();
+  const real = require('node:child_process').execFileSync;
+  const ws = createCodeWorkspaces({
+    dir: temp('noevia-ws-'), treeRoot: temp('noevia-shared-'), mode: 'clone', epoch: 'test',
+    run: (args, cwd) => {
+      if (args.includes('commit')) throw new Error('fatal: unable to write new index file');
+      return real('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    },
+  });
+  const claim = ws.claim({ taskId: ids(1), repoPath: repo });
+  fs.writeFileSync(path.join(claim.path, 'a.txt'), 'precious');
+  const released = ws.release({ taskId: ids(1) });
+  assert.equal(released.status, 'stuck');
+  assert.match(released.error, /uncommitted changes/);
+  assert.equal(fs.readFileSync(path.join(claim.path, 'a.txt'), 'utf8'), 'precious');
+});
+
+test('the harness gets its own HOME, beside the workspace and never inside it', () => {
+  // A real run had HOME pointing at the repository, so OpenCode's cache, sqlite database and a
+  // nested git repo all ended up committed onto the task's branch.
+  const repo = repoWith();
+  const shared = temp('noevia-shared-');
+  const ws = createCodeWorkspaces({ dir: temp('noevia-ws-'), treeRoot: shared, mode: 'clone', epoch: 'test' });
+  const claim = ws.claim({ taskId: ids(1), repoPath: repo });
+  assert.ok(claim.home, 'a task has somewhere of its own to keep harness state');
+  assert.equal(fs.existsSync(claim.home), true);
+  assert.equal(ws.contains(ids(1), claim.home), false, 'and it is outside the workspace');
+
+  // State written there does not reach the branch.
+  fs.writeFileSync(path.join(claim.home, 'opencode.db'), 'harness noise');
+  fs.writeFileSync(path.join(claim.path, 'a.txt'), 'the actual work');
+  ws.release({ taskId: ids(1) });
+  const files = execFileSync('git', ['diff', '--name-only', `main..${claim.branch}`], { cwd: repo, encoding: 'utf8' }).trim().split('\n');
+  assert.deepEqual(files, ['a.txt'], 'only the task’s work is on the branch');
+  assert.equal(fs.existsSync(claim.home), false, 'and the state directory goes with the clone');
+});
+
+test('harness droppings inside the workspace are ignored, not committed', () => {
+  const repo = repoWith();
+  const ws = createCodeWorkspaces({ dir: temp('noevia-ws-'), treeRoot: temp('noevia-shared-'), mode: 'clone', epoch: 'test' });
+  const claim = ws.claim({ taskId: ids(1), repoPath: repo });
+  // Some harnesses write into the working directory whatever HOME says.
+  for (const noise of ['.cache/opencode/models.json', '.local/share/opencode/opencode.db', '.config/opencode/x.jsonc', 'opencode.json']) {
+    fs.mkdirSync(path.dirname(path.join(claim.path, noise)), { recursive: true });
+    fs.writeFileSync(path.join(claim.path, noise), 'noise');
+  }
+  fs.writeFileSync(path.join(claim.path, 'a.txt'), 'the actual work');
+  ws.release({ taskId: ids(1) });
+  const files = execFileSync('git', ['diff', '--name-only', `main..${claim.branch}`], { cwd: repo, encoding: 'utf8' }).trim().split('\n');
+  assert.deepEqual(files, ['a.txt']);
+});
+
+test('the shared state parent is traversable, the task’s own directory is not', () => {
+  // Creating the whole path at 0700 left the shared parent root-owned and unenterable, and the
+  // real harness died with EACCES before doing any work.
+  const shared = temp('noevia-shared-');
+  const ws = createCodeWorkspaces({ dir: temp('noevia-ws-'), treeRoot: shared, mode: 'clone', epoch: 'test' });
+  const claim = ws.claim({ taskId: ids(1), repoPath: repoWith() });
+  const parent = fs.statSync(path.dirname(claim.home)).mode & 0o777;
+  const own = fs.statSync(claim.home).mode & 0o777;
+  assert.equal(parent & 0o111, 0o111, 'every user can traverse the shared parent');
+  assert.equal(own, 0o700, "but only the task's owner can read its own state");
+});
+
+test('a state parent left too strict by an older version is corrected', () => {
+  const shared = temp('noevia-shared-');
+  // What the first version of this created, and what `mkdir` would not fix.
+  fs.mkdirSync(path.join(shared, '.harness-home'), { recursive: true, mode: 0o700 });
+  const ws = createCodeWorkspaces({ dir: temp('noevia-ws-'), treeRoot: shared, mode: 'clone', epoch: 'test' });
+  const claim = ws.claim({ taskId: ids(1), repoPath: repoWith() });
+  assert.equal(fs.statSync(path.dirname(claim.home)).mode & 0o111, 0o111, 'now traversable');
 });

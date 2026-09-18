@@ -9,7 +9,13 @@ const { connectAcp } = require('./code-acp.cjs');
 const AGENT = require.resolve('./fixtures/fake-acp-agent.cjs');
 const temps = [];
 const temp = () => { const d = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-sbx-')); temps.push(d); return d; };
-test.after(() => { for (const d of temps) fs.rmSync(d, { recursive: true, force: true }); });
+// Every supervisor this file starts, closed when it ends. A listening server keeps the test
+// process alive forever, and an earlier version of this file left runners behind for 20 minutes.
+const supervisors = [];
+test.after(async () => {
+  for (const s of supervisors) { try { await s.close(); } catch { /* already closed */ } }
+  for (const d of temps) fs.rmSync(d, { recursive: true, force: true });
+});
 
 test('a workspace outside the root is refused, symlinks included', () => {
   const root = temp(), outside = temp();
@@ -25,13 +31,19 @@ test('a workspace outside the root is refused, symlinks included', () => {
   assert.equal(insideRoot('/nowhere-at-all', root), null);
 });
 
+test('the sandbox supplies its own HOME when noevia sends none', () => {
+  assert.equal(cleanEnv({}, '/home/node').HOME, '/home/node');
+  assert.equal(cleanEnv({ HOME: '/workspaces/trees/.harness-home/x' }, '/home/node').HOME, '/workspaces/trees/.harness-home/x');
+  assert.equal(cleanEnv({}, null).HOME, undefined, 'and invents nothing when there is none');
+});
+
 test('only an allowlist of environment variables crosses into the sandbox', () => {
   const out = cleanEnv({ HOME: '/work/t1', HTTPS_PROXY: 'http://task:tok@egress', PATH: '/usr/bin',
     AWS_SECRET_ACCESS_KEY: 'nope', COWORK_SESSION_SECRET: 'nope', LD_PRELOAD: '/evil.so', HOME_EXTRA: 'nope' });
   assert.deepEqual(out, { HOME: '/work/t1', HTTPS_PROXY: 'http://task:tok@egress', PATH: '/usr/bin' });
-  assert.deepEqual(cleanEnv({ HOME: 'x'.repeat(5000) }), {}, 'an absurd value is dropped');
-  assert.deepEqual(cleanEnv({ HOME: 12 }), {});
-  assert.deepEqual(cleanEnv(null), {});
+  assert.deepEqual(cleanEnv({ HOME: 'x'.repeat(5000) }, null), {}, 'an absurd value is dropped');
+  assert.deepEqual(cleanEnv({ HOME: 12 }, null), {});
+  assert.deepEqual(cleanEnv(null, null), {});
 });
 
 async function sandbox(script = []) {
@@ -46,6 +58,7 @@ async function sandbox(script = []) {
     spawnFn: (cmd, args, opts) => require('node:child_process').spawn(cmd, args,
       { ...opts, env: { ...opts.env, SCRIPT: JSON.stringify(script) } }),
   });
+  supervisors.push(sup);
   const address = await sup.listen(0, '127.0.0.1');
   return { sup, root, work, logs, endpoint: `127.0.0.1:${address.port}` };
 }
@@ -69,7 +82,10 @@ test('noevia drives an agent in the sandbox exactly as it drives a local one', a
   assert.equal(result.stopReason, 'end_turn');
   assert.deepEqual(seen.updates.map((u) => u.sessionUpdate), ['tool_call']);
   assert.equal(seen.permissions.length, 1, 'the approval still comes back to noevia');
-  assert.deepEqual(result.seen[0].result, { outcome: 'selected', optionId: 'y' });
+  // Nested, as ACP requires: the agent reads `result.outcome.outcome`, and the unwrapped shape
+  // reads to it as a rejection.
+  assert.deepEqual(result.seen[0].result, { outcome: { outcome: 'selected', optionId: 'y' } });
+  assert.equal(result.seen[0].noeviaSaid, 'selected', 'the sandbox agent understood it as an approval');
   await sup.close();
 });
 

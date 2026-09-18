@@ -72,14 +72,14 @@ function createLineReader(onMessage, onBad) {
  *          model?: string|null, onLog?: (line: string) => void, spawnFn?: Function,
  *          graceMs?: number}} options
  */
-async function connectAcp({ command, args = [], endpoint = null, cwd, env = {}, handlers, signal,
+async function connectAcp({ command, args = [], endpoint = null, cwd, env = {}, home = null, handlers, signal,
   permission = null, proxy = null, model = null, onLog = () => {}, spawnFn = spawn,
   connectFn = net.connect, graceMs = GRACE_MS, handshakeMs = HANDSHAKE_MS }) {
   if (!command && !endpoint) throw Object.assign(Error('No coding harness is configured on this server.'), { status: 409 });
 
   // The agent inherits nothing by default: no credentials, no tokens, no ambient proxy. What
   // it gets is what this object says, and the egress proxy is the only way out.
-  const childEnv = agentEnv({ cwd, env, proxy });
+  const childEnv = agentEnv({ cwd, env, proxy, home });
 
   const pending = new Map();
   let nextId = 1, closed = null;
@@ -106,7 +106,12 @@ async function connectAcp({ command, args = [], endpoint = null, cwd, env = {}, 
 
   // Incoming: either a reply to something we asked, or a call we must answer.
   const CLIENT_METHODS = {
-    'session/request_permission': (p) => handlers.requestPermission(p),
+    // ACP nests the outcome: `{ outcome: { outcome: 'selected', optionId } }`. Sending the inner
+    // object directly is read by the agent as a rejection — so noevia would answer "allow", the
+    // harness would hear "the user rejected permission", and Code mode could never do anything.
+    // Fail-safe, and invisible to every test until a real harness was on the other end.
+    // The shape belongs here, in the protocol layer; `pickOption` keeps returning the decision.
+    'session/request_permission': async (p) => ({ outcome: await handlers.requestPermission(p) }),
     'fs/read_text_file': (p) => handlers.readTextFile(p),
     'fs/write_text_file': (p) => handlers.writeTextFile(p),
   };
@@ -195,9 +200,12 @@ async function connectAcp({ command, args = [], endpoint = null, cwd, env = {}, 
  * The environment an agent runs with. Nothing is inherited: no credentials, no tokens, no
  * ambient proxy. `HOME` is the worktree, so the agent's own state lands inside the sandbox.
  */
-function agentEnv({ cwd, env = {}, proxy = null }) {
+function agentEnv({ cwd, env = {}, proxy = null, home = null }) {
   const out = {
-    PATH: process.env.PATH, HOME: cwd, TMPDIR: env.TMPDIR || undefined, LANG: process.env.LANG,
+    // HOME is deliberately NOT the workspace: a harness keeps caches, a database and even a
+    // nested git repository under it, and with HOME inside the repository a real run committed
+    // all of it onto the task's branch. It gets its own directory beside the workspace.
+    PATH: process.env.PATH, HOME: home || env.HOME || undefined, TMPDIR: env.TMPDIR || undefined, LANG: process.env.LANG,
     ...(proxy ? { HTTP_PROXY: proxy.url, HTTPS_PROXY: proxy.url, http_proxy: proxy.url, https_proxy: proxy.url, NO_PROXY: '' } : {}),
     ...env,
   };
@@ -268,8 +276,8 @@ function createAcpTransport({ command = process.env.CODE_HARNESS_COMMAND,
   endpoint = process.env.CODE_HARNESS_ENDPOINT || null, log = () => {}, spawnFn, connectFn } = {}) {
   // The sandbox wins when both are set: a deployment that has one should not fall back to
   // running the agent beside noevia's own state because of a stale variable.
-  return async function connect({ cwd, handlers, signal, permission, proxy, model }) {
-    return connectAcp({ command: endpoint ? null : command, args, endpoint, cwd, handlers, signal,
+  return async function connect({ cwd, home, handlers, signal, permission, proxy, model }) {
+    return connectAcp({ command: endpoint ? null : command, args, endpoint, cwd, home, handlers, signal,
       permission, proxy, model, onLog: (line) => log({ event: 'code.harness', line }), spawnFn, connectFn });
   };
 }

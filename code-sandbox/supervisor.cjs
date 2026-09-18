@@ -36,11 +36,14 @@ function insideRoot(root, candidate) {
   return resolved;
 }
 
-function cleanEnv(env) {
+function cleanEnv(env, fallbackHome = process.env.HOME) {
   const out = {};
   for (const [key, value] of Object.entries(env || {})) {
     if (ALLOWED_ENV.has(key) && typeof value === 'string' && value.length < 4096) out[key] = value;
   }
+  // A harness with no HOME misbehaves in its own ways, so fall back to this container's own —
+  // which is a tmpfs, inside the sandbox, and not the task's repository.
+  if (!out.HOME && fallbackHome) out.HOME = fallbackHome;
   return out;
 }
 

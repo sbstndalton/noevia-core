@@ -28,6 +28,13 @@
 const fs = require('node:fs'), path = require('node:path'), { execFileSync } = require('node:child_process');
 
 const TASK_ID = /^[0-9a-f-]{36}$/;
+// A clone has no committer identity of its own, and the harness's is not noevia's to claim.
+const COMMITTER = Object.freeze({ name: 'noevia', email: 'noevia@localhost' });
+// A harness keeps state wherever HOME points, and some also drop it in the working directory.
+// None of it is the task's work, and a real run committed thousands of such files — a sqlite
+// database and a nested git repository among them — into the branch.
+const HARNESS_LEAVINGS = ['.cache/', '.config/', '.local/', '.opencode/', '.claude/', '.codex/',
+  'opencode.json', 'opencode.jsonc', '.aider*', 'node_modules/.cache/'];
 const BRANCH_PREFIX = 'noevia/task-';
 
 function defaultRun(args, cwd) {
@@ -101,8 +108,20 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
     if (held) throw Object.assign(Error(`Another task already writes ${name} in this repository (${held.status})`), { status: 409 });
 
     const tree = treeDir(id);
+    // The harness's own state directory, beside the workspace and never inside it. With HOME
+    // pointing into the repository, one real run committed OpenCode's entire cache, database and
+    // a nested git repo onto the task's branch.
+    const home = path.join(trees, '.harness-home', id);
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
     if (trees !== root) fs.mkdirSync(trees, { recursive: true, mode: 0o755 });
+    // The shared parent must be traversable by the harness user; only the task's own directory
+    // inside it is private. Creating the whole path at 0700 left `.harness-home` root-owned and
+    // unenterable, and the agent died with EACCES before it did anything.
+    fs.mkdirSync(path.dirname(home), { recursive: true, mode: 0o755 });
+    // `mkdir` leaves an existing directory's mode alone, so a volume created by an earlier
+    // version keeps its 0700 and the harness still cannot enter. Correct it every time.
+    try { fs.chmodSync(path.dirname(home), 0o755); } catch { /* not ours to fix; the claim still works */ }
+    fs.mkdirSync(home, { recursive: true, mode: 0o700 });
     if (mode === 'clone') {
       // --shared: the clone reads the source's objects instead of copying them, so this costs
       // kilobytes. The source must therefore outlive the task, which it does.
@@ -115,15 +134,23 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
     }
     // Hand it to whoever runs the harness. Done after the tree exists so git's own files are
     // covered. A deployment whose harness runs as noevia has nothing to hand over.
+    // Belt and braces: a harness that writes into the working directory anyway is ignored
+    // rather than committed. `info/exclude` is local to this clone and never travels.
+    try {
+      const excludeFile = path.join(tree, '.git', 'info', 'exclude');
+      fs.mkdirSync(path.dirname(excludeFile), { recursive: true });
+      fs.appendFileSync(excludeFile, `\n# noevia: harness state, not the task's work\n${HARNESS_LEAVINGS.join('\n')}\n`);
+    } catch { /* a worktree keeps its exclude in the parent repo; not worth failing a claim over */ }
     if (owner) {
-      try { chown(tree, owner.uid, owner.gid); }
+      try { chown(tree, owner.uid, owner.gid); chown(home, owner.uid, owner.gid); }
       catch (e) {
         // Better to refuse than to start a harness that cannot write the tree it was given.
         try { rm(tree); } catch { /* the refusal is what matters */ }
+        try { rm(home); } catch { /* likewise */ }
         throw Object.assign(Error(`Could not hand the workspace to the harness user: ${e.message}`), { status: 500 });
       }
     }
-    return write({ taskId: id, repo, branch: name, path: fs.realpathSync(tree), status: 'held', mode,
+    return write({ taskId: id, repo, branch: name, path: fs.realpathSync(tree), home, status: 'held', mode,
       // Who to hand the clone BACK to before reading from it: git refuses to read a repository
       // owned by someone else ("dubious ownership"), and that check ignores `-c` and the
       // GIT_CONFIG_* environment on purpose, so it cannot be worked around from the outside.
@@ -187,6 +214,22 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
             error: `Could not take the workspace back from the harness user: ${e.message}` });
         }
       }
+      // Most harnesses edit files and never commit — OpenCode edited `median.js` through
+      // noevia's own file API and stopped there. Since only commits can be fetched back, an
+      // uncommitted change would be deleted with the clone, which is the opposite of the point.
+      // So noevia commits whatever is left, in its own name, clearly labelled.
+      try {
+        if (run(['status', '--porcelain'], record.path)) {
+          run(['add', '--all'], record.path);
+          run(['-c', `user.name=${COMMITTER.name}`, '-c', `user.email=${COMMITTER.email}`,
+            'commit', '--quiet', '--no-verify', '-m',
+            `noevia: work in progress from task ${record.taskId}\n\nCommitted by noevia when the task ended, because the harness left it uncommitted.`,
+          ], record.path);
+        }
+      } catch (e) {
+        return write({ ...record, status: 'stuck', releasedAt: now(),
+          error: `Could not save the task\u2019s uncommitted changes: ${e.message}` });
+      }
       try {
         // Never forced: a branch that would not fast-forward is a conflict for a human, not
         // something to overwrite. Nothing is fetched if the task never committed.
@@ -198,6 +241,7 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
         }
       }
       try { rm(record.path); } catch (e) { removed = false; error = e.message; }
+      if (record.home) { try { rm(record.home); } catch { /* nothing of the task's is in there */ } }
       if (removed && removeBranch) { try { run(['branch', '-D', record.branch], record.repo); } catch { /* keep going */ } }
     } else {
       try { run(['worktree', 'remove', '--force', record.path], record.repo); }
