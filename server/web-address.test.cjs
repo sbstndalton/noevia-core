@@ -125,3 +125,18 @@ test('sign-in uses the new address once the user has a passkey for it, the old n
   assert.equal(reg.options.rp.id, 'noevia.example.test', 'new passkeys are made for the current address');
   auth.db.close();
 });
+
+test('a pinned WEBAUTHN_RP_ID stops applying once the address moves to a name it does not cover', () => {
+  const dir = temp();
+  const auth = createAuth({ dataDir: dir, publicOrigin: 'https://cowork.example.test', rpId: 'cowork.example.test' });
+  assert.equal(auth.rpId, 'cowork.example.test');
+  auth.changeOrigin('https://noevia.example.test', 'u');
+  assert.equal(auth.rpId, 'noevia.example.test', 'new passkeys must be made for the name the browser is on');
+  auth.db.close();
+  const again = createAuth({ dataDir: dir, publicOrigin: 'https://cowork.example.test', rpId: 'cowork.example.test' });
+  assert.equal(again.rpId, 'noevia.example.test', 'also after a restart with the old env');
+  again.db.close();
+  const parent = createAuth({ dataDir: temp(), publicOrigin: 'https://app.example.test', rpId: 'example.test' });
+  assert.equal(parent.rpId, 'example.test', 'a parent-domain pin that fits still applies');
+  parent.db.close();
+});

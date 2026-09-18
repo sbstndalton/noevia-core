@@ -217,7 +217,14 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
   // New passkeys are always made for the current address. Each passkey remembers the name it was
   // made under (passkeys.rp_id), so after a rename the old ones still sign in (browsers that
   // support related origins accept them via /.well-known/webauthn on the old host).
-  let relyingPartyId = rpId || (origin ? new URL(origin).hostname : 'localhost');
+  // WEBAUTHN_RP_ID may pin a parent domain (e.g. example.com for app.example.com). It only applies
+  // while it fits the current address: after a rename to another name it would make every new
+  // passkey fail ("RP ID is invalid for this domain"), so the address's own name wins.
+  const rpFor = (o) => {
+    const host = o ? new URL(o).hostname : 'localhost';
+    return rpId && (host === rpId || host.endsWith(`.${rpId}`)) ? rpId : host;
+  };
+  let relyingPartyId = rpFor(origin);
   if (!db.prepare('PRAGMA table_info(passkeys)').all().some((c) => c.name === 'rp_id')) db.exec('ALTER TABLE passkeys ADD COLUMN rp_id TEXT');
   db.prepare('UPDATE passkeys SET rp_id=? WHERE rp_id IS NULL').run(setting('passkey_rp_id') || relyingPartyId);
   db.prepare("DELETE FROM settings WHERE key='passkey_rp_id'").run();
@@ -379,7 +386,7 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       origin = clean; originSource = 'settings';
       // Existing passkeys keep the name they were made under; new ones use the new address.
       db.prepare('UPDATE passkeys SET rp_id=? WHERE rp_id IS NULL').run(relyingPartyId);
-      if (!rpId) relyingPartyId = u.hostname;
+      relyingPartyId = rpFor(clean);
       audit('settings.public_origin', actorId, actorId);
       return null;
     }, userCount, authenticate, csrfValid, originValid, publicUser, issueSession,
@@ -411,7 +418,7 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       });
       try { tx(); } catch (e) { if (e.raced) return { status: 409, body: { error: 'setup already complete' } }; throw e; }
       origin = selectedOrigin;
-      if (!rpId) relyingPartyId = new URL(selectedOrigin).hostname;
+      relyingPartyId = rpFor(selectedOrigin);
       try { fs.unlinkSync(setupFile); } catch {}
       const user = db.prepare('SELECT * FROM users WHERE id=?').get(id);
       audit('setup.complete', id, id);
