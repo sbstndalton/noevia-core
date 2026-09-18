@@ -124,6 +124,11 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
       }
     }
     return write({ taskId: id, repo, branch: name, path: fs.realpathSync(tree), status: 'held', mode,
+      // Who to hand the clone BACK to before reading from it: git refuses to read a repository
+      // owned by someone else ("dubious ownership"), and that check ignores `-c` and the
+      // GIT_CONFIG_* environment on purpose, so it cannot be worked around from the outside.
+      owner: owner ? { ...owner } : null,
+      noevia: typeof process.getuid === 'function' ? { uid: process.getuid(), gid: process.getgid() } : null,
       capabilities: [...capabilities], domains: [...domains], epoch, claimedAt: now() });
   }
 
@@ -171,6 +176,17 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
     if (!record) return null;
     let removed = true, error = null;
     if ((record.mode || 'worktree') === 'clone') {
+      // Take the clone back first. git refuses to read a repository owned by another user, and
+      // that refusal cannot be lifted with `-c safe.directory` or GIT_CONFIG_* — only from a
+      // config file — so ownership, not a git escape hatch, is the right lever. Found by running
+      // a real harness: without this the fetch fails and every task's work is stranded.
+      if (record.owner && record.noevia) {
+        try { chown(record.path, record.noevia.uid, record.noevia.gid); }
+        catch (e) {
+          return write({ ...record, status: 'stuck', releasedAt: now(),
+            error: `Could not take the workspace back from the harness user: ${e.message}` });
+        }
+      }
       try {
         // Never forced: a branch that would not fast-forward is a conflict for a human, not
         // something to overwrite. Nothing is fetched if the task never committed.

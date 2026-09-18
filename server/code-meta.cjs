@@ -29,6 +29,26 @@ function readUsage(meta) {
 const INPUT = ['inputTokens', 'input_tokens', 'promptTokens', 'prompt_tokens', 'input', 'prompt'];
 const OUTPUT = ['outputTokens', 'output_tokens', 'completionTokens', 'completion_tokens', 'output', 'completion'];
 
+/**
+ * Context occupancy, which is NOT token usage and must not be recorded as it.
+ *
+ * OpenCode's `usage_update` carries `{used, size, cost}` — how full the window is right now, not
+ * how many tokens the task has spent. Observed on DaServer, 2026-09-17:
+ *   {"sessionUpdate":"usage_update","used":8012,"size":24576,"cost":{"amount":0,"currency":"USD"}}
+ * Reporting `used` as input tokens would be a plausible-looking lie, so it is kept as its own
+ * measurement and the token-usage limitation stands.
+ */
+function readContext(source) {
+  if (!source || typeof source !== 'object') return null;
+  for (const holder of [source, source.usage, source._meta, source.context]) {
+    if (!holder || typeof holder !== 'object') continue;
+    const used = firstNum(holder, ['used', 'usedTokens', 'used_tokens', 'contextUsed', 'context_used']);
+    const size = firstNum(holder, ['size', 'contextSize', 'context_size', 'limit', 'window']);
+    if (used !== null && size !== null && size > 0) return { used, size, percent: Math.round((used / size) * 100) };
+  }
+  return null;
+}
+
 /** A command's exit status, wherever the harness put it. Zero is a real answer, not absence. */
 function readExitCode(source) {
   if (!source || typeof source !== 'object') return null;
@@ -86,10 +106,15 @@ function summarize(input = {}) {
   const agent = source.agent && typeof source.agent === 'object' ? source.agent : {};
   const usage = source.usage && typeof source.usage === 'object' ? source.usage : null;
   const exits = Array.isArray(source.exits) ? source.exits.filter((e) => e && typeof e === 'object') : [];
-  const turns = Number.isFinite(source.turns) ? source.turns : 0;
+  // Streaming text arrives as many small chunks; calling them turns would overstate the work.
+  const messageChunks = Number.isFinite(source.messageChunks) ? source.messageChunks : 0;
+  const context = source.context && typeof source.context === 'object'
+    && Number.isFinite(source.context.used) && Number.isFinite(source.context.size) ? source.context : null;
 
   const limitations = [];
   if (!agent.version) limitations.push('The harness did not report its version, so this cannot be scoped to one.');
+  // Context occupancy is not token usage: a harness can report one and not the other, and this
+  // one does exactly that.
   if (!usage || usage.total === null || usage.total === undefined) limitations.push('The harness did not report token usage.');
   if (!exits.length) limitations.push('No command exit codes were reported.');
   return {
@@ -97,12 +122,13 @@ function summarize(input = {}) {
     harnessVersion: typeof agent.version === 'string' ? agent.version : null,
     protocolVersion: Number.isFinite(agent.protocolVersion) ? agent.protocolVersion : null,
     usage: usage && usage.total !== null && usage.total !== undefined ? usage : null,
+    context,
     commands: exits.length,
     failedCommands: exits.filter((e) => Number.isInteger(e.exitCode) && e.exitCode !== 0).length,
     exitCodes: exits.slice(0, 50),
-    turns,
+    messageChunks,
     limitations,
   };
 }
 
-module.exports = { readUsage, readExitCode, readAgent, codingIdentity, summarize };
+module.exports = { readUsage, readContext, readExitCode, readAgent, codingIdentity, summarize };

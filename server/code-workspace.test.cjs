@@ -285,3 +285,37 @@ test('a failed handover leaves nothing behind', () => {
   assert.throws(() => ws.claim({ taskId: ids(1), repoPath: repo }), /Could not hand the workspace/);
   assert.deepEqual(fs.readdirSync(shared), [], 'a half-made workspace is not left on the volume');
 });
+
+test('the clone is taken back before reading from it, or git refuses', () => {
+  // Found by a real harness run: git refuses to read a repository owned by another user, and
+  // that refusal deliberately ignores `-c safe.directory` and GIT_CONFIG_*. Without handing the
+  // clone back first, every task's work is stranded in it.
+  const repo = repoWith();
+  const order = [];
+  const ws = createCodeWorkspaces({
+    dir: temp('noevia-ws-'), treeRoot: temp('noevia-shared-'), owner: { uid: 1000, gid: 1000 }, epoch: 'test',
+    chown: (target, uid) => order.push(`chown:${uid}`),
+    run: (args, cwd) => {
+      if (args[0] === 'fetch') order.push('fetch');
+      return require('node:child_process').execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    },
+  });
+  ws.claim({ taskId: ids(1), repoPath: repo });
+  ws.release({ taskId: ids(1) });
+  assert.deepEqual(order, ['chown:1000', `chown:${process.getuid()}`, 'fetch'],
+    'handed to the harness, taken back, then read');
+});
+
+test('a clone that cannot be taken back is stuck, and keeps the work', () => {
+  const repo = repoWith();
+  let claimed = false;
+  const ws = createCodeWorkspaces({
+    dir: temp('noevia-ws-'), treeRoot: temp('noevia-shared-'), owner: { uid: 1000, gid: 1000 }, epoch: 'test',
+    chown: () => { if (claimed) throw new Error('EPERM: operation not permitted'); claimed = true; },
+  });
+  const claim = ws.claim({ taskId: ids(1), repoPath: repo });
+  const released = ws.release({ taskId: ids(1) });
+  assert.equal(released.status, 'stuck');
+  assert.match(released.error, /Could not take the workspace back/);
+  assert.equal(fs.existsSync(claim.path), true, 'the work stays on disk for a human');
+});

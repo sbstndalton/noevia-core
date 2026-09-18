@@ -237,6 +237,7 @@ test('a finished task records what the harness reported, and what it did not', a
   assert.equal(meta.failedCommands, 1);
   assert.deepEqual(meta.exitCodes.map((e) => [e.name, e.exitCode]), [['npm test', 0], ['npm run lint', 1]]);
   assert.deepEqual(meta.limitations, [], 'a harness that reports everything has nothing to disclaim');
+  assert.equal(meta.messageChunks, 1, 'streaming chunks are counted as chunks, not as turns');
   assert.match(r.job.result.identityHash, /^[0-9a-f]{64}$/);
 });
 
@@ -287,4 +288,21 @@ test('a failure before the harness starts still gives back the workspace and the
   // And the branch is claimable again, rather than blocked for good by a task that never ran.
   const held = workspaces.get(started.taskId);
   assert.ok(workspaces.claim({ taskId: '00000000-0000-4000-8000-000000000002', repoPath: held.repo, branch: held.branch }));
+});
+
+test('usage is taken from the harness’s own usage_update, where the real one puts it', async () => {
+  const r = await run({
+    script: async (h) => {
+      h.sessionUpdate({ sessionUpdate: 'available_commands_update', commands: ['build'] });
+      h.sessionUpdate({ sessionUpdate: 'agent_thought_chunk', content: { text: 'hmm' } });
+      h.sessionUpdate({ sessionUpdate: 'usage_update', usage: { inputTokens: 4200, outputTokens: 610 } });
+      h.sessionUpdate({ sessionUpdate: 'agent_message_chunk', content: { text: 'done' } });
+    },
+    agent: { name: 'OpenCode', version: '1.18.31', protocolVersion: 1 },
+    // OpenCode leaves the prompt result's _meta empty; the usage came in the stream.
+    promptResult: { stopReason: 'end_turn' },
+  });
+  assert.deepEqual(r.job.result.meta.usage, { input: 4200, output: 610, total: 4810 });
+  assert.equal(r.job.result.meta.limitations.some((l) => /token usage/.test(l)), false);
+  assert.equal(r.job.result.meta.messageChunks, 1);
 });

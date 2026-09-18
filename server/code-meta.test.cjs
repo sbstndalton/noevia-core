@@ -61,11 +61,11 @@ test('a summary names what the harness did not say, instead of defaulting it', (
 
   const full = summarize({ agent: { name: 'opencode', version: '1.18.31', protocolVersion: 1 },
     usage: { input: 10, output: 5, total: 15 },
-    exits: [{ id: '1', name: 'npm test', exitCode: 0 }, { id: '2', name: 'npm run lint', exitCode: 1 }], turns: 3 });
+    exits: [{ id: '1', name: 'npm test', exitCode: 0 }, { id: '2', name: 'npm run lint', exitCode: 1 }], messageChunks: 3 });
   assert.deepEqual(full.limitations, []);
   assert.equal(full.commands, 2);
   assert.equal(full.failedCommands, 1);
-  assert.equal(full.turns, 3);
+  assert.equal(full.messageChunks, 3);
   assert.equal(full.harnessVersion, '1.18.31');
 });
 
@@ -88,13 +88,31 @@ test('a summary survives whatever it is handed', () => {
   // Found by fuzzing: `agent: null` crashed, because a default only fills in `undefined`. This
   // module exists to read shapes nobody has verified, so it must not be the thing that throws.
   for (const input of [null, undefined, {}, 'nope', 42, { agent: null }, { agent: 'opencode' },
-    { usage: null }, { usage: 'lots' }, { exits: null }, { exits: 'none' }, { exits: [null, 3] }, { turns: NaN }]) {
+    { usage: null }, { usage: 'lots' }, { exits: null }, { exits: 'none' }, { exits: [null, 3] }, { messageChunks: NaN }]) {
     const out = summarize(input);
     assert.equal(typeof out.commands, 'number', JSON.stringify(input));
-    assert.equal(out.turns >= 0, true);
+    assert.equal(out.messageChunks >= 0, true);
     assert.ok(Array.isArray(out.limitations));
     assert.ok(out.harness === null || typeof out.harness === 'string');
   }
   assert.equal(summarize({ agent: { name: 42, version: [] } }).harness, null, 'a name that is not a name is absent');
   assert.equal(summarize({ exits: [{ exitCode: 0 }, { exitCode: 2 }, { exitCode: null }] }).failedCommands, 1);
+});
+
+test('context occupancy is read as itself, never as token usage', () => {
+  const { readContext } = require('./code-meta.cjs');
+  // The real payload, from OpenCode 1.18.31 on DaServer.
+  const real = { sessionUpdate: 'usage_update', used: 8012, size: 24576, cost: { amount: 0, currency: 'USD' } };
+  assert.deepEqual(readContext(real), { used: 8012, size: 24576, percent: 33 });
+  // And it is emphatically not usage: reporting `used` as input tokens would be a plausible lie.
+  assert.equal(readUsage(real), null);
+
+  const out = summarize({ agent: { version: '1.18.31' }, context: readContext(real) });
+  assert.deepEqual(out.context, { used: 8012, size: 24576, percent: 33 });
+  assert.equal(out.usage, null);
+  assert.ok(out.limitations.some((l) => /token usage/.test(l)), 'knowing the window says nothing about tokens spent');
+
+  for (const bad of [null, {}, { used: 5 }, { size: 0, used: 1 }, { used: 'x', size: 10 }]) {
+    assert.equal(readContext(bad), null, JSON.stringify(bad));
+  }
 });

@@ -21,7 +21,7 @@
 // process; the container, the worktree and the egress proxy are what contain it.
 const fs = require('node:fs'), nodePath = require('node:path');
 const { classify, decide, pickOption, ACTIONS } = require('./code-actions.cjs');
-const { readUsage, readExitCode, codingIdentity, summarize } = require('./code-meta.cjs');
+const { readUsage, readContext, readExitCode, codingIdentity, summarize } = require('./code-meta.cjs');
 
 const MAX_TEXT = 4000;                  // what a job event keeps, as chat keeps of a tool result
 const MAX_FILE_BYTES = 8 * 1024 * 1024; // one source file, not a database the agent found
@@ -102,7 +102,13 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
     // task should not be able to grow this without limit.
     const exits = [];
     const names = new Map(); // toolCallId -> what it was, so an exit code has a label
-    let turns = 0;
+    // OpenCode reports token usage in its own `usage_update`, not on the prompt result — found
+    // by running the real thing. Whatever arrives goes through the same defensive reader, so a
+    // harness using a different shape degrades to "not reported" rather than to a wrong number.
+    let reportedUsage = null;
+    // How full the window is, which the real harness reports and token usage, which it does not.
+    let reportedContext = null;
+    let messageChunks = 0;
 
     const record = (entry) => log({ at: now(), taskId, harness, model, ...entry });
 
@@ -207,8 +213,18 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
         }
       } else if (kind === 'plan') {
         ctx.event('plan.proposed', { question: null, subQuestions: (update.entries || []).map((e) => String(e.content || '').slice(0, 200)) });
+      } else if (kind === 'usage_update') {
+        const reported = readUsage(update) || readUsage(update.usage) || readUsage(update._meta);
+        if (reported) reportedUsage = reported;
+        const window = readContext(update);
+        if (window) reportedContext = window;
+      } else if (kind === 'available_commands_update') {
+        // What the harness can do, not something it is doing. Nothing to record.
       } else if (kind === 'agent_message_chunk' || kind === 'agent_thought_chunk') {
-        if (kind === 'agent_message_chunk') turns++;
+        // Streaming text arrives in many small chunks — 548 thought chunks and 50 message
+        // chunks in one real run — so this counts chunks and says so, rather than calling them
+        // turns.
+        if (kind === 'agent_message_chunk') messageChunks++;
         // Thoughts are progress, not stored reasoning: the spec keeps hidden reasoning out.
         ctx.event('progress', { stage: kind === 'agent_thought_chunk' ? 'thinking' : 'writing' });
       }
@@ -217,7 +233,10 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
     return {
       handlers: { requestPermission, readTextFile, writeTextFile, sessionUpdate },
       summary: () => ({ ...counts, workspace: workspace.path }),
-      meta: (agentInfo, usage) => summarize({ agent: agentInfo || {}, usage, exits, turns }),
+      // Usage the harness streamed wins over anything on the prompt result: the real one reports
+      // it in `usage_update` and leaves the result's `_meta` empty.
+      meta: (agentInfo, usage) => summarize({ agent: agentInfo || {}, usage: reportedUsage || usage,
+        context: reportedContext, exits, messageChunks }),
     };
   }
 
