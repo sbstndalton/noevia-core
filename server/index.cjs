@@ -661,10 +661,12 @@ function autoRoles() {
 }
 
 function setAutoRoles(next) {
-  // `vision` is optional: a deployment with no vision-capable model should not
-  // be forced to name one, and an existing config without it keeps working.
+  // `vision` and `code` are optional: a deployment with no vision-capable or
+  // coding model should not be forced to name one, and an existing config
+  // without them keeps working.
   const roles = { fast: String(next.fast), smart: String(next.smart) };
   if (next.vision) roles.vision = String(next.vision);
+  if (next.code) roles.code = String(next.code);
   currentWorkspace().autoRoles = roles;
   currentWorkspace().saveAutoRoles();
 }
@@ -685,7 +687,7 @@ function ensureRolesLoaded() {
   const roles = autoRoles();
   if (!roles) return;
   void (async () => {
-    for (const role of ['fast', 'smart', 'vision']) {
+    for (const role of ['fast', 'smart', 'vision', 'code']) {
       if (!roles[role]) continue;
       try {
         await ensureModelLoaded(roles[role]);
@@ -2108,8 +2110,12 @@ function heuristicWantsSmart(message) {
 // fail-open philosophy of diary-companion's pipeline.py skip_classifier: any
 // error or unparseable reply defaults to the fast role — the classifier must
 // never block the chat.
+// CODE is only offered to the model when a code role is configured. Asking for a verdict
+// the router cannot honour would spend the call and then discard the answer.
 const CLASSIFIER_SYSTEM_PROMPT =
   'You classify a user message for a model router. Reply with exactly one word: FAST for short simple questions or small talk, SMART for complex reasoning, multi-step work, code, or analysis. No other text.';
+const CLASSIFIER_SYSTEM_PROMPT_CODE =
+  'You classify a user message for a model router. Reply with exactly one word: FAST for short simple questions or small talk, CODE for writing, reading, debugging or explaining source code, SMART for any other complex reasoning, multi-step work or analysis. No other text.';
 
 // Budget for the classifier reply. A non-reasoning answer is 1-3 tokens; this
 // only has to be large enough for a reasoning model that ignores the
@@ -2121,11 +2127,11 @@ const CLASSIFIER_SYSTEM_PROMPT =
 // mode looked biased rather than broken.
 const CLASSIFIER_MAX_TOKENS = 512;
 
-function classifierBody(model, message, suppressThinking) {
+function classifierBody(model, message, suppressThinking, withCode = false) {
   const body = {
     model,
     messages: [
-      { role: 'system', content: CLASSIFIER_SYSTEM_PROMPT },
+      { role: 'system', content: withCode ? CLASSIFIER_SYSTEM_PROMPT_CODE : CLASSIFIER_SYSTEM_PROMPT },
       { role: 'user', content: String(message).slice(0, 1000) },
     ],
     max_tokens: CLASSIFIER_MAX_TOKENS,
@@ -2146,18 +2152,32 @@ function classifierBody(model, message, suppressThinking) {
 // last-resort one: a thinking model restates the prompt's own FAST/SMART
 // wording while deliberating, so scanning it can pick up the prompt's words
 // rather than the model's conclusion.
-function classifierVerdict(msg) {
+function classifierVerdict(msg, withCode = false) {
+  const words = withCode ? /\b(SMART|FAST|CODE)\b/g : /\b(SMART|FAST)\b/g;
   const content = String(msg.content || '').toUpperCase();
-  const direct = content.match(/\b(SMART|FAST)\b/g);
+  const direct = content.match(words);
   if (direct) return direct[direct.length - 1].toLowerCase();
   const reasoning = String(msg.reasoning_content || '').toUpperCase();
-  const hits = reasoning.match(/\b(SMART|FAST)\b/g);
+  const hits = reasoning.match(words);
   return hits ? hits[hits.length - 1].toLowerCase() : null;
+}
+
+// Code work the heuristic can name without a round-trip: a fenced block, or a diff.
+// Everything else is left to the classifier, as with `smart`.
+function heuristicWantsCode(message) {
+  const m = String(message);
+  if (m.includes('```')) return true;
+  if (/^(diff --git|@@ -|\+\+\+ b\/)/m.test(m)) return true;
+  return false;
 }
 
 async function classifyFastOrSmart(message) {
   const roles = autoRoles();
   if (!roles) return 'fast';
+  // A code role only participates when one is configured; otherwise the router
+  // behaves exactly as it did before, and code work keeps going to smart.
+  const withCode = !!roles.code;
+  if (withCode && heuristicWantsCode(message)) return 'code';
   if (heuristicWantsSmart(message)) return 'smart';
   try {
     const defaultProvider = getProvider(DEFAULT_PROVIDER_ID);
@@ -2168,7 +2188,7 @@ async function classifyFastOrSmart(message) {
         {
           method: 'POST',
           headers: providerHeaders(defaultProvider),
-          body: classifierBody(roles.fast, message, suppressThinking),
+          body: classifierBody(roles.fast, message, suppressThinking, withCode),
         },
         20000,
       );
@@ -2183,7 +2203,7 @@ async function classifyFastOrSmart(message) {
     }
     if (!r.ok) throw new Error(`classifier ${r.status}`);
     const choice = r.body?.choices?.[0] || {};
-    const verdict = classifierVerdict(choice.message || {});
+    const verdict = classifierVerdict(choice.message || {}, withCode);
     if (!verdict) {
       // Distinguish "ran out of room mid-thought" from "answered something
       // unparseable" — the first is a budget problem, the second a prompt one.
@@ -2564,6 +2584,9 @@ async function handleChatInner(req, res, body, authn, preparation) {
     const staleRoles = staleRolesError(missingRoles(roles, await servedCatalogue()));
     if (staleRoles) return json(res, 409, { error: staleRoles });
     routedRole = await classifyFastOrSmart(message); // fail-open inside
+    // A verdict with no model behind it falls back to smart rather than sending an
+    // empty model name upstream.
+    if (!roles[routedRole]) routedRole = roles.smart ? 'smart' : 'fast';
     model = roles[routedRole];
   } else if (!model && provider.id === DEFAULT_PROVIDER_ID && modelManager.enabled) {
     // No hardcoded model name: default to whatever the manager reports as loaded.
@@ -3494,8 +3517,9 @@ async function handleRequestScoped(req, res) {
         const fast = typeof body.fast === 'string' ? body.fast.trim() : '';
         const smart = typeof body.smart === 'string' ? body.smart.trim() : '';
         const vision = typeof body.vision === 'string' ? body.vision.trim() : '';
+        const code = typeof body.code === 'string' ? body.code.trim() : '';
         if (!fast || !smart) return json(res, 400, { error: 'both fast and smart model names are required' });
-        setAutoRoles({ fast, smart, vision });
+        setAutoRoles({ fast, smart, vision, code });
         ensureRolesLoaded(); // optional adapter warm-up; native routing stays on demand
         return json(res, 200, { configured: true, roles: autoRoles() });
       }
@@ -4692,4 +4716,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { checkAuth, handleRequest, sanitizeChats, MCP_SERVERS, toolboxOffered, ownsFile, projectFolderName, prefill, TOOL_PREFILL_TARGET_MS, isWriteTool, chatWideApproved, pendingApprovals, resolveTools, allToolboxes, mcpCredentialOriginAllowed, toolTokenBudgetFor, MCP_TOOLBOX_MANIFEST, toolboxSummaries, estimateToolTokens, toolCapFor, sanitizeToolboxes, executeToolCall, TOOLBOXES, classifierVerdict, heuristicWantsSmart, CLASSIFIER_MAX_TOKENS, recordUsage, readUsage, usageDayKey, USAGE_RETENTION_DAYS };
+module.exports = { checkAuth, handleRequest, sanitizeChats, MCP_SERVERS, toolboxOffered, ownsFile, projectFolderName, prefill, TOOL_PREFILL_TARGET_MS, isWriteTool, chatWideApproved, pendingApprovals, resolveTools, allToolboxes, mcpCredentialOriginAllowed, toolTokenBudgetFor, MCP_TOOLBOX_MANIFEST, toolboxSummaries, estimateToolTokens, toolCapFor, sanitizeToolboxes, executeToolCall, TOOLBOXES, classifierVerdict, heuristicWantsSmart, heuristicWantsCode, CLASSIFIER_MAX_TOKENS, recordUsage, readUsage, usageDayKey, USAGE_RETENTION_DAYS };
