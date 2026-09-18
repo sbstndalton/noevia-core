@@ -107,27 +107,17 @@ test('the destination may not overlap what it backs up', () => {
   assert.throws(() => checkDestination('/does/not/exist', [data]), /does not exist/);
 });
 
-test('the page learns the Google Drive mirror’s state, and nothing else about it', () => {
-  const { readMirror } = require('./offsite-service.cjs');
-  const dir = temp('noevia-mirror-');
+test('the page learns the Google Drive copy’s state, and nothing else about it', () => {
+  const { mirrorView } = require('./offsite-service.cjs');
   const now = Date.parse('2026-09-18T12:00:00Z');
-  const write = (o) => fs.writeFileSync(path.join(dir, '.mirror-status.json'), JSON.stringify(o));
-
-  assert.equal(readMirror(dir, now).state, 'unknown', 'no report yet');
-  write({ state: 'not-connected', at: now, message: 'Google Drive is not connected yet.' });
-  assert.deepEqual(readMirror(dir, now), { state: 'not-connected', at: now, message: 'Google Drive is not connected yet.' });
-  write({ state: 'ok', at: now - 3600000, message: 'Copied 1 snapshots.' });
-  assert.equal(readMirror(dir, now).state, 'ok');
-  // A mirror that stopped reporting is not "connected", whatever it last said.
-  write({ state: 'ok', at: now - 3 * 86400000, message: 'Copied 1 snapshots.' });
-  assert.equal(readMirror(dir, now).state, 'stale');
-  write({ state: 'something-new', at: now, message: 'x'.repeat(1000), token: 'must-not-surface' });
-  const odd = readMirror(dir, now);
+  assert.equal(mirrorView(null, now).state, 'unknown', 'no copy yet');
+  assert.equal(mirrorView({ state: 'ok', at: now - 3600000, message: 'Copied 1 snapshots.' }, now).state, 'ok');
+  // A copy that stopped succeeding is not "connected", whatever it last said.
+  assert.equal(mirrorView({ state: 'ok', at: now - 3 * 86400000, message: 'Copied 1 snapshots.' }, now).state, 'stale');
+  const odd = mirrorView({ state: 'something-new', at: now, message: 'x'.repeat(1000), token: 'must-not-surface' }, now);
   assert.equal(odd.state, 'unknown');
   assert.equal(odd.message.length, 300);
   assert.equal('token' in odd, false, 'only state, time and message are ever passed on');
-  fs.writeFileSync(path.join(dir, '.mirror-status.json'), 'not json');
-  assert.equal(readMirror(dir, now).state, 'unknown');
 });
 
 test('the status file is invisible to the backup store', async () => {
@@ -136,8 +126,3 @@ test('the status file is invisible to the backup store', async () => {
   assert.deepEqual(await createDirStore({ root }).list(''), []);
 });
 
-test('the connect steps learn host paths and an SSH name, with the documented defaults', () => {
-  const { connectInfo } = require('./offsite-service.cjs');
-  assert.deepEqual(connectInfo({}), { sshHost: null, script: '/mnt/docker/appdata/cowork/tools/offsite/rclone-sync.sh', keyFile: '/mnt/docker/appdata/cowork/config/offsite-backup.key', rcloneConfig: '/boot/config/rclone/rclone.conf' });
-  assert.equal(connectInfo({ OFFSITE_BACKUP_SSH_HOST: ' daserver ' }).sshHost, 'daserver');
-});

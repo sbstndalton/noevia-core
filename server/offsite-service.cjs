@@ -6,9 +6,10 @@ const fs = require('node:fs'), os = require('node:os'), path = require('node:pat
 const { createOffsiteBackup, loadKey } = require('./offsite-backup.cjs');
 const { createS3Store } = require('./offsite-s3.cjs');
 const { createDirStore } = require('./offsite-dir.cjs');
+const { createGoogleDrive } = require('./gdrive.cjs');
 
 const ENV = ['OFFSITE_BACKUP_S3_ENDPOINT', 'OFFSITE_BACKUP_S3_BUCKET', 'OFFSITE_BACKUP_S3_ACCESS_KEY_ID', 'OFFSITE_BACKUP_S3_SECRET_ACCESS_KEY', 'OFFSITE_BACKUP_KEY_FILE'];
-// A folder destination, mirrored elsewhere by the host (Google Drive via rclone): no S3 keys.
+// A folder destination, which noevia itself copies to Google Drive once connected: no S3 keys.
 const DIR_ENV = ['OFFSITE_BACKUP_DIR', 'OFFSITE_BACKUP_KEY_FILE'];
 
 /**
@@ -44,16 +45,12 @@ async function sqliteSnapshot(abs) {
 }
 
 /**
- * The host mirror's last word, from the dot file rclone-sync.sh leaves in the store folder.
- * noevia cannot see rclone or its config, and should not: this is the only thing it learns.
- * A mirror that has not reported for two days is stale, whatever it last said.
+ * The Google Drive copy's last result, as the page shows it. A copy that has not succeeded for
+ * two days is stale, whatever it last said.
  */
-function readMirror(dir, now = Date.now(), fsImpl = fs) {
-  if (!dir) return null;
-  let raw;
-  try { raw = JSON.parse(fsImpl.readFileSync(path.join(dir, '.mirror-status.json'), 'utf8')); }
-  catch { return { state: 'unknown', at: null, message: 'The copy to Google Drive has not run yet.' }; }
-  const states = ['ok', 'not-connected', 'waiting', 'refused', 'failed'];
+function mirrorView(raw, now = Date.now()) {
+  if (!raw) return { state: 'unknown', at: null, message: 'The copy to Google Drive has not run yet.' };
+  const states = ['ok', 'waiting', 'refused', 'failed'];
   const state = states.includes(raw.state) ? raw.state : 'unknown';
   const at = Number.isFinite(raw.at) ? raw.at : null;
   const message = typeof raw.message === 'string' ? raw.message.slice(0, 300) : '';
@@ -63,7 +60,7 @@ function readMirror(dir, now = Date.now(), fsImpl = fs) {
   return { state, at, message };
 }
 
-function createOffsiteService({ env = process.env, features, dataDir, now = Date.now, log = () => {}, backupFactory = null }) {
+function createOffsiteService({ env = process.env, features, dataDir, now = Date.now, log = () => {}, backupFactory = null, fetchImpl, driveFactory = null }) {
   const statusFile = path.join(dataDir, 'offsite-backup-status.json');
   const paths = String(env.OFFSITE_BACKUP_PATHS || dataDir).split(',').map((p) => p.trim()).filter(Boolean);
   const hour = Math.min(23, Math.max(0, Number.parseInt(env.OFFSITE_BACKUP_HOUR ?? '3', 10) || 0));
@@ -76,12 +73,18 @@ function createOffsiteService({ env = process.env, features, dataDir, now = Date
   };
   const useDir = () => !!String(env.OFFSITE_BACKUP_DIR || '').trim();
   const missing = () => (useDir() ? DIR_ENV : ENV).filter((k) => !String(env[k] || '').trim());
-  let engine = null, busy = '';
+  let engine = null, busy = '', store = null;
+  const drive = driveFactory ? driveFactory() : createGoogleDrive({
+    clientId: String(env.GOOGLE_OAUTH_CLIENT_ID || '').trim(), clientSecret: String(env.GOOGLE_OAUTH_CLIENT_SECRET || '').trim(),
+    tokenFile: path.join(dataDir, 'google-drive.sealed'), backupKey: () => loadKey(env.OFFSITE_BACKUP_KEY_FILE, paths),
+    oauthBase: env.GOOGLE_OAUTH_BASE_URL || undefined, apiBase: env.GOOGLE_DRIVE_API_BASE_URL || undefined, uploadBase: env.GOOGLE_DRIVE_UPLOAD_BASE_URL || undefined,
+    fetch: fetchImpl, now, log,
+  });
 
   function build() {
     if (engine) return engine;
     if (backupFactory) return (engine = backupFactory());
-    const store = useDir()
+    store = useDir()
       ? createDirStore({ root: checkDestination(env.OFFSITE_BACKUP_DIR.trim(), paths) })
       : createS3Store({ endpoint: env.OFFSITE_BACKUP_S3_ENDPOINT, bucket: env.OFFSITE_BACKUP_S3_BUCKET, region: env.OFFSITE_BACKUP_S3_REGION || 'us-east-1',
         accessKeyId: env.OFFSITE_BACKUP_S3_ACCESS_KEY_ID, secretAccessKey: env.OFFSITE_BACKUP_S3_SECRET_ACCESS_KEY, prefix: env.OFFSITE_BACKUP_S3_PREFIX || 'noevia-backup' });
@@ -104,6 +107,28 @@ function createOffsiteService({ env = process.env, features, dataDir, now = Date
       throw error;
     } finally { busy = ''; }
   }
+  /** Copies the local encrypted store to Drive and records the result for the page. */
+  async function copyToDrive() {
+    if (!useDir() || drive.state().state !== 'connected') return null;
+    busy = 'copy to Google Drive';
+    try {
+      build();
+      const r = await drive.mirror(store);
+      writeStatus({ mirror: { state: 'ok', at: now(), message: `Copied ${r.snapshots} snapshots.` } });
+      return r;
+    } catch (error) {
+      const message = String(error.publicMessage || 'The copy to Drive did not finish.').slice(0, 300);
+      writeStatus({ mirror: { state: /looks empty/.test(message) ? 'refused' : /Waiting/.test(message) ? 'waiting' : 'failed', at: now(), message } });
+      log({ event: 'gdrive.failed', message: error.message });
+      throw error;
+    } finally { busy = ''; }
+  }
+  const driveView = () => {
+    if (!useDir()) return null;
+    const g = drive.state();
+    return { ...g, copy: g.state === 'connected' ? mirrorView(readStatus().mirror, now()) : null };
+  };
+
   return {
     status() {
       const s = readStatus();
@@ -112,18 +137,32 @@ function createOffsiteService({ env = process.env, features, dataDir, now = Date
         // Naming where it goes, never how it authenticates.
         destination: useDir() ? `Folder ${env.OFFSITE_BACKUP_DIR.trim()}${env.OFFSITE_BACKUP_MIRROR ? `, mirrored to ${env.OFFSITE_BACKUP_MIRROR}` : ''}`
           : env.OFFSITE_BACKUP_S3_ENDPOINT ? `${new URL(env.OFFSITE_BACKUP_S3_ENDPOINT).host} / ${env.OFFSITE_BACKUP_S3_BUCKET || '?'}` : null,
-        mirror: useDir() ? readMirror(env.OFFSITE_BACKUP_DIR.trim(), now()) : null,
-        // What the one-time Google sign-in needs to know about the host. Paths and an SSH name
-        // only: the sign-in runs on the admin's own computer and the token goes straight to the
-        // host's rclone, never through noevia.
-        connect: useDir() ? connectInfo(env) : null,
+        google: driveView(),
         paths: paths.length, lastBackup: s.lastBackup || null, lastVerify: s.lastVerify || null, lastError: s.lastError || null, snapshots: s.snapshots ?? null };
     },
     runNow: () => exclusive('backup', async (b) => {
       const snap = await b.backup();
       const retention = await b.forget();
-      return writeStatus({ lastBackup: { at: now(), id: snap.id, files: snap.files, uploadedBytes: snap.uploadedBytes }, snapshots: retention.kept, lastError: null }).lastBackup;
+      const saved = writeStatus({ lastBackup: { at: now(), id: snap.id, files: snap.files, uploadedBytes: snap.uploadedBytes }, snapshots: retention.kept, lastError: null }).lastBackup;
+      // Straight after the local snapshot, in the background: a slow upload never holds the page.
+      Promise.resolve().then(() => { if (!busy) return copyToDrive(); }).catch(() => {});
+      return saved;
     }),
+    copyNow: () => {
+      const reason = ready();
+      if (reason) throw Object.assign(Error(reason), { status: 409, publicMessage: reason });
+      if (busy) throw Object.assign(Error(`A ${busy} is already running.`), { status: 409, publicMessage: `A ${busy} is already running.` });
+      return copyToDrive();
+    },
+    connectGoogle: () => {
+      if (!useDir()) throw Object.assign(Error('no folder'), { status: 409, publicMessage: 'Google Drive needs a backup folder on this server (OFFSITE_BACKUP_DIR).' });
+      build();
+      // Once approved, copy right away so the page can show the first result.
+      return drive.connect(() => copyToDrive().catch(() => {}));
+    },
+    disconnectGoogle: () => drive.disconnect(),
+    /** The backup key, for the admin to keep in a password manager. */
+    recoveryKey: () => loadKey(env.OFFSITE_BACKUP_KEY_FILE, paths).toString('hex'),
     verifyNow: () => exclusive('restore test', async (b) => writeStatus({ lastVerify: await b.verify(os.tmpdir()), lastError: null }).lastVerify),
     /** Checks every 15 minutes; runs once a day in the configured hour. Returns a stop function. */
     schedule(setIntervalImpl = setInterval, clearIntervalImpl = clearInterval) {
@@ -139,15 +178,4 @@ function createOffsiteService({ env = process.env, features, dataDir, now = Date
   };
 }
 
-/** Where the host keeps the sync script and key, as the admin reaches it over SSH. */
-function connectInfo(env) {
-  const clean = (v, fallback) => (String(v || '').trim() || fallback);
-  return {
-    sshHost: clean(env.OFFSITE_BACKUP_SSH_HOST, null),
-    script: clean(env.OFFSITE_BACKUP_HOST_SCRIPT, '/mnt/docker/appdata/cowork/tools/offsite/rclone-sync.sh'),
-    keyFile: clean(env.OFFSITE_BACKUP_HOST_KEY_FILE, '/mnt/docker/appdata/cowork/config/offsite-backup.key'),
-    rcloneConfig: clean(env.OFFSITE_BACKUP_HOST_RCLONE_CONFIG, '/boot/config/rclone/rclone.conf'),
-  };
-}
-
-module.exports = { connectInfo, readMirror, checkDestination, DIR_ENV, createOffsiteService, sqliteSnapshot, ENV };
+module.exports = { mirrorView, checkDestination, DIR_ENV, createOffsiteService, sqliteSnapshot, ENV };
