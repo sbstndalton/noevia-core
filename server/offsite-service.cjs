@@ -113,6 +113,10 @@ function createOffsiteService({ env = process.env, features, dataDir, now = Date
         destination: useDir() ? `Folder ${env.OFFSITE_BACKUP_DIR.trim()}${env.OFFSITE_BACKUP_MIRROR ? `, mirrored to ${env.OFFSITE_BACKUP_MIRROR}` : ''}`
           : env.OFFSITE_BACKUP_S3_ENDPOINT ? `${new URL(env.OFFSITE_BACKUP_S3_ENDPOINT).host} / ${env.OFFSITE_BACKUP_S3_BUCKET || '?'}` : null,
         mirror: useDir() ? readMirror(env.OFFSITE_BACKUP_DIR.trim(), now()) : null,
+        // What the one-time Google sign-in needs to know about the host. Paths and an SSH name
+        // only: the sign-in runs on the admin's own computer and the token goes straight to the
+        // host's rclone, never through noevia.
+        connect: useDir() ? connectInfo(env) : null,
         paths: paths.length, lastBackup: s.lastBackup || null, lastVerify: s.lastVerify || null, lastError: s.lastError || null, snapshots: s.snapshots ?? null };
     },
     runNow: () => exclusive('backup', async (b) => {
@@ -135,4 +139,15 @@ function createOffsiteService({ env = process.env, features, dataDir, now = Date
   };
 }
 
-module.exports = { readMirror, checkDestination, DIR_ENV, createOffsiteService, sqliteSnapshot, ENV };
+/** Where the host keeps the sync script and key, as the admin reaches it over SSH. */
+function connectInfo(env) {
+  const clean = (v, fallback) => (String(v || '').trim() || fallback);
+  return {
+    sshHost: clean(env.OFFSITE_BACKUP_SSH_HOST, null),
+    script: clean(env.OFFSITE_BACKUP_HOST_SCRIPT, '/mnt/docker/appdata/cowork/tools/offsite/rclone-sync.sh'),
+    keyFile: clean(env.OFFSITE_BACKUP_HOST_KEY_FILE, '/mnt/docker/appdata/cowork/config/offsite-backup.key'),
+    rcloneConfig: clean(env.OFFSITE_BACKUP_HOST_RCLONE_CONFIG, '/boot/config/rclone/rclone.conf'),
+  };
+}
+
+module.exports = { connectInfo, readMirror, checkDestination, DIR_ENV, createOffsiteService, sqliteSnapshot, ENV };

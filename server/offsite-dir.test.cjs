@@ -135,3 +135,9 @@ test('the status file is invisible to the backup store', async () => {
   fs.writeFileSync(path.join(root, '.mirror-status.json'), '{}');
   assert.deepEqual(await createDirStore({ root }).list(''), []);
 });
+
+test('the connect steps learn host paths and an SSH name, with the documented defaults', () => {
+  const { connectInfo } = require('./offsite-service.cjs');
+  assert.deepEqual(connectInfo({}), { sshHost: null, script: '/mnt/docker/appdata/cowork/tools/offsite/rclone-sync.sh', keyFile: '/mnt/docker/appdata/cowork/config/offsite-backup.key', rcloneConfig: '/boot/config/rclone/rclone.conf' });
+  assert.equal(connectInfo({ OFFSITE_BACKUP_SSH_HOST: ' daserver ' }).sshHost, 'daserver');
+});
