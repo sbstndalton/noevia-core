@@ -178,3 +178,16 @@ test('only the three valid decisions are accepted', () => {
   assert.equal(decide('APPROVE'), false);
   assert.deepEqual(seen, ['approve', 'deny', 'approve_all']);
 });
+
+test('Google Drive tools: four reads, three gated writes, and never a project toolbox choice', () => {
+  const { toolboxSummaries, sanitizeToolboxes, resolveTools } = require('./index.cjs');
+  for (const n of ['drive_search_files', 'drive_read_file', 'drive_get_metadata', 'drive_list_recent']) assert.equal(isWriteTool(n), false, n);
+  for (const n of ['drive_create_file', 'drive_update_file', 'drive_trash_file']) assert.equal(isWriteTool(n), true, n);
+  // A connector joins an account's chats when connected; it is not in the project picker.
+  assert.equal(toolboxSummaries().some((b) => b.id === 'gdrive'), false);
+  assert.deepEqual(sanitizeToolboxes(['core', 'gdrive']), ['core']);
+  // A blocked tool is dropped before the list is sent to the model.
+  const offered = resolveTools({ toolboxes: ['core', 'gdrive'] }, 'test-model', (n) => n === 'drive_trash_file').tools.map((t) => t.function.name);
+  assert.ok(offered.includes('drive_search_files'));
+  assert.equal(offered.includes('drive_trash_file'), false);
+});

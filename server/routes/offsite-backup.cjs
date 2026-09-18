@@ -11,7 +11,7 @@ function createOffsiteRoutes({ service, json }) {
     run: () => service.runNow(),
     verify: () => service.verifyNow(),
     copy: () => service.copyNow(),
-    'google/connect': () => service.connectGoogle(),
+    'google/connect': (authn) => service.connectGoogle(authn.user.id),
     'google/disconnect': () => service.disconnectGoogle(),
   };
   return async function offsiteRoutes(req, res, { path, authn }) {
@@ -30,7 +30,7 @@ function createOffsiteRoutes({ service, json }) {
     }
     if (!actions[action]) return send(404, { error: 'not found' });
     if (req.method !== 'POST') return send(405, { error: 'method not allowed' });
-    try { return send(200, (await actions[action]()) ?? {}); }
+    try { return send(200, (await actions[action](authn)) ?? {}); }
     catch (error) { return send(error.status || 502, { error: error.publicMessage || 'The backup destination could not be reached.' }); }
   };
 }

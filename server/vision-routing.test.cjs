@@ -47,6 +47,7 @@ async function run({ visionModel, probeStatus = 200, descriptionStatus = 200, mi
     providerHeaders: () => headers, autoRoles: () => visionModel ? { vision: visionModel } : null,
     visionDescriptions: cache, visionProbe: createVisionProbe({ fetchImpl: fetch }),
     chatToolRouter: { select: async (ids) => ({ ids, routed: false }) }, DEFAULT_TOOLBOXES: [],
+    CONNECTOR_BOXES: new Set(['gdrive']), connectedBoxes: () => [], toolPolicy: { mode: (_user, _name, write) => (write ? 'ask' : 'allow') }, requestScope: { getStore: () => ({}) },
     resolveTools: () => ({ tools: [], dropped: [] }), isWriteTool: () => true,
   };
   if(native)context.modelManager=require('./model-manager.cjs').createModelManager({kind:'llamacpp',baseUrl:'http://fixture.invalid',fetchJson:async(url,options)=>{

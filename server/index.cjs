@@ -115,6 +115,17 @@ const importRoutes = require('./routes/import.cjs').createImportRoutes({
 });
 const offsiteBackup = require('./offsite-service.cjs').createOffsiteService({ features, dataDir: DATA_DIR, log: (event) => console.log('[backup]', JSON.stringify(event)) });
 const offsiteRoutes = require('./routes/offsite-backup.cjs').createOffsiteRoutes({ service: offsiteBackup, json });
+// Google Drive as a chat connector: each account's own connection, per-tool allow/ask/block.
+const toolPolicy = require('./tool-policy.cjs').createToolPolicy({ db: authService.db, audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) });
+const driveAccounts = require('./drive-accounts.cjs').createDriveAccounts({
+  backupDrive: offsiteBackup.drive, backupUsable: () => offsiteBackup.driveUsable(), dataDir: DATA_DIR,
+  userKey: () => secretStore.derive('google-drive-user'),
+  makeDrive: ({ tokenFile, backupKey }) => require('./gdrive.cjs').createGoogleDrive({
+    clientId: String(process.env.GOOGLE_OAUTH_CLIENT_ID || '').trim(), clientSecret: String(process.env.GOOGLE_OAUTH_CLIENT_SECRET || '').trim(),
+    tokenFile, backupKey, oauthBase: process.env.GOOGLE_OAUTH_BASE_URL || undefined, apiBase: process.env.GOOGLE_DRIVE_API_BASE_URL || undefined,
+    uploadBase: process.env.GOOGLE_DRIVE_UPLOAD_BASE_URL || undefined, log: (event) => console.log('[gdrive]', JSON.stringify(event)),
+  }),
+});
 const { publicPage } = require('./routes/public-pages.cjs');
 const webAddressRoutes = require('./routes/web-address.cjs').createWebAddressRoutes({ auth: authService, json, readBody: (req) => readJson(req) });
 const davConfig = require('./dav-settings.cjs').configuration(process.env, authService.origin);
@@ -742,6 +753,16 @@ const TOOLBOXES = [
 // D9: read-only offline Wikipedia box, only with features.kiwix and an internal KIWIX_URL.
 const kiwixTools = features.enabled('kiwix') && process.env.KIWIX_URL ? require('./kiwix.cjs').createKiwixTools({ baseUrl: process.env.KIWIX_URL, cap: TOOL_RESULT_CAP }) : null;
 if (kiwixTools) TOOLBOXES.push(kiwixTools.box);
+// Offered per request only to accounts with a connected Drive (connectedBoxes below).
+const driveTools = require('./gdrive-tools.cjs').createDriveTools({ accounts: driveAccounts, cap: TOOL_RESULT_CAP });
+TOOLBOXES.push(driveTools.box);
+const connectorRoutes = require('./routes/connectors.cjs').createConnectorRoutes({
+  accounts: driveAccounts, driveTools, policy: toolPolicy, offsite: offsiteBackup, isWrite: (name) => isWriteTool(name), json, readBody: (req) => readJson(req),
+});
+// Account-level connectors are not a project choice: they join every chat of an account that
+// connected them, and never appear in a project's toolbox picker.
+const CONNECTOR_BOXES = new Set(['gdrive']);
+function connectedBoxes(user) { return user && driveTools.connected(user) ? ['gdrive'] : []; }
 
 const DEFAULT_TOOLBOXES = ['core'];
 
@@ -1028,7 +1049,7 @@ function toolTokenBudgetFor(model) {
 // goes away, and that must degrade to fewer tools, not to a broken chat. Over
 // the cap the list is truncated, but never silently: the dropped names come
 // back so the caller can log them.
-function resolveTools(project, model) {
+function resolveTools(project, model, skip = () => false) {
   // An absent key means a project predating toolboxes: fall back to core so
   // upgrading does not silently disarm existing projects. An empty ARRAY is a
   // deliberate choice — the operator unticked every box — and must be honoured,
@@ -1044,7 +1065,7 @@ function resolveTools(project, model) {
     boxes.push(box.id);
     for (const tool of box.tools) {
       const name = tool && tool.function && tool.function.name;
-      if (!name || seen.has(name)) continue; // first box wins a name clash
+      if (!name || seen.has(name) || skip(name)) continue; // first box wins a name clash
       seen.add(name);
       candidates.push(tool);
     }
@@ -1938,12 +1959,12 @@ function awaitApproval({ id, userId, chatId, abortSignal }) {
 // older client cannot accumulate junk in the project record.
 function sanitizeToolboxes(value) {
   if (!Array.isArray(value)) return null;
-  const ids = value.filter((v) => typeof v === 'string' && allToolboxes().some((b) => b.id === v));
+  const ids = value.filter((v) => typeof v === 'string' && !CONNECTOR_BOXES.has(v) && allToolboxes().some((b) => b.id === v));
   return [...new Set(ids)];
 }
 
 function toolboxSummaries() {
-  return allToolboxes().map((b) => ({
+  return allToolboxes().filter((b) => !CONNECTOR_BOXES.has(b.id)).map((b) => ({
     id: b.id,
     label: b.label,
     description: b.description,
@@ -1977,6 +1998,7 @@ async function executeToolCall(project, name, rawArgs, allowed) {
     return `ERROR: tool arguments were not valid JSON: ${String(rawArgs).slice(0, 200)}`;
   }
   if (kiwixTools?.names.has(name)) return kiwixTools.execute(name, args);
+  if (driveTools.names.has(name)) return driveTools.execute(requestScope.getStore()?.authn?.user, name, args);
   if (name === 'get_current_time') {
     const tz = typeof args.timezone === 'string' && args.timezone ? args.timezone : undefined;
     const now = new Date();
@@ -2648,10 +2670,13 @@ async function handleChatInner(req, res, body, authn, preparation) {
   // Resolve the project's toolboxes once for the whole exchange: every round
   // must offer the same list, or the model gets told a tool exists and then
   // punished for calling it.
-  const selectedBoxes = Array.isArray(project && project.toolboxes) ? project.toolboxes : DEFAULT_TOOLBOXES;
+  const chatUser = requestScope.getStore()?.authn?.user || null;
+  const selectedBoxes = [...(Array.isArray(project && project.toolboxes) ? project.toolboxes : DEFAULT_TOOLBOXES).filter((id) => !CONNECTOR_BOXES.has(id)), ...connectedBoxes(chatUser)];
   const routing = await chatToolRouter.select(selectedBoxes, message);
   if (routing.routed) console.log(`[tools] routed ${selectedBoxes.length} toolboxes to ${routing.ids.join(', ')}`);
-  const resolved = resolveTools(routing.routed ? { ...project, toolboxes: routing.ids } : project, model);
+  // A tool the account blocked is never offered, so the model cannot even ask for it.
+  const blocked = (name) => toolPolicy.mode(chatUser?.id, name, isWriteTool(name)) === 'block';
+  const resolved = resolveTools({ ...project, toolboxes: routing.routed ? routing.ids : selectedBoxes }, model, blocked);
   const activeTools = resolved.tools;
   const allowedToolNames = new Set(activeTools.map((t) => t.function.name));
   if (resolved.dropped.length) {
@@ -2867,7 +2892,13 @@ async function handleChatInner(req, res, body, authn, preparation) {
           // than a Promise.all: the round genuinely blocks on a person.
           let result;
           const userId = requestScope.getStore()?.workspace?.userId || null;
-          if (isWriteTool(tc.name) && !chatWideApproved(userId, chatId)) {
+          // The account's tool policy (Settings → Connectors). Writes are always at least `ask`.
+          const permission = toolPolicy.mode(userId, tc.name, isWriteTool(tc.name));
+          if (permission === 'block') {
+            authService.audit('tool.denied', userId, userId, { tool: tc.name, reason: 'blocked' });
+            return `ERROR: ${tc.name} is blocked in this account's settings, so it was not run. Do not retry it; tell the user they can change it in Settings → Connectors.`;
+          }
+          if (permission === 'ask' && !chatWideApproved(userId, chatId)) {
             const approvalId = `ap-${crypto.randomUUID()}`;
             send({
               type: 'tool_pending',
@@ -3012,6 +3043,7 @@ async function handleRequestScoped(req, res) {
     if (authn && await importRoutes(req, res, { path: p, authn })) return;
     if (authn && await accountRoutes(req, res, { path: p, authn })) return;
     if (authn && await offsiteRoutes(req, res, { path: p, authn })) return;
+    if (authn && await connectorRoutes(req, res, { path: p, authn })) return;
     if (authn && await webAddressRoutes(req, res, { path: p, authn })) return;
     if (authn && p.startsWith('/api/projects/') && await researchRoutes(req, res, { path: p, authn })) return;
     if (authn && p.startsWith('/api/projects/') && await codeRoutes(req, res, { path: p, authn })) return;
@@ -3242,6 +3274,7 @@ async function handleRequestScoped(req, res) {
           const id = decodeURIComponent(userRoute[1]); const ok = authService.deleteUser(authn.user.id, id, (await readJson(req)).username);
           if (ok) {
             workspaceStore.remove(id);
+            await driveAccounts.removeUser(id);
             const headers = { 'X-Cowork-User-ID': id };
             if (DIARY_TOKEN) headers.Authorization = `Bearer ${DIARY_TOKEN}`;
             await fetchJson(`${DIARY_BASE}/api/internal/tenant`, { method: 'DELETE', headers }, 15000).catch(() => null);

@@ -109,7 +109,7 @@ function createOffsiteService({ env = process.env, features, dataDir, now = Date
   }
   /** Copies the local encrypted store to Drive and records the result for the page. */
   async function copyToDrive() {
-    if (!useDir() || drive.state().state !== 'connected') return null;
+    if (!useDir() || drive.state().state !== 'connected' || readStatus().driveCopy === false) return null;
     busy = 'copy to Google Drive';
     try {
       build();
@@ -126,7 +126,7 @@ function createOffsiteService({ env = process.env, features, dataDir, now = Date
   const driveView = () => {
     if (!useDir()) return null;
     const g = drive.state();
-    return { ...g, copy: g.state === 'connected' ? mirrorView(readStatus().mirror, now()) : null };
+    return { ...g, copyEnabled: readStatus().driveCopy !== false, copy: g.state === 'connected' ? mirrorView(readStatus().mirror, now()) : null };
   };
 
   return {
@@ -154,11 +154,21 @@ function createOffsiteService({ env = process.env, features, dataDir, now = Date
       if (busy) throw Object.assign(Error(`A ${busy} is already running.`), { status: 409, publicMessage: `A ${busy} is already running.` });
       return copyToDrive();
     },
-    connectGoogle: () => {
+    connectGoogle: (owner = null) => {
       if (!useDir()) throw Object.assign(Error('no folder'), { status: 409, publicMessage: 'Google Drive needs a backup folder on this server (OFFSITE_BACKUP_DIR).' });
       build();
       // Once approved, copy right away so the page can show the first result.
-      return drive.connect(() => copyToDrive().catch(() => {}));
+      return drive.connect(() => copyToDrive().catch(() => {}), { owner });
+    },
+    /** The backup connection, which is also its administrator's Drive for chat tools (drive-accounts). */
+    drive,
+    /** Whether that connection can hold a token at all: a backup folder and a readable key. */
+    driveUsable() { if (!useDir()) return false; try { loadKey(env.OFFSITE_BACKUP_KEY_FILE, paths); return true; } catch { return false; } },
+    /** Whether backups are copied to the connected Drive (on unless an admin turned it off). */
+    setDriveCopy(on) {
+      writeStatus({ driveCopy: !!on });
+      if (on && drive.state().state === 'connected' && !busy) Promise.resolve().then(copyToDrive).catch(() => {});
+      return driveView();
     },
     disconnectGoogle: () => drive.disconnect(),
     /** The backup key, for the admin to keep in a password manager. */

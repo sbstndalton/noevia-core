@@ -82,12 +82,12 @@ function createGoogleDrive(o) {
     if (pending && pending.expiresAt > now()) return { configured: true, state: 'pending', userCode: pending.userCode, verificationUrl: pending.verificationUrl, expiresAt: pending.expiresAt };
     const saved = readSaved();
     if (saved?.broken) return { configured: true, state: 'error', message: 'The saved Google connection could not be read (was the backup key replaced?). Connect again.' };
-    if (saved?.refreshToken) return { configured: true, state: 'connected', email: saved.email || null, connectedAt: saved.connectedAt || null };
+    if (saved?.refreshToken) return { configured: true, state: 'connected', email: saved.email || null, connectedAt: saved.connectedAt || null, owner: saved.owner || null };
     return { configured: true, state: 'disconnected', ...(pollError ? { message: pollError } : {}) };
   }
 
   /** Starts Google's device sign-in and polls for approval in the background. */
-  async function connect(onConnected = () => {}) {
+  async function connect(onConnected = () => {}, { owner = null } = {}) {
     if (!configured()) throw fail('This noevia build has no Google sign-in registered.', 409);
     const cur = state();
     if (cur.state === 'pending') return cur;
@@ -105,7 +105,7 @@ function createGoogleDrive(o) {
       catch { wait(poll, interval); return; } // offline for a moment: keep trying until the code expires
       if (mine !== generation) return;
       if (t.status === 200 && t.body.refresh_token) {
-        save({ refreshToken: t.body.refresh_token, email: emailOf(t.body.id_token), connectedAt: now() });
+        save({ refreshToken: t.body.refresh_token, email: emailOf(t.body.id_token), connectedAt: now(), ...(owner ? { owner } : {}) });
         access = t.body.access_token ? { token: t.body.access_token, until: now() + ((t.body.expires_in || 3600) - 60) * 1000 } : null;
         pending = null;
         log({ event: 'gdrive.connected' });
@@ -143,9 +143,14 @@ function createGoogleDrive(o) {
     return access.token;
   }
 
+  /** An authorized fetch that hands back the raw response, for downloads (alt=media, export). */
+  async function request(url, init = {}) {
+    return http(url, { ...init, headers: { ...(init.headers || {}), Authorization: `Bearer ${await token()}` } });
+  }
+
   async function call(url, init = {}) {
-    const r = await http(url, { ...init, headers: { ...(init.headers || {}), Authorization: `Bearer ${await token()}` } });
-    if (!r.ok) throw fail(`Google Drive answered ${r.status}.`);
+    const r = await request(url, init);
+    if (!r.ok) throw fail(r.status === 404 ? 'Google Drive has no such file, or noevia cannot see it.' : `Google Drive answered ${r.status}.`, r.status === 404 ? 404 : 502);
     return r.status === 204 ? null : r.json();
   }
 
@@ -209,7 +214,7 @@ function createGoogleDrive(o) {
     return { uploaded, bytes, removed: stale.length, snapshots };
   }
 
-  return { configured, state, connect, disconnect, mirror, FOLDER };
+  return { configured, state, connect, disconnect, mirror, FOLDER, call, request, api, upload };
 }
 
 module.exports = { createGoogleDrive, SCOPE, FOLDER, emailOf };
