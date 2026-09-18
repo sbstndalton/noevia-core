@@ -43,6 +43,26 @@ async function sqliteSnapshot(abs) {
   } catch { return null; } finally { try { db?.close(); } catch { /* closed */ } fs.rmSync(path.dirname(tmp), { recursive: true, force: true }); }
 }
 
+/**
+ * The host mirror's last word, from the dot file rclone-sync.sh leaves in the store folder.
+ * noevia cannot see rclone or its config, and should not: this is the only thing it learns.
+ * A mirror that has not reported for two days is stale, whatever it last said.
+ */
+function readMirror(dir, now = Date.now(), fsImpl = fs) {
+  if (!dir) return null;
+  let raw;
+  try { raw = JSON.parse(fsImpl.readFileSync(path.join(dir, '.mirror-status.json'), 'utf8')); }
+  catch { return { state: 'unknown', at: null, message: 'The copy to Google Drive has not run yet.' }; }
+  const states = ['ok', 'not-connected', 'waiting', 'refused', 'failed'];
+  const state = states.includes(raw.state) ? raw.state : 'unknown';
+  const at = Number.isFinite(raw.at) ? raw.at : null;
+  const message = typeof raw.message === 'string' ? raw.message.slice(0, 300) : '';
+  if (state === 'ok' && at && now - at > 2 * 86400000) {
+    return { state: 'stale', at, message: 'The last copy to Drive is more than two days old.' };
+  }
+  return { state, at, message };
+}
+
 function createOffsiteService({ env = process.env, features, dataDir, now = Date.now, log = () => {}, backupFactory = null }) {
   const statusFile = path.join(dataDir, 'offsite-backup-status.json');
   const paths = String(env.OFFSITE_BACKUP_PATHS || dataDir).split(',').map((p) => p.trim()).filter(Boolean);
@@ -92,6 +112,7 @@ function createOffsiteService({ env = process.env, features, dataDir, now = Date
         // Naming where it goes, never how it authenticates.
         destination: useDir() ? `Folder ${env.OFFSITE_BACKUP_DIR.trim()}${env.OFFSITE_BACKUP_MIRROR ? `, mirrored to ${env.OFFSITE_BACKUP_MIRROR}` : ''}`
           : env.OFFSITE_BACKUP_S3_ENDPOINT ? `${new URL(env.OFFSITE_BACKUP_S3_ENDPOINT).host} / ${env.OFFSITE_BACKUP_S3_BUCKET || '?'}` : null,
+        mirror: useDir() ? readMirror(env.OFFSITE_BACKUP_DIR.trim(), now()) : null,
         paths: paths.length, lastBackup: s.lastBackup || null, lastVerify: s.lastVerify || null, lastError: s.lastError || null, snapshots: s.snapshots ?? null };
     },
     runNow: () => exclusive('backup', async (b) => {
@@ -114,4 +135,4 @@ function createOffsiteService({ env = process.env, features, dataDir, now = Date
   };
 }
 
-module.exports = { checkDestination, DIR_ENV, createOffsiteService, sqliteSnapshot, ENV };
+module.exports = { readMirror, checkDestination, DIR_ENV, createOffsiteService, sqliteSnapshot, ENV };

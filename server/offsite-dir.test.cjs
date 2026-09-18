@@ -106,3 +106,32 @@ test('the destination may not overlap what it backs up', () => {
   assert.equal(checkDestination(separate, [data]), fs.realpathSync(separate));
   assert.throws(() => checkDestination('/does/not/exist', [data]), /does not exist/);
 });
+
+test('the page learns the Google Drive mirror’s state, and nothing else about it', () => {
+  const { readMirror } = require('./offsite-service.cjs');
+  const dir = temp('noevia-mirror-');
+  const now = Date.parse('2026-09-18T12:00:00Z');
+  const write = (o) => fs.writeFileSync(path.join(dir, '.mirror-status.json'), JSON.stringify(o));
+
+  assert.equal(readMirror(dir, now).state, 'unknown', 'no report yet');
+  write({ state: 'not-connected', at: now, message: 'Google Drive is not connected yet.' });
+  assert.deepEqual(readMirror(dir, now), { state: 'not-connected', at: now, message: 'Google Drive is not connected yet.' });
+  write({ state: 'ok', at: now - 3600000, message: 'Copied 1 snapshots.' });
+  assert.equal(readMirror(dir, now).state, 'ok');
+  // A mirror that stopped reporting is not "connected", whatever it last said.
+  write({ state: 'ok', at: now - 3 * 86400000, message: 'Copied 1 snapshots.' });
+  assert.equal(readMirror(dir, now).state, 'stale');
+  write({ state: 'something-new', at: now, message: 'x'.repeat(1000), token: 'must-not-surface' });
+  const odd = readMirror(dir, now);
+  assert.equal(odd.state, 'unknown');
+  assert.equal(odd.message.length, 300);
+  assert.equal('token' in odd, false, 'only state, time and message are ever passed on');
+  fs.writeFileSync(path.join(dir, '.mirror-status.json'), 'not json');
+  assert.equal(readMirror(dir, now).state, 'unknown');
+});
+
+test('the status file is invisible to the backup store', async () => {
+  const root = temp();
+  fs.writeFileSync(path.join(root, '.mirror-status.json'), '{}');
+  assert.deepEqual(await createDirStore({ root }).list(''), []);
+});
