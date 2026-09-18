@@ -115,6 +115,7 @@ const importRoutes = require('./routes/import.cjs').createImportRoutes({
 });
 const offsiteBackup = require('./offsite-service.cjs').createOffsiteService({ features, dataDir: DATA_DIR, log: (event) => console.log('[backup]', JSON.stringify(event)) });
 const offsiteRoutes = require('./routes/offsite-backup.cjs').createOffsiteRoutes({ service: offsiteBackup, json });
+const { publicPage } = require('./routes/public-pages.cjs');
 const webAddressRoutes = require('./routes/web-address.cjs').createWebAddressRoutes({ auth: authService, json, readBody: (req) => readJson(req) });
 const davConfig = require('./dav-settings.cjs').configuration(process.env, authService.origin);
 const davSettings = require('./dav-settings.cjs').createDavSettings({ auth: authService, config: davConfig });
@@ -2957,6 +2958,10 @@ async function handleRequestScoped(req, res) {
   res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");
 
   try {
+    if ((req.method === 'GET' || req.method === 'HEAD') && publicPage(p)) {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'public, max-age=300' });
+      return res.end(req.method === 'HEAD' ? undefined : publicPage(p));
+    }
     if(p==='/api/diary-connector') {
       res.setHeader('Cache-Control','no-store');
       if(req.method!=='POST')return json(res,405,{error:'POST required'});

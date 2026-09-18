@@ -74,3 +74,11 @@ test('the route saves only when the new address reaches this same server', async
   assert.equal(out.status, 200);
   auth.db.close();
 });
+
+test('about and privacy pages exist for Google’s app registration and name the Drive scope', () => {
+  const { publicPage } = require('./routes/public-pages.cjs');
+  assert.match(publicPage('/privacy'), /drive\.file/);
+  assert.match(publicPage('/privacy'), /Limited Use/);
+  assert.match(publicPage('/about'), /noevia/);
+  assert.equal(publicPage('/admin'), null);
+});
