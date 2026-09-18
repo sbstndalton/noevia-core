@@ -115,6 +115,7 @@ const importRoutes = require('./routes/import.cjs').createImportRoutes({
 });
 const offsiteBackup = require('./offsite-service.cjs').createOffsiteService({ features, dataDir: DATA_DIR, log: (event) => console.log('[backup]', JSON.stringify(event)) });
 const offsiteRoutes = require('./routes/offsite-backup.cjs').createOffsiteRoutes({ service: offsiteBackup, json });
+const webAddressRoutes = require('./routes/web-address.cjs').createWebAddressRoutes({ auth: authService, json, readBody: (req) => readJson(req) });
 const davConfig = require('./dav-settings.cjs').configuration(process.env, authService.origin);
 const davSettings = require('./dav-settings.cjs').createDavSettings({ auth: authService, config: davConfig });
 if (process.env.LEMONADE_BASE_URL && !process.env.INFERENCE_BASE_URL) console.warn('LEMONADE_BASE_URL is deprecated; use INFERENCE_BASE_URL');
@@ -2974,6 +2975,7 @@ async function handleRequestScoped(req, res) {
       '/api/auth/login/passkey/options', '/api/auth/login/passkey/verify',
       '/api/auth/invitations/accept', '/api/auth/recovery/complete',
     ]);
+    if (p === '/api/instance' && await webAddressRoutes(req, res, { path: p, authn: null })) return;
     if (p === '/api/setup/status' && req.method === 'GET') {
       return json(res, 200, { configured: authService.userCount() > 0, publicOrigin: authService.origin || process.env.PUBLIC_ORIGIN || '' });
     }
@@ -3005,6 +3007,7 @@ async function handleRequestScoped(req, res) {
     if (authn && await importRoutes(req, res, { path: p, authn })) return;
     if (authn && await accountRoutes(req, res, { path: p, authn })) return;
     if (authn && await offsiteRoutes(req, res, { path: p, authn })) return;
+    if (authn && await webAddressRoutes(req, res, { path: p, authn })) return;
     if (authn && p.startsWith('/api/projects/') && await researchRoutes(req, res, { path: p, authn })) return;
     if (authn && p.startsWith('/api/projects/') && await codeRoutes(req, res, { path: p, authn })) return;
     if(p==='/api/profile/diary-connectors' && req.method==='GET')return json(res,200,{connectors:diaryConnectors.list(authn.user.id)});

@@ -204,15 +204,27 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
   }
   db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(5, unixepoch() * 1000)').run();
 
-  const configuredOrigin = db.prepare("SELECT value FROM settings WHERE key='public_origin'").get()?.value;
-  let origin = publicOrigin || configuredOrigin || '';
+  const setting = (key) => db.prepare('SELECT value FROM settings WHERE key=?').get(key)?.value;
+  const configuredOrigin = setting('public_origin');
+  // An address an administrator chose in Settings → Web address wins over the environment, so
+  // renaming the site never needs a server-side file edit. PUBLIC_ORIGIN stays the default.
+  const adminOrigin = setting('public_origin_admin');
+  let origin = adminOrigin || publicOrigin || configuredOrigin || '';
+  let originSource = adminOrigin ? 'settings' : publicOrigin ? 'environment' : configuredOrigin ? 'setup' : 'none';
   let relyingPartyId = rpId || (origin ? new URL(origin).hostname : 'localhost');
+  // A random, public id so noevia can tell whether a new address really reaches this server.
+  if (!setting('instance_id')) db.prepare("INSERT OR IGNORE INTO settings(key,value) VALUES('instance_id',?)").run(crypto.randomUUID());
+  const instanceId = setting('instance_id');
   // Password/session login can be reachable from more than one origin (e.g. a
   // Cloudflare Tunnel hostname plus a bare LAN IP for local access) even
   // though only one origin can ever be the WebAuthn RP — passkeys are bound to
   // `origin`/`relyingPartyId` and will never work from an IP-address origin
   // regardless of this list, per the WebAuthn spec (RP ID must be a domain).
   const trustedOrigins = new Set(additionalOrigins.filter(Boolean));
+  // Earlier addresses keep working for sign-in after a rename, so nobody is locked out mid-move.
+  let previousOrigins = [];
+  try { previousOrigins = JSON.parse(setting('previous_origins') || '[]').filter((o) => typeof o === 'string'); } catch { previousOrigins = []; }
+  for (const o of previousOrigins) trustedOrigins.add(o);
   const setupFile = path.join(dataDir, 'first-run-setup-code');
 
   function userCount() {
@@ -329,7 +341,28 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
 
   return {
     appPasswords: require('./app-passwords.cjs').createAppPasswords({ db, audit, rateLimited }),
-    db, get origin() { return origin; }, get rpId() { return relyingPartyId; }, userCount, authenticate, csrfValid, originValid, publicUser, issueSession,
+    db, get origin() { return origin; }, get rpId() { return relyingPartyId; }, get originSource() { return originSource; }, instanceId,
+    get previousOrigins() { return [...previousOrigins]; },
+    /** Settings → Web address. Returns an error message, or null once saved. */
+    changeOrigin(next, actorId) {
+      const clean = String(next || '').trim().replace(/\/+$/, '');
+      let u; try { u = new URL(clean); } catch { return 'Enter a full address, such as https://noevia.example.com.'; }
+      if (u.origin !== clean) return 'Enter just the address, without a path, such as https://noevia.example.com.';
+      if (!isAcceptablePublicOrigin(clean)) return 'Use https://, or a private-network address over http://.';
+      if (clean === origin) return null;
+      const before = origin;
+      previousOrigins = [...new Set([...(before ? [before] : []), ...previousOrigins])].filter((o) => o !== clean).slice(0, 5);
+      db.transaction(() => {
+        db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('public_origin_admin',?)").run(clean);
+        db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('previous_origins',?)").run(JSON.stringify(previousOrigins));
+      })();
+      for (const o of previousOrigins) trustedOrigins.add(o);
+      trustedOrigins.delete(clean);
+      origin = clean; originSource = 'settings';
+      if (!rpId) relyingPartyId = u.hostname;
+      audit('settings.public_origin', actorId, actorId);
+      return null;
+    }, userCount, authenticate, csrfValid, originValid, publicUser, issueSession,
     // Exposed for the tool permission gate (step 16): every write tool call is
     // recorded here, so "what did the model actually do on my behalf" is
     // answerable from the same log as logins and storage changes.
