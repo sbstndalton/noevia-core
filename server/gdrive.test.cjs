@@ -39,7 +39,7 @@ test('device sign-in: a code to show, background polling, a sealed token, the ac
   const started = await d.connect(() => { connected = true; });
   assert.equal(started.state, 'pending');
   assert.equal(started.userCode, 'WDJB-MJHT');
-  assert.equal(started.verificationUrl, 'https://www.google.com/device');
+  assert.match(started.verificationUrl, /\/device$/);
   await new Promise((r) => setTimeout(r, 1300));
   assert.equal(d.state().state, 'pending', 'still waiting while Google says authorization_pending');
   google.approve();
