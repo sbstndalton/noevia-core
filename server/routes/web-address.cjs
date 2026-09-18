@@ -19,6 +19,8 @@ function createWebAddressRoutes({ auth, json, readBody, fetchImpl = fetch, timeo
 
   return async function webAddressRoutes(req, res, { path, authn }) {
     if (path === '/api/instance' && req.method === 'GET') return json(res, 200, { id: auth.instanceId }), true;
+    // Related Origin Requests: lets a renamed site keep using passkeys made under the old name.
+    if (path === '/.well-known/webauthn' && req.method === 'GET') return json(res, 200, { origins: auth.relatedOrigins() }), true;
     if (path !== '/api/admin/web-address') return false;
     if (!authn || authn.user.role !== 'admin') return json(res, 403, { error: 'Administrator required' }), true;
     if (req.method === 'GET') return json(res, 200, view()), true;

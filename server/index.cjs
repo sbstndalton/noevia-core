@@ -2980,7 +2980,7 @@ async function handleRequestScoped(req, res) {
       '/api/auth/login/passkey/options', '/api/auth/login/passkey/verify',
       '/api/auth/invitations/accept', '/api/auth/recovery/complete',
     ]);
-    if (p === '/api/instance' && await webAddressRoutes(req, res, { path: p, authn: null })) return;
+    if ((p === '/api/instance' || p === '/.well-known/webauthn') && await webAddressRoutes(req, res, { path: p, authn: null })) return;
     if (p === '/api/setup/status' && req.method === 'GET') {
       return json(res, 200, { configured: authService.userCount() > 0, publicOrigin: authService.origin || process.env.PUBLIC_ORIGIN || '' });
     }

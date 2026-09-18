@@ -211,7 +211,10 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
   const adminOrigin = setting('public_origin_admin');
   let origin = adminOrigin || publicOrigin || configuredOrigin || '';
   let originSource = adminOrigin ? 'settings' : publicOrigin ? 'environment' : configuredOrigin ? 'setup' : 'none';
-  let relyingPartyId = rpId || (origin ? new URL(origin).hostname : 'localhost');
+  // Passkeys belong to the name they were made under. After a rename the old name stays the
+  // passkey name (saved as passkey_rp_id) and the new address is declared a related origin
+  // (GET /.well-known/webauthn on the old host), so existing passkeys keep working.
+  let relyingPartyId = rpId || setting('passkey_rp_id') || (origin ? new URL(origin).hostname : 'localhost');
   // A random, public id so noevia can tell whether a new address really reaches this server.
   if (!setting('instance_id')) db.prepare("INSERT OR IGNORE INTO settings(key,value) VALUES('instance_id',?)").run(crypto.randomUUID());
   const instanceId = setting('instance_id');
@@ -226,6 +229,12 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
   try { previousOrigins = JSON.parse(setting('previous_origins') || '[]').filter((o) => typeof o === 'string'); } catch { previousOrigins = []; }
   for (const o of previousOrigins) trustedOrigins.add(o);
   const setupFile = path.join(dataDir, 'first-run-setup-code');
+
+  /** Every address a passkey ceremony may come from: the current one and earlier ones. */
+  function passkeyOrigins() {
+    const current = origin || setting('public_origin');
+    return [...new Set([current, ...previousOrigins].filter(Boolean))];
+  }
 
   function userCount() {
     return db.prepare('SELECT count(*) AS n FROM users').get().n;
@@ -343,6 +352,8 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
     appPasswords: require('./app-passwords.cjs').createAppPasswords({ db, audit, rateLimited }),
     db, get origin() { return origin; }, get rpId() { return relyingPartyId; }, get originSource() { return originSource; }, instanceId,
     get previousOrigins() { return [...previousOrigins]; },
+    /** WebAuthn related origins, served at /.well-known/webauthn on the passkey name's host. */
+    relatedOrigins: () => passkeyOrigins(),
     /** Settings → Web address. Returns an error message, or null once saved. */
     changeOrigin(next, actorId) {
       const clean = String(next || '').trim().replace(/\/+$/, '');
@@ -359,7 +370,14 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       for (const o of previousOrigins) trustedOrigins.add(o);
       trustedOrigins.delete(clean);
       origin = clean; originSource = 'settings';
-      if (!rpId) relyingPartyId = u.hostname;
+      if (!rpId) {
+        // Existing passkeys only work under their original name: keep it, and let the new
+        // address use them as a related origin. With no passkeys yet, simply follow the rename.
+        const hasPasskeys = db.prepare('SELECT count(*) AS n FROM passkeys').get().n > 0;
+        if (hasPasskeys) db.prepare("INSERT OR IGNORE INTO settings(key,value) VALUES('passkey_rp_id',?)").run(relyingPartyId);
+        else db.prepare("DELETE FROM settings WHERE key='passkey_rp_id'").run();
+        relyingPartyId = hasPasskeys ? setting('passkey_rp_id') : u.hostname;
+      }
       audit('settings.public_origin', actorId, actorId);
       return null;
     }, userCount, authenticate, csrfValid, originValid, publicUser, issueSession,
@@ -436,7 +454,7 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       const challenge = takeChallenge(body.challengeToken || '', 'register');
       if (!challenge || challenge.user_id !== userId) throw new Error('registration challenge expired');
       const verification = await verifyRegistrationResponse({ response: body.response, expectedChallenge: challenge.challenge,
-        expectedOrigin: origin || db.prepare("SELECT value FROM settings WHERE key='public_origin'").get().value, expectedRPID: relyingPartyId,
+        expectedOrigin: passkeyOrigins(), expectedRPID: relyingPartyId,
         requireUserVerification: true });
       if (!verification.verified || !verification.registrationInfo) throw new Error('passkey registration failed');
       const info = verification.registrationInfo; const cred = info.credential;
@@ -466,7 +484,7 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       const key = db.prepare('SELECT * FROM passkeys WHERE id=?').get(body.response?.id || '');
       if (!challenge || !key || challenge.user_id !== key.user_id) throw new Error('authentication failed');
       const verification = await verifyAuthenticationResponse({ response: body.response, expectedChallenge: challenge.challenge,
-        expectedOrigin: origin || db.prepare("SELECT value FROM settings WHERE key='public_origin'").get().value, expectedRPID: relyingPartyId,
+        expectedOrigin: passkeyOrigins(), expectedRPID: relyingPartyId,
         credential: { id: key.id, publicKey: new Uint8Array(key.public_key), counter: key.counter, transports: JSON.parse(key.transports) }, requireUserVerification: true });
       if (!verification.verified) throw new Error('authentication failed');
       db.prepare('UPDATE passkeys SET counter=?,last_used_at=? WHERE id=?').run(verification.authenticationInfo.newCounter, Date.now(), key.id);

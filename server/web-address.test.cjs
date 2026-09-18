@@ -82,3 +82,24 @@ test('about and privacy pages exist for Google’s app registration and name the
   assert.match(publicPage('/about'), /noevia/);
   assert.equal(publicPage('/admin'), null);
 });
+
+test('a rename keeps existing passkeys usable: same passkey name, new address as a related origin', () => {
+  const dir = temp();
+  const auth = createAuth({ dataDir: dir, publicOrigin: 'https://cowork.example.test' });
+  const now = Date.now();
+  auth.db.prepare("INSERT INTO users(id,username,username_norm,display_name,role,password_hash,webauthn_user_id,created_at,updated_at) VALUES('u','u','u','u','admin','x','w',?,?)").run(now, now);
+  const cols = auth.db.prepare('PRAGMA table_info(passkeys)').all();
+  const row = Object.fromEntries(cols.filter((c) => c.notnull && c.dflt_value === null && !c.pk).map((c) => [c.name, /INT/i.test(c.type) ? 1 : c.type === 'BLOB' ? Buffer.from('k') : 'x']));
+  row.id = 'cred'; row.user_id = 'u';
+  auth.db.prepare(`INSERT INTO passkeys(${Object.keys(row).join(',')}) VALUES(${Object.keys(row).map(() => '?').join(',')})`).run(...Object.values(row));
+  assert.equal(auth.changeOrigin('https://noevia.example.test', 'u'), null);
+  assert.equal(auth.rpId, 'cowork.example.test', 'passkeys keep the name they were made under');
+  assert.deepEqual(auth.relatedOrigins(), ['https://noevia.example.test', 'https://cowork.example.test']);
+  auth.db.close();
+  const again = createAuth({ dataDir: dir, publicOrigin: 'https://cowork.example.test' });
+  assert.equal(again.rpId, 'cowork.example.test', 'and after a restart');
+  const out = {};
+  createWebAddressRoutes({ auth: again, json: (res, status, body) => Object.assign(out, { status, body }), readBody: async () => ({}) })({ method: 'GET' }, {}, { path: '/.well-known/webauthn', authn: null });
+  assert.deepEqual(out.body, { origins: ['https://noevia.example.test', 'https://cowork.example.test'] });
+  again.db.close();
+});
