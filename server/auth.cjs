@@ -94,7 +94,7 @@ function isAcceptablePublicOrigin(originStr) {
   if (u.protocol === 'https:') return true;
   if (u.protocol !== 'http:') return false;
   const host = u.hostname;
-  if (host === 'localhost' || host === '127.0.0.1' || host === '::1') return true;
+  if (host === 'localhost' || host.endsWith('.localhost') || host === '127.0.0.1' || host === '::1') return true;
   if (/^10\./.test(host) || /^192\.168\./.test(host) || /^172\.(1[6-9]|2\d|3[01])\./.test(host)) return true;
   if (host !== '' && !host.includes('.') && !host.includes(':')) return true; // bare LAN hostname
   return false;
@@ -214,7 +214,14 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
   // Passkeys belong to the name they were made under. After a rename the old name stays the
   // passkey name (saved as passkey_rp_id) and the new address is declared a related origin
   // (GET /.well-known/webauthn on the old host), so existing passkeys keep working.
-  let relyingPartyId = rpId || setting('passkey_rp_id') || (origin ? new URL(origin).hostname : 'localhost');
+  // New passkeys are always made for the current address. Each passkey remembers the name it was
+  // made under (passkeys.rp_id), so after a rename the old ones still sign in (browsers that
+  // support related origins accept them via /.well-known/webauthn on the old host).
+  let relyingPartyId = rpId || (origin ? new URL(origin).hostname : 'localhost');
+  if (!db.prepare('PRAGMA table_info(passkeys)').all().some((c) => c.name === 'rp_id')) db.exec('ALTER TABLE passkeys ADD COLUMN rp_id TEXT');
+  db.prepare('UPDATE passkeys SET rp_id=? WHERE rp_id IS NULL').run(setting('passkey_rp_id') || relyingPartyId);
+  db.prepare("DELETE FROM settings WHERE key='passkey_rp_id'").run();
+  const keyRp = (key) => key.rp_id || relyingPartyId;
   // A random, public id so noevia can tell whether a new address really reaches this server.
   if (!setting('instance_id')) db.prepare("INSERT OR IGNORE INTO settings(key,value) VALUES('instance_id',?)").run(crypto.randomUUID());
   const instanceId = setting('instance_id');
@@ -370,14 +377,9 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       for (const o of previousOrigins) trustedOrigins.add(o);
       trustedOrigins.delete(clean);
       origin = clean; originSource = 'settings';
-      if (!rpId) {
-        // Existing passkeys only work under their original name: keep it, and let the new
-        // address use them as a related origin. With no passkeys yet, simply follow the rename.
-        const hasPasskeys = db.prepare('SELECT count(*) AS n FROM passkeys').get().n > 0;
-        if (hasPasskeys) db.prepare("INSERT OR IGNORE INTO settings(key,value) VALUES('passkey_rp_id',?)").run(relyingPartyId);
-        else db.prepare("DELETE FROM settings WHERE key='passkey_rp_id'").run();
-        relyingPartyId = hasPasskeys ? setting('passkey_rp_id') : u.hostname;
-      }
+      // Existing passkeys keep the name they were made under; new ones use the new address.
+      db.prepare('UPDATE passkeys SET rp_id=? WHERE rp_id IS NULL').run(relyingPartyId);
+      if (!rpId) relyingPartyId = u.hostname;
       audit('settings.public_origin', actorId, actorId);
       return null;
     }, userCount, authenticate, csrfValid, originValid, publicUser, issueSession,
@@ -446,7 +448,7 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       const keys = db.prepare('SELECT * FROM passkeys WHERE user_id=?').all(userId);
       const options = await generateRegistrationOptions({ rpName: 'noevia', rpID: relyingPartyId, userName: user.username,
         userDisplayName: user.display_name, userID: Buffer.from(user.webauthn_user_id, 'base64url'), attestationType: 'none',
-        excludeCredentials: keys.map(k => ({ id: k.id, transports: JSON.parse(k.transports) })),
+        excludeCredentials: keys.filter(k => keyRp(k) === relyingPartyId).map(k => ({ id: k.id, transports: JSON.parse(k.transports) })),
         authenticatorSelection: { residentKey: 'preferred', userVerification: 'required' } });
       return { options, challengeToken: saveChallenge(userId, 'register', options.challenge) };
     },
@@ -456,18 +458,23 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       const verification = await verifyRegistrationResponse({ response: body.response, expectedChallenge: challenge.challenge,
         expectedOrigin: passkeyOrigins(), expectedRPID: relyingPartyId,
         requireUserVerification: true });
+      const madeFor = relyingPartyId;
       if (!verification.verified || !verification.registrationInfo) throw new Error('passkey registration failed');
       const info = verification.registrationInfo; const cred = info.credential;
-      db.prepare('INSERT INTO passkeys(id,user_id,name,public_key,webauthn_user_id,counter,device_type,backed_up,transports,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)')
+      db.prepare('INSERT INTO passkeys(id,user_id,name,public_key,webauthn_user_id,counter,device_type,backed_up,transports,created_at,rp_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)')
         .run(cred.id, userId, String(body.name || 'Passkey').slice(0, 80), Buffer.from(cred.publicKey), db.prepare('SELECT webauthn_user_id FROM users WHERE id=?').get(userId).webauthn_user_id,
-          cred.counter, info.credentialDeviceType, info.credentialBackedUp ? 1 : 0, JSON.stringify(cred.transports || []), Date.now());
+          cred.counter, info.credentialDeviceType, info.credentialBackedUp ? 1 : 0, JSON.stringify(cred.transports || []), Date.now(), madeFor);
       audit('passkey.add', userId, userId, { credentialId: cred.id });
       return { verified: true };
     },
     async authenticationOptions(username) {
       const norm = String(username || '').toLowerCase();
       const user = db.prepare('SELECT * FROM users WHERE username_norm=? AND disabled_at IS NULL').get(norm);
-      const keys = user ? db.prepare('SELECT * FROM passkeys WHERE user_id=?').all(user.id) : [];
+      const all = user ? db.prepare('SELECT * FROM passkeys WHERE user_id=?').all(user.id) : [];
+      // One ceremony has one RP ID: the current address if the user has a passkey for it,
+      // otherwise the name their passkeys were made under (related origins carry it across).
+      const signInRp = all.some(k => keyRp(k) === relyingPartyId) || !all.length ? relyingPartyId : keyRp(all[0]);
+      const keys = all.filter(k => keyRp(k) === signInRp);
       // Pad every list with stable decoy ids so known and unknown usernames get the same shape.
       // Authenticators ignore credential ids they do not hold, so real sign-in is unaffected.
       const real = keys.map(k => ({ id: k.id, transports: JSON.parse(k.transports) }));
@@ -476,7 +483,7 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
         decoys.push({ id: crypto.createHmac('sha256', decoyKey()).update(`${norm}:${i}`).digest('base64url'), transports: ['internal', 'hybrid'] });
       }
       const allowCredentials = [...real, ...decoys].sort((a, b) => (a.id < b.id ? -1 : 1));
-      const options = await generateAuthenticationOptions({ rpID: relyingPartyId, userVerification: 'required', allowCredentials });
+      const options = await generateAuthenticationOptions({ rpID: signInRp, userVerification: 'required', allowCredentials });
       return { options, challengeToken: saveChallenge(user?.id || null, 'authenticate', options.challenge) };
     },
     async authenticationVerify(req, res, body) {
@@ -484,7 +491,7 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       const key = db.prepare('SELECT * FROM passkeys WHERE id=?').get(body.response?.id || '');
       if (!challenge || !key || challenge.user_id !== key.user_id) throw new Error('authentication failed');
       const verification = await verifyAuthenticationResponse({ response: body.response, expectedChallenge: challenge.challenge,
-        expectedOrigin: passkeyOrigins(), expectedRPID: relyingPartyId,
+        expectedOrigin: passkeyOrigins(), expectedRPID: keyRp(key),
         credential: { id: key.id, publicKey: new Uint8Array(key.public_key), counter: key.counter, transports: JSON.parse(key.transports) }, requireUserVerification: true });
       if (!verification.verified) throw new Error('authentication failed');
       db.prepare('UPDATE passkeys SET counter=?,last_used_at=? WHERE id=?').run(verification.authenticationInfo.newCounter, Date.now(), key.id);
