@@ -5,8 +5,30 @@
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const { createOffsiteBackup, loadKey } = require('./offsite-backup.cjs');
 const { createS3Store } = require('./offsite-s3.cjs');
+const { createDirStore } = require('./offsite-dir.cjs');
 
 const ENV = ['OFFSITE_BACKUP_S3_ENDPOINT', 'OFFSITE_BACKUP_S3_BUCKET', 'OFFSITE_BACKUP_S3_ACCESS_KEY_ID', 'OFFSITE_BACKUP_S3_SECRET_ACCESS_KEY', 'OFFSITE_BACKUP_KEY_FILE'];
+// A folder destination, mirrored elsewhere by the host (Google Drive via rclone): no S3 keys.
+const DIR_ENV = ['OFFSITE_BACKUP_DIR', 'OFFSITE_BACKUP_KEY_FILE'];
+
+/**
+ * The destination folder may not overlap anything being backed up: inside a backed-up path it
+ * would back itself up on every run, growing without bound; containing one, a restore could
+ * land on top of its own source.
+ */
+function checkDestination(dir, paths, fsImpl = fs) {
+  let real;
+  try { real = fsImpl.realpathSync(dir); }
+  catch { throw Object.assign(Error(`The backup folder ${dir} does not exist.`), { status: 409, publicMessage: `The backup folder ${dir} does not exist.` }); }
+  for (const root of paths) {
+    let r; try { r = fsImpl.realpathSync(root); } catch { continue; }
+    if (real === r || real.startsWith(r + path.sep) || r.startsWith(real + path.sep)) {
+      const message = 'The backup folder must not overlap the folders being backed up.';
+      throw Object.assign(Error(message), { status: 409, publicMessage: message });
+    }
+  }
+  return real;
+}
 
 /** A consistent copy of a live SQLite database via the online backup API. */
 async function sqliteSnapshot(abs) {
@@ -32,14 +54,17 @@ function createOffsiteService({ env = process.env, features, dataDir, now = Date
     fs.writeFileSync(tmp, JSON.stringify(next, null, 2), { mode: 0o600 }); fs.renameSync(tmp, statusFile);
     return next;
   };
-  const missing = () => ENV.filter((k) => !String(env[k] || '').trim());
+  const useDir = () => !!String(env.OFFSITE_BACKUP_DIR || '').trim();
+  const missing = () => (useDir() ? DIR_ENV : ENV).filter((k) => !String(env[k] || '').trim());
   let engine = null, busy = '';
 
   function build() {
     if (engine) return engine;
     if (backupFactory) return (engine = backupFactory());
-    const store = createS3Store({ endpoint: env.OFFSITE_BACKUP_S3_ENDPOINT, bucket: env.OFFSITE_BACKUP_S3_BUCKET, region: env.OFFSITE_BACKUP_S3_REGION || 'us-east-1',
-      accessKeyId: env.OFFSITE_BACKUP_S3_ACCESS_KEY_ID, secretAccessKey: env.OFFSITE_BACKUP_S3_SECRET_ACCESS_KEY, prefix: env.OFFSITE_BACKUP_S3_PREFIX || 'noevia-backup' });
+    const store = useDir()
+      ? createDirStore({ root: checkDestination(env.OFFSITE_BACKUP_DIR.trim(), paths) })
+      : createS3Store({ endpoint: env.OFFSITE_BACKUP_S3_ENDPOINT, bucket: env.OFFSITE_BACKUP_S3_BUCKET, region: env.OFFSITE_BACKUP_S3_REGION || 'us-east-1',
+        accessKeyId: env.OFFSITE_BACKUP_S3_ACCESS_KEY_ID, secretAccessKey: env.OFFSITE_BACKUP_S3_SECRET_ACCESS_KEY, prefix: env.OFFSITE_BACKUP_S3_PREFIX || 'noevia-backup' });
     return (engine = createOffsiteBackup({ store, key: loadKey(env.OFFSITE_BACKUP_KEY_FILE, paths), paths, now, log, snapshotFile: sqliteSnapshot }));
   }
   const ready = () => {
@@ -63,7 +88,10 @@ function createOffsiteService({ env = process.env, features, dataDir, now = Date
     status() {
       const s = readStatus();
       return { enabled: features.enabled('offsiteBackup'), ready: !ready(), reason: ready(), busy: busy || null, schedule: `Daily at ${String(hour).padStart(2, '0')}:00 (server time)`,
-        retention: 'Keeps 7 daily, 4 weekly and 6 monthly snapshots', destination: env.OFFSITE_BACKUP_S3_ENDPOINT ? `${new URL(env.OFFSITE_BACKUP_S3_ENDPOINT).host} / ${env.OFFSITE_BACKUP_S3_BUCKET || '?'}` : null,
+        retention: 'Keeps 7 daily, 4 weekly and 6 monthly snapshots',
+        // Naming where it goes, never how it authenticates.
+        destination: useDir() ? `Folder ${env.OFFSITE_BACKUP_DIR.trim()}${env.OFFSITE_BACKUP_MIRROR ? `, mirrored to ${env.OFFSITE_BACKUP_MIRROR}` : ''}`
+          : env.OFFSITE_BACKUP_S3_ENDPOINT ? `${new URL(env.OFFSITE_BACKUP_S3_ENDPOINT).host} / ${env.OFFSITE_BACKUP_S3_BUCKET || '?'}` : null,
         paths: paths.length, lastBackup: s.lastBackup || null, lastVerify: s.lastVerify || null, lastError: s.lastError || null, snapshots: s.snapshots ?? null };
     },
     runNow: () => exclusive('backup', async (b) => {
@@ -86,4 +114,4 @@ function createOffsiteService({ env = process.env, features, dataDir, now = Date
   };
 }
 
-module.exports = { createOffsiteService, sqliteSnapshot, ENV };
+module.exports = { checkDestination, DIR_ENV, createOffsiteService, sqliteSnapshot, ENV };
