@@ -9,7 +9,7 @@ test('add, list and remove; only https; no duplicates', () => {
   const dir = createDirectoryMcp({ db: new Database(':memory:') });
   const s = dir.add({ registryName: 'io.github.x/weather', title: 'weather', url: 'https://mcp.example.com/mcp' }, 'u1');
   assert.equal(s.id, 'dir-io-github-x-weather');
-  assert.deepEqual(dir.asServers(), [{ id: s.id, url: 'https://mcp.example.com/mcp', auth: 'none', directory: true, title: 'weather' }]);
+  assert.deepEqual(dir.asServers(), [{ id: s.id, url: 'https://mcp.example.com/mcp', auth: 'none', directory: true, title: 'weather', addedBy: 'u1' }]);
   assert.throws(() => dir.add({ registryName: 'io.github.x/weather', url: 'https://mcp.example.com/mcp' }), /already added/);
   assert.throws(() => dir.add({ registryName: 'b', url: 'http://mcp.example.com/mcp' }), /https/);
   assert.throws(() => dir.add({ registryName: 'c', url: 'https://{host}/mcp' }), /https/);

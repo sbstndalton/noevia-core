@@ -1659,6 +1659,24 @@ async function directoryUrlAllowed(url) {
   if (process.env.NOEVIA_QA_ALLOW_LOOPBACK_MCP === '1' && /^https?:\/\/127\.0\.0\.1:\d+\//.test(url)) return true;
   return require('./ssrf.cjs').isPublicUrl(url);
 }
+// OAuth sign-in for directory servers: one sign-in per account per server (mcp-oauth.cjs).
+// Its URLs come from strangers' metadata, so they must be https (or the QA loopback) and public.
+const mcpOAuth = require('./mcp-oauth.cjs').createMcpOAuth({
+  db: authService.db, secrets: secretStore, audit: (action, actor, detail) => authService.audit(action, actor, actor, detail),
+  urlAllowed: async (url) => require('./directory-mcp.cjs').hostedUrlOk(url) && directoryUrlAllowed(url),
+  redirectUri: () => `${String(authService.origin || process.env.PUBLIC_ORIGIN || '').replace(/\/$/, '')}/api/mcp-oauth/callback`,
+});
+const oauthServerIds = () => new Set(MCP_SERVERS.filter((sv) => sv.auth === 'oauth').map((sv) => sv.id));
+/** An unauthenticated initialize: tells us whether a server wants OAuth (401 + WWW-Authenticate). */
+async function probeMcpAuth(url) {
+  if (!(await directoryUrlAllowed(url))) return { status: 0, challenge: '' };
+  try {
+    const r = await fetch(url, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(8000),
+      headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'noevia', version: '1' } } }) });
+    return { status: r.status, challenge: r.headers.get('www-authenticate') || '' };
+  } catch { return { status: 0, challenge: '' }; }
+}
 function syncDirectoryServers() {
   for (let i = MCP_SERVERS.length - 1; i >= 0; i--) if (MCP_SERVERS[i].directory) MCP_SERVERS.splice(i, 1);
   for (const sv of directoryMcp.asServers()) MCP_SERVERS.push(sv);
@@ -1704,7 +1722,13 @@ async function discoverOneServer(server) {
   // A directory server is someone else's: re-check at every discovery that its name still points
   // at a public address, so a DNS change cannot turn it into a probe of the home network.
   if (server.directory && !(await directoryUrlAllowed(server.url))) throw new Error('its address no longer resolves to a public host');
-  const headers = mcpDiscoveryAuth(server);
+  let headers = mcpDiscoveryAuth(server);
+  if (server.auth === 'oauth') {
+    // The tool list is read with the sign-in of the administrator who added the server.
+    const token = await mcpOAuth.tokenFor(server.addedBy, server.id);
+    if (!token) throw new Error('waiting for the administrator who added it to sign in');
+    headers = { Authorization: `Bearer ${token}` };
+  }
   const { session } = await mcp.connect(server.url, headers);
   const discovered = await mcp.listTools(server.url, session, headers);
   const byName = new Map();
@@ -2085,7 +2109,12 @@ async function executeMcpToolCall(name, args) {
   // somebody else's service, so only a server the operator marked
   // auth=nextcloud gets it — and then only if the origin allowlist agrees.
   let auth = null;
-  if (server.auth === 'directory') {
+  if (server.auth === 'oauth') {
+    // Each account's own sign-in, never another's.
+    const token = await mcpOAuth.tokenFor(requestScope.getStore()?.authn?.user?.id, server.id);
+    if (!token) return `ERROR: ${name} needs you to sign in to ${server.title || 'this server'} first: Plugins → Connected → Sign in.`;
+    auth = { Authorization: `Bearer ${token}` };
+  } else if (server.auth === 'directory') {
     auth = directoryMcp.headersFor(server.id);
   } else if (server.auth === 'bearer') {
     auth = mcpStaticAuth(server);
@@ -2738,6 +2767,8 @@ async function handleChatInner(req, res, body, authn, preparation) {
   // punished for calling it.
   const chatUser = requestScope.getStore()?.authn?.user || null;
   const selectedBoxes = [...(Array.isArray(project && project.toolboxes) ? project.toolboxes : DEFAULT_TOOLBOXES).filter((id) => !CONNECTOR_BOXES.has(id)), ...connectedBoxes(chatUser)];
+  // A sign-in server's tools reach only the accounts that signed in to it themselves.
+  { const oauthIds = oauthServerIds(); for (let k = selectedBoxes.length - 1; k >= 0; k--) if (oauthIds.has(selectedBoxes[k]) && !mcpOAuth.connected(chatUser?.id, selectedBoxes[k])) selectedBoxes.splice(k, 1); }
   const routing = await chatToolRouter.select(selectedBoxes, message);
   if (routing.routed) console.log(`[tools] routed ${selectedBoxes.length} toolboxes to ${routing.ids.join(', ')}`);
   // A tool the account blocked is never offered, so the model cannot even ask for it.
@@ -3136,6 +3167,30 @@ async function handleRequestScoped(req, res) {
     if (authn && await offsiteRoutes(req, res, { path: p, authn })) return;
     if (authn && await connectorRoutes(req, res, { path: p, authn })) return;
     if (authn && await pluginDirectoryRoutes(req, res, { path: p, authn })) return;
+    // Per-account OAuth sign-in to directory servers (any signed-in account, each for itself).
+    if (authn && p === '/api/mcp-oauth/servers' && req.method === 'GET') {
+      return json(res, 200, { servers: MCP_SERVERS.filter((sv) => sv.auth === 'oauth').map((sv) => ({ id: sv.id, title: sv.title, connected: mcpOAuth.connected(authn.user.id, sv.id) })) });
+    }
+    const oauthConnect = p.match(/^\/api\/mcp-oauth\/([a-z0-9-]+)\/connect$/);
+    if (authn && oauthConnect && req.method === 'POST') {
+      const sv = MCP_SERVERS.find((x) => x.id === oauthConnect[1] && x.auth === 'oauth');
+      if (!sv) return json(res, 404, { error: 'No such sign-in server.' });
+      try { return json(res, 200, { signIn: await mcpOAuth.start({ userId: authn.user.id, serverId: sv.id, serverUrl: sv.url, challenge: (await probeMcpAuth(sv.url)).challenge }) }); }
+      catch (e) { return json(res, e.status || 502, { error: e.message }); }
+    }
+    const oauthDrop = p.match(/^\/api\/mcp-oauth\/([a-z0-9-]+)$/);
+    if (authn && oauthDrop && req.method === 'DELETE') { mcpOAuth.disconnect(authn.user.id, oauthDrop[1]); return json(res, 200, { ok: true }); }
+    if (authn && p === '/api/mcp-oauth/callback' && req.method === 'GET') {
+      const q = new URL(req.url, 'http://local').searchParams;
+      const page = (ok, text) => { res.writeHead(ok ? 200 : 400, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'" });
+        res.end(`<!doctype html><meta name=viewport content="width=device-width"><title>noevia sign-in</title><body style="font:16px system-ui;padding:32px;max-width:32em"><h1 style="font-size:20px">${ok ? 'Signed in' : 'Sign-in did not finish'}</h1><p>${String(text).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]))}</p><p>You can close this tab and return to noevia.</p><script>setTimeout(()=>{try{window.close()}catch{}},1200)</script>`); };
+      if (q.get('error')) return page(false, `The sign-in service said: ${String(q.get('error_description') || q.get('error')).slice(0, 200)}`);
+      try {
+        const done = await mcpOAuth.finish({ userId: authn.user.id, state: q.get('state'), code: q.get('code') });
+        await discoverMcpTools(true); // an admin's (re-)sign-in may be what the tool list was waiting for
+        return page(true, done.purpose === 'add' ? 'The server is added. Choose it under a project’s Tools; each person signs in from Plugins → Connected.' : 'Your account is connected. Its tools are now offered in projects that chose this server.');
+      } catch (e) { return page(false, e.message); }
+    }
     // Plugins → MCP servers → Add: administrators only; the URL comes from the registry, not the client.
     if (p === '/api/admin/mcp-directory' || p.startsWith('/api/admin/mcp-directory/')) {
       if (!authn || authn.user.role !== 'admin') return json(res, 403, { error: 'Administrator required' });
@@ -3154,7 +3209,21 @@ async function handleRequestScoped(req, res) {
         try { pendingHeaders = require('./directory-mcp.cjs').checkHeaderValues(item.headers || [], body.headers || {}); } catch (e) { return json(res, e.status || 400, { error: e.message }); }
         const hasKey = Object.keys(pendingHeaders).length > 0;
         try { found = await discoverOneServer({ id: directoryMcp.idFor(item.id), url: item.remoteUrl, auth: hasKey ? 'directory' : 'none', directory: true, pendingHeaders }); }
-        catch (e) { return json(res, 422, { error: `${hasKey ? 'The server did not accept that key, or' : 'The server'} did not answer as an MCP server: ${String(e.message || e).slice(0, 200)}` }); }
+        catch (e) {
+          // No key and the server asks for sign-in: add it as an OAuth server and send the admin to sign in.
+          const probe = !hasKey ? await probeMcpAuth(item.remoteUrl) : { status: 0 };
+          if (probe.status === 401) {
+            let added;
+            try { added = directoryMcp.add({ registryName: item.id, title: item.name, url: item.remoteUrl, oauth: true }, authn.user.id); } catch (err) { return json(res, err.status || 400, { error: err.message }); }
+            syncDirectoryServers();
+            try {
+              const signIn = await mcpOAuth.start({ userId: authn.user.id, serverId: added.id, serverUrl: item.remoteUrl, challenge: probe.challenge, purpose: 'add' });
+              return json(res, 202, { signIn, server: added, servers: describe() });
+            } catch (err) {
+              directoryMcp.remove(added.id, authn.user.id); mcpOAuth.forget(added.id); syncDirectoryServers();
+              return json(res, 422, { error: `The server needs a sign-in noevia cannot do: ${err.message}` });
+            }
+          } return json(res, 422, { error: `${hasKey ? 'The server did not accept that key, or' : 'The server'} did not answer as an MCP server: ${String(e.message || e).slice(0, 200)}` }); }
         if (!found.size) return json(res, 422, { error: 'The server answered but offers no tools noevia can use.' });
         let added;
         try { added = directoryMcp.add({ registryName: item.id, title: item.name, url: item.remoteUrl, declaredHeaders: item.headers || [], headerValues: body.headers || {} }, authn.user.id); } catch (e) { return json(res, e.status || 400, { error: e.message }); }
@@ -3182,6 +3251,7 @@ async function handleRequestScoped(req, res) {
       }
       const del = p.match(/^\/api\/admin\/mcp-directory\/([a-z0-9-]+)$/);
       if (del && req.method === 'DELETE') {
+        mcpOAuth.forget(del[1]);
         try { directoryMcp.remove(del[1], authn.user.id); } catch (e) { return json(res, e.status || 400, { error: e.message }); }
         syncDirectoryServers();
         await discoverMcpTools(true);
