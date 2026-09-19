@@ -47,17 +47,20 @@ function createMcpOAuth({ db, secrets, fetchImpl = globalThis.fetch, urlAllowed,
     for (const [k, v] of [['authorization', as.authorization_endpoint], ['token', as.token_endpoint], ['registration', as.registration_endpoint]]) {
       if (v && !(await urlAllowed(v))) throw fail(`The sign-in service’s ${k} address is not a public https address.`);
     }
+    const methods = Array.isArray(as.token_endpoint_auth_methods_supported) ? as.token_endpoint_auth_methods_supported : ['client_secret_basic'];
     return { resource: serverUrl, issuer, authorizationEndpoint: as.authorization_endpoint, tokenEndpoint: as.token_endpoint,
-      registrationEndpoint: as.registration_endpoint || null, scopes: Array.isArray(prm?.scopes_supported) ? prm.scopes_supported.filter((x) => typeof x === 'string').slice(0, 20) : [] };
+      registrationEndpoint: as.registration_endpoint || null, secretMethod: methods.includes('client_secret_basic') ? 'client_secret_basic' : methods.includes('client_secret_post') ? 'client_secret_post' : 'client_secret_basic', scopes: Array.isArray(prm?.scopes_supported) ? prm.scopes_supported.filter((x) => typeof x === 'string').slice(0, 20) : [] };
   }
 
   /** Discover and register noevia once per server; kept (encrypted) for later sign-ins. */
   async function clientFor(serverId, serverUrl, challenge) {
     const row = db.prepare('SELECT data_enc FROM mcp_oauth_clients WHERE server_id=?').get(serverId);
     const known = row && dec(row.data_enc);
-    if (known && known.redirectUri === redirectUri()) return known;
+    // An app an administrator registered by hand is used as it is: its return address is the one
+    // they registered, and changing it is their call (setClient).
+    if (known && (known.manual || known.redirectUri === redirectUri())) return known;
     const meta = await discover(serverUrl, challenge);
-    if (!meta.registrationEndpoint) throw fail('The sign-in service does not allow apps to register themselves, so noevia cannot sign in to it yet.');
+    if (!meta.registrationEndpoint) throw Object.assign(fail('This sign-in service needs an app registered by hand. An administrator registers one and enters its client ID.', 409), { needsClient: true, issuer: meta.issuer });
     const r = await fetchImpl(meta.registrationEndpoint, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(8000),
       headers: { 'content-type': 'application/json', accept: 'application/json' },
       body: JSON.stringify({ client_name: 'noevia', redirect_uris: [redirectUri()], grant_types: ['authorization_code', 'refresh_token'], response_types: ['code'], token_endpoint_auth_method: 'none' }) });
@@ -84,7 +87,8 @@ function createMcpOAuth({ db, secrets, fetchImpl = globalThis.fetch, urlAllowed,
   async function tokenRequest(client, params) {
     const body = new URLSearchParams({ ...params, client_id: client.clientId, resource: client.resource });
     const headers = { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' };
-    if (client.clientSecret) headers.authorization = `Basic ${Buffer.from(`${encodeURIComponent(client.clientId)}:${encodeURIComponent(client.clientSecret)}`).toString('base64')}`;
+    if (client.clientSecret && client.tokenAuth === 'client_secret_post') body.set('client_secret', client.clientSecret);
+    else if (client.clientSecret) headers.authorization = `Basic ${Buffer.from(`${encodeURIComponent(client.clientId)}:${encodeURIComponent(client.clientSecret)}`).toString('base64')}`;
     const r = await fetchImpl(client.tokenEndpoint, { method: 'POST', headers, body, redirect: 'error', signal: AbortSignal.timeout(10000) });
     const t = await r.json().catch(() => null);
     if (!r.ok || !t?.access_token) throw fail(`The sign-in service did not issue a token (${r.status}${t?.error ? `: ${String(t.error).slice(0, 60)}` : ''}).`);
@@ -125,6 +129,25 @@ function createMcpOAuth({ db, secrets, fetchImpl = globalThis.fetch, urlAllowed,
     } catch { return null; }
   }
 
+  /** An administrator's hand-registered app: validated, checked against the service, stored encrypted. */
+  async function setClient({ serverId, serverUrl, clientId, clientSecret = '', challenge = '' }) {
+    const id = String(clientId || '').trim(), secret = String(clientSecret || '').trim();
+    if (!id || id.length > 300 || /[\s\0]/.test(id)) throw fail('Enter the client ID the service gave you (one word, no spaces).', 400);
+    if (secret.length > 1000 || /[\r\n\0]/.test(secret)) throw fail('The client secret must be one line.', 400);
+    const meta = await discover(serverUrl, challenge);
+    const client = { ...meta, clientId: id, clientSecret: secret || null, tokenAuth: secret ? meta.secretMethod : 'none', redirectUri: redirectUri(), manual: true };
+    db.prepare('INSERT INTO mcp_oauth_clients VALUES(?,?,?) ON CONFLICT(server_id) DO UPDATE SET data_enc=excluded.data_enc, updated_at=excluded.updated_at').run(serverId, enc(client), now());
+    // Sign-ins made with another app are not valid for this one.
+    db.prepare('DELETE FROM mcp_oauth_tokens WHERE server_id=?').run(serverId);
+    audit('mcp.oauth.client', null, { serverId, manual: true });
+  }
+  /** What an administrator may see about the app: never the secret. */
+  function clientInfo(serverId) {
+    const row = db.prepare('SELECT data_enc FROM mcp_oauth_clients WHERE server_id=?').get(serverId);
+    const c = row && dec(row.data_enc);
+    return c ? { manual: !!c.manual, clientId: c.manual ? c.clientId : null, hasSecret: !!c.clientSecret, redirectUri: c.redirectUri, issuer: c.issuer } : null;
+  }
+
   const connected = (userId, serverId) => !!(userId && db.prepare('SELECT 1 FROM mcp_oauth_tokens WHERE user_id=? AND server_id=?').get(userId, serverId));
   function disconnect(userId, serverId) {
     db.prepare('DELETE FROM mcp_oauth_tokens WHERE user_id=? AND server_id=?').run(userId, serverId);
@@ -136,7 +159,7 @@ function createMcpOAuth({ db, secrets, fetchImpl = globalThis.fetch, urlAllowed,
     db.prepare('DELETE FROM mcp_oauth_clients WHERE server_id=?').run(serverId);
   }
 
-  return { discover, start, finish, tokenFor, connected, disconnect, forget };
+  return { discover, start, finish, tokenFor, connected, disconnect, forget, setClient, clientInfo };
 }
 
 module.exports = { createMcpOAuth };

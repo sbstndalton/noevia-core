@@ -3176,7 +3176,7 @@ async function handleRequestScoped(req, res) {
       const sv = MCP_SERVERS.find((x) => x.id === oauthConnect[1] && x.auth === 'oauth');
       if (!sv) return json(res, 404, { error: 'No such sign-in server.' });
       try { return json(res, 200, { signIn: await mcpOAuth.start({ userId: authn.user.id, serverId: sv.id, serverUrl: sv.url, challenge: (await probeMcpAuth(sv.url)).challenge }) }); }
-      catch (e) { return json(res, e.status || 502, { error: e.message }); }
+      catch (e) { return json(res, e.status || 502, { error: e.needsClient ? 'An administrator has to finish setting this server up before anyone can sign in.' : e.message }); }
     }
     const oauthDrop = p.match(/^\/api\/mcp-oauth\/([a-z0-9-]+)$/);
     if (authn && oauthDrop && req.method === 'DELETE') { mcpOAuth.disconnect(authn.user.id, oauthDrop[1]); return json(res, 200, { ok: true }); }
@@ -3194,7 +3194,8 @@ async function handleRequestScoped(req, res) {
     // Plugins → MCP servers → Add: administrators only; the URL comes from the registry, not the client.
     if (p === '/api/admin/mcp-directory' || p.startsWith('/api/admin/mcp-directory/')) {
       if (!authn || authn.user.role !== 'admin') return json(res, 403, { error: 'Administrator required' });
-      const describe = () => directoryMcp.list().map((s) => { const st = mcpState.servers.get(s.id); return { ...s, toolCount: st?.toolCount ?? null, error: st?.error || null }; });
+      const redirectUri = `${String(authService.origin || process.env.PUBLIC_ORIGIN || '').replace(/\/$/, '')}/api/mcp-oauth/callback`;
+      const describe = () => directoryMcp.list().map((s) => { const st = mcpState.servers.get(s.id); return { ...s, toolCount: st?.toolCount ?? null, error: st?.error || null, ...(s.oauth ? { oauthClient: mcpOAuth.clientInfo(s.id), redirectUri } : {}) }; });
       if (p === '/api/admin/mcp-directory' && req.method === 'GET') return json(res, 200, { servers: describe() });
       if (p === '/api/admin/mcp-directory' && req.method === 'POST') {
         let body; try { body = await readJson(req); } catch { return json(res, 400, { error: 'invalid JSON' }); }
@@ -3220,6 +3221,8 @@ async function handleRequestScoped(req, res) {
               const signIn = await mcpOAuth.start({ userId: authn.user.id, serverId: added.id, serverUrl: item.remoteUrl, challenge: probe.challenge, purpose: 'add' });
               return json(res, 202, { signIn, server: added, servers: describe() });
             } catch (err) {
+              // The service needs an app registered by hand: keep the server and ask for the app.
+              if (err.needsClient) return json(res, 202, { needsClient: true, issuer: err.issuer, redirectUri, server: added, servers: describe() });
               directoryMcp.remove(added.id, authn.user.id); mcpOAuth.forget(added.id); syncDirectoryServers();
               return json(res, 422, { error: `The server needs a sign-in noevia cannot do: ${err.message}` });
             }
@@ -3248,6 +3251,20 @@ async function handleRequestScoped(req, res) {
         syncDirectoryServers();
         await discoverMcpTools(true);
         return json(res, 200, { servers: describe() });
+      }
+      // A hand-registered app for a sign-in service that does not let apps register themselves.
+      const appRoute = p.match(/^\/api\/admin\/mcp-directory\/([a-z0-9-]+)\/oauth-client$/);
+      if (appRoute && req.method === 'PUT') {
+        const sv = MCP_SERVERS.find((x) => x.id === appRoute[1] && x.auth === 'oauth');
+        if (!sv) return json(res, 404, { error: 'No such sign-in server.' });
+        let body; try { body = await readJson(req); } catch { return json(res, 400, { error: 'invalid JSON' }); }
+        try {
+          const challenge = (await probeMcpAuth(sv.url)).challenge;
+          await mcpOAuth.setClient({ serverId: sv.id, serverUrl: sv.url, clientId: body?.clientId, clientSecret: body?.clientSecret, challenge });
+          authService.audit('mcp.oauth.client', authn.user.id, authn.user.id, { serverId: sv.id });
+          const signIn = await mcpOAuth.start({ userId: authn.user.id, serverId: sv.id, serverUrl: sv.url, challenge, purpose: 'add' });
+          return json(res, 200, { signIn, servers: describe() });
+        } catch (e) { return json(res, e.status || 502, { error: e.message }); }
       }
       const del = p.match(/^\/api\/admin\/mcp-directory\/([a-z0-9-]+)$/);
       if (del && req.method === 'DELETE') {

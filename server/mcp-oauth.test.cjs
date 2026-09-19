@@ -51,7 +51,7 @@ test('full sign-in: discovery, registration, PKCE, resource indicator, per-user 
 });
 
 test('refuses services without registration or S256, and non-public endpoints', async () => {
-  await assert.rejects(make(fakeAs({ registration: false })).oauth.start({ userId: 'u', serverId: 's', serverUrl: 'https://mcp.example/mcp' }), /register themselves/);
+  await assert.rejects(make(fakeAs({ registration: false })).oauth.start({ userId: 'u', serverId: 's', serverUrl: 'https://mcp.example/mcp' }), /registered by hand/);
   await assert.rejects(make(fakeAs({ s256: false })).oauth.start({ userId: 'u', serverId: 's', serverUrl: 'https://mcp.example/mcp' }), /PKCE/);
   const as = fakeAs();
   const blocked = createMcpOAuth({ db: new Database(':memory:'), secrets, fetchImpl: as.fetchImpl, urlAllowed: async (u) => !u.startsWith('https://auth.example'), redirectUri: () => 'https://n/cb' });
@@ -69,4 +69,25 @@ test('a wrong PKCE verifier gets no token, and tokens are stored encrypted', asy
   const a = authorize(as, url2); await oauth.finish({ userId: 'u1', state: a.state, code: a.code });
   assert.ok(!JSON.stringify(db.prepare('SELECT * FROM mcp_oauth_tokens').all()).includes('AT-1'));
   oauth.forget('s'); assert.equal(oauth.connected('u1', 's'), false);
+});
+
+test('a service without self-registration uses an app an administrator registered by hand', async () => {
+  const as = fakeAs({ registration: false }); const db = new Database(':memory:');
+  const oauth = createMcpOAuth({ db, secrets, fetchImpl: as.fetchImpl, urlAllowed: async (u) => u.startsWith('https://'), redirectUri: () => 'https://noevia.example/api/mcp-oauth/callback' });
+  const err = await oauth.start({ userId: 'u1', serverId: 's', serverUrl: 'https://mcp.example/mcp' }).catch((e) => e);
+  assert.equal(err.needsClient, true); assert.equal(err.status, 409); assert.equal(err.issuer, 'https://auth.example');
+  await assert.rejects(oauth.setClient({ serverId: 's', serverUrl: 'https://mcp.example/mcp', clientId: 'has space' }), /one word/);
+  await oauth.setClient({ serverId: 's', serverUrl: 'https://mcp.example/mcp', clientId: 'manual-app', clientSecret: 'MANUAL-SECRET' });
+  const info = oauth.clientInfo('s');
+  assert.deepEqual(info, { manual: true, clientId: 'manual-app', hasSecret: true, redirectUri: 'https://noevia.example/api/mcp-oauth/callback', issuer: 'https://auth.example' });
+  assert.ok(!JSON.stringify(db.prepare('SELECT * FROM mcp_oauth_clients').all()).includes('MANUAL-SECRET'), 'secret stored encrypted');
+  const url = await oauth.start({ userId: 'u1', serverId: 's', serverUrl: 'https://mcp.example/mcp' });
+  assert.equal(new URL(url).searchParams.get('client_id'), 'manual-app');
+  const a = authorize(as, url); await oauth.finish({ userId: 'u1', state: a.state, code: a.code });
+  assert.equal(await oauth.tokenFor('u1', 's'), 'AT-1');
+  assert.equal(as.seen.lastToken.client_id, 'manual-app');
+  // Replacing the app signs everyone out of the old one.
+  await oauth.setClient({ serverId: 's', serverUrl: 'https://mcp.example/mcp', clientId: 'manual-app-2' });
+  assert.equal(oauth.connected('u1', 's'), false);
+  assert.equal(oauth.clientInfo('s').hasSecret, false);
 });
