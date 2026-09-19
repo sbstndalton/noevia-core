@@ -249,6 +249,15 @@ function managerFetch(rest, method = 'GET') {
 
 // Model files that appear in the models folder get safe defaults on their own (roadmap C3).
 // Needs the model management service; the engine's own preset file is edited through it.
+// Last model-folder scan, served instantly by the model-manager proxy (see there).
+const modelScanCache = new Map();
+let modelScanInflight = null;
+function refreshModelScan() {
+  if (modelScanInflight || !process.env.MODEL_LOADER_URL) return;
+  modelScanInflight = fetchJson(`${process.env.MODEL_LOADER_URL.replace(/\/+$/, '')}/api/v1/models`, { method: 'GET', headers: { 'Content-Type': 'application/json', ...(process.env.MODEL_LOADER_TOKEN ? { 'X-Model-Loader-Token': process.env.MODEL_LOADER_TOKEN } : {}) } })
+    .then((r) => { if (r?.ok && r.body && typeof r.body === 'object') modelScanCache.set('models', { at: Date.now(), body: r.body }); })
+    .catch(() => undefined).finally(() => { modelScanInflight = null; });
+}
 const folderSync = process.env.MODEL_LOADER_URL ? require('./model-folder-sync.cjs').createFolderSync({
   stateFile: path.join(DATA_DIR, 'model-folder-sync.json'),
   listUnregistered: async () => {
@@ -4439,6 +4448,8 @@ async function handleRequestScoped(req, res) {
       });
     }
 
+    // A change to the models anywhere else (load, unload, download, delete) also invalidates the scan.
+    if (p.startsWith('/api/models/') && !['GET','HEAD','OPTIONS'].includes(req.method || 'GET')) modelScanCache.clear();
     // Model manager (folded-in Model Loader) JSON API, administrators only.
     if (p.startsWith('/api/model-manager/')) {
       if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for model management'});
@@ -4447,6 +4458,13 @@ async function handleRequestScoped(req, res) {
       if(!/^[\w./%:+@-]*$/.test(rest)||rest.includes('..'))return json(res,400,{error:'Invalid path'});
       const method=req.method||'GET';
       const body=['GET','HEAD','DELETE'].includes(method)?undefined:await readBody(req,1024*1024);
+      // The file scan reads every model header from disk (~2 s on daserver). Serve the last scan at
+      // once and refresh it behind the response; any change through this API drops it.
+      if(method!=='GET')modelScanCache.clear();
+      if(method==='GET'&&rest==='models'&&!url.search){
+        const hit=modelScanCache.get('models');
+        if(hit){res.setHeader('Cache-Control','no-store');res.setHeader('X-Model-Scan','cached');if(Date.now()-hit.at>5000)refreshModelScan();return json(res,200,hit.body);}
+      }
       const result=await fetchJson(`${process.env.MODEL_LOADER_URL.replace(/\/+$/,'')}/api/v1/${rest}${url.search}`,{method,headers:{'Content-Type':'application/json',...(process.env.MODEL_LOADER_TOKEN?{'X-Model-Loader-Token':process.env.MODEL_LOADER_TOKEN}:{})},body},10*60*1000).catch(()=>null);
       res.setHeader('Cache-Control','no-store');
       if(!result)return json(res,502,{error:'The model management service is not responding.'});
@@ -4455,6 +4473,7 @@ async function handleRequestScoped(req, res) {
       if(result.ok&&method==='GET'&&/^benchmark\/runs\/\d+$/.test(rest)&&modelManager.recordEvidence){
         for(const {model,record} of require('./benchmark-evidence.cjs').throughputRecords(detail))modelManager.recordEvidence(model,record).catch(()=>undefined);
       }
+      if(result.ok&&method==='GET'&&rest==='models'&&!url.search)modelScanCache.set('models',{at:Date.now(),body:detail});
       return json(res,result.status,result.ok?detail:{error:detail.detail||detail.error||'Model management request failed.'});
     }
 
