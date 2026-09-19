@@ -22,7 +22,9 @@ function inspect(file, project = {}) {
       const match = /^([a-z_][\w-]*):[ \t]*(.*)$/i.exec(line);
       if (!match) throw Error('Use one scalar name: value per frontmatter line.');
       const key = match[1].toLowerCase();
-      if (!['name', 'description', 'version', 'requires'].includes(key)) throw Error(`Unsupported metadata field: ${key}`);
+      // The Agent Skills spec's plain-text fields are accepted (license, compatibility,
+      // allowed-tools) so published skills install; they are informational here and grant nothing.
+      if (!['name', 'description', 'version', 'requires', 'license', 'compatibility', 'allowed-tools'].includes(key)) throw Error(`Unsupported metadata field: ${key}`);
       if (owns(meta, key)) throw Error(`Duplicate metadata field: ${key}`);
       let value = match[2].trim();
       if (/^[\[\]{|>&*!]/.test(value)) throw Error('Lists, mappings, multiline values and YAML directives are not supported.');
@@ -33,7 +35,7 @@ function inspect(file, project = {}) {
       meta[key] = value;
     }
     if (!meta.name || !meta.description) throw Error('A non-empty name and description are required.');
-    if (meta.name.length > 160 || meta.description.length > 500 || (meta.version || '').length > 80) throw Error('Metadata exceeds its length limit (name 160, description 500, version 80).');
+    if (meta.name.length > 160 || meta.description.length > 1024 || (meta.version || '').length > 80 || (meta.license || '').length > 500) throw Error('Metadata exceeds its length limit (name 160, description 1024, version 80, license 500).');
     const requires = (meta.requires || '').split(',').map(x => x.trim()).filter(Boolean);
     if (requires.length > 12 || requires.some(x => !/^[a-z][a-z0-9-]{0,79}$/.test(x))) throw Error('requires must be a comma-separated list of existing toolbox IDs.');
     Object.assign(result, { name: meta.name, description: meta.description, version: meta.version || '', requires, valid: true });

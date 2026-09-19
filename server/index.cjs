@@ -764,6 +764,8 @@ const connectorRoutes = require('./routes/connectors.cjs').createConnectorRoutes
 });
 // Account-level connectors are not a project choice: they join every chat of an account that
 // connected them, and never appear in a project's toolbox picker.
+// Skill auto-loading shares the router's switch and embedding model (chat-skill-routing.cjs).
+const chatSkillRouter = require('./chat-skill-routing.cjs').createChatSkillRouter({ enabled: () => features.enabled('toolRouter'), embed: (texts) => rag.embed(texts) });
 const CONNECTOR_BOXES = new Set(['gdrive']);
 function connectedBoxes(user) { return user && driveTools.connected(user) ? ['gdrive'] : []; }
 
@@ -1577,6 +1579,8 @@ function toolboxOffered(id) {
   // core is built-in and always safe, so it is never filtered out — a
   // deployment that named only MCP boxes should not lose the clock.
   if (id === 'core') return true;
+  // An administrator adding a directory server is the opt-in; ENABLED_TOOLBOXES curates the operator's boxes.
+  if (id.startsWith('dir-')) return true;
   return !ENABLED_TOOLBOXES || ENABLED_TOOLBOXES.has(id);
 }
 
@@ -1644,8 +1648,24 @@ const MCP_INTERNAL_SERVER = MCP_SERVERS.find((sv) => sv.auth === 'internal') || 
 // credential-disclosure bug.
 const MCP_INTERNAL_KEY = secretStore.derive('mcp-internal-token');
 
+// Servers an administrator added from the public registry join the operator's list (after it,
+// so an operator's server keeps any tool name both offer). See directory-mcp.cjs.
+const directoryMcp = require('./directory-mcp.cjs').createDirectoryMcp({ db: authService.db, audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) });
+for (const sv of directoryMcp.asServers()) MCP_SERVERS.push(sv);
 const MCP_SERVER_BY_ID = new Map(MCP_SERVERS.map((sv) => [sv.id, sv]));
-const MCP_ENABLED = MCP_SERVERS.length > 0;
+let MCP_ENABLED = MCP_SERVERS.length > 0;
+// QA only: NOEVIA_QA_ALLOW_LOOPBACK_MCP lets a synthetic server on 127.0.0.1 stand in for a public one.
+async function directoryUrlAllowed(url) {
+  if (process.env.NOEVIA_QA_ALLOW_LOOPBACK_MCP === '1' && /^https?:\/\/127\.0\.0\.1:\d+\//.test(url)) return true;
+  return require('./ssrf.cjs').isPublicUrl(url);
+}
+function syncDirectoryServers() {
+  for (let i = MCP_SERVERS.length - 1; i >= 0; i--) if (MCP_SERVERS[i].directory) MCP_SERVERS.splice(i, 1);
+  for (const sv of directoryMcp.asServers()) MCP_SERVERS.push(sv);
+  MCP_SERVER_BY_ID.clear();
+  for (const sv of MCP_SERVERS) MCP_SERVER_BY_ID.set(sv.id, sv);
+  MCP_ENABLED = MCP_SERVERS.length > 0;
+}
 
 // Being unconfigured is a healthy state, but it is indistinguishable from a
 // broken one from the outside: a curated box that loses every tool is not
@@ -1681,6 +1701,9 @@ async function discoverOneServer(server) {
   // Discovery lists the catalogue only. A per-USER credential is attached at
   // call time instead (see mcpAuthHeaders), but a static service token has to
   // be present here or the server has nothing to list.
+  // A directory server is someone else's: re-check at every discovery that its name still points
+  // at a public address, so a DNS change cannot turn it into a probe of the home network.
+  if (server.directory && !(await directoryUrlAllowed(server.url))) throw new Error('its address no longer resolves to a public host');
   const headers = mcpDiscoveryAuth(server);
   const { session } = await mcp.connect(server.url, headers);
   const discovered = await mcp.listTools(server.url, session, headers);
@@ -1696,9 +1719,13 @@ async function discoverOneServer(server) {
 }
 
 async function discoverMcpTools(force = false) {
-  if (!MCP_ENABLED) return mcpState;
+  // No servers left (the last directory server was just removed): nothing may stay offered.
+  if (!MCP_ENABLED) { mcpState.tools = new Map(); mcpState.boxes = []; mcpState.servers = new Map(); mcpState.error = null; return mcpState; }
   const fresh = Date.now() - mcpState.discoveredAt < MCP_DISCOVERY_TTL_MS;
   if (!force && fresh && mcpState.boxes.length) return mcpState;
+  // A forced refresh (a server was just added or removed) must not reuse a discovery that
+  // started before the change: wait for it, then discover again with the new list.
+  if (mcpState.inflight && force) { await mcpState.inflight.catch(() => undefined); return discoverMcpTools(true); }
   if (mcpState.inflight) return mcpState.inflight;
   mcpState.inflight = (async () => {
     try {
@@ -1735,7 +1762,9 @@ async function discoverMcpTools(force = false) {
 
       // A box binds only tools from its own server, so a rogue or merely careless second
       // server cannot inject a tool into a curated box. See mcp-boxes.cjs.
-      const boxes = bindBoxes({ manifest: MCP_TOOLBOX_MANIFEST, perServer, servers, warn: (line) => console.warn(line) });
+      // Each directory server becomes one box holding every tool it offers (and only its own).
+      const directoryBoxes = MCP_SERVERS.filter((sv) => sv.directory).map((sv) => directoryMcp.boxFor(sv, (perServer.get(sv.id) || new Map()).keys()));
+      const boxes = bindBoxes({ manifest: [...MCP_TOOLBOX_MANIFEST, ...directoryBoxes], perServer, servers, warn: (line) => console.warn(line) });
 
       mcpState.tools = byName;
       mcpState.boxes = boxes;
@@ -2070,6 +2099,7 @@ async function executeMcpToolCall(name, args) {
     }
   }
 
+  if (server.directory && !(await directoryUrlAllowed(server.url))) return `ERROR: ${name} was not run: its server's address no longer resolves to a public host.`;
   try {
     const { session } = await mcp.connect(server.url, auth);
     const result = await mcp.callTool(server.url, session, name, args, auth);
@@ -2437,6 +2467,7 @@ async function handleChatInner(req, res, body, authn, preparation) {
     }
   }
 
+  let autoSkills = [];
   if (project) project = require('./instruction-skills.cjs').snapshot(project); // Pin reviewed skill bodies/config for this exchange.
 
   // Project knowledge files: RAG retrieval replaces whole-file pasting (step 10).
@@ -2470,6 +2501,14 @@ async function handleChatInner(req, res, body, authn, preparation) {
         `Available skills (load the full file with the read_project_file tool when a task matches; do not guess their contents):\n` +
           require('./skill-index.cjs').formatSkillIndex(skills),
       );
+      // L1 up front when one skill clearly matches this message, so a small model does not have
+      // to remember to fetch it. Only reviewed, enabled skills from the pinned snapshot.
+      const picked = await chatSkillRouter.select(skills, message);
+      if (picked.loaded.length) {
+        autoSkills = picked.loaded;
+        sysParts.push(require('./chat-skill-routing.cjs').skillBlock(autoSkills));
+        console.log(`[skills] auto-loaded ${autoSkills.map((s) => s.file).join(', ')}`);
+      }
     }
   }
 
@@ -2706,6 +2745,7 @@ async function handleChatInner(req, res, body, authn, preparation) {
   // Scope shown on the reply ("Using: Drive, Tasks"), so a wrong pick is visible and reportable.
   const boxLabel = (id) => allToolboxes().find((b) => b.id === id)?.label || id;
   send({ type: 'tools_scope', text: routing.narrowed ? routing.ids.map(boxLabel).join(', ') : '' });
+  if (autoSkills.length) send({ type: 'skills_scope', text: autoSkills.map((s) => s.name).join(', ') });
   // When routing narrowed the list, the model may ask once for the rest. Widening only restores
   // the project's own selection, and every write still goes through the approval gate.
   let widened = false;
@@ -3093,6 +3133,38 @@ async function handleRequestScoped(req, res) {
     if (authn && await offsiteRoutes(req, res, { path: p, authn })) return;
     if (authn && await connectorRoutes(req, res, { path: p, authn })) return;
     if (authn && await pluginDirectoryRoutes(req, res, { path: p, authn })) return;
+    // Plugins → MCP servers → Add: administrators only; the URL comes from the registry, not the client.
+    if (p === '/api/admin/mcp-directory' || p.startsWith('/api/admin/mcp-directory/')) {
+      if (!authn || authn.user.role !== 'admin') return json(res, 403, { error: 'Administrator required' });
+      const describe = () => directoryMcp.list().map((s) => { const st = mcpState.servers.get(s.id); return { ...s, toolCount: st?.toolCount ?? null, error: st?.error || null }; });
+      if (p === '/api/admin/mcp-directory' && req.method === 'GET') return json(res, 200, { servers: describe() });
+      if (p === '/api/admin/mcp-directory' && req.method === 'POST') {
+        let body; try { body = await readJson(req); } catch { return json(res, 400, { error: 'invalid JSON' }); }
+        let item;
+        try { item = await require('./routes/plugin-directory.cjs').findRegistryServer(body?.registryName); } catch (e) { return json(res, e.status || 502, { error: e.message }); }
+        if (!item) return json(res, 404, { error: 'That server is not in the MCP registry.' });
+        if (!item.installable) return json(res, 422, { error: item.notInstallable || 'That server cannot be added.' });
+        if (!(await directoryUrlAllowed(item.remoteUrl))) return json(res, 422, { error: 'That server’s address is not a public host.' });
+        // Prove it answers before saving: an entry that cannot list tools would only be a dead box.
+        let found;
+        try { found = await discoverOneServer({ id: directoryMcp.idFor(item.id), url: item.remoteUrl, auth: 'none', directory: true }); }
+        catch (e) { return json(res, 422, { error: `The server did not answer as an MCP server: ${String(e.message || e).slice(0, 200)}` }); }
+        if (!found.size) return json(res, 422, { error: 'The server answered but offers no tools noevia can use.' });
+        let added;
+        try { added = directoryMcp.add({ registryName: item.id, title: item.name, url: item.remoteUrl }, authn.user.id); } catch (e) { return json(res, e.status || 400, { error: e.message }); }
+        syncDirectoryServers();
+        await discoverMcpTools(true);
+        return json(res, 201, { server: { ...added, toolCount: found.size }, servers: describe() });
+      }
+      const del = p.match(/^\/api\/admin\/mcp-directory\/([a-z0-9-]+)$/);
+      if (del && req.method === 'DELETE') {
+        try { directoryMcp.remove(del[1], authn.user.id); } catch (e) { return json(res, e.status || 400, { error: e.message }); }
+        syncDirectoryServers();
+        await discoverMcpTools(true);
+        return json(res, 200, { servers: describe() });
+      }
+      return json(res, 405, { error: 'method not allowed' });
+    }
     if (authn && await webAddressRoutes(req, res, { path: p, authn })) return;
     if (authn && p.startsWith('/api/projects/') && await researchRoutes(req, res, { path: p, authn })) return;
     if (authn && p.startsWith('/api/projects/') && await codeRoutes(req, res, { path: p, authn })) return;
@@ -3620,6 +3692,28 @@ async function handleRequestScoped(req, res) {
       return json(res, 200, {skills: skills.list(project)});
     }
 
+    // Plugins → Skills → Add to project: copy one published SKILL.md into the project. It lands
+    // as "Review required" and stays off until the owner reviews and enables it.
+    const skillInstall = p.match(/^\/api\/projects\/([^/]+)\/skills\/install$/);
+    if (skillInstall && req.method === 'POST') {
+      const project = getProject(decodeURIComponent(skillInstall[1]));
+      if (!project) return json(res, 404, { error: 'no such project' });
+      let body; try { body = await readJson(req); } catch { return json(res, 400, { error: 'invalid JSON' }); }
+      let content;
+      try { content = await require('./routes/plugin-directory.cjs').fetchPublishedSkill(body?.skill); } catch (e) { return json(res, e.status || 502, { error: e.message }); }
+      const skills = require('./instruction-skills.cjs');
+      const file = { name: `${body.skill}/SKILL.md`, content };
+      const inspected = skills.inspect(file, project);
+      if (!inspected?.valid) return json(res, 422, { error: `This skill cannot be used as a project skill: ${inspected?.error || 'no skill frontmatter'}` });
+      const files = Array.isArray(project.files) ? project.files : [];
+      if (files.filter((f) => !f.source).length >= 60 && !files.some((f) => f.name === file.name)) return json(res, 409, { error: 'This project already has the maximum of 60 files.' });
+      project.files = [...files.filter((f) => f.name !== file.name), file];
+      if (project.instructionSkills) delete project.instructionSkills[file.name]; // a replaced skill needs review again
+      skills.reconcile(project);
+      project.updatedAt = Date.now();
+      currentWorkspace().saveProjects();
+      return json(res, 201, { file: file.name, skills: skills.list(project).map(({ content: _c, ...rest }) => rest) });
+    }
     const projCfg = p.match(/^\/api\/projects\/([^/]+)\/config$/);
     if (projCfg && req.method === 'POST') {
       const id = decodeURIComponent(projCfg[1]);

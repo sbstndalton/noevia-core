@@ -26,7 +26,7 @@ test('selection persists per project; missing tools are explained and never enab
  assert.deepEqual(saved.toolboxes,['core']);assert.match(skills.read(saved,saved.files[0]),/not selected: nextcloud-notes/);
 });
 test('malformed, duplicate, oversized and executable metadata cannot enable or enter ordinary sources', () => {
- for(const meta of ['name: Review','name: A\nname: B\ndescription: Duplicate','name: A\ndescription: |\n  Multi','name: A\ndescription: B\nrun: sh','name: A\ndescription: '+'x'.repeat(501)]){
+ for(const meta of ['name: Review','name: A\nname: B\ndescription: Duplicate','name: A\ndescription: |\n  Multi','name: A\ndescription: B\nrun: sh','name: A\ndescription: '+'x'.repeat(1025),'name: A\ndescription: B\nmetadata: x']){
   const p={files:[file('Body',meta)]};skills.reconcile(p);assert.equal(skills.list(p)[0].valid,false);assert.equal(skills.sources(p).length,0);assert.throws(()=>enable(p));
  }
  assert.equal(skills.inspect(file('x'.repeat(32769))).valid,false);
@@ -53,4 +53,8 @@ test('long skill reads paginate and never claim a partial body was fully loaded'
  const p=fixture();p.files[0]=file('PAGINATED-BODY '.repeat(700));skills.reconcile(p);enable(p);
  const first=skills.read(p,p.files[0],p,0,8000);assert.match(first,/Loaded part/);const offset=Number(/Continue with offset (\d+)/.exec(first)[1]);assert.ok(offset>0);assert.ok(first.length<=8000);
  assert.match(skills.read(p,p.files[0],p,offset,8000),/PAGINATED-BODY/);assert.match(skills.read(p,p.files[0],p,-1),/^ERROR/);
+});
+test('published skills with license/compatibility fields and a long description are valid', () => {
+  const p={files:[file('Body','name: pdf\ndescription: '+'d'.repeat(900)+'\nlicense: Proprietary. LICENSE.txt has complete terms\ncompatibility: any')]};skills.reconcile(p);
+  assert.equal(skills.list(p)[0].valid,true,skills.list(p)[0].error);
 });

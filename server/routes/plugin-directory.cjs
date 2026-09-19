@@ -10,6 +10,20 @@ const SOURCES = {
 };
 const TTL = 60 * 60 * 1000;
 
+// A hosted server noevia can add as-is: a streamable-HTTP remote at a fixed https URL that needs
+// no sign-in headers. Anything else (a package to run here, SSE, templated URLs, API keys) is
+// browse-only for now.
+function installable(s) {
+  const remotes = Array.isArray(s.remotes) ? s.remotes : [];
+  const usable = remotes.find((r) => r && r.type === 'streamable-http' && typeof r.url === 'string' && require('../directory-mcp.cjs').hostedUrlOk(r.url)
+    && !(Array.isArray(r.headers) && r.headers.some((h) => h && h.isRequired)));
+  if (usable) return { remoteUrl: usable.url, installable: true };
+  const why = !remotes.length ? 'Runs as a program on the server; not supported'
+    : remotes.some((r) => Array.isArray(r?.headers) && r.headers.some((h) => h?.isRequired)) ? 'Needs a sign-in key; not supported yet'
+    : 'Uses a connection type noevia does not support';
+  return { installable: false, notInstallable: why };
+}
+
 function mcpItems(body) {
   const list = Array.isArray(body?.servers) ? body.servers : [];
   const seen = new Set();
@@ -24,6 +38,7 @@ function mcpItems(body) {
     version: s.version || '',
     url: typeof s.repository?.url === 'string' && /^https:\/\//.test(s.repository.url) ? s.repository.url : (typeof s.websiteUrl === 'string' && /^https:\/\//.test(s.websiteUrl) ? s.websiteUrl : ''),
     remote: Array.isArray(s.remotes) && s.remotes.length > 0,
+    ...installable(s),
   }));
 }
 
@@ -69,4 +84,28 @@ function createPluginDirectoryRoutes({ json, fetchImpl = globalThis.fetch, now =
     }
   };
 }
-module.exports = { createPluginDirectoryRoutes, mcpItems, skillItems };
+/**
+ * Fetch one published skill's SKILL.md (only SKILL.md: scripts and assets are never fetched or
+ * run). Fixed host, validated name, 32 KiB cap, and the result must be valid skill frontmatter.
+ */
+async function fetchPublishedSkill(name, { fetchImpl = globalThis.fetch } = {}) {
+  if (!/^[a-z0-9][a-z0-9-]{0,79}$/.test(String(name || ''))) throw Object.assign(new Error('Unknown skill'), { status: 400 });
+  const r = await fetchImpl(`https://raw.githubusercontent.com/anthropics/skills/main/skills/${name}/SKILL.md`, { headers: { 'user-agent': 'noevia' }, redirect: 'error', signal: AbortSignal.timeout(8000) });
+  if (r.status === 404) throw Object.assign(new Error('That skill has no SKILL.md'), { status: 404 });
+  if (!r.ok) throw Object.assign(new Error('The skills repository could not be reached right now.'), { status: 502 });
+  const content = await r.text();
+  if (Buffer.byteLength(content) > 32768) throw Object.assign(new Error('That skill is larger than the 32 KiB limit for project skills.'), { status: 422 });
+  return content;
+}
+
+/** Look one server up in the public registry by its exact name; returns the mapped item or null. */
+async function findRegistryServer(name, { fetchImpl = globalThis.fetch } = {}) {
+  if (typeof name !== 'string' || !name || name.length > 200) return null;
+  // NOEVIA_QA_MCP_REGISTRY points the lookup at a synthetic registry in QA runs only.
+  const base = process.env.NOEVIA_QA_MCP_REGISTRY || 'https://registry.modelcontextprotocol.io';
+  const r = await fetchImpl(`${base}/v0/servers?limit=40&search=${encodeURIComponent(name)}`, { headers: { accept: 'application/json', 'user-agent': 'noevia' }, redirect: 'error', signal: AbortSignal.timeout(8000) });
+  if (!r.ok) throw Object.assign(new Error('The MCP registry could not be reached right now.'), { status: 502 });
+  return mcpItems(await r.json()).find((i) => i.id === name) || null;
+}
+
+module.exports = { createPluginDirectoryRoutes, mcpItems, skillItems, fetchPublishedSkill, findRegistryServer, installable };
