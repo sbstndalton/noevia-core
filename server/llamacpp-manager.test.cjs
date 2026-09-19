@@ -12,8 +12,9 @@ function fixture(){
 }
 test('native model lifecycle uses router endpoints and model keys',async()=>{
  const {manager,calls}=fixture();await manager.load('fixture/model:Q8_0');await manager.unload('fixture/model:Q8_0');
- assert.equal(calls[0].url,'http://synthetic-router/models/load');assert.deepEqual(JSON.parse(calls[0].options.body),{model:'fixture/model:Q8_0'});
- assert.equal(calls[2].url,'http://synthetic-router/models/unload');assert.equal(calls[0].options.headers.Authorization,'Bearer fixture-key');
+ const loadCall=calls.find(c=>c.url.endsWith('/models/load')),unloadCall=calls.find(c=>c.url.endsWith('/models/unload'));
+ assert.equal(loadCall.url,'http://synthetic-router/models/load');assert.deepEqual(JSON.parse(loadCall.options.body),{model:'fixture/model:Q8_0'});
+ assert.equal(unloadCall.url,'http://synthetic-router/models/unload');assert.equal(loadCall.options.headers.Authorization,'Bearer fixture-key');
  assert.equal((await manager.load('fixture/model',{save_options:true})).status,501);
 });
 test('cold model loads before live allocation check; architecture maximum is not used',async()=>{
@@ -106,4 +107,20 @@ test('qualification evidence is tied to the live configuration and goes stale wh
   fs.rmSync(path.join(models,'fx','fx.gguf'));
   assert.equal((await manager.evidence('fx')).body.categories.find(c=>c.category==='context_capacity').state,'unavailable','missing file');
  }finally{fs.rmSync(root,{recursive:true,force:true});}
+});
+
+test('before a chat model loads, other chat models are unloaded but the embedding model stays',async()=>{
+ const prev=process.env.EMBEDDING_MODEL;process.env.EMBEDDING_MODEL='fixture-embed';
+ const unloaded=[];let state={'chat-a':'loaded','fixture-embed':'loaded','chat-b':'unloaded'};
+ const manager=createModelManager({fetchStream:async()=>({ok:false}),kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async(url,options)=>{
+  const path=new URL(url).pathname,body=options?.body?JSON.parse(options.body):{};
+  if(path==='/models/unload'){unloaded.push(body.model);state[body.model]='unloaded';}
+  if(path==='/models/load')state[body.model]='loaded';
+  return {ok:true,status:200,body:path==='/models'?{data:Object.entries(state).map(([id,value])=>({id,status:{value}}))}:{success:true}};
+ }});
+ try{
+  assert.equal((await manager.load('chat-b')).ok,true);
+  assert.deepEqual(unloaded,['chat-a']);assert.equal(state['fixture-embed'],'loaded');
+  await manager.makeRoomFor('chat-b',['fixture-embed']);assert.deepEqual(unloaded,['chat-a'],'nothing else to unload');
+ }finally{if(prev===undefined)delete process.env.EMBEDDING_MODEL;else process.env.EMBEDDING_MODEL=prev;}
 });

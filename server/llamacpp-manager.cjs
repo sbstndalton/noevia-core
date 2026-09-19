@@ -12,6 +12,8 @@ function nativeLabels(model) {
     ...(model.architecture?.input_modalities?.includes('image') ? ['vision'] : []),
   ];
 }
+function keepAlongside() { const e = process.env.EMBEDDING_MODEL || process.env.EMBED_MODEL || ''; return e && e !== 'default' ? [e] : []; }
+
 function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig = {}, calibrationStatePath, calibrationOptions = {}, evidenceDir, autotuneStatePath, autotuneTablePath, autotuneOptions = {} }) {
   const base = String(baseUrl || '').replace(/\/+$/, '').replace(/\/v1$/, '');
   const url = new URL(base);
@@ -66,11 +68,21 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     }
     return { ...response, body: { manager: 'llamacpp', version: null, all_models_loaded: models } };
   }
+  // The engine keeps two models so the small embedding model can sit beside the chat model
+  // (tool routing, 2026-09-19). Two CHAT models would not fit the GPU, so before a chat model is
+  // used, any other loaded model except those in `keep` is unloaded first.
+  async function makeRoomFor(model, keep = keepAlongside()) {
+    const listing = await rawModels().catch(() => null);
+    if (!listing?.ok || !Array.isArray(listing.body?.data)) return;
+    const others = listing.body.data.filter((m) => m.id !== model && !keep.includes(m.id) && ['loaded', 'loading'].includes(m.status?.value));
+    for (const m of others) await post('/models/unload', { model: m.id }, 60000).catch(() => null);
+  }
   async function load(model, options = {}, signal) {
     if (Object.keys(options).length) return unsupported('Runtime option changes; configure a native model preset');
     const leave=maintenance.enter();
     try {
       signal?.throwIfAborted();
+      await makeRoomFor(model);
       const started=await post('/models/load', { model },120000,signal);
       if(!started.ok)return started;
       // Native load acknowledges launch; readiness must be observed separately.
@@ -261,7 +273,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     kind: 'llamacpp', enabled: true, baseUrl: base, headers, request,
     capabilities: { routing: true, load: true, unload: true, download: true, deleteCached: true, runtimeOptions: false, hardware: false, presets: !!presets },
     requireEnabled() {},
-    listModels, health, load, downloads,
+    listModels, health, load, downloads, makeRoomFor,
     close:tracker.close,
     enterInference: maintenance.enter,
     getPreset: model => presets ? Promise.resolve({ok:true,status:200,body:presets.get(model)}) : unsupported('Native preset editing'),
