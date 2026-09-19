@@ -83,6 +83,7 @@ const authService = createAuth({
 });
 const features = require('./features.cjs').createFeatures({ store: require('./features.cjs').settingsStore(authService.db), audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) });
 const featureRoutes = require('./routes/features.cjs').createFeatureRoutes({ features, json, readJson });
+const pluginDirectoryRoutes = require('./routes/plugin-directory.cjs').createPluginDirectoryRoutes({ json });
 // Settings → Data: the signed-in user's conversations as a ZIP (routes/export.cjs).
 const exportRoutes = require('./routes/export.cjs').createExportRoutes({ json, workspace: () => ({ freeChats: Array.from(FREE_CHATS), projects: PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)) }), readHistory: (id) => readHistory(id), audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) });
 const retentionLists = () => ({ freeChats: Array.from(FREE_CHATS), projects: PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)) });
@@ -3067,6 +3068,7 @@ async function handleRequestScoped(req, res) {
     if (authn && await accountRoutes(req, res, { path: p, authn })) return;
     if (authn && await offsiteRoutes(req, res, { path: p, authn })) return;
     if (authn && await connectorRoutes(req, res, { path: p, authn })) return;
+    if (authn && await pluginDirectoryRoutes(req, res, { path: p, authn })) return;
     if (authn && await webAddressRoutes(req, res, { path: p, authn })) return;
     if (authn && p.startsWith('/api/projects/') && await researchRoutes(req, res, { path: p, authn })) return;
     if (authn && p.startsWith('/api/projects/') && await codeRoutes(req, res, { path: p, authn })) return;
