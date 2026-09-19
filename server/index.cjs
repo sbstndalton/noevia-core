@@ -2701,8 +2701,15 @@ async function handleChatInner(req, res, body, authn, preparation) {
   // A tool the account blocked is never offered, so the model cannot even ask for it.
   const blocked = (name) => toolPolicy.mode(chatUser?.id, name, isWriteTool(name)) === 'block';
   const resolved = resolveTools({ ...project, toolboxes: routing.routed ? routing.ids : selectedBoxes }, model, blocked);
-  const activeTools = resolved.tools;
+  let activeTools = resolved.tools;
   const allowedToolNames = new Set(activeTools.map((t) => t.function.name));
+  // Scope shown on the reply ("Using: Drive, Tasks"), so a wrong pick is visible and reportable.
+  const boxLabel = (id) => allToolboxes().find((b) => b.id === id)?.label || id;
+  send({ type: 'tools_scope', text: routing.narrowed ? routing.ids.map(boxLabel).join(', ') : '' });
+  // When routing narrowed the list, the model may ask once for the rest. Widening only restores
+  // the project's own selection, and every write still goes through the approval gate.
+  let widened = false;
+  if (routing.narrowed) activeTools = [...activeTools, { type: 'function', function: { name: 'more_tools', description: "Call this only if none of the offered tools can do the user's task. It makes all of this project's other tools available for your next step.", parameters: { type: 'object', properties: {} } } }];
   if (resolved.dropped.length) {
     // Each entry carries its own reason (count cap or token budget), so do not
     // assert a cause in the header — the two limits are independent and either
@@ -2909,6 +2916,20 @@ async function handleChatInner(req, res, body, authn, preparation) {
       roundMessages = [...roundMessages, assistantMsg];
       for (const [toolIndex, tc] of toolCalls) {
         if (chatSignal.signal.aborted) break;
+        if (tc.name === 'more_tools' && routing.narrowed) {
+          let reply = 'All of this project\'s tools are already available.';
+          if (!widened) {
+            widened = true;
+            const full = resolveTools({ ...project, toolboxes: selectedBoxes }, model, blocked).tools;
+            activeTools = full;
+            for (const t of full) allowedToolNames.add(t.function.name);
+            reply = `More tools are now available: ${full.map((t) => t.function.name).join(', ')}. Continue with the task.`;
+            send({ type: 'tools_scope', text: 'all tools' });
+          }
+          send({ type: 'tool_result', index: toolOffset + toolIndex, name: tc.name, text: reply.slice(0, 300) });
+          roundMessages.push({ role: 'tool', tool_call_id: tc.id, content: reply });
+          continue;
+        }
         const result = await runTool(tc, async (markWriteAttempt) => {
           // ── Permission gate (step 16) ──────────────────────────────────
           // Reads run straight through. A write stops here and waits for a

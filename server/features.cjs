@@ -34,7 +34,7 @@ function createFeatures({ env = process.env, store = null, audit = () => {}, reg
   const state = new Map();
   for (const [name, spec] of Object.entries(registry)) {
     const fromEnv = parseEnv(env[spec.env]);
-    let value = false;
+    let value = spec.default === true;
     let source = 'default';
     if (fromEnv !== undefined) { value = fromEnv; source = 'env'; }
     else {
