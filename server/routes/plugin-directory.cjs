@@ -13,13 +13,28 @@ const TTL = 60 * 60 * 1000;
 // A hosted server noevia can add as-is: a streamable-HTTP remote at a fixed https URL that needs
 // no sign-in headers. Anything else (a package to run here, SSE, templated URLs, API keys) is
 // browse-only for now.
+// Headers a request must never carry from a stranger's config: transport, session and identity.
+const RESERVED_HEADERS = /^(host|cookie|connection|content-length|content-type|transfer-encoding|origin|accept|mcp-session-id|mcp-protocol-version|proxy-.*|x-forwarded-.*)$/i;
+const cleanHeaders = (list) => (Array.isArray(list) ? list : []).filter((h) => h && typeof h.name === 'string').map((h) => ({
+  name: h.name, required: !!h.isRequired, secret: h.isSecret !== false,
+  description: String(h.description || '').slice(0, 300),
+  // "Bearer {api_key}" style templates: the admin types only the key.
+  template: typeof h.value === 'string' && (h.value.match(/\{[^}]+\}/g) || []).length === 1 ? h.value.slice(0, 200) : null,
+}));
+
+// A hosted server noevia can add: a streamable-HTTP remote at a fixed https URL. Sign-in headers are
+// fine when their names are plain and not reserved; the admin supplies the values when adding.
+// Anything else (a package to run here, SSE, templated URLs) is browse-only.
 function installable(s) {
   const remotes = Array.isArray(s.remotes) ? s.remotes : [];
   const usable = remotes.find((r) => r && r.type === 'streamable-http' && typeof r.url === 'string' && require('../directory-mcp.cjs').hostedUrlOk(r.url)
-    && !(Array.isArray(r.headers) && r.headers.some((h) => h && h.isRequired)));
-  if (usable) return { remoteUrl: usable.url, installable: true };
+    && cleanHeaders(r.headers).every((h) => /^[A-Za-z0-9-]{1,64}$/.test(h.name) && !RESERVED_HEADERS.test(h.name)));
+  if (usable) {
+    const headers = cleanHeaders(usable.headers);
+    return { remoteUrl: usable.url, installable: true, ...(headers.length ? { headers, needsKey: headers.some((h) => h.required) } : {}) };
+  }
   const why = !remotes.length ? 'Runs as a program on the server; not supported'
-    : remotes.some((r) => Array.isArray(r?.headers) && r.headers.some((h) => h?.isRequired)) ? 'Needs a sign-in key; not supported yet'
+    : remotes.some((r) => r?.type === 'streamable-http') ? 'Uses an address or header noevia cannot accept'
     : 'Uses a connection type noevia does not support';
   return { installable: false, notInstallable: why };
 }
@@ -108,4 +123,4 @@ async function findRegistryServer(name, { fetchImpl = globalThis.fetch } = {}) {
   return mcpItems(await r.json()).find((i) => i.id === name) || null;
 }
 
-module.exports = { createPluginDirectoryRoutes, mcpItems, skillItems, fetchPublishedSkill, findRegistryServer, installable };
+module.exports = { createPluginDirectoryRoutes, mcpItems, skillItems, fetchPublishedSkill, findRegistryServer, installable, RESERVED_HEADERS };

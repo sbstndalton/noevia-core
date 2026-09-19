@@ -1650,7 +1650,7 @@ const MCP_INTERNAL_KEY = secretStore.derive('mcp-internal-token');
 
 // Servers an administrator added from the public registry join the operator's list (after it,
 // so an operator's server keeps any tool name both offer). See directory-mcp.cjs.
-const directoryMcp = require('./directory-mcp.cjs').createDirectoryMcp({ db: authService.db, audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) });
+const directoryMcp = require('./directory-mcp.cjs').createDirectoryMcp({ db: authService.db, secrets: secretStore, audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) });
 for (const sv of directoryMcp.asServers()) MCP_SERVERS.push(sv);
 const MCP_SERVER_BY_ID = new Map(MCP_SERVERS.map((sv) => [sv.id, sv]));
 let MCP_ENABLED = MCP_SERVERS.length > 0;
@@ -1886,6 +1886,7 @@ let internalCallProject = null;
  *  identical for everyone, so this leaks nothing. Longer-lived than a call
  *  token because listTools paginates, and harmless because it cannot act. */
 function mcpDiscoveryAuth(server) {
+  if (server && server.auth === 'directory') return server.pendingHeaders || directoryMcp.headersFor(server.id);
   if (server && server.auth === 'internal') {
     return { Authorization: `Bearer ${mcpInternal.mintToken(MCP_INTERNAL_KEY, { discovery: true, ttlMs: 120000 })}` };
   }
@@ -2084,7 +2085,9 @@ async function executeMcpToolCall(name, args) {
   // somebody else's service, so only a server the operator marked
   // auth=nextcloud gets it — and then only if the origin allowlist agrees.
   let auth = null;
-  if (server.auth === 'bearer') {
+  if (server.auth === 'directory') {
+    auth = directoryMcp.headersFor(server.id);
+  } else if (server.auth === 'bearer') {
     auth = mcpStaticAuth(server);
     if (!auth) return `ERROR: ${name} needs ${server.tokenEnv}, which is not configured on this deployment.`;
   } else if (server.auth === 'internal') {
@@ -3147,14 +3150,35 @@ async function handleRequestScoped(req, res) {
         if (!(await directoryUrlAllowed(item.remoteUrl))) return json(res, 422, { error: 'That server’s address is not a public host.' });
         // Prove it answers before saving: an entry that cannot list tools would only be a dead box.
         let found;
-        try { found = await discoverOneServer({ id: directoryMcp.idFor(item.id), url: item.remoteUrl, auth: 'none', directory: true }); }
-        catch (e) { return json(res, 422, { error: `The server did not answer as an MCP server: ${String(e.message || e).slice(0, 200)}` }); }
+        let pendingHeaders;
+        try { pendingHeaders = require('./directory-mcp.cjs').checkHeaderValues(item.headers || [], body.headers || {}); } catch (e) { return json(res, e.status || 400, { error: e.message }); }
+        const hasKey = Object.keys(pendingHeaders).length > 0;
+        try { found = await discoverOneServer({ id: directoryMcp.idFor(item.id), url: item.remoteUrl, auth: hasKey ? 'directory' : 'none', directory: true, pendingHeaders }); }
+        catch (e) { return json(res, 422, { error: `${hasKey ? 'The server did not accept that key, or' : 'The server'} did not answer as an MCP server: ${String(e.message || e).slice(0, 200)}` }); }
         if (!found.size) return json(res, 422, { error: 'The server answered but offers no tools noevia can use.' });
         let added;
-        try { added = directoryMcp.add({ registryName: item.id, title: item.name, url: item.remoteUrl }, authn.user.id); } catch (e) { return json(res, e.status || 400, { error: e.message }); }
+        try { added = directoryMcp.add({ registryName: item.id, title: item.name, url: item.remoteUrl, declaredHeaders: item.headers || [], headerValues: body.headers || {} }, authn.user.id); } catch (e) { return json(res, e.status || 400, { error: e.message }); }
         syncDirectoryServers();
         await discoverMcpTools(true);
         return json(res, 201, { server: { ...added, toolCount: found.size }, servers: describe() });
+      }
+      // Change a server's key: checked against the server before it replaces the old one.
+      const keys = p.match(/^\/api\/admin\/mcp-directory\/([a-z0-9-]+)\/keys$/);
+      if (keys && req.method === 'PUT') {
+        const row = directoryMcp.list().find((s) => s.id === keys[1]);
+        if (!row) return json(res, 404, { error: 'No such server.' });
+        let body; try { body = await readJson(req); } catch { return json(res, 400, { error: 'invalid JSON' }); }
+        let item;
+        try { item = await require('./routes/plugin-directory.cjs').findRegistryServer(row.registryName); } catch (e) { return json(res, e.status || 502, { error: e.message }); }
+        const declared = item?.headers || [];
+        let pendingHeaders;
+        try { pendingHeaders = require('./directory-mcp.cjs').checkHeaderValues(declared, body.headers || {}); } catch (e) { return json(res, e.status || 400, { error: e.message }); }
+        try { await discoverOneServer({ id: row.id, url: row.url, auth: 'directory', directory: true, pendingHeaders }); }
+        catch (e) { return json(res, 422, { error: `The server did not accept that key: ${String(e.message || e).slice(0, 200)}` }); }
+        try { directoryMcp.setKeys(row.id, declared, body.headers || {}, authn.user.id); } catch (e) { return json(res, e.status || 400, { error: e.message }); }
+        syncDirectoryServers();
+        await discoverMcpTools(true);
+        return json(res, 200, { servers: describe() });
       }
       const del = p.match(/^\/api\/admin\/mcp-directory\/([a-z0-9-]+)$/);
       if (del && req.method === 'DELETE') {

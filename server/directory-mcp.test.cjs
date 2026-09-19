@@ -19,10 +19,29 @@ test('add, list and remove; only https; no duplicates', () => {
   assert.deepEqual(dir.list(), []);
 });
 
-test('only hosted streamable-HTTP servers without required sign-in are installable', () => {
+test('hosted streamable-HTTP servers are installable, including ones that need a key', () => {
   assert.deepEqual(installable({ remotes: [{ type: 'streamable-http', url: 'https://a.example/mcp' }] }), { remoteUrl: 'https://a.example/mcp', installable: true });
   assert.equal(installable({ packages: [{}] }).installable, false);
-  assert.match(installable({ remotes: [{ type: 'streamable-http', url: 'https://a.example/mcp', headers: [{ name: 'Authorization', isRequired: true }] }] }).notInstallable, /sign-in/);
+  const keyed = installable({ remotes: [{ type: 'streamable-http', url: 'https://a.example/mcp', headers: [{ name: 'Authorization', isRequired: true, isSecret: true, value: 'Bearer {api_key}', description: 'Your API key' }] }] });
+  assert.equal(keyed.installable, true);assert.equal(keyed.needsKey, true);
+  assert.deepEqual(keyed.headers, [{ name: 'Authorization', required: true, secret: true, description: 'Your API key', template: 'Bearer {api_key}' }]);
+  for (const bad of ['Cookie', 'Host', 'mcp-session-id', 'X-Forwarded-For', 'bad name']) assert.equal(installable({ remotes: [{ type: 'streamable-http', url: 'https://a.example/mcp', headers: [{ name: bad, isRequired: true }] }] }).installable, false, bad);
   assert.equal(installable({ remotes: [{ type: 'sse', url: 'https://a.example/sse' }] }).installable, false);
   assert.equal(installable({ remotes: [{ type: 'streamable-http', url: 'https://{tenant}.example/mcp' }] }).installable, false);
+});
+
+test('keys are encrypted, never listed, templated, single-line, and replaceable', () => {
+  const secrets = { encrypt: (v) => 'enc:' + Buffer.from(v).toString('base64'), decrypt: (v) => Buffer.from(v.slice(4), 'base64').toString() };
+  const db = new Database(':memory:');
+  const dir = createDirectoryMcp({ db, secrets });
+  const declared = [{ name: 'Authorization', required: true, secret: true, template: 'Bearer {api_key}' }, { name: 'X-Region', required: false, secret: false, template: null }];
+  assert.throws(() => dir.add({ registryName: 'k', title: 'k', url: 'https://k.example/mcp', declaredHeaders: declared, headerValues: {} }), /Enter Authorization/);
+  assert.throws(() => dir.add({ registryName: 'k', title: 'k', url: 'https://k.example/mcp', declaredHeaders: declared, headerValues: { Authorization: 'a\nb' } }), /single line/);
+  const s = dir.add({ registryName: 'k', title: 'k', url: 'https://k.example/mcp', declaredHeaders: declared, headerValues: { Authorization: 'SECRET-1', Evil: 'x' } });
+  assert.deepEqual(dir.headersFor(s.id), { Authorization: 'Bearer SECRET-1' }, 'only declared names; template applied');
+  assert.ok(!JSON.stringify(dir.list()).includes('SECRET-1'));assert.deepEqual(dir.list()[0].keyHeaders, ['Authorization']);
+  assert.ok(!JSON.stringify(db.prepare('SELECT * FROM directory_mcp_servers').all()).includes('SECRET-1'), 'stored encrypted');
+  assert.equal(dir.asServers()[0].auth, 'directory');
+  dir.setKeys(s.id, declared, { Authorization: 'SECRET-2' });
+  assert.deepEqual(dir.headersFor(s.id), { Authorization: 'Bearer SECRET-2' });
 });
