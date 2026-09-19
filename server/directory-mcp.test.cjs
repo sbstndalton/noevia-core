@@ -45,3 +45,23 @@ test('keys are encrypted, never listed, templated, single-line, and replaceable'
   dir.setKeys(s.id, declared, { Authorization: 'SECRET-2' });
   assert.deepEqual(dir.headersFor(s.id), { Authorization: 'Bearer SECRET-2' });
 });
+
+test('personal servers keep one key per account and no shared key', () => {
+  const secrets = { encrypt: (v) => 'enc:' + Buffer.from(v).toString('base64'), decrypt: (v) => Buffer.from(v.slice(4), 'base64').toString() };
+  const db = new Database(':memory:');
+  const dir = createDirectoryMcp({ db, secrets });
+  const declared = [{ name: 'Authorization', required: true, secret: true, template: 'Bearer {api_key}', description: 'Your key' }];
+  const s = dir.add({ registryName: 'p', title: 'P', url: 'https://p.example/mcp', declaredHeaders: declared, headerValues: { Authorization: 'ADMIN-KEY' }, personal: true }, 'admin');
+  assert.equal(dir.asServers()[0].auth, 'personal');
+  assert.deepEqual(dir.headersFor(s.id), {}, 'no shared key');
+  assert.deepEqual(dir.userHeadersFor('admin', s.id), { Authorization: 'Bearer ADMIN-KEY' });
+  assert.deepEqual(dir.userHeadersFor('member', s.id), {});
+  assert.throws(() => dir.setUserKey('member', s.id, {}), /Enter Authorization/);
+  dir.setUserKey('member', s.id, { Authorization: 'MEMBER-KEY', Other: 'x' });
+  assert.deepEqual(dir.userHeadersFor('member', s.id), { Authorization: 'Bearer MEMBER-KEY' });
+  assert.equal(dir.hasUserKey('member', s.id), true);
+  assert.deepEqual(dir.list()[0].declaredHeaders.map((h) => h.name), ['Authorization']);
+  assert.ok(!JSON.stringify(db.prepare('SELECT * FROM directory_mcp_user_keys').all()).includes('MEMBER-KEY'), 'stored encrypted');
+  dir.clearUserKey('member', s.id); assert.equal(dir.hasUserKey('member', s.id), false);
+  dir.remove(s.id); assert.equal(db.prepare('SELECT COUNT(*) n FROM directory_mcp_user_keys').get().n, 0, 'removing the server drops every key');
+});

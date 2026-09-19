@@ -1666,7 +1666,13 @@ const mcpOAuth = require('./mcp-oauth.cjs').createMcpOAuth({
   urlAllowed: async (url) => require('./directory-mcp.cjs').hostedUrlOk(url) && directoryUrlAllowed(url),
   redirectUri: () => `${String(authService.origin || process.env.PUBLIC_ORIGIN || '').replace(/\/$/, '')}/api/mcp-oauth/callback`,
 });
-const oauthServerIds = () => new Set(MCP_SERVERS.filter((sv) => sv.auth === 'oauth').map((sv) => sv.id));
+const oauthServerIds = () => new Set(MCP_SERVERS.filter((sv) => sv.auth === 'oauth' || sv.auth === 'personal').map((sv) => sv.id));
+/** Whether this account can use a per-account server: its own sign-in or its own key. */
+function accountReady(userId, serverId) {
+  const sv = MCP_SERVERS.find((x) => x.id === serverId);
+  if (!sv) return false;
+  return sv.auth === 'oauth' ? mcpOAuth.connected(userId, serverId) : sv.auth === 'personal' ? directoryMcp.hasUserKey(userId, serverId) : true;
+}
 /** An unauthenticated initialize: tells us whether a server wants OAuth (401 + WWW-Authenticate). */
 async function probeMcpAuth(url) {
   if (!(await directoryUrlAllowed(url))) return { status: 0, challenge: '' };
@@ -1723,6 +1729,11 @@ async function discoverOneServer(server) {
   // at a public address, so a DNS change cannot turn it into a probe of the home network.
   if (server.directory && !(await directoryUrlAllowed(server.url))) throw new Error('its address no longer resolves to a public host');
   let headers = mcpDiscoveryAuth(server);
+  if (server.auth === 'personal') {
+    // The tool list is read with the key of the administrator who added the server.
+    headers = server.pendingHeaders || directoryMcp.userHeadersFor(server.addedBy, server.id);
+    if (!Object.keys(headers).length) throw new Error('waiting for the administrator who added it to enter their key');
+  }
   if (server.auth === 'oauth') {
     // The tool list is read with the sign-in of the administrator who added the server.
     const token = await mcpOAuth.tokenFor(server.addedBy, server.id);
@@ -2109,7 +2120,11 @@ async function executeMcpToolCall(name, args) {
   // somebody else's service, so only a server the operator marked
   // auth=nextcloud gets it — and then only if the origin allowlist agrees.
   let auth = null;
-  if (server.auth === 'oauth') {
+  if (server.auth === 'personal') {
+    // Each account's own key, never another's.
+    auth = directoryMcp.userHeadersFor(requestScope.getStore()?.authn?.user?.id, server.id);
+    if (!Object.keys(auth).length) return `ERROR: ${name} needs your own key for ${server.title || 'this server'}: Plugins → Connected → Add key.`;
+  } else if (server.auth === 'oauth') {
     // Each account's own sign-in, never another's.
     const token = await mcpOAuth.tokenFor(requestScope.getStore()?.authn?.user?.id, server.id);
     if (!token) return `ERROR: ${name} needs you to sign in to ${server.title || 'this server'} first: Plugins → Connected → Sign in.`;
@@ -2768,7 +2783,7 @@ async function handleChatInner(req, res, body, authn, preparation) {
   const chatUser = requestScope.getStore()?.authn?.user || null;
   const selectedBoxes = [...(Array.isArray(project && project.toolboxes) ? project.toolboxes : DEFAULT_TOOLBOXES).filter((id) => !CONNECTOR_BOXES.has(id)), ...connectedBoxes(chatUser)];
   // A sign-in server's tools reach only the accounts that signed in to it themselves.
-  { const oauthIds = oauthServerIds(); for (let k = selectedBoxes.length - 1; k >= 0; k--) if (oauthIds.has(selectedBoxes[k]) && !mcpOAuth.connected(chatUser?.id, selectedBoxes[k])) selectedBoxes.splice(k, 1); }
+  { const oauthIds = oauthServerIds(); for (let k = selectedBoxes.length - 1; k >= 0; k--) if (oauthIds.has(selectedBoxes[k]) && !accountReady(chatUser?.id, selectedBoxes[k])) selectedBoxes.splice(k, 1); }
   const routing = await chatToolRouter.select(selectedBoxes, message);
   if (routing.routed) console.log(`[tools] routed ${selectedBoxes.length} toolboxes to ${routing.ids.join(', ')}`);
   // A tool the account blocked is never offered, so the model cannot even ask for it.
@@ -3167,6 +3182,23 @@ async function handleRequestScoped(req, res) {
     if (authn && await offsiteRoutes(req, res, { path: p, authn })) return;
     if (authn && await connectorRoutes(req, res, { path: p, authn })) return;
     if (authn && await pluginDirectoryRoutes(req, res, { path: p, authn })) return;
+    // Per-account keys for directory servers the admin set to "each person uses their own key".
+    if (authn && p === '/api/mcp-keys/servers' && req.method === 'GET') {
+      return json(res, 200, { servers: directoryMcp.list().filter((s) => s.personal).map((s) => ({ id: s.id, title: s.title, headers: s.declaredHeaders, hasKey: directoryMcp.hasUserKey(authn.user.id, s.id) })) });
+    }
+    const userKey = p.match(/^\/api\/mcp-keys\/([a-z0-9-]+)$/);
+    if (authn && userKey && req.method === 'PUT') {
+      const row = directoryMcp.list().find((s) => s.id === userKey[1] && s.personal);
+      if (!row) return json(res, 404, { error: 'No such server.' });
+      let body; try { body = await readJson(req); } catch { return json(res, 400, { error: 'invalid JSON' }); }
+      let pendingHeaders;
+      try { pendingHeaders = require('./directory-mcp.cjs').checkHeaderValues(row.declaredHeaders, body?.headers || {}); } catch (e) { return json(res, e.status || 400, { error: e.message }); }
+      try { await discoverOneServer({ id: row.id, url: row.url, auth: 'directory', directory: true, pendingHeaders }); }
+      catch (e) { return json(res, 422, { error: `The server did not accept that key: ${String(e.message || e).slice(0, 200)}` }); }
+      try { directoryMcp.setUserKey(authn.user.id, row.id, body?.headers || {}); } catch (e) { return json(res, e.status || 400, { error: e.message }); }
+      return json(res, 200, { ok: true });
+    }
+    if (authn && userKey && req.method === 'DELETE') { directoryMcp.clearUserKey(authn.user.id, userKey[1]); return json(res, 200, { ok: true }); }
     // Per-account OAuth sign-in to directory servers (any signed-in account, each for itself).
     if (authn && p === '/api/mcp-oauth/servers' && req.method === 'GET') {
       return json(res, 200, { servers: MCP_SERVERS.filter((sv) => sv.auth === 'oauth').map((sv) => ({ id: sv.id, title: sv.title, connected: mcpOAuth.connected(authn.user.id, sv.id) })) });
@@ -3229,7 +3261,7 @@ async function handleRequestScoped(req, res) {
           } return json(res, 422, { error: `${hasKey ? 'The server did not accept that key, or' : 'The server'} did not answer as an MCP server: ${String(e.message || e).slice(0, 200)}` }); }
         if (!found.size) return json(res, 422, { error: 'The server answered but offers no tools noevia can use.' });
         let added;
-        try { added = directoryMcp.add({ registryName: item.id, title: item.name, url: item.remoteUrl, declaredHeaders: item.headers || [], headerValues: body.headers || {} }, authn.user.id); } catch (e) { return json(res, e.status || 400, { error: e.message }); }
+        try { added = directoryMcp.add({ registryName: item.id, title: item.name, url: item.remoteUrl, declaredHeaders: item.headers || [], headerValues: body.headers || {}, personal: hasKey && body.keyMode === 'personal' }, authn.user.id); } catch (e) { return json(res, e.status || 400, { error: e.message }); }
         syncDirectoryServers();
         await discoverMcpTools(true);
         return json(res, 201, { server: { ...added, toolCount: found.size }, servers: describe() });

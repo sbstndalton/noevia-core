@@ -37,7 +37,7 @@ function fixture({ rounds, decision = 'approve', execute, fallback = false, canc
     getProject: (id) => ({ id, model: 'synthetic-model', reasoningEffort: effort }),
     skillsIndexFor: () => skills, getProvider: () => ({ id: 'default', baseUrl: 'http://fixture.invalid', label: 'Mock' }),
     providerHeaders: () => ({}),
-    chatSkillRouter: { select: async () => ({ loaded: [] }) }, oauthServerIds: () => new Set(), mcpOAuth: { connected: () => false }, chatToolRouter: { select: async (ids) => (routedIds ? { ids: routedIds, routed: true } : { ids, routed: false }) }, DEFAULT_TOOLBOXES: ['core'],
+    chatSkillRouter: { select: async () => ({ loaded: [] }) }, oauthServerIds: () => new Set(), accountReady: () => true, mcpOAuth: { connected: () => false }, chatToolRouter: { select: async (ids) => (routedIds ? { ids: routedIds, routed: true } : { ids, routed: false }) }, DEFAULT_TOOLBOXES: ['core'],
     CONNECTOR_BOXES: new Set(['gdrive']), connectedBoxes: () => [], toolPolicy: { mode: (_user, _name, write) => (write ? 'ask' : 'allow') },
     resolveTools: (project) => { resolvedFor.push(project.toolboxes); return { tools: ['read', 'write'].map(name => ({ function: { name } })), dropped: [] }; },
     isWriteTool: name => name !== 'read',
