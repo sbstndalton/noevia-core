@@ -6,7 +6,7 @@
 // The version string is part of the extractor cache key in documents.cjs: a
 // change here re-extracts every document, which is what should happen when the
 // pipeline that produced the cached text changes.
-const VERSION = 'docling-2.129-layout-tableformer-tesseract-v1';
+const VERSION = 'docling-2.129-layout-tableformer-tesseract-v2';
 
 // Formats the worker accepts. Kept in sync with SUPPORTED in
 // services/docling/extract.py — the worker is authoritative and re-checks,
@@ -29,9 +29,15 @@ async function extractDocument(name, bytes, { url = process.env.DOCLING_BASE_URL
     redirect: 'error',
     headers: { 'Content-Type': 'application/octet-stream', 'X-Document-Name': String(name).slice(0, 200) },
     body: bytes,
-    // Matches the OCR client. A 300-page scan converting at a few seconds a
-    // page is the case this has to survive.
-    signal: AbortSignal.timeout(610000),
+    // Measured on DaServer (2 CPUs, CPU-only torch), not assumed:
+    //   scanned prose, OCR   3.4 s/page
+    //   table-heavy native   10.9 s/page  <- TableFormer, not OCR, is the cost
+    // The worker converts at most PAGE_CAP (300) pages, so the worst case this
+    // has to survive is 300 x 10.9 s ~= 55 min. The previous 610 s (~10 min)
+    // covered barely a fifth of that and would abort a large document the
+    // worker was still successfully converting, which surfaces as a retryable
+    // failure and then fails again identically on retry.
+    signal: AbortSignal.timeout(3900000),
   });
   if (!response.ok) {
     // 503 and 415 are the two a user can act on, so they say something useful;
