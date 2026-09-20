@@ -128,17 +128,23 @@ function reduceToolResult(result, opts = {}) {
       let kept = rows.length;
       // Still over after hoisting the keys: drop whole records from the end
       // rather than cutting a line in half, and say how many went.
+      //
+      // The budget has to account for the "showing N of M" note, because that
+      // note only exists when records are dropped — i.e. in exactly this
+      // branch. Measuring legend+body alone overshot the cap by the length of
+      // the note every time it fired: a real 400-record Nextcloud-shaped
+      // listing reduced to 8,037 characters against a 8,000 cap.
+      const noteFor = (n) => `[showing ${n} of ${rows.length} records; ${rows.length - n} omitted to fit. Narrow the query if you need them.]`;
+      const fits = (n, text) => legend.length + 1 + noteFor(n).length + 1 + text.length <= maxChars;
       if (legend.length + 1 + body.length > maxChars) {
         while (kept > 1) {
           kept -= 1;
           body = tabular(rows.slice(0, kept), keys, maxValueChars);
-          if (legend.length + 1 + body.length <= maxChars) break;
+          if (fits(kept, body)) break;
         }
       }
       const omitted = rows.length - kept;
-      const note = omitted
-        ? `[showing ${kept} of ${rows.length} records; ${omitted} omitted to fit. Narrow the query if you need them.]`
-        : legend;
+      const note = omitted ? noteFor(kept) : legend;
       const head = omitted ? `${legend}\n${note}` : legend;
       return { text: `${head}\n${body}`, reduced: true, note };
     }

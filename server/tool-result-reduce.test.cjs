@@ -98,3 +98,39 @@ test('a result that is already small stays byte-identical even if it is odd JSON
     assert.deepEqual(reduceToolResult(text), { text, reduced: false, note: '' });
   }
 });
+
+test('a reduced listing never exceeds the cap, including its own note', () => {
+  // Found against the deployed container, not in a fixture: a 400-record
+  // Nextcloud-shaped listing reduced to 8,037 characters against the 8,000
+  // cap. The fitting loop measured the legend and the rows but not the
+  // "showing N of M" note, which exists only when records are dropped — so
+  // the cap was exceeded in precisely the case it was there to enforce.
+  const rows = Array.from({ length: 400 }, (_, i) => ({
+    path: `/Documents/Projects/folder-${i}/report-${i}.md`,
+    fileid: 100000 + i,
+    mtime: `2026-09-${String((i % 28) + 1).padStart(2, '0')}T04:00:00Z`,
+    size: 1000 + i * 37,
+    mime: 'text/markdown',
+    owner: 'sebastian',
+    trashed: null,
+    comment: '',
+  }));
+  const out = reduceToolResult(JSON.stringify(rows));
+  assert.equal(out.reduced, true);
+  assert.match(out.note, /omitted to fit/);
+  assert.ok(out.text.length <= DEFAULT_MAX_CHARS,
+    `reduced to ${out.text.length} characters, over the ${DEFAULT_MAX_CHARS} cap`);
+});
+
+test('the cap holds across a range of row counts and widths', () => {
+  for (const count of [12, 40, 137, 400, 1500]) {
+    for (const width of [40, 200]) {
+      const rows = Array.from({ length: count }, (_, i) => ({
+        id: i, name: 'x'.repeat(width), tag: 'row',
+      }));
+      const out = reduceToolResult(JSON.stringify(rows), { maxChars: 8000 });
+      assert.ok(out.text.length <= 8000,
+        `count=${count} width=${width} produced ${out.text.length}`);
+    }
+  }
+});
