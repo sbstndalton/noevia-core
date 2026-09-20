@@ -30,6 +30,7 @@ const { AsyncLocalStorage } = require('async_hooks');
 const rag = require('./rag.cjs');
 const mcp = require('./mcp.cjs');
 const prefill = require('./prefill.cjs');
+const { reduceToolResult } = require('./tool-result-reduce.cjs');
 const { createToolExchange } = require('./tool-exchange.cjs');
 const storageClient = require('./storage-client.cjs');
 const documents = require('./documents.cjs');
@@ -2071,9 +2072,15 @@ async function executeMcpToolCall(name, args) {
     const { session } = await mcp.connect(server.url, auth);
     const result = await mcp.callTool(server.url, session, name, args, auth);
     const text = mcp.resultToText(result);
-    return text.length > TOOL_RESULT_CAP
-      ? `${text.slice(0, TOOL_RESULT_CAP)}\n…[truncated]`
-      : (text || '(the tool returned no output)');
+    if (!text) return '(the tool returned no output)';
+    // Was a blind `slice(0, TOOL_RESULT_CAP)`. A listing from the Nextcloud
+    // box is an array of near-identical objects, so most of what that slice
+    // spent the budget on was the same keys over and over. Hoisting them to a
+    // header row buys roughly twice the records for the same characters, and
+    // the cap itself is unchanged. Nothing is dropped without saying so.
+    const reduced = reduceToolResult(text, { maxChars: TOOL_RESULT_CAP });
+    if (reduced.reduced) console.log(`[tool-result] ${name}: ${text.length} → ${reduced.text.length} chars`);
+    return reduced.text;
   } catch (err) {
     // Returned, not thrown: a failed tool call is information the model can
     // act on or relay, and throwing would strand the chip with no result.
@@ -2935,7 +2942,11 @@ async function handleChatInner(req, res, body, authn, preparation) {
           return result;
         });
         send({ type: 'tool_result', index: toolOffset + toolIndex, name: tc.name, text: result.slice(0, 300) });
-        roundMessages.push({ role: 'tool', tool_call_id: tc.id, content: result });
+        // The chip above got the real result; this is the model's copy. Most
+        // tools cap themselves, so this is a no-op for them — it is here so a
+        // tool that does not cannot quietly spend the whole prefill budget.
+        const forModel = reduceToolResult(result, { maxChars: TOOL_RESULT_CAP });
+        roundMessages.push({ role: 'tool', tool_call_id: tc.id, content: forModel.text });
       }
     }
 

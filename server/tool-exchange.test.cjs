@@ -32,6 +32,9 @@ function fixture({ rounds, decision = 'approve', execute, fallback = false, canc
     require, reasoningEffort: require('./reasoning-effort.cjs'),
     AbortController, AbortSignal, TextDecoder, console, createToolExchange,
     crypto: require('node:crypto'), HISTORY_CAP: 20, DEFAULT_PROVIDER_ID: 'default',
+    // The handler compacts a tool result before the model sees it; this
+    // fixture is the handler's dependency manifest, so both names live here.
+    reduceToolResult: require('./tool-result-reduce.cjs').reduceToolResult, TOOL_RESULT_CAP: 8000,
     currentWorkspace: () => ({ userId: 'synthetic-user',dir:contextDir }),
     requestScope: { getStore: () => ({ workspace: { userId: 'synthetic-user' } }) },
     getProject: (id) => ({ id, model: 'synthetic-model', reasoningEffort: effort }),
@@ -284,4 +287,31 @@ test('account-wide custom instructions reach the system message; removing them r
   const plain = fixture({ rounds: [[]] });
   await plain.run();
   assert.doesNotMatch(JSON.stringify(plain.requests[0].messages), /British English/);
+});
+
+test('an oversized tool result is compacted for the model, and the chip still shows the real output', async () => {
+  const rows = Array.from({ length: 300 }, (_, i) => ({
+    id: i, name: `note-${i}.md`, path: `/Notes/note-${i}.md`, mime: 'text/markdown', comment: '',
+  }));
+  const raw = JSON.stringify(rows);
+  const f = fixture({ rounds: [[{ id: 'c1', name: 'read', args: '{}' }], []], execute: () => raw });
+  await f.run();
+
+  const toolMsg = f.requests[1].messages.find((m) => m.role === 'tool');
+  assert.ok(toolMsg, 'the second round carries the tool result');
+  assert.ok(toolMsg.content.length < raw.length, 'the model sees less than the raw result');
+  assert.match(toolMsg.content, /records, tab-separated/, 'and is told how to read it');
+  assert.match(toolMsg.content, /omitted because they were empty/, 'and what was dropped');
+  assert.match(toolMsg.content, /^id\tname\tpath\tmime$/m, 'keys are hoisted to one header row');
+
+  // The chip is the user's view and comes from the real result, not the
+  // model's copy — a reduction must never change what the user is shown.
+  const chip = f.events.find((e) => e.type === 'tool_result');
+  assert.equal(chip.text, raw.slice(0, 300));
+});
+
+test('a small tool result reaches the model byte-identical', async () => {
+  const f = fixture({ rounds: [[{ id: 'c1', name: 'read', args: '{}' }], []], execute: () => 'result-plain' });
+  await f.run();
+  assert.equal(f.requests[1].messages.find((m) => m.role === 'tool').content, 'result-plain');
 });
