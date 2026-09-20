@@ -3332,6 +3332,52 @@ async function handleRequestScoped(req, res) {
         await discoverMcpTools(true);
         return json(res, 200, { servers: describe() });
       }
+      // Add any MCP server by its URL (roadmap: Customize backends). Same rules as a directory
+      // server: hosted https, public address, must answer, its own toolbox, every tool asks.
+      if (p === '/api/admin/mcp-directory/custom' && req.method === 'POST') {
+        let body; try { body = await readJson(req); } catch { return json(res, 400, { error: 'invalid JSON' }); }
+        const title = String(body?.title || '').trim().slice(0, 80);
+        const url = String(body?.url || '').trim();
+        if (!title) return json(res, 400, { error: 'Give the server a name.' });
+        if (!require('./directory-mcp.cjs').hostedUrlOk(url)) return json(res, 400, { error: 'The address must be an https URL (no placeholders).' });
+        if (!(await directoryUrlAllowed(url))) return json(res, 422, { error: 'That address is not a public host.' });
+        const headerName = String(body?.headerName || '').trim();
+        const headerValue = String(body?.headerValue || '');
+        if (headerName && (!/^[A-Za-z0-9-]{1,64}$/.test(headerName) || require('./routes/plugin-directory.cjs').RESERVED_HEADERS.test(headerName))) {
+          return json(res, 400, { error: `${headerName} cannot be used as a sign-in header.` });
+        }
+        const declaredHeaders = headerName ? [{ name: headerName, required: true, secret: true, description: '', template: null }] : [];
+        let pendingHeaders;
+        try { pendingHeaders = require('./directory-mcp.cjs').checkHeaderValues(declaredHeaders, headerName ? { [headerName]: headerValue } : {}); } catch (e) { return json(res, e.status || 400, { error: e.message }); }
+        const hasKey = Object.keys(pendingHeaders).length > 0;
+        const registryName = `url:${url}`;
+        let found;
+        try { found = await discoverOneServer({ id: directoryMcp.idFor(registryName), url, auth: hasKey ? 'directory' : 'none', directory: true, pendingHeaders }); }
+        catch (e) {
+          const probe = !hasKey ? await probeMcpAuth(url) : { status: 0 };
+          if (probe.status === 401) {
+            let added;
+            try { added = directoryMcp.add({ registryName, title, url, oauth: true }, authn.user.id); } catch (err) { return json(res, err.status || 400, { error: err.message }); }
+            syncDirectoryServers();
+            try {
+              const signIn = await mcpOAuth.start({ userId: authn.user.id, serverId: added.id, serverUrl: url, challenge: probe.challenge, purpose: 'add' });
+              return json(res, 202, { signIn, server: added, servers: describe() });
+            } catch (err) {
+              if (err.needsClient) return json(res, 202, { needsClient: true, issuer: err.issuer, redirectUri, server: added, servers: describe() });
+              directoryMcp.remove(added.id, authn.user.id); mcpOAuth.forget(added.id); syncDirectoryServers();
+              return json(res, 422, { error: `The server needs a sign-in noevia cannot do: ${err.message}` });
+            }
+          }
+          return json(res, 422, { error: `${hasKey ? 'The server did not accept that key, or' : 'The server'} did not answer as an MCP server: ${String(e.message || e).slice(0, 200)}` });
+        }
+        if (!found.size) return json(res, 422, { error: 'The server answered but offers no tools noevia can use.' });
+        let added;
+        try { added = directoryMcp.add({ registryName, title, url, declaredHeaders, headerValues: headerName ? { [headerName]: headerValue } : {}, personal: hasKey && body?.keyMode === 'personal' }, authn.user.id); }
+        catch (e) { return json(res, e.status || 400, { error: e.message }); }
+        syncDirectoryServers();
+        await discoverMcpTools(true);
+        return json(res, 201, { server: { ...added, toolCount: found.size }, servers: describe() });
+      }
       // A hand-registered app for a sign-in service that does not let apps register themselves.
       const appRoute = p.match(/^\/api\/admin\/mcp-directory\/([a-z0-9-]+)\/oauth-client$/);
       if (appRoute && req.method === 'PUT') {
