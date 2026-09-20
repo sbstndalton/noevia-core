@@ -46,7 +46,7 @@ async function run({ visionModel, probeStatus = 200, descriptionStatus = 200, mi
     skillsIndexFor: () => [], getProvider: () => ({ id: 'default', baseUrl: 'http://fixture.invalid' }),
     providerHeaders: () => headers, autoRoles: () => visionModel ? { vision: visionModel } : null,
     visionDescriptions: cache, visionProbe: createVisionProbe({ fetchImpl: fetch }),
-    chatToolRouter: { select: async (ids) => ({ ids, routed: false }) }, DEFAULT_TOOLBOXES: [],
+    chatSkillRouter: { select: async () => ({ loaded: [] }) }, oauthServerIds: () => new Set(), accountReady: () => true, mcpOAuth: { connected: () => false }, chatToolRouter: { select: async (ids) => ({ ids, routed: false }) }, DEFAULT_TOOLBOXES: [],
     CONNECTOR_BOXES: new Set(['gdrive']), connectedBoxes: () => [], toolPolicy: { mode: (_user, _name, write) => (write ? 'ask' : 'allow') }, requestScope: { getStore: () => ({}) },
     resolveTools: () => ({ tools: [], dropped: [] }), isWriteTool: () => true,
   };

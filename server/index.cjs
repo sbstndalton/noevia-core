@@ -84,6 +84,7 @@ const authService = createAuth({
 });
 const features = require('./features.cjs').createFeatures({ store: require('./features.cjs').settingsStore(authService.db), audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) });
 const featureRoutes = require('./routes/features.cjs').createFeatureRoutes({ features, json, readJson });
+const pluginDirectoryRoutes = require('./routes/plugin-directory.cjs').createPluginDirectoryRoutes({ json });
 // Settings → Data: the signed-in user's conversations as a ZIP (routes/export.cjs).
 const exportRoutes = require('./routes/export.cjs').createExportRoutes({ json, workspace: () => ({ freeChats: Array.from(FREE_CHATS), projects: PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)) }), readHistory: (id) => readHistory(id), audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) });
 const retentionLists = () => ({ freeChats: Array.from(FREE_CHATS), projects: PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)) });
@@ -249,6 +250,15 @@ function managerFetch(rest, method = 'GET') {
 
 // Model files that appear in the models folder get safe defaults on their own (roadmap C3).
 // Needs the model management service; the engine's own preset file is edited through it.
+// Last model-folder scan, served instantly by the model-manager proxy (see there).
+const modelScanCache = new Map();
+let modelScanInflight = null;
+function refreshModelScan() {
+  if (modelScanInflight || !process.env.MODEL_LOADER_URL) return;
+  modelScanInflight = fetchJson(`${process.env.MODEL_LOADER_URL.replace(/\/+$/, '')}/api/v1/models`, { method: 'GET', headers: { 'Content-Type': 'application/json', ...(process.env.MODEL_LOADER_TOKEN ? { 'X-Model-Loader-Token': process.env.MODEL_LOADER_TOKEN } : {}) } })
+    .then((r) => { if (r?.ok && r.body && typeof r.body === 'object') modelScanCache.set('models', { at: Date.now(), body: r.body }); })
+    .catch(() => undefined).finally(() => { modelScanInflight = null; });
+}
 const folderSync = process.env.MODEL_LOADER_URL ? require('./model-folder-sync.cjs').createFolderSync({
   stateFile: path.join(DATA_DIR, 'model-folder-sync.json'),
   listUnregistered: async () => {
@@ -662,10 +672,12 @@ function autoRoles() {
 }
 
 function setAutoRoles(next) {
-  // `vision` is optional: a deployment with no vision-capable model should not
-  // be forced to name one, and an existing config without it keeps working.
+  // `vision` and `code` are optional: a deployment with no vision-capable or
+  // coding model should not be forced to name one, and an existing config
+  // without them keeps working.
   const roles = { fast: String(next.fast), smart: String(next.smart) };
   if (next.vision) roles.vision = String(next.vision);
+  if (next.code) roles.code = String(next.code);
   currentWorkspace().autoRoles = roles;
   currentWorkspace().saveAutoRoles();
 }
@@ -686,7 +698,7 @@ function ensureRolesLoaded() {
   const roles = autoRoles();
   if (!roles) return;
   void (async () => {
-    for (const role of ['fast', 'smart', 'vision']) {
+    for (const role of ['fast', 'smart', 'vision', 'code']) {
       if (!roles[role]) continue;
       try {
         await ensureModelLoaded(roles[role]);
@@ -762,6 +774,8 @@ const connectorRoutes = require('./routes/connectors.cjs').createConnectorRoutes
 });
 // Account-level connectors are not a project choice: they join every chat of an account that
 // connected them, and never appear in a project's toolbox picker.
+// Skill auto-loading shares the router's switch and embedding model (chat-skill-routing.cjs).
+const chatSkillRouter = require('./chat-skill-routing.cjs').createChatSkillRouter({ enabled: () => features.enabled('toolRouter'), embed: (texts) => rag.embed(texts) });
 const CONNECTOR_BOXES = new Set(['gdrive']);
 function connectedBoxes(user) { return user && driveTools.connected(user) ? ['gdrive'] : []; }
 
@@ -1576,6 +1590,8 @@ function toolboxOffered(id) {
   // core is built-in and always safe, so it is never filtered out — a
   // deployment that named only MCP boxes should not lose the clock.
   if (id === 'core') return true;
+  // An administrator adding a directory server is the opt-in; ENABLED_TOOLBOXES curates the operator's boxes.
+  if (id.startsWith('dir-')) return true;
   return !ENABLED_TOOLBOXES || ENABLED_TOOLBOXES.has(id);
 }
 
@@ -1643,8 +1659,48 @@ const MCP_INTERNAL_SERVER = MCP_SERVERS.find((sv) => sv.auth === 'internal') || 
 // credential-disclosure bug.
 const MCP_INTERNAL_KEY = secretStore.derive('mcp-internal-token');
 
+// Servers an administrator added from the public registry join the operator's list (after it,
+// so an operator's server keeps any tool name both offer). See directory-mcp.cjs.
+const directoryMcp = require('./directory-mcp.cjs').createDirectoryMcp({ db: authService.db, secrets: secretStore, audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) });
+for (const sv of directoryMcp.asServers()) MCP_SERVERS.push(sv);
 const MCP_SERVER_BY_ID = new Map(MCP_SERVERS.map((sv) => [sv.id, sv]));
-const MCP_ENABLED = MCP_SERVERS.length > 0;
+let MCP_ENABLED = MCP_SERVERS.length > 0;
+// QA only: NOEVIA_QA_ALLOW_LOOPBACK_MCP lets a synthetic server on 127.0.0.1 stand in for a public one.
+async function directoryUrlAllowed(url) {
+  if (process.env.NOEVIA_QA_ALLOW_LOOPBACK_MCP === '1' && /^https?:\/\/127\.0\.0\.1:\d+\//.test(url)) return true;
+  return require('./ssrf.cjs').isPublicUrl(url);
+}
+// OAuth sign-in for directory servers: one sign-in per account per server (mcp-oauth.cjs).
+// Its URLs come from strangers' metadata, so they must be https (or the QA loopback) and public.
+const mcpOAuth = require('./mcp-oauth.cjs').createMcpOAuth({
+  db: authService.db, secrets: secretStore, audit: (action, actor, detail) => authService.audit(action, actor, actor, detail),
+  urlAllowed: async (url) => require('./directory-mcp.cjs').hostedUrlOk(url) && directoryUrlAllowed(url),
+  redirectUri: () => `${String(authService.origin || process.env.PUBLIC_ORIGIN || '').replace(/\/$/, '')}/api/mcp-oauth/callback`,
+});
+const oauthServerIds = () => new Set(MCP_SERVERS.filter((sv) => sv.auth === 'oauth' || sv.auth === 'personal').map((sv) => sv.id));
+/** Whether this account can use a per-account server: its own sign-in or its own key. */
+function accountReady(userId, serverId) {
+  const sv = MCP_SERVERS.find((x) => x.id === serverId);
+  if (!sv) return false;
+  return sv.auth === 'oauth' ? mcpOAuth.connected(userId, serverId) : sv.auth === 'personal' ? directoryMcp.hasUserKey(userId, serverId) : true;
+}
+/** An unauthenticated initialize: tells us whether a server wants OAuth (401 + WWW-Authenticate). */
+async function probeMcpAuth(url) {
+  if (!(await directoryUrlAllowed(url))) return { status: 0, challenge: '' };
+  try {
+    const r = await fetch(url, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(8000),
+      headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'noevia', version: '1' } } }) });
+    return { status: r.status, challenge: r.headers.get('www-authenticate') || '' };
+  } catch { return { status: 0, challenge: '' }; }
+}
+function syncDirectoryServers() {
+  for (let i = MCP_SERVERS.length - 1; i >= 0; i--) if (MCP_SERVERS[i].directory) MCP_SERVERS.splice(i, 1);
+  for (const sv of directoryMcp.asServers()) MCP_SERVERS.push(sv);
+  MCP_SERVER_BY_ID.clear();
+  for (const sv of MCP_SERVERS) MCP_SERVER_BY_ID.set(sv.id, sv);
+  MCP_ENABLED = MCP_SERVERS.length > 0;
+}
 
 // Being unconfigured is a healthy state, but it is indistinguishable from a
 // broken one from the outside: a curated box that loses every tool is not
@@ -1680,7 +1736,21 @@ async function discoverOneServer(server) {
   // Discovery lists the catalogue only. A per-USER credential is attached at
   // call time instead (see mcpAuthHeaders), but a static service token has to
   // be present here or the server has nothing to list.
-  const headers = mcpDiscoveryAuth(server);
+  // A directory server is someone else's: re-check at every discovery that its name still points
+  // at a public address, so a DNS change cannot turn it into a probe of the home network.
+  if (server.directory && !(await directoryUrlAllowed(server.url))) throw new Error('its address no longer resolves to a public host');
+  let headers = mcpDiscoveryAuth(server);
+  if (server.auth === 'personal') {
+    // The tool list is read with the key of the administrator who added the server.
+    headers = server.pendingHeaders || directoryMcp.userHeadersFor(server.addedBy, server.id);
+    if (!Object.keys(headers).length) throw new Error('waiting for the administrator who added it to enter their key');
+  }
+  if (server.auth === 'oauth') {
+    // The tool list is read with the sign-in of the administrator who added the server.
+    const token = await mcpOAuth.tokenFor(server.addedBy, server.id);
+    if (!token) throw new Error('waiting for the administrator who added it to sign in');
+    headers = { Authorization: `Bearer ${token}` };
+  }
   const { session } = await mcp.connect(server.url, headers);
   let discovered;
   try {
@@ -1700,9 +1770,13 @@ async function discoverOneServer(server) {
 }
 
 async function discoverMcpTools(force = false) {
-  if (!MCP_ENABLED) return mcpState;
+  // No servers left (the last directory server was just removed): nothing may stay offered.
+  if (!MCP_ENABLED) { mcpState.tools = new Map(); mcpState.boxes = []; mcpState.servers = new Map(); mcpState.error = null; return mcpState; }
   const fresh = Date.now() - mcpState.discoveredAt < MCP_DISCOVERY_TTL_MS;
   if (!force && fresh && mcpState.boxes.length) return mcpState;
+  // A forced refresh (a server was just added or removed) must not reuse a discovery that
+  // started before the change: wait for it, then discover again with the new list.
+  if (mcpState.inflight && force) { await mcpState.inflight.catch(() => undefined); return discoverMcpTools(true); }
   if (mcpState.inflight) return mcpState.inflight;
   mcpState.inflight = (async () => {
     try {
@@ -1739,7 +1813,9 @@ async function discoverMcpTools(force = false) {
 
       // A box binds only tools from its own server, so a rogue or merely careless second
       // server cannot inject a tool into a curated box. See mcp-boxes.cjs.
-      const boxes = bindBoxes({ manifest: MCP_TOOLBOX_MANIFEST, perServer, servers, warn: (line) => console.warn(line) });
+      // Each directory server becomes one box holding every tool it offers (and only its own).
+      const directoryBoxes = MCP_SERVERS.filter((sv) => sv.directory).map((sv) => directoryMcp.boxFor(sv, (perServer.get(sv.id) || new Map()).keys()));
+      const boxes = bindBoxes({ manifest: [...MCP_TOOLBOX_MANIFEST, ...directoryBoxes], perServer, servers, warn: (line) => console.warn(line) });
 
       mcpState.tools = byName;
       mcpState.boxes = boxes;
@@ -1871,6 +1947,7 @@ function internalCallProjectId() {
  *  identical for everyone, so this leaks nothing. Longer-lived than a call
  *  token because listTools paginates, and harmless because it cannot act. */
 function mcpDiscoveryAuth(server) {
+  if (server && server.auth === 'directory') return server.pendingHeaders || directoryMcp.headersFor(server.id);
   if (server && server.auth === 'internal') {
     return { Authorization: `Bearer ${mcpInternal.mintToken(MCP_INTERNAL_KEY, { discovery: true, ttlMs: 120000 })}` };
   }
@@ -2074,7 +2151,18 @@ async function executeMcpToolCall(name, args) {
   // somebody else's service, so only a server the operator marked
   // auth=nextcloud gets it — and then only if the origin allowlist agrees.
   let auth = null;
-  if (server.auth === 'bearer') {
+  if (server.auth === 'personal') {
+    // Each account's own key, never another's.
+    auth = directoryMcp.userHeadersFor(requestScope.getStore()?.authn?.user?.id, server.id);
+    if (!Object.keys(auth).length) return `ERROR: ${name} needs your own key for ${server.title || 'this server'}: Plugins → Connected → Add key.`;
+  } else if (server.auth === 'oauth') {
+    // Each account's own sign-in, never another's.
+    const token = await mcpOAuth.tokenFor(requestScope.getStore()?.authn?.user?.id, server.id);
+    if (!token) return `ERROR: ${name} needs you to sign in to ${server.title || 'this server'} first: Plugins → Connected → Sign in.`;
+    auth = { Authorization: `Bearer ${token}` };
+  } else if (server.auth === 'directory') {
+    auth = directoryMcp.headersFor(server.id);
+  } else if (server.auth === 'bearer') {
     auth = mcpStaticAuth(server);
     if (!auth) return `ERROR: ${name} needs ${server.tokenEnv}, which is not configured on this deployment.`;
   } else if (server.auth === 'internal') {
@@ -2089,6 +2177,7 @@ async function executeMcpToolCall(name, args) {
     }
   }
 
+  if (server.directory && !(await directoryUrlAllowed(server.url))) return `ERROR: ${name} was not run: its server's address no longer resolves to a public host.`;
   try {
     const { session } = await mcp.connect(server.url, auth);
     let result;
@@ -2143,8 +2232,12 @@ function heuristicWantsSmart(message) {
 // fail-open philosophy of diary-companion's pipeline.py skip_classifier: any
 // error or unparseable reply defaults to the fast role — the classifier must
 // never block the chat.
+// CODE is only offered to the model when a code role is configured. Asking for a verdict
+// the router cannot honour would spend the call and then discard the answer.
 const CLASSIFIER_SYSTEM_PROMPT =
   'You classify a user message for a model router. Reply with exactly one word: FAST for short simple questions or small talk, SMART for complex reasoning, multi-step work, code, or analysis. No other text.';
+const CLASSIFIER_SYSTEM_PROMPT_CODE =
+  'You classify a user message for a model router. Reply with exactly one word: FAST for short simple questions or small talk, CODE for writing, reading, debugging or explaining source code, SMART for any other complex reasoning, multi-step work or analysis. No other text.';
 
 // Budget for the classifier reply. A non-reasoning answer is 1-3 tokens; this
 // only has to be large enough for a reasoning model that ignores the
@@ -2156,11 +2249,11 @@ const CLASSIFIER_SYSTEM_PROMPT =
 // mode looked biased rather than broken.
 const CLASSIFIER_MAX_TOKENS = 512;
 
-function classifierBody(model, message, suppressThinking) {
+function classifierBody(model, message, suppressThinking, withCode = false) {
   const body = {
     model,
     messages: [
-      { role: 'system', content: CLASSIFIER_SYSTEM_PROMPT },
+      { role: 'system', content: withCode ? CLASSIFIER_SYSTEM_PROMPT_CODE : CLASSIFIER_SYSTEM_PROMPT },
       { role: 'user', content: String(message).slice(0, 1000) },
     ],
     max_tokens: CLASSIFIER_MAX_TOKENS,
@@ -2181,18 +2274,32 @@ function classifierBody(model, message, suppressThinking) {
 // last-resort one: a thinking model restates the prompt's own FAST/SMART
 // wording while deliberating, so scanning it can pick up the prompt's words
 // rather than the model's conclusion.
-function classifierVerdict(msg) {
+function classifierVerdict(msg, withCode = false) {
+  const words = withCode ? /\b(SMART|FAST|CODE)\b/g : /\b(SMART|FAST)\b/g;
   const content = String(msg.content || '').toUpperCase();
-  const direct = content.match(/\b(SMART|FAST)\b/g);
+  const direct = content.match(words);
   if (direct) return direct[direct.length - 1].toLowerCase();
   const reasoning = String(msg.reasoning_content || '').toUpperCase();
-  const hits = reasoning.match(/\b(SMART|FAST)\b/g);
+  const hits = reasoning.match(words);
   return hits ? hits[hits.length - 1].toLowerCase() : null;
+}
+
+// Code work the heuristic can name without a round-trip: a fenced block, or a diff.
+// Everything else is left to the classifier, as with `smart`.
+function heuristicWantsCode(message) {
+  const m = String(message);
+  if (m.includes('```')) return true;
+  if (/^(diff --git|@@ -|\+\+\+ b\/)/m.test(m)) return true;
+  return false;
 }
 
 async function classifyFastOrSmart(message) {
   const roles = autoRoles();
   if (!roles) return 'fast';
+  // A code role only participates when one is configured; otherwise the router
+  // behaves exactly as it did before, and code work keeps going to smart.
+  const withCode = !!roles.code;
+  if (withCode && heuristicWantsCode(message)) return 'code';
   if (heuristicWantsSmart(message)) return 'smart';
   try {
     const defaultProvider = getProvider(DEFAULT_PROVIDER_ID);
@@ -2203,7 +2310,7 @@ async function classifyFastOrSmart(message) {
         {
           method: 'POST',
           headers: providerHeaders(defaultProvider),
-          body: classifierBody(roles.fast, message, suppressThinking),
+          body: classifierBody(roles.fast, message, suppressThinking, withCode),
         },
         20000,
       );
@@ -2218,7 +2325,7 @@ async function classifyFastOrSmart(message) {
     }
     if (!r.ok) throw new Error(`classifier ${r.status}`);
     const choice = r.body?.choices?.[0] || {};
-    const verdict = classifierVerdict(choice.message || {});
+    const verdict = classifierVerdict(choice.message || {}, withCode);
     if (!verdict) {
       // Distinguish "ran out of room mid-thought" from "answered something
       // unparseable" — the first is a budget problem, the second a prompt one.
@@ -2451,6 +2558,7 @@ async function handleChatInner(req, res, body, authn, preparation) {
     }
   }
 
+  let autoSkills = [];
   if (project) project = require('./instruction-skills.cjs').snapshot(project); // Pin reviewed skill bodies/config for this exchange.
 
   // Project knowledge files: RAG retrieval replaces whole-file pasting (step 10).
@@ -2484,6 +2592,14 @@ async function handleChatInner(req, res, body, authn, preparation) {
         `Available skills (load the full file with the read_project_file tool when a task matches; do not guess their contents):\n` +
           require('./skill-index.cjs').formatSkillIndex(skills),
       );
+      // L1 up front when one skill clearly matches this message, so a small model does not have
+      // to remember to fetch it. Only reviewed, enabled skills from the pinned snapshot.
+      const picked = await chatSkillRouter.select(skills, message);
+      if (picked.loaded.length) {
+        autoSkills = picked.loaded;
+        sysParts.push(require('./chat-skill-routing.cjs').skillBlock(autoSkills));
+        console.log(`[skills] auto-loaded ${autoSkills.map((s) => s.file).join(', ')}`);
+      }
     }
   }
 
@@ -2599,6 +2715,9 @@ async function handleChatInner(req, res, body, authn, preparation) {
     const staleRoles = staleRolesError(missingRoles(roles, await servedCatalogue()));
     if (staleRoles) return json(res, 409, { error: staleRoles });
     routedRole = await classifyFastOrSmart(message); // fail-open inside
+    // A verdict with no model behind it falls back to smart rather than sending an
+    // empty model name upstream.
+    if (!roles[routedRole]) routedRole = roles.smart ? 'smart' : 'fast';
     model = roles[routedRole];
   } else if (!model && provider.id === DEFAULT_PROVIDER_ID && modelManager.enabled) {
     // No hardcoded model name: default to whatever the manager reports as loaded.
@@ -2707,13 +2826,23 @@ async function handleChatInner(req, res, body, authn, preparation) {
   // punished for calling it.
   const chatUser = requestScope.getStore()?.authn?.user || null;
   const selectedBoxes = [...(Array.isArray(project && project.toolboxes) ? project.toolboxes : DEFAULT_TOOLBOXES).filter((id) => !CONNECTOR_BOXES.has(id)), ...connectedBoxes(chatUser)];
+  // A sign-in server's tools reach only the accounts that signed in to it themselves.
+  { const oauthIds = oauthServerIds(); for (let k = selectedBoxes.length - 1; k >= 0; k--) if (oauthIds.has(selectedBoxes[k]) && !accountReady(chatUser?.id, selectedBoxes[k])) selectedBoxes.splice(k, 1); }
   const routing = await chatToolRouter.select(selectedBoxes, message);
   if (routing.routed) console.log(`[tools] routed ${selectedBoxes.length} toolboxes to ${routing.ids.join(', ')}`);
   // A tool the account blocked is never offered, so the model cannot even ask for it.
   const blocked = (name) => toolPolicy.mode(chatUser?.id, name, isWriteTool(name)) === 'block';
   const resolved = resolveTools({ ...project, toolboxes: routing.routed ? routing.ids : selectedBoxes }, model, blocked);
-  const activeTools = resolved.tools;
+  let activeTools = resolved.tools;
   const allowedToolNames = new Set(activeTools.map((t) => t.function.name));
+  // Scope shown on the reply ("Using: Drive, Tasks"), so a wrong pick is visible and reportable.
+  const boxLabel = (id) => allToolboxes().find((b) => b.id === id)?.label || id;
+  send({ type: 'tools_scope', text: routing.narrowed ? routing.ids.map(boxLabel).join(', ') : '' });
+  if (autoSkills.length) send({ type: 'skills_scope', text: autoSkills.map((s) => s.name).join(', ') });
+  // When routing narrowed the list, the model may ask once for the rest. Widening only restores
+  // the project's own selection, and every write still goes through the approval gate.
+  let widened = false;
+  if (routing.narrowed) activeTools = [...activeTools, { type: 'function', function: { name: 'more_tools', description: "Call this only if none of the offered tools can do the user's task. It makes all of this project's other tools available for your next step.", parameters: { type: 'object', properties: {} } } }];
   if (resolved.dropped.length) {
     // Each entry carries its own reason (count cap or token budget), so do not
     // assert a cause in the header — the two limits are independent and either
@@ -2725,6 +2854,9 @@ async function handleChatInner(req, res, body, authn, preparation) {
   const contextId=chatId || spaceId;
   let prepared,limit,limitSource,requestStartedAt=Date.now();
   try {
+    // Native engine: free the GPU of any other chat model before this one loads (it holds two
+    // models so the embedding model can stay beside the chat model; two chat models do not fit).
+    if(provider.id===DEFAULT_PROVIDER_ID&&typeof modelManager.makeRoomFor==='function')await modelManager.makeRoomFor(model);
     ({limit,limitSource}=await context.resolveRuntimeLimit({
       manager:provider.id===DEFAULT_PROVIDER_ID?modelManager:null,model,dir:chatWorkspace.dir,
       scope:require('node:crypto').createHash('sha256').update(JSON.stringify([provider.baseUrl,provider.apiKey,modelManager.baseUrl])).digest('hex'),
@@ -2920,6 +3052,20 @@ async function handleChatInner(req, res, body, authn, preparation) {
       roundMessages = [...roundMessages, assistantMsg];
       for (const [toolIndex, tc] of toolCalls) {
         if (chatSignal.signal.aborted) break;
+        if (tc.name === 'more_tools' && routing.narrowed) {
+          let reply = 'All of this project\'s tools are already available.';
+          if (!widened) {
+            widened = true;
+            const full = resolveTools({ ...project, toolboxes: selectedBoxes }, model, blocked).tools;
+            activeTools = full;
+            for (const t of full) allowedToolNames.add(t.function.name);
+            reply = `More tools are now available: ${full.map((t) => t.function.name).join(', ')}. Continue with the task.`;
+            send({ type: 'tools_scope', text: 'all tools' });
+          }
+          send({ type: 'tool_result', index: toolOffset + toolIndex, name: tc.name, text: reply.slice(0, 300) });
+          roundMessages.push({ role: 'tool', tool_call_id: tc.id, content: reply });
+          continue;
+        }
         const result = await runTool(tc, async (markWriteAttempt) => {
           // ── Permission gate (step 16) ──────────────────────────────────
           // Reads run straight through. A write stops here and waits for a
@@ -3083,6 +3229,133 @@ async function handleRequestScoped(req, res) {
     if (authn && await accountRoutes(req, res, { path: p, authn })) return;
     if (authn && await offsiteRoutes(req, res, { path: p, authn })) return;
     if (authn && await connectorRoutes(req, res, { path: p, authn })) return;
+    if (authn && await pluginDirectoryRoutes(req, res, { path: p, authn })) return;
+    // Per-account keys for directory servers the admin set to "each person uses their own key".
+    if (authn && p === '/api/mcp-keys/servers' && req.method === 'GET') {
+      return json(res, 200, { servers: directoryMcp.list().filter((s) => s.personal).map((s) => ({ id: s.id, title: s.title, headers: s.declaredHeaders, hasKey: directoryMcp.hasUserKey(authn.user.id, s.id) })) });
+    }
+    const userKey = p.match(/^\/api\/mcp-keys\/([a-z0-9-]+)$/);
+    if (authn && userKey && req.method === 'PUT') {
+      const row = directoryMcp.list().find((s) => s.id === userKey[1] && s.personal);
+      if (!row) return json(res, 404, { error: 'No such server.' });
+      let body; try { body = await readJson(req); } catch { return json(res, 400, { error: 'invalid JSON' }); }
+      let pendingHeaders;
+      try { pendingHeaders = require('./directory-mcp.cjs').checkHeaderValues(row.declaredHeaders, body?.headers || {}); } catch (e) { return json(res, e.status || 400, { error: e.message }); }
+      try { await discoverOneServer({ id: row.id, url: row.url, auth: 'directory', directory: true, pendingHeaders }); }
+      catch (e) { return json(res, 422, { error: `The server did not accept that key: ${String(e.message || e).slice(0, 200)}` }); }
+      try { directoryMcp.setUserKey(authn.user.id, row.id, body?.headers || {}); } catch (e) { return json(res, e.status || 400, { error: e.message }); }
+      return json(res, 200, { ok: true });
+    }
+    if (authn && userKey && req.method === 'DELETE') { directoryMcp.clearUserKey(authn.user.id, userKey[1]); return json(res, 200, { ok: true }); }
+    // Per-account OAuth sign-in to directory servers (any signed-in account, each for itself).
+    if (authn && p === '/api/mcp-oauth/servers' && req.method === 'GET') {
+      return json(res, 200, { servers: MCP_SERVERS.filter((sv) => sv.auth === 'oauth').map((sv) => ({ id: sv.id, title: sv.title, connected: mcpOAuth.connected(authn.user.id, sv.id) })) });
+    }
+    const oauthConnect = p.match(/^\/api\/mcp-oauth\/([a-z0-9-]+)\/connect$/);
+    if (authn && oauthConnect && req.method === 'POST') {
+      const sv = MCP_SERVERS.find((x) => x.id === oauthConnect[1] && x.auth === 'oauth');
+      if (!sv) return json(res, 404, { error: 'No such sign-in server.' });
+      try { return json(res, 200, { signIn: await mcpOAuth.start({ userId: authn.user.id, serverId: sv.id, serverUrl: sv.url, challenge: (await probeMcpAuth(sv.url)).challenge }) }); }
+      catch (e) { return json(res, e.status || 502, { error: e.needsClient ? 'An administrator has to finish setting this server up before anyone can sign in.' : e.message }); }
+    }
+    const oauthDrop = p.match(/^\/api\/mcp-oauth\/([a-z0-9-]+)$/);
+    if (authn && oauthDrop && req.method === 'DELETE') { mcpOAuth.disconnect(authn.user.id, oauthDrop[1]); return json(res, 200, { ok: true }); }
+    if (authn && p === '/api/mcp-oauth/callback' && req.method === 'GET') {
+      const q = new URL(req.url, 'http://local').searchParams;
+      const page = (ok, text) => { res.writeHead(ok ? 200 : 400, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'" });
+        res.end(`<!doctype html><meta name=viewport content="width=device-width"><title>noevia sign-in</title><body style="font:16px system-ui;padding:32px;max-width:32em"><h1 style="font-size:20px">${ok ? 'Signed in' : 'Sign-in did not finish'}</h1><p>${String(text).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]))}</p><p>You can close this tab and return to noevia.</p><script>setTimeout(()=>{try{window.close()}catch{}},1200)</script>`); };
+      if (q.get('error')) return page(false, `The sign-in service said: ${String(q.get('error_description') || q.get('error')).slice(0, 200)}`);
+      try {
+        const done = await mcpOAuth.finish({ userId: authn.user.id, state: q.get('state'), code: q.get('code') });
+        await discoverMcpTools(true); // an admin's (re-)sign-in may be what the tool list was waiting for
+        return page(true, done.purpose === 'add' ? 'The server is added. Choose it under a project’s Tools; each person signs in from Plugins → Connected.' : 'Your account is connected. Its tools are now offered in projects that chose this server.');
+      } catch (e) { return page(false, e.message); }
+    }
+    // Plugins → MCP servers → Add: administrators only; the URL comes from the registry, not the client.
+    if (p === '/api/admin/mcp-directory' || p.startsWith('/api/admin/mcp-directory/')) {
+      if (!authn || authn.user.role !== 'admin') return json(res, 403, { error: 'Administrator required' });
+      const redirectUri = `${String(authService.origin || process.env.PUBLIC_ORIGIN || '').replace(/\/$/, '')}/api/mcp-oauth/callback`;
+      const describe = () => directoryMcp.list().map((s) => { const st = mcpState.servers.get(s.id); return { ...s, toolCount: st?.toolCount ?? null, error: st?.error || null, ...(s.oauth ? { oauthClient: mcpOAuth.clientInfo(s.id), redirectUri } : {}) }; });
+      if (p === '/api/admin/mcp-directory' && req.method === 'GET') return json(res, 200, { servers: describe() });
+      if (p === '/api/admin/mcp-directory' && req.method === 'POST') {
+        let body; try { body = await readJson(req); } catch { return json(res, 400, { error: 'invalid JSON' }); }
+        let item;
+        try { item = await require('./routes/plugin-directory.cjs').findRegistryServer(body?.registryName); } catch (e) { return json(res, e.status || 502, { error: e.message }); }
+        if (!item) return json(res, 404, { error: 'That server is not in the MCP registry.' });
+        if (!item.installable) return json(res, 422, { error: item.notInstallable || 'That server cannot be added.' });
+        if (!(await directoryUrlAllowed(item.remoteUrl))) return json(res, 422, { error: 'That server’s address is not a public host.' });
+        // Prove it answers before saving: an entry that cannot list tools would only be a dead box.
+        let found;
+        let pendingHeaders;
+        try { pendingHeaders = require('./directory-mcp.cjs').checkHeaderValues(item.headers || [], body.headers || {}); } catch (e) { return json(res, e.status || 400, { error: e.message }); }
+        const hasKey = Object.keys(pendingHeaders).length > 0;
+        try { found = await discoverOneServer({ id: directoryMcp.idFor(item.id), url: item.remoteUrl, auth: hasKey ? 'directory' : 'none', directory: true, pendingHeaders }); }
+        catch (e) {
+          // No key and the server asks for sign-in: add it as an OAuth server and send the admin to sign in.
+          const probe = !hasKey ? await probeMcpAuth(item.remoteUrl) : { status: 0 };
+          if (probe.status === 401) {
+            let added;
+            try { added = directoryMcp.add({ registryName: item.id, title: item.name, url: item.remoteUrl, oauth: true }, authn.user.id); } catch (err) { return json(res, err.status || 400, { error: err.message }); }
+            syncDirectoryServers();
+            try {
+              const signIn = await mcpOAuth.start({ userId: authn.user.id, serverId: added.id, serverUrl: item.remoteUrl, challenge: probe.challenge, purpose: 'add' });
+              return json(res, 202, { signIn, server: added, servers: describe() });
+            } catch (err) {
+              // The service needs an app registered by hand: keep the server and ask for the app.
+              if (err.needsClient) return json(res, 202, { needsClient: true, issuer: err.issuer, redirectUri, server: added, servers: describe() });
+              directoryMcp.remove(added.id, authn.user.id); mcpOAuth.forget(added.id); syncDirectoryServers();
+              return json(res, 422, { error: `The server needs a sign-in noevia cannot do: ${err.message}` });
+            }
+          } return json(res, 422, { error: `${hasKey ? 'The server did not accept that key, or' : 'The server'} did not answer as an MCP server: ${String(e.message || e).slice(0, 200)}` }); }
+        if (!found.size) return json(res, 422, { error: 'The server answered but offers no tools noevia can use.' });
+        let added;
+        try { added = directoryMcp.add({ registryName: item.id, title: item.name, url: item.remoteUrl, declaredHeaders: item.headers || [], headerValues: body.headers || {}, personal: hasKey && body.keyMode === 'personal' }, authn.user.id); } catch (e) { return json(res, e.status || 400, { error: e.message }); }
+        syncDirectoryServers();
+        await discoverMcpTools(true);
+        return json(res, 201, { server: { ...added, toolCount: found.size }, servers: describe() });
+      }
+      // Change a server's key: checked against the server before it replaces the old one.
+      const keys = p.match(/^\/api\/admin\/mcp-directory\/([a-z0-9-]+)\/keys$/);
+      if (keys && req.method === 'PUT') {
+        const row = directoryMcp.list().find((s) => s.id === keys[1]);
+        if (!row) return json(res, 404, { error: 'No such server.' });
+        let body; try { body = await readJson(req); } catch { return json(res, 400, { error: 'invalid JSON' }); }
+        let item;
+        try { item = await require('./routes/plugin-directory.cjs').findRegistryServer(row.registryName); } catch (e) { return json(res, e.status || 502, { error: e.message }); }
+        const declared = item?.headers || [];
+        let pendingHeaders;
+        try { pendingHeaders = require('./directory-mcp.cjs').checkHeaderValues(declared, body.headers || {}); } catch (e) { return json(res, e.status || 400, { error: e.message }); }
+        try { await discoverOneServer({ id: row.id, url: row.url, auth: 'directory', directory: true, pendingHeaders }); }
+        catch (e) { return json(res, 422, { error: `The server did not accept that key: ${String(e.message || e).slice(0, 200)}` }); }
+        try { directoryMcp.setKeys(row.id, declared, body.headers || {}, authn.user.id); } catch (e) { return json(res, e.status || 400, { error: e.message }); }
+        syncDirectoryServers();
+        await discoverMcpTools(true);
+        return json(res, 200, { servers: describe() });
+      }
+      // A hand-registered app for a sign-in service that does not let apps register themselves.
+      const appRoute = p.match(/^\/api\/admin\/mcp-directory\/([a-z0-9-]+)\/oauth-client$/);
+      if (appRoute && req.method === 'PUT') {
+        const sv = MCP_SERVERS.find((x) => x.id === appRoute[1] && x.auth === 'oauth');
+        if (!sv) return json(res, 404, { error: 'No such sign-in server.' });
+        let body; try { body = await readJson(req); } catch { return json(res, 400, { error: 'invalid JSON' }); }
+        try {
+          const challenge = (await probeMcpAuth(sv.url)).challenge;
+          await mcpOAuth.setClient({ serverId: sv.id, serverUrl: sv.url, clientId: body?.clientId, clientSecret: body?.clientSecret, challenge });
+          authService.audit('mcp.oauth.client', authn.user.id, authn.user.id, { serverId: sv.id });
+          const signIn = await mcpOAuth.start({ userId: authn.user.id, serverId: sv.id, serverUrl: sv.url, challenge, purpose: 'add' });
+          return json(res, 200, { signIn, servers: describe() });
+        } catch (e) { return json(res, e.status || 502, { error: e.message }); }
+      }
+      const del = p.match(/^\/api\/admin\/mcp-directory\/([a-z0-9-]+)$/);
+      if (del && req.method === 'DELETE') {
+        mcpOAuth.forget(del[1]);
+        try { directoryMcp.remove(del[1], authn.user.id); } catch (e) { return json(res, e.status || 400, { error: e.message }); }
+        syncDirectoryServers();
+        await discoverMcpTools(true);
+        return json(res, 200, { servers: describe() });
+      }
+      return json(res, 405, { error: 'method not allowed' });
+    }
     if (authn && await webAddressRoutes(req, res, { path: p, authn })) return;
     if (authn && p.startsWith('/api/projects/') && await researchRoutes(req, res, { path: p, authn })) return;
     if (authn && p.startsWith('/api/projects/') && await codeRoutes(req, res, { path: p, authn })) return;
@@ -3533,8 +3806,9 @@ async function handleRequestScoped(req, res) {
         const fast = typeof body.fast === 'string' ? body.fast.trim() : '';
         const smart = typeof body.smart === 'string' ? body.smart.trim() : '';
         const vision = typeof body.vision === 'string' ? body.vision.trim() : '';
+        const code = typeof body.code === 'string' ? body.code.trim() : '';
         if (!fast || !smart) return json(res, 400, { error: 'both fast and smart model names are required' });
-        setAutoRoles({ fast, smart, vision });
+        setAutoRoles({ fast, smart, vision, code });
         ensureRolesLoaded(); // optional adapter warm-up; native routing stays on demand
         return json(res, 200, { configured: true, roles: autoRoles() });
       }
@@ -3609,6 +3883,28 @@ async function handleRequestScoped(req, res) {
       return json(res, 200, {skills: skills.list(project)});
     }
 
+    // Plugins → Skills → Add to project: copy one published SKILL.md into the project. It lands
+    // as "Review required" and stays off until the owner reviews and enables it.
+    const skillInstall = p.match(/^\/api\/projects\/([^/]+)\/skills\/install$/);
+    if (skillInstall && req.method === 'POST') {
+      const project = getProject(decodeURIComponent(skillInstall[1]));
+      if (!project) return json(res, 404, { error: 'no such project' });
+      let body; try { body = await readJson(req); } catch { return json(res, 400, { error: 'invalid JSON' }); }
+      let content;
+      try { content = await require('./routes/plugin-directory.cjs').fetchPublishedSkill(body?.skill); } catch (e) { return json(res, e.status || 502, { error: e.message }); }
+      const skills = require('./instruction-skills.cjs');
+      const file = { name: `${body.skill}/SKILL.md`, content };
+      const inspected = skills.inspect(file, project);
+      if (!inspected?.valid) return json(res, 422, { error: `This skill cannot be used as a project skill: ${inspected?.error || 'no skill frontmatter'}` });
+      const files = Array.isArray(project.files) ? project.files : [];
+      if (files.filter((f) => !f.source).length >= 60 && !files.some((f) => f.name === file.name)) return json(res, 409, { error: 'This project already has the maximum of 60 files.' });
+      project.files = [...files.filter((f) => f.name !== file.name), file];
+      if (project.instructionSkills) delete project.instructionSkills[file.name]; // a replaced skill needs review again
+      skills.reconcile(project);
+      project.updatedAt = Date.now();
+      currentWorkspace().saveProjects();
+      return json(res, 201, { file: file.name, skills: skills.list(project).map(({ content: _c, ...rest }) => rest) });
+    }
     const projCfg = p.match(/^\/api\/projects\/([^/]+)\/config$/);
     if (projCfg && req.method === 'POST') {
       const id = decodeURIComponent(projCfg[1]);
@@ -4191,6 +4487,8 @@ async function handleRequestScoped(req, res) {
       });
     }
 
+    // A change to the models anywhere else (load, unload, download, delete) also invalidates the scan.
+    if (p.startsWith('/api/models/') && !['GET','HEAD','OPTIONS'].includes(req.method || 'GET')) modelScanCache.clear();
     // Model manager (folded-in Model Loader) JSON API, administrators only.
     if (p.startsWith('/api/model-manager/')) {
       if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for model management'});
@@ -4199,6 +4497,13 @@ async function handleRequestScoped(req, res) {
       if(!/^[\w./%:+@-]*$/.test(rest)||rest.includes('..'))return json(res,400,{error:'Invalid path'});
       const method=req.method||'GET';
       const body=['GET','HEAD','DELETE'].includes(method)?undefined:await readBody(req,1024*1024);
+      // The file scan reads every model header from disk (~2 s on daserver). Serve the last scan at
+      // once and refresh it behind the response; any change through this API drops it.
+      if(method!=='GET')modelScanCache.clear();
+      if(method==='GET'&&rest==='models'&&!url.search){
+        const hit=modelScanCache.get('models');
+        if(hit){res.setHeader('Cache-Control','no-store');res.setHeader('X-Model-Scan','cached');if(Date.now()-hit.at>5000)refreshModelScan();return json(res,200,hit.body);}
+      }
       const result=await fetchJson(`${process.env.MODEL_LOADER_URL.replace(/\/+$/,'')}/api/v1/${rest}${url.search}`,{method,headers:{'Content-Type':'application/json',...(process.env.MODEL_LOADER_TOKEN?{'X-Model-Loader-Token':process.env.MODEL_LOADER_TOKEN}:{})},body},10*60*1000).catch(()=>null);
       res.setHeader('Cache-Control','no-store');
       if(!result)return json(res,502,{error:'The model management service is not responding.'});
@@ -4207,6 +4512,7 @@ async function handleRequestScoped(req, res) {
       if(result.ok&&method==='GET'&&/^benchmark\/runs\/\d+$/.test(rest)&&modelManager.recordEvidence){
         for(const {model,record} of require('./benchmark-evidence.cjs').throughputRecords(detail))modelManager.recordEvidence(model,record).catch(()=>undefined);
       }
+      if(result.ok&&method==='GET'&&rest==='models'&&!url.search)modelScanCache.set('models',{at:Date.now(),body:detail});
       return json(res,result.status,result.ok?detail:{error:detail.detail||detail.error||'Model management request failed.'});
     }
 
@@ -4731,4 +5037,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { checkAuth, handleRequest, sanitizeChats, MCP_SERVERS, toolboxOffered, ownsFile, projectFolderName, prefill, TOOL_PREFILL_TARGET_MS, isWriteTool, chatWideApproved, pendingApprovals, resolveTools, allToolboxes, mcpCredentialOriginAllowed, toolTokenBudgetFor, MCP_TOOLBOX_MANIFEST, toolboxSummaries, estimateToolTokens, toolCapFor, sanitizeToolboxes, executeToolCall, TOOLBOXES, classifierVerdict, heuristicWantsSmart, CLASSIFIER_MAX_TOKENS, recordUsage, readUsage, usageDayKey, USAGE_RETENTION_DAYS };
+module.exports = { checkAuth, handleRequest, sanitizeChats, MCP_SERVERS, toolboxOffered, ownsFile, projectFolderName, prefill, TOOL_PREFILL_TARGET_MS, isWriteTool, chatWideApproved, pendingApprovals, resolveTools, allToolboxes, mcpCredentialOriginAllowed, toolTokenBudgetFor, MCP_TOOLBOX_MANIFEST, toolboxSummaries, estimateToolTokens, toolCapFor, sanitizeToolboxes, executeToolCall, TOOLBOXES, classifierVerdict, heuristicWantsSmart, heuristicWantsCode, CLASSIFIER_MAX_TOKENS, recordUsage, readUsage, usageDayKey, USAGE_RETENTION_DAYS };

@@ -110,3 +110,14 @@ test('changing the embedding model invalidates cached box vectors', async () => 
   await router.select(['nextcloud-files', 'calendar'], 'my calendar');
   assert.deepEqual(calls, [2, 1, 1, 2, 1], 'the new model re-embeds both boxes');
 });
+
+test('narrowed is true only when some selected toolbox was left out', async () => {
+  const { createChatToolRouter } = require('./chat-tool-routing.cjs');
+  const boxes = [{ id: 'a', label: 'Alpha', tools: [{ function: { name: 'a1' } }] }, { id: 'b', label: 'Beta', tools: [{ function: { name: 'b1' } }] }];
+  const vec = (t) => (/alpha/i.test(t) ? [1, 0] : /beta/i.test(t) ? [0, 1] : [0.7, 0.7]);
+  const router = createChatToolRouter({ enabled: () => true, boxes: () => boxes, embed: async (texts) => texts.map(vec), threshold: 0.5 });
+  const one = await router.select(['a', 'b'], 'alpha please');
+  assert.deepEqual([one.ids, one.narrowed], [['a'], true]);
+  const both = await router.select(['a', 'b'], 'something general');
+  assert.equal(both.narrowed, false);
+});
