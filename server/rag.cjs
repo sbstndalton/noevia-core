@@ -325,4 +325,9 @@ async function filesContext(projectId, files, query, userId) {
   return parts.length ? [manifest, coverage, ...parts].join('\n\n') : [manifest, coverage].join("\n");
 }
 
-module.exports = { init, indexProjectFile, deleteProjectFile, searchProject, filesContext, chunkText, ragAvailable, embed };
+// Which model embed() is currently using. Callers that CACHE vectors need this
+// in their key: a vector outlives a change to EMBEDDING_MODEL, and a stale one
+// of the wrong dimensionality scores silently rather than failing.
+function embedModel() { return EMBED_MODEL; }
+
+module.exports = { init, indexProjectFile, deleteProjectFile, searchProject, filesContext, chunkText, ragAvailable, embed, embedModel };

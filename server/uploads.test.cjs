@@ -83,3 +83,51 @@ test('failed DOCX replacement retains its original and clears previous readable 
   assert.equal(file.content,'');assert.equal(file.attachment.state,'stored');assert.match(file.attachment.reason,/parse failure/);
   assert.equal(fs.readFileSync(uploads.original(workspace,project.id,file),'utf8'),'new invalid');
 });
+
+// A text file that is not UTF-8 used to hit a bare catch and become empty
+// content in state 'stored' — indistinguishable from an opaque binary, with
+// nothing said to the user. These pin the four cases apart.
+const makeTextFile = (t) => async (name, bytes) => {
+  const { workspace, project } = setup(t);
+  return uploads.ingest(workspace, project, name, Buffer.from(bytes));
+};
+
+test('a Latin-1 text file is read, not silently emptied', async (t) => {
+  const textFile = makeTextFile(t);
+  // "Grüße aus München" in windows-1252 — invalid as UTF-8.
+  const f = await textFile('legacy.txt', [0x47,0x72,0xfc,0xdf,0x65,0x20,0x61,0x75,0x73,0x20,0x4d,0xfc,0x6e,0x63,0x68,0x65,0x6e]);
+  assert.match(f.content, /Grüße aus München/);
+  assert.equal(f.attachment.state, 'partial');
+  assert.match(f.attachment.reason, /windows-1252/);
+});
+
+test('UTF-16 and a UTF-8 BOM are honoured and the BOM is not left in the text', async (t) => {
+  const textFile = makeTextFile(t);
+  const le = await textFile('utf16.txt', [0xff,0xfe, 0x68,0x00, 0x69,0x00]);
+  assert.equal(le.content, 'hi');
+  assert.match(le.attachment.reason, /utf-16le/);
+
+  const be = await textFile('utf16be.txt', [0xfe,0xff, 0x00,0x68, 0x00,0x69]);
+  assert.equal(be.content, 'hi');
+
+  const bom = await textFile('bom.txt', [0xef,0xbb,0xbf, 0x68,0x69]);
+  assert.equal(bom.content, 'hi', 'the BOM itself must not survive into the content');
+  assert.equal(bom.attachment.state, 'ready');
+  assert.equal(bom.attachment.reason, undefined, 'a clean UTF-8 read carries no caveat');
+});
+
+test('plain UTF-8 is still read cleanly and reports no encoding caveat', async (t) => {
+  const textFile = makeTextFile(t);
+  const f = await textFile('clean.txt', Buffer.from('héllo wörld', 'utf8'));
+  assert.equal(f.content, 'héllo wörld');
+  assert.equal(f.attachment.state, 'ready');
+  assert.equal(f.attachment.reason, undefined);
+});
+
+test('binary wearing a text extension is refused with a reason, not guessed at', async (t) => {
+  const textFile = makeTextFile(t);
+  const f = await textFile('actually-binary.txt', [0x89,0x50,0x4e,0x47,0x00,0x1a,0x0a,0x00,0xff]);
+  assert.equal(f.content, '');
+  assert.equal(f.attachment.state, 'stored');
+  assert.match(f.attachment.reason, /not readable as text/);
+});

@@ -773,6 +773,7 @@ const DEFAULT_TOOLBOXES = ['core'];
 // Roadmap E: narrows each message's toolboxes to the matching ones when features.toolRouter is on.
 const chatToolRouter = require('./chat-tool-routing.cjs').createChatToolRouter({
   enabled: () => features.enabled('toolRouter'), boxes: () => allToolboxes(), embed: (texts) => rag.embed(texts),
+  embedModel: () => rag.embedModel(),
 });
 
 function allToolboxes() {
@@ -1681,7 +1682,12 @@ async function discoverOneServer(server) {
   // be present here or the server has nothing to list.
   const headers = mcpDiscoveryAuth(server);
   const { session } = await mcp.connect(server.url, headers);
-  const discovered = await mcp.listTools(server.url, session, headers);
+  let discovered;
+  try {
+    discovered = await mcp.listTools(server.url, session, headers);
+  } finally {
+    await mcp.disconnect(server.url, session, headers);
+  }
   const byName = new Map();
   const dropped = [];
   for (const t of discovered) {
@@ -1837,7 +1843,7 @@ function mcpInternalAuth(name) {
   if (!workspace) return null;
   const token = mcpInternal.mintToken(MCP_INTERNAL_KEY, {
     uid: workspace.userId,
-    pid: internalCallProject ? internalCallProject.id : null,
+    pid: internalCallProjectId(),
     w: isWriteTool(name) ? 1 : 0,
   });
   return { Authorization: `Bearer ${token}` };
@@ -1845,10 +1851,20 @@ function mcpInternalAuth(name) {
 
 /** Which project the in-flight tool call belongs to. executeMcpToolCall is
  *  reached from executeToolCall, which knows; rather than changing the
- *  signature of a function three other call sites share, the project is parked
- *  here for the length of one await. Single-threaded, set immediately before
- *  the call and cleared after. */
-let internalCallProject = null;
+ *  signature of a function three other call sites share, the project rides in
+ *  the request scope for the length of one await.
+ *
+ *  This used to be a module-level `let`, set immediately before the call and
+ *  cleared in a finally, on the reasoning that Node is single-threaded. Node
+ *  is single-threaded but NOT non-reentrant: two chats calling internal tools
+ *  interleave at the await, and whichever set it last wins for both. Since
+ *  this value decides which project a capability token is minted for, the
+ *  losing chat would act against the other's project. AsyncLocalStorage keeps
+ *  it per call chain, which is what was meant all along. */
+function internalCallProjectId() {
+  const project = requestScope.getStore()?.internalCallProject;
+  return project ? project.id : null;
+}
 
 /** Discovery runs with no user in scope, so it gets a token that can list the
  *  catalogue and can never call anything. The catalogue is static and
@@ -2036,8 +2052,13 @@ async function executeToolCall(project, name, rawArgs, allowed) {
   // there. The per-user credential is attached here rather than at discovery,
   // so two users sharing a project each act as themselves.
   if (mcpState.tools.has(name)) {
-    internalCallProject = project || null;
-    try { return await executeMcpToolCall(name, args); } finally { internalCallProject = null; }
+    // Extends the current scope rather than replacing it: the workspace and
+    // authn the rest of the call depends on must survive. Same shape as the
+    // sourceProgress extension below.
+    return requestScope.run(
+      { ...requestScope.getStore(), internalCallProject: project || null },
+      () => executeMcpToolCall(name, args),
+    );
   }
   return `ERROR: unknown tool "${name}"`;
 }
@@ -2070,7 +2091,14 @@ async function executeMcpToolCall(name, args) {
 
   try {
     const { session } = await mcp.connect(server.url, auth);
-    const result = await mcp.callTool(server.url, session, name, args, auth);
+    let result;
+    try {
+      result = await mcp.callTool(server.url, session, name, args, auth);
+    } finally {
+      // Close it whatever happened. Nothing used to, so every tool call left a
+      // session behind on the server for the life of the process.
+      await mcp.disconnect(server.url, session, auth);
+    }
     const text = mcp.resultToText(result);
     if (!text) return '(the tool returned no output)';
     // Was a blind `slice(0, TOOL_RESULT_CAP)`. A listing from the Nextcloud

@@ -5,7 +5,8 @@ const test = require('node:test');
 // Each test file gets its own data dir so parallel runs never race on the
 // default server/ui-data/secrets.key (EEXIST).
 process.env.UI_DATA_DIR = require('node:fs').mkdtempSync(require('node:path').join(require('node:os').tmpdir(), 'cowork-mcp-test-'));
-const { convertTool, parseRpcBody, resultToText, readOnlyHint } = require('./mcp.cjs');
+const mcp = require('./mcp.cjs');
+const { convertTool, parseRpcBody, resultToText, readOnlyHint } = mcp;
 const { resolveTools, toolTokenBudgetFor, MCP_TOOLBOX_MANIFEST } = require('./index.cjs');
 
 // ── schema conversion ────────────────────────────────────────────────────
@@ -80,8 +81,8 @@ test('a JSON-RPC reply is parsed from an SSE body as well as plain JSON', () => 
   // plain request/response call. A client that only handles application/json
   // fails against it entirely.
   const sse = 'event: message\ndata: {"jsonrpc":"2.0","id":2,"result":{"tools":[]}}\n\n';
-  assert.deepEqual(parseRpcBody('text/event-stream', sse), { jsonrpc: '2.0', id: 2, result: { tools: [] } });
-  assert.deepEqual(parseRpcBody('application/json', '{"jsonrpc":"2.0","id":1,"result":{}}'),
+  assert.deepEqual(parseRpcBody('text/event-stream', sse, 2), { jsonrpc: '2.0', id: 2, result: { tools: [] } });
+  assert.deepEqual(parseRpcBody('application/json', '{"jsonrpc":"2.0","id":1,"result":{}}', 1),
     { jsonrpc: '2.0', id: 1, result: {} });
 });
 
@@ -94,11 +95,38 @@ test('progress notifications before the result do not confuse the parser', () =>
     'data: {"jsonrpc":"2.0","id":7,"result":{"ok":true}}',
     '',
   ].join('\n');
-  assert.deepEqual(parseRpcBody('text/event-stream', sse).result, { ok: true });
+  assert.deepEqual(parseRpcBody('text/event-stream', sse, 7).result, { ok: true });
+});
+
+test('a server-initiated request on the stream is never mistaken for the reply', () => {
+  // The parser used to take the last frame carrying an `id`. Notifications
+  // have no id, so that worked by luck — but a spec-compliant server doing
+  // sampling or elicitation sends a REQUEST, which does have one, before the
+  // result. Taking that frame would hand the server's own question back to the
+  // model as the tool's output.
+  const sse = [
+    'event: message',
+    'data: {"jsonrpc":"2.0","id":9,"result":{"ok":true}}',
+    '',
+    'event: message',
+    'data: {"jsonrpc":"2.0","id":99,"method":"sampling/createMessage","params":{"messages":[]}}',
+    '',
+  ].join('\n');
+  assert.deepEqual(parseRpcBody('text/event-stream', sse, 9).result, { ok: true });
+});
+
+test('a stream with no reply to THIS request is an error naming the request', () => {
+  const sse = 'event: message\ndata: {"jsonrpc":"2.0","id":99,"method":"elicitation/create"}\n\n';
+  assert.throws(() => parseRpcBody('text/event-stream', sse, 9), /no reply to request 9/);
+});
+
+test('a plain-JSON reply for a different request is rejected rather than used', () => {
+  assert.throws(() => parseRpcBody('application/json', '{"jsonrpc":"2.0","id":41,"result":{}}', 40),
+    /does not match request 40/);
 });
 
 test('an event stream carrying no JSON-RPC message is an error, not a silent empty', () => {
-  assert.throws(() => parseRpcBody('text/event-stream', 'event: ping\n\n'), /no JSON-RPC message/);
+  assert.throws(() => parseRpcBody('text/event-stream', 'event: ping\n\n', 1), /no JSON-RPC message/);
 });
 
 test('tool results flatten to text, and an error result stays a message', () => {
@@ -286,4 +314,39 @@ test('an ordinary deeply-nested schema is NOT mistaken for a runaway ref', () =>
   for (let i = 0; i < 20; i++) deep = { type: 'object', properties: { nested: deep } };
   const r = convertTool({ name: 'x', inputSchema: { type: 'object', properties: { a: deep }, required: [] } });
   assert.equal(r.ok, true, r.reason);
+});
+
+// ── session lifecycle ────────────────────────────────────────────────────
+// Every tool call opened a session and nothing ever closed one, so a server
+// holding per-session state accumulated an entry per call for as long as
+// noevia ran.
+
+test('a session is terminated with DELETE, carrying its id and auth', async () => {
+  const seen = [];
+  const realFetch = global.fetch;
+  global.fetch = async (url, options) => { seen.push({ url, ...options }); return { ok: true, status: 200 }; };
+  try {
+    const session = { id: 'sess-abc' };
+    assert.equal(await mcp.disconnect('https://server.invalid/mcp', session, { Authorization: 'Basic x' }), true);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].method, 'DELETE');
+    assert.equal(seen[0].headers['mcp-session-id'], 'sess-abc');
+    assert.equal(seen[0].headers.Authorization, 'Basic x');
+    assert.equal(seen[0].redirect, 'error', 'the SSRF policy applies here too');
+    assert.equal(session.id, null, 'the closed session is not reusable');
+  } finally { global.fetch = realFetch; }
+});
+
+test('closing is best-effort: no session id is a no-op, and a refusal never throws', async () => {
+  const realFetch = global.fetch;
+  let called = 0;
+  global.fetch = async () => { called++; throw new Error('connection reset'); };
+  try {
+    assert.equal(await mcp.disconnect('https://server.invalid/mcp', { id: null }), false);
+    assert.equal(called, 0, 'nothing to close means nothing is sent');
+    // A server that does not implement DELETE answers 405; that is not an error
+    // worth surfacing, because the call it belongs to has already answered.
+    assert.equal(await mcp.disconnect('https://server.invalid/mcp', { id: 'sess-x' }), false);
+    assert.equal(called, 1);
+  } finally { global.fetch = realFetch; }
 });

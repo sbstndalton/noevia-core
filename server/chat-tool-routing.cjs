@@ -15,18 +15,40 @@ function boxText(box) {
   return `${box.label || box.id}: ${box.description || ''}\n${tools}`.slice(0, 4000);
 }
 
+// The embedder sits on the chat's critical path: both calls below are awaited
+// BEFORE the first model call, so a wedged embedder is a wedged chat. The
+// fail-open contract above only covers a throw, never a hang — so give the
+// hang a deadline and let it take the same path as any other failure.
+//
+// It belongs here rather than in rag.embed, whose other caller is indexing:
+// a long embed is correct there and fatal here.
+const EMBED_TIMEOUT_MS = 5000;
+
+function withTimeout(promise, ms, label) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms); }),
+  ]).finally(() => clearTimeout(timer));
+}
+
 /**
  * @param {{ enabled: () => boolean, boxes: () => object[], embed: (texts: string[]) => Promise<number[][]>,
- *           topK?: number, threshold?: number, cacheMax?: number }} deps
+ *           embedModel?: () => string, topK?: number, threshold?: number, cacheMax?: number,
+ *           timeoutMs?: number }} deps
  */
-function createChatToolRouter({ enabled, boxes, embed, topK = 3, threshold = 0.35, cacheMax = 200 }) {
-  const cache = new Map(); // sha256(box text) -> embedding
+function createChatToolRouter({ enabled, boxes, embed, embedModel = () => '', topK = 3, threshold = 0.35, cacheMax = 200, timeoutMs = EMBED_TIMEOUT_MS }) {
+  const cache = new Map(); // sha256(model + box text) -> embedding
 
   async function boxEmbeddings(rows) {
-    const keyed = rows.map((box) => ({ box, key: crypto.createHash('sha256').update(boxText(box)).digest('hex') }));
+    // The model is part of the key. Without it, changing EMBEDDING_MODEL keeps
+    // serving vectors of the old dimensionality, and cosine() silently
+    // truncates to the shorter of the two and returns a meaningless score
+    // instead of failing.
+    const keyed = rows.map((box) => ({ box, key: crypto.createHash('sha256').update(`${embedModel()}\u0000${boxText(box)}`).digest('hex') }));
     const missing = keyed.filter((row) => !cache.has(row.key));
     if (missing.length) {
-      const vectors = await embed(missing.map((row) => boxText(row.box)));
+      const vectors = await withTimeout(embed(missing.map((row) => boxText(row.box))), timeoutMs, 'toolbox embedding');
       missing.forEach((row, i) => cache.set(row.key, vectors[i]));
       while (cache.size > cacheMax) cache.delete(cache.keys().next().value);
     }
@@ -43,7 +65,7 @@ function createChatToolRouter({ enabled, boxes, embed, topK = 3, threshold = 0.3
     let ranked, taskEmbedding;
     try {
       ranked = await boxEmbeddings(rows);
-      [taskEmbedding] = await embed([String(message || '').slice(0, MESSAGE_CHARS)]);
+      [taskEmbedding] = await withTimeout(embed([String(message || '').slice(0, MESSAGE_CHARS)]), timeoutMs, 'message embedding');
     } catch (error) {
       return keep(`embeddings unavailable: ${error.message}`);
     }

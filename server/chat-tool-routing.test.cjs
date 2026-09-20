@@ -66,3 +66,47 @@ test('routed ids come back best match first, so the token budget keeps the best 
   assert.equal(out.routed, true);
   assert.deepEqual(out.ids, ['nextcloud-files', 'calendar']);
 });
+
+test('a hung embedder does not hang the chat; it falls back to the full selection', async () => {
+  // The fail-open contract used to cover only a throw. A hang is the more
+  // likely failure for a CPU embedder under load, and it sits before the first
+  // model call, so without a deadline the chat waits forever.
+  const never = new Promise(() => {});
+  const { router } = make({ embed: () => never, timeoutMs: 20 });
+  const started = Date.now();
+  const out = await router.select(['nextcloud-files', 'calendar', 'offline-wikipedia'], 'Search the wiki');
+  assert.equal(out.routed, false, 'the whole selection is kept');
+  assert.deepEqual(out.ids, ['nextcloud-files', 'calendar', 'offline-wikipedia']);
+  assert.match(out.reason, /timed out/);
+  assert.ok(Date.now() - started < 2000, 'and it gives up promptly');
+});
+
+test('a hang on the SECOND embedding call is caught too', async () => {
+  let call = 0;
+  const { router } = make({
+    embed: async (texts) => (++call === 1 ? texts.map(vec) : new Promise(() => {})),
+    timeoutMs: 20,
+  });
+  const out = await router.select(['nextcloud-files', 'calendar'], 'my calendar');
+  assert.equal(out.routed, false);
+  assert.match(out.reason, /message embedding timed out/);
+});
+
+test('changing the embedding model invalidates cached box vectors', async () => {
+  // Without the model in the cache key, vectors of the old dimensionality
+  // survive the switch and cosine() silently truncates to the shorter of the
+  // two, scoring nonsense instead of failing.
+  let model = 'nomic-v1';
+  const calls = [];
+  const router = createChatToolRouter({
+    enabled: () => true, boxes: () => boxes, embedModel: () => model,
+    embed: async (texts) => { calls.push(texts.length); return texts.map(vec); },
+  });
+  await router.select(['nextcloud-files', 'calendar'], 'my calendar');
+  await router.select(['nextcloud-files', 'calendar'], 'my calendar');
+  assert.deepEqual(calls, [2, 1, 1], 'boxes are embedded once, then cached');
+
+  model = 'some-other-embedder';
+  await router.select(['nextcloud-files', 'calendar'], 'my calendar');
+  assert.deepEqual(calls, [2, 1, 1, 2, 1], 'the new model re-embeds both boxes');
+});

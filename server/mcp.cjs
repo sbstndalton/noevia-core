@@ -26,26 +26,51 @@
 const PROTOCOL_VERSION = '2025-06-18';
 const CLIENT_INFO = { name: 'noevia', version: '1' };
 
+// Every request gets its own id, so a reply can be matched to it. These used
+// to be constants (1, 100+page, 200), which was survivable only because the
+// reply was identified by position rather than by id — see below.
+let nextRequestId = 0;
+function requestId() { return ++nextRequestId; }
+
 // Pull the JSON-RPC payload out of a response that may be either plain JSON
 // or an SSE stream carrying one message.
-function parseRpcBody(contentType, text) {
+//
+// This used to take the LAST frame carrying an `id`, on the reasoning that a
+// server may emit progress notifications first. Notifications have no `id`, so
+// that worked — by luck. A server REQUEST has an id: a spec-compliant server
+// doing sampling or elicitation emits one on this stream before the result,
+// and its payload would have been handed back to the model as the tool result.
+// Matching on the id we actually sent is the fix, and it is also what lets the
+// ids above stop being constants.
+function parseRpcBody(contentType, text, expectedId) {
   if (String(contentType || '').includes('text/event-stream')) {
-    // Take the LAST data: line — a server may emit progress notifications
-    // before the actual result.
     let found = null;
+    let sawOtherId = false;
     for (const line of text.split(/\r?\n/)) {
       if (!line.startsWith('data:')) continue;
       const payload = line.slice(5).trim();
       if (!payload) continue;
       try {
         const msg = JSON.parse(payload);
-        if (msg && Object.prototype.hasOwnProperty.call(msg, 'id')) found = msg;
+        if (!msg || !Object.prototype.hasOwnProperty.call(msg, 'id')) continue; // a notification
+        // A response carries `result` or `error`; a server-initiated request
+        // carries `method`. Both have an id, so check both.
+        if (msg.id === expectedId && !msg.method) found = msg;
+        else sawOtherId = true;
       } catch { /* a partial or non-JSON frame; keep looking */ }
     }
-    if (!found) throw new Error('MCP: no JSON-RPC message in event stream');
+    if (!found) {
+      throw new Error(sawOtherId
+        ? `MCP: no reply to request ${expectedId} in event stream (the server sent other traffic; noevia does not implement server-initiated requests)`
+        : 'MCP: no JSON-RPC message in event stream');
+    }
     return found;
   }
-  return JSON.parse(text);
+  const msg = JSON.parse(text);
+  if (msg && Object.prototype.hasOwnProperty.call(msg, 'id') && msg.id !== expectedId) {
+    throw new Error(`MCP: reply id ${msg.id} does not match request ${expectedId}`);
+  }
+  return msg;
 }
 
 // One JSON-RPC round trip. `session` is mutated to carry the id the server
@@ -77,7 +102,7 @@ async function rpc(baseUrl, session, body, { headers = {}, timeoutMs = 30000, no
     // Notifications have no id and the server answers 202 with an empty body.
     if (notify) return null;
     const text = await res.text();
-    const msg = parseRpcBody(res.headers.get('content-type'), text);
+    const msg = parseRpcBody(res.headers.get('content-type'), text, body.id);
     if (msg.error) throw new Error(`MCP error ${msg.error.code}: ${msg.error.message}`);
     return msg.result;
   } finally {
@@ -90,12 +115,45 @@ async function rpc(baseUrl, session, body, { headers = {}, timeoutMs = 30000, no
 async function connect(baseUrl, authHeaders = {}, timeoutMs = 30000) {
   const session = { id: null };
   const info = await rpc(baseUrl, session, {
-    jsonrpc: '2.0', id: 1, method: 'initialize',
+    jsonrpc: '2.0', id: requestId(), method: 'initialize',
     params: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, clientInfo: CLIENT_INFO },
   }, { headers: authHeaders, timeoutMs });
   await rpc(baseUrl, session, { jsonrpc: '2.0', method: 'notifications/initialized' },
     { headers: authHeaders, timeoutMs, notify: true });
   return { session, serverInfo: info && info.serverInfo };
+}
+
+// Close a session. Every connect() opened one and nothing ever closed it, so a
+// server that holds per-session state accumulated one entry per tool call for
+// as long as noevia ran.
+//
+// Deliberately NOT paired with a session cache. Reusing sessions would also
+// save two round trips per call, but a session is established with a specific
+// user's credentials (mcpAuthHeaders forwards per-user Nextcloud basic auth),
+// so a shared cache is a cross-tenant hazard of exactly the kind AGENTS.md
+// rules out. Correctness first; reuse needs a per-user key and its own tests.
+//
+// Best-effort by contract: the spec allows a server to refuse DELETE with 405,
+// and a session that never got an id has nothing to close. A failure here must
+// never surface as a tool error — the call it belongs to has already answered.
+async function disconnect(baseUrl, session, authHeaders = {}, timeoutMs = 5000) {
+  if (!session || !session.id) return false;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(baseUrl, {
+      method: 'DELETE',
+      headers: { 'MCP-Protocol-Version': PROTOCOL_VERSION, 'mcp-session-id': session.id, ...authHeaders },
+      signal: controller.signal,
+      redirect: 'error',
+    });
+    return res.ok;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+    session.id = null;
+  }
 }
 
 // tools/list, following `nextCursor` pagination to the end.
@@ -104,7 +162,7 @@ async function listTools(baseUrl, session, authHeaders = {}, timeoutMs = 60000) 
   let cursor;
   for (let page = 0; page < 20; page++) { // bounded: a broken server must not spin
     const result = await rpc(baseUrl, session, {
-      jsonrpc: '2.0', id: 100 + page, method: 'tools/list',
+      jsonrpc: '2.0', id: requestId(), method: 'tools/list',
       params: cursor ? { cursor } : {},
     }, { headers: authHeaders, timeoutMs });
     for (const t of (result && result.tools) || []) all.push(t);
@@ -116,7 +174,7 @@ async function listTools(baseUrl, session, authHeaders = {}, timeoutMs = 60000) 
 
 async function callTool(baseUrl, session, name, args, authHeaders = {}, timeoutMs = 60000) {
   const result = await rpc(baseUrl, session, {
-    jsonrpc: '2.0', id: 200, method: 'tools/call', params: { name, arguments: args || {} },
+    jsonrpc: '2.0', id: requestId(), method: 'tools/call', params: { name, arguments: args || {} },
   }, { headers: authHeaders, timeoutMs });
   return result;
 }
@@ -264,4 +322,4 @@ function readOnlyHint(mcpTool) {
   return typeof a.readOnlyHint === 'boolean' ? a.readOnlyHint : null;
 }
 
-module.exports = { connect, listTools, callTool, resultToText, convertTool, resolveSchemaRefs, readOnlyHint, parseRpcBody, PROTOCOL_VERSION };
+module.exports = { connect, disconnect, listTools, callTool, resultToText, convertTool, resolveSchemaRefs, readOnlyHint, parseRpcBody, PROTOCOL_VERSION };

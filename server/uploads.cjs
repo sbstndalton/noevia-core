@@ -25,6 +25,38 @@ function validate(name, bytes) {
   const archiveMagic = bytes.subarray(0, 4).equals(Buffer.from([0x50,0x4b,3,4])) || bytes.subarray(0,2).equals(Buffer.from([0x1f,0x8b])) || /^(Rar!|7z\xbc\xaf|BZh)/.test(bytes.subarray(0,6).toString('latin1')) || bytes.subarray(257,262).toString() === 'ustar';
   if (/\.(zip|rar|7z|tar|gz|tgz|bz2|xz|zst|cab|iso)$/i.test(name) || (archiveMagic && !packagedDocument)) throw Object.assign(new Error('Archive bundles are not supported. Upload their individual files instead.'), { status: 400 });
 }
+// A text file is not always UTF-8, and a `.txt` exported from an older editor
+// very often is not. This used to be one fatal UTF-8 decode inside a bare
+// `catch { state = 'stored' }`: a Latin-1 or UTF-16 file was silently reduced
+// to empty content, indistinguishable from an opaque binary, with nothing told
+// to the user and nothing logged. That is data loss, not a limitation.
+//
+// So: honour a BOM, then try UTF-8 strictly, then fall back to windows-1252 —
+// which is the usual answer for legacy Western European text and, being a
+// total mapping, cannot itself fail. Because it cannot fail, it would happily
+// turn a JPEG into mojibake, so binary is ruled out first by the one signal
+// that is reliable across encodings: a NUL byte, which no text encoding here
+// produces for real content.
+//
+// Returns null only when the bytes are genuinely not text. A non-UTF-8 read is
+// reported as such rather than presented as a clean read.
+function decodeText(bytes) {
+  const decode = (encoding, from = 0) => new TextDecoder(encoding, { fatal: true }).decode(bytes.subarray(from));
+  if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
+    try { return { text: decode('utf-8', 3), encoding: 'utf-8' }; } catch { /* a lying BOM; fall through */ }
+  }
+  if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) {
+    try { return { text: decode('utf-16le', 2), encoding: 'utf-16le' }; } catch { /* fall through */ }
+  }
+  if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
+    try { return { text: decode('utf-16be', 2), encoding: 'utf-16be' }; } catch { /* fall through */ }
+  }
+  try { return { text: decode('utf-8'), encoding: 'utf-8' }; } catch { /* not UTF-8; keep going */ }
+  // No BOM and not UTF-8. Before guessing an 8-bit encoding, rule out binary.
+  if (bytes.includes(0)) return null;
+  try { return { text: decode('windows-1252'), encoding: 'windows-1252' }; } catch { return null; }
+}
+
 function directory(workspace, id) { return path.join(workspace.dir, 'project-uploads', hash(String(id))); }
 function original(workspace, id, file) {
   if (!/^[a-f0-9]{64}$/.test(file.attachment?.id || '')) throw new Error('Original not available');
@@ -67,8 +99,15 @@ async function ingest(workspace, project, name, bytes, { connection, source, rem
       if (result.truncated || result.text.length + reason.length + 4 > 200000) reason += ' Text extraction limit reached.';
     } catch (err) { reason = String(err.message || 'DOCX reader unavailable').slice(0,300); }
   } else if (group === 'Text') {
-    const text = new TextDecoder('utf-8', { fatal: true });
-    try { file.content = text.decode(bytes).slice(0, 200000); state = bytes.length > 200000 ? 'partial' : 'ready'; } catch { state = 'stored'; }
+    const decoded = decodeText(bytes);
+    if (decoded) {
+      file.content = decoded.text.slice(0, 200000);
+      state = bytes.length > 200000 ? 'partial' : decoded.encoding === 'utf-8' ? 'ready' : 'partial';
+      if (decoded.encoding !== 'utf-8') reason = `Not valid UTF-8; read as ${decoded.encoding}. Characters outside that encoding may be wrong — re-save the file as UTF-8 if anything looks mangled.`;
+    } else {
+      state = 'stored';
+      reason = 'This file is not readable as text — it looks like binary data despite its extension. The original is kept.';
+    }
   } else if (mime) state = 'vision';
   file.attachment = { id, bytes: bytes.length, group, state, ...(reason ? {reason} : {}), ...(readerVersion ? {readerVersion} : {}), ...(group === 'Images' && bytes.length > 8 * 1024 * 1024 ? { reason: 'Original stored; resize below 8 MB for model image input.' } : {}) };
   if (source || connection) file.source = source || project.projectFolder;

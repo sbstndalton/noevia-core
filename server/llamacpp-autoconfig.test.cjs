@@ -1,7 +1,7 @@
 'use strict';
 const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),os=require('node:os'),path=require('node:path');
 const {readGguf,summarize}=require('./gguf-meta.cjs');
-const {suggest,kvCacheBytes,parseMemoryLimit}=require('./llamacpp-autoconfig.cjs');
+const {suggest,kvCacheBytes,parseMemoryLimit,CTX_CANDIDATES}=require('./llamacpp-autoconfig.cjs');
 const {createModelManager}=require('./model-manager.cjs');
 
 // Synthetic GGUF v3 writer: header only, no tensors.
@@ -83,4 +83,23 @@ test('manager suggestion reads only files inside the read-only model mount and n
   assert.equal((await make({budgetGib:14}).suggestPreset('good')).status,501);
   assert.equal((await make({modelsPath:models}).suggestPreset('good')).status,501);
   assert.equal(fs.readFileSync(ini,'utf8'),before);
+});
+
+test('the context ladder matches the Python planner exactly', () => {
+  // These two lists are the same list in two languages. The planner
+  // (services/model-manager/app/autoconfig.py) decides what to recommend; the
+  // calibrator (llamacpp-calibration.cjs) walks the JS copy to verify what
+  // actually loads. When they drift, noevia recommends contexts it can never
+  // verify — which is what had happened: six values existed only in Python,
+  // added by the densification explained in that file's own comment and never
+  // carried across.
+  const py = fs.readFileSync(
+    path.join(__dirname, '..', '..', '..', 'services', 'model-manager', 'app', 'autoconfig.py'), 'utf8');
+  const block = /_CTX_CANDIDATES = \(([\s\S]*?)\)/.exec(py);
+  assert.ok(block, 'the planner still declares _CTX_CANDIDATES as a tuple');
+  const expected = block[1].match(/\d+/g).map(Number);
+  assert.deepEqual(CTX_CANDIDATES, expected);
+  // Alignment invariant the Python comment relies on.
+  assert.ok(CTX_CANDIDATES.every((v) => v % 4096 === 0), 'every candidate is 4096-aligned');
+  assert.deepEqual(CTX_CANDIDATES, [...CTX_CANDIDATES].sort((a, b) => a - b), 'and ascending');
 });

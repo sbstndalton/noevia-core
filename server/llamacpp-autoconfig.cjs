@@ -10,11 +10,17 @@
 // mmproj, ub 1024) and 8.5 vs 8.6 GiB (Gemma 4 E4B Q4_K_M, 131072 ctx, mmproj), so totals
 // carry a 5% margin; both verified profiles still fit the 14 GiB limit they passed under.
 
+// Kept identical to _CTX_CANDIDATES in services/model-manager/app/autoconfig.py,
+// which is the planner. The calibrator below walks THIS list, so any value the
+// planner can recommend and this list lacks is a context noevia will suggest and
+// can never verify. They had drifted by six values; llamacpp-autoconfig.test.cjs
+// now parses the Python and fails if they diverge again.
 const CTX_CANDIDATES = [
   4096, 8192, 12288, 16384, 24576, 32768, 40960, 49152, 57344, 65536, 73728, 81920,
-  90112, 98304, 106496, 114688, 122880, 131072, 139264, 147456, 155648, 163840, 172032,
-  180224, 188416, 196608, 204800, 212992, 221184, 229376, 237568, 245760, 253952, 262144,
-  294912, 327680, 360448, 393216, 425984, 458752, 491520, 524288, 655360, 786432, 917504, 1048576,
+  90112, 98304, 106496, 114688, 122880, 131072, 139264, 147456, 151552, 155648, 159744, 163840,
+  172032, 180224, 188416, 196608, 204800, 212992, 221184, 229376, 237568, 245760, 253952, 262144,
+  294912, 327680, 360448, 393216, 425984, 458752, 491520, 524288, 589824, 655360, 720896, 786432,
+  851968, 917504, 983040, 1048576,
 ];
 const Q8_BYTES = 1.0625;           // q8_0 bytes per element; K and V both stay q8_0
 const RESERVE_GIB = 1.0;           // runtime, driver context and compute scratch
