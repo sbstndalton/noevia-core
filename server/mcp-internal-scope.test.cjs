@@ -10,40 +10,33 @@
 // the other chat's project — across users.
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const path = require('node:path');
-const vm = require('node:vm');
 const { AsyncLocalStorage } = require('node:async_hooks');
 
 // The real executeToolCall (toolboxes.cjs) and the real token-minting path
-// (mcpInternalAuth, still in index.cjs), with everything they touch faked out.
+// (mcp-wiring.cjs), with everything they touch faked out.
 function harness() {
-  const server = fs.readFileSync(path.join(__dirname, 'index.cjs'), 'utf8');
   const minted = [];
   let release;
   const gate = new Promise((resolve) => { release = resolve; });
-
-  const context = {
-    require,
-    console,
-    requestScope: new AsyncLocalStorage(),
-    MCP_INTERNAL_KEY: 'test-key',
-    isWriteTool: () => false,
-    authService: { getStorage: () => ({ kind: 'local' }) },
-    mcpInternal: { mintToken: (_key, claims) => { minted.push(claims); return 'tok'; } },
-  };
-  vm.createContext(context);
-  const cut = (from, to) => server.slice(server.indexOf(from), server.indexOf(to));
-  vm.runInContext(cut('function mcpInternalAuth(', '/** Discovery runs with no user'), context);
+  const scope = new AsyncLocalStorage();
+  const context = { requestScope: scope };
+  const wiring = require('./mcp-wiring.cjs').createMcpWiring({
+    servers: [], manifest: [], mcp: {}, bindBoxes: () => [],
+    directoryMcp: { asServers: () => [] }, mcpOAuth: {},
+    directoryUrlAllowed: async () => true, credentialOriginAllowed: () => false,
+    scope, storageFor: () => ({ kind: 'local' }), isWriteTool: () => false,
+    internal: { mintToken: (_key, claims) => { minted.push(claims); return 'tok'; } }, internalKey: 'test-key',
+    reduceToolResult: (text) => ({ text, reduced: false }), logger: { log() {}, warn() {} },
+  });
   const { executeToolCall } = require('./toolboxes.cjs').createToolboxes({
-    scope: context.requestScope,
+    scope,
     mcpTools: () => new Map([['nc_notes_search_notes', {}]]),
     documentSources: { notice: () => '' },
     // Stands in for the real MCP round trip: the first caller parks here so
     // the second can run to completion underneath it.
     async executeMcp(name) {
       if (minted.length === 0 && !context.__second) { context.__second = true; await gate; }
-      return JSON.stringify(context.mcpInternalAuth(name));
+      return JSON.stringify(wiring.mcpInternalAuth(name));
     },
   });
   context.executeToolCall = executeToolCall;
