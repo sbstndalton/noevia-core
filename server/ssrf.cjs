@@ -78,4 +78,22 @@ async function isPublicUrl(rawUrl) {
   return addresses.every((address) => !isPrivateIp(address));
 }
 
-module.exports = { isPublicUrl, isPrivateIp };
+// Origin policy for the endpoints a member may register: providers, storage
+// connections, the Diary corpus sync. A member must not aim the server's
+// outbound traffic — connection tests, file browsing, corpus sync — at
+// internal addresses (RFC1918, link-local metadata, …). Admins are exempt: a
+// self-hosted administrator legitimately connects LAN storage (a home NAS,
+// an in-network Nextcloud) or local inference. MEMBER_OUTBOUND_ORIGINS is
+// read at call time, so an operator's change (or a test's) takes effect
+// without a restart.
+function createEndpointApproved({ env = process.env } = {}) {
+  return function endpointApproved(authn, rawUrl) {
+    try {
+      const u = new URL(rawUrl);
+      if (!['http:', 'https:'].includes(u.protocol) || u.username || u.password) return false;
+      return authn?.user.role === 'admin' || (env.MEMBER_OUTBOUND_ORIGINS || '').split(',').map(x => x.trim()).includes(u.origin);
+    } catch { return false; }
+  };
+}
+
+module.exports = { isPublicUrl, isPrivateIp, createEndpointApproved };

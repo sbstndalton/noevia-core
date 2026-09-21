@@ -42,7 +42,7 @@ const { createModelManager } = require('./model-manager.cjs');
 const { createAuth, createRateLimiter } = require('./auth.cjs');
 const { createWorkspaceStore } = require('./workspace.cjs');
 const { createSecretStore } = require('./secrets.cjs');
-const { isPublicUrl } = require('./ssrf.cjs');
+const { isPublicUrl, createEndpointApproved } = require('./ssrf.cjs');
 
 const PORT = Number(process.env.UI_PORT || 8021);
 const HOST = process.env.UI_HOST || '0.0.0.0';
@@ -312,70 +312,20 @@ function diaryHeaders() {
   return h;
 }
 
-// SSRF guard for storage endpoints. A member must not aim the server's
-// outbound traffic — connection tests, file browsing, diary corpus sync — at
-// internal addresses (RFC1918, link-local metadata, …). Admins are exempt: a
-// self-hosted administrator legitimately connects LAN storage (a home NAS,
-// an in-network Nextcloud). Same policy as the provider registry.
+// SSRF guard for storage endpoints: the member-origin policy lives in ssrf.cjs (createEndpointApproved)
+// and is the same one the provider registry applies.
 const STORAGE_PRIVATE_URL_ERROR = 'An http(s) server URL is required. This server is not approved for member connections. Ask an administrator to add its origin to MEMBER_OUTBOUND_ORIGINS.';
-function endpointApproved(authn, rawUrl) {
-  try {
-    const u = new URL(rawUrl);
-    if (!['http:', 'https:'].includes(u.protocol) || u.username || u.password) return false;
-    return authn?.user.role === 'admin' || (process.env.MEMBER_OUTBOUND_ORIGINS || '').split(',').map(x => x.trim()).includes(u.origin);
-  } catch { return false; }
-}
+const endpointApproved = createEndpointApproved();
 async function storageEndpointAllowed(authn, rawUrl) {
   return endpointApproved(authn, rawUrl);
 }
 
 const PROJECTS = arrayProxy('projects');
 
-// ── Provider registry (step 9): generic OpenAI-compatible endpoints ────────
-// One adapter covers all of them (same /chat/completions shape). Projects
-// without a provider field use the environment-configured default provider.
-// Syncs the private half of the registry from the current merged view and
-// persists ONLY the user's private provider file. Shared rows are excluded:
-// a per-user save must never rewrite shared-providers.json (checkpoint 1c —
-// a stale snapshot could erase another admin's shared provider).
-function saveProviders() {
-  const ws = currentWorkspace();
-  ws.privateProviders = Array.from(ws.providers).filter((p) => !p.shared && p.id !== DEFAULT_PROVIDER_ID);
-  ws.saveProviders();
-}
-
-// Admin path: persists the shared half of the registry from the current
-// merged view (private rows are synced in memory only, untouched on disk).
-function saveSharedProviders() {
-  const ws = currentWorkspace();
-  ws.privateProviders = Array.from(ws.providers).filter((p) => !p.shared && p.id !== DEFAULT_PROVIDER_ID);
-  ws.saveShared();
-}
-
 const PROVIDERS = arrayProxy('providers');
-
-function backupOnce(name) {
-  const file = path.join(currentWorkspace().dir, name);
-  if (!fs.existsSync(file)) return;
-  const backup = `${file}.pre-neutral-provider.bak`;
-  if (!fs.existsSync(backup)) fs.copyFileSync(file, backup, fs.constants.COPYFILE_EXCL);
-}
-
-function getProvider(id) {
-  const normalized = id === 'lemonade' ? DEFAULT_PROVIDER_ID : id;
-  return PROVIDERS.find((pr) => pr.id === normalized) || PROVIDERS.find((pr) => pr.id === DEFAULT_PROVIDER_ID) || null;
-}
-
-function maskKey(key) {
-  if (!key || key === 'local') return null;
-  return key.length > 8 ? `${key.slice(0, 3)}…${key.slice(-4)}` : `…${key.slice(-4)}`;
-}
-
-function providerHeaders(provider, extra) {
-  const h = { 'Content-Type': 'application/json', ...(extra || {}) };
-  if (provider.apiKey && provider.apiKey !== 'local') h.Authorization = `Bearer ${provider.apiKey}`;
-  return h;
-}
+// The provider registry: persistence, lookup, key masking and request headers (providers.cjs).
+const providerRegistry = require('./providers.cjs').createProviderRegistry({ currentWorkspace, PROVIDERS, DEFAULT_PROVIDER_ID });
+const { getProvider, providerHeaders } = providerRegistry;
 
 const FREE_CHATS = arrayProxy('freeChats');
 
@@ -788,6 +738,10 @@ const projectRoutes = require('./routes/projects.cjs').createProjectRoutes({
   json, readBody, readJson, requestScope, dispatch: (req, res) => handleRequestScoped(req, res), currentWorkspace, authService, storageClient, documents, documentSources, rag, fs, path,
   reasoningEffort, projectAppearance, diaryExtras, PROJECTS, DEFAULT_TOOLBOXES, sanitizeToolboxes, getProvider, ensureRolesLoaded, store: projectStore,
 });
+// The provider registry's routes: list, connect, test and remove (routes/providers.cjs).
+const providerRoutes = require('./routes/providers.cjs').createProviderRoutes({
+  json, readBody, readJson, fetchJson, endpointApproved, PROVIDERS, PROJECTS, DEFAULT_PROVIDER_ID, modelManager, currentWorkspace, saveProjects, registry: providerRegistry,
+});
 // ── Routing ────────────────────────────────────────────────────────────────
 
 const diaryConnectors = require('./diary-connectors.cjs').createCredentials(authService);
@@ -1146,84 +1100,7 @@ async function handleRequestScoped(req, res) {
       });
     }
 
-    // ── Provider registry (step 9): list / connect / remove. GET never returns
-    // a saved apiKey in plaintext — masked, e.g. sk-…last4.
-    if (p === '/api/providers' && req.method === 'GET') {
-      return json(res, 200, {
-        providers: PROVIDERS.map((pr) => ({
-          id: pr.id,
-          label: pr.label,
-          baseUrl: pr.baseUrl,
-          apiKeyMasked: maskKey(pr.apiKey),
-          isDefault: pr.id === DEFAULT_PROVIDER_ID,
-          managed: pr.id === DEFAULT_PROVIDER_ID && modelManager.enabled,
-          shared: !!pr.shared,
-          defaultModel: pr.defaultModel || undefined,
-        })),
-      });
-    }
-    if (p === '/api/providers' && req.method === 'POST') {
-      const raw = await readBody(req);
-      let body;
-      try {
-        body = JSON.parse(raw);
-      } catch {
-        return json(res, 400, { error: 'invalid JSON' });
-      }
-      const label = String(body.label || '').trim().slice(0, 80);
-      let baseUrl = String(body.baseUrl || '').trim().replace(/\/+$/, '');
-      const apiKey = String(body.apiKey || '').trim();
-      const defaultModel = String(body.defaultModel || '').trim().slice(0, 200);
-      const shared = body.shared === true;
-      if (shared && authn.user.role !== 'admin') return json(res, 403, { error: 'administrator required for shared providers' });
-      if (!label) return json(res, 400, { error: 'label required' });
-      if (!/^https?:\/\//.test(baseUrl)) return json(res, 400, { error: 'baseUrl must be an http(s) URL' });
-      // SSRF guard: a member must not register an endpoint the server can
-      // only reach from its own internal network (RFC1918, metadata, etc.).
-      // Admins are exempt — local-inference setups legitimately do this.
-      if (!endpointApproved(authn, baseUrl)) {
-        return json(res, 400, { error: 'Provider origin is not approved for member connections; contact an administrator.' });
-      }
-      const id = `prov-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      PROVIDERS.push({ id, label, baseUrl, apiKey, defaultModel, shared });
-      if (shared) saveSharedProviders(); else saveProviders();
-      return json(res, 200, { id, label, baseUrl, defaultModel, apiKeyMasked: maskKey(apiKey) });
-    }
-    if (p === '/api/providers/test' && req.method === 'POST') {
-      const body = await readJson(req);
-      const baseUrl = String(body.baseUrl || '').trim().replace(/\/+$/, '');
-      if (!/^https?:\/\//.test(baseUrl)) return json(res, 400, { error: 'valid baseUrl required' });
-      // Same SSRF guard as registration: the test route must not become a
-      // prober for internal addresses on behalf of a member.
-      if (!endpointApproved(authn, baseUrl)) {
-        return json(res, 400, { error: 'Provider origin is not approved for member connections; contact an administrator.' });
-      }
-      const headers = { 'Content-Type': 'application/json' };
-      if (body.apiKey) headers.Authorization = `Bearer ${String(body.apiKey)}`;
-      try {
-        // redirect:'error' — same rationale as the storage client: a member-
-        // registered endpoint must not bounce the request inward.
-        const result = await fetchJson(`${baseUrl.replace(/\/v1$/, '')}/v1/models`, { headers, redirect: 'error' }, 8000);
-        const models = Array.isArray(result.body?.data) ? result.body.data.map(m => m.id).filter(Boolean).slice(0, 100) : [];
-        return json(res, result.ok ? 200 : 502, result.ok ? { ok: true, models } : { error: `provider returned ${result.status}` });
-      } catch (e) { return json(res, 502, { error: e.message }); }
-    }
-    const provDel = p.match(/^\/api\/providers\/([^/]+)$/);
-    if (provDel && req.method === 'DELETE') {
-      const id = decodeURIComponent(provDel[1]);
-      if (id === DEFAULT_PROVIDER_ID || id === 'lemonade') return json(res, 400, { error: 'the default provider cannot be removed' });
-      const selectedProvider = Array.from(PROVIDERS).find(p => p.id === id);
-      if (selectedProvider?.shared && authn.user.role !== 'admin') return json(res, 403, { error: 'administrator required' });
-      if (!currentWorkspace().removeProvider(id)) return json(res, 404, { error: 'no such provider' });
-      // Projects pointing at the removed provider fall back to the configured default.
-      for (const pr of PROJECTS) {
-        if (pr.provider === id) {
-          delete pr.provider;
-        }
-      }
-      saveProjects(PROJECTS);
-      return json(res, 200, { ok: true });
-    }
+    if (await providerRoutes(req, res, { path: p, authn })) return;
 
     // ── Optional model-manager statistics.
     if (p === '/api/stats') {

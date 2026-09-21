@@ -7,7 +7,7 @@ const path = require('node:path');
 const { Readable, Writable } = require('node:stream');
 const test = require('node:test');
 
-const { isPrivateIp, isPublicUrl } = require('./ssrf.cjs');
+const { isPrivateIp, isPublicUrl, createEndpointApproved } = require('./ssrf.cjs');
 
 // ── Unit tests: private-IP classification ───────────────────────────────────
 
@@ -62,6 +62,26 @@ test('isPublicUrl rejects literal private targets including metadata and IPv4-ma
 test('isPublicUrl accepts public IP literals and rejects unresolvable hostnames', async () => {
   assert.equal(await isPublicUrl('https://93.184.216.34/v1'), true);
   assert.equal(await isPublicUrl('http://this-host-does-not-exist.invalid/v1'), false);
+});
+
+// ── Unit tests: the member-origin policy behind providers and storage ──────
+
+test('endpointApproved exempts admins, matches members against the exact approved origin, read at call time', () => {
+  const env = {};
+  const approved = createEndpointApproved({ env });
+  const admin = { user: { role: 'admin' } }, member = { user: { role: 'member' } };
+  assert.equal(approved(admin, 'http://10.0.0.5:8080/v1'), true);
+  assert.equal(approved(admin, 'ftp://10.0.0.5/'), false, 'only http(s), even for an admin');
+  assert.equal(approved(admin, 'https://user:pw@host.example/'), false, 'credentials in the URL are refused');
+  assert.equal(approved(admin, 'not a url'), false);
+  assert.equal(approved(member, 'https://approved.example.com/v1'), false);
+  env.MEMBER_OUTBOUND_ORIGINS = ' https://approved.example.com , https://other.example';
+  assert.equal(approved(member, 'https://approved.example.com/v1'), true);
+  assert.equal(approved(member, 'https://approved.example.com.evil.test/v1'), false);
+  assert.equal(approved(member, 'https://approved.example.com:8443/v1'), false);
+  assert.equal(approved(member, 'https://other.example/'), true);
+  assert.equal(approved(null, 'https://other.example/'), true, 'an absent caller is treated as a member');
+  assert.equal(approved(null, 'https://elsewhere.example/'), false);
 });
 
 // ── Route-level tests: member vs admin on /api/providers ───────────────────
