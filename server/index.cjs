@@ -570,6 +570,16 @@ const connectorRate = require('./auth.cjs').createRateLimiter();
 const diaryRoutes = require('./routes/diary.cjs').createDiaryRoutes({
   json, readBody, readJson, fetchJson, DIARY_BASE, authService, currentWorkspace, rateLimited: (userId) => llmRateLimited(userId), connectorRate, diaryConnectors, diary,
 });
+// Sign-in, the signed-in account and /api/admin/* (routes/auth.cjs). The open set is also the
+// router's own list of what a signed-out browser may call.
+const publicAuthRoutes = new Set([
+  '/api/setup/status', '/api/setup/complete', '/api/auth/login/password',
+  '/api/auth/login/passkey/options', '/api/auth/login/passkey/verify',
+  '/api/auth/invitations/accept', '/api/auth/recovery/complete',
+]);
+const authRoutes = require('./routes/auth.cjs').createAuthRoutes({
+  json, authResult, readJson, authService, publicAuthRoutes, davSettings, davConfig, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, env: process.env,
+});
 // GET /api/toolboxes: the picker view (routes/toolboxes.cjs). MCP state is read at call time.
 const toolboxRoutes = require('./routes/toolboxes.cjs').createToolboxRoutes({
   discoverMcpTools: () => discoverMcpTools(), toolboxSummaries, json,
@@ -605,32 +615,8 @@ async function handleRequestScoped(req, res) {
       return res.end(req.method === 'HEAD' ? undefined : publicPage(p));
     }
     if (await diaryRoutes.connector(req, res, { path: p })) return;
-    const publicAuthRoutes = new Set([
-      '/api/setup/status', '/api/setup/complete', '/api/auth/login/password',
-      '/api/auth/login/passkey/options', '/api/auth/login/passkey/verify',
-      '/api/auth/invitations/accept', '/api/auth/recovery/complete',
-    ]);
     if ((p === '/api/instance' || p === '/.well-known/webauthn') && await webAddressRoutes(req, res, { path: p, authn: null })) return;
-    if (p === '/api/setup/status' && req.method === 'GET') {
-      return json(res, 200, { configured: authService.userCount() > 0, publicOrigin: authService.origin || process.env.PUBLIC_ORIGIN || '' });
-    }
-    if (publicAuthRoutes.has(p) && req.method !== 'GET' && !authService.originValid(req)) {
-      return json(res, 403, { error: 'origin not allowed' });
-    }
-    if (p === '/api/setup/complete' && req.method === 'POST') return authResult(res, await authService.setup(req, res, await readJson(req)));
-    if (p === '/api/auth/login/password' && req.method === 'POST') return authResult(res, await authService.passwordLogin(req, res, await readJson(req)));
-    if (p === '/api/auth/login/passkey/options' && req.method === 'POST') {
-      return json(res, 200, await authService.authenticationOptions((await readJson(req)).username));
-    }
-    if (p === '/api/auth/login/passkey/verify' && req.method === 'POST') {
-      try { return json(res, 200, await authService.authenticationVerify(req, res, await readJson(req))); }
-      catch { return json(res, 401, { error: 'sign-in failed' }); }
-    }
-    if (p === '/api/auth/invitations/accept' && req.method === 'POST') return authResult(res, await authService.acceptInvite(req, res, await readJson(req)));
-    if (p === '/api/auth/recovery/complete' && req.method === 'POST') {
-      try { const ok = await authService.completeRecovery(await readJson(req)); return json(res, ok ? 200 : 400, ok ? { ok: true } : { error: 'recovery link is invalid or expired' }); }
-      catch (e) { return json(res, 400, { error: e.message }); }
-    }
+    if (await authRoutes.open(req, res, { path: p })) return;
 
     const authn = p.startsWith('/api/') ? authService.authenticate(req) : null;
     if (p.startsWith('/api/') && !publicAuthRoutes.has(p) && !authn) return unauthorized(res);
@@ -650,49 +636,7 @@ async function handleRequestScoped(req, res) {
     if (authn && p.startsWith('/api/projects/') && await codeRoutes(req, res, { path: p, authn })) return;
     if (await diaryRoutes.connectors(req, res, { path: p, authn })) return;
     if (await projectRoutes(req, res, { path: p, authn, url })) return;
-    if (p === '/api/auth/session' && req.method === 'GET') {
-      const csrfCookie = String(req.headers.cookie || '').split(';').map(x => x.trim()).find(x => x.startsWith('cowork_csrf='));
-      return json(res, 200, { user: authn.user, csrfToken: authn.legacy ? null : decodeURIComponent((csrfCookie || '').slice(12)), legacy: authn.legacy });
-    }
-    if (p === '/api/auth/logout' && req.method === 'POST') return authResult(res, authService.logout(req, res, authn));
-    if (p === '/api/profile/appearance') {
-      if(req.method==='GET')return json(res,200,authService.getAppearance(authn.user.id));
-      if(req.method==='PUT') {
-        const body=await readJson(req);
-        try { return json(res,200,authService.setAppearance(authn.user.id,body)); }
-        catch(error) { return json(res,400,{error:error.message}); }
-      }
-      return json(res,405,{error:'method not allowed'});
-    }
-    if (p === '/api/profile' && req.method === 'GET') return json(res, 200, { user: authn.user, passkeys: authService.listPasskeys(authn.user.id), sessions: authService.listSessions(authn.user.id) });
-    if (p === '/api/profile/sharing' && req.method === 'GET') return json(res, 200, davSettings.get(authn.user));
-    if (p === '/api/profile/sharing' && req.method === 'PUT') {
-      try { return json(res, 200, davSettings.save(authn.user, await readJson(req))); }
-      catch (e) { return json(res, 400, { error: e.message }); }
-    }
-    if (p === '/api/profile/app-passwords' && req.method === 'GET') {
-      res.setHeader('Cache-Control', 'no-store');
-      return json(res, 200, { appPasswords: authService.appPasswords.list(authn.user.id), sharingAvailable: davConfig.available });
-    }
-    if (p === '/api/profile/app-passwords' && req.method === 'POST') {
-      res.setHeader('Cache-Control', 'no-store');
-      try { return json(res, 201, await authService.appPasswords.create(authn.user.id, await readJson(req))); }
-      catch (e) { return json(res, 400, { error: e.message }); }
-    }
-    const appPasswordRoute = p.match(/^\/api\/profile\/app-passwords\/([a-f0-9]{32})$/);
-    if (appPasswordRoute && req.method === 'DELETE') {
-      return json(res, authService.appPasswords.revoke(authn.user.id, appPasswordRoute[1]) ? 200 : 404, { ok: true });
-    }
-    if (p === '/api/profile' && req.method === 'PATCH') {
-      const body = await readJson(req); authService.updateProfile(authn.user.id, body.displayName);
-      return json(res, 200, { ok: true });
-    }
-    if (p === '/api/profile/features' && req.method === 'PUT') {
-      return json(res, 200, authService.setDiaryEnabled(authn.user.id, !!(await readJson(req)).diaryEnabled));
-    }
-    if (p === '/api/profile/onboarding' && req.method === 'POST') {
-      return json(res, 200, authService.markOnboarded(authn.user.id));
-    }
+    if (await authRoutes.account(req, res, { path: p, authn })) return;
     if (p === '/api/integrations/storage' && req.method === 'GET') return json(res, 200, authService.getStorage(authn.user.id));
     // Browse/read over the user's own connected storage (project knowledge
     // intake; read-only). The saved connection's own credentials are used
@@ -815,50 +759,6 @@ async function handleRequestScoped(req, res) {
       if (!endpointApproved(authn, baseUrl)) return json(res, 403, { error: STORAGE_PRIVATE_URL_ERROR });
       return json(res, 200, authService.saveStorage(authn.user.id, { kind: 'nextcloud', baseUrl, username: credentials.loginName, secret: credentials.appPassword, corpusRoot: body.corpusRoot || 'Cowork/Diary' }));
     }
-    if (p === '/api/auth/passkeys/register/options' && req.method === 'POST') return json(res, 200, await authService.registrationOptions(authn.user.id));
-    if (p === '/api/auth/passkeys/register/verify' && req.method === 'POST') {
-      try { return json(res, 200, await authService.registrationVerify(authn.user.id, await readJson(req))); }
-      catch (e) { return json(res, 400, { error: e.message }); }
-    }
-    const passkeyRoute = p.match(/^\/api\/auth\/passkeys\/([^/]+)$/);
-    if (passkeyRoute && req.method === 'DELETE') return json(res, authService.deletePasskey(authn.user.id, decodeURIComponent(passkeyRoute[1])) ? 200 : 404, { ok: true });
-    if (passkeyRoute && req.method === 'PATCH') {
-      const ok = authService.renamePasskey(authn.user.id, decodeURIComponent(passkeyRoute[1]), (await readJson(req)).name);
-      return json(res, ok ? 200 : 404, { ok });
-    }
-    const sessionRoute = p.match(/^\/api\/auth\/sessions\/([^/]+)$/);
-    if (sessionRoute && req.method === 'DELETE') return json(res, authService.revokeSession(authn.user.id, decodeURIComponent(sessionRoute[1])) ? 200 : 404, { ok: true });
-    if (p.startsWith('/api/admin/')) {
-      if (authn.user.role !== 'admin') return json(res, 403, { error: 'administrator required' });
-      if (p === '/api/admin/users' && req.method === 'GET') return json(res, 200, { users: authService.listUsers() });
-      if (p === '/api/admin/invitations' && req.method === 'POST') return json(res, 201, authService.createInvite(authn.user.id, (await readJson(req)).role));
-      const disabledRoute = p.match(/^\/api\/admin\/users\/([^/]+)\/disabled$/);
-      if (disabledRoute && req.method === 'PUT') {
-        try { return json(res, authService.setDisabled(authn.user.id, decodeURIComponent(disabledRoute[1]), !!(await readJson(req)).disabled) ? 200 : 404, { ok: true }); }
-        catch (e) { return json(res, 400, { error: e.message }); }
-      }
-      const recoveryRoute = p.match(/^\/api\/admin\/users\/([^/]+)\/recovery$/);
-      if (recoveryRoute && req.method === 'POST') {
-        const result = authService.createRecovery(authn.user.id, decodeURIComponent(recoveryRoute[1]));
-        return json(res, result ? 201 : 404, result || { error: 'no such user' });
-      }
-      const userRoute = p.match(/^\/api\/admin\/users\/([^/]+)$/);
-      if (userRoute && req.method === 'DELETE') {
-        try {
-          const id = decodeURIComponent(userRoute[1]); const ok = authService.deleteUser(authn.user.id, id, (await readJson(req)).username);
-          if (ok) {
-            workspaceStore.remove(id);
-            await driveAccounts.removeUser(id);
-            const headers = { 'X-Cowork-User-ID': id };
-            if (DIARY_TOKEN) headers.Authorization = `Bearer ${DIARY_TOKEN}`;
-            await fetchJson(`${DIARY_BASE}/api/internal/tenant`, { method: 'DELETE', headers }, 15000).catch(() => null);
-          }
-          return json(res, ok ? 200 : 400, { ok });
-        } catch (e) { return json(res, 400, { error: e.message }); }
-      }
-      return json(res, 404, { error: 'not found' });
-    }
-
     const approvalMatch = p.match(/^\/api\/tool-approvals\/([^/]+)$/);
     if (approvalMatch && req.method === 'POST') {
       const id = decodeURIComponent(approvalMatch[1]);
