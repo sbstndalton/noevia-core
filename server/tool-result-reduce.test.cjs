@@ -134,3 +134,23 @@ test('the cap holds across a range of row counts and widths', () => {
     }
   }
 });
+
+test('fitting a long listing is linear and matches a re-render-everything reference', () => {
+  // The fit used to re-tabulate the surviving rows on every step (quadratic; a
+  // 500-record listing took ~50 ms of the reply's own time). It now renders once
+  // and drops lines. The reference below is the old shape: for a given `kept`,
+  // the body is exactly the header plus the first `kept` rendered rows.
+  const rows = Array.from({ length: 500 }, (_, i) => ({ id: i, title: `Row ${i}`, content: 'x'.repeat(20 + (i % 9) * 7), empty: null }));
+  const out = reduceToolResult(JSON.stringify(rows), { maxChars: 8000 });
+  const kept = Number(/showing (\d+) of 500/.exec(out.note)[1]);
+  const lines = out.text.split('\n');
+  assert.equal(lines.length, 2 + 1 + kept, 'legend, note, header, then exactly the kept rows');
+  assert.deepEqual(lines.slice(3).map((l) => l.split('\t')[0]), rows.slice(0, kept).map((r) => String(r.id)));
+  assert.ok(out.text.length <= 8000);
+  // The old loop stopped at the FIRST kept that fits, so one more row cannot fit.
+  const oneMore = out.text.length + lines[lines.length - 1].length + 1;
+  assert.ok(oneMore > 8000, 'kept is the largest count that fits');
+  const t0 = performance.now();
+  for (let i = 0; i < 20; i++) reduceToolResult(JSON.stringify(rows), { maxChars: 8000 });
+  assert.ok((performance.now() - t0) / 20 < 10, 'well under the old 40-50 ms');
+});

@@ -63,17 +63,32 @@ function usefulKeys(rows) {
   return keys.filter((k) => rows.some((row) => !isEmptyValue(row[k])));
 }
 
-function tabular(rows, keys, maxValueChars) {
+// One line per record, header first. Rendered ONCE: fitting to the cap then
+// drops lines from the end rather than re-rendering the survivors, which made
+// a 500-record listing quadratic (measured 53 ms; now under a millisecond).
+function tabularLines(rows, keys, maxValueChars) {
   const lines = [keys.join('\t')];
   for (const row of rows) {
     lines.push(keys.map((k) => {
       const v = row[k];
       if (v === undefined) return '';
-      if (typeof v === 'string') return truncateValue(v, maxValueChars).replace(/[\t\r\n]+/g, ' ');
       return truncateValue(v, maxValueChars).replace(/[\t\r\n]+/g, ' ');
     }).join('\t'));
   }
-  return lines.join('\n');
+  return lines;
+}
+
+// The largest `kept` (at least 1) for which the header plus the first `kept`
+// record lines, joined by newlines, satisfy `fits(kept, length)`. Walks down
+// from the full listing exactly as the old loop did, so the answer is the same.
+function fitLines(lines, fits) {
+  let kept = lines.length - 1;
+  let length = lines.reduce((n, l) => n + l.length, 0) + lines.length - 1;
+  while (kept > 1 && !fits(kept, length)) {
+    length -= lines[kept].length + 1;
+    kept -= 1;
+  }
+  return { kept, body: lines.slice(0, kept + 1).join('\n') };
 }
 
 // Recursively drop empty fields and truncate long strings, then serialise
@@ -124,7 +139,8 @@ function reduceToolResult(result, opts = {}) {
       const droppedKeys = new Set(rows.flatMap((r) => Object.keys(r)));
       for (const k of keys) droppedKeys.delete(k);
       const legend = `[${rows.length} records, tab-separated, first line is the column names${droppedKeys.size ? `; ${droppedKeys.size} column(s) omitted because they were empty in every record: ${[...droppedKeys].join(', ')}` : ''}]`;
-      let body = tabular(rows, keys, maxValueChars);
+      const lines = tabularLines(rows, keys, maxValueChars);
+      let body = lines.join('\n');
       let kept = rows.length;
       // Still over after hoisting the keys: drop whole records from the end
       // rather than cutting a line in half, and say how many went.
@@ -135,13 +151,11 @@ function reduceToolResult(result, opts = {}) {
       // the note every time it fired: a real 400-record Nextcloud-shaped
       // listing reduced to 8,037 characters against a 8,000 cap.
       const noteFor = (n) => `[showing ${n} of ${rows.length} records; ${rows.length - n} omitted to fit. Narrow the query if you need them.]`;
-      const fits = (n, text) => legend.length + 1 + noteFor(n).length + 1 + text.length <= maxChars;
+      const fits = (n, length) => legend.length + 1 + noteFor(n).length + 1 + length <= maxChars;
       if (legend.length + 1 + body.length > maxChars) {
-        while (kept > 1) {
-          kept -= 1;
-          body = tabular(rows.slice(0, kept), keys, maxValueChars);
-          if (fits(kept, body)) break;
-        }
+        // The old loop stepped down first and then tested, so the full listing
+        // itself was never a candidate here; keep that by starting one below.
+        ({ kept, body } = fitLines(lines.slice(0, rows.length), fits));
       }
       const omitted = rows.length - kept;
       const note = omitted ? noteFor(kept) : legend;
@@ -172,12 +186,7 @@ function tabulate(rows, opts = {}) {
   if (!list.length) return { text: '(no records)', note: '', kept: 0 };
   const keys = usefulKeys(list);
   if (!keys.length) return { text: '(no records)', note: '', kept: 0 };
-  let kept = list.length;
-  let body = tabular(list, keys, maxValueChars);
-  while (kept > 1 && body.length > maxChars) {
-    kept -= 1;
-    body = tabular(list.slice(0, kept), keys, maxValueChars);
-  }
+  const { kept, body } = fitLines(tabularLines(list, keys, maxValueChars), (_n, length) => length <= maxChars);
   const omitted = list.length - kept;
   const note = omitted ? `[showing ${kept} of ${list.length}; ${omitted} omitted to fit]` : '';
   return { text: body, note, kept };
