@@ -39,7 +39,7 @@ function derive(events) {
 }
 
 // `kinds` scopes retention: stores sharing one jobs/ directory each prune only their own kinds.
-function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 200, kinds = null } = {}) {
+function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 200, kinds = null, durable = false } = {}) {
   const root = path.join(dir, 'jobs');
   const controllers = new Map();
   const file = (id) => {
@@ -47,9 +47,26 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
     return path.join(root, id + '.jsonl');
   };
   function events(id) {
-    try { return fs.readFileSync(file(id), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)); }
-    catch (e) { if (e.status) throw e; return []; }
+    try {
+      const rows = fs.readFileSync(file(id), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+      let previous = null;
+      for (const [i, row] of rows.entries()) {
+        if (rows[0]?.hash || row.hash || (durable && (!kinds || kinds.includes(rows[0]?.data?.kind)))) {
+          const { hash, ...payload } = row;
+          if (row.job !== id || row.seq !== i + 1 || row.previous !== previous ||
+              hash !== crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex')) throw Error('Invalid journal chain');
+          previous = hash;
+        }
+      }
+      return rows;
+    } catch (e) {
+      if (e.status) throw e;
+      if (e.code === 'ENOENT') return [];
+      // Never turn corruption into an empty journal and replay uncertain effects.
+      throw Object.assign(Error('Unreadable job journal; review required', { cause: e }), { status: 409 });
+    }
   }
+
   function append(id, type, data = {}) {
     if (!TYPES.has(type)) throw Error(`Unknown job event type: ${type}`);
     const current = events(id);
@@ -60,7 +77,18 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
     if (finished && TERMINAL.has(finished.status) && !(type === 'artifact.created' && finished.status === 'cancelled')) throw Object.assign(Error('Job already finished'), { status: 409 });
     const event = { job: id, seq: current.length + 1, type, at: now(), data };
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
-    fs.appendFileSync(file(id), JSON.stringify(event) + '\n', { mode: 0o600 });
+    const sync = durable || current[0]?.hash;
+    if (sync) {
+      event.previous = current.at(-1)?.hash || null;
+      event.hash = crypto.createHash('sha256').update(JSON.stringify(event)).digest('hex');
+    }
+    const fd = fs.openSync(file(id), 'a', 0o600);
+    try { fs.writeFileSync(fd, JSON.stringify(event) + '\n'); if (sync) fs.fsyncSync(fd); }
+    finally { fs.closeSync(fd); }
+    if (sync) {
+      const directory = fs.openSync(root, 'r');
+      try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+    }
     return event;
   }
   function get(id) { const e = events(id); return e.length ? derive(e) : null; }

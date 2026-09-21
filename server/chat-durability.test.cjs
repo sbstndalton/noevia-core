@@ -1,0 +1,55 @@
+'use strict';
+const test=require('node:test'),assert=require('node:assert/strict');
+const fs=require('node:fs'),path=require('node:path'),os=require('node:os');
+const {EventEmitter}=require('node:events');
+const {createChatHandler}=require('./chat.cjs');
+const {createToolExchange}=require('./tool-exchange.cjs');
+const {createVisionProbe}=require('./vision.cjs');
+const {createChatTurns}=require('./chat-turns.cjs');
+async function run(t,ambiguous=false) {
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'noevia-chat-durable-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+  const userId='synthetic-user',projectId='fixture-project',service=createChatTurns({enabled:true});
+  const events=[],res=new EventEmitter();res.writeHead=()=>{};res.write=line=>events.push(JSON.parse(line.slice(6)));res.end=()=>{res.writableEnded=true;res.emit('finish');};
+  let requests=0,executions=0;
+  const fetch=async()=>{requests++;if(requests>1)throw Error('mock model died');return {ok:true,body:(async function*(){yield Buffer.from('data: '+JSON.stringify({choices:[{delta:{content:'Preamble',tool_calls:[{index:0,id:'call-fixture',function:{name:'synthetic_write',arguments:'{}'}}]}}]})+'\n\n');})()};};
+  const context = {
+    modelManager:{enabled:true,health:async()=>({ok:true,body:{all_models_loaded:[{model_name:'answer-model',loaded:true,recipe_options:{ctx_size:32768}}]}})},
+    reasoningEffort: require('./reasoning-effort.cjs'),
+    authService: {audit() {}},
+    crypto: require('node:crypto'), path, fetch,
+    fs,
+    HISTORY_CAP: 20, DEFAULT_PROVIDER_ID: 'default', createToolExchange,
+    currentWorkspace: () => ({ userId, dir, assetDir: () => '/synthetic-only' }),
+    getProject: () => ({id:projectId,model:'answer-model',assets:[]}),
+    skillsIndexFor: () => [], getProvider: () => ({ id: 'default', baseUrl: 'http://fixture.invalid' }),
+    providerHeaders: () => ({}), autoRoles: () => null,
+    visionDescriptions: new Map(), visionProbe: createVisionProbe({ fetchImpl: fetch }),
+    chatSkillRouter: { select: async () => ({ loaded: [] }) }, oauthServerIds: () => new Set(), accountReady: () => true, mcpOAuth: { connected: () => false }, chatToolRouter: { select: async (ids) => ({ ids, routed: false }) }, DEFAULT_TOOLBOXES: [],
+    CONNECTOR_BOXES: new Set(['gdrive']), connectedBoxes: () => [], toolPolicy: { mode: (_user, _name, write) => (write ? 'ask' : 'allow') }, requestScope: { getStore: () => ({}) },
+    resolveTools: () => ({ tools: [{type:'function',function:{name:'synthetic_write',parameters:{type:'object'}}}], dropped: [] }), isWriteTool: () => true,
+  };
+  const { handleChat } = createChatHandler({
+    rag: { filesContext: async () => null }, prefill: { recordSample() {} }, reduceToolResult: () => ({ text:'reduced' }), diaryExtras: require('./diary-extras.cjs'),
+    DIARY_BASE: 'http://fixture.invalid', TOOL_RESULT_CAP: 8000, json: () => {}, saveChats() {}, endpointApproved: () => true, diaryHeaders: () => ({}),
+    lastLoadedModel: () => null, classifyFastOrSmart: async () => 'fast', servedCatalogue: async () => [], modelsInstalled: async () => [], missingRoles: () => [], staleRolesError: () => null,
+    allToolboxes: () => [], executeToolCall: async () => { executions++; if (ambiguous) throw Error('connection lost after write'); return 'complete synthetic result'; }, chatWideApproved: () => false, awaitApproval: async ({onDecision}) => {onDecision('approve_all'); return 'approve';}, recordUsage() {}, recordToolUse() {},
+    ...context, durableChat:service,
+  });
+  await handleChat({},res,{projectId,chatId:'fixture-chat',message:'synthetic write'});
+  const job=require('./jobs.cjs').createJobs({dir}).list({kind:'chat'})[0];
+  return {service,workspace:{dir,userId},id:job.id,executions,requests,events};
+}
+test('real chat loop checkpoints a tool result before model failure and restores with a fake provider',async t=>{
+  const f=await run(t);assert.equal(f.executions,1);assert.equal(f.requests,2);
+  const restored=createChatTurns({enabled:true}).restore(f.workspace,f.id);
+  assert.equal(restored.next,'generate');assert.equal(restored.state.calls[0].result,'complete synthetic result');
+  assert.equal(restored.state.calls[0].approval.action,'approve_all');
+  assert.equal(restored.state.projection.messages.at(-1).content,'reduced');
+  await f.service.resumeGeneration(f.workspace,f.id,{model:{id:'replacement'},project:s=>s.messages,provider:async()=>({content:'Recovered without re-running the tool'})});
+  assert.equal(f.executions,1);
+});
+test('real chat loop preserves an ambiguous tool exception and stops before another model request',async t=>{
+  const f=await run(t,true);assert.equal(f.executions,1);assert.equal(f.requests,1);
+  assert.equal(f.service.restore(f.workspace,f.id).next,'review');
+  await assert.rejects(f.service.resumeGeneration(f.workspace,f.id,{}),/review/);
+});

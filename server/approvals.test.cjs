@@ -73,3 +73,16 @@ test('waiting too long is a denial, never an approval', async () => {
   assert.equal(gate.pendingApprovals.size, 0);
   assert.equal(gate.chatWideApproved('u1', 'c1'), false);
 });
+
+for (const action of ['approve','deny','approve_all']) test(`records original ${action} before granting`,async()=>{
+  const gate=createApprovals(), recorded=[];
+  const promise=gate.awaitApproval({id:'recorded',userId:'u',chatId:'c',abortSignal:new AbortController().signal,onDecision:value=>recorded.push(value)});
+  gate.pendingApprovals.get('recorded').decide(action);
+  assert.deepEqual(recorded,[action]);assert.equal(await promise,action==='approve_all'?'approve':action);
+});
+test('checkpoint failure cannot grant an approval',async()=>{
+  const gate=createApprovals(),ctrl=new AbortController();
+  const promise=gate.awaitApproval({id:'broken',userId:'u',chatId:'c',abortSignal:ctrl.signal,onDecision:()=>{throw Error('disk failure');}});
+  assert.throws(()=>gate.pendingApprovals.get('broken').decide('approve_all'),/disk failure/);
+  assert.equal(gate.chatWideApproved('u','c'),false);ctrl.abort();assert.equal(await promise,'aborted');
+});

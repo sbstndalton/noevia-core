@@ -31,7 +31,7 @@ function chatWideApproved(userId, chatId) {
 // Ask the human. Resolves to 'approve' | 'deny', never rejects: the caller
 // turns a denial into a tool result the model can read, so a refused call is
 // a normal conversational turn rather than a broken stream.
-function awaitApproval({ id, userId, chatId, abortSignal }) {
+function awaitApproval({ id, userId, chatId, abortSignal, onDecision = () => {} }) {
   return new Promise((resolve) => {
     let settled = false;
     const finish = (decision) => {
@@ -52,6 +52,7 @@ function awaitApproval({ id, userId, chatId, abortSignal }) {
       userId,
       chatId,
       decide(decision) {
+        if (['approve', 'deny', 'approve_all'].includes(decision)) onDecision(decision);
         if (decision === 'approve_all') {
           chatWideApprovals.set(chatApprovalKey(userId, chatId), now() + CHAT_APPROVAL_TTL_MS);
           finish('approve');

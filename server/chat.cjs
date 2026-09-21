@@ -17,26 +17,31 @@
  *   the approval gate. `fetch` defaults to the global one; `json` writes a JSON reply.
  */
 function createChatHandler({
-  fs, path, crypto, fetch, codeTasksFor = () => [], reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse,
+  durableChat = null, fs, path, crypto, fetch, codeTasksFor = () => [], reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse,
 }) {
   async function handleChat(req, res, body, authn) {
     let preparation;
+    const execution = {};
     if(body?.spaceId==='diary-extras'&&body.recoveryId){
       if(body.extrasEnabled!==true || !authn || !authService.diaryEnabled(authn.user.id) || !getProject(diaryExtras.PROJECT_ID))return json(res,400,{error:'Diary extras are not enabled.'});
       if(typeof body.message!=='string'||!body.message)return json(res,400,{error:'message required'});
       try{preparation=require('./diary-jobs.cjs').start(currentWorkspace(),{entryDay:body.entryDay,exchangeId:body.recoveryId,message:body.message,kind:'preparation'});}
       catch(error){return json(res,error.status||500,{error:error.status?error.message:'Could not save preparation recovery; no tools were run.'});}
     }
-    try{return await handleChatInner(req,res,body,authn,preparation);}
+    try{return await handleChatInner(req,res,body,authn,preparation,execution);}
     finally{
       preparation?.finish();
+      if (execution.turn) {
+        if (execution.turn.snapshot().phase === 'completed') execution.turn.complete();
+        else execution.turn.interrupt('Chat request ended before completion');
+      }
       // A chat deleted while this reply ran leaves no context state (summaries hold conversation text).
       const id=typeof body?.chatId==='string'?body.chatId:null;
       try{const dir=currentWorkspace().dir;if(id&&require('./chat-lists.cjs').readTombstones(dir).has(id))require('./chat-context.cjs').remove(dir,id);}catch{/* best effort */}
     }
   }
 
-  async function handleChatInner(req, res, body, authn, preparation) {
+  async function handleChatInner(req, res, body, authn, preparation, execution = {}) {
     const { spaceId, message, history } = body || {};
     if (spaceId === 'diary-extras') {
       if (body.extrasEnabled !== true) return json(res, 400, { error: 'Extra attachments and tools are off' });
@@ -420,6 +425,10 @@ function createChatHandler({
       send({type:'context',...prepared.meter});
     } catch(error) {send({type:'error',text:error.message});res.end();return;}
     if(body.compactOnly){send({type:'done',model});res.end();return;}
+    const turn = durableChat?.enabled && !spaceId?.startsWith('diary')
+      ? durableChat.start(chatWorkspace, { projectId, conversationId: chatId || contextId,
+          messages: wire, model: { providerId:provider.id, id:model, effort, maxTokens:prepared.maxTokens, limit } }) : null;
+    execution.turn = turn;
     let roundMessages = prepared.messages;
     // Prefill measurement (step 17). Timed per ROUND, because each round is its
     // own upstream request with its own prompt — and the later rounds are the
@@ -439,6 +448,7 @@ function createChatHandler({
       context.logRound({dir:chatWorkspace.dir,chatId:contextId,model,limit,round,compacted:!!prepared.meter.compactedAt&&prepared.meter.compactedAt>=requestStartedAt,messages:roundMessages,tools:activeTools});
       if(roundBudget.used>roundBudget.threshold){send({type:'error',text:'Tool results filled the available context. Compact the chat or reduce sources before retrying.'});break;}
       const snapshot=context.read(chatWorkspace.dir,contextId);snapshot.meter={...roundBudget,historyCount:prepared.meter.historyCount,compactedAt:prepared.meter.compactedAt,covered:prepared.meter.covered};context.save(chatWorkspace.dir,contextId,snapshot);
+      turn?.generation({ messages:roundMessages, tools:activeTools }, round);
       let upstream;
       roundStartedAt = Date.now();
       roundFirstTokenMs = 0;
@@ -554,6 +564,7 @@ function createChatHandler({
           }
         }
       } catch (err) {
+        turn?.partial(roundContent);
         if (chatSignal.signal.aborted) break; // client went away; stop quietly
         send({ type: 'error', text: String(err?.message || err) });
         break;
@@ -563,6 +574,7 @@ function createChatHandler({
       // non-streaming retry is safe for generation (no side effects, unlike diary).
       if (!sawAnything) {
         try {
+          turn?.fallbackRetry();
           const response = await reasoningEffort.requestWithEffort(fetch, upstreamUrl, {
             method:'POST',headers:upstreamHeaders,signal:AbortSignal.any([chatSignal.signal,AbortSignal.timeout(300000)]),redirect:'error',
           }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:false,...(activeTools.length ? {tools:activeTools} : {})}, provider, model, effort, send);
@@ -584,6 +596,8 @@ function createChatHandler({
           send({ type: 'error', text: String(err?.message || err) });
         }
       }
+
+      if (sawAnything) turn?.output(roundContent, [...toolCalls.values()]);
 
       // Execute each requested tool and append assistant tool_calls + results.
       // This runs even on the final round: the client has already received the
@@ -608,6 +622,7 @@ function createChatHandler({
               send({ type: 'tools_scope', text: 'all tools' });
             }
             send({ type: 'tool_result', index: toolOffset + toolIndex, name: tc.name, text: reply.slice(0, 300) });
+            turn?.result(tc.id, reply);
             roundMessages.push({ role: 'tool', tool_call_id: tc.id, content: reply });
             continue;
           }
@@ -626,6 +641,7 @@ function createChatHandler({
             }
             if (permission === 'ask' && !chatWideApproved(userId, chatId)) {
               const approvalId = `ap-${crypto.randomUUID()}`;
+              turn?.approval(tc.id, { id:approvalId, action:'pending' });
               send({
                 type: 'tool_pending',
                 id: approvalId,
@@ -633,7 +649,7 @@ function createChatHandler({
                 name: tc.name,
                 args: tc.args,
               });
-              const decision = await awaitApproval({ id: approvalId, userId, chatId, abortSignal: chatSignal.signal });
+              const decision = await awaitApproval({ id: approvalId, userId, chatId, abortSignal: chatSignal.signal, onDecision: action => turn?.approval(tc.id, {id:approvalId,action}) });
               if (decision !== 'approve') {
                 // A refusal is a normal conversational turn: the model is told
                 // plainly so it can offer an alternative, rather than the stream
@@ -646,8 +662,11 @@ function createChatHandler({
               }
             }
             if (chatSignal.signal.aborted) return 'ERROR: exchange cancelled; tool was not run.';
+            if (chatWideApproved(userId, chatId)) turn?.approval(tc.id, {action:'approve_all', inherited:true});
+            turn?.started(tc.id);
             markWriteAttempt();
-            result = await executeToolCall(project, tc.name, tc.args, allowedToolNames);
+            try { result = await executeToolCall(project, tc.name, tc.args, allowedToolNames); }
+            catch (error) { turn?.uncertain(tc.id); throw error; }
             recordToolUse(chatWorkspace, tc.name);
             // Audit AFTER the fact and only for writes: "what did the model
             // actually do on my behalf" is the question this log has to answer,
@@ -661,6 +680,7 @@ function createChatHandler({
             }
             return result;
           });
+          turn?.result(tc.id, result);
           send({ type: 'tool_result', index: toolOffset + toolIndex, name: tc.name, text: result.slice(0, 300) });
           // The chip above got the real result; this is the model's copy. Most
           // tools cap themselves, so this is a no-op for them — it is here so a
@@ -670,6 +690,7 @@ function createChatHandler({
         }
       }
 
+      if (turn?.snapshot().calls.some(c => c.status === 'outcome_unknown')) break;
       if (toolCalls.size) toolOffset += Math.max(...toolCalls.keys()) + 1;
       if (round === 2 || toolCalls.size === 0) break; // last round or no tools requested
     }
