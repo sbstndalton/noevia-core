@@ -9,6 +9,7 @@ const SOURCES = {
   skills: { label: 'anthropics/skills on GitHub', home: 'https://github.com/anthropics/skills' },
 };
 const TTL = 60 * 60 * 1000;
+const STARTERS = (() => { const { mcp, skills } = require('../plugin-starters.json'); return { mcp, skills }; })();
 
 // A hosted server noevia can add as-is: a streamable-HTTP remote at a fixed https URL that needs
 // no sign-in headers. Anything else (a package to run here, SSE, templated URLs, API keys) is
@@ -86,12 +87,36 @@ function createPluginDirectoryRoutes({ json, fetchImpl = globalThis.fetch, now =
     cache.set(key, { at: now(), items });
     return items;
   }
+  /** noevia's curated starters (plugin-starters.json), each resolved against the live directory. */
+  async function starters(kind) {
+    const key = `starters:${kind}`;
+    const hit = cache.get(key);
+    if (hit && now() - hit.at < TTL) return hit.items;
+    const picks = STARTERS[kind];
+    let found;
+    if (kind === 'skills') {
+      const all = await load('skills', '');
+      found = picks.map((p) => all.find((i) => i.id === p.id)).map((item, n) => item && { ...item, why: picks[n].why });
+    } else {
+      found = await Promise.all(picks.map(async (p) => {
+        const item = await findRegistryServer(p.id, { fetchImpl }).catch(() => null);
+        return item && { ...item, why: p.why };
+      }));
+    }
+    const items = found.filter(Boolean);
+    cache.set(key, { at: now(), items });
+    return items;
+  }
   return async function pluginDirectoryRoutes(req, res, { path, url }) {
     if (path !== '/api/plugins/directory') return false;
     if (req.method !== 'GET') return json(res, 405, { error: 'method not allowed' }), true;
     const params = url?.searchParams ?? new URL(req.url, 'http://local').searchParams;
     const kind = params.get('kind') === 'skills' ? 'skills' : 'mcp';
     const q = String(params.get('q') || '').trim().slice(0, 80);
+    if (params.get('starters') === '1') {
+      try { return json(res, 200, { items: await starters(kind), source: SOURCES[kind] }), true; }
+      catch { return json(res, 502, { error: 'The directory could not be reached right now.', source: SOURCES[kind] }), true; }
+    }
     try {
       return json(res, 200, { items: await load(kind, q), source: SOURCES[kind] }), true;
     } catch (error) {

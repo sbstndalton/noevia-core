@@ -44,3 +44,20 @@ test('a published skill is fetched from the fixed raw host only, by a validated 
   await assert.rejects(fetchPublishedSkill('gone', { fetchImpl: ok('', 404) }), /no SKILL.md/);
   assert.equal(urls.length, 3, 'invalid names never reach the network');
 });
+
+test('starters resolve against the live directory, keep their order and line, and drop what vanished', async () => {
+  const starters = require('../plugin-starters.json');
+  const [r, json] = reply();
+  const run = createPluginDirectoryRoutes({ json, fetchImpl: async (u) => {
+    if (u.includes('api.github.com')) return { ok: true, json: async () => starters.skills.slice(1).map((s) => ({ type: 'dir', name: s.id, html_url: `https://github.com/anthropics/skills/tree/main/skills/${s.id}` })) };
+    const name = decodeURIComponent(new URL(u).searchParams.get('search'));
+    return { ok: true, json: async () => ({ servers: name === starters.mcp[0].id ? [] : [{ server: { name, remotes: [{ type: 'streamable-http', url: 'https://mcp.example.com/mcp' }] } }] }) };
+  } });
+  await run({ method: 'GET', url: '/api/plugins/directory?kind=skills&starters=1' }, {}, { path: '/api/plugins/directory' });
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body.items.map((i) => i.id), starters.skills.slice(1).map((s) => s.id), 'a skill missing upstream is dropped');
+  assert.equal(r.body.items[0].why, starters.skills[1].why);
+  await run({ method: 'GET', url: '/api/plugins/directory?kind=mcp&starters=1' }, {}, { path: '/api/plugins/directory' });
+  assert.deepEqual(r.body.items.map((i) => i.id), starters.mcp.slice(1).map((s) => s.id));
+  assert.ok(r.body.items.every((i) => i.why && i.installable));
+});
