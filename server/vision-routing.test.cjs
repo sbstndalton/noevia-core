@@ -3,12 +3,10 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const vm = require('node:vm');
 const { EventEmitter } = require('node:events');
 const { createToolExchange } = require('./tool-exchange.cjs');
 const { createVisionProbe } = require('./vision.cjs');
-const source = fs.readFileSync(path.join(__dirname, 'index.cjs'), 'utf8');
-const handler = source.slice(source.indexOf('async function handleChat('), source.indexOf('// ── Routing'));
+const { createChatHandler } = require('./chat.cjs');
 const contextDir=fs.mkdtempSync(require('node:path').join(require('node:os').tmpdir(),'chat-handler-test-'));
 test.after(()=>fs.rmSync(contextDir,{recursive:true,force:true}));
 
@@ -31,12 +29,10 @@ async function run({ visionModel, probeStatus = 200, descriptionStatus = 200, mi
     return new Response(JSON.stringify({ choices: [{ finish_reason: finishReason, message: { content: 'Fixture image: invoice INV-2042 total 34.95' } }] }), { status: descriptionStatus });
   };
   const context = {
-    setInterval, clearInterval,
     modelManager:{enabled:true,health:async()=>({ok:true,body:{all_models_loaded:[{model_name:'answer-model',loaded:true,recipe_options:{ctx_size:32768}}]}})},
-    require,
     reasoningEffort: require('./reasoning-effort.cjs'),
     authService: {},
-    crypto: require('node:crypto'), AbortController, AbortSignal, TextDecoder, console: { ...console, warn: () => {} }, path, fetch,
+    crypto: require('node:crypto'), path, fetch,
     fs: { readFileSync: () => { if (missingAsset) throw new Error('missing fixture'); return bytes; } },
     HISTORY_CAP: 20, DEFAULT_PROVIDER_ID: 'default', createToolExchange,
     currentWorkspace: () => ({ userId, dir:contextDir, assetDir: () => '/synthetic-only' }),
@@ -56,8 +52,14 @@ async function run({ visionModel, probeStatus = 200, descriptionStatus = 200, mi
     if(url.includes('/props?'))assert.equal(new URL(url).searchParams.get('autoload'),'false');
     return {ok:true,status:200,body:url.includes('/props?')?{default_generation_settings:{n_ctx:32768},total_slots:1}:{data:['answer-model','vision-model'].map(id=>({id,status:{value:id===nativeLoaded?'loaded':'unloaded'}}))}};
   }});
-  vm.createContext(context); vm.runInContext(handler, context);
-  await context.handleChat({}, res, { projectId: 'fixture-project', chatId: 'fixture-chat', message: 'Read the synthetic total' });
+  const { handleChat } = createChatHandler({
+    rag: { filesContext: async () => null }, prefill: { recordSample() {} }, reduceToolResult: (text) => ({ text }), diaryExtras: require('./diary-extras.cjs'),
+    DIARY_BASE: 'http://fixture.invalid', TOOL_RESULT_CAP: 8000, json: () => {}, saveChats() {}, endpointApproved: () => true, diaryHeaders: () => ({}),
+    lastLoadedModel: () => null, classifyFastOrSmart: async () => 'fast', servedCatalogue: async () => [], modelsInstalled: async () => [], missingRoles: () => [], staleRolesError: () => null,
+    allToolboxes: () => [], executeToolCall: async () => '', chatWideApproved: () => false, awaitApproval: async () => 'decline', recordUsage() {}, recordToolUse() {},
+    ...context,
+  });
+  await handleChat({}, res, { projectId: 'fixture-project', chatId: 'fixture-chat', message: 'Read the synthetic total' });
   assert.ok(events.some(e => e.type === 'done'));
   return { events, requests, nativeCalls, answer: requests.find(r => r.stream) };
 }

@@ -2,15 +2,13 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const vm = require('node:vm');
 const { EventEmitter } = require('node:events');
 const { createToolExchange } = require('./tool-exchange.cjs');
 
-// Execute the actual complete chat handler in an isolated VM: no server boot,
-// credentials, corpus, filesystem writes, or network. Only its collaborators
-// are mocked; the streaming loop, permission gate and SSE pairing are real.
-const source = fs.readFileSync(require.resolve('./index.cjs'), 'utf8');
-const handler = source.slice(source.indexOf('async function handleChat('), source.indexOf('// ── Routing'));
+// Execute the actual complete chat handler (chat.cjs) with every collaborator
+// injected: no server boot, credentials, corpus, filesystem writes, or network.
+// The streaming loop, permission gate and SSE pairing are real.
+const { createChatHandler } = require('./chat.cjs');
 const contextDir=fs.mkdtempSync(require('node:path').join(require('node:os').tmpdir(),'chat-handler-test-'));
 test.after(()=>fs.rmSync(contextDir,{recursive:true,force:true}));
 
@@ -27,10 +25,8 @@ function fixture({ rounds, decision = 'approve', execute, fallback = false, canc
     return rounds[round++] || [];
   }
   const context = {
-    setInterval, clearInterval,
     modelManager:{enabled:true,health:async()=>({ok:true,body:{all_models_loaded:[{model_name:'synthetic-model',loaded:true,recipe_options:{ctx_size:32768}}]}})},
-    require, reasoningEffort: require('./reasoning-effort.cjs'),
-    AbortController, AbortSignal, TextDecoder, console, createToolExchange,
+    reasoningEffort: require('./reasoning-effort.cjs'), createToolExchange,
     crypto: require('node:crypto'), HISTORY_CAP: 20, DEFAULT_PROVIDER_ID: 'default',
     // The handler compacts a tool result before the model sees it; this
     // fixture is the handler's dependency manifest, so both names live here.
@@ -87,13 +83,18 @@ function fixture({ rounds, decision = 'approve', execute, fallback = false, canc
       return {ok:true,status:200,body:url.includes('/props?')?{default_generation_settings:{n_ctx:32768},total_slots:1,build_info:'synthetic-native'}:{data:[{id:'synthetic-model',status:{value:loaded?'loaded':'unloaded'}}]}};
     }});
   }
-  vm.createContext(context);
-  vm.runInContext(handler, context);
+  const { handleChat } = createChatHandler({
+    fs, path: require('node:path'), rag: { filesContext: async () => null }, prefill: { recordSample() {} }, diaryExtras: require('./diary-extras.cjs'),
+    DIARY_BASE: 'http://fixture.invalid', json: () => {}, saveChats() {}, endpointApproved: () => true, diaryHeaders: () => ({}),
+    autoRoles: () => null, lastLoadedModel: () => null, classifyFastOrSmart: async () => 'fast', servedCatalogue: async () => [], modelsInstalled: async () => [], missingRoles: () => [], staleRolesError: () => null,
+    visionProbe: async () => ({ supported: false, reason: 'none' }), visionDescriptions: new Map(), allToolboxes: () => [], recordUsage() {},
+    ...context,
+  });
   return {
     events, executions, approvals, requests, audits, toolCounts, resolvedFor,
     async run(projectId = 'synthetic-project') {
       round = 0; res.writableEnded = false;
-      await context.handleChat({}, res, { message: 'synthetic fixture', projectId, chatId: 'synthetic-chat' });
+      await handleChat({}, res, { message: 'synthetic fixture', projectId, chatId: 'synthetic-chat' });
       assert.equal(events.some(e => e.type === 'error'), false);
     },
   };
