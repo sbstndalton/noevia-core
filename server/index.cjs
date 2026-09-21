@@ -233,32 +233,15 @@ function authResult(res, result) {
   return json(res, result.status || 200, result.body ?? result);
 }
 
-// One call to the model management service, with its token. Same path the proxy route uses.
-function managerFetch(rest, method = 'GET') {
-  return fetchJson(`${process.env.MODEL_LOADER_URL.replace(/\/+$/, '')}/api/v1/${rest}`,
-    { method, headers: { 'Content-Type': 'application/json', ...(process.env.MODEL_LOADER_TOKEN ? { 'X-Model-Loader-Token': process.env.MODEL_LOADER_TOKEN } : {}) }, ...(method === 'POST' ? { body: '{}' } : {}) }, 120000).catch(() => null);
-}
-
-// Model files that appear in the models folder get safe defaults on their own (roadmap C3).
-// Needs the model management service; the engine's own preset file is edited through it.
-// Last model-folder scan, served instantly by the model-manager proxy (see there).
-const modelScanCache = new Map();
-let modelScanInflight = null;
-function refreshModelScan() {
-  if (modelScanInflight || !process.env.MODEL_LOADER_URL) return;
-  modelScanInflight = fetchJson(`${process.env.MODEL_LOADER_URL.replace(/\/+$/, '')}/api/v1/models`, { method: 'GET', headers: { 'Content-Type': 'application/json', ...(process.env.MODEL_LOADER_TOKEN ? { 'X-Model-Loader-Token': process.env.MODEL_LOADER_TOKEN } : {}) } })
-    .then((r) => { if (r?.ok && r.body && typeof r.body === 'object') modelScanCache.set('models', { at: Date.now(), body: r.body }); })
-    .catch(() => undefined).finally(() => { modelScanInflight = null; });
-}
 const folderSync = process.env.MODEL_LOADER_URL ? require('./model-folder-sync.cjs').createFolderSync({
   stateFile: path.join(DATA_DIR, 'model-folder-sync.json'),
   listUnregistered: async () => {
-    const r = await managerFetch('models');
+    const r = await modelService.managerFetch('models');
     if (!r?.ok) throw Object.assign(Error(r?.body?.error || `model manager HTTP ${r?.status || 'unreachable'}`), { status: r?.status });
     return Array.isArray(r.body?.unregistered) ? r.body.unregistered : [];
   },
   register: async (stem) => {
-    const r = await managerFetch(`sections/${encodeURIComponent(stem)}/safe-defaults`, 'POST');
+    const r = await modelService.managerFetch(`sections/${encodeURIComponent(stem)}/safe-defaults`, 'POST');
     if (!r?.ok) throw Object.assign(Error(r?.body?.error || `model manager HTTP ${r?.status || 'unreachable'}`), { status: r?.status });
   },
   reloadPresets: () => modelManager.reloadPresets ? modelManager.reloadPresets({ unload: false }) : { ok: false },
@@ -285,6 +268,11 @@ const modelManager = createModelManager({
   apiKey: process.env.MODEL_MANAGER_API_KEY || INFERENCE_KEY,
   fetchJson,
 });
+
+// What index.cjs builds on the adapter: the installed list and the first loaded model as the
+// default, the auto-router roles, the manager service call and the cached folder scan (models.cjs).
+const modelService = require('./models.cjs').createModelService({ fetchJson, env: process.env, modelManager, currentWorkspace });
+const { autoRoles, ensureRolesLoaded, servedCatalogue, modelsInstalled, lastLoadedModel } = modelService;
 
 function inferenceHeaders(extra) {
   const h = { 'Content-Type': 'application/json' };
@@ -329,61 +317,8 @@ const { getProvider, providerHeaders } = providerRegistry;
 
 const FREE_CHATS = arrayProxy('freeChats');
 
-// ── Optional model manager ─────────────────────────────────────────────────
-
-// The last model the manager reported as loaded — the non-hardcoded default for
-// projects that have not picked a model yet (replaces the old DEFAULT_MODEL
-// literal per feature doc Item 0 / step 9).
-let LAST_LOADED_MODEL = null;
-
 // Usage accounting (daily rollups per tenant) lives in usage.cjs; its routes in routes/usage.cjs.
 const { USAGE_RETENTION_DAYS, usageDayKey, readUsage, recordUsage, recordToolUse } = require('./usage.cjs');
-
-// ── Auto model router (feature doc Item 4 / master step 12) ───────────────
-// Roles are config, never hardcoded model names: role→model mapping lives in
-// ui/server/auto-roles.json (created on first use; never ships a default
-// model string). Native llama.cpp owns role-model loading and eviction.
-function autoRoles() {
-  return currentWorkspace().autoRoles;
-}
-
-function setAutoRoles(next) {
-  // `vision` and `code` are optional: a deployment with no vision-capable or
-  // coding model should not be forced to name one, and an existing config
-  // without them keeps working.
-  const roles = { fast: String(next.fast), smart: String(next.smart) };
-  if (next.vision) roles.vision = String(next.vision);
-  if (next.code) roles.code = String(next.code);
-  currentWorkspace().autoRoles = roles;
-  currentWorkspace().saveAutoRoles();
-}
-
-async function ensureModelLoaded(name) {
-  const installed = await modelsInstalled();
-  const m = installed.find((x) => x.name === name);
-  if (!m) throw new Error(`model not installed: ${name}`);
-  if (!m.loaded) {
-    const result = await modelManager.load(name);
-    if (!result.ok) throw new Error(`model could not load: ${name}`);
-  }
-}
-
-function ensureRolesLoaded() {
-  // Native router owns on-demand loading and eviction (including models-max=1).
-  if (modelManager.capabilities?.routing) return;
-  const roles = autoRoles();
-  if (!roles) return;
-  void (async () => {
-    for (const role of ['fast', 'smart', 'vision', 'code']) {
-      if (!roles[role]) continue;
-      try {
-        await ensureModelLoaded(roles[role]);
-      } catch (err) {
-        console.warn(`[router] could not load ${role} model (${roles[role]}):`, err?.message || err);
-      }
-    }
-  })();
-}
 
 // D9: read-only offline Wikipedia box, only with features.kiwix and an internal KIWIX_URL.
 const kiwixTools = features.enabled('kiwix') && process.env.KIWIX_URL ? require('./kiwix.cjs').createKiwixTools({ baseUrl: process.env.KIWIX_URL, cap: TOOL_RESULT_CAP }) : null;
@@ -495,7 +430,7 @@ const codeRoutes = require('./routes/code.cjs').createCodeRoutes({
       return {
         baseUrl: base ? (/\/v1$/.test(base) ? base : `${base}/v1`) : null,
         apiKey: process.env.CODE_ENGINE_API_KEY || provider?.apiKey || null,
-        model: autoRoles()?.code || autoRoles()?.smart || LAST_LOADED_MODEL || null,
+        model: autoRoles()?.code || autoRoles()?.smart || lastLoadedModel() || null,
         contextTokens: Number(process.env.CODE_CONTEXT_TOKENS) || undefined,
       };
     },
@@ -545,7 +480,7 @@ const researchRoutes = require('./routes/research.cjs').createResearchRoutes({
   }),
 });
 function researchModel(project) {
-  return autoRoles()?.smart || project?.model || LAST_LOADED_MODEL || null;
+  return autoRoles()?.smart || project?.model || lastLoadedModel() || null;
 }
 
 // noevia's own capabilities, offered over the same MCP path as everything
@@ -612,62 +547,6 @@ const autoRouter = require('./auto-router.cjs').createAutoRouter({
 const { heuristicWantsSmart, heuristicWantsCode, classifierVerdict, CLASSIFIER_MAX_TOKENS } = autoRouter;
 const classifyFastOrSmart = (message) => autoRouter.classify(message);
 
-// The served model list, or null when it cannot be read (never treat an outage as "nothing installed").
-async function servedCatalogue() {
-  if (!modelManager.enabled) return null;
-  try { return await modelsInstalled(); } catch { return null; }
-}
-
-async function modelsInstalled() {
-  modelManager.requireEnabled();
-  const [list, health] = await Promise.allSettled([
-    modelManager.listModels(),
-    modelManager.health(),
-  ]);
-  if (list.status !== 'fulfilled' || !list.value.ok) {
-    throw new Error(`model list failed: ${list.status === 'fulfilled' ? list.value.status : 'unreachable'}`);
-  }
-  const loadedNames = new Set();
-  if (health.status === 'fulfilled' && health.value.ok) {
-    for (const m of health.value.body.all_models_loaded || []) {
-      if (m.loaded && m.model_name) loadedNames.add(m.model_name);
-    }
-  }
-  const installed = (list.value.body.data || [])
-    // Some managers register cosmetic hash-ID duplicates; hide bare hash names.
-    .filter((m) => !/^[0-9a-f]{32,40}$/i.test(m.id || m.model_name || ''))
-    .map((m) => ({
-      name: m.id || m.model_name,
-      sizeGB: typeof m.size === 'number' ? Math.round(m.size * 10) / 10 : null,
-      loaded: loadedNames.has(m.id || m.model_name),
-      labels: Array.isArray(m.labels) ? m.labels : [],
-      mtp: require('./mtp.cjs').capability(m),
-      maxContext: m.max_context_window || null,
-      suggested: !!m.suggested,
-      status: m.status?.value || (loadedNames.has(m.id || m.model_name) ? 'loaded' : 'unloaded'),
-      failed: m.status?.failed === true,
-      canDelete: m.can_remove !== false,
-      source: m.source || null,
-    }));
-  if (!LAST_LOADED_MODEL) {
-    const firstLoaded = installed.find((m) => m.loaded && !m.labels.some(label => /^(embedding|embeddings|rerank|reranking|reranker)$/i.test(label)));
-    if (firstLoaded) LAST_LOADED_MODEL = firstLoaded.name;
-  }
-  return installed;
-}
-
-// Lemonade's /pull needs a namespaced model_name for any checkpoint it
-// doesn't already know about; derive one from the repo/variant the user
-// picked (variants() below always hands us `<repo>:<variant>` or a bare
-// repo). Lemonade requires the `user.` prefix to avoid colliding with its
-// built-in registry.
-function deriveUserModelName(checkpoint) {
-  const [repo, variant] = String(checkpoint).split(':');
-  const base = (repo.split('/').pop() || repo).replace(/[^A-Za-z0-9._-]/g, '-');
-  const safeVariant = variant ? variant.replace(/[^A-Za-z0-9._-]/g, '-') : '';
-  return `user.${base}${safeVariant ? `-${safeVariant}` : ''}`;
-}
-
 // ── Corpus-source adapter (Diary tab reads) ────────────────────────────────
 // Contract: listMonths() → [{id,label}]; readMonth(id) → {todayLog, standing}.
 // v1 source: 'sidecar' (Nextcloud via diary-companion's read API). Planned:
@@ -722,7 +601,7 @@ const { handleChat } = require('./chat.cjs').createChatHandler({
   HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP,
   authService, toolPolicy, modelManager, requestScope, currentWorkspace, json,
   getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders,
-  autoRoles, lastLoadedModel: () => LAST_LOADED_MODEL, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError,
+  autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError,
   visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter,
   DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall,
   oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse,
@@ -741,6 +620,10 @@ const projectRoutes = require('./routes/projects.cjs').createProjectRoutes({
 // The provider registry's routes: list, connect, test and remove (routes/providers.cjs).
 const providerRoutes = require('./routes/providers.cjs').createProviderRoutes({
   json, readBody, readJson, fetchJson, endpointApproved, PROVIDERS, PROJECTS, DEFAULT_PROVIDER_ID, modelManager, currentWorkspace, saveProjects, registry: providerRegistry,
+});
+// Statistics, the auto-router roles, the model manager proxy and /api/models/* (routes/models.cjs).
+const modelRoutes = require('./routes/models.cjs').createModelRoutes({
+  json, readBody, readJson, fetchJson, env: process.env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe, reportedTokenRate, missingRoles, currentWorkspace, service: modelService,
 });
 // ── Routing ────────────────────────────────────────────────────────────────
 
@@ -861,9 +744,6 @@ async function handleRequestScoped(req, res) {
       return json(res, 200, { user: authn.user, csrfToken: authn.legacy ? null : decodeURIComponent((csrfCookie || '').slice(12)), legacy: authn.legacy });
     }
     if (p === '/api/auth/logout' && req.method === 'POST') return authResult(res, authService.logout(req, res, authn));
-    if (p.startsWith('/api/models/') && !['GET', 'HEAD'].includes(req.method || 'GET') && authn.user.role !== 'admin') {
-      return json(res, 403, { error: 'administrator required' });
-    }
     if (p === '/api/profile/appearance') {
       if(req.method==='GET')return json(res,200,authService.getAppearance(authn.user.id));
       if(req.method==='PUT') {
@@ -1102,35 +982,6 @@ async function handleRequestScoped(req, res) {
 
     if (await providerRoutes(req, res, { path: p, authn })) return;
 
-    // ── Optional model-manager statistics.
-    if (p === '/api/stats') {
-      const [gen, sys, mtpHealth, mtpMetrics, mtpModels] = await Promise.allSettled([
-        modelManager.enabled ? modelManager.stats() : Promise.resolve({ ok: false }),
-        modelManager.enabled ? modelManager.systemStats() : Promise.resolve({ ok: false }),
-        modelManager.enabled ? modelManager.health() : Promise.resolve({ok:false}),
-        modelManager.enabled ? modelManager.metrics() : Promise.resolve({ok:false}),
-        modelManager.enabled ? modelManager.listModels() : Promise.resolve({ok:false}),
-      ]);
-      const g = gen.status === 'fulfilled' && gen.value.ok ? gen.value.body : {};
-      const s = sys.status === 'fulfilled' && sys.value.ok ? sys.value.body : {};
-      return json(res, 200, {
-        up: gen.status === 'fulfilled' && gen.value.ok,
-        telemetryScope: g.scope || null,
-        mtp: modelManager.kind === 'llamacpp' ? (g.mtp || []) : require('./mtp.cjs').acceptance(mtpMetrics.status === 'fulfilled' && mtpMetrics.value.ok ? mtpMetrics.value.body : '', mtpHealth.status === 'fulfilled' && mtpHealth.value.ok ? mtpHealth.value.body.all_models_loaded : [], mtpModels.status === 'fulfilled' && mtpModels.value.ok ? mtpModels.value.body.data : [], currentWorkspace().userId),
-        tokensPerSecond: reportedTokenRate(g),
-        timeToFirstToken: typeof g.time_to_first_token === 'number' ? g.time_to_first_token : null,
-        inputTokens: typeof g.input_tokens === 'number' ? g.input_tokens : null,
-        outputTokens: typeof g.output_tokens === 'number' ? g.output_tokens : null,
-        inputTokensTotal: typeof g.input_tokens_total === 'number' ? g.input_tokens_total : null,
-        outputTokensTotal: typeof g.output_tokens_total === 'number' ? g.output_tokens_total : null,
-        requestCount: typeof g.request_count_total === 'number' ? g.request_count_total : null,
-        cpuPercent: typeof s.cpu_percent === 'number' ? s.cpu_percent : null,
-        gpuPercent: typeof s.gpu_percent === 'number' ? s.gpu_percent : null,
-        vramGb: typeof s.vram_gb === 'number' ? s.vram_gb : null,
-        memoryGb: typeof s.memory_gb === 'number' ? s.memory_gb : null,
-      });
-    }
-
     // ── Projects CRUD ──
     if (authn && await usageRoutes(req, res, { path: p, authn })) return;
     const windowMatch=p.match(/^\/api\/chats\/([^/]+)\/context-window$/);
@@ -1154,30 +1005,6 @@ async function handleRequestScoped(req, res) {
         return json(res,200,{default:body.default});
       }
       return json(res,405,{error:'Method not allowed'});
-    }
-
-    if (p === '/api/auto-roles') {
-      if (req.method === 'GET') {
-        const roles = autoRoles();
-        return json(res, 200, { configured: !!roles, roles: roles || null, missing: missingRoles(roles, await servedCatalogue()) });
-      }
-      if (req.method === 'PUT') {
-        const raw = await readBody(req);
-        let body;
-        try {
-          body = JSON.parse(raw);
-        } catch {
-          return json(res, 400, { error: 'invalid JSON' });
-        }
-        const fast = typeof body.fast === 'string' ? body.fast.trim() : '';
-        const smart = typeof body.smart === 'string' ? body.smart.trim() : '';
-        const vision = typeof body.vision === 'string' ? body.vision.trim() : '';
-        const code = typeof body.code === 'string' ? body.code.trim() : '';
-        if (!fast || !smart) return json(res, 400, { error: 'both fast and smart model names are required' });
-        setAutoRoles({ fast, smart, vision, code });
-        ensureRolesLoaded(); // optional adapter warm-up; native routing stays on demand
-        return json(res, 200, { configured: true, roles: autoRoles() });
-      }
     }
 
     // ── Free-chat metas (server-side so they survive browser switches) ──
@@ -1232,215 +1059,7 @@ async function handleRequestScoped(req, res) {
       });
     }
 
-    // A change to the models anywhere else (load, unload, download, delete) also invalidates the scan.
-    if (p.startsWith('/api/models/') && !['GET','HEAD','OPTIONS'].includes(req.method || 'GET')) modelScanCache.clear();
-    // Model manager (folded-in Model Loader) JSON API, administrators only.
-    if (p.startsWith('/api/model-manager/')) {
-      if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for model management'});
-      if(!process.env.MODEL_LOADER_URL)return json(res,404,{error:'Model management service is not configured'});
-      const rest=p.slice('/api/model-manager/'.length);
-      if(!/^[\w./%:+@-]*$/.test(rest)||rest.includes('..'))return json(res,400,{error:'Invalid path'});
-      const method=req.method||'GET';
-      const body=['GET','HEAD','DELETE'].includes(method)?undefined:await readBody(req,1024*1024);
-      // The file scan reads every model header from disk (~2 s on daserver). Serve the last scan at
-      // once and refresh it behind the response; any change through this API drops it.
-      if(method!=='GET')modelScanCache.clear();
-      if(method==='GET'&&rest==='models'&&!url.search){
-        const hit=modelScanCache.get('models');
-        if(hit){res.setHeader('Cache-Control','no-store');res.setHeader('X-Model-Scan','cached');if(Date.now()-hit.at>5000)refreshModelScan();return json(res,200,hit.body);}
-      }
-      const result=await fetchJson(`${process.env.MODEL_LOADER_URL.replace(/\/+$/,'')}/api/v1/${rest}${url.search}`,{method,headers:{'Content-Type':'application/json',...(process.env.MODEL_LOADER_TOKEN?{'X-Model-Loader-Token':process.env.MODEL_LOADER_TOKEN}:{})},body},10*60*1000).catch(()=>null);
-      res.setHeader('Cache-Control','no-store');
-      if(!result)return json(res,502,{error:'The model management service is not responding.'});
-      const detail=result.body&&typeof result.body==='object'?result.body:{error:String(result.body||'')};
-      // A finished benchmark run viewed in the manager becomes throughput evidence (best-effort, throttled).
-      if(result.ok&&method==='GET'&&/^benchmark\/runs\/\d+$/.test(rest)&&modelManager.recordEvidence){
-        for(const {model,record} of require('./benchmark-evidence.cjs').throughputRecords(detail))modelManager.recordEvidence(model,record).catch(()=>undefined);
-      }
-      if(result.ok&&method==='GET'&&rest==='models'&&!url.search)modelScanCache.set('models',{at:Date.now(),body:detail});
-      return json(res,result.status,result.ok?detail:{error:detail.detail||detail.error||'Model management request failed.'});
-    }
-
-    if (p === '/api/models/presets/reload') {
-      if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
-      if(req.method!=='POST')return json(res,405,{error:'Method not allowed'});
-      if(!modelManager.reloadPresets)return json(res,404,{error:'This engine does not use a preset file'});
-      try { const result=await modelManager.reloadPresets({unload:(await readJson(req))?.unload===true}); return json(res,result.status,result.body); }
-      catch(e){ return json(res,e.status||500,{error:e.status===409?'Requests are in progress. Try again when chats finish.':e.message}); }
-    }
-
-    if (p === '/api/models/evidence' && req.method === 'GET') {
-      if (!modelManager.evidence) return json(res, 404, { error: 'Qualification evidence needs the native engine' });
-      const model = url.searchParams.get('model') || '';
-      if (!model || model.length > 200) return json(res, 400, { error: 'Choose a model' });
-      const result = await modelManager.evidence(model);
-      res.setHeader('Cache-Control', 'no-store');
-      return json(res, result.status, result.body);
-    }
-
-    // Re-run the cheap image probe for one model and record the result. It may load the model.
-    if (p === '/api/models/evidence/recheck') {
-      if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model evidence'});
-      if(req.method!=='POST')return json(res,405,{error:'Method not allowed'});
-      if(!modelManager.recordEvidence)return json(res,404,{error:'Qualification evidence needs the native engine'});
-      const body=await readJson(req).catch(()=>null);
-      const model=typeof body?.model==='string'?body.model:'';
-      if(!model||model.length>200)return json(res,400,{error:'Choose a model'});
-      if(body.category!=='vision')return json(res,400,{error:'Only image input can be rechecked here; use Measure context for context capacity.'});
-      const provider=getProvider(DEFAULT_PROVIDER_ID);
-      const vision=await createVisionProbe()(provider.baseUrl,providerHeaders(provider),model);
-      if(!vision.supported&&!/projector|mmproj/i.test(vision.reason||''))return json(res,503,{error:vision.reason||'The engine could not run the image probe.'});
-      await modelManager.recordEvidence(model,{category:'vision',result:vision.supported?'passed':'failed',value:null,suite:{name:'vision-probe',version:1},source:'recheck',limitations:vision.supported?['1×1 image accepted; not an accuracy test']:[String(vision.reason||'').slice(0,200)]});
-      return json(res,200,(await modelManager.evidence(model)).body);
-    }
-
-    if (p === '/api/models/autotune' || p === '/api/models/autotune/cancel') {
-      if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
-      if(!modelManager.autotune)return json(res,404,{error:'Auto-tune is unavailable'});
-      let result;
-      if(p.endsWith('/cancel')){if(req.method!=='POST')return json(res,405,{error:'Method not allowed'});result=modelManager.autotune.cancel();}
-      else if(req.method==='GET')result=modelManager.autotune.status(url.searchParams.get('model')||'');
-      else if(req.method==='POST'){const body=await readJson(req);result=await modelManager.autotune.start(String(body?.model||''),{confirmPause:body?.confirmPause,promptBudgetSeconds:body?.promptBudgetSeconds,extendContext:body?.extendContext,resume:body?.resume});}
-      else return json(res,405,{error:'Method not allowed'});
-      res.setHeader('Cache-Control','no-store');
-      return json(res,result.status,result.body);
-    }
-    if (p === '/api/models/calibration' || p === '/api/models/calibration/cancel') {
-      if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
-      if(!modelManager.calibration)return json(res,404,{error:'Native calibration is unavailable'});
-      let result;
-      if(p.endsWith('/cancel')){if(req.method!=='POST')return json(res,405,{error:'Method not allowed'});result=modelManager.calibration.cancel();}
-      else if(req.method==='GET')result=modelManager.calibration.status(url.searchParams.get('model')||'');
-      else if(req.method==='POST'){const body=await readJson(req);result=await modelManager.calibration.start(String(body?.model||''),{promptBudgetSeconds:body?.promptBudgetSeconds,confirmPause:body?.confirmPause});}
-      else return json(res,405,{error:'Method not allowed'});
-      res.setHeader('Cache-Control','no-store');
-      return json(res,result.status,result.body);
-    }
-
-    if (p === '/api/models/preset/suggest') {
-      if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
-      if(req.method!=='GET')return json(res,405,{error:'Method not allowed'});
-      if(!modelManager.suggestPreset)return json(res,404,{error:'Native preset suggestions are unavailable'});
-      const result=await modelManager.suggestPreset(url.searchParams.get('model') || '');
-      return json(res,result.status,result.body);
-    }
-
-    if (p === '/api/models/preset') {
-      if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
-      if(!modelManager.getPreset)return json(res,404,{error:'Native presets are unavailable'});
-      if(!['GET','PUT'].includes(req.method))return json(res,405,{error:'Method not allowed'});
-      const result=req.method==='GET' ? await modelManager.getPreset(url.searchParams.get('model') || '') : await modelManager.applyPreset(await readJson(req));
-      return json(res,result.status,result.body);
-    }
-
-    if (p === '/api/models/capabilities' && req.method === 'GET') {
-      return json(res,200,{kind:modelManager.kind,enabled:modelManager.enabled,admin:authn.user.role==='admin',...modelManager.capabilities,modelManagement:!!process.env.MODEL_LOADER_URL&&authn.user.role==='admin'});
-    }
-
-    if (p === '/api/models/hardware') {
-      if(req.method!=='GET')return json(res,405,{error:'Method not allowed'});
-      if(!modelManager.enabled)return json(res,404,{error:'Model manager is disabled. Enter a memory plan manually.'});
-      try {
-        const result=await modelManager.systemInfo();
-        if(!result.ok)return json(res,502,{error:'Inference hardware is unavailable. Enter a memory plan manually or retry.'});
-        return json(res,200,require('./model-hardware.cjs').modelHardware(result.body));
-      } catch { return json(res,502,{error:'Could not read inference hardware. Enter a memory plan manually or retry.'}); }
-    }
-
-    if (p === '/api/models/installed') {
-      try {
-        return json(res, 200, await modelsInstalled());
-      } catch (err) {
-        return json(res, 502, { error: String(err.message || err) });
-      }
-    }
-
-    if (p === '/api/models/mtp-artifact' && req.method === 'GET') {
-      const repo = url.searchParams.get('repo') || '';
-      if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) return json(res,400,{error:'Invalid repository'});
-      const result = await modelManager.variants(repo);
-      if (!result.ok) return json(res,502,{error:'Could not resolve selected files'});
-      const variant = (result.body?.variants || []).find(v=>v.name === url.searchParams.get('variant'));
-      if (!variant) return json(res,404,{error:'Variant no longer available'});
-      return json(res,200,await require('./mtp-artifact.cjs').check(repo,variant.files || [variant.primary_file]));
-    }
-
-    if (p === '/api/models/pull' && req.method === 'POST') {
-      const raw = await readBody(req);
-      let body;
-      try {
-        body = JSON.parse(raw);
-      } catch {
-        return json(res, 400, { error: 'invalid JSON' });
-      }
-      if (!body.checkpoint) return json(res, 400, { error: 'checkpoint required' });
-      if (!modelManager.enabled) return json(res, 404, { error: 'model management is disabled' });
-      const modelName = body.modelName || deriveUserModelName(body.checkpoint);
-      const r = await modelManager.pull({ modelName, checkpoint: body.checkpoint, recipe: body.recipe || 'llamacpp' });
-      return json(
-        res,
-        r.ok ? 200 : 502,
-        r.ok ? { jobId: r.body?.id || r.body?.job_id || 'pull', modelName: r.body?.modelName || modelName } : { error: r.body?.error || `pull failed: ${r.status}` },
-      );
-    }
-
-    if (p === '/api/models/delete' && req.method === 'POST') {
-      const raw = await readBody(req);
-      let body;
-      try {
-        body = JSON.parse(raw);
-      } catch {
-        return json(res, 400, { error: 'invalid JSON' });
-      }
-      if (!body.name) return json(res, 400, { error: 'name required' });
-      if (!modelManager.enabled) return json(res, 404, { error: 'model management is disabled' });
-      const r = await modelManager.deleteModel(body.name);
-      return json(res, r.ok ? 200 : 502, r.ok ? { ok: true } : { error: `delete failed: ${r.status}` });
-    }
-
-    for (const verb of ['load', 'unload']) {
-      if (p === `/api/models/${verb}` && req.method === 'POST') {
-        const raw = await readBody(req);
-        let body;
-        try {
-          body = JSON.parse(raw);
-        } catch {
-          return json(res, 400, { error: 'invalid JSON' });
-        }
-        if (!body.name) return json(res, 400, { error: 'name required' });
-        if (!modelManager.enabled) return json(res, 404, { error: 'model management is disabled' });
-        if (verb === 'load' && body.mtp !== undefined && modelManager.kind === 'llamacpp') return json(res,400,{error:'Use the native preset editor to configure speculative decoding.'});
-        if (verb === 'load' && body.mtp !== undefined) {
-          const listing = await modelManager.listModels();
-          if (!listing.ok) return json(res,502,{error:'Could not verify MTP support'});
-          const model = (listing.body.data || []).find(m=>(m.id || m.model_name)===body.name);
-          if (!model) return json(res,404,{error:'Model not installed'});
-          let options;
-          try { options = require('./mtp.cjs').loadOptions(model,body.mtp); }
-          catch(error) { return json(res,400,{error:error.message}); }
-          const loaded = await modelManager.load(body.name,options);
-          if (!loaded.ok) return json(res,502,{error:'Model could not load with that MTP setting. Previous saved settings were kept.'});
-          const saved = await modelManager.load(body.name,{...options,save_options:true});
-          return json(res,saved.ok?200:502,saved.ok?{ok:true}:{error:'Model loaded, but its MTP preference could not be saved. Check before reloading.'});
-        }
-        const r = await modelManager[verb](body.name);
-        return json(res, r.ok ? 200 : 502, r.ok ? { ok: true } : { error: `${verb} failed: ${r.status}` });
-      }
-    }
-
-    if (p === '/api/models/downloads') {
-      if (!modelManager.enabled) return json(res, 200, []);
-      const r = await modelManager.downloads();
-      if (!r.ok) return json(res, 502, {error:'Download status unavailable'});
-      const arr = Array.isArray(r.body) ? r.body : r.body?.jobs || r.body?.downloads || [];
-      // Lemonade reports `percent` as 0-100; the UI expects a 0-1 fraction.
-      return json(res, 200, arr.map((j) => ({
-        id: j.id || j.job_id || '',
-        model: j.model_name || j.model || j.checkpoint || '',
-        progress: typeof j.percent === 'number' ? j.percent / 100 : typeof j.progress === 'number' ? j.progress : null,
-        status: j.status || j.state || '',
-      })));
-    }
+    if (await modelRoutes(req, res, { path: p, authn, url })) return;
 
     if(p==='/api/diary/exchanges' && req.method==='GET') {
       if(!authService.diaryEnabled(authn.user.id))return json(res,404,{error:'Diary add-on is disabled'});
