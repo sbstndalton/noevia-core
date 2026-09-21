@@ -771,6 +771,25 @@ const driveTools = require('./gdrive-tools.cjs').createDriveTools({ accounts: dr
 TOOLBOXES.push(driveTools.box);
 const connectorRoutes = require('./routes/connectors.cjs').createConnectorRoutes({
   accounts: driveAccounts, driveTools, policy: toolPolicy, offsite: offsiteBackup, isWrite: (name) => isWriteTool(name), json, readBody: (req) => readJson(req),
+  // Nextcloud's tools ride on the account's storage connection, so this only reports what that
+  // connection allows and owns the per-tool permissions.
+  nextcloud: {
+    state(user) {
+      const storage = authService.getStorage(user.id, true);
+      const connected = ['nextcloud', 'webdav'].includes(storage.kind) && !!storage.username && !!storage.secret;
+      if (!MCP_SERVERS.some((sv) => sv.auth === 'nextcloud')) {
+        return { configured: false, state: 'not-configured', message: 'This server has no Nextcloud MCP server configured, so there are no Nextcloud tools to offer.' };
+      }
+      if (!connected) return { configured: true, state: 'disconnected', message: 'Connect Nextcloud under Settings → Diary & storage; its tools then use that same connection.' };
+      if (!mcpCredentialOriginAllowed(storage.baseUrl)) {
+        return { configured: true, state: 'error', account: storage.username, baseUrl: storage.baseUrl,
+          message: 'Your Nextcloud address is not on this server\'s allowed list (MCP_NEXTCLOUD_ORIGINS), so noevia will not send your credential to it.' };
+      }
+      return { configured: true, state: 'connected', account: storage.username, baseUrl: storage.baseUrl, message: '' };
+    },
+    boxes: () => allToolboxes().filter((b) => b.server === 'nextcloud').map((b) => ({ id: b.id, label: b.label, toolCount: b.tools.length })),
+    tools: () => allToolboxes().filter((b) => b.server === 'nextcloud').flatMap((b) => b.tools.map((t) => t.function.name)),
+  },
 });
 // Account-level connectors are not a project choice: they join every chat of an account that
 // connected them, and never appear in a project's toolbox picker.
