@@ -10,11 +10,15 @@ const KINDS = new Set(['choice', 'multi', 'rank', 'noul', 'score']);
 
 /**
  * @param {{ backends: Record<string, object>, chains?: Record<string, string[]>, log?: (entry: object) => void,
- *           now?: () => number }} deps
+ *           now?: () => number, onDiagnostic?: (entry: object) => void }} deps
+ *   onDiagnostic: OPT-IN, for offline experiments only. Receives the backend's own structured
+ *   diagnostics (error.diagnostics on failure, result.metadata.diagnostics on success) for every
+ *   backend attempt. Backends put measurements there, never prompt text. Production does not pass
+ *   it, so nothing extra is recorded there.
  *   chains: purpose -> backend ids tried in order, e.g. { 'rag.rerank': ['llama-rerank'] }. The
  *   request's own fallback always follows the chain.
  */
-function createDecisions({ backends, chains = {}, log = () => {}, now = Date.now }) {
+function createDecisions({ backends, chains = {}, log = () => {}, now = Date.now, onDiagnostic = null }) {
   const benched = new Map(); // backend id -> until (ms): skipped after repeated deadline misses
   const misses = new Map();
 
@@ -36,11 +40,14 @@ function createDecisions({ backends, chains = {}, log = () => {}, now = Date.now
         result = await withDeadline((signal) => backend.decide(request, { signal }), request.constraints.deadlineMs);
       } catch (error) {
         if (error?.deadline) { const n = (misses.get(id) || 0) + 1; misses.set(id, n); if (n >= 3) { benched.set(id, now() + 60_000); misses.set(id, 0); } }
-        log({ purpose: request.purpose, backend: id, failed: error?.deadline ? 'deadline' : String(error?.message || error).slice(0, 200) });
+        const reason = error?.deadline ? 'deadline' : String(error?.message || error);
+        log({ purpose: request.purpose, backend: id, failed: reason.slice(0, 200) });
+        if (onDiagnostic) onDiagnostic({ purpose: request.purpose, backend: id, ok: false, reason, diagnostics: error?.diagnostics ?? null });
         continue;
       }
       misses.set(id, 0);
       const invalid = invalidResult(request, result);
+      if (onDiagnostic) onDiagnostic({ purpose: request.purpose, backend: id, ok: !invalid, reason: invalid ? `invalid: ${invalid}` : null, diagnostics: result?.metadata?.diagnostics ?? null });
       if (invalid) { log({ purpose: request.purpose, backend: id, failed: `invalid: ${invalid}` }); continue; }
       const min = request.constraints.minConfidence;
       if (typeof min === 'number' && request.kind !== 'rank' && !(result.confidence >= min)) {

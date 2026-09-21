@@ -1,5 +1,5 @@
 'use strict';
-// llama-logit measurement contract v2 (backends.cjs), against mocked llama.cpp responses only.
+// llama-logit readout contract v3 (backends.cjs), against mocked llama.cpp responses only.
 const test = require('node:test'), assert = require('node:assert/strict');
 const { llamaLogitBackend } = require('./backends.cjs');
 const { createDecisions } = require('./index.cjs');
@@ -7,74 +7,98 @@ const { createDecisions } = require('./index.cjs');
 // Token ids: "A"=10, " A"=11, "B"=20, " B"=21, "C"=30, " C"=31; "<|channel>"=1, "**"=2.
 const IDS = { A: 10, ' A': 11, B: 20, ' B': 21, C: 30, ' C': 31 };
 const opts = [{ id: 'keep', label: 'Keep' }, { id: 'switch', label: 'Switch' }, { id: 'ask', label: 'Ask' }];
-const request = { kind: 'choice', question: 'q', context: { stateText: 's' }, options: opts };
+const request = { kind: 'choice', question: 'q', context: { stateText: 'PRIVATE-STATE-TEXT' }, options: opts };
 
 function server({ first, biased, tokenize = (c) => [{ id: IDS[c], piece: c }] }) {
   const bodies = [];
   const fetchImpl = async (url, init) => {
-    const body = JSON.parse(init.body); bodies.push({ url, body });
+    const body = init.body ? JSON.parse(init.body) : null; bodies.push({ url, body });
     let out;
-    if (url.endsWith('/tokenize')) out = { tokens: tokenize(body.content) };
+    if (url.endsWith('/props')) out = { model_path: '/m/test.gguf', build_info: 'b1-test', default_generation_settings: { n_ctx: 8192 } };
+    else if (url.endsWith('/tokenize')) out = { tokens: tokenize(body.content) };
     else if (url.endsWith('/apply-template')) out = { prompt: 'P' };
     else if (body.logit_bias) out = { completion_probabilities: [{ top_probs: biased }] };
-    else out = { completion_probabilities: [{ top_logprobs: first }], timings: { prompt_n: 7 } };
+    else out = { completion_probabilities: [{ top_logprobs: first }], timings: { prompt_n: 7, prompt_ms: 3 } };
     return { ok: true, json: async () => out };
   };
   return { fetchImpl, bodies };
 }
 const lp = (token, id, p) => ({ token, id, logprob: Math.log(p) });
 const pp = (token, id, prob) => ({ token, id, prob });
+const all = (pA, pB, pC) => [pp('A', 10, pA * 0.9), pp(' A', 11, pA * 0.1), pp('B', 20, pB * 0.9), pp(' B', 21, pB * 0.1), pp('C', 30, pC * 0.9), pp(' C', 31, pC * 0.1)];
+const backend = (s, extra = {}) => llamaLogitBackend({ baseUrl: 'http://w', fetchImpl: s.fetchImpl, ...extra });
 
-test('variants of one label are summed, and ratios come from the equal-bias request', async () => {
-  const s = server({ first: [lp('B', 20, 0.6), lp('A', 10, 0.3), lp(' B', 21, 0.05)],
-    biased: [pp('B', 20, 0.5), pp(' B', 21, 0.1), pp('A', 10, 0.3), pp('C', 30, 0.0999)] });
-  const r = await llamaLogitBackend({ baseUrl: 'http://w', fetchImpl: s.fetchImpl }).decide(request);
-  assert.equal(r.selected, 'switch');
-  assert.ok(Math.abs(r.metadata.probs.switch - 0.6 / 0.9999) < 1e-9);
-  assert.deepEqual(r.metadata.readout.observed, ['keep', 'switch', 'ask']);
-  const biasedReq = s.bodies.find((b) => b.body.logit_bias);
-  assert.deepEqual(biasedReq.body.samplers, ['temperature']); assert.equal(biasedReq.body.post_sampling_probs, true);
-  assert.equal(new Set(biasedReq.body.logit_bias.map(([, b]) => b)).size, 1, 'one equal bias for every label token');
+test('exact: every permitted token observed; variants summed; ratios from the equal-bias request', async () => {
+  const s = server({ first: [lp('B', 20, 0.6), lp('A', 10, 0.3)], biased: all(0.3, 0.6, 0.1) });
+  const r = await backend(s).decide(request);
+  assert.equal(r.selected, 'switch'); assert.equal(r.metadata.readout, 'exact'); assert.equal(r.metadata.calibrated, false);
+  assert.ok(Math.abs(r.metadata.ratios.switch - 0.6) < 1e-9);
+  const b2 = s.bodies.find((b) => b.body?.logit_bias);
+  assert.deepEqual(b2.body.samplers, ['temperature']); assert.equal(b2.body.post_sampling_probs, true);
+  assert.equal(new Set(b2.body.logit_bias.map(([, v]) => v)).size, 1, 'one equal bias');
 });
 
-test('a formatting or channel token at the answer position makes the readout invalid', async () => {
-  const s = server({ first: [lp('<|channel>', 1, 0.9), lp('B', 20, 0.05)], biased: [pp('B', 20, 1)] });
-  await assert.rejects(llamaLogitBackend({ baseUrl: 'http://w', fetchImpl: s.fetchImpl }).decide(request), /answer position holds 0.050 label mass.*channel/);
+test('bounded: an unobserved label is absent from the scores and carries an interval, not a measured zero', async () => {
+  const s = server({ first: [lp('A', 10, 0.8), lp('B', 20, 0.15)], biased: [pp('A', 10, 0.7), pp(' A', 11, 0.1), pp('B', 20, 0.15), pp(' B', 21, 0.04995)] });
+  const r = await backend(s).decide(request);
+  assert.equal(r.metadata.readout, 'bounded'); assert.equal(r.selected, 'keep');
+  assert.equal('ask' in r.scores, false); assert.equal('ask' in r.metadata.ratios, false);
+  assert.equal(r.metadata.bounds.ask[0], 0); assert.ok(r.metadata.bounds.ask[1] > 0);
+  assert.deepEqual(r.metadata.diagnostics.unobserved, ['ask']);
+  assert.deepEqual(r.metadata.diagnostics.unobservedVariants.map((v) => v.id).sort(), [30, 31]);
 });
 
-test('empty probabilities are invalid, never a first-option default', async () => {
-  const s = server({ first: [], biased: [] });
-  await assert.rejects(llamaLogitBackend({ baseUrl: 'http://w', fetchImpl: s.fetchImpl }).decide(request), /no probabilities returned/);
+test('bounded: a choice that an unobserved token could overturn is rejected', async () => {
+  const s = server({ first: [lp('A', 10, 0.5), lp('B', 20, 0.45)], biased: [pp('A', 10, 0.4999), pp('B', 20, 0.4995)] });
+  await assert.rejects(backend(s, { maxResidual: 1e-2 }).decide(request), /not robust to unobserved-token bound/);
 });
 
-test('a label missing from the biased distribution is reported, and a large residual is invalid', async () => {
-  const s = server({ first: [lp('A', 10, 0.7), lp('B', 20, 0.2)], biased: [pp('A', 10, 0.7), pp('B', 20, 0.2), pp('x', 99, 0.1)] });
-  await assert.rejects(llamaLogitBackend({ baseUrl: 'http://w', fetchImpl: s.fetchImpl }).decide(request), (e) => {
-    assert.match(e.message, /residual mass/); assert.deepEqual(e.readout.unobserved, ['ask']); return true;
-  });
+test('an unsupported (multi-token) variant is recorded; a multi-token canonical label is refused', async () => {
+  const ok = server({ first: [lp('A', 10, 0.9)], biased: [pp('A', 10, 0.9), pp('B', 20, 0.05), pp(' B', 21, 0.01), pp('C', 30, 0.03), pp(' C', 31, 0.01)],
+    tokenize: (c) => (c === ' A' ? [{ id: 5, piece: ' ' }, { id: 10, piece: 'A' }] : [{ id: IDS[c], piece: c }]) });
+  const r = await backend(ok).decide(request);
+  assert.deepEqual(r.metadata.diagnostics.unsupportedVariants, [{ option: 'keep', text: ' A' }]);
+  const bad = server({ first: [], biased: [], tokenize: (c) => (c.trim() === 'B' ? [{ id: 1, piece: '(' }, { id: 2, piece: 'B' }] : [{ id: IDS[c], piece: c }]) });
+  await assert.rejects(backend(bad).decide(request), /label B is not a single token/);
 });
 
-test('an unobserved label with a negligible residual is complete, and marked unobserved rather than invented', async () => {
-  const s = server({ first: [lp('A', 10, 0.8), lp('B', 20, 0.15)], biased: [pp('A', 10, 0.8), pp('B', 20, 0.19995)] });
-  const r = await llamaLogitBackend({ baseUrl: 'http://w', fetchImpl: s.fetchImpl }).decide(request);
-  assert.equal(r.selected, 'keep'); assert.deepEqual(r.metadata.readout.unobserved, ['ask']); assert.equal(r.metadata.probs.ask, 0);
+test('invalid readouts throw with diagnostics: formatting token, empty, residual, tie', async () => {
+  const cases = [
+    [{ first: [lp('<|channel>', 1, 0.9), lp('B', 20, 0.05)], biased: all(0.3, 0.6, 0.1) }, /answer position holds 0.050 label mass < 0.5 \(top token "<\|channel>"\)/],
+    [{ first: [], biased: [] }, /no probabilities returned \(request 1\)/],
+    [{ first: [lp('A', 10, 0.7)], biased: [pp('A', 10, 0.7), pp('B', 20, 0.2), pp('x', 99, 0.1)] }, /residual mass/],
+    [{ first: [lp('A', 10, 0.45), lp('B', 20, 0.45)], biased: [pp('A', 10, 0.5), pp('B', 20, 0.5)] }, /exact tie/],
+  ];
+  for (const [srv, re] of cases) {
+    await assert.rejects(backend(server(srv)).decide(request), (e) => {
+      assert.match(e.message, re); assert.equal(e.diagnostics.readout, 'invalid'); assert.match(e.diagnostics.rejection, re);
+      assert.equal(e.diagnostics.runtime.build, 'b1-test'); assert.ok(e.diagnostics.labels.keep.variants.length === 2);
+      assert.equal(typeof e.diagnostics.timings.totalMs, 'number');
+      return true;
+    });
+  }
 });
 
-test('an exact tie is invalid', async () => {
-  const s = server({ first: [lp('A', 10, 0.45), lp('B', 20, 0.45)], biased: [pp('A', 10, 0.5), pp('B', 20, 0.5)] });
-  await assert.rejects(llamaLogitBackend({ baseUrl: 'http://w', fetchImpl: s.fetchImpl }).decide(request), /exact tie/);
+test('diagnostics never contain the prompt or state text', async () => {
+  const s = server({ first: [lp('<|channel>', 1, 0.99)], biased: [] });
+  await assert.rejects(backend(s).decide(request), (e) => { assert.equal(JSON.stringify(e.diagnostics).includes('PRIVATE-STATE-TEXT'), false); return true; });
 });
 
-test('a label that is not a single token is refused', async () => {
-  const s = server({ first: [], biased: [], tokenize: (c) => (c.trim() === 'B' ? [{ id: 1, piece: '(' }, { id: 2, piece: 'B' }] : [{ id: IDS[c], piece: c }]) });
-  await assert.rejects(llamaLogitBackend({ baseUrl: 'http://w', fetchImpl: s.fetchImpl }).decide(request), /label B is not a single token/);
-});
-
-test('through decide(), an invalid readout uses the authorised fallback and is logged', async () => {
+test('through decide(): a failure falls back, and its diagnostics reach the opt-in hook intact', async () => {
   const s = server({ first: [lp('**', 2, 0.99)], biased: [] });
-  const logs = [];
-  const d = createDecisions({ backends: { 'llama-logit': llamaLogitBackend({ baseUrl: 'http://w', fetchImpl: s.fetchImpl }) }, chains: { p: ['llama-logit'] }, log: (e) => logs.push(e) });
+  const seen = [];
+  const d = createDecisions({ backends: { 'llama-logit': backend(s) }, chains: { p: ['llama-logit'] }, onDiagnostic: (e) => seen.push(e) });
   const r = await d.decide({ ...request, purpose: 'p', fallback: { selected: 'keep', scores: {}, confidence: null }, constraints: { deadlineMs: 1000 } });
   assert.equal(r.source, 'fallback'); assert.equal(r.selected, 'keep');
-  assert.ok(logs.some((e) => /readout invalid/.test(e.failed || '')));
+  assert.equal(seen.length, 1); assert.equal(seen[0].ok, false);
+  assert.match(seen[0].reason, /answer position holds/);
+  assert.equal(seen[0].diagnostics.request1.top[0].token, '**');
+});
+
+test('without the hook, decide() records nothing beyond its usual short log line', async () => {
+  const s = server({ first: [lp('**', 2, 0.99)], biased: [] });
+  const logs = [];
+  const d = createDecisions({ backends: { 'llama-logit': backend(s) }, chains: { p: ['llama-logit'] }, log: (e) => logs.push(e) });
+  await d.decide({ ...request, purpose: 'p', fallback: { selected: 'keep', scores: {}, confidence: null }, constraints: { deadlineMs: 1000 } });
+  assert.ok(logs.every((e) => !('diagnostics' in e)));
 });
