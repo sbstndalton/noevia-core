@@ -34,6 +34,7 @@ function init({ dataDir, embedModel, inferenceUrl, headersFn, userDataDirFn, inf
   embeddingBase = (process.env.EMBEDDING_BASE_URL || '').trim() || null;
   if (headersFn) inferenceHeaders = headersFn;
   if (inferenceGuard) enterInference = inferenceGuard;
+  initRerank();
 }
 // Chunk sizing starts from diary-companion's shape (subsection-scale bodies).
 // ~1200 chars with a 150-char overlap keeps chunks coherent.
@@ -44,6 +45,46 @@ const CHUNK_STRIDE = 150;
 const DIRECT_INJECT_MAX = 2400;
 const TOP_K = 6;
 const MIN_SCORE = 0.3;
+
+// Optional cross-encoder rerank (docs/research/system-one, experiments/system-one/rag). Off unless
+// NOEVIA_FEATURE_RAG_RERANK=1 and RERANK_BASE_URL are set. Retrieval then pulls a wider cosine pool
+// and the reranker picks the kept chunks; any failure or a missed deadline falls back to today's
+// cosine top-6, so chat never waits longer than the deadline. KEEP defaults to 6, not the
+// measured-best 3: 3 won on the synthetic corpus (91% vs 86%) but it demoted gold chunks on
+// exact-number questions, and with only 3 kept one demotion loses the answer outright.
+const RERANK_POOL = 24;
+let rerank = null; // { decisions, keep, deadlineMs }
+function initRerank() {
+  const on = /^(1|true|on)$/i.test(process.env.NOEVIA_FEATURE_RAG_RERANK || '');
+  const baseUrl = (process.env.RERANK_BASE_URL || '').trim();
+  if (!on || !baseUrl) { rerank = null; return; }
+  const { createDecisions } = require('./decision/index.cjs');
+  const { llamaRerankBackend } = require('./decision/backends.cjs');
+  const decisions = createDecisions({
+    backends: { 'llama-rerank': llamaRerankBackend({ baseUrl, model: process.env.RERANK_MODEL || null }) },
+    chains: { 'rag.rerank': ['llama-rerank'] },
+    log: (e) => { if (e.failed || e.fellBack) console.warn('[rag] rerank', JSON.stringify(e)); },
+  });
+  rerank = { decisions, keep: clampInt(process.env.RAG_RERANK_KEEP, 6, 1, RERANK_POOL), deadlineMs: clampInt(process.env.RAG_RERANK_DEADLINE_MS, 3000, 100, 30000) };
+}
+function clampInt(v, dflt, lo, hi) { const n = parseInt(v, 10); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : dflt; }
+
+// Pure: cosine-ordered pool in, kept hits out. Fallback is the cosine top-K. Never throws.
+async function rerankPool({ query, pool, decisions, keep, deadlineMs, fallbackK = TOP_K }) {
+  const cosine = pool.slice(0, fallbackK);
+  if (!decisions || pool.length <= 1) return cosine;
+  const items = pool.map((h, i) => ({ id: String(i), label: h.body, score: h.score }));
+  const ids = cosine.map((_, i) => String(i));
+  try {
+    const r = await decisions.rank({
+      purpose: 'rag.rerank', question: String(query), items,
+      fallback: { selected: ids, scores: Object.fromEntries(items.map((it) => [it.id, it.score])), confidence: null },
+      constraints: { deadlineMs },
+    });
+    if (r.source === 'fallback') return cosine;
+    return r.selected.slice(0, keep).map((id) => pool[Number(id)]).filter(Boolean);
+  } catch { return cosine; }
+}
 
 let depsCache = null;
 function loadDeps() {
@@ -276,8 +317,10 @@ async function searchProject(projectId, query, userId) {
          ORDER BY score DESC
          LIMIT ?`
       )
-      .all(qbuf, qbuf, MIN_SCORE, TOP_K);
-    return rows.map((r) => ({ file: r.file, body: r.body, score: Math.round(r.score * 1000) / 1000 }));
+      .all(qbuf, qbuf, MIN_SCORE, rerank ? RERANK_POOL : TOP_K);
+    const hits = rows.map((r) => ({ file: r.file, body: r.body, score: Math.round(r.score * 1000) / 1000 }));
+    if (!rerank) return hits;
+    return await rerankPool({ query, pool: hits, ...rerank });
   } catch (err) {
     console.warn(`[rag] search failed for ${projectId}: ${err.message}`);
     return [];
@@ -330,4 +373,4 @@ async function filesContext(projectId, files, query, userId) {
 // of the wrong dimensionality scores silently rather than failing.
 function embedModel() { return EMBED_MODEL; }
 
-module.exports = { init, indexProjectFile, deleteProjectFile, searchProject, filesContext, chunkText, ragAvailable, embed, embedModel };
+module.exports = { init, indexProjectFile, deleteProjectFile, searchProject, filesContext, chunkText, ragAvailable, embed, embedModel, rerankPool };
