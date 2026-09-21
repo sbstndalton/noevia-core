@@ -219,3 +219,19 @@ test('the harness user is read only in the form that can be acted on', () => {
     assert.equal(parseUser(bad), null, JSON.stringify(bad));
   }
 });
+
+test('without the egress proxy, network and installs are never granted, and the server says so', async () => {
+  // They used to be recorded as granted and then quietly not happen: the proxy is the only way
+  // a task gets any network, so with no proxy there is nothing to grant.
+  const { svc, ws } = service();
+  assert.equal(svc.network(), false);
+  const started = await svc.start(ws, project, { repository: 'noevia', prompt: 'x',
+    capabilities: ['read_repository', 'edit_file', 'network', 'install_dependency'], domains: ['registry.npmjs.org'] });
+  assert.deepEqual(started.capabilities, ['read_repository', 'edit_file']);
+
+  const withProxy = service({ egress: { grant: () => ({ token: 't' }), revoke: () => {} } });
+  assert.equal(withProxy.svc.network(), true);
+  const online = await withProxy.svc.start(withProxy.ws, project, { repository: 'noevia', prompt: 'x',
+    capabilities: ['read_repository', 'network'], domains: ['registry.npmjs.org'] });
+  assert.deepEqual(online.capabilities, ['read_repository', 'network']);
+});

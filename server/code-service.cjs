@@ -137,6 +137,9 @@ function createCodeService({ repos, connect, egress = null, engine = undefined, 
     harnesses: () => harnesses.map((h) => ({ ...h })),
     promptPreparation: () => PROMPT_PREPARATION.map((p) => ({ ...p })),
     sandboxed: () => sandboxKind === 'sandbox',
+    // Whether a task can be given any network at all. Without the egress proxy there is no way
+    // to let one domain through, so the network capabilities are not offered as if there were.
+    network: () => !!egress,
 
     list(workspace, project) {
       const { jobs } = storeFor(workspace);
@@ -152,7 +155,10 @@ function createCodeService({ repos, connect, egress = null, engine = undefined, 
       if (!prompt) throw fail(400, 'Describe the task.');
       if (prompt.length > 8000) throw fail(400, 'That task description is too long.');
       const asked = Array.isArray(body.capabilities) ? body.capabilities : DEFAULT_CAPABILITIES;
-      const capabilities = GRANTABLE.filter((c) => asked.includes(c));
+      // Network and installs need the egress proxy. Without it they would be recorded as granted
+      // and then quietly never happen, so they are not granted at all.
+      const offline = [ACTIONS.NETWORK, ACTIONS.INSTALL];
+      const capabilities = GRANTABLE.filter((c) => asked.includes(c) && (egress || !offline.includes(c)));
       // A harness or a preparation mode noevia does not offer is refused here, not passed on:
       // the browser's list is a convenience, never the authority.
       const harnessId = String(body.harness || harnesses[0]?.id || '');

@@ -25,6 +25,7 @@ function createCodeRoutes({ service, features, getProject, workspace, json, read
           return send(200, { repositories: service.repositories(), capabilities: service.grantable,
             defaultCapabilities: service.defaultCapabilities, harnesses: service.harnesses(),
             promptPreparation: service.promptPreparation(), sandboxed: service.sandboxed(),
+            network: typeof service.network === 'function' ? service.network() : false,
             tasks: service.list(ws, project) });
         }
         if (req.method !== 'POST') return send(405, { error: 'method not allowed' });
