@@ -8,7 +8,7 @@ const test = require('node:test');
 // Each test file gets its own data dir so parallel runs never race on the
 // default server/ui-data/secrets.key (EEXIST).
 process.env.UI_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'cowork-usage-test-'));
-const { recordUsage, recordToolUse, readUsage, usageDayKey, USAGE_RETENTION_DAYS } = require('./index.cjs');
+const { recordUsage, recordToolUse, readUsage, usageDayKey, USAGE_RETENTION_DAYS } = require('./usage.cjs');
 
 function workspace(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cowork-usage-'));

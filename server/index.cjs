@@ -602,90 +602,8 @@ function writeHistory(spaceId, history) {
 // literal per feature doc Item 0 / step 9).
 let LAST_LOADED_MODEL = null;
 
-// ── Usage accounting ──────────────────────────────────────────────────────
-// Daily rollup buckets rather than a per-reply log: the dashboard only ever
-// asks day-level questions (totals, a heat map, active days, per-model split),
-// and a bucket file is bounded — one small record per day, capped at a year —
-// where an append-only log on a self-hosted box grows until someone notices.
-// Per-message detail is not lost; it already lives in each chat's history.
-const USAGE_RETENTION_DAYS = 365;
-
-// Local civil date, not UTC: "today" on the dashboard should mean the
-// operator's today, and an evening request must not land in tomorrow's bucket.
-function usageDayKey(at = new Date()) {
-  const y = at.getFullYear();
-  const m = String(at.getMonth() + 1).padStart(2, '0');
-  const d = String(at.getDate()).padStart(2, '0');
-  return `${y}-${m}-${d}`;
-}
-
-function readUsage(workspace) {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(workspace.usagePath(), 'utf8'));
-    return parsed && typeof parsed.days === 'object' && parsed.days ? parsed : { days: {} };
-  } catch {
-    return { days: {} };
-  }
-}
-
-// Called once per completed reply, from the point the provider reports its
-// usage chunk. Recording here rather than from the browser means the numbers
-// survive a client that navigated away mid-reply, and cannot be shaped by
-// anything the client sends.
-function recordUsage(workspace, model, usage) {
-  if (!workspace || !usage) return;
-  const input = Number(usage.promptTokens) || 0;
-  const output = Number(usage.completionTokens) || 0;
-  if (!Number.isFinite(input) || !Number.isFinite(output) || input<0 || output<0 || (!input && !output)) return;
-  try {
-    const store = readUsage(workspace);
-    const key = usageDayKey();
-    const day = store.days[key] || { input: 0, output: 0, replies: 0, models: {} };
-    day.input += input;
-    day.output += output;
-    day.replies += 1;
-    const name = String(model || 'unknown');
-    day.models=Object.assign(Object.create(null),day.models||{});
-    const perModel = day.models[name] || { input: 0, output: 0, replies: 0 };
-    perModel.input += input;
-    perModel.output += output;
-    perModel.replies += 1;
-    day.models[name] = perModel;
-    // Replies by hour of the same local clock the day keys use, so "peak hour"
-    // means the hour the user saw, not UTC.
-    day.hours = Object.assign(Object.create(null), day.hours || {});
-    const hour = new Date().getHours();
-    day.hours[hour] = (Number(day.hours[hour]) || 0) + 1;
-    store.days[key] = day;
-    // Drop anything past the window on write, so the file cannot creep upward
-    // even on a deployment that runs for years.
-    const cutoff = usageDayKey(new Date(Date.now() - USAGE_RETENTION_DAYS * 86400000));
-    for (const k of Object.keys(store.days)) if (k < cutoff) delete store.days[k];
-    atomicJson(workspace.usagePath(), store);
-  } catch (err) {
-    // Accounting must never break a reply that already succeeded.
-    console.warn('[usage] could not record:', err?.message || err);
-  }
-}
-
-// One line per tool the model actually ran, counted where the call is made so
-// the total cannot be shaped by the client. Failures count too: a tool that
-// keeps erroring is exactly what this number should show.
-function recordToolUse(workspace, name) {
-  if (!workspace || !name) return;
-  try {
-    const store = readUsage(workspace);
-    const key = usageDayKey();
-    const day = store.days[key] || { input: 0, output: 0, replies: 0, models: {} };
-    day.tools = Object.assign(Object.create(null), day.tools || {});
-    const tool = String(name).slice(0, 80);
-    day.tools[tool] = (Number(day.tools[tool]) || 0) + 1;
-    store.days[key] = day;
-    atomicJson(workspace.usagePath(), store);
-  } catch (err) {
-    console.warn('[usage] could not record a tool call:', err?.message || err);
-  }
-}
+// Usage accounting (daily rollups per tenant) lives in usage.cjs; its routes in routes/usage.cjs.
+const { USAGE_RETENTION_DAYS, usageDayKey, readUsage, recordUsage, recordToolUse } = require('./usage.cjs');
 
 // ── Auto model router (feature doc Item 4 / master step 12) ───────────────
 // Roles are config, never hardcoded model names: role→model mapping lives in
@@ -1668,6 +1586,12 @@ const codeRoutes = require('./routes/code.cjs').createCodeRoutes({
   }),
 });
 
+const usageRoutes = require('./routes/usage.cjs').createUsageRoutes({
+  readUsage, usageDayKey, retentionDays: USAGE_RETENTION_DAYS, json,
+  workspace: () => currentWorkspace(),
+  listUsers: () => authService.listUsers(), userDir: (id) => workspaceStore.userDir(id),
+});
+
 // ── Deep research (D12): module in research-service.cjs, routes in routes/research.cjs ──
 const researchRoutes = require('./routes/research.cjs').createResearchRoutes({
   features, getProject, workspace: () => currentWorkspace(), json, readJson,
@@ -2269,137 +2193,16 @@ async function executeMcpToolCall(name, args) {
 // Tuned against an 8-message battery (2026-09-03): the two misses were a
 // multi-step word problem (5 numbers, no keywords) and an explicit
 // "write 600 words" request — hence the numbers>=3 and effort-phrase rules.
-function heuristicWantsSmart(message) {
-  const m = String(message);
-  if (m.length > 600) return true;
-  if (m.includes('```')) return true;
-  if (/\b(function|algorithm|debug|refactor|implement|optimize|architecture|regex|sql|migration)\b/i.test(m)) return true;
-  // Multi-step quantitative asks: several numbers in one message rarely
-  // reduce to single-step arithmetic (e.g. chase/rate problems). False
-  // positives just get a better model — cheap; false negatives are the
-  // costly direction.
-  const numbers = m.match(/\d+(?:[.,]\d+)?/g);
-  if (numbers && numbers.length >= 3) return true;
-  // Explicit effort/length requests ("600 words", "step by step", ...).
-  if (/\b\d{2,}\s*(words?|paragraphs?|pages?|sentences?)\b/i.test(m)) return true;
-  if (/\b(step[- ]by[- ]step|in detail|detailed|thoroughly|comprehensive|deep dive|prove|derive)\b/i.test(m)) return true;
-  return false;
-}
-
-// One cheap classification call before an auto-routed message. Mirrors the
-// fail-open philosophy of diary-companion's pipeline.py skip_classifier: any
-// error or unparseable reply defaults to the fast role — the classifier must
-// never block the chat.
-// CODE is only offered to the model when a code role is configured. Asking for a verdict
-// the router cannot honour would spend the call and then discard the answer.
-const CLASSIFIER_SYSTEM_PROMPT =
-  'You classify a user message for a model router. Reply with exactly one word: FAST for short simple questions or small talk, SMART for complex reasoning, multi-step work, code, or analysis. No other text.';
-const CLASSIFIER_SYSTEM_PROMPT_CODE =
-  'You classify a user message for a model router. Reply with exactly one word: FAST for short simple questions or small talk, CODE for writing, reading, debugging or explaining source code, SMART for any other complex reasoning, multi-step work or analysis. No other text.';
-
-// Budget for the classifier reply. A non-reasoning answer is 1-3 tokens; this
-// only has to be large enough for a reasoning model that ignores the
-// no-thinking hint below to finish its chain of thought and still emit the
-// verdict. Measured against the local roster (2026-09-07): gemma-4-E2B needs
-// ~162 tokens thinking, Qwen3.5-9B ~427. The old value of 64 truncated both —
-// finish_reason came back 'length' with an empty content field, no verdict was
-// ever found, and every message silently fell open to fast. That is why auto
-// mode looked biased rather than broken.
-const CLASSIFIER_MAX_TOKENS = 512;
-
-function classifierBody(model, message, suppressThinking, withCode = false) {
-  const body = {
-    model,
-    messages: [
-      { role: 'system', content: withCode ? CLASSIFIER_SYSTEM_PROMPT_CODE : CLASSIFIER_SYSTEM_PROMPT },
-      { role: 'user', content: String(message).slice(0, 1000) },
-    ],
-    max_tokens: CLASSIFIER_MAX_TOKENS,
-    temperature: 0,
-    stream: false,
-  };
-  // Routing is a mechanical label, not a reasoning task, so ask the model to
-  // skip its chain of thought. llama.cpp/vLLM honour this; on the local
-  // roster it cuts the call from ~162-427 tokens (12-31s on an iGPU, paid
-  // before every single auto-routed message) to 2-3 tokens under 80ms.
-  // Providers that reject unknown fields get a retry without it — see below.
-  if (suppressThinking) body.chat_template_kwargs = { enable_thinking: false };
-  return JSON.stringify(body);
-}
-
-// Read the verdict out of a classifier reply. content is authoritative when
-// present; the reasoning channel is only a fallback, and deliberately a
-// last-resort one: a thinking model restates the prompt's own FAST/SMART
-// wording while deliberating, so scanning it can pick up the prompt's words
-// rather than the model's conclusion.
-function classifierVerdict(msg, withCode = false) {
-  const words = withCode ? /\b(SMART|FAST|CODE)\b/g : /\b(SMART|FAST)\b/g;
-  const content = String(msg.content || '').toUpperCase();
-  const direct = content.match(words);
-  if (direct) return direct[direct.length - 1].toLowerCase();
-  const reasoning = String(msg.reasoning_content || '').toUpperCase();
-  const hits = reasoning.match(words);
-  return hits ? hits[hits.length - 1].toLowerCase() : null;
-}
-
-// Code work the heuristic can name without a round-trip: a fenced block, or a diff.
-// Everything else is left to the classifier, as with `smart`.
-function heuristicWantsCode(message) {
-  const m = String(message);
-  if (m.includes('```')) return true;
-  if (/^(diff --git|@@ -|\+\+\+ b\/)/m.test(m)) return true;
-  return false;
-}
-
-async function classifyFastOrSmart(message) {
-  const roles = autoRoles();
-  if (!roles) return 'fast';
-  // A code role only participates when one is configured; otherwise the router
-  // behaves exactly as it did before, and code work keeps going to smart.
-  const withCode = !!roles.code;
-  if (withCode && heuristicWantsCode(message)) return 'code';
-  if (heuristicWantsSmart(message)) return 'smart';
-  try {
-    const defaultProvider = getProvider(DEFAULT_PROVIDER_ID);
-    const url = `${defaultProvider.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`;
-    const call = (suppressThinking) =>
-      fetchJson(
-        url,
-        {
-          method: 'POST',
-          headers: providerHeaders(defaultProvider),
-          body: classifierBody(roles.fast, message, suppressThinking, withCode),
-        },
-        20000,
-      );
-    let r = await call(true);
-    // chat_template_kwargs is a llama.cpp/vLLM extension. A strict provider
-    // (or a gateway in front of one) may 400 on the unknown field; retry once
-    // plainly rather than degrading to fast, which is the failure this whole
-    // function exists to avoid.
-    if (r.status === 400) {
-      console.warn('[router] classifier rejected chat_template_kwargs (400), retrying without it');
-      r = await call(false);
-    }
-    if (!r.ok) throw new Error(`classifier ${r.status}`);
-    const choice = r.body?.choices?.[0] || {};
-    const verdict = classifierVerdict(choice.message || {}, withCode);
-    if (!verdict) {
-      // Distinguish "ran out of room mid-thought" from "answered something
-      // unparseable" — the first is a budget problem, the second a prompt one.
-      const truncated = choice.finish_reason === 'length';
-      console.warn(
-        `[router] no verdict in classifier reply${truncated ? ` (truncated at ${CLASSIFIER_MAX_TOKENS} tokens)` : ''}, failing open to fast`,
-      );
-      return 'fast';
-    }
-    console.log(`[router] classified -> ${verdict}`);
-    return verdict;
-  } catch (err) {
-    console.warn('[router] classify failed, failing open to fast:', err?.message || err);
-    return 'fast';
-  }
-}
+// The auto router's classifier lives in auto-router.cjs: a heuristic, one cheap call, and how
+// to read a verdict. Everything it needs from here is injected.
+const autoRouter = require('./auto-router.cjs').createAutoRouter({
+  roles: () => autoRoles(),
+  provider: () => getProvider(DEFAULT_PROVIDER_ID),
+  headers: (p) => providerHeaders(p),
+  fetchJson: (url, init, timeoutMs) => fetchJson(url, init, timeoutMs),
+});
+const { heuristicWantsSmart, heuristicWantsCode, classifierVerdict, CLASSIFIER_MAX_TOKENS } = autoRouter;
+const classifyFastOrSmart = (message) => autoRouter.classify(message);
 
 // The served model list, or null when it cannot be read (never treat an outage as "nothing installed").
 async function servedCatalogue() {
@@ -3862,16 +3665,7 @@ async function handleRequestScoped(req, res) {
     }
 
     // ── Projects CRUD ──
-    const usageSummary = require('./usage-summary.cjs');
-    if ((p === '/api/usage' || p === '/api/usage/aggregate') && req.method === 'GET') {
-      if(p==='/api/usage/aggregate'&&authn.user.role!=='admin')return json(res,403,{error:'administrator required'});
-      let store,aggregate;
-      if(p==='/api/usage/aggregate'){
-        try {const result=await usageSummary.aggregateUsage(authService.listUsers(),workspaceStore.userDir);store=result.store;aggregate={accounts:result.accounts,unreadableAccounts:result.unreadableAccounts,checkedAt:result.checkedAt};}
-        catch{return json(res,503,{error:'Aggregate usage could not be read within its limits.'});}
-      }else store=readUsage(currentWorkspace());
-      return json(res,200,{...usageSummary.summarizeUsage(store,{dayKey:usageDayKey,retentionDays:USAGE_RETENTION_DAYS}),...(aggregate?{aggregate}:{})});
-    }
+    if (authn && await usageRoutes(req, res, { path: p, authn })) return;
     const windowMatch=p.match(/^\/api\/chats\/([^/]+)\/context-window$/);
     if(windowMatch && req.method==='GET') return json(res,200,{meter:require('./chat-context.cjs').read(currentWorkspace().dir,decodeURIComponent(windowMatch[1])).meter||null});
 
