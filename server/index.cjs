@@ -1715,25 +1715,6 @@ async function modelsInstalled() {
   return installed;
 }
 
-async function searchModels(query) {
-  modelManager.requireEnabled();
-  // Hugging Face's public search API, called server-side for the Lemonade adapter.
-  const r = await fetchJson(
-    `https://huggingface.co/api/models?search=${encodeURIComponent(`${query} gguf`)}&sort=downloads&limit=12`,
-    {},
-    20000,
-  );
-  if (!r.ok) throw new Error(`search failed: ${r.status}`);
-  const arr = Array.isArray(r.body) ? r.body : [];
-  return arr
-    .filter((h) => !h.private)
-    .map((h) => ({
-      repo: h.id,
-      name: (h.id || '').split('/').pop() || h.id,
-      downloads: typeof h.downloads === 'number' ? h.downloads : null,
-    }));
-}
-
 // Lemonade's /pull needs a namespaced model_name for any checkpoint it
 // doesn't already know about; derive one from the repo/variant the user
 // picked (variants() below always hands us `<repo>:<variant>` or a bare
@@ -1744,21 +1725,6 @@ function deriveUserModelName(checkpoint) {
   const base = (repo.split('/').pop() || repo).replace(/[^A-Za-z0-9._-]/g, '-');
   const safeVariant = variant ? variant.replace(/[^A-Za-z0-9._-]/g, '-') : '';
   return `user.${base}${safeVariant ? `-${safeVariant}` : ''}`;
-}
-
-async function modelVariants(repo) {
-  modelManager.requireEnabled();
-  // Param name is `checkpoint` for the Lemonade adapter; each variant's id is
-  // `<repo>/<variant-name>`-style GGUF filename reference the pull verb accepts.
-  const r = await modelManager.variants(repo);
-  if (!r.ok) throw new Error(`variants failed: ${r.status}`);
-  const suggested = r.body?.suggested_name;
-  const arr = Array.isArray(r.body?.variants) ? r.body.variants : [];
-  return arr.slice(0, 100).map((v) => ({
-    id: suggested ? `${repo}:${v.name}` : String(v.primary_file || v.name),
-    label: String(v.name || v.primary_file || 'default'),
-    sizeGB: typeof v.size_bytes === 'number' ? Math.round((v.size_bytes / 1e9) * 10) / 10 : null,
-  }));
 }
 
 // ── Corpus-source adapter (Diary tab reads) ────────────────────────────────
@@ -3805,22 +3771,6 @@ async function handleRequestScoped(req, res) {
     if (p === '/api/models/installed') {
       try {
         return json(res, 200, await modelsInstalled());
-      } catch (err) {
-        return json(res, 502, { error: String(err.message || err) });
-      }
-    }
-
-    if (p === '/api/models/search') {
-      try {
-        return json(res, 200, await searchModels(url.searchParams.get('q') || ''));
-      } catch (err) {
-        return json(res, 502, { error: String(err.message || err) });
-      }
-    }
-
-    if (p === '/api/models/variants') {
-      try {
-        return json(res, 200, await modelVariants(url.searchParams.get('repo') || ''));
       } catch (err) {
         return json(res, 502, { error: String(err.message || err) });
       }
