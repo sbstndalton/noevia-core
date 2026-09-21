@@ -16,7 +16,7 @@ test.after(()=>fs.rmSync(contextDir,{recursive:true,force:true}));
 
 function fixture({ rounds, decision = 'approve', execute, fallback = false, cancel = false, effort, reasoningOnly = false, skills = [], native = false, preambleText = '', routedIds = null } = {}) {
   const resolvedFor = [];
-  const events = [], executions = [], approvals = [], requests = [], audits = [];
+  const events = [], executions = [], approvals = [], requests = [], audits = [], toolCounts = [];
   let round = 0, allApproved = false;
   const res = new EventEmitter();
   res.writeHead = () => {};
@@ -52,6 +52,7 @@ function fixture({ rounds, decision = 'approve', execute, fallback = false, canc
       return decision;
     },
     authService: { audit: (...args) => audits.push(args) },
+    recordToolUse: (_workspace, name) => toolCounts.push(name),
     executeToolCall: async (_project, name, args, allowed) => {
       assert.ok(allowed.has(name));
       executions.push({ name, args });
@@ -89,7 +90,7 @@ function fixture({ rounds, decision = 'approve', execute, fallback = false, canc
   vm.createContext(context);
   vm.runInContext(handler, context);
   return {
-    events, executions, approvals, requests, audits, resolvedFor,
+    events, executions, approvals, requests, audits, toolCounts, resolvedFor,
     async run(projectId = 'synthetic-project') {
       round = 0; res.writableEnded = false;
       await context.handleChat({}, res, { message: 'synthetic fixture', projectId, chatId: 'synthetic-chat' });
@@ -112,6 +113,9 @@ for (const fallback of [false, true]) {
       [[0, 'result-1'], [1, 'result-1'], [2, 'result-1'], [3, 'result-1']]);
     assert.deepEqual(f.requests[2].messages.filter(m => m.role === 'tool').map(m => m.tool_call_id), ['a', 'b', 'c']);
     assert.equal(f.audits.filter(a => a[0] === 'tool.write').length, 1);
+    // Usage counts calls that actually ran: a deduplicated repeat is not a
+    // second call, so the count matches executions rather than chips.
+    assert.deepEqual(f.toolCounts, ['write']);
     await f.run();
     await f.run('another-project');
     assert.equal(f.executions.length, 3, 'later exchanges execute again');

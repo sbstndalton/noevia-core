@@ -8,7 +8,7 @@ const test = require('node:test');
 // Each test file gets its own data dir so parallel runs never race on the
 // default server/ui-data/secrets.key (EEXIST).
 process.env.UI_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'cowork-usage-test-'));
-const { recordUsage, readUsage, usageDayKey, USAGE_RETENTION_DAYS } = require('./index.cjs');
+const { recordUsage, recordToolUse, readUsage, usageDayKey, USAGE_RETENTION_DAYS } = require('./index.cjs');
 
 function workspace(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cowork-usage-'));
@@ -75,4 +75,26 @@ test('invalid provider counts are ignored and prototype-shaped model names remai
  recordUsage(ws,'__proto__',{promptTokens:3,completionTokens:4});
  const models=readUsage(ws).days[usageDayKey()].models;
  assert.equal(Object.hasOwn(models,'__proto__'),true);assert.equal(models.__proto__.input,3);assert.equal({}.input,undefined);
+});
+
+test('replies are counted by the hour they happened, in the same local clock as the day key', (t) => {
+  const ws = workspace(t);
+  recordUsage(ws, 'model-a', { promptTokens: 4, completionTokens: 1 });
+  const day = readUsage(ws).days[usageDayKey()];
+  assert.equal(day.hours[new Date().getHours()], 1);
+  assert.equal(Object.values(day.hours).reduce((a, b) => a + b, 0), day.replies);
+});
+
+test('tool calls are counted where they run, and never create a reply', (t) => {
+  const ws = workspace(t);
+  recordToolUse(ws, 'read_project_file');
+  recordToolUse(ws, 'read_project_file');
+  recordToolUse(ws, '__proto__');
+  recordToolUse(ws, null);
+  const day = readUsage(ws).days[usageDayKey()];
+  assert.equal(day.tools.read_project_file, 2);
+  assert.equal(Object.hasOwn(day.tools, '__proto__'), true);
+  assert.equal({}.input, undefined);
+  // A tool call is not a model reply: streaks and active days must not move.
+  assert.equal(day.replies, 0);
 });

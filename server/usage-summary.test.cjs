@@ -24,3 +24,25 @@ test('aggregation only carries numeric metrics and prevents prototype-shaped mod
  const merged=mergeUsage([store,dangerous]);assert.equal(merged.days['2026-09-13'].input,1000000);assert.equal(merged.days['2026-09-13'].output,500004);
  assert.equal({}.input,undefined);assert.ok(!JSON.stringify(merged).includes('PRIVATE'));
 });
+
+test('tool calls and peak hour summarize only what was recorded',()=>{
+ const withCounters={days:{'2026-09-13':{input:10,output:5,replies:3,models:{known:{input:10,output:5,replies:3}},
+   tools:{read_project_file:4,nc_notes_search:1},hours:{9:1,14:2}},
+  '2026-09-12':{input:1,output:1,replies:1,models:{},tools:{read_project_file:2},hours:{14:1}}}};
+ const result=summarizeUsage(withCounters,options);
+ assert.deepEqual(result.tools,[{name:'read_project_file',calls:6},{name:'nc_notes_search',calls:1}]);
+ assert.deepEqual(result.peakHour,{hour:14,replies:3});
+ assert.equal(result.hours.length,24);assert.equal(result.hours[14],3);assert.equal(result.hours[0],0);
+});
+test('a file written before tool and hour counters existed reads as empty, not broken',()=>{
+ const result=summarizeUsage(store,options);
+ assert.deepEqual(result.tools,[]);assert.equal(result.peakHour,null);
+ assert.deepEqual(result.hours,Array.from({length:24},()=>0));
+});
+test('merged counters stay numeric and cannot carry prototype-shaped tool names',()=>{
+ const dangerous=JSON.parse('{"days":{"2026-09-13":{"replies":1,"tools":{"__proto__":{"x":1},"nc_notes_create":-5},"hours":{"14":"many"}}}}');
+ const merged=mergeUsage([{days:{'2026-09-13':{replies:1,tools:{nc_notes_create:2},hours:{14:1}}}},dangerous]);
+ assert.equal(merged.days['2026-09-13'].tools.nc_notes_create,2);
+ assert.equal(merged.days['2026-09-13'].hours[14],1);
+ assert.equal({}.x,undefined);
+});

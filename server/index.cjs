@@ -651,6 +651,11 @@ function recordUsage(workspace, model, usage) {
     perModel.output += output;
     perModel.replies += 1;
     day.models[name] = perModel;
+    // Replies by hour of the same local clock the day keys use, so "peak hour"
+    // means the hour the user saw, not UTC.
+    day.hours = Object.assign(Object.create(null), day.hours || {});
+    const hour = new Date().getHours();
+    day.hours[hour] = (Number(day.hours[hour]) || 0) + 1;
     store.days[key] = day;
     // Drop anything past the window on write, so the file cannot creep upward
     // even on a deployment that runs for years.
@@ -660,6 +665,25 @@ function recordUsage(workspace, model, usage) {
   } catch (err) {
     // Accounting must never break a reply that already succeeded.
     console.warn('[usage] could not record:', err?.message || err);
+  }
+}
+
+// One line per tool the model actually ran, counted where the call is made so
+// the total cannot be shaped by the client. Failures count too: a tool that
+// keeps erroring is exactly what this number should show.
+function recordToolUse(workspace, name) {
+  if (!workspace || !name) return;
+  try {
+    const store = readUsage(workspace);
+    const key = usageDayKey();
+    const day = store.days[key] || { input: 0, output: 0, replies: 0, models: {} };
+    day.tools = Object.assign(Object.create(null), day.tools || {});
+    const tool = String(name).slice(0, 80);
+    day.tools[tool] = (Number(day.tools[tool]) || 0) + 1;
+    store.days[key] = day;
+    atomicJson(workspace.usagePath(), store);
+  } catch (err) {
+    console.warn('[usage] could not record a tool call:', err?.message || err);
   }
 }
 
@@ -3122,6 +3146,7 @@ async function handleChatInner(req, res, body, authn, preparation) {
           if (chatSignal.signal.aborted) return 'ERROR: exchange cancelled; tool was not run.';
           markWriteAttempt();
           result = await executeToolCall(project, tc.name, tc.args, allowedToolNames);
+          recordToolUse(chatWorkspace, tc.name);
           // Audit AFTER the fact and only for writes: "what did the model
           // actually do on my behalf" is the question this log has to answer,
           // and it lives beside logins and storage changes.
@@ -5102,4 +5127,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { checkAuth, handleRequest, sanitizeChats, MCP_SERVERS, toolboxOffered, ownsFile, projectFolderName, prefill, TOOL_PREFILL_TARGET_MS, isWriteTool, chatWideApproved, pendingApprovals, resolveTools, allToolboxes, mcpCredentialOriginAllowed, toolTokenBudgetFor, MCP_TOOLBOX_MANIFEST, toolboxSummaries, estimateToolTokens, toolCapFor, sanitizeToolboxes, executeToolCall, TOOLBOXES, classifierVerdict, heuristicWantsSmart, heuristicWantsCode, CLASSIFIER_MAX_TOKENS, recordUsage, readUsage, usageDayKey, USAGE_RETENTION_DAYS };
+module.exports = { checkAuth, handleRequest, sanitizeChats, MCP_SERVERS, toolboxOffered, ownsFile, projectFolderName, prefill, TOOL_PREFILL_TARGET_MS, isWriteTool, chatWideApproved, pendingApprovals, resolveTools, allToolboxes, mcpCredentialOriginAllowed, toolTokenBudgetFor, MCP_TOOLBOX_MANIFEST, toolboxSummaries, estimateToolTokens, toolCapFor, sanitizeToolboxes, executeToolCall, TOOLBOXES, classifierVerdict, heuristicWantsSmart, heuristicWantsCode, CLASSIFIER_MAX_TOKENS, recordUsage, recordToolUse, readUsage, usageDayKey, USAGE_RETENTION_DAYS };
