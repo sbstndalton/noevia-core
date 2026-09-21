@@ -429,3 +429,32 @@ test('a state parent left too strict by an older version is corrected', () => {
   const claim = ws.claim({ taskId: ids(1), repoPath: repoWith() });
   assert.equal(fs.statSync(path.dirname(claim.home)).mode & 0o111, 0o111, 'now traversable');
 });
+
+test('a registered repository owned by another user is used, and any other git refusal is reported as itself', (t) => {
+  // On a shared volume the repository belongs to the harness user (the sandbox has to read it)
+  // while noevia runs as root. git then refuses with "dubious ownership" unless the path is
+  // trusted in a config FILE — this is the one place noevia may say a repository is fine,
+  // because the operator registered it.
+  const dir = temp('noevia-trust-');
+  const repoPath = repoWith();
+  const calls = [];
+  const ws = createCodeWorkspaces({ dir, epoch: 'trust', run: (args, cwd, env) => {
+    calls.push({ args, env });
+    if (args[0] === 'rev-parse' && !env?.GIT_CONFIG_GLOBAL) {
+      throw Object.assign(Error('git failed'), { stderr: "fatal: detected dubious ownership in repository at '/workspaces/repos/scratch'" });
+    }
+    return '';
+  } });
+  const claimed = ws.claim({ taskId: ids(1), repoPath });
+  assert.ok(claimed.path, 'the claim succeeds with the repository trusted');
+  const trusted = fs.readFileSync(path.join(dir, 'code-workspaces', 'trusted-repositories.gitconfig'), 'utf8');
+  assert.match(trusted, /^\[safe\]$/m);
+  assert.ok(trusted.includes(fs.realpathSync(repoPath)), 'only the registered repository is named');
+  assert.ok(calls.every((c) => c.env?.GIT_CONFIG_GLOBAL), 'every git call carries the trust file, not just the first');
+
+  // Anything else git says is reported as itself rather than as "Not a git repository".
+  const other = createCodeWorkspaces({ dir: temp('noevia-trust2-'), epoch: 'trust2', run: () => {
+    throw Object.assign(Error('git failed'), { stderr: 'fatal: unable to read /x: Permission denied' });
+  } });
+  assert.throws(() => other.claim({ taskId: ids(2), repoPath }), (e) => e.status === 400 && /Permission denied/.test(e.message));
+});

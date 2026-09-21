@@ -37,8 +37,17 @@ const HARNESS_LEAVINGS = ['.cache/', '.config/', '.local/', '.opencode/', '.clau
   'opencode.json', 'opencode.jsonc', '.aider*', 'node_modules/.cache/'];
 const BRANCH_PREFIX = 'noevia/task-';
 
-function defaultRun(args, cwd) {
-  return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000 }).trim();
+/** Say what git actually refused. "Not a git repository" for anything else is a lie. */
+function gitReason(error) {
+  const text = String(error?.stderr || error?.message || '');
+  if (/dubious ownership/i.test(text)) return 'That repository is owned by another user and git refused to read it.';
+  if (/not a git repository/i.test(text)) return 'Not a git repository';
+  return `git could not read that repository: ${text.split('\n')[0].slice(0, 200) || 'unknown error'}`;
+}
+
+function defaultRun(args, cwd, env = {}) {
+  return execFileSync('git', args, { cwd, env: { ...process.env, ...env }, encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000 }).trim();
 }
 
 /**
@@ -60,6 +69,22 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
   now = Date.now, epoch = String(process.pid), chown = defaultChown, mode = owner ? 'clone' : 'worktree',
   rm = (target) => fs.rmSync(target, { recursive: true, force: true }) } = {}) {
   const root = path.join(dir, 'code-workspaces');
+  // git refuses to read a repository owned by another user, and that refusal is only liftable
+  // from a config FILE — not `-c safe.directory`, not GIT_CONFIG_*. On a shared volume the
+  // registered repository is owned by the harness user (the sandbox has to read it) while
+  // noevia runs as root, so without this every task fails at `rev-parse` — and reported
+  // "Not a git repository", which is not what happened. Only repositories the operator
+  // registered are ever named in this file, one line each, appended as they are first used.
+  const trustFile = path.join(root, 'trusted-repositories.gitconfig');
+  const gitEnv = () => ({ GIT_CONFIG_GLOBAL: trustFile, GIT_CONFIG_SYSTEM: '/dev/null' });
+  function trust(repo) {
+    fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+    const line = `\tdirectory = ${repo}\n`;
+    let current = '';
+    try { current = fs.readFileSync(trustFile, 'utf8'); } catch { /* first use */ }
+    if (current.includes(line)) return;
+    fs.writeFileSync(trustFile, (current || '[safe]\n') + line, { mode: 0o600 });
+  }
   const trees = treeRoot || root;
   const recordFile = (taskId) => path.join(root, taskId + '.json');
   const treeDir = (taskId) => path.join(trees, taskId);
@@ -94,8 +119,9 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
     let repo;
     try { repo = fs.realpathSync(String(repoPath || '')); }
     catch { throw Object.assign(Error('No such repository'), { status: 400 }); }
-    try { run(['rev-parse', '--git-dir'], repo); }
-    catch { throw Object.assign(Error('Not a git repository'), { status: 400 }); }
+    trust(repo);
+    try { run(['rev-parse', '--git-dir'], repo, gitEnv()); }
+    catch (error) { throw Object.assign(Error(gitReason(error)), { status: 400 }); }
 
     // The whole task id, not a prefix: two tasks must never derive the same branch.
     const name = branch ? String(branch) : BRANCH_PREFIX + id;
@@ -125,12 +151,12 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
     if (mode === 'clone') {
       // --shared: the clone reads the source's objects instead of copying them, so this costs
       // kilobytes. The source must therefore outlive the task, which it does.
-      run(['clone', '--quiet', '--shared', repo, tree], undefined);
-      run(['checkout', '--quiet', '-B', name], tree);
+      run(['clone', '--quiet', '--shared', repo, tree], undefined, gitEnv());
+      run(['checkout', '--quiet', '-B', name], tree, gitEnv());
     } else {
       // -B so a branch left behind by an earlier, released task does not block a new one; the
       // worktree path itself must be new, which `git worktree add` enforces.
-      run(['worktree', 'add', '-B', name, tree], repo);
+      run(['worktree', 'add', '-B', name, tree], repo, gitEnv());
     }
     // Hand it to whoever runs the harness. Done after the tree exists so git's own files are
     // covered. A deployment whose harness runs as noevia has nothing to hand over.
@@ -219,8 +245,8 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
       // uncommitted change would be deleted with the clone, which is the opposite of the point.
       // So noevia commits whatever is left, in its own name, clearly labelled.
       try {
-        if (run(['status', '--porcelain'], record.path)) {
-          run(['add', '--all'], record.path);
+        if (run(['status', '--porcelain'], record.path, gitEnv())) {
+          run(['add', '--all'], record.path, gitEnv());
           run(['-c', `user.name=${COMMITTER.name}`, '-c', `user.email=${COMMITTER.email}`,
             'commit', '--quiet', '--no-verify', '-m',
             `noevia: work in progress from task ${record.taskId}\n\nCommitted by noevia when the task ended, because the harness left it uncommitted.`,
@@ -233,7 +259,7 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
       try {
         // Never forced: a branch that would not fast-forward is a conflict for a human, not
         // something to overwrite. Nothing is fetched if the task never committed.
-        run(['fetch', '--quiet', record.path, `${record.branch}:${record.branch}`], record.repo);
+        run(['fetch', '--quiet', record.path, `${record.branch}:${record.branch}`], record.repo, gitEnv());
       } catch (e) {
         // "Couldn't find remote ref" simply means the task made no commits — not a failure.
         if (!/couldn't find remote ref|not found in upstream/i.test(String(e.message))) {
@@ -242,12 +268,12 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
       }
       try { rm(record.path); } catch (e) { removed = false; error = e.message; }
       if (record.home) { try { rm(record.home); } catch { /* nothing of the task's is in there */ } }
-      if (removed && removeBranch) { try { run(['branch', '-D', record.branch], record.repo); } catch { /* keep going */ } }
+      if (removed && removeBranch) { try { run(['branch', '-D', record.branch], record.repo, gitEnv()); } catch { /* keep going */ } }
     } else {
-      try { run(['worktree', 'remove', '--force', record.path], record.repo); }
+      try { run(['worktree', 'remove', '--force', record.path], record.repo, gitEnv()); }
       catch (e) { removed = false; error = e.message; }
-      try { run(['worktree', 'prune'], record.repo); } catch { /* best effort */ }
-      if (removed && removeBranch) { try { run(['branch', '-D', record.branch], record.repo); } catch { /* keep going */ } }
+      try { run(['worktree', 'prune'], record.repo, gitEnv()); } catch { /* best effort */ }
+      if (removed && removeBranch) { try { run(['branch', '-D', record.branch], record.repo, gitEnv()); } catch { /* keep going */ } }
     }
     // An unremovable tree is recorded, not hidden: it may still hold the branch, so the next
     // claim on it must keep failing until someone looks.
