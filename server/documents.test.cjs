@@ -43,42 +43,46 @@ test('large extracted text reports the 200k cap', async () => {
   assert.equal(out.truncated, true);
 });
 
-// Run real upload/sync route bodies with synthetic storage and real extraction.
-// No server bootstrap, credentials, diary, network, or persisted state.
-const source = fs.readFileSync(path.join(__dirname, 'index.cjs'), 'utf8');
-const upload = source.slice(source.indexOf('    const projUpload ='), source.indexOf('    const projFileDel ='));
-const deletion = source.slice(source.indexOf('    const projFileDel ='), source.indexOf('    const projAssets ='));
-const sync = source.slice(source.indexOf('    const projSync ='), source.indexOf('    const chatDel ='));
+// Run the real upload/sync/delete routes (routes/projects.cjs over projects.cjs) with synthetic
+// storage and real extraction. No server bootstrap, credentials, diary, network, or persisted state.
+const uploads = require('./uploads.cjs');
+const realIngest = uploads.ingest;
+let currentStorage = null;
+// The routes reach uploads.ingest through the module, so the harness's storage is handed in here.
+uploads.ingest = (...args) => { args[4] = { ...args[4], storageImpl: currentStorage }; return realIngest(...args); };
+test.after(() => { uploads.ingest = realIngest; });
 function harness(remote = false) {
   const project = { id: 'fixture-project', files: [], projectFolder: 'fixture', sourceFolders: remote ? ['fixture'] : [] };
   const stored = new Map();
   const workspace = { assetDir: id => path.join(testDir, 'assets', id), dir: path.join(testDir, String(++workspaceNumber)), userId: 'fixture-user', projects: [project], saveProjects: () => {} };
   let extracts = 0;
-  const context = {
-    Buffer, console, Date, fs, path, DOCUMENT_UPLOAD_CAP: 25 * 1024 * 1024,
-    documentSources, readJson: async req => req.body,
-    ownsFile: (project, target) => project.sourceFolders.some(folder => target.startsWith(folder + '/') && !target.slice(folder.length + 1).includes('/')),
-    PROJECTS: [project], getProject: id => id === project.id ? project : null,
-    saveProjects: () => {}, currentWorkspace: () => workspace,
-    authService: { getStorage: () => ({}) },
-    require: name => name === './uploads.cjs' ? { ...require(name), ingest: (...args) => { args[4] = { ...args[4], storageImpl: context.storageClient }; return require(name).ingest(...args); } } : require(name), requestScope: { getStore: () => ({}) },
-    readBody: async req => JSON.stringify(req.body),
-    json: (_res, status, body) => ({ status, body }),
-    documents: { ...documents, extractDocumentText: async (...args) => { extracts++; return documents.extractDocumentText(...args); } },
-    rag: { indexProjectFile: async () => {}, deleteProjectFile: () => {} },
-    storageClient: {
-      TEXT_EXTENSIONS: new Set(['.txt']), isBrowsable: () => remote,
-      createFolder: async () => {},
-      writeFile: async (_conn, name, bytes) => stored.set(name, bytes),
-      listFiles: async () => [...stored.keys()].map(p => ({ name: p.split('/').pop(), path: p, ext: '.pdf' })),
-      readBinaryFile: async (_conn, name) => stored.get(name),
-      deleteFile: async (_conn, name) => stored.delete(name),
-    },
+  const storageClient = {
+    TEXT_EXTENSIONS: new Set(['.txt']), isBrowsable: () => remote,
+    createFolder: async () => {},
+    writeFile: async (_conn, name, bytes) => stored.set(name, bytes),
+    listFiles: async () => [...stored.keys()].map(p => ({ name: p.split('/').pop(), path: p, ext: '.pdf' })),
+    readBinaryFile: async (_conn, name) => stored.get(name),
+    deleteFile: async (_conn, name) => stored.delete(name),
   };
-  vm.createContext(context);
-  vm.runInContext(source.slice(source.indexOf('function ownsFile('), source.indexOf('/** Create this project')), context);
-  vm.runInContext(source.slice(source.indexOf('const sourceOperations ='), source.indexOf('const MAX_PROJECT_IMAGES =')), context);
-  const run = vm.runInContext('(async function(p, req) { const res = {}; const authn = {user:{id:"fixture-user"}};\n' + upload + sync + deletion + '\n})', context);
+  currentStorage = storageClient;
+  const shared = {
+    fs, path, documentSources, storageClient,
+    rag: { indexProjectFile: async () => {}, deleteProjectFile: () => {} },
+    authService: { getStorage: () => ({}) }, currentWorkspace: () => workspace, PROJECTS: [project],
+  };
+  const store = {
+    ...require('./projects.cjs').createProjectStore({ ...shared, reasoningEffort: {}, projectAppearance: () => ({}), FREE_CHATS: [], sanitizeToolboxes: () => null, defaultToolboxes: () => [], PROJECT_ROOT_FOLDER: 'fixture-root', createProjectFolder: async () => null, projectSweep: { afterDelete: async () => {} } }),
+    getProject: id => id === project.id ? project : null, saveProjects: () => {},
+  };
+  let last;
+  const routes = require('./routes/projects.cjs').createProjectRoutes({
+    ...shared, store, requestScope: { getStore: () => ({}) }, dispatch: async () => {},
+    readJson: async req => req.body, readBody: async req => JSON.stringify(req.body),
+    json: (_res, status, body) => { last = { status, body }; },
+    documents: { ...documents, extractDocumentText: async (...args) => { extracts++; return documents.extractDocumentText(...args); } },
+    reasoningEffort: {}, projectAppearance: () => ({}), diaryExtras: {}, DEFAULT_TOOLBOXES: [], sanitizeToolboxes: () => null, getProvider: () => null, ensureRolesLoaded: () => {},
+  });
+  const run = async (p, req) => { last = undefined; await routes(req, {}, { path: p, authn: { user: { id: 'fixture-user' } }, url: new URL('http://localhost' + p) }); return last; };
   return { project, stored, workspace, extracts: () => extracts,
     upload: (name, bytes, id = project.id, organized = false) => run('/api/projects/' + id + '/upload', { method: 'POST', body: { name, organized, dataBase64: bytes.toString('base64') } }),
     remove: name => run('/api/projects/' + project.id + '/files', { method: 'DELETE', body: { path: name } }),
@@ -157,7 +161,7 @@ test('audit: retrieval fallback retains source names but supplies only the head 
     },
   };
   vm.createContext(context);
-  vm.runInContext(source.slice(source.indexOf('function ownsFile('), source.indexOf('/** Create this project')), context); vm.runInContext(ragSource, context);
+  vm.runInContext(ragSource, context);
   const out = await context.module.exports.filesContext('fixture-project', [
     { name: 'small.pdf', content: 'TOTAL 34.95' },
     { name: 'large.pdf', content: 'HEAD-MARKER ' + 'x'.repeat(30000) + ' TAIL-MARKER' },
