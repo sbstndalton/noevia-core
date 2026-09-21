@@ -1068,7 +1068,6 @@ function resolveTools(project, model, skip = () => false) {
   return { tools, dropped, boxes, cap, budget, estTokens: spent };
 }
 
-// Shape for the UI: what boxes exist, how big each is, and what it costs.
 // ── MCP toolboxes (master step 15): curated in mcp-toolbox-manifest.cjs ─────────
 const MCP_TOOLBOX_MANIFEST = require('./mcp-toolbox-manifest.cjs').buildToolboxManifest({ features });
 
