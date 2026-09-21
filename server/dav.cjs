@@ -105,16 +105,26 @@ function createDavHandler({ auth, settings, config, files }) {
           if(req.headers['content-encoding'] && req.headers['content-encoding']!=='identity')return send(415,'Encoded bodies are unsupported');
           if(req.headers['if'] || req.headers['if-unmodified-since'])return send(400,'Use If-Match or If-None-Match');
           const match=req.headers['if-match'],none=req.headers['if-none-match'];
-          if(!match && !none)return send(428,'Read the ETag and use If-Match; create with If-None-Match: *');
           if((match&&none) || (none&&none!=='*') || (match&&!/^"[a-f0-9]{64}"$/.test(match)))return send(400,'A single strong ETag or create-only condition is required');
+          // Without a precondition (rclone, Finder, Obsidian sync never send one) the write is checked
+          // against the version read just now, and a replaced file's previous bytes go to Trash first,
+          // restorable beside it. Protected files still need If-Match. Needs the companion's ops.
+          const unconditional=!match && !none;
+          if(unconditional && !davOps)return send(428,'Read the ETag and use If-Match; create with If-None-Match: *');
           const parent=path.includes('/')?path.slice(0,path.lastIndexOf('/')):'';
           if(!(await lookup(parent))?.isDir)return send(409,'Parent folder does not exist');
           const content=await readBody(req,MAX_BODY);
           if(!allowed())return send(403,'Sharing was disabled');
-          const result=await files.write(identity.userId,{path,content,version:match?match.slice(1,-1):null});
+          let version=match?match.slice(1,-1):null,created=!!none,preserved=null;
+          if(unconditional){
+            const current=await files.read(identity.userId,path);
+            if(current.content===null)created=true;
+            else{version=current.version;preserved=(await davOps.preserve(identity.userId,path,version)).trash;}
+          }
+          const result=await files.write(identity.userId,{path,content,version});
           res.setHeader('ETag',`"${result.version}"`);
-          auth.audit('dav.write',identity.userId,identity.userId,{credentialId:identity.credentialId,path,bytes:Buffer.byteLength(content)});
-          return send(none?201:204);
+          auth.audit('dav.write',identity.userId,identity.userId,{credentialId:identity.credentialId,path,bytes:Buffer.byteLength(content),...(unconditional?{unconditional,preserved}:{})});
+          return send(created?201:204);
         }
         if(davOps && davOps.methods.includes(req.method)){
           const result=await davOps.handle({req,method:req.method,path,identity,username,origin:config.origin,allowed,readBody,

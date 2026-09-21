@@ -29,14 +29,17 @@ test('OPTIONS advertises class 1 and the new methods, never LOCK',async t=>{
  assert.equal((await request('LOCK','a.md')).status,405);
 });
 
-test('DELETE requires If-Match and forwards the version; audit has no content',async t=>{
+test('DELETE forwards If-Match, or the version read now when a client sends none; audit has no content',async t=>{
  const {request,calls,events}=await setup(t);
- assert.equal((await request('DELETE','a.md')).status,428);
+ // rclone, Finder and Obsidian sync send no If-Match (docs/dav.md, interop run 1): Trash makes it reversible.
+ assert.equal((await request('DELETE','a.md')).status,204);
+ assert.deepEqual(calls.slice(-2).map(c=>c[1]),[{op:'stat',path:'a.md'},{op:'delete',path:'a.md',version:DEST}]);
+ assert.equal(events.at(-1)[3].unconditional,true);
  assert.equal((await request('DELETE','a.md',{'If-Match':'"weak"'})).status,400);
  assert.equal((await request('DELETE','',{'If-Match':`"${TAG}"`})).status,403);
  assert.equal((await request('DELETE','a.md',{'If-Match':`"${TAG}"`})).status,204);
  assert.deepEqual(calls.at(-1),['alice',{op:'delete',path:'a.md',version:TAG}]);
- assert.deepEqual(events.at(-1),['dav.delete','alice','alice',{credentialId:'device',path:'a.md',trashed:1}]);
+ assert.deepEqual(events.at(-1),['dav.delete','alice','alice',{credentialId:'device',path:'a.md',trashed:1,unconditional:false}]);
  assert.equal((await request('DELETE','a.md',{'If-Match':`"${TAG}"`,Depth:'1'})).status,400);
 });
 
@@ -48,7 +51,11 @@ test('MOVE and COPY resolve Destination inside the same tenant only',async t=>{
  assert.equal((await request('MOVE','a.md',{...h,Destination:'http://evil.example/dav/alice/b.md'})).status,502);
  assert.equal((await request('MOVE','a.md',{...h,Destination:'/dav/alice/.hidden.md'})).status,403);
  assert.equal((await request('MOVE','a.md',{...h,Destination:'/dav/alice/%2e%2e/x.md'})).status,403);
- assert.equal((await request('MOVE','a.md',{Destination:'/dav/alice/b.md'})).status,428);
+ assert.equal((await request('MOVE','a.md',{Destination:'/dav/alice/b.md'})).status,201);
+ assert.deepEqual(calls.at(-1)[1],{op:'move',path:'a.md',destination:'b.md',overwrite:false,version:DEST});
+ // An untagged Overwrite: T reads the destination's version; the companion sends it to Trash.
+ assert.equal((await request('MOVE','a.md',{Destination:'/dav/alice/b.md',Overwrite:'T'})).status,204);
+ assert.equal(calls.at(-1)[1].destinationVersion,DEST);
  assert.equal((await request('MOVE','a.md',{...h,Destination:'/dav/alice/b.md',Overwrite:'maybe'})).status,400);
  const replaced=await request('MOVE','a.md',{...h,Destination:'/dav/alice/b.md',Overwrite:'T',If:`</dav/alice/b.md> (["${DEST}"])`});
  assert.equal(replaced.status,204);assert.equal(calls.at(-1)[1].destinationVersion,DEST);
@@ -79,4 +86,12 @@ test('destination helpers',()=>{
  assert.throws(()=>destinationPath('http://localhost/dav/alice/x.md?y',{origin:'http://localhost',username:'alice'}),e=>e.status===400);
  assert.equal(destinationTag(`<http://localhost/dav/alice/b.md> (["${DEST}"])`,'http://localhost/dav/alice/b.md'),DEST);
  assert.equal(destinationTag(`<http://localhost/dav/alice/other.md> (["${DEST}"])`,'http://localhost/dav/alice/b.md'),null);
+});
+
+test('an unconditional PUT keeps the previous version in Trash, then writes against it',async t=>{
+ const {request,calls,events}=await setup(t);
+ const r=await request('PUT','a.md',{},'new text');
+ assert.equal(r.status,204);
+ assert.deepEqual(calls.at(-1),['alice',{op:'preserve',path:'a.md',version:TAG}]);
+ assert.equal(events.at(-1)[0],'dav.write');assert.equal(events.at(-1)[3].unconditional,true);
 });

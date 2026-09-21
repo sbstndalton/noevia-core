@@ -48,6 +48,10 @@ function createDavOps({ ops: call }) {
   const methods = ['DELETE', 'MOVE', 'COPY'];
   return {
     methods,
+    /** Keep a file's current bytes in Trash before an unconditional PUT replaces them. */
+    async preserve(userId, path, version) {
+      return ops(userId, { op: 'preserve', path, version });
+    },
     /** A collection's ETag, for PROPFIND. */
     async folderTag(userId, path) {
       try { return (await ops(userId, { op: 'stat', path })).version; } catch { return null; }
@@ -60,11 +64,16 @@ function createDavOps({ ops: call }) {
       if (depth !== undefined && depth !== 'infinity' && !(method === 'COPY' && depth === '0')) throw fail(400, 'Folder operations apply to the whole folder (Depth: infinity)');
       const match = req.headers['if-match'];
       if (match !== undefined && !ETAG.test(match)) throw fail(400, 'A single strong ETag is required');
-      if (method !== 'COPY' && !match) throw fail(428, 'Read the ETag and send it with If-Match');
       if (!allowed()) throw fail(403, 'Sharing was disabled');
+      // Ordinary clients (rclone, Finder, Explorer, Obsidian sync) never send If-Match (docs/dav.md,
+      // interop run 1). DELETE and MOVE are reversible — Trash, or a move back — so without one the
+      // current version is read and used; with one, it is checked exactly as before. Protected
+      // paths are refused by the companion either way.
+      const unconditional = !match && method !== 'COPY';
+      const version = match ? match.slice(1, -1) : unconditional ? (await ops(identity.userId, { op: 'stat', path })).version : null;
       if (method === 'DELETE') {
-        const result = await ops(identity.userId, { op: 'delete', path, version: match.slice(1, -1) });
-        audit('dav.delete', { path, trashed: result.trash?.length || 0 });
+        const result = await ops(identity.userId, { op: 'delete', path, version });
+        audit('dav.delete', { path, trashed: result.trash?.length || 0, unconditional });
         return { status: 204 };
       }
       const destination = destinationPath(req.headers.destination, { origin, username });
@@ -72,15 +81,21 @@ function createDavOps({ ops: call }) {
       if (overwriteHeader !== undefined && !['T', 'F'].includes(overwriteHeader)) throw fail(400, 'Overwrite must be T or F');
       const overwrite = overwriteHeader === 'T';
       const destinationUrl = new URL(req.headers.destination, origin).href;
-      const destinationVersion = destinationTag(req.headers.if, destinationUrl);
+      let destinationVersion = destinationTag(req.headers.if, destinationUrl);
+      // Replacing a destination sends it to Trash first (the companion capsules it), so an untagged
+      // Overwrite: T reads the destination's current version rather than refusing.
+      if (overwrite && !destinationVersion) {
+        try { destinationVersion = (await ops(identity.userId, { op: 'stat', path: destination })).version; }
+        catch (error) { if (error.status !== 404) throw error; }
+      }
       if (depth === '0' && method === 'COPY') {
         const stat = await ops(identity.userId, { op: 'stat', path });
         if (stat.isDir) throw fail(403, 'Copying a folder without its contents is unsupported');
       }
       const body = { op: method.toLowerCase(), path, destination, overwrite,
-        ...(match ? { version: match.slice(1, -1) } : {}), ...(destinationVersion ? { destinationVersion } : {}) };
+        ...(version ? { version } : {}), ...(destinationVersion ? { destinationVersion } : {}) };
       const result = await ops(identity.userId, body);
-      audit(`dav.${method.toLowerCase()}`, { path, destination, replaced: !!result.replaced });
+      audit(`dav.${method.toLowerCase()}`, { path, destination, replaced: !!result.replaced, unconditional });
       return { status: result.replaced ? 204 : 201 };
     },
   };
