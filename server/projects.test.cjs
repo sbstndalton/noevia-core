@@ -124,3 +124,9 @@ test('sweepDeletedProject hands the sweeper the tenant root, local dirs and the 
   assert.equal(f.swept[0].folder, 'noevia projects/P');
   assert.equal(f.swept[0].localDirs.length, 3);
 });
+
+test('new projects default to Auto routing; Manual only when asked for', async () => {
+  const f = fixture();
+  assert.equal((await f.store.createProject({ name: 'A' })).routing, 'auto');
+  assert.equal((await f.store.createProject({ name: 'B', routing: 'manual' })).routing, 'manual');
+});

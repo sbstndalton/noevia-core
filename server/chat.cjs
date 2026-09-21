@@ -246,7 +246,8 @@ function createChatHandler({
     }
     // Projects without a provider field use the configured default provider.
     const projectProvider = project?.provider === 'lemonade' ? DEFAULT_PROVIDER_ID : project?.provider;
-    const wantsAuto = !!(project && project.routing === 'auto' && (!projectProvider || projectProvider === DEFAULT_PROVIDER_ID));
+    // Auto is the default, so Auto without Fast/Smart roles behaves as Manual rather than refusing.
+    const wantsAuto = !!(project && project.routing === 'auto' && (!projectProvider || projectProvider === DEFAULT_PROVIDER_ID) && autoRoles());
     const provider = getProvider(wantsAuto ? DEFAULT_PROVIDER_ID : projectProvider || DEFAULT_PROVIDER_ID);
 
     let model = (project && project.model) || null;
