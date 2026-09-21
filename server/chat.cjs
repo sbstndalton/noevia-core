@@ -17,7 +17,7 @@
  *   the approval gate. `fetch` defaults to the global one; `json` writes a JSON reply.
  */
 function createChatHandler({
-  fs, path, crypto, fetch, reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse,
+  fs, path, crypto, fetch, codeTasksFor = () => [], reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse,
 }) {
   async function handleChat(req, res, body, authn) {
     let preparation;
@@ -118,6 +118,13 @@ function createChatHandler({
       if (project.goal) sysParts.push(`Project goal: ${project.goal}`);
       if (project.instructions) sysParts.push(`Project instructions (follow closely):\n${project.instructions}`);
       if (memoryPart) sysParts.push(memoryPart);
+      // Shared context (shared-context.cjs): recent Code tasks, only when the project shares into Chat.
+      if (require('./shared-context.cjs').read(project).chat) {
+        let tasks = [];
+        try { tasks = codeTasksFor(project) || []; } catch { /* Code mode off or its store unreadable: chat goes on without it */ }
+        const codePart = require('./shared-context.cjs').forChat(project, tasks);
+        if (codePart) sysParts.push(codePart);
+      }
       if (filesBlock) {
         sysParts.push(`Relevant knowledge-file excerpts for this message:\n${filesBlock}`);
       }

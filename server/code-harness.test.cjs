@@ -26,7 +26,7 @@ const OPTIONS = [{ optionId: 'y', kind: 'allow_once' }, { optionId: 'ya', kind: 
  * part of the harness; `answers` is what the human says, in order.
  */
 async function run({ script, answers = [], capabilities = [], domains = [], egress = null,
-  agent = {}, promptResult = { stopReason: 'end_turn' }, sandboxKind = 'spawn' }) {
+  agent = {}, promptResult = { stopReason: 'end_turn' }, sandboxKind = 'spawn', context = '', sent = [] }) {
   const dir = temp('noevia-hjobs-');
   const jobs = createJobs({ dir });
   const workspaces = createCodeWorkspaces({ dir, epoch: 'test' });
@@ -40,11 +40,11 @@ async function run({ script, answers = [], capabilities = [], domains = [], egre
   });
   let handlers, connected;
   const started = await harness.start({
-    repoPath: repo(), prompt: 'fix the bug', capabilities, domains, sandboxKind,
+    repoPath: repo(), prompt: 'fix the bug', capabilities, domains, sandboxKind, context,
     connect: async (args) => {
       const { handlers: h, cwd } = args;
       handlers = h; connected = args;
-      return { agent, prompt: async () => { await script(h, cwd); return promptResult; } };
+      return { agent, prompt: async (text) => { sent.push(text); await script(h, cwd); return promptResult; } };
     },
   });
   // jobs.run is started without being awaited, so wait for the job to reach a terminal state.
@@ -319,4 +319,14 @@ test('a granted task reaches the proxy by its endpoint and the engine directly',
   assert.equal(r.connected.proxy.noProxy, 'engine.test');
   const offline = await run({ capabilities: [ACTIONS.EDIT], egress, script: async () => {} });
   assert.equal(offline.connected.proxy, null);
+});
+
+test('shared project context reaches the agent ahead of the task, never the task label', async () => {
+  const sent = [];
+  const r = await run({ context: 'Context shared from the "Lab" project', sent, script: async () => {} });
+  assert.equal(sent[0], 'Context shared from the "Lab" project\n\nTask:\nfix the bug');
+  assert.equal(r.job.checkpoint.task, 'fix the bug');
+  const plain = [];
+  await run({ sent: plain, script: async () => {} });
+  assert.equal(plain[0], 'fix the bug');
 });

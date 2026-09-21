@@ -39,7 +39,7 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
    * every later decision is taken against this list, not against anything the agent claims.
    */
   async function start({ projectId = null, repoPath, prompt, capabilities = [], domains = [],
-    harness = 'opencode', connect, model = null, sandboxKind = 'spawn', promptPreparation = 'direct' }) {
+    harness = 'opencode', connect, model = null, sandboxKind = 'spawn', promptPreparation = 'direct', context = '' }) {
     if (!prompt || !String(prompt).trim()) throw Object.assign(Error('A task needs a prompt'), { status: 400 });
     if (typeof connect !== 'function') throw Object.assign(Error('No harness transport'), { status: 500 });
     const taskId = jobs.create({ kind: 'code', projectId, capabilities: [...new Set(capabilities)] });
@@ -95,7 +95,8 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
           signal: ctx.signal,
         });
         ctx.progress('running');
-        const outcome = await agent.prompt(String(prompt));
+        // Shared project context (shared-context.cjs) goes in front of the task, never into its label.
+        const outcome = await agent.prompt(context ? `${context}\n\nTask:\n${String(prompt)}` : String(prompt));
         // What the run can say about itself, and — just as much — what it could not (§1).
         const meta = session.meta(agent.agent, readUsage(outcome?._meta));
         const scope = codingIdentity({

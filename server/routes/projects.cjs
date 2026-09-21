@@ -201,6 +201,9 @@ function createProjectRoutes({
       if (patch.modes !== undefined) {
         try { project.modes = require('../project-modes.cjs').sanitize(patch.modes); } catch (e) { return json(res, 400, { error: e.message }); }
       }
+      if (patch.sharedContext !== undefined) {
+        try { project.sharedContext = require('../shared-context.cjs').sanitize(patch.sharedContext); } catch (e) { return json(res, 400, { error: e.message }); }
+      }
       if (typeof patch.routing === 'string') {
         if (patch.routing !== 'auto' && patch.routing !== 'manual') {
           return json(res, 400, { error: "routing must be 'auto' or 'manual'" });

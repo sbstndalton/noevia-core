@@ -327,33 +327,35 @@ const toolboxOffered = createToolboxOffered(ENABLED_TOOLBOXES);
 // `CODE_REPOS=name|/abs/path,...` is the only way a repository becomes reachable: a task can
 // never name a host path. The transport is supplied separately, so a deployment without a
 // coding harness installed simply has nothing to start.
+const codeService = require('./code-service.cjs').createCodeService({
+  repos: process.env.CODE_REPOS,
+  // The egress proxy (D15) is the only way a task reaches the internet, and only to the domains
+  // its grant names. Unconfigured, network and installs stay unavailable.
+  egress: require('./code-egress.cjs').startEgressFromEnv(process.env, { log: (entry) => console.log('[egress]', JSON.stringify(entry)) }),
+  log: (entry) => console.log('[code]', JSON.stringify(entry)),
+  // Where the agent's model lives, and which one. ACP carries neither, so noevia writes both
+  // into the harness's own config file (`code-harness-config.cjs`); a sandbox has no provider
+  // configuration of its own and would otherwise have nothing to run on. `CODE_ENGINE_URL`
+  // exists because the sandbox may reach the engine by a different name than the web
+  // container does — it is on an internal network of its own.
+  engine: () => {
+    const provider = getProvider(DEFAULT_PROVIDER_ID);
+    const base = (process.env.CODE_ENGINE_URL || provider?.baseUrl || '').replace(/\/+$/, '');
+    return {
+      baseUrl: base ? (/\/v1$/.test(base) ? base : `${base}/v1`) : null,
+      apiKey: process.env.CODE_ENGINE_API_KEY || provider?.apiKey || null,
+      model: autoRoles()?.code || autoRoles()?.smart || lastLoadedModel() || null,
+      contextTokens: Number(process.env.CODE_CONTEXT_TOKENS) || undefined,
+    };
+  },
+  // `CODE_HARNESS_COMMAND` is the ACP agent to run (for example `opencode acp`). Unset, a
+  // task cannot start and says so.
+  connect: require('./code-acp.cjs').createAcpTransport({ log: (entry) => console.log('[code]', JSON.stringify(entry)) }),
+  // Shared context (shared-context.cjs): off unless the project turns on sharing into Code.
+  sharedContext: (workspace, project) => require('./shared-context.cjs').forCode(project, loadChats(project.id)),
+});
 const codeRoutes = require('./routes/code.cjs').createCodeRoutes({
-  features, getProject, workspace: () => currentWorkspace(), json, readJson,
-  service: require('./code-service.cjs').createCodeService({
-    repos: process.env.CODE_REPOS,
-    // The egress proxy (D15) is the only way a task reaches the internet, and only to the domains
-    // its grant names. Unconfigured, network and installs stay unavailable.
-    egress: require('./code-egress.cjs').startEgressFromEnv(process.env, { log: (entry) => console.log('[egress]', JSON.stringify(entry)) }),
-    log: (entry) => console.log('[code]', JSON.stringify(entry)),
-    // Where the agent's model lives, and which one. ACP carries neither, so noevia writes both
-    // into the harness's own config file (`code-harness-config.cjs`); a sandbox has no provider
-    // configuration of its own and would otherwise have nothing to run on. `CODE_ENGINE_URL`
-    // exists because the sandbox may reach the engine by a different name than the web
-    // container does — it is on an internal network of its own.
-    engine: () => {
-      const provider = getProvider(DEFAULT_PROVIDER_ID);
-      const base = (process.env.CODE_ENGINE_URL || provider?.baseUrl || '').replace(/\/+$/, '');
-      return {
-        baseUrl: base ? (/\/v1$/.test(base) ? base : `${base}/v1`) : null,
-        apiKey: process.env.CODE_ENGINE_API_KEY || provider?.apiKey || null,
-        model: autoRoles()?.code || autoRoles()?.smart || lastLoadedModel() || null,
-        contextTokens: Number(process.env.CODE_CONTEXT_TOKENS) || undefined,
-      };
-    },
-    // `CODE_HARNESS_COMMAND` is the ACP agent to run (for example `opencode acp`). Unset, a
-    // task cannot start and says so.
-    connect: require('./code-acp.cjs').createAcpTransport({ log: (entry) => console.log('[code]', JSON.stringify(entry)) }),
-  }),
+  features, getProject, workspace: () => currentWorkspace(), json, readJson, service: codeService,
 });
 
 const usageRoutes = require('./routes/usage.cjs').createUsageRoutes({
@@ -465,6 +467,7 @@ const classifyFastOrSmart = (message) => autoRouter.classify(message);
 
 // ── Chat: the loop lives in chat.cjs; everything it needs is handed over here ──
 const { handleChat } = require('./chat.cjs').createChatHandler({
+  codeTasksFor: (project) => codeService.list(currentWorkspace(), project),
   // fetch is resolved per call, not captured: tests and QA swap the global at runtime.
   fs, path, crypto, fetch: (...args) => globalThis.fetch(...args), reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult,
   HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP,

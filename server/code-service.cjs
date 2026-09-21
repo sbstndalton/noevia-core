@@ -74,7 +74,7 @@ function view(job, pending = null) {
 function createCodeService({ repos, connect, egress = null, engine = undefined, now = Date.now, log = () => {},
   timeoutMs = APPROVAL_TIMEOUT_MS, sandboxKind = process.env.CODE_HARNESS_ENDPOINT ? 'sandbox' : 'spawn',
   harnesses = defaultHarnesses(), treeRoot = process.env.CODE_WORKSPACE_ROOT || null,
-  harnessUser = parseUser(process.env.CODE_HARNESS_USER) }) {
+  harnessUser = parseUser(process.env.CODE_HARNESS_USER), sharedContext = () => '' }) {
   const repositories = Array.isArray(repos) ? repos : parseRepos(repos);
   // Approvals live in memory on purpose, exactly as the chat gate does: a decision that
   // outlives the request it belongs to is not a decision, and a restart must re-ask.
@@ -176,8 +176,10 @@ function createCodeService({ repos, connect, egress = null, engine = undefined, 
       }
       const started = await harness.start({ projectId: project.id, repoPath: repo.path, prompt,
         capabilities, domains, connect, model: body.model ? String(body.model) : null, sandboxKind,
-        harness: harnessId, promptPreparation: preparation.id });
-      return { ...started, repository: repo.id, capabilities, domains, harness: harnessId, promptPreparation: preparation.id };
+        harness: harnessId, promptPreparation: preparation.id,
+        context: String(sharedContext(workspace, project) || '') });
+      return { ...started, repository: repo.id, capabilities, domains, harness: harnessId, promptPreparation: preparation.id,
+        sharedContext: require('./shared-context.cjs').read(project).code };
     },
     decide(workspace, project, taskId, decision) {
       owned(workspace, project, taskId);
