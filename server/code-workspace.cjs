@@ -77,13 +77,15 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
   // registered are ever named in this file, one line each, appended as they are first used.
   const trustFile = path.join(root, 'trusted-repositories.gitconfig');
   const gitEnv = () => ({ GIT_CONFIG_GLOBAL: trustFile, GIT_CONFIG_SYSTEM: '/dev/null' });
-  function trust(repo) {
+  function trust(...paths) {
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
-    const line = `\tdirectory = ${repo}\n`;
     let current = '';
     try { current = fs.readFileSync(trustFile, 'utf8'); } catch { /* first use */ }
-    if (current.includes(line)) return;
-    fs.writeFileSync(trustFile, (current || '[safe]\n') + line, { mode: 0o600 });
+    // The work tree AND its git directory: a clone resolves the source as its `.git`, and git
+    // checks ownership of whichever path it is about to open.
+    const lines = paths.filter(Boolean).map((p) => `\tdirectory = ${p}\n`).filter((l) => !current.includes(l));
+    if (!lines.length) return;
+    fs.writeFileSync(trustFile, (current || '[safe]\n') + lines.join(''), { mode: 0o600 });
   }
   const trees = treeRoot || root;
   const recordFile = (taskId) => path.join(root, taskId + '.json');
@@ -119,8 +121,8 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
     let repo;
     try { repo = fs.realpathSync(String(repoPath || '')); }
     catch { throw Object.assign(Error('No such repository'), { status: 400 }); }
-    trust(repo);
-    try { run(['rev-parse', '--git-dir'], repo, gitEnv()); }
+    trust(repo, path.join(repo, '.git'));
+    try { trust(run(['rev-parse', '--absolute-git-dir'], repo, gitEnv())); }
     catch (error) { throw Object.assign(Error(gitReason(error)), { status: 400 }); }
 
     // The whole task id, not a prefix: two tasks must never derive the same branch.
