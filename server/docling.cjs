@@ -55,9 +55,10 @@ async function extractDocument(name, bytes, { url = process.env.DOCLING_BASE_URL
     // 503 and 415 are the two a user can act on, so they say something useful;
     // everything else is a retry.
     if (response.status === 503) throw new Error('Document extraction is busy; refresh to retry.');
-    // A 400 means noevia sent something the worker refuses. Retrying sends the same thing, so
-    // it is reported as what it is rather than as a transient outage to keep retrying.
-    if (response.status === 400) throw Object.assign(new Error('This document could not be sent for reading; the original is stored.'), { permanent: true });
+    // A 400 means noevia sent something the worker refuses — a bug on this side, not a broken
+    // document. Named as that rather than as an outage, but deliberately NOT permanent: a
+    // cached refusal would outlive the fix, and the fix is what should heal it.
+    if (response.status === 400) throw new Error('noevia sent this document in a form the extractor refused; it will be read again after the next update.');
     if (response.status === 415) throw Object.assign(new Error(`This file type cannot be read yet; the original is stored.`), { permanent: true });
     if (response.status === 422) throw Object.assign(new Error('This document could not be read; the original is stored.'), { permanent: true });
     throw new Error(`Document extraction unavailable (HTTP ${response.status}); refresh to retry.`);

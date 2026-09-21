@@ -162,10 +162,13 @@ test('a storage path is sent as a file name, because the worker refuses anything
   for (const name of sent) assert.ok(!name.includes('/') && !name.includes('\\') && name.length <= 200);
 });
 
-test('a refusal noevia caused is not reported as an outage to keep retrying', async () => {
+test('a refusal noevia caused is named as that, and never cached as permanent', async () => {
+  // Permanent means "this document cannot be read". A 400 means noevia sent it wrongly, and
+  // caching that would outlive the fix -- which is exactly what happened when every document
+  // inside a folder was sent with its path as its name.
   const fetchImpl = async () => ({ ok: false, status: 400, json: async () => ({}) });
   await assert.rejects(
-    () => docling.extractDocument("x.pdf", Buffer.from("x"), { url: 'http://docling.test', fetchImpl }),
-    (error) => error.permanent === true && !/refresh to retry/.test(error.message),
+    () => docling.extractDocument('x.pdf', Buffer.from('x'), { url: 'http://docling.test', fetchImpl }),
+    (error) => !error.permanent && /noevia sent this document/.test(error.message),
   );
 });
