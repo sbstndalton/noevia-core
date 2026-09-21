@@ -43,6 +43,8 @@ const { createAuth, createRateLimiter } = require('./auth.cjs');
 const { createWorkspaceStore } = require('./workspace.cjs');
 const { createSecretStore } = require('./secrets.cjs');
 const { isPublicUrl, createEndpointApproved } = require('./ssrf.cjs');
+// One JSON reply shape, the 401, a bounded body read and the JSON fetch (http.cjs).
+const { json, unauthorized, fetchJson, readBody, readJson, authResult } = require('./http.cjs');
 
 const PORT = Number(process.env.UI_PORT || 8021);
 const HOST = process.env.UI_HOST || '0.0.0.0';
@@ -166,64 +168,6 @@ rag.init({ dataDir: DATA_DIR, inferenceUrl: INFERENCE_BASE, headersFn: () => inf
 // Each project: goal/description, custom instructions,
 // and text files (pasted/uploaded text injected into context; true doc-RAG is a
 // later feature — flagged in MIGRATION.md).
-
-function json(res, code, body) {
-  res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-  res.end(JSON.stringify(body));
-}
-
-function unauthorized(res) {
-  res.writeHead(401, {
-    'Content-Type': 'application/json',
-    'Cache-Control': 'no-store',
-    'WWW-Authenticate': 'Bearer realm="cowork"',
-  });
-  res.end(JSON.stringify({ error: 'unauthorized' }));
-}
-
-async function fetchJson(url, opts, timeoutMs) {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs || 15000);
-  // Honor a caller-supplied signal (e.g. client disconnect) in addition to the timeout.
-  const external = opts && opts.signal;
-  const onAbort = () => ctrl.abort();
-  if (external?.aborted) ctrl.abort();
-  else external?.addEventListener('abort', onAbort, { once: true });
-  try {
-    const res = await fetch(url, { ...opts, redirect: 'error', signal: ctrl.signal });
-    const text = await res.text();
-    let body = null;
-    try {
-      body = JSON.parse(text);
-    } catch {
-      body = text;
-    }
-    return { ok: res.ok, status: res.status, body };
-  } finally {
-    clearTimeout(timer);
-    external?.removeEventListener('abort', onAbort);
-  }
-}
-
-async function readBody(req, limit = 1024 * 1024) {
-  const chunks = [];
-  let size = 0;
-  for await (const chunk of req) {
-    const bytes = Buffer.from(chunk);
-    size += bytes.length;
-    if (size > limit) throw Object.assign(new Error('Request exceeds size limit'), { status: 413 });
-    chunks.push(bytes);
-  }
-  return Buffer.concat(chunks).toString('utf8');
-}
-async function readJson(req) {
-  const raw = await readBody(req);
-  return raw ? JSON.parse(raw) : {};
-}
-
-function authResult(res, result) {
-  return json(res, result.status || 200, result.body ?? result);
-}
 
 const folderSync = process.env.MODEL_LOADER_URL ? require('./model-folder-sync.cjs').createFolderSync({
   stateFile: path.join(DATA_DIR, 'model-folder-sync.json'),
