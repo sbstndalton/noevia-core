@@ -51,9 +51,10 @@ const MIN_SCORE = 0.3;
 // and the reranker picks the kept chunks; any failure or a missed deadline falls back to today's
 // cosine top-6, so chat never waits longer than the deadline. KEEP defaults to 6, not the
 // measured-best 3: 3 won on the synthetic corpus (91% vs 86%) but it demoted gold chunks on
-// exact-number questions, and with only 3 kept one demotion loses the answer outright.
-const RERANK_POOL = 24;
-let rerank = null; // { decisions, keep, deadlineMs }
+// exact-number questions, and with only 3 kept one demotion loses the answer outright. POOL defaults
+// to 12: on DaServer's GPU 12 chunks rerank in ~2 s vs ~3.9 s for 24, and 12->6 scored 89% vs 86%.
+const RERANK_POOL_MAX = 24;
+let rerank = null; // { decisions, pool, keep, deadlineMs }
 function initRerank() {
   const on = /^(1|true|on)$/i.test(process.env.NOEVIA_FEATURE_RAG_RERANK || '');
   const baseUrl = (process.env.RERANK_BASE_URL || '').trim();
@@ -61,11 +62,11 @@ function initRerank() {
   const { createDecisions } = require('./decision/index.cjs');
   const { llamaRerankBackend } = require('./decision/backends.cjs');
   const decisions = createDecisions({
-    backends: { 'llama-rerank': llamaRerankBackend({ baseUrl, model: process.env.RERANK_MODEL || null }) },
+    backends: { 'llama-rerank': llamaRerankBackend({ baseUrl, model: process.env.RERANK_MODEL || null, apiKey: process.env.RERANK_API_KEY || process.env.INFERENCE_API_KEY || null }) },
     chains: { 'rag.rerank': ['llama-rerank'] },
     log: (e) => { if (e.failed || e.fellBack) console.warn('[rag] rerank', JSON.stringify(e)); },
   });
-  rerank = { decisions, keep: clampInt(process.env.RAG_RERANK_KEEP, 6, 1, RERANK_POOL), deadlineMs: clampInt(process.env.RAG_RERANK_DEADLINE_MS, 3000, 100, 30000) };
+  rerank = { decisions, pool: clampInt(process.env.RAG_RERANK_POOL, 12, TOP_K, RERANK_POOL_MAX), keep: clampInt(process.env.RAG_RERANK_KEEP, 6, 1, RERANK_POOL_MAX), deadlineMs: clampInt(process.env.RAG_RERANK_DEADLINE_MS, 3000, 100, 30000) };
 }
 function clampInt(v, dflt, lo, hi) { const n = parseInt(v, 10); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : dflt; }
 
@@ -317,10 +318,10 @@ async function searchProject(projectId, query, userId) {
          ORDER BY score DESC
          LIMIT ?`
       )
-      .all(qbuf, qbuf, MIN_SCORE, rerank ? RERANK_POOL : TOP_K);
+      .all(qbuf, qbuf, MIN_SCORE, rerank ? rerank.pool : TOP_K);
     const hits = rows.map((r) => ({ file: r.file, body: r.body, score: Math.round(r.score * 1000) / 1000 }));
     if (!rerank) return hits;
-    return await rerankPool({ query, pool: hits, ...rerank });
+    return await rerankPool({ query, pool: hits, decisions: rerank.decisions, keep: rerank.keep, deadlineMs: rerank.deadlineMs });
   } catch (err) {
     console.warn(`[rag] search failed for ${projectId}: ${err.message}`);
     return [];

@@ -12,7 +12,12 @@ function nativeLabels(model) {
     ...(model.architecture?.input_modalities?.includes('image') ? ['vision'] : []),
   ];
 }
-function keepAlongside() { const e = process.env.EMBEDDING_MODEL || process.env.EMBED_MODEL || ''; return e && e !== 'default' ? [e] : []; }
+// The RAG reranker (NOEVIA_FEATURE_RAG_RERANK, rag.cjs) is the other small resident when enabled.
+function keepAlongside() {
+  const e = process.env.EMBEDDING_MODEL || process.env.EMBED_MODEL || '';
+  const r = /^(1|true|on)$/i.test(process.env.NOEVIA_FEATURE_RAG_RERANK || '') ? (process.env.RERANK_MODEL || '').trim() : '';
+  return [...(e && e !== 'default' ? [e] : []), ...(r ? [r] : [])];
+}
 
 function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig = {}, calibrationStatePath, calibrationOptions = {}, evidenceDir, autotuneStatePath, autotuneTablePath, autotuneOptions = {} }) {
   const base = String(baseUrl || '').replace(/\/+$/, '').replace(/\/v1$/, '');

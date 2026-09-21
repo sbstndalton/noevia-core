@@ -124,3 +124,19 @@ test('before a chat model loads, other chat models are unloaded but the embeddin
   await manager.makeRoomFor('chat-b',['fixture-embed']);assert.deepEqual(unloaded,['chat-a'],'nothing else to unload');
  }finally{if(prev===undefined)delete process.env.EMBEDDING_MODEL;else process.env.EMBEDDING_MODEL=prev;}
 });
+
+test('with RAG rerank on, the reranker also stays beside the chat model',async()=>{
+ const keys=['EMBEDDING_MODEL','NOEVIA_FEATURE_RAG_RERANK','RERANK_MODEL'],prev=Object.fromEntries(keys.map(k=>[k,process.env[k]]));
+ Object.assign(process.env,{EMBEDDING_MODEL:'fixture-embed',NOEVIA_FEATURE_RAG_RERANK:'1',RERANK_MODEL:'fixture-rerank'});
+ const unloaded=[];const state={'chat-a':'loaded','fixture-rerank':'loaded','chat-b':'unloaded'};
+ const manager=createModelManager({fetchStream:async()=>({ok:false}),kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async(url,options)=>{
+  const path=new URL(url).pathname,body=options?.body?JSON.parse(options.body):{};
+  if(path==='/models/unload'){unloaded.push(body.model);state[body.model]='unloaded';}
+  if(path==='/models/load')state[body.model]='loaded';
+  return {ok:true,status:200,body:path==='/models'?{data:Object.entries(state).map(([id,value])=>({id,status:{value}}))}:{success:true}};
+ }});
+ try{
+  assert.equal((await manager.load('chat-b')).ok,true);
+  assert.deepEqual(unloaded,['chat-a']);assert.equal(state['fixture-rerank'],'loaded');
+ }finally{for(const k of keys){if(prev[k]===undefined)delete process.env[k];else process.env[k]=prev[k];}}
+});
