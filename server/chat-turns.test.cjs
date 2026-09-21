@@ -91,3 +91,55 @@ test('a stale recorder cannot overwrite a consumed replacement budget',async t=>
   const pending=f.service.resumeGeneration(f.workspace,f.turn.id,{model:{id:'mock'},project:()=>new Promise(resolve=>{release=()=>resolve([]);}),provider:async()=>({content:'done'})});
   assert.throws(()=>f.turn.partial('stale output'),/Turn changed/);release();await pending;
 });
+
+for (const phase of ['generation', 'tool']) test(`SIGKILL during ${phase} restores from a separate process without replay`, {timeout:10000}, async t => {
+  const {spawn} = require('node:child_process');
+  const {once} = require('node:events');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-process-turn-'));
+  const workspace = {dir, userId:'synthetic-process-tenant'};
+  const worker = spawn(process.execPath, ['-e', `
+    const {createChatTurns}=require(process.argv[1]);
+    const service=createChatTurns({enabled:true});
+    const turn=service.start({dir:process.argv[2],userId:'synthetic-process-tenant'},
+      {projectId:'synthetic-project',conversationId:'synthetic-chat',messages:[{role:'user',content:'fixture'}],model:{id:'mock'}});
+    turn.generation({messages:[]},0);
+    turn.output('Explicit intermediate output',[{id:'persisted-call',name:'mock_write',args:'{}'}]);
+    turn.approval('persisted-call',{id:'persisted-approval',action:'approve_all'});
+    turn.started('persisted-call');
+    if(process.argv[3]==='generation'){
+      turn.result('persisted-call','Confirmed synthetic result');
+      turn.generation({messages:[{role:'user',content:'mock next request'}]},1);
+    }
+    process.stdout.write(turn.id+'\\n');
+    setInterval(()=>{},1000);
+  `, require.resolve('./chat-turns.cjs'), dir, phase], {stdio:['ignore','pipe','pipe']});
+  const exited = once(worker,'exit');
+  t.after(async()=>{if(worker.exitCode===null && worker.signalCode===null)worker.kill('SIGKILL');await exited;fs.rmSync(dir,{recursive:true,force:true});});
+  let stderr='';worker.stderr.on('data',data=>{stderr+=data;});
+  const id = await new Promise((resolve,reject)=>{
+    let output='';
+    worker.stdout.on('data',data=>{output+=data;if(output.includes('\n'))resolve(output.trim());});
+    worker.once('error',reject);
+    worker.once('exit',()=>reject(Error('Fixture exited before checkpoint: '+stderr)));
+  });
+  worker.kill('SIGKILL');
+  const [,signal] = await exited;assert.equal(signal,'SIGKILL');
+  const service = createChatTurns({enabled:true}), restored=service.restore(workspace,id);
+  assert.equal(restored.state.identity.projectId,'synthetic-project');
+  assert.equal(restored.state.identity.conversationId,'synthetic-chat');
+  assert.equal(restored.state.calls[0].id,'persisted-call');
+  assert.equal(restored.state.calls[0].approval.id,'persisted-approval');
+  assert.equal(restored.state.calls[0].approval.action,'approve_all');
+  assert.equal(restored.state.outputs[0].content,'Explicit intermediate output');
+  if(phase==='tool'){
+    assert.equal(restored.next,'review');
+    await assert.rejects(service.resumeGeneration(workspace,id,{provider:()=>assert.fail('Ambiguous effect must block continuation')}),/review/);
+  }else{
+    assert.equal(restored.next,'generate');
+    let requests=0;
+    const result=await service.resumeGeneration(workspace,id,{model:{id:'replacement-mock'},project:state=>state.messages,
+      provider:async({messages})=>{requests++;assert.equal(messages.at(-1).content,'Confirmed synthetic result');return {content:'Restored'};}});
+    assert.equal(requests,1);assert.deepEqual(result.identity,restored.state.identity);
+    assert.equal(result.calls.length,1);assert.equal(result.calls[0].result,'Confirmed synthetic result');
+  }
+});
