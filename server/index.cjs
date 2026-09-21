@@ -35,6 +35,7 @@ const { createToolExchange } = require('./tool-exchange.cjs');
 const storageClient = require('./storage-client.cjs');
 const documents = require('./documents.cjs');
 const documentSources = require('./document-sources.cjs');
+const { TOOL_RESULT_CAP, TOOL_PREFILL_TARGET_MS, estimateToolTokens, toolCapFor, createToolboxes } = require('./toolboxes.cjs');
 const { createVisionProbe } = require('./vision.cjs');
 const { createModelManager } = require('./model-manager.cjs');
 const { createAuth, createRateLimiter } = require('./auth.cjs');
@@ -591,66 +592,29 @@ function ensureRolesLoaded() {
   })();
 }
 
-// ── Built-in tools (Pi-style JSON-Schema schema, master step 13) ──────────
-// Two safe built-ins to start. The schema follows the OpenAI-compatible
-// function-calling format every provider speaks (and pi-ai uses TypeBox to
-// produce exactly this shape). Results return to the model as role:'tool'
-// messages keyed by tool_call_id — the wire form of pi's toolResult.
-const CORE_TOOLS = [
-  {
-    type: 'function',
-    function: {
-      name: 'get_current_time',
-      description:
-        'Get the current date and time on the server, optionally in a specific IANA timezone (e.g. Europe/Berlin). Use whenever freshness, "today", or a timezone matters.',
-      parameters: {
-        type: 'object',
-        properties: { timezone: { type: 'string', description: 'Optional IANA timezone name' } },
-        required: [],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'read_project_file',
-      description:
-        'Read an attached source or enabled instruction skill by exact name. Skills support offset pagination. For PDFs use startPage/endPage (up to 5 pages) and offset to read beyond summaries; results include page and version references.',
-      parameters: {
-        type: 'object',
-        properties: { name: { type: 'string', description: 'Exact file name, e.g. notes.md' }, startPage: { type: 'integer', minimum: 1 }, endPage: { type: 'integer', minimum: 1 }, offset: { type: 'integer', minimum: 0 } },
-        required: ['name'],
-      },
-    },
-  },
-];
-
-const TOOL_RESULT_CAP = 8000; // chars — protect the context window
-
-// ── Toolboxes (master step 14) ────────────────────────────────────────────
-// Tools are no longer one flat global list. A *toolbox* is a named, selectable
-// set; a project picks which boxes it wants and the active list is resolved
-// per request. The seam exists so MCP-sourced tools can arrive as further
-// boxes without the chat loop changing shape — but it already earns its keep:
-// on the target hardware (a 9B model at ~14 tok/s) the catalogue is a real
-// per-turn cost paid on every message, not a rounding error.
-const TOOLBOXES = [
-  {
-    id: 'core',
-    label: 'Core',
-    description: 'Always-safe built-ins: the server clock, and full reads of this project\'s knowledge files.',
-    source: 'builtin',
-    tools: CORE_TOOLS,
-    reads: ['get_current_time', 'read_project_file'],
-  },
-];
-
 // D9: read-only offline Wikipedia box, only with features.kiwix and an internal KIWIX_URL.
 const kiwixTools = features.enabled('kiwix') && process.env.KIWIX_URL ? require('./kiwix.cjs').createKiwixTools({ baseUrl: process.env.KIWIX_URL, cap: TOOL_RESULT_CAP }) : null;
-if (kiwixTools) TOOLBOXES.push(kiwixTools.box);
-// Offered per request only to accounts with a connected Drive (connectedBoxes below).
+// Offered per request only to accounts with a connected Drive (connectedBoxes).
 const driveTools = require('./gdrive-tools.cjs').createDriveTools({ accounts: driveAccounts, cap: TOOL_RESULT_CAP });
-TOOLBOXES.push(driveTools.box);
+// Toolboxes, the resolver, the read/write gate and the built-in executor live in toolboxes.cjs.
+// MCP state and the executor are injected as closures: mcpState and toolboxOffered are declared
+// further down and only read at call time.
+const {
+  TOOLBOXES, CONNECTOR_BOXES, DEFAULT_TOOLBOXES, connectedBoxes, allToolboxes, toolTokenBudgetFor,
+  resolveTools, isWriteTool, sanitizeToolboxes, toolboxSummaries, executeToolCall,
+} = createToolboxes({
+  boxes: [kiwixTools && kiwixTools.box, driveTools.box].filter(Boolean),
+  kiwixTools, driveTools,
+  mcpBoxes: () => mcpState.boxes,
+  mcpTools: () => mcpState.tools,
+  offered: (id) => toolboxOffered(id),
+  prefill,
+  scope: requestScope,
+  getProject: (id) => getProject(id),
+  documentSources,
+  workspace: () => currentWorkspace(),
+  executeMcp: (name, args) => executeMcpToolCall(name, args),
+});
 const connectorRoutes = require('./routes/connectors.cjs').createConnectorRoutes({
   accounts: driveAccounts, driveTools, policy: toolPolicy, offsite: offsiteBackup, isWrite: (name) => isWriteTool(name), json, readBody: (req) => readJson(req),
   // Nextcloud's tools ride on the account's storage connection, so this only reports what that
@@ -677,66 +641,12 @@ const connectorRoutes = require('./routes/connectors.cjs').createConnectorRoutes
 // connected them, and never appear in a project's toolbox picker.
 // Skill auto-loading shares the router's switch and embedding model (chat-skill-routing.cjs).
 const chatSkillRouter = require('./chat-skill-routing.cjs').createChatSkillRouter({ enabled: () => features.enabled('toolRouter'), embed: (texts) => rag.embed(texts) });
-const CONNECTOR_BOXES = new Set(['gdrive']);
-function connectedBoxes(user) { return user && driveTools.connected(user) ? ['gdrive'] : []; }
-
-const DEFAULT_TOOLBOXES = ['core'];
-
-// Built-ins plus whatever MCP discovery found. Everything downstream — the
-// picker, the validator, the resolver — goes through here so an MCP box is
-// indistinguishable from a built-in one once it exists.
 // Roadmap E: narrows each message's toolboxes to the matching ones when features.toolRouter is on.
 const chatToolRouter = require('./chat-tool-routing.cjs').createChatToolRouter({
   enabled: () => features.enabled('toolRouter'), boxes: () => allToolboxes(), embed: (texts) => rag.embed(texts),
   embedModel: () => rag.embedModel(),
 });
 
-function allToolboxes() {
-  return [...TOOLBOXES, ...mcpState.boxes].filter((b) => toolboxOffered(b.id));
-}
-
-// A tool definition is re-sent on EVERY turn, so its size is a recurring cost.
-//
-// Estimating it as chars/4 is wrong twice over. The provider does not put the
-// JSON on the wire as-is — llama.cpp's chat template re-renders every tool —
-// and there is a FIXED preamble for enabling tool calling at all, which a flat
-// multiplier cannot express. That fixed cost is why a tiny box looks wildly
-// expensive per character while a large one looks cheap.
-//
-// Measured directly against the live endpoint on 2026-09-08 (same message,
-// only `tools` differing, so nothing else contaminates the comparison):
-//
-//   box        chars   actual   model    err
-//   core         719      390     440   +13%
-//   notes      2,349      883     892    +1%
-//   talk       2,749      895   1,004   +12%
-//   calendar  15,535    4,512   4,555    +1%
-//   files      8,170    2,190   2,509   +15%
-//   contacts   6,038    1,650   1,917   +16%
-//   deck       8,415    2,533   2,578    +2%
-//
-// So: tokens ≈ TOOL_PREAMBLE_TOKENS + chars/3.6. It never under-predicts and
-// is at worst 16% high, which is the right direction for a budget — but only
-// just. An earlier version of this used a flat 2.1x factor derived from the
-// core box alone, which over-predicted the MCP boxes by up to 2x and made
-// nc_calendar_create_event unreachable despite it fitting comfortably. An
-// estimate that is too high silently withholds tools the hardware can afford,
-// which is a quieter failure than one that is too low, not a safer one.
-const TOOL_PREAMBLE_TOKENS = 240; // paid once per request that sends any tool
-const TOOL_CHARS_PER_TOKEN = 3.6;
-
-// The MARGINAL cost of these tools — the fixed preamble is deliberately not
-// included, so per-box numbers stay additive and the caller adds the preamble
-// exactly once for the whole request.
-function estimateToolTokens(tools) {
-  if (!Array.isArray(tools) || tools.length === 0) return 0; // no tools, no cost
-  return Math.round(JSON.stringify(tools).length / TOOL_CHARS_PER_TOKEN);
-}
-
-// How many tools a model can be handed before the catalogue crowds out the
-// conversation. This is a hardware/capability question, not a "what does this
-// work need" question — which is precisely why box *selection* is per-project
-// and only the cap looks at the model.
 // An image source is bytes, not text, and needs its own limits.
 const IMAGE_MIME = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
 // Endpoint-scoped probes expire, so repairing a model or its projector does
@@ -876,137 +786,6 @@ function indexSource(project, file) {
 }
 
 const MAX_PROJECT_IMAGES = 12;
-
-const TOOL_CAP_DEFAULT = 24;
-const TOOL_CAP_SMALL = 12;
-
-// The count cap is a separate question from the token budget: it guards
-// against handing a small model too many CHOICES, which degrades tool
-// selection accuracy regardless of how cheap the definitions are.
-function toolCapFor(model) {
-  // Parameter count in the model id (…-9B-…, …-4b-it…) is the only signal
-  // available here, and local GGUF names carry it by convention. An
-  // unrecognised name gets the roomier default: wrongly withholding tools is
-  // a worse failure than sending a few more than ideal.
-  const m = /(\d+(?:\.\d+)?)\s*[bB]\b/.exec(String(model || ''));
-  if (m && Number(m[1]) <= 12) return TOOL_CAP_SMALL;
-  return TOOL_CAP_DEFAULT;
-}
-
-// A COUNT cap alone is the wrong unit, which only became clear once real MCP
-// tools arrived. Measured against the reference server: nc_calendar_create_event
-// is ~2,739 calibrated tokens while nc_notes_search_notes is 449. "12 tools"
-// therefore describes anything between ~250 and ~47,000 tokens of prompt. The
-// count cap still guards against overwhelming a small model with too many
-// CHOICES; this budget guards latency, which is the constraint that bites.
-//
-// The budget is NOT about running out of context. Measured 2026-09-08 on this
-// deployment: the model advertises a 262,144-token window and llama-server is
-// configured with n_ctx=32,768 — so context only becomes the limit at the full
-// 160-tool catalogue (39,791 tokens, which does 400). Everything below that
-// fits comfortably.
-//
-// What actually degrades is TIME TO FIRST TOKEN. Prefill runs at roughly
-// 360 tok/s (~2.75 ms/token) on this hardware, and the tool catalogue is
-// re-sent on EVERY message, so its cost is paid on every turn before the model
-// says a word:
-//
-//     0 tools      17 tok    0.2 s
-//     6 tools     924 tok    3.1 s
-//    12 tools   1,500 tok    4.5 s
-//    20 tools   4,161 tok   11.7 s
-//    30 tools   6,895 tok   21.2 s
-//
-// So the budget is really a latency target, and these numbers are it:
-// ~5,000 tokens is about 14 seconds of silence before the first word. That is
-// a lot, and it is the honest price of the full calendar box on this hardware
-// (measured: 4,512 tokens, 14.1 s). It is the dial to turn if turns feel slow.
-// Larger/remote models are not prefill-bound in the same way and get more.
-const TOOL_TOKEN_BUDGET_DEFAULT = 8000;
-const TOOL_TOKEN_BUDGET_SMALL = 5000;
-
-// What the budget is really expressing: how long the user waits, before the
-// model says anything, for the privilege of having tools available. The
-// catalogue is re-read on every message, so this is paid every turn.
-//
-// 14 seconds is a lot. It is the honest price of the full calendar box on this
-// hardware (4,512 tokens measured at ~360 tok/s prefill), and it is the dial to
-// turn if turns feel sluggish.
-const TOOL_PREFILL_TARGET_MS = 14000;
-
-// Log the fallback→measured switch once per model, not once per request.
-const announcedMeasured = new Set();
-
-function toolTokenBudgetFor(model) {
-  // Measured, if we have watched enough real traffic for this model. This is
-  // the honest answer: a budget in tokens derived from how fast THIS model on
-  // THIS hardware actually reads, rather than from what its filename says.
-  const measured = prefill.budgetFor(model, TOOL_PREFILL_TARGET_MS);
-  if (measured) {
-    if (!announcedMeasured.has(model)) {
-      announcedMeasured.add(model);
-      const rate = Math.round(prefill.rateFor(model) * 1000);
-      console.log(`[prefill] ${model}: measured ~${rate} tok/s; tool budget is now ${measured} tokens for a ${TOOL_PREFILL_TARGET_MS}ms target (was a filename guess)`);
-    }
-    // Clamped so a freak measurement cannot hand a small model the whole
-    // catalogue or starve a fast one down to nothing.
-    return Math.max(1500, Math.min(measured, 16000));
-  }
-  // Fallback until measured: parameter count in the model id is the only
-  // signal available, and local GGUF names carry it by convention. It is a
-  // guess, and it is why the measurement above exists — but it has to be
-  // something on the very first request, before any traffic has been seen.
-  const m = /(\d+(?:\.\d+)?)\s*[bB]\b/.exec(String(model || ''));
-  if (m && Number(m[1]) <= 12) return TOOL_TOKEN_BUDGET_SMALL;
-  return TOOL_TOKEN_BUDGET_DEFAULT;
-}
-
-// Resolve a project's selection into the list actually sent upstream. Unknown
-// box ids are ignored rather than fatal — a box can vanish when an MCP server
-// goes away, and that must degrade to fewer tools, not to a broken chat. Over
-// the cap the list is truncated, but never silently: the dropped names come
-// back so the caller can log them.
-function resolveTools(project, model, skip = () => false) {
-  // An absent key means a project predating toolboxes: fall back to core so
-  // upgrading does not silently disarm existing projects. An empty ARRAY is a
-  // deliberate choice — the operator unticked every box — and must be honoured,
-  // or the UI checkbox would lie about what it does.
-  const wanted = Array.isArray(project && project.toolboxes) ? project.toolboxes : DEFAULT_TOOLBOXES;
-  const available = allToolboxes();
-  const boxes = [];
-  const candidates = [];
-  const seen = new Set();
-  for (const id of wanted) {
-    const box = available.find((b) => b.id === id);
-    if (!box) continue;
-    boxes.push(box.id);
-    for (const tool of box.tools) {
-      const name = tool && tool.function && tool.function.name;
-      if (!name || seen.has(name) || skip(name)) continue; // first box wins a name clash
-      seen.add(name);
-      candidates.push(tool);
-    }
-  }
-  // Two independent limits; whichever binds first stops the list. Tools are
-  // taken in selection order, so the box a user picked first keeps its tools
-  // when the budget runs out — a stable, explainable rule beats picking the
-  // cheapest tools and silently reshaping what the model can do.
-  const cap = toolCapFor(model);
-  const budget = toolTokenBudgetFor(model);
-  const tools = [];
-  const dropped = [];
-  // Enabling tool calling at all costs a fixed preamble, so it is charged once
-  // up front rather than smeared across the tools.
-  let spent = candidates.length ? TOOL_PREAMBLE_TOKENS : 0;
-  for (const tool of candidates) {
-    const cost = estimateToolTokens([tool]);
-    if (tools.length >= cap) { dropped.push(`${tool.function.name} (over ${cap}-tool cap)`); continue; }
-    if (spent + cost > budget) { dropped.push(`${tool.function.name} (~${cost} tok, over ${budget} budget)`); continue; }
-    tools.push(tool);
-    spent += cost;
-  }
-  return { tools, dropped, boxes, cap, budget, estTokens: spent };
-}
 
 // ── MCP toolboxes (master step 15): curated in mcp-toolbox-manifest.cjs ─────────
 const MCP_TOOLBOX_MANIFEST = require('./mcp-toolbox-manifest.cjs').buildToolboxManifest({ features });
@@ -1398,64 +1177,9 @@ function mcpDiscoveryAuth(server) {
   return mcpStaticAuth(server);
 }
 
-// ── Tool permissions (master step 16) ────────────────────────────────────
-//
-// Once a tool can create a calendar event or send a Talk message, a small
-// local model that hallucinates an argument has consequences that a wrong
-// sentence does not. Reads run automatically; writes need a human.
-//
-// The classification lives HERE, per toolbox, not in the MCP server, because
-// MCP cannot be trusted to supply it: annotations.readOnlyHint is present on
-// only 70 of the reference server's 160 tools and absent on 90. It is a useful
-// signal and a useless guarantee.
-//
-// So the rule is: a tool is a WRITE unless noevia explicitly says otherwise.
-// A new or unrecognised tool is therefore gated by default — the failure mode
-// of an unnecessary prompt is an annoyed user, and the failure mode of a
-// missing one is deleted data.
-function readOnlyToolNames() {
-  const names = new Set();
-  for (const box of allToolboxes()) {
-    for (const n of (box.reads || [])) names.add(n);
-  }
-  return names;
-}
-
-function isWriteTool(name) {
-  if (!readOnlyToolNames().has(name)) return true; // unknown ⇒ write
-  // Our manifest says read-only. If the server itself claims the tool writes,
-  // believe the server: the hint is unreliable when it is ABSENT, but a
-  // positive "this is not read-only" is information we should not override.
-  const known = mcpState.tools.get(name);
-  if (known && known.readOnly === false) {
-    console.warn(`[tools] ${name} is listed read-only in noevia but the MCP server reports it writes; treating as a write`);
-    return true;
-  }
-  return false;
-}
-
 // The approval gate's state lives in approvals.cjs; the chat loop below and the
 // /api/tool-approvals route are its only callers.
 const { pendingApprovals, chatWideApproved, awaitApproval } = require('./approvals.cjs').createApprovals();
-
-// Accept only ids that name a real box, so a stale selection persisted by an
-// older client cannot accumulate junk in the project record.
-function sanitizeToolboxes(value) {
-  if (!Array.isArray(value)) return null;
-  const ids = value.filter((v) => typeof v === 'string' && !CONNECTOR_BOXES.has(v) && allToolboxes().some((b) => b.id === v));
-  return [...new Set(ids)];
-}
-
-function toolboxSummaries() {
-  return allToolboxes().filter((b) => !CONNECTOR_BOXES.has(b.id)).map((b) => ({
-    id: b.id,
-    label: b.label,
-    description: b.description,
-    source: b.source,
-    toolCount: b.tools.length,
-    estTokens: estimateToolTokens(b.tools),
-  }));
-}
 
 // ── SKILL.md awareness (Hermes-style convention, master step 13) ─────────
 // A project knowledge file that starts with SKILL.md frontmatter is treated
@@ -1464,69 +1188,6 @@ function toolboxSummaries() {
 // read_project_file tool (L1) — progressive disclosure, zero extra deps.
 function skillsIndexFor(project) {
   return require('./instruction-skills.cjs').enabled(project);
-}
-
-async function executeToolCall(project, name, rawArgs, allowed) {
-  // A model can name a tool it was never offered — by hallucination, or from
-  // a box the project has since deselected mid-conversation. Enforce the
-  // resolved list here rather than trusting that whatever was sent upstream is
-  // still what came back.
-  if (allowed instanceof Set && !allowed.has(name)) {
-    return `ERROR: tool "${name}" is not enabled for this project`;
-  }
-  let args = {};
-  try {
-    args = rawArgs ? JSON.parse(rawArgs) : {};
-  } catch {
-    return `ERROR: tool arguments were not valid JSON: ${String(rawArgs).slice(0, 200)}`;
-  }
-  if (kiwixTools?.names.has(name)) return kiwixTools.execute(name, args);
-  if (driveTools.names.has(name)) return driveTools.execute(requestScope.getStore()?.authn?.user, name, args);
-  if (name === 'get_current_time') {
-    const tz = typeof args.timezone === 'string' && args.timezone ? args.timezone : undefined;
-    const now = new Date();
-    try {
-      const formatted = tz
-        ? new Intl.DateTimeFormat('en-GB', { timeZone: tz, dateStyle: 'full', timeStyle: 'long' }).format(now)
-        : now.toString();
-      return `Current time: ${formatted}${tz ? ` (${tz})` : ''} | ISO: ${now.toISOString()}`;
-    } catch {
-      return `ERROR: unknown IANA timezone "${tz}"`;
-    }
-  }
-  if (name === 'read_project_file') {
-    const wanted = typeof args.name === 'string' ? args.name : '';
-    const files = (project && Array.isArray(project.files)) ? project.files : [];
-    const f = files.find((x) => x.name === wanted);
-    if (!f) {
-      const names = files.map((x) => x.name).join(', ') || '(none attached)';
-      return `ERROR: no project file named "${wanted}". Available: ${names}`;
-    }
-    const instructionSkills = require('./instruction-skills.cjs');
-    if (instructionSkills.inspect(f, project)) return instructionSkills.read(project, f, getProject(project.id), args.offset ?? 0, TOOL_RESULT_CAP);
-    if (f.attachment?.state === 'stored') return `${f.name}: original stored; readable contents are unavailable. Contents have not been read.`;
-    if (f.document && args.startPage !== undefined) {
-      try {
-        const out = documentSources.readPages(currentWorkspace(), project.id, f, args.startPage, args.endPage ?? args.startPage, args.offset ?? 0, TOOL_RESULT_CAP);
-        return `${out.notice}\n${out.text}${out.nextOffset !== null ? '\nContinue with offset ' + out.nextOffset : ''}`;
-      } catch (err) { return 'ERROR: ' + err.message; }
-    }
-    const warning = documentSources.notice(f);
-    return `${warning ? warning + "\n" : ""}File "${f.name}" (${f.content.length} chars):\n\n${f.content.slice(0, TOOL_RESULT_CAP)}${f.content.length > TOOL_RESULT_CAP ? '\n…[truncated]' : ''}`;
-  }
-  // Not a built-in: if the name came from a discovered MCP box, execute it
-  // there. The per-user credential is attached here rather than at discovery,
-  // so two users sharing a project each act as themselves.
-  if (mcpState.tools.has(name)) {
-    // Extends the current scope rather than replacing it: the workspace and
-    // authn the rest of the call depends on must survive. Same shape as the
-    // sourceProgress extension below.
-    return requestScope.run(
-      { ...requestScope.getStore(), internalCallProject: project || null },
-      () => executeMcpToolCall(name, args),
-    );
-  }
-  return `ERROR: unknown tool "${name}"`;
 }
 
 async function executeMcpToolCall(name, args) {
@@ -2390,6 +2051,12 @@ const connectorFiles={
   read:(id,path)=>callDiaryFile(id,'/file','POST',{path}),
   write:(id,body)=>callDiaryFile(id,'/file','PUT',body),
 };
+// GET /api/toolboxes: the picker view (routes/toolboxes.cjs). MCP state is read at call time.
+const toolboxRoutes = require('./routes/toolboxes.cjs').createToolboxRoutes({
+  discoverMcpTools: () => discoverMcpTools(), toolboxSummaries, json,
+  prefill: { targetMs: TOOL_PREFILL_TARGET_MS, stats: () => prefill.stats() },
+  mcp: () => ({ enabled: MCP_ENABLED, state: mcpState, servers: MCP_SERVERS, manifest: MCP_TOOLBOX_MANIFEST }),
+});
 const mcpDirectoryRoutes = require('./routes/mcp-directory.cjs').createMcpDirectoryRoutes({
   json, readJson, auth: authService, servers: MCP_SERVERS, mcpState, directoryMcp, mcpOAuth,
   discoverOneServer, discoverMcpTools, probeMcpAuth, syncDirectoryServers, directoryUrlAllowed,
@@ -2732,26 +2399,7 @@ async function handleRequestScoped(req, res) {
       return json(res, 200, { ok: true });
     }
 
-    if (p === '/api/toolboxes' && req.method === 'GET') {
-      // Await discovery: on a cold start the picker would otherwise show only
-      // the built-in box and the user would think MCP was broken. Cached for
-      // MCP_DISCOVERY_TTL_MS, so this is one round trip every ten minutes.
-      await discoverMcpTools();
-      return json(res, 200, {
-        toolboxes: toolboxSummaries(),
-        // What has actually been measured about this hardware, so a slow box
-        // is diagnosable without reading logs.
-        prefill: { targetMs: TOOL_PREFILL_TARGET_MS, models: prefill.stats() },
-        mcp: MCP_ENABLED
-          ? {
-              configured: true,
-              error: mcpState.error,
-              discovered: mcpState.tools.size,
-              servers: require('./mcp-status.cjs').describeMcpServers(MCP_SERVERS,mcpState.servers,mcpState.tools,MCP_TOOLBOX_MANIFEST),
-            }
-          : { configured: false },
-      });
-    }
+    if (await toolboxRoutes(req, res, { path: p, authn })) return;
 
     if (p === '/api/workspace') {
       try { sweepRetention(); } catch (e) { console.warn('[retention] sweep failed:', e?.message || e); }

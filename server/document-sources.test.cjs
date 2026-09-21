@@ -4,7 +4,6 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
-const vm = require('node:vm');
 const sources = require('./document-sources.cjs');
 const documents = require('./documents.cjs');
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-source-store-'));
@@ -23,11 +22,8 @@ test('page reads reach the last page beyond the project summary cap and paginate
   assert.equal(first.nextOffset, 100);
   const next = sources.readPages(w, 'p', f, 1, 5, 100, 100);
   assert.notEqual(first.text, next.text);
-  const server = fs.readFileSync(path.join(__dirname, 'index.cjs'), 'utf8');
-  const context = { require, documents, documentSources: sources, currentWorkspace: () => w, TOOL_RESULT_CAP: 8000, kiwixTools: null, driveTools: { names: new Set() } };
-  vm.createContext(context);
-  vm.runInContext(server.slice(server.indexOf('async function executeToolCall('), server.indexOf('async function executeMcpToolCall(')), context);
-  const out = await context.executeToolCall({ id: 'p', files: [f] }, 'read_project_file', JSON.stringify({ name: 'long.pdf', startPage: 110 }));
+  const { executeToolCall } = require('./toolboxes.cjs').createToolboxes({ documentSources: sources, workspace: () => w });
+  const out = await executeToolCall({ id: 'p', files: [f] }, 'read_project_file', JSON.stringify({ name: 'long.pdf', startPage: 110 }));
   assert.match(out, /PAGE-110 ROW-50/); assert.match(out, /text version/);
 });
 

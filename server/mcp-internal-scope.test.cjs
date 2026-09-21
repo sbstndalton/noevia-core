@@ -15,8 +15,8 @@ const path = require('node:path');
 const vm = require('node:vm');
 const { AsyncLocalStorage } = require('node:async_hooks');
 
-// Build a sandbox holding the real executeToolCall and the real token-minting
-// path, with everything they touch faked out.
+// The real executeToolCall (toolboxes.cjs) and the real token-minting path
+// (mcpInternalAuth, still in index.cjs), with everything they touch faked out.
 function harness() {
   const server = fs.readFileSync(path.join(__dirname, 'index.cjs'), 'utf8');
   const minted = [];
@@ -27,26 +27,26 @@ function harness() {
     require,
     console,
     requestScope: new AsyncLocalStorage(),
-    mcpState: { tools: new Map([['nc_notes_search_notes', {}]]) },
-    kiwixTools: null,
-    driveTools: { names: new Set() },
-    documentSources: { notice: () => '' },
-    TOOL_RESULT_CAP: 8000,
     MCP_INTERNAL_KEY: 'test-key',
     isWriteTool: () => false,
     authService: { getStorage: () => ({ kind: 'local' }) },
     mcpInternal: { mintToken: (_key, claims) => { minted.push(claims); return 'tok'; } },
-    // Stands in for the real MCP round trip: the first caller parks here so
-    // the second can run to completion underneath it.
-    async executeMcpToolCall(name) {
-      if (minted.length === 0 && !context.__second) { context.__second = true; await gate; }
-      return JSON.stringify(context.mcpInternalAuth(name));
-    },
   };
   vm.createContext(context);
   const cut = (from, to) => server.slice(server.indexOf(from), server.indexOf(to));
   vm.runInContext(cut('function mcpInternalAuth(', '/** Discovery runs with no user'), context);
-  vm.runInContext(cut('async function executeToolCall(', 'async function executeMcpToolCall('), context);
+  const { executeToolCall } = require('./toolboxes.cjs').createToolboxes({
+    scope: context.requestScope,
+    mcpTools: () => new Map([['nc_notes_search_notes', {}]]),
+    documentSources: { notice: () => '' },
+    // Stands in for the real MCP round trip: the first caller parks here so
+    // the second can run to completion underneath it.
+    async executeMcp(name) {
+      if (minted.length === 0 && !context.__second) { context.__second = true; await gate; }
+      return JSON.stringify(context.mcpInternalAuth(name));
+    },
+  });
+  context.executeToolCall = executeToolCall;
   return { context, minted, release };
 }
 
