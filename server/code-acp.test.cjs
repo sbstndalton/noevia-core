@@ -194,3 +194,12 @@ test('a cancelled permission is nested too', async () => {
   const result = await agent.prompt('edit');
   assert.deepEqual(result.seen[0].result, { outcome: { outcome: 'cancelled' } });
 });
+
+test('a proxied agent keeps the engine off the proxy, and nothing else', () => {
+  const { agentEnv } = require('./code-acp.cjs');
+  const env = agentEnv({ cwd: '/w', proxy: { url: 'http://task:t@egress:8040', noProxy: 'llama' } });
+  assert.equal(env.HTTPS_PROXY, 'http://task:t@egress:8040');
+  assert.equal(env.NO_PROXY, 'llama');
+  assert.equal(agentEnv({ cwd: '/w', proxy: { url: 'http://task:t@egress' } }).NO_PROXY, '');
+  assert.equal(agentEnv({ cwd: '/w' }).HTTPS_PROXY, undefined);
+});

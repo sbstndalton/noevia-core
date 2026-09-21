@@ -331,6 +331,9 @@ const codeRoutes = require('./routes/code.cjs').createCodeRoutes({
   features, getProject, workspace: () => currentWorkspace(), json, readJson,
   service: require('./code-service.cjs').createCodeService({
     repos: process.env.CODE_REPOS,
+    // The egress proxy (D15) is the only way a task reaches the internet, and only to the domains
+    // its grant names. Unconfigured, network and installs stay unavailable.
+    egress: require('./code-egress.cjs').startEgressFromEnv(process.env, { log: (entry) => console.log('[egress]', JSON.stringify(entry)) }),
     log: (entry) => console.log('[code]', JSON.stringify(entry)),
     // Where the agent's model lives, and which one. ACP carries neither, so noevia writes both
     // into the harness's own config file (`code-harness-config.cjs`); a sandbox has no provider

@@ -213,3 +213,22 @@ test('a client that disconnects mid-check does not take the proxy down with it',
     await p.close();
   }
 });
+
+test('the deployment proxy starts only when a port is configured', async () => {
+  const { startEgressFromEnv } = require('./code-egress.cjs');
+  assert.equal(startEgressFromEnv({}), null);
+  assert.equal(startEgressFromEnv({ CODE_EGRESS_PORT: 'nope' }), null);
+  assert.throws(() => startEgressFromEnv({ CODE_EGRESS_PORT: '8040', CODE_EGRESS_HOST: 'bad host/' }), /host name/);
+  const proxy = startEgressFromEnv({ CODE_EGRESS_PORT: '0' });
+  assert.equal(proxy, null);
+  const live = startEgressFromEnv({ CODE_EGRESS_PORT: '38740', CODE_EGRESS_BIND: '127.0.0.1' });
+  try {
+    assert.equal(live.endpoint, 'egress:38740');
+    await new Promise((r) => live.server.listening ? r() : live.server.once('listening', r));
+    // Deny by default: no grant, no token, no connection.
+    const status = await new Promise((resolve) => {
+      require('node:http').get({ host: '127.0.0.1', port: 38740, path: 'http://example.com/' }, (res) => { res.resume(); resolve(res.statusCode); }).on('error', () => resolve('error'));
+    });
+    assert.equal(status, 407);
+  } finally { live.server.close(); }
+});

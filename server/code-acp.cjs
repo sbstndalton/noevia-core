@@ -206,7 +206,7 @@ function agentEnv({ cwd, env = {}, proxy = null, home = null }) {
     // nested git repository under it, and with HOME inside the repository a real run committed
     // all of it onto the task's branch. It gets its own directory beside the workspace.
     PATH: process.env.PATH, HOME: home || env.HOME || undefined, TMPDIR: env.TMPDIR || undefined, LANG: process.env.LANG,
-    ...(proxy ? { HTTP_PROXY: proxy.url, HTTPS_PROXY: proxy.url, http_proxy: proxy.url, https_proxy: proxy.url, NO_PROXY: '' } : {}),
+    ...(proxy ? { HTTP_PROXY: proxy.url, HTTPS_PROXY: proxy.url, http_proxy: proxy.url, https_proxy: proxy.url, NO_PROXY: proxy.noProxy || '' } : {}),
     ...env,
   };
   for (const key of Object.keys(out)) if (out[key] === undefined) delete out[key];

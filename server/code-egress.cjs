@@ -184,4 +184,19 @@ async function defaultLookup(host) {
 }
 function defaultConnect({ address, port }) { return net.connect(port, address); }
 
-module.exports = { createEgressProxy, hostAllowed, parseTarget };
+/**
+ * The proxy as a deployment runs it: on `CODE_EGRESS_PORT` inside the web process, reached by the
+ * sandbox as `CODE_EGRESS_HOST` (a network alias on the internal code network). Unset, there is
+ * no proxy, and Code mode keeps network and installs unavailable rather than pretending.
+ */
+function startEgressFromEnv(env = process.env, { log = () => {}, create = createEgressProxy } = {}) {
+  const port = Number(env.CODE_EGRESS_PORT);
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) return null;
+  const host = String(env.CODE_EGRESS_HOST || 'egress').trim();
+  if (!/^[a-z0-9.-]+$/i.test(host)) throw Error(`CODE_EGRESS_HOST should be a host name, not "${host}"`);
+  const proxy = create({ log });
+  proxy.server.listen(port, env.CODE_EGRESS_BIND || '0.0.0.0');
+  return Object.assign(proxy, { endpoint: `${host}:${port}` });
+}
+
+module.exports = { createEgressProxy, hostAllowed, parseTarget, startEgressFromEnv };

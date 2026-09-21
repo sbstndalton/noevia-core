@@ -87,7 +87,10 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
           // defaults writing silently, and noevia refuses to run a harness whose effective
           // config it cannot pin.
           permission: { edit: 'ask', bash: 'ask', webfetch: 'ask' },
-          proxy: grant ? { url: `http://task:${grant.token}@egress`, domains: [...domains] } : null,
+          proxy: grant ? { url: `http://task:${grant.token}@${egress.endpoint || 'egress'}`, domains: [...domains],
+            // The agent's own model calls go straight to the engine on the internal network; sent
+            // through the proxy they would be refused as a private address.
+            noProxy: engineHost(engine) } : null,
           handlers: session.handlers,
           signal: ctx.signal,
         });
@@ -298,3 +301,8 @@ const defaultFiles = {
 };
 
 module.exports = { createCodeHarness, defaultFiles, MAX_TEXT, MAX_FILE_BYTES };
+
+/** The engine's host name, kept off the proxy so a task granted the network can still think. */
+function engineHost(engine) {
+  try { return new URL(engine().baseUrl).hostname; } catch { return ''; }
+}

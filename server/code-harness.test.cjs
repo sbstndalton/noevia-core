@@ -38,11 +38,12 @@ async function run({ script, answers = [], capabilities = [], domains = [], egre
     engine: () => ({ baseUrl: 'http://engine.test/v1', model: 'synthetic-coder', apiKey: null, contextTokens: 8192 }),
     askApproval: async (request) => { asked.push(request); return answers.shift() ?? 'deny'; },
   });
-  let handlers;
+  let handlers, connected;
   const started = await harness.start({
     repoPath: repo(), prompt: 'fix the bug', capabilities, domains, sandboxKind,
-    connect: async ({ handlers: h, cwd }) => {
-      handlers = h;
+    connect: async (args) => {
+      const { handlers: h, cwd } = args;
+      handlers = h; connected = args;
       return { agent, prompt: async () => { await script(h, cwd); return promptResult; } };
     },
   });
@@ -50,7 +51,7 @@ async function run({ script, answers = [], capabilities = [], domains = [], egre
   for (let i = 0; i < 200 && !['completed', 'failed', 'cancelled'].includes(jobs.get(started.taskId)?.status); i++) {
     await new Promise((r) => setTimeout(r, 5));
   }
-  return { ...started, dir, jobs, workspaces, job: jobs.get(started.taskId), asked, handlers };
+  return { ...started, dir, jobs, workspaces, job: jobs.get(started.taskId), asked, handlers, connected };
 }
 
 const editCall = (file) => ({ toolCall: { kind: 'edit', title: 'Edit ' + file, locations: [{ path: file }], rawInput: { path: file } }, options: OPTIONS });
@@ -308,4 +309,14 @@ test('usage is taken from the harness’s own usage_update, where the real one p
   assert.deepEqual(r.job.result.meta.usage, { input: 4200, output: 610, total: 4810 });
   assert.equal(r.job.result.meta.limitations.some((l) => /token usage/.test(l)), false);
   assert.equal(r.job.result.meta.messageChunks, 1);
+});
+
+test('a granted task reaches the proxy by its endpoint and the engine directly', async () => {
+  const egress = { endpoint: 'egress:8040', grant: () => ({ token: 'tok' }), revoke: () => 1 };
+  const r = await run({ capabilities: [ACTIONS.NETWORK], domains: ['pypi.org'], egress, script: async () => {} });
+  assert.equal(r.connected.proxy.url, 'http://task:tok@egress:8040');
+  // Through the proxy the engine would be refused as a private address, and the agent could not think.
+  assert.equal(r.connected.proxy.noProxy, 'engine.test');
+  const offline = await run({ capabilities: [ACTIONS.EDIT], egress, script: async () => {} });
+  assert.equal(offline.connected.proxy, null);
 });
