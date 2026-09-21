@@ -38,7 +38,7 @@ const documentSources = require('./document-sources.cjs');
 const { createVisionProbe } = require('./vision.cjs');
 const { createModelManager } = require('./model-manager.cjs');
 const { createAuth, createRateLimiter } = require('./auth.cjs');
-const { createWorkspaceStore, atomicJson } = require('./workspace.cjs');
+const { createWorkspaceStore } = require('./workspace.cjs');
 const { createSecretStore } = require('./secrets.cjs');
 const { isPublicUrl } = require('./ssrf.cjs');
 
@@ -141,7 +141,6 @@ const workspaceStore = createWorkspaceStore(DATA_DIR, { id: DEFAULT_PROVIDER_ID,
 // must not be able to hog it. Fixed window, shared bucket across chat and
 // diary conversations. Admins are throttled like everyone else. Raise
 // LLM_RATE_LIMIT for a beefier inference host.
-const LLM_RATE_ROUTES = new Set(['/api/chat']);
 const LLM_RATE_LIMIT = Math.max(1, Number(process.env.LLM_RATE_LIMIT || 60));
 const LLM_RATE_WINDOW_MS = 60 * 1000;
 const llmRateLimiter = createRateLimiter();
@@ -177,16 +176,6 @@ rag.init({ dataDir: DATA_DIR, inferenceUrl: INFERENCE_BASE, headersFn: () => inf
 function json(res, code, body) {
   res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
   res.end(JSON.stringify(body));
-}
-
-function clientToken(req) {
-  const auth = String(req.headers.authorization || '');
-  if (auth.toLowerCase().startsWith('bearer ')) return auth.slice(7).trim();
-  return String(req.headers['x-cowork-token'] || req.headers['x-diary-token'] || '').trim();
-}
-
-function checkAuth(req) {
-  return !!authService.authenticate(req);
 }
 
 function unauthorized(res) {
@@ -340,10 +329,6 @@ async function storageEndpointAllowed(authn, rawUrl) {
 
 // ── Projects config: instructions, files, memories, model ─────────────────
 
-function loadProjects() {
-  return currentWorkspace().projects;
-}
-
 function saveProjects(projects) {
   for (const project of projects) require("./instruction-skills.cjs").reconcile(project);
   currentWorkspace().projects = Array.from(projects);
@@ -361,10 +346,6 @@ function getProject(id) {
 // ── Provider registry (step 9): generic OpenAI-compatible endpoints ────────
 // One adapter covers all of them (same /chat/completions shape). Projects
 // without a provider field use the environment-configured default provider.
-function loadProviders() {
-  return currentWorkspace().providers;
-}
-
 // Syncs the private half of the registry from the current merged view and
 // persists ONLY the user's private provider file. Shared rows are excluded:
 // a per-user save must never rewrite shared-providers.json (checkpoint 1c —
@@ -390,43 +371,6 @@ function backupOnce(name) {
   if (!fs.existsSync(file)) return;
   const backup = `${file}.pre-neutral-provider.bak`;
   if (!fs.existsSync(backup)) fs.copyFileSync(file, backup, fs.constants.COPYFILE_EXCL);
-}
-
-function migrateLegacyProviderIds() {
-  let changedProviders = false;
-  let changedProjects = false;
-  for (const provider of PROVIDERS) {
-    if (provider.id === 'lemonade') {
-      provider.id = DEFAULT_PROVIDER_ID;
-      provider.label = DEFAULT_PROVIDER_LABEL;
-      changedProviders = true;
-    }
-  }
-  if (changedProviders) {
-    const seen = new Set();
-    const filtered = Array.from(PROVIDERS).filter((provider) => {
-      if (seen.has(provider.id)) return false;
-      seen.add(provider.id);
-      return true;
-    });
-    PROVIDERS.splice(0, PROVIDERS.length, ...filtered);
-  }
-  for (const project of PROJECTS) {
-    if (project.provider === 'lemonade') {
-      project.provider = DEFAULT_PROVIDER_ID;
-      changedProjects = true;
-    }
-  }
-  if (changedProviders) {
-    backupOnce('providers.json');
-    const renamed = Array.from(PROVIDERS).filter((p) => p.id === DEFAULT_PROVIDER_ID);
-    if (renamed.some((p) => p.shared)) saveSharedProviders();
-    if (renamed.some((p) => !p.shared)) saveProviders();
-  }
-  if (changedProjects) {
-    backupOnce('projects.json');
-    saveProjects(PROJECTS);
-  }
 }
 
 function getProvider(id) {
@@ -490,10 +434,6 @@ function deleteChat(projectId, chatId) {
 
 // Free (non-project) chat metas — persisted server-side so recent chats
 // survive across browsers/devices (localStorage was the only home before).
-function loadFreeChats() {
-  return currentWorkspace().freeChats;
-}
-
 function saveFreeChats(list) {
   currentWorkspace().freeChats = Array.from(list);
   currentWorkspace().saveFreeChats();
@@ -1172,7 +1112,7 @@ let MCP_ENABLED = MCP_SERVERS.length > 0;
 // QA only: NOEVIA_QA_ALLOW_LOOPBACK_MCP lets a synthetic server on 127.0.0.1 stand in for a public one.
 async function directoryUrlAllowed(url) {
   if (process.env.NOEVIA_QA_ALLOW_LOOPBACK_MCP === '1' && /^https?:\/\/127\.0\.0\.1:\d+\//.test(url)) return true;
-  return require('./ssrf.cjs').isPublicUrl(url);
+  return isPublicUrl(url);
 }
 // OAuth sign-in for directory servers: one sign-in per account per server (mcp-oauth.cjs).
 // Its URLs come from strangers' metadata, so they must be https (or the QA loopback) and public.
@@ -4187,4 +4127,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { checkAuth, handleRequest, sanitizeChats, MCP_SERVERS, toolboxOffered, ownsFile, projectFolderName, prefill, TOOL_PREFILL_TARGET_MS, isWriteTool, chatWideApproved, pendingApprovals, resolveTools, allToolboxes, mcpCredentialOriginAllowed, toolTokenBudgetFor, MCP_TOOLBOX_MANIFEST, toolboxSummaries, estimateToolTokens, toolCapFor, sanitizeToolboxes, executeToolCall, TOOLBOXES, classifierVerdict, heuristicWantsSmart, heuristicWantsCode, CLASSIFIER_MAX_TOKENS, recordUsage, recordToolUse, readUsage, usageDayKey, USAGE_RETENTION_DAYS };
+module.exports = { handleRequest, sanitizeChats, MCP_SERVERS, toolboxOffered, ownsFile, projectFolderName, prefill, TOOL_PREFILL_TARGET_MS, isWriteTool, chatWideApproved, pendingApprovals, resolveTools, allToolboxes, mcpCredentialOriginAllowed, toolTokenBudgetFor, MCP_TOOLBOX_MANIFEST, toolboxSummaries, estimateToolTokens, toolCapFor, sanitizeToolboxes, executeToolCall, TOOLBOXES, classifierVerdict, heuristicWantsSmart, heuristicWantsCode, CLASSIFIER_MAX_TOKENS, recordUsage, recordToolUse, readUsage, usageDayKey, USAGE_RETENTION_DAYS };
