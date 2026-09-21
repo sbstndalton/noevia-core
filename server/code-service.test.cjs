@@ -38,6 +38,8 @@ function service(extra = {}) {
   const ws = { dir };
   const repoPath = repo();
   const svc = createCodeService({ repos: [{ id: 'noevia', path: repoPath }],
+    // What this deployment gives the agent to run on; a server without it refuses tasks.
+    engine: () => ({ baseUrl: 'http://engine.test/v1', model: 'synthetic-coder' }),
     connect: async () => ({ prompt: async () => ({ stopReason: 'end_turn' }) }), timeoutMs: 50, ...extra });
   return { svc, ws, repoPath };
 }
@@ -150,6 +152,7 @@ test('two tasks waiting at once each get their own answer', async () => {
   const ws = { dir };
   const repoPath = repo();
   const svc = createCodeService({ repos: [{ id: 'noevia', path: repoPath }], timeoutMs: 60000,
+    engine: () => ({ baseUrl: 'http://engine.test/v1', model: 'synthetic-coder' }),
     connect: async ({ handlers }) => ({ prompt: async () => {
       const key = Object.keys(asks).length ? 'b' : 'a';
       asks[key] = handlers.requestPermission({ toolCall: { kind: 'edit', locations: [] },

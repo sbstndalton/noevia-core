@@ -264,7 +264,9 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
       .map((r) => write({ ...r, status: 'interrupted', interruptedAt: now() }));
   }
 
-  return { claim, release, recover, contains, get: read, list, root, BRANCH_PREFIX };
+  // `owner` is public so anything else noevia writes into a workspace (the harness's own
+  // config file) can be handed over the same way the worktree is.
+  return { claim, release, recover, contains, get: read, list, root, owner, BRANCH_PREFIX };
 }
 
 /** Recursive chown, so the harness owns the tree and git's own files inside it. */

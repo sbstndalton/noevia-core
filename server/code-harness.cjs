@@ -32,7 +32,8 @@ const MAX_FILE_BYTES = 8 * 1024 * 1024; // one source file, not a database the a
  *          log?: (entry: object) => void}} deps
  */
 function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now = Date.now, log = () => {},
-  files = defaultFiles }) {
+  files = defaultFiles, pinConfig = require('./code-harness-config.cjs').writeHarnessConfig,
+  engine = () => ({ baseUrl: null, apiKey: null, contextTokens: undefined }) }) {
   /**
    * Start a task. `capabilities` is fixed here and never widens (§4): the job records it, and
    * every later decision is taken against this list, not against anything the agent claims.
@@ -57,11 +58,31 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
     // it outside meant a live proxy token and a branch claimed for good.
     jobs.run(taskId, async (ctx) => {
       try {
-        const session = createSession({ taskId, ctx, workspace, domains, capabilities, harness, model });
+        // A task that named no model runs on whatever this deployment loads, and the identity
+        // records the model that actually ran rather than the absence of a choice.
+        const endpoint = engine();
+        const chosen = model || endpoint.model || null;
+        const session = createSession({ taskId, ctx, workspace, domains, capabilities, harness, model: chosen });
         // Recorded first so a running task is identifiable in the list, not just once it ends.
         ctx.checkpoint({ branch: workspace.branch, task: String(prompt).slice(0, 120) });
+        // The agent's own config file, written by noevia before the agent exists: the gate it
+        // will actually obey, and the only model endpoint it is given. A harness whose config
+        // noevia cannot pin throws here, before anything runs.
+        // A step of the run, not a new event type: the vocabulary is closed on purpose, and
+        // this either happened or the task stops here.
+        ctx.event('step.started', { id: 'harness.config', title: 'Pin the harness configuration' });
+        let pinned;
+        try {
+          pinned = pinConfig({ cwd: workspace.path, owner: workspaces.owner || null, harness, model: chosen,
+            engine: endpoint.baseUrl, apiKey: endpoint.apiKey || null,
+            ...(endpoint.contextTokens ? { contextTokens: endpoint.contextTokens } : {}) });
+        } catch (error) {
+          ctx.event('step.completed', { id: 'harness.config', failed: true, error: String(error.message).slice(0, 300) });
+          throw error;
+        }
+        ctx.event('step.completed', { id: 'harness.config', ...pinned });
         const agent = await connect({
-          taskId, harness, model, cwd: workspace.path, home: workspace.home || null,
+          taskId, harness, model: chosen, cwd: workspace.path, home: workspace.home || null,
           // The adapter pins the agent's own permission config: the spike showed OpenCode's
           // defaults writing silently, and noevia refuses to run a harness whose effective
           // config it cannot pin.
@@ -76,7 +97,7 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
         const meta = session.meta(agent.agent, readUsage(outcome?._meta));
         const scope = codingIdentity({
           harness: meta.harness || harness, harnessVersion: meta.harnessVersion,
-          model, protocolVersion: meta.protocolVersion, capabilities,
+          model: chosen, protocolVersion: meta.protocolVersion, capabilities,
           promptPreparation, sandbox: sandboxKind,
         });
         ctx.event('checkpoint.created', { branch: workspace.branch, task: String(prompt).slice(0, 120),

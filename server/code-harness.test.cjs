@@ -33,6 +33,9 @@ async function run({ script, answers = [], capabilities = [], domains = [], egre
   const asked = [];
   const harness = createCodeHarness({
     jobs, workspaces, egress,
+    // The deployment's model endpoint. A real one is required to start — see the test below
+    // that a server without one refuses rather than running a harness that cannot work.
+    engine: () => ({ baseUrl: 'http://engine.test/v1', model: 'synthetic-coder', apiKey: null, contextTokens: 8192 }),
     askApproval: async (request) => { asked.push(request); return answers.shift() ?? 'deny'; },
   });
   let handlers;
@@ -274,7 +277,7 @@ test('a failure before the harness starts still gives back the workspace and the
       checkpoint: () => { throw new Error('ENOSPC: no space left on device'); },
     })),
   };
-  const harness = createCodeHarness({ jobs: brokenJobs, workspaces, egress, askApproval: async () => 'deny' });
+  const harness = createCodeHarness({ jobs: brokenJobs, workspaces, egress, engine: () => ({ baseUrl: 'http://engine.test/v1', model: 'synthetic-coder' }), askApproval: async () => 'deny' });
   const started = await harness.start({
     repoPath: repo(), prompt: 'fix', capabilities: [ACTIONS.NETWORK], domains: ['a.test'],
     connect: async () => ({ agent: {}, prompt: async () => ({ stopReason: 'end_turn' }) }),

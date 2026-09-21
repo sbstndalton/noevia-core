@@ -71,7 +71,7 @@ function view(job, pending = null) {
  * @param {{ repos: string|Array, connect: Function, egress?: object, now?: ()=>number,
  *           log?: Function, timeoutMs?: number }} deps
  */
-function createCodeService({ repos, connect, egress = null, now = Date.now, log = () => {},
+function createCodeService({ repos, connect, egress = null, engine = undefined, now = Date.now, log = () => {},
   timeoutMs = APPROVAL_TIMEOUT_MS, sandboxKind = process.env.CODE_HARNESS_ENDPOINT ? 'sandbox' : 'spawn',
   harnesses = defaultHarnesses(), treeRoot = process.env.CODE_WORKSPACE_ROOT || null,
   harnessUser = parseUser(process.env.CODE_HARNESS_USER) }) {
@@ -91,7 +91,8 @@ function createCodeService({ repos, connect, egress = null, now = Date.now, log 
       // sandbox deliberately does not).
       const workspaces = createCodeWorkspaces({ dir: workspace.dir, treeRoot, owner: harnessUser, now });
       workspaces.recover();
-      const harness = createCodeHarness({ jobs: store, workspaces, egress, log, now, askApproval });
+      const harness = createCodeHarness({ jobs: store, workspaces, egress, log, now, askApproval,
+        ...(engine ? { engine } : {}) });
       store = { jobs: store, workspaces, harness };
       stores.set(workspace, store);
     }

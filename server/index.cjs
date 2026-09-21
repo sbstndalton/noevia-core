@@ -1647,6 +1647,21 @@ const codeRoutes = require('./routes/code.cjs').createCodeRoutes({
   service: require('./code-service.cjs').createCodeService({
     repos: process.env.CODE_REPOS,
     log: (entry) => console.log('[code]', JSON.stringify(entry)),
+    // Where the agent's model lives, and which one. ACP carries neither, so noevia writes both
+    // into the harness's own config file (`code-harness-config.cjs`); a sandbox has no provider
+    // configuration of its own and would otherwise have nothing to run on. `CODE_ENGINE_URL`
+    // exists because the sandbox may reach the engine by a different name than the web
+    // container does — it is on an internal network of its own.
+    engine: () => {
+      const provider = getProvider(DEFAULT_PROVIDER_ID);
+      const base = (process.env.CODE_ENGINE_URL || provider?.baseUrl || '').replace(/\/+$/, '');
+      return {
+        baseUrl: base ? (/\/v1$/.test(base) ? base : `${base}/v1`) : null,
+        apiKey: process.env.CODE_ENGINE_API_KEY || provider?.apiKey || null,
+        model: autoRoles()?.code || autoRoles()?.smart || LAST_LOADED_MODEL || null,
+        contextTokens: Number(process.env.CODE_CONTEXT_TOKENS) || undefined,
+      };
+    },
     // `CODE_HARNESS_COMMAND` is the ACP agent to run (for example `opencode acp`). Unset, a
     // task cannot start and says so.
     connect: require('./code-acp.cjs').createAcpTransport({ log: (entry) => console.log('[code]', JSON.stringify(entry)) }),
