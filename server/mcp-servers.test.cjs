@@ -7,15 +7,9 @@ const test = require('node:test');
 process.env.UI_DATA_DIR = require('node:fs').mkdtempSync(require('node:path').join(require('node:os').tmpdir(), 'cowork-mcpservers-test-'));
 
 // The parser is the security boundary for credential pass-through, so it is
-// exercised directly rather than through a live server. Each case re-requires
-// index.cjs with a different environment.
-function parseWith(env) {
-  for (const key of ['MCP_SERVERS', 'MCP_SERVER_URL']) delete process.env[key];
-  Object.assign(process.env, env);
-  delete require.cache[require.resolve('./index.cjs')];
-  const mod = require('./index.cjs');
-  return mod.MCP_SERVERS;
-}
+// exercised directly (mcp-servers.cjs) with the environment handed in; no server boots.
+const { parseMcpServers, parseEnabledToolboxes, createToolboxOffered } = require('./mcp-servers.cjs');
+const parseWith = (env) => parseMcpServers(env);
 
 test('MCP_SERVER_URL still means one Nextcloud server that receives the credential', () => {
   const servers = parseWith({ MCP_SERVER_URL: 'http://nextcloud-mcp:8000/mcp' });
@@ -65,8 +59,8 @@ test('every box names a server, and boxes for an unconfigured one are not offere
   // server this instance does not run (Tavily is optional). What must hold is
   // that every box names SOME server, and that a box whose server is absent is
   // filtered out rather than offered as a promise nothing can keep.
-  parseWith({ MCP_SERVER_URL: 'http://nextcloud-mcp:8000/mcp' });
-  const { MCP_TOOLBOX_MANIFEST, MCP_SERVERS } = require('./index.cjs');
+  const MCP_SERVERS = parseWith({ MCP_SERVER_URL: 'http://nextcloud-mcp:8000/mcp' });
+  const MCP_TOOLBOX_MANIFEST = require('./mcp-toolbox-manifest.cjs').buildToolboxManifest({ features: { enabled: () => false } });
   const configured = new Set(MCP_SERVERS.map((s) => s.id));
   assert.deepEqual([...configured], ['nextcloud']);
 
@@ -83,12 +77,7 @@ test('every box names a server, and boxes for an unconfigured one are not offere
 
 // ── which boxes are offered ──────────────────────────────────────────────
 
-function offeredWith(env) {
-  for (const key of ['ENABLED_TOOLBOXES']) delete process.env[key];
-  Object.assign(process.env, env);
-  delete require.cache[require.resolve('./index.cjs')];
-  return require('./index.cjs').toolboxOffered;
-}
+const offeredWith = (env) => createToolboxOffered(parseEnabledToolboxes(env));
 
 test('unset ENABLED_TOOLBOXES offers every box', () => {
   const offered = offeredWith({});
