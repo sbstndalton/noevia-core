@@ -22,12 +22,24 @@ function supports(name) {
 
 function enabled() { return !!process.env.DOCLING_BASE_URL; }
 
+/** The last path segment, which is all the worker needs and all it will accept. */
+function documentName(name) {
+  const last = String(name || '').split(/[\\/]/).pop() || 'document';
+  // 200 is the worker's own limit; keep the end, because that is where the suffix is.
+  return last.length > 200 ? last.slice(-200) : last;
+}
+
 async function extractDocument(name, bytes, { url = process.env.DOCLING_BASE_URL, fetchImpl = fetch } = {}) {
   if (!url) throw new Error('Document extraction is not configured.');
   const response = await fetchImpl(`${url.replace(/\/+$/, '')}/extract`, {
     method: 'POST',
     redirect: 'error',
-    headers: { 'Content-Type': 'application/octet-stream', 'X-Document-Name': String(name).slice(0, 200) },
+    // The worker reads the suffix and nothing else, and refuses a name that could be a path —
+    // rightly, since it must never treat one as a path. noevia's own names ARE paths
+    // ("Documents/Tax Return 2024/W-2.pdf"), so send the last segment. Sending the whole path
+    // made every document in a folder fail with HTTP 400 while a bare filename worked, which
+    // is why a synthetic test did not catch it (2026-09-21).
+    headers: { 'Content-Type': 'application/octet-stream', 'X-Document-Name': documentName(name) },
     body: bytes,
     // Measured on DaServer (2 CPUs, CPU-only torch), not assumed:
     //   scanned prose, OCR   3.4 s/page
@@ -43,6 +55,9 @@ async function extractDocument(name, bytes, { url = process.env.DOCLING_BASE_URL
     // 503 and 415 are the two a user can act on, so they say something useful;
     // everything else is a retry.
     if (response.status === 503) throw new Error('Document extraction is busy; refresh to retry.');
+    // A 400 means noevia sent something the worker refuses. Retrying sends the same thing, so
+    // it is reported as what it is rather than as a transient outage to keep retrying.
+    if (response.status === 400) throw Object.assign(new Error('This document could not be sent for reading; the original is stored.'), { permanent: true });
     if (response.status === 415) throw Object.assign(new Error(`This file type cannot be read yet; the original is stored.`), { permanent: true });
     if (response.status === 422) throw Object.assign(new Error('This document could not be read; the original is stored.'), { permanent: true });
     throw new Error(`Document extraction unavailable (HTTP ${response.status}); refresh to retry.`);
@@ -52,4 +67,4 @@ async function extractDocument(name, bytes, { url = process.env.DOCLING_BASE_URL
   return body;
 }
 
-module.exports = { extractDocument, supports, enabled, VERSION, FORMATS };
+module.exports = { extractDocument, supports, enabled, documentName, VERSION, FORMATS };

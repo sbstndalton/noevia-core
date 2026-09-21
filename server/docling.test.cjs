@@ -146,3 +146,26 @@ test('with Docling off, the PDF-only gate and the pdf.js path are unchanged', as
   assert.deepEqual(documents.documentExtensions(), ['.pdf']);
   await assert.rejects(() => documents.extractDocumentText('a.xlsx', Buffer.from('x')), (e) => e.status === 400);
 });
+
+test('a storage path is sent as a file name, because the worker refuses anything path-shaped', async () => {
+  // Found in production: every document inside a folder failed with HTTP 400 while a file at
+  // the root worked. noevia's names are paths; the worker reads the suffix and rejects "/".
+  const sent = [];
+  const fetchImpl = async (url, init) => {
+    sent.push(init.headers['X-Document-Name']);
+    return { ok: true, json: async () => ({ pages: [{ page: 1, text: 'x' }], total: 1 }) };
+  };
+  for (const name of ['Documents/Important Documents/Tax Return 2024/2024 W-2.pdf', 'plain.pdf', 'a\\b\\c.PDF']) {
+    await docling.extractDocument(name, Buffer.from("x"), { url: 'http://docling.test', fetchImpl });
+  }
+  assert.deepEqual(sent, ['2024 W-2.pdf', 'plain.pdf', 'c.PDF']);
+  for (const name of sent) assert.ok(!name.includes('/') && !name.includes('\\') && name.length <= 200);
+});
+
+test('a refusal noevia caused is not reported as an outage to keep retrying', async () => {
+  const fetchImpl = async () => ({ ok: false, status: 400, json: async () => ({}) });
+  await assert.rejects(
+    () => docling.extractDocument("x.pdf", Buffer.from("x"), { url: 'http://docling.test', fetchImpl }),
+    (error) => error.permanent === true && !/refresh to retry/.test(error.message),
+  );
+});
