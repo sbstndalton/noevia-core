@@ -93,14 +93,6 @@ const exportRoutes = require('./routes/export.cjs').createExportRoutes({ json, w
 const retentionLists = () => ({ freeChats: Array.from(FREE_CHATS), projects: PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)) });
 const removeRetainedChat = ({ projectId, id }) => (projectId ? deleteChat(projectId, id) : deleteFreeChat(id));
 const accountRoutes = require('./routes/account.cjs').createAccountRoutes({ json, readJson, dir: () => currentWorkspace().dir, chatLists: retentionLists, removeChat: removeRetainedChat });
-// Delete-old-chats sweep (chat-retention.cjs): runs as the user's workspace loads, at most hourly.
-function sweepRetention() {
-  const retention = require('./chat-retention.cjs');
-  const dir = currentWorkspace().dir, settings = retention.read(dir);
-  if (!retention.sweepDue(settings)) return;
-  for (const chat of retention.expired({ ...retentionLists(), days: settings.days })) removeRetainedChat(chat);
-  retention.markSwept(dir);
-}
 const importRoutes = require('./routes/import.cjs').createImportRoutes({
   json, readBody: (req, limit) => readBody(req, limit), newId: () => `c-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
   audit: (action, actor, detail) => authService.audit(action, actor, actor, detail),
@@ -576,6 +568,18 @@ const authRoutes = require('./routes/auth.cjs').createAuthRoutes({
 // The user's own storage connection: read, save, test, browse, one folder, the Nextcloud login flow
 // (routes/storage.cjs). fetch is resolved per call: tests swap the global at runtime.
 const storageRoutes = require('./routes/storage.cjs').createStorageRoutes({ json, readJson, authService, storageClient, endpointApproved, fetch: (...args) => globalThis.fetch(...args), crypto });
+// The human's answer to a pending write (routes/approvals.cjs); the gate itself is approvals.cjs.
+const approvalRoutes = require('./routes/approvals.cjs').createApprovalRoutes({ json, readBody, pendingApprovals, requestScope });
+// The workspace view, free-chat metas, context meters and transcripts (routes/chat-lists.cjs); it also
+// runs the delete-old-chats sweep as the workspace loads, at most hourly.
+const chatListRoutes = require('./routes/chat-lists.cjs').createChatListRoutes({
+  json, readBody, currentWorkspace, PROJECTS, FREE_CHATS, diaryExtras, crypto, STORED_HISTORY_BYTES, STORED_HISTORY_CAP,
+  chatLists: retentionLists, removeChat: removeRetainedChat, store: projectStore,
+});
+// The reasoning-effort default and per-project resolution (routes/reasoning-settings.cjs).
+const reasoningSettingsRoutes = require('./routes/reasoning-settings.cjs').createReasoningSettingsRoutes({ json, readBody, authService, getProject, getProvider, reasoningEffort, DEFAULT_PROVIDER_ID });
+// GET /api/health: the default provider, the Diary sidecar and retrieval (routes/health.cjs).
+const healthRoutes = require('./routes/health.cjs').createHealthRoutes({ json, fetchJson, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, DIARY_BASE, diaryHeaders, authService, rag });
 // GET /api/toolboxes: the picker view (routes/toolboxes.cjs). MCP state is read at call time.
 const toolboxRoutes = require('./routes/toolboxes.cjs').createToolboxRoutes({
   discoverMcpTools: () => discoverMcpTools(), toolboxSummaries, json,
@@ -634,153 +638,24 @@ async function handleRequestScoped(req, res) {
     if (await projectRoutes(req, res, { path: p, authn, url })) return;
     if (await authRoutes.account(req, res, { path: p, authn })) return;
     if (await storageRoutes(req, res, { path: p, authn })) return;
-    const approvalMatch = p.match(/^\/api\/tool-approvals\/([^/]+)$/);
-    if (approvalMatch && req.method === 'POST') {
-      const id = decodeURIComponent(approvalMatch[1]);
-      const raw = await readBody(req);
-      let body;
-      try { body = JSON.parse(raw); } catch { return json(res, 400, { error: 'invalid JSON' }); }
-      const pending = pendingApprovals.get(id);
-      // Already decided, timed out, or never existed — all the same answer, so
-      // a stale id cannot be used to probe which approvals are outstanding.
-      if (!pending) return json(res, 404, { error: 'no such pending approval' });
-      // The approval must come from the user whose conversation it is. Without
-      // this, any signed-in member could approve another member's write.
-      const userId = requestScope.getStore()?.workspace?.userId || null;
-      if (!userId || pending.userId !== userId) return json(res, 404, { error: 'no such pending approval' });
-      if (!pending.decide(String(body.decision || ''))) {
-        return json(res, 400, { error: "decision must be 'approve', 'deny' or 'approve_all'" });
-      }
-      return json(res, 200, { ok: true });
-    }
+    if (await approvalRoutes(req, res, { path: p, authn })) return;
 
     if (await toolboxRoutes(req, res, { path: p, authn })) return;
 
-    if (p === '/api/workspace') {
-      try { sweepRetention(); } catch (e) { console.warn('[retention] sweep failed:', e?.message || e); }
-      // PROJECTS is served raw everywhere else; here it crosses to the client,
-      // so chats[] must be sanitized exactly as loadChats does.
-      return json(res, 200, {
-        projects: PROJECTS.filter(proj => !diaryExtras.internalProject(proj)).map((proj) => ({ ...proj, chats: sanitizeChats(proj.chats) })),
-        freeChats: sanitizeChats(FREE_CHATS),
-      });
-    }
+    if (await chatListRoutes(req, res, { path: p, authn })) return;
 
     if (await providerRoutes(req, res, { path: p, authn })) return;
 
-    // ── Projects CRUD ──
     if (authn && await usageRoutes(req, res, { path: p, authn })) return;
-    const windowMatch=p.match(/^\/api\/chats\/([^/]+)\/context-window$/);
-    if(windowMatch && req.method==='GET') return json(res,200,{meter:require('./chat-context.cjs').read(currentWorkspace().dir,decodeURIComponent(windowMatch[1])).meter||null});
+    if (await reasoningSettingsRoutes(req, res, { path: p, authn, url })) return;
 
-    if (p === '/api/reasoning-settings') {
-      const globalDefault = () => authService.db.prepare("SELECT value FROM settings WHERE key='reasoning_effort_default'").get()?.value || 'default';
-      if (req.method === 'GET') {
-        const project = url.searchParams.has('projectId') ? getProject(url.searchParams.get('projectId')) : null;
-        if (url.searchParams.has('projectId') && !project) return json(res,404,{error:'no such project'});
-        const effort = reasoningEffort.resolveEffort(project,globalDefault());
-        const provider = getProvider(project?.provider || DEFAULT_PROVIDER_ID);
-        return json(res,200,{default:globalDefault(),effort,mode:reasoningEffort.modeFor(provider,project?.model || '',effort),admin:authn.user.role === 'admin'});
-      }
-      if (req.method === 'PUT') {
-        if (authn.user.role !== 'admin') return json(res,403,{error:'Administrator required'});
-        let body; try { body = JSON.parse(await readBody(req)); } catch { return json(res,400,{error:'invalid JSON'}); }
-        if (!reasoningEffort.validEffort(body.default)) return json(res,400,{error:'default must be default, low or high'});
-        authService.db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('reasoning_effort_default',?)").run(body.default);
-        authService.audit('reasoning.default',authn.user.id,null,{effort:body.default});
-        return json(res,200,{default:body.default});
-      }
-      return json(res,405,{error:'Method not allowed'});
-    }
-
-    // ── Free-chat metas (server-side so they survive browser switches) ──
-    if (p === '/api/freechats') {
-      if (req.method === 'GET') return json(res, 200, { chats: FREE_CHATS });
-      if (req.method === 'POST') {
-        const raw = await readBody(req);
-        try {
-          const body = JSON.parse(raw);
-          if (!Array.isArray(body.chats)) return json(res, 400, { error: 'chats array required' });
-          const nextFreeChats = body.chats
-            .filter((c) => c && typeof c.id === 'string')
-            .slice(0, require('./chat-lists.cjs').LIST_CAP)
-            .map((c) => ({
-              id: c.id.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80),
-              title: String(c.title || 'New chat').slice(0, 120),
-              updatedAt: typeof c.updatedAt === 'number' ? c.updatedAt : Date.now(),
-              preview: String(c.preview || '').slice(0, 200),
-              pinned: c.pinned === true,
-              archived: c.archived === true,
-            }));
-          const lists = require('./chat-lists.cjs');
-          FREE_CHATS.splice(0, FREE_CHATS.length, ...lists.mergeChats(Array.from(FREE_CHATS), nextFreeChats, lists.readTombstones(currentWorkspace().dir)));
-          saveFreeChats(FREE_CHATS);
-          return json(res, 200, { ok: true });
-        } catch {
-          return json(res, 400, { error: 'invalid JSON' });
-        }
-      }
-    }
-
-    const freeDel = p.match(/^\/api\/freechats\/([^/]+)$/);
-    if (freeDel && req.method === 'DELETE') {
-      const removed = deleteFreeChat(decodeURIComponent(freeDel[1]));
-      return json(res, removed ? 200 : 404, removed ? { ok: true } : { error: 'no such chat' });
-    }
-
-    if (p === '/api/health') {
-      const defaultProvider = getProvider(DEFAULT_PROVIDER_ID);
-      const diaryEnabled = authService.diaryEnabled(authn.user.id);
-      const [inference, diary] = await Promise.allSettled([
-        fetchJson(`${defaultProvider.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/models`, { headers: providerHeaders(defaultProvider) }, 5000),
-        diaryEnabled ? fetchJson(`${DIARY_BASE}/api/health`, { headers: diaryHeaders() }, 5000) : Promise.resolve({ ok: false }),
-      ]);
-      return json(res, 200, {
-        inferenceUp: inference.status === 'fulfilled' && inference.value.ok,
-        lemonadeUp: inference.status === 'fulfilled' && inference.value.ok,
-        diaryUp: diaryEnabled ? diary.status === 'fulfilled' && diary.value.ok : null,
-        // True when project-file retrieval can run (native deps present).
-        // False means RAG is silently degraded to keyword-only context.
-        ragAvailable: rag.ragAvailable(),
-      });
-    }
+    if (await healthRoutes(req, res, { path: p, authn })) return;
 
     if (await modelRoutes(req, res, { path: p, authn, url })) return;
 
     if (await diaryRoutes.diary(req, res, { path: p, authn, url })) return;
 
     if (await chatRoutes(req, res, { path: p, authn })) return;
-
-    // Unused legacy spaces endpoints removed with the spaces UI (v4).
-
-    const historyMatch = p.match(/^\/api\/chats\/([^/]+)\/history$/);
-    if (historyMatch) {
-      const spaceId = decodeURIComponent(historyMatch[1]);
-      const revisionOf = (history) => crypto.createHash('sha256').update(JSON.stringify(history)).digest('hex');
-      if (req.method === 'GET') { const history = readHistory(spaceId); return json(res, 200, { history, revision: revisionOf(history) }); }
-      if (req.method === 'POST') {
-        // A reply that finishes after its chat was deleted must not write the transcript back.
-        if (require('./chat-lists.cjs').readTombstones(currentWorkspace().dir).has(spaceId)) return json(res, 410, { error: 'This chat was deleted.' });
-        let raw;
-        try { raw = await readBody(req, STORED_HISTORY_BYTES); }
-        catch (e) { return json(res, e.status || 400, { error: e.status === 413 ? 'This chat is too large to save; start a new chat to keep going.' : 'could not read the chat' }); }
-        try {
-          const body = JSON.parse(raw);
-          // Optimistic concurrency: a save based on an older copy (another device saved meanwhile)
-          // gets the current copy back to merge. Saves without a base revision are accepted as before.
-          if (typeof body.baseRevision === 'string') {
-            const current = readHistory(spaceId);
-            const revision = revisionOf(current);
-            if (body.baseRevision !== revision) return json(res, 409, { error: 'This chat changed on another device.', history: current, revision });
-          }
-          const next = Array.isArray(body.history) ? body.history.slice(-STORED_HISTORY_CAP) : [];
-          writeHistory(spaceId, next);
-          return json(res, 200, { ok: true, revision: revisionOf(next) });
-        } catch {
-          return json(res, 400, { error: 'invalid JSON' });
-        }
-      }
-    }
 
     // Static files with SPA fallback.
     const found = staticFiles.resolve(p);
