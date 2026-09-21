@@ -54,8 +54,9 @@ function llamaRerankBackend({ baseUrl, model = null, apiKey = null, fetchImpl = 
  *     next-token preference among the permitted tokens at that position, up to float rounding.
  *  2. `bounded`: some permitted tokens were not returned (the server drops p = 0 entries), but the
  *     mass outside the returned label tokens (the residual) is at most `maxResidual`. Returned
- *     labels carry their measured ratio; each unobserved label carries an interval [0, bound], not a
- *     measured zero. Accepted only if the chosen label beats every other label's upper bound.
+ *     labels carry an observed-normalized ratio, not a complete-distribution probability.
+ *     Bounds account for missing mass in both the numerator and denominator. Unobserved labels
+ *     have intervals, not measured zeros. A choice must remain best under every allowed allocation.
  *  3. invalid / unavailable: thrown (the answer-position check failed, a label is not one token,
  *     the residual is too large, an exact tie, empty results). decide() then uses the fallback.
  *  4. The calibrated probability that the DECISION IS CORRECT is none of the above. It is fitted
@@ -115,7 +116,7 @@ function llamaLogitBackend({ baseUrl, fetchImpl = globalThis.fetch, nProbs = 50,
     async decide(request, { signal } = {}) {
       const t0 = now();
       const opts = request.options;
-      const diagnostics = { contract: 'equal-bias-v3', runtime: null, labels: {}, request1: null, request2: null, observed: [], unobserved: [], unobservedVariants: [], unsupportedVariants: [],
+      const diagnostics = { contract: 'equal-bias-v4', runtime: null, labels: {}, request1: null, request2: null, observed: [], unobserved: [], unobservedVariants: [], unsupportedVariants: [],
         labelMassAtAnswer: null, residual: null, readout: null, rejection: null, timings: {} };
       const fail = (reason) => { diagnostics.rejection = reason; diagnostics.readout = 'invalid'; diagnostics.timings.totalMs = now() - t0; return Object.assign(Error(`readout invalid: ${reason}`), { diagnostics }); };
       if (!opts.length || opts.length > LETTERS.length) throw fail('option count');
@@ -150,6 +151,16 @@ function llamaLogitBackend({ baseUrl, fetchImpl = globalThis.fetch, nProbs = 50,
       const top2 = r2.completion_probabilities?.[0]?.top_probs || [];
       diagnostics.request2 = { ms: now() - t2, top: top2.map((t) => ({ id: t.id, token: t.token, prob: t.prob })) };
       if (!top2.length) throw fail('no probabilities returned (request 2)');
+      // Reject malformed distributions before computing a residual or conditional bound.
+      const returnedIds = new Set();
+      for (const t of top2) {
+        if (!Number.isInteger(t.id) || !Number.isFinite(t.prob) || t.prob < 0 || t.prob > 1)
+          throw fail('invalid token probability (request 2)');
+        if (returnedIds.has(t.id)) throw fail('duplicate token id (request 2)');
+        returnedIds.add(t.id);
+      }
+      if (top2.reduce((sum, t) => sum + t.prob, 0) > 1 + 1e-7)
+        throw fail('returned probability mass exceeds one (request 2)');
       const got = new Map(top2.filter((t) => owner.has(t.id)).map((t) => [t.id, t.prob]));
       const mass = opts.map(() => 0);
       for (const [id, p] of got) mass[owner.get(id)] += p;
@@ -162,14 +173,26 @@ function llamaLogitBackend({ baseUrl, fetchImpl = globalThis.fetch, nProbs = 50,
       if (diagnostics.residual > maxResidual) throw fail(`residual mass ${diagnostics.residual.toExponential(2)} > ${maxResidual}`);
       // Ratios among observed labels; any unobserved token could hold up to the residual.
       const ratio = mass.map((m) => m / labelTotal);
-      const bound = diagnostics.residual / labelTotal;
       const readout = diagnostics.unobservedVariants.length ? 'bounded' : 'exact';
       const ranked = ratio.map((p, i) => [p, i]).sort((a, b) => b[0] - a[0]);
       if (ranked.length > 1 && Math.abs(ranked[0][0] - ranked[1][0]) < 1e-9) throw fail('exact tie');
       const best = ranked[0][1];
-      // Under a bound, the choice must survive every other label taking its maximum possible share.
-      const upper = (i) => ratio[i] + (diagnostics.unobservedVariants.some((v) => v.option === opts[i].id) ? bound : 0);
-      if (readout === 'bounded' && opts.some((_, i) => i !== best && upper(i) >= ratio[best])) throw fail('choice not robust to unobserved-token bound');
+      const missing = opts.map((o) => diagnostics.unobservedVariants.some((v) => v.option === o.id));
+      // Let S be observed permitted mass and R the unallocated residual. The true conditional
+      // share is (mass[i] + x[i]) / (S + sum(x)), where x is nonnegative, sums to <= R,
+      // and x[i] = 0 for an option whose variants were all observed. R may contain non-labels.
+      // A competitor can dilute an observed option; its observed ratio is NOT a lower bound.
+      const bounds = mass.map((m, i) => {
+        const missingElsewhere = missing.some((yes, j) => yes && j !== i);
+        const lower = m / (labelTotal + (missingElsewhere ? diagnostics.residual : 0));
+        const upper = missing[i] ? (m + diagnostics.residual) / (labelTotal + diagnostics.residual) : ratio[i];
+        return [Math.max(0, lower), Math.min(1, upper)];
+      });
+      // Ordering has the same denominator for every option. Compare raw masses, rather than
+      // independently maximized conditional intervals, to test robust selection without over-rejection.
+      if (readout === 'bounded' && opts.some((_, i) => i !== best &&
+        mass[i] + (missing[i] ? diagnostics.residual : 0) >= mass[best]))
+        throw fail('choice not robust to unobserved-token bound');
       diagnostics.readout = readout;
       diagnostics.timings.totalMs = now() - t0;
       const observedIdx = opts.map((_, i) => i).filter((i) => mass[i] > 0);
@@ -178,7 +201,8 @@ function llamaLogitBackend({ baseUrl, fetchImpl = globalThis.fetch, nProbs = 50,
         confidence: ratio[best], // relative readout share, NOT a calibrated probability of being right
         metadata: { calibrated: false, readout,
           ratios: Object.fromEntries(observedIdx.map((i) => [opts[i].id, ratio[i]])),
-          bounds: Object.fromEntries(opts.map((o, i) => [o.id, mass[i] > 0 ? [ratio[i], upper(i)] : [0, bound]])),
+          bounds: Object.fromEntries(opts.map((o, i) => [o.id, bounds[i]])),
+          boundsSemantics: 'conditional-on-all-permitted-tokens',
           diagnostics } };
     },
   };
