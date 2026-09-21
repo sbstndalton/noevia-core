@@ -74,3 +74,27 @@ test('the llama rerank backend maps /v1/rerank indices back to item ids and refu
   const partial = llamaRerankBackend({ baseUrl: 'http://engine', fetchImpl: async () => ({ ok: true, json: async () => ({ results: [{ index: 0, relevance_score: 1 }] }) }) });
   await assert.rejects(partial.decide(req()), /partial/);
 });
+
+test('a backend past its deadline is cancelled through its signal', async () => {
+  let aborted = false;
+  const slow = fake((_req, { signal }) => new Promise((resolve) => { signal.addEventListener('abort', () => { aborted = true; resolve(null); }); }));
+  const d = createDecisions({ backends: { slow }, chains: { 'rag.rerank': ['slow'] } });
+  const r = await d.decide(req({ constraints: { deadlineMs: 30 } }));
+  assert.equal(r.source, 'fallback'); assert.equal(aborted, true);
+});
+
+test('llama-logit reads option letters from next-token log-probabilities, not sampled text', async () => {
+  const { llamaLogitBackend } = require('./backends.cjs');
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    calls.push(url);
+    const body = url.endsWith('/apply-template') ? { prompt: 'P' }
+      : { completion_probabilities: [{ top_logprobs: [{ token: '<|channel>', logprob: -0.1 }, { token: ' B', logprob: -0.5 }, { token: 'A', logprob: -2 }, { token: 'x', logprob: -9 }] }], timings: { prompt_n: 42 } };
+    return { ok: true, json: async () => body };
+  };
+  const b = llamaLogitBackend({ baseUrl: 'http://w/v1', fetchImpl });
+  const r = await b.decide({ kind: 'choice', question: 'q', context: { stateText: 's' }, options: [{ id: 'keep', label: 'Keep' }, { id: 'switch', label: 'Switch' }, { id: 'ask', label: 'Ask' }] });
+  assert.equal(r.selected, 'switch');
+  assert.ok(r.metadata.probs.switch > r.metadata.probs.keep && r.metadata.probs.keep > r.metadata.probs.ask, 'an unseen letter scores below every seen one');
+  assert.deepEqual(calls, ['http://w/apply-template', 'http://w/completion']);
+});

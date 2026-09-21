@@ -33,7 +33,7 @@ function createDecisions({ backends, chains = {}, log = () => {}, now = Date.now
       if (backend.locality === 'remote' && request.context?.cloud !== 'allowed') continue;
       let result;
       try {
-        result = await withDeadline(backend.decide(request), request.constraints.deadlineMs);
+        result = await withDeadline((signal) => backend.decide(request, { signal }), request.constraints.deadlineMs);
       } catch (error) {
         if (error?.deadline) { const n = (misses.get(id) || 0) + 1; misses.set(id, n); if (n >= 3) { benched.set(id, now() + 60_000); misses.set(id, 0); } }
         log({ purpose: request.purpose, backend: id, failed: error?.deadline ? 'deadline' : String(error?.message || error).slice(0, 200) });
@@ -62,9 +62,12 @@ function createDecisions({ backends, chains = {}, log = () => {}, now = Date.now
 
 function withReason(result, reason) { return { ...result, metadata: { ...result.metadata, fellBack: reason } }; }
 
-function withDeadline(promise, ms) {
+// The backend gets an AbortSignal that fires at the deadline, so an HTTP call or worker job it
+// started is cancelled rather than left running after its answer stopped mattering.
+function withDeadline(start, ms) {
+  const ctl = new AbortController();
   let timer;
-  return Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(Object.assign(Error('deadline'), { deadline: true })), ms); })])
+  return Promise.race([start(ctl.signal), new Promise((_, reject) => { timer = setTimeout(() => { ctl.abort(); reject(Object.assign(Error('deadline'), { deadline: true })); }, ms); })])
     .finally(() => clearTimeout(timer));
 }
 
