@@ -68,6 +68,27 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
       });
     }
 
+    // The default mode new projects start in, and (on request) a one-off switch of every existing
+    // project of this user to it. Per workspace, so tenants never touch each other's projects.
+    if (p === '/api/routing-default') {
+      const ws = currentWorkspace();
+      if (req.method === 'GET') return json(res, 200, { routing: ws.preferences?.defaultRouting === 'manual' ? 'manual' : 'auto' });
+      if (req.method === 'PUT') {
+        let body;
+        try { body = JSON.parse(await readBody(req)); } catch { return json(res, 400, { error: 'invalid JSON' }); }
+        if (body?.routing !== 'auto' && body?.routing !== 'manual') return json(res, 400, { error: "routing must be 'auto' or 'manual'" });
+        ws.preferences = { ...(ws.preferences || {}), defaultRouting: body.routing };
+        ws.savePreferences();
+        let updated = 0;
+        if (body.applyToExisting === true) {
+          for (const project of ws.projects) if (project.routing !== body.routing) { project.routing = body.routing; project.updatedAt = Date.now(); updated++; }
+          if (updated) ws.saveProjects();
+        }
+        return json(res, 200, { routing: body.routing, updated });
+      }
+      return json(res, 405, { error: 'method not allowed' });
+    }
+
     if (p === '/api/auto-roles') {
       if (req.method === 'GET') {
         const roles = autoRoles();

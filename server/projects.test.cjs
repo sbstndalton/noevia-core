@@ -129,4 +129,7 @@ test('new projects default to Auto routing; Manual only when asked for', async (
   const f = fixture();
   assert.equal((await f.store.createProject({ name: 'A' })).routing, 'auto');
   assert.equal((await f.store.createProject({ name: 'B', routing: 'manual' })).routing, 'manual');
+  f.workspace.preferences = { defaultRouting: 'manual' };
+  assert.equal((await f.store.createProject({ name: 'C' })).routing, 'manual', 'the user\'s default applies');
+  assert.equal((await f.store.createProject({ name: 'D', routing: 'auto' })).routing, 'auto');
 });

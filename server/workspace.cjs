@@ -105,6 +105,8 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets) {
       providers: [],
       freeChats: readJson(path.join(dir, 'free-chats.json'), []),
       autoRoles: readJson(path.join(dir, 'auto-roles.json'), null),
+      // Per-user settings with no better home. defaultRouting: what new projects start as.
+      preferences: readJson(path.join(dir, 'preferences.json'), {}) || {},
       saveProjects() { atomicJson(path.join(dir, 'projects.json'), { projects: this.projects }); },
       saveProviders() {
         const encode = p => ({ ...p, apiKey: secrets ? secrets.encrypt(p.apiKey) : p.apiKey });
@@ -148,6 +150,7 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets) {
         return true;
       },
       saveFreeChats() { atomicJson(path.join(dir, 'free-chats.json'), this.freeChats); },
+      savePreferences() { atomicJson(path.join(dir, 'preferences.json'), this.preferences); },
       saveAutoRoles() { atomicJson(path.join(dir, 'auto-roles.json'), this.autoRoles); },
       historyPath(id) { return path.join(dir, `history-${String(id).replace(/[^a-zA-Z0-9_-]/g, '')}.json`); },
       usagePath() { return path.join(dir, 'usage.json'); },

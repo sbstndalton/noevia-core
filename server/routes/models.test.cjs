@@ -7,7 +7,7 @@ const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
 const { createModelRoutes } = require('./models.cjs');
 
-function fixture({ env = {}, enabled = true, kind = 'llamacpp', manager = {} } = {}) {
+function fixture({ env = {}, enabled = true, kind = 'llamacpp', manager = {}, workspace = { userId: 'u1' } } = {}) {
   const sent = [], headers = [], fetched = [];
   const scan = new Map();
   let refreshes = 0;
@@ -35,7 +35,7 @@ function fixture({ env = {}, enabled = true, kind = 'llamacpp', manager = {} } =
     createVisionProbe: () => async () => ({ supported: true }),
     reportedTokenRate: (g) => g.tokens_per_second ?? null,
     missingRoles: (r, catalogue) => ({ roles: r, catalogue }),
-    currentWorkspace: () => ({ userId: 'u1' }),
+    currentWorkspace: () => workspace,
     service: {
       modelScanCache: scan, refreshModelScan: () => { refreshes += 1; },
       autoRoles: () => roles.current, setAutoRoles: (next) => { roles.current = next; }, ensureRolesLoaded: () => { roles.warmed = true; },
@@ -159,4 +159,22 @@ test('engine-specific routes say what is unavailable and guard the method', asyn
   assert.deepEqual(native.sent.pop(), { status: 405, body: { error: 'Method not allowed' } });
   await native.call('POST', '/api/models/autotune/cancel', undefined, 'admin');
   assert.deepEqual(native.sent.pop(), { status: 200, body: { cancelled: true } });
+});
+
+test('the default model mode round-trips, and only an explicit apply switches existing projects', async () => {
+  let saves = 0;
+  const workspace = { userId: 'u1', preferences: {}, projects: [{ id: 'a', routing: 'manual' }, { id: 'b', routing: 'auto' }],
+    savePreferences() {}, saveProjects() { saves += 1; } };
+  const f = fixture({ workspace });
+  await f.call('GET', '/api/routing-default');
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { routing: 'auto' } });
+  await f.call('PUT', '/api/routing-default', { routing: 'manual' });
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { routing: 'manual', updated: 0 } });
+  assert.equal(workspace.projects[1].routing, 'auto', 'changing the default alone rewrites nothing');
+  await f.call('PUT', '/api/routing-default', { routing: 'auto', applyToExisting: true });
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { routing: 'auto', updated: 1 } });
+  assert.deepEqual(workspace.projects.map((p) => p.routing), ['auto', 'auto']);
+  assert.equal(saves, 1);
+  await f.call('PUT', '/api/routing-default', { routing: 'fast' });
+  assert.equal(f.sent.pop().status, 400);
 });

@@ -142,7 +142,9 @@ function createProjectStore({
       model: typeof body.model === 'string' && body.model ? body.model : undefined,
       provider: typeof body.provider === 'string' && body.provider ? body.provider : undefined,
       reasoningEffort: body.reasoningEffort,
-      routing: body.routing === 'manual' ? 'manual' : 'auto', // default Auto (the user's call, 2026-09-21); unconfigured Auto uses the project model
+      // Explicit choice, else the user's default (Models → Routing), else Auto (the user's call,
+      // 2026-09-21). Unconfigured Auto uses the project model.
+      routing: body.routing === 'manual' || body.routing === 'auto' ? body.routing : currentWorkspace()?.preferences?.defaultRouting === 'manual' ? 'manual' : 'auto',
       modes,
       toolboxes: sanitizeToolboxes(body.toolboxes) || [...defaultToolboxes()], // step 14: core only by default
       // (files normalization below is shared with the config route's RAG bookkeeping)
