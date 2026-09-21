@@ -34,7 +34,7 @@ function fixture(t, { head = true, gen = { none: 20, mtp: 40, 'mtp-8': 46, 'mtp-
     calibrationStatePath: path.join(dir, 'cal.json'), autotuneStatePath: path.join(dir, 'tune.json'), autotuneTablePath: path.join(dir, 'table.json'),
     autoconfig: {}, calibrationOptions: { sleep: async () => {}, readMemory: () => 20 },
     autotuneOptions: { sleep: async () => {}, readMemory: () => 20, identityFor: async () => ({ arch: 'qwen35', quant: 'Q5_K_M', hardware: 'synthetic-apu' }), ...(calibrateSpy ? { calibrate: calibrateSpy } : {}) } });
-  return { manager, ini, original, router, section, dir };
+  return { manager, ini, original, router, section, dir, fetchJson };
 }
 async function finished(manager) {
   for (let i = 0; i < 5000; i++) { const job = manager.autotune.status().body.job; if (job && job.status !== 'running') return job; await new Promise((r) => setImmediate(r)); }
@@ -217,4 +217,65 @@ test('an expired partial is dropped, and resuming says it found nothing to reuse
     assert.equal(state.partial.drop, undefined, 'an expired partial is removed, not merely ignored');
     assert.ok(tuner._partialFor('keep').spec.a, 'a fresh partial is still reused');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('the run narrates itself line by line: what it tries, with which settings, and what came of it', async (t) => {
+  // A run is minutes of a progress bar that barely moves. Someone watching a still screen
+  // concludes nothing is happening, so the job carries an account of what it is doing.
+  const f = fixture(t);
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const job = await finished(f.manager);
+  assert.equal(job.status, 'passed', job.error);
+  const lines = job.log.map((l) => l.text);
+  const at = (pattern) => lines.findIndex((l) => pattern.test(l));
+
+  // In order: start, the baseline, a drafting test with the settings it wrote, the decision,
+  // the micro-batch step, saving, done.
+  const order = [/^Starting auto-tune for synthetic/, /Step 1 of 2/, /^Settings: /, /^Running the \w+ workload/,
+    /tokens\/s/, /^Chose /, /Step 2 of 2/, /^Saving the tuned settings: /, /^Done/];
+  const positions = order.map(at);
+  assert.ok(positions.every((p) => p >= 0), `missing lines: ${order.filter((_, i) => positions[i] < 0).join(', ')}`);
+  assert.deepEqual([...positions].sort((a, b) => a - b), positions, 'the account is in the order things happened');
+
+  // The settings each test actually wrote are stated, not just its label.
+  assert.ok(lines.some((l) => /^Settings: .*spec-type draft-mtp/.test(l)), 'a drafting test names what it set');
+  // Draft acceptance is reported where drafting happened.
+  assert.ok(lines.some((l) => /% of \d+ drafts accepted/.test(l)));
+  // Every line is timestamped, and time never runs backwards.
+  assert.ok(job.log.every((l, i) => Number.isFinite(l.at) && (i === 0 || l.at >= job.log[i - 1].at)));
+});
+
+test('a long load reports that it is still loading, instead of going quiet', async (t) => {
+  // Loads in the fixture are instant. Here the engine stays "loading" for several polls, and
+  // each poll moves a fake clock on four seconds -- about what a real 9B load looks like.
+  let clock = 1_000_000, polls = 0;
+  const f = fixture(t);
+  const manager = createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic', presetPath: f.ini,
+    fetchJson: async (url, opts = {}) => {
+      const u = new URL(url);
+      if (u.pathname === '/models/load') { f.router.status.synthetic = 'loading'; polls = 0; return { ok: true, status: 200, body: {} }; }
+      if (u.pathname === '/models' && (!opts.method || opts.method === 'GET') && f.router.status.synthetic === 'loading') {
+        clock += 4000;
+        if (++polls >= 5) f.router.status.synthetic = 'loaded';
+      }
+      return f.fetchJson(url, opts);
+    },
+    calibrationStatePath: path.join(f.dir, 'cal2.json'), autotuneStatePath: path.join(f.dir, 'tune2.json'), autotuneTablePath: path.join(f.dir, 'table2.json'),
+    autoconfig: {}, calibrationOptions: { sleep: async () => {}, readMemory: () => 20 },
+    autotuneOptions: { sleep: async () => {}, now: () => clock, readMemory: () => 20, identityFor: async () => ({ arch: 'qwen35', quant: 'Q5_K_M', hardware: 'synthetic-apu' }) } });
+  await manager.autotune.start('synthetic', { confirmPause: true });
+  const job = await finished(manager);
+  const heartbeats = job.log.filter((l) => /^still loading · \d+s$/.test(l.text));
+  assert.ok(heartbeats.length >= 2, `expected heartbeats during a slow load, got: ${heartbeats.map((h) => h.text).join(' | ')}`);
+  assert.ok(job.log.some((l) => /^Loaded in (1[6-9]|2\d)s$/.test(l.text)), 'the load says how long it actually took');
+});
+
+test('a cancelled run says it stopped, and that the original settings were put back', async (t) => {
+  let f;
+  f = fixture(t, { onChat: async (router) => { if (router.chats === 6) f.manager.autotune.cancel(); } });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const job = await finished(f.manager);
+  const lines = job.log.map((l) => l.text);
+  assert.ok(lines.includes('Cancelled — measurements so far are kept'));
+  assert.ok(lines.includes('Original settings restored'));
 });
