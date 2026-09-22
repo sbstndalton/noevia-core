@@ -2,7 +2,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
-const { configFor, writeHarnessConfig, PERMISSION } = require('./code-harness-config.cjs');
+const { configFor, pinFilesFor, writeHarnessConfig, PERMISSION, EDIT_TOOLS } = require('./code-harness-config.cjs');
 
 const base = { harness: 'opencode', model: 'Ornith-1.5-9B-Q5_K_M', engine: 'http://llama:8080/v1' };
 
@@ -31,7 +31,8 @@ test('the agent is given one endpoint and one model, and never updates itself', 
 });
 
 test('a harness whose configuration noevia cannot pin is refused, not run with its defaults', () => {
-  for (const harness of ['claude-code', 'codex', '', null]) {
+  for (const harness of ['aider', 'goose', '', null]) {
+    assert.throws(() => pinFilesFor({ ...base, harness }), (e) => e.status === 409 && /cannot pin/.test(e.message));
     assert.throws(() => configFor({ ...base, harness }), (e) => e.status === 409 && /cannot pin/.test(e.message));
   }
 });
@@ -62,4 +63,78 @@ test('the file lands in the task workspace, owned by whoever the harness runs as
 test('an api key is written only when the deployment has one, and never invented', () => {
   assert.equal(configFor(base).json.provider.local.options.apiKey, 'none');
   assert.equal(configFor({ ...base, apiKey: 'k' }).json.provider.local.options.apiKey, 'k');
+});
+
+const fileOf = (pinned, p) => pinned.files.find((f) => f.path === p);
+
+test('Claude Code: every edit, command and fetch asks, bypass and auto modes are off, one endpoint', () => {
+  const pinned = pinFilesFor({ ...base, harness: 'claude-code', apiKey: 'k' });
+  const local = JSON.parse(fileOf(pinned, '.claude/settings.local.json').content);
+  assert.equal(fileOf(pinned, '.claude/settings.local.json').base, 'cwd', 'project-local outranks user settings');
+  assert.deepEqual(local.permissions.ask, ['Edit', 'Write', 'NotebookEdit', 'Bash', 'WebFetch', 'WebSearch']);
+  assert.deepEqual(local.permissions.allow, []);
+  assert.equal(local.permissions.defaultMode, 'default');
+  assert.equal(local.permissions.disableBypassPermissionsMode, 'disable');
+  assert.equal(local.permissions.disableAutoMode, 'disable');
+  assert.equal(local.env.ANTHROPIC_BASE_URL, 'http://llama:8080', 'Claude Code appends /v1/messages itself');
+  assert.equal(local.env.ANTHROPIC_MODEL, base.model);
+  assert.equal(local.env.ANTHROPIC_API_KEY, 'k');
+  assert.equal(local.env.DISABLE_AUTOUPDATER, '1');
+  assert.equal(local.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, '1');
+  assert.equal(fileOf(pinned, '.claude/settings.json').base, 'home');
+  assert.ok(Object.isFrozen(EDIT_TOOLS), 'a caller cannot widen or narrow the list');
+});
+
+test('Codex: read-only sandbox, approvals on request, no web search, updates or analytics, untrusted project', () => {
+  const pinned = pinFilesFor({ ...base, harness: 'codex', engine: 'http://llama:8080', cwd: '/workspaces/t1' });
+  const file = fileOf(pinned, '.codex/config.toml');
+  assert.equal(file.base, 'home');
+  for (const line of ['approval_policy = "on-request"', 'sandbox_mode = "read-only"', 'web_search = "disabled"',
+    'check_for_update_on_startup = false', 'model_provider = "noevia"', `model = "${base.model}"`,
+    'base_url = "http://llama:8080/v1"', 'wire_api = "responses"', '[projects."/workspaces/t1"]', 'trust_level = "untrusted"', 'exporter = "none"']) {
+    assert.ok(file.content.includes(line), line);
+  }
+  assert.ok(!file.content.includes('never'), 'no approval policy that never asks');
+  assert.ok(!file.content.includes('bearer'), 'no token invented');
+  assert.ok(pinFilesFor({ ...base, harness: 'codex', apiKey: 'k"x' }).files[0].content.includes('experimental_bearer_token = "k\\"x"'), 'quoted safely');
+});
+
+test('pi: one local provider and model, no install telemetry, and a gate that fails closed', () => {
+  const pinned = pinFilesFor({ ...base, harness: 'pi', contextTokens: 16384 });
+  assert.ok(pinned.files.every((f) => f.base === 'home'));
+  const models = JSON.parse(fileOf(pinned, '.pi/agent/models.json').content);
+  assert.equal(models.providers.noevia.baseUrl, 'http://llama:8080/v1');
+  assert.equal(models.providers.noevia.api, 'openai-completions');
+  assert.equal(models.providers.noevia.models[0].contextWindow, 16384);
+  const settings = JSON.parse(fileOf(pinned, '.pi/agent/settings.json').content);
+  assert.deepEqual(settings, { defaultProvider: 'noevia', defaultModel: base.model, enableInstallTelemetry: false });
+});
+
+test('pi gate: reads pass, everything else asks with full input, and no channel or an error blocks', async () => {
+  const gate = fileOf(pinFilesFor({ ...base, harness: 'pi' }), '.pi/agent/extensions/noevia-gate.js').content;
+  const mod = await import('data:text/javascript;base64,' + Buffer.from(gate).toString('base64'));
+  let handler; mod.default({ on: (name, fn) => { assert.equal(name, 'tool_call'); handler = fn; } });
+  const asked = [];
+  const ui = (answer) => ({ hasUI: true, ui: { confirm: async (title, body) => { asked.push([title, body]); if (answer instanceof Error) throw answer; return answer; } } });
+  assert.equal(await handler({ toolName: 'read', input: { path: 'a' } }, ui(false)), undefined);
+  assert.equal(await handler({ toolName: 'bash', input: { command: 'rm -rf build' } }, ui(true)), undefined);
+  assert.match(asked[0][1], /rm -rf build/, 'the full arguments are shown');
+  assert.equal((await handler({ toolName: 'write', input: {} }, ui(false))).block, true);
+  assert.equal((await handler({ toolName: 'edit', input: {} }, ui(new Error('channel closed')))).block, true);
+  assert.equal((await handler({ toolName: 'some_new_tool', input: {} }, { hasUI: false })).block, true);
+  assert.equal((await handler({ toolName: 'bash', input: {} }, ui('yes'))).block, true, 'only a literal true allows');
+});
+
+test('home-based harnesses need the private home and write everything into it, owned by the harness user', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-harness-home-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const cwd = path.join(root, 'tree'), home = path.join(root, 'home'); fs.mkdirSync(cwd); fs.mkdirSync(home);
+  assert.throws(() => writeHarnessConfig({ ...base, harness: 'pi', cwd }), (e) => e.status === 409 && /home/.test(e.message));
+  const chowned = [];
+  t.mock.method(fs, 'chownSync', (file) => { chowned.push(path.relative(root, file)); });
+  const record = writeHarnessConfig({ ...base, harness: 'claude-code', cwd, home, owner: { uid: 1000, gid: 1000 } });
+  assert.deepEqual(record.files, ['./.claude/settings.local.json', '~/.claude/settings.json']);
+  assert.ok(fs.existsSync(path.join(cwd, '.claude/settings.local.json')) && fs.existsSync(path.join(home, '.claude/settings.json')));
+  assert.deepEqual(chowned.sort(), ['home/.claude', 'home/.claude/settings.json', 'tree/.claude', 'tree/.claude/settings.local.json']);
+  assert.equal(fs.statSync(path.join(home, '.claude/settings.json')).mode & 0o777, 0o600);
 });

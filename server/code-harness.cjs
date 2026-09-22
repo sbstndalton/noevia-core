@@ -73,7 +73,7 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
         ctx.event('step.started', { id: 'harness.config', title: 'Pin the harness configuration' });
         let pinned;
         try {
-          pinned = pinConfig({ cwd: workspace.path, owner: workspaces.owner || null, harness, model: chosen,
+          pinned = pinConfig({ cwd: workspace.path, home: workspace.home || null, owner: workspaces.owner || null, harness, model: chosen,
             engine: endpoint.baseUrl, apiKey: endpoint.apiKey || null,
             ...(endpoint.contextTokens ? { contextTokens: endpoint.contextTokens } : {}) });
         } catch (error) {

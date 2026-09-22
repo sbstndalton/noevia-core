@@ -56,16 +56,154 @@ function configFor({ harness, model, engine, contextTokens = 32768, outputTokens
   };
 }
 
-/**
- * Write the file into the task's own working directory and hand it to the user the harness runs
- * as, the same way the worktree is handed over. Returns what the job event records.
- */
-function writeHarnessConfig({ cwd, owner = null, ...options }) {
-  const { name, json } = configFor(options);
-  const file = nodePath.join(cwd, name);
-  fs.writeFileSync(file, JSON.stringify(json, null, 2) + '\n');
-  if (owner) fs.chownSync(file, owner.uid, owner.gid);
-  return { file: name, permission: { ...PERMISSION }, model: json.model, endpoint: json.provider.local.options.baseURL };
+// ── Other harnesses (roadmap: "Other harnesses") ─────────────────────────────────────────
+// Each is pinned through the files that harness itself treats as authoritative, written by noevia
+// before the agent exists: into the task's working directory (`cwd`) or the private HOME noevia
+// gives every task (`home`, code-workspace.cjs). Primary sources, checked 2026-09-22:
+//   * Claude Code — code.claude.com/docs/en/{settings,permissions,env-vars}: project-local
+//     `.claude/settings.local.json` outranks user and shared-project settings (only managed
+//     policy and CLI flags sit above it); `ask` rules cover Edit (every built-in file edit),
+//     Write, NotebookEdit, Bash, WebFetch and WebSearch; bypass and auto modes can be disabled;
+//     `env` in settings is honoured, which is how the endpoint and model are given.
+//   * Codex — learn.chatgpt.com/docs/config-file/config-reference: `$CODEX_HOME/config.toml`
+//     (default `~/.codex`); approval_policy is `on-request | never | granular`; `wire_api` only
+//     accepts `responses`. A read-only sandbox means every write or network use must escalate
+//     to an approval; read-only commands inside Codex's own sandbox can run without asking, so
+//     the container stays the real boundary (D14, D25).
+//   * pi — github.com/badlogic/pi-mono (coding-agent README, docs/extensions.md, docs/models.md):
+//     no permission prompts by design; global extensions in `~/.pi/agent/extensions/` load
+//     without a trust prompt and a `tool_call` handler returning `{ block: true }` stops a call.
+//     noevia's gate asks for every tool that is not a plain read, with the full input, and
+//     blocks whenever there is no channel to ask on — fail closed, never fail open.
+
+const EDIT_TOOLS = Object.freeze(['Edit', 'Write', 'NotebookEdit', 'Bash', 'WebFetch', 'WebSearch']);
+const PI_READ_TOOLS = Object.freeze(['read', 'grep', 'find', 'ls']);
+
+const toml = (value) => JSON.stringify(String(value)); // a TOML basic string is a JSON string for these inputs
+
+function endpointFor({ model, engine }) {
+  const name = String(model || '').trim();
+  const baseURL = String(engine || '').trim().replace(/\/+$/, '');
+  if (!name) throw Object.assign(Error('A coding task needs a model; none is loaded or chosen.'), { status: 409 });
+  if (!/^https?:\/\//.test(baseURL)) throw Object.assign(Error('This server has no model endpoint for coding tasks.'), { status: 409 });
+  return { name, baseURL: /\/v1$/.test(baseURL) ? baseURL : `${baseURL}/v1` };
 }
 
-module.exports = { configFor, writeHarnessConfig, PERMISSION };
+function claudeSettings({ name, baseURL, apiKey }) {
+  return {
+    permissions: {
+      defaultMode: 'default', disableBypassPermissionsMode: 'disable', disableAutoMode: 'disable',
+      allow: [], deny: [], ask: [...EDIT_TOOLS],
+    },
+    env: {
+      // Claude Code appends /v1/messages itself; llama.cpp serves the Anthropic Messages API there.
+      ANTHROPIC_BASE_URL: baseURL.replace(/\/v1$/, ''),
+      ANTHROPIC_API_KEY: apiKey || 'none',
+      ANTHROPIC_MODEL: name,
+      DISABLE_AUTOUPDATER: '1',
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+      DISABLE_TELEMETRY: '1',
+    },
+  };
+}
+
+function codexToml({ name, baseURL, apiKey, cwd }) {
+  return [
+    '# Written by noevia for this task. Edits here are overwritten at the next task.',
+    `model = ${toml(name)}`,
+    'model_provider = "noevia"',
+    'approval_policy = "on-request"',
+    'sandbox_mode = "read-only"',
+    'web_search = "disabled"',
+    'check_for_update_on_startup = false',
+    '',
+    '[model_providers.noevia]',
+    'name = "noevia engine"',
+    `base_url = ${toml(baseURL)}`,
+    'wire_api = "responses"',
+    'requires_openai_auth = false',
+    ...(apiKey ? [`experimental_bearer_token = ${toml(apiKey)}`] : []),
+    '',
+    '[analytics]', 'enabled = false', '',
+    '[feedback]', 'enabled = false', '',
+    '[otel]', 'exporter = "none"', '',
+    ...(cwd ? [`[projects.${toml(cwd)}]`, 'trust_level = "untrusted"', ''] : []),
+  ].join('\n');
+}
+
+const PI_GATE = `// Written by noevia for this task: every tool that is not a plain read asks, with its full
+// input, and is blocked when nothing can ask. Unknown and future tools ask too.
+const READ = new Set(${JSON.stringify(PI_READ_TOOLS)});
+export default function (pi) {
+  pi.on('tool_call', async (event, ctx) => {
+    if (READ.has(event.toolName)) return undefined;
+    if (!ctx.hasUI) return { block: true, reason: 'noevia has no approval channel for this call, so it is blocked.' };
+    let ok = false;
+    try { ok = await ctx.ui.confirm('Allow ' + event.toolName + '?', JSON.stringify(event.input ?? {}, null, 2)); } catch { ok = false; }
+    return ok === true ? undefined : { block: true, reason: 'Declined in noevia.' };
+  });
+}
+`;
+
+/**
+ * Every file a harness needs pinned, relative to `cwd` or `home`. Unknown harnesses are refused.
+ * @returns {{harness: string, files: {base: 'cwd'|'home', path: string, content: string}[], permission: object, model: string, endpoint: string}}
+ */
+function pinFilesFor({ harness, model, engine, contextTokens = 32768, outputTokens = 4096, apiKey = null, cwd = null }) {
+  const id = String(harness || '').trim();
+  const json = (value) => JSON.stringify(value, null, 2) + '\n';
+  if (id === 'opencode') {
+    const { name, json: config } = configFor({ harness: id, model, engine, contextTokens, outputTokens, apiKey });
+    return { harness: id, files: [{ base: 'cwd', path: name, content: json(config) }], permission: { ...PERMISSION }, model: config.model, endpoint: config.provider.local.options.baseURL };
+  }
+  if (id === 'claude-code') {
+    const e = endpointFor({ model, engine });
+    const settings = json(claudeSettings({ ...e, apiKey }));
+    return { harness: id, files: [
+      { base: 'cwd', path: '.claude/settings.local.json', content: settings },
+      { base: 'home', path: '.claude/settings.json', content: settings },
+    ], permission: { ...PERMISSION }, model: e.name, endpoint: e.baseURL };
+  }
+  if (id === 'codex') {
+    const e = endpointFor({ model, engine });
+    return { harness: id, files: [{ base: 'home', path: '.codex/config.toml', content: codexToml({ ...e, apiKey, cwd }) }],
+      permission: { ...PERMISSION }, model: e.name, endpoint: e.baseURL };
+  }
+  if (id === 'pi') {
+    const e = endpointFor({ model, engine });
+    const models = { providers: { noevia: { baseUrl: e.baseURL, api: 'openai-completions', apiKey: apiKey || 'none',
+      models: [{ id: e.name, name: e.name, contextWindow: contextTokens, maxTokens: outputTokens, reasoning: false, input: ['text'] }] } } };
+    const settings = { defaultProvider: 'noevia', defaultModel: e.name, enableInstallTelemetry: false };
+    return { harness: id, files: [
+      { base: 'home', path: '.pi/agent/models.json', content: json(models) },
+      { base: 'home', path: '.pi/agent/settings.json', content: json(settings) },
+      { base: 'home', path: '.pi/agent/extensions/noevia-gate.js', content: PI_GATE },
+    ], permission: { ...PERMISSION }, model: e.name, endpoint: e.baseURL };
+  }
+  throw Object.assign(Error(`noevia cannot pin the permissions of the ${id || 'unnamed'} harness, so it will not run it.`), { status: 409 });
+}
+
+/**
+ * Write the pinned files into the task's working directory and private HOME, handed to the user
+ * the harness runs as, the same way the worktree is handed over. Returns what the job event records.
+ */
+function writeHarnessConfig({ cwd, home = null, owner = null, ...options }) {
+  const pinned = pinFilesFor({ ...options, cwd });
+  const roots = { cwd, home };
+  for (const file of pinned.files) {
+    const root = roots[file.base];
+    if (!root) throw Object.assign(Error(`The ${pinned.harness} harness needs a private home directory for its configuration.`), { status: 409 });
+    const target = nodePath.join(root, file.path);
+    if (!target.startsWith(nodePath.resolve(root) + nodePath.sep)) throw Error('Pinned file outside its root');
+    const created = [];
+    for (let dir = nodePath.dirname(target); dir !== root && !fs.existsSync(dir); dir = nodePath.dirname(dir)) created.unshift(dir);
+    for (const dir of created) { fs.mkdirSync(dir, { mode: 0o700 }); if (owner) fs.chownSync(dir, owner.uid, owner.gid); }
+    fs.writeFileSync(target, file.content, { mode: 0o600 });
+    if (owner) fs.chownSync(target, owner.uid, owner.gid);
+  }
+  const first = pinned.files[0];
+  return { file: first.path, files: pinned.files.map((f) => `${f.base === 'home' ? '~' : '.'}/${f.path}`),
+    permission: pinned.permission, model: pinned.model, endpoint: pinned.endpoint };
+}
+
+module.exports = { configFor, pinFilesFor, writeHarnessConfig, PERMISSION, EDIT_TOOLS, PI_READ_TOOLS };

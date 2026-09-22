@@ -203,7 +203,8 @@ test('prompt preparation offers Direct and nothing that lacks evidence', async (
 test('the deployment names its harness, and whether it is sandboxed', () => {
   const { defaultHarnesses } = require('./code-service.cjs');
   assert.deepEqual(defaultHarnesses({ CODE_HARNESS_NAME: 'claude-code', CODE_HARNESS_VERSION: '2.0' }),
-    [{ id: 'claude-code', label: 'claude-code', version: '2.0' }]);
+    [{ id: 'claude-code', label: 'Claude Code', version: '2.0' }]);
+  assert.equal(defaultHarnesses({ CODE_HARNESS_NAME: 'some-fork' })[0].label, 'some-fork', 'an unknown name is shown as given (and refused at pin time)');
   assert.deepEqual(defaultHarnesses({ CODE_HARNESS_NAME: '  ' })[0].id, 'opencode');
   const { svc } = service();
   assert.equal(svc.sandboxed(), false);
