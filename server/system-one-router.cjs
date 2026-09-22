@@ -35,9 +35,12 @@ function createSystemOneRouter({ enabled, roles, fallback, env = process.env, ba
       if (!decisions) return fallback(message);
       const active = roles();
       if (!active?.fast || !active?.smart) return fallback(message);
-      const options = [{ id: 'fast', label: 'Short simple questions and small talk' },
-        { id: 'smart', label: 'Complex reasoning, analysis and multi-step work' }];
-      if (active.code) options.push({ id: 'code', label: 'Writing, reading, debugging or explaining source code' });
+      // Labels measured on Laya 2026-09-22 (docs/research/system-one/19-routing-labels.md): the
+      // earlier abstract wording sent most reasoning and code messages to Fast (23/40 held out);
+      // concrete examples of each role scored 36/40.
+      const options = [{ id: 'fast', label: 'Greetings, thanks, or a one-line factual answer' },
+        { id: 'smart', label: 'Explaining, comparing, planning, reasoning or writing more than a sentence' }];
+      if (active.code) options.push({ id: 'code', label: 'Anything involving programming code, regex, errors or software' });
       const result = await decisions.decide({ kind: 'choice', purpose: 'model.route',
         question: 'Which configured model role should answer this user message?',
         context: { cloud: 'forbidden', stateText: String(message).slice(0, 1000) }, options,

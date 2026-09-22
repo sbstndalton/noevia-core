@@ -58,3 +58,11 @@ test('experiment persists using existing feature settings but cannot enable with
   features.set('systemOneRouting', false, 'admin');
   assert.equal(values.get('feature:systemOneRouting'), 'false');
 });
+test('role labels name concrete examples of each role (measured on Laya)', async () => {
+  const seen = [];
+  const h = harness(async request => { seen.push(request); return { selected: 'smart', scores: { fast: 0.2, smart: 0.8 } }; });
+  h.enable(true); await h.router.classify('Compare two designs');
+  assert.deepEqual(seen[0].options.map(o => o.id), ['fast', 'smart']);
+  assert.match(seen[0].options[0].label, /one-line factual/);
+  assert.match(seen[0].options[1].label, /comparing, planning, reasoning/);
+});
