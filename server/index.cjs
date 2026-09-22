@@ -472,6 +472,10 @@ const classifyFastOrSmart = (message) => systemOneRouter.classify(message);
 
 // ── Chat: the loop lives in chat.cjs; everything it needs is handed over here ──
 const { handleChat } = require('./chat.cjs').createChatHandler({
+  stepSupervision: require('./step-supervision.cjs').createStepSupervision({
+    enabled: () => features.enabled('stepSupervision'),
+    provider: require('./decision-endpoint.cjs').createDecisionEndpoint(), deadlineMs:1500,
+  }),
   codeTasksFor: (project) => codeService.list(currentWorkspace(), project),
   // fetch is resolved per call, not captured: tests and QA swap the global at runtime.
   fs, path, crypto, fetch: (...args) => globalThis.fetch(...args), reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult,

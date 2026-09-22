@@ -7,7 +7,7 @@
 // and enabled() keeps answering with the value the running server actually uses.
 
 const REGISTRY = Object.freeze({
-  stepSupervision: { env: 'NOEVIA_FEATURE_STEP_SUPERVISION', experimental: true, unavailable: () => 'No decision provider is connected. This experiment is available for synthetic testing only.', label: 'Step supervision', description: 'Let a decision provider advise whether to continue, verify tool results or pause for review between chat steps. Keeps existing behavior if unavailable. Approvals and execution limits still apply.' },
+  stepSupervision: { env: 'NOEVIA_FEATURE_STEP_SUPERVISION', experimental: true, unavailable: env => require('./decision-endpoint.cjs').configuration(env).reason, label: 'Step supervision', description: 'Let a decision provider advise whether to continue, verify tool results or pause for review between chat steps. Keeps existing behavior if unavailable. Approvals and execution limits still apply.' },
   systemOneRouting: { env: 'NOEVIA_FEATURE_SYSTEM_ONE_ROUTING', experimental: true, unavailable: env => require('./system-one-router.cjs').configuration(env).reason, label: 'System-One routing', description: 'Use the experimental option-logit baseline to choose Fast, Smart or Code for new Auto-routed messages. Falls back to the current router when unavailable. Manual model choices are unchanged.' },
   previews: { env: 'NOEVIA_FEATURE_PREVIEWS', label: 'Preview surfaces', description: 'Show the unbuilt Scheduled, Plugins, Explore and Code previews.' },
   diaryMcpWrite: { env: 'NOEVIA_FEATURE_DIARY_MCP_WRITE', restart: true, label: 'Diary append tool', description: 'Offer an approval-gated, append-only Diary tool through the in-app MCP server.' },

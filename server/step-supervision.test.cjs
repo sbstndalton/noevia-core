@@ -36,5 +36,5 @@ test('unconfigured experiment cannot be activated by setting or operator env',()
   const features=createFeatures({env:{NOEVIA_FEATURE_STEP_SUPERVISION:'true'}});
   assert.equal(features.enabled('stepSupervision'),false);
   const normal=createFeatures({env:{},store:{get:()=>undefined,set:()=>assert.fail('must not persist activation')}});
-  assert.throws(()=>normal.set('stepSupervision',true,'admin'),/No decision provider/);
+  assert.throws(()=>normal.set('stepSupervision',true,'admin'),/Connect a private decision service/);
 });

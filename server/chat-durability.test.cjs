@@ -6,7 +6,7 @@ const {createChatHandler}=require('./chat.cjs');
 const {createToolExchange}=require('./tool-exchange.cjs');
 const {createVisionProbe}=require('./vision.cjs');
 const {createChatTurns}=require('./chat-turns.cjs');
-async function run(t,ambiguous=false,stepSupervision=null) {
+async function run(t,ambiguous=false,stepSupervision=null,providerId='default') {
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'noevia-chat-durable-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
   const userId='synthetic-user',projectId='fixture-project',service=createChatTurns({enabled:true});
   const events=[],res=new EventEmitter();res.writeHead=()=>{};res.write=line=>events.push(JSON.parse(line.slice(6)));res.end=()=>{res.writableEnded=true;res.emit('finish');};
@@ -21,7 +21,7 @@ async function run(t,ambiguous=false,stepSupervision=null) {
     HISTORY_CAP: 20, DEFAULT_PROVIDER_ID: 'default', createToolExchange,
     currentWorkspace: () => ({ userId, dir, assetDir: () => '/synthetic-only' }),
     getProject: () => ({id:projectId,model:'answer-model',assets:[]}),
-    skillsIndexFor: () => [], getProvider: () => ({ id: 'default', baseUrl: 'http://fixture.invalid' }),
+    skillsIndexFor: () => [], getProvider: () => ({ id: providerId, baseUrl: 'http://fixture.invalid' }),
     providerHeaders: () => ({}), autoRoles: () => null,
     visionDescriptions: new Map(), visionProbe: createVisionProbe({ fetchImpl: fetch }),
     chatSkillRouter: { select: async () => ({ loaded: [] }) }, oauthServerIds: () => new Set(), accountReady: () => true, mcpOAuth: { connected: () => false }, chatToolRouter: { select: async (ids) => ({ ids, routed: false }) }, DEFAULT_TOOLBOXES: [],
@@ -74,3 +74,12 @@ test('ambiguous tool outcomes bypass supervision',async t=>{
   const f=await run(t,true,{decide:async()=>{throw Error('must not supervise unresolved write');}});
   assert.equal(f.requests,1);assert.equal(f.service.restore(f.workspace,f.id).next,'review');
 });
+
+for (const providerId of ['openrouter-fixture','openai-fixture']) {
+  test(`supervision keeps the selected ${providerId} answering provider`,async t=>{
+    const supervisor=require('./step-supervision.cjs').createStepSupervision({enabled:()=>true,provider:{decide:async()=>({action:'verify'})}});
+    const f=await run(t,false,supervisor,providerId);
+    assert.equal(f.service.restore(f.workspace,f.id).state.model.providerId,providerId);
+    assert.equal(f.executions,1);assert.equal(f.requests,2);
+  });
+}
