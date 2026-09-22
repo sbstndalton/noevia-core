@@ -42,6 +42,9 @@ function createChatHandler({
   }
 
   async function handleChatInner(req, res, body, authn, preparation, execution = {}) {
+    // User-perceived first-token time includes routing, model/context preparation and
+    // provider prefill, not only the final upstream request's network time.
+    const exchangeStartedAt = Date.now();
     const { spaceId, message, history } = body || {};
     if (spaceId === 'diary-extras') {
       if (body.extrasEnabled !== true) return json(res, 400, { error: 'Extra attachments and tools are off' });
@@ -310,6 +313,7 @@ function createChatHandler({
     res.once('close',()=>clearInterval(heartbeat));
     res.once('finish',()=>clearInterval(heartbeat));
     send({ type: 'meta', model, chatId: chatId || undefined, route: routedRole || undefined });
+    send({ type: 'telemetry', phase: 'waiting', model });
     send({ type: 'status', text: attachedImages.length ? 'Reading image sources — model loading and visual processing may take a moment…' : 'Preparing response…' });
     let visionWarning = missingImages.length ? `Images were not read because their stored files are missing: ${missingImages.join(', ')}. Re-upload them.` : '';
     if (visionWarning) wire = [{ role: 'system', content: visionWarning + ' Do not guess their contents.' }, ...wire];
@@ -435,7 +439,78 @@ function createChatHandler({
     // interesting ones, since they carry the tool results and so span a wider
     // range of prompt sizes than the first round ever would.
     let roundStartedAt = 0;
-    let roundFirstTokenMs = 0;
+    let roundFirstTokenMs = null;
+    let roundTimings = null;
+    let exchangeFirstTokenMs = null;
+    // A visible reply can span several provider requests when tools are used.
+    // Keep the footer/message values cumulative for the whole exchange instead
+    // of silently replacing them with the last model round.
+    const exchangeUsage = {
+      prompt: 0, completion: 0, total: 0,
+      hasPrompt: false, hasCompletion: false, hasTotal: false,
+      predictedSeconds: 0, rateComplete: true,
+      drafted: 0, accepted: 0, hasMtp: false,
+    };
+    const reportedCount = value => {
+      if (value === null || value === undefined || value === '') return null;
+      const number = Number(value);
+      return Number.isSafeInteger(number) && number >= 0 ? number : null;
+    };
+    const reportedRate = value => {
+      const number = Number(value);
+      return Number.isFinite(number) && number > 0 ? number : null;
+    };
+    const markFirstOutput = () => {
+      const now = Date.now();
+      if (roundFirstTokenMs === null) roundFirstTokenMs = Math.max(0, now - roundStartedAt);
+      if (exchangeFirstTokenMs !== null) return;
+      exchangeFirstTokenMs = Math.max(0, now - exchangeStartedAt);
+      send({ type: 'telemetry', phase: 'streaming', model, timeToFirstToken: exchangeFirstTokenMs / 1000 });
+    };
+    const reportRoundUsage = (rawUsage, timings) => {
+      if (!rawUsage || typeof rawUsage !== 'object') return;
+      const prompt = reportedCount(rawUsage.prompt_tokens);
+      const completion = reportedCount(rawUsage.completion_tokens);
+      const total = reportedCount(rawUsage.total_tokens);
+      const rate = reportedRate(timings?.predicted_per_second);
+      if (prompt !== null) { exchangeUsage.prompt += prompt; exchangeUsage.hasPrompt = true; }
+      if (completion !== null) {
+        exchangeUsage.completion += completion;
+        exchangeUsage.hasCompletion = true;
+        if (completion > 0 && rate !== null) exchangeUsage.predictedSeconds += completion / rate;
+        else if (completion > 0) exchangeUsage.rateComplete = false;
+      }
+      if (total !== null) { exchangeUsage.total += total; exchangeUsage.hasTotal = true; }
+      else if (prompt !== null && completion !== null) { exchangeUsage.total += prompt + completion; exchangeUsage.hasTotal = true; }
+
+      const drafted = reportedCount(timings?.draft_n), accepted = reportedCount(timings?.draft_n_accepted);
+      if (drafted !== null && drafted > 0 && accepted !== null && accepted <= drafted) {
+        exchangeUsage.drafted += drafted; exchangeUsage.accepted += accepted; exchangeUsage.hasMtp = true;
+      }
+      const aggregateRate = exchangeUsage.hasCompletion && exchangeUsage.completion > 0 && exchangeUsage.rateComplete && exchangeUsage.predictedSeconds > 0
+        ? exchangeUsage.completion / exchangeUsage.predictedSeconds : null;
+      const reported = {
+        promptTokens: prompt, completionTokens: completion, totalTokens: total,
+        tokensPerSecond: rate,
+      };
+      if ((prompt !== null && prompt > 0) || (completion !== null && completion > 0)) recordUsage(chatWorkspace, model, reported);
+      if (provider.id === DEFAULT_PROVIDER_ID && modelManager.recordEvidence && drafted !== null && drafted > 0 && accepted !== null && accepted <= drafted) {
+        modelManager.recordEvidence(model, { category: 'mtp_acceptance', result: 'reported', value: { rate: Math.round((accepted / drafted) * 100) / 100, drafted, accepted }, suite: { name: 'chat-reply', version: 1 }, source: 'observation', limitations: ['single reply; depends on content'] }).catch(() => undefined);
+      }
+      // One free observation of (prompt size -> time to first token), per
+      // upstream round. It is not the user-visible end-to-end first-token time.
+      if (roundFirstTokenMs !== null && roundFirstTokenMs > 0 && prompt !== null && prompt > 0) prefill.recordSample(model, prompt, roundFirstTokenMs);
+      send({
+        type: 'usage', phase: 'streaming', model,
+        promptTokens: exchangeUsage.hasPrompt ? exchangeUsage.prompt : null,
+        completionTokens: exchangeUsage.hasCompletion ? exchangeUsage.completion : null,
+        totalTokens: exchangeUsage.hasTotal ? exchangeUsage.total : null,
+        tokensPerSecond: aggregateRate,
+        timeToFirstToken: exchangeFirstTokenMs === null ? null : exchangeFirstTokenMs / 1000,
+        drafted: exchangeUsage.hasMtp ? exchangeUsage.drafted : null,
+        accepted: exchangeUsage.hasMtp ? exchangeUsage.accepted : null,
+      });
+    };
     // Track final-answer content separately for each round. Reasoning may contain
     // internal planning or unfinished narration; it is never promoted to an answer.
     let roundHasContent = false;
@@ -458,7 +533,8 @@ function createChatHandler({
       turn?.generation({ messages:roundMessages, tools:activeTools }, round);
       let upstream;
       roundStartedAt = Date.now();
-      roundFirstTokenMs = 0;
+      roundFirstTokenMs = null;
+      roundTimings = null;
       try {
         upstream = await reasoningEffort.requestWithEffort(fetch, upstreamUrl, {
           method: 'POST', headers: upstreamHeaders, signal: chatSignal.signal, redirect: 'error',
@@ -501,36 +577,20 @@ function createChatHandler({
               const evt = JSON.parse(payload);
               if(evt.choices?.[0]?.finish_reason==='length')send({type:'warning',text:'The model reached its thinking/answer token budget. This reply may be incomplete; try Low thinking or a narrower question.'});
               if(evt.error){send({type:'error',text:context.providerError(evt.error)});res.end();return;}
-              require('./mtp.cjs').record(chatWorkspace?.userId,model,evt.timings);
-              // The include_usage chunk carries no choices — only totals. Emit it
-              // as its own event so the client can label the finished reply.
-              if (evt.usage) {
-                const reported = {
-                  promptTokens: Number(evt.usage.prompt_tokens) || 0,
-                  completionTokens: Number(evt.usage.completion_tokens) || 0,
-                  totalTokens: Number(evt.usage.total_tokens) || 0,
-                  tokensPerSecond: Number(evt.timings?.predicted_per_second) || 0,
-                };
-                recordUsage(chatWorkspace, model, reported);
-                const drafted = Number(evt.timings?.draft_n), accepted = Number(evt.timings?.draft_n_accepted);
-                if (provider.id === DEFAULT_PROVIDER_ID && modelManager.recordEvidence && drafted > 0 && accepted >= 0 && accepted <= drafted) {
-                  modelManager.recordEvidence(model, { category: 'mtp_acceptance', result: 'reported', value: { rate: Math.round((accepted / drafted) * 100) / 100, drafted, accepted }, suite: { name: 'chat-reply', version: 1 }, source: 'observation', limitations: ['single reply; depends on content'] }).catch(() => undefined);
-                }
-                // One free observation of (prompt size -> time to first token).
-                // Only when a first token was actually seen this round: a round
-                // that errored or returned nothing says nothing about prefill.
-                if (roundFirstTokenMs > 0 && reported.promptTokens > 0) {
-                  prefill.recordSample(model, reported.promptTokens, roundFirstTokenMs);
-                }
-                send({ type: 'usage', ...reported });
-              }
               const delta = evt.choices?.[0]?.delta || {};
-              // First token of this round, whatever channel it arrives on —
-              // content, reasoning or a tool-call fragment are all equally "the
-              // model has finished reading and started writing".
-              if (!roundFirstTokenMs && (delta.content || delta.reasoning_content || delta.tool_calls)) {
-                roundFirstTokenMs = Date.now() - roundStartedAt;
+              const meaningfulToolFragment = Array.isArray(delta.tool_calls) && delta.tool_calls.some(tc => tc?.id || tc?.function?.name || tc?.function?.arguments);
+              // Detect output before handling usage: a compact provider may put
+              // the only delta and its usage in the same SSE frame.
+              if (delta.content || delta.reasoning_content || delta.reasoning || meaningfulToolFragment) markFirstOutput();
+              if (evt.timings && typeof evt.timings === 'object') {
+                // llama-server may split timing fields across the final choice
+                // frame and the following usage-only frame.
+                roundTimings = { ...(roundTimings || {}), ...evt.timings };
+                require('./mtp.cjs').record(chatWorkspace?.userId,model,roundTimings);
               }
+              // The include_usage chunk commonly carries no choices. Forward
+              // cumulative, request-local facts instead of waiting on /api/stats.
+              if (evt.usage) reportRoundUsage(evt.usage, roundTimings);
               if (delta.reasoning_content) {
                 sawAnything = true;
                 roundReasoning += delta.reasoning_content;
@@ -582,6 +642,12 @@ function createChatHandler({
       if (!sawAnything) {
         try {
           turn?.fallbackRetry();
+          // This is a new provider request. Keep the user-visible exchange
+          // clock running, but do not attribute the empty streaming attempt's
+          // wait to this request's passive prefill sample.
+          roundStartedAt = Date.now();
+          roundFirstTokenMs = null;
+          roundTimings = null;
           const response = await reasoningEffort.requestWithEffort(fetch, upstreamUrl, {
             method:'POST',headers:upstreamHeaders,signal:AbortSignal.any([chatSignal.signal,AbortSignal.timeout(300000)]),redirect:'error',
           }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:false,...(activeTools.length ? {tools:activeTools} : {})}, provider, model, effort, send);
@@ -589,6 +655,7 @@ function createChatHandler({
           if (!full.ok) throw new Error(`Provider returned ${full.status}`);
           require('./mtp.cjs').record(chatWorkspace?.userId,model,full.body?.timings);
           const msg = full.body?.choices?.[0]?.message;
+          if (msg?.reasoning_content || msg?.content || (Array.isArray(msg?.tool_calls) && msg.tool_calls.length)) markFirstOutput();
           if (msg?.reasoning_content) { roundReasoning += msg.reasoning_content; send({ type: 'reasoning', text: msg.reasoning_content }); }
           if (msg?.content) { roundHasContent = true; roundContent += msg.content; send({ type: 'delta', text: msg.content }); }
           if (Array.isArray(msg?.tool_calls)) {
@@ -598,6 +665,7 @@ function createChatHandler({
               send({ type: 'tool', index: toolOffset + index, name: tc.function?.name || '', args: tc.function?.arguments || '' });
             }
           }
+          reportRoundUsage(full.body?.usage, full.body?.timings);
           sawAnything = true;
         } catch (err) {
           send({ type: 'error', text: String(err?.message || err) });
@@ -715,6 +783,7 @@ function createChatHandler({
     if (!roundHasContent && roundReasoning.trim()) {
       send({ type: 'delta', text: '\n\nThe model returned reasoning without a final answer. Try again or choose another model.' });
     }
+    send({ type: 'telemetry', phase: 'complete', model, timeToFirstToken: exchangeFirstTokenMs === null ? null : exchangeFirstTokenMs / 1000 });
     send({ type: 'done', model });
     res.end();
   }

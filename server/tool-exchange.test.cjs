@@ -12,7 +12,7 @@ const { createChatHandler } = require('./chat.cjs');
 const contextDir=fs.mkdtempSync(require('node:path').join(require('node:os').tmpdir(),'chat-handler-test-'));
 test.after(()=>fs.rmSync(contextDir,{recursive:true,force:true}));
 
-function fixture({ rounds, decision = 'approve', execute, fallback = false, cancel = false, effort, reasoningOnly = false, skills = [], native = false, preambleText = '', routedIds = null, contextLimit = 32768 } = {}) {
+function fixture({ rounds, decision = 'approve', execute, fallback = false, cancel = false, effort, reasoningOnly = false, skills = [], native = false, preambleText = '', routedIds = null, contextLimit = 32768, usageRounds = [], sameFrameUsage = false, splitTimings = false } = {}) {
   const resolvedFor = [];
   const events = [], executions = [], approvals = [], requests = [], audits = [], toolCounts = [];
   let round = 0, allApproved = false;
@@ -62,14 +62,19 @@ function fixture({ rounds, decision = 'approve', execute, fallback = false, canc
         return {ok:true,json:async()=>({choices:[{finish_reason:'stop',message:{content:'Earlier synthetic constraints and decisions.'}}]})};
       }
       if (fallback && JSON.parse(options.body).stream) return { ok: true, body: (async function* () {})() };
-      if (fallback) { const calls=completion(options); return {ok:true,status:200,json:async()=>({choices:[{message:{...(reasoningOnly && !calls.length ? {reasoning_content:'Synthetic internal plan: maybe search, then consider alternatives.'} : {}),tool_calls:calls.map(tc=>({id:tc.id,function:{name:tc.name,arguments:tc.args}}))}}]})}; }
-      const calls = completion(options);
+      if (fallback) { const roundIndex=round,calls=completion(options),sample=usageRounds[roundIndex]; return {ok:true,status:200,json:async()=>({choices:[{message:{...(reasoningOnly && !calls.length ? {reasoning_content:'Synthetic internal plan: maybe search, then consider alternatives.'} : {}),tool_calls:calls.map(tc=>({id:tc.id,function:{name:tc.name,arguments:tc.args}}))}}],...(sample?.usage?{usage:sample.usage}:{}),...(sample?.timings?{timings:sample.timings}:{})})}; }
+      const roundIndex=round,calls = completion(options),sample=usageRounds[roundIndex];
       // Split both argument deltas and SSE transport chunks.
       const deltas = calls.flatMap((tc, index) => [
         { index, id: tc.id, function: { name: tc.name, arguments: tc.args.slice(0, 2) } },
         { index, function: { arguments: tc.args.slice(2) } },
       ]);
-      const wire = !calls.length ? 'data: ' + JSON.stringify({ choices: [{ delta: { ...(reasoningOnly ? {reasoning_content:'Synthetic internal plan: maybe search, then consider alternatives.'} : {content:'Finished.'}) } }] }) + '\n\n' : (preambleText ? 'data: ' + JSON.stringify({ choices: [{ delta: { content: preambleText } }] }) + '\n\n' : '') + deltas.map(tc => 'data: ' + JSON.stringify({ choices: [{ delta: { tool_calls: [tc] } }] }) + '\n\n').join('');
+      const firstEvent={choices:[{delta:{...(reasoningOnly?{reasoning_content:'Synthetic internal plan: maybe search, then consider alternatives.'}:{content:'Finished.'})}}],...(sameFrameUsage&&sample?.usage?{usage:sample.usage}:{}),...(sameFrameUsage&&sample?.timings?{timings:sample.timings}:{})};
+      let wire = !calls.length ? 'data: ' + JSON.stringify(firstEvent) + '\n\n' : (preambleText ? 'data: ' + JSON.stringify({ choices: [{ delta: { content: preambleText } }] }) + '\n\n' : '') + deltas.map(tc => 'data: ' + JSON.stringify({ choices: [{ delta: { tool_calls: [tc] } }] }) + '\n\n').join('');
+      if(sample?.usage&&!sameFrameUsage){
+        if(splitTimings&&sample.timings)wire+='data: '+JSON.stringify({choices:[{finish_reason:'stop',delta:{}}],timings:sample.timings})+'\n\n';
+        wire+='data: '+JSON.stringify({usage:sample.usage,...(!splitTimings&&sample.timings?{timings:sample.timings}:{})})+'\n\n';
+      }
       return { ok: true, body: (async function* () {
         yield Buffer.from(wire.slice(0, 17)); yield Buffer.from(wire.slice(17));
       })() };
@@ -106,6 +111,46 @@ function fixture({ rounds, decision = 'approve', execute, fallback = false, canc
 }
 const call = (id, name = 'write', args = '{"a":1,"nested":{"x":2,"y":3}}') => ({ id, name, args });
 const equivalent = '{"nested": {"y":3,"x":2}, "a":1}';
+
+test('reply telemetry reaches the client before a same-frame usage sample and preserves exact timings',async()=>{
+ const f=fixture({rounds:[[]],sameFrameUsage:true,usageRounds:[{usage:{prompt_tokens:12,completion_tokens:4,total_tokens:16},timings:{predicted_per_second:4,draft_n:10,draft_n_accepted:8}}]});
+ await f.run();
+ const live=f.events.findIndex(e=>e.type==='telemetry'&&e.phase==='streaming'),usage=f.events.findIndex(e=>e.type==='usage');
+ assert.ok(live>=0&&live<usage,JSON.stringify(f.events));
+ assert.ok(f.events[live].timeToFirstToken>=0);
+ assert.deepEqual(f.events[usage],{type:'usage',phase:'streaming',model:'synthetic-model',promptTokens:12,completionTokens:4,totalTokens:16,tokensPerSecond:4,timeToFirstToken:f.events[live].timeToFirstToken,drafted:10,accepted:8});
+});
+
+test('tool-loop usage is cumulative across model rounds with a weighted provider rate',async()=>{
+ const f=fixture({rounds:[[call('telemetry-read','read','{}')],[]],usageRounds:[
+  {usage:{prompt_tokens:10,completion_tokens:2,total_tokens:12},timings:{predicted_per_second:2,draft_n:10,draft_n_accepted:7}},
+  {usage:{prompt_tokens:20,completion_tokens:4,total_tokens:24},timings:{predicted_per_second:4,draft_n:20,draft_n_accepted:14}},
+ ]});
+ await f.run();
+ const rows=f.events.filter(e=>e.type==='usage');assert.equal(rows.length,2);
+ assert.deepEqual(rows.map(({promptTokens,completionTokens,totalTokens})=>[promptTokens,completionTokens,totalTokens]),[[10,2,12],[30,6,36]]);
+ assert.equal(rows[1].tokensPerSecond,3);assert.equal(rows[1].drafted,30);assert.equal(rows[1].accepted,21);
+});
+
+test('timings from the final choice frame are retained for a following usage-only frame',async()=>{
+ const f=fixture({rounds:[[]],splitTimings:true,usageRounds:[{usage:{prompt_tokens:7,completion_tokens:6,total_tokens:13},timings:{predicted_per_second:3,draft_n:12,draft_n_accepted:9}}]});
+ await f.run();const usage=f.events.find(e=>e.type==='usage');
+ assert.equal(usage.tokensPerSecond,3);assert.equal(usage.drafted,12);assert.equal(usage.accepted,9);
+});
+
+test('missing provider timings stay unknown and reasoning still marks first output',async()=>{
+ const f=fixture({rounds:[[]],reasoningOnly:true,usageRounds:[{usage:{prompt_tokens:8,completion_tokens:3,total_tokens:11}}]});
+ await f.run();
+ const live=f.events.find(e=>e.type==='telemetry'&&e.phase==='streaming'),usage=f.events.find(e=>e.type==='usage');
+ assert.ok(live&&live.timeToFirstToken>=0);assert.equal(usage.tokensPerSecond,null);assert.equal(usage.drafted,null);assert.equal(usage.accepted,null);
+});
+
+test('non-streaming fallback forwards its usage and first-output telemetry',async()=>{
+ const f=fixture({fallback:true,reasoningOnly:true,rounds:[[]],usageRounds:[{usage:{prompt_tokens:9,completion_tokens:5,total_tokens:14},timings:{predicted_per_second:5}}]});
+ await f.run();
+ assert.ok(f.events.some(e=>e.type==='telemetry'&&e.phase==='streaming'));
+ const usage=f.events.find(e=>e.type==='usage');assert.equal(usage.promptTokens,9);assert.equal(usage.completionTokens,5);assert.equal(usage.tokensPerSecond,5);
+});
 
 for (const fallback of [false, true]) {
   test(`duplicates within/across rounds retain IDs and SSE pairing (fallback=${fallback})`, async () => {
