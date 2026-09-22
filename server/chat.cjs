@@ -17,7 +17,7 @@
  *   the approval gate. `fetch` defaults to the global one; `json` writes a JSON reply.
  */
 function createChatHandler({
-  durableChat = null, fs, path, crypto, fetch, codeTasksFor = () => [], reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse,
+  stepSupervision = null, durableChat = null, fs, path, crypto, fetch, codeTasksFor = () => [], reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse,
 }) {
   async function handleChat(req, res, body, authn) {
     let preparation;
@@ -693,6 +693,15 @@ function createChatHandler({
       if (turn?.snapshot().calls.some(c => c.status === 'outcome_unknown')) break;
       if (toolCalls.size) toolOffset += Math.max(...toolCalls.keys()) + 1;
       if (round === 2 || toolCalls.size === 0) break; // last round or no tools requested
+      const supervised = await require('./step-supervision.cjs').superviseNextStep(
+        spaceId?.startsWith('diary') ? null : stepSupervision,
+        { round, messages: roundMessages, signal: chatSignal.signal });
+      if (supervised.decision) turn?.supervision(supervised.decision);
+      roundMessages = supervised.messages;
+      if (supervised.pause) {
+        send({ type: 'error', text: 'Step supervision requested review. No further tools were run. Review the results before continuing or choosing another model.' });
+        break;
+      }
     }
 
     if (chatSignal.signal.aborted) return; // client gone — nothing more to write

@@ -37,6 +37,7 @@ function createChatTurns({ enabled = false } = {}) {
       started(callId) { const c = call(callId); if (c.status !== 'not_started') throw Error('Tool already started; review required'); c.status = 'started'; save(); },
       uncertain(callId) { call(callId).status = 'outcome_unknown'; save(); },
       result(callId, result) { const c = call(callId); if (c.status === 'started' && /^ERROR/i.test(result)) c.status = 'outcome_unknown'; if (c.status === 'outcome_unknown') { c.error = result; save(); return; } if (!['not_started','started'].includes(c.status)) throw Error('Tool already resolved'); c.status = 'completed'; c.result = result; state.messages.push({role:'tool',tool_call_id:callId,content:result}); save(); },
+      supervision(decision) { state.supervision = [...(state.supervision || []), { round:state.round, ...clone(decision) }]; if (decision.action === 'escalate') state.reviewRequired = true; save(); },
       interrupt(reason) { state.interruptedPhase = state.phase; state.phase = 'interrupted'; state.failure = String(reason); save(); },
       complete() { if (state.calls.some(c => c.status !== 'completed')) throw Error('Unresolved tools require review'); state.phase = 'completed'; save(); jobs.append(id, 'job.completed'); },
     };
@@ -53,7 +54,7 @@ function createChatTurns({ enabled = false } = {}) {
     const turn = bind(workspace,id), state = turn.snapshot();
     const unresolved = state.calls.filter(c => c.status !== 'completed');
     let next = state.phase === 'completed' ? 'completed' : 'generate';
-    if (unresolved.some(c => ['started','outcome_unknown'].includes(c.status))) next = 'review';
+    if (state.reviewRequired || unresolved.some(c => ['started','outcome_unknown'].includes(c.status))) next = 'review';
     else if (unresolved.length) next = 'approval'; // Even approve_all is historical, never a restored grant.
     else if ((state.retries.remaining <= 0 || (state.round >= 2 && (state.phase === 'tools' || state.interruptedPhase === 'tools'))) && next !== 'completed') next = 'budget_exhausted';
     return { state, next, unresolved: unresolved.map(c => ({...c,status:['started','outcome_unknown'].includes(c.status) ? 'outcome_unknown' : c.status, reask:true})) };

@@ -6,7 +6,7 @@ const {createChatHandler}=require('./chat.cjs');
 const {createToolExchange}=require('./tool-exchange.cjs');
 const {createVisionProbe}=require('./vision.cjs');
 const {createChatTurns}=require('./chat-turns.cjs');
-async function run(t,ambiguous=false) {
+async function run(t,ambiguous=false,stepSupervision=null) {
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'noevia-chat-durable-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
   const userId='synthetic-user',projectId='fixture-project',service=createChatTurns({enabled:true});
   const events=[],res=new EventEmitter();res.writeHead=()=>{};res.write=line=>events.push(JSON.parse(line.slice(6)));res.end=()=>{res.writableEnded=true;res.emit('finish');};
@@ -33,7 +33,7 @@ async function run(t,ambiguous=false) {
     DIARY_BASE: 'http://fixture.invalid', TOOL_RESULT_CAP: 8000, json: () => {}, saveChats() {}, endpointApproved: () => true, diaryHeaders: () => ({}),
     lastLoadedModel: () => null, classifyFastOrSmart: async () => 'fast', servedCatalogue: async () => [], modelsInstalled: async () => [], missingRoles: () => [], staleRolesError: () => null,
     allToolboxes: () => [], executeToolCall: async () => { executions++; if (ambiguous) throw Error('connection lost after write'); return 'complete synthetic result'; }, chatWideApproved: () => false, awaitApproval: async ({onDecision}) => {onDecision('approve_all'); return 'approve';}, recordUsage() {}, recordToolUse() {},
-    ...context, durableChat:service,
+    ...context, durableChat:service, stepSupervision,
   });
   await handleChat({},res,{projectId,chatId:'fixture-chat',message:'synthetic write'});
   const job=require('./jobs.cjs').createJobs({dir}).list({kind:'chat'})[0];
@@ -52,4 +52,25 @@ test('real chat loop preserves an ambiguous tool exception and stops before anot
   const f=await run(t,true);assert.equal(f.executions,1);assert.equal(f.requests,1);
   assert.equal(f.service.restore(f.workspace,f.id).next,'review');
   await assert.rejects(f.service.resumeGeneration(f.workspace,f.id,{}),/review/);
+});
+
+test('supervision escalation persists review, preserves approval and never repeats a write',async t=>{
+  const supervisor=require('./step-supervision.cjs').createStepSupervision({enabled:()=>true,provider:{decide:async()=>({action:'escalate'})}});
+  const f=await run(t,false,supervisor);
+  assert.equal(f.requests,1);assert.equal(f.executions,1);
+  const restored=f.service.restore(f.workspace,f.id);
+  assert.equal(restored.next,'review');assert.equal(restored.state.calls[0].approval.action,'approve_all');
+  assert.equal(restored.state.supervision[0].action,'escalate');
+  await assert.rejects(f.service.resumeGeneration(f.workspace,f.id,{}),/review/);
+});
+test('verification changes projection only; canonical tools and retry budget survive',async t=>{
+  const supervisor=require('./step-supervision.cjs').createStepSupervision({enabled:()=>true,provider:{decide:async()=>({action:'verify'})}});
+  const f=await run(t,false,supervisor),s=f.service.restore(f.workspace,f.id).state;
+  assert.equal(f.requests,2);assert.equal(f.executions,1);assert.equal(s.retries.remaining,1);
+  assert.match(s.projection.messages.at(-1).content,/Check the preceding/);
+  assert.equal(s.messages.at(-1).content,'complete synthetic result');
+});
+test('ambiguous tool outcomes bypass supervision',async t=>{
+  const f=await run(t,true,{decide:async()=>{throw Error('must not supervise unresolved write');}});
+  assert.equal(f.requests,1);assert.equal(f.service.restore(f.workspace,f.id).next,'review');
 });
