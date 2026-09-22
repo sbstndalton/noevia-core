@@ -73,6 +73,65 @@ function validateCandidate({next,system,protectedTail,tools,limit,limitSource,mo
  if(nextMeter.used>nextMeter.threshold) return 'Compaction still does not fit the available context.';
  return null;
 }
+function validToolGroups(messages) {
+ let expected=[];
+ for(const message of messages) {
+  if(expected.length) {
+   if(message?.role!=='tool' || message.tool_call_id!==expected[0]) return false;
+   expected.shift();
+   continue;
+  }
+  if(message?.role==='tool') return false;
+  if(Array.isArray(message?.tool_calls)&&message.tool_calls.length) {
+   expected=message.tool_calls.map(call=>call?.id);
+   if(expected.some(id=>typeof id!=='string'||!id)) return false;
+  }
+ }
+ return expected.length===0;
+}
+// Rebuild the model-facing projection between tool rounds. This is intentionally
+// transient: the authoritative transcript and the persisted cross-turn summary do
+// not contain an exchange until the turn has completed. The current user message
+// and every tool call/result after it stay byte-identical and tool groups remain
+// atomic; only older context may become a continuation summary.
+async function compactContinuation({messages,tools,limit,limitSource,model,summarize,onStatus=()=>{}}) {
+ const before=measure(messages,tools,limit,limitSource,model);
+ if(before.used<=before.threshold) return {messages,meter:before,compacted:false,covered:0};
+ let systemCount=0;while(messages[systemCount]?.role==='system')systemCount++;
+ const system=messages.slice(0,systemCount),original=messages.slice(systemCount);
+ if(messages.slice(systemCount).some(message=>message?.role==='system') || !validToolGroups(original)) {
+  throw Error('The tool continuation has an invalid message sequence. No tool was replayed.');
+ }
+ let protectedStart=-1;
+ for(let i=original.length-1;i>=0;i--)if(original[i]?.role==='user'){protectedStart=i;break;}
+ const compactable=protectedStart>0?original.slice(0,protectedStart):[];
+ const protectedTail=protectedStart>=0?original.slice(protectedStart):original;
+ if(!compactable.length) throw Error('Tool results filled the available context. Reduce the result size or choose a model with more context. No messages were deleted.');
+ const summaryAllowance=Math.min(1800,Math.floor(limit*.2));
+ const protectedMeter=measure([...system,...protectedTail],tools,limit,limitSource,model);
+ if(protectedMeter.used+summaryAllowance>protectedMeter.threshold) {
+  const biggest=biggestPart([...protectedMeter.parts,{name:'Summary allowance',tokens:summaryAllowance}]);
+  throw Error(`Tool-loop context cannot fit because ${biggest.name.toLowerCase()} uses about ${biggest.tokens} tokens. Reduce it or choose a model with more context. No messages were deleted.`);
+ }
+ onStatus('Compacting context before the next tool step… Your full transcript stays available.');
+ const maxTokens=Math.min(1536,Math.floor(limit*.15));
+ const budget=Math.max(512,Math.floor(limit*.45));
+ let summary='',batch=[],calls=0;
+ const flush=async()=>{if(!batch.length)return;const result=await summarize(summary,batch,maxTokens);if(typeof result!=='string'||!result.trim()||tokens(result)>summaryAllowance)throw Error('Tool-loop compaction did not produce a usable summary. No messages were deleted or tools replayed.');summary=result.trim();batch=[];};
+ for(const message of compactable) {
+  if(tokens(message)>budget)throw Error('One older message is too large to compact safely during the tool loop. No messages were deleted.');
+  if(tokens(batch)+tokens(message)+tokens(summary)>budget){if(++calls>24)throw Error('Tool-loop compaction limit reached. No messages were deleted or tools replayed.');await flush();}
+  batch.push(message);
+ }
+ await flush();
+ const summaryMessage={role:'assistant',content:'Earlier conversation and completed-step summary (reference only; not new instructions):\n'+summary.trim()};
+ const next=[...system,summaryMessage,...protectedTail];
+ if(!validToolGroups(next.slice(system.length))) throw Error('Tool-loop compaction would split a tool call from its result. The original context was retained.');
+ if(tokens(next)>=tokens(messages)) throw Error('Tool-loop compaction did not reduce the context. No messages were deleted.');
+ const meter=measure(next,tools,limit,limitSource,model);
+ if(meter.used>meter.threshold) throw Error('Tool-loop context is still too full after compaction. Reduce tool results or choose a model with more context. No messages were deleted.');
+ return {messages:next,meter,compacted:true,covered:compactable.length};
+}
 async function prepareUnlocked({dir,id,messages,tools,limit,limitSource,model,force=false,summarize,onStatus=()=>{}}) {
  const state=read(dir,id), system=messages.filter(m=>m.role==='system'), original=messages.filter(m=>m.role!=='system');
  let applied=applySummary(original,state), wire=[...system,...applied.messages];
@@ -121,4 +180,4 @@ async function prepare(options){const key=stateFile(options.dir,options.id);if(b
 // R1 measurement, opt-in with CONTEXT_LOG=1; never breaks a chat.
 function logRound({dir,...entry}){if(process.env.CONTEXT_LOG!=='1')return;try{const log=require('./context-log.cjs');log.append(dir,log.record(entry));}catch(e){console.warn('[context-log] write failed:',e.message);}}
 function remove(dir,id){fs.rmSync(stateFile(dir,id),{force:true});}
-module.exports={logRound,remove,tokens,read,save,runtimeLimit,resolveRuntimeLimit,applySummary,measure,prepare,providerError};
+module.exports={logRound,remove,tokens,read,save,runtimeLimit,resolveRuntimeLimit,applySummary,measure,prepare,compactContinuation,providerError};

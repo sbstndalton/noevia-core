@@ -12,7 +12,7 @@ const { createChatHandler } = require('./chat.cjs');
 const contextDir=fs.mkdtempSync(require('node:path').join(require('node:os').tmpdir(),'chat-handler-test-'));
 test.after(()=>fs.rmSync(contextDir,{recursive:true,force:true}));
 
-function fixture({ rounds, decision = 'approve', execute, fallback = false, cancel = false, effort, reasoningOnly = false, skills = [], native = false, preambleText = '', routedIds = null } = {}) {
+function fixture({ rounds, decision = 'approve', execute, fallback = false, cancel = false, effort, reasoningOnly = false, skills = [], native = false, preambleText = '', routedIds = null, contextLimit = 32768 } = {}) {
   const resolvedFor = [];
   const events = [], executions = [], approvals = [], requests = [], audits = [], toolCounts = [];
   let round = 0, allApproved = false;
@@ -25,7 +25,7 @@ function fixture({ rounds, decision = 'approve', execute, fallback = false, canc
     return rounds[round++] || [];
   }
   const context = {
-    modelManager:{enabled:true,health:async()=>({ok:true,body:{all_models_loaded:[{model_name:'synthetic-model',loaded:true,recipe_options:{ctx_size:32768}}]}})},
+    modelManager:{enabled:true,health:async()=>({ok:true,body:{all_models_loaded:[{model_name:'synthetic-model',loaded:true,recipe_options:{ctx_size:contextLimit}}]}})},
     reasoningEffort: require('./reasoning-effort.cjs'), createToolExchange,
     crypto: require('node:crypto'), HISTORY_CAP: 20, DEFAULT_PROVIDER_ID: 'default',
     // The handler compacts a tool result before the model sees it; this
@@ -56,6 +56,11 @@ function fixture({ rounds, decision = 'approve', execute, fallback = false, canc
     },
     fetch: async (url, options) => {
       assert.equal(url, 'http://fixture.invalid/v1/chat/completions');
+      const requestBody=JSON.parse(options.body);
+      if(requestBody.stream===false && requestBody.messages?.some(message=>String(message.content||'').includes('Summarize conversation history'))) {
+        requests.push(requestBody);
+        return {ok:true,json:async()=>({choices:[{finish_reason:'stop',message:{content:'Earlier synthetic constraints and decisions.'}}]})};
+      }
       if (fallback && JSON.parse(options.body).stream) return { ok: true, body: (async function* () {})() };
       if (fallback) { const calls=completion(options); return {ok:true,status:200,json:async()=>({choices:[{message:{...(reasoningOnly && !calls.length ? {reasoning_content:'Synthetic internal plan: maybe search, then consider alternatives.'} : {}),tool_calls:calls.map(tc=>({id:tc.id,function:{name:tc.name,arguments:tc.args}}))}}]})}; }
       const calls = completion(options);
@@ -92,10 +97,10 @@ function fixture({ rounds, decision = 'approve', execute, fallback = false, canc
   });
   return {
     events, executions, approvals, requests, audits, toolCounts, resolvedFor,
-    async run(projectId = 'synthetic-project') {
+    async run(projectId = 'synthetic-project', body = {}) {
       round = 0; res.writableEnded = false;
-      await handleChat({}, res, { message: 'synthetic fixture', projectId, chatId: 'synthetic-chat' });
-      assert.equal(events.some(e => e.type === 'error'), false);
+      await handleChat({}, res, { message: 'synthetic fixture', projectId, chatId: 'synthetic-chat', ...body });
+      assert.equal(events.some(e => e.type === 'error'), false, JSON.stringify(events.filter(e=>e.type==='error')));
     },
   };
 }
@@ -319,4 +324,18 @@ test('a small tool result reaches the model byte-identical', async () => {
   const f = fixture({ rounds: [[{ id: 'c1', name: 'read', args: '{}' }], []], execute: () => 'result-plain' });
   await f.run();
   assert.equal(f.requests[1].messages.find((m) => m.role === 'tool').content, 'result-plain');
+});
+
+test('the real handler compacts again before an oversized tool continuation', async () => {
+  const raw='tool-result '.repeat(650);
+  const f=fixture({contextLimit:8000,rounds:[[{id:'c1',name:'read',args:'{}'}],[]],execute:()=>raw});
+  const history=[{role:'user',content:'Earlier request '+ 'a'.repeat(3600)},{role:'assistant',content:'Earlier answer '+ 'b'.repeat(3600)}];
+  await f.run('synthetic-project',{history});
+  const summaryRequest=f.requests.find(request=>request.stream===false&&request.messages?.some(message=>String(message.content||'').includes('Summarize conversation history')));
+  assert.ok(summaryRequest,'a continuation summary was requested');
+  const continuation=f.requests.find(request=>request.stream===true&&request.messages?.some(message=>message.role==='tool'));
+  assert.ok(continuation,'the tool continuation was sent after compaction');
+  assert.match(continuation.messages.find(message=>message.content?.startsWith('Earlier conversation and completed-step summary'))?.content||'',/Earlier synthetic constraints/);
+  assert.deepEqual(continuation.messages.slice(-3).map(message=>message.role),['user','assistant','tool']);
+  assert.ok(f.events.some(event=>event.type==='status'&&/Compacting context before the next tool step/.test(event.text)));
 });

@@ -87,3 +87,36 @@ test('a successful compaction keeps protected messages byte-identical',async t=>
  assert.equal(state.covered,8);
  assert.deepEqual(ctx.applySummary(original,state).messages.slice(-4),original.slice(-4));
 });
+test('tool-loop compaction preserves the current turn and complete tool groups',async()=>{
+ const current=[
+  {role:'user',content:'Use the lookup result to answer.'},
+  {role:'assistant',content:null,tool_calls:[{id:'call-1',type:'function',function:{name:'lookup',arguments:'{"id":1}'}}]},
+  {role:'tool',tool_call_id:'call-1',content:'result '.repeat(220)},
+ ];
+ const messages=[
+  {role:'system',content:'Pinned instructions.'},
+  {role:'user',content:'Old question. '+'x'.repeat(2800)},
+  {role:'assistant',content:'Old answer. '+'y'.repeat(2800)},
+  ...current,
+ ];
+ const summarized=[];
+ const out=await ctx.compactContinuation({messages,tools:[],limit:4000,limitSource:'test',model:'q',summarize:async(_previous,batch)=>{summarized.push(...batch);return 'The earlier exchange established the relevant background.';}});
+ assert.equal(out.compacted,true);
+ assert.deepEqual(summarized,messages.slice(1,3));
+ assert.deepEqual(out.messages.slice(-3),current);
+ assert.match(out.messages[1].content,/Earlier conversation and completed-step summary/);
+ assert.ok(out.meter.used<=out.meter.threshold);
+ assert.deepEqual(messages.slice(-3),current);
+});
+test('tool-loop compaction never repairs, drops, or replays an invalid tool group',async()=>{
+ let calls=0;
+ const messages=[{role:'system',content:'x'.repeat(4000)},{role:'user',content:'question'},{role:'tool',tool_call_id:'missing',content:'result'}];
+ await assert.rejects(ctx.compactContinuation({messages,tools:[],limit:1200,limitSource:'test',model:'q',summarize:async()=>{calls++;return 'summary';}}),/invalid message sequence/);
+ assert.equal(calls,0);
+});
+test('tool-loop compaction fails before inference when the protected turn cannot fit',async()=>{
+ let calls=0;
+ const messages=[{role:'assistant',content:'older '.repeat(500)},{role:'user',content:'current'},{role:'assistant',content:null,tool_calls:[{id:'c',type:'function',function:{name:'read',arguments:'{}'}}]},{role:'tool',tool_call_id:'c',content:'large '.repeat(1000)}];
+ await assert.rejects(ctx.compactContinuation({messages,tools:[],limit:1800,limitSource:'test',model:'q',summarize:async()=>{calls++;return 'summary';}}),/cannot fit/);
+ assert.equal(calls,0);
+});
