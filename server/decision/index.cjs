@@ -3,8 +3,7 @@
 // in front of pluggable backends. It never carries authority: the caller passes the ALLOWED
 // options/items and a deterministic fallback, the answer is validated against them, and every
 // failure — unavailable, slow, malformed, unsure — resolves to that fallback. Nothing here throws
-// into the caller. Not wired into chat yet: the RAG rerank prototype (experiments/system-one/rag)
-// is its first user.
+// into the caller. Used by offline experiments and the opt-in System-One auto-role router.
 
 const KINDS = new Set(['choice', 'multi', 'rank', 'noul', 'score']);
 

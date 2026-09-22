@@ -463,7 +463,12 @@ const autoRouter = require('./auto-router.cjs').createAutoRouter({
   fetchJson: (url, init, timeoutMs) => fetchJson(url, init, timeoutMs),
 });
 const { heuristicWantsSmart, heuristicWantsCode, classifierVerdict, CLASSIFIER_MAX_TOKENS } = autoRouter;
-const classifyFastOrSmart = (message) => autoRouter.classify(message);
+const systemOneRouter = require('./system-one-router.cjs').createSystemOneRouter({
+  enabled: () => features.enabled('systemOneRouting'),
+  roles: () => autoRoles(),
+  fallback: message => autoRouter.classify(message),
+});
+const classifyFastOrSmart = (message) => systemOneRouter.classify(message);
 
 // ── Chat: the loop lives in chat.cjs; everything it needs is handed over here ──
 const { handleChat } = require('./chat.cjs').createChatHandler({
