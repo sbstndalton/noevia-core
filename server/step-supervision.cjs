@@ -1,7 +1,7 @@
 'use strict';
 // Application checkpoint policy, not access to model reasoning. Providers are injected only.
 const VERIFY = 'Check the preceding tool results against the user request before continuing. Identify missing evidence and uncertainty. Do not assume a failed tool succeeded.';
-function createStepSupervision({ enabled = () => false, provider = null, deadlineMs = 500 } = {}) {
+function createStepSupervision({ enabled = () => false, provider = null, deadlineMs = 500, getDeadlineMs = null } = {}) {
   if (!Number.isFinite(deadlineMs) || deadlineMs < 1 || deadlineMs > 1500) throw Error('Invalid supervision deadline');
   return {
     async decide({ round, messages, signal }) {
@@ -12,12 +12,14 @@ function createStepSupervision({ enabled = () => false, provider = null, deadlin
         .map(m => ({ role: m.role, content: typeof m.content === 'string' ? m.content.slice(0, 1500) : '' }));
       // An ambiguous tool failure must not be reinterpreted as a successful step.
       if (outputs.some(m => m.role === 'tool' && /^ERROR/i.test(m.content))) return fallback;
+      const ms=getDeadlineMs ? getDeadlineMs() : deadlineMs;
+      if(!Number.isInteger(ms) || ms<1 || ms>1500) return fallback;
       const controller = new AbortController();
       let timer, abort;
       try {
         const unavailable = new Promise(resolve => {
           abort = () => { controller.abort(); resolve(null); };
-          timer = setTimeout(abort, deadlineMs);
+          timer = setTimeout(abort, ms);
           signal?.addEventListener('abort', abort, { once: true });
           if (signal?.aborted) abort();
         });

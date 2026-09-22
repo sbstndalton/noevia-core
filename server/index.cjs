@@ -87,8 +87,9 @@ const authService = createAuth({
     .map((s) => s.trim())
     .filter(Boolean),
 });
-const features = require('./features.cjs').createFeatures({ store: require('./features.cjs').settingsStore(authService.db), audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) });
-const featureRoutes = require('./routes/features.cjs').createFeatureRoutes({ features, json, readJson });
+const decisionSettings = require('./decision-settings.cjs').createDecisionSettings({ store: require('./features.cjs').settingsStore(authService.db), audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail) });
+const features = require('./features.cjs').createFeatures({ store: require('./features.cjs').settingsStore(authService.db), audit: (action, actor, detail) => authService.audit(action, actor, actor, detail), availability:{stepSupervision:decisionSettings.unavailable,systemOneRouting:()=>decisionSettings.unavailable() && require('./system-one-router.cjs').configuration().reason} });
+const featureRoutes = require('./routes/features.cjs').createFeatureRoutes({ features, json, readJson, decisionSettings });
 const pluginDirectoryRoutes = require('./routes/plugin-directory.cjs').createPluginDirectoryRoutes({ json });
 // Settings → Data: the signed-in user's conversations as a ZIP (routes/export.cjs).
 const exportRoutes = require('./routes/export.cjs').createExportRoutes({ json, workspace: () => ({ freeChats: Array.from(FREE_CHATS), projects: PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)) }), readHistory: (id) => readHistory(id), audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) });
@@ -464,6 +465,7 @@ const autoRouter = require('./auto-router.cjs').createAutoRouter({
 });
 const { heuristicWantsSmart, heuristicWantsCode, classifierVerdict, CLASSIFIER_MAX_TOKENS } = autoRouter;
 const systemOneRouter = require('./system-one-router.cjs').createSystemOneRouter({
+  getBackend: decisionSettings.backend, getDeadlineMs:()=>decisionSettings.get().timeoutMs,
   enabled: () => features.enabled('systemOneRouting'),
   roles: () => autoRoles(),
   fallback: message => autoRouter.classify(message),
@@ -474,7 +476,8 @@ const classifyFastOrSmart = (message) => systemOneRouter.classify(message);
 const { handleChat } = require('./chat.cjs').createChatHandler({
   stepSupervision: require('./step-supervision.cjs').createStepSupervision({
     enabled: () => features.enabled('stepSupervision'),
-    provider: require('./decision-endpoint.cjs').createDecisionEndpoint(), deadlineMs:1500,
+    getDeadlineMs:()=>decisionSettings.get().timeoutMs,
+    provider: {decide:(...args)=>{const backend=decisionSettings.backend();if(!backend)throw Error('Decision service unavailable');return backend.supervise(...args);}}, deadlineMs:1500,
   }),
   codeTasksFor: (project) => codeService.list(currentWorkspace(), project),
   // fetch is resolved per call, not captured: tests and QA swap the global at runtime.

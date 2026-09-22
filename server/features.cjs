@@ -8,7 +8,7 @@
 
 const REGISTRY = Object.freeze({
   stepSupervision: { env: 'NOEVIA_FEATURE_STEP_SUPERVISION', experimental: true, unavailable: env => require('./decision-endpoint.cjs').configuration(env).reason, label: 'Step supervision', description: 'Let a decision provider advise whether to continue, verify tool results or pause for review between chat steps. Keeps existing behavior if unavailable. Approvals and execution limits still apply.' },
-  systemOneRouting: { env: 'NOEVIA_FEATURE_SYSTEM_ONE_ROUTING', experimental: true, unavailable: env => require('./system-one-router.cjs').configuration(env).reason, label: 'System-One routing', description: 'Use the experimental option-logit baseline to choose Fast, Smart or Code for new Auto-routed messages. Falls back to the current router when unavailable. Manual model choices are unchanged.' },
+  systemOneRouting: { env: 'NOEVIA_FEATURE_SYSTEM_ONE_ROUTING', experimental: true, unavailable: env => require('./system-one-router.cjs').configuration(env).reason, label: 'System-One routing', description: 'Use the configured decision service to choose Fast, Smart or Code for new Auto-routed messages. Falls back to the current router when unavailable. Manual model choices are unchanged.' },
   previews: { env: 'NOEVIA_FEATURE_PREVIEWS', label: 'Preview surfaces', description: 'Show the unbuilt Scheduled, Plugins, Explore and Code previews.' },
   diaryMcpWrite: { env: 'NOEVIA_FEATURE_DIARY_MCP_WRITE', restart: true, label: 'Diary append tool', description: 'Offer an approval-gated, append-only Diary tool through the in-app MCP server.' },
   deepResearch: { env: 'NOEVIA_FEATURE_DEEP_RESEARCH', label: 'Deep research', description: 'Administrators can run bounded research jobs that save a cited report to a project.' },
@@ -32,7 +32,7 @@ function parseEnv(raw) {
  * @param {{ env?: Record<string,string|undefined>, store?: { get(key:string): string|undefined, set(key:string, value:string): void },
  *           audit?: (action:string, actor:string, detail:object)=>void, registry?: object }} deps
  */
-function createFeatures({ env = process.env, store = null, audit = () => {}, registry = REGISTRY } = {}) {
+function createFeatures({ env = process.env, store = null, audit = () => {}, registry = REGISTRY, availability = {} } = {}) {
   const state = new Map();
   for (const [name, spec] of Object.entries(registry)) {
     const fromEnv = parseEnv(env[spec.env]);
@@ -46,24 +46,25 @@ function createFeatures({ env = process.env, store = null, audit = () => {}, reg
     state.set(name, { value, source, boot: value, unavailable: spec.unavailable?.(env) || null });
   }
   const known = name => state.has(name);
+  const unavailable = name => availability[name] ? availability[name]() : state.get(name).unavailable;
   return {
     names: () => [...state.keys()],
     enabled(name) {
       if (!known(name)) throw new Error(`Unknown feature: ${name}`);
       const s = state.get(name);
-      return !s.unavailable && (registry[name].restart ? s.boot : s.value);
+      return !unavailable(name) && (registry[name].restart ? s.boot : s.value);
     },
     /** Booleans only: safe to send to any signed-in user. */
-    flags: () => Object.fromEntries([...state].map(([name, s]) => [name, !s.unavailable && (registry[name].restart ? s.boot : s.value)])),
+    flags: () => Object.fromEntries([...state].map(([name, s]) => [name, !unavailable(name) && (registry[name].restart ? s.boot : s.value)])),
     describe: () => [...state].map(([name, s]) => ({ name, label: registry[name].label, description: registry[name].description,
       enabled: s.value, source: s.source, locked: s.source === 'env', env: registry[name].env,
-      ...(registry[name].experimental ? { experimental: true, unavailable: s.unavailable } : {}),
+      ...(registry[name].experimental ? { experimental: true, unavailable: unavailable(name) } : {}),
       pendingRestart: !!registry[name].restart && s.value !== s.boot })),
     set(name, enabled, actorId) {
       if (!known(name)) throw Object.assign(new Error('Unknown feature'), { status: 404 });
       if (typeof enabled !== 'boolean') throw Object.assign(new Error('enabled must be true or false'), { status: 400 });
       if (state.get(name).source === 'env') throw Object.assign(new Error(`Set by the operator (${registry[name].env}); change it in the deployment configuration.`), { status: 409 });
-      if (enabled && state.get(name).unavailable) throw Object.assign(new Error(state.get(name).unavailable), { status: 409 });
+      if (enabled && unavailable(name)) throw Object.assign(new Error(unavailable(name)), { status: 409 });
       if (!store) throw Object.assign(new Error('Feature settings are not persistent here'), { status: 409 });
       store.set(SETTING_PREFIX + name, String(enabled));
       state.set(name, { ...state.get(name), value: enabled, source: 'admin' });

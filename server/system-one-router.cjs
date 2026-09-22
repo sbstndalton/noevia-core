@@ -17,14 +17,22 @@ function configuration(env = process.env) {
   } catch { return { reason }; }
 }
 
-function createSystemOneRouter({ enabled, roles, fallback, env = process.env, backend, deadlineMs = 1500 }) {
+function createSystemOneRouter({ enabled, roles, fallback, env = process.env, backend, getBackend = null, getDeadlineMs = null, deadlineMs = 1500 }) {
   const config = configuration(env);
   const candidate = backend || (config.baseUrl ? llamaLogitBackend({ baseUrl: config.baseUrl,
     fetchImpl: (url, init) => fetch(url, { ...init, redirect: 'error' }) }) : null);
-  const decisions = createDecisions({ backends: candidate ? { baseline: candidate } : {}, chains: { 'model.route': ['baseline'] } });
+  let lastCandidate, decisions;
+  function currentDecisions() {
+    const current=getBackend ? (getBackend() || candidate) : candidate;
+    if(!current) return null;
+    if(current!==lastCandidate) { lastCandidate=current; decisions=createDecisions({backends:{configured:current},chains:{'model.route':['configured']}}); }
+    return decisions;
+  }
   return {
     async classify(message) {
-      if (!enabled() || !candidate) return fallback(message);
+      if (!enabled()) return fallback(message);
+      const decisions=currentDecisions();
+      if (!decisions) return fallback(message);
       const active = roles();
       if (!active?.fast || !active?.smart) return fallback(message);
       const options = [{ id: 'fast', label: 'Short simple questions and small talk' },
@@ -33,7 +41,7 @@ function createSystemOneRouter({ enabled, roles, fallback, env = process.env, ba
       const result = await decisions.decide({ kind: 'choice', purpose: 'model.route',
         question: 'Which configured model role should answer this user message?',
         context: { cloud: 'forbidden', stateText: String(message).slice(0, 1000) }, options,
-        constraints: { deadlineMs }, fallback: { selected: null, scores: {} } });
+        constraints: { deadlineMs: getDeadlineMs ? getDeadlineMs() : deadlineMs }, fallback: { selected: null, scores: {} } });
       // No async legacy call inside decide's synchronous fallback contract. Preserve the
       // existing classifier exactly, including its heuristics, on every rejected readout.
       return result.source !== 'fallback' && options.some(o => o.id === result.selected)
