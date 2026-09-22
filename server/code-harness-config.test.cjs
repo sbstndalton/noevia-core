@@ -85,18 +85,8 @@ test('Claude Code: every edit, command and fetch asks, bypass and auto modes are
   assert.ok(Object.isFrozen(EDIT_TOOLS), 'a caller cannot widen or narrow the list');
 });
 
-test('Codex: read-only sandbox, approvals on request, no web search, updates or analytics, untrusted project', () => {
-  const pinned = pinFilesFor({ ...base, harness: 'codex', engine: 'http://llama:8080', cwd: '/workspaces/t1' });
-  const file = fileOf(pinned, '.codex/config.toml');
-  assert.equal(file.base, 'home');
-  for (const line of ['approval_policy = "on-request"', 'sandbox_mode = "read-only"', 'web_search = "disabled"',
-    'check_for_update_on_startup = false', 'model_provider = "noevia"', `model = "${base.model}"`,
-    'base_url = "http://llama:8080/v1"', 'wire_api = "responses"', '[projects."/workspaces/t1"]', 'trust_level = "untrusted"', 'exporter = "none"']) {
-    assert.ok(file.content.includes(line), line);
-  }
-  assert.ok(!file.content.includes('never'), 'no approval policy that never asks');
-  assert.ok(!file.content.includes('bearer'), 'no token invented');
-  assert.ok(pinFilesFor({ ...base, harness: 'codex', apiKey: 'k"x' }).files[0].content.includes('experimental_bearer_token = "k\\"x"'), 'quoted safely');
+test('Codex is refused: measured, its commands run without asking inside its own sandbox', () => {
+  assert.throws(() => pinFilesFor({ ...base, harness: 'codex' }), (e) => e.status === 409 && /cannot pin/.test(e.message) && /without asking/.test(e.message));
 });
 
 test('pi: one local provider and model, no install telemetry, and a gate that fails closed', () => {

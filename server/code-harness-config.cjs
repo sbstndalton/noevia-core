@@ -65,11 +65,7 @@ function configFor({ harness, model, engine, contextTokens = 32768, outputTokens
 //     policy and CLI flags sit above it); `ask` rules cover Edit (every built-in file edit),
 //     Write, NotebookEdit, Bash, WebFetch and WebSearch; bypass and auto modes can be disabled;
 //     `env` in settings is honoured, which is how the endpoint and model are given.
-//   * Codex — learn.chatgpt.com/docs/config-file/config-reference: `$CODEX_HOME/config.toml`
-//     (default `~/.codex`); approval_policy is `on-request | never | granular`; `wire_api` only
-//     accepts `responses`. A read-only sandbox means every write or network use must escalate
-//     to an approval; read-only commands inside Codex's own sandbox can run without asking, so
-//     the container stays the real boundary (D14, D25).
+//   * Codex — refused; measured with the real adapter, see pinFilesFor below.
 //   * pi — github.com/badlogic/pi-mono (coding-agent README, docs/extensions.md, docs/models.md):
 //     no permission prompts by design; global extensions in `~/.pi/agent/extensions/` load
 //     without a trust prompt and a `tool_call` handler returning `{ block: true }` stops a call.
@@ -78,8 +74,6 @@ function configFor({ harness, model, engine, contextTokens = 32768, outputTokens
 
 const EDIT_TOOLS = Object.freeze(['Edit', 'Write', 'NotebookEdit', 'Bash', 'WebFetch', 'WebSearch']);
 const PI_READ_TOOLS = Object.freeze(['read', 'grep', 'find', 'ls']);
-
-const toml = (value) => JSON.stringify(String(value)); // a TOML basic string is a JSON string for these inputs
 
 function endpointFor({ model, engine }) {
   const name = String(model || '').trim();
@@ -105,30 +99,6 @@ function claudeSettings({ name, baseURL, apiKey }) {
       DISABLE_TELEMETRY: '1',
     },
   };
-}
-
-function codexToml({ name, baseURL, apiKey, cwd }) {
-  return [
-    '# Written by noevia for this task. Edits here are overwritten at the next task.',
-    `model = ${toml(name)}`,
-    'model_provider = "noevia"',
-    'approval_policy = "on-request"',
-    'sandbox_mode = "read-only"',
-    'web_search = "disabled"',
-    'check_for_update_on_startup = false',
-    '',
-    '[model_providers.noevia]',
-    'name = "noevia engine"',
-    `base_url = ${toml(baseURL)}`,
-    'wire_api = "responses"',
-    'requires_openai_auth = false',
-    ...(apiKey ? [`experimental_bearer_token = ${toml(apiKey)}`] : []),
-    '',
-    '[analytics]', 'enabled = false', '',
-    '[feedback]', 'enabled = false', '',
-    '[otel]', 'exporter = "none"', '',
-    ...(cwd ? [`[projects.${toml(cwd)}]`, 'trust_level = "untrusted"', ''] : []),
-  ].join('\n');
 }
 
 const PI_GATE = `// Written by noevia for this task: every tool that is not a plain read asks, with its full
@@ -168,9 +138,12 @@ function pinFilesFor({ harness, model, engine, contextTokens = 32768, outputToke
     ], permission: { ...PERMISSION }, model: e.name, endpoint: e.baseURL };
   }
   if (id === 'codex') {
-    const e = endpointFor({ model, engine });
-    return { harness: id, files: [{ base: 'home', path: '.codex/config.toml', content: codexToml({ ...e, apiKey, cwd }) }],
-      permission: { ...PERMISSION }, model: e.name, endpoint: e.baseURL };
+    // Measured 2026-09-22 with real codex-acp 1.12.0 / Codex 0.155 and noevia's config.toml: the
+    // adapter starts in its own "agent" mode (workspace writes, no asking) whatever config.toml
+    // says, and even in its read-only mode a plain `echo > file` ran without an approval — only
+    // commands the model itself escalates ever ask. Its gate is its OS sandbox, not a prompt, so
+    // "every command asks" (D14) cannot be pinned. Refused until that changes (config tried: docs/spec-agent-execution.md).
+    throw Object.assign(Error('noevia cannot pin the permissions of the codex harness (its commands run without asking inside its own sandbox), so it will not run it.'), { status: 409 });
   }
   if (id === 'pi') {
     const e = endpointFor({ model, engine });
