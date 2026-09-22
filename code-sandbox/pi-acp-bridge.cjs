@@ -1,7 +1,7 @@
 'use strict';
 // pi as an ACP agent, with its approvals routed to noevia.
 //
-// pi (github.com/badlogic/pi-mono) has no permission prompts by design and speaks its own JSONL
+// pi (github.com/earendil-works/pi) has no permission prompts by design and speaks its own JSONL
 // RPC (`pi --mode rpc`), not ACP. Community `pi-acp` adapters bridge the protocol but do not
 // document forwarding pi's extension dialogs, so with them noevia's gate could only fail closed.
 // This bridge is small on purpose: it is an ACP agent on stdio (the supervisor spawns it like any
@@ -18,10 +18,26 @@
 // bridge can only ever turn a question into "no" by itself, never into "yes".
 
 const { spawn } = require('node:child_process');
+const nodePath = require('node:path');
 
 const PROTOCOL_VERSION = 1;
 const KIND = { bash: 'execute', write: 'edit', edit: 'edit', read: 'read', grep: 'search', find: 'search', ls: 'search' };
 const DIALOGS = new Set(['confirm', 'select', 'input', 'editor']);
+
+/**
+ * Pin pi's noninteractive surface as tightly as its v0.87 CLI permits. Discovered extensions can
+ * execute before a tool call, so discovery is off and only noevia's managed gate is loaded.
+ * Project resources are never trusted, sessions are not persisted, and the model sees only the
+ * fixed tool set whose mutating members the gate intercepts.
+ */
+function piArgsFor(env = process.env) {
+  const home = typeof env?.HOME === 'string' ? env.HOME : '';
+  if (!nodePath.isAbsolute(home)) throw Error('The pi bridge needs the task private HOME.');
+  return ['--mode', 'rpc', '--offline', '--no-session', '--no-approve', '--no-context-files', '--no-extensions',
+    '--extension', nodePath.join(home, '.pi/agent/extensions/noevia-gate.js'),
+    '--no-skills', '--no-prompt-templates', '--no-themes',
+    '--tools', 'read,bash,edit,write,grep,find,ls'];
+}
 
 /** Strict LF framing (pi's RPC rule): split on \n only, strip one trailing \r. */
 function lines(onLine, limit = 16 * 1024 * 1024) {
@@ -57,7 +73,7 @@ function toolCallFor(payload) {
  * @param {{input: NodeJS.ReadableStream, output: NodeJS.WritableStream, piCommand?: string, piArgs?: string[],
  *          spawnFn?: typeof spawn, env?: object}} deps
  */
-function createBridge({ input, output, piCommand = 'pi', piArgs = ['--mode', 'rpc'], spawnFn = spawn, env = process.env }) {
+function createBridge({ input, output, piCommand = 'pi', piArgs = null, spawnFn = spawn, env = process.env }) {
   let nextId = 1;
   const waiting = new Map(); // our requests to the ACP client, by id
   let pi = null, sessionId = null, turn = null, piSeq = 0;
@@ -98,13 +114,15 @@ function createBridge({ input, output, piCommand = 'pi', piArgs = ['--mode', 'rp
       notify({ sessionUpdate: 'tool_call', ...toolCallFor({ toolCallId: event.toolCallId, toolName: event.toolName, input: event.args }), status: 'in_progress' });
     } else if (event.type === 'tool_execution_end') {
       notify({ sessionUpdate: 'tool_call_update', toolCallId: String(event.toolCallId || ''), status: event.isError ? 'failed' : 'completed' });
-    } else if (event.type === 'agent_end' && turn) {
+    } else if (event.type === 'agent_settled' && turn) {
+      // `agent_end` finishes only one low-level run; retry, compaction or continuation may
+      // follow. `agent_settled` is pi 0.87's promise that the whole user turn is actually done.
       const done = turn; turn = null; done({ stopReason: done.cancelled ? 'cancelled' : 'end_turn' });
     }
   }
 
   function startPi(cwd) {
-    pi = spawnFn(piCommand, piArgs, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] });
+    pi = spawnFn(piCommand, piArgs || piArgsFor(env), { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] });
     pi.stdout.setEncoding('utf8');
     pi.stdout.on('data', lines(onPiEvent));
     pi.stderr?.resume?.();
@@ -156,9 +174,9 @@ function createBridge({ input, output, piCommand = 'pi', piArgs = ['--mode', 'rp
   return { get pi() { return pi; } };
 }
 
-module.exports = { createBridge, toolCallFor, lines };
+module.exports = { createBridge, toolCallFor, lines, piArgsFor };
 
 if (require.main === module) {
   createBridge({ input: process.stdin, output: process.stdout,
-    piCommand: process.env.PI_COMMAND || 'pi', piArgs: ['--mode', 'rpc', '--offline'] });
+    piCommand: process.env.PI_COMMAND || 'pi' });
 }

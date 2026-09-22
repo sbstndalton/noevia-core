@@ -7,6 +7,7 @@ const send = (m) => process.stdout.write(JSON.stringify(m) + '\n');
 const script = JSON.parse(process.env.SCRIPT || '[]');
 let nextId = 1;
 const waiting = new Map();
+let sessionNew = null;
 const ask = (method, params) => new Promise((resolve) => { const id = nextId++; waiting.set(id, resolve); send({ jsonrpc: '2.0', id, method, params }); });
 
 process.stdin.setEncoding('utf8');
@@ -19,7 +20,7 @@ process.stdin.on('data', async (chunk) => {
     const m = JSON.parse(line);
     if (m.id !== undefined && m.method === undefined) { waiting.get(m.id)?.(m); waiting.delete(m.id); continue; }
     if (m.method === 'initialize') send({ jsonrpc: '2.0', id: m.id, result: { protocolVersion: 1, agentCapabilities: {} } });
-    else if (m.method === 'session/new') send({ jsonrpc: '2.0', id: m.id, result: { sessionId: 'session-1', _meta: { sawPermission: m.params?._meta?.noevia?.permission ?? null } } });
+    else if (m.method === 'session/new') { sessionNew = m.params; send({ jsonrpc: '2.0', id: m.id, result: { sessionId: 'session-1' } }); }
     else if (m.method === 'session/prompt') {
       const seen = [];
       for (const step of script) {
@@ -38,7 +39,7 @@ process.stdin.on('data', async (chunk) => {
         if (step.fail) return send({ jsonrpc: '2.0', id: m.id, error: { code: -32000, message: step.fail } });
         if (step.hang) return; // never answers: the client must be able to stop us
       }
-      send({ jsonrpc: '2.0', id: m.id, result: { stopReason: 'end_turn', seen } });
+      send({ jsonrpc: '2.0', id: m.id, result: { stopReason: 'end_turn', seen, sessionNew } });
     } else if (m.method === 'session/cancel') { if (process.env.IGNORE_CANCEL) return; process.exit(0); }
     else if (m.id !== undefined) send({ jsonrpc: '2.0', id: m.id, error: { code: -32601, message: 'no' } });
   }

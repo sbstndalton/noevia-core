@@ -168,4 +168,6 @@ test('the sandbox override stays hardened and unpublished', () => {
   const dockerfile = fs.readFileSync(path.join(__dirname, '../../../services/code-sandbox/Dockerfile'), 'utf8');
   assert.match(dockerfile, /^USER node$/m, 'nothing in the sandbox runs as root');
   assert.match(dockerfile, /ARG HARNESS_VERSION=\d+\.\d+\.\d+/);
+  assert.match(dockerfile, /pi-coding-agent[\s\S]*npm install -g --ignore-scripts/,
+    'the pinned pi install follows upstream and cannot run package lifecycle scripts');
 });

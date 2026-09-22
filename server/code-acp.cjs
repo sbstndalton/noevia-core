@@ -34,6 +34,7 @@
 // harness that ignores cancellation is not left running with a worktree checked out.
 const { spawn } = require('node:child_process');
 const net = require('node:net');
+const fs = require('node:fs'), nodePath = require('node:path');
 const { readAgent } = require('./code-meta.cjs');
 
 const PROTOCOL_VERSION = 1;
@@ -44,6 +45,49 @@ const GRACE_MS = 5000;
 const HANDSHAKE_MS = 30000;
 // JSON-RPC error codes we answer with; anything a handler throws without one is "internal".
 const INVALID_PARAMS = -32602, INTERNAL = -32603;
+
+/**
+ * Harness-specific session controls that cannot be expressed in ACP itself. Claude's adapter
+ * deliberately accepts Agent SDK options in this namespaced metadata. Supplying no filesystem
+ * sources keeps a repository's hooks, MCP servers, plugins and instructions out of the query;
+ * noevia's complete inline settings remain the highest user-controlled permission pin.
+ */
+function sessionMetadata({ permission = null, harness = null, settings = null } = {}) {
+  const meta = {};
+  if (permission) meta.noevia = { permission };
+  if (harness === 'claude-code') {
+    if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
+      throw Object.assign(Error('Claude Code needs noevia’s pinned session settings.'), { status: 409 });
+    }
+    meta.claudeCode = { options: {
+      // The complete noevia-owned settings object is supplied inline, so no user, project or
+      // local source is needed by the SDK query. This also excludes CLAUDE.md and plugins from a
+      // hostile checkout. The physical local file remains for the adapter's separate initial-
+      // mode lookup, which happens before it constructs that query.
+      settingSources: [],
+      strictMcpConfig: true,
+      allowDangerouslySkipPermissions: false,
+      plugins: [],
+      tools: ['Read', 'Edit', 'Write', 'NotebookEdit', 'Bash', 'Glob', 'Grep', 'WebFetch', 'WebSearch'],
+      extraArgs: { 'disable-slash-commands': null },
+      settings,
+    } };
+  }
+  return Object.keys(meta).length ? meta : null;
+}
+
+function readClaudeSettings(home) {
+  if (!home || !nodePath.isAbsolute(home)) {
+    throw Object.assign(Error('Claude Code needs the task private HOME for its pinned settings.'), { status: 409 });
+  }
+  try {
+    const parsed = JSON.parse(fs.readFileSync(nodePath.join(home, '.claude/settings.json'), 'utf8'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw Error('not an object');
+    return parsed;
+  } catch {
+    throw Object.assign(Error('Claude Code’s pinned settings are missing or invalid.'), { status: 409 });
+  }
+}
 
 /** One line of JSON per message, as ACP frames it over stdio. */
 function createLineReader(onMessage, onBad) {
@@ -68,14 +112,17 @@ function createLineReader(onMessage, onBad) {
  * `prompt(text)` and nothing else it has to know about.
  *
  * @param {{command: string, args?: string[], cwd: string, env?: object, handlers: object,
- *          signal?: AbortSignal, permission?: object, proxy?: {url: string}|null,
+ *          signal?: AbortSignal, permission?: object, harness?: string|null, proxy?: {url: string}|null,
  *          model?: string|null, onLog?: (line: string) => void, spawnFn?: Function,
  *          graceMs?: number}} options
  */
 async function connectAcp({ command, args = [], endpoint = null, cwd, env = {}, home = null, handlers, signal,
-  permission = null, proxy = null, model = null, onLog = () => {}, spawnFn = spawn,
+  permission = null, harness = null, proxy = null, model = null, onLog = () => {}, spawnFn = spawn,
   connectFn = net.connect, graceMs = GRACE_MS, handshakeMs = HANDSHAKE_MS }) {
   if (!command && !endpoint) throw Object.assign(Error('No coding harness is configured on this server.'), { status: 409 });
+  // Read this before starting the agent. A missing pin is a refusal, not a chance for Claude's
+  // adapter to fall back to whatever the checkout or its defaults say.
+  const harnessSettings = harness === 'claude-code' ? readClaudeSettings(home) : null;
 
   // The agent inherits nothing by default: no credentials, no tokens, no ambient proxy. What
   // it gets is what this object says, and the egress proxy is the only way out.
@@ -165,7 +212,8 @@ async function connectAcp({ command, args = [], endpoint = null, cwd, env = {}, 
     }));
     // `mcpServers: []` on purpose: a coding task's tools are the harness's own, gated here.
     // Anything noevia offers through MCP would arrive outside this gate.
-    return request('session/new', { cwd, mcpServers: [], ...(permission ? { _meta: { noevia: { permission } } } : {}) });
+    const meta = sessionMetadata({ permission, harness, settings: harnessSettings });
+    return request('session/new', { cwd, mcpServers: [], ...(meta ? { _meta: meta } : {}) });
   };
   let session;
   try {
@@ -276,10 +324,11 @@ function createAcpTransport({ command = process.env.CODE_HARNESS_COMMAND,
   endpoint = process.env.CODE_HARNESS_ENDPOINT || null, log = () => {}, spawnFn, connectFn } = {}) {
   // The sandbox wins when both are set: a deployment that has one should not fall back to
   // running the agent beside noevia's own state because of a stale variable.
-  return async function connect({ cwd, home, handlers, signal, permission, proxy, model }) {
+  return async function connect({ cwd, home, handlers, signal, permission, harness, proxy, model }) {
     return connectAcp({ command: endpoint ? null : command, args, endpoint, cwd, home, handlers, signal,
-      permission, proxy, model, onLog: (line) => log({ event: 'code.harness', line }), spawnFn, connectFn });
+      permission, harness, proxy, model, onLog: (line) => log({ event: 'code.harness', line }), spawnFn, connectFn });
   };
 }
 
-module.exports = { connectAcp, createAcpTransport, createLineReader, agentEnv, splitEndpoint, PROTOCOL_VERSION };
+module.exports = { connectAcp, createAcpTransport, createLineReader, agentEnv, splitEndpoint,
+  sessionMetadata, readClaudeSettings, PROTOCOL_VERSION };

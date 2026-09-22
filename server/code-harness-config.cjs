@@ -60,18 +60,17 @@ function configFor({ harness, model, engine, contextTokens = 32768, outputTokens
 // Each is pinned through the files that harness itself treats as authoritative, written by noevia
 // before the agent exists: into the task's working directory (`cwd`) or the private HOME noevia
 // gives every task (`home`, code-workspace.cjs). Primary sources, checked 2026-09-22:
-//   * Claude Code — code.claude.com/docs/en/{settings,permissions,env-vars}: project-local
-//     `.claude/settings.local.json` outranks user and shared-project settings (only managed
-//     policy and CLI flags sit above it); `ask` rules cover Edit (every built-in file edit),
-//     Write, NotebookEdit, Bash, WebFetch and WebSearch; bypass and auto modes can be disabled;
-//     `env` in settings is honoured, which is how the endpoint and model are given.
+//   * Claude Code — code.claude.com/docs/en/{settings,permissions,env-vars,sandboxing}:
+//     `ask` rules cover Edit (every built-in file edit), Write, NotebookEdit, Bash, WebFetch and
+//     WebSearch; bypass and auto modes can be disabled; sandboxed Bash auto-approval must also
+//     be disabled; `env` in settings is honoured, which is how the endpoint and model are given.
 //   * Codex — refused; measured with the real adapter, see pinFilesFor below.
 //   * Qwen Code — github.com/QwenLM/qwen-code docs/users/configuration/{settings,model-providers}.md:
 //     project `.qwen/settings.json` outranks the user file; `tools.approvalMode` now DEFAULTS to
 //     `auto` (an LLM classifier approves "safe" actions unasked), so `default` is pinned
 //     explicitly; credentials come from `process.env[envKey]`, and the settings file's own `env`
 //     section is honoured, which is how the endpoint key is given; `--acp` is the stable flag.
-//   * pi — github.com/badlogic/pi-mono (coding-agent README, docs/extensions.md, docs/models.md):
+//   * pi — github.com/earendil-works/pi (coding-agent docs/extensions.md, docs/models.md):
 //     no permission prompts by design; global extensions in `~/.pi/agent/extensions/` load
 //     without a trust prompt and a `tool_call` handler returning `{ block: true }` stops a call.
 //     noevia's gate asks for every tool that is not a plain read, with the full input, and
@@ -88,18 +87,36 @@ function endpointFor({ model, engine }) {
   return { name, baseURL: /\/v1$/.test(baseURL) ? baseURL : `${baseURL}/v1` };
 }
 
-function claudeSettings({ name, baseURL, apiKey }) {
+function claudeSecuritySettings() {
   return {
     permissions: {
       defaultMode: 'default', disableBypassPermissionsMode: 'disable', disableAutoMode: 'disable',
-      allow: [], deny: [], ask: [...EDIT_TOOLS],
+      blockReadsOutsideWorkingDirectories: true,
+      allow: [], deny: ['mcp__*'], ask: [...EDIT_TOOLS],
     },
+    // Claude's own sandbox defaults to auto-approving a sandboxed Bash call, even in Manual
+    // mode. The outer noevia container remains the security boundary, but D14 still requires
+    // every command to reach noevia's approval card.
+    sandbox: { autoAllowBashIfSandboxed: false },
+    // A checked-out repository must not gain pre-approval execution through a hook or a hosted
+    // connector. The ACP session also excludes project/local setting sources and filesystem MCPs.
+    disableAllHooks: true,
+    disableClaudeAiConnectors: true,
+    syncClaudeAiSkills: false,
+    syncClaudeAiPlugins: false,
+  };
+}
+
+function claudeSettings({ name, baseURL, apiKey }) {
+  return {
+    ...claudeSecuritySettings(),
     env: {
       // Claude Code appends /v1/messages itself; llama.cpp serves the Anthropic Messages API there.
       ANTHROPIC_BASE_URL: baseURL.replace(/\/v1$/, ''),
       ANTHROPIC_API_KEY: apiKey || 'none',
       ANTHROPIC_MODEL: name,
       DISABLE_AUTOUPDATER: '1',
+      DISABLE_UPDATES: '1',
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
       DISABLE_TELEMETRY: '1',
     },
@@ -117,7 +134,7 @@ export default function (pi) {
     // The message is machine-readable on purpose: noevia's pi bridge (services/code-sandbox/
     // pi-acp-bridge.cjs) turns it into an ACP permission request with the real tool and input.
     const payload = JSON.stringify({ noevia: 'tool_call', toolCallId: event.toolCallId ?? null, toolName: event.toolName, input: event.input ?? {} });
-    try { ok = await ctx.ui.confirm('Allow ' + event.toolName + '?', payload); } catch { ok = false; }
+    try { ok = await ctx.ui.confirm('Allow ' + event.toolName + '?', payload, { timeout: 300000 }); } catch { ok = false; }
     return ok === true ? undefined : { block: true, reason: 'Declined in noevia.' };
   });
 }
@@ -170,7 +187,7 @@ function pinFilesFor({ harness, model, engine, contextTokens = 32768, outputToke
     const e = endpointFor({ model, engine });
     const models = { providers: { noevia: { baseUrl: e.baseURL, api: 'openai-completions', apiKey: apiKey || 'none',
       models: [{ id: e.name, name: e.name, contextWindow: contextTokens, maxTokens: outputTokens, reasoning: false, input: ['text'] }] } } };
-    const settings = { defaultProvider: 'noevia', defaultModel: e.name, enableInstallTelemetry: false };
+    const settings = { defaultProvider: 'noevia', defaultModel: e.name, defaultProjectTrust: 'never', enableInstallTelemetry: false };
     return { harness: id, files: [
       { base: 'home', path: '.pi/agent/models.json', content: json(models) },
       { base: 'home', path: '.pi/agent/settings.json', content: json(settings) },
@@ -203,4 +220,5 @@ function writeHarnessConfig({ cwd, home = null, owner = null, ...options }) {
     permission: pinned.permission, model: pinned.model, endpoint: pinned.endpoint };
 }
 
-module.exports = { configFor, pinFilesFor, writeHarnessConfig, PERMISSION, EDIT_TOOLS, PI_READ_TOOLS };
+module.exports = { configFor, pinFilesFor, writeHarnessConfig, claudeSecuritySettings,
+  PERMISSION, EDIT_TOOLS, PI_READ_TOOLS };
