@@ -2,7 +2,7 @@
 const test=require('node:test'),assert=require('node:assert/strict');
 const {createStepSupervision,superviseNextStep}=require('./step-supervision.cjs');
 const input={round:0,messages:[{role:'user',content:'private request'},{role:'assistant',content:'visible output',reasoning_content:'hidden'},{role:'tool',tool_call_id:'call-a',content:'result'}]};
-const active=decide=>createStepSupervision({enabled:()=>true,provider:{decide},deadlineMs:10});
+const active=decide=>createStepSupervision({enabled:()=>true,provider:{decide},deadlineMs:10,log:()=>{}});
 test('default off and absent provider preserve existing behavior',async()=>{
   for(const supervisor of [createStepSupervision(),createStepSupervision({provider:{decide:()=>{throw Error('off');}}})])
     assert.deepEqual(await supervisor.decide(input),{action:'continue',source:'existing'});
@@ -37,4 +37,10 @@ test('unconfigured experiment cannot be activated by setting or operator env',()
   assert.equal(features.enabled('stepSupervision'),false);
   const normal=createFeatures({env:{},store:{get:()=>undefined,set:()=>assert.fail('must not persist activation')}});
   assert.throws(()=>normal.set('stepSupervision',true,'admin'),/Connect a private decision service/);
+});
+test('supervision logs the action and fallback without message content', async()=>{
+  const lines=[];
+  const s=createStepSupervision({enabled:()=>true,provider:{decide:async()=>({action:'verify'})},deadlineMs:50,log:e=>lines.push(e)});
+  await s.decide({round:0,messages:[{role:'user',content:'synthetic private goal'},{role:'tool',content:'x'}]});
+  assert.deepEqual(lines,[{round:0,action:'verify',fellBack:null}]);
 });

@@ -17,7 +17,8 @@ function configuration(env = process.env) {
   } catch { return { reason }; }
 }
 
-function createSystemOneRouter({ enabled, roles, fallback, env = process.env, backend, getBackend = null, getDeadlineMs = null, deadlineMs = 1500 }) {
+function createSystemOneRouter({ enabled, roles, fallback, env = process.env, backend, getBackend = null, getDeadlineMs = null, deadlineMs = 1500,
+  log = (entry) => console.info('[system-one] route', JSON.stringify(entry)) }) {
   const config = configuration(env);
   const candidate = backend || (config.baseUrl ? llamaLogitBackend({ baseUrl: config.baseUrl,
     fetchImpl: (url, init) => fetch(url, { ...init, redirect: 'error' }) }) : null);
@@ -47,8 +48,14 @@ function createSystemOneRouter({ enabled, roles, fallback, env = process.env, ba
         constraints: { deadlineMs: getDeadlineMs ? getDeadlineMs() : deadlineMs }, fallback: { selected: null, scores: {} } });
       // No async legacy call inside decide's synchronous fallback contract. Preserve the
       // existing classifier exactly, including its heuristics, on every rejected readout.
-      return result.source !== 'fallback' && options.some(o => o.id === result.selected)
-        ? result.selected : fallback(message);
+      const accepted = result.source !== 'fallback' && options.some(o => o.id === result.selected);
+      // One text-free line per decision, so live margins and fallback rates can be read from the
+      // web log before anything else is tuned. Never the message, never scores of other tenants.
+      const scores = Object.values(result.scores || {}).sort((a, b) => b - a);
+      log({ selected: accepted ? result.selected : 'legacy', options: options.length,
+        margin: scores.length > 1 ? Math.round((scores[0] - scores[1]) * 1000) / 1000 : null,
+        ms: result.metadata?.latencyMs ?? null, fellBack: accepted ? null : (result.metadata?.fellBack || 'rejected') });
+      return accepted ? result.selected : fallback(message);
     },
   };
 }

@@ -1,7 +1,8 @@
 'use strict';
 // Application checkpoint policy, not access to model reasoning. Providers are injected only.
 const VERIFY = 'Check the preceding tool results against the user request before continuing. Identify missing evidence and uncertainty. Do not assume a failed tool succeeded.';
-function createStepSupervision({ enabled = () => false, provider = null, deadlineMs = 500, getDeadlineMs = null } = {}) {
+function createStepSupervision({ enabled = () => false, provider = null, deadlineMs = 500, getDeadlineMs = null,
+  log = (entry) => console.info('[system-one] supervise', JSON.stringify(entry)) } = {}) {
   if (!Number.isFinite(deadlineMs) || deadlineMs < 1 || deadlineMs > 1500) throw Error('Invalid supervision deadline');
   return {
     async decide({ round, messages, signal }) {
@@ -29,9 +30,10 @@ function createStepSupervision({ enabled = () => false, provider = null, deadlin
           Promise.resolve().then(() => controller.signal.aborted ? null : provider.decide({ round, goal, outputs, choices: ['continue', 'verify', 'escalate'] }, { signal: controller.signal })),
           unavailable,
         ]);
-        if (signal?.aborted || !result || Object.keys(result).length !== 1 || !['continue','verify','escalate'].includes(result.action)) return fallback;
+        if (signal?.aborted || !result || Object.keys(result).length !== 1 || !['continue','verify','escalate'].includes(result.action)) { log({ round, action: 'continue', fellBack: 'no-decision' }); return fallback; }
+        log({ round, action: result.action, fellBack: null });
         return { action: result.action, source: 'experimental' };
-      } catch { return fallback; }
+      } catch { log({ round, action: 'continue', fellBack: 'error' }); return fallback; }
       finally { clearTimeout(timer); signal?.removeEventListener('abort', abort); controller.abort(); }
     },
   };

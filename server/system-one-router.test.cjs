@@ -7,7 +7,7 @@ const { createFeatures } = require('./features.cjs');
 function harness(decide = async () => ({ selected: 'smart', scores: { smart: 1 } })) {
   let on = false, calls = 0, legacy = 0;
   const router = createSystemOneRouter({ enabled: () => on, roles: () => ({ fast: 'a', smart: 'b' }),
-    fallback: async () => { legacy++; return 'fast'; }, deadlineMs: 10,
+    fallback: async () => { legacy++; return 'fast'; }, deadlineMs: 10, log: () => {},
     backend: { supports: () => true, locality: 'local', decide: async (...args) => { calls++; return decide(...args); } } });
   return { router, enable: value => { on = value; }, counts: () => [calls, legacy] };
 }
@@ -65,4 +65,13 @@ test('role labels name concrete examples of each role (measured on Laya)', async
   assert.deepEqual(seen[0].options.map(o => o.id), ['fast', 'smart']);
   assert.match(seen[0].options[0].label, /one-line factual/);
   assert.match(seen[0].options[1].label, /comparing, planning, reasoning/);
+});
+test('each decision logs role, margin and fallback but never the message', async () => {
+  const lines = [];
+  const router = createSystemOneRouter({ enabled: () => true, roles: () => ({ fast: 'a', smart: 'b' }),
+    fallback: async () => 'fast', deadlineMs: 50, log: e => lines.push(e),
+    backend: { supports: () => true, locality: 'local', decide: async () => ({ selected: 'smart', scores: { fast: 0.3, smart: 0.7 } }) } });
+  await router.classify('secret synthetic text');
+  assert.equal(lines[0].selected, 'smart'); assert.equal(lines[0].margin, 0.4); assert.equal(lines[0].fellBack, null);
+  assert.ok(!JSON.stringify(lines).includes('secret'));
 });
