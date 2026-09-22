@@ -153,6 +153,8 @@ function createDavHandler({ auth, settings, config, files }) {
           const folderTag=entry.isDir&&davOps&&wantsTag&&entry.path?await davOps.folderTag(identity.userId,entry.path):null;
           const props={displayname:xml(entry.name),resourcetype:entry.isDir?'<d:collection/>':'',getcontenttype:entry.isDir?'httpd/unix-directory':'text/markdown; charset=utf-8'};
           if(folderTag)props.getetag=xml(`"${folderTag}"`);
+          // Sync clients (Obsidian's Remotely Save) compare modification times; report the storage's own, never a guess.
+          if(Number.isFinite(entry.modified)&&entry.modified>0)props.getlastmodified=new Date(entry.modified*1000).toUTCString();
           if(!entry.isDir && (!selected||selected.some(p=>p.uri==='DAV:'&&['getetag','getcontentlength'].includes(p.local)))){
             const r=await files.read(identity.userId,entry.path);
             if(r.content===null)continue;
