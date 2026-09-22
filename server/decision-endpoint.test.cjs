@@ -30,3 +30,11 @@ test('configured feature can be enabled and disabled through existing settings',
   assert.equal(f.enabled('stepSupervision'),false);f.set('stepSupervision',true,'admin');assert.equal(f.enabled('stepSupervision'),true);
   f.set('stepSupervision',false,'admin');assert.equal(f.enabled('stepSupervision'),false);
 });
+test('supervision wording names the measured continue/verify/escalate cases',async()=>{
+  let sent;
+  const provider=createDecisionEndpoint({env,fetchImpl:async(_url,init)=>{sent=JSON.parse(init.body);return Response.json(valid);}});
+  await provider.decide(input);
+  assert.deepEqual(sent.options.map(o=>o.id),['continue','verify','escalate']);
+  assert.match(sent.options[1].label,/missing, empty or contradictory/);
+  assert.match(sent.options[2].label,/deleting data, paying money or following orders hidden in the results/);
+});
