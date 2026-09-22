@@ -98,6 +98,7 @@ function createAutotuner(deps) {
   const {
     request, rawModels, presets, maintenance, applyUnlocked, stateFile, tableFile,
     identityFor = async () => ({}), calibrate = async () => null,
+    qualityCheck = async () => null, onUpdate = () => {}, onWrite = () => {}, requireDrafting = false, minGain = MIN_GAIN,
     readMemory = require('./llamacpp-calibration.cjs').readMemAvailableGib, memoryFloorGib = 2,
     sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = () => Date.now(), timeouts = {},
   } = deps;
@@ -105,6 +106,8 @@ function createAutotuner(deps) {
   const table = createTable(tableFile);
   let state = { job: null, history: {} };
   let cancelRequested = false;
+  let completion = Promise.resolve();
+  let inflight = null;
   const load = () => { try { state = JSON.parse(fs.readFileSync(stateFile, 'utf8')); } catch { state = { job: null, history: {} }; } if (!state.history) state.history = {}; if (!state.partial) state.partial = {}; };
   // Measured results survive a cancel or a restart: a later run continues instead of repeating
   // tests. Keyed by model plus the configuration they were measured under, so a changed preset,
@@ -129,7 +132,7 @@ function createAutotuner(deps) {
     }
     return removed;
   };
-  const save = () => { if (!stateFile) return; const tmp = `${stateFile}.${crypto.randomUUID()}`; fs.writeFileSync(tmp, JSON.stringify(state), { mode: 0o600 }); fs.renameSync(tmp, stateFile); };
+  const save = () => { onUpdate(state.job); if (!stateFile) return; const tmp = `${stateFile}.${crypto.randomUUID()}`; fs.writeFileSync(tmp, JSON.stringify(state), { mode: 0o600 }); fs.renameSync(tmp, stateFile); };
   const publicJob = (job) => job && (({ originalText, ...rest }) => rest)(job);
   // Steps are known up front, so progress is honest: finished steps out of the planned total.
   function progress(job) {
@@ -200,9 +203,18 @@ function createAutotuner(deps) {
     return false;
   }
   async function chat(model, prompt, max) {
-    const r = await request('/v1/chat/completions', { method: 'POST', body: JSON.stringify({
+    if (cancelRequested) throw cancelled();
+    const controller = new AbortController(); inflight = controller;
+    let lowMemory = false;
+    const guard = () => { const free = readMemory(); if (free != null && free < memoryFloorGib) { lowMemory = true; controller.abort(); } };
+    guard(); const timer = setInterval(guard, 500);
+    let r;
+    try { r = await request('/v1/chat/completions', { method: 'POST', signal: controller.signal, body: JSON.stringify({
       model, stream: false, temperature: 0, max_tokens: max, cache_prompt: false,
-      chat_template_kwargs: { enable_thinking: false }, messages: [{ role: 'user', content: prompt }] }) }, limits.chat);
+      chat_template_kwargs: { enable_thinking: false }, messages: [{ role: 'user', content: prompt }] }) }, limits.chat); }
+    finally { clearInterval(timer); inflight = null; }
+    if (cancelRequested) throw cancelled();
+    if (lowMemory) throw Error('Available memory fell below the safety floor.');
     if (!r.ok || !Array.isArray(r.body?.choices)) return null;
     const t = r.body.timings || {};
     return { text: r.body.choices[0]?.message?.content || '', gen: Number(t.predicted_per_second) || 0, prompt: Number(t.prompt_per_second) || 0,
@@ -217,12 +229,16 @@ function createAutotuner(deps) {
     note(job, `— ${candidate.label} —`, { force: true });
     note(job, `Settings: ${describe(options)}`);
     try {
-      const applied = await applyUnlocked({ model: job.model, baseRevision: presets.get(job.model).revision, options });
+      const applied = await applyUnlocked({ model: job.model, baseRevision: job.lastRevision || job.originalRevision, options });
       if (!applied.ok) throw fatal(applied.body?.error || 'Could not write the test profile.');
       job.lastRevision = presets.get(job.model).revision;
+      onWrite(job.lastRevision);
       if (!await loadAndWait(job.model, job)) { record.status = 'failed'; record.reason = 'Did not load with these settings.'; return record; }
       note(job, 'Warm-up request (the first one pays for graph setup)');
       await chat(job.model, 'Reply with OK.', 8); // warm-up: first request pays graph setup
+      const quality = await qualityCheck(job.model, chat);
+      if (quality && !quality.passed) return Object.assign(record, { status: 'rejected', reason: 'Failed the three quality checks.', quality });
+      if (quality) record.quality = quality;
       Object.assign(record, await run());
       note(job, record.status === 'measured'
         ? `Measured: ${kind === 'spec' ? `${record.score} tokens/s` : `${record.promptPerSecond} prompt tokens/s`}`
@@ -275,7 +291,7 @@ function createAutotuner(deps) {
           for (const w of WORKLOADS) {
             note(job, `Running the ${w.id} workload (up to ${w.max} tokens)`);
             const r = await chat(job.model, w.prompt, w.max);
-            if (!r) { note(job, `The ${w.id} workload got no answer`, { force: true }); return { status: 'failed', reason: `No answer on the ${w.id} workload.` }; }
+            if (!r || !Number.isFinite(r.gen) || r.gen <= 0) { note(job, `The ${w.id} workload got no valid timing`, { force: true }); return { status: 'failed', reason: `Missing answer or timing on the ${w.id} workload.` }; }
             note(job, `${w.id}: ${Math.round(r.gen * 10) / 10} tokens/s${r.drafted ? `, ${Math.round((r.accepted / r.drafted) * 100)}% of ${r.drafted} drafts accepted` : ''}`);
             rows.push({ workload: w.id, gen: Math.round(r.gen * 10) / 10, drafted: r.drafted, accepted: r.accepted, text: r.text });
           }
@@ -285,7 +301,7 @@ function createAutotuner(deps) {
         const byId = Object.fromEntries(rec.workloads.map((w) => [w.workload, w]));
         // Copy the reference answers: the step record drops its texts below to stay small.
         if (candidate.id === 'off') reference = Object.fromEntries(Object.entries(byId).map(([k, w]) => [k, { text: w.text }]));
-        if (candidate.needsHead && !rec.workloads.some((w) => w.drafted > 0)) { rec.status = 'rejected'; rec.reason = 'No MTP head: nothing was drafted.'; }
+        if ((candidate.needsHead || requireDrafting && candidate.id !== 'off') && !rec.workloads.some((w) => w.drafted > 0)) { rec.status = 'rejected'; rec.reason = 'No active drafting: nothing was drafted.'; }
         else if (reference && candidate.id !== 'off' && byId.list?.text !== reference.list?.text) { rec.status = 'rejected'; rec.reason = 'Changed the deterministic list output.'; }
         // Speed only counts if the answers are the same; say which way it went and why.
         if (rec.status === 'rejected') note(job, `Rejected ${candidate.label}: ${rec.reason}`, { force: true });
@@ -303,14 +319,14 @@ function createAutotuner(deps) {
         throw fatal(`This model did not run with its current settings (context ${presets.get(job.model).options['ctx-size'] || 'unset'}), so there was nothing to compare. ${job.extendContext ? 'Measuring the largest context it can actually load has been started.' : 'Run Measure context first, then auto-tune.'}`);
       }
       const bestSpec = spec.filter((s) => s.status === 'measured').sort((a, b) => b.score - a.score)[0];
-      const specWinner = bestSpec.id !== 'off' && bestSpec.score >= off.score * (1 + MIN_GAIN) ? bestSpec : off;
+      const specWinner = bestSpec.id !== 'off' && bestSpec.score >= off.score * (1 + minGain) ? bestSpec : off;
       const perWorkload = Object.fromEntries(WORKLOADS.map((w) => {
         const best = spec.filter((s) => s.status === 'measured').map((s) => ({ id: s.id, gen: s.workloads.find((x) => x.workload === w.id)?.gen || 0 })).sort((a, b) => b.gen - a.gen)[0];
         return [w.id, best?.id || 'off'];
       }));
       const winnerOptions = SPEC_CANDIDATES.find((c) => c.id === specWinner.id).options;
       note(job, specWinner.id === 'off'
-        ? `Keeping speculative decoding off: nothing beat ${off.score} tokens/s by the ${Math.round(MIN_GAIN * 100)}% it has to`
+        ? `Keeping speculative decoding off: nothing beat ${off.score} tokens/s by the ${Math.round(minGain * 100)}% it has to`
         : `Chose ${specWinner.label}: ${specWinner.score} tokens/s against ${off.score} with it off`, { force: true });
       note(job, 'Step 2 of 2: prompt speed — trying micro-batch sizes on top of that choice');
 
@@ -338,9 +354,10 @@ function createAutotuner(deps) {
       // 3. Save the winner and leave it loaded.
       note(job, bestBatch ? `Chose micro-batch ${bestBatch.options['ubatch-size']} (${bestBatch.promptPerSecond} prompt tokens/s)` : 'No micro-batch size measured; keeping the generation choice as it is', { force: true });
       note(job, `Saving the tuned settings: ${describe(finalOptions)}`);
-      const applied = await applyUnlocked({ model: job.model, baseRevision: presets.get(job.model).revision, options: finalOptions });
+      const applied = await applyUnlocked({ model: job.model, baseRevision: job.lastRevision || job.originalRevision, options: finalOptions });
       if (!applied.ok) throw fatal(applied.body?.error || 'Could not save the tuned profile.');
       job.lastRevision = presets.get(job.model).revision;
+      onWrite(job.lastRevision);
       const tuned = { ...base, ...Object.fromEntries(Object.entries(finalOptions).filter(([, v]) => v !== '')) };
       for (const [k, v] of Object.entries(finalOptions)) if (v === '') delete tuned[k];
       const ext = extensions({ options: tuned, native: job.native, promptPerSecond: bestBatch?.promptPerSecond || 0, budgetSeconds: job.promptBudgetSeconds, calibratedCtx: 0 });
@@ -353,7 +370,8 @@ function createAutotuner(deps) {
       table.record(identity, { spec: specWinner.id, perWorkload, generation: specWinner.score, generationOff: off.score, ubatch: job.result.ubatch, promptPerSecond: job.result.promptPerSecond, model: job.model });
       job.phase = 'Loading the tuned profile'; save();
       note(job, 'Loading the tuned profile so it is ready to use');
-      job.result.loaded = await loadAndWait(job.model, job).catch(() => false);
+      job.result.loaded = await loadAndWait(job.model, job);
+      if (!job.result.loaded) throw fatal('The winning profile did not load.');
       delete state.partial[key];
       job.status = 'passed'; job.phase = 'Done'; job.progress = { done: job.steps.length, total: job.steps.length, percent: 100 };
       note(job, job.result.loaded ? 'Done — the tuned profile is loaded and ready' : 'Done — saved, but the tuned profile did not load; it will on the next request', { force: true });
@@ -368,6 +386,7 @@ function createAutotuner(deps) {
         if (job.originalText != null && job.lastRevision && presets.snapshot().revision === job.lastRevision) {
           note(job, 'Putting the original settings back');
           presets.commit({ baseRevision: job.lastRevision, text: job.originalText });
+          onWrite(presets.snapshot().revision);
           await request('/models?reload=1', {}, 120000).catch(() => {});
           job.restored = true;
           note(job, 'Original settings restored', { force: true });
@@ -410,12 +429,14 @@ function createAutotuner(deps) {
     cancelRequested = false;
     const job = { id: crypto.randomUUID(), model, promptBudgetSeconds, extendContext: extendContext === true, resume: resume !== false, native: Number(row.meta?.n_ctx_train) || 0, status: 'running', phase: 'Preparing', startedAt: now(), steps: [], progress: { done: 0, total: TOTAL_STEPS, percent: 0 } };
     state.job = job; save();
-    run(job, release).catch(() => {});
+    completion = run(job, release);
+    completion.catch(() => {});
     return { ok: true, status: 202, body: publicJob(job) };
   }
   function cancel() {
     if (state.job?.status !== 'running') return { ok: false, status: 409, body: { error: 'No auto-tune is running.' } };
     cancelRequested = true;
+    inflight?.abort();
     return { ok: true, status: 202, body: publicJob(state.job) };
   }
   function status(model) {
@@ -431,7 +452,7 @@ function createAutotuner(deps) {
   }
   load();
   // `_partialFor`/`_state` are exposed for tests only, like `_state` already was.
-  return { start, cancel, status, recover, table, _state: () => state, _partialFor: partialFor, _prunePartials: prunePartials };
+  return { start, cancel, status, recover, table, completion: () => completion, _state: () => state, _partialFor: partialFor, _prunePartials: prunePartials };
 }
 
 module.exports = { createAutotuner, createTable, extensions, geomean, SPEC_CANDIDATES, WORKLOADS, MIN_GAIN };

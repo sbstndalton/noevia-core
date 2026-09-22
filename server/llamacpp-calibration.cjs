@@ -42,6 +42,7 @@ function createCalibrator(deps) {
     readMemory = readMemAvailableGib,
     memoryFloorGib = 2,
     onResult = () => {},
+    onUpdate = () => {}, onWrite = () => {},
     sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
     now = () => Date.now(),
     timeouts = {},
@@ -49,12 +50,14 @@ function createCalibrator(deps) {
   const limits = { load: 600000, smoke: 180000, long: 7200000, unload: 60000, poll: 500, memoryPoll: 1000, recover: 180000, ...timeouts };
   let state = { job: null, history: {} };
   let cancelRequested = false, inflight = null;
+  let completion = Promise.resolve();
 
   function load() {
     try { state = JSON.parse(fs.readFileSync(stateFile, 'utf8')); } catch { state = { job: null, history: {} }; }
     if (!state.history || typeof state.history !== 'object') state.history = {};
   }
   function save() {
+    onUpdate(state.job);
     if (!stateFile) return;
     const temp = `${stateFile}.${crypto.randomUUID()}`;
     fs.writeFileSync(temp, JSON.stringify(state), { mode: 0o600 });
@@ -233,9 +236,10 @@ function createCalibrator(deps) {
     const memory = watchMemory(record, controller);
     const finish = (status, reason) => { record.status = status; if (reason) record.reason = reason; record.seconds = Math.round((now() - record.startedAt) / 1000); save(); return status === 'passed'; };
     try {
-      const applied = await applyUnlocked({ model: job.model, baseRevision: presets.get(job.model).revision, options: { ...job.base, 'ctx-size': String(ctx) } });
+      const applied = await applyUnlocked({ model: job.model, baseRevision: job.lastRevision || job.originalRevision, options: { ...job.base, 'ctx-size': String(ctx) } });
       if (!applied.ok) throw Object.assign(Error(applied.body?.error || 'Could not write the test profile.'), { fatal: true });
       job.lastRevision = presets.get(job.model).revision;
+      onWrite(job.lastRevision);
       const started = await request('/models/load', { method: 'POST', body: JSON.stringify({ model: job.model }), signal: controller.signal }, 120000);
       if (!started.ok) return finish('failed', 'The engine refused to load the model at this size.');
       const deadline = now() + limits.load;
@@ -329,13 +333,16 @@ function createCalibrator(deps) {
       if (low < 0) throw Object.assign(Error(`No size passed the long-prompt test within ${job.promptBudgetSeconds} s, down to ${start.toLocaleString('en-US')} tokens.`), { fatal: true });
       const chosen = sizes[low];
       job.result.verifiedCtx = chosen;
-      const applied = await applyUnlocked({ model: job.model, baseRevision: presets.get(job.model).revision, options: { ...job.base, 'ctx-size': String(chosen) } });
+      const applied = await applyUnlocked({ model: job.model, baseRevision: job.lastRevision || job.originalRevision, options: { ...job.base, 'ctx-size': String(chosen) } });
       if (!applied.ok) throw Object.assign(Error(applied.body?.error || 'Could not save the calibrated profile.'), { fatal: true });
+      job.lastRevision = presets.get(job.model).revision;
+      onWrite(job.lastRevision);
       job.result.appliedCtx = chosen;
       // Leave the model loaded with its calibrated profile, ready for the next chat.
       job.phase = 'Loading the calibrated profile';
       save();
       job.result.loaded = await loadAndWait(job.model);
+      if (!job.result.loaded) throw Object.assign(Error('The calibrated profile did not load.'), { fatal: true });
       job.status = 'passed';
       job.phase = 'Done';
       const props = await request('/props', {}, 8000).catch(() => null);
@@ -350,6 +357,7 @@ function createCalibrator(deps) {
       try {
         if (job.originalText != null && job.lastRevision && presets.snapshot().revision === job.lastRevision) {
           presets.commit({ baseRevision: job.lastRevision, text: job.originalText });
+          onWrite(presets.snapshot().revision);
           await request('/models?reload=1', {}, 120000).catch(() => {});
           job.restored = true;
         } else if (job.originalText != null && job.lastRevision) job.restored = false;
@@ -391,7 +399,8 @@ function createCalibrator(deps) {
     const job = { id: crypto.randomUUID(), model, promptBudgetSeconds, native, base, status: 'running', phase: 'Preparing', startedAt: now(), steps: [], memoryFloorGib, memoryGuard: readMemory() == null ? 'unavailable' : 'active' };
     state.job = job;
     save();
-    run(job, release).catch(() => {});
+    completion = run(job, release);
+    completion.catch(() => {});
     return { ok: true, status: 202, body: publicJob(job) };
   }
 
@@ -407,7 +416,7 @@ function createCalibrator(deps) {
   }
 
   load();
-  return { start, cancel, status, recover, _state: () => state };
+  return { start, cancel, status, recover, completion: () => completion, _state: () => state };
 }
 
 module.exports = { createCalibrator, ladder, readMemAvailableGib };

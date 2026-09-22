@@ -33,7 +33,7 @@ function fixture(t, { head = true, gen = { none: 20, mtp: 40, 'mtp-8': 46, 'mtp-
   const manager = createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic', presetPath: ini, fetchJson,
     calibrationStatePath: path.join(dir, 'cal.json'), autotuneStatePath: path.join(dir, 'tune.json'), autotuneTablePath: path.join(dir, 'table.json'),
     autoconfig: {}, calibrationOptions: { sleep: async () => {}, readMemory: () => 20 },
-    autotuneOptions: { sleep: async () => {}, readMemory: () => 20, identityFor: async () => ({ arch: 'qwen35', quant: 'Q5_K_M', hardware: 'synthetic-apu' }), ...(calibrateSpy ? { calibrate: calibrateSpy } : {}) } });
+    autotuneOptions: { speedOnly: true, sleep: async () => {}, readMemory: () => 20, identityFor: async () => ({ arch: 'qwen35', quant: 'Q5_K_M', hardware: 'synthetic-apu' }), ...(calibrateSpy ? { calibrate: calibrateSpy } : {}) } });
   return { manager, ini, original, router, section, dir, fetchJson };
 }
 async function finished(manager) {
@@ -262,7 +262,7 @@ test('a long load reports that it is still loading, instead of going quiet', asy
     },
     calibrationStatePath: path.join(f.dir, 'cal2.json'), autotuneStatePath: path.join(f.dir, 'tune2.json'), autotuneTablePath: path.join(f.dir, 'table2.json'),
     autoconfig: {}, calibrationOptions: { sleep: async () => {}, readMemory: () => 20 },
-    autotuneOptions: { sleep: async () => {}, now: () => clock, readMemory: () => 20, identityFor: async () => ({ arch: 'qwen35', quant: 'Q5_K_M', hardware: 'synthetic-apu' }) } });
+    autotuneOptions: { speedOnly: true, sleep: async () => {}, now: () => clock, readMemory: () => 20, identityFor: async () => ({ arch: 'qwen35', quant: 'Q5_K_M', hardware: 'synthetic-apu' }) } });
   await manager.autotune.start('synthetic', { confirmPause: true });
   const job = await finished(manager);
   const heartbeats = job.log.filter((l) => /^still loading · \d+s$/.test(l.text));
