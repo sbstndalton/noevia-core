@@ -464,7 +464,10 @@ const autoRouter = require('./auto-router.cjs').createAutoRouter({
   fetchJson: (url, init, timeoutMs) => fetchJson(url, init, timeoutMs),
 });
 const { heuristicWantsSmart, heuristicWantsCode, classifierVerdict, CLASSIFIER_MAX_TOKENS } = autoRouter;
+// Text-free decision record in the state directory: docker logs do not survive a deploy.
+const recordDecision = require('./decision-log.cjs').createDecisionLog({ dir: DATA_DIR });
 const systemOneRouter = require('./system-one-router.cjs').createSystemOneRouter({
+  log: (entry) => recordDecision('route', entry),
   getBackend: decisionSettings.backend, getDeadlineMs:()=>decisionSettings.get().timeoutMs,
   enabled: () => features.enabled('systemOneRouting'),
   roles: () => autoRoles(),
@@ -476,6 +479,7 @@ const classifyFastOrSmart = (message) => systemOneRouter.classify(message);
 const { handleChat } = require('./chat.cjs').createChatHandler({
   stepSupervision: require('./step-supervision.cjs').createStepSupervision({
     enabled: () => features.enabled('stepSupervision'),
+    log: (entry) => recordDecision('supervise', entry),
     getDeadlineMs:()=>decisionSettings.get().timeoutMs,
     provider: {decide:(...args)=>{const backend=decisionSettings.backend();if(!backend)throw Error('Decision service unavailable');return backend.supervise(...args);}}, deadlineMs:1500,
   }),
