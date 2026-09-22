@@ -268,15 +268,31 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     const quant=(/(?:^|[-_.])((?:UD-)?(?:IQ\d[\w]*|Q\d(?:_[\dKSMLX]+)*|F16|BF16|F32|MXFP4))(?:[-_.]|\.gguf$)/i.exec(require('node:path').basename(file))||[])[1]||null;
     let build=null;try{build=(await request('/props',{},8000))?.body?.build_info||null;}catch{}
     let memGiB=null;try{memGiB=Math.round(Number(/^MemTotal:\s+(\d+)/m.exec(require('node:fs').readFileSync('/proc/meminfo','utf8'))[1])/1048576);}catch{}
-    return {arch:read.meta?.arch||null,quant:quant&&quant.toUpperCase(),hardware:[autoconfig.hardwareLabel||null,memGiB?`${memGiB}GiB`:null,build].filter(Boolean).join(' ')||null};
+    const parsed=presets?require('./llamacpp-presets.cjs').parse(presets.snapshot().text):null;
+    const sectionText=name=>{const s=parsed?.sections.get(name);return s?parsed.lines.slice(s.start,s.end).join('\n'):'';};
+    return {arch:read.meta?.arch||null,quant:quant&&quant.toUpperCase(),artifact:evidenceLib.fileFingerprint(file),build,
+      profile:evidenceLib.identityHash([sectionText('*'),sectionText(model)]),
+      hardware:[autoconfig.hardwareLabel||null,memGiB?`${memGiB}GiB`:null,JSON.stringify(build)].filter(Boolean).join(' ')||null};
   }
   const calibrator=presets?require('./llamacpp-calibration.cjs').createCalibrator({request,rawModels,presets,maintenance,applyUnlocked,conservativeFor,onResult:({model,status,entry})=>recordEvidence(model,status==='passed'?{category:'context_capacity',result:'passed',value:{ctx:entry.verifiedCtx,appliedCtx:entry.appliedCtx,slots:entry.slots},suite:{name:'native-calibration',version:1},source:'calibration',limitations:[`prompt budget ${entry.promptBudgetSeconds} s`]}:{category:'context_capacity',result:'failed',value:null,suite:{name:'native-calibration',version:1},source:'calibration',limitations:[String(entry.error||'').slice(0,200)]}),stream:(path,opts={})=>(fetchStream||fetch)(base+path,{...opts,headers:headers(opts.headers),redirect:'error'}),stateFile:calibrationStatePath,memoryFloorGib:autoconfig.memoryFloorGib||2,...calibrationOptions}):null;
-  const autotuner=presets&&autotuneStatePath?require('./llamacpp-autotune.cjs').createAutotuner({request,rawModels,presets,maintenance,applyUnlocked,identityFor:tuneIdentity,
+  const speedDeps={request,rawModels,presets,maintenance,applyUnlocked,identityFor:tuneIdentity,
     calibrate:(model,promptBudgetSeconds)=>calibrator.start(model,{confirmPause:true,promptBudgetSeconds}),
-    stateFile:autotuneStatePath,tableFile:autotuneTablePath,memoryFloorGib:autoconfig.memoryFloorGib||2,...(calibrationOptions.readMemory?{readMemory:calibrationOptions.readMemory}:{}),...autotuneOptions}):null;
+    stateFile:autotuneStatePath,tableFile:autotuneTablePath,memoryFloorGib:autoconfig.memoryFloorGib||2,...(calibrationOptions.readMemory?{readMemory:calibrationOptions.readMemory}:{}),...autotuneOptions};
+  // Internal stages run under the full tuner's lease; the standalone context tool still
+  // acquires the real gate. No stage publishes success before the complete tune finishes.
+  const managedGate={hold:()=>()=>{}};
+  const autotuner=presets&&autotuneStatePath?(autotuneOptions.speedOnly===true
+    ?require('./llamacpp-autotune.cjs').createAutotuner(speedDeps)
+    :require('./llamacpp-full-autotune.cjs').createFullAutotuner({request,rawModels,presets,maintenance,applyUnlocked,identityFor:speedDeps.identityFor,stateFile:autotuneStatePath,
+      readMemory:speedDeps.readMemory,memoryFloorGib:speedDeps.memoryFloorGib,
+      onResult:async({model,result})=>{for(const [category,value] of [['context_capacity',{ctx:result.context,appliedCtx:result.context,slots:Number(presets.get(model).options.parallel)||1}],['throughput',{rate:result.generation}],...(result.acceptance==null?[]:[['mtp_acceptance',{rate:result.acceptance/100}]])])await recordEvidence(model,{category,result:'passed',value,suite:{name:'full-autotune',version:2},source:'autotune',limitations:['Three deterministic quality smoke probes, not a general quality benchmark','120 s default prompt budget; existing MTP head only']});},
+      speedFactory:hooks=>require('./llamacpp-autotune.cjs').createAutotuner({...speedDeps,maintenance:managedGate,stateFile:undefined,requireDrafting:true,minGain:0,...hooks}),
+      contextFactory:hooks=>require('./llamacpp-calibration.cjs').createCalibrator({request,rawModels,presets,applyUnlocked,conservativeFor,maintenance:managedGate,
+        stream:(path,opts={})=>(fetchStream||fetch)(base+path,{...opts,headers:headers(opts.headers),redirect:'error'}),
+        memoryFloorGib:autoconfig.memoryFloorGib||2,...calibrationOptions,stateFile:undefined,...hooks})})):null;
   return {
     kind: 'llamacpp', enabled: true, baseUrl: base, headers, request,
-    capabilities: { routing: true, load: true, unload: true, download: true, deleteCached: true, runtimeOptions: false, hardware: false, presets: !!presets },
+    capabilities: { routing: true, load: true, unload: true, download: true, deleteCached: true, runtimeOptions: false, hardware: false, presets: !!presets, autotune: !!autotuner },
     requireEnabled() {},
     listModels, health, load, downloads, makeRoomFor,
     close:tracker.close,
@@ -287,7 +303,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     reloadPresets,
     evidence, recordEvidence,
     calibration: calibrator ? { start: calibrator.start, cancel: calibrator.cancel, status: calibrator.status, recover: calibrator.recover } : null,
-    autotune: autotuner ? { start: autotuner.start, cancel: autotuner.cancel, status: autotuner.status, recover: autotuner.recover } : null,
+    autotune: autotuner ? { start: autotuner.start, cancel: autotuner.cancel, status: autotuner.status, recover: autotuner.recover, untuned: autotuner.untuned } : null,
     unload: model => mutate(()=>post('/models/unload', { model })),
     pull: ({ checkpoint }) => mutate(async () => {
       if (!/^[\w.-]+\/[\w.-]+(?::[\w.-]+)?$/.test(checkpoint || '')) return { ok: false, status: 400, body: { error: 'Choose a Hugging Face repository and quantization' } };

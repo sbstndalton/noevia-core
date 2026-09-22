@@ -161,6 +161,23 @@ test('engine-specific routes say what is unavailable and guard the method', asyn
   assert.deepEqual(native.sent.pop(), { status: 200, body: { cancelled: true } });
 });
 
+test('bulk tuning discovery and start are admin-only and the server owns the queue', async () => {
+  const starts = [];
+  const f = fixture({ manager: { autotune: {
+    untuned: async () => ({ status: 200, body: { models: ['m'], skipped: [] } }),
+    start: async (model, options) => { starts.push({ model, options }); return { status: 202, body: { status: 'running' } }; },
+  } } });
+  await f.call('GET', '/api/models/autotune/untuned');
+  assert.equal(f.sent.pop().status, 403);
+  await f.call('GET', '/api/models/autotune/untuned', undefined, 'admin');
+  assert.deepEqual(f.sent.pop().body.models, ['m']);
+  await f.call('POST', '/api/models/autotune', { untuned: true, confirmPause: true, models: ['untrusted'] }, 'admin');
+  assert.equal(f.sent.pop().status, 202);
+  assert.deepEqual(starts, [{ model: '', options: { confirmPause: true, promptBudgetSeconds: undefined, untuned: true } }]);
+  await f.call('POST', '/api/models/autotune/untuned', {}, 'admin');
+  assert.equal(f.sent.pop().status, 405);
+});
+
 test('the default model mode round-trips, and only an explicit apply switches existing projects', async () => {
   let saves = 0;
   const workspace = { userId: 'u1', preferences: {}, projects: [{ id: 'a', routing: 'manual' }, { id: 'b', routing: 'auto' }],
