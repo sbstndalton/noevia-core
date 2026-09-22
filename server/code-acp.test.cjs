@@ -1,7 +1,8 @@
 'use strict';
 const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
-const { connectAcp, createLineReader } = require('./code-acp.cjs');
+const { connectAcp, createAcpTransport, createLineReader } = require('./code-acp.cjs');
+const { pinFilesFor } = require('./code-harness-config.cjs');
 
 const AGENT = require.resolve('./fixtures/fake-acp-agent.cjs');
 const temps = [];
@@ -115,12 +116,49 @@ test('with no HOME given, none is invented', async () => {
   assert.equal(seen.updates[0].env, null, 'the sandbox supervisor supplies its own instead');
 });
 
-test('the pinned permission config is what the session is opened with', async () => {
-  const { agent } = await connect([], { permission: { edit: 'ask', bash: 'ask', webfetch: 'ask' } });
-  // The fake agent reports back what it saw on session/new.
+test('Claude sessions exclude repository settings, hooks and MCP while retaining the pinned permission config', async () => {
+  const permission = { edit: 'ask', bash: 'ask', webfetch: 'ask' };
+  const settings = JSON.parse(pinFilesFor({ harness: 'claude-code', model: 'fake', engine: 'http://engine.test/v1' })
+    .files.find((file) => file.base === 'home').content);
+  const home = temp(); fs.mkdirSync(path.join(home, '.claude'));
+  fs.writeFileSync(path.join(home, '.claude/settings.json'), JSON.stringify(settings));
+  const { agent } = await connect([], { permission, harness: 'claude-code', home });
+  // The fake agent reports back exactly what it saw on session/new.
   assert.ok(agent.sessionId);
   const result = await agent.prompt('x');
   assert.equal(result.stopReason, 'end_turn');
+  assert.deepEqual(result.sessionNew._meta.noevia.permission, permission);
+  assert.deepEqual(result.sessionNew._meta.claudeCode, { options: {
+    settingSources: [],
+    strictMcpConfig: true,
+    allowDangerouslySkipPermissions: false,
+    plugins: [],
+    tools: ['Read', 'Edit', 'Write', 'NotebookEdit', 'Bash', 'Glob', 'Grep', 'WebFetch', 'WebSearch'],
+    extraArgs: { 'disable-slash-commands': null },
+    settings,
+  } });
+  assert.deepEqual(result.sessionNew.mcpServers, []);
+});
+
+test('Claude is refused before spawn when its private pin is unavailable', async () => {
+  let spawned = false;
+  await assert.rejects(() => connectAcp({ command: 'claude-agent-acp', cwd: temp(), home: temp(),
+    harness: 'claude-code', handlers: handlers()[0], spawnFn: () => { spawned = true; } }), /missing or invalid/);
+  assert.equal(spawned, false);
+});
+
+test('the deployment transport preserves the selected harness and its Claude session pin', async () => {
+  const cwd = temp(), home = temp(), permission = { edit: 'ask', bash: 'ask', webfetch: 'ask' };
+  const settings = JSON.parse(pinFilesFor({ harness: 'claude-code', model: 'fake', engine: 'http://engine.test/v1' })
+    .files.find((file) => file.base === 'home').content);
+  fs.mkdirSync(path.join(home, '.claude'));
+  fs.writeFileSync(path.join(home, '.claude/settings.json'), JSON.stringify(settings));
+  const agent = await createAcpTransport({ command: process.execPath, args: [AGENT] })({
+    cwd, home, harness: 'claude-code', permission, handlers: handlers()[0],
+  });
+  const result = await agent.prompt('x');
+  assert.deepEqual(result.sessionNew._meta.claudeCode.options.settings, settings);
+  assert.deepEqual(result.sessionNew._meta.claudeCode.options.settingSources, []);
 });
 
 test('an agent error becomes a rejected prompt, and the subprocess is stopped', async () => {

@@ -13,7 +13,11 @@ ARG HARNESS_VERSION=1.18.31
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git ca-certificates \
  && rm -rf /var/lib/apt/lists/* \
- && npm install -g --no-fund --no-audit "${HARNESS_PACKAGE}@${HARNESS_VERSION}" \
+ && if [ "$HARNESS_PACKAGE" = "@earendil-works/pi-coding-agent" ]; then \
+      npm install -g --ignore-scripts --no-fund --no-audit "${HARNESS_PACKAGE}@${HARNESS_VERSION}"; \
+    else \
+      npm install -g --no-fund --no-audit "${HARNESS_PACKAGE}@${HARNESS_VERSION}"; \
+    fi \
  && npm cache clean --force
 
 WORKDIR /srv

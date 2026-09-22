@@ -76,10 +76,18 @@ test('Claude Code: every edit, command and fetch asks, bypass and auto modes are
   assert.equal(local.permissions.defaultMode, 'default');
   assert.equal(local.permissions.disableBypassPermissionsMode, 'disable');
   assert.equal(local.permissions.disableAutoMode, 'disable');
+  assert.equal(local.permissions.blockReadsOutsideWorkingDirectories, true);
+  assert.deepEqual(local.permissions.deny, ['mcp__*']);
+  assert.equal(local.sandbox.autoAllowBashIfSandboxed, false, 'sandboxing must not bypass the bare Bash ask rule');
+  assert.equal(local.disableAllHooks, true);
+  assert.equal(local.disableClaudeAiConnectors, true);
+  assert.equal(local.syncClaudeAiSkills, false);
+  assert.equal(local.syncClaudeAiPlugins, false);
   assert.equal(local.env.ANTHROPIC_BASE_URL, 'http://llama:8080', 'Claude Code appends /v1/messages itself');
   assert.equal(local.env.ANTHROPIC_MODEL, base.model);
   assert.equal(local.env.ANTHROPIC_API_KEY, 'k');
   assert.equal(local.env.DISABLE_AUTOUPDATER, '1');
+  assert.equal(local.env.DISABLE_UPDATES, '1');
   assert.equal(local.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, '1');
   assert.equal(fileOf(pinned, '.claude/settings.json').base, 'home');
   assert.ok(Object.isFrozen(EDIT_TOOLS), 'a caller cannot widen or narrow the list');
@@ -97,7 +105,8 @@ test('pi: one local provider and model, no install telemetry, and a gate that fa
   assert.equal(models.providers.noevia.api, 'openai-completions');
   assert.equal(models.providers.noevia.models[0].contextWindow, 16384);
   const settings = JSON.parse(fileOf(pinned, '.pi/agent/settings.json').content);
-  assert.deepEqual(settings, { defaultProvider: 'noevia', defaultModel: base.model, enableInstallTelemetry: false });
+  assert.deepEqual(settings, { defaultProvider: 'noevia', defaultModel: base.model,
+    defaultProjectTrust: 'never', enableInstallTelemetry: false });
 });
 
 test('pi gate: reads pass, everything else asks with full input, and no channel or an error blocks', async () => {
@@ -105,10 +114,11 @@ test('pi gate: reads pass, everything else asks with full input, and no channel 
   const mod = await import('data:text/javascript;base64,' + Buffer.from(gate).toString('base64'));
   let handler; mod.default({ on: (name, fn) => { assert.equal(name, 'tool_call'); handler = fn; } });
   const asked = [];
-  const ui = (answer) => ({ hasUI: true, ui: { confirm: async (title, body) => { asked.push([title, body]); if (answer instanceof Error) throw answer; return answer; } } });
+  const ui = (answer) => ({ hasUI: true, ui: { confirm: async (title, body, options) => { asked.push([title, body, options]); if (answer instanceof Error) throw answer; return answer; } } });
   assert.equal(await handler({ toolName: 'read', input: { path: 'a' } }, ui(false)), undefined);
   assert.equal(await handler({ toolName: 'bash', input: { command: 'rm -rf build' } }, ui(true)), undefined);
   assert.match(asked[0][1], /rm -rf build/, 'the full arguments are shown');
+  assert.deepEqual(asked[0][2], { timeout: 300000 }, 'a wedged bridge eventually fails closed');
   assert.equal((await handler({ toolName: 'write', input: {} }, ui(false))).block, true);
   assert.equal((await handler({ toolName: 'edit', input: {} }, ui(new Error('channel closed')))).block, true);
   assert.equal((await handler({ toolName: 'some_new_tool', input: {} }, { hasUI: false })).block, true);

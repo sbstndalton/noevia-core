@@ -26,7 +26,13 @@ process.stdin.on('data', (chunk) => {
       log(msg.confirmed === true ? 'ran' : 'blocked');
       out({ type: 'tool_execution_end', toolCallId: 'call_1', isError: msg.confirmed !== true });
       out({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: msg.confirmed ? 'Done.' : 'Skipped.' } });
+      // One low-level run ended, but the user turn has not settled yet. A bridge that resolves
+      // here can truncate a retry or compaction continuation.
       out({ type: 'agent_end' });
+      setTimeout(() => {
+        out({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: ' Settled.' } });
+        out({ type: 'agent_settled' });
+      }, 20);
     } else if (msg.type === 'abort') { log('aborted'); out({ type: 'agent_end' }); }
   }
 });

@@ -4,7 +4,7 @@
 const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const { connectAcp } = require('./code-acp.cjs');
-const { toolCallFor } = require('../../../services/code-sandbox/pi-acp-bridge.cjs');
+const { toolCallFor, piArgsFor } = require('../../../services/code-sandbox/pi-acp-bridge.cjs');
 const { classify, ACTIONS } = require('./code-actions.cjs');
 
 const BRIDGE = require.resolve('../../../services/code-sandbox/pi-acp-bridge.cjs');
@@ -21,6 +21,8 @@ test('an allowed pi command reaches noevia as a classifiable permission request 
   assert.equal(classify(call).action, ACTIONS.DELETE, 'noevia sees the real command, so a delete is classified as one');
   assert.equal(r.log(), 'ran');
   assert.ok(r.updates.some((u) => u.sessionUpdate === 'agent_message_chunk' && /Done/.test(u.content.text)));
+  assert.ok(r.updates.some((u) => u.sessionUpdate === 'agent_message_chunk' && /Settled/.test(u.content.text)),
+    'agent_end does not truncate a continuation before agent_settled');
   assert.ok(r.updates.some((u) => u.sessionUpdate === 'tool_call' && u.toolCallId === 'call_1'));
 });
 
@@ -53,7 +55,7 @@ async function runWithShim(t, answer, command) {
   // PI_COMMAND must be one executable; a shell script runs node on the fixture and drops pi's flags.
   const exe = path.join(dir, 'pi');
   fs.writeFileSync(exe, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(FAKE_PI)}\n`, { mode: 0o755 });
-  const agent = await connectAcp({ command: process.execPath, args: [BRIDGE], cwd: dir,
+  const agent = await connectAcp({ command: process.execPath, args: [BRIDGE], cwd: dir, home: dir,
     env: { PI_COMMAND: exe, FAKE_PI_LOG: logFile, ...(command ? { FAKE_PI_COMMAND: command } : {}) },
     handlers: {
       requestPermission: async (p) => { asked.push(p); return answer(p); },
@@ -69,7 +71,7 @@ test('other dialogs and confirms without noevia’s payload are refused without 
   const input = new PassThrough(), output = new PassThrough(), toPi = [];
   const fakePi = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(),
     stdin: { writable: true, write: (line) => { toPi.push(JSON.parse(line)); return true; } }, kill() {} });
-  createBridge({ input, output, spawnFn: () => fakePi });
+  createBridge({ input, output, env: { HOME: '/task-home' }, spawnFn: () => fakePi });
   const sent = []; output.setEncoding('utf8'); output.on('data', (d) => d.split('\n').filter(Boolean).forEach((l) => sent.push(JSON.parse(l))));
   input.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'session/new', params: { cwd: '/w' } }) + '\n');
   await new Promise((r) => setImmediate(r));
@@ -84,4 +86,15 @@ test('other dialogs and confirms without noevia’s payload are refused without 
     { type: 'extension_ui_response', id: 'c', confirmed: false },
   ]);
   assert.ok(!sent.some((m) => m.method === 'session/request_permission'), 'nothing reached the user as a question');
+});
+
+test('pi starts offline with no discovered resources, persistence or project trust', () => {
+  assert.deepEqual(piArgsFor({ HOME: '/workspaces/.harness-home/task-1' }), [
+    '--mode', 'rpc', '--offline', '--no-session', '--no-approve', '--no-context-files', '--no-extensions',
+    '--extension', '/workspaces/.harness-home/task-1/.pi/agent/extensions/noevia-gate.js',
+    '--no-skills', '--no-prompt-templates', '--no-themes',
+    '--tools', 'read,bash,edit,write,grep,find,ls',
+  ]);
+  assert.throws(() => piArgsFor({}), /private HOME/);
+  assert.throws(() => piArgsFor({ HOME: 'relative' }), /private HOME/);
 });
