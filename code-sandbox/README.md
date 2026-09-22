@@ -68,3 +68,12 @@ the agent beside noevia's own state.
 
 The harness version is pinned as a build argument. An agent that updates itself is a
 supply-chain change nobody reviewed, in the one container allowed to run arbitrary commands.
+
+## pi (not installed by default)
+
+pi has no permission prompts of its own and speaks JSONL RPC rather than ACP. noevia pins it with
+a gate extension written into the task's `~/.pi/agent/` (`server/code-harness-config.cjs`) and
+bridges it with `pi-acp-bridge.cjs`, which turns the gate's confirm into an ACP
+`session/request_permission`, so pi's commands reach the same approval card as any harness. The
+bridge can only turn a question into "no" by itself. Installing pi in this image is the user's
+decision (a supply-chain change); see docs/spec-agent-execution.md.

@@ -17,7 +17,10 @@ RUN apt-get update \
  && npm cache clean --force
 
 WORKDIR /srv
-COPY supervisor.cjs ./
+# pi-acp-bridge.cjs: noevia's own ACP bridge for pi (routes pi's approvals to noevia). Used only
+# when the image installs pi (HARNESS_PACKAGE=@earendil-works/pi-coding-agent) and runs with
+# CODE_HARNESS_COMMAND=node CODE_HARNESS_ARGS=/srv/pi-acp-bridge.cjs and CODE_HARNESS_NAME=pi on web.
+COPY supervisor.cjs pi-acp-bridge.cjs ./
 
 # `node` (uid 1000) already exists in this image. Nothing here runs as root.
 USER node

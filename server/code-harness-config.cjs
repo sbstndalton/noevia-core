@@ -139,7 +139,10 @@ export default function (pi) {
     if (READ.has(event.toolName)) return undefined;
     if (!ctx.hasUI) return { block: true, reason: 'noevia has no approval channel for this call, so it is blocked.' };
     let ok = false;
-    try { ok = await ctx.ui.confirm('Allow ' + event.toolName + '?', JSON.stringify(event.input ?? {}, null, 2)); } catch { ok = false; }
+    // The message is machine-readable on purpose: noevia's pi bridge (services/code-sandbox/
+    // pi-acp-bridge.cjs) turns it into an ACP permission request with the real tool and input.
+    const payload = JSON.stringify({ noevia: 'tool_call', toolCallId: event.toolCallId ?? null, toolName: event.toolName, input: event.input ?? {} });
+    try { ok = await ctx.ui.confirm('Allow ' + event.toolName + '?', payload); } catch { ok = false; }
     return ok === true ? undefined : { block: true, reason: 'Declined in noevia.' };
   });
 }
