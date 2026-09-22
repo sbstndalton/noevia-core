@@ -66,6 +66,11 @@ function configFor({ harness, model, engine, contextTokens = 32768, outputTokens
 //     Write, NotebookEdit, Bash, WebFetch and WebSearch; bypass and auto modes can be disabled;
 //     `env` in settings is honoured, which is how the endpoint and model are given.
 //   * Codex — refused; measured with the real adapter, see pinFilesFor below.
+//   * Qwen Code — github.com/QwenLM/qwen-code docs/users/configuration/{settings,model-providers}.md:
+//     project `.qwen/settings.json` outranks the user file; `tools.approvalMode` now DEFAULTS to
+//     `auto` (an LLM classifier approves "safe" actions unasked), so `default` is pinned
+//     explicitly; credentials come from `process.env[envKey]`, and the settings file's own `env`
+//     section is honoured, which is how the endpoint key is given; `--acp` is the stable flag.
 //   * pi — github.com/badlogic/pi-mono (coding-agent README, docs/extensions.md, docs/models.md):
 //     no permission prompts by design; global extensions in `~/.pi/agent/extensions/` load
 //     without a trust prompt and a `tool_call` handler returning `{ block: true }` stops a call.
@@ -144,6 +149,22 @@ function pinFilesFor({ harness, model, engine, contextTokens = 32768, outputToke
     // commands the model itself escalates ever ask. Its gate is its OS sandbox, not a prompt, so
     // "every command asks" (D14) cannot be pinned. Refused until that changes (config tried: docs/spec-agent-execution.md).
     throw Object.assign(Error('noevia cannot pin the permissions of the codex harness (its commands run without asking inside its own sandbox), so it will not run it.'), { status: 409 });
+  }
+  if (id === 'qwen-code') {
+    const e = endpointFor({ model, engine });
+    const settings = json({
+      tools: { approvalMode: 'default' },
+      security: { auth: { selectedType: 'openai' } },
+      model: { name: e.name, generationConfig: { contextWindowSize: contextTokens } },
+      modelProviders: { openai: [{ id: e.name, name: e.name, baseUrl: e.baseURL, envKey: 'NOEVIA_ENGINE_KEY' }] },
+      env: { NOEVIA_ENGINE_KEY: apiKey || 'none' },
+      general: { enableAutoUpdate: false },
+      privacy: { usageStatisticsEnabled: false },
+    });
+    return { harness: id, files: [
+      { base: 'cwd', path: '.qwen/settings.json', content: settings },
+      { base: 'home', path: '.qwen/settings.json', content: settings },
+    ], permission: { ...PERMISSION }, model: e.name, endpoint: e.baseURL };
   }
   if (id === 'pi') {
     const e = endpointFor({ model, engine });

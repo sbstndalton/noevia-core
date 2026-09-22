@@ -210,7 +210,7 @@ function parseUser(raw) {
 /** What this deployment runs. One entry today; the sandbox pins its version at build time. */
 function defaultHarnesses(env = process.env) {
   const id = String(env.CODE_HARNESS_NAME || 'opencode').trim() || 'opencode';
-  const labels = { opencode: 'OpenCode', 'claude-code': 'Claude Code', codex: 'Codex', pi: 'pi' };
+  const labels = { opencode: 'OpenCode', 'claude-code': 'Claude Code', codex: 'Codex', pi: 'pi', 'qwen-code': 'Qwen Code' };
   return [{ id, label: labels[id] || id, version: env.CODE_HARNESS_VERSION || null }];
 }
 

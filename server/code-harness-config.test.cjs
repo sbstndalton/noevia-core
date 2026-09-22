@@ -128,3 +128,16 @@ test('home-based harnesses need the private home and write everything into it, o
   assert.deepEqual(chowned.sort(), ['home/.claude', 'home/.claude/settings.json', 'tree/.claude', 'tree/.claude/settings.local.json']);
   assert.equal(fs.statSync(path.join(home, '.claude/settings.json')).mode & 0o777, 0o600);
 });
+
+test('Qwen Code: approvals pinned to default (not its auto classifier), one local provider, no updates or stats', () => {
+  const pinned = pinFilesFor({ ...base, harness: 'qwen-code', apiKey: 'k' });
+  assert.deepEqual(pinned.files.map((f) => `${f.base}:${f.path}`), ['cwd:.qwen/settings.json', 'home:.qwen/settings.json']);
+  const s = JSON.parse(pinned.files[0].content);
+  assert.equal(s.tools.approvalMode, 'default');
+  assert.equal(s.security.auth.selectedType, 'openai');
+  assert.equal(s.model.name, base.model);
+  assert.deepEqual(s.modelProviders.openai, [{ id: base.model, name: base.model, baseUrl: 'http://llama:8080/v1', envKey: 'NOEVIA_ENGINE_KEY' }]);
+  assert.equal(s.env.NOEVIA_ENGINE_KEY, 'k');
+  assert.equal(s.general.enableAutoUpdate, false);
+  assert.equal(s.privacy.usageStatisticsEnabled, false);
+});

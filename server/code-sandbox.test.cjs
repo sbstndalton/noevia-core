@@ -163,7 +163,8 @@ test('the sandbox override stays hardened and unpublished', () => {
   assert.doesNotMatch(code, /docker\.sock/, 'a socket holder is the finding this design exists to avoid');
   // The harness is pinned: an agent that updates itself is an unreviewed supply-chain change in
   // the one container allowed to run arbitrary commands.
-  assert.match(code, /HARNESS_VERSION:\s*"\d+\.\d+\.\d+"/);
+  // Pinned: an exact version, or a variable whose default is an exact version (the live .env pins its own).
+  assert.match(code, /HARNESS_VERSION:\s*"(\d+\.\d+\.\d+|\$\{[A-Z_]+:-\d+\.\d+\.\d+\})"/);
   const dockerfile = fs.readFileSync(path.join(__dirname, '../../../services/code-sandbox/Dockerfile'), 'utf8');
   assert.match(dockerfile, /^USER node$/m, 'nothing in the sandbox runs as root');
   assert.match(dockerfile, /ARG HARNESS_VERSION=\d+\.\d+\.\d+/);
