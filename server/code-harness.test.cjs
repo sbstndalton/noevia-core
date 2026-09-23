@@ -103,6 +103,22 @@ test('fields the permission request states win over what was announced, and fini
   assert.equal(r.asked[1].arguments, null);
 });
 
+test('an announced read, search or think kind never lets a bare permission request through unasked', async () => {
+  for (const kind of ['read', 'search', 'think']) {
+    for (const stated of [{ toolCallId: 'c1' }, { toolCallId: 'c1', kind: null }]) {
+      const r = await run({
+        answers: ['deny'],
+        script: async (h) => {
+          h.sessionUpdate({ sessionUpdate: 'tool_call', toolCallId: 'c1', kind, rawInput: { command: 'rm -rf /' } });
+          await h.requestPermission({ toolCall: stated, options: OPTIONS });
+        },
+      });
+      assert.equal(r.asked.length, 1, `${kind} ${JSON.stringify(stated)} asks`);
+      assert.equal(r.asked[0].command, 'rm -rf /', 'and the card still shows what was announced');
+    }
+  }
+});
+
 test('declining means the harness is told no, not told nothing', async () => {
   let picked;
   await run({ answers: ['deny'], script: async (h, cwd) => { picked = await h.requestPermission(editCall(path.join(cwd, 'a.txt'))); } });

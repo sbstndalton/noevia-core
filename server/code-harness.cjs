@@ -163,7 +163,13 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
       const toolCall = announced
         ? { ...announced, ...Object.fromEntries(Object.entries(stated).filter(([, v]) => v !== undefined && v !== null)) }
         : stated;
-      const classified = classify(toolCall);
+      let classified = classify(toolCall);
+      // The announcement explains the call; it cannot excuse it. A harness that asks is never
+      // waved through on a `read`/`think` kind it stated earlier (or omitted, or sent as null now).
+      if (announced && classified.approval === 'never') {
+        const own = classify(stated);
+        if (own.approval !== 'never') classified = { ...classified, approval: own.approval };
+      }
       counts.approvals++;
       const verdict = decide({ classified, capabilities, domains, inWorkspace: containment(classified) });
 
