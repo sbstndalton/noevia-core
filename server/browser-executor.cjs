@@ -177,8 +177,10 @@ function createBrowserExecutor({ launch, askApproval, secrets = {}, log = () => 
    * Run one action. The model's action names a `selector`; everything the gate judges is read here.
    * @returns {Promise<{status: 'done'|'blocked'|'needs_approval'|'uncertain', origin: string, reason?: string,
    *          evidence?: object, downloads?: object[]}>}
-   */
+  */
   async function act(sessionId, action = {}) {
+    let targetHandle = null;
+    try {
     // describeInPage is serialised into the page, so it must stay self-contained.
     const session = sessionOf(sessionId);
     if (session.closed) return { status: 'blocked', origin: '', reason: 'The browser session is closed.' };
@@ -199,7 +201,7 @@ function createBrowserExecutor({ launch, askApproval, secrets = {}, log = () => 
     }
 
     // The element as it really is, never as the model described it.
-    let element = null, locator = null, targetHandle = null;
+    let element = null, locator = null;
     if (action.selector && type !== 'navigate') {
       locator = page.locator(String(action.selector)).first();
       try {
@@ -320,6 +322,11 @@ function createBrowserExecutor({ launch, askApproval, secrets = {}, log = () => 
       return result(dispatched ? 'uncertain' : 'blocked', { reason, origin: originOf(session.page) });
     }
     return result('done', { origin: originOf(session.page), downloads: session.downloads.map(({ name, from }) => ({ name, from })) });
+    } finally {
+      // ElementHandle objects retain a remote browser object. One action owns at most one handle,
+      // and every outcome (including policy rejection and a declined approval) releases it.
+      if (targetHandle) try { await targetHandle.dispose(); } catch {}
+    }
   }
 
   /** What the audit and the approval card show about a session, masked. */

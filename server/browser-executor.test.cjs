@@ -13,7 +13,7 @@ test.after(() => { for (const d of temps) fs.rmSync(d, { recursive: true, force:
 
 /** A page whose elements are whatever `dom` says, recording every effect the executor causes. */
 function fakeBrowser({ dom = {}, url = ORIGIN + '/', failOn = null } = {}) {
-  const effects = [];
+  const effects = [], disposals = [];
   let screenshotCalls = 0;
   const handleFor = (selector) => {
     const node = dom[selector];
@@ -34,6 +34,7 @@ function fakeBrowser({ dom = {}, url = ORIGIN + '/', failOn = null } = {}) {
       press: async (key) => { attached(); effects.push(['press', selector, key]); },
       hover: async () => { attached(); effects.push(['hover', selector]); },
       setInputFiles: async (file) => { attached(); effects.push(['upload', selector, file]); },
+      dispose: async () => { disposals.push(selector); },
     };
   };
   const page = {
@@ -62,7 +63,7 @@ function fakeBrowser({ dom = {}, url = ORIGIN + '/', failOn = null } = {}) {
   let options = null;
   const browser = { newContext: async (o) => { options = o; return context; }, close: async () => {} };
   return { browser, effects, options: () => options, pageEmit: (event, value) => page.emit(event, value),
-    setUrl: (next) => { url = next; }, screenshotCalls: () => screenshotCalls };
+    setUrl: (next) => { url = next; }, screenshotCalls: () => screenshotCalls, disposals };
 }
 
 async function session({ dom, answers = [], secrets = {}, open = {}, failOn, onApproval } = {}) {
@@ -115,6 +116,20 @@ test('Allow once performs the action; a timeout or failure to answer does not', 
     assert.equal((await no.act({ type: 'click', selector: '#b' })).status, 'blocked');
     assert.deepEqual(no.effects, []);
   }
+});
+
+test('each action disposes its element handle after approved, declined and policy-blocked outcomes', async () => {
+  const approved = await session({ dom: { '#b': submitButton }, answers: ['approve'] });
+  assert.equal((await approved.act({ type: 'click', selector: '#b' })).status, 'done');
+  assert.deepEqual(approved.disposals, ['#b']);
+
+  const declined = await session({ dom: { '#b': submitButton }, answers: ['deny'] });
+  assert.equal((await declined.act({ type: 'click', selector: '#b' })).status, 'blocked');
+  assert.deepEqual(declined.disposals, ['#b']);
+
+  const blocked = await session({ dom: { '#f': textField }, secrets: { bank: { value: SECRET, domains: ['bank.example.test'] } } });
+  assert.equal((await blocked.act({ type: 'type', selector: '#f', text: '{{secret:bank}}' })).status, 'blocked');
+  assert.deepEqual(blocked.disposals, ['#f']);
 });
 
 test('a secret is typed only on its own site, and never appears in a result, card or log', async () => {
