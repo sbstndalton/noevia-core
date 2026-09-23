@@ -350,3 +350,76 @@ test('closing is best-effort: no session id is a no-op, and a refusal never thro
     assert.equal(called, 1);
   } finally { global.fetch = realFetch; }
 });
+
+test('failed handshakes close issued sessions and preserve the original error', async (t) => {
+  for (const failure of ['notification', 'status', 'malformed', 'rpc', 'mismatched', 'no-session']) {
+    for (const cleanup of ['ok', 'refused', 'network', 'timeout']) {
+      await t.test(`${failure}; DELETE ${cleanup}`, async () => {
+        const requests = [];
+        const original = new Error('notification failed');
+        const realFetch = global.fetch;
+        global.fetch = async (url, options) => {
+          requests.push({ url, ...options });
+          if (options.method === 'DELETE') {
+            if (cleanup === 'network') throw new Error('cleanup failed');
+            if (cleanup === 'timeout') return new Promise((resolve, reject) => {
+              options.signal.addEventListener('abort', () => reject(new Error('cleanup aborted')), { once: true });
+            });
+            return { ok: cleanup === 'ok', status: cleanup === 'ok' ? 200 : 405 };
+          }
+          const body = JSON.parse(options.body);
+          if (body.method === 'notifications/initialized') throw original;
+          const text = failure === 'malformed' ? '{' : JSON.stringify({
+            jsonrpc: '2.0', id: failure === 'mismatched' ? -1 : body.id,
+            ...(failure === 'rpc' ? { error: { code: -1, message: 'initialize failed' } } : { result: { serverInfo: { name: 'fixture' } } }),
+          });
+          return new Response(failure === 'status' || failure === 'no-session' ? 'initialize denied' : text, {
+            status: failure === 'status' || failure === 'no-session' ? 500 : 200,
+            headers: { 'content-type': 'application/json', ...(failure === 'no-session' ? {} : { 'mcp-session-id': 'issued-session' }) },
+          });
+        };
+        try {
+          const expected = {
+            notification: (error) => error === original,
+            status: /MCP 500: initialize denied/,
+            malformed: (error) => error instanceof SyntaxError,
+            rpc: /MCP error -1: initialize failed/,
+            mismatched: /does not match request/,
+            'no-session': /MCP 500: initialize denied/,
+          }[failure];
+          await assert.rejects(mcp.connect('https://server.invalid/mcp', { Authorization: 'Bearer synthetic' }, 15), expected);
+          const deletes = requests.filter((r) => r.method === 'DELETE');
+          assert.equal(deletes.length, failure === 'no-session' ? 0 : 1);
+          if (deletes.length) {
+            assert.equal(deletes[0].headers['mcp-session-id'], 'issued-session');
+            assert.equal(deletes[0].headers.Authorization, 'Bearer synthetic');
+            assert.equal(deletes[0].headers['MCP-Protocol-Version'], '2025-06-18');
+            assert.equal(deletes[0].redirect, 'error');
+            assert.equal(deletes[0].signal.aborted, cleanup === 'timeout');
+          }
+        } finally { global.fetch = realFetch; }
+      });
+    }
+  }
+});
+
+test('a successful handshake leaves cleanup to its caller', async () => {
+  const methods = [];
+  const realFetch = global.fetch;
+  global.fetch = async (url, options) => {
+    if (options.method === 'DELETE') { methods.push('DELETE'); return { ok: true }; }
+    const body = JSON.parse(options.body);
+    methods.push(body.method);
+    if (body.method === 'notifications/initialized') return new Response(null, { status: 202 });
+    return new Response(JSON.stringify({ jsonrpc: '2.0', id: body.id, result: { serverInfo: { name: 'fixture' } } }), {
+      headers: { 'content-type': 'application/json', 'mcp-session-id': 'successful-session' },
+    });
+  };
+  try {
+    const result = await mcp.connect('https://server.invalid/mcp');
+    assert.deepEqual(result, { session: { id: 'successful-session' }, serverInfo: { name: 'fixture' } });
+    assert.deepEqual(methods, ['initialize', 'notifications/initialized']);
+    await mcp.disconnect('https://server.invalid/mcp', result.session);
+    assert.deepEqual(methods, ['initialize', 'notifications/initialized', 'DELETE']);
+  } finally { global.fetch = realFetch; }
+});

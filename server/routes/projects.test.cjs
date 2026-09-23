@@ -27,7 +27,7 @@ function fixture({ projects = [], diary = true } = {}) {
   const routes = createProjectRoutes({
     json: (res, status, body) => { sent.push({ status, body }); },
     readBody: async (req) => { let s = ''; for await (const c of req) s += c; return s; },
-    readJson: async (req) => { let s = ''; for await (const c of req) s += c; return s ? JSON.parse(s) : {}; },
+    readJson: require('../http.cjs').readJson,
     requestScope,
     dispatch: async (req, res) => { dispatched.push({ url: req.url, method: req.method, headers: req.headers, progress: requestScope.getStore()?.sourceProgress }); res.writeHead(200); res.end('{"ok":true}'); },
     currentWorkspace: () => ({ dir, userId: 'u1', ragDir: () => path.join(dir, 'rag'), assetDir: () => path.join(dir, 'assets') }),
@@ -156,4 +156,14 @@ test('chat attachments and the Diary context are created on POST and only read o
   assert.equal(f.sent.pop().body.project.id, 'chat-abc');
   await f.call('POST', '/api/diary/context');
   assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'Diary add-on is disabled' } });
+});
+
+
+test('malformed background source JSON is 400 before any job is dispatched', async () => {
+  const f = fixture({ projects: [{ id: 'p1' }] });
+  for (const suffix of ['upload', 'documents', 'sources/sync']) {
+    await assert.rejects(f.call('POST', `/api/projects/p1/${suffix}`, '{broken', '?background=1'),
+      { status: 400, message: 'invalid JSON' });
+  }
+  assert.deepEqual(f.dispatched, []);
 });
