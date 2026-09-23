@@ -330,3 +330,17 @@ test('shared project context reaches the agent ahead of the task, never the task
   await run({ sent: plain, script: async () => {} });
   assert.equal(plain[0], 'fix the bug');
 });
+
+test("a networked task's result says which hosts it reached and which were refused", async () => {
+  const forgotten = [];
+  const egress = { grant: () => ({ token: 't' }), revoke: () => 1,
+    activity: (taskId, { forget = false } = {}) => { if (forget) forgotten.push(taskId);
+      return { hosts: [{ host: 'github.com', allowed: 0, refused: 2, reason: 'host is not on this task’s list' }], allowed: 0, refused: 2 }; } };
+  const r = await run({ capabilities: [ACTIONS.NETWORK], domains: ['pypi.org'], egress, script: async () => {} });
+  assert.equal(r.job.result.network.refused, 2);
+  assert.equal(r.job.result.network.hosts[0].host, 'github.com');
+  assert.deepEqual(forgotten, [r.taskId], 'the tally is dropped when the task ends');
+  // No grant, no network section.
+  const offline = await run({ script: async () => {} });
+  assert.equal('network' in offline.job.result, false);
+});
