@@ -16,6 +16,7 @@ process.stdin.on('data', (chunk) => {
       prompt = msg.message;
       out({ id: msg.id, type: 'response', command: 'prompt', success: true });
       out({ type: 'agent_start' });
+      out({ type: 'message_update', assistantMessageEvent: { type: 'thinking_delta', delta: 'PRIVATE_REASONING' } });
       out({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: 'Cleaning up. ' } });
       const input = { command: process.env.FAKE_PI_COMMAND || 'rm -rf build' };
       out({ type: 'tool_execution_start', toolCallId: 'call_1', toolName: 'bash', args: input });
@@ -25,6 +26,7 @@ process.stdin.on('data', (chunk) => {
     } else if (msg.type === 'extension_ui_response' && msg.id === confirmId) {
       log(msg.confirmed === true ? 'ran' : 'blocked');
       out({ type: 'tool_execution_end', toolCallId: 'call_1', isError: msg.confirmed !== true });
+      out({ type: 'message_update', assistantMessageEvent: { type: 'thinking_delta', delta: 'HIDDEN_TOOL_REASONING' } });
       out({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: msg.confirmed ? 'Done.' : 'Skipped.' } });
       // One low-level run ended, but the user turn has not settled yet. A bridge that resolves
       // here can truncate a retry or compaction continuation.

@@ -3,15 +3,17 @@
 // tenant's directory, state derived from events, restart recovery, cancellation, and
 // capability sets fixed at creation. No scheduler; callers run the work in-process.
 const fs = require('node:fs'), path = require('node:path'), crypto = require('node:crypto');
+const MAX_ASSISTANT_OUTPUT_BYTES = 32 * 1024;
+const MAX_ASSISTANT_OUTPUT_EVENT_BYTES = 1024, MAX_ASSISTANT_OUTPUT_EVENTS = 64;
 
 const TYPES = new Set(['job.created', 'job.started', 'step.started', 'step.completed', 'progress', 'approval.requested',
   'approval.decided', 'tool.started', 'tool.completed', 'tool.uncertain', 'artifact.created', 'checkpoint.created',
-  'job.completed', 'job.failed', 'job.cancelled', 'job.interrupted', 'plan.proposed', 'plan.edited', 'plan.skipped']);
+  'job.completed', 'job.failed', 'job.cancelled', 'job.interrupted', 'plan.proposed', 'plan.edited', 'plan.skipped', 'assistant.output']);
 const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
 
 function derive(events) {
   const job = { id: null, kind: null, projectId: null, parentId: null, capabilities: [], status: 'queued', stage: null,
-    steps: [], artifacts: [], plan: null, checkpoint: null, pendingApproval: null, uncertain: [], result: null, error: null, createdAt: null, updatedAt: null };
+    steps: [], artifacts: [], plan: null, assistantOutput: null, checkpoint: null, pendingApproval: null, uncertain: [], result: null, error: null, createdAt: null, updatedAt: null };
   for (const e of events) {
     job.updatedAt = e.at;
     const d = e.data || {};
@@ -27,6 +29,17 @@ function derive(events) {
       case 'artifact.created': job.artifacts.push(d); break;
       case 'plan.proposed': case 'plan.edited': job.plan = { status: e.type.slice(5), question: d.question ?? null, subQuestions: d.subQuestions || [] }; break;
       case 'plan.skipped': job.plan = { status: 'skipped', question: d.question ?? null, subQuestions: [] }; break;
+      case 'assistant.output': {
+        const previous = job.assistantOutput || { text: '', truncated: false };
+        const incoming = typeof d.text === 'string' ? d.text : '';
+        const remaining = MAX_ASSISTANT_OUTPUT_BYTES - Buffer.byteLength(previous.text);
+        const text = previous.truncated ? '' : clipUtf8(incoming, remaining);
+        if (text || d.truncated === true || previous.text) job.assistantOutput = {
+          text: previous.text + text,
+          truncated: previous.truncated || d.truncated === true || text.length < incoming.length,
+        };
+        break;
+      }
       case 'checkpoint.created': job.checkpoint = d; break;
       case 'job.completed': job.status = 'completed'; job.result = d.result ?? null; job.pendingApproval = null; break;
       case 'job.failed': job.status = 'failed'; job.error = d.error ?? 'failed'; job.result = d.result ?? null; job.pendingApproval = null; break;
@@ -36,6 +49,18 @@ function derive(events) {
     }
   }
   return job;
+}
+
+function clipUtf8(text, maxBytes) {
+  if (maxBytes <= 0) return '';
+  let clipped = '', bytes = 0;
+  for (const unit of text) {
+    const char = /^[\uD800-\uDFFF]$/.test(unit) ? '\uFFFD' : unit;
+    const size = Buffer.byteLength(char);
+    if (bytes + size > maxBytes) break;
+    clipped += char; bytes += size;
+  }
+  return clipped;
 }
 
 // `kinds` scopes retention: stores sharing one jobs/ directory each prune only their own kinds.
@@ -75,6 +100,13 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
     // cancelled job (spec-deep-research §4 — never saved automatically).
     const finished = current.length ? derive(current) : null;
     if (finished && TERMINAL.has(finished.status) && !(type === 'artifact.created' && finished.status === 'cancelled')) throw Object.assign(Error('Job already finished'), { status: 409 });
+    if (type === 'assistant.output') {
+      if (finished?.kind !== 'code') throw Error('Assistant output belongs to Code jobs');
+      if (current.filter((row) => row.type === type).length >= MAX_ASSISTANT_OUTPUT_EVENTS) throw Error('Assistant output event limit reached');
+      const incoming = typeof data.text === 'string' ? data.text : '';
+      const text = clipUtf8(incoming, MAX_ASSISTANT_OUTPUT_EVENT_BYTES);
+      data = { text, truncated: data.truncated === true || text.length < incoming.length };
+    }
     const event = { job: id, seq: current.length + 1, type, at: now(), data };
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
     const sync = durable || current[0]?.hash;
@@ -164,4 +196,4 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
   return { create, run, append, get, list, cancel, recover, can, prune };
 }
 
-module.exports = { createJobs, derive, TYPES };
+module.exports = { createJobs, derive, TYPES, MAX_ASSISTANT_OUTPUT_BYTES, MAX_ASSISTANT_OUTPUT_EVENTS };

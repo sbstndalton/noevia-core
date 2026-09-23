@@ -26,7 +26,7 @@ const OPTIONS = [{ optionId: 'y', kind: 'allow_once' }, { optionId: 'ya', kind: 
  * part of the harness; `answers` is what the human says, in order.
  */
 async function run({ script, answers = [], capabilities = [], domains = [], egress = null,
-  agent = {}, promptResult = { stopReason: 'end_turn' }, sandboxKind = 'spawn', context = '', sent = [] }) {
+  agent = {}, promptResult = { stopReason: 'end_turn' }, sandboxKind = 'spawn', context = '', sent = [], onStarted = null }) {
   const dir = temp('noevia-hjobs-');
   const jobs = createJobs({ dir });
   const workspaces = createCodeWorkspaces({ dir, epoch: 'test' });
@@ -44,9 +44,10 @@ async function run({ script, answers = [], capabilities = [], domains = [], egre
     connect: async (args) => {
       const { handlers: h, cwd } = args;
       handlers = h; connected = args;
-      return { agent, prompt: async (text) => { sent.push(text); await script(h, cwd); return promptResult; } };
+      return { agent, prompt: async (text) => { sent.push(text); await script(h, cwd, args.signal); return promptResult; } };
     },
   });
+  if (onStarted) await onStarted(started, jobs);
   // jobs.run is started without being awaited, so wait for the job to reach a terminal state.
   for (let i = 0; i < 200 && !['completed', 'failed', 'cancelled'].includes(jobs.get(started.taskId)?.status); i++) {
     await new Promise((r) => setTimeout(r, 5));
@@ -270,6 +271,80 @@ test('the job records what happened, and the proxy token never reaches the recor
 
 const rawLog = (r) => fs.readFileSync(path.join(r.dir, 'jobs', r.taskId + '.jsonl'), 'utf8');
 const events = (r) => rawLog(r).split('\n').filter(Boolean).map((l) => JSON.parse(l));
+
+test('assistant output retains visible chunks across tool rounds without thoughts or tool data', async () => {
+  const r = await run({ script: async (h) => {
+    h.sessionUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'First. ' } });
+    h.sessionUpdate({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'PRIVATE_REASONING' } });
+    h.sessionUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'image', text: 'NOT_TEXT' } });
+    h.sessionUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 7 } });
+    h.sessionUpdate({ sessionUpdate: 'tool_call', toolCallId: 'a', kind: 'other', rawInput: { secret: 'TOOL_INPUT' } });
+    h.sessionUpdate({ sessionUpdate: 'tool_call_update', toolCallId: 'a', status: 'completed', content: [{ type: 'text', text: 'TOOL_OUTPUT' }] });
+    h.sessionUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Second.' } });
+    h.sessionUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: ' Settled.' } });
+  } });
+  assert.equal(r.job.status, 'completed');
+  assert.deepEqual(r.job.assistantOutput, { text: 'First. \n\nSecond. Settled.', truncated: false });
+  const rows = events(r);
+  assert.ok(rows.findIndex((e) => e.type === 'assistant.output') < rows.findIndex((e) => e.type === 'job.completed'));
+  assert.equal(JSON.stringify(r.job.assistantOutput).includes('PRIVATE_REASONING'), false);
+  assert.equal(JSON.stringify(r.job.assistantOutput).includes('TOOL_OUTPUT'), false);
+  assert.ok(rows.some((e) => e.type === 'tool.completed' && e.data.content === 'TOOL_OUTPUT'), 'tool summary remains separately journaled');
+});
+
+test('tiny chunks, split emoji and repeated tool rounds stay bounded at 32 KiB and 64 output events', async () => {
+  const r = await run({ script: async (h) => {
+    h.sessionUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '\uD83D' } });
+    h.sessionUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '\uDE00' } });
+    for (let i = 0; i < 30; i++) {
+      h.sessionUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'x' } });
+      h.sessionUpdate({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'hidden' } });
+      h.sessionUpdate({ sessionUpdate: 'tool_call', toolCallId: `c${i}`, kind: 'read' });
+      h.sessionUpdate({ sessionUpdate: 'tool_call_update', toolCallId: `c${i}`, status: 'completed' });
+    }
+    for (let i = 0; i < 600; i++) h.sessionUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '😀😀😀😀' } });
+    h.sessionUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'b'.repeat(40000) } });
+  } });
+  assert.equal(r.job.status, 'completed');
+  assert.ok(r.job.assistantOutput.text.startsWith('😀' + 'x'));
+  assert.equal(Buffer.byteLength(r.job.assistantOutput.text), 32 * 1024);
+  assert.equal(r.job.assistantOutput.truncated, true);
+  const outputRows = events(r).filter((e) => e.type === 'assistant.output');
+  assert.ok(outputRows.length <= 64, `${outputRows.length} output events`);
+  assert.equal(outputRows.filter((e) => e.data.truncated).length, 1);
+  assert.ok(events(r).filter((e) => e.type === 'progress').length < 10, 'chunk progress is coalesced');
+});
+
+test('pending assistant output flushes before a prompt failure', async () => {
+  const r = await run({ script: async (h) => {
+    h.sessionUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Partial explanation' } });
+    throw Error('synthetic failure');
+  } });
+  assert.equal(r.job.status, 'failed');
+  assert.equal(r.job.assistantOutput.text, 'Partial explanation');
+  const rows = events(r).map((e) => e.type);
+  assert.ok(rows.indexOf('assistant.output') < rows.indexOf('job.failed'));
+});
+
+test('graceful cancellation flushes pending output before the cancelled event', async () => {
+  let streamed = false;
+  const r = await run({
+    script: async (h, _cwd, signal) => {
+      h.sessionUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Partial before cancel' } });
+      streamed = true;
+      await new Promise((resolve) => signal.addEventListener('abort', resolve, { once: true }));
+    },
+    onStarted: async (started, jobs) => {
+      for (let i = 0; i < 200 && !streamed; i++) await new Promise((resolve) => setTimeout(resolve, 5));
+      assert.equal(streamed, true);
+      jobs.cancel(started.taskId);
+    },
+  });
+  assert.equal(r.job.status, 'cancelled');
+  assert.equal(r.job.assistantOutput.text, 'Partial before cancel');
+  const types = events(r).map((e) => e.type);
+  assert.ok(types.indexOf('assistant.output') < types.indexOf('job.cancelled'));
+});
 
 test('a finished task records what the harness reported, and what it did not', async () => {
   const r = await run({

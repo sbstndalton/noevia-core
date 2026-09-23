@@ -22,9 +22,11 @@
 const fs = require('node:fs'), nodePath = require('node:path');
 const { classify, decide, pickOption, ACTIONS } = require('./code-actions.cjs');
 const { readUsage, readContext, readExitCode, codingIdentity, summarize } = require('./code-meta.cjs');
+const { MAX_ASSISTANT_OUTPUT_BYTES, MAX_ASSISTANT_OUTPUT_EVENTS } = require('./jobs.cjs');
 
 const MAX_TEXT = 4000;                  // what a job event keeps, as chat keeps of a tool result
 const MAX_FILE_BYTES = 8 * 1024 * 1024; // one source file, not a database the agent found
+const OUTPUT_BATCH_BYTES = 1024, MAX_EARLY_FLUSHES = 30;
 
 /**
  * @param {{jobs: object, workspaces: object, egress?: object, now?: () => number,
@@ -96,7 +98,9 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
         });
         ctx.progress('running');
         // Shared project context (shared-context.cjs) goes in front of the task, never into its label.
-        const outcome = await agent.prompt(context ? `${context}\n\nTask:\n${String(prompt)}` : String(prompt));
+        let outcome;
+        try { outcome = await agent.prompt(context ? `${context}\n\nTask:\n${String(prompt)}` : String(prompt)); }
+        finally { session.flushOutput(); }
         // What the run can say about itself, and — just as much — what it could not (§1).
         const meta = session.meta(agent.agent, readUsage(outcome?._meta));
         const scope = codingIdentity({
@@ -148,6 +152,51 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
     // How full the window is, which the real harness reports and token usage, which it does not.
     let reportedContext = null;
     let messageChunks = 0;
+    let outputBytes = 0, outputBuffer = '', outputBufferBytes = 0, outputTruncated = false, pendingHighSurrogate = '';
+    let truncationRecorded = false, outputEvents = 0, earlyFlushes = 0, breakAfterTool = false;
+    let lastStage = null, lastStageAt = -Infinity, pendingStage = null;
+
+    const emitOutput = () => {
+      if (!outputBuffer && (!outputTruncated || truncationRecorded)) return;
+      if (outputEvents >= MAX_ASSISTANT_OUTPUT_EVENTS) throw Error('Assistant output event limit reached');
+      ctx.event('assistant.output', { text: outputBuffer, truncated: outputTruncated && !truncationRecorded });
+      outputEvents++;
+      outputBuffer = ''; outputBufferBytes = 0;
+      if (outputTruncated) truncationRecorded = true;
+    };
+    const appendOutput = (text, final = false) => {
+      if (outputTruncated) return;
+      let source = pendingHighSurrogate + text;
+      pendingHighSurrogate = '';
+      if (!final && /[\uD800-\uDBFF]$/.test(source)) {
+        pendingHighSurrogate = source.at(-1);
+        source = source.slice(0, -1);
+      }
+      for (const unit of source) {
+        const char = /^[\uD800-\uDFFF]$/.test(unit) ? '\uFFFD' : unit;
+        const bytes = Buffer.byteLength(char);
+        if (outputBytes + bytes > MAX_ASSISTANT_OUTPUT_BYTES) {
+          outputTruncated = true;
+          emitOutput();
+          break;
+        }
+        if (outputBufferBytes + bytes > OUTPUT_BATCH_BYTES) emitOutput();
+        outputBuffer += char; outputBufferBytes += bytes; outputBytes += bytes;
+        if (outputBufferBytes === OUTPUT_BATCH_BYTES) emitOutput();
+      }
+    };
+    const setStage = (stage) => {
+      if (stage === lastStage) { pendingStage = null; return; }
+      const at = now();
+      if (at - lastStageAt < 500) { pendingStage = stage; return; }
+      ctx.event('progress', { stage }); lastStage = stage; lastStageAt = at; pendingStage = null;
+    };
+    const flushOutput = () => {
+      appendOutput('', true);
+      emitOutput();
+      if (pendingStage && pendingStage !== lastStage) ctx.event('progress', { stage: pendingStage });
+      pendingStage = null;
+    };
 
     const record = (entry) => log({ at: now(), taskId, harness, model, ...entry });
 
@@ -245,6 +294,10 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
     function sessionUpdate(update = {}) {
       const kind = update.sessionUpdate || update.type;
       if (kind === 'tool_call') {
+        if ((outputBuffer || pendingHighSurrogate) && earlyFlushes < MAX_EARLY_FLUSHES) {
+          appendOutput('', true); emitOutput(); earlyFlushes++;
+        }
+        if (outputBytes > 0) breakAfterTool = true;
         counts.tools++;
         known(update);
         const classified = classify(update);
@@ -252,6 +305,7 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
         ctx.event('tool.started', { id: update.toolCallId, name: update.title || update.kind || 'tool',
           action: classified.action, kind: update.kind || null });
       } else if (kind === 'tool_call_update') {
+        if (outputBytes > 0) breakAfterTool = true;
         const done = update.status === 'completed' || update.status === 'failed';
         if (done) calls.delete(update.toolCallId); else known(update);
         if (done) {
@@ -275,14 +329,23 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
         // Streaming text arrives in many small chunks — 548 thought chunks and 50 message
         // chunks in one real run — so this counts chunks and says so, rather than calling them
         // turns.
-        if (kind === 'agent_message_chunk') messageChunks++;
+        if (kind === 'agent_message_chunk') {
+          messageChunks++;
+          const content = update.content;
+          if (content?.type === 'text' && typeof content.text === 'string' && content.text) {
+            if (breakAfterTool) appendOutput('\n\n');
+            breakAfterTool = false;
+            appendOutput(content.text);
+          }
+        }
         // Thoughts are progress, not stored reasoning: the spec keeps hidden reasoning out.
-        ctx.event('progress', { stage: kind === 'agent_thought_chunk' ? 'thinking' : 'writing' });
+        setStage(kind === 'agent_thought_chunk' ? 'thinking' : 'writing');
       }
     }
 
     return {
       handlers: { requestPermission, readTextFile, writeTextFile, sessionUpdate },
+      flushOutput,
       summary: () => ({ ...counts, workspace: workspace.path }),
       // Usage the harness streamed wins over anything on the prompt result: the real one reports
       // it in `usage_update` and leaves the result's `_meta` empty.
