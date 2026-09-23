@@ -127,6 +127,18 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
     // task should not be able to grow this without limit.
     const exits = [];
     const names = new Map(); // toolCallId -> what it was, so an exit code has a label
+    // ACP's permission request carries a ToolCallUpdate: only the fields that changed since the
+    // `tool_call` it names. DeepSeek Harness sends nothing but `toolCallId` there, so the command
+    // the human must see lives in the earlier `tool_call`. Merged by id, the request's own fields
+    // winning; bounded, and dropped once the call finishes.
+    const calls = new Map(); // toolCallId -> the call as announced so far
+    const known = (update) => {
+      const id = update.toolCallId;
+      if (!id) return;
+      const fields = Object.fromEntries(Object.entries(update).filter(([k, v]) => v !== undefined && v !== null && k !== 'sessionUpdate'));
+      if (!calls.has(id) && calls.size >= 200) calls.delete(calls.keys().next().value);
+      calls.set(id, { ...calls.get(id), ...fields });
+    };
     // OpenCode reports token usage in its own `usage_update`, not on the prompt result — found
     // by running the real thing. Whatever arrives goes through the same defensive reader, so a
     // harness using a different shape degrades to "not reported" rather than to a wrong number.
@@ -146,7 +158,11 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
       return verdicts.every((v) => v === true) ? true : null;
     };
 
-    async function requestPermission({ toolCall = {}, options = [] } = {}) {
+    async function requestPermission({ toolCall: stated = {}, options = [] } = {}) {
+      const announced = stated && stated.toolCallId ? calls.get(stated.toolCallId) : null;
+      const toolCall = announced
+        ? { ...announced, ...Object.fromEntries(Object.entries(stated).filter(([, v]) => v !== undefined && v !== null)) }
+        : stated;
       const classified = classify(toolCall);
       counts.approvals++;
       const verdict = decide({ classified, capabilities, domains, inWorkspace: containment(classified) });
@@ -222,12 +238,14 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
       const kind = update.sessionUpdate || update.type;
       if (kind === 'tool_call') {
         counts.tools++;
+        known(update);
         const classified = classify(update);
         if (update.toolCallId) names.set(update.toolCallId, update.title || update.kind || 'tool');
         ctx.event('tool.started', { id: update.toolCallId, name: update.title || update.kind || 'tool',
           action: classified.action, kind: update.kind || null });
       } else if (kind === 'tool_call_update') {
         const done = update.status === 'completed' || update.status === 'failed';
+        if (done) calls.delete(update.toolCallId); else known(update);
         if (done) {
           const exitCode = readExitCode(update);
           if (exitCode !== null && exits.length < 200) {
