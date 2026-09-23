@@ -2,9 +2,8 @@
 // BrowserExecutor policy (spec-agent-execution §6): what noevia decides before every browser
 // action, independent of which executor (Playwright/CDP, Browser Use) eventually carries it out.
 // Pure and deterministic on purpose — model output can REQUEST an action but never mark it safe,
-// so nothing here reads model text as an instruction. Not wired to anything yet: there is no
-// executor, route or flag. It exists so the executor is built around a tested gate, not the
-// other way round.
+// so nothing here reads model text as an instruction. The executor built around it is
+// browser-executor.cjs; neither is wired to a route, job or flag yet (no execution node exists).
 //
 // Three answers only: 'allow', 'needs_approval' (noevia's card: origin, element, typed values
 // with secrets masked), 'blocked'. Anything unrecognised needs approval; nothing unrecognised is
