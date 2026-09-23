@@ -178,6 +178,25 @@ test('bulk tuning discovery and start are admin-only and the server owns the que
   assert.equal(f.sent.pop().status, 405);
 });
 
+test('resume is admin-only, POST-only and passes renewed pause confirmation', async () => {
+  const calls = [];
+  const f = fixture({ manager: { autotune: {
+    resume: async options => { calls.push(options); return { status: options.confirmPause ? 202 : 400, body: { resumed: options.confirmPause } }; },
+  } } });
+  await f.call('POST', '/api/models/autotune/resume', { confirmPause: true });
+  assert.equal(f.sent.pop().status, 403);
+  await f.call('GET', '/api/models/autotune/resume', undefined, 'admin');
+  assert.equal(f.sent.pop().status, 405);
+  await f.call('POST', '/api/models/autotune/resume', {}, 'admin');
+  assert.equal(f.sent.pop().status, 400);
+  await f.call('POST', '/api/models/autotune/resume', { confirmPause: true }, 'admin');
+  assert.equal(f.sent.pop().status, 202);
+  assert.deepEqual(calls, [{ confirmPause: undefined }, { confirmPause: true }]);
+  const speedOnly = fixture({ manager: { autotune: { start: () => ({ status: 202, body: {} }) } } });
+  await speedOnly.call('POST', '/api/models/autotune/resume', { confirmPause: true }, 'admin');
+  assert.deepEqual(speedOnly.sent.pop(), { status: 404, body: { error: 'Resume is unavailable' } });
+});
+
 test('the default model mode round-trips, and only an explicit apply switches existing projects', async () => {
   let saves = 0;
   const workspace = { userId: 'u1', preferences: {}, projects: [{ id: 'a', routing: 'manual' }, { id: 'b', routing: 'auto' }],

@@ -175,11 +175,12 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
       return json(res,200,(await modelManager.evidence(model)).body);
     }
 
-    if (p === '/api/models/autotune' || p === '/api/models/autotune/cancel' || p === '/api/models/autotune/untuned') {
+    if (p === '/api/models/autotune' || p === '/api/models/autotune/cancel' || p === '/api/models/autotune/resume' || p === '/api/models/autotune/untuned') {
       if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
       if(!modelManager.autotune)return json(res,404,{error:'Auto-tune is unavailable'});
       let result;
       if(p.endsWith('/cancel')){if(req.method!=='POST')return json(res,405,{error:'Method not allowed'});result=modelManager.autotune.cancel();}
+      else if(p.endsWith('/resume')){if(req.method!=='POST')return json(res,405,{error:'Method not allowed'});if(!modelManager.autotune.resume)return json(res,404,{error:'Resume is unavailable'});const body=await readJson(req);result=await modelManager.autotune.resume({confirmPause:body?.confirmPause});}
       else if(p.endsWith('/untuned')){if(req.method!=='GET')return json(res,405,{error:'Method not allowed'});result=await modelManager.autotune.untuned();}
       else if(req.method==='GET')result=modelManager.autotune.status(url.searchParams.get('model')||'');
       else if(req.method==='POST'){const body=await readJson(req);result=await modelManager.autotune.start(String(body?.model||''),{confirmPause:body?.confirmPause,promptBudgetSeconds:body?.promptBudgetSeconds,untuned:body?.untuned===true});}
