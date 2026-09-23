@@ -104,3 +104,16 @@ test('the pure helpers need no factory', () => {
   assert.equal(toolCapFor('Qwen3.5-27B'), 24);
   assert.equal(toolCapFor(''), 24);
 });
+
+test('a connector box outside ENABLED_TOOLBOXES still has its reads judged reads', () => {
+  // Live on aa5132b: gdrive is not in ENABLED_TOOLBOXES (it reaches a chat per user), so every
+  // Drive tool was listed and gated as a write.
+  const reads = ['drive_search_files', 'drive_read_file', 'drive_get_metadata', 'drive_list_recent'];
+  const writes = ['drive_create_file', 'drive_update_file', 'drive_trash_file'];
+  const drive = { box: box('gdrive', [...reads, ...writes].map(tool), reads), names: new Set([...reads, ...writes]), connected: () => true, execute: async () => '' };
+  const t = build({ boxes: [drive.box], driveTools: drive, offered: (id) => id !== 'gdrive' });
+  for (const name of reads) assert.equal(t.isWriteTool(name), false, name);
+  for (const name of writes) assert.equal(t.isWriteTool(name), true, name);
+  assert.equal(t.isWriteTool('drive_something_new'), true, 'unknown is still a write');
+  assert.ok(!t.allToolboxes().some((b) => b.id === 'gdrive'), 'what a chat is offered is unchanged');
+});

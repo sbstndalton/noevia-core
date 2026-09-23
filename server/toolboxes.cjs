@@ -288,9 +288,13 @@ function createToolboxes({
   // A new or unrecognised tool is therefore gated by default — the failure mode
   // of an unnecessary prompt is an annoyed user, and the failure mode of a
   // missing one is deleted data.
+  // Every box noevia knows, offered or not: whether a tool writes is a fact about the tool, and
+  // ENABLED_TOOLBOXES only decides what a chat is given. Connector boxes such as Google Drive reach
+  // a chat per user (connectedBoxes) without being listed there, and their reads were being
+  // judged writes.
   function readOnlyToolNames() {
     const names = new Set();
-    for (const box of allToolboxes()) {
+    for (const box of [...TOOLBOXES, ...mcpBoxes()]) {
       for (const n of (box.reads || [])) names.add(n);
     }
     return names;
