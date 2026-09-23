@@ -2,9 +2,8 @@
 // BrowserExecutor policy (spec-agent-execution §6): what noevia decides before every browser
 // action, independent of which executor (Playwright/CDP, Browser Use) eventually carries it out.
 // Pure and deterministic on purpose — model output can REQUEST an action but never mark it safe,
-// so nothing here reads model text as an instruction. Not wired to anything yet: there is no
-// executor, route or flag. It exists so the executor is built around a tested gate, not the
-// other way round.
+// so nothing here reads model text as an instruction. The executor built around it is
+// browser-executor.cjs; neither is wired to a route, job or flag yet (no execution node exists).
 //
 // Three answers only: 'allow', 'needs_approval' (noevia's card: origin, element, typed values
 // with secrets masked), 'blocked'. Anything unrecognised needs approval; nothing unrecognised is
@@ -85,7 +84,19 @@ function classifyAction(action = {}, page = {}) {
     return { status: 'allow', reason: '' };
   }
   if (type === 'press') {
-    if (fold(action.key) === 'enter' && el.inForm) return { status: 'needs_approval', reason: 'Enter submits the form.' };
+    // Keys are chords ("Shift+Enter", "NumpadEnter"): any Enter in a form can submit it, and
+    // Space or Enter on a control activates it exactly like a click, so it is judged as one.
+    const raw = String(action.key ?? '');
+    const key = raw.length && !raw.trim() ? 'space' : fold(raw).replace(/\s+/g, '');
+    const parts = key.split('+');
+    const last = parts[parts.length - 1];
+    const enter = /enter$/.test(last) || last === 'return';
+    const activates = enter || last === 'space' || key.endsWith('+');
+    const tag = fold(el.tag), kind = fold(el.type);
+    const control = tag === 'button' || tag === 'a' || tag === 'summary' || ['button', 'link', 'menuitem', 'tab', 'switch', 'checkbox', 'radio', 'option'].includes(fold(el.role))
+      || (tag === 'input' && ['submit', 'image', 'button', 'reset', 'checkbox', 'radio'].includes(kind));
+    if (activates && control) return classifyAction({ ...action, type: 'click' }, page);
+    if (enter && el.inForm) return { status: 'needs_approval', reason: 'Enter submits the form.' };
     return { status: 'allow', reason: '' };
   }
   if (type === 'type' || type === 'select') return { status: 'allow', reason: 'Nothing is sent until a submit, which asks.' };
@@ -122,7 +133,11 @@ function maskSecrets(text, secrets) {
   let out = String(text ?? '');
   const entries = Object.entries(secrets || {}).filter(([, s]) => s && typeof s.value === 'string' && s.value.length >= 4)
     .sort((a, b) => b[1].value.length - a[1].value.length);
-  for (const [name, s] of entries) out = out.split(s.value).join(`{{secret:${name}}}`);
+  for (const [name, s] of entries) {
+    // The value as typed, and as it travels in a URL or a form body.
+    const forms = new Set([s.value, encodeURIComponent(s.value), encodeURIComponent(s.value).replace(/%20/g, '+')]);
+    for (const form of forms) out = out.split(form).join(`{{secret:${name}}}`);
+  }
   return out;
 }
 

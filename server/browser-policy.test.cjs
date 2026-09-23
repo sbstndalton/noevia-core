@@ -29,6 +29,12 @@ test('form submits ask however they happen', () => {
   assert.equal(status({ type: 'click', element: { tag: 'button', type: 'button', inForm: true, text: 'Show password' } }), 'allow');
   assert.equal(status({ type: 'press', key: 'Enter', element: { tag: 'input', inForm: true } }), 'needs_approval');
   assert.equal(status({ type: 'press', key: 'Tab', element: { inForm: true } }), 'allow');
+  // Every Enter chord submits a form; Space/Enter on a submit control is a click on it.
+  for (const key of ['NumpadEnter', 'Shift+Enter', 'Control+Enter', 'Return'])
+    assert.equal(status({ type: 'press', key, element: { tag: 'input', inForm: true } }), 'needs_approval', key);
+  assert.equal(status({ type: 'press', key: 'Space', element: { tag: 'button', inForm: true } }), 'needs_approval');
+  assert.equal(status({ type: 'press', key: ' ', element: { tag: 'button', name: 'Delete account' } }), 'needs_approval');
+  assert.equal(status({ type: 'press', key: 'Space', element: { tag: 'input', type: 'text', inForm: true } }), 'allow');
 });
 
 test('consequential controls ask in several languages; ordinary ones do not', () => {
