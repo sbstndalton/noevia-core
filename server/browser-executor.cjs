@@ -31,13 +31,20 @@ const ACTIONS = new Set(['navigate', 'click', 'type', 'select', 'press', 'upload
 const ACTION_TIMEOUT_MS = 15000;
 const MAX_EXTRACT = 20000;
 
-// Runs in the page: what the element really is. Kept small and serialisable on purpose.
-function describeInPage(el) {
+// Runs in the page: what the element that will actually act really is. A click lands on the
+// target and is carried out by its nearest activatable ancestor (a <span> inside a submit button
+// submits), and a <label> acts through its control; so the facts are read from that element.
+// Also reports the origin of the element's own frame: a secret is only for that document.
+function describeInPage(target) {
   const text = (v) => String(v || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+  let el = target || document.body;
+  const activatable = 'button, a[href], input, select, textarea, summary, label, [role=button], [role=link], [role=menuitem], [role=tab], [role=switch], [role=checkbox], [role=radio], [role=option]';
+  el = (el.closest && el.closest(activatable)) || el;
+  if (el.tagName === 'LABEL' && el.control) el = el.control;
   const labelled = el.getAttribute('aria-labelledby');
   const byId = labelled ? labelled.split(/\s+/).map((id) => document.getElementById(id)?.textContent || '').join(' ') : '';
   const label = el.labels && el.labels.length ? Array.from(el.labels).map((l) => l.textContent).join(' ') : '';
-  const form = el.form || el.closest('form');
+  const form = el.form || (el.closest && el.closest('form'));
   return {
     tag: el.tagName.toLowerCase(),
     type: el.getAttribute('type') || '',
@@ -48,6 +55,7 @@ function describeInPage(el) {
     inForm: !!form,
     formMethod: form ? (form.getAttribute('method') || 'get').toLowerCase() : '',
     formAction: form ? form.action : '',
+    frameOrigin: location.origin,
   };
 }
 
@@ -90,7 +98,7 @@ function createBrowserExecutor({ launch, askApproval, secrets = {}, log = () => 
     const context = await browser.newContext({ acceptDownloads: true, serviceWorkers: 'block', ...(proxy ? { proxy } : {}) });
     const id = crypto.randomUUID();
     const session = { id, jobId, context, page: null, allowedDomains: [...allowedDomains], downloadsDir, uploads,
-      blocked: [], downloads: [], closed: false, secretTyped: false, navBlocked: null };
+      blocked: [], downloads: [], closed: false, secretTyped: false, navBlocked: null, downloadSeq: 0 };
     // Every request, not only the ones the model asked for. data:/blob: stay inside the page.
     const refuse = (req, url, reason) => {
       if (session.blocked.length < 100) session.blocked.push({ url: mask(url).slice(0, 300), reason });
@@ -114,9 +122,15 @@ function createBrowserExecutor({ launch, askApproval, secrets = {}, log = () => 
       ws.close({ code: 1008, reason: 'Not on this task’s allowed list.' });
     });
     context.on('page', (page) => {
-      // Popups share the context's route rules; the session follows the newest page.
+      // Popups share the context's route rules; the session follows the newest page, and falls
+      // back to the most recent one still open when it closes.
       session.page = page;
       page.on('download', (download) => { save(session, download).catch(() => {}); });
+      page.on('close', () => {
+        if (session.page !== page) return;
+        const open = context.pages().filter((p) => !p.isClosed());
+        session.page = open.length ? open[open.length - 1] : null;
+      });
     });
     session.page = await context.newPage();
     sessions.set(id, session);
@@ -131,7 +145,8 @@ function createBrowserExecutor({ launch, askApproval, secrets = {}, log = () => 
   async function save(session, download) {
     // The suggested name is the site's; only its base name is kept, inside the task's directory.
     const name = nodePath.basename(String(download.suggestedFilename() || 'download')).replace(/^\.+/, '') || 'download';
-    const target = nodePath.join(session.downloadsDir, `${session.downloads.length + 1}-${name}`);
+    // Numbered before anything awaits, so two downloads at once never share a name.
+    const target = nodePath.join(session.downloadsDir, `${++session.downloadSeq}-${name}`);
     await download.saveAs(target);
     session.downloads.push({ name, path: target, from: mask(download.url()).slice(0, 300) });
   }
@@ -152,8 +167,10 @@ function createBrowserExecutor({ launch, askApproval, secrets = {}, log = () => 
    *          evidence?: object, downloads?: object[]}>}
    */
   async function act(sessionId, action = {}) {
+    // describeInPage is serialised into the page, so it must stay self-contained.
     const session = sessionOf(sessionId);
     if (session.closed) return { status: 'blocked', origin: '', reason: 'The browser session is closed.' };
+    if (!session.page) return { status: 'blocked', origin: '', reason: 'No page is open in this session.' };
     const { page } = session;
     const type = String(action.type || '');
     const origin = originOf(page);
@@ -164,6 +181,10 @@ function createBrowserExecutor({ launch, askApproval, secrets = {}, log = () => 
       return out;
     };
     if (!ACTIONS.has(type)) return result('blocked', { reason: `Unknown action “${mask(type).slice(0, 40)}”.` });
+    // Navigation is a GET here; data is sent by submitting the page's own form, which asks.
+    if (type === 'navigate' && action.method && String(action.method).toUpperCase() !== 'GET') {
+      return result('blocked', { reason: 'Only plain navigation is supported; submit the page’s form instead.' });
+    }
 
     // The element as it really is, never as the model described it.
     let element = null, locator = null;
@@ -173,16 +194,24 @@ function createBrowserExecutor({ launch, askApproval, secrets = {}, log = () => 
       catch { return result('blocked', { reason: 'That element is not on the page.' }); }
     }
     const facts = { type, url: action.url, method: action.method, key: action.key, element: element || undefined };
-    if (type === 'press' && !element) facts.element = await page.evaluate(() => {
-      const el = document.activeElement; return { inForm: !!(el && (el.form || el.closest?.('form'))) };
-    }).catch(() => ({ inForm: true })); // unknown focus: assume the worst, so Enter asks
+    if (type === 'press' && !element) {
+      // The key goes to whatever has focus (in the main frame's view); judge that element.
+      element = await page.evaluateHandle(() => document.activeElement)
+        .then((h) => h.evaluate(describeInPage)).catch(() => null);
+      // Unknown focus, or focus inside a frame (whose field the main page cannot see): assume
+      // the worst, so any Enter asks.
+      if (!element || ['iframe', 'frame', 'object', 'embed'].includes(element.tag)) element = null;
+      facts.element = element || { inForm: true };
+    }
     const verdict = classifyAction(facts, { origin, allowedDomains: session.allowedDomains });
     if (verdict.status === 'blocked') return result('blocked', { reason: verdict.reason });
 
     // Values the action would type, with secrets resolved for this origin — and only for it.
     let typed = null;
     if (type === 'type' || type === 'select') {
-      const sub = substituteSecrets(String(action.text ?? action.value ?? ''), secrets, origin || 'about:blank');
+      // The origin of the document being typed into, which for a field in a frame is the frame's.
+      const into = element && /^https?:/.test(String(element.frameOrigin)) ? element.frameOrigin : origin;
+      const sub = substituteSecrets(String(action.text ?? action.value ?? ''), secrets, into || 'about:blank');
       if (!sub.ok) return result('blocked', { reason: sub.reason });
       typed = sub.value;
       if (sub.used.length) session.secretTyped = true;

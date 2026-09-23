@@ -37,10 +37,15 @@ function fakeBrowser({ dom = {}, url = ORIGIN + '/', failOn = null } = {}) {
     waitForTimeout: async () => {},
     innerText: async () => 'body text',
   };
-  const context = { route: async () => {}, routeWebSocket: async () => {}, on: () => {}, newPage: async () => page, close: async () => {} };
+  const handlers = {};
+  page.on = (event, fn) => { (handlers[event] ||= []).push(fn); };
+  page.emit = (event, value) => { for (const fn of handlers[event] || []) fn(value); };
+  let onPage = () => {};
+  const context = { route: async () => {}, routeWebSocket: async () => {}, on: (event, fn) => { if (event === 'page') onPage = fn; },
+    newPage: async () => { onPage(page); return page; }, pages: () => [page], close: async () => {} };
   let options = null;
   const browser = { newContext: async (o) => { options = o; return context; }, close: async () => {} };
-  return { browser, effects, options: () => options };
+  return { browser, effects, options: () => options, pageEmit: (event, value) => page.emit(event, value) };
 }
 
 async function session({ dom, answers = [], secrets = {}, open = {}, failOn } = {}) {
@@ -142,4 +147,17 @@ test('unknown actions, missing elements and closed sessions do nothing', async (
   await s.executor.close(s.id);
   assert.equal((await s.act({ type: 'screenshot' })).status, 'blocked');
   assert.deepEqual(s.effects, []);
+});
+
+test('two downloads at once keep both files, each under its own number', async () => {
+  const s = await session();
+  const saved = [];
+  const download = (name, delay) => ({ suggestedFilename: () => name, url: () => ORIGIN + '/' + name,
+    saveAs: async (to) => { await new Promise((r) => setTimeout(r, delay)); saved.push(to); } });
+  // Both fire before either save finishes, the slower one first.
+  s.pageEmit('download', download('r.csv', 30));
+  s.pageEmit('download', download('r.csv', 0));
+  await new Promise((r) => setTimeout(r, 80));
+  assert.equal(new Set(saved).size, 2, 'distinct paths');
+  assert.deepEqual(s.executor.state(s.id).downloads.map((d) => path.basename(d.path)).sort(), ['1-r.csv', '2-r.csv']);
 });
