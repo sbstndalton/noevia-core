@@ -64,11 +64,24 @@ test('a chat dropped by the list cap is skipped and cannot block later imports',
  const second=await f.request({format:FORMAT,chats:[{id:'c-later',title:'Later',updatedAt:2000,history:[]}]});
  assert.equal(second.status,200);assert.equal(second.body.imported,1);assert.ok(persistedChatIds(f.w.dir).has('c-later'));
 });
-test('unsupported hard links fall back to an exclusive copy and clean temporary files',async t=>{
+test('project and free groups classify their own list-cap results independently',async t=>{
+ const f=fixture(temporary(t)),project=await f.store.createProject({name:'Full project',toolboxes:[]});
+ f.store.saveChats(project.id,Array.from({length:lists.LIST_CAP},(_,i)=>({id:`c-project-kept-${i}`,title:`Kept ${i}`,updatedAt:i+1})));
+ const result=await f.request({format:FORMAT,chats:[
+  {id:'c-free-room',title:'Free room',updatedAt:0,history:[]},
+  {id:'c-project-overflow',title:'Project overflow',updatedAt:0,project:{name:'Full project'},history:[]},
+ ]});
+ assert.equal(result.status,200);assert.equal(result.body.imported,1);assert.equal(result.body.skipped.length,1);
+ assert.match(result.body.skipped[0].reason,/list is full/);assert.ok(persistedChatIds(f.w.dir).has('c-free-room'));
+ assert.equal(persistedChatIds(f.w.dir).has('c-project-overflow'),false);assert.equal(fs.existsSync(f.w.historyPath('c-project-overflow')),false);
+});
+test('unsupported hard links fail before journaling and do not block a later import',async t=>{
  const f=fixture(temporary(t)),link=fs.linkSync;
  fs.linkSync=()=>{const error=Error('synthetic unsupported hard link');error.code='EPERM';throw error;};
- t.after(()=>{fs.linkSync=link;});
- const result=await f.request({format:FORMAT,chats:[{id:'c-copy',title:'Copied',history:[{role:'user',content:'Synthetic'}]}]});
- assert.equal(result.status,200);assert.equal(result.body.imported,1);assert.equal(f.store.readHistory('c-copy')[0].content,'Synthetic');
- assert.equal(fs.readdirSync(f.w.dir).some(name=>name.includes('.import-')),false);
+ const failed=await f.request({format:FORMAT,chats:[{id:'c-copy',title:'Copied',history:[{role:'user',content:'Synthetic'}]}]});
+ assert.equal(failed.status,503);assert.match(failed.body.error,/storage does not support safe file promotion/);
+ assert.equal(fs.existsSync(path.join(f.w.dir,'conversation-imports')),false);assert.equal(fs.existsSync(f.w.historyPath('c-copy')),false);
+ fs.linkSync=link;t.after(()=>{fs.linkSync=link;});
+ const retry=await f.request({format:FORMAT,chats:[{id:'c-copy',title:'Copied',history:[{role:'user',content:'Synthetic'}]}]});
+ assert.equal(retry.status,200);assert.equal(retry.body.imported,1);assert.equal(f.store.readHistory('c-copy')[0].content,'Synthetic');
 });

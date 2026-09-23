@@ -26,63 +26,29 @@ function sameFile(a, b) {
   const x = fs.statSync(a), y = fs.statSync(b);
   return x.dev === y.dev && x.ino === y.ino;
 }
-function sameContents(a, b) {
-  if (fs.statSync(a).size !== fs.statSync(b).size) return false;
-  const left = fs.openSync(a, 'r'), right = fs.openSync(b, 'r');
+function requireHardLinks(directory) {
+  const token = `.conversation-import-link-${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
+  const source = path.join(directory, token), target = source + '.linked';
   try {
-    const x = Buffer.allocUnsafe(64 * 1024), y = Buffer.allocUnsafe(64 * 1024);
-    let offset = 0;
-    for (;;) {
-      const nx = fs.readSync(left, x, 0, x.length, offset);
-      const ny = fs.readSync(right, y, 0, y.length, offset);
-      if (nx !== ny || !x.subarray(0, nx).equals(y.subarray(0, ny))) return false;
-      if (!nx) return true;
-      offset += nx;
-    }
-  } finally {
-    fs.closeSync(left); fs.closeSync(right);
-  }
-}
-function copyExclusive(source, target) {
-  const temp = `${target}.import-${process.pid}-${crypto.randomBytes(6).toString('hex')}.tmp`;
-  let output;
-  let created = false;
-  try {
-    fs.copyFileSync(source, temp, fs.constants.COPYFILE_EXCL);
-    const input = fs.openSync(temp, 'r');
-    try {
-      output = fs.openSync(target, 'wx', 0o600);
-      created = true;
-      const buffer = Buffer.allocUnsafe(64 * 1024);
-      let offset = 0;
-      for (;;) {
-        const count = fs.readSync(input, buffer, 0, buffer.length, offset);
-        if (!count) break;
-        let written = 0;
-        while (written < count) written += fs.writeSync(output, buffer, written, count - written);
-        offset += count;
-      }
-      fs.fsyncSync(output);
-    } finally {
-      fs.closeSync(input);
-      if (output !== undefined) fs.closeSync(output);
-    }
+    fs.writeFileSync(source, token, { flag: 'wx', mode: 0o600 });
+    fs.linkSync(source, target);
   } catch (error) {
-    if (created) {
-      try { fs.unlinkSync(target); } catch {}
+    if (['EPERM', 'ENOTSUP', 'EXDEV'].includes(error.code)) {
+      throw Object.assign(Error('Conversation imports require hard-link support'), {
+        status: 503,
+        publicMessage: 'Conversation imports are unavailable because this storage does not support safe file promotion.',
+      });
     }
     throw error;
   } finally {
-    try { fs.unlinkSync(temp); } catch {}
+    try { fs.unlinkSync(target); } catch {}
+    try { fs.unlinkSync(source); } catch {}
   }
 }
 function publishStaged(staged, target) {
-  try { fs.linkSync(staged, target); return 'link'; }
+  try { fs.linkSync(staged, target); }
   catch (error) {
-    if (error.code === 'EEXIST' && sameFile(staged, target)) return 'link';
-    if (!['EPERM', 'ENOTSUP', 'EXDEV'].includes(error.code)) throw error;
-    copyExclusive(staged, target);
-    return 'copy';
+    if (error.code !== 'EEXIST' || !sameFile(staged, target)) throw error;
   }
 }
 function resultFor(record) {
@@ -128,8 +94,7 @@ async function applyRecord(directory, record, ctx, newId) {
         do { id = newId(); } while (visible.has(id) || deleted.has(id) || record.files.some(f => f.id === id) || fs.existsSync(ctx.historyPath(id)));
         file.id = id; chat.id = id; target = ctx.historyPath(id); save();
       }
-      const published = publishStaged(staged, target);
-      if (file.published !== published) { file.published = published; save(); }
+      publishStaged(staged, target);
     }
     // Merge-only collaborators preserve unrelated edits. Repeating these writes
     // after a crash is safe; durable membership is checked on every recovery.
@@ -156,7 +121,7 @@ async function applyRecord(directory, record, ctx, newId) {
   for (const file of record.files) {
     if (!capped.has(file.id)) continue;
     const target = ctx.historyPath(file.id), staged = path.join(directory, file.stage);
-    if (fs.existsSync(target) && (sameFile(staged, target) || (file.published === 'copy' && sameContents(staged, target)))) fs.unlinkSync(target);
+    if (fs.existsSync(target) && sameFile(staged, target)) fs.unlinkSync(target);
   }
   if (record.files.some(f => !visible.has(f.id) && !deleted.has(f.id) && !capped.has(f.id))) throw Error('Import metadata was not committed');
   const result = resultFor(record);
@@ -172,6 +137,7 @@ async function importConversations(data, ctx, newId, onComplete = () => {}) {
   const work = previous.catch(() => {}).then(async () => {
     const planning = () => planImport(data, { existingChatIds: ctx.existingChatIds(), tombstones: ctx.tombstones(), projects: ctx.projects(), newId });
     planning(); // Reject invalid input before recovering or writing anything.
+    requireHardLinks(ctx.directory); // Fail before creating/recovering a journal on unsupported storage.
     const fingerprint = crypto.createHash('sha256').update(JSON.stringify(data)).digest('hex');
     const root = path.join(ctx.directory, 'conversation-imports');
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
