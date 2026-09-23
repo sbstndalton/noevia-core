@@ -125,3 +125,26 @@ test('queue pressure stays retryable at the document extraction boundary', async
   await assert.rejects(documents.extractDocumentText('a.pdf', fixture('text.pdf'), { doclingEnabled: false, readPages: busy }),
     e => e.status === 503 && e.retryable === true && /retry/.test(e.message));
 });
+
+test('the next reader starts and admission recovers after worker startup, error, exit, or timeout failure', async () => {
+  for (const failure of ['startup', 'error', 'exit', 'timeout']) {
+    let started = 0;
+    const read = createReader({ maxPending: 1, maxPendingBytes: 2, queueWaitMs: 1000,
+      makeWorker() {
+        const index = ++started;
+        if (index === 1 && failure === 'startup') throw Error('synthetic startup failure');
+        const worker = new EventEmitter();
+        worker.terminate = async () => 0;
+        if (index === 1 && failure === 'error') setImmediate(() => worker.emit('error', Error('synthetic worker error')));
+        else if (index === 1 && failure === 'exit') setImmediate(() => worker.emit('exit', 3));
+        else if (index > 1) setImmediate(() => worker.emit('message', { ok: true, result: index }));
+        return worker;
+      },
+    });
+    const first = read(Buffer.alloc(2), { timeLimitMs: 20 });
+    const waiting = read(Buffer.alloc(2));
+    await assert.rejects(first, /failure|error|stopped|time limit/, failure);
+    assert.equal(await waiting, 2, `${failure}: queued work continued`);
+    assert.equal(await read(Buffer.alloc(2)), 3, `${failure}: admission capacity was released`);
+  }
+});
