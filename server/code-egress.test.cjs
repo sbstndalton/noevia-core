@@ -236,3 +236,31 @@ test('the deployment proxy starts only when a port is configured', async () => {
     assert.equal(status, 407);
   } finally { live.server.close(); }
 });
+
+test("a task's network activity is tallied by host, refusals first, and forgotten once read", async () => {
+  const upstream = http.createServer((req, res) => res.end('ok'));
+  await new Promise((r) => upstream.listen(0, '127.0.0.1', r));
+  const up = upstream.address().port;
+  const { p } = proxy({ allowedPorts: [up] });
+  const { token } = p.grant({ taskId: 't1', domains: ['example.com'] });
+  await p.listen();
+  const port = p.server.address().port;
+  const get = (url, auth = basic(token)) => new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port, method: 'GET', path: url,
+      headers: auth ? { 'proxy-authorization': auth } : {} }, (res) => { res.resume(); res.on('end', () => resolve(res.statusCode)); });
+    req.on('error', reject); req.end();
+  });
+  assert.equal(await get(`http://example.com:${up}/a`), 200);
+  assert.equal(await get(`http://github.test:${up}/x`), 403);
+  assert.equal(await get(`http://github.test:${up}/y`), 403);
+  assert.equal(await get(`http://example.com:${up}/b`, null), 407, 'no token: not counted against anyone');
+  const seen = p.activity('t1');
+  assert.deepEqual(seen.hosts.map((h) => [h.host, h.allowed, h.refused]), [['github.test', 0, 2], ['example.com', 1, 0]]);
+  assert.equal(seen.allowed, 1); assert.equal(seen.refused, 2);
+  assert.match(seen.hosts[0].reason, /not on this task/);
+  assert.equal(JSON.stringify(seen).includes(token), false);
+  assert.deepEqual(p.activity('t1', { forget: true }).hosts.length, 2);
+  assert.deepEqual(p.activity('t1'), { hosts: [], allowed: 0, refused: 0 });
+  assert.deepEqual(p.activity('someone-else').hosts, [], 'another task sees nothing');
+  await p.close(); upstream.close();
+});

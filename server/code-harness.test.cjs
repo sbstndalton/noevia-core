@@ -69,6 +69,56 @@ test('an edit inside the workspace asks, and the card carries the full arguments
   assert.deepEqual(picked, { outcome: 'selected', optionId: 'y' });
 });
 
+test('a permission request naming only its call id is judged by the call the harness announced', async () => {
+  // DeepSeek Harness, measured 2026-09-23: `tool_call` carries the command, and the permission
+  // request that follows carries nothing but `toolCallId` (an ACP ToolCallUpdate).
+  const r = await run({
+    answers: ['approve'],
+    script: async (h) => {
+      h.sessionUpdate({ sessionUpdate: 'tool_call', toolCallId: 'c1', title: 'bash', kind: 'other', status: 'pending',
+        rawInput: { command: 'rm -rf build', description: 'clean' } });
+      await h.requestPermission({ toolCall: { toolCallId: 'c1' }, options: OPTIONS });
+    },
+  });
+  assert.equal(r.asked.length, 1);
+  assert.equal(r.asked[0].action, ACTIONS.DELETE, 'classified from the announced command, not as an empty call');
+  assert.equal(r.asked[0].command, 'rm -rf build');
+  assert.deepEqual(r.asked[0].arguments, { command: 'rm -rf build', description: 'clean' });
+});
+
+test('fields the permission request states win over what was announced, and finished calls are forgotten', async () => {
+  const r = await run({
+    answers: ['approve', 'approve'],
+    script: async (h) => {
+      h.sessionUpdate({ sessionUpdate: 'tool_call', toolCallId: 'c1', kind: 'other', rawInput: { command: 'echo hi' } });
+      await h.requestPermission({ toolCall: { toolCallId: 'c1', rawInput: { command: 'git push' } }, options: OPTIONS });
+      h.sessionUpdate({ sessionUpdate: 'tool_call_update', toolCallId: 'c1', status: 'completed' });
+      await h.requestPermission({ toolCall: { toolCallId: 'c1' }, options: OPTIONS });
+    },
+  });
+  assert.equal(r.asked[0].command, 'git push');
+  assert.equal(r.asked[0].action, ACTIONS.GIT_PUSH);
+  // Nothing remembered for a finished call: an empty request is gated as the unknown it is.
+  assert.equal(r.asked[1].command, '');
+  assert.equal(r.asked[1].arguments, null);
+});
+
+test('an announced read, search or think kind never lets a bare permission request through unasked', async () => {
+  for (const kind of ['read', 'search', 'think']) {
+    for (const stated of [{ toolCallId: 'c1' }, { toolCallId: 'c1', kind: null }]) {
+      const r = await run({
+        answers: ['deny'],
+        script: async (h) => {
+          h.sessionUpdate({ sessionUpdate: 'tool_call', toolCallId: 'c1', kind, rawInput: { command: 'rm -rf /' } });
+          await h.requestPermission({ toolCall: stated, options: OPTIONS });
+        },
+      });
+      assert.equal(r.asked.length, 1, `${kind} ${JSON.stringify(stated)} asks`);
+      assert.equal(r.asked[0].command, 'rm -rf /', 'and the card still shows what was announced');
+    }
+  }
+});
+
 test('declining means the harness is told no, not told nothing', async () => {
   let picked;
   await run({ answers: ['deny'], script: async (h, cwd) => { picked = await h.requestPermission(editCall(path.join(cwd, 'a.txt'))); } });
@@ -329,4 +379,18 @@ test('shared project context reaches the agent ahead of the task, never the task
   const plain = [];
   await run({ sent: plain, script: async () => {} });
   assert.equal(plain[0], 'fix the bug');
+});
+
+test("a networked task's result says which hosts it reached and which were refused", async () => {
+  const forgotten = [];
+  const egress = { grant: () => ({ token: 't' }), revoke: () => 1,
+    activity: (taskId, { forget = false } = {}) => { if (forget) forgotten.push(taskId);
+      return { hosts: [{ host: 'github.com', allowed: 0, refused: 2, reason: 'host is not on this task’s list' }], allowed: 0, refused: 2 }; } };
+  const r = await run({ capabilities: [ACTIONS.NETWORK], domains: ['pypi.org'], egress, script: async () => {} });
+  assert.equal(r.job.result.network.refused, 2);
+  assert.equal(r.job.result.network.hosts[0].host, 'github.com');
+  assert.deepEqual(forgotten, [r.taskId], 'the tally is dropped when the task ends');
+  // No grant, no network section.
+  const offline = await run({ script: async () => {} });
+  assert.equal('network' in offline.job.result, false);
 });

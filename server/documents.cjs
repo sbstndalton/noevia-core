@@ -6,6 +6,7 @@ const TOTAL_TEXT_CAP = 2_000_000;
 const PAGE_CAP = 300;
 const ocr = require('./ocr.cjs');
 const docling = require('./docling.cjs');
+const native = require('./documents-native.cjs');
 
 // Two extraction backends, chosen by configuration rather than by file:
 //
@@ -81,69 +82,48 @@ async function extractDocumentText(name, bytes, {
   extractPages = ocr.extractPages,
   doclingEnabled = docling.enabled(),
   extractDocument = docling.extractDocument,
+  readPages = native.readInWorker,
 } = {}) {
   if (!isDocument(name, doclingEnabled)) {
     throw Object.assign(new Error(`not a supported document (${documentExtensions(doclingEnabled).join(', ')})`), { status: 400 });
   }
   if (doclingEnabled) return extractWithDocling(name, bytes, extractDocument);
-  const { getDocumentProxy, getResolvedPDFJS } = require('unpdf');
-  let pdf;
+  // pdf.js runs in a worker with a time and a heap limit (documents-native.cjs): a pathological
+  // PDF stops itself, not the server. A limit is as final as an unreadable file.
+  let numPages, pageTexts;
   try {
-    pdf = await getDocumentProxy(new Uint8Array(bytes));
-    const { OPS } = await getResolvedPDFJS();
-    const imageOps = new Set(Object.entries(OPS).filter(([name]) => /paint.*Image|paintImageMask/.test(name)).map(([, value]) => value));
-    const pageTexts = [];
-    let remaining = TOTAL_TEXT_CAP;
-    for (let number = 1; number <= Math.min(pdf.numPages, PAGE_CAP); number++) {
-      const page = await pdf.getPage(number);
-      try {
-        const content = await page.getTextContent();
-        let text = '', positions = [];
-        for (const item of content.items) {
-          if (typeof item.str !== 'string') continue;
-          // Keep native item order and coordinates for later layout work; do
-          // not invent table cells from spacing or reorder financial values.
-          const available = Math.min(PAGE_TEXT_CAP, remaining) - text.length;
-          if (available <= 0) break;
-          text += (item.str + (item.hasEOL ? '\n' : ' ')).slice(0, available);
-          positions.push({ text: item.str.slice(0, available), x: item.transform?.[4], y: item.transform?.[5] });
-        }
-        const truncated = content.items.reduce((n, i) => n + (typeof i.str === 'string' ? i.str.length + 1 : 0), 0) > text.length;
-        text = text.trim(); remaining -= text.length;
-        const ops = await page.getOperatorList();
-        const hasImages = ops.fnArray.some(op => imageOps.has(op));
-        const markOps = new Set(Object.entries(OPS).filter(([name]) => /^(stroke|fill|eoFill|shadingFill|paint)/.test(name)).map(([, value]) => value));
-        const status = truncated ? 'truncated' : hasImages ? 'ocr-needed' : text ? 'native' : ops.fnArray.some(op => markOps.has(op)) ? 'unreadable' : 'blank';
-        pageTexts.push({ number, text, positions, status, hasImages, method: 'native', truncated });
-      } catch (err) {
-        pageTexts.push({ number, text: '', status: 'failed', method: 'native', error: String(err.message || err).slice(0, 300) });
-      } finally { page.cleanup(); }
-    }
-    let retryable = false, ocrError;
-    const candidates = pageTexts.filter(p => ['ocr-needed', 'unreadable'].includes(p.status));
-    if (ocrEnabled && candidates.length) {
-      try {
-        const results = await extractPages(bytes, candidates.slice(0, 50).map(p => p.number));
-        for (const p of candidates.slice(0, 50)) {
-          const result = results.find(r => r.number === p.number);
-          if (!result || result.error) { retryable = true; ocrError = result?.error || 'OCR response omitted pages; refresh to retry.'; continue; }
-          const text = typeof result.text === 'string' ? result.text.trim() : '';
-          if (!text) { p.status = 'unreadable'; continue; }
-          const addition = `\n[OCR transcription — verify numbers against original]\n${text}`;
-          const available = Math.max(0, Math.min(PAGE_TEXT_CAP - p.text.length, remaining));
-          p.text += addition.slice(0, available);
-          remaining -= Math.min(addition.length, available);
-          p.truncated = !!result.truncated || addition.length > available;
-          p.status = p.truncated ? 'truncated' : 'ocr';
-          p.method = 'native+ocr';
-        }
-        if (candidates.length > 50) ocrError = 'OCR limited to 50 image-bearing pages per document.';
-      } catch (err) { retryable = true; ocrError = String(err.message || err).slice(0, 300); }
-    }
-    const assembled = assemble(pageTexts, pdf.numPages, { retryable });
-    return { ...assembled, error: ocrError || (assembled.state === 'failed' ? (ocrEnabled ? 'No readable text was recovered by OCR; try a clearer scan or an unlocked original.' : 'No readable native text. Scanned or image-based content needs OCR; OCR is not installed.') : undefined) };
+    ({ numPages, pageTexts } = await readPages(bytes, { pageCap: PAGE_CAP, pageTextCap: PAGE_TEXT_CAP, totalTextCap: TOTAL_TEXT_CAP }));
   } catch (err) {
-    throw Object.assign(new Error(/password/i.test(err.message) ? 'Password-protected PDF; upload an unlocked copy.' : 'Could not parse this PDF: ' + String(err.message).slice(0, 200)), { status: 422 });
-  } finally { if (pdf) await pdf.loadingTask.destroy(); }
+    const message = err.limit === 'time' ? 'Reading this PDF took too long, so it was stopped. Try a smaller or re-saved copy.'
+      : err.limit === 'memory' ? 'Reading this PDF needed too much memory, so it was stopped. Try a smaller or re-saved copy.'
+      : /password/i.test(err.message) ? 'Password-protected PDF; upload an unlocked copy.'
+      : 'Could not parse this PDF: ' + String(err.message).slice(0, 200);
+    throw Object.assign(new Error(message), { status: 422 });
+  }
+  // What the text caps still allow OCR to add, as the walk left it.
+  let remaining = TOTAL_TEXT_CAP - pageTexts.reduce((n, p) => n + (p.text ? p.text.length : 0), 0);
+  let retryable = false, ocrError;
+  const candidates = pageTexts.filter(p => ['ocr-needed', 'unreadable'].includes(p.status));
+  if (ocrEnabled && candidates.length) {
+    try {
+      const results = await extractPages(bytes, candidates.slice(0, 50).map(p => p.number));
+      for (const p of candidates.slice(0, 50)) {
+        const result = results.find(r => r.number === p.number);
+        if (!result || result.error) { retryable = true; ocrError = result?.error || 'OCR response omitted pages; refresh to retry.'; continue; }
+        const text = typeof result.text === 'string' ? result.text.trim() : '';
+        if (!text) { p.status = 'unreadable'; continue; }
+        const addition = `\n[OCR transcription — verify numbers against original]\n${text}`;
+        const available = Math.max(0, Math.min(PAGE_TEXT_CAP - p.text.length, remaining));
+        p.text += addition.slice(0, available);
+        remaining -= Math.min(addition.length, available);
+        p.truncated = !!result.truncated || addition.length > available;
+        p.status = p.truncated ? 'truncated' : 'ocr';
+        p.method = 'native+ocr';
+      }
+      if (candidates.length > 50) ocrError = 'OCR limited to 50 image-bearing pages per document.';
+    } catch (err) { retryable = true; ocrError = String(err.message || err).slice(0, 300); }
+  }
+  const assembled = assemble(pageTexts, numPages, { retryable });
+  return { ...assembled, error: ocrError || (assembled.state === 'failed' ? (ocrEnabled ? 'No readable text was recovered by OCR; try a clearer scan or an unlocked original.' : 'No readable native text. Scanned or image-based content needs OCR; OCR is not installed.') : undefined) };
 }
 module.exports = { isDocument, documentExtensions, extractDocumentText, DOCUMENT_EXTENSIONS, EXTRACT_CAP, EXTRACTOR_VERSION, PAGE_CAP, TOTAL_TEXT_CAP };

@@ -114,13 +114,20 @@ async function rpc(baseUrl, session, body, { headers = {}, timeoutMs = 30000, no
 // Returns the session object to pass back into listTools/callTool.
 async function connect(baseUrl, authHeaders = {}, timeoutMs = 30000) {
   const session = { id: null };
-  const info = await rpc(baseUrl, session, {
-    jsonrpc: '2.0', id: requestId(), method: 'initialize',
-    params: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, clientInfo: CLIENT_INFO },
-  }, { headers: authHeaders, timeoutMs });
-  await rpc(baseUrl, session, { jsonrpc: '2.0', method: 'notifications/initialized' },
-    { headers: authHeaders, timeoutMs, notify: true });
-  return { session, serverInfo: info && info.serverInfo };
+  try {
+    const info = await rpc(baseUrl, session, {
+      jsonrpc: '2.0', id: requestId(), method: 'initialize',
+      params: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, clientInfo: CLIENT_INFO },
+    }, { headers: authHeaders, timeoutMs });
+    await rpc(baseUrl, session, { jsonrpc: '2.0', method: 'notifications/initialized' },
+      { headers: authHeaders, timeoutMs, notify: true });
+    return { session, serverInfo: info && info.serverInfo };
+  } catch (error) {
+    // Callers cannot close a session until connect returns it. The server may
+    // already have issued an ID even when initialize response parsing fails.
+    await disconnect(baseUrl, session, authHeaders, Math.min(timeoutMs, 5000));
+    throw error;
+  }
 }
 
 // Close a session. Every connect() opened one and nothing ever closed it, so a
