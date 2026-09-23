@@ -278,15 +278,16 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
   const speedDeps={request,rawModels,presets,maintenance,applyUnlocked,identityFor:tuneIdentity,
     calibrate:(model,promptBudgetSeconds)=>calibrator.start(model,{confirmPause:true,promptBudgetSeconds}),
     stateFile:autotuneStatePath,tableFile:autotuneTablePath,memoryFloorGib:autoconfig.memoryFloorGib||2,...(calibrationOptions.readMemory?{readMemory:calibrationOptions.readMemory}:{}),...autotuneOptions};
-  // Internal stages run under the full tuner's lease; the standalone context tool still
-  // acquires the real gate. No stage publishes success before the complete tune finishes.
+  // Internal context checks run under the full tuner's per-model lease; standalone
+  // calibration still acquires the real gate.
   const managedGate={hold:()=>()=>{}};
   const autotuner=presets&&autotuneStatePath?(autotuneOptions.speedOnly===true
     ?require('./llamacpp-autotune.cjs').createAutotuner(speedDeps)
     :require('./llamacpp-full-autotune.cjs').createFullAutotuner({request,rawModels,presets,maintenance,applyUnlocked,identityFor:speedDeps.identityFor,stateFile:autotuneStatePath,
       readMemory:speedDeps.readMemory,memoryFloorGib:speedDeps.memoryFloorGib,
-      onResult:async({model,result})=>{for(const [category,value] of [['context_capacity',{ctx:result.context,appliedCtx:result.context,slots:Number(presets.get(model).options.parallel)||1}],['throughput',{rate:result.generation}],...(result.acceptance==null?[]:[['mtp_acceptance',{rate:result.acceptance/100}]])])await recordEvidence(model,{category,result:'passed',value,suite:{name:'full-autotune',version:2},source:'autotune',limitations:['Three deterministic quality smoke probes, not a general quality benchmark','120 s default prompt budget; existing MTP head only']});},
-      speedFactory:hooks=>require('./llamacpp-autotune.cjs').createAutotuner({...speedDeps,maintenance:managedGate,stateFile:undefined,requireDrafting:true,minGain:0,...hooks}),
+      ...(autotuneOptions.betweenModelsMs!=null?{betweenModelsMs:autotuneOptions.betweenModelsMs}:{}),
+      ...(autotuneOptions.idleTimeoutMs!=null?{idleTimeoutMs:autotuneOptions.idleTimeoutMs}:{}),
+      onResult:async({model,result})=>{for(const [category,value] of [['context_capacity',{ctx:result.context,appliedCtx:result.context,slots:Number(presets.get(model).options.parallel)||1}],['throughput',{rate:result.generation}],...(result.acceptance==null?[]:[['mtp_acceptance',{rate:result.acceptance/100}]])])await recordEvidence(model,{category,result:'passed',value,suite:{name:'full-autotune',version:3},source:'autotune',limitations:['Three deterministic quality smoke probes, not a general quality benchmark','120 s default prompt budget; existing MTP head only']});},
       contextFactory:hooks=>require('./llamacpp-calibration.cjs').createCalibrator({request,rawModels,presets,applyUnlocked,conservativeFor,maintenance:managedGate,
         stream:(path,opts={})=>(fetchStream||fetch)(base+path,{...opts,headers:headers(opts.headers),redirect:'error'}),
         memoryFloorGib:autoconfig.memoryFloorGib||2,...calibrationOptions,stateFile:undefined,...hooks})})):null;
@@ -303,7 +304,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     reloadPresets,
     evidence, recordEvidence,
     calibration: calibrator ? { start: calibrator.start, cancel: calibrator.cancel, status: calibrator.status, recover: calibrator.recover } : null,
-    autotune: autotuner ? { start: autotuner.start, cancel: autotuner.cancel, status: autotuner.status, recover: autotuner.recover, untuned: autotuner.untuned } : null,
+    autotune: autotuner ? { start: autotuner.start, resume: autotuner.resume, cancel: autotuner.cancel, status: autotuner.status, recover: autotuner.recover, untuned: autotuner.untuned } : null,
     unload: model => mutate(()=>post('/models/unload', { model })),
     pull: ({ checkpoint }) => mutate(async () => {
       if (!/^[\w.-]+\/[\w.-]+(?::[\w.-]+)?$/.test(checkpoint || '')) return { ok: false, status: 400, body: { error: 'Choose a Hugging Face repository and quantization' } };
