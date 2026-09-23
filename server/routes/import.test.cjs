@@ -55,3 +55,20 @@ test('another valid import request recovers pending work before planning its own
  const next=fixture(root);const result=await next.request({format:FORMAT,chats:[{id:'c-other',title:'Other',history:[]}]});
  assert.equal(result.status,200);assert.equal(result.body.imported,1);assert.deepEqual([...persistedChatIds(next.w.dir)].sort(),['c-existing','c-free','c-new','c-other']);assert.equal(next.audited.length,2);
 });
+test('a chat dropped by the list cap is skipped and cannot block later imports',async t=>{
+ const f=fixture(temporary(t)),existing=Array.from({length:lists.LIST_CAP},(_,i)=>({id:`c-kept-${i}`,title:`Kept ${i}`,updatedAt:i+1}));
+ f.store.saveFreeChats(existing);
+ const overflow={format:FORMAT,chats:[{id:'c-overflow',title:'Too old',updatedAt:0,history:[{role:'user',content:'Must not become orphaned'}]}]};
+ const first=await f.request(overflow);assert.equal(first.status,200);assert.equal(first.body.imported,0);assert.match(first.body.skipped[0].reason,/list is full/);
+ assert.equal(fs.existsSync(f.w.historyPath('c-overflow')),false);assert.deepEqual(fs.readdirSync(path.join(f.w.dir,'conversation-imports')),[]);
+ const second=await f.request({format:FORMAT,chats:[{id:'c-later',title:'Later',updatedAt:2000,history:[]}]});
+ assert.equal(second.status,200);assert.equal(second.body.imported,1);assert.ok(persistedChatIds(f.w.dir).has('c-later'));
+});
+test('unsupported hard links fall back to an exclusive copy and clean temporary files',async t=>{
+ const f=fixture(temporary(t)),link=fs.linkSync;
+ fs.linkSync=()=>{const error=Error('synthetic unsupported hard link');error.code='EPERM';throw error;};
+ t.after(()=>{fs.linkSync=link;});
+ const result=await f.request({format:FORMAT,chats:[{id:'c-copy',title:'Copied',history:[{role:'user',content:'Synthetic'}]}]});
+ assert.equal(result.status,200);assert.equal(result.body.imported,1);assert.equal(f.store.readHistory('c-copy')[0].content,'Synthetic');
+ assert.equal(fs.readdirSync(f.w.dir).some(name=>name.includes('.import-')),false);
+});
