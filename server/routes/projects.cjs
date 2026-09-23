@@ -63,7 +63,7 @@ function createProjectRoutes({
     if (backgroundSource && req.method === 'POST' && url.searchParams.get('background') === '1') {
       const projectId = decodeURIComponent(backgroundSource[1]);
       if (!getProject(projectId)) return json(res, 404, { error: 'project not found' });
-      const body = JSON.parse(await readBody(req, Math.ceil((backgroundSource[2] === 'upload' ? require('../pdf-reduce.cjs').INPUT_CAP : DOCUMENT_UPLOAD_CAP) / 3) * 4 + 512 * 1024));
+      const body = await readJson(req, Math.ceil((backgroundSource[2] === 'upload' ? require('../pdf-reduce.cjs').INPUT_CAP : DOCUMENT_UPLOAD_CAP) / 3) * 4 + 512 * 1024);
       const jobId = require('../source-jobs.cjs').start(currentWorkspace(), projectId, async (progress) => {
         const inner = require('node:stream').Readable.from([Buffer.from(JSON.stringify(body))]);
         Object.assign(inner, { method: req.method, url: p, headers: req.headers, socket: req.socket });
