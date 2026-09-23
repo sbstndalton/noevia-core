@@ -140,14 +140,17 @@ function createOffsiteService({ env = process.env, features, dataDir, now = Date
         google: driveView(),
         paths: paths.length, lastBackup: s.lastBackup || null, lastVerify: s.lastVerify || null, lastError: s.lastError || null, snapshots: s.snapshots ?? null };
     },
-    runNow: () => exclusive('backup', async (b) => {
-      const snap = await b.backup();
-      const retention = await b.forget();
-      const saved = writeStatus({ lastBackup: { at: now(), id: snap.id, files: snap.files, uploadedBytes: snap.uploadedBytes }, snapshots: retention.kept, lastError: null }).lastBackup;
-      // Straight after the local snapshot, in the background: a slow upload never holds the page.
-      Promise.resolve().then(() => { if (!busy) return copyToDrive(); }).catch(() => {});
+    runNow: async () => {
+      const saved = await exclusive('backup', async (b) => {
+        const snap = await b.backup();
+        const retention = await b.forget();
+        return writeStatus({ lastBackup: { at: now(), id: snap.id, files: snap.files, uploadedBytes: snap.uploadedBytes }, snapshots: retention.kept, lastError: null }).lastBackup;
+      });
+      // Start the mirror only after exclusive has released the backup lock. The upload
+      // runs in the background so a slow Drive connection cannot hold the response.
+      if (!busy) void copyToDrive().catch(() => {});
       return saved;
-    }),
+    },
     copyNow: () => {
       const reason = ready();
       if (reason) throw Object.assign(Error(reason), { status: 409, publicMessage: reason });

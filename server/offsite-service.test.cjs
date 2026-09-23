@@ -38,6 +38,68 @@ test('run now snapshots, applies retention, records status; restore test verifie
   assert.equal((await service.verifyNow()).files, 2);
 });
 
+test('successful backup starts one Drive copy after releasing the lock without waiting for upload', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-offsite-copy-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  let releaseMirror, mirrorCalls = 0;
+  const mirrorDone = new Promise((resolve) => { releaseMirror = resolve; });
+  const service = createOffsiteService({
+    env: { OFFSITE_BACKUP_DIR: dir }, dataDir: dir, features: { enabled: () => true },
+    backupFactory: () => ({ backup: async () => ({ id: 'synthetic', files: 1, uploadedBytes: 10 }), forget: async () => ({ kept: 1 }) }),
+    driveFactory: () => ({ state: () => ({ state: 'connected' }), mirror: async () => { mirrorCalls++; await mirrorDone; return { snapshots: 1 }; } }),
+  });
+  const saved = await service.runNow();
+  assert.equal(saved.id, 'synthetic', 'the backup response does not wait for Drive');
+  assert.equal(mirrorCalls, 1);
+  assert.equal(service.status().busy, 'copy to Google Drive');
+  await assert.rejects(() => service.runNow(), /already running/, 'a backup cannot overlap the copy');
+  assert.throws(() => service.copyNow(), /already running/, 'manual copy cannot overlap it');
+  releaseMirror();
+  for (let i = 0; i < 20 && service.status().google.copy.state !== 'ok'; i++) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(service.status().google.copy.state, 'ok');
+  assert.equal(service.status().busy, null);
+  assert.equal(mirrorCalls, 1);
+  await service.copyNow();
+  assert.equal(mirrorCalls, 2, 'manual copy remains available');
+});
+
+test('failed backup and unavailable Drive copy conditions do not start a mirror', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-offsite-skip-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  for (const [name, env, state, driveCopy, backupFails] of [
+    ['backup failed', { OFFSITE_BACKUP_DIR: dir }, 'connected', true, true],
+    ['copy disabled', { OFFSITE_BACKUP_DIR: dir }, 'connected', false, false],
+    ['Drive disconnected', { OFFSITE_BACKUP_DIR: dir }, 'disconnected', true, false],
+    ['non-directory backend', {}, 'connected', true, false],
+  ]) {
+    const dataDir = fs.mkdtempSync(path.join(dir, 'case-'));
+    let mirrorCalls = 0;
+    const service = createOffsiteService({
+      env, dataDir, features: { enabled: () => true },
+      backupFactory: () => ({ backup: async () => { if (backupFails) throw Error('synthetic backup failure'); return { id: name, files: 1, uploadedBytes: 10 }; }, forget: async () => ({ kept: 1 }) }),
+      driveFactory: () => ({ state: () => ({ state }), mirror: async () => { mirrorCalls++; return { snapshots: 1 }; } }),
+    });
+    if (!driveCopy) service.setDriveCopy(false);
+    if (backupFails) await assert.rejects(() => service.runNow(), /synthetic backup failure/, name);
+    else await service.runNow();
+    assert.equal(mirrorCalls, 0, name);
+  }
+});
+
+test('a failed background mirror records failure without failing the completed backup', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-offsite-mirror-fail-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const service = createOffsiteService({
+    env: { OFFSITE_BACKUP_DIR: dir }, dataDir: dir, features: { enabled: () => true },
+    backupFactory: () => ({ backup: async () => ({ id: 'synthetic', files: 1, uploadedBytes: 10 }), forget: async () => ({ kept: 1 }) }),
+    driveFactory: () => ({ state: () => ({ state: 'connected' }), mirror: async () => { throw Error('synthetic Drive failure'); } }),
+  });
+  assert.equal((await service.runNow()).id, 'synthetic');
+  for (let i = 0; i < 20 && service.status().google.copy.state !== 'failed'; i++) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(service.status().google.copy.state, 'failed');
+  assert.equal(service.status().busy, null);
+});
+
 test('schedule runs once in the configured hour, not again within 20 hours', async (t) => {
   const { service, advance } = setup(t);
   let tick; service.schedule((fn) => { tick = fn; return { unref() {} }; }, () => {});
