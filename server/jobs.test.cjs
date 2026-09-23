@@ -107,6 +107,40 @@ test('recover is scoped to the store kinds: another store in the same directory 
   assert.equal((await done).status, 'completed');
 });
 
+test('Code plan append and legacy replay stay bounded while Research retains its plan shape', (t) => {
+  const dir = tmp(); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const before = createJobs({ dir });
+  const code = before.create({ kind: 'code', projectId: 'p1' });
+  assert.equal(before.get(code).plan, null);
+  before.append(code, 'job.started');
+  const entries = Array.from({ length: 25 }, (_, i) => i === 0 ? '😀'.repeat(80) : `Entry ${i}`);
+  const appended = before.append(code, 'plan.proposed', { question: 'unused', subQuestions: entries });
+  assert.equal(appended.data.subQuestions.length, 20);
+  assert.equal(Buffer.byteLength(appended.data.subQuestions[0]), 200);
+  assert.equal(appended.data.truncated, true);
+  assert.equal(before.get(code).plan.truncated, true);
+
+  // Older journals can contain a plan event written before the producer cap existed.
+  const journal = path.join(dir, 'jobs', code + '.jsonl');
+  const seq = fs.readFileSync(journal, 'utf8').trim().split('\n').length + 1;
+  fs.appendFileSync(journal, JSON.stringify({ job: code, seq, type: 'plan.edited', at: Date.now(),
+    data: { question: 'legacy', subQuestions: entries } }) + '\n');
+  const replay = createJobs({ dir });
+  assert.deepEqual(replay.get(code).plan, { status: 'edited', question: null,
+    subQuestions: appended.data.subQuestions, truncated: true });
+  assert.equal(replay.recover(), 1);
+  assert.equal(replay.get(code).status, 'interrupted');
+  assert.equal(replay.get(code).plan.status, 'edited');
+
+  const skipped = replay.create({ kind: 'code' });
+  replay.append(skipped, 'plan.skipped', { question: 'unused', subQuestions: entries });
+  assert.deepEqual(replay.get(skipped).plan, { status: 'skipped', question: null, subQuestions: [], truncated: false });
+
+  const research = replay.create({ kind: 'deep_research' });
+  replay.append(research, 'plan.edited', { question: 'Why?', subQuestions: ['One', 'Two'] });
+  assert.deepEqual(replay.get(research).plan, { status: 'edited', question: 'Why?', subQuestions: ['One', 'Two'] });
+});
+
 test('assistant output replays after restart, clips UTF-8 safely, and survives interruption', (t) => {
   const dir = tmp(); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const before = createJobs({ dir, kinds: ['code'] });

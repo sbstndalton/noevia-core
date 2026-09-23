@@ -85,10 +85,11 @@ test('a task from another project is not found, rather than forbidden', async ()
   assert.throws(() => svc.get(ws, project, '00000000-0000-4000-8000-000000000000'), /Task not found/);
 });
 
-test('assistant output is visible only to its owning project and tenant workspace', async () => {
+test('assistant output and reported plan are visible only to their owning project and tenant workspace', async () => {
   let number = 0;
   const { svc, ws } = service({ connect: async ({ handlers }) => ({ prompt: async () => {
     handlers.sessionUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `Visible task ${++number}` } });
+    handlers.sessionUpdate({ sessionUpdate: 'plan', entries: [{ content: `Plan ${number}` }] });
     return { stopReason: 'end_turn' };
   } }) });
   const otherProject = { id: 'p2' }, otherTenant = { dir: temp('noevia-other-tenant-') };
@@ -98,8 +99,12 @@ test('assistant output is visible only to its owning project and tenant workspac
   for (let i = 0; i < 300 && svc.get(ws, otherProject, second.taskId).status !== 'completed'; i++) await new Promise((r) => setTimeout(r, 5));
   assert.deepEqual(svc.get(ws, project, first.taskId).assistantOutput, { text: 'Visible task 1', truncated: false });
   assert.deepEqual(svc.get(ws, otherProject, second.taskId).assistantOutput, { text: 'Visible task 2', truncated: false });
+  assert.deepEqual(svc.get(ws, project, first.taskId).plan.subQuestions, ['Plan 1']);
+  assert.deepEqual(svc.get(ws, otherProject, second.taskId).plan.subQuestions, ['Plan 2']);
   assert.deepEqual(svc.list(ws, project).map((task) => task.assistantOutput?.text), ['Visible task 1']);
   assert.deepEqual(svc.list(ws, otherProject).map((task) => task.assistantOutput?.text), ['Visible task 2']);
+  assert.deepEqual(svc.list(ws, project).map((task) => task.plan?.subQuestions), [['Plan 1']]);
+  assert.deepEqual(svc.list(ws, otherProject).map((task) => task.plan?.subQuestions), [['Plan 2']]);
   assert.deepEqual(svc.list(otherTenant, project), []);
   assert.throws(() => svc.get(ws, otherProject, first.taskId), /Task not found/);
   assert.throws(() => svc.get(otherTenant, project, first.taskId), /Task not found/);

@@ -23,6 +23,7 @@ const fs = require('node:fs'), nodePath = require('node:path');
 const { classify, decide, pickOption, ACTIONS } = require('./code-actions.cjs');
 const { readUsage, readContext, readExitCode, codingIdentity, summarize } = require('./code-meta.cjs');
 const { MAX_ASSISTANT_OUTPUT_BYTES, MAX_ASSISTANT_OUTPUT_EVENTS } = require('./jobs.cjs');
+const { boundCodePlan, MAX_CODE_PLAN_ENTRIES } = require('./code-plan.cjs');
 
 const MAX_TEXT = 4000;                  // what a job event keeps, as chat keeps of a tool result
 const MAX_FILE_BYTES = 8 * 1024 * 1024; // one source file, not a database the agent found
@@ -317,7 +318,11 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
             exitCode, content: summarizeContent(update.content) });
         }
       } else if (kind === 'plan') {
-        ctx.event('plan.proposed', { question: null, subQuestions: (update.entries || []).map((e) => String(e.content || '').slice(0, 200)) });
+        const entries = Array.isArray(update.entries) ? update.entries : [];
+        ctx.event('plan.proposed', { question: null, ...boundCodePlan({
+          subQuestions: entries.slice(0, MAX_CODE_PLAN_ENTRIES).map((entry) => entry?.content ?? ''),
+          truncated: entries.length > MAX_CODE_PLAN_ENTRIES,
+        }) });
       } else if (kind === 'usage_update') {
         const reported = readUsage(update) || readUsage(update.usage) || readUsage(update._meta);
         if (reported) reportedUsage = reported;
