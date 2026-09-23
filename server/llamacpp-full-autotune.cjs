@@ -319,13 +319,15 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
       throw e;
     }
   }
-  async function finishModel(j, item) {
+  async function finishModel(j, item, final) {
     const kv = phaseOf(item, 'kv').value, ctx = phaseOf(item, 'context').value,
       draft = phaseOf(item, 'drafting').value, batch = phaseOf(item, 'batch').value;
     const result = { kv: kv.kv, context: ctx.context, spec: draft.spec, specLabel: draft.specLabel,
-      generation: batch.generation, acceptance: batch.acceptance, ubatch: batch.ubatch,
-      promptPerSecond: batch.promptPerSecond, quality: batch.quality, extensions: [],
+      generation: final.generation, acceptance: final.acceptance, ubatch: batch.ubatch,
+      promptPerSecond: batch.promptPerSecond, quality: final.quality, extensions: [],
       loaded: true, version: VERSION, signature: await signature(item.model) };
+    if (presets.snapshot().revision !== j._revision)
+      throw Object.assign(Error('Settings changed outside auto-tune.'), { fatal: true });
     item.result = result; item.status = 'passed';
     state.history[item.model] = [{ at: now(), ...result }, ...(state.history[item.model] || [])].slice(0, 10);
     save();
@@ -347,6 +349,7 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
           });
           idleAbort = null; j.waiting = false; item.status = 'running'; save();
           const identity = await identityFor(item.model);
+          if (!identity) throw Object.assign(Error('Model identity could not be read.'), { fatal: true });
           const stableIdentity = hash({ ...identity, profile: undefined });
           if (item._identity && item._identity !== stableIdentity) throw Object.assign(Error('Model identity changed since tuning began.'), { fatal: true });
           item._identity = stableIdentity;
@@ -357,7 +360,15 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
             release.setReason('Chat is paused while noevia tunes ' + item.model + ': ' + p.label.toLowerCase() + '.');
             await runPhase(j, item, p);
           }
-          await finishModel(j, item);
+          // A restart can land after the final phase committed but before this summary.
+          // Confirm the saved profile loads and passes again before reporting it ready.
+          if (presets.snapshot().revision !== j._revision)
+            throw Object.assign(Error('Settings changed outside auto-tune.'), { fatal: true });
+          await unloadAll();
+          await load(j);
+          const final = await validate(item.model);
+          check();
+          await finishModel(j, item, final);
         } finally {
           idleAbort = null; j.waiting = false; release?.(); save();
         }
@@ -447,6 +458,7 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
       for (const item of j.models.filter(m => m.status !== 'passed')) {
         if (!rows.body.data.some(row => row.id === item.model) || !presets.get(item.model).exists) throw Error('A queued model is no longer configured.');
         const identity = await identityFor(item.model);
+        if (!identity) throw Error('A queued model identity could not be read.');
         if (item._identity && item._identity !== hash({ ...identity, profile: undefined })) throw Error('A queued model changed since tuning began.');
       }
       cancelled = false; j.status = 'running'; j.error = undefined; j.finishedAt = undefined;

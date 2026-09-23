@@ -5,7 +5,7 @@ const { createModelManager } = require('./model-manager.cjs');
 const { createPresetStore } = require('./llamacpp-presets.cjs');
 const { QUALITY, qualityCheck } = require('./llamacpp-full-autotune.cjs');
 
-function fixture(t, { models = ['synthetic'], onChat, badQ4 = true, noHead = false, rejectAll = false, rejectModel = '', badBatch = false, idleTimeoutMs = 300000 } = {}) {
+function fixture(t, { models = ['synthetic'], onChat, badQ4 = true, noHead = false, rejectAll = false, rejectModel = '', badBatch = false, idleTimeoutMs = 300000, loseIdentityAfterStart = false } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'full-tune-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const ini = path.join(dir, 'models.ini'), stateFile = path.join(dir, 'tune.json');
@@ -13,7 +13,7 @@ function fixture(t, { models = ['synthetic'], onChat, badQ4 = true, noHead = fal
   fs.writeFileSync(ini, original);
   const presets = createPresetStore(ini), status = Object.fromEntries([...models, 'embed'].map(m => [m, 'unloaded']));
   const requests = [], options = m => presets.get(m).options;
-  let chats = 0, build = 'fake-v1';
+  let chats = 0, build = 'fake-v1', identityReads = 0;
   const fetchJson = async (url, opts = {}) => {
     const u = new URL(url), b = opts.body ? JSON.parse(opts.body) : {};
     if (opts.signal?.aborted) throw Error('aborted');
@@ -47,7 +47,7 @@ function fixture(t, { models = ['synthetic'], onChat, badQ4 = true, noHead = fal
   const makeManager = () => createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic', presetPath: ini, fetchJson, fetchStream,
     calibrationStatePath: path.join(dir, 'cal.json'), autotuneStatePath: stateFile, autotuneTablePath: path.join(dir, 'table.json'),
     calibrationOptions: { sleep: async () => {}, readMemory: () => 20 },
-    autotuneOptions: { sleep: async () => {}, betweenModelsMs: 25, idleTimeoutMs, readMemory: () => 20, identityFor: async m => ({ model: m, hardware: 'fake', build }) } });
+    autotuneOptions: { sleep: async () => {}, betweenModelsMs: 25, idleTimeoutMs, readMemory: () => 20, identityFor: async m => (++identityReads > 1 && loseIdentityAfterStart ? null : { model: m, hardware: 'fake', build }) } });
   let manager = makeManager();
   return { manager, ini, stateFile, original, requests, options, status, restart: () => { manager = makeManager(); return manager; }, setBuild: b => { build = b; } };
 }
@@ -132,6 +132,15 @@ test('busy chat makes start wait, with cancellable bounded idle acquisition', as
   const chat = second.manager.enterInference(); chat();
 });
 
+test('unreadable identity after acceptance stops before writing a trial profile', async t => {
+  const f = fixture(t, { loseIdentityAfterStart: true });
+  assert.equal((await f.manager.autotune.start('synthetic', { confirmPause: true })).status, 202);
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'failed'); assert.match(j.error, /identity could not be read/);
+  assert.equal(fs.readFileSync(f.ini, 'utf8'), f.original);
+  assert.equal(f.requests.length, 0);
+});
+
 test('cancel during drafting keeps committed KV/context and Resume starts at drafting', async t => {
   let stopped = false;
   const f = fixture(t, { onChat: ({ manager }) => {
@@ -212,6 +221,26 @@ test('restart rolls back active phase only, then explicit Resume skips committed
   assert.equal(end.status, 'passed', end.error);
   assert.deepEqual(end.models[0].phases.slice(0,2).map(p => p.status), ['passed','passed']);
   assert.ok(f.requests.length > before);
+});
+
+test('restart after every phase commit reloads and qualifies the saved profile before reporting success', async t => {
+  const f = fixture(t);
+  await f.manager.autotune.start('synthetic', { confirmPause: true }); await finished(f.manager);
+  const state = JSON.parse(fs.readFileSync(f.stateFile, 'utf8'));
+  state.job.status = 'running'; state.job.models[0].status = 'running';
+  delete state.job.models[0].result;
+  state.history = {};
+  fs.writeFileSync(f.stateFile, JSON.stringify(state));
+  f.status.synthetic = 'unloaded';
+  const before = f.requests.length;
+  const manager = f.restart(); await manager.autotune.recover();
+  assert.equal(manager.autotune.status().body.job.status, 'interrupted');
+  assert.equal((await manager.autotune.resume({ confirmPause: true })).status, 202);
+  const resumed = await finished(manager);
+  assert.equal(resumed.status, 'passed', resumed.error);
+  assert.ok(f.requests.length >= before + 6, 'final quality and throughput run after restart');
+  assert.equal(f.status.synthetic, 'loaded');
+  assert.equal(resumed.models[0].result.loaded, true);
 });
 
 test('quality suite requires each independent probe', async () => {
