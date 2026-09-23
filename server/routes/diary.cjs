@@ -39,7 +39,7 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
       const token=String(req.headers.authorization||'').replace(/^Bearer /,'');
       const identity=diaryConnectors.verify(token);
       if(!identity)return json(res,401,{error:'Diary connector credential required'});
-      const body=JSON.parse(await readBody(req,4*1024*1024));
+      const body=await readJson(req,4*1024*1024);
       const result=await require('../diary-connectors.cjs').operate(identity,body,connectorFiles,()=>!!diaryConnectors.verify(token));
       if(body.action==='write')authService.audit('diary-connector.write',identity.userId,identity.userId,{credentialId:identity.id,path:body.path,bytes:Buffer.byteLength(body.content)});
       return json(res,200,result);
@@ -99,9 +99,10 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
       const listing = p.endsWith('/files');
       if (!(listing ? req.method === 'GET' : local ? req.method === 'POST' : ['POST', 'PUT'].includes(req.method))) return json(res, 405, { error: 'Method not allowed' });
       if (local && rateLimited(authn.user.id)) return json(res, 429, { error: 'Please wait before sending another message' });
-      const body = listing ? undefined : await readBody(req, local ? 16 * 1024 * 1024 : 1024 * 1024);
+      const parsed = local ? await readJson(req, 16 * 1024 * 1024) : undefined;
+      const body = local ? JSON.stringify(parsed) : listing ? undefined : await readBody(req, 1024 * 1024);
       const suffix = listing ? '/files?path=' + encodeURIComponent(url.searchParams.get('path') || '') : local ? '/local-exchange' : '/file';
-      if (local && JSON.parse(body).stream === true) {
+      if (local && parsed?.stream === true) {
         return require('../diary-stream.cjs').proxyDiaryStream(res, `${DIARY_BASE}/api${suffix}`, {
           method:'POST', headers:diaryHeaders(), body,
         }, {onEvent:event=>{if(event.type==='mtp')require('../mtp.cjs').record(authn.user.id,event.model,event.timings);}});
