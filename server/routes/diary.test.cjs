@@ -13,7 +13,7 @@ function fixture({ diaryOn = true, limited = false, connectorLimited = false, ad
   const routes = createDiaryRoutes({
     json: (res, status, body) => { sent.push({ status, body }); },
     readBody: async (req) => { let s = ''; for await (const c of req) s += c; return s; },
-    readJson: async (req) => { let s = ''; for await (const c of req) s += c; return s ? JSON.parse(s) : {}; },
+    readJson: require('../http.cjs').readJson,
     fetchJson: async (url, init) => { fetched.push({ url, init }); return reply ? reply(url, init) : { ok: true, status: 200, body: { ok: true } }; },
     DIARY_BASE: 'http://diary:8010',
     authService: { diaryEnabled: () => diaryOn, audit: (...args) => audits.push(args) },
@@ -140,4 +140,15 @@ test('operator import folders are admin-only and the entry edit validates before
   await f.call('diary', 'POST', '/api/diary/entries/edit', { xid: 'x', me: 'text' });
   assert.deepEqual(f.sent.pop(), { status: 502, body: { error: 'journal locked' } });
   assert.equal(f.fetched.at(-1).init.body, '{"xid":"x","me":"text","assistant":"","month":null}');
+});
+
+
+test('malformed local exchange and authenticated connector JSON fail before side effects', async () => {
+  const f = fixture();
+  await assert.rejects(f.call('diary', 'POST', '/api/diary/local-exchange', '{broken'),
+    { status: 400, message: 'invalid JSON' });
+  await assert.rejects(f.call('connector', 'POST', '/api/diary-connector', '{broken',
+    { reqHeaders: { authorization: 'Bearer good' } }), { status: 400, message: 'invalid JSON' });
+  assert.deepEqual(f.fetched, []);
+  assert.deepEqual(f.audits, []);
 });

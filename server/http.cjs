@@ -54,9 +54,10 @@ async function readBody(req, limit = 1024 * 1024) {
   }
   return Buffer.concat(chunks).toString('utf8');
 }
-async function readJson(req) {
-  const raw = await readBody(req);
-  return raw ? JSON.parse(raw) : {};
+async function readJson(req, limit) {
+  const raw = await readBody(req, limit);
+  try { return raw ? JSON.parse(raw) : {}; }
+  catch { throw Object.assign(new SyntaxError('invalid JSON'), { status: 400 }); }
 }
 
 function authResult(res, result) {
