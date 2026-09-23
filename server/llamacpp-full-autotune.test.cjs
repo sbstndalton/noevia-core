@@ -5,22 +5,26 @@ const { createModelManager } = require('./model-manager.cjs');
 const { createPresetStore } = require('./llamacpp-presets.cjs');
 const { QUALITY, qualityCheck } = require('./llamacpp-full-autotune.cjs');
 
-function fixture(t, { models = ['synthetic'], onChat, badQ4 = true, noHead = false, rejectAll = false, rejectModel = '', badBatch = false, failFinal = false, idleTimeoutMs = 300000, loseIdentityAfterStart = false, reloadFail = false } = {}) {
+function fixture(t, { models = ['synthetic'], onChat, onUnload, badQ4 = true, badF16 = false, noHead = false, rejectAll = false, rejectModel = '', badBatch = false, failFinal = false, idleTimeoutMs = 300000, loseIdentityAfterStart = false, reloadFail = false, unloadPolls = 0, unloadStuck = false } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'full-tune-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const ini = path.join(dir, 'models.ini'), stateFile = path.join(dir, 'tune.json');
   const original = 'version = 1\n' + [...models, 'embed'].map(m => `[${m}]\nmodel = /models/${m}.gguf\nctx-size = 8192\nparallel = 1\n`).join('');
   fs.writeFileSync(ini, original);
   const presets = createPresetStore(ini), status = Object.fromEntries([...models, 'embed'].map(m => [m, 'unloaded']));
+  const unloading = {};
   const requests = [], options = m => presets.get(m).options;
   let chats = 0, build = 'fake-v1', identityReads = 0;
   const fetchJson = async (url, opts = {}) => {
     const u = new URL(url), b = opts.body ? JSON.parse(opts.body) : {};
     if (opts.signal?.aborted) throw Error('aborted');
     if (u.pathname === '/models' && u.searchParams.has('reload')) return { ok: !reloadFail, body: {} };
-    if (u.pathname === '/models') return { ok: true, body: { data: Object.entries(status).map(([id, value]) => ({ id, status: { value, args: id === 'embed' ? ['--embedding'] : [] }, meta: { n_ctx_train: 16384 } })) } };
+    if (u.pathname === '/models') return { ok: true, body: { data: Object.entries(status).map(([id, value]) => {
+      if (value === 'unloading' && !unloadStuck && --unloading[id] <= 0) status[id] = value = 'unloaded';
+      return { id, status: { value, args: id === 'embed' ? ['--embedding'] : [] }, meta: { n_ctx_train: 16384 } };
+    }) } };
     if (u.pathname === '/models/load') { status[b.model] = 'loaded'; return { ok: true, body: {} }; }
-    if (u.pathname === '/models/unload') { status[b.model] = 'unloaded'; return { ok: true, body: {} }; }
+    if (u.pathname === '/models/unload') { status[b.model] = unloadPolls || unloadStuck ? 'unloading' : 'unloaded'; unloading[b.model] = unloadPolls; onUnload?.({ manager, model: b.model }); return { ok: true, body: {} }; }
     if (u.pathname === '/tokenize') return { ok: true, body: { tokens: Array(600).fill(1) } };
     if (u.pathname === '/props') return { ok: true, body: { build_info: build } };
     if (u.pathname === '/v1/chat/completions') {
@@ -30,7 +34,7 @@ function fixture(t, { models = ['synthetic'], onChat, badQ4 = true, noHead = fal
       if (opts.signal?.aborted) throw Error('aborted');
       const q = QUALITY.find(q => q.prompt === prompt);
       let text = q ? q.expected : prompt.startsWith('List the whole numbers') ? Array.from({ length: 60 }, (_, i) => i + 1).join(', ') : 'Synthetic answer';
-      if (q && (rejectAll || b.model === rejectModel || (badQ4 && o['cache-type-k'] === 'q4_0'))) text = 'wrong';
+      if (q && (rejectAll || b.model === rejectModel || (badF16 && o['cache-type-k'] === 'f16') || (badQ4 && o['cache-type-k'] === 'q4_0'))) text = 'wrong';
       if (badBatch && q && o['ubatch-size']) text = 'wrong';
       if (failFinal && q && manager.autotune.status().body.job?.phase === 'Verifying saved profile') text = 'wrong';
       const spec = o['spec-type'], draft = spec === 'ngram-simple' || spec === 'draft-mtp' && !noHead;
@@ -49,7 +53,7 @@ function fixture(t, { models = ['synthetic'], onChat, badQ4 = true, noHead = fal
   const makeManager = () => createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic', presetPath: ini, fetchJson, fetchStream,
     calibrationStatePath: path.join(dir, 'cal.json'), autotuneStatePath: stateFile, autotuneTablePath: path.join(dir, 'table.json'),
     calibrationOptions: { sleep: async () => {}, readMemory: () => 20 },
-    autotuneOptions: { sleep: async () => {}, betweenModelsMs: 25, idleTimeoutMs, readMemory: () => 20, identityFor: async m => (++identityReads > 1 && loseIdentityAfterStart ? null : { model: m, hardware: 'fake', build }) } });
+    autotuneOptions: { ...(unloadPolls || unloadStuck ? { sleep: async () => {} } : {}), betweenModelsMs: 25, idleTimeoutMs, readMemory: () => 20, identityFor: async m => (++identityReads > 1 && loseIdentityAfterStart ? null : { model: m, hardware: 'fake', build }) } });
   let manager = makeManager();
   return { manager, ini, stateFile, original, requests, options, status, restart: () => { manager = makeManager(); return manager; }, setBuild: b => { build = b; } };
 }
@@ -84,6 +88,42 @@ test('ordered script commits KV, context, drafting and batch with measured evide
   assert.equal((await f.manager.autotune.untuned()).body.models.length, 0);
   assert.equal(f.manager.autotune.status('synthetic').body.history.length, 1);
   assert.doesNotMatch(JSON.stringify(j), /beforeText|originalText|lastRevision|_revision/);
+});
+
+test('quality rejection followed by asynchronous unload still reaches the next KV candidate', async t => {
+  const f = fixture(t, { badF16: true, unloadPolls: 4 });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager), kv = phase(j.models[0], 'kv');
+  assert.equal(j.status, 'passed', j.error);
+  assert.equal(kv.steps.find(s => s.id === 'f16').status, 'failed');
+  assert.match(kv.steps.find(s => s.id === 'f16').reason, /arithmetic \(mismatch\)/);
+  assert.equal(kv.steps.find(s => s.id === 'q8_0').status, 'passed');
+  assert.equal(j.models[0].result.kv, 'q8_0');
+});
+
+test('an unload that never reaches unloaded stops without writing another profile', async t => {
+  const f = fixture(t, { badF16: true, unloadStuck: true });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'failed');
+  assert.match(j.error, /Timed out waiting for router unload: synthetic \(unloading\)/);
+  assert.equal(f.options('synthetic')['cache-type-k'], 'f16');
+  assert.equal(f.requests.length, 3, 'only the first candidate reached the quality probes');
+});
+
+test('cancelling during router unload waits for safe rollback and releases chat', async t => {
+  let cancelled = false;
+  const f = fixture(t, { unloadPolls: 4, onUnload: ({ manager }) => {
+    if (!cancelled) { cancelled = true; manager.autotune.cancel(); }
+  } });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  assert.equal(cancelled, true);
+  assert.equal(j.status, 'cancelled');
+  assert.equal(phase(j.models[0], 'kv').restored, true);
+  assert.equal(fs.readFileSync(f.ini, 'utf8'), f.original);
+  assert.equal(f.status.synthetic, 'unloaded');
+  const leave = f.manager.enterInference(); leave();
 });
 
 test('bulk tuning releases the lease between models so a chat can run', async t => {
@@ -319,4 +359,16 @@ test('quality suite requires each independent probe', async () => {
     const result = await qualityCheck('x', async (_m, p) => ({ text: p === bad.prompt ? 'wrong' : QUALITY.find(q => q.prompt === p).expected }));
     assert.equal(result.passed, false); assert.equal(result.checks.filter(c => c.passed).length, 2);
   }
+});
+
+test('quality diagnostics identify an upstream error and truncated response without storing generated text', async () => {
+  const result = await qualityCheck('x', async (_m, prompt) => prompt === QUALITY[0].prompt
+    ? { failure: 'HTTP 503' } : prompt === QUALITY[1].prompt
+      ? { text: 'AX', finishReason: 'length' } : { text: QUALITY[2].expected });
+  assert.deepEqual(result.checks, [
+    { id: 'arithmetic', passed: false, reason: 'HTTP 503' },
+    { id: 'extraction', passed: false, reason: 'truncated' },
+    { id: 'reasoning', passed: true },
+  ]);
+  assert.doesNotMatch(JSON.stringify(result), /AX|503 response body/);
 });
