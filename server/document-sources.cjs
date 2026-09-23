@@ -31,7 +31,7 @@ async function ingest(workspace, projectId, name, bytes, previous) {
   let out;
   try { out = JSON.parse(fs.readFileSync(resultFile, 'utf8')); if (out.retryable) throw new Error('retry OCR'); } catch {
     try { out = await documents.extractDocumentText(name, bytes); }
-    catch (err) { out = { text: '', pages: 0, pageTexts: [], state: 'failed', truncated: false, error: err.message }; }
+    catch (err) { out = { text: '', pages: 0, pageTexts: [], state: 'failed', truncated: false, retryable: !!err.retryable, error: err.message }; }
     writeOnce(resultFile, JSON.stringify(out));
   }
   const stale = out.state === 'failed' && !!previous?.content;

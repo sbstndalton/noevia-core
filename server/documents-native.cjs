@@ -21,6 +21,9 @@ const HEAP_LIMIT_MB = 512;
 // that growth is attributable to it.
 const GROWTH_LIMIT_MB = 1024;
 const WATCH_MS = 100;
+const MAX_PENDING = 4;
+const MAX_PENDING_BYTES = 100 * 1024 * 1024;
+const QUEUE_WAIT_MS = 30_000;
 // pdf.js's own cap on a decoded image, in pixels (default: unlimited).
 const MAX_IMAGE_PIXELS = 64 * 1024 * 1024;
 
@@ -63,51 +66,89 @@ async function readNativePages(bytes, { pageCap, pageTextCap, totalTextCap }) {
   } finally { if (pdf) await pdf.loadingTask.destroy(); }
 }
 
-// One reader at a time (see GROWTH_LIMIT_MB); the rest wait their turn.
-let running = Promise.resolve();
-function oneAtATime(task) {
-  const turn = running.then(task, task);
-  running = turn.then(() => {}, () => {});
-  return turn;
+/**
+ * Make a one-worker PDF reader with bounded pending work. Active reads retain their time, heap,
+ * and memory-growth limits; pending reads have separate count, byte, and wait limits.
+ * `script` and `rss` remain replaceable per read; copyBytes and makeWorker are replaceable
+ * per queue for deterministic tests.
+ */
+function createReader({ maxPending = MAX_PENDING, maxPendingBytes = MAX_PENDING_BYTES, queueWaitMs = QUEUE_WAIT_MS,
+  copyBytes = bytes => new Uint8Array(bytes), makeWorker = (script, options) => new Worker(script, options) } = {}) {
+  // Only pending calls consume reservations. The active worker keeps the existing RSS-growth
+  // attribution; its transfer copy is made after it owns that slot, never while queued.
+  const pending = [];
+  let pendingBytes = 0, active = false;
+  const busy = reason => Object.assign(new Error(reason === 'wait'
+    ? 'The PDF reader stayed busy too long; refresh or re-upload to retry.'
+    : 'The PDF reader is busy; wait for current processing, then retry.'), { limit: 'queue', reason });
+
+  function runWorker(bytes, { timeLimitMs = TIME_LIMIT_MS, heapLimitMb = HEAP_LIMIT_MB, growthLimitMb = GROWTH_LIMIT_MB,
+    script = __filename, rss = () => process.memoryUsage.rss(), ...caps }) {
+    return new Promise((resolve, reject) => {
+      // The caller's Buffer may be a slice of a shared pool. Transfer only this private copy.
+      const copy = copyBytes(bytes);
+      const baseline = rss();
+      const worker = makeWorker(script, {
+        workerData: { noeviaPdfWorker: true, bytes: copy, caps },
+        transferList: [copy.buffer],
+        resourceLimits: { maxOldGenerationSizeMb: heapLimitMb, maxYoungGenerationSizeMb: Math.min(64, heapLimitMb) },
+        // Nothing from the server's environment is the parser's business. pdf.js's own warnings
+        // still reach the server log through the inherited stdout/stderr.
+        env: {},
+      });
+      let settled = false;
+      const finish = (fn, value) => {
+        if (settled) return; settled = true; clearTimeout(timer); clearInterval(watch);
+        worker.terminate().catch(() => {}).finally(() => fn(value));
+      };
+      const timer = setTimeout(() => finish(reject, Object.assign(Error('time limit'), { limit: 'time' })), timeLimitMs);
+      const watch = setInterval(() => {
+        if (rss() - baseline > growthLimitMb * 1024 * 1024) finish(reject, Object.assign(Error('memory limit'), { limit: 'memory' }));
+      }, WATCH_MS);
+      worker.on('message', (m) => (m && m.ok ? finish(resolve, m.result) : finish(reject, Error(String(m?.message || 'The PDF reader failed.')))));
+      worker.on('error', (err) => finish(reject, err && err.code === 'ERR_WORKER_OUT_OF_MEMORY'
+        ? Object.assign(Error('memory limit'), { limit: 'memory' }) : err));
+      worker.on('exit', (code) => finish(reject, Error(`The PDF reader stopped (exit ${code}).`)));
+    });
+  }
+
+  function start(entry) {
+    active = true;
+    Promise.resolve().then(() => runWorker(entry.bytes, entry.options))
+      .then(entry.resolve, entry.reject)
+      .finally(() => { active = false; drain(); });
+  }
+
+  function drain() {
+    while (!active && pending.length) {
+      const entry = pending.shift();
+      pendingBytes -= entry.size;
+      clearTimeout(entry.waitTimer);
+      if (Date.now() >= entry.deadline) { entry.reject(busy('wait')); continue; }
+      start(entry);
+    }
+  }
+
+  return function readInWorker(bytes, options = {}) {
+    return new Promise((resolve, reject) => {
+      const entry = { bytes, options, resolve, reject, size: bytes.byteLength };
+      if (!active && !pending.length) return start(entry);
+      if (pending.length >= maxPending || pendingBytes + entry.size > maxPendingBytes) return reject(busy('full'));
+      entry.deadline = Date.now() + queueWaitMs;
+      entry.waitTimer = setTimeout(() => {
+        const index = pending.indexOf(entry);
+        if (index < 0) return;
+        pending.splice(index, 1);
+        pendingBytes -= entry.size;
+        reject(busy('wait'));
+      }, queueWaitMs);
+      pending.push(entry);
+      pendingBytes += entry.size;
+    });
+  };
 }
 
-/**
- * Read a PDF's pages in a worker, within a time, a heap and a memory-growth limit. A limit
- * rejects with `err.limit` = 'time' | 'memory'; a parse failure rejects with the parser's message.
- * @param {Buffer|Uint8Array} bytes
- * @param {{pageCap: number, pageTextCap: number, totalTextCap: number, timeLimitMs?: number,
- *          heapLimitMb?: number, growthLimitMb?: number, script?: string, rss?: () => number}} options
- *   `script` replaces the worker and `rss` the memory reading (tests).
- */
-function readInWorker(bytes, { timeLimitMs = TIME_LIMIT_MS, heapLimitMb = HEAP_LIMIT_MB, growthLimitMb = GROWTH_LIMIT_MB,
-  script = __filename, rss = () => process.memoryUsage.rss(), ...caps }) {
-  // A copy, transferred: the caller's buffer may be a slice of a shared pool.
-  const copy = new Uint8Array(bytes);
-  return oneAtATime(() => new Promise((resolve, reject) => {
-    const baseline = rss();
-    const worker = new Worker(script, {
-      workerData: { noeviaPdfWorker: true, bytes: copy, caps },
-      transferList: [copy.buffer],
-      resourceLimits: { maxOldGenerationSizeMb: heapLimitMb, maxYoungGenerationSizeMb: Math.min(64, heapLimitMb) },
-      // Nothing from the server's environment is the parser's business. pdf.js's own warnings
-      // still reach the server log through the inherited stdout/stderr.
-      env: {},
-    });
-    let settled = false;
-    const finish = (fn, value) => {
-      if (settled) return; settled = true; clearTimeout(timer); clearInterval(watch);
-      worker.terminate().catch(() => {}).finally(() => fn(value));
-    };
-    const timer = setTimeout(() => finish(reject, Object.assign(Error('time limit'), { limit: 'time' })), timeLimitMs);
-    const watch = setInterval(() => {
-      if (rss() - baseline > growthLimitMb * 1024 * 1024) finish(reject, Object.assign(Error('memory limit'), { limit: 'memory' }));
-    }, WATCH_MS);
-    worker.on('message', (m) => (m && m.ok ? finish(resolve, m.result) : finish(reject, Error(String(m?.message || 'The PDF reader failed.')))));
-    worker.on('error', (err) => finish(reject, err && err.code === 'ERR_WORKER_OUT_OF_MEMORY'
-      ? Object.assign(Error('memory limit'), { limit: 'memory' }) : err));
-    worker.on('exit', (code) => finish(reject, Error(`The PDF reader stopped (exit ${code}).`)));
-  }));
-}
+const readInWorker = createReader();
 
 if (!isMainThread && workerData && workerData.noeviaPdfWorker) {
   readNativePages(workerData.bytes, workerData.caps)
@@ -115,4 +156,4 @@ if (!isMainThread && workerData && workerData.noeviaPdfWorker) {
     .catch((err) => parentPort.postMessage({ ok: false, message: String(err && err.message || err) }));
 }
 
-module.exports = { readInWorker, readNativePages, TIME_LIMIT_MS, HEAP_LIMIT_MB, GROWTH_LIMIT_MB };
+module.exports = { readInWorker, readNativePages, createReader, TIME_LIMIT_MS, HEAP_LIMIT_MB, GROWTH_LIMIT_MB, MAX_PENDING, MAX_PENDING_BYTES, QUEUE_WAIT_MS };

@@ -94,6 +94,7 @@ async function extractDocumentText(name, bytes, {
   try {
     ({ numPages, pageTexts } = await readPages(bytes, { pageCap: PAGE_CAP, pageTextCap: PAGE_TEXT_CAP, totalTextCap: TOTAL_TEXT_CAP }));
   } catch (err) {
+    if (err.limit === 'queue') throw Object.assign(new Error(err.message), { status: 503, retryable: true });
     const message = err.limit === 'time' ? 'Reading this PDF took too long, so it was stopped. Try a smaller or re-saved copy.'
       : err.limit === 'memory' ? 'Reading this PDF needed too much memory, so it was stopped. Try a smaller or re-saved copy.'
       : /password/i.test(err.message) ? 'Password-protected PDF; upload an unlocked copy.'

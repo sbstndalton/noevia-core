@@ -54,6 +54,24 @@ test('new failed document has no stale content; later corrected bytes recover it
   assert.notEqual(ok.document.version, fail.document.version);
 });
 
+test('temporary PDF reader pressure is retried instead of cached as a broken document', async () => {
+  const w = workspace('busy-retry'), bytes = fixture('text.pdf');
+  const original = documents.extractDocumentText;
+  let calls = 0;
+  documents.extractDocumentText = async (...args) => {
+    if (++calls === 1) throw Object.assign(new Error('The PDF reader is busy; retry.'), { retryable: true, status: 503 });
+    return original(...args);
+  };
+  try {
+    const busy = await sources.ingest(w, 'p', 'a.pdf', bytes);
+    assert.equal(busy.document.state, 'failed');
+    assert.match(busy.document.error, /retry/);
+    const recovered = await sources.ingest(w, 'p', 'a.pdf', bytes, busy);
+    assert.equal(recovered.document.state, 'ready');
+    assert.equal(calls, 2);
+  } finally { documents.extractDocumentText = original; }
+});
+
 test('page chunking retains page labels on every chunk', () => {
   const rag = require('./rag.cjs');
   const chunks = rag.chunkText('[Page 1]\n' + 'one '.repeat(1000) + '\n\n[Page 2]\n' + 'two '.repeat(1000));

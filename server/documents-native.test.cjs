@@ -2,7 +2,8 @@
 // The PDF reader's worker and its limits. Synthetic fixtures only.
 const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
-const { readInWorker, readNativePages } = require('./documents-native.cjs');
+const { EventEmitter } = require('node:events');
+const { readInWorker, readNativePages, createReader } = require('./documents-native.cjs');
 const documents = require('./documents.cjs');
 
 const fixture = (name) => fs.readFileSync(path.join(__dirname, 'fixtures/documents', name));
@@ -69,4 +70,81 @@ test('readers run one at a time, so memory growth belongs to the one running', a
   const runs = await Promise.all(Array.from({ length: 3 }, () => readInWorker(fixture('text.pdf'), { ...caps, script: slow })));
   runs.sort((a, b) => a.start - b.start);
   for (let i = 1; i < runs.length; i++) assert.ok(runs[i].start >= runs[i - 1].end, `run ${i} started after run ${i - 1} ended`);
+});
+
+function controlledReader(limits) {
+  const workers = [];
+  let copies = 0;
+  const read = createReader({ ...limits,
+    copyBytes(bytes) { copies++; return new Uint8Array(bytes); },
+    makeWorker(_script, options) {
+      const worker = new EventEmitter();
+      worker.terminate = async () => 0;
+      workers.push({ worker, options });
+      return worker;
+    },
+  });
+  return { read, workers, copies: () => copies,
+    finish(index) { workers[index].worker.emit('message', { ok: true, result: { index } }); } };
+}
+const tick = () => new Promise(resolve => setImmediate(resolve));
+
+test('pending readers are admitted before copying and excess count/bytes are refused promptly', async () => {
+  const h = controlledReader({ maxPending: 2, maxPendingBytes: 3, queueWaitMs: 1000 });
+  const first = h.read(Buffer.alloc(2));
+  await tick();
+  assert.equal(h.copies(), 1);
+  const second = h.read(Buffer.alloc(2));
+  assert.equal(h.copies(), 1, 'a waiting input has no transfer copy');
+  await assert.rejects(h.read(Buffer.alloc(2)), e => e.limit === 'queue' && e.reason === 'full');
+  const third = h.read(Buffer.alloc(1));
+  await assert.rejects(h.read(Buffer.alloc(1)), e => e.limit === 'queue' && e.reason === 'full');
+  assert.equal(h.copies(), 1);
+  h.finish(0); await first; await tick();
+  assert.equal(h.copies(), 2, 'the next transfer copy is made only after the first worker ends');
+  assert.equal(h.workers.length, 2);
+  h.finish(1); await second; await tick();
+  h.finish(2); await third;
+  assert.equal(h.copies(), 3);
+});
+
+test('a queued reader expires during the wait, releases capacity, and never gets copied', async () => {
+  const h = controlledReader({ maxPending: 1, maxPendingBytes: 2, queueWaitMs: 25 });
+  const first = h.read(Buffer.alloc(2)); await tick();
+  const expired = h.read(Buffer.alloc(2));
+  await assert.rejects(expired, e => e.limit === 'queue' && e.reason === 'wait');
+  assert.equal(h.copies(), 1);
+  const replacement = h.read(Buffer.alloc(2));
+  h.finish(0); await first; await tick();
+  assert.equal(h.copies(), 2);
+  h.finish(1); await replacement;
+});
+
+test('queue pressure stays retryable at the document extraction boundary', async () => {
+  const busy = async () => { throw Object.assign(new Error('The PDF reader is busy; retry.'), { limit: 'queue' }); };
+  await assert.rejects(documents.extractDocumentText('a.pdf', fixture('text.pdf'), { doclingEnabled: false, readPages: busy }),
+    e => e.status === 503 && e.retryable === true && /retry/.test(e.message));
+});
+
+test('the next reader starts and admission recovers after worker startup, error, exit, or timeout failure', async () => {
+  for (const failure of ['startup', 'error', 'exit', 'timeout']) {
+    let started = 0;
+    const read = createReader({ maxPending: 1, maxPendingBytes: 2, queueWaitMs: 1000,
+      makeWorker() {
+        const index = ++started;
+        if (index === 1 && failure === 'startup') throw Error('synthetic startup failure');
+        const worker = new EventEmitter();
+        worker.terminate = async () => 0;
+        if (index === 1 && failure === 'error') setImmediate(() => worker.emit('error', Error('synthetic worker error')));
+        else if (index === 1 && failure === 'exit') setImmediate(() => worker.emit('exit', 3));
+        else if (index > 1) setImmediate(() => worker.emit('message', { ok: true, result: index }));
+        return worker;
+      },
+    });
+    const first = read(Buffer.alloc(2), { timeLimitMs: 20 });
+    const waiting = read(Buffer.alloc(2));
+    await assert.rejects(first, /failure|error|stopped|time limit/, failure);
+    assert.equal(await waiting, 2, `${failure}: queued work continued`);
+    assert.equal(await read(Buffer.alloc(2)), 3, `${failure}: admission capacity was released`);
+  }
 });
