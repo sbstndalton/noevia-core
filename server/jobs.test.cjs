@@ -106,3 +106,30 @@ test('recover is scoped to the store kinds: another store in the same directory 
   release('ok');
   assert.equal((await done).status, 'completed');
 });
+
+test('assistant output replays after restart, clips UTF-8 safely, and survives interruption', (t) => {
+  const dir = tmp(); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const before = createJobs({ dir, kinds: ['code'] });
+  const id = before.create({ kind: 'code', projectId: 'p1' });
+  before.append(id, 'job.started');
+  before.append(id, 'assistant.output', { text: 'Visible. ' });
+  for (let i = 0; i < 32; i++) before.append(id, 'assistant.output', { text: '😀'.repeat(256) });
+  const bounded = before.append(id, 'assistant.output', { text: 'x'.repeat(2000) });
+  assert.equal(Buffer.byteLength(bounded.data.text), 1024);
+  assert.equal(bounded.data.truncated, true);
+  const after = createJobs({ dir, kinds: ['code'] });
+  assert.equal(after.recover(), 1);
+  const recovered = after.get(id);
+  assert.equal(recovered.status, 'interrupted');
+  assert.equal(Buffer.byteLength(recovered.assistantOutput.text), 32765, 'later ASCII cannot fill the gap left at a multibyte boundary');
+  assert.ok(recovered.assistantOutput.text.startsWith('Visible. 😀'));
+  assert.equal(recovered.assistantOutput.truncated, true);
+  assert.equal(recovered.assistantOutput.text.includes('\uFFFD'), false);
+  assert.equal(after.list({ projectId: 'other', kind: 'code' }).length, 0);
+  const flood = before.create({ kind: 'code' });
+  for (let i = 0; i < 64; i++) before.append(flood, 'assistant.output', { text: 'x' });
+  assert.throws(() => before.append(flood, 'assistant.output', { text: 'more' }), /event limit/);
+  const invalid = before.create({ kind: 'code' });
+  before.append(invalid, 'assistant.output', { text: '\uD800' });
+  assert.equal(before.get(invalid).assistantOutput.text, '\uFFFD', 'malformed UTF-16 is normalized in the journal');
+});

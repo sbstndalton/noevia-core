@@ -61,7 +61,7 @@ function view(job, pending = null) {
     meta: job.checkpoint?.meta || null, identityHash: job.checkpoint?.identityHash || null,
     createdAt: job.createdAt, updatedAt: job.updatedAt,
     capabilities: job.capabilities,
-    steps: job.steps, plan: job.plan,
+    steps: job.steps, plan: job.plan, assistantOutput: job.assistantOutput,
     approval: pending ? { id: pending.id, ...pending.request } : null,
     result: job.result || null,
   };

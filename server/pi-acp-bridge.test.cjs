@@ -24,6 +24,10 @@ test('an allowed pi command reaches noevia as a classifiable permission request 
   assert.ok(r.updates.some((u) => u.sessionUpdate === 'agent_message_chunk' && /Settled/.test(u.content.text)),
     'agent_end does not truncate a continuation before agent_settled');
   assert.ok(r.updates.some((u) => u.sessionUpdate === 'tool_call' && u.toolCallId === 'call_1'));
+  assert.deepEqual(r.updates.filter((u) => u.sessionUpdate === 'agent_message_chunk').map((u) => u.content.text),
+    ['Cleaning up. ', 'Done.', ' Settled.'], 'visible text includes pre-tool, post-tool, and post-agent_end chunks in order');
+  assert.deepEqual(r.updates.filter((u) => u.sessionUpdate === 'agent_thought_chunk').map((u) => u.content.text),
+    ['PRIVATE_REASONING', 'HIDDEN_TOOL_REASONING'], 'reasoning is a separate protocol update');
 });
 
 test('declining, cancelling or an odd answer never lets the command run', async (t) => {
