@@ -108,7 +108,7 @@ function createCalibrator(deps) {
     const deadline = now() + limits.unload;
     while (now() < deadline) {
       const rows = await listing();
-      if (!rows.some(m => m.id !== except && ['loaded', 'loading'].includes(m.status?.value))) return;
+      if (!rows.some(m => m.id !== except && m.status?.value !== 'unloaded')) return;
       await sleep(limits.poll);
     }
     throw Error('Models did not unload in time.');
@@ -117,7 +117,7 @@ function createCalibrator(deps) {
     await request('/models/unload', { method: 'POST', body: JSON.stringify({ model }) }, limits.unload).catch(() => {});
     const deadline = now() + limits.unload;
     while (now() < deadline) {
-      try { const row = (await listing()).find(m => m.id === model); if (!row || !['loaded', 'loading'].includes(row.status?.value)) return; } catch {}
+      try { const row = (await listing()).find(m => m.id === model); if (row?.status?.value === 'unloaded') return; } catch {}
       await sleep(limits.poll);
     }
   }
@@ -236,6 +236,7 @@ function createCalibrator(deps) {
     const memory = watchMemory(record, controller);
     const finish = (status, reason) => { record.status = status; if (reason) record.reason = reason; record.seconds = Math.round((now() - record.startedAt) / 1000); save(); return status === 'passed'; };
     try {
+      await unloadAll();
       const applied = await applyUnlocked({ model: job.model, baseRevision: job.lastRevision || job.originalRevision, options: { ...job.base, 'ctx-size': String(ctx) } });
       if (!applied.ok) throw Object.assign(Error(applied.body?.error || 'Could not write the test profile.'), { fatal: true });
       job.lastRevision = presets.get(job.model).revision;
@@ -333,6 +334,7 @@ function createCalibrator(deps) {
       if (low < 0) throw Object.assign(Error(`No size passed the long-prompt test within ${job.promptBudgetSeconds} s, down to ${start.toLocaleString('en-US')} tokens.`), { fatal: true });
       const chosen = sizes[low];
       job.result.verifiedCtx = chosen;
+      await unloadAll();
       const applied = await applyUnlocked({ model: job.model, baseRevision: job.lastRevision || job.originalRevision, options: { ...job.base, 'ctx-size': String(chosen) } });
       if (!applied.ok) throw Object.assign(Error(applied.body?.error || 'Could not save the calibrated profile.'), { fatal: true });
       job.lastRevision = presets.get(job.model).revision;

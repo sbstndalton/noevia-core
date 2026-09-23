@@ -17,10 +17,15 @@ async function qualityCheck(model, chat) {
   const checks = [];
   for (const q of QUALITY) {
     const r = await chat(model, q.prompt, 64);
-    checks.push({ id: q.id, passed: !!r && r.text.trim().toLowerCase().replace(/[.!]$/, '') === q.expected.toLowerCase() });
+    const answer = typeof r?.text === 'string' ? r.text.trim().toLowerCase().replace(/[.!]$/, '') : '';
+    const reason = r?.failure || (r?.finishReason === 'length' ? 'truncated' : !answer ? 'no response' :
+      answer !== q.expected.toLowerCase() ? 'mismatch' : null);
+    checks.push({ id: q.id, passed: !reason, ...(reason ? { reason } : {}) });
   }
   return { passed: checks.every(c => c.passed), checks };
 }
+const qualityFailure = quality => 'Quality checks failed: ' + quality.checks.filter(c => !c.passed)
+  .map(c => c.id + ' (' + c.reason + ')').join(', ') + '.';
 const hash = value => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const sorted = value => Object.fromEntries(Object.entries(value || {}).sort(([a], [b]) => a.localeCompare(b)));
 const cancelledError = () => Object.assign(Error('Cancelled'), { cancelled: true });
@@ -73,12 +78,27 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
     return { models, skipped };
   }
   async function untuned() { try { return { ok: true, status: 200, body: await candidates() }; } catch (e) { return { ok: false, status: 502, body: { error: e.message } }; } }
-  async function unloadAll() {
+  async function unloadAll({ restoring = false } = {}) {
+    if (!restoring) check();
     const r = await rawModels();
     if (!r.ok || !Array.isArray(r.body?.data)) throw Error('The model server is not responding.');
     for (const row of r.body.data) if (['loaded', 'loading'].includes(row.status?.value)) {
+      if (!restoring) check();
       const u = await request('/models/unload', { method: 'POST', body: JSON.stringify({ model: row.id }) }, 60000);
-      if (!u.ok) throw Error('Could not unload models before testing.');
+      if (!u.ok) throw Error('Could not unload ' + row.id + ' before testing.');
+    }
+    // The router acknowledges unload before its model state changes. Profile writes require
+    // every row to be exactly unloaded; transitional and failed states remain unsafe.
+    const deadline = now() + 60000;
+    for (let poll = 0; poll < 120; poll++) {
+      if (!restoring) check();
+      const listing = await rawModels();
+      if (!listing.ok || !Array.isArray(listing.body?.data)) throw Error('The model server stopped responding while unloading.');
+      const pending = listing.body.data.filter(row => row.status?.value !== 'unloaded');
+      if (!pending.length) return;
+      if (poll === 119 || now() >= deadline) throw Error('Timed out waiting for router unload: ' + pending.map(row =>
+        row.id + ' (' + (row.status?.value || 'unknown') + ')').join(', ') + '.');
+      await sleep(500);
     }
   }
   async function write(j, options) {
@@ -107,10 +127,12 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
     finally { clearInterval(timer); inflight = null; }
     check();
     if (lowMemory) throw Error('Available memory fell below the safety floor.');
-    if (!r.ok || !r.body?.choices?.length) return null;
+    if (!r.ok) return { failure: 'HTTP ' + (r.status || 'error') };
+    if (!r.body?.choices?.length) return { failure: 'no response' };
     const t = r.body.timings || {};
     return { text: r.body.choices[0]?.message?.content || '', gen: Number(t.predicted_per_second),
-      prompt: Number(t.prompt_per_second), drafted: Number(t.draft_n) || 0, accepted: Number(t.draft_n_accepted) || 0 };
+      prompt: Number(t.prompt_per_second), drafted: Number(t.draft_n) || 0, accepted: Number(t.draft_n_accepted) || 0,
+      finishReason: r.body.choices[0]?.finish_reason };
   }
   async function load(j) {
     check();
@@ -132,7 +154,7 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
   }
   async function validate(model) {
     const quality = await qualityCheck(model, chat);
-    if (!quality.passed) throw Error('The profile failed the three quality checks.');
+    if (!quality.passed) throw Error(qualityFailure(quality));
     const workloads = [];
     for (const w of WORKLOADS) {
       const r = await chat(model, w.prompt, w.max);
@@ -169,8 +191,9 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
     if (presets.snapshot().revision !== j._revision) throw Object.assign(Error('Settings changed outside auto-tune.'), { fatal: true });
     const offset = prefix ? p.steps.length : 0;
     child = contextFactory({
-      applyUnlocked: body => {
+      applyUnlocked: async body => {
         if (body.baseRevision !== j._revision) throw Object.assign(Error('Settings changed outside auto-tune.'), { fatal: true });
+        await unloadAll();
         return applyUnlocked(body);
       },
       onWrite: revision => { j._revision = revision; save(); },
@@ -201,7 +224,7 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
       await write(j, { 'ctx-size': String(committed) });
       await load(j);
       const final = await qualityCheck(j.model, chat);
-      if (!final.passed) throw Error('The committed context failed quality checks after verification.');
+      if (!final.passed) throw Error(qualityFailure(final));
     }
   }
   async function runKv(j, p) {
@@ -263,7 +286,7 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
       const options = { 'ubatch-size': String(ub), 'batch-size': String(Math.max(2048, ub)) };
       const measured = await measure(j, p, String(ub), options, async () => {
         const quality = await qualityCheck(j.model, chat);
-        if (!quality.passed) throw Error('The profile failed the three quality checks.');
+        if (!quality.passed) throw Error(qualityFailure(quality));
         const r = await chat(j.model, prompt, 16);
         if (!r || !Number.isFinite(r.prompt) || r.prompt <= 0) throw Error('Missing prompt throughput measurement.');
         return { promptPerSecond: Math.round(r.prompt), quality };
@@ -285,7 +308,7 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
     if (p._beforeText == null) return true;
     if (presets.snapshot().revision !== j._revision) { p.restored = false; return false; }
     try {
-      await unloadAll();
+      await unloadAll({ restoring: true });
       presets.commit({ baseRevision: j._revision, text: p._beforeText });
       j._revision = presets.snapshot().revision; save();
       const reload = await request('/models?reload=1', {}, 120000);
