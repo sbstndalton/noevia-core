@@ -45,7 +45,9 @@ function createDecisionEndpoint({ env=process.env, fetchImpl=globalThis.fetch }=
         !ids.every(id=>Number.isFinite(result.scores[id])&&result.scores[id]>=0&&result.scores[id]<=1) ||
         Math.abs(Object.values(result.scores).reduce((a,b)=>a+b,0)-1)>0.002 ||
         ids.some(id=>id!==result.selected && result.scores[id]>=result.scores[result.selected])) throw Error('Invalid decision result');
-      return {selected:result.selected,scores:result.scores,confidence:null,metadata:{calibrated:false}};
+      // Only expose a known model identifier, never arbitrary service-provided text or URLs.
+      const model = result.model === 'convaiinnovations/laya' ? result.model : null;
+      return {selected:result.selected,scores:result.scores,confidence:null,metadata:{calibrated:false,model}};
     }
   };
 }

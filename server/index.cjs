@@ -475,7 +475,7 @@ const systemOneRouter = require('./system-one-router.cjs').createSystemOneRouter
   roles: () => autoRoles(),
   fallback: message => autoRouter.classify(message),
 });
-const classifyFastOrSmart = (message) => systemOneRouter.classify(message);
+const classifyFastOrSmart = (message) => systemOneRouter.classifyWithDetails(message);
 
 // ── Chat: the loop lives in chat.cjs; everything it needs is handed over here ──
 const { handleChat } = require('./chat.cjs').createChatHandler({

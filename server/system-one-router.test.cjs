@@ -75,3 +75,34 @@ test('each decision logs role, margin and fallback but never the message', async
   assert.equal(lines[0].selected, 'smart'); assert.equal(lines[0].margin, 0.4); assert.equal(lines[0].fellBack, null);
   assert.ok(!JSON.stringify(lines).includes('secret'));
 });
+
+test('per-request detail preserves actual offered scores and isolates simultaneous decisions', async () => {
+  const router = createSystemOneRouter({ enabled: () => true, roles: () => ({ fast: 'a', smart: 'b' }),
+    fallback: () => 'fast', log: () => {}, backend: { id: 'decision-service', supports: () => true,
+      locality: 'local', decide: async request => {
+        if (request.context.stateText === 'first') await new Promise(resolve => setTimeout(resolve, 5));
+        return { selected: request.context.stateText === 'first' ? 'smart' : 'fast',
+          scores: request.context.stateText === 'first' ? { fast: 0.23, smart: 0.77 } : { fast: 0.61, smart: 0.39 },
+          metadata: { model: 'convaiinnovations/laya', calibrated: false } };
+      } } });
+  const [first, second] = await Promise.all([router.classifyWithDetails('first'), router.classifyWithDetails('second')]);
+  assert.equal(first.role, 'smart'); assert.deepEqual(first.routingDecision.scores, { fast: 0.23, smart: 0.77 });
+  assert.equal(second.role, 'fast'); assert.deepEqual(second.routingDecision.scores, { fast: 0.61, smart: 0.39 });
+  assert.equal(first.routingDecision.model, 'convaiinnovations/laya');
+  assert.equal(first.routingDecision.calibrated, false);
+  assert.deepEqual(first.routingDecision.offered.map(o => o.id), ['fast', 'smart']);
+  assert.ok(Number.isFinite(first.routingDecision.latencyMs));
+  assert.ok(!JSON.stringify(first.routingDecision).includes('first'));
+});
+
+test('fallback detail has no fabricated classifier scores or private error text', async () => {
+  const router = createSystemOneRouter({ enabled: () => true, roles: () => ({ fast: 'a', smart: 'b' }),
+    fallback: () => 'fast', log: () => {}, backend: { supports: () => true, locality: 'local',
+      decide: async () => { throw Error('private synthetic backend error'); } } });
+  const result = await router.classifyWithDetails('secret synthetic message');
+  assert.equal(result.routingDecision.status, 'fallback');
+  assert.equal(result.routingDecision.fallbackReason, 'no-backend-answered');
+  assert.deepEqual(result.routingDecision.scores, {});
+  assert.ok(!JSON.stringify(result).includes('private synthetic'));
+  assert.ok(!JSON.stringify(result).includes('secret synthetic'));
+});

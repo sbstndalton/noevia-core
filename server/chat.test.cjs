@@ -8,10 +8,10 @@ const { createToolboxes } = require('./toolboxes.cjs');
 const { createDriveTools } = require('./gdrive-tools.cjs');
 const { createToolExchange } = require('./tool-exchange.cjs');
 
-async function runDriveCall(t, { name, savedMode = null, connected = true, decision = 'approve' }) {
+async function runDriveCall(t, { name, savedMode = null, connected = true, decision = 'approve', autoDecision = null, history = [] }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-drive-chat-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const user = { id: 'synthetic-user' }, project = { id: 'synthetic-project', model: 'synthetic-model', toolboxes: ['core'], files: [] };
+  const user = { id: 'synthetic-user' }, project = { id: 'synthetic-project', model: 'synthetic-model', routing: autoDecision ? 'auto' : 'manual', toolboxes: ['core'], files: [] };
   const store = { workspace: { userId: user.id }, authn: { user } };
   const requestScope = { getStore: () => store, run: (_scope, fn) => fn() };
   const accounts = { forUser: () => ({ drive: { state: () => ({ state: connected ? 'connected' : 'disconnected' }) } }) };
@@ -41,18 +41,18 @@ async function runDriveCall(t, { name, savedMode = null, connected = true, decis
     rag: { filesContext: async () => null }, prefill: { recordSample() {} }, reduceToolResult: require('./tool-result-reduce.cjs').reduceToolResult,
     HISTORY_CAP: 20, DEFAULT_PROVIDER_ID: 'default', DIARY_BASE: 'http://fixture.invalid', TOOL_RESULT_CAP: 8000,
     authService: { audit() {} }, toolPolicy: { mode: (_user, _tool, write) => write ? 'ask' : savedMode || 'allow' },
-    modelManager: { enabled: true, health: async () => ({ ok: true, body: { all_models_loaded: [{ model_name: 'synthetic-model', loaded: true, recipe_options: { ctx_size: 32768 } }] } }) },
+    modelManager: { enabled: true, load: async () => ({ ok: true }), health: async () => ({ ok: true, body: { all_models_loaded: ['synthetic-model', 'fast-model', 'smart-model'].map(model_name => ({ model_name, loaded: true, recipe_options: { ctx_size: 32768 } })) } }) },
     requestScope, currentWorkspace: () => ({ userId: user.id, dir }), json() {}, getProject: () => project,
     getProvider: () => ({ id: 'default', baseUrl: 'http://fixture.invalid', label: 'Mock' }), providerHeaders: () => ({}), saveChats() {}, endpointApproved: () => true,
-    diaryHeaders: () => ({}), diaryExtras: require('./diary-extras.cjs'), autoRoles: () => null, lastLoadedModel: () => null,
-    classifyFastOrSmart: async () => 'fast', servedCatalogue: async () => [], modelsInstalled: async () => [], missingRoles: () => [], staleRolesError: () => null,
+    diaryHeaders: () => ({}), diaryExtras: require('./diary-extras.cjs'), autoRoles: () => autoDecision ? { fast: 'fast-model', smart: 'smart-model' } : null, lastLoadedModel: () => null,
+    classifyFastOrSmart: async (message) => typeof autoDecision === 'function' ? autoDecision(message) : autoDecision || 'fast', servedCatalogue: async () => [], modelsInstalled: async () => [], missingRoles: () => [], staleRolesError: () => null,
     visionProbe: async () => ({ supported: false, reason: 'none' }), visionDescriptions: new Map(), skillsIndexFor: () => [],
     chatSkillRouter: { select: async () => ({ loaded: [] }) }, chatToolRouter: { select: async (ids) => ({ ids, routed: false }) },
     ...toolbox, oauthServerIds: () => new Set(), accountReady: () => true,
     chatWideApproved: () => false, awaitApproval: async (request) => { approvals.push(request); return decision; },
     recordUsage() {}, recordToolUse() {},
   });
-  await handler.handleChat({}, res, { message: 'Synthetic Drive request', projectId: project.id, chatId: 'synthetic-chat' });
+  await handler.handleChat({}, res, { message: 'Synthetic Drive request', projectId: project.id, chatId: 'synthetic-chat', history });
   assert.equal(events.some((event) => event.type === 'error'), false, JSON.stringify(events.filter((event) => event.type === 'error')));
   return { executions, approvals, requests, events };
 }
@@ -83,4 +83,36 @@ test('Drive writes still require approval and disconnected accounts receive no D
   const disconnected = await runDriveCall(t, { name: 'drive_read_file', connected: false });
   assert.equal(disconnected.requests[0].tools.some((tool) => tool.function.name === 'drive_read_file'), false);
   assert.deepEqual(disconnected.executions, []);
+});
+
+test('Auto route detail reaches only its reply metadata and model replay stays role/content only', async (t) => {
+  const decision = { offered: [{ id: 'fast', label: 'Short answer' }, { id: 'smart', label: 'Reasoning' }],
+    scores: { fast: 0.19, smart: 0.81 }, selectedRole: 'smart', effectiveRole: 'smart',
+    backend: 'decision-service', model: 'convaiinnovations/laya', calibrated: false,
+    latencyMs: 42, status: 'accepted', fallbackReason: null };
+  const history = [{ role: 'assistant', content: 'Earlier answer', routingDecision: decision }];
+  const result = await runDriveCall(t, { name: 'drive_read_file', autoDecision: { role: 'smart', routingDecision: decision }, history });
+  const meta = result.events.find(event => event.type === 'meta');
+  assert.equal(meta.model, 'smart-model'); assert.equal(meta.route, 'smart');
+  assert.deepEqual(meta.routingDecision, decision);
+  assert.deepEqual(result.requests[0].messages.find(message => message.content === 'Earlier answer'),
+    { role: 'assistant', content: 'Earlier answer' });
+  const guarded = await runDriveCall(t, { name: 'drive_read_file', autoDecision: { role: 'code', routingDecision: { ...decision, selectedRole: 'code' } } });
+  const guardedMeta = guarded.events.find(event => event.type === 'meta');
+  assert.equal(guardedMeta.route, 'smart'); assert.equal(guardedMeta.routingDecision.selectedRole, 'code');
+  assert.equal(guardedMeta.routingDecision.effectiveRole, 'smart');
+  const manual = await runDriveCall(t, { name: 'drive_read_file' });
+  assert.equal(manual.events.find(event => event.type === 'meta').routingDecision, undefined);
+});
+
+test('actual router decision flows through chat SSE with its scores and identity', async (t) => {
+  const { createSystemOneRouter } = require('./system-one-router.cjs');
+  const router = createSystemOneRouter({ enabled: () => true, roles: () => ({ fast: 'fast-model', smart: 'smart-model' }),
+    fallback: async () => 'fast', log: () => {}, backend: { supports: () => true, locality: 'local',
+      decide: async () => ({ selected: 'smart', scores: { fast: 0.125, smart: 0.875 }, metadata: { model: 'convaiinnovations/laya' } }) } });
+  const result = await runDriveCall(t, { name: 'drive_read_file', autoDecision: message => router.classifyWithDetails(message) });
+  const meta = result.events.find(event => event.type === 'meta');
+  assert.equal(meta.route, 'smart'); assert.equal(meta.routingDecision.model, 'convaiinnovations/laya');
+  assert.deepEqual(meta.routingDecision.scores, { fast: 0.125, smart: 0.875 });
+  assert.equal(meta.routingDecision.status, 'accepted');
 });

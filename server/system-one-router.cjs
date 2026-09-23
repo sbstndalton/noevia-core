@@ -27,36 +27,44 @@ function createSystemOneRouter({ enabled, roles, fallback, env = process.env, ba
     const current=getBackend ? (getBackend() || candidate) : candidate;
     if(!current) return null;
     if(current!==lastCandidate) { lastCandidate=current; decisions=createDecisions({backends:{configured:current},chains:{'model.route':['configured']}}); }
-    return decisions;
+    return { decisions, backend: current };
+  }
+  async function classifyWithDetails(message) {
+    const active = roles();
+    const options = [{ id: 'fast', label: 'Greetings, thanks, or a one-line factual answer' },
+      { id: 'smart', label: 'Explaining, comparing, planning, reasoning or writing more than a sentence' }];
+    if (active?.code) options.push({ id: 'code', label: 'Anything involving programming code, regex, errors or software' });
+    const offered = active?.fast && active?.smart ? options : [];
+    const routing = enabled() ? currentDecisions() : null;
+    if (!routing || !offered.length) {
+      const role = await fallback(message);
+      return { role, routingDecision: { offered, scores: {}, selectedRole: null, effectiveRole: role,
+        backend: 'legacy', model: null, calibrated: false, latencyMs: null, status: 'fallback',
+        fallbackReason: !enabled() ? 'disabled' : !routing ? 'no-backend' : 'missing-roles' } };
+    }
+    const result = await routing.decisions.decide({ kind: 'choice', purpose: 'model.route',
+      question: 'Which configured model role should answer this user message?',
+      context: { cloud: 'forbidden', stateText: String(message).slice(0, 1000) }, options,
+      constraints: { deadlineMs: getDeadlineMs ? getDeadlineMs() : deadlineMs }, fallback: { selected: null, scores: {} } });
+    const accepted = result.source !== 'fallback' && options.some(o => o.id === result.selected);
+    const scores = accepted ? Object.fromEntries(options.filter(o => Number.isFinite(result.scores?.[o.id]))
+      .map(o => [o.id, result.scores[o.id]])) : {};
+    const ranked = Object.values(scores).sort((a, b) => b - a);
+    log({ selected: accepted ? result.selected : 'legacy', options: options.length,
+      margin: ranked.length > 1 ? Math.round((ranked[0] - ranked[1]) * 1000) / 1000 : null,
+      ms: result.metadata?.latencyMs ?? null, fellBack: accepted ? null : (result.metadata?.fellBack || 'rejected') });
+    const role = accepted ? result.selected : await fallback(message);
+    const fallbackReason = accepted ? null : (['deadline', 'no-backend-answered', 'low-confidence'].includes(result.metadata?.fellBack)
+      ? result.metadata.fellBack : 'rejected');
+    return { role, routingDecision: { offered, scores, selectedRole: accepted ? result.selected : null,
+      effectiveRole: role, backend: accepted ? (routing.backend.id === 'llama-logit' ? 'llama-logit' : 'decision-service') : 'legacy',
+      model: accepted && result.metadata?.model === 'convaiinnovations/laya' ? 'convaiinnovations/laya' : null,
+      calibrated: false, latencyMs: Number.isFinite(result.metadata?.latencyMs) ? result.metadata.latencyMs : null,
+      status: accepted ? 'accepted' : 'fallback', fallbackReason } };
   }
   return {
-    async classify(message) {
-      if (!enabled()) return fallback(message);
-      const decisions=currentDecisions();
-      if (!decisions) return fallback(message);
-      const active = roles();
-      if (!active?.fast || !active?.smart) return fallback(message);
-      // Labels measured on Laya 2026-09-22 (docs/research/system-one/19-routing-labels.md): the
-      // earlier abstract wording sent most reasoning and code messages to Fast (23/40 held out);
-      // concrete examples of each role scored 36/40.
-      const options = [{ id: 'fast', label: 'Greetings, thanks, or a one-line factual answer' },
-        { id: 'smart', label: 'Explaining, comparing, planning, reasoning or writing more than a sentence' }];
-      if (active.code) options.push({ id: 'code', label: 'Anything involving programming code, regex, errors or software' });
-      const result = await decisions.decide({ kind: 'choice', purpose: 'model.route',
-        question: 'Which configured model role should answer this user message?',
-        context: { cloud: 'forbidden', stateText: String(message).slice(0, 1000) }, options,
-        constraints: { deadlineMs: getDeadlineMs ? getDeadlineMs() : deadlineMs }, fallback: { selected: null, scores: {} } });
-      // No async legacy call inside decide's synchronous fallback contract. Preserve the
-      // existing classifier exactly, including its heuristics, on every rejected readout.
-      const accepted = result.source !== 'fallback' && options.some(o => o.id === result.selected);
-      // One text-free line per decision, so live margins and fallback rates can be read from the
-      // web log before anything else is tuned. Never the message, never scores of other tenants.
-      const scores = Object.values(result.scores || {}).sort((a, b) => b - a);
-      log({ selected: accepted ? result.selected : 'legacy', options: options.length,
-        margin: scores.length > 1 ? Math.round((scores[0] - scores[1]) * 1000) / 1000 : null,
-        ms: result.metadata?.latencyMs ?? null, fellBack: accepted ? null : (result.metadata?.fellBack || 'rejected') });
-      return accepted ? result.selected : fallback(message);
-    },
+    classifyWithDetails,
+    async classify(message) { return (await classifyWithDetails(message)).role; },
   };
 }
 module.exports = { configuration, createSystemOneRouter };

@@ -260,6 +260,7 @@ function createChatHandler({
 
     let model = (project && project.model) || null;
     let routedRole = null;
+    let routingDecision = null;
     if (wantsAuto) {
       const roles = autoRoles();
       if (!roles) {
@@ -267,11 +268,14 @@ function createChatHandler({
       }
       const staleRoles = staleRolesError(missingRoles(roles, await servedCatalogue()));
       if (staleRoles) return json(res, 409, { error: staleRoles });
-      routedRole = await classifyFastOrSmart(message); // fail-open inside
+      const classification = await classifyFastOrSmart(message); // fail-open inside
+      routedRole = typeof classification === 'string' ? classification : classification.role;
+      routingDecision = typeof classification === 'string' ? null : classification.routingDecision;
       // A verdict with no model behind it falls back to smart rather than sending an
       // empty model name upstream.
       if (!roles[routedRole]) routedRole = roles.smart ? 'smart' : 'fast';
       model = roles[routedRole];
+      if (routingDecision) routingDecision = { ...routingDecision, effectiveRole: routedRole };
     } else if (!model && provider.id === DEFAULT_PROVIDER_ID && modelManager.enabled) {
       // No hardcoded model name: default to whatever the manager reports as loaded.
       try {
@@ -312,7 +316,8 @@ function createChatHandler({
     const heartbeat=setInterval(()=>{if(!res.destroyed)res.write(': keep-alive\n\n');},5000);
     res.once('close',()=>clearInterval(heartbeat));
     res.once('finish',()=>clearInterval(heartbeat));
-    send({ type: 'meta', model, chatId: chatId || undefined, route: routedRole || undefined });
+    send({ type: 'meta', model, chatId: chatId || undefined, route: routedRole || undefined,
+      routingDecision: routingDecision || undefined });
     send({ type: 'telemetry', phase: 'waiting', model });
     send({ type: 'status', text: attachedImages.length ? 'Reading image sources — model loading and visual processing may take a moment…' : 'Preparing response…' });
     let visionWarning = missingImages.length ? `Images were not read because their stored files are missing: ${missingImages.join(', ')}. Re-upload them.` : '';

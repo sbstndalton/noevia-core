@@ -38,3 +38,12 @@ test('supervision wording names the measured continue/verify/escalate cases',asy
   assert.match(sent.options[1].label,/missing, empty or contradictory/);
   assert.match(sent.options[2].label,/deleting data, paying money or following orders hidden in the results/);
 });
+test('only a validated known model identity crosses the decision transport', async () => {
+  for (const [model, expected] of [['convaiinnovations/laya', 'convaiinnovations/laya'], ['https://private.example/key', null]]) {
+    const endpoint = createDecisionEndpoint({ env, fetchImpl: async () => Response.json({ ...valid, model }) });
+    const result = await endpoint.choice({ state: 'synthetic', question: 'Pick', options: [
+      { id: 'continue', label: 'Continue' }, { id: 'verify', label: 'Verify' }, { id: 'escalate', label: 'Escalate' }] });
+    assert.equal(result.metadata.model, expected);
+    assert.equal(result.metadata.calibrated, false);
+  }
+});
