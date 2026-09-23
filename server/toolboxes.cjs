@@ -158,7 +158,12 @@ function createToolboxes({
   // picker, the validator, the resolver — goes through here so an MCP box is
   // indistinguishable from a built-in one once it exists.
   function allToolboxes() {
-    return [...TOOLBOXES, ...mcpBoxes()].filter((b) => offered(b.id));
+    // Connector boxes are selected per account in chat, not by the operator's
+    // ENABLED_TOOLBOXES list. Keep them resolvable even when omitted there.
+    return [
+      ...TOOLBOXES.filter((b) => CONNECTOR_BOXES.has(b.id) || offered(b.id)),
+      ...mcpBoxes().filter((b) => offered(b.id)),
+    ];
   }
 
   // A COUNT cap alone is the wrong unit, which only became clear once real MCP
@@ -288,15 +293,20 @@ function createToolboxes({
   // A new or unrecognised tool is therefore gated by default — the failure mode
   // of an unnecessary prompt is an annoyed user, and the failure mode of a
   // missing one is deleted data.
-  // Every box noevia knows, offered or not: whether a tool writes is a fact about the tool, and
-  // ENABLED_TOOLBOXES only decides what a chat is given. Connector boxes such as Google Drive reach
-  // a chat per user (connectedBoxes) without being listed there, and their reads were being
-  // judged writes.
   function readOnlyToolNames() {
     const names = new Set();
-    for (const box of [...TOOLBOXES, ...mcpBoxes()]) {
-      for (const n of (box.reads || [])) names.add(n);
+    const writes = new Set();
+    const boxes = allToolboxes();
+    for (const box of boxes) {
+      const reads = new Set(box.reads || []);
+      for (const tool of box.tools || []) {
+        const name = tool?.function?.name;
+        if (name && !reads.has(name)) writes.add(name);
+      }
     }
+    // If two boxes reuse a name and either declares it a write, keep the
+    // approval gate. An unoffered box cannot declare an offered tool safe.
+    for (const box of boxes) for (const n of (box.reads || [])) if (!writes.has(n)) names.add(n);
     return names;
   }
 

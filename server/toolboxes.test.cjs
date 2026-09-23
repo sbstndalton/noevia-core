@@ -78,6 +78,32 @@ test('connected account boxes are offered per user and never appear in the picke
   assert.equal(t.sanitizeToolboxes(['gdrive']).length, 0);
 });
 
+test('Drive stays resolvable per connected account when the operator offer list omits it', () => {
+  const names = ['drive_search_files', 'drive_read_file', 'drive_get_metadata', 'drive_list_recent', 'drive_create_file', 'drive_update_file', 'drive_trash_file'];
+  const reads = names.slice(0, 4);
+  const drive = { box: box('gdrive', names.map(tool), reads), names: new Set(names), connected: (u) => u.id === 'linked', execute: async () => '' };
+  const t = build({ boxes: [drive.box], driveTools: drive, offered: (id) => id !== 'gdrive' });
+  assert.deepEqual(t.allToolboxes().map((b) => b.id), ['core', 'gdrive']);
+  assert.deepEqual(t.toolboxSummaries().map((b) => b.id), ['core']);
+  assert.deepEqual(t.sanitizeToolboxes(['gdrive', 'core']), ['core']);
+  assert.deepEqual(names.map((name) => t.isWriteTool(name)), [false, false, false, false, true, true, true]);
+  assert.deepEqual(t.resolveTools({ toolboxes: ['core', ...t.connectedBoxes({ id: 'linked' })] }, 'model-70b').tools.map((x) => x.function.name),
+    ['get_current_time', 'read_project_file', ...names]);
+  assert.deepEqual(t.resolveTools({ toolboxes: ['core', ...t.connectedBoxes({ id: 'other' })] }, 'model-70b').tools.map((x) => x.function.name),
+    ['get_current_time', 'read_project_file']);
+});
+
+test('an offered write wins a name collision and an unoffered read cannot declassify it', () => {
+  const drive = { box: box('gdrive', [tool('drive_search_files')], ['drive_search_files']), names: new Set(['drive_search_files']), connected: () => true };
+  const colliding = build({ boxes: [drive.box], driveTools: drive,
+    mcpBoxes: [box('mcp-write', [tool('drive_search_files')])], offered: (id) => id !== 'gdrive' });
+  assert.equal(colliding.isWriteTool('drive_search_files'), true);
+  const hiddenRead = build({ boxes: [box('builtin-write', [tool('shared_tool')])],
+    mcpBoxes: [box('hidden-read', [tool('shared_tool')], ['shared_tool'])], offered: (id) => id !== 'hidden-read' });
+  assert.equal(hiddenRead.isWriteTool('shared_tool'), true);
+  assert.equal(hiddenRead.isWriteTool('unknown_tool'), true);
+});
+
 test('the executor runs built-ins itself and hands MCP tools on with the project in scope', async () => {
   const t = build({ mcpBoxes: [box('nc', [tool('nc_notes_search_notes')])] });
   assert.match(await t.executeToolCall(null, 'get_current_time', '{}'), /^Current time: .* \| ISO: /);
@@ -103,17 +129,4 @@ test('the pure helpers need no factory', () => {
   assert.equal(toolCapFor('Qwen3.5-9B'), 12);
   assert.equal(toolCapFor('Qwen3.5-27B'), 24);
   assert.equal(toolCapFor(''), 24);
-});
-
-test('a connector box outside ENABLED_TOOLBOXES still has its reads judged reads', () => {
-  // Live on aa5132b: gdrive is not in ENABLED_TOOLBOXES (it reaches a chat per user), so every
-  // Drive tool was listed and gated as a write.
-  const reads = ['drive_search_files', 'drive_read_file', 'drive_get_metadata', 'drive_list_recent'];
-  const writes = ['drive_create_file', 'drive_update_file', 'drive_trash_file'];
-  const drive = { box: box('gdrive', [...reads, ...writes].map(tool), reads), names: new Set([...reads, ...writes]), connected: () => true, execute: async () => '' };
-  const t = build({ boxes: [drive.box], driveTools: drive, offered: (id) => id !== 'gdrive' });
-  for (const name of reads) assert.equal(t.isWriteTool(name), false, name);
-  for (const name of writes) assert.equal(t.isWriteTool(name), true, name);
-  assert.equal(t.isWriteTool('drive_something_new'), true, 'unknown is still a write');
-  assert.ok(!t.allToolboxes().some((b) => b.id === 'gdrive'), 'what a chat is offered is unchanged');
 });

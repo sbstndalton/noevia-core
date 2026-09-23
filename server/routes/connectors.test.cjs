@@ -2,6 +2,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { createConnectorRoutes } = require('./connectors.cjs');
+const { createDriveTools } = require('../gdrive-tools.cjs');
+const { createToolboxes } = require('../toolboxes.cjs');
 
 const WRITES = new Set(['nc_notes_create', 'drive_create_file']);
 const isWrite = (name) => WRITES.has(name);
@@ -71,4 +73,27 @@ test('without a Nextcloud MCP server the connector is not offered at all', async
   assert.deepEqual(res.body.connectors.map((c) => c.id), ['gdrive']);
   const denied = await run(routes, { method: 'PUT', body: {} }, '/api/connectors/nextcloud/policy');
   assert.equal(denied.status, 404);
+});
+
+test('Drive connector reports four reads and three writes with the real classifier when omitted from operator boxes', async () => {
+  const accounts = { forUser: () => ({ drive: { state: () => ({ configured: true, state: 'connected' }) }, backup: null }) };
+  const driveTools = createDriveTools({ accounts });
+  const toolbox = createToolboxes({ boxes: [driveTools.box], driveTools, offered: (id) => id !== 'gdrive' });
+  const saved = { drive_read_file: 'ask', drive_list_recent: 'block' };
+  const routes = createConnectorRoutes({
+    accounts, driveTools, offsite: { status: () => null }, isWrite: toolbox.isWriteTool,
+    policy: { mode: (_user, name, write) => write ? 'ask' : saved[name] || 'allow' },
+    json: (res, status, body) => { res.status = status; res.body = body; }, readBody: async () => ({}),
+  });
+  const res = await run(routes, { method: 'GET' }, '/api/connectors');
+  assert.equal(res.status, 200);
+  const tools = res.body.connectors[0].tools;
+  assert.deepEqual(tools.filter((t) => !t.write).map((t) => t.name),
+    ['drive_search_files', 'drive_read_file', 'drive_get_metadata', 'drive_list_recent']);
+  assert.deepEqual(tools.filter((t) => t.write).map((t) => t.name),
+    ['drive_create_file', 'drive_update_file', 'drive_trash_file']);
+  assert.equal(tools.find((t) => t.name === 'drive_search_files').mode, 'allow');
+  assert.equal(tools.find((t) => t.name === 'drive_read_file').mode, 'ask');
+  assert.equal(tools.find((t) => t.name === 'drive_list_recent').mode, 'block');
+  assert.equal(tools.find((t) => t.name === 'drive_trash_file').mode, 'ask');
 });
