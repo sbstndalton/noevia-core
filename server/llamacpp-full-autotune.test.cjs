@@ -5,7 +5,7 @@ const { createModelManager } = require('./model-manager.cjs');
 const { createPresetStore } = require('./llamacpp-presets.cjs');
 const { QUALITY, qualityCheck } = require('./llamacpp-full-autotune.cjs');
 
-function fixture(t, { models = ['synthetic'], onChat, badQ4 = true, noHead = false, rejectAll = false, rejectModel = '', badBatch = false, idleTimeoutMs = 300000, loseIdentityAfterStart = false } = {}) {
+function fixture(t, { models = ['synthetic'], onChat, badQ4 = true, noHead = false, rejectAll = false, rejectModel = '', badBatch = false, failFinal = false, idleTimeoutMs = 300000, loseIdentityAfterStart = false, reloadFail = false } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'full-tune-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const ini = path.join(dir, 'models.ini'), stateFile = path.join(dir, 'tune.json');
@@ -17,6 +17,7 @@ function fixture(t, { models = ['synthetic'], onChat, badQ4 = true, noHead = fal
   const fetchJson = async (url, opts = {}) => {
     const u = new URL(url), b = opts.body ? JSON.parse(opts.body) : {};
     if (opts.signal?.aborted) throw Error('aborted');
+    if (u.pathname === '/models' && u.searchParams.has('reload')) return { ok: !reloadFail, body: {} };
     if (u.pathname === '/models') return { ok: true, body: { data: Object.entries(status).map(([id, value]) => ({ id, status: { value, args: id === 'embed' ? ['--embedding'] : [] }, meta: { n_ctx_train: 16384 } })) } };
     if (u.pathname === '/models/load') { status[b.model] = 'loaded'; return { ok: true, body: {} }; }
     if (u.pathname === '/models/unload') { status[b.model] = 'unloaded'; return { ok: true, body: {} }; }
@@ -31,6 +32,7 @@ function fixture(t, { models = ['synthetic'], onChat, badQ4 = true, noHead = fal
       let text = q ? q.expected : prompt.startsWith('List the whole numbers') ? Array.from({ length: 60 }, (_, i) => i + 1).join(', ') : 'Synthetic answer';
       if (q && (rejectAll || b.model === rejectModel || (badQ4 && o['cache-type-k'] === 'q4_0'))) text = 'wrong';
       if (badBatch && q && o['ubatch-size']) text = 'wrong';
+      if (failFinal && q && manager.autotune.status().body.job?.phase === 'Verifying saved profile') text = 'wrong';
       const spec = o['spec-type'], draft = spec === 'ngram-simple' || spec === 'draft-mtp' && !noHead;
       const speed = spec === 'draft-mtp' && !noHead ? o['spec-draft-n-max'] === '8' ? 50 : 36 : spec === 'ngram-simple' ? 26 : 20;
       return { ok: true, body: { choices: [{ message: { content: text } }], timings: { predicted_per_second: speed * (o['cache-type-k'] === 'q4_0' ? 2 : o['cache-type-k'] === 'q8_0' ? 1.2 : 1),
@@ -241,6 +243,59 @@ test('restart after every phase commit reloads and qualifies the saved profile b
   assert.ok(f.requests.length >= before + 6, 'final quality and throughput run after restart');
   assert.equal(f.status.synthetic, 'loaded');
   assert.equal(resumed.models[0].result.loaded, true);
+});
+
+test('legacy running journal restores only after unloading and confirmed reload', async t => {
+  for (const reloadFail of [false, true]) {
+    const f = fixture(t, { reloadFail });
+    const before = f.original;
+    fs.writeFileSync(f.ini, before.replace('ctx-size = 8192', 'ctx-size = 16384'));
+    f.status.synthetic = 'loaded';
+    const revision = createPresetStore(f.ini).snapshot().revision;
+    fs.writeFileSync(f.stateFile, JSON.stringify({ history: {}, job: {
+      id: 'legacy', model: 'synthetic', status: 'running', originalText: before, lastRevision: revision,
+      queue: [{ model: 'synthetic', status: 'running' }], steps: [],
+    } }));
+    const manager = f.restart();
+    assert.doesNotMatch(JSON.stringify(manager.autotune.status().body.job), /originalText|lastRevision|version = 1/);
+    await manager.autotune.recover();
+    const j = manager.autotune.status().body.job;
+    assert.equal(j.status, 'interrupted');
+    assert.equal(j.restored, !reloadFail);
+    assert.equal(f.status.synthetic, 'unloaded');
+    assert.equal(fs.readFileSync(f.ini, 'utf8'), before);
+    assert.equal((await manager.autotune.resume({ confirmPause: true })).status, 409);
+  }
+});
+
+test('engine identity and setting edits invalidate previously complete tunes', async t => {
+  const f = fixture(t);
+  await f.manager.autotune.start('synthetic', { confirmPause: true }); await finished(f.manager);
+  assert.deepEqual((await f.manager.autotune.untuned()).body.models, []);
+  f.setBuild('fake-v2');
+  assert.deepEqual((await f.manager.autotune.untuned()).body.models, ['synthetic']);
+  f.setBuild('fake-v1');
+  fs.writeFileSync(f.ini, fs.readFileSync(f.ini, 'utf8').replace('ctx-size = 16384', 'ctx-size = 12288'));
+  assert.deepEqual((await f.manager.autotune.untuned()).body.models, ['synthetic']);
+});
+
+test('a model without an MTP head chooses measured n-gram drafting', async t => {
+  const f = fixture(t, { noHead: true });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'passed', j.error);
+  assert.equal(j.models[0].result.spec, 'ngram');
+});
+
+test('final saved-profile quality failure does not publish a successful tune', async t => {
+  const f = fixture(t, { failFinal: true });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'failed');
+  assert.deepEqual(j.models[0].phases.map(p => p.status), ['passed','passed','passed','passed']);
+  assert.equal(j.models[0].result, undefined);
+  assert.equal(f.manager.autotune.status('synthetic').body.history.length, 0);
+  assert.deepEqual((await f.manager.autotune.untuned()).body.models, ['synthetic']);
 });
 
 test('quality suite requires each independent probe', async () => {

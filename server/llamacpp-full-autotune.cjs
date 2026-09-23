@@ -364,6 +364,7 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
           // Confirm the saved profile loads and passes again before reporting it ready.
           if (presets.snapshot().revision !== j._revision)
             throw Object.assign(Error('Settings changed outside auto-tune.'), { fatal: true });
+          j.phase = 'Verifying saved profile'; save();
           await unloadAll();
           await load(j);
           const final = await validate(item.model);
@@ -422,10 +423,20 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
     if (j?.status !== 'running') return;
     // Pre-v3 jobs have a single snapshot. They cannot be resumed into the new phase schema.
     if (!Array.isArray(j.models)) {
-      if (j.originalText && presets.snapshot().revision === j.lastRevision) {
-        try { presets.commit({ baseRevision: j.lastRevision, text: j.originalText }); await request('/models?reload=1', {}, 120000); } catch { j.restored = false; }
-      }
-      delete j.originalText; j.status = 'interrupted'; j.error = 'An older tuning run was interrupted. Start a new tune.'; save(); return;
+      try {
+        if (!j.originalText || !j.lastRevision || presets.snapshot().revision !== j.lastRevision)
+          throw Error('The profile changed after the run.');
+        const unloaded = await request('/models/unload', { method: 'POST', body: JSON.stringify({ model: j.model }) }, 60000);
+        if (!unloaded.ok) throw Error('Could not unload the test model.');
+        presets.commit({ baseRevision: j.lastRevision, text: j.originalText });
+        const reload = await request('/models?reload=1', {}, 120000);
+        if (!reload.ok) throw Error('The router did not confirm restored settings.');
+        j.restored = true;
+      } catch { j.restored = false; }
+      delete j.originalText; j.status = 'interrupted';
+      j.error = j.restored ? 'An older tuning run was interrupted and restored. Start a new tune.'
+        : 'An older tuning run was interrupted; settings could not safely be restored. Inspect models.ini before tuning again.';
+      save(); return;
     }
     const item = j.models.find(m => m.status === 'running');
     const p = item?.phases.find(p => p.status === 'running');
