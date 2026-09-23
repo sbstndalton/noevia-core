@@ -9,11 +9,11 @@ const { Readable } = require('node:stream');
 const { createStorageRoutes, STORAGE_PRIVATE_URL_ERROR } = require('./storage.cjs');
 
 function fixture({ storage = { kind: 'local' }, browsable = false, approved = () => true, network = async () => ({ ok: true, status: 200, json: async () => ({}) }) } = {}) {
-  const sent = [], saved = [], requests = [];
+  const sent = [], saved = [], requests = [], storageReads = [];
   const routes = createStorageRoutes({
     json: (res, status, body) => { sent.push({ status, body }); },
     readJson: async (req) => { let s = ''; for await (const c of req) s += c; return s ? JSON.parse(s) : {}; },
-    authService: { getStorage: () => storage, saveStorage: (_id, body) => { saved.push(body); return { ok: true, kind: body.kind }; } },
+    authService: { getStorage: (id, secret) => { storageReads.push([id, secret]); return storage; }, saveStorage: (_id, body) => { saved.push(body); return { ok: true, kind: body.kind }; } },
     storageClient: {
       isBrowsable: () => browsable,
       listFiles: async (_c, dir) => (dir === 'boom' ? (() => { throw new Error('listing failed'); })() : [{ name: 'a.txt', path: `${dir}/a.txt` }]),
@@ -29,7 +29,7 @@ function fixture({ storage = { kind: 'local' }, browsable = false, approved = ()
     req.method = method;
     return routes(req, {}, { path, authn: { user: { id: userId, role: 'member' } } });
   };
-  return { call, sent, saved, requests };
+  return { call, sent, saved, requests, storageReads };
 }
 
 test('reading, saving and the local shortcut keep their shapes; other paths fall through', async () => {
@@ -134,4 +134,42 @@ test('a Nextcloud that answers with an internal poll endpoint or a plain-http lo
   const down = fixture({ network: async () => ({ ok: false, status: 503 }) });
   await down.call('POST', '/api/integrations/storage/nextcloud/start', { baseUrl: 'https://cloud.example' });
   assert.deepEqual(down.sent.pop(), { status: 502, body: { error: 'Nextcloud returned 503' } });
+});
+
+test('edited WebDAV fields use only the current account secret without returning or saving it', async () => {
+  const storage = { kind: 'webdav', baseUrl: 'https://cloud.example/old', username: 'old', secret: 'synthetic-secret', corpusRoot: 'old' };
+  const f = fixture({ storage });
+  await f.call('POST', '/api/integrations/storage/test', { kind: 'webdav', baseUrl: 'https://cloud.example/new', username: 'edited', corpusRoot: 'Edited Folder', useSavedSecret: true, userId: 'other' });
+  assert.equal(f.requests[0].url, 'https://cloud.example/new/Edited%20Folder');
+  assert.equal(f.requests[0].init.headers.Authorization, `Basic ${Buffer.from('edited:synthetic-secret').toString('base64')}`);
+  assert.deepEqual(f.sent, [{ status: 200, body: { ok: true } }]);
+  assert.deepEqual(f.saved, []);
+  assert.equal(storage.username, 'old');
+  assert.deepEqual(f.storageReads, [['u1', true]]);
+});
+
+test('saved-secret tests reject different origins, types, missing secrets and unapproved targets', async () => {
+  const storage = { kind: 'webdav', baseUrl: 'https://cloud.example/old', secret: 'synthetic-secret' };
+  for (const patch of [ {baseUrl:'https://evil.example'}, {baseUrl:'http://cloud.example'}, {baseUrl:'https://cloud.example:444'}, {baseUrl:'https://user@cloud.example'}, {kind:'s3'} ]) {
+    const f = fixture({storage});
+    await f.call('POST', '/api/integrations/storage/test', {...storage, secret:'', useSavedSecret:true, ...patch});
+    assert.equal(f.sent[0].status, 400);
+    assert.equal(f.requests.length, 0);
+  }
+  for (const options of [{storage:{...storage,secret:''}}, {storage,approved:()=>false}]) {
+    const f=fixture(options);
+    await f.call('POST', '/api/integrations/storage/test', {...storage, secret:'', useSavedSecret:true});
+    assert.equal(f.sent[0].status,400);
+    assert.equal(f.requests.length,0);
+  }
+});
+
+test('edited S3 endpoint path, bucket and access key are signed with the saved secret', async () => {
+  const f=fixture({storage:{kind:'s3',baseUrl:'https://s3.example/old',bucket:'old',username:'old',secret:'synthetic-secret'}});
+  await f.call('POST','/api/integrations/storage/test',{kind:'s3',baseUrl:'https://s3.example/new',bucket:'edited',username:'edited-key',useSavedSecret:true});
+  assert.equal(f.requests[0].url,'https://s3.example/new/edited?list-type=2&max-keys=1');
+  const {signS3Request}=require('../s3-sign.cjs');
+  const headers=f.requests[0].init.headers;
+  assert.deepEqual(headers, signS3Request('GET', new URL(f.requests[0].url), '', 'edited-key', 'synthetic-secret', {amzDate:headers['x-amz-date']}));
+  assert.deepEqual(f.sent,[{status:200,body:{ok:true}}]);
 });
