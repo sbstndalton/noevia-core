@@ -170,12 +170,16 @@ test('a new grant for the same task replaces the old token', async () => {
   assert.equal((await p.check({ header: basic(second.token), target: 'b.test:443', defaultPort: 443 })).ok, true);
 });
 
-test('a client that disconnects mid-check does not take the proxy down with it', async () => {
+test('a client that disconnects mid-check does not take the proxy down with it', async (t) => {
   // The verdict does a DNS lookup, so there is a real window between accepting a connection and
   // answering it. An 'error' on the client socket with no listener attached is an uncaught
   // exception — and this proxy runs inside the web process, so that is the whole server.
   let release;
   const slow = new Promise((r) => { release = r; });
+  const upstream = http.createServer((_req, res) => res.end('synthetic'));
+  await new Promise((r) => upstream.listen(0, '127.0.0.1', r));
+  t.after(() => new Promise((r) => upstream.close(r)));
+  const upstreamPort = upstream.address().port;
   const { p } = proxy({ lookup: async () => { await slow; return ['127.0.0.1']; } });
   const { token } = p.grant({ taskId: 't1', domains: ['example.com'] });
   await p.listen();
@@ -188,8 +192,8 @@ test('a client that disconnects mid-check does not take the proxy down with it',
     for (const verb of ['CONNECT', 'GET']) {
       const socket = net.connect(port, '127.0.0.1', () => {
         socket.write(verb === 'CONNECT'
-          ? `CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProxy-Authorization: ${basic(token)}\r\n\r\n`
-          : `GET http://example.com/x HTTP/1.1\r\nHost: example.com\r\nProxy-Authorization: ${basic(token)}\r\n\r\n`);
+          ? `CONNECT example.com:${upstreamPort} HTTP/1.1\r\nHost: example.com:${upstreamPort}\r\nProxy-Authorization: ${basic(token)}\r\n\r\n`
+          : `GET http://example.com:${upstreamPort}/x HTTP/1.1\r\nHost: example.com:${upstreamPort}\r\nProxy-Authorization: ${basic(token)}\r\n\r\n`);
         // Gone before the lookup comes back, the way a cancelled task's container is — and
         // hung up with a reset, not a polite FIN, which is what a killed container sends.
         setTimeout(() => { socket.resetAndDestroy ? socket.resetAndDestroy() : socket.destroy(); }, 20);

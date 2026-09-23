@@ -2,6 +2,7 @@
 
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 const { Readable, Writable } = require('node:stream');
@@ -208,14 +209,19 @@ test('admin is exempt from the denylist (local inference targets private address
   assert.ok(JSON.parse(response.text).id);
 });
 
-test('admin can still test a private target (same exemption)', async () => {
-  // The fetch itself will fail to connect in the sandbox, but the guard must
-  // not be what rejects it: a 502 means the request was attempted.
+test('admin can still test a private target (same exemption)', async (t) => {
+  // Probe a disposable fixture, not an arbitrary host-local port. A 502 from
+  // the fixture proves that the request passed the member-origin guard.
+  let probed = false;
+  const server = http.createServer((_req, res) => { probed = true; res.writeHead(503); res.end('{}'); });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
   const response = await request('/api/providers/test', {
     method: 'POST', headers: adminHeaders,
-    body: JSON.stringify({ baseUrl: 'http://127.0.0.1:9/v1' }),
+    body: JSON.stringify({ baseUrl: `http://127.0.0.1:${server.address().port}/v1` }),
   });
   assert.equal(response.status, 502);
+  assert.equal(probed, true);
 });
 
 // ── storage endpoints: same policy, more fetch points ────────────────────────
