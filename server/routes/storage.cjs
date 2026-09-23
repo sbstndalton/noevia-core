@@ -93,7 +93,21 @@ function createStorageRoutes({ json, readJson, authService, storageClient, endpo
     if (p === '/api/integrations/storage/test' && req.method === 'POST') {
       const body = await readJson(req);
       if (body.kind === 'local') return json(res, 200, { ok: true });
-      const saved = body.useSaved ? authService.getStorage(authn.user.id, true) : body;
+      let saved = body.useSaved ? authService.getStorage(authn.user.id, true) : body;
+      if (body.useSavedSecret === true) {
+        const stored = authService.getStorage(authn.user.id, true);
+        // Only this session's credential, and never forwarded to a new origin.
+        let sameOrigin = false;
+        try {
+          const target = new URL(body.baseUrl);
+          sameOrigin = !target.username && !target.password &&
+            target.origin === new URL(stored.baseUrl).origin;
+        } catch { /* invalid URLs fail closed */ }
+        if (!sameOrigin || body.kind !== stored.kind || !stored.secret) {
+          return json(res, 400, { error: 'Enter a secret to test a different server or storage type.' });
+        }
+        saved = { ...body, secret: stored.secret };
+      }
       if (saved.kind !== 'local' && !(await storageEndpointAllowed(authn, saved.baseUrl))) {
         return json(res, 400, { error: STORAGE_PRIVATE_URL_ERROR });
       }
