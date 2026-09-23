@@ -54,3 +54,19 @@ test('a limit reaches the caller as an unreadable document, with the reason', as
   await assert.rejects(documents.extractDocumentText('a.pdf', fixture('text.pdf'), { doclingEnabled: false, readPages: limited('memory') }),
     (e) => e.status === 422 && /too much memory/.test(e.message));
 });
+
+test('memory outside the heap (decoded buffers) is stopped at the growth limit', async () => {
+  // 24 x 64 MB of Uint8Arrays sailed past a 64 MB heap limit in review; the growth watch stops it.
+  const buffers = script('buffers.cjs', 'const keep = []; for (let i = 0; i < 24; i++) keep.push(new Uint8Array(64 * 1024 * 1024).fill(1)); setInterval(() => {}, 1000);');
+  const started = Date.now();
+  await assert.rejects(readInWorker(fixture('text.pdf'), { ...caps, script: buffers, heapLimitMb: 64, growthLimitMb: 256, timeLimitMs: 30000 }),
+    (e) => e.limit === 'memory');
+  assert.ok(Date.now() - started < 20000);
+});
+
+test('readers run one at a time, so memory growth belongs to the one running', async () => {
+  const slow = script('slow.cjs', "const start = Date.now(); setTimeout(() => require('node:worker_threads').parentPort.postMessage({ ok: true, result: { numPages: 1, pageTexts: [], start, end: Date.now() } }), 150);");
+  const runs = await Promise.all(Array.from({ length: 3 }, () => readInWorker(fixture('text.pdf'), { ...caps, script: slow })));
+  runs.sort((a, b) => a.start - b.start);
+  for (let i = 1; i < runs.length; i++) assert.ok(runs[i].start >= runs[i - 1].end, `run ${i} started after run ${i - 1} ended`);
+});

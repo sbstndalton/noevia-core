@@ -4,8 +4,8 @@
 // pdf.js parses untrusted bytes, and before this it did so on the web server's own thread with no
 // bound but the output caps: a pathological PDF — a content stream that never ends, a font
 // program that allocates without limit — held every user's requests while it ran, and could
-// take the process down with it. In a worker it has a wall-clock limit and its own heap limit;
-// hitting either stops that document, not the server.
+// take the process down with it. In a worker it has a wall-clock limit, its own heap limit and a
+// watched memory-growth limit; hitting any stops that document, not the server.
 //
 // Worker side: `readNativePages` does the walk and posts page records back. Main side:
 // `readInWorker` starts one worker per document, enforces the limits and turns a limit into an
@@ -15,13 +15,21 @@ const { Worker, isMainThread, parentPort, workerData } = require('node:worker_th
 
 const TIME_LIMIT_MS = 120_000;
 const HEAP_LIMIT_MB = 512;
+// V8's heap limit does not count ArrayBuffer memory, which is where pdf.js puts decoded streams
+// and images (measured: a worker held 1.5 GB of Uint8Arrays under a 64 MB heap limit). So the
+// process's resident memory is watched while a reader runs, and one reader runs at a time so
+// that growth is attributable to it.
+const GROWTH_LIMIT_MB = 1024;
+const WATCH_MS = 100;
+// pdf.js's own cap on a decoded image, in pixels (default: unlimited).
+const MAX_IMAGE_PIXELS = 64 * 1024 * 1024;
 
 /** The walk itself: native text per page, image-bearing pages flagged for OCR. */
 async function readNativePages(bytes, { pageCap, pageTextCap, totalTextCap }) {
   const { getDocumentProxy, getResolvedPDFJS } = require('unpdf');
   let pdf;
   try {
-    pdf = await getDocumentProxy(new Uint8Array(bytes));
+    pdf = await getDocumentProxy(new Uint8Array(bytes), { maxImageSize: MAX_IMAGE_PIXELS, isEvalSupported: false });
     const { OPS } = await getResolvedPDFJS();
     const imageOps = new Set(Object.entries(OPS).filter(([name]) => /paint.*Image|paintImageMask/.test(name)).map(([, value]) => value));
     const markOps = new Set(Object.entries(OPS).filter(([name]) => /^(stroke|fill|eoFill|shadingFill|paint)/.test(name)).map(([, value]) => value));
@@ -55,32 +63,50 @@ async function readNativePages(bytes, { pageCap, pageTextCap, totalTextCap }) {
   } finally { if (pdf) await pdf.loadingTask.destroy(); }
 }
 
+// One reader at a time (see GROWTH_LIMIT_MB); the rest wait their turn.
+let running = Promise.resolve();
+function oneAtATime(task) {
+  const turn = running.then(task, task);
+  running = turn.then(() => {}, () => {});
+  return turn;
+}
+
 /**
- * Read a PDF's pages in a worker, within a time and a heap limit. A limit rejects with
- * `err.limit` = 'time' | 'memory'; a parse failure rejects with the parser's own message.
+ * Read a PDF's pages in a worker, within a time, a heap and a memory-growth limit. A limit
+ * rejects with `err.limit` = 'time' | 'memory'; a parse failure rejects with the parser's message.
  * @param {Buffer|Uint8Array} bytes
  * @param {{pageCap: number, pageTextCap: number, totalTextCap: number, timeLimitMs?: number,
- *          heapLimitMb?: number, script?: string}} options  `script` replaces the worker (tests).
+ *          heapLimitMb?: number, growthLimitMb?: number, script?: string, rss?: () => number}} options
+ *   `script` replaces the worker and `rss` the memory reading (tests).
  */
-function readInWorker(bytes, { timeLimitMs = TIME_LIMIT_MS, heapLimitMb = HEAP_LIMIT_MB, script = __filename, ...caps }) {
+function readInWorker(bytes, { timeLimitMs = TIME_LIMIT_MS, heapLimitMb = HEAP_LIMIT_MB, growthLimitMb = GROWTH_LIMIT_MB,
+  script = __filename, rss = () => process.memoryUsage.rss(), ...caps }) {
   // A copy, transferred: the caller's buffer may be a slice of a shared pool.
   const copy = new Uint8Array(bytes);
-  return new Promise((resolve, reject) => {
+  return oneAtATime(() => new Promise((resolve, reject) => {
+    const baseline = rss();
     const worker = new Worker(script, {
       workerData: { noeviaPdfWorker: true, bytes: copy, caps },
       transferList: [copy.buffer],
       resourceLimits: { maxOldGenerationSizeMb: heapLimitMb, maxYoungGenerationSizeMb: Math.min(64, heapLimitMb) },
-      // Nothing from the server's environment is the parser's business.
-      env: {}, stdout: true, stderr: true,
+      // Nothing from the server's environment is the parser's business. pdf.js's own warnings
+      // still reach the server log through the inherited stdout/stderr.
+      env: {},
     });
     let settled = false;
-    const finish = (fn, value) => { if (settled) return; settled = true; clearTimeout(timer); fn(value); worker.terminate().catch(() => {}); };
+    const finish = (fn, value) => {
+      if (settled) return; settled = true; clearTimeout(timer); clearInterval(watch);
+      worker.terminate().catch(() => {}).finally(() => fn(value));
+    };
     const timer = setTimeout(() => finish(reject, Object.assign(Error('time limit'), { limit: 'time' })), timeLimitMs);
+    const watch = setInterval(() => {
+      if (rss() - baseline > growthLimitMb * 1024 * 1024) finish(reject, Object.assign(Error('memory limit'), { limit: 'memory' }));
+    }, WATCH_MS);
     worker.on('message', (m) => (m && m.ok ? finish(resolve, m.result) : finish(reject, Error(String(m?.message || 'The PDF reader failed.')))));
     worker.on('error', (err) => finish(reject, err && err.code === 'ERR_WORKER_OUT_OF_MEMORY'
       ? Object.assign(Error('memory limit'), { limit: 'memory' }) : err));
     worker.on('exit', (code) => finish(reject, Error(`The PDF reader stopped (exit ${code}).`)));
-  });
+  }));
 }
 
 if (!isMainThread && workerData && workerData.noeviaPdfWorker) {
@@ -89,4 +115,4 @@ if (!isMainThread && workerData && workerData.noeviaPdfWorker) {
     .catch((err) => parentPort.postMessage({ ok: false, message: String(err && err.message || err) }));
 }
 
-module.exports = { readInWorker, readNativePages, TIME_LIMIT_MS, HEAP_LIMIT_MB };
+module.exports = { readInWorker, readNativePages, TIME_LIMIT_MS, HEAP_LIMIT_MB, GROWTH_LIMIT_MB };
