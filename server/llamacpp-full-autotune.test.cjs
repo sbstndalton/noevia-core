@@ -298,6 +298,22 @@ test('final saved-profile quality failure does not publish a successful tune', a
   assert.deepEqual((await f.manager.autotune.untuned()).body.models, ['synthetic']);
 });
 
+test('identity change during final validation does not publish measurements', async t => {
+  let f, changed = false;
+  f = fixture(t, { onChat: ({ manager }) => {
+    if (!changed && manager.autotune.status().body.job?.phase === 'Verifying saved profile') {
+      f.setBuild('fake-v2'); changed = true;
+    }
+  } });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  assert.equal(changed, true);
+  assert.equal(j.status, 'failed');
+  assert.match(j.error, /identity changed/i);
+  assert.equal(j.models[0].result, undefined);
+  assert.equal(f.manager.autotune.status('synthetic').body.history.length, 0);
+});
+
 test('quality suite requires each independent probe', async () => {
   for (const bad of QUALITY) {
     const result = await qualityCheck('x', async (_m, p) => ({ text: p === bad.prompt ? 'wrong' : QUALITY.find(q => q.prompt === p).expected }));

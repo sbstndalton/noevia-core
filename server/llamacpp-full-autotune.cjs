@@ -50,8 +50,8 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
   const phaseOf = (item, id) => item.phases.find(p => p.id === id);
   const currentPhase = item => item.phases.find(p => p.status !== 'passed');
   const status = model => ({ ok: true, status: 200, body: { job: publicJob(state.job), history: model ? state.history[model] || [] : [] } });
-  async function signature(model) {
-    const identity = await identityFor(model);
+  async function signature(model, suppliedIdentity) {
+    const identity = suppliedIdentity || await identityFor(model);
     if (!identity) throw Error('Model identity could not be read.');
     const profile = presets.get(model);
     return hash({ version: VERSION, identity, options: sorted({ ...profile.defaults, ...profile.options }) });
@@ -320,12 +320,15 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
     }
   }
   async function finishModel(j, item, final) {
+    const identity = await identityFor(item.model);
+    if (!identity || hash({ ...identity, profile: undefined }) !== item._identity)
+      throw Object.assign(Error('Model identity changed since tuning began.'), { fatal: true });
     const kv = phaseOf(item, 'kv').value, ctx = phaseOf(item, 'context').value,
       draft = phaseOf(item, 'drafting').value, batch = phaseOf(item, 'batch').value;
     const result = { kv: kv.kv, context: ctx.context, spec: draft.spec, specLabel: draft.specLabel,
       generation: final.generation, acceptance: final.acceptance, ubatch: batch.ubatch,
       promptPerSecond: batch.promptPerSecond, quality: final.quality, extensions: [],
-      loaded: true, version: VERSION, signature: await signature(item.model) };
+      loaded: true, version: VERSION, signature: await signature(item.model, identity) };
     if (presets.snapshot().revision !== j._revision)
       throw Object.assign(Error('Settings changed outside auto-tune.'), { fatal: true });
     item.result = result; item.status = 'passed';
