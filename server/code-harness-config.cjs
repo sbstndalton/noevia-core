@@ -75,6 +75,15 @@ function configFor({ harness, model, engine, contextTokens = 32768, outputTokens
 //     without a trust prompt and a `tool_call` handler returning `{ block: true }` stops a call.
 //     noevia's gate asks for every tool that is not a plain read, with the full input, and
 //     blocks whenever there is no channel to ask on — fail closed, never fail open.
+//   * DeepSeek Harness — @deepseek-ai/dsh 0.1.7-alpha.2, read at source and run (qa/deepseek-e2e.cjs):
+//     `dsh --profile acp` composes `$DSH_HOME/profiles/acp/cordis.patch.yml` (DSH_HOME defaults to
+//     `~/.dsh`, the task's private HOME) over its shipped bundles. Measured 2026-09-23: shipped, its
+//     approval seam is consulted only for sandbox escalations, so a plain `echo > file` ran unasked
+//     (the Codex shape). Its tools pipeline, though, runs a `tools/pre-execute` waterfall whose
+//     `ask` verdict goes through that fail-closed seam to ACP `session/request_permission`; noevia
+//     inserts its own gate there. Also turned off: OTel upload (on by default toward DeepSeek), the
+//     DeepSeek session log, web search, the direct DeepSeek route and account, the plugin manager
+//     and settings/config editors, repository instruction files and filesystem skills.
 
 const EDIT_TOOLS = Object.freeze(['Edit', 'Write', 'NotebookEdit', 'Bash', 'WebFetch', 'WebSearch']);
 const PI_READ_TOOLS = Object.freeze(['read', 'grep', 'find', 'ls']);
@@ -140,6 +149,51 @@ export default function (pi) {
 }
 `;
 
+// Plain reads, plus the harness's own to-do/goal bookkeeping, which touches nothing outside it.
+const DSH_NO_ASK_TOOLS = Object.freeze(['read', 'read_image', 'glob', 'grep', 'todo_write', 'get_goal']);
+
+const DSH_GATE = `// Written by noevia for this task: every DeepSeek Harness tool that is not a plain read asks
+// through the harness's fail-closed approval seam (no answer, an error or anything but
+// "allowed-once" refuses). Unknown and future tools ask too.
+const NO_ASK = new Set(${JSON.stringify(DSH_NO_ASK_TOOLS)});
+export const name = 'noevia-gate';
+export function apply(ctx) {
+  ctx.on('tools/pre-execute', async (exec, next) => {
+    if (NO_ASK.has(exec.name)) return next();
+    return { kind: 'ask', reason: 'noevia asks before every tool that is not a plain read.' };
+  }, { prepend: true });
+}
+`;
+
+// Shipped entries that call DeepSeek's services, edit the harness's own configuration, or read
+// what a checked-out repository supplies (instructions and skills are untrusted input here).
+const DSH_DISABLED = Object.freeze(['session-telemetry-otel', 'session-log-deepseek', 'web-search-deepseek',
+  'llm-deepseek', 'deepseek-account', 'plugin-manager', 'config-editor', 'settings',
+  'agent-instructions', 'skill-filesystem', 'tool-skill', 'skill']);
+
+/** The profile patch, as YAML. Every string goes through JSON, which YAML reads as a quoted scalar. */
+function dshPatch({ name, baseURL, apiKey, contextTokens, outputTokens }) {
+  const q = (v) => JSON.stringify(String(v));
+  const lines = [
+    '# Written by noevia for this task. Replaces nothing but the entries it names.',
+    '- id: llm-pi-ai', '  config:', '    providers:', '      noevia:',
+    '        displayName: "noevia engine"', '        api: openai-completions',
+    `        baseURL: ${q(baseURL)}`,
+    ...(apiKey ? ['        headers:', `          Authorization: ${q('Bearer ' + apiKey)}`] : []),
+    '        models:', `          - id: ${q(name)}`, `            name: ${q(name)}`,
+    `            contextWindow: ${Number(contextTokens) | 0}`, `            maxTokens: ${Number(outputTokens) | 0}`,
+    '            reasoningEfforts: false',
+    '- id: agent-default-model', '  config:', '    provider: noevia', `    model: ${q(name)}`,
+    '- id: acp', '  config:', '    provider: noevia', `    model: ${q(name)}`,
+    // Not read from the environment (the shipped default reads DSH_PERMISSION_MODE).
+    '- id: approval', '  config:', '    policy: ask',
+    '- id: sandbox-policy', '  config:', '    mode: workspace-write', '    workspaceRoot: !!js process.cwd()',
+    ...DSH_DISABLED.flatMap((id) => [`- id: ${id}`, '  disabled: true']),
+    '- insert:', '    - id: noevia-gate', '      name: ./noevia-gate.mjs',
+  ];
+  return lines.join('\n') + '\n';
+}
+
 /**
  * Every file a harness needs pinned, relative to `cwd` or `home`. Unknown harnesses are refused.
  * @returns {{harness: string, files: {base: 'cwd'|'home', path: string, content: string}[], permission: object, model: string, endpoint: string}}
@@ -194,6 +248,13 @@ function pinFilesFor({ harness, model, engine, contextTokens = 32768, outputToke
       { base: 'home', path: '.pi/agent/extensions/noevia-gate.js', content: PI_GATE },
     ], permission: { ...PERMISSION }, model: e.name, endpoint: e.baseURL };
   }
+  if (id === 'deepseek') {
+    const e = endpointFor({ model, engine });
+    return { harness: id, files: [
+      { base: 'home', path: '.dsh/profiles/acp/cordis.patch.yml', content: dshPatch({ ...e, apiKey, contextTokens, outputTokens }) },
+      { base: 'home', path: '.dsh/profiles/acp/noevia-gate.mjs', content: DSH_GATE },
+    ], permission: { ...PERMISSION }, model: e.name, endpoint: e.baseURL };
+  }
   throw Object.assign(Error(`noevia cannot pin the permissions of the ${id || 'unnamed'} harness, so it will not run it.`), { status: 409 });
 }
 
@@ -221,4 +282,4 @@ function writeHarnessConfig({ cwd, home = null, owner = null, ...options }) {
 }
 
 module.exports = { configFor, pinFilesFor, writeHarnessConfig, claudeSecuritySettings,
-  PERMISSION, EDIT_TOOLS, PI_READ_TOOLS };
+  PERMISSION, EDIT_TOOLS, PI_READ_TOOLS, DSH_NO_ASK_TOOLS, DSH_DISABLED };

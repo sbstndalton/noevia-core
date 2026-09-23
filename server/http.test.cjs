@@ -38,7 +38,8 @@ test('readBody enforces its cap with a 413 and readJson treats an empty body as 
   await assert.rejects(readBody(req('x'.repeat(11)), 10), (e) => e.status === 413 && e.message === 'Request exceeds size limit');
   assert.deepEqual(await readJson(req('')), {});
   assert.deepEqual(await readJson(req('{"a":1}')), { a: 1 });
-  await assert.rejects(readJson(req('{')), SyntaxError);
+  await assert.rejects(readJson(req('{')), { status: 400, message: 'invalid JSON' });
+  await assert.rejects(readJson(req('12345'), 4), { status: 413 });
 });
 
 test('fetchJson parses JSON, keeps text otherwise, refuses redirects and reports status', async () => {

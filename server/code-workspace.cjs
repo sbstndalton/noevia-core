@@ -33,7 +33,7 @@ const COMMITTER = Object.freeze({ name: 'noevia', email: 'noevia@localhost' });
 // A harness keeps state wherever HOME points, and some also drop it in the working directory.
 // None of it is the task's work, and a real run committed thousands of such files — a sqlite
 // database and a nested git repository among them — into the branch.
-const HARNESS_LEAVINGS = ['.cache/', '.config/', '.local/', '.opencode/', '.claude/', '.codex/', '.qwen/', '.pi/',
+const HARNESS_LEAVINGS = ['.cache/', '.config/', '.local/', '.opencode/', '.claude/', '.codex/', '.qwen/', '.pi/', '.dsh/',
   'opencode.json', 'opencode.jsonc', '.aider*', 'node_modules/.cache/'];
 const BRANCH_PREFIX = 'noevia/task-';
 

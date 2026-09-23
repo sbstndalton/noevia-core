@@ -151,3 +151,38 @@ test('Qwen Code: approvals pinned to default (not its auto classifier), one loca
   assert.equal(s.general.enableAutoUpdate, false);
   assert.equal(s.privacy.usageStatisticsEnabled, false);
 });
+
+test('DeepSeek Harness: one local route, approvals always ask, DeepSeek services and repo resources off', () => {
+  const pinned = pinFilesFor({ ...base, harness: 'deepseek', apiKey: 'k', contextTokens: 8192, outputTokens: 1024 });
+  assert.deepEqual(pinned.files.map((f) => `${f.base}:${f.path}`),
+    ['home:.dsh/profiles/acp/cordis.patch.yml', 'home:.dsh/profiles/acp/noevia-gate.mjs']);
+  const patch = pinned.files[0].content;
+  assert.match(patch, /^ {8}baseURL: "http:\/\/llama:8080\/v1"$/m);
+  assert.match(patch, /^ {10}Authorization: "Bearer k"$/m);
+  assert.match(patch, /^- id: acp\n {2}config:\n {4}provider: noevia\n {4}model: "Ornith-1\.5-9B-Q5_K_M"$/m);
+  assert.match(patch, /^- id: approval\n {2}config:\n {4}policy: ask$/m);
+  assert.match(patch, /^ {4}mode: workspace-write$/m);
+  for (const id of ['session-telemetry-otel', 'session-log-deepseek', 'web-search-deepseek', 'llm-deepseek',
+    'agent-instructions', 'skill-filesystem', 'plugin-manager']) {
+    assert.match(patch, new RegExp(`^- id: ${id}\\n  disabled: true$`, 'm'), id);
+  }
+  assert.match(patch, /^- insert:\n {4}- id: noevia-gate\n {6}name: \.\/noevia-gate\.mjs$/m);
+  // No key: no header at all, rather than a made-up one.
+  assert.doesNotMatch(pinFilesFor({ ...base, harness: 'deepseek' }).files[0].content, /Authorization/);
+  // A model name cannot break out of its scalar.
+  const odd = pinFilesFor({ ...base, harness: 'deepseek', model: 'a"\n- id: approval' }).files[0].content;
+  assert.equal(odd.match(/^- id: approval$/mg).length, 1);
+});
+
+test('DeepSeek Harness gate: reads pass, everything else, including tools it has never seen, asks', async () => {
+  const gate = pinFilesFor({ ...base, harness: 'deepseek' }).files[1].content;
+  const mod = await import('data:text/javascript,' + encodeURIComponent(gate));
+  let handler, options;
+  mod.apply({ on: (event, fn, opts) => { assert.equal(event, 'tools/pre-execute'); handler = fn; options = opts; } });
+  assert.equal(options.prepend, true, 'ahead of anything else that might answer allow');
+  const passed = Symbol('next');
+  for (const name of ['read', 'grep', 'glob']) assert.equal(await handler({ name }, () => passed), passed);
+  for (const name of ['bash', 'write', 'edit', 'web_fetch', 'subagent', 'workflow', 'some_future_tool']) {
+    assert.equal((await handler({ name }, () => passed)).kind, 'ask', name);
+  }
+});
