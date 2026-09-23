@@ -78,10 +78,12 @@ test('project and free groups classify their own list-cap results independently'
 test('unsupported hard links fail before journaling and do not block a later import',async t=>{
  const f=fixture(temporary(t)),link=fs.linkSync;
  fs.linkSync=()=>{const error=Error('synthetic unsupported hard link');error.code='EPERM';throw error;};
+ t.after(()=>{fs.linkSync=link;});
  const failed=await f.request({format:FORMAT,chats:[{id:'c-copy',title:'Copied',history:[{role:'user',content:'Synthetic'}]}]});
  assert.equal(failed.status,503);assert.match(failed.body.error,/storage does not support safe file promotion/);
  assert.equal(fs.existsSync(path.join(f.w.dir,'conversation-imports')),false);assert.equal(fs.existsSync(f.w.historyPath('c-copy')),false);
- fs.linkSync=link;t.after(()=>{fs.linkSync=link;});
+ assert.equal(fs.readdirSync(f.w.dir).some(name=>name.startsWith('.conversation-import-link-')),false);
+ fs.linkSync=link;
  const retry=await f.request({format:FORMAT,chats:[{id:'c-copy',title:'Copied',history:[{role:'user',content:'Synthetic'}]}]});
  assert.equal(retry.status,200);assert.equal(retry.body.imported,1);assert.equal(f.store.readHistory('c-copy')[0].content,'Synthetic');
 });
