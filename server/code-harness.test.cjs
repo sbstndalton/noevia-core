@@ -272,6 +272,22 @@ test('the job records what happened, and the proxy token never reaches the recor
 const rawLog = (r) => fs.readFileSync(path.join(r.dir, 'jobs', r.taskId + '.jsonl'), 'utf8');
 const events = (r) => rawLog(r).split('\n').filter(Boolean).map((l) => JSON.parse(l));
 
+test('ACP plan updates retain the latest bounded report without inventing entry progress', async () => {
+  const first = Array.from({ length: 25 }, (_, i) => ({ content: i === 0 ? '😀'.repeat(80) : `Step ${i}`,
+    status: i === 0 ? 'completed' : 'pending', priority: 'high' }));
+  const r = await run({ script: async (h) => {
+    h.sessionUpdate({ sessionUpdate: 'plan', entries: first });
+    h.sessionUpdate({ sessionUpdate: 'plan', entries: [{ content: '<script>text only</script>' }] });
+  } });
+  const rows = events(r).filter((e) => e.type === 'plan.proposed');
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].data.subQuestions.length, 20);
+  assert.equal(Buffer.byteLength(rows[0].data.subQuestions[0]), 200);
+  assert.equal(rows[0].data.truncated, true);
+  assert.equal(JSON.stringify(rows[0].data).includes('completed'), false, 'entry status is not a completion claim');
+  assert.deepEqual(r.job.plan, { status: 'proposed', question: null, subQuestions: ['<script>text only</script>'], truncated: false });
+});
+
 test('assistant output retains visible chunks across tool rounds without thoughts or tool data', async () => {
   const r = await run({ script: async (h) => {
     h.sessionUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'First. ' } });

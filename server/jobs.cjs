@@ -3,6 +3,7 @@
 // tenant's directory, state derived from events, restart recovery, cancellation, and
 // capability sets fixed at creation. No scheduler; callers run the work in-process.
 const fs = require('node:fs'), path = require('node:path'), crypto = require('node:crypto');
+const { boundCodePlan } = require('./code-plan.cjs');
 const MAX_ASSISTANT_OUTPUT_BYTES = 32 * 1024;
 const MAX_ASSISTANT_OUTPUT_EVENT_BYTES = 1024, MAX_ASSISTANT_OUTPUT_EVENTS = 64;
 
@@ -27,8 +28,12 @@ function derive(events) {
       case 'approval.decided': job.pendingApproval = null; if (!TERMINAL.has(job.status)) job.status = 'running'; break;
       case 'tool.uncertain': job.uncertain.push(d); break;
       case 'artifact.created': job.artifacts.push(d); break;
-      case 'plan.proposed': case 'plan.edited': job.plan = { status: e.type.slice(5), question: d.question ?? null, subQuestions: d.subQuestions || [] }; break;
-      case 'plan.skipped': job.plan = { status: 'skipped', question: d.question ?? null, subQuestions: [] }; break;
+      case 'plan.proposed': case 'plan.edited': job.plan = job.kind === 'code'
+        ? { status: e.type.slice(5), question: null, ...boundCodePlan(d) }
+        : { status: e.type.slice(5), question: d.question ?? null, subQuestions: d.subQuestions || [] }; break;
+      case 'plan.skipped': job.plan = job.kind === 'code'
+        ? { status: 'skipped', question: null, subQuestions: [], truncated: false }
+        : { status: 'skipped', question: d.question ?? null, subQuestions: [] }; break;
       case 'assistant.output': {
         const previous = job.assistantOutput || { text: '', truncated: false };
         const incoming = typeof d.text === 'string' ? d.text : '';
@@ -106,6 +111,11 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
       const incoming = typeof data.text === 'string' ? data.text : '';
       const text = clipUtf8(incoming, MAX_ASSISTANT_OUTPUT_EVENT_BYTES);
       data = { text, truncated: data.truncated === true || text.length < incoming.length };
+    }
+    if (finished?.kind === 'code' && (type === 'plan.proposed' || type === 'plan.edited' || type === 'plan.skipped')) {
+      data = type === 'plan.skipped'
+        ? { question: null, subQuestions: [], truncated: false }
+        : { question: null, ...boundCodePlan(data) };
     }
     const event = { job: id, seq: current.length + 1, type, at: now(), data };
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
