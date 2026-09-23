@@ -107,10 +107,12 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
         ctx.event('checkpoint.created', { branch: workspace.branch, task: String(prompt).slice(0, 120),
           identityHash: scope.identityHash, identity: scope.identity, meta });
         return { stopReason: outcome?.stopReason || 'end_turn', branch: workspace.branch,
-          identityHash: scope.identityHash, meta, ...session.summary() };
+          identityHash: scope.identityHash, meta, ...session.summary(),
+          // Which hosts the task reached and which it was refused, from the proxy's own record.
+          ...(grant && typeof egress.activity === 'function' ? { network: egress.activity(taskId) } : {}) };
       } finally {
         // Whatever happened, the task stops being able to reach anything.
-        if (grant) egress.revoke(taskId);
+        if (grant) { egress.revoke(taskId); if (typeof egress.activity === 'function') egress.activity(taskId, { forget: true }); }
         workspaces.release({ taskId });
       }
     }).catch(() => { /* jobs.run records the failure; nothing here should throw into the caller */ });

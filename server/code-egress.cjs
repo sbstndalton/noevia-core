@@ -99,7 +99,30 @@ function createEgressProxy({ now = Date.now, log = () => {}, lookup = defaultLoo
     return { ok: true, taskId: g.taskId, host, port, address: addresses[0] };
   }
 
-  function record(entry) { log({ at: now(), ...entry }); }
+  // What each task reached and what it was refused, by host, so the task's own result can say
+  // "github.com was refused" instead of leaving a failed install to be guessed at. Hosts and
+  // counts only, never paths, headers or tokens. Bounded per task and in tasks kept.
+  const activityByTask = new Map(); // taskId -> Map(host -> {host, allowed, refused, reason})
+  function tally(entry) {
+    if (!entry.taskId || !entry.host || !/^egress\.(allowed|refused)$/.test(entry.event)) return;
+    let hosts = activityByTask.get(entry.taskId);
+    if (!hosts) {
+      if (activityByTask.size >= 500) activityByTask.delete(activityByTask.keys().next().value);
+      activityByTask.set(entry.taskId, hosts = new Map());
+    }
+    let h = hosts.get(entry.host);
+    if (!h) { if (hosts.size >= 50) return; hosts.set(entry.host, h = { host: entry.host, allowed: 0, refused: 0, reason: null }); }
+    if (entry.event === 'egress.allowed') h.allowed++; else { h.refused++; h.reason = entry.reason || null; }
+  }
+  /** A task's network activity, most-refused first; `forget` drops it once the task has it. */
+  function activity(taskId, { forget = false } = {}) {
+    const hosts = [...(activityByTask.get(taskId)?.values() || [])].map((h) => ({ ...h }))
+      .sort((a, b) => b.refused - a.refused || b.allowed - a.allowed || a.host.localeCompare(b.host));
+    if (forget) activityByTask.delete(taskId);
+    return { hosts, allowed: hosts.reduce((n, h) => n + h.allowed, 0), refused: hosts.reduce((n, h) => n + h.refused, 0) };
+  }
+
+  function record(entry) { tally(entry); log({ at: now(), ...entry }); }
 
   const server = http.createServer();
 
@@ -163,7 +186,7 @@ function createEgressProxy({ now = Date.now, log = () => {}, lookup = defaultLoo
     clientSocket.on('close', () => upstream.destroy());
   });
 
-  return { server, grant, revoke, check, hostAllowed,
+  return { server, grant, revoke, check, hostAllowed, activity,
     /** Drop every live connection too: a tunnel outlives the listener otherwise. */
     closeAll: () => { server.closeAllConnections?.(); },
     listen: (port = 0, host = '127.0.0.1') => new Promise((r) => server.listen(port, host, () => r(server.address()))),
