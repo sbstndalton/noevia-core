@@ -14,22 +14,38 @@ test.after(() => { for (const d of temps) fs.rmSync(d, { recursive: true, force:
 /** A page whose elements are whatever `dom` says, recording every effect the executor causes. */
 function fakeBrowser({ dom = {}, url = ORIGIN + '/', failOn = null } = {}) {
   const effects = [];
+  let screenshotCalls = 0;
+  const handleFor = (selector) => {
+    const node = dom[selector];
+    if (!node) return null;
+    const attached = () => {
+      if (dom[selector] !== node) throw Error('Element is not attached to the DOM');
+    };
+    return {
+      evaluate: async (fn) => {
+        attached();
+        if (fn.name === 'describeInPage') return node;
+        if (String(fn).includes('isConnected')) return true;
+        return undefined;
+      },
+      click: async () => { attached(); if (failOn === 'click') throw Error('Target closed'); effects.push(['click', selector]); },
+      fill: async (value) => { attached(); effects.push(['fill', selector, value]); },
+      selectOption: async (value) => { attached(); effects.push(['select', selector, value]); },
+      press: async (key) => { attached(); effects.push(['press', selector, key]); },
+      hover: async () => { attached(); effects.push(['hover', selector]); },
+      setInputFiles: async (file) => { attached(); effects.push(['upload', selector, file]); },
+    };
+  };
   const page = {
     url: () => url,
     locator: (selector) => ({
       first() { return this; },
-      evaluate: async () => { if (!dom[selector]) throw Error('not found'); return dom[selector]; },
-      click: async () => { if (failOn === 'click') throw Error('Target closed'); effects.push(['click', selector]); },
-      fill: async (value) => { effects.push(['fill', selector, value]); },
-      selectOption: async (value) => { effects.push(['select', selector, value]); },
-      press: async (key) => { effects.push(['press', selector, key]); },
-      hover: async () => { effects.push(['hover', selector]); },
-      setInputFiles: async (file) => { effects.push(['upload', selector, file]); },
+      elementHandle: async () => handleFor(selector),
       innerText: async () => dom[selector]?.text || '',
     }),
     goto: async (to) => { effects.push(['goto', to]); url = to; },
     evaluate: async () => ({ inForm: false }),
-    screenshot: async () => Buffer.from('png'),
+    screenshot: async () => { screenshotCalls++; return Buffer.from(`png ${SECRET}`); },
     waitForLoadState: async () => {},
     goBack: async () => {},
     keyboard: { press: async (key) => { effects.push(['key', key]); } },
@@ -45,14 +61,15 @@ function fakeBrowser({ dom = {}, url = ORIGIN + '/', failOn = null } = {}) {
     newPage: async () => { onPage(page); return page; }, pages: () => [page], close: async () => {} };
   let options = null;
   const browser = { newContext: async (o) => { options = o; return context; }, close: async () => {} };
-  return { browser, effects, options: () => options, pageEmit: (event, value) => page.emit(event, value) };
+  return { browser, effects, options: () => options, pageEmit: (event, value) => page.emit(event, value),
+    setUrl: (next) => { url = next; }, screenshotCalls: () => screenshotCalls };
 }
 
-async function session({ dom, answers = [], secrets = {}, open = {}, failOn } = {}) {
+async function session({ dom, answers = [], secrets = {}, open = {}, failOn, onApproval } = {}) {
   const fake = fakeBrowser({ dom, failOn });
   const cards = [], logs = [];
   const executor = createBrowserExecutor({ launch: async () => fake.browser, secrets, log: (e) => logs.push(e),
-    askApproval: async (card) => { cards.push(card); return answers.shift() || 'deny'; } });
+    askApproval: async (card) => { cards.push(card); await onApproval?.(card, fake); return answers.shift() || 'deny'; } });
   const id = await executor.open({ jobId: 'job', allowedDomains: ['shop.example.test'], downloadsDir: temp(),
     proxy: { server: 'http://egress:8040', username: 'task', password: 'token' }, ...open });
   return { executor, id, act: (a) => executor.act(id, a), cards, logs, ...fake };
@@ -108,9 +125,38 @@ test('a secret is typed only on its own site, and never appears in a result, car
   const other = await s.act({ type: 'type', selector: '#f', text: '{{secret:bank}}' });
   assert.equal(other.status, 'blocked');
   assert.equal(s.effects.length, 1, "another site's secret is not typed at all");
+  const shot = await s.act({ type: 'screenshot' });
+  assert.equal(shot.evidence.screenshot, undefined);
+  assert.equal(shot.evidence.screenshotOmitted, true);
+  assert.match(shot.evidence.screenshotOmissionReason, /handled a secret/);
+  assert.equal(s.screenshotCalls(), 0, 'the page is never captured after a secret, even if ordinary page content echoes it');
   await s.act({ type: 'click', selector: '#b' });
+  assert.equal(s.cards[0].screenshot, undefined);
+  assert.equal(s.cards[0].screenshotOmitted, true);
   const everything = JSON.stringify({ cards: s.cards, logs: s.logs, state: s.executor.state(s.id) });
   assert.ok(!everything.includes(SECRET) && !everything.includes('bank-9981-x'));
+});
+
+test('approval is invalidated when the exact target is replaced before dispatch', async () => {
+  const dom = { '#b': submitButton };
+  const s = await session({ dom, answers: ['approve'], onApproval: async () => {
+    dom['#b'] = { ...submitButton, name: 'Replacement', text: 'Replacement' };
+  } });
+  const r = await s.act({ type: 'click', selector: '#b' });
+  assert.equal(r.status, 'blocked');
+  assert.match(r.reason, /approved target changed/);
+  assert.deepEqual(s.effects, [], 'the replacement target is never clicked');
+});
+
+test('approval is invalidated when the page origin changes before dispatch', async () => {
+  const s = await session({ dom: { '#b': submitButton }, answers: ['approve'], onApproval: async (_card, fake) => {
+    fake.setUrl('https://partner.example.test/account');
+  } });
+  const r = await s.act({ type: 'click', selector: '#b' });
+  assert.equal(r.status, 'blocked');
+  assert.match(r.reason, /page changed/);
+  assert.equal(r.origin, 'https://partner.example.test');
+  assert.deepEqual(s.effects, [], 'nothing is clicked on the changed page');
 });
 
 test('only files given to the task upload, and only after asking', async () => {

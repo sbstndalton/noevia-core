@@ -15,7 +15,8 @@
 //     After every action the page's own origin is checked too, and a page that ended up somewhere
 //     it may not be is reported blocked and stepped back.
 //   * Secrets are substituted only when the value is typed, only on an origin the secret is bound
-//     to, and every piece of evidence (results, approval cards, the audit) is masked.
+//     to. Textual evidence is masked, and screenshots are omitted once a session has handled a
+//     secret because arbitrary page content can echo a typed value.
 //   * Uploads come only from files the task was explicitly given; downloads land in the task's
 //     own directory and are reported, never opened.
 //
@@ -30,6 +31,8 @@ const ACTIONS = new Set(['navigate', 'click', 'type', 'select', 'press', 'upload
   'screenshot', 'scroll', 'hover', 'wait']);
 const ACTION_TIMEOUT_MS = 15000;
 const MAX_EXTRACT = 20000;
+const SECRET_SCREENSHOT_REASON = 'Screenshot omitted because this browser session has handled a secret.';
+const FAILED_SCREENSHOT_REASON = 'Screenshot omitted because capture failed.';
 
 // Runs in the page: what the element that will actually act really is. A click lands on the
 // target and is carried out by its nearest activatable ancestor (a <span> inside a submit button
@@ -154,12 +157,21 @@ function createBrowserExecutor({ launch, askApproval, secrets = {}, log = () => 
   const originOf = (page) => { try { const u = new URL(page.url()); return /^https?:$/.test(u.protocol) ? u.origin : ''; } catch { return ''; } };
 
   async function evidence(session, extra = {}) {
-    // Once a secret has been typed on this page, form fields are painted over in every
-    // screenshot: a plain text field would otherwise show the value itself.
-    const fields = session.secretTyped ? [session.page.locator('input, textarea, select, [contenteditable]:not([contenteditable="false"])')] : [];
-    const shot = await session.page.screenshot({ type: 'png', mask: fields }).catch(() => null);
-    return { screenshot: shot ? shot.toString('base64') : undefined, ...extra };
+    // A site can copy a typed secret into arbitrary page content. Masking form controls cannot
+    // prove the pixels are safe, so after the first substitution this session emits no more
+    // screenshots. The explicit metadata keeps a missing capture from looking accidental.
+    if (session.secretTyped) {
+      return { ...extra, screenshotOmitted: true, screenshotOmissionReason: SECRET_SCREENSHOT_REASON };
+    }
+    const shot = await session.page.screenshot({ type: 'png' }).catch(() => null);
+    if (!shot) return { ...extra, screenshotOmitted: true, screenshotOmissionReason: FAILED_SCREENSHOT_REASON };
+    return { ...extra, screenshot: shot.toString('base64') };
   }
+
+  const sameElement = (before, after) => {
+    const keys = ['tag', 'type', 'role', 'name', 'text', 'value', 'inForm', 'formMethod', 'formAction', 'frameOrigin'];
+    return keys.every((key) => (before?.[key] ?? '') === (after?.[key] ?? ''));
+  };
 
   /**
    * Run one action. The model's action names a `selector`; everything the gate judges is read here.
@@ -177,7 +189,7 @@ function createBrowserExecutor({ launch, askApproval, secrets = {}, log = () => 
     const result = (status, extra = {}) => {
       const out = { status, origin, ...extra };
       if (out.reason) out.reason = mask(out.reason);
-      log({ event: 'browser.act', jobId: session.jobId, session: sessionId, type, status, origin, reason: out.reason || '' });
+      log({ event: 'browser.act', jobId: session.jobId, session: sessionId, type, status, origin: out.origin, reason: out.reason || '' });
       return out;
     };
     if (!ACTIONS.has(type)) return result('blocked', { reason: `Unknown action “${mask(type).slice(0, 40)}”.` });
@@ -187,17 +199,21 @@ function createBrowserExecutor({ launch, askApproval, secrets = {}, log = () => 
     }
 
     // The element as it really is, never as the model described it.
-    let element = null, locator = null;
+    let element = null, locator = null, targetHandle = null;
     if (action.selector && type !== 'navigate') {
       locator = page.locator(String(action.selector)).first();
-      try { element = await locator.evaluate(describeInPage, null, { timeout: timeoutMs }); }
+      try {
+        targetHandle = await locator.elementHandle({ timeout: timeoutMs });
+        if (!targetHandle) throw Error('not found');
+        element = await targetHandle.evaluate(describeInPage);
+      }
       catch { return result('blocked', { reason: 'That element is not on the page.' }); }
     }
     const facts = { type, url: action.url, method: action.method, key: action.key, element: element || undefined };
     if (type === 'press' && !element) {
       // The key goes to whatever has focus (in the main frame's view); judge that element.
-      element = await page.evaluateHandle(() => document.activeElement)
-        .then((h) => h.evaluate(describeInPage)).catch(() => null);
+      targetHandle = await page.evaluateHandle(() => document.activeElement).then((h) => h.asElement?.() || h).catch(() => null);
+      element = await targetHandle?.evaluate(describeInPage).catch(() => null);
       // Unknown focus, or focus inside a frame (whose field the main page cannot see): assume
       // the worst, so any Enter asks.
       if (!element || ['iframe', 'frame', 'object', 'embed'].includes(element.tag)) element = null;
@@ -235,6 +251,26 @@ function createBrowserExecutor({ launch, askApproval, secrets = {}, log = () => 
       const answer = await askApproval(card).catch(() => 'deny');
       log({ event: 'browser.decided', jobId: session.jobId, type, origin, decision: answer });
       if (answer !== 'approve') return result('blocked', { reason: 'Declined.' });
+
+      // Approval binds the page origin and the exact DOM node that supplied the card. A locator
+      // resolves afresh, so a site could otherwise replace `#confirm` while the user is deciding
+      // and make the approved click land on a different control. Keep and re-check the original
+      // handle, then dispatch through it rather than resolving the selector again.
+      if (session.page !== page || page.isClosed?.() || originOf(page) !== origin) {
+        return result('blocked', { reason: 'The page changed while approval was pending; review the action again.', origin: originOf(session.page || page) });
+      }
+      if (targetHandle) {
+        const connected = await targetHandle.evaluate((el) => el.isConnected).catch(() => false);
+        let current = null;
+        if (connected) try { current = await targetHandle.evaluate(describeInPage); } catch {}
+        if (!connected || !current || !sameElement(element, current)) {
+          return result('blocked', { reason: 'The approved target changed while approval was pending; review the action again.' });
+        }
+        if (type === 'press' && !action.selector) {
+          const stillFocused = await targetHandle.evaluate((el) => el === document.activeElement).catch(() => false);
+          if (!stillFocused) return result('blocked', { reason: 'The approved target changed while approval was pending; review the action again.' });
+        }
+      }
     }
 
     let dispatched = false;
@@ -242,13 +278,13 @@ function createBrowserExecutor({ launch, askApproval, secrets = {}, log = () => 
     try {
       switch (type) {
         case 'navigate': dispatched = true; await page.goto(String(action.url), { timeout: timeoutMs }); break;
-        case 'click': dispatched = true; await locator.click({ timeout: timeoutMs }); break;
-        case 'hover': await locator.hover({ timeout: timeoutMs }); break;
-        case 'type': dispatched = true; await locator.fill(typed, { timeout: timeoutMs }); typed = null; break;
-        case 'select': dispatched = true; await locator.selectOption(typed, { timeout: timeoutMs }); typed = null; break;
-        case 'press': dispatched = true; await (locator ? locator.press(String(action.key), { timeout: timeoutMs }) : page.keyboard.press(String(action.key))); break;
-        case 'upload': dispatched = true; await locator.setInputFiles(file, { timeout: timeoutMs }); break;
-        case 'submit': dispatched = true; await locator.evaluate((el) => { const f = el.form || el.closest('form') || el; f.requestSubmit ? f.requestSubmit() : f.submit(); }); break;
+        case 'click': dispatched = true; await targetHandle.click({ timeout: timeoutMs }); break;
+        case 'hover': await targetHandle.hover({ timeout: timeoutMs }); break;
+        case 'type': dispatched = true; await targetHandle.fill(typed, { timeout: timeoutMs }); typed = null; break;
+        case 'select': dispatched = true; await targetHandle.selectOption(typed, { timeout: timeoutMs }); typed = null; break;
+        case 'press': dispatched = true; await (targetHandle ? targetHandle.press(String(action.key), { timeout: timeoutMs }) : page.keyboard.press(String(action.key))); break;
+        case 'upload': dispatched = true; await targetHandle.setInputFiles(file, { timeout: timeoutMs }); break;
+        case 'submit': dispatched = true; await targetHandle.evaluate((el) => { const f = el.form || el.closest('form') || el; f.requestSubmit ? f.requestSubmit() : f.submit(); }); break;
         case 'scroll': await page.mouse.wheel(0, Number(action.dy) || 600); break;
         case 'wait': await page.waitForTimeout(Math.min(Number(action.ms) || 500, 5000)); break;
         case 'extract': {
