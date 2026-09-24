@@ -22,3 +22,23 @@ test('a fresh nested state directory starts and reuses its encryption key', (t) 
   assert.equal(createSecretStore(state).decrypt(ciphertext), 'test secret');
   assert.equal(fs.statSync(store.keyFile).mode & 0o777, 0o600);
 });
+
+test('v1 still decrypts, v2 binds to the account, and ciphertext-looking input is encrypted', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-aad-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const store = createSecretStore(root);
+  const v1 = store.encrypt('legacy');
+  assert.match(v1, /^enc:v1:/);
+  assert.equal(store.decrypt(v1), 'legacy');
+  assert.equal(store.decrypt(v1, 'any-user'), 'legacy');
+  const v2 = store.encrypt('bound', 'user-a');
+  assert.match(v2, /^enc:v2:/);
+  assert.equal(store.decrypt(v2, 'user-a'), 'bound');
+  assert.throws(() => store.decrypt(v2, 'user-b'));
+  assert.throws(() => store.decrypt(v2));
+  const replayed = store.encrypt(v2, 'user-b');
+  assert.notEqual(replayed, v2);
+  assert.equal(store.decrypt(replayed, 'user-b'), v2);
+  assert.notEqual(store.encrypt(v1), v1);
+  assert.equal(store.encrypt(''), '');
+});

@@ -1,4 +1,6 @@
 'use strict';
+
+const { normalizeS3Region, S3_REGION_RE } = require('../s3-region.cjs');
 // The user's own storage connection (Settings → Diary & storage): read and save it, test it,
 // browse and read files over it for project knowledge, create one folder, and the Nextcloud
 // Login Flow v2 that turns a URL into an app password without the user typing a secret here.
@@ -88,6 +90,9 @@ function createStorageRoutes({ json, readJson, authService, storageClient, endpo
       if (body.kind !== 'local' && !(await storageEndpointAllowed(authn, body.baseUrl))) {
         return json(res, 400, { error: STORAGE_PRIVATE_URL_ERROR });
       }
+      if (body.region !== undefined && body.region !== null && body.region !== '' && !S3_REGION_RE.test(String(body.region))) {
+        return json(res, 400, { error: 'Region must be 1-32 lowercase letters, digits, or dashes (for example eu-west-1)' });
+      }
       return json(res, 200, authService.saveStorage(authn.user.id, body));
     }
     if (p === '/api/integrations/storage/test' && req.method === 'POST') {
@@ -121,7 +126,7 @@ function createStorageRoutes({ json, readJson, authService, storageClient, endpo
           const bucket = String(saved.bucket || '').trim();
           if (!bucket) return json(res, 400, { error: 'Bucket is required' });
           const target = `${endpoint}/${encodeURIComponent(bucket)}?list-type=2&max-keys=1`;
-          const signed = signS3Request('GET', new URL(target), '', saved.username || '', saved.secret || '');
+          const signed = signS3Request('GET', new URL(target), '', saved.username || '', saved.secret || '', { region: normalizeS3Region(saved.region) });
           const response = await fetch(target, { headers: signed, signal: AbortSignal.timeout(10000), redirect: 'error' });
           if (response.ok) return json(res, 200, { ok: true });
           const detail = response.status === 403 ? ' — check the access key and secret'

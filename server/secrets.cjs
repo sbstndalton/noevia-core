@@ -18,16 +18,29 @@ function createSecretStore(dataDir) {
     console.warn(`Generated credential-encryption key: ${keyFile} (include this file in backups)`);
   }
   if (key.length !== 32) throw new Error(`invalid credential-encryption key at ${keyFile}`);
-  function encrypt(value) {
-    if (!value || String(value).startsWith('enc:v1:')) return value || '';
+  // Formats:
+  //   enc:v1:<iv|tag|body>  legacy, no associated data (still decrypts)
+  //   enc:v2:<iv|tag|body>  GCM with AAD = "noevia:user:<userId>", so a
+  //                         ciphertext copied from another account fails.
+  // encrypt() always encrypts its input: a caller-supplied string that merely
+  // looks like a ciphertext is treated as plaintext, never stored verbatim.
+  const aadFor = (userId) => Buffer.from(`noevia:user:${userId}`, 'utf8');
+  function encrypt(value, userId) {
+    if (value === undefined || value === null || value === '') return '';
+    const bound = userId !== undefined && userId !== null && userId !== '';
     const iv = crypto.randomBytes(12); const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+    if (bound) cipher.setAAD(aadFor(userId));
     const body = Buffer.concat([cipher.update(String(value), 'utf8'), cipher.final()]);
-    return `enc:v1:${Buffer.concat([iv, cipher.getAuthTag(), body]).toString('base64url')}`;
+    return `enc:${bound ? 'v2' : 'v1'}:${Buffer.concat([iv, cipher.getAuthTag(), body]).toString('base64url')}`;
   }
-  function decrypt(value) {
-    if (!value || !String(value).startsWith('enc:v1:')) return value || '';
-    const raw = Buffer.from(String(value).slice(7), 'base64url');
+  function decrypt(value, userId) {
+    const text = String(value || '');
+    const version = text.startsWith('enc:v2:') ? 2 : text.startsWith('enc:v1:') ? 1 : 0;
+    if (!version) return value || '';
+    if (version === 2 && (userId === undefined || userId === null || userId === '')) throw new Error('credential is bound to an account');
+    const raw = Buffer.from(text.slice(7), 'base64url');
     const decipher = crypto.createDecipheriv('aes-256-gcm', key, raw.subarray(0, 12));
+    if (version === 2) decipher.setAAD(aadFor(userId));
     decipher.setAuthTag(raw.subarray(12, 28));
     return Buffer.concat([decipher.update(raw.subarray(28)), decipher.final()]).toString('utf8');
   }

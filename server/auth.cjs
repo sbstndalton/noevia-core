@@ -5,6 +5,7 @@ const fs = require('fs');
 const net = require('net');
 const path = require('path');
 const Database = require('better-sqlite3');
+const { DEFAULT_S3_REGION, normalizeS3Region } = require('./s3-region.cjs');
 const { hash, verify, Algorithm } = require('@node-rs/argon2');
 const {
   generateRegistrationOptions,
@@ -187,6 +188,9 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
   db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(3, unixepoch() * 1000)').run();
   // v4: bucket column for S3-compatible storage connections. Column add is
   // guarded because fresh databases already include it in the CREATE TABLE.
+  if (!db.prepare('PRAGMA table_info(storage_connections)').all().some((c) => c.name === 'region')) {
+    db.exec("ALTER TABLE storage_connections ADD COLUMN region TEXT NOT NULL DEFAULT 'us-east-1'");
+  }
   if (!db.prepare('PRAGMA table_info(storage_connections)').all().some((c) => c.name === 'bucket')) {
     db.exec("ALTER TABLE storage_connections ADD COLUMN bucket TEXT NOT NULL DEFAULT ''");
   }
@@ -627,19 +631,28 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       return true;
     },    getStorage(userId, includeSecret = false) {
       const row = db.prepare('SELECT * FROM storage_connections WHERE user_id=?').get(userId);
-      if (!row) return { kind: 'local', baseUrl: '', bucket: '', username: '', corpusRoot: '' };
-      const plain = secrets ? secrets.decrypt(row.secret) : row.secret;
-      return { kind: row.kind, baseUrl: row.base_url, bucket: row.bucket || '', username: row.username, corpusRoot: row.corpus_root,
+      if (!row) return { kind: 'local', baseUrl: '', bucket: '', region: DEFAULT_S3_REGION, username: '', corpusRoot: '' };
+      let plain = '';
+      try { plain = secrets ? secrets.decrypt(row.secret, userId) : row.secret; } catch {
+        // Lost or rotated secrets.key, or a ciphertext bound to another account.
+        console.warn(`storage secret for user ${userId} could not be decrypted; treating it as unset`);
+        plain = '';
+      }
+      // Upgrade a legacy unbound (v1) ciphertext to the account-bound format.
+      if (secrets && plain && String(row.secret).startsWith('enc:v1:')) {
+        db.prepare('UPDATE storage_connections SET secret=? WHERE user_id=?').run(secrets.encrypt(plain, userId), userId);
+      }
+      return { kind: row.kind, baseUrl: row.base_url, bucket: row.bucket || '', region: normalizeS3Region(row.region), username: row.username, corpusRoot: row.corpus_root,
         secret: includeSecret ? plain : undefined, secretConfigured: !!plain };
     },
     saveStorage(userId, value) {
       const kind = ['local', 'nextcloud', 'webdav', 's3'].includes(value.kind) ? value.kind : 'local';
-      const encrypted = secrets ? secrets.encrypt(value.secret || '') : (value.secret || '');
-      db.prepare(`INSERT INTO storage_connections(user_id,kind,base_url,bucket,username,secret,corpus_root,updated_at)
-        VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET kind=excluded.kind,base_url=excluded.base_url,
-        bucket=excluded.bucket,username=excluded.username,secret=excluded.secret,corpus_root=excluded.corpus_root,updated_at=excluded.updated_at`)
+      const encrypted = secrets ? secrets.encrypt(value.secret || '', userId) : (value.secret || '');
+      db.prepare(`INSERT INTO storage_connections(user_id,kind,base_url,bucket,region,username,secret,corpus_root,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET kind=excluded.kind,base_url=excluded.base_url,
+        bucket=excluded.bucket,region=excluded.region,username=excluded.username,secret=excluded.secret,corpus_root=excluded.corpus_root,updated_at=excluded.updated_at`)
         .run(userId, kind, String(value.baseUrl || '').replace(/\/+$/, ''), String(value.bucket || '').replace(/\/+$/, ''),
-          String(value.username || ''), encrypted, String(value.corpusRoot || ''), Date.now());
+          normalizeS3Region(value.region), String(value.username || ''), encrypted, String(value.corpusRoot || ''), Date.now());
       audit('storage.update', userId, userId, { kind });
       return this.getStorage(userId);
     },
