@@ -224,3 +224,47 @@ test('git aliases in any form are pushes, destructive git is a delete, gh is ext
   assert.equal(exec('git branch feat').action, ACTIONS.EXECUTE);
   assert.equal(exec('git fetch https://x.test/r').action, ACTIONS.NETWORK);
 });
+
+test('an env prefix or wrapper before curl/wget is never plain, auto-allowed or standing (#220)', () => {
+  const plain = exec('curl https://allowed.com');
+  assert.equal(decide({ classified: plain, domains: ['allowed.com'] }).decision, 'allow');
+  for (const command of [
+    'LD_PRELOAD=./x.so curl https://allowed.com',
+    'https_proxy=http://evil:8080 curl https://allowed.com',
+    'CURL_HOME=. curl https://allowed.com',
+    'command time -o /etc/x curl https://allowed.com',
+    'env -S "x" curl https://allowed.com',
+    'WGETRC=./rc wget -qO- https://allowed.com',
+  ]) {
+    const c = exec(command);
+    assert.equal(decide({ classified: c, domains: ['allowed.com'] }).decision, 'ask', command);
+    const a = analyzeCommand(command);
+    assert.ok(a.actions.includes(ACTIONS.EXECUTE), command);
+    assert.equal(a.simple, false, command);
+    assert.equal(a.standable, false, command);
+  }
+});
+
+test('git-<sub> push binaries are GIT_PUSH and never stand (#221)', () => {
+  for (const command of ['git-send-pack origin main', 'git-http-push https://x/r.git main', 'git-receive-pack /r.git',
+    '/usr/lib/git-core/git-send-pack origin main', '/usr/lib/git-core/git-http-push https://x main',
+    '/usr/lib/git-core/git-receive-pack /r.git', 'git receive-pack /r.git']) {
+    const a = analyzeCommand(command);
+    assert.equal(a.action, ACTIONS.GIT_PUSH, command);
+    assert.equal(a.standable, false, command);
+  }
+});
+
+test('publish/push tools are EXTERNAL and never stand, like gh (#222)', () => {
+  for (const command of ['npm publish', 'pnpm publish --access public', 'yarn publish', 'docker push img:1',
+    'podman push img:1', 'twine upload dist/*', 'hub push origin main', 'glab mr create --fill',
+    'glab release create v1', 'gem push x.gem', 'cargo publish', 'helm push chart.tgz oci://r',
+    'gcloud app deploy', 'gcloud run deploy svc', 'aws s3 cp f s3://b/f', 'aws s3 sync . s3://b']) {
+    const a = analyzeCommand(command);
+    assert.equal(a.action, ACTIONS.EXTERNAL, command);
+    assert.equal(a.standable, false, command);
+  }
+  for (const command of ['npm test', 'docker ps', 'cargo build', 'aws s3 ls', 'glab mr list']) {
+    assert.notEqual(analyzeCommand(command).action, ACTIONS.EXTERNAL, command);
+  }
+});

@@ -234,13 +234,15 @@ const one = (action, standable = true) => ({ actions: [action], standable });
 function classifyWords(input, depth) {
   let words = input.slice();
   let standable = true;
+  let prefixed = false; // an env prefix or wrapper ran before the real command
   // Peel `FOO=bar` prefixes and wrappers until the command that actually runs.
   for (;;) {
-    while (words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0])) words = words.slice(1);
+    while (words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0])) { words = words.slice(1); prefixed = true; }
     if (!words.length) return one(ACTIONS.NONE);
     const name = words[0].split('/').pop();
     if (!WRAPPERS.has(name)) break;
     if (DYNAMIC_WRAPPERS.has(name)) standable = false;
+    prefixed = true;
     const withArg = WRAPPERS.get(name);
     let k = 1;
     while (k < words.length) {
@@ -292,14 +294,33 @@ function classifyWords(input, depth) {
     return one(g.action, standable && g.standable);
   }
   const args = rest.filter((w) => !w.startsWith('-'));
+  if (name === 'gh' || publishes(name, args)) return one(ACTIONS.EXTERNAL, false);
   if (INSTALLERS.has(name)) return one(INSTALLERS.get(name).includes(args[0]) ? ACTIONS.INSTALL : ACTIONS.EXECUTE, standable);
   if (PACKAGE_RUNNERS.has(name)) return one(ACTIONS.INSTALL, standable);
   if (REMOTE_EXEC_COMMANDS.has(name)) return one(ACTIONS.EXECUTE, false);
-  if (name === 'gh') return one(ACTIONS.EXTERNAL, false);
-  if (NETWORK_COMMANDS.has(name)) return { actions: networkWords(name, rest), standable };
+  if (NETWORK_COMMANDS.has(name)) {
+    // `LD_PRELOAD=… curl`, `https_proxy=… curl`, `env -S … curl`, `time -o f curl`: the prefix can
+    // reroute or hijack the call, so it is never a plain, auto-allowed or standing network read.
+    if (prefixed) return { actions: [...new Set([...networkWords(name, rest), ACTIONS.EXECUTE])], standable: false };
+    return { actions: networkWords(name, rest), standable };
+  }
   if (DELETE_COMMANDS.has(name)) return one(ACTIONS.DELETE, standable);
   if (BROWSER_COMMANDS.has(name)) return one(ACTIONS.BROWSER, standable);
   return one(ACTIONS.EXECUTE, standable);
+}
+
+// Tools that publish or push to a remote registry/service: EXTERNAL, like `gh`, never standing.
+const PUBLISH_SUBCOMMANDS = new Map(Object.entries({
+  npm: ['publish'], pnpm: ['publish'], yarn: ['publish', 'npm'], docker: ['push'], podman: ['push'],
+  buildah: ['push'], twine: ['upload'], hub: ['push', 'release', 'pull-request'], gem: ['push'],
+  cargo: ['publish'], helm: ['push'], poetry: ['publish'], flit: ['publish'],
+}));
+function publishes(name, args) {
+  if (PUBLISH_SUBCOMMANDS.has(name)) return PUBLISH_SUBCOMMANDS.get(name).includes(args[0]);
+  if (name === 'glab') return args[0] === 'api' || (['mr', 'release', 'issue'].includes(args[0]) && ['create', 'merge', 'update', 'delete', 'upload', 'close', 'note'].includes(args[1]));
+  if (name === 'gcloud') return args.includes('deploy');
+  if (name === 'aws') return args[0] === 's3' && ['cp', 'sync', 'mv', 'rm', 'rb', 'mb'].includes(args[1]);
+  return false;
 }
 
 const isUrl = (w) => /^https?:\/\/\S+$/i.test(w);
@@ -340,7 +361,11 @@ function networkWords(name, rest) {
 
 /** @returns {{action: string, standable: boolean}} */
 function gitAction(name, rest) {
-  if (name !== 'git') return { action: GIT_SUBCOMMANDS.get(name.slice(4)) || ACTIONS.EXECUTE, standable: true }; // `git-push`
+  if (name !== 'git') { // `git-push`, `/usr/lib/git-core/git-send-pack`
+    const sub = name.slice(4);
+    if (['send-pack', 'http-push', 'receive-pack'].includes(sub)) return { action: ACTIONS.GIT_PUSH, standable: false };
+    return { action: GIT_SUBCOMMANDS.get(sub) || ACTIONS.EXECUTE, standable: true };
+  }
   let k = 0;
   let aliased = false;
   let rerouted = false;
@@ -368,7 +393,7 @@ function gitAction(name, rest) {
   const sub = rest[k];
   const args = rest.slice(k + 1);
   const has = (...flags) => args.some((a) => flags.includes(a) || flags.some((f) => f.startsWith('--') && a.startsWith(f + '=')));
-  if (sub === 'send-pack' || sub === 'http-push') return { action: ACTIONS.GIT_PUSH, standable: false };
+  if (sub === 'send-pack' || sub === 'http-push' || sub === 'receive-pack') return { action: ACTIONS.GIT_PUSH, standable: false };
   // History-destroying subcommands: DELETE, which never stands.
   const destructive =
     (sub === 'update-ref' && has('-d', '--delete')) ||
