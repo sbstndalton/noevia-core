@@ -113,11 +113,28 @@ function createOffsiteBackup({ store, key, paths, fs = nodeFs, now = Date.now, s
       await ensureConfig();
       const known = new Set((await store.list('data/')).map((k) => k.split('/').pop()));
       const files = [];
-      let uploaded = 0, bytes = 0;
+      let uploaded = 0, bytes = 0, incomplete = false;
+      const isSqlite = (abs) => /\.(db|sqlite3?)$/.test(abs);
       for (const [index, root] of paths.entries()) {
         for (const abs of walk(root)) {
           let content;
-          try { content = (snapshotFile && (await snapshotFile(abs))) || fs.readFileSync(abs); } catch { continue; }
+          if (snapshotFile && isSqlite(abs)) {
+            // A live .db/.sqlite file must never be raw-read: without a
+            // consistent snapshot (WAL not checkpointed, page writes
+            // in-flight) the copy is torn and can pass a restore test while
+            // being unusable. Skip the file and flag the manifest instead of
+            // silently falling back to fs.readFileSync.
+            let snap;
+            try { snap = await snapshotFile(abs); } catch { snap = null; }
+            if (!snap) {
+              log({ event: 'offsite.snapshot.skip', path: abs, reason: 'sqlite-snapshot-failed' });
+              incomplete = true;
+              continue;
+            }
+            content = snap;
+          } else {
+            try { content = (snapshotFile && (await snapshotFile(abs))) || fs.readFileSync(abs); } catch { continue; }
+          }
           const stat = fs.statSync(abs, { throwIfNoEntry: false });
           const chunks = [];
           for (let offset = 0; offset < content.length || (offset === 0 && content.length === 0); offset += CHUNK) {
@@ -134,9 +151,9 @@ function createOffsiteBackup({ store, key, paths, fs = nodeFs, now = Date.now, s
       }
       const time = now();
       const id = `${new Date(time).toISOString().replace(/[:.]/g, '-')}-${crypto.randomBytes(4).toString('hex')}`;
-      await store.put(`snapshots/${id}`, seal(keys, Buffer.from(JSON.stringify({ format: FORMAT, time, roots: paths.length, files }))));
-      log({ event: 'offsite.snapshot', id, files: files.length, uploadedChunks: uploaded, uploadedBytes: bytes });
-      return { id, time, files: files.length, uploadedChunks: uploaded, uploadedBytes: bytes };
+      await store.put(`snapshots/${id}`, seal(keys, Buffer.from(JSON.stringify({ format: FORMAT, time, roots: paths.length, files, incomplete }))));
+      log({ event: 'offsite.snapshot', id, files: files.length, uploadedChunks: uploaded, uploadedBytes: bytes, incomplete });
+      return { id, time, files: files.length, uploadedChunks: uploaded, uploadedBytes: bytes, incomplete };
     })();
     try { return await running; } finally { running = null; }
   }
@@ -145,8 +162,15 @@ function createOffsiteBackup({ store, key, paths, fs = nodeFs, now = Date.now, s
     const ids = (await store.list('snapshots/')).map((k) => k.slice('snapshots/'.length));
     const out = [];
     for (const id of ids) {
-      const manifest = await readManifest(id);
-      out.push({ id, time: manifest.time, files: manifest.files.length, bytes: manifest.files.reduce((n, f) => n + f.size, 0) });
+      let manifest;
+      try { manifest = await readManifest(id); }
+      catch (err) {
+        // One corrupt manifest must not take down retention or the restore
+        // test for every other snapshot: skip it and log, don't throw.
+        log({ event: 'offsite.snapshot.corrupt', id, message: err?.message });
+        continue;
+      }
+      out.push({ id, time: manifest.time, files: manifest.files.length, bytes: manifest.files.reduce((n, f) => n + f.size, 0), incomplete: !!manifest.incomplete });
     }
     return out.sort((a, b) => b.time - a.time);
   }

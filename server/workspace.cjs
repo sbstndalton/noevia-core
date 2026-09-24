@@ -27,8 +27,12 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets) {
   function loadShared() {
     const rows = readJson(sharedFile, { providers: [] }).providers || [];
     for (const row of rows) row.apiKey = secrets ? secrets.decrypt(row.apiKey) : row.apiKey;
-    if (!rows.some(p => p.id === defaultProvider.id)) rows.unshift({ ...defaultProvider, shared: true });
-    return rows;
+    // A stale default row may exist in the file from before this fix. Prefer
+    // the current env-derived defaultProvider values for that id (dropped on
+    // the next saveShared()/removeProvider() write since both now exclude it).
+    const filtered = rows.filter(p => p.id !== defaultProvider.id);
+    filtered.unshift({ ...defaultProvider, shared: true });
+    return filtered;
   }
 
   // Merge order mirrors the original load-time merge: shared rows first,
@@ -140,7 +144,10 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets) {
         if (!selected || id === defaultProvider.id) return false;
         if (selected.shared) {
           const encode = p => ({ ...p, apiKey: secrets ? secrets.encrypt(p.apiKey) : p.apiKey });
-          atomicJson(sharedFile, { providers: loadShared().filter(p => p.id !== id).map(encode) });
+          // Mirror saveShared(): never persist the built-in default row back
+          // to shared-providers.json, or its env-sourced key gets baked into
+          // the file and the env value is ignored from then on.
+          atomicJson(sharedFile, { providers: loadShared().filter(p => p.id !== id && p.id !== defaultProvider.id).map(encode) });
         } else {
           this.privateProviders = this.privateProviders.filter(p => p.id !== id);
           this.providers = this.providers.filter(p => p.id !== id);

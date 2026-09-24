@@ -69,3 +69,60 @@ test('deleting a shared provider propagates to other users without restart', () 
 
   fs.rmSync(root, { recursive: true, force: true });
 });
+
+test('removing a shared provider never writes the padded default row to disk', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cowork-shared-providers-'));
+  const sharedFile = path.join(root, 'shared-providers.json');
+  const secrets = createSecretStore(root);
+  const defaultProvider = { id: 'default', label: 'Default', baseUrl: 'http://localhost', apiKey: 'env-secret' };
+  const store = createWorkspaceStore(root, defaultProvider, secrets);
+
+  const admin = store.get(ADMIN_ID);
+  admin.providers.push({ id: 'shared-z', label: 'Shared Z', baseUrl: 'https://z.test/v1', apiKey: '', shared: true });
+  admin.saveShared();
+
+  // removeProvider() (not saveShared()) is the path under test: it must
+  // exclude the built-in default row the same way saveShared() does.
+  assert.equal(admin.removeProvider('shared-z'), true);
+
+  const raw = fs.readFileSync(sharedFile, 'utf8');
+  assert.doesNotMatch(raw, /shared-z/);
+  assert.doesNotMatch(raw, /"default"/, 'the built-in default row must never be persisted to shared-providers.json');
+  assert.doesNotMatch(raw, /env-secret/, 'the env-sourced default key must never be persisted');
+
+  // The default is still exposed to callers, sourced from env, not disk.
+  const userAgain = store.get(USER_B_ID);
+  assert.ok(userAgain.providers.some((p) => p.id === 'default' && p.apiKey === 'env-secret'));
+
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('loadShared prefers env-derived default values over a stale row left in the file', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cowork-shared-providers-'));
+  const sharedFile = path.join(root, 'shared-providers.json');
+  const secrets = createSecretStore(root);
+
+  // Simulate a file written by a pre-fix build: it contains a "default" row
+  // with a stale label/key that must not shadow the current env config.
+  fs.mkdirSync(root, { recursive: true });
+  fs.writeFileSync(sharedFile, JSON.stringify({
+    providers: [{ id: 'default', label: 'Stale Label', baseUrl: 'http://stale', apiKey: secrets.encrypt('stale-key'), shared: true }],
+  }));
+
+  const defaultProvider = { id: 'default', label: 'Fresh Label', baseUrl: 'http://fresh', apiKey: 'fresh-env-key' };
+  const store = createWorkspaceStore(root, defaultProvider, secrets);
+
+  const user = store.get(USER_B_ID);
+  const seenDefault = user.providers.find((p) => p.id === 'default');
+  assert.equal(seenDefault.label, 'Fresh Label');
+  assert.equal(seenDefault.apiKey, 'fresh-env-key');
+
+  // Any write path (saveShared/removeProvider) drops the stale row going forward.
+  user.providers.push({ id: 'shared-drop-trigger', label: 'Trigger', baseUrl: 'https://t.test', apiKey: '', shared: true });
+  user.saveShared();
+  const raw = fs.readFileSync(sharedFile, 'utf8');
+  assert.doesNotMatch(raw, /Stale Label/);
+  assert.doesNotMatch(raw, /stale-key/);
+
+  fs.rmSync(root, { recursive: true, force: true });
+});

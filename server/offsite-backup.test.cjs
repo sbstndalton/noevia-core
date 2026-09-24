@@ -80,6 +80,34 @@ test('retention keeps 7 daily, 4 weekly, 6 monthly and the newest; forget prunes
   for (const s of remaining) await b.restore(s.id, fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-offsite-r-')));
 });
 
+test('a failed sqlite snapshot is skipped, not raw-copied, and flags the manifest incomplete', async (t) => {
+  const { data } = tree(t); const store = memoryStore();
+  const log = []; const logged = (e) => log.push(e);
+  // snapshotFile stands in for sqliteSnapshot(): returns null for the .db,
+  // as it would when better-sqlite3's online backup fails.
+  const snapshotFile = async (abs) => (/\.db$/.test(abs) ? null : null);
+  const b = createOffsiteBackup({ store, key: KEY, paths: [data], snapshotFile, log: logged });
+  const result = await b.backup();
+  assert.equal(result.incomplete, true, 'manifest must be flagged incomplete');
+  assert.ok(log.some((e) => e.event === 'offsite.snapshot.skip' && /auth\.db$/.test(e.path)));
+  const target = path.join(data, '..', 'restore-sqlite-skip');
+  await b.restore(result.id, target);
+  assert.equal(fs.existsSync(path.join(target, '0', 'auth.db')), false, 'the torn live .db must never be copied raw');
+  const list = await b.snapshots();
+  assert.equal(list[0].incomplete, true);
+});
+
+test('a corrupt manifest is skipped by snapshots(), not thrown', async (t) => {
+  const { data } = tree(t); const store = memoryStore();
+  const b = createOffsiteBackup({ store, key: KEY, paths: [data] });
+  const good = await b.backup();
+  store.m.set('snapshots/corrupt', Buffer.from('not encrypted bytes at all'));
+  const log = []; const b2 = createOffsiteBackup({ store, key: KEY, paths: [data], log: (e) => log.push(e) });
+  const list = await b2.snapshots();
+  assert.deepEqual(list.map((s) => s.id), [good.id]);
+  assert.ok(log.some((e) => e.event === 'offsite.snapshot.corrupt' && e.id === 'corrupt'));
+});
+
 test('key file must be valid hex and outside backed-up paths', (t) => {
   const { root, data } = tree(t);
   const inside = path.join(data, 'key'); fs.writeFileSync(inside, 'a'.repeat(64));

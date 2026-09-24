@@ -10,7 +10,13 @@ function createS3Store({ endpoint, bucket, region = 'us-east-1', accessKeyId, se
   const base = new URL(endpoint);
   if (base.protocol !== 'https:' && !['127.0.0.1', 'localhost', '[::1]'].includes(base.hostname)) throw Object.assign(Error('Offsite backup endpoints must use HTTPS.'), { status: 409 });
   if (base.username || base.password || base.search) throw Object.assign(Error('Put credentials in their own settings, not the endpoint URL.'), { status: 409 });
-  const root = String(prefix).replace(/^\/+|\/+$/g, '');
+  // Normalise once: trim leading/trailing slashes and collapse internal runs
+  // (e.g. "a//b/" -> "a/b") so object URLs and listing prefixes agree. Before
+  // this fix only the URL builder collapsed doubled slashes (via
+  // split('/').filter(Boolean)); list() sent the raw prefix, so a listing
+  // could come back empty against objects that do exist, defeating dedup and
+  // letting retention never find anything to delete.
+  const root = String(prefix).replace(/\/+/g, '/').replace(/^\/+|\/+$/g, '');
   const url = (key, query) => {
     const u = new URL(`${base.origin}${base.pathname.replace(/\/+$/, '')}/${[bucket, ...`${root}/${key}`.split('/').filter(Boolean)].map(encodeURIComponent).join('/')}`);
     if (query) for (const [k, v] of Object.entries(query)) if (v !== undefined) u.searchParams.set(k, v);

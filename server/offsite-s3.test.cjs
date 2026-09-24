@@ -78,6 +78,18 @@ test('leading/trailing slashes on the configured prefix are normalised the same 
   assert.deepEqual([...messy.objects.keys()], [...clean.objects.keys()]);
 });
 
+test('an internal doubled slash like "a//b/" is collapsed the same in object URLs and listings', async () => {
+  const messy = store('a//b/');
+  const clean = store('a/b');
+  await messy.s.put('data/chunk1', Buffer.from('x'));
+  await clean.s.put('data/chunk1', Buffer.from('x'));
+  // Before the fix, the object landed at the collapsed key (matching clean)
+  // but list() sent the raw doubled-slash prefix, so it never found what put()
+  // had just written -- an empty listing meant dedup and retention saw nothing.
+  assert.deepEqual([...messy.objects.keys()], [...clean.objects.keys()]);
+  assert.deepEqual(await messy.s.list('data/'), ['data/chunk1']);
+});
+
 test('get() returns null for a missing key and delete() is idempotent', async () => {
   const { s } = store('noevia-backup');
   assert.equal(await s.get('data/missing'), null);
