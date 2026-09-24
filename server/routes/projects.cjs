@@ -215,6 +215,16 @@ function createProjectRoutes({
         if (!getProvider(patch.provider)) return json(res, 400, { error: 'no such provider' });
         project.provider = patch.provider;
       }
+      // Explicit sampling override (issue #194): null clears it, back to the automatic preset
+      // (or engine defaults, if automatic sampling presets are off). Unknown/out-of-range keys
+      // are dropped rather than rejecting the whole request — sanitizeExplicitSampling mirrors
+      // the same validation selectSamplingParams applies at request time.
+      if (patch.sampling === null) { delete project.sampling; delete storedProject.sampling; }
+      else if (patch.sampling !== undefined) {
+        const cleaned = require('../sampling-presets.cjs').sanitizeExplicitSampling(patch.sampling);
+        if (cleaned) project.sampling = cleaned;
+        else { delete project.sampling; delete storedProject.sampling; }
+      }
       if (patch.toolboxes !== undefined) {
         const boxes = sanitizeToolboxes(patch.toolboxes);
         if (!boxes) return json(res, 400, { error: 'toolboxes must be an array of toolbox ids' });

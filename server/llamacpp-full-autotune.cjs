@@ -5,7 +5,12 @@ const crypto = require('node:crypto');
 const { WORKLOADS, SPEC_CANDIDATES, geomean } = require('./llamacpp-autotune.cjs');
 const { isSystemModel, modelPathFromArgs, SYSTEM_MODEL_REASON } = require('./model-system.cjs');
 const VERSION = 3;
-const KV = ['f16', 'q8_0', 'q4_0'];
+// Q5 is the automatic floor for KV cache quantization (issue #190): Q4 degrades quality too
+// much to select automatically. Q4 stays reachable only through an explicit override env var,
+// never as a routine candidate, and never below Q5 by default. f16/q8_0 remain above the floor.
+const KV_FLOOR_OVERRIDE_ENV = 'NOEVIA_AUTOTUNE_ALLOW_BELOW_Q5_KV';
+const allowBelowQ5Kv = () => ['1', 'true', 'yes', 'on'].includes(String(process.env[KV_FLOOR_OVERRIDE_ENV] || '').toLowerCase());
+const kvCandidates = () => allowBelowQ5Kv() ? ['f16', 'q8_0', 'q5_1', 'q5_0', 'q4_0'] : ['f16', 'q8_0', 'q5_1', 'q5_0'];
 const UBATCH = [512, 1024, 2048];
 const PAD = 'The garden committee reviewed irrigation, seed orders, volunteer rotas and pump maintenance. ';
 const PHASES = [['kv', 'KV cache'], ['context', 'Context size'], ['drafting', 'Drafting'], ['batch', 'Batch and micro-batch']];
@@ -35,7 +40,7 @@ const publicJob = job => job && JSON.parse(JSON.stringify(job, (key, value) =>
 const step = (id, label) => ({ id, label, status: 'pending' });
 function newModel(model) {
   return { model, status: 'pending', phases: PHASES.map(([id, label]) => ({
-    id, label, status: 'pending', steps: id === 'kv' ? KV.map(k => step(k, k + ' KV cache'))
+    id, label, status: 'pending', steps: id === 'kv' ? kvCandidates().map(k => step(k, k + ' KV cache'))
       : id === 'drafting' ? SPEC_CANDIDATES.map(c => step(c.id, c.label))
       : id === 'batch' ? UBATCH.map(n => step(String(n), 'Micro-batch ' + n))
       : [step('capacity', 'Load and long-prompt recall')],
@@ -243,14 +248,14 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
   }
   async function runKv(j, p) {
     const before = { ...presets.get(j.model).options }, results = [];
-    for (const kv of KV) {
+    for (const kv of kvCandidates()) {
       check(); note(j, 'Testing ' + kv + ' KV cache with drafting off.');
       await unloadAll();
       const measured = await measure(j, p, kv, { 'cache-type-k': kv, 'cache-type-v': kv,
         'spec-type': 'none', 'spec-draft-n-max': '', 'spec-draft-p-min': '' }, () => validate(j.model));
       if (measured) results.push({ kv, ...measured });
     }
-    const best = results.sort((a, b) => b.generation - a.generation || KV.indexOf(a.kv) - KV.indexOf(b.kv))[0];
+    const best = results.sort((a, b) => b.generation - a.generation || kvCandidates().indexOf(a.kv) - kvCandidates().indexOf(b.kv))[0];
     if (!best) throw Error('No KV cache type passed quality and throughput checks.');
     const restoreSpec = Object.fromEntries(['spec-type', 'spec-draft-n-max', 'spec-draft-p-min'].map(k => [k, before[k] || '']));
     await write(j, { 'cache-type-k': best.kv, 'cache-type-v': best.kv, ...restoreSpec });
@@ -337,7 +342,7 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
     if (presets.snapshot().revision !== j._revision) throw Object.assign(Error('Settings changed outside auto-tune.'), { fatal: true });
     p._beforeText = presets.snapshot().text;
     p.status = 'running'; p.startedAt = now();
-    p.steps = p.id === 'kv' ? KV.map(k => step(k, k + ' KV cache'))
+    p.steps = p.id === 'kv' ? kvCandidates().map(k => step(k, k + ' KV cache'))
       : p.id === 'drafting' ? SPEC_CANDIDATES.map(c => step(c.id, c.label))
       : p.id === 'batch' ? UBATCH.map(n => step(String(n), 'Micro-batch ' + n))
       : [step('capacity', 'Load and long-prompt recall')];

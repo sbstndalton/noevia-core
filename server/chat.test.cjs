@@ -8,10 +8,10 @@ const { createToolboxes } = require('./toolboxes.cjs');
 const { createDriveTools } = require('./gdrive-tools.cjs');
 const { createToolExchange } = require('./tool-exchange.cjs');
 
-async function runDriveCall(t, { name, savedMode = null, connected = true, decision = 'approve', autoDecision = null, history = [] }) {
+async function runDriveCall(t, { name, savedMode = null, connected = true, decision = 'approve', autoDecision = null, history = [], sampling = undefined, autoSamplingEnabled = undefined, message = 'Synthetic Drive request', codeRoleConfigured = false }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-drive-chat-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const user = { id: 'synthetic-user' }, project = { id: 'synthetic-project', model: 'synthetic-model', routing: autoDecision ? 'auto' : 'manual', toolboxes: ['core'], files: [] };
+  const user = { id: 'synthetic-user' }, project = { id: 'synthetic-project', model: 'synthetic-model', routing: autoDecision ? 'auto' : 'manual', toolboxes: ['core'], files: [], ...(sampling !== undefined ? { sampling } : {}) };
   const store = { workspace: { userId: user.id }, authn: { user } };
   const requestScope = { getStore: () => store, run: (_scope, fn) => fn() };
   const accounts = { forUser: () => ({ drive: { state: () => ({ state: connected ? 'connected' : 'disconnected' }) } }) };
@@ -40,11 +40,12 @@ async function runDriveCall(t, { name, savedMode = null, connected = true, decis
     fs, path, crypto, fetch, reasoningEffort: require('./reasoning-effort.cjs'), createToolExchange,
     rag: { filesContext: async () => null }, prefill: { recordSample() {} }, reduceToolResult: require('./tool-result-reduce.cjs').reduceToolResult,
     HISTORY_CAP: 20, DEFAULT_PROVIDER_ID: 'default', DIARY_BASE: 'http://fixture.invalid', TOOL_RESULT_CAP: 8000,
-    authService: { audit() {} }, toolPolicy: { mode: (_user, _tool, write) => write ? 'ask' : savedMode || 'allow' },
-    modelManager: { enabled: true, load: async () => ({ ok: true }), health: async () => ({ ok: true, body: { all_models_loaded: ['synthetic-model', 'fast-model', 'smart-model'].map(model_name => ({ model_name, loaded: true, recipe_options: { ctx_size: 32768 } })) } }) },
+    authService: { audit() {}, db: autoSamplingEnabled === undefined ? undefined : { prepare: () => ({ get: () => ({ value: String(autoSamplingEnabled) }) }) } },
+    toolPolicy: { mode: (_user, _tool, write) => write ? 'ask' : savedMode || 'allow' },
+    modelManager: { enabled: true, load: async () => ({ ok: true }), health: async () => ({ ok: true, body: { all_models_loaded: ['synthetic-model', 'fast-model', 'smart-model', ...(codeRoleConfigured ? ['code-model'] : [])].map(model_name => ({ model_name, loaded: true, recipe_options: { ctx_size: 32768 } })) } }) },
     requestScope, currentWorkspace: () => ({ userId: user.id, dir }), json() {}, getProject: () => project,
     getProvider: () => ({ id: 'default', baseUrl: 'http://fixture.invalid', label: 'Mock' }), providerHeaders: () => ({}), saveChats() {}, endpointApproved: () => true,
-    diaryHeaders: () => ({}), diaryExtras: require('./diary-extras.cjs'), autoRoles: () => autoDecision ? { fast: 'fast-model', smart: 'smart-model' } : null, lastLoadedModel: () => null,
+    diaryHeaders: () => ({}), diaryExtras: require('./diary-extras.cjs'), autoRoles: () => autoDecision ? { fast: 'fast-model', smart: 'smart-model', ...(codeRoleConfigured ? { code: 'code-model' } : {}) } : null, lastLoadedModel: () => null,
     classifyFastOrSmart: async (message) => typeof autoDecision === 'function' ? autoDecision(message) : autoDecision || 'fast', servedCatalogue: async () => [], modelsInstalled: async () => [], missingRoles: () => [], staleRolesError: () => null,
     visionProbe: async () => ({ supported: false, reason: 'none' }), visionDescriptions: new Map(), skillsIndexFor: () => [],
     chatSkillRouter: { select: async () => ({ loaded: [] }) }, chatToolRouter: { select: async (ids) => ({ ids, routed: false }) },
@@ -52,7 +53,7 @@ async function runDriveCall(t, { name, savedMode = null, connected = true, decis
     chatWideApproved: () => false, awaitApproval: async (request) => { approvals.push(request); return decision; },
     recordUsage() {}, recordToolUse() {},
   });
-  await handler.handleChat({}, res, { message: 'Synthetic Drive request', projectId: project.id, chatId: 'synthetic-chat', history });
+  await handler.handleChat({}, res, { message, projectId: project.id, chatId: 'synthetic-chat', history });
   assert.equal(events.some((event) => event.type === 'error'), false, JSON.stringify(events.filter((event) => event.type === 'error')));
   return { executions, approvals, requests, events };
 }
@@ -118,4 +119,52 @@ test('actual router decision flows through chat SSE with its scores and identity
   assert.equal(meta.route, 'smart'); assert.equal(meta.routingDecision.model, 'convaiinnovations/laya');
   assert.deepEqual(meta.routingDecision.scores, { fast: 0.125, smart: 0.875 });
   assert.equal(meta.routingDecision.status, 'accepted');
+});
+
+test('the code-routed request applies the coding sampling preset (issue #194)', async (t) => {
+  const result = await runDriveCall(t, { name: 'drive_read_file', autoDecision: { role: 'code' }, codeRoleConfigured: true });
+  const meta = result.events.find(event => event.type === 'meta');
+  assert.equal(meta.sampling.preset, 'coding'); assert.equal(meta.sampling.source, 'auto');
+  assert.deepEqual(meta.sampling.values, { temperature: 0.2, top_p: 0.9, repeat_penalty: 1.05 });
+  assert.equal(result.requests[0].temperature, 0.2);
+  assert.equal(result.requests[0].top_p, 0.9);
+  assert.equal(result.requests[0].repeat_penalty, 1.05);
+});
+
+test('a fast-routed request with no creative wording sends no sampling override (general preset)', async (t) => {
+  const result = await runDriveCall(t, { name: 'drive_read_file', autoDecision: { role: 'fast' } });
+  const meta = result.events.find(event => event.type === 'meta');
+  assert.equal(meta.sampling, undefined);
+  assert.equal(result.requests[0].temperature, undefined);
+});
+
+test('an explicit project sampling override wins over the auto preset, key by key', async (t) => {
+  const result = await runDriveCall(t, { name: 'drive_read_file', autoDecision: { role: 'code' }, sampling: { temperature: 0.6 }, codeRoleConfigured: true });
+  const meta = result.events.find(event => event.type === 'meta');
+  assert.equal(meta.sampling.source, 'auto'); // top_p/repeat_penalty still came from the preset
+  assert.deepEqual(meta.sampling.values, { temperature: 0.6, top_p: 0.9, repeat_penalty: 1.05 });
+  assert.equal(result.requests[0].temperature, 0.6);
+});
+
+test('automatic sampling presets off applies only the explicit override, never a preset', async (t) => {
+  const result = await runDriveCall(t, { name: 'drive_read_file', autoDecision: { role: 'code' }, sampling: { temperature: 0.6 }, autoSamplingEnabled: false, codeRoleConfigured: true });
+  const meta = result.events.find(event => event.type === 'meta');
+  assert.equal(meta.sampling.preset, undefined); assert.equal(meta.sampling.source, 'explicit');
+  assert.deepEqual(meta.sampling.values, { temperature: 0.6 });
+  assert.equal(result.requests[0].temperature, 0.6);
+  assert.equal(result.requests[0].top_p, undefined);
+});
+
+test('automatic sampling presets off with no explicit override sends nothing at all', async (t) => {
+  const result = await runDriveCall(t, { name: 'drive_read_file', autoDecision: { role: 'code' }, autoSamplingEnabled: false, codeRoleConfigured: true });
+  const meta = result.events.find(event => event.type === 'meta');
+  assert.equal(meta.sampling, undefined);
+  assert.equal(result.requests[0].temperature, undefined);
+});
+
+test('the creative heuristic promotes an otherwise fast-routed writing prompt', async (t) => {
+  const result = await runDriveCall(t, { name: 'drive_read_file', autoDecision: { role: 'fast' }, message: 'Write a short story about a lighthouse keeper.' });
+  const meta = result.events.find(event => event.type === 'meta');
+  assert.equal(meta.sampling.preset, 'creative');
+  assert.deepEqual(meta.sampling.values, { temperature: 0.9, top_p: 0.95 });
 });

@@ -342,6 +342,17 @@ function createChatHandler({
     const upstreamUrl = `${provider.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`;
     const upstreamHeaders = providerHeaders(provider);
     const effort = reasoningEffort.resolveEffort(project, authService?.db?.prepare("SELECT value FROM settings WHERE key='reasoning_effort_default'").get()?.value);
+    // Task-aware sampling presets (issue #194): applied only when the operator has not turned
+    // the feature off and the project has no explicit sampling override for the key in
+    // question. `routedRole` (fast/smart/code) is the auto-router's existing signal; a manual
+    // (non-auto) chat has no routedRole and falls back to the message heuristic alone.
+    const samplingAutoEnabled = (() => {
+      const raw = authService?.db?.prepare("SELECT value FROM settings WHERE key='auto_sampling_presets_enabled'").get()?.value;
+      return raw === undefined || raw === null ? true : raw !== 'false';
+    })();
+    const sampling = require('./sampling-presets.cjs').selectSamplingParams({
+      routedRole, message, explicit: project?.sampling, autoEnabled: samplingAutoEnabled,
+    });
 
     // SSRF guard for member-registered providers (see the /api/providers POST
     // guard): a member must not reach internal addresses through a chat pinned
@@ -365,7 +376,8 @@ function createChatHandler({
     res.once('close',()=>clearInterval(heartbeat));
     res.once('finish',()=>clearInterval(heartbeat));
     send({ type: 'meta', model, chatId: chatId || undefined, route: routedRole || undefined,
-      routingDecision: routingDecision || undefined });
+      routingDecision: routingDecision || undefined,
+      sampling: sampling.source === 'none' ? undefined : { preset: sampling.presetId || undefined, source: sampling.source, values: sampling.params } });
     send({ type: 'telemetry', phase: 'waiting', model });
     send({ type: 'status', text: attachedImages.length ? 'Reading image sources — model loading and visual processing may take a moment…' : 'Preparing response…' });
     let visionWarning = missingImages.length ? `Images were not read because their stored files are missing: ${missingImages.join(', ')}. Re-upload them.` : '';
@@ -592,6 +604,7 @@ function createChatHandler({
         upstream = await reasoningEffort.requestWithEffort(fetch, upstreamUrl, {
           method: 'POST', headers: upstreamHeaders, signal: chatSignal.signal, redirect: 'error',
         }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:true,stream_options:{include_usage:true},
+          ...sampling.params,
           ...(activeTools.length ? {tools:activeTools} : {})}, provider, model, effort, send);
       } catch (err) {
         if (chatSignal.signal.aborted) break; // client went away; stop quietly
@@ -703,7 +716,7 @@ function createChatHandler({
           roundTimings = null;
           const response = await reasoningEffort.requestWithEffort(fetch, upstreamUrl, {
             method:'POST',headers:upstreamHeaders,signal:AbortSignal.any([chatSignal.signal,AbortSignal.timeout(300000)]),redirect:'error',
-          }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:false,...(activeTools.length ? {tools:activeTools} : {})}, provider, model, effort, send);
+          }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:false,...sampling.params,...(activeTools.length ? {tools:activeTools} : {})}, provider, model, effort, send);
           const full = {ok:response.ok,status:response.status,body:await response.json()};
           if (!full.ok) throw new Error(`Provider returned ${full.status}`);
           require('./mtp.cjs').record(chatWorkspace?.userId,model,full.body?.timings);

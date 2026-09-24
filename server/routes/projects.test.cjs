@@ -95,6 +95,21 @@ test('the config patch validates each field with the same words as before', asyn
   assert.equal(f.store.saves, 1);
 });
 
+test('the sampling patch is sanitized, and null clears an explicit override (issue #194)', async () => {
+  const f = fixture({ projects: [{ id: 'p1', files: [] }] });
+  await f.call('POST', '/api/projects/p1/config', { sampling: { temperature: 0.4, top_p: 5, mirostat: 2 } });
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true } });
+  assert.deepEqual(f.projects[0].sampling, { temperature: 0.4 }); // out-of-range top_p and unknown key dropped
+  await f.call('POST', '/api/projects/p1/config', { sampling: {} });
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true } });
+  assert.equal(f.projects[0].sampling, undefined); // nothing valid survived sanitization
+  await f.call('POST', '/api/projects/p1/config', { sampling: { temperature: 0.6 } });
+  assert.deepEqual(f.projects[0].sampling, { temperature: 0.6 });
+  await f.call('POST', '/api/projects/p1/config', { sampling: null });
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true } });
+  assert.equal(f.projects[0].sampling, undefined);
+});
+
 test('chat metas: listing, saving a normalized list and deleting one', async () => {
   const f = fixture({ projects: [{ id: 'p1', chats: [{ id: 'c1', title: 'one' }] }] });
   await f.call('GET', '/api/projects/p1/chats');

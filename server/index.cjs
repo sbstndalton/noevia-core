@@ -558,6 +558,9 @@ const chatListRoutes = require('./routes/chat-lists.cjs').createChatListRoutes({
 });
 // The reasoning-effort default and per-project resolution (routes/reasoning-settings.cjs).
 const reasoningSettingsRoutes = require('./routes/reasoning-settings.cjs').createReasoningSettingsRoutes({ json, readBody, authService, getProject, getProvider, reasoningEffort, DEFAULT_PROVIDER_ID });
+// The automatic sampling presets on/off default (routes/sampling-settings.cjs). Selection and
+// precedence live in sampling-presets.cjs; this only toggles whether chat.cjs applies a preset.
+const samplingSettingsRoutes = require('./routes/sampling-settings.cjs').createSamplingSettingsRoutes({ json, readBody, authService });
 // GET /api/health: the default provider, the Diary sidecar and retrieval (routes/health.cjs).
 const healthRoutes = require('./routes/health.cjs').createHealthRoutes({ json, fetchJson, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, DIARY_BASE, diaryHeaders, authService, rag });
 // GET /api/toolboxes: the picker view (routes/toolboxes.cjs). MCP state is read at call time.
@@ -628,6 +631,7 @@ async function handleRequestScoped(req, res) {
 
     if (authn && await usageRoutes(req, res, { path: p, authn })) return;
     if (await reasoningSettingsRoutes(req, res, { path: p, authn, url })) return;
+    if (await samplingSettingsRoutes(req, res, { path: p, authn, url })) return;
 
     if (await healthRoutes(req, res, { path: p, authn })) return;
 

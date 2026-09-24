@@ -34,12 +34,12 @@ function fixture(t, { models = ['synthetic'], onChat, onUnload, badQ4 = true, ba
       if (opts.signal?.aborted) throw Error('aborted');
       const q = QUALITY.find(q => q.prompt === prompt);
       let text = q ? q.expected : prompt.startsWith('List the whole numbers') ? Array.from({ length: 60 }, (_, i) => i + 1).join(', ') : 'Synthetic answer';
-      if (q && (rejectAll || b.model === rejectModel || (badF16 && o['cache-type-k'] === 'f16') || (badQ4 && o['cache-type-k'] === 'q4_0'))) text = 'wrong';
+      if (q && (rejectAll || b.model === rejectModel || (badF16 && o['cache-type-k'] === 'f16') || (badQ4 && ['q5_0', 'q5_1', 'q4_0'].includes(o['cache-type-k'])))) text = 'wrong';
       if (badBatch && q && o['ubatch-size']) text = 'wrong';
       if (failFinal && q && manager.autotune.status().body.job?.phase === 'Verifying saved profile') text = 'wrong';
       const spec = o['spec-type'], draft = spec === 'ngram-simple' || spec === 'draft-mtp' && !noHead;
       const speed = spec === 'draft-mtp' && !noHead ? o['spec-draft-n-max'] === '8' ? 50 : 36 : spec === 'ngram-simple' ? 26 : 20;
-      return { ok: true, body: { choices: [{ message: { content: text } }], timings: { predicted_per_second: speed * (o['cache-type-k'] === 'q4_0' ? 2 : o['cache-type-k'] === 'q8_0' ? 1.2 : 1),
+      return { ok: true, body: { choices: [{ message: { content: text } }], timings: { predicted_per_second: speed * (['q5_0', 'q5_1', 'q4_0'].includes(o['cache-type-k']) ? 2 : o['cache-type-k'] === 'q8_0' ? 1.2 : 1),
         prompt_per_second: o['ubatch-size'] === '1024' ? 800 : 500, draft_n: draft ? 100 : 0, draft_n_accepted: draft ? 65 : 0 } } };
     }
     return { ok: true, body: {} };
@@ -78,7 +78,9 @@ test('ordered script commits KV, context, drafting and batch with measured evide
   assert.equal(item.result.context, 16384); assert.equal(item.result.acceptance, 65);
   assert.equal(item.result.generation, 60);
   assert.equal(item.result.ubatch, 1024);
-  assert.equal(phase(item, 'kv').steps.find(s => s.id === 'q4_0').status, 'failed');
+  assert.equal(phase(item, 'kv').steps.find(s => s.id === 'q5_0').status, 'failed');
+  assert.equal(phase(item, 'kv').steps.find(s => s.id === 'q5_1').status, 'failed');
+  assert.deepEqual(phase(item, 'kv').steps.map(s => s.id), ['f16', 'q8_0', 'q5_1', 'q5_0']);
   assert.equal(phase(item, 'context').value.context, 16384);
   assert.equal(phase(item, 'drafting').value.spec, 'mtp-deep');
   assert.equal(phase(item, 'batch').value.promptPerSecond, 800);
@@ -417,4 +419,32 @@ test('quality diagnostics identify an upstream error and truncated response with
     { id: 'reasoning', passed: true },
   ]);
   assert.doesNotMatch(JSON.stringify(result), /AX|503 response body/);
+});
+
+test('KV phase never offers q4_0 by default and picks a Q5-or-higher profile even when q4 would be fastest (issue #190)', async t => {
+  const f = fixture(t); // badQ4 defaults true: q5_0/q5_1/q4_0 all fail quality in this fixture
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager), item = j.models[0];
+  assert.equal(j.status, 'passed', j.error);
+  assert.deepEqual(phase(item, 'kv').steps.map(s => s.id), ['f16', 'q8_0', 'q5_1', 'q5_0']);
+  assert.ok(!phase(item, 'kv').steps.some(s => s.id === 'q4_0'), 'q4_0 must not be a candidate by default');
+  assert.equal(item.result.kv, 'q8_0');
+});
+
+test('KV floor override env var adds q4_0 as a last-resort candidate, still below f16/q8_0/q5', async t => {
+  const prior = process.env.NOEVIA_AUTOTUNE_ALLOW_BELOW_Q5_KV;
+  process.env.NOEVIA_AUTOTUNE_ALLOW_BELOW_Q5_KV = '1';
+  t.after(() => { if (prior === undefined) delete process.env.NOEVIA_AUTOTUNE_ALLOW_BELOW_Q5_KV; else process.env.NOEVIA_AUTOTUNE_ALLOW_BELOW_Q5_KV = prior; });
+  const f = fixture(t, { badF16: true });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager), item = j.models[0];
+  assert.deepEqual(phase(item, 'kv').steps.map(s => s.id), ['f16', 'q8_0', 'q5_1', 'q5_0', 'q4_0']);
+});
+
+test('KV floor override env var is off by default (no override, no q4_0 candidate)', async t => {
+  delete process.env.NOEVIA_AUTOTUNE_ALLOW_BELOW_Q5_KV;
+  const f = fixture(t);
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager), item = j.models[0];
+  assert.ok(!phase(item, 'kv').steps.some(s => s.id === 'q4_0'));
 });
