@@ -13,7 +13,16 @@
 // unmatched method falls through as it did inline.
 
 const PASS = Symbol('unhandled');
-const { isSystemModel, SYSTEM_MODEL_DELETE_REASON } = require('../model-system.cjs');
+const { isSystemModel, modelPathFromArgs, SYSTEM_MODEL_DELETE_REASON } = require('../model-system.cjs');
+
+// A client sees e.message only when it was written for people (publicMessage, or a 4xx status).
+// Everything else is logged here and replaced by a fixed sentence.
+function clientMessage(e, fallback) {
+  if (e?.publicMessage) return String(e.publicMessage);
+  if (Number.isInteger(e?.status) && e.status < 500 && e.message) return e.message;
+  console.error('[models]', e?.stack || e);
+  return fallback;
+}
 
 /**
  * @param {object} deps
@@ -129,8 +138,15 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
       if(method==='POST'&&rest==='models/delete'){
         let payload; try{payload=JSON.parse(body||'{}');}catch{payload={};}
         const keys=Array.isArray(payload.models)?payload.models:[];
-        const scanned=modelScanCache.get('models')?.body?.models;
-        if(keys.length&&Array.isArray(scanned)){
+        let scanned=modelScanCache.get('models')?.body?.models;
+        // An empty cache (cold start, or any write just cleared it) must not skip the guard: scan first.
+        if(keys.length&&!Array.isArray(scanned)){
+          const fresh=await fetchJson(`${env.MODEL_LOADER_URL.replace(/\/+$/,'')}/api/v1/models`,{method:'GET',headers:{'Content-Type':'application/json',...(env.MODEL_LOADER_TOKEN?{'X-Model-Loader-Token':env.MODEL_LOADER_TOKEN}:{})}},60*1000).catch(()=>null);
+          scanned=fresh?.ok&&fresh.body&&typeof fresh.body==='object'?fresh.body.models:undefined;
+          if(!Array.isArray(scanned))return json(res,409,{error:'Could not confirm these files are not system models. Refresh the model list and try again.'});
+          modelScanCache.set('models',{at:Date.now(),body:fresh.body});
+        }
+        if(keys.length){
           const blocked=keys.some(key=>{const entry=scanned.find(f=>f.key===key);return entry&&(isSystemModel(entry.modelId)||(entry.sections||[]).some(s=>isSystemModel(s)));});
           if(blocked)return json(res,400,{error:SYSTEM_MODEL_DELETE_REASON});
         }
@@ -157,7 +173,7 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
       if(req.method!=='POST')return json(res,405,{error:'Method not allowed'});
       if(!modelManager.reloadPresets)return json(res,404,{error:'This engine does not use a preset file'});
       try { const result=await modelManager.reloadPresets({unload:(await readJson(req))?.unload===true}); return json(res,result.status,result.body); }
-      catch(e){ return json(res,e.status||500,{error:e.status===409?'Requests are in progress. Try again when chats finish.':e.message}); }
+      catch(e){ return json(res,e.status||500,{error:e.status===409?'Requests are in progress. Try again when chats finish.':clientMessage(e,'Could not reload model profiles.')}); }
     }
 
     if (p === '/api/models/evidence' && req.method === 'GET') {
@@ -244,7 +260,7 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
       try {
         return json(res, 200, await modelsInstalled());
       } catch (err) {
-        return json(res, 502, { error: String(err.message || err) });
+        return json(res, 502, { error: clientMessage(err, 'Could not list installed models.') });
       }
     }
 
@@ -288,6 +304,13 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
       if (!body.name) return json(res, 400, { error: 'name required' });
       if (isSystemModel(body.name)) return json(res, 400, { error: SYSTEM_MODEL_DELETE_REASON });
       if (!modelManager.enabled) return json(res, 404, { error: 'model management is disabled' });
+      // A neutral id can still point at Laya's weights: check the router's --model path as well.
+      if (modelManager.kind === 'llamacpp' && typeof modelManager.request === 'function') {
+        const listing = await modelManager.request('/models').catch(() => null);
+        if (!listing?.ok || !Array.isArray(listing.body?.data)) return json(res, 409, { error: 'Could not confirm this is not a system model. Try again.' });
+        const row = listing.body.data.find(m => m.id === body.name);
+        if (row && isSystemModel(row.id, modelPathFromArgs(row.status?.args || []))) return json(res, 400, { error: SYSTEM_MODEL_DELETE_REASON });
+      }
       const r = await modelManager.deleteModel(body.name);
       return json(res, r.ok ? 200 : 502, r.ok ? { ok: true } : { error: `delete failed: ${r.status}` });
     }

@@ -42,6 +42,16 @@ function newModel(model) {
   })) };
 }
 
+// Messages written for people carry publicMessage; anything else (fs, network, parser detail)
+// is logged and replaced by a fixed sentence before it reaches the client.
+const publicFail = message => Object.assign(Error(message), { publicMessage: message });
+function clientMessage(e, fallback) {
+  if (e?.publicMessage) return String(e.publicMessage);
+  if (Number.isInteger(e?.status) && e.status < 500 && e.message) return e.message;
+  console.error('[autotune]', e?.stack || e);
+  return fallback;
+}
+
 function createFullAutotuner({ request, rawModels, presets, maintenance, applyUnlocked, identityFor,
   contextFactory, stateFile, now = Date.now, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
   betweenModelsMs = 1000, idleTimeoutMs = 300000,
@@ -58,13 +68,13 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
   const status = model => ({ ok: true, status: 200, body: { job: publicJob(state.job), history: model ? state.history[model] || [] : [] } });
   async function signature(model, suppliedIdentity) {
     const identity = suppliedIdentity || await identityFor(model);
-    if (!identity) throw Error('Model identity could not be read.');
+    if (!identity) throw publicFail('Model identity could not be read.');
     const profile = presets.get(model);
     return hash({ version: VERSION, identity, options: sorted({ ...profile.defaults, ...profile.options }) });
   }
   async function candidates() {
     const r = await rawModels();
-    if (!r.ok || !Array.isArray(r.body?.data)) throw Error('The model server is not responding.');
+    if (!r.ok || !Array.isArray(r.body?.data)) throw publicFail('The model server is not responding.');
     const models = [], skipped = [];
     for (const row of r.body.data) {
       const profile = presets.get(row.id), args = row.status?.args || [];
@@ -81,7 +91,7 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
     }
     return { models, skipped };
   }
-  async function untuned() { try { return { ok: true, status: 200, body: await candidates() }; } catch (e) { return { ok: false, status: 502, body: { error: e.message } }; } }
+  async function untuned() { try { return { ok: true, status: 200, body: await candidates() }; } catch (e) { return { ok: false, status: 502, body: { error: clientMessage(e, 'Could not list untuned models.') } }; } }
   async function unloadAll({ restoring = false } = {}) {
     if (!restoring) check();
     const r = await rawModels();
@@ -441,7 +451,7 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
         queueProgress: { done: 0, total: models.length } };
       state.job = j; save(); completion = run(j); completion.catch(() => {});
       return { ok: true, status: 202, body: publicJob(j) };
-    } catch (e) { return { ok: false, status: 409, body: { error: e.message } }; }
+    } catch (e) { return { ok: false, status: 409, body: { error: clientMessage(e, 'Auto-tune could not start.') } }; }
     finally { starting = false; }
   }
   function cancel() {
@@ -496,11 +506,17 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
     // A job persisted by a pre-patch build may still list a system routing model (e.g. Laya) in
     // its queue. Never resume tuning it — drop it from the queue and record why, same as a fresh
     // scan would have. If nothing tunable remains, the job is done rather than resumable.
-    const systemItems = j.models.filter(item => isSystemModel(item.model));
+    // The router's --model path counts too: a neutral id can still point at Laya's weights.
+    let rows;
+    try { rows = await rawModels(); } catch { rows = null; }
+    if (!rows?.ok || !Array.isArray(rows.body?.data)) return { ok: false, status: 409, body: { error: 'The model server is not responding.' } };
+    const pathOf = id => modelPathFromArgs(rows.body.data.find(row => row.id === id)?.status?.args || []);
+    const isSystem = id => isSystemModel(id, pathOf(id));
+    const systemItems = j.models.filter(item => isSystem(item.model));
     if (systemItems.length) {
-      j.models = j.models.filter(item => !isSystemModel(item.model));
+      j.models = j.models.filter(item => !isSystem(item.model));
       j.skipped = [...(j.skipped || []), ...systemItems.map(item => ({ model: item.model, reason: SYSTEM_MODEL_REASON }))];
-      if (j.model && isSystemModel(j.model)) j.model = j.models[0]?.model || j.model;
+      if (j.model && isSystem(j.model)) j.model = j.models[0]?.model || j.model;
       if (!j.models.length) {
         j.status = 'passed'; j.phase = 'Done'; j.finishedAt = now(); j.error = undefined;
         save();
@@ -510,13 +526,11 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
     }
     starting = true;
     try {
-      const rows = await rawModels();
-      if (!rows.ok || !Array.isArray(rows.body?.data)) throw Error('The model server is not responding.');
       for (const item of j.models.filter(m => m.status !== 'passed')) {
-        if (!rows.body.data.some(row => row.id === item.model) || !presets.get(item.model).exists) throw Error('A queued model is no longer configured.');
+        if (!rows.body.data.some(row => row.id === item.model) || !presets.get(item.model).exists) throw publicFail('A queued model is no longer configured.');
         const identity = await identityFor(item.model);
-        if (!identity) throw Error('A queued model identity could not be read.');
-        if (item._identity && item._identity !== hash({ ...identity, profile: undefined })) throw Error('A queued model changed since tuning began.');
+        if (!identity) throw publicFail('A queued model identity could not be read.');
+        if (item._identity && item._identity !== hash({ ...identity, profile: undefined })) throw publicFail('A queued model changed since tuning began.');
       }
       cancelled = false; j.status = 'running'; j.error = undefined; j.finishedAt = undefined;
       for (const item of j.models) if (item.status !== 'passed') {
@@ -528,7 +542,7 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
       }
       save(); completion = run(j); completion.catch(() => {});
       return { ok: true, status: 202, body: publicJob(j) };
-    } catch (e) { return { ok: false, status: 409, body: { error: e.message } }; }
+    } catch (e) { return { ok: false, status: 409, body: { error: clientMessage(e, 'Auto-tune could not resume.') } }; }
     finally { starting = false; }
   }
   return { start, resume, cancel, status, untuned, recover, completion: () => completion };
