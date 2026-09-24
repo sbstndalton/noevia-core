@@ -5,7 +5,26 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
-const { json, unauthorized, fetchJson, readBody, readJson, authResult } = require('./http.cjs');
+const { json, unauthorized, fetchJson, readBody, readJson, authResult, DEFAULT_MAX_RESPONSE_BYTES } = require('./http.cjs');
+
+// A minimal streaming Response.body stand-in: a web ReadableStream-like object exposing
+// getReader().read() the same way Node's fetch() Response.body does.
+function streamingBody(chunks) {
+  let i = 0;
+  return {
+    getReader() {
+      return {
+        async read() {
+          if (i >= chunks.length) return { done: true, value: undefined };
+          const value = chunks[i++];
+          return { done: false, value };
+        },
+        releaseLock() {},
+        async cancel() { i = chunks.length; },
+      };
+    },
+  };
+}
 
 function fakeRes() {
   const res = { head: null, body: null, writeHead(code, headers) { res.head = { code, headers }; }, end(body) { res.body = body; } };
@@ -57,6 +76,68 @@ test('fetchJson parses JSON, keeps text otherwise, refuses redirects and reports
     assert.ok(seen[0].init.signal instanceof AbortSignal);
     assert.deepEqual(await fetchJson('http://x/text', {}, 1000), { ok: false, status: 502, body: 'bad gateway' });
   } finally { globalThis.fetch = original; }
+});
+
+test('fetchJson caps an oversized response body without buffering it all, and honours an override', async () => {
+  const original = globalThis.fetch;
+  let cancelled = false;
+  globalThis.fetch = async (url) => {
+    // 3 chunks of 4 MB each: over the 8 MB default cap, well under a naive in-memory read.
+    const chunk = Buffer.alloc(4 * 1024 * 1024, 'a');
+    const body = streamingBody([chunk, chunk, chunk]);
+    const realCancel = body.getReader().cancel;
+    return {
+      ok: true,
+      status: 200,
+      body: {
+        getReader() {
+          const reader = {
+            i: 0,
+            async read() {
+              if (this.i >= 3) return { done: true, value: undefined };
+              this.i++;
+              return { done: false, value: chunk };
+            },
+            releaseLock() {},
+            async cancel() { cancelled = true; this.i = 3; },
+          };
+          return reader;
+        },
+      },
+      text: async () => chunk.toString(),
+    };
+  };
+  try {
+    const result = await fetchJson('http://x/huge', {}, 1000);
+    assert.deepEqual(result, { ok: false, status: 200, error: 'response too large' });
+    assert.equal(cancelled, true);
+
+    // A caller-supplied override raises (or could lower) the cap.
+    globalThis.fetch = async () => ({
+      ok: true,
+      status: 200,
+      body: streamingBody([Buffer.alloc(4 * 1024 * 1024, 'b')]),
+      text: async () => 'unused',
+    });
+    const small = await fetchJson('http://x/ok', {}, 1000, 16 * 1024 * 1024);
+    assert.equal(small.ok, true);
+    assert.equal(small.body.length, 4 * 1024 * 1024);
+  } finally { globalThis.fetch = original; }
+});
+
+test('fetchJson caps a stub Response without a streaming body (test doubles) too', async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = async () => ({ ok: true, status: 200, text: async () => 'x'.repeat(20) });
+  try {
+    const result = await fetchJson('http://x/huge-stub', {}, 1000, 10);
+    assert.deepEqual(result, { ok: false, status: 200, error: 'response too large' });
+    const ok = await fetchJson('http://x/small-stub', {}, 1000, 100);
+    assert.equal(ok.body, 'x'.repeat(20));
+  } finally { globalThis.fetch = original; }
+});
+
+test('fetchJson default cap constant is exported and is 8 MB', () => {
+  assert.equal(DEFAULT_MAX_RESPONSE_BYTES, 8 * 1024 * 1024);
 });
 
 test('fetchJson aborts on its timeout and on the caller\'s signal', async () => {

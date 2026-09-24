@@ -19,7 +19,41 @@ function unauthorized(res) {
   res.end(JSON.stringify({ error: 'unauthorized' }));
 }
 
-async function fetchJson(url, opts, timeoutMs) {
+// Providers are user-configured base URLs (routes/providers.cjs, auto-router.cjs) and the
+// Hugging Face variants lookup can point anywhere, so a misbehaving or malicious endpoint
+// must not be able to make us buffer an unbounded response body into memory.
+const DEFAULT_MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+
+// Reads a fetch Response body with a byte cap, streaming it so an oversized body never
+// gets fully buffered. Falls back to res.text() for stub Response objects (as used in
+// tests) that don't expose a streaming .body; those are still cap-checked after the fact.
+async function _readCappedText(res, limit) {
+  if (res.body && typeof res.body.getReader === 'function') {
+    const reader = res.body.getReader();
+    let received = 0;
+    const chunks = [];
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        received += value.length;
+        if (received > limit) {
+          reader.cancel().catch(() => {});
+          return { overflow: true, text: null };
+        }
+        chunks.push(value);
+      }
+    } finally {
+      reader.releaseLock?.();
+    }
+    return { overflow: false, text: Buffer.concat(chunks.map((c) => Buffer.from(c))).toString('utf8') };
+  }
+  const text = await res.text();
+  if (Buffer.byteLength(text, 'utf8') > limit) return { overflow: true, text: null };
+  return { overflow: false, text };
+}
+
+async function fetchJson(url, opts, timeoutMs, maxResponseBytes) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs || 15000);
   // Honor a caller-supplied signal (e.g. client disconnect) in addition to the timeout.
@@ -29,7 +63,11 @@ async function fetchJson(url, opts, timeoutMs) {
   else external?.addEventListener('abort', onAbort, { once: true });
   try {
     const res = await fetch(url, { ...opts, redirect: 'error', signal: ctrl.signal });
-    const text = await res.text();
+    const limit = maxResponseBytes || (opts && opts.maxResponseBytes) || DEFAULT_MAX_RESPONSE_BYTES;
+    const { overflow, text } = await _readCappedText(res, limit);
+    if (overflow) {
+      return { ok: false, status: res.status, error: 'response too large' };
+    }
     let body = null;
     try {
       body = JSON.parse(text);
@@ -81,4 +119,4 @@ function authResult(res, result) {
   return json(res, result.status || 200, result.body ?? result);
 }
 
-module.exports = { json, unauthorized, fetchJson, readBody, readJson, authResult, isJsonObject, errorResponse };
+module.exports = { json, unauthorized, fetchJson, readBody, readJson, authResult, isJsonObject, errorResponse, DEFAULT_MAX_RESPONSE_BYTES };
