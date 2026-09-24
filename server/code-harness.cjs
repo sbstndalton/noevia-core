@@ -267,8 +267,9 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
         return pickOption(options, 'allow_once');
       }
       // A standing "allow for this task" covers only the same class, and never a delete or a
-      // push: the two actions whose damage a human should see every single time.
-      const standing = blanket.get(classified.action);
+      // push: the two actions whose damage a human should see every single time. A command whose
+      // real effect is built at run time (`sh -c`, `eval`, `xargs`, `$VAR`) never rides one either.
+      const standing = classified.standable === false ? undefined : blanket.get(classified.action);
       if (standing === 'allow') { counts.allowed++; return pickOption(options, 'allow_once'); }
       if (standing === 'deny') { counts.refused++; return pickOption(options, 'reject_once'); }
 
@@ -285,7 +286,7 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
       record({ event: 'code.decided', action: classified.action, decision: answer });
 
       if (answer === 'approve' || answer === 'approve_all') {
-        if (answer === 'approve_all' && canStand(classified.action)) blanket.set(classified.action, 'allow');
+        if (answer === 'approve_all' && canStand(classified.action) && classified.standable !== false) blanket.set(classified.action, 'allow');
         counts.allowed++;
         return pickOption(options, 'allow_once');
       }

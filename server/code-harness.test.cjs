@@ -163,6 +163,25 @@ test('"allow for this task" covers the same class only, and never a delete or a 
     [ACTIONS.EDIT, ACTIONS.DELETE, ACTIONS.DELETE, ACTIONS.GIT_PUSH, ACTIONS.GIT_PUSH]);
 });
 
+test('a standing execute allow does not cover hidden pushes, deletes or run-time commands', async () => {
+  const cmd = (command) => ({ toolCall: { kind: 'execute', title: 'bash', rawInput: { command } }, options: OPTIONS });
+  const r = await run({
+    capabilities: [ACTIONS.EXECUTE, ACTIONS.DELETE, ACTIONS.GIT_PUSH],
+    answers: ['approve_all', 'deny', 'deny', 'deny', 'approve_all', 'deny'],
+    script: async (h) => {
+      await h.requestPermission(cmd('make build'));                 // asks, stands for execute
+      await h.requestPermission(cmd('git -C . push origin HEAD:main')); // a push: asks
+      await h.requestPermission(cmd("'rm' -rf x"));                 // a delete: asks
+      await h.requestPermission(cmd("bash -c 'rm -rf .'"));         // a delete: asks
+      await h.requestPermission(cmd("bash -c 'make'"));             // run-time string: asks, cannot stand
+      await h.requestPermission(cmd("bash -c 'make'"));             // asks again
+      await h.requestPermission(cmd('make test'));                  // covered by the first standing allow
+    },
+  });
+  assert.deepEqual(r.asked.map((a) => a.action), [ACTIONS.EXECUTE, ACTIONS.GIT_PUSH, ACTIONS.DELETE, ACTIONS.DELETE,
+    ACTIONS.EXECUTE, ACTIONS.EXECUTE]);
+});
+
 test('a standing allow does not leak into another task', async () => {
   const first = await run({ capabilities: [ACTIONS.EDIT], answers: ['approve_all'],
     script: async (h, cwd) => { await h.requestPermission(editCall(path.join(cwd, 'a.txt'))); } });

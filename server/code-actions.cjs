@@ -26,8 +26,10 @@ const ACTIONS = Object.freeze({
 });
 
 // Most consequential first: a compound command takes the worst class among its parts.
+// EXECUTE ranks above NETWORK: `curl … | sh` runs code, and must never be read as "just a fetch"
+// that a domain allow-list can wave through.
 const SEVERITY = [ACTIONS.EXTERNAL, ACTIONS.GIT_PUSH, ACTIONS.DELETE, ACTIONS.BROWSER, ACTIONS.INSTALL,
-  ACTIONS.NETWORK, ACTIONS.EXECUTE, ACTIONS.EDIT, ACTIONS.READ, ACTIONS.NONE];
+  ACTIONS.EXECUTE, ACTIONS.NETWORK, ACTIONS.EDIT, ACTIONS.READ, ACTIONS.NONE];
 const rank = (action) => { const i = SEVERITY.indexOf(action); return i === -1 ? 0 : i; };
 const worst = (a, b) => (rank(a) <= rank(b) ? a : b);
 
@@ -61,15 +63,147 @@ const GIT_SUBCOMMANDS = new Map(Object.entries({
   remote: ACTIONS.NETWORK, submodule: ACTIONS.NETWORK, 'ls-remote': ACTIONS.NETWORK,
   clean: ACTIONS.DELETE,
 }));
-// Wrappers that only prefix a real command.
-const WRAPPERS = new Set(['sudo', 'doas', 'env', 'nohup', 'setsid', 'time', 'nice', 'command', 'exec', 'xargs']);
-const SEPARATORS = /\|\||&&|;|\||\n/;
+// Wrappers that only prefix a real command. The value lists the options that take an argument,
+// so `nice -n 10 rm x` reaches `rm`, not `10`.
+const WRAPPERS = new Map(Object.entries({
+  sudo: ['-u', '-g', '-C', '-D', '-h', '-p', '-r', '-t', '-U', '-T'], doas: ['-u', '-C'],
+  env: ['-u', '-C', '-S', '--unset', '--chdir', '--split-string'], nohup: [], setsid: [], time: ['-f', '-o'],
+  nice: ['-n', '--adjustment'], ionice: ['-c', '-n', '-p'], command: [], builtin: [], exec: ['-a'],
+  stdbuf: ['-i', '-o', '-e'], timeout: ['-s', '-k', '--signal', '--kill-after'], chronic: [], unbuffer: [],
+  xargs: ['-I', '-i', '-n', '-P', '-L', '-l', '-d', '-s', '-E', '-e', '-a', '--arg-file', '--delimiter', '--max-args', '--max-procs', '--replace'],
+}));
+// Wrappers whose inner command is built at run time (stdin, a string): never a standing approval.
+const DYNAMIC_WRAPPERS = new Set(['xargs']);
+const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'mksh', 'ash', 'fish', 'busybox']);
+const INTERPRETERS = new Set(['python', 'python2', 'python3', 'node', 'nodejs', 'perl', 'ruby', 'php', 'deno', 'bun', 'lua', 'osascript', 'pwsh', 'powershell']);
+// git options that come before the subcommand, and whether they take a separate argument.
+const GIT_GLOBAL_WITH_ARG = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix', '--config-env', '--list-cmds', '--attr-source']);
+const MAX_DEPTH = 6;
 
-/** Split off `FOO=bar` prefixes and wrappers to reach the command that actually runs. */
-function head(words) {
+/**
+ * A small POSIX-shell reader: enough to see what a command line runs, never enough to run it.
+ * Returns the simple commands (unquoted words), the text of every `$(…)`/backtick/process
+ * substitution, the targets of output redirects, and whether anything beyond one plain command
+ * was present (`compound`). Anything it cannot read closes (`broken`).
+ */
+function lex(text) {
+  const segments = [];
+  const nested = [];
+  const redirects = [];
+  let words = [];
+  let word = null; // null = no word in progress; '' = an (empty) quoted word
+  let compound = false;
+  let broken = false;
+  let dynamic = false; // `$VAR` in command position etc.
+  let pendingRedirect = false;
+  const endWord = () => {
+    if (word === null) return;
+    if (pendingRedirect) { redirects.push(word); pendingRedirect = false; } else words.push(word);
+    word = null;
+  };
+  const endSegment = () => { endWord(); if (words.length) segments.push(words); words = []; };
+  const readBalanced = (i) => { // text[i] is just past `(`; returns [inner, index after `)`]
+    let depth = 1; let j = i; let q = null;
+    for (; j < text.length; j++) {
+      const c = text[j];
+      if (q) { if (c === q) q = null; else if (c === '\\' && q === '"') j++; continue; }
+      if (c === '\\') { j++; continue; }
+      if (c === "'" || c === '"') { q = c; continue; }
+      if (c === '(') depth++;
+      else if (c === ')' && --depth === 0) return [text.slice(i, j), j + 1];
+    }
+    broken = true; return [text.slice(i), text.length];
+  };
+  const readBacktick = (i) => {
+    const end = text.indexOf('`', i);
+    if (end === -1) { broken = true; return [text.slice(i), text.length]; }
+    return [text.slice(i, end), end + 1];
+  };
   let i = 0;
-  while (i < words.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i]) || WRAPPERS.has(words[i]))) i++;
-  return words.slice(i);
+  while (i < text.length) {
+    const c = text[i];
+    if (c === '\\') {
+      if (text[i + 1] === '\n') { i += 2; continue; }
+      word = (word || '') + (text[i + 1] || ''); i += 2; continue;
+    }
+    if (c === "'") {
+      const end = text.indexOf("'", i + 1);
+      if (end === -1) { broken = true; word = (word || '') + text.slice(i + 1); break; }
+      word = (word || '') + text.slice(i + 1, end); i = end + 1; continue;
+    }
+    if (c === '"') {
+      let j = i + 1; let buf = '';
+      for (; j < text.length && text[j] !== '"'; j++) {
+        if (text[j] === '\\' && j + 1 < text.length) { buf += text[++j]; continue; }
+        if (text[j] === '`') { compound = true; const [inner, next] = readBacktick(j + 1); nested.push(inner); j = next - 1; continue; }
+        if (text[j] === '$' && text[j + 1] === '(') { compound = true; const [inner, next] = readBalanced(j + 2); nested.push(inner); j = next - 1; continue; }
+        buf += text[j];
+      }
+      if (j >= text.length) broken = true;
+      word = (word || '') + buf; i = j + 1; continue;
+    }
+    if (c === '`') { compound = true; const [inner, next] = readBacktick(i + 1); nested.push(inner); word = (word || '') + '$SUB'; i = next; continue; }
+    if (c === '$' && text[i + 1] === '(') { compound = true; const [inner, next] = readBalanced(i + 2); nested.push(inner); word = (word || '') + '$SUB'; i = next; continue; }
+    if ((c === '<' || c === '>') && text[i + 1] === '(') { // process substitution
+      compound = true; endWord(); const [inner, next] = readBalanced(i + 2); nested.push(inner); i = next; continue;
+    }
+    if (c === '>' || c === '<' || (c === '&' && text[i + 1] === '>')) {
+      compound = true;
+      // `2>` / `2>&1`: the fd number belongs to the redirect, not to the command.
+      if (word !== null && /^\d+$/.test(word)) word = null; else endWord();
+      let j = i + (c === '&' ? 1 : 0);
+      const output = text[j] === '>';
+      j++;
+      if (text[j] === '>' || text[j] === '|') j++;
+      if (text[j] === '<' && c === '<') { j++; if (text[j] === '<') j++; } // heredoc / herestring
+      if (text[j] === '&') { j++; while (/[\d-]/.test(text[j] || '')) j++; i = j; continue; } // dup an fd
+      while (text[j] === ' ' || text[j] === '\t') j++;
+      if (output) pendingRedirect = true; else pendingRedirect = false;
+      if (!output) { // input: read and discard the source word
+        let k = j; while (k < text.length && !/[\s;&|<>()]/.test(text[k])) k++; i = k; continue;
+      }
+      i = j; continue;
+    }
+    if (c === ';' || c === '|' || c === '&' || c === '\n' || c === '\r') {
+      compound = true; endSegment(); i++; continue;
+    }
+    if (c === '(' || c === ')' || ((c === '{' || c === '}') && word === null && /[\s;]|$/.test(text[i + 1] || ''))) {
+      compound = true; endSegment(); i++; continue;
+    }
+    if (c === ' ' || c === '\t') { endWord(); i++; continue; }
+    if (c === '$' && word === null && words.length === 0) dynamic = true;
+    word = (word || '') + c; i++;
+  }
+  endSegment();
+  if (pendingRedirect) broken = true;
+  return { segments, nested, redirects, compound, broken, dynamic };
+}
+
+/**
+ * Everything a command line does: the worst class, every class present (so capability checks see
+ * the `sh` behind a `curl |`), whether it is one plain command, and whether a standing approval
+ * may ever cover it.
+ * @returns {{action: string, actions: string[], simple: boolean, standable: boolean}}
+ */
+function analyzeCommand(command, depth = 0) {
+  const text = String(command || '').trim();
+  if (!text) return { action: ACTIONS.EXECUTE, actions: [ACTIONS.EXECUTE], simple: false, standable: false };
+  if (depth > MAX_DEPTH) return { action: ACTIONS.EXECUTE, actions: [ACTIONS.EXECUTE], simple: false, standable: false };
+  const lexed = lex(text);
+  const found = new Set();
+  let standable = !lexed.broken && !lexed.dynamic;
+  const add = (r) => { for (const a of r.actions) found.add(a); if (!r.standable) standable = false; };
+  for (const words of lexed.segments) add(classifyWords(words, depth));
+  for (const inner of lexed.nested) add(analyzeCommand(inner, depth + 1));
+  // Writing a file through `>` is an edit, whatever the command was.
+  if (lexed.redirects.some((t) => !/^\/dev\/(null|stdout|stderr|fd\/\d+)$/.test(t))) found.add(ACTIONS.EDIT);
+  if (lexed.broken || lexed.dynamic) found.add(ACTIONS.EXECUTE);
+  if (!found.size) found.add(ACTIONS.EXECUTE);
+  let action = ACTIONS.NONE;
+  for (const a of found) action = worst(action, a);
+  if (action === ACTIONS.NONE) action = ACTIONS.EXECUTE;
+  const simple = !lexed.compound && !lexed.broken && !lexed.dynamic && lexed.segments.length === 1 && found.size === 1;
+  return { action, actions: [...found], simple, standable };
 }
 
 /**
@@ -77,32 +211,95 @@ function head(words) {
  * `echo hi && rm -rf build` is a delete, not an ordinary command.
  * @param {string} command
  */
-function classifyCommand(command) {
-  const text = String(command || '').trim();
-  if (!text) return ACTIONS.EXECUTE; // an empty command we cannot read is not a safe one
-  // Command substitution hides a second command inside the first; read those too.
-  const parts = [...text.split(SEPARATORS), ...(text.match(/\$\(([^)]*)\)/g) || []).map((m) => m.slice(2, -1))];
-  let action = ACTIONS.NONE;
-  for (const part of parts) {
-    const words = head(part.trim().split(/\s+/).filter(Boolean));
-    if (!words.length) continue;
-    action = worst(action, classifySingle(words));
+function classifyCommand(command) { return analyzeCommand(command).action; }
+
+const one = (action, standable = true) => ({ actions: [action], standable });
+
+/** Classify one simple command (already unquoted words). */
+function classifyWords(input, depth) {
+  let words = input.slice();
+  let standable = true;
+  // Peel `FOO=bar` prefixes and wrappers until the command that actually runs.
+  for (;;) {
+    while (words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0])) words = words.slice(1);
+    if (!words.length) return one(ACTIONS.NONE);
+    const name = words[0].split('/').pop();
+    if (!WRAPPERS.has(name)) break;
+    if (DYNAMIC_WRAPPERS.has(name)) standable = false;
+    const withArg = WRAPPERS.get(name);
+    let k = 1;
+    while (k < words.length) {
+      const w = words[k];
+      if (w === '--') { k++; break; }
+      if (name === 'env' && /^[A-Za-z_][A-Za-z0-9_]*=/.test(w)) { k++; continue; }
+      if (!w.startsWith('-') || w === '-') break;
+      if (withArg.includes(w)) k += 2; else k++;
+    }
+    if (name === 'timeout' && k < words.length) k++; // the duration
+    words = words.slice(k);
+    if (!words.length) return one(ACTIONS.EXECUTE, standable);
   }
-  return action === ACTIONS.NONE ? ACTIONS.EXECUTE : action;
+  const name = words[0].split('/').pop();
+  if (!name || name.includes('$')) return one(ACTIONS.EXECUTE, false);
+  const rest = words.slice(1);
+
+  // A shell given a string runs that string: classify the string, and never let it stand.
+  if (SHELLS.has(name) || name === 'eval' || name === 'source' || name === '.') {
+    let inner = null;
+    if (name === 'eval') inner = rest.join(' ');
+    else {
+      const idx = rest.findIndex((w) => /^-[A-Za-z]*c[A-Za-z]*$/.test(w));
+      if (idx !== -1) inner = rest.slice(idx + 1).find((w) => !w.startsWith('-')) ?? '';
+    }
+    if (inner === null) return one(ACTIONS.EXECUTE, false);
+    const r = analyzeCommand(inner, depth + 1);
+    return { actions: r.actions.includes(ACTIONS.EXECUTE) ? r.actions : [...r.actions, ACTIONS.EXECUTE], standable: false };
+  }
+  if (INTERPRETERS.has(name) && rest.some((w) => /^-[A-Za-z]*[ceE]$/.test(w) || w === '--eval' || w === '--command')) {
+    return one(ACTIONS.EXECUTE, false);
+  }
+  if (name === 'find') {
+    const actions = new Set([ACTIONS.EXECUTE]);
+    let own = true;
+    rest.forEach((w, k) => {
+      if (w === '-delete') actions.add(ACTIONS.DELETE);
+      if (['-exec', '-execdir', '-ok', '-okdir'].includes(w)) {
+        own = false;
+        const end = rest.findIndex((x, m) => m > k && (x === ';' || x === '+' || x === '\;'));
+        const r = classifyWords(rest.slice(k + 1, end === -1 ? undefined : end), depth + 1);
+        r.actions.forEach((a) => actions.add(a));
+      }
+    });
+    return { actions: [...actions], standable: own && standable };
+  }
+  if (name === 'git' || name.startsWith('git-')) return one(gitAction(name, rest), standable);
+  const args = rest.filter((w) => !w.startsWith('-'));
+  if (INSTALLERS.has(name)) return one(INSTALLERS.get(name).includes(args[0]) ? ACTIONS.INSTALL : ACTIONS.EXECUTE, standable);
+  if (NETWORK_COMMANDS.has(name)) return one(ACTIONS.NETWORK, standable);
+  if (DELETE_COMMANDS.has(name)) return one(ACTIONS.DELETE, standable);
+  if (BROWSER_COMMANDS.has(name)) return one(ACTIONS.BROWSER, standable);
+  return one(ACTIONS.EXECUTE, standable);
 }
 
-function classifySingle(words) {
-  const name = (words[0] || '').split('/').pop();
-  const args = words.slice(1).filter((w) => !w.startsWith('-'));
-  if (name === 'git') {
-    const sub = args[0];
-    return GIT_SUBCOMMANDS.get(sub) || ACTIONS.EXECUTE;
+function gitAction(name, rest) {
+  if (name !== 'git') return GIT_SUBCOMMANDS.get(name.slice(4)) || ACTIONS.EXECUTE; // `git-push`
+  let k = 0;
+  let aliased = false;
+  while (k < rest.length && rest[k].startsWith('-')) {
+    const w = rest[k];
+    if (w === '--') { k++; break; }
+    if (GIT_GLOBAL_WITH_ARG.has(w)) {
+      if ((w === '-c' || w === '--config-env') && /^alias\./i.test(rest[k + 1] || '')) aliased = true;
+      k += 2; continue;
+    }
+    if (/^-c.+/.test(w) && /^-calias\./i.test(w)) aliased = true;
+    k++; // `--git-dir=x`, `-p`, `--no-pager`, `--bare`, `-Cpath` …
   }
-  if (INSTALLERS.has(name)) return INSTALLERS.get(name).includes(args[0]) ? ACTIONS.INSTALL : ACTIONS.EXECUTE;
-  if (NETWORK_COMMANDS.has(name)) return ACTIONS.NETWORK;
-  if (DELETE_COMMANDS.has(name)) return ACTIONS.DELETE;
-  if (BROWSER_COMMANDS.has(name)) return ACTIONS.BROWSER;
-  return ACTIONS.EXECUTE;
+  // An alias defined on the command line can be anything, including a push.
+  if (aliased) return ACTIONS.GIT_PUSH;
+  const sub = rest[k];
+  if (sub === 'send-pack' || sub === 'http-push') return ACTIONS.GIT_PUSH;
+  return GIT_SUBCOMMANDS.get(sub) || ACTIONS.EXECUTE;
 }
 
 /** The command text an ACP agent puts in `rawInput`, whatever key it chose. */
@@ -120,7 +317,8 @@ function commandOf(rawInput) {
 /**
  * Classify one ACP tool call.
  * @param {{kind?: string, title?: string, rawInput?: object, locations?: Array<{path?: string}>}} call
- * @returns {{action: string, approval: 'never'|'always'|'capability', command: string, paths: string[], readable: boolean}}
+ * @returns {{action: string, approval: 'never'|'always'|'capability', command: string, paths: string[], readable: boolean,
+ *            actions: string[], simple: boolean, standable: boolean}}
  */
 function classify(call = {}) {
   const kind = typeof call.kind === 'string' ? call.kind : '';
@@ -128,13 +326,16 @@ function classify(call = {}) {
   let action = Object.prototype.hasOwnProperty.call(KIND_ACTIONS, kind) ? KIND_ACTIONS[kind] : ACTIONS.EXECUTE;
   const command = commandOf(call.rawInput);
   let readable = true;
+  let actions = [action];
+  let simple = true;
+  let standable = true;
   if (action === ACTIONS.EXECUTE) {
-    if (command) action = classifyCommand(command);
+    if (command) ({ action, actions, simple, standable } = analyzeCommand(command));
     else readable = false; // a command we cannot see is a command we cannot vouch for
   }
   const paths = (Array.isArray(call.locations) ? call.locations : [])
     .map((l) => (l && typeof l.path === 'string' ? l.path : null)).filter(Boolean);
-  return { action, approval: approvalFor(action), command, paths, readable };
+  return { action, approval: approvalFor(action), command, paths, readable, actions, simple, standable };
 }
 
 /** `capability` means: allowed without a card only if the job was granted that domain up front. */
@@ -163,18 +364,30 @@ function decide({ classified, capabilities = [], domains = [], inWorkspace = nul
   if ((action === ACTIONS.EDIT || action === ACTIONS.DELETE) && paths.length && inWorkspace === false) {
     return { decision: 'deny', reason: 'The path is outside this task\u2019s workspace.' };
   }
-  if (action !== ACTIONS.NONE && action !== ACTIONS.READ && capabilities.length && !capabilities.includes(action)) {
-    return { decision: 'deny', reason: `This task was not granted ${action.replace(/_/g, ' ')}.` };
+  // Every part of a compound command needs its own grant: `curl … | sh` executes.
+  const all = Array.isArray(classified.actions) && classified.actions.length ? classified.actions : [action];
+  const missing = all.find((a) => a !== ACTIONS.NONE && a !== ACTIONS.READ && capabilities.length && !capabilities.includes(a));
+  if (missing) {
+    return { decision: 'deny', reason: `This task was not granted ${missing.replace(/_/g, ' ')}.` };
   }
   if (approval === 'never') return { decision: 'allow', reason: 'Read-only.' };
   if (approval === 'capability') {
     const host = hostOf(command);
-    if (host && domains.some((d) => host === d || host.endsWith('.' + d))) {
+    // Only ONE plain network command is waved through, and only when every URL it names is on
+    // the list. A pipe, a `;`, a redirect or a substitution always goes to a human.
+    const hosts = hostsOf(command);
+    const listed = (h) => domains.some((d) => h === d || h.endsWith('.' + d));
+    if (classified.simple !== false && hosts.length && hosts.every(listed)) {
       return { decision: 'allow', reason: `${host} is on this task\u2019s allowed list.` };
     }
     return { decision: 'ask', reason: host ? `Network request to ${host}.` : 'Network request.' };
   }
   return { decision: 'ask', reason: readable ? '' : 'The harness did not say what it would run.' };
+}
+
+function hostsOf(command) {
+  return [...String(command || '').matchAll(/https?:\/\/([^\s/'"`)?#]+)/gi)]
+    .map((m) => m[1].split('@').pop().split(':')[0].toLowerCase()).filter(Boolean);
 }
 
 function hostOf(command) {
@@ -206,4 +419,4 @@ function pickOption(options, wanted) {
   return { outcome: 'cancelled' };
 }
 
-module.exports = { ACTIONS, KIND_ACTIONS, classify, classifyCommand, commandOf, approvalFor, worst, decide, pickOption, hostOf };
+module.exports = { ACTIONS, KIND_ACTIONS, classify, classifyCommand, analyzeCommand, commandOf, approvalFor, worst, decide, pickOption, hostOf };

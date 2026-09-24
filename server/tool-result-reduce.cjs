@@ -28,6 +28,32 @@ const DEFAULT_MAX_VALUE_CHARS = 300;
 // Two rows is where a header row starts paying for itself; one row costs more
 // than it saves.
 const MIN_ROWS = 2;
+// The legend names omitted columns so the model can ask for them — but a listing whose rows carry
+// thousands of distinct keys must not turn the legend itself into megabytes.
+const MAX_LEGEND_KEYS = 50;
+// The header row gets at most this share of the budget; the rest is for records.
+const HEADER_SHARE = 0.25;
+
+function listKeys(keys, charBudget) {
+  const shown = [];
+  let length = 0;
+  for (const key of keys.slice(0, MAX_LEGEND_KEYS)) {
+    const k = key.length > 80 ? `${key.slice(0, 80)}…` : key;
+    if (shown.length && length + k.length + 2 > charBudget) break;
+    shown.push(k); length += k.length + 2;
+  }
+  return keys.length > shown.length ? `${shown.join(', ')}, … ${keys.length - shown.length} more` : shown.join(', ');
+}
+
+// Last line of defence: whatever the branch built, the model never gets more than `maxChars`.
+// The trailing note survives the cut so the truncation is never silent.
+function clampText(text, maxChars) {
+  if (text.length <= maxChars) return { text, clamped: false, note: '' };
+  let note = `[truncated: showing the first part of ${text.length} characters to fit. Ask for a narrower query if you need the rest.]`;
+  if (note.length + 1 >= maxChars) note = note.slice(0, Math.max(0, maxChars - 1));
+  const room = Math.max(0, maxChars - note.length - 1);
+  return { text: `${text.slice(0, room)}\n${note}`.slice(0, maxChars), clamped: true, note };
+}
 
 function isPlainObject(v) {
   return v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -134,11 +160,26 @@ function reduceToolResult(result, opts = {}) {
 
   const rows = Array.isArray(parsed) ? parsed : null;
   if (rows && rows.length >= MIN_ROWS && rows.every(isPlainObject)) {
-    const keys = usefulKeys(rows);
-    if (keys.length > 0) {
-      const droppedKeys = new Set(rows.flatMap((r) => Object.keys(r)));
-      for (const k of keys) droppedKeys.delete(k);
-      const legend = `[${rows.length} records, tab-separated, first line is the column names${droppedKeys.size ? `; ${droppedKeys.size} column(s) omitted because they were empty in every record: ${[...droppedKeys].join(', ')}` : ''}]`;
+    const allKeys = usefulKeys(rows);
+    if (allKeys.length > 0) {
+      const droppedKeys = new Set();
+      for (const r of rows) for (const k of Object.keys(r)) droppedKeys.add(k);
+      for (const k of allKeys) droppedKeys.delete(k);
+      // Cap the header: keep leading columns while they fit their share of the budget.
+      const headerBudget = Math.max(1, Math.floor(maxChars * HEADER_SHARE));
+      const keys = [];
+      let headerLength = 0;
+      for (const k of allKeys) {
+        const cost = k.length + (keys.length ? 1 : 0);
+        if (keys.length && headerLength + cost > headerBudget) break;
+        keys.push(k); headerLength += cost;
+      }
+      const cutKeys = allKeys.slice(keys.length);
+      const legendBudget = Math.max(80, Math.floor(maxChars * 0.1));
+      const legend = `[${rows.length} records, tab-separated, first line is the column names`
+        + (droppedKeys.size ? `; ${droppedKeys.size} column(s) omitted because they were empty in every record: ${listKeys([...droppedKeys], legendBudget)}` : '')
+        + (cutKeys.length ? `; ${cutKeys.length} further column(s) not shown to fit: ${listKeys(cutKeys, legendBudget)}` : '')
+        + ']';
       const lines = tabularLines(rows, keys, maxValueChars);
       let body = lines.join('\n');
       let kept = rows.length;
@@ -160,15 +201,16 @@ function reduceToolResult(result, opts = {}) {
       const omitted = rows.length - kept;
       const note = omitted ? noteFor(kept) : legend;
       const head = omitted ? `${legend}\n${note}` : legend;
-      return { text: `${head}\n${body}`, reduced: true, note };
+      const clamped = clampText(`${head}\n${body}`, maxChars);
+      return { text: clamped.text, reduced: true, note: clamped.clamped ? `${note}\n${clamped.note}` : note };
     }
   }
 
   // Structured, but not a uniform array: strip the padding and re-serialise.
   const compacted = JSON.stringify(compactValue(parsed, maxValueChars));
-  if (compacted.length <= maxChars) {
-    const note = `[compacted: empty fields removed and long values shortened; ${text.length} → ${compacted.length} characters.]`;
-    return { text: `${note}\n${compacted}`, reduced: true, note };
+  const compactNote = `[compacted: empty fields removed and long values shortened; ${text.length} → ${compacted.length} characters.]`;
+  if (compactNote.length + 1 + compacted.length <= maxChars) {
+    return { text: `${compactNote}\n${compacted}`, reduced: true, note: compactNote };
   }
   const note = `\n\n[truncated: showing the first ${maxChars} of ${compacted.length} characters after compaction. Ask for a narrower query if you need the rest.]`;
   return { text: compacted.slice(0, maxChars) + note, reduced: true, note: note.trim() };
@@ -192,4 +234,4 @@ function tabulate(rows, opts = {}) {
   return { text: body, note, kept };
 }
 
-module.exports = { reduceToolResult, tabulate, DEFAULT_MAX_CHARS, DEFAULT_MAX_VALUE_CHARS };
+module.exports = { reduceToolResult, tabulate, DEFAULT_MAX_CHARS, DEFAULT_MAX_VALUE_CHARS, MAX_LEGEND_KEYS };

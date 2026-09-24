@@ -154,3 +154,43 @@ test('fitting a long listing is linear and matches a re-render-everything refere
   for (let i = 0; i < 20; i++) reduceToolResult(JSON.stringify(rows), { maxChars: 8000 });
   assert.ok((performance.now() - t0) / 20 < 10, 'well under the old 40-50 ms');
 });
+
+// #145: rows with thousands of distinct keys must not blow the cap through the legend or header.
+test('an 8 MB listing of rows with thousands of distinct keys still fits the cap', () => {
+  const rows = [];
+  let size = 2;
+  for (let r = 0; size < 8 * 1024 * 1024; r++) {
+    const row = {};
+    for (let k = 0; k < 400; k++) row[`key_${r}_${k}_${'x'.repeat(20)}`] = k % 2 ? `value-${r}-${k}` : '';
+    const s = JSON.stringify(row); rows.push(s); size += s.length + 1;
+  }
+  const text = `[${rows.join(',')}]`;
+  assert.ok(text.length >= 8 * 1024 * 1024);
+  for (const maxChars of [DEFAULT_MAX_CHARS, 2000]) {
+    const out = reduceToolResult(text, { maxChars });
+    assert.ok(out.reduced);
+    assert.ok(out.text.length <= maxChars, `${out.text.length} > ${maxChars}`);
+    assert.match(out.text, /more|not shown|truncated/, 'the cut is stated, not silent');
+    for (const line of out.note.split('\n')) assert.ok(out.text.includes(line), 'every note survives the cut');
+  }
+});
+
+test('the omitted-keys legend is capped with a count of the rest', () => {
+  const rows = Array.from({ length: 3 }, (_, i) => {
+    const row = { id: i, name: `n${i}`.repeat(400) };
+    for (let k = 0; k < 500; k++) row[`empty_${k}`] = '';
+    return row;
+  });
+  const out = reduceToolResult(JSON.stringify(rows), { maxChars: 4000 });
+  assert.ok(out.text.length <= 4000);
+  assert.match(out.text, /500 column\(s\) omitted/);
+  assert.match(out.text, /… \d+ more/);
+  assert.ok(!out.text.includes('empty_499'));
+});
+
+test('when even one record overflows, the text is hard-sliced keeping the trailing note', () => {
+  const rows = Array.from({ length: 2 }, (_, i) => ({ id: i, body: 'b'.repeat(1000) }));
+  const out = reduceToolResult(JSON.stringify(rows), { maxChars: 400 });
+  assert.ok(out.text.length <= 400, String(out.text.length));
+  assert.match(out.text, /\[truncated: [^\]]*\]$/);
+});
