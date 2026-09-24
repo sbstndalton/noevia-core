@@ -164,7 +164,7 @@ function createChatHandler({
 
     const sysParts = [];
     const accountSettings = require('./account-instructions.cjs').read(currentWorkspace().dir);
-    const accountPart = require('./account-instructions.cjs').systemPart(accountSettings.text, accountSettings.style);
+    const accountPart = require('./account-instructions.cjs').systemPart(accountSettings); // style, advanced controls and response language
     if (accountPart) sysParts.push(accountPart);
     const accountMemory = require('./account-memory.cjs');
     const memoryPart = accountMemory.systemPart(accountMemory.read(currentWorkspace().dir), project?.memories);

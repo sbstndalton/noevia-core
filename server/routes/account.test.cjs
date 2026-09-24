@@ -45,3 +45,44 @@ test('memory GET/PUT: own account, validated, 401 without sign-in', async () => 
     assert.equal((await fetch(url).then((x) => x.json())).useProjectMemories, false);
   } finally { server.close(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('preferences GET/PUT are per account: one user never reads or writes another', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'acct-prefs-routes-'));
+  const json = (res, status, body) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
+  const readJson = async (req) => { let raw = ''; for await (const c of req) raw += c; return JSON.parse(raw); };
+  let current = 'alice';
+  const routes = createAccountRoutes({ json, readJson, dir: () => path.join(root, current), now: () => 9 });
+  const server = http.createServer((req, res) => { current = req.headers['x-user'] || 'alice'; void routes(req, res, { path: new URL(req.url, 'http://x').pathname, authn: req.headers['x-anon'] ? null : { user: { id: current } } }); });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${server.address().port}/api/account/preferences`;
+  const as = (user, init = {}) => fetch(url, { ...init, headers: { 'x-user': user, ...(init.headers || {}) } });
+  try {
+    assert.equal((await fetch(url, { headers: { 'x-anon': '1' } })).status, 401);
+    let r = await as('alice', { method: 'PUT', body: JSON.stringify({ sendKey: 'mod-enter', notifications: { approvalNeeded: false } }) });
+    assert.equal(r.status, 200);
+    const body = await r.json();
+    assert.equal(body.sendKey, 'mod-enter'); assert.deepEqual(body.options.notificationEvents, ['replyFinished', 'approvalNeeded']);
+    const bob = await as('bob').then((x) => x.json());
+    assert.equal(bob.sendKey, 'enter'); assert.equal(bob.notifications.approvalNeeded, true);
+    assert.equal((await as('bob', { method: 'PUT', body: JSON.stringify({ locale: 'zz' }) })).status, 400);
+    assert.equal((await as('bob', { method: 'DELETE' })).status, 405);
+    assert.equal((await as('alice').then((x) => x.json())).notifications.approvalNeeded, false);
+  } finally { server.close(); fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('instructions PUT carries the advanced style and language through the route', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'acct-instr-routes-'));
+  const json = (res, status, body) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
+  const readJson = async (req) => { let raw = ''; for await (const c of req) raw += c; return JSON.parse(raw); };
+  const routes = createAccountRoutes({ json, readJson, dir: () => dir });
+  const server = http.createServer((req, res) => void routes(req, res, { path: req.url, authn: { user: { id: 'u' } } }));
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${server.address().port}/api/account/instructions`;
+  try {
+    const r = await fetch(url, { method: 'PUT', body: JSON.stringify({ text: '', style: 'default', advanced: { formatting: 'minimal' }, language: 'German' }) });
+    const body = await r.json();
+    assert.equal(r.status, 200); assert.equal(body.advanced.formatting, 'minimal'); assert.equal(body.language, 'German');
+    assert.deepEqual(body.advancedOptions.emoji, ['auto', 'none', 'some']);
+    assert.equal((await fetch(url, { method: 'PUT', body: JSON.stringify({ text: '', advanced: { tone: 'loud' } }) })).status, 400);
+  } finally { server.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
