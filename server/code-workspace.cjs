@@ -45,6 +45,64 @@ function gitReason(error) {
   return `git could not read that repository: ${text.split('\n')[0].slice(0, 200) || 'unknown error'}`;
 }
 
+// A tree the harness has held is hostile input. Its `.git/config`, `.git/hooks` and
+// `.gitattributes` are the harness's to write, and git runs commands named there: an fsmonitor,
+// hooks (`--no-verify` skips only pre-commit and commit-msg; post-commit still runs), clean
+// filters. Running git on it as noevia would hand the harness noevia's user, which is exactly
+// the boundary the separate harness user exists to keep. So: every git call on such a tree
+// switches those off from the command line, and a clone whose config reaches for them anyway is
+// refused outright rather than trusted to the switches alone.
+const HOSTILE_OFF = ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-c', 'core.attributesFile=/dev/null'];
+const HOSTILE_KEYS = [
+  /^filter\./, /^diff\..*\.(command|textconv)$/, /^merge\..*\.driver$/, /^core\.fsmonitor$/, /^core\.hookspath$/,
+  /^core\.sshcommand$/, /^core\.gitproxy$/, /^core\.worktree$/, /^core\.askpass$/, /^core\.editor$/, /^core\.pager$/,
+  /^credential\.(.*\.)?helper$/, /^alias\./, /^include\./, /^includeif\./, /^uploadpack\./, /^receive\./,
+  /^sendemail\./,
+];
+
+/** Why a released clone must not be touched by git, or null when it looks inert. */
+function hostileReason(tree, run, env) {
+  const gitDir = path.join(tree, '.git');
+  let st;
+  try { st = fs.lstatSync(gitDir); } catch { return 'the clone has no .git directory'; }
+  // A `.git` file or symlink would point git at a directory the check below never read.
+  if (!st.isDirectory()) return 'the clone’s .git is not a plain directory';
+  let listing = '';
+  try { listing = run(['config', '--file', path.join(gitDir, 'config'), '--name-only', '--list'], tree, env); }
+  catch (e) { return `its .git/config could not be read: ${String(e.message).split('\n')[0]}`; }
+  const bad = listing.split('\n').map((k) => k.trim().toLowerCase()).filter((k) => k && HOSTILE_KEYS.some((re) => re.test(k)));
+  if (bad.length) return `its .git/config sets ${[...new Set(bad)].slice(0, 5).join(', ')}, which would make git run a command`;
+  const hooks = path.join(gitDir, 'hooks');
+  let names = [];
+  try { names = fs.readdirSync(hooks); } catch { /* no hooks directory is fine */ }
+  for (const name of names) {
+    if (name.endsWith('.sample')) continue;
+    try {
+      const h = fs.statSync(path.join(hooks, name));
+      if (h.isFile() && (h.mode & 0o111)) return `.git/hooks/${name} is an executable hook`;
+    } catch { /* a dangling link runs nothing */ }
+  }
+  const attrFiles = [path.join(gitDir, 'info', 'attributes')];
+  const walk = (dir, depth) => {
+    if (depth > 64) return;
+    let entries = [];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (e.name === '.git') continue;
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) walk(full, depth + 1);
+      else if (e.name === '.gitattributes') attrFiles.push(full);
+    }
+  };
+  walk(tree, 0);
+  for (const file of attrFiles) {
+    let body;
+    try { body = fs.readFileSync(file, 'utf8'); } catch { continue; }
+    if (/(^|\s)filter=/m.test(body)) return `${path.relative(tree, file)} names a filter driver`;
+  }
+  return null;
+}
+
 function defaultRun(args, cwd, env = {}) {
   return execFileSync('git', args, { cwd, env: { ...process.env, ...env }, encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000 }).trim();
@@ -246,13 +304,19 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
       // noevia's own file API and stopped there. Since only commits can be fetched back, an
       // uncommitted change would be deleted with the clone, which is the opposite of the point.
       // So noevia commits whatever is left, in its own name, clearly labelled.
+      const hostile = hostileReason(record.path, run, gitEnv());
+      if (hostile) {
+        // Kept, not deleted: whoever looks at it decides whether the work is worth saving.
+        return write({ ...record, status: 'stuck', releasedAt: now(),
+          error: `Refused to release the workspace: ${hostile}. It was left in place for inspection.` });
+      }
       try {
-        if (run(['status', '--porcelain'], record.path, gitEnv())) {
-          run(['add', '--all'], record.path, gitEnv());
-          run(['-c', `user.name=${COMMITTER.name}`, '-c', `user.email=${COMMITTER.email}`,
+        if (run([...HOSTILE_OFF, 'status', '--porcelain'], record.path, gitEnv())) {
+          run([...HOSTILE_OFF, 'add', '--all'], record.path, gitEnv());
+          run([...HOSTILE_OFF, '-c', `user.name=${COMMITTER.name}`, '-c', `user.email=${COMMITTER.email}`,
             'commit', '--quiet', '--no-verify', '-m',
             `noevia: work in progress from task ${record.taskId}\n\nCommitted by noevia when the task ended, because the harness left it uncommitted.`,
-          ], record.path);
+          ], record.path, gitEnv());
         }
       } catch (e) {
         return write({ ...record, status: 'stuck', releasedAt: now(),
@@ -261,7 +325,7 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
       try {
         // Never forced: a branch that would not fast-forward is a conflict for a human, not
         // something to overwrite. Nothing is fetched if the task never committed.
-        run(['fetch', '--quiet', record.path, `${record.branch}:${record.branch}`], record.repo, gitEnv());
+        run([...HOSTILE_OFF, 'fetch', '--quiet', record.path, `${record.branch}:${record.branch}`], record.repo, gitEnv());
       } catch (e) {
         // "Couldn't find remote ref" simply means the task made no commits — not a failure.
         if (!/couldn't find remote ref|not found in upstream/i.test(String(e.message))) {
@@ -272,9 +336,9 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
       if (record.home) { try { rm(record.home); } catch { /* nothing of the task's is in there */ } }
       if (removed && removeBranch) { try { run(['branch', '-D', record.branch], record.repo, gitEnv()); } catch { /* keep going */ } }
     } else {
-      try { run(['worktree', 'remove', '--force', record.path], record.repo, gitEnv()); }
+      try { run([...HOSTILE_OFF, 'worktree', 'remove', '--force', record.path], record.repo, gitEnv()); }
       catch (e) { removed = false; error = e.message; }
-      try { run(['worktree', 'prune'], record.repo, gitEnv()); } catch { /* best effort */ }
+      try { run([...HOSTILE_OFF, 'worktree', 'prune'], record.repo, gitEnv()); } catch { /* best effort */ }
       if (removed && removeBranch) { try { run(['branch', '-D', record.branch], record.repo, gitEnv()); } catch { /* keep going */ } }
     }
     // An unremovable tree is recorded, not hidden: it may still hold the branch, so the next

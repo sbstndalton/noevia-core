@@ -9,6 +9,8 @@ const temps = [];
 const temp = (prefix) => { const d = fs.mkdtempSync(path.join(os.tmpdir(), prefix)); temps.push(d); return d; };
 test.after(() => { for (const d of temps) fs.rmSync(d, { recursive: true, force: true }); });
 
+// The git subcommand, past any leading `-c key=value` pairs.
+const sub = (args) => { let i = 0; while (args[i] === '-c') i += 2; return args[i]; };
 const ids = (n) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
 
 function repoWith(files = { 'a.txt': 'a' }) {
@@ -138,7 +140,7 @@ test('a worktree that cannot be removed is recorded as stuck, not as released', 
 function makeFailingRun() {
   const real = require('node:child_process').execFileSync;
   return (args, cwd) => {
-    if (args[0] === 'worktree' && args[1] === 'remove') throw new Error('worktree remove refused');
+    if (sub(args) === 'worktree' && args.includes('remove')) throw new Error('worktree remove refused');
     return real('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
   };
 }
@@ -258,7 +260,7 @@ test('work that cannot be saved keeps the clone and says so', () => {
   const ws = createCodeWorkspaces({
     dir: temp('noevia-ws-'), treeRoot: temp('noevia-shared-'), mode: 'clone', epoch: 'test',
     run: (args, cwd) => {
-      if (args[0] === 'fetch') throw new Error('fatal: the disk is full');
+      if (sub(args) === 'fetch') throw new Error('fatal: the disk is full');
       return real('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
     },
   });
@@ -299,7 +301,7 @@ test('the clone is taken back before reading from it, or git refuses', () => {
     dir: temp('noevia-ws-'), treeRoot: temp('noevia-shared-'), owner: { uid: 1000, gid: 1000 }, epoch: 'test',
     chown: (target, uid) => order.push(`chown:${uid}`),
     run: (args, cwd) => {
-      if (args[0] === 'fetch') order.push('fetch');
+      if (sub(args) === 'fetch') order.push('fetch');
       return require('node:child_process').execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
     },
   });
@@ -457,4 +459,86 @@ test('a registered repository owned by another user is used, and any other git r
     throw Object.assign(Error('git failed'), { stderr: 'fatal: unable to read /x: Permission denied' });
   } });
   assert.throws(() => other.claim({ taskId: ids(2), repoPath }), (e) => e.status === 400 && /Permission denied/.test(e.message));
+});
+
+// A harness owns the clone while the task runs, so on release its .git is hostile input.
+function hostileClone() {
+  const repo = repoWith();
+  const ws = createCodeWorkspaces({ dir: temp('noevia-ws-'), treeRoot: temp('noevia-shared-'), mode: 'clone', epoch: 'test' });
+  const claim = ws.claim({ taskId: ids(1), repoPath: repo });
+  const git = (...args) => execFileSync('git', args, { cwd: claim.path, stdio: 'ignore' });
+  return { repo, ws, claim, git };
+}
+const marker = () => path.join(os.tmpdir(), `noevia-pwned-${process.pid}-${Math.random().toString(36).slice(2)}`);
+
+test('a clone whose config plants an fsmonitor is refused, and the command never runs', () => {
+  const { ws, claim, git } = hostileClone();
+  const pwned = marker();
+  git('config', 'core.fsmonitor', `touch ${pwned}`);
+  fs.writeFileSync(path.join(claim.path, 'a.txt'), 'changed, so release would run git status');
+  const released = ws.release({ taskId: ids(1) });
+  assert.equal(fs.existsSync(pwned), false, 'the planted fsmonitor ran as noevia');
+  assert.equal(released.status, 'stuck');
+  assert.match(released.error, /Refused to release.*core\.fsmonitor/);
+  assert.ok(fs.existsSync(claim.path), 'kept for inspection');
+});
+
+for (const [key, value] of [['filter.x.clean', 'sh -c true'], ['core.hooksPath', '/elsewhere'], ['alias.st', '!sh'],
+  ['includeIf.gitdir:/.path', '/x'], ['credential.helper', '!sh'], ['uploadpack.packObjectsHook', 'sh']]) {
+  test(`a clone whose config sets ${key} is refused`, () => {
+    const { ws, git } = hostileClone();
+    git('config', key, value);
+    const released = ws.release({ taskId: ids(1) });
+    assert.equal(released.status, 'stuck');
+    assert.match(released.error, /\.git\/config sets/);
+  });
+}
+
+test('an executable hook or a filter attribute in the clone is refused', () => {
+  let { ws, claim } = hostileClone();
+  fs.writeFileSync(path.join(claim.path, '.git', 'hooks', 'post-commit'), '#!/bin/sh\n', { mode: 0o755 });
+  let released = ws.release({ taskId: ids(1) });
+  assert.equal(released.status, 'stuck');
+  assert.match(released.error, /post-commit is an executable hook/);
+
+  ({ ws, claim } = hostileClone());
+  fs.mkdirSync(path.join(claim.path, 'deep'));
+  fs.writeFileSync(path.join(claim.path, 'deep', '.gitattributes'), '*.txt filter=x\n');
+  released = ws.release({ taskId: ids(1) });
+  assert.equal(released.status, 'stuck');
+  assert.match(released.error, /deep\/\.gitattributes names a filter driver/);
+});
+
+test('a post-commit hook the check cannot see still never runs on noevia’s commit', () => {
+  // Past the check (say, planted between check and commit): core.hooksPath=/dev/null disables it.
+  const repo = repoWith();
+  const pwned = marker();
+  const real = require('node:child_process').execFileSync;
+  let tree = null;
+  const ws = createCodeWorkspaces({
+    dir: temp('noevia-ws-'), treeRoot: temp('noevia-shared-'), mode: 'clone', epoch: 'test',
+    run: (args, cwd, env = {}) => {
+      if (args.includes('add') && tree) {
+        fs.writeFileSync(path.join(tree, '.git', 'hooks', 'post-commit'), `#!/bin/sh\ntouch ${pwned}\n`, { mode: 0o755 });
+      }
+      return real('git', args, { cwd, env: { ...process.env, ...env }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    },
+  });
+  const claim = ws.claim({ taskId: ids(1), repoPath: repo });
+  tree = claim.path;
+  fs.writeFileSync(path.join(claim.path, 'a.txt'), 'work');
+  const released = ws.release({ taskId: ids(1) });
+  assert.equal(released.status, 'released');
+  assert.equal(fs.existsSync(pwned), false, 'the post-commit hook ran');
+  assert.equal(execFileSync('git', ['show', `${claim.branch}:a.txt`], { cwd: repo, encoding: 'utf8' }), 'work');
+});
+
+test('a clean clone with a harness-set identity still releases and commits', () => {
+  const { repo, ws, claim, git } = hostileClone();
+  git('config', 'user.name', 'harness');
+  fs.writeFileSync(path.join(claim.path, 'a.txt'), 'fine');
+  fs.writeFileSync(path.join(claim.path, '.gitattributes'), '*.txt text eol=lf\n');
+  const released = ws.release({ taskId: ids(1) });
+  assert.equal(released.status, 'released', released.error);
+  assert.equal(execFileSync('git', ['show', `${claim.branch}:a.txt`], { cwd: repo, encoding: 'utf8' }), 'fine');
 });
