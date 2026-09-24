@@ -227,6 +227,72 @@ test('s3 listFiles and readTextFile honor the connection-relative contract', asy
   await assert.rejects(() => readTextFile(conn, 'nope.md'), /storage returned 404/);
 });
 
+// ── capped body reads (mocked fetch; no network) ─────────────────────────────
+
+/** A response whose body is `total` bytes of `fill`, served in 64 KiB chunks, counting pulls. */
+function hugeResponse(total, fill = 'a', status = 200, prefix = '') {
+  const stats = { served: 0, cancelled: false };
+  const chunk = 64 * 1024;
+  const body = new ReadableStream({
+    pull(controller) {
+      if (stats.served >= total) return controller.close();
+      const n = Math.min(chunk, total - stats.served);
+      const text = stats.served === 0 ? (prefix + fill.repeat(n)).slice(0, n) : fill.repeat(n);
+      stats.served += n;
+      controller.enqueue(new TextEncoder().encode(text));
+    },
+    cancel() { stats.cancelled = true; },
+  }, { highWaterMark: 0 });
+  const response = new Response(body, { status });
+  response.text = () => { throw new Error('the whole body must never be buffered'); };
+  return { response, stats };
+}
+
+function withFetch(t, impl) {
+  const real = globalThis.fetch;
+  globalThis.fetch = impl;
+  t.after(() => { globalThis.fetch = real; });
+}
+
+const { READ_CAP } = require('./storage-client.cjs');
+const HUGE = 64 * 1024 * 1024;
+
+for (const kind of ['webdav', 's3']) {
+  test(`${kind} readTextFile stops reading an oversized body at the cap and cancels it`, async (t) => {
+    const { response, stats } = hugeResponse(HUGE);
+    withFetch(t, async () => response);
+    const conn = kind === 's3'
+      ? { kind, baseUrl: 'http://s3.invalid', bucket: 'b', username: 'ak', secret: 'sk' }
+      : { kind, baseUrl: 'http://dav.invalid/remote.php/dav/files/u' };
+    const r = await readTextFile(conn, 'big.md');
+    assert.equal(r.content.length, READ_CAP);
+    assert.equal(r.truncated, true);
+    assert.ok(stats.served <= READ_CAP * 4 + 128 * 1024, `read ${stats.served} bytes`);
+    assert.equal(stats.cancelled, true);
+  });
+
+  test(`${kind} listing reads at most 4 MiB of an oversized body`, async (t) => {
+    const entry = kind === 's3'
+      ? '<ListBucketResult><Contents><Key>a.md</Key><Size>3</Size></Contents>'
+      : '<d:multistatus><d:response><d:href>/remote.php/dav/files/u/a.md</d:href><d:propstat><d:prop><d:getcontentlength>3</d:getcontentlength></d:prop></d:propstat></d:response>';
+    const { response, stats } = hugeResponse(HUGE, ' ', kind === 's3' ? 200 : 207, entry);
+    withFetch(t, async () => response);
+    const conn = kind === 's3'
+      ? { kind, baseUrl: 'http://s3.invalid', bucket: 'b', username: 'ak', secret: 'sk' }
+      : { kind, baseUrl: 'http://dav.invalid/remote.php/dav/files/u' };
+    const entries = await listFiles(conn, '');
+    assert.deepEqual(entries.map((e) => e.name), ['a.md'], 'entries inside the cap still parse');
+    assert.ok(stats.served <= 4 * 1024 * 1024 + 128 * 1024, `read ${stats.served} bytes`);
+    assert.equal(stats.cancelled, true);
+  });
+}
+
+test('a small text body is read whole and not marked truncated', async (t) => {
+  withFetch(t, async () => new Response('short and sweet \u00e9'));
+  const r = await readTextFile({ kind: 'webdav', baseUrl: 'http://dav.invalid/' }, 'a.md');
+  assert.deepEqual(r, { name: 'a.md', content: 'short and sweet \u00e9', truncated: false });
+});
+
 // ── route-level tests (fake WebDAV behind the real proxy routes) ─────────────
 
 const testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cowork-storage-client-test-'));

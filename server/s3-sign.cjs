@@ -24,6 +24,19 @@ function uriEncode(value) {
 }
 
 /**
+ * SigV4 canonical URI: every path segment URI-encoded once (RFC3986 unreserved set, so
+ * ! ' ( ) * are escaped too), matching `_path` in services/diary/agent/s3_storage.py.
+ * URL.pathname is already percent-encoded (and leaves ! ' ( ) * alone), so decode first.
+ */
+function canonicalUri(pathname) {
+  return String(pathname || '/').split('/').map((seg) => {
+    let raw = seg;
+    try { raw = decodeURIComponent(seg); } catch { /* a stray % stays literal */ }
+    return uriEncode(raw);
+  }).join('/') || '/';
+}
+
+/**
  * Sign an S3 request (SigV4, path-style).
  * @param {string} method HTTP verb
  * @param {URL} url full target URL (path-style: /bucket[/key][?query])
@@ -57,7 +70,7 @@ function signS3Request(method, url, payload, accessKey, secretKey, opts = {}) {
 
   const canonicalRequest = [
     method,
-    url.pathname,
+    canonicalUri(url.pathname),
     canonicalQuery,
     canonicalHeaders,
     signedHeaders,
@@ -82,4 +95,4 @@ function algorithmHeader() {
   return 'AWS4-HMAC-SHA256';
 }
 
-module.exports = { signS3Request, sha256Hex, uriEncode };
+module.exports = { signS3Request, sha256Hex, uriEncode, canonicalUri };

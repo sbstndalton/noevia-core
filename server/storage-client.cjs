@@ -26,6 +26,34 @@
 const { signS3Request } = require('./s3-sign.cjs');
 
 const READ_CAP = 200_000; // matches the project-file upload cap
+const TEXT_BODY_CAP = READ_CAP * 4; // bytes read for a text preview (UTF-8 is at most 4 bytes a char)
+const LIST_BODY_CAP = 4 * 1024 * 1024; // a directory listing response
+
+/** Reads at most `cap` bytes of a response body as UTF-8, then cancels the rest of the stream. */
+async function readCappedText(response, cap) {
+  if (!response.body) return { text: '', capped: false };
+  const reader = response.body.getReader();
+  const chunks = [];
+  let size = 0, capped = false;
+  try {
+    while (size < cap) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const room = cap - size;
+      const piece = value.byteLength > room ? value.subarray(0, room) : value;
+      chunks.push(Buffer.from(piece));
+      size += piece.byteLength;
+    }
+    if (size >= cap) {
+      const next = await reader.read().catch(() => ({ done: true }));
+      if (!next.done) { capped = true; await reader.cancel().catch(() => {}); }
+    }
+  } finally { reader.releaseLock(); }
+  // A multi-byte character cut at the cap decodes to U+FFFD; drop it.
+  let text = Buffer.concat(chunks, size).toString('utf8');
+  if (capped) text = text.replace(/\uFFFD$/, '');
+  return { text, capped };
+}
 const TEXT_EXTENSIONS = new Set([
   '.txt', '.md', '.markdown', '.json', '.csv', '.yml', '.yaml',
   '.ts', '.tsx', '.js', '.jsx', '.py', '.sh', '.html', '.css',
@@ -101,7 +129,7 @@ async function davList(conn, fullPath) {
   }));
   if (response.status === 404) return [];
   if (!response.ok && response.status !== 207) throw new Error(`storage returned ${response.status}`);
-  const body = await response.text();
+  const { text: body } = await readCappedText(response, LIST_BODY_CAP);
   const entries = [];
   const requestDir = decodeURIComponent(new URL(target).pathname).replace(/\/+$/, '');
   for (const match of body.matchAll(/<(?:[a-zA-Z0-9]+:)?response>([\s\S]*?)<\/(?:[a-zA-Z0-9]+:)?response>/g)) {
@@ -133,7 +161,7 @@ async function davRead(conn, fullPath) {
     redirect: 'error',
   }));
   if (!response.ok) throw new Error(`storage returned ${response.status}`);
-  return response.text();
+  return readCappedText(response, TEXT_BODY_CAP);
 }
 
 // ── S3-compatible ────────────────────────────────────────────────────────────
@@ -158,7 +186,7 @@ async function s3List(conn, connectionPath) {
     redirect: 'error',
   }));
   if (!response.ok) throw new Error(`storage returned ${response.status}`);
-  const body = await response.text();
+  const { text: body } = await readCappedText(response, LIST_BODY_CAP);
   const entries = [];
   for (const match of body.matchAll(/<CommonPrefixes><Prefix>([\s\S]*?)<\/Prefix><\/CommonPrefixes>/g)) {
     const full = match[1].replace(/\/+$/, '');
@@ -185,7 +213,7 @@ async function s3Read(conn, connectionPath) {
     redirect: 'error',
   }));
   if (!response.ok) throw new Error(`storage returned ${response.status}`);
-  return response.text();
+  return readCappedText(response, TEXT_BODY_CAP);
 }
 
 // ── Public API ───────────────────────────────────────────────────────────────
@@ -224,10 +252,10 @@ async function readTextFile(conn, rawPath, opts) {
   if (!TEXT_EXTENSIONS.has(extensionOf(name))) {
     throw Object.assign(new Error(`"${name}" is not a supported text file`), { status: 400 });
   }
-  const text = connectionKind(conn) === 's3'
+  const { text, capped } = connectionKind(conn) === 's3'
     ? await s3Read(conn, path)
     : await davRead(conn, scoped ? joinRoot(conn.corpusRoot, path) : path);
-  return { name, content: text.slice(0, READ_CAP), truncated: text.length > READ_CAP };
+  return { name, content: text.slice(0, READ_CAP), truncated: capped || text.length > READ_CAP };
 }
 
 /** Create one directory. The only write this module performs: MKCOL creates a

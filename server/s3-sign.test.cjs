@@ -6,7 +6,7 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 
-const { signS3Request } = require('./s3-sign.cjs');
+const { signS3Request, canonicalUri } = require('./s3-sign.cjs');
 
 // SigV4 probe signer tests. The expected signature is produced by the diary
 // sidecar's Python signer (services/diary/agent/s3_storage.py), which is
@@ -46,4 +46,24 @@ test('signS3Request canonicalizes query params in sorted order with AWS encoding
   const urlReordered = new URL('https://s3.example.com/diary-bucket?list-type=2&max-keys=1');
   const b = signS3Request('GET', urlReordered, '', 'AK', 'SK', { amzDate: '20130524T000000Z' });
   assert.equal(a.Authorization, b.Authorization, 'signature must not depend on query param order');
+});
+
+test('canonical URI encodes each segment once, including ! \' ( ) *', () => {
+  // s3Url builds this with encodeURIComponent, which leaves ( ) unescaped.
+  const url = new URL(`https://s3.example.com/diary-bucket/Cowork/${encodeURIComponent('notes (1).md')}`);
+  assert.equal(url.pathname, '/diary-bucket/Cowork/notes%20(1).md');
+  assert.equal(canonicalUri(url.pathname), '/diary-bucket/Cowork/notes%20%281%29.md');
+  assert.equal(canonicalUri("/b/it's*!.md"), '/b/it%27s%2A%21.md');
+  assert.equal(canonicalUri('/b/a%2Fb.md'), '/b/a%2Fb.md', 'an encoded slash stays inside its segment');
+  assert.equal(canonicalUri('/b/100%.md'), '/b/100%25.md', 'a stray % is encoded, not thrown on');
+  assert.equal(canonicalUri('/'), '/');
+});
+
+test('signS3Request signs "notes (1).md" the way the Python signer does', () => {
+  // Expected value computed by hand with the Python algorithm (quote(seg, safe="-_.~") per
+  // segment of bucket/key); canonical request:
+  // GET\n/diary-bucket/Cowork/notes%20%281%29.md\n\nhost:...\nx-amz-content-sha256:...\nx-amz-date:...\n\n...
+  const url = new URL(`https://s3.example.com/diary-bucket/Cowork/${encodeURIComponent('notes (1).md')}`);
+  const headers = signS3Request('GET', url, '', 'AKIAIOSFODNN7EXAMPLE', 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY', { amzDate: '20130524T000000Z' });
+  assert.match(headers.Authorization, /Signature=9cec0576cc907d6fd8116f20defdd879c7f20be1a35cff4d3c00c797ea405e58$/);
 });
