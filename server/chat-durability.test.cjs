@@ -42,7 +42,8 @@ async function run(t,ambiguous=false,stepSupervision=null,providerId='default') 
 test('real chat loop checkpoints a tool result before model failure and restores with a fake provider',async t=>{
   const f=await run(t);assert.equal(f.executions,1);assert.equal(f.requests,2);
   const restored=createChatTurns({enabled:true}).restore(f.workspace,f.id);
-  assert.equal(restored.next,'generate');assert.equal(restored.state.calls[0].result,'complete synthetic result');
+  assert.equal(restored.next,'generate');assert.equal(restored.state.calls[0].result,'reduced'); // the model's copy is what replays
+  assert.equal(restored.state.calls[0].resultBytes,Buffer.byteLength('complete synthetic result'));
   assert.equal(restored.state.calls[0].approval.action,'approve_all');
   assert.equal(restored.state.projection.messages.at(-1).content,'reduced');
   await f.service.resumeGeneration(f.workspace,f.id,{model:{id:'replacement'},project:s=>s.messages,provider:async()=>({content:'Recovered without re-running the tool'})});
@@ -68,7 +69,7 @@ test('verification changes projection only; canonical tools and retry budget sur
   const f=await run(t,false,supervisor),s=f.service.restore(f.workspace,f.id).state;
   assert.equal(f.requests,2);assert.equal(f.executions,1);assert.equal(s.retries.remaining,1);
   assert.match(s.projection.messages.at(-1).content,/Check the preceding/);
-  assert.equal(s.messages.at(-1).content,'complete synthetic result');
+  assert.equal(s.messages.at(-1).content,'reduced');
 });
 test('ambiguous tool outcomes bypass supervision',async t=>{
   const f=await run(t,true,{decide:async()=>{throw Error('must not supervise unresolved write');}});

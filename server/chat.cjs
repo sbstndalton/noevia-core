@@ -736,6 +736,7 @@ function createChatHandler({
             roundMessages.push({ role: 'tool', tool_call_id: tc.id, content: reply });
             continue;
           }
+          const outcome = { failed: false }; // set explicitly by executeToolCall
           const result = await runTool(tc, async (markWriteAttempt) => {
             // ── Permission gate (step 16) ──────────────────────────────────
             // Reads run straight through. A write stops here and waits for a
@@ -775,7 +776,7 @@ function createChatHandler({
             if (chatWideApproved(userId, chatId)) turn?.approval(tc.id, {action:'approve_all', inherited:true});
             turn?.started(tc.id);
             markWriteAttempt();
-            try { result = await executeToolCall(project, tc.name, tc.args, allowedToolNames, chatSignal.signal); }
+            try { result = await executeToolCall(project, tc.name, tc.args, allowedToolNames, chatSignal.signal, outcome); }
             catch (error) { turn?.uncertain(tc.id); throw error; }
             recordToolUse(chatWorkspace, tc.name);
             // Audit AFTER the fact and only for writes: "what did the model
@@ -785,17 +786,19 @@ function createChatHandler({
               authService.audit('tool.write', userId, userId, {
                 tool: tc.name,
                 args: String(tc.args || '').slice(0, 500),
-                failed: result.startsWith('ERROR') || undefined,
+                failed: outcome.failed || undefined,
               });
             }
             return result;
           });
-          turn?.result(tc.id, result);
-          send({ type: 'tool_result', index: toolOffset + toolIndex, name: tc.name, text: result.slice(0, 300) });
-          // The chip above got the real result; this is the model's copy. Most
+          // The chip gets the real result; this is the model's copy. Most
           // tools cap themselves, so this is a no-op for them — it is here so a
           // tool that does not cannot quietly spend the whole prefill budget.
+          // The durable turn stores the same reduced copy (replay/resume use it)
+          // plus the original size, never the raw megabytes.
           const forModel = reduceToolResult(result, { maxChars: TOOL_RESULT_CAP });
+          turn?.result(tc.id, forModel.text, { failed: outcome.failed === true, originalBytes: Buffer.byteLength(String(result)) });
+          send({ type: 'tool_result', index: toolOffset + toolIndex, name: tc.name, text: result.slice(0, 300) });
           roundMessages.push({ role: 'tool', tool_call_id: tc.id, content: forModel.text });
         }
       }

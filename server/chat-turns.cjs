@@ -3,8 +3,11 @@
 // Canonical turn snapshots use the existing tenant jobs journal; projections are disposable.
 const { createJobs } = require('./jobs.cjs');
 const crypto = require('node:crypto');
+// Backstop for persisted tool text: the chat loop passes the reduced copy (TOOL_RESULT_CAP),
+// whose truncation note may run slightly past the cap.
+const DEFAULT_RESULT_CAP = 16000;
 const clone = (value) => JSON.parse(JSON.stringify(value));
-function createChatTurns({ enabled = false } = {}) {
+function createChatTurns({ enabled = false, resultCap = DEFAULT_RESULT_CAP } = {}) {
   const store = (workspace) => {
     if (!enabled) throw Error('Durable chat is disabled');
     if (!workspace?.userId || !workspace?.dir) throw Error('Tenant workspace required');
@@ -36,7 +39,18 @@ function createChatTurns({ enabled = false } = {}) {
       approval(callId, approval) { const c = call(callId); c.approval = { ...c.approval, ...clone(approval) }; save(); },
       started(callId) { const c = call(callId); if (c.status !== 'not_started') throw Error('Tool already started; review required'); c.status = 'started'; save(); },
       uncertain(callId) { call(callId).status = 'outcome_unknown'; save(); },
-      result(callId, result) { const c = call(callId); if (c.status === 'started' && /^ERROR/i.test(result)) c.status = 'outcome_unknown'; if (c.status === 'outcome_unknown') { c.error = result; save(); return; } if (!['not_started','started'].includes(c.status)) throw Error('Tool already resolved'); c.status = 'completed'; c.result = result; state.messages.push({role:'tool',tool_call_id:callId,content:result}); save(); },
+      // `result` should already be the model's (reduced) copy; the hard cap is a
+      // backstop so a caller that forgets cannot write megabytes into the journal.
+      // Failure is an explicit flag from the executor, never inferred from text.
+      result(callId, result, { failed = false, originalBytes } = {}) {
+        const c = call(callId), raw = String(result ?? '');
+        const text = raw.length > resultCap ? raw.slice(0, resultCap) + `\n\n[truncated: stored ${resultCap} of ${raw.length} characters]` : raw;
+        c.resultBytes = Number.isInteger(originalBytes) ? originalBytes : Buffer.byteLength(raw);
+        if (c.status === 'started' && failed === true) c.status = 'outcome_unknown';
+        if (c.status === 'outcome_unknown') { c.error = text; save(); return; }
+        if (!['not_started','started'].includes(c.status)) throw Error('Tool already resolved');
+        c.status = 'completed'; c.result = text; state.messages.push({role:'tool',tool_call_id:callId,content:text}); save();
+      },
       supervision(decision) { state.supervision = [...(state.supervision || []), { round:state.round, ...clone(decision) }]; if (decision.action === 'escalate') state.reviewRequired = true; save(); },
       interrupt(reason) { state.interruptedPhase = state.phase; state.phase = 'interrupted'; state.failure = String(reason); save(); },
       complete() { if (state.calls.some(c => c.status !== 'completed')) throw Error('Unresolved tools require review'); state.phase = 'completed'; save(); jobs.append(id, 'job.completed'); },

@@ -45,6 +45,7 @@ const CORE_TOOLS = [
   },
 ];
 
+const DELEGATED_FAILURE = /^ERROR(?: from tool)?: /;
 const TOOL_RESULT_CAP = 8000; // chars — protect the context window
 
 // A tool definition is re-sent on EVERY turn, so its size is a recurring cost.
@@ -342,26 +343,26 @@ function createToolboxes({
     }));
   }
 
-  async function executeToolCall(project, name, rawArgs, allowed, signal) {
+  async function runToolCall(project, name, rawArgs, allowed, signal, fail) {
     // A model can name a tool it was never offered — by hallucination, or from
     // a box the project has since deselected mid-conversation. Enforce the
     // resolved list here rather than trusting that whatever was sent upstream is
     // still what came back.
     if (allowed instanceof Set && !allowed.has(name)) {
-      return `ERROR: tool "${name}" is not enabled for this project`;
+      return fail(`ERROR: tool "${name}" is not enabled for this project`);
     }
     let args = {};
     try {
       args = rawArgs ? JSON.parse(rawArgs) : {};
     } catch {
-      return `ERROR: tool arguments were not valid JSON: ${String(rawArgs).slice(0, 200)}`;
+      return fail(`ERROR: tool arguments were not valid JSON: ${String(rawArgs).slice(0, 200)}`);
     }
     // A syntactically valid JSON value like `null`, `42`, or `"x"` parses fine
     // but is not an arguments object; every tool below assumes it can read
     // properties off `args`, so treat anything else as a clean argument error
     // rather than letting it surface as an unhandled TypeError.
     if (typeof args !== 'object' || args === null || Array.isArray(args)) {
-      return `ERROR: tool arguments must be a JSON object: ${String(rawArgs).slice(0, 200)}`;
+      return fail(`ERROR: tool arguments must be a JSON object: ${String(rawArgs).slice(0, 200)}`);
     }
     if (kiwixTools?.names.has(name)) return kiwixTools.execute(name, args);
     if (driveTools?.names.has(name)) return driveTools.execute(scope.getStore()?.authn?.user, name, args);
@@ -374,7 +375,7 @@ function createToolboxes({
           : now.toString();
         return `Current time: ${formatted}${tz ? ` (${tz})` : ''} | ISO: ${now.toISOString()}`;
       } catch {
-        return `ERROR: unknown IANA timezone "${tz}"`;
+        return fail(`ERROR: unknown IANA timezone "${tz}"`);
       }
     }
     if (name === 'read_project_file') {
@@ -383,7 +384,7 @@ function createToolboxes({
       const f = files.find((x) => x.name === wanted);
       if (!f) {
         const names = files.map((x) => x.name).join(', ') || '(none attached)';
-        return `ERROR: no project file named "${wanted}". Available: ${names}`;
+        return fail(`ERROR: no project file named "${wanted}". Available: ${names}`);
       }
       const instructionSkills = require('./instruction-skills.cjs');
       if (instructionSkills.inspect(f, project)) return instructionSkills.read(project, f, getProject(project.id), args.offset ?? 0, TOOL_RESULT_CAP);
@@ -392,7 +393,7 @@ function createToolboxes({
         try {
           const out = documentSources.readPages(workspace(), project.id, f, args.startPage, args.endPage ?? args.startPage, args.offset ?? 0, TOOL_RESULT_CAP);
           return `${out.notice}\n${out.text}${out.nextOffset !== null ? '\nContinue with offset ' + out.nextOffset : ''}`;
-        } catch (err) { return 'ERROR: ' + err.message; }
+        } catch (err) { return fail('ERROR: ' + err.message); }
       }
       const warning = documentSources.notice(f);
       return `${warning ? warning + "\n" : ""}File "${f.name}" (${f.content.length} chars):\n\n${f.content.slice(0, TOOL_RESULT_CAP)}${f.content.length > TOOL_RESULT_CAP ? '\n…[truncated]' : ''}`;
@@ -405,7 +406,20 @@ function createToolboxes({
     if (mcpTools().has(name)) {
       return scope.run({ ...scope.getStore(), internalCallProject: project || null }, () => executeMcp(name, args, signal));
     }
-    return `ERROR: unknown tool "${name}"`;
+    return fail(`ERROR: unknown tool "${name}"`);
+  }
+
+  // Returns the tool's text. `outcome.failed` (optional out-parameter) is set
+  // explicitly: built-in errors flag themselves; delegated executors (Kiwix,
+  // Drive, MCP) report failure with their own fixed prefixes ("ERROR: " /
+  // "ERROR from tool: "), matched exactly and case-sensitively, so a successful
+  // result that merely begins with the word "Error" is never a failure.
+  async function executeToolCall(project, name, rawArgs, allowed, signal, outcome = {}) {
+    let flagged = false;
+    const fail = (text) => { flagged = true; return text; };
+    const text = await runToolCall(project, name, rawArgs, allowed, signal, fail);
+    outcome.failed = flagged || (typeof text === 'string' && DELEGATED_FAILURE.test(text));
+    return text;
   }
 
   return {

@@ -134,3 +134,12 @@ test('the pure helpers need no factory', () => {
   assert.equal(toolCapFor('Qwen3.5-27B'), 24);
   assert.equal(toolCapFor(''), 24);
 });
+
+test('executeToolCall reports failure explicitly, not from the text', async () => {
+  const t = createToolboxes({ scope: new AsyncLocalStorage(), executeMcp: async (name) => name === 'mcp_ok' ? 'Error log for synthetic job: clean' : 'ERROR from tool: synthetic', mcpTools: () => new Map([['mcp_ok', {}], ['mcp_bad', {}]]) });
+  let o = {};
+  await t.executeToolCall(null, 'get_current_time', '{"timezone":"Mars/Olympus"}', undefined, undefined, o); assert.equal(o.failed, true);
+  o = {}; await t.executeToolCall(null, 'get_current_time', '{}', undefined, undefined, o); assert.equal(o.failed, false);
+  o = {}; assert.match(await t.executeToolCall(null, 'mcp_ok', '{}', undefined, undefined, o), /^Error log/); assert.equal(o.failed, false);
+  o = {}; await t.executeToolCall(null, 'mcp_bad', '{}', undefined, undefined, o); assert.equal(o.failed, true);
+});

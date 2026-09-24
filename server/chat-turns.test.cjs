@@ -17,11 +17,11 @@ test('model failure restores identity, full results and explicit outputs with a 
   f.turn.result(tool.id,'full result '.repeat(2000)); f.turn.generation({messages:[{role:'tool',content:'reduced'}]},1);
   f.turn.partial('incomplete response'); f.turn.interrupt('model died');
   const service=createChatTurns({enabled:true}), restored=service.restore(f.workspace,f.turn.id);
-  assert.equal(restored.next,'generate'); assert.equal(restored.state.calls[0].result.length,24000);
+  assert.equal(restored.next,'generate'); assert.ok(restored.state.calls[0].result.length<16100); assert.equal(restored.state.calls[0].resultBytes,24000);
   assert.equal(restored.state.calls[0].approval.action,'approve_all'); assert.equal(restored.state.calls[0].approval.id,'ap-1');
   let calls=0;
   const result=await service.resumeGeneration(f.workspace,f.turn.id,{
-    model:{id:'replacement'},project: state=>{assert.equal(state.messages.at(-1).content.length,24000); return state.messages.map(m=>m.role === 'tool' ? {...m,content:'reduced'} : m);},
+    model:{id:'replacement'},project: state=>{assert.equal(state.messages.at(-1).content,restored.state.calls[0].result); return state.messages.map(m=>m.role === 'tool' ? {...m,content:'reduced'} : m);},
     provider:async request=>{calls++;assert.equal(request.model.id,'replacement');return {content:'Recovered'};}
   });
   assert.equal(calls,1);assert.deepEqual(result.identity,restored.state.identity);
@@ -78,7 +78,7 @@ for(const projection of [[{role:'tool',tool_call_id:'orphan',content:'x'}],[{rol
   const f=fixture(t);await assert.rejects(f.service.resumeGeneration(f.workspace,f.turn.id,{model:{id:'mock'},project:()=>projection,provider:()=>assert.fail('invalid projection reached provider')}),/tool group/);
 });
 test('returned tool errors after start remain ambiguous',t=>{
-  const f=fixture(t);f.turn.output('',[tool]);f.turn.started(tool.id);f.turn.result(tool.id,'ERROR: timeout after submission');
+  const f=fixture(t);f.turn.output('',[tool]);f.turn.started(tool.id);f.turn.result(tool.id,'ERROR: timeout after submission',{failed:true});
   const restored=f.service.restore(f.workspace,f.turn.id);assert.equal(restored.next,'review');
   assert.equal(restored.state.messages.at(-1).role,'assistant');assert.match(restored.state.calls[0].error,/timeout/);
 });
@@ -142,4 +142,22 @@ for (const phase of ['generation', 'tool']) test(`SIGKILL during ${phase} restor
     assert.equal(requests,1);assert.deepEqual(result.identity,restored.state.identity);
     assert.equal(result.calls.length,1);assert.equal(result.calls[0].result,'Confirmed synthetic result');
   }
+});
+
+test('an 8 MB tool result is stored capped with its original size recorded',t=>{
+  const f=fixture(t);f.turn.output('',[tool]);f.turn.started(tool.id);
+  const big='synthetic row\n'.repeat(Math.ceil(8*1024*1024/14)), bytes=Buffer.byteLength(big);
+  f.turn.result(tool.id,big);
+  const size=fs.readdirSync(f.dir,{recursive:true}).map(n=>path.join(f.dir,n)).filter(p=>fs.statSync(p).isFile()).reduce((a,p)=>a+fs.statSync(p).size,0);
+  assert.ok(size<256*1024,`turn state is ${size} bytes`);
+  const restored=f.service.restore(f.workspace,f.turn.id);
+  assert.equal(restored.state.calls[0].resultBytes,bytes);assert.ok(restored.state.calls[0].result.length<16100);
+  assert.equal(restored.state.messages.at(-1).content,restored.state.calls[0].result);
+});
+test('a successful result that starts with "Error" is a normal outcome',t=>{
+  const f=fixture(t);f.turn.output('',[tool]);f.turn.started(tool.id);
+  f.turn.result(tool.id,'Error log for synthetic service: 0 entries',{failed:false});
+  const restored=f.service.restore(f.workspace,f.turn.id);
+  assert.equal(restored.state.calls[0].status,'completed');assert.equal(restored.next,'generate');
+  assert.equal(restored.state.messages.at(-1).role,'tool');
 });
