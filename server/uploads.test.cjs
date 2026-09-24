@@ -131,3 +131,29 @@ test('binary wearing a text extension is refused with a reason, not guessed at',
   assert.equal(f.attachment.state, 'stored');
   assert.match(f.attachment.reason, /not readable as text/);
 });
+
+test('prune keeps a replaced image that a chat transcript still references, and drops it once unreferenced (#218)', async t => {
+  const { workspace, project } = setup(t);
+  workspace.historyPath = workspace.historyPath || ((id) => path.join(workspace.dir, `history-${id}.json`));
+  const first = await uploads.ingest(workspace, project, 'fixture.png', Buffer.from('synthetic first image'));
+  project.files = [first];
+  const oldAsset = first.attachment.assetId;
+  // A synthetic chat whose transcript names the first image.
+  project.chats = [{ id: 'chat-a', title: 'synthetic' }, { id: 'chat-b', title: 'unrelated' }];
+  fs.mkdirSync(path.dirname(workspace.historyPath('chat-a')), { recursive: true });
+  fs.writeFileSync(workspace.historyPath('chat-a'), JSON.stringify({ history: [{ role: 'user', content: 'see image', assetId: oldAsset }] }));
+  fs.writeFileSync(workspace.historyPath('chat-b'), JSON.stringify({ history: [{ role: 'user', content: 'no images here' }] }));
+  const second = await uploads.ingest(workspace, project, 'fixture.png', Buffer.from('synthetic second image'));
+  project.files = [second];
+  uploads.prune(workspace, project);
+  const oldPath = path.join(workspace.assetDir(project.id), oldAsset);
+  assert.equal(fs.existsSync(oldPath), true, 'the referenced old image keeps its bytes');
+  assert.deepEqual(project.retiredAssets.map(a => a.id), [oldAsset], 'and stays listed as retired, readable but not model input');
+  assert.deepEqual(project.assets.map(a => a.id), [second.attachment.assetId]);
+  // Once no transcript names it, the next prune deletes it.
+  fs.writeFileSync(workspace.historyPath('chat-a'), JSON.stringify({ history: [] }));
+  uploads.prune(workspace, project);
+  assert.equal(fs.existsSync(oldPath), false);
+  assert.equal(project.retiredAssets, undefined);
+  assert.equal(fs.existsSync(path.join(workspace.assetDir(project.id), second.attachment.assetId)), true);
+});

@@ -113,6 +113,9 @@ async function ingest(workspace, project, name, bytes, { connection, source, rem
   if (source || connection) file.source = source || project.projectFolder;
   // Replacing a vision image with a stored-only original must also retire its
   // old model input. Otherwise chat silently describes the previous bytes.
+  // The replaced asset is retired, not forgotten: prune() keeps its bytes while a chat still
+  // references its id (#218).
+  retire(project, (project.assets || []).filter(a => a.sourceName === fullName));
   project.assets = (project.assets || []).filter(a => a.sourceName !== fullName);
   if (mime) {
     const assetId = 'img-' + hash(fullName + ':' + id).slice(0,40);
@@ -123,6 +126,29 @@ async function ingest(workspace, project, name, bytes, { connection, source, rem
   }
   return file;
 }
+// Image assets that left project.assets (replaced or their source removed). They are no longer
+// model input, but a chat transcript may still name one; such an asset keeps its bytes and stays
+// readable until no chat of the project mentions it (#218).
+function retire(project, assets) {
+  if (!assets.length) return;
+  const known = new Set((project.retiredAssets || []).map(a => a.id));
+  project.retiredAssets = [...(project.retiredAssets || []), ...assets.filter(a => a && a.id && !known.has(a.id)).map(a => ({ ...a, retiredAt: Date.now() }))];
+}
+// Asset ids named anywhere in this project's chat transcripts. Only called when an image is
+// about to be deleted, and reads each transcript once.
+function referencedAssets(workspace, project, candidates) {
+  const found = new Set();
+  if (!candidates.length || typeof workspace.historyPath !== 'function') return found;
+  for (const chat of project.chats || []) {
+    const chatId = chat && typeof chat === 'object' ? chat.id : chat;
+    if (typeof chatId !== 'string' || !chatId) continue;
+    let text;
+    try { text = fs.readFileSync(workspace.historyPath(chatId), 'utf8'); } catch { continue; }
+    for (const id of candidates) if (!found.has(id) && text.includes(id)) found.add(id);
+    if (found.size === candidates.length) break;
+  }
+  return found;
+}
 function prune(workspace, project) {
   const dir = directory(workspace, project.id);
   if (fs.existsSync(dir)) {
@@ -130,11 +156,16 @@ function prune(workspace, project) {
     for (const name of fs.readdirSync(dir)) if (!keep.has(name)) fs.rmSync(path.join(dir, name), { force: true });
   }
   const live = new Set((project.files || []).map(f => f.name));
+  retire(project, (project.assets || []).filter(a => a.sourceName && !live.has(a.sourceName)));
   project.assets = (project.assets || []).filter(a => !a.sourceName || live.has(a.sourceName));
   if (workspace.assetDir) {
     const assetDir = workspace.assetDir(project.id);
-    const keep = new Set(project.assets.map(a => a.id));
-    if (fs.existsSync(assetDir)) for (const name of fs.readdirSync(assetDir)) if (!keep.has(name)) fs.rmSync(path.join(assetDir, name), { force: true });
-  }
+    const current = new Set(project.assets.map(a => a.id));
+    const names = fs.existsSync(assetDir) ? fs.readdirSync(assetDir).filter(n => !current.has(n)) : [];
+    const referenced = referencedAssets(workspace, project, names);
+    project.retiredAssets = (project.retiredAssets || []).filter(a => referenced.has(a.id));
+    if (!project.retiredAssets.length) delete project.retiredAssets;
+    for (const name of names) if (!referenced.has(name)) fs.rmSync(path.join(assetDir, name), { force: true });
+  } else delete project.retiredAssets;
 }
 module.exports = { CAP, GROUPS, directory, classify, validate, ingest, original, prune };

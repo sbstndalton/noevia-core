@@ -107,6 +107,34 @@ function createOffsiteBackup({ store, key, paths, fs = nodeFs, now = Date.now, s
     return out;
   }
 
+  // Yields a file's content in CHUNK-sized pieces (an empty file yields one empty piece, so it
+  // still has a chunk list). Only one piece is in memory at a time.
+  async function* readPieces(abs, snap) {
+    if (snap) {
+      for (let offset = 0; offset < snap.length || offset === 0; offset += CHUNK) {
+        yield snap.subarray(offset, offset + CHUNK);
+        if (snap.length === 0) return;
+      }
+      return;
+    }
+    const fd = fs.openSync(abs, 'r');
+    try {
+      let first = true;
+      for (;;) {
+        const buffer = Buffer.allocUnsafe(CHUNK);
+        let filled = 0;
+        while (filled < CHUNK) {
+          const n = fs.readSync(fd, buffer, filled, CHUNK - filled, null);
+          if (!n) break;
+          filled += n;
+        }
+        if (filled || first) yield buffer.subarray(0, filled);
+        first = false;
+        if (filled < CHUNK) return;
+      }
+    } finally { fs.closeSync(fd); }
+  }
+
   async function backup() {
     if (running) throw fail('A backup is already running.', 409);
     running = (async () => {
@@ -117,36 +145,45 @@ function createOffsiteBackup({ store, key, paths, fs = nodeFs, now = Date.now, s
       const isSqlite = (abs) => /\.(db|sqlite3?)$/.test(abs);
       for (const [index, root] of paths.entries()) {
         for (const abs of walk(root)) {
-          let content;
+          // A snapshot hook hands back a Buffer (a consistent sqlite copy); anything else is
+          // streamed from disk CHUNK bytes at a time, so a large file is never held whole (#139).
+          let snap = null;
           if (snapshotFile && isSqlite(abs)) {
             // A live .db/.sqlite file must never be raw-read: without a
             // consistent snapshot (WAL not checkpointed, page writes
             // in-flight) the copy is torn and can pass a restore test while
             // being unusable. Skip the file and flag the manifest instead of
-            // silently falling back to fs.readFileSync.
-            let snap;
+            // silently falling back to a raw read.
             try { snap = await snapshotFile(abs); } catch { snap = null; }
             if (!snap) {
               log({ event: 'offsite.snapshot.skip', path: abs, reason: 'sqlite-snapshot-failed' });
               incomplete = true;
               continue;
             }
-            content = snap;
-          } else {
-            try { content = (snapshotFile && (await snapshotFile(abs))) || fs.readFileSync(abs); } catch { continue; }
+          } else if (snapshotFile) {
+            try { snap = await snapshotFile(abs); } catch { continue; }
           }
           const stat = fs.statSync(abs, { throwIfNoEntry: false });
           const chunks = [];
-          for (let offset = 0; offset < content.length || (offset === 0 && content.length === 0); offset += CHUNK) {
-            const piece = content.subarray(offset, offset + CHUNK);
+          const whole = crypto.createHash('sha256');
+          let size = 0;
+          const store1 = async (piece) => {
             const id = chunkId(piece);
             if (!known.has(id)) { await store.put(dataKey(id), seal(keys, piece)); known.add(id); uploaded++; bytes += piece.length; }
             chunks.push(id);
-            if (content.length === 0) break;
+            whole.update(piece); size += piece.length;
+          };
+          try {
+            for await (const piece of readPieces(abs, snap)) await store1(piece);
+          } catch (err) {
+            // A file that vanished or became unreadable is skipped, as a failed read always was;
+            // any chunks it already uploaded are unreferenced and go at the next forget().
+            if (err && typeof err.code === 'string') { log({ event: 'offsite.read.skip', path: abs, code: err.code }); continue; }
+            throw err;
           }
-          files.push({ root: index, path: nodePath.relative(root, abs).split(nodePath.sep).join('/'), size: content.length,
+          files.push({ root: index, path: nodePath.relative(root, abs).split(nodePath.sep).join('/'), size,
             mode: stat ? stat.mode & 0o777 : 0o600, mtime: stat ? Math.round(stat.mtimeMs) : 0,
-            sha256: crypto.createHash('sha256').update(content).digest('hex'), chunks });
+            sha256: whole.digest('hex'), chunks });
         }
       }
       const time = now();
@@ -195,19 +232,30 @@ function createOffsiteBackup({ store, key, paths, fs = nodeFs, now = Date.now, s
       if (!rel || rel.split('/').some((s) => !s || s === '.' || s === '..') || nodePath.isAbsolute(rel)) throw fail('The snapshot names an unsafe path.', 422);
       const dest = nodePath.join(base, String(file.root), ...rel.split('/'));
       if (!dest.startsWith(base + nodePath.sep)) throw fail('The snapshot names an unsafe path.', 422);
-      const parts = [];
-      for (const cid of file.chunks) {
-        if (!/^[a-f0-9]{64}$/.test(cid)) throw fail('The snapshot names an invalid chunk.', 422);
-        const sealed = await store.get(dataKey(cid));
-        if (!sealed) throw fail(`A chunk of ${rel} is missing from the destination.`, 422);
-        const plain = open(keys, sealed);
-        if (chunkId(plain) !== cid) throw fail(`A chunk of ${rel} does not match its id.`, 422);
-        parts.push(plain);
-      }
-      const content = Buffer.concat(parts);
-      if (crypto.createHash('sha256').update(content).digest('hex') !== file.sha256 || content.length !== file.size) throw fail(`${rel} does not match the snapshot.`, 422);
+      // Verify and write one chunk at a time; the whole file is never assembled in memory (#139).
+      // The file is created exclusively and removed again if it fails verification.
+      for (const cid of file.chunks) if (!/^[a-f0-9]{64}$/.test(cid)) throw fail('The snapshot names an invalid chunk.', 422);
       fs.mkdirSync(nodePath.dirname(dest), { recursive: true, mode: 0o700 });
-      fs.writeFileSync(dest, content, { mode: file.mode || 0o600, flag: 'wx' });
+      const fd = fs.openSync(dest, 'wx', file.mode || 0o600);
+      let ok = false;
+      try {
+        const whole = crypto.createHash('sha256');
+        let size = 0;
+        for (const cid of file.chunks) {
+          const sealed = await store.get(dataKey(cid));
+          if (!sealed) throw fail(`A chunk of ${rel} is missing from the destination.`, 422);
+          const plain = open(keys, sealed);
+          if (chunkId(plain) !== cid) throw fail(`A chunk of ${rel} does not match its id.`, 422);
+          whole.update(plain); size += plain.length;
+          if (size > file.size) throw fail(`${rel} does not match the snapshot.`, 422);
+          for (let written = 0; written < plain.length;) written += fs.writeSync(fd, plain, written, plain.length - written);
+        }
+        if (whole.digest('hex') !== file.sha256 || size !== file.size) throw fail(`${rel} does not match the snapshot.`, 422);
+        ok = true;
+      } finally {
+        fs.closeSync(fd);
+        if (!ok) fs.rmSync(dest, { force: true });
+      }
     }
     return { id, files: manifest.files.length };
   }
@@ -216,10 +264,12 @@ function createOffsiteBackup({ store, key, paths, fs = nodeFs, now = Date.now, s
   async function verify(scratchRoot) {
     const [latest] = await snapshots();
     if (!latest) throw fail('There is no snapshot to verify yet.', 409);
+    // mkdtemp creates a fresh 0700 directory only this process can write into; the restore goes
+    // into a new child of it. The scratch dir is never deleted and recreated, which would leave a
+    // window for another local user to plant a symlink at the shared-temp path (#140).
     const scratch = fs.mkdtempSync(nodePath.join(scratchRoot, 'noevia-restore-test-'));
     try {
-      fs.rmSync(scratch, { recursive: true, force: true });
-      const result = await restore(latest.id, scratch);
+      const result = await restore(latest.id, nodePath.join(scratch, 'restore'));
       log({ event: 'offsite.verify', id: latest.id, files: result.files });
       return { id: latest.id, files: result.files, verifiedAt: now() };
     } finally { fs.rmSync(scratch, { recursive: true, force: true }); }

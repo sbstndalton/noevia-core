@@ -167,3 +167,47 @@ test('new projects default to Auto routing; Manual only when asked for', async (
   assert.equal((await f.store.createProject({ name: 'C' })).routing, 'manual', 'the user\'s default applies');
   assert.equal((await f.store.createProject({ name: 'D', routing: 'auto' })).routing, 'auto');
 });
+
+test('withSourceLock is keyed by project id, so a rebuilt project object still waits for the lock (#217)', async () => {
+  const f = fixture();
+  const project = await f.store.createProject({ name: 'P' });
+  const rebuilt = { ...project }; // what a reload of the project list hands the next request
+  f.workspace.projects.splice(0, 1, rebuilt);
+  const order = [];
+  const first = f.store.withSourceLock(project, async () => { await new Promise((r) => setTimeout(r, 20)); order.push('old-object'); });
+  const second = f.store.withSourceLock(rebuilt, async () => { order.push('new-object'); });
+  await Promise.all([first, second]);
+  assert.deepEqual(order, ['old-object', 'new-object'], 'the second operation queued behind the first');
+});
+
+test('withSourceLock is re-entrant for the same project and never deadlocks (#217)', async () => {
+  const f = fixture();
+  const project = await f.store.createProject({ name: 'P' });
+  const result = await Promise.race([
+    f.store.withSourceLock(project, () => f.store.withSourceLock({ ...project }, async () => 'inner ran')),
+    new Promise((resolve) => setTimeout(() => resolve('deadlocked'), 500)),
+  ]);
+  assert.equal(result, 'inner ran');
+  // A sibling (not nested) operation still waits for the outer one.
+  const order = [];
+  const outer = f.store.withSourceLock(project, async () => { await f.store.withSourceLock(project, async () => order.push('nested')); await new Promise((r) => setTimeout(r, 10)); order.push('outer-done'); });
+  const sibling = f.store.withSourceLock(project, async () => order.push('sibling'));
+  await Promise.all([outer, sibling]);
+  assert.deepEqual(order, ['nested', 'outer-done', 'sibling']);
+  await assert.rejects(f.store.withSourceLock({}, async () => 1), /needs a project with an id/);
+});
+
+test('withSourceLock keys differ per tenant: the same project id in another workspace does not wait (#217)', async () => {
+  const f = fixture();
+  const project = await f.store.createProject({ name: 'P' });
+  const order = [];
+  let release;
+  const held = f.store.withSourceLock(project, () => new Promise((r) => { release = r; }));
+  const originalUser = f.workspace.userId;
+  f.workspace.userId = 'u2';
+  const other = f.store.withSourceLock({ id: project.id }, async () => order.push('other tenant'));
+  f.workspace.userId = originalUser;
+  await other;
+  assert.deepEqual(order, ['other tenant']);
+  release(); await held;
+});

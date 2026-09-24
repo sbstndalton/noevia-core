@@ -240,25 +240,43 @@ function createProjectStore({
 
   // Serialize source operations within one authenticated project. Config edits
   // and deletion can still happen while waiting; recheck ownership before commit.
-  const sourceOperations = new WeakMap();
+  //
+  // Keyed by tenant + project id, not by the project object: the workspace's project list is
+  // rebuilt from disk and by saves, and a lock keyed by object identity would let an upload
+  // holding the old object race one that fetched the new object for the same project (#217).
+  // A nested call for a key this async context already holds runs inline (re-entrant) rather
+  // than queueing behind itself, which would deadlock.
+  const sourceOperations = new Map(); // key -> promise tail
+  const heldSourceLocks = new (require('node:async_hooks').AsyncLocalStorage)();
+  function sourceLockKey(project) {
+    const workspace = currentWorkspace();
+    return JSON.stringify([String(workspace?.userId ?? workspace?.dir ?? ''), String(project?.id ?? '')]);
+  }
   async function withSourceLock(project, operation) {
-    const previous = sourceOperations.get(project) || Promise.resolve();
-    const next = previous.catch(() => {}).then(operation);
-    sourceOperations.set(project, next);
+    if (!project || typeof project.id !== 'string' || !project.id) throw new Error('withSourceLock needs a project with an id');
+    const key = sourceLockKey(project);
+    const held = heldSourceLocks.getStore();
+    if (held && held.has(key)) return operation();
+    const previous = sourceOperations.get(key) || Promise.resolve();
+    const next = previous.catch(() => {}).then(() => heldSourceLocks.run(new Set([...(held || []), key]), operation));
+    sourceOperations.set(key, next);
     try { return await next; }
     finally {
-      if (sourceOperations.get(project) === next) {
-        sourceOperations.delete(project);
+      if (sourceOperations.get(key) === next) {
+        sourceOperations.delete(key);
         pruneDocuments(project);
       }
     }
   }
   function pruneDocuments(project) {
-    if (sourceOperations.has(project)) return;
+    if (sourceOperations.has(sourceLockKey(project))) return;
     const workspace = currentWorkspace();
-    try { documentSources.prune(workspace, workspace.projects.includes(project) ? project : { id: project.id, files: [] }); }
+    // The live record for this id, not the (possibly superseded) object the caller held: a
+    // rebuilt project list must not make a stale reference look deleted and prune everything.
+    const live = (workspace.projects || []).find((p) => p && p.id === project.id) || { id: project.id, files: [] };
+    try { documentSources.prune(workspace, live); }
     catch (err) { console.warn('[documents] cleanup failed:', err.message); }
-    try { require('./uploads.cjs').prune(workspace, workspace.projects.includes(project) ? project : { id: project.id, files: [] }); }
+    try { require('./uploads.cjs').prune(workspace, live); }
     catch (err) { console.warn('[uploads] cleanup failed:', err.message); }
   }
   // One write path for server-authored project text files (MCP writes, research reports), the

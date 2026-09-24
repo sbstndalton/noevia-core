@@ -195,6 +195,10 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
   function can(id, capability) { return !!get(id)?.capabilities.includes(capability); }
   // Runs `work` for a created job. The job completes, fails or is cancelled exactly once.
   async function run(id, work) {
+    // A second run() of a live id would replace the first run's controller, and the first
+    // run's finally would then delete the second's: cancel would miss it and the final
+    // write would race. Refuse it before touching the journal.
+    if (controllers.has(id)) throw Object.assign(Error('This job is already running'), { status: 409 });
     const controller = new AbortController();
     // append() must succeed (job not finished, journal writable) before this job is
     // considered "running" — if it throws (409 on an already-finished job, disk full),

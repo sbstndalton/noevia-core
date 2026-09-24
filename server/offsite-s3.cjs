@@ -3,9 +3,34 @@
 // Credentials come from env and are only ever sent in signed headers, never in URLs or logs.
 const { signS3Request } = require('./s3-sign.cjs');
 
+// A data object is one sealed CHUNK (4 MiB + 28 bytes); manifests list files and stay far below
+// this. A destination that answers with more is refused while streaming, never buffered (#139).
+const MAX_OBJECT_BYTES = 64 * 1024 * 1024;
+const tooLarge = () => Object.assign(Error('A backup object from the destination is larger than any object this backup writes.'), { status: 502 });
+async function readCapped(response, limit) {
+  const declared = Number(response.headers?.get?.('content-length'));
+  if (Number.isFinite(declared) && declared > limit) { response.body?.cancel?.().catch(() => {}); throw tooLarge(); }
+  if (response.body && typeof response.body.getReader === 'function') {
+    const reader = response.body.getReader();
+    const chunks = [];
+    let received = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      received += value.length;
+      if (received > limit) { reader.cancel().catch(() => {}); throw tooLarge(); }
+      chunks.push(Buffer.from(value));
+    }
+    return Buffer.concat(chunks);
+  }
+  const bytes = Buffer.from(await response.arrayBuffer());
+  if (bytes.length > limit) throw tooLarge();
+  return bytes;
+}
+
 const decode = (s) => s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&');
 
-function createS3Store({ endpoint, bucket, region = 'us-east-1', accessKeyId, secretAccessKey, prefix = 'noevia-backup', fetchImpl = fetch, timeoutMs = 60000 }) {
+function createS3Store({ endpoint, bucket, region = 'us-east-1', accessKeyId, secretAccessKey, prefix = 'noevia-backup', fetchImpl = fetch, timeoutMs = 60000, maxObjectBytes = MAX_OBJECT_BYTES }) {
   if (!endpoint || !bucket || !accessKeyId || !secretAccessKey) throw Object.assign(Error('Offsite backup needs endpoint, bucket and credentials.'), { status: 409 });
   const base = new URL(endpoint);
   if (base.protocol !== 'https:' && !['127.0.0.1', 'localhost', '[::1]'].includes(base.hostname)) throw Object.assign(Error('Offsite backup endpoints must use HTTPS.'), { status: 409 });
@@ -37,7 +62,7 @@ function createS3Store({ endpoint, bucket, region = 'us-east-1', accessKeyId, se
       const r = await request('GET', url(key));
       if (r.status === 404) return null;
       if (!r.ok) throw Object.assign(Error(`The backup destination refused a read (${r.status}).`), { status: 502 });
-      return Buffer.from(await r.arrayBuffer());
+      return readCapped(r, maxObjectBytes);
     },
     async delete(key) {
       const r = await request('DELETE', url(key));
@@ -65,4 +90,4 @@ function createS3Store({ endpoint, bucket, region = 'us-east-1', accessKeyId, se
   };
 }
 
-module.exports = { createS3Store };
+module.exports = { createS3Store, MAX_OBJECT_BYTES };

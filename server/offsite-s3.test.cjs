@@ -103,3 +103,17 @@ test('put/get/list/delete surface a clear error when the destination refuses', a
   await assert.rejects(() => s.get('k'), /refused a read/);
   await assert.rejects(() => s.list('k'), /refused a listing/);
 });
+
+test('get() refuses an oversized object while streaming instead of buffering it (#139)', async () => {
+  let pulled = 0;
+  const endless = async () => new Response(new ReadableStream({ pull(c) { pulled++; c.enqueue(new Uint8Array(1024)); } }));
+  const s = createS3Store({ endpoint: 'https://s3.example.test', bucket: 'b', accessKeyId: 'AKIATEST', secretAccessKey: 'secret', fetchImpl: endless, maxObjectBytes: 10 * 1024 });
+  await assert.rejects(s.get('data/aa/x'), (e) => e.status === 502 && /larger than/.test(e.message));
+  assert.ok(pulled <= 12, `stopped after the cap (${pulled} KiB pulled)`);
+  const declared = createS3Store({ endpoint: 'https://s3.example.test', bucket: 'b', accessKeyId: 'AKIATEST', secretAccessKey: 'secret', maxObjectBytes: 4,
+    fetchImpl: async () => new Response('12345678', { headers: { 'content-length': '8' } }) });
+  await assert.rejects(declared.get('config'), /larger than/);
+  const fits = createS3Store({ endpoint: 'https://s3.example.test', bucket: 'b', accessKeyId: 'AKIATEST', secretAccessKey: 'secret', maxObjectBytes: 8,
+    fetchImpl: async () => new Response('12345678') });
+  assert.equal((await fits.get('config')).toString(), '12345678');
+});

@@ -167,3 +167,46 @@ test('malformed background source JSON is 400 before any job is dispatched', asy
   }
   assert.deepEqual(f.dispatched, []);
 });
+
+test('a project id from another tenant 404s on the upload path: getProject reads only the current workspace (#116)', async () => {
+  const { createProjectStore } = require('../projects.cjs');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-tenant-'));
+  const mk = (userId) => ({ dir: path.join(root, userId), userId, projects: [], freeChats: [], saveProjects() {}, saveFreeChats() {}, historyPath: (id) => path.join(root, userId, `h-${id}.json`), assetDir: (id) => path.join(root, userId, 'assets', id), ragDir: () => path.join(root, userId, 'rag') });
+  const tenants = { alice: mk('alice'), bob: mk('bob') };
+  tenants.bob.projects.push({ id: 'proj-bob', name: 'Bob only', files: [], chats: [] });
+  tenants.alice.projects.push({ id: 'proj-alice', name: 'Alice', files: [], chats: [] });
+  const scope = new AsyncLocalStorage();
+  const currentWorkspace = () => tenants[scope.getStore().user];
+  // The same request-scoped array view index.cjs builds (arrayProxy).
+  const view = (field) => new Proxy([], {
+    get(_t, prop) { const v = currentWorkspace()[field][prop]; return typeof v === 'function' ? v.bind(currentWorkspace()[field]) : v; },
+    set(_t, prop, v) { currentWorkspace()[field][prop] = v; return true; },
+    ownKeys() { return Reflect.ownKeys(currentWorkspace()[field]); },
+    getOwnPropertyDescriptor() { return { enumerable: true, configurable: true }; },
+  });
+  const PROJECTS = view('projects');
+  const store = createProjectStore({ fs, path, reasoningEffort: {}, projectAppearance: () => ({}), rag: {}, storageClient: { isBrowsable: () => false }, documentSources: {}, authService: {},
+    currentWorkspace, PROJECTS, FREE_CHATS: view('freeChats'), sanitizeToolboxes: () => null, defaultToolboxes: () => [], PROJECT_ROOT_FOLDER: 'x', createProjectFolder: async () => null, projectSweep: {} });
+  const sent = [];
+  let touchedLock = false;
+  const routes = createProjectRoutes({
+    json: (_res, status, body) => { sent.push({ status, body }); }, readBody: async () => '{}', readJson: async () => ({}), requestScope: scope, dispatch: async () => {},
+    currentWorkspace, authService: { getStorage: () => ({ kind: 'local' }) }, storageClient: { isBrowsable: () => false, TEXT_EXTENSIONS: new Set(['.txt']) }, documents: { isDocument: () => false },
+    documentSources: {}, rag: {}, fs, path, reasoningEffort: {}, projectAppearance: () => ({}), diaryExtras: { chatProjectId: () => null }, PROJECTS, DEFAULT_TOOLBOXES: [], sanitizeToolboxes: () => null,
+    getProvider: () => null, ensureRolesLoaded() {}, store: { ...store, withSourceLock: (...a) => { touchedLock = true; return store.withSourceLock(...a); } },
+  });
+  const upload = (user, id) => scope.run({ user }, () => {
+    const p = `/api/projects/${id}/upload`;
+    const req = Readable.from([Buffer.from(JSON.stringify({ name: 'n.txt', dataBase64: Buffer.from('synthetic').toString('base64'), organized: true }))]);
+    Object.assign(req, { method: 'POST', url: p, headers: {}, socket: {} });
+    return routes(req, { writeHead() {}, end() {} }, { path: p, authn: { user: { id: user } }, url: new URL(`http://localhost${p}`) });
+  });
+  try {
+    await upload('alice', 'proj-bob');
+    assert.deepEqual(sent.pop(), { status: 404, body: { error: 'no such project' } });
+    assert.equal(touchedLock, false, 'no source lock or write was attempted for a foreign project');
+    assert.deepEqual(tenants.bob.projects[0].files, [], 'the other tenant\'s project is untouched');
+    scope.run({ user: 'bob' }, () => assert.equal(store.getProject('proj-bob').name, 'Bob only'));
+    scope.run({ user: 'alice' }, () => assert.equal(store.getProject('proj-bob'), null));
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});

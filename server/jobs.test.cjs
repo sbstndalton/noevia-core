@@ -233,3 +233,18 @@ test('a torn last line is tolerated; corruption elsewhere in one journal never b
   const created = sources.create({ kind: 'source' });
   assert.equal(sources.get(created).status, 'queued');
 });
+
+test('a second run() of a live job id is refused, so cancel and the final write stay with the first run (#157)', async () => {
+  const dir = tmp();
+  try {
+    const jobs = createJobs({ dir });
+    const id = jobs.create({ kind: 'x' });
+    const first = jobs.run(id, (ctx) => new Promise((resolve) => ctx.signal.addEventListener('abort', () => resolve('stopped'))));
+    await assert.rejects(jobs.run(id, async () => 'second'), (err) => err.status === 409 && /already running/.test(err.message));
+    assert.equal(jobs.get(id).status, 'running');
+    jobs.cancel(id);
+    const done = await first;
+    assert.equal(done.status, 'cancelled', 'cancel reached the first run\'s controller');
+    assert.equal(done.result, 'stopped');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});

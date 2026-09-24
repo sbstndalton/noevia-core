@@ -149,3 +149,47 @@ test('S3 store signs requests, pages listings and never puts secrets in URLs', a
   assert.throws(() => createS3Store({ endpoint: 'http://backup.example', bucket: 'b', accessKeyId: 'a', secretAccessKey: 's' }), /HTTPS/);
   assert.throws(() => createS3Store({ endpoint: 'https://key:secret@backup.example', bucket: 'b', accessKeyId: 'a', secretAccessKey: 's' }), /credentials/);
 });
+
+test('large files are streamed in CHUNK pieces, never read whole, and restore byte-identical (#139)', async (t) => {
+  const { CHUNK } = require('./offsite-backup.cjs');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-offsite-big-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const data = path.join(root, 'data'); fs.mkdirSync(data);
+  const big = crypto.randomBytes(CHUNK * 2 + 123);
+  fs.writeFileSync(path.join(data, 'big.bin'), big);
+  const guarded = { ...fs, readFileSync: (...a) => { if (String(a[0]).endsWith('big.bin')) throw Error('whole-file read'); return fs.readFileSync(...a); } };
+  const store = memoryStore();
+  const b = createOffsiteBackup({ store, key: KEY, paths: [data], fs: guarded });
+  const snap = await b.backup();
+  assert.equal(snap.files, 1); assert.equal(snap.uploadedChunks, 3);
+  const target = path.join(root, 'restore');
+  await b.restore(snap.id, target);
+  assert.ok(fs.readFileSync(path.join(target, '0', 'big.bin')).equals(big));
+  // A tampered chunk leaves no partial file behind.
+  const [dataKey] = [...store.m.keys()].filter((k) => k.startsWith('data/'));
+  const bad = Buffer.from(store.m.get(dataKey)); bad[20] ^= 1; store.m.set(dataKey, bad);
+  const target2 = path.join(root, 'restore2');
+  await assert.rejects(b.restore(snap.id, target2), /failed authentication/);
+  assert.equal(fs.existsSync(path.join(target2, '0', 'big.bin')), false);
+});
+
+test('the restore test never deletes and recreates its scratch dir; it restores into a child of a private mkdtemp dir (#140)', async (t) => {
+  const { data } = tree(t);
+  const scratchRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-scratch-root-'));
+  t.after(() => fs.rmSync(scratchRoot, { recursive: true, force: true }));
+  const calls = [];
+  const spy = { ...fs,
+    mkdtempSync: (...a) => { const d = fs.mkdtempSync(...a); calls.push(['mkdtemp', d]); return d; },
+    rmSync: (p, o) => { calls.push(['rm', p]); return fs.rmSync(p, o); },
+    mkdirSync: (p, o) => { calls.push(['mkdir', p]); return fs.mkdirSync(p, o); } };
+  const b = createOffsiteBackup({ store: memoryStore(), key: KEY, paths: [data], fs: spy });
+  await b.backup();
+  const result = await b.verify(scratchRoot);
+  assert.equal(result.files, 3);
+  const [[, scratch]] = calls.filter(([op]) => op === 'mkdtemp');
+  assert.equal(fs.statSync(scratchRoot).isDirectory(), true);
+  const rmIndex = calls.findIndex(([op, p]) => op === 'rm' && p === scratch);
+  assert.equal(rmIndex, calls.length - 1, 'the scratch dir is removed exactly once, at the end');
+  assert.ok(!calls.some(([op, p]) => op === 'mkdir' && p === scratch), 'the scratch dir itself is never recreated');
+  assert.equal(fs.existsSync(scratch), false);
+});

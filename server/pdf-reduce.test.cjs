@@ -18,3 +18,13 @@ test('unavailable, busy, failed and invalid workers never create an accepted sou
  for(const status of [503,422])await assert.rejects(prepare('a.pdf',large,{url:'http://worker',fetchImpl:async()=>new Response('',{status})}));
  await assert.rejects(prepare('a.pdf',large,{url:'http://worker',fetchImpl:async()=>Response.json({kind:'pdf',dataBase64:'bad'})}),/Invalid/);
 });
+test('an oversized worker response is refused while streaming, never buffered whole (#130)',async()=>{
+ const {readCappedJson}=require('./pdf-reduce.cjs');
+ let pulled=0;
+ const endless=()=>new Response(new ReadableStream({pull(c){pulled++;c.enqueue(new Uint8Array(1024*1024).fill(32));}}));
+ await assert.rejects(prepare('a.pdf',large,{url:'http://worker',fetchImpl:async()=>endless()}),e=>e.status===502&&/too large/.test(e.message));
+ assert.ok(pulled<60,`stopped reading after the cap (${pulled} MiB pulled)`);
+ await assert.rejects(readCappedJson(new Response('x'.repeat(100),{headers:{'content-length':'100'}}),10),/too large/);
+ await assert.rejects(readCappedJson(new Response('{"kind":'),1000),/Invalid PDF reduction response/);
+ assert.deepEqual(await readCappedJson(Response.json({kind:'text'}),1000),{kind:'text'});
+});

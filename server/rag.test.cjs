@@ -391,3 +391,36 @@ test('KNOWN LIMIT: with no vectors, a large file contributes only its head', asy
   assert.match(out, /File "unindexed\.txt" \(excerpts\)/);
   assert.equal(out.includes('TAIL-MARKER'), false);
 });
+
+test('a search while a newer version is being indexed never returns chunks of the old version (#122)', async () => {
+  reset();
+  const v1 = Array.from({ length: 20 }, (_, i) => `walrus passage ${i} ${'filler '.repeat(200)}`).join('\n\n');
+  const v2 = Array.from({ length: 20 }, (_, i) => `zebra passage ${i} ${'filler '.repeat(200)}`).join('\n\n');
+  // Let v1's first embedding batch land, then hold its second batch: v1 is now partly
+  // searchable and its run still owns the per-file queue.
+  const mockFetch = global.fetch;
+  let batches = 0, release;
+  const gate = new Promise((r) => { release = r; });
+  global.fetch = async (url, options) => {
+    if (JSON.parse(options.body).input.length > 1 && batches++ >= 1) await gate;
+    return mockFetch(url, options);
+  };
+  try {
+    const first = rag.indexProjectFile('p-version', 'doc.txt', v1, null);
+    while (batches < 2) await new Promise((r) => setImmediate(r));
+    const before = await rag.searchProject('p-version', 'walrus', null);
+    assert.ok(before.length > 0 && before.every((h) => /walrus/.test(h.body)), 'the version being indexed is searchable');
+    // A newer version is requested; it queues behind the held run. Until it lands, the old
+    // chunks must not be served as if current.
+    const second = rag.indexProjectFile('p-version', 'doc.txt', v2, null);
+    assert.deepEqual(await rag.searchProject('p-version', 'walrus', null), [], 'no hit from the superseded version');
+    release();
+    await first; await second;
+    const after = await rag.searchProject('p-version', 'zebra', null);
+    assert.ok(after.length > 0 && after.every((h) => /zebra/.test(h.body)));
+    assert.deepEqual(await rag.searchProject('p-version', 'walrus', null), []);
+    // A delete retires every version at once.
+    rag.deleteProjectFile('p-version', 'doc.txt', null);
+    assert.deepEqual(await rag.searchProject('p-version', 'zebra', null), []);
+  } finally { global.fetch = mockFetch; release(); }
+});

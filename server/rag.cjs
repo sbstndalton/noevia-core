@@ -207,6 +207,9 @@ function openIndex(projectId, userId) {
       CREATE UNIQUE INDEX IF NOT EXISTS idx_chunks_file_hash ON chunks(file, content_hash);
       CREATE TABLE IF NOT EXISTS vec_meta (key TEXT PRIMARY KEY, value TEXT);
     `);
+    // Which version of the file (sha256 of its full text) a chunk was cut from (#122). Older
+    // indexes gain the column empty; those rows are simply unversioned until re-indexed.
+    if (!db.prepare('PRAGMA table_info(chunks)').all().some((c) => c.name === 'version')) db.exec('ALTER TABLE chunks ADD COLUMN version TEXT');
     let dim = null;
     const row = db.prepare("SELECT value FROM vec_meta WHERE key='dim'").get();
     if (row) dim = Number(row.value);
@@ -239,6 +242,10 @@ function dropFileRows(index, fileName) {
 const fileQueues = new Map(); // key -> promise tail
 const fileGenerations = new Map(); // key -> latest generation
 const fileKey = (projectId, fileName, userId) => JSON.stringify([userId || null, projectId, fileName]);
+// The version (sha256 of the full text) each file is being indexed at, set the moment a
+// re-index is requested. Searches drop hits whose chunk version differs, so a chat that runs
+// while a newer version waits in the queue (or is mid-embed) never reads the old text (#122).
+const fileVersions = new Map(); // key -> version hash
 const bumpGeneration = (key) => { const g = (fileGenerations.get(key) || 0) + 1; fileGenerations.set(key, g); return g; };
 
 async function embedBatchAndStore(index, rows, isCurrent = () => true) {
@@ -287,16 +294,18 @@ async function embedBatchAndStore(index, rows, isCurrent = () => true) {
 function indexProjectFile(projectId, fileName, text, userId) {
   const key = fileKey(projectId, fileName, userId);
   const generation = bumpGeneration(key);
+  const version = hash(String(text));
+  fileVersions.set(key, version);
   const run = (fileQueues.get(key) || Promise.resolve())
     .catch(() => {})
-    .then(() => indexProjectFileNow(projectId, fileName, text, userId, () => fileGenerations.get(key) === generation));
+    .then(() => indexProjectFileNow(projectId, fileName, text, userId, () => fileGenerations.get(key) === generation, version));
   const tail = run.catch(() => {});
   fileQueues.set(key, tail);
   tail.then(() => { if (fileQueues.get(key) === tail) fileQueues.delete(key); });
   return run;
 }
 
-async function indexProjectFileNow(projectId, fileName, text, userId, isCurrent) {
+async function indexProjectFileNow(projectId, fileName, text, userId, isCurrent, version = hash(String(text))) {
   if (!isCurrent()) return { ok: true, stored: 0, embedded: 0, superseded: true };
   const index = openIndex(projectId, userId);
   if (!index) return { ok: false, reason: 'rag-unavailable' };
@@ -306,8 +315,8 @@ async function indexProjectFileNow(projectId, fileName, text, userId, isCurrent)
       index.db.transaction(() => {
         dropFileRows(index, fileName);
         index.db
-          .prepare('INSERT INTO chunks (file, chunk_no, body, content_hash) VALUES (?, 0, ?, ?)')
-          .run(fileName, text, hash(text));
+          .prepare('INSERT INTO chunks (file, chunk_no, body, content_hash, version) VALUES (?, 0, ?, ?, ?)')
+          .run(fileName, text, hash(text), version);
       })();
       return { ok: true, stored: 1, embedded: 0, direct: true };
     }
@@ -323,10 +332,10 @@ async function indexProjectFileNow(projectId, fileName, text, userId, isCurrent)
       seen.add(h);
       unique.push(body);
     }
-    const ins = index.db.prepare('INSERT INTO chunks (file, chunk_no, body, content_hash) VALUES (?, ?, ?, ?)');
+    const ins = index.db.prepare('INSERT INTO chunks (file, chunk_no, body, content_hash, version) VALUES (?, ?, ?, ?, ?)');
     const rows = index.db.transaction(() => {
       dropFileRows(index, fileName);
-      return unique.map((body, i) => ({ id: Number(ins.run(fileName, i, body, hash(body)).lastInsertRowid), body }));
+      return unique.map((body, i) => ({ id: Number(ins.run(fileName, i, body, hash(body), version).lastInsertRowid), body }));
     })();
     let embedded = 0;
     try {
@@ -343,14 +352,28 @@ async function indexProjectFileNow(projectId, fileName, text, userId, isCurrent)
 // Drop one file's chunks (called when a file is removed from a project).
 function deleteProjectFile(projectId, fileName, userId) {
   // Supersede any index run still embedding this file, so it cannot write vectors afterwards.
-  bumpGeneration(fileKey(projectId, fileName, userId));
+  const key = fileKey(projectId, fileName, userId);
+  bumpGeneration(key);
+  // No version is current any more: until the rows are gone, and if dropping them fails, every
+  // remaining chunk of this file is filtered out of search.
+  fileVersions.set(key, null);
   const index = openIndex(projectId, userId);
   if (!index) return;
   try {
     index.db.transaction(() => dropFileRows(index, fileName))();
+    if (fileVersions.get(key) === null) fileVersions.delete(key);
   } finally {
     index.db.close();
   }
+}
+
+// A chunk is current when no re-index or delete of its file has been requested in this process
+// (nothing newer is known), or when it was cut from the version most recently requested.
+function isCurrentVersion(projectId, fileName, userId, version) {
+  const key = fileKey(projectId, fileName, userId);
+  if (!fileVersions.has(key)) return true;
+  const want = fileVersions.get(key);
+  return want !== null && version === want;
 }
 
 // Top-K chunks for a query, this project's index only. Empty array on any
@@ -364,14 +387,14 @@ async function searchProject(projectId, query, userId) {
     const qbuf = serializeF32(qvec);
     const rows = index.db
       .prepare(
-        `SELECT c.file, c.chunk_no, c.body, 1.0 - vec_distance_cosine(v.embedding, ?) AS score
+        `SELECT c.file, c.chunk_no, c.body, c.version, 1.0 - vec_distance_cosine(v.embedding, ?) AS score
          FROM vec_items v JOIN chunks c ON c.id = v.chunk_id
          WHERE 1.0 - vec_distance_cosine(v.embedding, ?) >= ?
          ORDER BY score DESC
          LIMIT ?`
       )
-      .all(qbuf, qbuf, MIN_SCORE, rerank ? rerank.pool : TOP_K);
-    const hits = rows.map((r) => ({ file: r.file, body: r.body, score: Math.round(r.score * 1000) / 1000 }));
+      .all(qbuf, qbuf, MIN_SCORE, (rerank ? rerank.pool : TOP_K) * 4);
+    const hits = rows.filter((r) => isCurrentVersion(projectId, r.file, userId, r.version)).slice(0, rerank ? rerank.pool : TOP_K).map((r) => ({ file: r.file, body: r.body, score: Math.round(r.score * 1000) / 1000 }));
     if (!rerank) return hits;
     return await rerankPool({ query, pool: hits, decisions: rerank.decisions, keep: rerank.keep, deadlineMs: rerank.deadlineMs });
   } catch (err) {

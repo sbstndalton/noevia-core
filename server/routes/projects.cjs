@@ -549,7 +549,9 @@ function createProjectRoutes({
       const assetId = decodeURIComponent(projAssetOne[2]).replace(/[^a-zA-Z0-9_-]/g, '');
       const project = getProject(id);
       if (!project) return json(res, 404, { error: 'no such project' });
-      const asset = (project.assets || []).find((a) => a.id === assetId);
+      // A retired image (replaced, but still named by a chat transcript) stays readable (#218).
+      const asset = (project.assets || []).find((a) => a.id === assetId)
+        || (req.method === 'GET' ? (project.retiredAssets || []).find((a) => a.id === assetId) : null);
       if (!asset) return json(res, 404, { error: 'no such image' });
       const file = path.join(currentWorkspace().assetDir(id), assetId);
       if (req.method === 'GET') {
