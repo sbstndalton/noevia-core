@@ -29,8 +29,10 @@ const PASS = Symbol('unhandled');
  * @param {string} deps.DIARY_BASE
  * @param {string} deps.DIARY_TOKEN
  * @param {object} deps.env                              process.env, read at call time
+ * @param {{ forgetUser: (userId:string) => void }} [deps.mcpOAuth]      OAuth sign-ins, keyed per (user, server)
+ * @param {{ forgetUser: (userId:string) => void }} [deps.directoryMcp]  directory server keys, keyed per (user, server)
  */
-function createAuthRoutes({ json, authResult, readJson, authService, publicAuthRoutes, davSettings, davConfig, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, env }) {
+function createAuthRoutes({ json, authResult, readJson, authService, publicAuthRoutes, davSettings, davConfig, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, env, mcpOAuth, directoryMcp }) {
   async function open(req, res, { path: p }) {
     if (p === '/api/setup/status' && req.method === 'GET') {
       return json(res, 200, { configured: authService.userCount() > 0, publicOrigin: authService.origin || env.PUBLIC_ORIGIN || '' });
@@ -133,6 +135,8 @@ function createAuthRoutes({ json, authResult, readJson, authService, publicAuthR
           if (ok) {
             workspaceStore.remove(id);
             await driveAccounts.removeUser(id);
+            mcpOAuth?.forgetUser(id);
+            directoryMcp?.forgetUser(id);
             const headers = { 'X-Cowork-User-ID': id };
             if (DIARY_TOKEN) headers.Authorization = `Bearer ${DIARY_TOKEN}`;
             await fetchJson(`${DIARY_BASE}/api/internal/tenant`, { method: 'DELETE', headers }, 15000).catch(() => null);

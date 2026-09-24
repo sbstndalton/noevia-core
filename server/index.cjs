@@ -441,6 +441,7 @@ const mcpWiring = createMcpWiring({
   isWriteTool: (name) => isWriteTool(name),
   internal: mcpInternal, internalKey: MCP_INTERNAL_KEY,
   reduceToolResult, resultCap: TOOL_RESULT_CAP,
+  isUserDisabled: (userId) => !!authService.listUsers().find((u) => u.id === userId)?.disabled,
 });
 const { state: mcpState, oauthServerIds, accountReady, probeMcpAuth, syncDirectoryServers, discoverOneServer, discoverMcpTools, executeMcpToolCall } = mcpWiring;
 
@@ -538,6 +539,7 @@ const publicAuthRoutes = new Set([
 ]);
 const authRoutes = require('./routes/auth.cjs').createAuthRoutes({
   json, authResult, readJson, authService, publicAuthRoutes, davSettings, davConfig, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, env: process.env,
+  mcpOAuth, directoryMcp,
 });
 // The user's own storage connection: read, save, test, browse, one folder, the Nextcloud login flow
 // (routes/storage.cjs). fetch is resolved per call: tests swap the global at runtime.

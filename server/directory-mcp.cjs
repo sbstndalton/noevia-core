@@ -25,7 +25,7 @@ function checkHeaderValues(declared, values) {
     let v = values && typeof values[h.name] === 'string' ? values[h.name].trim() : '';
     if (!v) { if (h.required) throw Object.assign(new Error(`Enter ${h.name}.`), { status: 400 }); continue; }
     if (v.length > 4096 || /[\r\n\0]/.test(v)) throw Object.assign(new Error(`${h.name} must be a single line under 4 KB.`), { status: 400 });
-    if (h.template) v = h.template.replace(/\{[^}]+\}/, v);
+    if (h.template) v = h.template.replace(/\{[^}]+\}/, () => v);
     out[h.name] = v;
   }
   return out;
@@ -90,6 +90,11 @@ function createDirectoryMcp({ db, audit = () => {}, secrets = null }) {
     audit('mcp.directory.user-key.remove', userId, { id });
   }
 
+  /** A deleted account takes its own per-server keys with it (every server). */
+  function forgetUser(userId) {
+    db.prepare('DELETE FROM directory_mcp_user_keys WHERE user_id=?').run(userId);
+  }
+
   function remove(id, actorId) {
     const row = list().find((s) => s.id === id);
     if (!row) throw Object.assign(new Error('No such server.'), { status: 404 });
@@ -104,7 +109,7 @@ function createDirectoryMcp({ db, audit = () => {}, secrets = null }) {
   const boxFor = (server, toolNames) => ({ id: server.id, server: server.id, label: server.title, directory: true,
     description: `Added from the MCP directory. Every call asks first.`, tools: [...toolNames] });
 
-  return { list, add, remove, setKeys, headersFor, userHeadersFor, hasUserKey, setUserKey, clearUserKey, asServers, boxFor, idFor };
+  return { list, add, remove, setKeys, headersFor, userHeadersFor, hasUserKey, setUserKey, clearUserKey, forgetUser, asServers, boxFor, idFor };
 }
 
 module.exports = { createDirectoryMcp, hostedUrlOk, checkHeaderValues };

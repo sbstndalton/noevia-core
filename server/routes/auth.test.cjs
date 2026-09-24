@@ -42,6 +42,8 @@ function fixture({ users = 1, originOk = true } = {}) {
     driveAccounts: { removeUser: async (id) => calls.push(['drive.removeUser', id]) },
     fetchJson: async (url, init) => { calls.push(['fetch', url, init.method, init.headers]); return { ok: true }; },
     DIARY_BASE: 'http://diary:8010', DIARY_TOKEN: 'sidecar-token', env: { PUBLIC_ORIGIN: 'https://env.example' },
+    mcpOAuth: { forgetUser: (id) => calls.push(['mcpOAuth.forgetUser', id]) },
+    directoryMcp: { forgetUser: (id) => calls.push(['directoryMcp.forgetUser', id]) },
   });
   const call = (mount, method, path, body, { role = 'member', legacy = false, cookie = '' } = {}) => {
     const req = Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body))]);
@@ -136,6 +138,8 @@ test('deleting an account also removes its workspace, its Drive and its Diary te
   assert.equal(f.calls.length, 0);
   await f.call('account', 'DELETE', '/api/admin/users/u2', { username: 'two' }, { role: 'admin' });
   assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true } });
-  assert.deepEqual(f.calls.map((c) => c[0]), ['workspace.remove', 'drive.removeUser', 'fetch']);
-  assert.deepEqual(f.calls[2].slice(1), ['http://diary:8010/api/internal/tenant', 'DELETE', { 'X-Cowork-User-ID': 'u2', Authorization: 'Bearer sidecar-token' }]);
+  assert.deepEqual(f.calls.map((c) => c[0]), ['workspace.remove', 'drive.removeUser', 'mcpOAuth.forgetUser', 'directoryMcp.forgetUser', 'fetch']);
+  assert.deepEqual(f.calls[2].slice(1), ['u2']);
+  assert.deepEqual(f.calls[3].slice(1), ['u2']);
+  assert.deepEqual(f.calls[4].slice(1), ['http://diary:8010/api/internal/tenant', 'DELETE', { 'X-Cowork-User-ID': 'u2', Authorization: 'Bearer sidecar-token' }]);
 });

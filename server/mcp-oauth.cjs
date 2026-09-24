@@ -159,7 +159,12 @@ function createMcpOAuth({ db, secrets, fetchImpl = globalThis.fetch, urlAllowed,
     db.prepare('DELETE FROM mcp_oauth_clients WHERE server_id=?').run(serverId);
   }
 
-  return { discover, start, finish, tokenFor, connected, disconnect, forget, setClient, clientInfo };
+  /** A deleted account takes every one of its own sign-ins with it (every server). */
+  function forgetUser(userId) {
+    db.prepare('DELETE FROM mcp_oauth_tokens WHERE user_id=?').run(userId);
+  }
+
+  return { discover, start, finish, tokenFor, connected, disconnect, forget, forgetUser, setClient, clientInfo };
 }
 
 module.exports = { createMcpOAuth };

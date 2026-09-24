@@ -65,3 +65,28 @@ test('personal servers keep one key per account and no shared key', () => {
   dir.clearUserKey('member', s.id); assert.equal(dir.hasUserKey('member', s.id), false);
   dir.remove(s.id); assert.equal(db.prepare('SELECT COUNT(*) n FROM directory_mcp_user_keys').get().n, 0, 'removing the server drops every key');
 });
+
+test('forgetUser drops one account\'s keys across every server, leaving others intact', () => {
+  const secrets = { encrypt: (v) => 'enc:' + Buffer.from(v).toString('base64'), decrypt: (v) => Buffer.from(v.slice(4), 'base64').toString() };
+  const db = new Database(':memory:');
+  const dir = createDirectoryMcp({ db, secrets });
+  const declared = [{ name: 'Authorization', required: true, secret: true, template: null }];
+  const s1 = dir.add({ registryName: 'p1', title: 'P1', url: 'https://p1.example/mcp', declaredHeaders: declared, headerValues: { Authorization: 'A' }, personal: true }, 'admin');
+  const s2 = dir.add({ registryName: 'p2', title: 'P2', url: 'https://p2.example/mcp', declaredHeaders: declared, headerValues: { Authorization: 'A' }, personal: true }, 'admin');
+  dir.setUserKey('member', s1.id, { Authorization: 'M1' });
+  dir.setUserKey('member', s2.id, { Authorization: 'M2' });
+  dir.setUserKey('other', s1.id, { Authorization: 'O1' });
+  dir.forgetUser('member');
+  assert.equal(dir.hasUserKey('member', s1.id), false);
+  assert.equal(dir.hasUserKey('member', s2.id), false);
+  assert.equal(dir.hasUserKey('other', s1.id), true, 'another account keeps its own key');
+});
+
+test('a "$$" in a key value is not treated as a template replacement pattern', () => {
+  const secrets = { encrypt: (v) => 'enc:' + Buffer.from(v).toString('base64'), decrypt: (v) => Buffer.from(v.slice(4), 'base64').toString() };
+  const db = new Database(':memory:');
+  const dir = createDirectoryMcp({ db, secrets });
+  const declared = [{ name: 'Authorization', required: true, secret: true, template: 'Bearer {api_key}' }];
+  const s = dir.add({ registryName: 'd', title: 'D', url: 'https://d.example/mcp', declaredHeaders: declared, headerValues: { Authorization: 'k$$ey' } });
+  assert.deepEqual(dir.headersFor(s.id), { Authorization: 'Bearer k$$ey' });
+});

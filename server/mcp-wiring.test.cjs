@@ -23,7 +23,7 @@ function fakeMcp(catalogues) {
   };
 }
 
-function build({ servers, catalogues, directoryServers = [], env = {}, storage = { kind: 'local' }, origins = '', manifest = [] } = {}) {
+function build({ servers, catalogues, directoryServers = [], env = {}, storage = { kind: 'local' }, origins = '', manifest = [], isUserDisabled } = {}) {
   const mcp = fakeMcp(catalogues);
   const scope = new AsyncLocalStorage();
   const minted = [];
@@ -37,6 +37,7 @@ function build({ servers, catalogues, directoryServers = [], env = {}, storage =
     scope, storageFor: () => storage, isWriteTool: (name) => name.endsWith('_write'),
     internal: { mintToken: (_k, claims) => { minted.push(claims); return 'cap' } }, internalKey: 'k',
     reduceToolResult: (text) => ({ text, reduced: false }), env, logger: { log() {}, warn() {} },
+    ...(isUserDisabled ? { isUserDisabled } : {}),
   });
   return { wiring, mcp, scope, minted };
 }
@@ -127,6 +128,19 @@ test('each server mode gets exactly its own credential, and a missing one is an 
   assert.deepEqual(minted.at(-1), { uid: 'alice', pid: 'proj', w: 1 });
   assert.equal(await wiring.executeMcpToolCall('i_write', {}), 'ERROR: i_write needs a signed-in session and there is none.');
   assert.ok(mcp.sessions.every((s) => !s.open), 'every call session is closed, even after a refusal');
+});
+
+test('discovery skips a personal/oauth credential once its adding administrator is disabled', async () => {
+  const servers = [
+    { id: 'p', url: 'http://p/mcp', auth: 'personal', title: 'Personal', addedBy: 'keyed' },
+    { id: 'o', url: 'http://o/mcp', auth: 'oauth', title: 'OAuth', addedBy: 'signed' },
+  ];
+  const catalogues = { 'http://p/mcp': [rawTool('p_read')], 'http://o/mcp': [rawTool('o_read')] };
+  const { wiring } = build({ servers, catalogues, isUserDisabled: (uid) => uid === 'keyed' || uid === 'signed' });
+  const state = await wiring.discoverMcpTools();
+  assert.equal(state.tools.size, 0);
+  assert.match(state.servers.get('p').error, /active administrator/);
+  assert.match(state.servers.get('o').error, /active administrator/);
 });
 
 test("a user's Nextcloud credential is never forwarded to an origin the operator did not list", async () => {

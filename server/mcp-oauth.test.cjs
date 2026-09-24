@@ -71,6 +71,24 @@ test('a wrong PKCE verifier gets no token, and tokens are stored encrypted', asy
   oauth.forget('s'); assert.equal(oauth.connected('u1', 's'), false);
 });
 
+test("forgetUser removes one account's tokens across every server, leaving others intact", async () => {
+  const as = fakeAs(); const db = new Database(':memory:');
+  const oauth = createMcpOAuth({ db, secrets, fetchImpl: as.fetchImpl, urlAllowed: async () => true, redirectUri: () => 'https://n/cb' });
+  for (const [userId, serverId] of [['u1', 's1'], ['u1', 's2'], ['u2', 's1']]) {
+    const url = await oauth.start({ userId, serverId, serverUrl: 'https://mcp.example/mcp' });
+    const a = authorize(as, url);
+    await oauth.finish({ userId, state: a.state, code: a.code });
+  }
+  assert.equal(oauth.connected('u1', 's1'), true);
+  assert.equal(oauth.connected('u1', 's2'), true);
+  assert.equal(oauth.connected('u2', 's1'), true);
+  oauth.forgetUser('u1');
+  assert.equal(oauth.connected('u1', 's1'), false);
+  assert.equal(oauth.connected('u1', 's2'), false);
+  assert.equal(oauth.connected('u2', 's1'), true, 'another account keeps its own token');
+  assert.equal(await oauth.tokenFor('u1', 's1'), null);
+});
+
 test('a service without self-registration uses an app an administrator registered by hand', async () => {
   const as = fakeAs({ registration: false }); const db = new Database(':memory:');
   const oauth = createMcpOAuth({ db, secrets, fetchImpl: as.fetchImpl, urlAllowed: async (u) => u.startsWith('https://'), redirectUri: () => 'https://noevia.example/api/mcp-oauth/callback' });

@@ -74,6 +74,7 @@ function createMcpWiring({
   servers, manifest = [], mcp, bindBoxes, directoryMcp, mcpOAuth, directoryUrlAllowed, credentialOriginAllowed,
   scope, storageFor, isWriteTool, internal, internalKey, reduceToolResult, resultCap = 8000,
   env = process.env, fetch = globalThis.fetch, discoveryTtlMs = 10 * 60 * 1000, logger = console,
+  isUserDisabled = () => false,
 }) {
   const MCP_SERVERS = servers;
   // Servers an administrator added from the public registry join the operator's list (after it,
@@ -231,12 +232,16 @@ function createMcpWiring({
     if (server.directory && !(await directoryUrlAllowed(server.url))) throw new Error('its address no longer resolves to a public host');
     let headers = mcpDiscoveryAuth(server);
     if (server.auth === 'personal') {
-      // The tool list is read with the key of the administrator who added the server.
+      // The tool list is read with the key of the administrator who added the server. A disabled
+      // administrator's key is not trusted for discovery, even if it is still stored.
+      if (server.addedBy && isUserDisabled(server.addedBy)) throw new Error('waiting for an active administrator to add a key');
       headers = server.pendingHeaders || directoryMcp.userHeadersFor(server.addedBy, server.id);
       if (!Object.keys(headers).length) throw new Error('waiting for the administrator who added it to enter their key');
     }
     if (server.auth === 'oauth') {
-      // The tool list is read with the sign-in of the administrator who added the server.
+      // The tool list is read with the sign-in of the administrator who added the server. A
+      // disabled administrator's sign-in is not trusted for discovery, even if it is still stored.
+      if (server.addedBy && isUserDisabled(server.addedBy)) throw new Error('waiting for an active administrator to sign in');
       const token = await mcpOAuth.tokenFor(server.addedBy, server.id);
       if (!token) throw new Error('waiting for the administrator who added it to sign in');
       headers = { Authorization: `Bearer ${token}` };
