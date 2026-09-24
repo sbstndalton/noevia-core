@@ -264,3 +264,80 @@ test("a task's network activity is tallied by host, refusals first, and forgotte
   assert.deepEqual(p.activity('someone-else').hosts, [], 'another task sees nothing');
   await p.close(); upstream.close();
 });
+
+test('a plain-HTTP request for a non-http(s) URL is rejected with 400', async () => {
+  const { p } = proxy();
+  const { token } = p.grant({ taskId: 't1', domains: ['example.com'] });
+  await p.listen();
+  const port = p.server.address().port;
+  const status = await new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port, method: 'GET', path: 'ftp://example.com/x',
+      headers: { 'proxy-authorization': basic(token) } }, (res) => { res.resume(); resolve(res.statusCode); });
+    req.on('error', reject); req.end();
+  });
+  assert.equal(status, 400);
+  await p.close();
+});
+
+test('hop-by-hop headers are stripped before forwarding, task headers survive', async () => {
+  const seen = [];
+  const origin = http.createServer((req, res) => { seen.push(req.headers); res.end('ok'); });
+  await new Promise((r) => origin.listen(0, '127.0.0.1', r));
+  const originPort = origin.address().port;
+  const { p } = proxy({ allowedPorts: [80, 443, originPort] });
+  const { token } = p.grant({ taskId: 't1', domains: ['example.com'] });
+  await p.listen();
+  const proxyPort = p.server.address().port;
+  try {
+    await new Promise((resolve, reject) => {
+      const req = http.request({ host: '127.0.0.1', port: proxyPort, method: 'GET',
+        path: `http://example.com:${originPort}/thing`,
+        headers: { 'proxy-authorization': basic(token), host: `example.com:${originPort}`,
+          connection: 'keep-alive, x-made-up', 'keep-alive': 'timeout=5', te: 'trailers',
+          upgrade: 'websocket', 'x-task': 'yes' } },
+        (res) => { res.resume(); res.on('end', resolve); });
+      req.on('error', reject); req.end();
+    });
+    assert.equal(seen.length, 1);
+    // node's own client manages `connection` for the new upstream hop it opens; what matters is
+    // that the *client's* hop-by-hop values never ride along.
+    assert.notEqual(seen[0].connection, 'keep-alive, x-made-up', 'the client-supplied connection value must not be forwarded');
+    for (const h of ['keep-alive', 'transfer-encoding', 'te', 'trailer', 'upgrade']) {
+      assert.equal(seen[0][h], undefined, `${h} must not be forwarded`);
+    }
+    assert.equal(seen[0]['x-task'], 'yes', 'ordinary headers still pass through');
+  } finally {
+    await p.close();
+    origin.closeAllConnections?.(); origin.close();
+  }
+});
+
+test('a plain-HTTP upstream request is destroyed if the client socket errors mid-request', async () => {
+  let upstreamSocket = null;
+  const origin = http.createServer((req, res) => {
+    upstreamSocket = req.socket;
+    // Never respond: the client will be killed before this call would complete.
+  });
+  await new Promise((r) => origin.listen(0, '127.0.0.1', r));
+  const originPort = origin.address().port;
+  const { p } = proxy({ allowedPorts: [80, 443, originPort] });
+  const { token } = p.grant({ taskId: 't1', domains: ['example.com'] });
+  await p.listen();
+  const proxyPort = p.server.address().port;
+
+  await new Promise((resolve, reject) => {
+    const client = net.connect(proxyPort, '127.0.0.1', () => {
+      client.write(`GET http://example.com:${originPort}/thing HTTP/1.1\r\nproxy-authorization: ${basic(token)}\r\nhost: example.com:${originPort}\r\n\r\n`);
+      // Give the request a moment to actually reach the origin, then vanish mid-flight.
+      setTimeout(() => client.destroy(), 150);
+    });
+    client.on('close', resolve);
+    client.on('error', reject);
+  });
+
+  await new Promise((r) => setTimeout(r, 150));
+  assert.ok(upstreamSocket, 'the request must have reached the origin');
+  assert.ok(upstreamSocket.destroyed, 'the upstream connection must be torn down once the client is gone');
+  await p.close();
+  origin.closeAllConnections?.(); origin.close();
+});

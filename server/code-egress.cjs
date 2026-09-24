@@ -135,6 +135,9 @@ function createEgressProxy({ now = Date.now, log = () => {}, lookup = defaultLoo
     req.on('error', () => {});
     res.on('error', () => {});
     const url = (() => { try { return new URL(req.url); } catch { return null; } })();
+    if (url && url.protocol !== 'http:' && url.protocol !== 'https:') {
+      return refuse(res, { ok: false, status: 400, reason: `unsupported protocol "${url.protocol}"` }, record);
+    }
     const verdict = await check({ header: req.headers['proxy-authorization'],
       target: url ? url.host : null, defaultPort: 80 });
     if (!verdict.ok) return refuse(res, verdict, record);
@@ -143,6 +146,10 @@ function createEgressProxy({ now = Date.now, log = () => {}, lookup = defaultLoo
     const headers = { ...req.headers };
     delete headers['proxy-authorization'];       // never travels onward
     delete headers['proxy-connection'];
+    // Hop-by-hop headers stop at the proxy (RFC 7230 §6.1): `connection` names further
+    // hop-by-hop headers to strip, and node itself manages keep-alive/transfer-encoding for the
+    // upstream request it builds, so those must not be forwarded verbatim either.
+    for (const h of ['connection', 'keep-alive', 'transfer-encoding', 'te', 'trailer', 'upgrade']) delete headers[h];
     headers.host = url.host;
     const upstream = http.request({ host: verdict.address, port: verdict.port, method: req.method,
       path: url.pathname + url.search, headers, setHost: false }, (up) => {
@@ -150,6 +157,12 @@ function createEgressProxy({ now = Date.now, log = () => {}, lookup = defaultLoo
       up.pipe(res);
     });
     upstream.on('error', () => { if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' }); res.end('Upstream failed\n'); });
+    // If the client's own socket goes away mid-request, the upstream request must not be left
+    // dangling: an aborted/errored client is exactly the "cancelled task" case this proxy has to
+    // survive without leaking a socket per abandoned request.
+    const dropUpstream = () => { if (!res.writableEnded) upstream.destroy(); };
+    req.on('aborted', dropUpstream);
+    res.on('close', dropUpstream);
     req.pipe(upstream);
   });
 
