@@ -241,3 +241,26 @@ test('a proxied agent keeps the engine off the proxy, and nothing else', () => {
   assert.equal(agentEnv({ cwd: '/w', proxy: { url: 'http://task:t@egress' } }).NO_PROXY, '');
   assert.equal(agentEnv({ cwd: '/w' }).HTTPS_PROXY, undefined);
 });
+
+test('cancelling while an approval is pending does not crash the process with an unhandled rejection', async () => {
+  const controller = new AbortController();
+  const unhandled = [];
+  const onUnhandled = (reason) => unhandled.push(reason);
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    let asked;
+    const askedP = new Promise((r) => { asked = r; });
+    const { agent } = await connect([{ permission: { toolCall: { kind: 'edit' }, options: [{ optionId: 'n', kind: 'reject_once' }] } }, { hang: true }], {
+      signal: controller.signal,
+      // Like code-service: the pending approval is answered 'aborted' when the task is cancelled,
+      // which resumes this handler AFTER the connection has closed.
+      handlers: { requestPermission: async () => { asked(); await new Promise((r) => controller.signal.addEventListener('abort', () => setImmediate(r), { once: true })); return { outcome: 'selected', optionId: 'n' }; } },
+    });
+    const running = agent.prompt('edit').then(() => 'resolved', () => 'rejected');
+    await askedP;
+    controller.abort();
+    assert.equal(await running, 'rejected');
+    await new Promise((r) => setTimeout(r, 50));
+    assert.deepEqual(unhandled, [], 'no unhandled rejection escapes');
+  } finally { process.off('unhandledRejection', onUnhandled); }
+});

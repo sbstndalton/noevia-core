@@ -79,12 +79,14 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
     // disk, so it can fail for ordinary reasons — a full volume, a read-only mount — and leaving
     // it outside meant a live proxy token and a branch claimed for good.
     jobs.run(taskId, async (ctx) => {
+      let sessionEnd = null;
       try {
         // A task that named no model runs on whatever this deployment loads, and the identity
         // records the model that actually ran rather than the absence of a choice.
         const endpoint = engine();
         const chosen = model || endpoint.model || null;
         const session = createSession({ taskId, ctx, workspace, domains, capabilities, harness, model: chosen });
+        sessionEnd = session.end;
         // Recorded first so a running task is identifiable in the list, not just once it ends.
         ctx.checkpoint({ branch: workspace.branch, task: String(prompt).slice(0, 120) });
         // The agent's own config file, written by noevia before the agent exists: the gate it
@@ -135,7 +137,9 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
           // Which hosts the task reached and which it was refused, from the proxy's own record.
           ...(grant && typeof egress.activity === 'function' ? { network: egress.activity(taskId) } : {}) };
       } finally {
-        // Whatever happened, the task stops being able to reach anything.
+        // Whatever happened, the task stops being able to reach anything, and no approval it
+        // raised is left waiting to be answered into an action.
+        sessionEnd?.();
         cleanup();
       }
     }).catch(() => {
@@ -151,6 +155,11 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
   function createSession({ taskId, ctx, workspace, domains, capabilities, harness, model }) {
     // "Allow for this task", per action class. Scoped to this job, in memory, gone when it ends.
     const blanket = new Map(); // action -> 'allow' | 'deny'
+    // Aborted when the task is cancelled, fails or ends: every approval it still has waiting is
+    // refused then, not left to time out against a connection that is already gone.
+    const ended = new AbortController();
+    const end = () => { if (!ended.signal.aborted) ended.abort(); };
+    ctx.signal?.addEventListener?.('abort', end, { once: true });
     const counts = { tools: 0, approvals: 0, allowed: 0, refused: 0, denied: 0 };
     // Exit codes per finished command, when the harness bothers to report one. Bounded: a long
     // task should not be able to grow this without limit.
@@ -271,7 +280,7 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
         diff: diffOf(toolCall),
       };
       ctx.event('approval.requested', request);
-      const answer = await askApproval(request);
+      const answer = ended.signal.aborted ? 'aborted' : await askApproval(request, { signal: ended.signal });
       ctx.event('approval.decided', { decision: answer, action: classified.action });
       record({ event: 'code.decided', action: classified.action, decision: answer });
 
@@ -297,7 +306,15 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
         record({ event: 'code.refused', reason: 'path outside the workspace' });
         throw Object.assign(Error('Outside this task’s workspace'), { code: -32602 });
       }
-      return target;
+      // Hand back the path contains() actually judged: resolved against the worktree. Returning
+      // the raw target let a relative path be checked against the worktree and then read or
+      // written relative to the web process's own cwd.
+      const root = workspaces.get(taskId)?.path;
+      if (typeof root !== 'string' || !root) {
+        record({ event: 'code.refused', reason: 'path outside the workspace' });
+        throw Object.assign(Error('Outside this task’s workspace'), { code: -32602 });
+      }
+      return nodePath.resolve(root, target);
     };
     const readTextFile = async ({ path: target, line = null, limit = null } = {}) => {
       const content = files.read(inside(target), MAX_FILE_BYTES);
@@ -372,7 +389,7 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
 
     return {
       handlers: { requestPermission, readTextFile, writeTextFile, sessionUpdate },
-      flushOutput,
+      flushOutput, end,
       summary: () => ({ ...counts, workspace: workspace.path }),
       // Usage the harness streamed wins over anything on the prompt result: the real one reports
       // it in `usage_update` and leaves the result's `_meta` empty.

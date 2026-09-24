@@ -773,6 +773,11 @@ if (require.main === module) {
     }),
   });
   server.requestTimeout = 20 * 60 * 1000;
+  // A stray rejected promise in one request or task must not take the whole web process (and
+  // every other tenant's session) down with it. Logged loudly with its stack, never silent.
+  process.on('unhandledRejection', (reason) => {
+    console.error('[noevia] unhandled promise rejection:', reason?.stack || reason);
+  });
   server.listen(PORT, HOST, () => {
     console.log(`cowork-ui listening on http://${HOST}:${PORT} (inference: ${INFERENCE_BASE}, manager: ${modelManager.kind}, diary: ${DIARY_BASE}, mcp: ${mcpWiring.enabled() ? MCP_SERVERS.map((sv) => sv.id).join('+') : 'disabled'})`);
     // Warm the tool catalogue so the first chat does not pay for discovery.

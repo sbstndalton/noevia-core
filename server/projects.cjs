@@ -306,7 +306,8 @@ function createProjectStore({
       if (!workspace.projects.includes(project) || !project.files.includes(file) || !file.document) return;
       file.document.indexing = !result?.ok ? 'unavailable' : result.direct ? 'direct' : result.embedded < result.stored ? 'partial' : 'ready';
       workspace.saveProjects();
-    }).catch(() => {
+    }).catch((error) => {
+      console.warn(`[documents] indexing ${project.id}/${file.name} failed:`, error?.stack || error);
       if (workspace.projects.includes(project) && project.files.includes(file) && file.document) {
         file.document.indexing = 'failed';
         try { workspace.saveProjects(); } catch (err) { console.warn('[documents] could not save index state:', err.message); }

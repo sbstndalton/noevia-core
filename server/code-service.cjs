@@ -99,7 +99,7 @@ function createCodeService({ repos, connect, egress = null, engine = undefined, 
     return store;
   }
 
-  function askApproval(request) {
+  function askApproval(request, { signal = null } = {}) {
     return new Promise((resolve) => {
       // A random id, not one derived from the map's size and the clock: two approvals raised in
       // the same millisecond would otherwise collide, and the overwritten one would hang until
@@ -114,9 +114,15 @@ function createCodeService({ repos, connect, egress = null, engine = undefined, 
       const timer = setTimeout(() => finish('timeout'), timeoutMs);
       timer.unref?.();
       pending.set(id, { id, taskId: request.taskId, request, decide: finish });
+      // The task ended (cancelled, failed, disconnected): nobody can act on this answer any more.
+      if (signal) {
+        if (signal.aborted) finish('aborted');
+        else signal.addEventListener('abort', () => finish('aborted'), { once: true });
+      }
     });
   }
-  const pendingFor = (taskId) => [...pending.values()].find((p) => p.taskId === taskId) || null;
+  const pendingAll = (taskId) => [...pending.values()].filter((p) => p.taskId === taskId);
+  const pendingFor = (taskId) => pendingAll(taskId)[0] || null;
 
   function owned(workspace, project, taskId) {
     const { jobs } = storeFor(workspace);
@@ -197,7 +203,7 @@ function createCodeService({ repos, connect, egress = null, engine = undefined, 
       owned(workspace, project, taskId);
       // Refuse anything still waiting first, so a cancelled task never leaves a card that
       // could later be answered into an action.
-      pendingFor(taskId)?.decide('aborted');
+      for (const waiting of pendingAll(taskId)) waiting.decide('aborted');
       const { harness, jobs } = storeFor(workspace);
       harness.cancel(taskId);
       return view(jobs.get(taskId), null);

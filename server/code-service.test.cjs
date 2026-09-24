@@ -298,3 +298,36 @@ test('an answer names the card it was for: an expired approval is a 409, and the
   release();
   await settle(svc, ws, started.taskId);
 });
+
+test('cancelling refuses EVERY approval the task has waiting, not just the first', async () => {
+  const asks = [];
+  const { svc, ws } = service({
+    timeoutMs: 60000,
+    connect: async ({ handlers }) => ({ prompt: async () => {
+      const call = { toolCall: { kind: 'edit', locations: [] }, options: [{ optionId: 'y', kind: 'allow_once' }, { optionId: 'n', kind: 'reject_once' }] };
+      asks.push(handlers.requestPermission(call), handlers.requestPermission(call));
+      await Promise.all(asks); return { stopReason: 'end_turn' };
+    } }),
+  });
+  const started = await svc.start(ws, project, { repository: 'noevia', prompt: 'fix', capabilities: ['edit_file'] });
+  for (let i = 0; i < 200 && asks.length < 2; i++) await new Promise((r) => setTimeout(r, 5));
+  await new Promise((r) => setTimeout(r, 10));
+  svc.cancel(ws, project, started.taskId);
+  assert.deepEqual(await Promise.all(asks), [{ outcome: 'selected', optionId: 'n' }, { outcome: 'selected', optionId: 'n' }]);
+  assert.equal(svc.get(ws, project, started.taskId).approval, null);
+});
+
+test('a task that fails with an approval waiting refuses it rather than leaving the card live', async () => {
+  let ask;
+  const { svc, ws } = service({
+    timeoutMs: 60000,
+    connect: async ({ handlers }) => ({ prompt: async () => {
+      ask = handlers.requestPermission({ toolCall: { kind: 'edit', locations: [] }, options: [{ optionId: 'y', kind: 'allow_once' }, { optionId: 'n', kind: 'reject_once' }] });
+      throw Error('harness disconnected');
+    } }),
+  });
+  const started = await svc.start(ws, project, { repository: 'noevia', prompt: 'fix', capabilities: ['edit_file'] });
+  await settle(svc, ws, started.taskId);
+  assert.deepEqual(await ask, { outcome: 'selected', optionId: 'n' });
+  assert.equal(svc.get(ws, project, started.taskId).approval, null);
+});

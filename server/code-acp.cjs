@@ -137,19 +137,22 @@ async function connectAcp({ command, args = [], endpoint = null, cwd, env = {}, 
     for (const { reject } of pending.values()) reject(error);
     pending.clear();
   };
+  // Answering after the connection closed is not an error worth a crash: the agent is gone,
+  // so there is nobody to answer. Requests still need to know, so they check `closed` first.
   const send = (message) => {
-    if (closed) throw closed;
-    try { channel.write(JSON.stringify(message) + '\n'); }
-    catch (error) { fail(error); throw error; }
+    if (closed) return false;
+    try { channel.write(JSON.stringify(message) + '\n'); return true; }
+    catch (error) { fail(error); return false; }
   };
   function request(method, params) {
     const id = nextId++;
     return new Promise((resolve, reject) => {
+      if (closed) { reject(closed); return; }
       pending.set(id, { resolve, reject });
-      try { send({ jsonrpc: '2.0', id, method, params }); } catch (error) { pending.delete(id); reject(error); }
+      if (!send({ jsonrpc: '2.0', id, method, params })) { pending.delete(id); reject(closed || Error('The coding harness stopped.')); }
     });
   }
-  const notify = (method, params) => { try { send({ jsonrpc: '2.0', method, params }); } catch { /* already gone */ } };
+  const notify = (method, params) => { send({ jsonrpc: '2.0', method, params }); };
 
   // Incoming: either a reply to something we asked, or a call we must answer.
   const CLIENT_METHODS = {
@@ -183,7 +186,9 @@ async function connectAcp({ command, args = [], endpoint = null, cwd, env = {}, 
     }
   }
 
-  const onMessage = createLineReader((m) => { handleIncoming(m); }, (e) => onLog(String(e.message)));
+  const onMessage = createLineReader((m) => {
+    handleIncoming(m).catch((error) => onLog(`ACP message handling failed: ${error?.stack || error}`));
+  }, (e) => onLog(String(e.message)));
   const channelOptions = {
     cwd, env: childEnv, graceMs,
     onMessage, onLog: (text) => onLog(String(text).slice(0, 2000)),

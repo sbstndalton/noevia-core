@@ -131,12 +131,14 @@ const vectorFor = (text) => {
 
 let embedCalls = 0;
 let embedFails = false;
+let embedGate = null; // when set, batch (multi-input) embedding calls wait on it
 const realFetch = global.fetch;
 global.fetch = async (url, options) => {
   assert.match(String(url), /\/v1\/embeddings$/);
   embedCalls++;
   if (embedFails) return { ok: false, status: 503, text: async () => 'embedder down' };
   const { input } = JSON.parse(options.body);
+  if (embedGate && input.length > 1) await embedGate;
   return { ok: true, json: async () => ({ data: input.map((t) => ({ embedding: vectorFor(t) })) }) };
 };
 test.after(() => { global.fetch = realFetch; });
@@ -274,6 +276,69 @@ test('deleting a file removes its chunks and leaves the rest of the project inta
   rag.deleteProjectFile('p-del', 'gone.txt', null);
   assert.deepEqual(await rag.searchProject('p-del', 'zebra', null), []);
   assert.ok((await rag.searchProject('p-del', 'walrus', null)).length > 0);
+});
+
+test('replacing a file twice quickly leaves vectors only on the newest version', async () => {
+  reset();
+  const runs = [
+    rag.indexProjectFile('p-race', 'doc.txt', big('zebra'), null),
+    rag.indexProjectFile('p-race', 'doc.txt', big('walrus'), null),
+    rag.indexProjectFile('p-race', 'doc.txt', big('narwhal'), null),
+  ];
+  const results = await Promise.all(runs);
+  assert.ok(results[2].embedded > 0 && results[2].embedded === results[2].stored, 'the newest run is fully embedded');
+  for (const q of ['zebra', 'walrus']) {
+    const hits = await rag.searchProject('p-race', q, null);
+    assert.ok(hits.every((h) => /narwhal/.test(h.body) && !new RegExp(q).test(h.body)), `no ${q} text or vector survives`);
+  }
+  const hits = await rag.searchProject('p-race', 'narwhal', null);
+  assert.ok(hits.length > 0 && hits.every((h) => /narwhal/.test(h.body)));
+});
+
+test('shrinking a file to small leaves no orphan vectors joined to the new text', async () => {
+  reset();
+  await rag.indexProjectFile('p-shrink', 'doc.txt', big('zebra'), null);
+  // The small version reuses the freed chunk id; an orphan zebra vector would now point at it.
+  await rag.indexProjectFile('p-shrink', 'doc.txt', 'walrus note', null);
+  assert.deepEqual(await rag.searchProject('p-shrink', 'zebra', null), [], 'the old vectors went with the old chunks');
+  await rag.indexProjectFile('p-shrink', 'other.txt', big('quokka'), null);
+  rag.deleteProjectFile('p-shrink', 'other.txt', null);
+  assert.deepEqual(await rag.searchProject('p-shrink', 'quokka', null), [], 'deleting a file removes its vectors too');
+});
+
+test('a search during re-index sees only the new version (partially embedded), never a mix', async () => {
+  // Documented behaviour: the old chunks and vectors are swapped out atomically for the new
+  // chunks; the new ones gain vectors batch by batch. Old text is never returned once the
+  // re-index has begun, and an old vector never joins to new text.
+  reset();
+  await rag.indexProjectFile('p-mid', 'doc.txt', big('zebra'), null);
+  let release;
+  embedGate = new Promise((r) => { release = r; });
+  try {
+    const running = rag.indexProjectFile('p-mid', 'doc.txt', big('walrus'), null);
+    await new Promise((r) => setTimeout(r, 20));
+    const during = await rag.searchProject('p-mid', 'zebra', null);
+    assert.deepEqual(during, [], 'no old version, and no old vector attached to new text');
+    release();
+    await running;
+  } finally { embedGate = null; }
+  const after = await rag.searchProject('p-mid', 'walrus', null);
+  assert.ok(after.length > 0 && after.every((h) => /walrus/.test(h.body)));
+});
+
+test('a delete during an in-flight index run stops it writing vectors afterwards', async () => {
+  reset();
+  let release;
+  embedGate = new Promise((r) => { release = r; });
+  try {
+    const running = rag.indexProjectFile('p-delrace', 'doc.txt', big('zebra'), null);
+    await new Promise((r) => setTimeout(r, 20));
+    rag.deleteProjectFile('p-delrace', 'doc.txt', null);
+    release();
+    const out = await running;
+    assert.equal(out.embedded, 0, 'the superseded run wrote nothing');
+  } finally { embedGate = null; }
+  assert.deepEqual(await rag.searchProject('p-delrace', 'zebra', null), []);
 });
 
 // ── filesContext ─────────────────────────────────────────────────────────
