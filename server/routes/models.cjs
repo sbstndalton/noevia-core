@@ -10,7 +10,10 @@
 // Returns true when it handled the request. Auth and CSRF run before routes are mounted.
 // Every write under /api/models/ is administrator-only (the gate at the top), and any
 // write there also drops the cached folder scan. Blocks keep their original order; an
-// unmatched method falls through as it did inline.
+// unmatched method falls through as it did inline. /api/auto-roles is not under
+// /api/models/, so its own PUT handler carries the narrower member-vs-admin split: any
+// member may save their workspace's roles, but only an admin's save also warms models
+// up on the shared engine (ensureRolesLoaded).
 
 const PASS = Symbol('unhandled');
 const { isSystemModel, modelPathFromArgs, SYSTEM_MODEL_DELETE_REASON } = require('../model-system.cjs');
@@ -117,8 +120,22 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
         const vision = typeof body.vision === 'string' ? body.vision.trim() : '';
         const code = typeof body.code === 'string' ? body.code.trim() : '';
         if (!fast || !smart) return json(res, 400, { error: 'both fast and smart model names are required' });
+        // Names must resolve to installed models, or a bad id would keep producing repeated
+        // load-warning log lines forever (ensureRolesLoaded retries every save/warm-up). Skip
+        // the check only when the catalogue itself cannot be read (engine unreachable): saving
+        // is still allowed, since the alternative is a member/admin locked out of the page.
+        const catalogue = await servedCatalogue();
+        if (Array.isArray(catalogue)) {
+          const known = new Set(catalogue.map((m) => m.name));
+          const named = { fast, smart, ...(vision ? { vision } : {}), ...(code ? { code } : {}) };
+          const bad = Object.entries(named).filter(([, name]) => !known.has(name)).map(([, name]) => name);
+          if (bad.length) return json(res, 400, { error: `unknown model(s): ${bad.join(', ')}` });
+        }
         setAutoRoles({ fast, smart, vision, code });
-        ensureRolesLoaded(); // optional adapter warm-up; native routing stays on demand
+        // Loading models for the shared engine is an administrative action: a member's save is
+        // stored per workspace like anyone else's, but only an admin's save may warm models up
+        // (native routing stays on demand either way; see ensureRolesLoaded above it).
+        if (authn.user.role === 'admin') ensureRolesLoaded();
         return json(res, 200, { configured: true, roles: autoRoles() });
       }
     }

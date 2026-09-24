@@ -768,9 +768,15 @@ if (require.main === module) {
   require('./diary-backup-worker.cjs').startDiaryBackupWorker({
     users: () => authService.listUsers(),
     enabled: id => authService.diaryEnabled(id),
+    // Default 30 s so an idle tenant does not build a new ManagedCorpusBackend every
+    // 3 s; DIARY_BACKUP_WORKER_INTERVAL_MS keeps the old cadence available for tests.
+    interval: Number(process.env.DIARY_BACKUP_WORKER_INTERVAL_MS) > 0 ? Number(process.env.DIARY_BACKUP_WORKER_INTERVAL_MS) : 30000,
     run: user => requestScope.run({ workspace: workspaceStore.get(user.id), authn: { user, legacy: false } }, async () => {
-      await fetchJson(`${DIARY_BASE}/api/storage-backup`, { method: 'POST', headers: diaryHeaders() }, 300000);
+      const r = await fetchJson(`${DIARY_BASE}/api/storage-backup`, { method: 'POST', headers: diaryHeaders() }, 300000);
+      if (!r.ok) throw new Error(`storage-backup failed: ${r.status}`);
+      return r.body;
     }),
+    onError: userId => console.warn(`[diary-backup] ${userId ? `backup failed for ${userId}` : 'backup tick failed'}, backing off`),
   });
   server.requestTimeout = 20 * 60 * 1000;
   // A stray rejected promise in one request or task must not take the whole web process (and

@@ -7,7 +7,7 @@ const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
 const { createModelRoutes } = require('./models.cjs');
 
-function fixture({ env = {}, enabled = true, kind = 'llamacpp', manager = {}, workspace = { userId: 'u1' }, catalogue = [{ name: 'm' }] } = {}) {
+function fixture({ env = {}, enabled = true, kind = 'llamacpp', manager = {}, workspace = { userId: 'u1' }, catalogue = [{ name: 'm' }], servedCatalogue = async () => catalogue } = {}) {
   const sent = [], headers = [], fetched = [];
   const scan = new Map();
   let refreshes = 0;
@@ -39,7 +39,7 @@ function fixture({ env = {}, enabled = true, kind = 'llamacpp', manager = {}, wo
     service: {
       modelScanCache: scan, refreshModelScan: () => { refreshes += 1; },
       autoRoles: () => roles.current, setAutoRoles: (next) => { roles.current = next; }, ensureRolesLoaded: () => { roles.warmed = true; },
-      servedCatalogue: async () => catalogue, modelsInstalled: async () => [{ name: 'm', loaded: true }],
+      servedCatalogue, modelsInstalled: async () => [{ name: 'm', loaded: true }],
       deriveUserModelName: (c) => `user.${c}`,
     },
   });
@@ -77,13 +77,31 @@ test('stats and capabilities read the adapter; the roles round-trip and warm up'
   assert.equal(f.sent.pop().body.modelManagement, false, 'members do not see model management');
   await f.call('GET', '/api/auto-roles');
   assert.deepEqual(f.sent.pop(), { status: 200, body: { configured: false, roles: null, missing: { roles: null, catalogue: [{ name: 'm' }] } } });
-  await f.call('PUT', '/api/auto-roles', { fast: ' f ', smart: 's', code: 7 });
-  assert.deepEqual(f.sent.pop(), { status: 200, body: { configured: true, roles: { fast: 'f', smart: 's', vision: '', code: '' } } });
-  assert.equal(f.roles.warmed, true);
+  await f.call('PUT', '/api/auto-roles', { fast: ' m ', smart: 'm' }, 'admin');
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { configured: true, roles: { fast: 'm', smart: 'm', vision: '', code: '' } } });
+  assert.equal(f.roles.warmed, true, 'an admin save warms the roles up');
   await f.call('PUT', '/api/auto-roles', { fast: 'f' });
   assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'both fast and smart model names are required' } });
   await f.call('PUT', '/api/auto-roles', '{');
   assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'invalid JSON' } });
+});
+
+test('a member may save their own auto-roles but never warms the shared engine, and unknown names 400', async () => {
+  const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' } });
+  await f.call('PUT', '/api/auto-roles', { fast: 'm', smart: 'm' }, 'member');
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { configured: true, roles: { fast: 'm', smart: 'm', vision: '', code: '' } } });
+  assert.equal(f.roles.warmed, undefined, 'a member save never calls ensureRolesLoaded / modelManager.load');
+
+  const bad = fixture({ env: { MODEL_LOADER_URL: 'http://loader' } });
+  await bad.call('PUT', '/api/auto-roles', { fast: 'nope', smart: 'm' }, 'admin');
+  assert.deepEqual(bad.sent.pop(), { status: 400, body: { error: 'unknown model(s): nope' } });
+  assert.equal(bad.roles.current, null, 'a bad name is never saved either');
+  assert.equal(bad.roles.warmed, undefined);
+
+  // When the catalogue cannot be read (engine unreachable), saving is still allowed.
+  const unreachable = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, servedCatalogue: async () => null });
+  await unreachable.call('PUT', '/api/auto-roles', { fast: 'anything', smart: 'goes' }, 'admin');
+  assert.deepEqual(unreachable.sent.pop(), { status: 200, body: { configured: true, roles: { fast: 'anything', smart: 'goes', vision: '', code: '' } } });
 });
 
 test('the model manager proxy is admin-only, validates the path and serves the cached scan', async () => {
