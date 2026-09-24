@@ -293,10 +293,25 @@ test('an answer names the card it was for: an expired approval is a 409, and the
   for (let i = 0; i < 200 && !(second = svc.get(ws, project, started.taskId)?.approval); i++) await new Promise((r) => setTimeout(r, 2));
   assert.equal(second.title, 'second');
   assert.notEqual(second.id, first.id);
-  assert.throws(() => svc.decide(ws, project, started.taskId, 'approve_all', first.id), (e) => e.status === 409);
+  assert.throws(() => svc.decide(ws, project, started.taskId, 'approve_all', first.id),
+    (e) => e.status === 409 && /expired/i.test(e.message),
+    'a late answer for a card that timed out on our own clock says so, not a generic "no longer waiting"');
   assert.equal(svc.get(ws, project, started.taskId).approval?.id, second.id, 'the unseen request is still waiting');
+  // Answer the second card too: leaving it to time out on its own risks the 150ms timer firing
+  // after the job (and the test) has already finished, which is flaky, not a real assertion.
+  svc.decide(ws, project, started.taskId, 'approve', second.id);
+  await asks[1];
   release();
   await settle(svc, ws, started.taskId);
+});
+
+test('an answer for an id that was never a real approval gets the generic message, not "expired"', async () => {
+  const { svc, ws } = service({ connect: async () => ({ prompt: async () => ({ stopReason: 'end_turn' }) }) });
+  const started = await svc.start(ws, project, { repository: 'noevia', prompt: 'x', capabilities: ['edit_file'] });
+  await settle(svc, ws, started.taskId);
+  assert.throws(() => svc.decide(ws, project, started.taskId, 'approve', 'never-issued-id'),
+    (e) => e.status === 409 && e.message === 'That approval is no longer waiting.' && !/expired/i.test(e.message),
+    'a bogus id that was never a timed-out card gets the plain message');
 });
 
 test('cancelling refuses EVERY approval the task has waiting, not just the first', async () => {
