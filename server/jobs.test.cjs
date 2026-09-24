@@ -31,6 +31,29 @@ test('failures and cancellation end the job exactly once', async () => {
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('run() never leaks a controllers entry when the job.started append throws (e.g. disk full)', async (t) => {
+  const dir = tmp();
+  try {
+    const jobs = createJobs({ dir });
+    const id = jobs.create({ kind: 'x' });
+    const realWrite = fs.writeFileSync;
+    t.mock.method(fs, 'writeFileSync', (fd, data, ...rest) => {
+      if (typeof data === 'string' && data.includes('"job.started"')) throw Object.assign(Error('ENOSPC: no space left on device'), { code: 'ENOSPC' });
+      return realWrite(fd, data, ...rest);
+    });
+    await assert.rejects(jobs.run(id, async () => 'never runs'), /ENOSPC/);
+    t.mock.restoreAll();
+    // If the controllers entry had leaked (the pre-fix bug: controllers.set happened
+    // before the append that can throw), recover() would see controllers.has(id) and
+    // wrongly treat this job as still "running" in this process — skipping cleanup
+    // (code-harness egress revoke / worktree release / research controllers) forever.
+    // With the fix, the append throws before controllers ever gets an entry, so recover()
+    // correctly finds an unfinished, un-tracked job and interrupts it.
+    assert.equal(jobs.recover(), 1);
+    assert.equal(jobs.get(id).status, 'interrupted');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('restart recovery interrupts unfinished jobs and never resumes an approval', () => {
   const dir = tmp();
   try {

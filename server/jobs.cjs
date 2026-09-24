@@ -196,7 +196,11 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
   // Runs `work` for a created job. The job completes, fails or is cancelled exactly once.
   async function run(id, work) {
     const controller = new AbortController();
-    controllers.set(id, controller);
+    // append() must succeed (job not finished, journal writable) before this job is
+    // considered "running" — if it throws (409 on an already-finished job, disk full),
+    // controllers must not hold an entry for it, otherwise callers relying on the
+    // controllers map to know a job is live (code-harness egress revoke, worktree
+    // release, research controllers cleanup) never get to run their cleanup.
     append(id, 'job.started');
     const ctx = {
       id,
@@ -208,6 +212,7 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
       uncertain: (data) => append(id, 'tool.uncertain', data),
     };
     try {
+      controllers.set(id, controller);
       const result = await work(ctx);
       if (controller.signal.aborted) append(id, 'job.cancelled', result === undefined ? {} : { result });
       else append(id, 'job.completed', { result });
