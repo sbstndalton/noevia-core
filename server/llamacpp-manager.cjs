@@ -127,7 +127,15 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
   async function applyPreset(body) {
     if(!presets)return unsupported('Native preset editing; configure LLAMACPP_PRESET_PATH');
     if(body?.confirmReload!==true) return {ok:false,status:400,body:{error:'Confirm that other clients and Diary background inference are stopped before reloading.'}};
-    return maintenance.exclusive(()=>applyUnlocked(body));
+    return maintenance.exclusive(async()=>{
+      const {isSystemModel,modelPathFromArgs,SYSTEM_MODEL_REASON}=require('./model-system.cjs');
+      const listing=await rawModels();
+      if(listing.ok){
+        const row=(listing.body?.data||[]).find(m=>m.id===body?.model);
+        if(row && isSystemModel(row.id, modelPathFromArgs(row.status?.args))) return {ok:false,status:400,body:{error:SYSTEM_MODEL_REASON}};
+      }
+      return applyUnlocked(body);
+    });
   }
   // Caller must hold the maintenance gate (applyPreset or a calibration job).
   async function applyUnlocked(body) {

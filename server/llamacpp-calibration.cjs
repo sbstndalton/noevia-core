@@ -15,6 +15,7 @@
 const fs = require('node:fs');
 const crypto = require('node:crypto');
 const { CTX_CANDIDATES } = require('./llamacpp-autoconfig.cjs');
+const { isSystemModel, modelPathFromArgs, SYSTEM_MODEL_REASON } = require('./model-system.cjs');
 
 const PAD = 'This is synthetic padding for a context allocation validation.\n';
 const GIB = 1024 ** 3;
@@ -385,6 +386,7 @@ function createCalibrator(deps) {
     try { models = await listing(); } catch { return { ok: false, status: 502, body: { error: 'The model server is not responding.' } }; }
     const row = models.find(m => m.id === model);
     if (!row) return { ok: false, status: 404, body: { error: 'Choose an installed model.' } };
+    if (isSystemModel(model, modelPathFromArgs(row.status?.args))) return { ok: false, status: 400, body: { error: SYSTEM_MODEL_REASON } };
     let base = {}, native = Number(row.meta?.n_ctx_train) || 0;
     const profile = presets.get(model);
     const conservative = await conservativeFor(model).catch(() => null);

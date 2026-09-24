@@ -8,6 +8,29 @@ test('unsafe options, injection, stale revisions and invalid allocations cannot 
 test('native apply refuses active inference, loaded router models, and missing explicit reload acknowledgement',async t=>{const {file,store}=fixture(t);let loaded=true;const calls=[];const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',presetPath:file,fetchJson:async(url)=>{calls.push(url);return {ok:true,status:200,body:{data:[{id:'synthetic',status:{value:loaded?'loaded':'unloaded'}}]}};}});const body={model:'synthetic',baseRevision:store.get('synthetic').revision,options:{parallel:'1'},confirmReload:true};assert.equal((await manager.applyPreset({...body,confirmReload:false})).status,400);assert.equal((await manager.applyPreset(body)).status,409);loaded=false;const leave=manager.enterInference();await assert.rejects(manager.applyPreset(body),{status:409});leave();assert.equal((await manager.applyPreset(body)).ok,true);assert.equal(calls.filter(u=>u.includes('reload=1')).length,1);});
 test('failed native reload restores prior file without claiming runtime success',async t=>{const {file,store}=fixture(t),before=fs.readFileSync(file,'utf8');const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',presetPath:file,fetchJson:async url=>({ok:!url.includes('reload'),status:url.includes('reload')?503:200,body:{data:[{id:'synthetic',status:{value:'unloaded'}}]}})});const result=await manager.applyPreset({model:'synthetic',baseRevision:store.get('synthetic').revision,options:{parallel:'1'},confirmReload:true});assert.equal(result.status,503);assert.equal(fs.readFileSync(file,'utf8'),before);});
 
+test('applying a preset refuses Laya, by id or by --model path, without reloading',async t=>{
+ const {file,store}=fixture(t),before=fs.readFileSync(file,'utf8');
+ const calls=[];
+ const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',presetPath:file,fetchJson:async(url,opts={})=>{
+  calls.push(url);
+  if(new URL(url).pathname==='/models')return {ok:true,status:200,body:{data:[
+   {id:'laya_multilingual_f16',status:{value:'unloaded',args:[]}},
+   {id:'router_a',status:{value:'unloaded',args:['--model','/models/laya_multilingual_f16.gguf']}},
+   {id:'synthetic',status:{value:'unloaded',args:[]}},
+   {id:'other',status:{value:'unloaded',args:[]}},
+  ]}};
+  return {ok:true,status:200,body:{}};
+ }});
+ const byId=await manager.applyPreset({model:'laya_multilingual_f16',baseRevision:store.get('synthetic').revision,options:{parallel:'1'},confirmReload:true});
+ assert.equal(byId.status,400);assert.equal(byId.body.error,'System routing model — not tuned');
+ const byPath=await manager.applyPreset({model:'router_a',baseRevision:store.get('synthetic').revision,options:{parallel:'1'},confirmReload:true});
+ assert.equal(byPath.status,400);assert.equal(byPath.body.error,'System routing model — not tuned');
+ assert.ok(!calls.some(u=>u.includes('reload=1')));
+ assert.equal(fs.readFileSync(file,'utf8'),before);
+ const allowed=await manager.applyPreset({model:'synthetic',baseRevision:store.get('synthetic').revision,options:{parallel:'1'},confirmReload:true});
+ assert.equal(allowed.ok,true);
+});
+
 test('preset reload excludes concurrent native lifecycle mutations',async t=>{
  const {file,store}=fixture(t);let release;
  const waiting=new Promise(resolve=>{release=resolve;});

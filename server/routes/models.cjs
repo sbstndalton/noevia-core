@@ -151,6 +151,17 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
           if(blocked)return json(res,400,{error:SYSTEM_MODEL_DELETE_REASON});
         }
       }
+      // sections/<name> (and its /rename variant) can delete or rename a models.ini section directly;
+      // block that for Laya's section the same way models/delete is blocked above.
+      const sectionMatch = /^sections\/([^/]+)(?:\/rename)?$/.exec(rest);
+      if (sectionMatch && ['DELETE','POST','PUT'].includes(method)) {
+        const name = decodeURIComponent(sectionMatch[1]);
+        const scanned = modelScanCache.get('models')?.body?.models;
+        const cachedEntry = Array.isArray(scanned) ? scanned.find(f => (f.sections||[]).includes(name)) : null;
+        if (isSystemModel(name) || (cachedEntry && isSystemModel(cachedEntry.modelId))) {
+          return json(res,400,{error:SYSTEM_MODEL_DELETE_REASON});
+        }
+      }
       if(method!=='GET')modelScanCache.clear();
       if(method==='GET'&&rest==='models'&&!url.search){
         const hit=modelScanCache.get('models');

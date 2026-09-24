@@ -125,6 +125,37 @@ test('the model-manager delete proxy rejects a system model by its scanned key, 
   assert.equal(f.fetched.length, 1);
 });
 
+test('the model-manager sections proxy rejects delete and rename of a Laya section, never forwarding them', async () => {
+  const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' } });
+  f.scan.set('models', { at: Date.now(), body: { models: [
+    { key: 'k-laya', modelId: 'laya_multilingual_f16', sections: ['laya_multilingual_f16'] },
+    { key: 'k-synthetic', modelId: 'synthetic', sections: ['synthetic'] },
+  ] } });
+  await f.call('DELETE', '/api/model-manager/sections/laya_multilingual_f16', undefined, 'admin');
+  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'System routing model — not deleted' } });
+  assert.equal(f.fetched.length, 0, 'a blocked delete never reaches the model management service');
+  f.scan.set('models', { at: Date.now(), body: { models: [
+    { key: 'k-laya', modelId: 'laya_multilingual_f16', sections: ['laya_multilingual_f16'] },
+    { key: 'k-synthetic', modelId: 'synthetic', sections: ['synthetic'] },
+  ] } });
+  await f.call('POST', '/api/model-manager/sections/laya_multilingual_f16/rename', { to: 'renamed' }, 'admin');
+  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'System routing model — not deleted' } });
+  assert.equal(f.fetched.length, 0, 'a blocked rename never reaches the model management service');
+  // A cached scan section id that only resolves to Laya through its modelId is caught too.
+  f.scan.set('models', { at: Date.now(), body: { models: [
+    { key: 'k-router', modelId: 'router_a', sections: ['laya-router-section'] },
+  ] } });
+  await f.call('DELETE', '/api/model-manager/sections/laya-router-section', undefined, 'admin');
+  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'System routing model — not deleted' } });
+  assert.equal(f.fetched.length, 0);
+  f.scan.set('models', { at: Date.now(), body: { models: [
+    { key: 'k-synthetic', modelId: 'synthetic', sections: ['synthetic'] },
+  ] } });
+  await f.call('DELETE', '/api/model-manager/sections/synthetic', undefined, 'admin');
+  assert.equal(f.sent.pop().status, 200, 'an ordinary section still deletes through the proxy');
+  assert.equal(f.fetched.length, 1);
+});
+
 test('any write under /api/models/ drops the scan, and pull/delete/load keep their answers', async () => {
   const f = fixture();
   f.scan.set('models', { at: Date.now(), body: {} });

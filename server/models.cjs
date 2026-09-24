@@ -110,7 +110,7 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace }) 
         if (m.loaded && m.model_name) loadedNames.add(m.model_name);
       }
     }
-    const installed = (list.value.body.data || [])
+    const installed = (list.value.body?.data || [])
       // Some managers register cosmetic hash-ID duplicates; hide bare hash names.
       .filter((m) => !/^[0-9a-f]{32,40}$/i.test(m.id || m.model_name || ''))
       .map((m) => ({

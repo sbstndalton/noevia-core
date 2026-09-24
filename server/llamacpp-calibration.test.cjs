@@ -183,6 +183,29 @@ test('an interrupted run is restored on startup only if the file is still the jo
   assert.equal(kept.restored,false);assert.match(kept.error,/not restored/);
 });
 
+test('calibration refuses to start on Laya, by id or by --model path, and unloads nothing',async t=>{
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'calibration-laya-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+  const ini=path.join(dir,'models.ini'),stateFile=path.join(dir,'state.json');
+  fs.writeFileSync(ini,'version = 1\n[laya_multilingual_f16]\nmodel = /models/laya_multilingual_f16.gguf\nctx-size = 8192\n[router_a]\nmodel = /models/laya_multilingual_f16.gguf\nctx-size = 8192\n[synthetic]\nmodel = /models/s.gguf\nctx-size = 8192\n');
+  const status={laya_multilingual_f16:'unloaded',router_a:'unloaded',synthetic:'unloaded'};
+  const args={laya_multilingual_f16:[],router_a:['--model','/models/laya_multilingual_f16.gguf'],synthetic:[]};
+  let unloadCalls=0;
+  const fetchJson=async(url,opts={})=>{
+    const u=new URL(url),body=opts.body?JSON.parse(opts.body):{};
+    if(u.pathname==='/models'&&(!opts.method||opts.method==='GET'))return {ok:true,status:200,body:{data:Object.entries(status).map(([id,value])=>({id,status:{value,args:args[id]},meta:{}}))}};
+    if(u.pathname==='/models/unload'){unloadCalls++;status[body.model]='unloaded';return {ok:true,status:200,body:{}};}
+    return {ok:true,status:200,body:{}};
+  };
+  const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',presetPath:ini,fetchJson,calibrationStatePath:stateFile,autoconfig:{},calibrationOptions:{sleep:async()=>{},readMemory:()=>20}});
+  const byId=await manager.calibration.start('laya_multilingual_f16',{promptBudgetSeconds:60,confirmPause:true});
+  assert.equal(byId.status,400);assert.equal(byId.body.error,'System routing model — not tuned');
+  const byPath=await manager.calibration.start('router_a',{promptBudgetSeconds:60,confirmPause:true});
+  assert.equal(byPath.status,400);assert.equal(byPath.body.error,'System routing model — not tuned');
+  assert.equal(unloadCalls,0);
+  assert.equal(manager.calibration.status().body.job,null);
+  assert.equal(fs.readFileSync(ini,'utf8'),'version = 1\n[laya_multilingual_f16]\nmodel = /models/laya_multilingual_f16.gguf\nctx-size = 8192\n[router_a]\nmodel = /models/laya_multilingual_f16.gguf\nctx-size = 8192\n[synthetic]\nmodel = /models/s.gguf\nctx-size = 8192\n');
+});
+
 test('memory that stays low with the model unloaded stops the run instead of failing every size',async t=>{
   const {manager,ini,original}=fixture(t,{loadCap:131072,memory:()=>1});
   await manager.calibration.start('synthetic',{promptBudgetSeconds:120,confirmPause:true});
