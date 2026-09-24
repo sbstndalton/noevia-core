@@ -3,6 +3,7 @@
 const fs = require('node:fs');
 const crypto = require('node:crypto');
 const { WORKLOADS, SPEC_CANDIDATES, geomean } = require('./llamacpp-autotune.cjs');
+const { isSystemModel, modelPathFromArgs, SYSTEM_MODEL_REASON } = require('./model-system.cjs');
 const VERSION = 3;
 const KV = ['f16', 'q8_0', 'q4_0'];
 const UBATCH = [512, 1024, 2048];
@@ -67,6 +68,9 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
     const models = [], skipped = [];
     for (const row of r.body.data) {
       const profile = presets.get(row.id), args = row.status?.args || [];
+      if (isSystemModel(row.id, modelPathFromArgs(args))) {
+        skipped.push({ model: row.id, reason: SYSTEM_MODEL_REASON }); continue;
+      }
       if (!profile.exists || args.some(a => ['--embedding', '--embeddings', '--rerank', '--reranking'].includes(a)) ||
           ['embedding', 'embeddings', 'rerank', 'reranking'].some(k => ['true', '1', 'on'].includes(String(profile.options[k])))) {
         skipped.push({ model: row.id, reason: 'Not a configured chat model' }); continue;
@@ -423,6 +427,7 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
     if (!Number.isInteger(promptBudgetSeconds) || promptBudgetSeconds < 15 || promptBudgetSeconds > 1800)
       return { ok: false, status: 400, body: { error: 'Choose a prompt time limit between 15 and 1800 seconds.' } };
     if (starting || state.job?.status === 'running') return { ok: false, status: 409, body: { error: 'Auto-tune is already running.' } };
+    if (!bulk && isSystemModel(model)) return { ok: false, status: 400, body: { error: SYSTEM_MODEL_REASON } };
     starting = true;
     try {
       const scan = await candidates();
@@ -488,6 +493,21 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
       return { ok: false, status: 409, body: { error: 'Settings could not safely be restored; inspect models.ini before starting a new tune.' } };
     if (presets.snapshot().revision !== j._revision)
       return { ok: false, status: 409, body: { error: 'Settings changed outside auto-tune. Start a new tune after reviewing them.' } };
+    // A job persisted by a pre-patch build may still list a system routing model (e.g. Laya) in
+    // its queue. Never resume tuning it — drop it from the queue and record why, same as a fresh
+    // scan would have. If nothing tunable remains, the job is done rather than resumable.
+    const systemItems = j.models.filter(item => isSystemModel(item.model));
+    if (systemItems.length) {
+      j.models = j.models.filter(item => !isSystemModel(item.model));
+      j.skipped = [...(j.skipped || []), ...systemItems.map(item => ({ model: item.model, reason: SYSTEM_MODEL_REASON }))];
+      if (j.model && isSystemModel(j.model)) j.model = j.models[0]?.model || j.model;
+      if (!j.models.length) {
+        j.status = 'passed'; j.phase = 'Done'; j.finishedAt = now(); j.error = undefined;
+        save();
+        return { ok: true, status: 200, body: publicJob(j) };
+      }
+      save();
+    }
     starting = true;
     try {
       const rows = await rawModels();
@@ -513,4 +533,4 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
   }
   return { start, resume, cancel, status, untuned, recover, completion: () => completion };
 }
-module.exports = { createFullAutotuner, qualityCheck, QUALITY, VERSION };
+module.exports = { createFullAutotuner, qualityCheck, QUALITY, VERSION, newModel };

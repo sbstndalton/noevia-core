@@ -3,7 +3,7 @@ const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const { createModelManager } = require('./model-manager.cjs');
 const { createPresetStore } = require('./llamacpp-presets.cjs');
-const { QUALITY, qualityCheck } = require('./llamacpp-full-autotune.cjs');
+const { QUALITY, qualityCheck, newModel } = require('./llamacpp-full-autotune.cjs');
 
 function fixture(t, { models = ['synthetic'], onChat, onUnload, badQ4 = true, badF16 = false, noHead = false, rejectAll = false, rejectModel = '', badBatch = false, failFinal = false, idleTimeoutMs = 300000, loseIdentityAfterStart = false, reloadFail = false, unloadPolls = 0, unloadStuck = false } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'full-tune-'));
@@ -88,6 +88,52 @@ test('ordered script commits KV, context, drafting and batch with measured evide
   assert.equal((await f.manager.autotune.untuned()).body.models.length, 0);
   assert.equal(f.manager.autotune.status('synthetic').body.history.length, 1);
   assert.doesNotMatch(JSON.stringify(j), /beforeText|originalText|lastRevision|_revision/);
+});
+
+function seedLegacyJob(f, models) {
+  const { createPresetStore } = require('./llamacpp-presets.cjs');
+  const revision = createPresetStore(f.ini).get('synthetic').revision;
+  const job = { id: 'legacy', status: 'interrupted', phase: 'Interrupted', startedAt: Date.now(), finishedAt: Date.now(),
+    log: [], _revision: revision, model: models[0], promptBudgetSeconds: 120, bulk: true,
+    queueProgress: { done: 0, total: models.length },
+    models: models.map(model => newModel(model)) };
+  fs.writeFileSync(f.stateFile, JSON.stringify({ history: {}, job }));
+  return f.restart();
+}
+
+test('a job persisted before this fix that still lists Laya in its queue drops it on resume instead of tuning it', async t => {
+  const f = fixture(t, { models: ['synthetic'] });
+  const manager = seedLegacyJob(f, ['laya_multilingual_f16', 'synthetic']);
+  const r = await manager.autotune.resume({ confirmPause: true });
+  assert.equal(r.status, 202);
+  assert.deepEqual(r.body.skipped, [{ model: 'laya_multilingual_f16', reason: 'System routing model — not tuned' }]);
+  assert.deepEqual(r.body.models.map(m => m.model), ['synthetic']);
+  const j = await finished(manager);
+  assert.equal(j.status, 'passed', j.error);
+  assert.deepEqual(j.models.map(m => m.model), ['synthetic']);
+  assert.ok(!f.requests.some(req => req.model === 'laya_multilingual_f16'), 'Laya must never be loaded or chatted with');
+});
+
+test('a job persisted before this fix that lists only Laya finishes cleanly on resume without running anything', async t => {
+  const f = fixture(t, { models: ['synthetic'] });
+  const manager = seedLegacyJob(f, ['laya_multilingual_f16']);
+  const r = await manager.autotune.resume({ confirmPause: true });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.status, 'passed');
+  assert.deepEqual(r.body.skipped, [{ model: 'laya_multilingual_f16', reason: 'System routing model — not tuned' }]);
+  assert.deepEqual(r.body.models, []);
+  assert.equal(f.requests.length, 0);
+});
+
+test('Laya is reported as a system model, not a chat model needing tuning, and cannot be started directly', async t => {
+  const f = fixture(t, { models: ['synthetic', 'laya_multilingual_f16'] });
+  const scan = (await f.manager.autotune.untuned()).body;
+  assert.deepEqual(scan.models, ['synthetic']);
+  assert.deepEqual(scan.skipped.find(s => s.model === 'laya_multilingual_f16'), { model: 'laya_multilingual_f16', reason: 'System routing model — not tuned' });
+  assert.notEqual(scan.skipped.find(s => s.model === 'embed').reason, scan.skipped.find(s => s.model === 'laya_multilingual_f16').reason);
+  const r = await f.manager.autotune.start('laya_multilingual_f16', { confirmPause: true });
+  assert.equal(r.status, 400);
+  assert.equal(r.body.error, 'System routing model — not tuned');
 });
 
 test('quality rejection followed by asynchronous unload still reaches the next KV candidate', async t => {

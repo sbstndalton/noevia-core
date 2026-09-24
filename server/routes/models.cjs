@@ -13,6 +13,7 @@
 // unmatched method falls through as it did inline.
 
 const PASS = Symbol('unhandled');
+const { isSystemModel, SYSTEM_MODEL_DELETE_REASON } = require('../model-system.cjs');
 
 /**
  * @param {object} deps
@@ -125,6 +126,15 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
       const body=['GET','HEAD','DELETE'].includes(method)?undefined:await readBody(req,1024*1024);
       // The file scan reads every model header from disk (~2 s on daserver). Serve the last scan at
       // once and refresh it behind the response; any change through this API drops it.
+      if(method==='POST'&&rest==='models/delete'){
+        let payload; try{payload=JSON.parse(body||'{}');}catch{payload={};}
+        const keys=Array.isArray(payload.models)?payload.models:[];
+        const scanned=modelScanCache.get('models')?.body?.models;
+        if(keys.length&&Array.isArray(scanned)){
+          const blocked=keys.some(key=>{const entry=scanned.find(f=>f.key===key);return entry&&(isSystemModel(entry.modelId)||(entry.sections||[]).some(s=>isSystemModel(s)));});
+          if(blocked)return json(res,400,{error:SYSTEM_MODEL_DELETE_REASON});
+        }
+      }
       if(method!=='GET')modelScanCache.clear();
       if(method==='GET'&&rest==='models'&&!url.search){
         const hit=modelScanCache.get('models');
@@ -276,6 +286,7 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
         return json(res, 400, { error: 'invalid JSON' });
       }
       if (!body.name) return json(res, 400, { error: 'name required' });
+      if (isSystemModel(body.name)) return json(res, 400, { error: SYSTEM_MODEL_DELETE_REASON });
       if (!modelManager.enabled) return json(res, 404, { error: 'model management is disabled' });
       const r = await modelManager.deleteModel(body.name);
       return json(res, r.ok ? 200 : 502, r.ok ? { ok: true } : { error: `delete failed: ${r.status}` });

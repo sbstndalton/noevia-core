@@ -18,6 +18,7 @@
 // available memory falls below the floor, and aborts if another client loads a model.
 const fs = require('node:fs');
 const crypto = require('node:crypto');
+const { isSystemModel, modelPathFromArgs, SYSTEM_MODEL_REASON } = require('./model-system.cjs');
 
 const MIN_GAIN = 0.05;
 const PAD = 'The garden committee reviewed irrigation, seed orders, volunteer rotas and pump maintenance. ';
@@ -418,10 +419,12 @@ function createAutotuner(deps) {
     promptBudgetSeconds = Number(promptBudgetSeconds);
     if (!Number.isInteger(promptBudgetSeconds) || promptBudgetSeconds < 15 || promptBudgetSeconds > 1800) return { ok: false, status: 400, body: { error: 'Choose a prompt time limit between 15 and 1800 seconds.' } };
     if (state.job?.status === 'running') return { ok: false, status: 409, body: { error: 'Auto-tune is already running.' } };
+    if (isSystemModel(model)) return { ok: false, status: 400, body: { error: SYSTEM_MODEL_REASON } };
     let rows;
     try { rows = await listing(); } catch { return { ok: false, status: 502, body: { error: 'The model server is not responding.' } }; }
     const row = rows.find((m) => m.id === model);
     if (!row) return { ok: false, status: 404, body: { error: 'Choose an installed model.' } };
+    if (isSystemModel(row.id, modelPathFromArgs(row.status?.args))) return { ok: false, status: 400, body: { error: SYSTEM_MODEL_REASON } };
     if (!presets.get(model).exists) return { ok: false, status: 409, body: { error: 'Set up this model first; auto-tune starts from its saved settings.' } };
     let release;
     try { release = maintenance.hold(`Chat is paused while noevia auto-tunes ${model}. It will be available again when tuning finishes or is cancelled.`); }

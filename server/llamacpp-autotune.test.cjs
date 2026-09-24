@@ -79,6 +79,14 @@ test('a profile that changes the deterministic list output is rejected even when
   assert.equal(job.result.spec, 'mtp');
 });
 
+test('Laya (a system routing model) is rejected even when requested directly, before touching the model server', async (t) => {
+  const f = fixture(t);
+  const r = await f.manager.autotune.start('laya_multilingual_f16', { confirmPause: true });
+  assert.equal(r.status, 400);
+  assert.equal(r.body.error, 'System routing model — not tuned');
+  assert.equal(f.router.chats, 0);
+});
+
 test('chat pauses for the whole run, needs confirmation, and will not start twice', async (t) => {
   let pausedDuringRun = null;
   const f = fixture(t, { onChat: async () => { if (pausedDuringRun === null) pausedDuringRun = true; } });

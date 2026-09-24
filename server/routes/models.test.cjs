@@ -111,6 +111,20 @@ test('the model manager proxy is admin-only, validates the path and serves the c
   assert.equal(f.fetched.length, 2);
 });
 
+test('the model-manager delete proxy rejects a system model by its scanned key, even though keys are opaque', async () => {
+  const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' } });
+  f.scan.set('models', { at: Date.now(), body: { models: [
+    { key: 'k-laya', modelId: 'laya_multilingual_f16', sections: ['laya_multilingual_f16'] },
+    { key: 'k-synthetic', modelId: 'synthetic', sections: ['synthetic'] },
+  ] } });
+  await f.call('POST', '/api/model-manager/models/delete', { models: ['k-laya'] }, 'admin');
+  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'System routing model — not deleted' } });
+  assert.equal(f.fetched.length, 0, 'the model management service is never called for a blocked delete');
+  await f.call('POST', '/api/model-manager/models/delete', { models: ['k-synthetic'] }, 'admin');
+  assert.equal(f.sent.pop().status, 200, 'an ordinary model still deletes through the proxy');
+  assert.equal(f.fetched.length, 1);
+});
+
 test('any write under /api/models/ drops the scan, and pull/delete/load keep their answers', async () => {
   const f = fixture();
   f.scan.set('models', { at: Date.now(), body: {} });
@@ -121,6 +135,8 @@ test('any write under /api/models/ drops the scan, and pull/delete/load keep the
   assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'checkpoint required' } });
   await f.call('POST', '/api/models/delete', { name: 'm' }, 'admin');
   assert.deepEqual(f.sent.pop(), { status: 502, body: { error: 'delete failed: 500' } });
+  await f.call('POST', '/api/models/delete', { name: 'laya_multilingual_f16' }, 'admin');
+  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'System routing model — not deleted' } });
   await f.call('POST', '/api/models/load', { name: 'm', mtp: true }, 'admin');
   assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'Use the native preset editor to configure speculative decoding.' } });
   await f.call('POST', '/api/models/unload', { name: 'm' }, 'admin');
@@ -176,6 +192,19 @@ test('bulk tuning discovery and start are admin-only and the server owns the que
   assert.deepEqual(starts, [{ model: '', options: { confirmPause: true, promptBudgetSeconds: undefined, untuned: true } }]);
   await f.call('POST', '/api/models/autotune/untuned', {}, 'admin');
   assert.equal(f.sent.pop().status, 405);
+});
+
+test('starting auto-tune on a system routing model (Laya) is rejected as a 4xx, even requested directly', async () => {
+  const f = fixture({ manager: { autotune: {
+    untuned: async () => ({ status: 200, body: { models: [], skipped: [{ model: 'laya_multilingual_f16', reason: 'System routing model — not tuned' }] } }),
+    start: async (model) => model === 'laya_multilingual_f16'
+      ? { status: 400, body: { error: 'System routing model — not tuned' } }
+      : { status: 202, body: { status: 'running' } },
+  } } });
+  await f.call('POST', '/api/models/autotune', { model: 'laya_multilingual_f16', confirmPause: true }, 'admin');
+  const sent = f.sent.pop();
+  assert.equal(sent.status, 400);
+  assert.equal(sent.body.error, 'System routing model — not tuned');
 });
 
 test('resume is admin-only, POST-only and passes renewed pause confirmation', async () => {
