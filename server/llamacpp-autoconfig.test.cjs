@@ -125,3 +125,33 @@ test('a native context below the smallest qualified candidate is a clear error, 
   assert.equal(r.values, undefined);
   assert.equal(r.rows, undefined);
 });
+
+test('estimate inputs are read-only facts: q8 KV rows, pinned projector memory, current settings (#204)',async t=>{
+  const {estimateInputs}=require('./llamacpp-autoconfig.cjs');
+  const meta=summarize(Object.fromEntries(Object.entries(qwen35).map(([k,[,v]])=>[k,v])));
+  const gib=1024**3;
+  const plain=estimateInputs({meta,modelBytes:5.5*gib,current:{'ctx-size':'16384','cache-type-k':'q8_0'}});
+  assert.equal(plain.chat,true);assert.equal(plain.sizeable,true);assert.equal(plain.modelGib,5.5);assert.equal(plain.pinnedGib,0);
+  assert.deepEqual(plain.current,{ctx:16384,kv:'q8_0'});
+  assert.equal(plain.rows.at(-1).ctx,262144);
+  const row=plain.rows.find(r=>r.ctx===32768);
+  assert.equal(row.kvQ8Gib,Math.round(kvCacheBytes(meta,32768)/gib*100)/100);
+  assert.ok(plain.rows.every((r,i)=>i===0||r.kvQ8Gib>=plain.rows[i-1].kvQ8Gib),'KV grows with context');
+  const vision=estimateInputs({meta,modelBytes:5.5*gib,mmprojBytes:0.9*gib});
+  assert.ok(vision.pinnedGib>1.3&&vision.pinnedGib<2,'projector plus its compute scratch');
+  const embed=estimateInputs({meta:{arch:'nomic-bert',hasChatTemplate:false},modelBytes:gib});
+  assert.equal(embed.chat,false);assert.equal(embed.sizeable,false);assert.deepEqual(embed.rows,[]);
+  // The manager reads only the mounted file and never writes the preset file.
+  const models=write(t,'x',Buffer.alloc(0)).dir;
+  fs.writeFileSync(path.join(models,'q.gguf'),gguf(qwen35));
+  const ini=path.join(models,'models.ini');
+  fs.writeFileSync(ini,'version = 1\n[good]\nmodel = /models/q.gguf\nc = 8192\n');
+  const before=fs.readFileSync(ini,'utf8');
+  const make=autoconfig=>createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',presetPath:ini,fetchJson:async()=>{throw Error('no router call expected');},autoconfig});
+  const r=await make({modelsPath:models,budgetGib:14}).estimateMemory('good');
+  assert.equal(r.status,200);assert.equal(r.body.budgetGib,14);assert.equal(r.body.model,'good');assert.ok(r.body.rows.length>10);
+  assert.equal((await make({modelsPath:models}).estimateMemory('good')).body.budgetGib,null,'no budget is not an error');
+  assert.equal((await make({budgetGib:14}).estimateMemory('good')).status,501);
+  assert.equal((await make({modelsPath:models}).estimateMemory('absent')).status,404);
+  assert.equal(fs.readFileSync(ini,'utf8'),before);
+});

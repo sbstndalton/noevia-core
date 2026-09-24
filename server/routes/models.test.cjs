@@ -306,3 +306,25 @@ test('the benchmark start proxy refuses non-chat models with 400 and forwards ch
   assert.equal(f.sent.pop().status, 200);
   assert.equal(f.fetched.length, 1);
 });
+
+test('the memory estimate is admin-only, read-only and validates the model name (#204)', async () => {
+  const seen = [];
+  const f = fixture({ manager: { estimateMemory: async (m) => { seen.push(m); return { ok: true, status: 200, body: { model: m, rows: [] } }; } } });
+  await f.call('GET', '/api/models/estimate', undefined, 'member', '?model=m');
+  assert.equal(f.sent.pop().status, 403);
+  await f.call('POST', '/api/models/estimate', {}, 'admin', '?model=m');
+  assert.equal(f.sent.pop().status, 405);
+  await f.call('GET', '/api/models/estimate', undefined, 'admin', '');
+  assert.equal(f.sent.pop().status, 400);
+  await f.call('GET', '/api/models/estimate', undefined, 'admin', '?model=m');
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { model: 'm', rows: [] } });
+  assert.deepEqual(seen, ['m']);
+  assert.equal(f.scan.size, 0);
+  const none = fixture();
+  await none.call('GET', '/api/models/estimate', undefined, 'admin', '?model=m');
+  assert.equal(none.sent.pop().status, 404);
+  const boom = fixture({ manager: { estimateMemory: async () => { throw Error('/secret/path exploded'); } } });
+  const orig = console.error; console.error = () => {};
+  try { await boom.call('GET', '/api/models/estimate', undefined, 'admin', '?model=m'); } finally { console.error = orig; }
+  assert.deepEqual(boom.sent.pop(), { status: 500, body: { error: 'Could not estimate memory for this model.' } });
+});

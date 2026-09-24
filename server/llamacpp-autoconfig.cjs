@@ -163,6 +163,28 @@ function suggest({ meta, modelBytes, mmprojBytes = 0, budgetGib, current = {}, c
   return { values, rows, budgetGib, estimateGib: best.totalGib, notes, source: 'Adapted from Model Loader autoconfig (scratchhax/model-loader, MIT).' };
 }
 
+/**
+ * The read-only ingredients of the memory estimate, for the guided "Will it fit?" panel (#204).
+ * KV rows are sized at q8_0 (the cache type suggest() uses); the client rescales them per
+ * cache type. Nothing here depends on the budget, so it is safe to return without one.
+ */
+function estimateInputs({ meta, modelBytes, mmprojBytes = 0, current = {} }) {
+  const m = meta || {};
+  const chat = !!m.hasChatTemplate && !/bert/i.test(m.arch || '');
+  let pinnedGib = 0;
+  if (mmprojBytes > 0) {
+    const ubatch = Math.max(IMAGE_MAX_TOKENS, Number(current['ubatch-size']) || 0);
+    pinnedGib = mmprojBytes / GIB + MMPROJ_COMPUTE_GIB + 7 * Math.max(0, ubatch - 512) * (m.blockCount || 0) * (m.embeddingLength || 0) / 1e9;
+  }
+  const native = m.contextLength || 0;
+  const sizeable = kvCacheBytes(m, 4096) > 0;
+  const rows = sizeable ? CTX_CANDIDATES.filter(c => !native || c <= native).map(ctx => ({ ctx, kvQ8Gib: round2((kvCacheBytes(m, ctx) + draftKvBytes(m, ctx)) / GIB) })) : [];
+  const currentCtx = Number(current['ctx-size'] || current.c) || null;
+  const currentKv = typeof current['cache-type-k'] === 'string' ? current['cache-type-k'] : null;
+  return { chat, sizeable, arch: m.arch || '', nativeCtx: native || null, modelGib: round2(modelBytes / GIB), pinnedGib: round2(pinnedGib),
+    reserveGib: RESERVE_GIB, safety: SAFETY, moe: !!(m.expertCount && m.expertCount > 1), rows, current: { ctx: currentCtx, kv: currentKv } };
+}
+
 function parseMemoryLimit(value) {
   const match = /^\s*(\d+(?:\.\d+)?)\s*([kmgt]?)i?b?\s*$/i.exec(String(value || ''));
   if (!match) return null;
@@ -170,4 +192,4 @@ function parseMemoryLimit(value) {
   return Number(match[1]) * scale;
 }
 
-module.exports = { suggest, kvCacheBytes, parseMemoryLimit, CTX_CANDIDATES };
+module.exports = { suggest, estimateInputs, kvCacheBytes, parseMemoryLimit, CTX_CANDIDATES };

@@ -216,6 +216,17 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     const result=require('./llamacpp-autoconfig.cjs').suggest({meta:read.meta,modelBytes:read.modelFile.size,mmprojBytes:read.mmproj?.size||0,budgetGib,current:{...profile.defaults,...profile.options},cacheRamMaxMib});
     return {ok:true,status:200,body:{model,revision:profile.revision,arch:read.meta.arch,...result}};
   }
+  // Memory-estimate inputs for the guided "Will it fit?" panel (#204). Reads the model file's
+  // metadata only; never loads, writes or measures. budgetGib is null when none is configured.
+  async function estimateMemory(model) {
+    if(!presets)return unsupported('Memory estimates; configure LLAMACPP_PRESET_PATH');
+    if(!autoconfig.modelsPath)return {ok:false,status:501,body:{error:'Estimates need the model directory mounted read-only; set LLAMACPP_MODELS_PATH.'}};
+    const profile=presets.get(model);
+    const read=await readModel(model);
+    if(read.error)return {ok:false,status:read.status,body:{error:read.error}};
+    const inputs=require('./llamacpp-autoconfig.cjs').estimateInputs({meta:read.meta,modelBytes:read.modelFile.size,mmprojBytes:read.mmproj?.size||0,current:{...profile.defaults,...profile.options}});
+    return {ok:true,status:200,body:{model,budgetGib:autoconfig.budgetGib>0?autoconfig.budgetGib:null,...inputs}};
+  }
   // Starting settings for calibration: structural values from the model file; the context
   // itself is measured, so an unconfigured memory budget is not an obstacle here.
   async function conservativeFor(model) {
@@ -310,6 +321,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     getPreset: model => presets ? Promise.resolve({ok:true,status:200,body:presets.get(model)}) : unsupported('Native preset editing'),
     applyPreset,
     suggestPreset,
+    estimateMemory,
     reloadPresets,
     evidence, recordEvidence,
     calibration: calibrator ? { start: calibrator.start, cancel: calibrator.cancel, status: calibrator.status, recover: calibrator.recover } : null,

@@ -269,6 +269,17 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
       return json(res,result.status,result.body);
     }
 
+    // Read-only memory estimate inputs (#204): file metadata and sizes, never a load or a write.
+    if (p === '/api/models/estimate') {
+      if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
+      if(req.method!=='GET')return json(res,405,{error:'Method not allowed'});
+      if(!modelManager.estimateMemory)return json(res,404,{error:'Memory estimates need the native engine'});
+      const model=url.searchParams.get('model')||'';
+      if(!model||model.length>200)return json(res,400,{error:'Choose a model'});
+      try{const result=await modelManager.estimateMemory(model);res.setHeader('Cache-Control','no-store');return json(res,result.status,result.body);}
+      catch(e){return json(res,500,{error:clientMessage(e,'Could not estimate memory for this model.')});}
+    }
+
     if (p === '/api/models/preset') {
       if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
       if(!modelManager.getPreset)return json(res,404,{error:'Native presets are unavailable'});
