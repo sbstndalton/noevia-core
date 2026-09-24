@@ -45,22 +45,35 @@ test('DELETE forwards If-Match, or the version read now when a client sends none
 
 test('MOVE and COPY resolve Destination inside the same tenant only',async t=>{
  const {request,calls}=await setup(t);const h={'If-Match':`"${TAG}"`};
- assert.equal((await request('MOVE','a.md',{...h,Destination:'http://localhost/dav/alice/notes/b.md'})).status,201);
- assert.deepEqual(calls.at(-1)[1],{op:'move',path:'a.md',destination:'notes/b.md',overwrite:false,version:TAG});
+ assert.equal((await request('MOVE','a.md',{...h,Destination:'http://localhost/dav/alice/notes/b.md'})).status,204);
+ // RFC 4918 10.6: with no Overwrite header, overwrite defaults to T, so the
+ // destination's current version is read (this fixture's stat always succeeds).
+ assert.deepEqual(calls.at(-1)[1],{op:'move',path:'a.md',destination:'notes/b.md',overwrite:true,version:TAG,destinationVersion:DEST});
  assert.equal((await request('MOVE','a.md',{...h,Destination:'http://localhost/dav/bob/b.md'})).status,403);
  assert.equal((await request('MOVE','a.md',{...h,Destination:'http://evil.example/dav/alice/b.md'})).status,502);
  assert.equal((await request('MOVE','a.md',{...h,Destination:'/dav/alice/.hidden.md'})).status,403);
  assert.equal((await request('MOVE','a.md',{...h,Destination:'/dav/alice/%2e%2e/x.md'})).status,403);
- assert.equal((await request('MOVE','a.md',{Destination:'/dav/alice/b.md'})).status,201);
- assert.deepEqual(calls.at(-1)[1],{op:'move',path:'a.md',destination:'b.md',overwrite:false,version:DEST});
- // An untagged Overwrite: T reads the destination's version; the companion sends it to Trash.
+ // Overwrite header omitted entirely, destination already exists: defaults to T
+ // (not F), replaces it, and the companion sends the replaced file to Trash.
+ assert.equal((await request('MOVE','a.md',{Destination:'/dav/alice/b.md'})).status,204);
+ assert.deepEqual(calls.at(-1)[1],{op:'move',path:'a.md',destination:'b.md',overwrite:true,version:DEST,destinationVersion:DEST});
+ // Explicit Overwrite: T behaves the same way.
  assert.equal((await request('MOVE','a.md',{Destination:'/dav/alice/b.md',Overwrite:'T'})).status,204);
  assert.equal(calls.at(-1)[1].destinationVersion,DEST);
+ // Explicit Overwrite: F skips the destinationVersion lookup entirely, so the
+ // companion is left to refuse (412/409) a conflicting write on its own.
+ assert.equal((await request('MOVE','a.md',{Destination:'/dav/alice/b.md',Overwrite:'F'})).status,201);
+ assert.equal(calls.at(-1)[1].overwrite,false);
+ assert.equal(calls.at(-1)[1].destinationVersion,undefined);
+ // Overwrite header value is case-insensitive.
+ assert.equal((await request('MOVE','a.md',{Destination:'/dav/alice/b.md',Overwrite:'f'})).status,201);
+ assert.equal(calls.at(-1)[1].overwrite,false);
  assert.equal((await request('MOVE','a.md',{...h,Destination:'/dav/alice/b.md',Overwrite:'maybe'})).status,400);
  const replaced=await request('MOVE','a.md',{...h,Destination:'/dav/alice/b.md',Overwrite:'T',If:`</dav/alice/b.md> (["${DEST}"])`});
  assert.equal(replaced.status,204);assert.equal(calls.at(-1)[1].destinationVersion,DEST);
- assert.equal((await request('COPY','a.md',{Destination:'/dav/alice/c.md'})).status,201);
- assert.deepEqual(calls.at(-1)[1],{op:'copy',path:'a.md',destination:'c.md',overwrite:false});
+ // COPY with no Overwrite header also defaults to T (RFC 4918 10.6).
+ assert.equal((await request('COPY','a.md',{Destination:'/dav/alice/c.md'})).status,204);
+ assert.deepEqual(calls.at(-1)[1],{op:'copy',path:'a.md',destination:'c.md',overwrite:true,destinationVersion:DEST});
  assert.equal((await request('COPY','notes',{Destination:'/dav/alice/n2',Depth:'0'})).status,403);
  assert.equal((await request('MOVE','a.md',{...h,Destination:'/dav/alice/b.md'},'body')).status,415);
 });

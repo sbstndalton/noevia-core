@@ -78,8 +78,11 @@ function createDavOps({ ops: call }) {
       }
       const destination = destinationPath(req.headers.destination, { origin, username });
       const overwriteHeader = req.headers.overwrite;
-      if (overwriteHeader !== undefined && !['T', 'F'].includes(overwriteHeader)) throw fail(400, 'Overwrite must be T or F');
-      const overwrite = overwriteHeader === 'T';
+      if (overwriteHeader !== undefined && !['T', 'F'].includes(String(overwriteHeader).toUpperCase())) throw fail(400, 'Overwrite must be T or F');
+      // RFC 4918 §10.6: a missing Overwrite header defaults to T, not F. The replaced
+      // destination goes to Trash (not deleted outright) either way, so defaulting to
+      // T here is safe and matches the RFC rather than the old fail-closed reading.
+      const overwrite = String(overwriteHeader ?? 'T').toUpperCase() !== 'F';
       const destinationUrl = new URL(req.headers.destination, origin).href;
       let destinationVersion = destinationTag(req.headers.if, destinationUrl);
       // Replacing a destination sends it to Trash first (the companion capsules it), so an untagged

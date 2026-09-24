@@ -16,6 +16,36 @@
  *   the request scope, the project/provider/history accessors, the toolbox and MCP seams, and
  *   the approval gate. `fetch` defaults to the global one; `json` writes a JSON reply.
  */
+// Strict chat templates (Gemma/Mistral style) reject non-alternating roles. The
+// client-side history array can violate that: an errored/cancelled reply gets
+// filtered out client-side (m.error) leaving two adjacent user turns, a
+// two-device merge can do the same, and slicing to HISTORY_CAP can start mid-
+// exchange on an assistant turn. Fix up shape here, server-side, right before
+// the new user message is appended — this is the only place both the trimmed
+// history and the new message are available together. System messages, if
+// ever present in this array, pass through untouched (merging only joins
+// adjacent user/assistant turns of the same role).
+function normalizeReplayHistory(mapped, newMessage) {
+  const out = [];
+  for (const entry of mapped) {
+    const last = out[out.length - 1];
+    if (last && last.role === entry.role && (entry.role === 'user' || entry.role === 'assistant')) {
+      last.content = `${last.content}\n\n${entry.content}`;
+    } else {
+      out.push({ ...entry });
+    }
+  }
+  // A slice can start mid-exchange on an assistant turn with no prior user
+  // turn to answer; strict templates require the first turn to be user.
+  while (out.length && out[0].role === 'assistant') out.shift();
+  if (typeof newMessage === 'string') {
+    const last = out[out.length - 1];
+    if (last && last.role === 'user') last.content = `${last.content}\n\n${newMessage}`;
+    else out.push({ role: 'user', content: newMessage });
+  }
+  return out;
+}
+
 function createChatHandler({
   stepSupervision = null, durableChat = null, fs, path, crypto, fetch, codeTasksFor = () => [], reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse,
 }) {
@@ -77,11 +107,11 @@ function createChatHandler({
     // what the async context looks like by then.
     const chatWorkspace = (() => { try { return currentWorkspace(); } catch { return null; } })();
 
-    const msgs = (Array.isArray(history) ? history : [])
+    const mappedHistory = (Array.isArray(history) ? history : [])
       .filter((h) => h && (h.role === 'user' || h.role === 'assistant') && typeof h.content === 'string' && h.content)
       .slice(-HISTORY_CAP)
       .map((h) => ({ role: h.role, content: h.content }));
-    if (!body.compactOnly) msgs.push({ role: 'user', content: message });
+    const msgs = body.compactOnly ? normalizeReplayHistory(mappedHistory) : normalizeReplayHistory(mappedHistory, message);
 
     // ── Project context: instructions + knowledge files prepend
     // the system message for every chat in the project.
@@ -796,4 +826,4 @@ function createChatHandler({
   return { handleChat, handleChatInner };
 }
 
-module.exports = { createChatHandler };
+module.exports = { createChatHandler, normalizeReplayHistory };

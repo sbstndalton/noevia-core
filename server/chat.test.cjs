@@ -90,7 +90,10 @@ test('Auto route detail reaches only its reply metadata and model replay stays r
     scores: { fast: 0.19, smart: 0.81 }, selectedRole: 'smart', effectiveRole: 'smart',
     backend: 'decision-service', model: 'convaiinnovations/laya', calibrated: false,
     latencyMs: 42, status: 'accepted', fallbackReason: null };
-  const history = [{ role: 'assistant', content: 'Earlier answer', routingDecision: decision }];
+  // A leading assistant turn (nothing preceded it) is dropped by server-side
+  // history normalization to keep strict chat templates happy, so this fixture
+  // leads with the user turn it answers.
+  const history = [{ role: 'user', content: 'Earlier question' }, { role: 'assistant', content: 'Earlier answer', routingDecision: decision }];
   const result = await runDriveCall(t, { name: 'drive_read_file', autoDecision: { role: 'smart', routingDecision: decision }, history });
   const meta = result.events.find(event => event.type === 'meta');
   assert.equal(meta.model, 'smart-model'); assert.equal(meta.route, 'smart');
