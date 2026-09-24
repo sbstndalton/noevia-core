@@ -135,6 +135,13 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
       const body=['GET','HEAD','DELETE'].includes(method)?undefined:await readBody(req,1024*1024);
       // The file scan reads every model header from disk (~2 s on daserver). Serve the last scan at
       // once and refresh it behind the response; any change through this API drops it.
+      // The prompt suite is chat generation: refuse embedding, reranking and routing models here too,
+      // so the picker is not the only gate (#206). An unreadable catalogue falls back to names.
+      if(method==='POST'&&rest==='benchmark/start'){
+        let payload; try{payload=JSON.parse(body||'{}');}catch{payload={};}
+        const bad=require('../chat-model-kind.cjs').nonChatAliases(Array.isArray(payload.aliases)?payload.aliases:[],await servedCatalogue());
+        if(bad.length)return json(res,400,{error:`The prompt suite needs chat models; ${bad.join(', ')} ${bad.length===1?'is':'are'} an embedding, reranking or routing model.`});
+      }
       if(method==='POST'&&rest==='models/delete'){
         let payload; try{payload=JSON.parse(body||'{}');}catch{payload={};}
         const keys=Array.isArray(payload.models)?payload.models:[];

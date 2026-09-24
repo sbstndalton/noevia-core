@@ -7,7 +7,7 @@ const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
 const { createModelRoutes } = require('./models.cjs');
 
-function fixture({ env = {}, enabled = true, kind = 'llamacpp', manager = {}, workspace = { userId: 'u1' } } = {}) {
+function fixture({ env = {}, enabled = true, kind = 'llamacpp', manager = {}, workspace = { userId: 'u1' }, catalogue = [{ name: 'm' }] } = {}) {
   const sent = [], headers = [], fetched = [];
   const scan = new Map();
   let refreshes = 0;
@@ -39,7 +39,7 @@ function fixture({ env = {}, enabled = true, kind = 'llamacpp', manager = {}, wo
     service: {
       modelScanCache: scan, refreshModelScan: () => { refreshes += 1; },
       autoRoles: () => roles.current, setAutoRoles: (next) => { roles.current = next; }, ensureRolesLoaded: () => { roles.warmed = true; },
-      servedCatalogue: async () => [{ name: 'm' }], modelsInstalled: async () => [{ name: 'm', loaded: true }],
+      servedCatalogue: async () => catalogue, modelsInstalled: async () => [{ name: 'm', loaded: true }],
       deriveUserModelName: (c) => `user.${c}`,
     },
   });
@@ -273,4 +273,18 @@ test('the default model mode round-trips, and only an explicit apply switches ex
   assert.equal(saves, 1);
   await f.call('PUT', '/api/routing-default', { routing: 'fast' });
   assert.equal(f.sent.pop().status, 400);
+});
+
+test('the benchmark start proxy refuses non-chat models with 400 and forwards chat-only suites (#206)', async () => {
+  const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, catalogue: [{ name: 'chat-syn', labels: [] }, { name: 'vec-syn', labels: ['embeddings'] }] });
+  for (const alias of ['vec-syn', 'nomic-embed-text-v1', 'qwen3-reranker-0.6b-q8_0', 'laya_multilingual_f16']) {
+    await f.call('POST', '/api/model-manager/benchmark/start', { backend: 'b', aliases: ['chat-syn', alias], promptIds: [1], reps: 1 }, 'admin');
+    const out = f.sent.pop();
+    assert.equal(out.status, 400, alias);
+    assert.match(out.body.error, new RegExp(alias.replace(/[.]/g, '\\.')));
+  }
+  assert.equal(f.fetched.length, 0, 'a refused suite never reaches the model management service');
+  await f.call('POST', '/api/model-manager/benchmark/start', { backend: 'b', aliases: ['chat-syn'], promptIds: [1], reps: 1 }, 'admin');
+  assert.equal(f.sent.pop().status, 200);
+  assert.equal(f.fetched.length, 1);
 });
