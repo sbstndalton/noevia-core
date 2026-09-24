@@ -330,11 +330,14 @@ const toolboxOffered = createToolboxOffered(ENABLED_TOOLBOXES);
 // `CODE_REPOS=name|/abs/path,...` is the only way a repository becomes reachable: a task can
 // never name a host path. The transport is supplied separately, so a deployment without a
 // coding harness installed simply has nothing to start.
+// One proxy per deployment (it binds CODE_EGRESS_PORT): Code and Browser tasks share it, each
+// scoped by its own per-task grant/token.
+const codeEgress = require('./code-egress.cjs').startEgressFromEnv(process.env, { log: (entry) => console.log('[egress]', JSON.stringify(entry)) });
 const codeService = require('./code-service.cjs').createCodeService({
   repos: process.env.CODE_REPOS,
   // The egress proxy (D15) is the only way a task reaches the internet, and only to the domains
   // its grant names. Unconfigured, network and installs stay unavailable.
-  egress: require('./code-egress.cjs').startEgressFromEnv(process.env, { log: (entry) => console.log('[egress]', JSON.stringify(entry)) }),
+  egress: codeEgress,
   log: (entry) => console.log('[code]', JSON.stringify(entry)),
   // Where the agent's model lives, and which one. ACP carries neither, so noevia writes both
   // into the harness's own config file (`code-harness-config.cjs`); a sandbox has no provider
@@ -359,6 +362,26 @@ const codeService = require('./code-service.cjs').createCodeService({
 });
 const codeRoutes = require('./routes/code.cjs').createCodeRoutes({
   features, getProject, workspace: () => currentWorkspace(), json, readJson, service: codeService,
+});
+
+// ── Browser mode (issue #274, spec-agent-execution §6 wired to §4): service in
+// browser-service.cjs, routes in routes/browser.cjs. Off (404) unless features.browserExecutor
+// is on, and every task still needs the egress proxy (D15) exactly as a networked Code task does.
+// `playwright` is an operator-installed dependency, never a hard one: a deployment without it
+// simply cannot start a browser task, and says so, rather than falling back to something
+// unsandboxed.
+const browserService = require('./browser-service.cjs').createBrowserService({
+  launch: async () => {
+    let playwright;
+    try { playwright = require('playwright'); }
+    catch { throw Object.assign(Error('Browser mode needs Playwright installed on this server.'), { status: 503, publicMessage: 'Browser mode needs Playwright installed on this server.' }); }
+    return playwright.chromium.launch({ headless: true });
+  },
+  egress: codeEgress,
+  log: (entry) => console.log('[browser]', JSON.stringify(entry)),
+});
+const browserRoutes = require('./routes/browser.cjs').createBrowserRoutes({
+  features, getProject, workspace: () => currentWorkspace(), json, readJson, service: browserService,
 });
 
 const usageRoutes = require('./routes/usage.cjs').createUsageRoutes({
@@ -637,6 +660,7 @@ async function handleRequestScoped(req, res) {
     if (authn && await webAddressRoutes(req, res, { path: p, authn })) return;
     if (authn && p.startsWith('/api/projects/') && await researchRoutes(req, res, { path: p, authn })) return;
     if (authn && p.startsWith('/api/projects/') && await codeRoutes(req, res, { path: p, authn })) return;
+    if (authn && p.startsWith('/api/projects/') && await browserRoutes(req, res, { path: p, authn })) return;
     if (await diaryRoutes.connectors(req, res, { path: p, authn })) return;
     if (await projectRoutes(req, res, { path: p, authn, url })) return;
     if (await authRoutes.account(req, res, { path: p, authn })) return;
