@@ -636,18 +636,18 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
     },    getStorage(userId, includeSecret = false) {
       const row = db.prepare('SELECT * FROM storage_connections WHERE user_id=?').get(userId);
       if (!row) return { kind: 'local', baseUrl: '', bucket: '', region: DEFAULT_S3_REGION, username: '', corpusRoot: '' };
-      let plain = '';
+      let plain = ''; let needsReauth = false;
       try { plain = secrets ? secrets.decrypt(row.secret, userId) : row.secret; } catch {
         // Lost or rotated secrets.key, or a ciphertext bound to another account.
         console.warn(`storage secret for user ${userId} could not be decrypted; treating it as unset`);
-        plain = '';
+        plain = ''; needsReauth = !!row.secret;
       }
-      // Upgrade a legacy unbound (v1) ciphertext to the account-bound format.
-      if (secrets && plain && String(row.secret).startsWith('enc:v1:')) {
+      // Upgrade a legacy unbound (v1) ciphertext or a plaintext secret to the account-bound format.
+      if (secrets && plain && !String(row.secret).startsWith('enc:v2:')) {
         db.prepare('UPDATE storage_connections SET secret=? WHERE user_id=?').run(secrets.encrypt(plain, userId), userId);
       }
       return { kind: row.kind, baseUrl: row.base_url, bucket: row.bucket || '', region: normalizeS3Region(row.region), username: row.username, corpusRoot: row.corpus_root,
-        secret: includeSecret ? plain : undefined, secretConfigured: !!plain };
+        secret: includeSecret ? plain : undefined, secretConfigured: !!plain, secretNeedsReauth: needsReauth };
     },
     saveStorage(userId, value) {
       const kind = ['local', 'nextcloud', 'webdav', 's3'].includes(value.kind) ? value.kind : 'local';

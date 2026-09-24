@@ -31,8 +31,9 @@ const PASS = Symbol('unhandled');
  * @param {object} deps.env                              process.env, read at call time
  * @param {{ forgetUser: (userId:string) => void }} [deps.mcpOAuth]      OAuth sign-ins, keyed per (user, server)
  * @param {{ forgetUser: (userId:string) => void }} [deps.directoryMcp]  directory server keys, keyed per (user, server)
+ * @param {(actorId:string) => object} [deps.rotateSecrets]  re-encrypts stored credentials under the current key
  */
-function createAuthRoutes({ json, authResult, readJson, authService, publicAuthRoutes, davSettings, davConfig, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, env, mcpOAuth, directoryMcp }) {
+function createAuthRoutes({ json, authResult, readJson, authService, publicAuthRoutes, davSettings, davConfig, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, env, mcpOAuth, directoryMcp, rotateSecrets }) {
   async function open(req, res, { path: p }) {
     if (p === '/api/setup/status' && req.method === 'GET') {
       return json(res, 200, { configured: authService.userCount() > 0, publicOrigin: authService.origin || env.PUBLIC_ORIGIN || '' });
@@ -118,6 +119,10 @@ function createAuthRoutes({ json, authResult, readJson, authService, publicAuthR
       if (authn.user.role !== 'admin') return json(res, 403, { error: 'administrator required' });
       if (p === '/api/admin/users' && req.method === 'GET') return json(res, 200, { users: authService.listUsers() });
       if (p === '/api/admin/invitations' && req.method === 'POST') return json(res, 201, authService.createInvite(authn.user.id, (await readJson(req)).role));
+      if (p === '/api/admin/secrets/rotate' && req.method === 'POST') {
+        if (!rotateSecrets) return json(res, 501, { error: 'secrets rotation is not available' });
+        try { return json(res, 200, rotateSecrets(authn.user.id)); } catch (e) { return json(res, 500, { error: String(e.message || e) }); }
+      }
       const disabledRoute = p.match(/^\/api\/admin\/users\/([^/]+)\/disabled$/);
       if (disabledRoute && req.method === 'PUT') {
         try { return json(res, authService.setDisabled(authn.user.id, decodeURIComponent(disabledRoute[1]), !!(await readJson(req)).disabled) ? 200 : 404, { ok: true }); }

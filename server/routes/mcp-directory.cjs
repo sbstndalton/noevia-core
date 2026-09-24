@@ -37,7 +37,7 @@ function createMcpDirectoryRoutes({ json, readJson, auth, servers: MCP_SERVERS, 
     if (authn && userKey && req.method === 'DELETE') { directoryMcp.clearUserKey(authn.user.id, userKey[1]); return reply(res, 200, { ok: true }); }
     // Per-account OAuth sign-in to directory servers (any signed-in account, each for itself).
     if (authn && p === '/api/mcp-oauth/servers' && req.method === 'GET') {
-      return reply(res, 200, { servers: MCP_SERVERS.filter((sv) => sv.auth === 'oauth').map((sv) => ({ id: sv.id, title: sv.title, connected: mcpOAuth.connected(authn.user.id, sv.id) })) });
+      return reply(res, 200, { servers: MCP_SERVERS.filter((sv) => sv.auth === 'oauth').map((sv) => { const state = mcpOAuth.status ? mcpOAuth.status(authn.user.id, sv.id) : (mcpOAuth.connected(authn.user.id, sv.id) ? 'connected' : 'disconnected'); return { id: sv.id, title: sv.title, connected: state === 'connected', needsReauth: state === 'needs-reauth' }; }) });
     }
     const oauthConnect = p.match(/^\/api\/mcp-oauth\/([a-z0-9-]+)\/connect$/);
     if (authn && oauthConnect && req.method === 'POST') {

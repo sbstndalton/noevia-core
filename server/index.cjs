@@ -542,6 +542,8 @@ const publicAuthRoutes = new Set([
 const authRoutes = require('./routes/auth.cjs').createAuthRoutes({
   json, authResult, readJson, authService, publicAuthRoutes, davSettings, davConfig, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, env: process.env,
   mcpOAuth, directoryMcp,
+  // POST /api/admin/secrets/rotate (CSRF-checked by the router like every signed-in POST).
+  rotateSecrets: (actorId) => require('./secrets-rotate.cjs').runRotation({ secrets: secretStore, db: authService.db, dataDir: DATA_DIR, audit: authService.audit, actorId }),
 });
 // The user's own storage connection: read, save, test, browse, one folder, the Nextcloud login flow
 // (routes/storage.cjs). fetch is resolved per call: tests swap the global at runtime.

@@ -75,7 +75,7 @@ test('sign-in servers list this account\'s own connection state', async () => {
   const { routes } = build();
   const res = fakeRes();
   await routes(req('GET'), res, { path: '/api/mcp-oauth/servers', authn: { user: { id: 'u2', role: 'member' } } });
-  assert.deepEqual(res.out.body, { servers: [{ id: 'dir-a', title: 'A', connected: false }] });
+  assert.deepEqual(res.out.body, { servers: [{ id: 'dir-a', title: 'A', connected: false, needsReauth: false }] });
 });
 
 test('the admin directory refuses members and answers admins', async () => {

@@ -165,7 +165,14 @@ function createMcpOAuth({ db, secrets, fetchImpl = globalThis.fetch, urlAllowed,
     return c ? { manual: !!c.manual, clientId: c.manual ? c.clientId : null, hasSecret: !!c.clientSecret, redirectUri: c.redirectUri, issuer: c.issuer } : null;
   }
 
-  const connected = (userId, serverId) => !!(userId && db.prepare('SELECT 1 FROM mcp_oauth_tokens WHERE user_id=? AND server_id=?').get(userId, serverId));
+  // 'connected' | 'needs-reauth' (a stored token no key can open: lost or rotated
+  // secrets.key without a rotation) | 'disconnected'.
+  function status(userId, serverId) {
+    const row = userId && db.prepare('SELECT data_enc FROM mcp_oauth_tokens WHERE user_id=? AND server_id=?').get(userId, serverId);
+    if (!row) return 'disconnected';
+    return dec(row.data_enc, userId) ? 'connected' : 'needs-reauth';
+  }
+  const connected = (userId, serverId) => status(userId, serverId) === 'connected';
   function disconnect(userId, serverId) {
     db.prepare('DELETE FROM mcp_oauth_tokens WHERE user_id=? AND server_id=?').run(userId, serverId);
     audit('mcp.oauth.disconnect', userId, { serverId });
@@ -181,7 +188,7 @@ function createMcpOAuth({ db, secrets, fetchImpl = globalThis.fetch, urlAllowed,
     db.prepare('DELETE FROM mcp_oauth_tokens WHERE user_id=?').run(userId);
   }
 
-  return { discover, start, finish, tokenFor, connected, disconnect, forget, forgetUser, setClient, clientInfo };
+  return { discover, start, finish, tokenFor, connected, status, disconnect, forget, forgetUser, setClient, clientInfo };
 }
 
 module.exports = { createMcpOAuth };
