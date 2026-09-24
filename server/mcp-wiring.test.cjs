@@ -13,10 +13,10 @@ function fakeMcp(catalogues) {
   const sessions = [];
   return {
     calls, sessions,
-    async connect(url, headers) { sessions.push({ url, headers, open: true }); return { session: sessions.length - 1 }; },
+    async connect(url, headers, _timeoutMs, signal) { sessions.push({ url, headers, open: true, connectSignal: signal }); return { session: sessions.length - 1 }; },
     async disconnect(_url, session) { sessions[session].open = false; },
     async listTools(url) { if (catalogues[url] instanceof Error) throw catalogues[url]; return catalogues[url] || []; },
-    async callTool(url, _session, name, args, headers) { calls.push({ url, name, args, headers }); return { content: [{ type: 'text', text: `${name}:${JSON.stringify(args)}` }] }; },
+    async callTool(url, _session, name, args, headers, _timeoutMs, signal) { calls.push({ url, name, args, headers, signal }); return { content: [{ type: 'text', text: `${name}:${JSON.stringify(args)}` }] }; },
     convertTool(t) { return { ok: true, tool: { type: 'function', function: { name: t.name, description: t.description, parameters: t.inputSchema } } }; },
     readOnlyHint(t) { return t.annotations ? t.annotations.readOnlyHint : undefined; },
     resultToText(r) { return r.content.map((c) => c.text).join(''); },
@@ -99,6 +99,15 @@ test('each server mode gets exactly its own credential, and a missing one is an 
   // Discovery credentials: bearer from env, internal a discovery-only token, none for user modes' listing.
   assert.deepEqual(mcp.sessions.find((s) => s.url === 'http://b/mcp').headers, { Authorization: 'Bearer secret' });
   assert.ok(minted.some((c) => c.discovery === true && c.ttlMs === 120000));
+
+  // The chat's own abort signal (browser disconnect) travels through to the
+  // underlying connect/callTool, so a tool call stops when the caller goes
+  // away instead of running for the full internal timeout regardless.
+  const chatController = new AbortController();
+  const withSignal = await asUser(scope, 'alice', () => wiring.executeMcpToolCall('nc_read', { q: 1 }, chatController.signal));
+  assert.equal(withSignal, 'nc_read:{"q":1}');
+  assert.equal(mcp.sessions.filter((s) => s.url === 'http://nc/mcp').at(-1).connectSignal, chatController.signal);
+  assert.equal(mcp.calls.find((c) => c.name === 'nc_read').signal, chatController.signal);
 
   const run = (uid, name) => asUser(scope, uid, () => wiring.executeMcpToolCall(name, { q: 1 }));
   assert.equal(await run('alice', 'nc_read'), 'nc_read:{"q":1}');

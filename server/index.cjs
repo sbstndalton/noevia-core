@@ -257,7 +257,7 @@ const {
   getProject: (id) => getProject(id),
   documentSources,
   workspace: () => currentWorkspace(),
-  executeMcp: (name, args) => executeMcpToolCall(name, args),
+  executeMcp: (name, args, signal) => executeMcpToolCall(name, args, signal),
 });
 const connectorRoutes = require('./routes/connectors.cjs').createConnectorRoutes({
   accounts: driveAccounts, driveTools, policy: toolPolicy, offsite: offsiteBackup, isWrite: (name) => isWriteTool(name), json, readBody: (req) => readJson(req),

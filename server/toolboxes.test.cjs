@@ -110,6 +110,10 @@ test('the executor runs built-ins itself and hands MCP tools on with the project
   assert.match(await t.executeToolCall(null, 'get_current_time', '{"timezone":"Europe/Berlin"}'), /\(Europe\/Berlin\)/);
   assert.match(await t.executeToolCall(null, 'get_current_time', '{"timezone":"Mars/Olympus"}'), /^ERROR: unknown IANA timezone/);
   assert.match(await t.executeToolCall(null, 'read_project_file', 'not json'), /^ERROR: tool arguments were not valid JSON/);
+  assert.match(await t.executeToolCall(null, 'get_current_time', 'null'), /^ERROR: tool arguments must be a JSON object/);
+  assert.match(await t.executeToolCall(null, 'get_current_time', '42'), /^ERROR: tool arguments must be a JSON object/);
+  assert.match(await t.executeToolCall(null, 'get_current_time', '"x"'), /^ERROR: tool arguments must be a JSON object/);
+  assert.match(await t.executeToolCall(null, 'get_current_time', '[]'), /^ERROR: tool arguments must be a JSON object/);
   assert.match(await t.executeToolCall({ id: 'p', files: [] }, 'read_project_file', '{"name":"x.md"}'), /^ERROR: no project file named "x.md"/);
   const big = '#'.repeat(TOOL_RESULT_CAP + 500);
   const out = await t.executeToolCall({ id: 'p', files: [{ name: 'big.md', content: big }] }, 'read_project_file', '{"name":"big.md"}');

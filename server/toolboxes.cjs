@@ -342,7 +342,7 @@ function createToolboxes({
     }));
   }
 
-  async function executeToolCall(project, name, rawArgs, allowed) {
+  async function executeToolCall(project, name, rawArgs, allowed, signal) {
     // A model can name a tool it was never offered — by hallucination, or from
     // a box the project has since deselected mid-conversation. Enforce the
     // resolved list here rather than trusting that whatever was sent upstream is
@@ -355,6 +355,13 @@ function createToolboxes({
       args = rawArgs ? JSON.parse(rawArgs) : {};
     } catch {
       return `ERROR: tool arguments were not valid JSON: ${String(rawArgs).slice(0, 200)}`;
+    }
+    // A syntactically valid JSON value like `null`, `42`, or `"x"` parses fine
+    // but is not an arguments object; every tool below assumes it can read
+    // properties off `args`, so treat anything else as a clean argument error
+    // rather than letting it surface as an unhandled TypeError.
+    if (typeof args !== 'object' || args === null || Array.isArray(args)) {
+      return `ERROR: tool arguments must be a JSON object: ${String(rawArgs).slice(0, 200)}`;
     }
     if (kiwixTools?.names.has(name)) return kiwixTools.execute(name, args);
     if (driveTools?.names.has(name)) return driveTools.execute(scope.getStore()?.authn?.user, name, args);
@@ -396,7 +403,7 @@ function createToolboxes({
     // the workspace and authn the rest of the call depends on survive — and
     // two interleaved chats each keep their own project (see the scope test).
     if (mcpTools().has(name)) {
-      return scope.run({ ...scope.getStore(), internalCallProject: project || null }, () => executeMcp(name, args));
+      return scope.run({ ...scope.getStore(), internalCallProject: project || null }, () => executeMcp(name, args, signal));
     }
     return `ERROR: unknown tool "${name}"`;
   }

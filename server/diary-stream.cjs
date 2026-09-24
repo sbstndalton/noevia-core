@@ -23,7 +23,7 @@ async function proxyDiaryStream(res, url, options, { heartbeatMs = 5000, onEvent
         while ((boundary = buffer.indexOf('\n\n')) !== -1) {
           const frame=buffer.slice(0,boundary + 2);
           if(onEvent){try{const line=frame.split('\n').find(l=>l.startsWith('data: '));if(line)onEvent(JSON.parse(line.slice(6)));}catch{ /* Optional telemetry must never break diary capture. */ }}
-          if(job){const line=frame.split('\n').find(l=>l.startsWith('data: '));if(line)job.event(JSON.parse(line.slice(6)));}
+          if(job){try{const line=frame.split('\n').find(l=>l.startsWith('data: '));if(line)job.event(JSON.parse(line.slice(6)));}catch{ /* A non-JSON data frame (e.g. `[DONE]`) must not look like an interrupted stream. */ }}
           if(!res.destroyed)res.write(frame);
           buffer = buffer.slice(boundary + 2);
         }

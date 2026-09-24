@@ -25,6 +25,40 @@
 
 const PROTOCOL_VERSION = '2025-06-18';
 const CLIENT_INFO = { name: 'noevia', version: '1' };
+// A remote MCP server is not trusted infrastructure: nothing stops it from
+// streaming an unbounded body instead of a JSON-RPC reply, and `await
+// res.text()` would buffer all of it before the 30-60s request timeout ever
+// fires. Cap how much of any response body noevia will read into memory.
+const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+
+// Read a response body up to `capBytes`, aborting the underlying request (via
+// `controller`) and throwing a clear error the moment the cap is exceeded,
+// rather than buffering an unbounded stream. Falls back to res.text() when a
+// body reader isn't available (e.g. in tests using a plain Response-like
+// object without a streamable body).
+async function readBodyCapped(res, controller, capBytes = MAX_RESPONSE_BYTES) {
+  if (!res.body || typeof res.body.getReader !== 'function') return await res.text();
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let text = '', total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > capBytes) {
+        controller.abort();
+        try { await reader.cancel(); } catch { /* already aborted */ }
+        throw new Error(`MCP: response body exceeded the ${Math.round(capBytes / (1024 * 1024))} MB limit`);
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+    return text;
+  } finally {
+    try { reader.releaseLock(); } catch { /* stream already errored/canceled */ }
+  }
+}
 
 // Every request gets its own id, so a reply can be matched to it. These used
 // to be constants (1, 100+page, 200), which was survivable only because the
@@ -75,9 +109,18 @@ function parseRpcBody(contentType, text, expectedId) {
 
 // One JSON-RPC round trip. `session` is mutated to carry the id the server
 // hands out at initialize.
-async function rpc(baseUrl, session, body, { headers = {}, timeoutMs = 30000, notify = false } = {}) {
+async function rpc(baseUrl, session, body, { headers = {}, timeoutMs = 30000, notify = false, signal } = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  // `signal`, when given, is the caller's own lifetime (e.g. the chat's
+  // abort signal on browser disconnect). Forwarding it means a tool call
+  // stops the moment the caller goes away, instead of running up to
+  // `timeoutMs` regardless.
+  const forwardAbort = () => controller.abort();
+  if (signal) {
+    if (signal.aborted) controller.abort();
+    else signal.addEventListener('abort', forwardAbort);
+  }
   try {
     const res = await fetch(baseUrl, {
       method: 'POST',
@@ -96,35 +139,41 @@ async function rpc(baseUrl, session, body, { headers = {}, timeoutMs = 30000, no
     const sid = res.headers.get('mcp-session-id');
     if (sid) session.id = sid;
     if (!res.ok) {
-      const detail = await res.text().catch(() => '');
+      const detail = await readBodyCapped(res, controller).catch(() => '');
       throw new Error(`MCP ${res.status}: ${detail.slice(0, 200)}`);
     }
     // Notifications have no id and the server answers 202 with an empty body.
     if (notify) return null;
-    const text = await res.text();
+    const text = await readBodyCapped(res, controller);
     const msg = parseRpcBody(res.headers.get('content-type'), text, body.id);
     if (msg.error) throw new Error(`MCP error ${msg.error.code}: ${msg.error.message}`);
     return msg.result;
   } finally {
     clearTimeout(timer);
+    if (signal) signal.removeEventListener('abort', forwardAbort);
   }
 }
 
 // Open a session: initialize, then the required `initialized` notification.
 // Returns the session object to pass back into listTools/callTool.
-async function connect(baseUrl, authHeaders = {}, timeoutMs = 30000) {
+// `signal`, when given, is the caller's own lifetime — e.g. the browser
+// connection for the chat this tool call belongs to — so a disconnect stops
+// the handshake rather than leaving it to run out its own timeout.
+async function connect(baseUrl, authHeaders = {}, timeoutMs = 30000, signal) {
   const session = { id: null };
   try {
     const info = await rpc(baseUrl, session, {
       jsonrpc: '2.0', id: requestId(), method: 'initialize',
       params: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, clientInfo: CLIENT_INFO },
-    }, { headers: authHeaders, timeoutMs });
+    }, { headers: authHeaders, timeoutMs, signal });
     await rpc(baseUrl, session, { jsonrpc: '2.0', method: 'notifications/initialized' },
-      { headers: authHeaders, timeoutMs, notify: true });
+      { headers: authHeaders, timeoutMs, notify: true, signal });
     return { session, serverInfo: info && info.serverInfo };
   } catch (error) {
     // Callers cannot close a session until connect returns it. The server may
     // already have issued an ID even when initialize response parsing fails.
+    // Cleanup itself is deliberately NOT tied to `signal`: an aborted chat
+    // still deserves its MCP session closed rather than left dangling.
     await disconnect(baseUrl, session, authHeaders, Math.min(timeoutMs, 5000));
     throw error;
   }
@@ -179,10 +228,10 @@ async function listTools(baseUrl, session, authHeaders = {}, timeoutMs = 60000) 
   return all;
 }
 
-async function callTool(baseUrl, session, name, args, authHeaders = {}, timeoutMs = 60000) {
+async function callTool(baseUrl, session, name, args, authHeaders = {}, timeoutMs = 60000, signal) {
   const result = await rpc(baseUrl, session, {
     jsonrpc: '2.0', id: requestId(), method: 'tools/call', params: { name, arguments: args || {} },
-  }, { headers: authHeaders, timeoutMs });
+  }, { headers: authHeaders, timeoutMs, signal });
   return result;
 }
 
@@ -329,4 +378,4 @@ function readOnlyHint(mcpTool) {
   return typeof a.readOnlyHint === 'boolean' ? a.readOnlyHint : null;
 }
 
-module.exports = { connect, disconnect, listTools, callTool, resultToText, convertTool, resolveSchemaRefs, readOnlyHint, parseRpcBody, PROTOCOL_VERSION };
+module.exports = { connect, disconnect, listTools, callTool, resultToText, convertTool, resolveSchemaRefs, readOnlyHint, parseRpcBody, PROTOCOL_VERSION, MAX_RESPONSE_BYTES };

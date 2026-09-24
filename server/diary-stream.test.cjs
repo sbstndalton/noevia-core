@@ -27,6 +27,17 @@ test('disconnect aborts the transport and does not retry or crash',async t=>{
  const {res}=response();const run=proxyDiaryStream(res,'http://synthetic',{});res.destroy();await run;
  assert.equal(signal.aborted,true);assert.equal(calls,1);
 });
+test('a non-JSON data frame (e.g. [DONE]) with a job attached does not interrupt the stream',async t=>{
+ t.mock.method(globalThis,'fetch',async()=>new Response(new ReadableStream({start(c){
+  c.enqueue(new TextEncoder().encode('data: {"type":"reasoning","text":"Synthetic thought"}\n\n'));
+  c.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+  c.enqueue(new TextEncoder().encode('data: {"type":"done"}\n\n'));c.close();
+ }}),{headers:{'Content-Type':'text/event-stream'}}));
+ const events=[];const job={event:e=>events.push(e),finish(){}};
+ const {res,text}=response();await proxyDiaryStream(res,'http://synthetic',{}, {heartbeatMs:5,job});
+ assert.deepEqual(events.map(e=>e.type),['status','reasoning','done']);
+ assert.doesNotMatch(text(),/interrupted/);
+});
 test('heartbeats cannot split a fragmented upstream SSE event',async t=>{
  t.mock.method(globalThis,'fetch',async()=>new Response(new ReadableStream({start(c){
   c.enqueue(new TextEncoder().encode('data: {"type":"reasoning","text":"'));

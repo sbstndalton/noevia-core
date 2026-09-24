@@ -423,3 +423,51 @@ test('a successful handshake leaves cleanup to its caller', async () => {
     assert.deepEqual(methods, ['initialize', 'notifications/initialized', 'DELETE']);
   } finally { global.fetch = realFetch; }
 });
+
+// The chat's own abort signal (browser disconnect) must stop an in-flight
+// MCP call immediately rather than letting it run out its internal timeout.
+test('an external abort signal cancels an in-flight call rather than waiting out the timeout', async () => {
+  const realFetch = global.fetch;
+  const external = new AbortController();
+  let sawAbort = false;
+  global.fetch = (url, options) => {
+    if (options.method === 'DELETE') return Promise.resolve({ ok: true }); // best-effort session cleanup after the abort
+    return new Promise((resolve, reject) => {
+      options.signal.addEventListener('abort', () => { sawAbort = true; reject(new Error('aborted')); });
+    });
+  };
+  try {
+    const run = mcp.connect('https://server.invalid/mcp', {}, 30000, external.signal);
+    await new Promise((r) => setTimeout(r, 5));
+    external.abort();
+    await assert.rejects(run, /aborted/);
+    assert.equal(sawAbort, true);
+  } finally { global.fetch = realFetch; }
+});
+
+// A remote MCP server is not trusted: nothing stops it from streaming an
+// unbounded body instead of a real JSON-RPC reply. The client must cap what
+// it buffers rather than growing memory until the timeout fires.
+test('an oversized remote response body is capped, not buffered whole', async () => {
+  const realFetch = global.fetch;
+  const chunkSize = 1024 * 1024;
+  const chunk = new Uint8Array(chunkSize).fill(97); // 'a' * 1MB, synthetic filler, well over the 8MB cap when repeated
+  let aborted = false;
+  global.fetch = async (url, options) => {
+    options.signal.addEventListener('abort', () => { aborted = true; });
+    const body = new ReadableStream({
+      async pull(controller) {
+        if (options.signal.aborted) { controller.error(new Error('aborted')); return; }
+        controller.enqueue(chunk);
+      },
+    });
+    return new Response(body, { headers: { 'content-type': 'application/json' } });
+  };
+  try {
+    await assert.rejects(
+      mcp.connect('https://server.invalid/mcp'),
+      /exceeded the 8 MB limit/,
+    );
+    assert.equal(aborted, true, 'the oversized fetch is aborted rather than left to finish');
+  } finally { global.fetch = realFetch; }
+});

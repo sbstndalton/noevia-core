@@ -113,6 +113,40 @@ test('withSourceLock serializes operations on one project and prunes when the la
   assert.equal(await f.store.withSourceLock(project, async () => 'after a failure'), 'after a failure');
 });
 
+test('a concurrent upload and prune on the same project do not lose the in-flight file', async () => {
+  // Regression for the theoretical race in uploads.cjs prune(): an ingest that
+  // writes its temp file and renames it to <hash> before project.files is
+  // updated, racing a prune() from another request that has not yet seen the
+  // new file in project.files and so would delete it. withSourceLock() must
+  // serialize the two so prune only ever runs once ingest has landed (or not
+  // at all yet), never in between.
+  const uploads = require('./uploads.cjs');
+  const f = fixture();
+  const project = await f.store.createProject({ name: 'P' });
+  const workspace = f.workspace;
+  const bytes = Buffer.from('synthetic upload contents, not a real Diary prompt');
+
+  const uploadOp = f.store.withSourceLock(project, async () => {
+    // Simulate the route: ingest writes the original to disk, then the route
+    // commits it into project.files, all inside the lock.
+    await new Promise((r) => setTimeout(r, 10));
+    const file = await uploads.ingest(workspace, project, 'note.txt', bytes, {});
+    project.files = [...(project.files || []), file];
+    return file;
+  });
+  // A second request's delete-triggered prune, queued behind the upload via the same lock.
+  const pruneOp = f.store.withSourceLock(project, async () => {
+    uploads.prune(workspace, project);
+  });
+
+  const file = await uploadOp;
+  await pruneOp;
+
+  const dir = uploads.directory(workspace, project.id);
+  assert.ok(fs.existsSync(path.join(dir, file.attachment.id)), 'the freshly ingested original survives a queued concurrent prune');
+  assert.equal(project.files.some((x) => x.name === 'note.txt'), true);
+});
+
 test('sweepDeletedProject hands the sweeper the tenant root, local dirs and the storage folder', async () => {
   const f = fixture();
   const project = await f.store.createProject({ name: 'P' });

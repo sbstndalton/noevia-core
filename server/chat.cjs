@@ -745,7 +745,7 @@ function createChatHandler({
             if (chatWideApproved(userId, chatId)) turn?.approval(tc.id, {action:'approve_all', inherited:true});
             turn?.started(tc.id);
             markWriteAttempt();
-            try { result = await executeToolCall(project, tc.name, tc.args, allowedToolNames); }
+            try { result = await executeToolCall(project, tc.name, tc.args, allowedToolNames, chatSignal.signal); }
             catch (error) { turn?.uncertain(tc.id); throw error; }
             recordToolUse(chatWorkspace, tc.name);
             // Audit AFTER the fact and only for writes: "what did the model

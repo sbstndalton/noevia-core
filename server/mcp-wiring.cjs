@@ -327,7 +327,7 @@ function createMcpWiring({
     return mcpState.inflight;
   }
 
-  async function executeMcpToolCall(name, args) {
+  async function executeMcpToolCall(name, args, signal) {
     const known = mcpState.tools.get(name);
     if (!known) return `ERROR: unknown tool "${name}"`;
     const server = MCP_SERVER_BY_ID.get(known.serverId);
@@ -366,10 +366,10 @@ function createMcpWiring({
 
     if (server.directory && !(await directoryUrlAllowed(server.url))) return `ERROR: ${name} was not run: its server's address no longer resolves to a public host.`;
     try {
-      const { session } = await mcp.connect(server.url, auth);
+      const { session } = await mcp.connect(server.url, auth, undefined, signal);
       let result;
       try {
-        result = await mcp.callTool(server.url, session, name, args, auth);
+        result = await mcp.callTool(server.url, session, name, args, auth, undefined, signal);
       } finally {
         // Close it whatever happened. Nothing used to, so every tool call left a
         // session behind on the server for the life of the process.
