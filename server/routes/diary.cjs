@@ -27,7 +27,7 @@ const PASS = Symbol('unhandled');
  * @param {object} deps.diaryConnectors   diary-connectors.cjs credentials (verify, list, create, revoke)
  * @param {object} deps.diary             diary.cjs: diaryHeaders, corpusSource, connectorFiles
  */
-function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, authService, currentWorkspace, rateLimited, connectorRate, diaryConnectors, diary }) {
+function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, authService, currentWorkspace, rateLimited, connectorRate, diaryConnectors, diary, clientAddress = (req) => req.socket?.remoteAddress }) {
   const { diaryHeaders, corpusSource, connectorFiles } = diary;
 
   async function connector(req, res, { path: p }) {
@@ -35,7 +35,7 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
       res.setHeader('Cache-Control','no-store');
       if(req.method!=='POST')return json(res,405,{error:'POST required'});
       if(req.headers.origin)return json(res,403,{error:'Use the authenticated connector client'});
-      if(connectorRate.rateLimited('diary-connector:'+String(req.socket?.remoteAddress),120,60000))return json(res,429,{error:'Try later'});
+      if(connectorRate.rateLimited('diary-connector:'+String(clientAddress(req)||'unknown'),120,60000))return json(res,429,{error:'Try later'});
       const token=String(req.headers.authorization||'').replace(/^Bearer /,'');
       const identity=diaryConnectors.verify(token);
       if(!identity)return json(res,401,{error:'Diary connector credential required'});

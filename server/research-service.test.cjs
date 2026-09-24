@@ -131,3 +131,27 @@ test('a second report on the same question and day gets its own files instead of
   assert.ok(names.includes('Research 2026-09-17 what-is-the-zephyr-cell (2).md'));
   assert.ok(names.includes('Research 2026-09-17 what-is-the-zephyr-cell (2).sources.json'));
 });
+
+test('a raced double savePartial does not write the same report twice', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-research-race-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const workspace = { dir }, project = { id: 'p1', files: [] };
+  const saved = [], calls = [];
+  const service = createResearchService({
+    now: () => Date.parse('2026-09-17T10:00:00Z') + calls.length,
+    // A slow write widens the window a real race (double-click, retried request) would hit.
+    saveFile: async (p, name, text) => { await new Promise((r) => setTimeout(r, 5)); saved.push({ project: p.id, name, text }); },
+    getProject: () => project,
+    tools: () => ({ search: async () => [{ url: 'https://fixture.test/z', title: 'Zephyr' }], extract: async () => PAGE, projectRetrieve: async () => [], complete: model(calls, { hang: 2 }) }),
+  });
+  const started = await service.start(workspace, project, { question: 'Zephyr', plan: 'proposed', subQuestions: ['One?', 'Two?', 'Three?'] });
+  for (let i = 0; i < 200 && !(service.get(workspace, project, started.id).checkpoint?.step >= 1); i++) await new Promise((r) => setTimeout(r, 5));
+  service.cancel(workspace, project, started.id);
+  await settle(service, workspace, project, started.id, 'cancelled');
+  const results = await Promise.allSettled([
+    service.savePartial(workspace, project, started.id),
+    service.savePartial(workspace, project, started.id),
+  ]);
+  assert.equal(results.filter((r) => r.status === 'fulfilled').length, 1, 'only one concurrent savePartial should succeed');
+  assert.equal(saved.length, 2, 'the report files must be written exactly once, not duplicated by the race');
+});

@@ -7,8 +7,9 @@ const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
 const { createDiaryRoutes } = require('./diary.cjs');
 
-function fixture({ diaryOn = true, limited = false, connectorLimited = false, admin = false, reply } = {}) {
+function fixture({ diaryOn = true, limited = false, connectorLimited = false, admin = false, reply, clientAddress } = {}) {
   const sent = [], fetched = [], audits = [], headers = [];
+  const rateKeys = [];
   const credentials = [{ id: 'a'.repeat(32), name: 'Claude Diary' }];
   const routes = createDiaryRoutes({
     json: (res, status, body) => { sent.push({ status, body }); },
@@ -19,7 +20,8 @@ function fixture({ diaryOn = true, limited = false, connectorLimited = false, ad
     authService: { diaryEnabled: () => diaryOn, audit: (...args) => audits.push(args) },
     currentWorkspace: () => ({ userId: 'u1', dir: '/nowhere' }),
     rateLimited: () => limited,
-    connectorRate: { rateLimited: () => connectorLimited },
+    connectorRate: { rateLimited: (key) => { rateKeys.push(key); return connectorLimited; } },
+    clientAddress,
     diaryConnectors: {
       verify: (token) => (token === 'good' ? { id: credentials[0].id, userId: 'u1' } : null),
       list: () => credentials, create: (userId, name) => ({ id: 'b'.repeat(32), name, userId }), revoke: (userId, id) => id === credentials[0].id,
@@ -36,7 +38,7 @@ function fixture({ diaryOn = true, limited = false, connectorLimited = false, ad
     const res = { setHeader: (k, v) => headers.push([k, v]) };
     return routes[mount](req, res, { path, authn: { user: { id: 'u1', role } }, url: new URL(`http://localhost${path}${search}`) });
   };
-  return { call, sent, fetched, audits, headers, credentials };
+  return { call, sent, fetched, audits, headers, credentials, rateKeys };
 }
 
 test('the connector endpoint is POST-only, refuses browsers, rate-limits and checks the credential', async () => {
@@ -52,6 +54,13 @@ test('the connector endpoint is POST-only, refuses browsers, rate-limits and che
   const limited = fixture({ connectorLimited: true });
   await limited.call('connector', 'POST', '/api/diary-connector', {}, { reqHeaders: { authorization: 'Bearer good' } });
   assert.deepEqual(limited.sent.pop(), { status: 429, body: { error: 'Try later' } });
+});
+
+test('the connector rate limit key comes from the injected clientAddress, not the raw socket', async () => {
+  const f = fixture({ clientAddress: (req) => 'proxy-resolved-ip' });
+  await f.call('connector', 'POST', '/api/diary-connector', { action: 'list', path: 'Notes' }, { reqHeaders: { authorization: 'Bearer good' } });
+  assert.ok(f.rateKeys.some((k) => k === 'diary-connector:proxy-resolved-ip'));
+  assert.ok(!f.rateKeys.some((k) => k.includes('10.0.0.2')));
 });
 
 test('a verified connector write is forwarded and audited with its path and size', async () => {

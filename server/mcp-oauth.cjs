@@ -10,6 +10,7 @@
 const crypto = require('node:crypto');
 
 const STATE_TTL_MS = 10 * 60 * 1000;
+const MAX_PENDING_PER_USER = 20;
 const b64url = (buf) => Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 const fail = (message, status = 502) => Object.assign(new Error(message), { status });
 
@@ -75,6 +76,11 @@ function createMcpOAuth({ db, secrets, fetchImpl = globalThis.fetch, urlAllowed,
   async function start({ userId, serverId, serverUrl, challenge = '', purpose = 'connect' }) {
     const client = await clientFor(serverId, serverUrl, challenge);
     for (const [k, v] of pending) if (v.expires < now()) pending.delete(k);
+    // Cap how many pending sign-ins one user can hold open: evict their oldest
+    // (by insertion order, which Map preserves) rather than letting a user
+    // grow this in-memory map without bound.
+    const own = [...pending].filter(([, v]) => v.userId === userId).map(([k]) => k);
+    while (own.length >= MAX_PENDING_PER_USER) pending.delete(own.shift());
     const verifier = b64url(crypto.randomBytes(32));
     const state = b64url(crypto.randomBytes(24));
     pending.set(state, { userId, serverId, verifier, expires: now() + STATE_TTL_MS, purpose });
@@ -100,8 +106,10 @@ function createMcpOAuth({ db, secrets, fetchImpl = globalThis.fetch, urlAllowed,
   async function finish({ userId, state, code }) {
     const p = pending.get(String(state || ''));
     if (!p || p.expires < now()) throw fail('This sign-in expired or was already used. Start again.', 400);
-    pending.delete(state);
+    // Check ownership before consuming the entry: a different signed-in user
+    // presenting this user's state must not be able to burn it for them.
     if (p.userId !== userId) throw fail('This sign-in was started by a different account.', 403);
+    pending.delete(state);
     const row = db.prepare('SELECT data_enc FROM mcp_oauth_clients WHERE server_id=?').get(p.serverId);
     const client = row && dec(row.data_enc);
     if (!client) throw fail('This server’s sign-in setup is missing. Start again.', 400);

@@ -71,8 +71,13 @@ function createResearchService({ tools, saveFile, getProject, now = Date.now }) 
     if (!current) throw fail(410, 'The project was deleted while this research was running; the report could not be saved.');
     const names = new Set((current.files || []).map((f) => String(f.name).split('/').pop()));
     for (const file of reportFiles(result, now(), (name) => names.has(name))) {
-      await saveFile(current, file.name, file.text);
+      // A natural finish and an explicit savePartial (or a retried request) can race to save
+      // the same job. jobs.append/get are synchronous, so reserving the artifact name here,
+      // before the async write below, makes the second concurrent caller see it already
+      // recorded and skip its write instead of saving the same report twice.
+      if (jobs.get(id).artifacts.some((a) => a.name === file.name)) continue;
       jobs.append(id, 'artifact.created', { name: file.name, bytes: Buffer.byteLength(file.text) });
+      await saveFile(current, file.name, file.text);
     }
   }
   return {

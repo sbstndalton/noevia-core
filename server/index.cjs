@@ -530,6 +530,7 @@ const connectorRate = require('./auth.cjs').createRateLimiter();
 // The Diary routes: the connector endpoint, the connector credentials and /api/diary/* (routes/diary.cjs).
 const diaryRoutes = require('./routes/diary.cjs').createDiaryRoutes({
   json, readBody, readJson, fetchJson, DIARY_BASE, authService, currentWorkspace, rateLimited: (userId) => llmRateLimited(userId), connectorRate, diaryConnectors, diary,
+  clientAddress: (req) => require('./auth.cjs').clientAddress(req, process.env.TRUST_PROXY === 'true'),
 });
 // Sign-in, the signed-in account and /api/admin/* (routes/auth.cjs). The open set is also the
 // router's own list of what a signed-out browser may call.

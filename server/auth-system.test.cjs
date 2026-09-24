@@ -37,6 +37,13 @@ test('deleting an administrator revokes issued invite/recovery tokens but preser
   assert.ok(auth.db.prepare("SELECT 1 FROM audit_events WHERE target_user_id=? AND action='user.delete'").get(secondId));
 });
 
+test('disabling an administrator revokes their still-open invitations, not just their sessions', async t => {
+  const { auth, firstId, secondId, password } = await deletionFixture(t);
+  const invitation = auth.createInvite(secondId);
+  auth.setDisabled(firstId, secondId, true);
+  assert.equal((await auth.acceptInvite(request(), response(), { token: invitation.token, username: 'third', password })).status, 400);
+});
+
 test('a disabled administrator cannot make deletion of the last active administrator safe', async t => {
   const { auth, firstId, secondId } = await deletionFixture(t);
   auth.setDisabled(firstId, secondId, true);

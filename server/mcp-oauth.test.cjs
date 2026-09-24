@@ -109,3 +109,25 @@ test('a service without self-registration uses an app an administrator registere
   assert.equal(oauth.connected('u1', 's'), false);
   assert.equal(oauth.clientInfo('s').hasSecret, false);
 });
+
+test('pending sign-in states are capped per user (oldest evicted) and bound to the initiating user', async () => {
+  const as = fakeAs(); const { oauth } = make(as);
+  const urls = [];
+  for (let i = 0; i < 25; i++) urls.push(await oauth.start({ userId: 'u1', serverId: 's', serverUrl: 'https://mcp.example/mcp' }));
+  const firstState = new URL(urls[0]).searchParams.get('state');
+  const lastState = new URL(urls[urls.length - 1]).searchParams.get('state');
+  const first = authorize(as, urls[0]);
+  // The oldest of 25 states was evicted once the per-user cap (20) was exceeded.
+  await assert.rejects(oauth.finish({ userId: 'u1', state: firstState, code: first.code }), /expired or was already used/);
+  const last = authorize(as, urls[urls.length - 1]);
+  assert.equal((await oauth.finish({ userId: 'u1', state: lastState, code: last.code })).serverId, 's');
+});
+
+test('a state cannot be burned by a different user presenting it', async () => {
+  const as = fakeAs(); const { oauth } = make(as);
+  const url = await oauth.start({ userId: 'u1', serverId: 's', serverUrl: 'https://mcp.example/mcp' });
+  const a = authorize(as, url);
+  await assert.rejects(oauth.finish({ userId: 'u2', state: a.state, code: a.code }), /different account/);
+  // Rejected attempt by another user must not have consumed the state.
+  assert.equal((await oauth.finish({ userId: 'u1', state: a.state, code: a.code })).serverId, 's');
+});

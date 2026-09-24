@@ -29,6 +29,7 @@ function createDecisionEndpoint({ env=process.env, fetchImpl=globalThis.fetch }=
       const response=await fetchImpl(config.baseUrl+'/v1/decisions',{method:'POST',redirect:'error',signal,
         headers:{'Content-Type':'application/json'},body:JSON.stringify({state,question,options})});
       if(!response.ok) throw Error('Decision endpoint unavailable');
+      if(!response.body) throw Error('Decision endpoint returned no decision');
       const reader=response.body.getReader();
       const chunks=[]; let size=0;
       try {
@@ -40,6 +41,7 @@ function createDecisionEndpoint({ env=process.env, fetchImpl=globalThis.fetch }=
         }
       } finally { await reader.cancel(); }
       const text=Buffer.concat(chunks).toString('utf8');
+      if(!text.trim()) throw Error('Decision endpoint returned no decision');
       const result=JSON.parse(text), ids=options.map(o=>o.id);
       if(!ids.includes(result.selected) || !result.scores || Object.keys(result.scores).length!==ids.length ||
         !ids.every(id=>Number.isFinite(result.scores[id])&&result.scores[id]>=0&&result.scores[id]<=1) ||

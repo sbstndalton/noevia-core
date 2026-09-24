@@ -549,7 +549,11 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       const user = db.prepare('SELECT * FROM users WHERE id=?').get(userId); if (!user) return false;
       if (user.role === 'admin' && disabled && db.prepare("SELECT count(*) AS n FROM users WHERE role='admin' AND disabled_at IS NULL").get().n <= 1) throw new Error('cannot disable the last administrator');
       db.prepare('UPDATE users SET disabled_at=?,updated_at=? WHERE id=?').run(disabled ? Date.now() : null, Date.now(), userId);
-      if (disabled) db.prepare('DELETE FROM sessions WHERE user_id=?').run(userId);
+      if (disabled) {
+        db.prepare('DELETE FROM sessions WHERE user_id=?').run(userId);
+        // A disabled admin's still-open invitations must not outlive them.
+        db.prepare('DELETE FROM invitations WHERE created_by=? AND used_at IS NULL').run(userId);
+      }
       audit(disabled ? 'user.disable' : 'user.enable', actorId, userId); return true;
     },
     createRecovery(actorId, userId) {

@@ -24,6 +24,10 @@ test('rejects partial, tied, contradictory, nonfinite and oversized replies',asy
     await assert.rejects(provider.decide(input));
   }
 });
+test('a 204/empty decision response is treated as no decision, not a JSON.parse crash',async()=>{
+  const provider=createDecisionEndpoint({env,fetchImpl:async()=>new Response(null,{status:204})});
+  await assert.rejects(provider.decide(input),/no decision/);
+});
 test('configured feature can be enabled and disabled through existing settings',()=>{
   const {createFeatures}=require('./features.cjs'), saved=new Map();
   const f=createFeatures({env,store:{get:k=>saved.get(k),set:(k,v)=>saved.set(k,v)}});
