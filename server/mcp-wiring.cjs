@@ -68,12 +68,19 @@ function createCredentialOriginCheck(origins) {
  * @param {NodeJS.ProcessEnv} [deps.env]   for a bearer server's tokenEnv
  * @param {(url, init) => Promise<Response>} [deps.fetch]
  * @param {number} [deps.discoveryTtlMs]
+ * @param {number} [deps.discoveryFailTtlMs]   how long a failed/empty discovery is remembered
+ *   before the next unforced request is allowed to retry every server again. Short on purpose:
+ *   long enough that a member spamming GET /api/toolboxes cannot re-trigger a full
+ *   connect/listTools/disconnect of every server on every request, short enough that a side-car
+ *   coming back up is noticed soon. A forced discovery (admin add/remove, OAuth finish) always
+ *   bypasses this.
  * @param {{ log, warn }} [deps.logger]
  */
 function createMcpWiring({
   servers, manifest = [], mcp, bindBoxes, directoryMcp, mcpOAuth, directoryUrlAllowed, credentialOriginAllowed,
   scope, storageFor, isWriteTool, internal, internalKey, reduceToolResult, resultCap = 8000,
-  env = process.env, fetch = globalThis.fetch, discoveryTtlMs = 10 * 60 * 1000, logger = console,
+  env = process.env, fetch = globalThis.fetch, discoveryTtlMs = 10 * 60 * 1000,
+  discoveryFailTtlMs = Number(process.env.MCP_DISCOVERY_FAIL_TTL_MS || 30 * 1000), logger = console,
   isUserDisabled = () => false,
 }) {
   const MCP_SERVERS = servers;
@@ -133,6 +140,10 @@ function createMcpWiring({
     boxes: [],
     servers: new Map(), // id -> { id, url, auth, error, discoveredAt, toolCount }
     discoveredAt: 0,
+    // When the last discovery came back with no boxes at all (every server failed, or none
+    // configured yet), the moment it finished — kept separately from discoveredAt so the
+    // internal-server-down retry-sooner behaviour below cannot also defeat the failure TTL.
+    failedAt: 0,
     error: null,
     inflight: null,
   };
@@ -269,6 +280,13 @@ function createMcpWiring({
     if (!MCP_ENABLED) { mcpState.tools = new Map(); mcpState.boxes = []; mcpState.servers = new Map(); mcpState.error = null; return mcpState; }
     const fresh = Date.now() - mcpState.discoveredAt < discoveryTtlMs;
     if (!force && fresh && mcpState.boxes.length) return mcpState;
+    // A discovery that found nothing (every server failed, or none are configured yet) is still
+    // worth remembering for a short TTL: otherwise every unauthenticated poll of
+    // GET /api/toolboxes re-triggers a full connect/listTools/disconnect of every server. Forced
+    // discovery (admin add/remove, OAuth finish) always bypasses this — it must see the outcome
+    // of the change it just made, not a stale failure from before it.
+    const recentFailure = !mcpState.boxes.length && Date.now() - mcpState.failedAt < discoveryFailTtlMs;
+    if (!force && recentFailure) return mcpState;
     // A forced refresh (a server was just added or removed) must not reuse a discovery that
     // started before the change: wait for it, then discover again with the new list.
     if (mcpState.inflight && force) { await mcpState.inflight.catch(() => undefined); return discoverMcpTools(true); }
@@ -321,6 +339,10 @@ function createMcpWiring({
         // boxes for the whole TTL.
         const internalDown = [...found.values()].some((sv) => sv.auth === 'internal' && sv.error);
         mcpState.discoveredAt = internalDown ? 0 : Date.now();
+        // A run that produced no boxes at all (every server failed, including the case above, or
+        // none are configured) is remembered for the short failure TTL regardless — an internal
+        // server that keeps failing must not turn into an unthrottled retry loop either.
+        mcpState.failedAt = boxes.length ? 0 : Date.now();
         // Kept for the single-server status shape: the first error, if any.
         mcpState.error = [...found.values()].map((sv) => sv.error).find(Boolean) || null;
         logger.log(`[mcp] ${byName.size} tools across ${MCP_SERVERS.length} server(s); ${boxes.length} curated boxes available`);

@@ -23,7 +23,7 @@ function fakeMcp(catalogues) {
   };
 }
 
-function build({ servers, catalogues, directoryServers = [], env = {}, storage = { kind: 'local' }, origins = '', manifest = [], isUserDisabled } = {}) {
+function build({ servers, catalogues, directoryServers = [], env = {}, storage = { kind: 'local' }, origins = '', manifest = [], isUserDisabled, discoveryFailTtlMs } = {}) {
   const mcp = fakeMcp(catalogues);
   const scope = new AsyncLocalStorage();
   const minted = [];
@@ -38,6 +38,7 @@ function build({ servers, catalogues, directoryServers = [], env = {}, storage =
     internal: { mintToken: (_k, claims) => { minted.push(claims); return 'cap' } }, internalKey: 'k',
     reduceToolResult: (text) => ({ text, reduced: false }), env, logger: { log() {}, warn() {} },
     ...(isUserDisabled ? { isUserDisabled } : {}),
+    ...(discoveryFailTtlMs !== undefined ? { discoveryFailTtlMs } : {}),
   });
   return { wiring, mcp, scope, minted };
 }
@@ -63,6 +64,26 @@ test('discovery is per server: a dead server loses its tools, a healthy one keep
   assert.equal(mcp.sessions.length, before);
   await wiring.discoverMcpTools(true);
   assert.equal(mcp.sessions.length, before + 3, 'a forced refresh discovers every server again');
+});
+
+test('a discovery where every server fails is still cached for the failure TTL, and a forced refresh bypasses it', async () => {
+  const servers = [{ id: 'a', url: 'http://a/mcp', auth: 'bearer', tokenEnv: 'T' }, { id: 'b', url: 'http://b/mcp', auth: 'bearer', tokenEnv: 'T' }];
+  const { wiring, mcp } = build({
+    servers, env: { T: 't' }, discoveryFailTtlMs: 30000,
+    catalogues: { 'http://a/mcp': new Error('ECONNREFUSED'), 'http://b/mcp': new Error('ECONNREFUSED') },
+  });
+  const state1 = await wiring.discoverMcpTools();
+  assert.equal(state1.boxes.length, 0);
+  const afterFirst = mcp.sessions.length;
+  assert.ok(afterFirst > 0, 'the first call actually connects');
+
+  // Within the TTL, an unforced call (what GET /api/toolboxes issues) must not reconnect.
+  await wiring.discoverMcpTools();
+  assert.equal(mcp.sessions.length, afterFirst, 'a second unforced call within the TTL is served from the cached failure');
+
+  // Forced discovery (admin add/remove, OAuth finish) bypasses the TTL regardless.
+  await wiring.discoverMcpTools(true);
+  assert.equal(mcp.sessions.length, afterFirst * 2, 'a forced refresh always reconnects to every server');
 });
 
 test('with no servers nothing is offered and discovery is a no-op', async () => {
