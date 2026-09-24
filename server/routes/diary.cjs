@@ -173,11 +173,21 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
       if (!body || typeof body.xid !== 'string' || typeof body.me !== 'string' || (body.assistant !== undefined && typeof body.assistant !== 'string')) {
         return json(res, 400, { error: 'xid and me required' });
       }
+      if (body.base_hash !== undefined && body.base_hash !== null && typeof body.base_hash !== 'string') {
+        return json(res, 400, { error: 'base_hash must be a string' });
+      }
+      const forward = { xid: body.xid, me: body.me, assistant: body.assistant || '', month: body.month || null };
+      // Optimistic concurrency: pass the loaded exchange's hash through so the
+      // sidecar can refuse a stale edit instead of silently overwriting.
+      if (typeof body.base_hash === 'string') forward.base_hash = body.base_hash;
       const r = await fetchJson(
         `${DIARY_BASE}/api/entries/edit`,
-        { method: 'POST', headers: diaryHeaders(), body: JSON.stringify({ xid: body.xid, me: body.me, assistant: body.assistant || '', month: body.month || null }) },
+        { method: 'POST', headers: diaryHeaders(), body: JSON.stringify(forward) },
         60000,
       );
+      // A 409 edit conflict carries current_hash/current_text the client needs
+      // to keep the draft and re-base; relay that body unchanged.
+      if (r.status === 409 && r.body && r.body.conflict === true) return json(res, 409, r.body);
       if (!r.ok) {
         const detail = r.body?.detail || r.body?.error || `diary sidecar ${r.status}`;
         return json(res, r.status >= 500 ? 502 : r.status, { error: String(detail) });

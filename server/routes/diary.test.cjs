@@ -152,3 +152,20 @@ test('malformed local exchange and authenticated connector JSON fail before side
   assert.deepEqual(f.fetched, []);
   assert.deepEqual(f.audits, []);
 });
+
+test('entry edits forward base_hash and relay a 409 conflict body unchanged', async () => {
+  const base = 'a'.repeat(64);
+  const conflict = { error: 'exchange changed since it was loaded', conflict: true, current_hash: 'b'.repeat(64), current_text: '**Me:** synthetic newer words' };
+  const f = fixture({ reply: (url, init) => (JSON.parse(init.body).base_hash === base ? { ok: false, status: 409, body: conflict } : { ok: true, status: 200, body: { ok: true, hash: 'c'.repeat(64) } }) });
+  await f.call('diary', 'POST', '/api/diary/entries/edit', { xid: 'x1', me: 'draft', base_hash: base, month: '2026-09' });
+  assert.equal(f.fetched.at(-1).init.body, JSON.stringify({ xid: 'x1', me: 'draft', assistant: '', month: '2026-09', base_hash: base }));
+  assert.deepEqual(f.sent.pop(), { status: 409, body: conflict });
+  await f.call('diary', 'POST', '/api/diary/entries/edit', { xid: 'x1', me: 'draft', base_hash: conflict.current_hash });
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true, hash: 'c'.repeat(64) } });
+  await f.call('diary', 'POST', '/api/diary/entries/edit', { xid: 'x1', me: 'draft', base_hash: 7 });
+  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'base_hash must be a string' } });
+  assert.equal(f.fetched.length, 2, 'an invalid base_hash never reaches the sidecar');
+  const plain = fixture({ reply: () => ({ ok: false, status: 409, body: { detail: 'etag clash' } }) });
+  await plain.call('diary', 'POST', '/api/diary/entries/edit', { xid: 'x1', me: 'draft' });
+  assert.deepEqual(plain.sent.pop(), { status: 409, body: { error: 'etag clash' } }, 'non-conflict 409s keep the old shape');
+});
