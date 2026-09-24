@@ -1,8 +1,12 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const Database = require('better-sqlite3');
 const { createDirectoryMcp } = require('./directory-mcp.cjs');
+const { createSecretStore } = require('./secrets.cjs');
 const { installable } = require('./routes/plugin-directory.cjs');
 
 test('add, list and remove; only https; no duplicates', () => {
@@ -89,4 +93,28 @@ test('a "$$" in a key value is not treated as a template replacement pattern', (
   const declared = [{ name: 'Authorization', required: true, secret: true, template: 'Bearer {api_key}' }];
   const s = dir.add({ registryName: 'd', title: 'D', url: 'https://d.example/mcp', declaredHeaders: declared, headerValues: { Authorization: 'k$$ey' } });
   assert.deepEqual(dir.headersFor(s.id), { Authorization: 'Bearer k$$ey' });
+});
+
+test('a personal server key is user-bound: round-trips for its owner, a legacy v1 row still decrypts, a copied row fails elsewhere', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-dirmcp-secrets-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const secrets = createSecretStore(root);
+  const db = new Database(':memory:');
+  const dir = createDirectoryMcp({ db, secrets });
+  const declared = [{ name: 'Authorization', required: true, secret: true, template: 'Bearer {api_key}' }];
+  const s = dir.add({ registryName: 'p', title: 'P', url: 'https://p.example/mcp', declaredHeaders: declared, headerValues: { Authorization: 'ADMIN-KEY' }, personal: true }, 'admin');
+  assert.deepEqual(dir.userHeadersFor('admin', s.id), { Authorization: 'Bearer ADMIN-KEY' }, 'round-trips for its owner');
+  const adminRow = db.prepare('SELECT headers_enc FROM directory_mcp_user_keys WHERE user_id=?').get('admin');
+  assert.match(adminRow.headers_enc, /^enc:v2:/, 'new writes are user-bound');
+  // A legacy v1 (unbound) row still decrypts.
+  db.prepare('INSERT INTO directory_mcp_user_keys VALUES(?,?,?,?)').run('legacy-user', s.id, secrets.encrypt(JSON.stringify({ Authorization: 'LEGACY-KEY' })), Date.now());
+  assert.deepEqual(dir.userHeadersFor('legacy-user', s.id), { Authorization: 'LEGACY-KEY' }, 'v1 row still decrypts');
+  // Copying a bound row to another account's slot fails to decrypt there.
+  db.prepare('INSERT INTO directory_mcp_user_keys VALUES(?,?,?,?)').run('member', s.id, adminRow.headers_enc, Date.now());
+  assert.deepEqual(dir.userHeadersFor('member', s.id), {}, 'a row copied to another account fails to decrypt');
+  // Once that account saves its own key, it is re-encrypted user-bound.
+  dir.setUserKey('member', s.id, { Authorization: 'MEMBER-KEY' });
+  const memberRow = db.prepare('SELECT headers_enc FROM directory_mcp_user_keys WHERE user_id=?').get('member');
+  assert.match(memberRow.headers_enc, /^enc:v2:/, 're-encrypted as user-bound on next write');
+  assert.deepEqual(dir.userHeadersFor('member', s.id), { Authorization: 'Bearer MEMBER-KEY' });
 });

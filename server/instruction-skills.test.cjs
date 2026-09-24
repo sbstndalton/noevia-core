@@ -58,3 +58,22 @@ test('published skills with license/compatibility fields and a long description 
   const p={files:[file('Body','name: pdf\ndescription: '+'d'.repeat(900)+'\nlicense: Proprietary. LICENSE.txt has complete terms\ncompatibility: any')]};skills.reconcile(p);
   assert.equal(skills.list(p)[0].valid,true,skills.list(p)[0].error);
 });
+test('an ordinary note with a Name: line in the body (not the frontmatter) is not a skill candidate and reaches rag', () => {
+ const note={name:'meeting.md',content:'---\ntitle: Meeting\n---\nName: Alice'};
+ assert.equal(skills.inspect(note),null);
+ const p={files:[note]};skills.reconcile(p);
+ assert.deepEqual(Object.keys(p.instructionSkills),[]);
+ assert.deepEqual(skills.sources(p).map(f=>f.name),['meeting.md']);
+});
+test('a genuine skill with name/description in frontmatter is still detected', () => {
+ assert.equal(skills.inspect(file()).valid,true);
+});
+test('a formerly-recorded candidate note is released by reconcile once it no longer matches', () => {
+ const note={name:'meeting.md',content:'---\nname: Meeting\n---\nBody text.'};
+ const p={files:[note]};skills.reconcile(p);
+ assert.deepEqual(Object.keys(p.instructionSkills),['meeting.md']);
+ note.content='---\ntitle: Meeting\n---\nName: Alice';
+ skills.reconcile(p);
+ assert.deepEqual(Object.keys(p.instructionSkills),[]);
+ assert.deepEqual(skills.sources(p).map(f=>f.name),['meeting.md']);
+});

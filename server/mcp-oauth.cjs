@@ -18,8 +18,17 @@ function createMcpOAuth({ db, secrets, fetchImpl = globalThis.fetch, urlAllowed,
   db.exec(`CREATE TABLE IF NOT EXISTS mcp_oauth_clients(server_id TEXT PRIMARY KEY, data_enc TEXT NOT NULL, updated_at INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS mcp_oauth_tokens(user_id TEXT NOT NULL, server_id TEXT NOT NULL, data_enc TEXT NOT NULL, updated_at INTEGER NOT NULL,
       PRIMARY KEY(user_id, server_id));`);
-  const enc = (o) => secrets.encrypt(JSON.stringify(o));
-  const dec = (s) => { try { return JSON.parse(secrets.decrypt(s)); } catch { return null; } };
+  const enc = (o, userId) => secrets.encrypt(JSON.stringify(o), userId);
+  // A row encrypted before user-binding shipped (or one with no owning user, like a
+  // shared client registration) is v1 and decrypts without a userId; try the bound
+  // form first, then fall back to unbound so pre-existing v1 rows keep working. A
+  // token bound to a different user's AAD (e.g. a row copied between accounts) fails
+  // both and returns null. The next write of a fallback-read row re-encrypts as v2.
+  const dec = (s, userId) => {
+    try { return JSON.parse(secrets.decrypt(s, userId)); } catch {}
+    if (userId !== undefined) { try { return JSON.parse(secrets.decrypt(s)); } catch {} }
+    return null;
+  };
   const pending = new Map(); // state -> { userId, serverId, verifier, expires, purpose }
 
   async function getJson(url, what) {
@@ -114,7 +123,7 @@ function createMcpOAuth({ db, secrets, fetchImpl = globalThis.fetch, urlAllowed,
     const client = row && dec(row.data_enc);
     if (!client) throw fail('This server’s sign-in setup is missing. Start again.', 400);
     const tokens = await tokenRequest(client, { grant_type: 'authorization_code', code: String(code || ''), redirect_uri: client.redirectUri, code_verifier: p.verifier });
-    db.prepare('INSERT INTO mcp_oauth_tokens VALUES(?,?,?,?) ON CONFLICT(user_id, server_id) DO UPDATE SET data_enc=excluded.data_enc, updated_at=excluded.updated_at').run(userId, p.serverId, enc(tokens), now());
+    db.prepare('INSERT INTO mcp_oauth_tokens VALUES(?,?,?,?) ON CONFLICT(user_id, server_id) DO UPDATE SET data_enc=excluded.data_enc, updated_at=excluded.updated_at').run(userId, p.serverId, enc(tokens, userId), now());
     audit('mcp.oauth.connect', userId, { serverId: p.serverId });
     return { serverId: p.serverId, purpose: p.purpose };
   }
@@ -123,7 +132,7 @@ function createMcpOAuth({ db, secrets, fetchImpl = globalThis.fetch, urlAllowed,
   async function tokenFor(userId, serverId) {
     if (!userId) return null;
     const row = db.prepare('SELECT data_enc FROM mcp_oauth_tokens WHERE user_id=? AND server_id=?').get(userId, serverId);
-    const t = row && dec(row.data_enc);
+    const t = row && dec(row.data_enc, userId);
     if (!t) return null;
     if (!t.expiresAt || t.expiresAt - now() > 60000) return t.accessToken;
     if (!t.refreshToken) return null;
@@ -132,7 +141,7 @@ function createMcpOAuth({ db, secrets, fetchImpl = globalThis.fetch, urlAllowed,
     if (!client) return null;
     try {
       const next = await tokenRequest(client, { grant_type: 'refresh_token', refresh_token: t.refreshToken });
-      db.prepare('UPDATE mcp_oauth_tokens SET data_enc=?, updated_at=? WHERE user_id=? AND server_id=?').run(enc(next), now(), userId, serverId);
+      db.prepare('UPDATE mcp_oauth_tokens SET data_enc=?, updated_at=? WHERE user_id=? AND server_id=?').run(enc(next, userId), now(), userId, serverId);
       return next.accessToken;
     } catch { return null; }
   }

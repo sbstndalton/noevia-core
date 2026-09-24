@@ -5,11 +5,14 @@ const MAX_BODY = 32768;
 const hash = content => crypto.createHash('sha256').update(String(content || '')).digest('hex');
 const owns = (obj, key) => Object.prototype.hasOwnProperty.call(obj || {}, key);
 
+function isFrontMatterSkill(file, header) {
+  return /(?:^|\/)SKILL\.md$/i.test(file.name) || (!!header && /^(?:name|description)\s*:/im.test(header[1]));
+}
+
 function inspect(file, project = {}) {
   const content = String(file.content || '');
   const header = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(content);
-  const candidate = owns(project.instructionSkills, file.name) || /(?:^|\/)SKILL\.md$/i.test(file.name) ||
-    (/^---\r?\n/.test(content) && /^(?:name|description)\s*:/im.test(content.slice(0, 4096)));
+  const candidate = isFrontMatterSkill(file, header) || owns(project.instructionSkills, file.name);
   if (!candidate) return null;
   const result = { file: file.name, hash: hash(content), content, valid: false, error: '', name: '', description: '', version: '', requires: [] };
   try {
@@ -54,7 +57,14 @@ function reconcile(project) {
   const before = JSON.stringify(project.instructionSkills || {});
   const next = Object.create(null);
   for (const file of project.files || []) {
-    if (inspect(file, project)) next[file.name] = owns(project.instructionSkills, file.name) ? project.instructionSkills[file.name] : { enabled: false, reviewedHash: null };
+    const content = String(file.content || '');
+    const header = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(content);
+    const existing = owns(project.instructionSkills, file.name) ? project.instructionSkills[file.name] : null;
+    // Keep tracking a file that structurally still looks like a skill, or one that was
+    // already confirmed (reviewed/enabled at least once). A file only ever auto-flagged
+    // as a candidate by the (now-corrected) front-matter test, and never confirmed, is
+    // released here if it no longer matches - this undoes stale mis-detections.
+    if (isFrontMatterSkill(file, header) || existing?.reviewedHash) next[file.name] = existing || { enabled: false, reviewedHash: null };
   }
   project.instructionSkills = next;
   return before !== JSON.stringify(next);

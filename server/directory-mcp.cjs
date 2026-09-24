@@ -44,8 +44,13 @@ function createDirectoryMcp({ db, audit = () => {}, secrets = null }) {
   db.exec(`CREATE TABLE IF NOT EXISTS directory_mcp_user_keys(user_id TEXT NOT NULL, server_id TEXT NOT NULL, headers_enc TEXT NOT NULL, updated_at INTEGER NOT NULL,
     PRIMARY KEY(user_id, server_id));`);
   const rows = () => db.prepare('SELECT id, registry_name AS registryName, title, url, added_by AS addedBy, added_at AS addedAt, headers_enc AS headersEnc, oauth, personal, declared_json AS declaredJson FROM directory_mcp_servers ORDER BY added_at').all();
-  const decode = (enc) => { if (!enc || !secrets) return {}; try { return JSON.parse(secrets.decrypt(enc)); } catch { return {}; } };
-  const encode = (headers) => (Object.keys(headers).length ? (secrets ? secrets.encrypt(JSON.stringify(headers)) : (() => { throw Object.assign(new Error('Keys cannot be stored on this server.'), { status: 500 }); })()) : null);
+  // A shared server's key has no owning user (decode/encode with no userId, v1). A
+  // personal server's per-account key is bound to its owner: secrets.decrypt only
+  // needs userId to check the AAD of a v2 (bound) ciphertext, so an existing v1 row
+  // still decrypts unchanged, and is re-encrypted as user-bound the next time that
+  // account saves its key.
+  const decode = (enc, userId) => { if (!enc || !secrets) return {}; try { return JSON.parse(secrets.decrypt(enc, userId)); } catch { return {}; } };
+  const encode = (headers, userId) => (Object.keys(headers).length ? (secrets ? secrets.encrypt(JSON.stringify(headers), userId) : (() => { throw Object.assign(new Error('Keys cannot be stored on this server.'), { status: 500 }); })()) : null);
   // Public shape: which header names hold a key, never the key.
   const parse = (j) => { try { const v = JSON.parse(j); return Array.isArray(v) ? v : []; } catch { return []; } };
   const list = () => rows().map(({ headersEnc, oauth, personal, declaredJson, ...r }) => ({ ...r, oauth: !!oauth, personal: !!personal, declaredHeaders: parse(declaredJson), keyHeaders: Object.keys(decode(headersEnc)) }));
@@ -61,7 +66,7 @@ function createDirectoryMcp({ db, audit = () => {}, secrets = null }) {
     const declared = JSON.stringify(declaredHeaders.map((h) => ({ name: h.name, required: !!h.required, secret: h.secret !== false, description: String(h.description || '').slice(0, 300), template: h.template || null })));
     // A personal server keeps no shared key: the adding admin's key is stored as theirs.
     db.prepare('INSERT INTO directory_mcp_servers(id, registry_name, title, url, added_by, added_at, headers_enc, oauth, personal, declared_json) VALUES(?,?,?,?,?,?,?,?,?,?)').run(id, registryName, String(title || registryName).slice(0, 80), url, actorId || null, Date.now(), personal ? null : encode(headers), oauth ? 1 : 0, personal ? 1 : 0, declared);
-    if (personal) db.prepare('INSERT INTO directory_mcp_user_keys VALUES(?,?,?,?)').run(actorId, id, encode(headers), Date.now());
+    if (personal) db.prepare('INSERT INTO directory_mcp_user_keys VALUES(?,?,?,?)').run(actorId, id, encode(headers, actorId), Date.now());
     audit('mcp.directory.add', actorId, { registryName, url, keyHeaders: Object.keys(headers) });
     return list().find((s) => s.id === id);
   }
@@ -75,14 +80,14 @@ function createDirectoryMcp({ db, audit = () => {}, secrets = null }) {
   const headersFor = (id) => decode(rows().find((r) => r.id === id)?.headersEnc);
 
   // ── Each account's own key for a personal server ──
-  const userHeadersFor = (userId, id) => { if (!userId) return {}; const r = db.prepare('SELECT headers_enc FROM directory_mcp_user_keys WHERE user_id=? AND server_id=?').get(userId, id); return r ? decode(r.headers_enc) : {}; };
+  const userHeadersFor = (userId, id) => { if (!userId) return {}; const r = db.prepare('SELECT headers_enc FROM directory_mcp_user_keys WHERE user_id=? AND server_id=?').get(userId, id); return r ? decode(r.headers_enc, userId) : {}; };
   const hasUserKey = (userId, id) => !!(userId && db.prepare('SELECT 1 FROM directory_mcp_user_keys WHERE user_id=? AND server_id=?').get(userId, id));
   function setUserKey(userId, id, headerValues) {
     const s = list().find((x) => x.id === id && x.personal);
     if (!s) throw Object.assign(new Error('No such server.'), { status: 404 });
     const headers = checkHeaderValues(s.declaredHeaders, headerValues);
     if (!Object.keys(headers).length) throw Object.assign(new Error('Enter your key.'), { status: 400 });
-    db.prepare('INSERT INTO directory_mcp_user_keys VALUES(?,?,?,?) ON CONFLICT(user_id, server_id) DO UPDATE SET headers_enc=excluded.headers_enc, updated_at=excluded.updated_at').run(userId, id, encode(headers), Date.now());
+    db.prepare('INSERT INTO directory_mcp_user_keys VALUES(?,?,?,?) ON CONFLICT(user_id, server_id) DO UPDATE SET headers_enc=excluded.headers_enc, updated_at=excluded.updated_at').run(userId, id, encode(headers, userId), Date.now());
     audit('mcp.directory.user-key', userId, { id, keyHeaders: Object.keys(headers) });
   }
   function clearUserKey(userId, id) {
