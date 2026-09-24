@@ -44,7 +44,7 @@ const { createWorkspaceStore } = require('./workspace.cjs');
 const { createSecretStore } = require('./secrets.cjs');
 const { isPublicUrl, createEndpointApproved } = require('./ssrf.cjs');
 // One JSON reply shape, the 401, a bounded body read and the JSON fetch (http.cjs).
-const { json, unauthorized, fetchJson, readBody, readJson, authResult } = require('./http.cjs');
+const { json, unauthorized, fetchJson, readBody, readJson, authResult, errorResponse } = require('./http.cjs');
 
 const PORT = Number(process.env.UI_PORT || 8021);
 const HOST = process.env.UI_HOST || '0.0.0.0';
@@ -639,7 +639,11 @@ async function handleRequestScoped(req, res) {
     if (res.destroyed || res.writableEnded) return;
     if (res.headersSent) {
       res.end(`data: ${JSON.stringify({ type: 'error', text: 'The request could not be completed. Please retry.' })}\n\n`);
-    } else json(res, err.status || 500, { error: String((err && err.message) || err) });
+    } else {
+      const failure = errorResponse(err);
+      if (failure.status >= 500) console.error('[request] unhandled error:', err);
+      json(res, failure.status, failure.body);
+    }
   }
 }
 

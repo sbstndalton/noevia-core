@@ -90,7 +90,9 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
 
     const historyMatch = p.match(/^\/api\/chats\/([^/]+)\/history$/);
     if (historyMatch) {
-      const spaceId = decodeURIComponent(historyMatch[1]);
+      // Sanitized here, exactly as storage does, so the tombstone check sees the stored id.
+      const spaceId = require('../chat-lists.cjs').safeChatId(decodeURIComponent(historyMatch[1]));
+      if (!spaceId) return json(res, 400, { error: 'invalid chat id' });
       const revisionOf = (history) => crypto.createHash('sha256').update(JSON.stringify(history)).digest('hex');
       if (req.method === 'GET') { const history = readHistory(spaceId); return json(res, 200, { history, revision: revisionOf(history) }); }
       if (req.method === 'POST') {
@@ -101,6 +103,7 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
         catch (e) { return json(res, e.status || 400, { error: e.status === 413 ? 'This chat is too large to save; start a new chat to keep going.' : 'could not read the chat' }); }
         try {
           const body = JSON.parse(raw);
+          if (!body || typeof body !== 'object' || Array.isArray(body)) return json(res, 400, { error: 'request body must be a JSON object' });
           // Optimistic concurrency: a save based on an older copy (another device saved meanwhile)
           // gets the current copy back to merge. Saves without a base revision are accepted as before.
           if (typeof body.baseRevision === 'string') {

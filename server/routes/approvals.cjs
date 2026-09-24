@@ -6,6 +6,8 @@
 // only carries the decision across, and only from the account whose conversation it is:
 // a stale, foreign or unknown id all get the same 404, so it cannot be used to probe.
 
+const { isJsonObject } = require('../http.cjs');
+
 const PASS = Symbol('unhandled');
 
 /**
@@ -23,6 +25,7 @@ function createApprovalRoutes({ json, readBody, pendingApprovals, requestScope }
       const raw = await readBody(req);
       let body;
       try { body = JSON.parse(raw); } catch { return json(res, 400, { error: 'invalid JSON' }); }
+      if (!isJsonObject(body)) return json(res, 400, { error: 'request body must be a JSON object' });
       const pending = pendingApprovals.get(id);
       // Already decided, timed out, or never existed — all the same answer, so
       // a stale id cannot be used to probe which approvals are outstanding.

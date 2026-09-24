@@ -36,7 +36,7 @@ function createChatHandler({
         else execution.turn.interrupt('Chat request ended before completion');
       }
       // A chat deleted while this reply ran leaves no context state (summaries hold conversation text).
-      const id=typeof body?.chatId==='string'?body.chatId:null;
+      const id=typeof body?.chatId==='string'?require('./chat-lists.cjs').safeChatId(body.chatId):null;
       try{const dir=currentWorkspace().dir;if(id&&require('./chat-lists.cjs').readTombstones(dir).has(id))require('./chat-context.cjs').remove(dir,id);}catch{/* best effort */}
     }
   }

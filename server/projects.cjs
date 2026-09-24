@@ -173,7 +173,9 @@ function createProjectStore({
   // ── History persistence (atomic write, JSON per space) ─────────────────────
 
   function historyPath(spaceId) {
-    const safe = String(spaceId).replace(/[^a-zA-Z0-9_-]/g, '');
+    const safe = require('./chat-lists.cjs').safeChatId(spaceId);
+    // Every id that sanitizes to nothing would share one file.
+    if (!safe) throw Object.assign(new Error('invalid chat id'), { status: 400 });
     return currentWorkspace().historyPath(safe);
   }
 

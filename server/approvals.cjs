@@ -19,9 +19,12 @@ const APPROVAL_TIMEOUT_MS = timeoutMs;
 const chatWideApprovals = new Map(); // `${userId}:${chatId}` -> expiresAt
 const CHAT_APPROVAL_TTL_MS = ttlMs;
 
-function chatApprovalKey(userId, chatId) { return `${userId}:${chatId || '-'}`; }
+// No chat id means no chat to scope a grant to: id-less requests would otherwise all share
+// one `${userId}:-` key, so "approve all" in one would silently cover every other.
+function chatApprovalKey(userId, chatId) { return userId && chatId ? `${userId}:${chatId}` : null; }
 
 function chatWideApproved(userId, chatId) {
+  if (!chatApprovalKey(userId, chatId)) return false;
   const until = chatWideApprovals.get(chatApprovalKey(userId, chatId));
   if (!until) return false;
   if (now() > until) { chatWideApprovals.delete(chatApprovalKey(userId, chatId)); return false; }
@@ -33,6 +36,8 @@ function chatWideApproved(userId, chatId) {
 // a normal conversational turn rather than a broken stream.
 function awaitApproval({ id, userId, chatId, abortSignal, onDecision = () => {} }) {
   return new Promise((resolve) => {
+    // Already stopped before the question was asked: nothing to wait for, nothing approved.
+    if (abortSignal.aborted) { resolve('aborted'); return; }
     let settled = false;
     const finish = (decision) => {
       if (settled) return;
@@ -54,7 +59,9 @@ function awaitApproval({ id, userId, chatId, abortSignal, onDecision = () => {} 
       decide(decision) {
         if (['approve', 'deny', 'approve_all'].includes(decision)) onDecision(decision);
         if (decision === 'approve_all') {
-          chatWideApprovals.set(chatApprovalKey(userId, chatId), now() + CHAT_APPROVAL_TTL_MS);
+          // Without a chat id this approves this one call only; the grant has nowhere safe to live.
+          const key = chatApprovalKey(userId, chatId);
+          if (key) chatWideApprovals.set(key, now() + CHAT_APPROVAL_TTL_MS);
           finish('approve');
           return true;
         }

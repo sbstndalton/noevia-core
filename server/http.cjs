@@ -60,8 +60,25 @@ async function readJson(req, limit) {
   catch { throw Object.assign(new SyntaxError('invalid JSON'), { status: 400 }); }
 }
 
+// A JSON request body that is not an object (null, a number, an array) is a client error,
+// not a TypeError deep in a route.
+function isJsonObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+// What a failed request tells the client. Only errors that carry a 4xx status were raised
+// on purpose for the client; anything else is an internal fault whose message may leak
+// paths or internals, so the client gets a generic text and the caller logs the real one.
+function errorResponse(err) {
+  const status = Number(err && err.status);
+  if (Number.isInteger(status) && status >= 400 && status < 500) {
+    return { status, body: { error: String((err && err.message) || 'Request failed') } };
+  }
+  return { status: Number.isInteger(status) && status >= 500 && status < 600 ? status : 500, body: { error: 'Internal error' } };
+}
+
 function authResult(res, result) {
   return json(res, result.status || 200, result.body ?? result);
 }
 
-module.exports = { json, unauthorized, fetchJson, readBody, readJson, authResult };
+module.exports = { json, unauthorized, fetchJson, readBody, readJson, authResult, isJsonObject, errorResponse };
