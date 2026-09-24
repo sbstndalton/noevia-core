@@ -161,6 +161,40 @@ test('claims from an earlier process are interrupted, never silently reused', ()
   assert.equal(afterRestart.recover().length, 0, 'recovery is idempotent');
 });
 
+test('recover() re-owns and strips the pinned harness config from an interrupted claim, keeping the tree', () => {
+  const repo = repoWith();
+  const dir = temp('noevia-ws-');
+  const first = createCodeWorkspaces({ dir, epoch: 'process-1' });
+  const claim = first.claim({ taskId: ids(1), repoPath: repo, pinned: ['opencode.json'] });
+  fs.writeFileSync(path.join(claim.path, 'opencode.json'), '{"key":"synthetic-key"}');
+
+  const afterRestart = createCodeWorkspaces({ dir, epoch: 'process-2' });
+  const recovered = afterRestart.recover();
+  assert.equal(recovered.length, 1);
+  assert.equal(recovered[0].status, 'interrupted');
+  assert.equal(recovered[0].pinnedDropped, true);
+  assert.equal(fs.existsSync(path.join(claim.path, 'opencode.json')), false, 'the pinned config no longer sits on disk with no expiry');
+  // The tree survives: it may hold work nobody has read yet.
+  assert.equal(fs.existsSync(claim.path), true);
+  assert.equal(fs.existsSync(path.join(claim.path, 'a.txt')), true);
+});
+
+test('recover() records a dropPinned failure on the record rather than throwing', () => {
+  const repo = repoWith();
+  const dir = temp('noevia-ws-');
+  const first = createCodeWorkspaces({ dir, epoch: 'process-1' });
+  const claim = first.claim({ taskId: ids(1), repoPath: repo, pinned: ['opencode.json'] });
+  // A pinned path that is a directory cannot be unlinked: dropPinned throws for it.
+  fs.mkdirSync(path.join(claim.path, 'opencode.json'));
+
+  const afterRestart = createCodeWorkspaces({ dir, epoch: 'process-2' });
+  const recovered = afterRestart.recover();
+  assert.equal(recovered.length, 1);
+  assert.equal(recovered[0].pinnedDropped, false);
+  assert.match(recovered[0].pinnedDropError, /directory/);
+  assert.equal(fs.existsSync(claim.path), true, 'the tree is still kept for inspection');
+});
+
 test('worktrees can live on a shared root, at one path both containers see', () => {
   // The harness runs in another container, so it must see the worktree at the SAME absolute
   // path noevia sends it. That means a shared volume, not the tenant's own directory.

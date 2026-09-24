@@ -416,7 +416,22 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
    */
   function recover() {
     return list().filter((r) => r.status === 'held' && r.epoch !== epoch)
-      .map((r) => write({ ...r, status: 'interrupted', interruptedAt: now() }));
+      .map((r) => {
+        const interrupted = { ...r, status: 'interrupted', interruptedAt: now() };
+        // Hand the tree back to noevia before touching it, the same way release() does for a
+        // clone — otherwise git (and dropPinned's own unlink) can refuse a tree the harness user
+        // still owns.
+        if (interrupted.owner && interrupted.noevia) {
+          try { chown(interrupted.path, interrupted.noevia.uid, interrupted.noevia.gid); }
+          catch { /* best effort: dropPinned below reports its own failure */ }
+        }
+        // The pinned config holds the engine key and has no expiry otherwise — an interrupted
+        // claim must not leave it on disk indefinitely. The tree itself is kept for inspection;
+        // only the pinned files are removed.
+        try { dropPinned(interrupted); interrupted.pinnedDropped = true; }
+        catch (e) { interrupted.pinnedDropped = false; interrupted.pinnedDropError = e.message; }
+        return write(interrupted);
+      });
   }
 
   // `owner` is public so anything else noevia writes into a workspace (the harness's own
