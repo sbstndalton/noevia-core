@@ -43,9 +43,9 @@ function view(job) {
 
 /**
  * @param {{ jobsDir:(workspace)=>string, tools:(workspace, project)=>{search, extract, projectRetrieve, complete, windowTokens?},
- *           saveFile:(project, name, text)=>Promise<void>, now?:()=>number }} deps
+ *           saveFile:(project, name, text)=>Promise<void>, getProject?:(id)=>object|null, now?:()=>number }} deps
  */
-function createResearchService({ tools, saveFile, now = Date.now }) {
+function createResearchService({ tools, saveFile, getProject, now = Date.now }) {
   const stores = new WeakMap();
   const storeFor = (workspace) => {
     let store = stores.get(workspace);
@@ -64,9 +64,14 @@ function createResearchService({ tools, saveFile, now = Date.now }) {
   };
   async function save(workspace, project, id, result) {
     const jobs = storeFor(workspace);
-    const names = new Set((project.files || []).map((f) => String(f.name).split('/').pop()));
+    // The job holds the `project` object from when it started, minutes before the report is
+    // ready; PROJECTS may have replaced or deleted it meanwhile. Look it up by id at save time
+    // instead of trusting the stale reference, so a rename/edit elsewhere doesn't lose the report.
+    const current = getProject ? getProject(project.id) : project;
+    if (!current) throw fail(410, 'The project was deleted while this research was running; the report could not be saved.');
+    const names = new Set((current.files || []).map((f) => String(f.name).split('/').pop()));
     for (const file of reportFiles(result, now(), (name) => names.has(name))) {
-      await saveFile(project, file.name, file.text);
+      await saveFile(current, file.name, file.text);
       jobs.append(id, 'artifact.created', { name: file.name, bytes: Buffer.byteLength(file.text) });
     }
   }

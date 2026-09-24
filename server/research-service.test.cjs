@@ -21,13 +21,15 @@ function setup(t, opts = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-research-service-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const workspace = { dir }, project = { id: 'p1' }, other = { id: 'p2' };
+  const projects = new Map([[project.id, project], [other.id, other]]);
   const saved = [], calls = [];
   const service = createResearchService({
     now: () => Date.parse('2026-09-17T10:00:00Z') + calls.length,
     saveFile: async (p, name, text) => { saved.push({ project: p.id, name, text }); },
+    getProject: (id) => projects.get(id) || null,
     tools: () => ({ search: async () => [{ url: 'https://fixture.test/z', title: 'Zephyr' }], extract: async () => PAGE, projectRetrieve: async () => [], complete: model(calls, opts) }),
   });
-  return { service, workspace, project, other, saved, calls };
+  return { service, workspace, project, other, projects, saved, calls };
 }
 const settle = async (service, w, p, id, status) => { for (let i = 0; i < 200; i++) { const j = service.get(w, p, id); if (!status ? !['queued', 'running'].includes(j.status) : j.status === status) return j; await new Promise((r) => setTimeout(r, 5)); } throw Error('job did not settle'); };
 
@@ -73,6 +75,28 @@ test('cancel keeps finished sections, never auto-saves, and partial save is expl
   assert.equal(saved.length, 2);
   assert.equal(after.canSavePartial, false);
   await assert.rejects(() => service.savePartial(workspace, project, started.id), /already saved/);
+});
+
+test('a project replaced mid-run is looked up fresh at save time, so the report still saves', async (t) => {
+  const { service, workspace, project, projects, saved } = setup(t);
+  const started = await service.start(workspace, project, { question: 'Zephyr' });
+  // PROJECTS replaced the object (e.g. a concurrent edit) while the job still holds the old one.
+  const replaced = { id: project.id, files: [] };
+  projects.set(project.id, replaced);
+  const job = await settle(service, workspace, project, started.id);
+  assert.equal(job.status, 'completed');
+  assert.equal(saved.length, 2, 'the report must still be saved against the current project');
+  assert.equal(saved[0].project, project.id);
+});
+
+test('a project deleted mid-run fails the job with a clear reason instead of losing the report', async (t) => {
+  const { service, workspace, project, projects, saved } = setup(t);
+  const started = await service.start(workspace, project, { question: 'Zephyr' });
+  projects.delete(project.id);
+  const job = await settle(service, workspace, project, started.id);
+  assert.equal(job.status, 'failed');
+  assert.match(job.error, /project was deleted/);
+  assert.equal(saved.length, 0);
 });
 
 test('jobs are project-scoped and inputs are validated', async (t) => {

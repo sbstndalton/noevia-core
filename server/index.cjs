@@ -377,6 +377,7 @@ const researchRoutes = require('./routes/research.cjs').createResearchRoutes({
   },
   service: require('./research-service.cjs').createResearchService({
     saveFile: (project, name, text) => writeProjectTextFile(project, name, text),
+    getProject,
     tools: (workspace, project) => ({
       complete: async (messages, { signal, maxTokens }) => {
         const provider = getProvider(DEFAULT_PROVIDER_ID), model = researchModel(project);
