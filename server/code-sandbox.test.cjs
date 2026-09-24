@@ -171,3 +171,63 @@ test('the sandbox override stays hardened and unpublished', () => {
   assert.match(dockerfile, /pi-coding-agent[\s\S]*npm install -g --ignore-scripts/,
     'the pinned pi install follows upstream and cannot run package lifecycle scripts');
 });
+
+// A raw supervisor whose agent is an inline script, for the lifetime tests below.
+async function rawSandbox(agentScript) {
+  const root = temp();
+  fs.mkdirSync(path.join(root, 'task-1'));
+  const logs = [];
+  const sup = createSupervisor({ command: process.execPath, args: ['-e', agentScript], root, graceMs: 50,
+    log: (line) => logs.push(line) });
+  supervisors.push(sup);
+  const { port } = await sup.listen(0, '127.0.0.1');
+  const start = JSON.stringify({ noevia: 'start', cwd: path.join(root, 'task-1') }) + '\n';
+  return { sup, logs, port, start };
+}
+const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+const waitFor = async (fn, ms = 3000) => {
+  const until = Date.now() + ms;
+  while (Date.now() < until) { if (fn()) return true; await new Promise((r) => setTimeout(r, 25)); }
+  return fn();
+};
+
+test('an agent that exits does not leave its background children running', async () => {
+  // The agent starts a sleeper in its own process group, reports its pid, and exits.
+  const { sup, port, start } = await rawSandbox(`
+    const c = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+    process.stdout.write(JSON.stringify({ sleeper: c.pid }) + '\\n');
+    c.unref(); setTimeout(() => process.exit(0), 100);`);
+  let sleeper = null;
+  const socket = net.connect(port, '127.0.0.1', () => socket.write(start));
+  socket.setEncoding('utf8');
+  let out = '';
+  socket.on('data', (d) => { out += d; const m = out.match(/"sleeper":(\d+)/); if (m) sleeper = Number(m[1]); });
+  await new Promise((r) => socket.on('close', r));
+  assert.ok(sleeper, 'the fake agent reported its background child');
+  try {
+    assert.ok(await waitFor(() => !alive(sleeper)), 'the background child was killed with the group');
+  } finally { try { process.kill(sleeper, 'SIGKILL'); } catch { /* already dead */ } }
+  await sup.close();
+});
+
+test('nothing after a refusal or an exited agent can start another agent', async () => {
+  const { sup, port, start, logs } = await rawSandbox('setTimeout(() => process.exit(0), 50)');
+  const send = (payload, delayed) => new Promise((resolve) => {
+    const socket = net.connect(port, '127.0.0.1', () => {
+      socket.write(payload);
+      if (delayed) setTimeout(() => { try { socket.write(delayed); } catch { /* closed */ } }, 300);
+    });
+    socket.on('data', () => {});
+    socket.on('error', () => {});
+    socket.on('close', resolve);
+    setTimeout(() => { socket.destroy(); resolve(); }, 3000).unref();
+  });
+  await send('not json\n' + start);
+  await send('not json\n', start);
+  assert.equal(logs.filter((l) => l.startsWith('started ')).length, 0, 'a refused connection starts nothing');
+  await send(start, start);
+  assert.equal(logs.filter((l) => l.startsWith('started ')).length, 1, 'one agent per connection, even after it exits');
+  await send('x'.repeat(70 * 1024) + 'y'.repeat(70 * 1024));
+  assert.equal(logs.filter((l) => l === 'refused: start line too long').length, 1, 'refused once, not per chunk');
+  await sup.close();
+});

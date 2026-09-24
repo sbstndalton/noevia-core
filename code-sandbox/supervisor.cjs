@@ -54,9 +54,15 @@ function cleanEnv(env, fallbackHome = process.env.HOME) {
 function createSupervisor({ command, args = [], root, spawnFn = spawn, log = () => {}, graceMs = 5000 }) {
   const server = net.createServer((socket) => {
     socket.setEncoding('utf8');
-    let buffer = '', agent = null;
+    // `pid` outlives `agent`: the agent exiting does not end its process group, and anything it
+    // left running in the background must still be stopped when the connection goes.
+    // `done` is set once this connection has been refused or its agent has gone; after that no
+    // byte on the socket is read, buffered or allowed to start a second agent.
+    let buffer = '', agent = null, pid = null, done = false, stopped = false;
 
     const refuse = (reason) => {
+      done = true;
+      buffer = '';
       log(`refused: ${reason}`);
       // Answered in the agent's own language so the failure reaches the task as a message
       // rather than as a dead socket.
@@ -64,15 +70,18 @@ function createSupervisor({ command, args = [], root, spawnFn = spawn, log = () 
     };
 
     const stopAgent = () => {
-      if (!agent || !agent.pid) return;
-      const pid = agent.pid;
+      done = true;
       agent = null;
-      try { process.kill(-pid, 'SIGTERM'); } catch { /* already gone */ }
-      const timer = setTimeout(() => { try { process.kill(-pid, 'SIGKILL'); } catch { /* gone */ } }, graceMs);
+      if (!pid || stopped) return;
+      stopped = true;
+      const group = -pid;
+      try { process.kill(group, 'SIGTERM'); } catch { /* ESRCH: the whole group is already gone */ }
+      const timer = setTimeout(() => { try { process.kill(group, 'SIGKILL'); } catch { /* gone */ } }, graceMs);
       timer.unref?.();
     };
 
     socket.on('data', (chunk) => {
+      if (done) return;
       if (agent) return agent.stdin.write(chunk);   // the ACP stream, untouched
       buffer += chunk;
       if (buffer.length > MAX_START_LINE) return refuse('start line too long');
@@ -87,14 +96,22 @@ function createSupervisor({ command, args = [], root, spawnFn = spawn, log = () 
       const cwd = insideRoot(root, start.cwd);
       if (!cwd) return refuse('that workspace is not inside this sandbox');
 
-      agent = spawnFn(command, args, { cwd, env: cleanEnv(start.env), stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+      const child = spawnFn(command, args, { cwd, env: cleanEnv(start.env), stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+      agent = child;
+      pid = child.pid || null;
       log(`started ${command} in ${cwd}`);
-      agent.stdout.on('data', (out) => socket.write(out));
-      agent.stderr.setEncoding('utf8');
-      agent.stderr.on('data', (out) => log(`agent: ${String(out).slice(0, 2000).trimEnd()}`));
-      agent.on('error', (error) => { log(`agent failed: ${error.message}`); socket.destroy(); });
-      agent.on('exit', (code, sig) => { log(`agent exited (${sig || code})`); agent = null; socket.end(); });
-      if (rest) agent.stdin.write(rest);
+      child.stdin.on('error', () => { /* the agent closed its stdin; exit/close handles the rest */ });
+      child.stdout.on('data', (out) => socket.write(out));
+      child.stderr.setEncoding('utf8');
+      child.stderr.on('data', (out) => log(`agent: ${String(out).slice(0, 2000).trimEnd()}`));
+      child.on('error', (error) => { log(`agent failed: ${error.message}`); stopAgent(); socket.destroy(); });
+      child.on('exit', (code, sig) => {
+        log(`agent exited (${sig || code})`);
+        // Its children may still be running in its group; stop them now, not only at close.
+        stopAgent();
+        socket.end();
+      });
+      if (rest) child.stdin.write(rest);
     });
 
     // The connection IS the lifetime. noevia hanging up, the task being cancelled and the web
