@@ -328,3 +328,37 @@ test('the memory estimate is admin-only, read-only and validates the model name 
   try { await boom.call('GET', '/api/models/estimate', undefined, 'admin', '?model=m'); } finally { console.error = orig; }
   assert.deepEqual(boom.sent.pop(), { status: 500, body: { error: 'Could not estimate memory for this model.' } });
 });
+
+test('evidence import (#266) is admin-only, validates the model, and always reports current evidence back', async () => {
+  const calls = [];
+  const f = fixture({
+    manager: {
+      importEvidence: async (model, opts) => { calls.push([model, opts]); return { ok: true }; },
+      evidence: async (model) => ({ status: 200, body: { model, external: { category: 'external_model_card', state: 'reported' } } }),
+    },
+  });
+  await f.call('POST', '/api/models/evidence/import', { model: 'm' }, 'member');
+  assert.deepEqual(f.sent.pop(), { status: 403, body: { error: 'administrator required' } });
+  await f.call('GET', '/api/models/evidence/import', { model: 'm' }, 'admin');
+  assert.deepEqual(f.sent.pop(), { status: 405, body: { error: 'Method not allowed' } });
+  await f.call('POST', '/api/models/evidence/import', {}, 'admin');
+  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'Choose a model' } });
+  await f.call('POST', '/api/models/evidence/import', { model: 'm', checkpoint: 'acme/model-7b' }, 'admin');
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { model: 'm', external: { category: 'external_model_card', state: 'reported' } } });
+  assert.deepEqual(calls, [['m', { checkpoint: 'acme/model-7b' }]]);
+
+  const none = fixture();
+  await none.call('POST', '/api/models/evidence/import', { model: 'm' }, 'admin');
+  assert.deepEqual(none.sent.pop(), { status: 404, body: { error: 'Model evidence import needs the native engine' } });
+});
+
+test('evidence import never throws through the route when the source lookup fails', async () => {
+  const f = fixture({
+    manager: {
+      importEvidence: async () => { throw Error('source unavailable'); },
+      evidence: async (model) => ({ status: 200, body: { model, external: { state: 'unavailable' } } }),
+    },
+  });
+  await f.call('POST', '/api/models/evidence/import', { model: 'm' }, 'admin');
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { model: 'm', external: { state: 'unavailable' } } });
+});

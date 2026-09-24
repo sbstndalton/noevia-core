@@ -236,6 +236,22 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
       return json(res,200,(await modelManager.evidence(model)).body);
     }
 
+    // Explicit "fetch evidence" action (#266): re-import attributable model-card evidence
+    // for one model from its source. Offline/failed lookups never surface as an error here —
+    // they return the same shape as "nothing to show" — since this must never look like the
+    // model itself is broken.
+    if (p === '/api/models/evidence/import') {
+      if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model evidence'});
+      if(req.method!=='POST')return json(res,405,{error:'Method not allowed'});
+      if(!modelManager.importEvidence)return json(res,404,{error:'Model evidence import needs the native engine'});
+      const body=await readJson(req).catch(()=>null);
+      const model=typeof body?.model==='string'?body.model:'';
+      if(!model||model.length>200)return json(res,400,{error:'Choose a model'});
+      const checkpoint=typeof body?.checkpoint==='string'?body.checkpoint:undefined;
+      await modelManager.importEvidence(model,{checkpoint}).catch(()=>null);
+      return json(res,200,(await modelManager.evidence(model)).body);
+    }
+
     if (p === '/api/models/autotune' || p === '/api/models/autotune/cancel' || p === '/api/models/autotune/resume' || p === '/api/models/autotune/untuned') {
       if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
       if(!modelManager.autotune)return json(res,404,{error:'Auto-tune is unavailable'});

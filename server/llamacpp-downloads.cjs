@@ -1,11 +1,18 @@
 'use strict';
 const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto');
 const terminal=new Set(['completed','failed','rejected']);
-function createDownloadTracker({base,headers,file,fetchStream=fetch}) {
+function createDownloadTracker({base,headers,file,fetchStream=fetch,onCompleted}) {
   const jobs=new Map();let controller=null;
   try {for(const job of JSON.parse(fs.readFileSync(file,'utf8')))if(typeof job.model==='string')jobs.set(job.model,{...job,status:terminal.has(job.status)?job.status:'unknown',progress:null});}catch {}
   function persist(){if(!file)return;try{fs.mkdirSync(path.dirname(file),{recursive:true});const temp=file+'.'+crypto.randomUUID();try{fs.writeFileSync(temp,JSON.stringify([...jobs.values()]),{mode:0o600});fs.renameSync(temp,file);}finally{fs.rmSync(temp,{force:true});}}catch(e){console.error('download tracker persist failed:',e);}}
-  function update(model,status,progress=null){jobs.delete(model);jobs.set(model,{id:model,model,status,progress,updatedAt:Date.now()});while(jobs.size>100)jobs.delete(jobs.keys().next().value);persist();}
+  // Best-effort import hook for #266: fires once, only on a fresh transition into
+  // 'completed', and never blocks or throws into the tracker (a metadata source being down
+  // must never make a finished download look unfinished).
+  function update(model,status,progress=null){
+    const was=jobs.get(model);
+    jobs.delete(model);jobs.set(model,{id:model,model,status,progress,updatedAt:Date.now()});while(jobs.size>100)jobs.delete(jobs.keys().next().value);persist();
+    if(status==='completed'&&was?.status!=='completed'&&typeof onCompleted==='function'){try{Promise.resolve(onCompleted(model)).catch(()=>{});}catch{}}
+  }
   function event(value){if(!value || typeof value.model!=='string')return;if(value.event==='download_finished')update(value.model,'completed',1);if(value.event==='download_failed')update(value.model,'failed');}
   function connect() {
     if(controller)return;

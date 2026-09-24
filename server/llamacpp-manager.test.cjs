@@ -57,6 +57,34 @@ test('download tracking distinguishes completion, failure, unknown and restart',
  tracker.requested('synthetic/c:Q8_0');assert.equal(tracker.snapshot([{id:'synthetic/c:Q8_0',source:'cache',status:{value:'unloaded'}}])[0].status,'completed');
  tracker.close();restored.close();
 });
+// #266: a metadata-import hook wired to onCompleted is best-effort by contract. Even when
+// the hook itself throws synchronously or returns a rejected promise, the job the tracker
+// just finished must stay 'completed' — a broken import must never make a finished download
+// look unfinished — and it must fire exactly once per fresh completion, not on every snapshot.
+test('onCompleted throwing or rejecting never reverts or re-marks a completed download',async t=>{
+ const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
+ const {createDownloadTracker}=require('./llamacpp-downloads.cjs');
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'native-downloads-onCompleted-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+ const calls=[];
+ const tracker=createDownloadTracker({base:'http://synthetic',headers:()=>({}),file:path.join(dir,'jobs.json'),fetchStream:async()=>({ok:false}),
+  onCompleted:model=>{calls.push(model);throw Error('metadata source unavailable');}});
+ tracker.requested('synthetic/a:Q8_0');
+ tracker.event({model:'synthetic/a:Q8_0',event:'download_finished'});
+ assert.equal(tracker.snapshot([])[0].status,'completed');
+ assert.deepEqual(calls,['synthetic/a:Q8_0']);
+ // A duplicate 'download_finished' (or any other update while already completed) is not a
+ // fresh transition and must not re-fire the hook.
+ tracker.event({model:'synthetic/a:Q8_0',event:'download_finished'});
+ assert.equal(tracker.snapshot([])[0].status,'completed');
+ assert.deepEqual(calls,['synthetic/a:Q8_0']);
+ const rejecting=createDownloadTracker({base:'http://synthetic',headers:()=>({}),file:path.join(dir,'jobs2.json'),fetchStream:async()=>({ok:false}),
+  onCompleted:()=>Promise.reject(Error('metadata source unavailable'))});
+ rejecting.requested('synthetic/b:Q8_0');
+ rejecting.event({model:'synthetic/b:Q8_0',event:'download_finished'});
+ assert.equal(rejecting.snapshot([])[0].status,'completed');
+ await new Promise(r=>setImmediate(r)); // let the rejected promise settle; must not surface as an unhandled rejection
+ tracker.close();rejecting.close();
+});
 
 test('native launch acknowledgement is not readiness; failed asynchronous load rejects',async()=>{
  let listed=0;
