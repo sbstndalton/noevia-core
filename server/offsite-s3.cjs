@@ -40,7 +40,8 @@ function createS3Store({ endpoint, bucket, region = 'us-east-1', accessKeyId, se
     async list(keyPrefix) {
       const keys = [];
       let token;
-      const full = `${root}/${keyPrefix}`;
+      const full = root ? `${root}/${keyPrefix}` : keyPrefix;
+      const skip = root ? root.length + 1 : 0;
       for (let page = 0; page < 1000; page++) {
         const target = new URL(`${base.origin}${base.pathname.replace(/\/+$/, '')}/${encodeURIComponent(bucket)}`);
         target.searchParams.set('list-type', '2'); target.searchParams.set('prefix', full);
@@ -48,7 +49,7 @@ function createS3Store({ endpoint, bucket, region = 'us-east-1', accessKeyId, se
         const r = await request('GET', target);
         if (!r.ok) throw Object.assign(Error(`The backup destination refused a listing (${r.status}).`), { status: 502 });
         const xml = await r.text();
-        for (const m of xml.matchAll(/<Key>([\s\S]*?)<\/Key>/g)) keys.push(decode(m[1]).slice(root.length + 1));
+        for (const m of xml.matchAll(/<Key>([\s\S]*?)<\/Key>/g)) keys.push(decode(m[1]).slice(skip));
         const next = xml.match(/<NextContinuationToken>([\s\S]*?)<\/NextContinuationToken>/);
         if (!/<IsTruncated>true<\/IsTruncated>/.test(xml) || !next) break;
         token = decode(next[1]);

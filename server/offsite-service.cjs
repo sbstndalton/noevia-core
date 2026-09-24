@@ -110,6 +110,8 @@ function createOffsiteService({ env = process.env, features, dataDir, now = Date
   /** Copies the local encrypted store to Drive and records the result for the page. */
   async function copyToDrive() {
     if (!useDir() || drive.state().state !== 'connected' || readStatus().driveCopy === false) return null;
+    if (busy) return null;
+    const previous = busy;
     busy = 'copy to Google Drive';
     try {
       build();
@@ -121,7 +123,7 @@ function createOffsiteService({ env = process.env, features, dataDir, now = Date
       writeStatus({ mirror: { state: /looks empty/.test(message) ? 'refused' : /Waiting/.test(message) ? 'waiting' : 'failed', at: now(), message } });
       log({ event: 'gdrive.failed', message: error.message });
       throw error;
-    } finally { busy = ''; }
+    } finally { busy = previous; }
   }
   const driveView = () => {
     if (!useDir()) return null;

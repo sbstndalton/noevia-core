@@ -100,6 +100,44 @@ test('a failed background mirror records failure without failing the completed b
   assert.equal(service.status().busy, null);
 });
 
+test('a Drive connect callback firing mid-backup does not clobber the backup lock or race verifyNow', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-offsite-connect-race-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  let releaseBackup, mirrorCalls = 0;
+  const backupStarted = new Promise((resolve) => {
+    releaseBackup = resolve;
+  });
+  let holdBackup;
+  const service = createOffsiteService({
+    env: { OFFSITE_BACKUP_DIR: dir }, dataDir: dir, features: { enabled: () => true },
+    backupFactory: () => ({
+      backup: async () => { releaseBackup(); await holdBackup; return { id: 'synthetic', files: 1, uploadedBytes: 10 }; },
+      forget: async () => ({ kept: 1 }),
+      verify: async () => ({ files: 1 }),
+    }),
+    driveFactory: () => ({
+      state: () => ({ state: 'connected' }),
+      mirror: async () => { mirrorCalls++; return { snapshots: 1 }; },
+      connect: (onApproved) => { onApproved(); return { ok: true }; },
+    }),
+  });
+  let releaseHold;
+  holdBackup = new Promise((resolve) => { releaseHold = resolve; });
+  const backupDone = service.runNow();
+  await backupStarted;
+  assert.equal(service.status().busy, 'backup');
+  // Simulate an OAuth approval landing mid-backup: its callback tries to copy to Drive.
+  service.connectGoogle();
+  await new Promise((resolve) => setImmediate(resolve));
+  // The in-flight backup lock must survive the connect callback's attempted copy.
+  assert.equal(service.status().busy, 'backup');
+  assert.equal(mirrorCalls, 0, 'the copy is skipped while a backup holds the lock');
+  await assert.rejects(() => service.verifyNow(), /already running/, 'verifyNow must not race the still-running backup');
+  releaseHold();
+  await backupDone;
+  assert.equal(service.status().busy, null);
+});
+
 test('schedule runs once in the configured hour, not again within 20 hours', async (t) => {
   const { service, advance } = setup(t);
   let tick; service.schedule((fn) => { tick = fn; return { unref() {} }; }, () => {});
