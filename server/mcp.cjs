@@ -107,6 +107,17 @@ function parseRpcBody(contentType, text, expectedId) {
   return msg;
 }
 
+// Protocol headers noevia sets itself. Credentials (user keys, directory
+// headers, bearer/OAuth tokens) are merged in, but may never replace these:
+// a key header named e.g. `mcp-session-id` or `Accept` would otherwise
+// silently hijack the session or the transport negotiation.
+const RESERVED_HEADERS = new Set(['content-type', 'accept', 'mcp-protocol-version', 'mcp-session-id']);
+function withBuiltInHeaders(extra, builtIn) {
+  const out = {};
+  for (const [k, v] of Object.entries(extra || {})) if (!RESERVED_HEADERS.has(String(k).toLowerCase())) out[k] = v;
+  return { ...out, ...builtIn };
+}
+
 // One JSON-RPC round trip. `session` is mutated to carry the id the server
 // hands out at initialize.
 async function rpc(baseUrl, session, body, { headers = {}, timeoutMs = 30000, notify = false, signal } = {}) {
@@ -124,14 +135,13 @@ async function rpc(baseUrl, session, body, { headers = {}, timeoutMs = 30000, no
   try {
     const res = await fetch(baseUrl, {
       method: 'POST',
-      headers: {
+      headers: withBuiltInHeaders(headers, {
         'Content-Type': 'application/json',
         // Must advertise BOTH: the server picks the stream form at will.
         Accept: 'application/json, text/event-stream',
         'MCP-Protocol-Version': PROTOCOL_VERSION,
         ...(session.id ? { 'mcp-session-id': session.id } : {}),
-        ...headers,
-      },
+      }),
       body: JSON.stringify(body),
       signal: controller.signal,
       redirect: 'error', // same policy as the provider routes: no inward bounces
@@ -140,7 +150,9 @@ async function rpc(baseUrl, session, body, { headers = {}, timeoutMs = 30000, no
     if (sid) session.id = sid;
     if (!res.ok) {
       const detail = await readBodyCapped(res, controller).catch(() => '');
-      throw new Error(`MCP ${res.status}: ${detail.slice(0, 200)}`);
+      // The snippet is for logs/operators only; `httpStatus` lets the chat
+      // path hand the model a neutral message instead of the server's body.
+      throw Object.assign(new Error(`MCP ${res.status}: ${detail.slice(0, 200)}`), { httpStatus: res.status });
     }
     // Notifications have no id and the server answers 202 with an empty body.
     if (notify) return null;
@@ -174,7 +186,7 @@ async function connect(baseUrl, authHeaders = {}, timeoutMs = 30000, signal) {
     // already have issued an ID even when initialize response parsing fails.
     // Cleanup itself is deliberately NOT tied to `signal`: an aborted chat
     // still deserves its MCP session closed rather than left dangling.
-    await disconnect(baseUrl, session, authHeaders, Math.min(timeoutMs, 5000));
+    await disconnect(baseUrl, session, authHeaders, Math.min(timeoutMs, 5000), signal);
     throw error;
   }
 }
@@ -192,14 +204,21 @@ async function connect(baseUrl, authHeaders = {}, timeoutMs = 30000, signal) {
 // Best-effort by contract: the spec allows a server to refuse DELETE with 405,
 // and a session that never got an id has nothing to close. A failure here must
 // never surface as a tool error — the call it belongs to has already answered.
-async function disconnect(baseUrl, session, authHeaders = {}, timeoutMs = 5000) {
+//
+// `signal` is the caller's lifetime. Cleanup still runs after an abort (the
+// session deserves closing), but a cancelled caller waits at most
+// ABORTED_DISCONNECT_MS for it rather than the full timeout.
+const ABORTED_DISCONNECT_MS = 1000;
+async function disconnect(baseUrl, session, authHeaders = {}, timeoutMs = 5000, signal) {
   if (!session || !session.id) return false;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let timer = setTimeout(() => controller.abort(), signal && signal.aborted ? Math.min(timeoutMs, ABORTED_DISCONNECT_MS) : timeoutMs);
+  const shorten = () => { clearTimeout(timer); timer = setTimeout(() => controller.abort(), Math.min(timeoutMs, ABORTED_DISCONNECT_MS)); };
+  if (signal && !signal.aborted) signal.addEventListener('abort', shorten, { once: true });
   try {
     const res = await fetch(baseUrl, {
       method: 'DELETE',
-      headers: { 'MCP-Protocol-Version': PROTOCOL_VERSION, 'mcp-session-id': session.id, ...authHeaders },
+      headers: withBuiltInHeaders(authHeaders, { 'MCP-Protocol-Version': PROTOCOL_VERSION, 'mcp-session-id': session.id }),
       signal: controller.signal,
       redirect: 'error',
     });
@@ -208,20 +227,44 @@ async function disconnect(baseUrl, session, authHeaders = {}, timeoutMs = 5000) 
     return false;
   } finally {
     clearTimeout(timer);
+    if (signal) signal.removeEventListener('abort', shorten);
     session.id = null;
   }
 }
 
 // tools/list, following `nextCursor` pagination to the end.
-async function listTools(baseUrl, session, authHeaders = {}, timeoutMs = 60000) {
+// Discovery is bounded in total, not only per page (each page is still capped
+// at MAX_RESPONSE_BYTES by rpc): a server that pages forever or returns huge
+// definitions stops at the page or byte budget, with a warning, keeping the
+// tools gathered so far. Both budgets are read per call so they are env-overridable.
+function positiveEnv(name, fallback) {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+async function listTools(baseUrl, session, authHeaders = {}, timeoutMs = 60000, signal) {
+  const maxPages = positiveEnv('MCP_LIST_TOOLS_MAX_PAGES', 20);
+  const maxBytes = positiveEnv('MCP_LIST_TOOLS_MAX_BYTES', 16 * 1024 * 1024);
   const all = [];
+  let bytes = 0;
   let cursor;
-  for (let page = 0; page < 20; page++) { // bounded: a broken server must not spin
+  for (let page = 0; ; page++) {
+    if (page >= maxPages) {
+      console.warn(`[mcp] tools/list for ${baseUrl} stopped after ${maxPages} pages; keeping ${all.length} tools`);
+      break;
+    }
     const result = await rpc(baseUrl, session, {
       jsonrpc: '2.0', id: requestId(), method: 'tools/list',
       params: cursor ? { cursor } : {},
-    }, { headers: authHeaders, timeoutMs });
-    for (const t of (result && result.tools) || []) all.push(t);
+    }, { headers: authHeaders, timeoutMs, signal });
+    for (const t of (result && result.tools) || []) {
+      const size = Buffer.byteLength(JSON.stringify(t) || '');
+      if (bytes + size > maxBytes) {
+        console.warn(`[mcp] tools/list for ${baseUrl} reached its ${maxBytes}-byte budget; keeping ${all.length} tools`);
+        return all;
+      }
+      bytes += size;
+      all.push(t);
+    }
     cursor = result && result.nextCursor;
     if (!cursor) break;
   }
@@ -378,4 +421,5 @@ function readOnlyHint(mcpTool) {
   return typeof a.readOnlyHint === 'boolean' ? a.readOnlyHint : null;
 }
 
-module.exports = { connect, disconnect, listTools, callTool, resultToText, convertTool, resolveSchemaRefs, readOnlyHint, parseRpcBody, PROTOCOL_VERSION, MAX_RESPONSE_BYTES };
+module.exports = {
+  withBuiltInHeaders, connect, disconnect, listTools, callTool, resultToText, convertTool, resolveSchemaRefs, readOnlyHint, parseRpcBody, PROTOCOL_VERSION, MAX_RESPONSE_BYTES };

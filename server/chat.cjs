@@ -1,4 +1,5 @@
 'use strict';
+const { frameUntrusted } = require('./prompt-framing.cjs');
 // ── The chat loop ─────────────────────────────────────────────────────────
 // One POST /api/chat: build the system prompt (account instructions, memory,
 // project context, RAG excerpts, skills), hand the Diary space to its
@@ -25,10 +26,27 @@
 // history and the new message are available together. System messages, if
 // ever present in this array, pass through untouched (merging only joins
 // adjacent user/assistant turns of the same role).
+//
+// Tool/function messages in an imported or replayed history cannot be replayed
+// as-is (their tool_call ids and tool schemas are gone, and strict templates
+// reject orphan tool turns), but dropping them loses what the tools returned.
+// They are folded into the assistant turn they belong to as a compact, framed
+// "tool result" block; a tool message with no preceding assistant turn has
+// nothing to attach to and is dropped.
+const REPLAY_TOOL_RESULT_MAX = 500;
+function foldToolMessage(entry) {
+  const text = String(entry.content);
+  const clipped = text.length > REPLAY_TOOL_RESULT_MAX ? `${text.slice(0, REPLAY_TOOL_RESULT_MAX)}…` : text;
+  return frameUntrusted('tool result', typeof entry.name === 'string' ? entry.name.slice(0, 80) : '', clipped);
+}
 function normalizeReplayHistory(mapped, newMessage) {
   const out = [];
   for (const entry of mapped) {
     const last = out[out.length - 1];
+    if (entry.role === 'tool' || entry.role === 'function') {
+      if (last && last.role === 'assistant') last.content = `${last.content}\n\n${foldToolMessage(entry)}`;
+      continue;
+    }
     if (last && last.role === entry.role && (entry.role === 'user' || entry.role === 'assistant')) {
       last.content = `${last.content}\n\n${entry.content}`;
     } else {
@@ -63,7 +81,7 @@ function createChatHandler({
       preparation?.finish();
       if (execution.turn) {
         if (execution.turn.snapshot().phase === 'completed') execution.turn.complete();
-        else execution.turn.interrupt('Chat request ended before completion');
+        else if (execution.turn.snapshot().phase !== 'interrupted') execution.turn.interrupt('Chat request ended before completion');
       }
       // A chat deleted while this reply ran leaves no context state (summaries hold conversation text).
       const id=typeof body?.chatId==='string'?require('./chat-lists.cjs').safeChatId(body.chatId):null;
@@ -108,9 +126,9 @@ function createChatHandler({
     const chatWorkspace = (() => { try { return currentWorkspace(); } catch { return null; } })();
 
     const mappedHistory = (Array.isArray(history) ? history : [])
-      .filter((h) => h && (h.role === 'user' || h.role === 'assistant') && typeof h.content === 'string' && h.content)
+      .filter((h) => h && ['user', 'assistant', 'tool', 'function'].includes(h.role) && typeof h.content === 'string' && h.content)
       .slice(-HISTORY_CAP)
-      .map((h) => ({ role: h.role, content: h.content }));
+      .map((h) => (h.role === 'tool' || h.role === 'function') && typeof h.name === 'string' ? { role: h.role, content: h.content, name: h.name } : { role: h.role, content: h.content });
     const msgs = body.compactOnly ? normalizeReplayHistory(mappedHistory) : normalizeReplayHistory(mappedHistory, message);
 
     // ── Project context: instructions + knowledge files prepend
@@ -366,7 +384,7 @@ function createChatHandler({
       }
 
       if (described) {
-        const note = `Description of this project's images (${loadedImageNames.join(', ')}), produced by ${visionModel}:\n${described}`;
+        const note = frameUntrusted('image description', `${loadedImageNames.join(', ')} by ${visionModel}`, described);
         wire = wire.map((m) => (m.role === 'system' ? { ...m, content: `${m.content}\n\n${note}` } : m));
         if (!sys) wire = [{ role: 'system', content: note }, ...wire];
         attachedImages = [];
@@ -611,7 +629,7 @@ function createChatHandler({
             try {
               const evt = JSON.parse(payload);
               if(evt.choices?.[0]?.finish_reason==='length')send({type:'warning',text:'The model reached its thinking/answer token budget. This reply may be incomplete; try Low thinking or a narrower question.'});
-              if(evt.error){send({type:'error',text:context.providerError(evt.error)});res.end();return;}
+              if(evt.error){const text=context.providerError(evt.error);turn?.interrupt(`Provider stream error: ${text}`);send({type:'error',text});res.end();return;}
               const delta = evt.choices?.[0]?.delta || {};
               const meaningfulToolFragment = Array.isArray(delta.tool_calls) && delta.tool_calls.some(tc => tc?.id || tc?.function?.name || tc?.function?.arguments);
               // Detect output before handling usage: a compact provider may put
@@ -797,9 +815,12 @@ function createChatHandler({
           // The durable turn stores the same reduced copy (replay/resume use it)
           // plus the original size, never the raw megabytes.
           const forModel = reduceToolResult(result, { maxChars: TOOL_RESULT_CAP });
-          turn?.result(tc.id, forModel.text, { failed: outcome.failed === true, originalBytes: Buffer.byteLength(String(result)) });
+          // Tool/MCP output is third-party data: framed once, and the same framed
+          // copy is journaled so a replay sends the model exactly what it saw.
+          const framedResult = frameUntrusted('tool result', tc.name, forModel.text);
+          turn?.result(tc.id, framedResult, { failed: outcome.failed === true, originalBytes: Buffer.byteLength(String(result)) });
           send({ type: 'tool_result', index: toolOffset + toolIndex, name: tc.name, text: result.slice(0, 300) });
-          roundMessages.push({ role: 'tool', tool_call_id: tc.id, content: forModel.text });
+          roundMessages.push({ role: 'tool', tool_call_id: tc.id, content: framedResult });
         }
       }
 

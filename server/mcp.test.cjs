@@ -471,3 +471,101 @@ test('an oversized remote response body is capped, not buffered whole', async ()
     assert.equal(aborted, true, 'the oversized fetch is aborted rather than left to finish');
   } finally { global.fetch = realFetch; }
 });
+
+// ── #202: credential headers never replace protocol headers ─────────────
+test('user/key headers cannot override Content-Type, Accept, protocol version or the session id', async () => {
+  const seen = [];
+  const realFetch = global.fetch;
+  global.fetch = async (url, options) => {
+    seen.push(options);
+    if (options.method === 'DELETE') return { ok: true, status: 200 };
+    const body = JSON.parse(options.body);
+    return new Response(body.id === undefined ? '' : JSON.stringify({ jsonrpc: '2.0', id: body.id, result: {} }), {
+      status: body.id === undefined ? 202 : 200, headers: { 'content-type': 'application/json', 'mcp-session-id': 'real-session' },
+    });
+  };
+  const hostile = { 'X-Api-Key': 'synthetic-key', 'mcp-session-id': 'forged', accept: 'text/html', 'CONTENT-TYPE': 'text/plain', 'Mcp-Protocol-Version': '1999-01-01' };
+  try {
+    const { session } = await mcp.connect('https://server.invalid/mcp', hostile, 1000);
+    await mcp.callTool('https://server.invalid/mcp', session, 'synthetic_tool', {}, hostile, 1000);
+    await mcp.disconnect('https://server.invalid/mcp', session, hostile);
+    for (const { headers } of seen) {
+      const lower = Object.fromEntries(Object.entries(headers).map(([k, v]) => [k.toLowerCase(), v]));
+      assert.equal(Object.keys(headers).length, Object.keys(lower).length, 'no duplicate header names in different case');
+      assert.equal(lower['x-api-key'], 'synthetic-key', 'the key itself is still sent');
+      assert.equal(lower['mcp-protocol-version'], mcp.PROTOCOL_VERSION);
+      assert.notEqual(lower['mcp-session-id'], 'forged');
+      assert.notEqual(lower.accept, 'text/html');
+      assert.notEqual(lower['content-type'], 'text/plain');
+    }
+    assert.equal(seen.at(-1).headers['mcp-session-id'], 'real-session');
+  } finally { global.fetch = realFetch; }
+});
+
+// ── #185: the HTTP status travels separately from the server's body ──────
+test('an HTTP failure exposes its status as httpStatus', async () => {
+  const realFetch = global.fetch;
+  global.fetch = async () => new Response('synthetic server secret detail', { status: 503 });
+  try {
+    await assert.rejects(mcp.connect('https://server.invalid/mcp', {}, 1000), (e) => e.httpStatus === 503 && /synthetic server secret/.test(e.message));
+  } finally { global.fetch = realFetch; }
+});
+
+// ── #149: an aborted caller waits at most ~1 s for session cleanup ──────
+test('disconnect honours an abort signal: cleanup is capped at about a second', async () => {
+  const realFetch = global.fetch;
+  global.fetch = async (_url, options) => new Promise((_resolve, reject) => {
+    options.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+  });
+  try {
+    const aborted = new AbortController(); aborted.abort();
+    let started = Date.now();
+    assert.equal(await mcp.disconnect('https://server.invalid/mcp', { id: 's1' }, {}, 5000, aborted.signal), false);
+    let took = Date.now() - started;
+    assert.ok(took >= 900 && took < 2500, `already-aborted cleanup took ${took} ms`);
+
+    const later = new AbortController();
+    started = Date.now();
+    setTimeout(() => later.abort(), 50);
+    assert.equal(await mcp.disconnect('https://server.invalid/mcp', { id: 's2' }, {}, 5000, later.signal), false);
+    took = Date.now() - started;
+    assert.ok(took >= 900 && took < 2500, `abort mid-cleanup took ${took} ms`);
+  } finally { global.fetch = realFetch; }
+});
+
+// ── #202 (second half): paged discovery has a total budget ──────────────
+test('listTools stops a server that pages forever at the page and byte budgets, keeping what it has', async () => {
+  const realFetch = global.fetch, realWarn = console.warn;
+  const env = { pages: process.env.MCP_LIST_TOOLS_MAX_PAGES, bytes: process.env.MCP_LIST_TOOLS_MAX_BYTES };
+  let requests = 0; const warnings = [];
+  console.warn = (m) => warnings.push(String(m));
+  global.fetch = async (_url, options) => {
+    requests++;
+    const body = JSON.parse(options.body);
+    const tools = [{ name: `t${requests}`, description: 'x'.repeat(1000), inputSchema: { type: 'object' } }];
+    return new Response(JSON.stringify({ jsonrpc: '2.0', id: body.id, result: { tools, nextCursor: `c${requests}` } }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  try {
+    delete process.env.MCP_LIST_TOOLS_MAX_PAGES; delete process.env.MCP_LIST_TOOLS_MAX_BYTES;
+    let tools = await mcp.listTools('https://server.invalid/mcp', { id: 's' }, {}, 1000);
+    assert.equal(requests, 20); assert.equal(tools.length, 20);
+    assert.match(warnings.at(-1), /stopped after 20 pages; keeping 20 tools/);
+
+    requests = 0; process.env.MCP_LIST_TOOLS_MAX_PAGES = '1000'; process.env.MCP_LIST_TOOLS_MAX_BYTES = '5000';
+    tools = await mcp.listTools('https://server.invalid/mcp', { id: 's' }, {}, 1000);
+    assert.equal(tools.length, 4, 'four ~1.1 kB definitions fit in 5000 bytes');
+    assert.equal(requests, 5);
+    assert.match(warnings.at(-1), /reached its 5000-byte budget; keeping 4 tools/);
+  } finally {
+    global.fetch = realFetch; console.warn = realWarn;
+    for (const [k, v] of [['MCP_LIST_TOOLS_MAX_PAGES', env.pages], ['MCP_LIST_TOOLS_MAX_BYTES', env.bytes]]) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+  }
+});
+
+test('the per-page response cap still applies inside listTools', async () => {
+  const realFetch = global.fetch;
+  global.fetch = async () => new Response('x'.repeat(mcp.MAX_RESPONSE_BYTES + 10), { status: 200, headers: { 'content-type': 'application/json' } });
+  try {
+    await assert.rejects(mcp.listTools('https://server.invalid/mcp', { id: 's' }, {}, 1000), /response body exceeded the 8 MB limit/);
+  } finally { global.fetch = realFetch; }
+});

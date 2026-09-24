@@ -43,7 +43,7 @@ test('excluded skill vectors never re-enter retrieval or fallback context',async
  const body=source.slice(source.indexOf('async function filesContext('),source.indexOf('\nmodule.exports'));
  const p=fixture();p.files.push({name:'long.txt',content:'ORDINARY-LONG '.repeat(300)});skills.reconcile(p);
  for(const available of [true,false]){
-  const context={DIRECT_INJECT_MAX:2400,FILES_CONTEXT_MAX_CHARS:120000,LARGE_FILE_HEAD:24000,documentNotice:()=>'',ragAvailable:()=>available,searchProject:async()=>[{file:'review.md',body:'FORBIDDEN-SKILL-VECTOR'},{file:'removed.md',body:'REMOVED-SOURCE'}]};
+  const context={DIRECT_INJECT_MAX:2400,FILES_CONTEXT_MAX_CHARS:120000,LARGE_FILE_HEAD:24000,documentNotice:()=>'',frameUntrusted:require('./prompt-framing.cjs').frameUntrusted,ragAvailable:()=>available,searchProject:async()=>[{file:'review.md',body:'FORBIDDEN-SKILL-VECTOR'},{file:'removed.md',body:'REMOVED-SOURCE'}]};
   vm.createContext(context);vm.runInContext(body,context);
   const text=await context.filesContext('project',skills.sources(p),'query','tenant');
   assert.ok(!text.includes('FORBIDDEN'));assert.ok(!text.includes('REMOVED'));assert.ok(!text.includes('review.md'));assert.match(text,/Ordinary notes/);assert.match(text,/ORDINARY-LONG/);

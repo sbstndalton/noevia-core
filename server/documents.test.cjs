@@ -156,7 +156,7 @@ test('audit: retrieval fallback retains source names but supplies only the head 
   const ragSource = fs.readFileSync(path.join(__dirname, 'rag.cjs'), 'utf8');
   const context = { module: { exports: {} }, process: { env: {} }, console: { warn: () => {} },
     require: name => {
-      if (['fs', 'path', 'crypto', './document-sources.cjs'].includes(name)) return require(name);
+      if (['fs', 'path', 'crypto', './document-sources.cjs', './prompt-framing.cjs'].includes(name)) return require(name);
       throw new Error('Optional index intentionally unavailable in synthetic test');
     },
   };
@@ -274,7 +274,7 @@ test('retrieval fallback stays within the files-context budget, smallest first, 
   const ragSource = fs.readFileSync(path.join(__dirname, 'rag.cjs'), 'utf8');
   const context = { module: { exports: {} }, process: { env: {} }, console: { warn: () => {} },
     require: name => {
-      if (['fs', 'path', 'crypto', './document-sources.cjs'].includes(name)) return require(name);
+      if (['fs', 'path', 'crypto', './document-sources.cjs', './prompt-framing.cjs'].includes(name)) return require(name);
       throw new Error('Optional index intentionally unavailable in synthetic test');
     },
   };
@@ -291,7 +291,7 @@ test('retrieval fallback stays within the files-context budget, smallest first, 
   assert.equal(out.includes('BIG59 '), false);
   assert.match(manifest, /more files not included/);
   assert.match(manifest, /"big-59\.md"/);
-  const included = files.filter((f) => out.includes(`File "${f.name}"`)).length;
+  const included = files.filter((f) => out.includes(`label="${f.name}"`)).length;
   const omitted = Number(manifest.match(/ (\d+) more files not included/)[1]);
   assert.equal(included + omitted, files.length);
 });

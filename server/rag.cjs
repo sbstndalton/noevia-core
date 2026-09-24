@@ -13,6 +13,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { frameUntrusted } = require('./prompt-framing.cjs');
 const { notice: documentNotice } = require('./document-sources.cjs');
 
 // Injected by init() from index.cjs (keeps this module testable standalone).
@@ -428,15 +429,15 @@ async function filesContext(projectId, files, query, userId) {
     const hits = await searchProject(projectId, query, userId);
     if (hits.length > 0) {
       const permitted = new Set(files.map(f => f.name));
-      for (const h of hits) if (permitted.has(h.file)) parts.push(`[from ${h.file}] ${h.body}`);
+      for (const h of hits) if (permitted.has(h.file)) parts.push(frameUntrusted('excerpt', h.file, h.body));
     }
   }
   // Whole small files (and, without hits, the head of each large file) are
   // added smallest first until FILES_CONTEXT_MAX_CHARS is spent; anything that
   // does not fit is named below so the model knows it exists.
   let budget = FILES_CONTEXT_MAX_CHARS - parts.reduce((n, x) => n + x.length, 0);
-  const candidates = small.map((f) => ({ f, text: `File "${f.name}":\n${f.content}` }));
-  if (parts.length === 0) for (const f of large) candidates.push({ f, text: `File "${f.name}" (excerpts):\n${String(f.content).slice(0, LARGE_FILE_HEAD)}` });
+  const candidates = small.map((f) => ({ f, text: frameUntrusted('file', f.name, f.content) }));
+  if (parts.length === 0) for (const f of large) candidates.push({ f, text: frameUntrusted('file excerpts', f.name, String(f.content).slice(0, LARGE_FILE_HEAD)) });
   candidates.sort((a, b) => a.text.length - b.text.length);
   const omitted = [];
   for (const c of candidates) {

@@ -1,4 +1,5 @@
 'use strict';
+const { escapeClosing } = require('./prompt-framing.cjs');
 // Deep research runner (docs/spec-deep-research.md §3–6, variant B: no plan step, the question
 // is the only sub-question unless the caller passes sub-questions). Runs on the durable jobs
 // primitive. Every I/O dependency is injected, so the fixture measurement and unit tests use
@@ -46,7 +47,7 @@ function createResearchRunner({ jobs, search, extract, projectRetrieve = async (
   async function section(question, capped, ctx, budget) {
     const notes = [];
     for (const { id, excerpts } of capped) {
-      const messages = [{ role: 'system', content: NOTE_SYSTEM }, { role: 'user', content: `Question: ${question}\n\n<SOURCE id="${id}">\n${excerpts.join('\n\n')}\n</SOURCE>` }];
+      const messages = [{ role: 'system', content: NOTE_SYSTEM }, { role: 'user', content: `Question: ${question}\n\n<SOURCE id="${id}">\n${escapeClosing(excerpts.join('\n\n'), 'SOURCE')}\n</SOURCE>` }];
       preflight(messages, cfg.windowTokens, cfg.replyTokens);
       const note = String(await complete(messages, { signal: ctx.signal, maxTokens: cfg.replyTokens })).trim();
       if (note && note !== 'NONE') notes.push({ id, note });

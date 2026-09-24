@@ -400,7 +400,7 @@ function createMcpWiring({
       } finally {
         // Close it whatever happened. Nothing used to, so every tool call left a
         // session behind on the server for the life of the process.
-        await mcp.disconnect(server.url, session, auth);
+        await mcp.disconnect(server.url, session, auth, undefined, signal);
       }
       const text = mcp.resultToText(result);
       if (!text) return '(the tool returned no output)';
@@ -415,6 +415,13 @@ function createMcpWiring({
     } catch (err) {
       // Returned, not thrown: a failed tool call is information the model can
       // act on or relay, and throwing would strand the chip with no result.
+      // An HTTP failure carries the server's response body in its message; that
+      // is third-party text, so it goes to the log and the model gets a
+      // neutral line with the status only.
+      if (err && Number.isInteger(err.httpStatus)) {
+        logger.warn(`[mcp] ${name} failed: ${String(err.message).slice(0, 300)}`);
+        return `ERROR calling ${name}: tool call failed (HTTP ${err.httpStatus})`;
+      }
       return `ERROR calling ${name}: ${String((err && err.message) || err).slice(0, 300)}`;
     }
   }
