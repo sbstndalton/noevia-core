@@ -269,3 +269,29 @@ test('refresh retains unified batches larger than the retired 40-source folder c
   const out = await h.sync(); assert.equal(out.status, 200);
   assert.equal(h.project.files.length, 41); assert.equal(out.body.skipped.length, 0);
 });
+
+test('retrieval fallback stays within the files-context budget, smallest first, naming omitted files', async () => {
+  const ragSource = fs.readFileSync(path.join(__dirname, 'rag.cjs'), 'utf8');
+  const context = { module: { exports: {} }, process: { env: {} }, console: { warn: () => {} },
+    require: name => {
+      if (['fs', 'path', 'crypto', './document-sources.cjs'].includes(name)) return require(name);
+      throw new Error('Optional index intentionally unavailable in synthetic test');
+    },
+  };
+  vm.createContext(context);
+  vm.runInContext(ragSource, context);
+  const files = Array.from({ length: 60 }, (_, i) => ({ name: `big-${i}.md`, content: `BIG${i} ` + 'y'.repeat(30000 - 1000 + i * 10) }));
+  files.push({ name: 'tiny.md', content: 'TINY-MARKER' });
+  const out = await context.module.exports.filesContext('fixture-project', files, 'q', 'fixture-user');
+  const [manifest] = out.split('\n\n');
+  const body = out.slice(manifest.length);
+  assert.ok(body.length <= 120_000 + 1000, `body ${body.length}`);
+  assert.match(out, /TINY-MARKER/);
+  assert.match(out, /BIG0 /); // the shortest of the large files goes in first
+  assert.equal(out.includes('BIG59 '), false);
+  assert.match(manifest, /more files not included/);
+  assert.match(manifest, /"big-59\.md"/);
+  const included = files.filter((f) => out.includes(`File "${f.name}"`)).length;
+  const omitted = Number(manifest.match(/ (\d+) more files not included/)[1]);
+  assert.equal(included + omitted, files.length);
+});

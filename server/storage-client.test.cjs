@@ -563,3 +563,58 @@ test('base64 overhead does not reject images below the advertised 8 MB cap', asy
   assert.equal(response.status, 200, response.text);
   assert.equal(JSON.parse(response.text).asset.bytes, 7 * 1024 * 1024);
 });
+
+test('folder sync counts other sources against the 60 cap and reports every file it leaves out', async () => {
+  const project = await createTestProject('Source cap');
+  const uploads = Array.from({ length: 10 }, (_, i) => ({ name: `upload-${i}.txt`, content: `upload ${i}` }));
+  await request(`/api/projects/${project.id}/config`, { method: 'POST', headers: mutationHeaders(), body: JSON.stringify({ files: uploads, sourceFolders: ['Synthetic/A', 'Synthetic/B'] }) });
+  const names = (folder, n) => Array.from({ length: n }, (_, i) => `${folder}/f${String(i).padStart(2, '0')}.md`);
+  const listing = { 'Synthetic/A': names('Synthetic/A', 30), 'Synthetic/B': names('Synthetic/B', 50) };
+  const client = require('./storage-client.cjs');
+  const rag = require('./rag.cjs');
+  const saved = { list: client.listFiles, read: client.readTextFile, del: rag.deleteProjectFile };
+  const deleted = [];
+  let blockA = false; let release; let entered;
+  client.listFiles = async (_c, folder) => {
+    if (blockA && folder === 'Synthetic/B') { entered(); await new Promise((r) => { release = r; }); }
+    return (listing[folder] || []).map((p) => ({ name: p.split('/').pop(), path: p, isDir: false, size: 1, ext: '.md' }));
+  };
+  client.readTextFile = async (_c, p) => ({ content: 'synthetic ' + p });
+  rag.deleteProjectFile = (_id, name) => { deleted.push(name); };
+  const syncUrl = `/api/projects/${project.id}/sources/sync`;
+  try {
+    const first = JSON.parse((await request(syncUrl, { method: 'POST', headers: mutationHeaders() })).text);
+    const limited = first.skipped.filter((s) => s.code === 'limit').map((s) => s.file);
+    assert.deepEqual(limited, listing['Synthetic/B'].slice(20));
+    assert.ok(first.skipped.every((s) => s.code !== 'limit' || /60-source/.test(s.reason)));
+    const after = await workspaceProject(project.id);
+    assert.equal(after.files.length, 60);
+    assert.equal(after.files.filter((f) => f.source === 'Synthetic/A').length, 30);
+    assert.deepEqual(after.files.filter((f) => f.source === 'Synthetic/B').map((f) => f.name), listing['Synthetic/B'].slice(0, 20));
+
+    // An upload that lands while the folders are being read must not be
+    // sliced off silently: the overflow comes from the synced files and each
+    // is reported. A fresh project so the late uploads fit the patch cap.
+    const race = await createTestProject('Source cap race');
+    await request(`/api/projects/${race.id}/config`, { method: 'POST', headers: mutationHeaders(), body: JSON.stringify({ files: uploads, sourceFolders: ['Synthetic/A', 'Synthetic/B'] }) });
+    blockA = true; deleted.length = 0;
+    const started = new Promise((r) => { entered = r; });
+    const syncing = request(`/api/projects/${race.id}/sources/sync`, { method: 'POST', headers: mutationHeaders() });
+    await started;
+    const extra = Array.from({ length: 5 }, (_, i) => ({ name: `late-${i}.txt`, content: 'late' }));
+    assert.equal((await request(`/api/projects/${race.id}/config`, { method: 'POST', headers: mutationHeaders(), body: JSON.stringify({ files: [...uploads, ...extra] }) })).status, 200);
+    release();
+    const second = JSON.parse((await syncing).text);
+    const final = await workspaceProject(race.id);
+    assert.equal(final.files.length, 60);
+    for (const f of [...uploads, ...extra]) assert.ok(final.files.some((x) => x.name === f.name), f.name);
+    assert.equal(final.files.filter((f) => f.source === 'Synthetic/A').length, 30);
+    const kept = new Set(final.files.map((f) => f.name));
+    const reported = new Set(second.skipped.filter((s) => s.code === 'limit').map((s) => s.file));
+    for (const name of listing['Synthetic/B']) assert.ok(kept.has(name) !== reported.has(name), name);
+    assert.deepEqual([...kept].filter((n) => n.startsWith('Synthetic/B/')), listing['Synthetic/B'].slice(0, 15));
+    // Nothing that stays attached loses its chunks; the uploads and A are intact.
+    assert.ok(deleted.every((n) => !kept.has(n)));
+    assert.equal(first.files.length, 60);
+  } finally { release?.(); client.listFiles = saved.list; client.readTextFile = saved.read; rag.deleteProjectFile = saved.del; }
+});

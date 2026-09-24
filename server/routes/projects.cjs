@@ -581,8 +581,8 @@ function createProjectRoutes({
         if (getProject(id) !== project) return json(res, 409, { error: 'Project changed; retry.' });
         const connection = authService.getStorage(authn.user.id, true);
         const fromFolders = [];
-        const sourceLimit = Math.max(0, 60 - (project.files || []).filter(f => !f.source).length);
         const skipped = [];
+        const LIMIT_REASON = '60-source project limit reached; this file was not read.';
         if (storageClient.isBrowsable(connection) && (project.assets || []).some(a => !a.sourceName)) {
           if (!project.projectFolder) project.projectFolder = await ensureProjectFolder(project);
           if (project.projectFolder) {
@@ -603,6 +603,10 @@ function createProjectRoutes({
         }
         const folders = Array.isArray(project.sourceFolders) ? project.sourceFolders : [];
         if (folders.length && !storageClient.isBrowsable(connection)) return json(res, 400, { error: 'no browsable storage connection is configured' });
+        // Room left for the folders being re-read: every source that is NOT
+        // from one of them (uploads, images just moved into storage, files of
+        // other attached folders) stays, so it counts against the 60 cap.
+        const sourceLimit = Math.max(0, 60 - (project.files || []).filter(f => !f.source || !folders.includes(f.source)).length);
 
         for (const folder of folders) {
           let entries;
@@ -631,7 +635,7 @@ function createProjectRoutes({
             const isDocx = /\.docx$/i.test(entry.name);
             const managed = folder === project.projectFolder && require('../uploads.cjs').GROUPS.some(g => entry.path.startsWith(`${folder}/${g}/`));
             if (!isText && !isDoc && !isDocx && !managed) continue;
-            if (fromFolders.length >= sourceLimit) { skipped.push({ folder, file: entry.path, reason: '60-source project limit reached; this file was not read.', retained: false }); continue; } // a cap, so one big folder cannot blow up a project
+            if (fromFolders.length >= sourceLimit) { skipped.push({ folder, file: entry.path, reason: LIMIT_REASON, code: 'limit', retained: false }); continue; } // a cap, so one big folder cannot blow up a project
             try {
               if (managed || isDocx) {
                 const bytes = await storageClient.readBinaryFile(connection, entry.path);
@@ -667,7 +671,11 @@ function createProjectRoutes({
         const uploaded = prev.filter((f) => !f.source);
         const untouched = prev.filter((f) => f.source && currentFolders.has(f.source) && !folders.includes(f.source));
         const synced = fromFolders.filter((f) => currentFolders.has(f.source));
-        project.files = [...uploaded, ...untouched, ...synced].slice(0, 60);
+        // Existing uploads and other folders' sources are never dropped here;
+        // only newly synced files beyond the cap are, and each is reported.
+        const room = Math.max(0, 60 - uploaded.length - untouched.length);
+        for (const f of synced.slice(room)) skipped.push({ folder: f.source, file: f.name, reason: LIMIT_REASON, code: 'limit', retained: false });
+        project.files = [...uploaded, ...untouched, ...synced.slice(0, room)];
         require('../uploads.cjs').prune(currentWorkspace(), project);
         saveProjects(PROJECTS);
         // Same RAG bookkeeping the config patch does: drop chunks for files that
