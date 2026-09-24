@@ -53,8 +53,23 @@ const INSTALLERS = new Map(Object.entries({
   apt: ['install'], 'apt-get': ['install'], apk: ['add'], brew: ['install'], dnf: ['install'], yum: ['install'],
 }));
 // Fetches code or data over the network whatever the subcommand.
-const NETWORK_COMMANDS = new Set(['curl', 'wget', 'nc', 'ncat', 'netcat', 'ssh', 'scp', 'sftp', 'rsync',
-  'telnet', 'ftp', 'npx', 'http', 'https']);
+// Only curl, wget and httpie stay plain network, and only with read-only flags (see networkWords).
+const NETWORK_COMMANDS = new Set(['curl', 'wget', 'http', 'https']);
+// Remote shells and raw sockets run whatever they are told on the far end (or locally via -e / -o
+// ProxyCommand): never waved through by the domain list.
+const REMOTE_EXEC_COMMANDS = new Set(['nc', 'ncat', 'netcat', 'ssh', 'scp', 'sftp', 'rsync', 'telnet', 'ftp']);
+// Downloads and runs a package.
+const PACKAGE_RUNNERS = new Set(['npx', 'bunx', 'pnpx']);
+// curl/wget flags that neither write a file nor read config/upload data. Anything else is not.
+const CURL_SAFE_BARE = new Set(['--silent', '--show-error', '--location', '--head', '--fail', '--compressed']);
+const CURL_SAFE_SHORT = /^-[sSLIf]+$/;
+const CURL_SAFE_WITH_ARG = new Set(['-H', '--header', '-A', '--user-agent', '-m', '--max-time', '--retry']);
+const CURL_WRITE_FLAGS = /^(-[a-zA-Z]*[oOJDc]|--output|--output-dir|--remote-name|--remote-name-all|--remote-header-name|--dump-header|--cookie-jar|--create-dirs|--trace|--trace-ascii|--stderr|--libcurl|--etag-save|--hsts|--alt-svc)/;
+const WGET_SAFE_BARE = new Set(['-q', '--quiet', '--spider', '-qO-', '-O-']);
+const WGET_SAFE_WITH_ARG = new Set(['--timeout', '--tries', '--header', '-U', '--user-agent', '-T', '-t']);
+const WGET_WRITE_FLAGS = /^(-[a-zA-Z]*[OoaPx]|--output-document|--output-file|--append-output|--directory-prefix|--mirror|--recursive|-r|-m|--save-headers|--save-cookies|--force-directories|--backups|--warc-file)/;
+// git config keys that run a command or reroute traffic; any of them on the command line.
+const GIT_DANGEROUS_KEY = /^(core\.sshcommand|core\.gitproxy|core\.fsmonitor|core\.hookspath|core\.pager|core\.editor|credential\.|http\.proxy|https\.proxy|http\..*\.proxy|protocol\.|url\.|remote\..*\.(uploadpack|receivepack|proxy)|uploadpack\.|include\.|includeif\.|diff\.|filter\.|merge\.|gpg\.|ssh\.)/i;
 const DELETE_COMMANDS = new Set(['rm', 'rmdir', 'unlink', 'shred', 'truncate', 'srm']);
 const BROWSER_COMMANDS = new Set(['open', 'xdg-open', 'chromium', 'chrome', 'google-chrome', 'firefox', 'safari']);
 // `git` decides by subcommand; anything not listed stays an ordinary command.
@@ -272,34 +287,105 @@ function classifyWords(input, depth) {
     });
     return { actions: [...actions], standable: own && standable };
   }
-  if (name === 'git' || name.startsWith('git-')) return one(gitAction(name, rest), standable);
+  if (name === 'git' || name.startsWith('git-')) {
+    const g = gitAction(name, rest);
+    return one(g.action, standable && g.standable);
+  }
   const args = rest.filter((w) => !w.startsWith('-'));
   if (INSTALLERS.has(name)) return one(INSTALLERS.get(name).includes(args[0]) ? ACTIONS.INSTALL : ACTIONS.EXECUTE, standable);
-  if (NETWORK_COMMANDS.has(name)) return one(ACTIONS.NETWORK, standable);
+  if (PACKAGE_RUNNERS.has(name)) return one(ACTIONS.INSTALL, standable);
+  if (REMOTE_EXEC_COMMANDS.has(name)) return one(ACTIONS.EXECUTE, false);
+  if (name === 'gh') return one(ACTIONS.EXTERNAL, false);
+  if (NETWORK_COMMANDS.has(name)) return { actions: networkWords(name, rest), standable };
   if (DELETE_COMMANDS.has(name)) return one(ACTIONS.DELETE, standable);
   if (BROWSER_COMMANDS.has(name)) return one(ACTIONS.BROWSER, standable);
   return one(ACTIONS.EXECUTE, standable);
 }
 
+const isUrl = (w) => /^https?:\/\/\S+$/i.test(w);
+
+/**
+ * A curl/wget/httpie call is plain NETWORK only when every word is a URL or a read-only flag.
+ * A flag that writes a file adds EDIT; any other flag (config, upload, post-file, unknown) or a
+ * bare non-URL word adds EXECUTE. Either makes the call non-simple, so it is never auto-allowed.
+ */
+function networkWords(name, rest) {
+  const actions = new Set([ACTIONS.NETWORK]);
+  const other = (w, writes) => actions.add(writes.test(w) ? ACTIONS.EDIT : ACTIONS.EXECUTE);
+  for (let k = 0; k < rest.length; k++) {
+    const w = rest[k];
+    if (isUrl(w)) continue;
+    if (name === 'curl') {
+      if (CURL_SAFE_BARE.has(w) || CURL_SAFE_SHORT.test(w)) continue;
+      // `-H @file` reads headers from a file: not read-only with respect to local secrets.
+      if (CURL_SAFE_WITH_ARG.has(w) && k + 1 < rest.length && !rest[k + 1].startsWith('@')) { k++; continue; }
+      if (/^--(header|user-agent|max-time|retry)=/.test(w)) continue;
+      if ((w === '-X' || w === '--request') && /^GET$/i.test(rest[k + 1] || '')) { k++; continue; }
+      if (/^(-XGET|--request=GET)$/i.test(w)) continue;
+      other(w, CURL_WRITE_FLAGS);
+    } else if (name === 'wget') {
+      if (WGET_SAFE_BARE.has(w)) continue;
+      if ((w === '-O' || w === '-qO' || w === '--output-document') && rest[k + 1] === '-') { k++; continue; }
+      if (w === '--output-document=-') continue;
+      if (WGET_SAFE_WITH_ARG.has(w) && k + 1 < rest.length) { k++; continue; }
+      if (/^--(timeout|tries|header|user-agent)=/.test(w)) continue;
+      other(w, WGET_WRITE_FLAGS);
+    } else {
+      // httpie: `key=value` sends data, `--download`/`-o` write, anything else is not read-only.
+      other(w, /^(-[a-zA-Z]*[od]|--download|--output)/);
+    }
+  }
+  return [...actions];
+}
+
+/** @returns {{action: string, standable: boolean}} */
 function gitAction(name, rest) {
-  if (name !== 'git') return GIT_SUBCOMMANDS.get(name.slice(4)) || ACTIONS.EXECUTE; // `git-push`
+  if (name !== 'git') return { action: GIT_SUBCOMMANDS.get(name.slice(4)) || ACTIONS.EXECUTE, standable: true }; // `git-push`
   let k = 0;
   let aliased = false;
+  let rerouted = false;
+  const configKey = (value) => {
+    const key = String(value || '').split('=')[0];
+    if (/^alias\./i.test(key)) aliased = true;
+    if (GIT_DANGEROUS_KEY.test(key)) rerouted = true;
+  };
   while (k < rest.length && rest[k].startsWith('-')) {
     const w = rest[k];
     if (w === '--') { k++; break; }
-    if (GIT_GLOBAL_WITH_ARG.has(w)) {
-      if ((w === '-c' || w === '--config-env') && /^alias\./i.test(rest[k + 1] || '')) aliased = true;
-      k += 2; continue;
+    if (w === '--config-env' || w.startsWith('--config-env=')) {
+      // The value comes from the environment, which we cannot see: never plain.
+      rerouted = true;
+      configKey(w === '--config-env' ? rest[k + 1] : w.slice('--config-env='.length));
+      k += w === '--config-env' ? 2 : 1; continue;
     }
-    if (/^-c.+/.test(w) && /^-calias\./i.test(w)) aliased = true;
+    if (w === '-c') { configKey(rest[k + 1]); k += 2; continue; }
+    if (/^-c.+/.test(w)) { configKey(w.slice(2)); k++; continue; }
+    if (GIT_GLOBAL_WITH_ARG.has(w)) { k += 2; continue; }
     k++; // `--git-dir=x`, `-p`, `--no-pager`, `--bare`, `-Cpath` …
   }
   // An alias defined on the command line can be anything, including a push.
-  if (aliased) return ACTIONS.GIT_PUSH;
+  if (aliased) return { action: ACTIONS.GIT_PUSH, standable: false };
   const sub = rest[k];
-  if (sub === 'send-pack' || sub === 'http-push') return ACTIONS.GIT_PUSH;
-  return GIT_SUBCOMMANDS.get(sub) || ACTIONS.EXECUTE;
+  const args = rest.slice(k + 1);
+  const has = (...flags) => args.some((a) => flags.includes(a) || flags.some((f) => f.startsWith('--') && a.startsWith(f + '=')));
+  if (sub === 'send-pack' || sub === 'http-push') return { action: ACTIONS.GIT_PUSH, standable: false };
+  // History-destroying subcommands: DELETE, which never stands.
+  const destructive =
+    (sub === 'update-ref' && has('-d', '--delete')) ||
+    (sub === 'reset' && has('--hard', '--merge', '--keep')) ||
+    (sub === 'branch' && args.some((a) => /^-[a-zA-Z]*[dD]/.test(a) || a === '--delete')) ||
+    (sub === 'tag' && args.some((a) => /^-[a-zA-Z]*d/.test(a) || a === '--delete')) ||
+    (sub === 'stash' && ['drop', 'clear'].includes(args[0])) ||
+    (sub === 'reflog' && ['expire', 'delete'].includes(args[0])) ||
+    (sub === 'gc' && args.some((a) => a === '--prune' || a.startsWith('--prune=')));
+  if (destructive) return { action: ACTIONS.DELETE, standable: false };
+  const action = GIT_SUBCOMMANDS.get(sub) || ACTIONS.EXECUTE;
+  // A network subcommand told to run a helper, or with rerouted config, runs code.
+  if (action === ACTIONS.NETWORK && (rerouted || has('--upload-pack', '-u', '--receive-pack', '--exec', '--config', '-c', '--template'))) {
+    return { action: ACTIONS.EXECUTE, standable: false };
+  }
+  if (rerouted) return { action: action === ACTIONS.GIT_PUSH ? action : ACTIONS.EXECUTE, standable: false };
+  return { action, standable: true };
 }
 
 /** The command text an ACP agent puts in `rawInput`, whatever key it chose. */

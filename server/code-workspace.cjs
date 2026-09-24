@@ -309,6 +309,9 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
     const target = path.resolve(record.path, candidate);
     let resolvedRoot;
     try { resolvedRoot = fs.realpathSync(record.path); } catch { return false; }
+    // A symlink whose target is missing cannot be realpath'd, and falling back to its parent
+    // would judge the link, not where a write through it lands. Refuse it.
+    try { if (fs.lstatSync(target).isSymbolicLink() && !fs.existsSync(target)) return false; } catch { /* absent: fine */ }
     let probe = target, unresolved = 0;
     for (;;) {
       try { probe = fs.realpathSync(probe); break; }

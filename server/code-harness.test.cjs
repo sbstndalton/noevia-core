@@ -574,3 +574,47 @@ test('relative fs paths resolve inside the worktree, never against the web proce
   assert.equal(fs.existsSync(path.join(outside, 'new.txt')), false);
   assert.equal(fs.existsSync(path.join(path.dirname(r.workspace), 'escape.txt')), false);
 });
+
+// ---- #181: a symlink as the final component is never followed, dangling or not ----
+test('a symlinked final component is refused for reads and writes; ordinary writes still land inside', async () => {
+  const outside = temp('noevia-symout-');
+  const target = path.join(outside, 'authorized_keys'); // absent: the link dangles
+  fs.writeFileSync(path.join(outside, 'present.txt'), 'synthetic secret');
+  const r = await run({
+    script: async (h, cwd) => {
+      fs.symlinkSync(target, path.join(cwd, 'k'));
+      await assert.rejects(() => h.writeTextFile({ path: 'k', content: 'ssh-ed25519 AAAA' }), /Outside|symlink/);
+      await assert.rejects(() => h.writeTextFile({ path: path.join(cwd, 'k'), content: 'x' }), /Outside|symlink/);
+      assert.equal(fs.existsSync(target), false, 'nothing was created outside the worktree');
+      fs.symlinkSync(path.join(outside, 'present.txt'), path.join(cwd, 'p'));
+      await assert.rejects(() => h.writeTextFile({ path: 'p', content: 'x' }), /Outside|symlink/);
+      await assert.rejects(() => h.readTextFile({ path: 'p' }), /Outside|symlink/);
+      assert.equal(fs.readFileSync(path.join(outside, 'present.txt'), 'utf8'), 'synthetic secret');
+      // Documented choice: a link to a file inside the worktree is refused too (by contains() or by the lstat check).
+      fs.symlinkSync(path.join(cwd, 'a.txt'), path.join(cwd, 'in'));
+      await assert.rejects(() => h.writeTextFile({ path: 'in', content: 'x' }), /Outside|symlink/);
+      await assert.rejects(() => h.readTextFile({ path: 'in' }), /Outside|symlink/);
+      assert.equal(await h.writeTextFile({ path: 'sub/dir/ok.txt', content: 'fine' }), null);
+      assert.equal(fs.readFileSync(path.join(cwd, 'sub/dir/ok.txt'), 'utf8'), 'fine');
+    },
+  });
+  assert.equal(r.job.status, 'completed', r.job.error);
+});
+
+test('defaultFiles refuses a link swapped in after the containment check (O_NOFOLLOW)', () => {
+  const { defaultFiles } = require('./code-harness.cjs');
+  const root = temp('noevia-race-'), outside = temp('noevia-race-out-');
+  const victim = path.join(outside, 'v.txt');
+  fs.symlinkSync(victim, path.join(root, 'late'));
+  assert.throws(() => defaultFiles.write(path.join(root, 'late'), 'x', root), /symlink/);
+  assert.throws(() => defaultFiles.read(path.join(root, 'late'), 100, root), /symlink/);
+  assert.equal(fs.existsSync(victim), false);
+  assert.throws(() => defaultFiles.write(path.join(outside, 'x.txt'), 'x', root), /Outside/);
+  assert.throws(() => defaultFiles.write(path.join(root, 'x.txt'), 'x'), /Outside/, 'no root, no write');
+  // mkdir -p must not follow a symlinked directory out of the worktree.
+  fs.symlinkSync(outside, path.join(root, 'dirlink'));
+  assert.throws(() => defaultFiles.write(path.join(root, 'dirlink', 'a', 'b', 'file'), 'x', root), /Outside/);
+  assert.equal(fs.existsSync(path.join(outside, 'a')), false, 'nothing created outside');
+  defaultFiles.write(path.join(root, 'new', 'deep', 'ok.txt'), 'ok', root);
+  assert.equal(fs.readFileSync(path.join(root, 'new', 'deep', 'ok.txt'), 'utf8'), 'ok');
+});

@@ -318,7 +318,7 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
       return nodePath.resolve(root, target);
     };
     const readTextFile = async ({ path: target, line = null, limit = null } = {}) => {
-      const content = files.read(inside(target), MAX_FILE_BYTES);
+      const content = files.read(inside(target), MAX_FILE_BYTES, workspaces.get(taskId)?.path);
       if (line === null && limit === null) return { content };
       const all = content.split('\n');
       const from = Math.max(0, (Number(line) || 1) - 1);
@@ -327,7 +327,7 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
     const writeTextFile = async ({ path: target, content } = {}) => {
       const text = String(content ?? '');
       if (Buffer.byteLength(text) > MAX_FILE_BYTES) throw Object.assign(Error('File too large'), { code: -32602 });
-      files.write(inside(target), text);
+      files.write(inside(target), text, workspaces.get(taskId)?.path);
       ctx.event('tool.completed', { name: 'write_file', path: target, bytes: Buffer.byteLength(text) });
       return null;
     };
@@ -422,16 +422,68 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
 }
 
 /** Real file I/O, injectable so the policy above can be tested without a disk. */
+/**
+ * The parent directory must realpath inside the worktree root, and the final component must not
+ * be a symlink (dangling or not). The file is then opened with O_NOFOLLOW, so a link swapped in
+ * after the check is still refused by the kernel. A symlink whose target is inside the worktree
+ * is refused too: simpler to reason about than following it, and the agent can write the target.
+ */
+function pinnedParent(target, root) {
+  const refuse = () => { throw Object.assign(Error('Outside this task’s workspace'), { code: -32602 }); };
+  if (typeof root !== 'string' || !root) refuse();
+  let realRoot, realParent;
+  try { realRoot = fs.realpathSync(root); realParent = fs.realpathSync(nodePath.dirname(target)); } catch { refuse(); }
+  const rel = nodePath.relative(realRoot, realParent);
+  if (rel.startsWith('..') || nodePath.isAbsolute(rel)) refuse();
+  const final = nodePath.join(realParent, nodePath.basename(target));
+  let st = null;
+  try { st = fs.lstatSync(final); } catch (err) { if (err.code !== 'ENOENT') throw err; }
+  if (st && st.isSymbolicLink()) {
+    throw Object.assign(Error('Refusing to follow a symlink'), { code: -32602 });
+  }
+  return final;
+}
+
 const defaultFiles = {
-  read(target, max) {
-    const stat = fs.statSync(target);
-    if (!stat.isFile()) throw Object.assign(Error('Not a file'), { code: -32602 });
-    if (stat.size > max) throw Object.assign(Error('File too large'), { code: -32602 });
-    return fs.readFileSync(target, 'utf8');
+  read(target, max, root) {
+    const final = pinnedParent(target, root);
+    const { O_RDONLY, O_NOFOLLOW } = fs.constants;
+    let fd;
+    try { fd = fs.openSync(final, O_RDONLY | O_NOFOLLOW); }
+    catch (err) { if (err.code === 'ELOOP') throw Object.assign(Error('Refusing to follow a symlink'), { code: -32602 }); throw err; }
+    try {
+      const stat = fs.fstatSync(fd);
+      if (!stat.isFile()) throw Object.assign(Error('Not a file'), { code: -32602 });
+      if (stat.size > max) throw Object.assign(Error('File too large'), { code: -32602 });
+      return fs.readFileSync(fd, 'utf8');
+    } finally { fs.closeSync(fd); }
   },
-  write(target, text) {
-    fs.mkdirSync(nodePath.dirname(target), { recursive: true });
-    fs.writeFileSync(target, text);
+  write(target, text, root) {
+    // Create missing directories first, then judge where the parent really is.
+    // mkdir -p follows symlinks, so vet the deepest existing ancestor before creating anything.
+    if (typeof root === 'string' && root) {
+      const refuse = () => { throw Object.assign(Error('Outside this task\u2019s workspace'), { code: -32602 }); };
+      let realRoot;
+      try { realRoot = fs.realpathSync(root); } catch { refuse(); }
+      const dir = nodePath.resolve(nodePath.dirname(target));
+      let existing = dir;
+      while (!fs.existsSync(existing)) {
+        if (fs.lstatSync(existing, { throwIfNoEntry: false })) refuse(); // a dangling link
+        const up = nodePath.dirname(existing);
+        if (up === existing) refuse();
+        existing = up;
+      }
+      if (existing !== dir && fs.lstatSync(existing).isSymbolicLink()) refuse();
+      const rel = nodePath.relative(realRoot, fs.realpathSync(existing));
+      if (rel.startsWith('..') || nodePath.isAbsolute(rel)) refuse();
+      if (existing !== dir) fs.mkdirSync(dir, { recursive: true });
+    }
+    const final = pinnedParent(target, root);
+    const { O_WRONLY, O_CREAT, O_TRUNC, O_NOFOLLOW } = fs.constants;
+    let fd;
+    try { fd = fs.openSync(final, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0o644); }
+    catch (err) { if (err.code === 'ELOOP') throw Object.assign(Error('Refusing to follow a symlink'), { code: -32602 }); throw err; }
+    try { fs.writeFileSync(fd, text); } finally { fs.closeSync(fd); }
   },
 };
 

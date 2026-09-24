@@ -594,3 +594,13 @@ test('in clone mode the release auto-commit never carries the pinned config, eve
   const files = trackedGit(repo, 'ls-tree', '-r', '--name-only', claim.branch).split('\n');
   assert.deepEqual(files, ['a.txt']);
 });
+
+test('a dangling symlink inside the worktree is not contained', () => {
+  const repo = repoWith();
+  const { ws } = workspaces();
+  const claim = ws.claim({ taskId: ids(1), repoPath: repo });
+  const outside = temp('noevia-dangle-');
+  fs.symlinkSync(path.join(outside, 'authorized_keys'), path.join(claim.path, 'k'));
+  assert.equal(ws.contains(ids(1), path.join(claim.path, 'k')), false);
+  assert.equal(ws.contains(ids(1), 'k'), false);
+});
