@@ -77,8 +77,30 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
     return path.join(root, id + '.jsonl');
   };
   function events(id) {
+    let raw;
     try {
-      const rows = fs.readFileSync(file(id), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+      raw = fs.readFileSync(file(id), 'utf8');
+    } catch (e) {
+      if (e.status) throw e;
+      if (e.code === 'ENOENT') return [];
+      throw Object.assign(Error('Unreadable job journal; review required', { cause: e }), { status: 409 });
+    }
+    const lines = raw.split('\n').filter(Boolean);
+    try {
+      const rows = [];
+      for (const [i, line] of lines.entries()) {
+        try {
+          rows.push(JSON.parse(line));
+        } catch (e) {
+          // Tolerate a torn last line left by a crash mid-write, but only for journals
+          // that don't hash-chain their events: a durable (e.g. chat-turns tool-call)
+          // journal must fail closed on any unreadable tail rather than silently resume
+          // with the last recorded event possibly missing its effect.
+          const hashChained = rows[0]?.hash || (durable && (!kinds || kinds.includes(rows[0]?.data?.kind)));
+          if (i === lines.length - 1 && !hashChained) break;
+          throw e;
+        }
+      }
       let previous = null;
       for (const [i, row] of rows.entries()) {
         if (rows[0]?.hash || row.hash || (durable && (!kinds || kinds.includes(rows[0]?.data?.kind)))) {
@@ -91,7 +113,6 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
       return rows;
     } catch (e) {
       if (e.status) throw e;
-      if (e.code === 'ENOENT') return [];
       // Never turn corruption into an empty journal and replay uncertain effects.
       throw Object.assign(Error('Unreadable job journal; review required', { cause: e }), { status: 409 });
     }
@@ -135,10 +156,28 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
   }
   function get(id) { const e = events(id); return e.length ? derive(e) : null; }
   function ids() { try { return fs.readdirSync(root).filter((n) => n.endsWith('.jsonl')).map((n) => n.slice(0, -6)); } catch { return []; } }
+  const warnedUnreadable = new Set();
+  // A single corrupt or torn-mid-line journal must never take down reads of every other
+  // job sharing the directory (recover/prune/list all enumerate every file up front).
+  function getSafe(id) {
+    try {
+      return { job: get(id) };
+    } catch (e) {
+      if (e.status !== 409) throw e;
+      const p = file(id);
+      if (!warnedUnreadable.has(p)) { warnedUnreadable.add(p); console.error(`[jobs] unreadable job journal, skipping: ${p}: ${e.message}`); }
+      return { unreadable: true };
+    }
+  }
   function list({ projectId, kind, active } = {}) {
-    return ids().map(get).filter(Boolean)
-      .filter((j) => (projectId === undefined || j.projectId === projectId) && (!kind || j.kind === kind) && (active === undefined || active === !TERMINAL.has(j.status)))
-      .sort((a, b) => b.createdAt - a.createdAt);
+    const out = [];
+    for (const id of ids()) {
+      const { job, unreadable } = getSafe(id);
+      if (unreadable) { out.push({ id, status: 'unreadable' }); continue; }
+      if (!job) continue;
+      if ((projectId === undefined || job.projectId === projectId) && (!kind || job.kind === kind) && (active === undefined || active === !TERMINAL.has(job.status))) out.push(job);
+    }
+    return out.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
   }
   function create({ kind, projectId = null, parentId = null, capabilities = [] }) {
     if (!kind) throw Error('Job kind required');
@@ -191,7 +230,8 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
   function recover() {
     let count = 0;
     for (const id of ids()) {
-      const job = get(id);
+      const { job, unreadable } = getSafe(id);
+      if (unreadable) continue; // leave it for manual review; never delete silently
       if (!job || TERMINAL.has(job.status) || controllers.has(id) || (kinds && !kinds.includes(job.kind))) continue;
       append(id, 'job.interrupted', { reason: job.status === 'waiting_approval' ? 'The server restarted while waiting for approval; start again to be asked again.' : 'The server restarted before this finished.' });
       count++;
@@ -199,7 +239,12 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
     return count;
   }
   function prune() {
-    const all = ids().map(get).filter(Boolean);
+    const all = [];
+    for (const id of ids()) {
+      const { job, unreadable } = getSafe(id);
+      if (unreadable) continue; // leave it for manual review; never delete silently
+      if (job) all.push(job);
+    }
     const done = all.filter((j) => TERMINAL.has(j.status) && (!kinds || kinds.includes(j.kind))).sort((a, b) => b.updatedAt - a.updatedAt);
     for (const [i, j] of done.entries()) if (now() - j.updatedAt > retainMs || i >= maxJobs) fs.rmSync(file(j.id), { force: true });
   }

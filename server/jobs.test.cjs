@@ -167,3 +167,46 @@ test('assistant output replays after restart, clips UTF-8 safely, and survives i
   before.append(invalid, 'assistant.output', { text: '\uD800' });
   assert.equal(before.get(invalid).assistantOutput.text, '\uFFFD', 'malformed UTF-16 is normalized in the journal');
 });
+
+test('a torn last line is tolerated; corruption elsewhere in one journal never blocks another kind sharing the directory', async (t) => {
+  const dir = tmp(); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const research = createJobs({ dir, kinds: ['research'] });
+  const sources = createJobs({ dir, kinds: ['source'] });
+
+  // Torn last line: the process died mid-write of the final event. events() should
+  // ignore the partial trailing line and derive the job from what came before it.
+  const torn = research.create({ kind: 'research' });
+  research.append(torn, 'job.started');
+  research.append(torn, 'progress', { stage: 'reading' });
+  const journal = path.join(dir, 'jobs', torn + '.jsonl');
+  fs.appendFileSync(journal, '{"job":"' + torn + '","seq":3,"type":"progress","data":{"stage":"wri');
+  assert.equal(research.get(torn).status, 'running');
+  assert.equal(research.get(torn).stage, 'reading');
+
+  // Real corruption in the middle of a different kind's journal must still 409 on
+  // direct access, but must not stop recover/prune/list from doing their job for
+  // everything else in the shared directory.
+  const corrupt = sources.create({ kind: 'source' });
+  sources.append(corrupt, 'job.started');
+  fs.writeFileSync(path.join(dir, 'jobs', corrupt + '.jsonl'), 'not json at all\n{"job":"' + corrupt + '","seq":2,"type":"progress","data":{}}\n');
+  assert.throws(() => sources.get(corrupt), (e) => e.status === 409);
+
+  const running = sources.create({ kind: 'source' }); sources.append(running, 'job.started');
+  assert.equal(sources.recover(), 1, 'recover still interrupts the healthy job in the same directory');
+  assert.equal(sources.get(running).status, 'interrupted');
+
+  const kept = sources.create({ kind: 'source' }); sources.append(kept, 'job.completed', {});
+  sources.prune();
+  assert.ok(fs.existsSync(path.join(dir, 'jobs', corrupt + '.jsonl')), 'unreadable journals are never deleted silently');
+  assert.ok(fs.existsSync(path.join(dir, 'jobs', kept + '.jsonl')));
+
+  const listed = sources.list();
+  const entry = listed.find((j) => j.id === corrupt);
+  assert.deepEqual(entry, { id: corrupt, status: 'unreadable' });
+  assert.ok(listed.find((j) => j.id === running));
+  assert.ok(listed.find((j) => j.id === kept));
+
+  // create() for the healthy kind still works after prune runs over the corrupt file.
+  const created = sources.create({ kind: 'source' });
+  assert.equal(sources.get(created).status, 'queued');
+});
