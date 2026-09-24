@@ -36,10 +36,10 @@ function fixture() {
     removeChat: (chat) => removed.push(chat),
     store,
   });
-  const call = (method, path, body) => {
+  const call = (method, path, body, role = 'member') => {
     const req = Readable.from(body === undefined ? [] : [Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))]);
     req.method = method;
-    return routes(req, {}, { path, authn: { user: { id: 'u1' } } });
+    return routes(req, {}, { path, authn: { user: { id: 'u1', role } } });
   };
   return { call, sent, removed, projects, freeChats, histories, store, dir };
 }
@@ -108,4 +108,19 @@ test('the context meter reads null when nothing was recorded', async () => {
   const f = fixture();
   await f.call('GET', '/api/chats/c1/context-window');
   assert.deepEqual(f.sent.pop(), { status: 200, body: { meter: null } });
+});
+
+test('a member cannot save a Cowork mode on a free chat; it is coerced to Chat (#236)', async () => {
+  const f = fixture();
+  await f.call('POST', '/api/freechats', { chats: [{ id: 'fc', mode: 'cowork' }] });
+  assert.equal(f.sent.pop().status, 200);
+  assert.equal('mode' in f.freeChats.find((c) => c.id === 'fc'), false);
+});
+
+test('an admin free chat keeps its Cowork mode; anything else reads back as Chat (#236)', async () => {
+  const f = fixture();
+  await f.call('POST', '/api/freechats', { chats: [{ id: 'fc', mode: 'cowork' }, { id: 'fx', mode: 'shell' }, { id: 'fy' }] }, 'admin');
+  assert.equal(f.freeChats.find((c) => c.id === 'fc').mode, 'cowork');
+  assert.equal('mode' in f.freeChats.find((c) => c.id === 'fx'), false);
+  assert.equal('mode' in f.freeChats.find((c) => c.id === 'fy'), false);
 });

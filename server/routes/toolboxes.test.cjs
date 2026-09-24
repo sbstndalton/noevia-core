@@ -48,3 +48,54 @@ test('other paths and methods are left alone or refused', async () => {
   assert.equal(f.sent[0].status, 405);
   assert.equal(f.discoveries(), 0);
 });
+
+// ── #237: GET /api/toolboxes/permitted ──
+function permittedFixture() {
+  const sent = [], calls = [];
+  // Two tenants: each account sees only its own project, as the real getProject does.
+  const projects = { 'u-a': { pa: { id: 'pa' } }, 'u-b': { pb: { id: 'pb' } } };
+  const routes = createToolboxRoutes({
+    discoverMcpTools: async () => {}, toolboxSummaries: () => [], prefill: { targetMs: 1, stats: () => ({}) },
+    mcp: () => ({ enabled: false }), json: (res, status, body) => { sent.push({ status, body }); return true; },
+    permitted: ({ authn, projectId, mode }) => {
+      calls.push({ user: authn.user.id, projectId, mode });
+      const project = projectId ? projects[authn.user.id][projectId] : null;
+      if (projectId && !project) return null;
+      return { project, boxes: [{ id: 'core', owner: authn.user.id, mode }] };
+    },
+  });
+  const get = (user, query = '') => routes({ method: 'GET' }, {}, { path: '/api/toolboxes/permitted', authn: { user }, url: new URL(`http://x/api/toolboxes/permitted${query}`) });
+  return { get, sent, calls };
+}
+const A = { id: 'u-a', role: 'member' }, B = { id: 'u-b', role: 'admin' };
+
+test('permitted tools are computed per account and never served from another account\'s cache', async () => {
+  const f = permittedFixture();
+  await f.get(A, '?projectId=pa&mode=chat');
+  await f.get(B, '?mode=chat');
+  assert.equal(f.sent[0].body.boxes[0].owner, 'u-a');
+  assert.equal(f.sent[1].body.boxes[0].owner, 'u-b');
+  assert.equal(f.calls.length, 2);
+});
+
+test('another tenant\'s project is a 404, not an empty catalogue', async () => {
+  const f = permittedFixture();
+  await f.get(A, '?projectId=pb');
+  assert.equal(f.sent[0].status, 404);
+});
+
+test('the view is cached per account/project/mode and a mode change recomputes', async () => {
+  const f = permittedFixture();
+  await f.get(A, '?projectId=pa&mode=chat');
+  await f.get(A, '?projectId=pa&mode=chat');
+  assert.equal(f.calls.length, 1, 'a repeat inside the TTL is served from cache');
+  await f.get(A, '?projectId=pa&mode=cowork');
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.sent[2].body.mode, 'cowork');
+});
+
+test('an unknown mode is refused', async () => {
+  const f = permittedFixture();
+  await f.get(A, '?mode=code');
+  assert.equal(f.sent[0].status, 400);
+});

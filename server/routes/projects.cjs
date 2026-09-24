@@ -292,6 +292,9 @@ function createProjectRoutes({
                 preview: String(c.preview || '').slice(0, 200),
                 pinned: c.pinned === true,
                 archived: c.archived === true,
+                // The session's harness (#236); absent means Chat. Only an admin may run Cowork, so a
+                // member's saved 'cowork' is coerced to Chat rather than failing every turn.
+                ...(c.mode === 'cowork' && authn?.user?.role === 'admin' ? { mode: 'cowork' } : {}),
               })),
           );
           return json(res, 200, { ok: true });

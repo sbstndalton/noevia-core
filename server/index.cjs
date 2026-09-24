@@ -508,6 +508,13 @@ const { handleChat } = require('./chat.cjs').createChatHandler({
 const chatRoutes = require('./routes/chat.cjs').createChatRoutes({
   json, readBody, bodyCap: STORED_HISTORY_BYTES, rateLimited: (userId) => llmRateLimited(userId),
   diaryEnabled: (userId) => authService.diaryEnabled(userId), handleChat,
+  // Cowork sessions (#236) start a task on the existing code path; the route guards admin and the flag.
+  harnessEnabled: () => features.enabled('codeHarness'),
+  startCoworkTask: async (body) => {
+    const project = getProject(String(body.projectId));
+    if (!project) throw Object.assign(Error('project not found'), { status: 404, publicMessage: 'project not found' });
+    return codeService.start(currentWorkspace(), project, { repository: body.repository, prompt: body.message });
+  },
 });
 
 // Projects, sources and uploads (routes/projects.cjs). Background source jobs re-enter the router.
@@ -568,6 +575,19 @@ const toolboxRoutes = require('./routes/toolboxes.cjs').createToolboxRoutes({
   discoverMcpTools: () => discoverMcpTools(), toolboxSummaries, json,
   prefill: { targetMs: TOOL_PREFILL_TARGET_MS, stats: () => prefill.stats() },
   mcp: () => ({ enabled: mcpWiring.enabled(), state: mcpState, servers: MCP_SERVERS, manifest: MCP_TOOLBOX_MANIFEST }),
+  // The per-turn catalogue (#237). getProject is scoped to the signed-in account's workspace.
+  permitted: ({ authn, projectId, mode }) => {
+    const project = projectId ? getProject(projectId) : null;
+    if (projectId && !project) return null;
+    return { project, boxes: require('./toolboxes-permitted.cjs').computePermittedTools({
+      user: authn.user, project, mode, boxes: allToolboxes(),
+      manifest: mcpWiring.enabled() ? MCP_TOOLBOX_MANIFEST.filter((b) => toolboxOffered(b.id)) : [],
+      defaultToolboxes: DEFAULT_TOOLBOXES, connectorBoxes: CONNECTOR_BOXES, connected: connectedBoxes(authn.user),
+      oauthServerIds: oauthServerIds(), accountReady, policyMode: (u, t, w) => toolPolicy.mode(u, t, w), isWriteTool,
+      diaryEnabled: authService.diaryEnabled(authn.user.id), harnessEnabled: features.enabled('codeHarness'),
+      repositories: codeService.repositories().map((r) => r.id),
+    }) };
+  },
 });
 const mcpDirectoryRoutes = require('./routes/mcp-directory.cjs').createMcpDirectoryRoutes({
   json, readJson, auth: authService, servers: MCP_SERVERS, mcpState, directoryMcp, mcpOAuth,
@@ -623,7 +643,7 @@ async function handleRequestScoped(req, res) {
     if (await storageRoutes(req, res, { path: p, authn })) return;
     if (await approvalRoutes(req, res, { path: p, authn })) return;
 
-    if (await toolboxRoutes(req, res, { path: p, authn })) return;
+    if (await toolboxRoutes(req, res, { path: p, authn, url })) return;
 
     if (await chatListRoutes(req, res, { path: p, authn })) return;
 

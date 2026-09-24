@@ -39,7 +39,7 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
     retention.markSwept(dir);
   }
 
-  async function handle(req, res, { path: p }) {
+  async function handle(req, res, { path: p, authn }) {
     if (p === '/api/workspace') {
       try { sweepRetention(); } catch (e) { console.warn('[retention] sweep failed:', e?.message || e); }
       // PROJECTS is served raw everywhere else; here it crosses to the client,
@@ -71,6 +71,10 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
               preview: String(c.preview || '').slice(0, 200),
               pinned: c.pinned === true,
               archived: c.archived === true,
+              // The session's harness (#236); absent means Chat, as for every older chat. Only an
+              // admin may run Cowork, so a member's saved 'cowork' is coerced to Chat rather than
+              // planting a mode that would fail every turn.
+              ...(c.mode === 'cowork' && authn?.user?.role === 'admin' ? { mode: 'cowork' } : {}),
             }));
           const lists = require('../chat-lists.cjs');
           FREE_CHATS.splice(0, FREE_CHATS.length, ...lists.mergeChats(Array.from(FREE_CHATS), nextFreeChats, lists.readTombstones(currentWorkspace().dir)));
