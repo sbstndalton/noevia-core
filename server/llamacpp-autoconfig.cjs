@@ -119,7 +119,15 @@ function suggest({ meta, modelBytes, mmprojBytes = 0, budgetGib, current = {}, c
     pinnedGib = mmprojBytes / GIB + MMPROJ_COMPUTE_GIB + 7 * Math.max(0, ubatch - 512) * (m.blockCount || 0) * (m.embeddingLength || 0) / 1e9;
   }
   const native = m.contextLength || 0;
-  const candidates = [...new Set([...CTX_CANDIDATES, ...(native ? [native] : [])])].filter(c => !native || c <= native).sort((a, b) => a - b);
+  // Only offer context sizes the calibrator actually load-tests; snap to the largest qualified
+  // candidate at or below the model's native context instead of proposing the raw native value.
+  // If native sits below every qualified rung (e.g. an old 2048-ctx model), there is nothing
+  // verified to fall back to: report that plainly instead of silently suggesting an unverified
+  // context, and instead of letting an empty candidate list masquerade as "needs more memory".
+  if (native && native < CTX_CANDIDATES[0]) {
+    return { error: `This model's native context (${native}) is below the smallest supported context size (${CTX_CANDIDATES[0]}). Set the context manually and load-test it.` };
+  }
+  const candidates = CTX_CANDIDATES.filter(c => !native || c <= native).sort((a, b) => a - b);
   const rows = candidates.map(ctx => {
     const kvGib = (kvCacheBytes(m, ctx) + draftKvBytes(m, ctx)) / GIB;
     const totalGib = (modelGib + kvGib + pinnedGib + RESERVE_GIB) * SAFETY;

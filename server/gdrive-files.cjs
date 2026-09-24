@@ -25,6 +25,38 @@ const clean = (v, name, max = 1000) => {
 const quote = (s) => `'${s.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
 const fileId = (v) => { const id = clean(v, 'fileId', 200); if (!/^[\w-]+$/.test(id)) throw fail('fileId is not a Drive file id'); return id; };
 
+// Reads at most `max` bytes from a fetch Response, cancelling the underlying stream as soon as
+// the cap is hit so a multi-GB Drive file never gets buffered whole in process memory. Falls
+// back to arrayBuffer() for responses without a streaming body (e.g. simple test doubles).
+async function readCapped(r, max) {
+  if (typeof r.body?.getReader !== 'function') {
+    const buf = Buffer.from(await r.arrayBuffer());
+    return { bytes: buf.subarray(0, max), truncated: buf.length > max };
+  }
+  const reader = r.body.getReader();
+  const chunks = [];
+  let total = 0;
+  let truncated = false;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.length;
+      if (total > max) {
+        const keep = value.length - (total - max);
+        if (keep > 0) chunks.push(Buffer.from(value.subarray(0, keep)));
+        truncated = true;
+        await reader.cancel().catch(() => {});
+        break;
+      }
+      chunks.push(Buffer.from(value));
+    }
+  } finally {
+    try { reader.releaseLock(); } catch { /* already released */ }
+  }
+  return { bytes: Buffer.concat(chunks), truncated };
+}
+
 function driveFiles(drive) {
   const { call, request, api, upload } = drive;
   const list = async (q, { limit = 10, orderBy = 'modifiedTime desc' } = {}) => {
@@ -45,10 +77,12 @@ function driveFiles(drive) {
       const url = exportAs
         ? `${api}/files/${encodeURIComponent(meta.id)}/export?mimeType=${encodeURIComponent(exportAs)}`
         : `${api}/files/${encodeURIComponent(meta.id)}?alt=media`;
-      const r = await request(url);
-      if (!r.ok) throw fail(`Google Drive answered ${r.status}.`, 502);
-      const bytes = Buffer.from(await r.arrayBuffer());
-      return { meta, text: bytes.subarray(0, MAX_READ).toString('utf8'), truncated: bytes.length > MAX_READ };
+      // alt=media reads ask Drive to only send the first MAX_READ+1 bytes; export links (Docs,
+      // Sheets, Slides) don't reliably honor Range, so readCapped() below is the real backstop.
+      const r = await request(url, exportAs ? {} : { headers: { Range: `bytes=0-${MAX_READ}` } });
+      if (!r.ok && r.status !== 206) throw fail(`Google Drive answered ${r.status}.`, 502);
+      const { bytes, truncated } = await readCapped(r, MAX_READ);
+      return { meta, text: bytes.toString('utf8'), truncated };
     },
     async create({ name, content, mimeType }) {
       const type = typeof mimeType === 'string' && /^text\/[\w.+-]+$|^application\/json$/.test(mimeType) ? mimeType : 'text/plain';
