@@ -36,6 +36,7 @@ const OUTPUT_BATCH_BYTES = 1024, MAX_EARLY_FLUSHES = 30;
  */
 function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now = Date.now, log = () => {},
   files = defaultFiles, pinConfig = require('./code-harness-config.cjs').writeHarnessConfig,
+  pinnedPaths = require('./code-harness-config.cjs').cwdPinPaths,
   engine = () => ({ baseUrl: null, apiKey: null, contextTokens: undefined }) }) {
   /**
    * Start a task. `capabilities` is fixed here and never widens (§4): the job records it, and
@@ -48,12 +49,30 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
     const taskId = jobs.create({ kind: 'code', projectId, capabilities: [...new Set(capabilities)] });
 
     let workspace;
-    try { workspace = workspaces.claim({ taskId, repoPath, capabilities, domains }); }
+    try { workspace = workspaces.claim({ taskId, repoPath, capabilities, domains, pinned: pinnedPaths(harness) }); }
     catch (error) { jobs.append(taskId, 'job.failed', { error: String(error.message).slice(0, 500) }); throw error; }
 
     // Network is a capability like any other: no grant unless the task has it AND named domains.
     const wantsNetwork = capabilities.includes(ACTIONS.NETWORK) || capabilities.includes(ACTIONS.INSTALL);
-    const grant = egress && wantsNetwork && domains.length ? egress.grant({ taskId, domains }) : null;
+    let grant = null;
+    // Once, whichever path gets here first: the work's own `finally`, or the run failing around
+    // it (jobs.run records `job.started` before the work and `job.completed` after it, and
+    // either append can throw — a full disk — without the work's `finally` ever running).
+    let cleaned = false;
+    const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
+      try { if (grant) { egress.revoke(taskId); if (typeof egress.activity === 'function') egress.activity(taskId, { forget: true }); } }
+      catch (error) { log({ at: now(), taskId, event: 'code.cleanup_failed', what: 'network grant', error: String(error?.message || error) }); }
+      try { workspaces.release({ taskId }); }
+      catch (error) { log({ at: now(), taskId, event: 'code.cleanup_failed', what: 'workspace', error: String(error?.message || error) }); }
+    };
+    try { grant = egress && wantsNetwork && domains.length ? egress.grant({ taskId, domains }) : null; }
+    catch (error) {
+      cleanup();
+      try { jobs.append(taskId, 'job.failed', { error: String(error.message).slice(0, 500) }); } catch { /* the throw below says it */ }
+      throw error;
+    }
 
     // The whole body is inside the try: the grant and the worktree have to come back even when
     // something fails before the harness ever starts. Writing that first checkpoint touches the
@@ -117,10 +136,13 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
           ...(grant && typeof egress.activity === 'function' ? { network: egress.activity(taskId) } : {}) };
       } finally {
         // Whatever happened, the task stops being able to reach anything.
-        if (grant) { egress.revoke(taskId); if (typeof egress.activity === 'function') egress.activity(taskId, { forget: true }); }
-        workspaces.release({ taskId });
+        cleanup();
       }
-    }).catch(() => { /* jobs.run records the failure; nothing here should throw into the caller */ });
+    }).catch(() => {
+      // jobs.run records the failure when it can; when it could not even record the start, the
+      // work never ran, so the grant and the claim are given back here instead.
+      cleanup();
+    });
 
     return { taskId, branch: workspace.branch, workspace: workspace.path };
   }

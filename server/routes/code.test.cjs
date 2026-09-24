@@ -12,7 +12,7 @@ function harness({ enabled = true } = {}) {
     sandboxed: () => true,
     list: () => [], get: (ws, p, id) => ({ id }),
     start: async (ws, p, body) => { calls.push(['start', p.id, body]); return { taskId: 't', branch: 'noevia/task-t' }; },
-    decide: (ws, p, id, decision) => { calls.push(['decide', id, decision]); return { ok: true }; },
+    decide: (ws, p, id, decision, approvalId) => { calls.push(['decide', id, decision, approvalId]); return { ok: true }; },
     cancel: (ws, p, id) => { calls.push(['cancel', id]); return { id, status: 'cancelled' }; },
   };
   const route = createCodeRoutes({ service, features: { enabled: () => enabled },
@@ -45,10 +45,10 @@ test('an admin lists, starts, reads, approves and cancels', async () => {
   assert.equal(listed.body.sandboxed, true, 'the page says whether the harness is contained');
   assert.equal((await call('POST', '/api/projects/p1/code', 'admin', '{"repository":"noevia","prompt":"fix"}')).status, 202);
   assert.equal((await call('GET', `/api/projects/p1/code/${TASK}`)).body.id, TASK);
-  assert.deepEqual((await call('POST', `/api/projects/p1/code/${TASK}/approve`, 'admin', '{"decision":"approve"}')).body, { ok: true });
+  assert.deepEqual((await call('POST', `/api/projects/p1/code/${TASK}/approve`, 'admin', '{"decision":"approve","approvalId":"a-1"}')).body, { ok: true });
   assert.equal((await call('POST', `/api/projects/p1/code/${TASK}/cancel`)).body.status, 'cancelled');
   assert.deepEqual(calls.map((c) => c[0]), ['start', 'decide', 'cancel']);
-  assert.deepEqual(calls[1], ['decide', TASK, 'approve']);
+  assert.deepEqual(calls[1], ['decide', TASK, 'approve', 'a-1']);
 });
 
 test('bad requests are refused without reaching the service', async () => {

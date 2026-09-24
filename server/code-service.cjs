@@ -181,11 +181,15 @@ function createCodeService({ repos, connect, egress = null, engine = undefined, 
       return { ...started, repository: repo.id, capabilities, domains, harness: harnessId, promptPreparation: preparation.id,
         sharedContext: require('./shared-context.cjs').read(project).code };
     },
-    decide(workspace, project, taskId, decision) {
+    decide(workspace, project, taskId, decision, approvalId) {
       owned(workspace, project, taskId);
       if (!['approve', 'approve_all', 'deny'].includes(decision)) throw fail(400, 'Unknown decision');
-      const waiting = pendingFor(taskId);
-      if (!waiting) throw fail(409, 'That approval is no longer waiting.');
+      // The answer is for the card the person saw, named by its id — never "whatever this task
+      // is waiting on now". After a timeout, or with requests queued, the next one would
+      // otherwise be approved unseen, and "Allow for this task" would stand on its action class.
+      if (typeof approvalId !== 'string' || !approvalId) throw fail(400, 'Which approval is this answer for?');
+      const waiting = pending.get(approvalId);
+      if (!waiting || waiting.taskId !== taskId) throw fail(409, 'That approval is no longer waiting.');
       waiting.decide(decision);
       return { ok: true };
     },

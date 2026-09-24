@@ -268,18 +268,51 @@ function writeHarnessConfig({ cwd, home = null, owner = null, ...options }) {
   for (const file of pinned.files) {
     const root = roots[file.base];
     if (!root) throw Object.assign(Error(`The ${pinned.harness} harness needs a private home directory for its configuration.`), { status: 409 });
-    const target = nodePath.join(root, file.path);
-    if (!target.startsWith(nodePath.resolve(root) + nodePath.sep)) throw Error('Pinned file outside its root');
-    const created = [];
-    for (let dir = nodePath.dirname(target); dir !== root && !fs.existsSync(dir); dir = nodePath.dirname(dir)) created.unshift(dir);
-    for (const dir of created) { fs.mkdirSync(dir, { mode: 0o700 }); if (owner) fs.chownSync(dir, owner.uid, owner.gid); }
-    fs.writeFileSync(target, file.content, { mode: 0o600 });
-    if (owner) fs.chownSync(target, owner.uid, owner.gid);
+    writePinned(root, file.path, file.content, owner);
   }
   const first = pinned.files[0];
   return { file: first.path, files: pinned.files.map((f) => `${f.base === 'home' ? '~' : '.'}/${f.path}`),
     permission: pinned.permission, model: pinned.model, endpoint: pinned.endpoint };
 }
 
-module.exports = { configFor, pinFilesFor, writeHarnessConfig, claudeSecuritySettings,
+// The repository is not noevia's: a checkout can carry a symlink named `.claude` or
+// `opencode.json`, and noevia runs as root. Written through such a link, the engine key would
+// land wherever the repository pointed and then be handed to the harness uid. So nothing on the
+// way down may be a link, the target is replaced rather than written in place, and the final
+// open refuses to follow one even if it appeared in between.
+const refuse = (why) => Object.assign(Error(`Refused to pin the harness configuration: ${why}.`), { status: 409 });
+function writePinned(root, relative, content, owner) {
+  const base = nodePath.resolve(root);
+  const target = nodePath.join(base, relative);
+  if (!target.startsWith(base + nodePath.sep)) throw Error('Pinned file outside its root');
+  const parts = nodePath.relative(base, target).split(nodePath.sep);
+  let dir = base;
+  for (const part of parts.slice(0, -1)) {
+    dir = nodePath.join(dir, part);
+    let st = null;
+    try { st = fs.lstatSync(dir); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+    if (st && st.isSymbolicLink()) throw refuse(`${nodePath.relative(base, dir)} is a symbolic link`);
+    if (st && !st.isDirectory()) throw refuse(`${nodePath.relative(base, dir)} is not a directory`);
+    if (!st) { fs.mkdirSync(dir, { mode: 0o700 }); if (owner) fs.lchownSync(dir, owner.uid, owner.gid); }
+  }
+  let st = null;
+  try { st = fs.lstatSync(target); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  if (st && st.isSymbolicLink()) throw refuse(`${relative} is a symbolic link`);
+  if (st && st.isDirectory()) throw refuse(`${relative} is a directory`);
+  if (st) fs.unlinkSync(target);
+  const { O_WRONLY, O_CREAT, O_EXCL, O_TRUNC, O_NOFOLLOW } = fs.constants;
+  const fd = fs.openSync(target, O_WRONLY | O_CREAT | O_EXCL | O_TRUNC | O_NOFOLLOW, 0o600);
+  try { fs.writeFileSync(fd, content); } finally { fs.closeSync(fd); }
+  if (owner) fs.lchownSync(target, owner.uid, owner.gid);
+}
+
+/** The pinned files a harness writes into the working tree, which must never be committed. */
+function cwdPinPaths(harness) {
+  try {
+    return pinFilesFor({ harness, model: 'm', engine: 'http://engine.invalid/v1' }).files
+      .filter((f) => f.base === 'cwd').map((f) => f.path);
+  } catch { return []; }
+}
+
+module.exports = { configFor, pinFilesFor, writeHarnessConfig, cwdPinPaths, claudeSecuritySettings,
   PERMISSION, EDIT_TOOLS, PI_READ_TOOLS, DSH_NO_ASK_TOOLS, DSH_DISABLED };

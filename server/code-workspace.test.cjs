@@ -445,6 +445,8 @@ test('a registered repository owned by another user is used, and any other git r
     if (args[0] === 'rev-parse' && !env?.GIT_CONFIG_GLOBAL) {
       throw Object.assign(Error('git failed'), { stderr: "fatal: detected dubious ownership in repository at '/workspaces/repos/scratch'" });
     }
+    if (args.includes('--git-path')) return path.join(dir, 'exclude');
+    if (args[0] === 'worktree') fs.mkdirSync(args.at(-1), { recursive: true });
     return '';
   } });
   const claimed = ws.claim({ taskId: ids(1), repoPath });
@@ -541,4 +543,54 @@ test('a clean clone with a harness-set identity still releases and commits', () 
   const released = ws.release({ taskId: ids(1) });
   assert.equal(released.status, 'released', released.error);
   assert.equal(execFileSync('git', ['show', `${claim.branch}:a.txt`], { cwd: repo, encoding: 'utf8' }), 'fine');
+});
+
+// The pinned harness configuration carries the engine key: it must never reach a commit.
+const trackedGit = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
+
+test('in worktree mode the pinned config is excluded through the real exclude file, so `git add -A` skips it', () => {
+  const repo = repoWith();
+  const { ws } = workspaces();
+  const claim = ws.claim({ taskId: ids(1), repoPath: repo, pinned: ['opencode.json', '.claude/settings.local.json'] });
+  assert.equal(fs.lstatSync(path.join(claim.path, '.git')).isFile(), true, 'a worktree .git is a file');
+  fs.writeFileSync(path.join(claim.path, 'opencode.json'), '{"key":"synthetic-key"}');
+  fs.mkdirSync(path.join(claim.path, '.claude'));
+  fs.writeFileSync(path.join(claim.path, '.claude', 'settings.local.json'), '{"key":"synthetic-key"}');
+  fs.writeFileSync(path.join(claim.path, 'a.txt'), 'work');
+  trackedGit(claim.path, 'add', '-A');
+  assert.equal(trackedGit(claim.path, 'diff', '--cached', '--name-only'), 'a.txt');
+  // Claiming again does not pile up duplicate lines in the shared exclude file.
+  ws.release({ taskId: ids(1) });
+  ws.claim({ taskId: ids(2), repoPath: repo, pinned: ['opencode.json'] });
+  const exclude = fs.readFileSync(path.join(repo, '.git', 'info', 'exclude'), 'utf8');
+  assert.equal(exclude.split('\n').filter((l) => l === '/opencode.json').length, 1);
+});
+
+test('a repository that already tracks a pinned config path is refused, and nothing is left behind', () => {
+  for (const mode of ['worktree', 'clone']) {
+    const repo = repoWith({ 'a.txt': 'a', 'opencode.json': '{}' });
+    const shared = temp('noevia-shared-');
+    const ws = createCodeWorkspaces({ dir: temp('noevia-ws-'), treeRoot: shared, mode, epoch: 'test' });
+    assert.throws(() => ws.claim({ taskId: ids(1), repoPath: repo, pinned: ['opencode.json'] }),
+      (e) => e.status === 409 && /tracks opencode\.json/.test(e.message), mode);
+    assert.deepEqual(fs.readdirSync(shared).filter((n) => n !== '.harness-home'), [], mode);
+    assert.equal(fs.existsSync(path.join(shared, '.harness-home', ids(1))), false, mode);
+    assert.equal(ws.get(ids(1)), null, 'no claim is recorded');
+    // The branch is free for the next task: the refused worktree does not hold it.
+    assert.doesNotThrow(() => ws.claim({ taskId: ids(2), repoPath: repo }), mode);
+  }
+});
+
+test('in clone mode the release auto-commit never carries the pinned config, even force-added', () => {
+  const repo = repoWith();
+  const ws = createCodeWorkspaces({ dir: temp('noevia-ws-'), treeRoot: temp('noevia-shared-'), mode: 'clone', epoch: 'test' });
+  const claim = ws.claim({ taskId: ids(1), repoPath: repo, pinned: ['.qwen/settings.json'] });
+  fs.mkdirSync(path.join(claim.path, '.qwen'));
+  fs.writeFileSync(path.join(claim.path, '.qwen', 'settings.json'), '{"key":"synthetic-key"}');
+  trackedGit(claim.path, 'add', '-f', '.qwen/settings.json');
+  fs.writeFileSync(path.join(claim.path, 'a.txt'), 'work');
+  const released = ws.release({ taskId: ids(1) });
+  assert.equal(released.status, 'released', released.error);
+  const files = trackedGit(repo, 'ls-tree', '-r', '--name-only', claim.branch).split('\n');
+  assert.deepEqual(files, ['a.txt']);
 });

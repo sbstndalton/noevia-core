@@ -2,7 +2,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
-const { configFor, pinFilesFor, writeHarnessConfig, PERMISSION, EDIT_TOOLS } = require('./code-harness-config.cjs');
+const { configFor, pinFilesFor, writeHarnessConfig, cwdPinPaths, PERMISSION, EDIT_TOOLS } = require('./code-harness-config.cjs');
 
 const base = { harness: 'opencode', model: 'Ornith-1.5-9B-Q5_K_M', engine: 'http://llama:8080/v1' };
 
@@ -49,15 +49,15 @@ test('the file lands in the task workspace, owned by whoever the harness runs as
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-harness-config-'));
   t.after(() => fs.rmSync(cwd, { recursive: true, force: true }));
   const chowned = [];
-  const realChown = fs.chownSync;
-  t.mock.method(fs, 'chownSync', (file, uid, gid) => { chowned.push([path.basename(file), uid, gid]); });
+  const realChown = fs.lchownSync;
+  t.mock.method(fs, 'lchownSync', (file, uid, gid) => { chowned.push([path.basename(file), uid, gid]); });
   const record = writeHarnessConfig({ ...base, cwd, owner: { uid: 1000, gid: 1000 } });
   assert.equal(record.file, 'opencode.json');
   assert.deepEqual(record.permission, { edit: 'ask', bash: 'ask', webfetch: 'ask' });
   assert.deepEqual(chowned, [['opencode.json', 1000, 1000]]);
   const written = JSON.parse(fs.readFileSync(path.join(cwd, 'opencode.json'), 'utf8'));
   assert.equal(written.permission.bash, 'ask');
-  assert.equal(realChown === fs.chownSync, false);
+  assert.equal(realChown === fs.lchownSync, false);
 });
 
 test('an api key is written only when the deployment has one, and never invented', () => {
@@ -131,7 +131,7 @@ test('home-based harnesses need the private home and write everything into it, o
   const cwd = path.join(root, 'tree'), home = path.join(root, 'home'); fs.mkdirSync(cwd); fs.mkdirSync(home);
   assert.throws(() => writeHarnessConfig({ ...base, harness: 'pi', cwd }), (e) => e.status === 409 && /home/.test(e.message));
   const chowned = [];
-  t.mock.method(fs, 'chownSync', (file) => { chowned.push(path.relative(root, file)); });
+  t.mock.method(fs, 'lchownSync', (file) => { chowned.push(path.relative(root, file)); });
   const record = writeHarnessConfig({ ...base, harness: 'claude-code', cwd, home, owner: { uid: 1000, gid: 1000 } });
   assert.deepEqual(record.files, ['./.claude/settings.local.json', '~/.claude/settings.json']);
   assert.ok(fs.existsSync(path.join(cwd, '.claude/settings.local.json')) && fs.existsSync(path.join(home, '.claude/settings.json')));
@@ -185,4 +185,40 @@ test('DeepSeek Harness gate: reads pass, everything else, including tools it has
   for (const name of ['bash', 'write', 'edit', 'web_fetch', 'subagent', 'workflow', 'some_future_tool']) {
     assert.equal((await handler({ name }, () => passed)).kind, 'ask', name);
   }
+});
+
+test('a repository that links a config path elsewhere is refused, and nothing is written outside', (t) => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-harness-link-'));
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-harness-outside-'));
+  t.after(() => { fs.rmSync(cwd, { recursive: true, force: true }); fs.rmSync(outside, { recursive: true, force: true }); });
+  fs.symlinkSync(outside, path.join(cwd, '.claude'));
+  assert.throws(() => writeHarnessConfig({ ...base, harness: 'claude-code', apiKey: 'synthetic-key', cwd, home: cwd }),
+    (e) => e.status === 409 && /\.claude is a symbolic link/.test(e.message));
+  assert.deepEqual(fs.readdirSync(outside), []);
+
+  // A link AS the file is refused too, and its target is left alone.
+  const cwd2 = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-harness-link2-'));
+  t.after(() => fs.rmSync(cwd2, { recursive: true, force: true }));
+  const victim = path.join(outside, 'victim');
+  fs.writeFileSync(victim, 'untouched');
+  fs.symlinkSync(victim, path.join(cwd2, 'opencode.json'));
+  assert.throws(() => writeHarnessConfig({ ...base, apiKey: 'synthetic-key', cwd: cwd2 }), /opencode\.json is a symbolic link/);
+  assert.equal(fs.readFileSync(victim, 'utf8'), 'untouched');
+});
+
+test('an existing config file is replaced, not written through', (t) => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-harness-replace-'));
+  t.after(() => fs.rmSync(cwd, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(cwd, 'opencode.json'), '{"permission":"allow"}');
+  writeHarnessConfig({ ...base, cwd });
+  const after = fs.statSync(path.join(cwd, 'opencode.json'));
+  assert.equal(JSON.parse(fs.readFileSync(path.join(cwd, 'opencode.json'), 'utf8')).permission.bash, 'ask');
+  assert.equal(after.mode & 0o777, 0o600);
+});
+
+test('the working-tree paths each harness pins are known up front', () => {
+  assert.deepEqual(cwdPinPaths('opencode'), ['opencode.json']);
+  assert.deepEqual(cwdPinPaths('claude-code'), ['.claude/settings.local.json']);
+  assert.deepEqual(cwdPinPaths('qwen-code'), ['.qwen/settings.json']);
+  assert.deepEqual(cwdPinPaths('pi'), []);
 });

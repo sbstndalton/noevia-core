@@ -435,6 +435,53 @@ test('a failure before the harness starts still gives back the workspace and the
   assert.ok(workspaces.claim({ taskId: '00000000-0000-4000-8000-000000000002', repoPath: held.repo, branch: held.branch }));
 });
 
+test('a run that cannot even record its start still gives back the workspace and the network', async () => {
+  // jobs.run appends `job.started` before the work and outside its try: a full disk there used
+  // to skip the work's finally entirely, leaving the proxy token valid and the branch claimed.
+  const dir = temp('noevia-hjobs-');
+  const jobs = createJobs({ dir });
+  const workspaces = createCodeWorkspaces({ dir, epoch: 'test' });
+  const revoked = [];
+  const egress = { grant: () => ({ token: 'secret' }), revoke: (id) => { revoked.push(id); return 1; } };
+  let failing = false;
+  // jobs.run's shape: the append that throws happens inside run, before `work` is ever called.
+  const brokenJobs = { ...jobs, run: async () => { failing = true; throw new Error('ENOSPC: no space left on device'); } };
+  const harness = createCodeHarness({ jobs: brokenJobs, workspaces, egress, engine: () => ({ baseUrl: 'http://engine.test/v1', model: 'synthetic-coder' }), askApproval: async () => 'deny' });
+  let connected = false;
+  const started = await harness.start({
+    repoPath: repo(), prompt: 'fix', capabilities: [ACTIONS.NETWORK], domains: ['a.test'],
+    connect: async () => { connected = true; return { agent: {}, prompt: async () => ({ stopReason: 'end_turn' }) }; },
+  });
+  for (let i = 0; i < 200 && workspaces.get(started.taskId)?.status === 'held'; i++) await new Promise((r) => setTimeout(r, 5));
+  assert.equal(failing, true);
+  assert.equal(connected, false, 'the harness never started');
+  assert.deepEqual(revoked, [started.taskId], 'the proxy token must not outlive the task');
+  assert.equal(workspaces.get(started.taskId).status, 'released');
+});
+
+test('the real jobs.run failing to append job.started triggers the same cleanup', async () => {
+  const dir = temp('noevia-hjobs-');
+  const jobs = createJobs({ dir });
+  const workspaces = createCodeWorkspaces({ dir, epoch: 'test' });
+  const revoked = [];
+  const egress = { grant: () => ({ token: 'secret' }), revoke: (id) => { revoked.push(id); return 1; } };
+  // createJobs' run calls its own closure-bound append, so the disk is what has to fail: the
+  // job's log file is replaced by a directory the moment the run begins.
+  const harness = createCodeHarness({ jobs: { ...jobs, run: (id, work) => {
+    const file = path.join(dir, 'jobs', id + '.jsonl');
+    const found = fs.existsSync(file) ? file : fs.readdirSync(dir, { recursive: true }).map((n) => path.join(dir, n)).find((n) => n.endsWith(id + '.jsonl'));
+    fs.rmSync(found); fs.mkdirSync(found);
+    return jobs.run(id, work);
+  } }, workspaces, egress, engine: () => ({ baseUrl: 'http://engine.test/v1', model: 'synthetic-coder' }), askApproval: async () => 'deny' });
+  const started = await harness.start({
+    repoPath: repo(), prompt: 'fix', capabilities: [ACTIONS.NETWORK], domains: ['a.test'],
+    connect: async () => ({ agent: {}, prompt: async () => ({ stopReason: 'end_turn' }) }),
+  });
+  for (let i = 0; i < 200 && workspaces.get(started.taskId)?.status === 'held'; i++) await new Promise((r) => setTimeout(r, 5));
+  assert.deepEqual(revoked, [started.taskId]);
+  assert.equal(workspaces.get(started.taskId).status, 'released');
+});
+
 test('usage is taken from the harness’s own usage_update, where the real one puts it', async () => {
   const r = await run({
     script: async (h) => {

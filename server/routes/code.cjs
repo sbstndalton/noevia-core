@@ -4,7 +4,7 @@
 //   GET  /api/projects/:id/code                                  -> { repositories, capabilities, tasks }
 //   POST /api/projects/:id/code        { repository, prompt, capabilities?, domains?, model? } -> 202
 //   GET  /api/projects/:id/code/:task                            -> task (incl. a waiting approval)
-//   POST /api/projects/:id/code/:task/approve  { decision }       -> { ok }
+//   POST /api/projects/:id/code/:task/approve  { decision, approvalId } -> { ok }
 //   POST /api/projects/:id/code/:task/cancel                      -> task
 const PATTERN = /^\/api\/projects\/([^/]+)\/code(?:\/([0-9a-f-]{36}))?(?:\/(approve|cancel))?$/;
 
@@ -35,7 +35,7 @@ function createCodeRoutes({ service, features, getProject, workspace, json, read
       if (req.method !== 'POST') return send(405, { error: 'method not allowed' });
       if (action === 'cancel') return send(200, service.cancel(ws, project, taskId));
       const body = await readJson(req);
-      return send(200, service.decide(ws, project, taskId, String(body?.decision || '')));
+      return send(200, service.decide(ws, project, taskId, String(body?.decision || ''), String(body?.approvalId || '')));
     } catch (error) {
       if (error instanceof SyntaxError) return send(400, { error: 'invalid JSON' });
       return send(error.status || 500, { error: error.publicMessage || (error.status ? error.message : 'Code request failed') });

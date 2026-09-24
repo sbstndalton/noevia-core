@@ -103,6 +103,12 @@ function hostileReason(tree, run, env) {
   return null;
 }
 
+/** Relative, plain paths only: they are handed to git and joined onto the tree. */
+function pinnedPaths(list) {
+  return (Array.isArray(list) ? list : []).map(String)
+    .filter((p) => p && !path.isAbsolute(p) && !p.split(/[\\/]/).includes('..') && /^[\w./-]+$/.test(p));
+}
+
 function defaultRun(args, cwd, env = {}) {
   return execFileSync('git', args, { cwd, env: { ...process.env, ...env }, encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000 }).trim();
@@ -173,7 +179,7 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
    * Take the workspace for one task. Refuses a second live claim on the same repository and
    * branch — that is the "one writer" rule — and refuses to reuse a task id.
    */
-  function claim({ taskId, repoPath, branch = null, capabilities = [], domains = [] }) {
+  function claim({ taskId, repoPath, branch = null, capabilities = [], domains = [], pinned = [] }) {
     const id = checkId(taskId);
     if (read(id)) throw Object.assign(Error('This task already has a workspace'), { status: 409 });
     let repo;
@@ -218,21 +224,56 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
       // worktree path itself must be new, which `git worktree add` enforces.
       run(['worktree', 'add', '-B', name, tree], repo, gitEnv());
     }
+    // Anything that fails from here on takes the half-made workspace with it.
+    const undo = () => {
+      if (mode === 'clone') { try { rm(tree); } catch { /* the refusal is what matters */ } }
+      else {
+        try { run([...HOSTILE_OFF, 'worktree', 'remove', '--force', tree], repo, gitEnv()); } catch { try { rm(tree); } catch { /* likewise */ } }
+        try { run([...HOSTILE_OFF, 'worktree', 'prune'], repo, gitEnv()); } catch { /* best effort */ }
+      }
+      try { rm(home); } catch { /* likewise */ }
+    };
+    const pins = pinnedPaths(pinned);
+    // The harness configuration noevia writes into the tree carries the engine key. A repository
+    // that already tracks one of those paths would have it overwritten and then committed (by
+    // the agent, or by the release below), so such a repository is refused up front.
+    if (pins.length) {
+      let tracked = '';
+      try { tracked = run([...HOSTILE_OFF, 'ls-files', '-z', '--', ...pins], tree, gitEnv()); }
+      catch (error) { undo(); throw Object.assign(Error(gitReason(error)), { status: 400 }); }
+      const names = tracked.split('\0').filter(Boolean);
+      if (names.length) {
+        undo();
+        throw Object.assign(Error(`This repository tracks ${names.slice(0, 3).join(', ')}, which noevia writes the harness configuration (and its key) into. Remove it from the repository to run this harness.`), { status: 409 });
+      }
+    }
+    // Harness state and the pinned configuration are ignored rather than committed. A worktree's
+    // `.git` is a FILE, so the exclude file is wherever git says it is, not `<tree>/.git/info`;
+    // for a worktree that is the repository's own (shared) exclude. Not being able to write it
+    // means an agent's `git add -A` would commit the key, so the claim fails instead.
+    try {
+      const where = run([...HOSTILE_OFF, 'rev-parse', '--git-path', 'info/exclude'], tree, gitEnv());
+      if (!where) throw Error('git did not say where its exclude file is');
+      const excludeFile = path.resolve(tree, where);
+      const lines = [...HARNESS_LEAVINGS, ...pins.map((p) => '/' + p)];
+      let current = '';
+      try { current = fs.readFileSync(excludeFile, 'utf8'); } catch { /* first use */ }
+      const missing = lines.filter((l) => !current.split('\n').includes(l));
+      if (missing.length) {
+        fs.mkdirSync(path.dirname(excludeFile), { recursive: true });
+        fs.appendFileSync(excludeFile, `\n# noevia: harness state, not the task's work\n${missing.join('\n')}\n`);
+      }
+    } catch (e) {
+      undo();
+      throw Object.assign(Error(`Could not keep the harness configuration out of git: ${String(e.message).split('\n')[0]}`), { status: 500 });
+    }
     // Hand it to whoever runs the harness. Done after the tree exists so git's own files are
     // covered. A deployment whose harness runs as noevia has nothing to hand over.
-    // Belt and braces: a harness that writes into the working directory anyway is ignored
-    // rather than committed. `info/exclude` is local to this clone and never travels.
-    try {
-      const excludeFile = path.join(tree, '.git', 'info', 'exclude');
-      fs.mkdirSync(path.dirname(excludeFile), { recursive: true });
-      fs.appendFileSync(excludeFile, `\n# noevia: harness state, not the task's work\n${HARNESS_LEAVINGS.join('\n')}\n`);
-    } catch { /* a worktree keeps its exclude in the parent repo; not worth failing a claim over */ }
     if (owner) {
       try { chown(tree, owner.uid, owner.gid); chown(home, owner.uid, owner.gid); }
       catch (e) {
         // Better to refuse than to start a harness that cannot write the tree it was given.
-        try { rm(tree); } catch { /* the refusal is what matters */ }
-        try { rm(home); } catch { /* likewise */ }
+        undo();
         throw Object.assign(Error(`Could not hand the workspace to the harness user: ${e.message}`), { status: 500 });
       }
     }
@@ -242,7 +283,17 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
       // GIT_CONFIG_* environment on purpose, so it cannot be worked around from the outside.
       owner: owner ? { ...owner } : null,
       noevia: typeof process.getuid === 'function' ? { uid: process.getuid(), gid: process.getgid() } : null,
-      capabilities: [...capabilities], domains: [...domains], epoch, claimedAt: now() });
+      capabilities: [...capabilities], domains: [...domains], pinned: pins, epoch, claimedAt: now() });
+  }
+
+  /** Delete the pinned config files from a released tree, never following a link. */
+  function dropPinned(record) {
+    for (const rel of pinnedPaths(record.pinned || [])) {
+      const target = path.join(record.path, rel);
+      let st; try { st = fs.lstatSync(target); } catch { continue; }
+      if (st.isDirectory()) throw Error(`${rel} is a directory`);
+      fs.unlinkSync(target);
+    }
   }
 
   /**
@@ -310,6 +361,14 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
         return write({ ...record, status: 'stuck', releasedAt: now(),
           error: `Refused to release the workspace: ${hostile}. It was left in place for inspection.` });
       }
+      // The pinned configuration holds the engine key and is never the task's work. Removed
+      // before anything is staged, so the auto-commit below cannot carry it even if the
+      // harness un-ignored or force-added it.
+      try { dropPinned(record); }
+      catch (e) {
+        return write({ ...record, status: 'stuck', releasedAt: now(),
+          error: `Could not remove the harness configuration before saving: ${e.message}` });
+      }
       try {
         if (run([...HOSTILE_OFF, 'status', '--porcelain'], record.path, gitEnv())) {
           run([...HOSTILE_OFF, 'add', '--all'], record.path, gitEnv());
@@ -336,6 +395,7 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
       if (record.home) { try { rm(record.home); } catch { /* nothing of the task's is in there */ } }
       if (removed && removeBranch) { try { run(['branch', '-D', record.branch], record.repo, gitEnv()); } catch { /* keep going */ } }
     } else {
+      try { dropPinned(record); } catch { /* the tree is removed next either way */ }
       try { run([...HOSTILE_OFF, 'worktree', 'remove', '--force', record.path], record.repo, gitEnv()); }
       catch (e) { removed = false; error = e.message; }
       try { run([...HOSTILE_OFF, 'worktree', 'prune'], record.repo, gitEnv()); } catch { /* best effort */ }

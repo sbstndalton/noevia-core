@@ -124,9 +124,10 @@ test('an approval reaches the waiting task, and an unknown decision is refused',
   assert.ok(waiting.approval, 'the task reports what it is waiting for');
   assert.equal(waiting.approval.action, 'edit_file');
   assert.throws(() => svc.decide(ws, project, started.taskId, 'maybe'), /Unknown decision/);
-  assert.deepEqual(svc.decide(ws, project, started.taskId, 'approve'), { ok: true });
+  assert.throws(() => svc.decide(ws, project, started.taskId, 'approve'), /Which approval/);
+  assert.deepEqual(svc.decide(ws, project, started.taskId, 'approve', waiting.approval.id), { ok: true });
   assert.deepEqual(await ask, { outcome: 'selected', optionId: 'y' });
-  assert.throws(() => svc.decide(ws, project, started.taskId, 'approve'), /no longer waiting/);
+  assert.throws(() => svc.decide(ws, project, started.taskId, 'approve', waiting.approval.id), /no longer waiting/);
   await settle(svc, ws, started.taskId);
 });
 
@@ -155,10 +156,11 @@ test('cancelling refuses whatever was waiting, so no card can be answered afterw
   });
   const started = await svc.start(ws, project, { repository: 'noevia', prompt: 'fix', capabilities: ['edit_file'] });
   for (let i = 0; i < 200 && !svc.get(ws, project, started.taskId)?.approval; i++) await new Promise((r) => setTimeout(r, 5));
+  const seen = svc.get(ws, project, started.taskId).approval.id;
   svc.cancel(ws, project, started.taskId);
   assert.deepEqual(await ask, { outcome: 'selected', optionId: 'n' }, 'the harness is told no, not left hanging');
   assert.equal(svc.get(ws, project, started.taskId).approval, null);
-  assert.throws(() => svc.decide(ws, project, started.taskId, 'approve'), /no longer waiting/);
+  assert.throws(() => svc.decide(ws, project, started.taskId, 'approve', seen), /no longer waiting/);
 });
 
 test('the listed task carries no host path and no repository location', async () => {
@@ -191,10 +193,12 @@ test('two tasks waiting at once each get their own answer', async () => {
     await new Promise((r) => setTimeout(r, 5));
   }
   assert.ok(svc.get(ws, one, a.taskId).approval && svc.get(ws, two, b.taskId).approval, 'both are waiting');
-  svc.decide(ws, one, a.taskId, 'approve');
+  assert.throws(() => svc.decide(ws, one, a.taskId, 'approve', svc.get(ws, two, b.taskId).approval.id),
+    (e) => e.status === 409, 'another task\'s approval id cannot be answered through this task');
+  svc.decide(ws, one, a.taskId, 'approve', svc.get(ws, one, a.taskId).approval.id);
   assert.deepEqual(await asks.a, { outcome: 'selected', optionId: 'y' });
   assert.ok(svc.get(ws, two, b.taskId).approval, 'the other task is still waiting for its own answer');
-  svc.decide(ws, two, b.taskId, 'deny');
+  svc.decide(ws, two, b.taskId, 'deny', svc.get(ws, two, b.taskId).approval.id);
   assert.deepEqual(await asks.b, { outcome: 'selected', optionId: 'n' });
 });
 
@@ -260,4 +264,37 @@ test('without the egress proxy, network and installs are never granted, and the 
   const online = await withProxy.svc.start(withProxy.ws, project, { repository: 'noevia', prompt: 'x',
     capabilities: ['read_repository', 'network'], domains: ['registry.npmjs.org'] });
   assert.deepEqual(online.capabilities, ['read_repository', 'network']);
+});
+
+test('an answer names the card it was for: an expired approval is a 409, and the next one is untouched', async () => {
+  const asks = [];
+  let release;
+  const { svc, ws } = service({
+    timeoutMs: 150,
+    connect: async ({ handlers }) => ({ prompt: async () => {
+      const opts = [{ optionId: 'y', kind: 'allow_once' }, { optionId: 'n', kind: 'reject_once' }];
+      asks.push(handlers.requestPermission({ toolCall: { kind: 'edit', title: 'first', locations: [] }, options: opts }));
+      await asks[0];
+      asks.push(handlers.requestPermission({ toolCall: { kind: 'edit', title: 'second', locations: [] }, options: opts }));
+      await new Promise((r) => { release = r; });
+      return { stopReason: 'end_turn' };
+    } }),
+  });
+  const started = await svc.start(ws, project, { repository: 'noevia', prompt: 'fix', capabilities: ['edit_file'] });
+  let first = null;
+  for (let i = 0; i < 200 && !(first = svc.get(ws, project, started.taskId)?.approval); i++) await new Promise((r) => setTimeout(r, 2));
+  assert.equal(first.title, 'first');
+  // The approval timer is unref'd, so something has to keep the loop alive while it runs out.
+  const alive = setInterval(() => {}, 10);
+  let firstAnswer;
+  try { firstAnswer = await asks[0]; } finally { clearInterval(alive); }
+  assert.deepEqual(firstAnswer, { outcome: 'selected', optionId: 'n' }, 'the first timed out as a refusal');
+  let second = null;
+  for (let i = 0; i < 200 && !(second = svc.get(ws, project, started.taskId)?.approval); i++) await new Promise((r) => setTimeout(r, 2));
+  assert.equal(second.title, 'second');
+  assert.notEqual(second.id, first.id);
+  assert.throws(() => svc.decide(ws, project, started.taskId, 'approve_all', first.id), (e) => e.status === 409);
+  assert.equal(svc.get(ws, project, started.taskId).approval?.id, second.id, 'the unseen request is still waiting');
+  release();
+  await settle(svc, ws, started.taskId);
 });
