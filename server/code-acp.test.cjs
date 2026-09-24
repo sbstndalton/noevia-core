@@ -264,3 +264,10 @@ test('cancelling while an approval is pending does not crash the process with an
     assert.deepEqual(unhandled, [], 'no unhandled rejection escapes');
   } finally { process.off('unhandledRejection', onUnhandled); }
 });
+
+test('the agent env pins curl and wget away from rc files in its HOME (#224)', () => {
+  const { agentEnv } = require('./code-acp.cjs');
+  const env = agentEnv({ cwd: '/w', home: '/h', env: { WGETRC: '/h/.wgetrc', CURL_HOME: '/h' } });
+  assert.equal(env.WGETRC, '/dev/null');
+  assert.equal(env.CURL_HOME, '/nonexistent');
+});

@@ -288,6 +288,18 @@ test('a task that committed nothing releases cleanly', () => {
   assert.equal(fs.existsSync(claim.path), false);
 });
 
+test('releasing a released clone again is a no-op, not a flip to stuck (#146)', () => {
+  const repo = repoWith();
+  const ws = createCodeWorkspaces({ dir: temp('noevia-ws-'), treeRoot: temp('noevia-shared-'), mode: 'clone', epoch: 'test' });
+  ws.claim({ taskId: ids(1), repoPath: repo });
+  const first = ws.release({ taskId: ids(1) });
+  assert.equal(first.status, 'released');
+  const second = ws.release({ taskId: ids(1) });
+  assert.equal(second.status, 'released');
+  assert.equal(second.releasedAt, first.releasedAt, 'the record is left untouched');
+  assert.equal(ws.get(ids(1)).status, 'released');
+});
+
 test('work that cannot be saved keeps the clone and says so', () => {
   const repo = repoWith();
   const real = require('node:child_process').execFileSync;

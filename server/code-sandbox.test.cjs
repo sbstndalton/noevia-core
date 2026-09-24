@@ -231,3 +231,76 @@ test('nothing after a refusal or an exited agent can start another agent', async
   assert.equal(logs.filter((l) => l === 'refused: start line too long').length, 1, 'refused once, not per chunk');
   await sup.close();
 });
+
+// ---- #115: the supervisor's own limits, with a fake spawn ----
+function fakeSpawn() {
+  const { EventEmitter } = require('node:events');
+  const { PassThrough } = require('node:stream');
+  const spawned = [];
+  const fn = () => {
+    const child = new EventEmitter();
+    child.pid = 90000 + spawned.length;
+    child.stdin = new PassThrough(); child.stdout = new PassThrough(); child.stderr = new PassThrough();
+    spawned.push(child);
+    return child;
+  };
+  return { fn, spawned };
+}
+const startLine = (cwd) => JSON.stringify({ noevia: 'start', cwd, env: {} }) + '\n';
+function dial(port, cwd) {
+  const socket = net.connect(port, '127.0.0.1');
+  let data = '';
+  socket.setEncoding('utf8');
+  socket.on('data', (d) => { data += d; });
+  socket.on('error', () => {});
+  const closed = new Promise((r) => socket.on('close', r));
+  socket.on('connect', () => { if (cwd) socket.write(startLine(cwd)); });
+  return { socket, closed, data: () => data };
+}
+const until = async (fn, ms = 3000) => { const end = Date.now() + ms; while (!fn()) { if (Date.now() > end) throw Error('timed out'); await new Promise((r) => setTimeout(r, 10)); } };
+
+test('connections beyond the cap are refused with a JSON-RPC error, and a slot frees on close', async () => {
+  const root = temp(); const work = path.join(root, 't'); fs.mkdirSync(work);
+  const { fn, spawned } = fakeSpawn();
+  const kills = [];
+  const sup = createSupervisor({ command: 'agent', root, spawnFn: fn, graceMs: 10, maxConnections: 2,
+    kill: (pid, sig) => kills.push([pid, sig]) });
+  supervisors.push(sup);
+  const { port } = await sup.listen(0, '127.0.0.1');
+  const a = dial(port, work), b = dial(port, work);
+  await until(() => spawned.length === 2);
+  const c = dial(port, work);
+  await c.closed;
+  const reply = JSON.parse(c.data().trim());
+  assert.equal(reply.jsonrpc, '2.0');
+  assert.match(reply.error.message, /already running 2 agents/);
+  assert.equal(spawned.length, 2, 'the refused connection started nothing');
+  a.socket.destroy(); await a.closed;
+  await until(() => sup.live() === 1);
+  const d = dial(port, work);
+  await until(() => spawned.length === 3);
+  b.socket.destroy(); d.socket.destroy(); await Promise.all([b.closed, d.closed]);
+  await sup.close();
+});
+
+test('an agent past its wall-clock limit gets SIGTERM, then SIGKILL, and the connection ends', async () => {
+  const root = temp(); const work = path.join(root, 't'); fs.mkdirSync(work);
+  const { fn, spawned } = fakeSpawn();
+  const kills = [];
+  const sup = createSupervisor({ command: 'agent', root, spawnFn: fn, graceMs: 20, maxWallMs: 50,
+    kill: (pid, sig) => kills.push([pid, sig]) });
+  supervisors.push(sup);
+  const { port } = await sup.listen(0, '127.0.0.1');
+  const a = dial(port, work);
+  await a.closed;
+  assert.equal(spawned.length, 1);
+  assert.match(a.data(), /time limit/);
+  await until(() => kills.length === 2);
+  assert.deepEqual(kills, [[-spawned[0].pid, 'SIGTERM'], [-spawned[0].pid, 'SIGKILL']]);
+  await until(() => sup.live() === 0);
+  await sup.close();
+});
+
+test('the start-message allowlist carries the pinned curl/wget config paths (#224)', () => {
+  assert.deepEqual(cleanEnv({ CURL_HOME: '/nonexistent', WGETRC: '/dev/null' }, null), { CURL_HOME: '/nonexistent', WGETRC: '/dev/null' });
+});

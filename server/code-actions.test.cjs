@@ -110,9 +110,9 @@ const netTask = { capabilities: [ACTIONS.NETWORK], domains: ['x.test'] };
 const allNet = { capabilities: [ACTIONS.NETWORK, ACTIONS.EXECUTE, ACTIONS.EDIT], domains: ['x.test'] };
 
 test('a single plain network command to an allowed domain is still allowed', () => {
-  assert.equal(decide({ classified: exec('curl https://x.test'), ...netTask }).decision, 'allow');
-  assert.equal(decide({ classified: exec('curl -fsSL "https://api.x.test/a?b=1"'), ...netTask }).decision, 'allow');
-  assert.equal(decide({ classified: exec('curl https://x.test https://evil.test'), ...netTask }).decision, 'ask',
+  assert.equal(decide({ classified: exec('curl -q https://x.test'), ...netTask }).decision, 'allow');
+  assert.equal(decide({ classified: exec('curl -q -fsSL "https://api.x.test/a?b=1"'), ...netTask }).decision, 'allow');
+  assert.equal(decide({ classified: exec('curl -q https://x.test https://evil.test'), ...netTask }).decision, 'ask',
     'every URL must be on the list, not just the first');
 });
 
@@ -200,8 +200,8 @@ test('network commands with writing, uploading or remote-exec flags always ask',
 });
 
 test('read-only curl and wget to an allowed domain still pass', () => {
-  for (const cmd of ['curl https://x.test', 'curl -sSL https://x.test/a', 'wget -qO- https://x.test', 'wget -q -O - https://x.test',
-    'curl -fsSL -H "Accept: a" -m 5 --retry 2 -X GET --compressed https://x.test', 'wget --timeout 5 --tries 2 -U ua --spider https://x.test']) {
+  for (const cmd of ['curl -q https://x.test', 'curl --disable -sSL https://x.test/a', 'wget -qO- https://x.test', 'wget -q -O - https://x.test',
+    'curl -q -fsSL -H "Accept: a" -m 5 --retry 2 -X GET --compressed https://x.test', 'wget --timeout 5 --tries 2 -U ua --spider https://x.test']) {
     assert.equal(decide({ classified: exec(cmd), ...everything }).decision, 'allow', cmd);
   }
 });
@@ -226,7 +226,7 @@ test('git aliases in any form are pushes, destructive git is a delete, gh is ext
 });
 
 test('an env prefix or wrapper before curl/wget is never plain, auto-allowed or standing (#220)', () => {
-  const plain = exec('curl https://allowed.com');
+  const plain = exec('curl -q https://allowed.com');
   assert.equal(decide({ classified: plain, domains: ['allowed.com'] }).decision, 'allow');
   for (const command of [
     'LD_PRELOAD=./x.so curl https://allowed.com',
@@ -267,4 +267,55 @@ test('publish/push tools are EXTERNAL and never stand, like gh (#222)', () => {
   for (const command of ['npm test', 'docker ps', 'cargo build', 'aws s3 ls', 'glab mr list']) {
     assert.notEqual(analyzeCommand(command).action, ACTIONS.EXTERNAL, command);
   }
+});
+
+// ---- batch A: #148, #182, #224, #225 ----
+test('every URL counts, as the shell unquotes it, and a Host header is never plain (#148)', () => {
+  const task = { domains: ['ok.test'] };
+  assert.equal(decide({ classified: exec("curl -q https://ok.test'@evil.test'/x"), ...task }).decision, 'ask', 'userinfo trick');
+  assert.equal(decide({ classified: exec('curl -q -H "Referer: https://evil.test" https://ok.test'), ...task }).decision, 'ask', 'URL in a flag value');
+  assert.equal(decide({ classified: exec('curl -q -H "Host: evil.test" https://ok.test'), ...task }).decision, 'ask');
+  assert.equal(decide({ classified: exec('curl -q --header=host:evil.test https://ok.test'), ...task }).decision, 'ask');
+  assert.equal(decide({ classified: exec('wget -qO- --header "Host: evil.test" https://ok.test'), ...task }).decision, 'ask');
+  assert.equal(analyzeCommand('curl -q -H "Host: evil.test" https://ok.test').simple, false);
+  assert.equal(decide({ classified: exec('curl -q https://a.ok.test https://ok.test/b'), ...task }).decision, 'allow');
+  assert.equal(hostOf("curl https://ok.test'@evil.test'"), 'evil.test');
+});
+
+test('inline-code and preload interpreter flags never stand; find -fprint/-fls is a contained edit (#182)', () => {
+  for (const cmd of ["node -p 'process.env'", "node -r ./x.js app.js", "node --require=./x app.js", "node --import ./x.mjs a.mjs",
+    "ruby -r ./evil x.rb", "php -r 'system(1);'", "perl -Mstrict x.pl", "lua -l mod x.lua", "perl -eprint", "python3 -cprint(1)"]) {
+    assert.equal(analyzeCommand(cmd).standable, false, cmd);
+  }
+  assert.equal(analyzeCommand('python3 -m pytest').standable, true, 'running a module is a script, not inline code');
+  assert.equal(analyzeCommand('node app.js').standable, true);
+  for (const cmd of ['find . -fprint /tmp/results.txt', 'find . -fls /var/log/listing', 'find . -fprintf /etc/x %p']) {
+    const c = exec(cmd);
+    assert.ok(c.actions.includes(ACTIONS.EDIT), cmd);
+    assert.equal(c.standable, false, cmd);
+    assert.ok(c.paths.length === 1 && c.paths[0].startsWith('/'), cmd);
+    assert.equal(decide({ classified: c, inWorkspace: false }).decision, 'deny', cmd);
+  }
+});
+
+test('curl may only be waved through when it cannot read .curlrc (#224)', () => {
+  const task = { domains: ['ok.test'] };
+  assert.equal(decide({ classified: exec('curl https://ok.test'), ...task }).decision, 'ask');
+  assert.equal(decide({ classified: exec('curl -s -q https://ok.test'), ...task }).decision, 'ask', '-q only counts first');
+  assert.equal(decide({ classified: exec('curl -q https://ok.test'), ...task }).decision, 'allow');
+  assert.equal(analyzeCommand('curl https://ok.test').standable, true, 'still a network call a human may stand behind');
+});
+
+test('a redirect under a command still goes through the edit containment check (#225)', () => {
+  const home = exec(': > ~/.bashrc');
+  assert.equal(home.action, ACTIONS.EXECUTE);
+  assert.equal(home.standable, false, 'a target the shell expands cannot ride a standing execute');
+  const abs = exec('echo x > /home/u/.bashrc');
+  assert.deepEqual(abs.paths, ['/home/u/.bashrc']);
+  assert.equal(decide({ classified: abs, inWorkspace: false }).decision, 'deny');
+  assert.equal(decide({ classified: exec('make >> build.log'), inWorkspace: true }).decision, 'ask');
+  assert.equal(exec('cd /etc && echo x > passwd').standable, false, 'relative after cd');
+  assert.equal(exec('echo x > $HOME/.profile').standable, false);
+  assert.equal(exec('make >> build.log').standable, true);
+  assert.deepEqual(exec('make > /dev/null 2>&1').paths, []);
 });

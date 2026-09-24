@@ -21,6 +21,8 @@ const { isPrivateIp } = require('./ssrf.cjs');
 // Only the web ports. A task that needs a package registry needs 80/443; anything else
 // (SSH, a database, a mail relay) is a different conversation with the user.
 const ALLOWED_PORTS = Object.freeze([80, 443]);
+// A token dies after this long without traffic (#160). CODE_EGRESS_TOKEN_TTL_MS overrides.
+const DEFAULT_TOKEN_TTL_MS = 6 * 60 * 60 * 1000;
 const STATUS_TEXT = Object.freeze({ 400: 'Bad Request', 403: 'Forbidden', 407: 'Proxy Authentication Required', 502: 'Bad Gateway' });
 
 /** Exact host or a subdomain of a granted domain; a lookalike suffix (`notexample.com`) is not. */
@@ -50,21 +52,50 @@ function parseTarget(raw, defaultPort) {
  *          connect?: (opts: {address: string, port: number, host: string}) => import('node:net').Socket}} deps
  */
 function createEgressProxy({ now = Date.now, log = () => {}, lookup = defaultLookup,
-  isPublicAddress = (ip) => !isPrivateIp(ip), connect = defaultConnect, allowedPorts = ALLOWED_PORTS } = {}) {
+  isPublicAddress = (ip) => !isPrivateIp(ip), connect = defaultConnect, allowedPorts = ALLOWED_PORTS,
+  ttlMs = DEFAULT_TOKEN_TTL_MS } = {}) {
   const ports = new Set(allowedPorts);
-  const grants = new Map(); // token -> { taskId, domains, grantedAt }
+  const grants = new Map(); // token -> { taskId, domains, grantedAt, lastUsed, sockets:Set }
+  const ttl = Number.isFinite(ttlMs) && ttlMs > 0 ? ttlMs : DEFAULT_TOKEN_TTL_MS;
+
+  /** A revoked or expired token takes its live connections with it (tunnels would outlive it). */
+  function dropGrant(token, g) {
+    grants.delete(token);
+    for (const s of g.sockets) { try { s.destroy(); } catch { /* already gone */ } }
+    g.sockets.clear();
+  }
+  /** Tokens expire after `ttlMs` without activity (#160); returns how many were dropped. */
+  function sweep() {
+    let dropped = 0;
+    const t = now();
+    for (const [token, g] of grants) if (t - g.lastUsed > ttl) {
+      dropGrant(token, g); dropped++;
+      log({ at: t, event: 'egress.expired', taskId: g.taskId });
+    }
+    return dropped;
+  }
+  function track(g, ...sockets) {
+    for (const s of sockets) {
+      if (!s) continue;
+      if (!grants.has(g.token)) { try { s.destroy(); } catch { /* ignore */ } continue; }
+      g.sockets.add(s);
+      s.on?.('close', () => g.sockets.delete(s));
+      s.on?.('data', () => { g.lastUsed = now(); });
+    }
+  }
 
   /** Capability sets are fixed at creation (§4): a grant is written once and never widened. */
   function grant({ taskId, domains = [] }) {
     if (!taskId) throw Object.assign(Error('taskId required'), { status: 400 });
-    for (const [token, g] of grants) if (g.taskId === taskId) grants.delete(token);
+    for (const [token, g] of grants) if (g.taskId === taskId) dropGrant(token, g);
     const token = crypto.randomBytes(32).toString('base64url');
-    grants.set(token, { taskId, domains: [...domains], grantedAt: now() });
+    const at = now();
+    grants.set(token, { token, taskId, domains: [...domains], grantedAt: at, lastUsed: at, sockets: new Set() });
     return { token, taskId, domains: [...domains] };
   }
   function revoke(taskId) {
     let removed = 0;
-    for (const [token, g] of grants) if (g.taskId === taskId) { grants.delete(token); removed++; }
+    for (const [token, g] of grants) if (g.taskId === taskId) { dropGrant(token, g); removed++; }
     return removed;
   }
   /** Constant-time token compare, so a wrong token leaks nothing by how long it took. */
@@ -74,9 +105,10 @@ function createEgressProxy({ now = Date.now, log = () => {}, lookup = defaultLoo
     let decoded; try { decoded = Buffer.from(raw, 'base64').toString('utf8'); } catch { return null; }
     const token = decoded.slice(decoded.indexOf(':') + 1);
     const wanted = Buffer.from(token);
+    sweep();
     for (const [known, g] of grants) {
       const candidate = Buffer.from(known);
-      if (candidate.length === wanted.length && crypto.timingSafeEqual(candidate, wanted)) return g;
+      if (candidate.length === wanted.length && crypto.timingSafeEqual(candidate, wanted)) { g.lastUsed = now(); return g; }
     }
     return null;
   }
@@ -96,7 +128,8 @@ function createEgressProxy({ now = Date.now, log = () => {}, lookup = defaultLoo
     else { try { addresses = await lookup(host); } catch { addresses = []; } }
     if (!addresses.length) return { ok: false, status: 502, reason: 'host does not resolve', taskId: g.taskId, host };
     if (!addresses.every(isPublicAddress)) return { ok: false, status: 403, reason: 'host resolves to a private address', taskId: g.taskId, host };
-    return { ok: true, taskId: g.taskId, host, port, address: addresses[0] };
+    if (!grants.has(g.token)) return { ok: false, status: 407, reason: 'task token was revoked', taskId: g.taskId, host };
+    return { ok: true, taskId: g.taskId, host, port, address: addresses[0], grant: g };
   }
 
   // What each task reached and what it was refused, by host, so the task's own result can say
@@ -141,6 +174,7 @@ function createEgressProxy({ now = Date.now, log = () => {}, lookup = defaultLoo
     const verdict = await check({ header: req.headers['proxy-authorization'],
       target: url ? url.host : null, defaultPort: 80 });
     if (!verdict.ok) return refuse(res, verdict, record);
+    const { grant: owner } = verdict; delete verdict.grant;
     record({ event: 'egress.allowed', taskId: verdict.taskId, host: verdict.host, port: verdict.port, method: req.method });
 
     const headers = { ...req.headers };
@@ -153,6 +187,7 @@ function createEgressProxy({ now = Date.now, log = () => {}, lookup = defaultLoo
     headers.host = url.host;
     const upstream = http.request({ host: verdict.address, port: verdict.port, method: req.method,
       path: url.pathname + url.search, headers, setHost: false }, (up) => {
+      track(owner, up.socket);
       res.writeHead(up.statusCode || 502, up.headers);
       up.pipe(res);
     });
@@ -160,6 +195,7 @@ function createEgressProxy({ now = Date.now, log = () => {}, lookup = defaultLoo
     // If the client's own socket goes away mid-request, the upstream request must not be left
     // dangling: an aborted/errored client is exactly the "cancelled task" case this proxy has to
     // survive without leaking a socket per abandoned request.
+    track(owner, req.socket);
     const dropUpstream = () => { if (!res.writableEnded) upstream.destroy(); };
     req.on('aborted', dropUpstream);
     res.on('close', dropUpstream);
@@ -185,8 +221,10 @@ function createEgressProxy({ now = Date.now, log = () => {}, lookup = defaultLoo
       clientSocket.end(lines.join('\r\n'));
       return;
     }
+    const { grant: owner } = verdict; delete verdict.grant;
     record({ event: 'egress.allowed', taskId: verdict.taskId, host: verdict.host, port: verdict.port, method: 'CONNECT' });
     const upstream = connect({ address: verdict.address, port: verdict.port, host: verdict.host });
+    track(owner, clientSocket, upstream);
     upstream.on('connect', () => {
       clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
       if (head && head.length) upstream.write(head);
@@ -199,7 +237,7 @@ function createEgressProxy({ now = Date.now, log = () => {}, lookup = defaultLoo
     clientSocket.on('close', () => upstream.destroy());
   });
 
-  return { server, grant, revoke, check, hostAllowed, activity,
+  return { server, grant, revoke, check, hostAllowed, activity, sweep, ttlMs: ttl,
     /** Drop every live connection too: a tunnel outlives the listener otherwise. */
     closeAll: () => { server.closeAllConnections?.(); },
     listen: (port = 0, host = '127.0.0.1') => new Promise((r) => server.listen(port, host, () => r(server.address()))),
@@ -230,9 +268,15 @@ function startEgressFromEnv(env = process.env, { log = () => {}, create = create
   if (!Number.isInteger(port) || port <= 0 || port > 65535) return null;
   const host = String(env.CODE_EGRESS_HOST || 'egress').trim();
   if (!/^[a-z0-9.-]+$/i.test(host)) throw Error(`CODE_EGRESS_HOST should be a host name, not "${host}"`);
-  const proxy = create({ log });
+  const ttlMs = Number(env.CODE_EGRESS_TOKEN_TTL_MS) > 0 ? Number(env.CODE_EGRESS_TOKEN_TTL_MS) : DEFAULT_TOKEN_TTL_MS;
+  const proxy = create({ log, ttlMs });
   proxy.server.listen(port, env.CODE_EGRESS_BIND || '0.0.0.0');
+  if (typeof proxy.sweep === 'function') {
+    const timer = setInterval(() => proxy.sweep(), Math.min(ttlMs, 60_000));
+    timer.unref?.();
+    proxy.server.on('close', () => clearInterval(timer));
+  }
   return Object.assign(proxy, { endpoint: `${host}:${port}` });
 }
 
-module.exports = { createEgressProxy, hostAllowed, parseTarget, startEgressFromEnv };
+module.exports = { DEFAULT_TOKEN_TTL_MS, createEgressProxy, hostAllowed, parseTarget, startEgressFromEnv };

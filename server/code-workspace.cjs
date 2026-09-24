@@ -341,6 +341,9 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
   function release({ taskId, removeBranch = false } = {}) {
     const record = read(taskId);
     if (!record) return null;
+    // Idempotent (#146): a released record has nothing left on disk, so a second release must
+    // not chown or inspect a deleted path and flip it to stuck.
+    if (record.status === 'released') return record;
     let removed = true, error = null;
     if ((record.mode || 'worktree') === 'clone') {
       // Take the clone back first. git refuses to read a repository owned by another user, and

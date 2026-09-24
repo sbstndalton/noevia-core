@@ -139,3 +139,16 @@ test('pi is spawned detached and killed via its process group, with a SIGKILL fa
     process.kill = realKill2;
   }
 });
+
+test('an outside-the-workspace read from the gate goes to noevia as an ask that cannot stand (#113)', () => {
+  const { toolCallFor } = require('./pi-acp-bridge.cjs');
+  const { classify, decide } = require('../../apps/web/server/code-actions.cjs');
+  const inside = toolCallFor({ toolCallId: 'a', toolName: 'read', input: { path: 'src/a.ts' } });
+  assert.equal(inside.kind, 'read');
+  assert.equal(decide({ classified: classify(inside) }).decision, 'allow');
+  const outside = toolCallFor({ toolCallId: 'b', toolName: 'read', input: { path: '/etc/passwd' }, outsideWorkspace: true });
+  assert.equal(outside.kind, 'other');
+  const c = classify(outside);
+  assert.equal(decide({ classified: c }).decision, 'ask');
+  assert.equal(c.standable, false);
+});

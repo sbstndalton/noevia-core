@@ -444,6 +444,31 @@ function pinnedParent(target, root) {
   return final;
 }
 
+/**
+ * After open: the descriptor must be the file the checked path names NOW (#223). A middle
+ * directory swapped for a symlink between pinnedParent() and open() lands somewhere else, so the
+ * parent is realpath'd again, must still be inside the root, and lstat of the resolved path must
+ * be the same dev/ino as fstat of what was opened. A hard link (nlink > 1) is refused as well: its
+ * other name can be anywhere on the volume, and writing through this one would change that file.
+ */
+function verifyOpened(fd, final, root) {
+  const refuse = () => { throw Object.assign(Error('Outside this task\u2019s workspace'), { code: -32602 }); };
+  const opened = fs.fstatSync(fd);
+  let realRoot, realParent, named;
+  try {
+    realRoot = fs.realpathSync(root);
+    realParent = fs.realpathSync(nodePath.dirname(final));
+    named = fs.lstatSync(nodePath.join(realParent, nodePath.basename(final)));
+  } catch { refuse(); }
+  const rel = nodePath.relative(realRoot, realParent);
+  if (rel.startsWith('..') || nodePath.isAbsolute(rel)) refuse();
+  if (named.dev !== opened.dev || named.ino !== opened.ino) refuse();
+  if (opened.isFile() && opened.nlink > 1) {
+    throw Object.assign(Error('Refusing a file with more than one hard link'), { code: -32602 });
+  }
+  return opened;
+}
+
 const defaultFiles = {
   read(target, max, root) {
     const final = pinnedParent(target, root);
@@ -452,7 +477,7 @@ const defaultFiles = {
     try { fd = fs.openSync(final, O_RDONLY | O_NOFOLLOW); }
     catch (err) { if (err.code === 'ELOOP') throw Object.assign(Error('Refusing to follow a symlink'), { code: -32602 }); throw err; }
     try {
-      const stat = fs.fstatSync(fd);
+      const stat = verifyOpened(fd, final, root);
       if (!stat.isFile()) throw Object.assign(Error('Not a file'), { code: -32602 });
       if (stat.size > max) throw Object.assign(Error('File too large'), { code: -32602 });
       return fs.readFileSync(fd, 'utf8');
@@ -479,15 +504,21 @@ const defaultFiles = {
       if (existing !== dir) fs.mkdirSync(dir, { recursive: true });
     }
     const final = pinnedParent(target, root);
-    const { O_WRONLY, O_CREAT, O_TRUNC, O_NOFOLLOW } = fs.constants;
+    // Not O_TRUNC: nothing is changed until the descriptor is proven to be the checked file.
+    const { O_WRONLY, O_CREAT, O_NOFOLLOW } = fs.constants;
     let fd;
-    try { fd = fs.openSync(final, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0o644); }
+    try { fd = fs.openSync(final, O_WRONLY | O_CREAT | O_NOFOLLOW, 0o644); }
     catch (err) { if (err.code === 'ELOOP') throw Object.assign(Error('Refusing to follow a symlink'), { code: -32602 }); throw err; }
-    try { fs.writeFileSync(fd, text); } finally { fs.closeSync(fd); }
+    try {
+      const stat = verifyOpened(fd, final, root);
+      if (!stat.isFile()) throw Object.assign(Error('Not a file'), { code: -32602 });
+      fs.ftruncateSync(fd, 0);
+      fs.writeFileSync(fd, text);
+    } finally { fs.closeSync(fd); }
   },
 };
 
-module.exports = { createCodeHarness, defaultFiles, MAX_TEXT, MAX_FILE_BYTES };
+module.exports = { createCodeHarness, defaultFiles, verifyOpened, MAX_TEXT, MAX_FILE_BYTES };
 
 /** The engine's host name, kept off the proxy so a task granted the network can still think. */
 function engineHost(engine) {

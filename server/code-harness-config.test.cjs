@@ -222,3 +222,31 @@ test('the working-tree paths each harness pins are known up front', () => {
   assert.deepEqual(cwdPinPaths('qwen-code'), ['.qwen/settings.json']);
   assert.deepEqual(cwdPinPaths('pi'), []);
 });
+
+test('pi gate: a read outside the task directory asks instead of passing (#113)', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-pi-read-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const tree = path.join(root, 'tree'), other = path.join(root, 'other-task');
+  fs.mkdirSync(path.join(tree, 'src'), { recursive: true }); fs.mkdirSync(other);
+  fs.writeFileSync(path.join(other, 'models.json'), '{}');
+  fs.symlinkSync(other, path.join(tree, 'escape'));
+  t.mock.method(process, 'cwd', () => tree);
+  const gate = fileOf(pinFilesFor({ ...base, harness: 'pi' }), '.pi/agent/extensions/noevia-gate.js').content;
+  // A fresh module instance per import, so ROOT is read under the mocked cwd.
+  const mod = await import('data:text/javascript;base64,' + Buffer.from(gate + `\n// ${Math.random()}`).toString('base64'));
+  let handler; mod.default({ on: (_, fn) => { handler = fn; } });
+  const asked = [];
+  const ui = { hasUI: true, ui: { confirm: async (title, body) => { asked.push(JSON.parse(body)); return false; } } };
+  for (const input of [{ path: 'src' }, { path: 'src/new-file.ts' }, {}, { pattern: '**/*.ts' }, { path: tree }]) {
+    assert.equal(await handler({ toolName: 'read', input }, ui), undefined, JSON.stringify(input));
+  }
+  assert.equal(asked.length, 0);
+  for (const [toolName, input] of [['read', { path: path.join(other, 'models.json') }], ['read', { path: '../other-task/models.json' }],
+    ['ls', { path: '/' }], ['grep', { pattern: 'key', path: '~/.pi' }], ['read', { path: 'escape/models.json' }],
+    ['find', { pattern: '../../**/models.json' }], ['grep', { pattern: 'x', glob: '/etc/**' }]]) {
+    assert.equal((await handler({ toolName, input }, ui)).block, true, JSON.stringify(input));
+  }
+  assert.equal(asked.length, 7, 'every outside read asked');
+  assert.ok(asked.every((p) => p.outsideWorkspace === true));
+  assert.equal((await handler({ toolName: 'read', input: { path: '/etc/passwd' } }, { hasUI: false })).block, true);
+});

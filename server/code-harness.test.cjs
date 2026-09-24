@@ -618,3 +618,54 @@ test('defaultFiles refuses a link swapped in after the containment check (O_NOFO
   defaultFiles.write(path.join(root, 'new', 'deep', 'ok.txt'), 'ok', root);
   assert.equal(fs.readFileSync(path.join(root, 'new', 'deep', 'ok.txt'), 'utf8'), 'ok');
 });
+
+test('defaultFiles refuses a hard-linked file, and leaves the other name untouched (#223)', () => {
+  const { defaultFiles } = require('./code-harness.cjs');
+  const root = temp('noevia-hl-'), outside = temp('noevia-hl-out-');
+  const victim = path.join(outside, 'secret.txt');
+  fs.writeFileSync(victim, 'keep me');
+  fs.linkSync(victim, path.join(root, 'linked.txt'));
+  assert.throws(() => defaultFiles.write(path.join(root, 'linked.txt'), 'overwritten', root), /hard link/);
+  assert.equal(fs.readFileSync(victim, 'utf8'), 'keep me', 'not truncated before the check');
+  assert.throws(() => defaultFiles.read(path.join(root, 'linked.txt'), 100, root), /hard link/);
+  defaultFiles.write(path.join(root, 'plain.txt'), 'fine', root);
+  assert.equal(defaultFiles.read(path.join(root, 'plain.txt'), 100, root), 'fine');
+});
+
+test('a middle directory swapped after open is caught by comparing dev/ino (#223)', () => {
+  const { verifyOpened } = require('./code-harness.cjs');
+  const root = temp('noevia-swap-'), outside = temp('noevia-swap-out-');
+  fs.mkdirSync(path.join(root, 'sub'));
+  fs.writeFileSync(path.join(root, 'sub', 'f.txt'), 'inside');
+  fs.mkdirSync(path.join(root, 'decoy'));
+  fs.writeFileSync(path.join(root, 'decoy', 'f.txt'), 'decoy');
+  fs.writeFileSync(path.join(outside, 'f.txt'), 'outside');
+  const final = path.join(fs.realpathSync(root), 'sub', 'f.txt');
+  const fd = fs.openSync(final, 'r');
+  try {
+    assert.equal(verifyOpened(fd, final, root).isFile(), true, 'unchanged: accepted');
+    fs.renameSync(path.join(root, 'sub'), path.join(root, 'sub-old'));
+    fs.symlinkSync(path.join(root, 'decoy'), path.join(root, 'sub'));
+    assert.throws(() => verifyOpened(fd, final, root), /Outside/, 'same name, different file');
+    fs.unlinkSync(path.join(root, 'sub'));
+    fs.symlinkSync(outside, path.join(root, 'sub'));
+    assert.throws(() => verifyOpened(fd, final, root), /Outside/, 'parent now resolves outside');
+  } finally { fs.closeSync(fd); }
+});
+
+test('a redirect under a standing execute allow still meets the edit containment check (#225)', async () => {
+  const cmd = (command) => ({ toolCall: { kind: 'execute', title: 'bash', rawInput: { command } }, options: OPTIONS });
+  const picked = [];
+  const r = await run({
+    capabilities: [ACTIONS.EXECUTE, ACTIONS.EDIT],
+    answers: ['approve_all', 'deny'],
+    script: async (h) => {
+      picked.push(await h.requestPermission(cmd('make build')));        // asks, stands for execute
+      picked.push(await h.requestPermission(cmd(': > ~/.bashrc')));     // shell-expanded target: asks
+      picked.push(await h.requestPermission(cmd(': > /etc/profile')));  // outside: refused, nobody asked
+      picked.push(await h.requestPermission(cmd('make > build.log')));  // inside: the standing allow covers it
+    },
+  });
+  assert.deepEqual(r.asked.map((a) => a.command), ['make build', ': > ~/.bashrc']);
+  assert.deepEqual(picked.map((p) => p.optionId), ['y', 'n', 'n', 'y']);
+});

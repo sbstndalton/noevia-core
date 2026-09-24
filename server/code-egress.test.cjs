@@ -341,3 +341,38 @@ test('a plain-HTTP upstream request is destroyed if the client socket errors mid
   await p.close();
   origin.closeAllConnections?.(); origin.close();
 });
+
+test('revoking a task closes its open CONNECT tunnels (#128)', async () => {
+  const origin = net.createServer((socket) => { socket.on('data', (d) => socket.write(d)); });
+  await new Promise((r) => origin.listen(0, '127.0.0.1', r));
+  const originPort = origin.address().port;
+  const { p } = proxy({ connect: () => net.connect(originPort, '127.0.0.1') });
+  const { token } = p.grant({ taskId: 't1', domains: ['example.com'] });
+  await p.listen();
+  const socket = net.connect(p.server.address().port, '127.0.0.1');
+  const closed = new Promise((r) => socket.on('close', r));
+  socket.on('error', () => {});
+  await new Promise((resolve) => {
+    socket.on('connect', () => socket.write(`CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProxy-Authorization: ${basic(token)}\r\n\r\n`));
+    socket.once('data', (d) => { assert.match(String(d), /^HTTP\/1\.1 200/); resolve(); });
+  });
+  assert.equal(p.revoke('t1'), 1);
+  await Promise.race([closed, new Promise((_, rej) => setTimeout(() => rej(Error('tunnel survived revoke')), 3000).unref())]);
+  await p.close();
+  origin.closeAllConnections?.(); origin.close();
+});
+
+test('tokens expire after the idle TTL and activity refreshes them (#160)', async () => {
+  let clock = 1000;
+  const { p, log } = proxy({ now: () => clock, ttlMs: 100 });
+  const { token } = p.grant({ taskId: 't1', domains: ['example.com'] });
+  const check = () => p.check({ header: basic(token), target: 'example.com:443', defaultPort: 443 });
+  clock += 90; assert.equal((await check()).ok, true, 'used within the TTL');
+  clock += 90; assert.equal((await check()).ok, true, 'use refreshed the TTL');
+  clock += 101; assert.equal((await check()).status, 407, 'idle past the TTL');
+  assert.ok(log.some((e) => e.event === 'egress.expired' && e.taskId === 't1'));
+  const { token: t2 } = p.grant({ taskId: 't2', domains: ['example.com'] });
+  clock += 500;
+  assert.equal(p.sweep(), 1, 'a never-used token expires on the sweep without a request');
+  assert.equal((await p.check({ header: basic(t2), target: 'example.com:443', defaultPort: 443 })).status, 407);
+});

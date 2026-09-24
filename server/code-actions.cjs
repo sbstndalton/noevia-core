@@ -61,7 +61,7 @@ const REMOTE_EXEC_COMMANDS = new Set(['nc', 'ncat', 'netcat', 'ssh', 'scp', 'sft
 // Downloads and runs a package.
 const PACKAGE_RUNNERS = new Set(['npx', 'bunx', 'pnpx']);
 // curl/wget flags that neither write a file nor read config/upload data. Anything else is not.
-const CURL_SAFE_BARE = new Set(['--silent', '--show-error', '--location', '--head', '--fail', '--compressed']);
+const CURL_SAFE_BARE = new Set(['-q', '--disable', '--silent', '--show-error', '--location', '--head', '--fail', '--compressed']);
 const CURL_SAFE_SHORT = /^-[sSLIf]+$/;
 const CURL_SAFE_WITH_ARG = new Set(['-H', '--header', '-A', '--user-agent', '-m', '--max-time', '--retry']);
 const CURL_WRITE_FLAGS = /^(-[a-zA-Z]*[oOJDc]|--output|--output-dir|--remote-name|--remote-name-all|--remote-header-name|--dump-header|--cookie-jar|--create-dirs|--trace|--trace-ascii|--stderr|--libcurl|--etag-save|--hsts|--alt-svc)/;
@@ -207,18 +207,32 @@ function analyzeCommand(command, depth = 0) {
   const lexed = lex(text);
   const found = new Set();
   let standable = !lexed.broken && !lexed.dynamic;
-  const add = (r) => { for (const a of r.actions) found.add(a); if (!r.standable) standable = false; };
+  let complex = false;
+  const writes = [];
+  const add = (r) => {
+    for (const a of r.actions) found.add(a);
+    if (!r.standable) standable = false;
+    if (r.complex || r.simple === false) complex = true;
+    if (Array.isArray(r.writes)) writes.push(...r.writes);
+  };
   for (const words of lexed.segments) add(classifyWords(words, depth));
   for (const inner of lexed.nested) add(analyzeCommand(inner, depth + 1));
-  // Writing a file through `>` is an edit, whatever the command was.
-  if (lexed.redirects.some((t) => !/^\/dev\/(null|stdout|stderr|fd\/\d+)$/.test(t))) found.add(ACTIONS.EDIT);
+  // Writing a file through `>` is an edit, whatever the command was — and whatever else the
+  // command is, the target is a write the containment check must see (#225).
+  const written = lexed.redirects.filter((t) => !/^\/dev\/(null|stdout|stderr|fd\/\d+)$/.test(t));
+  if (written.length) found.add(ACTIONS.EDIT);
+  writes.push(...written);
+  // A target the shell expands (`~`, `$VAR`, `$SUB`) or resolves after a `cd` cannot be judged
+  // here, so no standing approval may carry the call past a human.
+  const moves = lexed.segments.some((w) => ['cd', 'pushd', 'popd'].includes(String(w[0] || '').split('/').pop()));
+  if (writes.some((t) => /^~|\$/.test(t) || (moves && !t.startsWith('/')))) standable = false;
   if (lexed.broken || lexed.dynamic) found.add(ACTIONS.EXECUTE);
   if (!found.size) found.add(ACTIONS.EXECUTE);
   let action = ACTIONS.NONE;
   for (const a of found) action = worst(action, a);
   if (action === ACTIONS.NONE) action = ACTIONS.EXECUTE;
-  const simple = !lexed.compound && !lexed.broken && !lexed.dynamic && lexed.segments.length === 1 && found.size === 1;
-  return { action, actions: [...found], simple, standable };
+  const simple = !complex && !lexed.compound && !lexed.broken && !lexed.dynamic && lexed.segments.length === 1 && found.size === 1;
+  return { action, actions: [...found], simple, standable, writes: [...new Set(writes)] };
 }
 
 /**
@@ -272,14 +286,26 @@ function classifyWords(input, depth) {
     const r = analyzeCommand(inner, depth + 1);
     return { actions: r.actions.includes(ACTIONS.EXECUTE) ? r.actions : [...r.actions, ACTIONS.EXECUTE], standable: false };
   }
-  if (INTERPRETERS.has(name) && rest.some((w) => /^-[A-Za-z]*[ceE]$/.test(w) || w === '--eval' || w === '--command')) {
+  // Inline code (`-c`, `-e`, `node -p`, `php -r`) or a preload (`node -r`, `ruby -r`, `perl -M`,
+  // `lua -l`), in any cluster or with the value attached (`-eprint 1`), is never a standing
+  // approval (#182).
+  if (INTERPRETERS.has(name) && rest.some((w) => /^-[A-Za-z]*[ceEprlM]/.test(w)
+    || /^--(eval|command|print|require|import|loader|experimental-loader|preload)(=|$)/.test(w))) {
     return one(ACTIONS.EXECUTE, false);
   }
   if (name === 'find') {
     const actions = new Set([ACTIONS.EXECUTE]);
+    const writes = [];
     let own = true;
     rest.forEach((w, k) => {
       if (w === '-delete') actions.add(ACTIONS.DELETE);
+      // `-fprint FILE` and friends write the listing to a file: an edit whose target must pass
+      // the containment check (#182).
+      if (['-fprint', '-fprint0', '-fprintf', '-fls'].includes(w)) {
+        actions.add(ACTIONS.EDIT);
+        if (k + 1 < rest.length) writes.push(rest[k + 1]);
+        own = false;
+      }
       if (['-exec', '-execdir', '-ok', '-okdir'].includes(w)) {
         own = false;
         const end = rest.findIndex((x, m) => m > k && (x === ';' || x === '+' || x === '\;'));
@@ -287,7 +313,7 @@ function classifyWords(input, depth) {
         r.actions.forEach((a) => actions.add(a));
       }
     });
-    return { actions: [...actions], standable: own && standable };
+    return { actions: [...actions], standable: own && standable, writes };
   }
   if (name === 'git' || name.startsWith('git-')) {
     const g = gitAction(name, rest);
@@ -302,7 +328,7 @@ function classifyWords(input, depth) {
     // `LD_PRELOAD=… curl`, `https_proxy=… curl`, `env -S … curl`, `time -o f curl`: the prefix can
     // reroute or hijack the call, so it is never a plain, auto-allowed or standing network read.
     if (prefixed) return { actions: [...new Set([...networkWords(name, rest), ACTIONS.EXECUTE])], standable: false };
-    return { actions: networkWords(name, rest), standable };
+    return { actions: networkWords(name, rest), standable, complex: !plainNetwork(name, rest) };
   }
   if (DELETE_COMMANDS.has(name)) return one(ACTIONS.DELETE, standable);
   if (BROWSER_COMMANDS.has(name)) return one(ACTIONS.BROWSER, standable);
@@ -357,6 +383,23 @@ function networkWords(name, rest) {
     }
   }
   return [...actions];
+}
+
+/**
+ * Whether a read-only network call is also plain enough to wave through on the domain list.
+ * Not when a header re-targets it (`-H 'Host: …'`), and not a curl that may read `.curlrc`
+ * (which the agent can write in its HOME and which can upload, proxy or save): only `-q` /
+ * `--disable` as the FIRST argument stops that (#224, #148). WGETRC is pinned in the agent env.
+ */
+function plainNetwork(name, rest) {
+  const headerValues = [];
+  rest.forEach((w, k) => {
+    if (['-H', '--header'].includes(w) && k + 1 < rest.length) headerValues.push(rest[k + 1]);
+    const eq = /^--header=(.*)$/s.exec(w); if (eq) headerValues.push(eq[1]);
+  });
+  if (headerValues.some((h) => /^\s*(host|:authority)\s*:/i.test(h))) return false;
+  if (name === 'curl' && !['-q', '--disable'].includes(rest[0])) return false;
+  return true;
 }
 
 /** @returns {{action: string, standable: boolean}} */
@@ -440,12 +483,15 @@ function classify(call = {}) {
   let actions = [action];
   let simple = true;
   let standable = true;
+  let writes = [];
   if (action === ACTIONS.EXECUTE) {
-    if (command) ({ action, actions, simple, standable } = analyzeCommand(command));
+    if (command) ({ action, actions, simple, standable, writes } = analyzeCommand(command));
     else readable = false; // a command we cannot see is a command we cannot vouch for
   }
-  const paths = (Array.isArray(call.locations) ? call.locations : [])
-    .map((l) => (l && typeof l.path === 'string' ? l.path : null)).filter(Boolean);
+  // A read outside the task's tree (flagged by the pi bridge, #113) always goes to a human.
+  if (call.rawInput && typeof call.rawInput === 'object' && call.rawInput.noeviaOutsideWorkspace === true) standable = false;
+  const paths = [...new Set([...(Array.isArray(call.locations) ? call.locations : [])
+    .map((l) => (l && typeof l.path === 'string' ? l.path : null)).filter(Boolean), ...writes])];
   return { action, approval: approvalFor(action), command, paths, readable, actions, simple, standable };
 }
 
@@ -470,25 +516,27 @@ function approvalFor(action) {
  */
 function decide({ classified, capabilities = [], domains = [], inWorkspace = null } = {}) {
   const { action, approval, command, readable, paths } = classified;
-  // Containment first: an edit or delete outside the worktree is refused, never offered.
+  const all = Array.isArray(classified.actions) && classified.actions.length ? classified.actions : [action];
+  // Containment first: an edit or delete outside the worktree is refused, never offered — also
+  // when the edit rides inside a command whose worst class is something else (`: > ~/x`, #225).
   // `null` means the path is not known yet, which is itself a reason to ask rather than allow.
-  if ((action === ACTIONS.EDIT || action === ACTIONS.DELETE) && paths.length && inWorkspace === false) {
+  const writes = all.includes(ACTIONS.EDIT) || all.includes(ACTIONS.DELETE);
+  if (writes && paths.length && inWorkspace === false) {
     return { decision: 'deny', reason: 'The path is outside this task\u2019s workspace.' };
   }
   // Every part of a compound command needs its own grant: `curl … | sh` executes.
-  const all = Array.isArray(classified.actions) && classified.actions.length ? classified.actions : [action];
   const missing = all.find((a) => a !== ACTIONS.NONE && a !== ACTIONS.READ && capabilities.length && !capabilities.includes(a));
   if (missing) {
     return { decision: 'deny', reason: `This task was not granted ${missing.replace(/_/g, ' ')}.` };
   }
   if (approval === 'never') return { decision: 'allow', reason: 'Read-only.' };
   if (approval === 'capability') {
-    const host = hostOf(command);
+      const host = hostOf(command);
     // Only ONE plain network command is waved through, and only when every URL it names is on
     // the list. A pipe, a `;`, a redirect or a substitution always goes to a human.
     const hosts = hostsOf(command);
     const listed = (h) => domains.some((d) => h === d || h.endsWith('.' + d));
-    if (classified.simple !== false && hosts.length && hosts.every(listed)) {
+    if (classified.simple !== false && hosts.length && hosts.every((h) => h && listed(h))) {
       return { decision: 'allow', reason: `${host} is on this task\u2019s allowed list.` };
     }
     return { decision: 'ask', reason: host ? `Network request to ${host}.` : 'Network request.' };
@@ -496,15 +544,29 @@ function decide({ classified, capabilities = [], domains = [], inWorkspace = nul
   return { decision: 'ask', reason: readable ? '' : 'The harness did not say what it would run.' };
 }
 
+/**
+ * Every host a command names, read from the words the shell will actually see (quotes removed),
+ * so `https://ok.com'@evil.test'` is evil.test, as curl reads it (#148). Every URL counts, in
+ * any argument or flag value; one that cannot be parsed yields an empty host, which no list has.
+ */
 function hostsOf(command) {
-  return [...String(command || '').matchAll(/https?:\/\/([^\s/'"`)?#]+)/gi)]
-    .map((m) => m[1].split('@').pop().split(':')[0].toLowerCase()).filter(Boolean);
+  const text = String(command || '');
+  const { segments, nested, redirects } = lex(text);
+  const words = [...segments.flat(), ...redirects, ...nested];
+  const hosts = [];
+  for (const word of words) {
+    for (const m of String(word).matchAll(/https?:\/\//gi)) {
+      const rest = String(word).slice(m.index).split(/\s/)[0];
+      let host = '';
+      try { host = new URL(rest).hostname.toLowerCase().replace(/^\[|\]$/g, ''); } catch { host = ''; }
+      hosts.push(host);
+    }
+  }
+  return hosts;
 }
 
 function hostOf(command) {
-  const match = String(command || '').match(/https?:\/\/([^\s/'"`)]+)/i);
-  if (!match) return null;
-  return match[1].split('@').pop().split(':')[0].toLowerCase() || null;
+  return hostsOf(command).find(Boolean) || null;
 }
 
 /**

@@ -261,6 +261,11 @@ function agentEnv({ cwd, env = {}, proxy = null, home = null }) {
     PATH: process.env.PATH, HOME: home || env.HOME || undefined, TMPDIR: env.TMPDIR || undefined, LANG: process.env.LANG,
     ...(proxy ? { HTTP_PROXY: proxy.url, HTTPS_PROXY: proxy.url, http_proxy: proxy.url, https_proxy: proxy.url, NO_PROXY: proxy.noProxy || '' } : {}),
     ...env,
+    // curl and wget read rc files that can upload, proxy or save (#224). The agent can write its
+    // own HOME, so neither tool may read config from it: WGETRC replaces ~/.wgetrc outright, and
+    // CURL_HOME is looked up first (the classifier additionally wants `curl -q` to auto-allow,
+    // since curl still falls back to HOME when CURL_HOME has no .curlrc). Pinned after `env`.
+    CURL_HOME: '/nonexistent', WGETRC: '/dev/null',
   };
   for (const key of Object.keys(out)) if (out[key] === undefined) delete out[key];
   return out;

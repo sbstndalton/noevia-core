@@ -76,11 +76,14 @@ function toolCallFor(payload) {
   const name = String(payload.toolName || '');
   const input = payload.input && typeof payload.input === 'object' ? payload.input : {};
   const path = typeof input.path === 'string' ? input.path : typeof input.file_path === 'string' ? input.file_path : null;
+  // A read the gate saw leave the task's directory is not a read noevia may wave through: it goes
+  // as `other` (asks), marked so no standing approval covers it (#113).
+  const outside = payload.outsideWorkspace === true;
   return {
     toolCallId: String(payload.toolCallId || `pi-${name}`),
-    title: name === 'bash' && typeof input.command === 'string' ? input.command : name,
-    kind: KIND[name] || 'other',
-    rawInput: input,
+    title: name === 'bash' && typeof input.command === 'string' ? input.command : outside ? `${name} outside the workspace` : name,
+    kind: outside ? 'other' : KIND[name] || 'other',
+    rawInput: outside ? { ...input, noeviaOutsideWorkspace: true } : input,
     ...(path ? { locations: [{ path }] } : {}),
   };
 }

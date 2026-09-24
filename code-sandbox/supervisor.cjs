@@ -15,6 +15,10 @@
 //   * Only an allowlisted set of environment variables is accepted, and nothing of this
 //     process's own environment is passed on.
 //   * One agent per connection; closing the connection kills that agent's process group.
+//   * Its own limits (#115), not only the container's: at most `maxConnections` live connections
+//     (CODE_SANDBOX_MAX_CONNECTIONS, default 4; more are refused with a JSON-RPC error), and an
+//     agent running longer than `maxWallMs` (CODE_SANDBOX_MAX_WALL_MS, default 2 h) is stopped
+//     — SIGTERM to its group, SIGKILL after the grace period.
 //
 // It listens on an internal network only. There is no authentication here on purpose: a
 // deployment that lets anything but noevia reach this port has already lost, and a shared
@@ -23,9 +27,12 @@ const net = require('node:net'), fs = require('node:fs'), path = require('node:p
 const { spawn } = require('node:child_process');
 
 const MAX_START_LINE = 64 * 1024;
+const DEFAULT_MAX_CONNECTIONS = 4;
+const DEFAULT_MAX_WALL_MS = 2 * 60 * 60 * 1000;
+const positive = (value, fallback) => { const n = Number(value); return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback; };
 // Passed through when noevia sends them; everything else is dropped without comment.
 const ALLOWED_ENV = new Set(['HOME', 'PATH', 'LANG', 'TMPDIR',
-  'HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'NO_PROXY']);
+  'HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'NO_PROXY', 'CURL_HOME', 'WGETRC']);
 
 function insideRoot(root, candidate) {
   let resolvedRoot, resolved;
@@ -51,9 +58,27 @@ function cleanEnv(env, fallbackHome = process.env.HOME) {
  * @param {{command: string, args?: string[], root: string, spawnFn?: Function,
  *          log?: (line: string) => void, graceMs?: number}} deps
  */
-function createSupervisor({ command, args = [], root, spawnFn = spawn, log = () => {}, graceMs = 5000 }) {
+function createSupervisor({ command, args = [], root, spawnFn = spawn, log = () => {}, graceMs = 5000,
+  maxConnections = DEFAULT_MAX_CONNECTIONS, maxWallMs = DEFAULT_MAX_WALL_MS, kill = process.kill.bind(process) }) {
+  const cap = positive(maxConnections, DEFAULT_MAX_CONNECTIONS);
+  const wall = positive(maxWallMs, DEFAULT_MAX_WALL_MS);
+  let live = 0;
+  const sockets = new Set();
   const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
     socket.setEncoding('utf8');
+    if (live >= cap) {
+      log(`refused: ${live} agents already running (limit ${cap})`);
+      socket.on('error', () => {});
+      socket.end(JSON.stringify({ jsonrpc: '2.0', id: null,
+        error: { code: -32000, message: `The sandbox is already running ${cap} agents; try again when one finishes.` } }) + '\n');
+      return;
+    }
+    live++;
+    let counted = true;
+    const release = () => { if (counted) { counted = false; live--; } };
+    let wallTimer = null;
     // `pid` outlives `agent`: the agent exiting does not end its process group, and anything it
     // left running in the background must still be stopped when the connection goes.
     // `done` is set once this connection has been refused or its agent has gone; after that no
@@ -72,11 +97,12 @@ function createSupervisor({ command, args = [], root, spawnFn = spawn, log = () 
     const stopAgent = () => {
       done = true;
       agent = null;
+      if (wallTimer) { clearTimeout(wallTimer); wallTimer = null; }
       if (!pid || stopped) return;
       stopped = true;
       const group = -pid;
-      try { process.kill(group, 'SIGTERM'); } catch { /* ESRCH: the whole group is already gone */ }
-      const timer = setTimeout(() => { try { process.kill(group, 'SIGKILL'); } catch { /* gone */ } }, graceMs);
+      try { kill(group, 'SIGTERM'); } catch { /* ESRCH: the whole group is already gone */ }
+      const timer = setTimeout(() => { try { kill(group, 'SIGKILL'); } catch { /* gone */ } }, graceMs);
       timer.unref?.();
     };
 
@@ -100,6 +126,16 @@ function createSupervisor({ command, args = [], root, spawnFn = spawn, log = () 
       agent = child;
       pid = child.pid || null;
       log(`started ${command} in ${cwd}`);
+      wallTimer = setTimeout(() => {
+        wallTimer = null;
+        log(`agent ran past its ${wall} ms limit; stopping it`);
+        stopAgent();
+        if (!socket.destroyed) {
+          socket.end(JSON.stringify({ jsonrpc: '2.0', id: null,
+            error: { code: -32000, message: 'The agent ran past the sandbox time limit and was stopped.' } }) + '\n');
+        }
+      }, wall);
+      wallTimer.unref?.();
       child.stdin.on('error', () => { /* the agent closed its stdin; exit/close handles the rest */ });
       child.stdout.on('data', (out) => socket.write(out));
       child.stderr.setEncoding('utf8');
@@ -116,15 +152,17 @@ function createSupervisor({ command, args = [], root, spawnFn = spawn, log = () 
 
     // The connection IS the lifetime. noevia hanging up, the task being cancelled and the web
     // container restarting all look the same from here, and all mean: stop the agent.
-    socket.on('close', stopAgent);
+    socket.on('close', () => { release(); stopAgent(); });
     socket.on('error', () => { stopAgent(); socket.destroy(); });
   });
 
-  return { server, listen: (port, host = '0.0.0.0') => new Promise((r) => server.listen(port, host, () => r(server.address()))),
-    close: () => new Promise((r) => { server.closeAllConnections?.(); server.close(() => r()); }) };
+  return { server, live: () => live, listen: (port, host = '0.0.0.0') => new Promise((r) => server.listen(port, host, () => r(server.address()))),
+    // net.Server has no closeAllConnections: every socket is tracked and destroyed here, so
+    // close() cannot wait forever on a connection whose agent never exits.
+    close: () => new Promise((r) => { for (const s of sockets) s.destroy(); server.close(() => r()); }) };
 }
 
-module.exports = { createSupervisor, insideRoot, cleanEnv, ALLOWED_ENV };
+module.exports = { createSupervisor, insideRoot, cleanEnv, ALLOWED_ENV, DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_WALL_MS };
 
 if (require.main === module) {
   const command = process.env.CODE_HARNESS_COMMAND;
@@ -134,7 +172,9 @@ if (require.main === module) {
     process.exit(2);
   }
   const { listen } = createSupervisor({ command, args: String(process.env.CODE_HARNESS_ARGS || '').split(' ').filter(Boolean),
-    root, log: (line) => console.log(`[code-sandbox] ${line}`) });
+    root, log: (line) => console.log(`[code-sandbox] ${line}`),
+    maxConnections: positive(process.env.CODE_SANDBOX_MAX_CONNECTIONS, DEFAULT_MAX_CONNECTIONS),
+    maxWallMs: positive(process.env.CODE_SANDBOX_MAX_WALL_MS, DEFAULT_MAX_WALL_MS) });
   listen(Number(process.env.PORT || 8030)).then((address) => {
     console.log(`[code-sandbox] listening on ${address.address}:${address.port}, workspaces under ${root}`);
   });
