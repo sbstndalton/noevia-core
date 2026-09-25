@@ -53,11 +53,11 @@ test('small and binary files are sent as they are', () => {
   assert.equal(font.headers['Content-Type'], 'font/woff2');
 });
 
-test('index.html is revalidated with an ETag and answers 304 when unchanged', () => {
+test('index.html is never cached (iOS standalone apps do not reliably revalidate) but still answers 304 for an in-flight conditional request', () => {
   const root = fixture();
   const files = createStaticFiles(root);
   const first = call(files, '/', { 'accept-encoding': 'br' });
-  assert.equal(first.headers['Cache-Control'], 'no-cache');
+  assert.equal(first.headers['Cache-Control'], 'no-store');
   assert.match(first.headers['Content-Type'], /^text\/html/);
   const again = call(files, '/', { 'accept-encoding': 'br', 'if-none-match': first.headers.ETag });
   assert.equal(again.status, 304);
@@ -67,6 +67,15 @@ test('index.html is revalidated with an ETag and answers 304 when unchanged', ()
   const changed = call(files, '/', { 'accept-encoding': 'br', 'if-none-match': first.headers.ETag });
   assert.equal(changed.status, 200);
   assert.match(zlib.brotliDecompressSync(changed.body).toString(), /y{2100}/);
+});
+
+test('version.json is never cached, so the stale-shell guard always sees the current build', () => {
+  const root = fixture();
+  fs.writeFileSync(path.join(root, 'version.json'), '{"version":"1.2.3"}');
+  const files = createStaticFiles(root);
+  const res = call(files, '/version.json');
+  assert.equal(res.headers['Cache-Control'], 'no-store');
+  assert.equal(res.headers['Content-Type'], 'application/json');
 });
 
 test('HEAD sends headers only', () => {

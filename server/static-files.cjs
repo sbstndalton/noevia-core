@@ -17,6 +17,15 @@ const TYPES = {
 const COMPRESSIBLE = new Set(['.html', '.js', '.css', '.svg', '.json', '.txt', '.webmanifest']);
 const IMMUTABLE = 'public, max-age=31536000, immutable';
 const REVALIDATE = 'no-cache';
+// index.html (and any other .html shell) gets the strongest possible directive:
+// a plain ETag-revalidated `no-cache` is enough for desktop/Android browsers,
+// but iOS Safari's cache for a standalone/home-screen web app has been observed
+// to keep serving a stale top-level navigation response without revalidating it
+// (issue #311) — the app shell then never fetches the JS bundle that carries
+// the current Logo. `no-store` forbids caching the response at all, so there is
+// nothing for that cache to serve stale. src/stale-shell-guard.ts is the
+// belt-and-suspenders fix for caches that ignore this header too.
+const NO_STORE = 'no-store';
 
 function createStaticFiles(root) {
   const cache = new Map();
@@ -67,9 +76,13 @@ function createStaticFiles(root) {
     const file = entry(filePath);
     const hashed = urlPath.startsWith('/assets/');
     const encoding = encodingFor(req, file);
+    // version.json is polled by src/stale-shell-guard.ts to detect a stale
+    // shell; it must never be served from any cache (client, CDN, or a proxy
+    // in between), or the check it powers becomes meaningless.
+    const cacheControl = hashed ? IMMUTABLE : (file.ext === '.html' || urlPath === '/version.json') ? NO_STORE : REVALIDATE;
     const headers = {
       'Content-Type': TYPES[file.ext] || 'application/octet-stream',
-      'Cache-Control': hashed ? IMMUTABLE : REVALIDATE,
+      'Cache-Control': cacheControl,
       ETag: encoding ? `${file.etag.slice(0, -1)}-${encoding}"` : file.etag,
     };
     if (Object.keys(file.encoded).length) headers.Vary = 'Accept-Encoding';
