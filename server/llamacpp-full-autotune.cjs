@@ -328,7 +328,7 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
     if (presets.snapshot().revision !== j._revision) { p.restored = false; return false; }
     try {
       await unloadAll({ restoring: true });
-      presets.commit({ baseRevision: j._revision, text: p._beforeText });
+      await presets.commit({ baseRevision: j._revision, text: p._beforeText });
       j._revision = presets.snapshot().revision; save();
       const reload = await request('/models?reload=1', {}, 120000);
       if (!reload.ok) throw Error('The router did not confirm restored settings.');
@@ -474,7 +474,7 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
           throw Error('The profile changed after the run.');
         const unloaded = await request('/models/unload', { method: 'POST', body: JSON.stringify({ model: j.model }) }, 60000);
         if (!unloaded.ok) throw Error('Could not unload the test model.');
-        presets.commit({ baseRevision: j.lastRevision, text: j.originalText });
+        await presets.commit({ baseRevision: j.lastRevision, text: j.originalText });
         const reload = await request('/models?reload=1', {}, 120000);
         if (!reload.ok) throw Error('The router did not confirm restored settings.');
         j.restored = true;

@@ -386,7 +386,7 @@ function createAutotuner(deps) {
       try {
         if (job.originalText != null && job.lastRevision && presets.snapshot().revision === job.lastRevision) {
           note(job, 'Putting the original settings back');
-          presets.commit({ baseRevision: job.lastRevision, text: job.originalText });
+          await presets.commit({ baseRevision: job.lastRevision, text: job.originalText });
           onWrite(presets.snapshot().revision);
           await request('/models?reload=1', {}, 120000).catch(() => {});
           job.restored = true;
@@ -450,7 +450,7 @@ function createAutotuner(deps) {
     const job = state.job;
     if (!job || job.status !== 'running') return;
     job.status = 'interrupted'; job.finishedAt = now(); job.error = 'noevia stopped during auto-tune.';
-    try { if (job.originalText != null && job.lastRevision) { presets.commit({ baseRevision: job.lastRevision, text: job.originalText }); job.restored = true; await request('/models?reload=1', {}, 120000).catch(() => {}); } } catch { job.restored = false; }
+    try { if (job.originalText != null && job.lastRevision) { await presets.commit({ baseRevision: job.lastRevision, text: job.originalText }); job.restored = true; await request('/models?reload=1', {}, 120000).catch(() => {}); } } catch { job.restored = false; }
     delete job.originalText; save();
   }
   load();

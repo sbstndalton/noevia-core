@@ -297,7 +297,7 @@ test('restart rolls back active phase only, then explicit Resume skips committed
   const beforeText = fs.readFileSync(f.ini, 'utf8');
   const store = createPresetStore(f.ini);
   const probe = store.prepare({ model: 'synthetic', baseRevision: store.snapshot().revision, options: { 'spec-type': 'ngram-simple' } });
-  store.commit(probe);
+  await store.commit(probe);
   state.job._revision = store.snapshot().revision;
   state.job.status = 'running'; item.status = 'running'; draft.status = 'running'; draft._beforeText = beforeText;
   fs.writeFileSync(f.stateFile, JSON.stringify(state));

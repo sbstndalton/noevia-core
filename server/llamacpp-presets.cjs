@@ -39,7 +39,7 @@ function parse(text) {
   });
   return {lines,sections};
 }
-function createPresetStore(file) {
+function createPresetStore(file,{writer=null}={}) {
   if(!file || !path.isAbsolute(file))throw error(500,'LLAMACPP_PRESET_PATH must be an absolute path');
   function read() {
     const stat=fs.lstatSync(file);
@@ -75,8 +75,11 @@ function createPresetStore(file) {
     if(Number(effective['ubatch-size'])>Number(effective['batch-size']))throw error(400,'Micro batch cannot exceed batch size');
     return {before:data.text,baseRevision:data.revision,text,revision:revision(text)};
   }
-  function commit(candidate) {
+  // Async in both modes so callers need not know who the writer is.
+  async function commit(candidate) {
     if(read().revision!==candidate.baseRevision)throw error(409,'Presets changed while applying. Reload before retrying.');
+    // Single-writer mode: the sidecar does the revision check, backup and atomic rename.
+    if(writer){await writer.write({baseRevision:candidate.baseRevision,text:candidate.text});return;}
     // Immutable recovery copy precedes the new file; contains operator settings.
     const backup=file+'.noevia-backup-'+candidate.baseRevision;
     try {const fd=fs.openSync(backup,'wx',0o600);try{fs.writeFileSync(fd,read().text);fs.fsyncSync(fd);}finally{fs.closeSync(fd);}}catch(e){if(e.code!=='EEXIST')throw e;}

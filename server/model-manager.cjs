@@ -1,8 +1,8 @@
 'use strict';
 
-function createModelManager({ kind, baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig, calibrationStatePath, calibrationOptions, evidenceDir, autotuneStatePath, autotuneTablePath, autotuneOptions }) {
+function createModelManager({ kind, baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig, calibrationStatePath, calibrationOptions, evidenceDir, autotuneStatePath, autotuneTablePath, autotuneOptions, presetWriter }) {
   const normalizedKind = String(kind || 'none').toLowerCase();
-  if (normalizedKind === 'llamacpp') return require('./llamacpp-manager.cjs').createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig, calibrationStatePath, calibrationOptions, evidenceDir, autotuneStatePath, autotuneTablePath, autotuneOptions });
+  if (normalizedKind === 'llamacpp') return require('./llamacpp-manager.cjs').createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig, calibrationStatePath, calibrationOptions, evidenceDir, autotuneStatePath, autotuneTablePath, autotuneOptions, presetWriter });
   const enabled = normalizedKind === 'lemonade';
   if (!enabled && normalizedKind !== 'none') {
     throw new Error(`unsupported MODEL_MANAGER_KIND: ${normalizedKind}`);

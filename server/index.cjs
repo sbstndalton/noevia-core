@@ -190,6 +190,8 @@ const folderSync = process.env.MODEL_LOADER_URL ? require('./model-folder-sync.c
 const modelManager = createModelManager({
   kind: MODEL_MANAGER_KIND,
   presetPath: process.env.LLAMACPP_PRESET_PATH,
+  // MODELS_INI_WRITER=model-loader makes the sidecar the single models.ini writer (#295).
+  presetWriter: require('./models-ini-writer.cjs').createModelsIniWriter({ mode: process.env.MODELS_INI_WRITER, url: process.env.MODEL_LOADER_URL, token: process.env.MODEL_LOADER_TOKEN, fetchJson }),
   autoconfig: {
     modelsPath: process.env.LLAMACPP_MODELS_PATH || '',
     budgetGib: Number(process.env.LLAMACPP_AUTOCONFIG_MEMORY_GIB) || require('./llamacpp-autoconfig.cjs').parseMemoryLimit(process.env.LLAMACPP_MEMORY_LIMIT) || 0,

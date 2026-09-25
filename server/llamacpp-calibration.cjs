@@ -78,7 +78,7 @@ function createCalibrator(deps) {
     job.error = 'noevia stopped during calibration.';
     try {
       if (job.originalText != null && job.lastRevision) {
-        presets.commit({ baseRevision: job.lastRevision, text: job.originalText });
+        await presets.commit({ baseRevision: job.lastRevision, text: job.originalText });
         job.restored = true;
         await request('/models?reload=1', {}, 120000).catch(() => {});
       }
@@ -359,7 +359,7 @@ function createCalibrator(deps) {
       // Put the original profile back; never overwrite a file someone else changed since.
       try {
         if (job.originalText != null && job.lastRevision && presets.snapshot().revision === job.lastRevision) {
-          presets.commit({ baseRevision: job.lastRevision, text: job.originalText });
+          await presets.commit({ baseRevision: job.lastRevision, text: job.originalText });
           onWrite(presets.snapshot().revision);
           await request('/models?reload=1', {}, 120000).catch(() => {});
           job.restored = true;
