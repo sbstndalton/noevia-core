@@ -303,7 +303,14 @@ function createChatHandler({
     // Projects without a provider field use the configured default provider.
     const projectProvider = project?.provider === 'lemonade' ? DEFAULT_PROVIDER_ID : project?.provider;
     // Auto is the default, so Auto without Fast/Smart roles behaves as Manual rather than refusing.
-    const wantsAuto = !!(project && project.routing === 'auto' && (!projectProvider || projectProvider === DEFAULT_PROVIDER_ID) && autoRoles());
+    //
+    // A free chat (no project at all — nobody has opened its per-chat model popup yet, so there
+    // is no explicit choice) starts on Auto too (#305): the only place an explicit choice for a
+    // free chat can come from is its own synthetic per-chat context project
+    // (diaryExtras.chatProjectId), which is exactly the `project` this resolves against above —
+    // once it exists with routing 'manual' and/or a model, that explicit choice wins below same
+    // as any other project. `project` stays null only while no explicit choice has been made.
+    const wantsAuto = !!((project ? project.routing === 'auto' : true) && (!projectProvider || projectProvider === DEFAULT_PROVIDER_ID) && autoRoles());
     const provider = getProvider(wantsAuto ? DEFAULT_PROVIDER_ID : projectProvider || DEFAULT_PROVIDER_ID);
 
     let model = (project && project.model) || null;

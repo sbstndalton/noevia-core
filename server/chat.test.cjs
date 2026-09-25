@@ -168,3 +168,107 @@ test('the creative heuristic promotes an otherwise fast-routed writing prompt', 
   assert.equal(meta.sampling.preset, 'creative');
   assert.deepEqual(meta.sampling.values, { temperature: 0.9, top_p: 0.95 });
 });
+
+// #305 (Opus review): a free chat (no project at all — nobody has opened its per-chat model
+// popup yet, so there is no explicit choice) routes through Auto when Fast/Smart roles are
+// configured, matching the composer label; it falls back to the loaded model exactly as before
+// when roles are not configured, so a server with no roles behaves exactly as today.
+async function runFreeChat(t, { project = null, rolesConfigured = true, loaded = 'loaded-model', message = 'Hello' } = {}) {
+  const os = require('node:os'), path = require('node:path'), fs = require('node:fs'), crypto = require('node:crypto');
+  const { EventEmitter } = require('node:events');
+  const { createToolboxes } = require('./toolboxes.cjs');
+  const { createToolExchange } = require('./tool-exchange.cjs');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-free-chat-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const user = { id: 'synthetic-user' };
+  const store = { workspace: { userId: user.id }, authn: { user } };
+  const requestScope = { getStore: () => store, run: (_scope, fn) => fn() };
+  const driveTools = { box: { id: 'gdrive', tools: [] }, connected: () => false, execute: async () => 'unused' };
+  const toolbox = createToolboxes({
+    boxes: [], driveTools, offered: () => false, mcpBoxes: () => [], mcpTools: () => new Map(),
+    prefill: { budgetFor: () => null, rateFor: () => 0 }, requestScope, scope: requestScope,
+    documentSources: { notice: () => '' }, workspace: () => ({ dir }),
+  });
+  const events = [], requests = [], jsonReplies = [];
+  const res = new EventEmitter();
+  res.writeHead = () => {}; res.write = (line) => events.push(JSON.parse(line.slice(6)));
+  res.end = () => { res.writableEnded = true; res.emit('finish'); };
+  const fetch = async (_url, options) => {
+    requests.push(JSON.parse(options.body));
+    return { ok: true, body: (async function* () { yield Buffer.from(`data: ${JSON.stringify({ choices: [{ delta: { content: 'Synthetic reply.' } }] })}\n\n`); })() };
+  };
+  const handler = createChatHandler({
+    fs, path, crypto, fetch, reasoningEffort: require('./reasoning-effort.cjs'), createToolExchange,
+    rag: { filesContext: async () => null }, prefill: { recordSample() {} }, reduceToolResult: require('./tool-result-reduce.cjs').reduceToolResult,
+    HISTORY_CAP: 20, DEFAULT_PROVIDER_ID: 'default', DIARY_BASE: 'http://fixture.invalid', TOOL_RESULT_CAP: 8000,
+    authService: { audit() {} }, toolPolicy: { mode: () => 'allow' },
+    modelManager: { enabled: true, load: async () => ({ ok: true }), health: async () => ({ ok: true, body: { all_models_loaded: ['fast-model', 'smart-model', 'the-loaded-model', 'explicitly-chosen-model', 'project-model'].map((model_name) => ({ model_name, loaded: true, recipe_options: { ctx_size: 32768 } })) } }) },
+    requestScope, currentWorkspace: () => ({ userId: user.id, dir }), json: (_res, status, body) => jsonReplies.push({ status, body }), getProject: () => project,
+    getProvider: () => ({ id: 'default', baseUrl: 'http://fixture.invalid', label: 'Mock' }), providerHeaders: () => ({}), saveChats() {}, endpointApproved: () => true,
+    diaryHeaders: () => ({}), diaryExtras: require('./diary-extras.cjs'),
+    autoRoles: () => rolesConfigured ? { fast: 'fast-model', smart: 'smart-model' } : null,
+    lastLoadedModel: () => loaded,
+    classifyFastOrSmart: async () => 'fast',
+    servedCatalogue: async () => [], modelsInstalled: async () => [], missingRoles: () => [], staleRolesError: () => null,
+    visionProbe: async () => ({ supported: false, reason: 'none' }), visionDescriptions: new Map(), skillsIndexFor: () => [],
+    chatSkillRouter: { select: async () => ({ loaded: [] }) }, chatToolRouter: { select: async (ids) => ({ ids, routed: false }) },
+    ...toolbox, oauthServerIds: () => new Set(), accountReady: () => true,
+    chatWideApproved: () => false, awaitApproval: async () => 'approve',
+    recordUsage() {}, recordToolUse() {},
+  });
+  await handler.handleChat({}, res, { message, projectId: project ? project.id : null, chatId: 'synthetic-free-chat', history: [] });
+  return { events, requests, jsonReplies };
+}
+
+test('a free chat with Fast/Smart roles configured routes via classifyFastOrSmart, not the loaded model', async (t) => {
+  const { events, requests } = await runFreeChat(t, { rolesConfigured: true });
+  assert.equal(events.some((e) => e.type === 'error'), false, JSON.stringify(events.filter((e) => e.type === 'error')));
+  assert.equal(requests[0].model, 'fast-model');
+  const meta = events.find((e) => e.type === 'meta');
+  assert.equal(meta.route, 'fast');
+});
+
+test('a free chat with no Fast/Smart roles configured falls back to the loaded model, exactly as before', async (t) => {
+  const { events, requests } = await runFreeChat(t, { rolesConfigured: false, loaded: 'the-loaded-model' });
+  assert.equal(events.some((e) => e.type === 'error'), false, JSON.stringify(events.filter((e) => e.type === 'error')));
+  assert.equal(requests[0].model, 'the-loaded-model');
+  const meta = events.find((e) => e.type === 'meta');
+  assert.equal(meta.route, undefined, 'no routing decision when Auto never engaged');
+});
+
+test('a free chat with neither roles configured nor a model loaded is refused, exactly as before', async (t) => {
+  const { requests, jsonReplies } = await runFreeChat(t, { rolesConfigured: false, loaded: null });
+  assert.equal(requests.length, 0);
+  assert.equal(jsonReplies.length, 1);
+  assert.equal(jsonReplies[0].status, 400);
+  assert.match(jsonReplies[0].body.error, /no model selected/);
+});
+
+test('an explicit per-chat choice (the free chat\'s own synthetic context project) always wins over Auto', async (t) => {
+  // routing: 'manual' + an explicit model is exactly what the composer\'s ModelPopup writes to
+  // the chat\'s own context project (diaryExtras.chatProjectId) once the person picks one.
+  const explicit = { id: 'cowork-chat-context-c1', model: 'explicitly-chosen-model', routing: 'manual', toolboxes: [], files: [] };
+  const { events, requests } = await runFreeChat(t, { project: explicit, rolesConfigured: true });
+  assert.equal(events.some((e) => e.type === 'error'), false, JSON.stringify(events.filter((e) => e.type === 'error')));
+  assert.equal(requests[0].model, 'explicitly-chosen-model');
+  const meta = events.find((e) => e.type === 'meta');
+  assert.equal(meta.route, undefined, 'an explicit model choice never goes through Auto routing');
+});
+
+test('a project explicitly set to manual routing is unaffected by the free-chat Auto default', async (t) => {
+  const project = { id: 'p1', model: 'project-model', routing: 'manual', toolboxes: [], files: [] };
+  const { events, requests } = await runFreeChat(t, { project, rolesConfigured: true });
+  assert.equal(events.some((e) => e.type === 'error'), false, JSON.stringify(events.filter((e) => e.type === 'error')));
+  assert.equal(requests[0].model, 'project-model');
+  const meta = events.find((e) => e.type === 'meta');
+  assert.equal(meta.route, undefined);
+});
+
+test('a project explicitly set to auto routing is unaffected (unchanged pre-existing behaviour)', async (t) => {
+  const project = { id: 'p1', model: 'unused', routing: 'auto', toolboxes: [], files: [] };
+  const { events, requests } = await runFreeChat(t, { project, rolesConfigured: true });
+  assert.equal(events.some((e) => e.type === 'error'), false, JSON.stringify(events.filter((e) => e.type === 'error')));
+  assert.equal(requests[0].model, 'fast-model');
+  const meta = events.find((e) => e.type === 'meta');
+  assert.equal(meta.route, 'fast');
+});
