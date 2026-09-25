@@ -88,7 +88,7 @@ const authService = createAuth({
     .filter(Boolean),
 });
 const decisionSettings = require('./decision-settings.cjs').createDecisionSettings({ store: require('./features.cjs').settingsStore(authService.db), audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail) });
-const features = require('./features.cjs').createFeatures({ store: require('./features.cjs').settingsStore(authService.db), audit: (action, actor, detail) => authService.audit(action, actor, actor, detail), availability:{stepSupervision:decisionSettings.unavailable,systemOneRouting:()=>decisionSettings.unavailable() && require('./system-one-router.cjs').configuration().reason} });
+const features = require('./features.cjs').createFeatures({ store: require('./features.cjs').settingsStore(authService.db), audit: (action, actor, detail) => authService.audit(action, actor, actor, detail), availability:{stepSupervision:decisionSettings.unavailable,toolGate:decisionSettings.unavailable,systemOneRouting:()=>decisionSettings.unavailable() && require('./system-one-router.cjs').configuration().reason} });
 const featureRoutes = require('./routes/features.cjs').createFeatureRoutes({ features, json, readJson, decisionSettings });
 const pluginDirectoryRoutes = require('./routes/plugin-directory.cjs').createPluginDirectoryRoutes({ json });
 // Settings → Data: the signed-in user's conversations as a ZIP (routes/export.cjs).
@@ -507,6 +507,21 @@ const systemOneRouter = require('./system-one-router.cjs').createSystemOneRouter
   fallback: message => autoRouter.classify(message),
 });
 const classifyFastOrSmart = (message) => systemOneRouter.classifyWithDetails(message);
+// Tool gate (features.toolGate): rules first, then the same decision service as System-One.
+// One decision layer per configured backend, so its deadline benching survives between chats.
+let toolGateBackend = null, toolGateDecisions = null;
+const toolGate = require('./tool-gate.cjs').createToolGate({
+  enabled: () => features.enabled('toolGate'),
+  isWriteTool: (name) => isWriteTool(name),
+  deadlineMs: () => decisionSettings.get().timeoutMs,
+  log: (entry) => recordDecision('tool-gate', entry),
+  decide: (request) => {
+    const backend = decisionSettings.backend();
+    if (!backend) throw Error('Decision service unavailable');
+    if (backend !== toolGateBackend) { toolGateBackend = backend; toolGateDecisions = require('./decision/index.cjs').createDecisions({ backends: { configured: backend }, chains: { 'tool.gate': ['configured'] } }); }
+    return toolGateDecisions.decide(request);
+  },
+});
 
 // ── Chat: the loop lives in chat.cjs; everything it needs is handed over here ──
 const { handleChat } = require('./chat.cjs').createChatHandler({
@@ -523,7 +538,7 @@ const { handleChat } = require('./chat.cjs').createChatHandler({
   authService, toolPolicy, modelManager, requestScope, currentWorkspace, json,
   getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders,
   autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError,
-  visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter,
+  visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, toolGate,
   DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall,
   oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse,
 });

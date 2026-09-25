@@ -69,3 +69,15 @@ test('features wired at startup report a pending restart instead of pretending t
   assert.equal(features.describe().find((f) => f.name === 'previews').pendingRestart, false);
   assert.equal(createFeatures({ env: {}, store: { get: (k) => m.get(k), set() {} } }).enabled('previews'), true);
 });
+
+test('toolGate is experimental, off by default and unavailable until the decision service is configured', () => {
+  const { createFeatures: make } = require('./features.cjs');
+  const off = make({ env: {} });
+  const info = off.describe().find((f) => f.name === 'toolGate');
+  assert.equal(info.experimental, true); assert.equal(info.enabled, false); assert.equal(info.env, 'NOEVIA_FEATURE_TOOL_GATE');
+  assert.match(info.unavailable, /COWORK_DECISION_URL/);
+  assert.equal(off.enabled('toolGate'), false);
+  const pinned = make({ env: { NOEVIA_FEATURE_TOOL_GATE: 'true', COWORK_DECISION_URL: 'http://laya:8040' } });
+  assert.equal(pinned.enabled('toolGate'), true);
+  assert.equal(make({ env: { NOEVIA_FEATURE_TOOL_GATE: 'true' } }).enabled('toolGate'), false, 'unavailable wins over the env pin');
+});
