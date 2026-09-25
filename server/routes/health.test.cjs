@@ -3,7 +3,7 @@
 // skipped (null) for an account without the add-on, and a probe that throws reads as down.
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createHealthRoutes } = require('./health.cjs');
+const { createHealthRoutes, createReadyRoutes } = require('./health.cjs');
 
 function fixture({ diary = true, inference = async () => ({ ok: true }), sidecar = async () => ({ ok: true }), rag = true } = {}) {
   const sent = [], probed = [];
@@ -40,4 +40,24 @@ test('without the Diary add-on the sidecar is not probed and reads null; a throw
   const down = fixture({ inference: async () => { throw new Error('ECONNREFUSED'); }, sidecar: async () => ({ ok: false }) });
   await down.call('/api/health');
   assert.deepEqual(down.sent.pop(), { status: 200, body: { inferenceUp: false, lemonadeUp: false, diaryUp: false, ragAvailable: true } });
+});
+
+// #297: unauthenticated, no tenant/upstream detail, just whether startup wiring has finished.
+test('/api/ready is unauthenticated and reports only {ready, version}', async () => {
+  const sent = [];
+  let readyFlag = false;
+  const routes = createReadyRoutes({ json: (res, status, body) => { sent.push({ status, body }); }, isReady: () => readyFlag, version: '1.2.3' });
+  assert.equal(await routes({ method: 'GET' }, {}, { path: '/api/other' }), false, 'unmatched paths pass through');
+  assert.equal(await routes({ method: 'GET' }, {}, { path: '/api/ready' }), true);
+  assert.deepEqual(sent.pop(), { status: 200, body: { ready: false, version: '1.2.3' } });
+  readyFlag = true;
+  await routes({ method: 'GET' }, {}, { path: '/api/ready' });
+  assert.deepEqual(sent.pop(), { status: 200, body: { ready: true, version: '1.2.3' } });
+});
+
+test('/api/ready ignores non-GET methods and never needs an authn context', async () => {
+  const sent = [];
+  const routes = createReadyRoutes({ json: (res, status, body) => { sent.push({ status, body }); }, isReady: () => true, version: 'v' });
+  assert.equal(await routes({ method: 'POST' }, {}, { path: '/api/ready' }), false);
+  assert.equal(sent.length, 0);
 });

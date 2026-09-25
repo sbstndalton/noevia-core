@@ -218,6 +218,27 @@ test('a client that disconnects mid-check does not take the proxy down with it',
   }
 });
 
+test('the egress bind narrows to the code-network alias, not every interface (#296)', async () => {
+  const { resolveEgressBind } = require('./code-egress.cjs');
+  // An explicit CODE_EGRESS_BIND always wins.
+  assert.deepEqual(
+    await resolveEgressBind({ CODE_EGRESS_BIND: '10.0.0.5' }, 'egress', { lookup: async () => { throw Error('should not be called'); } }),
+    { address: '10.0.0.5', fallback: false },
+  );
+  // No override: resolve web's own address on the `code` network by looking up the same alias
+  // (`egress`) the sandbox is given, rather than binding 0.0.0.0 across every network web joins.
+  assert.deepEqual(
+    await resolveEgressBind({}, 'egress', { lookup: async (h) => (h === 'egress' ? { address: '172.20.0.3' } : Promise.reject(Error('wrong host'))) }),
+    { address: '172.20.0.3', fallback: false },
+  );
+  // No compose override at all (CODE_EGRESS_PORT set without the code-sandbox override): the
+  // alias does not resolve, so this fails closed to loopback instead of wide open — and says why.
+  const fallback = await resolveEgressBind({}, 'egress', { lookup: async () => { throw Error('ENOTFOUND'); } });
+  assert.equal(fallback.address, '127.0.0.1');
+  assert.equal(fallback.fallback, true);
+  assert.equal(fallback.reason, 'ENOTFOUND');
+});
+
 test('the deployment proxy starts only when a port is configured', async () => {
   const { startEgressFromEnv } = require('./code-egress.cjs');
   assert.equal(startEgressFromEnv({}), null);
@@ -225,7 +246,8 @@ test('the deployment proxy starts only when a port is configured', async () => {
   assert.throws(() => startEgressFromEnv({ CODE_EGRESS_PORT: '8040', CODE_EGRESS_HOST: 'bad host/' }), /host name/);
   const proxy = startEgressFromEnv({ CODE_EGRESS_PORT: '0' });
   assert.equal(proxy, null);
-  const live = startEgressFromEnv({ CODE_EGRESS_PORT: '38740', CODE_EGRESS_BIND: '127.0.0.1' });
+  const events = [];
+  const live = startEgressFromEnv({ CODE_EGRESS_PORT: '38740', CODE_EGRESS_BIND: '127.0.0.1' }, { log: (e) => events.push(e) });
   try {
     assert.equal(live.endpoint, 'egress:38740');
     await new Promise((r) => live.server.listening ? r() : live.server.once('listening', r));
@@ -234,7 +256,53 @@ test('the deployment proxy starts only when a port is configured', async () => {
       require('node:http').get({ host: '127.0.0.1', port: 38740, path: 'http://example.com/' }, (res) => { res.resume(); resolve(res.statusCode); }).on('error', () => resolve('error'));
     });
     assert.equal(status, 407);
+    // Once bound, the address and port it actually bound to are logged (finding: operators had
+    // no way to see this via `docker logs ... | grep egress`).
+    const listening = events.find((e) => e.event === 'egress.listening');
+    assert.ok(listening, 'expected an egress.listening log entry');
+    assert.equal(listening.bind, '127.0.0.1');
+    assert.equal(listening.port, 38740);
   } finally { live.server.close(); }
+});
+
+test('a silent loopback fallback (alias not resolvable) is logged with its reason', async () => {
+  const { startEgressFromEnv } = require('./code-egress.cjs');
+  const events = [];
+  const live = startEgressFromEnv({ CODE_EGRESS_PORT: '38741' }, {
+    log: (e) => events.push(e),
+    lookup: async () => { throw Error('ENOTFOUND egress'); },
+  });
+  try {
+    await new Promise((r) => live.server.listening ? r() : live.server.once('listening', r));
+    const fallback = events.find((e) => e.event === 'egress.bind_fallback_loopback');
+    assert.ok(fallback, 'expected an egress.bind_fallback_loopback log entry');
+    assert.equal(fallback.host, 'egress');
+    assert.match(fallback.reason, /ENOTFOUND/);
+  } finally { live.server.close(); }
+});
+
+test('a failed listen is logged as egress.bind_failed and crashes the process like any other startup failure', async () => {
+  // Run in a child process: the module's `error` handler rethrows on purpose, and under
+  // node:test itself an uncaught exception would just fail the current test rather than
+  // demonstrate the crash this is meant to verify.
+  const blocker = require('node:net').createServer();
+  await new Promise((r) => blocker.listen(0, '127.0.0.1', r));
+  const port = blocker.address().port;
+  try {
+    const child = require('node:child_process').spawnSync(process.execPath, ['-e', `
+      const { startEgressFromEnv } = require(${JSON.stringify(require.resolve('./code-egress.cjs'))});
+      startEgressFromEnv({ CODE_EGRESS_PORT: '${port}', CODE_EGRESS_BIND: '127.0.0.1' },
+        { log: (e) => console.log(JSON.stringify(e)) });
+    `], { encoding: 'utf8' });
+    assert.notEqual(child.status, 0, 'expected the process to exit non-zero on a failed bind');
+    const failed = child.stdout.split('\n').filter(Boolean).map((l) => JSON.parse(l))
+      .find((e) => e.event === 'egress.bind_failed');
+    assert.ok(failed, `expected an egress.bind_failed log entry, got stdout: ${child.stdout}`);
+    assert.match(failed.error, /EADDRINUSE/);
+    assert.match(child.stderr, /EADDRINUSE/);
+  } finally {
+    await new Promise((r) => blocker.close(r));
+  }
 });
 
 test("a task's network activity is tallied by host, refusals first, and forgotten once read", async () => {

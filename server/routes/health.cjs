@@ -4,6 +4,10 @@
 //
 // Returns true when it handled the request. Auth runs before routes are mounted. Both probes
 // are short and settle independently, so one sidecar being down never hides the other.
+//
+// GET /api/ready (#297) is separate and unauthenticated: it answers only whether the process has
+// finished startup wiring, as {ready, version}. No tenant data, no upstream detail — a caller
+// needs this before a session exists to check it with.
 
 const PASS = Symbol('unhandled');
 
@@ -45,4 +49,21 @@ function createHealthRoutes({ json, fetchJson, getProvider, providerHeaders, DEF
   };
 }
 
-module.exports = { createHealthRoutes };
+/**
+ * GET /api/ready, mounted unauthenticated before the session gate (like the sign-in routes).
+ * @param {object} deps
+ * @param {(res, status, body) => any} deps.json
+ * @param {() => boolean} deps.isReady   true once startup wiring has finished
+ * @param {string} deps.version          reported as-is; no upstream or tenant detail
+ */
+function createReadyRoutes({ json, isReady, version }) {
+  return async function readyRoutes(req, res, { path: p }) {
+    if (p === '/api/ready' && req.method === 'GET') {
+      json(res, 200, { ready: !!isReady(), version: String(version || '') });
+      return true;
+    }
+    return false;
+  };
+}
+
+module.exports = { createHealthRoutes, createReadyRoutes };

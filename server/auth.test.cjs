@@ -9,6 +9,9 @@ const test = require('node:test');
 
 const testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cowork-auth-test-'));
 process.env.DIARY_AUTH_TOKEN = 'test-cowork-token';
+// #294: UI_AUTH_TOKEN no longer falls back to DIARY_AUTH_TOKEN, so the legacy bearer tests below
+// need it set explicitly.
+process.env.UI_AUTH_TOKEN = 'test-cowork-token';
 process.env.UI_DATA_DIR = testDataDir;
 process.env.LEGACY_AUTH_COMPAT = 'true';
 process.env.PUBLIC_ORIGIN = 'http://localhost';

@@ -55,11 +55,13 @@ const DEFAULT_PROVIDER_LABEL = process.env.DEFAULT_PROVIDER_LABEL || 'Local infe
 const MODEL_MANAGER_KIND = process.env.MODEL_MANAGER_KIND || (process.env.LEMONADE_BASE_URL ? 'lemonade' : 'none');
 const MODEL_MANAGER_BASE = process.env.MODEL_MANAGER_BASE_URL || process.env.LEMONADE_BASE_URL || INFERENCE_BASE;
 const DIARY_BASE = process.env.DIARY_BASE_URL || 'http://cowork-diary-companion:8010';
-const DIARY_TOKEN = process.env.DIARY_AUTH_TOKEN || '';
 // Per-request Diary tenant assertion key (M2, docs/spec-managed-diary.md). Deploy the sidecar first.
 const DIARY_TENANT_KEY = (process.env.DIARY_TENANT_KEY || '').trim();
 const DIARY_SOURCE = process.env.DIARY_SOURCE || 'sidecar';
-const UI_AUTH_TOKEN = (process.env.UI_AUTH_TOKEN || DIARY_TOKEN).trim();
+// #294: DIARY_AUTH_TOKEN and UI_AUTH_TOKEN are independent — see auth-tokens.cjs.
+const authTokens = require('./auth-tokens.cjs').resolveAuthTokens(process.env);
+const DIARY_TOKEN = authTokens.diaryToken;
+const UI_AUTH_TOKEN = authTokens.uiAuthToken;
 const DIST_DIR = path.join(__dirname, '..', 'dist');
 const DATA_DIR = process.env.UI_DATA_DIR || path.join(__dirname, 'ui-data');
 // Messages offered to the context projection per request. Compaction summarizes whatever does not
@@ -76,7 +78,7 @@ const authService = createAuth({
   publicOrigin: process.env.PUBLIC_ORIGIN || '',
   rpId: process.env.WEBAUTHN_RP_ID || '',
   legacyToken: UI_AUTH_TOKEN,
-  legacyCompat: process.env.LEGACY_AUTH_COMPAT === 'true',
+  legacyCompat: authTokens.legacyCompat,
   secrets: secretStore,
   trustProxy: process.env.TRUST_PROXY === 'true',
   // Lets password/session login also work from e.g. a bare LAN IP alongside
@@ -617,6 +619,11 @@ const reasoningSettingsRoutes = require('./routes/reasoning-settings.cjs').creat
 const samplingSettingsRoutes = require('./routes/sampling-settings.cjs').createSamplingSettingsRoutes({ json, readBody, authService });
 // GET /api/health: the default provider, the Diary sidecar and retrieval (routes/health.cjs).
 const healthRoutes = require('./routes/health.cjs').createHealthRoutes({ json, fetchJson, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, DIARY_BASE, diaryHeaders, authService, rag });
+// GET /api/ready (#297): unauthenticated, mounted before the session gate below alongside the
+// sign-in routes. isReady is set once startup wiring under require.main finishes (see below).
+const readyRoutes = require('./routes/health.cjs').createReadyRoutes({
+  json, isReady: () => processReady, version: process.env.STAMP_VERSION || require('../package.json').version,
+});
 // GET /api/toolboxes: the picker view (routes/toolboxes.cjs). MCP state is read at call time.
 const toolboxRoutes = require('./routes/toolboxes.cjs').createToolboxRoutes({
   discoverMcpTools: () => discoverMcpTools(), toolboxSummaries, json,
@@ -667,6 +674,7 @@ async function handleRequestScoped(req, res) {
     if (await diaryRoutes.connector(req, res, { path: p })) return;
     if ((p === '/api/instance' || p === '/.well-known/webauthn') && await webAddressRoutes(req, res, { path: p, authn: null })) return;
     if (await authRoutes.open(req, res, { path: p })) return;
+    if (await readyRoutes(req, res, { path: p })) return;
 
     const authn = p.startsWith('/api/') ? authService.authenticate(req) : null;
     if (p.startsWith('/api/') && !publicAuthRoutes.has(p) && !authn) return unauthorized(res);
@@ -741,11 +749,12 @@ async function handleRequest(req,res) {
   try {return await handleRequestInner(req,res);}finally{if(leave && (res.writableEnded||res.destroyed))leave();}
 }
 
+// #297: GET /api/ready flips true once startup wiring below has run and the server is listening.
+let processReady = false;
+
 if (require.main === module) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
-  if (!UI_AUTH_TOKEN) {
-    console.warn('WARNING: Set DIARY_AUTH_TOKEN to protect the internal diary connection. Browser accounts remain authenticated.');
-  }
+  authTokens.warnings.forEach((w) => console.warn(w));
   if (!DIARY_TENANT_KEY) console.warn('WARNING: DIARY_TENANT_KEY is unset; Diary calls carry no tenant assertion and remote storage secrets ride on every call.');
   const server = http.createServer((req, res) => { handleRequest(req, res).catch(() => { if (!res.destroyed) res.destroy(); }); });
   staticFiles.warm();
@@ -863,6 +872,7 @@ if (require.main === module) {
     console.error('[noevia] unhandled promise rejection:', reason?.stack || reason);
   });
   server.listen(PORT, HOST, () => {
+    processReady = true;
     console.log(`cowork-ui listening on http://${HOST}:${PORT} (inference: ${INFERENCE_BASE}, manager: ${modelManager.kind}, diary: ${DIARY_BASE}, mcp: ${mcpWiring.enabled() ? MCP_SERVERS.map((sv) => sv.id).join('+') : 'disabled'})`);
     // Warm the tool catalogue so the first chat does not pay for discovery.
     // Never blocks startup: a side-car that is still booting must not stop

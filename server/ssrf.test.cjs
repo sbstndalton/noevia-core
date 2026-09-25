@@ -89,6 +89,9 @@ test('endpointApproved exempts admins, matches members against the exact approve
 
 const testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cowork-ssrf-test-'));
 process.env.DIARY_AUTH_TOKEN = 'test-cowork-token';
+// #294: UI_AUTH_TOKEN no longer falls back to DIARY_AUTH_TOKEN; the admin Bearer requests below
+// need it set explicitly.
+process.env.UI_AUTH_TOKEN = 'test-cowork-token';
 process.env.UI_DATA_DIR = testDataDir;
 process.env.LEGACY_AUTH_COMPAT = 'true';
 process.env.PUBLIC_ORIGIN = 'http://localhost';
