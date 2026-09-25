@@ -45,7 +45,7 @@ function clientMessage(e, fallback) {
  * @param {object} deps.service   models.cjs
  */
 function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe, reportedTokenRate, missingRoles, currentWorkspace, service }) {
-  const { modelScanCache, refreshModelScan, autoRoles, setAutoRoles, ensureRolesLoaded, servedCatalogue, modelsInstalled, deriveUserModelName } = service;
+  const { modelScanCache, refreshModelScan, autoRoles, setAutoRoles, ensureRolesLoaded, servedCatalogue, modelsInstalled, deriveUserModelName, lastLoadedModel, clearLastLoadedModel, clearRoleReferences } = service;
 
   async function handle(req, res, { path: p, authn, url }) {
     if (p.startsWith('/api/models/') && !['GET', 'HEAD'].includes(req.method || 'GET') && authn.user.role !== 'admin') {
@@ -159,6 +159,13 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
         const bad=require('../chat-model-kind.cjs').nonChatAliases(Array.isArray(payload.aliases)?payload.aliases:[],await servedCatalogue());
         if(bad.length)return json(res,400,{error:`The prompt suite needs chat models; ${bad.join(', ')} ${bad.length===1?'is':'are'} an embedding, reranking or routing model.`});
       }
+      // Set only for POST models/delete, and read again once the forwarded delete has
+      // succeeded (below): the folder-scan proxy deletes files directly through the model
+      // management service, bypassing modelManager entirely — the only way to unload a model
+      // deleted this way, and to clear the roles/last-loaded default that named it, is to
+      // resolve the deleted keys back to the engine model id(s) (a scanned entry's modelId and
+      // every models.ini section it backed) using the SAME scan this guard already reads.
+      let deleteKeys=null, deleteScanned=null;
       if(method==='POST'&&rest==='models/delete'){
         let payload; try{payload=JSON.parse(body||'{}');}catch{payload={};}
         const keys=Array.isArray(payload.models)?payload.models:[];
@@ -174,6 +181,7 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
           const blocked=keys.some(key=>{const entry=scanned.find(f=>f.key===key);return entry&&(isSystemModel(entry.modelId)||(entry.sections||[]).some(s=>isSystemModel(s)));});
           if(blocked)return json(res,400,{error:SYSTEM_MODEL_DELETE_REASON});
         }
+        deleteKeys=keys; deleteScanned=scanned;
       }
       // sections/<name> (and its /rename variant) can delete or rename a models.ini section directly;
       // block that for Laya's section the same way models/delete is blocked above.
@@ -200,6 +208,30 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
         for(const {model,record} of require('../benchmark-evidence.cjs').throughputRecords(detail))modelManager.recordEvidence(model,record).catch(()=>undefined);
       }
       if(result.ok&&method==='GET'&&rest==='models'&&!url.search)modelScanCache.set('models',{at:Date.now(),body:detail});
+      // #302: the folder-scan delete above only removed files through the model management
+      // service — it never touched the live engine or the auto-router roles. Run the same
+      // cleanup /api/models/delete runs, for every engine id the deleted files backed.
+      if(result.ok&&deleteKeys&&deleteKeys.length){
+        const ids=new Set();
+        for(const key of deleteKeys){
+          const entry=Array.isArray(deleteScanned)?deleteScanned.find(f=>f.key===key):null;
+          if(!entry)continue;
+          if(entry.modelId)ids.add(entry.modelId);
+          for(const section of entry.sections||[])ids.add(section);
+        }
+        let unloaded=false; const rolesCleared=new Set();
+        for(const id of ids){
+          if(typeof modelManager.unload==='function'){
+            const u=await modelManager.unload(id).catch(()=>null);
+            if(u?.ok)unloaded=true;
+          }
+          for(const role of clearRoleReferences(id))rolesCleared.add(role);
+          if(lastLoadedModel()===id)clearLastLoadedModel(id);
+          if(typeof modelManager.forgetIdentity==='function')modelManager.forgetIdentity(id);
+        }
+        modelScanCache.clear();
+        return json(res,result.status,{...detail,unloaded,rolesCleared:[...rolesCleared]});
+      }
       return json(res,result.status,result.ok?detail:{error:detail.detail||detail.error||'Model management request failed.'});
     }
 
@@ -373,8 +405,38 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
         const row = listing.body.data.find(m => m.id === body.name);
         if (row && isSystemModel(row.id, modelPathFromArgs(row.status?.args || []))) return json(res, 400, { error: SYSTEM_MODEL_DELETE_REASON });
       }
-      const r = await modelManager.deleteModel(body.name);
-      return json(res, r.ok ? 200 : 502, r.ok ? { ok: true } : { error: `delete failed: ${r.status}` });
+      // Confirm the model is known before touching it: an unknown name 404s instead of
+      // forwarding a delete the manager might silently accept for anything. When the
+      // installed list cannot be read (engine unreachable) this check is skipped and the
+      // delete below is attempted anyway, same as before this existence check existed.
+      let installed = null;
+      try { installed = await modelsInstalled(); } catch { installed = null; }
+      const entry = Array.isArray(installed) ? installed.find((m) => m.name === body.name) : null;
+      if (Array.isArray(installed) && !entry) return json(res, 404, { error: `model not found: ${body.name}` });
+      // Unload first: a loaded model can refuse deletion or leave its file locked. Tolerate
+      // the manager reporting "not loaded" (or being momentarily unreachable) — the delete
+      // below still goes ahead either way. removeModel (llama.cpp) holds a single mutate()
+      // gate across both calls and retries the unload once if the delete is refused, so an
+      // on-demand load cannot slip in between; other manager kinds fall back to the two calls.
+      let unloaded = false, r;
+      if (typeof modelManager.removeModel === 'function') {
+        r = await modelManager.removeModel(body.name);
+        unloaded = !!r.unloaded;
+      } else {
+        if (!entry || entry.loaded) {
+          const u = await modelManager.unload(body.name).catch(() => null);
+          unloaded = !!u?.ok;
+        }
+        r = await modelManager.deleteModel(body.name);
+      }
+      if (!r.ok) return json(res, 502, { error: `delete failed: ${r.status}`, unloaded });
+      // The model is gone: drop every auto-role that pointed at it, the shared "last loaded
+      // model" default if it was this one, and the cached folder scan, so nothing still
+      // served by this route can hand the deleted name back out.
+      const rolesCleared = clearRoleReferences(body.name);
+      if (lastLoadedModel() === body.name) clearLastLoadedModel(body.name);
+      modelScanCache.clear();
+      return json(res, 200, { ok: true, unloaded, rolesCleared });
     }
 
     for (const verb of ['load', 'unload']) {

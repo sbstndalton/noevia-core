@@ -7,9 +7,13 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { createModelService } = require('./models.cjs');
 
-function fixture({ enabled = true, routing = false, models = [], loaded = [], env = {}, fetchJson } = {}) {
+function makeWorkspace(autoRoles = null) {
+  return { autoRoles, saves: 0, saveAutoRoles() { this.saves += 1; } };
+}
+
+function fixture({ enabled = true, routing = false, models = [], loaded = [], env = {}, fetchJson, otherWorkspaces = [] } = {}) {
   const calls = [];
-  const workspace = { autoRoles: null, saves: 0, saveAutoRoles() { this.saves += 1; } };
+  const workspace = makeWorkspace();
   const modelManager = {
     enabled, capabilities: { routing },
     requireEnabled() { if (!enabled) throw new Error('model management is disabled'); },
@@ -20,6 +24,7 @@ function fixture({ enabled = true, routing = false, models = [], loaded = [], en
   const service = createModelService({
     fetchJson: fetchJson || (async (url, init) => { calls.push(['fetch', url, init]); return { ok: true, status: 200, body: { unregistered: ['x'] } }; }),
     env, modelManager, currentWorkspace: () => workspace,
+    listWorkspaces: () => [workspace, ...otherWorkspaces],
   });
   return { service, workspace, calls, modelManager };
 }
@@ -92,6 +97,52 @@ test('the manager call carries the token and the folder scan is cached once', as
   const unset = fixture({ env: {} });
   unset.service.refreshModelScan();
   assert.equal(unset.calls.length, 0, 'no service URL: nothing to scan');
+});
+
+test('clearRoleReferences drops the optional roles and falls the required ones back to each other', () => {
+  const f = fixture();
+  assert.deepEqual(f.service.clearRoleReferences('m'), [], 'no roles configured yet: nothing to clear');
+
+  f.service.setAutoRoles({ fast: 'm', smart: 'keep', vision: 'm', code: 'keep-code' });
+  assert.deepEqual(f.service.clearRoleReferences('m'), ['fast', 'vision']);
+  assert.deepEqual(f.service.autoRoles(), { fast: 'keep', smart: 'keep', code: 'keep-code' });
+
+  assert.deepEqual(f.service.clearRoleReferences('nope'), [], 'a model no role points at clears nothing and does not resave');
+});
+
+test('when both required roles would end up empty, the whole config is unset rather than saved as fast:\'\' smart:\'\'', () => {
+  const f = fixture();
+  f.service.setAutoRoles({ fast: 'm', smart: 'm' });
+  const savesBefore = f.workspace.saves;
+  assert.deepEqual(f.service.clearRoleReferences('m'), ['fast', 'smart'], 'both required roles pointed at the deleted model, with no candidate left');
+  assert.equal(f.service.autoRoles(), null, 'unset (null), not { fast: "", smart: "" } — chat.cjs reads this as "not configured yet"');
+  assert.equal(f.workspace.saves, savesBefore + 1);
+});
+
+test('clearRoleReferences fixes every workspace it can see, not just the current one, and reports only the current workspace\'s cleared roles', () => {
+  const other1 = makeWorkspace({ fast: 'm', smart: 'other-smart' });
+  const other2 = makeWorkspace({ fast: 'untouched', smart: 'also-untouched', vision: 'm' });
+  const f = fixture({ otherWorkspaces: [other1, other2] });
+  f.service.setAutoRoles({ fast: 'keep-fast', smart: 'm' });
+
+  const cleared = f.service.clearRoleReferences('m');
+
+  assert.deepEqual(cleared, ['smart'], 'the return value only describes the current (requesting) workspace');
+  assert.deepEqual(f.service.autoRoles(), { fast: 'keep-fast', smart: 'keep-fast' }, 'current workspace: smart falls back to fast');
+  assert.deepEqual(other1.autoRoles, { fast: 'other-smart', smart: 'other-smart' }, 'other workspace 1 is fixed silently: fast falls back to smart');
+  assert.equal(other1.saves, 1);
+  assert.deepEqual(other2.autoRoles, { fast: 'untouched', smart: 'also-untouched' }, 'other workspace 2: the optional vision role referencing it is dropped');
+  assert.equal(other2.saves, 1);
+});
+
+test('clearLastLoadedModel only clears when the name still matches (a load in between is left alone)', async () => {
+  const f = fixture({ models: [{ id: 'm' }], loaded: ['m'] });
+  await f.service.modelsInstalled();
+  assert.equal(f.service.lastLoadedModel(), 'm');
+  f.service.clearLastLoadedModel('other');
+  assert.equal(f.service.lastLoadedModel(), 'm', 'clearing a different name is a no-op');
+  f.service.clearLastLoadedModel('m');
+  assert.equal(f.service.lastLoadedModel(), null);
 });
 
 test('a checkpoint becomes a namespaced user model name', () => {

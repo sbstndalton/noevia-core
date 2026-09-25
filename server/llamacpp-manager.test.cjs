@@ -168,3 +168,47 @@ test('with RAG rerank on, the reranker also stays beside the chat model',async()
   assert.deepEqual(unloaded,['chat-a']);assert.equal(state['fixture-rerank'],'loaded');
  }finally{for(const k of keys){if(prev[k]===undefined)delete process.env[k];else process.env[k]=prev[k];}}
 });
+
+// removeModel (#302 follow-up): unload and delete inside a single mutate() gate, with the
+// delete retried once (after one more unload attempt) if the router refuses it the first time.
+test('removeModel unloads then deletes as one call, and reports unloaded:true on success',async()=>{
+ const calls=[];
+ const manager=createModelManager({fetchStream:async()=>({ok:false}),kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async(url,options)=>{
+  const path=new URL(url).pathname;calls.push(`${options?.method||'GET'} ${path}`);
+  if(path==='/models/unload')return {ok:true,status:200,body:{success:true}};
+  if(path==='/models'&&options?.method==='DELETE')return {ok:true,status:200,body:{deleted:true}};
+  return {ok:true,status:200,body:{}};
+ }});
+ const r=await manager.removeModel('gone');
+ assert.equal(r.ok,true);assert.equal(r.unloaded,true);
+ assert.deepEqual(calls,['POST /models/unload','DELETE /models'],'unload happens before delete, exactly once each on the happy path');
+});
+
+test('removeModel retries the unload once, then retries the delete, if the first delete is refused',async()=>{
+ const calls=[];let deleteAttempts=0;
+ const manager=createModelManager({fetchStream:async()=>({ok:false}),kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async(url,options)=>{
+  const path=new URL(url).pathname;calls.push(`${options?.method||'GET'} ${path}`);
+  if(path==='/models/unload')return {ok:true,status:200,body:{success:true}};
+  if(path==='/models'&&options?.method==='DELETE'){deleteAttempts+=1;return deleteAttempts===1?{ok:false,status:409,body:{error:'busy'}}:{ok:true,status:200,body:{deleted:true}};}
+  return {ok:true,status:200,body:{}};
+ }});
+ const r=await manager.removeModel('busy-model');
+ assert.equal(r.ok,true);assert.equal(deleteAttempts,2);
+ assert.deepEqual(calls,['POST /models/unload','DELETE /models','POST /models/unload','DELETE /models'],'a refused delete gets one more unload+delete attempt, inside the same mutate() gate');
+});
+
+test('removeModel gives up after the retry and still reports whether anything actually unloaded',async()=>{
+ const manager=createModelManager({fetchStream:async()=>({ok:false}),kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async(url,options)=>{
+  const path=new URL(url).pathname;
+  if(path==='/models/unload')return {ok:false,status:404,body:{error:'not loaded'}};
+  if(path==='/models'&&options?.method==='DELETE')return {ok:false,status:409,body:{error:'still busy'}};
+  return {ok:true,status:200,body:{}};
+ }});
+ const r=await manager.removeModel('stuck-model');
+ assert.equal(r.ok,false);assert.equal(r.status,409);assert.equal(r.unloaded,false,'the manager never reported a successful unload, on either attempt');
+});
+
+test('forgetIdentity drops a cached identity without needing a live request',async()=>{
+ const manager=createModelManager({fetchStream:async()=>({ok:false}),kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async()=>({ok:true,status:200,body:{}})});
+ assert.doesNotThrow(()=>manager.forgetIdentity('whatever-not-cached'));
+});

@@ -358,7 +358,25 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
       if(!response.ok)tracker.rejected(checkpoint);
       return response.ok ? { ...response, body: { ...response.body, id: checkpoint, modelName: checkpoint } } : response;
     }),
-    deleteModel: model => mutate(()=>request('/models?model=' + encodeURIComponent(model), { method: 'DELETE' }, 60000)),
+    deleteModel: model => mutate(async () => { const r = await request('/models?model=' + encodeURIComponent(model), { method: 'DELETE' }, 60000); if (r.ok) identityCache.delete(model); return r; }),
+    // Unload-then-delete as ONE mutate() gate, so an on-demand load triggered by another
+    // request cannot slip in between the two the way it could with separate unload()/
+    // deleteModel() calls. If the delete is still refused (busy, or a load raced in despite
+    // the gate — the router itself can start one outside this process's control), retry the
+    // unload once more and try the delete again before giving up.
+    removeModel: model => mutate(async () => {
+      let unloaded = !!(await post('/models/unload', { model }).catch(() => null))?.ok;
+      let del = await request('/models?model=' + encodeURIComponent(model), { method: 'DELETE' }, 60000);
+      if (!del.ok) {
+        if ((await post('/models/unload', { model }).catch(() => null))?.ok) unloaded = true;
+        del = await request('/models?model=' + encodeURIComponent(model), { method: 'DELETE' }, 60000);
+      }
+      if (del.ok) identityCache.delete(model);
+      return { ...del, unloaded };
+    }),
+    // Exposed so callers that delete a model's files through a different path (the raw
+    // model-manager folder-scan proxy, routes/models.cjs) can still drop its cached identity.
+    forgetIdentity: model => identityCache.delete(model),
     props: model => request('/props' + modelQuery(model)),
     metrics: model => model ? request('/metrics' + modelQuery(model), {}, 6000) : unsupported('Aggregate metrics'),
     stats,

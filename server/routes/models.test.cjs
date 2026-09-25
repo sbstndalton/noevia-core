@@ -6,12 +6,30 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
 const { createModelRoutes } = require('./models.cjs');
+const { createModelService } = require('../models.cjs');
 
-function fixture({ env = {}, enabled = true, kind = 'llamacpp', manager = {}, workspace = { userId: 'u1' }, catalogue = [{ name: 'm' }], servedCatalogue = async () => catalogue } = {}) {
+// A workspace-shaped test double (autoRoles + saveAutoRoles), for tests that pass
+// `otherWorkspaces` to check clearRoleReferences fixes every workspace it can see.
+function makeWorkspace(autoRoles = null) {
+  return { autoRoles, saves: 0, saveAutoRoles() { this.saves += 1; } };
+}
+
+function fixture({ env = {}, enabled = true, kind = 'llamacpp', manager = {}, workspace = { userId: 'u1' }, catalogue = [{ name: 'm' }], servedCatalogue = async () => catalogue, modelsInstalled = async () => [{ name: 'm', loaded: true }], initialRoles = null, initialLastLoaded = null, otherWorkspaces = [] } = {}) {
   const sent = [], headers = [], fetched = [];
   const scan = new Map();
   let refreshes = 0;
-  const roles = { current: null };
+  const roles = { current: initialRoles, warmed: undefined };
+  const lastLoaded = { current: initialLastLoaded };
+  // clearRoleReferences below delegates to the REAL createModelService implementation (fallback,
+  // unset-when-both-required-empty, every workspace) instead of a hand test-double reimplementing
+  // that logic — a drift between the two previously would never have shown up here. `roles.current`
+  // stays the bridge the rest of this fixture (autoRoles/setAutoRoles, and every existing test's
+  // assertions on `f.roles.current`) already reads and writes.
+  const roleWorkspace = { get autoRoles() { return roles.current; }, set autoRoles(v) { roles.current = v; }, saveAutoRoles() {} };
+  const roleService = createModelService({
+    fetchJson: async () => ({ ok: false }), env: {}, modelManager: { enabled: false, requireEnabled() { throw new Error('model management is disabled'); } },
+    currentWorkspace: () => roleWorkspace, listWorkspaces: () => [roleWorkspace, ...otherWorkspaces],
+  });
   const modelManager = {
     enabled, kind, capabilities: { routing: true },
     stats: async () => ({ ok: true, body: { scope: 'engine', tokens_per_second: 41.5, mtp: [] } }),
@@ -39,8 +57,11 @@ function fixture({ env = {}, enabled = true, kind = 'llamacpp', manager = {}, wo
     service: {
       modelScanCache: scan, refreshModelScan: () => { refreshes += 1; },
       autoRoles: () => roles.current, setAutoRoles: (next) => { roles.current = next; }, ensureRolesLoaded: () => { roles.warmed = true; },
-      servedCatalogue, modelsInstalled: async () => [{ name: 'm', loaded: true }],
+      servedCatalogue, modelsInstalled,
       deriveUserModelName: (c) => `user.${c}`,
+      lastLoadedModel: () => lastLoaded.current,
+      clearLastLoadedModel: (name) => { if (lastLoaded.current === name) lastLoaded.current = null; },
+      clearRoleReferences: (name) => roleService.clearRoleReferences(name),
     },
   });
   const call = (method, path, body, role = 'member', search = '') => {
@@ -49,7 +70,7 @@ function fixture({ env = {}, enabled = true, kind = 'llamacpp', manager = {}, wo
     const res = { setHeader: (k, v) => headers.push([k, v]) };
     return routes(req, res, { path, authn: { user: { id: 'u1', role } }, url: new URL(`http://localhost${path}${search}`) });
   };
-  return { call, sent, headers, fetched, scan, refreshes: () => refreshes, roles };
+  return { call, sent, headers, fetched, scan, refreshes: () => refreshes, roles, lastLoaded };
 }
 
 test('every write under /api/models/ is refused for members before anything else is looked at', async () => {
@@ -143,6 +164,54 @@ test('the model-manager delete proxy rejects a system model by its scanned key, 
   assert.equal(f.fetched.length, 1);
 });
 
+// #302 follow-up: on llama.cpp, a folder-configured model (source: 'preset' in modelsInstalled,
+// listed only through the folder scan) is deleted through THIS proxy — LibraryTab's DeleteModel
+// only calls POST /api/models/delete when canDelete !== false && source !== 'preset'. Without
+// the same cleanup running here, #302 stayed broken for every folder model on a live llama.cpp
+// engine (the common case), even though the direct /api/models/delete route was fixed.
+test('the model-manager delete proxy runs the same unload/roles/identity cleanup as /api/models/delete, for a source:"preset" folder model', async () => {
+  const forgotten = [];
+  const f = fixture({
+    env: { MODEL_LOADER_URL: 'http://loader' },
+    manager: {
+      unload: async (name) => ({ ok: name === 'Folder-Model' }),
+      forgetIdentity: (name) => forgotten.push(name),
+    },
+    initialRoles: { fast: 'Folder-Model', smart: 'keep-smart' },
+    initialLastLoaded: 'Folder-Model',
+  });
+  f.scan.set('models', { at: Date.now(), body: { models: [
+    { key: 'f/folder-model.gguf', modelId: 'Folder-Model', sections: ['Folder-Model'] },
+  ] } });
+  await f.call('POST', '/api/model-manager/models/delete', { models: ['f/folder-model.gguf'] }, 'admin');
+  const sent = f.sent.pop();
+  assert.equal(sent.status, 200);
+  assert.equal(sent.body.unloaded, true, 'the engine model behind the deleted file was unloaded');
+  assert.deepEqual(sent.body.rolesCleared, ['fast']);
+  assert.deepEqual(f.roles.current, { fast: 'keep-smart', smart: 'keep-smart' }, 'the persisted role config actually fell back, not a stub');
+  assert.equal(f.lastLoaded.current, null, 'the deleted model is no longer the no-model-selected default');
+  assert.deepEqual(forgotten, ['Folder-Model'], 'the identity cache entry for the deleted engine model was dropped');
+  assert.equal(f.scan.has('models'), false, 'the folder scan cache is dropped so the deleted model is not still listed');
+});
+
+test('the model-manager delete proxy cleanup covers every section a deleted file backed, and never touches unrelated roles', async () => {
+  const unloadedNames = [];
+  const f = fixture({
+    env: { MODEL_LOADER_URL: 'http://loader' },
+    manager: { unload: async (name) => { unloadedNames.push(name); return { ok: true }; } },
+    initialRoles: { fast: 'keep', smart: 'section-b' },
+  });
+  f.scan.set('models', { at: Date.now(), body: { models: [
+    { key: 'f/multi.gguf', modelId: 'multi', sections: ['section-a', 'section-b'] },
+  ] } });
+  await f.call('POST', '/api/model-manager/models/delete', { models: ['f/multi.gguf'] }, 'admin');
+  const sent = f.sent.pop();
+  assert.equal(sent.status, 200);
+  assert.deepEqual(sent.body.rolesCleared, ['smart']);
+  assert.deepEqual(new Set(unloadedNames), new Set(['multi', 'section-a', 'section-b']), 'every resolved id (modelId and each section) is offered for unload');
+  assert.deepEqual(f.roles.current, { fast: 'keep', smart: 'keep' });
+});
+
 test('the model-manager sections proxy rejects delete and rename of a Laya section, never forwarding them', async () => {
   const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' } });
   f.scan.set('models', { at: Date.now(), body: { models: [
@@ -183,7 +252,7 @@ test('any write under /api/models/ drops the scan, and pull/delete/load keep the
   await f.call('POST', '/api/models/pull', {}, 'admin');
   assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'checkpoint required' } });
   await f.call('POST', '/api/models/delete', { name: 'm' }, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 502, body: { error: 'delete failed: 500' } });
+  assert.deepEqual(f.sent.pop(), { status: 502, body: { error: 'delete failed: 500', unloaded: true } }, 'a failed delete still reports whether the unload before it succeeded (#302 follow-up)');
   await f.call('POST', '/api/models/delete', { name: 'laya_multilingual_f16' }, 'admin');
   assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'System routing model — not deleted' } });
   await f.call('POST', '/api/models/load', { name: 'm', mtp: true }, 'admin');
@@ -291,6 +360,116 @@ test('the default model mode round-trips, and only an explicit apply switches ex
   assert.equal(saves, 1);
   await f.call('PUT', '/api/routing-default', { routing: 'fast' });
   assert.equal(f.sent.pop().status, 400);
+});
+
+test('deleting a loaded model unloads first, clears its auto-role and the last-loaded default, and reports what changed', async () => {
+  const calls = [];
+  const f = fixture({
+    manager: {
+      unload: async (name) => { calls.push(['unload', name]); return { ok: true }; },
+      deleteModel: async (name) => { calls.push(['delete', name]); return { ok: true, status: 200 }; },
+    },
+    modelsInstalled: async () => [{ name: 'm', loaded: true }, { name: 'other', loaded: false }],
+    initialRoles: { fast: 'm', smart: 'other' },
+    initialLastLoaded: 'm',
+  });
+  await f.call('POST', '/api/models/delete', { name: 'm' }, 'admin');
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true, unloaded: true, rolesCleared: ['fast'] } });
+  assert.deepEqual(calls, [['unload', 'm'], ['delete', 'm']], 'unload happens before delete, in that order');
+  assert.deepEqual(f.roles.current, { fast: 'other', smart: 'other' }, 'the fast role falls back to the still-configured smart model');
+  assert.equal(f.lastLoaded.current, null, 'the deleted model is no longer the no-model-selected default');
+});
+
+test('deleting a model that is not loaded skips unload but still deletes and clears roles', async () => {
+  const calls = [];
+  const f = fixture({
+    manager: {
+      unload: async (name) => { calls.push(['unload', name]); return { ok: true }; },
+      deleteModel: async (name) => { calls.push(['delete', name]); return { ok: true, status: 200 }; },
+    },
+    modelsInstalled: async () => [{ name: 'm', loaded: false }],
+    initialRoles: { fast: 'f', smart: 'm', vision: 'm' },
+  });
+  await f.call('POST', '/api/models/delete', { name: 'm' }, 'admin');
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true, unloaded: false, rolesCleared: ['smart', 'vision'] } });
+  assert.deepEqual(calls, [['delete', 'm']], 'an already-unloaded model is never sent an unload call');
+  assert.deepEqual(f.roles.current, { fast: 'f', smart: 'f' }, 'smart falls back to fast, and the optional vision role is dropped rather than left dangling');
+});
+
+test('deleting a model prefers manager.removeModel (one mutate gate) over separate unload+deleteModel calls, when the manager offers it', async () => {
+  const calls = [];
+  const f = fixture({
+    manager: {
+      removeModel: async (name) => { calls.push(['removeModel', name]); return { ok: true, status: 200, unloaded: true }; },
+      unload: async (name) => { calls.push(['unload', name]); return { ok: true }; },
+      deleteModel: async (name) => { calls.push(['delete', name]); return { ok: true, status: 200 }; },
+    },
+    modelsInstalled: async () => [{ name: 'm', loaded: true }],
+  });
+  await f.call('POST', '/api/models/delete', { name: 'm' }, 'admin');
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true, unloaded: true, rolesCleared: [] } });
+  assert.deepEqual(calls, [['removeModel', 'm']], 'removeModel is called instead of separate unload/deleteModel calls');
+});
+
+test('a failed delete through removeModel reports its own unloaded value in the 502 body', async () => {
+  const f = fixture({
+    manager: { removeModel: async () => ({ ok: false, status: 409, unloaded: true }) },
+    modelsInstalled: async () => [{ name: 'm', loaded: true }],
+  });
+  await f.call('POST', '/api/models/delete', { name: 'm' }, 'admin');
+  assert.deepEqual(f.sent.pop(), { status: 502, body: { error: 'delete failed: 409', unloaded: true } });
+});
+
+test('deleting a model tolerates the manager reporting "not loaded" on unload and still deletes', async () => {
+  const f = fixture({
+    manager: {
+      unload: async () => ({ ok: false, status: 404 }),
+      deleteModel: async () => ({ ok: true, status: 200 }),
+    },
+    modelsInstalled: async () => [{ name: 'm', loaded: true }],
+  });
+  await f.call('POST', '/api/models/delete', { name: 'm' }, 'admin');
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true, unloaded: false, rolesCleared: [] } });
+});
+
+test('deleting an unknown model 404s and never reaches unload or delete', async () => {
+  const calls = [];
+  const f = fixture({
+    manager: {
+      unload: async () => { calls.push('unload'); return { ok: true }; },
+      deleteModel: async () => { calls.push('delete'); return { ok: true, status: 200 }; },
+    },
+    modelsInstalled: async () => [{ name: 'other', loaded: false }],
+  });
+  await f.call('POST', '/api/models/delete', { name: 'gone' }, 'admin');
+  assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'model not found: gone' } });
+  assert.deepEqual(calls, []);
+});
+
+test('a system model is still refused before any unload or delete call, on both engine kinds', async () => {
+  const llama = fixture({ manager: { unload: async () => ({ ok: true }), deleteModel: async () => ({ ok: true, status: 200 }) } });
+  await llama.call('POST', '/api/models/delete', { name: 'laya_multilingual_f16' }, 'admin');
+  assert.deepEqual(llama.sent.pop(), { status: 400, body: { error: 'System routing model — not deleted' } });
+
+  const python = fixture({ kind: 'lemonade', manager: { unload: async () => ({ ok: true }), deleteModel: async () => ({ ok: true, status: 200 }) } });
+  await python.call('POST', '/api/models/delete', { name: 'laya_multilingual_f16' }, 'admin');
+  assert.deepEqual(python.sent.pop(), { status: 400, body: { error: 'System routing model — not deleted' } });
+});
+
+test('the python model-manager branch (no /models listing check) still unloads, deletes and clears roles', async () => {
+  const calls = [];
+  const f = fixture({
+    kind: 'lemonade',
+    manager: {
+      unload: async (name) => { calls.push(['unload', name]); return { ok: true }; },
+      deleteModel: async (name) => { calls.push(['delete', name]); return { ok: true, status: 200 }; },
+    },
+    modelsInstalled: async () => [{ name: 'm', loaded: true }],
+    initialRoles: { fast: 'm', smart: 'other' },
+  });
+  await f.call('POST', '/api/models/delete', { name: 'm' }, 'admin');
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true, unloaded: true, rolesCleared: ['fast'] } });
+  assert.deepEqual(calls, [['unload', 'm'], ['delete', 'm']]);
 });
 
 test('the benchmark start proxy refuses non-chat models with 400 and forwards chat-only suites (#206)', async () => {

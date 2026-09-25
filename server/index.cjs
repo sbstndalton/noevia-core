@@ -210,7 +210,12 @@ const modelManager = createModelManager({
 
 // What index.cjs builds on the adapter: the installed list and the first loaded model as the
 // default, the auto-router roles, the manager service call and the cached folder scan (models.cjs).
-const modelService = require('./models.cjs').createModelService({ fetchJson, env: process.env, modelManager, currentWorkspace });
+const modelService = require('./models.cjs').createModelService({
+  fetchJson, env: process.env, modelManager, currentWorkspace,
+  // Auto-roles are per workspace: a deleted model's role reference must be cleared out of
+  // every workspace's config, not just whichever one happened to make the delete request.
+  listWorkspaces: () => authService.listUsers().map((u) => workspaceStore.get(u.id)),
+});
 const { autoRoles, ensureRolesLoaded, servedCatalogue, modelsInstalled, lastLoadedModel } = modelService;
 
 function inferenceHeaders(extra) {
