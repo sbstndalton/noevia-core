@@ -1,5 +1,7 @@
 // Keep the browser/proxy connection alive throughout one journaled operation.
-async function proxyDiaryStream(res, url, options, { heartbeatMs = 5000, onEvent, job } = {}) {
+// options.headers may be `(withSecret) => headers`; withStorageCredential (diary.cjs) then resends once
+// with the storage secret when the sidecar answers 428 before any stream starts.
+async function proxyDiaryStream(res, url, options, { heartbeatMs = 5000, onEvent, job, withStorageCredential = (send) => send(true) } = {}) {
   const controller = new AbortController();
   const close = () => { if (!res.writableEnded && !job) controller.abort(); };
   res.on('close', close);
@@ -10,7 +12,8 @@ async function proxyDiaryStream(res, url, options, { heartbeatMs = 5000, onEvent
   const deadline = setTimeout(() => controller.abort(), 15 * 60 * 1000);
   try {
     send({type:'status',text:'Connecting to diary companion…'});
-    const upstream = await fetch(url, {...options, signal:controller.signal});
+    const headersFor = typeof options.headers === 'function' ? options.headers : () => options.headers;
+    const upstream = await withStorageCredential((secret) => fetch(url, {...options, headers:headersFor(secret), signal:controller.signal}));
     if (!upstream.ok || !upstream.body) throw new Error('Diary upstream unavailable');
     if ((upstream.headers.get('content-type') || '').includes('text/event-stream')) {
       const decoder = new TextDecoder();

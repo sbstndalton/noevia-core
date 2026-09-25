@@ -29,6 +29,8 @@ const PASS = Symbol('unhandled');
  */
 function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, authService, currentWorkspace, rateLimited, connectorRate, diaryConnectors, diary, clientAddress = (req) => req.socket?.remoteAddress }) {
   const { diaryHeaders, corpusSource, connectorFiles } = diary;
+  // Older fakes pass only diaryHeaders; fall back to a single send without the 428 retry.
+  const diaryFetchJson = diary.diaryFetchJson || ((url, { method = 'GET', body } = {}, timeoutMs) => fetchJson(url, { method, headers: diaryHeaders(method, url, { body }), body }, timeoutMs));
 
   async function connector(req, res, { path: p }) {
     if(p==='/api/diary-connector') {
@@ -67,7 +69,7 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
       if (!['GET', 'POST'].includes(req.method)) return json(res, 405, { error: 'Method not allowed' });
       const body = req.method === 'POST' ? await readBody(req, 4096) : undefined;
       const query = req.method === 'GET' ? '?after=' + encodeURIComponent(url.searchParams.get('after') || '') : '';
-      const r = await fetchJson(`${DIARY_BASE}/api/workspace-trash${query}`, { method: req.method, headers: diaryHeaders(), body }, 60000);
+      const r = await diaryFetchJson(`${DIARY_BASE}/api/workspace-trash${query}`, { method: req.method, body }, 60000);
       res.setHeader('Cache-Control', 'no-store');
       return json(res, r.status, r.ok ? r.body : { error: r.body?.detail || 'Diary recovery request failed. Retry or refresh Trash.' });
     }
@@ -75,13 +77,15 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
     if (p === '/api/diary/workspace-import') {
       if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
       if (req.method !== 'POST') return json(res, 405, { error: 'Method not allowed' });
-      return require('../workspace-import.cjs').proxyWorkspaceImport(req, res, `${DIARY_BASE}/api/workspace-import${url.search}`, diaryHeaders());
+      const target = `${DIARY_BASE}/api/workspace-import${url.search}`;
+      return require('../workspace-import.cjs').proxyWorkspaceImport(req, res, target, (secret) => diaryHeaders('POST', target, { secret, contentType: 'application/zip' }), diary.withStorageCredential);
     }
 
     if (p === '/api/diary/workspace-export') {
       if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
       if (req.method !== 'GET') return json(res, 405, { error: 'Method not allowed' });
-      return require('../workspace-export.cjs').proxyWorkspaceExport(res, `${DIARY_BASE}/api/workspace-export`, diaryHeaders());
+      const target = `${DIARY_BASE}/api/workspace-export`;
+      return require('../workspace-export.cjs').proxyWorkspaceExport(res, target, (secret) => diaryHeaders('GET', target, { secret }), diary.withStorageCredential);
     }
 
     if (['/api/diary/storage-status', '/api/diary/storage-import'].includes(p)) {
@@ -89,7 +93,7 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
       const status = p.endsWith('storage-status');
       if (req.method !== (status ? 'GET' : 'POST')) return json(res, 405, { error: 'Method not allowed' });
       const body = status ? undefined : await readBody(req, 4096);
-      const r = await fetchJson(`${DIARY_BASE}/api/${status ? 'storage-status' : 'storage-import'}`, { method: req.method, headers: diaryHeaders(), body }, status ? 60000 : 300000);
+      const r = await diaryFetchJson(`${DIARY_BASE}/api/${status ? 'storage-status' : 'storage-import'}`, { method: req.method, body }, status ? 60000 : 300000);
       return json(res, r.status, r.ok ? r.body : { error: r.body?.detail || 'Diary storage request failed' });
     }
 
@@ -103,11 +107,12 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
       const body = local ? JSON.stringify(parsed) : listing ? undefined : await readBody(req, 1024 * 1024);
       const suffix = listing ? '/files?path=' + encodeURIComponent(url.searchParams.get('path') || '') : local ? '/local-exchange' : '/file';
       if (local && parsed?.stream === true) {
-        return require('../diary-stream.cjs').proxyDiaryStream(res, `${DIARY_BASE}/api${suffix}`, {
-          method:'POST', headers:diaryHeaders(), body,
-        }, {onEvent:event=>{if(event.type==='mtp')require('../mtp.cjs').record(authn.user.id,event.model,event.timings);}});
+        const target = `${DIARY_BASE}/api${suffix}`;
+        return require('../diary-stream.cjs').proxyDiaryStream(res, target, {
+          method:'POST', headers:(secret)=>diaryHeaders('POST', target, { secret, body }), body,
+        }, {withStorageCredential:diary.withStorageCredential, onEvent:event=>{if(event.type==='mtp')require('../mtp.cjs').record(authn.user.id,event.model,event.timings);}});
       }
-      const r = await fetchJson(`${DIARY_BASE}/api${suffix}`, { method: req.method, headers: diaryHeaders(), body }, local ? 600000 : 60000);
+      const r = await diaryFetchJson(`${DIARY_BASE}/api${suffix}`, { method: req.method, body }, local ? 600000 : 60000);
       return json(res, r.status, r.ok ? r.body : { error: r.body?.detail || r.body?.error || 'Diary storage request failed' });
     }
 
@@ -127,7 +132,7 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
     if (p === '/api/diary/external-sources') {
       if (authn.user.role !== 'admin') return json(res, 403, { error: 'Administrator required for server import folders' });
       if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });
-      const r = await fetchJson(`${DIARY_BASE}/api/external-sources`, { headers: diaryHeaders() }, 30000);
+      const r = await diaryFetchJson(`${DIARY_BASE}/api/external-sources`, {}, 30000);
       if (!r.ok) return json(res, r.status >= 500 ? 502 : r.status, { error: `diary sidecar ${r.status}` });
       return json(res, 200, r.body);
     }
@@ -145,9 +150,9 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
       if (!body || typeof body.sourcePath !== 'string' || typeof body.relPath !== 'string') {
         return json(res, 400, { error: 'sourcePath and relPath required' });
       }
-      const r = await fetchJson(
+      const r = await diaryFetchJson(
         `${DIARY_BASE}/api/external-sources/import`,
-        { method: 'POST', headers: diaryHeaders(), body: JSON.stringify({ source_path: body.sourcePath, rel_path: body.relPath }) },
+        { method: 'POST', body: JSON.stringify({ source_path: body.sourcePath, rel_path: body.relPath }) },
         60000,
       );
       if (!r.ok) {
@@ -180,9 +185,9 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
       // Optimistic concurrency: pass the loaded exchange's hash through so the
       // sidecar can refuse a stale edit instead of silently overwriting.
       if (typeof body.base_hash === 'string') forward.base_hash = body.base_hash;
-      const r = await fetchJson(
+      const r = await diaryFetchJson(
         `${DIARY_BASE}/api/entries/edit`,
-        { method: 'POST', headers: diaryHeaders(), body: JSON.stringify(forward) },
+        { method: 'POST', body: JSON.stringify(forward) },
         60000,
       );
       // A 409 edit conflict carries current_hash/current_text the client needs

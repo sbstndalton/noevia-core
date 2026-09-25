@@ -56,6 +56,8 @@ const MODEL_MANAGER_KIND = process.env.MODEL_MANAGER_KIND || (process.env.LEMONA
 const MODEL_MANAGER_BASE = process.env.MODEL_MANAGER_BASE_URL || process.env.LEMONADE_BASE_URL || INFERENCE_BASE;
 const DIARY_BASE = process.env.DIARY_BASE_URL || 'http://cowork-diary-companion:8010';
 const DIARY_TOKEN = process.env.DIARY_AUTH_TOKEN || '';
+// Per-request Diary tenant assertion key (M2, docs/spec-managed-diary.md). Deploy the sidecar first.
+const DIARY_TENANT_KEY = (process.env.DIARY_TENANT_KEY || '').trim();
 const DIARY_SOURCE = process.env.DIARY_SOURCE || 'sidecar';
 const UI_AUTH_TOKEN = (process.env.UI_AUTH_TOKEN || DIARY_TOKEN).trim();
 const DIST_DIR = path.join(__dirname, '..', 'dist');
@@ -229,8 +231,8 @@ function inferenceHeaders(extra) {
 // The member-origin policy for providers, storage connections and the Diary corpus (ssrf.cjs).
 const endpointApproved = createEndpointApproved();
 // The Diary sidecar client: tenant headers, the corpus reads and the connector file bridge (diary.cjs).
-const diary = require('./diary.cjs').createDiary({ fs, path, fetchJson, DIARY_BASE, DIARY_TOKEN, DIARY_SOURCE, requestScope, authService, endpointApproved, workspaceStore });
-const { diaryHeaders } = diary;
+const diary = require('./diary.cjs').createDiary({ fs, path, fetchJson, DIARY_BASE, DIARY_TOKEN, DIARY_TENANT_KEY, DIARY_SOURCE, requestScope, authService, endpointApproved, workspaceStore });
+const { diaryHeaders, diaryFetchJson } = diary;
 const PROJECTS = arrayProxy('projects');
 
 const PROVIDERS = arrayProxy('providers');
@@ -543,7 +545,7 @@ const { handleChat } = require('./chat.cjs').createChatHandler({
   fs, path, crypto, fetch: (...args) => globalThis.fetch(...args), reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult,
   HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP,
   authService, toolPolicy, modelManager, requestScope, currentWorkspace, json,
-  getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders,
+  getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, diaryStorageRetry: diary.withStorageCredential,
   autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError,
   visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, toolGate,
   DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall,
@@ -592,7 +594,7 @@ const publicAuthRoutes = new Set([
   '/api/auth/invitations/accept', '/api/auth/recovery/complete',
 ]);
 const authRoutes = require('./routes/auth.cjs').createAuthRoutes({
-  json, authResult, readJson, authService, publicAuthRoutes, davSettings, davConfig, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, env: process.env,
+  json, authResult, readJson, authService, publicAuthRoutes, davSettings, davConfig, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, diaryTenantHeaders: diary.tenantHeaders, env: process.env,
   mcpOAuth, directoryMcp,
   // POST /api/admin/secrets/rotate (CSRF-checked by the router like every signed-in POST).
   rotateSecrets: (actorId) => require('./secrets-rotate.cjs').runRotation({ secrets: secretStore, db: authService.db, dataDir: DATA_DIR, audit: authService.audit, actorId }),
@@ -744,6 +746,7 @@ if (require.main === module) {
   if (!UI_AUTH_TOKEN) {
     console.warn('WARNING: Set DIARY_AUTH_TOKEN to protect the internal diary connection. Browser accounts remain authenticated.');
   }
+  if (!DIARY_TENANT_KEY) console.warn('WARNING: DIARY_TENANT_KEY is unset; Diary calls carry no tenant assertion and remote storage secrets ride on every call.');
   const server = http.createServer((req, res) => { handleRequest(req, res).catch(() => { if (!res.destroyed) res.destroy(); }); });
   staticFiles.warm();
   // A chat waiting on a write approval is a legitimately long request. Node's
@@ -758,7 +761,7 @@ if (require.main === module) {
       const workspace = workspaceStore.get(userId);
       const user = authService.publicUser(authService.db.prepare('SELECT * FROM users WHERE id=?').get(userId));
       return requestScope.run({ workspace, authn: { user, legacy: false } }, async () => {
-        const r = await fetchJson(`${DIARY_BASE}/api${endpoint}`, { method, headers: diaryHeaders(), body: body === undefined ? undefined : JSON.stringify(body) }, 15000);
+        const r = await diaryFetchJson(`${DIARY_BASE}/api${endpoint}`, { method, body: body === undefined ? undefined : JSON.stringify(body) }, 15000);
         if (!r.ok) throw Object.assign(Error(r.body?.detail || 'Diary file request failed'), { status: r.status });
         return r.body;
       });
@@ -798,7 +801,7 @@ if (require.main === module) {
       diary: async (endpoint) => {
         const userId = requestScope.getStore()?.workspace?.userId;
         if (!userId || !authService.diaryEnabled(userId)) throw new Error('the Diary add-on is not enabled for this account');
-        const r = await fetchJson(`${DIARY_BASE}/api${endpoint}`, { headers: diaryHeaders() }, 15000);
+        const r = await diaryFetchJson(`${DIARY_BASE}/api${endpoint}`, {}, 15000);
         if (!r.ok) throw new Error(String(r.body?.detail || r.body?.error || `diary sidecar ${r.status}`));
         return r.body || {};
       },
@@ -806,7 +809,7 @@ if (require.main === module) {
         const userId = requestScope.getStore()?.workspace?.userId;
         if (!userId || !authService.diaryEnabled(userId)) throw new Error('the Diary add-on is not enabled for this account');
         const body = { text, title, requestId: crypto.randomUUID(), entryTime: require('./mcp-internal-tools.cjs').isoWithOffset(new Date(), timezone) };
-        const r = await fetchJson(`${DIARY_BASE}/api/entries/append`, { method: 'POST', headers: diaryHeaders(), body: JSON.stringify(body) }, 30000);
+        const r = await diaryFetchJson(`${DIARY_BASE}/api/entries/append`, { method: 'POST', body: JSON.stringify(body) }, 30000);
         if (!r.ok) throw new Error(String(r.body?.error || r.body?.detail || `diary sidecar ${r.status}`));
         authService.audit('diary.append', userId, userId, { xid: r.body.xid, chars: text.length });
         return r.body;
@@ -844,7 +847,10 @@ if (require.main === module) {
     // 3 s; DIARY_BACKUP_WORKER_INTERVAL_MS keeps the old cadence available for tests.
     interval: Number(process.env.DIARY_BACKUP_WORKER_INTERVAL_MS) > 0 ? Number(process.env.DIARY_BACKUP_WORKER_INTERVAL_MS) : 30000,
     run: user => requestScope.run({ workspace: workspaceStore.get(user.id), authn: { user, legacy: false } }, async () => {
-      const r = await fetchJson(`${DIARY_BASE}/api/storage-backup`, { method: 'POST', headers: diaryHeaders() }, 300000);
+      // The backup copies to the remote destination on every run, so it is the one call that
+      // always carries the storage secret (#292); every other call sends only its ref.
+      const target = `${DIARY_BASE}/api/storage-backup`;
+      const r = await fetchJson(target, { method: 'POST', headers: diaryHeaders('POST', target, { secret: true }) }, 300000);
       if (!r.ok) throw new Error(`storage-backup failed: ${r.status}`);
       return r.body;
     }),

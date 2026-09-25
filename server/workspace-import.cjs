@@ -1,5 +1,8 @@
 const MAX_UPLOAD = 32 * 1024 * 1024;
-async function proxyWorkspaceImport(req, res, url, headers) {
+// `headers` is an object or `(withSecret) => headers`; with `retry` (diary.cjs withStorageCredential)
+// a 428 from the sidecar is retried once with the storage secret. The body is buffered, so resending is safe.
+async function proxyWorkspaceImport(req, res, url, headers, retry = (send) => send(true)) {
+  const headersFor = typeof headers === 'function' ? headers : () => headers;
   const controller = new AbortController();
   const close = () => { if (!res.writableEnded) controller.abort(); };
   res.on('close', close);
@@ -16,7 +19,8 @@ async function proxyWorkspaceImport(req, res, url, headers) {
       if (size > MAX_UPLOAD) return send(413, {error:'Browser imports support ZIP files up to 32 MiB'});
       chunks.push(chunk);
     }
-    const response = await fetch(url, {method:'POST', headers:{...headers, 'Content-Type':'application/zip'}, body:Buffer.concat(chunks), signal:controller.signal});
+    const payload = Buffer.concat(chunks);
+    const response = await retry((secret) => fetch(url, {method:'POST', headers:{...headersFor(secret), 'Content-Type':'application/zip'}, body:payload, signal:controller.signal}));
     const body = await response.json();
     send(response.status, response.ok ? body : {error:typeof body.detail === 'string' ? body.detail : 'Workspace import failed'});
   } catch {

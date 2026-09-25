@@ -1,12 +1,14 @@
 const {Readable, Transform}=require('node:stream');
 const {pipeline}=require('node:stream/promises');
-async function proxyWorkspaceExport(res,url,headers) {
+// `headers` is an object or `(withSecret) => headers`; `retry` resends once with the storage secret on a 428.
+async function proxyWorkspaceExport(res,url,headers,retry=(send)=>send(true)) {
+  const headersFor=typeof headers==='function'?headers:()=>headers;
   const controller=new AbortController();
   const close=()=>{if(!res.writableEnded)controller.abort();};
   res.on('close',close);
   const deadline=setTimeout(()=>controller.abort(),300000);
   try {
-    const upstream=await fetch(url,{headers,signal:controller.signal});
+    const upstream=await retry((secret)=>fetch(url,{headers:headersFor(secret),signal:controller.signal}));
     if(!upstream.ok){
       const body=await upstream.json().catch(()=>({}));
       res.writeHead(upstream.status,{'Content-Type':'application/json','Cache-Control':'no-store'});

@@ -65,7 +65,7 @@ function normalizeReplayHistory(mapped, newMessage) {
 }
 
 function createChatHandler({
-  stepSupervision = null, durableChat = null, fs, path, crypto, fetch, codeTasksFor = () => [], reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, toolGate = null, DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse,
+  stepSupervision = null, durableChat = null, fs, path, crypto, fetch, codeTasksFor = () => [], reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, diaryStorageRetry = (send) => send(true), autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, toolGate = null, DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse,
 }) {
   async function handleChat(req, res, body, authn) {
     let preparation;
@@ -209,11 +209,14 @@ function createChatHandler({
     if (spaceId === 'diary') {
       let job;
       if(body.exchangeId){try{job=require('./diary-jobs.cjs').start(chatWorkspace,{entryDay:body.entryDay,exchangeId:body.exchangeId,message,preparationId:body.preparationId});}catch(e){return json(res,e.status||500,{error:e.status?e.message:'Could not create recovery record; no diary request was sent.'});}}
-      return require('./diary-stream.cjs').proxyDiaryStream(res, `${DIARY_BASE}/v1/chat/completions`, {
-        method: 'POST', headers: diaryHeaders(), body: JSON.stringify({stream:true, diary_events:true, messages:msgs,
+      const diaryUrl = `${DIARY_BASE}/v1/chat/completions`;
+      // The request body is buffered and signed as sent (tenant assertion v2); only the reply streams.
+      const diaryBody = JSON.stringify({stream:true, diary_events:true, messages:msgs,
           session_id:body.sessionId, entryTime:body.entryTime, entryDay:body.entryDay,
-          extrasEnabled:body.extrasEnabled === true, extraContext:diaryExtras.reference(body)})
-      }, {job,onEvent:event=>{if(event.type==='mtp')require('./mtp.cjs').record(chatWorkspace?.userId,event.model,event.timings);}});
+          extrasEnabled:body.extrasEnabled === true, extraContext:diaryExtras.reference(body)});
+      return require('./diary-stream.cjs').proxyDiaryStream(res, diaryUrl, {
+        method: 'POST', headers: (secret) => diaryHeaders('POST', diaryUrl, { secret, body: diaryBody }), body: diaryBody
+      }, {job,withStorageCredential:diaryStorageRetry,onEvent:event=>{if(event.type==='mtp')require('./mtp.cjs').record(chatWorkspace?.userId,event.model,event.timings);}});
     }
 
     // ── Ordinary space / project chat: routed via the project's provider ──

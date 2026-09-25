@@ -26,7 +26,7 @@ function createHealthRoutes({ json, fetchJson, getProvider, providerHeaders, DEF
       const diaryEnabled = authService.diaryEnabled(authn.user.id);
       const [inference, diary] = await Promise.allSettled([
         fetchJson(`${defaultProvider.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/models`, { headers: providerHeaders(defaultProvider) }, 5000),
-        diaryEnabled ? fetchJson(`${DIARY_BASE}/api/health`, { headers: diaryHeaders() }, 5000) : Promise.resolve({ ok: false }),
+        diaryEnabled ? fetchJson(`${DIARY_BASE}/api/health`, { headers: diaryHeaders('GET', `${DIARY_BASE}/api/health`) }, 5000) : Promise.resolve({ ok: false }),
       ]);
       return json(res, 200, {
         inferenceUp: inference.status === 'fulfilled' && inference.value.ok,

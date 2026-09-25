@@ -28,12 +28,13 @@ const PASS = Symbol('unhandled');
  * @param {(url:string, init:object, timeoutMs?:number) => Promise<any>} deps.fetchJson
  * @param {string} deps.DIARY_BASE
  * @param {string} deps.DIARY_TOKEN
+ * @param {(userId:string, method:string, url:string) => object} [deps.diaryTenantHeaders]  diary.cjs tenantHeaders (signed)
  * @param {object} deps.env                              process.env, read at call time
  * @param {{ forgetUser: (userId:string) => void }} [deps.mcpOAuth]      OAuth sign-ins, keyed per (user, server)
  * @param {{ forgetUser: (userId:string) => void }} [deps.directoryMcp]  directory server keys, keyed per (user, server)
  * @param {(actorId:string) => object} [deps.rotateSecrets]  re-encrypts stored credentials under the current key
  */
-function createAuthRoutes({ json, authResult, readJson, authService, publicAuthRoutes, davSettings, davConfig, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, env, mcpOAuth, directoryMcp, rotateSecrets }) {
+function createAuthRoutes({ json, authResult, readJson, authService, publicAuthRoutes, davSettings, davConfig, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, diaryTenantHeaders = null, env, mcpOAuth, directoryMcp, rotateSecrets }) {
   async function open(req, res, { path: p }) {
     if (p === '/api/setup/status' && req.method === 'GET') {
       return json(res, 200, { configured: authService.userCount() > 0, publicOrigin: authService.origin || env.PUBLIC_ORIGIN || '' });
@@ -142,9 +143,11 @@ function createAuthRoutes({ json, authResult, readJson, authService, publicAuthR
             await driveAccounts.removeUser(id);
             mcpOAuth?.forgetUser(id);
             directoryMcp?.forgetUser(id);
-            const headers = { 'X-Cowork-User-ID': id };
-            if (DIARY_TOKEN) headers.Authorization = `Bearer ${DIARY_TOKEN}`;
-            await fetchJson(`${DIARY_BASE}/api/internal/tenant`, { method: 'DELETE', headers }, 15000).catch(() => null);
+            const target = `${DIARY_BASE}/api/internal/tenant`;
+            // Signed with DIARY_TENANT_KEY when set: the sidecar refuses an unasserted delete.
+            let headers = diaryTenantHeaders ? diaryTenantHeaders(id, 'DELETE', target) : null;
+            if (!headers) { headers = { 'X-Cowork-User-ID': id }; if (DIARY_TOKEN) headers.Authorization = `Bearer ${DIARY_TOKEN}`; }
+            await fetchJson(target, { method: 'DELETE', headers }, 15000).catch(() => null);
           }
           return json(res, ok ? 200 : 400, { ok });
         } catch (e) { return json(res, 400, { error: e.message }); }
