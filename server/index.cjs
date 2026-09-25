@@ -622,7 +622,7 @@ const healthRoutes = require('./routes/health.cjs').createHealthRoutes({ json, f
 // GET /api/ready (#297): unauthenticated, mounted before the session gate below alongside the
 // sign-in routes. isReady is set once startup wiring under require.main finishes (see below).
 const readyRoutes = require('./routes/health.cjs').createReadyRoutes({
-  json, isReady: () => processReady, version: process.env.STAMP_VERSION || require('../package.json').version,
+  json, isReady: () => processReady, version: require('./version-resolve.cjs').resolveVersion(),
 });
 // GET /api/toolboxes: the picker view (routes/toolboxes.cjs). MCP state is read at call time.
 const toolboxRoutes = require('./routes/toolboxes.cjs').createToolboxRoutes({
