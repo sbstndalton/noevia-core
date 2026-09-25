@@ -2,19 +2,34 @@
 // Code mode routes (spec-agent-execution §3). Admin-only, and absent (404) unless
 // features.codeHarness is on.
 //   GET  /api/projects/:id/code                                  -> { repositories, capabilities, tasks }
+//   GET  /api/code/active                                         -> live tasks across this account's projects (admin only)
 //   POST /api/projects/:id/code        { repository, prompt, capabilities?, domains?, model? } -> 202
 //   GET  /api/projects/:id/code/:task                            -> task (incl. a waiting approval)
 //   POST /api/projects/:id/code/:task/approve  { decision, approvalId } -> { ok }
 //   POST /api/projects/:id/code/:task/cancel                      -> task
 const PATTERN = /^\/api\/projects\/([^/]+)\/code(?:\/([0-9a-f-]{36}))?(?:\/(approve|cancel))?$/;
 
-function createCodeRoutes({ service, features, getProject, workspace, json, readJson }) {
+function createCodeRoutes({ service, features, getProject, projects = () => [], workspace, json, readJson }) {
   return async function codeRoutes(req, res, { path, authn }) {
+    const activeSummary = path === '/api/code/active';
     const m = path.match(PATTERN);
-    if (!m) return false;
+    if (!m && !activeSummary) return false;
     const send = (status, body) => (json(res, status, body), true);
     if (!features.enabled('codeHarness')) return send(404, { error: 'Code mode is not enabled on this server.' });
     if (!authn || authn.user.role !== 'admin') return send(403, { error: 'Administrator required' });
+    if (activeSummary) {
+      if (req.method !== 'GET') return send(405, { error: 'method not allowed' });
+      try {
+        const ws = workspace();
+        const visible = projects();
+        const names = new Map(visible.map((project) => [project.id, project.name]));
+        const active = service.listActive(ws, names.keys());
+        const tasks = active.tasks.map((task) => ({ id: task.id, projectId: task.projectId,
+          projectName: names.get(task.projectId), title: task.task, status: task.status,
+          stage: task.stage, updatedAt: task.updatedAt, approvalAction: task.approval?.action || null }));
+        return send(200, { tasks, total: active.total });
+      } catch (error) { return send(error.status || 500, { error: error.publicMessage || 'Could not load active tasks' }); }
+    }
     const project = getProject(decodeURIComponent(m[1]));
     if (!project) return send(404, { error: 'project not found' });
     const [, , taskId, action] = m;

@@ -164,6 +164,14 @@ function createCodeService({ repos, connect, egress = null, engine = undefined, 
       const { jobs } = storeFor(workspace);
       return jobs.list({ projectId: project.id, kind: 'code' }).map((j) => view(j, pendingFor(j.id)));
     },
+    listActive(workspace, projectIds, limit = 100) {
+      const { jobs } = storeFor(workspace);
+      const allowed = new Set(projectIds);
+      // One journal scan for the whole account. Calling list(project) for every
+      // project would parse the same journals repeatedly on each status poll.
+      const matching = jobs.list({ kind: 'code', active: true }).filter((job) => allowed.has(job.projectId));
+      return { tasks: matching.slice(0, limit).map((job) => ({ ...view(job, pendingFor(job.id)), projectId: job.projectId })), total: matching.length };
+    },
     get(workspace, project, taskId) {
       return view(owned(workspace, project, taskId), pendingFor(taskId));
     },

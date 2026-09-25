@@ -361,7 +361,7 @@ const codeService = require('./code-service.cjs').createCodeService({
   sharedContext: (workspace, project) => require('./shared-context.cjs').forCode(project, loadChats(project.id)),
 });
 const codeRoutes = require('./routes/code.cjs').createCodeRoutes({
-  features, getProject, workspace: () => currentWorkspace(), json, readJson, service: codeService,
+  features, getProject, projects: () => PROJECTS.filter((project) => !diaryExtras.internalProject(project)), workspace: () => currentWorkspace(), json, readJson, service: codeService,
 });
 
 // ── Browser mode (issue #274, spec-agent-execution §6 wired to §4): service in
@@ -659,7 +659,7 @@ async function handleRequestScoped(req, res) {
     if (await mcpDirectoryRoutes(req, res, { path: p, authn })) return;
     if (authn && await webAddressRoutes(req, res, { path: p, authn })) return;
     if (authn && p.startsWith('/api/projects/') && await researchRoutes(req, res, { path: p, authn })) return;
-    if (authn && p.startsWith('/api/projects/') && await codeRoutes(req, res, { path: p, authn })) return;
+    if (authn && (p === '/api/code/active' || p.startsWith('/api/projects/')) && await codeRoutes(req, res, { path: p, authn })) return;
     if (authn && p.startsWith('/api/projects/') && await browserRoutes(req, res, { path: p, authn })) return;
     if (await diaryRoutes.connectors(req, res, { path: p, authn })) return;
     if (await projectRoutes(req, res, { path: p, authn, url })) return;

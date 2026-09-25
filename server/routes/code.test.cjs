@@ -10,13 +10,14 @@ function harness({ enabled = true } = {}) {
     harnesses: () => [{ id: 'opencode', label: 'OpenCode', version: null }],
     promptPreparation: () => [{ id: 'direct', label: 'Direct', available: true, reason: 'As you wrote it.' }],
     sandboxed: () => true,
-    list: () => [], get: (ws, p, id) => ({ id }),
+    list: (ws, p) => p.id === 'p1' ? [{ id: 'task-1', status: 'waiting_approval', task: 'Fix tests', stage: 'Checking tests', updatedAt: 10, approval: { action: 'execute_command' } }] : [{ id: 'task-2', status: 'completed' }],
+    listActive: () => ({ tasks: [{ id: 'task-1', projectId: 'p1', status: 'waiting_approval', task: 'Fix tests', stage: 'Checking tests', updatedAt: 10, approval: { action: 'execute_command' } }], total: 1 }), get: (ws, p, id) => ({ id }),
     start: async (ws, p, body) => { calls.push(['start', p.id, body]); return { taskId: 't', branch: 'noevia/task-t' }; },
     decide: (ws, p, id, decision, approvalId) => { calls.push(['decide', id, decision, approvalId]); return { ok: true }; },
     cancel: (ws, p, id) => { calls.push(['cancel', id]); return { id, status: 'cancelled' }; },
   };
   const route = createCodeRoutes({ service, features: { enabled: () => enabled },
-    getProject: (id) => (id === 'p1' ? { id } : null), workspace: () => ({ dir: '/tmp/x' }),
+    getProject: (id) => (id === 'p1' ? { id } : null), projects: () => [{ id: 'p1', name: 'Alpha' }, { id: 'p2', name: 'Beta' }], workspace: () => ({ dir: '/tmp/x' }),
     json: (res, status, body) => Object.assign(res, { status, body }), readJson: async (req) => JSON.parse(req.raw || '{}') });
   const call = async (method, path, role = 'admin', raw) => {
     const res = {};
@@ -29,10 +30,20 @@ const TASK = '12345678-1234-4234-8234-123456789012';
 
 test('the feature off hides every route, and members are refused before anything runs', async () => {
   assert.equal((await harness({ enabled: false }).call('GET', '/api/projects/p1/code')).status, 404);
+  assert.equal((await harness({ enabled: false }).call('GET', '/api/code/active')).status, 404);
   const { call, calls } = harness();
   assert.equal((await call('POST', '/api/projects/p1/code', 'member', '{"prompt":"x"}')).status, 403);
   assert.equal((await call('GET', '/api/projects/p1/code', null)).status, 403, 'signed out too');
+  assert.equal((await call('GET', '/api/code/active', 'member')).status, 403);
   assert.equal(calls.length, 0, 'nothing reached the service');
+});
+
+test('active summary includes only live tasks from this scoped project list', async () => {
+  const { call } = harness();
+  const response = await call('GET', '/api/code/active');
+  assert.equal(response.status, 200);
+  assert.deepEqual(response.body, { tasks: [{ id: 'task-1', projectId: 'p1', projectName: 'Alpha', title: 'Fix tests', status: 'waiting_approval', stage: 'Checking tests', updatedAt: 10, approvalAction: 'execute_command' }], total: 1 });
+  assert.equal((await call('POST', '/api/code/active')).status, 405);
 });
 
 test('an admin lists, starts, reads, approves and cancels', async () => {

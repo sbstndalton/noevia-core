@@ -77,6 +77,24 @@ test('one task at a time per project', async () => {
   await settle(svc, ws, second.taskId);
 });
 
+test('active task summary scans once, respects project scope and caps the returned list', async () => {
+  const releases = [];
+  const { svc, ws } = service({ connect: async () => ({ prompt: () => new Promise((resolve) => { releases.push(() => resolve({ stopReason: 'end_turn' })); }) }) });
+  const otherProject = { id: 'p2' };
+  await svc.start(ws, project, { repository: 'noevia', prompt: 'first' });
+  await svc.start(ws, otherProject, { repository: 'noevia', prompt: 'second' });
+  const scoped = svc.listActive(ws, [project.id]);
+  assert.equal(scoped.total, 1);
+  assert.equal(scoped.tasks[0].projectId, project.id);
+  const capped = svc.listActive(ws, [project.id, otherProject.id], 1);
+  assert.equal(capped.total, 2);
+  assert.equal(capped.tasks.length, 1);
+  assert.equal(svc.listActive({ dir: temp('noevia-empty-tenant-') }, [project.id, otherProject.id]).total, 0);
+  for (let i = 0; i < 100 && releases.length < 2; i++) await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(releases.length, 2);
+  releases.forEach((release) => release());
+});
+
 test('a task from another project is not found, rather than forbidden', async () => {
   const { svc, ws } = service();
   const started = await svc.start(ws, project, { repository: 'noevia', prompt: 'fix' });
