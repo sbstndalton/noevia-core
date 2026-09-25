@@ -162,6 +162,41 @@ test('a storage path is sent as a file name, because the worker refuses anything
   for (const name of sent) assert.ok(!name.includes('/') && !name.includes('\\') && name.length <= 200);
 });
 
+test('a name with characters outside Latin-1 (spaces/unicode in a storage path) does not crash before the request is sent (#262)', async () => {
+  // fetch/undici header values are ByteStrings; a raw emoji or non-Latin-1
+  // character used to throw a TypeError out of extractDocument itself before
+  // any request left the process, rather than surfacing as a normal
+  // retryable/permanent worker failure.
+  const sent = [];
+  const fetchImpl = async (url, init) => {
+    sent.push(init.headers['X-Document-Name']);
+    return { ok: true, json: async () => ({ pages: [{ number: 1, text: 'x' }], total: 1 }) };
+  };
+  for (const name of ['Récépissé 📎.pdf', 'Tax Docs 2024/Papéis Não Lidos.pdf', 'plain.pdf']) {
+    await docling.extractDocument(name, Buffer.from('x'), { url: 'http://docling.test', fetchImpl });
+  }
+  for (const header of sent) {
+    assert.ok(/^[\x00-\xff]*$/.test(header), `header must be representable: ${header}`);
+    assert.match(header, /\.pdf$/i, 'the suffix the worker keys off of survives encoding');
+  }
+});
+
+test('headerSafeName only encodes when needed, and keeps the worker\'s 200-char limit', () => {
+  assert.equal(docling.headerSafeName('plain.pdf'), 'plain.pdf');
+  assert.equal(docling.headerSafeName('Récépissé.pdf'), 'Récépissé.pdf', 'Latin-1 already fits in a header, so it is left alone');
+  assert.equal(docling.headerSafeName('Récépissé 📎.pdf'), encodeURIComponent('Récépissé 📎.pdf'), 'a code point above 255 forces encoding');
+  assert.ok(docling.headerSafeName('é'.repeat(500) + '.pdf').length <= 200);
+});
+
+test('headerSafeName encodes control characters that would make undici throw', () => {
+  // CR/LF in a header value is request smuggling territory; undici (and any
+  // spec-compliant client) rejects it with a TypeError rather than send it.
+  assert.equal(docling.headerSafeName('a\nb.pdf'), encodeURIComponent('a\nb.pdf'));
+  assert.equal(docling.headerSafeName('a\r\nb.pdf'), encodeURIComponent('a\r\nb.pdf'));
+  // NUL is below 0x20 too, and just as fatal to send raw.
+  assert.equal(docling.headerSafeName('a\0b.pdf'), encodeURIComponent('a\0b.pdf'));
+});
+
 test('a refusal noevia caused is named as that, and never cached as permanent', async () => {
   // Permanent means "this document cannot be read". A 400 means noevia sent it wrongly, and
   // caching that would outlive the fix -- which is exactly what happened when every document
