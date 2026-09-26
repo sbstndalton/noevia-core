@@ -10,3 +10,10 @@ test('catalogue status counts unique missing tools against the owning server wit
  assert.equal(result[1].error,'Unavailable');assert.equal(result[1].discovered,0);
  assert.ok(!JSON.stringify(result).includes('private.example'));assert.ok(!JSON.stringify(result).includes('not-for-clients'));
 });
+
+test('#366: `directory` marks a server added through the MCP directory; everything else defaults false',()=>{
+ const servers=[{id:'internal',auth:'internal'},{id:'nextcloud',auth:'nextcloud'},{id:'added-one',auth:'directory',directory:true}];
+ const states=new Map();
+ const result=describeMcpServers(servers,states,new Map(),[]);
+ assert.deepEqual(result.map(r=>r.directory),[false,false,true]);
+});
