@@ -36,6 +36,10 @@ function init({ dataDir, embedModel, inferenceUrl, headersFn, userDataDirFn, inf
   if (headersFn) inferenceHeaders = headersFn;
   if (inferenceGuard) enterInference = inferenceGuard;
   initRerank();
+  // A new init() (endpoint/model swap, or a test isolating scenarios) invalidates whatever the
+  // last readiness probe found — never serve a cached verdict from before the reconfiguration.
+  retrievalProbeCache = null;
+  retrievalProbeInFlight = null;
 }
 // Chunk sizing starts from diary-companion's shape (subsection-scale bodies).
 // ~1200 chars with a 150-char overlap keeps chunks coherent.
@@ -106,8 +110,128 @@ function loadDeps() {
   return depsCache;
 }
 
+// "Index support installed": native sqlite-vec/better-sqlite3 deps loaded. Unchanged meaning —
+// callers that only care whether the index CAN run (filesContext, the internal MCP tool, the
+// #340 tri-state below) keep using this. It says nothing about whether the embedding endpoint
+// configured for this deployment is actually reachable right now.
 function ragAvailable() {
   return !loadDeps().broken;
+}
+
+// Bounded, cached probe of the configured embedding endpoint (#340): "index support installed"
+// does not mean "search works" — a restarting or misconfigured embedder leaves the index able to
+// store text but never gains vectors, and search silently returns nothing (see indexProjectFileNow
+// and searchProject above). /api/health polls every few seconds, so this must be cheap: a fixed,
+// synthetic probe string (never real project or chat content), a short timeout so one slow health
+// poll cannot stall behind it, and a short cache so concurrent/rapid polls share one probe instead
+// of hammering the embedder.
+const RETRIEVAL_PROBE_TEXT = ['noevia health probe'];
+const RETRIEVAL_PROBE_TIMEOUT_MS = clampInt(process.env.RETRIEVAL_PROBE_TIMEOUT_MS, 2500, 200, 5000);
+const RETRIEVAL_PROBE_TTL_MS = clampInt(process.env.RETRIEVAL_PROBE_TTL_MS, 45000, 200, 300000);
+let retrievalProbeCache = null; // { status: 'available'|'degraded', at: number }
+let retrievalProbeInFlight = null; // shared promise while a probe is in flight
+
+const HELD_BY_MAINTENANCE = Symbol('retrieval-probe-held-by-maintenance');
+
+// A dedicated embedding sidecar (EMBEDDING_BASE_URL set) is not the shared inference router: it
+// never holds the router's maintenance gate, and a tiny synthetic embedding request there cannot
+// load or evict the chat model. Safe to call directly, with no inference guard at all.
+async function probeEmbeddingSidecar(base) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), RETRIEVAL_PROBE_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${base.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/embeddings`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: EMBED_MODEL, input: RETRIEVAL_PROBE_TEXT }),
+      signal: ctrl.signal,
+    });
+    if (!res.ok) return false;
+    const body = await res.json();
+    const items = Array.isArray(body?.data) ? body.data : [];
+    return items.length >= 1 && Array.isArray(items[0]?.embedding) && items[0].embedding.length > 0;
+  } catch {
+    // Network failure, non-2xx thrown by a stub, JSON error, or the timeout's abort — all mean
+    // the same thing to a caller: the sidecar cannot be reached right now.
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// No dedicated sidecar: embeddings share the chat engine. A live embedding request here would
+// hit the same single-slot router chat uses, which can load the embed model and evict whatever
+// chat model is loaded — every TTL window, triggered by nothing more than a health poll (e.g.
+// someone with Settings open). GET /v1/models is side-effect-free and answers the same question:
+// is EMBED_MODEL actually available there right now.
+async function probeEmbeddingRouter(base) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), RETRIEVAL_PROBE_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${base.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/models`, {
+      headers: inferenceHeaders(),
+      signal: ctrl.signal,
+    });
+    if (!res.ok) return false;
+    const body = await res.json();
+    const ids = Array.isArray(body?.data) ? body.data.map((m) => m?.id) : [];
+    return ids.includes(EMBED_MODEL);
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function probeEmbeddingEndpoint() {
+  if (embeddingBase) return probeEmbeddingSidecar(embeddingBase);
+  if (!inferenceBase) return false;
+  // The router's maintenance gate (autotune, preset apply) is a "a human is mid-change" signal,
+  // never an outage — reporting 'degraded' every time someone tunes the model would be a false
+  // alarm distinct from an actually unreachable embedder.
+  let leave;
+  try {
+    leave = enterInference();
+  } catch {
+    return HELD_BY_MAINTENANCE;
+  }
+  try {
+    return await probeEmbeddingRouter(inferenceBase);
+  } finally {
+    leave();
+  }
+}
+
+// Tri-state retrieval readiness for /api/health and the Settings/Capabilities UI:
+//   'unavailable' — native index deps are missing; retrieval cannot run at all (unchanged case).
+//   'degraded'    — the index is installed but the configured embedding endpoint/model did not
+//                    answer the probe within the timeout; small files and source excerpts still
+//                    reach the model (filesContext's direct-injection path), semantic search does not.
+//   'available'   — the probe found the embedder answering (sidecar) or the embed model listed
+//                    (router) within the timeout.
+// Never throws; never issues more than one live probe per RETRIEVAL_PROBE_TTL_MS window.
+async function retrievalStatus() {
+  if (!ragAvailable()) return 'unavailable';
+  const now = Date.now();
+  if (retrievalProbeCache && now - retrievalProbeCache.at < RETRIEVAL_PROBE_TTL_MS) {
+    return retrievalProbeCache.status;
+  }
+  if (!retrievalProbeInFlight) {
+    retrievalProbeInFlight = probeEmbeddingEndpoint()
+      .then((result) => {
+        // Model maintenance holding the gate is not itself a finding — nothing was actually
+        // probed, so keep whatever the last real probe found, or assume available until one runs.
+        if (result === HELD_BY_MAINTENANCE) return retrievalProbeCache ? retrievalProbeCache.status : 'available';
+        return result ? 'available' : 'degraded';
+      })
+      .catch(() => 'degraded')
+      .then((status) => {
+        retrievalProbeCache = { status, at: Date.now() };
+        retrievalProbeInFlight = null;
+        return status;
+      });
+  }
+  return retrievalProbeInFlight;
 }
 
 function chunkText(text, pagePart = false) {
@@ -454,4 +578,4 @@ async function filesContext(projectId, files, query, userId) {
 // of the wrong dimensionality scores silently rather than failing.
 function embedModel() { return EMBED_MODEL; }
 
-module.exports = { init, indexProjectFile, deleteProjectFile, searchProject, filesContext, chunkText, ragAvailable, embed, embedModel, rerankPool };
+module.exports = { init, indexProjectFile, deleteProjectFile, searchProject, filesContext, chunkText, ragAvailable, retrievalStatus, embed, embedModel, rerankPool };
