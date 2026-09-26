@@ -11,7 +11,7 @@ const path = require('node:path');
 const { AsyncLocalStorage } = require('node:async_hooks');
 const { createProjectRoutes, DOCUMENT_UPLOAD_CAP } = require('./projects.cjs');
 
-function fixture({ projects = [], diary = true } = {}) {
+function fixture({ projects = [], diary = true, catalogue = null } = {}) {
   const sent = [];
   const dispatched = [];
   const requestScope = new AsyncLocalStorage();
@@ -41,6 +41,7 @@ function fixture({ projects = [], diary = true } = {}) {
     diaryExtras: { PROJECT_ID: 'diary-extras', chatProjectId: (id) => (id === 'bad' ? null : `chat-${id}`), newProject: () => ({ id: 'diary-extras', name: 'Diary' }) },
     PROJECTS: projects, DEFAULT_TOOLBOXES: ['core'], sanitizeToolboxes: (b) => (Array.isArray(b) ? b : null),
     getProvider: (id) => (id === 'default' ? {} : null), ensureRolesLoaded() {},
+    servedCatalogue: async () => catalogue, DEFAULT_PROVIDER_ID: 'default',
     store,
   });
   const call = (method, path, body, search = '', role = 'member') => {
@@ -229,6 +230,52 @@ test('an explicit routing in the same patch always wins over the model-implies-m
   assert.equal(f.projects[0].routingChosen, true);
 });
 
+
+// #409: the composer's Manual model pick had no server-side guard at all — unlike PUT
+// /api/auto-roles (#343) and benchmark/start, which both already reject an embedding, reranking
+// or Laya (routing) model through the same chat-model-kind.cjs helper this now shares.
+test('a project config patch rejects Laya (the internal routing model) as a manual chat model, for both a member and an admin', async () => {
+  for (const role of ['member', 'admin']) {
+    const f = fixture({ projects: [{ id: 'p1', files: [] }], catalogue: [{ name: 'laya_multilingual_f16', labels: ['routing'] }, { name: 'chat-model', labels: [] }] });
+    await f.call('POST', '/api/projects/p1/config', { model: 'laya_multilingual_f16' }, '', role);
+    assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'laya_multilingual_f16 is an embedding, reranking or routing model and cannot be used as a chat model — pick a chat model instead.' } });
+    assert.equal(f.projects[0].model, undefined, `${role}: the rejected model must not be saved`);
+  }
+});
+
+test('a project config patch rejects an embedding model as a manual chat model, for both a member and an admin', async () => {
+  for (const role of ['member', 'admin']) {
+    const f = fixture({ projects: [{ id: 'p1', files: [] }], catalogue: [{ name: 'nomic-embed-text-v1', labels: ['embeddings'] }] });
+    await f.call('POST', '/api/projects/p1/config', { model: 'nomic-embed-text-v1' }, '', role);
+    assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'nomic-embed-text-v1 is an embedding, reranking or routing model and cannot be used as a chat model — pick a chat model instead.' } });
+    assert.equal(f.projects[0].model, undefined);
+  }
+});
+
+test('a project config patch still accepts an ordinary chat model, and Laya is rejected by name even when the catalogue is unreadable', async () => {
+  const ok = fixture({ projects: [{ id: 'p1', files: [] }], catalogue: [{ name: 'chat-model', labels: [] }] });
+  await ok.call('POST', '/api/projects/p1/config', { model: 'chat-model' });
+  assert.deepEqual(ok.sent.pop(), { status: 200, body: { ok: true } });
+  assert.equal(ok.projects[0].model, 'chat-model');
+
+  // servedCatalogue() returns null when the model manager is disabled or unreachable — Laya is
+  // still refused by name alone (chat-model-kind.cjs falls back to the name when an alias is not
+  // found in the catalogue), matching nonChatAliases' own unreadable-catalogue behaviour.
+  const unreadable = fixture({ projects: [{ id: 'p1', files: [] }], catalogue: null });
+  await unreadable.call('POST', '/api/projects/p1/config', { model: 'laya_multilingual_f16' });
+  assert.equal(unreadable.sent.pop().status, 400);
+  assert.equal(unreadable.projects[0].model, undefined);
+});
+
+test('a model on a non-default (cloud) provider is never checked against the local catalogue', async () => {
+  // Mirrors modelChoiceLabel's own comment (src/model-guidance.ts): a model on another provider
+  // is not in the local catalogue this check reads, so it must never be flagged here — the cloud
+  // provider's own model list is the only authority for what it serves.
+  const f = fixture({ projects: [{ id: 'p1', files: [], provider: 'openrouter' }], catalogue: [{ name: 'laya_multilingual_f16', labels: ['routing'] }] });
+  await f.call('POST', '/api/projects/p1/config', { model: 'laya_multilingual_f16' });
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true } });
+  assert.equal(f.projects[0].model, 'laya_multilingual_f16');
+});
 
 test('malformed background source JSON is 400 before any job is dispatched', async () => {
   const f = fixture({ projects: [{ id: 'p1' }] });

@@ -1,5 +1,6 @@
 'use strict';
 const { frameUntrusted } = require('./prompt-framing.cjs');
+const { isChatGenerationModel } = require('./chat-model-kind.cjs');
 // ── The chat loop ─────────────────────────────────────────────────────────
 // One POST /api/chat: build the system prompt (account instructions, memory,
 // project context, RAG excerpts, skills), hand the Diary space to its
@@ -345,6 +346,24 @@ function createChatHandler({
     }
     if (!model) {
       return json(res, 400, { error: 'no model selected and none loaded — pick one in the model popup' });
+    }
+    // #409: project.model is a stored, explicit pick that (until now) had no server-side guard
+    // when it was saved — a project saved before this guard existed, or written directly through
+    // the API, may still name an embedding, reranking or Laya (routing) model. Sending that
+    // upstream as a chat completion would produce a garbled or system-purposed reply with no
+    // indication why, so refuse with a clear 409 instead (chosen over a silent Auto/default
+    // fallback: a stored pick failing loudly is easier to notice and fix than a chat that quietly
+    // stopped answering the model the person thinks they picked). Auto's fast/smart/code roles
+    // are already checked against this same helper when saved (PUT /api/auto-roles, #343), so
+    // only the manual/explicit path is re-checked here; the local catalogue is the only one this
+    // check can see, so a cloud-provider model is never flagged (matches modelChoiceLabel's own
+    // caveat in src/model-guidance.ts).
+    if (!wantsAuto && project && project.model === model && provider.id === DEFAULT_PROVIDER_ID) {
+      const catalogue = await servedCatalogue();
+      const entry = Array.isArray(catalogue) ? catalogue.find((m) => m.name === model) : null;
+      if (!isChatGenerationModel(model, entry?.labels)) {
+        return json(res, 409, { error: `${model} is an embedding, reranking or routing model and cannot answer chat messages — pick a chat model in the model popup.` });
+      }
     }
 
     // Accept both bare-host and conventional /v1-suffixed base URLs (cloud

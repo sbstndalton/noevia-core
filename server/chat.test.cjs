@@ -272,3 +272,31 @@ test('a project explicitly set to auto routing is unaffected (unchanged pre-exis
   const meta = events.find((e) => e.type === 'meta');
   assert.equal(meta.route, 'fast');
 });
+
+// #409: the composer's Manual model pick had no server-side guard when it was saved
+// (routes/projects.cjs now refuses it), but a project saved before that guard existed — or
+// patched directly through the API — can still store Laya (the internal routing model) or an
+// embedding/reranking model as its manual `model`. The chat path must not silently send a
+// completions request to it; it refuses with a clear 409 instead of a garbled/system reply.
+test('a stored manual project model that is Laya (stale data) is refused with a 409, never sent upstream', async (t) => {
+  const project = { id: 'p1', model: 'laya_multilingual_f16', routing: 'manual', toolboxes: [], files: [] };
+  const { events, requests, jsonReplies } = await runFreeChat(t, { project, rolesConfigured: true });
+  assert.equal(requests.length, 0, 'the non-chat model must never reach the provider');
+  assert.equal(events.length, 0);
+  assert.deepEqual(jsonReplies, [{ status: 409, body: { error: 'laya_multilingual_f16 is an embedding, reranking or routing model and cannot answer chat messages — pick a chat model in the model popup.' } }]);
+});
+
+test('a stored manual project model that is an embedding model (stale data) is refused with a 409', async (t) => {
+  const project = { id: 'p1', model: 'nomic-embed-text-v1', routing: 'manual', toolboxes: [], files: [] };
+  const { requests, jsonReplies } = await runFreeChat(t, { project, rolesConfigured: true });
+  assert.equal(requests.length, 0);
+  assert.equal(jsonReplies[0].status, 409);
+  assert.match(jsonReplies[0].body.error, /nomic-embed-text-v1 is an embedding, reranking or routing model/);
+});
+
+test('an ordinary manual project model is unaffected by the #409 guard', async (t) => {
+  const project = { id: 'p1', model: 'project-model', routing: 'manual', toolboxes: [], files: [] };
+  const { requests, jsonReplies } = await runFreeChat(t, { project, rolesConfigured: true });
+  assert.equal(jsonReplies.length, 0);
+  assert.equal(requests[0].model, 'project-model');
+});

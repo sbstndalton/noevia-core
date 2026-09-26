@@ -570,7 +570,7 @@ const chatRoutes = require('./routes/chat.cjs').createChatRoutes({
 // Projects, sources and uploads (routes/projects.cjs). Background source jobs re-enter the router.
 const projectRoutes = require('./routes/projects.cjs').createProjectRoutes({
   json, readBody, readJson, requestScope, dispatch: (req, res) => handleRequestScoped(req, res), currentWorkspace, authService, storageClient, documents, documentSources, rag, fs, path,
-  reasoningEffort, projectAppearance, diaryExtras, PROJECTS, DEFAULT_TOOLBOXES, sanitizeToolboxes, getProvider, ensureRolesLoaded, store: projectStore,
+  reasoningEffort, projectAppearance, diaryExtras, PROJECTS, DEFAULT_TOOLBOXES, sanitizeToolboxes, getProvider, ensureRolesLoaded, servedCatalogue, DEFAULT_PROVIDER_ID, store: projectStore,
 });
 // The provider registry's routes: list, connect, test and remove (routes/providers.cjs).
 const providerRoutes = require('./routes/providers.cjs').createProviderRoutes({

@@ -16,6 +16,10 @@ const MAX_PROJECT_IMAGES = 12;
 // Shared with projects.cjs's createProject and the create/edit dialogs (src/project-limits.ts,
 // #398) so a name is capped identically everywhere it can be set.
 const { nameMaxLength: PROJECT_NAME_MAX_LENGTH } = require('../project-limits.json');
+// #409: the composer's Manual model pick had no server-side guard at all — unlike PUT
+// /api/auto-roles (#343) and benchmark/start, which both already reject an embedding,
+// reranking or Laya (routing) model through this same helper.
+const { isChatGenerationModel } = require('../chat-model-kind.cjs');
 
 const PASS = Symbol('unhandled');
 
@@ -42,11 +46,13 @@ const PASS = Symbol('unhandled');
  * @param {(boxes:any) => string[]|null} deps.sanitizeToolboxes
  * @param {(id:string) => object|null} deps.getProvider
  * @param {() => void} deps.ensureRolesLoaded
+ * @param {() => Promise<{name:string, labels:string[]}[]|null>} deps.servedCatalogue
+ * @param {string} deps.DEFAULT_PROVIDER_ID
  * @param {object} deps.store   projects.cjs
  */
 function createProjectRoutes({
   json, readBody, readJson, requestScope, dispatch, currentWorkspace, authService, storageClient, documents, documentSources, rag, fs, path,
-  reasoningEffort, projectAppearance, diaryExtras, PROJECTS, DEFAULT_TOOLBOXES, sanitizeToolboxes, getProvider, ensureRolesLoaded, store,
+  reasoningEffort, projectAppearance, diaryExtras, PROJECTS, DEFAULT_TOOLBOXES, sanitizeToolboxes, getProvider, ensureRolesLoaded, servedCatalogue, DEFAULT_PROVIDER_ID, store,
 }) {
   const {
     getProject, saveProjects, createProject, pruneDocuments, sweepDeletedProject, withSourceLock, ensureProjectFolder, indexSource, ownsFile,
@@ -193,7 +199,24 @@ function createProjectRoutes({
       if (typeof patch.name === 'string' && patch.name.trim()) project.name = patch.name.trim().slice(0, PROJECT_NAME_MAX_LENGTH);
       if (typeof patch.goal === 'string') project.goal = patch.goal.slice(0, 2000);
       if (typeof patch.instructions === 'string') project.instructions = patch.instructions.slice(0, 8000);
-      if (typeof patch.model === 'string' && patch.model) project.model = patch.model;
+      if (typeof patch.model === 'string' && patch.model) {
+        // Embedding, reranking and Laya (the internal routing model) cannot answer a chat
+        // prompt — pinning one as the project's manual model would save successfully and send
+        // every subsequent message to it (#409). Only checked against the local catalogue: a
+        // model on another provider (cloud) is not in it, and modelChoiceLabel's own comment on
+        // this same caveat is why (src/model-guidance.ts) — never flag what this server cannot see.
+        const patchProviderId = typeof patch.provider === 'string' && patch.provider ? patch.provider : undefined;
+        const effectiveProviderId = patchProviderId || storedProject.provider || DEFAULT_PROVIDER_ID;
+        const isLocalProvider = effectiveProviderId === DEFAULT_PROVIDER_ID || effectiveProviderId === 'lemonade';
+        if (isLocalProvider) {
+          const catalogue = await servedCatalogue();
+          const entry = Array.isArray(catalogue) ? catalogue.find((m) => m.name === patch.model) : null;
+          if (!isChatGenerationModel(patch.model, entry?.labels)) {
+            return json(res, 400, { error: `${patch.model} is an embedding, reranking or routing model and cannot be used as a chat model — pick a chat model instead.` });
+          }
+        }
+        project.model = patch.model;
+      }
       // Picking a model is a manual choice even when the caller only sent `model` — the picker
       // row itself now sends `routing: 'manual'` alongside it (#384), but older/other callers
       // that patch `model` alone must not have the pick silently auto-routed away on the next
