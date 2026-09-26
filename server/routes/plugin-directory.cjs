@@ -40,6 +40,33 @@ function installable(s) {
   return { installable: false, notInstallable: why };
 }
 
+// Reverse-DNS namespace segments (and the registry's own generic word "mcp") that say nothing
+// about which server this is, e.g. the "com" and "mcp" in "com.cloudflare.mcp".
+const GENERIC_NAME_SEGMENTS = new Set(['com', 'org', 'net', 'io', 'ai', 'co', 'app', 'dev', 'www', 'mcp']);
+const titleCase = (seg) => seg.replace(/[-_]+/g, ' ').trim().replace(/\b\w/g, (c) => c.toUpperCase());
+const hostSlug = (url) => { try { return new URL(url).hostname.replace(/^www\./, '').split('.')[0]; } catch { return ''; } };
+
+/**
+ * A directory entry's readable title. A manifest `title` always wins. Otherwise the registry's
+ * `name` is a reverse-DNS id like "com.notion/mcp" or "com.cloudflare.mcp/mcp": the segment after
+ * the last `/` is usually the server's own slug ("exa", "linear"), but for some publishers it is
+ * just the generic word "mcp" — identical across unrelated servers and meaningless on its own.
+ * When that happens, fall back to the last non-generic namespace segment ("notion",
+ * "cloudflare"), then to the repository/website host, before giving up and showing the raw id
+ * rather than fabricate a title out of nothing but generic words.
+ */
+function fallbackServerName(s) {
+  if (s?.title) return s.title;
+  const raw = String(s?.name || '');
+  const parts = raw.split('/');
+  const slug = parts[parts.length - 1] || '';
+  if (slug && slug.toLowerCase() !== 'mcp') return slug;
+  const segments = parts.slice(0, -1).join('.').split('.').filter(Boolean);
+  const meaningful = segments.filter((seg) => seg && !GENERIC_NAME_SEGMENTS.has(seg.toLowerCase()));
+  const derived = meaningful[meaningful.length - 1] || hostSlug(s?.repository?.url) || hostSlug(s?.websiteUrl);
+  return derived ? titleCase(derived) : (raw || slug);
+}
+
 function mcpItems(body) {
   const list = Array.isArray(body?.servers) ? body.servers : [];
   const seen = new Set();
@@ -48,7 +75,7 @@ function mcpItems(body) {
     seen.add(s.name); return true;
   }).map((s) => ({
     id: s.name,
-    name: s.title || s.name.split('/').pop(),
+    name: fallbackServerName(s),
     publisher: s.name.includes('/') ? s.name.split('/')[0] : '',
     description: String(s.description || '').slice(0, 300),
     version: s.version || '',
@@ -148,4 +175,4 @@ async function findRegistryServer(name, { fetchImpl = globalThis.fetch } = {}) {
   return mcpItems(await r.json()).find((i) => i.id === name) || null;
 }
 
-module.exports = { createPluginDirectoryRoutes, mcpItems, skillItems, fetchPublishedSkill, findRegistryServer, installable, RESERVED_HEADERS };
+module.exports = { createPluginDirectoryRoutes, mcpItems, skillItems, fetchPublishedSkill, findRegistryServer, installable, RESERVED_HEADERS, fallbackServerName };

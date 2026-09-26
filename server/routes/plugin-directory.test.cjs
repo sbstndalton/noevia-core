@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert');
-const { createPluginDirectoryRoutes, mcpItems } = require('./plugin-directory.cjs');
+const { createPluginDirectoryRoutes, mcpItems, fallbackServerName } = require('./plugin-directory.cjs');
 
 const reply = () => { const r = {}; return [r, (res, status, body) => { r.status = status; r.body = body; }]; };
 
@@ -14,6 +14,37 @@ test('maps both registry shapes and drops non-https links', () => {
   assert.equal(items.length, 2);
   assert.deepEqual(items[0], { id: 'io.github.a/one', name: 'one', publisher: 'io.github.a', description: 'One', version: '1.0.0', url: 'https://github.com/a/one', remote: true, installable: false, notInstallable: 'Uses a connection type noevia does not support' });
   assert.equal(items[1].url, '');
+});
+
+test('#410: two starters that both end in the generic slug "mcp" get distinct, readable titles', () => {
+  const items = mcpItems({ servers: [
+    { server: { name: 'com.notion/mcp', description: 'Notion', version: '1.0.0' } },
+    { server: { name: 'com.cloudflare.mcp/mcp', description: 'Cloudflare docs', version: '1.0.0' } },
+  ] });
+  assert.equal(items.length, 2);
+  assert.equal(items[0].id, 'com.notion/mcp');
+  assert.equal(items[0].name, 'Notion');
+  assert.equal(items[1].id, 'com.cloudflare.mcp/mcp');
+  assert.equal(items[1].name, 'Cloudflare');
+  assert.notEqual(items[0].name, items[1].name, 'never the same generic title for two different servers');
+  assert.notEqual(items[0].name.toLowerCase(), 'mcp');
+  assert.notEqual(items[1].name.toLowerCase(), 'mcp');
+});
+
+test('fallbackServerName: title wins, then a non-generic slug, then the namespace, then the host, never the literal "mcp"', () => {
+  // A manifest title always wins, even over a perfectly fine slug.
+  assert.equal(fallbackServerName({ name: 'co.huggingface/hf-mcp-server', title: 'Hugging Face' }), 'Hugging Face');
+  // A non-generic trailing slug is used as-is (existing, working shapes).
+  assert.equal(fallbackServerName({ name: 'ai.exa/exa' }), 'exa');
+  assert.equal(fallbackServerName({ name: 'app.linear/linear' }), 'linear');
+  // The generic slug "mcp" falls back to the last meaningful namespace segment.
+  assert.equal(fallbackServerName({ name: 'com.notion/mcp' }), 'Notion');
+  assert.equal(fallbackServerName({ name: 'com.cloudflare.mcp/mcp' }), 'Cloudflare');
+  // No usable namespace segment (only generic words): fall back to the repository/website host.
+  assert.equal(fallbackServerName({ name: 'mcp', repository: { url: 'https://github.com/acme/widget' } }), 'Github');
+  assert.equal(fallbackServerName({ name: 'com.mcp/mcp', websiteUrl: 'https://widgetco.example.com' }), 'Widgetco');
+  // Nothing at all to derive from: show the raw id rather than crash.
+  assert.equal(fallbackServerName({ name: 'mcp' }), 'mcp');
 });
 
 test('fetches only the fixed registry host, caches, and reports failures as 502', async () => {
