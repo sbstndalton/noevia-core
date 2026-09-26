@@ -16,7 +16,7 @@
 // up on the shared engine (ensureRolesLoaded).
 
 const PASS = Symbol('unhandled');
-const { isSystemModel, modelPathFromArgs, SYSTEM_MODEL_DELETE_REASON } = require('../model-system.cjs');
+const { isSystemModel, modelPathFromArgs, SYSTEM_MODEL_DELETE_REASON, isSidecarModel, SIDECAR_MODEL_DELETE_REASON } = require('../model-system.cjs');
 
 // A client sees e.message only when it was written for people (publicMessage, or a 4xx status).
 // Everything else is logged here and replaced by a fixed sentence.
@@ -125,11 +125,24 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
         // the check only when the catalogue itself cannot be read (engine unreachable): saving
         // is still allowed, since the alternative is a member/admin locked out of the page.
         const catalogue = await servedCatalogue();
+        const named = { fast, smart, ...(vision ? { vision } : {}), ...(code ? { code } : {}) };
         if (Array.isArray(catalogue)) {
           const known = new Set(catalogue.map((m) => m.name));
-          const named = { fast, smart, ...(vision ? { vision } : {}), ...(code ? { code } : {}) };
           const bad = Object.entries(named).filter(([, name]) => !known.has(name)).map(([, name]) => name);
           if (bad.length) return json(res, 400, { error: `unknown model(s): ${bad.join(', ')}` });
+        }
+        // #343: fast/smart/code all route chat-generation prompts — an embedding, reranking or
+        // routing model there fails every request through it (auto-router.cjs classifyFastOrSmart
+        // fails open to fast, so a bad `fast` breaks Auto entirely). Same helper the sibling
+        // benchmark/start handler above already uses. Vision keeps its own allowed-kind rule
+        // (a vision/multimodal label, not this chat-generation check) — unchanged here.
+        const { nonChatAliases } = require('../chat-model-kind.cjs');
+        const textRoles = { fast, smart, ...(code ? { code } : {}) };
+        const nonChat = new Set(nonChatAliases(Object.values(textRoles), catalogue));
+        const badRole = Object.entries(textRoles).find(([, name]) => nonChat.has(name));
+        if (badRole) {
+          const [role, model] = badRole;
+          return json(res, 400, { error: `The ${role} role needs a chat model; ${model} is an embedding, reranking or routing model.` });
         }
         setAutoRoles({ fast, smart, vision, code });
         // Loading models for the shared engine is an administrative action: a member's save is
@@ -180,6 +193,11 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
         if(keys.length){
           const blocked=keys.some(key=>{const entry=scanned.find(f=>f.key===key);return entry&&(isSystemModel(entry.modelId)||(entry.sections||[]).some(s=>isSystemModel(s)));});
           if(blocked)return json(res,400,{error:SYSTEM_MODEL_DELETE_REASON});
+          // #336: the folder-scan delete removes files directly, bypassing the /api/models/delete
+          // guard below entirely — without this, canDelete:false on the installed list (models.cjs)
+          // is cosmetic, since the client falls back to this very endpoint whenever canDelete is false.
+          const sidecarBlocked=keys.some(key=>{const entry=scanned.find(f=>f.key===key);return entry&&(isSidecarModel(entry.modelId,env)||(entry.sections||[]).some(s=>isSidecarModel(s,env)));});
+          if(sidecarBlocked)return json(res,409,{error:SIDECAR_MODEL_DELETE_REASON});
         }
         deleteKeys=keys; deleteScanned=scanned;
       }
@@ -192,6 +210,11 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
         const cachedEntry = Array.isArray(scanned) ? scanned.find(f => (f.sections||[]).includes(name)) : null;
         if (isSystemModel(name) || (cachedEntry && isSystemModel(cachedEntry.modelId))) {
           return json(res,400,{error:SYSTEM_MODEL_DELETE_REASON});
+        }
+        // Delete-only guard (#336): removing the section for a model a live sidecar depends on
+        // leaves that sidecar pointed at nothing. Rename is left alone — out of scope here.
+        if (method === 'DELETE' && (isSidecarModel(name, env) || (cachedEntry && isSidecarModel(cachedEntry.modelId, env)))) {
+          return json(res, 409, { error: SIDECAR_MODEL_DELETE_REASON });
         }
       }
       if(method!=='GET')modelScanCache.clear();
@@ -397,6 +420,10 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
       }
       if (!body.name) return json(res, 400, { error: 'name required' });
       if (isSystemModel(body.name)) return json(res, 400, { error: SYSTEM_MODEL_DELETE_REASON });
+      // #336: nomic-embed-text-v1 was deleted through this route while the embed sidecar was
+      // still pointed at it, which crash-loops that sidecar with nothing to fall back to.
+      // 409 (not 400): the name is a perfectly valid model, just not deletable right now.
+      if (isSidecarModel(body.name, env)) return json(res, 409, { error: SIDECAR_MODEL_DELETE_REASON });
       if (!modelManager.enabled) return json(res, 404, { error: 'model management is disabled' });
       // A neutral id can still point at Laya's weights: check the router's --model path as well.
       if (modelManager.kind === 'llamacpp' && typeof modelManager.request === 'function') {
@@ -404,6 +431,7 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
         if (!listing?.ok || !Array.isArray(listing.body?.data)) return json(res, 409, { error: 'Could not confirm this is not a system model. Try again.' });
         const row = listing.body.data.find(m => m.id === body.name);
         if (row && isSystemModel(row.id, modelPathFromArgs(row.status?.args || []))) return json(res, 400, { error: SYSTEM_MODEL_DELETE_REASON });
+        if (row && isSidecarModel(row.id, env)) return json(res, 409, { error: SIDECAR_MODEL_DELETE_REASON });
       }
       // Confirm the model is known before touching it: an unknown name 404s instead of
       // forwarding a delete the manager might silently accept for anything. When the

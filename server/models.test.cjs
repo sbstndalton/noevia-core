@@ -37,12 +37,39 @@ test('modelsInstalled hides hash duplicates, marks loaded models and remembers t
   assert.equal(f.service.lastLoadedModel(), null);
   const installed = await f.service.modelsInstalled();
   assert.deepEqual(installed.map((m) => m.name), ['embed-1', 'chat-7b', 'failed-x']);
-  assert.deepEqual(installed[1], { name: 'chat-7b', sizeGB: 4.3, loaded: true, labels: [], mtp: installed[1].mtp, maxContext: 8192, suggested: true, status: 'loaded', failed: false, canDelete: false, source: null });
+  assert.deepEqual(installed[1], { name: 'chat-7b', sizeGB: 4.3, loaded: true, labels: [], mtp: installed[1].mtp, maxContext: 8192, suggested: true, status: 'loaded', failed: false, canDelete: false, sidecarProtected: false, source: null });
   assert.equal(installed[0].sizeGB, 0.6);
   assert.equal(installed[2].status, 'failed');
   assert.equal(installed[2].failed, true);
   assert.equal(f.service.lastLoadedModel(), 'chat-7b', 'an embedding model is never the default');
   assert.deepEqual(await f.service.servedCatalogue(), installed);
+});
+
+test('#336: sidecarProtected is true for the configured embedding model, distinct from (and regardless of) canDelete', async () => {
+  const f = fixture({
+    env: { EMBEDDING_MODEL: 'nomic-embed-text-v1' },
+    models: [
+      // can_remove:true here on purpose: the manager itself sees nothing wrong with removing it,
+      // but noevia's own embed sidecar still depends on the name — sidecarProtected catches that
+      // even though canDelete (the manager's own signal) stays true.
+      { id: 'nomic-embed-text-v1', labels: ['embedding'], size: 0.27, can_remove: true },
+      { id: 'chat-7b', size: 4.26, can_remove: true },
+      // The reverse also holds: can_remove:false alone (nothing to do with a sidecar) must not
+      // set sidecarProtected — that used to collapse the two and hid a delete path that still
+      // works through the client's canDelete:false fallback (regression fixed after #350 review).
+      { id: 'unrelated-locked', size: 1.1, can_remove: false },
+    ],
+  });
+  const installed = await f.service.modelsInstalled();
+  const embed = installed.find((m) => m.name === 'nomic-embed-text-v1');
+  assert.equal(embed.sidecarProtected, true);
+  assert.equal(embed.canDelete, true, 'canDelete keeps its own (manager-reported) meaning');
+  const chat = installed.find((m) => m.name === 'chat-7b');
+  assert.equal(chat.sidecarProtected, false);
+  assert.equal(chat.canDelete, true);
+  const locked = installed.find((m) => m.name === 'unrelated-locked');
+  assert.equal(locked.canDelete, false, 'can_remove:false still reaches canDelete, unchanged');
+  assert.equal(locked.sidecarProtected, false, 'but it is not a sidecar model, so sidecarProtected stays false');
 });
 
 test('a disabled or unreachable manager reads as null from servedCatalogue and throws from modelsInstalled', async () => {

@@ -32,4 +32,34 @@ function isSystemModel(id, modelPath) {
 const SYSTEM_MODEL_REASON = 'System routing model — not tuned';
 const SYSTEM_MODEL_DELETE_REASON = 'System routing model — not deleted';
 
-module.exports = { isSystemModel, modelPathFromArgs, SYSTEM_MODEL_REASON, SYSTEM_MODEL_DELETE_REASON };
+// Model names a live sidecar depends on right now: the RAG embedding model (EMBEDDING_MODEL, or
+// EMBED_MODEL — same precedence rag.cjs's init() uses) and, only when the RAG reranker feature is
+// actually on, RERANK_MODEL. Mirrors llamacpp-manager.cjs's keepAlongside() (out of scope to edit
+// here), which uses the same two names to decide what never gets evicted from a single-slot
+// engine. Deleting one of these while its sidecar is still pointed at it crash-loops that sidecar
+// (#336) — there is no fallback name to load instead, so the guard is name-based, not label-based:
+// an unused, merely embeddings-labelled install is not protected, only the one actually wired up.
+// `env` is read at call time (same convention as the rest of the model routes), defaulting to
+// process.env so callers outside a request (e.g. the installed-list mapper) need not pass it.
+function sidecarModelNames(env = process.env) {
+  const names = new Set();
+  const embed = String(env.EMBEDDING_MODEL || env.EMBED_MODEL || '').trim();
+  if (embed && embed.toLowerCase() !== 'default') names.add(embed);
+  const rerankOn = /^(1|true|on)$/i.test(String(env.NOEVIA_FEATURE_RAG_RERANK || ''));
+  const rerank = rerankOn ? String(env.RERANK_MODEL || '').trim() : '';
+  if (rerank) names.add(rerank);
+  return names;
+}
+
+/** True when `name` is the configured embedding model or (feature-gated) reranker. */
+function isSidecarModel(name, env = process.env) {
+  const n = String(name || '').trim();
+  return !!n && sidecarModelNames(env).has(n);
+}
+
+const SIDECAR_MODEL_DELETE_REASON = 'A running sidecar (embedding or reranking) depends on this model — not deleted';
+
+module.exports = {
+  isSystemModel, modelPathFromArgs, SYSTEM_MODEL_REASON, SYSTEM_MODEL_DELETE_REASON,
+  sidecarModelNames, isSidecarModel, SIDECAR_MODEL_DELETE_REASON,
+};

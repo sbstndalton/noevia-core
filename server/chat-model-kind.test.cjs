@@ -20,3 +20,13 @@ test('nonChatAliases uses catalogue labels and falls back to names when the cata
   assert.deepEqual(nonChatAliases(['chat-x', 'nomic-embed-text-v1'], null), ['nomic-embed-text-v1']);
   assert.deepEqual(nonChatAliases(undefined, cat), []);
 });
+
+// #343 review follow-up: servedCatalogue() returns null on an unreachable engine, but callers
+// should never have to know that specifically — any non-array (undefined, or a stray non-array
+// value) must degrade to the same name-only fallback rather than throwing.
+test('nonChatAliases never throws when catalogue is not an array, for any non-array value', () => {
+  for (const catalogue of [undefined, {}, 'not-an-array', 0, false]) {
+    assert.doesNotThrow(() => nonChatAliases(['chat-x', 'nomic-embed-text-v1'], catalogue));
+    assert.deepEqual(nonChatAliases(['chat-x', 'nomic-embed-text-v1'], catalogue), ['nomic-embed-text-v1']);
+  }
+});

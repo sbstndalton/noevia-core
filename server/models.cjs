@@ -16,6 +16,8 @@
  * @param {object} deps.modelManager         model-manager.cjs adapter
  * @param {() => object} deps.currentWorkspace
  */
+const { isSidecarModel } = require('./model-system.cjs');
+
 function createModelService({ fetchJson, env, modelManager, currentWorkspace, listWorkspaces }) {
   // One call to the model management service, with its token. Same path the proxy route uses.
   function managerFetch(rest, method = 'GET') {
@@ -179,6 +181,12 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
         status: m.status?.value || (loadedNames.has(m.id || m.model_name) ? 'loaded' : 'unloaded'),
         failed: m.status?.failed === true,
         canDelete: m.can_remove !== false,
+        // #336: distinct from canDelete (which the client falls back to a different delete path
+        // for, when false — see routes/models.cjs). A model can_remove reports removable is still
+        // the one EMBEDDING_MODEL/RERANK_MODEL names, and deleting that file crash-loops its
+        // sidecar with nothing to fall back to; sidecarProtected is the client's own signal to
+        // hide Delete entirely rather than trying the fallback path.
+        sidecarProtected: isSidecarModel(m.id || m.model_name, env),
         source: m.source || null,
       }));
     if (!LAST_LOADED_MODEL) {

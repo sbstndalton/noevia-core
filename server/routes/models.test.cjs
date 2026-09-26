@@ -125,6 +125,37 @@ test('a member may save their own auto-roles but never warms the shared engine, 
   assert.deepEqual(unreachable.sent.pop(), { status: 200, body: { configured: true, roles: { fast: 'anything', smart: 'goes', vision: '', code: '' } } });
 });
 
+test('#343: PUT /api/auto-roles rejects an embedding model as fast/smart/code for both member and admin, but leaves vision alone', async () => {
+  const catalogue = [
+    { name: 'chat-syn', labels: [] },
+    { name: 'vec-syn', labels: ['embeddings'] },
+  ];
+  for (const role of ['fast', 'smart', 'code']) {
+    for (const actor of ['member', 'admin']) {
+      const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, catalogue });
+      const body = { fast: 'chat-syn', smart: 'chat-syn', [role]: 'vec-syn' };
+      await f.call('PUT', '/api/auto-roles', body, actor);
+      assert.deepEqual(f.sent.pop(), { status: 400, body: { error: `The ${role} role needs a chat model; vec-syn is an embedding, reranking or routing model.` } }, `${role}/${actor}`);
+      assert.equal(f.roles.current, null, `${role}/${actor}: a rejected role is never saved`);
+      assert.equal(f.roles.warmed, undefined, `${role}/${actor}: nothing is warmed up either`);
+    }
+  }
+  // A chat model in every text role still saves and (for an admin) still warms up.
+  const good = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, catalogue });
+  await good.call('PUT', '/api/auto-roles', { fast: 'chat-syn', smart: 'chat-syn', code: 'chat-syn' }, 'admin');
+  assert.deepEqual(good.sent.pop(), { status: 200, body: { configured: true, roles: { fast: 'chat-syn', smart: 'chat-syn', vision: '', code: 'chat-syn' } } });
+  assert.equal(good.roles.warmed, true);
+  // Vision keeps its own allowed-kind rule: an embeddings-labelled model there is unaffected by
+  // this guard (still only checked against the catalogue's known names, same as before #343).
+  const vision = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, catalogue });
+  await vision.call('PUT', '/api/auto-roles', { fast: 'chat-syn', smart: 'chat-syn', vision: 'vec-syn' }, 'admin');
+  assert.deepEqual(vision.sent.pop(), { status: 200, body: { configured: true, roles: { fast: 'chat-syn', smart: 'chat-syn', vision: 'vec-syn', code: '' } } });
+  // The guard still catches a name-pattern match even when the catalogue cannot be read.
+  const unreachable = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, servedCatalogue: async () => null });
+  await unreachable.call('PUT', '/api/auto-roles', { fast: 'nomic-embed-text-v1', smart: 'chat-syn' }, 'admin');
+  assert.deepEqual(unreachable.sent.pop(), { status: 400, body: { error: 'The fast role needs a chat model; nomic-embed-text-v1 is an embedding, reranking or routing model.' } });
+});
+
 test('the model manager proxy is admin-only, validates the path and serves the cached scan', async () => {
   const unset = fixture();
   await unset.call('GET', '/api/model-manager/models', undefined, 'admin');
@@ -169,6 +200,19 @@ test('the model-manager delete proxy rejects a system model by its scanned key, 
 // only calls POST /api/models/delete when canDelete !== false && source !== 'preset'. Without
 // the same cleanup running here, #302 stayed broken for every folder model on a live llama.cpp
 // engine (the common case), even though the direct /api/models/delete route was fixed.
+test('#336: the model-manager delete proxy also refuses the configured embedding model by its scanned key, with 409', async () => {
+  const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader', EMBEDDING_MODEL: 'nomic-embed-text-v1' } });
+  f.scan.set('models', { at: Date.now(), body: { models: [
+    { key: 'k-embed', modelId: 'nomic-embed-text-v1', sections: ['nomic-embed-text-v1'] },
+    { key: 'k-synthetic', modelId: 'synthetic', sections: ['synthetic'] },
+  ] } });
+  await f.call('POST', '/api/model-manager/models/delete', { models: ['k-embed'] }, 'admin');
+  assert.deepEqual(f.sent.pop(), { status: 409, body: { error: 'A running sidecar (embedding or reranking) depends on this model — not deleted' } });
+  assert.equal(f.fetched.length, 0, 'the model management service is never called for a blocked delete');
+  await f.call('POST', '/api/model-manager/models/delete', { models: ['k-synthetic'] }, 'admin');
+  assert.equal(f.sent.pop().status, 200, 'an ordinary model still deletes through the proxy');
+});
+
 test('the model-manager delete proxy runs the same unload/roles/identity cleanup as /api/models/delete, for a source:"preset" folder model', async () => {
   const forgotten = [];
   const f = fixture({
@@ -241,6 +285,22 @@ test('the model-manager sections proxy rejects delete and rename of a Laya secti
   await f.call('DELETE', '/api/model-manager/sections/synthetic', undefined, 'admin');
   assert.equal(f.sent.pop().status, 200, 'an ordinary section still deletes through the proxy');
   assert.equal(f.fetched.length, 1);
+});
+
+test('#336: the sections proxy refuses to delete the configured embedding model\'s section (409), but still allows renaming it', async () => {
+  const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader', EMBEDDING_MODEL: 'nomic-embed-text-v1' } });
+  f.scan.set('models', { at: Date.now(), body: { models: [
+    { key: 'k-embed', modelId: 'nomic-embed-text-v1', sections: ['nomic-embed-text-v1'] },
+  ] } });
+  await f.call('DELETE', '/api/model-manager/sections/nomic-embed-text-v1', undefined, 'admin');
+  assert.deepEqual(f.sent.pop(), { status: 409, body: { error: 'A running sidecar (embedding or reranking) depends on this model — not deleted' } });
+  assert.equal(f.fetched.length, 0, 'a blocked delete never reaches the model management service');
+  // Rename is out of scope for this delete guard; it still forwards.
+  f.scan.set('models', { at: Date.now(), body: { models: [
+    { key: 'k-embed', modelId: 'nomic-embed-text-v1', sections: ['nomic-embed-text-v1'] },
+  ] } });
+  await f.call('POST', '/api/model-manager/sections/nomic-embed-text-v1/rename', { to: 'renamed' }, 'admin');
+  assert.equal(f.sent.pop().status, 200, 'renaming the embedding model section is unaffected by the delete guard');
 });
 
 test('any write under /api/models/ drops the scan, and pull/delete/load keep their answers', async () => {
@@ -454,6 +514,54 @@ test('a system model is still refused before any unload or delete call, on both 
   const python = fixture({ kind: 'lemonade', manager: { unload: async () => ({ ok: true }), deleteModel: async () => ({ ok: true, status: 200 }) } });
   await python.call('POST', '/api/models/delete', { name: 'laya_multilingual_f16' }, 'admin');
   assert.deepEqual(python.sent.pop(), { status: 400, body: { error: 'System routing model — not deleted' } });
+});
+
+test('#336: deleting the configured embedding model (or reranker) 409s before any unload/delete call, on both engine kinds', async () => {
+  const calls = [];
+  const manager = {
+    unload: async () => { calls.push('unload'); return { ok: true }; },
+    deleteModel: async () => { calls.push('delete'); return { ok: true, status: 200 }; },
+  };
+  const llama = fixture({ env: { EMBEDDING_MODEL: 'nomic-embed-text-v1' }, manager, modelsInstalled: async () => [{ name: 'nomic-embed-text-v1', loaded: true }] });
+  await llama.call('POST', '/api/models/delete', { name: 'nomic-embed-text-v1' }, 'admin');
+  assert.deepEqual(llama.sent.pop(), { status: 409, body: { error: 'A running sidecar (embedding or reranking) depends on this model — not deleted' } });
+  assert.deepEqual(calls, [], 'never unloaded or deleted');
+
+  // EMBED_MODEL is the fallback name (rag.cjs's own precedence), and a reranker only counts
+  // once the feature is actually on.
+  const rerank = fixture({
+    env: { EMBED_MODEL: 'nomic-embed-text-v1', NOEVIA_FEATURE_RAG_RERANK: '1', RERANK_MODEL: 'qwen3-reranker-0.6b-q8_0' },
+    modelsInstalled: async () => [{ name: 'qwen3-reranker-0.6b-q8_0', loaded: false }],
+  });
+  await rerank.call('POST', '/api/models/delete', { name: 'qwen3-reranker-0.6b-q8_0' }, 'admin');
+  assert.deepEqual(rerank.sent.pop(), { status: 409, body: { error: 'A running sidecar (embedding or reranking) depends on this model — not deleted' } });
+
+  const rerankOff = fixture({
+    env: { RERANK_MODEL: 'qwen3-reranker-0.6b-q8_0' },
+    manager: { unload: async () => ({ ok: true }), deleteModel: async () => ({ ok: true, status: 200 }) },
+    modelsInstalled: async () => [{ name: 'qwen3-reranker-0.6b-q8_0', loaded: false }],
+  });
+  await rerankOff.call('POST', '/api/models/delete', { name: 'qwen3-reranker-0.6b-q8_0' }, 'admin');
+  assert.equal(rerankOff.sent.pop().status, 200, 'RERANK_MODEL alone (feature off) does not protect it');
+
+  // A neutral id resolving to the embedding model through the llama.cpp router listing is caught too.
+  const python = fixture({
+    kind: 'lemonade',
+    env: { EMBEDDING_MODEL: 'nomic-embed-text-v1' },
+    manager,
+    modelsInstalled: async () => [{ name: 'nomic-embed-text-v1', loaded: true }],
+  });
+  await python.call('POST', '/api/models/delete', { name: 'nomic-embed-text-v1' }, 'admin');
+  assert.deepEqual(python.sent.pop(), { status: 409, body: { error: 'A running sidecar (embedding or reranking) depends on this model — not deleted' } });
+
+  // EMBEDDING_MODEL=default (the .env.example placeholder) protects nothing.
+  const placeholder = fixture({
+    env: { EMBEDDING_MODEL: 'default' },
+    manager: { unload: async () => ({ ok: true }), deleteModel: async () => ({ ok: true, status: 200 }) },
+    modelsInstalled: async () => [{ name: 'default', loaded: false }],
+  });
+  await placeholder.call('POST', '/api/models/delete', { name: 'default' }, 'admin');
+  assert.equal(placeholder.sent.pop().status, 200);
 });
 
 test('the python model-manager branch (no /models listing check) still unloads, deletes and clears roles', async () => {
