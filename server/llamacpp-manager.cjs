@@ -35,7 +35,11 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
   // presets/evidence require the request() helper this closure also builds.
   let onDownloadCompleted=null;
   const tracker=require('./llamacpp-downloads.cjs').createDownloadTracker({base,headers,file:downloadStatePath,fetchStream,onCompleted:model=>onDownloadCompleted?.(model)});
-  const presets=presetPath ? require('./llamacpp-presets.cjs').createPresetStore(presetPath,{writer:presetWriter}) : null;
+  const store=presetPath ? require('./llamacpp-presets.cjs').createPresetStore(presetPath,{writer:presetWriter}) : null;
+  // Every commit (apply, calibration, auto-tune, restores) settles an uncertain Model Loader
+  // write by reading models.ini back instead of assuming nothing changed (#339).
+  const {commitReconciled}=require('./models-ini-writer.cjs');
+  const presets=store ? {...store,commit:candidate=>commitReconciled(store,candidate)} : null;
   const maintenance=require('./inference-maintenance.cjs').createMaintenanceGate();
   async function mutate(fn) {const leave=maintenance.enter();try{return await fn();}finally{leave();}}
   async function listModels() {
@@ -149,7 +153,13 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     if(!models.some(m=>m.id===body.model))return {ok:false,status:404,body:{error:'Choose an installed model'}};
     if(models.some(m=>!['unloaded'].includes(m.status?.value)))return {ok:false,status:409,body:{error:'Unload all router models and finish downloads before applying a profile. Other clients must remain stopped.'}};
     const candidate=presets.prepare(body);
-    await presets.commit(candidate);
+    try {await presets.commit(candidate);}
+    catch(e) {
+      // A settled Model Loader outcome carries its own message; a 5xx would otherwise reach
+      // the admin as "Internal error". Nothing was reloaded: the file is not ours to apply.
+      if(e?.publicMessage&&e.status>=500)return {ok:false,status:e.status,body:{error:e.publicMessage,...(e.retryable?{retryable:true}:{})}};
+      throw e;
+    }
     try {
       const result=await request('/models?reload=1',{},120000);
       if(!result.ok)throw Error('Native reload failed');
@@ -157,7 +167,11 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     } catch {
       // Restore only our own version; never overwrite an operator's later edit.
       try {await presets.commit({baseRevision:candidate.revision,text:candidate.before});}
-      catch {return {ok:false,status:503,body:{error:'Reload outcome is uncertain and the file changed again. Stop inference and inspect native presets before retrying.'}};}
+      catch(e) {
+        if(e?.status===409)return {ok:false,status:503,body:{error:'Reload outcome is uncertain and the file changed again. Stop inference and inspect native presets before retrying.'}};
+        if(e?.retryable)return {ok:false,status:503,body:{error:'Reload failed or timed out, and the previous preset file could not be restored: models.ini still holds the new settings. Check router and Model Loader health before retrying.'}};
+        return {ok:false,status:503,body:{error:'Reload failed or timed out, and restoring the previous preset file could not be confirmed. Stop inference and inspect native presets before retrying.'}};
+      }
       try {await request('/models?reload=1',{},120000);}catch {}
       return {ok:false,status:503,body:{error:'Reload failed or timed out. Previous preset file restored; check router health before retrying.'}};
     }

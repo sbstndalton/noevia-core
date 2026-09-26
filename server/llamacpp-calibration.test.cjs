@@ -5,7 +5,7 @@ const {ladder}=require('./llamacpp-calibration.cjs');
 
 // Synthetic llama.cpp router: a model loads only while its preset context is at or below
 // `loadCap`, and recalls the start marker only at or below `longCap`.
-function fixture(t,{loadCap=40960,longCap=Infinity,native=131072,memory=()=>20,other=false,onLoad,speed=100000}={}){
+function fixture(t,{loadCap=40960,longCap=Infinity,native=131072,memory=()=>20,other=false,onLoad,speed=100000,presetWriter}={}){
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'calibration-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
   const ini=path.join(dir,'models.ini'),stateFile=path.join(dir,'state.json');
   const original='version = 1\n[*]\ncache-type-k = q8_0\n[synthetic]\n; operator note stays\nmodel = /models/s.gguf\nc = 8192\nparallel = 1\n[other]\nc = 4096\n';
@@ -56,10 +56,26 @@ function fixture(t,{loadCap=40960,longCap=Infinity,native=131072,memory=()=>20,o
     });
     return new Response(readable,{status:200});
   };
-  const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',presetPath:ini,fetchJson,fetchStream,calibrationStatePath:stateFile,autoconfig:{},calibrationOptions:{sleep:async()=>{},readMemory:memory,now:()=>clock.t,timeouts:{memoryPoll:5}}});
+  const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',presetPath:ini,fetchJson,fetchStream,calibrationStatePath:stateFile,autoconfig:{},presetWriter,calibrationOptions:{sleep:async()=>{},readMemory:memory,now:()=>clock.t,timeouts:{memoryPoll:5}}});
   return {manager,ini,stateFile,original,router,ctxOf};
 }
 async function finished(manager){for(let i=0;i<2000;i++){const job=manager.calibration.status().body.job;if(job&&job.status!=='running')return job;await new Promise(r=>setImmediate(r));}throw Error('calibration did not finish');}
+
+test('#339 calibration survives Model Loader replies lost after every commit',async t=>{
+  // Each PUT commits and then its reply is lost; the manager reads models.ini back instead of failing.
+  const crypto=require('node:crypto'),sha=x=>crypto.createHash('sha256').update(x).digest('hex');
+  let ini,writes=0;
+  const presetWriter=require('./models-ini-writer.cjs').createModelsIniWriter({mode:'model-loader',url:'http://ml',fetchJson:async(_u,opts)=>{
+    const {baseRevision,text}=JSON.parse(opts.body);writes++;
+    if(baseRevision!==sha(fs.readFileSync(ini,'utf8')))return {ok:false,status:409,body:{}};
+    fs.writeFileSync(ini,text);throw Error('socket hang up after commit');
+  }});
+  const f=fixture(t,{loadCap:131072,presetWriter});ini=f.ini;
+  assert.equal((await f.manager.calibration.start('synthetic',{promptBudgetSeconds:60,confirmPause:true})).status,202);
+  const job=await finished(f.manager);
+  assert.equal(job.status,'passed',job.error);assert.ok(writes>1);
+  assert.equal(f.ctxOf(),job.result.appliedCtx);assert.match(fs.readFileSync(f.ini,'utf8'),/; operator note stays/);
+});
 
 test('ladder covers 4096 up to the trained context, or 128K when unknown',()=>{
   assert.equal(ladder(32768).at(-1),32768);assert.equal(ladder(0).at(-1),131072);assert.ok(ladder(100000).includes(100000));assert.equal(ladder(262144)[0],4096);
