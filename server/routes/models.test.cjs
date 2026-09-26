@@ -125,12 +125,13 @@ test('a member may save their own auto-roles but never warms the shared engine, 
   assert.deepEqual(unreachable.sent.pop(), { status: 200, body: { configured: true, roles: { fast: 'anything', smart: 'goes', vision: '', code: '' } } });
 });
 
-test('#343: PUT /api/auto-roles rejects an embedding model as fast/smart/code for both member and admin, but leaves vision alone', async () => {
+test('#343/#442: PUT /api/auto-roles rejects a non-chat model for fast/smart/vision/code alike', async () => {
   const catalogue = [
     { name: 'chat-syn', labels: [] },
     { name: 'vec-syn', labels: ['embeddings'] },
+    { name: 'laya_multilingual_f16', labels: [] },
   ];
-  for (const role of ['fast', 'smart', 'code']) {
+  for (const role of ['fast', 'smart', 'vision', 'code']) {
     for (const actor of ['member', 'admin']) {
       const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, catalogue });
       const body = { fast: 'chat-syn', smart: 'chat-syn', [role]: 'vec-syn' };
@@ -140,16 +141,30 @@ test('#343: PUT /api/auto-roles rejects an embedding model as fast/smart/code fo
       assert.equal(f.roles.warmed, undefined, `${role}/${actor}: nothing is warmed up either`);
     }
   }
+  // #442: Laya (the internal routing model — labels [], flagged by name via isSystemModel) is
+  // rejected for vision the same way it already was for fast/smart/code.
+  const laya = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, catalogue });
+  await laya.call('PUT', '/api/auto-roles', { fast: 'chat-syn', smart: 'chat-syn', vision: 'laya_multilingual_f16' }, 'admin');
+  assert.deepEqual(laya.sent.pop(), { status: 400, body: { error: 'The vision role needs a chat model; laya_multilingual_f16 is an embedding, reranking or routing model.' } });
+  assert.equal(laya.roles.current, null, 'a rejected vision role is never saved');
+
   // A chat model in every text role still saves and (for an admin) still warms up.
   const good = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, catalogue });
   await good.call('PUT', '/api/auto-roles', { fast: 'chat-syn', smart: 'chat-syn', code: 'chat-syn' }, 'admin');
   assert.deepEqual(good.sent.pop(), { status: 200, body: { configured: true, roles: { fast: 'chat-syn', smart: 'chat-syn', vision: '', code: 'chat-syn' } } });
   assert.equal(good.roles.warmed, true);
-  // Vision keeps its own allowed-kind rule: an embeddings-labelled model there is unaffected by
-  // this guard (still only checked against the catalogue's known names, same as before #343).
-  const vision = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, catalogue });
-  await vision.call('PUT', '/api/auto-roles', { fast: 'chat-syn', smart: 'chat-syn', vision: 'vec-syn' }, 'admin');
-  assert.deepEqual(vision.sent.pop(), { status: 200, body: { configured: true, roles: { fast: 'chat-syn', smart: 'chat-syn', vision: 'vec-syn', code: '' } } });
+
+  // #442: a vision-capable chat model (labels: ['vision']) is accepted for the vision role.
+  const visionCatalogue = [...catalogue, { name: 'vision-syn', labels: ['vision'] }];
+  const vision = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, catalogue: visionCatalogue });
+  await vision.call('PUT', '/api/auto-roles', { fast: 'chat-syn', smart: 'chat-syn', vision: 'vision-syn' }, 'admin');
+  assert.deepEqual(vision.sent.pop(), { status: 200, body: { configured: true, roles: { fast: 'chat-syn', smart: 'chat-syn', vision: 'vision-syn', code: '' } } });
+
+  // #442: an empty/absent vision role stays valid (vision remains optional).
+  const empty = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, catalogue });
+  await empty.call('PUT', '/api/auto-roles', { fast: 'chat-syn', smart: 'chat-syn', vision: '' }, 'admin');
+  assert.deepEqual(empty.sent.pop(), { status: 200, body: { configured: true, roles: { fast: 'chat-syn', smart: 'chat-syn', vision: '', code: '' } } });
+
   // The guard still catches a name-pattern match even when the catalogue cannot be read.
   const unreachable = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, servedCatalogue: async () => null });
   await unreachable.call('PUT', '/api/auto-roles', { fast: 'nomic-embed-text-v1', smart: 'chat-syn' }, 'admin');

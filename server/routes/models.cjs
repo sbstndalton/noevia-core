@@ -131,13 +131,19 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
           const bad = Object.entries(named).filter(([, name]) => !known.has(name)).map(([, name]) => name);
           if (bad.length) return json(res, 400, { error: `unknown model(s): ${bad.join(', ')}` });
         }
-        // #343: fast/smart/code all route chat-generation prompts — an embedding, reranking or
-        // routing model there fails every request through it (auto-router.cjs classifyFastOrSmart
-        // fails open to fast, so a bad `fast` breaks Auto entirely). Same helper the sibling
-        // benchmark/start handler above already uses. Vision keeps its own allowed-kind rule
-        // (a vision/multimodal label, not this chat-generation check) — unchanged here.
+        // #343/#442: fast/smart/vision/code all route chat-generation prompts — an embedding,
+        // reranking or routing model there fails every request through it (auto-router.cjs
+        // classifyFastOrSmart fails open to fast, so a bad `fast` breaks Auto entirely; a Laya or
+        // embedding `vision` role would send image-description duty to a model that cannot see).
+        // Same helper the sibling benchmark/start handler above already uses. This does not
+        // additionally require a `vision`/`multimodal` label: unlike Laya (name-flagged as a
+        // system model) or an embedding/reranking model (label-flagged), an ordinary chat model
+        // with no vision label is not known to be incapable of the image-description role, only
+        // unconfirmed — the client's picker narrows further to models the server actually
+        // reported as vision-capable (ModelsSettings.tsx), but the server accepts any chat model
+        // here so a hand-written /api/auto-roles call from a working setup never breaks.
         const { nonChatAliases } = require('../chat-model-kind.cjs');
-        const textRoles = { fast, smart, ...(code ? { code } : {}) };
+        const textRoles = { fast, smart, ...(vision ? { vision } : {}), ...(code ? { code } : {}) };
         const nonChat = new Set(nonChatAliases(Object.values(textRoles), catalogue));
         const badRole = Object.entries(textRoles).find(([, name]) => nonChat.has(name));
         if (badRole) {
