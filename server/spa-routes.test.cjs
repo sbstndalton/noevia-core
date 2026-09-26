@@ -38,7 +38,10 @@ test('client places get index.html, uncached', async () => {
   const root = build();
   const serve = createStaticFallback({ staticFiles: createStaticFiles(root), indexFile: path.join(root, 'index.html'), json });
   for (const p of ['/', '/c/c-1727000000000-abc', '/p/proj-1', '/p/proj-1/sources', '/p/proj-1/new', '/settings/appearance',
-    '/customise/skills', '/models', '/models/org%2Fmodel.gguf', '/diary', '/archived', '/code', '/projects', '/chat', '/settings']) {
+    '/customise/skills', '/models', '/models/org%2Fmodel.gguf', '/diary', '/archived', '/code', '/projects', '/chat', '/settings',
+    // #406: a truncated/stripped-id chat or project link — the shell loads and the client's own
+    // routing (routes.ts) reads these as a new chat, same as any other unrecognised /c or /p id.
+    '/c', '/c/', '/p', '/p/']) {
     const res = await call(serve, p);
     assert.equal(res.status, 200, p);
     assert.equal(res.body, INDEX, p);
@@ -71,11 +74,14 @@ test('traversal out of the build directory stays forbidden', async () => {
 });
 
 test('isClientRoute: narrow on purpose', () => {
-  for (const p of ['/', '/c/abc', '/c/abc/', '/p/a_b-1', '/p/x/code', '/settings/notifications', '/customize/connectors', '/models/x%20y']) {
+  for (const p of ['/', '/c/abc', '/c/abc/', '/p/a_b-1', '/p/x/code', '/settings/notifications', '/customize/connectors', '/models/x%20y',
+    // #406: bare/truncated /c and /p (and their trailing-slash forms) are a chat/project link
+    // with an empty id, not an arbitrary unknown route.
+    '/c', '/c/', '/p', '/p/']) {
     assert.equal(isClientRoute(p), true, p);
   }
   for (const p of ['/api/', '/api/workspace', '/assets/x.js', '//evil.example', '/\\evil', '/c/' + 'a'.repeat(121), '/models/a/b',
-    '/settings/UPPER', null, undefined, 42, '/' + 'x'.repeat(800)]) {
+    '/settings/UPPER', null, undefined, 42, '/' + 'x'.repeat(800), '/c/a/b', '/c/<x>', '/p/proj-1/unknown', '/p/proj-1/new/x']) {
     assert.equal(isClientRoute(p), false, String(p));
   }
 });

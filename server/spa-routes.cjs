@@ -15,8 +15,13 @@ const SEG = '[^/]{1,600}';
 const CLIENT_ROUTES = [
   /^\/$/,
   new RegExp(`^/(chat|projects|diary|archived|code|models|settings|customise|customize|plugins)/?$`),
-  new RegExp(`^/c/${ID}/?$`),
-  new RegExp(`^/p/${ID}(/(new|chats|sources|research|code|browser))?/?$`),
+  // #406: /c and /p with no id (and their trailing-slash forms) are a truncated or
+  // stripped-id chat/project link, not an arbitrary unknown route — the client's own
+  // routes.ts already reads a bare /c or /p as a new chat (matchPath returns null,
+  // parsePath falls back to { kind: 'new' }); this only has to get it past the static
+  // fallback to the SPA shell so that fallback can run instead of a raw JSON 404.
+  new RegExp(`^/c(/${ID})?/?$`),
+  new RegExp(`^/p(/${ID}(/(new|chats|sources|research|code|browser))?)?/?$`),
   /^\/settings\/[a-z][a-z0-9-]{0,39}\/?$/,
   /^\/(customise|customize|plugins)\/(skills|connectors|plugins|mcp|connected)\/?$/,
   new RegExp(`^/models/${SEG}$`),
