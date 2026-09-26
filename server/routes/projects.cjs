@@ -191,6 +191,16 @@ function createProjectRoutes({
       if (typeof patch.goal === 'string') project.goal = patch.goal.slice(0, 2000);
       if (typeof patch.instructions === 'string') project.instructions = patch.instructions.slice(0, 8000);
       if (typeof patch.model === 'string' && patch.model) project.model = patch.model;
+      // Picking a model is a manual choice even when the caller only sent `model` — the picker
+      // row itself now sends `routing: 'manual'` alongside it (#384), but older/other callers
+      // that patch `model` alone must not have the pick silently auto-routed away on the next
+      // send. An explicit `routing` in the same patch is a deliberate combination (e.g. picking
+      // a model while staying on Auto) and always wins — handled by the block below, which runs
+      // after this one.
+      if (typeof patch.model === 'string' && patch.model && typeof patch.routing !== 'string') {
+        project.routing = 'manual';
+        project.routingChosen = true;
+      }
       // Pin and archive are plain booleans rather than a status enum: a project
       // can be both pinned and archived, and collapsing them would lose that.
       if (typeof patch.pinned === 'boolean') project.pinned = patch.pinned;
