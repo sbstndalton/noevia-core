@@ -13,7 +13,8 @@ const { createTtlCache } = require('../toolboxes-permitted.cjs');
 /**
  * @param {object} deps
  * @param {() => Promise<void>} deps.discoverMcpTools  awaited so a cold start still lists MCP boxes
- * @param {() => object[]} deps.toolboxSummaries
+ * @param {(connected?:string[]) => object[]} deps.toolboxSummaries
+ * @param {(user) => string[]} [deps.connectedBoxes]  this account's connected connectors (#354)
  * @param {{ targetMs:number, stats:() => object }} deps.prefill
  * @param {() => { enabled:boolean, state:object, servers:object[], manifest:object[] }} deps.mcp
  *        read at call time: MCP_ENABLED and the server list change when directory servers sync
@@ -22,7 +23,7 @@ const { createTtlCache } = require('../toolboxes-permitted.cjs');
  *        null when the project is not this account's (the caller's getProject is tenant-scoped)
  * @param {{ get:(k:string)=>any, set:(k:string, v:any)=>void }} [deps.cache]
  */
-function createToolboxRoutes({ discoverMcpTools, toolboxSummaries, prefill, mcp, json, permitted = null, cache = createTtlCache({ ttlMs: 30000 }) }) {
+function createToolboxRoutes({ discoverMcpTools, toolboxSummaries, connectedBoxes = () => [], prefill, mcp, json, permitted = null, cache = createTtlCache({ ttlMs: 30000 }) }) {
   return async function toolboxRoutes(req, res, { path, authn, url }) {
     if (path === '/api/toolboxes/permitted' && permitted) {
       if (req.method !== 'GET') return json(res, 405, { error: 'method not allowed' }), true;
@@ -50,7 +51,7 @@ function createToolboxRoutes({ discoverMcpTools, toolboxSummaries, prefill, mcp,
     await discoverMcpTools();
     const { enabled, state, servers, manifest } = mcp();
     json(res, 200, {
-      toolboxes: toolboxSummaries(),
+      toolboxes: toolboxSummaries(connectedBoxes(authn.user)),
       // What has actually been measured about this hardware, so a slow box is diagnosable
       // without reading logs.
       prefill: { targetMs: prefill.targetMs, models: prefill.stats() },

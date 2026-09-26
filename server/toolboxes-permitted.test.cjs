@@ -2,7 +2,7 @@
 // #237: the per-turn view of permitted tools. Synthetic boxes only.
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { computePermittedTools, createTtlCache } = require('./toolboxes-permitted.cjs');
+const { computePermittedTools, createTtlCache, selectedToolboxIds } = require('./toolboxes-permitted.cjs');
 
 const fn = (name, description = '') => ({ type: 'function', function: { name, description, parameters: {} } });
 const BOXES = [
@@ -72,6 +72,27 @@ test('the coding harness: Cowork-only, admin-only, harness on, project and repos
   const on = code({ mode: 'cowork', user: admin });
   assert.equal(on.state, 'available');
   assert.deepEqual(on.tools.map((t) => t.permission), ['allowed', 'needs-approval', 'needs-approval']);
+});
+
+test('selectedToolboxIds (#354): the shared union chat.cjs, this catalogue and the picker must all agree on', () => {
+  const connectorBoxes = new Set(['gdrive']);
+  // A connector id can end up stored on an older/hand-edited project even though
+  // sanitizeToolboxes normally strips it; the union still strips it from the base list and adds
+  // it back exactly once, from `connected`, never from the project's own list.
+  assert.deepEqual(
+    selectedToolboxIds({ project: { toolboxes: ['core', 'gdrive'] }, defaultToolboxes: ['core'], connectorBoxes, connected: ['gdrive'] }),
+    ['core', 'gdrive'],
+  );
+  assert.deepEqual(
+    selectedToolboxIds({ project: { toolboxes: ['core'] }, defaultToolboxes: ['core'], connectorBoxes, connected: [] }),
+    ['core'],
+  );
+  // No project (a free chat with no explicit choice) falls back to the operator default, same as
+  // a project's own empty selection would not.
+  assert.deepEqual(
+    selectedToolboxIds({ project: null, defaultToolboxes: ['core'], connectorBoxes, connected: ['gdrive'] }),
+    ['core', 'gdrive'],
+  );
 });
 
 test('a free chat (no project) uses the default selection', () => {

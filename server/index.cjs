@@ -626,7 +626,7 @@ const readyRoutes = require('./routes/health.cjs').createReadyRoutes({
 });
 // GET /api/toolboxes: the picker view (routes/toolboxes.cjs). MCP state is read at call time.
 const toolboxRoutes = require('./routes/toolboxes.cjs').createToolboxRoutes({
-  discoverMcpTools: () => discoverMcpTools(), toolboxSummaries, json,
+  discoverMcpTools: () => discoverMcpTools(), toolboxSummaries, connectedBoxes, json,
   prefill: { targetMs: TOOL_PREFILL_TARGET_MS, stats: () => prefill.stats() },
   mcp: () => ({ enabled: mcpWiring.enabled(), state: mcpState, servers: MCP_SERVERS, manifest: MCP_TOOLBOX_MANIFEST }),
   // The per-turn catalogue (#237). getProject is scoped to the signed-in account's workspace.

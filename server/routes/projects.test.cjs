@@ -179,9 +179,21 @@ test('chat attachments and the Diary context are created on POST and only read o
   await f.call('GET', '/api/chats/abc/context');
   assert.deepEqual(f.sent.pop(), { status: 200, body: { project: null } });
   await f.call('POST', '/api/chats/abc/context');
-  assert.equal(f.sent.pop().body.project.id, 'chat-abc');
+  const created = f.sent.pop().body.project;
+  assert.equal(created.id, 'chat-abc');
+  // #352: diaryExtras.newProject() is written for Diary, which really does default to manual —
+  // a standalone chat's own shadow context must not inherit that.
+  assert.equal(created.routing, 'auto', "a standalone chat's context starts on Auto, not Diary's Manual default");
   await f.call('POST', '/api/diary/context');
   assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'Diary add-on is disabled' } });
+});
+
+test('an explicit routing choice is marked so the #352 migration never reverts it', async () => {
+  const f = fixture({ projects: [{ id: 'p1', routing: 'auto' }] });
+  await f.call('POST', '/api/projects/p1/config', { routing: 'manual' });
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true } });
+  assert.equal(f.projects[0].routing, 'manual');
+  assert.equal(f.projects[0].routingChosen, true);
 });
 
 

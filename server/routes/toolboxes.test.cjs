@@ -41,6 +41,23 @@ test('without MCP servers the picker says so instead of inventing an empty disco
   assert.deepEqual(f.sent[0].body.mcp, { configured: false });
 });
 
+test('this account\'s connected connectors are passed into the summaries so a connected box is not hidden (#354)', async () => {
+  const calls = [];
+  const routes = createToolboxRoutes({
+    discoverMcpTools: async () => {},
+    toolboxSummaries: (connected) => { calls.push(connected); return [{ id: 'core', label: 'Core', toolCount: 1, estTokens: 10 }, ...(connected || []).map((id) => ({ id, label: id, toolCount: 1, estTokens: 5, connector: true }))]; },
+    connectedBoxes: (user) => (user.id === 'linked' ? ['gdrive'] : []),
+    prefill: { targetMs: 1, stats: () => ({}) },
+    mcp: () => ({ enabled: false }),
+    json: (res, status, body) => { calls.sent = calls.sent || []; calls.sent.push({ status, body }); return true; },
+  });
+  await routes({ method: 'GET' }, {}, { path: '/api/toolboxes', authn: { user: { id: 'linked' } } });
+  assert.deepEqual(calls[0], ['gdrive']);
+  assert.deepEqual(calls.sent[0].body.toolboxes.map((b) => b.id), ['core', 'gdrive']);
+  await routes({ method: 'GET' }, {}, { path: '/api/toolboxes', authn: { user: { id: 'other' } } });
+  assert.deepEqual(calls.sent[1].body.toolboxes.map((b) => b.id), ['core']);
+});
+
 test('other paths and methods are left alone or refused', async () => {
   const f = fixture();
   assert.equal(await f.routes({ method: 'GET' }, {}, { path: '/api/toolbox', authn: null }), false);

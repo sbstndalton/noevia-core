@@ -168,6 +168,33 @@ test('new projects default to Auto routing; Manual only when asked for', async (
   assert.equal((await f.store.createProject({ name: 'D', routing: 'auto' })).routing, 'auto');
 });
 
+test('getProject self-heals a pre-#352 standalone chat context stuck on manual, but never a real choice', () => {
+  const f = fixture();
+  // Simulates a project persisted before #352 was fixed: diaryExtras.newProject() forced
+  // routing:'manual' on every standalone chat's shadow context object, and nobody ever chose it
+  // (no routingChosen — that flag is new, set only by the routing PATCH).
+  const stale = { id: 'cowork-chat-context-abc', name: 'Chat attachments abc', routing: 'manual', toolboxes: ['core'] };
+  f.workspace.projects.push(stale);
+  assert.equal(f.store.getProject('cowork-chat-context-abc').routing, 'auto', 'inherited default is healed to Auto');
+  assert.equal(f.workspace.saved > 0, true, 'the heal is persisted so it does not have to rerun forever');
+
+  // A real explicit choice (routingChosen set, however it got there) must never be reverted.
+  const chosen = { id: 'cowork-chat-context-xyz', name: 'Chat attachments xyz', routing: 'manual', routingChosen: true, toolboxes: ['core'] };
+  f.workspace.projects.push(chosen);
+  assert.equal(f.store.getProject('cowork-chat-context-xyz').routing, 'manual', 'an explicit Manual choice stays Manual');
+
+  // The Diary project's own manual default (unrelated id shape) is never touched by this heal.
+  const diary = { id: 'cowork-diary-extras', name: 'Diary attachments', routing: 'manual', toolboxes: ['core'] };
+  f.workspace.projects.push(diary);
+  assert.equal(f.store.getProject('cowork-diary-extras').routing, 'manual');
+
+  // Once healed, a second read must not need to heal again (idempotent, and routingChosen is not
+  // required to stay Auto — only Manual needs the explicit-choice guard).
+  const savedBefore = f.workspace.saved;
+  f.store.getProject('cowork-chat-context-abc');
+  assert.equal(f.workspace.saved, savedBefore, 'already-Auto reads do not trigger a re-save');
+});
+
 test('withSourceLock is keyed by project id, so a rebuilt project object still waits for the lock (#217)', async () => {
   const f = fixture();
   const project = await f.store.createProject({ name: 'P' });

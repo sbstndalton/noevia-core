@@ -80,7 +80,11 @@ function createProjectRoutes({
       if (!id) return json(res, 400, { error: 'Invalid chat identifier' });
       let project = getProject(id);
       if (!project && req.method === 'POST') {
-        project = { ...diaryExtras.newProject(), id, name: 'Chat attachments ' + freeContext[1], instructions: '', toolboxes: [...DEFAULT_TOOLBOXES] };
+        // diaryExtras.newProject() is written for the Diary project, which really does default
+        // to manual — a standalone chat's shadow context must not inherit that (#352). It starts
+        // on Auto like any other free chat with no explicit choice, until routingChosen (below)
+        // records that a person actually picked one.
+        project = { ...diaryExtras.newProject(), id, name: 'Chat attachments ' + freeContext[1], instructions: '', toolboxes: [...DEFAULT_TOOLBOXES], routing: 'auto' };
         PROJECTS.push(project); saveProjects(PROJECTS);
       }
       return json(res, 200, { project });
@@ -209,6 +213,10 @@ function createProjectRoutes({
           return json(res, 400, { error: "routing must be 'auto' or 'manual'" });
         }
         project.routing = patch.routing;
+        // Marks this value as a person's own choice, never the template default a project or
+        // shadow chat-context object was created with (#352). getProject()'s migration only
+        // self-heals a stale 'manual' when this is absent.
+        project.routingChosen = true;
         if (patch.routing === 'auto') ensureRolesLoaded(); // no-op if unconfigured
       }
       if (typeof patch.provider === 'string' && patch.provider) {

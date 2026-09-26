@@ -332,14 +332,21 @@ function createToolboxes({
     return [...new Set(ids)];
   }
 
-  function toolboxSummaries() {
-    return allToolboxes().filter((b) => !CONNECTOR_BOXES.has(b.id)).map((b) => ({
+  // `connected` (connectedBoxes(user)) includes a connector box here only for the account that
+  // actually has it connected — never offered as a pickable option to anyone else, since there is
+  // nothing to pick: a connector's on/off state lives in Settings → Connectors, not a project's
+  // toolboxes list (sanitizeToolboxes rejects a connector id there either way). Without this, the
+  // picker, the "+" menu and the token budget under-reported a connector the chat loop already
+  // sends every turn (#354).
+  function toolboxSummaries(connected = []) {
+    return allToolboxes().filter((b) => !CONNECTOR_BOXES.has(b.id) || connected.includes(b.id)).map((b) => ({
       id: b.id,
       label: b.label,
       description: b.description,
       source: b.source,
       toolCount: b.tools.length,
       estTokens: estimateToolTokens(b.tools),
+      ...(CONNECTOR_BOXES.has(b.id) ? { connector: true } : {}),
     }));
   }
 

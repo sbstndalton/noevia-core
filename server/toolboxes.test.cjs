@@ -78,6 +78,21 @@ test('connected account boxes are offered per user and never appear in the picke
   assert.equal(t.sanitizeToolboxes(['gdrive']).length, 0);
 });
 
+test('toolboxSummaries lists a connector only for the account that actually connected it (#354)', () => {
+  const drive = { box: box('gdrive', [tool('drive_search')], ['drive_search']), names: new Set(['drive_search']), connected: (u) => u.id === 'linked', execute: async () => '' };
+  const t = build({ boxes: [drive.box], driveTools: drive });
+  // Nobody passed a connected list: the picker's generic catalogue still omits it, same as before.
+  assert.ok(!t.toolboxSummaries().some((b) => b.id === 'gdrive'));
+  // The connected account's own connectedBoxes() result, fed back in, surfaces it — this is what
+  // the model picker and composer "+" menu were missing (#354): they can now see and count it.
+  const summaries = t.toolboxSummaries(t.connectedBoxes({ id: 'linked' }));
+  const gdrive = summaries.find((b) => b.id === 'gdrive');
+  assert.ok(gdrive, 'a connected connector is listed');
+  assert.equal(gdrive.connector, true, 'flagged so a client never offers it as a plain checkbox');
+  assert.ok(gdrive.estTokens > 0, 'its cost counts toward the token budget shown before sending');
+  assert.equal(t.toolboxSummaries(t.connectedBoxes({ id: 'other' })).some((b) => b.id === 'gdrive'), false, "another account's summaries still omit it");
+});
+
 test('Drive stays resolvable per connected account when the operator offer list omits it', () => {
   const names = ['drive_search_files', 'drive_read_file', 'drive_get_metadata', 'drive_list_recent', 'drive_create_file', 'drive_update_file', 'drive_trash_file'];
   const reads = names.slice(0, 4);

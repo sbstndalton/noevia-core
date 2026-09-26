@@ -454,7 +454,7 @@ function createChatHandler({
     // must offer the same list, or the model gets told a tool exists and then
     // punished for calling it.
     const chatUser = requestScope.getStore()?.authn?.user || null;
-    const selectedBoxes = [...(Array.isArray(project && project.toolboxes) ? project.toolboxes : DEFAULT_TOOLBOXES).filter((id) => !CONNECTOR_BOXES.has(id)), ...connectedBoxes(chatUser)];
+    const selectedBoxes = require('./toolboxes-permitted.cjs').selectedToolboxIds({ project, defaultToolboxes: DEFAULT_TOOLBOXES, connectorBoxes: CONNECTOR_BOXES, connected: connectedBoxes(chatUser) });
     // Per-turn overrides from the composer catalogue (#237): only boxes this server already offers
     // may be added, never a connector box; the OAuth filter below and the write gate still apply.
     if (Array.isArray(body.turnToolboxes)) {

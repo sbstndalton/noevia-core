@@ -43,6 +43,15 @@ function createProjectStore({
 
   function getProject(id) {
     const project = PROJECTS.find((p) => p.id === id) || null;
+    // One-time self-heal for a standalone chat's shadow context project created before #352 was
+    // fixed: it always inherited Diary's routing:'manual' template, with no person ever choosing
+    // it (a real choice is only ever recorded by the routing PATCH, which now also sets
+    // routingChosen). Once healed, or once a person picks a routing explicitly, this never
+    // reruns — routingChosen is set either way.
+    if (project && !project.routingChosen && project.routing === 'manual' && typeof project.id === 'string' && project.id.startsWith('cowork-chat-context-')) {
+      project.routing = 'auto';
+      currentWorkspace().saveProjects();
+    }
     if (project && require('./instruction-skills.cjs').reconcile(project)) currentWorkspace().saveProjects();
     return project;
   }

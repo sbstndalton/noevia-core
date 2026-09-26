@@ -30,14 +30,23 @@ const CODE_BOX_ID = 'code';
  * @param {boolean} input.harnessEnabled
  * @param {string[]} [input.repositories]
  */
+/** The toolbox ids one request will actually carry: the project's own list (or the operator
+ *  default, for a project-less chat) with any connector id stripped, unioned with this account's
+ *  actually-connected connectors. Every reader of "what tools are enabled" — the chat loop itself,
+ *  this catalogue, and the model picker / composer menu (#354) — must compute this the same way,
+ *  or one of them under-reports what the next message really sends. */
+function selectedToolboxIds({ project, defaultToolboxes, connectorBoxes, connected }) {
+  return [
+    ...(Array.isArray(project && project.toolboxes) ? project.toolboxes : defaultToolboxes).filter((id) => !connectorBoxes.has(id)),
+    ...connected,
+  ];
+}
+
 function computePermittedTools(input) {
   const { user, project, mode, boxes, manifest = [], defaultToolboxes, connectorBoxes, connected, oauthServerIds,
     accountReady, policyMode, isWriteTool, diaryEnabled, harnessEnabled, repositories = [] } = input;
   const isAdmin = user.role === 'admin';
-  const selected = new Set([
-    ...(Array.isArray(project && project.toolboxes) ? project.toolboxes : defaultToolboxes).filter((id) => !connectorBoxes.has(id)),
-    ...connected,
-  ]);
+  const selected = new Set(selectedToolboxIds({ project, defaultToolboxes, connectorBoxes, connected }));
   const out = [];
   for (const box of boxes) {
     let reason = null;
@@ -110,4 +119,4 @@ function createTtlCache({ ttlMs = 30000, now = Date.now, max = 500 } = {}) {
   };
 }
 
-module.exports = { computePermittedTools, createTtlCache, CODE_BOX_ID };
+module.exports = { computePermittedTools, createTtlCache, CODE_BOX_ID, selectedToolboxIds };
