@@ -13,6 +13,9 @@ const IMAGE_MIME = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif'
 const IMAGE_UPLOAD_CAP = 8 * 1024 * 1024;
 const DOCUMENT_UPLOAD_CAP = 25 * 1024 * 1024;
 const MAX_PROJECT_IMAGES = 12;
+// Shared with projects.cjs's createProject and the create/edit dialogs (src/project-limits.ts,
+// #398) so a name is capped identically everywhere it can be set.
+const { nameMaxLength: PROJECT_NAME_MAX_LENGTH } = require('../project-limits.json');
 
 const PASS = Symbol('unhandled');
 
@@ -187,7 +190,7 @@ function createProjectRoutes({
       const project = { ...storedProject, ...appearance };
       if (patch.reasoningEffort === null) delete project.reasoningEffort;
       else if (patch.reasoningEffort !== undefined) project.reasoningEffort = patch.reasoningEffort;
-      if (typeof patch.name === 'string' && patch.name.trim()) project.name = patch.name.trim().slice(0, 120);
+      if (typeof patch.name === 'string' && patch.name.trim()) project.name = patch.name.trim().slice(0, PROJECT_NAME_MAX_LENGTH);
       if (typeof patch.goal === 'string') project.goal = patch.goal.slice(0, 2000);
       if (typeof patch.instructions === 'string') project.instructions = patch.instructions.slice(0, 8000);
       if (typeof patch.model === 'string' && patch.model) project.model = patch.model;

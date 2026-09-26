@@ -10,6 +10,11 @@
 // builds over the current workspace; everything else is injected so the
 // store can be exercised with fakes (projects.test.cjs).
 
+// The name length cap (#398) lives in one JSON file so the create/edit dialogs
+// (src/project-limits.ts) enforce the same limit the server applies here and in
+// routes/projects.cjs's PATCH handler.
+const { nameMaxLength: PROJECT_NAME_MAX_LENGTH } = require('./project-limits.json');
+
 /**
  * @param {object} deps
  * @param {object} deps.fs
@@ -126,7 +131,7 @@ function createProjectStore({
   // invalid input. Shared by POST /api/projects and conversation import.
   async function createProject(body) {
     if (body.reasoningEffort !== undefined && !reasoningEffort.validEffort(body.reasoningEffort)) throw Object.assign(Error('Invalid reasoning effort'), { status: 400 });
-    const name = String(body.name || '').trim().slice(0, 120);
+    const name = String(body.name || '').trim().slice(0, PROJECT_NAME_MAX_LENGTH);
     if (!name) throw Object.assign(Error('name required'), { status: 400 });
     let modes = ['chat'];
     if (body.modes !== undefined) { try { modes = require('./project-modes.cjs').sanitize(body.modes); } catch (e) { throw Object.assign(Error(e.message), { status: 400 }); } }
