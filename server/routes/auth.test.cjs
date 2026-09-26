@@ -22,7 +22,7 @@ function fixture({ users = 1, originOk = true } = {}) {
     completeRecovery: async (body) => body.token === 'good',
     logout: () => ({ status: 200, body: { ok: true } }),
     getAppearance: () => ({ theme: 'soft' }), setAppearance: (_id, body) => { if (body.theme === 'bad') throw new Error('unknown theme'); return body; },
-    listPasskeys: () => [{ id: 'pk1' }], listSessions: () => [{ id: 's1' }],
+    listPasskeys: () => [{ id: 'pk1' }], listSessions: (id, currentId) => { calls.push(['listSessions', id, currentId]); return [{ id: 's1' }]; },
     appPasswords: { list: () => [], create: async (_id, body) => { if (!body.name) throw new Error('name required'); return { id: 'ap', name: body.name }; }, revoke: (_id, id) => id === 'a'.repeat(32) },
     updateProfile: (...args) => calls.push(['updateProfile', ...args]), setDiaryEnabled: (_id, on) => ({ diaryEnabled: on }), markOnboarded: () => ({ onboarded: true }),
     registrationOptions: async () => ({ challenge: 'r' }), registrationVerify: async () => { throw new Error('verify failed'); },
@@ -45,11 +45,11 @@ function fixture({ users = 1, originOk = true } = {}) {
     mcpOAuth: { forgetUser: (id) => calls.push(['mcpOAuth.forgetUser', id]) },
     directoryMcp: { forgetUser: (id) => calls.push(['directoryMcp.forgetUser', id]) },
   });
-  const call = (mount, method, path, body, { role = 'member', legacy = false, cookie = '' } = {}) => {
+  const call = (mount, method, path, body, { role = 'member', legacy = false, cookie = '', session } = {}) => {
     const req = Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body))]);
     Object.assign(req, { method, headers: { cookie } });
     const res = { setHeader: (k, v) => headers.push([k, v]) };
-    return routes[mount](req, res, { path, authn: { user: { id: 'u1', role }, legacy } });
+    return routes[mount](req, res, { path, authn: { user: { id: 'u1', role }, legacy, session } });
   };
   return { call, sent, calls, headers };
 }
@@ -89,6 +89,11 @@ test('profile, appearance, sharing, app passwords and preferences keep their cod
   const f = fixture();
   await f.call('account', 'GET', '/api/profile');
   assert.deepEqual(f.sent.pop(), { status: 200, body: { user: { id: 'u1', role: 'member' }, passkeys: [{ id: 'pk1' }], sessions: [{ id: 's1' }] } });
+  assert.deepEqual(f.calls.pop(), ['listSessions', 'u1', undefined], 'no session on the request (e.g. a legacy caller) asks for no current id');
+  // #404: the route hands the calling request's own session id_hash to listSessions, so it can
+  // mark that one (and only that one) current — not whichever the mock happens to return.
+  await f.call('account', 'GET', '/api/profile', undefined, { session: { id_hash: 'this-devices-hash' } });
+  assert.deepEqual(f.calls.pop(), ['listSessions', 'u1', 'this-devices-hash']);
   await f.call('account', 'PUT', '/api/profile/appearance', { theme: 'bad' });
   assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'unknown theme' } });
   await f.call('account', 'DELETE', '/api/profile/appearance');

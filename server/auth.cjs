@@ -514,8 +514,13 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
     listPasskeys(userId) {
       return db.prepare('SELECT id,name,device_type AS deviceType,backed_up AS backedUp,created_at AS createdAt,last_used_at AS lastUsedAt FROM passkeys WHERE user_id=? ORDER BY created_at').all(userId);
     },
-    listSessions(userId) {
-      return db.prepare('SELECT id_hash AS id,created_at AS createdAt,last_seen_at AS lastSeenAt,expires_at AS expiresAt,user_agent AS userAgent,ip FROM sessions WHERE user_id=? ORDER BY last_seen_at DESC').all(userId);
+    // #404: `currentId` (the calling request's own session, i.e. `authn.session.id_hash`) marks
+    // which row is "this device" so the client can show a real current/other state instead of an
+    // unconditional dot. A legacy bearer-token caller (session: null) has no row of its own —
+    // every session then reads as "other", which is correct: none of them is this request.
+    listSessions(userId, currentId) {
+      return db.prepare('SELECT id_hash AS id,created_at AS createdAt,last_seen_at AS lastSeenAt,expires_at AS expiresAt,user_agent AS userAgent,ip FROM sessions WHERE user_id=? ORDER BY last_seen_at DESC').all(userId)
+        .map((s) => ({ ...s, current: !!currentId && s.id === currentId }));
     },
     revokeSession(userId, id) { return db.prepare('DELETE FROM sessions WHERE id_hash=? AND user_id=?').run(id, userId).changes > 0; },
     deletePasskey(userId, id) { return db.prepare('DELETE FROM passkeys WHERE id=? AND user_id=?').run(id, userId).changes > 0; },

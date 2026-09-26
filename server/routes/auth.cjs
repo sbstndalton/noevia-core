@@ -74,7 +74,7 @@ function createAuthRoutes({ json, authResult, readJson, authService, publicAuthR
       }
       return json(res,405,{error:'method not allowed'});
     }
-    if (p === '/api/profile' && req.method === 'GET') return json(res, 200, { user: authn.user, passkeys: authService.listPasskeys(authn.user.id), sessions: authService.listSessions(authn.user.id) });
+    if (p === '/api/profile' && req.method === 'GET') return json(res, 200, { user: authn.user, passkeys: authService.listPasskeys(authn.user.id), sessions: authService.listSessions(authn.user.id, authn.session?.id_hash) });
     if (p === '/api/profile/sharing' && req.method === 'GET') return json(res, 200, davSettings.get(authn.user));
     if (p === '/api/profile/sharing' && req.method === 'PUT') {
       try { return json(res, 200, davSettings.save(authn.user, await readJson(req))); }
