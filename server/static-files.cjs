@@ -42,7 +42,8 @@ function createStaticFiles(root) {
       encoded: {},
     };
     if (COMPRESSIBLE.has(ext) && body.length > 1024) {
-      next.encoded.br = zlib.brotliCompressSync(body, { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 10, [zlib.constants.BROTLI_PARAM_SIZE_HINT]: body.length } });
+      // Quality 8 avoids a large synchronous warmup stall for a small size tradeoff.
+      next.encoded.br = zlib.brotliCompressSync(body, { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 8, [zlib.constants.BROTLI_PARAM_SIZE_HINT]: body.length } });
       next.encoded.gzip = zlib.gzipSync(body, { level: 9 });
     }
     cache.set(filePath, next);
