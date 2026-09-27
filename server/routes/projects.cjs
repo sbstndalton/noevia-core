@@ -320,9 +320,13 @@ function createProjectRoutes({
     const projChats = p.match(/^\/api\/projects\/([^/]+)\/chats$/);
     if (projChats) {
       const id = decodeURIComponent(projChats[1]);
-      if (req.method === 'GET') return json(res, 200, { chats: loadChats(id) });
+      if (req.method === 'GET') {
+        if (!getProject(id)) return json(res, 404, { error: 'no such project' });
+        return json(res, 200, { chats: loadChats(id) });
+      }
       if (req.method === 'POST') {
         const raw = await readBody(req);
+        if (!getProject(id)) return json(res, 404, { error: 'no such project' });
         try {
           const body = JSON.parse(raw);
           if (!Array.isArray(body.chats)) return json(res, 400, { error: 'chats array required' });

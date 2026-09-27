@@ -154,6 +154,16 @@ test('chat metas: listing, saving a normalized list and deleting one', async () 
   assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'no such chat' } });
 });
 
+test('chat meta routes refuse a deleted project instead of reporting an empty list or successful save', async () => {
+  const f = fixture();
+  await f.call('GET', '/api/projects/deleted-project/chats');
+  assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'no such project' } });
+  await f.call('POST', '/api/projects/deleted-project/chats', { chats: [{ id: 'orphan', title: 'Unsaved' }] });
+  assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'no such project' } });
+  assert.equal(f.store.savedChats, undefined);
+  assert.equal(f.store.saves, 0);
+});
+
 test('uploads refuse what they always refused', async () => {
   const f = fixture({ projects: [{ id: 'p1', files: [] }] });
   await f.call('POST', '/api/projects/p1/upload', { name: '' });

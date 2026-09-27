@@ -173,7 +173,7 @@ test('the creative heuristic promotes an otherwise fast-routed writing prompt', 
 // popup yet, so there is no explicit choice) routes through Auto when Fast/Smart roles are
 // configured, matching the composer label; it falls back to the loaded model exactly as before
 // when roles are not configured, so a server with no roles behaves exactly as today.
-async function runFreeChat(t, { project = null, rolesConfigured = true, loaded = 'loaded-model', message = 'Hello' } = {}) {
+async function runFreeChat(t, { project = null, requestedProjectId = null, spaceId = null, rolesConfigured = true, loaded = 'loaded-model', message = 'Hello' } = {}) {
   const os = require('node:os'), path = require('node:path'), fs = require('node:fs'), crypto = require('node:crypto');
   const { EventEmitter } = require('node:events');
   const { createToolboxes } = require('./toolboxes.cjs');
@@ -216,9 +216,23 @@ async function runFreeChat(t, { project = null, rolesConfigured = true, loaded =
     chatWideApproved: () => false, awaitApproval: async () => 'approve',
     recordUsage() {}, recordToolUse() {},
   });
-  await handler.handleChat({}, res, { message, projectId: project ? project.id : null, chatId: 'synthetic-free-chat', history: [] });
+  await handler.handleChat({}, res, { message, projectId: requestedProjectId || (project ? project.id : null),
+    ...((spaceId || requestedProjectId) ? { spaceId: spaceId || requestedProjectId } : {}), chatId: 'synthetic-free-chat', history: [] });
   return { events, requests, jsonReplies };
 }
+
+test('an explicit missing project is refused before a model request', async (t) => {
+  const { events, requests, jsonReplies } = await runFreeChat(t, { requestedProjectId: 'deleted-project' });
+  assert.deepEqual(jsonReplies, [{ status: 404, body: { error: 'no such project' } }]);
+  assert.equal(requests.length, 0);
+  assert.equal(events.length, 0);
+});
+
+test('a free chat with a missing optional shadow context still reaches the model', async (t) => {
+  const { requests, jsonReplies } = await runFreeChat(t, { spaceId: 'free' });
+  assert.equal(jsonReplies.length, 0);
+  assert.equal(requests.length, 1);
+});
 
 test('a free chat with Fast/Smart roles configured routes via classifyFastOrSmart, not the loaded model', async (t) => {
   const { events, requests } = await runFreeChat(t, { rolesConfigured: true });
