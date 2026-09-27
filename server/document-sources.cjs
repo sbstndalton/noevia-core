@@ -14,7 +14,8 @@ function versionPath(workspace, projectId, version, ext) {
   if (!/^[a-f0-9]{64}$/.test(version || '')) throw new Error('invalid document version');
   return path.join(directory(workspace, projectId), version + ext);
 }
-function writeOnce(file, bytes) {
+function writeOnce(workspace, file, bytes) {
+  workspace.assertActive?.();
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const temp = file + '.' + crypto.randomUUID() + '.tmp';
   fs.writeFileSync(temp, bytes, { mode: 0o600 });
@@ -23,17 +24,19 @@ function writeOnce(file, bytes) {
   fs.renameSync(temp, file);
 }
 async function ingest(workspace, projectId, name, bytes, previous) {
+  workspace.assertActive?.();
   const byteHash = hash(bytes);
   const version = hash(byteHash + ':' + documents.EXTRACTOR_VERSION);
   const original = versionPath(workspace, projectId, byteHash, '.pdf');
-  if (!fs.existsSync(original)) writeOnce(original, bytes);
+  if (!fs.existsSync(original)) writeOnce(workspace, original, bytes);
   const resultFile = versionPath(workspace, projectId, version, '.json');
   let out;
   try { out = JSON.parse(fs.readFileSync(resultFile, 'utf8')); if (out.retryable) throw new Error('retry OCR'); } catch {
     try { out = await documents.extractDocumentText(name, bytes); }
     catch (err) { out = { text: '', pages: 0, pageTexts: [], state: 'failed', truncated: false, retryable: !!err.retryable, error: err.message }; }
-    writeOnce(resultFile, JSON.stringify(out));
+    writeOnce(workspace, resultFile, JSON.stringify(out));
   }
+  workspace.assertActive?.();
   const stale = out.state === 'failed' && !!previous?.content;
   const availableVersion = stale ? previous.document?.availableVersion : out.state !== 'failed' ? version : undefined;
   return { name, content: stale ? previous.content : out.text,

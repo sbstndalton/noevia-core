@@ -132,13 +132,14 @@ const vectorFor = (text) => {
 let embedCalls = 0;
 let embedFails = false;
 let embedGate = null; // when set, batch (multi-input) embedding calls wait on it
+let embedReached = null;
 const realFetch = global.fetch;
 global.fetch = async (url, options) => {
   assert.match(String(url), /\/v1\/embeddings$/);
   embedCalls++;
   if (embedFails) return { ok: false, status: 503, text: async () => 'embedder down' };
   const { input } = JSON.parse(options.body);
-  if (embedGate && input.length > 1) await embedGate;
+  if (embedGate && input.length > 1) { embedReached?.(); await embedGate; }
   return { ok: true, json: async () => ({ data: input.map((t) => ({ embedding: vectorFor(t) })) }) };
 };
 test.after(() => { global.fetch = realFetch; });
@@ -339,6 +340,37 @@ test('a delete during an in-flight index run stops it writing vectors afterwards
     assert.equal(out.embedded, 0, 'the superseded run wrote nothing');
   } finally { embedGate = null; }
   assert.deepEqual(await rag.searchProject('p-delrace', 'zebra', null), []);
+});
+
+test('account deletion during an in-flight embed stops post-await vector writes', async (t) => {
+  if (!rag.ragAvailable()) { t.skip('local SQLite vector dependency unavailable'); return; }
+  reset();
+  const userId = 'aaaaaaaa-1111-4111-8111-111111111111';
+  const userDir = path.join(root, 'users', userId);
+  const removed = new Set();
+  let release;
+  embedGate = new Promise((resolve) => { release = resolve; });
+  const reached = new Promise((resolve) => { embedReached = resolve; });
+  rag.init({ dataDir: root, embedModel: 'fake-embed', inferenceUrl: 'http://embedder.invalid',
+    userDataDirFn: (id) => path.join(root, 'users', id), userActive: (id) => !removed.has(id) });
+  try {
+    const running = rag.indexProjectFile('p-account-delete', 'doc.txt', big('zebra'), userId);
+    await reached;
+    assert.ok(fs.existsSync(userDir), 'the index was opened before account deletion');
+    removed.add(userId);
+    release();
+    const out = await running;
+    assert.equal(out.embedded, 0, 'resumed embedding must not write a deleted account\'s vectors');
+    // Keep the index on disk for inspection; remove() itself is covered by
+    // the source-route test. Re-enable reads only after the worker settles.
+    removed.delete(userId);
+    assert.deepEqual(await rag.searchProject('p-account-delete', 'zebra', userId), []);
+  } finally {
+    release();
+    embedGate = null;
+    embedReached = null;
+    rag.init({ dataDir: root, embedModel: 'fake-embed', inferenceUrl: 'http://embedder.invalid' });
+  }
 });
 
 // ── filesContext ─────────────────────────────────────────────────────────

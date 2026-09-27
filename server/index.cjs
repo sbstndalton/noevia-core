@@ -169,7 +169,8 @@ function arrayProxy(field) {
     getOwnPropertyDescriptor() { return { enumerable: true, configurable: true }; },
   });
 }
-rag.init({ dataDir: DATA_DIR, inferenceUrl: INFERENCE_BASE, headersFn: () => inferenceHeaders(), userDataDirFn: workspaceStore.userDir, inferenceGuard: () => modelManager.enterInference?.() || (() => {}) });
+rag.init({ dataDir: DATA_DIR, inferenceUrl: INFERENCE_BASE, headersFn: () => inferenceHeaders(), userDataDirFn: workspaceStore.userDir,
+  userActive: (userId) => !workspaceStore.isRemoved(userId), inferenceGuard: () => modelManager.enterInference?.() || (() => {}) });
 
 // User-created projects; the earlier fixed demo spaces were removed.
 // spaces were deleted per user request — projects are user-created only.

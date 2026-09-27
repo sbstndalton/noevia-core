@@ -41,12 +41,14 @@ function createProjectStore({
   // ── Projects config: instructions, files, memories, model ─────────────────
 
   function saveProjects(projects) {
+    currentWorkspace().assertActive?.();
     for (const project of projects) require("./instruction-skills.cjs").reconcile(project);
     currentWorkspace().projects = Array.from(projects);
     currentWorkspace().saveProjects();
   }
 
   function getProject(id) {
+    if (currentWorkspace().revoked) return null;
     const project = PROJECTS.find((p) => p.id === id) || null;
     // One-time self-heal for a standalone chat's shadow context project created before #352 was
     // fixed: it always inherited Diary's routing:'manual' template, with no person ever choosing
@@ -202,6 +204,7 @@ function createProjectStore({
   }
 
   function writeHistory(spaceId, history) {
+    currentWorkspace().assertActive?.();
     fs.mkdirSync(currentWorkspace().dir, { recursive: true });
     const file = historyPath(spaceId);
     const tmp = `${file}.tmp`;
@@ -270,9 +273,12 @@ function createProjectStore({
     if (!project || typeof project.id !== 'string' || !project.id) throw new Error('withSourceLock needs a project with an id');
     const key = sourceLockKey(project);
     const held = heldSourceLocks.getStore();
-    if (held && held.has(key)) return operation();
+    if (held && held.has(key)) { currentWorkspace().assertActive?.(); return operation(); }
     const previous = sourceOperations.get(key) || Promise.resolve();
-    const next = previous.catch(() => {}).then(() => heldSourceLocks.run(new Set([...(held || []), key]), operation));
+    const next = previous.catch(() => {}).then(() => heldSourceLocks.run(new Set([...(held || []), key]), () => {
+      currentWorkspace().assertActive?.();
+      return operation();
+    }));
     sourceOperations.set(key, next);
     try { return await next; }
     finally {
@@ -328,6 +334,7 @@ function createProjectStore({
   }
   function indexSource(project, file) {
     const workspace = currentWorkspace();
+    workspace.assertActive?.();
     if (require('./instruction-skills.cjs').inspect(file, project) || !file.content) {
       if (file.document) file.document.indexing = 'unavailable';
       rag.deleteProjectFile(project.id, file.name, workspace.userId);
@@ -335,10 +342,12 @@ function createProjectStore({
     }
     if (file.document) file.document.indexing = 'pending';
     rag.indexProjectFile(project.id, file.name, file.content, workspace.userId).then(result => {
+      if (workspace.revoked) return;
       if (!workspace.projects.includes(project) || !project.files.includes(file) || !file.document) return;
       file.document.indexing = !result?.ok ? 'unavailable' : result.direct ? 'direct' : result.embedded < result.stored ? 'partial' : 'ready';
       workspace.saveProjects();
     }).catch((error) => {
+      if (workspace.revoked) return;
       console.warn(`[documents] indexing ${project.id}/${file.name} failed:`, error?.stack || error);
       if (workspace.projects.includes(project) && project.files.includes(file) && file.document) {
         file.document.indexing = 'failed';

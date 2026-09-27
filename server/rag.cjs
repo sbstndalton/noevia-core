@@ -25,11 +25,13 @@ let inferenceBase = null;
 let embeddingBase = null;
 let inferenceHeaders = () => ({ 'Content-Type': 'application/json' });
 let dataDirForUser = null;
+let userActive = () => true;
 let enterInference = () => () => {};
 
-function init({ dataDir, embedModel, inferenceUrl, headersFn, userDataDirFn, inferenceGuard }) {
+function init({ dataDir, embedModel, inferenceUrl, headersFn, userDataDirFn, userActive: userActiveFn, inferenceGuard }) {
   RAG_DIR = process.env.RAG_DIR || path.join(dataDir, 'rag');
   dataDirForUser = userDataDirFn || null;
+  userActive = userActiveFn || (() => true);
   EMBED_MODEL = process.env.EMBEDDING_MODEL || process.env.EMBED_MODEL || embedModel || EMBED_MODEL;
   inferenceBase = inferenceUrl;
   embeddingBase = (process.env.EMBEDDING_BASE_URL || '').trim() || null;
@@ -312,6 +314,9 @@ async function embed(texts) {
 }
 
 function openIndex(projectId, userId) {
+  // Queued indexing may begin after account deletion. Refuse the directory
+  // creation before opening SQLite, including for detached index promises.
+  if (userId && !userActive(userId)) return null;
   const { Database, sqliteVec } = loadDeps();
   if (!Database || !sqliteVec) return null;
   try {
@@ -423,7 +428,8 @@ function indexProjectFile(projectId, fileName, text, userId) {
   fileVersions.set(key, version);
   const run = (fileQueues.get(key) || Promise.resolve())
     .catch(() => {})
-    .then(() => indexProjectFileNow(projectId, fileName, text, userId, () => fileGenerations.get(key) === generation, version));
+    .then(() => indexProjectFileNow(projectId, fileName, text, userId,
+      () => fileGenerations.get(key) === generation && (!userId || userActive(userId)), version));
   const tail = run.catch(() => {});
   fileQueues.set(key, tail);
   tail.then(() => { if (fileQueues.get(key) === tail) fileQueues.delete(key); });

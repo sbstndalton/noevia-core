@@ -21,6 +21,10 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets) {
   // user with a long-cached workspace could rewrite shared-providers.json
   // from a stale snapshot and silently erase an admin's shared provider.
   const cache = new Map();
+  // An authenticated request may still hold its workspace after the account
+  // has been deleted. Keep the revocation for that process lifetime so a
+  // later get() cannot create a fresh directory for the same deleted id.
+  const removed = new Set();
   const usersDir = path.join(rootDir, 'users');
   const sharedFile = path.join(rootDir, 'shared-providers.json');
 
@@ -77,6 +81,7 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets) {
   }
 
   function get(userId, { claim = false } = {}) {
+    if (removed.has(userId)) throw Object.assign(new Error('account no longer exists'), { status: 410 });
     if (claim) claimLegacy(userId);
     const cached = cache.get(userId);
     if (cached) {
@@ -102,6 +107,10 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets) {
     for (const project of projects) if (require('./project-modes.cjs').migrate(project)) modesMigrated = true;
     const workspace = {
       userId, dir, projects,
+      revoked: false,
+      assertActive() {
+        if (this.revoked) throw Object.assign(new Error('account no longer exists'), { status: 410 });
+      },
       // `privateProviders` is the cached per-user truth; `providers` is the
       // merged view rebuilt from disk on every get() so it always reflects
       // the current shared set.
@@ -111,8 +120,9 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets) {
       autoRoles: readJson(path.join(dir, 'auto-roles.json'), null),
       // Per-user settings with no better home. defaultRouting: what new projects start as.
       preferences: readJson(path.join(dir, 'preferences.json'), {}) || {},
-      saveProjects() { atomicJson(path.join(dir, 'projects.json'), { projects: this.projects }); },
+      saveProjects() { this.assertActive(); atomicJson(path.join(dir, 'projects.json'), { projects: this.projects }); },
       saveProviders() {
+        this.assertActive();
         const encode = p => ({ ...p, apiKey: secrets ? secrets.encrypt(p.apiKey) : p.apiKey });
         // Adopt rows a consumer pushed directly onto the merged `providers`
         // view (the historical push-then-save contract). Existing rows are
@@ -135,11 +145,13 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets) {
       // Admin path for shared-provider changes: persists the shared rows
       // from the (freshly merged) current view, then re-merges from disk.
       saveShared() {
+        this.assertActive();
         const encode = p => ({ ...p, apiKey: secrets ? secrets.encrypt(p.apiKey) : p.apiKey });
         atomicJson(sharedFile, { providers: this.providers.filter(p => p.shared && p.id !== defaultProvider.id).map(encode) });
         this.providers = mergeProviders(this.privateProviders);
       },
       removeProvider(id) {
+        this.assertActive();
         const selected = this.providers.find(p => p.id === id);
         if (!selected || id === defaultProvider.id) return false;
         if (selected.shared) {
@@ -156,9 +168,9 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets) {
         this.providers = mergeProviders(this.privateProviders);
         return true;
       },
-      saveFreeChats() { atomicJson(path.join(dir, 'free-chats.json'), this.freeChats); },
-      savePreferences() { atomicJson(path.join(dir, 'preferences.json'), this.preferences); },
-      saveAutoRoles() { atomicJson(path.join(dir, 'auto-roles.json'), this.autoRoles); },
+      saveFreeChats() { this.assertActive(); atomicJson(path.join(dir, 'free-chats.json'), this.freeChats); },
+      savePreferences() { this.assertActive(); atomicJson(path.join(dir, 'preferences.json'), this.preferences); },
+      saveAutoRoles() { this.assertActive(); atomicJson(path.join(dir, 'auto-roles.json'), this.autoRoles); },
       historyPath(id) { return path.join(dir, `history-${String(id).replace(/[^a-zA-Z0-9_-]/g, '')}.json`); },
       usagePath() { return path.join(dir, 'usage.json'); },
       ragDir() { return path.join(dir, 'rag'); },
@@ -176,8 +188,15 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets) {
     return workspace;
   }
 
-  function remove(userId) { cache.delete(userId); fs.rmSync(userDir(userId), { recursive: true, force: true }); }
-  return { get, remove, claimLegacy, userDir };
+  function remove(userId) {
+    const dir = userDir(userId);
+    removed.add(userId);
+    const workspace = cache.get(userId);
+    if (workspace) workspace.revoked = true;
+    cache.delete(userId);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+  return { get, remove, claimLegacy, userDir, isRemoved: (userId) => removed.has(userId) };
 }
 
 module.exports = { createWorkspaceStore, atomicJson };

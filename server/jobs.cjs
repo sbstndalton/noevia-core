@@ -69,7 +69,7 @@ function clipUtf8(text, maxBytes) {
 }
 
 // `kinds` scopes retention: stores sharing one jobs/ directory each prune only their own kinds.
-function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 200, kinds = null, durable = false } = {}) {
+function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 200, kinds = null, durable = false, assertActive = () => {} } = {}) {
   const root = path.join(dir, 'jobs');
   const controllers = new Map();
   const file = (id) => {
@@ -119,6 +119,7 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
   }
 
   function append(id, type, data = {}) {
+    assertActive();
     if (!TYPES.has(type)) throw Error(`Unknown job event type: ${type}`);
     const current = events(id);
     if (!current.length && type !== 'job.created') throw Object.assign(Error('No such job'), { status: 404 });

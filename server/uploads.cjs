@@ -63,6 +63,7 @@ function original(workspace, id, file) {
   return path.join(directory(workspace, id), file.attachment.id);
 }
 async function ingest(workspace, project, name, bytes, { connection, source, remotePath, progress = () => {}, storageImpl = storage, extractDocx = docx.extract } = {}) {
+  workspace.assertActive?.();
   validate(name, bytes);
   const group = classify(name), mime = bytes.length <= 8 * 1024 * 1024 ? images[path.extname(name).toLowerCase()] : undefined;
   const fullName = remotePath || (connection ? `${project.projectFolder}/${group}/${name}` : name);
@@ -72,8 +73,10 @@ async function ingest(workspace, project, name, bytes, { connection, source, rem
   if (connection && !remotePath) {
     progress('Saving to Nextcloud / storage');
     await storageImpl.createFolder(connection, `${project.projectFolder}/${group}`);
+    workspace.assertActive?.();
     await storageImpl.writeFile(connection, fullName, bytes);
   }
+  workspace.assertActive?.();
   progress('Saving original');
   const id = hash(bytes), dir = directory(workspace, project.id);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -109,6 +112,7 @@ async function ingest(workspace, project, name, bytes, { connection, source, rem
       reason = 'This file is not readable as text — it looks like binary data despite its extension. The original is kept.';
     }
   } else if (mime) state = 'vision';
+  workspace.assertActive?.();
   file.attachment = { id, bytes: bytes.length, group, state, ...(reason ? {reason} : {}), ...(readerVersion ? {readerVersion} : {}), ...(group === 'Images' && bytes.length > 8 * 1024 * 1024 ? { reason: 'Original stored; resize below 8 MB for model image input.' } : {}) };
   if (source || connection) file.source = source || project.projectFolder;
   // Replacing a vision image with a stored-only original must also retire its

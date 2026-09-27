@@ -602,6 +602,7 @@ function createProjectRoutes({
         return json(res, 400, { error: `A project holds at most ${MAX_PROJECT_IMAGES} images.` });
       }
       const assetId = `img-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+      currentWorkspace().assertActive?.();
       const dir = currentWorkspace().assetDir(id);
       fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
       fs.writeFileSync(path.join(dir, assetId), bytes, { mode: 0o600 });
