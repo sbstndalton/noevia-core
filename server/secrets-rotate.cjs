@@ -47,6 +47,7 @@ function rotationTables({ db, dataDir }) {
     sqlTable(db, 'mcp_oauth_clients', { table: 'mcp_oauth_clients', keys: ['server_id'], column: 'data_enc', bound: false }),
     sqlTable(db, 'directory_mcp_servers', { table: 'directory_mcp_servers', keys: ['id'], column: 'headers_enc', bound: false }),
     sqlTable(db, 'directory_mcp_user_keys', { table: 'directory_mcp_user_keys', keys: ['user_id', 'server_id'], column: 'headers_enc', bound: true }),
+    sqlTable(db, 'chatgpt_oauth_tokens', { table: 'chatgpt_oauth_tokens', keys: ['user_id'], column: 'data_enc', bound: true }),
     providerFile('shared_providers', path.join(dataDir, 'shared-providers.json')),
   ];
   const usersDir = path.join(dataDir, 'users');

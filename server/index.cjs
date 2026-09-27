@@ -467,6 +467,12 @@ const mcpOAuth = require('./mcp-oauth.cjs').createMcpOAuth({
   urlAllowed: async (url) => require('./directory-mcp.cjs').hostedUrlOk(url) && directoryUrlAllowed(url),
   redirectUri: () => `${String(authService.origin || process.env.PUBLIC_ORIGIN || '').replace(/\/$/, '')}/api/mcp-oauth/callback`,
 });
+// Sign in with ChatGPT (#447): per-account tokens, encrypted and bound to their owner, used only
+// while features.chatgptOAuth is on. The table exists either way so a disconnect always works.
+const chatgptOAuth = require('./chatgpt-oauth.cjs').createChatGptOAuth({
+  db: authService.db, secrets: secretStore, audit: (action, actor, detail) => authService.audit(action, actor, actor, detail),
+  config: { codexClientVersion: process.env.NOEVIA_CHATGPT_CODEX_VERSION },
+});
 const mcpCredentialOriginAllowed = createCredentialOriginCheck(process.env.MCP_NEXTCLOUD_ORIGINS);
 // The live server list, discovery, per-server credentials and the MCP executor: mcp-wiring.cjs.
 // It appends the directory servers to MCP_SERVERS itself and keeps that array current.
@@ -553,6 +559,7 @@ const { handleChat } = require('./chat.cjs').createChatHandler({
   visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, toolGate,
   DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall,
   oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse,
+  chatgptOAuth, chatgptEnabled: () => features.enabled('chatgptOAuth'),
 });
 // POST /api/chat: rate limit, body cap and the Diary gate, then the loop (routes/chat.cjs).
 const chatRoutes = require('./routes/chat.cjs').createChatRoutes({
@@ -572,9 +579,11 @@ const projectRoutes = require('./routes/projects.cjs').createProjectRoutes({
   json, readBody, readJson, requestScope, dispatch: (req, res) => handleRequestScoped(req, res), currentWorkspace, authService, storageClient, documents, documentSources, rag, fs, path,
   reasoningEffort, projectAppearance, diaryExtras, PROJECTS, DEFAULT_TOOLBOXES, sanitizeToolboxes, getProvider, ensureRolesLoaded, servedCatalogue, DEFAULT_PROVIDER_ID, store: projectStore,
 });
-// The provider registry's routes: list, connect, test and remove (routes/providers.cjs).
+// The provider registry's routes: list, connect, test and remove (routes/providers.cjs), plus
+// Sign in with ChatGPT (chatgptOAuth, built beside mcpOAuth above) while features.chatgptOAuth is on.
 const providerRoutes = require('./routes/providers.cjs').createProviderRoutes({
   json, readBody, readJson, fetchJson, endpointApproved, PROVIDERS, PROJECTS, DEFAULT_PROVIDER_ID, modelManager, currentWorkspace, saveProjects, registry: providerRegistry,
+  chatgptOAuth, chatgptEnabled: () => features.enabled('chatgptOAuth'),
 });
 // Statistics, the auto-router roles, the model manager proxy and /api/models/* (routes/models.cjs).
 const modelRoutes = require('./routes/models.cjs').createModelRoutes({
@@ -598,7 +607,7 @@ const publicAuthRoutes = new Set([
 ]);
 const authRoutes = require('./routes/auth.cjs').createAuthRoutes({
   json, authResult, readJson, authService, publicAuthRoutes, davSettings, davConfig, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, diaryTenantHeaders: diary.tenantHeaders, env: process.env,
-  mcpOAuth, directoryMcp,
+  mcpOAuth, directoryMcp, chatgptOAuth,
   // POST /api/admin/secrets/rotate (CSRF-checked by the router like every signed-in POST).
   rotateSecrets: (actorId) => require('./secrets-rotate.cjs').runRotation({ secrets: secretStore, db: authService.db, dataDir: DATA_DIR, audit: authService.audit, actorId }),
 });

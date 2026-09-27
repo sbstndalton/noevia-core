@@ -32,9 +32,10 @@ const PASS = Symbol('unhandled');
  * @param {object} deps.env                              process.env, read at call time
  * @param {{ forgetUser: (userId:string) => void }} [deps.mcpOAuth]      OAuth sign-ins, keyed per (user, server)
  * @param {{ forgetUser: (userId:string) => void }} [deps.directoryMcp]  directory server keys, keyed per (user, server)
+ * @param {{ forgetUser: (userId:string) => void }} [deps.chatgptOAuth]  Sign in with ChatGPT tokens, keyed per user
  * @param {(actorId:string) => object} [deps.rotateSecrets]  re-encrypts stored credentials under the current key
  */
-function createAuthRoutes({ json, authResult, readJson, authService, publicAuthRoutes, davSettings, davConfig, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, diaryTenantHeaders = null, env, mcpOAuth, directoryMcp, rotateSecrets }) {
+function createAuthRoutes({ json, authResult, readJson, authService, publicAuthRoutes, davSettings, davConfig, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, diaryTenantHeaders = null, env, mcpOAuth, directoryMcp, chatgptOAuth = null, rotateSecrets }) {
   async function open(req, res, { path: p }) {
     if (p === '/api/setup/status' && req.method === 'GET') {
       return json(res, 200, { configured: authService.userCount() > 0, publicOrigin: authService.origin || env.PUBLIC_ORIGIN || '' });
@@ -143,6 +144,7 @@ function createAuthRoutes({ json, authResult, readJson, authService, publicAuthR
             await driveAccounts.removeUser(id);
             mcpOAuth?.forgetUser(id);
             directoryMcp?.forgetUser(id);
+            chatgptOAuth?.forgetUser(id);
             const target = `${DIARY_BASE}/api/internal/tenant`;
             // Signed with DIARY_TENANT_KEY when set: the sidecar refuses an unasserted delete.
             let headers = diaryTenantHeaders ? diaryTenantHeaders(id, 'DELETE', target) : null;

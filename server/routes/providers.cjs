@@ -5,6 +5,15 @@
 //   POST   /api/providers/test   probe an endpoint's /v1/models before saving it
 //   DELETE /api/providers/:id    remove one; projects on it fall back to the default
 //
+// Sign in with ChatGPT (#447, chatgpt-oauth.cjs), only while features.chatgptOAuth is on (404 off):
+//   GET    /api/providers/chatgpt              this account's connection: state + masked account
+//   POST   /api/providers/chatgpt/device       start a device-code sign-in -> { loginId, userCode, verificationUrl }
+//   POST   /api/providers/chatgpt/device/poll  { loginId } -> pending | connected | expired
+//   POST   /api/providers/chatgpt/device/cancel { loginId }
+//   GET    /api/providers/chatgpt/models       the account's model ids
+//   DELETE /api/providers/chatgpt              disconnect: tokens deleted, the provider row removed
+// A connection is always the signed-in account's own private provider, never shared.
+//
 // Returns true when it handled the request. Auth and CSRF run before routes are mounted.
 // The SSRF guard (endpointApproved) is the same policy the storage routes apply.
 
@@ -24,16 +33,73 @@ const PASS = Symbol('unhandled');
  * @param {() => object} deps.currentWorkspace
  * @param {(projects:object[]) => void} deps.saveProjects
  * @param {object} deps.registry   providers.cjs
+ * @param {object|null} [deps.chatgptOAuth]   chatgpt-oauth.cjs; null leaves Sign in with ChatGPT out entirely
+ * @param {() => boolean} [deps.chatgptEnabled]   features.enabled('chatgptOAuth')
  */
-function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApproved, PROVIDERS, PROJECTS, DEFAULT_PROVIDER_ID, modelManager, currentWorkspace, saveProjects, registry }) {
+function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApproved, PROVIDERS, PROJECTS, DEFAULT_PROVIDER_ID, modelManager, currentWorkspace, saveProjects, registry, chatgptOAuth = null, chatgptEnabled = () => false }) {
   const { saveProviders, saveSharedProviders, maskKey } = registry;
+  const chatgpt = require('../chatgpt-oauth.cjs');
+  const chatgptOn = () => !!chatgptOAuth && chatgptEnabled();
+
+  // The provider row that points this account's chats at its ChatGPT connection (no credential in it).
+  function ensureChatGptRow() {
+    if (Array.from(PROVIDERS).some((pr) => pr.id === chatgpt.PROVIDER_ID && !pr.shared)) return;
+    PROVIDERS.push(chatgpt.providerRow());
+    saveProviders();
+  }
+  function removeChatGptRow() {
+    const row = Array.from(PROVIDERS).find((pr) => pr.id === chatgpt.PROVIDER_ID);
+    if (row && !row.shared) currentWorkspace().removeProvider(chatgpt.PROVIDER_ID);
+    let changed = false;
+    for (const pr of PROJECTS) if (pr.provider === chatgpt.PROVIDER_ID) { delete pr.provider; changed = true; }
+    if (changed) saveProjects(PROJECTS);
+  }
+
+  async function handleChatGpt(req, res, p, authn) {
+    if (!chatgptOn()) return json(res, 404, { error: 'Sign in with ChatGPT is turned off on this server.' });
+    const userId = authn?.user?.id;
+    if (!userId) return json(res, 401, { error: 'Sign in to noevia first.' });
+    try {
+      if (p === '/api/providers/chatgpt' && req.method === 'GET') {
+        return json(res, 200, { ...chatgptOAuth.status(userId), providerId: chatgpt.PROVIDER_ID, external: true });
+      }
+      if (p === '/api/providers/chatgpt' && req.method === 'DELETE') {
+        chatgptOAuth.disconnect(userId);
+        removeChatGptRow();
+        return json(res, 200, { ok: true, state: 'disconnected' });
+      }
+      if (p === '/api/providers/chatgpt/device' && req.method === 'POST') {
+        return json(res, 200, await chatgptOAuth.startDeviceLogin(userId));
+      }
+      if (p === '/api/providers/chatgpt/device/poll' && req.method === 'POST') {
+        const body = await readJson(req).catch(() => ({}));
+        const result = await chatgptOAuth.pollDeviceLogin(userId, String(body?.loginId || ''));
+        if (result.state === 'connected') ensureChatGptRow();
+        return json(res, 200, result);
+      }
+      if (p === '/api/providers/chatgpt/device/cancel' && req.method === 'POST') {
+        const body = await readJson(req).catch(() => ({}));
+        return json(res, 200, { ok: chatgptOAuth.cancelDeviceLogin(userId, String(body?.loginId || '')) });
+      }
+      if (p === '/api/providers/chatgpt/models' && req.method === 'GET') {
+        return json(res, 200, { models: await chatgptOAuth.listModels(userId) });
+      }
+    } catch (e) {
+      // Messages from chatgpt-oauth.cjs are written for people and carry no credential.
+      return json(res, e.status && e.status < 600 ? e.status : 502, { error: e.status ? e.message : 'ChatGPT sign-in failed.' });
+    }
+    return json(res, 405, { error: 'method not allowed' });
+  }
 
   async function handle(req, res, { path: p, authn }) {
+    if (p === '/api/providers/chatgpt' || p.startsWith('/api/providers/chatgpt/')) return handleChatGpt(req, res, p, authn);
     // ── Provider registry (step 9): list / connect / remove. GET never returns
     // a saved apiKey in plaintext — masked, e.g. sk-…last4.
     if (p === '/api/providers' && req.method === 'GET') {
+      // A ChatGPT row is listed only while the flag is on, with its connection state instead of a key.
+      const listed = Array.from(PROVIDERS).filter((pr) => !chatgpt.isChatGptProvider(pr) || (chatgptOn() && !pr.shared));
       return json(res, 200, {
-        providers: PROVIDERS.map((pr) => ({
+        providers: listed.map((pr) => ({
           id: pr.id,
           label: pr.label,
           baseUrl: pr.baseUrl,
@@ -42,6 +108,7 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
           managed: pr.id === DEFAULT_PROVIDER_ID && modelManager.enabled,
           shared: !!pr.shared,
           defaultModel: pr.defaultModel || undefined,
+          ...(chatgpt.isChatGptProvider(pr) ? { kind: chatgpt.KIND, external: true, connection: chatgptOAuth.status(authn?.user?.id).state } : {}),
         })),
       });
     }
@@ -98,6 +165,8 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
       const selectedProvider = Array.from(PROVIDERS).find(p => p.id === id);
       if (selectedProvider?.shared && authn.user.role !== 'admin') return json(res, 403, { error: 'administrator required' });
       if (!currentWorkspace().removeProvider(id)) return json(res, 404, { error: 'no such provider' });
+      // Removing the ChatGPT row is disconnecting: its tokens go too, flag on or off.
+      if (chatgpt.isChatGptProvider(selectedProvider) && !selectedProvider.shared && chatgptOAuth && authn?.user?.id) chatgptOAuth.disconnect(authn.user.id);
       // Projects pointing at the removed provider fall back to the configured default.
       for (const pr of PROJECTS) {
         if (pr.provider === id) {
