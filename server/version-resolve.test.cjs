@@ -3,19 +3,37 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const { resolveVersion } = require('./version-resolve.cjs');
 
-function makeBaseDir({ root, server } = {}) {
+function makeBaseDir({ dist, root, server } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'version-resolve-'));
   const baseDir = path.join(dir, 'server');
   fs.mkdirSync(baseDir, { recursive: true });
+  if (dist !== undefined) {
+    fs.mkdirSync(path.join(dir, 'dist'));
+    fs.writeFileSync(path.join(dir, 'dist', 'version.json'), dist);
+  }
   if (root !== undefined) fs.writeFileSync(path.join(dir, 'package.json'), root);
   if (server !== undefined) fs.writeFileSync(path.join(baseDir, 'package.json'), server);
   return { dir, baseDir };
 }
 
-test('STAMP_VERSION env wins over any package.json on disk', () => {
+test('the served version wins over runtime environment and package versions', () => {
+  const { baseDir, dir } = makeBaseDir({ dist: JSON.stringify({ version: 'deadbee' }), root: JSON.stringify({ version: '1.2.3' }) });
+  try {
+    assert.equal(resolveVersion({ STAMP_VERSION: 'other' }, baseDir), 'deadbee');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('STAMP_VERSION env is a fallback when the served artifact is unavailable', () => {
   const { baseDir, dir } = makeBaseDir({ root: JSON.stringify({ version: '1.2.3' }) });
   try {
     assert.equal(resolveVersion({ STAMP_VERSION: '9.9.9' }, baseDir), '9.9.9');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('unreadable served version falls through safely (#337)', () => {
+  const { baseDir, dir } = makeBaseDir({ dist: '{bad json', root: JSON.stringify({ version: '1.2.3' }) });
+  try {
+    assert.equal(resolveVersion({}, baseDir), '1.2.3');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 

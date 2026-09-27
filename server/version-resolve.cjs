@@ -1,9 +1,9 @@
 // Resolves the version string reported by GET /api/ready (#297, #337).
 //
-// Priority: STAMP_VERSION env var (set from COWORK_VERSION at build time,
-// see Dockerfile) > the repo-root package.json (present in the runtime image
-// alongside dist/ and server/) > server/package.json (always present since
-// it ships the server's own deps) > 'unknown'. Never throws: a missing or
+// Priority: dist/version.json (the artifact served to the browser) >
+// STAMP_VERSION env var > the repo-root package.json > server/package.json >
+// 'unknown'. The build-stage STAMP_VERSION is not inherited by the runtime
+// Docker stage, so the served artifact must be authoritative. Never throws: a missing or
 // unreadable file must not take the process down (#337 — root package.json
 // was omitted from the runtime image and the previous inline `require`
 // crashed the container on every start).
@@ -23,6 +23,8 @@ function readVersionFrom(jsonPath) {
 }
 
 function resolveVersion(env = process.env, baseDir = __dirname) {
+  const servedVersion = readVersionFrom(path.join(baseDir, '..', 'dist', 'version.json'));
+  if (servedVersion) return servedVersion;
   if (env.STAMP_VERSION) return env.STAMP_VERSION;
   const rootVersion = readVersionFrom(path.join(baseDir, '..', 'package.json'));
   if (rootVersion) return rootVersion;

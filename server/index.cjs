@@ -744,6 +744,9 @@ async function handleRequestScoped(req, res) {
 
 async function handleRequest(req,res) {
   const pathname=new URL(req.url,'http://localhost').pathname;
+  // This is a browser/core contract marker, including unauthenticated and error
+  // responses. Set it before the maintenance gate, which may return early.
+  if (pathname.startsWith('/api/')) res.setHeader('X-Noevia-API', '1');
   const inference=req.method!=='GET' && (pathname==='/api/chat' || pathname.startsWith('/api/diary/'));
   let leave;
   try {if(inference && modelManager.enterInference)leave=modelManager.enterInference();}
