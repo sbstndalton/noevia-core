@@ -18,6 +18,9 @@ const USERNAME_RE = /^[A-Za-z0-9._-]{3,32}$/;
 const IDLE_MS = 7 * 24 * 60 * 60 * 1000;
 const ABSOLUTE_MS = 30 * 24 * 60 * 60 * 1000;
 const CHALLENGE_MS = 5 * 60 * 1000;
+// Allow concurrent ceremonies while bounding persistent storage from the public
+// options endpoint. At capacity, existing challenges keep their full lifetime.
+const MAX_PENDING_CHALLENGES = 4096;
 
 // Client IP resolution. By default the direct socket address is used.
 // Behind a reverse proxy (a documented first-class deployment), every
@@ -143,6 +146,7 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       id_hash TEXT PRIMARY KEY, user_id TEXT, kind TEXT NOT NULL, challenge TEXT NOT NULL,
       expires_at INTEGER NOT NULL
     );
+    CREATE INDEX IF NOT EXISTS challenges_expires_at_idx ON challenges(expires_at);
     CREATE TABLE IF NOT EXISTS invitations(
       token_hash TEXT PRIMARY KEY, created_by TEXT NOT NULL REFERENCES users(id),
       role TEXT NOT NULL, expires_at INTEGER NOT NULL, used_at INTEGER, created_at INTEGER NOT NULL
@@ -348,10 +352,21 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
     return hash(password, { algorithm: Algorithm.Argon2id, memoryCost: 19456, timeCost: 2, parallelism: 1 });
   }
 
+  const deleteExpiredChallenges = db.prepare('DELETE FROM challenges WHERE expires_at<=?');
+  const pendingChallengeCount = db.prepare('SELECT count(*) AS n FROM challenges');
+  const insertChallenge = db.prepare('INSERT INTO challenges(id_hash,user_id,kind,challenge,expires_at) VALUES(?,?,?,?,?)');
+  const persistChallenge = db.transaction((idHash, userId, kind, challenge, now) => {
+    deleteExpiredChallenges.run(now);
+    // Reject new work at capacity instead of invalidating a live passkey ceremony.
+    if (pendingChallengeCount.get().n >= MAX_PENDING_CHALLENGES) return false;
+    insertChallenge.run(idHash, userId, kind, challenge, now + CHALLENGE_MS);
+    return true;
+  });
   function saveChallenge(userId, kind, challenge) {
     const token = randomToken();
-    db.prepare('INSERT INTO challenges(id_hash,user_id,kind,challenge,expires_at) VALUES(?,?,?,?,?)')
-      .run(digest(token), userId || null, kind, challenge, Date.now() + CHALLENGE_MS);
+    if (!persistChallenge(digest(token), userId || null, kind, challenge, Date.now())) {
+      throw Object.assign(new Error('passkey challenge capacity reached'), { code: 'CHALLENGE_CAPACITY' });
+    }
     return token;
   }
 

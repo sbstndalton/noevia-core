@@ -46,7 +46,11 @@ function createAuthRoutes({ json, authResult, readJson, authService, publicAuthR
     if (p === '/api/setup/complete' && req.method === 'POST') return authResult(res, await authService.setup(req, res, await readJson(req)));
     if (p === '/api/auth/login/password' && req.method === 'POST') return authResult(res, await authService.passwordLogin(req, res, await readJson(req)));
     if (p === '/api/auth/login/passkey/options' && req.method === 'POST') {
-      return json(res, 200, await authService.authenticationOptions((await readJson(req)).username));
+      try { return json(res, 200, await authService.authenticationOptions((await readJson(req)).username)); }
+      catch (e) {
+        if (e.code === 'CHALLENGE_CAPACITY') return json(res, 503, { error: 'passkey sign-in is temporarily busy' });
+        throw e;
+      }
     }
     if (p === '/api/auth/login/passkey/verify' && req.method === 'POST') {
       try { return json(res, 200, await authService.authenticationVerify(req, res, await readJson(req))); }
@@ -104,7 +108,13 @@ function createAuthRoutes({ json, authResult, readJson, authService, publicAuthR
     if (p === '/api/profile/onboarding' && req.method === 'POST') {
       return json(res, 200, authService.markOnboarded(authn.user.id));
     }
-    if (p === '/api/auth/passkeys/register/options' && req.method === 'POST') return json(res, 200, await authService.registrationOptions(authn.user.id));
+    if (p === '/api/auth/passkeys/register/options' && req.method === 'POST') {
+      try { return json(res, 200, await authService.registrationOptions(authn.user.id)); }
+      catch (e) {
+        if (e.code === 'CHALLENGE_CAPACITY') return json(res, 503, { error: 'passkey setup is temporarily busy' });
+        throw e;
+      }
+    }
     if (p === '/api/auth/passkeys/register/verify' && req.method === 'POST') {
       try { return json(res, 200, await authService.registrationVerify(authn.user.id, await readJson(req))); }
       catch (e) { return json(res, 400, { error: e.message }); }
