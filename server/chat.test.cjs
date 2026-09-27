@@ -7,8 +7,10 @@ const { createChatHandler } = require('./chat.cjs');
 const { createToolboxes } = require('./toolboxes.cjs');
 const { createDriveTools } = require('./gdrive-tools.cjs');
 const { createToolExchange } = require('./tool-exchange.cjs');
+const { createApprovals } = require('./approvals.cjs');
+const { createApprovalRoutes } = require('./routes/approvals.cjs');
 
-async function runDriveCall(t, { name, savedMode = null, connected = true, decision = 'approve', autoDecision = null, history = [], sampling = undefined, autoSamplingEnabled = undefined, message = 'Synthetic Drive request', codeRoleConfigured = false }) {
+async function runDriveCall(t, { name, savedMode = null, connected = true, decision = 'approve', policyDuringApproval = null, autoDecision = null, history = [], sampling = undefined, autoSamplingEnabled = undefined, message = 'Synthetic Drive request', codeRoleConfigured = false }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-drive-chat-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const user = { id: 'synthetic-user' }, project = { id: 'synthetic-project', model: 'synthetic-model', routing: autoDecision ? 'auto' : 'manual', toolboxes: ['core'], files: [], ...(sampling !== undefined ? { sampling } : {}) };
@@ -16,7 +18,15 @@ async function runDriveCall(t, { name, savedMode = null, connected = true, decis
   const requestScope = { getStore: () => store, run: (_scope, fn) => fn() };
   const accounts = { forUser: () => ({ drive: { state: () => ({ state: connected ? 'connected' : 'disconnected' }) } }) };
   const definitions = createDriveTools({ accounts });
-  const executions = [], approvals = [], requests = [], events = [];
+  const executions = [], approvals = [], requests = [], events = [], audits = [];
+  let currentMode = savedMode;
+  const approvalGate = createApprovals();
+  const approvalRoute = createApprovalRoutes({
+    json: (_res, status) => { assert.equal(status, 200); },
+    readBody: async (req) => req.body,
+    pendingApprovals: approvalGate.pendingApprovals,
+    requestScope,
+  });
   const driveTools = { ...definitions, execute: async (_user, tool) => { executions.push(tool); return 'synthetic Drive result'; } };
   const toolbox = createToolboxes({
     boxes: [driveTools.box], driveTools, offered: (id) => id !== 'gdrive',
@@ -40,8 +50,8 @@ async function runDriveCall(t, { name, savedMode = null, connected = true, decis
     fs, path, crypto, fetch, reasoningEffort: require('./reasoning-effort.cjs'), createToolExchange,
     rag: { filesContext: async () => null }, prefill: { recordSample() {} }, reduceToolResult: require('./tool-result-reduce.cjs').reduceToolResult,
     HISTORY_CAP: 20, DEFAULT_PROVIDER_ID: 'default', DIARY_BASE: 'http://fixture.invalid', TOOL_RESULT_CAP: 8000,
-    authService: { audit() {}, db: autoSamplingEnabled === undefined ? undefined : { prepare: () => ({ get: () => ({ value: String(autoSamplingEnabled) }) }) } },
-    toolPolicy: { mode: (_user, _tool, write) => write ? 'ask' : savedMode || 'allow' },
+    authService: { audit: (...args) => audits.push(args), db: autoSamplingEnabled === undefined ? undefined : { prepare: () => ({ get: () => ({ value: String(autoSamplingEnabled) }) }) } },
+    toolPolicy: { mode: (_user, _tool, write) => currentMode === 'block' ? 'block' : write ? 'ask' : currentMode || 'allow' },
     modelManager: { enabled: true, load: async () => ({ ok: true }), health: async () => ({ ok: true, body: { all_models_loaded: ['synthetic-model', 'fast-model', 'smart-model', ...(codeRoleConfigured ? ['code-model'] : [])].map(model_name => ({ model_name, loaded: true, recipe_options: { ctx_size: 32768 } })) } }) },
     requestScope, currentWorkspace: () => ({ userId: user.id, dir }), json() {}, getProject: () => project,
     getProvider: () => ({ id: 'default', baseUrl: 'http://fixture.invalid', label: 'Mock' }), providerHeaders: () => ({}), saveChats() {}, endpointApproved: () => true,
@@ -50,12 +60,19 @@ async function runDriveCall(t, { name, savedMode = null, connected = true, decis
     visionProbe: async () => ({ supported: false, reason: 'none' }), visionDescriptions: new Map(), skillsIndexFor: () => [],
     chatSkillRouter: { select: async () => ({ loaded: [] }) }, chatToolRouter: { select: async (ids) => ({ ids, routed: false }) },
     ...toolbox, oauthServerIds: () => new Set(), accountReady: () => true,
-    chatWideApproved: () => false, awaitApproval: async (request) => { approvals.push(request); return decision; },
+    chatWideApproved: approvalGate.chatWideApproved, awaitApproval: async (request) => {
+      approvals.push(request);
+      if (!policyDuringApproval) return decision;
+      const waiting = approvalGate.awaitApproval(request);
+      await policyDuringApproval({ setMode: (mode) => { currentMode = mode; }, decide: async (action) => approvalRoute(
+        { method: 'POST', body: JSON.stringify({ decision: action }) }, {}, { path: `/api/tool-approvals/${request.id}` }) });
+      return waiting;
+    },
     recordUsage() {}, recordToolUse() {},
   });
   await handler.handleChat({}, res, { message, projectId: project.id, chatId: 'synthetic-chat', history });
   assert.equal(events.some((event) => event.type === 'error'), false, JSON.stringify(events.filter((event) => event.type === 'error')));
-  return { executions, approvals, requests, events };
+  return { executions, approvals, requests, events, audits };
 }
 
 test('connected Drive read runs in chat without approval when omitted from ENABLED_TOOLBOXES', async (t) => {
@@ -71,7 +88,7 @@ test('saved ask still prompts for a Drive read and saved block withholds it', as
   assert.equal(ask.approvals.length, 1);
   assert.deepEqual(ask.executions, ['drive_read_file']);
   const blocked = await runDriveCall(t, { name: 'drive_read_file', savedMode: 'block' });
-  assert.equal(blocked.requests[0].tools.some((tool) => tool.function.name === 'drive_read_file'), false);
+  assert.equal(blocked.requests.some((request) => request.tools?.some((tool) => tool.function.name === 'drive_read_file')), false);
   assert.deepEqual(blocked.executions, []);
 });
 
@@ -84,6 +101,33 @@ test('Drive writes still require approval and disconnected accounts receive no D
   const disconnected = await runDriveCall(t, { name: 'drive_read_file', connected: false });
   assert.equal(disconnected.requests[0].tools.some((tool) => tool.function.name === 'drive_read_file'), false);
   assert.deepEqual(disconnected.executions, []);
+});
+
+test('a pending Drive write is blocked when its policy changes before owner approval', async (t) => {
+  const result = await runDriveCall(t, { name: 'drive_trash_file', policyDuringApproval: async ({ setMode, decide }) => {
+    setMode('block');
+    await decide('approve');
+  } });
+  assert.equal(result.approvals.length, 1);
+  assert.deepEqual(result.executions, []);
+  assert.match(result.events.find((event) => event.type === 'tool_result')?.text || '', /blocked/i);
+  assert.ok(result.audits.some(([event, , , details]) => event === 'tool.denied' && details.reason === 'blocked'));
+});
+
+test('a pending Drive read is blocked when its policy changes before approval', async (t) => {
+  const result = await runDriveCall(t, { name: 'drive_read_file', savedMode: 'ask', policyDuringApproval: async ({ setMode, decide }) => {
+    setMode('block');
+    await decide('approve');
+  } });
+  assert.equal(result.approvals.length, 1);
+  assert.deepEqual(result.executions, []);
+  assert.match(result.events.find((event) => event.type === 'tool_result')?.text || '', /blocked/i);
+});
+
+test('a pending Drive write still runs after approval when policy stays ask', async (t) => {
+  const result = await runDriveCall(t, { name: 'drive_trash_file', policyDuringApproval: async ({ decide }) => decide('approve') });
+  assert.equal(result.approvals.length, 1);
+  assert.deepEqual(result.executions, ['drive_trash_file']);
 });
 
 test('Auto route detail reaches only its reply metadata and model replay stays role/content only', async (t) => {

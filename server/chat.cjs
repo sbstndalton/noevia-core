@@ -967,6 +967,13 @@ function createChatHandler({
               }
             }
             if (chatSignal.signal.aborted) return 'ERROR: exchange cancelled; tool was not run.';
+            // Settings may change while the approval card is pending. The mode at
+            // dispatch, rather than the mode when the question was asked, controls
+            // whether this call can run.
+            if (toolPolicy.mode(userId, tc.name, isWriteTool(tc.name)) === 'block') {
+              authService.audit('tool.denied', userId, userId, { tool: tc.name, reason: 'blocked' });
+              return `ERROR: ${tc.name} is blocked in this account's settings, so it was not run. Do not retry it; tell the user they can change it in Settings → Connectors.`;
+            }
             if (chatWideApproved(userId, chatId)) turn?.approval(tc.id, {action:'approve_all', inherited:true});
             turn?.started(tc.id);
             markWriteAttempt();
