@@ -10,7 +10,7 @@ const { createProviderRoutes } = require('./providers.cjs');
 function fixture({ probe = async () => ({ ok: true, status: 200, body: { data: [{ id: 'm-a' }, { id: 'm-b' }, {}] } }) } = {}) {
   const sent = [];
   const providers = [{ id: 'default', label: 'Local', baseUrl: 'http://engine', apiKey: 'local' }, { id: 'shared-1', label: 'Team', baseUrl: 'https://t.example', apiKey: 'sk-teamteam1234', shared: true }];
-  const projects = [{ id: 'p1', provider: 'shared-1' }, { id: 'p2', provider: 'default' }];
+  const projects = [{ id: 'p1', provider: 'shared-1', model: 'shared-only-model' }, { id: 'p2', provider: 'default', model: 'local-model' }];
   const saved = { private: 0, shared: 0, projects: 0 };
   const routes = createProviderRoutes({
     json: (res, status, body) => { sent.push({ status, body }); },
@@ -102,6 +102,8 @@ test('removal protects the default, keeps shared rows for admins, and detaches p
   assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true } });
   assert.deepEqual(f.providers.map((p) => p.id), ['default']);
   assert.equal('provider' in f.projects[0], false, 'the project falls back to the default');
+  assert.equal('model' in f.projects[0], false, 'the removed provider model cannot be sent to the default');
   assert.equal(f.projects[1].provider, 'default');
+  assert.equal(f.projects[1].model, 'local-model');
   assert.equal(f.saved.projects, 1);
 });

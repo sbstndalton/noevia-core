@@ -51,7 +51,11 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
     const row = Array.from(PROVIDERS).find((pr) => pr.id === chatgpt.PROVIDER_ID);
     if (row && !row.shared) currentWorkspace().removeProvider(chatgpt.PROVIDER_ID);
     let changed = false;
-    for (const pr of PROJECTS) if (pr.provider === chatgpt.PROVIDER_ID) { delete pr.provider; changed = true; }
+    for (const pr of PROJECTS) if (pr.provider === chatgpt.PROVIDER_ID) {
+      delete pr.provider;
+      delete pr.model;
+      changed = true;
+    }
     if (changed) saveProjects(PROJECTS);
   }
 
@@ -171,6 +175,7 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
       for (const pr of PROJECTS) {
         if (pr.provider === id) {
           delete pr.provider;
+          delete pr.model;
         }
       }
       saveProjects(PROJECTS);

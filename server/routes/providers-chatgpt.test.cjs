@@ -122,15 +122,21 @@ test('connecting twice keeps one row; disconnect deletes the tokens, the row and
   const a = f.routesFor('user-a');
   assert.equal(a.providers.filter((p) => p.id === 'chatgpt-oauth').length, 1);
   a.projects[0].provider = 'chatgpt-oauth';
+  a.projects[0].model = 'gpt-synthetic';
   const out = await a.call('DELETE', '/api/providers/chatgpt');
   assert.deepEqual(out, { status: 200, body: { ok: true, state: 'disconnected' } });
   assert.equal(a.providers.some((p) => p.id === 'chatgpt-oauth'), false);
   assert.equal('provider' in a.projects[0], false, 'the project falls back to the default provider');
+  assert.equal('model' in a.projects[0], false, 'the ChatGPT model cannot be sent to the default provider');
   assert.equal(f.oauth.status('user-a').state, 'disconnected');
   // Removing the row through the generic route is also a disconnect.
   await signIn(f, 'user-a');
+  a.projects[0].provider = 'chatgpt-oauth';
+  a.projects[0].model = 'gpt-synthetic';
   assert.equal((await a.call('DELETE', '/api/providers/chatgpt-oauth')).status, 200);
   assert.equal(f.oauth.status('user-a').state, 'disconnected');
+  assert.equal('provider' in a.projects[0], false);
+  assert.equal('model' in a.projects[0], false);
 });
 
 test('POST /api/providers cannot mint a ChatGPT or external row', async (t) => {

@@ -10,12 +10,16 @@ const os = require('node:os');
 const path = require('node:path');
 const { AsyncLocalStorage } = require('node:async_hooks');
 const { createProjectRoutes, DOCUMENT_UPLOAD_CAP } = require('./projects.cjs');
+const { createProviderRegistry } = require('../providers.cjs');
 
 function fixture({ projects = [], diary = true, catalogue = null } = {}) {
   const sent = [];
   const dispatched = [];
   const requestScope = new AsyncLocalStorage();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-project-routes-'));
+  const providers = [{ id: 'default' }, { id: 'prov-cloud' }];
+  // Use production fallback semantics: an unknown ID resolves to default.
+  const { getProvider } = createProviderRegistry({ currentWorkspace: () => ({}), PROVIDERS: providers, DEFAULT_PROVIDER_ID: 'default' });
   const store = {
     getProject: (id) => projects.find((p) => p.id === id) || null,
     saveProjects: () => { store.saves += 1; }, saves: 0,
@@ -40,7 +44,7 @@ function fixture({ projects = [], diary = true, catalogue = null } = {}) {
     projectAppearance: () => ({}),
     diaryExtras: { PROJECT_ID: 'diary-extras', chatProjectId: (id) => (id === 'bad' ? null : `chat-${id}`), newProject: () => ({ id: 'diary-extras', name: 'Diary' }) },
     PROJECTS: projects, DEFAULT_TOOLBOXES: ['core'], sanitizeToolboxes: (b) => (Array.isArray(b) ? b : null),
-    getProvider: (id) => (id === 'default' ? {} : null), ensureRolesLoaded() {},
+    getProvider, ensureRolesLoaded() {},
     servedCatalogue: async () => catalogue, DEFAULT_PROVIDER_ID: 'default',
     store,
   });
@@ -49,7 +53,7 @@ function fixture({ projects = [], diary = true, catalogue = null } = {}) {
     Object.assign(req, { method, url: path + search, headers: { cookie: 'session=x' }, socket: {} });
     return routes(req, { writeHead() {}, end() {} }, { path, authn: { user: { id: 'u1', role } }, url: new URL(`http://localhost${path}${search}`) });
   };
-  return { call, sent, dispatched, store, projects };
+  return { call, sent, dispatched, store, projects, providers };
 }
 
 test('paths and methods outside the project surface fall through', async () => {
@@ -82,6 +86,14 @@ test('the config patch validates each field with the same words as before', asyn
   assert.deepEqual(f.sent.pop(), { status: 400, body: { error: "routing must be 'auto' or 'manual'" } });
   await f.call('POST', '/api/projects/p1/config', { provider: 'ghost' });
   assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'no such provider' } });
+  assert.equal(f.projects[0].provider, undefined);
+  assert.equal(f.store.saves, 0);
+  await f.call('POST', '/api/projects/p1/config', { provider: 'prov-cloud' });
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true } });
+  assert.equal(f.projects[0].provider, 'prov-cloud');
+  await f.call('POST', '/api/projects/p1/config', { provider: 'lemonade' });
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true } });
+  assert.equal(f.projects[0].provider, 'lemonade');
   await f.call('POST', '/api/projects/p1/config', { toolboxes: 'core' });
   assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'toolboxes must be an array of toolbox ids' } });
   await f.call('POST', '/api/projects/p1/config', { reasoningEffort: 'max' });
@@ -93,7 +105,7 @@ test('the config patch validates each field with the same words as before', asyn
   assert.equal(f.projects[0].name, 'Renamed');
   assert.equal(f.projects[0].pinned, true);
   assert.deepEqual(f.projects[0].memories, ['keep']);
-  assert.equal(f.store.saves, 1);
+  assert.equal(f.store.saves, 3);
 });
 
 test('the sampling patch is sanitized, and null clears an explicit override (issue #194)', async () => {

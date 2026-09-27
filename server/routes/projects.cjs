@@ -256,7 +256,11 @@ function createProjectRoutes({
         if (patch.routing === 'auto') ensureRolesLoaded(); // no-op if unconfigured
       }
       if (typeof patch.provider === 'string' && patch.provider) {
-        if (!getProvider(patch.provider)) return json(res, 400, { error: 'no such provider' });
+        // getProvider also resolves unknown IDs to the default for chat. An explicit
+        // selection must match its registered ID (or the legacy lemonade alias).
+        const selectedProvider = getProvider(patch.provider);
+        const selectedId = patch.provider === 'lemonade' ? DEFAULT_PROVIDER_ID : patch.provider;
+        if (!selectedProvider || selectedProvider.id !== selectedId) return json(res, 400, { error: 'no such provider' });
         project.provider = patch.provider;
       }
       // Explicit sampling override (issue #194): null clears it, back to the automatic preset
