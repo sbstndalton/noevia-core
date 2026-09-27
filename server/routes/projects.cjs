@@ -263,11 +263,12 @@ function createProjectRoutes({
       // (or engine defaults, if automatic sampling presets are off). Unknown/out-of-range keys
       // are dropped rather than rejecting the whole request — sanitizeExplicitSampling mirrors
       // the same validation selectSamplingParams applies at request time.
-      if (patch.sampling === null) { delete project.sampling; delete storedProject.sampling; }
+      let clearSampling = false;
+      if (patch.sampling === null) { delete project.sampling; clearSampling = true; }
       else if (patch.sampling !== undefined) {
         const cleaned = require('../sampling-presets.cjs').sanitizeExplicitSampling(patch.sampling);
         if (cleaned) project.sampling = cleaned;
-        else { delete project.sampling; delete storedProject.sampling; }
+        else { delete project.sampling; clearSampling = true; }
       }
       if (patch.toolboxes !== undefined) {
         const boxes = sanitizeToolboxes(patch.toolboxes);
@@ -310,6 +311,7 @@ function createProjectRoutes({
       }
       project.updatedAt = Date.now();
       Object.assign(storedProject, project);
+      if (clearSampling) delete storedProject.sampling;
       saveProjects(PROJECTS);
       pruneDocuments(storedProject);
       return json(res, 200, { ok: true });

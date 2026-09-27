@@ -104,11 +104,24 @@ test('the sampling patch is sanitized, and null clears an explicit override (iss
   await f.call('POST', '/api/projects/p1/config', { sampling: {} });
   assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true } });
   assert.equal(f.projects[0].sampling, undefined); // nothing valid survived sanitization
+  assert.equal(Object.hasOwn(f.projects[0], 'sampling'), false);
   await f.call('POST', '/api/projects/p1/config', { sampling: { temperature: 0.6 } });
   assert.deepEqual(f.projects[0].sampling, { temperature: 0.6 });
   await f.call('POST', '/api/projects/p1/config', { sampling: null });
   assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true } });
   assert.equal(f.projects[0].sampling, undefined);
+  assert.equal(Object.hasOwn(f.projects[0], 'sampling'), false);
+});
+
+test('rejected config patches do not clear the active sampling override', async () => {
+  for (const sampling of [null, {}]) {
+    const project = { id: 'p1', files: [], sampling: { temperature: 0.6 } };
+    const f = fixture({ projects: [project] });
+    await f.call('POST', '/api/projects/p1/config', { sampling, toolboxes: 'invalid' });
+    assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'toolboxes must be an array of toolbox ids' } });
+    assert.deepEqual(project, { id: 'p1', files: [], sampling: { temperature: 0.6 } });
+    assert.equal(f.store.saves, 0);
+  }
 });
 
 test('chat metas: listing, saving a normalized list and deleting one', async () => {
