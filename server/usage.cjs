@@ -66,6 +66,8 @@ function recordUsage(workspace, model, usage) {
     // even on a deployment that runs for years.
     const cutoff = usageDayKey(new Date(Date.now() - USAGE_RETENTION_DAYS * 86400000));
     for (const k of Object.keys(store.days)) if (k < cutoff) delete store.days[k];
+    if (workspace.revoked) return;
+    workspace.assertActive?.();
     atomicJson(workspace.usagePath(), store);
   } catch (err) {
     // Accounting must never break a reply that already succeeded.
@@ -86,6 +88,8 @@ function recordToolUse(workspace, name) {
     const tool = String(name).slice(0, 80);
     day.tools[tool] = (Number(day.tools[tool]) || 0) + 1;
     store.days[key] = day;
+    if (workspace.revoked) return;
+    workspace.assertActive?.();
     atomicJson(workspace.usagePath(), store);
   } catch (err) {
     console.warn('[usage] could not record a tool call:', err?.message || err);
