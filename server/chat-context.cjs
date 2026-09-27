@@ -5,25 +5,29 @@ const tokens = value => { let images=0;const text=typeof value==='string'?value:
 const fingerprint = value => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
 function stateFile(dir, id) { return path.join(dir, 'context-' + fingerprint(String(id)) + '.json'); }
 function read(dir, id) { try { return JSON.parse(fs.readFileSync(stateFile(dir,id),'utf8')); } catch { return {}; } }
-function save(dir,id,state) { fs.mkdirSync(dir,{recursive:true}); const file=stateFile(dir,id),tmp=file+'.'+crypto.randomUUID(); fs.writeFileSync(tmp,JSON.stringify(state),{mode:0o600}); fs.renameSync(tmp,file); }
+function save(dir,id,state,assertActive) { assertActive?.(); fs.mkdirSync(dir,{recursive:true}); const file=stateFile(dir,id),tmp=file+'.'+crypto.randomUUID(); fs.writeFileSync(tmp,JSON.stringify(state),{mode:0o600}); fs.renameSync(tmp,file); }
 function runtimeLimit(health, model) {
   const entry=health?.all_models_loaded?.find(m=>m.model_name===model && m.loaded && m.backend_alive!==false);
   const configured=Number(entry?.recipe_options?.ctx_size);
   return Number.isFinite(configured)&&configured>=2048 ? {limit:Math.floor(configured),limitSource:'Configured backend context'} : {limit:8192,limitSource:'Conservative fallback; backend limit unavailable'};
 }
-async function resolveRuntimeLimit({manager,model,dir,scope,onStatus=()=>{},signal}) {
+async function resolveRuntimeLimit({manager,model,dir,scope,onStatus=()=>{},signal,assertActive}) {
+  assertActive?.();
   if (!manager?.enabled) return runtimeLimit(null,model);
   signal?.throwIfAborted();
   let response=await manager.health();
+  assertActive?.();
   if (!response.ok) throw Error('Could not read the model backend context. Try again when the backend is available.');
   let health=response.body;
   if (!health?.all_models_loaded?.some(m=>m.model_name===model && m.loaded && m.backend_alive!==false)) {
     onStatus('Loading the selected model and checking its context allocation…');
     signal?.throwIfAborted();
     const loaded=await manager.load(model,{},signal);
+    assertActive?.();
     if (!loaded.ok) throw Error('The selected model could not load. Its context allocation was not changed.');
     signal?.throwIfAborted();
     response=await manager.health();
+    assertActive?.();
     if (!response.ok) throw Error('The model loaded, but its context allocation could not be checked. Try again.');
     health=response.body;
     if (!health?.all_models_loaded?.some(m=>m.model_name===model && m.loaded && m.backend_alive!==false)) {
@@ -42,7 +46,7 @@ async function resolveRuntimeLimit({manager,model,dir,scope,onStatus=()=>{},sign
     const observation={model,limit:result.limit,source:result.limitSource,configuration,managerVersion:health.version ?? null,engineVersion:entry.engineVersion ?? null,qualification:'allocation-observation-only',observedAt:Date.now()};
     const history=Array.isArray(previous.history)?previous.history:[];
     if (previous.current && previous.current.configuration!==configuration) history.push(previous.current);
-    save(dir,id,{current:observation,history:history.slice(-20)});
+    save(dir,id,{current:observation,history:history.slice(-20)},assertActive);
   }
   return result;
 }
@@ -132,7 +136,8 @@ async function compactContinuation({messages,tools,limit,limitSource,model,summa
  if(meter.used>meter.threshold) throw Error('Tool-loop context is still too full after compaction. Reduce tool results or choose a model with more context. No messages were deleted.');
  return {messages:next,meter,compacted:true,covered:compactable.length};
 }
-async function prepareUnlocked({dir,id,messages,tools,limit,limitSource,model,force=false,summarize,onStatus=()=>{}}) {
+async function prepareUnlocked({dir,id,messages,tools,limit,limitSource,model,force=false,summarize,onStatus=()=>{},assertActive}) {
+ assertActive?.();
  const state=read(dir,id), system=messages.filter(m=>m.role==='system'), original=messages.filter(m=>m.role!=='system');
  let applied=applySummary(original,state), wire=[...system,...applied.messages];
  if(!applied.covered){delete state.summary;delete state.covered;delete state.prefix;delete state.compactedAt;}
@@ -151,7 +156,7 @@ async function prepareUnlocked({dir,id,messages,tools,limit,limitSource,model,fo
    onStatus('Compacting older messages… Your full transcript stays available.');
    let summary=applied.covered?state.summary:'', batch=[];
    const budget=Math.max(512,Math.floor(limit*.45));
-   const flush=async()=>{if(!batch.length)return;const result=await summarize(summary,batch,Math.min(1536,Math.floor(limit*.15))); if(typeof result!=='string'||!result.trim()||tokens(result)>Math.min(1800,limit*.2))throw Error('Compaction did not produce a usable summary. Your transcript is unchanged; try another model.');summary=result.trim();batch=[];};
+   const flush=async()=>{if(!batch.length)return;const result=await summarize(summary,batch,Math.min(1536,Math.floor(limit*.15)));assertActive?.(); if(typeof result!=='string'||!result.trim()||tokens(result)>Math.min(1800,limit*.2))throw Error('Compaction did not produce a usable summary. Your transcript is unchanged; try another model.');summary=result.trim();batch=[];};
    const older=original.slice(applied.covered,cut);
    if(older.length>1000)throw Error('Too much history to compact in one operation. Start a new chat with selected context.');
    let calls=0;
@@ -170,7 +175,7 @@ async function prepareUnlocked({dir,id,messages,tools,limit,limitSource,model,fo
   } else if(force) throw Error('Not enough older messages to compact. Recent exchanges are kept intact.');
  }
  meter.historyCount=original.length;meter.compactedAt=state.compactedAt||null;meter.covered=state.covered||0;
- state.meter=meter;save(dir,id,state);
+ state.meter=meter;save(dir,id,state,assertActive);
  if(meter.used>meter.threshold)throw Error('Context is still too full after compaction. Reduce attached sources or start a new chat. No messages were deleted.');
  return {messages:wire,meter,maxTokens:meter.reserve};
 }
@@ -178,6 +183,6 @@ function providerError(value) {const text=typeof value==='string'?value:JSON.str
 const busy=new Set();
 async function prepare(options){const key=stateFile(options.dir,options.id);if(busy.has(key))throw Error('This chat is already preparing context. Wait for that request to finish.');busy.add(key);try{return await prepareUnlocked(options);}finally{busy.delete(key);}}
 // R1 measurement, opt-in with CONTEXT_LOG=1; never breaks a chat.
-function logRound({dir,...entry}){if(process.env.CONTEXT_LOG!=='1')return;try{const log=require('./context-log.cjs');log.append(dir,log.record(entry));}catch(e){console.warn('[context-log] write failed:',e.message);}}
+function logRound({dir,assertActive,...entry}){if(process.env.CONTEXT_LOG!=='1')return;try{const log=require('./context-log.cjs');const record=log.record(entry);assertActive?.();log.append(dir,record);}catch(e){console.warn('[context-log] write failed:',e.message);}}
 function remove(dir,id){fs.rmSync(stateFile(dir,id),{force:true});}
 module.exports={logRound,remove,tokens,read,save,runtimeLimit,resolveRuntimeLimit,applySummary,measure,prepare,compactContinuation,providerError};

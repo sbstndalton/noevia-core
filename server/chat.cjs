@@ -126,6 +126,7 @@ function createChatHandler({
     // workspace here keeps that write bound to the requesting user no matter
     // what the async context looks like by then.
     const chatWorkspace = (() => { try { return currentWorkspace(); } catch { return null; } })();
+    const assertWorkspaceActive = () => chatWorkspace?.assertActive?.();
 
     const mappedHistory = (Array.isArray(history) ? history : [])
       .filter((h) => h && ['user', 'assistant', 'tool', 'function'].includes(h.role) && typeof h.content === 'string' && h.content)
@@ -598,6 +599,7 @@ function createChatHandler({
         manager:provider.id===DEFAULT_PROVIDER_ID?modelManager:null,model,dir:chatWorkspace.dir,
         scope:require('node:crypto').createHash('sha256').update(JSON.stringify([provider.baseUrl,provider.apiKey,modelManager.baseUrl])).digest('hex'),
         signal:chatSignal.signal,onStatus:text=>send({type:'status',text}),
+        assertActive:assertWorkspaceActive,
       }));
       summarizeContext=async(summary,older,maxTokens)=>{
           const response=await reasoningEffort.requestWithEffort(providerFetch,upstreamUrl,{method:'POST',headers:upstreamHeaders,signal:AbortSignal.any([chatSignal.signal,AbortSignal.timeout(180000)]),redirect:'error'},
@@ -608,7 +610,7 @@ function createChatHandler({
           return choice?.message?.content;
         };
       prepared=await context.prepare({dir:chatWorkspace.dir,id:contextId,messages:wire,tools:activeTools,limit,limitSource,model,force:body.compactOnly===true,
-        onStatus:text=>send({type:'status',text}),summarize:summarizeContext});
+        onStatus:text=>send({type:'status',text}),summarize:summarizeContext,assertActive:assertWorkspaceActive});
       send({type:'context',...prepared.meter});
     } catch(error) {send({type:'error',text:error.message});res.end();return;}
     if(body.compactOnly){send({type:'done',model});res.end();return;}
@@ -726,8 +728,8 @@ function createChatHandler({
           if(roundCompacted){continuationCompactedAt=Date.now();continuationCovered=continuation.covered;send({type:'context',...roundBudget,historyCount:prepared.meter.historyCount,compactedAt:continuationCompactedAt,covered:continuationCovered});}
         } catch(error) {send({type:'error',text:error.message});break;}
       }
-      context.logRound({dir:chatWorkspace.dir,chatId:contextId,model,limit,round,compacted:!!continuationCompactedAt||!!prepared.meter.compactedAt&&prepared.meter.compactedAt>=requestStartedAt,messages:roundMessages,tools:activeTools});
-      const snapshot=context.read(chatWorkspace.dir,contextId);snapshot.meter={...roundBudget,historyCount:prepared.meter.historyCount,compactedAt:continuationCompactedAt||prepared.meter.compactedAt,covered:continuationCompactedAt?continuationCovered:prepared.meter.covered};context.save(chatWorkspace.dir,contextId,snapshot);
+      context.logRound({dir:chatWorkspace.dir,chatId:contextId,model,limit,round,compacted:!!continuationCompactedAt||!!prepared.meter.compactedAt&&prepared.meter.compactedAt>=requestStartedAt,messages:roundMessages,tools:activeTools,assertActive:assertWorkspaceActive});
+      const snapshot=context.read(chatWorkspace.dir,contextId);snapshot.meter={...roundBudget,historyCount:prepared.meter.historyCount,compactedAt:continuationCompactedAt||prepared.meter.compactedAt,covered:continuationCompactedAt?continuationCovered:prepared.meter.covered};context.save(chatWorkspace.dir,contextId,snapshot,assertWorkspaceActive);
       turn?.generation({ messages:roundMessages, tools:activeTools }, round);
       let upstream;
       roundStartedAt = Date.now();
