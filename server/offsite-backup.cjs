@@ -73,7 +73,7 @@ function retain(snapshots, policy = RETENTION) {
 /**
  * @param {{ store: { put(key, bytes), get(key): Promise<Buffer|null>, list(prefix): Promise<string[]>, delete(key) },
  *           key: Buffer, paths: string[], fs?: typeof import('node:fs'), now?: () => number,
- *           snapshotFile?: (absPath: string) => Promise<Buffer|null> }} deps
+ *           snapshotFile?: (absPath: string) => Promise<{path: string, cleanup: () => void}|null> }} deps
  */
 function createOffsiteBackup({ store, key, paths, fs = nodeFs, now = Date.now, snapshotFile = null, log = () => {} }) {
   const keys = deriveKeys(key);
@@ -109,14 +109,7 @@ function createOffsiteBackup({ store, key, paths, fs = nodeFs, now = Date.now, s
 
   // Yields a file's content in CHUNK-sized pieces (an empty file yields one empty piece, so it
   // still has a chunk list). Only one piece is in memory at a time.
-  async function* readPieces(abs, snap) {
-    if (snap) {
-      for (let offset = 0; offset < snap.length || offset === 0; offset += CHUNK) {
-        yield snap.subarray(offset, offset + CHUNK);
-        if (snap.length === 0) return;
-      }
-      return;
-    }
+  async function* readPieces(abs) {
     const fd = fs.openSync(abs, 'r');
     try {
       let first = true;
@@ -135,7 +128,7 @@ function createOffsiteBackup({ store, key, paths, fs = nodeFs, now = Date.now, s
     } finally { fs.closeSync(fd); }
   }
 
-  async function backup() {
+  async function backup({ signal } = {}) {
     if (running) throw fail('A backup is already running.', 409);
     running = (async () => {
       await ensureConfig();
@@ -145,8 +138,9 @@ function createOffsiteBackup({ store, key, paths, fs = nodeFs, now = Date.now, s
       const isSqlite = (abs) => /\.(db|sqlite3?)$/.test(abs);
       for (const [index, root] of paths.entries()) {
         for (const abs of walk(root)) {
-          // A snapshot hook hands back a Buffer (a consistent sqlite copy); anything else is
-          // streamed from disk CHUNK bytes at a time, so a large file is never held whole (#139).
+          signal?.throwIfAborted();
+          // Live SQLite files must be read from a consistent on-disk snapshot. The hook owns
+          // its temporary copy until cleanup; both copies and ordinary files use CHUNK reads.
           let snap = null;
           if (snapshotFile && isSqlite(abs)) {
             // A live .db/.sqlite file must never be raw-read: without a
@@ -155,35 +149,47 @@ function createOffsiteBackup({ store, key, paths, fs = nodeFs, now = Date.now, s
             // being unusable. Skip the file and flag the manifest instead of
             // silently falling back to a raw read.
             try { snap = await snapshotFile(abs); } catch { snap = null; }
-            if (!snap) {
+            if (!snap?.path || typeof snap.cleanup !== 'function') {
+              snap?.cleanup?.();
               log({ event: 'offsite.snapshot.skip', path: abs, reason: 'sqlite-snapshot-failed' });
               incomplete = true;
               continue;
             }
-          } else if (snapshotFile) {
-            try { snap = await snapshotFile(abs); } catch { continue; }
           }
-          const stat = fs.statSync(abs, { throwIfNoEntry: false });
-          const chunks = [];
-          const whole = crypto.createHash('sha256');
-          let size = 0;
-          const store1 = async (piece) => {
-            const id = chunkId(piece);
-            if (!known.has(id)) { await store.put(dataKey(id), seal(keys, piece)); known.add(id); uploaded++; bytes += piece.length; }
-            chunks.push(id);
-            whole.update(piece); size += piece.length;
-          };
           try {
-            for await (const piece of readPieces(abs, snap)) await store1(piece);
-          } catch (err) {
-            // A file that vanished or became unreadable is skipped, as a failed read always was;
-            // any chunks it already uploaded are unreferenced and go at the next forget().
-            if (err && typeof err.code === 'string') { log({ event: 'offsite.read.skip', path: abs, code: err.code }); continue; }
-            throw err;
+            signal?.throwIfAborted();
+            const stat = fs.statSync(abs, { throwIfNoEntry: false });
+            const chunks = [];
+            const whole = crypto.createHash('sha256');
+            let size = 0;
+            const store1 = async (piece) => {
+              const id = chunkId(piece);
+              if (!known.has(id)) { await store.put(dataKey(id), seal(keys, piece)); known.add(id); uploaded++; bytes += piece.length; }
+              signal?.throwIfAborted();
+              chunks.push(id);
+              whole.update(piece); size += piece.length;
+            };
+            try {
+              for await (const piece of readPieces(snap ? snap.path : abs)) await store1(piece);
+            } catch (err) {
+              // A file that vanished or became unreadable is skipped. Uploaded chunks without
+              // a manifest reference are pruned by forget(). Never retry a live SQLite read.
+              // An abort reason can carry a string code (for example ABORT_ERR); it must
+              // always stop the backup rather than publishing an incomplete manifest.
+              if (signal?.aborted) signal.throwIfAborted();
+              if (err && typeof err.code === 'string') {
+                log({ event: 'offsite.read.skip', path: abs, code: err.code });
+                if (snap) incomplete = true;
+                continue;
+              }
+              throw err;
+            }
+            files.push({ root: index, path: nodePath.relative(root, abs).split(nodePath.sep).join('/'), size,
+              mode: stat ? stat.mode & 0o777 : 0o600, mtime: stat ? Math.round(stat.mtimeMs) : 0,
+              sha256: whole.digest('hex'), chunks });
+          } finally {
+            snap?.cleanup();
           }
-          files.push({ root: index, path: nodePath.relative(root, abs).split(nodePath.sep).join('/'), size,
-            mode: stat ? stat.mode & 0o777 : 0o600, mtime: stat ? Math.round(stat.mtimeMs) : 0,
-            sha256: whole.digest('hex'), chunks });
         }
       }
       const time = now();

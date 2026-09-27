@@ -2,6 +2,7 @@
 const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path'), http = require('node:http'), crypto = require('node:crypto');
 const { createOffsiteBackup, retain, loadKey, seal, open, deriveKeys } = require('./offsite-backup.cjs');
+const { sqliteSnapshot } = require('./offsite-service.cjs');
 const { createS3Store } = require('./offsite-s3.cjs');
 
 const memoryStore = () => { const m = new Map(); return { m, put: async (k, v) => { m.set(k, Buffer.from(v)); }, get: async (k) => m.get(k) || null, list: async (p) => [...m.keys()].filter((k) => k.startsWith(p)), delete: async (k) => { m.delete(k); } }; };
@@ -95,6 +96,94 @@ test('a failed sqlite snapshot is skipped, not raw-copied, and flags the manifes
   assert.equal(fs.existsSync(path.join(target, '0', 'auth.db')), false, 'the torn live .db must never be copied raw');
   const list = await b.snapshots();
   assert.equal(list[0].incomplete, true);
+});
+
+test('SQLite online snapshots stream in bounded reads, restore consistently, and clean up on success, failure or abort', async (t) => {
+  const Database = require('better-sqlite3');
+  const { CHUNK } = require('./offsite-backup.cjs');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-offsite-sqlite-stream-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const data = path.join(root, 'data'); fs.mkdirSync(data);
+  const live = path.join(data, 'live.db');
+  const db = new Database(live);
+  db.pragma('journal_mode = WAL');
+  db.exec(`CREATE TABLE t (payload BLOB); INSERT INTO t VALUES (zeroblob(${CHUNK * 2 + 123}));`);
+  let snapshotPath, cleanups = 0, maxRead = 0;
+  const snapshotFile = async (abs) => {
+    const snap = await sqliteSnapshot(abs);
+    snapshotPath = snap.path;
+    return { path: snap.path, cleanup: () => { snap.cleanup(); cleanups++; } };
+  };
+  const guarded = { ...fs,
+    readFileSync: (name, ...args) => {
+      if (name === live || name === snapshotPath) throw Error('whole SQLite file read');
+      return fs.readFileSync(name, ...args);
+    },
+    readSync: (fd, buffer, offset, length, position) => {
+      maxRead = Math.max(maxRead, length);
+      return fs.readSync(fd, buffer, offset, length, position);
+    },
+  };
+  const store = memoryStore();
+  const backup = createOffsiteBackup({ store, key: KEY, paths: [data], fs: guarded, snapshotFile });
+  const result = await backup.backup();
+  assert.equal(result.incomplete, false);
+  assert.equal(result.files, 1);
+  assert.ok(result.uploadedChunks >= 3);
+  assert.ok(maxRead <= CHUNK, `largest requested read was ${maxRead}`);
+  assert.equal(cleanups, 1);
+  assert.equal(fs.existsSync(snapshotPath), false);
+  const target = path.join(root, 'restore');
+  await backup.restore(result.id, target);
+  const restored = new Database(path.join(target, '0', 'live.db'), { readonly: true });
+  assert.equal(restored.prepare('SELECT length(payload) AS bytes FROM t').get().bytes, CHUNK * 2 + 123);
+  restored.close();
+
+  const failingStore = { ...memoryStore(), put: async (key) => {
+    if (key.startsWith('data/')) throw Error('synthetic upload failure');
+  } };
+  const failingBackup = createOffsiteBackup({ store: failingStore, key: KEY, paths: [data], snapshotFile });
+  await assert.rejects(() => failingBackup.backup(), /synthetic upload failure/);
+  assert.equal(cleanups, 2, 'upload failure cleans up the snapshot');
+  assert.equal(fs.existsSync(snapshotPath), false);
+
+  const controller = new AbortController();
+  const cancelStore = { ...memoryStore(), put: async (key) => {
+    if (key.startsWith('data/')) controller.abort();
+  } };
+  const cancelBackup = createOffsiteBackup({ store: cancelStore, key: KEY, paths: [data], snapshotFile });
+  await assert.rejects(() => cancelBackup.backup({ signal: controller.signal }), { name: 'AbortError' });
+  assert.equal(cleanups, 3, 'cancellation cleans up the snapshot');
+  assert.equal(fs.existsSync(snapshotPath), false);
+
+  const readGuard = { ...fs, openSync: (name, ...args) => {
+    if (name === live) throw Error('raw live SQLite read');
+    if (name === snapshotPath) throw Object.assign(Error('synthetic snapshot read failure'), { code: 'EIO' });
+    return fs.openSync(name, ...args);
+  } };
+  const readFailure = createOffsiteBackup({ store: memoryStore(), key: KEY, paths: [data], fs: readGuard, snapshotFile });
+  const skipped = await readFailure.backup();
+  assert.equal(skipped.incomplete, true);
+  assert.equal(skipped.files, 0, 'a failed snapshot read is not replaced by the live database');
+  assert.equal(cleanups, 4, 'snapshot read failure cleans up the snapshot');
+  assert.equal(fs.existsSync(snapshotPath), false);
+
+  const codedController = new AbortController();
+  const codedReason = Object.assign(Error('synthetic coded cancellation'), { code: 'ABORT_ERR' });
+  const codedStore = memoryStore();
+  const put = codedStore.put;
+  let dataPuts = 0;
+  codedStore.put = async (key, value) => {
+    await put(key, value);
+    if (key.startsWith('data/') && ++dataPuts === 3) codedController.abort(codedReason);
+  };
+  const codedBackup = createOffsiteBackup({ store: codedStore, key: KEY, paths: [data], snapshotFile });
+  await assert.rejects(() => codedBackup.backup({ signal: codedController.signal }), (err) => err === codedReason);
+  assert.equal(dataPuts, 3, 'abort happens during the final file chunk upload');
+  assert.equal([...codedStore.m.keys()].some((key) => key.startsWith('snapshots/')), false, 'no manifest is published');
+  assert.equal(cleanups, 5, 'coded cancellation cleans up the snapshot');
+  assert.equal(fs.existsSync(snapshotPath), false);
+  db.close();
 });
 
 test('a corrupt manifest is skipped by snapshots(), not thrown', async (t) => {

@@ -31,17 +31,21 @@ function checkDestination(dir, paths, fsImpl = fs) {
   return real;
 }
 
-/** A consistent copy of a live SQLite database via the online backup API. */
+/** A consistent on-disk copy of a live SQLite database via the online backup API. */
 async function sqliteSnapshot(abs) {
   if (!/\.(db|sqlite3?)$/.test(abs)) return null;
   const Database = require('better-sqlite3');
-  const tmp = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-sqlite-')), 'copy.db');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-sqlite-'));
+  const tmp = path.join(dir, 'copy.db');
   let db;
   try {
     db = new Database(abs, { readonly: true, fileMustExist: true });
     await db.backup(tmp);
-    return fs.readFileSync(tmp);
-  } catch { return null; } finally { try { db?.close(); } catch { /* closed */ } fs.rmSync(path.dirname(tmp), { recursive: true, force: true }); }
+    return { path: tmp, cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
+  } catch {
+    fs.rmSync(dir, { recursive: true, force: true });
+    return null;
+  } finally { try { db?.close(); } catch { /* closed */ } }
 }
 
 /**

@@ -172,9 +172,12 @@ test('sqlite snapshot copies a live database consistently', async (t) => {
   db.exec("CREATE TABLE t(v TEXT); INSERT INTO t VALUES ('synthetic')");
   const copy = await sqliteSnapshot(file);
   db.close();
-  const restored = path.join(dir, 'restored.db'); fs.writeFileSync(restored, copy);
-  const check = new Database(restored, { readonly: true });
+  assert.ok(copy.path.endsWith('copy.db'));
+  assert.equal(fs.existsSync(copy.path), true);
+  const check = new Database(copy.path, { readonly: true });
   assert.equal(check.prepare('SELECT v FROM t').get().v, 'synthetic', 'WAL content is included');
   check.close();
+  copy.cleanup();
+  assert.equal(fs.existsSync(copy.path), false, 'temporary snapshot is removed by its owner');
   assert.equal(await sqliteSnapshot(path.join(dir, 'notes.json')), null);
 });
