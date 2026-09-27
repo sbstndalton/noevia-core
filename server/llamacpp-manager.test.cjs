@@ -169,6 +169,111 @@ test('with RAG rerank on, the reranker also stays beside the chat model',async()
  }finally{for(const k of keys){if(prev[k]===undefined)delete process.env[k];else process.env[k]=prev[k];}}
 });
 
+test('concurrent distinct native loads serialize eviction and admission',async()=>{
+ const calls=[],state={alpha:'unloaded',beta:'unloaded'};
+ const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async(url,options={})=>{
+  const route=new URL(url).pathname,body=options.body?JSON.parse(options.body):{};
+  calls.push(`${options.method||'GET'} ${route}${body.model?' '+body.model:''}`);
+  if(route==='/models')return {ok:true,status:200,body:{data:Object.entries(state).map(([id,value])=>({id,status:{value}}))}};
+  if(route==='/models/unload'){state[body.model]='unloaded';return {ok:true,status:200,body:{success:true}};}
+  if(route==='/models/load'){state[body.model]='loaded';return {ok:true,status:200,body:{success:true}};}
+  throw Error(`Unexpected route ${route}`);
+ }});
+ const results=await Promise.all([manager.load('alpha'),manager.load('beta')]);
+ assert.ok(results.every(r=>r.ok));
+ assert.deepEqual(state,{alpha:'unloaded',beta:'loaded'});
+ assert.ok(calls.indexOf('POST /models/unload alpha')<calls.indexOf('POST /models/load beta'));
+});
+
+test('a failed or unconfirmed eviction stops native admission, including the chat preflight',async()=>{
+ for(const confirm of [false,true]){
+  const calls=[];
+  const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async(url,options={})=>{
+   const route=new URL(url).pathname,body=options.body?JSON.parse(options.body):{};
+   calls.push(`${options.method||'GET'} ${route}${body.model?' '+body.model:''}`);
+   if(route==='/models')return {ok:true,status:200,body:{data:[{id:'alpha',status:{value:'loaded'}},{id:'beta',status:{value:'unloaded'}}]}};
+   if(route==='/models/unload')return {ok:confirm,status:confirm?200:409,body:{success:confirm}};
+   if(route==='/models/load')throw Error('must not load after failed eviction');
+   throw Error(`Unexpected route ${route}`);
+  }});
+  const result=await manager.load('beta');
+  assert.equal(result.ok,false);
+  assert.equal(result.status,409);
+  await assert.rejects(manager.makeRoomFor('beta'),{status:409});
+  assert.equal(calls.some(c=>c==='POST /models/load beta'),false);
+ }
+});
+
+test('a newly appearing loaded model after eviction blocks native admission',async()=>{
+ const calls=[],state={alpha:'loaded',beta:'unloaded'};
+ const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async(url,options={})=>{
+  const route=new URL(url).pathname,body=options.body?JSON.parse(options.body):{};
+  calls.push(`${options.method||'GET'} ${route}${body.model?' '+body.model:''}`);
+  if(route==='/models')return {ok:true,status:200,body:{data:Object.entries(state).map(([id,value])=>({id,status:{value}}))}};
+  if(route==='/models/unload'){
+   assert.equal(body.model,'alpha');state.alpha='unloaded';state.gamma='loaded';
+   return {ok:true,status:200,body:{success:true}};
+  }
+  if(route==='/models/load')throw Error('must not admit while a newly appearing model is loaded');
+  throw Error(`Unexpected route ${route}`);
+ }});
+ const result=await manager.load('beta');
+ assert.equal(result.ok,false);assert.equal(result.status,409);
+ assert.deepEqual(calls,['GET /models','POST /models/unload alpha','GET /models']);
+});
+
+test('a queued native load observes cancellation before it can evict or load',async()=>{
+ let releaseFirst;const holdFirst=new Promise(resolve=>{releaseFirst=resolve;});
+ let firstStarted;const firstPost=new Promise(resolve=>{firstStarted=resolve;});
+ const calls=[],state={alpha:'unloaded',beta:'unloaded'};
+ const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async(url,options={})=>{
+  const route=new URL(url).pathname,body=options.body?JSON.parse(options.body):{};
+  calls.push(`${options.method||'GET'} ${route}${body.model?' '+body.model:''}`);
+  if(route==='/models')return {ok:true,status:200,body:{data:Object.entries(state).map(([id,value])=>({id,status:{value}}))}};
+  if(route==='/models/load'&&body.model==='alpha'){firstStarted();await holdFirst;state.alpha='loaded';return {ok:true,status:200,body:{success:true}};}
+  if(route==='/models/unload'){state[body.model]='unloaded';return {ok:true,status:200,body:{success:true}};}
+  if(route==='/models/load'&&body.model==='beta'){state.beta='loaded';return {ok:true,status:200,body:{success:true}};}
+  throw Error(`Unexpected route ${route}`);
+ }});
+ const first=manager.load('alpha');await firstPost;
+ const controller=new AbortController();
+ const second=manager.load('beta',{},controller.signal);
+ controller.abort();
+ await assert.rejects(second,{name:'AbortError'});
+ assert.deepEqual(calls,['GET /models','POST /models/load alpha'],'cancellation settles while the first load is held');
+ const third=manager.load('beta');
+ await new Promise(resolve=>setImmediate(resolve));
+ assert.deepEqual(calls,['GET /models','POST /models/load alpha'],'later admissions cannot pass the held first load or cancelled queue slot');
+ releaseFirst();
+ assert.equal((await first).ok,true);
+ assert.equal((await third).ok,true);
+ assert.equal(calls.filter(c=>c==='POST /models/load beta').length,1);
+ assert.ok(calls.indexOf('POST /models/unload alpha')<calls.indexOf('POST /models/load beta'));
+});
+
+test('chat room checks and explicit unload wait for a pending native admission',async()=>{
+ let releaseFirst;const holdFirst=new Promise(resolve=>{releaseFirst=resolve;});
+ let firstStarted;const firstPost=new Promise(resolve=>{firstStarted=resolve;});
+ const calls=[],state={alpha:'unloaded',beta:'unloaded'};
+ const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async(url,options={})=>{
+  const route=new URL(url).pathname,body=options.body?JSON.parse(options.body):{};
+  calls.push(`${options.method||'GET'} ${route}${body.model?' '+body.model:''}`);
+  if(route==='/models')return {ok:true,status:200,body:{data:Object.entries(state).map(([id,value])=>({id,status:{value}}))}};
+  if(route==='/models/load'){firstStarted();await holdFirst;state[body.model]='loaded';return {ok:true,status:200,body:{success:true}};}
+  if(route==='/models/unload'){state[body.model]='unloaded';return {ok:true,status:200,body:{success:true}};}
+  throw Error(`Unexpected route ${route}`);
+ }});
+ const loading=manager.load('alpha');await firstPost;
+ const room=manager.makeRoomFor('beta');
+ const explicit=manager.unload('alpha');
+ assert.deepEqual(calls,['GET /models','POST /models/load alpha'],'neither later operation reaches the router while admission is pending');
+ releaseFirst();
+ assert.equal((await loading).ok,true);
+ await room;
+ assert.equal((await explicit).ok,true);
+ assert.ok(calls.indexOf('POST /models/unload alpha')>calls.indexOf('POST /models/load alpha'));
+});
+
 // removeModel (#302 follow-up): unload and delete inside a single mutate() gate, with the
 // delete retried once (after one more unload attempt) if the router refuses it the first time.
 test('removeModel unloads then deletes as one call, and reports unloaded:true on success',async()=>{

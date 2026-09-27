@@ -594,7 +594,7 @@ function createChatHandler({
     try {
       // Native engine: free the GPU of any other chat model before this one loads (it holds two
       // models so the embedding model can stay beside the chat model; two chat models do not fit).
-      if(provider.id===DEFAULT_PROVIDER_ID&&typeof modelManager.makeRoomFor==='function')await modelManager.makeRoomFor(model);
+      if(provider.id===DEFAULT_PROVIDER_ID&&typeof modelManager.makeRoomFor==='function')await modelManager.makeRoomFor(model,undefined,chatSignal.signal);
       ({limit,limitSource}=await context.resolveRuntimeLimit({
         manager:provider.id===DEFAULT_PROVIDER_ID?modelManager:null,model,dir:chatWorkspace.dir,
         scope:require('node:crypto').createHash('sha256').update(JSON.stringify([provider.baseUrl,provider.apiKey,modelManager.baseUrl])).digest('hex'),

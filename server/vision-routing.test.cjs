@@ -49,6 +49,7 @@ async function run({ visionModel, probeStatus = 200, descriptionStatus = 200, mi
   if(native)context.modelManager=require('./model-manager.cjs').createModelManager({kind:'llamacpp',baseUrl:'http://fixture.invalid',fetchJson:async(url,options)=>{
     nativeCalls.push(url);
     if(url.endsWith('/models/load'))nativeLoaded=JSON.parse(options.body).model;
+    if(url.endsWith('/models/unload'))nativeLoaded=null;
     if(url.includes('/props?'))assert.equal(new URL(url).searchParams.get('autoload'),'false');
     return {ok:true,status:200,body:url.includes('/props?')?{default_generation_settings:{n_ctx:32768},total_slots:1}:{data:['answer-model','vision-model'].map(id=>({id,status:{value:id===nativeLoaded?'loaded':'unloaded'}}))}};
   }});

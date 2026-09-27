@@ -42,6 +42,31 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
   const presets=store ? {...store,commit:candidate=>commitReconciled(store,candidate)} : null;
   const maintenance=require('./inference-maintenance.cjs').createMaintenanceGate();
   async function mutate(fn) {const leave=maintenance.enter();try{return await fn();}finally{leave();}}
+  // Serialize only admission/eviction, never the inference that follows it.
+  let admission = Promise.resolve();
+  async function withAdmission(work, signal) {
+    signal?.throwIfAborted();
+    const previous = admission;
+    let release;
+    admission = new Promise(resolve => { release = resolve; });
+    let onAbort, acquired = false;
+    const cancelled = signal && new Promise((_, reject) => {
+      onAbort = () => reject(signal.reason);
+      signal.addEventListener('abort', onAbort, { once: true });
+      if (signal.aborted) onAbort();
+    });
+    try {
+      await (cancelled ? Promise.race([previous, cancelled]) : previous);
+      acquired = true;
+      signal?.throwIfAborted();
+      return await work();
+    } finally {
+      if (onAbort) signal.removeEventListener('abort', onAbort);
+      // An aborted waiter returns promptly, but its queue slot remains behind the previous
+      // operation until that operation finishes; later admissions cannot overtake it.
+      if (acquired) release(); else void previous.then(release);
+    }
+  }
   async function listModels() {
     const response = await rawModels();
     if (!response.ok) return response;
@@ -83,32 +108,53 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
   // The engine keeps two models so the small embedding model can sit beside the chat model
   // (tool routing, 2026-09-19). Two CHAT models would not fit the GPU, so before a chat model is
   // used, any other loaded model except those in `keep` is unloaded first.
-  async function makeRoomFor(model, keep = keepAlongside()) {
-    const listing = await rawModels().catch(() => null);
-    if (!listing?.ok || !Array.isArray(listing.body?.data)) return;
+  const admissionError = message => Object.assign(Error(message), { status: 409, publicMessage: message });
+  async function makeRoomForUnlocked(model, keep, signal) {
+    const listing = await rawModels(signal);
+    if (!listing.ok || !Array.isArray(listing.body?.data)) throw admissionError('Could not check loaded models before switching. Try again.');
     const others = listing.body.data.filter((m) => m.id !== model && !keep.includes(m.id) && ['loaded', 'loading'].includes(m.status?.value));
-    for (const m of others) await post('/models/unload', { model: m.id }, 60000).catch(() => null);
+    for (const m of others) {
+      signal?.throwIfAborted();
+      const result = await post('/models/unload', { model: m.id }, 60000, signal);
+      if (!result.ok) throw admissionError('Another model could not be unloaded. Try again when it is idle.');
+    }
+    if (others.length) {
+      const updated = await rawModels(signal);
+      if (!updated.ok || !Array.isArray(updated.body?.data) || updated.body.data.some(m => m.id !== model && !keep.includes(m.id) && ['loaded', 'loading'].includes(m.status?.value))) {
+        throw admissionError('Another model is still loaded. Try again when it is idle.');
+      }
+    }
+  }
+  async function makeRoomFor(model, keep = keepAlongside(), signal) {
+    return withAdmission(() => makeRoomForUnlocked(model, keep, signal), signal);
   }
   async function load(model, options = {}, signal) {
     if (Object.keys(options).length) return unsupported('Runtime option changes; configure a native model preset');
     const leave=maintenance.enter();
     try {
-      signal?.throwIfAborted();
-      await makeRoomFor(model);
-      const started=await post('/models/load', { model },120000,signal);
-      if(!started.ok)return started;
-      // Native load acknowledges launch; readiness must be observed separately.
-      const deadline=Date.now()+120000;
-      while(Date.now()<deadline) {
+      return await withAdmission(async () => {
         signal?.throwIfAborted();
-        const listing=await rawModels(signal);
-        if(!listing.ok)return listing;
-        const entry=listing.body?.data?.find(m=>m.id===model);
-        if(entry?.status?.value==='loaded')return started;
-        if(!entry || entry.status?.failed || entry.status?.value==='unloaded')return {ok:false,status:502,body:{error:'The native model failed to become ready. Check its artifact and preset.'}};
-        await new Promise(resolve=>setTimeout(resolve,200));
-      }
-      return {ok:false,status:504,body:{error:'Native model loading is still unconfirmed. Check its status before retrying.'}};
+        try { await makeRoomForUnlocked(model, keepAlongside(), signal); }
+        catch (error) {
+          if (signal?.aborted) throw error;
+          return {ok:false,status:error.status || 502,body:{error:error.publicMessage || 'Could not make room for the selected model.'}};
+        }
+        signal?.throwIfAborted();
+        const started=await post('/models/load', { model },120000,signal);
+        if(!started.ok)return started;
+        // Native load acknowledges launch; readiness must be observed separately.
+        const deadline=Date.now()+120000;
+        while(Date.now()<deadline) {
+          signal?.throwIfAborted();
+          const listing=await rawModels(signal);
+          if(!listing.ok)return listing;
+          const entry=listing.body?.data?.find(m=>m.id===model);
+          if(entry?.status?.value==='loaded')return started;
+          if(!entry || entry.status?.failed || entry.status?.value==='unloaded')return {ok:false,status:502,body:{error:'The native model failed to become ready. Check its artifact and preset.'}};
+          await new Promise(resolve=>setTimeout(resolve,200));
+        }
+        return {ok:false,status:504,body:{error:'Native model loading is still unconfirmed. Check its status before retrying.'}};
+      }, signal);
     }finally{leave();}
   }
   async function downloads() {
@@ -364,7 +410,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     evidence, recordEvidence, importEvidence,
     calibration: calibrator ? { start: calibrator.start, cancel: calibrator.cancel, status: calibrator.status, recover: calibrator.recover } : null,
     autotune: autotuner ? { start: autotuner.start, resume: autotuner.resume, cancel: autotuner.cancel, status: autotuner.status, recover: autotuner.recover, untuned: autotuner.untuned } : null,
-    unload: model => mutate(()=>post('/models/unload', { model })),
+    unload: model => mutate(()=>withAdmission(()=>post('/models/unload', { model }))),
     pull: ({ checkpoint }) => mutate(async () => {
       if (!/^[\w.-]+\/[\w.-]+(?::[\w.-]+)?$/.test(checkpoint || '')) return { ok: false, status: 400, body: { error: 'Choose a Hugging Face repository and quantization' } };
       tracker.requested(checkpoint);
@@ -372,13 +418,10 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
       if(!response.ok)tracker.rejected(checkpoint);
       return response.ok ? { ...response, body: { ...response.body, id: checkpoint, modelName: checkpoint } } : response;
     }),
-    deleteModel: model => mutate(async () => { const r = await request('/models?model=' + encodeURIComponent(model), { method: 'DELETE' }, 60000); if (r.ok) identityCache.delete(model); return r; }),
-    // Unload-then-delete as ONE mutate() gate, so an on-demand load triggered by another
-    // request cannot slip in between the two the way it could with separate unload()/
-    // deleteModel() calls. If the delete is still refused (busy, or a load raced in despite
-    // the gate — the router itself can start one outside this process's control), retry the
-    // unload once more and try the delete again before giving up.
-    removeModel: model => mutate(async () => {
+    deleteModel: model => mutate(()=>withAdmission(async () => { const r = await request('/models?model=' + encodeURIComponent(model), { method: 'DELETE' }, 60000); if (r.ok) identityCache.delete(model); return r; })),
+    // Hold web admission across unload and delete. The router can still receive a load from
+    // another client outside this process, so retry once if deletion is refused.
+    removeModel: model => mutate(()=>withAdmission(async () => {
       let unloaded = !!(await post('/models/unload', { model }).catch(() => null))?.ok;
       let del = await request('/models?model=' + encodeURIComponent(model), { method: 'DELETE' }, 60000);
       if (!del.ok) {
@@ -387,7 +430,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
       }
       if (del.ok) identityCache.delete(model);
       return { ...del, unloaded };
-    }),
+    })),
     // Exposed so callers that delete a model's files through a different path (the raw
     // model-manager folder-scan proxy, routes/models.cjs) can still drop its cached identity.
     forgetIdentity: model => identityCache.delete(model),
