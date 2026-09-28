@@ -340,12 +340,17 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     if(evidenceStore)identityCache.set(model,{at:Date.now(),value:live});
     const records=evidenceStore?evidenceStore.list():[];
     const importLib=require('./model-evidence-import.cjs');
-    const external=importLib.deriveExternal(records,{model,artifactHash:live?.identity?.artifact?importLib.artifactIdentityHash(live.identity.artifact):null});
+    const artifactHash=live?.identity?.artifact?importLib.artifactIdentityHash(live.identity.artifact):null;
+    const external=importLib.deriveExternal(records,{model,artifactHash});
+    const sampling=importLib.deriveSampling(records,{model,artifactHash});
     return {ok:true,status:200,body:{model,tracked:!!evidenceStore,identityHash:live?.identityHash||null,
       categories:evidenceLib.CATEGORIES.map(category=>{const d=evidenceLib.derive(records,{model,category,liveHash:live?.identityHash||null});
         return {category,state:d.state,value:d.record?.value??null,result:d.record?.result??null,at:d.record?.at??null,suite:d.record?.suite??null,limitations:d.record?.limitations||[]};}),
       external:{category:'external_model_card',state:external.state,value:external.record?.value??null,at:external.record?.at??null,suite:external.record?.suite??null,
-        provenance:external.record?.provenance??null,limitations:external.record?.limitations||[]}}};
+        provenance:external.record?.provenance??null,limitations:external.record?.limitations||[]},
+      samplingRecommendation:{state:sampling.state,values:sampling.state==='reported'?sampling.record?.value??null:null,
+        source:sampling.record?'generation_config.json':null,provenance:sampling.record?.provenance??null,
+        limitations:sampling.record?.limitations||[]}}};
   }
   // Best-effort import of attributable model-card evidence for one model (#266). The
   // checkpoint (HF repo) equals the llama.cpp model id for a pulled model; a locally

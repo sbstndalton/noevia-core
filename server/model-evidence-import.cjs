@@ -18,6 +18,7 @@ const CHECKPOINT_RE = /^[\w.-]+\/[\w.-]+(?::[\w.-]+)?$/;
 const DOT_ONLY = /^\.+$/;
 const MAX_FIELD = 2000;
 const MAX_LIST = 8;
+const FULL_REVISION_RE = /^[a-f0-9]{40}$/i;
 
 // Strip HTML/markup and control characters, collapse whitespace, and cap length. Model-card
 // text is untrusted third-party content; it is stored and later rendered as plain text, so it
@@ -60,6 +61,56 @@ function hostAllowed(rawUrl) {
   } catch {
     return false;
   }
+}
+
+// A generation config is read only from the card's full, immutable commit. Never
+// use a moving branch or an admin-supplied file path for sampling provenance.
+function generationConfigUrl(repo, revision) {
+  if (repoFromCheckpoint(repo) !== repo || !FULL_REVISION_RE.test(String(revision || ''))) return null;
+  // HF's public /resolve/ URL redirects to this same-origin cache endpoint for
+  // small JSON files. Use the pinned cache path directly so fetchJson can keep
+  // rejecting redirects instead of following one to an unchecked destination.
+  return `https://huggingface.co/api/resolve-cache/models/${repo.split('/').map(encodeURIComponent).join('/')}/${revision}/generation_config.json`;
+}
+function samplingUrlAllowed(rawUrl, repo, revision) {
+  const expected = generationConfigUrl(repo, revision);
+  return !!expected && rawUrl === expected;
+}
+
+// Structured source values only. A model card's free-form prose and unknown JSON
+// fields are deliberately excluded because they can describe multiple modes or
+// incompatible runtimes. These are reported priors, not validated local settings.
+function normalizeGenerationConfig(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body) || body.do_sample === false ||
+      (Object.hasOwn(body, 'do_sample') && body.do_sample !== true) ||
+      (Object.hasOwn(body, 'num_beams') && body.num_beams !== 1)) return null;
+  const valid = require('./sampling-presets.cjs').validSamplingValue;
+  const values = {};
+  for (const key of ['temperature', 'top_p', 'top_k', 'min_p']) {
+    const value = body[key];
+    if (key === 'min_p' ? typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1
+      : valid(key, value) && (key !== 'top_k' || value <= 100000)) values[key] = value;
+  }
+  if (valid('repeat_penalty', body.repetition_penalty)) values.repeat_penalty = body.repetition_penalty;
+  return Object.keys(values).length ? values : null;
+}
+
+async function fetchSamplingConfigEvidence({ repo, revision, artifact, fetchJson, now = () => Date.now() }) {
+  const url = generationConfigUrl(repo, revision);
+  if (!url || !artifact || !samplingUrlAllowed(url, repo, revision)) return { ok: false, reason: 'sampling source unavailable' };
+  let response;
+  try { response = await fetchJson(url, { redirect: 'error' }, 15000, 64 * 1024); }
+  catch { return { ok: false, reason: 'sampling fetch failed' }; }
+  if (!response?.ok) return { ok: false, reason: `sampling source responded ${response?.status ?? 'error'}`, definitive: response?.status === 404 };
+  const value = normalizeGenerationConfig(response.body);
+  if (!value) return { ok: false, reason: 'no supported sampling values', definitive: true };
+  return { ok: true, record: {
+    category: 'external_sampling_config', result: 'reported', identityHash: artifactIdentityHash(artifact), value,
+    suite: { name: 'huggingface-generation-config', version: 1 }, source: 'external',
+    provenance: { sourceUrl: url, retrievedAt: now(), revision, artifactIdentityHash: artifactIdentityHash(artifact) },
+    limitations: ['Source-reported generation config, not measured locally or applied to the model',
+      'Values may describe the source weights rather than this GGUF conversion or runtime'],
+  } };
 }
 
 // Public model-card fields worth recording, matched against the standard HF card schema
@@ -180,8 +231,29 @@ async function importModelEvidence({ model, checkpoint, artifact, fetchJson, sto
   if (!fetched.ok || !store) return fetched;
   const entry = { model, ...fetched.record };
   const newest = store.list().filter((r) => r.model === model && r.category === entry.category && r.identityHash === entry.identityHash).at(-1);
-  if (newest && cardContentKey(newest.value) === cardContentKey(entry.value)) return { ok: true, record: newest };
-  return { ok: true, record: store.append(entry) };
+  const record = newest && cardContentKey(newest.value) === cardContentKey(entry.value) ? newest : store.append(entry);
+  const sampling = await fetchSamplingConfigEvidence({ repo: fetched.record.value.repo, revision: fetched.record.value.revision,
+    artifact, fetchJson, now });
+  if (!sampling.ok) {
+    // A definite source removal or switch to non-sampling decoding must not leave
+    // a previously imported value looking current. Transient network/5xx failures
+    // retain the last reported source claim; they never create a recommendation.
+    const old = store.list().filter((r) => r.model === model && r.category === 'external_sampling_config' &&
+      r.identityHash === entry.identityHash).at(-1);
+    if (sampling.definitive && old && old.value !== null) store.append({ model, category: 'external_sampling_config',
+      result: 'reported', identityHash: entry.identityHash, value: null, source: 'external',
+      suite: { name: 'huggingface-generation-config', version: 1 },
+      provenance: { sourceUrl: generationConfigUrl(fetched.record.value.repo, fetched.record.value.revision),
+        retrievedAt: typeof now === 'function' ? now() : Date.now(), revision: fetched.record.value.revision,
+        artifactIdentityHash: entry.identityHash },
+      limitations: ['Current source config has no supported sampling recommendation; previous source values were retired'] });
+    return { ok: true, record };
+  }
+  const samplingEntry = { model, ...sampling.record };
+  const latestSampling = store.list().filter((r) => r.model === model && r.category === samplingEntry.category && r.identityHash === samplingEntry.identityHash).at(-1);
+  const samplingRecord = latestSampling && JSON.stringify(latestSampling.value) === JSON.stringify(samplingEntry.value)
+    ? latestSampling : store.append(samplingEntry);
+  return { ok: true, record, samplingRecord };
 }
 
 // State for one model's external evidence against its current artifact. Unlike
@@ -199,6 +271,14 @@ function deriveExternal(records, { model, artifactHash }) {
   return { state: 'unverified', record: null };
 }
 
+function deriveSampling(records, { model, artifactHash }) {
+  const mine = (records || []).filter((r) => r.model === model && r.category === 'external_sampling_config');
+  if (!artifactHash) return { state: 'unavailable', record: mine.at(-1) || null };
+  const newest = mine.filter((r) => r.identityHash === artifactHash).at(-1);
+  if (newest) return { state: newest.value === null ? 'unverified' : 'reported', record: newest };
+  return mine.length ? { state: 'stale', record: mine.at(-1) } : { state: 'unverified', record: null };
+}
+
 module.exports = {
   sanitizeText,
   repoFromCheckpoint,
@@ -210,5 +290,10 @@ module.exports = {
   resolveCheckpoint,
   importModelEvidence,
   deriveExternal,
+  generationConfigUrl,
+  samplingUrlAllowed,
+  normalizeGenerationConfig,
+  fetchSamplingConfigEvidence,
+  deriveSampling,
   ALLOWED_HOSTS,
 };

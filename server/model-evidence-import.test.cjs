@@ -4,6 +4,7 @@ const fs = require('node:fs'), os = require('node:os'), path = require('node:pat
 const {
   sanitizeText, repoFromCheckpoint, cardUrl, hostAllowed, normalizeCard,
   artifactIdentityHash, fetchModelCardEvidence, resolveCheckpoint, importModelEvidence, deriveExternal,
+  generationConfigUrl, samplingUrlAllowed, normalizeGenerationConfig, fetchSamplingConfigEvidence, deriveSampling,
 } = require('./model-evidence-import.cjs');
 const { createStore } = require('./evidence.cjs');
 
@@ -181,4 +182,83 @@ test('deriveExternal reports the artifact-matching record, falls back to stale, 
   assert.equal(deriveExternal(records, { model: 'laya', artifactHash: null }).state, 'unavailable');
   assert.equal(deriveExternal([], { model: 'laya', artifactHash: artifactIdentityHash('new') }).state, 'unverified');
   assert.equal(deriveExternal(records, { model: 'other', artifactHash: artifactIdentityHash('new') }).state, 'unverified');
+});
+
+test('generation config source is pinned to the card commit and cannot escape the same HF model repository', () => {
+  const sha = 'a'.repeat(40), url = `https://huggingface.co/api/resolve-cache/models/acme/model-7b/${sha}/generation_config.json`;
+  assert.equal(generationConfigUrl('acme/model-7b', sha), url);
+  assert.equal(samplingUrlAllowed(url, 'acme/model-7b', sha), true);
+  assert.equal(generationConfigUrl('acme/..', sha), null);
+  assert.equal(generationConfigUrl('acme/model-7b', 'main'), null);
+  assert.equal(samplingUrlAllowed('https://evil.example/api/resolve-cache/models/acme/model-7b/' + sha + '/generation_config.json', 'acme/model-7b', sha), false);
+  assert.equal(samplingUrlAllowed('https://huggingface.co/api/resolve-cache/models/other/repo/' + sha + '/generation_config.json', 'acme/model-7b', sha), false);
+});
+
+test('generation config keeps only finite supported numeric sampling values and refuses inactive sampling', () => {
+  assert.deepEqual(normalizeGenerationConfig({ do_sample: true, temperature: 0.7, top_p: 0.9, top_k: 40, min_p: 0.01, repetition_penalty: 1.1, chat_template: 'untrusted', eos_token_id: 42 }),
+    { temperature: 0.7, top_p: 0.9, top_k: 40, min_p: 0.01, repeat_penalty: 1.1 });
+  assert.deepEqual(normalizeGenerationConfig({ temperature: '0.7', top_p: -1, top_k: 1e12, min_p: Infinity, repetition_penalty: 0.9 }), { repeat_penalty: 0.9 });
+  assert.equal(normalizeGenerationConfig({ do_sample: false, temperature: 0.7 }), null);
+  assert.equal(normalizeGenerationConfig({ num_beams: 4, temperature: 0.7 }), null);
+  assert.equal(normalizeGenerationConfig({ temperature: 30 }), null);
+  assert.equal(normalizeGenerationConfig(['temperature', 0.7]), null);
+});
+
+test('sampling import is source-reported, bounded, and separate from local qualification', async t => {
+  const store = tempStore(t), sha = 'a'.repeat(40), seen = [];
+  const fetchJson = async (url, options, timeout, limit) => {
+    seen.push({ url, options, timeout, limit });
+    return url.includes('/api/models/') ? { ok: true, body: cardBody({ sha }) }
+      : { ok: true, body: { do_sample: true, temperature: 0.6, top_p: 0.95, top_k: 20, min_p: 0 } };
+  };
+  const first = await importModelEvidence({ model: 'acme/model-7b', artifact: 'artifact-1', fetchJson, store, now: () => now });
+  const second = await importModelEvidence({ model: 'acme/model-7b', artifact: 'artifact-1', fetchJson, store, now: () => now + 1 });
+  assert.equal(first.ok, true);
+  assert.equal(first.samplingRecord.category, 'external_sampling_config');
+  assert.equal(first.samplingRecord.result, 'reported');
+  assert.deepEqual(first.samplingRecord.value, { temperature: 0.6, top_p: 0.95, top_k: 20, min_p: 0 });
+  assert.equal(first.samplingRecord.identityHash, artifactIdentityHash('artifact-1'));
+  assert.equal(first.samplingRecord.provenance.revision, sha);
+  assert.equal(first.samplingRecord.provenance.artifactIdentityHash, artifactIdentityHash('artifact-1'));
+  assert.match(first.samplingRecord.limitations[0], /not measured locally/);
+  assert.equal(first.samplingRecord.id, second.samplingRecord.id, 'same values for same artifact dedupe');
+  assert.equal(store.list().length, 2, 'card and sampling config have distinct source records');
+  assert.deepEqual(seen.map(s => s.options.redirect), ['error', 'error', 'error', 'error']);
+  assert.equal(seen[1].limit, 64 * 1024);
+  assert.match(seen[1].url, new RegExp(`/api/resolve-cache/models/acme/model-7b/${sha}/generation_config\\.json$`));
+});
+
+test('missing, invalid or offline generation config cannot block a model-card import', async t => {
+  const store = tempStore(t);
+  const fetchJson = async url => url.includes('/api/models/') ? { ok: true, body: cardBody() } : { ok: false, status: 404 };
+  const result = await importModelEvidence({ model: 'acme/model-7b', artifact: 'artifact-1', fetchJson, store, now: () => now });
+  assert.equal(result.ok, true);
+  assert.equal(result.samplingRecord, undefined);
+  assert.deepEqual(store.list().map(r => r.category), ['external_model_card']);
+  const failed = await fetchSamplingConfigEvidence({ repo: 'acme/model-7b', revision: 'a'.repeat(40), artifact: 'artifact-1', fetchJson: async () => { throw Error('offline'); } });
+  assert.equal(failed.ok, false);
+});
+
+test('a source config that disables sampling clears an earlier recommendation while offline fetch does not invent a replacement', async t => {
+  const store = tempStore(t), sha = 'a'.repeat(40);
+  let config = { do_sample: true, temperature: 0.7 };
+  const fetchJson = async url => url.includes('/api/models/') ? { ok: true, body: cardBody({ sha }) }
+    : config === 'offline' ? Promise.reject(Error('offline')) : { ok: true, body: config };
+  await importModelEvidence({ model: 'acme/model-7b', artifact: 'artifact-1', fetchJson, store, now: () => now });
+  config = 'offline';
+  await importModelEvidence({ model: 'acme/model-7b', artifact: 'artifact-1', fetchJson, store, now: () => now + 1 });
+  assert.equal(deriveSampling(store.list(), { model: 'acme/model-7b', artifactHash: artifactIdentityHash('artifact-1') }).state, 'reported');
+  config = { do_sample: false, temperature: 0.7 };
+  await importModelEvidence({ model: 'acme/model-7b', artifact: 'artifact-1', fetchJson, store, now: () => now + 2 });
+  const state = deriveSampling(store.list(), { model: 'acme/model-7b', artifactHash: artifactIdentityHash('artifact-1') });
+  assert.equal(state.state, 'unverified');
+  assert.equal(state.record.value, null);
+});
+
+test('sampling metadata follows exact artifact state without qualifying stale values', () => {
+  const rows = [{ model: 'acme/model-7b', category: 'external_sampling_config', identityHash: artifactIdentityHash('old'), value: { temperature: 0.7 } }];
+  assert.equal(deriveSampling(rows, { model: 'acme/model-7b', artifactHash: artifactIdentityHash('old') }).state, 'reported');
+  assert.equal(deriveSampling(rows, { model: 'acme/model-7b', artifactHash: artifactIdentityHash('new') }).state, 'stale');
+  assert.equal(deriveSampling(rows, { model: 'acme/model-7b', artifactHash: null }).state, 'unavailable');
+  assert.equal(deriveSampling([], { model: 'acme/model-7b', artifactHash: artifactIdentityHash('new') }).state, 'unverified');
 });

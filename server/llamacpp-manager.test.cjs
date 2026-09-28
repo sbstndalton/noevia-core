@@ -122,6 +122,16 @@ test('qualification evidence is tied to the live configuration and goes stale wh
    fetchJson:async(url)=>{const p=new URL(url).pathname;return {ok:true,status:200,body:p==='/models'?{data:[{id:'fx',status:{value:'unloaded',args:[]}}]}:p==='/props'?{build_info:'b-synthetic'}:{}};}});
   const unverified=(await manager.evidence('fx')).body;
   assert.equal(unverified.categories.find(c=>c.category==='context_capacity').state,'unverified');
+  assert.deepEqual(unverified.samplingRecommendation,{state:'unverified',values:null,source:null,provenance:null,limitations:[]});
+  const artifact=require('./evidence.cjs').fileFingerprint(path.join(models,'fx','fx.gguf'));
+  require('./evidence.cjs').createStore(ev).append({model:'fx',category:'external_sampling_config',result:'reported',
+    identityHash:require('./model-evidence-import.cjs').artifactIdentityHash(artifact),value:{temperature:0.7,top_p:0.9},
+    provenance:{sourceUrl:'https://huggingface.co/acme/fx/resolve/'+'a'.repeat(40)+'/generation_config.json',revision:'a'.repeat(40),retrievedAt:1000},
+    limitations:['Source-reported, not measured locally']});
+  const reported=(await manager.evidence('fx')).body.samplingRecommendation;
+  assert.equal(reported.state,'reported');
+  assert.deepEqual(reported.values,{temperature:0.7,top_p:0.9});
+  assert.equal(reported.source,'generation_config.json');
   await manager.recordEvidence('fx',{category:'context_capacity',result:'passed',value:{ctx:8192},suite:{name:'native-calibration',version:1},source:'calibration'});
   const verified=(await manager.evidence('fx')).body.categories.find(c=>c.category==='context_capacity');
   assert.equal(verified.state,'verified');assert.equal(verified.value.ctx,8192);
@@ -132,6 +142,8 @@ test('qualification evidence is tied to the live configuration and goes stale wh
   assert.equal((await manager.evidence('fx')).body.categories.find(c=>c.category==='context_capacity').state,'verified','restored preset matches again');
   fs.writeFileSync(path.join(models,'fx','fx.gguf'),Buffer.alloc(4096,9));
   assert.equal((await manager.evidence('fx')).body.categories.find(c=>c.category==='context_capacity').state,'stale','replaced artifact');
+  const stale=(await manager.evidence('fx')).body.samplingRecommendation;
+  assert.equal(stale.state,'stale');assert.equal(stale.values,null,'old artifact recommendation is never offered as current');
   fs.rmSync(path.join(models,'fx','fx.gguf'));
   assert.equal((await manager.evidence('fx')).body.categories.find(c=>c.category==='context_capacity').state,'unavailable','missing file');
  }finally{fs.rmSync(root,{recursive:true,force:true});}
