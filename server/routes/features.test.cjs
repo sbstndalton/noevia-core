@@ -37,6 +37,14 @@ test('admin toggles a feature; unknown and malformed requests are refused', asyn
   assert.equal((await call(route, 'POST', '/api/features', 'admin')).status, 405);
 });
 
+test('constrainedPlanDecoding is listed as unavailable and cannot be switched on', async () => {
+  const { route } = harness();
+  const list = await call(route, 'GET', '/api/admin/features', 'admin');
+  const info = list.body.features.find(f => f.name === 'constrainedPlanDecoding');
+  assert.match(info.unavailable, /no server-side plan generator/);
+  assert.equal((await call(route, 'PUT', '/api/admin/features/constrainedPlanDecoding', 'admin', '{"enabled":true}')).status, 409);
+});
+
 test('unrelated paths are not handled', async () => {
   const { route } = harness();
   assert.equal((await call(route, 'GET', '/api/featuresX', 'admin')).handled, false);

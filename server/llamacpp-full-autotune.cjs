@@ -569,4 +569,4 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
   }
   return { start, resume, cancel, status, untuned, recover, completion: () => completion };
 }
-module.exports = { createFullAutotuner, qualityCheck, QUALITY, VERSION, newModel };
+module.exports = { createFullAutotuner, qualityCheck, QUALITY, VERSION, newModel, hasHarmonyReasoning };
