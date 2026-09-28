@@ -5,7 +5,7 @@ const { createModelManager } = require('./model-manager.cjs');
 const { createPresetStore } = require('./llamacpp-presets.cjs');
 const { QUALITY, qualityCheck, newModel } = require('./llamacpp-full-autotune.cjs');
 
-function fixture(t, { models = ['synthetic'], onChat, onUnload, badQ4 = true, badF16 = false, noHead = false, rejectAll = false, rejectModel = '', badBatch = false, failFinal = false, idleTimeoutMs = 300000, loseIdentityAfterStart = false, reloadFail = false, unloadPolls = 0, unloadStuck = false } = {}) {
+function fixture(t, { models = ['synthetic'], onChat, onUnload, badQ4 = true, badF16 = false, noHead = false, rejectAll = false, rejectModel = '', badBatch = false, failFinal = false, formattedQuality = false, reasoningOnly = false, truncatedWorkloads = false, idleTimeoutMs = 300000, loseIdentityAfterStart = false, reloadFail = false, unloadPolls = 0, unloadStuck = false } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'full-tune-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const ini = path.join(dir, 'models.ini'), stateFile = path.join(dir, 'tune.json');
@@ -29,7 +29,7 @@ function fixture(t, { models = ['synthetic'], onChat, onUnload, badQ4 = true, ba
     if (u.pathname === '/props') return { ok: true, body: { build_info: build } };
     if (u.pathname === '/v1/chat/completions') {
       chats++; const o = options(b.model), prompt = b.messages[0].content;
-      requests.push({ model: b.model, options: { ...o }, prompt });
+      requests.push({ model: b.model, options: { ...o }, prompt, maxTokens: b.max_tokens, reasoningEffort: b.reasoning_effort });
       await onChat?.({ manager, chats, o, prompt, ini, status, requests });
       if (opts.signal?.aborted) throw Error('aborted');
       const q = QUALITY.find(q => q.prompt === prompt);
@@ -37,9 +37,10 @@ function fixture(t, { models = ['synthetic'], onChat, onUnload, badQ4 = true, ba
       if (q && (rejectAll || b.model === rejectModel || (badF16 && o['cache-type-k'] === 'f16') || (badQ4 && ['q5_0', 'q5_1', 'q4_0'].includes(o['cache-type-k'])))) text = 'wrong';
       if (badBatch && q && o['ubatch-size']) text = 'wrong';
       if (failFinal && q && manager.autotune.status().body.job?.phase === 'Verifying saved profile') text = 'wrong';
+      if (formattedQuality && q) text = q.id === 'extraction' ? '`' + text + '`' : '**' + text + '**';
       const spec = o['spec-type'], draft = spec === 'ngram-simple' || spec === 'draft-mtp' && !noHead;
       const speed = spec === 'draft-mtp' && !noHead ? o['spec-draft-n-max'] === '8' ? 50 : 36 : spec === 'ngram-simple' ? 26 : 20;
-      return { ok: true, body: { choices: [{ message: { content: text } }], timings: { predicted_per_second: speed * (['q5_0', 'q5_1', 'q4_0'].includes(o['cache-type-k']) ? 2 : o['cache-type-k'] === 'q8_0' ? 1.2 : 1),
+      return { ok: true, body: { choices: [{ message: { content: reasoningOnly ? '' : text, ...(reasoningOnly ? { reasoning_content: text } : {}) }, ...(reasoningOnly || (truncatedWorkloads && !q) ? { finish_reason: 'length' } : {}) }], timings: { predicted_per_second: speed * (['q5_0', 'q5_1', 'q4_0'].includes(o['cache-type-k']) ? 2 : o['cache-type-k'] === 'q8_0' ? 1.2 : 1),
         prompt_per_second: o['ubatch-size'] === '1024' ? 800 : 500, draft_n: draft ? 100 : 0, draft_n_accepted: draft ? 65 : 0 } } };
     }
     return { ok: true, body: {} };
@@ -419,6 +420,64 @@ test('quality diagnostics identify an upstream error and truncated response with
     { id: 'reasoning', passed: true },
   ]);
   assert.doesNotMatch(JSON.stringify(result), /AX|503 response body/);
+});
+
+test('quality accepts only a complete, unambiguous answer with benign markdown wrapping', async () => {
+  const wrapped = ['**59**', '`AX-417`', '**no.**'];
+  const ok = await qualityCheck('Gemma-4-E2B-it-GGUF', async (_m, prompt) => ({ text: wrapped[QUALITY.findIndex(q => q.prompt === prompt)] }));
+  assert.equal(ok.passed, true);
+  for (const answer of ['59, but the answer is 58', '59 58', 'The answer is 59', '**59** and 58']) {
+    const result = await qualityCheck('Gemma-4-E2B-it-GGUF', async (_m, prompt) => ({ text: prompt === QUALITY[0].prompt ? answer : QUALITY.find(q => q.prompt === prompt).expected }));
+    assert.deepEqual(result.checks[0], { id: 'arithmetic', passed: false, reason: 'mismatch' });
+  }
+  const reasoningOnly = await qualityCheck('gpt-oss-20b', async (_m, prompt) => ({ text: '', reasoningContent: QUALITY.find(q => q.prompt === prompt).expected, finishReason: 'length' }));
+  assert.equal(reasoningOnly.passed, false, 'analysis text is never proof of a correct final answer');
+  const cappedProbe = await qualityCheck('gpt-oss-20b', async (_m, prompt) => ({ text: QUALITY.find(q => q.prompt === prompt).expected, finishReason: 'length' }));
+  assert.equal(cappedProbe.passed, false, 'even a correct-looking final answer cannot pass a truncated quality probe');
+  assert.ok(cappedProbe.checks.every(check => check.reason === 'truncated'));
+});
+
+test('gpt-oss quality probes ask for bounded low reasoning effort while other model probes stay short', async t => {
+  const f = fixture(t, { models: ['gpt-oss-20b'] });
+  await f.manager.autotune.start('gpt-oss-20b', { confirmPause: true });
+  const job = await finished(f.manager);
+  assert.equal(job.status, 'passed', job.error);
+  const probes = f.requests.filter(r => QUALITY.some(q => q.prompt === r.prompt));
+  assert.ok(probes.length >= 3);
+  assert.ok(probes.every(r => r.maxTokens === 512 && r.reasoningEffort === 'low'));
+  const workload = f.requests.find(r => !QUALITY.some(q => q.prompt === r.prompt));
+  assert.ok(workload && workload.reasoningEffort === 'low' && workload.maxTokens === 512);
+  assert.ok(f.requests.filter(r => r.prompt.startsWith('The garden committee')).every(r => r.maxTokens === 16), 'batch prompt timing remains short');
+  const budgets = [];
+  await qualityCheck('GPT-OSS20B-Q4', async (_m, _p, max) => { budgets.push(max); return { text: 'wrong' }; });
+  assert.deepEqual(budgets, [512, 512, 512]);
+});
+
+test('Gemma formatted final answers can finish tuning without weakening the quality gate', async t => {
+  const f = fixture(t, { models: ['Gemma-4-E2B-it-GGUF'], formattedQuality: true });
+  await f.manager.autotune.start('Gemma-4-E2B-it-GGUF', { confirmPause: true });
+  const job = await finished(f.manager);
+  assert.equal(job.status, 'passed', job.error);
+  assert.ok(f.requests.filter(r => QUALITY.some(q => q.prompt === r.prompt)).every(r => r.maxTokens === 64 && r.reasoningEffort === undefined));
+});
+
+test('reasoning-only gpt-oss output fails all quality candidates and restores the profile', async t => {
+  const f = fixture(t, { models: ['gpt-oss-20b'], reasoningOnly: true });
+  await f.manager.autotune.start('gpt-oss-20b', { confirmPause: true });
+  const job = await finished(f.manager);
+  assert.equal(job.status, 'failed');
+  assert.equal(job.models[0].phases[0].restored, true);
+  assert.equal(fs.readFileSync(f.ini, 'utf8'), f.original);
+  assert.equal(job.models[0].result, undefined);
+  assert.equal(f.manager.autotune.status('gpt-oss-20b').body.history.length, 0);
+});
+
+test('capped nonempty throughput samples remain measurable after independent quality probes pass', async t => {
+  const f = fixture(t, { truncatedWorkloads: true });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const job = await finished(f.manager);
+  assert.equal(job.status, 'passed', job.error);
+  assert.equal(job.models[0].result.generation, 60);
 });
 
 test('KV phase never offers q4_0 by default and picks a Q5-or-higher profile even when q4 would be fastest (issue #190)', async t => {

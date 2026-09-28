@@ -19,11 +19,24 @@ const QUALITY = [
   { id: 'extraction', prompt: 'Record: name=Juniper; code=AX-417; colour=blue. Return only the code, without quotes.', expected: 'AX-417' },
   { id: 'reasoning', prompt: 'All daxes are blue. No blue things are round. Can a dax be round? Reply with only yes or no.', expected: 'no' },
 ];
+const hasHarmonyReasoning = model => /(?:^|[^a-z0-9])gpt[-_. ]?oss(?:\d|[^a-z0-9]|$)/i.test(model);
+// A short final answer may follow analysis on Harmony models. Keep this finite and
+// require the final content itself to pass every probe; analysis is not an answer.
+const qualityBudget = model => hasHarmonyReasoning(model) ? 512 : 64;
+function normalizedAnswer(text) {
+  let answer = text.trim().toLowerCase();
+  // Accept formatting around the entire answer, never a correct substring inside prose.
+  for (const mark of ['**', '__', '`']) {
+    if (answer.startsWith(mark) && answer.endsWith(mark) && answer.length > mark.length * 2)
+      answer = answer.slice(mark.length, -mark.length).trim();
+  }
+  return answer.replace(/[.!]$/, '').trim();
+}
 async function qualityCheck(model, chat) {
   const checks = [];
   for (const q of QUALITY) {
-    const r = await chat(model, q.prompt, 64);
-    const answer = typeof r?.text === 'string' ? r.text.trim().toLowerCase().replace(/[.!]$/, '') : '';
+    const r = await chat(model, q.prompt, qualityBudget(model));
+    const answer = typeof r?.text === 'string' ? normalizedAnswer(r.text) : '';
     const reason = r?.failure || (r?.finishReason === 'length' ? 'truncated' : !answer ? 'no response' :
       answer !== q.expected.toLowerCase() ? 'mismatch' : null);
     checks.push({ id: q.id, passed: !reason, ...(reason ? { reason } : {}) });
@@ -141,6 +154,7 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
     let r;
     try { r = await request('/v1/chat/completions', { method: 'POST', signal: controller.signal, body: JSON.stringify({
       model, stream: false, temperature: 0, max_tokens: max, cache_prompt: false,
+      ...(hasHarmonyReasoning(model) ? { reasoning_effort: 'low' } : {}),
       chat_template_kwargs: { enable_thinking: false }, messages: [{ role: 'user', content: prompt }],
     }) }, 180000); }
     finally { clearInterval(timer); inflight = null; }
@@ -176,8 +190,11 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
     if (!quality.passed) throw Error(qualityFailure(quality));
     const workloads = [];
     for (const w of WORKLOADS) {
-      const r = await chat(model, w.prompt, w.max);
+      const r = await chat(model, w.prompt, hasHarmonyReasoning(model) ? Math.max(w.max, 512) : w.max);
       if (!r || !Number.isFinite(r.gen) || r.gen <= 0) throw Error('Missing throughput measurements.');
+      // These are capped timing samples, so a nonempty sample may finish at the cap.
+      // An analysis-only reply has no final sample to compare or measure.
+      if (!r.text?.trim()) throw Error('Workload did not produce a final answer.');
       workloads.push({ workload: w.id, gen: r.gen, drafted: r.drafted, accepted: r.accepted, text: r.text });
     }
     const drafted = workloads.reduce((n, w) => n + w.drafted, 0), accepted = workloads.reduce((n, w) => n + w.accepted, 0);
