@@ -618,6 +618,8 @@ function createChatHandler({
         scope:require('node:crypto').createHash('sha256').update(JSON.stringify([provider.baseUrl,provider.apiKey,modelManager.baseUrl])).digest('hex'),
         signal:chatSignal.signal,onStatus:text=>send({type:'status',text}),
         assertActive:assertWorkspaceActive,
+        // #536: a hosted/custom provider's own context setting (or the hosted default); the local default is unchanged.
+        hosted:provider.id===DEFAULT_PROVIDER_ID?null:provider,
       }));
       summarizeContext=async(summary,older,maxTokens)=>{
           const response=await reasoningEffort.requestWithEffort(providerFetch,upstreamUrl,{method:'POST',headers:upstreamHeaders,signal:AbortSignal.any([chatSignal.signal,AbortSignal.timeout(180000)]),redirect:'error'},

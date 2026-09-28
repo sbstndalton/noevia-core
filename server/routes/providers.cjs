@@ -3,6 +3,7 @@
 //   GET    /api/providers        list, with keys masked
 //   POST   /api/providers        connect one (shared rows are admin-only)
 //   POST   /api/providers/test   probe an endpoint's /v1/models before saving it
+//   PUT    /api/providers/:id    edit one in place (#535); projects on it keep their provider/model
 //   DELETE /api/providers/:id    remove one; projects on it fall back to the default
 //
 // Sign in with ChatGPT (#447, chatgpt-oauth.cjs), only while features.chatgptOAuth is on (404 off):
@@ -38,6 +39,7 @@ const PASS = Symbol('unhandled');
  */
 function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApproved, PROVIDERS, PROJECTS, DEFAULT_PROVIDER_ID, modelManager, currentWorkspace, saveProjects, registry, chatgptOAuth = null, chatgptEnabled = () => false }) {
   const { saveProviders, saveSharedProviders, maskKey } = registry;
+  const { parseContextTokens, validContextTokens } = require('../providers.cjs');
   const chatgpt = require('../chatgpt-oauth.cjs');
   const egress = require('../provider-egress.cjs');
   const chatgptOn = () => !!chatgptOAuth && chatgptEnabled();
@@ -96,6 +98,40 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
     return json(res, 405, { error: 'method not allowed' });
   }
 
+  // One provider as the client sees it: never the plaintext key.
+  function listRow(pr, authn) {
+    const contextTokens = validContextTokens(pr.contextTokens);
+    return {
+      id: pr.id,
+      label: pr.label,
+      baseUrl: pr.baseUrl,
+      apiKeyMasked: maskKey(pr.apiKey),
+      isDefault: pr.id === DEFAULT_PROVIDER_ID,
+      managed: pr.id === DEFAULT_PROVIDER_ID && modelManager.enabled,
+      shared: !!pr.shared,
+      defaultModel: pr.defaultModel || undefined,
+      ...(contextTokens ? { contextTokens } : {}),
+      ...(egress.isTrialTermsHost(pr) ? { external: true } : {}),
+      ...(chatgpt.isChatGptProvider(pr) ? { kind: chatgpt.KIND, external: true, connection: chatgptOAuth.status(authn?.user?.id).state } : {}),
+    };
+  }
+
+  // scheme://host:port of a URL, or null. A stored key may follow a path change, never an origin change.
+  function originOf(url) {
+    try { return new URL(url).origin; } catch { return null; }
+  }
+  const hasRealKey = (key) => !!key && key !== 'local';
+
+  // The rows PUT may not touch: the default (and its legacy alias), and rows a sign-in owns or
+  // the server flagged external (their address and credential are not the person's to set).
+  function editRefusal(id, row, authn) {
+    if (id === DEFAULT_PROVIDER_ID || id === 'lemonade') return [400, 'the default provider cannot be edited'];
+    if (!row) return [404, 'no such provider'];
+    if (chatgpt.isChatGptProvider(row) || row.external === true) return [400, 'this provider is managed by its sign-in and cannot be edited'];
+    if (row.shared && authn?.user?.role !== 'admin') return [403, 'administrator required'];
+    return null;
+  }
+
   async function handle(req, res, { path: p, authn }) {
     if (p === '/api/providers/chatgpt' || p.startsWith('/api/providers/chatgpt/')) return handleChatGpt(req, res, p, authn);
     // ── Provider registry (step 9): list / connect / remove. GET never returns
@@ -103,20 +139,7 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
     if (p === '/api/providers' && req.method === 'GET') {
       // A ChatGPT row is listed only while the flag is on, with its connection state instead of a key.
       const listed = Array.from(PROVIDERS).filter((pr) => !chatgpt.isChatGptProvider(pr) || (chatgptOn() && !pr.shared));
-      return json(res, 200, {
-        providers: listed.map((pr) => ({
-          id: pr.id,
-          label: pr.label,
-          baseUrl: pr.baseUrl,
-          apiKeyMasked: maskKey(pr.apiKey),
-          isDefault: pr.id === DEFAULT_PROVIDER_ID,
-          managed: pr.id === DEFAULT_PROVIDER_ID && modelManager.enabled,
-          shared: !!pr.shared,
-          defaultModel: pr.defaultModel || undefined,
-          ...(egress.isTrialTermsHost(pr) ? { external: true } : {}),
-          ...(chatgpt.isChatGptProvider(pr) ? { kind: chatgpt.KIND, external: true, connection: chatgptOAuth.status(authn?.user?.id).state } : {}),
-        })),
-      });
+      return json(res, 200, { providers: listed.map((pr) => listRow(pr, authn)) });
     }
     if (p === '/api/providers' && req.method === 'POST') {
       const raw = await readBody(req);
@@ -133,6 +156,8 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
       const shared = body.shared === true;
       if (shared && authn.user.role !== 'admin') return json(res, 403, { error: 'administrator required for shared providers' });
       if (!label) return json(res, 400, { error: 'label required' });
+      const context = parseContextTokens(body.contextTokens);
+      if (context.error) return json(res, 400, { error: context.error });
       if (!/^https?:\/\//.test(baseUrl)) return json(res, 400, { error: 'baseUrl must be an http(s) URL' });
       // SSRF guard: a member must not register an endpoint the server can
       // only reach from its own internal network (RFC1918, metadata, etc.).
@@ -141,9 +166,9 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
         return json(res, 400, { error: 'Provider origin is not approved for member connections; contact an administrator.' });
       }
       const id = `prov-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      PROVIDERS.push({ id, label, baseUrl, apiKey, defaultModel, shared });
+      PROVIDERS.push({ id, label, baseUrl, apiKey, defaultModel, shared, ...(context.value ? { contextTokens: context.value } : {}) });
       if (shared) saveSharedProviders(); else saveProviders();
-      return json(res, 200, { id, label, baseUrl, defaultModel, apiKeyMasked: maskKey(apiKey) });
+      return json(res, 200, { id, label, baseUrl, defaultModel, apiKeyMasked: maskKey(apiKey), ...(context.value ? { contextTokens: context.value } : {}) });
     }
     if (p === '/api/providers/test' && req.method === 'POST') {
       const body = await readJson(req);
@@ -155,7 +180,14 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
         return json(res, 400, { error: 'Provider origin is not approved for member connections; contact an administrator.' });
       }
       const headers = { 'Content-Type': 'application/json' };
-      if (body.apiKey) headers.Authorization = `Bearer ${String(body.apiKey)}`;
+      let probeKey = String(body.apiKey || '');
+      // Editing (#535): with no key typed, an existing provider's stored key may be used, but only
+      // by someone allowed to edit that row and only against the same origin it is stored for.
+      if (!probeKey && typeof body.providerId === 'string' && body.providerId) {
+        const row = Array.from(PROVIDERS).find((pr) => pr.id === body.providerId);
+        if (row && !editRefusal(body.providerId, row, authn) && hasRealKey(row.apiKey) && originOf(baseUrl) !== null && originOf(row.baseUrl) === originOf(baseUrl)) probeKey = row.apiKey;
+      }
+      if (probeKey) headers.Authorization = `Bearer ${probeKey}`;
       try {
         // redirect:'error' — same rationale as the storage client: a member-
         // registered endpoint must not bounce the request inward.
@@ -165,6 +197,48 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
       } catch (e) { return json(res, 502, { error: e.message }); }
     }
     const provDel = p.match(/^\/api\/providers\/([^/]+)$/);
+    if (provDel && req.method === 'PUT') {
+      const id = decodeURIComponent(provDel[1]);
+      const row = Array.from(PROVIDERS).find((pr) => pr.id === id);
+      const refused = editRefusal(id, row, authn);
+      if (refused) return json(res, refused[0], { error: refused[1] });
+      let body;
+      try {
+        body = JSON.parse(await readBody(req));
+      } catch {
+        return json(res, 400, { error: 'invalid JSON' });
+      }
+      if (!body || typeof body !== 'object' || Array.isArray(body)) return json(res, 400, { error: 'invalid JSON' });
+      for (const field of ['label', 'baseUrl', 'apiKey', 'defaultModel']) {
+        if (body[field] !== undefined && body[field] !== null && typeof body[field] !== 'string') return json(res, 400, { error: `${field} must be a string` });
+      }
+      const label = body.label === undefined ? row.label : String(body.label || '').trim().slice(0, 80);
+      const baseUrl = body.baseUrl === undefined ? row.baseUrl : String(body.baseUrl || '').trim().replace(/\/+$/, '');
+      const newKey = String(body.apiKey || '').trim();
+      const defaultModel = body.defaultModel === undefined ? (row.defaultModel || '') : String(body.defaultModel || '').trim().slice(0, 200);
+      if (!label) return json(res, 400, { error: 'label required' });
+      if (!/^https?:\/\//.test(baseUrl)) return json(res, 400, { error: 'baseUrl must be an http(s) URL' });
+      // Same SSRF guard as POST whenever the address changes.
+      if (baseUrl !== row.baseUrl && !endpointApproved(authn, baseUrl)) {
+        return json(res, 400, { error: 'Provider origin is not approved for member connections; contact an administrator.' });
+      }
+      // A stored key never follows the provider to another origin: that would send it somewhere
+      // the person never typed it for (and read it back out through a host they control).
+      if (!newKey && hasRealKey(row.apiKey) && (originOf(baseUrl) === null || originOf(baseUrl) !== originOf(row.baseUrl))) {
+        return json(res, 400, { error: 'Enter the API key again when moving a provider to a different address.' });
+      }
+      // Omitted keeps the stored value; null or '' clears it.
+      const context = body.contextTokens === undefined ? { value: validContextTokens(row.contextTokens) } : parseContextTokens(body.contextTokens);
+      if (context.error) return json(res, 400, { error: context.error });
+      // Validated in full before anything changes, so a refusal leaves the row as it was.
+      row.label = label;
+      row.baseUrl = baseUrl;
+      if (newKey) row.apiKey = newKey;
+      row.defaultModel = defaultModel;
+      if (context.value) row.contextTokens = context.value; else delete row.contextTokens;
+      if (row.shared) saveSharedProviders(); else saveProviders();
+      return json(res, 200, listRow(row, authn));
+    }
     if (provDel && req.method === 'DELETE') {
       const id = decodeURIComponent(provDel[1]);
       if (id === DEFAULT_PROVIDER_ID || id === 'lemonade') return json(res, 400, { error: 'the default provider cannot be removed' });

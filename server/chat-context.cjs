@@ -11,9 +11,22 @@ function runtimeLimit(health, model) {
   const configured=Number(entry?.recipe_options?.ctx_size);
   return Number.isFinite(configured)&&configured>=2048 ? {limit:Math.floor(configured),limitSource:'Configured backend context'} : {limit:8192,limitSource:'Conservative fallback; backend limit unavailable'};
 }
-async function resolveRuntimeLimit({manager,model,dir,scope,onStatus=()=>{},signal,assertActive}) {
+// Hosted/custom OpenAI-compatible providers (#536): no backend to ask, so a person's stated
+// context size wins, else a default sized for current hosted models rather than the local 8k floor.
+const HOSTED_DEFAULT_LIMIT=32768;
+function hostedLimit(provider) {
+  const stated=require('./providers.cjs').validContextTokens(provider?.contextTokens);
+  return stated ? {limit:stated,limitSource:'Provider setting'} : {limit:HOSTED_DEFAULT_LIMIT,limitSource:'Default for hosted providers'};
+}
+// `hosted` is the provider row for a non-default (hosted/custom) provider, or null for the local
+// default. The model-manager path ignores it entirely.
+async function resolveRuntimeLimit({manager,model,dir,scope,onStatus=()=>{},signal,assertActive,hosted=null}) {
   assertActive?.();
-  if (!manager?.enabled) return runtimeLimit(null,model);
+  if (manager?.enabled) return resolveManagedLimit({manager,model,dir,scope,onStatus,signal,assertActive});
+  if (hosted) return hostedLimit(hosted);
+  return runtimeLimit(null,model);
+}
+async function resolveManagedLimit({manager,model,dir,scope,onStatus,signal,assertActive}) {
   signal?.throwIfAborted();
   let response=await manager.health();
   assertActive?.();
@@ -185,4 +198,4 @@ async function prepare(options){const key=stateFile(options.dir,options.id);if(b
 // R1 measurement, opt-in with CONTEXT_LOG=1; never breaks a chat.
 function logRound({dir,assertActive,...entry}){if(process.env.CONTEXT_LOG!=='1')return;try{const log=require('./context-log.cjs');const record=log.record(entry);assertActive?.();log.append(dir,record);}catch(e){console.warn('[context-log] write failed:',e.message);}}
 function remove(dir,id){fs.rmSync(stateFile(dir,id),{force:true});}
-module.exports={logRound,remove,tokens,read,save,runtimeLimit,resolveRuntimeLimit,applySummary,measure,prepare,compactContinuation,providerError};
+module.exports={logRound,remove,tokens,read,save,runtimeLimit,resolveRuntimeLimit,HOSTED_DEFAULT_LIMIT,applySummary,measure,prepare,compactContinuation,providerError};

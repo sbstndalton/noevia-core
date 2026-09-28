@@ -52,4 +52,22 @@ function createProviderRegistry({ currentWorkspace, PROVIDERS, DEFAULT_PROVIDER_
   return { saveProviders, saveSharedProviders, getProvider, maskKey, providerHeaders };
 }
 
-module.exports = { createProviderRegistry };
+// A provider's context window, as a person states it (#536): a whole number of tokens in
+// [CONTEXT_TOKENS_MIN, CONTEXT_TOKENS_MAX]. null, undefined or '' clear it (the chat falls back
+// to its default for that kind of provider). Anything else is an error, never silently clamped.
+const CONTEXT_TOKENS_MIN = 2048;
+const CONTEXT_TOKENS_MAX = 2000000;
+function parseContextTokens(value) {
+  if (value === undefined || value === null || value === '') return { value: null };
+  const n = typeof value === 'string' && /^\s*\d+\s*$/.test(value) ? Number(value) : value;
+  if (typeof n !== 'number' || !Number.isInteger(n) || n < CONTEXT_TOKENS_MIN || n > CONTEXT_TOKENS_MAX) {
+    return { error: `contextTokens must be a whole number from ${CONTEXT_TOKENS_MIN} to ${CONTEXT_TOKENS_MAX}` };
+  }
+  return { value: n };
+}
+/** A stored contextTokens that is still in bounds, else null (hand-edited files included). */
+function validContextTokens(value) {
+  return typeof value === 'number' && Number.isInteger(value) && value >= CONTEXT_TOKENS_MIN && value <= CONTEXT_TOKENS_MAX ? value : null;
+}
+
+module.exports = { createProviderRegistry, parseContextTokens, validContextTokens, CONTEXT_TOKENS_MIN, CONTEXT_TOKENS_MAX };
