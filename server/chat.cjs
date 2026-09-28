@@ -342,8 +342,10 @@ function createChatHandler({
     if (egressRefused) return json(res, 409, { error: egressRefused });
     const chatgptProvider = require('./chatgpt-oauth.cjs').isChatGptProvider(provider);
     // Rule 4 (#452): storage tools never reach the Diary folder through an external provider.
-    const egressToolRefusal = (userId, name, rawArgs) => (externalProvider ? egress.toolRefusal({ provider, toolName: name, rawArgs,
-      storage: userId && typeof authService?.getStorage === 'function' ? authService.getStorage(userId) : null }) : null);
+    // The stream-guard schema check (#516) inside evaluateToolCall runs for every provider,
+    // local/default included, ahead of those external-only rules; it is off by default.
+    const egressToolRefusal = (userId, name, rawArgs) => egress.evaluateToolCall({ provider, toolName: name, rawArgs,
+      storage: userId && typeof authService?.getStorage === 'function' ? authService.getStorage(userId) : null });
     let providerFetch = fetch;
     if (chatgptProvider) {
       if (!chatgptOAuth || !chatgptEnabled()) return json(res, 409, { error: 'Sign in with ChatGPT is turned off on this server. Choose another provider in the model popup.' });
