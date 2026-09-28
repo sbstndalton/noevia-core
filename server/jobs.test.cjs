@@ -248,3 +248,61 @@ test('a second run() of a live job id is refused, so cancel and the final write 
     assert.equal(done.result, 'stopped');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+// #512/#522: job.lifecycle is additive, read-only and must never make get()/append() throw,
+// even on odd real journals this layer was never shaped to interpret.
+test('job.lifecycle is derived onto jobs from createJobs(), and never reaches merged/reviewing from ordinary events', async () => {
+  const dir = tmp();
+  try {
+    const jobs = createJobs({ dir });
+    const id = jobs.create({ kind: 'chat', projectId: 'p1' });
+    assert.equal(jobs.get(id).lifecycle, 'planned');
+    const done = await jobs.run(id, async (ctx) => {
+      ctx.event('approval.requested', { action: 'write' });
+      ctx.event('approval.decided', { decision: 'approve', action: 'write' });
+      return { ok: true };
+    });
+    assert.equal(done.status, 'completed');
+    // A routine write-approval card is not a task review, and a finished job was not merged:
+    // both would be dishonest given no real reviewer/merge feature exists yet.
+    assert.notEqual(done.lifecycle, 'reviewing');
+    assert.notEqual(done.lifecycle, 'merged');
+    assert.equal(done.lifecycle, 'verifying');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('job.lifecycle survives a duplicate approval.requested and an out-of-order/unexpected journal without throwing from append() or get()', () => {
+  const dir = tmp();
+  try {
+    const jobs = createJobs({ dir });
+    const id = jobs.create({ kind: 'browser', projectId: 'p1' });
+    jobs.append(id, 'job.started');
+    // Two approval.requested events back to back with no decided in between — a real card
+    // could plausibly be re-announced (e.g. a retried render) before any answer lands.
+    jobs.append(id, 'approval.requested', { action: 'click' });
+    jobs.append(id, 'approval.requested', { action: 'click' });
+    assert.doesNotThrow(() => jobs.get(id));
+    assert.equal(jobs.get(id).lifecycle, 'implementing');
+    jobs.append(id, 'approval.decided', { decision: 'approve', action: 'click' });
+    jobs.append(id, 'job.completed', { result: {} });
+    const done = jobs.get(id);
+    assert.equal(done.status, 'completed');
+    assert.equal(done.lifecycle, 'verifying');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('job.lifecycle is null, never a throw, when a journal implies an illegal lifecycle jump', () => {
+  const dir = tmp();
+  try {
+    const jobs = createJobs({ dir });
+    const id = jobs.create({ kind: 'x' });
+    // job.completed with no preceding job.started: a job.cjs journal cannot normally look
+    // like this (run() always appends job.started first), but derive() must stay safe even
+    // if some future caller or corrupted-then-recovered journal produces it.
+    jobs.append(id, 'job.completed', { result: {} });
+    assert.doesNotThrow(() => jobs.get(id));
+    const job = jobs.get(id);
+    assert.equal(job.status, 'completed'); // ordinary job.status derivation is unaffected
+    assert.equal(job.lifecycle, null);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});

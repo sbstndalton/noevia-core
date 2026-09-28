@@ -4,6 +4,7 @@
 // capability sets fixed at creation. No scheduler; callers run the work in-process.
 const fs = require('node:fs'), path = require('node:path'), crypto = require('node:crypto');
 const { boundCodePlan } = require('./code-plan.cjs');
+const taskLifecycle = require('./task-lifecycle.cjs');
 const MAX_ASSISTANT_OUTPUT_BYTES = 32 * 1024;
 const MAX_ASSISTANT_OUTPUT_EVENT_BYTES = 1024, MAX_ASSISTANT_OUTPUT_EVENTS = 64;
 
@@ -14,10 +15,20 @@ const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
 
 function derive(events) {
   const job = { id: null, kind: null, projectId: null, parentId: null, capabilities: [], status: 'queued', stage: null,
-    steps: [], artifacts: [], plan: null, assistantOutput: null, checkpoint: null, pendingApproval: null, uncertain: [], result: null, error: null, createdAt: null, updatedAt: null };
+    steps: [], artifacts: [], plan: null, assistantOutput: null, checkpoint: null, pendingApproval: null, uncertain: [], result: null, error: null, createdAt: null, updatedAt: null,
+    lifecycle: null };
+  // Folded alongside the switch below in the same single pass over `events`, rather than
+  // re-reading the whole journal a second time after the loop: `lifecycleState` only advances
+  // while `lifecycleOk` stays true, and one illegal jump (a journal never shaped with this
+  // layer in mind) just stops the fold there — the rest of `derive()` above is unaffected.
+  let lifecycleState = taskLifecycle.INITIAL_STATE, lifecycleOk = true;
   for (const e of events) {
     job.updatedAt = e.at;
     const d = e.data || {};
+    if (lifecycleOk) {
+      try { lifecycleState = taskLifecycle.step(lifecycleState, e); }
+      catch (err) { if (err instanceof taskLifecycle.TaskLifecycleError) lifecycleOk = false; else throw err; }
+    }
     switch (e.type) {
       case 'job.created': Object.assign(job, { id: e.job, kind: d.kind, projectId: d.projectId ?? null, parentId: d.parentId ?? null, capabilities: d.capabilities || [], createdAt: e.at }); break;
       case 'job.started': job.status = 'running'; break;
@@ -53,6 +64,10 @@ function derive(events) {
       default: break;
     }
   }
+  // Additive, read-only: a coarser vision-layer state (#512), folded above in the same loop.
+  // Never affects `job.status` or any other field, and never throws — an event sequence this
+  // layer can't make sense of just yields `null`.
+  job.lifecycle = lifecycleOk ? lifecycleState : null;
   return job;
 }
 
