@@ -190,6 +190,25 @@ test('the listed task carries no host path and no repository location', async ()
   assert.deepEqual(svc.repositories(), [{ id: 'noevia' }], 'the browser learns the name, never the path');
 });
 
+test('a completed task carries the commit it forked from and the commit it left at, not just the branch', async () => {
+  const { svc, ws, repoPath } = service({
+    connect: async ({ cwd }) => ({ prompt: async () => {
+      fs.writeFileSync(path.join(cwd, 'b.txt'), 'b');
+      execFileSync('git', ['add', '.'], { cwd, stdio: 'ignore' });
+      execFileSync('git', ['-c', 'user.email=qa@example.invalid', '-c', 'user.name=QA', 'commit', '-qm', 'second'], { cwd, stdio: 'ignore' });
+      return { stopReason: 'end_turn' };
+    } }),
+  });
+  const base = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repoPath, encoding: 'utf8' }).trim();
+  const started = await svc.start(ws, project, { repository: 'noevia', prompt: 'add a file' });
+  const done = await settle(svc, ws, started.taskId);
+  assert.equal(done.status, 'completed');
+  assert.equal(done.baseSha, base, 'base is the commit the task branch forked from');
+  assert.match(done.headSha, /^[0-9a-f]{40}$/, 'head is a real commit the agent left behind');
+  assert.notEqual(done.headSha, done.baseSha, 'the agent’s commit moved the branch past base');
+  assert.equal(JSON.stringify(done).includes(repoPath), false, 'still no host path leaks through');
+});
+
 test('two tasks waiting at once each get their own answer', async () => {
   // Same workspace, different projects: both wait, and answering one must not touch the other.
   const asks = {};

@@ -56,6 +56,10 @@ function view(job, pending = null) {
   return {
     id: job.id, status: job.status, stage: job.stage, error: job.error,
     task: job.checkpoint?.task || null, branch: job.checkpoint?.branch || null,
+    // The commit the task's branch forked from and, once the run has a checkpoint past the
+    // first, the commit currently at its head. Both are `null` until git can say them (an
+    // empty repository, or before the first checkpoint lands).
+    baseSha: job.checkpoint?.baseSha || null, headSha: job.checkpoint?.headSha || null,
     // What the run could say about itself, and what it could not (§1). The identity hash is
     // what a later evidence record would be scoped to.
     meta: job.checkpoint?.meta || null, identityHash: job.checkpoint?.identityHash || null,

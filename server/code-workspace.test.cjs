@@ -641,6 +641,71 @@ test('in clone mode the release auto-commit never carries the pinned config, eve
   assert.deepEqual(files, ['a.txt']);
 });
 
+test('claim records the base commit, and headSha tracks commits made after the claim', () => {
+  for (const mode of ['worktree', 'clone']) {
+    const repo = repoWith();
+    const base = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
+    const ws = createCodeWorkspaces({ dir: temp('noevia-ws-'), treeRoot: temp('noevia-shared-'), mode, epoch: 'test' });
+    const claim = ws.claim({ taskId: ids(1), repoPath: repo });
+    assert.equal(claim.baseSha, base, mode);
+    // Before any commit in the worktree, head is still base.
+    assert.equal(ws.headSha(ids(1)), base, mode);
+    fs.writeFileSync(path.join(claim.path, 'b.txt'), 'b');
+    trackedGit(claim.path, 'add', '.');
+    trackedGit(claim.path, '-c', 'user.email=qa@example.invalid', '-c', 'user.name=QA', 'commit', '-qm', 'second');
+    const head = ws.headSha(ids(1));
+    assert.notEqual(head, base, mode);
+    assert.match(head, /^[0-9a-f]{40}$/, mode);
+    ws.release({ taskId: ids(1) });
+    assert.equal(ws.headSha(ids(1)), null, 'released workspaces have nothing to read, ' + mode);
+  }
+});
+
+test('claim on an empty repository (no commits yet) records base and head as null, not a thrown error', () => {
+  const repo = temp('noevia-empty-repo-');
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: repo, stdio: 'ignore' });
+  const { ws } = workspaces();
+  const claim = ws.claim({ taskId: ids(1), repoPath: repo });
+  assert.equal(claim.baseSha, null);
+  assert.equal(ws.headSha(ids(1)), null);
+});
+
+test('headSha never trusts or reads an owner-held tree live, and the trust file is left untouched', () => {
+  // Trusting an agent-owned tree here would lift git's "dubious ownership" refusal for a tree
+  // the harness fully controls: an agent could point .git/HEAD at a ref that is a symlink to a
+  // file only root can read, and have rev-parse hand its contents back as a "commit sha" — a
+  // real leak (another tenant's files, a secret), not a hypothetical one. So headSha() must
+  // neither trust nor even attempt to read the tree while an owner is recorded; the
+  // authoritative head only ever comes from branchHead(), read from the SOURCE repository once
+  // release() has reclaimed ownership.
+  const repo = repoWith();
+  const dir = temp('noevia-ws-');
+  const trustFile = path.join(dir, 'code-workspaces', 'trusted-repositories.gitconfig');
+  const calls = [];
+  const run = (args, cwd, env) => {
+    calls.push({ args: [...args], cwd });
+    return execFileSync('git', args, { cwd, env: { ...process.env, ...env }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000 }).trim();
+  };
+  // `owner` set (mode defaults to 'clone', matching CODE_HARNESS_USER in production); chown is
+  // faked as a no-op so this test never needs real root privileges.
+  const ws = createCodeWorkspaces({ dir, treeRoot: temp('noevia-shared-'), owner: { uid: 1000, gid: 1000 }, epoch: 'test', run, chown: () => {} });
+  const claim = ws.claim({ taskId: ids(1), repoPath: repo });
+  assert.equal(claim.mode, 'clone');
+  const ownedTree = fs.realpathSync(claim.path);
+  const trustBefore = fs.readFileSync(trustFile, 'utf8');
+  assert.equal(trustBefore.includes(ownedTree), false, 'the tree was never trusted by claim() either');
+  calls.length = 0;
+  assert.equal(ws.headSha(ids(1)), null, 'an owner-held tree reports no live head at all');
+  assert.equal(calls.length, 0, 'no git call is made against the tree — not even to check it');
+  assert.equal(fs.readFileSync(trustFile, 'utf8'), trustBefore, 'the trust file is byte-for-byte unchanged');
+  assert.equal(fs.readFileSync(trustFile, 'utf8').includes(ownedTree), false, 'the tree is still never trusted');
+});
+
+test('headSha is null for a task id that never claimed a workspace', () => {
+  const { ws } = workspaces();
+  assert.equal(ws.headSha(ids(9)), null);
+});
+
 test('a dangling symlink inside the worktree is not contained', () => {
   const repo = repoWith();
   const { ws } = workspaces();

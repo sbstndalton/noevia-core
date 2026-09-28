@@ -69,6 +69,130 @@ test('reported rates are throttled to meaningful changes or a daily refresh', ()
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('a task-scoped record gets a monotonic revision, independent of category or identity', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-evidence-revision-'));
+  try {
+    const store = ev.createStore(dir);
+    const taskId = 'task-1';
+    const one = store.append({ taskId, model: 'm', category: 'context_capacity', identityHash: 'h1', result: 'passed', value: null });
+    const two = store.append({ taskId, model: 'm', category: 'vision', identityHash: 'h2', result: 'failed', value: null });
+    const three = store.append({ taskId, model: 'm', category: 'context_capacity', identityHash: 'h1', result: 'passed', value: null });
+    assert.deepEqual([one.revision, two.revision, three.revision], [1, 2, 3]);
+    // A different task starts its own sequence at 1; the two never interleave.
+    const other = store.append({ taskId: 'task-2', model: 'm', category: 'vision', identityHash: 'h1', result: 'passed', value: null });
+    assert.equal(other.revision, 1);
+    // A caller cannot smuggle its own revision in: the store's own count always wins.
+    const spoofed = store.append({ taskId, model: 'm', category: 'vision', identityHash: 'h2', result: 'passed', value: null, revision: 999 });
+    assert.equal(spoofed.revision, 4);
+    // A record with no taskId at all — every existing producer — gets no revision field, exactly
+    // as before this feature existed.
+    const untaskd = store.append({ model: 'm', category: 'throughput', identityHash: 'h3', result: 'passed', value: null });
+    assert.equal('revision' in untaskd, false);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('revisions survive a reload of the store from disk', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-evidence-revision-reload-'));
+  try {
+    const first = ev.createStore(dir);
+    first.append({ taskId: 't', model: 'm', category: 'vision', identityHash: 'h', result: 'passed', value: null });
+    first.append({ taskId: 't', model: 'm', category: 'vision', identityHash: 'h', result: 'passed', value: null });
+    const reopened = ev.createStore(dir);
+    const third = reopened.append({ taskId: 't', model: 'm', category: 'vision', identityHash: 'h', result: 'passed', value: null });
+    assert.equal(third.revision, 3, 'a freshly constructed store still continues the task’s sequence');
+    assert.deepEqual(reopened.list().map((r) => r.revision), [1, 2, 3]);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('legacy records with no revision or taskId field still load, list and derive normally', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-evidence-legacy-'));
+  try {
+    const file = path.join(dir, 'evidence.jsonl');
+    fs.mkdirSync(dir, { recursive: true });
+    // Written by hand, the shape evidence.jsonl had before this feature existed: no `taskId`,
+    // no `revision`.
+    const legacy = { id: 'ev_legacy', at: 1000, limitations: [], model: 'm', category: 'context_capacity', identityHash: 'h1', result: 'passed', value: { ctx: 32768 } };
+    fs.writeFileSync(file, JSON.stringify(legacy) + '\n', { mode: 0o600 });
+    const store = ev.createStore(dir);
+    const loaded = store.list();
+    assert.equal(loaded.length, 1);
+    assert.deepEqual(loaded[0], legacy, 'nothing was rewritten or backfilled onto the old record');
+    const derived = ev.derive(loaded, { model: 'm', category: 'context_capacity', liveHash: 'h1' });
+    assert.equal(derived.state, 'verified');
+    // A new task-scoped record appended alongside legacy ones starts its own sequence at 1: the
+    // legacy record (no taskId) is simply invisible to that count.
+    const next = store.append({ taskId: 'new-task', model: 'm', category: 'context_capacity', identityHash: 'h1', result: 'passed', value: null });
+    assert.equal(next.revision, 1);
+    assert.equal(store.list().length, 2);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a task’s revision never repeats, even once compaction drops the record that held the highest one', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-evidence-revision-compact-'));
+  try {
+    // A tiny cap and a single shared key so the very first few appends already trigger
+    // compaction and evict everything but the newest keepPerKey=1 record for that key.
+    const store = ev.createStore(dir, { maxBytes: 1, keepPerKey: 1 });
+    const rec = (taskId) => ({ taskId, model: 'm', category: 'vision', identityHash: 'h', result: 'passed', value: null });
+    const one = store.append(rec('t1'));
+    assert.equal(one.revision, 1);
+    // Other tasks append to the SAME key, so compaction (triggered by the tiny maxBytes) evicts
+    // t1's revision-1 record entirely — list() can no longer see it at all.
+    store.append(rec('t2'));
+    store.append(rec('t3'));
+    assert.equal(store.list().some((r) => r.taskId === 't1'), false, 't1’s own record was compacted away');
+    // Without a persisted high-water mark this would recompute from an empty scan and hand out
+    // revision 1 again — a real repeat, not just a gap.
+    const again = store.append(rec('t1'));
+    assert.equal(again.revision, 2, 't1’s next revision still continues from where it left off');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a corrupt revisions sidecar is rebuilt from the log, never silently treated as empty', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-evidence-corrupt-sidecar-'));
+  try {
+    const store = ev.createStore(dir);
+    store.append({ taskId: 't1', model: 'm', category: 'vision', identityHash: 'h', result: 'passed', value: null });
+    store.append({ taskId: 't1', model: 'm', category: 'vision', identityHash: 'h', result: 'passed', value: null });
+    store.append({ taskId: 't2', model: 'm', category: 'vision', identityHash: 'h', result: 'passed', value: null });
+    // Corrupt the sidecar by hand: truncated JSON, the kind a crash mid-write could leave.
+    const sidecar = path.join(dir, 'evidence-task-revisions.json');
+    fs.writeFileSync(sidecar, '{"t1": 2, "t2":', { mode: 0o600 });
+    // The next append for t2 must not silently treat the corrupt file as empty (which would
+    // reissue t2's already-used revision 1) or erase t1's mark from the rebuilt file.
+    const next = store.append({ taskId: 't2', model: 'm', category: 'vision', identityHash: 'h', result: 'passed', value: null });
+    assert.equal(next.revision, 2, 't2 continues from what the log itself still shows');
+    const rebuilt = JSON.parse(fs.readFileSync(sidecar, 'utf8'));
+    assert.deepEqual(rebuilt, { t1: 2, t2: 2 }, 't1’s high-water mark survived the corruption, rebuilt from the log');
+    // And t1's own next revision is unaffected — nothing was lost.
+    const t1next = store.append({ taskId: 't1', model: 'm', category: 'vision', identityHash: 'h', result: 'passed', value: null });
+    assert.equal(t1next.revision, 3);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a sidecar that parses to null, an array or a bare number is rejected the same as corrupt JSON', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-evidence-bad-sidecar-'));
+  try {
+    const store = ev.createStore(dir);
+    store.append({ taskId: 't1', model: 'm', category: 'vision', identityHash: 'h', result: 'passed', value: null });
+    const sidecar = path.join(dir, 'evidence-task-revisions.json');
+    for (const bad of ['null', '[1,2,3]', '42', '"just a string"']) {
+      fs.writeFileSync(sidecar, bad, { mode: 0o600 });
+      const next = store.append({ taskId: 't1', model: 'm', category: 'vision', identityHash: 'h', result: 'passed', value: null });
+      assert.ok(next.revision > 1, `revision still advances past what the log shows for ${bad}`);
+    }
+    // Values of the wrong shape inside an otherwise-plain object are dropped, not trusted.
+    fs.writeFileSync(sidecar, JSON.stringify({ t1: 'not-a-number', t2: -5, t3: 4.5, t4: 9 }), { mode: 0o600 });
+    const next = store.append({ taskId: 't2', model: 'm', category: 'vision', identityHash: 'h', result: 'passed', value: null });
+    // t2's bad entry (-5) is dropped; the log itself already shows t2 has never been used here,
+    // so its true next revision is computed from scratch, not from the rejected -5.
+    assert.equal(next.revision, 1);
+    const after = JSON.parse(fs.readFileSync(sidecar, 'utf8'));
+    assert.equal(after.t3, undefined, 'a non-integer value is dropped, not carried forward');
+    assert.equal(after.t4, 9, 'a valid entry alongside bad ones is preserved');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('the evidence log stays bounded and keeps the newest records per model, category and identity', () => {
   const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
   const { createStore } = require('./evidence.cjs');

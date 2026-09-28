@@ -405,6 +405,112 @@ test('a finished task records what the harness reported, and what it did not', a
   assert.match(r.job.result.identityHash, /^[0-9a-f]{64}$/);
 });
 
+test('checkpoints carry the base commit and the head commit the agent actually left, not just the branch', async () => {
+  let observedBase;
+  const r = await run({
+    script: async (h, cwd) => {
+      observedBase = execFileSync('git', ['rev-parse', 'HEAD'], { cwd, encoding: 'utf8' }).trim();
+      fs.writeFileSync(path.join(cwd, 'b.txt'), 'b');
+      execFileSync('git', ['add', '.'], { cwd, stdio: 'ignore' });
+      execFileSync('git', ['-c', 'user.email=qa@example.invalid', '-c', 'user.name=QA', 'commit', '-qm', 'second'], { cwd, stdio: 'ignore' });
+    },
+  });
+  assert.equal(r.job.checkpoint.baseSha, observedBase);
+  assert.match(r.job.checkpoint.headSha, /^[0-9a-f]{40}$/);
+  assert.notEqual(r.job.checkpoint.headSha, r.job.checkpoint.baseSha, 'the checkpoint sees the agent’s commit');
+  // The workspace is released once the task finishes, so a later read has nothing to report,
+  // never a stale or wrong sha for a tree that no longer exists.
+  assert.equal(r.workspaces.headSha(r.taskId), null);
+});
+
+test('a task on a repository with no commits yet checkpoints base and head as null, not a thrown error', async () => {
+  const dir = temp('noevia-hjobs-');
+  const jobs = createJobs({ dir });
+  const workspaces = createCodeWorkspaces({ dir, epoch: 'test' });
+  const emptyRepo = temp('noevia-hrepo-empty-');
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: emptyRepo, stdio: 'ignore' });
+  const harness = createCodeHarness({
+    jobs, workspaces, engine: () => ({ baseUrl: 'http://engine.test/v1', model: 'synthetic-coder', apiKey: null, contextTokens: 8192 }),
+    askApproval: async () => 'deny',
+  });
+  const started = await harness.start({
+    repoPath: emptyRepo, prompt: 'fix the bug',
+    connect: async () => ({ agent: {}, prompt: async () => ({ stopReason: 'end_turn' }) }),
+  });
+  for (let i = 0; i < 200 && !['completed', 'failed', 'cancelled'].includes(jobs.get(started.taskId)?.status); i++) {
+    await new Promise((res) => setTimeout(res, 5));
+  }
+  const job = jobs.get(started.taskId);
+  assert.equal(job.checkpoint.baseSha, null);
+  assert.equal(job.checkpoint.headSha, null);
+});
+
+test('the recorded head matches the branch in the SOURCE repository even after an uncommitted edit, not a pre-release snapshot (clone mode)', async () => {
+  // Clone mode is what a sandboxed harness runs under (CODE_HARNESS_USER set in production, see
+  // `mode` in code-workspace.cjs): only release() auto-commits whatever the agent left
+  // uncommitted, and only after that auto-commit is headSha's answer actually final.
+  const dir = temp('noevia-hjobs-');
+  const jobs = createJobs({ dir });
+  const workspaces = createCodeWorkspaces({ dir, treeRoot: temp('noevia-hshared-'), mode: 'clone', epoch: 'test' });
+  const repoPath = repo();
+  const harness = createCodeHarness({
+    jobs, workspaces, engine: () => ({ baseUrl: 'http://engine.test/v1', model: 'synthetic-coder', apiKey: null, contextTokens: 8192 }),
+    askApproval: async () => 'deny',
+  });
+  const started = await harness.start({
+    repoPath, prompt: 'leave uncommitted work',
+    connect: async ({ cwd }) => ({ agent: {}, prompt: async () => {
+      // Never committed by the agent — only noevia's own release-time auto-commit saves this.
+      fs.writeFileSync(path.join(cwd, 'wip.txt'), 'uncommitted');
+      return { stopReason: 'end_turn' };
+    } }),
+  });
+  for (let i = 0; i < 200 && !['completed', 'failed', 'cancelled'].includes(jobs.get(started.taskId)?.status); i++) {
+    await new Promise((res) => setTimeout(res, 5));
+  }
+  const job = jobs.get(started.taskId);
+  const branchHeadInSource = execFileSync('git', ['rev-parse', job.checkpoint.branch], { cwd: repoPath, encoding: 'utf8' }).trim();
+  assert.equal(job.checkpoint.headSha, branchHeadInSource, 'the checkpoint’s head is exactly the branch’s tip in the source repository');
+  assert.notEqual(job.checkpoint.headSha, job.checkpoint.baseSha, 'the release-time auto-commit moved the branch past base');
+});
+
+test('a throw from the corrected, post-release checkpoint is caught and logged, never masking the job’s real outcome', async () => {
+  const dir = temp('noevia-hjobs-');
+  const realJobs = createJobs({ dir });
+  const workspaces = createCodeWorkspaces({ dir, epoch: 'test' });
+  const logs = [];
+  let checkpointCalls = 0;
+  // `ctx.checkpoint` is called exactly twice by code-harness.cjs: once at the very start (before
+  // anything can fail), and once — the corrected one this test targets — inside the `finally`
+  // after release(). Everything else (the mid-run snapshot) goes through `ctx.event`, untouched.
+  const jobs = { ...realJobs, run: (id, work) => realJobs.run(id, (ctx) => work({
+    ...ctx,
+    checkpoint: (data) => {
+      checkpointCalls++;
+      if (checkpointCalls === 2) throw new Error('disk full, simulated');
+      return ctx.checkpoint(data);
+    },
+  })) };
+  const harness = createCodeHarness({
+    jobs, workspaces, log: (entry) => logs.push(entry),
+    engine: () => ({ baseUrl: 'http://engine.test/v1', model: 'synthetic-coder', apiKey: null, contextTokens: 8192 }),
+    askApproval: async () => 'deny',
+  });
+  const started = await harness.start({
+    repoPath: repo(), prompt: 'fix',
+    connect: async () => ({ agent: {}, prompt: async () => ({ stopReason: 'end_turn' }) }),
+  });
+  for (let i = 0; i < 200 && !['completed', 'failed', 'cancelled'].includes(realJobs.get(started.taskId)?.status); i++) {
+    await new Promise((res) => setTimeout(res, 5));
+  }
+  const job = realJobs.get(started.taskId);
+  assert.equal(job.status, 'completed', 'the real outcome is delivered even though the corrected checkpoint failed');
+  assert.ok(job.result, 'the result the run actually produced is still recorded');
+  assert.ok(job.checkpoint, 'the earlier checkpoint is still on record — nothing is left with no checkpoint at all');
+  assert.ok(logs.some((l) => l.event === 'code.cleanup_failed' && l.what === 'corrected checkpoint' && /disk full, simulated/.test(l.error)),
+    'the failure is logged, not swallowed silently');
+});
+
 test('a silent harness produces an honest record rather than zeroes', async () => {
   const r = await run({ script: async () => {} });
   const meta = r.job.result.meta;
