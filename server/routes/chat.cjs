@@ -33,7 +33,7 @@ function createChatRoutes({ json, readBody, bodyCap, rateLimited, diaryEnabled, 
     catch { return json(res, 400, { error: 'invalid JSON' }), true; }
     if (!isJsonObject(body)) return json(res, 400, { error: 'request body must be a JSON object' }), true;
     const shape = requestShapeError(body);
-    if (shape) return json(res, shape.status, { error: shape.error }), true;
+    if (shape) return json(res, shape.status, { error: shape.error, ...(shape.code ? { code: shape.code } : {}) }), true;
     if (body.mode === 'cowork') {
       const refused = coworkRefusal({ authn, harnessEnabled: harnessEnabled(), projectId: body.projectId }) || (startCoworkTask ? null : { status: 409, error: 'Cowork is not available on this server.' });
       if (refused) return json(res, refused.status, { error: refused.error, mode: 'cowork' }), true;

@@ -56,11 +56,12 @@ function createChatTurns({ enabled = false, resultCap = DEFAULT_RESULT_CAP } = {
       complete() { if (state.calls.some(c => c.status !== 'completed')) throw Error('Unresolved tools require review'); state.phase = 'completed'; save(); jobs.append(id, 'job.completed'); },
     };
   }
-  function start(workspace, { projectId = null, conversationId, messages, model, retries = 1 }) {
+  function start(workspace, { projectId = null, conversationId, messages, model, retries = 1, skill = null }) {
     if (!conversationId || !Number.isInteger(retries) || retries < 0) throw Error('Conversation and retry budget required');
     const jobs = store(workspace), id = jobs.create({ kind:'chat', projectId });
     jobs.append(id, 'checkpoint.created', { v:1, identity:{userId:workspace.userId,projectId,conversationId,turnId:crypto.randomUUID()},
-      phase:'ready', round:0, model:clone(model), models:[clone(model)], retries:{remaining:retries,fallbackRemaining:3}, messages:clone(messages), outputs:[], calls:[], projection:null });
+      phase:'ready', round:0, model:clone(model), models:[clone(model)], retries:{remaining:retries,fallbackRemaining:3}, messages:clone(messages), outputs:[], calls:[], projection:null,
+      ...(skill ? { skill: clone(skill) } : {}) }); // the exact pinned Skill version (#272); absent when unpinned
     jobs.append(id, 'job.started');
     return bind(workspace, id);
   }

@@ -83,6 +83,55 @@ function resolve(project, id, version, knownToolboxes = []) {
   const file = (project.files || []).find(f => f.name === manifest.file);
   return { manifest, content: file.content };
 }
+// Explicit, version-pinned invocation (#272). A pin names one Skill by its project-scoped id and
+// one exact artifact by SHA-256: `skill_<id>@<sha256>` or `{ id, version, contentHash }`, where
+// `version` is either the SHA-256 manifest version or the human label (then `contentHash` is
+// required). Only the reviewed, enabled content of the requesting project resolves; every other
+// case is an explicit error so a client never silently runs different instructions than it named.
+const SHA = /^[a-f0-9]{64}$/;
+const pinError = (status, code, message) => Object.assign(Error(message), { status, code });
+function parsePin(raw) {
+  let id, version, contentHash;
+  if (typeof raw === 'string') {
+    const at = raw.lastIndexOf('@');
+    if (at < 1) throw pinError(400, 'skill_pin_invalid', 'A pinned Skill must be "skillId@sha256" or { id, version, contentHash }.');
+    id = raw.slice(0, at); version = raw.slice(at + 1);
+  } else if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    ({ id, version, contentHash } = raw);
+  } else throw pinError(400, 'skill_pin_invalid', 'A pinned Skill must be "skillId@sha256" or { id, version, contentHash }.');
+  if (typeof id !== 'string' || !/^skill_[a-f0-9]{32}$/.test(id)) throw pinError(400, 'skill_pin_invalid', 'The pinned Skill id is malformed.');
+  if (version !== undefined && (typeof version !== 'string' || !version || version.length > 80)) throw pinError(400, 'skill_pin_invalid', 'The pinned Skill version is malformed.');
+  if (contentHash !== undefined && (typeof contentHash !== 'string' || !SHA.test(contentHash))) throw pinError(400, 'skill_pin_invalid', 'contentHash must be a lowercase SHA-256 digest.');
+  const versionIsHash = typeof version === 'string' && SHA.test(version);
+  if (versionIsHash && contentHash && contentHash !== version) throw pinError(409, 'skill_hash_mismatch', 'The pinned version and contentHash disagree.');
+  const digest = versionIsHash ? version : contentHash;
+  if (!digest) throw pinError(400, 'skill_pin_invalid', 'A pinned Skill needs an exact SHA-256 version or contentHash.');
+  return { id, digest, label: versionIsHash || version === undefined ? null : version };
+}
+function resolvePinned(project, raw, knownToolboxes = []) {
+  const pin = parsePin(raw);
+  // Manifests come only from the requesting project, which the caller loaded through the
+  // tenant-scoped project store; an id from any other project or tenant is simply unknown here.
+  const manifest = manifests(project, knownToolboxes).find(s => s.id === pin.id);
+  if (!manifest) throw pinError(404, 'skill_not_found', 'No such instruction skill in this project.');
+  if (!manifest.valid) throw pinError(422, 'skill_invalid', `This skill is invalid: ${manifest.error}`);
+  if (pin.digest !== manifest.version) {
+    const reviewed = project.instructionSkills?.[manifest.file]?.reviewedHash;
+    if (reviewed && pin.digest === reviewed) throw pinError(409, 'skill_version_changed', 'The pinned version is no longer the stored content; review the current version first.');
+    throw pinError(404, 'skill_version_unknown', 'This project holds no such version of the skill.');
+  }
+  if (pin.label !== null && pin.label !== manifest.versionLabel) throw pinError(409, 'skill_hash_mismatch', 'The pinned version label does not match the content hash.');
+  if (manifest.status === 'disabled') throw pinError(409, 'skill_disabled', 'This skill is disabled.');
+  if (manifest.status !== 'enabled') throw pinError(409, 'skill_version_unreviewed', 'This version awaits review. Review it in Sources before invoking it.');
+  if (!manifest.resolvable) throw pinError(422, 'skill_unsupported_requirements', 'This skill declares unsupported toolbox requirements.');
+  const file = (project.files || []).find(f => f.name === manifest.file);
+  const content = String(file?.content || '');
+  // Defence in depth: hash the stored source file itself, not the cached manifest. The prompt later
+  // receives this file's body with frontmatter stripped and a length cap applied.
+  if (hash(content) !== pin.digest) throw pinError(409, 'skill_hash_mismatch', 'The skill content does not match the pinned hash.');
+  return { manifest, content, record: { id: manifest.id, file: manifest.file, name: manifest.name,
+    versionLabel: manifest.versionLabel, version: manifest.version, contentHash: pin.digest, origin: manifest.origin.kind } };
+}
 function enabled(project) { return list(project).filter(skill => skill.status === 'enabled'); }
 function sources(project) { return (project.files || []).filter(file => !inspect(file, project)); }
 function reconcile(project) {
@@ -128,4 +177,4 @@ function read(project, file, current = project, offset = 0, cap = 8000) {
   return `${full ? 'Loaded instruction skill ' : prefix}${heading}${file.content.slice(offset, end)}${end < file.content.length ? suffix + end + '.' : ''}`;
 }
 function snapshot(project) { return structuredClone(project); }
-module.exports = { snapshot, inspect, list, enabled, sources, reconcile, setSelection, read, hash, skillId, manifests, resolve, MAX_BODY };
+module.exports = { snapshot, inspect, list, enabled, sources, reconcile, setSelection, read, hash, skillId, manifests, resolve, parsePin, resolvePinned, MAX_BODY };

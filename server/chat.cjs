@@ -149,14 +149,24 @@ function createChatHandler({
       if (project && body.projectId && !require('./project-modes.cjs').enabled(project, 'chat')) {
         return json(res, 409, { error: `${project.name} is not enabled for Chat. Turn Chat on in the project's settings.` });
       }
-      if (project && !chatId) {
-        chatId = `p-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-        saveChats(projectId, [{ id: chatId, title: 'New task', updatedAt: Date.now(), preview: '' }]);
-      }
     }
 
     let autoSkills = [];
     if (project) project = require('./instruction-skills.cjs').snapshot(project); // Pin reviewed skill bodies/config for this exchange.
+    // Explicit version-pinned Skill (#272). Absent means exactly the old behaviour. Resolved from the
+    // snapshot of the tenant-scoped project before any model, RAG or tool work, so a refusal costs nothing.
+    let pinnedSkill = null;
+    if (body.skill !== undefined && body.skill !== null) {
+      if (spaceId === 'diary' || !project) return json(res, 400, { error: 'A pinned Skill needs a project chat.', code: 'skill_pin_requires_project' });
+      if (body.compactOnly) return json(res, 400, { error: 'Compaction does not accept a pinned Skill.', code: 'skill_pin_invalid' });
+      try { pinnedSkill = require('./instruction-skills.cjs').resolvePinned(project, body.skill, allToolboxes().map((b) => b.id)); }
+      catch (error) { return json(res, error.status || 400, { error: error.message, code: error.code || 'skill_pin_invalid' }); }
+    }
+    // Created only after the pin resolved, so a refused request leaves no empty chat behind.
+    if (project && !chatId) {
+      chatId = `p-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      saveChats(projectId, [{ id: chatId, title: 'New task', updatedAt: Date.now(), preview: '' }]);
+    }
 
     // Project knowledge files: RAG retrieval replaces whole-file pasting (step 10).
     // rag.filesContext never throws; on any RAG failure it falls back to verbatim
@@ -198,12 +208,17 @@ function createChatHandler({
         );
         // L1 up front when one skill clearly matches this message, so a small model does not have
         // to remember to fetch it. Only reviewed, enabled skills from the pinned snapshot.
-        const picked = await chatSkillRouter.select(skills, message);
+        // An explicitly pinned skill replaces automatic selection for this message.
+        const picked = pinnedSkill ? { loaded: [] } : await chatSkillRouter.select(skills, message);
         if (picked.loaded.length) {
           autoSkills = picked.loaded;
           sysParts.push(require('./chat-skill-routing.cjs').skillBlock(autoSkills));
           console.log(`[skills] auto-loaded ${autoSkills.map((s) => s.file).join(', ')}`);
         }
+      }
+      if (pinnedSkill) {
+        sysParts.push(require('./chat-skill-routing.cjs').pinnedSkillBlock(pinnedSkill));
+        console.log(`[skills] pinned ${pinnedSkill.record.file}@${pinnedSkill.record.contentHash.slice(0, 12)}`);
       }
     }
 
@@ -434,7 +449,7 @@ function createChatHandler({
     res.once('close',()=>clearInterval(heartbeat));
     res.once('finish',()=>clearInterval(heartbeat));
     send({ type: 'meta', model, chatId: chatId || undefined, route: routedRole || undefined,
-      routingDecision: routingDecision || undefined,
+      routingDecision: routingDecision || undefined, skill: pinnedSkill?.record,
       sampling: sampling.source === 'none' ? undefined : { preset: sampling.presetId || undefined, source: sampling.source, values: sampling.params } });
     send({ type: 'telemetry', phase: 'waiting', model });
     send({ type: 'status', text: attachedImages.length ? 'Reading image sources — model loading and visual processing may take a moment…' : 'Preparing response…' });
@@ -534,7 +549,8 @@ function createChatHandler({
     // Scope shown on the reply ("Using: Drive, Tasks"), so a wrong pick is visible and reportable.
     const boxLabel = (id) => allToolboxes().find((b) => b.id === id)?.label || id;
     send({ type: 'tools_scope', text: routing.narrowed ? routing.ids.map(boxLabel).join(', ') : '' });
-    if (autoSkills.length) send({ type: 'skills_scope', text: autoSkills.map((s) => s.name).join(', ') });
+    if (pinnedSkill) send({ type: 'skills_scope', text: pinnedSkill.record.name });
+    else if (autoSkills.length) send({ type: 'skills_scope', text: autoSkills.map((s) => s.name).join(', ') });
     // When routing narrowed the list, the model may ask once for the rest. Widening only restores
     // the project's own selection, and every write still goes through the approval gate.
     let widened = false;
@@ -616,7 +632,7 @@ function createChatHandler({
     if(body.compactOnly){send({type:'done',model});res.end();return;}
     const turn = durableChat?.enabled && !spaceId?.startsWith('diary')
       ? durableChat.start(chatWorkspace, { projectId, conversationId: chatId || contextId,
-          messages: wire, model: { providerId:provider.id, id:model, effort, maxTokens:prepared.maxTokens, limit } }) : null;
+          messages: wire, model: { providerId:provider.id, id:model, effort, maxTokens:prepared.maxTokens, limit }, skill: pinnedSkill?.record }) : null;
     execution.turn = turn;
     let roundMessages = prepared.messages;
     // Prefill measurement (step 17). Timed per ROUND, because each round is its

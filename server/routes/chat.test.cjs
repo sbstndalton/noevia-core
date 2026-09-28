@@ -138,3 +138,14 @@ test('turnToolboxes must be a short list of ids', async () => {
   await ok.call();
   assert.deepEqual(ok.handled[0].turnToolboxes, ['web-search']);
 });
+
+test('a pinned Skill on a cowork request is refused with a code, and nothing starts (#272)', async () => {
+  const f = coworkFixture({ raw: JSON.stringify({ mode: 'cowork', projectId: 'p1', message: 'x', skill: `skill_${'0'.repeat(32)}@${'a'.repeat(64)}` }) });
+  await f.call();
+  assert.equal(f.sent[0].status, 400);
+  assert.equal(f.sent[0].body.code, 'skill_pin_unsupported_mode');
+  assert.equal(f.started.length + f.handled.length, 0);
+  const shape = coworkFixture({ raw: JSON.stringify({ message: 'hi', turnToolboxes: 'web-search' }) });
+  await shape.call();
+  assert.equal('code' in shape.sent[0].body, false, 'other shape errors are unchanged');
+});
