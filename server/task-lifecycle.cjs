@@ -40,6 +40,8 @@
 // exists, `reviewing`/`changes_requested`/`merged` are reachable only from tests exercising
 // this module directly, by design.
 
+const { canEnterReviewing } = require('./completeness-report.cjs');
+
 const STATES = Object.freeze([
   'planned',
   'implementing',
@@ -192,6 +194,16 @@ function safeDeriveLifecycle(events) {
   }
 }
 
+// Pure guard for a future `transition()` caller entering `reviewing` (#514, part of #511):
+// legal per the guarded state table AND the deterministic completeness report
+// (completeness-report.cjs) says nothing required is failing or unknown. Exported only —
+// nothing in this module calls it, `step()`/`deriveLifecycle()` are completely unaffected, and
+// today's derivation still NEVER reaches `reviewing` on its own (see the module header). A
+// future real review/merge feature calls this before its own `transition(from, 'reviewing')`.
+function canTransitionToReviewing(from, report) {
+  return canTransition(from, 'reviewing') && canEnterReviewing(report);
+}
+
 module.exports = {
   STATES,
   INITIAL_STATE,
@@ -203,4 +215,5 @@ module.exports = {
   foldEvents,
   deriveLifecycle,
   safeDeriveLifecycle,
+  canTransitionToReviewing,
 };
