@@ -81,8 +81,25 @@ function validateToolArguments(toolName, rawArgs) {
   return validator.feed(text) || validator.end();
 }
 
+// Hosted services whose terms allow only testing and evaluation and forbid personal or confidential
+// data (NVIDIA API Trial Terms §2.6/§4.3; the service also logs traffic). A custom OpenAI-compatible
+// provider pointed at one of these is treated as external whatever the row says, because the host
+// comes from the URL: a member cannot register it as an ordinary provider by leaving a flag off.
+const TRIAL_TERMS_HOSTS = ['nvidia.com'];
+
+function hostOf(baseUrl) {
+  try { return new URL(String(baseUrl)).hostname.toLowerCase().replace(/\.+$/, ''); } catch { return ''; }
+}
+
+/** True when the provider's endpoint is a third-party trial service (e.g. build.nvidia.com's
+ *  integrate.api.nvidia.com). Local NIM containers live on other hosts and are unaffected. */
+function isTrialTermsHost(provider) {
+  const host = hostOf(provider && provider.baseUrl);
+  return !!host && TRIAL_TERMS_HOSTS.some((h) => host === h || host.endsWith(`.${h}`));
+}
+
 function isExternalProvider(provider) {
-  return !!provider && (provider.kind === 'chatgpt-oauth' || provider.external === true);
+  return !!provider && (provider.kind === 'chatgpt-oauth' || provider.external === true || isTrialTermsHost(provider));
 }
 
 /** Why this request may not use this provider, or null. */
@@ -198,6 +215,7 @@ function evaluateToolCall({ provider, toolName, rawArgs, storage }) {
 module.exports = {
   PRIVATE_TOOLBOXES,
   isExternalProvider,
+  isTrialTermsHost,
   egressRefusal,
   stripPrivateToolboxes,
   toolRefusal,

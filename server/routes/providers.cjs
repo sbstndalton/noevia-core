@@ -39,6 +39,7 @@ const PASS = Symbol('unhandled');
 function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApproved, PROVIDERS, PROJECTS, DEFAULT_PROVIDER_ID, modelManager, currentWorkspace, saveProjects, registry, chatgptOAuth = null, chatgptEnabled = () => false }) {
   const { saveProviders, saveSharedProviders, maskKey } = registry;
   const chatgpt = require('../chatgpt-oauth.cjs');
+  const egress = require('../provider-egress.cjs');
   const chatgptOn = () => !!chatgptOAuth && chatgptEnabled();
 
   // The provider row that points this account's chats at its ChatGPT connection (no credential in it).
@@ -112,6 +113,7 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
           managed: pr.id === DEFAULT_PROVIDER_ID && modelManager.enabled,
           shared: !!pr.shared,
           defaultModel: pr.defaultModel || undefined,
+          ...(egress.isTrialTermsHost(pr) ? { external: true } : {}),
           ...(chatgpt.isChatGptProvider(pr) ? { kind: chatgpt.KIND, external: true, connection: chatgptOAuth.status(authn?.user?.id).state } : {}),
         })),
       });

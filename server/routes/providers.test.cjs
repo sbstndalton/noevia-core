@@ -107,3 +107,13 @@ test('removal protects the default, keeps shared rows for admins, and detaches p
   assert.equal(f.projects[1].model, 'local-model');
   assert.equal(f.saved.projects, 1);
 });
+
+test('the listing marks a provider on a trial-terms host (NVIDIA Build) as external, and only that one', async () => {
+  const f = fixture();
+  f.providers.push({ id: 'nv', label: 'NVIDIA Build (free trial)', baseUrl: 'https://integrate.api.nvidia.com/v1', apiKey: 'nvapi-synthetic0000' });
+  await f.call('GET', '/api/providers');
+  const { body } = f.sent.pop();
+  assert.equal(body.providers.find((p) => p.id === 'nv').external, true);
+  assert.equal(body.providers.find((p) => p.id === 'default').external, undefined);
+  assert.equal(body.providers.find((p) => p.id === 'shared-1').external, undefined);
+});
