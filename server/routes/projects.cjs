@@ -44,6 +44,7 @@ const PASS = Symbol('unhandled');
  * @param {object[]} deps.PROJECTS
  * @param {string[]} deps.DEFAULT_TOOLBOXES
  * @param {(boxes:any) => string[]|null} deps.sanitizeToolboxes
+ * @param {() => object[]} deps.allToolboxes
  * @param {(id:string) => object|null} deps.getProvider
  * @param {() => void} deps.ensureRolesLoaded
  * @param {() => Promise<{name:string, labels:string[]}[]|null>} deps.servedCatalogue
@@ -52,7 +53,7 @@ const PASS = Symbol('unhandled');
  */
 function createProjectRoutes({
   json, readBody, readJson, requestScope, dispatch, currentWorkspace, authService, storageClient, documents, documentSources, rag, fs, path,
-  reasoningEffort, projectAppearance, diaryExtras, PROJECTS, DEFAULT_TOOLBOXES, sanitizeToolboxes, getProvider, ensureRolesLoaded, servedCatalogue, DEFAULT_PROVIDER_ID, store,
+  reasoningEffort, projectAppearance, diaryExtras, PROJECTS, DEFAULT_TOOLBOXES, sanitizeToolboxes, allToolboxes = () => [{ id: 'core' }], getProvider, ensureRolesLoaded, servedCatalogue, DEFAULT_PROVIDER_ID, store,
 }) {
   const {
     getProject, saveProjects, createProject, pruneDocuments, sweepDeletedProject, withSourceLock, ensureProjectFolder, indexSource, ownsFile,
@@ -142,6 +143,18 @@ function createProjectRoutes({
       return json(res, 200, { ok: true });
     }
 
+    const skillManifestRoute = p.match(/^\/api\/projects\/([^/]+)\/instruction-skills\/manifests$/);
+    const skillContentRoute = p.match(/^\/api\/projects\/([^/]+)\/instruction-skills\/manifests\/([^/]+)\/content$/);
+    if (req.method === 'GET' && (skillManifestRoute || skillContentRoute)) {
+      const project = getProject(decodeURIComponent((skillManifestRoute || skillContentRoute)[1]));
+      if (!project) return json(res, 404, { error: 'No such project' });
+      const skills = require('../instruction-skills.cjs');
+      const known = allToolboxes().map(box => box.id);
+      if (skillManifestRoute) return json(res, 200, { schemaVersion: 1, skills: skills.manifests(project, known) });
+      try { return json(res, 200, skills.resolve(project, skillContentRoute[2], url.searchParams.get('version'), known)); }
+      catch (err) { return json(res, err.status || 400, { error: err.message }); }
+    }
+
     const skillRoute = p.match(/^\/api\/projects\/([^/]+)\/instruction-skills$/);
     if (skillRoute && ['GET', 'PUT'].includes(req.method)) {
       const project = getProject(decodeURIComponent(skillRoute[1]));
@@ -166,7 +179,11 @@ function createProjectRoutes({
       let content;
       try { content = await require('./plugin-directory.cjs').fetchPublishedSkill(body?.skill); } catch (e) { return json(res, e.status || 502, { error: e.message }); }
       const skills = require('../instruction-skills.cjs');
-      const file = { name: `${body.skill}/SKILL.md`, content };
+      const file = { name: `${body.skill}/SKILL.md`, content, skillOrigin: {
+        kind: 'published', publisher: 'Anthropic', repository: 'https://github.com/anthropics/skills',
+        sourceRef: 'main', sourcePath: `skills/${body.skill}/SKILL.md`,
+        digest: skills.hash(content), retrievedAt: new Date().toISOString(),
+      } };
       const inspected = skills.inspect(file, project);
       if (!inspected?.valid) return json(res, 422, { error: `This skill cannot be used as a project skill: ${inspected?.error || 'no skill frontmatter'}` });
       const files = Array.isArray(project.files) ? project.files : [];
@@ -294,7 +311,11 @@ function createProjectRoutes({
           .slice(0, Math.max(0, 60 - fromFolders.length))
           .map((f) => {
             const existing = prevFiles.find(p => !p.source && p.name === f.name);
-            return existing?.document || existing?.attachment ? existing : { name: f.name.slice(0, 200), content: f.content.slice(0, 200000) };
+            return existing?.document || existing?.attachment ? existing : {
+              name: f.name.slice(0, 200), content: f.content.slice(0, 200000),
+              // Preserve published provenance only while the exact copied bytes survive.
+              ...(existing?.content === f.content && existing?.skillOrigin ? { skillOrigin: existing.skillOrigin } : {}),
+            };
           });
         project.files = [...fromFolders, ...uploads];
         // RAG bookkeeping (step 10): drop chunks for removed files; index

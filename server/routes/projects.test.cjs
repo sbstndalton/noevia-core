@@ -65,6 +65,47 @@ test('paths and methods outside the project surface fall through', async () => {
   assert.equal(f.sent.length, 0);
 });
 
+test('portable skill routes preserve the legacy body list and require an exact enabled version', async () => {
+  const skills = require('../instruction-skills.cjs');
+  const content = '---\nname: Review\ndescription: Synthetic notes\nversion: 1\n---\nDraft from synthetic notes.';
+  const project = { id: 'p1', files: [{ name: 'review.md', content }], toolboxes: ['core'] };
+  skills.reconcile(project);
+  const f = fixture({ projects: [project] });
+  const base = '/api/projects/p1/instruction-skills';
+  await f.call('GET', base);
+  assert.equal(f.sent.pop().body.skills[0].content, content, 'existing UI list retains its body');
+  await f.call('GET', `${base}/manifests`);
+  const item = f.sent.pop().body.skills[0];
+  assert.equal(JSON.stringify(item).includes('Draft from synthetic notes.'), false);
+  await f.call('GET', `${base}/manifests/${item.id}/content`, undefined, `?version=${item.version}`);
+  assert.equal(f.sent.pop().status, 409);
+  await f.call('PUT', base, { file: 'review.md', enabled: true, hash: item.version });
+  assert.equal(f.sent.pop().status, 200);
+  await f.call('GET', `${base}/manifests/${item.id}/content`, undefined, `?version=${item.version}`);
+  assert.equal(f.sent.pop().body.content, content);
+  await f.call('GET', `${base}/manifests/${item.id}/content`, undefined, '?version=' + '0'.repeat(64));
+  assert.equal(f.sent.pop().status, 409);
+  await f.call('PUT', base, { file: 'review.md', enabled: false });f.sent.pop();
+  await f.call('GET', `${base}/manifests/${item.id}/content`, undefined, `?version=${item.version}`);
+  assert.equal(f.sent.pop().status, 409);
+  await f.call('GET', '/api/projects/missing/instruction-skills/manifests');
+  assert.equal(f.sent.pop().status, 404);
+});
+
+test('an unchanged source patch retains published provenance; a local edit clears it', async () => {
+  const content = '---\nname: Review\ndescription: Synthetic notes\n---\nDraft.';
+  const digest = require('../instruction-skills.cjs').hash(content);
+  const origin = { kind: 'published', publisher: 'Anthropic', digest, sourceRef: 'main' };
+  const project = { id: 'p1', files: [{ name: 'review.md', content, skillOrigin: origin }], toolboxes: ['core'] };
+  const f = fixture({ projects: [project] });
+  await f.call('POST', '/api/projects/p1/config', { files: [{ name: 'review.md', content }] });
+  assert.equal(f.sent.pop().status, 200);
+  assert.deepEqual(project.files[0].skillOrigin, origin);
+  await f.call('POST', '/api/projects/p1/config', { files: [{ name: 'review.md', content: content + '\nLocal edit.' }] });
+  assert.equal(f.sent.pop().status, 200);
+  assert.equal(project.files[0].skillOrigin, undefined);
+});
+
 test('creating and deleting a project keeps the original status codes and messages', async () => {
   const f = fixture();
   assert.equal(await f.call('POST', '/api/projects', '{oops'), true);

@@ -41,7 +41,9 @@ function inspect(file, project = {}) {
     if (meta.name.length > 160 || meta.description.length > 1024 || (meta.version || '').length > 80 || (meta.license || '').length > 500) throw Error('Metadata exceeds its length limit (name 160, description 1024, version 80, license 500).');
     const requires = (meta.requires || '').split(',').map(x => x.trim()).filter(Boolean);
     if (requires.length > 12 || requires.some(x => !/^[a-z][a-z0-9-]{0,79}$/.test(x))) throw Error('requires must be a comma-separated list of existing toolbox IDs.');
-    Object.assign(result, { name: meta.name, description: meta.description, version: meta.version || '', requires, valid: true });
+    const allowedTools = (meta['allowed-tools'] || '').split(/\s+/).filter(Boolean);
+    Object.assign(result, { name: meta.name, description: meta.description, version: meta.version || '',
+      license: meta.license || '', compatibility: meta.compatibility || '', allowedTools, requires, valid: true });
   } catch (err) { result.error = err.message; }
   const selection = project.instructionSkills?.[file.name];
   result.status = !result.valid ? 'invalid' : !selection?.reviewedHash ? 'review' :
@@ -51,6 +53,36 @@ function inspect(file, project = {}) {
 }
 
 function list(project) { return (project.files || []).map(file => inspect(file, project)).filter(Boolean); }
+// IDs are scoped to a project and a filename, never to display names or mutable content.
+const skillId = (project, file) => `skill_${hash(`${project.id || ''}\0${file}`).slice(0, 32)}`;
+function manifests(project, knownToolboxes = []) {
+  const known = new Set(knownToolboxes);
+  return list(project).map(skill => {
+    const file = (project.files || []).find(f => f.name === skill.file);
+    const origin = file?.skillOrigin?.kind === 'published' && file.skillOrigin.digest === skill.hash
+      ? file.skillOrigin : { kind: file?.source ? 'attached-folder' : 'project-file' };
+    const unsupportedToolboxes = skill.requires.filter(id => !known.has(id));
+    const unselectedToolboxes = skill.requires.filter(id => known.has(id) && !(project.toolboxes || ['core']).includes(id));
+    return {
+      schemaVersion: 1, id: skillId(project, skill.file), file: skill.file,
+      name: skill.name, description: skill.description, versionLabel: skill.version,
+      version: skill.hash, status: skill.status, valid: skill.valid, error: skill.error,
+      origin, compatibility: skill.compatibility || '', license: skill.license || '',
+      requirements: { toolboxes: skill.requires, allowedTools: skill.allowedTools || [], unsupportedToolboxes, unselectedToolboxes },
+      // Metadata declares needs only. Core chooses offered tools and approves each write.
+      resolvable: skill.status === 'enabled' && unsupportedToolboxes.length === 0,
+    };
+  });
+}
+function resolve(project, id, version, knownToolboxes = []) {
+  const manifest = manifests(project, knownToolboxes).find(s => s.id === id);
+  if (!manifest) throw Object.assign(Error('No such instruction skill in this project.'), { status: 404 });
+  if (!/^[a-f0-9]{64}$/.test(String(version || ''))) throw Object.assign(Error('A SHA-256 version is required.'), { status: 400 });
+  if (manifest.version !== version || manifest.status !== 'enabled') throw Object.assign(Error('The skill changed, is disabled, or awaits review.'), { status: 409 });
+  if (!manifest.resolvable) throw Object.assign(Error('This skill declares unsupported toolbox requirements.'), { status: 422 });
+  const file = (project.files || []).find(f => f.name === manifest.file);
+  return { manifest, content: file.content };
+}
 function enabled(project) { return list(project).filter(skill => skill.status === 'enabled'); }
 function sources(project) { return (project.files || []).filter(file => !inspect(file, project)); }
 function reconcile(project) {
@@ -96,4 +128,4 @@ function read(project, file, current = project, offset = 0, cap = 8000) {
   return `${full ? 'Loaded instruction skill ' : prefix}${heading}${file.content.slice(offset, end)}${end < file.content.length ? suffix + end + '.' : ''}`;
 }
 function snapshot(project) { return structuredClone(project); }
-module.exports = { snapshot, inspect, list, enabled, sources, reconcile, setSelection, read, hash, MAX_BODY };
+module.exports = { snapshot, inspect, list, enabled, sources, reconcile, setSelection, read, hash, skillId, manifests, resolve, MAX_BODY };

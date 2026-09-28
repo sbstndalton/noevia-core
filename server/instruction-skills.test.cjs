@@ -68,6 +68,49 @@ test('an ordinary note with a Name: line in the body (not the frontmatter) is no
 test('a genuine skill with name/description in frontmatter is still detected', () => {
  assert.equal(skills.inspect(file()).valid,true);
 });
+test('portable manifests have stable project-scoped IDs, metadata only, and exact reviewed resolution', () => {
+ const a={id:'owner-a',...fixture()}, b={id:'owner-b',...fixture()};
+ skills.reconcile(a); skills.reconcile(b);
+ const before=skills.manifests(a,['core'])[0];
+ assert.equal(before.schemaVersion,1);assert.equal(before.status,'review');
+ assert.equal(JSON.stringify(before).includes('Draft a synthetic review.'),false);
+ assert.notEqual(before.id,skills.manifests(b,['core'])[0].id);
+ assert.equal(before.version,skills.hash(a.files[0].content));
+ assert.throws(()=>skills.resolve(a,before.id,before.version,['core']),e=>e.status===409);
+ enable(a);
+ const ready=skills.manifests(a,['core'])[0];assert.equal(ready.id,before.id);assert.equal(ready.resolvable,true);
+ assert.equal(skills.resolve(a,ready.id,ready.version,['core']).content,a.files[0].content);
+ assert.throws(()=>skills.resolve(b,ready.id,ready.version,['core']),e=>e.status===404);
+ assert.throws(()=>skills.resolve(a,ready.id,'invalid',['core']),e=>e.status===400);
+ assert.throws(()=>skills.resolve(a,ready.id,'0'.repeat(64),['core']),e=>e.status===409);
+ skills.setSelection(a,{file:'review.md',enabled:false});
+ assert.throws(()=>skills.resolve(a,ready.id,ready.version,['core']),e=>e.status===409);
+ enable(a);a.files[0].content+=' updated';
+ assert.equal(skills.manifests(a,['core'])[0].status,'updated');
+ assert.throws(()=>skills.resolve(a,ready.id,ready.version,['core']),e=>e.status===409);
+});
+test('unsupported requirements block portable resolution without granting or selecting tools', () => {
+ const p={id:'p',files:[file('Body','name: Review\ndescription: Notes\nrequires: unavailable-box')],toolboxes:['core']};
+ skills.reconcile(p);enable(p);
+ const manifest=skills.manifests(p,['core'])[0];
+ assert.deepEqual(manifest.requirements.unsupportedToolboxes,['unavailable-box']);
+ assert.deepEqual(manifest.requirements.unselectedToolboxes,[]);
+ assert.equal(manifest.resolvable,false);
+ assert.throws(()=>skills.resolve(p,manifest.id,manifest.version,['core']),e=>e.status===422);
+ assert.deepEqual(p.toolboxes,['core']);
+ const known=skills.manifests(p,['core','unavailable-box'])[0];
+ assert.deepEqual(known.requirements.unselectedToolboxes,['unavailable-box']);
+ assert.equal(known.resolvable,true);
+});
+test('published provenance is shown only for the exact copied artifact', () => {
+ const p={id:'p',files:[file()],toolboxes:['core']};
+ const digest=skills.hash(p.files[0].content);
+ p.files[0].skillOrigin={kind:'published',publisher:'Anthropic',repository:'https://github.com/anthropics/skills',sourceRef:'main',digest,retrievedAt:'2026-09-27T00:00:00.000Z'};
+ skills.reconcile(p);
+ assert.equal(skills.manifests(p,['core'])[0].origin.digest,digest);
+ p.files[0].content+='\nLocal edit';
+ assert.deepEqual(skills.manifests(p,['core'])[0].origin,{kind:'project-file'});
+});
 test('a formerly-recorded candidate note is released by reconcile once it no longer matches', () => {
  const note={name:'meeting.md',content:'---\nname: Meeting\n---\nBody text.'};
  const p={files:[note]};skills.reconcile(p);
