@@ -114,6 +114,21 @@ test('history saves carry a revision; a save based on a stale revision is refuse
   assert.equal((await post('/api/chats/c-two-devices/history', { history: phone })).status, 200, 'saves without a base revision still work (older clients)');
 });
 
+test('an assistant turn keeps its sources across a reload, re-bounded on save (#552)', async () => {
+  const sources = [{ id: 'note-a.md', file: 'note-a.md', snippet: 'Synthetic passage', kind: 'excerpt', score: 0.812 }];
+  const history = [{ role: 'user', content: 'q' }, { role: 'assistant', content: 'a', sources }];
+  assert.equal((await post('/api/chats/c-sources-552/history', { history })).status, 200);
+  const read = JSON.parse((await request('/api/chats/c-sources-552/history', { headers: mutationHeaders() })).text).history;
+  assert.deepEqual(read[1].sources, sources);
+  const hostile = [{ role: 'assistant', content: 'a', sources: [{ file: 'x.md', snippet: 'y'.repeat(50_000), kind: 'excerpt' }, { nope: 1 }, 'str'] },
+    { role: 'user', content: 'u', sources }];
+  assert.equal((await post('/api/chats/c-sources-552b/history', { history: hostile })).status, 200);
+  const stored = JSON.parse((await request('/api/chats/c-sources-552b/history', { headers: mutationHeaders() })).text).history;
+  assert.equal(stored[0].sources.length, 1);
+  assert.ok(stored[0].sources[0].snippet.length <= 200);
+  assert.equal('sources' in stored[1], false, 'only assistant turns carry sources');
+});
+
 test('routing details round-trip through history and remain on conflict copies', async () => {
   const routingDecision = { offered: [{ id: 'fast', label: 'Short answer' }, { id: 'smart', label: 'Reasoning' }],
     scores: { fast: 0.2, smart: 0.8 }, selectedRole: 'smart', effectiveRole: 'smart',

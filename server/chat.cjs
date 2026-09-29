@@ -201,8 +201,12 @@ function createChatHandler({
     // rag.filesContext never throws; on any RAG failure it falls back to verbatim
     // injection (small files whole, big files capped) — the old behavior.
     let filesBlock = null;
+    let replySources = [];
     if (project && Array.isArray(project.files) && project.files.length) {
-      filesBlock = await rag.filesContext(project.id, require('./instruction-skills.cjs').sources(project), message, currentWorkspace().userId);
+      const readable = require('./instruction-skills.cjs').sources(project);
+      // #552: the chunks that went into the prompt, reported to the browser as a `sources` event.
+      filesBlock = await rag.filesContext(project.id, readable, message, currentWorkspace().userId,
+        (placed) => { replySources = require('./chat-sources.cjs').buildSources(placed, readable); });
     }
 
     const sysParts = [];
@@ -490,6 +494,7 @@ function createChatHandler({
     send({ type: 'meta', model, chatId: chatId || undefined, route: routedRole || undefined,
       routingDecision: routingDecision || undefined, skill: pinnedSkill?.record,
       sampling: sampling.source === 'none' ? undefined : { preset: sampling.presetId || undefined, source: sampling.source, values: sampling.params } });
+    if (replySources.length && !body.compactOnly) send({ type: 'sources', sources: replySources });
     send({ type: 'telemetry', phase: 'waiting', model });
     send({ type: 'status', text: attachedImages.length ? 'Reading image sources — model loading and visual processing may take a moment…' : 'Preparing response…' });
     let visionWarning = missingImages.length ? `Images were not read because their stored files are missing: ${missingImages.join(', ')}. Re-upload them.` : '';

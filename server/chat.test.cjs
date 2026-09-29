@@ -10,10 +10,10 @@ const { createToolExchange } = require('./tool-exchange.cjs');
 const { createApprovals } = require('./approvals.cjs');
 const { createApprovalRoutes } = require('./routes/approvals.cjs');
 
-async function runDriveCall(t, { name, savedMode = null, connected = true, decision = 'approve', policyDuringApproval = null, autoDecision = null, history = [], sampling = undefined, autoSamplingEnabled = undefined, message = 'Synthetic Drive request', codeRoleConfigured = false }) {
+async function runDriveCall(t, { name, files = [], ragOverride = null, savedMode = null, connected = true, decision = 'approve', policyDuringApproval = null, autoDecision = null, history = [], sampling = undefined, autoSamplingEnabled = undefined, message = 'Synthetic Drive request', codeRoleConfigured = false }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-drive-chat-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const user = { id: 'synthetic-user' }, project = { id: 'synthetic-project', model: 'synthetic-model', routing: autoDecision ? 'auto' : 'manual', toolboxes: ['core'], files: [], ...(sampling !== undefined ? { sampling } : {}) };
+  const user = { id: 'synthetic-user' }, project = { id: 'synthetic-project', model: 'synthetic-model', routing: autoDecision ? 'auto' : 'manual', toolboxes: ['core'], files, ...(sampling !== undefined ? { sampling } : {}) };
   const store = { workspace: { userId: user.id }, authn: { user } };
   const requestScope = { getStore: () => store, run: (_scope, fn) => fn() };
   const accounts = { forUser: () => ({ drive: { state: () => ({ state: connected ? 'connected' : 'disconnected' }) } }) };
@@ -48,7 +48,7 @@ async function runDriveCall(t, { name, savedMode = null, connected = true, decis
   };
   const handler = createChatHandler({
     fs, path, crypto, fetch, reasoningEffort: require('./reasoning-effort.cjs'), createToolExchange,
-    rag: { filesContext: async () => null }, prefill: { recordSample() {} }, reduceToolResult: require('./tool-result-reduce.cjs').reduceToolResult,
+    rag: ragOverride || { filesContext: async () => null }, prefill: { recordSample() {} }, reduceToolResult: require('./tool-result-reduce.cjs').reduceToolResult,
     HISTORY_CAP: 20, DEFAULT_PROVIDER_ID: 'default', DIARY_BASE: 'http://fixture.invalid', TOOL_RESULT_CAP: 8000,
     authService: { audit: (...args) => audits.push(args), db: autoSamplingEnabled === undefined ? undefined : { prepare: () => ({ get: () => ({ value: String(autoSamplingEnabled) }) }) } },
     toolPolicy: { mode: (_user, _tool, write) => currentMode === 'block' ? 'block' : write ? 'ask' : currentMode || 'allow' },
@@ -128,6 +128,34 @@ test('a pending Drive write still runs after approval when policy stays ask', as
   const result = await runDriveCall(t, { name: 'drive_trash_file', policyDuringApproval: async ({ decide }) => decide('approve') });
   assert.equal(result.approvals.length, 1);
   assert.deepEqual(result.executions, ['drive_trash_file']);
+});
+
+test('a project reply announces the sources placed in its prompt, bounded and limited to the project files (#552)', async (t) => {
+  const files = [{ name: 'note-a.md', content: 'A' }, { name: 'docs/big.txt', content: 'B', attachment: { id: 'att-1' } }];
+  const seen = [];
+  const ragOverride = { filesContext: async (_project, readable, _query, userId, onSources) => {
+    seen.push({ names: readable.map((f) => f.name), userId });
+    onSources([
+      { file: 'docs/big.txt', body: 'x'.repeat(5000), score: 0.83149, kind: 'excerpt' },
+      { file: 'other-tenant-secret.md', body: 'must not leak', score: 0.99, kind: 'excerpt' },
+      { file: 'note-a.md', body: '  short   note\n body ', kind: 'file' },
+    ]);
+    return 'Sources attached to this project';
+  } };
+  const r = await runDriveCall(t, { name: 'drive_read_file', files, ragOverride });
+  const ev = r.events.filter((e) => e.type === 'sources');
+  assert.equal(ev.length, 1);
+  assert.deepEqual(seen, [{ names: ['note-a.md', 'docs/big.txt'], userId: 'synthetic-user' }]);
+  assert.deepEqual(ev[0].sources.map((s) => [s.id, s.file, s.kind, s.score]), [['att-1', 'docs/big.txt', 'excerpt', 0.831], ['note-a.md', 'note-a.md', 'file', undefined]]);
+  assert.ok(ev[0].sources[0].snippet.length <= 200);
+  assert.equal(ev[0].sources[1].snippet, 'short note body');
+  assert.equal(JSON.stringify(ev).includes('must not leak'), false);
+  assert.ok(r.events.findIndex((e) => e.type === 'sources') < r.events.findIndex((e) => e.type === 'delta'), 'announced before the reply text');
+});
+
+test('no sources event when nothing was retrieved', async (t) => {
+  const r = await runDriveCall(t, { name: 'drive_read_file', files: [{ name: 'a.md', content: 'A' }], ragOverride: { filesContext: async (_p, _f, _q, _u, onSources) => { onSources([]); return null; } } });
+  assert.equal(r.events.some((e) => e.type === 'sources'), false);
 });
 
 test('Auto route detail reaches only its reply metadata and model replay stays role/content only', async (t) => {

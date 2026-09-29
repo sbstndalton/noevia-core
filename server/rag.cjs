@@ -539,7 +539,7 @@ async function searchProject(projectId, query, userId) {
 // The files-context for one chat message: retrieved chunks when the index has
 // vectors, otherwise the verbatim small files (old behavior, still the path
 // for anything <= DIRECT_INJECT_MAX). Never throws.
-async function filesContext(projectId, files, query, userId) {
+async function filesContext(projectId, files, query, userId, onSources) {
   if (!Array.isArray(files) || files.length === 0) return null;
   const small = files.filter((f) => String(f.content || '').length <= DIRECT_INJECT_MAX);
   const large = files.filter((f) => String(f.content || '').length > DIRECT_INJECT_MAX);
@@ -555,26 +555,29 @@ async function filesContext(projectId, files, query, userId) {
 
   const notices = files.map(f => documentNotice(f) || (f.attachment?.reason ? `${f.name}: ${f.attachment.reason}` : '')).filter(Boolean);
   const parts = [];
+  // What is placed in the prompt, in order, for the caller's optional onSources (#552).
+  const placed = [];
   if (ragAvailable() && large.length > 0) {
     const hits = await searchProject(projectId, query, userId);
     if (hits.length > 0) {
       const permitted = new Set(files.map(f => f.name));
-      for (const h of hits) if (permitted.has(h.file)) parts.push(frameUntrusted('excerpt', h.file, h.body));
+      for (const h of hits) if (permitted.has(h.file)) { parts.push(frameUntrusted('excerpt', h.file, h.body)); placed.push({ file: h.file, body: h.body, score: h.score, kind: 'excerpt' }); }
     }
   }
   // Whole small files (and, without hits, the head of each large file) are
   // added smallest first until FILES_CONTEXT_MAX_CHARS is spent; anything that
   // does not fit is named below so the model knows it exists.
   let budget = FILES_CONTEXT_MAX_CHARS - parts.reduce((n, x) => n + x.length, 0);
-  const candidates = small.map((f) => ({ f, text: frameUntrusted('file', f.name, f.content) }));
-  if (parts.length === 0) for (const f of large) candidates.push({ f, text: frameUntrusted('file excerpts', f.name, String(f.content).slice(0, LARGE_FILE_HEAD)) });
+  const candidates = small.map((f) => ({ f, text: frameUntrusted('file', f.name, f.content), body: String(f.content || '') }));
+  if (parts.length === 0) for (const f of large) candidates.push({ f, text: frameUntrusted('file excerpts', f.name, String(f.content).slice(0, LARGE_FILE_HEAD)), body: String(f.content).slice(0, LARGE_FILE_HEAD) });
   candidates.sort((a, b) => a.text.length - b.text.length);
   const omitted = [];
   for (const c of candidates) {
-    if (c.text.length <= budget) { parts.push(c.text); budget -= c.text.length; }
+    if (c.text.length <= budget) { parts.push(c.text); budget -= c.text.length; placed.push({ file: c.f.name, body: c.body, kind: 'file' }); }
     else omitted.push(c.f.name);
   }
   if (omitted.length) manifest += ` ${omitted.length} more file${omitted.length === 1 ? '' : 's'} not included (prompt size limit): ${omitted.map((n) => `"${n}"`).join(', ')}.`;
+  if (typeof onSources === 'function') { try { onSources(placed); } catch { /* a reporting hook never breaks the prompt */ } }
   const coverage = 'Source completeness: ' + (notices.join('\n') || 'Legacy text sources have no page completeness metadata.') + '\nContext may contain excerpts only. Use read_project_file with PDF startPage/endPage and offset for pages beyond the summary. Do not treat missing excerpts or failed/partial sources as evidence of absence.';
   return parts.length ? [manifest, coverage, ...parts].join('\n\n') : [manifest, coverage].join("\n");
 }

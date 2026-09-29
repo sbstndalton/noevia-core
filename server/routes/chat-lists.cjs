@@ -120,7 +120,7 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
             const revision = revisionOf(current);
             if (body.baseRevision !== revision) return json(res, 409, { error: 'This chat changed on another device.', history: current, revision });
           }
-          const next = Array.isArray(body.history) ? body.history.slice(-STORED_HISTORY_CAP) : [];
+          const next = Array.isArray(body.history) ? require('../chat-sources.cjs').sanitizeHistory(body.history.slice(-STORED_HISTORY_CAP)) : [];
           writeHistory(spaceId, next);
           return json(res, 200, { ok: true, revision: revisionOf(next) });
         } catch {
