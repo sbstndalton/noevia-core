@@ -123,6 +123,7 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
     const installed = await modelsInstalled();
     const m = installed.find((x) => x.name === name);
     if (!m) throw new Error(`model not installed: ${name}`);
+    if (m.missingFile) throw new Error(`model file missing: ${name}`);
     if (!m.loaded) {
       const result = await modelManager.load(name);
       if (!result.ok) throw new Error(`model could not load: ${name}`);
@@ -152,6 +153,22 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
     try { return await modelsInstalled(); } catch { return null; }
   }
 
+  // #545: the folder scan's list of model files, or null when it cannot be trusted. The cached scan
+  // is used when there is one (it is refreshed behind the proxy route); otherwise one bounded scan
+  // is read. An unreadable scan, or an empty one (the manager also reports an unmounted models
+  // volume as zero files), must never make every preset look missing.
+  async function folderScanFiles() {
+    let files = modelScanCache.get('models')?.body?.models;
+    if (!Array.isArray(files) && env.MODEL_LOADER_URL) {
+      const fresh = await fetchJson(`${env.MODEL_LOADER_URL.replace(/\/+$/, '')}/api/v1/models`, { method: 'GET', headers: { 'Content-Type': 'application/json', ...(env.MODEL_LOADER_TOKEN ? { 'X-Model-Loader-Token': env.MODEL_LOADER_TOKEN } : {}) } }, 8000).catch(() => null);
+      if (fresh?.ok && fresh.body && typeof fresh.body === 'object') {
+        modelScanCache.set('models', { at: Date.now(), body: fresh.body });
+        files = fresh.body.models;
+      }
+    }
+    return Array.isArray(files) && files.length ? files : null;
+  }
+
   async function modelsInstalled() {
     modelManager.requireEnabled();
     const [list, health] = await Promise.allSettled([
@@ -167,7 +184,14 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
         if (m.loaded && m.model_name) loadedNames.add(m.model_name);
       }
     }
-    const installed = (list.value.body?.data || [])
+    // Only a router entry that comes from a models.ini preset has a file in the models folder;
+    // download-cache models legitimately have none. Laya is included on purpose: its preset points
+    // at a GGUF that does not exist (it runs in its own sidecar), so it reads as missing too.
+    const rows = list.value.body?.data || [];
+    const scan = rows.some((m) => m.source === 'preset') ? await folderScanFiles().catch(() => null) : null;
+    const hasFile = (id) => scan.some((f) => f.modelId === id || (Array.isArray(f.sections) && f.sections.includes(id)));
+    const missingFile = (m) => !!scan && m.source === 'preset' && !hasFile(m.id || m.model_name);
+    const installed = rows
       // Some managers register cosmetic hash-ID duplicates; hide bare hash names.
       .filter((m) => !/^[0-9a-f]{32,40}$/i.test(m.id || m.model_name || ''))
       .map((m) => ({
@@ -178,8 +202,10 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
         mtp: require('./mtp.cjs').capability(m),
         maxContext: m.max_context_window || null,
         suggested: !!m.suggested,
-        status: m.status?.value || (loadedNames.has(m.id || m.model_name) ? 'loaded' : 'unloaded'),
-        failed: m.status?.failed === true,
+        status: missingFile(m) ? 'missing' : m.status?.value || (loadedNames.has(m.id || m.model_name) ? 'loaded' : 'unloaded'),
+        failed: m.status?.failed === true || missingFile(m),
+        // #545: a preset whose GGUF is not in the models folder. Never offered for chat, loading or tuning.
+        missingFile: missingFile(m),
         canDelete: m.can_remove !== false,
         // #336: distinct from canDelete (which the client falls back to a different delete path
         // for, when false — see routes/models.cjs). A model can_remove reports removable is still

@@ -16,7 +16,7 @@
 // up on the shared engine (ensureRolesLoaded).
 
 const PASS = Symbol('unhandled');
-const { isSystemModel, modelPathFromArgs, SYSTEM_MODEL_DELETE_REASON, isSidecarModel, SIDECAR_MODEL_DELETE_REASON } = require('../model-system.cjs');
+const { isSystemModel, modelPathFromArgs, SYSTEM_MODEL_DELETE_REASON, SYSTEM_MODEL_LOAD_REASON, SIDECAR_MODEL_LOAD_REASON, MISSING_MODEL_FILE_REASON, isSidecarModel, SIDECAR_MODEL_DELETE_REASON } = require('../model-system.cjs');
 
 // A client sees e.message only when it was written for people (publicMessage, or a 4xx status).
 // Everything else is logged here and replaced by a fixed sentence.
@@ -484,6 +484,17 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
         }
         if (!body.name) return json(res, 400, { error: 'name required' });
         if (!modelManager.enabled) return json(res, 404, { error: 'model management is disabled' });
+        // #548: Laya and the in-use embedding/reranker models are run by their own sidecars; a
+        // load would duplicate them in the router and an unload would silently break RAG. 409, not
+        // 400: a valid model, just not one this route may touch.
+        if (isSystemModel(body.name)) return json(res, 409, { error: SYSTEM_MODEL_LOAD_REASON });
+        if (isSidecarModel(body.name, env)) return json(res, 409, { error: SIDECAR_MODEL_LOAD_REASON });
+        // #545: a preset whose GGUF is gone can only fail to load. Unloading it stays allowed.
+        if (verb === 'load') {
+          let installed = null;
+          try { installed = await modelsInstalled(); } catch { installed = null; }
+          if (Array.isArray(installed) && installed.find((m) => m.name === body.name)?.missingFile) return json(res, 409, { error: MISSING_MODEL_FILE_REASON });
+        }
         if (verb === 'load' && body.mtp !== undefined && modelManager.kind === 'llamacpp') return json(res,400,{error:'Use the native preset editor to configure speculative decoding.'});
         if (verb === 'load' && body.mtp !== undefined) {
           const listing = await modelManager.listModels();

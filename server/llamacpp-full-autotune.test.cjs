@@ -589,3 +589,17 @@ test('shared family table drives the gpt-oss reasoning budget, and its sampling 
   const probes = f.requests.filter(r => QUALITY.some(q => q.prompt === r.prompt));
   assert.ok(probes.length > 0 && probes.every(r => r.reasoningEffort === 'low' && r.maxTokens === 512));
 });
+
+test('#545: the bulk untuned list skips presets whose model file is missing, and keeps the rest', async t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'full-tune-missing-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const { createFullAutotuner } = require('./llamacpp-full-autotune.cjs');
+  const rows = [{ id: 'present', source: 'preset', status: { args: [] } }, { id: 'ghost', source: 'preset', status: { args: [] } }];
+  const presets = { get: () => ({ exists: true, options: {}, defaults: {} }), files: () => ({}) };
+  const build = fileMissing => createFullAutotuner({ request: async () => ({ ok: true, body: {} }), rawModels: async () => ({ ok: true, body: { data: rows } }), presets,
+    maintenance: {}, applyUnlocked: async () => ({ ok: true }), identityFor: async m => ({ model: m }), stateFile: path.join(dir, 'tune.json'), ...(fileMissing ? { fileMissing } : {}) });
+  assert.deepEqual((await build().untuned()).body.models, ['present', 'ghost'], 'default: nothing is treated as missing');
+  const scan = (await build(row => row.id === 'ghost').untuned()).body;
+  assert.deepEqual(scan.models, ['present']);
+  assert.deepEqual(scan.skipped, [{ model: 'ghost', reason: 'Model file missing from the models folder' }]);
+});

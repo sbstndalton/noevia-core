@@ -664,3 +664,38 @@ test('evidence import never throws through the route when the source lookup fail
   await f.call('POST', '/api/models/evidence/import', { model: 'm' }, 'admin');
   assert.deepEqual(f.sent.pop(), { status: 200, body: { model: 'm', external: { state: 'unavailable' } } });
 });
+
+test('#548: load and unload refuse Laya and the in-use sidecar models with 409 and never reach the engine', async () => {
+  const calls = [];
+  const f = fixture({ env: { EMBEDDING_MODEL: 'nomic-embed-text-v1', NOEVIA_FEATURE_RAG_RERANK: '1', RERANK_MODEL: 'qwen3-reranker-0.6b-q8_0' },
+    manager: { load: async (n) => { calls.push(['load', n]); return { ok: true }; }, unload: async (n) => { calls.push(['unload', n]); return { ok: true }; } } });
+  for (const verb of ['load', 'unload']) {
+    for (const name of ['laya_multilingual_f16', 'nomic-embed-text-v1', 'qwen3-reranker-0.6b-q8_0']) {
+      await f.call('POST', `/api/models/${verb}`, { name }, 'admin');
+      const sent = f.sent.pop();
+      assert.equal(sent.status, 409, `${verb} ${name}`);
+      assert.match(sent.body.error, /not loaded or unloaded here/);
+    }
+  }
+  assert.deepEqual(calls, []);
+  await f.call('POST', '/api/models/load', { name: 'chat-7b' }, 'admin');
+  assert.equal(f.sent.pop().status, 200, 'an ordinary model still loads');
+  await f.call('POST', '/api/models/unload', { name: 'chat-7b' }, 'admin');
+  assert.equal(f.sent.pop().status, 200);
+  assert.deepEqual(calls, [['load', 'chat-7b'], ['unload', 'chat-7b']]);
+});
+
+test('#545: load refuses a preset whose model file is missing with 409, but unload is still allowed', async () => {
+  const calls = [];
+  const f = fixture({ modelsInstalled: async () => [{ name: 'ghost', missingFile: true, failed: true }, { name: 'ok', loaded: false }],
+    manager: { load: async (n) => { calls.push(['load', n]); return { ok: true }; }, unload: async (n) => { calls.push(['unload', n]); return { ok: true }; } } });
+  await f.call('POST', '/api/models/load', { name: 'ghost' }, 'admin');
+  const sent = f.sent.pop();
+  assert.equal(sent.status, 409);
+  assert.match(sent.body.error, /not in the models folder/);
+  assert.deepEqual(calls, []);
+  await f.call('POST', '/api/models/unload', { name: 'ghost' }, 'admin');
+  assert.equal(f.sent.pop().status, 200);
+  await f.call('POST', '/api/models/load', { name: 'ok' }, 'admin');
+  assert.equal(f.sent.pop().status, 200);
+});

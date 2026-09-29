@@ -249,6 +249,15 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     }
     return null;
   }
+  // #545: a preset-sourced router row whose GGUF is not on the read-only models mount. Unknown
+  // (no mount configured, or a path outside /models/) never counts as missing.
+  function presetFileMissing(row) {
+    if (!autoconfig.modelsPath || row?.source !== 'preset') return false;
+    const args = row.status?.args || [];
+    const i = args.findIndex(a => a === '--model' || a === '-m');
+    const file = (i >= 0 ? args[i + 1] : undefined) || (presets ? presets.files(row.id).model : undefined);
+    return typeof file === 'string' && file.startsWith('/models/') && !localFile(file);
+  }
   // The router reports each model's effective argv, which names its files even when the
   // model came from the download cache and has no preset section of its own.
   async function modelFiles(model) {
@@ -413,7 +422,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
   const managedGate={hold:()=>()=>{}};
   const autotuner=presets&&autotuneStatePath?(autotuneOptions.speedOnly===true
     ?require('./llamacpp-autotune.cjs').createAutotuner(speedDeps)
-    :require('./llamacpp-full-autotune.cjs').createFullAutotuner({request,rawModels,presets,maintenance,applyUnlocked,identityFor:speedDeps.identityFor,stateFile:autotuneStatePath,
+    :require('./llamacpp-full-autotune.cjs').createFullAutotuner({fileMissing:presetFileMissing,request,rawModels,presets,maintenance,applyUnlocked,identityFor:speedDeps.identityFor,stateFile:autotuneStatePath,
       samplingFor,
       readMemory:speedDeps.readMemory,memoryFloorGib:speedDeps.memoryFloorGib,
       ...(autotuneOptions.betweenModelsMs!=null?{betweenModelsMs:autotuneOptions.betweenModelsMs}:{}),

@@ -78,7 +78,9 @@ function clientMessage(e, fallback) {
 function createFullAutotuner({ request, rawModels, presets, maintenance, applyUnlocked, identityFor,
   contextFactory, samplingFor = null, stateFile, now = Date.now, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
   betweenModelsMs = 1000, idleTimeoutMs = 300000,
-  readMemory = require('./llamacpp-calibration.cjs').readMemAvailableGib, memoryFloorGib = 2, onResult = async () => {} }) {
+  readMemory = require('./llamacpp-calibration.cjs').readMemAvailableGib, memoryFloorGib = 2, onResult = async () => {},
+  // #545: true when a router row is a preset whose model file is not in the models folder.
+  fileMissing = () => false }) {
   let state;
   try { state = JSON.parse(fs.readFileSync(stateFile, 'utf8')); } catch { state = {}; }
   state.history ||= {};
@@ -104,6 +106,7 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
       if (isSystemModel(row.id, modelPathFromArgs(args))) {
         skipped.push({ model: row.id, reason: SYSTEM_MODEL_REASON }); continue;
       }
+      if (fileMissing(row)) { skipped.push({ model: row.id, reason: 'Model file missing from the models folder' }); continue; }
       if (!profile.exists || args.some(a => ['--embedding', '--embeddings', '--rerank', '--reranking'].includes(a)) ||
           ['embedding', 'embeddings', 'rerank', 'reranking'].some(k => ['true', '1', 'on'].includes(String(profile.options[k])))) {
         skipped.push({ model: row.id, reason: 'Not a configured chat model' }); continue;

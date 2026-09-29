@@ -6,7 +6,8 @@ const LABELS = { fast: 'Fast', smart: 'Smart', vision: 'Vision', code: 'Code' };
 /** Roles whose model is not in `installed`. An unknown catalogue (null) never reports anything. */
 function missingRoles(roles, installed) {
   if (!roles || !Array.isArray(installed)) return [];
-  const names = new Set(installed.map((m) => m.name));
+  // #545: a preset whose model file is gone is listed but cannot be served, so it counts as missing.
+  const names = new Set(installed.filter((m) => !m.missingFile).map((m) => m.name));
   return Object.keys(LABELS).filter((role) => roles[role] && !names.has(roles[role])).map((role) => ({ role, model: roles[role] }));
 }
 

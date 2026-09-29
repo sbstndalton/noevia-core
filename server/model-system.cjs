@@ -59,7 +59,12 @@ function isSidecarModel(name, env = process.env) {
 
 const SIDECAR_MODEL_DELETE_REASON = 'A running sidecar (embedding or reranking) depends on this model — not deleted';
 
+const SYSTEM_MODEL_LOAD_REASON = 'System routing model runs in its own service — it is not loaded or unloaded here';
+const SIDECAR_MODEL_LOAD_REASON = 'A running sidecar (embedding or reranking) manages this model — it is not loaded or unloaded here';
+const MISSING_MODEL_FILE_REASON = 'This preset points at a model file that is not in the models folder — it cannot be loaded';
+
 module.exports = {
+  SYSTEM_MODEL_LOAD_REASON, SIDECAR_MODEL_LOAD_REASON, MISSING_MODEL_FILE_REASON,
   isSystemModel, modelPathFromArgs, SYSTEM_MODEL_REASON, SYSTEM_MODEL_DELETE_REASON,
   sidecarModelNames, isSidecarModel, SIDECAR_MODEL_DELETE_REASON,
 };

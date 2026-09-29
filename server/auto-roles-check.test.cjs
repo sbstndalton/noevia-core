@@ -4,6 +4,11 @@ const { missingRoles, staleRolesError } = require('./auto-roles-check.cjs');
 
 const installed = [{ name: 'Qwen3.5-4B-Q5_K_M' }, { name: 'Ornith-1.5-9B-Q5_K_M' }];
 
+test('#545: a role pointing at a preset whose model file is missing counts as missing', () => {
+  const rows = [{ name: 'ok' }, { name: 'ghost', missingFile: true }];
+  assert.deepEqual(missingRoles({ fast: 'ok', smart: 'ghost' }, rows), [{ role: 'smart', model: 'ghost' }]);
+});
+
 test('roles that name served models are not missing', () => {
   assert.deepEqual(missingRoles({ fast: 'Qwen3.5-4B-Q5_K_M', smart: 'Ornith-1.5-9B-Q5_K_M' }, installed), []);
 });

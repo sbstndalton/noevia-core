@@ -37,7 +37,7 @@ test('modelsInstalled hides hash duplicates, marks loaded models and remembers t
   assert.equal(f.service.lastLoadedModel(), null);
   const installed = await f.service.modelsInstalled();
   assert.deepEqual(installed.map((m) => m.name), ['embed-1', 'chat-7b', 'failed-x']);
-  assert.deepEqual(installed[1], { name: 'chat-7b', sizeGB: 4.3, loaded: true, labels: [], mtp: installed[1].mtp, maxContext: 8192, suggested: true, status: 'loaded', failed: false, canDelete: false, sidecarProtected: false, source: null });
+  assert.deepEqual(installed[1], { name: 'chat-7b', sizeGB: 4.3, loaded: true, labels: [], mtp: installed[1].mtp, maxContext: 8192, suggested: true, status: 'loaded', failed: false, canDelete: false, sidecarProtected: false, missingFile: false, source: null });
   assert.equal(installed[0].sizeGB, 0.6);
   assert.equal(installed[2].status, 'failed');
   assert.equal(installed[2].failed, true);
@@ -177,4 +177,41 @@ test('a checkpoint becomes a namespaced user model name', () => {
   assert.equal(service.deriveUserModelName('org/Model-7B:Q4_K_M'), 'user.Model-7B-Q4_K_M');
   assert.equal(service.deriveUserModelName('org/Model 7B'), 'user.Model-7B');
   assert.equal(service.deriveUserModelName('bare'), 'user.bare');
+});
+
+test('#545: a models.ini preset whose file is not in the folder scan reads as missing and failed; cache-sourced models and other presets are untouched', async () => {
+  const f = fixture({
+    env: { MODEL_LOADER_URL: 'http://loader' },
+    models: [
+      { id: 'laya_multilingual_f16', source: 'preset', size: 0 },
+      { id: 'present-7b', source: 'preset', size: 4 },
+      { id: 'renamed-section', source: 'preset', size: 2 },
+      { id: 'from-cache', source: 'cache', size: 1 },
+    ],
+    fetchJson: async () => ({ ok: true, status: 200, body: { models: [
+      { key: 'a.gguf', modelId: 'present-7b', sections: ['present-7b'] },
+      { key: 'b.gguf', modelId: 'b', sections: ['renamed-section'] },
+    ] } }),
+  });
+  const installed = await f.service.modelsInstalled();
+  const by = Object.fromEntries(installed.map((m) => [m.name, m]));
+  assert.equal(by.laya_multilingual_f16.missingFile, true);
+  assert.equal(by.laya_multilingual_f16.failed, true);
+  assert.equal(by.laya_multilingual_f16.status, 'missing');
+  assert.equal(by['present-7b'].missingFile, false);
+  assert.equal(by['renamed-section'].missingFile, false, 'a section renamed to a short id still owns its file');
+  assert.equal(by['from-cache'].missingFile, false, 'download-cache models have no folder file by design');
+  await assert.rejects(f.service.ensureModelLoaded('laya_multilingual_f16'), /file missing/);
+});
+
+test('#545: an unreadable or empty folder scan never marks presets missing', async () => {
+  const models = [{ id: 'x', source: 'preset' }];
+  for (const fetchJson of [async () => ({ ok: false, status: 502 }), async () => { throw new Error('down'); }, async () => ({ ok: true, status: 200, body: { models: [] } })]) {
+    const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, models, fetchJson });
+    const [row] = await f.service.modelsInstalled();
+    assert.equal(row.missingFile, false);
+    assert.equal(row.failed, false);
+  }
+  const noLoader = fixture({ models });
+  assert.equal((await noLoader.service.modelsInstalled())[0].missingFile, false);
 });
