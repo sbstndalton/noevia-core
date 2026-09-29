@@ -1,0 +1,14 @@
+{
+  "notes": [
+    "docker unreachable",
+    "container not found",
+    "warming up…",
+    "port unknown",
+    "timeout",
+    "connection refused",
+    "request failed",
+    "invalid response",
+    "not reachable from the model loader (Docker reports it healthy)"
+  ],
+  "soft": ["no models configured"]
+}
