@@ -157,3 +157,27 @@ test('prune keeps a replaced image that a chat transcript still references, and 
   assert.equal(project.retiredAssets, undefined);
   assert.equal(fs.existsSync(path.join(workspace.assetDir(project.id), second.attachment.assetId)), true);
 });
+
+test('every reason the server writes carries a stable id the browser can translate (#607)', async (t) => {
+  const textFile = makeTextFile(t);
+  const binary = await textFile('binary.txt', [0x89, 0x50, 0x4e, 0x47, 0x00, 0x1a, 0x0a, 0x00, 0xff]);
+  assert.equal(binary.attachment.reasonId, 'binaryText');
+  assert.equal(binary.attachment.reasonParams, undefined);
+  const latin = await textFile('legacy.txt', [0x47, 0x72, 0xfc, 0xdf, 0x65]);
+  assert.equal(latin.attachment.reasonId, 'encoding');
+  assert.deepEqual({ ...latin.attachment.reasonParams }, { encoding: 'windows-1252' });
+  const clean = await textFile('clean.txt', Buffer.from('plain', 'utf8'));
+  assert.equal('reasonId' in clean.attachment, false);
+  const { workspace, project } = setup(t);
+  const docx = await uploads.ingest(workspace, project, 'a.docx', Buffer.from('synthetic docx'), { extractDocx: async () => ({ text: 'Body', truncated: false }) });
+  assert.equal(docx.attachment.reasonId, 'docxPartial');
+  const limited = await uploads.ingest(workspace, project, 'b.docx', Buffer.from('synthetic docx b'), { extractDocx: async () => ({ text: 'Body', truncated: true }) });
+  assert.equal(limited.attachment.reasonId, 'docxPartialLimit');
+  const empty = await uploads.ingest(workspace, project, 'c.docx', Buffer.from('synthetic docx c'), { extractDocx: async () => ({ text: '   ', truncated: false }) });
+  assert.equal(empty.attachment.reasonId, 'docxEmpty');
+  const broken = await uploads.ingest(workspace, project, 'd.docx', Buffer.from('synthetic docx d'), { extractDocx: async () => { throw Error('zip exploded'); } });
+  assert.equal(broken.attachment.reasonId, undefined);
+  assert.equal(broken.attachment.reason, 'zip exploded');
+  // The English sentence stays alongside the id for API clients that do not translate.
+  assert.match(binary.attachment.reason, /not readable as text/);
+});

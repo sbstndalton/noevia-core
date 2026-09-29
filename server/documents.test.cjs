@@ -22,6 +22,7 @@ test('text PDF preserves synthetic dates, signed amounts and total', async () =>
 test('scans, encrypted PDFs and malformed bytes fail explicitly', async () => {
   const scan = await documents.extractDocumentText('scanned.pdf', fixture('scanned.pdf'));
   assert.equal(scan.state, 'failed'); assert.match(scan.error, /OCR/);
+  assert.ok(['noNativeText', 'noOcrText'].includes(scan.errorId), 'noevia-written extraction errors carry an id the browser translates (#607)');
   await assert.rejects(documents.extractDocumentText('encrypted.pdf', fixture('encrypted.pdf')), /Password/i);
   await assert.rejects(documents.extractDocumentText('malformed.pdf', fixture('malformed.pdf')), /parse this PDF/);
 });

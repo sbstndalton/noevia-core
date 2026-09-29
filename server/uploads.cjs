@@ -84,7 +84,7 @@ async function ingest(workspace, project, name, bytes, { connection, source, rem
   const temp = path.join(dir, id + '.' + crypto.randomUUID());
   fs.writeFileSync(temp, bytes, { mode: 0o600 }); fs.renameSync(temp, path.join(dir, id));
   let file = { name: fullName, content: '' };
-  let state = 'stored', reason, readerVersion;
+  let state = 'stored', reason, reasonId, reasonParams, readerVersion;
   if (documents.isDocument(name)) {
     progress('Extracting PDF text / OCR');
     file = await sources.ingest(workspace, project.id, fullName, bytes, previous);
@@ -93,28 +93,31 @@ async function ingest(workspace, project, name, bytes, { connection, source, rem
     progress('Reading DOCX body text and tables');
     if (previous?.attachment?.id === id && previous.attachment.readerVersion === docx.VERSION && previous.content) {
       file.content = previous.content; state = previous.attachment.state;
-      reason = previous.attachment.reason; readerVersion = docx.VERSION;
+      reason = previous.attachment.reason; reasonId = previous.attachment.reasonId; readerVersion = docx.VERSION;
     } else try {
       const result = await extractDocx(bytes);
-      if (!result.text.trim()) throw Error('No body text was recovered from this DOCX. The original is kept.');
+      if (!result.text.trim()) throw Object.assign(Error('No body text was recovered from this DOCX. The original is kept.'), { reasonId: 'docxEmpty' });
+      reasonId = 'docxPartial';
       reason = 'DOCX body text and tables only; layout, images, headers, footers, comments and footnotes are not interpreted.';
       file.content = (`[${reason}]\n\n` + result.text).slice(0,200000);
       state = 'partial'; readerVersion = docx.VERSION;
-      if (result.truncated || result.text.length + reason.length + 4 > 200000) reason += ' Text extraction limit reached.';
-    } catch (err) { reason = String(err.message || 'DOCX reader unavailable').slice(0,300); }
+      if (result.truncated || result.text.length + reason.length + 4 > 200000) { reason += ' Text extraction limit reached.'; reasonId = 'docxPartialLimit'; }
+    } catch (err) { reason = String(err.message || 'DOCX reader unavailable').slice(0,300); reasonId = err.reasonId; }
   } else if (group === 'Text') {
     const decoded = decodeText(bytes);
     if (decoded) {
       file.content = decoded.text.slice(0, 200000);
       state = bytes.length > 200000 ? 'partial' : decoded.encoding === 'utf-8' ? 'ready' : 'partial';
+      if (decoded.encoding !== 'utf-8') { reasonId = 'encoding'; reasonParams = { encoding: decoded.encoding }; }
       if (decoded.encoding !== 'utf-8') reason = `Not valid UTF-8; read as ${decoded.encoding}. Characters outside that encoding may be wrong — re-save the file as UTF-8 if anything looks mangled.`;
     } else {
       state = 'stored';
+      reasonId = 'binaryText';
       reason = 'This file is not readable as text — it looks like binary data despite its extension. The original is kept.';
     }
   } else if (mime) state = 'vision';
   workspace.assertActive?.();
-  file.attachment = { id, bytes: bytes.length, group, state, ...(reason ? {reason} : {}), ...(readerVersion ? {readerVersion} : {}), ...(group === 'Images' && bytes.length > 8 * 1024 * 1024 ? { reason: 'Original stored; resize below 8 MB for model image input.' } : {}) };
+  file.attachment = { id, bytes: bytes.length, group, state, ...(reason ? {reason} : {}), ...(reasonId ? {reasonId} : {}), ...(reasonParams ? {reasonParams} : {}), ...(readerVersion ? {readerVersion} : {}), ...(group === 'Images' && bytes.length > 8 * 1024 * 1024 ? { reason: 'Original stored; resize below 8 MB for model image input.', reasonId: 'imageTooLarge', reasonParams: undefined } : {}) };
   if (source || connection) file.source = source || project.projectFolder;
   // Replacing a vision image with a stored-only original must also retire its
   // old model input. Otherwise chat silently describes the previous bytes.

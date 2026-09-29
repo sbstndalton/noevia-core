@@ -43,7 +43,7 @@ async function ingest(workspace, projectId, name, bytes, previous) {
     document: { version, byteHash, bytes: bytes.length, extractor: documents.EXTRACTOR_VERSION,
       state: out.state, stale, availableVersion, availableByteHash: stale ? previous.document?.availableByteHash : byteHash, pages: out.pages, truncated: out.truncated,
       pageStatus: out.pageTexts.map(p => ({ number: p.number, status: p.status })),
-      error: out.error, indexing: stale || previous?.document?.availableVersion === availableVersion ? previous?.document?.indexing || 'unavailable' : 'pending' } };
+      error: out.error, ...(out.errorId ? { errorId: out.errorId } : {}), indexing: stale || previous?.document?.availableVersion === availableVersion ? previous?.document?.indexing || 'unavailable' : 'pending' } };
 }
 function failed(previous, name, reason) {
   return { ...previous, name, content: previous?.content || '', document: {

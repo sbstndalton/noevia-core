@@ -108,14 +108,14 @@ async function extractDocumentText(name, bytes, {
   }
   // What the text caps still allow OCR to add, as the walk left it.
   let remaining = TOTAL_TEXT_CAP - pageTexts.reduce((n, p) => n + (p.text ? p.text.length : 0), 0);
-  let retryable = false, ocrError;
+  let retryable = false, ocrError, ocrErrorId;
   const candidates = pageTexts.filter(p => ['ocr-needed', 'unreadable'].includes(p.status));
   if (ocrEnabled && candidates.length) {
     try {
       const results = await extractPages(bytes, candidates.slice(0, 50).map(p => p.number));
       for (const p of candidates.slice(0, 50)) {
         const result = results.find(r => r.number === p.number);
-        if (!result || result.error) { retryable = true; ocrError = result?.error || 'OCR response omitted pages; refresh to retry.'; continue; }
+        if (!result || result.error) { retryable = true; ocrError = result?.error || 'OCR response omitted pages; refresh to retry.'; ocrErrorId = result?.error ? undefined : 'ocrOmittedPages'; continue; }
         const text = typeof result.text === 'string' ? result.text.trim() : '';
         if (!text) { p.status = 'unreadable'; continue; }
         const addition = `\n[OCR transcription — verify numbers against original]\n${text}`;
@@ -126,10 +126,14 @@ async function extractDocumentText(name, bytes, {
         p.status = p.truncated ? 'truncated' : 'ocr';
         p.method = 'native+ocr';
       }
-      if (candidates.length > 50) ocrError = 'OCR limited to 50 image-bearing pages per document.';
-    } catch (err) { retryable = true; ocrError = String(err.message || err).slice(0, 300); }
+      if (candidates.length > 50) { ocrError = 'OCR limited to 50 image-bearing pages per document.'; ocrErrorId = 'ocrPageLimit'; }
+    } catch (err) { retryable = true; ocrError = String(err.message || err).slice(0, 300); ocrErrorId = undefined; }
   }
   const assembled = assemble(pageTexts, numPages, { retryable });
-  return { ...assembled, error: ocrError || (assembled.state === 'failed' ? (ocrEnabled ? 'No readable text was recovered by OCR; try a clearer scan or an unlocked original.' : 'No readable native text. Scanned or image-based content needs OCR; OCR is not installed.') : undefined) };
+  // errorId (#607) is the stable id of the message when noevia wrote it, so the browser can show it
+  // in the interface language; an error that came from the OCR service or a library stays as it is.
+  const noText = assembled.state === 'failed' && !ocrError;
+  return { ...assembled, error: ocrError || (noText ? (ocrEnabled ? 'No readable text was recovered by OCR; try a clearer scan or an unlocked original.' : 'No readable native text. Scanned or image-based content needs OCR; OCR is not installed.') : undefined),
+    ...(ocrError ? (ocrErrorId ? { errorId: ocrErrorId } : {}) : noText ? { errorId: ocrEnabled ? 'noOcrText' : 'noNativeText' } : {}) };
 }
 module.exports = { isDocument, documentExtensions, extractDocumentText, DOCUMENT_EXTENSIONS, EXTRACT_CAP, EXTRACTOR_VERSION, PAGE_CAP, TOTAL_TEXT_CAP };
