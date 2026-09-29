@@ -67,8 +67,10 @@ function normalizeReplayHistory(mapped, newMessage) {
 
 function createChatHandler({
   stepSupervision = null, durableChat = null, fs, path, crypto, fetch, codeTasksFor = () => [], reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, diaryStorageRetry = (send) => send(true), autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, toolGate = null, DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse,
-  chatgptOAuth = null, chatgptEnabled = () => false,
+  chatgptOAuth = null, chatgptEnabled = () => false, skillHistory = null,
 }) {
+  // Revoked Skill content in earlier turns (#546): one ledger per handler, cached in memory.
+  const skillLedger = skillHistory || require('./skill-history.cjs').createSkillHistory({ fs, path });
   async function handleChat(req, res, body, authn) {
     let preparation;
     const execution = {};
@@ -132,7 +134,7 @@ function createChatHandler({
       .filter((h) => h && ['user', 'assistant', 'tool', 'function'].includes(h.role) && typeof h.content === 'string' && h.content)
       .slice(-HISTORY_CAP)
       .map((h) => (h.role === 'tool' || h.role === 'function') && typeof h.name === 'string' ? { role: h.role, content: h.content, name: h.name } : { role: h.role, content: h.content });
-    const msgs = body.compactOnly ? normalizeReplayHistory(mappedHistory) : normalizeReplayHistory(mappedHistory, message);
+    let msgs = body.compactOnly ? normalizeReplayHistory(mappedHistory) : normalizeReplayHistory(mappedHistory, message);
 
     // ── Project context: instructions + knowledge files prepend
     // the system message for every chat in the project.
@@ -154,6 +156,24 @@ function createChatHandler({
     let autoSkills = [];
     if (project) project = require('./instruction-skills.cjs').snapshot(project); // Pin reviewed skill bodies/config for this exchange.
     const instructionSkills = require('./instruction-skills.cjs');
+    // A Skill an earlier turn loaded and that is now disabled or changed does not ride along in the
+    // client's history (#546): its body is replaced with a placeholder, judged only from server
+    // records (skill-history.cjs). Enabled Skills, user messages and Skill-free chats are untouched.
+    let revokedInHistory = [];
+    if (project && chatWorkspace?.dir) {
+      const scrubbed = skillLedger.scrub({ dir: chatWorkspace.dir, project, messages: mappedHistory, chatId });
+      if (scrubbed.removed.length) {
+        revokedInHistory = scrubbed.removed;
+        msgs = body.compactOnly ? normalizeReplayHistory(scrubbed.messages) : normalizeReplayHistory(scrubbed.messages, message);
+        console.log(`[skills] removed revoked skill text from history: ${revokedInHistory.join(', ')}`);
+      }
+    }
+    // Every Skill version put in front of the model is recorded for that scrub, with the chat that
+    // loaded it, before it is used. Never for an account whose workspace was deleted meanwhile.
+    const rememberSkill = (file, hash, name, content) => {
+      if (project && chatWorkspace?.dir) skillLedger.record(chatWorkspace.dir, project, { file, hash, name, content }, { chatId, assertActive: assertWorkspaceActive });
+    };
+    const historyNote = (names) => `Earlier replies in this chat used ${names.length === 1 ? 'Skill' : 'Skills'} ${names.map((n) => JSON.stringify(n)).join(', ')}, which ${names.length === 1 ? 'is' : 'are'} now disabled or changed. ${names.length === 1 ? 'Its' : 'Their'} instructions were left out of this request.`;
     const chatUser = requestScope.getStore()?.authn?.user || null;
     // The toolbox ids this request carries, before the provider is known (the external-provider
     // strip comes later). One function, so the Skill requirement check (#272) and the tool loop
@@ -196,6 +216,8 @@ function createChatHandler({
       chatId = `p-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       saveChats(projectId, [{ id: chatId, title: 'New task', updatedAt: Date.now(), preview: '' }]);
     }
+    // Recorded once the chat id is known, so the ledger knows which chat loaded it (#546).
+    if (pinnedSkill) rememberSkill(pinnedSkill.record.file, pinnedSkill.record.contentHash, pinnedSkill.record.name, pinnedSkill.content);
 
     // Project knowledge files: RAG retrieval replaces whole-file pasting (step 10).
     // rag.filesContext never throws; on any RAG failure it falls back to verbatim
@@ -253,7 +275,7 @@ function createChatHandler({
           autoSkills = picked.loaded;
           autoSkillBlock = require('./chat-skill-routing.cjs').skillBlock(autoSkills);
           sysParts.push(autoSkillBlock);
-          for (const s of autoSkills) loadedSkills.set(s.file, { hash: s.hash, name: s.name });
+          for (const s of autoSkills) { loadedSkills.set(s.file, { hash: s.hash, name: s.name }); rememberSkill(s.file, s.hash, s.name, s.content); }
           console.log(`[skills] auto-loaded ${autoSkills.map((s) => s.file).join(', ')}`);
         }
       }
@@ -557,7 +579,9 @@ function createChatHandler({
     }
 
     send({ type: 'status', text: 'Generating response…' });
-    if (visionWarning) send({ type: 'warning', text: visionWarning });
+    const imageWarning = visionWarning;
+    const replyWarning = () => [imageWarning, revokedInHistory.length ? historyNote(revokedInHistory) : ''].filter(Boolean).join(' ');
+    if (replyWarning()) send({ type: 'warning', text: replyWarning() });
 
     // ── Tool rounds (Pi-style loop, master step 13): stream a completion; if
     // the model called a tool, execute it, append role:'tool' results, and
@@ -635,7 +659,7 @@ function createChatHandler({
       let added = false;
       for (const skill of instructionSkills.list(project)) {
         if (skill.status !== 'enabled' || loadedSkills.has(skill.file)) continue;
-        if (skill.file === name || text.includes(skill.hash)) { loadedSkills.set(skill.file, { hash: skill.hash, name: skill.name }); added = true; }
+        if (skill.file === name || text.includes(skill.hash)) { loadedSkills.set(skill.file, { hash: skill.hash, name: skill.name }); rememberSkill(skill.file, skill.hash, skill.name, skill.content); added = true; }
       }
       if (added) recordLoadedSkills();
     };
@@ -830,6 +854,17 @@ function createChatHandler({
     }
     for (let round = 0; round < 3 && !chatSignal.signal.aborted; round++) {
       if (revokedSkills()) break; // a loaded skill was disabled or changed: no further model round
+      // #546: a Skill disabled while this request was being prepared (routing, RAG, vision,
+      // compaction) is taken out of the earlier turns too, against the project as stored now.
+      if (round === 0 && project && chatWorkspace?.dir) {
+        const current = getProject(project.id);
+        const again = current ? skillLedger.scrub({ dir: chatWorkspace.dir, project: current, messages: roundMessages, chatId }) : null;
+        if (again?.removed.length) {
+          roundMessages = again.messages;
+          const fresh = again.removed.filter((n) => !revokedInHistory.includes(n));
+          if (fresh.length) { revokedInHistory = [...revokedInHistory, ...fresh]; send({ type: 'warning', text: replyWarning() }); }
+        }
+      }
       let roundBudget=context.measure(roundMessages,activeTools,limit,limitSource,model),roundCompacted=false;
       if(roundBudget.used>roundBudget.threshold) {
         try {

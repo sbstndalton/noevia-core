@@ -109,8 +109,9 @@ test('the Sources list carries the portable id, origin and bundled scripts', () 
 
 // ── Chat loop ──
 
-async function run(t, { reqBody = {}, fixture = project(), rounds = [], onExecute, onApproval, streamDelayMs = 0, provider, known = ['core', 'web-search'], user, stepSupervision = null } = {}) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-skill-port-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+async function run(t, { reqBody = {}, fixture = project(), rounds = [], onExecute, onApproval, streamDelayMs = 0, provider, known = ['core', 'web-search'], user, stepSupervision = null, dir: sharedDir = null, userId = 'user-a', router = null } = {}) {
+  // `dir` is the account's workspace, shared across runs to model several turns of one account.
+  const dir = sharedDir || fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-skill-port-')); if (!sharedDir) t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const events = [], res = new EventEmitter(), saved = [], audits = []; let reply = null;
   res.writeHead = () => {}; res.write = (line) => events.push(JSON.parse(line.slice(6))); res.end = () => { res.writableEnded = true; res.emit('finish'); };
   const requests = [], executed = []; let approvals = 0, routerInput = null;
@@ -129,7 +130,7 @@ async function run(t, { reqBody = {}, fixture = project(), rounds = [], onExecut
     })() };
   };
   const durableChat = createChatTurns({ enabled: true });
-  const workspace = { userId: 'user-a', dir, assetDir: () => '/synthetic-only' };
+  const workspace = { userId, dir, assetDir: () => '/synthetic-only' };
   const getProject = (id) => (id === fixture.id ? fixture : null); // the live store: edits show at once
   const writes = new Set(['synthetic_write']);
   const { handleChat } = createChatHandler({
@@ -138,7 +139,7 @@ async function run(t, { reqBody = {}, fixture = project(), rounds = [], onExecut
     HISTORY_CAP: 20, DEFAULT_PROVIDER_ID: 'default', createToolExchange, currentWorkspace: () => workspace, getProject,
     skillsIndexFor: (p) => skills.enabled(p), getProvider: (id) => (provider && id === provider.id ? provider : { id: 'default', baseUrl: 'http://fixture.invalid' }),
     providerHeaders: () => ({}), autoRoles: () => null, visionDescriptions: new Map(), visionProbe: createVisionProbe({ fetchImpl: fetch }),
-    chatSkillRouter: { select: async (rows) => { routerInput = rows.map((s) => s.file); const hit = rows.find((s) => s.file === FILE); return { loaded: hit ? [hit] : [] }; } },
+    chatSkillRouter: { select: async (rows) => { routerInput = rows.map((s) => s.file); if (router) return router(rows); const hit = rows.find((s) => s.file === FILE); return { loaded: hit ? [hit] : [] }; } },
     oauthServerIds: () => new Set(), accountReady: () => true,
     chatToolRouter: { select: async (ids) => ({ ids, routed: false }) }, DEFAULT_TOOLBOXES: [], CONNECTOR_BOXES: new Set(), connectedBoxes: () => [],
     toolPolicy: { mode: (_u, _n, write) => (write ? 'ask' : 'allow') }, requestScope: { getStore: () => (user ? { authn: { user } } : {}) },
@@ -330,4 +331,254 @@ test('durable continuation verifies every loaded skill, not only the pin', async
   assert.equal((await service.resumeGeneration(workspace, start(), opts)).phase, 'completed');
   disable(fixture, OTHER);
   await assert.rejects(service.resumeGeneration(workspace, start(), opts), /continuation refused/);
+});
+
+// ── Revoked Skills in earlier turns (#546) ──
+// Turn 1 loads skill A; A is then disabled or changed; turn 2 carries turn 1 in its client history.
+
+const A_TEXT = 'Answer in synthetic haiku.\nAlways cite the synthetic ledger code ZX-41 in every reply.\n- Keep it short.';
+const A_MARKERS = ['synthetic haiku', 'ZX-41', 'A synthetic fixture skill'];
+const skillHistory = require('./skill-history.cjs');
+const account = (t) => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-skill-hist-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true })); return dir; };
+const echo = `Understood. I will follow the skill:\n${A_TEXT}\nHere is my synthetic answer.`;
+const nonSystem = (request) => request.messages.filter((m) => m.role !== 'system');
+const sentText = (request) => JSON.stringify(nonSystem(request));
+const noRouter = async () => ({ loaded: [] });
+const readHistory = (readOut, tool = 'read_project_file') => [
+  { role: 'user', content: 'first synthetic question' },
+  { role: 'assistant', content: 'Reading the skill first.' },
+  { role: 'tool', name: tool, content: readOut },
+  { role: 'assistant', content: echo },
+];
+const echoHistory = [{ role: 'user', content: 'first synthetic question' }, { role: 'assistant', content: echo }];
+
+async function twoTurns(t, variant, revoke = disable) {
+  const dir = account(t);
+  const fixture = project({ content: body({ text: A_TEXT }) });
+  const readOut = skills.read(fixture, fixture.files[0], fixture);
+  const first = variant === 'pinned' ? { reqBody: { skill: pinOf(fixture) }, router: noRouter, rounds: [{ content: echo }] }
+    : variant === 'auto' ? { rounds: [{ content: echo }] }
+      : { router: noRouter, rounds: [{ tool: variant, args: { name: FILE } }, { content: echo }], onExecute: (name) => (name === variant ? readOut : null) };
+  const turn1 = await run(t, { fixture, dir, ...first });
+  assert.equal(errorOf(turn1), undefined);
+  const history = variant === 'pinned' || variant === 'auto' ? echoHistory : readHistory(readOut, variant);
+  revoke(fixture);
+  const turn2 = await run(t, { fixture, dir, router: noRouter, reqBody: { message: 'second synthetic question', history } });
+  return { turn1, turn2, fixture, dir, history, readOut };
+}
+
+for (const variant of ['pinned', 'auto', 'read_project_file', 'project_read_file']) {
+  test(`history (#546): a ${variant} skill disabled after turn 1 leaves none of its body in turn 2's model request`, async (t) => {
+    const { turn1, turn2 } = await twoTurns(t, variant);
+    if (variant === 'pinned' || variant === 'auto') assert.match(turn1.requests[0].messages[0].content, /ZX-41/, 'turn 1 did load the skill');
+    assert.equal(turn2.requests.length, 1);
+    const all = JSON.stringify(turn2.requests[0].messages);
+    for (const marker of A_MARKERS) assert.equal(all.includes(marker), false, `no "${marker}" anywhere in turn 2`);
+    assert.match(sentText(turn2.requests[0]), /\[Skill \\"synthetic-helper\\" was disabled or changed, and its instructions were removed\]/);
+    assert.match(sentText(turn2.requests[0]), /Here is my synthetic answer\./, 'the rest of the earlier reply is kept');
+    assert.match(sentText(turn2.requests[0]), /first synthetic question/);
+    const warning = turn2.events.find((e) => e.type === 'warning');
+    assert.match(warning?.text || '', /Earlier replies in this chat used Skill "synthetic-helper", which is now disabled or changed/);
+    assert.ok(turn2.events.some((e) => e.type === 'done'), 'the new reply runs normally');
+  });
+}
+
+test('history (#546): a skill that is still enabled at the same hash is kept exactly', async (t) => {
+  const { turn2, history } = await twoTurns(t, 'read_project_file', () => {});
+  const sent = nonSystem(turn2.requests[0]);
+  assert.match(JSON.stringify(sent), /ZX-41/);
+  assert.equal(sent.find((m) => m.role === 'assistant').content.includes(history[2].content.slice(0, 200)), true, 'the read result is replayed as before');
+  assert.equal(turn2.events.some((e) => e.type === 'warning'), false);
+});
+
+test('history (#546): a changed hash is treated as revoked, even when the new version is enabled', async (t) => {
+  const { turn2 } = await twoTurns(t, 'read_project_file', (fixture) => {
+    const next = body({ text: 'Answer in plain synthetic prose.\n- Keep it short.' });
+    fixture.files[0].content = next;
+    fixture.instructionSkills[FILE] = { enabled: true, reviewedHash: skills.hash(next) };
+  });
+  const all = JSON.stringify(nonSystem(turn2.requests[0]));
+  for (const marker of ['synthetic haiku', 'ZX-41']) assert.equal(all.includes(marker), false, `no "${marker}" from the old version`);
+  assert.match(all, /was disabled or changed/);
+});
+
+test('history (#546): a skill removed from the project is revoked through the ledger', async (t) => {
+  const { turn2 } = await twoTurns(t, 'auto', (fixture) => { fixture.files.shift(); delete fixture.instructionSkills[FILE]; });
+  assert.equal(JSON.stringify(turn2.requests[0].messages).includes('ZX-41'), false);
+});
+
+test('history (#546): a disabled skill loaded before the ledger existed is recognised by its SHA-256 only', async (t) => {
+  const fixture = project({ content: body({ text: A_TEXT }) });
+  const readOut = skills.read(fixture, fixture.files[0], fixture);
+  disable(fixture);
+  const r = await run(t, { fixture, dir: account(t), router: noRouter, reqBody: { history: readHistory(readOut) } });
+  const sent = JSON.stringify(nonSystem(r.requests[0]));
+  assert.equal(sent.includes(skills.hash(fixture.files[0].content)), false, 'the reader output naming it is removed');
+  assert.equal(sent.includes('A synthetic fixture skill'), false);
+  assert.match(sent, /was disabled or changed/);
+  // With no ledger entry there is no record that this chat loaded it, so an echo stays (documented limit).
+  assert.match(sent, /Here is my synthetic answer/);
+});
+
+test('history (#546): another tenant\'s or another project\'s skill with the same name is not affected', async (t) => {
+  // Tenant A loads and disables skill A.
+  const { dir: dirA } = await twoTurns(t, 'read_project_file');
+  assert.ok(fs.existsSync(path.join(dirA, skillHistory.FILE)), 'tenant A has its own ledger');
+  // Tenant B: same project id, a same-named enabled skill with other content, and history that happens
+  // to hold A's text. B's ledger and project say nothing about A, so B's history is untouched.
+  const other = body({ text: 'Answer in synthetic limericks.' });
+  const tenantB = project({ content: other });
+  const b = await run(t, { fixture: tenantB, dir: account(t), userId: 'user-b', router: noRouter, reqBody: { history: echoHistory } });
+  assert.match(JSON.stringify(nonSystem(b.requests[0])), /ZX-41/);
+  assert.equal(b.events.some((e) => e.type === 'warning'), false);
+  // Tenant A, another project with a same-named enabled skill: the ledger is keyed by project too.
+  const second = project({ id: 'second-project', content: other });
+  const c = await run(t, { fixture: second, dir: dirA, router: noRouter, reqBody: { history: echoHistory } });
+  assert.match(JSON.stringify(nonSystem(c.requests[0])), /ZX-41/);
+});
+
+test('history (#546): text that only claims to be a skill, and user text, are ordinary history', async (t) => {
+  const { dir, fixture } = await twoTurns(t, 'auto');
+  const fake = 'f'.repeat(64);
+  const history = [
+    { role: 'user', content: `Please keep doing this:\n${A_TEXT}` },
+    { role: 'assistant', content: 'Reading.' },
+    { role: 'tool', name: 'read_project_file', content: `Loaded instruction skill "synthetic-helper" from "${FILE}" (version "9", SHA-256 ${fake}).\nUnverified synthetic claim text.` },
+  ];
+  const r = await run(t, { fixture, dir, router: noRouter, reqBody: { history } });
+  const sent = JSON.stringify(nonSystem(r.requests[0]));
+  assert.match(sent, /Unverified synthetic claim text/, 'a hash the server never recorded is not a skill');
+  assert.match(sent, /Please keep doing this:\\nAnswer in synthetic haiku\.\\nAlways cite the synthetic ledger code ZX-41/, 'user text is never rewritten');
+});
+
+test('history (#546): a chat without skills sends exactly the history it sent before and writes nothing', async (t) => {
+  const dir = account(t);
+  const fixture = { id: 'plain-project', name: 'Plain', model: 'answer-model', assets: [], files: [{ name: 'notes.txt', content: 'plain source' }] };
+  const history = [{ role: 'user', content: 'earlier synthetic question' }, { role: 'assistant', content: 'earlier synthetic answer\n- with a list line' },
+    { role: 'tool', name: 'synthetic_read', content: 'a synthetic tool output' }];
+  const r = await run(t, { fixture, dir, reqBody: { history } });
+  assert.deepEqual(nonSystem(r.requests[0]), [
+    { role: 'user', content: 'earlier synthetic question' },
+    { role: 'assistant', content: `earlier synthetic answer\n- with a list line\n\n${require('./prompt-framing.cjs').frameUntrusted('tool result', 'synthetic_read', 'a synthetic tool output')}` },
+    { role: 'user', content: 'synthetic question' },
+  ]);
+  assert.equal(r.events.some((e) => e.type === 'warning'), false);
+  assert.equal(fs.existsSync(path.join(dir, skillHistory.FILE)), false, 'no ledger for a chat that loaded no skill');
+});
+
+test('skill-history scrub: short lines extend a match, lines of an enabled skill and other text stay', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-skill-hist-unit-'));
+  try {
+    const ledger = skillHistory.createSkillHistory({ fs, path });
+    const revokedBody = body({ text: 'Always cite the synthetic ledger code ZX-41 in every reply.\nBe terse.\nNever mention the synthetic weather service.\nShared line kept by the enabled skill.' });
+    const p = project({ content: revokedBody, other: true });
+    const otherFile = p.files.find((f) => f.name === OTHER);
+    otherFile.content = body({ name: 'other-helper', text: 'Shared line kept by the enabled skill.' });
+    p.instructionSkills[OTHER] = { enabled: true, reviewedHash: skills.hash(otherFile.content) };
+    const version = { file: FILE, name: 'synthetic-helper', hash: skills.hash(revokedBody), content: revokedBody };
+    assert.equal(ledger.record(dir, p, version, { chatId: 'chat-1' }), true);
+    assert.equal(ledger.record(dir, p, version, { chatId: 'chat-1' }), false, 'idempotent');
+    assert.equal(fs.readFileSync(path.join(dir, skillHistory.FILE), 'utf8').includes('ZX-41'), false, 'the ledger keeps fingerprints, not text');
+    const messages = [{ role: 'assistant', content: 'Intro.\n\nAlways cite the synthetic ledger code ZX-41 in every reply.\nBe terse.\nNever mention the synthetic weather service.\n\nShared line kept by the enabled skill.\nBe terse.\nOutro.' }];
+    assert.equal(ledger.scrub({ dir, project: p, messages, chatId: 'chat-1' }).messages, messages, 'enabled: nothing to do, same array back');
+    disable(p);
+    const out = ledger.scrub({ dir, project: p, messages, chatId: 'chat-1' });
+    assert.deepEqual(out.removed, ['synthetic-helper']);
+    assert.equal(out.messages[0].content, `Intro.\n\n${skillHistory.placeholder(['synthetic-helper'])}\n\nShared line kept by the enabled skill.\nBe terse.\nOutro.`);
+    assert.equal(messages[0].content.includes('ZX-41'), true, 'the input is not mutated');
+    assert.equal(ledger.scrub({ dir, project: p, messages, chatId: 'chat-2' }).messages, messages, 'a chat that never loaded it: its text is not matched');
+    // A fresh handler reads the same ledger from disk.
+    const reloaded = skillHistory.createSkillHistory({ fs, path });
+    const removed = structuredClone(p); removed.files.shift(); delete removed.instructionSkills[FILE];
+    assert.deepEqual(reloaded.scrub({ dir, project: removed, messages, chatId: 'chat-1' }).removed, ['synthetic-helper']);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ── #546 review follow-ups ──
+
+const CODE_SKILL = 'Always cite the synthetic ledger code ZX-41 in every reply.\nNever mention the synthetic weather service.\n```python\nimport numpy as np\n```\nLet me know if you have any questions.';
+
+test('history (#546 review): one common line and a code fence shared with a revoked skill stay, with no warning', async (t) => {
+  const dir = account(t);
+  const fixture = project({ content: body({ text: CODE_SKILL }) });
+  await run(t, { fixture, dir, reqBody: { skill: pinOf(fixture) }, router: noRouter }); // this chat loaded it
+  disable(fixture);
+  const code = 'Here is the synthetic script:\n```python\nimport numpy as np\nprint(np.zeros(3))\n```\nLet me know if you have any questions.';
+  const history = [{ role: 'user', content: 'write synthetic code' }, { role: 'assistant', content: code }];
+  const r = await run(t, { fixture, dir, router: noRouter, reqBody: { history } });
+  assert.equal(nonSystem(r.requests[0])[1].content, code, 'the code block reaches the model unchanged');
+  assert.equal(r.events.some((e) => e.type === 'warning'), false);
+  // A real echo (two identifying lines) in another chat that never loaded the skill is not matched either.
+  const echoOf = [{ role: 'user', content: 'q' }, { role: 'assistant', content: 'Always cite the synthetic ledger code ZX-41 in every reply.\nNever mention the synthetic weather service.' }];
+  const other = await run(t, { fixture, dir, router: noRouter, reqBody: { chatId: 'another-chat', history: echoOf } });
+  assert.match(JSON.stringify(nonSystem(other.requests[0])), /ZX-41/);
+  assert.equal(other.events.some((e) => e.type === 'warning'), false);
+  // The same echo in the chat that loaded it is removed.
+  const same = await run(t, { fixture, dir, router: noRouter, reqBody: { history: echoOf } });
+  assert.equal(JSON.stringify(same.requests[0].messages).includes('ZX-41'), false);
+});
+
+test('history (#546 review): switching off a skill that was never enabled leaves history unchanged', async (t) => {
+  const content = body({ text: A_TEXT });
+  const fixture = project({ content });
+  fixture.instructionSkills[FILE] = { enabled: false, reviewedHash: null }; // awaiting review
+  skills.setSelection(fixture, { file: FILE, enabled: false }); // switched off from review
+  assert.equal(skills.list(fixture)[0].status, 'disabled');
+  const r = await run(t, { fixture, dir: account(t), router: noRouter, reqBody: { history: echoHistory } });
+  assert.equal(nonSystem(r.requests[0])[1].content, echo);
+  assert.equal(r.events.some((e) => e.type === 'warning'), false);
+});
+
+test('history (#546 review): a skill disabled while the request is prepared is removed before the first model request', async (t) => {
+  const dir = account(t);
+  const fixture = project({ content: body({ text: A_TEXT }) });
+  await run(t, { fixture, dir, reqBody: { skill: pinOf(fixture) }, router: noRouter, rounds: [{ content: echo }] });
+  // Enabled when the history is first checked; disabled by the time routing finishes.
+  const r = await run(t, { fixture, dir, router: async () => { disable(fixture); return { loaded: [] }; }, reqBody: { history: echoHistory } });
+  assert.equal(r.requests.length, 1);
+  assert.equal(JSON.stringify(r.requests[0].messages).includes('ZX-41'), false);
+  assert.match(r.events.filter((e) => e.type === 'warning').at(-1)?.text || '', /Skill "synthetic-helper", which is now disabled or changed/);
+});
+
+test('skill-history (#546 review): an inactive account records nothing and its folder is not recreated', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-skill-hist-gone-'));
+  try {
+    const dir = path.join(root, 'deleted-account');
+    const ledger = skillHistory.createSkillHistory({ fs, path });
+    const p = project();
+    const ok = ledger.record(dir, p, { file: FILE, name: 'synthetic-helper', hash: skills.hash(p.files[0].content), content: p.files[0].content },
+      { chatId: 'c', assertActive: () => { throw Error('Workspace was deleted'); } });
+    assert.equal(ok, false);
+    assert.equal(fs.existsSync(dir), false);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('skill-history (#546 review): a corrupt ledger is moved aside, and malformed entries are dropped without breaking chat', async (t) => {
+  const dir = account(t);
+  fs.writeFileSync(path.join(dir, skillHistory.FILE), '{not json');
+  const p = project({ content: body({ text: A_TEXT }) });
+  const version = { file: FILE, name: 'synthetic-helper', hash: skills.hash(p.files[0].content), content: p.files[0].content };
+  assert.equal(skillHistory.createSkillHistory({ fs, path }).record(dir, p, version, { chatId: 'fixture-chat' }), true);
+  assert.equal(fs.readFileSync(path.join(dir, `${skillHistory.FILE}.corrupt`), 'utf8'), '{not json', 'the unreadable file is kept');
+  assert.ok(JSON.parse(fs.readFileSync(path.join(dir, skillHistory.FILE), 'utf8')).projects[p.id].length === 1);
+  // Structurally bad entries next to a good one.
+  const good = JSON.parse(fs.readFileSync(path.join(dir, skillHistory.FILE), 'utf8')).projects[p.id][0];
+  fs.writeFileSync(path.join(dir, skillHistory.FILE), JSON.stringify({ v: 1, projects: { [p.id]: [null, 7, { file: 3 }, { file: FILE, hash: 'short' }, good], other: 'x' } }));
+  disable(p);
+  const r = await run(t, { fixture: p, dir, router: noRouter, reqBody: { history: echoHistory } });
+  assert.equal(r.reply, null, 'chat still runs');
+  assert.equal(JSON.stringify(r.requests[0].messages).includes('ZX-41'), false, 'the valid entry still applies');
+});
+
+test('skill-history (#546 review): at the cap, versions still enabled are evicted before revoked ones', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-skill-hist-cap-'));
+  try {
+    const ledger = skillHistory.createSkillHistory({ fs, path, maxVersions: 3 });
+    const files = ['a', 'b', 'c', 'd'].map((n) => ({ name: `${n}/SKILL.md`, content: body({ name: n, text: `Synthetic instruction line for ${n}.\nSecond synthetic line for skill ${n}.` }) }));
+    const p = { id: 'cap-project', files, instructionSkills: Object.fromEntries(files.map((f) => [f.name, { enabled: true, reviewedHash: skills.hash(f.content) }])) };
+    p.instructionSkills['a/SKILL.md'].enabled = false; // a: recorded first, now revoked
+    for (const f of files) ledger.record(dir, p, { file: f.name, name: f.name[0], hash: skills.hash(f.content), content: f.content }, { chatId: 'c' });
+    const kept = JSON.parse(fs.readFileSync(path.join(dir, skillHistory.FILE), 'utf8')).projects[p.id].map((e) => e.name);
+    assert.deepEqual(kept, ['a', 'c', 'd'], 'the oldest enabled version went, the revoked one stayed');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
