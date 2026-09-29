@@ -106,6 +106,18 @@ function createProjectStore({
     return true;
   }
 
+  // Deleting a project deletes its chats too (#554): tombstone each so a late reply cannot write
+  // it back, and drop the per-chat context meter and transcript. Tenant-scoped via currentWorkspace().
+  function purgeProjectChats(project) {
+    const workspace = currentWorkspace(), lists = require('./chat-lists.cjs'), context = require('./chat-context.cjs');
+    for (const chat of project?.chats || []) {
+      if (!chat || typeof chat.id !== 'string') continue;
+      try { lists.addTombstone(workspace.dir, chat.id); } catch { /* best effort */ }
+      try { context.remove(workspace.dir, chat.id); } catch { /* best effort */ }
+      try { fs.unlinkSync(workspace.historyPath(chat.id)); } catch { /* no history file - fine */ }
+    }
+  }
+
   // Free (non-project) chat metas — persisted server-side so recent chats
   // survive across browsers/devices (localStorage was the only home before).
   function saveFreeChats(list) {
@@ -357,7 +369,7 @@ function createProjectStore({
   }
 
   return {
-    saveProjects, getProject, sanitizeChats, loadChats, saveChats, deleteChat, saveFreeChats, deleteFreeChat, createProject,
+    saveProjects, getProject, sanitizeChats, loadChats, saveChats, deleteChat, purgeProjectChats, saveFreeChats, deleteFreeChat, createProject,
     historyPath, readHistory, writeHistory,
     ownsFile, ensureProjectFolder, withSourceLock, pruneDocuments, writeProjectTextFile, sweepDeletedProject, indexSource,
   };

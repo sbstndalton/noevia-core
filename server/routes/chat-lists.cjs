@@ -51,7 +51,12 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
     }
 
     const windowMatch=p.match(/^\/api\/chats\/([^/]+)\/context-window$/);
-    if(windowMatch && req.method==='GET') return json(res,200,{meter:require('../chat-context.cjs').read(currentWorkspace().dir,decodeURIComponent(windowMatch[1])).meter||null});
+    if(windowMatch && req.method==='GET') {
+      const dir=currentWorkspace().dir,lists=require('../chat-lists.cjs'),id=decodeURIComponent(windowMatch[1]);
+      // A deleted chat answers exactly like one that never existed (#554), even if state was written back late.
+      if(lists.readTombstones(dir).has(lists.safeChatId(id)||id)) return json(res,200,{meter:null});
+      return json(res,200,{meter:require('../chat-context.cjs').read(dir,id).meter||null});
+    }
 
     // ── Free-chat metas (server-side so they survive browser switches) ──
     if (p === '/api/freechats') {

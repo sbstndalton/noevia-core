@@ -110,6 +110,16 @@ test('the context meter reads null when nothing was recorded', async () => {
   assert.deepEqual(f.sent.pop(), { status: 200, body: { meter: null } });
 });
 
+test('a deleted chat reads the same as one that never existed, even with state written back late (#554)', async () => {
+  const f = fixture();
+  require('../chat-context.cjs').save(f.dir, 'c-gone', { meter: { model: 'synthetic', used: 5 } });
+  await f.call('GET', '/api/chats/c-gone/context-window');
+  assert.equal(f.sent.pop().body.meter.used, 5);
+  require('../chat-lists.cjs').addTombstone(f.dir, 'c-gone');
+  await f.call('GET', '/api/chats/c-gone/context-window');
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { meter: null } });
+});
+
 test('a member cannot save a Cowork mode on a free chat; it is coerced to Chat (#236)', async () => {
   const f = fixture();
   await f.call('POST', '/api/freechats', { chats: [{ id: 'fc', mode: 'cowork' }] });

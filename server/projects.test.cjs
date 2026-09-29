@@ -238,3 +238,34 @@ test('withSourceLock keys differ per tenant: the same project id in another work
   assert.deepEqual(order, ['other tenant']);
   release(); await held;
 });
+
+test('deleting a chat or a project removes its context meter, tenant-scoped (#554)', async () => {
+  const context = require('./chat-context.cjs');
+  const lists = require('./chat-lists.cjs');
+  const f = fixture();
+  const other = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-projects-other-'));
+  try {
+    const meter = { meter: { model: 'synthetic', used: 10 } };
+    const project = await f.store.createProject({ name: 'Doomed' });
+    const keep = await f.store.createProject({ name: 'Kept' });
+    project.chats = [{ id: 'c-a' }, { id: 'c-b' }];
+    keep.chats = [{ id: 'c-keep' }];
+    for (const id of ['c-a', 'c-b', 'c-keep', 'c-free']) { context.save(f.dir, id, meter); fs.writeFileSync(f.workspace.historyPath(id), '[]'); }
+    f.workspace.freeChats.push({ id: 'c-free' });
+    context.save(other, 'c-a', meter); // another user's chat that happens to share an id
+    assert.equal(f.store.deleteChat(keep.id, 'c-keep'), true);
+    assert.deepEqual(context.read(f.dir, 'c-keep'), {});
+    assert.equal(f.store.deleteFreeChat('c-free'), true);
+    assert.deepEqual(context.read(f.dir, 'c-free'), {});
+    f.store.purgeProjectChats(project);
+    for (const id of ['c-a', 'c-b']) {
+      assert.deepEqual(context.read(f.dir, id), {}, id);
+      assert.equal(fs.existsSync(f.workspace.historyPath(id)), false, id);
+      assert.ok(lists.readTombstones(f.dir).has(id), id);
+    }
+    assert.deepEqual(context.read(other, 'c-a'), meter, "another user's meter is untouched");
+  } finally {
+    fs.rmSync(f.dir, { recursive: true, force: true });
+    fs.rmSync(other, { recursive: true, force: true });
+  }
+});

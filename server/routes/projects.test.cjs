@@ -24,7 +24,7 @@ function fixture({ projects = [], diary = true, catalogue = null } = {}) {
     getProject: (id) => projects.find((p) => p.id === id) || null,
     saveProjects: () => { store.saves += 1; }, saves: 0,
     createProject: async (body) => { if (!body.name) throw Object.assign(Error('name required'), { status: 400 }); const p = { id: 'proj-new', ...body }; projects.unshift(p); return p; },
-    pruneDocuments() {}, sweepDeletedProject() {}, withSourceLock: (_p, op) => op(), ensureProjectFolder: async () => null, indexSource() {},
+    pruneDocuments() {}, sweepDeletedProject() {}, purgeProjectChats(project) { store.purged = project.id; }, withSourceLock: (_p, op) => op(), ensureProjectFolder: async () => null, indexSource() {},
     ownsFile: () => false, loadChats: (id) => (store.getProject(id) || { chats: [] }).chats || [], saveChats: (id, chats) => { store.savedChats = [id, chats]; },
     deleteChat: (id, chatId) => id === 'p1' && chatId === 'c1',
   };
@@ -123,6 +123,7 @@ test('creating and deleting a project keeps the original status codes and messag
   assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'no such project' } });
   await f.call('DELETE', '/api/projects/proj-new');
   assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true } });
+  assert.equal(f.store.purged, 'proj-new', 'deleting a project purges its chats (#554)');
   assert.deepEqual(f.projects, []);
 });
 

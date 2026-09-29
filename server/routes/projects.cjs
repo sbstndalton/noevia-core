@@ -56,7 +56,7 @@ function createProjectRoutes({
   reasoningEffort, projectAppearance, diaryExtras, PROJECTS, DEFAULT_TOOLBOXES, sanitizeToolboxes, allToolboxes = () => [{ id: 'core' }], getProvider, ensureRolesLoaded, servedCatalogue, DEFAULT_PROVIDER_ID, store,
 }) {
   const {
-    getProject, saveProjects, createProject, pruneDocuments, sweepDeletedProject, withSourceLock, ensureProjectFolder, indexSource, ownsFile,
+    getProject, saveProjects, createProject, pruneDocuments, sweepDeletedProject, purgeProjectChats, withSourceLock, ensureProjectFolder, indexSource, ownsFile,
     loadChats, saveChats, deleteChat,
   } = store;
 
@@ -139,7 +139,7 @@ function createProjectRoutes({
           fs.rmSync(path.join(currentWorkspace().ragDir(), `${id}${suffix}`), { force: true });
         }
       } catch { /* best effort */ }
-      if (removedProject) sweepDeletedProject(removedProject);
+      if (removedProject) { purgeProjectChats?.(removedProject); sweepDeletedProject(removedProject); }
       return json(res, 200, { ok: true });
     }
 
