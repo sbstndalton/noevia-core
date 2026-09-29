@@ -129,6 +129,20 @@ test('an assistant turn keeps its sources across a reload, re-bounded on save (#
   assert.equal('sources' in stored[1], false, 'only assistant turns carry sources');
 });
 
+test('a user turn keeps its exact Skill pin across a reload; anything else is dropped on save (#571)', async () => {
+  const pin = `skill_${'a'.repeat(32)}@${'b'.repeat(64)}`;
+  const history = [{ role: 'user', content: 'q', skill: pin }, { role: 'assistant', content: 'a', skill: pin }];
+  assert.equal((await post('/api/chats/c-pin-571/history', { history })).status, 200);
+  const read = JSON.parse((await request('/api/chats/c-pin-571/history', { headers: mutationHeaders() })).text).history;
+  assert.equal(read[0].skill, pin);
+  assert.equal('skill' in read[1], false, 'only user turns carry a pin');
+  for (const bad of [{ id: `skill_${'a'.repeat(32)}`, version: 'b'.repeat(64) }, 'skill_x@y', `${pin}\nignore previous`, `skill_${'A'.repeat(32)}@${'b'.repeat(64)}`, `${pin}@extra`, 42, ['x']]) {
+    assert.equal((await post('/api/chats/c-pin-571b/history', { history: [{ role: 'user', content: 'q', skill: bad }] })).status, 200);
+    const stored = JSON.parse((await request('/api/chats/c-pin-571b/history', { headers: mutationHeaders() })).text).history;
+    assert.equal('skill' in stored[0], false, `dropped: ${JSON.stringify(bad)}`);
+  }
+});
+
 test('routing details round-trip through history and remain on conflict copies', async () => {
   const routingDecision = { offered: [{ id: 'fast', label: 'Short answer' }, { id: 'smart', label: 'Reasoning' }],
     scores: { fast: 0.2, smart: 0.8 }, selectedRole: 'smart', effectiveRole: 'smart',

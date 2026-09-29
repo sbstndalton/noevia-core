@@ -31,6 +31,14 @@ test('sanitizeHistory leaves untouched entries alone and strips sources from use
   assert.equal('sources' in b, false);
 });
 
+test('sanitizeHistory keeps only an exact skill pin on user turns (#571)', () => {
+  const pin = `skill_${'0'.repeat(32)}@${'f'.repeat(64)}`;
+  const out = sanitizeHistory([{ role: 'user', content: 'u', skill: pin }, { role: 'assistant', content: 'a', skill: pin }, { role: 'user', content: 'u', skill: 'skill_1@2' }]);
+  assert.equal(out[0].skill, pin);
+  assert.equal('skill' in out[1], false);
+  assert.equal('skill' in out[2], false);
+});
+
 function load(hits, ragAvailable, extra = {}) {
   const src = fs.readFileSync(require.resolve('./rag.cjs'), 'utf8');
   const body = src.slice(src.indexOf('async function filesContext('), src.indexOf('\nmodule.exports'));

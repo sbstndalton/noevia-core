@@ -45,13 +45,22 @@ function sanitizeStored(list) {
   return out.length ? out : undefined;
 }
 
+// The Skill pin a user turn was sent with (#571), kept so Retry can resend it after a reload. It is
+// client-supplied, so only the exact `skill_<32 hex>@<sha256>` string survives; anything else
+// (objects, labels, other lengths, extra text) is dropped, and it is never kept on assistant turns.
+const STORED_PIN = /^skill_[a-f0-9]{32}@[a-f0-9]{64}$/;
+function sanitizePin(value) {
+  return typeof value === 'string' && STORED_PIN.test(value) ? value : undefined;
+}
+
 function sanitizeHistory(history) {
   return history.map((m) => {
-    if (!m || typeof m !== 'object' || !('sources' in m)) return m;
-    const { sources, ...rest } = m;
-    const clean = m.role === 'assistant' ? sanitizeStored(sources) : undefined;
-    return clean ? { ...rest, sources: clean } : rest;
+    if (!m || typeof m !== 'object' || !('sources' in m || 'skill' in m)) return m;
+    const { sources, skill, ...rest } = m;
+    const cleanSources = m.role === 'assistant' ? sanitizeStored(sources) : undefined;
+    const cleanSkill = m.role === 'user' ? sanitizePin(skill) : undefined;
+    return { ...rest, ...(cleanSources ? { sources: cleanSources } : {}), ...(cleanSkill ? { skill: cleanSkill } : {}) };
   });
 }
 
-module.exports = { MAX_SOURCES, SNIPPET_MAX, buildSources, sanitizeStored, sanitizeHistory };
+module.exports = { MAX_SOURCES, SNIPPET_MAX, STORED_PIN, buildSources, sanitizeStored, sanitizePin, sanitizeHistory };
