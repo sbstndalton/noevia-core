@@ -19,6 +19,7 @@ test('a box binds only tools from its own server', () => {
   });
   assert.deepEqual(box.tools.map((t) => t.function.name), ['nc_notes_search']);
   assert.equal(box.source, 'mcp');
+  assert.equal(box.inApp, true, 'a box the manifest curates ships with noevia even though an MCP server backs it (#615)');
 });
 
 test('a box that lost every tool is not offered at all', () => {

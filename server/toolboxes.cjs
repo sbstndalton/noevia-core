@@ -344,6 +344,9 @@ function createToolboxes({
       label: b.label,
       description: b.description,
       source: b.source,
+      // An in-app box: shipped with noevia (built in, or curated in the MCP manifest), so the
+      // client may word it from its catalogue by id. A box a third party defined is never one (#615).
+      inApp: b.source === 'builtin' || b.inApp === true,
       toolCount: b.tools.length,
       estTokens: estimateToolTokens(b.tools),
       ...(CONNECTOR_BOXES.has(b.id) ? { connector: true } : {}),

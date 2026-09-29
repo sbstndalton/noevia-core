@@ -158,3 +158,14 @@ test('executeToolCall reports failure explicitly, not from the text', async () =
   o = {}; assert.match(await t.executeToolCall(null, 'mcp_ok', '{}', undefined, undefined, o), /^Error log/); assert.equal(o.failed, false);
   o = {}; await t.executeToolCall(null, 'mcp_bad', '{}', undefined, undefined, o); assert.equal(o.failed, true);
 });
+
+test('toolboxSummaries marks the boxes shipped with noevia, so the client may word them by id (#615)', () => {
+  const curated = { ...box('diary', [tool('diary_read')]), inApp: true };
+  const foreign = box('third-party', [tool('tp_read')]);
+  const t = build({ mcpBoxes: [curated, foreign] });
+  const byId = Object.fromEntries(t.toolboxSummaries().map((b) => [b.id, b]));
+  assert.equal(byId.core.inApp, true, 'a built-in box');
+  assert.equal(byId.diary.source, 'mcp');
+  assert.equal(byId.diary.inApp, true, 'an MCP-backed box curated in the manifest');
+  assert.equal(byId['third-party'].inApp, false, 'a box a third party defined keeps its own name');
+});

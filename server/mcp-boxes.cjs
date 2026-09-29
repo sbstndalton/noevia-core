@@ -36,7 +36,7 @@ function bindBoxes({ manifest, perServer, servers, warn = () => {} }) {
     }
     // A box that lost every tool is not shown at all — an empty box in the picker is a promise
     // the server cannot keep.
-    if (tools.length) boxes.push({ ...box, source: 'mcp', tools });
+    if (tools.length) boxes.push({ ...box, source: 'mcp', inApp: true, tools });
   }
   return boxes;
 }

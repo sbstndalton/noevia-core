@@ -17,9 +17,9 @@ const BOXES = [
   { id: 'oauth-box', tools: [{ type: 'function', function: { name: 'oauth_list' } }] },
 ];
 
-async function run(t, { turnToolboxes, projectToolboxes = ['core'], diary = false, user = { id: 'synthetic-user', role: 'member' } }) {
+async function run(t, { turnToolboxes, projectToolboxes = ['core'], diary = false, narrow = false, boxes = BOXES, user = { id: 'synthetic-user', role: 'member' } }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-turn-boxes-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const res = new EventEmitter(); res.writeHead = () => {}; res.write = () => {}; res.end = () => { res.writableEnded = true; res.emit('finish'); };
+  const res = new EventEmitter(); res.writeHead = () => {}; const written = []; res.write = (c) => { written.push(String(c)); }; res.end = () => { res.writableEnded = true; res.emit('finish'); };
   let routed = null, offered = null;
   const fetch = async (_url, init) => {
     offered = (JSON.parse(init.body).tools || []).map((x) => x.function.name);
@@ -34,7 +34,7 @@ async function run(t, { turnToolboxes, projectToolboxes = ['core'], diary = fals
     skillsIndexFor: () => [], getProvider: () => ({ id: 'default', baseUrl: 'http://fixture.invalid' }), providerHeaders: () => ({}), autoRoles: () => null,
     visionDescriptions: new Map(), visionProbe: createVisionProbe({ fetchImpl: fetch }),
     chatSkillRouter: { select: async () => ({ loaded: [] }) }, oauthServerIds: () => new Set(['oauth-box']), accountReady: () => false, mcpOAuth: { connected: () => false },
-    chatToolRouter: { select: async (ids) => { routed = [...ids]; return { ids, routed: false }; } }, DEFAULT_TOOLBOXES: ['core'],
+    chatToolRouter: { select: async (ids) => { routed = [...ids]; return { ids, routed: false, narrowed: narrow }; } }, DEFAULT_TOOLBOXES: ['core'],
     CONNECTOR_BOXES: new Set(['gdrive']), connectedBoxes: () => [],
     toolPolicy: { mode: (_u, name) => (name === 'web_blocked' ? 'block' : 'allow') }, requestScope: { getStore: () => ({ authn: user ? { user } : null }) },
     // The real resolver's contract: the selected boxes' tools minus the blocked ones.
@@ -43,10 +43,11 @@ async function run(t, { turnToolboxes, projectToolboxes = ['core'], diary = fals
     rag: { filesContext: async () => null }, prefill: { recordSample() {} }, reduceToolResult: () => ({ text: 'reduced' }), diaryExtras: require('./diary-extras.cjs'),
     DIARY_BASE: 'http://fixture.invalid', TOOL_RESULT_CAP: 8000, json: () => {}, saveChats() {}, endpointApproved: () => true, diaryHeaders: () => ({}),
     lastLoadedModel: () => null, classifyFastOrSmart: async () => 'fast', servedCatalogue: async () => [], modelsInstalled: async () => [], missingRoles: () => [], staleRolesError: () => null,
-    allToolboxes: () => BOXES, executeToolCall: async () => 'unused', chatWideApproved: () => false, awaitApproval: async () => 'deny', recordUsage() {}, recordToolUse() {},
+    allToolboxes: () => boxes, executeToolCall: async () => 'unused', chatWideApproved: () => false, awaitApproval: async () => 'deny', recordUsage() {}, recordToolUse() {},
   });
   await handleChat({}, res, { projectId: 'fixture-project', chatId: 'fixture-chat', message: 'synthetic question', ...(turnToolboxes ? { turnToolboxes } : {}) });
-  return { routed, offered };
+  const events = written.join('').split('\n').filter((l) => l.startsWith('data: ')).map((l) => { try { return JSON.parse(l.slice(6)); } catch { return null; } }).filter(Boolean);
+  return { routed, offered, events };
 }
 
 test('a turn toolbox the server offers is added for that turn', async (t) => {
@@ -67,4 +68,24 @@ test('Diary tools are not offered when the Diary add-on is off, from the turn or
   assert.equal(off.offered.includes('diary_search'), false);
   const on = await run(t, { turnToolboxes: ['diary'], diary: true });
   assert.ok(on.offered.includes('diary_search'));
+});
+
+test('the "Using:" scope carries the box ids beside the joined English text, so the client can translate it (#624)', async (t) => {
+  const boxes = [
+    { id: 'core', label: 'Core', source: 'builtin', tools: BOXES[0].tools },
+    { id: 'diary', label: 'Diary', source: 'mcp', inApp: true, tools: BOXES[2].tools },
+    { id: 'web-search', label: 'Web search', source: 'mcp', tools: BOXES[1].tools },
+  ];
+  const f = await run(t, { narrow: true, diary: true, boxes, projectToolboxes: ['core', 'diary', 'web-search'] });
+  const scope = f.events.find((e) => e.type === 'tools_scope');
+  assert.equal(scope.text, 'Core, Diary, Web search', 'the joined string is unchanged for older clients');
+  assert.deepEqual(scope.boxes, [
+    { id: 'core', label: 'Core', inApp: true },
+    { id: 'diary', label: 'Diary', inApp: true },
+    { id: 'web-search', label: 'Web search', inApp: false },
+  ]);
+  const wide = await run(t, { narrow: false, boxes });
+  const all = wide.events.find((e) => e.type === 'tools_scope');
+  assert.equal(all.text, '');
+  assert.equal('boxes' in all, false, 'nothing is narrowed, so there are no ids to send');
 });
