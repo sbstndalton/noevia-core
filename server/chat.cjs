@@ -42,10 +42,35 @@ function foldToolMessage(entry) {
   const clipped = text.length > REPLAY_TOOL_RESULT_MAX ? `${text.slice(0, REPLAY_TOOL_RESULT_MAX)}…` : text;
   return frameUntrusted('tool result', typeof entry.name === 'string' ? entry.name.slice(0, 80) : '', clipped);
 }
+// #658: a write that already succeeded in an earlier turn. The client sends one entry per
+// completed write (`applied: true`), also for a reply that then failed or was paused, so the
+// model sees that the change is done and does not propose it again. The sentence outside the
+// frame is ours; the tool's name, target, arguments and result are data and stay inside it.
+const APPLIED_ARG_MAX = 300;
+function appliedToolNote(entry) {
+  const name = typeof entry.name === 'string' && /^[\w.-]{1,80}$/.test(entry.name) ? entry.name : 'a tool';
+  const clip = (value, max) => { const s = String(value || ''); return s.length > max ? `${s.slice(0, max)}…` : s; };
+  const lines = [
+    typeof entry.target === 'string' && entry.target ? `target: ${clip(entry.target, APPLIED_ARG_MAX)}` : '',
+    typeof entry.args === 'string' && entry.args ? `arguments: ${clip(entry.args, APPLIED_ARG_MAX)}` : '',
+    `result: ${clip(entry.content, REPLAY_TOOL_RESULT_MAX)}`,
+  ].filter(Boolean).join('\n');
+  return `Already done earlier in this chat: ${name} ran after the user approved it, and it succeeded. Do not run it again for the same change; if the user asks for it again, say it is already done unless they clearly want a second, separate change.\n${frameUntrusted('applied change', name, lines)}`;
+}
 function normalizeReplayHistory(mapped, newMessage) {
   const out = [];
+  // Applied changes with no turn before them (the first message was edited and re-run, #658
+  // review): strict templates need a user turn first, so they lead the first user turn instead.
+  const leading = [];
   for (const entry of mapped) {
     const last = out[out.length - 1];
+    if ((entry.role === 'tool' || entry.role === 'function') && entry.applied === true) {
+      // A reply that failed or paused has no assistant text of its own to attach to.
+      if (last && last.role === 'assistant') last.content = `${last.content}\n\n${appliedToolNote(entry)}`;
+      else if (last) out.push({ role: 'assistant', content: appliedToolNote(entry) });
+      else leading.push(appliedToolNote(entry));
+      continue;
+    }
     if (entry.role === 'tool' || entry.role === 'function') {
       if (last && last.role === 'assistant') last.content = `${last.content}\n\n${foldToolMessage(entry)}`;
       continue;
@@ -64,6 +89,9 @@ function normalizeReplayHistory(mapped, newMessage) {
     if (last && last.role === 'user') last.content = `${last.content}\n\n${newMessage}`;
     else out.push({ role: 'user', content: newMessage });
   }
+  if (leading.length && out[0] && out[0].role === 'user') {
+    out[0] = { ...out[0], content: `${leading.join('\n\n')}\n\n${out[0].content}` };
+  }
   return out;
 }
 
@@ -73,9 +101,16 @@ function createChatHandler({
   // #648: whether a tool is one of noevia's own project file edits, whose target is resolved and
   // shown on the approval card and pinned for the call. By name when not wired (the stricter side).
   projectEditTool = (name) => require('./project-edit-target.cjs').EDIT_TOOLS.has(name),
+  // #659: the resolved target of any other write whose card should name what it changes (the
+  // Google Drive tools). async (name, rawArgs, { user, chatKey }) => null (no target to show)
+  // | { target, kind } | { error } (refused before the card; nothing is written).
+  writeTargetFor = null,
+  // #658: writes that succeeded per account and chat, for the repeat flag on approval cards.
+  recentWrites = null,
 }) {
   // Revoked Skill content in earlier turns (#546): one ledger per handler, cached in memory.
   const skillLedger = skillHistory || require('./skill-history.cjs').createSkillHistory({ fs, path });
+  const writesDone = recentWrites || require('./recent-writes.cjs').createRecentWrites();
   async function handleChat(req, res, body, authn) {
     let preparation;
     const execution = {};
@@ -135,10 +170,18 @@ function createChatHandler({
     const chatWorkspace = (() => { try { return currentWorkspace(); } catch { return null; } })();
     const assertWorkspaceActive = () => chatWorkspace?.assertActive?.();
 
+    // An applied-write entry (#658) may have an empty result; it still says the change is done.
+    const appliedEntry = (h) => h.role === 'tool' && h.applied === true && typeof h.name === 'string' && typeof h.content === 'string';
     const mappedHistory = (Array.isArray(history) ? history : [])
-      .filter((h) => h && ['user', 'assistant', 'tool', 'function'].includes(h.role) && typeof h.content === 'string' && h.content)
+      .filter((h) => h && ['user', 'assistant', 'tool', 'function'].includes(h.role) && ((typeof h.content === 'string' && h.content) || appliedEntry(h)))
       .slice(-HISTORY_CAP)
-      .map((h) => (h.role === 'tool' || h.role === 'function') && typeof h.name === 'string' ? { role: h.role, content: h.content, name: h.name } : { role: h.role, content: h.content });
+      .map((h) => appliedEntry(h)
+        ? { role: 'tool', content: h.content, name: h.name, applied: true,
+            ...(typeof h.target === 'string' ? { target: h.target } : {}), ...(typeof h.args === 'string' ? { args: h.args } : {}) }
+        : (h.role === 'tool' || h.role === 'function') && typeof h.name === 'string' ? { role: h.role, content: h.content, name: h.name } : { role: h.role, content: h.content });
+    // Writes the client says already succeeded in this chat, for the repeat flag on approval cards.
+    const recentWriteFps = new Set(mappedHistory.filter((h) => h.applied === true)
+      .map((h) => require('./recent-writes.cjs').fingerprint(h.name, h.target, h.args)));
     let msgs = body.compactOnly ? normalizeReplayHistory(mappedHistory) : normalizeReplayHistory(mappedHistory, message);
 
     // ── Project context: instructions + knowledge files prepend
@@ -703,7 +746,7 @@ function createChatHandler({
       const outcome = { failed: false };
       const result = String(await runTool(call, async () => {
         turn?.started(call.id);
-        const out = await executeToolCall(project, call.name, call.args, allowedToolNames, chatSignal.signal, outcome);
+        const out = await executeToolCall(project, call.name, call.args, allowedToolNames, chatSignal.signal, outcome, { chatKey, exchangeKey });
         recordToolUse(chatWorkspace, call.name);
         return out;
       }));
@@ -724,6 +767,14 @@ function createChatHandler({
     }
     const context = require('./chat-context.cjs');
     const contextId=chatId || spaceId;
+    // Which conversation a Drive read belongs to, so an update can be checked against it (#659).
+    const chatKey = chatId || spaceId || null;
+    // This one request (#659 review): a Drive read counts for an update only within the exchange
+    // that read it, since read results are not resent to the model on later turns.
+    const exchangeKey = crypto.randomUUID();
+    // Writes that succeeded in THIS exchange (#658): how many the reply reports if it pauses.
+    const appliedWrites = [];
+    let paused = false;
     let prepared,limit,limitSource,summarizeContext,requestStartedAt=Date.now();
     try {
       // Native engine: free the GPU of any other chat model before this one loads (it holds two
@@ -1094,6 +1145,8 @@ function createChatHandler({
             continue;
           }
           const outcome = { failed: false }; // set explicitly by executeToolCall
+          // What the card names (#648/#659), and this write's fingerprint (#658); set in the gate below.
+          let cardTarget = null, targetKind = null, writePrint = null, ran = false;
           const result = await runTool(tc, async (markWriteAttempt) => {
             // ── Permission gate (step 16) ──────────────────────────────────
             // Reads run straight through. A write stops here and waits for a
@@ -1126,17 +1179,38 @@ function createChatHandler({
                 return `ERROR: ${resolvedEdit.error.replace(/\.?$/, '.')} ${tc.name} was not run and nothing was changed.`;
               }
               editTarget = resolvedEdit.path;
+              cardTarget = editTarget;
+            } else if (writeTargetFor && isWriteTool(tc.name)) {
+              // Any other write that knows what it changes (#659: the Google Drive tools) is
+              // resolved the same way: shown on the card, or refused here with nothing written.
+              let resolvedWrite = null;
+              try { resolvedWrite = await writeTargetFor(tc.name, tc.args, { user: chatUser, chatKey }); }
+              catch { resolvedWrite = { error: 'The file this would change could not be looked up' }; }
+              if (resolvedWrite?.error) {
+                authService.audit('tool.denied', userId, userId, { tool: tc.name, reason: 'write-target' });
+                return `ERROR: ${String(resolvedWrite.error).replace(/\.?$/, '.')} ${tc.name} was not run and nothing was changed.`;
+              }
+              if (resolvedWrite && typeof resolvedWrite.target === 'string' && resolvedWrite.target) {
+                cardTarget = resolvedWrite.target;
+                if (typeof resolvedWrite.kind === 'string') targetKind = resolvedWrite.kind;
+              }
             }
+            writePrint = isWriteTool(tc.name) ? require('./recent-writes.cjs').fingerprint(tc.name, cardTarget, tc.args) : null;
             if (permission === 'ask' && !chatWideApproved(userId, chatId)) {
               const approvalId = `ap-${crypto.randomUUID()}`;
               turn?.approval(tc.id, { id:approvalId, action:'pending' });
+              // #658: the same tool, target and arguments as a write that already succeeded in this
+              // chat. Only a flag on the card: the person still decides, with all three actions.
+              const repeat = writePrint !== null && (writesDone.has(userId, chatId, writePrint) || recentWriteFps.has(writePrint));
               send({
                 type: 'tool_pending',
                 id: approvalId,
                 index: toolOffset + toolIndex, // same index the `tool` events used, so the UI updates that chip
                 name: tc.name,
                 args: tc.args,
-                ...(editTarget !== null ? { target: editTarget } : {}),
+                ...(cardTarget !== null ? { target: cardTarget } : {}),
+                ...(targetKind ? { targetKind } : {}),
+                ...(repeat ? { repeatOf: true } : {}),
               });
               const decision = await awaitApproval({ id: approvalId, userId, chatId, abortSignal: chatSignal.signal, onDecision: action => turn?.approval(tc.id, {id:approvalId,action}) });
               if (decision !== 'approve') {
@@ -1172,9 +1246,10 @@ function createChatHandler({
             if (chatWideApproved(userId, chatId)) turn?.approval(tc.id, {action:'approve_all', inherited:true});
             turn?.started(tc.id);
             markWriteAttempt();
-            const pin = editTarget !== null ? [{ editTarget: editTargets.targetDigest(editTarget) }] : [];
-            try { result = await executeToolCall(project, tc.name, tc.args, allowedToolNames, chatSignal.signal, outcome, ...pin); }
+            const options = { chatKey, exchangeKey, ...(editTarget !== null ? { editTarget: editTargets.targetDigest(editTarget) } : {}) };
+            try { result = await executeToolCall(project, tc.name, tc.args, allowedToolNames, chatSignal.signal, outcome, options); }
             catch (error) { turn?.uncertain(tc.id); throw error; }
+            ran = true;
             recordToolUse(chatWorkspace, tc.name);
             // Audit AFTER the fact and only for writes: "what did the model
             // actually do on my behalf" is the question this log has to answer,
@@ -1199,7 +1274,15 @@ function createChatHandler({
           // copy is journaled so a replay sends the model exactly what it saw.
           const framedResult = frameUntrusted('tool result', tc.name, forModel.text);
           turn?.result(tc.id, framedResult, { failed: outcome.failed === true, originalBytes: Buffer.byteLength(String(result)) });
-          send({ type: 'tool_result', index: toolOffset + toolIndex, name: tc.name, text: result.slice(0, 300) });
+          // #658: a write that ran and succeeded. The chip carries it, so the client can tell the
+          // model on later turns (and after a failed or paused reply) that this change is done.
+          const applied = ran && writePrint !== null && outcome.failed !== true && !/^ERROR\b/.test(String(result));
+          if (applied) {
+            appliedWrites.push({ name: tc.name, target: cardTarget });
+            writesDone.record(requestScope.getStore()?.workspace?.userId || null, chatId, writePrint);
+          }
+          send({ type: 'tool_result', index: toolOffset + toolIndex, name: tc.name, text: result.slice(0, 300),
+            ...(applied ? { applied: true } : {}), ...(applied && cardTarget !== null ? { target: cardTarget } : {}) });
           roundMessages.push({ role: 'tool', tool_call_id: tc.id, content: framedResult });
           if (outcome.failed !== true && !/^ERROR\b/.test(String(result))) noteSkillRead(tc.args, result);
         }
@@ -1215,7 +1298,15 @@ function createChatHandler({
       if (supervised.decision) turn?.supervision(supervised.decision);
       roundMessages = supervised.messages;
       if (supervised.pause) {
-        send({ type: 'error', text: 'Step supervision requested review. No further tools were run. Review the results before continuing or choosing another model.' });
+        // #658: the tool round before this checkpoint finished, and its writes are real. A pause
+        // is not a failed request: the reply ends normally and says what was already applied, so
+        // nobody retries (and repeats) a change that happened. No further model round or tool runs.
+        turn?.interrupt('Step supervision paused after completed tool steps');
+        paused = true;
+        const n = appliedWrites.length;
+        send({ type: 'paused', reason: 'supervision', applied: n,
+          text: n ? `${n === 1 ? '1 change was' : `${n} changes were`} saved. Step supervision paused this reply before any further steps.`
+            : 'Step supervision paused this reply before any further steps. Nothing was changed.' });
         break;
       }
     }
@@ -1224,7 +1315,7 @@ function createChatHandler({
     // Any path that saw a loaded skill revoked (round start, mid-stream, before or after an approval)
     // ends the reply with one explicit error; nothing after the revocation was run.
     if (skillRevocation) { reportRevocation(); res.end(); return; }
-    if (!roundHasContent && roundReasoning.trim()) {
+    if (!paused && !roundHasContent && roundReasoning.trim()) {
       send({ type: 'delta', text: '\n\nThe model returned reasoning without a final answer. Try again or choose another model.' });
     }
     send({ type: 'telemetry', phase: 'complete', model, timeToFirstToken: exchangeFirstTokenMs === null ? null : exchangeFirstTokenMs / 1000 });

@@ -354,7 +354,7 @@ function createToolboxes({
     }));
   }
 
-  async function runToolCall(project, name, rawArgs, allowed, signal, fail, { editTarget } = {}) {
+  async function runToolCall(project, name, rawArgs, allowed, signal, fail, { editTarget, chatKey, exchangeKey } = {}) {
     // A model can name a tool it was never offered — by hallucination, or from
     // a box the project has since deselected mid-conversation. Enforce the
     // resolved list here rather than trusting that whatever was sent upstream is
@@ -376,7 +376,8 @@ function createToolboxes({
       return fail(`ERROR: tool arguments must be a JSON object: ${String(rawArgs).slice(0, 200)}`);
     }
     if (kiwixTools?.names.has(name)) return kiwixTools.execute(name, args);
-    if (driveTools?.names.has(name)) return driveTools.execute(scope.getStore()?.authn?.user, name, args);
+    // The chat travels along so a Drive update is checked against what THIS chat read (#659).
+    if (driveTools?.names.has(name)) return driveTools.execute(scope.getStore()?.authn?.user, name, args, { chatKey: typeof chatKey === 'string' ? chatKey : null, exchangeKey: typeof exchangeKey === 'string' ? exchangeKey : null });
     if (name === 'get_current_time') {
       const tz = typeof args.timezone === 'string' && args.timezone ? args.timezone : undefined;
       const now = new Date();

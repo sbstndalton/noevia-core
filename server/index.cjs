@@ -585,6 +585,8 @@ const { handleChat } = require('./chat.cjs').createChatHandler({
   oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse,
   chatgptOAuth, chatgptEnabled: () => features.enabled('chatgptOAuth'),
   projectEditTool: (name) => require('./project-edit-target.cjs').EDIT_TOOLS.has(name) && !!MCP_INTERNAL_SERVER && mcpState.tools.get(name)?.serverId === MCP_INTERNAL_SERVER.id,
+  // #659: the Google Drive writes name the Drive file they change on the approval card.
+  writeTargetFor: (name, rawArgs, { user }) => (driveTools.names.has(name) ? driveTools.describeTarget(user, name, rawArgs) : null),
 });
 // POST /api/chat: rate limit, body cap and the Diary gate, then the loop (routes/chat.cjs).
 const chatRoutes = require('./routes/chat.cjs').createChatRoutes({

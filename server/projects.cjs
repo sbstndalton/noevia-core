@@ -180,6 +180,12 @@ function createProjectStore({
       createdAt: Date.now(),
       updatedAt: Date.now(),
     };
+    // Files sent with the create call are uploads: the Project documents box comes with them
+    // (#659), unless the caller chose the toolboxes itself.
+    if (!Array.isArray(body.toolboxes)) {
+      require('./project-docs-default.cjs').applyProjectDocsDefault(project, {
+        offered: (id) => (sanitizeToolboxes([id]) || []).includes(id), defaults: defaultToolboxes(), hadUploads: false });
+    }
     // Reserve (name, never create) the unique folder path now so same-named projects stay distinct.
     try {
       const conn = authService.getStorage(currentWorkspace().userId, true);

@@ -6,7 +6,9 @@
 const crypto = require('node:crypto');
 
 const fail = (message, status = 400) => Object.assign(Error(message), { status, publicMessage: message });
-const FIELDS = 'id,name,mimeType,size,modifiedTime,createdTime,webViewLink,trashed';
+// `version` (#659): Drive's per-file counter, raised by every change to the file. An update is
+// made only against the version the chat read, so a change made elsewhere is never overwritten.
+const FIELDS = 'id,name,mimeType,size,modifiedTime,createdTime,webViewLink,trashed,version';
 const MAX_READ = 64 * 1024; // bytes pulled from Drive per read; the tool layer caps again for context
 const EXPORTS = {
   'application/vnd.google-apps.document': 'text/plain',
@@ -94,9 +96,16 @@ function driveFiles(drive) {
       ]);
       return call(`${upload}/files?uploadType=multipart&fields=${encodeURIComponent(FIELDS)}`, { method: 'POST', headers: { 'Content-Type': `multipart/related; boundary=${boundary}` }, body: multipart });
     },
-    async update({ fileId: id, content }) {
+    // `expectVersion` (#659): the version the caller read. Drive's v3 files.update has no
+    // If-Match precondition, so the version is checked immediately before the write instead; a
+    // mismatch refuses with nothing written. (A change landing between that check and the PATCH
+    // is not detectable through this API; the window is one request long.)
+    async update({ fileId: id, content }, { expectVersion } = {}) {
       const meta = await metadata(id);
       if (EXPORTS[meta.mimeType] || !TEXTUAL.test(meta.mimeType || '')) throw fail(`${meta.name} is not a plain text file, so noevia will not overwrite it.`);
+      if (expectVersion !== undefined && (meta.version === undefined || String(meta.version) !== String(expectVersion))) {
+        throw Object.assign(fail(`${meta.name} changed in Google Drive after it was read in this chat, so it was not overwritten. Nothing was changed. Read it again and make the edit on the current text.`, 409), { code: 'changed' });
+      }
       return call(`${upload}/files/${encodeURIComponent(meta.id)}?uploadType=media&fields=${encodeURIComponent(FIELDS)}`, { method: 'PATCH', headers: { 'Content-Type': `${meta.mimeType}; charset=UTF-8` }, body: typeof content === 'string' ? content : '' });
     },
     trash: ({ fileId: id }) => call(`${api}/files/${encodeURIComponent(fileId(id))}?fields=${encodeURIComponent(FIELDS)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ trashed: true }) }),

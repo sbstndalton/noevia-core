@@ -194,7 +194,9 @@ function createInternalTools(ports) {
       },
     },
     project_append_file: {
-      description: 'Add text to the end of an existing project text file.',
+      // #659: named as the tool for the project's own files (uploads included), so the model does
+      // not reach for a Google Drive tool when the user means a file listed in the project.
+      description: 'Add text to the end of a file in this project, uploads included. Use this, not Google Drive, for project files.',
       write: true,
       schema: { type: 'object', properties: { name: { type: 'string' }, text: { type: 'string' } }, required: ['name', 'text'] },
       handler: async (args, ctx) => {
@@ -214,7 +216,7 @@ function createInternalTools(ports) {
       // model asked to regenerate a long file silently drops parts of it, and
       // an approval card whose argument is the entire file is unreadable — so
       // the gate stops working exactly where it matters most.
-      description: 'Replace exact text in a project file. Give expectedCount to require that many matches.',
+      description: 'Replace exact text in a project file or upload (not Google Drive). expectedCount: matches to require.',
       write: true,
       schema: { type: 'object', properties: {
         name: { type: 'string' },

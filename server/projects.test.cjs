@@ -45,7 +45,9 @@ test('createProject validates, defaults and indexes its files', async () => {
   await assert.rejects(f.store.createProject({ name: 'x', icon: 'bad' }), (e) => e.status === 400 && e.message === 'unknown icon');
   const project = await f.store.createProject({ name: '  Notes  ', files: [{ name: 'a.md', content: 'hello' }, { name: 3 }], toolboxes: 'nope', routing: 'auto' });
   assert.equal(project.name, 'Notes');
-  assert.deepEqual(project.toolboxes, ['core']);
+  // #659: files sent with the create call are uploads, so the Project documents box comes with
+  // them (this fixture offers every box). Without files a new project has Core only.
+  assert.deepEqual(project.toolboxes, ['core', 'project-docs']);
   assert.equal(project.routing, 'auto');
   assert.deepEqual(project.files, [{ name: 'a.md', content: 'hello' }]);
   assert.equal(project.projectFolder, undefined, 'no browsable storage: no folder, and creation still succeeds');
@@ -53,6 +55,8 @@ test('createProject validates, defaults and indexes its files', async () => {
   assert.equal(f.indexed.length, 1);
   assert.equal(f.store.getProject(project.id), project);
   assert.equal(f.store.getProject('missing'), null);
+  assert.deepEqual((await f.store.createProject({ name: 'Empty' })).toolboxes, ['core']);
+  assert.deepEqual((await f.store.createProject({ name: 'Chosen', files: [{ name: 'b.md', content: 'x' }], toolboxes: ['core'] })).toolboxes, ['core'], 'an explicit choice stands');
 });
 
 test('with browsable storage a new project makes no storage folder until its first upload (#589)', async () => {
