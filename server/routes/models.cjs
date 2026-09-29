@@ -374,6 +374,9 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
       if(!modelManager.enabled)return json(res,404,{error:'Model manager is disabled. Enter a memory plan manually.'});
       try {
         const result=await modelManager.systemInfo();
+        // #629: a manager that cannot discover hardware (404/501, e.g. the llama.cpp adapter) is a normal
+        // capability answer, not a gateway failure. Genuine failures still surface as 502 below.
+        if(!result.ok&&(result.status===404||result.status===501))return json(res,200,{supported:false});
         if(!result.ok)return json(res,502,{error:'Inference hardware is unavailable. Enter a memory plan manually or retry.'});
         return json(res,200,require('../model-hardware.cjs').modelHardware(result.body));
       } catch { return json(res,502,{error:'Could not read inference hardware. Enter a memory plan manually or retry.'}); }
