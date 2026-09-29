@@ -214,10 +214,13 @@ function createMcpWiring({
   function mcpInternalAuth(name) {
     const workspace = scope.getStore()?.workspace;
     if (!workspace) return null;
+    // The approved edit target (#648), set by the chat loop for this call chain only.
+    const target = scope.getStore()?.internalEditTarget;
     const token = internal.mintToken(internalKey, {
       uid: workspace.userId,
       pid: internalCallProjectId(),
       w: isWriteTool(name) ? 1 : 0,
+      ...(isWriteTool(name) && typeof target === 'string' && target ? { t: target } : {}),
     });
     return { Authorization: `Bearer ${token}` };
   }

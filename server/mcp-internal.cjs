@@ -46,6 +46,11 @@ const MAX_BODY_BYTES = 256 * 1024;
 // already resolved `approve` — see mcpInternalAuth in index.cjs. The server
 // keeps its own write set and refuses a write presented with w:0, so a tool
 // mistakenly listed under a box's `reads` still fails closed.
+//
+// `t` (#648) is present only on an approved project file edit: a digest of the stored path the
+// approval card showed (project-edit-target.cjs). It reaches the handler as ctx.editTarget, and
+// the edit tools refuse when the name no longer resolves to that file. Like uid/pid it is covered
+// by the HMAC, so an argument cannot change it.
 
 function b64u(buf) { return Buffer.from(buf).toString('base64url'); }
 
@@ -55,7 +60,7 @@ function sign(key, payloadB64) {
 
 /** Mint a token. `uid`/`pid` null means a discovery-only token, which may
  *  answer initialize and tools/list and can never call a tool. */
-function mintToken(key, { uid = null, pid = null, cid = null, w = 0, discovery = false, ttlMs = TOKEN_TTL_MS, now = Date.now() } = {}) {
+function mintToken(key, { uid = null, pid = null, cid = null, w = 0, t = null, discovery = false, ttlMs = TOKEN_TTL_MS, now = Date.now() } = {}) {
   const payload = {
     v: TOKEN_VERSION,
     uid: uid || null,
@@ -65,6 +70,7 @@ function mintToken(key, { uid = null, pid = null, cid = null, w = 0, discovery =
     exp: now + ttlMs,
     w: w ? 1 : 0,
     d: discovery ? 1 : 0,
+    ...(typeof t === 'string' && t ? { t } : {}),
   };
   const body = b64u(JSON.stringify(payload));
   return `${body}.${b64u(sign(key, body))}`;
@@ -202,7 +208,7 @@ function createHandler({ key, definitions, guard = createReplayGuard(), now = ()
     // arguments carry only what the tool schema declares. Identity is taken
     // from the verified token, never from here.
     const args = (params.arguments && typeof params.arguments === 'object' && !Array.isArray(params.arguments)) ? params.arguments : {};
-    const ctx = { userId: claims.uid, projectId: claims.pid, chatId: claims.cid };
+    const ctx = { userId: claims.uid, projectId: claims.pid, chatId: claims.cid, ...(typeof claims.t === 'string' && claims.t ? { editTarget: claims.t } : {}) };
     const invoke = () => definition.handler(args, ctx);
     try {
       const text = runAs ? await runAs(claims.uid, invoke) : await invoke();

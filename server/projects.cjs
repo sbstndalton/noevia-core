@@ -311,19 +311,84 @@ function createProjectStore({
     try { require('./uploads.cjs').prune(workspace, live); }
     catch (err) { console.warn('[uploads] cleanup failed:', err.message); }
   }
+  const changedInStorage = (stored) => `"${stored}" changed in storage since noevia last read it (it was edited, moved or deleted there, or storage is now a different account). Nothing was saved. Sync this project's Sources first, then try again.`;
+  /** Before an in-place edit of a stored file (#648): the file must still exist in storage with
+   *  exactly the bytes noevia holds (sha256 === attachment.id), and the server must report an
+   *  ETag, which the write is made conditional on. Without one a change landing between this
+   *  check and the PUT would be overwritten, so the edit is refused (as removeEmptyFolder refuses
+   *  a DELETE without one). Returns the ETag; throws otherwise. */
+  async function confirmStoredVersion(connection, stored, current) {
+    if (!current || !current.attachment || !/^[a-f0-9]{64}$/.test(String(current.attachment.id || ''))) throw new Error(changedInStorage(stored));
+    let version, remoteBytes;
+    try {
+      version = await storageClient.fileVersion(connection, stored);
+      if (!version.exists) throw new Error('missing');
+      remoteBytes = await storageClient.readBinaryFile(connection, stored);
+    } catch { throw new Error(changedInStorage(stored)); }
+    const digest = require('node:crypto').createHash('sha256').update(remoteBytes).digest('hex');
+    if (digest !== current.attachment.id) throw new Error(changedInStorage(stored));
+    if (!version.etag) throw new Error(`"${stored}" cannot be edited in place: this storage server does not report file versions (ETags), so noevia cannot make sure a change made there meanwhile is not overwritten. Nothing was saved. Use project_create_file to write a new file instead.`);
+    return version.etag;
+  }
   // One write path for server-authored project text files (MCP writes, research reports), the
   // same one a browser upload takes: the file lands in the project's storage folder and is
   // re-indexed identically.
-  function writeProjectTextFile(project, name, text) {
+  //
+  // An in-place edit (#648) passes `expectName`, the stored name of the file it read, and
+  // `expectContent`, the text it read. The destination is otherwise recomputed from the storage
+  // connection as it is now, so with storage disconnected an upload stored at
+  // `<folder>/Text/notes.md` would be written as a second, local `notes.md` (and the reverse once
+  // storage is connected). So an edit is refused, with nothing written anywhere, unless the
+  // destination is exactly `expectName` and that file still holds `expectContent`.
+  //
+  // `expectAttachment` is the attachment id (the SHA-256 of the stored bytes) of the file the edit
+  // was planned against, or null for a legacy file with no attachment record. The project folder
+  // is a synced source, so noevia's copy can be older than storage: someone may have changed,
+  // moved or deleted the file in Nextcloud since the last sync, or storage may now be another
+  // account's. So for a stored file the edit also reads it back from storage first and refuses
+  // unless it still exists with exactly those bytes, then writes with If-Match on the ETag it saw,
+  // so a change landing in between is refused by the server (412) instead of overwritten.
+  function writeProjectTextFile(project, name, text, { expectName, expectContent, expectAttachment } = {}) {
     return withSourceLock(project, async () => {
       if (getProject(project.id) !== project) throw new Error('the project changed while writing; nothing was saved');
       const uploads = require('./uploads.cjs');
       const bytes = Buffer.from(text, 'utf8');
       uploads.validate(name, bytes);
+      const edit = expectName !== undefined;
+      let current = null;
+      if (edit) {
+        if (typeof expectName !== 'string' || !expectName) throw new Error('an edit must name the stored file it changes; nothing was saved');
+        current = (project.files || []).find((f) => f.name === expectName);
+        if (!current) throw new Error(`"${expectName}" is no longer in this project; nothing was saved`);
+        if (expectContent !== undefined && String(current.content || '') !== expectContent) throw new Error(`"${expectName}" changed while this edit was being made; nothing was saved. Read it again and retry.`);
+        // Same stored version as planned, and still fully read text: a sync that re-read the file
+        // (new bytes, or now partial) in between means the plan is stale.
+        const currentId = current.attachment ? current.attachment.id : null;
+        if (currentId !== (expectAttachment === undefined ? null : expectAttachment) || (current.attachment && current.attachment.state !== 'ready')) {
+          throw new Error(`"${expectName}" changed since this edit was prepared; nothing was saved. Sync this project's Sources, read it again and retry.`);
+        }
+      }
       const connection = authService.getStorage(currentWorkspace().userId, true);
       const remote = storageClient.isBrowsable(connection) ? connection : null;
-      if (remote && !project.projectFolder) project.projectFolder = await ensureProjectFolder(project);
-      const file = await uploads.ingest(currentWorkspace(), project, name, bytes, { connection: remote });
+      let ifMatch;
+      if (edit) {
+        const destination = remote && project.projectFolder ? uploads.destinationFor(project, name, { connection: remote }) : remote ? null : name;
+        if (destination !== expectName) {
+          throw new Error(remote
+            ? `saving now would write "${destination || name}" instead of editing "${expectName}" in place; nothing was saved`
+            : `"${expectName}" is kept in this project's storage, which is not connected right now, so it cannot be edited in place; nothing was saved. Reconnect storage and try again.`);
+        }
+        if (remote) ifMatch = await confirmStoredVersion(remote, expectName, current);
+      } else if (remote && !project.projectFolder) project.projectFolder = await ensureProjectFolder(project);
+      let file;
+      try {
+        file = await uploads.ingest(currentWorkspace(), project, name, bytes, { connection: remote, storageImpl: storageClient, ...(edit && remote ? { ifMatch } : {}) });
+      } catch (err) {
+        if (err && err.code === 'changed') throw new Error(changedInStorage(expectName));
+        throw err;
+      }
+      if (edit && file.name !== expectName) throw new Error(`the edit was stored as "${file.name}", not "${expectName}"; the project list was not changed`);
+      if (getProject(project.id) !== project) throw new Error('the project was removed while writing; the project list was not changed');
       if (remote) project.sourceFolders = [...new Set([...(project.sourceFolders || []), project.projectFolder])];
       project.files = [...(project.files || []).filter((f) => f.name !== file.name), file];
       project.updatedAt = Date.now();

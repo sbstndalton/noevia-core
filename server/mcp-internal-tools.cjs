@@ -15,8 +15,7 @@
 // so prose here is paid for on every request by the smallest model.
 
 const MAX_TEXT_BYTES = 256 * 1024;
-const { resolveProjectFile } = require('./project-file-names.cjs');
-const { classify } = require('./uploads.cjs');
+const { uploadPathFor, planEdit, targetDigest } = require('./project-edit-target.cjs');
 
 function requireProject(ports, ctx) {
   const project = ports.getProject(ctx.projectId);
@@ -30,35 +29,35 @@ function cleanName(raw) {
   return name;
 }
 
-/** A file the project holds, by its listed name or a unique bare name (#642), or a readable
- *  error: what it does have, or which files an ambiguous name matched. Same resolver as
- *  read_project_file, confined to this project's own files. */
-function findFile(project, wanted) {
-  const found = resolveProjectFile(project, wanted);
-  if (found.file) return found.file;
-  throw new Error(found.error);
+/** The file an edit changes (#648), pinned to the one the person approved.
+ *
+ *  Which files may be edited, and why the others may not, is planEdit (project-edit-target.cjs):
+ *  connected uploads at their stored path and local uploads under their plain name; attached-folder
+ *  files, originals, unreadable sources and partly read text are refused.
+ *
+ *  The chat loop resolves the name before it shows the approval card, puts that resolved path on
+ *  the card, and mints this call's token carrying a digest of it (ctx.editTarget). Here the name
+ *  is resolved again against the project as it is NOW; if it no longer lands on the approved file
+ *  (a file was added, removed or renamed while the card was open) the edit is refused. An edit
+ *  that arrives without a pin was never tied to a file on a card, so it is refused as well. */
+function pinnedEdit(project, args, ctx) {
+  const plan = planEdit(project, args.name);
+  const pinned = ctx && typeof ctx.editTarget === 'string' ? ctx.editTarget : '';
+  if (!pinned) throw new Error('this edit was not tied to a file when it was approved, so nothing was changed');
+  if (pinned !== targetDigest(plan.file.name)) throw new Error(`${JSON.stringify(String(args.name))} now refers to "${plan.file.name}", which is not the file that was approved. Nothing was changed; ask again.`);
+  return plan;
 }
 
-/** The storage path an upload named `base` is written to (see uploads.ingest). */
-function uploadPathFor(project, base) {
-  return project.projectFolder ? `${project.projectFolder}/${classify(base)}/${base}` : base;
-}
-
-/** An upload into the project's own storage folder, detected the way ownsFile does. */
-const isProjectUpload = (project, file) => !!(project.projectFolder && file.attachment && file.source === project.projectFolder);
-
-/** Files that came from an attached storage folder are owned by the server —
- *  the sync loop rewrites them — so editing one here would be undone silently.
- *  Uploads into the project's storage folder are not edited in place yet: the write path
- *  recomputes their destination from the storage connection at write time, so the written
- *  name is not guaranteed to be the resolved one (follow-up to #642). Only a local upload,
- *  stored under its plain name, is rewritten here. */
-function assertEditable(project, file) {
-  if (isProjectUpload(project, file)) throw new Error(`"${file.name}" is a file uploaded to this project's storage folder; editing uploads with tools isn't supported yet. Use project_create_file to write a new file.`);
-  if (file.source) throw new Error(`"${file.name}" comes from the attached folder "${file.source}" and is kept in sync from there. Edit it in that folder instead.`);
-  if (file.name.includes('/')) throw new Error(`"${file.name}" is stored under a folder path; editing it with tools isn't supported yet. Use project_create_file to write a new file.`);
-  if (file.attachment && file.attachment.state === 'stored') throw new Error(`"${file.name}" is stored in its original format and has no editable text.`);
-  if (file.document) throw new Error(`"${file.name}" is an extracted document, not an editable text file.`);
+/** Writes the new text over exactly `plan.file`. The write path refuses, and writes nothing, when
+ *  the destination it would use is not that stored name (storage disconnected, say), when the
+ *  file changed after it was read here, or when the copy in storage is no longer the version
+ *  noevia read (changed, moved or deleted there since the last sync). */
+function writeInPlace(ports, project, plan, text) {
+  return ports.writeTextFile(project, plan.writeName, text, {
+    expectName: plan.file.name,
+    expectContent: String(plan.file.content || ''),
+    expectAttachment: plan.file.attachment ? plan.file.attachment.id : null,
+  });
 }
 
 function createInternalTools(ports) {
@@ -200,13 +199,13 @@ function createInternalTools(ports) {
       schema: { type: 'object', properties: { name: { type: 'string' }, text: { type: 'string' } }, required: ['name', 'text'] },
       handler: async (args, ctx) => {
         const project = requireProject(ports, ctx);
-        const file = findFile(project, args.name);
-        assertEditable(project, file);
+        const plan = pinnedEdit(project, args, ctx);
+        const file = plan.file;
         const addition = String(args.text == null ? '' : args.text);
         if (!addition) throw new Error('there is nothing to append');
         const next = `${file.content || ''}${(file.content || '').endsWith('\n') || !file.content ? '' : '\n'}${addition}`;
         if (Buffer.byteLength(next) > MAX_TEXT_BYTES) throw new Error('that would make the file too large to write in one call');
-        await ports.writeTextFile(project, file.name, next);
+        await writeInPlace(ports, project, plan, next);
         return `Appended ${addition.length} chars to "${file.name}".`;
       },
     },
@@ -225,9 +224,9 @@ function createInternalTools(ports) {
       }, required: ['name', 'find', 'replace'] },
       handler: async (args, ctx) => {
         const project = requireProject(ports, ctx);
-        const file = findFile(project, args.name);
-        assertEditable(project, file);
-        const find = String(args.find == null ? '' : args.find);
+        const plan = pinnedEdit(project, args, ctx);
+        const file = plan.file;
+        const find =String(args.find == null ? '' : args.find);
         if (!find) throw new Error('find must not be empty');
         const replace = String(args.replace == null ? '' : args.replace);
         const content = String(file.content || '');
@@ -245,7 +244,7 @@ function createInternalTools(ports) {
         }
         const next = parts.join(replace);
         if (Buffer.byteLength(next) > MAX_TEXT_BYTES) throw new Error('that would make the file too large to write in one call');
-        await ports.writeTextFile(project, file.name, next);
+        await writeInPlace(ports, project, plan, next);
         return `Replaced ${found} occurrence${found === 1 ? '' : 's'} in "${file.name}".`;
       },
     },

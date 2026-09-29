@@ -360,19 +360,29 @@ async function readBinaryFile(conn, rawPath, opts) {
 /** Write one file, creating or replacing it. Used for a project's own folder,
  *  where noevia owns the contents — not a general "write anywhere" primitive,
  *  though nothing here enforces that beyond the caller. */
-async function writeFile(conn, rawPath, bytes) {
+//
+// `ifMatch` (an ETag from fileVersion) makes the PUT conditional: if the file changed in storage
+// since that ETag was read, the server answers 412 and nothing is written. The error then carries
+// `code: 'changed'`. A retried conditional PUT is safe for the same reason.
+async function writeFile(conn, rawPath, bytes, { ifMatch } = {}) {
   const path = safeRelativePath(rawPath);
   if (!path) throw Object.assign(new Error('invalid path'), { status: 400 });
   if (connectionKind(conn) === 's3') {
     throw Object.assign(new Error('writing to S3 is not supported'), { status: 400 });
   }
+  if (ifMatch !== undefined && (typeof ifMatch !== 'string' || !ifMatch || /[\r\n]/.test(ifMatch))) {
+    throw Object.assign(new Error('invalid If-Match value'), { status: 400 });
+  }
   const response = await withRetry(() => fetch(davUrl(conn, path), {
     method: 'PUT',
-    headers: davHeaders(conn, { 'Content-Type': 'application/octet-stream' }),
+    headers: davHeaders(conn, { 'Content-Type': 'application/octet-stream', ...(ifMatch ? { 'If-Match': quoteEtag(ifMatch) } : {}) }),
     body: bytes,
     signal: AbortSignal.timeout(60000),
     redirect: 'error',
   }));
+  if (ifMatch && response.status === 412) {
+    throw Object.assign(new Error(`"${path}" changed in storage before it could be written (412)`), { status: 409, code: 'changed' });
+  }
   if (!response.ok) {
     throw Object.assign(new Error(`could not write "${path}" (${response.status})`), { status: response.status === 409 ? 400 : 502 });
   }
@@ -440,7 +450,7 @@ async function removeEmptyFolder(conn, rawPath) {
   if (!etag || /[\r\n]/.test(etag)) return { removed: false, reason: 'no-etag' };
   const del = await fetch(target, {
     method: 'DELETE',
-    headers: davHeaders(conn, { 'If-Match': etag.startsWith('"') || etag.startsWith('W/') ? etag : `"${etag}"` }),
+    headers: davHeaders(conn, { 'If-Match': quoteEtag(etag) }),
     signal: AbortSignal.timeout(15000),
     redirect: 'error',
   });
@@ -450,4 +460,35 @@ async function removeEmptyFolder(conn, rawPath) {
   return { removed: true };
 }
 
-module.exports = { removeEmptyFolder, listFiles, readTextFile, readBinaryFile, writeFile, deleteFile, createFolder, isBrowsable, safeRelativePath, TEXT_EXTENSIONS, READ_CAP };
+const quoteEtag = (etag) => (etag.startsWith('"') || etag.startsWith('W/') ? etag : `"${etag}"`);
+
+/** The current state of one WebDAV file, for a write that must not overwrite a change made in
+ *  storage (#648): `{ exists: false }` on 404, else `{ exists: true, etag }`, where etag is ''
+ *  when the server reports none. A collection, an S3 connection or any other answer throws,
+ *  so a caller that needs certainty refuses rather than guessing. */
+async function fileVersion(conn, rawPath) {
+  const path = safeRelativePath(rawPath);
+  if (!path) throw Object.assign(new Error('invalid path'), { status: 400 });
+  if (!['webdav', 'nextcloud'].includes(connectionKind(conn))) {
+    throw Object.assign(new Error('this storage cannot report a file version'), { status: 400 });
+  }
+  const target = davUrl(conn, path);
+  const response = await withRetry(() => fetch(target, {
+    method: 'PROPFIND',
+    headers: davHeaders(conn, { Depth: '0', 'Content-Type': 'application/xml' }),
+    body: '<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/><d:getetag/></d:prop></d:propfind>',
+    signal: AbortSignal.timeout(15000),
+    redirect: 'error',
+  }));
+  if (response.status === 404) return { exists: false };
+  if (response.status !== 207) throw Object.assign(new Error(`storage returned ${response.status}`), { status: 502 });
+  const body = await response.text();
+  const block = body.match(/<(?:[a-zA-Z0-9]+:)?response>([\s\S]*?)<\/(?:[a-zA-Z0-9]+:)?response>/)?.[1];
+  if (!block) throw Object.assign(new Error('storage returned no file state'), { status: 502 });
+  if (/<(?:[a-zA-Z0-9]+:)?collection\s*\/?>/.test(block)) throw Object.assign(new Error(`"${path}" is a folder in storage`), { status: 409 });
+  const etag = (block.match(/<(?:[a-zA-Z0-9]+:)?getetag>([\s\S]*?)<\/(?:[a-zA-Z0-9]+:)?getetag>/)?.[1] || '').trim()
+    .replace(/&quot;/g, '"').replace(/&amp;/g, '&');
+  return { exists: true, etag: /[\r\n]/.test(etag) ? '' : etag };
+}
+
+module.exports = { removeEmptyFolder, listFiles, readTextFile, readBinaryFile, writeFile, fileVersion, deleteFile, createFolder, isBrowsable, safeRelativePath, TEXT_EXTENSIONS, READ_CAP };

@@ -46,7 +46,7 @@ function tools() {
     // Wired exactly as index.cjs wires it: the MCP read delegates to the built-in reader.
     readProjectFile: (project, args) => executeToolCall(project, 'read_project_file', JSON.stringify(args), null),
     ragAvailable: () => false, search: async () => [],
-    writeTextFile: async (project, name, text) => { written.push({ project: project.id, name, text }); },
+    writeTextFile: async (project, name, text, expect) => { written.push({ project: project.id, name, text, ...(expect || {}) }); },
   });
   const read = (name, project = a) => executeToolCall(project, 'read_project_file', JSON.stringify({ name }), null);
   const mcpRead = (name, projectId = a.id) => internal.project_read_file.handler({ name }, { userId: 'alice', projectId });
@@ -132,28 +132,30 @@ test('unreadable files (#586) resolve by bare name but their contents are never 
   }
 });
 
-test('the write tools refuse a connected upload with an accurate reason, while reads by bare name still work', async () => {
+test('the write tools edit a connected upload in place (#648) and keep refusing other path-named files', async () => {
   const { internal, written, a, read, mcpRead } = tools();
-  const ctx = { userId: 'alice', projectId: a.id };
-  const uploadRefusal = new RegExp(`^"${NOTES}" is a file uploaded to this project's storage folder; editing uploads with tools isn't supported yet\\. Use project_create_file to write a new file\\.$`);
-  for (const name of ['synthetic-notes.md', NOTES]) {
-    await assert.rejects(() => internal.project_append_file.handler({ name, text: 'Appended.' }, ctx), (e) => uploadRefusal.test(e.message) && !/attached folder/.test(e.message));
-    await assert.rejects(() => internal.project_replace_text.handler({ name, find: 'Thursday', replace: 'Friday' }, ctx), (e) => uploadRefusal.test(e.message));
-  }
-  assert.match(await read('synthetic-notes.md'), /SYNTHETIC-NOTES-CANARY: the launch is on Thursday/, 'the refused edits changed nothing and reading still works');
+  const ctx = (stored) => ({ userId: 'alice', projectId: a.id, editTarget: require('./project-edit-target.cjs').targetDigest(stored) });
+  // A connected upload, by bare name: written as its plain name with the stored path pinned, which
+  // the write path turns into exactly that storage object (project-edit-in-place.test.cjs).
+  await internal.project_append_file.handler({ name: 'synthetic-notes.md', text: 'Appended.' }, ctx(NOTES));
+  assert.deepEqual(written.pop(), { project: a.id, name: 'synthetic-notes.md', text: 'SYNTHETIC-NOTES-CANARY: the launch is on Thursday.\nAppended.', expectName: NOTES, expectContent: 'SYNTHETIC-NOTES-CANARY: the launch is on Thursday.', expectAttachment: 'a'.repeat(64) });
+  assert.match(await read('synthetic-notes.md'), /SYNTHETIC-NOTES-CANARY/, 'reading by bare name still works');
   assert.match(await mcpRead('synthetic-notes.md'), /SYNTHETIC-NOTES-CANARY/);
   // A file synced from an attached folder keeps its own message, whichever name reaches it.
-  await assert.rejects(() => internal.project_append_file.handler({ name: 'Other/plan.md', text: 'x' }, ctx), /comes from the attached folder "Reference\/Other"/);
+  await assert.rejects(() => internal.project_append_file.handler({ name: 'Other/plan.md', text: 'x' }, ctx('Reference/Other/plan.md')), /comes from the attached folder "Reference\/Other"/);
   // A path-named file of no known origin is refused rather than written under another name.
   const odd = { id: 'odd', projectFolder: FOLDER, files: [{ name: 'Elsewhere/odd.md', content: 'x' }] };
   const t = createInternalTools({ getProject: () => odd, writeTextFile: async () => { throw new Error('must not write'); } });
-  await assert.rejects(() => t.project_append_file.handler({ name: 'odd.md', text: 'y' }, { projectId: 'odd' }), /stored under a folder path; editing it with tools isn't supported yet/);
-  assert.deepEqual(written, [], 'nothing was written');
+  await assert.rejects(() => t.project_append_file.handler({ name: 'odd.md', text: 'y' }, { projectId: 'odd', editTarget: require('./project-edit-target.cjs').targetDigest('Elsewhere/odd.md') }), /stored under a folder path; editing it with tools isn't supported yet/);
+  // Unreadable (#586) and stored-only uploads are resolved but never edited.
+  await assert.rejects(() => internal.project_append_file.handler({ name: 'binary.txt', text: 'x' }, ctx(`${FOLDER}/Text/binary.txt`)), /stored in its original format/);
+  await assert.rejects(() => internal.project_replace_text.handler({ name: 'broken.pdf', find: 'a', replace: 'b' }, ctx(`${FOLDER}/Documents/broken.pdf`)), /could not be read|extracted document|original format/);
+  assert.deepEqual(written, [], 'nothing else was written');
   // A local upload (plain name, no storage) is still edited in place under its own name.
-  await internal.project_append_file.handler({ name: 'local-upload.md', text: 'more' }, ctx);
-  assert.deepEqual(written.map((w) => w.name), ['local-upload.md']);
+  await internal.project_append_file.handler({ name: 'local-upload.md', text: 'more' }, ctx('local-upload.md'));
+  assert.deepEqual(written.map((w) => [w.name, w.expectName]), [['local-upload.md', 'local-upload.md']]);
   // Creating a bare name that already exists as an upload would overwrite it; refused.
-  await assert.rejects(() => internal.project_create_file.handler({ name: 'synthetic-notes.md', text: 'x' }, ctx), /already exists/);
+  await assert.rejects(() => internal.project_create_file.handler({ name: 'synthetic-notes.md', text: 'x' }, ctx(NOTES)), /already exists/);
 });
 
 test('the tool descriptions tell the model to pass the listed name or a unique bare name', async () => {

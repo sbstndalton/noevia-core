@@ -31,6 +31,8 @@ function harness(overrides = {}) {
 }
 
 const CTX = { userId: 'alice', projectId: 'proj-a' };
+// An approved edit's context: the chat loop pins it to the stored file the approval card showed (#648).
+const PINNED = (stored) => ({ ...CTX, editTarget: require('./project-edit-target.cjs').targetDigest(stored) });
 
 test('a project tool outside a project says so instead of failing obscurely', async () => {
   const { tools } = harness();
@@ -64,14 +66,14 @@ test('search without an index says so rather than returning nothing', async () =
 test('replace requires the expected number of matches and never writes on a mismatch', async () => {
   const { tools, written, project } = harness();
   // "alpha" appears twice; the default expectation is one.
-  await assert.rejects(() => tools.project_replace_text.handler({ name: 'notes.md', find: 'alpha', replace: 'A' }, CTX),
+  await assert.rejects(() => tools.project_replace_text.handler({ name: 'notes.md', find: 'alpha', replace: 'A' }, PINNED('notes.md')),
     /expected 1 match but found 2/);
-  await assert.rejects(() => tools.project_replace_text.handler({ name: 'notes.md', find: 'nowhere', replace: 'A' }, CTX),
+  await assert.rejects(() => tools.project_replace_text.handler({ name: 'notes.md', find: 'nowhere', replace: 'A' }, PINNED('notes.md')),
     /not in "notes\.md"/);
   assert.deepEqual(written, [], 'a mismatch must not write');
   assert.equal(project.files[0].content, 'alpha\nbeta\nalpha\n');
 
-  const out = await tools.project_replace_text.handler({ name: 'notes.md', find: 'alpha', replace: 'A', expectedCount: 2 }, CTX);
+  const out = await tools.project_replace_text.handler({ name: 'notes.md', find: 'alpha', replace: 'A', expectedCount: 2 }, PINNED('notes.md'));
   assert.match(out, /Replaced 2 occurrences/);
   assert.equal(project.files[0].content, 'A\nbeta\nA\n');
 });
@@ -93,7 +95,7 @@ test('create refuses to clobber, append keeps what is there', async () => {
   await tools.project_create_file.handler({ name: 'fresh.md', text: 'hello' }, CTX);
   assert.equal(project.files.find((f) => f.name === 'fresh.md').content, 'hello');
 
-  await tools.project_append_file.handler({ name: 'fresh.md', text: 'world' }, CTX);
+  await tools.project_append_file.handler({ name: 'fresh.md', text: 'world' }, PINNED('fresh.md'));
   assert.equal(project.files.find((f) => f.name === 'fresh.md').content, 'hello\nworld');
 });
 

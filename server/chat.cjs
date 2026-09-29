@@ -2,6 +2,7 @@
 const { frameUntrusted } = require('./prompt-framing.cjs');
 const { isChatGenerationModel } = require('./chat-model-kind.cjs');
 const { isInAppBox } = require('./toolbox-flags.cjs');
+const editTargets = require('./project-edit-target.cjs');
 // ── The chat loop ─────────────────────────────────────────────────────────
 // One POST /api/chat: build the system prompt (account instructions, memory,
 // project context, RAG excerpts, skills), hand the Diary space to its
@@ -69,6 +70,9 @@ function normalizeReplayHistory(mapped, newMessage) {
 function createChatHandler({
   stepSupervision = null, durableChat = null, fs, path, crypto, fetch, codeTasksFor = () => [], reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, diaryStorageRetry = (send) => send(true), autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, toolGate = null, DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse,
   chatgptOAuth = null, chatgptEnabled = () => false, skillHistory = null,
+  // #648: whether a tool is one of noevia's own project file edits, whose target is resolved and
+  // shown on the approval card and pinned for the call. By name when not wired (the stricter side).
+  projectEditTool = (name) => require('./project-edit-target.cjs').EDIT_TOOLS.has(name),
 }) {
   // Revoked Skill content in earlier turns (#546): one ledger per handler, cached in memory.
   const skillLedger = skillHistory || require('./skill-history.cjs').createSkillHistory({ fs, path });
@@ -1110,6 +1114,19 @@ function createChatHandler({
               authService.audit('tool.denied', userId, userId, { tool: tc.name, reason: 'blocked' });
               return `ERROR: ${tc.name} is blocked in this account's settings, so it was not run. Do not retry it; tell the user they can change it in Settings → Connectors.`;
             }
+            // A project file edit (#648) is resolved to the one stored file it would change BEFORE
+            // anyone is asked, so the card shows that full path beside the model's own argument, and
+            // the call is pinned to it. A name that does not resolve to an editable file is refused
+            // here: there is nothing to approve, and nothing is written.
+            let editTarget = null;
+            if (projectEditTool(tc.name)) {
+              const resolvedEdit = editTargets.resolveEditTarget(project ? getProject(project.id) : null, tc.args);
+              if (resolvedEdit.error) {
+                authService.audit('tool.denied', userId, userId, { tool: tc.name, reason: 'edit-target' });
+                return `ERROR: ${resolvedEdit.error.replace(/\.?$/, '.')} ${tc.name} was not run and nothing was changed.`;
+              }
+              editTarget = resolvedEdit.path;
+            }
             if (permission === 'ask' && !chatWideApproved(userId, chatId)) {
               const approvalId = `ap-${crypto.randomUUID()}`;
               turn?.approval(tc.id, { id:approvalId, action:'pending' });
@@ -1119,6 +1136,7 @@ function createChatHandler({
                 index: toolOffset + toolIndex, // same index the `tool` events used, so the UI updates that chip
                 name: tc.name,
                 args: tc.args,
+                ...(editTarget !== null ? { target: editTarget } : {}),
               });
               const decision = await awaitApproval({ id: approvalId, userId, chatId, abortSignal: chatSignal.signal, onDecision: action => turn?.approval(tc.id, {id:approvalId,action}) });
               if (decision !== 'approve') {
@@ -1142,10 +1160,20 @@ function createChatHandler({
             }
             // Likewise a skill disabled while the approval card was open: the approval does not outlive it.
             if (revokedSkills()) return refuseForRevokedSkill(tc.name, userId);
+            // And a project file edit whose name now lands on a different file (or none) than the
+            // one the card showed: the approval was for that file, not for whatever the name means now.
+            if (editTarget !== null) {
+              const again = editTargets.resolveEditTarget(project ? getProject(project.id) : null, tc.args);
+              if (again.path !== editTarget) {
+                authService.audit('tool.denied', userId, userId, { tool: tc.name, reason: 'edit-target-changed' });
+                return `ERROR: the project's files changed after approval, so ${JSON.stringify(editTarget)} ${again.error ? 'can no longer be edited' : `is no longer the file this name refers to (it now means ${JSON.stringify(again.path)})`}. ${tc.name} was not run and nothing was changed. Ask again if the edit is still wanted.`;
+              }
+            }
             if (chatWideApproved(userId, chatId)) turn?.approval(tc.id, {action:'approve_all', inherited:true});
             turn?.started(tc.id);
             markWriteAttempt();
-            try { result = await executeToolCall(project, tc.name, tc.args, allowedToolNames, chatSignal.signal, outcome); }
+            const pin = editTarget !== null ? [{ editTarget: editTargets.targetDigest(editTarget) }] : [];
+            try { result = await executeToolCall(project, tc.name, tc.args, allowedToolNames, chatSignal.signal, outcome, ...pin); }
             catch (error) { turn?.uncertain(tc.id); throw error; }
             recordToolUse(chatWorkspace, tc.name);
             // Audit AFTER the fact and only for writes: "what did the model
@@ -1155,6 +1183,7 @@ function createChatHandler({
               authService.audit('tool.write', userId, userId, {
                 tool: tc.name,
                 args: String(tc.args || '').slice(0, 500),
+                ...(editTarget !== null ? { target: editTarget.slice(0, 500) } : {}),
                 failed: outcome.failed || undefined,
               });
             }

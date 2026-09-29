@@ -354,7 +354,7 @@ function createToolboxes({
     }));
   }
 
-  async function runToolCall(project, name, rawArgs, allowed, signal, fail) {
+  async function runToolCall(project, name, rawArgs, allowed, signal, fail, { editTarget } = {}) {
     // A model can name a tool it was never offered — by hallucination, or from
     // a box the project has since deselected mid-conversation. Enforce the
     // resolved list here rather than trusting that whatever was sent upstream is
@@ -414,8 +414,10 @@ function createToolboxes({
     // request scope, EXTENDING the current store rather than replacing it, so
     // the workspace and authn the rest of the call depends on survive — and
     // two interleaved chats each keep their own project (see the scope test).
+    // An approved project file edit also carries the digest of the path its card showed (#648);
+    // only noevia's own server receives it, inside its capability token.
     if (mcpTools().has(name)) {
-      return scope.run({ ...scope.getStore(), internalCallProject: project || null }, () => executeMcp(name, args, signal));
+      return scope.run({ ...scope.getStore(), internalCallProject: project || null, internalEditTarget: typeof editTarget === 'string' ? editTarget : null }, () => executeMcp(name, args, signal));
     }
     return fail(`ERROR: unknown tool "${name}"`);
   }
@@ -425,10 +427,10 @@ function createToolboxes({
   // Drive, MCP) report failure with their own fixed prefixes ("ERROR: " /
   // "ERROR from tool: "), matched exactly and case-sensitively, so a successful
   // result that merely begins with the word "Error" is never a failure.
-  async function executeToolCall(project, name, rawArgs, allowed, signal, outcome = {}) {
+  async function executeToolCall(project, name, rawArgs, allowed, signal, outcome = {}, options = {}) {
     let flagged = false;
     const fail = (text) => { flagged = true; return text; };
-    const text = await runToolCall(project, name, rawArgs, allowed, signal, fail);
+    const text = await runToolCall(project, name, rawArgs, allowed, signal, fail, options || {});
     outcome.failed = flagged || (typeof text === 'string' && DELEGATED_FAILURE.test(text));
     return text;
   }
