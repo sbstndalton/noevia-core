@@ -87,6 +87,8 @@ function createPresetStore(file,{writer=null}={}) {
     if(read().revision!==candidate.baseRevision)throw error(409,'Presets changed while applying. Reload before retrying.');
     // Single-writer mode: the sidecar does the revision check, backup and atomic rename.
     if(writer){await writer.write({baseRevision:candidate.baseRevision,text:candidate.text});return;}
+    // Web writer on a read-only mount: an explicit 503 before the backup, not a raw EROFS (#269).
+    require('./models-ini-writer.cjs').assertWebWritable(file);
     // Immutable recovery copy precedes the new file; contains operator settings.
     const backup=file+'.noevia-backup-'+candidate.baseRevision;
     try {const fd=fs.openSync(backup,'wx',0o600);try{fs.writeFileSync(fd,read().text);fs.fsyncSync(fd);}finally{fs.closeSync(fd);}}catch(e){if(e.code!=='EEXIST')throw e;}

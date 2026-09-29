@@ -1,7 +1,7 @@
 'use strict';
 // MODELS_INI_WRITER (#295): model-loader as the single models.ini writer, with a fake sidecar.
 const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),os=require('node:os'),path=require('node:path'),crypto=require('node:crypto');
-const {createModelsIniWriter}=require('./models-ini-writer.cjs');
+const {createModelsIniWriter,reportModelsIniWriter}=require('./models-ini-writer.cjs');
 const {createPresetStore}=require('./llamacpp-presets.cjs');
 const {createModelManager}=require('./model-manager.cjs');
 const sha=text=>crypto.createHash('sha256').update(text).digest('hex');
@@ -223,4 +223,68 @@ test('preamble before the first section round-trips through the sidecar',async t
   await store.commit(store.prepare({model:'synthetic',baseRevision:store.get('synthetic').revision,options:{parallel:'2'}}));
   const after=fs.readFileSync(file,'utf8');
   assert.match(after,/^version = 1\n\[\*\]\n/);assert.match(after,/cache-type-k = q8_0/);assert.equal(store.get('synthetic').options.parallel,'2');
+});
+
+// #269: compose mounts web's /llamacpp-config :ro with model-loader as the default writer. A dir
+// without write permission stands in for the read-only bind (root ignores mode bits, so skip).
+const asRoot=process.getuid?.()===0;
+// fixture()'s cleanup hook runs first (after hooks are FIFO), so restore the mode in-test.
+async function readOnlyDir(dir,body){fs.chmodSync(dir,0o500);try{await body();}finally{fs.chmodSync(dir,0o700);}}
+const router=async()=>({ok:true,status:200,body:{data:[{id:'synthetic',status:{value:'unloaded'}}]}});
+
+test('web mode on a read-only config dir: startup logs once, saves fail explicitly, nothing is written',{skip:asRoot&&'root bypasses directory permissions'},async t=>{
+  const {dir,file}=fixture(t),before=fs.readFileSync(file,'utf8');
+  await readOnlyDir(dir,async()=>{
+  const logs=[];
+  assert.ok(reportModelsIniWriter({mode:undefined,presetPath:file,log:m=>logs.push(m)}));
+  assert.equal(logs.length,1);assert.match(logs[0],/MODELS_INI_WRITER=web but .* is not writable/);assert.match(logs[0],/MODELS_INI_WRITER=model-loader/);
+  // The raw store refuses before any backup or temp file: a clear 503, not EROFS/EACCES.
+  const store=createPresetStore(file);
+  const c=store.prepare({model:'synthetic',baseRevision:store.get('synthetic').revision,options:{parallel:'2'}});
+  await assert.rejects(store.commit(c),e=>e.status===503&&e.code==='MODELS_INI_READ_ONLY'&&/read-only mount while MODELS_INI_WRITER=web, so nothing was changed/.test(e.publicMessage));
+  // Through the manager the admin gets that message, and reads keep working.
+  const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',presetPath:file,fetchJson:router,presetWriter:createModelsIniWriter({mode:'web'})});
+  const r=await manager.applyPreset({model:'synthetic',baseRevision:sha(before),options:{parallel:'3'},confirmReload:true});
+  assert.equal(r.ok,false);assert.equal(r.status,503);assert.match(r.body.error,/remove :ro from the \/llamacpp-config mount/);
+  assert.equal(fs.readFileSync(file,'utf8'),before);assert.deepEqual(fs.readdirSync(dir),['models.ini']);
+  assert.equal(store.get('synthetic').options['ctx-size'],'8192');
+  });
+});
+
+test('model-loader mode on a read-only config dir: startup is silent and saves go through the sidecar',{skip:asRoot&&'root bypasses directory permissions'},async t=>{
+  const {dir,file}=fixture(t);
+  await readOnlyDir(dir,async()=>{
+  const logs=[];
+  assert.equal(reportModelsIniWriter({mode:'model-loader',presetPath:file,log:m=>logs.push(m)}),null);assert.deepEqual(logs,[]);
+  const side=fakeSidecar(file);
+  const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',presetPath:file,fetchJson:router,presetWriter:createModelsIniWriter({mode:'model-loader',url:'http://ml',fetchJson:side.fetchJson})});
+  const r=await manager.applyPreset({model:'synthetic',baseRevision:sha(fs.readFileSync(file,'utf8')),options:{parallel:'3'},confirmReload:true});
+  assert.equal(r.ok,true);assert.equal(side.calls.length,1);assert.match(fs.readFileSync(file,'utf8'),/parallel = 3/);
+  assert.deepEqual(fs.readdirSync(dir),['models.ini']);
+  });
+});
+
+test('web mode on a writable dir: no startup error and the in-process write still works',async t=>{
+  const {dir,file}=fixture(t),logs=[];
+  assert.equal(reportModelsIniWriter({mode:'web',presetPath:file,log:m=>logs.push(m)}),null);assert.deepEqual(logs,[]);
+  assert.equal(reportModelsIniWriter({mode:'web',presetPath:'',log:m=>logs.push(m)}),null);
+  const store=createPresetStore(file),c=store.prepare({model:'synthetic',baseRevision:store.get('synthetic').revision,options:{parallel:'2'}});
+  await store.commit(c);assert.equal(store.get('synthetic').options.parallel,'2');
+  assert.ok(fs.readdirSync(dir).some(n=>n.startsWith('models.ini.noevia-backup-')));
+});
+
+// The shipped llama.cpp overlays keep web read-only with model-loader as the writer (#269). No
+// compose validation runs in CI; walk the web service block by indentation (compose-embed.test).
+test('llama.cpp compose files mount web /llamacpp-config :ro and default to the model-loader writer',()=>{
+  const root=path.resolve(__dirname,'..','..','..');
+  for(const rel of ['compose.llamacpp.yaml','deploy/examples/unraid-llamacpp.override.yml']){
+    const lines=fs.readFileSync(path.join(root,rel),'utf8').split('\n'),start=lines.indexOf('  web:');
+    assert.ok(start>=0,rel);
+    const end=lines.findIndex((l,i)=>i>start&&/^ {0,2}\S/.test(l)&&!/^\s*#/.test(l));
+    const web=lines.slice(start,end<0?undefined:end).filter(l=>!/^\s*#/.test(l)).join('\n');
+    assert.match(web,/^\s+MODELS_INI_WRITER: \$\{MODELS_INI_WRITER:-model-loader\}$/m,rel);
+    assert.match(web,/^\s+- \$\{LLAMACPP_CONFIG_DIR\}:\/llamacpp-config:ro$/m,rel);
+    assert.doesNotMatch(web,/:\/llamacpp-config(:rw)?$/m,rel);
+    assert.match(web,/MODEL_LOADER_URL: http:\/\/model-loader:8090/,rel);
+  }
 });

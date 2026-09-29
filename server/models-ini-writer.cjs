@@ -2,7 +2,7 @@
 // Who writes models.ini (#295, spec M3). 'web' keeps the historical in-process atomic write;
 // 'model-loader' sends the prepared whole-file text to the sidecar's compare-and-swap endpoint
 // so the sidecar is the single writer. Web still reads the file directly in both modes.
-const crypto=require('node:crypto');
+const crypto=require('node:crypto'),fs=require('node:fs'),path=require('node:path');
 // publicMessage: written for people, so routes may show it even on a 5xx (routes/models.cjs).
 const error=(status,message,extra={})=>Object.assign(Error(message),{status,publicMessage:message,...extra});
 const sha=text=>crypto.createHash('sha256').update(text).digest('hex');
@@ -14,6 +14,26 @@ const UNCERTAIN='Model Loader did not confirm whether models.ini was saved. Relo
 const NOT_SAVED='Model Loader did not confirm the save, and models.ini still holds the previous settings, so the preset was not applied. Check that the model-loader service is running, then retry.';
 const THIRD_PARTY='Model Loader did not confirm the save, and models.ini now holds changes from somewhere else. They were left untouched; reload the presets before retrying.';
 const UNREADABLE='Model Loader did not confirm the save, and models.ini could not be read back to check. Reload the presets before retrying.';
+// MODELS_INI_WRITER=web on a read-only /llamacpp-config (#269): the compose default is now
+// model-loader with the mount :ro, so this is a half-applied rollback. Refuse before any backup
+// or temp file is attempted instead of surfacing a raw EROFS.
+const READ_ONLY='models.ini is on a read-only mount while MODELS_INI_WRITER=web, so nothing was changed. Set MODELS_INI_WRITER=model-loader (the default), or remove :ro from the /llamacpp-config mount to roll back to the web writer, then recreate web.';
+function webWriteBlocked(file) {
+  try {fs.accessSync(path.dirname(file),fs.constants.W_OK);return null;}
+  catch(e) {return e?.code||'EACCES';}
+}
+function assertWebWritable(file) {
+  const code=webWriteBlocked(file);
+  if(code)throw error(503,READ_ONLY,{code:'MODELS_INI_READ_ONLY',cause:code});
+}
+// Startup report: logs a clear error (never throws) so a misconfigured mount does not turn into
+// a crash loop; chat keeps working and preset saves return READ_ONLY. Returns the blocking code.
+function reportModelsIniWriter({mode,presetPath,log=console.error}={}) {
+  if(String(mode||'web').toLowerCase()!=='web'||!presetPath)return null;
+  const code=webWriteBlocked(presetPath);
+  if(code)log(`[models-ini] MODELS_INI_WRITER=web but ${path.dirname(presetPath)} is not writable (${code}); preset saves, calibration and autotune will be refused. Set MODELS_INI_WRITER=model-loader or remove :ro from the mount.`);
+  return code;
+}
 function createModelsIniWriter({mode,url,token,fetchJson}) {
   const kind=String(mode||'web').toLowerCase();
   if(kind==='web')return null;
@@ -53,4 +73,4 @@ async function commitReconciled(store,candidate) {
     throw error(409,THIRD_PARTY);
   }
 }
-module.exports={createModelsIniWriter,commitReconciled};
+module.exports={createModelsIniWriter,commitReconciled,assertWebWritable,reportModelsIniWriter};

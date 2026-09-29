@@ -218,6 +218,8 @@ const modelManager = createModelManager({
   apiKey: process.env.MODEL_MANAGER_API_KEY || INFERENCE_KEY,
   fetchJson,
 });
+// MODELS_INI_WRITER=web with a read-only /llamacpp-config: log it once; saves then fail explicitly (#269).
+require('./models-ini-writer.cjs').reportModelsIniWriter({ mode: process.env.MODELS_INI_WRITER, presetPath: process.env.LLAMACPP_PRESET_PATH });
 
 // What index.cjs builds on the adapter: the installed list and the first loaded model as the
 // default, the auto-router roles, the manager service call and the cached folder scan (models.cjs).
