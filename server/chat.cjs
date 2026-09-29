@@ -661,11 +661,14 @@ function createChatHandler({
       if (!project) return;
       let name = null;
       try { const args = JSON.parse(rawArgs || '{}'); if (args && typeof args.name === 'string') name = args.name; } catch { /* no usable args */ }
+      // The readers accept a unique bare name for a file stored under a path (#642), so the name
+      // is resolved the same way before it is compared with a skill's stored name.
+      const resolvedName = name ? require('./project-file-names.cjs').resolveProjectFile(project, name).file?.name ?? null : null;
       const text = String(result ?? '');
       let added = false;
       for (const skill of instructionSkills.list(project)) {
         if (skill.status !== 'enabled' || loadedSkills.has(skill.file)) continue;
-        if (skill.file === name || text.includes(skill.hash)) { loadedSkills.set(skill.file, { hash: skill.hash, name: skill.name }); rememberSkill(skill.file, skill.hash, skill.name, skill.content); added = true; }
+        if (skill.file === name || skill.file === resolvedName || text.includes(skill.hash)) { loadedSkills.set(skill.file, { hash: skill.hash, name: skill.name }); rememberSkill(skill.file, skill.hash, skill.name, skill.content); added = true; }
       }
       if (added) recordLoadedSkills();
     };

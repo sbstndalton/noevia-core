@@ -263,6 +263,19 @@ test('chat: a skill loaded only through read_project_file is tracked too', async
   assert.match(errorOf(r).text, /"other-helper"/);
 });
 
+test('chat: a SKILL.md stored under the upload folder and read by its bare name is tracked (#642)', async (t) => {
+  const stored = 'noevia projects/Fixture/Text/SKILL.md', content = body({ name: 'uploaded-helper' });
+  const fixture = { id: 'fixture-project', name: 'Fixture', model: 'answer-model', assets: [], projectFolder: 'noevia projects/Fixture',
+    files: [{ name: stored, content }, { name: 'notes.txt', content: 'plain source' }],
+    instructionSkills: { [stored]: { enabled: true, reviewedHash: skills.hash(content) } } };
+  // The result carries no SHA-256, so only the name can tie the read to the skill.
+  const r = await run(t, { fixture, router: () => ({ loaded: [] }), rounds: [{ tool: 'read_project_file', args: { name: 'SKILL.md' } }, { tool: 'synthetic_write' }],
+    onExecute: (name, args) => { if (name === 'read_project_file' && JSON.parse(args).name === 'SKILL.md') { disable(fixture, stored); return 'Loaded instruction skill "uploaded-helper"'; } return null; } });
+  assert.deepEqual(r.executed, ['read_project_file'], 'the bare-name read loaded the skill, so its revocation stopped the write');
+  assert.equal(r.requests.length, 1);
+  assert.match(errorOf(r).text, /"uploaded-helper"/);
+});
+
 test('chat: a reply streaming under a skill that is disabled mid-stream is cut off', async (t) => {
   const fixture = project();
   const r = await run(t, { fixture, reqBody: { skill: pinOf(fixture) }, streamDelayMs: 1100, rounds: [{ content: 'first words', afterFirstChunk: () => disable(fixture) }] });

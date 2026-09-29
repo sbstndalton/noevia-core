@@ -15,6 +15,8 @@
 // so prose here is paid for on every request by the smallest model.
 
 const MAX_TEXT_BYTES = 256 * 1024;
+const { resolveProjectFile } = require('./project-file-names.cjs');
+const { classify } = require('./uploads.cjs');
 
 function requireProject(ports, ctx) {
   const project = ports.getProject(ctx.projectId);
@@ -28,20 +30,33 @@ function cleanName(raw) {
   return name;
 }
 
-/** A file the project holds, or a readable error naming what it does have. */
+/** A file the project holds, by its listed name or a unique bare name (#642), or a readable
+ *  error: what it does have, or which files an ambiguous name matched. Same resolver as
+ *  read_project_file, confined to this project's own files. */
 function findFile(project, wanted) {
-  const files = Array.isArray(project.files) ? project.files : [];
-  const file = files.find((f) => f.name === wanted);
-  if (file) return file;
-  const names = files.map((f) => f.name).join(', ') || '(none attached)';
-  throw new Error(`no project file named "${wanted}". Available: ${names}`);
+  const found = resolveProjectFile(project, wanted);
+  if (found.file) return found.file;
+  throw new Error(found.error);
 }
+
+/** The storage path an upload named `base` is written to (see uploads.ingest). */
+function uploadPathFor(project, base) {
+  return project.projectFolder ? `${project.projectFolder}/${classify(base)}/${base}` : base;
+}
+
+/** An upload into the project's own storage folder, detected the way ownsFile does. */
+const isProjectUpload = (project, file) => !!(project.projectFolder && file.attachment && file.source === project.projectFolder);
 
 /** Files that came from an attached storage folder are owned by the server —
  *  the sync loop rewrites them — so editing one here would be undone silently.
- *  Uploads are ours to change. */
-function assertEditable(file) {
+ *  Uploads into the project's storage folder are not edited in place yet: the write path
+ *  recomputes their destination from the storage connection at write time, so the written
+ *  name is not guaranteed to be the resolved one (follow-up to #642). Only a local upload,
+ *  stored under its plain name, is rewritten here. */
+function assertEditable(project, file) {
+  if (isProjectUpload(project, file)) throw new Error(`"${file.name}" is a file uploaded to this project's storage folder; editing uploads with tools isn't supported yet. Use project_create_file to write a new file.`);
   if (file.source) throw new Error(`"${file.name}" comes from the attached folder "${file.source}" and is kept in sync from there. Edit it in that folder instead.`);
+  if (file.name.includes('/')) throw new Error(`"${file.name}" is stored under a folder path; editing it with tools isn't supported yet. Use project_create_file to write a new file.`);
   if (file.attachment && file.attachment.state === 'stored') throw new Error(`"${file.name}" is stored in its original format and has no editable text.`);
   if (file.document) throw new Error(`"${file.name}" is an extracted document, not an editable text file.`);
 }
@@ -122,7 +137,7 @@ function createInternalTools(ports) {
         const project = requireProject(ports, ctx);
         const files = Array.isArray(project.files) ? project.files : [];
         if (!files.length) return 'This project has no files attached.';
-        return clip(files.map((f) => {
+        return clip('Pass a name exactly as shown (or just its file name, when unique) to project_read_file.\n' + files.map((f) => {
           const kind = f.source ? `from folder ${f.source}` : f.document ? 'document' : 'text';
           const size = typeof f.content === 'string' ? `${f.content.length} chars` : 'no readable text';
           return `${f.name} — ${kind}, ${size}`;
@@ -130,7 +145,7 @@ function createInternalTools(ports) {
       },
     },
     project_read_file: {
-      description: 'Read one project file by name. Use offset to continue a long file.',
+      description: 'Read one project file by its listed name (or file name, if unique). Use offset to continue a long file.',
       schema: { type: 'object', properties: {
         name: { type: 'string' },
         offset: { type: 'integer', description: 'characters to skip' },
@@ -172,7 +187,9 @@ function createInternalTools(ports) {
         const name = cleanName(args.name);
         const text = String(args.text == null ? '' : args.text);
         if (Buffer.byteLength(text) > MAX_TEXT_BYTES) throw new Error('that text is too large to write in one call');
-        if ((project.files || []).some((f) => f.name === name)) throw new Error(`"${name}" already exists. Use project_append_file or project_replace_text.`);
+        // An upload into the project folder is stored under its path, so this bare name may
+        // already exist there; creating it again would silently overwrite that upload.
+        if ((project.files || []).some((f) => f.name === name || f.name === uploadPathFor(project, name))) throw new Error(`"${name}" already exists. Use project_append_file or project_replace_text.`);
         await ports.writeTextFile(project, name, text);
         return `Created "${name}" (${text.length} chars).`;
       },
@@ -183,8 +200,8 @@ function createInternalTools(ports) {
       schema: { type: 'object', properties: { name: { type: 'string' }, text: { type: 'string' } }, required: ['name', 'text'] },
       handler: async (args, ctx) => {
         const project = requireProject(ports, ctx);
-        const file = findFile(project, cleanName(args.name));
-        assertEditable(file);
+        const file = findFile(project, args.name);
+        assertEditable(project, file);
         const addition = String(args.text == null ? '' : args.text);
         if (!addition) throw new Error('there is nothing to append');
         const next = `${file.content || ''}${(file.content || '').endsWith('\n') || !file.content ? '' : '\n'}${addition}`;
@@ -208,8 +225,8 @@ function createInternalTools(ports) {
       }, required: ['name', 'find', 'replace'] },
       handler: async (args, ctx) => {
         const project = requireProject(ports, ctx);
-        const file = findFile(project, cleanName(args.name));
-        assertEditable(file);
+        const file = findFile(project, args.name);
+        assertEditable(project, file);
         const find = String(args.find == null ? '' : args.find);
         if (!find) throw new Error('find must not be empty');
         const replace = String(args.replace == null ? '' : args.replace);

@@ -36,10 +36,10 @@ const CORE_TOOLS = [
     function: {
       name: 'read_project_file',
       description:
-        'Read an attached source or enabled instruction skill by exact name. Skills support offset pagination. For PDFs use startPage/endPage (up to 5 pages) and offset to read beyond summaries; results include page and version references.',
+        'Read an attached source or enabled instruction skill by its name as listed. Skills support offset pagination. For PDFs use startPage/endPage (up to 5 pages) and offset to read beyond summaries; results include page and version references.',
       parameters: {
         type: 'object',
-        properties: { name: { type: 'string', description: 'Exact file name, e.g. notes.md' }, startPage: { type: 'integer', minimum: 1 }, endPage: { type: 'integer', minimum: 1 }, offset: { type: 'integer', minimum: 0 } },
+        properties: { name: { type: 'string', description: 'File name as listed (e.g. Folder/Text/notes.md), or just notes.md if unique' }, startPage: { type: 'integer', minimum: 1 }, endPage: { type: 'integer', minimum: 1 }, offset: { type: 'integer', minimum: 0 } },
         required: ['name'],
       },
     },
@@ -390,16 +390,16 @@ function createToolboxes({
       }
     }
     if (name === 'read_project_file') {
-      const wanted = typeof args.name === 'string' ? args.name : '';
-      const files = (project && Array.isArray(project.files)) ? project.files : [];
-      const f = files.find((x) => x.name === wanted);
-      if (!f) {
-        const names = files.map((x) => x.name).join(', ') || '(none attached)';
-        return fail(`ERROR: no project file named "${wanted}". Available: ${names}`);
-      }
+      // The stored name, or a unique trailing part of it (#642): one resolver shared with the
+      // Project documents box and Skill tracking, confined to this project's own files.
+      const found = require('./project-file-names.cjs').resolveProjectFile(project, args.name);
+      if (!found.file) return fail(`ERROR: ${found.error}`);
+      const f = found.file;
       const instructionSkills = require('./instruction-skills.cjs');
       if (instructionSkills.inspect(f, project)) return instructionSkills.read(project, f, getProject(project.id), args.offset ?? 0, TOOL_RESULT_CAP);
       if (f.attachment?.state === 'stored') return `${f.name}: original stored; readable contents are unavailable. Contents have not been read.`;
+      // #586: a source whose text could not be read is never offered to the model as content.
+      if (require('./source-readability.cjs').isUnreadable(f)) return `${f.name}: this file could not be read when it was added; its contents are unavailable. Contents have not been read.`;
       if (f.document && args.startPage !== undefined) {
         try {
           const out = documentSources.readPages(workspace(), project.id, f, args.startPage, args.endPage ?? args.startPage, args.offset ?? 0, TOOL_RESULT_CAP);
