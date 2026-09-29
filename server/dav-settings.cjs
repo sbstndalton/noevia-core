@@ -3,7 +3,9 @@
 // opt-in never publishes a port or turns a LAN credential into a public one.
 function configuration(env = process.env, publicOrigin = '') {
   const port = Number(env.COWORK_DAV_PORT || 0);
-  if (!port) return { available: false, reason: 'The operator has not configured a file-sharing endpoint.' };
+  // `reasonId` is what the client translates (sharing.reason.<id>); `reason` stays as the English fallback for a
+  // client that does not know the id.
+  if (!port) return { available: false, reasonId: 'not-configured', reason: 'The operator has not configured a file-sharing endpoint.' };
   if (!Number.isInteger(port) || port < 1024 || port > 65535 || port === Number(env.UI_PORT || 8021)) throw Error('Invalid separate COWORK_DAV_PORT');
   const scope = env.COWORK_DAV_SCOPE;
   if (!['lan', 'public'].includes(scope)) throw Error('Set COWORK_DAV_SCOPE to lan or public');
@@ -23,7 +25,7 @@ function createDavSettings({ auth, config }) {
   return {
     scope,
     get(user) {
-      return { available: config.available, reason: config.reason, scope: scope(user.id), endpointScope: config.scope,
+      return { available: config.available, reasonId: config.reasonId, reason: config.reason, scope: scope(user.id), endpointScope: config.scope,
         cleartext: config.cleartext || false, port: config.port,
         url: config.available ? `${config.origin}/dav/${encodeURIComponent(user.username)}/` : '',
         eligible: auth.diaryEnabled(user.id) && auth.getStorage(user.id).kind === 'local' };

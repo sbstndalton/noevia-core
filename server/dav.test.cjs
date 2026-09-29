@@ -96,3 +96,17 @@ test('MKCOL is create-only, scoped and refuses bodies and unsupported conditions
  f.storage.alice='webdav';assert.equal((await request('MKCOL','remote')).status,403);
  assert.deepEqual(made,['folder']);assert.equal(f.events.filter(e=>e[0]==='dav.mkdir').length,1);
 });
+
+// #652: the "not configured" reason travels as an id the client translates, with the English sentence beside it as a
+// fallback; an available endpoint sends no reason at all.
+test('DAV settings report why sharing is unavailable as a translatable id plus the English fallback',t=>{
+ const off=fixture(t,configuration({}));
+ const value=off.settings.get(off.user('alice'));
+ assert.equal(value.available,false);
+ assert.equal(value.reasonId,'not-configured');
+ assert.equal(value.reason,'The operator has not configured a file-sharing endpoint.');
+ const on=fixture(t);
+ const ready=on.settings.get(on.user('alice'));
+ assert.equal(ready.reasonId,undefined);
+ assert.equal(ready.reason,undefined);
+});
