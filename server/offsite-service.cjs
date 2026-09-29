@@ -3,7 +3,7 @@
 // small status file, and exposes run-now / restore-test for admins. Off unless
 // features.offsiteBackup is on AND the destination and key are configured.
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
-const { createOffsiteBackup, loadKey } = require('./offsite-backup.cjs');
+const { createOffsiteBackup, loadKey, RETENTION } = require('./offsite-backup.cjs');
 const { createS3Store } = require('./offsite-s3.cjs');
 const { createDirStore } = require('./offsite-dir.cjs');
 const { createGoogleDrive } = require('./gdrive.cjs');
@@ -100,6 +100,8 @@ function createOffsiteService({ env = process.env, features, dataDir, now = Date
     if (gaps.length && !backupFactory) return `Not configured: set ${gaps.join(', ')}.`;
     return null;
   };
+  // The same answer as a code, for the client to translate (#618); `reason` stays the English fallback.
+  const reasonCode = () => (!features.enabled('offsiteBackup') ? 'off' : missing().length && !backupFactory ? 'notConfigured' : null);
   async function exclusive(label, work) {
     const reason = ready();
     if (reason) throw Object.assign(Error(reason), { status: 409, publicMessage: reason });
@@ -138,8 +140,11 @@ function createOffsiteService({ env = process.env, features, dataDir, now = Date
   return {
     status() {
       const s = readStatus();
-      return { enabled: features.enabled('offsiteBackup'), ready: !ready(), reason: ready(), busy: busy || null, schedule: `Daily at ${String(hour).padStart(2, '0')}:00 (server time)`,
-        retention: 'Keeps 7 daily, 4 weekly and 6 monthly snapshots',
+      return { enabled: features.enabled('offsiteBackup'), ready: !ready(), reason: ready(), reasonCode: reasonCode(), reasonGaps: reasonCode() === 'notConfigured' ? missing() : [], busy: busy || null,
+        // The English strings stay for older clients; the structured fields are what the page translates (#618).
+        schedule: `Daily at ${String(hour).padStart(2, '0')}:00 (server time)`, scheduleHour: hour,
+        retention: `Keeps ${RETENTION.daily} daily, ${RETENTION.weekly} weekly and ${RETENTION.monthly} monthly snapshots`, retentionPolicy: { ...RETENTION },
+        destinationFolder: useDir() ? { path: env.OFFSITE_BACKUP_DIR.trim(), mirror: env.OFFSITE_BACKUP_MIRROR || null } : null,
         // Naming where it goes, never how it authenticates.
         destination: useDir() ? `Folder ${env.OFFSITE_BACKUP_DIR.trim()}${env.OFFSITE_BACKUP_MIRROR ? `, mirrored to ${env.OFFSITE_BACKUP_MIRROR}` : ''}`
           : env.OFFSITE_BACKUP_S3_ENDPOINT ? `${new URL(env.OFFSITE_BACKUP_S3_ENDPOINT).host} / ${env.OFFSITE_BACKUP_S3_BUCKET || '?'}` : null,

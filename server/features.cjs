@@ -42,6 +42,18 @@ const REGISTRY = Object.freeze({
   nativeClientAuth: { env: 'NOEVIA_FEATURE_NATIVE_CLIENT_AUTH', unavailable: env => (env.TRUST_PROXY === 'true' ? null : 'Needs TRUST_PROXY on so sign-in limits can tell clients apart.'), label: 'Native app sign-in', description: 'Let a native app (such as the macOS client) sign in by showing a short code that you approve in this browser. Each device gets its own token, listed with a Revoke button under Security and login. A device acts as you for chats, projects and the Diary, but never for administration or security settings. Turning this off signs every device out for good: their tokens are deleted and each device must be approved again.' },
 });
 
+/**
+ * Stable ids for the reasons a feature can be unavailable, so the client can translate them (#618).
+ * The reason text stays English on the wire as the fallback; anything not matched has no id.
+ */
+function unavailableId(name, reason) {
+  if (!reason) return null;
+  if (name === 'browserExecutor') return /Playwright installed/.test(reason) ? 'browserPlaywright' : /Chromium/.test(reason) ? 'browserChromium' : null;
+  if (name === 'constrainedPlanDecoding') return /Not used yet/.test(reason) ? 'notUsed' : null;
+  if (name === 'nativeClientAuth') return /TRUST_PROXY/.test(reason) ? 'trustProxy' : null;
+  return null;
+}
+
 const SETTING_PREFIX = 'feature:';
 
 function parseEnv(raw) {
@@ -80,10 +92,12 @@ function createFeatures({ env = process.env, store = null, audit = () => {}, reg
     },
     /** Booleans only: safe to send to any signed-in user. */
     flags: () => Object.fromEntries([...state].map(([name, s]) => [name, !unavailable(name) && (registry[name].restart ? s.boot : s.value)])),
-    describe: () => [...state].map(([name, s]) => ({ name, label: registry[name].label, description: registry[name].description,
+    // `id` is the flag name: the stable key the client translates the label and description by
+    // (features.item.<id>.*, #618). `label` and `description` remain the English fallback.
+    describe: () => [...state].map(([name, s]) => ({ id: name, name, label: registry[name].label, description: registry[name].description,
       enabled: s.value, source: s.source, locked: s.source === 'env', env: registry[name].env,
-      ...(registry[name].experimental ? { experimental: true, unavailable: unavailable(name) }
-        : registry[name].unavailable ? { unavailable: unavailable(name) } : {}),
+      ...(registry[name].experimental ? { experimental: true, unavailable: unavailable(name), unavailableId: unavailableId(name, unavailable(name)) }
+        : registry[name].unavailable ? { unavailable: unavailable(name), unavailableId: unavailableId(name, unavailable(name)) } : {}),
       pendingRestart: !!registry[name].restart && s.value !== s.boot })),
     set(name, enabled, actorId) {
       if (!known(name)) throw Object.assign(new Error('Unknown feature'), { status: 404 });
@@ -109,4 +123,4 @@ function settingsStore(db) {
   };
 }
 
-module.exports = { browserRuntimeReason, REGISTRY, createFeatures, settingsStore, parseEnv };
+module.exports = { browserRuntimeReason, unavailableId, REGISTRY, createFeatures, settingsStore, parseEnv };

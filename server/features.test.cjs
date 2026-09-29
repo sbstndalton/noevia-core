@@ -120,3 +120,28 @@ test('the registered Browser mode probe is the real runtime check', () => {
   const r = REGISTRY.browserExecutor.unavailable({});
   assert.ok(r === null || typeof r === 'string');
 });
+
+test('every feature is described with a stable id equal to its flag name, for the client to translate by (#618)', () => {
+  const features = createFeatures({ env: {}, store: memoryStore() });
+  const described = features.describe();
+  assert.deepEqual(described.map(f => f.id), Object.keys(REGISTRY));
+  for (const f of described) {
+    assert.equal(f.id, f.name, 'the id is the flag name');
+    assert.match(f.id, /^[a-z][A-Za-z0-9]*$/, 'a key-safe identifier');
+    assert.ok(f.label && f.description, 'the English label and description stay as the fallback');
+  }
+});
+
+test('the reasons a feature is unavailable carry a stable id where the server owns the text (#618)', () => {
+  const { unavailableId, browserRuntimeReason } = require('./features.cjs');
+  assert.equal(unavailableId('browserExecutor', browserRuntimeReason({ resolve: () => { throw new Error('no'); } })), 'browserPlaywright');
+  assert.equal(unavailableId('browserExecutor', browserRuntimeReason({ resolve: () => 'x', load: () => { throw new Error('no'); } })), 'browserChromium');
+  assert.equal(unavailableId('browserExecutor', null), null);
+  assert.equal(unavailableId('constrainedPlanDecoding', 'Not used yet: no server-side plan generator.'), 'notUsed');
+  assert.equal(unavailableId('nativeClientAuth', 'Needs TRUST_PROXY on so sign-in limits can tell clients apart.'), 'trustProxy');
+  assert.equal(unavailableId('toolGate', 'Connect a private decision service with COWORK_DECISION_URL, then restart Noevia.'), null, 'an unknown reason has no id and stays English');
+  const info = createFeatures({ env: {}, store: memoryStore() }).describe();
+  assert.equal(info.find(f => f.id === 'nativeClientAuth').unavailableId, 'trustProxy');
+  assert.equal(info.find(f => f.id === 'constrainedPlanDecoding').unavailableId, 'notUsed');
+  assert.equal('unavailableId' in info.find(f => f.id === 'previews'), false);
+});

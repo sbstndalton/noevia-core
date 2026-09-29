@@ -181,3 +181,21 @@ test('sqlite snapshot copies a live database consistently', async (t) => {
   assert.equal(fs.existsSync(copy.path), false, 'temporary snapshot is removed by its owner');
   assert.equal(await sqliteSnapshot(path.join(dir, 'notes.json')), null);
 });
+
+test('status carries structured fields the page translates from, next to the English fallbacks (#618)', async (t) => {
+  const { service, flags } = setup(t, { enabled: false, env: { real: true, OFFSITE_BACKUP_HOUR: '2' } });
+  let status = service.status();
+  assert.equal(status.reasonCode, 'off');
+  assert.match(status.reason, /turned off/);
+  flags.enabled = true;
+  status = service.status();
+  assert.equal(status.reasonCode, 'notConfigured');
+  assert.ok(status.reasonGaps.length > 0 && status.reasonGaps.every((g) => /^[A-Z0-9_]+$/.test(g)));
+  assert.equal(status.scheduleHour, 2);
+  assert.equal(status.schedule, 'Daily at 02:00 (server time)');
+  assert.deepEqual(status.retentionPolicy, { daily: 7, weekly: 4, monthly: 6 });
+  assert.equal(status.retention, 'Keeps 7 daily, 4 weekly and 6 monthly snapshots');
+  const ready = setup(t).service.status();
+  assert.equal(ready.reasonCode, null);
+  assert.deepEqual(ready.reasonGaps, []);
+});
