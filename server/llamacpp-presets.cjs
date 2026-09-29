@@ -1,6 +1,7 @@
 'use strict';
 const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto');
 const integer=(min,max)=>v=>/^\d+$/.test(v)&&Number(v)>=min&&Number(v)<=max;
+const decimal=(min,max)=>v=>/^\d+(\.\d{1,3})?$/.test(v)&&Number(v)>=min&&Number(v)<=max;
 const choice=(...values)=>v=>values.includes(v);
 // Only resource/runtime knobs, never executable paths, templates, URLs or credentials.
 const fields={
@@ -17,6 +18,12 @@ const fields={
   'spec-type':{aliases:['LLAMA_ARG_SPEC_TYPE'],valid:choice('none','draft-mtp','ngram-simple','draft-mtp,ngram-simple')},
   'spec-draft-n-max':{aliases:['LLAMA_ARG_SPEC_DRAFT_N_MAX'],valid:integer(1,32)},
   'spec-draft-p-min':{aliases:['LLAMA_ARG_SPEC_DRAFT_P_MIN'],valid:v=>/^(0(\.\d{1,3})?|1(\.0{1,3})?)$/.test(v)},
+  // Sampling defaults (#308): apply only to requests that send no value of their own.
+  temp:{aliases:[],valid:decimal(0,2)},
+  'top-p':{aliases:[],valid:decimal(0,1)},
+  'top-k':{aliases:['LLAMA_ARG_TOP_K'],valid:integer(0,100000)},
+  'min-p':{aliases:[],valid:decimal(0,1)},
+  'repeat-penalty':{aliases:[],valid:decimal(0,3)},
 };
 const canonical=key=>Object.keys(fields).find(k=>k===key||fields[k].aliases.includes(key));
 const error=(status,message)=>Object.assign(Error(message),{status});

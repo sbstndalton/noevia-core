@@ -3,6 +3,7 @@
 const fs = require('node:fs');
 const crypto = require('node:crypto');
 const { WORKLOADS, SPEC_CANDIDATES, geomean } = require('./llamacpp-autotune.cjs');
+const { hasHarmonyReasoning, quirksOf, toIniOptions, INI_KEY_LIST } = require('./sampling-recommendation.cjs');
 const { isSystemModel, modelPathFromArgs, SYSTEM_MODEL_REASON } = require('./model-system.cjs');
 const VERSION = 3;
 // Q5 is the automatic floor for KV cache quantization (issue #190): Q4 degrades quality too
@@ -13,16 +14,16 @@ const allowBelowQ5Kv = () => ['1', 'true', 'yes', 'on'].includes(String(process.
 const kvCandidates = () => allowBelowQ5Kv() ? ['f16', 'q8_0', 'q5_1', 'q5_0', 'q4_0'] : ['f16', 'q8_0', 'q5_1', 'q5_0'];
 const UBATCH = [512, 1024, 2048];
 const PAD = 'The garden committee reviewed irrigation, seed orders, volunteer rotas and pump maintenance. ';
-const PHASES = [['kv', 'KV cache'], ['context', 'Context size'], ['drafting', 'Drafting'], ['batch', 'Batch and micro-batch']];
+const PHASES = [['sampling', 'Sampling'], ['kv', 'KV cache'], ['context', 'Context size'], ['drafting', 'Drafting'], ['batch', 'Batch and micro-batch']];
 const QUALITY = [
   { id: 'arithmetic', prompt: 'Compute (17 * 4) - 9. Reply with only the integer.', expected: '59' },
   { id: 'extraction', prompt: 'Record: name=Juniper; code=AX-417; colour=blue. Return only the code, without quotes.', expected: 'AX-417' },
   { id: 'reasoning', prompt: 'All daxes are blue. No blue things are round. Can a dax be round? Reply with only yes or no.', expected: 'no' },
 ];
-const hasHarmonyReasoning = model => /(?:^|[^a-z0-9])gpt[-_. ]?oss(?:\d|[^a-z0-9]|$)/i.test(model);
+// Family facts (Harmony reasoning budget and effort) come from the shared per-family table (#308, #328).
 // A short final answer may follow analysis on Harmony models. Keep this finite and
 // require the final content itself to pass every probe; analysis is not an answer.
-const qualityBudget = model => hasHarmonyReasoning(model) ? 512 : 64;
+const qualityBudget = model => quirksOf(model).qualityBudget || 64;
 function normalizedAnswer(text) {
   let answer = text.trim().toLowerCase();
   // Accept formatting around the entire answer, never a correct substring inside prose.
@@ -51,12 +52,16 @@ const cancelledError = () => Object.assign(Error('Cancelled'), { cancelled: true
 const publicJob = job => job && JSON.parse(JSON.stringify(job, (key, value) =>
   key.startsWith('_') || ['originalText', 'lastRevision', 'originalRevision', 'beforeText'].includes(key) ? undefined : value));
 const step = (id, label) => ({ id, label, status: 'pending' });
+function stepsFor(id) {
+  return id === 'sampling' ? [step('apply', 'Recommended sampling')]
+    : id === 'kv' ? kvCandidates().map(k => step(k, k + ' KV cache'))
+    : id === 'drafting' ? SPEC_CANDIDATES.map(c => step(c.id, c.label))
+    : id === 'batch' ? UBATCH.map(n => step(String(n), 'Micro-batch ' + n))
+    : [step('capacity', 'Load and long-prompt recall')];
+}
 function newModel(model) {
   return { model, status: 'pending', phases: PHASES.map(([id, label]) => ({
-    id, label, status: 'pending', steps: id === 'kv' ? kvCandidates().map(k => step(k, k + ' KV cache'))
-      : id === 'drafting' ? SPEC_CANDIDATES.map(c => step(c.id, c.label))
-      : id === 'batch' ? UBATCH.map(n => step(String(n), 'Micro-batch ' + n))
-      : [step('capacity', 'Load and long-prompt recall')],
+    id, label, status: 'pending', steps: stepsFor(id),
   })) };
 }
 
@@ -71,7 +76,7 @@ function clientMessage(e, fallback) {
 }
 
 function createFullAutotuner({ request, rawModels, presets, maintenance, applyUnlocked, identityFor,
-  contextFactory, stateFile, now = Date.now, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
+  contextFactory, samplingFor = null, stateFile, now = Date.now, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
   betweenModelsMs = 1000, idleTimeoutMs = 300000,
   readMemory = require('./llamacpp-calibration.cjs').readMemAvailableGib, memoryFloorGib = 2, onResult = async () => {} }) {
   let state;
@@ -154,7 +159,7 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
     let r;
     try { r = await request('/v1/chat/completions', { method: 'POST', signal: controller.signal, body: JSON.stringify({
       model, stream: false, temperature: 0, max_tokens: max, cache_prompt: false,
-      ...(hasHarmonyReasoning(model) ? { reasoning_effort: 'low' } : {}),
+      ...(quirksOf(model).reasoningEffort ? { reasoning_effort: quirksOf(model).reasoningEffort } : {}),
       chat_template_kwargs: { enable_thinking: false }, messages: [{ role: 'user', content: prompt }],
     }) }, 180000); }
     finally { clearInterval(timer); inflight = null; }
@@ -263,6 +268,32 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
       if (!final.passed) throw Error(qualityFailure(final));
     }
   }
+  // Scripted, deterministic (#308): the recommendation table decides, nothing is measured to
+  // choose it. Written through the same applyUnlocked path as every other step (so
+  // MODELS_INI_WRITER=model-loader keeps a single writer), loaded and probed once to prove the
+  // engine accepts it, and put back by runPhase's restore if any of that fails. An operator's own
+  // sampling keys, model-level or in the [*] defaults, are never overwritten.
+  async function runSampling(j, p) {
+    const rec = samplingFor ? await samplingFor(j.model) : null;
+    const options = rec ? toIniOptions(rec.values) : {};
+    const profile = presets.get(j.model);
+    const own = INI_KEY_LIST.filter(k => profile.options[k] || profile.defaults[k]);
+    const skip = reason => {
+      record(p, 'apply', 'skipped', { reason });
+      p.value = { skipped: true, reason, ...(rec ? { tier: rec.tier, source: rec.source } : {}) };
+      note(j, 'Sampling left unchanged: ' + reason);
+    };
+    if (!Object.keys(options).length) return skip('No recommended sampling values; the engine defaults stay in force.');
+    if (own.length) return skip('Sampling is already set in models.ini (' + own.join(', ') + '); left as configured.');
+    check(); note(j, 'Applying recommended sampling (' + rec.source + ').');
+    record(p, 'apply', 'running', { startedAt: now() });
+    await write(j, options);
+    await load(j);
+    const final = await validate(j.model);
+    record(p, 'apply', 'passed', { value: options, finishedAt: now() });
+    p.value = { applied: true, tier: rec.tier, source: rec.source, family: rec.familyId, values: options, quality: final.quality };
+    note(j, 'Committed recommended sampling: ' + Object.entries(options).map(([k, v]) => k + ' ' + v).join(', ') + '.');
+  }
   async function runKv(j, p) {
     const before = { ...presets.get(j.model).options }, results = [];
     for (const kv of kvCandidates()) {
@@ -339,7 +370,7 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
       generation: final.generation, acceptance: final.acceptance, quality: final.quality };
     note(j, 'Committed micro-batch ' + best.ub + '.');
   }
-  const phaseRuns = { kv: runKv, context: runContext, drafting: runDrafting, batch: runBatch };
+  const phaseRuns = { sampling: runSampling, kv: runKv, context: runContext, drafting: runDrafting, batch: runBatch };
   async function restorePhase(j, p) {
     if (p._beforeText == null) return true;
     if (presets.snapshot().revision !== j._revision) { p.restored = false; return false; }
@@ -359,10 +390,7 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
     if (presets.snapshot().revision !== j._revision) throw Object.assign(Error('Settings changed outside auto-tune.'), { fatal: true });
     p._beforeText = presets.snapshot().text;
     p.status = 'running'; p.startedAt = now();
-    p.steps = p.id === 'kv' ? kvCandidates().map(k => step(k, k + ' KV cache'))
-      : p.id === 'drafting' ? SPEC_CANDIDATES.map(c => step(c.id, c.label))
-      : p.id === 'batch' ? UBATCH.map(n => step(String(n), 'Micro-batch ' + n))
-      : [step('capacity', 'Load and long-prompt recall')];
+    p.steps = stepsFor(p.id);
     j.phase = p.label; save();
     try {
       await phaseRuns[p.id](j, p); check();
@@ -371,6 +399,15 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
       delete p._beforeText; save();
     } catch (e) {
       const restored = await restorePhase(j, p);
+      // Sampling is an optional nicety: a failure there must not fail a tune that the measured
+      // phases would complete. Once models.ini is confirmed restored, record why and go on.
+      // Cancellation, outside edits and unsafe restores still stop the job as for any phase.
+      if (p.id === 'sampling' && restored && !cancelled && !e.cancelled && !e.fatal) {
+        for (const s of p.steps) if (s.status !== 'skipped') { s.status = 'failed'; s.reason = e.message; }
+        p.status = 'passed'; p.reason = e.message; p.value = { skipped: true, failed: true, reason: e.message };
+        p.finishedAt = now(); note(j, 'Recommended sampling was not applied and models.ini was restored: ' + e.message);
+        return;
+      }
       p.status = cancelled || e.cancelled ? 'interrupted' : 'failed'; p.reason = e.message;
       for (const s of p.steps) if (s.status === 'running') { s.status = 'interrupted'; s.reason = e.message; }
       p.finishedAt = now(); save();
@@ -387,6 +424,7 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
     const result = { kv: kv.kv, context: ctx.context, spec: draft.spec, specLabel: draft.specLabel,
       generation: final.generation, acceptance: final.acceptance, ubatch: batch.ubatch,
       promptPerSecond: batch.promptPerSecond, quality: final.quality, extensions: [],
+      sampling: phaseOf(item, 'sampling')?.value || null,
       loaded: true, version: VERSION, signature: await signature(item.model, identity) };
     if (presets.snapshot().revision !== j._revision)
       throw Object.assign(Error('Settings changed outside auto-tune.'), { fatal: true });

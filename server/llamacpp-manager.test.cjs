@@ -123,6 +123,7 @@ test('qualification evidence is tied to the live configuration and goes stale wh
   const unverified=(await manager.evidence('fx')).body;
   assert.equal(unverified.categories.find(c=>c.category==='context_capacity').state,'unverified');
   assert.deepEqual(unverified.samplingRecommendation,{state:'unverified',values:null,source:null,provenance:null,limitations:[]});
+  assert.equal(unverified.samplingPlan.tier,'preset','no source and no family: task preset fallback');assert.deepEqual(unverified.samplingPlan.values,{});
   const artifact=require('./evidence.cjs').fileFingerprint(path.join(models,'fx','fx.gguf'));
   require('./evidence.cjs').createStore(ev).append({model:'fx',category:'external_sampling_config',result:'reported',
     identityHash:require('./model-evidence-import.cjs').artifactIdentityHash(artifact),value:{temperature:0.7,top_p:0.9},
@@ -132,6 +133,8 @@ test('qualification evidence is tied to the live configuration and goes stale wh
   assert.equal(reported.state,'reported');
   assert.deepEqual(reported.values,{temperature:0.7,top_p:0.9});
   assert.equal(reported.source,'generation_config.json');
+  const plan=(await manager.evidence('fx')).body.samplingPlan;
+  assert.equal(plan.tier,'model-card');assert.deepEqual(plan.values,{temperature:0.7,top_p:0.9});assert.equal(plan.provenance.revision,'a'.repeat(40));
   await manager.recordEvidence('fx',{category:'context_capacity',result:'passed',value:{ctx:8192},suite:{name:'native-calibration',version:1},source:'calibration'});
   const verified=(await manager.evidence('fx')).body.categories.find(c=>c.category==='context_capacity');
   assert.equal(verified.state,'verified');assert.equal(verified.value.ctx,8192);
@@ -144,6 +147,7 @@ test('qualification evidence is tied to the live configuration and goes stale wh
   assert.equal((await manager.evidence('fx')).body.categories.find(c=>c.category==='context_capacity').state,'stale','replaced artifact');
   const stale=(await manager.evidence('fx')).body.samplingRecommendation;
   assert.equal(stale.state,'stale');assert.equal(stale.values,null,'old artifact recommendation is never offered as current');
+  assert.equal((await manager.evidence('fx')).body.samplingPlan.tier,'preset','a stale source claim is not the plan');
   fs.rmSync(path.join(models,'fx','fx.gguf'));
   assert.equal((await manager.evidence('fx')).body.categories.find(c=>c.category==='context_capacity').state,'unavailable','missing file');
  }finally{fs.rmSync(root,{recursive:true,force:true});}

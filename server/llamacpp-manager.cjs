@@ -343,6 +343,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     const artifactHash=live?.identity?.artifact?importLib.artifactIdentityHash(live.identity.artifact):null;
     const external=importLib.deriveExternal(records,{model,artifactHash});
     const sampling=importLib.deriveSampling(records,{model,artifactHash});
+    const recommendation=resolveSampling(model,sampling);
     return {ok:true,status:200,body:{model,tracked:!!evidenceStore,identityHash:live?.identityHash||null,
       categories:evidenceLib.CATEGORIES.map(category=>{const d=evidenceLib.derive(records,{model,category,liveHash:live?.identityHash||null});
         return {category,state:d.state,value:d.record?.value??null,result:d.record?.result??null,at:d.record?.at??null,suite:d.record?.suite??null,limitations:d.record?.limitations||[]};}),
@@ -350,7 +351,28 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
         provenance:external.record?.provenance??null,limitations:external.record?.limitations||[]},
       samplingRecommendation:{state:sampling.state,values:sampling.state==='reported'?sampling.record?.value??null:null,
         source:sampling.record?'generation_config.json':null,provenance:sampling.record?.provenance??null,
-        limitations:sampling.record?.limitations||[]}}};
+        limitations:sampling.record?.limitations||[]},
+      // What auto-tune would apply, with its source tier (#308). Separate from the raw source
+      // claim above so that claim's shape stays as #508 published it.
+      samplingPlan:{tier:recommendation.tier,source:recommendation.source,values:recommendation.values,family:recommendation.familyId,
+        quirks:recommendation.quirks,note:recommendation.note,provenance:recommendation.provenance}}};
+  }
+  // The recommendation the tuner applies and the pre-flight shows (#308). Only a current source
+  // claim counts as tier 1; a stale or unverified one falls through to the family table.
+  function resolveSampling(model,sampling){
+    const current=sampling?.state==='reported'?sampling.record:null;
+    return require('./sampling-recommendation.cjs').resolveSamplingRecommendation({model,sourceValues:current?.value??null,sourceProvenance:current?.provenance??null});
+  }
+  async function samplingFor(model){
+    let sampling=null;
+    if(evidenceStore){
+      try{
+        const importLib=require('./model-evidence-import.cjs'),live=await computeIdentity(model);
+        const artifactHash=live?.identity?.artifact?importLib.artifactIdentityHash(live.identity.artifact):null;
+        sampling=importLib.deriveSampling(evidenceStore.list(),{model,artifactHash});
+      }catch{sampling=null;}
+    }
+    return resolveSampling(model,sampling);
   }
   // Best-effort import of attributable model-card evidence for one model (#266). The
   // checkpoint (HF repo) equals the llama.cpp model id for a pulled model; a locally
@@ -392,6 +414,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
   const autotuner=presets&&autotuneStatePath?(autotuneOptions.speedOnly===true
     ?require('./llamacpp-autotune.cjs').createAutotuner(speedDeps)
     :require('./llamacpp-full-autotune.cjs').createFullAutotuner({request,rawModels,presets,maintenance,applyUnlocked,identityFor:speedDeps.identityFor,stateFile:autotuneStatePath,
+      samplingFor,
       readMemory:speedDeps.readMemory,memoryFloorGib:speedDeps.memoryFloorGib,
       ...(autotuneOptions.betweenModelsMs!=null?{betweenModelsMs:autotuneOptions.betweenModelsMs}:{}),
       ...(autotuneOptions.idleTimeoutMs!=null?{idleTimeoutMs:autotuneOptions.idleTimeoutMs}:{}),

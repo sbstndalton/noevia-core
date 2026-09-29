@@ -52,3 +52,13 @@ test('reloading presets refuses while a model is loaded unless asked to unload i
  assert.ok(calls.indexOf('POST /models/unload')<calls.indexOf('GET /models?reload=1'));
  const leave=manager.enterInference();await assert.rejects(manager.reloadPresets({unload:true}),{status:409});leave();
 });
+test('sampling defaults are accepted as bounded decimals and rejected otherwise',async t=>{
+ const {file,store}=fixture(t),profile=store.get('synthetic');
+ const c=store.prepare({model:'synthetic',baseRevision:profile.revision,options:{temp:'0.6','top-p':'0.95','top-k':'20','min-p':'0','repeat-penalty':'1.05'}});
+ await store.commit(c);
+ assert.deepEqual(['temp','top-p','top-k','min-p','repeat-penalty'].map(k=>store.get('synthetic').options[k]),['0.6','0.95','20','0','1.05']);
+ const rev=store.get('synthetic').revision,before=fs.readFileSync(file,'utf8');
+ for(const options of [{temp:'2.5'},{temp:'-1'},{temp:'0.6\nmodel = /evil'},{'top-p':'1.5'},{'top-k':'0.5'},{'min-p':'abc'},{'repeat-penalty':'4'}])
+  assert.throws(()=>store.prepare({model:'synthetic',baseRevision:rev,options}),{status:400});
+ assert.equal(fs.readFileSync(file,'utf8'),before);
+});
