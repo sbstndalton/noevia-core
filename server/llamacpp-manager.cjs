@@ -366,9 +366,9 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     const recommendation=resolveSampling(model,sampling);
     return {ok:true,status:200,body:{model,tracked:!!evidenceStore,identityHash:live?.identityHash||null,
       categories:evidenceLib.CATEGORIES.map(category=>{const d=evidenceLib.derive(records,{model,category,liveHash:live?.identityHash||null});
-        return {category,state:d.state,value:d.record?.value??null,result:d.record?.result??null,at:d.record?.at??null,suite:d.record?.suite??null,limitations:d.record?.limitations||[]};}),
+        return {category,state:d.state,value:d.record?.value??null,result:d.record?.result??null,at:d.record?.at??null,suite:d.record?.suite??null,limitations:d.record?.limitations||[],limitationKeys:require('./evidence-limitations.cjs').limitationKeys(d.record?.limitations)};}),
       external:{category:'external_model_card',state:external.state,value:external.record?.value??null,at:external.record?.at??null,suite:external.record?.suite??null,
-        provenance:external.record?.provenance??null,limitations:external.record?.limitations||[]},
+        provenance:external.record?.provenance??null,limitations:external.record?.limitations||[],limitationKeys:require('./evidence-limitations.cjs').limitationKeys(external.record?.limitations)},
       samplingRecommendation:{state:sampling.state,values:sampling.state==='reported'?sampling.record?.value??null:null,
         source:sampling.record?'generation_config.json':null,provenance:sampling.record?.provenance??null,
         limitations:sampling.record?.limitations||[]},

@@ -138,6 +138,11 @@ test('qualification evidence is tied to the live configuration and goes stale wh
   await manager.recordEvidence('fx',{category:'context_capacity',result:'passed',value:{ctx:8192},suite:{name:'native-calibration',version:1},source:'calibration'});
   const verified=(await manager.evidence('fx')).body.categories.find(c=>c.category==='context_capacity');
   assert.equal(verified.state,'verified');assert.equal(verified.value.ctx,8192);
+  assert.deepEqual(verified.limitationKeys,[],'no limitations, no keys');
+  await manager.recordEvidence('fx',{category:'vision',result:'passed',value:null,suite:{name:'vision-probe',version:1},source:'probe',limitations:['1×1 image accepted; not an accuracy test','A new sentence nobody translated']});
+  const vision=(await manager.evidence('fx')).body.categories.find(c=>c.category==='vision');
+  assert.deepEqual(vision.limitations,['1×1 image accepted; not an accuracy test','A new sentence nobody translated'],'the English sentences stay for older clients');
+  assert.deepEqual(JSON.parse(JSON.stringify(vision.limitationKeys)),[{id:'vision-probe',params:{}},null],'#598: a stable id beside each known sentence, null for the rest');
   assert.ok(!fs.readFileSync(path.join(ev,'evidence.jsonl'),'utf8').includes('synthetic-router'),'raw endpoint must not be stored');
   fs.writeFileSync(ini,'version = 1\n\n[fx]\nmodel = /models/fx/fx.gguf\nctx-size = 16384\n');
   assert.equal((await manager.evidence('fx')).body.categories.find(c=>c.category==='context_capacity').state,'stale','preset change');
