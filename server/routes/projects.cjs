@@ -166,7 +166,8 @@ function createProjectRoutes({
         project.updatedAt = Date.now();
         saveProjects(PROJECTS);
       }
-      return json(res, 200, {skills: skills.list(project)});
+      // Origin, portable id and bundled scripts ride along so Sources shows provenance (#272).
+      return json(res, 200, {skills: skills.listForClient(project, allToolboxes().map(box => box.id))});
     }
 
     // Plugins → Skills → Add to project: copy one published SKILL.md into the project. It lands

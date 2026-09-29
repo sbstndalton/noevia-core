@@ -73,9 +73,14 @@ test('portable skill routes preserve the legacy body list and require an exact e
   const f = fixture({ projects: [project] });
   const base = '/api/projects/p1/instruction-skills';
   await f.call('GET', base);
-  assert.equal(f.sent.pop().body.skills[0].content, content, 'existing UI list retains its body');
+  const row = f.sent.pop().body.skills[0];
+  assert.equal(row.content, content, 'existing UI list retains its body');
   await f.call('GET', `${base}/manifests`);
   const item = f.sent.pop().body.skills[0];
+  // #272: the Sources list also shows where the skill came from, under its portable id.
+  assert.equal(row.id, item.id);
+  assert.deepEqual(row.origin, { kind: 'project-file' });
+  assert.deepEqual(row.scripts, []);
   assert.equal(JSON.stringify(item).includes('Draft from synthetic notes.'), false);
   await f.call('GET', `${base}/manifests/${item.id}/content`, undefined, `?version=${item.version}`);
   assert.equal(f.sent.pop().status, 409);

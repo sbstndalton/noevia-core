@@ -153,14 +153,43 @@ function createChatHandler({
 
     let autoSkills = [];
     if (project) project = require('./instruction-skills.cjs').snapshot(project); // Pin reviewed skill bodies/config for this exchange.
+    const instructionSkills = require('./instruction-skills.cjs');
+    const chatUser = requestScope.getStore()?.authn?.user || null;
+    // The toolbox ids this request carries, before the provider is known (the external-provider
+    // strip comes later). One function, so the Skill requirement check (#272) and the tool loop
+    // read the same selection; calling it never enables anything.
+    const requestToolboxes = () => {
+      const selectedBoxes = require('./toolboxes-permitted.cjs').selectedToolboxIds({ project, defaultToolboxes: DEFAULT_TOOLBOXES, connectorBoxes: CONNECTOR_BOXES, connected: connectedBoxes(chatUser) });
+      // Per-turn overrides from the composer catalogue (#237): only boxes this server already offers
+      // may be added, never a connector box; the OAuth filter below and the write gate still apply.
+      if (Array.isArray(body.turnToolboxes)) {
+        const offeredIds = new Set(allToolboxes().map((b) => b.id));
+        for (const id of body.turnToolboxes) if (typeof id === 'string' && offeredIds.has(id) && !CONNECTOR_BOXES.has(id) && !selectedBoxes.includes(id)) selectedBoxes.push(id);
+      }
+      // Diary tools reach only accounts with the Diary add-on on, whether the project or the turn
+      // asked for them (the same predicate the permitted catalogue uses to mark Diary unavailable).
+      if (!(chatUser && authService && typeof authService.diaryEnabled === 'function' && authService.diaryEnabled(chatUser.id))) { const k = selectedBoxes.indexOf('diary'); if (k >= 0) selectedBoxes.splice(k, 1); }
+      // A sign-in server's tools reach only the accounts that signed in to it themselves.
+      { const oauthIds = oauthServerIds(); for (let k = selectedBoxes.length - 1; k >= 0; k--) if (oauthIds.has(selectedBoxes[k]) && !accountReady(chatUser?.id, selectedBoxes[k])) selectedBoxes.splice(k, 1); }
+      return selectedBoxes;
+    };
+    // Skills whose instructions this exchange put in front of the model: file -> the SHA-256 loaded.
+    // Checked against the stored project before every step, so disabling or changing one stops the
+    // exchange (#272); skills this exchange did not load are not consulted.
+    const loadedSkills = new Map();
     // Explicit version-pinned Skill (#272). Absent means exactly the old behaviour. Resolved from the
     // snapshot of the tenant-scoped project before any model, RAG or tool work, so a refusal costs nothing.
     let pinnedSkill = null;
     if (body.skill !== undefined && body.skill !== null) {
       if (spaceId === 'diary' || !project) return json(res, 400, { error: 'A pinned Skill needs a project chat.', code: 'skill_pin_requires_project' });
       if (body.compactOnly) return json(res, 400, { error: 'Compaction does not accept a pinned Skill.', code: 'skill_pin_invalid' });
-      try { pinnedSkill = require('./instruction-skills.cjs').resolvePinned(project, body.skill, allToolboxes().map((b) => b.id)); }
+      try { pinnedSkill = instructionSkills.resolvePinned(project, body.skill, allToolboxes().map((b) => b.id)); }
       catch (error) { return json(res, error.status || 400, { error: error.message, code: error.code || 'skill_pin_invalid' }); }
+      // Requirements are validated before use and never satisfied by the skill itself: a required
+      // toolbox this request does not carry refuses the pin (fail closed) rather than running without it.
+      const missing = instructionSkills.unmetRequirements(pinnedSkill.manifest.requirements.toolboxes, requestToolboxes());
+      if (missing.length) return json(res, 422, { error: `This skill needs toolboxes this chat does not offer: ${missing.join(', ')}. Select them for the project or for this message first.`, code: 'skill_requirements_unmet', missing });
+      loadedSkills.set(pinnedSkill.record.file, { hash: pinnedSkill.record.contentHash, name: pinnedSkill.record.name });
     }
     // Created only after the pin resolved, so a refused request leaves no empty chat behind.
     if (project && !chatId) {
@@ -177,6 +206,7 @@ function createChatHandler({
     }
 
     const sysParts = [];
+    let autoSkillBlock = '';
     const accountSettings = require('./account-instructions.cjs').read(currentWorkspace().dir);
     const accountPart = require('./account-instructions.cjs').systemPart(accountSettings); // style, advanced controls and response language
     if (accountPart) sysParts.push(accountPart);
@@ -209,10 +239,17 @@ function createChatHandler({
         // L1 up front when one skill clearly matches this message, so a small model does not have
         // to remember to fetch it. Only reviewed, enabled skills from the pinned snapshot.
         // An explicitly pinned skill replaces automatic selection for this message.
-        const picked = pinnedSkill ? { loaded: [] } : await chatSkillRouter.select(skills, message);
+        // Automatic loading considers only skills usable as they stand: no unsupported toolbox, no
+        // bundled scripts, and every required toolbox carried by this request (#272, fail closed).
+        const usable = new Set(instructionSkills.manifests(project, allToolboxes().map((b) => b.id)).filter((m) => m.resolvable).map((m) => m.file));
+        const carried = pinnedSkill ? [] : requestToolboxes();
+        const candidates = pinnedSkill ? [] : skills.filter((s) => usable.has(s.file) && !instructionSkills.unmetRequirements(s.requires, carried).length);
+        const picked = pinnedSkill ? { loaded: [] } : await chatSkillRouter.select(candidates, message);
         if (picked.loaded.length) {
           autoSkills = picked.loaded;
-          sysParts.push(require('./chat-skill-routing.cjs').skillBlock(autoSkills));
+          autoSkillBlock = require('./chat-skill-routing.cjs').skillBlock(autoSkills);
+          sysParts.push(autoSkillBlock);
+          for (const s of autoSkills) loadedSkills.set(s.file, { hash: s.hash, name: s.name });
           console.log(`[skills] auto-loaded ${autoSkills.map((s) => s.file).join(', ')}`);
         }
       }
@@ -526,21 +563,21 @@ function createChatHandler({
     // Resolve the project's toolboxes once for the whole exchange: every round
     // must offer the same list, or the model gets told a tool exists and then
     // punished for calling it.
-    const chatUser = requestScope.getStore()?.authn?.user || null;
-    const selectedBoxes = require('./toolboxes-permitted.cjs').selectedToolboxIds({ project, defaultToolboxes: DEFAULT_TOOLBOXES, connectorBoxes: CONNECTOR_BOXES, connected: connectedBoxes(chatUser) });
-    // Per-turn overrides from the composer catalogue (#237): only boxes this server already offers
-    // may be added, never a connector box; the OAuth filter below and the write gate still apply.
-    if (Array.isArray(body.turnToolboxes)) {
-      const offeredIds = new Set(allToolboxes().map((b) => b.id));
-      for (const id of body.turnToolboxes) if (typeof id === 'string' && offeredIds.has(id) && !CONNECTOR_BOXES.has(id) && !selectedBoxes.includes(id)) selectedBoxes.push(id);
-    }
-    // Diary tools reach only accounts with the Diary add-on on, whether the project or the turn
-    // asked for them (the same predicate the permitted catalogue uses to mark Diary unavailable).
-    if (!(chatUser && authService && typeof authService.diaryEnabled === 'function' && authService.diaryEnabled(chatUser.id))) { const k = selectedBoxes.indexOf('diary'); if (k >= 0) selectedBoxes.splice(k, 1); }
+    // Project and turn boxes with the Diary add-on and OAuth sign-in filters (requestToolboxes, above).
+    const selectedBoxes = requestToolboxes();
     // Rule 2 of provider-egress.cjs: private tools (the Diary) are not offered through an external provider.
     egress.stripPrivateToolboxes(selectedBoxes, provider);
-    // A sign-in server's tools reach only the accounts that signed in to it themselves.
-    { const oauthIds = oauthServerIds(); for (let k = selectedBoxes.length - 1; k >= 0; k--) if (oauthIds.has(selectedBoxes[k]) && !accountReady(chatUser?.id, selectedBoxes[k])) selectedBoxes.splice(k, 1); }
+    // The provider can remove a box a skill requires (#272). A pinned skill then stops here, before
+    // any model request; an automatically loaded one is taken back out of the prompt instead.
+    if (pinnedSkill) {
+      const missing = instructionSkills.unmetRequirements(pinnedSkill.manifest.requirements.toolboxes, selectedBoxes);
+      if (missing.length) { send({ type: 'error', code: 'skill_requirements_unmet', text: `This skill needs toolboxes that ${provider.label || 'this provider'} cannot use: ${missing.join(', ')}. Nothing was run.` }); res.end(); return; }
+    }
+    if (autoSkills.some((s) => instructionSkills.unmetRequirements(s.requires, selectedBoxes).length)) {
+      wire = wire.map((m) => (m.role === 'system' && typeof m.content === 'string' ? { ...m, content: m.content.replace(`\n\n${autoSkillBlock}`, '').replace(autoSkillBlock, '') } : m));
+      for (const s of autoSkills) loadedSkills.delete(s.file);
+      autoSkills = [];
+    }
     const routing = await chatToolRouter.select(selectedBoxes, message);
     if (routing.routed) console.log(`[tools] routed ${selectedBoxes.length} toolboxes to ${routing.ids.join(', ')}`);
     // A tool the account blocked is never offered, so the model cannot even ask for it.
@@ -568,6 +605,41 @@ function createChatHandler({
     // (after policy blocks and tool routing). Off, it returns 'none' without doing anything, and
     // the request below is exactly what it was without the gate. It never picks a write.
     const gate = toolGate && !body.compactOnly ? await toolGate.evaluate(message, resolved.tools) : null;
+    // In-flight revocation (#272): the loaded skills against the project as stored now. Once revoked
+    // it stays revoked for the rest of the exchange: no further tool runs and no further model round
+    // starts, and a round already streaming is cut off at its next check (at most once a second).
+    let skillRevocation = null, skillRevocationReported = false, skillCheckedAt = 0;
+    const revokedSkills = () => {
+      if (!skillRevocation && loadedSkills.size && project) {
+        skillCheckedAt = Date.now();
+        const gone = instructionSkills.revoked(getProject(project.id), loadedSkills);
+        if (gone.length) skillRevocation = gone;
+      }
+      return skillRevocation;
+    };
+    // A skill body the model fetched itself is loaded too, at the version read. Tracked by WHAT was
+    // read, not by which tool read it: read_project_file, the Project documents box's
+    // project_read_file (same reader through MCP) or anything else. A successful call that names a
+    // skill file, or whose result carries a skill's SHA-256 (the reader's heading), counts. Tracking
+    // too much only makes revocation stricter, which is the safe direction.
+    const noteSkillRead = (rawArgs, result) => {
+      if (!project) return;
+      let name = null;
+      try { const args = JSON.parse(rawArgs || '{}'); if (args && typeof args.name === 'string') name = args.name; } catch { /* no usable args */ }
+      const text = String(result ?? '');
+      let added = false;
+      for (const skill of instructionSkills.list(project)) {
+        if (skill.status !== 'enabled' || loadedSkills.has(skill.file)) continue;
+        if (skill.file === name || text.includes(skill.hash)) { loadedSkills.set(skill.file, { hash: skill.hash, name: skill.name }); added = true; }
+      }
+      if (added) recordLoadedSkills();
+    };
+    const loadedSkillRecords = () => [...loadedSkills].map(([file, { hash, name }]) => ({ file, name, contentHash: hash }));
+    const revocationText = () => `Skill ${skillRevocation.map((s) => JSON.stringify(s.name)).join(', ')} was disabled or changed during this reply, so no further steps were run.`;
+    const refuseForRevokedSkill = (name, userId) => {
+      authService?.audit?.('tool.denied', userId, userId, { tool: name, reason: 'skill-revoked' });
+      return `ERROR: ${revocationText()} ${name} was not run. Do not retry it.`;
+    };
     // Returns the messages with the fetched exchange added, or null when the read could not run
     // (the account asks before this tool, the tool failed, or the chat was cancelled).
     async function prefetchTool({ tool, args }) {
@@ -577,6 +649,7 @@ function createChatHandler({
       const userId = chatUser?.id || null;
       const workspaceUserId = requestScope.getStore()?.workspace?.userId || null;
       if (!userId || (workspaceUserId && workspaceUserId !== userId)) return null;
+      if (revokedSkills()) return null;
       if (chatSignal.signal.aborted || toolPolicy.mode(userId, tool, isWriteTool(tool)) !== 'allow') return null;
       if (egressToolRefusal(chatUser?.id || userId, tool, JSON.stringify(args))) return null;
       const call = { id: `gate-${crypto.randomUUID()}`, name: tool, args: JSON.stringify(args) };
@@ -599,6 +672,7 @@ function createChatHandler({
       // resolved with its error text rather than 'outcome_unknown', which would halt the turn.
       turn?.result(call.id, framed, { failed: false, originalBytes: Buffer.byteLength(result) });
       if (outcome.failed === true || /^ERROR\b/.test(result)) return null;
+      noteSkillRead(call.args, result);
       const note = 'The following was fetched for you; use it.';
       const hasSystem = roundMessages.some((m) => m.role === 'system');
       const base = hasSystem ? roundMessages.map((m, i) => (i === roundMessages.findIndex((x) => x.role === 'system') && typeof m.content === 'string' ? { ...m, content: `${m.content}\n\n${note}` } : m))
@@ -636,8 +710,18 @@ function createChatHandler({
     if(body.compactOnly){send({type:'done',model});res.end();return;}
     const turn = durableChat?.enabled && !spaceId?.startsWith('diary')
       ? durableChat.start(chatWorkspace, { projectId, conversationId: chatId || contextId,
-          messages: wire, model: { providerId:provider.id, id:model, effort, maxTokens:prepared.maxTokens, limit }, skill: pinnedSkill?.record }) : null;
+          messages: wire, model: { providerId:provider.id, id:model, effort, maxTokens:prepared.maxTokens, limit }, skill: pinnedSkill?.record,
+          skills: loadedSkillRecords() }) : null;
     execution.turn = turn;
+    // Every skill this exchange loaded is journaled on the turn (#272), so a continuation can verify
+    // all of them, not only the pin. Called again whenever a read loads another skill.
+    function recordLoadedSkills() { turn?.skillsLoaded(loadedSkillRecords()); }
+    const reportRevocation = () => {
+      if (!skillRevocation || skillRevocationReported) return;
+      skillRevocationReported = true;
+      turn?.interrupt(`Skill revoked: ${skillRevocation.map((s) => s.file).join(', ')}`);
+      send({ type: 'error', code: 'skill_revoked', text: revocationText() });
+    };
     let roundMessages = prepared.messages;
     // Prefill measurement (step 17). Timed per ROUND, because each round is its
     // own upstream request with its own prompt — and the later rounds are the
@@ -740,6 +824,7 @@ function createChatHandler({
       }
     }
     for (let round = 0; round < 3 && !chatSignal.signal.aborted; round++) {
+      if (revokedSkills()) break; // a loaded skill was disabled or changed: no further model round
       let roundBudget=context.measure(roundMessages,activeTools,limit,limitSource,model),roundCompacted=false;
       if(roundBudget.used>roundBudget.threshold) {
         try {
@@ -796,6 +881,8 @@ function createChatHandler({
       let buffer = '';
       try {
         for await (const chunk of upstream.body) {
+          // Leaving the loop cancels the provider stream; checked at most once a second (#272).
+          if (loadedSkills.size && Date.now() - skillCheckedAt >= 1000 && revokedSkills()) break;
           buffer += decoder.decode(chunk, { stream: true });
           let idx;
           while ((idx = buffer.indexOf('\n')) !== -1) {
@@ -865,6 +952,14 @@ function createChatHandler({
         turn?.partial(roundContent);
         if (chatSignal.signal.aborted) break; // client went away; stop quietly
         send({ type: 'error', text: String(err?.message || err) });
+        break;
+      }
+      // Cut off mid-stream by a revoked skill: keep what was already shown, request no tools.
+      if (skillRevocation) {
+        turn?.partial(roundContent);
+        // Chips for calls already streamed this round would otherwise stay pending: each gets a
+        // result saying it was not run (none of them was executed).
+        for (const [i, slot] of toolCalls) send({ type: 'tool_result', index: toolOffset + i, name: slot.name, text: `ERROR: ${revocationText()} ${slot.name || 'This tool'} was not run.`.slice(0, 300) });
         break;
       }
 
@@ -953,6 +1048,8 @@ function createChatHandler({
             // than a Promise.all: the round genuinely blocks on a person.
             let result;
             const userId = requestScope.getStore()?.workspace?.userId || null;
+            // A call requested under a skill that has since been disabled or changed never runs (#272).
+            if (revokedSkills()) return refuseForRevokedSkill(tc.name, userId);
             // The account's tool policy (Settings → Connectors). Writes are always at least `ask`.
             const refusedForEgress = egressToolRefusal(chatUser?.id || userId, tc.name, tc.args);
             if (refusedForEgress) {
@@ -994,6 +1091,8 @@ function createChatHandler({
               authService.audit('tool.denied', userId, userId, { tool: tc.name, reason: 'blocked' });
               return `ERROR: ${tc.name} is blocked in this account's settings, so it was not run. Do not retry it; tell the user they can change it in Settings → Connectors.`;
             }
+            // Likewise a skill disabled while the approval card was open: the approval does not outlive it.
+            if (revokedSkills()) return refuseForRevokedSkill(tc.name, userId);
             if (chatWideApproved(userId, chatId)) turn?.approval(tc.id, {action:'approve_all', inherited:true});
             turn?.started(tc.id);
             markWriteAttempt();
@@ -1024,12 +1123,14 @@ function createChatHandler({
           turn?.result(tc.id, framedResult, { failed: outcome.failed === true, originalBytes: Buffer.byteLength(String(result)) });
           send({ type: 'tool_result', index: toolOffset + toolIndex, name: tc.name, text: result.slice(0, 300) });
           roundMessages.push({ role: 'tool', tool_call_id: tc.id, content: framedResult });
+          if (outcome.failed !== true && !/^ERROR\b/.test(String(result))) noteSkillRead(tc.args, result);
         }
       }
 
       if (turn?.snapshot().calls.some(c => c.status === 'outcome_unknown')) break;
       if (toolCalls.size) toolOffset += Math.max(...toolCalls.keys()) + 1;
       if (round === 2 || toolCalls.size === 0) break; // last round or no tools requested
+      if (skillRevocation) break; // revoked during this round's tools: no supervisor call, one error
       const supervised = await require('./step-supervision.cjs').superviseNextStep(
         spaceId?.startsWith('diary') ? null : stepSupervision,
         { round, messages: roundMessages, signal: chatSignal.signal });
@@ -1042,6 +1143,9 @@ function createChatHandler({
     }
 
     if (chatSignal.signal.aborted) return; // client gone — nothing more to write
+    // Any path that saw a loaded skill revoked (round start, mid-stream, before or after an approval)
+    // ends the reply with one explicit error; nothing after the revocation was run.
+    if (skillRevocation) { reportRevocation(); res.end(); return; }
     if (!roundHasContent && roundReasoning.trim()) {
       send({ type: 'delta', text: '\n\nThe model returned reasoning without a final answer. Try again or choose another model.' });
     }

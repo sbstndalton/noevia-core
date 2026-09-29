@@ -52,16 +52,19 @@ function createChatTurns({ enabled = false, resultCap = DEFAULT_RESULT_CAP } = {
         c.status = 'completed'; c.result = text; state.messages.push({role:'tool',tool_call_id:callId,content:text}); save();
       },
       supervision(decision) { state.supervision = [...(state.supervision || []), { round:state.round, ...clone(decision) }]; if (decision.action === 'escalate') state.reviewRequired = true; save(); },
+      // Every Skill the exchange loaded (#272): { file, name, contentHash }. Replaced as reads add more.
+      skillsLoaded(records) { const next = clone(Array.isArray(records) ? records : []); if (JSON.stringify(next) === JSON.stringify(state.skills || [])) return; state.skills = next; save(); },
       interrupt(reason) { state.interruptedPhase = state.phase; state.phase = 'interrupted'; state.failure = String(reason); save(); },
       complete() { if (state.calls.some(c => c.status !== 'completed')) throw Error('Unresolved tools require review'); state.phase = 'completed'; save(); jobs.append(id, 'job.completed'); },
     };
   }
-  function start(workspace, { projectId = null, conversationId, messages, model, retries = 1, skill = null }) {
+  function start(workspace, { projectId = null, conversationId, messages, model, retries = 1, skill = null, skills = [] }) {
     if (!conversationId || !Number.isInteger(retries) || retries < 0) throw Error('Conversation and retry budget required');
     const jobs = store(workspace), id = jobs.create({ kind:'chat', projectId });
     jobs.append(id, 'checkpoint.created', { v:1, identity:{userId:workspace.userId,projectId,conversationId,turnId:crypto.randomUUID()},
       phase:'ready', round:0, model:clone(model), models:[clone(model)], retries:{remaining:retries,fallbackRemaining:3}, messages:clone(messages), outputs:[], calls:[], projection:null,
-      ...(skill ? { skill: clone(skill) } : {}) }); // the exact pinned Skill version (#272); absent when unpinned
+      ...(skill ? { skill: clone(skill) } : {}), // the exact pinned Skill version (#272); absent when unpinned
+      ...(Array.isArray(skills) && skills.length ? { skills: clone(skills) } : {}) }); // every Skill loaded (#272)
     jobs.append(id, 'job.started');
     return bind(workspace, id);
   }
@@ -75,10 +78,23 @@ function createChatTurns({ enabled = false, resultCap = DEFAULT_RESULT_CAP } = {
     return { state, next, unresolved: unresolved.map(c => ({...c,status:['started','outcome_unknown'].includes(c.status) ? 'outcome_unknown' : c.status, reask:true})) };
   }
   // Explicitly invoked test/internal continuation, generation only. No tool executor is accepted.
-  async function resumeGeneration(workspace, id, { provider, model, project }) {
+  // Not yet wired to a production caller. A turn that loaded Skills (#272) continues only while every
+  // one of them (the pin and each entry of `skills`) is still that exact enabled version:
+  // `skillActive(record)` must confirm each against the stored project, or the continuation is refused.
+  async function resumeGeneration(workspace, id, { provider, model, project, skillActive = null }) {
     const restored = restore(workspace,id);
     if (restored.next !== 'generate') throw Error(`Continuation requires ${restored.next}`);
     const turn = bind(workspace,id);
+    const records = [...(restored.state.skill ? [restored.state.skill] : []), ...(Array.isArray(restored.state.skills) ? restored.state.skills : [])];
+    let active = true;
+    for (const record of records) {
+      if (!(typeof skillActive === 'function' && await skillActive(clone(record)) === true)) { active = false; break; }
+    }
+    if (!active) {
+      const reason = 'A Skill this turn loaded is disabled, changed or unverifiable; continuation refused';
+      turn.interrupt(reason);
+      throw Error(reason);
+    }
     turn.retry(); // Persist the attempt before any external request, including projection failure.
     try {
       const projection = await project(clone(restored.state));
