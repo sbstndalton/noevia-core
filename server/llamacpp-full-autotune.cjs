@@ -33,19 +33,32 @@ function normalizedAnswer(text) {
   }
   return answer.replace(/[.!]$/, '').trim();
 }
+// Arithmetic only: a worked line such as `68 - 9 = 59` is a correct answer. Everything in the reply
+// must be numeric/operator characters and the value after the last `=` must be exactly the expected
+// integer, so prose ("not 59, it's 61") and lists ("59 or 61") still fail.
+const WORKED_SUM = /^[\d\s+\-−*x×÷/().]+(?:=\s*[\d\s+\-−*x×÷/().]+)*=\s*(\d+)$/;
+const acceptsAnswer = (q, answer) => answer === q.expected.toLowerCase()
+  || (q.id === 'arithmetic' && WORKED_SUM.exec(answer)?.[1] === q.expected);
+// A short, printable excerpt of a wrong answer so the panel shows what the model said.
+const snippetOf = text => {
+  const flat = String(text).replace(/[\p{Cc}\p{Zl}\p{Zp}]+/gu, ' ').replace(/\s+/g, ' ').trim();
+  return flat.length > 24 ? flat.slice(0, 23) + '…' : flat;
+};
 async function qualityCheck(model, chat) {
   const checks = [];
   for (const q of QUALITY) {
     const r = await chat(model, q.prompt, qualityBudget(model));
     const answer = typeof r?.text === 'string' ? normalizedAnswer(r.text) : '';
     const reason = r?.failure || (r?.finishReason === 'length' ? 'truncated' : !answer ? 'no response' :
-      answer !== q.expected.toLowerCase() ? 'mismatch' : null);
-    checks.push({ id: q.id, passed: !reason, ...(reason ? { reason } : {}) });
+      !acceptsAnswer(q, answer) ? 'mismatch' : null);
+    checks.push({ id: q.id, passed: !reason, ...(reason ? { reason } : {}),
+      ...(reason === 'mismatch' ? { answer: snippetOf(r.text) } : {}) });
   }
   return { passed: checks.every(c => c.passed), checks };
 }
 const qualityFailure = quality => 'Quality checks failed: ' + quality.checks.filter(c => !c.passed)
-  .map(c => c.id + ' (' + c.reason + ')').join(', ') + '.';
+  .map(c => c.id + ' (' + c.reason + ')').join(', ') + '.' + quality.checks
+  .filter(c => !c.passed && c.answer).map(c => ' Answered ' + c.id + ': "' + c.answer + '".').join('');
 const hash = value => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const sorted = value => Object.fromEntries(Object.entries(value || {}).sort(([a], [b]) => a.localeCompare(b)));
 const cancelledError = () => Object.assign(Error('Cancelled'), { cancelled: true });
@@ -610,4 +623,4 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
   }
   return { start, resume, cancel, status, untuned, recover, completion: () => completion };
 }
-module.exports = { createFullAutotuner, qualityCheck, QUALITY, VERSION, newModel, hasHarmonyReasoning };
+module.exports = { createFullAutotuner, qualityCheck, qualityFailure, QUALITY, VERSION, newModel, hasHarmonyReasoning };

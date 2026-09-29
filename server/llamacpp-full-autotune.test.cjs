@@ -3,7 +3,7 @@ const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const { createModelManager } = require('./model-manager.cjs');
 const { createPresetStore } = require('./llamacpp-presets.cjs');
-const { QUALITY, qualityCheck, newModel } = require('./llamacpp-full-autotune.cjs');
+const { QUALITY, qualityCheck, qualityFailure, newModel } = require('./llamacpp-full-autotune.cjs');
 
 function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnload, badQ4 = true, badF16 = false, noHead = false, rejectAll = false, rejectModel = '', badBatch = false, failFinal = false, formattedQuality = false, reasoningOnly = false, truncatedWorkloads = false, idleTimeoutMs = 300000, loseIdentityAfterStart = false, reloadFail = false, unloadPolls = 0, unloadStuck = false } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'full-tune-'));
@@ -428,7 +428,7 @@ test('quality accepts only a complete, unambiguous answer with benign markdown w
   assert.equal(ok.passed, true);
   for (const answer of ['59, but the answer is 58', '59 58', 'The answer is 59', '**59** and 58']) {
     const result = await qualityCheck('Gemma-4-E2B-it-GGUF', async (_m, prompt) => ({ text: prompt === QUALITY[0].prompt ? answer : QUALITY.find(q => q.prompt === prompt).expected }));
-    assert.deepEqual(result.checks[0], { id: 'arithmetic', passed: false, reason: 'mismatch' });
+    assert.deepEqual(result.checks[0], { id: 'arithmetic', passed: false, reason: 'mismatch', answer });
   }
   const reasoningOnly = await qualityCheck('gpt-oss-20b', async (_m, prompt) => ({ text: '', reasoningContent: QUALITY.find(q => q.prompt === prompt).expected, finishReason: 'length' }));
   assert.equal(reasoningOnly.passed, false, 'analysis text is never proof of a correct final answer');
@@ -602,4 +602,26 @@ test('#545: the bulk untuned list skips presets whose model file is missing, and
   const scan = (await build(row => row.id === 'ghost').untuned()).body;
   assert.deepEqual(scan.models, ['present']);
   assert.deepEqual(scan.skipped, [{ model: 'ghost', reason: 'Model file missing from the models folder' }]);
+});
+
+test('arithmetic accepts a worked line ending in the expected value but never an ambiguous reply', async () => {
+  const run = (text, id = 'arithmetic') => qualityCheck('Gemma-4-E2B-it-GGUF', async (_m, prompt) => {
+    const q = QUALITY.find(c => c.prompt === prompt);
+    return { text: q.id === id ? text : q.expected };
+  });
+  for (const good of ['68 - 9 = 59', '(17 * 4) - 9 = 68 - 9 = 59', '59.', '**68 - 9 = 59**', '17 × 4 - 9 = 59'])
+    assert.equal((await run(good)).passed, true, good);
+  for (const bad of ['59 or 61', 'not 59, it\'s 61', '68 - 9 = 61', '59 = 59 or 61', 'The answer is 59', '68 - 9 = 59 or 61'])
+    assert.equal((await run(bad)).checks[0].reason, 'mismatch', bad);
+  assert.equal((await run('x = AX-417', 'extraction')).checks[1].reason, 'mismatch', 'other probes stay strict');
+  assert.equal((await run('yes = no', 'reasoning')).checks[2].reason, 'mismatch');
+});
+
+test('a mismatch records a short sanitized answer snippet in the failure text', async () => {
+  const q = await qualityCheck('x', async (_m, prompt) => prompt === QUALITY[0].prompt
+    ? { text: 'It is\n\u0007sixty\u0000-one, roughly, give or take a few more' } : { text: QUALITY.find(c => c.prompt === prompt).expected });
+  const a = q.checks[0].answer;
+  assert.ok(a.length <= 24); assert.doesNotMatch(a, /[\u0000-\u001f]/); assert.match(a, /^It is sixty/);
+  assert.match(qualityFailure(q), /^Quality checks failed: arithmetic \(mismatch\)\. Answered arithmetic: "It is sixty[^"]*"\.$/);
+  assert.equal(qualityFailure({ checks: [{ id: 'arithmetic', passed: false, reason: 'truncated' }] }), 'Quality checks failed: arithmetic (truncated).');
 });
