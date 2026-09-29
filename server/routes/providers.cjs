@@ -39,7 +39,7 @@ const PASS = Symbol('unhandled');
  */
 function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApproved, PROVIDERS, PROJECTS, DEFAULT_PROVIDER_ID, modelManager, currentWorkspace, saveProjects, registry, chatgptOAuth = null, chatgptEnabled = () => false }) {
   const { saveProviders, saveSharedProviders, maskKey } = registry;
-  const { parseContextTokens, validContextTokens } = require('../providers.cjs');
+  const { parseContextTokens, validContextTokens, parseCapabilities, effectiveCapabilities } = require('../providers.cjs');
   const chatgpt = require('../chatgpt-oauth.cjs');
   const egress = require('../provider-egress.cjs');
   const chatgptOn = () => !!chatgptOAuth && chatgptEnabled();
@@ -101,6 +101,7 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
   // One provider as the client sees it: never the plaintext key.
   function listRow(pr, authn) {
     const contextTokens = validContextTokens(pr.contextTokens);
+    const capabilities = effectiveCapabilities(pr);
     return {
       id: pr.id,
       label: pr.label,
@@ -111,6 +112,7 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
       shared: !!pr.shared,
       defaultModel: pr.defaultModel || undefined,
       ...(contextTokens ? { contextTokens } : {}),
+      ...(Object.keys(capabilities).length ? { capabilities } : {}),
       ...(egress.isTrialTermsHost(pr) ? { external: true } : {}),
       ...(chatgpt.isChatGptProvider(pr) ? { kind: chatgpt.KIND, external: true, connection: chatgptOAuth.status(authn?.user?.id).state } : {}),
     };
@@ -165,8 +167,14 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
       if (!endpointApproved(authn, baseUrl)) {
         return json(res, 400, { error: 'Provider origin is not approved for member connections; contact an administrator.' });
       }
+      let capabilities;
+      if (body.capabilities !== undefined && body.capabilities !== null) {
+        const parsed = parseCapabilities(body.capabilities);
+        if (parsed.error) return json(res, 400, { error: parsed.error });
+        capabilities = parsed.value;
+      }
       const id = `prov-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      PROVIDERS.push({ id, label, baseUrl, apiKey, defaultModel, shared, ...(context.value ? { contextTokens: context.value } : {}) });
+      PROVIDERS.push({ id, label, baseUrl, apiKey, defaultModel, shared, ...(context.value ? { contextTokens: context.value } : {}), ...(capabilities ? { capabilities } : {}) });
       if (shared) saveSharedProviders(); else saveProviders();
       return json(res, 200, { id, label, baseUrl, defaultModel, apiKeyMasked: maskKey(apiKey), ...(context.value ? { contextTokens: context.value } : {}) });
     }
@@ -230,12 +238,21 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
       // Omitted keeps the stored value; null or '' clears it.
       const context = body.contextTokens === undefined ? { value: validContextTokens(row.contextTokens) } : parseContextTokens(body.contextTokens);
       if (context.error) return json(res, 400, { error: context.error });
+      // Omitted keeps the stored capabilities; null returns to the preset default; an object replaces them.
+      let capabilities = row.capabilities;
+      if (body.capabilities === null) capabilities = undefined;
+      else if (body.capabilities !== undefined) {
+        const parsed = parseCapabilities(body.capabilities);
+        if (parsed.error) return json(res, 400, { error: parsed.error });
+        capabilities = parsed.value;
+      }
       // Validated in full before anything changes, so a refusal leaves the row as it was.
       row.label = label;
       row.baseUrl = baseUrl;
       if (newKey) row.apiKey = newKey;
       row.defaultModel = defaultModel;
       if (context.value) row.contextTokens = context.value; else delete row.contextTokens;
+      if (capabilities) row.capabilities = capabilities; else delete row.capabilities;
       if (row.shared) saveSharedProviders(); else saveProviders();
       return json(res, 200, listRow(row, authn));
     }

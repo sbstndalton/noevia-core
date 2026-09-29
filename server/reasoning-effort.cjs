@@ -15,11 +15,13 @@ function capabilityKey(provider, model) {
   return [provider.baseUrl, provider.id, model, crypto.createHash('sha256').update(provider.apiKey || '').digest('hex')].join('|');
 }
 function documented(provider, model) {
-  try {
-    const url = new URL(provider.baseUrl);
-    return !url.search && !url.hash && !url.username && !url.password && url.origin === 'https://api.openai.com' && ['', '/', '/v1', '/v1/'].includes(url.pathname) &&
-      model === 'gpt-5.4';
-  } catch { return false; }
+  // Provider capabilities are data on the row (providers.cjs), never a host or model named here.
+  const caps = provider?.capabilities;
+  if (!caps || caps.reasoningEffortParam !== true) return false;
+  return !Array.isArray(caps.reasoningEffortModels) || caps.reasoningEffortModels.includes(model);
+}
+function budgetFieldFor(provider) {
+  return provider?.capabilities?.tokenBudgetField === 'max_completion_tokens' ? 'max_completion_tokens' : 'max_tokens';
 }
 function nativeThinking(provider, model) {
   // Only the configured local llama.cpp/Lemonade endpoint and documented Qwen3 templates.
@@ -38,13 +40,13 @@ function requestBody(body, effort, mode, provider) {
   if (mode === 'real') return nativeThinking(provider, body.model)
     ? { ...body, chat_template_kwargs: { ...body.chat_template_kwargs, enable_thinking: effort === 'high' } }
     : { ...body, reasoning_effort: effort };
-  const budgetField = provider?.baseUrl && new URL(provider.baseUrl).origin === 'https://api.openai.com' ? 'max_completion_tokens' : 'max_tokens';
+  const budgetField = budgetFieldFor(provider);
   return { ...body, messages: [{ role: 'system', content: HINTS[effort] }, ...body.messages],
     ...(effort === 'high' ? { [budgetField]: body[budgetField] || body.max_tokens || 8192 } : {}) };
 }
 async function requestWithEffort(fetcher, url, options, body, provider, model, effort, report) {
   const explicitBudget=!!(body.max_tokens || body.max_completion_tokens);
-  if(body.max_tokens && new URL(provider.baseUrl).origin==='https://api.openai.com'){body={...body,max_completion_tokens:body.max_tokens};delete body.max_tokens;}
+  if(body.max_tokens && budgetFieldFor(provider)==='max_completion_tokens'){body={...body,max_completion_tokens:body.max_tokens};delete body.max_tokens;}
   let mode = modeFor(provider, model, effort);
   const key = capabilityKey(provider,model);
   const prepare = () => {

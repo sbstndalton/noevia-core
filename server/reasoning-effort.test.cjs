@@ -1,6 +1,9 @@
 const test=require('node:test'),assert=require('node:assert/strict');
 const {validEffort,resolveEffort,modeFor,requestBody,requestWithEffort}=require('./reasoning-effort.cjs');
-const provider={id:'fixture',baseUrl:'https://api.openai.com/v1',apiKey:'synthetic-key'};
+const {effectiveCapabilities,parseCapabilities}=require('./providers.cjs');
+// Fixture: a provider whose capability data declares a real parameter for one model.
+const CAPS={reasoningEffortParam:true,reasoningEffortModels:['gpt-5.4'],tokenBudgetField:'max_completion_tokens'};
+const provider={id:'fixture',baseUrl:'https://cloud.fixture.invalid/v1',apiKey:'synthetic-key',capabilities:CAPS};
 const body={model:'gpt-5.4',messages:[{role:'user',content:'Synthetic question'}],stream:true,tools:[{type:'function',function:{name:'read'}}]};
 test('project explicit default overrides global high; missing and invalid settings inherit safely',()=>{
  assert.equal(resolveEffort({reasoningEffort:'default'},'high'),'default');
@@ -8,10 +11,37 @@ test('project explicit default overrides global high; missing and invalid settin
  assert.equal(resolveEffort({},'high'),'high');assert.equal(resolveEffort({},'bogus'),'default');
  assert.equal(validEffort('medium'),false);assert.equal(validEffort(null),false);
 });
-test('only the documented endpoint and model pair receives a parameter',()=>{
+test('only a flagged provider and a listed model receive a parameter',()=>{
  assert.equal(modeFor(provider,'gpt-5.4','high'),'real');
- for(const p of [{...provider,baseUrl:'https://api.openai.com.evil.test/v1'},{...provider,baseUrl:'http://api.openai.com/v1'},{...provider,baseUrl:'https://api.openai.com/custom'}, {...provider,baseUrl:'http://localhost:13305/v1'}])assert.equal(modeFor(p,'gpt-5.4','high'),'hint');
+ assert.equal(modeFor({...provider,capabilities:{...CAPS,reasoningEffortParam:false}},'gpt-5.4','high'),'hint');
+ assert.equal(modeFor({...provider,capabilities:undefined},'gpt-5.4','high'),'hint');
+ assert.equal(modeFor({...provider,baseUrl:'http://localhost:13305/v1',capabilities:{}},'gpt-5.4','high'),'hint');
  assert.equal(modeFor(provider,'unverified-model','high'),'hint');assert.equal(modeFor(provider,'gpt-5.4','default'),'off');
+ assert.equal(modeFor({...provider,capabilities:{reasoningEffortParam:true}},'any-model','low'),'real');
+});
+test('token budget field comes from provider data',()=>{
+ const other={...provider,capabilities:{tokenBudgetField:'max_tokens'}};
+ assert.equal(requestBody(body,'high','hint',other).max_tokens,8192);
+ assert.equal(requestBody(body,'high','hint',{...provider,capabilities:{tokenBudgetField:'max_completion_tokens'},baseUrl:'http://x.invalid'}).max_completion_tokens,8192);
+});
+test('existing preset rows without capabilities keep the old behaviour via preset data',()=>{
+ const legacy={id:'legacy',baseUrl:'https://api.openai.com/v1',apiKey:'k'};
+ const eff={...legacy,capabilities:effectiveCapabilities(legacy)};
+ assert.equal(modeFor(eff,'gpt-5.4','high'),'real');assert.equal(modeFor(eff,'other','high'),'hint');
+ assert.equal(requestBody(body,'high','hint',eff).max_completion_tokens,8192);
+ for(const u of ['https://api.openai.com.evil.test/v1','http://api.openai.com/v1','https://api.openai.com/custom','http://localhost:13305/v1']){
+  const e={...legacy,baseUrl:u,capabilities:effectiveCapabilities({baseUrl:u})};assert.equal(modeFor(e,'gpt-5.4','high'),'hint',u);
+ }
+ assert.equal(effectiveCapabilities({baseUrl:'https://api.openai.com/custom'}).tokenBudgetField,'max_completion_tokens');
+ assert.deepEqual(effectiveCapabilities({baseUrl:'https://api.openai.com/v1',capabilities:{}}),{});
+});
+test('capability input is validated',()=>{
+ assert.deepEqual(parseCapabilities(CAPS).value,CAPS);
+ for(const bad of [null,[],'x',{bogus:1},{reasoningEffortParam:'yes'},{tokenBudgetField:'n'},{reasoningEffortModels:'a'},{reasoningEffortModels:['']}])assert.ok(parseCapabilities(bad).error,JSON.stringify(bad));
+});
+test('reasoning-effort.cjs names no vendor host or model',()=>{
+ const src=require('node:fs').readFileSync(require('node:path').join(__dirname,'reasoning-effort.cjs'),'utf8');
+ assert.doesNotMatch(src,/api\.openai\.com/);assert.doesNotMatch(src,/gpt-/i);
 });
 test('default preserves the body; hints preserve raw messages/tools and bound output explicitly',()=>{
  assert.equal(requestBody(body,'default','off'),body);
@@ -43,7 +73,7 @@ test('OpenAI hint mode uses the completion budget field accepted by reasoning mo
 });
 
 test('unverified output-budget rejection falls back once without breaking hint chat',async()=>{
- const p={id:'budget-fixture',baseUrl:'http://fixture.invalid'},requests=[];
+ const p={id:'budget-fixture',baseUrl:'http://fixture.invalid',capabilities:{}},requests=[];
  const response=await requestWithEffort(async(_,options)=>{requests.push(JSON.parse(options.body));return requests.length===1?new Response('max_tokens unsupported',{status:400}):new Response('{}');},p.baseUrl,{},body,p,'synthetic','high',()=>{});
  assert.equal(response.status,200);assert.equal(requests.length,2);assert.equal(requests[1].max_tokens,undefined);
  assert.equal(requests[1].messages[0].content,'Think through this step by step before answering.');
