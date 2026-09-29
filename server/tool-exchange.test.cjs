@@ -183,12 +183,15 @@ test('different names, values and array order remain distinct', async () => {
 
 for (const decision of ['deny', 'timeout']) {
   test(`${decision} is reused without another approval or execution`, async () => {
-    const f = fixture({ decision, rounds: [[call('a')], [call('b', 'write', equivalent)], [call('c')]] });
+    // The duplicate is in the same round as well as in later ones: a decline ends the reply after
+    // its round (#666), a timeout lets the model answer, so both still show the reuse.
+    const f = fixture({ decision, rounds: [[call('a'), call('b', 'write', equivalent)], [call('c')], [call('d')]] });
     await f.run();
     assert.equal(f.approvals.length, 1);
     assert.equal(f.executions.length, 0);
     const results = f.events.filter(e => e.type === 'tool_result');
-    assert.equal(results.length, 3);
+    assert.equal(results.length, decision === 'deny' ? 2 : 4);
+    assert.equal(f.events.some(e => e.type === 'paused' && e.reason === 'declined'), decision === 'deny');
     assert.ok(results.every(e => e.text === results[0].text && e.text.startsWith('ERROR')));
   });
 }
@@ -307,7 +310,7 @@ test('actual chat request indexes the exact skill filename even when its display
 
 for(const decision of ['approve','deny','approve_all'])test(`native manager preserves write approval action ${decision}`,async()=>{
  const f=fixture({native:true,decision,rounds:[[call('native-a'),call('native-b','write','{"a":2}')]]});
- await f.run();assert.equal(f.executions.length,decision==='deny'?0:2);assert.equal(f.approvals.length,decision==='approve_all'?1:2);assert.equal(f.events.find(e=>e.type==='context').limit,32768);
+ await f.run();assert.equal(f.executions.length,decision==='deny'?0:2);/* #666 review: after a decline the next write in the round gets no card */assert.equal(f.approvals.length,decision==='approve'?2:1);assert.equal(f.events.find(e=>e.type==='context').limit,32768);
 });
 
 test('text streamed before a tool call is marked as preamble, the final answer is not', async () => {

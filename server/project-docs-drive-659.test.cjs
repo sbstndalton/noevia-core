@@ -239,7 +239,8 @@ test('the Drive approval card carries the resolved target through the chat gate;
     await handleChat({}, res, { projectId: 'p', chatId: 'chat-x', ...body });
     return events;
   };
-  turns.push(call('drive_update_file', { fileId: id, content: 'new text' }), []);
+  // The card is declined, which ends the reply (#666): no second model turn is scripted.
+  turns.push(call('drive_update_file', { fileId: id, content: 'new text' }));
   const events = await run({ message: 'Update budget.md in my Drive' });
   const card = events.find((e) => e.type === 'tool_pending');
   assert.equal(card.target, `budget.md (id ${id})`);

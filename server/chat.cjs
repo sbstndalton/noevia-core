@@ -57,6 +57,16 @@ function appliedToolNote(entry) {
   ].filter(Boolean).join('\n');
   return `Already done earlier in this chat: ${name} ran after the user approved it, and it succeeded. Do not run it again for the same change; if the user asks for it again, say it is already done unless they clearly want a second, separate change.\n${frameUntrusted('applied change', name, lines)}`;
 }
+// #666: a write the user did not approve in an earlier turn (declined, or not answered in time).
+// That reply ended with no model text, so this is what the model learns of it: the call did not
+// run and changed nothing. The client's note ("No change was made…") is never sent; this sentence
+// is ours and the tool's own result stays inside the frame.
+function declinedToolNote(entry) {
+  const name = typeof entry.name === 'string' && /^[\w.-]{1,80}$/.test(entry.name) ? entry.name : 'a tool';
+  const text = String(entry.content || '');
+  const clipped = text.length > REPLAY_TOOL_RESULT_MAX ? `${text.slice(0, REPLAY_TOOL_RESULT_MAX)}…` : text;
+  return `Not run earlier in this chat: the user did not approve ${name}, so it did not run and nothing was changed by it.\n${frameUntrusted('tool result', name, clipped)}`;
+}
 function normalizeReplayHistory(mapped, newMessage) {
   const out = [];
   // Applied changes with no turn before them (the first message was edited and re-run, #658
@@ -69,6 +79,12 @@ function normalizeReplayHistory(mapped, newMessage) {
       if (last && last.role === 'assistant') last.content = `${last.content}\n\n${appliedToolNote(entry)}`;
       else if (last) out.push({ role: 'assistant', content: appliedToolNote(entry) });
       else leading.push(appliedToolNote(entry));
+      continue;
+    }
+    if ((entry.role === 'tool' || entry.role === 'function') && entry.declined === true) {
+      // The declined reply has no text of its own either (#666): the note stands in for it.
+      if (last && last.role === 'assistant') last.content = `${last.content}\n\n${declinedToolNote(entry)}`;
+      else if (last) out.push({ role: 'assistant', content: declinedToolNote(entry) });
       continue;
     }
     if (entry.role === 'tool' || entry.role === 'function') {
@@ -172,12 +188,15 @@ function createChatHandler({
 
     // An applied-write entry (#658) may have an empty result; it still says the change is done.
     const appliedEntry = (h) => h.role === 'tool' && h.applied === true && typeof h.name === 'string' && typeof h.content === 'string';
+    // A write the user did not approve (#666), kept so the next turn knows it did not run.
+    const declinedEntry = (h) => h.role === 'tool' && h.declined === true && h.applied !== true && typeof h.name === 'string' && typeof h.content === 'string';
     const mappedHistory = (Array.isArray(history) ? history : [])
       .filter((h) => h && ['user', 'assistant', 'tool', 'function'].includes(h.role) && ((typeof h.content === 'string' && h.content) || appliedEntry(h)))
       .slice(-HISTORY_CAP)
       .map((h) => appliedEntry(h)
         ? { role: 'tool', content: h.content, name: h.name, applied: true,
             ...(typeof h.target === 'string' ? { target: h.target } : {}), ...(typeof h.args === 'string' ? { args: h.args } : {}) }
+        : declinedEntry(h) ? { role: 'tool', content: h.content, name: h.name, declined: true }
         : (h.role === 'tool' || h.role === 'function') && typeof h.name === 'string' ? { role: h.role, content: h.content, name: h.name } : { role: h.role, content: h.content });
     // Writes the client says already succeeded in this chat, for the repeat flag on approval cards.
     const recentWriteFps = new Set(mappedHistory.filter((h) => h.applied === true)
@@ -774,6 +793,14 @@ function createChatHandler({
     const exchangeKey = crypto.randomUUID();
     // Writes that succeeded in THIS exchange (#658): how many the reply reports if it pauses.
     const appliedWrites = [];
+    // Writes the person declined on their approval card in THIS exchange (#666): later writes in
+    // the same round do not run, and the reply ends after that round with a fixed note instead of
+    // more model text. Diary extras keep their earlier flow (their client has no note for it).
+    const declinedWrites = [];
+    const declineEndsReply = !spaceId?.startsWith('diary');
+    // The exact results that mean "not approved" (declined or timed out) and "not run after a
+    // decline": the chip is told explicitly (`declined` / `notRun`), never by reading tool text.
+    const notApprovedResults = new Set(), notRunResults = new Set();
     let paused = false;
     let prepared,limit,limitSource,summarizeContext,requestStartedAt=Date.now();
     try {
@@ -1156,6 +1183,14 @@ function createChatHandler({
             const userId = requestScope.getStore()?.workspace?.userId || null;
             // A call requested under a skill that has since been disabled or changed never runs (#272).
             if (revokedSkills()) return refuseForRevokedSkill(tc.name, userId);
+            // #666 review: a write after one the person declined in this reply is not asked about
+            // and does not run; the reply ends after this round anyway.
+            if (declinedWrites.length && isWriteTool(tc.name)) {
+              authService.audit('tool.denied', userId, userId, { tool: tc.name, reason: 'earlier-decline' });
+              result = `ERROR: ${tc.name} was not run because an earlier write in this reply was declined. Nothing was changed.`;
+              notRunResults.add(result);
+              return result;
+            }
             // The account's tool policy (Settings → Connectors). Writes are always at least `ask`.
             const refusedForEgress = egressToolRefusal(chatUser?.id || userId, tc.name, tc.args);
             if (refusedForEgress) {
@@ -1221,6 +1256,8 @@ function createChatHandler({
                   ? `ERROR: the user did not respond in time, so ${tc.name} was not run. Ask before trying again.`
                   : `ERROR: the user declined to run ${tc.name}. Do not retry it; ask what they would prefer.`;
                 authService.audit('tool.denied', userId, userId, { tool: tc.name, reason: decision });
+                notApprovedResults.add(result);
+                if (decision === 'deny' && declineEndsReply) declinedWrites.push(tc.name);
                 return result;
               }
             }
@@ -1282,7 +1319,8 @@ function createChatHandler({
             writesDone.record(requestScope.getStore()?.workspace?.userId || null, chatId, writePrint);
           }
           send({ type: 'tool_result', index: toolOffset + toolIndex, name: tc.name, text: result.slice(0, 300),
-            ...(applied ? { applied: true } : {}), ...(applied && cardTarget !== null ? { target: cardTarget } : {}) });
+            ...(applied ? { applied: true } : {}), ...(applied && cardTarget !== null ? { target: cardTarget } : {}),
+            ...(notApprovedResults.has(result) ? { declined: true } : {}), ...(notRunResults.has(result) ? { notRun: true } : {}) });
           roundMessages.push({ role: 'tool', tool_call_id: tc.id, content: framedResult });
           if (outcome.failed !== true && !/^ERROR\b/.test(String(result))) noteSkillRead(tc.args, result);
         }
@@ -1290,6 +1328,19 @@ function createChatHandler({
 
       if (turn?.snapshot().calls.some(c => c.status === 'outcome_unknown')) break;
       if (toolCalls.size) toolOffset += Math.max(...toolCalls.keys()) + 1;
+      if (declineEndsReply && declinedWrites.length && !skillRevocation) {
+        // #666: the person declined a write. Small models ignore the declined result and still
+        // say the change was made, so the model is not asked for more text: the reply ends here
+        // with a fixed note (words the client shows in its own language, never model text). Every
+        // call of this round has its result, and any approved write that ran is counted.
+        turn?.interrupt('A write was declined on its approval card');
+        paused = true;
+        const n = appliedWrites.length, names = [...new Set(declinedWrites)].join(', ');
+        send({ type: 'paused', reason: 'declined', applied: n, declined: [...new Set(declinedWrites)],
+          text: n ? `${n === 1 ? '1 change was' : `${n} changes were`} saved. You declined ${names}, so nothing else was changed.`
+            : `No change was made: you declined ${names}.` });
+        break;
+      }
       if (round === 2 || toolCalls.size === 0) break; // last round or no tools requested
       if (skillRevocation) break; // revoked during this round's tools: no supervisor call, one error
       const supervised = await require('./step-supervision.cjs').superviseNextStep(
