@@ -465,7 +465,18 @@ async function workspaceProject(id) {
 test('same-name projects receive distinct storage folders', async () => {
   const one = await createTestProject('Same name');
   const two = await createTestProject('Same name');
-  assert.notEqual(one.projectFolder, two.projectFolder);
+  // Created before any upload: no folder yet (#589), but the path is already reserved and distinct.
+  assert.equal(one.projectFolder, undefined);
+  assert.ok(one.reservedFolder && two.reservedFolder);
+  assert.notEqual(one.reservedFolder, two.reservedFolder);
+  const upload = (p) => request(`/api/projects/${p.id}/upload`, { method: 'POST', headers: mutationHeaders(), body: JSON.stringify({ name: 'a.md', dataBase64: Buffer.from('hello').toString('base64') }) });
+  // Upload in the opposite order: each project still lands exactly on its own reserved path.
+  assert.equal((await upload(two)).status, 200);
+  assert.equal((await upload(one)).status, 200);
+  const [a, b] = [await workspaceProject(one.id), await workspaceProject(two.id)];
+  assert.equal(a.projectFolder, one.reservedFolder);
+  assert.equal(b.projectFolder, two.reservedFolder);
+  assert.notEqual(a.projectFolder, b.projectFolder);
 });
 
 test('a rejected config patch leaves every previous field unchanged', async () => {

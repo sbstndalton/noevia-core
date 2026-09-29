@@ -302,7 +302,9 @@ function createChatHandler({
     }
 
     // ── Ordinary space / project chat: routed via the project's provider ──
-    if (project?.files?.some(f => f.attachment?.state === 'stored')) sysParts.push('These sources are stored only; their contents are NOT available to the model: ' + project.files.filter(f => f.attachment?.state === 'stored').map(f => f.name).join(', ') + '. Do not claim to know their contents.');
+    // Unreadable text originals (#586) are not offered to the model at all, not even by name.
+    const storedOnly = require('./source-readability.cjs').readable(project?.files).filter(f => f.attachment?.state === 'stored');
+    if (storedOnly.length) sysParts.push('These sources are stored only; their contents are NOT available to the model: ' + storedOnly.map(f => f.name).join(', ') + '. Do not claim to know their contents.');
     const sys = sysParts.join('\n\n');
     let wire = sys ? [{ role: 'system', content: sys }, ...msgs] : msgs;
 

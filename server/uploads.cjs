@@ -51,9 +51,10 @@ function decodeText(bytes) {
   if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
     try { return { text: decode('utf-16be', 2), encoding: 'utf-16be' }; } catch { /* fall through */ }
   }
-  try { return { text: decode('utf-8'), encoding: 'utf-8' }; } catch { /* not UTF-8; keep going */ }
-  // No BOM and not UTF-8. Before guessing an 8-bit encoding, rule out binary.
+  // No BOM: a NUL byte means binary. NUL is valid UTF-8, so this must precede the UTF-8 attempt or a
+  // file of NULs and ASCII would be read as "text" (#586).
   if (bytes.includes(0)) return null;
+  try { return { text: decode('utf-8'), encoding: 'utf-8' }; } catch { /* not UTF-8; keep going */ }
   try { return { text: decode('windows-1252'), encoding: 'windows-1252' }; } catch { return null; }
 }
 

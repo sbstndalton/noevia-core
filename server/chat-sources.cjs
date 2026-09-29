@@ -21,7 +21,7 @@ function shape(id, file, body, kind, score) {
 // entries: [{ file, body, score?, kind: 'excerpt' | 'file' }] in prompt order.
 // files: the project files this chat may read (already tenant-scoped and skill-filtered).
 function buildSources(entries, files) {
-  const byName = new Map((Array.isArray(files) ? files : []).filter((f) => f && typeof f.name === 'string').map((f) => [f.name, f]));
+  const byName = new Map(require('./source-readability.cjs').readable(files).filter((f) => f && typeof f.name === 'string').map((f) => [f.name, f]));
   const out = [];
   for (const e of Array.isArray(entries) ? entries : []) {
     if (out.length >= MAX_SOURCES) break;

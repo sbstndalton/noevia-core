@@ -55,11 +55,13 @@ test('createProject validates, defaults and indexes its files', async () => {
   assert.equal(f.store.getProject('missing'), null);
 });
 
-test('with browsable storage a new project gets its own folder attached as a source', async () => {
+test('with browsable storage a new project makes no storage folder until its first upload (#589)', async () => {
   const f = fixture({ browsable: true });
   const project = await f.store.createProject({ name: 'Trip' });
-  assert.equal(project.projectFolder, 'noevia projects/Trip');
-  assert.deepEqual(project.sourceFolders, ['noevia projects/Trip']);
+  assert.equal(project.projectFolder, undefined);
+  assert.deepEqual(project.sourceFolders, []);
+  // The folder is allocated by the first upload path, which shares one allocation per project.
+  assert.equal(await f.store.ensureProjectFolder(project), 'noevia projects/Trip');
 });
 
 test('chat metas are sanitized on read and deleting one leaves a tombstone and removes its transcript', async () => {

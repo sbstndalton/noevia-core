@@ -77,7 +77,7 @@ function manifests(project, knownToolboxes = []) {
   return list(project).map(skill => {
     const file = (project.files || []).find(f => f.name === skill.file);
     const origin = file?.skillOrigin?.kind === 'published' && file.skillOrigin.digest === skill.hash
-      ? file.skillOrigin : { kind: file?.source ? 'attached-folder' : 'project-file' };
+      ? file.skillOrigin : { kind: file?.source && file.source !== project.projectFolder ? 'attached-folder' : 'project-file' };
     const unsupportedToolboxes = skill.requires.filter(id => !known.has(id));
     const unselectedToolboxes = skill.requires.filter(id => known.has(id) && !(project.toolboxes || ['core']).includes(id));
     const bundled = assets(project, skill.file);
@@ -188,7 +188,8 @@ function listForClient(project, knownToolboxes = []) {
   });
 }
 function enabled(project) { return list(project).filter(skill => skill.status === 'enabled'); }
-function sources(project) { return (project.files || []).filter(file => !inspect(file, project)); }
+// The files a chat may read: not an unreviewed skill, and not an unreadable original (#586).
+function sources(project) { return (project.files || []).filter(file => !inspect(file, project) && !require('./source-readability.cjs').isUnreadable(file)); }
 function reconcile(project) {
   const before = JSON.stringify(project.instructionSkills || {});
   const next = Object.create(null);
