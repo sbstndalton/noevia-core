@@ -49,7 +49,7 @@ function internalProject(project) {
 function applyProjectDocsDefault(project, { offered, defaults, hadUploads }) {
   if (hadUploads !== false) return false; // only the transition from no uploads to some
   if (!project || internalProject(project) || project.docsToolboxDefaulted === true || !hasUploads(project)) return false;
-  if (!offered(BOX)) return false; // not offered on this server: decide again once it is
+  if (!offered(BOX)) return false; // not offered at this project's first upload: the project is not reconsidered later (cautious side)
   const current = Array.isArray(project.toolboxes) ? project.toolboxes : [...defaults];
   if (!current.length) return false; // "no tools" was chosen on purpose
   project.docsToolboxDefaulted = true;
