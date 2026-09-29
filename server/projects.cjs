@@ -312,6 +312,16 @@ function createProjectStore({
     catch (err) { console.warn('[uploads] cleanup failed:', err.message); }
   }
   const changedInStorage = (stored) => `"${stored}" changed in storage since noevia last read it (it was edited, moved or deleted there, or storage is now a different account). Nothing was saved. Sync this project's Sources first, then try again.`;
+  // #655: each way the pre-write check can fail says what actually happened. "Changed in storage,
+  // sync first" is only true for a missing file or different bytes; for the rest a sync would not help.
+  const editRefusal = (stored, err) => {
+    const code = err && err.code, upstream = err && err.upstream;
+    if (code === 'unsupported') return `"${stored}" cannot be edited in place: in-place edits are not supported on this storage type (only WebDAV / Nextcloud). Nothing was saved. Use project_create_file to write a new file instead.`;
+    if (code === 'folder') return `"${stored}" is a folder in storage, not a file, so it cannot be edited. Nothing was saved.`;
+    if (upstream === 401 || upstream === 403) return `Storage refused the sign-in while checking "${stored}" (${upstream}), so it was not edited. Nothing was saved. Reconnect storage in Settings → Storage and try again.`;
+    if (upstream === 404 || (err && err.status === 404)) return changedInStorage(stored);
+    return `Storage is unavailable right now, so "${stored}" could not be checked before editing. Nothing was saved. Try again in a moment.`;
+  };
   /** Before an in-place edit of a stored file (#648): the file must still exist in storage with
    *  exactly the bytes noevia holds (sha256 === attachment.id), and the server must report an
    *  ETag, which the write is made conditional on. Without one a change landing between this
@@ -324,7 +334,9 @@ function createProjectStore({
       version = await storageClient.fileVersion(connection, stored);
       if (!version.exists) throw new Error('missing');
       remoteBytes = await storageClient.readBinaryFile(connection, stored);
-    } catch { throw new Error(changedInStorage(stored)); }
+    } catch (err) {
+      throw new Error(err && err.message === 'missing' ? changedInStorage(stored) : editRefusal(stored, err));
+    }
     const digest = require('node:crypto').createHash('sha256').update(remoteBytes).digest('hex');
     if (digest !== current.attachment.id) throw new Error(changedInStorage(stored));
     if (!version.etag) throw new Error(`"${stored}" cannot be edited in place: this storage server does not report file versions (ETags), so noevia cannot make sure a change made there meanwhile is not overwritten. Nothing was saved. Use project_create_file to write a new file instead.`);
@@ -385,6 +397,7 @@ function createProjectStore({
         file = await uploads.ingest(currentWorkspace(), project, name, bytes, { connection: remote, storageImpl: storageClient, ...(edit && remote ? { ifMatch } : {}) });
       } catch (err) {
         if (err && err.code === 'changed') throw new Error(changedInStorage(expectName));
+        if (edit && err && err.code === 'unknown') throw new Error(`The connection to storage failed while saving "${expectName}", so noevia cannot tell whether the edit landed. Outcome unknown: sync this project's Sources to check whether it was saved before trying again.`);
         throw err;
       }
       if (edit && file.name !== expectName) throw new Error(`the edit was stored as "${file.name}", not "${expectName}"; the project list was not changed`);

@@ -110,12 +110,13 @@ function joinRoot(corpusRoot, relative) {
 
 // One bounded retry on network-level failures (connection reset, pooled dead
 // socket after a server restart). HTTP error statuses are NOT retried — those
-// are real answers, not transport noise.
-async function withRetry(fn) {
+// are real answers, not transport noise. `once` disables the retry for a request that is not
+// safe to repeat (a conditional PUT: the first attempt may have landed with its response lost).
+async function withRetry(fn, { once = false } = {}) {
   try {
     return await fn();
   } catch (err) {
-    if (err instanceof TypeError && err.message === 'fetch failed') {
+    if (!once && err instanceof TypeError && err.message === 'fetch failed') {
       await new Promise((r) => setTimeout(r, 250));
       return fn();
     }
@@ -334,7 +335,7 @@ async function readBinaryFile(conn, rawPath, opts) {
     redirect: 'error',
   }));
   if (!response.ok) {
-    throw Object.assign(new Error(`storage returned ${response.status}`), { status: response.status === 404 ? 404 : 502 });
+    throw Object.assign(new Error(`storage returned ${response.status}`), { status: response.status === 404 ? 404 : 502, upstream: response.status });
   }
   const tooLarge = () => Object.assign(new Error(`file exceeds the ${cap} byte limit`), { status: 413 });
   if (Number(response.headers.get('content-length')) > cap) {
@@ -363,7 +364,9 @@ async function readBinaryFile(conn, rawPath, opts) {
 //
 // `ifMatch` (an ETag from fileVersion) makes the PUT conditional: if the file changed in storage
 // since that ETag was read, the server answers 412 and nothing is written. The error then carries
-// `code: 'changed'`. A retried conditional PUT is safe for the same reason.
+// `code: 'changed'`. A conditional PUT is never retried (#655): if the first attempt landed and only
+// its response was lost, the retry would meet a 412 against noevia's own write. A connection
+// failure or timeout is therefore reported as `code: 'unknown'` (the write may or may not have landed).
 async function writeFile(conn, rawPath, bytes, { ifMatch } = {}) {
   const path = safeRelativePath(rawPath);
   if (!path) throw Object.assign(new Error('invalid path'), { status: 400 });
@@ -373,13 +376,19 @@ async function writeFile(conn, rawPath, bytes, { ifMatch } = {}) {
   if (ifMatch !== undefined && (typeof ifMatch !== 'string' || !ifMatch || /[\r\n]/.test(ifMatch))) {
     throw Object.assign(new Error('invalid If-Match value'), { status: 400 });
   }
-  const response = await withRetry(() => fetch(davUrl(conn, path), {
-    method: 'PUT',
-    headers: davHeaders(conn, { 'Content-Type': 'application/octet-stream', ...(ifMatch ? { 'If-Match': quoteEtag(ifMatch) } : {}) }),
-    body: bytes,
-    signal: AbortSignal.timeout(60000),
-    redirect: 'error',
-  }));
+  let response;
+  try {
+    response = await withRetry(() => fetch(davUrl(conn, path), {
+      method: 'PUT',
+      headers: davHeaders(conn, { 'Content-Type': 'application/octet-stream', ...(ifMatch ? { 'If-Match': quoteEtag(ifMatch) } : {}) }),
+      body: bytes,
+      signal: AbortSignal.timeout(60000),
+      redirect: 'error',
+    }), { once: !!ifMatch });
+  } catch (err) {
+    if (!ifMatch) throw err;
+    throw Object.assign(new Error(`the connection to storage failed while writing "${path}"; it may or may not have been saved`), { status: 502, code: 'unknown' });
+  }
   if (ifMatch && response.status === 412) {
     throw Object.assign(new Error(`"${path}" changed in storage before it could be written (412)`), { status: 409, code: 'changed' });
   }
@@ -470,7 +479,7 @@ async function fileVersion(conn, rawPath) {
   const path = safeRelativePath(rawPath);
   if (!path) throw Object.assign(new Error('invalid path'), { status: 400 });
   if (!['webdav', 'nextcloud'].includes(connectionKind(conn))) {
-    throw Object.assign(new Error('this storage cannot report a file version'), { status: 400 });
+    throw Object.assign(new Error('this storage cannot report a file version'), { status: 400, code: 'unsupported' });
   }
   const target = davUrl(conn, path);
   const response = await withRetry(() => fetch(target, {
@@ -481,11 +490,11 @@ async function fileVersion(conn, rawPath) {
     redirect: 'error',
   }));
   if (response.status === 404) return { exists: false };
-  if (response.status !== 207) throw Object.assign(new Error(`storage returned ${response.status}`), { status: 502 });
+  if (response.status !== 207) throw Object.assign(new Error(`storage returned ${response.status}`), { status: 502, upstream: response.status });
   const body = await response.text();
   const block = body.match(/<(?:[a-zA-Z0-9]+:)?response>([\s\S]*?)<\/(?:[a-zA-Z0-9]+:)?response>/)?.[1];
   if (!block) throw Object.assign(new Error('storage returned no file state'), { status: 502 });
-  if (/<(?:[a-zA-Z0-9]+:)?collection\s*\/?>/.test(block)) throw Object.assign(new Error(`"${path}" is a folder in storage`), { status: 409 });
+  if (/<(?:[a-zA-Z0-9]+:)?collection\s*\/?>/.test(block)) throw Object.assign(new Error(`"${path}" is a folder in storage`), { status: 409, code: 'folder' });
   const etag = (block.match(/<(?:[a-zA-Z0-9]+:)?getetag>([\s\S]*?)<\/(?:[a-zA-Z0-9]+:)?getetag>/)?.[1] || '').trim()
     .replace(/&quot;/g, '"').replace(/&amp;/g, '&');
   return { exists: true, etag: /[\r\n]/.test(etag) ? '' : etag };
