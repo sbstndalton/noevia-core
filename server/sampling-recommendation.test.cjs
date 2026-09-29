@@ -65,3 +65,18 @@ test('Gemma 4 and Qwen3.5 use their own card values, not Gemma 3 or Qwen3', () =
   }
   assert.equal(resolveSamplingRecommendation({ model: 'Qwen3-8B' }).values.temperature, 0.6);
 });
+
+test('the recommendation carries stable ids next to the English display strings (#565)', () => {
+  const family = resolveSamplingRecommendation({ model: 'Qwen3.5-4B' });
+  assert.equal(family.tier, 'family'); assert.equal(family.sourceId, 'family-table');
+  assert.equal(family.familyId, 'qwen3.5'); assert.equal(family.familyLabel, 'Qwen3.5');
+  assert.equal(family.noteId, 'thinking-mode');
+  assert.equal(family.source, 'Qwen3.5 family table', 'the English strings stay for older clients');
+  assert.equal(family.note, 'thinking-mode values');
+  const gemma = resolveSamplingRecommendation({ model: 'gemma-4-E2B-it' });
+  assert.equal(gemma.familyLabel, 'Gemma 4'); assert.equal(gemma.noteId, null);
+  const card = resolveSamplingRecommendation({ model: 'Qwen3-8B', sourceValues: { temperature: 0.7 } });
+  assert.equal(card.sourceId, 'generation-config'); assert.equal(card.noteId, null);
+  const preset = resolveSamplingRecommendation({ model: 'unknown-model' });
+  assert.equal(preset.sourceId, 'task-preset'); assert.equal(preset.presetId, 'general');
+});

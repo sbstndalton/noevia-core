@@ -211,6 +211,12 @@ function setSelection(project, body) {
   if (!skill) throw Object.assign(Error('No such instruction skill in this project.'), { status: 404 });
   if (body.enabled && !skill.valid) throw Object.assign(Error(skill.error), { status: 400 });
   if (body.enabled && body.hash !== skill.hash) throw Object.assign(Error('The file changed. Inspect the current version before enabling it.'), { status: 409 });
+  // #567: chat never runs Skill scripts, so a skill that bundles any can never be used there. Refuse
+  // to enable it (rather than show "Enabled" for something no chat can load); disabling stays allowed.
+  if (body.enabled) {
+    const scripts = assets(project, body.file).filter(a => a.executable).map(a => a.file);
+    if (scripts.length) throw Object.assign(Error(`${SCRIPTS_REFUSED} Bundled scripts: ${scripts.join(', ')}.`), { status: 422, code: 'skill_scripts_unsupported' });
+  }
   const next = { ...project, instructionSkills: { ...project.instructionSkills,
     [body.file]: { enabled: body.enabled, reviewedHash: body.enabled ? skill.hash : (project.instructionSkills?.[body.file]?.reviewedHash || skill.hash), reviewedAt: Date.now() } } };
   if (formatSkillIndex(enabled(next)).includes('additional skill metadata entries omitted')) throw Object.assign(Error('Enabled skill metadata exceeds the context limit. Disable another skill first.'), { status: 400 });

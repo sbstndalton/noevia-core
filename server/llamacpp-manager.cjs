@@ -363,8 +363,9 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
         limitations:sampling.record?.limitations||[]},
       // What auto-tune would apply, with its source tier (#308). Separate from the raw source
       // claim above so that claim's shape stays as #508 published it.
-      samplingPlan:{tier:recommendation.tier,source:recommendation.source,values:recommendation.values,family:recommendation.familyId,
-        quirks:recommendation.quirks,note:recommendation.note,provenance:recommendation.provenance}}};
+      samplingPlan:{tier:recommendation.tier,source:recommendation.source,sourceId:recommendation.sourceId,values:recommendation.values,family:recommendation.familyId,
+        familyLabel:recommendation.familyLabel,presetId:recommendation.presetId??null,
+        quirks:recommendation.quirks,note:recommendation.note,noteId:recommendation.noteId,provenance:recommendation.provenance}}};
   }
   // The recommendation the tuner applies and the pre-flight shows (#308). Only a current source
   // claim counts as tier 1; a stale or unverified one falls through to the family table.

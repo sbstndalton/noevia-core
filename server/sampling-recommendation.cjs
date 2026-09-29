@@ -26,10 +26,10 @@ const FAMILIES = Object.freeze([
   // temperature 1.0, top_p 0.95, top_k 20, min_p 0.0 (plus a presence penalty this runtime
   // setting set does not carry). It differs from Qwen3's 0.6, so it has its own entry.
   { id: 'qwen3.5', label: 'Qwen3.5', match: /qwen[-_. ]?3[-_. ]?5/i,
-    values: { temperature: 1.0, top_p: 0.95, top_k: 20, min_p: 0 }, quirks: {}, note: 'thinking-mode values' },
+    values: { temperature: 1.0, top_p: 0.95, top_k: 20, min_p: 0 }, quirks: {}, note: 'thinking-mode values', noteId: 'thinking-mode' },
   { id: 'qwen3', label: 'Qwen3', match: /qwen[-_. ]?3/i,
     // The card splits thinking from non-thinking; these are the thinking-mode values.
-    values: { temperature: 0.6, top_p: 0.95, top_k: 20, min_p: 0 }, quirks: {}, note: 'thinking-mode values' },
+    values: { temperature: 0.6, top_p: 0.95, top_k: 20, min_p: 0 }, quirks: {}, note: 'thinking-mode values', noteId: 'thinking-mode' },
   { id: 'llama-3', label: 'Llama 3', match: /llama[-_. ]?3/i,
     values: { temperature: 0.6, top_p: 0.9 }, quirks: {} },
   // Gemma 4 card (verified 2026-09-28): https://huggingface.co/google/gemma-4-E2B-it and
@@ -70,21 +70,23 @@ function toIniOptions(values) {
 
 /**
  * @param {{ model: string, sourceValues?: object|null, sourceProvenance?: object|null, presetId?: string }} args
- * @returns {{ tier: 'model-card'|'family'|'preset', source: string, values: object, familyId: string|null,
+ * `source` and `note` are English display strings kept for older clients; `sourceId` and `noteId` (with
+ * `familyId`, `familyLabel`, `presetId`) are the stable keys a client translates from (#565).
+ * @returns {{ tier: 'model-card'|'family'|'preset', source: string, sourceId: string, noteId: string|null, values: object, familyId: string|null,
  *   quirks: object, note: string|null, provenance: object|null, versions: object }}
  */
 function resolveSamplingRecommendation({ model, sourceValues = null, sourceProvenance = null, presetId = 'general' } = {}) {
   const family = familyOf(model);
-  const base = { familyId: family?.id || null, quirks: family?.quirks || NO_QUIRKS,
+  const base = { familyId: family?.id || null, familyLabel: family?.label || null, quirks: family?.quirks || NO_QUIRKS,
     versions: { familyTable: FAMILY_TABLE_VERSION, presets: PRESETS_VERSION } };
   const card = clean(sourceValues);
-  if (Object.keys(card).length) return { ...base, tier: 'model-card', source: 'generation_config.json', values: card, note: null, provenance: sourceProvenance };
+  if (Object.keys(card).length) return { ...base, tier: 'model-card', source: 'generation_config.json', sourceId: 'generation-config', values: card, note: null, noteId: null, provenance: sourceProvenance };
   if (family) {
     const values = clean(family.values);
-    if (Object.keys(values).length) return { ...base, tier: 'family', source: family.label + ' family table', values, note: family.note || null, provenance: null };
+    if (Object.keys(values).length) return { ...base, tier: 'family', source: family.label + ' family table', sourceId: 'family-table', values, note: family.note || null, noteId: family.noteId || null, provenance: null };
   }
   const id = Object.hasOwn(PRESETS, presetId) ? presetId : 'general';
-  return { ...base, tier: 'preset', source: 'Task preset: ' + id, values: clean(PRESETS[id]), note: null, provenance: null };
+  return { ...base, tier: 'preset', source: 'Task preset: ' + id, sourceId: 'task-preset', presetId: id, values: clean(PRESETS[id]), note: null, noteId: null, provenance: null };
 }
 
 module.exports = { FAMILIES, FAMILY_TABLE_VERSION, INI_KEYS, INI_KEY_LIST, familyOf, hasHarmonyReasoning, quirksOf,

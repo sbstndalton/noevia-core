@@ -55,6 +55,27 @@ test('bundled executable assets are listed and refuse pinned, content and automa
   assert.equal(skills.resolvePinned(plain, pinOf(plain), ['core']).record.file, FILE);
 });
 
+test('#567: a skill with bundled scripts cannot be enabled, and can still be disabled', () => {
+  const p = project({ extraFiles: [{ name: 'synthetic-helper/scripts/run.sh', content: 'echo synthetic' }] });
+  p.instructionSkills = {};
+  const hash = skills.hash(p.files[0].content);
+  const err = (() => { try { skills.setSelection(p, { file: FILE, enabled: true, hash }); } catch (e) { return e; } return null; })();
+  assert.equal(err?.status, 422);
+  assert.equal(err.code, 'skill_scripts_unsupported');
+  assert.match(err.message, /chat never runs Skill scripts/i);
+  assert.match(err.message, /synthetic-helper\/scripts\/run\.sh/);
+  assert.notEqual(skills.list(p)[0].status, 'enabled', 'the refused enable changed nothing');
+  // A skill that was enabled before scripts appeared can still be turned off.
+  p.instructionSkills = { [FILE]: { enabled: true, reviewedHash: hash } };
+  skills.setSelection(p, { file: FILE, enabled: false });
+  assert.equal(skills.list(p)[0].status, 'disabled');
+  // Without scripts the same call enables normally.
+  const plain = project({ extraFiles: [{ name: 'synthetic-helper/reference.md', content: 'text' }] });
+  plain.instructionSkills = {};
+  skills.setSelection(plain, { file: FILE, enabled: true, hash });
+  assert.equal(skills.list(plain)[0].status, 'enabled');
+});
+
 test('a root SKILL.md or single-file skill owns no directory and so no assets', () => {
   const p = { id: 'p', files: [{ name: 'SKILL.md', content: body() }, { name: 'tool.py', content: 'print(1)' }, { name: 'weekly.md', content: body({ name: 'weekly' }) }] };
   assert.deepEqual(skills.assets(p, 'SKILL.md'), []);

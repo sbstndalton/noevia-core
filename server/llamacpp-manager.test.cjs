@@ -123,7 +123,7 @@ test('qualification evidence is tied to the live configuration and goes stale wh
   const unverified=(await manager.evidence('fx')).body;
   assert.equal(unverified.categories.find(c=>c.category==='context_capacity').state,'unverified');
   assert.deepEqual(unverified.samplingRecommendation,{state:'unverified',values:null,source:null,provenance:null,limitations:[]});
-  assert.equal(unverified.samplingPlan.tier,'preset','no source and no family: task preset fallback');assert.deepEqual(unverified.samplingPlan.values,{});
+  assert.equal(unverified.samplingPlan.tier,'preset','no source and no family: task preset fallback');assert.equal(unverified.samplingPlan.sourceId,'task-preset');assert.deepEqual(unverified.samplingPlan.values,{});
   const artifact=require('./evidence.cjs').fileFingerprint(path.join(models,'fx','fx.gguf'));
   require('./evidence.cjs').createStore(ev).append({model:'fx',category:'external_sampling_config',result:'reported',
     identityHash:require('./model-evidence-import.cjs').artifactIdentityHash(artifact),value:{temperature:0.7,top_p:0.9},
