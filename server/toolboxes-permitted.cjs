@@ -10,7 +10,24 @@
 // Per box:   available / unavailable (+ reason), and `active` when the project or chat already
 //            selects it, so the catalogue can show what is on by default versus on for one turn.
 
+const { isInAppBox, isManifestBoxInApp } = require('./toolbox-flags.cjs');
+
 const CODE_BOX_ID = 'code';
+
+/** English fallbacks. `reasonCode` names each one so the client can word it from its catalogue
+ *  (`tools.reason.<code>`); a client that does not know a code shows this text. */
+const REASONS = {
+  connect: 'Connect this account in Settings → Connected apps first.',
+  signIn: 'Sign in to this service in Settings → Connected apps first.',
+  diaryOff: 'The Diary add-on is off for this account.',
+  blocked: 'Blocked in your tool permissions.',
+  notConnected: 'Not connected on this server right now.',
+  codeNeedsCowork: 'Switch this session to Cowork to use the coding harness.',
+  codeAdminOnly: 'The coding harness is limited to administrators.',
+  codeOff: 'The coding harness is off on this server.',
+  codeNeedsProject: 'Open a project chat to run a Cowork task.',
+  codeNoRepository: 'No repository is registered on this server.',
+};
 
 /**
  * @param {object} input
@@ -49,10 +66,10 @@ function computePermittedTools(input) {
   const selected = new Set(selectedToolboxIds({ project, defaultToolboxes, connectorBoxes, connected }));
   const out = [];
   for (const box of boxes) {
-    let reason = null;
-    if (connectorBoxes.has(box.id) && !connected.includes(box.id)) reason = 'Connect this account in Settings → Connectors first.';
-    else if (oauthServerIds.has(box.id) && !accountReady(user.id, box.id)) reason = 'Sign in to this service in Settings → Connectors first.';
-    else if (box.id === 'diary' && !diaryEnabled) reason = 'The Diary add-on is off for this account.';
+    let reason = null, reasonCode = null;
+    if (connectorBoxes.has(box.id) && !connected.includes(box.id)) [reason, reasonCode] = [REASONS.connect, 'connect'];
+    else if (oauthServerIds.has(box.id) && !accountReady(user.id, box.id)) [reason, reasonCode] = [REASONS.signIn, 'signIn'];
+    else if (box.id === 'diary' && !diaryEnabled) [reason, reasonCode] = [REASONS.diaryOff, 'diaryOff'];
     const tools = (box.tools || []).map((tool) => {
       const name = tool && tool.function && tool.function.name;
       if (!name) return null;
@@ -64,12 +81,13 @@ function computePermittedTools(input) {
         description: String((tool.function && tool.function.description) || '').slice(0, 240),
         write,
         permission,
-        reason: reason ? reason : policy === 'block' ? 'Blocked in your tool permissions.' : null,
+        reason: reason ? reason : policy === 'block' ? REASONS.blocked : null,
+        reasonCode: reason ? reasonCode : policy === 'block' ? 'blocked' : null,
       };
     }).filter(Boolean);
     out.push({
-      id: box.id, label: box.label, description: box.description, source: box.source,
-      state: reason ? 'unavailable' : 'available', reason, active: !reason && selected.has(box.id), tools,
+      id: box.id, label: box.label, description: box.description, source: box.source, inApp: isInAppBox(box),
+      state: reason ? 'unavailable' : 'available', reason, reasonCode, active: !reason && selected.has(box.id), tools,
     });
   }
   // Configured but not discovered (the server is down, or its credentials are missing): shown so
@@ -79,24 +97,25 @@ function computePermittedTools(input) {
     if (!entry || present.has(entry.id)) continue;
     if (entry.id === 'diary' && !diaryEnabled) continue;
     out.push({ id: entry.id, label: entry.label || entry.id, description: entry.description || '', source: 'mcp',
-      state: 'unavailable', reason: 'Not connected on this server right now.', active: false, tools: [] });
+      inApp: isManifestBoxInApp(entry), state: 'unavailable', reason: REASONS.notConnected, reasonCode: 'notConnected', active: false, tools: [] });
   }
   // The coding harness: only in a Cowork session, only for administrators, only when it is on.
-  const codeReason = mode !== 'cowork' ? 'Switch this session to Cowork to use the coding harness.'
-    : !isAdmin ? 'The coding harness is limited to administrators.'
-    : !harnessEnabled ? 'The coding harness is off on this server.'
-    : !project ? 'Open a project chat to run a Cowork task.'
-    : !repositories.length ? 'No repository is registered on this server.'
+  const codeCode = mode !== 'cowork' ? 'codeNeedsCowork'
+    : !isAdmin ? 'codeAdminOnly'
+    : !harnessEnabled ? 'codeOff'
+    : !project ? 'codeNeedsProject'
+    : !repositories.length ? 'codeNoRepository'
     : null;
+  const codeReason = codeCode ? REASONS[codeCode] : null;
   out.push({
-    id: CODE_BOX_ID, label: 'Coding harness', source: 'code', active: !codeReason,
+    id: CODE_BOX_ID, label: 'Coding harness', source: 'code', inApp: true, active: !codeReason, reasonCode: codeCode,
     description: 'Read, edit and run commands in a registered repository. Every edit and command asks first.',
     state: codeReason ? 'unavailable' : 'available', reason: codeReason,
     tools: [
       { name: 'read_repository', description: 'Read files in the chosen repository.', write: false },
       { name: 'edit_file', description: 'Change files on a task branch.', write: true },
       { name: 'execute_command', description: 'Run a command in the sandbox.', write: true },
-    ].map((t) => ({ ...t, permission: codeReason ? 'unavailable' : t.write ? 'needs-approval' : 'allowed', reason: codeReason })),
+    ].map((t) => ({ ...t, permission: codeReason ? 'unavailable' : t.write ? 'needs-approval' : 'allowed', reason: codeReason, reasonCode: codeCode })),
   });
   return out;
 }
@@ -119,4 +138,4 @@ function createTtlCache({ ttlMs = 30000, now = Date.now, max = 500 } = {}) {
   };
 }
 
-module.exports = { computePermittedTools, createTtlCache, CODE_BOX_ID, selectedToolboxIds };
+module.exports = { REASONS, computePermittedTools, createTtlCache, CODE_BOX_ID, selectedToolboxIds };

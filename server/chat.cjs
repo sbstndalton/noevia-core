@@ -1,6 +1,7 @@
 'use strict';
 const { frameUntrusted } = require('./prompt-framing.cjs');
 const { isChatGenerationModel } = require('./chat-model-kind.cjs');
+const { isInAppBox } = require('./toolbox-flags.cjs');
 // ── The chat loop ─────────────────────────────────────────────────────────
 // One POST /api/chat: build the system prompt (account instructions, memory,
 // project context, RAG excerpts, skills), hand the Diary space to its
@@ -620,7 +621,7 @@ function createChatHandler({
     const boxLabel = (id) => allToolboxes().find((b) => b.id === id)?.label || id;
     // `boxes` carries the stable ids next to the joined English text (#624), so the client words
     // the list in the interface language; `text` stays for clients that only read the string.
-    const boxInfo = (id) => { const b = allToolboxes().find((x) => x.id === id); return { id, label: b?.label || id, inApp: !!b && (b.source === 'builtin' || b.inApp === true) }; };
+    const boxInfo = (id) => { const b = allToolboxes().find((x) => x.id === id); return { id, label: b?.label || id, inApp: isInAppBox(b) }; };
     send({ type: 'tools_scope', text: routing.narrowed ? routing.ids.map(boxLabel).join(', ') : '', ...(routing.narrowed ? { boxes: routing.ids.map(boxInfo) } : {}) });
     if (pinnedSkill) send({ type: 'skills_scope', text: pinnedSkill.record.name });
     else if (autoSkills.length) send({ type: 'skills_scope', text: autoSkills.map((s) => s.name).join(', ') });

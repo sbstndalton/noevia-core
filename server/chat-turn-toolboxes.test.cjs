@@ -89,3 +89,15 @@ test('the "Using:" scope carries the box ids beside the joined English text, so 
   assert.equal(all.text, '');
   assert.equal('boxes' in all, false, 'nothing is narrowed, so there are no ids to send');
 });
+
+test('the "Using:" scope marks every in-app box the server ships, MCP-backed or built in, and no third party box (#615)', async (t) => {
+  const { buildInAppBoxes } = require('./toolbox-inapp-fixture.cjs');
+  const shipped = buildInAppBoxes().allToolboxes().filter((b) => b.id !== 'gdrive');
+  const foreign = { id: 'their-box', label: 'Theirs', source: 'mcp', tools: [{ type: 'function', function: { name: 'their_tool' } }] };
+  const boxes = [...shipped, foreign];
+  const f = await run(t, { narrow: true, diary: true, boxes, projectToolboxes: boxes.map((b) => b.id) });
+  const scope = f.events.find((e) => e.type === 'tools_scope');
+  const byId = Object.fromEntries(scope.boxes.map((b) => [b.id, b]));
+  for (const box of shipped) assert.equal(byId[box.id].inApp, true, `tools_scope ${box.id} (source ${box.source})`);
+  assert.equal(byId['their-box'].inApp, false);
+});

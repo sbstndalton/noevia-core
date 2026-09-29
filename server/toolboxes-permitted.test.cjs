@@ -40,7 +40,7 @@ test('reads are allowed, writes and Ask reads need approval, and the project sel
 test('a blocked tool is unavailable with a reason, and a tool policy is read for this account only', () => {
   const seen = [];
   const boxes = byId(computePermittedTools(input({ policyMode: (u, name) => { seen.push(u); return name === 'get_current_time' ? 'block' : 'allow'; } })));
-  assert.deepEqual(boxes.core.tools[0], { name: 'get_current_time', description: '', write: false, permission: 'unavailable', reason: 'Blocked in your tool permissions.' });
+  assert.deepEqual(boxes.core.tools[0], { name: 'get_current_time', description: '', write: false, permission: 'unavailable', reason: 'Blocked in your tool permissions.', reasonCode: 'blocked' });
   assert.ok(seen.every((u) => u === 'u-member'));
 });
 

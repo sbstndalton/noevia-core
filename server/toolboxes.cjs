@@ -1,4 +1,5 @@
 'use strict';
+const { isInAppBox } = require('./toolbox-flags.cjs');
 // ── Toolboxes and built-in tools ──────────────────────────────────────────
 // Everything about WHICH tools a chat is offered and how the built-in ones
 // run: the core box, the per-model count cap and token budget, the resolver,
@@ -346,7 +347,7 @@ function createToolboxes({
       source: b.source,
       // An in-app box: shipped with noevia (built in, or curated in the MCP manifest), so the
       // client may word it from its catalogue by id. A box a third party defined is never one (#615).
-      inApp: b.source === 'builtin' || b.inApp === true,
+      inApp: isInAppBox(b),
       toolCount: b.tools.length,
       estTokens: estimateToolTokens(b.tools),
       ...(CONNECTOR_BOXES.has(b.id) ? { connector: true } : {}),
