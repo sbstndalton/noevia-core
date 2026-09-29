@@ -64,10 +64,12 @@ function serviceKeys(block) {
   return keys;
 }
 
-test('compose.embed.yaml has exactly one top-level key: services', () => {
+test('compose.embed.yaml top-level keys are services and the shared models network only', () => {
   const text = fs.readFileSync(overlayPath, 'utf8');
-  assert.deepEqual(topLevelKeys(text), ['services'],
-    'overlay must declare only `services:` at the top level (no networks/volumes)');
+  assert.deepEqual(topLevelKeys(text), ['services', 'networks'],
+    'overlay must declare only `services:` and `networks:` (no volumes)');
+  assert.match(text, /\nnetworks:\n(?: {2}#.*\n)* {2}models: \{\}\s*$/,
+    'the only network the overlay declares is `models` (same as compose.llamacpp.yaml)');
 });
 
 test('compose.embed.yaml declares exactly the embed and web services', () => {
@@ -76,7 +78,7 @@ test('compose.embed.yaml declares exactly the embed and web services', () => {
     'overlay must declare exactly {embed, web}');
 });
 
-test('compose.embed.yaml embed service is digest-pinned, healthchecked and default-network only', () => {
+test('compose.embed.yaml embed service is digest-pinned, healthchecked and default and models networks only', () => {
   const text = fs.readFileSync(overlayPath, 'utf8');
   const block = serviceBlock(text, 'embed');
   const keys = serviceKeys(block);
@@ -101,8 +103,12 @@ test('compose.embed.yaml embed service is digest-pinned, healthchecked and defau
       .map((m) => m[1]);
   }
   assert.ok(networks, 'embed service declares no networks');
-  assert.deepEqual(networks, ['default'],
-    'docs/spec-service-boundaries.md §2 says embed is default-network only');
+  // Issue #549: model-loader is on `models` only (it holds the Docker socket, so it must not be
+  // on `default`); embed joins `models` so the loader can probe it. No other network.
+  assert.deepEqual(networks, ['default', 'models']);
+  const llamacpp = fs.readFileSync(llamacppPath, 'utf8');
+  assert.match(serviceBlock(llamacpp, 'model-loader'), /^ {4}networks:\s*\[models\]/m,
+    'model-loader must stay on models only; embed joins it, not the other way round');
 });
 
 test('compose.embed.yaml pins embed to the same digest as llama, openly', () => {

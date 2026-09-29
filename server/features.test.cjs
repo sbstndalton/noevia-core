@@ -81,3 +81,42 @@ test('toolGate is experimental, off by default and unavailable until the decisio
   assert.equal(pinned.enabled('toolGate'), true);
   assert.equal(make({ env: { NOEVIA_FEATURE_TOOL_GATE: 'true' } }).enabled('toolGate'), false, 'unavailable wins over the env pin');
 });
+
+test('browserRuntimeReason: missing playwright, missing Chromium, and a complete runtime (issue 550)', () => {
+  const { browserRuntimeReason } = require('./features.cjs');
+  const missing = () => { throw Object.assign(new Error('nope'), { code: 'MODULE_NOT_FOUND' }); };
+  assert.match(browserRuntimeReason({ resolve: missing }), /Playwright installed/);
+  const pw = { chromium: { executablePath: () => '/ms/chromium' } };
+  assert.match(browserRuntimeReason({ resolve: () => 'x', load: () => pw, exists: () => false }), /Chromium/);
+  assert.match(browserRuntimeReason({ resolve: () => 'x', load: () => { throw new Error('boom'); }, exists: () => true }), /Chromium/);
+  assert.equal(browserRuntimeReason({ resolve: () => 'x', load: () => pw, exists: p => p === '/ms/chromium' }), null);
+});
+
+test('Browser mode is described as unavailable, cannot be switched on and never reads as enabled when the runtime is missing', () => {
+  const reason = 'Needs Playwright installed on this server; it is not in this image.';
+  const registry = { ...REGISTRY, browserExecutor: { ...REGISTRY.browserExecutor, unavailable: () => reason } };
+  const features = createFeatures({ env: { NOEVIA_FEATURE_BROWSER_EXECUTOR: 'true' }, store: memoryStore(), registry });
+  assert.equal(features.enabled('browserExecutor'), false);
+  assert.equal(features.flags().browserExecutor, false);
+  const d = features.describe().find(f => f.name === 'browserExecutor');
+  assert.equal(d.unavailable, reason);
+  assert.equal(d.experimental, undefined);
+  const admin = createFeatures({ env: {}, store: memoryStore(), registry });
+  assert.throws(() => admin.set('browserExecutor', true, 'a1'), e => e.status === 409 && e.message === reason);
+  assert.equal(admin.set('browserExecutor', false, 'a1'), false);
+});
+
+test('Browser mode can be switched on once the runtime is present, and flags without a probe stay unmarked', () => {
+  const registry = { ...REGISTRY, browserExecutor: { ...REGISTRY.browserExecutor, unavailable: () => null } };
+  const features = createFeatures({ env: {}, store: memoryStore(), registry });
+  features.set('browserExecutor', true, 'a1');
+  assert.equal(features.enabled('browserExecutor'), true);
+  assert.equal(features.describe().find(f => f.name === 'browserExecutor').unavailable, null);
+  assert.equal('unavailable' in features.describe().find(f => f.name === 'previews'), false);
+});
+
+test('the registered Browser mode probe is the real runtime check', () => {
+  assert.equal(typeof REGISTRY.browserExecutor.unavailable, 'function');
+  const r = REGISTRY.browserExecutor.unavailable({});
+  assert.ok(r === null || typeof r === 'string');
+});

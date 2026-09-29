@@ -6,6 +6,22 @@
 // `restart` are wired into tool catalogues at startup: a change is saved and reported as pending,
 // and enabled() keeps answering with the value the running server actually uses.
 
+/**
+ * Why Browser mode cannot run on this server, or null when it can (issue #550). `playwright` is an
+ * operator-installed dependency (index.cjs launches it lazily), and it also needs a downloaded
+ * Chromium. Probed at runtime so an image that adds both becomes usable without a code change.
+ * Injectable for tests.
+ */
+function browserRuntimeReason({ resolve = require.resolve, load = require, exists = require('node:fs').existsSync } = {}) {
+  try { resolve('playwright'); }
+  catch { return 'Needs Playwright installed on this server; it is not in this image.'; }
+  try {
+    const executable = load('playwright').chromium.executablePath();
+    if (executable && exists(executable)) return null;
+  } catch { /* fall through to the same message */ }
+  return 'Needs a Chromium browser installed for Playwright on this server.';
+}
+
 const REGISTRY = Object.freeze({
   stepSupervision: { env: 'NOEVIA_FEATURE_STEP_SUPERVISION', experimental: true, unavailable: env => require('./decision-endpoint.cjs').configuration(env).reason, label: 'Step supervision', description: 'Let a decision provider advise whether to continue, verify tool results or pause for review between chat steps. Keeps existing behavior if unavailable. Approvals and execution limits still apply.' },
   systemOneRouting: { env: 'NOEVIA_FEATURE_SYSTEM_ONE_ROUTING', experimental: true, unavailable: env => require('./system-one-router.cjs').configuration(env).reason, label: 'System-One routing', description: 'Use the configured decision service to choose Fast, Smart or Code for new Auto-routed messages. Falls back to the current router when unavailable. Manual model choices are unchanged.' },
@@ -17,7 +33,7 @@ const REGISTRY = Object.freeze({
   toolRouter: { env: 'NOEVIA_FEATURE_TOOL_ROUTER', label: 'Tool routing', description: "Send only the project's toolboxes that match each message (needs an embedding model); falls back to all of them." },
   codeHarness: { env: 'NOEVIA_FEATURE_CODE_HARNESS', label: 'Code mode', description: 'Administrators can run a coding harness in a per-task git worktree, with every write through the approval card.' },
   astraReview: { env: 'NOEVIA_FEATURE_ASTRA_REVIEW', experimental: true, label: 'Astra review (Code mode)', description: 'After a Code task finishes, a reviewer model reads the change and gives an approve or request-changes verdict on a final card. It is advice only: you still accept or decline the change, and a failed or late review falls back to your own review.' },
-  browserExecutor: { env: 'NOEVIA_FEATURE_BROWSER_EXECUTOR', label: 'Browser mode', description: 'Administrators can run a domain-scoped Chromium session as a durable job, with every consequential action through the approval card.' },
+  browserExecutor: { env: 'NOEVIA_FEATURE_BROWSER_EXECUTOR', unavailable: () => browserRuntimeReason(), label: 'Browser mode', description: 'Administrators can run a domain-scoped Chromium session as a durable job, with every consequential action through the approval card.' },
   constrainedPlanDecoding: { env: 'NOEVIA_FEATURE_CONSTRAINED_PLAN_DECODING', experimental: true, unavailable: () => 'Not used yet: no server-side plan generator.',label: 'Constrained plan decoding', description: 'Ask the local llama.cpp engine to constrain the plan artifact to its JSON schema. Adds to the after-the-fact validation and falls back to unconstrained generation for reasoning models or when the engine rejects it.' },
   kiwix: { env: 'NOEVIA_FEATURE_KIWIX', restart: true, label: 'Offline Wikipedia', description: 'A read-only lookup tool backed by an internal kiwix-serve.' },
   chatgptOAuth: { env: 'NOEVIA_FEATURE_CHATGPT_OAUTH', label: 'Sign in with ChatGPT', description: 'Let each person connect their own ChatGPT account as a private AI provider. Chats that use it are sent to OpenAI; Diary text, Diary tools and project images never are.' },
@@ -63,7 +79,8 @@ function createFeatures({ env = process.env, store = null, audit = () => {}, reg
     flags: () => Object.fromEntries([...state].map(([name, s]) => [name, !unavailable(name) && (registry[name].restart ? s.boot : s.value)])),
     describe: () => [...state].map(([name, s]) => ({ name, label: registry[name].label, description: registry[name].description,
       enabled: s.value, source: s.source, locked: s.source === 'env', env: registry[name].env,
-      ...(registry[name].experimental ? { experimental: true, unavailable: unavailable(name) } : {}),
+      ...(registry[name].experimental ? { experimental: true, unavailable: unavailable(name) }
+        : registry[name].unavailable ? { unavailable: unavailable(name) } : {}),
       pendingRestart: !!registry[name].restart && s.value !== s.boot })),
     set(name, enabled, actorId) {
       if (!known(name)) throw Object.assign(new Error('Unknown feature'), { status: 404 });
@@ -87,4 +104,4 @@ function settingsStore(db) {
   };
 }
 
-module.exports = { REGISTRY, createFeatures, settingsStore, parseEnv };
+module.exports = { browserRuntimeReason, REGISTRY, createFeatures, settingsStore, parseEnv };

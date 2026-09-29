@@ -45,6 +45,22 @@ test('constrainedPlanDecoding is listed as unavailable and cannot be switched on
   assert.equal((await call(route, 'PUT', '/api/admin/features/constrainedPlanDecoding', 'admin', '{"enabled":true}')).status, 409);
 });
 
+test('Browser mode without a browser runtime is listed with a reason, refused with 409 and reads false (issue 550)', async () => {
+  const { REGISTRY } = require('../features.cjs');
+  const reason = 'Needs Playwright installed on this server; it is not in this image.';
+  const registry = { ...REGISTRY, browserExecutor: { ...REGISTRY.browserExecutor, unavailable: () => reason } };
+  const m = new Map();
+  const features = createFeatures({ env: {}, store: { get: k => m.get(k), set: (k, v) => m.set(k, v) }, registry });
+  const json = (res, status, body) => { res.status = status; res.body = body; };
+  const route = createFeatureRoutes({ features, json, readJson: async req => JSON.parse(req.raw || '{}') });
+  const info = (await call(route, 'GET', '/api/admin/features', 'admin')).body.features.find(f => f.name === 'browserExecutor');
+  assert.equal(info.unavailable, reason);
+  const put = await call(route, 'PUT', '/api/admin/features/browserExecutor', 'admin', '{"enabled":true}');
+  assert.equal(put.status, 409);
+  assert.equal(features.enabled('browserExecutor'), false);
+  assert.equal((await call(route, 'GET', '/api/features', 'member')).body.flags.browserExecutor, false);
+});
+
 test('unrelated paths are not handled', async () => {
   const { route } = harness();
   assert.equal((await call(route, 'GET', '/api/featuresX', 'admin')).handled, false);
