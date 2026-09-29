@@ -188,22 +188,35 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
     // download-cache models legitimately have none. Laya is included on purpose: its preset points
     // at a GGUF that does not exist (it runs in its own sidecar), so it reads as missing too.
     const rows = list.value.body?.data || [];
+    // #580: the embedding (and reranking) sidecar is its own fixed llama-server, so the router's
+    // status for its model ("unloaded") says nothing about it. The model manager probes each
+    // backend; a sidecar model counts as loaded when some backend reports it as loaded.
+    const sidecarLoaded = new Set();
+    if (env.MODEL_LOADER_URL && rows.some((m) => isSidecarModel(m.id || m.model_name, env))) {
+      const res = await fetchJson(`${env.MODEL_LOADER_URL.replace(/\/+$/, '')}/api/v1/backends`, { method: 'GET', headers: { 'Content-Type': 'application/json', ...(env.MODEL_LOADER_TOKEN ? { 'X-Model-Loader-Token': env.MODEL_LOADER_TOKEN } : {}) } }, 4000).catch(() => null);
+      for (const b of res?.ok && Array.isArray(res.body?.backends) ? res.body.backends : []) {
+        if (b?.status !== 'running' || typeof b.loaded_model !== 'string') continue;
+        for (const id of b.loaded_model.split(',').map((x) => x.trim()).filter(Boolean)) sidecarLoaded.add(id);
+      }
+    }
+    const sidecarUp = (m) => isSidecarModel(m.id || m.model_name, env) && sidecarLoaded.has(m.id || m.model_name);
     const scan = rows.some((m) => m.source === 'preset') ? await folderScanFiles().catch(() => null) : null;
     const hasFile = (id) => scan.some((f) => f.modelId === id || (Array.isArray(f.sections) && f.sections.includes(id)));
-    const missingFile = (m) => !!scan && m.source === 'preset' && !hasFile(m.id || m.model_name);
+    // A sidecar model that a live backend reports as loaded is running, whatever the folder scan says.
+    const missingFile = (m) => !sidecarUp(m) && !!scan && m.source === 'preset' && !hasFile(m.id || m.model_name);
     const installed = rows
       // Some managers register cosmetic hash-ID duplicates; hide bare hash names.
       .filter((m) => !/^[0-9a-f]{32,40}$/i.test(m.id || m.model_name || ''))
       .map((m) => ({
         name: m.id || m.model_name,
         sizeGB: typeof m.size === 'number' ? Math.round(m.size * 10) / 10 : null,
-        loaded: loadedNames.has(m.id || m.model_name),
+        loaded: loadedNames.has(m.id || m.model_name) || sidecarUp(m),
         labels: Array.isArray(m.labels) ? m.labels : [],
         mtp: require('./mtp.cjs').capability(m),
         maxContext: m.max_context_window || null,
         suggested: !!m.suggested,
-        status: missingFile(m) ? 'missing' : m.status?.value || (loadedNames.has(m.id || m.model_name) ? 'loaded' : 'unloaded'),
-        failed: m.status?.failed === true || missingFile(m),
+        status: missingFile(m) ? 'missing' : sidecarUp(m) ? 'loaded' : m.status?.value || (loadedNames.has(m.id || m.model_name) ? 'loaded' : 'unloaded'),
+        failed: !sidecarUp(m) && (m.status?.failed === true || missingFile(m)),
         // #545: a preset whose GGUF is not in the models folder. Never offered for chat, loading or tuning.
         missingFile: missingFile(m),
         canDelete: m.can_remove !== false,

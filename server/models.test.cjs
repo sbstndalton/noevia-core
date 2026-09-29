@@ -72,6 +72,48 @@ test('#336: sidecarProtected is true for the configured embedding model, distinc
   assert.equal(locked.sidecarProtected, false, 'but it is not a sidecar model, so sidecarProtected stays false');
 });
 
+test('#580: the embedding sidecar model reads as loaded from the backend probe, not the router status', async () => {
+  const backends = [
+    { name: 'cowork-llama-1', status: 'running', loaded_model: 'chat-7b', probe_error: null },
+    { name: 'cowork-embed-1', status: 'running', loaded_model: 'nomic-embed-text-v1', probe_error: null },
+  ];
+  const urls = [];
+  const fetchJson = async (url) => { urls.push(url); return url.endsWith('/api/v1/backends') ? { ok: true, status: 200, body: { backends } } : { ok: true, status: 200, body: {} }; };
+  const f = fixture({
+    env: { EMBEDDING_MODEL: 'nomic-embed-text-v1', MODEL_LOADER_URL: 'http://loader:8000/' }, fetchJson,
+    models: [{ id: 'nomic-embed-text-v1', labels: ['embedding'], status: { value: 'unloaded' } }, { id: 'chat-7b', status: { value: 'unloaded' } }],
+  });
+  const by = Object.fromEntries((await f.service.modelsInstalled()).map((m) => [m.name, m]));
+  assert.equal(by['nomic-embed-text-v1'].loaded, true);
+  assert.equal(by['nomic-embed-text-v1'].status, 'loaded');
+  assert.equal(by['nomic-embed-text-v1'].failed, false);
+  assert.equal(by['chat-7b'].loaded, false, 'a non-sidecar model still follows the router');
+  assert.equal(by['chat-7b'].status, 'unloaded');
+  assert.ok(urls.includes('http://loader:8000/api/v1/backends'));
+});
+
+test('#580: an unreachable, stopped or empty backend leaves the sidecar model on the router state', async () => {
+  const models = [{ id: 'nomic-embed-text-v1', labels: ['embedding'], status: { value: 'unloaded' } }];
+  const env = { EMBEDDING_MODEL: 'nomic-embed-text-v1', MODEL_LOADER_URL: 'http://loader:8000' };
+  for (const fetchJson of [
+    async () => { throw new Error('down'); },
+    async () => ({ ok: false, status: 502, body: {} }),
+    async () => ({ ok: true, status: 200, body: { backends: [{ name: 'cowork-embed-1', status: 'exited', loaded_model: 'nomic-embed-text-v1' }] } }),
+    async () => ({ ok: true, status: 200, body: { backends: [{ name: 'cowork-embed-1', status: 'running', loaded_model: null }] } }),
+  ]) {
+    const [m] = await fixture({ env, models, fetchJson }).service.modelsInstalled();
+    assert.equal(m.loaded, false);
+    assert.equal(m.status, 'unloaded');
+  }
+});
+
+test('#580: no backend lookup when no sidecar model is installed', async () => {
+  const urls = [];
+  const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader:8000' }, models: [{ id: 'chat-7b' }], fetchJson: async (u) => { urls.push(u); return { ok: true, body: {} }; } });
+  await f.service.modelsInstalled();
+  assert.ok(!urls.some((u) => u.includes('/backends')));
+});
+
 test('a disabled or unreachable manager reads as null from servedCatalogue and throws from modelsInstalled', async () => {
   const off = fixture({ enabled: false });
   assert.equal(await off.service.servedCatalogue(), null);
