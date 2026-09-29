@@ -31,7 +31,7 @@ function createOffsiteRoutes({ service, json }) {
     if (!actions[action]) return send(404, { error: 'not found' });
     if (req.method !== 'POST') return send(405, { error: 'method not allowed' });
     try { return send(200, (await actions[action](authn)) ?? {}); }
-    catch (error) { return send(error.status || 502, { error: error.publicMessage || 'The backup destination could not be reached.' }); }
+    catch (error) { return send(error.status || 502, { error: error.publicMessage || 'The backup destination could not be reached.', ...(error.messageId ? { errorId: error.messageId, errorParams: error.messageParams || {} } : {}) }); }
   };
 }
 module.exports = { createOffsiteRoutes };

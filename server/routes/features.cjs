@@ -16,7 +16,7 @@ function createFeatureRoutes({ features, json, readJson, decisionSettings = null
       try {
         const result=req.method==='GET' ? decisionSettings.get() : path.endsWith('/test') ? await decisionSettings.test(await readJson(req)) : decisionSettings.save(await readJson(req),authn.user.id);
         return json(res,200,result),true;
-      } catch(error) {return json(res,error.status||400,{error:error.status?error.message:'Invalid decision settings'}),true;}
+      } catch(error) {return json(res,error.status||400,{error:error.status?error.message:'Invalid decision settings',...(error.status&&error.messageId?{errorId:error.messageId}:{})}),true;}
     }
     if (path !== '/api/admin/features' && !path.startsWith('/api/admin/features/')) return false;
     if (!authn || authn.user.role !== 'admin') return json(res, 403, { error: 'Administrator required' }), true;

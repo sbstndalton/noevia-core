@@ -520,7 +520,7 @@ function createChatHandler({
       sampling: sampling.source === 'none' ? undefined : { preset: sampling.presetId || undefined, source: sampling.source, values: sampling.params } });
     if (replySources.length && !body.compactOnly) send({ type: 'sources', sources: replySources });
     send({ type: 'telemetry', phase: 'waiting', model });
-    send({ type: 'status', text: attachedImages.length ? 'Reading image sources — model loading and visual processing may take a moment…' : 'Preparing response…' });
+    send({ type: 'status', id: attachedImages.length ? 'readingImages' : 'preparing', text: attachedImages.length ? 'Reading image sources — model loading and visual processing may take a moment…' : 'Preparing response…' });
     let visionWarning = missingImages.length ? `Images were not read because their stored files are missing: ${missingImages.join(', ')}. Re-upload them.` : '';
     if (visionWarning) wire = [{ role: 'system', content: visionWarning + ' Do not guess their contents.' }, ...wire];
     // Rule 3 of provider-egress.cjs: project images are not sent to an external provider on their own.
@@ -580,7 +580,7 @@ function createChatHandler({
       }
     }
 
-    send({ type: 'status', text: 'Generating response…' });
+    send({ type: 'status', id: 'generating', text: 'Generating response…' });
     const imageWarning = visionWarning;
     const replyWarning = () => [imageWarning, revokedInHistory.length ? historyNote(revokedInHistory) : ''].filter(Boolean).join(' ');
     if (replyWarning()) send({ type: 'warning', text: replyWarning() });
@@ -724,7 +724,7 @@ function createChatHandler({
       ({limit,limitSource}=await context.resolveRuntimeLimit({
         manager:provider.id===DEFAULT_PROVIDER_ID?modelManager:null,model,dir:chatWorkspace.dir,
         scope:require('node:crypto').createHash('sha256').update(JSON.stringify([provider.baseUrl,provider.apiKey,modelManager.baseUrl])).digest('hex'),
-        signal:chatSignal.signal,onStatus:text=>send({type:'status',text}),
+        signal:chatSignal.signal,onStatus:(text,id)=>send({type:'status',text,...(id?{id}:{})}),
         assertActive:assertWorkspaceActive,
         // #536: a hosted/custom provider's own context setting (or the hosted default); the local default is unchanged.
         hosted:provider.id===DEFAULT_PROVIDER_ID?null:provider,
@@ -738,7 +738,7 @@ function createChatHandler({
           return choice?.message?.content;
         };
       prepared=await context.prepare({dir:chatWorkspace.dir,id:contextId,messages:wire,tools:activeTools,limit,limitSource,model,force:body.compactOnly===true,
-        onStatus:text=>send({type:'status',text}),summarize:summarizeContext,assertActive:assertWorkspaceActive});
+        onStatus:(text,id)=>send({type:'status',text,...(id?{id}:{})}),summarize:summarizeContext,assertActive:assertWorkspaceActive});
       send({type:'context',...prepared.meter});
     } catch(error) {send({type:'error',text:error.message});res.end();return;}
     if(body.compactOnly){send({type:'done',model});res.end();return;}
@@ -873,7 +873,7 @@ function createChatHandler({
       let roundBudget=context.measure(roundMessages,activeTools,limit,limitSource,model),roundCompacted=false;
       if(roundBudget.used>roundBudget.threshold) {
         try {
-          const continuation=await context.compactContinuation({messages:roundMessages,tools:activeTools,limit,limitSource,model,summarize:summarizeContext,onStatus:text=>send({type:'status',text})});
+          const continuation=await context.compactContinuation({messages:roundMessages,tools:activeTools,limit,limitSource,model,summarize:summarizeContext,onStatus:(text,id)=>send({type:'status',text,...(id?{id}:{})})});
           roundMessages=continuation.messages;roundBudget=continuation.meter;roundCompacted=continuation.compacted;
           if(roundCompacted){continuationCompactedAt=Date.now();continuationCovered=continuation.covered;send({type:'context',...roundBudget,historyCount:prepared.meter.historyCount,compactedAt:continuationCompactedAt,covered:continuationCovered});}
         } catch(error) {send({type:'error',text:error.message});break;}

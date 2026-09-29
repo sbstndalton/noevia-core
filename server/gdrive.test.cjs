@@ -107,6 +107,23 @@ test('mirror: a different file under an existing name is corruption, not somethi
   assert.equal(google.state.uploads, uploads);
 });
 
+test('mirror: refusals carry a stable message id and their numbers for the client to translate (#624)', async () => {
+  const d = make(temp());
+  await d.connect(); google.approve();
+  await until(() => d.state().state === 'connected');
+  const empty = createDirStore({ root: temp('noevia-wiped-id-') });
+  await assert.rejects(() => d.mirror(empty), (e) => e.messageId === 'storeEmpty' && /looks empty/.test(e.publicMessage));
+  const store = await backupStore();
+  await d.mirror(store);
+  const folder = [...google.files.values()].find((f) => f.name === 'noevia-offsite').id;
+  for (let i = 0; i < 3; i++) google.files.set(`idextra${i}`, { id: `idextra${i}`, name: `data/zz/idextra${i}`, parents: [folder], body: Buffer.from('x'), trashed: false });
+  await assert.rejects(() => d.mirror(store, { maxDelete: 1 }), (e) => e.messageId === 'tooManyStale' && e.messageParams.max === 1);
+  const snap = (await store.list('snapshots/'))[0];
+  fs.appendFileSync(path.join(store.root, ...snap.split('/')), 'CORRUPT');
+  for (let i = 0; i < 3; i++) google.files.delete(`idextra${i}`);
+  await assert.rejects(() => d.mirror(store), (e) => e.messageId === 'fileDiffers' && e.messageParams.name === 'snapshots' && e.publicMessage.includes('(snapshots)'));
+});
+
 test('mirror: over the delete cap it stops rather than emptying Drive', async () => {
   const d = make(temp());
   await d.connect(); google.approve();

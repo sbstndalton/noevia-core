@@ -29,6 +29,23 @@ test('connection test uses health only, rejects redirects/not-ready and never sa
     await assert.rejects(fixture(async()=>reply).settings.test({url:'http://laya:8040',timeoutMs:500}));
   }
 });
+test('test results and refusals carry a stable message id, in the body and in the route reply (#624)',async()=>{
+  const {settings,features}=fixture();
+  assert.equal((await settings.test({url:'http://laya:8040',timeoutMs:500})).messageId,'ready');
+  await assert.rejects(fixture(async()=>Response.json({ready:false})).settings.test({url:'http://laya:8040',timeoutMs:500}),e=>e.status===502&&e.messageId==='notReady');
+  assert.throws(()=>settings.save({url:'http://laya:8040',timeoutMs:9999},'admin'),e=>e.messageId==='invalidInput');
+  assert.throws(()=>settings.save({url:'http://public.example',timeoutMs:500},'admin'),e=>e.messageId==='invalidUrl');
+  const route=createFeatureRoutes({features,decisionSettings:settings,json:(res,status,body)=>Object.assign(res,{status,body}),readJson:async req=>req.body});
+  const admin={user:{id:'admin',role:'admin'}};
+  let res={};await route({method:'POST',body:{url:'http://laya:8040',timeoutMs:500}},res,{path:'/api/admin/decision-settings/test',authn:admin});
+  assert.equal(res.body.messageId,'ready');assert.match(res.body.message,/ready/);
+  res={};await route({method:'PUT',body:{url:'http://public.example',timeoutMs:500}},res,{path:'/api/admin/decision-settings',authn:admin});
+  assert.equal(res.status,400);assert.equal(res.body.errorId,'invalidUrl');assert.match(res.body.error,/private HTTP origin/,'the English stays for older clients');
+  res={};await route({method:'PUT',get body(){throw Error('unreadable');}},res,{path:'/api/admin/decision-settings',authn:admin});
+  assert.equal('errorId' in res.body,false,'an error without an id sends none');
+  const info=features.describe();
+  assert.equal(info.find(f=>f.name==='stepSupervision').unavailableId,'decisionSetup');
+});
 test('Laya routing supports Fast/Smart choice and live endpoint replacement',async()=>{
   const urls=[];const {settings}=fixture(async(url,init)=>{urls.push(url);const body=JSON.parse(init.body);assert.deepEqual(body.options.map(o=>o.id),['fast','smart']);return Response.json({selected:'smart',scores:{fast:0.2,smart:0.8}});});
   settings.save({url:'http://laya:8040',timeoutMs:1000},'admin');

@@ -51,6 +51,12 @@ function unavailableId(name, reason) {
   if (name === 'browserExecutor') return /Playwright installed/.test(reason) ? 'browserPlaywright' : /Chromium/.test(reason) ? 'browserChromium' : null;
   if (name === 'constrainedPlanDecoding') return /Not used yet/.test(reason) ? 'notUsed' : null;
   if (name === 'nativeClientAuth') return /TRUST_PROXY/.test(reason) ? 'trustProxy' : null;
+  // The decision-service experiments (#624): unset URL, not yet set up in Settings, or System-One's own URL.
+  if (name === 'stepSupervision' || name === 'toolGate' || name === 'systemOneRouting') {
+    if (/COWORK_DECISION_URL/.test(reason)) return 'decisionUrl';
+    if (/Set up the decision service/.test(reason)) return 'decisionSetup';
+    if (/COWORK_SYSTEM_ONE_URL/.test(reason)) return 'systemOneUrl';
+  }
   return null;
 }
 

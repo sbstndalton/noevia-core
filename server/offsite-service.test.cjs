@@ -18,6 +18,21 @@ function setup(t, { enabled = true, env = {} } = {}) {
   return { service, dir, flags, advance: (ms) => { clock += ms; } };
 }
 
+test('the Drive copy view passes a message id and clean numbers through, and marks a stale copy by id (#624)', () => {
+  const { mirrorView } = require('./offsite-service.cjs');
+  const now = Date.parse('2026-09-29T12:00:00Z');
+  const failed = mirrorView({ state: 'failed', at: now, message: 'English text', messageId: 'tooManyStale', messageParams: { max: 500, evil: { a: 1 }, 'bad key': 3, name: 'x'.repeat(200) } }, now);
+  assert.equal(failed.messageId, 'tooManyStale');
+  assert.deepEqual(Object.keys(failed.messageParams).sort(), ['max', 'name'], 'only plain values under plain names');
+  assert.equal(failed.messageParams.name.length, 80);
+  assert.equal(failed.message, 'English text', 'the English stays for older clients');
+  assert.equal('messageId' in mirrorView({ state: 'failed', at: now, message: 'old record' }, now), false, 'a record from before ids has none');
+  assert.equal('messageId' in mirrorView({ state: 'failed', at: now, message: 'x', messageId: '../../etc' }, now), false, 'an id that is not a plain word is dropped');
+  const stale = mirrorView({ state: 'ok', at: now - 3 * 86400000, message: 'Copied 2 snapshots.' }, now);
+  assert.equal(stale.state, 'stale');
+  assert.equal(stale.messageId, 'stale');
+});
+
 test('off by default and unconfigured deployments refuse to run and say why', async (t) => {
   const { service, flags } = setup(t, { enabled: false, env: { real: true } });
   assert.match(service.status().reason, /turned off/);

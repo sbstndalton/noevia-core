@@ -139,7 +139,13 @@ test('the reasons a feature is unavailable carry a stable id where the server ow
   assert.equal(unavailableId('browserExecutor', null), null);
   assert.equal(unavailableId('constrainedPlanDecoding', 'Not used yet: no server-side plan generator.'), 'notUsed');
   assert.equal(unavailableId('nativeClientAuth', 'Needs TRUST_PROXY on so sign-in limits can tell clients apart.'), 'trustProxy');
-  assert.equal(unavailableId('toolGate', 'Connect a private decision service with COWORK_DECISION_URL, then restart Noevia.'), null, 'an unknown reason has no id and stays English');
+  assert.equal(unavailableId('toolGate', 'Some new reason nobody wrote an id for.'), null, 'an unknown reason has no id and stays English');
+  // #624: the decision-service reasons carry ids too, whichever experiment shows them.
+  const url = 'Connect a private decision service with COWORK_DECISION_URL, then restart Noevia.';
+  for (const name of ['stepSupervision', 'toolGate', 'systemOneRouting']) assert.equal(unavailableId(name, url), 'decisionUrl');
+  assert.equal(unavailableId('toolGate', 'Set up the decision service below before enabling this experiment.'), 'decisionSetup');
+  assert.equal(unavailableId('systemOneRouting', 'Not configured. Set COWORK_SYSTEM_ONE_URL to a dedicated local llama.cpp decision-model endpoint, then restart the app.'), 'systemOneUrl');
+  assert.equal(unavailableId('previews', url), null, 'only the decision-service experiments use these ids');
   const info = createFeatures({ env: {}, store: memoryStore() }).describe();
   assert.equal(info.find(f => f.id === 'nativeClientAuth').unavailableId, 'trustProxy');
   assert.equal(info.find(f => f.id === 'constrainedPlanDecoding').unavailableId, 'notUsed');

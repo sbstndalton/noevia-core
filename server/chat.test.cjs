@@ -153,6 +153,15 @@ test('a project reply announces the sources placed in its prompt, bounded and li
   assert.ok(r.events.findIndex((e) => e.type === 'sources') < r.events.findIndex((e) => e.type === 'delta'), 'announced before the reply text');
 });
 
+test('in-progress status events carry a stable id next to their English text (#624)', async (t) => {
+  const r = await runDriveCall(t, { name: 'drive_read_file' });
+  const statuses = r.events.filter((e) => e.type === 'status');
+  assert.ok(statuses.length >= 2, 'a preparing and a generating status');
+  assert.deepEqual(statuses.map((e) => [e.id, e.text]).filter(([id]) => id === 'preparing' || id === 'generating'),
+    [['preparing', 'Preparing response…'], ['generating', 'Generating response…']]);
+  assert.ok(statuses.every((e) => typeof e.text === 'string' && e.text), 'the English text stays for older clients');
+});
+
 test('no sources event when nothing was retrieved', async (t) => {
   const r = await runDriveCall(t, { name: 'drive_read_file', files: [{ name: 'a.md', content: 'A' }], ragOverride: { filesContext: async (_p, _f, _q, _u, onSources) => { onSources([]); return null; } } });
   assert.equal(r.events.some((e) => e.type === 'sources'), false);

@@ -33,7 +33,7 @@ async function resolveManagedLimit({manager,model,dir,scope,onStatus,signal,asse
   if (!response.ok) throw Error('Could not read the model backend context. Try again when the backend is available.');
   let health=response.body;
   if (!health?.all_models_loaded?.some(m=>m.model_name===model && m.loaded && m.backend_alive!==false)) {
-    onStatus('Loading the selected model and checking its context allocation…');
+    onStatus('Loading the selected model and checking its context allocation…','loadingModel');
     signal?.throwIfAborted();
     const loaded=await manager.load(model,{},signal);
     assertActive?.();
@@ -130,7 +130,7 @@ async function compactContinuation({messages,tools,limit,limitSource,model,summa
   const biggest=biggestPart([...protectedMeter.parts,{name:'Summary allowance',tokens:summaryAllowance}]);
   throw Error(`Tool-loop context cannot fit because ${biggest.name.toLowerCase()} uses about ${biggest.tokens} tokens. Reduce it or choose a model with more context. No messages were deleted.`);
  }
- onStatus('Compacting context before the next tool step… Your full transcript stays available.');
+ onStatus('Compacting context before the next tool step… Your full transcript stays available.','compactingTools');
  const maxTokens=Math.min(1536,Math.floor(limit*.15));
  const budget=Math.max(512,Math.floor(limit*.45));
  let summary='',batch=[],calls=0;
@@ -166,7 +166,7 @@ async function prepareUnlocked({dir,id,messages,tools,limit,limitSource,model,fo
     const biggest=biggestPart([...protectedMeter.parts,{name:'Summary allowance',tokens:summaryAllowance}]);
     throw Error(`Even with older messages compacted, ${biggest.name} alone (${biggest.tokens} tokens) will not fit this model's context. Reduce ${biggest.name.toLowerCase()} or choose a model with more context. No inference call was made.`);
    }
-   onStatus('Compacting older messages… Your full transcript stays available.');
+   onStatus('Compacting older messages… Your full transcript stays available.','compactingOlder');
    let summary=applied.covered?state.summary:'', batch=[];
    const budget=Math.max(512,Math.floor(limit*.45));
    const flush=async()=>{if(!batch.length)return;const result=await summarize(summary,batch,Math.min(1536,Math.floor(limit*.15)));assertActive?.(); if(typeof result!=='string'||!result.trim()||tokens(result)>Math.min(1800,limit*.2))throw Error('Compaction did not produce a usable summary. Your transcript is unchanged; try another model.');summary=result.trim();batch=[];};

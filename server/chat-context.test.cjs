@@ -14,6 +14,12 @@ test('cold auto-selected fast model is loaded before resolving its own allocatio
  assert.equal(records[0].current.managerVersion,'1');assert.equal(records[0].current.engineVersion,null);
  assert.equal(records[0].current.qualification,'allocation-observation-only');assert.equal(records[0].current.backendVersion,undefined);
 });
+test('the model-loading status carries a stable id next to its English text (#624)',async t=>{
+ const dir=fixture(t);let health=loadedHealth('smart',32768);const statuses=[];
+ const manager={enabled:true,health:async()=>health,load:async()=>{health=loadedHealth('fast',131072);return {ok:true};}};
+ await ctx.resolveRuntimeLimit({manager,model:'fast',dir,scope:'provider-status',onStatus:(...args)=>statuses.push(args)});
+ assert.deepEqual(statuses,[['Loading the selected model and checking its context allocation…','loadingModel']]);
+});
 test('remembered contexts are per provider/model and never override smaller live allocations',async t=>{
  const dir=fixture(t);let health=loadedHealth('fast',131072);
  const manager={enabled:true,health:async()=>health,load:async()=>assert.fail('already loaded')};

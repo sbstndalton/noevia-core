@@ -30,7 +30,8 @@ const MAX_DELETE_SHARE = 0.25;
 const SHARE_FLOOR = 8; // tiny stores: pruning a handful of files is ordinary retention
 const STORE_PROP = 'noeviaStoreId';
 const FOLDER_NAME = /^noevia-offsite(?: \((\d+)\))?$/;
-const fail = (message, status = 502) => Object.assign(Error(message), { status, publicMessage: message });
+// `id` and `params` name the message for the client to translate (#624); the English text stays as the fallback.
+const fail = (message, status = 502, id = undefined, params = undefined) => Object.assign(Error(message), { status, publicMessage: message, ...(id ? { messageId: id, messageParams: params || {} } : {}) });
 
 function sealer(backupKey) {
   const key = Buffer.from(crypto.hkdfSync('sha256', backupKey, Buffer.alloc(0), 'noevia google token v1', 32));
@@ -164,7 +165,7 @@ function createGoogleDrive(o) {
 
   async function call(url, init = {}) {
     const r = await request(url, init);
-    if (!r.ok) throw fail(r.status === 404 ? 'Google Drive has no such file, or noevia cannot see it.' : `Google Drive answered ${r.status}.`, r.status === 404 ? 404 : 502);
+    if (!r.ok) throw fail(r.status === 404 ? 'Google Drive has no such file, or noevia cannot see it.' : `Google Drive answered ${r.status}.`, r.status === 404 ? 404 : 502, r.status === 404 ? undefined : 'driveAnswered', { status: r.status });
     return r.status === 204 ? null : r.json();
   }
 
@@ -182,7 +183,7 @@ function createGoogleDrive(o) {
     const cfg = files.find((f) => f.name === 'config');
     if (!cfg) return false;
     const r = await request(`${api}/files/${encodeURIComponent(cfg.id)}?alt=media`);
-    if (!r.ok) throw fail(`Google Drive answered ${r.status}.`);
+    if (!r.ok) throw fail(`Google Drive answered ${r.status}.`, 502, 'driveAnswered', { status: r.status });
     return Buffer.from(await r.arrayBuffer()).equals(localConfig);
   }
 
@@ -244,11 +245,11 @@ function createGoogleDrive(o) {
 
   async function mirrorOnce(store, { maxDelete = MAX_DELETE } = {}) {
     const keys = await store.list('');
-    if (!keys.includes('config')) throw fail('The local backup store looks empty, so nothing was copied (this protects the copy on Drive).', 409);
+    if (!keys.includes('config')) throw fail('The local backup store looks empty, so nothing was copied (this protects the copy on Drive).', 409, 'storeEmpty');
     const snapshots = keys.filter((k) => k.startsWith('snapshots/')).length;
-    if (!snapshots) throw fail('Waiting for the first backup before copying.', 409);
+    if (!snapshots) throw fail('Waiting for the first backup before copying.', 409, 'waitingFirstBackup');
     const localConfig = await store.get('config');
-    if (!localConfig) throw fail('The local backup store looks empty, so nothing was copied (this protects the copy on Drive).', 409);
+    if (!localConfig) throw fail('The local backup store looks empty, so nothing was copied (this protects the copy on Drive).', 409, 'storeEmpty');
     const storeId = crypto.createHash('sha256').update(localConfig).digest('hex');
     const folder = await folderId(storeId, localConfig);
     const parent = folder.id;
@@ -256,14 +257,14 @@ function createGoogleDrive(o) {
     const sizeOf = async (key) => (store.root ? fs.statSync(nodePath.join(store.root, ...key.split('/'))).size : (await store.get(key))?.length);
     // A same-named `config` of another size means another store: never mix or prune it.
     if (remote.has('config') && remote.get('config').size !== localConfig.length) {
-      throw fail('The Drive folder holds a different backup store; nothing was copied or removed.', 409);
+      throw fail('The Drive folder holds a different backup store; nothing was copied or removed.', 409, 'differentStore');
     }
     let uploaded = 0, bytes = 0;
     for (const key of keys) {
       const have = remote.get(key);
       if (have) {
         // Names are content hashes, so a size difference can only be corruption on one side.
-        if (have.size !== await sizeOf(key)) throw fail(`A file on Drive differs from the local copy (${key.split('/')[0]}); nothing was replaced or pruned.`);
+        if (have.size !== await sizeOf(key)) throw fail(`A file on Drive differs from the local copy (${key.split('/')[0]}); nothing was replaced or pruned.`, 502, 'fileDiffers', { name: key.split('/')[0] });
         continue;
       }
       const body = await store.get(key);
@@ -279,9 +280,9 @@ function createGoogleDrive(o) {
     const local = new Set(keys);
     const stale = [...remote.entries()].filter(([name]) => !local.has(name));
     // Decide before deleting anything: a run either prunes everything stale or nothing.
-    if (stale.length > maxDelete) throw fail(`Copied, but more than ${maxDelete} old files would be removed from Drive at once; nothing was removed, to be safe.`);
+    if (stale.length > maxDelete) throw fail(`Copied, but more than ${maxDelete} old files would be removed from Drive at once; nothing was removed, to be safe.`, 502, 'tooManyStale', { max: maxDelete });
     if (stale.length > Math.max(SHARE_FLOOR, remote.size * MAX_DELETE_SHARE)) {
-      throw fail(`Copied, but ${stale.length} of the ${remote.size} files on Drive are not in the local store; nothing was removed, to be safe.`);
+      throw fail(`Copied, but ${stale.length} of the ${remote.size} files on Drive are not in the local store; nothing was removed, to be safe.`, 502, 'staleShare', { stale: stale.length, total: remote.size });
     }
     for (const [, f] of stale) await call(`${api}/files/${encodeURIComponent(f.id)}`, { method: 'DELETE' });
     log({ event: 'gdrive.mirrored', uploaded, removed: stale.length, folder: folder.name });

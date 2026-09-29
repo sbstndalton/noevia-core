@@ -48,6 +48,13 @@ async function sqliteSnapshot(abs) {
   } finally { try { db?.close(); } catch { /* closed */ } }
 }
 
+/** Only short strings and numbers survive: the params end up in a page the client words. */
+function cleanParams(params) {
+  const out = {};
+  if (params && typeof params === 'object') for (const [key, value] of Object.entries(params).slice(0, 8)) if (/^[A-Za-z]{1,20}$/.test(key) && (typeof value === 'number' || typeof value === 'string')) out[key] = typeof value === 'string' ? value.slice(0, 80) : value;
+  return out;
+}
+
 /**
  * The Google Drive copy's last result, as the page shows it. A copy that has not succeeded for
  * two days is stale, whatever it last said.
@@ -58,10 +65,12 @@ function mirrorView(raw, now = Date.now()) {
   const state = states.includes(raw.state) ? raw.state : 'unknown';
   const at = Number.isFinite(raw.at) ? raw.at : null;
   const message = typeof raw.message === 'string' ? raw.message.slice(0, 300) : '';
+  // The stable id of the message and its numbers (#624), so the page can word it in the interface language.
+  const ids = typeof raw.messageId === 'string' && /^[A-Za-z]{1,40}$/.test(raw.messageId) ? { messageId: raw.messageId, messageParams: cleanParams(raw.messageParams) } : {};
   if (state === 'ok' && at && now - at > 2 * 86400000) {
-    return { state: 'stale', at, message: 'The last copy to Drive is more than two days old.' };
+    return { state: 'stale', at, message: 'The last copy to Drive is more than two days old.', messageId: 'stale', messageParams: {} };
   }
-  return { state, at, message };
+  return { state, at, message, ...ids };
 }
 
 function createOffsiteService({ env = process.env, features, dataDir, now = Date.now, log = () => {}, backupFactory = null, fetchImpl, driveFactory = null }) {
@@ -126,7 +135,7 @@ function createOffsiteService({ env = process.env, features, dataDir, now = Date
       return r;
     } catch (error) {
       const message = String(error.publicMessage || 'The copy to Drive did not finish.').slice(0, 300);
-      writeStatus({ mirror: { state: /looks empty/.test(message) ? 'refused' : /Waiting/.test(message) ? 'waiting' : 'failed', at: now(), message } });
+      writeStatus({ mirror: { state: /looks empty/.test(message) ? 'refused' : /Waiting/.test(message) ? 'waiting' : 'failed', at: now(), message, ...(error.messageId ? { messageId: error.messageId, messageParams: cleanParams(error.messageParams) } : error.publicMessage ? {} : { messageId: 'didNotFinish', messageParams: {} }) } });
       log({ event: 'gdrive.failed', message: error.message });
       throw error;
     } finally { busy = previous; }
