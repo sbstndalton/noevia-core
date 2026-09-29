@@ -372,6 +372,26 @@ const codeService = require('./code-service.cjs').createCodeService({
   connect: require('./code-acp.cjs').createAcpTransport({ log: (entry) => console.log('[code]', JSON.stringify(entry)) }),
   // Shared context (shared-context.cjs): off unless the project turns on sharing into Code.
   sharedContext: (workspace, project) => require('./shared-context.cjs').forCode(project, loadChats(project.id)),
+  // Astra review (#519, code-review.cjs): off unless features.astraReview. Advice on a final card
+  // the person still answers; it runs on the default provider as the web container reaches it, and
+  // refuses an external one.
+  review: require('./code-review.cjs').createAstraReview({
+    enabled: () => features.enabled('astraReview'),
+    log: (entry) => console.log('[code]', JSON.stringify(entry)),
+    provider: require('./code-review.cjs').createEngineReviewer({
+      fetch: (...args) => globalThis.fetch(...args),
+      engine: () => {
+        const provider = getProvider(DEFAULT_PROVIDER_ID);
+        const base = String(provider?.baseUrl || '').replace(/\/+$/, '');
+        return {
+          baseUrl: base ? (/\/v1$/.test(base) ? base : `${base}/v1`) : null,
+          apiKey: provider?.apiKey || null,
+          model: autoRoles()?.code || autoRoles()?.smart || lastLoadedModel() || null,
+          external: require('./provider-egress.cjs').isExternalProvider(provider),
+        };
+      },
+    }),
+  }),
 });
 const codeRoutes = require('./routes/code.cjs').createCodeRoutes({
   features, getProject, projects: () => PROJECTS.filter((project) => !diaryExtras.internalProject(project)), workspace: () => currentWorkspace(), json, readJson, service: codeService,

@@ -4,13 +4,19 @@
 // capability sets fixed at creation. No scheduler; callers run the work in-process.
 const fs = require('node:fs'), path = require('node:path'), crypto = require('node:crypto');
 const { boundCodePlan } = require('./code-plan.cjs');
+const { boundReviewEvent } = require('./code-review-verdict.cjs');
 const taskLifecycle = require('./task-lifecycle.cjs');
 const MAX_ASSISTANT_OUTPUT_BYTES = 32 * 1024;
 const MAX_ASSISTANT_OUTPUT_EVENT_BYTES = 1024, MAX_ASSISTANT_OUTPUT_EVENTS = 64;
 
 const TYPES = new Set(['job.created', 'job.started', 'step.started', 'step.completed', 'progress', 'approval.requested',
   'approval.decided', 'tool.started', 'tool.completed', 'tool.uncertain', 'artifact.created', 'checkpoint.created',
-  'job.completed', 'job.failed', 'job.cancelled', 'job.interrupted', 'plan.proposed', 'plan.edited', 'plan.skipped', 'assistant.output']);
+  'job.completed', 'job.failed', 'job.cancelled', 'job.interrupted', 'plan.proposed', 'plan.edited', 'plan.skipped', 'assistant.output',
+  // Astra review of a finished Code change (#519, code-review.cjs). Appended only by the
+  // harness's own review gate, never from agent or reviewer output; task-lifecycle.cjs treats
+  // them as no-ops, so a model verdict carries no lifecycle authority.
+  'review.requested', 'review.completed', 'review.failed']);
+const REVIEW_TYPES = new Set(['review.requested', 'review.completed', 'review.failed']);
 const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
 
 function derive(events) {
@@ -57,6 +63,10 @@ function derive(events) {
         break;
       }
       case 'checkpoint.created': job.checkpoint = d; break;
+      // Only a job that was reviewed ever carries `review`: every other job's derived shape,
+      // and so every API response built from it, is exactly what it was before #519.
+      case 'review.requested': case 'review.completed': case 'review.failed':
+        job.review = boundReviewEvent(e.type, d); break;
       case 'job.completed': job.status = 'completed'; job.result = d.result ?? null; job.pendingApproval = null; break;
       case 'job.failed': job.status = 'failed'; job.error = d.error ?? 'failed'; job.result = d.result ?? null; job.pendingApproval = null; break;
       case 'job.cancelled': job.status = 'cancelled'; job.result = d.result ?? null; job.pendingApproval = null; break;
@@ -148,6 +158,10 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
       const incoming = typeof data.text === 'string' ? data.text : '';
       const text = clipUtf8(incoming, MAX_ASSISTANT_OUTPUT_EVENT_BYTES);
       data = { text, truncated: data.truncated === true || text.length < incoming.length };
+    }
+    if (REVIEW_TYPES.has(type)) {
+      if (finished?.kind !== 'code') throw Error('Reviews belong to Code jobs');
+      data = boundReviewEvent(type, data);
     }
     if (finished?.kind === 'code' && (type === 'plan.proposed' || type === 'plan.edited' || type === 'plan.skipped')) {
       data = type === 'plan.skipped'

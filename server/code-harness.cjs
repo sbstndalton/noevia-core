@@ -24,6 +24,7 @@ const { classify, decide, pickOption, ACTIONS } = require('./code-actions.cjs');
 const { readUsage, readContext, readExitCode, codingIdentity, summarize } = require('./code-meta.cjs');
 const { MAX_ASSISTANT_OUTPUT_BYTES, MAX_ASSISTANT_OUTPUT_EVENTS } = require('./jobs.cjs');
 const { boundCodePlan, MAX_CODE_PLAN_ENTRIES } = require('./code-plan.cjs');
+const { REVIEW_ACTION } = require('./code-review.cjs');
 
 const MAX_TEXT = 4000;                  // what a job event keeps, as chat keeps of a tool result
 const MAX_FILE_BYTES = 8 * 1024 * 1024; // one source file, not a database the agent found
@@ -37,13 +38,13 @@ const OUTPUT_BATCH_BYTES = 1024, MAX_EARLY_FLUSHES = 30;
 function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now = Date.now, log = () => {},
   files = defaultFiles, pinConfig = require('./code-harness-config.cjs').writeHarnessConfig,
   pinnedPaths = require('./code-harness-config.cjs').cwdPinPaths,
-  engine = () => ({ baseUrl: null, apiKey: null, contextTokens: undefined }) }) {
+  engine = () => ({ baseUrl: null, apiKey: null, contextTokens: undefined }), review = null }) {
   /**
    * Start a task. `capabilities` is fixed here and never widens (§4): the job records it, and
    * every later decision is taken against this list, not against anything the agent claims.
    */
   async function start({ projectId = null, repoPath, prompt, capabilities = [], domains = [],
-    harness = 'opencode', connect, model = null, sandboxKind = 'spawn', promptPreparation = 'direct', context = '' }) {
+    harness = 'opencode', connect, model = null, sandboxKind = 'spawn', promptPreparation = 'direct', context = '', tenantId = null }) {
     if (!prompt || !String(prompt).trim()) throw Object.assign(Error('A task needs a prompt'), { status: 400 });
     if (typeof connect !== 'function') throw Object.assign(Error('No harness transport'), { status: 500 });
     const taskId = jobs.create({ kind: 'code', projectId, capabilities: [...new Set(capabilities)] });
@@ -80,11 +81,16 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
       throw error;
     }
 
+    // Astra review (#519, features.astraReview) is decided once, here, for the life of this task:
+    // flipping the flag mid-run changes nothing for a task already started. Off, `work` below is
+    // exactly what runs, with nothing wrapped around it.
+    const reviewer = review && typeof review.enabled === 'function' && review.enabled() ? review : null;
+
     // The whole body is inside the try: the grant and the worktree have to come back even when
     // something fails before the harness ever starts. Writing that first checkpoint touches the
     // disk, so it can fail for ordinary reasons — a full volume, a read-only mount — and leaving
     // it outside meant a live proxy token and a branch claimed for good.
-    jobs.run(taskId, async (ctx) => {
+    const work = async (ctx) => {
       let sessionEnd = null;
       // Set once the run has something to report, so the `finally` below knows whether a
       // corrected, post-release checkpoint is owed at all (a task that never got this far — a
@@ -179,7 +185,73 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
           }
         }
       }
-    }).catch(() => {
+    };
+
+    /**
+     * The review gate: after the harness has finished on its own, its grant is revoked and its
+     * workspace released. Astra's verdict (or the reason there is none) goes on one more approval
+     * card, and only the person's answer accepts the change. Nothing here can accept it: a
+     * failed, late or refused review asks exactly the same question, saying why it is unreviewed,
+     * and a timeout or an abort of that card is "not accepted", never an allow.
+     */
+    const reviewed = async (ctx) => {
+      const result = await work(ctx);
+      // A cancelled run is recorded as cancelled by jobs.run; there is nothing to accept.
+      if (ctx.signal.aborted) return result;
+      return reviewGate(ctx, result);
+    };
+    async function reviewGate(ctx, result) {
+      const shas = { baseSha: workspace.baseSha ?? null, headSha: released?.headSha ?? null };
+      let change = null, outcome = null;
+      try {
+        if (typeof workspaces.change !== 'function') throw Object.assign(Error('This server cannot read a task’s change.'), { code: 'unavailable' });
+        change = workspaces.change(taskId);
+      } catch (error) {
+        outcome = { ok: false, code: String(error?.code || 'no_change'), reason: String(error?.message || 'The change could not be read.').slice(0, 300) };
+      }
+      ctx.event('review.requested', { ...shas, files: change ? change.files.length : null });
+      if (!outcome) {
+        const job = jobs.get(taskId);
+        let engineKey = null;
+        try { engineKey = engine()?.apiKey || null; } catch { /* nothing to guard against then */ }
+        outcome = await reviewer.review({ signal: ctx.signal, state: {
+          taskId, tenantId, request: String(prompt), capabilities,
+          plan: job?.plan?.subQuestions?.length ? { steps: job.plan.subQuestions.map((entry) => ({ do: entry })) } : undefined,
+          execution: { headSha: shas.headSha, changedFiles: change.files.map((f) => f.path), summary: runSummary(result) },
+          change,
+          // Values the leak guard refuses to let through, should the diff carry them.
+          credentials: engineKey ? { engine: engineKey } : undefined,
+          tokens: grant?.token ? [grant.token] : undefined,
+        } });
+      }
+      if (ctx.signal.aborted) return result;
+      if (outcome.ok) ctx.event('review.completed', { ...shas, ...outcome.verdict, corrected: outcome.corrected === true });
+      else ctx.event('review.failed', { ...shas, code: outcome.code, reason: outcome.reason });
+      const recorded = jobs.get(taskId)?.review || null;
+      const files = change ? change.files.map((f) => f.path) : [];
+      const request = {
+        taskId, action: REVIEW_ACTION, title: 'Accept this change', kind: 'review', command: '',
+        paths: files.slice(0, 50),
+        reason: outcome.ok
+          ? 'Astra’s verdict is advice. Accepting records this reviewed head as accepted; nothing is merged automatically.'
+          : `Not reviewed: ${outcome.reason} Review the change on its branch yourself before accepting it.`,
+        // What is being accepted, in full: the branch and the exact commits.
+        arguments: { branch: workspace.branch, baseSha: shas.baseSha, headSha: shas.headSha, files },
+        diff: null,
+        review: recorded,
+      };
+      ctx.event('approval.requested', request);
+      const answer = await askApproval(request, { signal: ctx.signal });
+      ctx.event('approval.decided', { decision: answer, action: REVIEW_ACTION });
+      log({ at: now(), taskId, event: 'code.review_decided', decision: answer, reviewed: outcome.ok });
+      // Only the person's own yes accepts. "Allow for this task" means nothing more here than
+      // once: there is no later card for it to stand in for.
+      const accepted = answer === 'approve' || answer === 'approve_all';
+      return { ...result, review: { reviewed: outcome.ok, verdict: outcome.ok ? outcome.verdict.verdict : null,
+        accepted, decision: answer, headSha: shas.headSha } };
+    }
+
+    jobs.run(taskId, reviewer ? reviewed : work).catch(() => {
       // jobs.run records the failure when it can; when it could not even record the start, the
       // work never ran, so the grant and the claim are given back here instead.
       cleanup();
@@ -454,6 +526,12 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
   }
 
   function cancel(taskId) { return jobs.cancel(taskId); }
+
+  /** A server-side line about the run for the reviewer: counts noevia kept, not the agent's words. */
+  function runSummary(result = {}) {
+    const n = (v) => (Number.isInteger(v) ? v : 0);
+    return `${n(result.tools)} tool calls; ${n(result.allowed)} allowed, ${n(result.refused)} declined by the person, ${n(result.denied)} refused by noevia.`;
+  }
 
   return { start, cancel, canStand };
 }

@@ -68,6 +68,9 @@ function view(job, pending = null) {
     steps: job.steps, plan: job.plan, assistantOutput: job.assistantOutput,
     approval: pending ? { id: pending.id, ...pending.request } : null,
     result: job.result || null,
+    // Astra's verdict (#519), only on a task that was reviewed: every other task's view is
+    // exactly what it was before the review step existed.
+    ...(job.review ? { review: job.review } : {}),
   };
 }
 
@@ -78,7 +81,7 @@ function view(job, pending = null) {
 function createCodeService({ repos, connect, egress = null, engine = undefined, now = Date.now, log = () => {},
   timeoutMs = APPROVAL_TIMEOUT_MS, sandboxKind = process.env.CODE_HARNESS_ENDPOINT ? 'sandbox' : 'spawn',
   harnesses = defaultHarnesses(), treeRoot = process.env.CODE_WORKSPACE_ROOT || null,
-  harnessUser = parseUser(process.env.CODE_HARNESS_USER), sharedContext = () => '' }) {
+  harnessUser = parseUser(process.env.CODE_HARNESS_USER), sharedContext = () => '', review = null }) {
   const repositories = Array.isArray(repos) ? repos : parseRepos(repos);
   // Approvals live in memory on purpose, exactly as the chat gate does: a decision that
   // outlives the request it belongs to is not a decision, and a restart must re-ask.
@@ -107,7 +110,7 @@ function createCodeService({ repos, connect, egress = null, engine = undefined, 
       const workspaces = createCodeWorkspaces({ dir: workspace.dir, treeRoot, owner: harnessUser, now });
       workspaces.recover();
       const harness = createCodeHarness({ jobs: store, workspaces, egress, log, now, askApproval,
-        ...(engine ? { engine } : {}) });
+        ...(engine ? { engine } : {}), ...(review ? { review } : {}) });
       store = { jobs: store, workspaces, harness };
       stores.set(workspace, store);
     }
@@ -208,7 +211,9 @@ function createCodeService({ repos, connect, egress = null, engine = undefined, 
       const started = await harness.start({ projectId: project.id, repoPath: repo.path, prompt,
         capabilities, domains, connect, model: body.model ? String(body.model) : null, sandboxKind,
         harness: harnessId, promptPreparation: preparation.id,
-        context: String(sharedContext(workspace, project) || '') });
+        context: String(sharedContext(workspace, project) || ''),
+        // Whose task this is, for the review's context guard (role-context.cjs requires it).
+        tenantId: typeof workspace.userId === 'string' ? workspace.userId : null });
       return { ...started, repository: repo.id, capabilities, domains, harness: harnessId, promptPreparation: preparation.id,
         sharedContext: require('./shared-context.cjs').read(project).code };
     },

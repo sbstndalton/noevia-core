@@ -109,9 +109,15 @@ function pinnedPaths(list) {
     .filter((p) => p && !path.isAbsolute(p) && !p.split(/[\\/]/).includes('..') && /^[\w./-]+$/.test(p));
 }
 
-function defaultRun(args, cwd, env = {}) {
-  return execFileSync('git', args, { cwd, env: { ...process.env, ...env }, encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000 }).trim();
+// A diff read for review may be larger than execFileSync's 1 MiB default; the reviewer's own
+// projection bounds what is sent on.
+const CHANGE_MAX_BUFFER = 16 * 1024 * 1024;
+
+/** `options.maxBuffer` overrides the default; `options.raw` keeps the output untrimmed. */
+function defaultRun(args, cwd, env = {}, { maxBuffer, raw = false } = {}) {
+  const out = execFileSync('git', args, { cwd, env: { ...process.env, ...env }, encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000, ...(maxBuffer ? { maxBuffer } : {}) });
+  return raw ? out : out.trim();
 }
 
 /**
@@ -131,7 +137,7 @@ function defaultRun(args, cwd, env = {}) {
  */
 function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaultRun,
   now = Date.now, epoch = String(process.pid), chown = defaultChown, mode = owner ? 'clone' : 'worktree',
-  rm = (target) => fs.rmSync(target, { recursive: true, force: true }) } = {}) {
+  rm = (target) => fs.rmSync(target, { recursive: true, force: true }), changeMaxBuffer = CHANGE_MAX_BUFFER } = {}) {
   const root = path.join(dir, 'code-workspaces');
   // git refuses to read a repository owned by another user, and that refusal is only liftable
   // from a config FILE — not `-c safe.directory`, not GIT_CONFIG_*. On a shared volume the
@@ -476,9 +482,54 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
       });
   }
 
+  /**
+   * What a released task changed, for the Astra review (#519): `git diff base..head` read from the
+   * SOURCE repository, exactly as `branchHead()` is — never the harness's tree, which may be gone
+   * or hostile. Only a cleanly released claim is diffed (a stuck one is for a human to inspect),
+   * both ends must be real commit ids noevia recorded itself, and every diff driver, textconv and
+   * external diff is switched off, so content fetched from the harness never runs anything.
+   * Returns `{ baseSha, headSha, files: [{ path, patch }] }`; throws with a plain reason
+   * otherwise. The caller bounds what it sends on (role-context.cjs `capChange`).
+   */
+  function change(taskId, { maxFiles = 200 } = {}) {
+    const record = read(taskId);
+    if (!record) throw Object.assign(Error('The task holds no workspace record.'), { code: 'no_workspace' });
+    if (record.status !== 'released') throw Object.assign(Error('The workspace was not released cleanly, so its change was not read.'), { code: 'not_released' });
+    const sha = /^[0-9a-f]{7,64}$/;
+    if (!sha.test(String(record.baseSha || ''))) throw Object.assign(Error('The repository had no base commit to compare against.'), { code: 'no_base' });
+    if (!sha.test(String(record.headSha || ''))) throw Object.assign(Error('The task branch has no commit to review.'), { code: 'no_head' });
+    if (record.baseSha === record.headSha) throw Object.assign(Error('The task made no commits, so there is nothing to review.'), { code: 'no_change' });
+    const DIFF = [...HOSTILE_OFF, 'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--no-renames'];
+    // Its own buffer: the default 1 MiB would turn a large change into a raw ENOBUFS on the card.
+    // What is sent on is bounded later (capChange); this only has to hold what git prints.
+    const opts = { maxBuffer: changeMaxBuffer, raw: true };
+    const git = (args) => {
+      try { return String(run(args, record.repo, gitEnv(), opts) ?? ''); }
+      catch (error) {
+        // Plain reasons only: the command line and git's own words never reach the card.
+        if (error?.code === 'ENOBUFS' || /ENOBUFS|maxBuffer/i.test(String(error?.message || ''))) {
+          throw Object.assign(Error('The change is too large to review.'), { code: 'too_large' });
+        }
+        throw Object.assign(Error('The change could not be read.'), { code: 'unreadable' });
+      }
+    };
+    // Names come from git's own NUL-separated list, never from a patch body: a content line of
+    // `+++ b/decoy.js`, or a quoted name that a regex falls through, would let the agent choose
+    // the path the card shows. Both commands see the same trees with the same flags, so git lists
+    // the files in the same order as the patches it prints.
+    const names = git([...DIFF, '--name-only', '-z', record.baseSha, record.headSha, '--']).split('\0').filter(Boolean);
+    const text = git([...DIFF, '--unified=3', record.baseSha, record.headSha, '--']);
+    // A hunk line always starts with ' ', '+', '-', '\' or '@', and git quotes a newline in a
+    // name, so only a real file header starts a line with `diff --git `.
+    const chunks = text.split(/^(?=diff --git )/m).filter((c) => c.startsWith('diff --git '));
+    if (chunks.length !== names.length) throw Object.assign(Error('The change could not be read.'), { code: 'unreadable' });
+    const files = chunks.slice(0, maxFiles).map((chunk, i) => ({ path: names[i], patch: chunk.replace(/\n$/, '') }));
+    return { baseSha: record.baseSha, headSha: record.headSha, files, truncated: names.length > maxFiles };
+  }
+
   // `owner` is public so anything else noevia writes into a workspace (the harness's own
   // config file) can be handed over the same way the worktree is.
-  return { claim, release, recover, contains, headSha, get: read, list, root, owner, BRANCH_PREFIX };
+  return { claim, release, recover, contains, headSha, change, get: read, list, root, owner, BRANCH_PREFIX };
 }
 
 /** Recursive chown, so the harness owns the tree and git's own files inside it. */
