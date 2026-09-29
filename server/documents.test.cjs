@@ -295,3 +295,29 @@ test('retrieval fallback stays within the files-context budget, smallest first, 
   const omitted = Number(manifest.match(/ (\d+) more files not included/)[1]);
   assert.equal(included + omitted, files.length);
 });
+
+test('#577: with Docling live, text-like types stay on the plain-text path and SKILL.md yields a readable Skill awaiting review', async () => {
+  const prev = process.env.DOCLING_BASE_URL; process.env.DOCLING_BASE_URL = 'http://synthetic-docling';
+  try {
+    for (const name of ['a.md', 'A.MARKDOWN', 'a.txt', 'a.csv', 'a.json', 'a.yaml', 'a.yml', 'a.ts', 'a.py', 'a.sh', 'SKILL.md']) {
+      assert.equal(documents.isDocument(name), false, name);
+    }
+    assert.equal(documents.isDocument('a.docx'), true);
+    assert.equal(documents.isDocument('a.pdf'), true);
+    const h = harness(true);
+    const skill = '---\nname: synthetic-skill\ndescription: Synthetic skill for tests\n---\n\nDo the synthetic thing.\n';
+    const out = await h.upload('SKILL.md', Buffer.from(skill), h.project.id, true);
+    assert.equal(out.status, 200, JSON.stringify(out));
+    const file = h.project.files.find(f => f.name.endsWith('SKILL.md'));
+    assert.equal(file.attachment.state, 'ready');
+    assert.equal(file.content, skill);
+    const listed = require('./instruction-skills.cjs').list(h.project);
+    assert.equal(listed.length, 1);
+    assert.equal(listed[0].status, 'review');
+    for (const name of ['notes.md', 'data.csv', 'conf.json', 'conf.yaml']) {
+      const r = await h.upload(name, Buffer.from('synthetic text'), h.project.id, true);
+      assert.equal(r.status, 200, name);
+      assert.equal(r.body.attachment.state, 'ready', name);
+    }
+  } finally { if (prev === undefined) delete process.env.DOCLING_BASE_URL; else process.env.DOCLING_BASE_URL = prev; }
+});

@@ -35,7 +35,12 @@ const DOCUMENT_EXTENSIONS = new Set(['.pdf']);
 // never disagree about what is readable: the first version read the env var
 // here while extractDocumentText took the backend as an option, so a caller
 // that asked for Docling was still refused .xlsx by the gate in front of it.
+// Text-like files are read as text by the upload path, never sent to an extractor.
+// Docling lists .md and .csv as inputs, but its Markdown reader rejects ordinary
+// Markdown (including SKILL.md), which left the file stored as "Not readable" (#577).
+const PLAIN_TEXT = /\.(txt|md|markdown|csv|json|ya?ml|ts|tsx|js|jsx|py|sh|css)$/i;
 function isDocument(name, doclingEnabled = docling.enabled()) {
+  if (PLAIN_TEXT.test(String(name || ''))) return false;
   return doclingEnabled ? docling.supports(name) : /\.pdf$/i.test(String(name || ''));
 }
 function documentExtensions(doclingEnabled = docling.enabled()) {

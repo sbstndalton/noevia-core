@@ -19,7 +19,7 @@ function keepAlongside() {
   return [...(e && e !== 'default' ? [e] : []), ...(r ? [r] : [])];
 }
 
-function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig = {}, calibrationStatePath, calibrationOptions = {}, evidenceDir, autotuneStatePath, autotuneTablePath, autotuneOptions = {}, presetWriter = null }) {
+function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig = {}, calibrationStatePath, calibrationOptions = {}, evidenceDir, autotuneStatePath, autotuneTablePath, autotuneOptions = {}, presetWriter = null, unloadWait = {} }) {
   const base = String(baseUrl || '').replace(/\/+$/, '').replace(/\/v1$/, '');
   const url = new URL(base);
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw Error('Invalid llama.cpp router URL');
@@ -119,9 +119,20 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
       if (!result.ok) throw admissionError('Another model could not be unloaded. Try again when it is idle.');
     }
     if (others.length) {
-      const updated = await rawModels(signal);
-      if (!updated.ok || !Array.isArray(updated.body?.data) || updated.body.data.some(m => m.id !== model && !keep.includes(m.id) && ['loaded', 'loading'].includes(m.status?.value))) {
-        throw admissionError('Another model is still loaded. Try again when it is idle.');
+      // The router acknowledges /models/unload before the process has exited, so the listing can
+      // still show the old model as loaded for a few seconds. Wait for it to actually leave
+      // (bounded, with backoff) instead of failing the first switch and succeeding on retry.
+      const timeoutMs = unloadWait.timeoutMs ?? 30000, sleep = unloadWait.sleep || (ms => new Promise(resolve => setTimeout(resolve, ms)));
+      const deadline = Date.now() + timeoutMs;
+      let delay = 100;
+      for (;;) {
+        const updated = await rawModels(signal);
+        if (!updated.ok || !Array.isArray(updated.body?.data)) throw admissionError('Could not check loaded models after unloading. Try again.');
+        if (!updated.body.data.some(m => m.id !== model && !keep.includes(m.id) && ['loaded', 'loading'].includes(m.status?.value))) break;
+        if (Date.now() >= deadline) throw admissionError(`Another model was still unloading after ${Math.round(timeoutMs / 1000)} seconds. Try again when it is idle.`);
+        signal?.throwIfAborted();
+        await sleep(delay);
+        delay = Math.min(delay * 2, 1000);
       }
     }
   }

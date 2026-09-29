@@ -222,7 +222,7 @@ test('a failed or unconfirmed eviction stops native admission, including the cha
 
 test('a newly appearing loaded model after eviction blocks native admission',async()=>{
  const calls=[],state={alpha:'loaded',beta:'unloaded'};
- const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async(url,options={})=>{
+ const manager=require('./llamacpp-manager.cjs').createLlamaCppManager({unloadWait:{timeoutMs:0},baseUrl:'http://synthetic',fetchJson:async(url,options={})=>{
   const route=new URL(url).pathname,body=options.body?JSON.parse(options.body):{};
   calls.push(`${options.method||'GET'} ${route}${body.model?' '+body.model:''}`);
   if(route==='/models')return {ok:true,status:200,body:{data:Object.entries(state).map(([id,value])=>({id,status:{value}}))}};
@@ -332,4 +332,23 @@ test('removeModel gives up after the retry and still reports whether anything ac
 test('forgetIdentity drops a cached identity without needing a live request',async()=>{
  const manager=createModelManager({fetchStream:async()=>({ok:false}),kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async()=>({ok:true,status:200,body:{}})});
  assert.doesNotThrow(()=>manager.forgetIdentity('whatever-not-cached'));
+});
+
+test('#578: switching models waits for the old model to finish unloading instead of failing the first time', async () => {
+ const {createLlamaCppManager}=require('./llamacpp-manager.cjs');
+ for(const [polls,timeoutMs,expectOk] of [[3,30000,true],[1000,0,false]]){
+  const state={'chat-a':'loaded','chat-b':'unloaded'};let stillLoaded=polls,unloadedAt=false,sleeps=[],loadedBeforeUnloadDone=false;
+  const manager=createLlamaCppManager({baseUrl:'http://synthetic',unloadWait:{timeoutMs,sleep:async ms=>{sleeps.push(ms);}},fetchJson:async(url,options={})=>{
+   const path=new URL(url).pathname,body=options.body?JSON.parse(options.body):{};
+   if(path==='/models/unload'){unloadedAt=true;return {ok:true,status:200,body:{success:true}};}
+   if(path==='/models/load'){loadedBeforeUnloadDone=state['chat-a']==='loaded';state[body.model]='loaded';return {ok:true,status:200,body:{success:true}};}
+   if(path==='/models'){if(unloadedAt&&stillLoaded>0){stillLoaded--;if(stillLoaded===0)state['chat-a']='unloaded';}
+    return {ok:true,status:200,body:{data:Object.entries(state).map(([id,value])=>({id,status:{value}}))}};}
+   throw Error('unexpected '+path);
+  }});
+  const result=await manager.load('chat-b');
+  assert.equal(result.ok,expectOk,JSON.stringify(result));
+  if(expectOk){assert.equal(loadedBeforeUnloadDone,false,'load only after unload finished');assert.ok(sleeps.length>=1);assert.ok(sleeps.every((v,i)=>i===0||v>=sleeps[i-1]),'backoff does not shrink');}
+  else{assert.equal(result.status,409);assert.match(result.body.error,/still unloading/);}
+ }
 });
