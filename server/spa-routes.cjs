@@ -25,6 +25,9 @@ const CLIENT_ROUTES = [
   /^\/settings\/[a-z][a-z0-9-]{0,39}\/?$/,
   /^\/(customise|customize|plugins)\/(skills|connectors|plugins|mcp|connected)\/?$/,
   new RegExp(`^/models/${SEG}$`),
+  // #555: the native-app approval page. routes/device-auth.cjs answers 404 first while the
+  // nativeClientAuth feature is off.
+  /^\/device\/?$/,
 ];
 
 function isClientRoute(pathname) {

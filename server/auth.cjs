@@ -211,6 +211,9 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
     db.exec('ALTER TABLE user_features ADD COLUMN insights_seen_at INTEGER');
   }
   db.prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(5, unixepoch() * 1000)').run();
+  // Native-client device grants (#555, device-auth.cjs). The tables exist whether or not the
+  // feature is on, so disabling an account or resetting its password always revokes them.
+  require('./device-auth.cjs').ensureDeviceSchema(db);
 
   const setting = (key) => db.prepare('SELECT value FROM settings WHERE key=?').get(key)?.value;
   const configuredOrigin = setting('public_origin');
@@ -571,6 +574,7 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       db.prepare('UPDATE users SET disabled_at=?,updated_at=? WHERE id=?').run(disabled ? Date.now() : null, Date.now(), userId);
       if (disabled) {
         db.prepare('DELETE FROM sessions WHERE user_id=?').run(userId);
+        db.prepare('DELETE FROM device_grants WHERE user_id=?').run(userId);
         // A disabled admin's still-open invitations must not outlive them.
         db.prepare('DELETE FROM invitations WHERE created_by=? AND used_at IS NULL').run(userId);
       }
@@ -588,6 +592,7 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       const claimed = db.transaction(() => {
         if (db.prepare('UPDATE recoveries SET used_at=? WHERE token_hash=? AND used_at IS NULL').run(Date.now(), row.token_hash).changes !== 1) return false;
         db.prepare('UPDATE users SET password_hash=?,updated_at=? WHERE id=?').run(passwordHash, Date.now(), row.user_id); db.prepare('DELETE FROM sessions WHERE user_id=?').run(row.user_id);
+        db.prepare('DELETE FROM device_grants WHERE user_id=?').run(row.user_id);
         return true;
       })();
       if (!claimed) return false;

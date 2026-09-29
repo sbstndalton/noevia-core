@@ -37,6 +37,9 @@ const REGISTRY = Object.freeze({
   constrainedPlanDecoding: { env: 'NOEVIA_FEATURE_CONSTRAINED_PLAN_DECODING', experimental: true, unavailable: () => 'Not used yet: no server-side plan generator.',label: 'Constrained plan decoding', description: 'Ask the local llama.cpp engine to constrain the plan artifact to its JSON schema. Adds to the after-the-fact validation and falls back to unconstrained generation for reasoning models or when the engine rejects it.' },
   kiwix: { env: 'NOEVIA_FEATURE_KIWIX', restart: true, label: 'Offline Wikipedia', description: 'A read-only lookup tool backed by an internal kiwix-serve.' },
   chatgptOAuth: { env: 'NOEVIA_FEATURE_CHATGPT_OAUTH', label: 'Sign in with ChatGPT', description: 'Let each person connect their own ChatGPT account as a private AI provider. Chats that use it are sent to OpenAI; Diary text, Diary tools and project images never are.' },
+  // Review N3: behind a reverse proxy (the Cloudflare tunnel) without TRUST_PROXY every request
+  // carries the proxy's address, so per-client sign-in limits would be one shared bucket.
+  nativeClientAuth: { env: 'NOEVIA_FEATURE_NATIVE_CLIENT_AUTH', unavailable: env => (env.TRUST_PROXY === 'true' ? null : 'Needs TRUST_PROXY on so sign-in limits can tell clients apart.'), label: 'Native app sign-in', description: 'Let a native app (such as the macOS client) sign in by showing a short code that you approve in this browser. Each device gets its own token, listed with a Revoke button under Security and login. A device acts as you for chats, projects and the Diary, but never for administration or security settings. Turning this off signs every device out for good: their tokens are deleted and each device must be approved again.' },
 });
 
 const SETTING_PREFIX = 'feature:';
@@ -53,7 +56,7 @@ function parseEnv(raw) {
  * @param {{ env?: Record<string,string|undefined>, store?: { get(key:string): string|undefined, set(key:string, value:string): void },
  *           audit?: (action:string, actor:string, detail:object)=>void, registry?: object }} deps
  */
-function createFeatures({ env = process.env, store = null, audit = () => {}, registry = REGISTRY, availability = {} } = {}) {
+function createFeatures({ env = process.env, store = null, audit = () => {}, registry = REGISTRY, availability = {}, onChange = () => {} } = {}) {
   const state = new Map();
   for (const [name, spec] of Object.entries(registry)) {
     const fromEnv = parseEnv(env[spec.env]);
@@ -91,6 +94,8 @@ function createFeatures({ env = process.env, store = null, audit = () => {}, reg
       store.set(SETTING_PREFIX + name, String(enabled));
       state.set(name, { ...state.get(name), value: enabled, source: 'admin' });
       audit('feature.set', actorId, { name, enabled });
+      // Side effects a change must have (e.g. nativeClientAuth off revokes every device, #555 F4).
+      onChange(name, enabled, actorId);
       return enabled;
     },
   };

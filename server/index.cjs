@@ -93,7 +93,10 @@ const authService = createAuth({
     .filter(Boolean),
 });
 const decisionSettings = require('./decision-settings.cjs').createDecisionSettings({ store: require('./features.cjs').settingsStore(authService.db), audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail) });
-const features = require('./features.cjs').createFeatures({ store: require('./features.cjs').settingsStore(authService.db), audit: (action, actor, detail) => authService.audit(action, actor, actor, detail), availability:{stepSupervision:decisionSettings.unavailable,toolGate:decisionSettings.unavailable,systemOneRouting:()=>decisionSettings.unavailable() && require('./system-one-router.cjs').configuration().reason} });
+const features = require('./features.cjs').createFeatures({ store: require('./features.cjs').settingsStore(authService.db), audit: (action, actor, detail) => authService.audit(action, actor, actor, detail),
+  // #555 F4: switching native-app sign-in off is a revoke, not a pause (deviceAuth is built below).
+  onChange: (name, enabled, actorId) => { if (name === 'nativeClientAuth' && !enabled) deviceAuth.revokeAll(actorId, 'feature-off'); },
+  availability:{stepSupervision:decisionSettings.unavailable,toolGate:decisionSettings.unavailable,systemOneRouting:()=>decisionSettings.unavailable() && require('./system-one-router.cjs').configuration().reason} });
 const featureRoutes = require('./routes/features.cjs').createFeatureRoutes({ features, json, readJson, decisionSettings });
 const pluginDirectoryRoutes = require('./routes/plugin-directory.cjs').createPluginDirectoryRoutes({ json });
 // Settings → Data: the signed-in user's conversations as a ZIP (routes/export.cjs).
@@ -626,6 +629,20 @@ const publicAuthRoutes = new Set([
   '/api/auth/login/passkey/options', '/api/auth/login/passkey/verify',
   '/api/auth/invitations/accept', '/api/auth/recovery/complete',
 ]);
+// Native-client sign-in (#555): the RFC 8628 device flow and per-device tokens (device-auth.cjs),
+// only while features.nativeClientAuth is on. requestAuth is the router's single credential check.
+const nativeClientAuth = () => features.enabled('nativeClientAuth');
+const deviceAuth = require('./device-auth.cjs').createDeviceAuth({
+  db: authService.db, audit: authService.audit, publicUser: authService.publicUser, rate: createRateLimiter(),
+  clientAddress: (req) => require('./auth.cjs').clientAddress(req, process.env.TRUST_PROXY === 'true'),
+  origin: () => authService.origin || process.env.PUBLIC_ORIGIN || '',
+  // Without TRUST_PROXY every request carries the tunnel's address: not shown, not rate-limited on.
+  addressesTrusted: process.env.TRUST_PROXY === 'true',
+});
+// Started with the feature off: grants from an earlier "on" period are revoked, not kept dormant.
+if (!nativeClientAuth()) deviceAuth.revokeAll(null, 'feature-off');
+const requestAuth = require('./device-auth.cjs').createRequestAuth({ enabled: nativeClientAuth, deviceAuth, authService });
+const deviceRoutes = require('./routes/device-auth.cjs').createDeviceAuthRoutes({ json, authResult, readJson, deviceAuth, authService, enabled: nativeClientAuth });
 const authRoutes = require('./routes/auth.cjs').createAuthRoutes({
   json, authResult, readJson, authService, publicAuthRoutes, davSettings, davConfig, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, diaryTenantHeaders: diary.tenantHeaders, env: process.env,
   mcpOAuth, directoryMcp, chatgptOAuth,
@@ -680,8 +697,9 @@ const mcpDirectoryRoutes = require('./routes/mcp-directory.cjs').createMcpDirect
 });
 
 async function handleRequestInner(req, res) {
-  const preAuth = authService.authenticate(req);
-  const workspace = preAuth ? workspaceStore.get(preAuth.user.id, { claim: preAuth.user.role === 'admin' }) : null;
+  const preAuth = requestAuth.authenticate(req);
+  // accountRole: a device token acts as a member, but its account's workspace is the same one.
+  const workspace = preAuth ? workspaceStore.get(preAuth.user.id, { claim: (preAuth.accountRole || preAuth.user.role) === 'admin' }) : null;
   if (workspace && preAuth.user.role === 'admin' && authService.diaryEnabled(preAuth.user.id) && fs.existsSync(path.join(workspace.dir, 'migration.json')) &&
       process.env.CORPUS_BACKEND === 'webdav' && authService.getStorage(preAuth.user.id).kind === 'local') {
     authService.saveStorage(preAuth.user.id, { kind: 'webdav', baseUrl: process.env.WEBDAV_BASE_URL || '', username: process.env.WEBDAV_USERNAME || '', secret: process.env.WEBDAV_PASSWORD || '', corpusRoot: process.env.CORPUS_ROOT || '' });
@@ -704,14 +722,19 @@ async function handleRequestScoped(req, res) {
     }
     if (await diaryRoutes.connector(req, res, { path: p })) return;
     if ((p === '/api/instance' || p === '/.well-known/webauthn') && await webAddressRoutes(req, res, { path: p, authn: null })) return;
+    if (await deviceRoutes.open(req, res, { path: p })) return;
     if (await authRoutes.open(req, res, { path: p })) return;
     if (await readyRoutes(req, res, { path: p })) return;
 
-    const authn = p.startsWith('/api/') ? authService.authenticate(req) : null;
+    const authn = p.startsWith('/api/') ? requestAuth.authenticate(req) : null;
     if (p.startsWith('/api/') && !publicAuthRoutes.has(p) && !authn) return unauthorized(res);
-    if (authn && !['GET', 'HEAD', 'OPTIONS'].includes(req.method || 'GET') && (!authService.originValid(req) || !authService.csrfValid(req, authn))) {
+    if (authn && !['GET', 'HEAD', 'OPTIONS'].includes(req.method || 'GET') && (!authService.originValid(req) || !requestAuth.csrfValid(req, authn))) {
       return json(res, 403, { error: 'invalid CSRF token' });
     }
+    if (requestAuth.browserOnly(authn, p, req.method || 'GET')) {
+      return json(res, 403, { error: 'This needs a signed-in browser session.', code: 'browser_session_required' });
+    }
+    if (authn && await deviceRoutes.account(req, res, { path: p, authn })) return;
     if (authn && await featureRoutes(req, res, { path: p, authn })) return;
     if (authn && await exportRoutes(req, res, { path: p, authn })) return;
     if (authn && await importRoutes(req, res, { path: p, authn })) return;
