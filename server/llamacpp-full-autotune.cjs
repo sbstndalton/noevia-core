@@ -44,9 +44,15 @@ const snippetOf = text => {
   const flat = String(text).replace(/[\p{Cc}\p{Zl}\p{Zp}]+/gu, ' ').replace(/\s+/g, ' ').trim();
   return flat.length > 24 ? flat.slice(0, 23) + '…' : flat;
 };
-async function qualityCheck(model, chat) {
+// #328: the gate is relative. A baseline measured once per model at its reference settings (f16
+// KV cache and drafting off, or the current profile when f16 does not load) decides which probes
+// can discriminate for this model: a probe the model already gets wrong there says nothing about
+// the tuned settings, so candidates are judged only on the probes the baseline passed and are not
+// sent the others. Without a baseline (an older resumed job) every probe is required, as before.
+async function qualityCheck(model, chat, baseline = null) {
   const checks = [];
-  for (const q of QUALITY) {
+  const probes = baseline ? QUALITY.filter(q => baseline.probes.includes(q.id)) : QUALITY;
+  for (const q of probes) {
     const r = await chat(model, q.prompt, qualityBudget(model));
     const answer = typeof r?.text === 'string' ? normalizedAnswer(r.text) : '';
     const reason = r?.failure || (r?.finishReason === 'length' ? 'truncated' : !answer ? 'no response' :
@@ -54,11 +60,26 @@ async function qualityCheck(model, chat) {
     checks.push({ id: q.id, passed: !reason, ...(reason ? { reason } : {}),
       ...(reason === 'mismatch' ? { answer: snippetOf(r.text) } : {}) });
   }
-  return { passed: checks.every(c => c.passed), checks };
+  const skipped = baseline ? baseline.skipped.map(s => s.id) : [];
+  return { passed: checks.every(c => c.passed), checks, ...(skipped.length ? { skipped } : {}) };
 }
 const qualityFailure = quality => 'Quality checks failed: ' + quality.checks.filter(c => !c.passed)
   .map(c => c.id + ' (' + c.reason + ')').join(', ') + '.' + quality.checks
   .filter(c => !c.passed && c.answer).map(c => ' Answered ' + c.id + ': "' + c.answer + '".').join('');
+// An HTTP error is the engine failing, not the model answering: it cannot mark a probe as one the
+// model gets wrong, so a baseline with one is not usable.
+const engineFailed = quality => quality.checks.some(c => /^HTTP\b/.test(c.reason || ''));
+const REFERENCE_LABEL = { f16: 'f16 KV cache, drafting off', current: 'the current settings, drafting off' };
+function baselineOf(reference, quality) {
+  return { reference, probes: quality.checks.filter(c => c.passed).map(c => c.id),
+    skipped: quality.checks.filter(c => !c.passed).map(c => ({ id: c.id, reason: c.reason, ...(c.answer ? { answer: c.answer } : {}) })) };
+}
+const baselineSummary = b => 'Quality baseline at ' + REFERENCE_LABEL[b.reference] + ': ' + [
+  ...b.probes.map(id => id + ' passed'),
+  ...b.skipped.map(s => s.id + ' skipped (the model gets this wrong at its reference settings'
+    + (s.answer ? '; answered "' + s.answer + '"' : '') + ')'),
+].join(', ') + '.';
+const NO_PROBE_PASSED = 'The model failed every quality probe at its reference settings, so auto-tune cannot tell whether a setting harms it.';
 const hash = value => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const sorted = value => Object.fromEntries(Object.entries(value || {}).sort(([a], [b]) => a.localeCompare(b)));
 const cancelledError = () => Object.assign(Error('Cancelled'), { cancelled: true });
@@ -103,7 +124,8 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
   const note = (j, text) => { (j.log ||= []).push({ at: now(), text }); if (j.log.length > 400) j.log.shift(); save(); };
   const phaseOf = (item, id) => item.phases.find(p => p.id === id);
   const currentPhase = item => item.phases.find(p => p.status !== 'passed');
-  const status = model => ({ ok: true, status: 200, body: { job: publicJob(state.job), history: model ? state.history[model] || [] : [] } });
+  // kvCandidates: the list this server really tries, so the panel never describes another build's.
+  const status = model => ({ ok: true, status: 200, body: { job: publicJob(state.job), history: model ? state.history[model] || [] : [], kvCandidates: kvCandidates() } });
   async function signature(model, suppliedIdentity) {
     const identity = suppliedIdentity || await identityFor(model);
     if (!identity) throw publicFail('Model identity could not be read.');
@@ -206,8 +228,10 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
     }
     throw Error('Loading the test profile timed out.');
   }
-  async function validate(model) {
-    const quality = await qualityCheck(model, chat);
+  // The baseline of the model being tuned, once it has at least one discriminative probe.
+  const gate = model => { const b = state.job?.models?.find(m => m.model === model)?.baseline; return b?.probes?.length ? b : null; };
+  async function validate(model, measured = null) {
+    const quality = measured || await qualityCheck(model, chat, gate(model));
     if (!quality.passed) throw Error(qualityFailure(quality));
     const workloads = [];
     for (const w of WORKLOADS) {
@@ -280,9 +304,47 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
     if (measured.appliedCtx !== committed) {
       await write(j, { 'ctx-size': String(committed) });
       await load(j);
-      const final = await qualityCheck(j.model, chat);
+      const final = await qualityCheck(j.model, chat, gate(j.model));
       if (!final.passed) throw Error(qualityFailure(final));
     }
+  }
+  const BASELINE_KEYS = ['cache-type-k', 'cache-type-v', 'spec-type', 'spec-draft-n-max', 'spec-draft-p-min'];
+  const REFERENCE = { 'cache-type-k': 'f16', 'cache-type-v': 'f16', 'spec-type': 'none', 'spec-draft-n-max': '', 'spec-draft-p-min': '' };
+  const keysOf = options => Object.fromEntries(BASELINE_KEYS.map(k => [k, options[k] || '']));
+  // Records the baseline on the model's queue entry (kept across Resume) and stops the job when
+  // no probe passed: then no setting can be judged. That is fatal on purpose, so the optional
+  // sampling phase cannot swallow it.
+  function setBaseline(j, reference, quality) {
+    const item = j.models.find(m => m.model === j.model);
+    item.baseline = baselineOf(reference, quality); save();
+    note(j, baselineSummary(item.baseline));
+    if (!item.baseline.probes.length) throw Object.assign(Error(NO_PROBE_PASSED + ' ' + qualityFailure(quality)), { fatal: true, publicMessage: NO_PROBE_PASSED });
+    return item.baseline;
+  }
+  // Measures the baseline when a phase needs it before the KV phase's f16 candidate can supply it
+  // (sampling about to be applied, or f16 did not load). Tries f16 first, then the settings the
+  // phase started from, and always leaves the KV and drafting keys as it found them.
+  async function ensureBaseline(j, original, { tryF16 = true } = {}) {
+    if (gate(j.model)) return;
+    const restore = keysOf(original);
+    const attempt = async (reference, options) => {
+      check(); note(j, 'Measuring the quality baseline at ' + REFERENCE_LABEL[reference] + '.');
+      try {
+        await write(j, options); await load(j);
+        const quality = await qualityCheck(j.model, chat);
+        if (engineFailed(quality)) throw Error(qualityFailure(quality));
+        return quality;
+      } catch (e) {
+        if (e.fatal || e.cancelled || cancelled) throw e;
+        note(j, 'The baseline at ' + REFERENCE_LABEL[reference] + ' could not be measured: ' + e.message);
+        return null;
+      }
+    };
+    let reference = 'f16', quality = tryF16 ? await attempt('f16', REFERENCE) : null;
+    if (!quality) { reference = 'current'; quality = await attempt('current', { ...restore, 'spec-type': 'none', 'spec-draft-n-max': '', 'spec-draft-p-min': '' }); }
+    await write(j, restore);
+    if (!quality) throw Object.assign(Error('The quality baseline could not be measured at the reference or current settings.'), { fatal: true });
+    setBaseline(j, reference, quality);
   }
   // Scripted, deterministic (#308): the recommendation table decides, nothing is measured to
   // choose it. Written through the same applyUnlocked path as every other step (so
@@ -301,6 +363,7 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
     };
     if (!Object.keys(options).length) return skip('No recommended sampling values; the engine defaults stay in force.');
     if (own.length) return skip('Sampling is already set in models.ini (' + own.join(', ') + '); left as configured.');
+    await ensureBaseline(j, profile.options);
     check(); note(j, 'Applying recommended sampling (' + rec.source + ').');
     record(p, 'apply', 'running', { startedAt: now() });
     await write(j, options);
@@ -315,9 +378,21 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
     for (const kv of kvCandidates()) {
       check(); note(j, 'Testing ' + kv + ' KV cache with drafting off.');
       await unloadAll();
+      // With no baseline yet, the f16 candidate is the reference setting itself: its probes become
+      // the baseline instead of loading the same profile twice.
+      const reuse = kv === 'f16' && !gate(j.model);
       const measured = await measure(j, p, kv, { 'cache-type-k': kv, 'cache-type-v': kv,
-        'spec-type': 'none', 'spec-draft-n-max': '', 'spec-draft-p-min': '' }, () => validate(j.model));
+        'spec-type': 'none', 'spec-draft-n-max': '', 'spec-draft-p-min': '' }, async () => {
+        if (!reuse) return validate(j.model);
+        const quality = await qualityCheck(j.model, chat);
+        if (engineFailed(quality)) throw Error(qualityFailure(quality));
+        const b = setBaseline(j, 'f16', quality);
+        // Judged like any later candidate: on the probes its own run passed, the rest skipped.
+        return validate(j.model, { passed: true, checks: quality.checks.filter(c => b.probes.includes(c.id)),
+          ...(b.skipped.length ? { skipped: b.skipped.map(s => s.id) } : {}) });
+      });
       if (measured) results.push({ kv, ...measured });
+      if (kv === 'f16' && !gate(j.model)) await ensureBaseline(j, before, { tryF16: false });
     }
     const best = results.sort((a, b) => b.generation - a.generation || kvCandidates().indexOf(a.kv) - kvCandidates().indexOf(b.kv))[0];
     if (!best) throw Error('No KV cache type passed quality and throughput checks.');
@@ -368,7 +443,7 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
       await unloadAll();
       const options = { 'ubatch-size': String(ub), 'batch-size': String(Math.max(2048, ub)) };
       const measured = await measure(j, p, String(ub), options, async () => {
-        const quality = await qualityCheck(j.model, chat);
+        const quality = await qualityCheck(j.model, chat, gate(j.model));
         if (!quality.passed) throw Error(qualityFailure(quality));
         const r = await chat(j.model, prompt, 16);
         if (!r || !Number.isFinite(r.prompt) || r.prompt <= 0) throw Error('Missing prompt throughput measurement.');
@@ -440,7 +515,7 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
     const result = { kv: kv.kv, context: ctx.context, spec: draft.spec, specLabel: draft.specLabel,
       generation: final.generation, acceptance: final.acceptance, ubatch: batch.ubatch,
       promptPerSecond: batch.promptPerSecond, quality: final.quality, extensions: [],
-      sampling: phaseOf(item, 'sampling')?.value || null,
+      sampling: phaseOf(item, 'sampling')?.value || null, ...(item.baseline ? { baseline: item.baseline } : {}),
       loaded: true, version: VERSION, signature: await signature(item.model, identity) };
     if (presets.snapshot().revision !== j._revision)
       throw Object.assign(Error('Settings changed outside auto-tune.'), { fatal: true });

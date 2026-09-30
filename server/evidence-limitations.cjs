@@ -7,6 +7,8 @@
 const PATTERNS = [
   { id: 'autotune-quality', re: /^Three deterministic quality smoke probes, not a general quality benchmark$/ },
   { id: 'autotune-budget', re: /^120 s default prompt budget; existing MTP head only$/ },
+  // #328: probe ids stay as recorded (arithmetic, extraction, reasoning).
+  { id: 'autotune-baseline-skipped', re: /^Probes not used \(failed at the model's reference settings\): ([\w, -]+)$/, params: (m) => ({ probes: m[1] }) },
   { id: 'vision-probe', re: /^1×1 image accepted; not an accuracy test$/ },
   { id: 'single-reply', re: /^single reply; depends on content$/ },
   { id: 'calibration-budget', re: /^prompt budget (\d+(?:\.\d+)?) s$/, params: (m) => ({ seconds: Number(m[1]) }) },

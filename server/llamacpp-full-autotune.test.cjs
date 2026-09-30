@@ -5,7 +5,7 @@ const { createModelManager } = require('./model-manager.cjs');
 const { createPresetStore } = require('./llamacpp-presets.cjs');
 const { QUALITY, qualityCheck, qualityFailure, newModel } = require('./llamacpp-full-autotune.cjs');
 
-function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnload, badQ4 = true, badF16 = false, noHead = false, rejectAll = false, rejectModel = '', badBatch = false, failFinal = false, formattedQuality = false, reasoningOnly = false, truncatedWorkloads = false, idleTimeoutMs = 300000, loseIdentityAfterStart = false, reloadFail = false, unloadPolls = 0, unloadStuck = false } = {}) {
+function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnload, badQ4 = true, badF16 = false, noHead = false, rejectAll = false, rejectModel = '', badBatch = false, failFinal = false, formattedQuality = false, reasoningOnly = false, truncatedWorkloads = false, idleTimeoutMs = 300000, loseIdentityAfterStart = false, reloadFail = false, unloadPolls = 0, unloadStuck = false, answerFor = null, failLoadF16 = false, httpFor = null } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'full-tune-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const ini = path.join(dir, 'models.ini'), stateFile = path.join(dir, 'tune.json');
@@ -23,7 +23,7 @@ function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnl
       if (value === 'unloading' && !unloadStuck && --unloading[id] <= 0) status[id] = value = 'unloaded';
       return { id, status: { value, args: id === 'embed' ? ['--embedding'] : [] }, meta: { n_ctx_train: 16384 } };
     }) } };
-    if (u.pathname === '/models/load') { status[b.model] = 'loaded'; return { ok: true, body: {} }; }
+    if (u.pathname === '/models/load') { status[b.model] = failLoadF16 && options(b.model)['cache-type-k'] === 'f16' ? 'unloaded' : 'loaded'; return { ok: true, body: {} }; }
     if (u.pathname === '/models/unload') { status[b.model] = unloadPolls || unloadStuck ? 'unloading' : 'unloaded'; unloading[b.model] = unloadPolls; onUnload?.({ manager, model: b.model }); return { ok: true, body: {} }; }
     if (u.pathname === '/tokenize') return { ok: true, body: { tokens: Array(600).fill(1) } };
     if (u.pathname === '/props') return { ok: true, body: { build_info: build } };
@@ -33,11 +33,14 @@ function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnl
       await onChat?.({ manager, chats, o, prompt, ini, status, requests });
       if (opts.signal?.aborted) throw Error('aborted');
       const q = QUALITY.find(q => q.prompt === prompt);
+      const httpStatus = httpFor?.({ q, o });
+      if (httpStatus) return { ok: false, status: httpStatus, body: {} };
       let text = q ? q.expected : prompt.startsWith('List the whole numbers') ? Array.from({ length: 60 }, (_, i) => i + 1).join(', ') : 'Synthetic answer';
       if (q && (rejectAll || (badSampling && o.temp) || b.model === rejectModel || (badF16 && o['cache-type-k'] === 'f16') || (badQ4 && ['q5_0', 'q5_1', 'q4_0'].includes(o['cache-type-k'])))) text = 'wrong';
       if (badBatch && q && o['ubatch-size']) text = 'wrong';
       if (failFinal && q && manager.autotune.status().body.job?.phase === 'Verifying saved profile') text = 'wrong';
       if (formattedQuality && q) text = q.id === 'extraction' ? '`' + text + '`' : '**' + text + '**';
+      if (q && answerFor) text = answerFor({ q, o, text }) ?? text;
       const spec = o['spec-type'], draft = spec === 'ngram-simple' || spec === 'draft-mtp' && !noHead;
       const speed = spec === 'draft-mtp' && !noHead ? o['spec-draft-n-max'] === '8' ? 50 : 36 : spec === 'ngram-simple' ? 26 : 20;
       return { ok: true, body: { choices: [{ message: { content: reasoningOnly ? '' : text, ...(reasoningOnly ? { reasoning_content: text } : {}) }, ...(reasoningOnly || (truncatedWorkloads && !q) ? { finish_reason: 'length' } : {}) }], timings: { predicted_per_second: speed * (['q5_0', 'q5_1', 'q4_0'].includes(o['cache-type-k']) ? 2 : o['cache-type-k'] === 'q8_0' ? 1.2 : 1),
@@ -140,24 +143,25 @@ test('Laya is reported as a system model, not a chat model needing tuning, and c
 });
 
 test('quality rejection followed by asynchronous unload still reaches the next KV candidate', async t => {
-  const f = fixture(t, { badF16: true, unloadPolls: 4 });
+  // f16 is the reference, so the rejected candidate is q8_0 (it breaks arithmetic, which f16 passed).
+  const f = fixture(t, { badQ4: false, unloadPolls: 4, answerFor: ({ q, o }) => q.id === 'arithmetic' && o['cache-type-k'] === 'q8_0' ? '61' : null });
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   const j = await finished(f.manager), kv = phase(j.models[0], 'kv');
   assert.equal(j.status, 'passed', j.error);
-  assert.equal(kv.steps.find(s => s.id === 'f16').status, 'failed');
-  assert.match(kv.steps.find(s => s.id === 'f16').reason, /arithmetic \(mismatch\)/);
-  assert.equal(kv.steps.find(s => s.id === 'q8_0').status, 'passed');
-  assert.equal(j.models[0].result.kv, 'q8_0');
+  assert.equal(kv.steps.find(s => s.id === 'q8_0').status, 'failed');
+  assert.match(kv.steps.find(s => s.id === 'q8_0').reason, /arithmetic \(mismatch\)/);
+  assert.equal(kv.steps.find(s => s.id === 'q5_1').status, 'passed');
+  assert.equal(j.models[0].result.kv, 'q5_1');
 });
 
 test('an unload that never reaches unloaded stops without writing another profile', async t => {
-  const f = fixture(t, { badF16: true, unloadStuck: true });
+  const f = fixture(t, { unloadStuck: true });
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   const j = await finished(f.manager);
   assert.equal(j.status, 'failed');
   assert.match(j.error, /Timed out waiting for router unload: synthetic \(unloading\)/);
   assert.equal(f.options('synthetic')['cache-type-k'], 'f16');
-  assert.equal(f.requests.length, 3, 'only the first candidate reached the quality probes');
+  assert.ok(f.requests.length > 0 && f.requests.every(r => r.options['cache-type-k'] === 'f16'), 'only the first candidate was measured');
 });
 
 test('cancelling during router unload waits for safe rollback and releases chat', async t => {
@@ -466,6 +470,11 @@ test('reasoning-only gpt-oss output fails all quality candidates and restores th
   await f.manager.autotune.start('gpt-oss-20b', { confirmPause: true });
   const job = await finished(f.manager);
   assert.equal(job.status, 'failed');
+  // #328: the baseline taken before sampling already fails every probe, so the optional sampling
+  // phase cannot swallow it and nothing further is measured.
+  assert.match(job.error, /^The model failed every quality probe at its reference settings/);
+  assert.equal(job.models[0].phases[0].status, 'failed');
+  assert.equal(job.models[0].phases[1].status, 'pending');
   assert.equal(job.models[0].phases[0].restored, true);
   assert.equal(fs.readFileSync(f.ini, 'utf8'), f.original);
   assert.equal(job.models[0].result, undefined);
@@ -494,7 +503,7 @@ test('KV floor override env var adds q4_0 as a last-resort candidate, still belo
   const prior = process.env.NOEVIA_AUTOTUNE_ALLOW_BELOW_Q5_KV;
   process.env.NOEVIA_AUTOTUNE_ALLOW_BELOW_Q5_KV = '1';
   t.after(() => { if (prior === undefined) delete process.env.NOEVIA_AUTOTUNE_ALLOW_BELOW_Q5_KV; else process.env.NOEVIA_AUTOTUNE_ALLOW_BELOW_Q5_KV = prior; });
-  const f = fixture(t, { badF16: true });
+  const f = fixture(t);
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   const j = await finished(f.manager), item = j.models[0];
   assert.deepEqual(phase(item, 'kv').steps.map(s => s.id), ['f16', 'q8_0', 'q5_1', 'q5_0', 'q4_0']);
@@ -624,4 +633,128 @@ test('a mismatch records a short sanitized answer snippet in the failure text', 
   assert.ok(a.length <= 24); assert.doesNotMatch(a, /[\u0000-\u001f]/); assert.match(a, /^It is sixty/);
   assert.match(qualityFailure(q), /^Quality checks failed: arithmetic \(mismatch\)\. Answered arithmetic: "It is sixty[^"]*"\.$/);
   assert.equal(qualityFailure({ checks: [{ id: 'arithmetic', passed: false, reason: 'truncated' }] }), 'Quality checks failed: arithmetic (truncated).');
+});
+
+// #328: the quality gate is relative to the model's own baseline at its reference settings.
+const probeRequests = (f, id) => f.requests.filter(r => r.prompt === QUALITY.find(q => q.id === id).prompt);
+// The 2026-09-30 E2B run: a plain wrong "69" for arithmetic at every setting, the other probes fine.
+const e2b = ({ q }) => q.id === 'arithmetic' ? '69' : null;
+
+test('#328 baseline passing every probe reuses the f16 candidate instead of loading f16 twice', async t => {
+  const f = fixture(t);
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager), item = j.models[0];
+  assert.equal(j.status, 'passed', j.error);
+  assert.deepEqual(item.baseline, { reference: 'f16', probes: ['arithmetic', 'extraction', 'reasoning'], skipped: [] });
+  // One probe set at f16 (the KV candidate, which is the baseline), none measured separately.
+  assert.equal(f.requests.filter(r => r.options['cache-type-k'] === 'f16' && QUALITY.some(q => q.prompt === r.prompt)).length, 3);
+  assert.equal(phase(item, 'kv').steps.find(s => s.id === 'f16').status, 'passed');
+  assert.ok(j.log.some(l => /^Quality baseline at f16 KV cache, drafting off: arithmetic passed, extraction passed, reasoning passed\.$/.test(l.text)));
+  assert.deepEqual(item.result.baseline, item.baseline);
+});
+
+test('#328 a probe the model fails at its reference settings is skipped, and the tune completes on the others', async t => {
+  const f = fixture(t, { answerFor: e2b });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager), item = j.models[0];
+  assert.equal(j.status, 'passed', j.error);
+  assert.deepEqual(item.baseline, { reference: 'f16', probes: ['extraction', 'reasoning'], skipped: [{ id: 'arithmetic', reason: 'mismatch', answer: '69' }] });
+  assert.equal(probeRequests(f, 'arithmetic').length, 1, 'arithmetic is asked once, for the baseline, then never again');
+  assert.ok(probeRequests(f, 'extraction').length > 5, 'the discriminative probes still gate every later step');
+  assert.deepEqual(item.phases.map(p => p.status), ['passed', 'passed', 'passed', 'passed', 'passed']);
+  assert.equal(item.result.kv, 'q8_0');
+  assert.deepEqual(item.result.quality.skipped, ['arithmetic']);
+  assert.ok(item.result.quality.checks.every(c => c.id !== 'arithmetic' && c.passed));
+  assert.ok(j.log.some(l => l.text.includes('arithmetic skipped (the model gets this wrong at its reference settings; answered "69")')));
+});
+
+test('#328 a candidate that breaks a probe the baseline passed still fails', async t => {
+  const f = fixture(t, { badQ4: false, answerFor: ({ q, o }) => e2b({ q }) ?? (q.id === 'extraction' && o['cache-type-k'] === 'q5_0' ? 'AX-471' : null) });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager), kv = phase(j.models[0], 'kv');
+  assert.equal(j.status, 'passed', j.error);
+  const q50 = kv.steps.find(s => s.id === 'q5_0');
+  assert.equal(q50.status, 'failed');
+  assert.equal(q50.reason, 'Quality checks failed: extraction (mismatch). Answered extraction: "AX-471".');
+  assert.equal(kv.steps.find(s => s.id === 'q5_1').status, 'passed');
+  assert.equal(j.models[0].result.kv, 'q5_1');
+});
+
+test('#328 a model that fails every probe at its reference settings stops with a clear reason', async t => {
+  const f = fixture(t, { rejectAll: true });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager), kv = phase(j.models[0], 'kv');
+  assert.equal(j.status, 'failed');
+  assert.match(j.error, /^The model failed every quality probe at its reference settings/);
+  assert.match(j.error, /arithmetic \(mismatch\), extraction \(mismatch\), reasoning \(mismatch\)/);
+  assert.equal(kv.status, 'failed'); assert.equal(kv.restored, true);
+  assert.deepEqual(kv.steps.map(s => s.status), ['failed', 'pending', 'pending', 'pending'], 'no further candidate is measured');
+  assert.deepEqual(j.models[0].baseline.probes, []);
+  assert.equal(fs.readFileSync(f.ini, 'utf8'), f.original);
+  // Resume measures the baseline again rather than trusting the empty one.
+  const before = f.requests.length;
+  assert.equal((await f.manager.autotune.resume({ confirmPause: true })).status, 202);
+  const again = await finished(f.manager);
+  assert.equal(again.status, 'failed');
+  assert.equal(f.requests.length - before, 3);
+});
+
+test('#328 with sampling to apply, the baseline is measured first at f16 and the KV and drafting keys are put back', async t => {
+  const f = fixture(t, { models: ['Qwen3-8B-Instruct'], answerFor: e2b });
+  await f.manager.autotune.start('Qwen3-8B-Instruct', { confirmPause: true });
+  const j = await finished(f.manager), item = j.models[0];
+  assert.equal(j.status, 'passed', j.error);
+  // The sampling step is judged on extraction and reasoning, so the E2B-style "69" no longer blocks it.
+  assert.equal(phase(item, 'sampling').value.applied, true);
+  assert.equal(item.baseline.reference, 'f16');
+  assert.deepEqual(item.baseline.skipped.map(s => s.id), ['arithmetic']);
+  const first = f.requests[0];
+  assert.equal(first.options['cache-type-k'], 'f16'); assert.equal(first.options['spec-type'], 'none'); assert.equal(first.options.temp, undefined);
+  // The sampling probe ran on the profile as it was (no KV keys), not on the baseline's f16.
+  const samplingProbe = f.requests.find(r => r.options.temp);
+  assert.equal(samplingProbe.options['cache-type-k'], undefined); assert.equal(samplingProbe.options['spec-type'], undefined);
+  assert.equal(probeRequests(f, 'arithmetic').length, 1);
+});
+
+test('#328 when f16 does not load, the baseline comes from the current settings', async t => {
+  const f = fixture(t, { failLoadF16: true, answerFor: e2b });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager), item = j.models[0];
+  assert.equal(j.status, 'passed', j.error);
+  assert.equal(item.baseline.reference, 'current');
+  assert.deepEqual(item.baseline.probes, ['extraction', 'reasoning']);
+  assert.equal(phase(item, 'kv').steps.find(s => s.id === 'f16').status, 'failed');
+  assert.equal(item.result.kv, 'q8_0');
+  assert.ok(j.log.some(l => /^Quality baseline at the current settings, drafting off:/.test(l.text)));
+});
+
+test('#328 an engine error during the baseline never marks a probe as one the model gets wrong', async t => {
+  // f16 loads but the engine errors on one probe: that f16 run cannot be the baseline, so the
+  // current settings supply it, with every probe still counted.
+  const f = fixture(t, { httpFor: ({ q, o }) => q?.id === 'extraction' && o['cache-type-k'] === 'f16' ? 500 : 0 });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager), item = j.models[0];
+  assert.equal(j.status, 'passed', j.error);
+  assert.deepEqual(item.baseline, { reference: 'current', probes: ['arithmetic', 'extraction', 'reasoning'], skipped: [] });
+  assert.match(phase(item, 'kv').steps.find(s => s.id === 'f16').reason, /extraction \(HTTP 500\)/);
+});
+
+test('#328 qualityCheck sends only the probes the baseline passed and reports the rest as skipped', async () => {
+  const baseline = { reference: 'f16', probes: ['extraction', 'reasoning'], skipped: [{ id: 'arithmetic', reason: 'mismatch', answer: '69' }] };
+  const asked = [];
+  const q = await qualityCheck('x', async (_m, prompt) => { const c = QUALITY.find(c => c.prompt === prompt); asked.push(c.id); return { text: c.expected }; }, baseline);
+  assert.deepEqual(asked, ['extraction', 'reasoning']);
+  assert.deepEqual(q, { passed: true, checks: [{ id: 'extraction', passed: true }, { id: 'reasoning', passed: true }], skipped: ['arithmetic'] });
+  // No baseline (an older resumed job): every probe is required, as before.
+  const all = await qualityCheck('x', async (_m, prompt) => ({ text: prompt === QUALITY[0].prompt ? '69' : QUALITY.find(c => c.prompt === prompt).expected }));
+  assert.equal(all.passed, false); assert.equal(all.skipped, undefined);
+});
+
+test('#328 status reports the KV candidates this server really tries', async t => {
+  delete process.env.NOEVIA_AUTOTUNE_ALLOW_BELOW_Q5_KV;
+  const f = fixture(t);
+  assert.deepEqual(f.manager.autotune.status('synthetic').body.kvCandidates, ['f16', 'q8_0', 'q5_1', 'q5_0']);
+  process.env.NOEVIA_AUTOTUNE_ALLOW_BELOW_Q5_KV = '1';
+  t.after(() => { delete process.env.NOEVIA_AUTOTUNE_ALLOW_BELOW_Q5_KV; });
+  assert.deepEqual(f.manager.autotune.status('synthetic').body.kvCandidates, ['f16', 'q8_0', 'q5_1', 'q5_0', 'q4_0']);
 });

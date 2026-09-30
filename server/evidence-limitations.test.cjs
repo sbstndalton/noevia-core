@@ -18,6 +18,14 @@ test('every sentence the server records maps to a stable id, in order', () => {
   assert.deepEqual(keys[5].params, { n: 5 });
 });
 
+test('#328 the skipped-probe limitation keeps the probe ids as a parameter', () => {
+  const [key] = limitationKeys(["Probes not used (failed at the model's reference settings): arithmetic, reasoning"]);
+  assert.deepEqual(key, { id: 'autotune-baseline-skipped', params: { probes: 'arithmetic, reasoning' } });
+  const fs = require('node:fs');
+  const path = require('node:path');
+  assert.ok(fs.readFileSync(path.join(__dirname, 'llamacpp-manager.cjs'), 'utf8').includes("`Probes not used (failed at the model's reference settings): ${"));
+});
+
 test('unknown text, non-strings and non-arrays yield null, never a guess', () => {
   assert.deepEqual(limitationKeys(['The engine ran out of memory', 3, null]), [null, null, null]);
   assert.deepEqual(limitationKeys(undefined), []);
