@@ -1,4 +1,5 @@
 'use strict';
+const { causeOf } = require('./decision/index.cjs');
 // Application checkpoint policy, not access to model reasoning. Providers are injected only.
 const VERIFY = 'Check the preceding tool results against the user request before continuing. Identify missing evidence and uncertainty. Do not assume a failed tool succeeded.';
 function createStepSupervision({ enabled = () => false, provider = null, deadlineMs = 500, getDeadlineMs = null,
@@ -30,10 +31,18 @@ function createStepSupervision({ enabled = () => false, provider = null, deadlin
           Promise.resolve().then(() => controller.signal.aborted ? null : provider.decide({ round, goal, outputs, choices: ['continue', 'verify', 'escalate'] }, { signal: controller.signal })),
           unavailable,
         ]);
-        if (signal?.aborted || !result || Object.keys(result).length !== 1 || !['continue','verify','escalate'].includes(result.action)) { log({ round, action: 'continue', fellBack: 'no-decision' }); return fallback; }
+        if (signal?.aborted || !result || Object.keys(result).length !== 1 || !['continue','verify','escalate'].includes(result.action)) {
+          // #682: why there was no decision: the chat was stopped, the deadline passed, or the answer was malformed.
+          log({ round, action: 'continue', fellBack: 'no-decision', cause: signal?.aborted ? 'aborted' : !result ? 'deadline' : 'invalid-result' });
+          return fallback;
+        }
         log({ round, action: result.action, fellBack: null });
         return { action: result.action, source: 'experimental' };
-      } catch { log({ round, action: 'continue', fellBack: 'error' }); return fallback; }
+      } catch (error) {
+        // A text-free code only (http-503, http-422, network, parse, ...), never the error message.
+        log({ round, action: 'continue', fellBack: 'error', cause: signal?.aborted ? 'aborted' : causeOf(error) });
+        return fallback;
+      }
       finally { clearTimeout(timer); signal?.removeEventListener('abort', abort); controller.abort(); }
     },
   };

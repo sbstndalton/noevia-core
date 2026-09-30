@@ -10,6 +10,8 @@ function configuration(env = process.env) {
     return { baseUrl:url.origin, reason:null };
   } catch { return { reason:'Connect a private decision service with COWORK_DECISION_URL, then restart Noevia.' }; }
 }
+// A failure with a short text-free cause code (decision/index.cjs causeOf) for the decision log.
+const failure=(reason,message)=>Object.assign(Error(message),{reason});
 function createDecisionEndpoint({ env=process.env, fetchImpl=globalThis.fetch }={}) {
   const config=configuration(env);
   if (config.reason) return null;
@@ -26,27 +28,33 @@ function createDecisionEndpoint({ env=process.env, fetchImpl=globalThis.fetch }=
       return {action:result.selected};
     },
     async choice({state,question,options},{signal}={}) {
-      const response=await fetchImpl(config.baseUrl+'/v1/decisions',{method:'POST',redirect:'error',signal,
-        headers:{'Content-Type':'application/json'},body:JSON.stringify({state,question,options})});
-      if(!response.ok) throw Error('Decision endpoint unavailable');
-      if(!response.body) throw Error('Decision endpoint returned no decision');
+      let response;
+      try {
+        response=await fetchImpl(config.baseUrl+'/v1/decisions',{method:'POST',redirect:'error',signal,
+          headers:{'Content-Type':'application/json'},body:JSON.stringify({state,question,options})});
+      } catch (error) { throw failure(signal?.aborted || error?.name==='AbortError' ? 'aborted' : 'network','Decision endpoint unreachable'); }
+      // The status is the whole diagnosis for the Laya service: 422 is a request it refused
+      // (shape or token budget), 503 a worker that missed its deadline or is reloading (#682).
+      if(!response.ok) throw failure(`http-${Number(response.status)||0}`,'Decision endpoint unavailable');
+      if(!response.body) throw failure('empty-response','Decision endpoint returned no decision');
       const reader=response.body.getReader();
       const chunks=[]; let size=0;
       try {
         for (;;) {
           const {done,value}=await reader.read(); if(done) break;
           size+=value.byteLength;
-          if(size>8192) throw Error('Decision response too large');
+          if(size>8192) throw failure('response-too-large','Decision response too large');
           chunks.push(Buffer.from(value));
         }
       } finally { await reader.cancel(); }
       const text=Buffer.concat(chunks).toString('utf8');
-      if(!text.trim()) throw Error('Decision endpoint returned no decision');
-      const result=JSON.parse(text), ids=options.map(o=>o.id);
+      if(!text.trim()) throw failure('empty-response','Decision endpoint returned no decision');
+      let result; try { result=JSON.parse(text); } catch { throw failure('parse','Decision response is not JSON'); }
+      const ids=options.map(o=>o.id);
       if(!ids.includes(result.selected) || !result.scores || Object.keys(result.scores).length!==ids.length ||
         !ids.every(id=>Number.isFinite(result.scores[id])&&result.scores[id]>=0&&result.scores[id]<=1) ||
         Math.abs(Object.values(result.scores).reduce((a,b)=>a+b,0)-1)>0.002 ||
-        ids.some(id=>id!==result.selected && result.scores[id]>=result.scores[result.selected])) throw Error('Invalid decision result');
+        ids.some(id=>id!==result.selected && result.scores[id]>=result.scores[result.selected])) throw failure('invalid-result','Invalid decision result');
       // Only expose a known model identifier, never arbitrary service-provided text or URLs.
       const model = result.model === 'convaiinnovations/laya' ? result.model : null;
       return {selected:result.selected,scores:result.scores,confidence:null,metadata:{calibrated:false,model}};

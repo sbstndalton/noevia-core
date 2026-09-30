@@ -28,18 +28,23 @@ function createDecisions({ backends, chains = {}, log = () => {}, now = Date.now
       return { ...f, source: 'fallback', metadata: { ...(f?.metadata || {}), latencyMs: now() - started } };
     };
     const problem = invalidRequest(request);
-    if (problem) return done(request, withReason(fallback(), `invalid-request: ${problem}`));
+    if (problem) return done(request, withReason(fallback(), `invalid-request: ${problem}`, 'invalid-request'));
+    // #682: why the last backend in the chain did not answer, as a short code (never message text),
+    // so a fallback record says more than "no-backend-answered".
+    let cause = (chains[request.purpose] || []).length ? null : 'no-chain';
     for (const id of chains[request.purpose] || []) {
       const backend = backends[id];
-      if (!backend || !backend.supports(request.kind, request.purpose)) continue;
-      if ((benched.get(id) || 0) > now()) continue;
-      if (backend.locality === 'remote' && request.context?.cloud !== 'allowed') continue;
+      if (!backend) { cause = 'backend-missing'; continue; }
+      if (!backend.supports(request.kind, request.purpose)) { cause = 'unsupported-kind'; continue; }
+      if ((benched.get(id) || 0) > now()) { cause = 'benched'; continue; }
+      if (backend.locality === 'remote' && request.context?.cloud !== 'allowed') { cause = 'remote-forbidden'; continue; }
       let result;
       try {
         result = await withDeadline((signal) => backend.decide(request, { signal }), request.constraints.deadlineMs);
       } catch (error) {
         if (error?.deadline) { const n = (misses.get(id) || 0) + 1; misses.set(id, n); if (n >= 3) { benched.set(id, now() + 60_000); misses.set(id, 0); } }
         const reason = error?.deadline ? 'deadline' : String(error?.message || error);
+        cause = causeOf(error);
         log({ purpose: request.purpose, backend: id, failed: reason.slice(0, 200) });
         if (onDiagnostic) onDiagnostic({ purpose: request.purpose, backend: id, ok: false, reason, diagnostics: error?.diagnostics ?? null });
         continue;
@@ -47,18 +52,18 @@ function createDecisions({ backends, chains = {}, log = () => {}, now = Date.now
       misses.set(id, 0);
       const invalid = invalidResult(request, result);
       if (onDiagnostic) onDiagnostic({ purpose: request.purpose, backend: id, ok: !invalid, reason: invalid ? `invalid: ${invalid}` : null, diagnostics: result?.metadata?.diagnostics ?? null });
-      if (invalid) { log({ purpose: request.purpose, backend: id, failed: `invalid: ${invalid}` }); continue; }
+      if (invalid) { cause = 'invalid-result'; log({ purpose: request.purpose, backend: id, failed: `invalid: ${invalid}` }); continue; }
       const min = request.constraints.minConfidence;
       if (typeof min === 'number' && request.kind !== 'rank' && !(result.confidence >= min)) {
         return done(request, withReason(fallback(), 'low-confidence'), { backend: id, confidence: result.confidence });
       }
       return done(request, { ...result, source: id, metadata: { ...(result.metadata || {}), latencyMs: now() - started } });
     }
-    return done(request, withReason(fallback(), 'no-backend-answered'));
+    return done(request, withReason(fallback(), 'no-backend-answered', cause || 'no-backend'));
   }
 
   function done(request, result, extra = {}) {
-    log({ purpose: request.purpose, source: result.source, fellBack: result.metadata?.fellBack || null,
+    log({ purpose: request.purpose, source: result.source, fellBack: result.metadata?.fellBack || null, cause: result.metadata?.cause || null,
       latencyMs: result.metadata?.latencyMs, confidence: result.confidence ?? null, ...extra });
     return result;
   }
@@ -66,7 +71,22 @@ function createDecisions({ backends, chains = {}, log = () => {}, now = Date.now
   return { decide, rank: (request) => decide({ ...request, kind: 'rank' }) };
 }
 
-function withReason(result, reason) { return { ...result, metadata: { ...result.metadata, fellBack: reason } }; }
+function withReason(result, reason, cause = null) { return { ...result, metadata: { ...result.metadata, fellBack: reason, ...(cause ? { cause } : {}) } }; }
+
+const CAUSE_RE = /^[a-z][a-z0-9-]{0,39}$/;
+/**
+ * A short, text-free code for why a decision call failed (#682). Only a vetted `reason` slug set by
+ * our own code, or a classification of the error's type, is returned: never an error message, which
+ * may echo a service body or model output.
+ */
+function causeOf(error) {
+  if (error?.deadline) return 'deadline';
+  if (typeof error?.reason === 'string' && CAUSE_RE.test(error.reason)) return error.reason;
+  if (error?.name === 'AbortError' || error?.name === 'TimeoutError') return 'aborted';
+  if (error instanceof SyntaxError) return 'parse';
+  if (error instanceof TypeError && /fetch failed/i.test(String(error.message))) return 'network';
+  return 'exception';
+}
 
 // The backend gets an AbortSignal that fires at the deadline, so an HTTP call or worker job it
 // started is cancelled rather than left running after its answer stopped mattering.
@@ -101,4 +121,4 @@ function invalidResult(r, result) {
   return null;
 }
 
-module.exports = { createDecisions, invalidResult, invalidRequest };
+module.exports = { createDecisions, invalidResult, invalidRequest, causeOf, CAUSE_RE };

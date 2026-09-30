@@ -57,6 +57,7 @@ function unavailableId(name, reason) {
   if (name === 'stepSupervision' || name === 'toolGate' || name === 'systemOneRouting') {
     if (/COWORK_DECISION_URL/.test(reason)) return 'decisionUrl';
     if (/Set up the decision service/.test(reason)) return 'decisionSetup';
+    if (/does not support choice decisions/.test(reason)) return 'decisionUnsupported';
     if (/COWORK_SYSTEM_ONE_URL/.test(reason)) return 'systemOneUrl';
   }
   return null;

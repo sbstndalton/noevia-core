@@ -18,18 +18,26 @@ function createDecisionLog({ dir, name = 'system-one-decisions.jsonl', maxBytes 
   };
 }
 
-/** Summary for reading back: counts by selection and fallback, and margin buckets. */
+/**
+ * Summary for reading back: counts by selection and fallback, the text-free fallback causes
+ * (#682), margin buckets, tool-gate reasons and resend outcomes.
+ */
 function summarize(lines) {
-  const out = { route: { n: 0, selected: {}, fellBack: {}, margin: { '<0.05': 0, '0.05-0.2': 0, '>=0.2': 0 } }, supervise: { n: 0, action: {}, fellBack: {} } };
+  const out = { route: { n: 0, selected: {}, fellBack: {}, cause: {}, margin: { '<0.05': 0, '0.05-0.2': 0, '>=0.2': 0 } },
+    supervise: { n: 0, action: {}, fellBack: {}, cause: {} }, toolGate: { n: 0, source: {}, reason: {}, cause: {} },
+    outcome: { n: 0, event: {}, previousRole: {} } };
+  const bump = (bucket, key) => { if (key !== undefined && key !== null) bucket[key] = (bucket[key] || 0) + 1; };
   for (const raw of lines) {
     let e; try { e = JSON.parse(raw); } catch { continue; }
     if (e.kind === 'route') {
-      const r = out.route; r.n++; r.selected[e.selected] = (r.selected[e.selected] || 0) + 1;
-      if (e.fellBack) r.fellBack[e.fellBack] = (r.fellBack[e.fellBack] || 0) + 1;
+      const r = out.route; r.n++; bump(r.selected, e.selected); bump(r.fellBack, e.fellBack || null); bump(r.cause, e.cause || null);
       if (typeof e.margin === 'number') r.margin[e.margin < 0.05 ? '<0.05' : e.margin < 0.2 ? '0.05-0.2' : '>=0.2']++;
     } else if (e.kind === 'supervise') {
-      const s = out.supervise; s.n++; s.action[e.action] = (s.action[e.action] || 0) + 1;
-      if (e.fellBack) s.fellBack[e.fellBack] = (s.fellBack[e.fellBack] || 0) + 1;
+      const s = out.supervise; s.n++; bump(s.action, e.action); bump(s.fellBack, e.fellBack || null); bump(s.cause, e.cause || null);
+    } else if (e.kind === 'tool-gate' && e.event === 'decision') {
+      const g = out.toolGate; g.n++; bump(g.source, e.source); bump(g.reason, e.reason || null); bump(g.cause, e.cause || null);
+    } else if (e.kind === 'outcome') {
+      const o = out.outcome; o.n++; bump(o.event, e.event); bump(o.previousRole, e.previousRole || null);
     }
   }
   return out;

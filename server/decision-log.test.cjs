@@ -24,5 +24,5 @@ test('summary counts selections, fallbacks and margin buckets', () => {
   assert.deepEqual(s.route.selected, { fast: 1, legacy: 1, code: 1 });
   assert.deepEqual(s.route.fellBack, { deadline: 1 });
   assert.deepEqual(s.route.margin, { '<0.05': 1, '0.05-0.2': 0, '>=0.2': 1 });
-  assert.deepEqual(s.supervise, { n: 1, action: { verify: 1 }, fellBack: {} });
+  assert.deepEqual(s.supervise, { n: 1, action: { verify: 1 }, fellBack: {}, cause: {} });
 });

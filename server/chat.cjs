@@ -123,6 +123,9 @@ function createChatHandler({
   writeTargetFor = null,
   // #658: writes that succeeded per account and chat, for the repeat flag on approval cards.
   recentWrites = null,
+  // #682: a text-free record that this turn re-runs an earlier one (Regenerate or Retry), with the
+  // role the earlier reply was routed to, so misroutes can be counted. Never message text.
+  recordOutcome = () => {},
 }) {
   // Revoked Skill content in earlier turns (#546): one ledger per handler, cached in memory.
   const skillLedger = skillHistory || require('./skill-history.cjs').createSkillHistory({ fs, path });
@@ -147,6 +150,16 @@ function createChatHandler({
       const id=typeof body?.chatId==='string'?require('./chat-lists.cjs').safeChatId(body.chatId):null;
       try{const dir=currentWorkspace().dir;if(id&&require('./chat-lists.cjs').readTombstones(dir).has(id))require('./chat-context.cjs').remove(dir,id);}catch{/* best effort */}
     }
+  }
+
+  // #682: only enumerated values reach the log; anything else in `resend` is ignored.
+  function recordResend(resend, now) {
+    const kind = resend?.kind;
+    if (kind !== 'regenerate' && kind !== 'retry') return;
+    const role = ['fast', 'smart', 'code'].includes(resend.role) ? resend.role : null;
+    const status = ['accepted', 'fallback'].includes(resend.status) ? resend.status : null;
+    try { recordOutcome({ event: kind, previousRole: role, previousStatus: status, auto: now.auto, role: now.role, status: now.status }); }
+    catch { /* logging never breaks a chat */ }
   }
 
   async function handleChatInner(req, res, body, authn, preparation, execution = {}) {
@@ -512,6 +525,7 @@ function createChatHandler({
       if (!roles[routedRole]) routedRole = roles.smart ? 'smart' : 'fast';
       model = roles[routedRole];
       if (routingDecision) routingDecision = { ...routingDecision, effectiveRole: routedRole };
+      recordResend(body.resend, { auto: true, role: routedRole, status: routingDecision?.status || null });
     } else if (!model && provider.id === DEFAULT_PROVIDER_ID && modelManager.enabled) {
       // No hardcoded model name: default to whatever the manager reports as loaded.
       try {

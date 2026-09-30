@@ -1,6 +1,6 @@
 'use strict';
 const { isIP } = require('node:net');
-const { createDecisions } = require('./decision/index.cjs');
+const { createDecisions, CAUSE_RE } = require('./decision/index.cjs');
 const { llamaLogitBackend } = require('./decision/backends.cjs');
 
 // Operator configuration only. No browser-supplied endpoint, model loading or downloads.
@@ -52,7 +52,9 @@ function createSystemOneRouter({ enabled, roles, fallback, env = process.env, ba
     const ranked = Object.values(scores).sort((a, b) => b - a);
     log({ selected: accepted ? result.selected : 'legacy', options: options.length,
       margin: ranked.length > 1 ? Math.round((ranked[0] - ranked[1]) * 1000) / 1000 : null,
-      ms: result.metadata?.latencyMs ?? null, fellBack: accepted ? null : (result.metadata?.fellBack || 'rejected') });
+      ms: result.metadata?.latencyMs ?? null, fellBack: accepted ? null : (result.metadata?.fellBack || 'rejected'),
+      // #682: the text-free cause behind a fallback (deadline, http-503, invalid-result, ...).
+      cause: accepted ? null : (typeof result.metadata?.cause === 'string' && CAUSE_RE.test(result.metadata.cause) ? result.metadata.cause : null) });
     const role = accepted ? result.selected : await fallback(message);
     const fallbackReason = accepted ? null : (['deadline', 'no-backend-answered', 'low-confidence'].includes(result.metadata?.fellBack)
       ? result.metadata.fellBack : 'rejected');

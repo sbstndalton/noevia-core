@@ -15,6 +15,8 @@
 // (writes keep the approval card), and every failure, timeout or doubt resolves to "none".
 // Nothing here throws into the chat path.
 
+const { causeOf, CAUSE_RE } = require('./decision/index.cjs');
+
 // Rule kind -> candidate tools in preference order. The first one offered on this request wins.
 const DEFAULT_BOXES = Object.freeze({
   url: ['tavily_extract', 'web_fetch', 'fetch_url', 'browse'],
@@ -128,9 +130,20 @@ function deriveArgs(kind, tool, message, now, stage = 'rule') {
  *   log: text-free entries only (tool names, source, mode, confidence, timings, never the message).
  */
 function createToolGate({ enabled, decide, boxes = DEFAULT_BOXES, isWriteTool, log = () => {}, now = Date.now,
-  minConfidence = DEFAULT_MIN_CONFIDENCE, deadlineMs = DEFAULT_DEADLINE_MS }) {
+  minConfidence = DEFAULT_MIN_CONFIDENCE, deadlineMs = DEFAULT_DEADLINE_MS, limits = null, unavailable = () => null,
+  warn = (line) => console.warn(line) }) {
   const value = (v) => (typeof v === 'function' ? v() : v);
   const safeLog = (entry) => { try { log(entry); } catch { /* logging never breaks a chat */ } };
+  // #682: a decision service that cannot answer `choice` is reported once (and in Settings, via
+  // features availability), not rediscovered as a silent fallback on every message.
+  let warned = null;
+  function stage2Blocked() {
+    let reason = null;
+    try { reason = unavailable() || null; } catch { reason = 'Decision service status unknown.'; }
+    if (reason && warned !== reason) { warned = reason; try { warn(`[system-one] tool gate: stage 2 is off. ${reason}`); } catch { /* console gone */ } }
+    if (!reason) warned = null;
+    return reason ? (/does not support/.test(reason) ? 'unsupported' : 'unconfigured') : null;
+  }
   const readOnly = (name) => { try { return !isWriteTool(name); } catch { return false; } };
 
   function ruleDecision(message, offered) {
@@ -154,28 +167,35 @@ function createToolGate({ enabled, decide, boxes = DEFAULT_BOXES, isWriteTool, l
   }
 
   async function readout(message, offered) {
-    const tools = [...offered.values()].filter((t) => readOnly(toolName(t))).slice(0, MAX_OPTIONS - 1);
-    if (!tools.length) return { reason: 'no-read-tools' };
-    const options = [...tools.map((t) => ({ id: toolName(t), label: `${toolName(t)}: ${String(t.function?.description || '').slice(0, 160)}` })),
-      { id: 'none', label: 'none: answer directly, no tool is needed' }];
+    const readTools = [...offered.values()].filter((t) => readOnly(toolName(t)));
+    if (!readTools.length) return { reason: 'no-read-tools' };
+    const blocked = stage2Blocked();
+    if (blocked) return { reason: blocked };
+    const shaped = shapeOptions(readTools, value(limits), boxes);
+    if (!shaped.options.length) return { reason: 'no-options-fit' };
+    const { options } = shaped;
+    const trim = { options: options.length, ...(shaped.trimmed ? { trimmed: shaped.trimmed } : {}) };
     const ms = Math.max(1, Number(value(deadlineMs)) || DEFAULT_DEADLINE_MS);
     let timer;
     const result = await Promise.race([
       Promise.resolve().then(() => decide({ kind: 'choice', purpose: 'tool.gate',
-        question: 'Which tool, if any, must the assistant call before answering this user message?',
+        question: QUESTION,
         context: { cloud: 'forbidden', stateText: String(message).slice(0, 1000) }, options,
         constraints: { deadlineMs: ms, temperature: 0 }, fallback: { selected: null, scores: {} } })),
       new Promise((_, reject) => { timer = setTimeout(() => reject(Object.assign(Error('deadline'), { deadline: true })), ms + 250); }),
     ]).finally(() => clearTimeout(timer));
     const selected = result?.selected;
-    if (!result || result.source === 'fallback') return { reason: result?.metadata?.fellBack || 'fallback' };
-    if (selected === 'none' || !selected) return { reason: 'none', confidence: confidenceOf(result, 'none') };
-    if (!offered.has(selected) || !readOnly(selected)) return { reason: 'not-offered' };
+    if (!result || result.source === 'fallback') {
+      const cause = result?.metadata?.cause;
+      return { reason: result?.metadata?.fellBack || 'fallback', extra: { ...trim, ...(typeof cause === 'string' && CAUSE_RE.test(cause) ? { cause } : {}) } };
+    }
+    if (selected === 'none' || !selected) return { reason: 'none', confidence: confidenceOf(result, 'none'), extra: trim };
+    if (!offered.has(selected) || !readOnly(selected)) return { reason: 'not-offered', extra: trim };
     const confidence = confidenceOf(result, selected);
-    if (!(confidence >= value(minConfidence))) return { reason: 'low-confidence', confidence };
+    if (!(confidence >= value(minConfidence))) return { reason: 'low-confidence', confidence, extra: trim };
     const kind = Object.keys(boxes).find((k) => k !== 'drive' && (boxes[k] || []).includes(selected));
     const args = kind ? deriveArgs(kind, offered.get(selected), message, now, 'decision') : null;
-    return { confidence, decision: args ? { tool: selected, args, mode: 'prefetch' } : { tool: selected, mode: 'require' } };
+    return { confidence, extra: trim, decision: args ? { tool: selected, args, mode: 'prefetch' } : { tool: selected, mode: 'require' } };
   }
 
   /**
@@ -199,10 +219,10 @@ function createToolGate({ enabled, decide, boxes = DEFAULT_BOXES, isWriteTool, l
       const ruled = ruleDecision(message, offered);
       if (ruled) return done({ decision: ruled.decision, source: 'rule' }, { rule: ruled.rule });
       const read = await readout(message, offered);
-      if (read.decision) return done({ decision: read.decision, source: 'decision', confidence: read.confidence });
-      return done({ decision: 'none', source: 'none', ...(typeof read.confidence === 'number' ? { confidence: read.confidence } : {}) }, { reason: read.reason });
+      if (read.decision) return done({ decision: read.decision, source: 'decision', confidence: read.confidence }, read.extra);
+      return done({ decision: 'none', source: 'none', ...(typeof read.confidence === 'number' ? { confidence: read.confidence } : {}) }, { reason: read.reason, ...read.extra });
     } catch (error) {
-      return done({ decision: 'none', source: 'none' }, { reason: error?.deadline ? 'deadline' : 'error' });
+      return done({ decision: 'none', source: 'none' }, { reason: error?.deadline ? 'deadline' : 'error', cause: causeOf(error) });
     }
   }
 
@@ -210,6 +230,42 @@ function createToolGate({ enabled, decide, boxes = DEFAULT_BOXES, isWriteTool, l
   function record(event, entry = {}) { safeLog({ event, ...entry }); }
 
   return { evaluate, record };
+}
+
+const QUESTION = 'Which tool, if any, must the assistant call before answering this user message?';
+const NONE_ID = 'none';
+const MIN_LABEL_CHARS = 12;
+
+/**
+ * The Stage 2 options for this request (#682). Without backend limits: every read-only tool (up to
+ * the readout's 25 labels) as "name: description". With limits (the private decision service takes
+ * at most 8 options of 120 characters, and question plus options must fit its option-head token
+ * budget): tools the gate's rules know come first, the rest in offered order, then as many as fit
+ * with a label of at least MIN_LABEL_CHARS; the service sees the id, so the label is the description
+ * alone. "none" is always the last option. `trimmed` counts tools left out.
+ */
+function shapeOptions(readTools, limits, boxes = DEFAULT_BOXES) {
+  const describe = (t) => String(t.function?.description || '').replace(/\s+/g, ' ').trim();
+  if (!limits || !Number.isFinite(limits.maxOptions)) {
+    const tools = readTools.slice(0, MAX_OPTIONS - 1);
+    return { trimmed: readTools.length - tools.length, options: [...tools.map((t) => ({ id: toolName(t), label: `${toolName(t)}: ${describe(t).slice(0, 160)}` })),
+      { id: NONE_ID, label: 'none: answer directly, no tool is needed' }] };
+  }
+  const known = Object.values(boxes).flat();
+  const rank = (t) => { const i = known.indexOf(toolName(t)); return i < 0 ? known.length : i; };
+  const ordered = readTools.map((t, i) => [t, i]).sort((a, b) => rank(a[0]) - rank(b[0]) || a[1] - b[1]).map(([t]) => t);
+  const none = { id: NONE_ID, label: 'No tool: answer directly' };
+  const maxLabel = Math.max(1, Number(limits.maxLabelChars) || 120);
+  const budget = (Number(limits.maxChoiceChars) || Infinity) - QUESTION.length - (none.id.length + none.label.length + 2);
+  let tools = ordered.slice(0, Math.max(0, Math.min(MAX_OPTIONS, limits.maxOptions) - 1));
+  for (;;) {
+    const idChars = tools.reduce((n, t) => n + toolName(t).length + 2, 0);
+    const per = tools.length ? Math.min(maxLabel, Math.floor((budget - idChars) / tools.length)) : 0;
+    if (!tools.length || per >= MIN_LABEL_CHARS) {
+      return { trimmed: readTools.length - tools.length, options: tools.length ? [...tools.map((t) => ({ id: toolName(t), label: (describe(t) || toolName(t)).slice(0, per) })), none] : [] };
+    }
+    tools = tools.slice(0, -1);
+  }
 }
 
 /** Lower bound of the selected option's readout interval if reported, else its share/confidence. */
@@ -220,4 +276,4 @@ function confidenceOf(result, id) {
   return Number.isFinite(result?.confidence) ? result.confidence : null;
 }
 
-module.exports = { createToolGate, searchQuery, diaryMonth, publicUrlPattern, prefetchableSearch, DEFAULT_BOXES, DEFAULT_MIN_CONFIDENCE };
+module.exports = { createToolGate, shapeOptions, searchQuery, diaryMonth, publicUrlPattern, prefetchableSearch, DEFAULT_BOXES, DEFAULT_MIN_CONFIDENCE };

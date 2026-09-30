@@ -96,7 +96,7 @@ const decisionSettings = require('./decision-settings.cjs').createDecisionSettin
 const features = require('./features.cjs').createFeatures({ store: require('./features.cjs').settingsStore(authService.db), audit: (action, actor, detail) => authService.audit(action, actor, actor, detail),
   // #555 F4: switching native-app sign-in off is a revoke, not a pause (deviceAuth is built below).
   onChange: (name, enabled, actorId) => { if (name === 'nativeClientAuth' && !enabled) deviceAuth.revokeAll(actorId, 'feature-off'); },
-  availability:{stepSupervision:decisionSettings.unavailable,toolGate:decisionSettings.unavailable,systemOneRouting:()=>decisionSettings.unavailable() && require('./system-one-router.cjs').configuration().reason} });
+  availability:{stepSupervision:()=>decisionSettings.unavailable('choice'),toolGate:()=>decisionSettings.unavailable('choice'),systemOneRouting:()=>decisionSettings.unavailable() && require('./system-one-router.cjs').configuration().reason} });
 const featureRoutes = require('./routes/features.cjs').createFeatureRoutes({ features, json, readJson, decisionSettings });
 const pluginDirectoryRoutes = require('./routes/plugin-directory.cjs').createPluginDirectoryRoutes({ json });
 // Settings → Data: the signed-in user's conversations as a ZIP (routes/export.cjs).
@@ -559,6 +559,10 @@ const toolGate = require('./tool-gate.cjs').createToolGate({
   isWriteTool: (name) => isWriteTool(name),
   deadlineMs: () => decisionSettings.get().timeoutMs,
   log: (entry) => recordDecision('tool-gate', entry),
+  // #682: what the service accepts (option count, label and token budget), and whether it can
+  // answer `choice` at all; an unsupported service is reported once and in Settings.
+  limits: () => decisionSettings.backend()?.limits || null,
+  unavailable: () => decisionSettings.unavailable('choice'),
   decide: (request) => {
     const backend = decisionSettings.backend();
     if (!backend) throw Error('Decision service unavailable');
@@ -566,6 +570,11 @@ const toolGate = require('./tool-gate.cjs').createToolGate({
     return toolGateDecisions.decide(request);
   },
 });
+// #682: a decision experiment switched on that cannot run (no service, or one without `choice`)
+// says so once at startup; Settings shows the same reason, and the chat path skips it silently.
+for (const f of features.describe()) {
+  if (['toolGate', 'stepSupervision', 'systemOneRouting'].includes(f.id) && f.enabled && f.unavailable) console.warn(`[system-one] ${f.id} is on but cannot run: ${f.unavailable}`);
+}
 
 // ── Chat: the loop lives in chat.cjs; everything it needs is handed over here ──
 const { handleChat } = require('./chat.cjs').createChatHandler({
@@ -575,6 +584,7 @@ const { handleChat } = require('./chat.cjs').createChatHandler({
     getDeadlineMs:()=>decisionSettings.get().timeoutMs,
     provider: {decide:(...args)=>{const backend=decisionSettings.backend();if(!backend)throw Error('Decision service unavailable');return backend.supervise(...args);}}, deadlineMs:1500,
   }),
+  recordOutcome: (entry) => recordDecision('outcome', entry),
   codeTasksFor: (project) => codeService.list(currentWorkspace(), project),
   // fetch is resolved per call, not captured: tests and QA swap the global at runtime.
   fs, path, crypto, fetch: (...args) => globalThis.fetch(...args), reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult,
