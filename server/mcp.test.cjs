@@ -192,7 +192,7 @@ test('a single tool larger than the whole budget is dropped, not forced through'
 test('budget scales with model size, like the count cap', () => {
   assert.equal(toolTokenBudgetFor('Qwen3.5-9B-GGUF'), 5000);
   assert.equal(toolTokenBudgetFor('Gemma-4-E4B-it-GGUF-4b'), 5000);
-  assert.equal(toolTokenBudgetFor('claude-sonnet-4-5'), 8000);
+  assert.equal(toolTokenBudgetFor('remote-model-a'), 8000);
 });
 
 // ── curation ─────────────────────────────────────────────────────────────

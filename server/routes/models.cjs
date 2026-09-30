@@ -429,7 +429,7 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
       }
       if (!body.name) return json(res, 400, { error: 'name required' });
       if (isSystemModel(body.name)) return json(res, 400, { error: SYSTEM_MODEL_DELETE_REASON });
-      // #336: nomic-embed-text-v1 was deleted through this route while the embed sidecar was
+      // #336: the embedding model was deleted through this route while the embed sidecar was
       // still pointed at it, which crash-loops that sidecar with nothing to fall back to.
       // 409 (not 400): the name is a perfectly valid model, just not deletable right now.
       if (isSidecarModel(body.name, env)) return json(res, 409, { error: SIDECAR_MODEL_DELETE_REASON });

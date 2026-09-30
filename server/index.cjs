@@ -377,11 +377,11 @@ const codeService = require('./code-service.cjs').createCodeService({
   connect: require('./code-acp.cjs').createAcpTransport({ log: (entry) => console.log('[code]', JSON.stringify(entry)) }),
   // Shared context (shared-context.cjs): off unless the project turns on sharing into Code.
   sharedContext: (workspace, project) => require('./shared-context.cjs').forCode(project, loadChats(project.id)),
-  // Astra review (#519, code-review.cjs): off unless features.astraReview. Advice on a final card
+  // Planner review (#519, code-review.cjs): off unless features.plannerReview. Advice on a final card
   // the person still answers; it runs on the default provider as the web container reaches it, and
   // refuses an external one.
-  review: require('./code-review.cjs').createAstraReview({
-    enabled: () => features.enabled('astraReview'),
+  review: require('./code-review.cjs').createPlannerReview({
+    enabled: () => features.enabled('plannerReview'),
     log: (entry) => console.log('[code]', JSON.stringify(entry)),
     provider: require('./code-review.cjs').createEngineReviewer({
       fetch: (...args) => globalThis.fetch(...args),

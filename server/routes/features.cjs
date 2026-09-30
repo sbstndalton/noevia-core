@@ -24,7 +24,9 @@ function createFeatureRoutes({ features, json, readJson, decisionSettings = null
       if (req.method !== 'GET') return json(res, 405, { error: 'method not allowed' }), true;
       return json(res, 200, { features: features.describe() }), true;
     }
-    const name = decodeURIComponent(path.slice('/api/admin/features/'.length));
+    // A legacy flag name (e.g. astraReview, renamed plannerReview) is accepted for one release.
+    const requested = decodeURIComponent(path.slice('/api/admin/features/'.length));
+    const name = typeof features.resolve === 'function' ? features.resolve(requested) : requested;
     if (req.method !== 'PUT') return json(res, 405, { error: 'method not allowed' }), true;
     let body;
     try { body = await readJson(req); } catch { return json(res, 400, { error: 'invalid JSON' }), true; }

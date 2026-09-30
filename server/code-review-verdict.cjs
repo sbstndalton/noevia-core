@@ -1,5 +1,5 @@
 'use strict';
-// The Astra review verdict (#519): its schema, the strict reading of what a reviewer model
+// The Planner review verdict (#519): its schema, the strict reading of what a reviewer model
 // returned, and the bounded shape a `review.*` job event keeps. Pure and dependency-free, like
 // code-plan.cjs, so jobs.cjs can bound replayed events without loading the reviewer runner.
 //
@@ -86,7 +86,7 @@ const count = (v) => (Number.isInteger(v) && v >= 0 ? Math.min(v, 100000) : null
 /** What a `review.*` event keeps, on append and again on replay. Nothing else survives. */
 function boundReviewEvent(type, data = {}) {
   const d = isPlain(data) ? data : {};
-  const base = { reviewer: 'astra', baseSha: sha(d.baseSha), headSha: sha(d.headSha) };
+  const base = { reviewer: 'planner', baseSha: sha(d.baseSha), headSha: sha(d.headSha) };
   if (type === 'review.requested') return { status: 'pending', ...base, files: count(d.files) };
   if (type === 'review.failed') {
     return { status: 'failed', ...base, code: clean(d.code, 40) || 'failed',

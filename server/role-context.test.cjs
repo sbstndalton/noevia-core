@@ -96,9 +96,9 @@ test('each role gets exactly its allowlisted fields', () => {
     assert.deepEqual(allowedFields(role), expected[role]);
     assert.deepEqual(Object.keys(all[role]).sort(), expected[role]);
   }
-  assert.equal(all.planner.role_name, 'Astra');
-  assert.equal(all.executor.role_name, 'Sol');
-  assert.equal(all.auditor.role_name, 'Luna');
+  assert.equal(all.planner.role_name, 'Planner');
+  assert.equal(all.executor.role_name, 'Executor');
+  assert.equal(all.auditor.role_name, 'Auditor');
   assert.equal(all.planner.request, fixtureState().request);
   assert.equal(all.planner.context_limit, 32768);
   assert.deepEqual(Object.keys(all.executor.plan).sort(), ['approval_boundaries', 'capabilities', 'completion', 'constraints', 'goal', 'non_goals', 'steps', 'verification']);

@@ -483,7 +483,7 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
   }
 
   /**
-   * What a released task changed, for the Astra review (#519): `git diff base..head` read from the
+   * What a released task changed, for the Planner review (#519): `git diff base..head` read from the
    * SOURCE repository, exactly as `branchHead()` is — never the harness's tree, which may be gone
    * or hostile. Only a cleanly released claim is diffed (a stuck one is for a human to inspect),
    * both ends must be real commit ids noevia recorded itself, and every diff driver, textconv and

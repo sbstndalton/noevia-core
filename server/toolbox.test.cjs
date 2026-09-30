@@ -87,7 +87,7 @@ test('the cap truncates and reports every dropped tool by name', () => {
     assert.match(small.dropped[0], /over 12-tool cap/);
 
     // Same selection, roomier model: nothing is dropped.
-    const large = resolveTools({ toolboxes: ['test-big'] }, 'claude-sonnet-4-5');
+    const large = resolveTools({ toolboxes: ['test-big'] }, 'remote-model-a');
     assert.equal(large.cap, 24);
     assert.equal(large.dropped.length, 0);
     assert.equal(large.tools.length, 20);
@@ -113,7 +113,7 @@ test('the cap keys off parameter count in the model id', () => {
   assert.equal(toolCapFor('some-70B-model'), 24);
   // An unrecognised name gets the roomier default: withholding tools is the
   // worse failure.
-  assert.equal(toolCapFor('claude-sonnet-4-5'), 24);
+  assert.equal(toolCapFor('remote-model-a'), 24);
   assert.equal(toolCapFor(''), 24);
   assert.equal(toolCapFor(undefined), 24);
 });

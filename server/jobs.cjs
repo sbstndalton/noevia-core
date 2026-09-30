@@ -12,7 +12,7 @@ const MAX_ASSISTANT_OUTPUT_EVENT_BYTES = 1024, MAX_ASSISTANT_OUTPUT_EVENTS = 64;
 const TYPES = new Set(['job.created', 'job.started', 'step.started', 'step.completed', 'progress', 'approval.requested',
   'approval.decided', 'tool.started', 'tool.completed', 'tool.uncertain', 'artifact.created', 'checkpoint.created',
   'job.completed', 'job.failed', 'job.cancelled', 'job.interrupted', 'plan.proposed', 'plan.edited', 'plan.skipped', 'assistant.output',
-  // Astra review of a finished Code change (#519, code-review.cjs). Appended only by the
+  // Planner review of a finished Code change (#519, code-review.cjs). Appended only by the
   // harness's own review gate, never from agent or reviewer output; task-lifecycle.cjs treats
   // them as no-ops, so a model verdict carries no lifecycle authority.
   'review.requested', 'review.completed', 'review.failed']);

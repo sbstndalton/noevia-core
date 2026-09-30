@@ -15,7 +15,7 @@ function embedBackend() {
 }
 
 /**
- * llama.cpp `/v1/rerank` with a cross-encoder reranker GGUF (e.g. Qwen3-Reranker-0.6B, run with
+ * llama.cpp `/v1/rerank` with a cross-encoder reranker GGUF (any reranking model, run with
  * `--reranking --pooling rank`). Scores are relevance logits, not probabilities: `rank` only.
  */
 function llamaRerankBackend({ baseUrl, model = null, apiKey = null, fetchImpl = globalThis.fetch, maxDocChars = 4000 }) {

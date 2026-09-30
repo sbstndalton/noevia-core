@@ -66,3 +66,13 @@ test('unrelated paths are not handled', async () => {
   assert.equal((await call(route, 'GET', '/api/featuresX', 'admin')).handled, false);
   assert.equal((await call(route, 'GET', '/api/admin/users', 'admin')).handled, false);
 });
+
+test('PUT /api/admin/features/astraReview is accepted as the legacy name of plannerReview (one release)', async () => {
+  const { route, features } = harness();
+  const put = await call(route, 'PUT', '/api/admin/features/astraReview', 'admin', '{"enabled":true}');
+  assert.equal(put.status, 200);
+  assert.equal(put.body.name, 'plannerReview');
+  assert.equal(put.body.enabled, true);
+  assert.equal(features.enabled('plannerReview'), true);
+  assert.equal((await call(route, 'GET', '/api/features', 'member')).body.flags.plannerReview, true);
+});

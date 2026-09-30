@@ -81,7 +81,7 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
       throw error;
     }
 
-    // Astra review (#519, features.astraReview) is decided once, here, for the life of this task:
+    // Planner review (#519, features.plannerReview) is decided once, here, for the life of this task:
     // flipping the flag mid-run changes nothing for a task already started. Off, `work` below is
     // exactly what runs, with nothing wrapped around it.
     const reviewer = review && typeof review.enabled === 'function' && review.enabled() ? review : null;
@@ -189,7 +189,7 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
 
     /**
      * The review gate: after the harness has finished on its own, its grant is revoked and its
-     * workspace released. Astra's verdict (or the reason there is none) goes on one more approval
+     * workspace released. The Planner's verdict (or the reason there is none) goes on one more approval
      * card, and only the person's answer accepts the change. Nothing here can accept it: a
      * failed, late or refused review asks exactly the same question, saying why it is unreviewed,
      * and a timeout or an abort of that card is "not accepted", never an allow.
@@ -233,7 +233,7 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
         taskId, action: REVIEW_ACTION, title: 'Accept this change', kind: 'review', command: '',
         paths: files.slice(0, 50),
         reason: outcome.ok
-          ? 'Astra’s verdict is advice. Accepting records this reviewed head as accepted; nothing is merged automatically.'
+          ? 'The Planner’s verdict is advice. Accepting records this reviewed head as accepted; nothing is merged automatically.'
           : `Not reviewed: ${outcome.reason} Review the change on its branch yourself before accepting it.`,
         // What is being accepted, in full: the branch and the exact commits.
         arguments: { branch: workspace.branch, baseSha: shas.baseSha, headSha: shas.headSha, files },

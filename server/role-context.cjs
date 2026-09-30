@@ -2,7 +2,7 @@
 // role-context.cjs — per-role context projection for the vision multi-agent pipeline (#511/#515).
 //
 // Builds the bounded, model-facing context each sub-role receives from a task/orchestrator state
-// object: planner (Astra), executor (Sol) and auditor (Luna). Modelled on PromptArchitect's
+// object: planner, executor and auditor. Modelled on PromptArchitect's
 // allowlisted outbound payload builder (docs/spec-agent-execution.md §2, reference implementation
 // `outbound_payload`/`audit_outbound` in experiments/prompt-preparation/run.py — Python, so it is
 // mirrored here rather than imported).
@@ -35,8 +35,8 @@
 // request, which the projection already carries as authoritative intent).
 
 const ROLES = Object.freeze(['planner', 'executor', 'auditor']);
-const ROLE_NAMES = Object.freeze({ planner: 'Astra', executor: 'Sol', auditor: 'Luna', reviewer: 'Astra' });
-// Astra's second persona (#519): the reviewer of a finished Code change. Deliberately not in ROLES,
+const ROLE_NAMES = Object.freeze({ planner: 'Planner', executor: 'Executor', auditor: 'Auditor', reviewer: 'Planner' });
+// The planner's second persona (#519): the reviewer of a finished Code change. Deliberately not in ROLES,
 // which stays the three #515 sub-roles `buildAllRoleContexts` projects; code-review.cjs builds this
 // one on demand through the same allowlist, caps and leak guard.
 const REVIEW_ROLE = 'reviewer';
@@ -336,7 +336,7 @@ const ROLE_SPECS = Object.freeze({
     execution: (s) => capExecution(s.execution),
     approval_outcomes: (s) => approvalOutcomes(s.approvals),
   }),
-  // What Astra needs to judge a finished change, and nothing else: the request (authoritative
+  // What the Planner needs to judge a finished change, and nothing else: the request (authoritative
   // intent), what the task was allowed to do, the plan it reported, a server-side summary and the
   // bounded diff. No approval cards, ids, arguments or grants — the reviewer cannot answer or
   // widen anything, and has nothing that names one.

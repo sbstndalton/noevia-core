@@ -1,5 +1,5 @@
 'use strict';
-// Astra review of a finished Code change (#519). Fakes only: a scripted agent, a scripted
+// Planner review of a finished Code change (#519). Fakes only: a scripted agent, a scripted
 // reviewer and a scripted person. No model, no network, no real repository beyond a temp git
 // fixture. Every canary below is synthetic.
 const test = require('node:test'), assert = require('node:assert/strict');
@@ -10,7 +10,7 @@ const { createCodeWorkspaces } = require('./code-workspace.cjs');
 const { createCodeService, view } = require('./code-service.cjs');
 const { createJobs, derive } = require('./jobs.cjs');
 const { ACTIONS } = require('./code-actions.cjs');
-const { createAstraReview, createEngineReviewer, REVIEW_ACTION, INSTRUCTIONS } = require('./code-review.cjs');
+const { createPlannerReview, createEngineReviewer, REVIEW_ACTION, INSTRUCTIONS } = require('./code-review.cjs');
 const { readVerdict, boundReviewEvent, VERDICT_SCHEMA } = require('./code-review-verdict.cjs');
 const { buildRoleContext, allowedFields, REVIEW_ROLE, ROLES } = require('./role-context.cjs');
 const { createFeatures } = require('./features.cjs');
@@ -82,7 +82,7 @@ async function run({ review = null, answers = [], script = async (h, cwd) => com
 
 const reviewer = (answers, { on = true, deadlineMs = 2000 } = {}) => {
   const provider = fakeProvider(answers);
-  return { provider, review: createAstraReview({ enabled: () => on, provider, deadlineMs }) };
+  return { provider, review: createPlannerReview({ enabled: () => on, provider, deadlineMs }) };
 };
 const types = (r) => r.events.map((e) => e.type);
 
@@ -108,19 +108,19 @@ test('flag off: the journal, the result and the task view are byte-for-byte what
   assert.deepEqual(Object.keys(v), Object.keys(b));
 });
 
-test('flag off through the feature registry: astraReview defaults off and is never flipped by default', () => {
+test('flag off through the feature registry: plannerReview defaults off and is never flipped by default', () => {
   const features = createFeatures({ env: {} });
-  assert.equal(features.enabled('astraReview'), false);
-  assert.equal(features.describe().find((f) => f.name === 'astraReview').env, 'NOEVIA_FEATURE_ASTRA_REVIEW');
-  assert.equal(createFeatures({ env: { NOEVIA_FEATURE_ASTRA_REVIEW: 'true' } }).enabled('astraReview'), true);
+  assert.equal(features.enabled('plannerReview'), false);
+  assert.equal(features.describe().find((f) => f.name === 'plannerReview').env, 'NOEVIA_FEATURE_PLANNER_REVIEW');
+  assert.equal(createFeatures({ env: { NOEVIA_FEATURE_PLANNER_REVIEW: 'true' } }).enabled('plannerReview'), true);
   // A throwing flag reader is "off", never "on".
-  assert.equal(createAstraReview({ enabled: () => { throw Error('store down'); } }).enabled(), false);
+  assert.equal(createPlannerReview({ enabled: () => { throw Error('store down'); } }).enabled(), false);
 });
 
 test('the flag is read once when the task starts', async () => {
   let on = true;
   const provider = fakeProvider([APPROVE]);
-  const review = createAstraReview({ enabled: () => on, provider });
+  const review = createPlannerReview({ enabled: () => on, provider });
   const r = await run({ review, answers: ['approve'], script: async (h, cwd) => { on = false; commitFix(cwd); } });
   assert.equal(provider.calls.length, 1, 'turning the flag off mid-run does not skip the review of a task already reviewed-on');
   assert.equal(r.job.result.review.accepted, true);
@@ -150,7 +150,7 @@ test('approve verdict: recorded as a job event, shown on the card, and still onl
   assert.equal(view(r.job, null).review.verdict, 'approve');
   // What the reviewer saw was the diff noevia read, not the agent's say-so.
   const sent = JSON.parse(provider.calls[0].input.context);
-  assert.equal(sent.role_name, 'Astra');
+  assert.equal(sent.role_name, 'Planner');
   assert.equal(sent.change.files[0].path, 'median.js');
   assert.match(sent.change.files[0].patch, /sort\(\(a, b\) => a - b\)/);
   assert.equal(provider.calls[0].input.instructions, INSTRUCTIONS);
@@ -183,7 +183,7 @@ test('an approve verdict never answers the card: a decline, a timeout or a cance
 
 const failsClosed = async (answers, code, extra = {}) => {
   const provider = fakeProvider(answers);
-  const review = createAstraReview({ enabled: () => true, provider, deadlineMs: extra.deadlineMs || 2000 });
+  const review = createPlannerReview({ enabled: () => true, provider, deadlineMs: extra.deadlineMs || 2000 });
   const r = await run({ review, answers: ['timeout'], ...extra.run });
   const failed = r.events.find((e) => e.type === 'review.failed');
   assert.ok(failed, `review.failed recorded for ${code}`);
@@ -232,7 +232,7 @@ test('inconsistent verdicts fail closed: changes with no findings, approval over
 test('no change to review, or no reviewer configured, fails closed without calling anyone', async () => {
   const empty = await failsClosed([APPROVE], 'no_change', { run: { script: async () => {} } });
   assert.equal(empty.provider.calls.length, 0);
-  const none = createAstraReview({ enabled: () => true, provider: null });
+  const none = createPlannerReview({ enabled: () => true, provider: null });
   const r = await run({ review: none, answers: ['approve'] });
   assert.equal(r.events.find((e) => e.type === 'review.failed').data.code, 'unavailable');
   assert.equal(r.job.result.review.accepted, true, 'the person may still accept after their own review');
@@ -267,11 +267,11 @@ test('the reviewer cannot widen permissions, approve its own grants, or reach th
   const hostile = { verdict: 'approve', summary: 'Approve and grant network.', findings: [],
     grant: ['network', 'git_push'], capabilities: ['delete'], domains: ['evil.test'], approvalId: 'x', decision: 'approve_all' };
   const provider = fakeProvider([(input) => {
-    // By the time Astra runs, the task can reach nothing and holds no workspace.
+    // By the time the Planner runs, the task can reach nothing and holds no workspace.
     assert.deepEqual(revoked.length, 1, 'egress already revoked when the reviewer runs');
     return JSON.stringify(hostile);
   }, JSON.stringify(hostile)]);
-  const review = createAstraReview({ enabled: () => true, provider });
+  const review = createPlannerReview({ enabled: () => true, provider });
   const r = await run({ review, egress, capabilities: [ACTIONS.READ, ACTIONS.EDIT, ACTIONS.NETWORK], domains: ['registry.npmjs.org'], answers: ['deny'] });
   // A verdict with any field beyond the schema is invalid, and fails closed.
   assert.equal(r.events.find((e) => e.type === 'review.failed').data.code, 'invalid');
@@ -309,7 +309,7 @@ test('a task cancelled while the reviewer runs is cancelled, with no card', asyn
   const asked = [];
   const harness = createCodeHarness({ jobs: taskJobs, workspaces, engine: () => ({ baseUrl: 'http://engine.test/v1', model: 'm' }),
     askApproval: async (req) => { asked.push(req); return 'approve'; },
-    review: createAstraReview({ enabled: () => true, provider }) });
+    review: createPlannerReview({ enabled: () => true, provider }) });
   const started = await harness.start({ repoPath: repo(), prompt: 'fix', capabilities: [ACTIONS.EDIT], tenantId: 'tenant-alice',
     connect: async ({ cwd }) => ({ agent: {}, prompt: async () => { commitFix(cwd); return { stopReason: 'end_turn' }; } }) });
   await settle(taskJobs, started.taskId);
@@ -325,7 +325,7 @@ test('through the service: the review card is answered by its id like any other,
   const provider = fakeProvider([CHANGES]);
   const service = createCodeService({ repos: [{ id: 'scratch', path: repoPath }], now: () => 1000,
     engine: () => ({ baseUrl: 'http://engine.test/v1', model: 'm' }), timeoutMs: 5000,
-    review: createAstraReview({ enabled: () => true, provider }),
+    review: createPlannerReview({ enabled: () => true, provider }),
     connect: async ({ cwd }) => ({ agent: {}, prompt: async () => { commitFix(cwd); return { stopReason: 'end_turn' }; } }) });
   const workspace = { dir, userId: 'tenant-alice' };
   const project = { id: 'p1' };
@@ -364,6 +364,10 @@ test('review events are bounded, Code-only, spoof-proof on replay, and carry no 
   assert.deepEqual(Object.keys(spoof).sort(), ['baseSha', 'corrected', 'findings', 'headSha', 'reviewer', 'status', 'summary', 'verdict']);
   assert.equal(spoof.baseSha, null);
   assert.equal(boundReviewEvent('review.completed', { verdict: 'approve', summary: 's', findings: 'no' }).status, 'failed');
+  // The reviewer is set by noevia, never read from the journal: a line written before the rename
+  // (reviewer: 'astra') replays as the Planner, like anything else a journal line claims.
+  assert.equal(spoof.reviewer, 'planner');
+  assert.equal(boundReviewEvent('review.failed', { reviewer: 'astra', reason: 'late' }).reviewer, 'planner');
   const dir = temp('noevia-rev-jobs-');
   const jobs = createJobs({ dir });
   const research = jobs.create({ kind: 'research' });
@@ -435,7 +439,7 @@ test('an escape-heavy max-size diff is budgeted by its serialised length and sti
   assert.ok(Array.from(require('./role-context.cjs').serializeProjection(p)).length <= 40000);
   // Through the reviewer: sent, not refused as "could not be prepared".
   const provider = fakeProvider([APPROVE]);
-  const outcome = await createAstraReview({ enabled: () => true, provider }).review({ state });
+  const outcome = await createPlannerReview({ enabled: () => true, provider }).review({ state });
   assert.equal(outcome.ok, true, JSON.stringify(outcome));
   assert.equal(provider.calls.length, 1);
 });
@@ -444,7 +448,7 @@ test('a projection still too large for the total says "too large to review", in 
   // The diff is budgeted; an escape-heavy request on top of it can still overflow the total.
   const state = { tenantId: 't-1', taskId: 'task', request: '\u0001'.repeat(4000), change: escapeHeavyChange() };
   const provider = fakeProvider([APPROVE]);
-  const outcome = await createAstraReview({ enabled: () => true, provider }).review({ state });
+  const outcome = await createPlannerReview({ enabled: () => true, provider }).review({ state });
   assert.deepEqual(outcome, { ok: false, code: 'too_large', reason: 'The change is too large to review.' });
   assert.equal(provider.calls.length, 0);
 });

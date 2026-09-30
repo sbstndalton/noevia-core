@@ -151,3 +151,72 @@ test('the reasons a feature is unavailable carry a stable id where the server ow
   assert.equal(info.find(f => f.id === 'constrainedPlanDecoding').unavailableId, 'notUsed');
   assert.equal('unavailableId' in info.find(f => f.id === 'previews'), false);
 });
+
+// astraReview was renamed plannerReview (2026-09-29). One release of back-compat: the stored
+// setting is migrated on boot (old row kept), the old env var still works with a deprecation line,
+// and the old name is accepted as an alias.
+test('plannerReview: a stored astraReview setting is copied to the new key on boot, and the old row is left', () => {
+  const store = memoryStore({ 'feature:astraReview': 'true' }); const lines = [];
+  const features = createFeatures({ env: {}, store, log: l => lines.push(l) });
+  assert.equal(features.enabled('plannerReview'), true);
+  assert.equal(features.describe().find(f => f.name === 'plannerReview').source, 'admin');
+  assert.equal(store.m.get('feature:plannerReview'), 'true');
+  assert.equal(store.m.get('feature:astraReview'), 'true', 'the legacy row stays for a rollback');
+  assert.equal(lines.length, 1);
+  // A second boot reads the new key and does not migrate again.
+  lines.length = 0;
+  assert.equal(createFeatures({ env: {}, store, log: l => lines.push(l) }).enabled('plannerReview'), true);
+  assert.deepEqual(lines, []);
+});
+
+test('plannerReview: the new stored key wins over the legacy one, garbage legacy values are ignored', () => {
+  const store = memoryStore({ 'feature:astraReview': 'true', 'feature:plannerReview': 'false' });
+  assert.equal(createFeatures({ env: {}, store, log: () => {} }).enabled('plannerReview'), false);
+  assert.equal(store.m.get('feature:plannerReview'), 'false');
+  const junk = memoryStore({ 'feature:astraReview': 'maybe' });
+  assert.equal(createFeatures({ env: {}, store: junk, log: () => {} }).enabled('plannerReview'), false);
+  assert.equal(junk.m.has('feature:plannerReview'), false);
+});
+
+test('plannerReview: a store that cannot be written still honours the legacy value for this boot', () => {
+  const store = { get: k => (k === 'feature:astraReview' ? 'true' : undefined), set: () => { throw new Error('read-only'); } };
+  const lines = [];
+  assert.equal(createFeatures({ env: {}, store, log: l => lines.push(l) }).enabled('plannerReview'), true);
+  assert.match(lines[0], /could not migrate/);
+});
+
+test('plannerReview: stays off by default, and nothing is written when there is nothing to migrate', () => {
+  const store = memoryStore();
+  const features = createFeatures({ env: {}, store, log: () => {} });
+  assert.equal(features.enabled('plannerReview'), false);
+  assert.equal(store.m.size, 0);
+  assert.equal(REGISTRY.plannerReview.default, undefined);
+  assert.equal('astraReview' in REGISTRY, false);
+});
+
+test('plannerReview: NOEVIA_FEATURE_ASTRA_REVIEW still works, with one deprecation line; the new env var wins', () => {
+  const lines = [];
+  const legacy = createFeatures({ env: { NOEVIA_FEATURE_ASTRA_REVIEW: 'true' }, store: memoryStore(), log: l => lines.push(l) });
+  assert.equal(legacy.enabled('plannerReview'), true);
+  assert.equal(legacy.describe().find(f => f.name === 'plannerReview').locked, true);
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /NOEVIA_FEATURE_ASTRA_REVIEW is deprecated.*NOEVIA_FEATURE_PLANNER_REVIEW/);
+  lines.length = 0;
+  const both = createFeatures({ env: { NOEVIA_FEATURE_PLANNER_REVIEW: 'false', NOEVIA_FEATURE_ASTRA_REVIEW: 'true' }, store: memoryStore(), log: l => lines.push(l) });
+  assert.equal(both.enabled('plannerReview'), false);
+  assert.deepEqual(lines, []);
+  assert.equal(createFeatures({ env: { NOEVIA_FEATURE_PLANNER_REVIEW: 'true' }, log: () => {} }).enabled('plannerReview'), true);
+});
+
+test('plannerReview: astraReview is accepted as an alias on input, and only the new key is written', () => {
+  const store = memoryStore();
+  const features = createFeatures({ env: {}, store, log: () => {} });
+  assert.equal(features.resolve('astraReview'), 'plannerReview');
+  assert.equal(features.resolve('previews'), 'previews');
+  features.set('astraReview', true, 'admin1');
+  assert.equal(features.enabled('plannerReview'), true);
+  assert.equal(features.enabled('astraReview'), true);
+  assert.equal(store.m.get('feature:plannerReview'), 'true');
+  assert.equal(store.m.has('feature:astraReview'), false);
+  assert.equal(Object.keys(features.flags()).includes('astraReview'), false, 'flags use the new name only');
+});

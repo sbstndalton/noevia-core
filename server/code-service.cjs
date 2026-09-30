@@ -68,7 +68,7 @@ function view(job, pending = null) {
     steps: job.steps, plan: job.plan, assistantOutput: job.assistantOutput,
     approval: pending ? { id: pending.id, ...pending.request } : null,
     result: job.result || null,
-    // Astra's verdict (#519), only on a task that was reviewed: every other task's view is
+    // The Planner's verdict (#519), only on a task that was reviewed: every other task's view is
     // exactly what it was before the review step existed.
     ...(job.review ? { review: job.review } : {}),
   };

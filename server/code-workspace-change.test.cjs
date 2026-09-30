@@ -1,5 +1,5 @@
 'use strict';
-// code-workspace.cjs change(): the diff the Astra review reads (#519). Temp git fixtures only.
+// code-workspace.cjs change(): the diff the Planner review reads (#519). Temp git fixtures only.
 const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const { execFileSync } = require('node:child_process');

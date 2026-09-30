@@ -111,5 +111,5 @@ test('an unmeasured model falls back to the filename heuristic', () => {
   const { toolTokenBudgetFor } = require('./index.cjs');
   prefill.reset();
   assert.equal(toolTokenBudgetFor('Qwen3.5-9B-GGUF'), 5000);
-  assert.equal(toolTokenBudgetFor('claude-sonnet-4-5'), 8000);
+  assert.equal(toolTokenBudgetFor('remote-model-a'), 8000);
 });

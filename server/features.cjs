@@ -32,7 +32,9 @@ const REGISTRY = Object.freeze({
   offsiteBackup: { env: 'NOEVIA_FEATURE_OFFSITE_BACKUP', label: 'Backups', description: 'Nightly encrypted copies of the whole server, to a folder mirrored to Google Drive or to an S3-compatible target.' },
   toolRouter: { env: 'NOEVIA_FEATURE_TOOL_ROUTER', label: 'Tool routing', description: "Send only the project's toolboxes that match each message (needs an embedding model); falls back to all of them." },
   codeHarness: { env: 'NOEVIA_FEATURE_CODE_HARNESS', label: 'Code mode', description: 'Administrators can run a coding harness in a per-task git worktree, with every write through the approval card.' },
-  astraReview: { env: 'NOEVIA_FEATURE_ASTRA_REVIEW', experimental: true, label: 'Astra review (Code mode)', description: 'After a Code task finishes, a reviewer model reads the change and gives an approve or request-changes verdict on a final card. It is advice only: you still accept or decline the change, and a failed or late review falls back to your own review.' },
+  // Renamed from astraReview (2026-09-29). For one release the old stored setting, the old env var
+  // and the old name on the admin API are still honoured (`legacy`, see createFeatures).
+  plannerReview: { env: 'NOEVIA_FEATURE_PLANNER_REVIEW', legacy: { name: 'astraReview', env: 'NOEVIA_FEATURE_ASTRA_REVIEW' }, experimental: true, label: 'Planner review (Code mode)', description: 'After a Code task finishes, a reviewer model reads the change and gives an approve or request-changes verdict on a final card. It is advice only: you still accept or decline the change, and a failed or late review falls back to your own review.' },
   browserExecutor: { env: 'NOEVIA_FEATURE_BROWSER_EXECUTOR', unavailable: () => browserRuntimeReason(), label: 'Browser mode', description: 'Administrators can run a domain-scoped Chromium session as a durable job, with every consequential action through the approval card.' },
   constrainedPlanDecoding: { env: 'NOEVIA_FEATURE_CONSTRAINED_PLAN_DECODING', experimental: true, unavailable: () => 'Not used yet: no server-side plan generator.',label: 'Constrained plan decoding', description: 'Ask the local llama.cpp engine to constrain the plan artifact to its JSON schema. Adds to the after-the-fact validation and falls back to unconstrained generation for reasoning models or when the engine rejects it.' },
   kiwix: { env: 'NOEVIA_FEATURE_KIWIX', restart: true, label: 'Offline Wikipedia', description: 'A read-only lookup tool backed by an internal kiwix-serve.' },
@@ -74,24 +76,56 @@ function parseEnv(raw) {
  * @param {{ env?: Record<string,string|undefined>, store?: { get(key:string): string|undefined, set(key:string, value:string): void },
  *           audit?: (action:string, actor:string, detail:object)=>void, registry?: object }} deps
  */
-function createFeatures({ env = process.env, store = null, audit = () => {}, registry = REGISTRY, availability = {}, onChange = () => {} } = {}) {
+/**
+ * A renamed feature's stored setting, carried over once (one-release back-compat): when the new
+ * key has no valid value and the legacy key has one, the legacy value is copied to the new key.
+ * The legacy row is left in place so a rollback to the previous release still reads it. A store
+ * that cannot be written still answers with the legacy value for this boot.
+ */
+function migrateLegacySetting(store, name, legacyName, log) {
+  const valid = v => v === 'true' || v === 'false';
+  const current = store.get(SETTING_PREFIX + name);
+  if (valid(current)) return current;
+  const legacy = store.get(SETTING_PREFIX + legacyName);
+  if (!valid(legacy)) return current;
+  try {
+    store.set(SETTING_PREFIX + name, legacy);
+    log(`[features] migrated the stored ${legacyName} setting to ${name}`);
+  } catch (error) {
+    log(`[features] could not migrate the stored ${legacyName} setting to ${name}: ${error.message}`);
+  }
+  return legacy;
+}
+
+function createFeatures({ env = process.env, store = null, audit = () => {}, registry = REGISTRY, availability = {}, onChange = () => {}, log = (line) => console.warn(line) } = {}) {
   const state = new Map();
+  // Old flag names still accepted on input (the admin API, enabled()) for one release.
+  const aliases = new Map();
   for (const [name, spec] of Object.entries(registry)) {
-    const fromEnv = parseEnv(env[spec.env]);
+    let fromEnv = parseEnv(env[spec.env]);
+    if (fromEnv === undefined && spec.legacy?.env) {
+      fromEnv = parseEnv(env[spec.legacy.env]);
+      if (fromEnv !== undefined) log(`[features] ${spec.legacy.env} is deprecated and will be removed in the next release; set ${spec.env} instead.`);
+    }
+    if (spec.legacy?.name) aliases.set(spec.legacy.name, name);
     let value = spec.default === true;
     let source = 'default';
     if (fromEnv !== undefined) { value = fromEnv; source = 'env'; }
-    else {
-      const saved = store?.get(SETTING_PREFIX + name);
+    else if (store) {
+      const saved = spec.legacy?.name ? migrateLegacySetting(store, name, spec.legacy.name, log) : store.get(SETTING_PREFIX + name);
       if (saved === 'true' || saved === 'false') { value = saved === 'true'; source = 'admin'; }
     }
     state.set(name, { value, source, boot: value, unavailable: spec.unavailable?.(env) || null });
   }
+  const resolve = name => (state.has(name) ? name : aliases.get(name) || name);
   const known = name => state.has(name);
   const unavailable = name => availability[name] ? availability[name]() : state.get(name).unavailable;
   return {
     names: () => [...state.keys()],
+    /** The current name for a flag, mapping a legacy alias (e.g. astraReview) to its new name. */
+    resolve,
     enabled(name) {
+      name = resolve(name);
       if (!known(name)) throw new Error(`Unknown feature: ${name}`);
       const s = state.get(name);
       return !unavailable(name) && (registry[name].restart ? s.boot : s.value);
@@ -106,6 +140,7 @@ function createFeatures({ env = process.env, store = null, audit = () => {}, reg
         : registry[name].unavailable ? { unavailable: unavailable(name), unavailableId: unavailableId(name, unavailable(name)) } : {}),
       pendingRestart: !!registry[name].restart && s.value !== s.boot })),
     set(name, enabled, actorId) {
+      name = resolve(name);
       if (!known(name)) throw Object.assign(new Error('Unknown feature'), { status: 404 });
       if (typeof enabled !== 'boolean') throw Object.assign(new Error('enabled must be true or false'), { status: 400 });
       if (state.get(name).source === 'env') throw Object.assign(new Error(`Set by the operator (${registry[name].env}); change it in the deployment configuration.`), { status: 409 });
@@ -129,4 +164,4 @@ function settingsStore(db) {
   };
 }
 
-module.exports = { browserRuntimeReason, unavailableId, REGISTRY, createFeatures, settingsStore, parseEnv };
+module.exports = { browserRuntimeReason, unavailableId, REGISTRY, createFeatures, settingsStore, parseEnv, migrateLegacySetting };

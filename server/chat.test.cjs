@@ -250,7 +250,7 @@ test('the creative heuristic promotes an otherwise fast-routed writing prompt', 
   assert.deepEqual(meta.sampling.values, { temperature: 0.9, top_p: 0.95 });
 });
 
-// #305 (Opus review): a free chat (no project at all — nobody has opened its per-chat model
+// #305 (model review): a free chat (no project at all — nobody has opened its per-chat model
 // popup yet, so there is no explicit choice) routes through Auto when Fast/Smart roles are
 // configured, matching the composer label; it falls back to the loaded model exactly as before
 // when roles are not configured, so a server with no roles behaves exactly as today.
