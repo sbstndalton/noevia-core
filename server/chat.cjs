@@ -123,6 +123,8 @@ function createChatHandler({
   writeTargetFor = null,
   // #658: writes that succeeded per account and chat, for the repeat flag on approval cards.
   recentWrites = null,
+  // #679: the stored transcript cap, for a reply saved after its client disconnected.
+  STORED_HISTORY_CAP = 5000,
   // #682: a text-free record that this turn re-runs an earlier one (Regenerate or Retry), with the
   // role the earlier reply was routed to, so misroutes can be counted. Never message text.
   recordOutcome = () => {},
@@ -145,6 +147,15 @@ function createChatHandler({
       if (execution.turn) {
         if (execution.turn.snapshot().phase === 'completed') execution.turn.complete();
         else if (execution.turn.snapshot().phase !== 'interrupted') execution.turn.interrupt('Chat request ended before completion');
+      }
+      // #679: the client went away mid-reply (reload, closed tab). Keep the reply as stopped, with
+      // any write that ran, after the user message the client saved as the turn started.
+      if (execution.record && execution.aborted?.()) {
+        try {
+          const outcome = require('./chat-interrupted-turn.cjs').saveInterruptedTurn({ fs, workspace: execution.workspace, chatId: body.chatId,
+            message: body.message, entry: execution.record.assistantEntry(), cap: STORED_HISTORY_CAP });
+          if (outcome !== 'saved' && outcome !== 'not-last') console.log(`[chat] interrupted reply not kept: ${outcome}`);
+        } catch (error) { console.warn('[chat] could not keep an interrupted reply:', error?.message || error); }
       }
       // A chat deleted while this reply ran leaves no context state (summaries hold conversation text).
       const id=typeof body?.chatId==='string'?require('./chat-lists.cjs').safeChatId(body.chatId):null;
@@ -365,7 +376,14 @@ function createChatHandler({
       }
     }
 
-    const send = (obj) => { preparation?.event(obj); if (!res.destroyed && !chatSignal.signal.aborted) res.write(`data: ${JSON.stringify(obj)}\n\n`); };
+    // #679: an ordinary chat's reply is followed here too, so it can be kept if the client leaves
+    // before it ends. Diary exchanges have their own journal (diary-jobs.cjs) and are not touched.
+    const record = typeof body.chatId === 'string' && body.chatId && !spaceId?.startsWith('diary') && !body.compactOnly && chatWorkspace
+      ? require('./chat-interrupted-turn.cjs').createTurnRecord() : null;
+    if (record) Object.assign(execution, { record, workspace: chatWorkspace, aborted: () => chatSignal.signal.aborted });
+    // An error raised after the client left is the disconnect itself (an aborted compaction or
+    // request), not a failed reply: the kept reply must not be dropped as failed (#679 review).
+    const send = (obj) => { preparation?.event(obj); if (!(obj?.type === 'error' && chatSignal.signal.aborted)) record?.observe(obj); if (!res.destroyed && !chatSignal.signal.aborted) res.write(`data: ${JSON.stringify(obj)}\n\n`); };
 
     // One streamed journaled exchange; never retry implicitly after a disconnect.
     if (spaceId === 'diary') {
@@ -1266,6 +1284,14 @@ function createChatHandler({
                 // A refusal is a normal conversational turn: the model is told
                 // plainly so it can offer an alternative, rather than the stream
                 // dying or the chip hanging with no result.
+                // #679: the client went away while the card was open. Nobody declined, and the
+                // write did not run; the kept reply shows the call as stopped, not declined.
+                if (decision === 'aborted') {
+                  result = `ERROR: the reply was stopped before ${tc.name} was approved, so it was not run. Nothing was changed.`;
+                  authService.audit('tool.denied', userId, userId, { tool: tc.name, reason: decision });
+                  notRunResults.add(result);
+                  return result;
+                }
                 result = decision === 'timeout'
                   ? `ERROR: the user did not respond in time, so ${tc.name} was not run. Ask before trying again.`
                   : `ERROR: the user declined to run ${tc.name}. Do not retry it; ask what they would prefer.`;

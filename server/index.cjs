@@ -588,7 +588,7 @@ const { handleChat } = require('./chat.cjs').createChatHandler({
   codeTasksFor: (project) => codeService.list(currentWorkspace(), project),
   // fetch is resolved per call, not captured: tests and QA swap the global at runtime.
   fs, path, crypto, fetch: (...args) => globalThis.fetch(...args), reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult,
-  HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP,
+  HISTORY_CAP, STORED_HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP,
   authService, toolPolicy, modelManager, requestScope, currentWorkspace, json,
   getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, diaryStorageRetry: diary.withStorageCredential,
   autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError,
