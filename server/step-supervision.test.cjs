@@ -44,3 +44,13 @@ test('supervision logs the action and fallback without message content', async()
   await s.decide({round:0,messages:[{role:'user',content:'synthetic private goal'},{role:'tool',content:'x'}]});
   assert.deepEqual(lines,[{round:0,action:'verify',fellBack:null}]);
 });
+test('supervision deadline cap is 2000 ms (#682)',async()=>{
+  assert.doesNotThrow(()=>createStepSupervision({deadlineMs:2000}));
+  assert.throws(()=>createStepSupervision({deadlineMs:2001}),/Invalid supervision deadline/);
+  let called=0;
+  const provider={decide:async()=>{called++;return {action:'verify'};}};
+  const at=ms=>createStepSupervision({enabled:()=>true,provider,getDeadlineMs:()=>ms,log:()=>{}});
+  assert.equal((await at(2000).decide(input)).action,'verify');
+  assert.deepEqual(await at(2001).decide(input),{action:'continue',source:'existing'});
+  assert.equal(called,1);
+});

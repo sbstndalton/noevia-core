@@ -4,7 +4,7 @@ const { causeOf } = require('./decision/index.cjs');
 const VERIFY = 'Check the preceding tool results against the user request before continuing. Identify missing evidence and uncertainty. Do not assume a failed tool succeeded.';
 function createStepSupervision({ enabled = () => false, provider = null, deadlineMs = 500, getDeadlineMs = null,
   log = (entry) => console.info('[system-one] supervise', JSON.stringify(entry)) } = {}) {
-  if (!Number.isFinite(deadlineMs) || deadlineMs < 1 || deadlineMs > 1500) throw Error('Invalid supervision deadline');
+  if (!Number.isFinite(deadlineMs) || deadlineMs < 1 || deadlineMs > 2000) throw Error('Invalid supervision deadline');
   return {
     async decide({ round, messages, signal }) {
       const fallback = { action: 'continue', source: 'existing' };
@@ -15,7 +15,7 @@ function createStepSupervision({ enabled = () => false, provider = null, deadlin
       // An ambiguous tool failure must not be reinterpreted as a successful step.
       if (outputs.some(m => m.role === 'tool' && /^ERROR/i.test(m.content))) return fallback;
       const ms=getDeadlineMs ? getDeadlineMs() : deadlineMs;
-      if(!Number.isInteger(ms) || ms<1 || ms>1500) return fallback;
+      if(!Number.isInteger(ms) || ms<1 || ms>2000) return fallback;
       const controller = new AbortController();
       let timer, abort;
       try {

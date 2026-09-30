@@ -29,6 +29,11 @@ test('connection test uses health only, rejects redirects/not-ready and never sa
     await assert.rejects(fixture(async()=>reply).settings.test({url:'http://laya:8040',timeoutMs:500}));
   }
 });
+test('deadline accepts up to 2000 ms and rejects 2001 (#682)',()=>{
+  const {settings}=fixture();
+  assert.equal(settings.save({url:'http://laya:8040',timeoutMs:2000},'admin').timeoutMs,2000);
+  assert.throws(()=>settings.save({url:'http://laya:8040',timeoutMs:2001},'admin'),e=>e.messageId==='invalidInput'&&/2000 ms/.test(e.message));
+});
 test('test results and refusals carry a stable message id, in the body and in the route reply (#624)',async()=>{
   const {settings,features}=fixture();
   assert.equal((await settings.test({url:'http://laya:8040',timeoutMs:500})).messageId,'ready');

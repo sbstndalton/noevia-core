@@ -28,8 +28,8 @@ function createDecisionSettings({store,env=process.env,fetchImpl=globalThis.fetc
   let cachedKey, cachedBackend;
   const get=()=>({...saved || {url:env.COWORK_DECISION_URL||'',timeoutMs:1500},source:saved?'admin':'deployment'});
   function validate(value) {
-    if(!value || typeof value.url!=='string' || !Number.isInteger(value.timeoutMs) || value.timeoutMs<100 || value.timeoutMs>1500)
-      throw Object.assign(Error('Enter a private decision-service URL and a deadline from 100 to 1500 ms.'),{status:400,messageId:'invalidInput'});
+    if(!value || typeof value.url!=='string' || !Number.isInteger(value.timeoutMs) || value.timeoutMs<100 || value.timeoutMs>2000)
+      throw Object.assign(Error('Enter a private decision-service URL and a deadline from 100 to 2000 ms.'),{status:400,messageId:'invalidInput'});
     const parsed=configuration({COWORK_DECISION_URL:value.url.trim()});
     if(parsed.reason) throw Object.assign(Error('Use a private HTTP origin such as http://laya:8040, without a path, credentials or query string.'),{status:400,messageId:'invalidUrl'});
     return {url:parsed.baseUrl,timeoutMs:value.timeoutMs};
