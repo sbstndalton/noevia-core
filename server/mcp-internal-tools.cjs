@@ -40,11 +40,12 @@ function cleanName(raw) {
  *  is resolved again against the project as it is NOW; if it no longer lands on the approved file
  *  (a file was added, removed or renamed while the card was open) the edit is refused. An edit
  *  that arrives without a pin was never tied to a file on a card, so it is refused as well. */
-function pinnedEdit(project, args, ctx) {
-  const plan = planEdit(project, args.name);
+function pinnedEdit(ports, project, args, ctx) {
+  // Resolved exactly as the chat loop resolved it for the card, storage state included (#687).
+  const plan = planEdit(project, args.name, { storageAccount: typeof ports.storageAccount === 'function' ? ports.storageAccount() : null });
   const pinned = ctx && typeof ctx.editTarget === 'string' ? ctx.editTarget : '';
   if (!pinned) throw new Error('this edit was not tied to a file when it was approved, so nothing was changed');
-  if (pinned !== targetDigest(plan.file.name)) throw new Error(`${JSON.stringify(String(args.name))} now refers to "${plan.file.name}", which is not the file that was approved. Nothing was changed; ask again.`);
+  if (pinned !== targetDigest(plan.target, plan.account)) throw new Error(`${JSON.stringify(String(args.name))} now refers to "${plan.target}", which is not the file that was approved. Nothing was changed; ask again.`);
   return plan;
 }
 
@@ -57,6 +58,8 @@ function writeInPlace(ports, project, plan, text) {
     expectName: plan.file.name,
     expectContent: String(plan.file.content || ''),
     expectAttachment: plan.file.attachment ? plan.file.attachment.id : null,
+    // #687: a plain-named file moved into the project folder by this edit, at the approved path.
+    ...(plan.adopt ? { adoptTo: plan.target, adoptAccount: plan.account } : {}),
   });
 }
 
@@ -201,14 +204,14 @@ function createInternalTools(ports) {
       schema: { type: 'object', properties: { name: { type: 'string' }, text: { type: 'string' } }, required: ['name', 'text'] },
       handler: async (args, ctx) => {
         const project = requireProject(ports, ctx);
-        const plan = pinnedEdit(project, args, ctx);
+        const plan = pinnedEdit(ports, project, args, ctx);
         const file = plan.file;
         const addition = String(args.text == null ? '' : args.text);
         if (!addition) throw new Error('there is nothing to append');
         const next = `${file.content || ''}${(file.content || '').endsWith('\n') || !file.content ? '' : '\n'}${addition}`;
         if (Buffer.byteLength(next) > MAX_TEXT_BYTES) throw new Error('that would make the file too large to write in one call');
         await writeInPlace(ports, project, plan, next);
-        return `Appended ${addition.length} chars to "${file.name}".`;
+        return `Appended ${addition.length} chars to "${plan.target}".`;
       },
     },
     project_replace_text: {
@@ -226,7 +229,7 @@ function createInternalTools(ports) {
       }, required: ['name', 'find', 'replace'] },
       handler: async (args, ctx) => {
         const project = requireProject(ports, ctx);
-        const plan = pinnedEdit(project, args, ctx);
+        const plan = pinnedEdit(ports, project, args, ctx);
         const file = plan.file;
         const find =String(args.find == null ? '' : args.find);
         if (!find) throw new Error('find must not be empty');
@@ -247,7 +250,7 @@ function createInternalTools(ports) {
         const next = parts.join(replace);
         if (Buffer.byteLength(next) > MAX_TEXT_BYTES) throw new Error('that would make the file too large to write in one call');
         await writeInPlace(ports, project, plan, next);
-        return `Replaced ${found} occurrence${found === 1 ? '' : 's'} in "${file.name}".`;
+        return `Replaced ${found} occurrence${found === 1 ? '' : 's'} in "${plan.target}".`;
       },
     },
   };

@@ -367,7 +367,11 @@ async function readBinaryFile(conn, rawPath, opts) {
 // `code: 'changed'`. A conditional PUT is never retried (#655): if the first attempt landed and only
 // its response was lost, the retry would meet a 412 against noevia's own write. A connection
 // failure or timeout is therefore reported as `code: 'unknown'` (the write may or may not have landed).
-async function writeFile(conn, rawPath, bytes, { ifMatch } = {}) {
+//
+// `ifNoneMatch: '*'` makes the PUT create-only (#687): if anything already exists at the path the
+// server answers 412 and nothing is written, with the same `code: 'changed'` and the same no-retry
+// and `code: 'unknown'` rules as If-Match.
+async function writeFile(conn, rawPath, bytes, { ifMatch, ifNoneMatch } = {}) {
   const path = safeRelativePath(rawPath);
   if (!path) throw Object.assign(new Error('invalid path'), { status: 400 });
   if (connectionKind(conn) === 's3') {
@@ -376,21 +380,24 @@ async function writeFile(conn, rawPath, bytes, { ifMatch } = {}) {
   if (ifMatch !== undefined && (typeof ifMatch !== 'string' || !ifMatch || /[\r\n]/.test(ifMatch))) {
     throw Object.assign(new Error('invalid If-Match value'), { status: 400 });
   }
+  if (ifNoneMatch !== undefined && ifNoneMatch !== '*') throw Object.assign(new Error('invalid If-None-Match value'), { status: 400 });
+  if (ifMatch !== undefined && ifNoneMatch !== undefined) throw Object.assign(new Error('If-Match and If-None-Match cannot be combined'), { status: 400 });
+  const conditional = !!ifMatch || ifNoneMatch === '*';
   let response;
   try {
     response = await withRetry(() => fetch(davUrl(conn, path), {
       method: 'PUT',
-      headers: davHeaders(conn, { 'Content-Type': 'application/octet-stream', ...(ifMatch ? { 'If-Match': quoteEtag(ifMatch) } : {}) }),
+      headers: davHeaders(conn, { 'Content-Type': 'application/octet-stream', ...(ifMatch ? { 'If-Match': quoteEtag(ifMatch) } : {}), ...(ifNoneMatch === '*' ? { 'If-None-Match': '*' } : {}) }),
       body: bytes,
       signal: AbortSignal.timeout(60000),
       redirect: 'error',
-    }), { once: !!ifMatch });
+    }), { once: conditional });
   } catch (err) {
-    if (!ifMatch) throw err;
+    if (!conditional) throw err;
     throw Object.assign(new Error(`the connection to storage failed while writing "${path}"; it may or may not have been saved`), { status: 502, code: 'unknown' });
   }
-  if (ifMatch && response.status === 412) {
-    throw Object.assign(new Error(`"${path}" changed in storage before it could be written (412)`), { status: 409, code: 'changed' });
+  if (conditional && response.status === 412) {
+    throw Object.assign(new Error(ifMatch ? `"${path}" changed in storage before it could be written (412)` : `"${path}" already exists in storage, so it was not overwritten (412)`), { status: 409, code: 'changed' });
   }
   if (!response.ok) {
     throw Object.assign(new Error(`could not write "${path}" (${response.status})`), { status: response.status === 409 ? 400 : 502 });

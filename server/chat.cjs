@@ -117,6 +117,10 @@ function createChatHandler({
   // #648: whether a tool is one of noevia's own project file edits, whose target is resolved and
   // shown on the approval card and pinned for the call. By name when not wired (the stricter side).
   projectEditTool = (name) => require('./project-edit-target.cjs').EDIT_TOOLS.has(name),
+  // #687: the storage account (project-edit-target.storageAccount) this user has browsable now, or
+  // null. A plain-named project file is edited by moving it into the project folder when there is
+  // one, so the card must show that path, and the approval is bound to that account. Not wired: null.
+  editStorageAccount = () => null,
   // #659: the resolved target of any other write whose card should name what it changes (the
   // Google Drive tools). async (name, rawArgs, { user, chatKey }) => null (no target to show)
   // | { target, kind } | { error } (refused before the card; nothing is written).
@@ -1238,14 +1242,15 @@ function createChatHandler({
             // anyone is asked, so the card shows that full path beside the model's own argument, and
             // the call is pinned to it. A name that does not resolve to an editable file is refused
             // here: there is nothing to approve, and nothing is written.
-            let editTarget = null;
+            let editTarget = null, editAccount = null;
             if (projectEditTool(tc.name)) {
-              const resolvedEdit = editTargets.resolveEditTarget(project ? getProject(project.id) : null, tc.args);
+              const resolvedEdit = editTargets.resolveEditTarget(project ? getProject(project.id) : null, tc.args, { storageAccount: editStorageAccount(userId) });
               if (resolvedEdit.error) {
                 authService.audit('tool.denied', userId, userId, { tool: tc.name, reason: 'edit-target' });
                 return `ERROR: ${resolvedEdit.error.replace(/\.?$/, '.')} ${tc.name} was not run and nothing was changed.`;
               }
               editTarget = resolvedEdit.path;
+              editAccount = resolvedEdit.account || null;
               cardTarget = editTarget;
             } else if (writeTargetFor && isWriteTool(tc.name)) {
               // Any other write that knows what it changes (#659: the Google Drive tools) is
@@ -1314,8 +1319,8 @@ function createChatHandler({
             // And a project file edit whose name now lands on a different file (or none) than the
             // one the card showed: the approval was for that file, not for whatever the name means now.
             if (editTarget !== null) {
-              const again = editTargets.resolveEditTarget(project ? getProject(project.id) : null, tc.args);
-              if (again.path !== editTarget) {
+              const again = editTargets.resolveEditTarget(project ? getProject(project.id) : null, tc.args, { storageAccount: editStorageAccount(userId) });
+              if (again.path !== editTarget || (again.account || null) !== editAccount) {
                 authService.audit('tool.denied', userId, userId, { tool: tc.name, reason: 'edit-target-changed' });
                 return `ERROR: the project's files changed after approval, so ${JSON.stringify(editTarget)} ${again.error ? 'can no longer be edited' : `is no longer the file this name refers to (it now means ${JSON.stringify(again.path)})`}. ${tc.name} was not run and nothing was changed. Ask again if the edit is still wanted.`;
               }
@@ -1323,7 +1328,7 @@ function createChatHandler({
             if (chatWideApproved(userId, chatId)) turn?.approval(tc.id, {action:'approve_all', inherited:true});
             turn?.started(tc.id);
             markWriteAttempt();
-            const options = { chatKey, exchangeKey, ...(editTarget !== null ? { editTarget: editTargets.targetDigest(editTarget) } : {}) };
+            const options = { chatKey, exchangeKey, ...(editTarget !== null ? { editTarget: editTargets.targetDigest(editTarget, editAccount) } : {}) };
             try { result = await executeToolCall(project, tc.name, tc.args, allowedToolNames, chatSignal.signal, outcome, options); }
             catch (error) { turn?.uncertain(tc.id); throw error; }
             ran = true;

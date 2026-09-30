@@ -196,12 +196,60 @@ function createProjectStore({
     // project that never receives a file leaves nothing behind in the user's storage.
     PROJECTS.unshift(project);
     saveProjects(PROJECTS);
+    // #687: files that arrived with the create call are stored like any upload when storage is
+    // connected: in the project's folder (created now, since there is a file for it), as real files.
+    // Otherwise, or if storage fails, they stay as noevia's own plain-named copies; the first edit
+    // of one moves it into the folder (writeProjectTextFile's adoptTo).
+    if (project.files.length) await storeCreateFiles(project);
     // Index any files that arrived with the create call (same RAG bookkeeping
     // as the config route).
     for (const f of project.files) {
       indexSource(project, f);
     }
     return project;
+  }
+
+  async function storeCreateFiles(project) {
+    let connection;
+    try { connection = authService.getStorage(currentWorkspace().userId, true); } catch { return; }
+    if (!storageClient.isBrowsable(connection)) return;
+    const uploads = require('./uploads.cjs');
+    try {
+      await withSourceLock(project, async () => {
+        if (getProject(project.id) !== project) return;
+        // Only files that will actually be stored: no folder is created for nothing (#589).
+        const storable = (f) => {
+          if (f.source || f.attachment || f.name.includes('/') || uploads.classify(f.name) !== 'Text') return false;
+          try { uploads.validate(f.name, Buffer.from(f.content, 'utf8')); return true; } catch { return false; }
+        };
+        const pending = project.files.filter(storable);
+        if (!pending.length) return;
+        if (!project.projectFolder) {
+          const folder = await ensureProjectFolder(project);
+          if (!folder) return;
+          project.projectFolder = folder;
+          project.sourceFolders = [...new Set([...(project.sourceFolders || []), folder])];
+          saveProjects(PROJECTS);
+        }
+        for (const inline of pending) {
+          let file;
+          try {
+            // Create-only: on case-insensitive storage a case-variant name (or an upload landing
+            // meanwhile) must not replace a file already there; this one then stays in noevia.
+            file = await uploads.ingest(currentWorkspace(), project, inline.name, Buffer.from(inline.content, 'utf8'), { connection, storageImpl: storageClient, ifNoneMatch: '*' });
+          } catch (err) {
+            console.warn(`[projects] could not store a file of new project ${project.id} in storage; it stays in noevia: ${String((err && err.message) || err)}`);
+            continue;
+          }
+          if (getProject(project.id) !== project) return;
+          project.files = project.files.filter((f) => f === inline || f.name !== file.name).map((f) => (f === inline ? file : f));
+        }
+        project.updatedAt = Date.now();
+        saveProjects(PROJECTS);
+      });
+    } catch (err) {
+      console.warn(`[projects] storing the files of new project ${project.id} failed; they stay in noevia: ${String((err && err.message) || err)}`);
+    }
   }
 
   // ── History persistence (atomic write, JSON per space) ─────────────────────
@@ -366,7 +414,17 @@ function createProjectStore({
   // account's. So for a stored file the edit also reads it back from storage first and refuses
   // unless it still exists with exactly those bytes, then writes with If-Match on the ETag it saw,
   // so a change landing in between is refused by the server (412) instead of overwritten.
-  function writeProjectTextFile(project, name, text, { expectName, expectContent, expectAttachment } = {}) {
+  //
+  // `adoptTo` (#687) is set for a plain-named file noevia keeps itself (added in the Create-project
+  // dialog before it stored files, or uploaded while storage was disconnected) in a project whose
+  // storage is connected: the edit moves it into the project folder, at exactly `adoptTo`, the path
+  // the approval card showed. The folder is created then if it does not exist yet (as any first
+  // upload does); the write is refused if the destination is anything but `adoptTo`, if storage is
+  // not connected, or if something already exists at `adoptTo` in storage (checked first, and the
+  // PUT is create-only with If-None-Match, so a file appearing in between is not overwritten).
+  // `adoptAccount` is the storage account (project-edit-target.storageAccount) the move was approved
+  // for; with any other account connected now the write is refused.
+  function writeProjectTextFile(project, name, text, { expectName, expectContent, expectAttachment, adoptTo, adoptAccount } = {}) {
     return withSourceLock(project, async () => {
       if (getProject(project.id) !== project) throw new Error('the project changed while writing; nothing was saved');
       const uploads = require('./uploads.cjs');
@@ -388,8 +446,30 @@ function createProjectStore({
       }
       const connection = authService.getStorage(currentWorkspace().userId, true);
       const remote = storageClient.isBrowsable(connection) ? connection : null;
-      let ifMatch;
-      if (edit) {
+      let ifMatch, ifNoneMatch;
+      const adopt = edit && adoptTo !== undefined;
+      if (adopt) {
+        if (typeof adoptTo !== 'string' || !adoptTo || current.source || current.name.includes('/') || current.name !== name) throw new Error(`"${expectName}" cannot be moved into the project folder; nothing was saved`);
+        if (!remote) throw new Error(`"${expectName}" was to be saved as "${adoptTo}" in this project's storage, which is not connected right now, so nothing was saved. Reconnect storage and try again.`);
+        if (typeof adoptAccount !== 'string' || !adoptAccount || require('./project-edit-target.cjs').storageAccount(remote) !== adoptAccount) {
+          throw new Error(`"${expectName}" was approved to be saved as "${adoptTo}" in a different storage account than the one connected now, so nothing was saved. Ask again to save it in this one.`);
+        }
+        if (!project.projectFolder) {
+          const folder = await ensureProjectFolder(project);
+          if (!folder) throw new Error(`Could not create this project's storage folder, so "${expectName}" was not edited. Nothing was saved. Check the storage connection and try again.`);
+          // Recorded at once, as an upload does: the folder now exists in storage whatever happens next.
+          project.projectFolder = folder;
+          project.sourceFolders = [...new Set([...(project.sourceFolders || []), folder])];
+          saveProjects(PROJECTS);
+        }
+        const destination = uploads.destinationFor(project, name, { connection: remote });
+        if (destination !== adoptTo) throw new Error(`saving now would write "${destination}" instead of "${adoptTo}", the file that was approved; nothing was saved. Ask again to edit it there.`);
+        let version;
+        try { version = await storageClient.fileVersion(remote, adoptTo); }
+        catch (err) { throw new Error(editRefusal(adoptTo, err)); }
+        if (version.exists) throw new Error(`"${adoptTo}" already exists in storage and noevia has not read it, so it was not overwritten. Nothing was saved. Sync this project's Sources, then edit that file.`);
+        ifNoneMatch = '*';
+      } else if (edit) {
         const destination = remote && project.projectFolder ? uploads.destinationFor(project, name, { connection: remote }) : remote ? null : name;
         if (destination !== expectName) {
           throw new Error(remote
@@ -400,16 +480,20 @@ function createProjectStore({
       } else if (remote && !project.projectFolder) project.projectFolder = await ensureProjectFolder(project);
       let file;
       try {
-        file = await uploads.ingest(currentWorkspace(), project, name, bytes, { connection: remote, storageImpl: storageClient, ...(edit && remote ? { ifMatch } : {}) });
+        file = await uploads.ingest(currentWorkspace(), project, name, bytes, { connection: remote, storageImpl: storageClient, ...(adopt ? { ifNoneMatch } : edit && remote ? { ifMatch } : {}) });
       } catch (err) {
+        if (adopt && err && err.code === 'changed') throw new Error(`"${adoptTo}" appeared in storage while this edit was being saved, so it was not overwritten. Nothing was saved. Sync this project's Sources, then edit that file.`);
         if (err && err.code === 'changed') throw new Error(changedInStorage(expectName));
-        if (edit && err && err.code === 'unknown') throw new Error(`The connection to storage failed while saving "${expectName}", so noevia cannot tell whether the edit landed. Outcome unknown: sync this project's Sources to check whether it was saved before trying again.`);
+        if (edit && err && err.code === 'unknown') throw new Error(`The connection to storage failed while saving "${adopt ? adoptTo : expectName}", so noevia cannot tell whether the edit landed. Outcome unknown: sync this project's Sources to check whether it was saved before trying again.`);
         throw err;
       }
-      if (edit && file.name !== expectName) throw new Error(`the edit was stored as "${file.name}", not "${expectName}"; the project list was not changed`);
+      const stored = adopt ? adoptTo : expectName;
+      if (edit && file.name !== stored) throw new Error(`the edit was stored as "${file.name}", not "${stored}"; the project list was not changed`);
       if (getProject(project.id) !== project) throw new Error('the project was removed while writing; the project list was not changed');
       if (remote) project.sourceFolders = [...new Set([...(project.sourceFolders || []), project.projectFolder])];
-      project.files = [...(project.files || []).filter((f) => f.name !== file.name), file];
+      // A moved file (#687) leaves its plain-named copy behind in neither the list nor the index.
+      if (adopt) rag.deleteProjectFile(project.id, expectName, currentWorkspace().userId);
+      project.files = [...(project.files || []).filter((f) => f.name !== file.name && !(adopt && f === current)), file];
       project.updatedAt = Date.now();
       indexSource(project, file);
       saveProjects(PROJECTS);

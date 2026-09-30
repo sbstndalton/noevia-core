@@ -15,7 +15,7 @@ function startDav(t) {
     let raw = '';
     req.on('data', (c) => { raw += c; });
     req.on('end', () => {
-      seen.push({ method: req.method, path: p, depth: req.headers.depth, ifMatch: req.headers['if-match'] });
+      seen.push({ method: req.method, path: p, depth: req.headers.depth, ifMatch: req.headers['if-match'], ifNoneMatch: req.headers['if-none-match'] });
       if (req.method === 'PROPFIND') {
         if (p === 'Docs') { res.writeHead(207); return res.end('<d:multistatus xmlns:d="DAV:"><d:response><d:href>/dav/Docs/</d:href><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype><d:getetag>"dir"</d:getetag></d:prop></d:propstat></d:response></d:multistatus>'); }
         const f = files.get(p);
@@ -26,6 +26,7 @@ function startDav(t) {
       if (req.method === 'PUT') {
         const f = files.get(p);
         if (req.headers['if-match'] && (!f || f.etag !== req.headers['if-match'])) { res.writeHead(412); return res.end(); }
+        if (req.headers['if-none-match'] === '*' && f) { res.writeHead(412); return res.end(); }
         files.set(p, { body: raw, etag: `"w${seen.length}"` });
         res.writeHead(201); return res.end();
       }
@@ -67,4 +68,17 @@ test('writeFile with ifMatch sends If-Match; a 412 is a changed error and nothin
   // Without ifMatch nothing changes: no header.
   await writeFile(conn, 'Docs/new.md', Buffer.from('n'));
   assert.equal(seen.at(-1).ifMatch, undefined);
+});
+
+test('#687: writeFile with ifNoneMatch creates only; an existing file is a changed error and stays', async (t) => {
+  const { conn, files, seen } = await startDav(t);
+  await writeFile(conn, 'Docs/fresh.md', Buffer.from('new'), { ifNoneMatch: '*' });
+  assert.equal(seen.at(-1).ifNoneMatch, '*');
+  assert.equal(files.get('Docs/fresh.md').body, 'new');
+  await assert.rejects(() => writeFile(conn, 'Docs/notes.md', Buffer.from('clobber'), { ifNoneMatch: '*' }), (e) => e.code === 'changed' && /already exists/.test(e.message));
+  assert.equal(files.get('Docs/notes.md').body, 'v1');
+  const count = seen.length;
+  await assert.rejects(() => writeFile(conn, 'Docs/x.md', Buffer.from('x'), { ifNoneMatch: '"e1"' }), /invalid If-None-Match/);
+  await assert.rejects(() => writeFile(conn, 'Docs/x.md', Buffer.from('x'), { ifNoneMatch: '*', ifMatch: '"e1"' }), /cannot be combined/);
+  assert.equal(seen.length, count, 'refused before any request');
 });
