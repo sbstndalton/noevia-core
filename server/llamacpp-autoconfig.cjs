@@ -195,6 +195,12 @@ function estimateInputs({ meta, modelBytes, mmprojBytes = 0, current = {} }) {
     cacheRamGib: Number.isFinite(cacheRamMibOf(current['cache-ram'])) ? round2(cacheRamMibOf(current['cache-ram']) / 1024) : null };
 }
 
+/** Embedding or reranking preset, by its flags or its name (as chat-model-kind.cjs judges names). */
+function isPromptCacheFree(model, options = {}) {
+  const on = key => ['true', '1', 'on'].includes(String(options[key] ?? '').trim().toLowerCase());
+  return on('embedding') || on('embeddings') || on('reranking') || on('rerank') || /embed|rerank/i.test(String(model || ''));
+}
+
 /** Prompt-cache MiB a preset value means: unset is llama-server's 8192 default, -1 unbounded. */
 function cacheRamMibOf(value) {
   const text = value == null ? '' : String(value).trim();
@@ -212,7 +218,7 @@ function cacheRamMibOf(value) {
  *           + cache-ram
  * `options` are the effective preset options ({...'*', ...section}).
  */
-function estimateFootprint({ meta, modelBytes, mmprojBytes = 0, options = {} }) {
+function estimateFootprint({ meta, modelBytes, mmprojBytes = 0, options = {}, model = '' }) {
   const m = meta || {};
   const native = m.contextLength || 0;
   const ctx = Number(options['ctx-size'] || options.c) || native || 4096;
@@ -226,7 +232,9 @@ function estimateFootprint({ meta, modelBytes, mmprojBytes = 0, options = {} }) 
     pinnedGib = mmprojBytes / GIB + MMPROJ_COMPUTE_GIB + 7 * Math.max(0, ubatch - 512) * (m.blockCount || 0) * (m.embeddingLength || 0) / 1e9;
   }
   const modelGib = (Number(modelBytes) || 0) / GIB;
-  const cacheMib = cacheRamMibOf(options['cache-ram']);
+  // #723: llama-server keeps a prompt cache only for completion slots, so embedding and
+  // reranking sections cost no cache-ram whatever the preset (or the 8 GiB default) says.
+  const cacheMib = isPromptCacheFree(model, options) ? 0 : cacheRamMibOf(options['cache-ram']);
   const cacheRamGib = cacheMib === Infinity ? Infinity : cacheMib / 1024;
   const engineGib = (modelGib + kvGib + pinnedGib + RESERVE_GIB) * SAFETY;
   const totalGib = engineGib + cacheRamGib;
@@ -242,4 +250,4 @@ function parseMemoryLimit(value) {
   return Number(match[1]) * scale;
 }
 
-module.exports = { suggest, estimateInputs, estimateFootprint, cacheRamMibOf, kvCacheBytes, parseMemoryLimit, CTX_CANDIDATES, KV_TYPE_BYTES, LLAMA_CACHE_RAM_DEFAULT_MIB };
+module.exports = { isPromptCacheFree, suggest, estimateInputs, estimateFootprint, cacheRamMibOf, kvCacheBytes, parseMemoryLimit, CTX_CANDIDATES, KV_TYPE_BYTES, LLAMA_CACHE_RAM_DEFAULT_MIB };

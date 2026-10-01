@@ -75,6 +75,25 @@ test('cache-ram limits default to a 1024 MiB cap and a 2048 MiB hard maximum', (
   assert.equal(clampCacheRam('512', limits), '512'); assert.equal(clampCacheRam('0', limits), '0'); assert.equal(clampCacheRam('x', limits), 'x');
 });
 
+test('#723: embedding and reranking presets carry no prompt cache in the estimate or in writes', t => {
+  const bert = { arch: 'nomic-bert', contextLength: 2048, embeddingLength: 768, blockCount: 12, headCount: 12, headCountKv: 12 };
+  const chat = estimateFootprint({ meta: qwenMeta, modelBytes: 5 * GIB, options: { 'ctx-size': '4096' } });
+  assert.equal(chat.cacheRamGib, 8, 'chat sections unchanged: a missing cache-ram is the 8 GiB default');
+  for (const [model, bytes, options] of [['nomic-embed-text-v1', 0.14 * GIB, {}], ['qwen3-reranker-0.6b-q8_0', 0.6 * GIB, {}], ['x', 0.6 * GIB, { reranking: 'true' }], ['y', 0.14 * GIB, { embedding: 'true', 'cache-ram': '4096' }]]) {
+    const est = estimateFootprint({ meta: bert, modelBytes: bytes, options, model });
+    assert.equal(est.cacheRamGib, 0, model);
+    assert.ok(est.totalGib < bytes / GIB + 1.5, `${model} is about model size plus overhead, got ${est.totalGib}`);
+  }
+  const dir = tmp(t), file = path.join(dir, 'models.ini');
+  fs.writeFileSync(file, 'version = 1\n\n[*]\ncache-ram = 1024\n\n[nomic-embed]\nmodel = /models/n.gguf\n\n[rr]\nmodel = /models/r.gguf\nreranking = true\n');
+  const store = createPresetStore(file, { cacheRam: { capMib: 1024, hardMaxMib: 2048 } });
+  const save = (model, options) => fs.writeFileSync(file, store.prepare({ model, baseRevision: store.get(model).revision, options }).text);
+  save('nomic-embed', { 'ctx-size': '2048' }); assert.equal(store.get('nomic-embed').options['cache-ram'], '0');
+  save('rr', { 'ctx-size': '2048' }); assert.equal(store.get('rr').options['cache-ram'], '0');
+  save('new-embedding-model', { 'ctx-size': '2048' }); assert.equal(store.get('new-embedding-model').options['cache-ram'], '0');
+  save('rr', { 'cache-ram': '' }); assert.equal(store.get('rr').options['cache-ram'], '0', 'clearing it still writes 0, not the chat cap');
+});
+
 test('every preset write leaves an explicit, bounded cache-ram', t => {
   const dir = tmp(t), file = path.join(dir, 'models.ini');
   fs.writeFileSync(file, 'version = 1\n\n[a]\nmodel = /models/a.gguf\n\n[b]\nmodel = /models/b.gguf\ncache-ram = 8192\n');

@@ -329,7 +329,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     if (hit && hit.revision === profile.revision && Date.now() - hit.at < 60000) return hit.value;
     const read = await readModel(model).catch(() => ({ error: 'unreadable' }));
     const value = read.error ? null : require('./llamacpp-autoconfig.cjs').estimateFootprint({ meta: read.meta, modelBytes: read.modelFile.size,
-      mmprojBytes: read.mmproj?.size || 0, options: { ...profile.defaults, ...profile.options } });
+      mmprojBytes: read.mmproj?.size || 0, options: { ...profile.defaults, ...profile.options }, model });
     footprints.set(model, { revision: profile.revision, at: Date.now(), value });
     if (footprints.size > 64) footprints.delete(footprints.keys().next().value);
     return value;
@@ -382,8 +382,8 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     let defaults = {};
     try { defaults = presets.get(model).defaults || {}; } catch {}
     const opts = { ...defaults, ...options };
-    if (opts['cache-ram'] === undefined || opts['cache-ram'] === '') opts['cache-ram'] = String((autoconfig.cacheRam || require('./inference-budget.cjs').cacheRamLimits()).capMib);
-    const est = require('./llamacpp-autoconfig.cjs').estimateFootprint({ meta: read.meta, modelBytes: read.modelFile.size, mmprojBytes: read.mmproj?.size || 0, options: opts });
+    if (opts['cache-ram'] === undefined || opts['cache-ram'] === '') opts['cache-ram'] = require('./llamacpp-autoconfig.cjs').isPromptCacheFree(model, opts) ? '0' : String((autoconfig.cacheRam || require('./inference-budget.cjs').cacheRamLimits()).capMib);
+    const est = require('./llamacpp-autoconfig.cjs').estimateFootprint({ meta: read.meta, modelBytes: read.modelFile.size, mmprojBytes: read.mmproj?.size || 0, options: opts, model });
     if (!est.cacheRamUnbounded && est.totalGib <= budgetGib) return null;
     const error = est.cacheRamUnbounded
       ? `Not saved: an unbounded prompt cache (cache-ram = -1) cannot fit the ${budgetGib} GiB inference memory budget.`

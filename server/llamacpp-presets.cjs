@@ -80,8 +80,13 @@ function createPresetStore(file,{writer=null,cacheRam=null}={}) {
       const {capMib}=limits();
       const own=Object.hasOwn(updates,'cache-ram')?updates['cache-ram']:section?.options['cache-ram'];
       const inherited=data.sections.get('*')?.options['cache-ram'];
+      // Mode flags are not editable preset fields, so they are read from the section's own lines.
+      const flag=k=>!!section&&lines.slice(section.start+1,section.end).some(l=>new RegExp(`^\\s*-{0,2}${k}\\s*=\\s*(true|1|on)\\s*$`,'i').test(l));
+      // #723: embedding and reranking presets have no prompt cache; say so explicitly.
+      const noCache=flag('embedding')||flag('embeddings')||flag('reranking')||flag('rerank')||/embed|rerank/i.test(model);
       const effective=own===undefined||own===''?inherited:own;
-      if(effective===undefined||effective==='')updates['cache-ram']=String(capMib);
+      if(noCache&&(own===undefined||own===''))updates['cache-ram']='0';
+      else if(effective===undefined||effective==='')updates['cache-ram']=String(capMib);
       else if(budget.clampCacheRam(effective,limits())!==String(effective).trim())updates['cache-ram']=budget.clampCacheRam(effective,limits());
     }
     if(section) {
