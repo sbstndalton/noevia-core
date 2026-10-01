@@ -6,6 +6,7 @@ const fs = require('node:fs'), path = require('node:path'), crypto = require('no
 const { boundCodePlan } = require('./code-plan.cjs');
 const { boundReviewEvent } = require('./code-review-verdict.cjs');
 const taskLifecycle = require('./task-lifecycle.cjs');
+const { buildCompletenessReport, canEnterReviewing, reportHash } = require('./completeness-report.cjs');
 const MAX_ASSISTANT_OUTPUT_BYTES = 32 * 1024;
 const MAX_ASSISTANT_OUTPUT_EVENT_BYTES = 1024, MAX_ASSISTANT_OUTPUT_EVENTS = 64;
 
@@ -15,9 +16,28 @@ const TYPES = new Set(['job.created', 'job.started', 'step.started', 'step.compl
   // Planner review of a finished Code change (#519, code-review.cjs). Appended only by the
   // harness's own review gate, never from agent or reviewer output; task-lifecycle.cjs treats
   // them as no-ops, so a model verdict carries no lifecycle authority.
-  'review.requested', 'review.completed', 'review.failed']);
+  'review.requested', 'review.completed', 'review.failed',
+  // Lifecycle authority for Code tasks (#701): append() refuses both unless the caller presents
+  // LIFECYCLE_AUTHORITY, so the ACP session's ctx.event, an approval payload or a job result can
+  // never write one. See task-lifecycle.cjs for how they fold.
+  'task.stage', 'task.revision']);
 const REVIEW_TYPES = new Set(['review.requested', 'review.completed', 'review.failed']);
 const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'interrupted']);
+const AUTHORITY_TYPES = taskLifecycle.AUTHORITY_TYPES;
+const MAX_STAGE_EVENTS = 64, MAX_REVISIONS = 32, MAX_STAGE_REASON = 300, MAX_EXPECTED_ARTIFACTS = 32;
+const GIT_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/, CONTENT_HASH = /^[0-9a-f]{64}$/;
+
+// The lifecycle capability token (#701). Module-private: it is never exported, never written to
+// a journal (a Symbol does not survive JSON, so no event, approval card or result can carry it)
+// and handed out exactly once per process, to the pipeline that claims it first. Any other
+// caller, including the harness that holds the same job store, cannot produce it.
+const LIFECYCLE_AUTHORITY = Symbol('noevia.task-lifecycle-authority');
+let authorityClaimed = false;
+function claimLifecycleAuthority() {
+  if (authorityClaimed) throw Error('Task lifecycle authority was already claimed in this process');
+  authorityClaimed = true;
+  return LIFECYCLE_AUTHORITY;
+}
 
 function derive(events) {
   const job = { id: null, kind: null, projectId: null, parentId: null, capabilities: [], status: 'queued', stage: null,
@@ -28,11 +48,16 @@ function derive(events) {
   // while `lifecycleOk` stays true, and one illegal jump (a journal never shaped with this
   // layer in mind) just stops the fold there — the rest of `derive()` above is unaffected.
   let lifecycleState = taskLifecycle.INITIAL_STATE, lifecycleOk = true;
+  // A journal with any lifecycle authority event folds authoritatively throughout (#701), and
+  // only such a journal gains `revision`/`stages`: every other derived job keeps its exact shape.
+  const authoritative = taskLifecycle.isAuthoritative(events);
+  const fold = { authoritative };
+  let revision = null; const stages = [];
   for (const e of events) {
     job.updatedAt = e.at;
     const d = e.data || {};
     if (lifecycleOk) {
-      try { lifecycleState = taskLifecycle.step(lifecycleState, e); }
+      try { lifecycleState = taskLifecycle.step(lifecycleState, e, fold); }
       catch (err) { if (err instanceof taskLifecycle.TaskLifecycleError) lifecycleOk = false; else throw err; }
     }
     switch (e.type) {
@@ -67,6 +92,9 @@ function derive(events) {
       // and so every API response built from it, is exactly what it was before #519.
       case 'review.requested': case 'review.completed': case 'review.failed':
         job.review = boundReviewEvent(e.type, d); break;
+      case 'task.stage': if (d.revision !== (revision?.n ?? 0)) lifecycleOk = false; stages.push({ from: d.from ?? null, to: d.to ?? null, revision: d.revision ?? 0, reason: d.reason ?? null,
+        ...(d.reportHash ? { reportHash: d.reportHash } : {}), at: e.at }); break;
+      case 'task.revision': if (d.n !== (revision?.n ?? 0) + 1) lifecycleOk = false; revision = { n: d.n, headSha: d.headSha ?? null, planHash: d.planHash ?? null, at: e.at }; break;
       case 'job.completed': job.status = 'completed'; job.result = d.result ?? null; job.pendingApproval = null; break;
       case 'job.failed': job.status = 'failed'; job.error = d.error ?? 'failed'; job.result = d.result ?? null; job.pendingApproval = null; break;
       case 'job.cancelled': job.status = 'cancelled'; job.result = d.result ?? null; job.pendingApproval = null; break;
@@ -78,7 +106,59 @@ function derive(events) {
   // Never affects `job.status` or any other field, and never throws — an event sequence this
   // layer can't make sense of just yields `null`.
   job.lifecycle = lifecycleOk ? lifecycleState : null;
+  if (authoritative) Object.assign(job, { revision, stages });
   return job;
+}
+
+const lifecycleConflict = (message) => Object.assign(Error(message), { status: 409 });
+
+// Validates a lifecycle authority event against the journal it would join and rebuilds its data
+// from known fields only. Holding the token proves who is writing, not that the move is sound:
+// a stale `from` or revision, an illegal transition, or a journal whose completeness report does
+// not allow review is refused here, before anything is written. That report is built here, from
+// the journal itself: a caller-supplied `report` is ignored, and the caller may only name the
+// artifacts it expects (`expectedArtifacts`, a short list of names).
+//
+// Once the job has ended nothing more is accepted (append()'s terminal rule): a task blocked by a
+// restart, failure or cancel is not resumed — the pipeline starts a new job for it. Only a live
+// job can go `blocked → implementing`.
+function boundAuthorityEvent(id, type, data, current, known) {
+  const raw = data && typeof data === 'object' ? data : {};
+  let state;
+  try { state = taskLifecycle.foldEvents(current, taskLifecycle.INITIAL_STATE, { authoritative: true }); }
+  catch (error) {
+    if (error instanceof taskLifecycle.TaskLifecycleError) throw lifecycleConflict('This task’s lifecycle journal is inconsistent; review required');
+    throw error;
+  }
+  const revision = known.revision?.n ?? 0;
+  if (type === 'task.revision') {
+    if (current.filter((row) => row.type === type).length >= MAX_REVISIONS) throw lifecycleConflict('Task revision limit reached');
+    if (raw.n !== revision + 1) throw lifecycleConflict(`Stale task revision: expected ${revision + 1}`);
+    if (typeof raw.headSha !== 'string' || !GIT_SHA.test(raw.headSha)) throw Object.assign(Error('A task revision needs the full head commit SHA'), { status: 400 });
+    if (raw.planHash != null && (typeof raw.planHash !== 'string' || !CONTENT_HASH.test(raw.planHash))) throw Object.assign(Error('A plan hash is a sha256 hex digest'), { status: 400 });
+    return { n: raw.n, headSha: raw.headSha, planHash: raw.planHash ?? null };
+  }
+  if (current.filter((row) => row.type === type).length >= MAX_STAGE_EVENTS) throw lifecycleConflict('Task stage limit reached');
+  if (!taskLifecycle.STATES.includes(raw.to)) throw Object.assign(Error(`Unknown task stage: ${JSON.stringify(raw.to)}`), { status: 400 });
+  if (raw.from !== state) throw lifecycleConflict(`Stale task stage: the task is ${state}`);
+  if (raw.revision !== revision) throw lifecycleConflict(`Stale task revision: the task is at revision ${revision}`);
+  taskLifecycle.assertStageMove(state, raw.to); // throws TaskLifecycleError (409) on an illegal move
+  const out = { from: state, to: raw.to, revision,
+    reason: typeof raw.reason === 'string' ? raw.reason.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim().slice(0, MAX_STAGE_REASON) || null : null };
+  if (raw.to === 'reviewing' && state !== 'reviewing') {
+    const expected = raw.expectedArtifacts;
+    if (expected != null && (!Array.isArray(expected) || expected.length > MAX_EXPECTED_ARTIFACTS
+      || !expected.every((n) => typeof n === 'string' && n.length > 0 && n.length <= 200))) {
+      throw Object.assign(Error('expectedArtifacts is a short list of artifact names'), { status: 400 });
+    }
+    const report = buildCompletenessReport({ job: { ...known, id }, expectedArtifacts: expected ?? null });
+    if (!canEnterReviewing(report)) {
+      const open = report.checks.filter((c) => c.status !== 'pass').map((c) => `${c.name}: ${c.status}`);
+      throw lifecycleConflict(`The completeness report does not allow review (${open.join('; ')})`);
+    }
+    out.reportHash = reportHash(report);
+  }
+  return out;
 }
 
 function clipUtf8(text, maxBytes) {
@@ -143,9 +223,12 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
     }
   }
 
-  function append(id, type, data = {}) {
+  // `authority` is only ever read for the lifecycle authority types; see claimLifecycleAuthority.
+  function append(id, type, data = {}, authority = undefined) {
     assertActive();
     if (!TYPES.has(type)) throw Error(`Unknown job event type: ${type}`);
+    const lifecycleEvent = AUTHORITY_TYPES.has(type);
+    if (lifecycleEvent && authority !== LIFECYCLE_AUTHORITY) throw Object.assign(Error('Task lifecycle events are server-only'), { status: 403 });
     const current = events(id);
     if (!current.length && type !== 'job.created') throw Object.assign(Error('No such job'), { status: 404 });
     // One exception: a partial result the user explicitly saves after a cancel is recorded on the
@@ -158,6 +241,10 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
       const incoming = typeof data.text === 'string' ? data.text : '';
       const text = clipUtf8(incoming, MAX_ASSISTANT_OUTPUT_EVENT_BYTES);
       data = { text, truncated: data.truncated === true || text.length < incoming.length };
+    }
+    if (lifecycleEvent) {
+      if (finished?.kind !== 'code') throw Error('Task lifecycle events belong to Code jobs');
+      data = boundAuthorityEvent(id, type, data, current, finished);
     }
     if (REVIEW_TYPES.has(type)) {
       if (finished?.kind !== 'code') throw Error('Reviews belong to Code jobs');
@@ -239,6 +326,7 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
     const ctx = {
       id,
       signal: controller.signal,
+      // Two arguments, never more: whatever the work passes, it cannot hand append() authority.
       event: (type, data) => append(id, type, data),
       progress: (stage) => { if (!controller.signal.aborted) append(id, 'progress', { stage }); },
       checkpoint: (data) => append(id, 'checkpoint.created', data),
@@ -290,4 +378,4 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
   return { create, run, append, get, list, cancel, recover, can, prune };
 }
 
-module.exports = { createJobs, derive, TYPES, MAX_ASSISTANT_OUTPUT_BYTES, MAX_ASSISTANT_OUTPUT_EVENTS };
+module.exports = { createJobs, derive, claimLifecycleAuthority, TYPES, MAX_ASSISTANT_OUTPUT_BYTES, MAX_ASSISTANT_OUTPUT_EVENTS };

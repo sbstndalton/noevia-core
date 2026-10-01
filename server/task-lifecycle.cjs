@@ -1,9 +1,10 @@
 'use strict';
 // Pure, deterministic task-lifecycle layer for the vision multi-agent pipeline (#511/#512).
 // This module knows nothing about models, HTTP, or storage: it is a state machine plus a
-// derivation function over the *existing* jobs.cjs journal event vocabulary (see jobs.cjs
-// `TYPES`). It never adds a new job event type and never changes job.cjs semantics — it only
-// reads the same append-only events a job already writes and infers a coarser, higher-level
+// derivation function over the jobs.cjs journal event vocabulary (see jobs.cjs `TYPES`). It
+// never changes job.cjs semantics — it only reads the same append-only events a job already
+// writes (plus, since #701, the pipeline's own `task.stage`/`task.revision`, below) and infers a
+// coarser, higher-level
 // "where is this task in its life" state that the current job.status (queued/running/
 // waiting_approval/completed/failed/cancelled/interrupted) does not express.
 //
@@ -39,6 +40,15 @@
 // by the harness after a human actually answers, never by tool/model output). Until that
 // exists, `reviewing`/`changes_requested`/`merged` are reachable only from tests exercising
 // this module directly, by design.
+//
+// #701 adds exactly those dedicated events: `task.stage` {from,to,revision,reason[,reportHash]}
+// and `task.revision` {n,headSha,planHash}. jobs.cjs refuses to append either one unless the
+// caller presents the lifecycle capability token (a module-private Symbol only the pipeline
+// claims), so no ACP session, approval payload or job result can write them. A journal that
+// carries one is *authoritative*: its lifecycle is folded from `task.stage` alone (each through
+// `transition()`), the implicit moves above (job.started, canonical progress, job.completed) are
+// ignored, and only the run ending without the pipeline's say-so (failed, cancelled,
+// interrupted) still forces `blocked`. A journal without one folds exactly as before.
 
 const { canEnterReviewing } = require('./completeness-report.cjs');
 
@@ -53,6 +63,10 @@ const STATES = Object.freeze([
 ]);
 const STATE_SET = new Set(STATES);
 const INITIAL_STATE = 'planned';
+// The server-only lifecycle authority events (#701). See the module header.
+const AUTHORITY_TYPES = Object.freeze(new Set(['task.stage', 'task.revision']));
+const REPORT_HASH = /^[0-9a-f]{64}$/;
+const isAuthoritative = (events) => (events || []).some((e) => e && AUTHORITY_TYPES.has(e.type));
 
 // Guarded transition table: the only legal moves. `merged` is terminal (no outgoing edges).
 // Anything not listed here is illegal and `transition()` throws for it. `reviewing`,
@@ -122,9 +136,26 @@ const CANONICAL_STAGES = new Set(['implementing', 'verifying']);
 // - `job.completed` means the harness finished, not that anyone reviewed or merged it: it
 //   ALWAYS moves to `verifying`, unconditionally, with no data-carried override.
 // - `job.failed` / `job.cancelled` / `job.interrupted` all move to `blocked`.
-function step(state, event) {
+//
+// With `{ authoritative: true }` (a journal carrying a lifecycle authority event, #701):
+// - `task.stage` moves through `transition()`; its `from` must be the current state, and
+//   entering `reviewing` must carry the hash of the completeness report that allowed it.
+// - `task.revision` is a no-op here (jobs.cjs derives the revision itself).
+// - job.started / progress / job.completed / approval.* are no-ops: only the pipeline says
+//   where an authoritative task is.
+// - job.failed / job.cancelled / job.interrupted still force `blocked`, except out of the
+//   terminal `merged`, which they leave alone (the merge already happened).
+function step(state, event, { authoritative = false } = {}) {
   if (!event || typeof event.type !== 'string') return state;
   const data = event.data || {};
+  if (event.type === 'task.stage') return stageStep(state, data);
+  if (event.type === 'task.revision') return state;
+  if (authoritative) {
+    if (event.type === 'job.failed' || event.type === 'job.cancelled' || event.type === 'job.interrupted') {
+      return state === 'merged' ? state : advance(state, 'blocked');
+    }
+    return state;
+  }
   switch (event.type) {
     case 'job.created':
       return state; // already `planned` (or wherever a prior fold left it)
@@ -157,6 +188,26 @@ function step(state, event) {
 // journal (task-lifecycle-wiring is defensive — see jobs.cjs) should expect this can throw
 // on a journal that was never shaped with this layer in mind, and treat that as "no derived
 // lifecycle available" rather than a crash.
+function stageStep(state, data) {
+  assertKnownState(data.to, 'to');
+  if (data.from !== state) {
+    throw new TaskLifecycleError(`Stale task-lifecycle stage: recorded from ${JSON.stringify(data.from)} but the task is ${state}`, { from: data.from, to: data.to });
+  }
+  if (data.to === 'reviewing' && data.to !== state && !REPORT_HASH.test(String(data.reportHash || ''))) {
+    throw new TaskLifecycleError('Entering reviewing needs the hash of the completeness report that allowed it', { from: state, to: data.to });
+  }
+  return assertStageMove(state, data.to);
+}
+
+// The pipeline's own moves are stricter than the general table: a task reaches `merged` only
+// from `reviewing`, never straight from implementing/verifying/changes_requested.
+function assertStageMove(from, to) {
+  if (to === 'merged' && from !== 'merged' && from !== 'reviewing') {
+    throw new TaskLifecycleError(`A task is merged only from reviewing, not ${from}`, { from, to });
+  }
+  return transition(from, to);
+}
+
 function advance(from, to) {
   if (from === to) return from;
   return transition(from, to);
@@ -168,16 +219,17 @@ function advance(from, to) {
 // yields the same result — including in chunks (fold(events.slice(0, k)) then
 // fold(events.slice(k), thatResult) === fold(events)), which is what a server restart relies
 // on: the journal is replayed from disk, not resumed from in-memory state.
-function foldEvents(events, fromState = INITIAL_STATE) {
+function foldEvents(events, fromState = INITIAL_STATE, options = {}) {
   assertKnownState(fromState, 'fromState');
   let state = fromState;
-  for (const event of events || []) state = step(state, event);
+  for (const event of events || []) state = step(state, event, options);
   return state;
 }
 
-// Convenience: derive the lifecycle state for a full journal from the beginning.
+// Convenience: derive the lifecycle state for a full journal from the beginning. Whether the
+// journal is authoritative is decided by the whole journal (see the module header).
 function deriveLifecycle(events) {
-  return foldEvents(events, INITIAL_STATE);
+  return foldEvents(events, INITIAL_STATE, { authoritative: isAuthoritative(events) });
 }
 
 // Defensive variant for wiring into read paths that must never throw: returns null instead
@@ -207,6 +259,9 @@ function canTransitionToReviewing(from, report) {
 module.exports = {
   STATES,
   INITIAL_STATE,
+  AUTHORITY_TYPES,
+  isAuthoritative,
+  assertStageMove,
   TRANSITIONS,
   TaskLifecycleError,
   canTransition,

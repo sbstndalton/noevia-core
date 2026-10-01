@@ -43,8 +43,10 @@
 // This module deliberately does NOT change the derived lifecycle: `job.lifecycle` from
 // jobs.cjs/task-lifecycle.cjs is unaffected by anything here, and `canEnterReviewing()` is a
 // pure, read-only guard — nothing in this file appends an event, mutates `job`, or calls
-// `transition()`. It is wired into task-lifecycle.cjs only as an additional guard function
-// exported for a future `transition()` caller to use; today nothing calls it automatically.
+// `transition()`. Since #701, jobs.cjs consults it before appending a `task.stage` into
+// `reviewing` and records `reportHash(report)` on that event; nothing else calls it.
+
+const crypto = require('node:crypto');
 
 const CHECK_NAMES = Object.freeze([
   'tests-run',
@@ -208,4 +210,33 @@ function canEnterReviewing(report) {
   return report.checks.every((c) => c.status === 'pass');
 }
 
-module.exports = { CHECK_NAMES, TEST_STEP_IDS, TEST_ARTIFACT_KIND, buildCompletenessReport, canEnterReviewing };
+// Key-order-independent JSON: the same report always hashes the same, however it was built.
+// Bounded: a cycle, very deep nesting or an oversized report is refused (409), never a crash.
+const MAX_HASH_CHARS = 4 * 1024 * 1024, MAX_HASH_DEPTH = 64;
+const unhashable = (why) => Object.assign(Error(`The completeness report cannot be hashed: ${why}`), { status: 409 });
+function canonical(value, stack = new Set(), budget = { chars: 0 }) {
+  let out;
+  if (value && typeof value === 'object') {
+    if (stack.has(value)) throw unhashable('it is circular');
+    if (stack.size >= MAX_HASH_DEPTH) throw unhashable('it is nested too deeply');
+    stack.add(value);
+    out = Array.isArray(value)
+      ? `[${value.map((v) => canonical(v === undefined ? null : v, stack, budget)).join(',')}]`
+      : `{${Object.keys(value).filter((k) => value[k] !== undefined).sort()
+        .map((k) => { budget.chars += k.length; return `${JSON.stringify(k)}:${canonical(value[k], stack, budget)}`; }).join(',')}}`;
+    stack.delete(value);
+  } else {
+    out = typeof value === 'bigint' ? JSON.stringify(String(value)) : JSON.stringify(value) ?? 'null';
+    budget.chars += out.length; // leaves only, so nesting is not counted twice
+    if (budget.chars > MAX_HASH_CHARS) throw unhashable('it is too large');
+  }
+  return out;
+}
+
+// The hash a `task.stage` into `reviewing` records (#701): which report allowed the move.
+function reportHash(report) {
+  if (!report || typeof report !== 'object') throw Object.assign(Error('reportHash requires a report'), { status: 400 });
+  return crypto.createHash('sha256').update(canonical(report)).digest('hex');
+}
+
+module.exports = { reportHash, CHECK_NAMES, TEST_STEP_IDS, TEST_ARTIFACT_KIND, buildCompletenessReport, canEnterReviewing };

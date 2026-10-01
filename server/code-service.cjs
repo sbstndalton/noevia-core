@@ -71,6 +71,9 @@ function view(job, pending = null) {
     // The Planner's verdict (#519), only on a task that was reviewed: every other task's view is
     // exactly what it was before the review step existed.
     ...(job.review ? { review: job.review } : {}),
+    // The pipeline's lifecycle (#701), only on a task whose journal carries its authority events
+    // (`stages` is derived only then): every other task's view is byte-for-byte what it was.
+    ...(job.stages ? { lifecycle: job.lifecycle, revision: job.revision, stages: job.stages } : {}),
   };
 }
 
