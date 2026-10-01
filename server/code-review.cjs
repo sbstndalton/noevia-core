@@ -46,20 +46,75 @@ const INSTRUCTIONS = [
 const fail = (code, reason) => ({ ok: /** @type {false} */ (false), code, reason });
 
 /**
- * @param {{ enabled?: () => boolean, provider?: { review: Function } | null,
+ * @param {{ enabled?: () => boolean, provider?: { review: Function } | null, roleEngine?: { pinModel: Function } | null,
  *           deadlineMs?: number, log?: (entry: object) => void }} deps
+ * `roleEngine` (role-engine.cjs, #702): when given, a review pins the task's model and streams
+ * under the Laya guard instead of using `provider`.
  */
-function createPlannerReview({ enabled = () => false, provider = null, deadlineMs = DEFAULT_DEADLINE_MS, log = () => {} } = {}) {
+function createPlannerReview({ enabled = () => false, provider = null, roleEngine = null, deadlineMs = DEFAULT_DEADLINE_MS, log = () => {} } = {}) {
   if (!Number.isInteger(deadlineMs) || deadlineMs < 1) throw Error('Invalid review deadline');
+  /** @param {{ state?: any, signal?: AbortSignal | null, session?: any }} input */
+  async function reviewInSession({ state, signal = null, session = null }) {
+    if (signal?.aborted) return fail('aborted', 'The task was cancelled before it was reviewed.');
+    const controller = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; controller.abort(); }, deadlineMs);
+    timer.unref?.();
+    const onAbort = () => controller.abort();
+    signal?.addEventListener('abort', onAbort, { once: true });
+    try {
+      let pinned = session;
+      if (!pinned) {
+        // Review alone (no pipeline): pin for this one task, with the pipeline's role set so the
+        // shared prefix is the same one a pipeline run of this task would build.
+        const taskId = typeof state?.taskId === 'string' ? state.taskId : '';
+        const pin = await roleEngine.pinModel({ taskId });
+        if (!pin.ok) {
+          log({ event: 'code.review_failed', code: pin.code });
+          return fail(pin.code === 'model_mismatch' ? 'model_mismatch' : pin.code === 'external' ? 'unavailable' : pin.code, pin.reason);
+        }
+        pinned = pin.session;
+      }
+      const r = await pinned.call({ role: REVIEW_ROLE, state, instructions: INSTRUCTIONS, schema: VERDICT_SCHEMA, schemaName: 'planner_review',
+        constrain: true, maxBytes: MAX_VERDICT_BYTES, signal: controller.signal });
+      if (timedOut) return fail('timeout', `The review did not finish within ${Math.round(deadlineMs / 1000)} seconds.`);
+      if (signal?.aborted) return fail('aborted', 'The task was cancelled before the review finished.');
+      if (!r.ok) {
+        if (r.code === 'context_refused') return fail('context_refused', 'The change was not sent for review because it would have carried private data.');
+        if (r.code === 'too_large') return fail('too_large', 'The change is too large to review.');
+        if (r.code === 'invalid') return fail('invalid', 'The reviewer’s answer did not match the verdict format, even after one correction.');
+        if (r.code === 'aborted') return fail('aborted', 'The task was cancelled before the review finished.');
+        if (r.code === 'error') return fail('error', 'The reviewer could not be reached.');
+        return fail(r.code, r.reason);
+      }
+      let parsed;
+      try { parsed = JSON.parse(r.text); } catch { return fail('invalid', 'The reviewer did not return a readable verdict.'); }
+      const verdict = readVerdict(parsed);
+      log({ event: 'code.reviewed', verdict: verdict.verdict, findings: verdict.findings.length, corrected: r.corrected });
+      return { ok: /** @type {true} */ (true), verdict, corrected: r.corrected === true };
+    } catch (error) {
+      if (error instanceof ReviewVerdictError) return fail('invalid', error.message);
+      return fail('error', 'The reviewer could not be reached.');
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      controller.abort();
+    }
+  }
+
   return {
     /** The flag, read once per task by the harness. A throwing flag reader is "off". */
     enabled() { try { return enabled() === true; } catch { return false; } },
     /**
-     * @param {{ state?: object, signal?: AbortSignal | null }} [input]  `state` is the role-context state
+     * @param {{ state?: object, signal?: AbortSignal | null, session?: any }} [input]  `state` is the role-context state
      * (taskId, tenantId, request, capabilities, plan, execution, change, credentials, tokens).
+     * `session` is a role-engine session the pipeline pinned for this task (#702).
      * @returns {Promise<{ok: true, verdict: object, corrected: boolean} | {ok: false, code: string, reason: string}>}
      */
-    async review({ state, signal = null } = {}) {
+    async review({ state, signal = null, session = null } = {}) {
+      // #702: with a role engine (or a session the pipeline already pinned for this task) the
+      // review is one streamed call of the task's pinned model, never a model swap.
+      if (session || (roleEngine && typeof roleEngine.pinModel === 'function')) return reviewInSession({ state, signal, session });
       if (!provider || typeof provider.review !== 'function') return fail('unavailable', 'No reviewer model is configured on this server.');
       if (signal?.aborted) return fail('aborted', 'The task was cancelled before it was reviewed.');
       let context;

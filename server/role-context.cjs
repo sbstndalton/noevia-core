@@ -680,6 +680,46 @@ function projectRoleContext(role, state) {
   return { projection: deepFreeze(canonical), meta: Object.freeze({ role, redactions: counter.redactions }) };
 }
 
+// ── shared dossier (#702) ───────────────────────────────────────────────────
+// The task dossier every role call of one task shares as its first user message, so the engine can
+// reuse the KV cache of [shared frame + dossier] across roles. It is the INTERSECTION of the given
+// roles' allowlists, minus the persona fields (who the role is, its own prompt, the revision): a
+// field enters only if every role may see it AND every role's own spec yields byte-identical output
+// for it. So the dossier can never carry a field one of the roles is not allowed, and nothing that
+// changes between revisions (revision, SHAs, plan, execution, diff) is in it. It passes the leak
+// guard once per role. Refusals throw exactly like projectRoleContext.
+const PERSONA_FIELDS = Object.freeze(['role', 'role_name', 'role_instructions', 'revision']);
+// Fields bound to one revision of the work (plan, head/base SHAs, diff, run results, state): never
+// shared, whatever the role set, so the cached prefix survives a changes_requested loop.
+const REVISION_FIELDS = Object.freeze(['plan', 'execution', 'change', 'lifecycle_state', 'approval_outcomes']);
+const DOSSIER_ROLES = Object.freeze([...ROLES, REVIEW_ROLE]);
+
+function projectSharedDossier(state, { roles = DOSSIER_ROLES } = {}) {
+  if (!Array.isArray(roles) || roles.length === 0) throw new RoleContextError('at least one role is required', 'unknown_role');
+  const specs = roles.map((role) => [role, resolveSpec(role)]);
+  if (!isPlainObject(state)) throw new RoleContextError('state must be an object', 'invalid_state');
+  if (state.tenantId === undefined || state.tenantId === null || state.tenantId === '') throw new RoleContextError('state.tenantId is required', 'missing_tenant');
+  if (typeof state.tenantId !== 'string') throw new RoleContextError('state.tenantId must be a string', 'invalid_tenant');
+  const known = credentialValues(state);
+  const counter = { redactions: 0 };
+  const keys = Object.keys(specs[0][1]).filter((key) => !PERSONA_FIELDS.includes(key) && !REVISION_FIELDS.includes(key) && specs.every(([, spec]) => Object.hasOwn(spec, key))).sort();
+  const dossier = {};
+  for (const key of keys) {
+    const outputs = specs.map(([role, spec]) => {
+      const local = { redactions: 0 };
+      const value = spec[key](state, { role, tenantId: state.tenantId, redact: (text) => redactCredentials(text, known, local) });
+      return { value, text: value === undefined ? undefined : serializeProjection(value), redactions: local.redactions };
+    });
+    if (outputs[0].value === undefined || outputs.some((o) => o.text !== outputs[0].text)) continue;
+    dossier[key] = outputs[0].value;
+    counter.redactions += outputs[0].redactions;
+  }
+  const canonical = canonicalize(dossier);
+  if (Array.from(serializeProjection(canonical)).length > CAPS.total) throw new RoleContextError(`projection exceeds ${CAPS.total} characters`, 'too_large');
+  for (const [role] of specs) guardProjection(canonical, state, role);
+  return { dossier: deepFreeze(canonical), meta: Object.freeze({ roles: Object.freeze([...roles]), fields: Object.freeze(Object.keys(canonical)), redactions: counter.redactions }) };
+}
+
 function buildRoleContext(role, state) {
   return projectRoleContext(role, state).projection;
 }
@@ -708,6 +748,10 @@ module.exports = {
   buildRoleContext,
   projectRoleContext,
   buildAllRoleContexts,
+  projectSharedDossier,
+  PERSONA_FIELDS,
+  REVISION_FIELDS,
+  DOSSIER_ROLES,
   serializeProjection,
   findLeaks,
   assertNoLeak,

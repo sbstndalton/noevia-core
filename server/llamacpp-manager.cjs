@@ -449,6 +449,8 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     capabilities: { routing: true, load: true, unload: true, download: true, deleteCached: true, runtimeOptions: false, hardware: false, presets: !!presets, autotune: !!autotuner },
     requireEnabled() {},
     listModels, health, load, downloads, makeRoomFor,
+    // The admission lock itself, for callers that must check residency and send as one step (#702).
+    withAdmission,
     close:tracker.close,
     enterInference: maintenance.enter,
     getPreset: model => presets ? Promise.resolve({ok:true,status:200,body:presets.get(model)}) : unsupported('Native preset editing'),

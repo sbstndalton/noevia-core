@@ -75,14 +75,60 @@ function createPlannerPlan({ enabled = () => false, engine, fetch = (url, init) 
   const record = (entry) => { try { log(entry); } catch { /* logging never changes the outcome */ } };
   const flagOn = () => { try { return enabled() === true; } catch { return false; } };
 
+  /**
+   * The plan as one call of a pinned role-engine session (role-engine.cjs, #702): the task's model,
+   * thinking and shared prefix come from the session; this step adds its persona and its checks.
+   * @param {{ state?: any, signal?: AbortSignal|null, session: any }} input
+   */
+  async function generateInSession({ state, signal, session }) {
+    if (signal?.aborted) return fail('aborted', 'The plan was cancelled.');
+    const controller = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; controller.abort(); }, deadlineMs);
+    timer.unref?.();
+    const onAbort = () => controller.abort();
+    signal?.addEventListener('abort', onAbort, { once: true });
+    try {
+      const r = await session.call({ role: 'planner', state, instructions: INSTRUCTIONS, schema: PLAN_ARTIFACT_SCHEMA, schemaName: 'plan_artifact',
+        constrain: flagOn(), maxTokens: MAX_REPLY_TOKENS, maxBytes: MAX_PLAN_BYTES, signal: controller.signal });
+      const outcome = r.constraint || { applied: false, mode: null, reason: null, fallback: false };
+      if (!r.ok) {
+        if (timedOut) return fail('timeout', `The plan did not finish within ${Math.round(deadlineMs / 1000)} seconds.`);
+        if (r.code === 'aborted' || signal?.aborted) return fail('aborted', 'The plan was cancelled.');
+        if (r.code === 'invalid') {
+          record({ event: 'planner.plan', constrained: outcome.applied, fallback: outcome.fallback, reason: outcome.reason, corrected: true, problems: ['schema_violation'] });
+          return { ...fail('invalid', 'The Planner’s answer did not match the plan format, even after one correction.'), constraint: outcome };
+        }
+        if (r.code === 'context_refused') return fail('context_refused', 'The task was not sent to the Planner because its context would have carried private data.');
+        return fail(r.code, r.reason);
+      }
+      let plan;
+      try { plan = JSON.parse(r.text); } catch { return fail('invalid', 'The Planner did not return a readable plan.'); }
+      const projection = projectRoleContext('planner', state).projection;
+      const given = Array.isArray(projection.capabilities) ? projection.capabilities.map((c) => c.name) : null;
+      const problems = validatePlanArtifact(plan, { capabilities: given });
+      record({ event: 'planner.plan', constrained: outcome.applied, fallback: outcome.fallback, reason: outcome.reason, corrected: r.corrected, problems });
+      if (problems.length) return { ...fail('invalid', 'The Planner’s plan did not pass validation.'), problems, constraint: outcome };
+      return { ok: true, plan, constraint: outcome, corrected: r.corrected === true };
+    } catch {
+      return fail('error', 'The Planner model could not be reached.');
+    } finally {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      controller.abort();
+    }
+  }
+
   return {
     /**
-     * @param {{ state?: object, signal?: AbortSignal|null, thinking?: boolean }} [input]
+     * @param {{ state?: object, signal?: AbortSignal|null, thinking?: boolean, session?: any }} [input]
      * `state` is the role-context state (taskId, tenantId, request, projectInstructions, snippets,
      * capabilities, constraints, contextLimit). `thinking: true` keeps the reasoning channel and so
-     * forgoes constrained decoding.
+     * forgoes constrained decoding. With `session` (a role-engine.cjs pinned session, #702) the plan
+     * is one streamed call of that task's pinned model; `thinking` then comes from the session.
      */
-    async generate({ state, signal = null, thinking = false } = {}) {
+    async generate({ state, signal = null, thinking = false, session = null } = {}) {
+      if (session) return generateInSession({ state, signal, session });
       const endpoint = engine() || {};
       if (!endpoint.baseUrl) return fail('unavailable', 'No model is configured for the Planner.');
       if (signal?.aborted) return fail('aborted', 'The plan was cancelled.');
