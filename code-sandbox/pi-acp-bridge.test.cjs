@@ -152,3 +152,59 @@ test('an outside-the-workspace read from the gate goes to noevia as an ask that 
   assert.equal(decide({ classified: c }).decision, 'ask');
   assert.equal(c.standable, false);
 });
+
+test('noevia’s reason for a refusal reaches the pi gate as its block reason (#704); a plain Decline has none', async () => {
+  const child = fakePi();
+  const { send, out } = harness({ spawnFn: () => child, askTimeoutMs: 1000 });
+  send({ id: 1, method: 'session/new', params: { cwd: '/task' } });
+  await flush();
+  const responses = () => child.stdin.writes.map((w) => JSON.parse(w)).filter((m) => m.type === 'extension_ui_response');
+  const confirm = (id, toolCallId) => child.stdout.emit('data', JSON.stringify({ type: 'extension_ui_request', id, method: 'confirm',
+    message: JSON.stringify({ noevia: 'tool_call', toolCallId, toolName: 'bash', input: {} }) }) + '\n');
+  const askReason = (id, toolCallId) => child.stdout.emit('data', JSON.stringify({ type: 'extension_ui_request', id, method: 'input',
+    title: 'noevia refusal reason', placeholder: JSON.stringify({ noevia: 'refusal_reason', toolCallId, toolName: 'bash' }) }) + '\n');
+  const requests = () => out.filter((m) => m.method === 'session/request_permission');
+
+  // 1. The Executor guard's refusal: the reject outcome, with the violation in _meta.
+  confirm('ui1', 'c1');
+  await flush();
+  const reason = 'noevia refused this malformed tool call (violation 1 of 3). Correct the arguments and call the tool again. Missing command at $.rawInput.command.';
+  send({ id: requests()[0].id, result: { outcome: { outcome: 'selected', optionId: 'reject_once', _meta: { noevia: { reason, violation: { count: 1 } } } } } });
+  await flush();
+  assert.equal(responses().find((m) => m.id === 'ui1').confirmed, false, 'still a refusal');
+  askReason('ui2', 'c1');
+  await flush();
+  assert.equal(responses().find((m) => m.id === 'ui2').value, reason, 'the gate gets noevia’s own words');
+  askReason('ui3', 'c1');
+  await flush();
+  assert.equal(responses().find((m) => m.id === 'ui3').cancelled, true, 'read once');
+
+  // 2. A JSON-RPC error from noevia: its message is the reason.
+  confirm('ui4', 'c2');
+  await flush();
+  send({ id: requests()[1].id, error: { code: -32602, message: 'Outside this task’s workspace' } });
+  await flush();
+  assert.equal(responses().find((m) => m.id === 'ui4').confirmed, false);
+  askReason('ui5', 'c2');
+  await flush();
+  assert.equal(responses().find((m) => m.id === 'ui5').value, 'Outside this task’s workspace');
+
+  // 3. A person's Decline carries no reason: the gate keeps its generic one.
+  confirm('ui6', 'c3');
+  await flush();
+  send({ id: requests()[2].id, result: { outcome: { outcome: 'selected', optionId: 'reject_once' } } });
+  await flush();
+  askReason('ui7', 'c3');
+  await flush();
+  assert.equal(responses().find((m) => m.id === 'ui7').cancelled, true);
+
+  // An allow is never turned into anything else, and any other input request is still refused.
+  confirm('ui8', 'c4');
+  await flush();
+  send({ id: requests()[3].id, result: { outcome: { outcome: 'selected', optionId: 'allow_once', _meta: { noevia: { reason: 'ignored' } } } } });
+  await flush();
+  assert.equal(responses().find((m) => m.id === 'ui8').confirmed, true);
+  child.stdout.emit('data', JSON.stringify({ type: 'extension_ui_request', id: 'ui9', method: 'input', title: 'Name?', placeholder: 'x' }) + '\n');
+  await flush();
+  assert.equal(responses().find((m) => m.id === 'ui9').cancelled, true);
+});

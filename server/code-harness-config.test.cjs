@@ -125,6 +125,25 @@ test('pi gate: reads pass, everything else asks with full input, and no channel 
   assert.equal((await handler({ toolName: 'bash', input: {} }, ui('yes'))).block, true, 'only a literal true allows');
 });
 
+test('pi gate: a refusal carries the reason noevia gives through the bridge, and falls back to the generic one (#704)', async () => {
+  const gate = fileOf(pinFilesFor({ ...base, harness: 'pi' }), '.pi/agent/extensions/noevia-gate.js').content;
+  const mod = await import('data:text/javascript;base64,' + Buffer.from(gate + `\n// reason ${Math.random()}`).toString('base64'));
+  let handler; mod.default({ on: (name, fn) => { handler = fn; } });
+  const inputs = [];
+  const ui = (confirmed, input) => ({ hasUI: true, ui: { confirm: async () => confirmed, ...(input ? { input: async (...args) => { inputs.push(args); return input(...args); } } : {}) } });
+  const said = 'noevia refused this malformed tool call (violation 1 of 3). Missing command at $.rawInput.command.';
+  assert.deepEqual(await handler({ toolCallId: 't1', toolName: 'bash', input: {} }, ui(false, async () => said)), { block: true, reason: said });
+  assert.equal(inputs[0][0], 'noevia refusal reason');
+  assert.deepEqual(JSON.parse(inputs[0][1]), { noevia: 'refusal_reason', toolCallId: 't1', toolName: 'bash' });
+  assert.deepEqual(inputs[0][2], { timeout: 5000 }, 'a bridge that never answers costs seconds, not the turn');
+  assert.deepEqual(await handler({ toolName: 'bash', input: {} }, ui(false, async () => undefined)), { block: true, reason: 'Declined in noevia.' });
+  assert.deepEqual(await handler({ toolName: 'bash', input: {} }, ui(false, async () => { throw Error('closed'); })), { block: true, reason: 'Declined in noevia.' });
+  assert.deepEqual(await handler({ toolName: 'bash', input: {} }, ui(false)), { block: true, reason: 'Declined in noevia.' }, 'an older pi without input');
+  const before = inputs.length;
+  assert.equal(await handler({ toolName: 'bash', input: {} }, ui(true, async () => 'never asked')), undefined, 'an allow never asks for a reason');
+  assert.equal(inputs.length, before);
+});
+
 test('home-based harnesses need the private home and write everything into it, owned by the harness user', (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-harness-home-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

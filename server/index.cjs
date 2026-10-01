@@ -354,6 +354,9 @@ const toolboxOffered = createToolboxOffered(ENABLED_TOOLBOXES);
 // One proxy per deployment (it binds CODE_EGRESS_PORT): Code and Browser tasks share it, each
 // scoped by its own per-task grant/token.
 const codeEgress = require('./code-egress.cjs').startEgressFromEnv(process.env, { log: (entry) => console.log('[egress]', JSON.stringify(entry)) });
+// Executor guard (#704, code-tool-schemas.cjs): off unless features.executorGuard. Read once per
+// Code task when it starts; it only adds automatic refusals of malformed tool calls.
+require('./code-tool-schemas.cjs').useExecutorGuard(() => features.enabled('executorGuard'));
 const codeService = require('./code-service.cjs').createCodeService({
   repos: process.env.CODE_REPOS,
   // The egress proxy (D15) is the only way a task reaches the internet, and only to the domains

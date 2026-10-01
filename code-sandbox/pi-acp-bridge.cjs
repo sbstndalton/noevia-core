@@ -72,6 +72,17 @@ function lines(onLine, onOverflow = () => {}, limit = 16 * 1024 * 1024) {
   };
 }
 
+/**
+ * The reason noevia gave for a refusal, as text for pi: the structured violation's own text when
+ * the outcome carries one (`_meta.noevia`), else a JSON-RPC error's message. Bounded.
+ */
+function refusalReason(outcome, error) {
+  const said = outcome && typeof outcome === 'object' ? outcome._meta?.noevia : null;
+  const text = typeof said?.reason === 'string' && said.reason.trim() ? said.reason
+    : typeof error?.message === 'string' && error.message.trim() ? error.message : '';
+  return text ? text.slice(0, 4000) : '';
+}
+
 function toolCallFor(payload) {
   const name = String(payload.toolName || '');
   const input = payload.input && typeof payload.input === 'object' ? payload.input : {};
@@ -102,7 +113,9 @@ function createBridge({ input, output, piCommand = 'pi', piArgs = null, spawnFn 
 
   const send = (message) => { try { output.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n'); } catch { /* client gone */ } };
   const notify = (update) => send({ method: 'session/update', params: { sessionId, update } });
-  const ask = (method, params, timeoutMs = askTimeoutMs) => new Promise((resolve) => {
+  // Why noevia refused a call, kept for the gate to fetch (see onUiRequest). Bounded; read once.
+  const refusals = new Map(); // toolCallId -> reason text
+  const ask = (method, params, timeoutMs = askTimeoutMs, detailed = false) => new Promise((resolve) => {
     const id = `b${nextId++}`;
     let settled = false;
     const timer = setTimeout(() => {
@@ -113,10 +126,13 @@ function createBridge({ input, output, piCommand = 'pi', piArgs = null, spawnFn 
       // wait must not depend on it ever answering. Resolving null here reads as "refused" to
       // every caller of ask(), and any reply that arrives after this under `id` is simply
       // unrecognised by onClientMessage and dropped (see there) — never applied late.
-      resolve(null);
+      resolve(detailed ? { result: null, error: null } : null);
     }, timeoutMs);
     timer.unref?.();
-    waiting.set(id, (result) => { if (settled) return; settled = true; clearTimeout(timer); resolve(result); });
+    waiting.set(id, (result, error = null) => {
+      if (settled) return; settled = true; clearTimeout(timer);
+      resolve(detailed ? { result: result ?? null, error } : result);
+    });
     send({ id, method, params });
   });
   const toPi = (command) => { if (pi?.stdin.writable) pi.stdin.write(JSON.stringify(command) + '\n'); };
@@ -156,16 +172,34 @@ function createBridge({ input, output, piCommand = 'pi', piArgs = null, spawnFn 
   async function onUiRequest(request) {
     if (!DIALOGS.has(request.method)) return; // notify/setStatus/…: fire and forget
     const refuse = () => toPi({ type: 'extension_ui_response', id: request.id, ...(request.method === 'confirm' ? { confirmed: false } : { cancelled: true }) });
+    // The gate asking why its last call was refused: the words only, never a decision.
+    if (request.method === 'input') {
+      let asked; try { asked = JSON.parse(String(request.placeholder ?? '')); } catch { return refuse(); }
+      if (!asked || asked.noevia !== 'refusal_reason') return refuse();
+      const key = toolCallFor({ toolCallId: asked.toolCallId, toolName: asked.toolName }).toolCallId;
+      const reason = refusals.get(key);
+      refusals.delete(key);
+      return reason ? toPi({ type: 'extension_ui_response', id: request.id, value: reason }) : refuse();
+    }
     if (request.method !== 'confirm') return refuse();
     let payload; try { payload = JSON.parse(String(request.message ?? '')); } catch { return refuse(); }
     if (!payload || payload.noevia !== 'tool_call' || !payload.toolName) return refuse();
     const toolCall = toolCallFor(payload);
-    const answer = await ask('session/request_permission', { sessionId, toolCall, options: [
+    const { result: answer, error } = await ask('session/request_permission', { sessionId, toolCall, options: [
       { optionId: 'allow_once', name: 'Allow once', kind: 'allow_once' },
       { optionId: 'reject_once', name: 'Decline', kind: 'reject_once' },
-    ] }).catch(() => null);
+    ] }, askTimeoutMs, true).catch(() => ({ result: null, error: null }));
     const outcome = answer?.outcome;
     const confirmed = outcome?.outcome === 'selected' && outcome.optionId === 'allow_once';
+    if (!confirmed) {
+      // noevia's own words for the refusal (#704: a malformed call's correction), so pi's model
+      // can fix the call instead of reading a bare "declined".
+      const reason = refusalReason(outcome, error);
+      if (reason) {
+        if (refusals.size >= 50) refusals.delete(refusals.keys().next().value);
+        refusals.set(toolCall.toolCallId, reason);
+      }
+    }
     toPi({ type: 'extension_ui_response', id: request.id, confirmed });
   }
 
@@ -227,7 +261,7 @@ function createBridge({ input, output, piCommand = 'pi', piArgs = null, spawnFn 
       // A reply for an id we are no longer waiting on (already timed out, already answered) is
       // simply unrecognised here and dropped — never applied as a late decision.
       const resolve = waiting.get(message.id); waiting.delete(message.id);
-      resolve?.(message.error ? null : message.result);
+      resolve?.(message.error ? null : message.result, message.error || null);
       return;
     }
     if (message.method === 'session/cancel') { if (turn) turn.cancelled = true; toPi({ type: 'abort' }); return; }
@@ -252,7 +286,7 @@ function createBridge({ input, output, piCommand = 'pi', piArgs = null, spawnFn 
   return { get pi() { return pi; } };
 }
 
-module.exports = { createBridge, toolCallFor, lines, piArgsFor };
+module.exports = { createBridge, toolCallFor, lines, piArgsFor, refusalReason };
 
 if (require.main === module) {
   createBridge({ input: process.stdin, output: process.stdout,

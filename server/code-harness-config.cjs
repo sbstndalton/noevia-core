@@ -177,7 +177,16 @@ export default function (pi) {
     const payload = JSON.stringify({ noevia: 'tool_call', toolCallId: event.toolCallId ?? null, toolName: event.toolName, input: event.input ?? {},
       ...(outside ? { outsideWorkspace: true } : {}) });
     try { ok = await ctx.ui.confirm('Allow ' + event.toolName + '?', payload, { timeout: 300000 }); } catch { ok = false; }
-    return ok === true ? undefined : { block: true, reason: 'Declined in noevia.' };
+    if (ok === true) return undefined;
+    // Why it was refused, when noevia said (a malformed call, #704): asked for once, briefly, on the
+    // same channel. A bridge that has no reason, or predates this, answers nothing and the generic
+    // reason stands. It can only change the words of a refusal, never turn one into an allow.
+    let reason = 'Declined in noevia.';
+    try {
+      const said = await ctx.ui.input('noevia refusal reason', JSON.stringify({ noevia: 'refusal_reason', toolCallId: event.toolCallId ?? null, toolName: event.toolName }), { timeout: 5000 });
+      if (typeof said === 'string' && said.trim()) reason = said.slice(0, 4000);
+    } catch { /* the generic reason stands */ }
+    return { block: true, reason };
   });
 }
 `;

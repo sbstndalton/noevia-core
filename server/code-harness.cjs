@@ -25,6 +25,7 @@ const { readUsage, readContext, readExitCode, codingIdentity, summarize } = requ
 const { MAX_ASSISTANT_OUTPUT_BYTES, MAX_ASSISTANT_OUTPUT_EVENTS } = require('./jobs.cjs');
 const { boundCodePlan, MAX_CODE_PLAN_ENTRIES } = require('./code-plan.cjs');
 const { REVIEW_ACTION } = require('./code-review.cjs');
+const { createExecutorGuard, executorGuardFlag, rejectOutcome } = require('./code-tool-schemas.cjs');
 
 const MAX_TEXT = 4000;                  // what a job event keeps, as chat keeps of a tool result
 const MAX_FILE_BYTES = 8 * 1024 * 1024; // one source file, not a database the agent found
@@ -38,7 +39,8 @@ const OUTPUT_BATCH_BYTES = 1024, MAX_EARLY_FLUSHES = 30;
 function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now = Date.now, log = () => {},
   files = defaultFiles, pinConfig = require('./code-harness-config.cjs').writeHarnessConfig,
   pinnedPaths = require('./code-harness-config.cjs').cwdPinPaths,
-  engine = () => ({ baseUrl: null, apiKey: null, contextTokens: undefined }), review = null }) {
+  engine = () => ({ baseUrl: null, apiKey: null, contextTokens: undefined }), review = null,
+  guard = executorGuardFlag }) {
   /**
    * Start a task. `capabilities` is fixed here and never widens (§4): the job records it, and
    * every later decision is taken against this list, not against anything the agent claims.
@@ -85,6 +87,9 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
     // flipping the flag mid-run changes nothing for a task already started. Off, `work` below is
     // exactly what runs, with nothing wrapped around it.
     const reviewer = review && typeof review.enabled === 'function' && review.enabled() ? review : null;
+    // The Executor guard (#704, features.executorGuard), decided once here like the review. Off,
+    // nothing below changes: no guard, no extra signal, the handlers exactly as they were.
+    const guarded = !!(guard && typeof guard.enabled === 'function' && guard.enabled() === true);
 
     // The whole body is inside the try: the grant and the worktree have to come back even when
     // something fails before the harness ever starts. Writing that first checkpoint touches the
@@ -102,7 +107,10 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
         // records the model that actually ran rather than the absence of a choice.
         const endpoint = engine();
         const chosen = model || endpoint.model || null;
-        const session = createSession({ taskId, ctx, workspace, domains, capabilities, harness, model: chosen });
+        // Guarded, the guard can stop the agent on its own (too many malformed calls): that is
+        // this signal, joined to the job's own so a cancel still stops it the usual way.
+        const halt = guarded ? new AbortController() : null;
+        const session = createSession({ taskId, ctx, workspace, domains, capabilities, harness, model: chosen, halt });
         sessionEnd = session.end;
         // Recorded first so a running task is identifiable in the list, not just once it ends.
         // `baseSha` is the commit the task's branch forked from (captured at claim, before the
@@ -135,13 +143,16 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
             // through the proxy they would be refused as a private address.
             noProxy: engineHost(engine) } : null,
           handlers: session.handlers,
-          signal: ctx.signal,
+          signal: halt ? AbortSignal.any([ctx.signal, halt.signal]) : ctx.signal,
         });
         ctx.progress('running');
         // Shared project context (shared-context.cjs) goes in front of the task, never into its label.
         let outcome;
         try { outcome = await agent.prompt(context ? `${context}\n\nTask:\n${String(prompt)}` : String(prompt)); }
+        // A task the guard stopped ends as blocked, not as the "cancelled" the transport reports.
+        catch (error) { throw session.guard?.blockedError() || error; }
         finally { session.flushOutput(); }
+        if (session.guard?.blocked) throw session.guard.blockedError();
         // What the run can say about itself, and — just as much — what it could not (§1).
         meta = session.meta(agent.agent, readUsage(outcome?._meta));
         scope = codingIdentity({
@@ -261,7 +272,7 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
   }
 
   /** The per-session state and the handlers an ACP connection calls back into. */
-  function createSession({ taskId, ctx, workspace, domains, capabilities, harness, model }) {
+  function createSession({ taskId, ctx, workspace, domains, capabilities, harness, model, halt = null }) {
     // "Allow for this task", per action class. Scoped to this job, in memory, gone when it ends.
     const blanket = new Map(); // action -> 'allow' | 'deny'
     // Aborted when the task is cancelled, fails or ends: every approval it still has waiting is
@@ -340,6 +351,15 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
     };
 
     const record = (entry) => log({ at: now(), taskId, harness, model, ...entry });
+    // The Executor guard (#704): present only when the task started with the flag on. It can only
+    // refuse a malformed call before the policy below sees it; a call it passes is judged exactly
+    // as before, approval card and all.
+    const toolGuard = halt ? createExecutorGuard({
+      event: (type, data) => ctx.event(type, data), log: record, maxBytes: MAX_FILE_BYTES,
+      // Pending approvals are refused now; the agent is stopped on the next turn of the event
+      // loop, so the refusal that reached the limit is still delivered to it first.
+      onBlocked: () => { end(); setImmediate(() => halt.abort()); },
+    }) : null;
 
     /** Where a call wants to write, as far as we can tell before it happens. */
     const containment = (classified) => {
@@ -355,6 +375,12 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
       const toolCall = announced
         ? { ...announced, ...Object.fromEntries(Object.entries(stated).filter(([, v]) => v !== undefined && v !== null)) }
         : stated;
+      if (toolGuard) {
+        // Answered as an ordinary refusal (the reject outcome a Decline sends), with the violation
+        // alongside for the agent; the journal records it as an automatic denial.
+        const malformed = toolGuard.permission(toolCall, classify(toolCall).action);
+        if (malformed) { counts.approvals++; counts.denied++; return rejectOutcome(pickOption(options, 'reject_once'), malformed); }
+      }
       let classified = classify(toolCall);
       // The announcement explains the call; it cannot excuse it. A harness that asks is never
       // waved through on a `read`/`think` kind it stated earlier (or omitted, or sent as null now).
@@ -426,14 +452,18 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
       }
       return nodePath.resolve(root, target);
     };
-    const readTextFile = async ({ path: target, line = null, limit = null } = {}) => {
+    const readTextFile = async (params = {}) => {
+      if (toolGuard) { const malformed = toolGuard.readTextFile(params); if (malformed) throw malformed; }
+      const { path: target, line = null, limit = null } = params;
       const content = files.read(inside(target), MAX_FILE_BYTES, workspaces.get(taskId)?.path);
       if (line === null && limit === null) return { content };
       const all = content.split('\n');
       const from = Math.max(0, (Number(line) || 1) - 1);
       return { content: all.slice(from, limit ? from + Number(limit) : undefined).join('\n') };
     };
-    const writeTextFile = async ({ path: target, content } = {}) => {
+    const writeTextFile = async (params = {}) => {
+      if (toolGuard) { const malformed = toolGuard.writeTextFile(params); if (malformed) throw malformed; }
+      const { path: target, content } = params;
       const text = String(content ?? '');
       if (Buffer.byteLength(text) > MAX_FILE_BYTES) throw Object.assign(Error('File too large'), { code: -32602 });
       files.write(inside(target), text, workspaces.get(taskId)?.path);
@@ -499,8 +529,8 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
 
     return {
       handlers: { requestPermission, readTextFile, writeTextFile, sessionUpdate },
-      flushOutput, end,
-      summary: () => ({ ...counts, workspace: workspace.path }),
+      flushOutput, end, guard: toolGuard,
+      summary: () => ({ ...counts, workspace: workspace.path, ...(toolGuard ? { violations: toolGuard.violations } : {}) }),
       // Usage the harness streamed wins over anything on the prompt result: the real one reports
       // it in `usage_update` and leaves the result's `_meta` empty.
       meta: (agentInfo, usage) => summarize({ agent: agentInfo || {}, usage: reportedUsage || usage,

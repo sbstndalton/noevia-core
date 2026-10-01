@@ -182,7 +182,9 @@ async function connectAcp({ command, args = [], endpoint = null, cwd, env = {}, 
     if (!handler) return send({ jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'Method not supported by this client' } });
     try { send({ jsonrpc: '2.0', id: message.id, result: (await handler(message.params || {})) ?? null }); }
     catch (error) {
-      send({ jsonrpc: '2.0', id: message.id, error: { code: error.code === -32602 ? INVALID_PARAMS : INTERNAL, message: String(error.message || 'refused') } });
+      // A refusal may carry structured detail for the agent (the Executor guard's violation, #704).
+      const data = error.code === -32602 && error.data && typeof error.data === 'object' ? { data: error.data } : {};
+      send({ jsonrpc: '2.0', id: message.id, error: { code: error.code === -32602 ? INVALID_PARAMS : INTERNAL, message: String(error.message || 'refused'), ...data } });
     }
   }
 

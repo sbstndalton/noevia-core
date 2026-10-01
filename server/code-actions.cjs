@@ -456,10 +456,13 @@ function gitAction(name, rest) {
   return { action, standable: true };
 }
 
+/** The keys an ACP agent may put its command text under in `rawInput`, in the order they are read. */
+const COMMAND_KEYS = Object.freeze(['command', 'cmd', 'script', 'shell', 'commandLine']);
+
 /** The command text an ACP agent puts in `rawInput`, whatever key it chose. */
 function commandOf(rawInput) {
   if (!rawInput || typeof rawInput !== 'object') return '';
-  for (const key of ['command', 'cmd', 'script', 'shell', 'commandLine']) {
+  for (const key of COMMAND_KEYS) {
     const value = rawInput[key];
     if (typeof value === 'string' && value.trim()) return value.trim();
     if (Array.isArray(value) && value.length) return value.map(String).join(' ').trim();
@@ -592,4 +595,4 @@ function pickOption(options, wanted) {
   return { outcome: 'cancelled' };
 }
 
-module.exports = { ACTIONS, KIND_ACTIONS, classify, classifyCommand, analyzeCommand, commandOf, approvalFor, worst, decide, pickOption, hostOf };
+module.exports = { ACTIONS, KIND_ACTIONS, COMMAND_KEYS, classify, classifyCommand, analyzeCommand, commandOf, approvalFor, worst, decide, pickOption, hostOf };
