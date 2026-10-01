@@ -137,7 +137,7 @@ test('the reasons a feature is unavailable carry a stable id where the server ow
   assert.equal(unavailableId('browserExecutor', browserRuntimeReason({ resolve: () => { throw new Error('no'); } })), 'browserPlaywright');
   assert.equal(unavailableId('browserExecutor', browserRuntimeReason({ resolve: () => 'x', load: () => { throw new Error('no'); } })), 'browserChromium');
   assert.equal(unavailableId('browserExecutor', null), null);
-  assert.equal(unavailableId('constrainedPlanDecoding', 'Not used yet: no server-side plan generator.'), 'notUsed');
+  assert.equal(unavailableId('constrainedPlanDecoding', 'Not used yet: no task runs the Planner’s plan step.'), 'notUsed');
   assert.equal(unavailableId('nativeClientAuth', 'Needs TRUST_PROXY on so sign-in limits can tell clients apart.'), 'trustProxy');
   assert.equal(unavailableId('toolGate', 'Some new reason nobody wrote an id for.'), null, 'an unknown reason has no id and stays English');
   // #624: the decision-service reasons carry ids too, whichever experiment shows them.

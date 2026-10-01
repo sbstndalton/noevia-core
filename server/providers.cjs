@@ -77,8 +77,10 @@ function validContextTokens(value) {
 //   reasoningEffortParam   boolean  send a real reasoning_effort field (else a prompt hint)
 //   reasoningEffortModels  string[] optional exact model ids the parameter applies to (absent = any)
 //   tokenBudgetField       'max_tokens' | 'max_completion_tokens'  the output-budget field name
+//   jsonSchemaParam        boolean  accepts `response_format: { type: 'json_schema', json_schema: { schema } }`
+//                                   and constrains decoding to it (#517; read by plan-constrained-decoding.cjs)
 const TOKEN_BUDGET_FIELDS = ['max_tokens', 'max_completion_tokens'];
-const CAPABILITY_KEYS = ['reasoningEffortParam', 'reasoningEffortModels', 'tokenBudgetField'];
+const CAPABILITY_KEYS = ['reasoningEffortParam', 'reasoningEffortModels', 'tokenBudgetField', 'jsonSchemaParam'];
 /** Validates admin/tenant input. { value } is a clean object (possibly {}), or { error }. */
 function parseCapabilities(input) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return { error: 'capabilities must be an object' };
@@ -99,7 +101,23 @@ function parseCapabilities(input) {
     if (!TOKEN_BUDGET_FIELDS.includes(input.tokenBudgetField)) return { error: `tokenBudgetField must be one of ${TOKEN_BUDGET_FIELDS.join(', ')}` };
     out.tokenBudgetField = input.tokenBudgetField;
   }
+  if (input.jsonSchemaParam !== undefined) {
+    if (typeof input.jsonSchemaParam !== 'boolean') return { error: 'jsonSchemaParam must be true or false' };
+    out.jsonSchemaParam = input.jsonSchemaParam;
+  }
   return { value: out };
+}
+
+// What the operator-configured default provider accepts, by the engine kind the deployment declares
+// (MODEL_MANAGER_KIND), not by its address or model. The engine kinds here document the field in the
+// version this repository pins (llama.cpp b10920 tools/server: `response_format` json_schema, converted
+// to a grammar). A kind not listed declares nothing. The default row cannot be edited (routes/providers),
+// so this definition is the only source of its capabilities.
+const ENGINE_CAPABILITIES = Object.freeze({ llamacpp: Object.freeze({ jsonSchemaParam: true }) });
+/** Capabilities for the env-derived default provider row, or null when the engine kind declares none. */
+function engineCapabilities(kind) {
+  const caps = Object.prototype.hasOwnProperty.call(ENGINE_CAPABILITIES, kind) ? ENGINE_CAPABILITIES[kind] : null;
+  return caps ? { ...caps } : null;
 }
 
 // The built-in presets' capability definitions (mirrors the presets in ProviderForm.tsx). A stored
@@ -135,4 +153,4 @@ function effectiveCapabilities(row) {
   return legacyPresetCapabilities(row?.baseUrl);
 }
 
-module.exports = { parseCapabilities, effectiveCapabilities, createProviderRegistry, parseContextTokens, validContextTokens, CONTEXT_TOKENS_MIN, CONTEXT_TOKENS_MAX };
+module.exports = { parseCapabilities, effectiveCapabilities, engineCapabilities, createProviderRegistry, parseContextTokens, validContextTokens, CONTEXT_TOKENS_MIN, CONTEXT_TOKENS_MAX };

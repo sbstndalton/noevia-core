@@ -1,18 +1,35 @@
 'use strict';
-// Optional engine-side constrained decoding for the PromptArchitect plan artifact (#517,
-// spec-agent-execution §2). Behind features.constrainedPlanDecoding
-// (NOEVIA_FEATURE_CONSTRAINED_PLAN_DECODING), off by default. It ADDS llama.cpp's
-// `response_format: json_schema` to the artifact request; the after-the-fact artifact validation
-// still runs on the result and is never replaced. Masking rules out malformed structure only, not
+// Optional engine-side constrained decoding for the Planner's plan artifact (#517, #511;
+// spec-agent-execution §2 output contract). Behind features.constrainedPlanDecoding
+// (NOEVIA_FEATURE_CONSTRAINED_PLAN_DECODING), off by default. It ADDS
+// `response_format: { type: 'json_schema', json_schema: { schema } }` to the plan request; the
+// stream validator (stream-guard.cjs, Laya-lite) and the artifact check in planner-plan.cjs still
+// run on the result and are never replaced. Masking rules out malformed structure only, not
 // wrong-but-valid content.
 //
-// The fields go only to the llama.cpp-backed local provider. Any other provider (a remote or
-// external endpoint, a ChatGPT row, a custom OpenAI-compatible URL) never receives them.
-// Unconstrained generation is the fallback, with the reason recorded, when:
-//   - the model is a harmony/reasoning type (a grammar would also mask the reasoning channel),
-//   - the caller has thinking on (same reason), or
-//   - the engine rejects the field (HTTP 400/422/501: a build without json_schema support).
-const { hasHarmonyReasoning } = require('./llamacpp-full-autotune.cjs');
+// Who receives it is data, not code: only a provider whose capabilities declare
+// `jsonSchemaParam: true` (providers.cjs). The local llama.cpp engine declares it through its engine
+// definition (providers.cjs ENGINE_CAPABILITIES); any other row only if an administrator says so.
+// No host, vendor or model is named here.
+//
+// Field choice (verified against llama.cpp b10920, the build docs/sources.md pins):
+// tools/server/server-common.cpp reads `response_format.type === 'json_schema'` and takes
+// `response_format.json_schema.schema` (the OpenAI-compatible shape), turning it into a grammar. The
+// top-level `json_schema` body field means the same there, but other OpenAI-compatible APIs only know
+// `response_format`, so that is the one sent. `name` and `strict` are ignored by llama.cpp.
+//
+// Thinking (the open question on #517). In b10920 the response-format grammar is
+// `reasoning-block? json` only when the server extracts reasoning (common/chat-auto-parser-generator.cpp);
+// with reasoning extraction off, a `<think>` opening would be masked and the template's reasoning
+// channel broken. So a constrained plan call also sends `chat_template_kwargs.enable_thinking: false`:
+// the plan is produced without a reasoning channel, which is also what §2 asks for ("no hidden
+// reasoning requested") and what the prompt-preparation experiment does (thinking on spent the whole
+// budget before any JSON). Unconstrained generation is used instead, with the reason recorded, when:
+//   - the model family's reasoning channel cannot be switched off by that kwarg (harmony format,
+//     sampling-recommendation.cjs family table) — a grammar would mask the channel,
+//   - the caller explicitly asks for thinking on the plan call (`thinking: true`), or
+//   - the engine rejects the fields (HTTP 400/422/501): retried once without them, logged text-free.
+const { hasHarmonyReasoning } = require('./sampling-recommendation.cjs');
 
 const LIST = { type: 'array', items: { type: 'string' } };
 const PLAN_ARTIFACT_SCHEMA = Object.freeze({
@@ -32,46 +49,59 @@ const PLAN_ARTIFACT_SCHEMA = Object.freeze({
 
 const REJECTED = new Set([400, 422, 501]);
 
-/** True only for the operator-configured local llama.cpp provider. */
-function isLlamaCppProvider(provider, { defaultProviderId, managerKind } = {}) {
-  return !!provider && managerKind === 'llamacpp' && provider.id === defaultProviderId
-    && !provider.external && !provider.kind;
-}
-
-/** Decide what to add. Returns { fields, applied, reason }; fields is {} whenever applied is false. */
-function planConstraint({ enabled, provider, managerKind, defaultProviderId, model, thinking = false } = {}) {
-  const none = reason => ({ fields: {}, applied: false, mode: null, reason });
-  if (!enabled) return none('flag_off');
-  if (!isLlamaCppProvider(provider, { defaultProviderId, managerKind })) return none('not_llamacpp_provider');
-  if (hasHarmonyReasoning(String(model || ''))) return none('reasoning_model');
-  if (thinking) return none('thinking_enabled');
-  return { applied: true, mode: 'json_schema', reason: null,
-    fields: { response_format: { type: 'json_schema', json_schema: { name: 'plan_artifact', strict: true, schema: PLAN_ARTIFACT_SCHEMA } } } };
+/** True when the provider row declares that it accepts a json_schema response_format. */
+function supportsJsonSchema(provider) {
+  return !!provider && provider.capabilities?.jsonSchemaParam === true;
 }
 
 /**
- * Send the artifact request, constrained when allowed. `send(payload)` resolves to
- * { ok, status, body } (or throws an error with `.status`). An engine rejection retries once
- * unconstrained; anything else propagates. The result carries `constraint` for the job record,
- * and a log line is written for any fallback. Callers still validate the artifact afterwards.
+ * Decide what to add. Returns { fields, applied, mode, reason }; fields is {} whenever applied is false.
+ * `provider` is a row as providers.cjs getProvider() returns it (effective capabilities attached).
+ * @param {{ enabled?: boolean, provider?: any, model?: string|null, thinking?: boolean }} [input]
  */
-async function requestPlanArtifact({ payload, send, constraint, log = () => {} }) {
+function planConstraint({ enabled, provider, model, thinking = false } = {}) {
+  const none = reason => ({ fields: {}, applied: false, mode: null, reason });
+  if (!enabled) return none('flag_off');
+  if (!supportsJsonSchema(provider)) return none('provider_unsupported');
+  if (hasHarmonyReasoning(String(model || ''))) return none('reasoning_model');
+  if (thinking) return none('thinking_enabled');
+  return { applied: true, mode: 'json_schema', reason: null, fields: {
+    response_format: { type: 'json_schema', json_schema: { name: 'plan_artifact', strict: true, schema: PLAN_ARTIFACT_SCHEMA } },
+    chat_template_kwargs: { enable_thinking: false },
+  } };
+}
+
+/** The payload with the constraint's fields merged in (existing template kwargs are kept). */
+function constrainedPayload(payload, constraint) {
+  const { chat_template_kwargs: kwargs, ...rest } = constraint.fields;
+  return { ...payload, ...rest, ...(kwargs ? { chat_template_kwargs: { ...(payload.chat_template_kwargs || {}), ...kwargs } } : {}) };
+}
+
+/**
+ * Send the plan request, constrained when allowed. `send(payload)` resolves to { ok, status, body }
+ * (or throws an error with `.status`). An engine rejection retries once unconstrained; anything else
+ * propagates. The result carries `constraint` for the record. `log` gets a text-free entry (status
+ * only, never the engine's message or any model text) for a fallback. Callers still validate.
+ */
+/** @param {{ payload: object, send: (payload: object) => Promise<any>, constraint?: any, log?: (entry: object) => void }} input */
+async function requestPlanArtifact({ payload, send, constraint, log = (_entry) => {} }) {
   if (!constraint?.applied) {
     const r = await unwrap(await send(payload));
     return { body: r.body, constraint: { applied: false, mode: null, reason: constraint?.reason || 'flag_off', fallback: false } };
   }
   let first;
-  try { first = await send({ ...payload, ...constraint.fields }); } catch (error) { first = { ok: false, status: error?.status, error }; }
+  try { first = await send(constrainedPayload(payload, constraint)); } catch (error) { first = { ok: false, status: error?.status, error }; }
   if (first?.ok !== false) return { body: first?.body, constraint: { applied: true, mode: constraint.mode, reason: null, fallback: false } };
   if (!REJECTED.has(first.status)) throw first.error || Object.assign(new Error(`engine returned ${first.status}`), { status: first.status });
-  log(`plan artifact: constrained decoding refused by the engine (${first.status}); retrying unconstrained`);
+  try { log({ event: 'plan.constraint_rejected', status: first.status }); } catch { /* logging never changes the outcome */ }
   const r = await unwrap(await send(payload));
   return { body: r.body, constraint: { applied: false, mode: null, reason: `engine_rejected_${first.status}`, fallback: true } };
 }
 
+/** @param {any} r */
 async function unwrap(r) {
   if (r && r.ok === false) throw r.error || Object.assign(new Error(`engine returned ${r.status}`), { status: r.status });
   return { body: r?.body };
 }
 
-module.exports = { PLAN_ARTIFACT_SCHEMA, isLlamaCppProvider, planConstraint, requestPlanArtifact };
+module.exports = { PLAN_ARTIFACT_SCHEMA, REJECTED, supportsJsonSchema, planConstraint, constrainedPayload, requestPlanArtifact };

@@ -41,7 +41,7 @@ test('constrainedPlanDecoding is listed as unavailable and cannot be switched on
   const { route } = harness();
   const list = await call(route, 'GET', '/api/admin/features', 'admin');
   const info = list.body.features.find(f => f.name === 'constrainedPlanDecoding');
-  assert.match(info.unavailable, /no server-side plan generator/);
+  assert.match(info.unavailable, /no task runs the Planner’s plan step/);
   assert.equal((await call(route, 'PUT', '/api/admin/features/constrainedPlanDecoding', 'admin', '{"enabled":true}')).status, 409);
 });
 

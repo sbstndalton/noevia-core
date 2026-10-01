@@ -142,7 +142,10 @@ const davConfig = require('./dav-settings.cjs').configuration(process.env, authS
 const davSettings = require('./dav-settings.cjs').createDavSettings({ auth: authService, config: davConfig });
 if (process.env.LEMONADE_BASE_URL && !process.env.INFERENCE_BASE_URL) console.warn('LEMONADE_BASE_URL is deprecated; use INFERENCE_BASE_URL');
 if (process.env.LEMONADE_API_KEY && !process.env.INFERENCE_API_KEY) console.warn('LEMONADE_API_KEY is deprecated; use INFERENCE_API_KEY');
-const workspaceStore = createWorkspaceStore(DATA_DIR, { id: DEFAULT_PROVIDER_ID, label: DEFAULT_PROVIDER_LABEL, baseUrl: INFERENCE_BASE, apiKey: INFERENCE_KEY, shared: true }, secretStore);
+// The default row's capabilities come from the engine kind the deployment declares (providers.cjs).
+const DEFAULT_PROVIDER_CAPABILITIES = require('./providers.cjs').engineCapabilities(MODEL_MANAGER_KIND);
+const workspaceStore = createWorkspaceStore(DATA_DIR, { id: DEFAULT_PROVIDER_ID, label: DEFAULT_PROVIDER_LABEL, baseUrl: INFERENCE_BASE, apiKey: INFERENCE_KEY, shared: true,
+  ...(DEFAULT_PROVIDER_CAPABILITIES ? { capabilities: DEFAULT_PROVIDER_CAPABILITIES } : {}) }, secretStore);
 
 // Per-user throttle for LLM-backed routes. Every hit is a full model call
 // against the shared inference endpoint, so one member (or a runaway client)
