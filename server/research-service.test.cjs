@@ -12,9 +12,10 @@ const model = (calls, { hang } = {}) => async (messages, { signal } = {}) => {
     await new Promise((_, reject) => signal.addEventListener('abort', () => reject(Object.assign(Error('aborted'), { name: 'AbortError' }))));
   }
   const user = messages[1].content;
-  if (messages[0].content.startsWith('You write research notes')) { const id = user.match(/<SOURCE id="(\d+)">/)[1]; return `- The Zephyr cell stores 410 Wh per kilogram [${id}]`; }
-  const [, id] = user.match(/Note \[(\d+)\]/);
-  return `The Zephyr cell stores 410 Wh per kilogram [${id}].`;
+  // Selection step answers with sentence IDs; the write step cites the sentence it uses.
+  if (messages[0].content.startsWith('You select evidence')) return (user.match(/\[(S\d+)\]/g) || []).map((m) => m.slice(1, -1)).join(' ');
+  const [, sid] = user.match(/\[(S\d+)\] [^\n]*410 Wh/);
+  return `The Zephyr cell stores 410 Wh per kilogram [${sid}].`;
 };
 
 function setup(t, opts = {}) {
@@ -53,7 +54,11 @@ test('a completed job saves the report and sources as project files, once', asyn
   assert.deepEqual(job.plan, { status: 'edited', question: 'What is the Zephyr cell?', subQuestions: ['What is the Zephyr cell?', 'Energy?'] });
   assert.deepEqual(saved.map((f) => f.name), ['Research 2026-09-17 what-is-the-zephyr-cell.md', 'Research 2026-09-17 what-is-the-zephyr-cell.sources.json']);
   assert.match(saved[0].text, /410 Wh per kilogram \[1\]/);
-  assert.equal(JSON.parse(saved[1].text).sources[0].url, 'https://fixture.test/z');
+  const meta = JSON.parse(saved[1].text);
+  assert.equal(meta.sources[0].url, 'https://fixture.test/z');
+  assert.match(meta.sources[0].sentences[0].id, /^S\d+$/, 'sources.json keeps the sentence IDs claims were verified against');
+  assert.deepEqual(meta.claims, { total: 2, supported: 2, flagged: 0, dropped: 0, uncited: 0 });
+  assert.deepEqual(job.result.claims, meta.claims, 'the job view reports claim counts');
   assert.deepEqual(job.artifacts, saved.map((f) => f.name));
   assert.equal(job.canSavePartial, false);
   await assert.rejects(() => service.savePartial(workspace, project, started.id), /already saved|cancelled/);

@@ -23,10 +23,13 @@ function reportFiles(result, when, taken = () => false) {
   let base = stem;
   // Never overwrite an earlier report: the same question on the same day gets a numbered name.
   for (let n = 2; taken(`${base}.md`) || taken(`${base}.sources.json`); n++) base = `${stem} (${n})`;
-  const sources = result.sources.map(({ id, kind, url, file, title, retrievedAt, excerpts }) => ({ id, kind, url, file, title, retrievedAt, excerpts }));
+  // Sentences carry the IDs the claims were verified against; dropped and flagged claims are kept
+  // here so verification never silently loses what the model wrote (#707).
+  const sources = result.sources.map(({ id, kind, url, file, title, retrievedAt, excerpts, sentences = [] }) => ({ id, kind, url, file, title, retrievedAt, excerpts, sentences }));
+  const verification = { claims: result.claims || null, dropped: result.dropped || [], flagged: result.flagged || [] };
   return [
     { name: `${base}.md`, text: result.markdown },
-    { name: `${base}.sources.json`, text: JSON.stringify({ question: result.question, partial: !!result.partial, citationValidity: result.citationValidity, webCalls: result.webCalls, sources }, null, 2) + '\n' },
+    { name: `${base}.sources.json`, text: JSON.stringify({ question: result.question, partial: !!result.partial, citationValidity: result.citationValidity, webCalls: result.webCalls, ...verification, sources }, null, 2) + '\n' },
   ];
 }
 
@@ -37,7 +40,7 @@ function view(job) {
   return { id: job.id, status: job.status, stage: job.stage, plan: job.plan, error: job.error, createdAt: job.createdAt, updatedAt: job.updatedAt,
     checkpoint: job.checkpoint, artifacts: job.artifacts.map((a) => a.name),
     result: r ? { question: r.question, partial: r.partial, sections: r.sections, questions: r.questions, citationValidity: r.citationValidity,
-      citations: r.citations, webCalls: r.webCalls, markdown: String(r.markdown || '').slice(0, 200000), sources: (r.sources || []).length } : null,
+      citations: r.citations, claims: r.claims || null, webCalls: r.webCalls, markdown: String(r.markdown || '').slice(0, 200000), sources: (r.sources || []).length } : null,
     canSavePartial: job.status === 'cancelled' && !!r && r.sections > 0 && !job.artifacts.length };
 }
 
