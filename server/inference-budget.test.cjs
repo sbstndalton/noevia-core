@@ -488,12 +488,29 @@ test('other engine callers admit their model first and stop cleanly when refused
   assert.deepEqual(plan, { ok: false, code: 'over_budget', reason: 'big needs about 30 GiB to load' });
 });
 
-test('the embed parity check passes identical vectors and fails diverging ones', async () => {
-  const { check, cosine } = require('../../../tools/embed-parity-check.cjs');
+test('the embed parity check samples many strings and requires cosine and top-5 retrieval agreement', async () => {
+  const { check, cosine, DOCS, QUERIES } = require('../../../tools/embed-parity-check.cjs');
   assert.equal(Math.round(cosine([1, 0], [1, 0]) * 1000) / 1000, 1); assert.equal(cosine([1, 0], [0, 1]), 0);
-  const fetchFor = vectors => async url => ({ ok: true, json: async () => ({ data: [{ embedding: url.includes('llama') ? vectors[0] : vectors[1] }] }) });
-  assert.equal((await check({ engine: 'http://llama:8080', engineModel: 'e', sidecar: 'http://embed:8080', sidecarModel: 'e', fetchImpl: fetchFor([[0.6, 0.8], [0.6, 0.8]]) })).ok, true);
-  const off = await check({ engine: 'http://llama:8080', engineModel: 'e', sidecar: 'http://embed:8080', sidecarModel: 'e', fetchImpl: fetchFor([[0.6, 0.8], [0.8, 0.6]]) });
-  assert.equal(off.ok, false); assert.ok(off.similarity < 0.999);
-  await assert.rejects(check({ engine: 'http://llama:8080', engineModel: 'e', sidecar: 'http://embed:8080', sidecarModel: 'e', fetchImpl: async () => ({ ok: false, status: 404 }) }), /HTTP 404/);
+  assert.ok(DOCS.length >= 40 && QUERIES.length >= 10);
+  // Deterministic pseudo-embedding per text; `noise(url, text, i)` perturbs one server's vectors.
+  const vec = (t) => Array.from({ length: 16 }, (_, i) => Math.sin((t.length + 1) * (i + 1) + t.charCodeAt(i % t.length)));
+  const fetchFor = (noise) => async (url, init) => {
+    const { input } = JSON.parse(init.body);
+    return { ok: true, json: async () => ({ data: input.map((t, index) => ({ index, embedding: vec(t).map((x, i) => x + noise(url, t, i)) })).reverse() }) };
+  };
+  const args = { engine: 'http://llama:8080', engineModel: 'e', sidecar: 'http://embed:8080', sidecarModel: 'e' };
+  const same = await check({ ...args, fetchImpl: fetchFor(() => 0) });
+  assert.equal(same.ok, true); assert.equal(same.overlapAtK, 1); assert.equal(same.strings, DOCS.length + QUERIES.length);
+  assert.ok(same.cosine.min > 0.999999);
+  // Small float noise on the sidecar: cosine stays above 0.997, ranking agrees.
+  const noisy = await check({ ...args, fetchImpl: fetchFor((url, t, i) => (url.startsWith('http://embed:') ? 1e-4 * Math.cos(i + t.length) : 0)) });
+  assert.equal(noisy.ok, true); assert.ok(noisy.cosine.min < 1 && noisy.cosine.min >= 0.997);
+  // A different model: unrelated vectors fail both rules.
+  const other = await check({ ...args, fetchImpl: fetchFor((url, t, i) => (url.startsWith('http://embed:') ? 3 * Math.cos(7 * i + 3 * t.length) : 0)) });
+  assert.equal(other.ok, false); assert.ok(other.similarity < 0.997);
+  // Above the cosine floor but the ranking disagrees: fails on overlap alone.
+  const ranked = await check({ ...args, minOverlap: 1.01, fetchImpl: fetchFor(() => 0) });
+  assert.equal(ranked.ok, false); assert.equal(ranked.similarity >= 0.997, true);
+  await assert.rejects(check({ ...args, fetchImpl: async () => ({ ok: false, status: 404 }) }), /HTTP 404/);
+  await assert.rejects(check({ ...args, fetchImpl: async () => ({ ok: true, json: async () => ({ data: [] }) }) }), /0 embeddings for/);
 });
