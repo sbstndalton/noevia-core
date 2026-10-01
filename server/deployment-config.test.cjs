@@ -60,3 +60,15 @@ test('the preflight expected-key list matches compose.yaml', () => {
   assert.deepEqual(shipped, [...canonical].sort(),
     'deploy/preflight/web-env-keys.txt is stale relative to compose.yaml');
 });
+
+// #590: a missing COWORK_PORT must not publish web on every interface.
+test('web port defaults to loopback in both compose definitions', () => {
+  const root = path.resolve(__dirname, '../../..');
+  for (const name of ['compose.yaml', 'deploy/examples/unraid-compose-manager.yml']) {
+    const compose = fs.readFileSync(path.join(root, name), 'utf8');
+    assert.ok(compose.includes('"${COWORK_PORT:-127.0.0.1:8021}:8021"'), `${name} port default`);
+    assert.ok(!/COWORK_PORT:-8021/.test(compose), `${name} still has a LAN default`);
+  }
+  const example = fs.readFileSync(path.join(root, '.env.example'), 'utf8');
+  assert.match(example, /^COWORK_PORT=127\.0\.0\.1:8021$/m);
+});
