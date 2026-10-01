@@ -74,9 +74,13 @@ async function extractWithDocling(name, bytes, extractDocument) {
     return { ...assemble([], 0, { retryable: true }), state: 'failed',
       error: String(err.message || err).slice(0, 300) };
   }
+  // A 'degraded' page (#700) is one Docling left (near-)empty whose text came from the PDF's own
+  // text layer instead. It is readable — its text is in `full` and reaches retrieval — but it is
+  // not in the complete set, so the document is 'partial', never plain ready.
   const pageTexts = body.pages.map(p => ({
     number: Number(p.number), text: String(p.text || ''), status: String(p.status || 'failed'),
-    method: 'docling', truncated: !!p.truncated,
+    method: p.method === 'pdfium' ? 'pdfium' : 'docling', truncated: !!p.truncated,
+    ...(typeof p.reason === 'string' && /^[a-z-]{1,40}$/.test(p.reason) ? { reason: p.reason } : {}),
   }));
   return assemble(pageTexts, Number(body.total) || pageTexts.length, { extraTruncated: !!body.truncatedPages });
 }

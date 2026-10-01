@@ -79,3 +79,23 @@ test('page chunking retains page labels on every chunk', () => {
   assert.ok(chunks.every(c => /^\[Page [12]\]/.test(c)));
   assert.ok(chunks.some(c => c.startsWith('[Page 2]')));
 });
+
+test('a native-fallback page is stored as partial, readable by page, and named in the notice (#700)', async () => {
+  const w = workspace('native-fallback');
+  const original = documents.extractDocumentText;
+  documents.extractDocumentText = async () => ({
+    text: '[Page 1]\nfirst page\n\n[Page 2]\nsynthetic fallback words', pages: 2, truncated: false, state: 'partial', retryable: false,
+    pageTexts: [
+      { number: 1, text: 'first page', status: 'native', method: 'docling', truncated: false },
+      { number: 2, text: 'synthetic fallback words', status: 'degraded', reason: 'native-fallback', method: 'pdfium', truncated: false },
+    ],
+  });
+  try {
+    const f = await sources.ingest(w, 'p', 'fallback.pdf', Buffer.from('%PDF-1.4 synthetic'));
+    assert.equal(f.document.state, 'partial');
+    assert.match(f.content, /synthetic fallback words/, 'the fallback text is the content retrieval indexes');
+    assert.deepEqual(f.document.pageStatus[1], { number: 2, status: 'degraded', reason: 'native-fallback' });
+    assert.match(sources.problem(f), /incomplete pages 2 \(degraded: native-fallback\)/);
+    assert.match(sources.readPages(w, 'p', f, 2).text, /^\[Page 2; degraded: native-fallback\]\nsynthetic fallback words/);
+  } finally { documents.extractDocumentText = original; }
+});

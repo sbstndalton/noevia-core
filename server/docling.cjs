@@ -6,7 +6,10 @@
 // The version string is part of the extractor cache key in documents.cjs: a
 // change here re-extracts every document, which is what should happen when the
 // pipeline that produced the cached text changes.
-const VERSION = 'docling-2.129-layout-tableformer-tesseract-v2';
+// v3 (#700): pages Docling returned empty fall back to the PDF's own text layer and come back
+// 'degraded'. Bumped so documents cached with such a page as 'blank' are read again — which
+// only helps once the docling image carrying the fallback is running; deploy that first.
+const VERSION = 'docling-2.129-layout-tableformer-tesseract-v3-native-fallback';
 
 // Formats the worker accepts. Kept in sync with SUPPORTED in
 // services/docling/extract.py — the worker is authoritative and re-checks,

@@ -105,6 +105,25 @@ test('a blank page is partial, not failed, and keeps the readable pages', async 
   assert.match(out.text, /\[Page 2\]\n\(blank\)/);
 });
 
+test('a native-text fallback page is partial, keeps its text for retrieval and its reason (#700)', async () => {
+  const run = withWorker(async () => ({ pages: [page(1, 'readable'),
+    { number: 2, text: 'synthetic text recovered from the PDF text layer', status: 'degraded', reason: 'native-fallback', method: 'pdfium', truncated: false },
+    page(3, '', 'blank')], total: 3 }));
+  const out = await run('a.pdf');
+  assert.equal(out.state, 'partial', 'degraded is never plain ready');
+  assert.match(out.text, /\[Page 2\]\nsynthetic text recovered from the PDF text layer/, 'the fallback text reaches the extracted text');
+  assert.equal(out.pageTexts[1].status, 'degraded');
+  assert.equal(out.pageTexts[1].reason, 'native-fallback');
+  assert.equal(out.pageTexts[1].method, 'pdfium');
+});
+
+test('a worker reason that is not a plain token is dropped, not passed through', async () => {
+  const run = withWorker(async () => ({ pages: [{ number: 1, text: 'x', status: 'degraded', reason: '<b>quoted document text</b>' }], total: 1 }));
+  const out = await run('a.pdf');
+  assert.equal(out.pageTexts[0].reason, undefined);
+  assert.equal(out.state, 'partial');
+});
+
 test('a truncated page marks the document partial', async () => {
   const run = withWorker(async () => ({ pages: [{ ...page(1, 'x'), status: 'truncated', truncated: true }], total: 1 }));
   const out = await run('a.pdf');

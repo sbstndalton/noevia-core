@@ -42,7 +42,7 @@ async function ingest(workspace, projectId, name, bytes, previous) {
   return { name, content: stale ? previous.content : out.text,
     document: { version, byteHash, bytes: bytes.length, extractor: documents.EXTRACTOR_VERSION,
       state: out.state, stale, availableVersion, availableByteHash: stale ? previous.document?.availableByteHash : byteHash, pages: out.pages, truncated: out.truncated,
-      pageStatus: out.pageTexts.map(p => ({ number: p.number, status: p.status })),
+      pageStatus: out.pageTexts.map(p => ({ number: p.number, status: p.status, ...(p.reason ? { reason: p.reason } : {}) })),
       error: out.error, ...(out.errorId ? { errorId: out.errorId } : {}), indexing: stale || previous?.document?.availableVersion === availableVersion ? previous?.document?.indexing || 'unavailable' : 'pending' } };
 }
 function failed(previous, name, reason) {
@@ -57,7 +57,7 @@ function problem(file) {
   const issues = (d.pageStatus || []).filter(p => !['native', 'blank', 'ocr'].includes(p.status));
   return `${d.state}${d.stale ? '; using STALE text from the last readable version' : ''}` +
     `${d.pages ? '; ' + d.pages + ' pages' : ''}${d.truncated ? '; summary/page extraction limits reached' : ''}` +
-    `${issues.length ? '; incomplete pages ' + issues.slice(0, 20).map(p => p.number + ' (' + p.status + ')').join(', ') + (issues.length > 20 ? '…' : '') : ''}` +
+    `${issues.length ? '; incomplete pages ' + issues.slice(0, 20).map(p => p.number + ' (' + p.status + (p.reason ? ': ' + p.reason : '') + ')').join(', ') + (issues.length > 20 ? '…' : '') : ''}` +
     `${d.error ? '; ' + d.error : ''}.`;
 }
 function notice(file) {
@@ -78,7 +78,7 @@ function readPages(workspace, projectId, file, start = 1, end = start, offset = 
   if (end > out.pages) throw Object.assign(new Error('Page range exceeds the document.'), { status: 400 });
   const selected = out.pageTexts.filter(p => p.number >= start && p.number <= end);
   if (selected.length !== end - start + 1) throw Object.assign(new Error('Requested pages were not extracted because of a processing limit.'), { status: 422 });
-  const text = selected.map(p => `[Page ${p.number}; ${p.status}]\n${p.text || '(no native text)'}`).join('\n\n');
+  const text = selected.map(p => `[Page ${p.number}; ${p.status}${p.reason ? ': ' + p.reason : ''}]\n${p.text || '(no native text)'}`).join('\n\n');
   return { text: text.slice(offset, offset + cap), nextOffset: offset + cap < text.length ? offset + cap : null, notice: notice(file), startPage: start, endPage: end };
 }
 function readOriginal(workspace, projectId, file) {
