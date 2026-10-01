@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { SELECTION_SCHEMA, selectionConstraint, requestSelection, selectionCause } = require('./selection-constraint.cjs');
+const { SELECTION_SCHEMA, SELECTION_MAX_TOKENS, idsSchema, compactCandidates, idsToProposal, selectionConstraint, requestSelection, selectionCause } = require('./selection-constraint.cjs');
 const { validateProposal } = require('../../../experiments/system-one/skills-mcp/contract.cjs');
 
 test('schema is sent only to providers that declare jsonSchemaParam; thinking is off with it', () => {
@@ -43,4 +43,31 @@ test('selectionCause is text-free', () => {
   assert.equal(selectionCause({ content: '  ', finishReason: 'stop' }), 'empty-content');
   assert.equal(selectionCause({ content: 'x', parsed: null }), 'invalid-json');
   assert.equal(selectionCause({ content: '{}', parsed: {} }), null);
+});
+
+test('ids-only schema: enum is exactly the offered ids, sorted, capability-gated, thinking off', () => {
+  const ids = ['skill:b', 'box:a', 'skill:b', 'box:c'];
+  const c = selectionConstraint({ provider: { capabilities: { jsonSchemaParam: true } }, model: 'm', offeredIds: ids });
+  const schema = c.fields.response_format.json_schema.schema;
+  assert.deepEqual(schema, { type: 'array', items: { type: 'string', enum: ['box:a', 'box:c', 'skill:b'] }, maxItems: 4, uniqueItems: true });
+  assert.equal(c.mode, 'ids'); assert.deepEqual(c.fields.chat_template_kwargs, { enable_thinking: false });
+  assert.ok(!schema.items.enum.includes('skill:invented'));
+  assert.equal(SELECTION_MAX_TOKENS, 48);
+  assert.equal(idsSchema(['x'], 2).maxItems, 2);
+  // not capable: no schema at all; no offered ids: legacy object schema
+  assert.deepEqual(selectionConstraint({ provider: { capabilities: {} }, model: 'm', offeredIds: ids }).fields, {});
+  assert.equal(selectionConstraint({ provider: { capabilities: { jsonSchemaParam: true } }, model: 'm' }).mode, 'object');
+});
+
+test('compactCandidates is deterministic and cuts descriptions; ids array maps to a valid proposal', () => {
+  const rows = [{ id: 'skill:z', description: 'x'.repeat(100) }, { id: 'box:a', label: 'a  b\nc' }];
+  assert.deepEqual(compactCandidates(rows), compactCandidates([...rows].reverse()));
+  assert.deepEqual(compactCandidates(rows).map(r => r.id), ['box:a', 'skill:z']);
+  assert.equal(compactCandidates(rows)[1].label.length, 60);
+  assert.equal(compactCandidates(rows)[0].label, 'a b c');
+  const p = idsToProposal(['skill:a']);
+  assert.equal(validateProposal(p, [{ id: 'skill:a' }], { maxSkills: 1, maxBoxes: 3, minConfidence: 0.5, minScore: 0.5 }), null);
+  assert.equal(validateProposal(idsToProposal(['skill:zz']), [{ id: 'skill:a' }], { maxSkills: 1, maxBoxes: 3, minConfidence: 0.5, minScore: 0.5 }), 'unknown-id');
+  assert.equal(idsToProposal([]).abstain, true);
+  assert.equal(idsToProposal(null), null);
 });
