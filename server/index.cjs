@@ -388,6 +388,7 @@ const codeService = require('./code-service.cjs').createCodeService({
     log: (entry) => console.log('[code]', JSON.stringify(entry)),
     provider: require('./code-review.cjs').createEngineReviewer({
       fetch: (...args) => globalThis.fetch(...args),
+      log: (entry) => console.log('[code]', JSON.stringify(entry)),
       engine: () => {
         const provider = getProvider(DEFAULT_PROVIDER_ID);
         const base = String(provider?.baseUrl || '').replace(/\/+$/, '');
@@ -396,6 +397,7 @@ const codeService = require('./code-service.cjs').createCodeService({
           apiKey: provider?.apiKey || null,
           model: autoRoles()?.code || autoRoles()?.smart || lastLoadedModel() || null,
           external: require('./provider-egress.cjs').isExternalProvider(provider),
+          provider,
         };
       },
     }),

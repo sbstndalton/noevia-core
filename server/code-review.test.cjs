@@ -409,7 +409,7 @@ test('the reviewer projection is allowlisted and bounded; ROLES stays the three 
 test('engine reviewer: sends only the instructions and the projection, refuses an external provider', async () => {
   const sent = [];
   const fetch = async (url, init) => { sent.push({ url, init }); return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify(APPROVE) } }] }) }; };
-  const provider = createEngineReviewer({ fetch, engine: () => ({ baseUrl: 'http://engine.test/v1/', apiKey: 'k-local', model: 'coder' }) });
+  const provider = createEngineReviewer({ fetch, engine: () => ({ baseUrl: 'http://engine.test/v1/', apiKey: 'k-local', model: 'coder', provider: { capabilities: { jsonSchemaParam: true } } }) });
   const out = await provider.review({ instructions: INSTRUCTIONS, context: '{"role":"reviewer"}', schema: VERDICT_SCHEMA }, {});
   assert.deepEqual(JSON.parse(out), APPROVE);
   assert.equal(sent[0].url, 'http://engine.test/v1/chat/completions');
@@ -422,6 +422,46 @@ test('engine reviewer: sends only the instructions and the projection, refuses a
   assert.equal(sent.length, 1, 'nothing sent to an external provider');
   const failing = createEngineReviewer({ fetch: async () => ({ ok: false, status: 500 }), engine: () => ({ baseUrl: 'http://e/v1' }) });
   await assert.rejects(failing.review({ instructions: 'i', context: 'c', schema: VERDICT_SCHEMA }, {}), /500/);
+});
+
+const okReply = (content) => ({ ok: true, status: 200, json: async () => ({ choices: [{ message: { content } }] }) });
+const reviewWith = (fetch, provider) => createEngineReviewer({ fetch, engine: () => ({ baseUrl: 'http://e/v1', model: 'm', provider }) })
+  .review({ instructions: INSTRUCTIONS, context: 'c', schema: VERDICT_SCHEMA }, {});
+
+test('engine reviewer: schema only to a provider declaring jsonSchemaParam', async () => {
+  for (const provider of [undefined, null, {}, { capabilities: {} }, { capabilities: { jsonSchemaParam: false } }]) {
+    const bodies = [];
+    const out = await reviewWith(async (_u, init) => { bodies.push(JSON.parse(init.body)); return okReply(JSON.stringify(APPROVE)); }, provider);
+    assert.equal(bodies.length, 1);
+    assert.ok(!('response_format' in bodies[0]));
+    assert.deepEqual(readVerdict(JSON.parse(out)).verdict, 'approve');
+  }
+  const bodies = [];
+  await reviewWith(async (_u, init) => { bodies.push(JSON.parse(init.body)); return okReply(JSON.stringify(APPROVE)); }, { capabilities: { jsonSchemaParam: true } });
+  assert.equal(bodies[0].response_format.type, 'json_schema');
+});
+
+test('without the schema the review service still validates the verdict (fail closed)', async () => {
+  const provider = createEngineReviewer({ engine: () => ({ baseUrl: 'http://e/v1' }), fetch: async () => okReply(JSON.stringify({ verdict: 'approve', summary: 's', findings: [], extra: 1 })) });
+  const r = await createPlannerReview({ enabled: () => true, provider }).review({ state: { tenantId: 't-1', taskId: 'task', request: 'fix it', change: { baseSha: 'a'.repeat(40), headSha: 'b'.repeat(40), files: [{ path: 'a.txt', patch: '+x\n' }] } } });
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'invalid');
+});
+
+test('engine reviewer: a 400/422/501 rejection retries once without the schema; other errors do not', async () => {
+  for (const status of [400, 422, 501]) {
+    const bodies = [], logs = [];
+    const fetch = async (_u, init) => { const b = JSON.parse(init.body); bodies.push(b); return 'response_format' in b ? { ok: false, status } : okReply(JSON.stringify(APPROVE)); };
+    const out = await createEngineReviewer({ fetch, log: (e) => logs.push(e), engine: () => ({ baseUrl: 'http://e/v1', provider: { capabilities: { jsonSchemaParam: true } } }) })
+      .review({ instructions: 'i', context: 'c', schema: VERDICT_SCHEMA }, {});
+    assert.equal(bodies.length, 2);
+    assert.ok(!('response_format' in bodies[1]));
+    assert.deepEqual(JSON.parse(out), APPROVE);
+    assert.deepEqual(logs, [{ event: 'plan.constraint_rejected', status }]);
+  }
+  let calls = 0;
+  await assert.rejects(reviewWith(async () => { calls++; return { ok: false, status: 500 }; }, { capabilities: { jsonSchemaParam: true } }), /500/);
+  assert.equal(calls, 1);
 });
 
 // A max-size diff where almost every character grows when JSON-escaped: tabs, quotes,

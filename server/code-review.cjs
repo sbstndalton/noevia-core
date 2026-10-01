@@ -26,6 +26,7 @@
 const { runGuardedStream, GuardAbortError, CorrectionFailedError } = require('./stream-guard.cjs');
 const { projectRoleContext, serializeProjection, REVIEW_ROLE, RoleContextLeakError } = require('./role-context.cjs');
 const { VERDICT_SCHEMA, readVerdict, ReviewVerdictError } = require('./code-review-verdict.cjs');
+const { supportsJsonSchema, requestPlanArtifact } = require('./plan-constrained-decoding.cjs');
 
 /** The approval-card action for "accept this reviewed change". Not an ACP action class. */
 const REVIEW_ACTION = 'review_change';
@@ -119,11 +120,11 @@ function createPlannerReview({ enabled = () => false, provider = null, deadlineM
 
 /**
  * The production provider: one non-streaming chat completion against the engine Code mode already
- * runs on, asking for the verdict schema. `engine()` answers `{ baseUrl, apiKey, model, external }`
+ * runs on, asking for the verdict schema when `engine().provider` declares jsonSchemaParam. `engine()` answers `{ baseUrl, apiKey, model, external }`
  * from the web container's point of view. An external provider is refused: the diff is repository
  * content, and Planner review is for the local model only.
  */
-function createEngineReviewer({ engine, fetch = (...args) => globalThis.fetch(...args) }) {
+function createEngineReviewer({ engine, fetch = (...args) => globalThis.fetch(...args), log = () => {} }) {
   return {
     async review({ instructions, context, schema, correction = null }, { signal } = {}) {
       const endpoint = engine() || {};
@@ -132,16 +133,24 @@ function createEngineReviewer({ engine, fetch = (...args) => globalThis.fetch(..
       const messages = [{ role: 'system', content: instructions }, { role: 'user', content: context }];
       // The correction names only the violation (stream-guard.cjs): no meta-prompt, no history.
       if (correction) messages.push({ role: 'user', content: `That answer was not a valid verdict: ${JSON.stringify(correction.violation || {})}. Answer again with only the JSON verdict.` });
-      const response = await fetch(`${String(endpoint.baseUrl).replace(/\/+$/, '')}/chat/completions`, {
-        method: 'POST', signal,
-        headers: { 'Content-Type': 'application/json', ...(endpoint.apiKey ? { Authorization: `Bearer ${endpoint.apiKey}` } : {}) },
-        body: JSON.stringify({
-          ...(endpoint.model ? { model: endpoint.model } : {}), messages, temperature: 0, stream: false,
-          response_format: { type: 'json_schema', json_schema: { name: 'planner_review', strict: true, schema } },
-        }),
-      });
-      if (!response.ok) throw Error(`Engine answered ${response.status}`);
-      const body = await response.json();
+      const url = `${String(endpoint.baseUrl).replace(/\/+$/, '')}/chat/completions`;
+      const headers = { 'Content-Type': 'application/json', ...(endpoint.apiKey ? { Authorization: `Bearer ${endpoint.apiKey}` } : {}) };
+      // Same rule as the Planner's plan (#517): the schema goes only to a provider that declares
+      // jsonSchemaParam; otherwise the prompt and readVerdict() carry it. An engine 400/422/501 retries
+      // once without it (the shared helper in plan-constrained-decoding.cjs, text-free log entry).
+      const constraint = supportsJsonSchema(endpoint.provider)
+        ? { applied: true, mode: 'json_schema', reason: null, fields: { response_format: { type: 'json_schema', json_schema: { name: 'planner_review', strict: true, schema } } } }
+        : { fields: {}, applied: false, mode: null, reason: 'provider_unsupported' };
+      const send = async (payload) => {
+        const response = await fetch(url, { method: 'POST', signal, headers, body: JSON.stringify(payload) });
+        if (!response.ok) return { ok: false, status: response.status };
+        return { ok: true, status: response.status, body: await response.json() };
+      };
+      const payload = { ...(endpoint.model ? { model: endpoint.model } : {}), messages, temperature: 0, stream: false };
+      let result;
+      try { result = await requestPlanArtifact({ payload, constraint, send, log }); }
+      catch (error) { if (error?.status) throw Error(`Engine answered ${error.status}`); throw error; }
+      const body = result.body;
       const content = body?.choices?.[0]?.message?.content;
       if (typeof content !== 'string') throw Error('Engine returned no content');
       return content;
