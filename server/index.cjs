@@ -93,6 +93,8 @@ const authService = createAuth({
     .filter(Boolean),
 });
 const decisionSettings = require('./decision-settings.cjs').createDecisionSettings({ store: require('./features.cjs').settingsStore(authService.db), audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail) });
+// #697: the inference memory budget (admin setting; INFERENCE_MEMORY_BUDGET_GIB is its initial value).
+const inferenceBudget = require('./inference-budget.cjs').createInferenceBudget({ store: require('./features.cjs').settingsStore(authService.db), audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail) });
 const features = require('./features.cjs').createFeatures({ store: require('./features.cjs').settingsStore(authService.db), audit: (action, actor, detail) => authService.audit(action, actor, actor, detail),
   // #555 F4: switching native-app sign-in off is a revoke, not a pause (deviceAuth is built below).
   onChange: (name, enabled, actorId) => { if (name === 'nativeClientAuth' && !enabled) deviceAuth.revokeAll(actorId, 'feature-off'); },
@@ -207,7 +209,11 @@ const modelManager = createModelManager({
   autoconfig: {
     modelsPath: process.env.LLAMACPP_MODELS_PATH || '',
     budgetGib: Number(process.env.LLAMACPP_AUTOCONFIG_MEMORY_GIB) || require('./llamacpp-autoconfig.cjs').parseMemoryLimit(process.env.LLAMACPP_MEMORY_LIMIT) || 0,
-    cacheRamMaxMib: Number(process.env.LLAMACPP_AUTOCONFIG_CACHE_RAM_MAX_MIB) || 1024,
+    // #697: with an inference budget only this explicit figure may lower autoconfig's sizing.
+    explicitBudgetGib: Number(process.env.LLAMACPP_AUTOCONFIG_MEMORY_GIB) || 0,
+    // #697: the prompt-cache cap autoconfig and new presets write, and the hard maximum every write keeps.
+    cacheRamMaxMib: require('./inference-budget.cjs').cacheRamLimits(process.env).capMib,
+    cacheRam: require('./inference-budget.cjs').cacheRamLimits(process.env),
     cachePath: process.env.LLAMACPP_CACHE_PATH || '',
     memoryFloorGib: Number(process.env.LLAMACPP_CALIBRATION_MEMORY_FLOOR_GIB) || 2,
   },
@@ -220,7 +226,39 @@ const modelManager = createModelManager({
   baseUrl: MODEL_MANAGER_BASE,
   apiKey: process.env.MODEL_MANAGER_API_KEY || INFERENCE_KEY,
   fetchJson,
+  inferenceBudget,
 });
+// #697 runtime safety net: unload the engine's models when measured inference memory stays
+// above the budget by more than INFERENCE_BUDGET_OVERSHOOT_PCT (default 10). Native engine only.
+const inferenceBudgetWatch = modelManager.kind === 'llamacpp' ? (() => {
+  const watch = require('./inference-budget-watch.cjs');
+  const files = watch.gpuMemoryFiles(process.env);
+  return watch.createInferenceBudgetWatch({
+    budgetGib: inferenceBudget.budgetGib,
+    readGpu: () => watch.readGpuMemory(files),
+    readEngine: watch.engineReaderFromModelLoader({ env: process.env, fetchJson }),
+    listLoaded: async () => { const r = await modelManager.listModels(); return r.ok ? r.body.data.filter(m => ['loaded', 'loading'].includes(m.status.value)).map(m => m.id) : []; },
+    unload: model => modelManager.emergencyUnload(model),
+    onUnloaded: (model, budgetGib) => modelManager.quarantine?.(model, budgetGib),
+  });
+})() : null;
+inferenceBudgetWatch?.start();
+// #697: every web caller of the shared engine admits its model first: within the inference memory
+// budget, and with the engine's other model unloaded (one model at a time). Throws a 409 with a
+// publicMessage when the model would not fit. A no-op for other managers.
+async function admitEngineModel(model, signal) {
+  if (!model || typeof modelManager.makeRoomFor !== 'function') return;
+  await modelManager.makeRoomFor(model, undefined, signal);
+}
+// The auto-router's classifier must never cause a swap: it runs only on the resident model, and
+// only if that model fits the budget. Null to proceed, or a text-free { cause } to skip.
+async function classifierAdmission(model) {
+  if (modelManager.kind !== 'llamacpp' || !model) return null;
+  if (await modelManager.loadRefusal?.(model)) return { cause: 'over-budget' };
+  const listing = await modelManager.listModels();
+  if (!listing.ok) return { cause: 'engine-unavailable' };
+  return listing.body.data.some(m => m.id === model && m.loaded) ? null : { cause: 'not-resident' };
+}
 // MODELS_INI_WRITER=web with a read-only /llamacpp-config: log it once; saves then fail explicitly (#269).
 require('./models-ini-writer.cjs').reportModelsIniWriter({ mode: process.env.MODELS_INI_WRITER, presetPath: process.env.LLAMACPP_PRESET_PATH });
 
@@ -314,7 +352,9 @@ const chatToolRouter = require('./chat-tool-routing.cjs').createChatToolRouter({
 
 // Endpoint-scoped probes expire, so repairing a model or its projector does
 // not require restarting noevia before images work again.
-const visionProbe = createVisionProbe();
+const isEngineUrl = (baseUrl) => String(baseUrl || '').replace(/\/+$/, '').replace(/\/v1$/, '') === String(getProvider(DEFAULT_PROVIDER_ID)?.baseUrl || '').replace(/\/+$/, '').replace(/\/v1$/, '');
+const engineVisionProbe = () => createVisionProbe({ admit: (baseUrl, model) => (isEngineUrl(baseUrl) ? admitEngineModel(model) : undefined) });
+const visionProbe = engineVisionProbe();
 // Cached image descriptions, keyed by model + images + question.
 const visionDescriptions = new Map();
 
@@ -406,10 +446,13 @@ const codeService = require('./code-service.cjs').createCodeService({
     return require('./code-review.cjs').createPlannerReview({
       enabled: () => features.enabled('plannerReview'),
       log,
-      provider: require('./code-review.cjs').createEngineReviewer({ fetch: (...args) => globalThis.fetch(...args), log, engine: reviewEngine }),
+      // #697: both paths admit the model within the inference memory budget before any request.
+      provider: require('./code-review.cjs').createEngineReviewer({ fetch: (...args) => globalThis.fetch(...args), log, engine: reviewEngine, admit: (model, signal) => admitEngineModel(model, signal) }),
       roleEngine: require('./role-engine.cjs').createRoleEngine({ fetch: (...args) => globalThis.fetch(...args), log, engine: reviewEngine,
         keep: () => [...require('./model-system.cjs').sidecarModelNames(process.env)],
-        admission: typeof modelManager.withAdmission === 'function' ? (work, signal) => modelManager.withAdmission(work, signal) : null }),
+        admission: typeof modelManager.withAdmission === 'function' ? (work, signal) => modelManager.withAdmission(work, signal) : null,
+        // #697: never pin or call a model that would not fit the inference memory budget.
+        budgetRefusal: typeof modelManager.loadRefusal === 'function' ? (model) => modelManager.loadRefusal(model) : null }),
     });
   })(),
 });
@@ -462,6 +505,7 @@ const researchRoutes = require('./routes/research.cjs').createResearchRoutes({
         try { leave = modelManager.enterInference?.() || (() => {}); }
         catch (e) { throw Object.assign(e, { publicMessage: e.publicMessage || (e.status === 503 ? e.message : 'The model is busy. Try again shortly.') }); }
         try {
+        await admitEngineModel(model, signal);
         const r = await fetch(`${provider.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`, { method: 'POST', redirect: 'error',
           headers: providerHeaders(provider, { 'Content-Type': 'application/json' }), signal: AbortSignal.any([signal, AbortSignal.timeout(120000)]),
           body: JSON.stringify({ model, stream: false, max_tokens: maxTokens, messages }) });
@@ -554,6 +598,8 @@ const autoRouter = require('./auto-router.cjs').createAutoRouter({
   provider: () => getProvider(DEFAULT_PROVIDER_ID),
   headers: (p) => providerHeaders(p),
   fetchJson: (url, init, timeoutMs) => fetchJson(url, init, timeoutMs),
+  admit: (model) => classifierAdmission(model),
+  record: (entry) => recordDecision('route', entry),
 });
 const { heuristicWantsSmart, heuristicWantsCode, classifierVerdict, CLASSIFIER_MAX_TOKENS } = autoRouter;
 // Text-free decision record in the state directory: docker logs do not survive a deploy.
@@ -643,7 +689,7 @@ const providerRoutes = require('./routes/providers.cjs').createProviderRoutes({
 });
 // Statistics, the auto-router roles, the model manager proxy and /api/models/* (routes/models.cjs).
 const modelRoutes = require('./routes/models.cjs').createModelRoutes({
-  json, readBody, readJson, fetchJson, env: process.env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe, reportedTokenRate, missingRoles, currentWorkspace, service: modelService,
+  json, readBody, readJson, fetchJson, env: process.env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe: engineVisionProbe, reportedTokenRate, missingRoles, currentWorkspace, service: modelService, inferenceBudget,
 });
 // ── Routing ────────────────────────────────────────────────────────────────
 

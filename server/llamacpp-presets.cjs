@@ -13,7 +13,9 @@ const fields={
   'flash-attn':{aliases:['fa','LLAMA_ARG_FLASH_ATTN'],valid:choice('on','off','auto')},
   'batch-size':{aliases:['b','LLAMA_ARG_BATCH'],valid:integer(32,8192)},
   'ubatch-size':{aliases:['ub','LLAMA_ARG_UBATCH'],valid:integer(32,8192)},
-  'cache-ram':{aliases:['LLAMA_ARG_CACHE_RAM'],valid:integer(0,16384)},
+  // #697: prepare() clamps -1 (unbounded) and values above the hard maximum before this check,
+  // and writes an explicit value when a section would otherwise run on llama-server's 8 GiB default.
+  'cache-ram':{aliases:['cram','LLAMA_ARG_CACHE_RAM'],valid:integer(0,1048576)},
   'image-max-tokens':{aliases:['LLAMA_ARG_IMAGE_MAX_TOKENS'],valid:integer(64,16384)},
   'spec-type':{aliases:['LLAMA_ARG_SPEC_TYPE'],valid:choice('none','draft-mtp','ngram-simple','draft-mtp,ngram-simple')},
   'spec-draft-n-max':{aliases:['LLAMA_ARG_SPEC_DRAFT_N_MAX'],valid:integer(1,32)},
@@ -46,7 +48,9 @@ function parse(text) {
   });
   return {lines,sections};
 }
-function createPresetStore(file,{writer=null}={}) {
+function createPresetStore(file,{writer=null,cacheRam=null}={}) {
+  const budget=require('./inference-budget.cjs');
+  const limits=()=>cacheRam||budget.cacheRamLimits();
   if(!file || !path.isAbsolute(file))throw error(500,'LLAMACPP_PRESET_PATH must be an absolute path');
   function read() {
     const stat=fs.lstatSync(file);
@@ -61,13 +65,25 @@ function createPresetStore(file,{writer=null}={}) {
     if(!/^[\w./:-]{1,200}$/.test(model || ''))throw error(400,'Invalid preset model name');
     if(!options||typeof options!=='object'||Array.isArray(options))throw error(400,'Preset options are required');
     const updates={};
-    for(const [key,value] of Object.entries(options)) {
+    for(let [key,value] of Object.entries(options)) {
+      if(key==='cache-ram'&&typeof value==='string'&&value!=='')value=budget.clampCacheRam(value,limits());
       if(!Object.hasOwn(fields,key) || typeof value!=='string' || value!==''&&!fields[key].valid(value))throw error(400,`Invalid preset option: ${key}`);
       updates[key]=value;
     }
     if(!Object.keys(updates).length)throw error(400,'No preset changes supplied');
     const data=read();if(baseRevision!==data.revision)throw error(409,'Presets changed. Reload the profile before saving; your draft is retained.');
     const section=data.sections.get(model);let lines=[...data.lines];
+    // #697: every write leaves this model with an explicit, bounded prompt cache. Unset (or a
+    // cleared value) would mean llama-server's 8 GiB default; an older value above the hard
+    // maximum is brought down to it.
+    {
+      const {capMib}=limits();
+      const own=Object.hasOwn(updates,'cache-ram')?updates['cache-ram']:section?.options['cache-ram'];
+      const inherited=data.sections.get('*')?.options['cache-ram'];
+      const effective=own===undefined||own===''?inherited:own;
+      if(effective===undefined||effective==='')updates['cache-ram']=String(capMib);
+      else if(budget.clampCacheRam(effective,limits())!==String(effective).trim())updates['cache-ram']=budget.clampCacheRam(effective,limits());
+    }
     if(section) {
       const content=lines.slice(section.start+1,section.end).filter(line=>{
         const match=/^\s*([^=\s]+)\s*=/.exec(line);return !match||!Object.hasOwn(updates,canonical(match[1]));
@@ -114,4 +130,11 @@ function createPresetStore(file,{writer=null}={}) {
   const snapshot=()=>{const data=read();return {text:data.text,revision:data.revision};};
   return {get,prepare,commit,files,snapshot};
 }
-module.exports={createPresetStore,parse,fields};
+// Known option keys under their canonical names (aliases such as LLAMA_ARG_CACHE_RAM or cram
+// folded in); unknown keys are dropped. Later keys win, like the router's last-wins reading.
+function canonicalOptions(options){
+  const out={};
+  for(const [key,value] of Object.entries(options||{})){const c=canonical(String(key).trim().replace(/^-+/,''));if(c&&value!=null)out[c]=String(value).trim();}
+  return out;
+}
+module.exports={createPresetStore,parse,fields,canonical,canonicalOptions};

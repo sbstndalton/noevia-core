@@ -426,6 +426,12 @@ function createChatHandler({
       const key = crypto.createHash('sha256').update(JSON.stringify([currentWorkspace().userId, baseUrl, visionModel, project.id, headers, attachedImages, question])).digest('hex');
       const cached = visionDescriptions.get(key);
       if (cached && cached.until > Date.now()) return cached.text;
+      // #697: the vision model is admitted to the shared engine (one model, memory budget) first;
+      // a refusal falls back to handing the images to the answering model, as a failure does.
+      if (provider.id === DEFAULT_PROVIDER_ID && typeof modelManager.makeRoomFor === 'function') {
+        try { await modelManager.makeRoomFor(visionModel, undefined, chatSignal.signal); }
+        catch (err) { console.warn(`[vision] ${visionModel} not admitted: ${String(err?.code || err?.status || 'error')}`); return null; }
+      }
       const url = `${String(baseUrl).replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`;
       const prompt = [
         'Describe these images in detail, so someone who cannot see them can answer questions about them.',

@@ -179,12 +179,14 @@ function createPlannerReview({ enabled = () => false, provider = null, roleEngin
  * from the web container's point of view. An external provider is refused: the diff is repository
  * content, and Planner review is for the local model only.
  */
-function createEngineReviewer({ engine, fetch = (...args) => globalThis.fetch(...args), log = () => {} }) {
+function createEngineReviewer({ engine, fetch = (...args) => globalThis.fetch(...args), log = () => {}, admit = null }) {
   return {
     async review({ instructions, context, schema, correction = null }, { signal } = {}) {
       const endpoint = engine() || {};
       if (endpoint.external === true) throw Error('Planner review runs only on a local model.');
       if (!endpoint.baseUrl) throw Error('No engine is configured.');
+      // #697: admitted to the shared engine (one model, memory budget) before any request.
+      if (admit) await admit(endpoint.model, signal);
       const messages = [{ role: 'system', content: instructions }, { role: 'user', content: context }];
       // The correction names only the violation (stream-guard.cjs): no meta-prompt, no history.
       if (correction) messages.push({ role: 'user', content: `That answer was not a valid verdict: ${JSON.stringify(correction.violation || {})}. Answer again with only the JSON verdict.` });

@@ -2,12 +2,18 @@
 
 // Scope results to endpoint and credentials as well as model name. Retry
 // failures shortly: a timeout or missing projector is not a model capability.
-function createVisionProbe({ fetchImpl = fetch, now = Date.now } = {}) {
+// #697: `admit(baseUrl, model)` makes room for the model on the shared engine (within the
+// inference memory budget) before the probe; a refusal is reported, not cached.
+function createVisionProbe({ fetchImpl = fetch, now = Date.now, admit = null } = {}) {
   const cache = new Map();
   return async (baseUrl, headers, model) => {
     const key = JSON.stringify([baseUrl, headers, model]);
     const cached = cache.get(key);
     if (cached && cached.until > now()) return cached.result;
+    if (admit) {
+      try { await admit(baseUrl, model); }
+      catch (e) { return { supported: false, reason: e?.publicMessage || 'The model cannot be loaded right now, so the image probe did not run.' }; }
+    }
     const url = `${String(baseUrl).replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`;
     const pixel = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
     let result;

@@ -14,7 +14,7 @@ function makeWorkspace(autoRoles = null) {
   return { autoRoles, saves: 0, saveAutoRoles() { this.saves += 1; } };
 }
 
-function fixture({ env = {}, enabled = true, kind = 'llamacpp', manager = {}, workspace = { userId: 'u1' }, catalogue = [{ name: 'm' }], servedCatalogue = async () => catalogue, modelsInstalled = async () => [{ name: 'm', loaded: true }], initialRoles = null, initialLastLoaded = null, otherWorkspaces = [] } = {}) {
+function fixture({ env = {}, enabled = true, kind = 'llamacpp', manager = {}, workspace = { userId: 'u1' }, catalogue = [{ name: 'm' }], servedCatalogue = async () => catalogue, modelsInstalled = async () => [{ name: 'm', loaded: true }], initialRoles = null, initialLastLoaded = null, otherWorkspaces = [], inferenceBudget = null } = {}) {
   const sent = [], headers = [], fetched = [];
   const scan = new Map();
   let refreshes = 0;
@@ -48,7 +48,7 @@ function fixture({ env = {}, enabled = true, kind = 'llamacpp', manager = {}, wo
     readBody: async (req) => { let s = ''; for await (const c of req) s += c; return s; },
     readJson: async (req) => { let s = ''; for await (const c of req) s += c; return s ? JSON.parse(s) : {}; },
     fetchJson: async (url, init) => { fetched.push({ url, init }); return { ok: true, status: 200, body: { models: ['a'] } }; },
-    env, modelManager,
+    env, modelManager, inferenceBudget,
     getProvider: () => ({ baseUrl: 'http://engine', apiKey: 'local' }), providerHeaders: () => ({}), DEFAULT_PROVIDER_ID: 'default',
     createVisionProbe: () => async () => ({ supported: true }),
     reportedTokenRate: (g) => g.tokens_per_second ?? null,
@@ -711,4 +711,63 @@ test('#629: hardware discovery reports unsupported as a clean 200, real failures
     await f.call('GET', '/api/models/hardware');
     assert.equal(f.sent.pop().status, 502, 'manager down still surfaces as an error');
   }
+});
+
+// #697: the inference memory budget setting, the estimates beside it, and the two proxied paths
+// that would otherwise reach the engine or size past the budget.
+test('the inference budget is read with each model\'s estimate and saved by an administrator', async () => {
+  const saved = [];
+  const inferenceBudget = { get: () => ({ budgetGib: 12, source: 'deployment', minGib: 2, maxGib: 25 }),
+    save: (body, actor) => { if (body.budgetGib > 25) throw Object.assign(Error('Enter a budget from 2 to 25 GiB, in steps of 0.1.'), { status: 400, messageId: 'invalidBudget', minGib: 2, maxGib: 25 }); saved.push([body, actor]); return { budgetGib: body.budgetGib, source: 'admin', minGib: 2, maxGib: 25 }; } };
+  const f = fixture({ inferenceBudget, manager: { inferenceEstimates: async () => ({ ok: true, status: 200, body: { budgetGib: 12, models: [{ model: 'chat-syn', fits: true, estimate: { totalGib: 9.1 } }] } }) } });
+  await f.call('GET', '/api/models/inference-budget');
+  assert.equal(f.sent.pop().status, 403, 'members do not read shared model settings');
+  await f.call('GET', '/api/models/inference-budget', undefined, 'admin');
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { budgetGib: 12, source: 'deployment', minGib: 2, maxGib: 25, models: [{ model: 'chat-syn', fits: true, estimate: { totalGib: 9.1 } }] } });
+  await f.call('PUT', '/api/models/inference-budget', { budgetGib: 20 });
+  assert.equal(f.sent.pop().status, 403);
+  await f.call('PUT', '/api/models/inference-budget', { budgetGib: 20 }, 'admin');
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { budgetGib: 20, source: 'admin', minGib: 2, maxGib: 25 } });
+  assert.deepEqual(saved, [[{ budgetGib: 20 }, 'u1']]);
+  await f.call('PUT', '/api/models/inference-budget', { budgetGib: 40 }, 'admin');
+  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'Enter a budget from 2 to 25 GiB, in steps of 0.1.', errorId: 'invalidBudget', minGib: 2, maxGib: 25 } });
+  await f.call('DELETE', '/api/models/inference-budget', undefined, 'admin');
+  assert.equal(f.sent.pop().status, 405);
+  const engineDown = fixture({ inferenceBudget, manager: { inferenceEstimates: async () => ({ ok: false, status: 502 }) } });
+  await engineDown.call('GET', '/api/models/inference-budget', undefined, 'admin');
+  assert.deepEqual(engineDown.sent.pop().body, { budgetGib: 12, source: 'deployment', minGib: 2, maxGib: 25, models: null, estimateError: 'engine' });
+});
+
+test('a benchmark of an over-budget model is refused before the model manager loads it', async () => {
+  const refusal = { error: 'big needs about 30 GiB to load', code: 'inference_budget', budgetGib: 12 };
+  const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, catalogue: [{ name: 'small' }, { name: 'big' }],
+    manager: { loadRefusal: async (m) => (m === 'big' ? refusal : null) } });
+  await f.call('POST', '/api/model-manager/benchmark/start', { aliases: ['small', 'big'] }, 'admin');
+  assert.deepEqual(f.sent.pop(), { status: 409, body: refusal });
+  assert.equal(f.fetched.length, 0, 'nothing reached the model manager');
+  await f.call('POST', '/api/model-manager/benchmark/start', { aliases: ['small'] }, 'admin');
+  assert.equal(f.fetched.length, 1);
+});
+
+test('the model manager autoconfig is sized against the budget set by the server, not the browser', async () => {
+  const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, manager: { sizingBudgetGib: () => 14 } });
+  await f.call('GET', '/api/model-manager/sections/chat-syn/autoconfig', undefined, 'admin', '?sessions=1&budget_gib=999');
+  assert.equal(f.fetched[0].url, 'http://loader/api/v1/sections/chat-syn/autoconfig?sessions=1&budget_gib=14');
+  await f.call('GET', '/api/model-manager/sections/chat-syn', undefined, 'admin', '?x=1');
+  assert.equal(f.fetched[1].url, 'http://loader/api/v1/sections/chat-syn?x=1', 'other paths pass through unchanged');
+  const none = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, manager: { sizingBudgetGib: () => 0 } });
+  await none.call('GET', '/api/model-manager/sections/chat-syn/autoconfig', undefined, 'admin', '?budget_gib=999');
+  assert.equal(none.fetched[0].url, 'http://loader/api/v1/sections/chat-syn/autoconfig', 'a client figure is never forwarded');
+});
+
+test('#697: a model manager section save that would exceed the budget is refused before it is forwarded', async () => {
+  const seen = [];
+  const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' },
+    manager: { presetRefusal: async (name, options) => { seen.push([name, options]); return options['ctx-size'] === '262144' ? { error: 'Not saved: too big', code: 'inference_budget', budgetGib: 12 } : null; } } });
+  await f.call('PUT', '/api/model-manager/sections/chat-syn', { baseRevision: 'r', values: { 'ctx-size': '262144', 'cache-type-k': '', jinja: 'true' }, extras: 'LLAMA_ARG_CACHE_RAM = 512\n# note' }, 'admin');
+  assert.deepEqual(f.sent.pop(), { status: 409, body: { error: 'Not saved: too big', code: 'inference_budget', budgetGib: 12 } });
+  assert.equal(f.fetched.length, 0);
+  assert.deepEqual(seen[0], ['chat-syn', { 'ctx-size': '262144', jinja: 'true', LLAMA_ARG_CACHE_RAM: '512' }], 'values and extras, empty values dropped');
+  await f.call('PUT', '/api/model-manager/sections/chat-syn', { baseRevision: 'r', values: { 'ctx-size': '8192' } }, 'admin');
+  assert.equal(f.fetched.length, 1, 'a fitting save is forwarded');
 });

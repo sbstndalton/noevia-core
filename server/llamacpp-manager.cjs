@@ -12,21 +12,35 @@ function nativeLabels(model) {
     ...(model.architecture?.input_modalities?.includes('image') ? ['vision'] : []),
   ];
 }
-// The RAG reranker (NOEVIA_FEATURE_RAG_RERANK, rag.cjs) is the other small resident when enabled.
-function keepAlongside() {
-  const e = process.env.EMBEDDING_MODEL || process.env.EMBED_MODEL || '';
-  const r = /^(1|true|on)$/i.test(process.env.NOEVIA_FEATURE_RAG_RERANK || '') ? (process.env.RERANK_MODEL || '').trim() : '';
+// Small models that may stay beside the chat model on a multi-slot engine: the embedding model,
+// only while embeddings are served by this engine (no EMBEDDING_BASE_URL sidecar), and the RAG
+// reranker, only where it is allowed on the shared engine (rerank-target.cjs, #697).
+function keepAlongside(env = process.env) {
+  const e = String(env.EMBEDDING_BASE_URL || '').trim() ? '' : (env.EMBEDDING_MODEL || env.EMBED_MODEL || '');
+  const target = require('./rerank-target.cjs').rerankTarget(env);
+  const r = target.enabled && target.shared ? target.model || '' : '';
   return [...(e && e !== 'default' ? [e] : []), ...(r ? [r] : [])];
 }
 
-function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig = {}, calibrationStatePath, calibrationOptions = {}, evidenceDir, autotuneStatePath, autotuneTablePath, autotuneOptions = {}, presetWriter = null, unloadWait = {} }) {
+function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig = {}, calibrationStatePath, calibrationOptions = {}, evidenceDir, autotuneStatePath, autotuneTablePath, autotuneOptions = {}, presetWriter = null, unloadWait = {}, inferenceBudget = null }) {
   const base = String(baseUrl || '').replace(/\/+$/, '').replace(/\/v1$/, '');
   const url = new URL(base);
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw Error('Invalid llama.cpp router URL');
   function headers(extra) {
     return { 'Content-Type': 'application/json', ...(apiKey && apiKey !== 'local' ? { Authorization: `Bearer ${apiKey}` } : {}), ...(extra || {}) };
   }
-  const request = (path, options = {}, timeout = 8000) => fetchJson(base + path, { ...options, headers: headers(options.headers) }, timeout);
+  const rawRequest = (path, options = {}, timeout = 8000) => fetchJson(base + path, { ...options, headers: headers(options.headers) }, timeout);
+  // #697: every load this process asks for (the Models page, calibration, auto-tune) passes the
+  // inference memory budget first. Chat loads pass it in makeRoomFor, before anything is evicted.
+  async function request(path, options = {}, timeout = 8000) {
+    if (path === '/models/load' && String(options.method || 'GET').toUpperCase() === 'POST') {
+      let model = null;
+      try { model = JSON.parse(options.body || '{}').model; } catch {}
+      const refusal = typeof model === 'string' ? await overBudget(model) : null;
+      if (refusal) return { ok: false, status: 409, body: refusal.body };
+    }
+    return rawRequest(path, options, timeout);
+  }
   const post = (path, body, timeout = 120000, signal) => request(path, { method: 'POST', body: JSON.stringify(body), signal }, timeout);
   const unsupported = operation => Promise.resolve({ ok: false, status: 501, body: { error: `${operation} is not exposed by this llama.cpp adapter` } });
   const modelQuery = model => '?model=' + encodeURIComponent(model) + '&autoload=false';
@@ -35,7 +49,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
   // presets/evidence require the request() helper this closure also builds.
   let onDownloadCompleted=null;
   const tracker=require('./llamacpp-downloads.cjs').createDownloadTracker({base,headers,file:downloadStatePath,fetchStream,onCompleted:model=>onDownloadCompleted?.(model)});
-  const store=presetPath ? require('./llamacpp-presets.cjs').createPresetStore(presetPath,{writer:presetWriter}) : null;
+  const store=presetPath ? require('./llamacpp-presets.cjs').createPresetStore(presetPath,{writer:presetWriter,cacheRam:autoconfig.cacheRam||null}) : null;
   // Every commit (apply, calibration, auto-tune, restores) settles an uncertain Model Loader
   // write by reading models.ini back instead of assuming nothing changed (#339).
   const {commitReconciled}=require('./models-ini-writer.cjs');
@@ -105,11 +119,14 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     }
     return { ...response, body: { manager: 'llamacpp', version: null, all_models_loaded: models } };
   }
-  // The engine keeps two models so the small embedding model can sit beside the chat model
-  // (tool routing, 2026-09-19). Two CHAT models would not fit the GPU, so before a chat model is
-  // used, any other loaded model except those in `keep` is unloaded first.
+  // Before a chat model is used, any other loaded model except those in `keep` is unloaded first.
+  // The engine runs one model at a time (compose --models-max, #697); on a multi-slot engine the
+  // small models in keepAlongside() may stay, but two chat models never share it.
   const admissionError = message => Object.assign(Error(message), { status: 409, publicMessage: message });
   async function makeRoomForUnlocked(model, keep, signal) {
+    // Refuse before evicting anything: an over-budget model must not cost the loaded one.
+    const refusal = await overBudget(model);
+    if (refusal) throw Object.assign(admissionError(refusal.body.error), { code: refusal.body.code });
     const listing = await rawModels(signal);
     if (!listing.ok || !Array.isArray(listing.body?.data)) throw admissionError('Could not check loaded models before switching. Try again.');
     const others = listing.body.data.filter((m) => m.id !== model && !keep.includes(m.id) && ['loaded', 'loading'].includes(m.status?.value));
@@ -148,7 +165,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
         try { await makeRoomForUnlocked(model, keepAlongside(), signal); }
         catch (error) {
           if (signal?.aborted) throw error;
-          return {ok:false,status:error.status || 502,body:{error:error.publicMessage || 'Could not make room for the selected model.'}};
+          return {ok:false,status:error.status || 502,body:{error:error.publicMessage || 'Could not make room for the selected model.',...(error.code?{code:error.code}:{})}};
         }
         signal?.throwIfAborted();
         const started=await post('/models/load', { model },120000,signal);
@@ -198,6 +215,11 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
         const row=(listing.body?.data||[]).find(m=>m.id===body?.model);
         if(row && isSystemModel(row.id, modelPathFromArgs(row.status?.args))) return {ok:false,status:400,body:{error:SYSTEM_MODEL_REASON}};
       }
+      // #697: a dry run of the same write, estimated before anything is committed.
+      let section=null;
+      try {const candidate=presets.prepare(body);section=require('./llamacpp-presets.cjs').parse(candidate.text).sections.get(body.model)?.options||null;} catch {}
+      const refusal=section?await presetRefusal(body.model,section):null;
+      if(refusal)return {ok:false,status:409,body:refusal};
       return applyUnlocked(body);
     });
   }
@@ -287,10 +309,107 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     const {readGguf,summarize}=require('./gguf-meta.cjs');
     try{return {meta:summarize(readGguf(modelFile.file)),modelFile,mmproj};}catch(e){return {error:'Could not read model metadata: '+e.message,status:422};}
   }
+  // #697: the budget autoconfig sizes against: the inference budget (an admin setting), lowered
+  // only by an explicit LLAMACPP_AUTOCONFIG_MEMORY_GIB. The engine container's memory limit
+  // (autoconfig.budgetGib's fallback source) does not count GTT, so it applies only without one.
+  function sizingBudgetGib() {
+    const inference = Number(inferenceBudget?.budgetGib?.());
+    const explicit = Number(autoconfig.explicitBudgetGib);
+    if (inference > 0) return explicit > 0 ? Math.min(inference, explicit) : inference;
+    return Number(autoconfig.budgetGib) > 0 ? Number(autoconfig.budgetGib) : 0;
+  }
+  const footprints = new Map();
+  // What loading `model` with its current preset would use, or null when it cannot be told
+  // (no read-only model mount, file not visible, unreadable metadata). Cached per preset revision.
+  async function footprint(model) {
+    if (!presets || !autoconfig.modelsPath) return null;
+    let profile;
+    try { profile = presets.get(model); } catch { return null; }
+    const hit = footprints.get(model);
+    if (hit && hit.revision === profile.revision && Date.now() - hit.at < 60000) return hit.value;
+    const read = await readModel(model).catch(() => ({ error: 'unreadable' }));
+    const value = read.error ? null : require('./llamacpp-autoconfig.cjs').estimateFootprint({ meta: read.meta, modelBytes: read.modelFile.size,
+      mmprojBytes: read.mmproj?.size || 0, options: { ...profile.defaults, ...profile.options } });
+    footprints.set(model, { revision: profile.revision, at: Date.now(), value });
+    if (footprints.size > 64) footprints.delete(footprints.keys().next().value);
+    return value;
+  }
+  // #697: models the runtime watchdog unloaded, with the preset revision and budget they were
+  // running under. They stay refused until one of the three changes (a different model is
+  // simply a different key), so the next chat cannot reload the same overload straight away.
+  const quarantined = new Map();
+  function quarantine(model, budgetGib) {
+    let revision = null;
+    try { revision = presets ? presets.get(model).revision : null; } catch {}
+    quarantined.set(model, { revision, budgetGib: Number(budgetGib), at: Date.now() });
+    if (quarantined.size > 64) quarantined.delete(quarantined.keys().next().value);
+  }
+  function quarantineRefusal(model, budgetGib) {
+    const q = quarantined.get(model);
+    if (!q) return null;
+    let revision = null;
+    try { revision = presets ? presets.get(model).revision : null; } catch {}
+    if (q.revision !== revision || q.budgetGib !== budgetGib) { quarantined.delete(model); return null; }
+    const error = `${model} was unloaded by the memory safety net because measured inference memory ran more than the allowed margin over the ${budgetGib} GiB budget. It stays unloaded until its settings or the budget change: lower its context or prompt cache, or raise the budget, in Settings → Models & routing.`;
+    return { body: { error, code: 'inference_budget_unloaded', budgetGib, unloadedAt: new Date(q.at).toISOString() } };
+  }
+  // The refusal for a load whose estimate is above the budget, or null (fits, no budget, or no
+  // estimate: the runtime watchdog still covers what cannot be estimated).
+  async function overBudget(model) {
+    const budgetGib = Number(inferenceBudget?.budgetGib?.());
+    if (!(budgetGib > 0)) return null;
+    const held = quarantineRefusal(model, budgetGib);
+    if (held) return held;
+    const est = await footprint(model).catch(() => null);
+    if (!est) return null;
+    if (est.cacheRamUnbounded) {
+      const error = `${model} has an unbounded prompt cache (cache-ram = -1), so it cannot be loaded within the ${budgetGib} GiB inference memory budget. Set its prompt cache in Settings → Models & routing.`;
+      return { body: { error, code: 'inference_budget', budgetGib, estimate: est } };
+    }
+    if (est.totalGib <= budgetGib) return null;
+    const error = `${model} needs about ${est.totalGib} GiB to load (weights ${est.modelGib}, context ${est.kvGib} at ${est.ctx.toLocaleString('en-US')} tokens, prompt cache ${est.cacheRamGib}, runtime ${est.extraGib}), above the ${budgetGib} GiB inference memory budget. Lower its context or prompt cache, use a smaller quantization, or raise the budget in Settings → Models & routing.`;
+    return { body: { error, code: 'inference_budget', budgetGib, estimate: est } };
+  }
+  // #697: refuse to SAVE settings whose estimate is above the budget. Clients outside web (Diary,
+  // Nextcloud Assistant) load presets straight from the router, so a preset that cannot fit must
+  // not be written at all. `options` are the section's own options after the save; the global
+  // section and the explicit prompt cache every write adds are applied here as the write would.
+  async function presetRefusal(model, options) {
+    const budgetGib = Number(inferenceBudget?.budgetGib?.());
+    if (!(budgetGib > 0) || !presets || !autoconfig.modelsPath) return null;
+    const read = await readModel(model).catch(() => ({ error: 'unreadable' }));
+    if (read.error) return null;
+    let defaults = {};
+    try { defaults = presets.get(model).defaults || {}; } catch {}
+    const opts = { ...defaults, ...options };
+    if (opts['cache-ram'] === undefined || opts['cache-ram'] === '') opts['cache-ram'] = String((autoconfig.cacheRam || require('./inference-budget.cjs').cacheRamLimits()).capMib);
+    const est = require('./llamacpp-autoconfig.cjs').estimateFootprint({ meta: read.meta, modelBytes: read.modelFile.size, mmprojBytes: read.mmproj?.size || 0, options: opts });
+    if (!est.cacheRamUnbounded && est.totalGib <= budgetGib) return null;
+    const error = est.cacheRamUnbounded
+      ? `Not saved: an unbounded prompt cache (cache-ram = -1) cannot fit the ${budgetGib} GiB inference memory budget.`
+      : `Not saved: with these settings ${model} needs about ${est.totalGib} GiB (weights ${est.modelGib}, context ${est.kvGib} at ${est.ctx.toLocaleString('en-US')} tokens, prompt cache ${est.cacheRamGib}, runtime ${est.extraGib}), above the ${budgetGib} GiB inference memory budget. Lower the context or prompt cache, or raise the budget.`;
+    return { error, code: 'inference_budget', budgetGib, estimate: est };
+  }
+  // The Models page's per-model estimate against the budget. Read-only; loads nothing.
+  async function inferenceEstimates() {
+    const listing = await rawModels();
+    if (!listing.ok) return listing;
+    if (!Array.isArray(listing.body?.data)) throw Error('Invalid llama.cpp model listing');
+    const budgetGib = Number(inferenceBudget?.budgetGib?.()) || null;
+    const { isSystemModel, modelPathFromArgs } = require('./model-system.cjs');
+    const rows = [];
+    for (const m of listing.body.data) {
+      const est = await footprint(m.id).catch(() => null);
+      rows.push({ model: m.id, loaded: m.status?.value === 'loaded', labels: nativeLabels(m),
+        system: isSystemModel(m.id, modelPathFromArgs(m.status?.args)), estimate: est,
+        fits: est && budgetGib ? !est.cacheRamUnbounded && est.totalGib <= budgetGib : null });
+    }
+    return { ok: true, status: 200, body: { budgetGib, models: rows } };
+  }
   // Size-based preset suggestion. Never writes; the admin applies it through applyPreset.
   async function suggestPreset(model) {
     if(!presets)return unsupported('Native preset suggestions; configure LLAMACPP_PRESET_PATH');
-    const {modelsPath,budgetGib,cacheRamMaxMib}=autoconfig;
+    const {modelsPath,cacheRamMaxMib}=autoconfig;const budgetGib=sizingBudgetGib();
     if(!modelsPath)return {ok:false,status:501,body:{error:'Suggestions need the model directory mounted read-only; set LLAMACPP_MODELS_PATH.'}};
     if(!(budgetGib>0))return {ok:false,status:501,body:{error:'Suggestions need an inference memory budget; set LLAMACPP_AUTOCONFIG_MEMORY_GIB or LLAMACPP_MEMORY_LIMIT.'}};
     const profile=presets.get(model);
@@ -308,7 +427,8 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     const read=await readModel(model);
     if(read.error)return {ok:false,status:read.status,body:{error:read.error}};
     const inputs=require('./llamacpp-autoconfig.cjs').estimateInputs({meta:read.meta,modelBytes:read.modelFile.size,mmprojBytes:read.mmproj?.size||0,current:{...profile.defaults,...profile.options}});
-    return {ok:true,status:200,body:{model,budgetGib:autoconfig.budgetGib>0?autoconfig.budgetGib:null,...inputs}};
+    const budgetGib=sizingBudgetGib();
+    return {ok:true,status:200,body:{model,budgetGib:budgetGib>0?budgetGib:null,...inputs}};
   }
   // Starting settings for calibration: structural values from the model file; the context
   // itself is measured, so an unconfigured memory budget is not an obstacle here.
@@ -316,7 +436,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     const read=await readModel(model);
     if(read.error)return null;
     const profile=presets.get(model);
-    const result=require('./llamacpp-autoconfig.cjs').suggest({meta:read.meta,modelBytes:read.modelFile.size,mmprojBytes:read.mmproj?.size||0,budgetGib:autoconfig.budgetGib>0?autoconfig.budgetGib:1e6,current:{...profile.defaults,...profile.options},cacheRamMaxMib:autoconfig.cacheRamMaxMib});
+    const result=require('./llamacpp-autoconfig.cjs').suggest({meta:read.meta,modelBytes:read.modelFile.size,mmprojBytes:read.mmproj?.size||0,budgetGib:sizingBudgetGib()||1e6,current:{...profile.defaults,...profile.options},cacheRamMaxMib:autoconfig.cacheRamMaxMib});
     return {native:read.meta.contextLength||0,values:result.values||null};
   }
   // Live identity of a model's current configuration (spec-agent-execution §1). Null when
@@ -457,11 +577,19 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     applyPreset,
     suggestPreset,
     estimateMemory,
+    inferenceEstimates,
+    // #697: the load guard and the budget, for the proxied benchmark start and the watchdog.
+    loadRefusal: model => overBudget(model).then(r => r ? r.body : null),
+    presetRefusal: (model, options) => presetRefusal(model, require('./llamacpp-presets.cjs').canonicalOptions(options)),
+    quarantine,
+    sizingBudgetGib,
     reloadPresets,
     evidence, recordEvidence, importEvidence,
     calibration: calibrator ? { start: calibrator.start, cancel: calibrator.cancel, status: calibrator.status, recover: calibrator.recover } : null,
     autotune: autotuner ? { start: autotuner.start, resume: autotuner.resume, cancel: autotuner.cancel, status: autotuner.status, recover: autotuner.recover, untuned: autotuner.untuned } : null,
     unload: model => mutate(()=>withAdmission(()=>post('/models/unload', { model }))),
+    // #697 watchdog: unload without waiting behind admission or maintenance; memory is running out.
+    emergencyUnload: model => post('/models/unload', { model }, 60000),
     pull: ({ checkpoint }) => mutate(async () => {
       if (!/^[\w.-]+\/[\w.-]+(?::[\w.-]+)?$/.test(checkpoint || '')) return { ok: false, status: 400, body: { error: 'Choose a Hugging Face repository and quantization' } };
       tracker.requested(checkpoint);
@@ -493,4 +621,4 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     variants: repo => require('./llamacpp-variants.cjs').variants(repo, fetchJson),
   };
 }
-module.exports = { createLlamaCppManager };
+module.exports = { createLlamaCppManager, keepAlongside };

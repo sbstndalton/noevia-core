@@ -10,7 +10,7 @@
 /** @param {{roles: () => object|null, provider: () => object, headers: (p: object) => object,
  *           fetchJson: (url: string, init: object, timeoutMs: number) => Promise<object>,
  *           log?: object}} deps */
-function createAutoRouter({ roles, provider, headers, fetchJson, log = console }) {
+function createAutoRouter({ roles, provider, headers, fetchJson, log = console, admit = null, record = () => {} }) {
 
   function heuristicWantsSmart(message) {
     const m = String(message);
@@ -102,6 +102,20 @@ function createAutoRouter({ roles, provider, headers, fetchJson, log = console }
     const withCode = !!active.code;
     if (withCode && heuristicWantsCode(message)) return 'code';
     if (heuristicWantsSmart(message)) return 'smart';
+    // #697: the engine holds one model within a memory budget. The classifier is a cheap call,
+    // never a reason to swap models: when its model is not the resident one (or would not fit),
+    // the rules above have already had their say and the message goes to fast, without any
+    // request to the engine. `admit` answers null to proceed or { cause } to skip.
+    if (admit) {
+      let blocked;
+      try { blocked = await admit(active.fast); } catch { blocked = { cause: 'admission-error' }; }
+      if (blocked) {
+        const cause = /^[a-z][a-z0-9-]{0,39}$/.test(String(blocked.cause || '')) ? blocked.cause : 'skipped';
+        try { record({ selected: 'fast', fellBack: 'classifier-skipped', cause }); } catch { /* text-free log only */ }
+        log.log(`[router] classifier skipped (${cause}), rules default to fast`);
+        return 'fast';
+      }
+    }
     try {
       const defaultProvider = provider();
       const url = `${defaultProvider.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`;

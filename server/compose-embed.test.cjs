@@ -72,10 +72,13 @@ test('compose.embed.yaml top-level keys are services and the shared models netwo
     'the only network the overlay declares is `models` (same as compose.llamacpp.yaml)');
 });
 
-test('compose.embed.yaml declares exactly the embed and web services', () => {
+test('compose.embed.yaml declares exactly the embed, web and diary services', () => {
   const text = fs.readFileSync(overlayPath, 'utf8');
-  assert.deepEqual(new Set(serviceNames(text)), new Set(['embed', 'web']),
-    'overlay must declare exactly {embed, web}');
+  assert.deepEqual(new Set(serviceNames(text)), new Set(['embed', 'web', 'diary']),
+    'overlay must declare exactly {embed, web, diary}');
+  // #697: Diary only gains its embedding endpoint, so it never asks the one-model engine to embed.
+  const diary = serviceBlock(text, 'diary');
+  assert.deepEqual(diary.split('\n').filter(l => /^ {6}\w/.test(l)).map(l => l.trim()), ['LLM_EMBED_BASE_URL: http://embed:8080/v1']);
 });
 
 test('compose.embed.yaml embed service is digest-pinned, healthchecked and default and models networks only', () => {

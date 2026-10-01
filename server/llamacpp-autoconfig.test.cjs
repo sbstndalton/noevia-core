@@ -51,8 +51,12 @@ test('KV sizing follows hybrid, sliding-window and plain attention layouts',()=>
 test('suggestion picks the largest fitting context and adds projector and MTP settings',()=>{
   const meta=summarize(Object.fromEntries(Object.entries(qwen35).map(([k,[,v]])=>[k,v])));
   const gib=1024**3;
+  // #697: rows include the 1 GiB prompt-cache cap, so 14 GiB now stops one rung below native
+  // and 15 GiB is what holds the full 262144 context with its cache.
+  assert.equal(suggest({meta,modelBytes:5.56*gib,mmprojBytes:0.86*gib,budgetGib:15,current:{'ubatch-size':'1024'}}).values['ctx-size'],'262144');
   const r=suggest({meta,modelBytes:5.56*gib,mmprojBytes:0.86*gib,budgetGib:14,current:{'ubatch-size':'1024'}});
-  assert.equal(r.values['ctx-size'],'262144');
+  assert.equal(r.values['ctx-size'],'237568');
+  assert.ok(r.rows.every(row=>row.cacheRamGib===1),'every row carries the prompt-cache cap');
   assert.equal(r.values['image-max-tokens'],'1024');assert.equal(r.values['ubatch-size'],'1024');
   assert.equal(r.values['cache-ram'],'1024');assert.equal(r.values['spec-type'],undefined);
   assert.ok(r.estimateGib<=14&&r.rows.every(row=>row.fits===(row.totalGib<=14)));

@@ -555,3 +555,21 @@ test('SSE parsing survives events split across chunks, mid-line and mid multi-by
   for await (const d of sseDeltas({ body: new Response(crlf).body }, { ...m, deltas: 0, bytes: 0, timings: {} }, () => 0)) t2 += d;
   assert.equal(t2, 'é');
 });
+
+test('#697: a model over the inference memory budget is never pinned or called', async () => {
+  const fake = fakeEngine({ loaded: [] });
+  let over = true;
+  const logs = [];
+  const make = () => createRoleEngine({ fetch: fake.fetch, log: (e) => logs.push(e), keep: () => ['synthetic-rerank'],
+    budgetRefusal: async (model) => (over ? { error: `${model} needs about 30 GiB to load`, code: 'inference_budget' } : null),
+    engine: () => ({ baseUrl: 'http://engine.invalid/v1', apiKey: 'k-local', model: MODEL }) });
+  const refused = await make().pinModel({ taskId: 'task-702' });
+  assert.deepEqual(refused, { ok: false, code: 'over_budget', reason: `${MODEL} needs about 30 GiB to load` });
+  over = false;
+  const session = (await make().pinModel({ taskId: 'task-702' })).session;
+  over = true; // the budget was lowered after the pin
+  const r = await session.call({ role: 'planner', state: state(), instructions: 'p', schema: SCHEMA });
+  assert.equal(r.ok, false); assert.equal(r.code, 'over_budget');
+  assert.equal(fake.calls.length, 0, 'nothing was sent, so nothing was loaded');
+  assert.ok(logs.some((e) => e.event === 'role.budget_refused'));
+});

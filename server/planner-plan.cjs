@@ -69,7 +69,7 @@ function validatePlanArtifact(artifact, { capabilities = null } = {}) {
  * `enabled` reads features.constrainedPlanDecoding; `engine().provider` is the provider row (its
  * effective capabilities decide whether the schema is sent).
  */
-function createPlannerPlan({ enabled = () => false, engine, fetch = (url, init) => globalThis.fetch(url, init), deadlineMs = DEFAULT_DEADLINE_MS, log = () => {} }) {
+function createPlannerPlan({ enabled = () => false, engine, fetch = (url, init) => globalThis.fetch(url, init), deadlineMs = DEFAULT_DEADLINE_MS, log = () => {}, admit = null }) {
   if (typeof engine !== 'function') throw Error('createPlannerPlan needs engine()');
   if (!Number.isInteger(deadlineMs) || deadlineMs < 1) throw Error('Invalid plan deadline');
   const record = (entry) => { try { log(entry); } catch { /* logging never changes the outcome */ } };
@@ -145,6 +145,11 @@ function createPlannerPlan({ enabled = () => false, engine, fetch = (url, init) 
         return fail('context_invalid', 'The task could not be prepared for the Planner.');
       }
 
+      // #697: the plan's model is admitted to the shared engine (one model, memory budget) first.
+      if (admit) {
+        try { await admit(endpoint.model, signal); }
+        catch (e) { return fail('over_budget', e?.publicMessage || 'The Planner model cannot be loaded within the inference memory budget.'); }
+      }
       let constraint = planConstraint({ enabled: flagOn(), provider: endpoint.provider || null, model: endpoint.model, thinking });
       let outcome = { applied: false, mode: null, reason: constraint.reason, fallback: false };
       const url = `${String(endpoint.baseUrl).replace(/\/+$/, '')}/chat/completions`;

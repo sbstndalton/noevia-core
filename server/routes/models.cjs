@@ -44,7 +44,7 @@ function clientMessage(e, fallback) {
  * @param {() => object} deps.currentWorkspace
  * @param {object} deps.service   models.cjs
  */
-function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe, reportedTokenRate, missingRoles, currentWorkspace, service }) {
+function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe, reportedTokenRate, missingRoles, currentWorkspace, service, inferenceBudget = null }) {
   const { modelScanCache, refreshModelScan, autoRoles, setAutoRoles, ensureRolesLoaded, servedCatalogue, modelsInstalled, deriveUserModelName, lastLoadedModel, clearLastLoadedModel, clearRoleReferences } = service;
 
   async function handle(req, res, { path: p, authn, url }) {
@@ -177,6 +177,11 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
         let payload; try{payload=JSON.parse(body||'{}');}catch{payload={};}
         const bad=require('../chat-model-kind.cjs').nonChatAliases(Array.isArray(payload.aliases)?payload.aliases:[],await servedCatalogue());
         if(bad.length)return json(res,400,{error:`The prompt suite needs chat models; ${bad.join(', ')} ${bad.length===1?'is':'are'} an embedding, reranking or routing model.`});
+        // #697: the benchmark loads each model through the router itself, so the budget is checked here.
+        if(modelManager.loadRefusal)for(const alias of (Array.isArray(payload.aliases)?payload.aliases:[]).filter(a=>typeof a==='string').slice(0,64)){
+          const refusal=await modelManager.loadRefusal(alias).catch(()=>null);
+          if(refusal)return json(res,409,refusal);
+        }
       }
       // Set only for POST models/delete, and read again once the forwarded delete has
       // succeeded (below): the folder-scan proxy deletes files directly through the model
@@ -222,13 +227,34 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
         if (method === 'DELETE' && (isSidecarModel(name, env) || (cachedEntry && isSidecarModel(cachedEntry.modelId, env)))) {
           return json(res, 409, { error: SIDECAR_MODEL_DELETE_REASON });
         }
+        // #697: a section saved through the model manager replaces the whole section; refuse it when
+        // the settings would not fit the inference memory budget, as the preset editor does.
+        if (method === 'PUT' && !rest.endsWith('/rename') && modelManager.presetRefusal) {
+          let payload; try { payload = JSON.parse(body || '{}'); } catch { payload = {}; }
+          const options = { ...(payload.values && typeof payload.values === 'object' ? payload.values : {}) };
+          for (const line of String(payload.extras || '').split('\n')) {
+            const m = /^\s*([^#;=\s][^=]*?)\s*=\s*(.*?)\s*$/.exec(line);
+            if (m) options[m[1]] = m[2];
+          }
+          const refusal = await modelManager.presetRefusal(name, Object.fromEntries(Object.entries(options).filter(([, v]) => typeof v === 'string' && v !== '')));
+          if (refusal) return json(res, 409, refusal);
+        }
       }
       if(method!=='GET')modelScanCache.clear();
       if(method==='GET'&&rest==='models'&&!url.search){
         const hit=modelScanCache.get('models');
         if(hit){res.setHeader('Cache-Control','no-store');res.setHeader('X-Model-Scan','cached');if(Date.now()-hit.at>5000)refreshModelScan();return json(res,200,hit.body);}
       }
-      const result=await fetchJson(`${env.MODEL_LOADER_URL.replace(/\/+$/,'')}/api/v1/${rest}${url.search}`,{method,headers:{'Content-Type':'application/json',...(env.MODEL_LOADER_TOKEN?{'X-Model-Loader-Token':env.MODEL_LOADER_TOKEN}:{})},body},10*60*1000).catch(()=>null);
+      // #697: the model manager's autoconfig sizes against the inference budget, set here rather
+      // than by the browser (any budget_gib the client sent is replaced).
+      let search=url.search;
+      if(method==='GET'&&/^sections\/[^/]+\/autoconfig$/.test(rest)&&modelManager.sizingBudgetGib){
+        const q=new URLSearchParams(url.search);q.delete('budget_gib');
+        const budget=modelManager.sizingBudgetGib();
+        if(budget>0)q.set('budget_gib',String(budget));
+        search=q.toString()?'?'+q.toString():'';
+      }
+      const result=await fetchJson(`${env.MODEL_LOADER_URL.replace(/\/+$/,'')}/api/v1/${rest}${search}`,{method,headers:{'Content-Type':'application/json',...(env.MODEL_LOADER_TOKEN?{'X-Model-Loader-Token':env.MODEL_LOADER_TOKEN}:{})},body},10*60*1000).catch(()=>null);
       res.setHeader('Cache-Control','no-store');
       if(!result)return json(res,502,{error:'The model management service is not responding.'});
       const detail=result.body&&typeof result.body==='object'?result.body:{error:String(result.body||'')};
@@ -355,6 +381,26 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
       if(!model||model.length>200)return json(res,400,{error:'Choose a model'});
       try{const result=await modelManager.estimateMemory(model);res.setHeader('Cache-Control','no-store');return json(res,result.status,result.body);}
       catch(e){return json(res,500,{error:clientMessage(e,'Could not estimate memory for this model.')});}
+    }
+
+    // #697: the inference memory budget (admin setting) and each model's estimate against it.
+    // GET is read-only (no load, no write); PUT stores the budget.
+    if (p === '/api/models/inference-budget') {
+      if(authn.user.role!=='admin')return json(res,403,{error:'Administrator required for shared model profiles'});
+      if(!inferenceBudget)return json(res,404,{error:'The inference memory budget is unavailable'});
+      res.setHeader('Cache-Control','no-store');
+      if(req.method==='PUT'){
+        let body;try{body=await readJson(req);}catch{return json(res,400,{error:'invalid JSON'});}
+        try{return json(res,200,inferenceBudget.save(body,authn.user.id));}
+        catch(e){return json(res,e.status||500,{error:e.status?e.message:'Could not save the budget',...(e.messageId?{errorId:e.messageId,minGib:e.minGib,maxGib:e.maxGib}:{})});}
+      }
+      if(req.method!=='GET')return json(res,405,{error:'Method not allowed'});
+      let models=null,estimateError=null;
+      if(modelManager.inferenceEstimates){
+        try{const r=await modelManager.inferenceEstimates();if(r.ok)models=r.body.models;else estimateError='engine';}
+        catch(e){estimateError='engine';clientMessage(e,'');}
+      }
+      return json(res,200,{...inferenceBudget.get(),models,...(estimateError?{estimateError}:{})});
     }
 
     if (p === '/api/models/preset') {

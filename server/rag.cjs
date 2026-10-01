@@ -67,13 +67,15 @@ const MIN_SCORE = 0.3;
 const RERANK_POOL_MAX = 24;
 let rerank = null; // { decisions, pool, keep, deadlineMs }
 function initRerank() {
-  const on = /^(1|true|on)$/i.test(process.env.NOEVIA_FEATURE_RAG_RERANK || '');
-  const baseUrl = (process.env.RERANK_BASE_URL || '').trim();
-  if (!on || !baseUrl) { rerank = null; return; }
+  // #697: never on the shared inference engine unless the operator allows it (rerank-target.cjs).
+  const target = require('./rerank-target.cjs').rerankTarget(process.env);
+  if (target.reason) console.warn('[rag] rerank off:', target.reason);
+  if (!target.enabled) { rerank = null; return; }
+  const baseUrl = target.baseUrl;
   const { createDecisions } = require('./decision/index.cjs');
   const { llamaRerankBackend } = require('./decision/backends.cjs');
   const decisions = createDecisions({
-    backends: { 'llama-rerank': llamaRerankBackend({ baseUrl, model: process.env.RERANK_MODEL || null, apiKey: process.env.RERANK_API_KEY || process.env.INFERENCE_API_KEY || null }) },
+    backends: { 'llama-rerank': llamaRerankBackend({ baseUrl, model: process.env.RERANK_MODEL || null, apiKey: process.env.RERANK_API_KEY || null /* #697: the inference key never goes to a reranker sidecar */ }) },
     chains: { 'rag.rerank': ['llama-rerank'] },
     log: (e) => { if (e.failed || e.fellBack) console.warn('[rag] rerank', JSON.stringify(e)); },
   });

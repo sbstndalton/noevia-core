@@ -174,9 +174,10 @@ test('before a chat model loads, other chat models are unloaded but the embeddin
  }finally{if(prev===undefined)delete process.env.EMBEDDING_MODEL;else process.env.EMBEDDING_MODEL=prev;}
 });
 
-test('with RAG rerank on, the reranker also stays beside the chat model',async()=>{
- const keys=['EMBEDDING_MODEL','NOEVIA_FEATURE_RAG_RERANK','RERANK_MODEL'],prev=Object.fromEntries(keys.map(k=>[k,process.env[k]]));
- Object.assign(process.env,{EMBEDDING_MODEL:'fixture-embed',NOEVIA_FEATURE_RAG_RERANK:'1',RERANK_MODEL:'fixture-rerank'});
+test('with RAG rerank allowed on the shared engine, the reranker also stays beside the chat model',async()=>{
+ // #697: only an operator who allowed the reranker on the shared engine keeps it resident.
+ const keys=['EMBEDDING_MODEL','NOEVIA_FEATURE_RAG_RERANK','RERANK_MODEL','RERANK_BASE_URL','INFERENCE_BASE_URL','RERANK_SHARED_ENGINE'],prev=Object.fromEntries(keys.map(k=>[k,process.env[k]]));
+ Object.assign(process.env,{EMBEDDING_MODEL:'fixture-embed',NOEVIA_FEATURE_RAG_RERANK:'1',RERANK_MODEL:'fixture-rerank',RERANK_BASE_URL:'http://synthetic/v1',INFERENCE_BASE_URL:'http://synthetic/v1',RERANK_SHARED_ENGINE:'allow'});
  const unloaded=[];const state={'chat-a':'loaded','fixture-rerank':'loaded','chat-b':'unloaded'};
  const manager=createModelManager({fetchStream:async()=>({ok:false}),kind:'llamacpp',baseUrl:'http://synthetic',fetchJson:async(url,options)=>{
   const path=new URL(url).pathname,body=options?.body?JSON.parse(options.body):{};

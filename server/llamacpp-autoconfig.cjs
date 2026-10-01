@@ -29,6 +29,10 @@ const MMPROJ_COMPUTE_GIB = 0.5;    // vision encoder scratch beyond projector we
 const IMAGE_MAX_TOKENS = 1024;     // bounds per-image decode memory; ubatch must cover it
 const SAFETY = 1.05;              // raw estimate ran 4% under the measured Qwen 9B peak
 const GIB = 1024 ** 3;
+// Bytes per KV element per cache type (llama.cpp block layouts); f16 is llama.cpp's default.
+const KV_TYPE_BYTES = { f32: 4, f16: 2, bf16: 2, q8_0: 1.0625, q5_1: 0.75, q5_0: 0.6875, q4_1: 0.625, q4_0: 0.5625, iq4_nl: 0.5625 };
+// llama-server's own --cache-ram default (MiB) when a preset sets none (#697).
+const LLAMA_CACHE_RAM_DEFAULT_MIB = 8192;
 
 const scalar = v => (typeof v === 'number' && v > 0 ? v : null);
 function kvHeadsOf(value, fallback) {
@@ -128,13 +132,17 @@ function suggest({ meta, modelBytes, mmprojBytes = 0, budgetGib, current = {}, c
     return { error: `This model's native context (${native}) is below the smallest supported context size (${CTX_CANDIDATES[0]}). Set the context manually and load-test it.` };
   }
   const candidates = CTX_CANDIDATES.filter(c => !native || c <= native).sort((a, b) => a - b);
+  // #697: the prompt cache (--cache-ram) is host RAM spent on inference too, so each row is
+  // sized with the largest cache this suggestion may write; the estimate then never exceeds
+  // the budget whatever cache size is chosen below.
+  const cacheGib = Math.max(0, Number(cacheRamMaxMib) || 0) / 1024;
   const rows = candidates.map(ctx => {
     const kvGib = (kvCacheBytes(m, ctx) + draftKvBytes(m, ctx)) / GIB;
-    const totalGib = (modelGib + kvGib + pinnedGib + RESERVE_GIB) * SAFETY;
-    return { ctx, modelGib: round2(modelGib), kvGib: round2(kvGib), extraGib: round2(pinnedGib + RESERVE_GIB), totalGib: round2(totalGib), fits: totalGib <= budgetGib };
+    const totalGib = (modelGib + kvGib + pinnedGib + RESERVE_GIB) * SAFETY + cacheGib;
+    return { ctx, modelGib: round2(modelGib), kvGib: round2(kvGib), extraGib: round2(pinnedGib + RESERVE_GIB), cacheRamGib: round2(cacheGib), totalGib: round2(totalGib), fits: totalGib <= budgetGib };
   });
   const fitting = rows.filter(r => r.fits);
-  if (!fitting.length) return { error: `This model needs about ${round2((modelGib + pinnedGib + RESERVE_GIB) * SAFETY)} GiB before any context, more than the ${budgetGib} GiB budget. Use a smaller quantization.`, rows, budgetGib };
+  if (!fitting.length) return { error: `This model needs about ${round2((modelGib + pinnedGib + RESERVE_GIB) * SAFETY + cacheGib)} GiB before any context, more than the ${budgetGib} GiB budget. Use a smaller quantization.`, rows, budgetGib };
   const best = fitting.at(-1);
 
   const values = { 'ctx-size': String(best.ctx), parallel: '1', 'n-gpu-layers': '999', 'flash-attn': 'on', 'cache-type-k': 'q8_0', 'cache-type-v': 'q8_0' };
@@ -182,7 +190,49 @@ function estimateInputs({ meta, modelBytes, mmprojBytes = 0, current = {} }) {
   const currentCtx = Number(current['ctx-size'] || current.c) || null;
   const currentKv = typeof current['cache-type-k'] === 'string' ? current['cache-type-k'] : null;
   return { chat, sizeable, arch: m.arch || '', nativeCtx: native || null, modelGib: round2(modelBytes / GIB), pinnedGib: round2(pinnedGib),
-    reserveGib: RESERVE_GIB, safety: SAFETY, moe: !!(m.expertCount && m.expertCount > 1), rows, current: { ctx: currentCtx, kv: currentKv } };
+    reserveGib: RESERVE_GIB, safety: SAFETY, moe: !!(m.expertCount && m.expertCount > 1), rows, current: { ctx: currentCtx, kv: currentKv },
+    // #697: the preset's prompt cache counts against the inference budget too (null: unbounded).
+    cacheRamGib: Number.isFinite(cacheRamMibOf(current['cache-ram'])) ? round2(cacheRamMibOf(current['cache-ram']) / 1024) : null };
+}
+
+/** Prompt-cache MiB a preset value means: unset is llama-server's 8192 default, -1 unbounded. */
+function cacheRamMibOf(value) {
+  const text = value == null ? '' : String(value).trim();
+  if (text === '') return LLAMA_CACHE_RAM_DEFAULT_MIB;
+  const n = Number(text);
+  if (!Number.isFinite(n)) return LLAMA_CACHE_RAM_DEFAULT_MIB;
+  return n < 0 ? Infinity : n;
+}
+
+/**
+ * #697: what loading one preset costs in inference memory (GPU-visible memory, which on an APU
+ * is GTT in system RAM, plus the host-RAM prompt cache). Uses the same KV/projector estimators
+ * as suggest(), at the preset's own context and cache types:
+ *   total = (weights + KV(ctx, cache types) + draft KV + projector + 1 GiB runtime) x 1.05
+ *           + cache-ram
+ * `options` are the effective preset options ({...'*', ...section}).
+ */
+function estimateFootprint({ meta, modelBytes, mmprojBytes = 0, options = {} }) {
+  const m = meta || {};
+  const native = m.contextLength || 0;
+  const ctx = Number(options['ctx-size'] || options.c) || native || 4096;
+  const typeBytes = t => KV_TYPE_BYTES[String(t || 'f16').toLowerCase()] || KV_TYPE_BYTES.f16;
+  const kvScale = (typeBytes(options['cache-type-k']) + typeBytes(options['cache-type-v'])) / 2 / Q8_BYTES;
+  const sizeable = kvCacheBytes(m, 4096) > 0;
+  const kvGib = sizeable ? (kvCacheBytes(m, ctx) + draftKvBytes(m, ctx)) * kvScale / GIB : 0;
+  let pinnedGib = 0;
+  if (mmprojBytes > 0) {
+    const ubatch = Math.max(IMAGE_MAX_TOKENS, Number(options['ubatch-size']) || 0);
+    pinnedGib = mmprojBytes / GIB + MMPROJ_COMPUTE_GIB + 7 * Math.max(0, ubatch - 512) * (m.blockCount || 0) * (m.embeddingLength || 0) / 1e9;
+  }
+  const modelGib = (Number(modelBytes) || 0) / GIB;
+  const cacheMib = cacheRamMibOf(options['cache-ram']);
+  const cacheRamGib = cacheMib === Infinity ? Infinity : cacheMib / 1024;
+  const engineGib = (modelGib + kvGib + pinnedGib + RESERVE_GIB) * SAFETY;
+  const totalGib = engineGib + cacheRamGib;
+  return { ctx, modelGib: round2(modelGib), kvGib: round2(kvGib), extraGib: round2(pinnedGib + RESERVE_GIB),
+    cacheRamGib: cacheRamGib === Infinity ? null : round2(cacheRamGib), cacheRamUnbounded: cacheRamGib === Infinity,
+    totalGib: totalGib === Infinity ? null : round2(totalGib), sizeable };
 }
 
 function parseMemoryLimit(value) {
@@ -192,4 +242,4 @@ function parseMemoryLimit(value) {
   return Number(match[1]) * scale;
 }
 
-module.exports = { suggest, estimateInputs, kvCacheBytes, parseMemoryLimit, CTX_CANDIDATES };
+module.exports = { suggest, estimateInputs, estimateFootprint, cacheRamMibOf, kvCacheBytes, parseMemoryLimit, CTX_CANDIDATES, KV_TYPE_BYTES, LLAMA_CACHE_RAM_DEFAULT_MIB };

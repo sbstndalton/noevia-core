@@ -214,7 +214,7 @@ async function* sseDeltas(response, m, now) {
  * embedding/reranking sidecars). `admission` serialises the residency check with the send (the
  * model manager's withAdmission); without one, they run back to back unlocked.
  */
-function createRoleEngine({ engine, fetch = (url, init) => globalThis.fetch(url, init), loadedModels = null, keep = () => [], admission = null, roleDefaults = {}, log = () => {}, now = () => Date.now() }) {
+function createRoleEngine({ engine, fetch = (url, init) => globalThis.fetch(url, init), loadedModels = null, keep = () => [], admission = null, budgetRefusal = null, roleDefaults = {}, log = () => {}, now = () => Date.now() }) {
   if (typeof engine !== 'function') throw Error('createRoleEngine needs engine()');
   const admit = typeof admission === 'function' ? admission : (work) => work();
   const keepIds = () => { try { const k = keep(); return Array.isArray(k) ? k.filter((x) => typeof x === 'string') : []; } catch { return []; } };
@@ -266,6 +266,13 @@ function createRoleEngine({ engine, fetch = (url, init) => globalThis.fetch(url,
       if (loaded.some((id) => id !== wanted)) {
         record({ event: 'role.model_refused', taskId, stage: 'pin', pinned: wanted, others: loaded.filter((id) => id !== wanted).length });
         return fail('model_mismatch', 'A different model is loaded. The task was not started, because switching models would unload it.');
+      }
+      // #697: a model that would not fit the inference memory budget is never pinned (a cold pin
+      // would load it on the first call). `budgetRefusal(model)` answers null or { error, code }.
+      const refused = budgetRefusal ? await Promise.resolve().then(() => budgetRefusal(wanted)).catch(() => null) : null;
+      if (refused) {
+        record({ event: 'role.budget_refused', taskId, stage: 'pin' });
+        return fail('over_budget', String(refused.error || 'The model does not fit the inference memory budget.'));
       }
       record({ event: 'role.pinned', taskId, model: wanted, thinking, cold: !loaded.includes(wanted) });
       return { ok: /** @type {true} */ (true), session: makeSession({ taskId, model: wanted, thinking, roles: [...roles] }) };
@@ -348,6 +355,9 @@ function createRoleEngine({ engine, fetch = (url, init) => globalThis.fetch(url,
                 temperature: 0, max_tokens: maxTokens, chat_template_kwargs: { enable_thinking: pin.thinking },
               };
               const m = { start: now(), bytes: 0, deltas: 0, reasoningDeltas: 0, firstDeltaMs: null, complete: false, timings: {} };
+              // #697: checked again per call: the budget, or the model's preset, may have changed.
+              const refused = budgetRefusal ? await Promise.resolve().then(() => budgetRefusal(pin.model)).catch(() => null) : null;
+              if (refused) throw Object.assign(Error('over budget'), { code: 'inference_budget', publicMessage: String(refused.error || '') });
               // One admission: the residency check and the send (until the engine answers headers).
               const r = await admit(async () => {
                 await assertResident(endpoint, role);
@@ -376,6 +386,8 @@ function createRoleEngine({ engine, fetch = (url, init) => globalThis.fetch(url,
             record({ event: 'role.invalid', taskId: pin.taskId, role, corrected: true });
             return { ...fail('invalid', 'The answer did not match the expected format, even after one correction.'), constraint: outcome };
           }
+          // #697: the pinned model would not fit the inference memory budget; nothing was sent.
+          if (error?.code === 'inference_budget' || error?.code === 'inference_budget_unloaded') return { ...fail('over_budget', String(error.publicMessage || 'The model does not fit the inference memory budget, so this step was not sent.')), constraint: outcome };
           if (error?.code === 'router_unavailable') return { ...fail('router_unavailable', 'The model router could not say which model is loaded, so this step was not sent.'), constraint: outcome };
           record({ event: 'role.call_failed', taskId: pin.taskId, role, status: Number.isInteger(error?.status) ? error.status : null, code: ['no_stream', 'engine_error'].includes(error?.code) ? error.code : 'transport' });
           return { ...fail('error', 'The model could not be reached.'), constraint: outcome };
