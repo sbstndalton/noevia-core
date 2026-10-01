@@ -397,6 +397,46 @@ const codeEgress = require('./code-egress.cjs').startEgressFromEnv(process.env, 
 // Executor guard (#704, code-tool-schemas.cjs): off unless features.executorGuard. Read once per
 // Code task when it starts; it only adds automatic refusals of malformed tool calls.
 require('./code-tool-schemas.cjs').useExecutorGuard(() => features.enabled('executorGuard'));
+// Planner review (#519, code-review.cjs): off unless features.plannerReview. Advice on a final card
+// the person still answers; it runs on the default provider as the web container reaches it, and
+// refuses an external one. With the flag on it runs through the role engine (#702, role-engine.cjs):
+// the task's model is pinned and the call streams under the Laya guard. Under the model manager's
+// admission lock, a different resident chat model (the embedding/rerank sidecars excepted) refuses
+// the review instead of swapping (models-max 1); with nothing resident, the review loads the pinned
+// model inside that same lock. A client outside this process can still race the router.
+// The same role engine runs the Code pipeline's Planner, review and Auditor (#705).
+const codeRoleLog = (entry) => console.log('[code]', JSON.stringify(entry));
+const codeRoleEndpoint = () => {
+  const provider = getProvider(DEFAULT_PROVIDER_ID);
+  const base = String(provider?.baseUrl || '').replace(/\/+$/, '');
+  return {
+    baseUrl: base ? (/\/v1$/.test(base) ? base : `${base}/v1`) : null,
+    apiKey: provider?.apiKey || null,
+    model: autoRoles()?.code || autoRoles()?.smart || lastLoadedModel() || null,
+    external: require('./provider-egress.cjs').isExternalProvider(provider),
+    provider,
+  };
+};
+const codeRoleEngine = require('./role-engine.cjs').createRoleEngine({ fetch: (...args) => globalThis.fetch(...args), log: codeRoleLog, engine: codeRoleEndpoint,
+  keep: () => [...require('./model-system.cjs').sidecarModelNames(process.env)],
+  admission: typeof modelManager.withAdmission === 'function' ? (work, signal) => modelManager.withAdmission(work, signal) : null,
+  // #697: never pin or call a model that would not fit the inference memory budget.
+  budgetRefusal: typeof modelManager.loadRefusal === 'function' ? (model) => modelManager.loadRefusal(model) : null });
+const codeReview = require('./code-review.cjs').createPlannerReview({
+  enabled: () => features.enabled('plannerReview'),
+  log: codeRoleLog,
+  // #697: both paths admit the model within the inference memory budget before any request.
+  provider: require('./code-review.cjs').createEngineReviewer({ fetch: (...args) => globalThis.fetch(...args), log: codeRoleLog, engine: codeRoleEndpoint, admit: (model, signal) => admitEngineModel(model, signal) }),
+  roleEngine: codeRoleEngine,
+});
+// The Code pipeline (#705, code-pipeline.cjs, which holds the task-lifecycle authority): offered as
+// the "Planner" preparation only with features.codePipeline on and Code mode in the sandbox.
+// Verification is #703's one-shot verifier container (code-verify.cjs, CODE_VERIFY_ENDPOINT); unset,
+// busy or unreachable, a pipeline task stops as blocked at verification, never as passed.
+const { createCodePipeline } = require('./code-pipeline.cjs');
+const codeVerify = require('./code-pipeline-verify.cjs').createVerifyAdapter(require('./code-verify.cjs').createCodeVerify({ log: codeRoleLog }));
+const codePlanner = require('./planner-plan.cjs').createPlannerPlan({ enabled: () => features.enabled('constrainedPlanDecoding'), engine: codeRoleEndpoint, log: codeRoleLog,
+  admit: (model, signal) => admitEngineModel(model, signal) });
 const codeService = require('./code-service.cjs').createCodeService({
   repos: process.env.CODE_REPOS,
   // The egress proxy (D15) is the only way a task reaches the internet, and only to the domains
@@ -423,38 +463,15 @@ const codeService = require('./code-service.cjs').createCodeService({
   connect: require('./code-acp.cjs').createAcpTransport({ log: (entry) => console.log('[code]', JSON.stringify(entry)) }),
   // Shared context (shared-context.cjs): off unless the project turns on sharing into Code.
   sharedContext: (workspace, project) => require('./shared-context.cjs').forCode(project, loadChats(project.id)),
-  // Planner review (#519, code-review.cjs): off unless features.plannerReview. Advice on a final card
-  // the person still answers; it runs on the default provider as the web container reaches it, and
-  // refuses an external one. With the flag on it runs through the role engine (#702, role-engine.cjs):
-  // the task's model is pinned and the call streams under the Laya guard. Under the model manager's
-  // admission lock, a different resident chat model (the embedding/rerank sidecars excepted) refuses
-  // the review instead of swapping (models-max 1); with nothing resident, the review loads the pinned
-  // model inside that same lock. A client outside this process can still race the router.
-  review: (() => {
-    const reviewEngine = () => {
-      const provider = getProvider(DEFAULT_PROVIDER_ID);
-      const base = String(provider?.baseUrl || '').replace(/\/+$/, '');
-      return {
-        baseUrl: base ? (/\/v1$/.test(base) ? base : `${base}/v1`) : null,
-        apiKey: provider?.apiKey || null,
-        model: autoRoles()?.code || autoRoles()?.smart || lastLoadedModel() || null,
-        external: require('./provider-egress.cjs').isExternalProvider(provider),
-        provider,
-      };
-    };
-    const log = (entry) => console.log('[code]', JSON.stringify(entry));
-    return require('./code-review.cjs').createPlannerReview({
-      enabled: () => features.enabled('plannerReview'),
-      log,
-      // #697: both paths admit the model within the inference memory budget before any request.
-      provider: require('./code-review.cjs').createEngineReviewer({ fetch: (...args) => globalThis.fetch(...args), log, engine: reviewEngine, admit: (model, signal) => admitEngineModel(model, signal) }),
-      roleEngine: require('./role-engine.cjs').createRoleEngine({ fetch: (...args) => globalThis.fetch(...args), log, engine: reviewEngine,
-        keep: () => [...require('./model-system.cjs').sidecarModelNames(process.env)],
-        admission: typeof modelManager.withAdmission === 'function' ? (work, signal) => modelManager.withAdmission(work, signal) : null,
-        // #697: never pin or call a model that would not fit the inference memory budget.
-        budgetRefusal: typeof modelManager.loadRefusal === 'function' ? (model) => modelManager.loadRefusal(model) : null }),
-    });
-  })(),
+  // Planner review (#519): see codeReview above.
+  review: codeReview,
+  pipeline: {
+    enabled: () => features.enabled('codeHarness') && features.enabled('codePipeline'),
+    create: ({ jobs, workspaces, harness, askApproval }) => createCodePipeline({ jobs, workspaces, harness, askApproval,
+      roleEngine: codeRoleEngine, planner: codePlanner, review: codeReview, verify: codeVerify,
+      merge: () => features.enabled('codeMerge'), constrain: () => features.enabled('constrainedPlanDecoding'),
+      engineKey: () => codeRoleEndpoint().apiKey, log: codeRoleLog }),
+  },
 });
 const codeRoutes = require('./routes/code.cjs').createCodeRoutes({
   features, getProject, projects: () => PROJECTS.filter((project) => !diaryExtras.internalProject(project)), workspace: () => currentWorkspace(), json, readJson, service: codeService,

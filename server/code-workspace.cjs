@@ -36,6 +36,8 @@ const COMMITTER = Object.freeze({ name: 'noevia', email: 'noevia@localhost' });
 const HARNESS_LEAVINGS = ['.cache/', '.config/', '.local/', '.opencode/', '.claude/', '.codex/', '.qwen/', '.pi/', '.dsh/',
   'opencode.json', 'opencode.jsonc', '.aider*', 'node_modules/.cache/'];
 const BRANCH_PREFIX = 'noevia/task-';
+const BRANCH_NAME_OK = (name) => /^[\w./-]+$/.test(name) && !name.includes('..') && !name.startsWith('-');
+const FULL_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 /** Say what git actually refused. "Not a git repository" for anything else is a lie. */
 function gitReason(error) {
@@ -210,16 +212,7 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
     // pointing into the repository, one real run committed OpenCode's entire cache, database and
     // a nested git repo onto the task's branch.
     const home = path.join(trees, '.harness-home', id);
-    fs.mkdirSync(root, { recursive: true, mode: 0o700 });
-    if (trees !== root) fs.mkdirSync(trees, { recursive: true, mode: 0o755 });
-    // The shared parent must be traversable by the harness user; only the task's own directory
-    // inside it is private. Creating the whole path at 0700 left `.harness-home` root-owned and
-    // unenterable, and the agent died with EACCES before it did anything.
-    fs.mkdirSync(path.dirname(home), { recursive: true, mode: 0o755 });
-    // `mkdir` leaves an existing directory's mode alone, so a volume created by an earlier
-    // version keeps its 0700 and the harness still cannot enter. Correct it every time.
-    try { fs.chmodSync(path.dirname(home), 0o755); } catch { /* not ours to fix; the claim still works */ }
-    fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+    makeDirs(home);
     if (mode === 'clone') {
       // --shared: the clone reads the source's objects instead of copying them, so this costs
       // kilobytes. The source must therefore outlive the task, which it does.
@@ -235,7 +228,40 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
     // `null`, not treated as a failure of the claim.
     let baseSha = null;
     try { baseSha = run([...HOSTILE_OFF, 'rev-parse', 'HEAD'], tree, gitEnv()) || null; } catch { /* no commits yet */ }
-    // Anything that fails from here on takes the half-made workspace with it.
+    // Which branch of the source that commit was the tip of, for a verified merge (#705). Read
+    // from the SOURCE repository, which is noevia's own; a detached HEAD records `null`.
+    let baseBranch = null;
+    try { baseBranch = run([...HOSTILE_OFF, 'symbolic-ref', '--quiet', '--short', 'HEAD'], repo, gitEnv()) || null; } catch { /* detached */ }
+    const pins = prepareTree({ repo, tree, home, pinned });
+    return write({ taskId: id, repo, branch: name, path: fs.realpathSync(tree), home, status: 'held', mode, baseSha,
+      ...(baseBranch && BRANCH_NAME_OK(baseBranch) ? { baseBranch } : {}),
+      // Who to hand the clone BACK to before reading from it: git refuses to read a repository
+      // owned by someone else ("dubious ownership"), and that check ignores `-c` and the
+      // GIT_CONFIG_* environment on purpose, so it cannot be worked around from the outside.
+      owner: owner ? { ...owner } : null,
+      noevia: typeof process.getuid === 'function' ? { uid: process.getuid(), gid: process.getgid() } : null,
+      capabilities: [...capabilities], domains: [...domains], pinned: pins, epoch, claimedAt: now() });
+  }
+
+  function makeDirs(home) {
+    fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+    if (trees !== root) fs.mkdirSync(trees, { recursive: true, mode: 0o755 });
+    // The shared parent must be traversable by the harness user; only the task's own directory
+    // inside it is private. Creating the whole path at 0700 left `.harness-home` root-owned and
+    // unenterable, and the agent died with EACCES before it did anything.
+    fs.mkdirSync(path.dirname(home), { recursive: true, mode: 0o755 });
+    // `mkdir` leaves an existing directory's mode alone, so a volume created by an earlier
+    // version keeps its 0700 and the harness still cannot enter. Correct it every time.
+    try { fs.chmodSync(path.dirname(home), 0o755); } catch { /* not ours to fix; the claim still works */ }
+    fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+  }
+
+  /**
+   * Everything a new tree needs before a harness may have it: the pinned paths refused if the
+   * repository tracks them, the harness's leavings excluded from git, and the tree handed to the
+   * harness user. Anything that fails takes the half-made workspace with it. Returns the pins.
+   */
+  function prepareTree({ repo, tree, home, pinned }) {
     const undo = () => {
       if (mode === 'clone') { try { rm(tree); } catch { /* the refusal is what matters */ } }
       else {
@@ -288,13 +314,7 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
         throw Object.assign(Error(`Could not hand the workspace to the harness user: ${e.message}`), { status: 500 });
       }
     }
-    return write({ taskId: id, repo, branch: name, path: fs.realpathSync(tree), home, status: 'held', mode, baseSha,
-      // Who to hand the clone BACK to before reading from it: git refuses to read a repository
-      // owned by someone else ("dubious ownership"), and that check ignores `-c` and the
-      // GIT_CONFIG_* environment on purpose, so it cannot be worked around from the outside.
-      owner: owner ? { ...owner } : null,
-      noevia: typeof process.getuid === 'function' ? { uid: process.getuid(), gid: process.getgid() } : null,
-      capabilities: [...capabilities], domains: [...domains], pinned: pins, epoch, claimedAt: now() });
+    return pins;
   }
 
   /** Delete the pinned config files from a released tree, never following a link. */
@@ -528,6 +548,135 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
   }
 
   /**
+   * Take a released task's workspace again, on the SAME branch, for the pipeline's next revision
+   * (#705: changes requested or tests failed). The branch keeps every commit the earlier rounds
+   * made; the record keeps the original `baseSha` and `baseBranch`, so a later diff and a later
+   * merge are judged against where the task first forked, not against its own last round.
+   * Only a cleanly released claim can be taken again: a stuck or interrupted one is for a human.
+   */
+  function reclaim({ taskId, pinned = [] }) {
+    const id = checkId(taskId);
+    const record = read(id);
+    if (!record) throw Object.assign(Error('This task holds no workspace to take again'), { status: 404 });
+    if (record.status !== 'released') throw Object.assign(Error(`This task's workspace is ${record.status}, so it cannot be taken again`), { status: 409 });
+    const held = list().find((r) => r.taskId !== id && r.status !== 'released' && r.repo === record.repo && r.branch === record.branch);
+    if (held) throw Object.assign(Error(`Another task already writes ${record.branch} in this repository (${held.status})`), { status: 409 });
+    const tree = treeDir(id);
+    const home = record.home || path.join(trees, '.harness-home', id);
+    makeDirs(home);
+    if ((record.mode || 'worktree') === 'clone') {
+      // The branch lives in the source once released (fetched back); a round that never committed
+      // left none, and starts again from the base.
+      const start = branchHead(record) || record.baseSha;
+      if (!/^[0-9a-f]{7,64}$/.test(String(start || ''))) throw Object.assign(Error('The task branch has no commit to continue from'), { status: 409 });
+      run(['clone', '--quiet', '--shared', record.repo, tree], undefined, gitEnv());
+      run([...HOSTILE_OFF, 'checkout', '--quiet', '-B', record.branch, start], tree, gitEnv());
+    } else {
+      // No -B: the branch exists and carries the earlier rounds' work; resetting it would lose it.
+      run(['worktree', 'add', tree, record.branch], record.repo, gitEnv());
+    }
+    const pins = prepareTree({ repo: record.repo, tree, home, pinned });
+    const { releasedAt: _r, headSha: _h, error: _e, ...kept } = record;
+    return write({ ...kept, path: fs.realpathSync(tree), home, status: 'held', pinned: pins, epoch, claimedAt: now(),
+      rounds: (Number.isInteger(record.rounds) ? record.rounds : 1) + 1 });
+  }
+
+  /**
+   * What the Planner may see of the repository before any work (#705 plan stage): a bounded list
+   * of tracked file names and the README, both read from the SOURCE repository at the task's base
+   * commit — never from a tree a harness has held. Every diff driver and textconv is off.
+   */
+  function projectSnapshot(taskId, { maxFiles = 400, maxReadmeBytes = 8 * 1024 } = {}) {
+    const record = read(taskId);
+    if (!record || !/^[0-9a-f]{7,64}$/.test(String(record.baseSha || ''))) return { files: [], truncated: false, readme: null };
+    let names = [];
+    try {
+      names = String(run([...HOSTILE_OFF, 'ls-tree', '-r', '--name-only', '-z', record.baseSha], record.repo, gitEnv(), { raw: true, maxBuffer: CHANGE_MAX_BUFFER }) ?? '')
+        .split('\0').filter(Boolean);
+    } catch { names = []; }
+    let readme = null;
+    const top = names.find((n) => /^readme(\.(md|markdown|txt|rst))?$/i.test(n));
+    if (top) {
+      try {
+        const text = String(run([...HOSTILE_OFF, 'cat-file', 'blob', `${record.baseSha}:${top}`], record.repo, gitEnv(), { raw: true }) ?? '');
+        readme = { path: top, text: Buffer.byteLength(text) > maxReadmeBytes ? Buffer.from(text).subarray(0, maxReadmeBytes).toString('utf8').replace(/\uFFFD$/, '') : text };
+      } catch { readme = null; }
+    }
+    return { files: names.slice(0, maxFiles), truncated: names.length > maxFiles, readme };
+  }
+
+  /**
+   * Fast-forward the branch the task forked from to the reviewed head (#705, features.codeMerge).
+   * Refuses — never forces, never merges with a commit, never touches a working tree — unless ALL
+   * of these hold at this moment:
+   *   * the claim is cleanly released (no agent holds the tree);
+   *   * the task branch's tip in the source is exactly `headSha`, the head that was verified and
+   *     reviewed (a branch that moved since is a different change);
+   *   * the base branch's tip is still exactly the task's `baseSha` (a base that moved needs a new
+   *     review against what is there now);
+   *   * `baseSha` is an ancestor of `headSha` (a fast-forward exists);
+   *   * the base branch is checked out in NO worktree, the registered repository's own included.
+   *     Moving a checked-out branch would rewrite files someone is working in — including ignored
+   *     ones a task's commit happens to track — so that case is the owner's to merge by hand.
+   * The ref is moved only with a compare-and-swap (`update-ref <base> <reviewed> <baseSha>`), so a
+   * concurrent push loses. `mergePreflight` runs every check without moving anything.
+   * Returns `{ ok: true, baseBranch, from, to, recordFailed? }` or `{ ok: false, code, reason }`;
+   * never throws. `recordFailed` means the branch DID move but noevia's own record of it did not
+   * save.
+   */
+  function mergeChecks(taskId, reviewed) {
+    const no = (code, reason) => ({ ok: false, code, reason });
+    let record;
+    try { record = read(taskId); } catch { return no('invalid', 'Invalid task id.'); }
+    if (!record) return no('no_workspace', 'The task holds no workspace record.');
+    if (record.status !== 'released') return no('not_released', `The workspace is ${record.status}, so nothing is merged.`);
+    if (!FULL_SHA.test(String(reviewed || ''))) return no('bad_sha', 'A merge needs the full reviewed commit id.');
+    if (!FULL_SHA.test(String(record.baseSha || ''))) return no('no_base', 'The task recorded no base commit.');
+    const base = record.baseBranch;
+    if (typeof base !== 'string' || !BRANCH_NAME_OK(base)) return no('no_base_branch', 'The task did not fork from a named branch, so there is nothing to fast-forward.');
+    if (base === record.branch) return no('no_base_branch', 'The task branch is its own base.');
+    const git = (args) => run([...HOSTILE_OFF, ...args], record.repo, gitEnv());
+    const tip = (ref) => { try { return git(['rev-parse', '--verify', '--quiet', `refs/heads/${ref}^{commit}`]) || null; } catch { return null; } };
+    if (tip(record.branch) !== reviewed) return no('head_moved', 'The task branch is no longer at the reviewed commit, so it was not merged.');
+    if (tip(base) !== record.baseSha) return no('base_moved', `${base} has moved since the task forked from it, so the change was not merged. Review it again against the new base.`);
+    try { git(['merge-base', '--is-ancestor', record.baseSha, reviewed]); }
+    catch { return no('not_fast_forward', 'The reviewed head does not build on the base, so it cannot be fast-forwarded.'); }
+    const checkedOut = [];
+    try {
+      let at = null;
+      for (const line of git(['worktree', 'list', '--porcelain']).split('\n')) {
+        if (line.startsWith('worktree ')) at = line.slice(9);
+        else if (line === `branch refs/heads/${base}` && at) checkedOut.push(at);
+      }
+    } catch { return no('unreadable', 'The repository could not say where its branches are checked out.'); }
+    if (checkedOut.length) {
+      return no('checked_out', `${base} is checked out in ${checkedOut[0]}, so noevia did not move it: that would rewrite files in a working tree. `
+        + `To merge it yourself, run there: git merge --ff-only ${reviewed} (the reviewed commit on ${record.branch}).`);
+    }
+    return { ok: true, record, base, git, tip };
+  }
+
+  function mergePreflight(taskId, { headSha: reviewed } = {}) {
+    const checked = mergeChecks(taskId, reviewed);
+    return checked.ok ? { ok: true, baseBranch: checked.base } : checked;
+  }
+
+  function mergeVerified(taskId, { headSha: reviewed } = {}) {
+    const checked = mergeChecks(taskId, reviewed);
+    if (!checked.ok) return checked;
+    const { record, base, git, tip } = checked;
+    try { git(['update-ref', '-m', `noevia: fast-forward to reviewed task ${record.taskId}`, `refs/heads/${base}`, reviewed, record.baseSha]); }
+    catch { return { ok: false, code: tip(base) === record.baseSha ? 'refused' : 'base_moved', reason: `git refused to fast-forward ${base}; nothing was merged.` }; }
+    if (tip(base) !== reviewed) return { ok: false, code: 'refused', reason: `${base} did not end at the reviewed commit.` };
+    const merged = { ok: true, baseBranch: base, from: record.baseSha, to: reviewed };
+    // The branch has moved: that is the fact. Failing to note it in our own record is reported, not
+    // turned into "not merged".
+    try { write({ ...record, merged: { baseBranch: base, from: record.baseSha, to: reviewed, at: now() } }); }
+    catch { return { ...merged, recordFailed: true }; }
+    return merged;
+  }
+
+  /**
    * What the verifier (#703, services/code-sandbox/verifier.cjs) should copy for this task: the
    * SOURCE repository and the commit, which must be the task branch's current tip there — never
    * the harness's own tree. Nothing is created here; the verifier makes its own hash-checked copy
@@ -550,9 +699,16 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
     return { source: record.repo, headSha: commit, branch: record.branch };
   }
 
+  /** The task branch's tip in the SOURCE repository now (#705 stale-revision check), or null. */
+  function branchTip(taskId) {
+    let record;
+    try { record = read(taskId); } catch { return null; }
+    return record ? branchHead(record) : null;
+  }
+
   // `owner` is public so anything else noevia writes into a workspace (the harness's own
   // config file) can be handed over the same way the worktree is.
-  return { claim, release, recover, contains, headSha, change, verifyCheckout, get: read, list, root, owner, BRANCH_PREFIX };
+  return { claim, reclaim, release, recover, contains, headSha, change, projectSnapshot, mergePreflight, mergeVerified, branchTip, verifyCheckout, get: read, list, root, owner, BRANCH_PREFIX };
 }
 
 /** Recursive chown, so the harness owns the tree and git's own files inside it. */

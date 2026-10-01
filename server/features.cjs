@@ -22,6 +22,11 @@ function browserRuntimeReason({ resolve = require.resolve, load = require, exist
   return 'Needs a Chromium browser installed for Playwright on this server.';
 }
 
+/** Why the Code pipeline cannot run here, or null: it needs the code sandbox (#705). */
+function codeSandboxReason(env = process.env) {
+  return String(env.CODE_HARNESS_ENDPOINT || '').trim() ? null : 'Needs Code mode running in the code sandbox (CODE_HARNESS_ENDPOINT).';
+}
+
 const REGISTRY = Object.freeze({
   stepSupervision: { env: 'NOEVIA_FEATURE_STEP_SUPERVISION', experimental: true, unavailable: env => require('./decision-endpoint.cjs').configuration(env).reason, label: 'Step supervision', description: 'Let a decision provider advise whether to continue, verify tool results or pause for review between chat steps. Keeps existing behavior if unavailable. Approvals and execution limits still apply.' },
   systemOneRouting: { env: 'NOEVIA_FEATURE_SYSTEM_ONE_ROUTING', experimental: true, unavailable: env => require('./system-one-router.cjs').configuration(env).reason, label: 'System-One routing', description: 'Use the configured decision service to choose Fast, Smart or Code for new Auto-routed messages. Falls back to the current router when unavailable. Manual model choices are unchanged.' },
@@ -36,7 +41,12 @@ const REGISTRY = Object.freeze({
   // and the old name on the admin API are still honoured (`legacy`, see createFeatures).
   plannerReview: { env: 'NOEVIA_FEATURE_PLANNER_REVIEW', legacy: { name: 'astraReview', env: 'NOEVIA_FEATURE_ASTRA_REVIEW' }, experimental: true, label: 'Planner review (Code mode)', description: 'After a Code task finishes, a reviewer model reads the change and gives an approve or request-changes verdict on a final card. It is advice only: you still accept or decline the change, and a failed or late review falls back to your own review.' },
   browserExecutor: { env: 'NOEVIA_FEATURE_BROWSER_EXECUTOR', unavailable: () => browserRuntimeReason(), label: 'Browser mode', description: 'Administrators can run a domain-scoped Chromium session as a durable job, with every consequential action through the approval card.' },
-  constrainedPlanDecoding: { env: 'NOEVIA_FEATURE_CONSTRAINED_PLAN_DECODING', experimental: true, unavailable: () => 'Not used yet: no task runs the Planner’s plan step.', label: 'Constrained plan decoding', description: 'Ask the local llama.cpp engine to constrain the plan artifact to its JSON schema. Adds to the after-the-fact validation and falls back to unconstrained generation for reasoning models or when the engine rejects it.' },
+  // Available since the Code pipeline (#705) runs the Planner's plan step.
+  constrainedPlanDecoding: { env: 'NOEVIA_FEATURE_CONSTRAINED_PLAN_DECODING', experimental: true, label: 'Constrained plan decoding', description: 'Ask the local llama.cpp engine to constrain the plan artifact to its JSON schema. Adds to the after-the-fact validation and falls back to unconstrained generation for reasoning models or when the engine rejects it.' },
+  // The Code pipeline (#705): Planner → Executor → verification → Planner review → Auditor. It runs
+  // only inside the code sandbox (and with Code mode on); without the sandbox it cannot be enabled.
+  codePipeline: { env: 'NOEVIA_FEATURE_CODE_PIPELINE', experimental: true, unavailable: env => codeSandboxReason(env), label: 'Planner pipeline (Code mode)', description: 'Offer a Planner preparation for Code tasks: the Planner writes a plan, the coding agent carries it out, the operator’s tests run in a separate verifier, the Planner reviews the change (at most two rounds of changes) and the Auditor reports what evidence there is. Every write still goes through the approval card, and you accept the result yourself.' },
+  codeMerge: { env: 'NOEVIA_FEATURE_CODE_MERGE', experimental: true, unavailable: env => codeSandboxReason(env), label: 'Merge reviewed changes (Code mode)', description: 'When you accept a Planner pipeline task, fast-forward the branch it started from to the reviewed commit. Nothing is merged if that branch has moved or the task branch changed after review. Off, accepting records the change without merging it.' },
   executorGuard: { env: 'NOEVIA_FEATURE_EXECUTOR_GUARD', experimental: true, label: 'Executor guard (Code mode)', description: 'Check every tool call the coding agent makes against its schema before anything else sees it. A malformed call is refused with the reason, so the agent can correct it; after three, the task stops as blocked. It only adds refusals: every write still goes through the approval card.' },
   kiwix: { env: 'NOEVIA_FEATURE_KIWIX', restart: true, label: 'Offline Wikipedia', description: 'A read-only lookup tool backed by an internal kiwix-serve.' },
   chatgptOAuth: { env: 'NOEVIA_FEATURE_CHATGPT_OAUTH', label: 'Sign in with ChatGPT', description: 'Let each person connect their own ChatGPT account as a private AI provider. Chats that use it are sent to OpenAI; Diary text, Diary tools and project images never are.' },
@@ -54,6 +64,7 @@ function unavailableId(name, reason) {
   if (name === 'browserExecutor') return /Playwright installed/.test(reason) ? 'browserPlaywright' : /Chromium/.test(reason) ? 'browserChromium' : null;
   if (name === 'constrainedPlanDecoding') return /Not used yet/.test(reason) ? 'notUsed' : null;
   if (name === 'nativeClientAuth') return /TRUST_PROXY/.test(reason) ? 'trustProxy' : null;
+  if (name === 'codePipeline' || name === 'codeMerge') return /CODE_HARNESS_ENDPOINT/.test(reason) ? 'codeSandbox' : null;
   // The decision-service experiments (#624): unset URL, not yet set up in Settings, or System-One's own URL.
   if (name === 'stepSupervision' || name === 'toolGate' || name === 'systemOneRouting') {
     if (/COWORK_DECISION_URL/.test(reason)) return 'decisionUrl';
@@ -166,4 +177,4 @@ function settingsStore(db) {
   };
 }
 
-module.exports = { browserRuntimeReason, unavailableId, REGISTRY, createFeatures, settingsStore, parseEnv, migrateLegacySetting };
+module.exports = { browserRuntimeReason, codeSandboxReason, unavailableId, REGISTRY, createFeatures, settingsStore, parseEnv, migrateLegacySetting };

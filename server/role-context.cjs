@@ -328,6 +328,9 @@ const ROLE_SPECS = Object.freeze({
     plan: (s) => capPlan(s.plan, PLAN_KEYS_EXECUTOR),
     snippets: (s, ctx) => capSnippets(s.snippets, ctx.tenantId),
     capabilities: (s) => capCapabilities(s.capabilities),
+    // What the pipeline (#705) asks the next revision to fix: the Planner's findings and the
+    // server-measured test outcome, as short text items. Never the Planner's instructions.
+    feedback: (s) => capList(s.feedback, CAPS.listItems, CAPS.shortText),
   }),
   auditor: Object.freeze({
     ...common,
@@ -691,7 +694,7 @@ function projectRoleContext(role, state) {
 const PERSONA_FIELDS = Object.freeze(['role', 'role_name', 'role_instructions', 'revision']);
 // Fields bound to one revision of the work (plan, head/base SHAs, diff, run results, state): never
 // shared, whatever the role set, so the cached prefix survives a changes_requested loop.
-const REVISION_FIELDS = Object.freeze(['plan', 'execution', 'change', 'lifecycle_state', 'approval_outcomes']);
+const REVISION_FIELDS = Object.freeze(['plan', 'execution', 'change', 'lifecycle_state', 'approval_outcomes', 'feedback']);
 const DOSSIER_ROLES = Object.freeze([...ROLES, REVIEW_ROLE]);
 
 function projectSharedDossier(state, { roles = DOSSIER_ROLES } = {}) {

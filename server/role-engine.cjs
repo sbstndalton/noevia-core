@@ -248,19 +248,24 @@ function createRoleEngine({ engine, fetch = (url, init) => globalThis.fetch(url,
      * @param {{ taskId: string, model?: string|null, thinking?: boolean, roles?: string[] }} input
      * @returns {Promise<{ ok: true, session: ReturnType<typeof makeSession> } | { ok: false, code: string, reason: string }>}
      */
-    async pinModel({ taskId, model = null, thinking = false, roles = [...DOSSIER_ROLES] } = /** @type {any} */ ({})) {
+    async pinModel({ taskId, model = null, thinking = false, roles = [...DOSSIER_ROLES], signal = null } = /** @type {any} */ ({})) {
       if (typeof taskId !== 'string' || !taskId) return fail('invalid', 'A task id is required to pin a model.');
+      // `signal` (#705): the task's cancel and deadline. It reaches the admission wait, so a pin
+      // queued behind a load is abandoned with the task instead of holding it.
+      if (signal?.aborted) return fail('aborted', 'The task was cancelled.');
       if (typeof thinking !== 'boolean') return fail('invalid', 'Thinking must be on or off for the whole task.');
       let endpoint;
       try { endpoint = engine() || {}; } catch { endpoint = {}; }
       if (endpoint.external === true) return fail('external', 'The task pipeline runs only on a local model.');
       if (!endpoint.baseUrl) return fail('unavailable', 'No model is configured for the task pipeline.');
       let loaded;
-      try { loaded = await admit(() => readLoaded(endpoint)); }
+      try { loaded = await admit(() => readLoaded(endpoint), signal || undefined); }
       catch (error) {
+        if (signal?.aborted) return fail('aborted', 'The task was cancelled.');
         record({ event: 'role.pin_failed', taskId, code: 'router_unavailable', status: Number.isInteger(error?.status) ? error.status : null });
         return fail('router_unavailable', 'The model router could not say which model is loaded, so no model was pinned.');
       }
+      if (signal?.aborted) return fail('aborted', 'The task was cancelled.');
       const wanted = typeof model === 'string' && model ? model : typeof endpoint.model === 'string' && endpoint.model ? endpoint.model : loaded.length === 1 ? loaded[0] : null;
       if (!wanted) return fail('no_model', 'No model is configured for the task pipeline.');
       if (loaded.some((id) => id !== wanted)) {

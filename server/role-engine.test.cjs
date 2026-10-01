@@ -573,3 +573,21 @@ test('#697: a model over the inference memory budget is never pinned or called',
   assert.equal(fake.calls.length, 0, 'nothing was sent, so nothing was loaded');
   assert.ok(logs.some((e) => e.event === 'role.budget_refused'));
 });
+
+test('#705: pinModel hands the task signal to the admission wait, and an aborted pin is refused, never pinned', async () => {
+  const fake = fakeEngine();
+  let given = null;
+  const admission = (work, signal) => { given = signal; return work(); };
+  const controller = new AbortController();
+  const ok = await engineFor(fake, { admission }).pinModel({ taskId: 't', signal: controller.signal });
+  assert.equal(ok.ok, true);
+  assert.equal(given, controller.signal, 'admission receives the task’s signal');
+  controller.abort();
+  assert.equal((await engineFor(fake, { admission }).pinModel({ taskId: 't', signal: controller.signal })).code, 'aborted');
+  // Aborted while waiting for admission: the admission rejects, and the pin says aborted.
+  const later = new AbortController();
+  const waiting = (work, signal) => new Promise((resolve, reject) => signal.addEventListener('abort', () => reject(Error('aborted')), { once: true }));
+  const pending = engineFor(fake, { admission: waiting }).pinModel({ taskId: 't', signal: later.signal });
+  later.abort();
+  assert.equal((await pending).code, 'aborted');
+});

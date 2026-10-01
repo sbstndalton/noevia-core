@@ -75,7 +75,9 @@ const isAuthoritative = (events) => (events || []).some((e) => e && AUTHORITY_TY
 const TRANSITIONS = Object.freeze({
   planned: Object.freeze(['implementing', 'blocked']),
   implementing: Object.freeze(['verifying', 'reviewing', 'merged', 'blocked']),
-  verifying: Object.freeze(['reviewing', 'implementing', 'merged', 'blocked']),
+  // verifying → changes_requested: the operator's tests failed (#705), the same loop a review's
+  // "request changes" starts.
+  verifying: Object.freeze(['reviewing', 'implementing', 'changes_requested', 'merged', 'blocked']),
   reviewing: Object.freeze(['implementing', 'changes_requested', 'merged', 'blocked']),
   changes_requested: Object.freeze(['implementing', 'reviewing', 'merged', 'blocked']),
   blocked: Object.freeze(['implementing', 'planned']),

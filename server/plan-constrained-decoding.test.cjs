@@ -13,11 +13,11 @@ const base = { enabled: true, provider: capable, model: 'synthetic-plan-model' }
 const payload = { model: 'synthetic-plan-model', messages: [{ role: 'user', content: 'x' }] };
 const fake = (...replies) => { const calls = []; const send = async p => { calls.push(p); const r = replies.shift(); if (r instanceof Error) throw r; return r; }; return { send, calls }; };
 
-test('the feature flag exists, is off, and is unavailable until a task runs the plan step', () => {
+test('the feature flag exists, is off by default, and is available now the pipeline runs the plan step (#705)', () => {
   const f = createFeatures({ env: { NOEVIA_FEATURE_CONSTRAINED_PLAN_DECODING: 'true' } });
   assert.equal(createFeatures({ env: {} }).enabled('constrainedPlanDecoding'), false);
-  assert.equal(f.enabled('constrainedPlanDecoding'), false, 'unavailable wins over the env pin');
-  assert.match(f.describe().find(x => x.name === 'constrainedPlanDecoding').unavailable, /^Not used yet/);
+  assert.equal(f.enabled('constrainedPlanDecoding'), true, 'the env pin turns it on');
+  assert.equal(f.describe().find(x => x.name === 'constrainedPlanDecoding').unavailable, null);
 });
 
 test('flag off: no constraint fields', async () => {

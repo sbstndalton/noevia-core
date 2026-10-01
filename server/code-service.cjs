@@ -12,6 +12,7 @@ const { createJobs } = require('./jobs.cjs');
 const { createCodeHarness } = require('./code-harness.cjs');
 const { createCodeWorkspaces } = require('./code-workspace.cjs');
 const { ACTIONS } = require('./code-actions.cjs');
+const { pipelineView } = require('./auditor-report.cjs');
 
 const APPROVAL_TIMEOUT_MS = 5 * 60 * 1000;
 
@@ -29,6 +30,10 @@ const PROMPT_PREPARATION = Object.freeze([
   { id: 'frontier', label: 'Frontier architect', available: false,
     reason: 'Not built: it needs a provider, official authentication and the outbound allowlist enforced in code (spec §2).' },
 ]);
+// The Planner preparation (#705): offered only while features.codePipeline is on and Code mode runs
+// in the sandbox. Off, the list above is exactly what is offered, and `planner` is unknown.
+const PLANNER_PREPARATION = Object.freeze({ id: 'planner', label: 'Planner', available: true,
+  reason: 'The Planner plans the task, the coding agent carries it out, the operator’s tests verify it and the Planner reviews it, at most twice more, before you accept.' });
 // What a task may be granted at all. Browser and external-account actions have no home here
 // yet: they belong to the execution node (§5), so a task cannot be given one by mistake.
 const GRANTABLE = Object.freeze([ACTIONS.READ, ACTIONS.EDIT, ACTIONS.EXECUTE, ACTIONS.INSTALL,
@@ -74,6 +79,9 @@ function view(job, pending = null) {
     // The pipeline's lifecycle (#701), only on a task whose journal carries its authority events
     // (`stages` is derived only then): every other task's view is byte-for-byte what it was.
     ...(job.stages ? { lifecycle: job.lifecycle, revision: job.revision, stages: job.stages } : {}),
+    // The pipeline's plan, per-revision evidence and audit (#705, auditor-report.cjs pipelineView),
+    // only on a task the pipeline drove.
+    ...(job.stages && pipelineView(job) ? { pipeline: pipelineView(job) } : {}),
   };
 }
 
@@ -84,7 +92,14 @@ function view(job, pending = null) {
 function createCodeService({ repos, connect, egress = null, engine = undefined, now = Date.now, log = () => {},
   timeoutMs = APPROVAL_TIMEOUT_MS, sandboxKind = process.env.CODE_HARNESS_ENDPOINT ? 'sandbox' : 'spawn',
   harnesses = defaultHarnesses(), treeRoot = process.env.CODE_WORKSPACE_ROOT || null,
-  harnessUser = parseUser(process.env.CODE_HARNESS_USER), sharedContext = () => '', review = null }) {
+  harnessUser = parseUser(process.env.CODE_HARNESS_USER), sharedContext = () => '', review = null, pipeline = null }) {
+  // The pipeline (#705): `{ enabled(), create({ jobs, workspaces, harness, askApproval }) }`. It needs
+  // the sandbox as well as its flag; anything less and the Planner preparation is simply not offered.
+  const pipelineOn = () => {
+    if (!pipeline || typeof pipeline.create !== 'function' || sandboxKind !== 'sandbox') return false;
+    try { return pipeline.enabled() === true; } catch { return false; }
+  };
+  const preparations = () => (pipelineOn() ? [...PROMPT_PREPARATION, PLANNER_PREPARATION] : PROMPT_PREPARATION);
   const repositories = Array.isArray(repos) ? repos : parseRepos(repos);
   // Approvals live in memory on purpose, exactly as the chat gate does: a decision that
   // outlives the request it belongs to is not a decision, and a restart must re-ask.
@@ -114,7 +129,8 @@ function createCodeService({ repos, connect, egress = null, engine = undefined, 
       workspaces.recover();
       const harness = createCodeHarness({ jobs: store, workspaces, egress, log, now, askApproval,
         ...(engine ? { engine } : {}), ...(review ? { review } : {}) });
-      store = { jobs: store, workspaces, harness };
+      store = { jobs: store, workspaces, harness, pipeline: null };
+      if (pipeline && typeof pipeline.create === 'function') store.pipeline = pipeline.create({ jobs: store.jobs, workspaces, harness, askApproval });
       stores.set(workspace, store);
     }
     return store;
@@ -164,7 +180,7 @@ function createCodeService({ repos, connect, egress = null, engine = undefined, 
     // the shape is what changes when a second one is adapted — and an `Auto` that picks between
     // them is only allowed once there is measured evidence to pick on (§3).
     harnesses: () => harnesses.map((h) => ({ ...h })),
-    promptPreparation: () => PROMPT_PREPARATION.map((p) => ({ ...p })),
+    promptPreparation: () => preparations().map((p) => ({ ...p })),
     sandboxed: () => sandboxKind === 'sandbox',
     // Whether a task can be given any network at all. Without the egress proxy there is no way
     // to let one domain through, so the network capabilities are not offered as if there were.
@@ -200,16 +216,27 @@ function createCodeService({ repos, connect, egress = null, engine = undefined, 
       // the browser's list is a convenience, never the authority.
       const harnessId = String(body.harness || harnesses[0]?.id || '');
       if (!harnesses.some((h) => h.id === harnessId)) throw fail(400, 'That coding harness is not configured on this server.');
-      const preparation = PROMPT_PREPARATION.find((p) => p.id === String(body.promptPreparation || 'direct'));
+      const preparation = preparations().find((p) => p.id === String(body.promptPreparation || 'direct'));
       if (!preparation) throw fail(400, 'Unknown prompt preparation.');
       if (!preparation.available) throw fail(409, preparation.reason);
       const domains = (Array.isArray(body.domains) ? body.domains : [])
         .map((d) => String(d || '').trim().toLowerCase()).filter((d) => /^[a-z0-9.-]+\.[a-z]{2,}$/.test(d)).slice(0, 20);
-      const { harness, jobs } = storeFor(workspace);
+      const { harness, jobs, pipeline: pipelineRun } = storeFor(workspace);
       // One task at a time per project: a second writer is the thing §3 says to avoid, and it
       // also makes "what is running" answerable without a scheduler.
       if (jobs.list({ projectId: project.id, kind: 'code', active: true }).length) {
         throw fail(409, 'This project already has a task running.');
+      }
+      if (preparation.id === PLANNER_PREPARATION.id) {
+        if (!pipelineRun) throw fail(409, 'The Planner pipeline is not set up on this server.');
+        // Planner → Executor → verification → review → Auditor (#705), as one job. The person still
+        // answers every approval, including the final accept.
+        const started = pipelineRun.start({ projectId: project.id, repo, prompt, capabilities, domains, connect,
+          model: body.model ? String(body.model) : null, sandboxKind, harness: harnessId,
+          context: String(sharedContext(workspace, project) || ''), approvePlan: body.approvePlan === true,
+          tenantId: typeof workspace.userId === 'string' ? workspace.userId : null });
+        return { ...started, repository: repo.id, capabilities, domains, harness: harnessId, promptPreparation: preparation.id,
+          sharedContext: require('./shared-context.cjs').read(project).code };
       }
       const started = await harness.start({ projectId: project.id, repoPath: repo.path, prompt,
         capabilities, domains, connect, model: body.model ? String(body.model) : null, sandboxKind,
@@ -262,4 +289,4 @@ function defaultHarnesses(env = process.env) {
   return [{ id, label: labels[id] || id, version: env.CODE_HARNESS_VERSION || null }];
 }
 
-module.exports = { createCodeService, parseRepos, view, defaultHarnesses, parseUser, GRANTABLE, DEFAULT_CAPABILITIES, PROMPT_PREPARATION, APPROVAL_TIMEOUT_MS };
+module.exports = { createCodeService, parseRepos, view, defaultHarnesses, parseUser, GRANTABLE, DEFAULT_CAPABILITIES, PROMPT_PREPARATION, PLANNER_PREPARATION, APPROVAL_TIMEOUT_MS };

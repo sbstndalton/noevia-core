@@ -88,13 +88,14 @@ function fixtureState(overrides = {}) {
 test('each role gets exactly its allowlisted fields', () => {
   const expected = {
     planner: ['capabilities', 'constraints', 'context_limit', 'project_instructions', 'request', 'revision', 'role', 'role_instructions', 'role_name', 'snippets', 'task_id'],
-    executor: ['capabilities', 'plan', 'project_instructions', 'request', 'revision', 'role', 'role_instructions', 'role_name', 'snippets', 'task_id'],
+    executor: ['capabilities', 'feedback', 'plan', 'project_instructions', 'request', 'revision', 'role', 'role_instructions', 'role_name', 'snippets', 'task_id'],
     auditor: ['approval_outcomes', 'execution', 'lifecycle_state', 'plan', 'request', 'revision', 'role', 'role_instructions', 'role_name', 'task_id'],
   };
   const all = buildAllRoleContexts(fixtureState());
   for (const role of ROLES) {
     assert.deepEqual(allowedFields(role), expected[role]);
-    assert.deepEqual(Object.keys(all[role]).sort(), expected[role]);
+    // `feedback` (#705) exists only on a revision after the first; the fixture is a first round.
+    assert.deepEqual(Object.keys(all[role]).sort(), expected[role].filter((k) => k !== 'feedback'));
   }
   assert.equal(all.planner.role_name, 'Planner');
   assert.equal(all.executor.role_name, 'Executor');
@@ -464,4 +465,17 @@ test('zero-width and format characters do not hide leaks or credentials', () => 
   // Text without credentials keeps its format characters (emoji ZWJ sequences survive).
   const family = 'family \u{1F468}‍\u{1F469}‍\u{1F467} photo';
   assert.equal(projectRoleContext('planner', fixtureState({ request: family })).projection.request, family);
+});
+
+test('#705: the executor alone gets the pipeline feedback, capped, and never in the shared dossier', () => {
+  const long = 'x'.repeat(5000);
+  const state = fixtureState({ feedback: ['Tests failed (exit 1).', long, 7, ...Array(20).fill('more')] });
+  const all = buildAllRoleContexts(state);
+  assert.equal(all.executor.feedback[0], 'Tests failed (exit 1).');
+  assert.ok(Array.from(all.executor.feedback[1]).length <= 600);
+  assert.ok(all.executor.feedback.length <= 12);
+  assert.equal('feedback' in all.planner, false);
+  assert.equal('feedback' in all.auditor, false);
+  const { projectSharedDossier } = require('./role-context.cjs');
+  assert.equal('feedback' in projectSharedDossier(state, { roles: ['executor'] }).dossier, false, 'revision-bound, never shared');
 });

@@ -41,6 +41,162 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
   pinnedPaths = require('./code-harness-config.cjs').cwdPinPaths,
   engine = () => ({ baseUrl: null, apiKey: null, contextTokens: undefined }), review = null,
   guard = executorGuardFlag }) {
+  // Marks an error thrown by the network grant rather than by the workspace claim: start() records
+  // the two differently (a grant failure's own record is best-effort, as it always was).
+  const GRANT_FAILED = Symbol('grant failed');
+
+  /**
+   * Claim (#705 split): the task's workspace and, when it has the capability AND named domains, its
+   * network grant. `resume` takes a released task's workspace again on the same branch, for the
+   * pipeline's next revision. Throws with nothing left held. The handle is what run and release use.
+   */
+  function claimRun({ taskId, repoPath = null, capabilities = [], domains = [], harness = 'opencode', resume = false }) {
+    const pinned = pinnedPaths(harness);
+    const workspace = resume
+      ? workspaces.reclaim({ taskId, pinned })
+      : workspaces.claim({ taskId, repoPath, capabilities, domains, pinned });
+    const handle = { taskId, workspace, grant: null, cleaned: false, released: null };
+    // Network is a capability like any other: no grant unless the task has it AND named domains.
+    const wantsNetwork = capabilities.includes(ACTIONS.NETWORK) || capabilities.includes(ACTIONS.INSTALL);
+    try { handle.grant = egress && wantsNetwork && domains.length ? egress.grant({ taskId, domains }) : null; }
+    catch (error) {
+      releaseRun(handle);
+      if (error && typeof error === 'object') error[GRANT_FAILED] = true;
+      throw error;
+    }
+    return handle;
+  }
+
+  /**
+   * Release (#705 split): the grant revoked and the workspace given back. Once per handle, whichever
+   * path gets here first: the run's own `finally`, or the run failing around it (jobs.run records
+   * `job.started` before the work and `job.completed` after it, and either append can throw — a full
+   * disk — without the work's `finally` ever running). What release() reported is kept on the
+   * handle, so the run can correct the checkpoint's head once the workspace is actually gone; every
+   * caller after the first gets that cached value.
+   */
+  function releaseRun(handle) {
+    if (!handle || handle.cleaned) return handle?.released ?? null;
+    handle.cleaned = true;
+    const { taskId, grant } = handle;
+    try { if (grant) { egress.revoke(taskId); if (typeof egress.activity === 'function') egress.activity(taskId, { forget: true }); } }
+    catch (error) { log({ at: now(), taskId, event: 'code.cleanup_failed', what: 'network grant', error: String(error?.message || error) }); }
+    try { handle.released = workspaces.release({ taskId }); }
+    catch (error) { log({ at: now(), taskId, event: 'code.cleanup_failed', what: 'workspace', error: String(error?.message || error) }); }
+    return handle.released;
+  }
+
+  /**
+   * Run (#705 split): one agent turn in a claimed workspace, under the job's own `ctx`, releasing the
+   * handle in its `finally`. `prompt` is exactly what the agent is sent; `label` is what the task is
+   * called in its checkpoint (the person's request, not a brief built from it).
+   */
+  async function runExecutor(ctx, handle, { prompt, label = prompt, connect, model = null, harness = 'opencode', capabilities = [],
+    domains = [], sandboxKind = 'spawn', promptPreparation = 'direct', context = '', guarded = false }) {
+    const { taskId, workspace, grant } = handle;
+    const title = String(label).slice(0, 120);
+    let sessionEnd = null;
+    // Set once the run has something to report, so the `finally` below knows whether a
+    // corrected, post-release checkpoint is owed at all (a task that never got this far — a
+    // config pin that failed, a connect() that threw — still gets its workspace back, but has
+    // no result to attach a head commit to).
+    let scope = null, meta = null;
+    try {
+      // A task that named no model runs on whatever this deployment loads, and the identity
+      // records the model that actually ran rather than the absence of a choice.
+      const endpoint = engine();
+      const chosen = model || endpoint.model || null;
+      // Guarded, the guard can stop the agent on its own (too many malformed calls): that is
+      // this signal, joined to the job's own so a cancel still stops it the usual way.
+      const halt = guarded ? new AbortController() : null;
+      const session = createSession({ taskId, ctx, workspace, domains, capabilities, harness, model: chosen, halt });
+      sessionEnd = session.end;
+      // Recorded first so a running task is identifiable in the list, not just once it ends.
+      // `baseSha` is the commit the task's branch forked from (captured at claim, before the
+      // agent runs); a repository with no commits yet records `null`, not a failure.
+      ctx.checkpoint({ branch: workspace.branch, task: title, baseSha: workspace.baseSha ?? null });
+      // The agent's own config file, written by noevia before the agent exists: the gate it
+      // will actually obey, and the only model endpoint it is given. A harness whose config
+      // noevia cannot pin throws here, before anything runs.
+      // A step of the run, not a new event type: the vocabulary is closed on purpose, and
+      // this either happened or the task stops here.
+      ctx.event('step.started', { id: 'harness.config', title: 'Pin the harness configuration' });
+      let pinned;
+      try {
+        pinned = pinConfig({ cwd: workspace.path, home: workspace.home || null, owner: workspaces.owner || null, harness, model: chosen,
+          engine: endpoint.baseUrl, apiKey: endpoint.apiKey || null,
+          ...(endpoint.contextTokens ? { contextTokens: endpoint.contextTokens } : {}) });
+      } catch (error) {
+        ctx.event('step.completed', { id: 'harness.config', failed: true, error: String(error.message).slice(0, 300) });
+        throw error;
+      }
+      ctx.event('step.completed', { id: 'harness.config', ...pinned });
+      const agent = await connect({
+        taskId, harness, model: chosen, cwd: workspace.path, home: workspace.home || null,
+        // The adapter pins the agent's own permission config: the spike showed OpenCode's
+        // defaults writing silently, and noevia refuses to run a harness whose effective
+        // config it cannot pin.
+        permission: { edit: 'ask', bash: 'ask', webfetch: 'ask' },
+        proxy: grant ? { url: `http://task:${grant.token}@${egress.endpoint || 'egress'}`, domains: [...domains],
+          // The agent's own model calls go straight to the engine on the internal network; sent
+          // through the proxy they would be refused as a private address.
+          noProxy: engineHost(engine) } : null,
+        handlers: session.handlers,
+        signal: halt ? AbortSignal.any([ctx.signal, halt.signal]) : ctx.signal,
+      });
+      ctx.progress('running');
+      // Shared project context (shared-context.cjs) goes in front of the task, never into its label.
+      let outcome;
+      try { outcome = await agent.prompt(context ? `${context}\n\nTask:\n${String(prompt)}` : String(prompt)); }
+      // A task the guard stopped ends as blocked, not as the "cancelled" the transport reports.
+      catch (error) { throw session.guard?.blockedError() || error; }
+      finally { session.flushOutput(); }
+      if (session.guard?.blocked) throw session.guard.blockedError();
+      // What the run can say about itself, and — just as much — what it could not (§1).
+      meta = session.meta(agent.agent, readUsage(outcome?._meta));
+      scope = codingIdentity({
+        harness: meta.harness || harness, harnessVersion: meta.harnessVersion,
+        model: chosen, protocolVersion: meta.protocolVersion, capabilities,
+        promptPreparation, sandbox: sandboxKind,
+      });
+      // A snapshot, not the final word: the worktree is still live here, before release() makes
+      // its own "work in progress" auto-commit for whatever the agent left uncommitted (§ below).
+      // Recorded anyway so a task that dies during cleanup still has a checkpoint on file.
+      ctx.event('checkpoint.created', { branch: workspace.branch, task: title,
+        identityHash: scope.identityHash, identity: scope.identity, meta,
+        baseSha: workspace.baseSha ?? null, headSha: workspaces.headSha(taskId) });
+      return { stopReason: outcome?.stopReason || 'end_turn', branch: workspace.branch,
+        identityHash: scope.identityHash, meta, ...session.summary(),
+        // Which hosts the task reached and which it was refused, from the proxy's own record.
+        ...(grant && typeof egress.activity === 'function' ? { network: egress.activity(taskId) } : {}) };
+    } finally {
+      // Whatever happened, the task stops being able to reach anything, and no approval it
+      // raised is left waiting to be answered into an action.
+      sessionEnd?.();
+      const releasedWorkspace = releaseRun(handle);
+      // The corrected checkpoint: release() reads the branch back from the SOURCE repository,
+      // after any WIP auto-commit and after ownership is handed back to noevia, so this never
+      // needs "dubious ownership" cooperation from a harness-owned clone (#1) and it reflects
+      // what actually landed on the branch, not a snapshot from before release ran (#2).
+      // `ctx` is still valid here: jobs.run does not append the job's terminal event until this
+      // whole function returns, which happens only after this `finally` completes.
+      if (scope) {
+        // Best-effort: this `finally` may already be unwinding a real error from the try
+        // block above (a `throw` inside a `finally` replaces it), and a full disk or a job
+        // already finished by a race is exactly the ordinary failure this append can hit. The
+        // task's true outcome — the result or the error the try block produced — must reach
+        // the caller either way; losing the corrected head is a lesser problem than that.
+        try {
+          ctx.checkpoint({ branch: workspace.branch, task: title,
+            identityHash: scope.identityHash, identity: scope.identity, meta,
+            baseSha: workspace.baseSha ?? null, headSha: releasedWorkspace?.headSha ?? null });
+        } catch (error) {
+          log({ at: now(), taskId, event: 'code.cleanup_failed', what: 'corrected checkpoint', error: String(error?.message || error) });
+        }
+      }
+    }
+  }
+
   /**
    * Start a task. `capabilities` is fixed here and never widens (§4): the job records it, and
    * every later decision is taken against this list, not against anything the agent claims.
@@ -51,37 +207,16 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
     if (typeof connect !== 'function') throw Object.assign(Error('No harness transport'), { status: 500 });
     const taskId = jobs.create({ kind: 'code', projectId, capabilities: [...new Set(capabilities)] });
 
-    let workspace;
-    try { workspace = workspaces.claim({ taskId, repoPath, capabilities, domains, pinned: pinnedPaths(harness) }); }
-    catch (error) { jobs.append(taskId, 'job.failed', { error: String(error.message).slice(0, 500) }); throw error; }
-
-    // Network is a capability like any other: no grant unless the task has it AND named domains.
-    const wantsNetwork = capabilities.includes(ACTIONS.NETWORK) || capabilities.includes(ACTIONS.INSTALL);
-    let grant = null;
-    // Once, whichever path gets here first: the work's own `finally`, or the run failing around
-    // it (jobs.run records `job.started` before the work and `job.completed` after it, and
-    // either append can throw — a full disk — without the work's `finally` ever running).
-    let cleaned = false;
-    // What release() reported back, kept so the work below can correct the checkpoint's head
-    // once the workspace is actually gone — see `released` below. `cleanup` is idempotent and
-    // may run more than once (the work's own `finally`, or a run that never got that far); the
-    // cached value is what every caller after the first gets.
-    let released = null;
-    const cleanup = () => {
-      if (cleaned) return released;
-      cleaned = true;
-      try { if (grant) { egress.revoke(taskId); if (typeof egress.activity === 'function') egress.activity(taskId, { forget: true }); } }
-      catch (error) { log({ at: now(), taskId, event: 'code.cleanup_failed', what: 'network grant', error: String(error?.message || error) }); }
-      try { released = workspaces.release({ taskId }); }
-      catch (error) { log({ at: now(), taskId, event: 'code.cleanup_failed', what: 'workspace', error: String(error?.message || error) }); }
-      return released;
-    };
-    try { grant = egress && wantsNetwork && domains.length ? egress.grant({ taskId, domains }) : null; }
+    // The whole claim is inside the try: the grant and the worktree have to come back even when
+    // something fails before the harness ever starts.
+    let handle;
+    try { handle = claimRun({ taskId, repoPath, capabilities, domains, harness }); }
     catch (error) {
-      cleanup();
-      try { jobs.append(taskId, 'job.failed', { error: String(error.message).slice(0, 500) }); } catch { /* the throw below says it */ }
+      if (error?.[GRANT_FAILED]) { try { jobs.append(taskId, 'job.failed', { error: String(error.message).slice(0, 500) }); } catch { /* the throw below says it */ } }
+      else jobs.append(taskId, 'job.failed', { error: String(error.message).slice(0, 500) });
       throw error;
     }
+    const { workspace } = handle;
 
     // Planner review (#519, features.plannerReview) is decided once, here, for the life of this task:
     // flipping the flag mid-run changes nothing for a task already started. Off, `work` below is
@@ -91,112 +226,13 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
     // nothing below changes: no guard, no extra signal, the handlers exactly as they were.
     const guarded = !!(guard && typeof guard.enabled === 'function' && guard.enabled() === true);
 
-    // The whole body is inside the try: the grant and the worktree have to come back even when
-    // something fails before the harness ever starts. Writing that first checkpoint touches the
-    // disk, so it can fail for ordinary reasons — a full volume, a read-only mount — and leaving
-    // it outside meant a live proxy token and a branch claimed for good.
-    const work = async (ctx) => {
-      let sessionEnd = null;
-      // Set once the run has something to report, so the `finally` below knows whether a
-      // corrected, post-release checkpoint is owed at all (a task that never got this far — a
-      // config pin that failed, a connect() that threw — still gets its workspace back, but has
-      // no result to attach a head commit to).
-      let scope = null, meta = null;
-      try {
-        // A task that named no model runs on whatever this deployment loads, and the identity
-        // records the model that actually ran rather than the absence of a choice.
-        const endpoint = engine();
-        const chosen = model || endpoint.model || null;
-        // Guarded, the guard can stop the agent on its own (too many malformed calls): that is
-        // this signal, joined to the job's own so a cancel still stops it the usual way.
-        const halt = guarded ? new AbortController() : null;
-        const session = createSession({ taskId, ctx, workspace, domains, capabilities, harness, model: chosen, halt });
-        sessionEnd = session.end;
-        // Recorded first so a running task is identifiable in the list, not just once it ends.
-        // `baseSha` is the commit the task's branch forked from (captured at claim, before the
-        // agent runs); a repository with no commits yet records `null`, not a failure.
-        ctx.checkpoint({ branch: workspace.branch, task: String(prompt).slice(0, 120), baseSha: workspace.baseSha ?? null });
-        // The agent's own config file, written by noevia before the agent exists: the gate it
-        // will actually obey, and the only model endpoint it is given. A harness whose config
-        // noevia cannot pin throws here, before anything runs.
-        // A step of the run, not a new event type: the vocabulary is closed on purpose, and
-        // this either happened or the task stops here.
-        ctx.event('step.started', { id: 'harness.config', title: 'Pin the harness configuration' });
-        let pinned;
-        try {
-          pinned = pinConfig({ cwd: workspace.path, home: workspace.home || null, owner: workspaces.owner || null, harness, model: chosen,
-            engine: endpoint.baseUrl, apiKey: endpoint.apiKey || null,
-            ...(endpoint.contextTokens ? { contextTokens: endpoint.contextTokens } : {}) });
-        } catch (error) {
-          ctx.event('step.completed', { id: 'harness.config', failed: true, error: String(error.message).slice(0, 300) });
-          throw error;
-        }
-        ctx.event('step.completed', { id: 'harness.config', ...pinned });
-        const agent = await connect({
-          taskId, harness, model: chosen, cwd: workspace.path, home: workspace.home || null,
-          // The adapter pins the agent's own permission config: the spike showed OpenCode's
-          // defaults writing silently, and noevia refuses to run a harness whose effective
-          // config it cannot pin.
-          permission: { edit: 'ask', bash: 'ask', webfetch: 'ask' },
-          proxy: grant ? { url: `http://task:${grant.token}@${egress.endpoint || 'egress'}`, domains: [...domains],
-            // The agent's own model calls go straight to the engine on the internal network; sent
-            // through the proxy they would be refused as a private address.
-            noProxy: engineHost(engine) } : null,
-          handlers: session.handlers,
-          signal: halt ? AbortSignal.any([ctx.signal, halt.signal]) : ctx.signal,
-        });
-        ctx.progress('running');
-        // Shared project context (shared-context.cjs) goes in front of the task, never into its label.
-        let outcome;
-        try { outcome = await agent.prompt(context ? `${context}\n\nTask:\n${String(prompt)}` : String(prompt)); }
-        // A task the guard stopped ends as blocked, not as the "cancelled" the transport reports.
-        catch (error) { throw session.guard?.blockedError() || error; }
-        finally { session.flushOutput(); }
-        if (session.guard?.blocked) throw session.guard.blockedError();
-        // What the run can say about itself, and — just as much — what it could not (§1).
-        meta = session.meta(agent.agent, readUsage(outcome?._meta));
-        scope = codingIdentity({
-          harness: meta.harness || harness, harnessVersion: meta.harnessVersion,
-          model: chosen, protocolVersion: meta.protocolVersion, capabilities,
-          promptPreparation, sandbox: sandboxKind,
-        });
-        // A snapshot, not the final word: the worktree is still live here, before release() makes
-        // its own "work in progress" auto-commit for whatever the agent left uncommitted (§ below).
-        // Recorded anyway so a task that dies during cleanup still has a checkpoint on file.
-        ctx.event('checkpoint.created', { branch: workspace.branch, task: String(prompt).slice(0, 120),
-          identityHash: scope.identityHash, identity: scope.identity, meta,
-          baseSha: workspace.baseSha ?? null, headSha: workspaces.headSha(taskId) });
-        return { stopReason: outcome?.stopReason || 'end_turn', branch: workspace.branch,
-          identityHash: scope.identityHash, meta, ...session.summary(),
-          // Which hosts the task reached and which it was refused, from the proxy's own record.
-          ...(grant && typeof egress.activity === 'function' ? { network: egress.activity(taskId) } : {}) };
-      } finally {
-        // Whatever happened, the task stops being able to reach anything, and no approval it
-        // raised is left waiting to be answered into an action.
-        sessionEnd?.();
-        const releasedWorkspace = cleanup();
-        // The corrected checkpoint: release() reads the branch back from the SOURCE repository,
-        // after any WIP auto-commit and after ownership is handed back to noevia, so this never
-        // needs "dubious ownership" cooperation from a harness-owned clone (#1) and it reflects
-        // what actually landed on the branch, not a snapshot from before release ran (#2).
-        // `ctx` is still valid here: jobs.run does not append the job's terminal event until this
-        // whole function returns, which happens only after this `finally` completes.
-        if (scope) {
-          // Best-effort: this `finally` may already be unwinding a real error from the try
-          // block above (a `throw` inside a `finally` replaces it), and a full disk or a job
-          // already finished by a race is exactly the ordinary failure this append can hit. The
-          // task's true outcome — the result or the error the try block produced — must reach
-          // the caller either way; losing the corrected head is a lesser problem than that.
-          try {
-            ctx.checkpoint({ branch: workspace.branch, task: String(prompt).slice(0, 120),
-              identityHash: scope.identityHash, identity: scope.identity, meta,
-              baseSha: workspace.baseSha ?? null, headSha: releasedWorkspace?.headSha ?? null });
-          } catch (error) {
-            log({ at: now(), taskId, event: 'code.cleanup_failed', what: 'corrected checkpoint', error: String(error?.message || error) });
-          }
-        }
-      }
-    };
+    // The whole body is inside runExecutor's try: the grant and the worktree have to come back
+    // even when something fails before the harness ever starts. Writing that first checkpoint
+    // touches the disk, so it can fail for ordinary reasons — a full volume, a read-only mount —
+    // and leaving it outside meant a live proxy token and a branch claimed for good.
+    const work = (ctx) => runExecutor(ctx, handle, { prompt, connect, model, harness, capabilities, domains,
+      sandboxKind, promptPreparation, context, guarded });
+    const grant = handle.grant;
 
     /**
      * The review gate: after the harness has finished on its own, its grant is revoked and its
@@ -212,7 +248,7 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
       return reviewGate(ctx, result);
     };
     async function reviewGate(ctx, result) {
-      const shas = { baseSha: workspace.baseSha ?? null, headSha: released?.headSha ?? null };
+      const shas = { baseSha: workspace.baseSha ?? null, headSha: handle.released?.headSha ?? null };
       let change = null, outcome = null;
       try {
         if (typeof workspaces.change !== 'function') throw Object.assign(Error('This server cannot read a task’s change.'), { code: 'unavailable' });
@@ -265,7 +301,7 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
     jobs.run(taskId, reviewer ? reviewed : work).catch(() => {
       // jobs.run records the failure when it can; when it could not even record the start, the
       // work never ran, so the grant and the claim are given back here instead.
-      cleanup();
+      releaseRun(handle);
     });
 
     return { taskId, branch: workspace.branch, workspace: workspace.path };
@@ -563,7 +599,9 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
     return `${n(result.tools)} tool calls; ${n(result.allowed)} allowed, ${n(result.refused)} declined by the person, ${n(result.denied)} refused by noevia.`;
   }
 
-  return { start, cancel, canStand };
+  // claimRun / runExecutor / releaseRun are the pipeline's (#705): one job, the Executor run more
+  // than once on the same branch. start() is exactly those three, as it always was.
+  return { start, cancel, canStand, claimRun, runExecutor, releaseRun };
 }
 
 /** Real file I/O, injectable so the policy above can be tested without a disk. */

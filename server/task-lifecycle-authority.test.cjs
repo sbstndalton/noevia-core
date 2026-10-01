@@ -420,3 +420,53 @@ test('reportHash is stable across key order and changes with any check', () => {
   // A shared (non-circular) sub-object is fine.
   const shared = { k: 1 }; assert.match(reportHash({ a: shared, b: shared }), /^[0-9a-f]{64}$/);
 });
+
+// #705: a move into reviewing is judged on the CURRENT round's evidence — the steps and artifacts
+// since the task last entered implementing. A failed test run of an earlier revision does not hold
+// a later one back, and a passing one does not vouch for it either.
+test('reviewing is judged on the current revision: earlier failures do not block, earlier passes do not count', () => {
+  const failFirst = () => {
+    const { jobs } = store();
+    const id = codeJob(jobs);
+    jobs.append(id, 'task.stage', { from: 'planned', to: 'implementing', revision: 0 }, AUTHORITY);
+    jobs.append(id, 'task.revision', { n: 1, headSha: SHA1, planHash: PLAN }, AUTHORITY);
+    jobs.append(id, 'task.stage', { from: 'implementing', to: 'verifying', revision: 1 }, AUTHORITY);
+    jobs.append(id, 'checkpoint.created', { branch: 'noevia/task-synthetic', task: 'synthetic', headSha: SHA1 });
+    jobs.append(id, 'step.started', { id: 'tests', title: 'Run the tests' });
+    jobs.append(id, 'step.completed', { id: 'tests', failed: true });
+    jobs.append(id, 'artifact.created', { name: 'test-report', kind: 'test-report', passed: false, headSha: SHA1, revision: 1 });
+    assert.throws(() => jobs.append(id, 'task.stage', { from: 'verifying', to: 'reviewing', revision: 1, expectedArtifacts: EXPECTED }, AUTHORITY), /tests-run: fail/);
+    jobs.append(id, 'task.stage', { from: 'verifying', to: 'changes_requested', revision: 1, reason: 'Tests failed' }, AUTHORITY);
+    jobs.append(id, 'task.stage', { from: 'changes_requested', to: 'implementing', revision: 1 }, AUTHORITY);
+    jobs.append(id, 'task.revision', { n: 2, headSha: SHA2, planHash: PLAN }, AUTHORITY);
+    jobs.append(id, 'task.stage', { from: 'implementing', to: 'verifying', revision: 2 }, AUTHORITY);
+    return { jobs, id };
+  };
+  // Revision 2 with no test run of its own: refused, although revision 1 recorded one.
+  {
+    const { jobs, id } = failFirst();
+    jobs.append(id, 'checkpoint.created', { branch: 'noevia/task-synthetic', task: 'synthetic', headSha: SHA2 });
+    assert.throws(() => jobs.append(id, 'task.stage', { from: 'verifying', to: 'reviewing', revision: 2, expectedArtifacts: EXPECTED }, AUTHORITY), /tests-run: unknown/);
+  }
+  // Revision 2 with its own passing run: allowed, although revision 1 failed.
+  {
+    const { jobs, id } = failFirst();
+    evidence(jobs, id, { sha: SHA2 });
+    const e = jobs.append(id, 'task.stage', { from: 'verifying', to: 'reviewing', revision: 2, expectedArtifacts: EXPECTED }, AUTHORITY);
+    assert.match(e.data.reportHash, /^[0-9a-f]{64}$/);
+    // The view keeps both runs, each closed by its own completion.
+    assert.deepEqual(jobs.get(id).steps.filter((s) => s.id === 'tests').map((s) => s.status), ['failed', 'completed']);
+  }
+});
+
+test('flag off: a non-pipeline journal with a repeated step id derives exactly as before (#705 review)', () => {
+  const { jobs } = store();
+  const id = codeJob(jobs);
+  jobs.append(id, 'step.started', { id: 'harness.config', title: 'Pin' });
+  jobs.append(id, 'step.started', { id: 'harness.config', title: 'Pin again' });
+  jobs.append(id, 'step.completed', { id: 'harness.config' });
+  jobs.append(id, 'step.completed', { id: 'harness.config', failed: true });
+  // The original rule: every completion closes the FIRST step with that id.
+  assert.deepEqual(jobs.get(id).steps.map((s) => s.status), ['failed', 'running']);
+  assert.equal('stages' in jobs.get(id), false);
+});

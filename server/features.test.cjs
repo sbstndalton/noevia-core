@@ -148,7 +148,10 @@ test('the reasons a feature is unavailable carry a stable id where the server ow
   assert.equal(unavailableId('previews', url), null, 'only the decision-service experiments use these ids');
   const info = createFeatures({ env: {}, store: memoryStore() }).describe();
   assert.equal(info.find(f => f.id === 'nativeClientAuth').unavailableId, 'trustProxy');
-  assert.equal(info.find(f => f.id === 'constrainedPlanDecoding').unavailableId, 'notUsed');
+  // #705: the pipeline runs the Planner's plan step, so constrained decoding is available now.
+  assert.equal(info.find(f => f.id === 'constrainedPlanDecoding').unavailable, null);
+  assert.equal(info.find(f => f.id === 'codePipeline').unavailableId, 'codeSandbox');
+  assert.equal(info.find(f => f.id === 'codeMerge').unavailableId, 'codeSandbox');
   assert.equal('unavailableId' in info.find(f => f.id === 'previews'), false);
 });
 
@@ -219,4 +222,15 @@ test('plannerReview: astraReview is accepted as an alias on input, and only the 
   assert.equal(store.m.get('feature:plannerReview'), 'true');
   assert.equal(store.m.has('feature:astraReview'), false);
   assert.equal(Object.keys(features.flags()).includes('astraReview'), false, 'flags use the new name only');
+});
+
+test('#705: the Code pipeline and merge flags are off by default and need the code sandbox', () => {
+  const none = createFeatures({ env: { NOEVIA_FEATURE_CODE_PIPELINE: 'true', NOEVIA_FEATURE_CODE_MERGE: 'true' } });
+  assert.equal(none.enabled('codePipeline'), false, 'unavailable without the sandbox wins over the env pin');
+  assert.equal(none.enabled('codeMerge'), false);
+  const sandbox = { CODE_HARNESS_ENDPOINT: 'code-sandbox:7700' };
+  assert.equal(createFeatures({ env: sandbox }).enabled('codePipeline'), false, 'off by default');
+  assert.equal(createFeatures({ env: { ...sandbox, NOEVIA_FEATURE_CODE_PIPELINE: 'true' } }).enabled('codePipeline'), true);
+  assert.equal(createFeatures({ env: { ...sandbox, NOEVIA_FEATURE_CODE_MERGE: 'true' } }).enabled('codeMerge'), true);
+  assert.equal(createFeatures({ env: { NOEVIA_FEATURE_CONSTRAINED_PLAN_DECODING: 'true' } }).enabled('constrainedPlanDecoding'), true);
 });

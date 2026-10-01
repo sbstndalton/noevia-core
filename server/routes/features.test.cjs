@@ -37,12 +37,12 @@ test('admin toggles a feature; unknown and malformed requests are refused', asyn
   assert.equal((await call(route, 'POST', '/api/features', 'admin')).status, 405);
 });
 
-test('constrainedPlanDecoding is listed as unavailable and cannot be switched on', async () => {
+test('constrainedPlanDecoding is available since the Code pipeline runs the plan step (#705), and can be switched on', async () => {
   const { route } = harness();
   const list = await call(route, 'GET', '/api/admin/features', 'admin');
   const info = list.body.features.find(f => f.name === 'constrainedPlanDecoding');
-  assert.match(info.unavailable, /no task runs the Planner’s plan step/);
-  assert.equal((await call(route, 'PUT', '/api/admin/features/constrainedPlanDecoding', 'admin', '{"enabled":true}')).status, 409);
+  assert.equal(info.unavailable, null);
+  assert.equal((await call(route, 'PUT', '/api/admin/features/constrainedPlanDecoding', 'admin', '{"enabled":true}')).status, 200);
 });
 
 test('Browser mode without a browser runtime is listed with a reason, refused with 409 and reads false (issue 550)', async () => {

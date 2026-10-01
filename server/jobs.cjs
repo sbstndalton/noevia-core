@@ -65,7 +65,10 @@ function derive(events) {
       case 'job.started': job.status = 'running'; break;
       case 'progress': job.stage = d.stage ?? job.stage; break;
       case 'step.started': job.steps.push({ id: d.id, title: d.title, status: 'running' }); break;
-      case 'step.completed': { const s = job.steps.find((x) => x.id === d.id); if (s) s.status = d.failed ? 'failed' : 'completed'; break; }
+      // In a pipeline journal (#705, authoritative) a step id recurs once per revision (`tests`), so a
+      // completion closes the latest one still running. Every other journal keeps the original rule:
+      // the first step with that id.
+      case 'step.completed': { const s = (authoritative && job.steps.findLast((x) => x.id === d.id && x.status === 'running')) || job.steps.find((x) => x.id === d.id); if (s) s.status = d.failed ? 'failed' : 'completed'; break; }
       case 'approval.requested': job.pendingApproval = d; job.status = 'waiting_approval'; break;
       case 'approval.decided': job.pendingApproval = null; if (!TERMINAL.has(job.status)) job.status = 'running'; break;
       case 'tool.uncertain': job.uncertain.push(d); break;
@@ -151,7 +154,7 @@ function boundAuthorityEvent(id, type, data, current, known) {
       || !expected.every((n) => typeof n === 'string' && n.length > 0 && n.length <= 200))) {
       throw Object.assign(Error('expectedArtifacts is a short list of artifact names'), { status: 400 });
     }
-    const report = buildCompletenessReport({ job: { ...known, id }, expectedArtifacts: expected ?? null });
+    const report = buildCompletenessReport({ job: { ...revisionWindow(current, known), id }, expectedArtifacts: expected ?? null });
     if (!canEnterReviewing(report)) {
       const open = report.checks.filter((c) => c.status !== 'pass').map((c) => `${c.name}: ${c.status}`);
       throw lifecycleConflict(`The completeness report does not allow review (${open.join('; ')})`);
@@ -159,6 +162,22 @@ function boundAuthorityEvent(id, type, data, current, known) {
     out.reportHash = reportHash(report);
   }
   return out;
+}
+
+// The evidence a move into `reviewing` is judged on is the CURRENT round's (#705): the steps and
+// artifacts recorded since the task last entered `implementing`. A test run that failed in an
+// earlier revision is that revision's evidence, not this one's — and a passing one from an earlier
+// revision does not vouch for this head either. Everything else (plan, checkpoint, uncertainty,
+// a pending approval) is still the whole job's. A journal that never entered `implementing` is
+// judged whole, exactly as before.
+function revisionWindow(current, known) {
+  let since = -1;
+  for (let i = current.length - 1; i >= 0; i--) {
+    if (current[i].type === 'task.stage' && current[i].data?.to === 'implementing') { since = i; break; }
+  }
+  if (since < 0) return known;
+  const window = derive([current[0], ...current.slice(since + 1)]);
+  return { ...known, steps: window.steps, artifacts: window.artifacts };
 }
 
 function clipUtf8(text, maxBytes) {
