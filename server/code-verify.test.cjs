@@ -238,6 +238,32 @@ test('leftover run directories are swept at start, and a failed sweep is logged'
   assert.ok(logs.some((l) => /could not read .* to sweep/.test(l)), 'a sweep that cannot run says so');
 });
 
+test('sweep of a directory only the dropped uid can list goes through that uid, quietly', { skip: process.getuid?.() === 0 }, async () => {
+  const { root } = fixture({ 'a.txt': 'a' });
+  const scratchRoot = temp();
+  fs.mkdirSync(path.join(scratchRoot, `${SCRATCH_PREFIX}old`));
+  fs.chmodSync(scratchRoot, 0o000);
+  closers.push(() => fs.chmodSync(scratchRoot, 0o755));
+  const calls = [];
+  const sp = require('node:child_process').spawn;
+  const spawnFn = (file, args, o) => {
+    const script = String(args[1]);
+    calls.push(script);
+    // Stand in for the dropped uid: it can list the directory, and its rm succeeds.
+    if (script.startsWith('ls -A')) return sp('sh', ['-c', `echo ${SCRATCH_PREFIX}old; echo keep`], o);
+    return sp('sh', ['-c', 'exit 0'], o);
+  };
+  const user = { uid: process.getuid(), gid: process.getgid() };
+  const { logs } = await verifier(root, { scratchRoot, testUser: user, spawnFn });
+  assert.ok(calls.some((c) => c.startsWith('ls -A')), 'listed as the dropped uid');
+  assert.ok(calls.some((c) => c.includes('rm -rf')), 'removed the leftover');
+  assert.equal(logs.filter((l) => /could not read/.test(l)).length, 0, 'no EACCES noise');
+  // Failing for that uid too is still reported.
+  const failing = (file, args, o) => sp('sh', ['-c', String(args[1]).startsWith('ls -A') ? 'echo denied >&2; exit 1' : 'exit 0'], o);
+  const again = await verifier(root, { scratchRoot, testUser: user, spawnFn: failing });
+  assert.ok(again.logs.some((l) => /could not read .* denied/.test(l)));
+});
+
 test('in production the verifier listens on a unix socket, and code-verify dials one', async () => {
   const { root } = fixture({ 'a.txt': 'a' });
   const v = createVerifier({ root, copyRoot: temp(), log: () => {} });

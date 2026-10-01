@@ -181,7 +181,15 @@ function createVerifier({ root, copyRoot = os.tmpdir(), scratchRoot = copyRoot, 
     const places = [{ dir: copyRoot, who: gitUser }, { dir: scratchRoot, who: testUser }, { dir: ctlRoot, who: null }];
     for (const { dir, who } of places) {
       let names = [];
-      try { names = fs.readdirSync(dir); } catch (e) { log(`could not read ${dir} to sweep it: ${e.message}`); continue; }
+      try { names = fs.readdirSync(dir); } catch (e) {
+        // A 0700 directory owned by the dropped uid (the tmpfs at /verify/run) is not ours to list, but
+        // that uid can. Only a listing that fails for it too is a real failure worth a log line.
+        if (who && (e.code === 'EACCES' || e.code === 'EPERM')) {
+          const r = await exec(shell, ['-c', 'ls -A "$1"', 'ls', dir], { who, timeoutMs: 10_000 });
+          if (r.code === 0) names = String(r.stdout).split('\n').filter(Boolean);
+          else { log(`could not read ${dir} to sweep it: ${String(r.stderr).split('\n')[0] || `exit ${r.code}`}`); continue; }
+        } else { log(`could not read ${dir} to sweep it: ${e.message}`); continue; }
+      }
       for (const name of names.filter((n) => n.startsWith(SCRATCH_PREFIX))) { swept++; await removeAs(who, path.join(dir, name), 'leftover verify directory'); }
     }
     return swept;
