@@ -143,8 +143,8 @@ test('chatFraming flag exists and defaults off', () => {
 test('framing settings: model-agnostic role ids, validated and audited', () => {
   const data = new Map(), audits = [];
   const s = createFramingSettings({ store: { get: (k) => data.get(k), set: (k, v) => data.set(k, v) }, audit: (...a) => audits.push(a) });
-  assert.deepEqual(s.get(), { framingRouterModel: '', framingReasonerModel: '' });
-  assert.deepEqual(s.save({ framingRouterModel: ' router-a.gguf ', framingReasonerModel: '' }, 'u1'), { framingRouterModel: 'router-a.gguf', framingReasonerModel: '' });
+  assert.deepEqual(s.get(), { framingRouterModel: '', framingReasonerModel: '', brainContextChars: 2000 });
+  assert.deepEqual(s.save({ framingRouterModel: ' router-a.gguf ', framingReasonerModel: '' }, 'u1'), { framingRouterModel: 'router-a.gguf', framingReasonerModel: '', brainContextChars: 2000 });
   assert.throws(() => s.save({ framingRouterModel: 'bad model; rm' }, 'u1'), /model id/);
   assert.equal(audits.length, 1);
   assert.equal(createFramingSettings({ store: { get: (k) => data.get(k), set() {} } }).get().framingRouterModel, 'router-a.gguf');

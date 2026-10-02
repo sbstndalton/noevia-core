@@ -703,14 +703,40 @@ const chatFramingRoutes = require('./routes/chat-framing.cjs').createChatFraming
 // #741: "Mirror chats to Diary", per user and off by default. One-way, debounced, through the Diary
 // files client above, as the chat's own user. Runs only with chatFraming on and the Diary add-on on.
 const vaultMirrorLib = require('./chat-vault-mirror.cjs');
+const chatBrainLib = require('./chat-brain.cjs');
 const vaultMirrorAvailable = (userId) => features.enabled('chatFraming') && authService.diaryEnabled(userId);
 const chatVaultMirror = vaultMirrorLib.createChatVaultMirror({
   enabled: (userId) => vaultMirrorAvailable(userId) && vaultMirrorLib.readPreferences(workspaceStore.get(userId).dir).enabled,
   lists: (userId) => diaryAsUser(userId, () => ({ freeChats: Array.from(FREE_CHATS), projects: PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)) })),
   deleted: (userId) => diaryAsUser(userId, () => require('./chat-lists.cjs').readTombstones(currentWorkspace().dir)),
   readHistory: (userId, chatId) => diaryAsUser(userId, () => readHistory(chatId)),
+  readBrain: (userId, chatId) => chatBrainLib.readBrain(workspaceStore.get(userId).dir, chatId)?.brain || null,
   files: diaryFiles,
   index: { read: (userId) => vaultMirrorLib.readIndex(workspaceStore.get(userId).dir), write: (userId, state) => vaultMirrorLib.writeIndex(workspaceStore.get(userId).dir, state) },
+  log: (...args) => console.warn(...args),
+});
+// #742: each mirrored chat gets a small "brain" when it goes idle, built by the reasoner role (same
+// engine and budget gate as #740; skipped without a reasoner model). Needs framingReasoner +
+// chatFraming AND the user's mirror opt-in. Stored per chat in the user's own workspace.
+const brainStore = { read: (userId, chatId) => chatBrainLib.readBrain(workspaceStore.get(userId).dir, chatId),
+  write: (userId, chatId, record) => chatBrainLib.writeBrain(workspaceStore.get(userId).dir, chatId, record),
+  remove: (userId, chatId) => chatBrainLib.removeBrain(workspaceStore.get(userId).dir, chatId) };
+const chatBrains = chatBrainLib.createBrainScheduler({
+  enabled: (userId) => features.enabled('framingReasoner') && vaultMirrorAvailable(userId) && vaultMirrorLib.readPreferences(workspaceStore.get(userId).dir).enabled,
+  chat: (userId, chatId) => diaryAsUser(userId, () => [...Array.from(FREE_CHATS), ...PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)).flatMap((proj) => proj.chats || [])].find((c) => c && c.id === chatId) || null),
+  readHistory: (userId, chatId) => diaryAsUser(userId, () => readHistory(chatId)),
+  deleted: (userId) => diaryAsUser(userId, () => require('./chat-lists.cjs').readTombstones(currentWorkspace().dir)),
+  store: brainStore,
+  builder: chatBrainLib.createBrainBuilder({
+    enabled: () => features.enabled('framingReasoner') && features.enabled('chatFraming'),
+    model: () => framingSettings.get().framingReasonerModel,
+    complete: require('./framing-reasoner.cjs').createEngineCompletion({ getProvider, providerHeaders, providerId: DEFAULT_PROVIDER_ID, fetch: (...a) => fetch(...a) }),
+    admit: (model, { answerModel, answerIsLocal }) => require('./framing-reasoner.cjs').admitReasoner({ model, answerModel, answerIsLocal,
+      keep: require('./llamacpp-manager.cjs').keepAlongside(), loadRefusal: typeof modelManager.loadRefusal === 'function' ? modelManager.loadRefusal : null }),
+    loadedModel: () => lastLoadedModel(),
+    log: (entry) => recordDecision('chat-brain', entry),
+  }),
+  built: (userId, chatId) => chatVaultMirror.schedule(userId, chatId),
   log: (...args) => console.warn(...args),
 });
 const chatVaultMirrorRoutes = require('./routes/chat-vault-mirror.cjs').createChatVaultMirrorRoutes({ json, readJson,
@@ -742,6 +768,10 @@ const { handleChat } = require('./chat.cjs').createChatHandler({
   // #739: a confirmed frame steers the answer; looked up in the signed-in user's own lists only.
   chatFramingEnabled: () => features.enabled('chatFraming'), freeChats: () => Array.from(FREE_CHATS),
   framingReasoner, reasoningTraces,
+  // #742: linked chats' brains, read from the signed-in user's own workspace and lists only.
+  brainContext: { enabled: () => features.enabled('brainContext') && features.enabled('chatFraming'), maxChars: () => framingSettings.get().brainContextChars,
+    chats: () => [...Array.from(FREE_CHATS), ...PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)).flatMap((proj) => proj.chats || [])],
+    read: (chatId) => chatBrainLib.readBrain(currentWorkspace().dir, chatId) },
   DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall,
   oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse,
   chatgptOAuth, chatgptEnabled: () => features.enabled('chatgptOAuth'),
@@ -906,7 +936,7 @@ async function handleRequestScoped(req, res) {
     if (authn && await chatVaultMirrorRoutes(req, res, { path: p, authn })) return;
     // #741: a successful change to the user's chats nudges their mirror (debounced; a no-op unless opted in).
     const mirrorNudge = authn ? vaultMirrorLib.mirrorTrigger(req.method, p) : null;
-    if (mirrorNudge && typeof res.once === 'function') res.once('finish', () => { if (res.statusCode >= 200 && res.statusCode < 300) chatVaultMirror.schedule(authn.user.id, mirrorNudge.chatId); });
+    if (mirrorNudge && typeof res.once === 'function') res.once('finish', () => { if (res.statusCode >= 200 && res.statusCode < 300) { chatVaultMirror.schedule(authn.user.id, mirrorNudge.chatId); if (mirrorNudge.chatId) chatBrains.schedule(authn.user.id, mirrorNudge.chatId); } });
     if (authn && await exportRoutes(req, res, { path: p, authn })) return;
     if (authn && await importRoutes(req, res, { path: p, authn })) return;
     if (authn && await accountRoutes(req, res, { path: p, authn })) return;

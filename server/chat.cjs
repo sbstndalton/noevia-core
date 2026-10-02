@@ -112,7 +112,7 @@ function normalizeReplayHistory(mapped, newMessage) {
 }
 
 function createChatHandler({
-  stepSupervision = null, durableChat = null, fs, path, crypto, fetch, codeTasksFor = () => [], reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, diaryStorageRetry = (send) => send(true), autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, toolGate = null, chatFramingEnabled = () => false, freeChats = () => [], framingReasoner = null, reasoningTraces = null, DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse,
+  stepSupervision = null, durableChat = null, fs, path, crypto, fetch, codeTasksFor = () => [], reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, diaryStorageRetry = (send) => send(true), autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, toolGate = null, chatFramingEnabled = () => false, freeChats = () => [], framingReasoner = null, reasoningTraces = null, brainContext = null, DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse,
   chatgptOAuth = null, chatgptEnabled = () => false, skillHistory = null,
   // #648: whether a tool is one of noevia's own project file edits, whose target is resolved and
   // shown on the approval card and pinned for the call. By name when not wired (the stricter side).
@@ -419,6 +419,14 @@ function createChatHandler({
     }
     const frameBlock = steering.frameBlock(chatFrame);
     if (frameBlock) sysParts.push(frameBlock);
+    // #742 (features.brainContext): linked chats' brain summaries, as untrusted data, from the user's own
+    // workspace and lists only. Flag off, no confirmed frame or no links: nothing is added.
+    if (chatFrame && brainContext && brainContext.enabled() === true) {
+      try {
+        const block = require('./chat-brain.cjs').linkedBrainBlock({ enabled: true, frame: chatFrame, chatId: body.chatId, chats: brainContext.chats(), read: brainContext.read, maxChars: brainContext.maxChars() });
+        if (block) sysParts.push(block);
+      } catch { /* fail open: no brain context */ }
+    }
     const sys = sysParts.join('\n\n');
     let wire = sys ? [{ role: 'system', content: sys }, ...msgs] : msgs;
 

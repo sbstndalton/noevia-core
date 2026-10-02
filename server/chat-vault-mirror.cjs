@@ -5,6 +5,8 @@
 // and never reads a note back. Each note opens with frontmatter (noevia_id, created, updated,
 // project, kind, tags, brain_schema: 0), then the same Markdown the conversation export writes
 // (chat-export.cjs chatMarkdown, which leaves reasoning out), then the chat's links as [[Title]].
+// When the chat has a brain (#742, chat-brain.cjs), its Summary / Decisions / Facts / Open questions /
+// Entities sections follow the frontmatter and brain_schema is 1; without one, nothing changes.
 //
 // Identity is the chat id (noevia_id), kept in a small per-user index, so a rename or a move to
 // another project moves the note instead of leaving a copy. A chat that was deleted has its note
@@ -23,10 +25,11 @@
 // runs on the request path and nothing here can throw into it.
 const crypto = require('node:crypto');
 const { chatMarkdown } = require('./chat-export.cjs');
+const chatBrain = require('./chat-brain.cjs');
 
 const ROOT = 'Chats';
 const INBOX = 'Inbox';
-const BRAIN_SCHEMA = 0;
+const BRAIN_SCHEMA = 0;            // a note without a brain; with one it is chatBrain.BRAIN_SCHEMA (#742)
 const MAX_NOTE_BYTES = 500 * 1024;          // the companion's editor limit is 512 KiB
 const MAX_NAME = 100;
 const DEFAULT_DELAY_MS = 5000, DEFAULT_MAX_WAIT_MS = 30000, DEFAULT_RETRY_MS = 60000;
@@ -67,7 +70,7 @@ const yamlString = (value) => JSON.stringify(String(value)); // a JSON string is
 const iso = (ms) => (Number.isFinite(ms) && ms > 0 ? new Date(ms).toISOString() : null);
 
 /** The note's YAML frontmatter. Unknown or missing values are written as null, never guessed. */
-function frontmatter({ chat, projectName }) {
+function frontmatter({ chat, projectName, brain = null }) {
   const frame = chat.frame && typeof chat.frame === 'object' ? chat.frame : null;
   const tags = Array.isArray(frame?.tags) ? frame.tags.filter((t) => typeof t === 'string' && t) : [];
   const lines = ['---',
@@ -77,14 +80,17 @@ function frontmatter({ chat, projectName }) {
     `project: ${projectName == null ? 'null' : yamlString(projectName)}`,
     `kind: ${frame?.kind ? yamlString(frame.kind) : 'null'}`,
     `tags: [${tags.map(yamlString).join(', ')}]`,
-    `brain_schema: ${BRAIN_SCHEMA}`,
+    `brain_schema: ${brain ? chatBrain.BRAIN_SCHEMA : BRAIN_SCHEMA}`,
     '---', ''];
   return lines.join('\n');
 }
 
-/** The whole note. `linkNames` are the note names of the chats this one links to. */
-function renderNote({ chat, projectName, history, linkNames = [] }) {
-  const head = frontmatter({ chat, projectName });
+/** The whole note. `linkNames` are the note names of the chats this one links to. With a valid
+ *  `brain` (#742) its Markdown sections follow the frontmatter; without one the note is unchanged. */
+function renderNote({ chat, projectName, history, linkNames = [], brain = null }) {
+  const valid = brain ? chatBrain.validateBrain(brain) : null;
+  const usable = valid?.ok ? valid.brain : null;
+  const head = frontmatter({ chat, projectName, brain: usable }) + (usable ? chatBrain.renderBrainMarkdown(usable) : '');
   const links = linkNames.length ? `\n## Links\n\n${linkNames.map((n) => `- [[${n}]]`).join('\n')}\n` : '';
   let body = chatMarkdown(chat, Array.isArray(history) ? history : []);
   const budget = MAX_NOTE_BYTES - Buffer.byteLength(head + links) - 200;
@@ -116,8 +122,9 @@ function mirrorTrigger(method, path) {
  * @param {(userId:string, chatId:string) => object[]} deps.readHistory           the user's own transcript
  * @param {{read:Function, write:Function, mkdir:Function, ops:Function}} deps.files the Diary files client (DAV's)
  * @param {{read:(userId:string)=>object, write:(userId:string, state:object)=>void}} deps.index
+ * @param {(userId:string, chatId:string) => object|null} [deps.readBrain]  the chat's brain from the user's own workspace (#742)
  */
-function createChatVaultMirror({ enabled, lists, deleted = () => new Set(), readHistory, files, index, log = () => {},
+function createChatVaultMirror({ enabled, lists, deleted = () => new Set(), readHistory, readBrain = () => null, files, index, log = () => {},
   delayMs = DEFAULT_DELAY_MS, maxWaitMs = DEFAULT_MAX_WAIT_MS, retryMs = DEFAULT_RETRY_MS,
   setTimer = setTimeout, clearTimer = clearTimeout, now = Date.now }) {
   const users = new Map(); // userId -> { timer, firstAt, dirty:Set, running, again }
@@ -205,12 +212,15 @@ function createChatVaultMirror({ enabled, lists, deleted = () => new Set(), read
       if (!insideMirror(target)) { ok = false; log('chat-vault-mirror: refused path', target); continue; }
       const linkNames = [...new Set(Array.isArray(chat.frame?.links) ? chat.frame.links : [])]
         .filter((id) => id !== chat.id && want.has(id)).map((id) => noteName(want.get(id)));
-      const metaPrint = hash(JSON.stringify([chat.title, chat.createdAt, chat.updatedAt, chat.frame ?? null, projectName, linkNames]));
+      let brain = null;
+      try { brain = readBrain(userId, chat.id) || null; } catch { brain = null; } // no brain: the note as before
+      // A brain joins the fingerprint only when there is one, so notes without a brain are not rewritten.
+      const metaPrint = hash(JSON.stringify([chat.title, chat.createdAt, chat.updatedAt, chat.frame ?? null, projectName, linkNames, ...(brain ? [brain] : [])]));
       const entry = notes[chat.id];
       if (entry && entry.path === target && entry.meta === metaPrint && !dirty.has(chat.id)) continue;
       try {
         await ensureFolder(userId, target.slice(0, target.lastIndexOf('/')), made);
-        const content = renderNote({ chat, projectName, history: readHistory(userId, chat.id), linkNames });
+        const content = renderNote({ chat, projectName, history: readHistory(userId, chat.id), linkNames, brain });
         let at = entry?.path && entry.path !== target ? entry.path : target;
         let current = await readNote(userId, at);
         if (at !== target) {

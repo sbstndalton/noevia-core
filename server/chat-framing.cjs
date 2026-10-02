@@ -45,11 +45,17 @@ function existingTags(chats) {
 
 const SETTINGS_KEY = 'framing:roles';
 const ROLE_RE = /^[A-Za-z0-9._:/@+-]{0,200}$/;
-/** framingRouterModel / framingReasonerModel: model ids, any provider, empty = default. */
+// #742: how many characters of linked chats' brain summaries one answer may get (features.brainContext).
+// The upgrade knob for bigger hardware: raise it, nothing else is hard-wired.
+const BRAIN_CONTEXT_CHARS = Object.freeze({ default: 2000, min: 0, max: 200000 });
+const brainChars = (v) => (Number.isInteger(v) && v >= BRAIN_CONTEXT_CHARS.min && v <= BRAIN_CONTEXT_CHARS.max ? v : BRAIN_CONTEXT_CHARS.default);
+/** framingRouterModel / framingReasonerModel: model ids, any provider, empty = default.
+ *  brainContextChars: integer 0..200000, default 2000; omitted on save keeps the current value. */
 function createFramingSettings({ store, audit = () => {} }) {
   let saved;
   try { saved = JSON.parse(store.get(SETTINGS_KEY) || 'null'); } catch { saved = null; }
-  const get = () => ({ framingRouterModel: saved?.framingRouterModel || '', framingReasonerModel: saved?.framingReasonerModel || '' });
+  const get = () => ({ framingRouterModel: saved?.framingRouterModel || '', framingReasonerModel: saved?.framingReasonerModel || '',
+    brainContextChars: brainChars(saved?.brainContextChars) });
   return {
     get,
     save(value, actor) {
@@ -59,6 +65,11 @@ function createFramingSettings({ store, audit = () => {} }) {
         if (typeof v !== 'string' || !ROLE_RE.test(v.trim())) throw Object.assign(Error('Enter a model id (letters, digits and . _ : / @ + -), or leave it empty for the default.'), { status: 400 });
         next[key] = v.trim();
       }
+      if (value && 'brainContextChars' in value) {
+        const n = value.brainContextChars;
+        if (!Number.isInteger(n) || n < BRAIN_CONTEXT_CHARS.min || n > BRAIN_CONTEXT_CHARS.max) throw Object.assign(Error(`brainContextChars must be a whole number from ${BRAIN_CONTEXT_CHARS.min} to ${BRAIN_CONTEXT_CHARS.max}.`), { status: 400 });
+        next.brainContextChars = n;
+      } else next.brainContextChars = get().brainContextChars;
       store.set(SETTINGS_KEY, JSON.stringify(next));
       saved = next;
       audit('framing.roles', actor, next);
@@ -167,4 +178,4 @@ function writePreferences(dir, value) {
   return record;
 }
 
-module.exports = { createChatFraming, createFramingSettings, normalizeFrame, existingTags, readPreferences, writePreferences, KINDS, NONE };
+module.exports = { createChatFraming, createFramingSettings, BRAIN_CONTEXT_CHARS, normalizeFrame, existingTags, readPreferences, writePreferences, KINDS, NONE };
