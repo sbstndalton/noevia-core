@@ -691,6 +691,8 @@ const { handleChat } = require('./chat.cjs').createChatHandler({
   getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, diaryStorageRetry: diary.withStorageCredential,
   autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError,
   visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, toolGate,
+  // #739: a confirmed frame steers the answer; looked up in the signed-in user's own lists only.
+  chatFramingEnabled: () => features.enabled('chatFraming'), freeChats: () => Array.from(FREE_CHATS),
   DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall,
   oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse,
   chatgptOAuth, chatgptEnabled: () => features.enabled('chatgptOAuth'),

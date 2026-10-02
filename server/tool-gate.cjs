@@ -166,12 +166,20 @@ function createToolGate({ enabled, decide, boxes = DEFAULT_BOXES, isWriteTool, l
     return null;
   }
 
-  async function readout(message, offered) {
-    const readTools = [...offered.values()].filter((t) => readOnly(toolName(t)));
+  async function readout(message, offered, bias) {
+    let readTools = [...offered.values()].filter((t) => readOnly(toolName(t)));
+    // #739: a confirmed "search" frame puts the offered web and project-search tools first, so they
+    // survive option trimming. Only reorders what is offered; nothing is added.
+    const preferred = Array.isArray(bias?.prefer) ? bias.prefer.flatMap((k) => boxes[k] || []) : [];
+    if (preferred.length) {
+      const rank = (t) => { const i = preferred.indexOf(toolName(t)); return i < 0 ? preferred.length : i; };
+      readTools = readTools.map((t, i) => [t, i]).sort((a, b) => rank(a[0]) - rank(b[0]) || a[1] - b[1]).map(([t]) => t);
+    }
+    const question = typeof bias?.hint === 'string' && bias.hint ? `${QUESTION} ${bias.hint.slice(0, 160)}` : QUESTION;
     if (!readTools.length) return { reason: 'no-read-tools' };
     const blocked = stage2Blocked();
     if (blocked) return { reason: blocked };
-    const shaped = shapeOptions(readTools, value(limits), boxes);
+    const shaped = shapeOptions(readTools, value(limits), boxes, question.length, preferred);
     if (!shaped.options.length) return { reason: 'no-options-fit' };
     const { options } = shaped;
     const trim = { options: options.length, ...(shaped.trimmed ? { trimmed: shaped.trimmed } : {}) };
@@ -179,7 +187,7 @@ function createToolGate({ enabled, decide, boxes = DEFAULT_BOXES, isWriteTool, l
     let timer;
     const result = await Promise.race([
       Promise.resolve().then(() => decide({ kind: 'choice', purpose: 'tool.gate',
-        question: QUESTION,
+        question,
         context: { cloud: 'forbidden', stateText: String(message).slice(0, 1000) }, options,
         constraints: { deadlineMs: ms, temperature: 0 }, fallback: { selected: null, scores: {} } })),
       new Promise((_, reject) => { timer = setTimeout(() => reject(Object.assign(Error('deadline'), { deadline: true })), ms + 250); }),
@@ -201,8 +209,9 @@ function createToolGate({ enabled, decide, boxes = DEFAULT_BOXES, isWriteTool, l
   /**
    * @param {string} message  the user's message for this turn
    * @param {object[]} offeredTools  the OpenAI-shaped tools this request will actually send
+   * @param {object|null} [bias]  chat-frame-steering.cjs gateBias(): may only narrow or prefer
    */
-  async function evaluate(message, offeredTools) {
+  async function evaluate(message, offeredTools, bias = null) {
     const started = now();
     const done = (out, extra = {}) => {
       const result = { ...out, elapsedMs: Math.max(0, now() - started) };
@@ -216,9 +225,10 @@ function createToolGate({ enabled, decide, boxes = DEFAULT_BOXES, isWriteTool, l
       if (!enabled()) return { decision: 'none', source: 'none', elapsedMs: 0 }; // off: silent, no log
       const offered = new Map((Array.isArray(offeredTools) ? offeredTools : []).filter((t) => typeof toolName(t) === 'string').map((t) => [toolName(t), t]));
       if (!offered.size) return done({ decision: 'none', source: 'none' }, { reason: 'no-tools' });
+      if (bias?.noForce) return done({ decision: 'none', source: 'none' }, { reason: 'frame' });
       const ruled = ruleDecision(message, offered);
       if (ruled) return done({ decision: ruled.decision, source: 'rule' }, { rule: ruled.rule });
-      const read = await readout(message, offered);
+      const read = await readout(message, offered, bias);
       if (read.decision) return done({ decision: read.decision, source: 'decision', confidence: read.confidence }, read.extra);
       return done({ decision: 'none', source: 'none', ...(typeof read.confidence === 'number' ? { confidence: read.confidence } : {}) }, { reason: read.reason, ...read.extra });
     } catch (error) {
@@ -244,19 +254,19 @@ const MIN_LABEL_CHARS = 12;
  * with a label of at least MIN_LABEL_CHARS; the service sees the id, so the label is the description
  * alone. "none" is always the last option. `trimmed` counts tools left out.
  */
-function shapeOptions(readTools, limits, boxes = DEFAULT_BOXES) {
+function shapeOptions(readTools, limits, boxes = DEFAULT_BOXES, questionChars = QUESTION.length, preferred = []) {
   const describe = (t) => String(t.function?.description || '').replace(/\s+/g, ' ').trim();
   if (!limits || !Number.isFinite(limits.maxOptions)) {
     const tools = readTools.slice(0, MAX_OPTIONS - 1);
     return { trimmed: readTools.length - tools.length, options: [...tools.map((t) => ({ id: toolName(t), label: `${toolName(t)}: ${describe(t).slice(0, 160)}` })),
       { id: NONE_ID, label: 'none: answer directly, no tool is needed' }] };
   }
-  const known = Object.values(boxes).flat();
+  const known = [...preferred, ...Object.values(boxes).flat()];
   const rank = (t) => { const i = known.indexOf(toolName(t)); return i < 0 ? known.length : i; };
   const ordered = readTools.map((t, i) => [t, i]).sort((a, b) => rank(a[0]) - rank(b[0]) || a[1] - b[1]).map(([t]) => t);
   const none = { id: NONE_ID, label: 'No tool: answer directly' };
   const maxLabel = Math.max(1, Number(limits.maxLabelChars) || 120);
-  const budget = (Number(limits.maxChoiceChars) || Infinity) - QUESTION.length - (none.id.length + none.label.length + 2);
+  const budget = (Number(limits.maxChoiceChars) || Infinity) - questionChars - (none.id.length + none.label.length + 2);
   let tools = ordered.slice(0, Math.max(0, Math.min(MAX_OPTIONS, limits.maxOptions) - 1));
   for (;;) {
     const idChars = tools.reduce((n, t) => n + toolName(t).length + 2, 0);

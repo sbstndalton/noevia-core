@@ -112,7 +112,7 @@ function normalizeReplayHistory(mapped, newMessage) {
 }
 
 function createChatHandler({
-  stepSupervision = null, durableChat = null, fs, path, crypto, fetch, codeTasksFor = () => [], reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, diaryStorageRetry = (send) => send(true), autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, toolGate = null, DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse,
+  stepSupervision = null, durableChat = null, fs, path, crypto, fetch, codeTasksFor = () => [], reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, diaryStorageRetry = (send) => send(true), autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, toolGate = null, chatFramingEnabled = () => false, freeChats = () => [], DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse,
   chatgptOAuth = null, chatgptEnabled = () => false, skillHistory = null,
   // #648: whether a tool is one of noevia's own project file edits, whose target is resolved and
   // shown on the approval card and pinned for the call. By name when not wired (the stricter side).
@@ -407,6 +407,18 @@ function createChatHandler({
     // Unreadable text originals (#586) are not offered to the model at all, not even by name.
     const storedOnly = require('./source-readability.cjs').readable(project?.files).filter(f => f.attachment?.state === 'stored');
     if (storedOnly.length) sysParts.push('These sources are stored only; their contents are NOT available to the model: ' + storedOnly.map(f => f.name).join(', ') + '. Do not claim to know their contents.');
+    // Chat framing (#739): a confirmed frame stored in the user's own lists steers the answer. The
+    // request body's frame is never read. Flag off or no confirmed frame: nothing changes.
+    const steering = require('./chat-frame-steering.cjs');
+    let chatFrame = null;
+    if (!body.compactOnly && spaceId !== 'diary') {
+      try {
+        chatFrame = steering.storedFrame({ enabled: chatFramingEnabled() === true, chatId: typeof body.chatId === 'string' ? body.chatId : null,
+          projectId, project: project ? getProject(project.id) : null, freeChats: freeChats() });
+      } catch { chatFrame = null; } // fail open: an unreadable list means no steering
+    }
+    const frameBlock = steering.frameBlock(chatFrame);
+    if (frameBlock) sysParts.push(frameBlock);
     const sys = sysParts.join('\n\n');
     let wire = sys ? [{ role: 'system', content: sys }, ...msgs] : msgs;
 
@@ -747,7 +759,7 @@ function createChatHandler({
     // Tool gate (features.toolGate, tool-gate.cjs): runs on the tools this request really offers
     // (after policy blocks and tool routing). Off, it returns 'none' without doing anything, and
     // the request below is exactly what it was without the gate. It never picks a write.
-    const gate = toolGate && !body.compactOnly ? await toolGate.evaluate(message, resolved.tools) : null;
+    const gate = toolGate && !body.compactOnly ? await toolGate.evaluate(message, resolved.tools, ...(chatFrame ? [steering.gateBias(chatFrame)] : [])) : null;
     // In-flight revocation (#272): the loaded skills against the project as stored now. Once revoked
     // it stays revoked for the rest of the exchange: no further tool runs and no further model round
     // starts, and a round already streaming is cut off at its next check (at most once a second).
