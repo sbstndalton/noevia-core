@@ -283,6 +283,25 @@ const endpointApproved = createEndpointApproved();
 // The Diary sidecar client: tenant headers, the corpus reads and the connector file bridge (diary.cjs).
 const diary = require('./diary.cjs').createDiary({ fs, path, fetchJson, DIARY_BASE, DIARY_TOKEN, DIARY_TENANT_KEY, DIARY_SOURCE, requestScope, authService, endpointApproved, workspaceStore });
 const { diaryHeaders, diaryFetchJson } = diary;
+// The Diary files client (/api/file, /api/directory, /api/workspace-ops), always as one user and
+// with that user's tenant headers. Shared by the DAV listener and the chat mirror (#741).
+function diaryAsUser(userId, fn) {
+  const workspace = workspaceStore.get(userId);
+  const user = authService.publicUser(authService.db.prepare('SELECT * FROM users WHERE id=?').get(userId));
+  return requestScope.run({ workspace, authn: { user, legacy: false } }, fn);
+}
+const diaryFileCall = (userId, endpoint, method, body) => diaryAsUser(userId, async () => {
+  const r = await diaryFetchJson(`${DIARY_BASE}/api${endpoint}`, { method, body: body === undefined ? undefined : JSON.stringify(body) }, 15000);
+  if (!r.ok) throw Object.assign(Error(r.body?.detail || 'Diary file request failed'), { status: r.status });
+  return r.body;
+});
+const diaryFiles = {
+  list: async (id, path) => (await diaryFileCall(id, '/files?path='+encodeURIComponent(path), 'GET')).files,
+  read: (id, path) => diaryFileCall(id, '/file', 'POST', { path }),
+  write: (id, body) => diaryFileCall(id, '/file', 'PUT', body),
+  mkdir: (id, path) => diaryFileCall(id, '/directory', 'POST', { path }),
+  ops: (id, body) => diaryFileCall(id, '/workspace-ops', 'POST', body),
+};
 const PROJECTS = arrayProxy('projects');
 
 const PROVIDERS = arrayProxy('providers');
@@ -681,6 +700,22 @@ const reasoningTraces = { enabled: (dir) => require('./chat-framing.cjs').readPr
 const chatFramingRoutes = require('./routes/chat-framing.cjs').createChatFramingRoutes({ json, readJson, framing: chatFraming, settings: framingSettings,
   preferences: { get: () => require('./chat-framing.cjs').readPreferences(currentWorkspace().dir), save: (value) => require('./chat-framing.cjs').writePreferences(currentWorkspace().dir, value) },
   workspace: () => { const projects = PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)); return { projects: projects.map((proj) => ({ id: proj.id, name: proj.name })), chats: [...Array.from(FREE_CHATS), ...projects.flatMap((proj) => proj.chats || [])] }; } });
+// #741: "Mirror chats to Diary", per user and off by default. One-way, debounced, through the Diary
+// files client above, as the chat's own user. Runs only with chatFraming on and the Diary add-on on.
+const vaultMirrorLib = require('./chat-vault-mirror.cjs');
+const vaultMirrorAvailable = (userId) => features.enabled('chatFraming') && authService.diaryEnabled(userId);
+const chatVaultMirror = vaultMirrorLib.createChatVaultMirror({
+  enabled: (userId) => vaultMirrorAvailable(userId) && vaultMirrorLib.readPreferences(workspaceStore.get(userId).dir).enabled,
+  lists: (userId) => diaryAsUser(userId, () => ({ freeChats: Array.from(FREE_CHATS), projects: PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)) })),
+  deleted: (userId) => diaryAsUser(userId, () => require('./chat-lists.cjs').readTombstones(currentWorkspace().dir)),
+  readHistory: (userId, chatId) => diaryAsUser(userId, () => readHistory(chatId)),
+  files: diaryFiles,
+  index: { read: (userId) => vaultMirrorLib.readIndex(workspaceStore.get(userId).dir), write: (userId, state) => vaultMirrorLib.writeIndex(workspaceStore.get(userId).dir, state) },
+  log: (...args) => console.warn(...args),
+});
+const chatVaultMirrorRoutes = require('./routes/chat-vault-mirror.cjs').createChatVaultMirrorRoutes({ json, readJson,
+  preferences: { get: () => vaultMirrorLib.readPreferences(currentWorkspace().dir), save: (value) => vaultMirrorLib.writePreferences(currentWorkspace().dir, value) },
+  available: vaultMirrorAvailable, schedule: chatVaultMirror.schedule, audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) });
 // #682: a decision experiment switched on that cannot run (no service, or one without `choice`)
 // says so once at startup; Settings shows the same reason, and the chat path skips it silently.
 for (const f of features.describe()) {
@@ -868,6 +903,10 @@ async function handleRequestScoped(req, res) {
     if (authn && await deviceRoutes.account(req, res, { path: p, authn })) return;
     if (authn && await featureRoutes(req, res, { path: p, authn })) return;
     if (authn && await chatFramingRoutes(req, res, { path: p, authn })) return;
+    if (authn && await chatVaultMirrorRoutes(req, res, { path: p, authn })) return;
+    // #741: a successful change to the user's chats nudges their mirror (debounced; a no-op unless opted in).
+    const mirrorNudge = authn ? vaultMirrorLib.mirrorTrigger(req.method, p) : null;
+    if (mirrorNudge && typeof res.once === 'function') res.once('finish', () => { if (res.statusCode >= 200 && res.statusCode < 300) chatVaultMirror.schedule(authn.user.id, mirrorNudge.chatId); });
     if (authn && await exportRoutes(req, res, { path: p, authn })) return;
     if (authn && await importRoutes(req, res, { path: p, authn })) return;
     if (authn && await accountRoutes(req, res, { path: p, authn })) return;
@@ -947,22 +986,7 @@ if (require.main === module) {
   // actually bite. headersTimeout still guards the slow-header attack this
   // setting otherwise protects against.
   if (davConfig.available) {
-    const call = async (userId, endpoint, method, body) => {
-      const workspace = workspaceStore.get(userId);
-      const user = authService.publicUser(authService.db.prepare('SELECT * FROM users WHERE id=?').get(userId));
-      return requestScope.run({ workspace, authn: { user, legacy: false } }, async () => {
-        const r = await diaryFetchJson(`${DIARY_BASE}/api${endpoint}`, { method, body: body === undefined ? undefined : JSON.stringify(body) }, 15000);
-        if (!r.ok) throw Object.assign(Error(r.body?.detail || 'Diary file request failed'), { status: r.status });
-        return r.body;
-      });
-    };
-    const handler = require('./dav.cjs').createDavHandler({ auth: authService, settings: davSettings, config: davConfig, files: {
-      list: async (id, path) => (await call(id, '/files?path='+encodeURIComponent(path), 'GET')).files,
-      read: (id, path) => call(id, '/file', 'POST', { path }),
-      write: (id, body) => call(id, '/file', 'PUT', body),
-      mkdir: (id, path) => call(id, '/directory', 'POST', { path }),
-      ops: (id, body) => call(id, '/workspace-ops', 'POST', body),
-    } });
+    const handler = require('./dav.cjs').createDavHandler({ auth: authService, settings: davSettings, config: davConfig, files: diaryFiles });
     const davServer = http.createServer((req, res) => { handler(req, res).catch(() => res.destroy()); });
     davServer.requestTimeout = 60000; davServer.headersTimeout = 15000;
     davServer.setTimeout(60000, socket => socket.destroy());
