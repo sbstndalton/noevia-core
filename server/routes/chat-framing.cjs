@@ -1,7 +1,7 @@
 'use strict';
 // Chat framing, phase 1 (#737):
 //   POST /api/chat-framing/suggest        { message, chatId? } -> { frame|null, reason }  signed-in user
-//   GET/PUT /api/chat-framing/preferences { autoAccept }                                signed-in user (#738)
+//   GET/PUT /api/chat-framing/preferences { autoAccept?, keepReasoningTraces? }         signed-in user (#738, #740)
 //   GET/PUT /api/admin/framing-settings   { framingRouterModel, framingReasonerModel }    admin
 // The suggestion is read-only: nothing is saved and nothing reaches the prompt. Only the signed-in
 // user's own projects and chats (the request-scoped workspace) are offered as options.

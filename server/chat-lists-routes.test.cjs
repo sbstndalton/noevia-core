@@ -166,14 +166,17 @@ test('the move refuses unknown, deleted and malformed targets without changing a
   assert.equal((await request('/api/chats/c-stays/move', { method: 'POST', headers: { origin: 'http://localhost', 'content-type': 'application/json' }, body: JSON.stringify({ projectId: null }) })).status >= 401, true, 'signed out (no session, no CSRF) is refused');
 });
 
-test('auto-accept chat frames is a per-user preference, off by default (#738)', async () => {
+test('auto-accept chat frames is a per-user preference, off by default (#738, #740)', async () => {
   const get = async () => JSON.parse((await request('/api/chat-framing/preferences', { headers: mutationHeaders() })).text);
-  assert.deepEqual(await get(), { autoAccept: false });
+  const prefs = (autoAccept, keepReasoningTraces = false) => ({ autoAccept, keepReasoningTraces });
+  assert.deepEqual(await get(), prefs(false));
   const put = (body) => request('/api/chat-framing/preferences', { method: 'PUT', headers: mutationHeaders(), body: JSON.stringify(body) });
   assert.equal((await put({ autoAccept: true })).status, 200);
-  assert.deepEqual(await get(), { autoAccept: true });
+  assert.deepEqual(await get(), prefs(true));
   assert.equal((await put({ autoAccept: 'yes' })).status, 400);
-  assert.deepEqual(await get(), { autoAccept: true }, 'an invalid value changes nothing');
+  assert.deepEqual(await get(), prefs(true), 'an invalid value changes nothing');
+  assert.equal((await put({ keepReasoningTraces: true })).status, 200);
+  assert.deepEqual(await get(), prefs(true, true), 'a partial update keeps the other choice');
   assert.equal((await put({ autoAccept: false })).status, 200);
-  assert.deepEqual(await get(), { autoAccept: false });
+  assert.deepEqual(await get(), prefs(false, true));
 });

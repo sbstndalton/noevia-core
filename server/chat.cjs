@@ -112,7 +112,7 @@ function normalizeReplayHistory(mapped, newMessage) {
 }
 
 function createChatHandler({
-  stepSupervision = null, durableChat = null, fs, path, crypto, fetch, codeTasksFor = () => [], reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, diaryStorageRetry = (send) => send(true), autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, toolGate = null, chatFramingEnabled = () => false, freeChats = () => [], DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse,
+  stepSupervision = null, durableChat = null, fs, path, crypto, fetch, codeTasksFor = () => [], reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, diaryStorageRetry = (send) => send(true), autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, toolGate = null, chatFramingEnabled = () => false, freeChats = () => [], framingReasoner = null, reasoningTraces = null, DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse,
   chatgptOAuth = null, chatgptEnabled = () => false, skillHistory = null,
   // #648: whether a tool is one of noevia's own project file edits, whose target is resolved and
   // shown on the approval card and pinned for the call. By name when not wired (the stricter side).
@@ -831,13 +831,28 @@ function createChatHandler({
       turn?.result(call.id, framed, { failed: false, originalBytes: Buffer.byteLength(result) });
       if (outcome.failed === true || /^ERROR\b/.test(result)) return null;
       noteSkillRead(call.args, result);
+      // #740 (framingReasoner): a confirmed search/action frame may hand the answer model a
+      // validated task packet instead of the raw result. Any failure inside condense() returns
+      // { ok: false } and the raw framed result goes on exactly as before. The packet replaces only
+      // this read's tool-message content: approvals, policy and the journal never see it.
+      let handed = framed;
+      if (framingReasoner && chatFrame) {
+        const condensed = await framingReasoner.condense({ frame: chatFrame, message, tool: call.name,
+          resultText: reduceToolResult(result, { maxChars: TOOL_RESULT_CAP }).text, isWriteTool,
+          answerModel: model, answerIsLocal: provider.id === DEFAULT_PROVIDER_ID, signal: chatSignal.signal });
+        if (condensed?.ok && typeof condensed.rendered === 'string') {
+          handed = condensed.rendered;
+          reasonerTrace = { kind: chatFrame.kind, tool: call.name, packet: condensed.packet, timings: { ...condensed.timings }, handedAt: Date.now() };
+        }
+      }
       const note = 'The following was fetched for you; use it.';
       const hasSystem = roundMessages.some((m) => m.role === 'system');
       const base = hasSystem ? roundMessages.map((m, i) => (i === roundMessages.findIndex((x) => x.role === 'system') && typeof m.content === 'string' ? { ...m, content: `${m.content}\n\n${note}` } : m))
         : [{ role: 'system', content: note }, ...roundMessages];
       return [...base, { role: 'assistant', content: null, tool_calls: [{ id: call.id, type: 'function', function: { name: call.name, arguments: call.args } }] },
-        { role: 'tool', tool_call_id: call.id, content: framed }];
+        { role: 'tool', tool_call_id: call.id, content: handed }];
     }
+    let reasonerTrace = null; // #740: set only when a packet was handed on; traced if the user opted in
     const context = require('./chat-context.cjs');
     const contextId=chatId || spaceId;
     // Which conversation a Drive read belongs to, so an update can be checked against it (#659).
@@ -1433,6 +1448,14 @@ function createChatHandler({
       send({ type: 'delta', text: '\n\nThe model returned reasoning without a final answer. Try again or choose another model.' });
     }
     send({ type: 'telemetry', phase: 'complete', model, timeToFirstToken: exchangeFirstTokenMs === null ? null : exchangeFirstTokenMs / 1000 });
+    if (reasonerTrace && reasoningTraces && chatWorkspace?.dir) {
+      // #740: the person's own opt-in, in their own workspace dir. Packet, answer length, timings only.
+      try { if (reasoningTraces.enabled(chatWorkspace.dir)) {
+        const { handedAt, ...trace } = reasonerTrace;
+        reasoningTraces.append(chatWorkspace.dir, { ...trace, answerChars: roundContent.length, timings: { ...trace.timings, answerMs: Math.max(0, Date.now() - handedAt) } });
+      } }
+      catch { /* a trace never changes the reply */ }
+    }
     send({ type: 'done', model });
     res.end();
   }

@@ -154,12 +154,18 @@ test('framing preferences live in the user directory, default off, and refuse no
   const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
   const { readPreferences, writePreferences } = require('./chat-framing.cjs');
   const one = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-framing-a-')), two = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-framing-b-'));
-  assert.deepEqual(readPreferences(one), { autoAccept: false });
-  assert.deepEqual(writePreferences(one, { autoAccept: true, extra: 'dropped' }), { autoAccept: true });
-  assert.deepEqual(readPreferences(one), { autoAccept: true });
-  assert.deepEqual(readPreferences(two), { autoAccept: false }, 'another user directory is unaffected');
+  const off = { autoAccept: false, keepReasoningTraces: false };
+  assert.deepEqual(readPreferences(one), off);
+  assert.deepEqual(writePreferences(one, { autoAccept: true, extra: 'dropped' }), { autoAccept: true, keepReasoningTraces: false });
+  assert.deepEqual(readPreferences(one), { autoAccept: true, keepReasoningTraces: false });
+  // #740: a partial update keeps the other choice.
+  assert.deepEqual(writePreferences(one, { keepReasoningTraces: true }), { autoAccept: true, keepReasoningTraces: true });
+  assert.deepEqual(readPreferences(two), off, 'another user directory is unaffected');
   assert.throws(() => writePreferences(one, { autoAccept: 1 }), (e) => e.status === 400);
+  assert.throws(() => writePreferences(one, { keepReasoningTraces: 'yes' }), (e) => e.status === 400);
+  assert.throws(() => writePreferences(one, {}), (e) => e.status === 400);
   assert.throws(() => writePreferences(one, null), (e) => e.status === 400);
+  assert.deepEqual(readPreferences(one), { autoAccept: true, keepReasoningTraces: true }, 'a refused write changes nothing');
   fs.writeFileSync(path.join(two, 'chat-framing.json'), '{not json');
-  assert.deepEqual(readPreferences(two), { autoAccept: false }, 'an unreadable file reads as off');
+  assert.deepEqual(readPreferences(two), off, 'an unreadable file reads as off');
 });

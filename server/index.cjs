@@ -98,7 +98,7 @@ const inferenceBudget = require('./inference-budget.cjs').createInferenceBudget(
 const features = require('./features.cjs').createFeatures({ store: require('./features.cjs').settingsStore(authService.db), audit: (action, actor, detail) => authService.audit(action, actor, actor, detail),
   // #555 F4: switching native-app sign-in off is a revoke, not a pause (deviceAuth is built below).
   onChange: (name, enabled, actorId) => { if (name === 'nativeClientAuth' && !enabled) deviceAuth.revokeAll(actorId, 'feature-off'); },
-  availability:{stepSupervision:()=>decisionSettings.unavailable('choice'),toolGate:()=>decisionSettings.unavailable('choice'),systemOneRouting:()=>decisionSettings.unavailable() && require('./system-one-router.cjs').configuration().reason,chatFraming:()=>decisionSettings.unavailable('choice')} });
+  availability:{stepSupervision:()=>decisionSettings.unavailable('choice'),toolGate:()=>decisionSettings.unavailable('choice'),systemOneRouting:()=>decisionSettings.unavailable() && require('./system-one-router.cjs').configuration().reason,chatFraming:()=>decisionSettings.unavailable('choice'),framingReasoner:()=>decisionSettings.unavailable('choice')} });
 const featureRoutes = require('./routes/features.cjs').createFeatureRoutes({ features, json, readJson, decisionSettings });
 const pluginDirectoryRoutes = require('./routes/plugin-directory.cjs').createPluginDirectoryRoutes({ json });
 // Settings → Data: the signed-in user's conversations as a ZIP (routes/export.cjs).
@@ -665,6 +665,19 @@ const chatFraming = require('./chat-framing.cjs').createChatFraming({
     return framingDecisions.decide(request);
   },
 });
+// Chat framing phase 4 (features.framingReasoner, needs chatFraming; #740): the reasoner role
+// condenses a pre-run read into a task packet on the local engine. Skips (raw result) unless the
+// reasoner model is set and fits the inference budget without swapping the answer model out.
+const framingReasoner = require('./framing-reasoner.cjs').createFramingReasoner({
+  enabled: () => features.enabled('framingReasoner') && features.enabled('chatFraming'),
+  model: () => framingSettings.get().framingReasonerModel,
+  complete: require('./framing-reasoner.cjs').createEngineCompletion({ getProvider, providerHeaders, providerId: DEFAULT_PROVIDER_ID, fetch: (...a) => fetch(...a) }),
+  admit: (model, { answerModel, answerIsLocal }) => require('./framing-reasoner.cjs').admitReasoner({ model, answerModel, answerIsLocal,
+    keep: require('./llamacpp-manager.cjs').keepAlongside(), loadRefusal: typeof modelManager.loadRefusal === 'function' ? modelManager.loadRefusal : null }),
+  log: (entry) => recordDecision('chat-reasoner', entry),
+});
+const reasoningTraces = { enabled: (dir) => require('./chat-framing.cjs').readPreferences(dir).keepReasoningTraces === true,
+  append: (dir, entry) => require('./framing-reasoner.cjs').appendTrace(dir, entry) };
 const chatFramingRoutes = require('./routes/chat-framing.cjs').createChatFramingRoutes({ json, readJson, framing: chatFraming, settings: framingSettings,
   preferences: { get: () => require('./chat-framing.cjs').readPreferences(currentWorkspace().dir), save: (value) => require('./chat-framing.cjs').writePreferences(currentWorkspace().dir, value) },
   workspace: () => { const projects = PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)); return { projects: projects.map((proj) => ({ id: proj.id, name: proj.name })), chats: [...Array.from(FREE_CHATS), ...projects.flatMap((proj) => proj.chats || [])] }; } });
@@ -693,6 +706,7 @@ const { handleChat } = require('./chat.cjs').createChatHandler({
   visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, toolGate,
   // #739: a confirmed frame steers the answer; looked up in the signed-in user's own lists only.
   chatFramingEnabled: () => features.enabled('chatFraming'), freeChats: () => Array.from(FREE_CHATS),
+  framingReasoner, reasoningTraces,
   DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall,
   oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse,
   chatgptOAuth, chatgptEnabled: () => features.enabled('chatgptOAuth'),
