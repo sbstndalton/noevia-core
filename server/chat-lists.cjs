@@ -30,11 +30,26 @@ function addTombstone(dir, id) {
   fs.renameSync(tmp, file);
 }
 
+/** Chat framing (#737): a client that does not know about frames (an older tab) sends metas without
+ *  one, which must not erase the stored frame; `frame: null` clears it on purpose. createdAt is set
+ *  once and never moves. An invalid frame is ignored rather than stored. */
+function withKeptFields(current, chat) {
+  const next = { ...chat };
+  if (!('frame' in chat)) { if (current && 'frame' in current) next.frame = current.frame; }
+  else if (chat.frame !== null) {
+    const frame = require('./chat-framing.cjs').normalizeFrame(chat.frame);
+    if (frame) next.frame = frame; else if (current && 'frame' in current) next.frame = current.frame; else delete next.frame;
+  }
+  const created = Number.isFinite(current?.createdAt) ? current.createdAt : Number.isFinite(chat.createdAt) ? chat.createdAt : undefined;
+  if (created === undefined) delete next.createdAt; else next.createdAt = created;
+  return next;
+}
+
 /** Incoming entries replace same-id entries; entries only on the server stay; tombstoned ids never return. */
 function mergeChats(current, incoming, tombstones = new Set()) {
   const byId = new Map();
   for (const chat of current || []) if (chat && typeof chat.id === 'string' && !tombstones.has(chat.id)) byId.set(chat.id, chat);
-  for (const chat of incoming || []) if (chat && typeof chat.id === 'string' && chat.id && !tombstones.has(chat.id)) byId.set(chat.id, chat);
+  for (const chat of incoming || []) if (chat && typeof chat.id === 'string' && chat.id && !tombstones.has(chat.id)) byId.set(chat.id, withKeptFields(byId.get(chat.id), chat));
   return [...byId.values()].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)).slice(0, LIST_CAP);
 }
 

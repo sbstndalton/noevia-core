@@ -98,7 +98,7 @@ const inferenceBudget = require('./inference-budget.cjs').createInferenceBudget(
 const features = require('./features.cjs').createFeatures({ store: require('./features.cjs').settingsStore(authService.db), audit: (action, actor, detail) => authService.audit(action, actor, actor, detail),
   // #555 F4: switching native-app sign-in off is a revoke, not a pause (deviceAuth is built below).
   onChange: (name, enabled, actorId) => { if (name === 'nativeClientAuth' && !enabled) deviceAuth.revokeAll(actorId, 'feature-off'); },
-  availability:{stepSupervision:()=>decisionSettings.unavailable('choice'),toolGate:()=>decisionSettings.unavailable('choice'),systemOneRouting:()=>decisionSettings.unavailable() && require('./system-one-router.cjs').configuration().reason} });
+  availability:{stepSupervision:()=>decisionSettings.unavailable('choice'),toolGate:()=>decisionSettings.unavailable('choice'),systemOneRouting:()=>decisionSettings.unavailable() && require('./system-one-router.cjs').configuration().reason,chatFraming:()=>decisionSettings.unavailable('choice')} });
 const featureRoutes = require('./routes/features.cjs').createFeatureRoutes({ features, json, readJson, decisionSettings });
 const pluginDirectoryRoutes = require('./routes/plugin-directory.cjs').createPluginDirectoryRoutes({ json });
 // Settings → Data: the signed-in user's conversations as a ZIP (routes/export.cjs).
@@ -648,10 +648,29 @@ const toolGate = require('./tool-gate.cjs').createToolGate({
     return toolGateDecisions.decide(request);
   },
 });
+// Chat framing (features.chatFraming, #737): the router role suggests a frame for a new chat through
+// the same decision service; related chats by embedding. Read-only, fails open to no frame.
+const framingSettings = require('./chat-framing.cjs').createFramingSettings({ store: require('./features.cjs').settingsStore(authService.db), audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) });
+let framingBackend = null, framingDecisions = null;
+const chatFraming = require('./chat-framing.cjs').createChatFraming({
+  enabled: () => features.enabled('chatFraming') && !decisionSettings.unavailable('choice'),
+  roles: () => framingSettings.get(),
+  deadlineMs: () => decisionSettings.get().timeoutMs,
+  embed: (texts) => rag.embed(texts),
+  log: (entry) => recordDecision('chat-frame', entry),
+  decide: (request) => {
+    const backend = decisionSettings.backend();
+    if (!backend) throw Error('Decision service unavailable');
+    if (backend !== framingBackend) { framingBackend = backend; framingDecisions = require('./decision/index.cjs').createDecisions({ backends: { configured: backend }, chains: { 'chat.frame.kind': ['configured'], 'chat.frame.project': ['configured'], 'chat.frame.tag': ['configured'] } }); }
+    return framingDecisions.decide(request);
+  },
+});
+const chatFramingRoutes = require('./routes/chat-framing.cjs').createChatFramingRoutes({ json, readJson, framing: chatFraming, settings: framingSettings,
+  workspace: () => { const projects = PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)); return { projects: projects.map((proj) => ({ id: proj.id, name: proj.name })), chats: [...Array.from(FREE_CHATS), ...projects.flatMap((proj) => proj.chats || [])] }; } });
 // #682: a decision experiment switched on that cannot run (no service, or one without `choice`)
 // says so once at startup; Settings shows the same reason, and the chat path skips it silently.
 for (const f of features.describe()) {
-  if (['toolGate', 'stepSupervision', 'systemOneRouting'].includes(f.id) && f.enabled && f.unavailable) console.warn(`[system-one] ${f.id} is on but cannot run: ${f.unavailable}`);
+  if (['toolGate', 'stepSupervision', 'systemOneRouting', 'chatFraming'].includes(f.id) && f.enabled && f.unavailable) console.warn(`[system-one] ${f.id} is on but cannot run: ${f.unavailable}`);
 }
 
 // ── Chat: the loop lives in chat.cjs; everything it needs is handed over here ──
@@ -831,6 +850,7 @@ async function handleRequestScoped(req, res) {
     }
     if (authn && await deviceRoutes.account(req, res, { path: p, authn })) return;
     if (authn && await featureRoutes(req, res, { path: p, authn })) return;
+    if (authn && await chatFramingRoutes(req, res, { path: p, authn })) return;
     if (authn && await exportRoutes(req, res, { path: p, authn })) return;
     if (authn && await importRoutes(req, res, { path: p, authn })) return;
     if (authn && await accountRoutes(req, res, { path: p, authn })) return;
