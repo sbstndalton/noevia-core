@@ -114,3 +114,66 @@ test('a late history save for a deleted chat does not write the transcript back'
   const read = JSON.parse((await request('/api/chats/c-deleted-while-streaming/history', { headers: mutationHeaders() })).text).history;
   assert.deepEqual(read, []);
 });
+
+// Chat framing, phase 2 (#738): what the confirm row writes reaches storage, and the move path.
+const frame = (extra = {}) => ({ projectId: null, kind: 'idea', tags: ['plans'], links: [], confirmed: true, source: 'user', ...extra });
+const freeMeta = async (id) => JSON.parse((await request('/api/freechats', { headers: mutationHeaders() })).text).chats.find((c) => c.id === id);
+
+test('list saves keep a frame and createdAt; frame null clears it and an older tab cannot erase it (#738)', async () => {
+  await post('/api/freechats', { chats: [{ ...meta('c-framed'), createdAt: 500, frame: frame() }] });
+  assert.deepEqual((await freeMeta('c-framed')).frame, frame());
+  assert.equal((await freeMeta('c-framed')).createdAt, 500);
+  await post('/api/freechats', { chats: [{ ...meta('c-framed', 'Older tab'), createdAt: 900 }] });
+  assert.deepEqual((await freeMeta('c-framed')).frame, frame(), 'a meta without a frame keeps the stored one');
+  assert.equal((await freeMeta('c-framed')).createdAt, 500, 'createdAt is set once');
+  await post('/api/freechats', { chats: [{ ...meta('c-framed'), frame: null }] });
+  assert.ok(!(await freeMeta('c-framed')).frame, 'frame: null clears it');
+  const project = JSON.parse((await post('/api/projects', { name: 'Synthetic framed' })).text);
+  await post(`/api/projects/${project.id}/chats`, { chats: [{ ...meta('p-framed'), frame: frame({ projectId: project.id }) }] });
+  const stored = JSON.parse((await request(`/api/projects/${project.id}/chats`, { headers: mutationHeaders() })).text).chats.find((c) => c.id === 'p-framed');
+  assert.deepEqual(stored.frame, frame({ projectId: project.id }));
+});
+
+test('accepting a frame moves the chat into the project with its frame; the transcript stays readable (#738)', async () => {
+  const project = JSON.parse((await post('/api/projects', { name: 'Synthetic destination' })).text);
+  await post('/api/freechats', { chats: [meta('c-moving', 'Moving chat')] });
+  await post('/api/chats/c-moving/history', { history: [{ role: 'user', content: 'synthetic first message' }] });
+  const moved = await post('/api/chats/c-moving/move', { projectId: project.id, frame: frame({ projectId: project.id }) });
+  assert.equal(moved.status, 200);
+  assert.deepEqual(JSON.parse(moved.text), { ok: true, from: null, projectId: project.id });
+  assert.ok(!(await freeMeta('c-moving')), 'gone from the free list');
+  const inProject = JSON.parse((await request(`/api/projects/${project.id}/chats`, { headers: mutationHeaders() })).text).chats.find((c) => c.id === 'c-moving');
+  assert.equal(inProject.title, 'Moving chat');
+  assert.deepEqual(inProject.frame, frame({ projectId: project.id }));
+  const history = JSON.parse((await request('/api/chats/c-moving/history', { headers: mutationHeaders() })).text).history;
+  assert.deepEqual(history, [{ role: 'user', content: 'synthetic first message' }]);
+  // Moving it back out, and accepting in place (same list), both work without a tombstone.
+  assert.equal((await post('/api/chats/c-moving/move', { projectId: null })).status, 200);
+  assert.ok(await freeMeta('c-moving'));
+  assert.equal((await post('/api/chats/c-moving/move', { projectId: null, frame: frame() })).status, 200);
+  assert.deepEqual((await freeMeta('c-moving')).frame, frame());
+});
+
+test('the move refuses unknown, deleted and malformed targets without changing anything (#738)', async () => {
+  await post('/api/freechats', { chats: [meta('c-stays')] });
+  assert.equal((await post('/api/chats/c-stays/move', { projectId: 'no-such-project' })).status, 404);
+  assert.ok(await freeMeta('c-stays'), 'still in the free list after a refused move');
+  assert.equal((await post('/api/chats/no-such-chat/move', { projectId: null })).status, 404);
+  assert.equal((await post('/api/chats/c-stays/move', { projectId: 7 })).status, 400);
+  assert.equal((await post('/api/chats/c-stays/move', {})).status, 400);
+  assert.equal((await request('/api/freechats/c-stays', { method: 'DELETE', headers: mutationHeaders() })).status, 200);
+  assert.equal((await post('/api/chats/c-stays/move', { projectId: null })).status, 404, 'a deleted chat cannot be moved back to life');
+  assert.equal((await request('/api/chats/c-stays/move', { method: 'POST', headers: { origin: 'http://localhost', 'content-type': 'application/json' }, body: JSON.stringify({ projectId: null }) })).status >= 401, true, 'signed out (no session, no CSRF) is refused');
+});
+
+test('auto-accept chat frames is a per-user preference, off by default (#738)', async () => {
+  const get = async () => JSON.parse((await request('/api/chat-framing/preferences', { headers: mutationHeaders() })).text);
+  assert.deepEqual(await get(), { autoAccept: false });
+  const put = (body) => request('/api/chat-framing/preferences', { method: 'PUT', headers: mutationHeaders(), body: JSON.stringify(body) });
+  assert.equal((await put({ autoAccept: true })).status, 200);
+  assert.deepEqual(await get(), { autoAccept: true });
+  assert.equal((await put({ autoAccept: 'yes' })).status, 400);
+  assert.deepEqual(await get(), { autoAccept: true }, 'an invalid value changes nothing');
+  assert.equal((await put({ autoAccept: false })).status, 200);
+  assert.deepEqual(await get(), { autoAccept: false });
+});

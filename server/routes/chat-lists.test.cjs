@@ -134,3 +134,37 @@ test('an admin free chat keeps its Cowork mode; anything else reads back as Chat
   assert.equal('mode' in f.freeChats.find((c) => c.id === 'fx'), false);
   assert.equal('mode' in f.freeChats.find((c) => c.id === 'fy'), false);
 });
+
+test('POST /api/chats/:id/move validates, scopes to the caller and maps the store outcome (#738)', async () => {
+  const f = fixture();
+  const moves = [];
+  f.store.moveChat = (id, projectId, patch, allowed) => {
+    moves.push({ id, projectId, patch, internalAllowed: allowed({ id: 'diary-extras' }), p1Allowed: allowed({ id: 'p1' }) });
+    return id === 'f1' ? { status: 200, from: null } : { status: 404 };
+  };
+  // The routes destructure the store once, so build them again with the move in place.
+  const routes = createChatListRoutes({
+    json: (res, status, body) => { f.sent.push({ status, body }); },
+    readBody: async (req) => { let s = ''; for await (const c of req) s += c; return s; },
+    currentWorkspace: () => ({ dir: f.dir }), PROJECTS: f.projects, FREE_CHATS: f.freeChats,
+    diaryExtras: { internalProject: (p) => p.id === 'diary-extras' }, crypto, STORED_HISTORY_BYTES: 200, STORED_HISTORY_CAP: 3,
+    chatLists: () => ({ freeChats: [], projects: [] }), removeChat() {}, store: f.store,
+  });
+  const call = (method, p, body) => { const req = Readable.from(body === undefined ? [] : [Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))]); req.method = method; return routes(req, {}, { path: p, authn: { user: { id: 'u1', role: 'member' } } }); };
+  const frame = { kind: 'idea', tags: [], links: [], confirmed: true, source: 'user' };
+  assert.equal(await call('POST', '/api/chats/f1/move', { projectId: 'p1', frame }), true);
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true, from: null, projectId: 'p1' } });
+  assert.deepEqual(moves.pop(), { id: 'f1', projectId: 'p1', patch: { frame }, internalAllowed: false, p1Allowed: true });
+  await call('POST', '/api/chats/f1/move', { projectId: null });
+  f.sent.pop();
+  assert.deepEqual(moves.pop().patch, {}, 'no frame in the body leaves the frame alone');
+  await call('POST', '/api/chats/zz/move', { projectId: null });
+  assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'no such chat or project' } });
+  moves.length = 0;
+  for (const bad of [{}, { projectId: 3 }, [], 'not json']) {
+    await call('POST', '/api/chats/f1/move', bad);
+    assert.equal(f.sent.pop().status, 400);
+  }
+  assert.equal(moves.length, 0, 'malformed bodies never reach the store');
+  assert.equal(await call('GET', '/api/chats/f1/move'), false, 'other methods fall through');
+});

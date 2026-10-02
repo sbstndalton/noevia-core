@@ -6,6 +6,8 @@
 //   GET/POST /api/freechats                the free-chat metas, merged against tombstones
 //   DELETE /api/freechats/:id
 //   GET/POST /api/chats/:id/history        the transcript, with a revision for optimistic saves
+//   POST /api/chats/:id/move               { projectId: string|null, frame? } moves the meta between
+//                                          the caller's own lists (#738); the transcript stays put
 //
 // Returns true when it handled the request. Auth and CSRF run before routes are mounted.
 // Blocks keep their original order and an unmatched method falls through as it did inline.
@@ -25,10 +27,10 @@ const PASS = Symbol('unhandled');
  * @param {number} deps.STORED_HISTORY_CAP
  * @param {() => { freeChats:object[], projects:object[] }} deps.chatLists   what the retention sweep may delete from
  * @param {(chat:{ projectId?:string, id:string }) => boolean} deps.removeChat
- * @param {object} deps.store   projects.cjs: sanitizeChats, saveFreeChats, deleteFreeChat, readHistory, writeHistory
+ * @param {object} deps.store   projects.cjs: sanitizeChats, saveFreeChats, deleteFreeChat, readHistory, writeHistory, moveChat
  */
 function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE_CHATS, diaryExtras, crypto, STORED_HISTORY_BYTES, STORED_HISTORY_CAP, chatLists, removeChat, store }) {
-  const { sanitizeChats, saveFreeChats, deleteFreeChat, readHistory, writeHistory } = store;
+  const { sanitizeChats, saveFreeChats, deleteFreeChat, readHistory, writeHistory, moveChat } = store;
 
   // Delete-old-chats sweep (chat-retention.cjs): runs as the user's workspace loads, at most hourly.
   function sweepRetention() {
@@ -76,6 +78,10 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
               preview: String(c.preview || '').slice(0, 200),
               pinned: c.pinned === true,
               archived: c.archived === true,
+              // Chat framing (#737/#738): the frame (null clears it) and the first-saved time; the
+              // merge (chat-lists.cjs) validates the frame and keeps the first createdAt.
+              ...('frame' in c ? { frame: c.frame } : {}),
+              ...(Number.isFinite(c.createdAt) ? { createdAt: c.createdAt } : {}),
               // The session's harness (#236); absent means Chat, as for every older chat. Only an
               // admin may run Cowork, so a member's saved 'cowork' is coerced to Chat rather than
               // planting a mode that would fail every turn.
@@ -95,6 +101,17 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
     if (freeDel && req.method === 'DELETE') {
       const removed = deleteFreeChat(decodeURIComponent(freeDel[1]));
       return json(res, removed ? 200 : 404, removed ? { ok: true } : { error: 'no such chat' });
+    }
+
+    const moveMatch = p.match(/^\/api\/chats\/([^/]+)\/move$/);
+    if (moveMatch && req.method === 'POST' && moveChat) {
+      let body;
+      try { body = JSON.parse(await readBody(req)); } catch { return json(res, 400, { error: 'invalid JSON' }); }
+      if (!body || typeof body !== 'object' || Array.isArray(body) || !(body.projectId === null || typeof body.projectId === 'string')) return json(res, 400, { error: 'projectId (or null) required' });
+      const patch = 'frame' in body ? { frame: body.frame } : {};
+      // Only the caller's own lists (the request-scoped workspace); Diary's internal project is not a destination.
+      const moved = moveChat(decodeURIComponent(moveMatch[1]), body.projectId, patch, (proj) => !diaryExtras.internalProject(proj));
+      return json(res, moved.status, moved.status === 200 ? { ok: true, from: moved.from, projectId: body.projectId } : { error: 'no such chat or project' });
     }
 
     const historyMatch = p.match(/^\/api\/chats\/([^/]+)\/history$/);

@@ -666,6 +666,7 @@ const chatFraming = require('./chat-framing.cjs').createChatFraming({
   },
 });
 const chatFramingRoutes = require('./routes/chat-framing.cjs').createChatFramingRoutes({ json, readJson, framing: chatFraming, settings: framingSettings,
+  preferences: { get: () => require('./chat-framing.cjs').readPreferences(currentWorkspace().dir), save: (value) => require('./chat-framing.cjs').writePreferences(currentWorkspace().dir, value) },
   workspace: () => { const projects = PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)); return { projects: projects.map((proj) => ({ id: proj.id, name: proj.name })), chats: [...Array.from(FREE_CHATS), ...projects.flatMap((proj) => proj.chats || [])] }; } });
 // #682: a decision experiment switched on that cannot run (no service, or one without `choice`)
 // says so once at startup; Settings shows the same reason, and the chat path skips it silently.

@@ -149,3 +149,17 @@ test('framing settings: model-agnostic role ids, validated and audited', () => {
   assert.equal(audits.length, 1);
   assert.equal(createFramingSettings({ store: { get: (k) => data.get(k), set() {} } }).get().framingRouterModel, 'router-a.gguf');
 });
+
+test('framing preferences live in the user directory, default off, and refuse non-booleans (#738)', () => {
+  const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
+  const { readPreferences, writePreferences } = require('./chat-framing.cjs');
+  const one = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-framing-a-')), two = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-framing-b-'));
+  assert.deepEqual(readPreferences(one), { autoAccept: false });
+  assert.deepEqual(writePreferences(one, { autoAccept: true, extra: 'dropped' }), { autoAccept: true });
+  assert.deepEqual(readPreferences(one), { autoAccept: true });
+  assert.deepEqual(readPreferences(two), { autoAccept: false }, 'another user directory is unaffected');
+  assert.throws(() => writePreferences(one, { autoAccept: 1 }), (e) => e.status === 400);
+  assert.throws(() => writePreferences(one, null), (e) => e.status === 400);
+  fs.writeFileSync(path.join(two, 'chat-framing.json'), '{not json');
+  assert.deepEqual(readPreferences(two), { autoAccept: false }, 'an unreadable file reads as off');
+});

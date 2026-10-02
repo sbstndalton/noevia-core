@@ -275,3 +275,43 @@ test('deleting a chat or a project removes its context meter, tenant-scoped (#55
     fs.rmSync(other, { recursive: true, force: true });
   }
 });
+
+test('moveChat takes a meta out of one list and into another without a tombstone (#738)', async () => {
+  const f = fixture();
+  const a = await f.store.createProject({ name: 'A' }), b = await f.store.createProject({ name: 'B' });
+  f.workspace.freeChats.push({ id: 'f1', title: 'Free one', updatedAt: 1 }, { id: 'f2', title: 'Other', updatedAt: 2 });
+  const frame = { projectId: a.id, kind: 'search', tags: ['#trip plans'], links: ['f2'], confirmed: true, source: 'user' };
+  assert.deepEqual(f.store.moveChat('f1', a.id, { frame }), { status: 200, from: null });
+  assert.deepEqual(f.workspace.freeChats.map((c) => c.id), ['f2'], 'only the moved chat left the free list');
+  assert.equal(a.chats[0].id, 'f1');
+  assert.equal(a.chats[0].title, 'Free one');
+  assert.deepEqual(a.chats[0].frame, { ...frame, tags: ['trip-plans'] }, 'the frame is normalized as a list save would');
+  assert.deepEqual(f.store.moveChat('f1', b.id), { status: 200, from: a.id }, 'project to project');
+  assert.deepEqual(a.chats, []);
+  assert.equal(b.chats[0].frame.kind, 'search', 'a move without a frame keeps the stored one');
+  assert.deepEqual(f.store.moveChat('f1', b.id, { frame: { ...frame, kind: 'idea' } }), { status: 200, from: b.id }, 'in place');
+  assert.equal(b.chats.length, 1);
+  assert.equal(b.chats[0].frame.kind, 'idea');
+  assert.ok(!require('./chat-lists.cjs').readTombstones(f.dir).has('f1'), 'never tombstoned');
+});
+
+test('moveChat refuses unknown chats and projects, deleted chats and disallowed projects, changing nothing (#738)', async () => {
+  const f = fixture();
+  const a = await f.store.createProject({ name: 'A' });
+  const internal = await f.store.createProject({ name: 'Internal' });
+  internal.chats = [{ id: 'i1', title: 'inside' }];
+  f.workspace.freeChats.push({ id: 'f1', title: 'Free', updatedAt: 1 });
+  const before = f.workspace.saved;
+  assert.equal(f.store.moveChat('f1', 'missing').status, 404);
+  assert.equal(f.store.moveChat('nope', a.id).status, 404);
+  assert.equal(f.store.moveChat('', null).status, 404);
+  const allowed = (p) => p.id !== internal.id;
+  assert.equal(f.store.moveChat('f1', internal.id, {}, allowed).status, 404, 'not into a project the caller may not use');
+  assert.equal(f.store.moveChat('i1', a.id, {}, allowed).status, 404, 'not out of one either');
+  assert.deepEqual(f.workspace.freeChats.map((c) => c.id), ['f1']);
+  assert.deepEqual(internal.chats.map((c) => c.id), ['i1']);
+  assert.equal(f.workspace.saved, before, 'nothing was saved');
+  assert.equal(f.store.deleteFreeChat('f1'), true);
+  f.workspace.freeChats.push({ id: 'f1', title: 'stale copy' });
+  assert.equal(f.store.moveChat('f1', a.id).status, 404, 'a tombstoned chat is never moved back to life');
+});

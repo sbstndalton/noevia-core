@@ -410,3 +410,16 @@ test('a project id from another tenant 404s on the upload path: getProject reads
     scope.run({ user: 'alice' }, () => assert.equal(store.getProject('proj-bob'), null));
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+test('project chat saves pass the frame (null too) and createdAt on to the merge (#738)', async () => {
+  const f = fixture({ projects: [{ id: 'p1', chats: [] }] });
+  const frame = { projectId: 'p1', kind: 'code', tags: ['x'], links: [], confirmed: true, source: 'user' };
+  await f.call('POST', '/api/projects/p1/chats', { chats: [{ id: 'a', frame, createdAt: 5 }, { id: 'b', frame: null }, { id: 'c', createdAt: 'soon' }] });
+  assert.equal(f.sent.pop().status, 200);
+  const [a, b, c] = f.store.savedChats[1];
+  assert.deepEqual(a.frame, frame);
+  assert.equal(a.createdAt, 5);
+  assert.equal(b.frame, null, 'null reaches the merge, which clears the stored frame');
+  assert.equal('frame' in c, false, 'no frame in the body: the merge keeps the stored one');
+  assert.equal('createdAt' in c, false);
+});

@@ -1,6 +1,7 @@
 'use strict';
 // Chat framing, phase 1 (#737):
 //   POST /api/chat-framing/suggest        { message, chatId? } -> { frame|null, reason }  signed-in user
+//   GET/PUT /api/chat-framing/preferences { autoAccept }                                signed-in user (#738)
 //   GET/PUT /api/admin/framing-settings   { framingRouterModel, framingReasonerModel }    admin
 // The suggestion is read-only: nothing is saved and nothing reaches the prompt. Only the signed-in
 // user's own projects and chats (the request-scoped workspace) are offered as options.
@@ -11,8 +12,9 @@
  * @param {{ suggest: Function }} deps.framing
  * @param {{ get: Function, save: Function }} deps.settings
  * @param {() => { projects: object[], chats: object[] }} deps.workspace  the current user's own lists
+ * @param {{ get: () => object, save: (value:object) => object }} [deps.preferences]  the current user's own framing preferences
  */
-function createChatFramingRoutes({ json, readJson, framing, settings, workspace }) {
+function createChatFramingRoutes({ json, readJson, framing, settings, workspace, preferences }) {
   return async function chatFramingRoutes(req, res, { path, authn }) {
     if (path === '/api/chat-framing/suggest') {
       if (!authn) return json(res, 401, { error: 'Sign in required' }), true;
@@ -25,6 +27,13 @@ function createChatFramingRoutes({ json, readJson, framing, settings, workspace 
       const result = await framing.suggest({ message: body.message.slice(0, 4000), chatId: typeof body.chatId === 'string' ? body.chatId : null,
         projects: lists.projects, chats: lists.chats });
       return json(res, 200, result), true;
+    }
+    if (path === '/api/chat-framing/preferences' && preferences) {
+      if (!authn) return json(res, 401, { error: 'Sign in required' }), true;
+      if (!['GET', 'PUT'].includes(req.method)) return json(res, 405, { error: 'method not allowed' }), true;
+      try {
+        return json(res, 200, req.method === 'GET' ? preferences.get() : preferences.save(await readJson(req))), true;
+      } catch (error) { return json(res, error.status || 400, { error: error.status ? error.message : 'Invalid framing preferences' }), true; }
     }
     if (path === '/api/admin/framing-settings') {
       if (!authn || authn.user.role !== 'admin') return json(res, 403, { error: 'Administrator required' }), true;

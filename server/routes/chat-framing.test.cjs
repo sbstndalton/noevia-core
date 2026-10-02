@@ -44,3 +44,29 @@ test('admin settings are admin-only; other paths fall through', async () => {
   assert.deepEqual(saved, [{ framingRouterModel: 'r' }]);
   assert.equal(await routes({ method: 'GET' }, {}, { path: '/api/other', authn: user }), false);
 });
+
+test('framing preferences: signed-in only, GET and PUT, invalid values refused (#738)', async () => {
+  let stored = { autoAccept: false };
+  const sent = [];
+  let body = {};
+  const routes = createChatFramingRoutes({
+    json: (res, status, payload) => { sent.push({ status, payload }); },
+    readJson: async () => body,
+    framing: { suggest: async () => ({ frame: null }) }, settings: { get: () => ({}), save: (v) => v }, workspace: () => ({ projects: [], chats: [] }),
+    preferences: { get: () => stored, save: (v) => { if (typeof v?.autoAccept !== 'boolean') throw Object.assign(Error('autoAccept must be true or false'), { status: 400 }); stored = { autoAccept: v.autoAccept }; return stored; } },
+  });
+  const call = (method, authn = user) => routes({ method }, {}, { path: '/api/chat-framing/preferences', authn });
+  assert.equal(await call('GET', null), true);
+  assert.equal(sent.pop().status, 401);
+  await call('GET');
+  assert.deepEqual(sent.pop(), { status: 200, payload: { autoAccept: false } });
+  body = { autoAccept: true };
+  await call('PUT');
+  assert.deepEqual(sent.pop(), { status: 200, payload: { autoAccept: true } });
+  body = { autoAccept: 'yes' };
+  await call('PUT');
+  assert.deepEqual(sent.pop(), { status: 400, payload: { error: 'autoAccept must be true or false' } });
+  await call('DELETE');
+  assert.equal(sent.pop().status, 405);
+  assert.deepEqual(stored, { autoAccept: true });
+});

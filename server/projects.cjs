@@ -118,6 +118,34 @@ function createProjectStore({
     }
   }
 
+  // Moves one chat between lists (#738): free <-> project, or project -> project. The chat-list
+  // POSTs merge (an entry only on the server stays), so a list save can never take a chat OUT of
+  // a list, and a DELETE tombstones the id, so delete-then-add would lose it. This is the one
+  // place a meta leaves a list without a tombstone. The transcript is keyed by chat id and does
+  // not move. `patch` may carry a frame (or null), normalized by the same merge as a list save.
+  // `allowed(project)` refuses projects the caller may not use (Diary's internal one). Returns
+  // { status, from } — 200 moved (or already there, patch applied), 404 unknown chat or project.
+  function moveChat(chatId, toProjectId, patch = {}, allowed = () => true) {
+    const id = typeof chatId === 'string' ? chatId : '';
+    if (!id) return { status: 404 };
+    const lists = require('./chat-lists.cjs');
+    if (lists.readTombstones(currentWorkspace().dir).has(id)) return { status: 404 };
+    const target = toProjectId === null ? null : getProject(toProjectId);
+    if (toProjectId !== null && (!target || !allowed(target))) return { status: 404 };
+    const owner = PROJECTS.find((p) => Array.isArray(p.chats) && p.chats.some((c) => c && c.id === id)) || null;
+    const meta = owner ? owner.chats.find((c) => c && c.id === id) : FREE_CHATS.find((c) => c && c.id === id);
+    if (!meta || (owner && !allowed(owner))) return { status: 404 };
+    const from = owner ? owner.id : null;
+    const next = { ...meta, ...('frame' in patch ? { frame: patch.frame } : {}) };
+    if (owner) owner.chats = owner.chats.filter((c) => !(c && c.id === id));
+    else FREE_CHATS.splice(0, FREE_CHATS.length, ...FREE_CHATS.filter((c) => !(c && c.id === id)));
+    if (target) target.chats = lists.mergeChats(target.chats || [], [next]);
+    else FREE_CHATS.splice(0, FREE_CHATS.length, ...lists.mergeChats(Array.from(FREE_CHATS), [next]));
+    if (owner || target) saveProjects(PROJECTS);
+    if (!owner || !target) saveFreeChats(FREE_CHATS);
+    return { status: 200, from };
+  }
+
   // Free (non-project) chat metas — persisted server-side so recent chats
   // survive across browsers/devices (localStorage was the only home before).
   function saveFreeChats(list) {
@@ -537,7 +565,7 @@ function createProjectStore({
   }
 
   return {
-    saveProjects, getProject, sanitizeChats, loadChats, saveChats, deleteChat, purgeProjectChats, saveFreeChats, deleteFreeChat, createProject,
+    saveProjects, getProject, sanitizeChats, loadChats, saveChats, deleteChat, moveChat, purgeProjectChats, saveFreeChats, deleteFreeChat, createProject,
     historyPath, readHistory, writeHistory,
     ownsFile, ensureProjectFolder, withSourceLock, pruneDocuments, writeProjectTextFile, sweepDeletedProject, indexSource,
   };
