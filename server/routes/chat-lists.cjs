@@ -88,7 +88,7 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
               ...(c.mode === 'cowork' && authn?.user?.role === 'admin' ? { mode: 'cowork' } : {}),
             }));
           const lists = require('../chat-lists.cjs');
-          FREE_CHATS.splice(0, FREE_CHATS.length, ...lists.mergeChats(Array.from(FREE_CHATS), nextFreeChats, lists.readTombstones(currentWorkspace().dir)));
+          FREE_CHATS.splice(0, FREE_CHATS.length, ...lists.mergeChats(Array.from(FREE_CHATS), nextFreeChats, lists.readTombstones(currentWorkspace().dir), store.chatIdsElsewhere ? store.chatIdsElsewhere(null) : new Set()));
           saveFreeChats(FREE_CHATS);
           return json(res, 200, { ok: true });
         } catch {
@@ -108,7 +108,13 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
       let body;
       try { body = JSON.parse(await readBody(req)); } catch { return json(res, 400, { error: 'invalid JSON' }); }
       if (!body || typeof body !== 'object' || Array.isArray(body) || !(body.projectId === null || typeof body.projectId === 'string')) return json(res, 400, { error: 'projectId (or null) required' });
-      const patch = 'frame' in body ? { frame: body.frame } : {};
+      let patch = {};
+      if ('frame' in body) {
+        // An invalid frame is refused outright (#759); the merge would otherwise drop the stored one.
+        // The store's merge normalizes it again, so the body's frame is passed on as before.
+        if (body.frame !== null && !require('../chat-framing.cjs').normalizeFrame(body.frame)) return json(res, 400, { error: 'invalid frame' });
+        patch = { frame: body.frame };
+      }
       // Only the caller's own lists (the request-scoped workspace); Diary's internal project is not a destination.
       const moved = moveChat(decodeURIComponent(moveMatch[1]), body.projectId, patch, (proj) => !diaryExtras.internalProject(proj));
       return json(res, moved.status, moved.status === 200 ? { ok: true, from: moved.from, projectId: body.projectId } : { error: 'no such chat or project' });

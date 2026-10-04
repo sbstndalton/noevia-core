@@ -166,6 +166,30 @@ test('the move refuses unknown, deleted and malformed targets without changing a
   assert.equal((await request('/api/chats/c-stays/move', { method: 'POST', headers: { origin: 'http://localhost', 'content-type': 'application/json' }, body: JSON.stringify({ projectId: null }) })).status >= 401, true, 'signed out (no session, no CSRF) is refused');
 });
 
+test('a stale whole-list save never copies a moved chat back into its old list (#755)', async () => {
+  const project = JSON.parse((await post('/api/projects', { name: 'Synthetic stale target' })).text);
+  const projectIds = async () => JSON.parse((await request(`/api/projects/${project.id}/chats`, { headers: mutationHeaders() })).text).chats.map((c) => c.id);
+  await post('/api/freechats', { chats: [meta('c-stale-f1')] });
+  assert.equal((await post('/api/chats/c-stale-f1/move', { projectId: project.id })).status, 200);
+  assert.equal((await post('/api/freechats', { chats: [meta('c-stale-f1', 'stale tab', 5000), meta('c-stale-other')] })).status, 200);
+  assert.ok(!(await freeChats()).includes('c-stale-f1'), 'the free list does not get the moved chat back');
+  assert.ok((await freeChats()).includes('c-stale-other'), 'the rest of the stale list still saves');
+  assert.deepEqual((await projectIds()).filter((id) => id === 'c-stale-f1'), ['c-stale-f1'], 'the project holds it exactly once');
+  // Reverse: moved back out to the free list, a stale project-list save must not re-add it.
+  assert.equal((await post('/api/chats/c-stale-f1/move', { projectId: null })).status, 200);
+  assert.equal((await post(`/api/projects/${project.id}/chats`, { chats: [meta('c-stale-f1', 'stale tab', 6000)] })).status, 200);
+  assert.ok(!(await projectIds()).includes('c-stale-f1'), 'the project list does not get it back');
+  assert.ok((await freeChats()).includes('c-stale-f1'), 'still in the free list');
+});
+
+test('a move with an invalid frame is refused and keeps the stored frame (#759)', async () => {
+  await post('/api/freechats', { chats: [{ ...meta('c-bad-frame'), frame: frame() }] });
+  const project = JSON.parse((await post('/api/projects', { name: 'Synthetic bad frame' })).text);
+  const res = await post('/api/chats/c-bad-frame/move', { projectId: project.id, frame: { kind: 'bogus' } });
+  assert.equal(res.status, 400);
+  assert.deepEqual((await freeMeta('c-bad-frame')).frame, frame(), 'still free, frame intact');
+});
+
 test('auto-accept chat frames is a per-user preference, off by default (#738, #740)', async () => {
   const get = async () => JSON.parse((await request('/api/chat-framing/preferences', { headers: mutationHeaders() })).text);
   const prefs = (autoAccept, keepReasoningTraces = false) => ({ autoAccept, keepReasoningTraces });

@@ -276,6 +276,35 @@ test('deleting a chat or a project removes its context meter, tenant-scoped (#55
   }
 });
 
+test('every delete path removes the chat brain, best effort (#756)', async () => {
+  const brain = require('./chat-brain.cjs');
+  const f = fixture();
+  const file = (id) => path.join(f.dir, brain.BRAIN_DIR, `${require('node:crypto').createHash('sha256').update(id).digest('hex')}.json`);
+  const write = (id) => { fs.mkdirSync(path.dirname(file(id)), { recursive: true }); fs.writeFileSync(file(id), '{}'); };
+  const project = await f.store.createProject({ name: 'Brains' });
+  project.chats = [{ id: 'b-proj' }, { id: 'b-purge' }];
+  f.workspace.freeChats.push({ id: 'b-free' });
+  for (const id of ['b-proj', 'b-purge', 'b-free']) write(id);
+  assert.equal(f.store.deleteChat(project.id, 'b-proj'), true);
+  assert.equal(fs.existsSync(file('b-proj')), false);
+  assert.equal(f.store.deleteFreeChat('b-free'), true);
+  assert.equal(fs.existsSync(file('b-free')), false);
+  f.store.purgeProjectChats(project);
+  assert.equal(fs.existsSync(file('b-purge')), false);
+  project.chats = [{ id: 'b-none' }];
+  assert.equal(f.store.deleteChat(project.id, 'b-none'), true, 'no brain file is fine');
+});
+
+test('saveChats skips ids held by another list of the workspace (#755)', async () => {
+  const f = fixture();
+  const a = await f.store.createProject({ name: 'A' }), b = await f.store.createProject({ name: 'B' });
+  b.chats = [{ id: 'in-b', updatedAt: 1 }];
+  f.workspace.freeChats.push({ id: 'free-1', updatedAt: 1 });
+  f.store.saveChats(a.id, [{ id: 'in-b' }, { id: 'free-1' }, { id: 'new-a' }]);
+  assert.deepEqual(a.chats.map((c) => c.id), ['new-a']);
+  assert.deepEqual([...f.store.chatIdsElsewhere(null)].sort(), ['in-b', 'new-a']);
+});
+
 test('moveChat takes a meta out of one list and into another without a tombstone (#738)', async () => {
   const f = fixture();
   const a = await f.store.createProject({ name: 'A' }), b = await f.store.createProject({ name: 'B' });

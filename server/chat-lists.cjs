@@ -45,11 +45,13 @@ function withKeptFields(current, chat) {
   return next;
 }
 
-/** Incoming entries replace same-id entries; entries only on the server stay; tombstoned ids never return. */
-function mergeChats(current, incoming, tombstones = new Set()) {
+/** Incoming entries replace same-id entries; entries only on the server stay; tombstoned ids never return.
+ *  `elsewhere` (#755): ids that live in another list of the workspace; a stale whole-list save
+ *  must not copy a moved chat back into its old list, so incoming entries with those ids are skipped. */
+function mergeChats(current, incoming, tombstones = new Set(), elsewhere = new Set()) {
   const byId = new Map();
   for (const chat of current || []) if (chat && typeof chat.id === 'string' && !tombstones.has(chat.id)) byId.set(chat.id, chat);
-  for (const chat of incoming || []) if (chat && typeof chat.id === 'string' && chat.id && !tombstones.has(chat.id)) byId.set(chat.id, withKeptFields(byId.get(chat.id), chat));
+  for (const chat of incoming || []) if (chat && typeof chat.id === 'string' && chat.id && !tombstones.has(chat.id) && !elsewhere.has(chat.id)) byId.set(chat.id, withKeptFields(byId.get(chat.id), chat));
   return [...byId.values()].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)).slice(0, LIST_CAP);
 }
 

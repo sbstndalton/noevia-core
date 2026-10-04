@@ -85,8 +85,23 @@ function createProjectStore({
     const p = getProject(projectId);
     if (!p) return;
     const lists = require('./chat-lists.cjs');
-    p.chats = lists.mergeChats(p.chats, chats, lists.readTombstones(currentWorkspace().dir));
+    p.chats = lists.mergeChats(p.chats, chats, lists.readTombstones(currentWorkspace().dir), chatIdsElsewhere(p.id));
     saveProjects(PROJECTS);
+  }
+
+  // Chat ids held by any list of this workspace other than `listId` (a project id, or null for
+  // the free list). A whole-list save skips these, so a stale tab cannot resurrect a moved chat
+  // into its old list (#755). Request-scoped: PROJECTS and FREE_CHATS are the caller's own.
+  function chatIdsElsewhere(listId) {
+    const ids = new Set();
+    if (listId !== null) for (const c of FREE_CHATS) if (c && typeof c.id === 'string') ids.add(c.id);
+    for (const proj of PROJECTS) if (proj && proj.id !== listId) for (const c of proj.chats || []) if (c && typeof c.id === 'string') ids.add(c.id);
+    return ids;
+  }
+
+  // Best effort (#756): a deleted chat's brain note goes with it; never throws into the delete.
+  function removeChatBrain(dir, chatId) {
+    try { require('./chat-brain.cjs').removeBrain(dir, chatId); } catch { /* best effort */ }
   }
 
   function deleteChat(projectId, chatId) {
@@ -97,6 +112,7 @@ function createProjectStore({
     if (p.chats.length === before) return false;
     require('./chat-lists.cjs').addTombstone(currentWorkspace().dir, chatId);
     saveProjects(PROJECTS);
+    removeChatBrain(currentWorkspace().dir, chatId);
     try {
       require('./chat-context.cjs').remove(currentWorkspace().dir,chatId);
       fs.unlinkSync(currentWorkspace().historyPath(chatId));
@@ -114,6 +130,7 @@ function createProjectStore({
       if (!chat || typeof chat.id !== 'string') continue;
       try { lists.addTombstone(workspace.dir, chat.id); } catch { /* best effort */ }
       try { context.remove(workspace.dir, chat.id); } catch { /* best effort */ }
+      removeChatBrain(workspace.dir, chat.id);
       try { fs.unlinkSync(workspace.historyPath(chat.id)); } catch { /* no history file - fine */ }
     }
   }
@@ -160,6 +177,7 @@ function createProjectStore({
     if (FREE_CHATS.length === before) return false;
     require('./chat-lists.cjs').addTombstone(currentWorkspace().dir, chatId);
     saveFreeChats(FREE_CHATS);
+    removeChatBrain(currentWorkspace().dir, chatId);
     try {
       require('./chat-context.cjs').remove(currentWorkspace().dir,chatId);
       fs.unlinkSync(currentWorkspace().historyPath(chatId));
@@ -565,7 +583,7 @@ function createProjectStore({
   }
 
   return {
-    saveProjects, getProject, sanitizeChats, loadChats, saveChats, deleteChat, moveChat, purgeProjectChats, saveFreeChats, deleteFreeChat, createProject,
+    saveProjects, getProject, sanitizeChats, loadChats, saveChats, chatIdsElsewhere, deleteChat, moveChat, purgeProjectChats, saveFreeChats, deleteFreeChat, createProject,
     historyPath, readHistory, writeHistory,
     ownsFile, ensureProjectFolder, withSourceLock, pruneDocuments, writeProjectTextFile, sweepDeletedProject, indexSource,
   };

@@ -165,6 +165,8 @@ test('POST /api/chats/:id/move validates, scopes to the caller and maps the stor
     await call('POST', '/api/chats/f1/move', bad);
     assert.equal(f.sent.pop().status, 400);
   }
+  await call('POST', '/api/chats/f1/move', { projectId: 'p1', frame: { kind: 'bogus' } });
+  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'invalid frame' } }, 'an invalid frame is refused (#759)');
   assert.equal(moves.length, 0, 'malformed bodies never reach the store');
   assert.equal(await call('GET', '/api/chats/f1/move'), false, 'other methods fall through');
 });
