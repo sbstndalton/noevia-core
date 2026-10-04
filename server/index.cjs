@@ -774,6 +774,8 @@ const { handleChat } = require('./chat.cjs').createChatHandler({
   // #739: a confirmed frame steers the answer; looked up in the signed-in user's own lists only.
   chatFramingEnabled: () => features.enabled('chatFraming'), freeChats: () => Array.from(FREE_CHATS),
   framingReasoner, reasoningTraces,
+  // #769: tainted sensitive arguments of a write always get their own approval card.
+  provenancePolicy: { enabled: () => features.enabled('provenancePolicy') },
   // #742: linked chats' brains, read from the signed-in user's own workspace and lists only.
   brainContext: { enabled: () => features.enabled('brainContext') && features.enabled('chatFraming'), maxChars: () => framingSettings.get().brainContextChars,
     chats: () => [...Array.from(FREE_CHATS), ...PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)).flatMap((proj) => proj.chats || [])],

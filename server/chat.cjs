@@ -1,5 +1,6 @@
 'use strict';
 const { frameUntrusted } = require('./prompt-framing.cjs');
+const provenance = require('./provenance-policy.cjs');
 const { isChatGenerationModel } = require('./chat-model-kind.cjs');
 const { isInAppBox } = require('./toolbox-flags.cjs');
 const editTargets = require('./project-edit-target.cjs');
@@ -132,6 +133,9 @@ function createChatHandler({
   // #682: a text-free record that this turn re-runs an earlier one (Regenerate or Retry), with the
   // role the earlier reply was routed to, so misroutes can be counted. Never message text.
   recordOutcome = () => {},
+  // #769 (features.provenancePolicy): { enabled() } — when on, a write whose recipient, URL, host,
+  // path or command holds text from an untrusted source this exchange always gets its own card.
+  provenancePolicy = null,
 }) {
   // Revoked Skill content in earlier turns (#546): one ledger per handler, cached in memory.
   const skillLedger = skillHistory || require('./skill-history.cjs').createSkillHistory({ fs, path });
@@ -920,6 +924,14 @@ function createChatHandler({
       send({ type: 'error', code: 'skill_revoked', text: revocationText() });
     };
     let roundMessages = prepared.messages;
+    // #769: the untrusted text this exchange has put in front of the model, for the write gate.
+    // Null with the flag off, so nothing below changes. A flag read that throws counts as on.
+    let taint = null, taintBroken = false;
+    if (provenancePolicy) {
+      let on = true;
+      try { on = provenancePolicy.enabled() === true; } catch { on = true; }
+      if (on) { try { taint = provenance.createTaintStore(); } catch { taintBroken = true; } }
+    }
     // Prefill measurement (step 17). Timed per ROUND, because each round is its
     // own upstream request with its own prompt — and the later rounds are the
     // interesting ones, since they carry the tool results and so span a wider
@@ -1044,6 +1056,7 @@ function createChatHandler({
       context.logRound({dir:chatWorkspace.dir,chatId:contextId,model,limit,round,compacted:!!continuationCompactedAt||!!prepared.meter.compactedAt&&prepared.meter.compactedAt>=requestStartedAt,messages:roundMessages,tools:activeTools,assertActive:assertWorkspaceActive});
       const snapshot=context.read(chatWorkspace.dir,contextId);snapshot.meter={...roundBudget,historyCount:prepared.meter.historyCount,compactedAt:continuationCompactedAt||prepared.meter.compactedAt,covered:continuationCompactedAt?continuationCovered:prepared.meter.covered};context.save(chatWorkspace.dir,contextId,snapshot,assertWorkspaceActive);
       turn?.generation({ messages:roundMessages, tools:activeTools }, round);
+      if (taint) { try { taint.ingestMessages(roundMessages); } catch { taintBroken = true; } }
       let upstream;
       roundStartedAt = Date.now();
       roundFirstTokenMs = null;
@@ -1309,7 +1322,17 @@ function createChatHandler({
               }
             }
             writePrint = isWriteTool(tc.name) ? require('./recent-writes.cjs').fingerprint(tc.name, cardTarget, tc.args) : null;
-            if (permission === 'ask' && !chatWideApproved(userId, chatId)) {
+            // #769: a write whose sensitive arguments hold untrusted text (or that could not be
+            // checked) is asked about per call even under "Allow for this chat". Only ever adds a card.
+            let provenanceHits = [];
+            if ((taint || taintBroken) && isWriteTool(tc.name)) {
+              const unchecked = [{ field: null, source: null, unchecked: true }];
+              try { provenanceHits = taintBroken ? unchecked : provenance.checkWrite(taint, tc.args); } catch { provenanceHits = unchecked; }
+              if (!Array.isArray(provenanceHits)) provenanceHits = unchecked;
+            }
+            if (provenanceHits.length) authService.audit('tool.provenance', userId, userId, { tool: tc.name, fields: provenanceHits.map((h) => h.field), unchecked: provenanceHits.some((h) => h.unchecked) || undefined });
+            const askedPerCall = permission === 'ask' && (!chatWideApproved(userId, chatId) || provenanceHits.length > 0);
+            if (askedPerCall) {
               const approvalId = `ap-${crypto.randomUUID()}`;
               turn?.approval(tc.id, { id:approvalId, action:'pending' });
               // #658: the same tool, target and arguments as a write that already succeeded in this
@@ -1324,6 +1347,7 @@ function createChatHandler({
                 ...(cardTarget !== null ? { target: cardTarget } : {}),
                 ...(targetKind ? { targetKind } : {}),
                 ...(repeat ? { repeatOf: true } : {}),
+                ...(provenanceHits.length ? { provenance: provenanceHits } : {}),
               });
               const decision = await awaitApproval({ id: approvalId, userId, chatId, abortSignal: chatSignal.signal, onDecision: action => turn?.approval(tc.id, {id:approvalId,action}) });
               if (decision !== 'approve') {
@@ -1366,7 +1390,7 @@ function createChatHandler({
                 return `ERROR: the project's files changed after approval, so ${JSON.stringify(editTarget)} ${again.error ? 'can no longer be edited' : `is no longer the file this name refers to (it now means ${JSON.stringify(again.path)})`}. ${tc.name} was not run and nothing was changed. Ask again if the edit is still wanted.`;
               }
             }
-            if (chatWideApproved(userId, chatId)) turn?.approval(tc.id, {action:'approve_all', inherited:true});
+            if (!(askedPerCall && provenanceHits.length) && chatWideApproved(userId, chatId)) turn?.approval(tc.id, {action:'approve_all', inherited:true});
             turn?.started(tc.id);
             markWriteAttempt();
             const options = { chatKey, exchangeKey, ...(editTarget !== null ? { editTarget: editTargets.targetDigest(editTarget, editAccount) } : {}) };
