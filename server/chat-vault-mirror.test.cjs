@@ -267,6 +267,94 @@ test('a failed sync keeps the index and retries later with the same dirty chats'
   assert.equal(state.index.notes.a.path, 'Chats/Inbox/A.md');
 });
 
+test('#757 rename with the old note gone never overwrites a foreign note at the new name', async () => {
+  const { mirror, vault, state } = setup({ freeChats: [chat('a', 'Old')] });
+  await mirror.sync('u1', new Set());
+  vault.files.delete('Chats/Inbox/Old.md');
+  vault.files.set('Chats/Inbox/New.md', 'my own note');
+  state.freeChats = [chat('a', 'New', { updatedAt: Date.UTC(2026, 9, 3) })];
+  assert.equal(await mirror.sync('u1', new Set()), false, 'the clash is reported');
+  assert.equal(vault.files.get('Chats/Inbox/New.md'), 'my own note');
+  assert.equal(await mirror.sync('u1', new Set()), true);
+  assert.equal(vault.files.get('Chats/Inbox/New.md'), 'my own note', 'the foreign note is untouched');
+  assert.match(vault.files.get('Chats/Inbox/New (2).md'), /^# New$/m);
+  assert.equal(state.index.notes.a.path, 'Chats/Inbox/New (2).md');
+  assert.equal(vault.trash.length, 0);
+});
+
+test('#757 rename with the old note present still refuses a foreign note at the new name', async () => {
+  const { mirror, vault, state } = setup({ freeChats: [chat('a', 'Old')] });
+  await mirror.sync('u1', new Set());
+  vault.files.set('Chats/Inbox/New.md', 'my own note');
+  state.freeChats = [chat('a', 'New', { updatedAt: Date.UTC(2026, 9, 3) })];
+  await mirror.sync('u1', new Set());
+  await mirror.sync('u1', new Set());
+  assert.equal(vault.files.get('Chats/Inbox/New.md'), 'my own note');
+  assert.ok(vault.files.has('Chats/Inbox/New (2).md'));
+  assert.ok(!vault.files.has('Chats/Inbox/Old.md'), 'the old note moved');
+});
+
+test('#757 an entry with an unknown (null) version is preserved to Trash before it is overwritten', async () => {
+  const { mirror, vault, state } = setup({ freeChats: [chat('a', 'A')] });
+  await mirror.sync('u1', new Set());
+  state.index.notes.a.version = null;
+  vault.files.set('Chats/Inbox/A.md', 'maybe edited');
+  state.freeChats = [chat('a', 'A', { updatedAt: Date.UTC(2026, 9, 3) })];
+  assert.equal(await mirror.sync('u1', new Set()), true);
+  assert.deepEqual(vault.trash.map((t) => [t.path, t.content, t.reason]), [['Chats/Inbox/A.md', 'maybe edited', 'preserve']]);
+  assert.match(vault.files.get('Chats/Inbox/A.md'), /^# A$/m);
+});
+
+test('#758 failures back off 1, 2, 4 ... minutes, cap at an hour, log once per step; a nudge resets', async () => {
+  const vault = stubVault();
+  vault.client.write = async () => { throw Object.assign(Error('storage down'), { status: 503 }); };
+  const logs = [];
+  const timers = [];
+  const mirror = createChatVaultMirror({
+    enabled: () => true, lists: () => ({ freeChats: [chat('a', 'A')], projects: [] }), readHistory: () => [],
+    files: vault.client, index: { read: () => ({}), write: () => {} }, log: (...a) => logs.push(a.join(' ')),
+    setTimer: (fn, ms) => { const t = { fn, ms, done: false }; timers.push(t); return t; }, clearTimer: (t) => { t.done = true; }, now: () => 1000,
+  });
+  const step = async () => { const t = timers.find((x) => !x.done); t.done = true; await t.fn(); return timers.find((x) => !x.done)?.ms; };
+  mirror.schedule('u1', 'a');
+  const delays = [];
+  for (let i = 0; i < 10; i++) delays.push(await step());
+  const m = 60000;
+  assert.deepEqual(delays, [m, 2 * m, 4 * m, 8 * m, 16 * m, 32 * m, 60 * m, 60 * m, 60 * m, 60 * m]);
+  assert.equal(logs.filter((l) => l.includes('retrying in')).length, 7, 'one log per backoff step, none at the steady cap');
+  mirror.schedule('u1', 'a');
+  assert.equal(await step(), m, 'a nudge starts the backoff over');
+  assert.ok(mirror.pending('u1'));
+});
+
+test('#758 a success frees the user entry and resets the backoff', async () => {
+  const vault = stubVault();
+  let broken = true;
+  const write = vault.client.write;
+  vault.client.write = async (...args) => { if (broken) throw Object.assign(Error('down'), { status: 503 }); return write(...args); };
+  const { mirror, timers } = setup({ vault, freeChats: [chat('a', 'A')] });
+  mirror.schedule('u1', 'a');
+  for (let i = 0; i < 3; i++) { const t = timers.find((x) => !x.done); t.done = true; await t.fn(); }
+  assert.equal(timers.find((x) => !x.done).ms, 240000);
+  broken = false;
+  const t = timers.find((x) => !x.done); t.done = true; await t.fn();
+  assert.equal(mirror.pending('u1'), false, 'idle users are freed');
+});
+
+test('#758 a taken: entry is pruned once the foreign note is gone', async () => {
+  const vault = stubVault();
+  vault.files.set('Chats/Inbox/A.md', 'foreign');
+  const { mirror, state } = setup({ vault, freeChats: [chat('a', 'A')] });
+  await mirror.sync('u1', new Set());
+  assert.deepEqual(state.index.notes['taken:Chats/Inbox/A.md'], { path: 'Chats/Inbox/A.md', foreign: true });
+  await mirror.sync('u1', new Set());
+  assert.ok(state.index.notes['taken:Chats/Inbox/A.md'], 'kept while the foreign note exists');
+  vault.files.delete('Chats/Inbox/A.md');
+  await mirror.sync('u1', new Set());
+  assert.equal(state.index.notes['taken:Chats/Inbox/A.md'], undefined);
+  assert.equal(state.index.notes.a.path, 'Chats/Inbox/A (2).md', 'the chat keeps its note name');
+});
+
 test('mirrorTrigger: only writes to chats, transcripts, moves, projects and imports', () => {
   assert.deepEqual(mirrorTrigger('POST', '/api/chats/c%201/history'), { chatId: 'c 1' });
   assert.deepEqual(mirrorTrigger('POST', '/api/chats/c1/move'), { chatId: 'c1' });

@@ -32,7 +32,7 @@ const INBOX = 'Inbox';
 const BRAIN_SCHEMA = 0;            // a note without a brain; with one it is chatBrain.BRAIN_SCHEMA (#742)
 const MAX_NOTE_BYTES = 500 * 1024;          // the companion's editor limit is 512 KiB
 const MAX_NAME = 100;
-const DEFAULT_DELAY_MS = 5000, DEFAULT_MAX_WAIT_MS = 30000, DEFAULT_RETRY_MS = 60000;
+const DEFAULT_DELAY_MS = 5000, DEFAULT_MAX_WAIT_MS = 30000, DEFAULT_RETRY_MS = 60000, DEFAULT_MAX_RETRY_MS = 60 * 60 * 1000;
 const RESERVED = /^(con|prn|aux|nul|com[0-9]|lpt[0-9])$/i;
 
 /** A file or folder name that cannot leave its folder, hide itself or break a sync client:
@@ -125,15 +125,17 @@ function mirrorTrigger(method, path) {
  * @param {(userId:string, chatId:string) => object|null} [deps.readBrain]  the chat's brain from the user's own workspace (#742)
  */
 function createChatVaultMirror({ enabled, lists, deleted = () => new Set(), readHistory, readBrain = () => null, files, index, log = () => {},
-  delayMs = DEFAULT_DELAY_MS, maxWaitMs = DEFAULT_MAX_WAIT_MS, retryMs = DEFAULT_RETRY_MS,
+  delayMs = DEFAULT_DELAY_MS, maxWaitMs = DEFAULT_MAX_WAIT_MS, retryMs = DEFAULT_RETRY_MS, maxRetryMs = DEFAULT_MAX_RETRY_MS,
   setTimer = setTimeout, clearTimer = clearTimeout, now = Date.now }) {
-  const users = new Map(); // userId -> { timer, firstAt, dirty:Set, running, again }
+  const users = new Map(); // userId -> { timer, firstAt, dirty:Set, running, again, failures, loggedDelay }
 
   function schedule(userId, chatId = null, { immediate = false } = {}) {
     if (typeof userId !== 'string' || !userId) return;
     let u = users.get(userId);
-    if (!u) { u = { timer: null, firstAt: 0, dirty: new Set(), running: false, again: false }; users.set(userId, u); }
+    if (!u) { u = { timer: null, firstAt: 0, dirty: new Set(), running: false, again: false, failures: 0, loggedDelay: 0 }; users.set(userId, u); }
     if (chatId) u.dirty.add(chatId);
+    // A new nudge (a fresh save, or the person switching the mirror on) starts the backoff over.
+    u.failures = 0; u.loggedDelay = 0;
     if (u.running) { u.again = true; return; }
     if (u.timer) clearTimer(u.timer); else u.firstAt = now();
     // Debounced, but a chat that keeps changing is still mirrored at least every maxWaitMs.
@@ -156,8 +158,19 @@ function createChatVaultMirror({ enabled, lists, deleted = () => new Set(), read
       log('chat-vault-mirror: sync failed', error?.message || String(error));
     } finally {
       u.running = false;
-      if (failed) { for (const id of dirty) u.dirty.add(id); u.firstAt = now(); u.timer = setTimer(() => { u.timer = null; return run(userId); }, retryMs); u.timer?.unref?.(); }
-      else if (u.again) schedule(userId);
+      if (failed && u.again) {
+        // Nudged while this pass ran: the nudge already reset the backoff; go again on the debounce.
+        for (const id of dirty) u.dirty.add(id);
+        schedule(userId);
+      } else if (failed) {
+        // Exponential backoff (#758): 1, 2, 4 ... x retryMs, capped at maxRetryMs, then hourly for
+        // good. Logged once per step, not on every attempt.
+        for (const id of dirty) u.dirty.add(id);
+        u.failures += 1;
+        const wait = Math.min(maxRetryMs, retryMs * 2 ** Math.min(u.failures - 1, 30));
+        if (wait !== u.loggedDelay) { u.loggedDelay = wait; log('chat-vault-mirror: retrying in', `${Math.round(wait / 1000)}s`, `after ${u.failures} failed pass(es)`); }
+        u.firstAt = now(); u.timer = setTimer(() => { u.timer = null; return run(userId); }, wait); u.timer?.unref?.();
+      } else if (u.again) { u.failures = 0; u.loggedDelay = 0; schedule(userId); }
       else if (!u.timer) users.delete(userId);
     }
   }
@@ -181,6 +194,13 @@ function createChatVaultMirror({ enabled, lists, deleted = () => new Set(), read
   async function sync(userId, dirty) {
     const state = index.read(userId) || {};
     const notes = state.notes && typeof state.notes === 'object' ? { ...state.notes } : {};
+    // A name remembered as someone else's (#758) is freed once that note is gone from the vault.
+    for (const key of Object.keys(notes)) {
+      if (!key.startsWith('taken:')) continue;
+      const path = notes[key]?.path;
+      if (!insideMirror(path)) { delete notes[key]; continue; }
+      try { if ((await readNote(userId, path)).content === null) delete notes[key]; } catch { /* unknown: keep it */ }
+    }
     const { freeChats = [], projects = [] } = lists(userId) || {};
     const live = [];
     for (const chat of freeChats) if (chat && typeof chat.id === 'string') live.push({ chat, projectName: null });
@@ -225,20 +245,24 @@ function createChatVaultMirror({ enabled, lists, deleted = () => new Set(), read
         let current = await readNote(userId, at);
         if (at !== target) {
           // Renamed or moved to another project: move the note itself, so links in the vault follow it.
-          if (current.content !== null) {
-            const dest = await readNote(userId, target);
-            if (dest.content !== null) throw Object.assign(Error('a note noevia did not write already has this name'), { status: 409, taken: target });
+          // The destination is checked whether or not the old note still exists (#757): a note at the
+          // new name that is not this chat's own last write is never overwritten.
+          const dest = await readNote(userId, target);
+          const ours = dest.content !== null && entry?.version != null && dest.version === entry.version;
+          if (dest.content !== null && !ours) throw Object.assign(Error('a note noevia did not write already has this name'), { status: 409, taken: target });
+          if (current.content !== null && dest.content === null) {
             await files.ops(userId, { op: 'move', path: at, destination: target, overwrite: false, version: current.version });
-          }
+            current = await readNote(userId, target);
+          } else current = dest;
           at = target;
-          current = await readNote(userId, target);
         } else if (!entry && current.content !== null) {
           // A note noevia did not write is in the way: never overwrite it; take the next free name.
           throw Object.assign(Error('a note noevia did not write already has this name'), { status: 409, taken: target });
         }
         if (current.content === content) { notes[chat.id] = { path: target, version: current.version, meta: metaPrint }; continue; }
         // Edited in the vault since noevia last wrote it: keep that copy in Trash before replacing it.
-        if (current.content !== null && entry?.version && current.version !== entry.version) await files.ops(userId, { op: 'preserve', path: target, version: current.version });
+        // An unknown last version (null) counts as possibly edited (#757).
+        if (current.content !== null && entry && (entry.version == null || current.version !== entry.version)) await files.ops(userId, { op: 'preserve', path: target, version: current.version });
         const written = await files.write(userId, { path: target, content, version: current.version });
         notes[chat.id] = { path: target, version: written?.version ?? null, meta: metaPrint };
       } catch (error) {
