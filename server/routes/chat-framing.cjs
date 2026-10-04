@@ -1,6 +1,7 @@
 'use strict';
 // Chat framing, phase 1 (#737):
 //   POST /api/chat-framing/suggest        { message, chatId? } -> { frame|null, reason }  signed-in user
+//        rate limited per user (#760): over the budget, 429 { frame:null, reason:'rate-limited' }
 //   GET/PUT /api/chat-framing/preferences { autoAccept?, keepReasoningTraces? }         signed-in user (#738, #740)
 //   GET/PUT /api/admin/framing-settings   { framingRouterModel, framingReasonerModel }    admin
 // The suggestion is read-only: nothing is saved and nothing reaches the prompt. Only the signed-in
@@ -13,12 +14,14 @@
  * @param {{ get: Function, save: Function }} deps.settings
  * @param {() => { projects: object[], chats: object[] }} deps.workspace  the current user's own lists
  * @param {{ get: () => object, save: (value:object) => object }} [deps.preferences]  the current user's own framing preferences
+ * @param {(userId:string) => boolean} [deps.rateLimited]  true when this user is over the suggest budget (#760)
  */
-function createChatFramingRoutes({ json, readJson, framing, settings, workspace, preferences }) {
+function createChatFramingRoutes({ json, readJson, framing, settings, workspace, preferences, rateLimited = () => false }) {
   return async function chatFramingRoutes(req, res, { path, authn }) {
     if (path === '/api/chat-framing/suggest') {
       if (!authn) return json(res, 401, { error: 'Sign in required' }), true;
       if (req.method !== 'POST') return json(res, 405, { error: 'method not allowed' }), true;
+      if (rateLimited(authn.user.id)) return json(res, 429, { frame: null, reason: 'rate-limited' }), true;
       let body;
       try { body = await readJson(req); } catch { return json(res, 400, { error: 'Invalid request' }), true; }
       if (typeof body?.message !== 'string') return json(res, 400, { error: 'message required' }), true;

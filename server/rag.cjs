@@ -282,7 +282,7 @@ function serializeF32(vec) {
   return Buffer.from(new Float32Array(vec).buffer);
 }
 
-async function embedOnce(texts) {
+async function embedOnce(texts, signal) {
   const leave=enterInference();
   try {
   const base = embeddingBase || inferenceBase;
@@ -290,6 +290,7 @@ async function embedOnce(texts) {
     method: 'POST',
     headers: embeddingBase ? { 'Content-Type': 'application/json' } : inferenceHeaders(),
     body: JSON.stringify({ model: EMBED_MODEL, input: texts }),
+    ...(signal ? { signal } : {}),
   });
   if (!res.ok) throw new Error(`embeddings ${res.status}: ${(await res.text()).slice(0, 120)}`);
   const body = await res.json();
@@ -297,21 +298,22 @@ async function embedOnce(texts) {
   } finally {leave();}
 }
 
-async function embed(texts) {
+// Optional { signal } (#760): aborts the embeddings request, including the per-text fallback.
+async function embed(texts, { signal } = {}) {
   if (!texts.length) return [];
   if (texts.length === 1) {
-    const items = await embedOnce(texts);
+    const items = await embedOnce(texts, signal);
     if (items.length !== 1 || !items[0]?.embedding) throw new Error('embeddings returned no vector');
     return [items[0].embedding];
   }
   // Some OpenAI-compatible providers answer a multi-input batch with an empty data array —
   // fall back to one call per text (cheap on local hardware).
-  const items = await embedOnce(texts);
+  const items = await embedOnce(texts, signal);
   if (items.length === texts.length && items.every((it) => it?.embedding)) {
     return items.map((it) => it.embedding);
   }
   const out = [];
-  for (const t of texts) out.push(...(await embed([t])));
+  for (const t of texts) out.push(...(await embed([t], { signal })));
   return out;
 }
 

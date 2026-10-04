@@ -78,36 +78,40 @@ function createFramingSettings({ store, audit = () => {} }) {
   };
 }
 
-function withDeadline(promise, ms) {
+// #760: one AbortController per suggest call. At the deadline it aborts, so the embed and decide
+// calls that honour a signal stop instead of running on after their answer stopped mattering.
+function withDeadline(start, ms) {
+  const ctl = new AbortController();
   let timer;
-  return Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(Object.assign(Error('deadline'), { deadline: true })), ms); })])
+  return Promise.race([start(ctl.signal), new Promise((_, reject) => { timer = setTimeout(() => { ctl.abort(); reject(Object.assign(Error('deadline'), { deadline: true })); }, ms); })])
     .finally(() => clearTimeout(timer));
 }
 
 /**
  * @param {object} deps
  * @param {() => boolean} deps.enabled                  features.enabled('chatFraming')
- * @param {(request:object) => Promise<object>} deps.decide  decision/index.cjs decide(), router role
- * @param {(texts:string[]) => Promise<number[][]>} [deps.embed]
+ * @param {(request:object, opts:{signal:AbortSignal}) => Promise<object>} deps.decide  decision/index.cjs decide(), router role
+ * @param {(texts:string[], opts:{signal:AbortSignal}) => Promise<number[][]>} [deps.embed]
  * @param {() => {framingRouterModel:string}} [deps.roles]
  * @param {() => number} [deps.deadlineMs]
  */
 function createChatFraming({ enabled, decide, embed = null, roles = () => ({}), deadlineMs = () => DEFAULT_DEADLINE_MS, log = () => {}, now = Date.now }) {
-  async function choose(purpose, question, options, stateText, budget, routerModel) {
+  async function choose(purpose, question, options, stateText, budget, routerModel, signal) {
+    if (signal?.aborted) return null;
     const result = await decide({ kind: 'choice', purpose, question, options,
       context: { cloud: 'forbidden', stateText, ...(routerModel ? { roleModel: routerModel } : {}) },
-      constraints: { deadlineMs: budget }, fallback: { selected: null, scores: {} } });
+      constraints: { deadlineMs: budget }, fallback: { selected: null, scores: {} } }, { signal });
     // decide() validates against the options; check again so a stub or future backend cannot widen them.
     if (!result || result.source === 'fallback' || !options.some((o) => o.id === result.selected)) return null;
     return result.selected;
   }
 
-  async function embedAll(texts) {
+  async function embedAll(texts, signal) {
     if (!embed || !texts.length) return null;
-    try { const v = await embed(texts); return Array.isArray(v) && v.length === texts.length ? v : null; } catch { return null; }
+    try { const v = await embed(texts, { signal }); return Array.isArray(v) && v.length === texts.length ? v : null; } catch { return null; }
   }
 
-  async function run({ message, projects, chats, chatId, started, budget }) {
+  async function run({ message, projects, chats, chatId, started, budget, signal }) {
     const text = String(message || '').slice(0, 1000);
     const routerModel = roles()?.framingRouterModel || '';
     const left = () => Math.max(1, budget - (now() - started));
@@ -117,7 +121,8 @@ function createChatFraming({ enabled, decide, embed = null, roles = () => ({}), 
     const ownProjects = (projects || []).filter((p) => p && typeof p.id === 'string' && typeof p.name === 'string');
     // One embedding call: the message, the related-chat pool, then project names and tags for pre-ranking.
     const texts = [text, ...pool.map((c) => c.title), ...ownProjects.map((p) => p.name), ...tags];
-    const vectors = await embedAll(texts);
+    const vectors = await embedAll(texts, signal);
+    if (signal.aborted) return { frame: null, reason: 'deadline' };
     const sim = (i) => (vectors ? cosine(vectors[0], vectors[i]) : 0);
     const links = vectors ? pool.map((c, i) => ({ id: c.id, score: sim(1 + i) })).filter((r) => r.score >= RELATED_MIN)
       .sort((a, b) => b.score - a.score).slice(0, RELATED_MAX).map((r) => r.id) : [];
@@ -128,9 +133,9 @@ function createChatFraming({ enabled, decide, embed = null, roles = () => ({}), 
     const none = { id: NONE, label: 'None of these' };
 
     const [kind, projectId, tag] = await Promise.all([
-      choose('chat.frame.kind', 'What kind of chat does this first message start?', KINDS.map((id) => ({ id, label: KIND_LABELS[id] })), text, left(), routerModel),
-      projectOptions.length ? choose('chat.frame.project', 'Which of the user\'s projects does this chat belong to?', [...projectOptions, none], text, left(), routerModel) : null,
-      tagOptions.length ? choose('chat.frame.tag', 'Which existing tag fits this chat best?', [...tagOptions, none], text, left(), routerModel) : null,
+      choose('chat.frame.kind', 'What kind of chat does this first message start?', KINDS.map((id) => ({ id, label: KIND_LABELS[id] })), text, left(), routerModel, signal),
+      projectOptions.length ? choose('chat.frame.project', 'Which of the user\'s projects does this chat belong to?', [...projectOptions, none], text, left(), routerModel, signal) : null,
+      tagOptions.length ? choose('chat.frame.tag', 'Which existing tag fits this chat best?', [...tagOptions, none], text, left(), routerModel, signal) : null,
     ]);
     if (!kind) return { frame: null, reason: 'no-kind' };
     return { frame: normalizeFrame({ kind, projectId: projectId && projectId !== NONE ? projectId : null,
@@ -144,7 +149,7 @@ function createChatFraming({ enabled, decide, embed = null, roles = () => ({}), 
     const started = now();
     const budget = Number(deadlineMs()) > 0 ? Number(deadlineMs()) : DEFAULT_DEADLINE_MS;
     let out;
-    try { out = await withDeadline(run({ message, projects, chats, chatId, started, budget }), budget); }
+    try { out = await withDeadline((signal) => run({ message, projects, chats, chatId, started, budget, signal }), budget); }
     catch (error) { out = { frame: null, reason: error?.deadline ? 'deadline' : 'error' }; }
     log({ purpose: 'chat.frame', framed: !!out.frame, kind: out.frame?.kind || null, fellBack: out.reason, ms: now() - started });
     return out;

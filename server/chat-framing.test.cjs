@@ -169,3 +169,50 @@ test('framing preferences live in the user directory, default off, and refuse no
   fs.writeFileSync(path.join(two, 'chat-framing.json'), '{not json');
   assert.deepEqual(readPreferences(two), off, 'an unreadable file reads as off');
 });
+
+// #760: the suggest deadline aborts work still in flight.
+test('at the deadline the embed and decide calls get an aborted signal', async () => {
+  const signals = { embed: [], decide: [] };
+  const slowEmbed = async (texts, { signal }) => { signals.embed.push(signal); await new Promise((r) => setTimeout(r, 30)); return texts.map(vec); };
+  const slowDecide = async (request, { signal }) => { signals.decide.push(signal); await new Promise((r) => setTimeout(r, 200)); return { selected: 'question', source: 'stub' }; };
+  const out = await make(slowDecide, { embed: slowEmbed, deadlineMs: () => 60 }).suggest({ message: 'Tomato question', projects, chats });
+  assert.deepEqual(out, { frame: null, reason: 'deadline' });
+  assert.equal(signals.embed.length, 1);
+  assert.ok(signals.decide.length >= 1);
+  for (const s of [...signals.embed, ...signals.decide]) assert.equal(s.aborted, true);
+});
+
+test('a decision is not started once the deadline has aborted the call', async () => {
+  let decided = 0;
+  const slowEmbed = (texts, { signal }) => new Promise((resolve) => signal.addEventListener('abort', () => resolve(texts.map(vec))));
+  const out = await make(async () => { decided++; return { selected: 'question' }; }, { embed: slowEmbed, deadlineMs: () => 30 }).suggest({ message: 'Tomato', projects, chats });
+  assert.equal(out.reason, 'deadline');
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(decided, 0);
+});
+
+test('flag off: no embed or decide call at all', async () => {
+  let calls = 0;
+  const out = await make(async () => { calls++; }, { enabled: () => false, embed: async () => { calls++; return []; } }).suggest({ message: 'Tomato', projects, chats });
+  assert.deepEqual(out, { frame: null, reason: 'disabled' });
+  assert.equal(calls, 0);
+});
+
+test('route: a burst over the per-user budget gets 429 rate-limited without calling suggest', async () => {
+  const { createChatFramingRoutes } = require('./routes/chat-framing.cjs');
+  // Same fixed-window contract as auth.cjs createRateLimiter (which needs better-sqlite3 to load).
+  const hits = new Map();
+  const limiter = { rateLimited: (key, limit) => { const n = (hits.get(key) || 0) + 1; hits.set(key, n); return n > limit; } };
+  let suggested = 0;
+  const routes = createChatFramingRoutes({ json: (res, status, body) => { res.status = status; res.body = body; },
+    readJson: async () => ({ message: 'hi' }), settings: {}, workspace: () => ({ projects: [], chats: [] }),
+    framing: { suggest: async () => { suggested++; return { frame: null, reason: 'no-kind' }; } },
+    rateLimited: (userId) => limiter.rateLimited(`chat-frame:${userId}`, 10, 60000) });
+  const call = async (id) => { const res = {}; await routes({ method: 'POST' }, res, { path: '/api/chat-framing/suggest', authn: { user: { id } } }); return res; };
+  const statuses = [];
+  for (let i = 0; i < 12; i++) statuses.push((await call('u-a')).status);
+  assert.deepEqual(statuses, [...Array(10).fill(200), 429, 429]);
+  assert.deepEqual((await call('u-a')).body, { frame: null, reason: 'rate-limited' });
+  assert.equal(suggested, 10);
+  assert.equal((await call('u-b')).status, 200, 'another user has their own budget');
+});
