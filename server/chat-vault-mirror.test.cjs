@@ -294,6 +294,45 @@ test('#757 rename with the old note present still refuses a foreign note at the 
   assert.ok(!vault.files.has('Chats/Inbox/Old.md'), 'the old note moved');
 });
 
+test('#764 rename onto a byte-identical note of ours: the old note goes to Trash, the new one is indexed', async () => {
+  const { mirror, vault, state } = setup({ freeChats: [chat('a', 'Old')] });
+  await mirror.sync('u1', new Set());
+  vault.files.set('Chats/Inbox/New.md', vault.files.get('Chats/Inbox/Old.md'));
+  state.freeChats = [chat('a', 'New')];
+  assert.equal(await mirror.sync('u1', new Set()), true);
+  assert.ok(!vault.files.has('Chats/Inbox/Old.md'), 'no orphan left behind');
+  assert.deepEqual(vault.trash.map((t) => [t.path, t.reason]), [['Chats/Inbox/Old.md', 'delete']]);
+  const del = vault.calls.find((c) => c.op === 'delete');
+  assert.ok(del.version, 'the delete is guarded by the version it read');
+  assert.equal(state.index.notes.a.path, 'Chats/Inbox/New.md');
+  assert.ok(vault.files.has('Chats/Inbox/New.md'));
+});
+
+test('#764 an edited old note is not ours: it is skipped, left in place, and the index moves on', async () => {
+  const { mirror, vault, state } = setup({ freeChats: [chat('a', 'Old')] });
+  await mirror.sync('u1', new Set());
+  vault.files.set('Chats/Inbox/New.md', vault.files.get('Chats/Inbox/Old.md'));
+  vault.files.set('Chats/Inbox/Old.md', 'my edits to the old note');
+  state.freeChats = [chat('a', 'New')];
+  assert.equal(await mirror.sync('u1', new Set()), true);
+  assert.equal(vault.files.get('Chats/Inbox/Old.md'), 'my edits to the old note');
+  assert.deepEqual(vault.trash, []);
+  assert.equal(state.index.notes.a.path, 'Chats/Inbox/New.md');
+});
+
+test('#764 a failed trash of the old note is logged and never fails the pass or loses a note', async () => {
+  const vault = stubVault();
+  const realOps = vault.client.ops;
+  vault.client.ops = async (u, body) => { if (body.op === 'delete') throw Object.assign(Error('boom'), { status: 500 }); return realOps(u, body); };
+  const { mirror, state } = setup({ freeChats: [chat('a', 'Old')], vault });
+  await mirror.sync('u1', new Set());
+  vault.files.set('Chats/Inbox/New.md', vault.files.get('Chats/Inbox/Old.md'));
+  state.freeChats = [chat('a', 'New')];
+  assert.equal(await mirror.sync('u1', new Set()), true);
+  assert.ok(vault.files.has('Chats/Inbox/Old.md'), 'the old note stays when Trash fails');
+  assert.equal(state.index.notes.a.path, 'Chats/Inbox/New.md');
+});
+
 test('#757 an entry with an unknown (null) version is preserved to Trash before it is overwritten', async () => {
   const { mirror, vault, state } = setup({ freeChats: [chat('a', 'A')] });
   await mirror.sync('u1', new Set());

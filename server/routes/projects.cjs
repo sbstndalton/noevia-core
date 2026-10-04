@@ -365,7 +365,7 @@ function createProjectRoutes({
         try {
           const body = JSON.parse(raw);
           if (!Array.isArray(body.chats)) return json(res, 400, { error: 'chats array required' });
-          saveChats(
+          const skipped = saveChats(
             id,
             body.chats
               .filter((c) => c && typeof c.id === 'string')
@@ -386,7 +386,8 @@ function createProjectRoutes({
                 ...(c.mode === 'cowork' && authn?.user?.role === 'admin' ? { mode: 'cowork' } : {}),
               })),
           );
-          return json(res, 200, { ok: true });
+          // Ids another list holds were not saved here (#765): say so, so the client refreshes.
+          return json(res, 200, Array.isArray(skipped) && skipped.length ? { ok: true, skipped } : { ok: true });
         } catch {
           return json(res, 400, { error: 'invalid JSON' });
         }

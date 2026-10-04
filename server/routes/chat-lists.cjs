@@ -88,9 +88,12 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
               ...(c.mode === 'cowork' && authn?.user?.role === 'admin' ? { mode: 'cowork' } : {}),
             }));
           const lists = require('../chat-lists.cjs');
-          FREE_CHATS.splice(0, FREE_CHATS.length, ...lists.mergeChats(Array.from(FREE_CHATS), nextFreeChats, lists.readTombstones(currentWorkspace().dir), store.chatIdsElsewhere ? store.chatIdsElsewhere(null) : new Set()));
+          const elsewhere = store.chatIdsElsewhere ? store.chatIdsElsewhere(null) : new Set();
+          FREE_CHATS.splice(0, FREE_CHATS.length, ...lists.mergeChats(Array.from(FREE_CHATS), nextFreeChats, lists.readTombstones(currentWorkspace().dir), elsewhere));
           saveFreeChats(FREE_CHATS);
-          return json(res, 200, { ok: true });
+          // Ids a project holds were not saved here (#765): say so, so a stale tab refreshes.
+          const skipped = lists.skippedElsewhere(nextFreeChats, elsewhere);
+          return json(res, 200, skipped.length ? { ok: true, skipped } : { ok: true });
         } catch {
           return json(res, 400, { error: 'invalid JSON' });
         }

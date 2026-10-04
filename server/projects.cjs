@@ -83,10 +83,13 @@ function createProjectStore({
 
   function saveChats(projectId, chats) {
     const p = getProject(projectId);
-    if (!p) return;
+    if (!p) return [];
     const lists = require('./chat-lists.cjs');
-    p.chats = lists.mergeChats(p.chats, chats, lists.readTombstones(currentWorkspace().dir), chatIdsElsewhere(p.id));
+    const elsewhere = chatIdsElsewhere(p.id);
+    p.chats = lists.mergeChats(p.chats, chats, lists.readTombstones(currentWorkspace().dir), elsewhere);
     saveProjects(PROJECTS);
+    // The incoming ids the elsewhere-dedupe dropped (#765), so a stale tab learns to refresh.
+    return lists.skippedElsewhere(chats, elsewhere);
   }
 
   // Chat ids held by any list of this workspace other than `listId` (a project id, or null for

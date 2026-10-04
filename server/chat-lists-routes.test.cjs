@@ -171,13 +171,19 @@ test('a stale whole-list save never copies a moved chat back into its old list (
   const projectIds = async () => JSON.parse((await request(`/api/projects/${project.id}/chats`, { headers: mutationHeaders() })).text).chats.map((c) => c.id);
   await post('/api/freechats', { chats: [meta('c-stale-f1')] });
   assert.equal((await post('/api/chats/c-stale-f1/move', { projectId: project.id })).status, 200);
-  assert.equal((await post('/api/freechats', { chats: [meta('c-stale-f1', 'stale tab', 5000), meta('c-stale-other')] })).status, 200);
+  const staleFree = await post('/api/freechats', { chats: [meta('c-stale-f1', 'stale tab', 5000), meta('c-stale-other')] });
+  assert.equal(staleFree.status, 200);
+  assert.deepEqual(JSON.parse(staleFree.text), { ok: true, skipped: ['c-stale-f1'] }, 'the stale tab learns its chat lives elsewhere (#765)');
+  assert.deepEqual(JSON.parse((await post('/api/freechats', { chats: [meta('c-stale-other')] })).text), { ok: true }, 'unchanged when nothing is skipped');
   assert.ok(!(await freeChats()).includes('c-stale-f1'), 'the free list does not get the moved chat back');
   assert.ok((await freeChats()).includes('c-stale-other'), 'the rest of the stale list still saves');
   assert.deepEqual((await projectIds()).filter((id) => id === 'c-stale-f1'), ['c-stale-f1'], 'the project holds it exactly once');
   // Reverse: moved back out to the free list, a stale project-list save must not re-add it.
   assert.equal((await post('/api/chats/c-stale-f1/move', { projectId: null })).status, 200);
-  assert.equal((await post(`/api/projects/${project.id}/chats`, { chats: [meta('c-stale-f1', 'stale tab', 6000)] })).status, 200);
+  const staleProject = await post(`/api/projects/${project.id}/chats`, { chats: [meta('c-stale-f1', 'stale tab', 6000)] });
+  assert.equal(staleProject.status, 200);
+  assert.deepEqual(JSON.parse(staleProject.text), { ok: true, skipped: ['c-stale-f1'] }, 'the project save reports it too (#765)');
+  assert.deepEqual(JSON.parse((await post(`/api/projects/${project.id}/chats`, { chats: [] })).text), { ok: true });
   assert.ok(!(await projectIds()).includes('c-stale-f1'), 'the project list does not get it back');
   assert.ok((await freeChats()).includes('c-stale-f1'), 'still in the free list');
 });

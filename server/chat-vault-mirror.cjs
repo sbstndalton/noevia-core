@@ -253,7 +253,19 @@ function createChatVaultMirror({ enabled, lists, deleted = () => new Set(), read
           if (current.content !== null && dest.content === null) {
             await files.ops(userId, { op: 'move', path: at, destination: target, overwrite: false, version: current.version });
             current = await readNote(userId, target);
-          } else current = dest;
+          } else {
+            if (ours && current.content !== null && insideMirror(at) && current.version !== entry.version) {
+              // The old note was edited since noevia wrote it: it is no longer ours, so it stays put.
+              log('chat-vault-mirror: old note skipped, edited', chat.id, at);
+            } else if (ours && current.content !== null && insideMirror(at) && current.version === entry.version) {
+              // The destination is already this chat's own last write (#764): the old note would be
+              // left behind unindexed, so it goes to Trash with the same guarded delete the trash pass
+              // uses. A failure here is logged only; the old note stays and nothing is lost.
+              try { await files.ops(userId, { op: 'delete', path: at, version: current.version }); }
+              catch (error) { log('chat-vault-mirror: old note trash failed', chat.id, error?.message || String(error)); }
+            }
+            current = dest;
+          }
           at = target;
         } else if (!entry && current.content !== null) {
           // A note noevia did not write is in the way: never overwrite it; take the next free name.

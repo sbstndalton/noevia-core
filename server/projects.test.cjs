@@ -300,8 +300,10 @@ test('saveChats skips ids held by another list of the workspace (#755)', async (
   const a = await f.store.createProject({ name: 'A' }), b = await f.store.createProject({ name: 'B' });
   b.chats = [{ id: 'in-b', updatedAt: 1 }];
   f.workspace.freeChats.push({ id: 'free-1', updatedAt: 1 });
-  f.store.saveChats(a.id, [{ id: 'in-b' }, { id: 'free-1' }, { id: 'new-a' }]);
+  const skipped = f.store.saveChats(a.id, [{ id: 'in-b' }, { id: 'free-1' }, { id: 'new-a' }]);
   assert.deepEqual(a.chats.map((c) => c.id), ['new-a']);
+  assert.deepEqual(skipped.sort(), ['free-1', 'in-b'], 'the dropped ids are reported (#765)');
+  assert.deepEqual(f.store.saveChats(a.id, [{ id: 'new-a' }]), [], 'nothing skipped, nothing reported');
   assert.deepEqual([...f.store.chatIdsElsewhere(null)].sort(), ['in-b', 'new-a']);
 });
 

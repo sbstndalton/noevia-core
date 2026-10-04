@@ -55,4 +55,11 @@ function mergeChats(current, incoming, tombstones = new Set(), elsewhere = new S
   return [...byId.values()].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)).slice(0, LIST_CAP);
 }
 
-module.exports = { mergeChats, readTombstones, addTombstone, safeChatId, LIST_CAP };
+// The incoming ids mergeChats drops because another list holds them (#765), deduplicated.
+function skippedElsewhere(incoming, elsewhere = new Set()) {
+  const out = new Set();
+  for (const chat of incoming || []) if (chat && typeof chat.id === 'string' && elsewhere.has(chat.id)) out.add(chat.id);
+  return [...out];
+}
+
+module.exports = { mergeChats, skippedElsewhere, readTombstones, addTombstone, safeChatId, LIST_CAP };
