@@ -1,6 +1,7 @@
 'use strict';
 
 const { normalizeS3Region, S3_REGION_RE } = require('../s3-region.cjs');
+const { checkLogin } = require('../storage-client.cjs');
 // The user's own storage connection (Settings → Diary & storage): read and save it, test it,
 // browse and read files over it for project knowledge, create one folder, and the Nextcloud
 // Login Flow v2 that turns a URL into an app password without the user typing a secret here.
@@ -11,6 +12,11 @@ const { normalizeS3Region, S3_REGION_RE } = require('../s3-region.cjs');
 // is the choke point, because everything downstream fetches the *saved* baseUrl.
 
 const STORAGE_PRIVATE_URL_ERROR = 'An http(s) server URL is required. This server is not approved for member connections. Ask an administrator to add its origin to MEMBER_OUTBOUND_ORIGINS.';
+
+const STORAGE_LOGIN_REJECTED = 'The server rejected this username or app password.';
+const STORAGE_UNVERIFIED = 'Saved, but the storage server could not be reached to check the login.';
+// Kinds that authenticate with a WebDAV username and app password (#770).
+const DAV_KINDS = new Set(['nextcloud', 'webdav']);
 
 const PASS = Symbol('unhandled');
 
@@ -93,7 +99,17 @@ function createStorageRoutes({ json, readJson, authService, storageClient, endpo
       if (body.region !== undefined && body.region !== null && body.region !== '' && !S3_REGION_RE.test(String(body.region))) {
         return json(res, 400, { error: 'Region must be 1-32 lowercase letters, digits, or dashes (for example eu-west-1)' });
       }
-      return json(res, 200, authService.saveStorage(authn.user.id, body));
+      // #770: check the login before replacing the saved row. A rejected login keeps the old row;
+      // an unreachable server still saves (it may be down for a moment) but says it was not checked.
+      // Only the status is reported; the secret never reaches a log or a response.
+      let warning;
+      if (DAV_KINDS.has(body.kind)) {
+        const check = await checkLogin({ baseUrl: body.baseUrl, username: body.username, secret: body.secret }, { fetchImpl: (...a) => fetch(...a) });
+        if (check.rejected) return json(res, 400, { error: STORAGE_LOGIN_REJECTED, code: 'storageLoginRejected', status: check.status });
+        if (!check.ok) warning = { warning: STORAGE_UNVERIFIED, warningCode: 'storageUnverified', ...(check.status ? { status: check.status } : {}) };
+      }
+      const saved = authService.saveStorage(authn.user.id, body);
+      return json(res, 200, warning ? { ...saved, ...warning } : saved);
     }
     if (p === '/api/integrations/storage/test' && req.method === 'POST') {
       const body = await readJson(req);
