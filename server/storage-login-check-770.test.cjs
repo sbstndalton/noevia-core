@@ -107,6 +107,20 @@ test('a network error or timeout saves with a warning', async (t) => {
   }
 });
 
+test('#773: a server that answers with a non-401 status was reached, so the warning names the status', async (t) => {
+  for (const status of [403, 500]) {
+    const f = fixture(t, () => new Response('', { status }));
+    const reply = await f.put(NEW);
+    assert.equal(reply.status, 200);
+    assert.equal(reply.body.warningCode, 'storageUnverified');
+    assert.equal(reply.body.status, status);
+    assert.doesNotMatch(reply.body.warning, /could not be reached/);
+    assert.match(reply.body.warning, new RegExp(`login could not be checked \\(the storage server answered ${status}\\)`));
+    assert.equal(f.row().username, 'bob');
+    noSecret(f, reply);
+  }
+});
+
 test('S3 and server storage are not tested with WebDAV credentials', async (t) => {
   const f = fixture(t, () => new Response('', { status: 401 }));
   assert.equal((await f.put({ kind: 's3', baseUrl: 'https://s3.example.test', bucket: 'b', username: 'AKID', secret: SECRET, corpusRoot: '' })).status, 200);
