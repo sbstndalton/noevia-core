@@ -210,7 +210,12 @@ async function checkLogin(conn, { fetchImpl = fetch, timeoutMs = 10000 } = {}) {
     });
   } catch (err) {
     const timeout = err && (err.name === 'TimeoutError' || err.name === 'AbortError');
-    return { ok: false, unverified: timeout ? 'timeout' : 'network' };
+    if (timeout) return { ok: false, unverified: 'timeout' };
+    // #776: with redirect:'error' undici throws TypeError('fetch failed') whose cause is
+    // 'unexpected redirect'. The server was reached; the URL is likely http vs https or a slash.
+    const cause = err && err.cause;
+    if (err && err.name === 'TypeError' && cause && /redirect/i.test(String(cause.message || ''))) return { ok: false, unverified: 'redirect' };
+    return { ok: false, unverified: 'network' };
   }
   try { await response.body?.cancel?.(); } catch { /* body not needed */ }
   if (response.status === 401) return { ok: false, rejected: true, status: 401 };

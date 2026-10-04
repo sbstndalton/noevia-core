@@ -15,6 +15,8 @@ const STORAGE_PRIVATE_URL_ERROR = 'An http(s) server URL is required. This serve
 
 const STORAGE_LOGIN_REJECTED = 'The server rejected this username or app password.';
 const STORAGE_UNVERIFIED = 'Saved, but the storage server could not be reached to check the login.';
+// #776: the server answered with a 3xx; the login was not checked because redirects are refused.
+const STORAGE_REDIRECTED = 'Saved, but the server redirected the login check. Check the URL (https, trailing slash).';
 // #773: the server answered, just not with a usable reply, so it was reached.
 const storageUncheckedMessage = (status) => `Saved, but the login could not be checked (the storage server answered ${status}).`;
 // Kinds that authenticate with a WebDAV username and app password (#770).
@@ -108,7 +110,7 @@ function createStorageRoutes({ json, readJson, authService, storageClient, endpo
       if (DAV_KINDS.has(body.kind)) {
         const check = await checkLogin({ baseUrl: body.baseUrl, username: body.username, secret: body.secret }, { fetchImpl: (...a) => fetch(...a) });
         if (check.rejected) return json(res, 400, { error: STORAGE_LOGIN_REJECTED, code: 'storageLoginRejected', status: check.status });
-        if (!check.ok) warning = check.status ? { warning: storageUncheckedMessage(check.status), warningCode: 'storageUnverified', status: check.status } : { warning: STORAGE_UNVERIFIED, warningCode: 'storageUnverified' };
+        if (!check.ok) warning = check.unverified === 'redirect' ? { warning: STORAGE_REDIRECTED, warningCode: 'storageUnverified', reason: 'redirect' } : check.status ? { warning: storageUncheckedMessage(check.status), warningCode: 'storageUnverified', status: check.status } : { warning: STORAGE_UNVERIFIED, warningCode: 'storageUnverified' };
       }
       const saved = authService.saveStorage(authn.user.id, body);
       return json(res, 200, warning ? { ...saved, ...warning } : saved);

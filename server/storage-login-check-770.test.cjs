@@ -121,6 +121,34 @@ test('#773: a server that answers with a non-401 status was reached, so the warn
   }
 });
 
+// undici's shape for a refused redirect: TypeError('fetch failed') with cause 'unexpected redirect'.
+const redirectError = () => Object.assign(new TypeError('fetch failed'), { cause: new Error('unexpected redirect') });
+
+test('#776: a redirect saves with a redirect warning, not "could not be reached"', async (t) => {
+  const f = fixture(t, () => { throw redirectError(); });
+  const reply = await f.put(NEW);
+  assert.equal(reply.status, 200);
+  assert.equal(reply.body.warningCode, 'storageUnverified');
+  assert.equal(reply.body.reason, 'redirect');
+  assert.equal(reply.body.status, undefined);
+  assert.doesNotMatch(reply.body.warning, /could not be reached/);
+  assert.match(reply.body.warning, /server redirected the login check\. Check the URL \(https, trailing slash\)/);
+  assert.equal(f.row().username, 'bob');
+  assert.equal(f.auth.getStorage('u1', true).secret, SECRET);
+  noSecret(f, reply);
+});
+
+test('#776: checkLogin maps a real 3xx under redirect:error to unverified redirect', async (t) => {
+  const http = require('node:http');
+  const server = http.createServer((req, res) => { res.writeHead(301, { Location: '/elsewhere/' }); res.end(); });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  t.after(() => server.close());
+  const conn = { baseUrl: `http://127.0.0.1:${server.address().port}/dav`, username: 'u', secret: SECRET };
+  const result = await storageClient.checkLogin(conn, { fetchImpl: fetch });
+  assert.deepEqual(result, { ok: false, unverified: 'redirect' });
+  assert.ok(!JSON.stringify(result).includes(SECRET));
+});
+
 test('S3 and server storage are not tested with WebDAV credentials', async (t) => {
   const f = fixture(t, () => new Response('', { status: 401 }));
   assert.equal((await f.put({ kind: 's3', baseUrl: 'https://s3.example.test', bucket: 'b', username: 'AKID', secret: SECRET, corpusRoot: '' })).status, 200);
@@ -137,6 +165,9 @@ test('checkLogin never throws and classifies statuses', async () => {
   assert.deepEqual(await at(500), { ok: false, unverified: 'status', status: 500 });
   const failed = await storageClient.checkLogin(conn, { fetchImpl: async () => { throw new Error(SECRET); } });
   assert.deepEqual(failed, { ok: false, unverified: 'network' });
+  assert.deepEqual(await storageClient.checkLogin(conn, { fetchImpl: async () => { throw redirectError(); } }), { ok: false, unverified: 'redirect' });
+  // A plain network TypeError without a redirect cause stays 'network'.
+  assert.deepEqual(await storageClient.checkLogin(conn, { fetchImpl: async () => { throw new TypeError('fetch failed'); } }), { ok: false, unverified: 'network' });
   assert.equal(storageClient.isLoginRejected, undefined);
 });
 
