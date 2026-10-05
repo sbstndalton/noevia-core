@@ -715,3 +715,55 @@ test('a dangling symlink inside the worktree is not contained', () => {
   assert.equal(ws.contains(ids(1), path.join(claim.path, 'k')), false);
   assert.equal(ws.contains(ids(1), 'k'), false);
 });
+
+// #864: the harness owns the tree, so it can swap the pinned config's directory for a link to
+// anywhere. Releasing (as root) must not unlink a file of the pinned name wherever it points.
+function linkedPinDir() {
+  const outside = temp('noevia-outside-');
+  fs.writeFileSync(path.join(outside, 'settings.local.json'), 'synthetic outside file');
+  return outside;
+}
+
+test('release refuses a symlinked pinned-config directory, leaves the outside file, and marks the claim stuck (#864)', () => {
+  for (const mode of ['clone', 'worktree']) {
+    const repo = repoWith();
+    const ws = createCodeWorkspaces({ dir: temp('noevia-ws-'), treeRoot: temp('noevia-shared-'), mode, epoch: 'test' });
+    const claim = ws.claim({ taskId: ids(1), repoPath: repo, pinned: ['.claude/settings.local.json'] });
+    const outside = linkedPinDir();
+    fs.rmSync(path.join(claim.path, '.claude'), { recursive: true, force: true });
+    fs.symlinkSync(outside, path.join(claim.path, '.claude'));
+    const released = ws.release({ taskId: ids(1) });
+    assert.equal(released.status, 'stuck', mode);
+    assert.match(released.error, /\.claude is a symbolic link/, mode);
+    assert.equal(fs.readFileSync(path.join(outside, 'settings.local.json'), 'utf8'), 'synthetic outside file', `${mode}: the outside file is untouched`);
+    assert.equal(fs.existsSync(claim.path), true, `${mode}: the tree is kept for inspection`);
+  }
+});
+
+test('recover() refuses a symlinked pinned-config directory and records why, leaving the outside file (#864)', () => {
+  const repo = repoWith();
+  const dir = temp('noevia-ws-');
+  const first = createCodeWorkspaces({ dir, epoch: 'process-1' });
+  const claim = first.claim({ taskId: ids(1), repoPath: repo, pinned: ['.qwen/settings.json'] });
+  const outside = temp('noevia-outside-');
+  fs.writeFileSync(path.join(outside, 'settings.json'), 'synthetic outside file');
+  fs.symlinkSync(outside, path.join(claim.path, '.qwen'));
+  const recovered = createCodeWorkspaces({ dir, epoch: 'process-2' }).recover();
+  assert.equal(recovered.length, 1);
+  assert.equal(recovered[0].pinnedDropped, false);
+  assert.match(recovered[0].pinnedDropError, /\.qwen is a symbolic link/);
+  assert.equal(fs.readFileSync(path.join(outside, 'settings.json'), 'utf8'), 'synthetic outside file');
+});
+
+test('a pinned config under a real directory is still removed, and the tree kept, on recover (#864)', () => {
+  const repo = repoWith();
+  const dir = temp('noevia-ws-');
+  const claim = createCodeWorkspaces({ dir, epoch: 'process-1' }).claim({ taskId: ids(1), repoPath: repo, pinned: ['.claude/settings.local.json'] });
+  fs.mkdirSync(path.join(claim.path, '.claude'), { recursive: true });
+  const pin = path.join(claim.path, '.claude', 'settings.local.json');
+  fs.writeFileSync(pin, '{"key":"synthetic-key"}');
+  const recovered = createCodeWorkspaces({ dir, epoch: 'process-2' }).recover();
+  assert.equal(recovered[0].pinnedDropped, true, recovered[0].pinnedDropError);
+  assert.equal(fs.existsSync(pin), false);
+  assert.equal(fs.existsSync(path.join(claim.path, 'a.txt')), true);
+});

@@ -144,8 +144,14 @@ function createMcpWiring({
   // be routed back to the right one — and because a box may only bind tools from
   // the server it declares, so a second server cannot quietly take over a
   // curated box by offering a tool of the same name.
+  //
+  // `tools` keeps one entry per name (the first server's) for status and the read/write hint.
+  // It is NOT what a call is routed by: `offers` holds every server offering each name, and a
+  // call goes to the server whose box offered the tool (#865) — or, when the caller cannot say
+  // which server it means, is refused if more than one server offers that name.
   const mcpState = {
     tools: new Map(), // name -> { tool, readOnly, serverId }
+    offers: new Map(), // name -> Map(serverId -> { tool, readOnly, serverId })
     boxes: [],
     servers: new Map(), // id -> { id, url, auth, error, discoveredAt, toolCount }
     discoveredAt: 0,
@@ -290,7 +296,7 @@ function createMcpWiring({
 
   async function discoverMcpTools(force = false) {
     // No servers left (the last directory server was just removed): nothing may stay offered.
-    if (!MCP_ENABLED) { mcpState.tools = new Map(); mcpState.boxes = []; mcpState.servers = new Map(); mcpState.error = null; return mcpState; }
+    if (!MCP_ENABLED) { mcpState.tools = new Map(); mcpState.offers = new Map(); mcpState.boxes = []; mcpState.servers = new Map(); mcpState.error = null; return mcpState; }
     const fresh = Date.now() - mcpState.discoveredAt < discoveryTtlMs;
     if (!force && fresh && mcpState.boxes.length) return mcpState;
     // A discovery that found nothing (every server failed, or none are configured yet) is still
@@ -323,11 +329,15 @@ function createMcpWiring({
         }));
 
         // Flatten into one registry. A name offered by two servers keeps the
-        // first — declaration order in MCP_SERVERS is the tie-break, and the
-        // collision is logged rather than silently resolved.
+        // first in `tools` — declaration order in MCP_SERVERS is the tie-break, and the
+        // collision is logged rather than silently resolved. `offers` keeps every server
+        // offering the name, which is what a call is routed by (routeMcpTool, below).
         const byName = new Map();
+        const offers = new Map();
         for (const server of MCP_SERVERS) {
           for (const [name, entry] of perServer.get(server.id) || []) {
+            if (!offers.has(name)) offers.set(name, new Map());
+            offers.get(name).set(server.id, entry);
             const held = byName.get(name);
             if (held) {
               logger.warn(`[mcp] "${name}" offered by both "${held.serverId}" and "${server.id}"; keeping "${held.serverId}"`);
@@ -344,6 +354,7 @@ function createMcpWiring({
         const boxes = bindBoxes({ manifest: [...manifest, ...directoryBoxes], perServer, servers: found, warn: (line) => logger.warn(line) });
 
         mcpState.tools = byName;
+        mcpState.offers = offers;
         mcpState.boxes = boxes;
         mcpState.servers = found;
         // The internal server is this process. If it did not answer, something
@@ -367,11 +378,48 @@ function createMcpWiring({
     return mcpState.inflight;
   }
 
-  async function executeMcpToolCall(name, args, signal) {
+  /** Which server's tool a call means (#865). A call is routed by (server, name): `serverId` is
+   *  the server whose box offered the tool to the model. Without one, a name only one server
+   *  offers is unambiguous; a name two servers offer is refused rather than guessed, because
+   *  guessing sends the call — and that server's credential — somewhere the model was not shown. */
+  function routeMcpTool(name, serverId) {
+    const offered = mcpState.offers.get(name);
+    if (serverId !== undefined && serverId !== null) {
+      const entry = offered ? offered.get(serverId) : null;
+      return entry ? { known: entry } : { error: `ERROR: unknown tool "${name}" on MCP server "${serverId}"` };
+    }
+    if (offered && offered.size > 1) {
+      logger.warn(`[mcp] refused a call to "${name}" without a server: offered by ${[...offered.keys()].map((id) => `"${id}"`).join(', ')}`);
+      return { error: `ERROR: tool "${name}" is offered by more than one MCP server, so it was not run.` };
+    }
     const known = mcpState.tools.get(name);
-    if (!known) return `ERROR: unknown tool "${name}"`;
+    return known ? { known } : { error: `ERROR: unknown tool "${name}"` };
+  }
+
+  /** The one operator (non-directory) server offering a name, for noevia's own fixed callers
+   *  (deep research's tavily_search / tavily_extract). They name a tool the operator configured,
+   *  so a directory server offering the same name must neither take the call nor make it
+   *  ambiguous. `undefined` when no operator server, or more than one, offers it. */
+  function operatorServerFor(name) {
+    const offered = mcpState.offers.get(name);
+    if (!offered) return undefined;
+    const ids = [...offered.keys()].filter((id) => { const sv = MCP_SERVER_BY_ID.get(id); return sv && !sv.directory; });
+    return ids.length === 1 ? ids[0] : undefined;
+  }
+
+  async function executeMcpToolCall(name, args, signal, serverId) {
+    const route = routeMcpTool(name, serverId);
+    if (route.error) return route.error;
+    const known = route.known;
     const server = MCP_SERVER_BY_ID.get(known.serverId);
     if (!server) return `ERROR: tool "${name}" belongs to MCP server "${known.serverId}", which is no longer configured`;
+    // An approval for a project file edit names a stored project file, and only noevia's own
+    // server edits project files. A call carrying that approval that is routed anywhere else was
+    // approved for something it would not do: refused, nothing sent (#865 review).
+    if (scope.getStore()?.internalEditTarget && server.auth !== 'internal') {
+      logger.warn(`[mcp] refused "${name}": approved as a project file edit but routed to MCP server "${server.id}"`);
+      return `ERROR: ${name} was approved as a project file edit, but "${name}" was offered by MCP server "${server.id}"; it was not run.`;
+    }
 
     // Credentials are per server. Forwarding the user's Nextcloud password to a
     // server that merely happens to be configured would hand their password to
@@ -447,7 +495,7 @@ function createMcpWiring({
     oauthServerIds, accountReady, probeMcpAuth, syncDirectoryServers,
     discoverOneServer, discoverMcpTools,
     mcpStaticAuth, mcpAuthHeaders, mcpInternalAuth, internalCallProjectId, mcpDiscoveryAuth,
-    executeMcpToolCall,
+    executeMcpToolCall, operatorServerFor,
   };
 }
 

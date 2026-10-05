@@ -317,10 +317,28 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
     return pins;
   }
 
-  /** Delete the pinned config files from a released tree, never following a link. */
+  /** Delete the pinned config files from a released tree, never following a link.
+   *
+   *  Not just the file itself: every directory between the tree and it is checked too (#864).
+   *  The harness owns the tree, so it can replace `.claude` with a link to any directory, and
+   *  noevia (root) unlinking `.claude/settings.local.json` through it would delete a file of that
+   *  name wherever the link points. A link on the way down is refused — the same rule
+   *  writePinned (code-harness-config.cjs) applies when the file is written — and the error says
+   *  so (`link: true`), so the release keeps the tree for inspection and marks the claim stuck. */
   function dropPinned(record) {
+    const base = path.resolve(record.path);
     for (const rel of pinnedPaths(record.pinned || [])) {
-      const target = path.join(record.path, rel);
+      const target = path.join(base, rel);
+      if (!target.startsWith(base + path.sep)) continue;
+      let dir = base, reachable = true;
+      for (const part of path.relative(base, target).split(path.sep).slice(0, -1)) {
+        dir = path.join(dir, part);
+        let st; try { st = fs.lstatSync(dir); } catch { reachable = false; break; }
+        if (st.isSymbolicLink()) throw Object.assign(Error(`${path.relative(base, dir)} is a symbolic link`), { link: true });
+        // A file where a directory should be: nothing can sit under it.
+        if (!st.isDirectory()) { reachable = false; break; }
+      }
+      if (!reachable) continue;
       let st; try { st = fs.lstatSync(target); } catch { continue; }
       if (st.isDirectory()) throw Error(`${rel} is a directory`);
       fs.unlinkSync(target);
@@ -466,7 +484,16 @@ function createCodeWorkspaces({ dir, treeRoot = null, owner = null, run = defaul
       if (record.home) { try { rm(record.home); } catch { /* nothing of the task's is in there */ } }
       if (removed && removeBranch) { try { run(['branch', '-D', record.branch], record.repo, gitEnv()); } catch { /* keep going */ } }
     } else {
-      try { dropPinned(record); } catch { /* the tree is removed next either way */ }
+      try { dropPinned(record); }
+      catch (e) {
+        // A link where the pinned config's directory should be means the tree was tampered with:
+        // kept for inspection, like a hostile clone, rather than removed (#864). Anything else
+        // goes with the tree, which is removed next either way.
+        if (e && e.link) {
+          return write({ ...record, status: 'stuck', releasedAt: now(), headSha: branchHead(record),
+            error: `Refused to release the workspace: ${e.message}. It was left in place for inspection.` });
+        }
+      }
       try { run([...HOSTILE_OFF, 'worktree', 'remove', '--force', record.path], record.repo, gitEnv()); }
       catch (e) { removed = false; error = e.message; }
       try { run([...HOSTILE_OFF, 'worktree', 'prune'], record.repo, gitEnv()); } catch { /* best effort */ }

@@ -125,7 +125,8 @@ const TOOL_PREFILL_TARGET_MS = 14000;
  * @param {(id:string) => object|null} deps.getProject
  * @param {object} deps.documentSources   { readPages(ws, projectId, file, start, end, offset, cap), notice(file) }
  * @param {() => object} deps.workspace
- * @param {(name, args) => Promise<string>} deps.executeMcp   runs a discovered MCP tool; reads the project it acts for from scope
+ * @param {(name, args, signal, serverId) => Promise<string>} deps.executeMcp   runs a discovered MCP tool on the
+ *   server it was offered from (serverId; none means "the only server offering it"); reads the project it acts for from scope
  */
 function createToolboxes({
   boxes = [], kiwixTools = null, driveTools = null, mcpBoxes = () => [], mcpTools = () => new Map(),
@@ -248,6 +249,10 @@ function createToolboxes({
     const boxes = [];
     const candidates = [];
     const seen = new Set();
+    // Which MCP server each offered name belongs to: the server of the box that won the name
+    // (#865). A call is routed by it, so it reaches the server whose tool the model was shown,
+    // never another server that happens to offer the same name. Built-in boxes have no server.
+    const serverOf = new Map();
     for (const id of wanted) {
       const box = available.find((b) => b.id === id);
       if (!box) continue;
@@ -257,6 +262,7 @@ function createToolboxes({
         if (!name || seen.has(name) || skip(name)) continue; // first box wins a name clash
         seen.add(name);
         candidates.push(tool);
+        if (typeof box.server === 'string' && box.server) serverOf.set(name, box.server);
       }
     }
     // Two independent limits; whichever binds first stops the list. Tools are
@@ -277,7 +283,9 @@ function createToolboxes({
       tools.push(tool);
       spent += cost;
     }
-    return { tools, dropped, boxes, cap, budget, estTokens: spent };
+    const routes = new Map();
+    for (const tool of tools) if (serverOf.has(tool.function.name)) routes.set(tool.function.name, serverOf.get(tool.function.name));
+    return { tools, dropped, boxes, cap, budget, estTokens: spent, routes };
   }
 
   // ── Tool permissions (master step 16) ────────────────────────────────────
@@ -354,7 +362,7 @@ function createToolboxes({
     }));
   }
 
-  async function runToolCall(project, name, rawArgs, allowed, signal, fail, { editTarget, chatKey, exchangeKey } = {}) {
+  async function runToolCall(project, name, rawArgs, allowed, signal, fail, { editTarget, chatKey, exchangeKey, routes } = {}) {
     // A model can name a tool it was never offered — by hallucination, or from
     // a box the project has since deselected mid-conversation. Enforce the
     // resolved list here rather than trusting that whatever was sent upstream is
@@ -375,6 +383,16 @@ function createToolboxes({
     if (typeof args !== 'object' || args === null || Array.isArray(args)) {
       return fail(`ERROR: tool arguments must be a JSON object: ${String(rawArgs).slice(0, 200)}`);
     }
+    // The project this call acts for travels in the request scope, EXTENDING the current store
+    // rather than replacing it, so the workspace and authn the rest of the call depends on
+    // survive — and two interleaved chats each keep their own project (see the scope test).
+    // An approved project file edit also carries the digest of the path its card showed (#648);
+    // only noevia's own server receives it, inside its capability token.
+    const runMcp = (serverId) => scope.run({ ...scope.getStore(), internalCallProject: project || null, internalEditTarget: typeof editTarget === 'string' ? editTarget : null }, () => executeMcp(name, args, signal, serverId));
+    // A name the resolved list took from an MCP box goes to THAT box's server (#865), never to
+    // whichever server or built-in first claims the name: the model was shown that server's tool.
+    const route = routes instanceof Map ? routes.get(name) : undefined;
+    if (typeof route === 'string' && route) return runMcp(route);
     if (kiwixTools?.names.has(name)) return kiwixTools.execute(name, args);
     // The chat travels along so a Drive update is checked against what THIS chat read (#659).
     if (driveTools?.names.has(name)) return driveTools.execute(scope.getStore()?.authn?.user, name, args, { chatKey: typeof chatKey === 'string' ? chatKey : null, exchangeKey: typeof exchangeKey === 'string' ? exchangeKey : null });
@@ -410,16 +428,9 @@ function createToolboxes({
       const warning = documentSources.notice(f);
       return `${warning ? warning + "\n" : ""}File "${f.name}" (${f.content.length} chars):\n\n${f.content.slice(0, TOOL_RESULT_CAP)}${f.content.length > TOOL_RESULT_CAP ? '\n…[truncated]' : ''}`;
     }
-    // Not a built-in: if the name came from a discovered MCP box, the injected
-    // executor runs it there. The project this call acts for travels in the
-    // request scope, EXTENDING the current store rather than replacing it, so
-    // the workspace and authn the rest of the call depends on survive — and
-    // two interleaved chats each keep their own project (see the scope test).
-    // An approved project file edit also carries the digest of the path its card showed (#648);
-    // only noevia's own server receives it, inside its capability token.
-    if (mcpTools().has(name)) {
-      return scope.run({ ...scope.getStore(), internalCallProject: project || null, internalEditTarget: typeof editTarget === 'string' ? editTarget : null }, () => executeMcp(name, args, signal));
-    }
+    // Not a built-in and no route: if the name came from a discovered MCP box, the injected
+    // executor runs it there — and refuses it if more than one server offers the name.
+    if (mcpTools().has(name)) return runMcp(undefined);
     return fail(`ERROR: unknown tool "${name}"`);
   }
 
