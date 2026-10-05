@@ -294,19 +294,23 @@ async function s3List(conn, connectionPath) {
   if (!response.ok) throw new Error(`storage returned ${response.status}`);
   const { text: body } = await readCappedText(response, LIST_BODY_CAP);
   const entries = [];
-  for (const match of body.matchAll(/<CommonPrefixes><Prefix>([\s\S]*?)<\/Prefix><\/CommonPrefixes>/g)) {
-    const full = match[1].replace(/\/+$/, '');
+  // Forward-only scans (elementTexts, #787): a hostile endpoint's body of unclosed tags cannot make
+  // the old lazy regexes rescan the rest of the body from every opening tag (#833).
+  for (const block of elementTexts(body, 'CommonPrefixes')) {
+    const prefix = firstElementText(block, 'Prefix');
+    if (prefix === undefined) continue;
+    const full = prefix.replace(/\/+$/, '');
     const rel = queryPrefix && full.startsWith(queryPrefix) ? full.slice(queryPrefix.length) : full;
     if (!rel) continue;
     entries.push({ name: rel, path: rel, isDir: true, size: null, ext: '' });
   }
-  for (const match of body.matchAll(/<Contents><Key>([\s\S]*?)<\/Key>([\s\S]*?)<\/Contents>/g)) {
-    const full = match[1];
-    if (full.endsWith('/')) continue;
+  for (const block of elementTexts(body, 'Contents')) {
+    const full = firstElementText(block, 'Key');
+    if (full === undefined || full.endsWith('/')) continue;
     const rel = queryPrefix && full.startsWith(queryPrefix) ? full.slice(queryPrefix.length) : full;
     if (!rel || rel.includes('/')) continue; // direct children only
-    const sizeMatch = match[2].match(/<Size>(\d+)<\/Size>/);
-    entries.push({ name: rel, path: rel, isDir: false, size: sizeMatch ? Number(sizeMatch[1]) : null, ext: extensionOf(rel) });
+    const sizeText = firstElementText(block, 'Size');
+    entries.push({ name: rel, path: rel, isDir: false, size: sizeText !== undefined && /^\d+$/.test(sizeText) ? Number(sizeText) : null, ext: extensionOf(rel) });
   }
   return entries;
 }

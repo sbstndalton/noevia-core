@@ -892,7 +892,7 @@ const requestAuth = require('./device-auth.cjs').createRequestAuth({ enabled: na
 const deviceRoutes = require('./routes/device-auth.cjs').createDeviceAuthRoutes({ json, authResult, readJson, deviceAuth, authService, enabled: nativeClientAuth });
 const authRoutes = require('./routes/auth.cjs').createAuthRoutes({
   json, authResult, readJson, authService, publicAuthRoutes, davSettings, davConfig, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, diaryTenantHeaders: diary.tenantHeaders, env: process.env,
-  mcpOAuth, directoryMcp, chatgptOAuth,
+  mcpOAuth, directoryMcp, chatgptOAuth, onToolsChange: () => permittedToolsCache.clear(),
   // POST /api/admin/secrets/rotate (CSRF-checked by the router like every signed-in POST).
   rotateSecrets: (actorId) => require('./secrets-rotate.cjs').runRotation({ secrets: secretStore, db: authService.db, dataDir: DATA_DIR, audit: authService.audit, actorId }),
 });
@@ -943,6 +943,7 @@ const toolboxRoutes = require('./routes/toolboxes.cjs').createToolboxRoutes({
 const mcpDirectoryRoutes = require('./routes/mcp-directory.cjs').createMcpDirectoryRoutes({
   json, readJson, auth: authService, servers: MCP_SERVERS, mcpState, directoryMcp, mcpOAuth,
   discoverOneServer, discoverMcpTools, probeMcpAuth, syncDirectoryServers, directoryUrlAllowed,
+  onToolsChange: () => permittedToolsCache.clear(),
 });
 
 async function handleRequestInner(req, res) {

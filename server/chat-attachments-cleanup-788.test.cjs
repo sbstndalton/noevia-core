@@ -234,3 +234,37 @@ test('Delete old chats (retention) removes expired chats\' attachments projects 
     assert.ok(allExist(pinned.paths) && allExist(recent.paths) && allExist(host.paths));
   } finally { f.cleanup(); }
 });
+
+test('the orphan sweep removes at most 10 contexts per call by default and drains a backlog over several calls (#826)', async () => {
+  const f = fixture();
+  try {
+    const ids = Array.from({ length: 13 }, (_, i) => `backlog-${i}`);
+    for (const id of ids) { lists.addTombstone(f.alice.dir, id); seedProject(f.alice, CONTEXT(id)); }
+    assert.equal(f.store.removeOrphanChatContexts(), 10);
+    assert.equal(f.alice.projects.length, 3);
+    assert.equal(f.store.removeOrphanChatContexts(), 3);
+    assert.equal(f.store.removeOrphanChatContexts(), 0);
+    await tick();
+    assert.equal(f.alice.projects.length, 0);
+  } finally { f.cleanup(); }
+});
+
+test('a context cleanup failure still lets deleteFreeChat succeed and the chat is gone (#826)', async () => {
+  const f = fixture();
+  const warn = console.warn; const warnings = [];
+  console.warn = (...args) => warnings.push(args.join(' '));
+  try {
+    f.alice.freeChats.push({ id: 'c1', title: 'synthetic' }, { id: 'c2', title: 'neighbour' });
+    seedProject(f.alice, CONTEXT('c1'));
+    // saveProjects throws once, inside the context project delete (the chat list save is a
+    // different method and has already committed by then).
+    let calls = 0;
+    f.alice.saveProjects = function () { calls += 1; if (calls === 1) throw new Error('disk full (synthetic)'); this.saved += 1; };
+    assert.equal(f.store.deleteFreeChat('c1'), true, 'the chat delete succeeds');
+    assert.equal(calls, 1, 'the context delete did try to save');
+    assert.deepEqual(f.alice.freeChats.map((c) => c.id), ['c2'], 'the chat is gone');
+    assert.ok(lists.readTombstones(f.alice.dir).has('c1'), 'and tombstoned');
+    assert.ok(warnings.some((w) => w.includes('could not remove the attachments of deleted chat c1')), 'the failure is logged, not thrown');
+    await tick();
+  } finally { console.warn = warn; f.cleanup(); }
+});

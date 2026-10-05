@@ -10,7 +10,7 @@ const { createAuthRoutes } = require('./auth.cjs');
 
 const publicAuthRoutes = new Set(['/api/setup/status', '/api/setup/complete', '/api/auth/login/password', '/api/auth/login/passkey/options', '/api/auth/login/passkey/verify', '/api/auth/invitations/accept', '/api/auth/recovery/complete']);
 
-function fixture({ users = 1, originOk = true } = {}) {
+function fixture({ users = 1, originOk = true, onToolsChange } = {}) {
   const sent = [], calls = [], headers = [];
   const authService = {
     origin: 'https://noevia.example', userCount: () => users, originValid: () => originOk,
@@ -44,6 +44,7 @@ function fixture({ users = 1, originOk = true } = {}) {
     DIARY_BASE: 'http://diary:8010', DIARY_TOKEN: 'sidecar-token', env: { PUBLIC_ORIGIN: 'https://env.example' },
     mcpOAuth: { forgetUser: (id) => calls.push(['mcpOAuth.forgetUser', id]) },
     directoryMcp: { forgetUser: (id) => calls.push(['directoryMcp.forgetUser', id]) },
+    onToolsChange,
   });
   const call = (mount, method, path, body, { role = 'member', legacy = false, cookie = '', session } = {}) => {
     const req = Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body))]);
@@ -147,4 +148,14 @@ test('deleting an account also removes its workspace, its Drive and its Diary te
   assert.deepEqual(f.calls[2].slice(1), ['u2']);
   assert.deepEqual(f.calls[3].slice(1), ['u2']);
   assert.deepEqual(f.calls[4].slice(1), ['http://diary:8010/api/internal/tenant', 'DELETE', { 'X-Cowork-User-ID': 'u2', Authorization: 'Bearer sidecar-token' }]);
+});
+
+test('#831: the Diary toggle clears the permitted-tools view', async () => {
+  let cleared = 0;
+  const f = fixture({ onToolsChange: () => { cleared += 1; } });
+  await f.call('account', 'PUT', '/api/profile/features', { diaryEnabled: false });
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { diaryEnabled: false } });
+  assert.equal(cleared, 1);
+  await f.call('account', 'GET', '/api/profile/app-passwords');
+  assert.equal(cleared, 1, 'other account routes leave it alone');
 });

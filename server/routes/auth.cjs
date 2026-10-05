@@ -37,7 +37,7 @@ const PASS = Symbol('unhandled');
  * @param {{ forgetUser: (userId:string) => void }} [deps.chatgptOAuth]  Sign in with ChatGPT tokens, keyed per user
  * @param {(actorId:string) => object} [deps.rotateSecrets]  re-encrypts stored credentials under the current key
  */
-function createAuthRoutes({ json, authResult, readJson: readAnyJson, authService, publicAuthRoutes, davSettings, davConfig, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, diaryTenantHeaders = null, env, mcpOAuth, directoryMcp, chatgptOAuth = null, rotateSecrets }) {
+function createAuthRoutes({ json, authResult, readJson: readAnyJson, authService, publicAuthRoutes, davSettings, davConfig, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, diaryTenantHeaders = null, env, mcpOAuth, directoryMcp, chatgptOAuth = null, rotateSecrets, onToolsChange = () => {} }) {
   // Every body these routes read is a JSON object; `null`, an array or a number is a 400 (#786).
   const readJson = requireJsonObject(readAnyJson);
   async function open(req, res, { path: p }) {
@@ -108,7 +108,9 @@ function createAuthRoutes({ json, authResult, readJson: readAnyJson, authService
       return json(res, 200, { ok: true });
     }
     if (p === '/api/profile/features' && req.method === 'PUT') {
-      return json(res, 200, authService.setDiaryEnabled(authn.user.id, !!(await readJson(req)).diaryEnabled));
+      const saved = authService.setDiaryEnabled(authn.user.id, !!(await readJson(req)).diaryEnabled);
+      onToolsChange(); // the Diary toolbox shows as on or off in the permitted-tools view (#831)
+      return json(res, 200, saved);
     }
     if (p === '/api/profile/onboarding' && req.method === 'POST') {
       return json(res, 200, authService.markOnboarded(authn.user.id));

@@ -8,14 +8,14 @@ const { createToolboxes } = require('../toolboxes.cjs');
 const WRITES = new Set(['nc_notes_create', 'drive_create_file']);
 const isWrite = (name) => WRITES.has(name);
 
-function harness({ state, modes = {}, onPolicyChange } = {}) {
+function harness({ state, modes = {}, onPolicyChange, drive = { state: () => ({ configured: false, state: 'not-configured' }) } } = {}) {
   const set = [];
   const policy = {
     mode: (_u, tool, write) => (modes[tool] ? modes[tool] : write ? 'ask' : 'allow'),
     set: (user, tools, mode) => { set.push({ user, tools, mode }); for (const t of tools) modes[t] = mode; },
   };
   const routes = createConnectorRoutes({
-    accounts: { forUser: () => ({ drive: { state: () => ({ configured: false, state: 'not-configured' }) }, backup: null }) },
+    accounts: { forUser: () => ({ drive, backup: null }) },
     driveTools: { names: new Set(['drive_create_file']), labels: { drive_create_file: 'Create file' } },
     policy, offsite: { status: () => null }, isWrite, onPolicyChange,
     json: (res, status, body) => { res.status = status; res.body = body; },
@@ -116,4 +116,21 @@ test('#796: a saved tool permission clears the cached permitted-tools view; a re
   const refused = await run(refusing, { method: 'PUT', body: { tools: ['drive_create_file'], mode: 'allow' } }, '/api/connectors/gdrive/policy');
   assert.equal(refused.status, 400);
   assert.equal(cleared, 2, 'a refused save changed nothing, so nothing is cleared');
+});
+
+test('#831: Drive connect (and its later completion) and disconnect clear the cached permitted-tools view', async () => {
+  let cleared = 0, onConnected = null;
+  const drive = {
+    state: () => ({ configured: true, state: 'pending' }),
+    connect: async (cb) => { onConnected = cb; return { state: 'pending' }; },
+    disconnect: async () => ({ state: 'disconnected' }),
+  };
+  const { routes } = harness({ drive, onPolicyChange: () => { cleared += 1; } });
+  const res = await run(routes, { method: 'POST' }, '/api/connectors/gdrive/connect');
+  assert.equal(res.status, 200);
+  assert.equal(cleared, 1, 'starting the sign-in clears it');
+  await onConnected();
+  assert.equal(cleared, 2, 'so does the sign-in completing on Google\'s page');
+  await run(routes, { method: 'POST' }, '/api/connectors/gdrive/disconnect');
+  assert.equal(cleared, 3, 'disconnecting clears it');
 });

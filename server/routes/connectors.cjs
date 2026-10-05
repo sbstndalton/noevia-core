@@ -10,6 +10,8 @@
 // Nextcloud has no connect button of its own: its tools use the account's storage connection
 // (Settings → Diary & storage), which is where it is connected and disconnected. This page says
 // whether that credential can be used, and owns what each of its tools may do.
+// onPolicyChange clears the cached permitted-tools view; it runs after every write that changes what
+// that view shows: a tool permission, a connect or a disconnect (#796, #831).
 function createConnectorRoutes({ accounts, driveTools, policy, offsite, isWrite, json, readBody, nextcloud = null, onPolicyChange = () => {} }) {
   function view(user) {
     const { drive, backup } = accounts.forUser(user);
@@ -53,10 +55,12 @@ function createConnectorRoutes({ accounts, driveTools, policy, offsite, isWrite,
       if (!path.startsWith('/api/connectors/gdrive/')) return send(404, { error: 'not found' });
       if (action === 'connect' && req.method === 'POST') {
         const { drive, backup } = accounts.forUser(user);
-        await (backup ? offsite.connectGoogle(user.id) : drive.connect(() => {}, { owner: user.id }));
+        // The sign-in completes later, on Google's page: clear the permitted-tools view then too (#831).
+        await (backup ? offsite.connectGoogle(user.id) : drive.connect(() => onPolicyChange(), { owner: user.id }));
+        onPolicyChange();
         return send(200, view(user));
       }
-      if (action === 'disconnect' && req.method === 'POST') { await accounts.forUser(user).drive.disconnect(); return send(200, view(user)); }
+      if (action === 'disconnect' && req.method === 'POST') { await accounts.forUser(user).drive.disconnect(); onPolicyChange(); return send(200, view(user)); }
       if (action === 'policy' && req.method === 'PUT') {
         const body = await readBody(req);
         const tools = [].concat(body.tools || []).filter((t) => driveTools.names.has(t));

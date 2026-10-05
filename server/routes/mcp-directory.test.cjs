@@ -288,3 +288,21 @@ test('#796: a body that is not a JSON object is a 400 on every admin directory w
   }
   assert.deepEqual(calls, [], 'nothing was added or changed');
 });
+
+test('#831: an OAuth sign-in finishing and a sign-out clear the permitted-tools view; a failed sign-in does not', async () => {
+  let cleared = 0;
+  const callback = (finish) => {
+    const { routes } = build({ onToolsChange: () => { cleared += 1; }, mcpOAuth: { finish, disconnect() {}, connected: () => true, clientInfo: () => null } });
+    const res = { writeHead() {}, end() {} };
+    return routes({ method: 'GET', url: '/api/mcp-oauth/callback?state=s&code=c' }, res, { path: '/api/mcp-oauth/callback', authn: member });
+  };
+  await callback(async () => ({ purpose: 'connect' }));
+  assert.equal(cleared, 1, 'the sign-in callback clears it');
+  await callback(async () => { throw new Error('bad state'); });
+  assert.equal(cleared, 1, 'a failed sign-in changed nothing');
+  const { routes } = build({ onToolsChange: () => { cleared += 1; } });
+  const res = fakeRes();
+  await routes(req('DELETE'), res, { path: '/api/mcp-oauth/dir-a', authn: member });
+  assert.equal(res.out.code, 200);
+  assert.equal(cleared, 2, 'signing out clears it');
+});

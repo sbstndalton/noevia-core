@@ -148,8 +148,9 @@ function createProjectStore({
   // refuse it), and ids are random, so a tombstoned id is gone for good. A context whose chat is
   // merely absent from every list is NOT removed: a new chat creates its context when it opens,
   // before its first message saves the meta, so absence alone may be a chat open in a tab right
-  // now. Idempotent; bounded per call so a large backlog cannot stall the request that runs it.
-  function removeOrphanChatContexts({ limit = 50 } = {}) {
+  // now. Idempotent; bounded per call (default 10, each one a full projects.json rewrite) so a large
+  // backlog drains over a few workspace loads instead of stalling the first request that runs it.
+  function removeOrphanChatContexts({ limit = 10 } = {}) {
     const prefix = 'cowork-chat-context-';
     const contexts = PROJECTS.filter((p) => p && typeof p.id === 'string' && p.id.startsWith(prefix));
     if (!contexts.length) return 0;

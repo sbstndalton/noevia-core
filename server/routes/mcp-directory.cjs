@@ -20,7 +20,7 @@ const PREVIEW_TTL_MS = 5 * 60 * 1000;
 // Returns true when it handled the request. Discovery and the directory state stay in
 // index.cjs and are injected; `servers` is the live MCP_SERVERS array (mutated in place by
 // `syncDirectoryServers`), never a copy.
-function createMcpDirectoryRoutes({ json, readJson, auth, servers: MCP_SERVERS, mcpState, directoryMcp, mcpOAuth, discoverOneServer, discoverMcpTools, probeMcpAuth, syncDirectoryServers, directoryUrlAllowed }) {
+function createMcpDirectoryRoutes({ json, readJson, auth, servers: MCP_SERVERS, mcpState, directoryMcp, mcpOAuth, discoverOneServer, discoverMcpTools, probeMcpAuth, syncDirectoryServers, directoryUrlAllowed, onToolsChange = () => {} }) {
   const reply = (res, code, body) => (json(res, code, body), true);
   // A body that parses but is not an object (null, a number, an array) is the client's mistake: it
   // takes the same 400 as unparseable JSON instead of a TypeError further down (#796).
@@ -73,7 +73,7 @@ function createMcpDirectoryRoutes({ json, readJson, auth, servers: MCP_SERVERS, 
       catch (e) { return reply(res, e.status || 502, { error: e.needsClient ? 'An administrator has to finish setting this server up before anyone can sign in.' : e.message }); }
     }
     const oauthDrop = p.match(/^\/api\/mcp-oauth\/([a-z0-9-]+)$/);
-    if (authn && oauthDrop && req.method === 'DELETE') { mcpOAuth.disconnect(authn.user.id, oauthDrop[1]); return reply(res, 200, { ok: true }); }
+    if (authn && oauthDrop && req.method === 'DELETE') { mcpOAuth.disconnect(authn.user.id, oauthDrop[1]); onToolsChange(); return reply(res, 200, { ok: true }); }
     if (authn && p === '/api/mcp-oauth/callback' && req.method === 'GET') {
       const q = new URL(req.url, 'http://local').searchParams;
       const page = (ok, text) => { res.writeHead(ok ? 200 : 400, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'" });
@@ -82,6 +82,7 @@ function createMcpDirectoryRoutes({ json, readJson, auth, servers: MCP_SERVERS, 
       try {
         const done = await mcpOAuth.finish({ userId: authn.user.id, state: q.get('state'), code: q.get('code') });
         await discoverMcpTools(true); // an admin's (re-)sign-in may be what the tool list was waiting for
+        onToolsChange(); // this account is now ready for the server: the permitted-tools view changed (#831)
         return page(true, done.purpose === 'add' ? 'The server is added. Choose it under a project’s Tools; each person signs in from Plugins → Connected.' : 'Your account is connected. Its tools are now offered in projects that chose this server.');
       } catch (e) { return page(false, e.message); }
     }

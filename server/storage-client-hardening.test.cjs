@@ -185,3 +185,47 @@ test('#784/#787: unterminated collection tags in a 4 MB file-state body are chec
   const ms = Number(process.hrtime.bigint() - started) / 1e6;
   assert.ok(ms < 1000, `fileVersion took ${ms.toFixed(0)} ms`);
 });
+
+// #833: the S3 ListObjects parse uses the same forward-only scan.
+function startRawS3(t, body) {
+  const server = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => { res.writeHead(200, { 'Content-Type': 'application/xml' }); res.end(body); });
+  });
+  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => {
+    t.after(() => new Promise((r) => server.close(r)));
+    resolve({ kind: 's3', baseUrl: `http://127.0.0.1:${server.address().port}`, bucket: 'b', username: 'ak', secret: 'sk', corpusRoot: 'Cowork' });
+  }));
+}
+
+test('#833: a 4 MB S3 listing of unclosed tags parses in bounded time', async (t) => {
+  const bodies = {
+    'unclosed CommonPrefixes': unclosed('<CommonPrefixes><Prefix>Cowork/a/'),
+    'unclosed Contents': unclosed('<Contents><Key>Cowork/a.md</Key>'),
+    'unclosed Key and Size inside one Contents': `<ListBucketResult><Contents>${unclosed('<Key>')}${unclosed('<Size>')}</Contents></ListBucketResult>`,
+    'unclosed Prefix inside one CommonPrefixes': `<ListBucketResult><CommonPrefixes>${unclosed('<Prefix>')}</CommonPrefixes></ListBucketResult>`,
+  };
+  for (const [label, body] of Object.entries(bodies)) {
+    const conn = await startRawS3(t, body);
+    const started = process.hrtime.bigint();
+    await listFiles(conn, '');
+    const ms = Number(process.hrtime.bigint() - started) / 1e6;
+    assert.ok(ms < 1000, `${label}: listing took ${ms.toFixed(0)} ms`);
+  }
+});
+
+test('#833: the S3 listing still returns folders and direct-child files with sizes', async (t) => {
+  const body = '<?xml version="1.0"?><ListBucketResult><Prefix>Docs/</Prefix>'
+    + '<Contents><Key>Docs/</Key><Size>0</Size></Contents>'
+    + '<Contents><Key>Docs/notes.md</Key><LastModified>x</LastModified><Size>42</Size></Contents>'
+    + '<Contents><Key>Docs/no-size.md</Key></Contents>'
+    + '<Contents><Key>Docs/bad-size.md</Key><Size>big</Size></Contents>'
+    + '<Contents><Key>Docs/deep/x.md</Key><Size>1</Size></Contents>'
+    + '<CommonPrefixes><Prefix>Docs/sub/</Prefix></CommonPrefixes>'
+    + '<Contents><Key>Docs/unclosed.md</Key><Size>7</Size></ListBucketResult>';
+  const conn = await startRawS3(t, body);
+  const listed = await listFiles({ ...conn, corpusRoot: '' }, 'Docs');
+  assert.deepEqual(listed.map(({ name, isDir, size }) => [name, isDir, size]).sort((a, b) => a[0].localeCompare(b[0])), [
+    ['bad-size.md', false, null], ['no-size.md', false, null], ['notes.md', false, 42], ['sub', true, null],
+  ]);
+});
