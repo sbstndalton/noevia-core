@@ -155,9 +155,8 @@ test('the reasons a feature is unavailable carry a stable id where the server ow
   assert.equal('unavailableId' in info.find(f => f.id === 'previews'), false);
 });
 
-// astraReview was renamed plannerReview (2026-09-29). One release of back-compat: the stored
-// setting is migrated on boot (old row kept), the old env var still works with a deprecation line,
-// and the old name is accepted as an alias.
+// astraReview was renamed plannerReview (2026-09-29). Back-compat kept: the stored setting is
+// migrated on boot (old row kept) and the old name is accepted as an alias. The old env var is gone.
 test('plannerReview: a stored astraReview setting is copied to the new key on boot, and the old row is left', () => {
   const store = memoryStore({ 'feature:astraReview': 'true' }); const lines = [];
   const features = createFeatures({ env: {}, store, log: l => lines.push(l) });
@@ -197,16 +196,11 @@ test('plannerReview: stays off by default, and nothing is written when there is 
   assert.equal('astraReview' in REGISTRY, false);
 });
 
-test('plannerReview: NOEVIA_FEATURE_ASTRA_REVIEW still works, with one deprecation line; the new env var wins', () => {
+test('plannerReview: the removed NOEVIA_FEATURE_ASTRA_REVIEW env var is ignored, and only the new env var pins it', () => {
   const lines = [];
   const legacy = createFeatures({ env: { NOEVIA_FEATURE_ASTRA_REVIEW: 'true' }, store: memoryStore(), log: l => lines.push(l) });
-  assert.equal(legacy.enabled('plannerReview'), true);
-  assert.equal(legacy.describe().find(f => f.name === 'plannerReview').locked, true);
-  assert.equal(lines.length, 1);
-  assert.match(lines[0], /NOEVIA_FEATURE_ASTRA_REVIEW is deprecated.*NOEVIA_FEATURE_PLANNER_REVIEW/);
-  lines.length = 0;
-  const both = createFeatures({ env: { NOEVIA_FEATURE_PLANNER_REVIEW: 'false', NOEVIA_FEATURE_ASTRA_REVIEW: 'true' }, store: memoryStore(), log: l => lines.push(l) });
-  assert.equal(both.enabled('plannerReview'), false);
+  assert.equal(legacy.enabled('plannerReview'), false);
+  assert.equal(legacy.describe().find(f => f.name === 'plannerReview').locked, false);
   assert.deepEqual(lines, []);
   assert.equal(createFeatures({ env: { NOEVIA_FEATURE_PLANNER_REVIEW: 'true' }, log: () => {} }).enabled('plannerReview'), true);
 });

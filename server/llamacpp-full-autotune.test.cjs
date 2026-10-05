@@ -55,7 +55,7 @@ function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnl
     return new Response(`data: ${JSON.stringify({ choices: [{ delta: { content } }], timings: { prompt_n: Math.floor(text.length / 5), prompt_ms: 100, prompt_per_second: 100000 } })}\n\ndata: [DONE]\n\n`);
   };
   const makeManager = () => createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic', presetPath: ini, fetchJson, fetchStream,
-    calibrationStatePath: path.join(dir, 'cal.json'), autotuneStatePath: stateFile, autotuneTablePath: path.join(dir, 'table.json'),
+    calibrationStatePath: path.join(dir, 'cal.json'), autotuneStatePath: stateFile,
     calibrationOptions: { sleep: async () => {}, readMemory: () => 20 },
     autotuneOptions: { ...(unloadPolls || unloadStuck ? { sleep: async () => {} } : {}), betweenModelsMs: 25, idleTimeoutMs, readMemory: () => 20, identityFor: async m => (++identityReads > 1 && loseIdentityAfterStart ? null : { model: m, hardware: 'fake', build }) } });
   let manager = makeManager();

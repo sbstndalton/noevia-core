@@ -414,9 +414,6 @@ test('resume is admin-only, POST-only and passes renewed pause confirmation', as
   await f.call('POST', '/api/models/autotune/resume', { confirmPause: true }, 'admin');
   assert.equal(f.sent.pop().status, 202);
   assert.deepEqual(calls, [{ confirmPause: undefined }, { confirmPause: true }]);
-  const speedOnly = fixture({ manager: { autotune: { start: () => ({ status: 202, body: {} }) } } });
-  await speedOnly.call('POST', '/api/models/autotune/resume', { confirmPause: true }, 'admin');
-  assert.deepEqual(speedOnly.sent.pop(), { status: 404, body: { error: 'Resume is unavailable' } });
 });
 
 test('the default model mode round-trips, and only an explicit apply switches existing projects', async () => {

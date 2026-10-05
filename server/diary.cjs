@@ -19,7 +19,7 @@
  * @param {string} deps.DIARY_BASE
  * @param {string} deps.DIARY_TOKEN
  * @param {string} [deps.DIARY_TENANT_KEY]  HMAC key for the per-request tenant assertion (M2)
- * @param {string} deps.DIARY_SOURCE
+ * @param {string} deps.DIARY_SOURCE      must be 'sidecar'; any other value throws at startup
  * @param {object} deps.requestScope        AsyncLocalStorage carrying { workspace, authn }
  * @param {object} deps.authService
  * @param {(authn, url:string) => boolean} deps.endpointApproved
@@ -106,48 +106,40 @@ function createDiary({ fs, path, fetchJson, DIARY_BASE, DIARY_TOKEN, DIARY_TENAN
 
   // ── Corpus-source adapter (Diary tab reads) ────────────────────────────────
   // Contract: listMonths() → [{id,label}]; readMonth(id) → {todayLog, standing}.
-  // v1 source: 'sidecar' (Nextcloud via diary-companion's read API). Planned:
-  // 'local' (DIARY_LOCAL_DIR) when/if the corpus moves off Nextcloud. WRITES are
-  // never here — they go through the sidecar pipeline via the diary alias.
-  const corpusSource =
-    DIARY_SOURCE === 'sidecar'
-      ? {
-          name: 'sidecar',
-          async listMonths() {
-            // Real month list from the sidecar (PROPFIND over the corpus dir).
-            // Returns only months that actually have a corpus file — the client
-            // synthesizes a "Today" entry itself, and a first-run user must see
-            // an empty list so the diary zero-state can trigger. Tolerant: on
-            // failure, return an empty list (today's file still renders when
-            // navigated to directly).
-            try {
-              const r = await diaryFetchJson(`${DIARY_BASE}/api/months`, {}, 15000);
-              return (r.ok && Array.isArray(r.body?.months) ? r.body.months : [])
-                .filter((m) => m && typeof m.id === 'string' && /^\d{4}-\d{2}$/.test(m.id))
-                .map((m) => ({ id: m.id, label: m.label || m.id }))
-                .sort((a, b) => a.id.localeCompare(b.id));
-            } catch {
-              return [];
-            }
-          },
-          async readMonth(monthId) {
-            const q = monthId ? `?month=${encodeURIComponent(monthId)}` : '';
-            const r = await diaryFetchJson(`${DIARY_BASE}/api/day${q}`, {}, 15000);
-            if (!r.ok) throw new Error(`sidecar ${r.status}`);
-            // Whole-month mode returns { month, log }; today mode returns { today_log }.
-            const log = (r.body && (r.body.log ?? r.body.today_log)) || '';
-            return { todayLog: log, standing: (r.body && r.body.standing) || '' };
-          },
-        }
-      : {
-          name: DIARY_SOURCE,
-          async listMonths() {
-            throw new Error(`corpus source '${DIARY_SOURCE}' not implemented yet (planned: local)`);
-          },
-          async readMonth() {
-            throw new Error(`corpus source '${DIARY_SOURCE}' not implemented yet (planned: local)`);
-          },
-        };
+  // The only source is 'sidecar' (Nextcloud via diary-companion's read API). Any other
+  // DIARY_SOURCE fails at startup rather than serving a stub that throws on every read.
+  // WRITES are never here — they go through the sidecar pipeline via the diary alias.
+  if (DIARY_SOURCE !== 'sidecar') {
+    throw new Error(`Unsupported DIARY_SOURCE '${DIARY_SOURCE}': only 'sidecar' is supported (unset DIARY_SOURCE to use it)`);
+  }
+  const corpusSource = {
+    name: 'sidecar',
+    async listMonths() {
+      // Real month list from the sidecar (PROPFIND over the corpus dir).
+      // Returns only months that actually have a corpus file — the client
+      // synthesizes a "Today" entry itself, and a first-run user must see
+      // an empty list so the diary zero-state can trigger. Tolerant: on
+      // failure, return an empty list (today's file still renders when
+      // navigated to directly).
+      try {
+        const r = await diaryFetchJson(`${DIARY_BASE}/api/months`, {}, 15000);
+        return (r.ok && Array.isArray(r.body?.months) ? r.body.months : [])
+          .filter((m) => m && typeof m.id === 'string' && /^\d{4}-\d{2}$/.test(m.id))
+          .map((m) => ({ id: m.id, label: m.label || m.id }))
+          .sort((a, b) => a.id.localeCompare(b.id));
+      } catch {
+        return [];
+      }
+    },
+    async readMonth(monthId) {
+      const q = monthId ? `?month=${encodeURIComponent(monthId)}` : '';
+      const r = await diaryFetchJson(`${DIARY_BASE}/api/day${q}`, {}, 15000);
+      if (!r.ok) throw new Error(`sidecar ${r.status}`);
+      // Whole-month mode returns { month, log }; today mode returns { today_log }.
+      const log = (r.body && (r.body.log ?? r.body.today_log)) || '';
+      return { todayLog: log, standing: (r.body && r.body.standing) || '' };
+    },
+  };
 
   async function callDiaryFile(userId, endpoint, method, body) {
     const workspace = workspaceStore.get(userId);

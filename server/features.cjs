@@ -37,9 +37,10 @@ const REGISTRY = Object.freeze({
   offsiteBackup: { env: 'NOEVIA_FEATURE_OFFSITE_BACKUP', label: 'Backups', description: 'Nightly encrypted copies of the whole server, to a folder mirrored to Google Drive or to an S3-compatible target.' },
   toolRouter: { env: 'NOEVIA_FEATURE_TOOL_ROUTER', label: 'Tool routing', description: "Send only the project's toolboxes that match each message (needs an embedding model); falls back to all of them." },
   codeHarness: { env: 'NOEVIA_FEATURE_CODE_HARNESS', label: 'Code mode', description: 'Administrators can run a coding harness in a per-task git worktree, with every write through the approval card.' },
-  // Renamed from astraReview (2026-09-29). For one release the old stored setting, the old env var
-  // and the old name on the admin API are still honoured (`legacy`, see createFeatures).
-  plannerReview: { env: 'NOEVIA_FEATURE_PLANNER_REVIEW', legacy: { name: 'astraReview', env: 'NOEVIA_FEATURE_ASTRA_REVIEW' }, experimental: true, label: 'Planner review (Code mode)', description: 'After a Code task finishes, a reviewer model reads the change and gives an approve or request-changes verdict on a final card. It is advice only: you still accept or decline the change, and a failed or late review falls back to your own review.' },
+  // Renamed from astraReview (2026-09-29). The old stored setting is still migrated once on read
+  // and the old name is still accepted on the admin API (`legacy`, see createFeatures). The old
+  // NOEVIA_FEATURE_ASTRA_REVIEW env var is no longer read.
+  plannerReview: { env: 'NOEVIA_FEATURE_PLANNER_REVIEW', legacy: { name: 'astraReview' }, experimental: true, label: 'Planner review (Code mode)', description: 'After a Code task finishes, a reviewer model reads the change and gives an approve or request-changes verdict on a final card. It is advice only: you still accept or decline the change, and a failed or late review falls back to your own review.' },
   browserExecutor: { env: 'NOEVIA_FEATURE_BROWSER_EXECUTOR', unavailable: () => browserRuntimeReason(), label: 'Browser mode', description: 'Administrators can run a domain-scoped Chromium session as a durable job, with every consequential action through the approval card.' },
   // Available since the Code pipeline (#705) runs the Planner's plan step.
   constrainedPlanDecoding: { env: 'NOEVIA_FEATURE_CONSTRAINED_PLAN_DECODING', experimental: true, label: 'Constrained plan decoding', description: 'Ask the local llama.cpp engine to constrain the plan artifact to its JSON schema. Adds to the after-the-fact validation and falls back to unconstrained generation for reasoning models or when the engine rejects it.' },
@@ -101,7 +102,7 @@ function parseEnv(raw) {
  *           audit?: (action:string, actor:string, detail:object)=>void, registry?: object }} deps
  */
 /**
- * A renamed feature's stored setting, carried over once (one-release back-compat): when the new
+ * A renamed feature's stored setting, carried over once (back-compat): when the new
  * key has no valid value and the legacy key has one, the legacy value is copied to the new key.
  * The legacy row is left in place so a rollback to the previous release still reads it. A store
  * that cannot be written still answers with the legacy value for this boot.
@@ -126,11 +127,7 @@ function createFeatures({ env = process.env, store = null, audit = () => {}, reg
   // Old flag names still accepted on input (the admin API, enabled()) for one release.
   const aliases = new Map();
   for (const [name, spec] of Object.entries(registry)) {
-    let fromEnv = parseEnv(env[spec.env]);
-    if (fromEnv === undefined && spec.legacy?.env) {
-      fromEnv = parseEnv(env[spec.legacy.env]);
-      if (fromEnv !== undefined) log(`[features] ${spec.legacy.env} is deprecated and will be removed in the next release; set ${spec.env} instead.`);
-    }
+    const fromEnv = parseEnv(env[spec.env]);
     if (spec.legacy?.name) aliases.set(spec.legacy.name, name);
     let value = spec.default === true;
     let source = 'default';

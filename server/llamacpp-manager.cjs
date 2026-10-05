@@ -22,7 +22,7 @@ function keepAlongside(env = process.env) {
   return [...(e && e !== 'default' ? [e] : []), ...(r ? [r] : [])];
 }
 
-function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig = {}, calibrationStatePath, calibrationOptions = {}, evidenceDir, autotuneStatePath, autotuneTablePath, autotuneOptions = {}, presetWriter = null, unloadWait = {}, inferenceBudget = null }) {
+function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig = {}, calibrationStatePath, calibrationOptions = {}, evidenceDir, autotuneStatePath, autotuneOptions = {}, presetWriter = null, unloadWait = {}, inferenceBudget = null }) {
   const base = String(baseUrl || '').replace(/\/+$/, '').replace(/\/v1$/, '');
   const url = new URL(base);
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw Error('Invalid llama.cpp router URL');
@@ -546,24 +546,20 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
       hardware:[autoconfig.hardwareLabel||null,memGiB?`${memGiB}GiB`:null,JSON.stringify(build)].filter(Boolean).join(' ')||null};
   }
   const calibrator=presets?require('./llamacpp-calibration.cjs').createCalibrator({request,rawModels,presets,maintenance,applyUnlocked,conservativeFor,onResult:({model,status,entry})=>recordEvidence(model,status==='passed'?{category:'context_capacity',result:'passed',value:{ctx:entry.verifiedCtx,appliedCtx:entry.appliedCtx,slots:entry.slots},suite:{name:'native-calibration',version:1},source:'calibration',limitations:[`prompt budget ${entry.promptBudgetSeconds} s`]}:{category:'context_capacity',result:'failed',value:null,suite:{name:'native-calibration',version:1},source:'calibration',limitations:[String(entry.error||'').slice(0,200)]}),stream:(path,opts={})=>(fetchStream||fetch)(base+path,{...opts,headers:headers(opts.headers),redirect:'error'}),stateFile:calibrationStatePath,memoryFloorGib:autoconfig.memoryFloorGib||2,...calibrationOptions}):null;
-  const speedDeps={request,rawModels,presets,maintenance,applyUnlocked,identityFor:tuneIdentity,
-    calibrate:(model,promptBudgetSeconds)=>calibrator.start(model,{confirmPause:true,promptBudgetSeconds}),
-    stateFile:autotuneStatePath,tableFile:autotuneTablePath,memoryFloorGib:autoconfig.memoryFloorGib||2,...(calibrationOptions.readMemory?{readMemory:calibrationOptions.readMemory}:{}),...autotuneOptions};
+  const tuneDeps={identityFor:tuneIdentity,stateFile:autotuneStatePath,memoryFloorGib:autoconfig.memoryFloorGib||2,...(calibrationOptions.readMemory?{readMemory:calibrationOptions.readMemory}:{}),...autotuneOptions};
   // Internal context checks run under the full tuner's per-model lease; standalone
   // calibration still acquires the real gate.
   const managedGate={hold:()=>()=>{}};
-  const autotuner=presets&&autotuneStatePath?(autotuneOptions.speedOnly===true
-    ?require('./llamacpp-autotune.cjs').createAutotuner(speedDeps)
-    :require('./llamacpp-full-autotune.cjs').createFullAutotuner({fileMissing:presetFileMissing,request,rawModels,presets,maintenance,applyUnlocked,identityFor:speedDeps.identityFor,stateFile:autotuneStatePath,
+  const autotuner=presets&&autotuneStatePath?require('./llamacpp-full-autotune.cjs').createFullAutotuner({fileMissing:presetFileMissing,request,rawModels,presets,maintenance,applyUnlocked,identityFor:tuneDeps.identityFor,stateFile:autotuneStatePath,
       samplingFor,
-      readMemory:speedDeps.readMemory,memoryFloorGib:speedDeps.memoryFloorGib,
+      readMemory:tuneDeps.readMemory,memoryFloorGib:tuneDeps.memoryFloorGib,
       ...(autotuneOptions.betweenModelsMs!=null?{betweenModelsMs:autotuneOptions.betweenModelsMs}:{}),
       ...(autotuneOptions.idleTimeoutMs!=null?{idleTimeoutMs:autotuneOptions.idleTimeoutMs}:{}),
       ...(autotuneOptions.sleep?{sleep:autotuneOptions.sleep}:{}),
       onResult:async({model,result})=>{for(const [category,value] of [['context_capacity',{ctx:result.context,appliedCtx:result.context,slots:Number(presets.get(model).options.parallel)||1}],['throughput',{rate:result.generation}],...(result.acceptance==null?[]:[['mtp_acceptance',{rate:result.acceptance/100}]])])await recordEvidence(model,{category,result:'passed',value,suite:{name:'full-autotune',version:3},source:'autotune',limitations:['Three deterministic quality smoke probes, not a general quality benchmark','120 s default prompt budget; existing MTP head only',...(result.baseline?.skipped?.length?[`Probes not used (failed at the model's reference settings): ${result.baseline.skipped.map(s=>s.id).join(', ')}`]:[])]});},
       contextFactory:hooks=>require('./llamacpp-calibration.cjs').createCalibrator({request,rawModels,presets,applyUnlocked,conservativeFor,maintenance:managedGate,
         stream:(path,opts={})=>(fetchStream||fetch)(base+path,{...opts,headers:headers(opts.headers),redirect:'error'}),
-        memoryFloorGib:autoconfig.memoryFloorGib||2,...calibrationOptions,stateFile:undefined,...hooks})})):null;
+        memoryFloorGib:autoconfig.memoryFloorGib||2,...calibrationOptions,stateFile:undefined,...hooks})}):null;
   return {
     kind: 'llamacpp', enabled: true, baseUrl: base, headers, request,
     capabilities: { routing: true, load: true, unload: true, download: true, deleteCached: true, runtimeOptions: false, hardware: false, presets: !!presets, autotune: !!autotuner },

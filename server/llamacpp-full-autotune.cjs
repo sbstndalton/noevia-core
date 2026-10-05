@@ -2,7 +2,7 @@
 // A durable ordered script: one model lease, then KV, context, drafting and batch commits.
 const fs = require('node:fs');
 const crypto = require('node:crypto');
-const { WORKLOADS, SPEC_CANDIDATES, geomean } = require('./llamacpp-autotune.cjs');
+const { WORKLOADS, SPEC_CANDIDATES, geomean } = require('./llamacpp-tune-spec.cjs');
 const { hasHarmonyReasoning, quirksOf, toIniOptions, INI_KEY_LIST } = require('./sampling-recommendation.cjs');
 const { isSystemModel, modelPathFromArgs, SYSTEM_MODEL_REASON } = require('./model-system.cjs');
 const VERSION = 3;
@@ -123,7 +123,6 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
   const check = () => { if (cancelled) throw cancelledError(); };
   const note = (j, text) => { (j.log ||= []).push({ at: now(), text }); if (j.log.length > 400) j.log.shift(); save(); };
   const phaseOf = (item, id) => item.phases.find(p => p.id === id);
-  const currentPhase = item => item.phases.find(p => p.status !== 'passed');
   // kvCandidates: the list this server really tries, so the panel never describes another build's.
   const status = model => ({ ok: true, status: 200, body: { job: publicJob(state.job), history: model ? state.history[model] || [] : [], kvCandidates: kvCandidates() } });
   async function signature(model, suppliedIdentity) {

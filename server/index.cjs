@@ -220,8 +220,6 @@ const modelManager = createModelManager({
   evidenceDir: path.join(DATA_DIR,'evidence-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)),
   calibrationStatePath: path.join(DATA_DIR,'native-calibration-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)+'.json'),
   autotuneStatePath: path.join(DATA_DIR,'native-autotune-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)+'.json'),
-  // Measured settings per architecture, quantisation and hardware; shared across models on this server.
-  autotuneTablePath: path.join(DATA_DIR,'native-tuning-table.json'),
   downloadStatePath: path.join(DATA_DIR,'native-downloads-'+require('node:crypto').createHash('sha256').update(MODEL_MANAGER_BASE).digest('hex').slice(0,16)+'.json'),
   baseUrl: MODEL_MANAGER_BASE,
   apiKey: process.env.MODEL_MANAGER_API_KEY || INFERENCE_KEY,

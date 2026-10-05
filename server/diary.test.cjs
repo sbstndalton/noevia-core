@@ -73,11 +73,9 @@ test('the sidecar corpus source lists real months sorted and reads a month or to
   await assert.rejects(failing.diary.corpusSource.readMonth(null), /sidecar 503/);
 });
 
-test('an unimplemented corpus source says so by name', async () => {
-  const { diary } = fixture({ source: 'local' });
-  assert.equal(diary.corpusSource.name, 'local');
-  await assert.rejects(diary.corpusSource.listMonths(), /corpus source 'local' not implemented yet/);
-  await assert.rejects(diary.corpusSource.readMonth('x'), /corpus source 'local' not implemented yet/);
+test('an unsupported DIARY_SOURCE fails at startup and names the value', () => {
+  assert.throws(() => fixture({ source: 'local' }), /Unsupported DIARY_SOURCE 'local': only 'sidecar' is supported/);
+  assert.throws(() => fixture({ source: '' }), /Unsupported DIARY_SOURCE ''/);
 });
 
 test('callDiaryFile runs as the named user and refuses accounts without the Diary', async () => {
