@@ -583,10 +583,15 @@ const MCP_INTERNAL_KEY = secretStore.derive('mcp-internal-token');
 
 const directoryMcp = require('./directory-mcp.cjs').createDirectoryMcp({ db: authService.db, secrets: secretStore, audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) });
 const directoryUrlAllowed = createDirectoryUrlAllowed({ isPublicUrl, allowLoopback: process.env.NOEVIA_QA_ALLOW_LOOPBACK_MCP === '1' });
+// Every request to a directory/custom server and its OAuth endpoints: the address is checked
+// again at connect time, so a name that re-resolves after directoryUrlAllowed (DNS rebinding,
+// #795) cannot reach a private one. The operator's MCP_SERVERS keep the ordinary fetch.
+const mcpPublicFetch = require('./public-fetch.cjs').createPublicFetch({ allowLoopbackLiteral: process.env.NOEVIA_QA_ALLOW_LOOPBACK_MCP === '1' });
 // OAuth sign-in for directory servers: one sign-in per account per server (mcp-oauth.cjs).
 // Its URLs come from strangers' metadata, so they must be https (or the QA loopback) and public.
 const mcpOAuth = require('./mcp-oauth.cjs').createMcpOAuth({
   db: authService.db, secrets: secretStore, audit: (action, actor, detail) => authService.audit(action, actor, actor, detail),
+  fetchImpl: mcpPublicFetch,
   urlAllowed: async (url) => require('./directory-mcp.cjs').hostedUrlOk(url) && directoryUrlAllowed(url),
   redirectUri: () => `${String(authService.origin || process.env.PUBLIC_ORIGIN || '').replace(/\/$/, '')}/api/mcp-oauth/callback`,
 });
@@ -601,6 +606,7 @@ const mcpCredentialOriginAllowed = createCredentialOriginCheck(process.env.MCP_N
 // It appends the directory servers to MCP_SERVERS itself and keeps that array current.
 const mcpWiring = createMcpWiring({
   servers: MCP_SERVERS, manifest: MCP_TOOLBOX_MANIFEST, mcp, bindBoxes, directoryMcp, mcpOAuth, directoryUrlAllowed,
+  publicFetch: mcpPublicFetch,
   credentialOriginAllowed: mcpCredentialOriginAllowed, scope: requestScope,
   storageFor: (userId) => authService.getStorage(userId, true),
   isWriteTool: (name) => isWriteTool(name),

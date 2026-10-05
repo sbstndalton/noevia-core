@@ -120,7 +120,12 @@ function withBuiltInHeaders(extra, builtIn) {
 
 // One JSON-RPC round trip. `session` is mutated to carry the id the server
 // hands out at initialize.
-async function rpc(baseUrl, session, body, { headers = {}, timeoutMs = 30000, notify = false, signal } = {}) {
+//
+// `fetchImpl`, here and on every exported call below, replaces the global fetch
+// for one server: directory servers go through public-fetch.cjs so their
+// address is checked at connect time (#795). Omitted, the global fetch is used,
+// looked up at call time.
+async function rpc(baseUrl, session, body, { headers = {}, timeoutMs = 30000, notify = false, signal, fetchImpl } = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   // `signal`, when given, is the caller's own lifetime (e.g. the chat's
@@ -133,7 +138,7 @@ async function rpc(baseUrl, session, body, { headers = {}, timeoutMs = 30000, no
     else signal.addEventListener('abort', forwardAbort);
   }
   try {
-    const res = await fetch(baseUrl, {
+    const res = await (fetchImpl || fetch)(baseUrl, {
       method: 'POST',
       headers: withBuiltInHeaders(headers, {
         'Content-Type': 'application/json',
@@ -171,22 +176,22 @@ async function rpc(baseUrl, session, body, { headers = {}, timeoutMs = 30000, no
 // `signal`, when given, is the caller's own lifetime — e.g. the browser
 // connection for the chat this tool call belongs to — so a disconnect stops
 // the handshake rather than leaving it to run out its own timeout.
-async function connect(baseUrl, authHeaders = {}, timeoutMs = 30000, signal) {
+async function connect(baseUrl, authHeaders = {}, timeoutMs = 30000, signal, fetchImpl) {
   const session = { id: null };
   try {
     const info = await rpc(baseUrl, session, {
       jsonrpc: '2.0', id: requestId(), method: 'initialize',
       params: { protocolVersion: PROTOCOL_VERSION, capabilities: {}, clientInfo: CLIENT_INFO },
-    }, { headers: authHeaders, timeoutMs, signal });
+    }, { headers: authHeaders, timeoutMs, signal, fetchImpl });
     await rpc(baseUrl, session, { jsonrpc: '2.0', method: 'notifications/initialized' },
-      { headers: authHeaders, timeoutMs, notify: true, signal });
+      { headers: authHeaders, timeoutMs, notify: true, signal, fetchImpl });
     return { session, serverInfo: info && info.serverInfo };
   } catch (error) {
     // Callers cannot close a session until connect returns it. The server may
     // already have issued an ID even when initialize response parsing fails.
     // Cleanup itself is deliberately NOT tied to `signal`: an aborted chat
     // still deserves its MCP session closed rather than left dangling.
-    await disconnect(baseUrl, session, authHeaders, Math.min(timeoutMs, 5000), signal);
+    await disconnect(baseUrl, session, authHeaders, Math.min(timeoutMs, 5000), signal, fetchImpl);
     throw error;
   }
 }
@@ -209,14 +214,14 @@ async function connect(baseUrl, authHeaders = {}, timeoutMs = 30000, signal) {
 // session deserves closing), but a cancelled caller waits at most
 // ABORTED_DISCONNECT_MS for it rather than the full timeout.
 const ABORTED_DISCONNECT_MS = 1000;
-async function disconnect(baseUrl, session, authHeaders = {}, timeoutMs = 5000, signal) {
+async function disconnect(baseUrl, session, authHeaders = {}, timeoutMs = 5000, signal, fetchImpl) {
   if (!session || !session.id) return false;
   const controller = new AbortController();
   let timer = setTimeout(() => controller.abort(), signal && signal.aborted ? Math.min(timeoutMs, ABORTED_DISCONNECT_MS) : timeoutMs);
   const shorten = () => { clearTimeout(timer); timer = setTimeout(() => controller.abort(), Math.min(timeoutMs, ABORTED_DISCONNECT_MS)); };
   if (signal && !signal.aborted) signal.addEventListener('abort', shorten, { once: true });
   try {
-    const res = await fetch(baseUrl, {
+    const res = await (fetchImpl || fetch)(baseUrl, {
       method: 'DELETE',
       headers: withBuiltInHeaders(authHeaders, { 'MCP-Protocol-Version': PROTOCOL_VERSION, 'mcp-session-id': session.id }),
       signal: controller.signal,
@@ -241,7 +246,7 @@ function positiveEnv(name, fallback) {
   const n = Number(process.env[name]);
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
 }
-async function listTools(baseUrl, session, authHeaders = {}, timeoutMs = 60000, signal) {
+async function listTools(baseUrl, session, authHeaders = {}, timeoutMs = 60000, signal, fetchImpl) {
   const maxPages = positiveEnv('MCP_LIST_TOOLS_MAX_PAGES', 20);
   const maxBytes = positiveEnv('MCP_LIST_TOOLS_MAX_BYTES', 16 * 1024 * 1024);
   const all = [];
@@ -255,7 +260,7 @@ async function listTools(baseUrl, session, authHeaders = {}, timeoutMs = 60000, 
     const result = await rpc(baseUrl, session, {
       jsonrpc: '2.0', id: requestId(), method: 'tools/list',
       params: cursor ? { cursor } : {},
-    }, { headers: authHeaders, timeoutMs, signal });
+    }, { headers: authHeaders, timeoutMs, signal, fetchImpl });
     for (const t of (result && result.tools) || []) {
       const size = Buffer.byteLength(JSON.stringify(t) || '');
       if (bytes + size > maxBytes) {
@@ -271,11 +276,23 @@ async function listTools(baseUrl, session, authHeaders = {}, timeoutMs = 60000, 
   return all;
 }
 
-async function callTool(baseUrl, session, name, args, authHeaders = {}, timeoutMs = 60000, signal) {
+async function callTool(baseUrl, session, name, args, authHeaders = {}, timeoutMs = 60000, signal, fetchImpl) {
   const result = await rpc(baseUrl, session, {
     jsonrpc: '2.0', id: requestId(), method: 'tools/call', params: { name, arguments: args || {} },
-  }, { headers: authHeaders, timeoutMs, signal });
+  }, { headers: authHeaders, timeoutMs, signal, fetchImpl });
   return result;
+}
+
+/** The same four transport calls, every request made through `fetchImpl`
+ *  (e.g. public-fetch.cjs for a directory server). Signatures are unchanged. */
+function withFetch(fetchImpl) {
+  if (typeof fetchImpl !== 'function') throw new TypeError('mcp.withFetch needs a fetch function');
+  return {
+    connect: (baseUrl, authHeaders, timeoutMs, signal) => connect(baseUrl, authHeaders, timeoutMs, signal, fetchImpl),
+    listTools: (baseUrl, session, authHeaders, timeoutMs, signal) => listTools(baseUrl, session, authHeaders, timeoutMs, signal, fetchImpl),
+    callTool: (baseUrl, session, name, args, authHeaders, timeoutMs, signal) => callTool(baseUrl, session, name, args, authHeaders, timeoutMs, signal, fetchImpl),
+    disconnect: (baseUrl, session, authHeaders, timeoutMs, signal) => disconnect(baseUrl, session, authHeaders, timeoutMs, signal, fetchImpl),
+  };
 }
 
 // Flatten an MCP tool result into the plain string the chat loop feeds back as
@@ -333,11 +350,30 @@ const TOOL_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
 // through anyOf/items/properties without anything being wrong.
 const MAX_REF_DEPTH = 8;
 const MAX_NODE_DEPTH = 64;
+// #794: neither depth limit bounds the SIZE of the result. Eight definitions
+// that each hold ten properties all pointing at the next one is about 2 KB of
+// input and 10^8 nodes of output, built synchronously — the web process stops
+// answering every tenant, then runs out of memory, and discovery reruns it on
+// every restart. So the whole expansion of one tool also has a budget: nodes
+// walked, and characters of keys and strings emitted. Past either, the schema
+// throws and convertTool drops the tool with a reason, like any other schema
+// it cannot convert. Both are far above anything real: the whole 160-tool
+// reference server converts to ~162 K characters (measured 2026-09-08).
+const MAX_SCHEMA_NODES = 20000;
+const MAX_SCHEMA_CHARS = 256 * 1024;
 
-function inlineRefs(node, defs, stack, depth) {
+function spend(budget, nodes, chars) {
+  budget.nodes += nodes;
+  budget.chars += chars;
+  if (budget.nodes > MAX_SCHEMA_NODES) throw new Error(`schema expands past ${MAX_SCHEMA_NODES} nodes`);
+  if (budget.chars > MAX_SCHEMA_CHARS) throw new Error(`schema expands past ${MAX_SCHEMA_CHARS} characters`);
+}
+
+function inlineRefs(node, defs, stack, depth, budget) {
   if (depth > MAX_NODE_DEPTH) throw new Error('schema nests deeper than we will walk');
   if (stack.length > MAX_REF_DEPTH) throw new Error('refs expand deeper than we will inline');
-  if (Array.isArray(node)) return node.map((n) => inlineRefs(n, defs, stack, depth + 1));
+  spend(budget, 1, typeof node === 'string' ? node.length : 0);
+  if (Array.isArray(node)) return node.map((n) => inlineRefs(n, defs, stack, depth + 1, budget));
   if (!node || typeof node !== 'object') return node;
   const ref = node.$ref;
   if (typeof ref === 'string') {
@@ -350,19 +386,23 @@ function inlineRefs(node, defs, stack, depth) {
     // Sibling keys alongside a $ref (a description, say) are kept, with the
     // resolved body underneath them.
     const { $ref: _drop, ...siblings } = node;
-    return { ...inlineRefs(target, defs, [...stack, key], depth + 1), ...siblings };
+    // Siblings are copied, not walked, but they are emitted once per expansion
+    // all the same, so they count against the character budget.
+    if (Object.keys(siblings).length) spend(budget, 0, JSON.stringify(siblings).length);
+    return { ...inlineRefs(target, defs, [...stack, key], depth + 1, budget), ...siblings };
   }
   const out = {};
   for (const [k, v] of Object.entries(node)) {
     if (k === '$defs' || k === 'definitions') continue; // consumed by inlining
-    out[k] = inlineRefs(v, defs, stack, depth + 1);
+    spend(budget, 0, k.length);
+    out[k] = inlineRefs(v, defs, stack, depth + 1, budget);
   }
   return out;
 }
 
 function resolveSchemaRefs(schema) {
   const defs = { ...(schema.$defs || {}), ...(schema.definitions || {}) };
-  return inlineRefs(schema, defs, [], 0);
+  return inlineRefs(schema, defs, [], 0, { nodes: 0, chars: 0 });
 }
 
 function convertTool(mcpTool) {
@@ -422,4 +462,5 @@ function readOnlyHint(mcpTool) {
 }
 
 module.exports = {
-  withBuiltInHeaders, connect, disconnect, listTools, callTool, resultToText, convertTool, resolveSchemaRefs, readOnlyHint, parseRpcBody, PROTOCOL_VERSION, MAX_RESPONSE_BYTES };
+  withBuiltInHeaders, connect, disconnect, listTools, callTool, withFetch, resultToText, convertTool, resolveSchemaRefs, readOnlyHint, parseRpcBody, PROTOCOL_VERSION, MAX_RESPONSE_BYTES,
+  MAX_SCHEMA_NODES, MAX_SCHEMA_CHARS };

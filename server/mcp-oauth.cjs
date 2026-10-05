@@ -13,6 +13,25 @@ const STATE_TTL_MS = 10 * 60 * 1000;
 const MAX_PENDING_PER_USER = 20;
 const b64url = (buf) => Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 const fail = (message, status = 502) => Object.assign(new Error(message), { status });
+// OAuth metadata, registrations and tokens are small; a stranger's server could stream an
+// unbounded body instead. Read at most this much, then give up on it (null, like bad JSON).
+const MAX_JSON_BYTES = 256 * 1024;
+async function readJsonCapped(r, capBytes = MAX_JSON_BYTES) {
+  if (!r.body || typeof r.body.getReader !== 'function') return r.json(); // test doubles
+  const reader = r.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > capBytes) { await reader.cancel().catch(() => {}); throw new Error('response too large'); }
+      chunks.push(value);
+    }
+  } finally { try { reader.releaseLock(); } catch { /* cancelled */ } }
+  return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+}
 
 function createMcpOAuth({ db, secrets, fetchImpl = globalThis.fetch, urlAllowed, redirectUri, now = () => Date.now(), audit = () => {} }) {
   db.exec(`CREATE TABLE IF NOT EXISTS mcp_oauth_clients(server_id TEXT PRIMARY KEY, data_enc TEXT NOT NULL, updated_at INTEGER NOT NULL);
@@ -35,7 +54,7 @@ function createMcpOAuth({ db, secrets, fetchImpl = globalThis.fetch, urlAllowed,
     if (!(await urlAllowed(url))) throw fail(`The ${what} address is not a public https address.`);
     const r = await fetchImpl(url, { headers: { accept: 'application/json', 'user-agent': 'noevia' }, redirect: 'error', signal: AbortSignal.timeout(8000) });
     if (!r.ok) return null;
-    return r.json().catch(() => null);
+    return readJsonCapped(r).catch(() => null);
   }
 
   /** Find the authorization server for an MCP server; `challenge` is its WWW-Authenticate header, if any. */
@@ -74,7 +93,7 @@ function createMcpOAuth({ db, secrets, fetchImpl = globalThis.fetch, urlAllowed,
     const r = await fetchImpl(meta.registrationEndpoint, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(8000),
       headers: { 'content-type': 'application/json', accept: 'application/json' },
       body: JSON.stringify({ client_name: 'noevia', redirect_uris: [redirectUri()], grant_types: ['authorization_code', 'refresh_token'], response_types: ['code'], token_endpoint_auth_method: 'none' }) });
-    const reg = await r.json().catch(() => null);
+    const reg = await readJsonCapped(r).catch(() => null);
     if (!r.ok || !reg?.client_id) throw fail(`The sign-in service refused to register noevia (${r.status}).`);
     const client = { ...meta, clientId: reg.client_id, clientSecret: reg.client_secret || null, redirectUri: redirectUri() };
     db.prepare('INSERT INTO mcp_oauth_clients VALUES(?,?,?) ON CONFLICT(server_id) DO UPDATE SET data_enc=excluded.data_enc, updated_at=excluded.updated_at').run(serverId, enc(client), now());
@@ -105,7 +124,7 @@ function createMcpOAuth({ db, secrets, fetchImpl = globalThis.fetch, urlAllowed,
     if (client.clientSecret && client.tokenAuth === 'client_secret_post') body.set('client_secret', client.clientSecret);
     else if (client.clientSecret) headers.authorization = `Basic ${Buffer.from(`${encodeURIComponent(client.clientId)}:${encodeURIComponent(client.clientSecret)}`).toString('base64')}`;
     const r = await fetchImpl(client.tokenEndpoint, { method: 'POST', headers, body, redirect: 'error', signal: AbortSignal.timeout(10000) });
-    const t = await r.json().catch(() => null);
+    const t = await readJsonCapped(r).catch(() => null);
     if (!r.ok || !t?.access_token) throw fail(`The sign-in service did not issue a token (${r.status}${t?.error ? `: ${String(t.error).slice(0, 60)}` : ''}).`);
     return { accessToken: t.access_token, refreshToken: t.refresh_token || params.refresh_token || null,
       expiresAt: Number.isFinite(Number(t.expires_in)) ? now() + Number(t.expires_in) * 1000 : null };

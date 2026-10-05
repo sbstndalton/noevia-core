@@ -67,6 +67,11 @@ function createCredentialOriginCheck(origins) {
  * @param {number} deps.resultCap
  * @param {NodeJS.ProcessEnv} [deps.env]   for a bearer server's tokenEnv
  * @param {(url, init) => Promise<Response>} [deps.fetch]
+ * @param {(url, init) => Promise<Response>} [deps.publicFetch]   public-fetch.cjs: refuses a private
+ *   address at connect time. Used for every request to a directory/custom server (the servers
+ *   directoryUrlAllowed already requires to be public), so a name that re-resolves between that
+ *   check and the request (DNS rebinding, #795) cannot reach the home network. The operator's
+ *   MCP_SERVERS — a LAN Nextcloud server, noevia's own loopback server — never use it.
  * @param {number} [deps.discoveryTtlMs]
  * @param {number} [deps.discoveryFailTtlMs]   how long a failed/empty discovery is remembered
  *   before the next unforced request is allowed to retry every server again. Short on purpose:
@@ -79,11 +84,15 @@ function createCredentialOriginCheck(origins) {
 function createMcpWiring({
   servers, manifest = [], mcp, bindBoxes, directoryMcp, mcpOAuth, directoryUrlAllowed, credentialOriginAllowed,
   scope, storageFor, isWriteTool, internal, internalKey, reduceToolResult, resultCap = 8000,
-  env = process.env, fetch = globalThis.fetch, discoveryTtlMs = 10 * 60 * 1000,
+  env = process.env, fetch = globalThis.fetch, publicFetch = null, discoveryTtlMs = 10 * 60 * 1000,
   discoveryFailTtlMs = Number(process.env.MCP_DISCOVERY_FAIL_TTL_MS || 30 * 1000), logger = console,
   isUserDisabled = () => false,
 }) {
   const MCP_SERVERS = servers;
+  if (publicFetch && typeof mcp.withFetch !== 'function') throw new TypeError('publicFetch needs an MCP client with withFetch');
+  const publicMcp = publicFetch ? mcp.withFetch(publicFetch) : null;
+  /** The transport for one server: a directory server's requests are pinned to public addresses. */
+  const transportFor = (server) => (server && server.directory && publicMcp ? publicMcp : mcp);
   // Servers an administrator added from the public registry join the operator's list (after it,
   // so an operator's server keeps any tool name both offer). See directory-mcp.cjs.
   for (const sv of directoryMcp.asServers()) MCP_SERVERS.push(sv);
@@ -101,7 +110,7 @@ function createMcpWiring({
   async function probeMcpAuth(url) {
     if (!(await directoryUrlAllowed(url))) return { status: 0, challenge: '' };
     try {
-      const r = await fetch(url, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(8000),
+      const r = await (publicFetch || fetch)(url, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(8000),
         headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
         body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'noevia', version: '1' } } }) });
       return { status: r.status, challenge: r.headers.get('www-authenticate') || '' };
@@ -260,12 +269,13 @@ function createMcpWiring({
       if (!token) throw new Error('waiting for the administrator who added it to sign in');
       headers = { Authorization: `Bearer ${token}` };
     }
-    const { session } = await mcp.connect(server.url, headers);
+    const transport = transportFor(server);
+    const { session } = await transport.connect(server.url, headers);
     let discovered;
     try {
-      discovered = await mcp.listTools(server.url, session, headers);
+      discovered = await transport.listTools(server.url, session, headers);
     } finally {
-      await mcp.disconnect(server.url, session, headers);
+      await transport.disconnect(server.url, session, headers);
     }
     const byName = new Map();
     const dropped = [];
@@ -396,14 +406,15 @@ function createMcpWiring({
 
     if (server.directory && !(await directoryUrlAllowed(server.url))) return `ERROR: ${name} was not run: its server's address no longer resolves to a public host.`;
     try {
-      const { session } = await mcp.connect(server.url, auth, undefined, signal);
+      const transport = transportFor(server);
+      const { session } = await transport.connect(server.url, auth, undefined, signal);
       let result;
       try {
-        result = await mcp.callTool(server.url, session, name, args, auth, undefined, signal);
+        result = await transport.callTool(server.url, session, name, args, auth, undefined, signal);
       } finally {
         // Close it whatever happened. Nothing used to, so every tool call left a
         // session behind on the server for the life of the process.
-        await mcp.disconnect(server.url, session, auth, undefined, signal);
+        await transport.disconnect(server.url, session, auth, undefined, signal);
       }
       const text = mcp.resultToText(result);
       if (!text) return '(the tool returned no output)';
