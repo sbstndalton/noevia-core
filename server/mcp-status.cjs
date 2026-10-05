@@ -8,7 +8,9 @@ function describeMcpServers(servers, states, tools, manifest) {
     // Added, #366); everything else here — the internal server and any MCP_SERVERS/MCP_SERVER_URL
     // entry — is configured for this deployment and was never going to appear in that list.
     return {id:server.id,auth:server.auth,error:state?.error||null,discovered:state?.toolCount||0,
-      checkedAt:state?.discoveredAt||null,missingCurated:missing.length,directory:!!server.directory};
+      checkedAt:state?.discoveredAt||null,missingCurated:missing.length,directory:!!server.directory,
+      // A directory server's display name, so the approval card can say where a write goes (#887).
+      ...(typeof server.title==='string'&&server.title?{title:server.title.slice(0,80)}:{})};
   });
 }
 module.exports={describeMcpServers};

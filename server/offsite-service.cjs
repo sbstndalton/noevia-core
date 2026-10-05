@@ -177,11 +177,13 @@ function createOffsiteService({ env = process.env, features, dataDir, now = Date
       if (busy) throw Object.assign(Error(`A ${busy} is already running.`), { status: 409, publicMessage: `A ${busy} is already running.` });
       return copyToDrive();
     },
-    connectGoogle: (owner = null) => {
+    connectGoogle: (owner = null, onConnected = null) => {
       if (!useDir()) throw Object.assign(Error('no folder'), { status: 409, publicMessage: 'Google Drive needs a backup folder on this server (OFFSITE_BACKUP_DIR).' });
       build();
       // Once approved, copy right away so the page can show the first result.
-      return drive.connect(() => copyToDrive().catch(() => {}), { owner });
+      // onConnected lets the caller react when the sign-in completes (the connectors route clears the
+      // permitted-tools view: this administrator's Drive is also their chat Drive, #845).
+      return drive.connect(() => { try { if (typeof onConnected === 'function') onConnected(); } catch { /* a caller's hook must not block the first copy */ } return copyToDrive().catch(() => {}); }, { owner });
     },
     /** The backup connection, which is also its administrator's Drive for chat tools (drive-accounts). */
     drive,

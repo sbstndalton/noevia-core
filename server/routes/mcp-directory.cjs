@@ -81,8 +81,10 @@ function createMcpDirectoryRoutes({ json, readJson, auth, servers: MCP_SERVERS, 
       if (q.get('error')) return page(false, `The sign-in service said: ${String(q.get('error_description') || q.get('error')).slice(0, 200)}`);
       try {
         const done = await mcpOAuth.finish({ userId: authn.user.id, state: q.get('state'), code: q.get('code') });
-        await discoverMcpTools(true); // an admin's (re-)sign-in may be what the tool list was waiting for
-        onToolsChange(); // this account is now ready for the server: the permitted-tools view changed (#831)
+        // The token is stored once finish() returns, so the permitted-tools view has changed even if
+        // rediscovery then throws (#845): clear it either way.
+        try { await discoverMcpTools(true); } // an admin's (re-)sign-in may be what the tool list was waiting for
+        finally { onToolsChange(); } // this account is now ready for the server (#831)
         return page(true, done.purpose === 'add' ? 'The server is added. Choose it under a project’s Tools; each person signs in from Plugins → Connected.' : 'Your account is connected. Its tools are now offered in projects that chose this server.');
       } catch (e) { return page(false, e.message); }
     }

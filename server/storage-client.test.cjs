@@ -629,3 +629,78 @@ test('folder sync counts other sources against the 60 cap and reports every file
     assert.equal(first.files.length, 60);
   } finally { release?.(); client.listFiles = saved.list; client.readTextFile = saved.read; rag.deleteProjectFile = saved.del; }
 });
+
+// ── #845: S3 listing decoding and pagination (mocked fetch) ──────────────────
+
+const s3Conn = { kind: 's3', baseUrl: 'http://s3.invalid', bucket: 'b', username: 'ak', secret: 'sk', corpusRoot: 'Cowork' };
+const s3Xml = (inner, truncatedToken) => `<?xml version="1.0"?><ListBucketResult>${inner}<IsTruncated>${truncatedToken ? 'true' : 'false'}</IsTruncated>${truncatedToken ? `<NextContinuationToken>${truncatedToken}</NextContinuationToken>` : ''}</ListBucketResult>`;
+const xmlResponse = (xml) => new Response(xml, { status: 200, headers: { 'Content-Type': 'application/xml' } });
+
+test('#845: s3 keys and prefixes are XML-entity decoded so "a&b.md" lists under its real name', async (t) => {
+  withFetch(t, async () => xmlResponse(s3Xml(
+    '<CommonPrefixes><Prefix>Cowork/R&amp;D/</Prefix></CommonPrefixes>'
+    + '<Contents><Key>Cowork/a&amp;b.md</Key><Size>3</Size></Contents>'
+    + '<Contents><Key>Cowork/it&apos;s &#38; &lt;x&gt;.md</Key><Size>4</Size></Contents>')));
+  const list = await listFiles(s3Conn, '');
+  assert.deepEqual(list.map((e) => [e.name, e.isDir]).sort(), [['R&D', true], ["it's & <x>.md", false], ['a&b.md', false]].sort());
+});
+
+test('#845: s3 listing follows the continuation token across pages, URL-encoding it, and stops when not truncated', async (t) => {
+  const seen = [];
+  withFetch(t, async (url) => {
+    const u = new URL(String(url));
+    seen.push(u.searchParams.get('continuation-token'));
+    if (!u.searchParams.has('continuation-token')) return xmlResponse(s3Xml('<Contents><Key>Cowork/one.md</Key><Size>1</Size></Contents>', 'tok+1/a&amp;b=='));
+    if (u.searchParams.get('continuation-token') === 'tok+1/a&b==') return xmlResponse(s3Xml('<Contents><Key>Cowork/two.md</Key><Size>1</Size></Contents>', 'tok2'));
+    return xmlResponse(s3Xml('<Contents><Key>Cowork/three.md</Key><Size>1</Size></Contents>'));
+  });
+  const list = await listFiles(s3Conn, '');
+  assert.deepEqual(list.map((e) => e.name), ['one.md', 'three.md', 'two.md']);
+  assert.deepEqual(seen, [null, 'tok+1/a&b==', 'tok2']);
+});
+
+test('#845: s3 pagination is bounded by pages even when the endpoint always says truncated, and a repeated token stops it', async (t) => {
+  let calls = 0;
+  withFetch(t, async () => { calls++; return xmlResponse(s3Xml(`<Contents><Key>Cowork/f${calls}.md</Key><Size>1</Size></Contents>`, `t${calls}`)); });
+  const list = await listFiles(s3Conn, '');
+  assert.equal(calls, 20);
+  assert.equal(list.length, 20);
+
+  let repeats = 0;
+  withFetch(t, async () => { repeats++; return xmlResponse(s3Xml(`<Contents><Key>Cowork/g${repeats}.md</Key><Size>1</Size></Contents>`, 'same')); });
+  const again = await listFiles(s3Conn, '');
+  assert.equal(repeats, 2, 'the second page repeats the token: stop');
+  assert.equal(again.length, 2);
+});
+
+test('#845: s3 listing caps the total entries', async (t) => {
+  const page = (n) => s3Xml(Array.from({ length: 1000 }, (_, i) => `<Contents><Key>Cowork/p${n}-${i}.md</Key><Size>1</Size></Contents>`).join(''), `t${n}`);
+  let calls = 0;
+  withFetch(t, async () => xmlResponse(page(calls++)));
+  const list = await listFiles(s3Conn, '');
+  assert.equal(list.length, 10000);
+  assert.equal(calls, 10);
+});
+
+test('#845: an s3 error on a later page fails the listing rather than returning a silent partial one', async (t) => {
+  let calls = 0;
+  withFetch(t, async () => (++calls === 1 ? xmlResponse(s3Xml('<Contents><Key>Cowork/a.md</Key><Size>1</Size></Contents>', 't1')) : new Response('', { status: 503 })));
+  await assert.rejects(() => listFiles(s3Conn, ''), /storage returned 503/);
+});
+
+test('#845: hitting the s3 listing cap logs a warning naming the kind and prefix, never the credentials', async (t) => {
+  withFetch(t, async () => xmlResponse(s3Xml('<Contents><Key>Cowork/Docs/f.md</Key><Size>1</Size></Contents>', `t${Math.random()}`)));
+  const logged = [];
+  const realWarn = console.warn;
+  console.warn = (...a) => logged.push(a.join(' '));
+  t.after(() => { console.warn = realWarn; });
+  await listFiles(s3Conn, 'Docs');
+  assert.equal(logged.length, 1);
+  assert.match(logged[0], /s3 listing of "Cowork\/Docs\/" stopped at the cap/);
+  assert.doesNotMatch(logged[0], /\bsk\b|\bak\b/, 'no credentials');
+  // A complete listing stays quiet.
+  logged.length = 0;
+  withFetch(t, async () => xmlResponse(s3Xml('<Contents><Key>Cowork/a.md</Key><Size>1</Size></Contents>')));
+  await listFiles(s3Conn, '');
+  assert.deepEqual(logged, []);
+});

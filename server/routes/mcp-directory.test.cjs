@@ -306,3 +306,17 @@ test('#831: an OAuth sign-in finishing and a sign-out clear the permitted-tools 
   assert.equal(res.out.code, 200);
   assert.equal(cleared, 2, 'signing out clears it');
 });
+
+test('#845: an OAuth sign-in whose rediscovery throws still clears the permitted-tools view (the token is already stored)', async () => {
+  let cleared = 0;
+  let body = '';
+  const { routes } = build({
+    onToolsChange: () => { cleared += 1; },
+    discoverMcpTools: async () => { throw new Error('discovery down'); },
+    mcpOAuth: { finish: async () => ({ purpose: 'connect' }), disconnect() {}, connected: () => true, clientInfo: () => null },
+  });
+  const res = { writeHead() {}, end(b) { body = String(b); } };
+  await routes({ method: 'GET', url: '/api/mcp-oauth/callback?state=s&code=c' }, res, { path: '/api/mcp-oauth/callback', authn: member });
+  assert.equal(cleared, 1);
+  assert.match(body, /discovery down/);
+});

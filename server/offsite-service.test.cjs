@@ -214,3 +214,18 @@ test('status carries structured fields the page translates from, next to the Eng
   assert.equal(ready.reasonCode, null);
   assert.deepEqual(ready.reasonGaps, []);
 });
+
+test('#845: connectGoogle runs the caller hook when the Drive sign-in is approved, and a throwing hook does not stop the copy', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-offsite-connect-hook-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  let hook = 0;
+  const service = createOffsiteService({
+    env: { OFFSITE_BACKUP_DIR: dir }, dataDir: dir, features: { enabled: () => true },
+    backupFactory: () => ({ backup: async () => ({ id: 's', files: 1, uploadedBytes: 1 }), forget: async () => ({ kept: 1 }), verify: async () => ({ files: 1 }) }),
+    driveFactory: () => ({ state: () => ({ state: 'connected' }), mirror: async () => ({ snapshots: 1 }), connect: (onApproved) => { onApproved(); return { ok: true }; } }),
+  });
+  service.connectGoogle('u1', () => { hook += 1; });
+  assert.equal(hook, 1);
+  service.connectGoogle('u1', () => { throw new Error('hook failed'); }); // must not throw
+  service.connectGoogle('u1'); // no hook is fine
+});

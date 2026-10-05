@@ -134,3 +134,25 @@ test('#831: Drive connect (and its later completion) and disconnect clear the ca
   await run(routes, { method: 'POST' }, '/api/connectors/gdrive/disconnect');
   assert.equal(cleared, 3, 'disconnecting clears it');
 });
+
+test('#845: the backup administrator\'s Drive sign-in clears the permitted-tools view when it completes, not only on the start request', async () => {
+  let cleared = 0;
+  let finish;
+  const offsite = {
+    status: () => null,
+    // The real service hands its caller's hook to the Drive connection, which runs it once the sign-in is approved.
+    connectGoogle: (owner, onConnected) => { finish = onConnected; return { ok: true }; },
+  };
+  const routes = createConnectorRoutes({
+    accounts: { forUser: () => ({ drive: { state: () => ({ configured: true, state: 'connected' }) }, backup: true }) },
+    driveTools: { names: new Set(), labels: {} }, policy: { mode: () => 'ask', set() {} }, offsite, isWrite: () => false,
+    onPolicyChange: () => { cleared += 1; },
+    json: (res, status, body) => { res.status = status; res.body = body; }, readBody: async () => ({}),
+  });
+  const res = await run(routes, { method: 'POST' }, '/api/connectors/gdrive/connect');
+  assert.equal(res.status, 200);
+  const afterStart = cleared;
+  assert.equal(typeof finish, 'function', 'the route passes a completion hook to the backup connection');
+  finish();
+  assert.equal(cleared, afterStart + 1, 'completion clears the view');
+});

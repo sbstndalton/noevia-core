@@ -17,3 +17,11 @@ test('#366: `directory` marks a server added through the MCP directory; everythi
  const result=describeMcpServers(servers,states,new Map(),[]);
  assert.deepEqual(result.map(r=>r.directory),[false,false,true]);
 });
+
+test('#887: a directory server\'s title is reported (bounded) so the approval card can name it; others carry none',()=>{
+ const servers=[{id:'dir-a',auth:'oauth',directory:true,title:'Notes '+'x'.repeat(200),url:'https://private.example'},{id:'nextcloud',auth:'nextcloud'}];
+ const result=describeMcpServers(servers,new Map(),new Map(),[]);
+ assert.equal(result[0].title.length,80);assert.ok(result[0].title.startsWith('Notes '));
+ assert.equal('title' in result[1],false);
+ assert.ok(!JSON.stringify(result).includes('private.example'));
+});

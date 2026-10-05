@@ -56,7 +56,7 @@ function createConnectorRoutes({ accounts, driveTools, policy, offsite, isWrite,
       if (action === 'connect' && req.method === 'POST') {
         const { drive, backup } = accounts.forUser(user);
         // The sign-in completes later, on Google's page: clear the permitted-tools view then too (#831).
-        await (backup ? offsite.connectGoogle(user.id) : drive.connect(() => onPolicyChange(), { owner: user.id }));
+        await (backup ? offsite.connectGoogle(user.id, () => onPolicyChange()) : drive.connect(() => onPolicyChange(), { owner: user.id }));
         onPolicyChange();
         return send(200, view(user));
       }

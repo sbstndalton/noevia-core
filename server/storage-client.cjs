@@ -290,39 +290,63 @@ function s3Url(conn, key, query) {
   return url;
 }
 
+// #845: a bucket listing arrives 1000 keys at a time. Follow the continuation token, but bound the
+// walk: a hostile or enormous bucket must not hold a request open or fill memory.
+const S3_LIST_MAX_PAGES = 20;
+const S3_LIST_MAX_ENTRIES = 10000;
+
 async function s3List(conn, connectionPath) {
   const root = cleanRoot(conn.corpusRoot);
   // Bucket-key prefix of the requested directory ('' = whole bucket).
   const dirPrefix = joinRoot(root, connectionPath);
   const queryPrefix = dirPrefix ? `${dirPrefix}/` : '';
-  const url = s3Url(conn, '', { 'list-type': '2', prefix: queryPrefix, delimiter: '/', 'max-keys': '1000' });
-  const response = await withRetry(() => fetch(url, {
-    headers: signS3Request('GET', url, '', conn.username || '', conn.secret || '', { region: normalizeS3Region(conn.region) }),
-    signal: AbortSignal.timeout(15000),
-    redirect: 'error',
-  }));
-  if (!response.ok) throw new Error(`storage returned ${response.status}`);
-  const { text: body } = await readCappedText(response, LIST_BODY_CAP);
   const entries = [];
-  // Forward-only scans (elementTexts, #787): a hostile endpoint's body of unclosed tags cannot make
-  // the old lazy regexes rescan the rest of the body from every opening tag (#833).
-  for (const block of elementTexts(body, 'CommonPrefixes')) {
-    const prefix = firstElementText(block, 'Prefix');
-    if (prefix === undefined) continue;
-    const full = prefix.replace(/\/+$/, '');
-    const rel = queryPrefix && full.startsWith(queryPrefix) ? full.slice(queryPrefix.length) : full;
-    if (!rel) continue;
-    entries.push({ name: rel, path: rel, isDir: true, size: null, ext: '' });
+  let token;
+  let more = false; // the endpoint offered another page that the caps stopped us from fetching
+  for (let page = 0; page < S3_LIST_MAX_PAGES && entries.length < S3_LIST_MAX_ENTRIES; page++) {
+    const query = { 'list-type': '2', prefix: queryPrefix, delimiter: '/', 'max-keys': '1000' };
+    if (token !== undefined) query['continuation-token'] = token;
+    const url = s3Url(conn, '', query);
+    more = false;
+    const response = await withRetry(() => fetch(url, {
+      headers: signS3Request('GET', url, '', conn.username || '', conn.secret || '', { region: normalizeS3Region(conn.region) }),
+      signal: AbortSignal.timeout(15000),
+      redirect: 'error',
+    }));
+    if (!response.ok) throw new Error(`storage returned ${response.status}`);
+    const { text: body } = await readCappedText(response, LIST_BODY_CAP);
+    // Forward-only scans (elementTexts, #787): a hostile endpoint's body of unclosed tags cannot make
+    // the old lazy regexes rescan the rest of the body from every opening tag (#833).
+    // Keys and prefixes are XML text: decode &amp; and friends back to the real key (#845, as #787 did
+    // for PROPFIND), or "a&b.md" lists as "a&amp;b.md" and 404s on read.
+    for (const block of elementTexts(body, 'CommonPrefixes')) {
+      const raw = firstElementText(block, 'Prefix');
+      if (raw === undefined) continue;
+      const full = decodeXmlEntities(raw).replace(/\/+$/, '');
+      const rel = queryPrefix && full.startsWith(queryPrefix) ? full.slice(queryPrefix.length) : full;
+      if (!rel) continue;
+      entries.push({ name: rel, path: rel, isDir: true, size: null, ext: '' });
+    }
+    for (const block of elementTexts(body, 'Contents')) {
+      const raw = firstElementText(block, 'Key');
+      if (raw === undefined) continue;
+      const full = decodeXmlEntities(raw);
+      if (full.endsWith('/')) continue;
+      const rel = queryPrefix && full.startsWith(queryPrefix) ? full.slice(queryPrefix.length) : full;
+      if (!rel || rel.includes('/')) continue; // direct children only
+      const sizeText = firstElementText(block, 'Size');
+      entries.push({ name: rel, path: rel, isDir: false, size: sizeText !== undefined && /^\d+$/.test(sizeText) ? Number(sizeText) : null, ext: extensionOf(rel) });
+    }
+    const truncated = firstElementText(body, 'IsTruncated');
+    const next = firstElementText(body, 'NextContinuationToken');
+    if (String(truncated).trim().toLowerCase() !== 'true' || next === undefined) break;
+    const nextToken = decodeXmlEntities(next);
+    if (!nextToken || nextToken === token) break; // a token that never advances would loop to the cap
+    token = nextToken;
+    more = true;
   }
-  for (const block of elementTexts(body, 'Contents')) {
-    const full = firstElementText(block, 'Key');
-    if (full === undefined || full.endsWith('/')) continue;
-    const rel = queryPrefix && full.startsWith(queryPrefix) ? full.slice(queryPrefix.length) : full;
-    if (!rel || rel.includes('/')) continue; // direct children only
-    const sizeText = firstElementText(block, 'Size');
-    entries.push({ name: rel, path: rel, isDir: false, size: sizeText !== undefined && /^\d+$/.test(sizeText) ? Number(sizeText) : null, ext: extensionOf(rel) });
-  }
-  return entries;
+  if (more || entries.length > S3_LIST_MAX_ENTRIES) console.warn(`[storage] ${conn.kind || 's3'} listing of "${queryPrefix}" stopped at the cap (${S3_LIST_MAX_PAGES} pages / ${S3_LIST_MAX_ENTRIES} entries); the listing is incomplete`);
+  return entries.length > S3_LIST_MAX_ENTRIES ? entries.slice(0, S3_LIST_MAX_ENTRIES) : entries;
 }
 
 async function s3Read(conn, connectionPath) {
