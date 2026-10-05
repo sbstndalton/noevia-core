@@ -87,6 +87,18 @@ function insideRoot(root, candidate) {
   return resolved;
 }
 
+/**
+ * Whether a resolved path can be written into the git config the verifier generates (#855). The
+ * path comes from the shared workspaces volume, which the agent can write: a repository swapped
+ * for a symlink to a directory named `x\n[uploadpack]\n\tpackObjectsHook=…` would otherwise add
+ * its own section to that config. Control characters (a newline ends the value), `"` and `\`
+ * (quoting and escapes) are refused; everything else is safe inside a quoted value. Called on
+ * the realpath, since that is what is written.
+ */
+function configSafePath(p) {
+  return typeof p === 'string' && p.length > 0 && !/[\u0000-\u001f\u007f-\u009f"\\]/.test(p);
+}
+
 /** The only environment a verify command gets. Nothing from noevia, no proxy. */
 function verifyEnv(home, tmp, basePath = process.env.PATH) {
   return { PATH: basePath || '/usr/local/bin:/usr/bin:/bin', HOME: home, TMPDIR: tmp, LANG: 'C.UTF-8', CI: 'true', NO_COLOR: '1' };
@@ -234,6 +246,7 @@ function createVerifier({ root, copyRoot = os.tmpdir(), scratchRoot = copyRoot, 
       if (!command) return refuse('not_configured', `no verification command is configured for ${name} (CODE_VERIFY)`);
       const src = insideRoot(root, msg.source);
       if (!src) return refuse('outside', 'that source repository is not under the verifier’s read-only root');
+      if (!configSafePath(src)) return refuse('hostile_source', 'the source path holds characters that cannot go into a git config');
       if (running > 0) return refuse('busy', 'the verifier is already running a verification; try again when it finishes');
       running++;
       // The answer goes out only after the run's processes are reaped and its directories removed.
@@ -251,11 +264,15 @@ function createVerifier({ root, copyRoot = os.tmpdir(), scratchRoot = copyRoot, 
       const copy = path.join(copyRoot, id);        // git's: the clone
       const scratch = path.join(scratchRoot, id);  // the test's: HOME and TMPDIR
       const tree = path.join(copy, 'tree');
+      // Checked again before anything is created: the git config below is the only place the path
+      // is written, and nothing may reach it unvalidated (#855).
+      if (!configSafePath(src)) return { ok: false, error: 'hostile_source', message: 'the source path holds characters that cannot go into a git config' };
       fs.mkdirSync(ctl, { mode: 0o755 });
       // safe.directory is honoured only from a global/system FILE (not -c): the source belongs to
       // another uid. Exactly this source, nothing else.
       const gitConfig = path.join(ctl, 'gitconfig');
-      fs.writeFileSync(gitConfig, `[safe]\n\tdirectory = ${src}\n\tdirectory = ${path.join(src, '.git')}\n`, { mode: 0o644 });
+      // Quoted, so `#` or `;` in a path stays part of the value instead of starting a comment.
+      fs.writeFileSync(gitConfig, `[safe]\n\tdirectory = "${src}"\n\tdirectory = "${path.join(src, '.git')}"\n`, { mode: 0o644 });
       const gitEnv = { PATH: PATHV, HOME: ctl, LANG: 'C.UTF-8', GIT_CONFIG_GLOBAL: gitConfig, GIT_CONFIG_NOSYSTEM: '1',
         GIT_TERMINAL_PROMPT: '0', GIT_ASKPASS: '/bin/false' };
       const controller = new AbortController();
@@ -387,7 +404,7 @@ function createVerifier({ root, copyRoot = os.tmpdir(), scratchRoot = copyRoot, 
   };
 }
 
-module.exports = { createVerifier, parseVerify, parseIdentity, verifyEnv, createTail, insideRoot,
+module.exports = { createVerifier, parseVerify, parseIdentity, verifyEnv, createTail, insideRoot, configSafePath,
   HOSTILE_KEYS, DEFAULT_WALL_MS, DEFAULT_TAIL_BYTES, SCRATCH_PREFIX };
 
 if (require.main === module) {

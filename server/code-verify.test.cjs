@@ -194,6 +194,33 @@ test('the verifier refuses a hostile source config, an unconfigured repository, 
   assert.equal((await answer(off.socketPath, request(repo, head))).error, 'not_configured');
 });
 
+test('a source path that could inject git config is refused before any config is written (#855)', async () => {
+  const { configSafePath } = require('../../../services/code-sandbox/verifier.cjs');
+  assert.equal(configSafePath('/workspaces/repos/a b#c;d'), true, 'ordinary punctuation is fine inside a quoted value');
+  for (const bad of ['/w/a\nb', '/w/a\rb', '/w/a\tb', '/w/a\u0000b', '/w/a\u007fb', '/w/a"b', '/w/a\\b', '']) {
+    assert.equal(configSafePath(bad), false, JSON.stringify(bad));
+  }
+  const { root, repo, head } = fixture({ 'a.txt': 'a' });
+  const { socketPath, ctlRoot, logs } = await verifier(root, { verify: parseVerify('scratch|exit 0') });
+  // The agent can write the shared volume: it swaps a repository path for a symlink whose target's
+  // NAME carries a config section. The check is on the realpath, which is what would be written.
+  const names = ['evil\n[uploadpack]\n\tpackObjectsHook = touch /tmp/pwned\n[x', 'quote"d', 'back\\slash'];
+  for (const name of names) {
+    const target = path.join(root, name);
+    fs.mkdirSync(path.join(target, '.git'), { recursive: true });
+    const link = path.join(root, 'repos', `link-${names.indexOf(name)}`);
+    fs.symlinkSync(target, link);
+    const refused = await answer(socketPath, request(link, head));
+    assert.equal(refused.ok, false);
+    assert.equal(refused.error, 'hostile_source', JSON.stringify(name));
+    assert.equal((await answer(socketPath, request(target, head))).error, 'hostile_source', 'named directly, too');
+  }
+  assert.deepEqual(fs.readdirSync(ctlRoot), [], 'no control directory, so no git config, was ever written');
+  assert.ok(logs.some((l) => /cannot go into a git config/.test(l)), 'the refusal is logged');
+  // An ordinary source is unaffected.
+  assert.equal((await answer(socketPath, request(repo, head))).ok, true);
+});
+
 test('one run at a time; a run past its wall time is stopped with its process group', async () => {
   const { root, repo, head } = fixture({ 'a.txt': 'a' });
   const pidFile = path.join(temp(), 'pid');

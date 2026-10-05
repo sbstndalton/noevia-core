@@ -415,6 +415,10 @@ const toolboxOffered = createToolboxOffered(ENABLED_TOOLBOXES);
 // One proxy per deployment (it binds CODE_EGRESS_PORT): Code and Browser tasks share it, each
 // scoped by its own per-task grant/token.
 const codeEgress = require('./code-egress.cjs').startEgressFromEnv(process.env, { log: (entry) => console.log('[egress]', JSON.stringify(entry)) });
+// #853: the UI and file-sharing listeners refuse requests that arrive over the internal code
+// network (COWORK_CODE_NET_ADDR, code-net-guard.cjs). The egress proxy above is not wrapped.
+const codeNetGuard = require('./code-net-guard.cjs').createCodeNetGuard({ spec: process.env.COWORK_CODE_NET_ADDR || '',
+  log: (entry) => console.warn('[code-net]', JSON.stringify(entry)) });
 // Executor guard (#704, code-tool-schemas.cjs): off unless features.executorGuard. Read once per
 // Code task when it starts; it only adds automatic refusals of malformed tool calls.
 require('./code-tool-schemas.cjs').useExecutorGuard(() => features.enabled('executorGuard'));
@@ -1068,7 +1072,7 @@ if (require.main === module) {
   if (!DIARY_TENANT_KEY) console.warn('WARNING: DIARY_TENANT_KEY is unset; Diary calls carry no tenant assertion and remote storage secrets ride on every call.');
   // A throw outside handleRequestScoped's own try (authentication, the workspace load) answers 500
   // rather than resetting the connection, so one bad request input cannot look like a dead server (#781).
-  const server = http.createServer((req, res) => { handleRequest(req, res).catch((err) => answerUnhandled(res, err)); });
+  const server = http.createServer(codeNetGuard.wrap((req, res) => handleRequest(req, res).catch((err) => answerUnhandled(res, err)), 'ui'));
   staticFiles.warm();
   // A chat waiting on a write approval is a legitimately long request. Node's
   // default requestTimeout is 5 minutes measured from the START of the request,
@@ -1079,7 +1083,7 @@ if (require.main === module) {
   // setting otherwise protects against.
   if (davConfig.available) {
     const handler = require('./dav.cjs').createDavHandler({ auth: authService, settings: davSettings, config: davConfig, files: diaryFiles });
-    const davServer = http.createServer((req, res) => { handler(req, res).catch(() => res.destroy()); });
+    const davServer = http.createServer(codeNetGuard.wrap((req, res) => handler(req, res).catch(() => res.destroy()), 'file-sharing'));
     davServer.requestTimeout = 60000; davServer.headersTimeout = 15000;
     davServer.setTimeout(60000, socket => socket.destroy());
     davServer.listen(davConfig.port, HOST, () => console.log(`Diary file sharing listener on port ${davConfig.port}; scope ${davConfig.scope}; per-user opt-in required`));

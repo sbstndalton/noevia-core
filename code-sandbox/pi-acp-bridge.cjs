@@ -138,20 +138,43 @@ function createBridge({ input, output, piCommand = 'pi', piArgs = null, spawnFn 
   const toPi = (command) => { if (pi?.stdin.writable) pi.stdin.write(JSON.stringify(command) + '\n'); };
   const piCommandWithId = (command) => new Promise((resolve) => { const id = `p${++piSeq}`; piPending.set(id, resolve); toPi({ id, ...command }); });
 
-  /** A protocol-level failure (an oversized line from either side): refuse cleanly rather than hang. */
-  function failSession(reason) {
-    if (closed) return;
-    closed = true;
-    onLog(reason);
-    send({ id: null, error: { code: -32000, message: reason } });
+  /**
+   * Answer everything still waiting as a refusal: the running turn, every command pi never
+   * acknowledged (#852: a `session/prompt` awaiting pi's ack would otherwise wait forever once pi
+   * is gone), and every question to the client.
+   */
+  function refuseAllPending() {
+    for (const resolve of piPending.values()) resolve({ type: 'response', success: false, error: 'pi is not running' });
+    piPending.clear();
     if (turn) { const done = turn; turn = null; done({ stopReason: 'refusal' }); }
     for (const resolve of waiting.values()) resolve(null);
     waiting.clear();
+  }
+
+  /**
+   * The session is over: refuse what is pending, stop pi, and let the bridge exit. Nothing can run
+   * after this (pi is one per session), so the bridge stops reading the client and closes its
+   * output; with pi's own handles gone too, the process ends and the supervisor hangs up, which is
+   * what tells noevia the harness stopped even if it never reads a reply.
+   */
+  function endSession(reason, { error = false } = {}) {
+    if (closed) return;
+    closed = true;
+    onLog(reason);
+    if (error) send({ id: null, error: { code: -32000, message: reason } });
+    refuseAllPending();
     killPi('SIGTERM');
     // Let whatever `done()`/resolve() just triggered (the `session/prompt` reply, in particular)
     // finish writing to `output` before it is closed — closing synchronously here would drop it.
-    setImmediate(() => { try { output.end?.(); } catch { /* gone */ } });
+    // Promise reactions are microtasks, so they have all run before this callback.
+    setImmediate(() => {
+      try { output.end?.(); } catch { /* gone */ }
+      try { input.pause?.(); input.destroy?.(); } catch { /* gone */ }
+    });
   }
+
+  /** A protocol-level failure (an oversized line from either side): refuse cleanly rather than hang. */
+  function failSession(reason) { endSession(reason, { error: true }); }
 
   /** Kill pi's whole process group, not just its own pid, falling back where that is unsupported. */
   function killPi(signal) {
@@ -232,8 +255,14 @@ function createBridge({ input, output, piCommand = 'pi', piArgs = null, spawnFn 
       (size) => failSession(`pi's output exceeded the ${size}-byte line buffer; closing the session`),
     ));
     pi.stderr?.resume?.();
-    pi.on('exit', () => { pi = null; if (turn) { const done = turn; turn = null; done({ stopReason: 'refusal' }); } });
-    pi.on('error', () => { pi = null; if (turn) { const done = turn; turn = null; done({ stopReason: 'refusal' }); } });
+    // Writing to a pi that has just died is EPIPE on its stdin; 'exit'/'error' below handle that.
+    pi.stdin.on?.('error', () => {});
+    // pi gone (it crashed at startup, was killed, or could not be spawned) ends the session: every
+    // pending command and the turn are refused, never left waiting on an ack that cannot come.
+    const gone = (child, why) => { if (pi === child) pi = null; endSession(why); };
+    const child = pi;
+    pi.on('exit', (code, signal) => gone(child, `pi exited (${signal || code})`));
+    pi.on('error', (err) => gone(child, `pi failed: ${String(err?.message || err)}`));
   }
 
   const methods = {
@@ -290,5 +319,7 @@ module.exports = { createBridge, toolCallFor, lines, piArgsFor, refusalReason };
 
 if (require.main === module) {
   createBridge({ input: process.stdin, output: process.stdout,
-    piCommand: process.env.PI_COMMAND || 'pi' });
+    piCommand: process.env.PI_COMMAND || 'pi',
+    // stderr is what the supervisor logs ("agent: …"): why a session ended is worth a line there.
+    onLog: (line) => { try { process.stderr.write(`pi-acp-bridge: ${String(line).slice(0, 2000)}\n`); } catch { /* gone */ } } });
 }

@@ -208,3 +208,87 @@ test('noevia’s reason for a refusal reaches the pi gate as its block reason (#
   await flush();
   assert.equal(responses().find((m) => m.id === 'ui9').cancelled, true);
 });
+
+// #852: pi dying before it acknowledges the prompt must not leave the turn (and a sandbox slot)
+// hanging until the wall limit.
+async function promptThenPiDies(kill) {
+  const child = fakePi();
+  const logs = [];
+  const h = harness({ spawnFn: () => child, askTimeoutMs: 1000, onLog: (m) => logs.push(m) });
+  let outputEnded = false;
+  h.fromBridge.on('finish', () => { outputEnded = true; });
+  h.send({ id: 1, method: 'initialize', params: {} });
+  h.send({ id: 2, method: 'session/new', params: { cwd: '/task' } });
+  await flush();
+  h.send({ id: 3, method: 'session/prompt', params: { sessionId: 'pi-1', prompt: [{ type: 'text', text: 'hi' }] } });
+  await flush();
+  const sent = child.stdin.writes.map((w) => JSON.parse(w));
+  assert.ok(sent.some((m) => m.type === 'prompt' && m.id === 'p1'), 'pi received the prompt');
+  assert.equal(h.out.find((m) => m.id === 3), undefined, 'no reply before pi acknowledges or dies');
+  kill(child); // pi never answers `p1`
+  await flush(); await flush();
+  return { ...h, child, logs, outputEnded: () => outputEnded };
+}
+
+test('pi exiting before it acknowledges the prompt ends the turn as a refusal and closes the bridge (#852)', async () => {
+  const r = await promptThenPiDies((child) => child.emit('exit', 1, null));
+  const reply = r.out.find((m) => m.id === 3);
+  assert.ok(reply, 'session/prompt was answered, not left hanging');
+  assert.equal(reply.result.stopReason, 'refusal');
+  assert.equal(r.outputEnded(), true, 'the bridge closed its output: the session is over');
+  assert.equal(r.toBridge.destroyed, true, 'and stopped reading the client, so the process can exit');
+  assert.equal(r.bridge.pi, null);
+  assert.ok(r.logs.some((l) => /pi exited \(1\)/.test(l)), 'why it ended is logged');
+});
+
+test('pi failing to start (spawn error) before the ack is a refusal too (#852)', async () => {
+  const r = await promptThenPiDies((child) => child.emit('error', Object.assign(Error('spawn pi ENOENT'), { code: 'ENOENT' })));
+  assert.equal(r.out.find((m) => m.id === 3)?.result?.stopReason, 'refusal');
+  assert.equal(r.outputEnded(), true);
+});
+
+test('a failed session answers a prompt pi never acknowledged, not only an acknowledged turn (#852)', async () => {
+  const child = fakePi();
+  const { send, out } = harness({ spawnFn: () => child, askTimeoutMs: 1000 });
+  send({ id: 2, method: 'session/new', params: { cwd: '/task' } });
+  await flush();
+  send({ id: 3, method: 'session/prompt', params: { sessionId: 'pi-1', prompt: [{ type: 'text', text: 'hi' }] } });
+  await flush();
+  child.stdout.emit('data', 'x'.repeat(16 * 1024 * 1024 + 1)); // before any ack
+  await flush(); await flush();
+  assert.equal(out.find((m) => m.id === 3)?.result?.stopReason, 'refusal');
+  assert.ok(child.killCalls.length > 0, "pi was killed with the failed session");
+});
+
+test('as a process: a pi that reads the prompt and exits gets a refusal, and the bridge exits (#852)', async () => {
+  const fs = require('node:fs'), os = require('node:os'), nodePath = require('node:path');
+  const { spawn } = require('node:child_process');
+  const dir = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'pi-bridge-'));
+  try {
+    const fake = nodePath.join(dir, 'fake-pi');
+    // Synthetic pi: waits for the prompt command, then dies without answering it.
+    fs.writeFileSync(fake, `#!${process.execPath}\nlet b='';process.stdin.on('data',(c)=>{b+=c;if(b.includes('"type":"prompt"'))process.exit(3);});\n`, { mode: 0o755 });
+    const bridge = spawn(process.execPath, [nodePath.join(__dirname, 'pi-acp-bridge.cjs')], {
+      env: { PATH: process.env.PATH, HOME: dir, PI_COMMAND: fake }, stdio: ['pipe', 'pipe', 'pipe'] });
+    const out = [];
+    let buf = '', stderr = '';
+    bridge.stdout.setEncoding('utf8');
+    bridge.stdout.on('data', (c) => { buf += c; let i; while ((i = buf.indexOf('\n')) !== -1) { const l = buf.slice(0, i); buf = buf.slice(i + 1); if (l.trim()) out.push(JSON.parse(l)); } });
+    bridge.stderr.on('data', (c) => { stderr += c; });
+    const exited = new Promise((resolve) => bridge.on('exit', (code, signal) => resolve({ code, signal })));
+    const write = (m) => bridge.stdin.write(JSON.stringify({ jsonrpc: '2.0', ...m }) + '\n');
+    write({ id: 1, method: 'initialize', params: {} });
+    write({ id: 2, method: 'session/new', params: { cwd: dir } });
+    write({ id: 3, method: 'session/prompt', params: { sessionId: 'pi-1', prompt: [{ type: 'text', text: 'hi' }] } });
+    // stdin stays open: the bridge must exit on its own, not because the client hung up.
+    let timer;
+    const result = await Promise.race([exited, new Promise((r) => { timer = setTimeout(() => r('timeout'), 10000); })]);
+    clearTimeout(timer);
+    if (result === 'timeout') bridge.kill('SIGKILL');
+    assert.notEqual(result, 'timeout', `the bridge exited by itself (stderr: ${stderr})`);
+    assert.equal(out.find((m) => m.id === 3)?.result?.stopReason, 'refusal', JSON.stringify(out));
+    assert.match(stderr, /pi exited \(3\)/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
