@@ -36,7 +36,7 @@ const ROOT = '/work/tree';
 
 test('well-formed calls from the harnesses noevia runs pass every schema', () => {
   const ok = [
-    // OpenCode, measured in experiments/acp-spike: an edit names `filepath` + `diff` and a location.
+    // OpenCode, measured in experiments/acp-spike (removed in #846; git history at cc1bc4a9): an edit names `filepath` + `diff` and a location.
     { toolCallId: 'c1', kind: 'edit', title: `${ROOT}/median.js`, locations: [{ path: `${ROOT}/median.js` }], rawInput: { filepath: `${ROOT}/median.js`, diff: '@@' } },
     { toolCallId: 'c2', kind: 'execute', title: 'node test.js', rawInput: { command: 'node test.js', cwd: ROOT } },
     // pi bridge: bash as `execute`, write as `edit` with `path`, grep as `search`.

@@ -57,7 +57,8 @@ const FILES_CONTEXT_MAX_CHARS = clampInt(process.env.FILES_CONTEXT_MAX_CHARS, 12
 const LARGE_FILE_HEAD = 24000;
 const MIN_SCORE = 0.3;
 
-// Optional cross-encoder rerank (docs/research/system-one, experiments/system-one/rag). Off unless
+// Optional cross-encoder rerank (docs/research/system-one; experiments/system-one/rag was removed
+// in #846, see git history at f9dc5df2). Off unless
 // NOEVIA_FEATURE_RAG_RERANK=1 and RERANK_BASE_URL are set. Retrieval then pulls a wider cosine pool
 // and the reranker picks the kept chunks; any failure or a missed deadline falls back to today's
 // cosine top-6, so chat never waits longer than the deadline. KEEP defaults to 6, not the

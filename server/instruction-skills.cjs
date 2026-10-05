@@ -175,7 +175,7 @@ function revoked(current, loaded) {
   }
   return out;
 }
-// Whether a pinned record (chat-turns `skill`) is still the enabled, reviewed content of `current`.
+// Whether a pinned record ({ file, contentHash, name }) is still the enabled, reviewed content of `current`.
 const pinActive = (current, record) => !!record?.file && SHA.test(String(record.contentHash || '')) &&
   revoked(current, new Map([[record.file, { hash: record.contentHash, name: record.name }]])).length === 0;
 // The Sources list (GET/PUT /instruction-skills), with the portable id, origin and bundled scripts

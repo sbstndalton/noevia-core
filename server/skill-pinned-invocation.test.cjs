@@ -7,7 +7,6 @@ const skills = require('./instruction-skills.cjs');
 const { createChatHandler } = require('./chat.cjs');
 const { createToolExchange } = require('./tool-exchange.cjs');
 const { createVisionProbe } = require('./vision.cjs');
-const { createChatTurns } = require('./chat-turns.cjs');
 const { requestShapeError } = require('./chat-mode.cjs');
 
 const FILE = 'synthetic-helper/SKILL.md';
@@ -75,7 +74,6 @@ async function run(t, { reqBody = {}, owner = 'user-a', requester = owner, fixtu
       : { content: 'synthetic reply' };
     return { ok: true, body: (async function* () { yield Buffer.from('data: ' + JSON.stringify({ choices: [{ delta }] }) + '\n\n'); yield Buffer.from('data: [DONE]\n\n'); })() };
   };
-  const durableChat = createChatTurns({ enabled: true });
   const workspace = { userId: requester, dir, assetDir: () => '/synthetic-only' };
   // The tenant-scoped project store: a project is only visible to its owner.
   const getProject = (id) => (workspace.userId === owner && id === fixture.id ? fixture : null);
@@ -94,16 +92,14 @@ async function run(t, { reqBody = {}, owner = 'user-a', requester = owner, fixtu
     endpointApproved: () => true, diaryHeaders: () => ({}), lastLoadedModel: () => null, classifyFastOrSmart: async () => 'fast', servedCatalogue: async () => [],
     modelsInstalled: async () => [], missingRoles: () => [], staleRolesError: () => null, allToolboxes: () => [{ id: 'core' }],
     executeToolCall: async () => { executions++; return 'synthetic result'; }, chatWideApproved: () => false,
-    awaitApproval: async () => { approvals++; return 'approve'; }, recordUsage() {}, recordToolUse() {}, durableChat,
+    awaitApproval: async () => { approvals++; return 'approve'; }, recordUsage() {}, recordToolUse() {},
   });
   await handleChat({}, res, { projectId: fixture.id, chatId: 'fixture-chat', message: 'synthetic question', ...reqBody }, { user: { id: requester } });
-  const job = require('./jobs.cjs').createJobs({ dir }).list({ kind: 'chat' })[0];
-  const turn = job ? durableChat.restore(workspace, job.id).state : null;
-  return { events, requests, reply, turn, approvals, executions, routerCalls, saved };
+  return { events, requests, reply, approvals, executions, routerCalls, saved };
 }
 const system = (r) => r.requests[0].messages.find((m) => m.role === 'system')?.content || '';
 
-test('chat: a pinned reviewed version is injected, recorded on meta and on the durable turn', async (t) => {
+test('chat: a pinned reviewed version is injected and recorded on meta', async (t) => {
   const fixture = project(), pin = pinOf(fixture);
   const r = await run(t, { fixture, reqBody: { skill: `${pin.id}@${pin.version}` } });
   assert.equal(r.reply, null);
@@ -114,7 +110,6 @@ test('chat: a pinned reviewed version is injected, recorded on meta and on the d
   const meta = r.events.find((e) => e.type === 'meta');
   assert.deepEqual(meta.skill, { id: pin.id, file: FILE, name: 'synthetic-helper', versionLabel: '1.0.0', version: pin.version, contentHash: pin.version, origin: 'project-file' });
   assert.equal(r.events.find((e) => e.type === 'skills_scope')?.text, 'synthetic-helper');
-  assert.deepEqual(r.turn.skill, meta.skill);
 });
 
 test('chat: a refused pin on a new project chat creates no chat entry; a resolved one still does', async (t) => {
@@ -139,7 +134,6 @@ test('chat: an unpinned request behaves as before and records no skill', async (
   assert.equal(r.routerCalls, 1, 'automatic selection still runs');
   assert.doesNotMatch(system(r), /invoked skill/);
   assert.equal('skill' in r.events.find((e) => e.type === 'meta'), false, 'absent on the wire');
-  assert.equal('skill' in r.turn, false);
   assert.equal(r.events.some((e) => e.type === 'skills_scope'), false);
   const nullPin = await run(t, { reqBody: { skill: null } });
   assert.equal(nullPin.reply, null); assert.equal(nullPin.routerCalls, 1);
@@ -159,7 +153,6 @@ test('chat: refused pins answer with an explicit code before any model request',
     assert.equal(r.reply?.status, status, errorCode);
     assert.equal(r.reply.payload.code, errorCode);
     assert.equal(r.requests.length, 0, `${errorCode}: no model request`);
-    assert.equal(r.turn, null, `${errorCode}: no turn journaled`);
   }
   const free = await run(t, { reqBody: { projectId: undefined, spaceId: 'free', chatId: undefined, skill: pin } });
   assert.equal(free.reply.status, 400); assert.equal(free.reply.payload.code, 'skill_pin_requires_project');
@@ -182,5 +175,4 @@ test('chat: a pinned skill never bypasses the write approval gate', async (t) =>
   const r = await run(t, { fixture, reqBody: { skill: pin }, toolCall: true });
   assert.equal(r.approvals, 1, 'the write still asked for approval');
   assert.equal(r.executions, 1);
-  assert.ok(r.turn.calls[0].approval, 'the durable turn journaled the approval request');
 });

@@ -4,7 +4,8 @@
 // It only narrows: a box the project did not select is never added, so routing can never offer a
 // write the user did not already allow. Any doubt (flag off, one box, embeddings down, nothing
 // clears the threshold) keeps the whole selection. Gate evidence:
-// experiments/tool-routing/README.md § Router variant, measured 2026-09-17.
+// the experiments/tool-routing README § Router variant, measured 2026-09-17 (removed in #846;
+// see git history at 0eee673f).
 const crypto = require('node:crypto');
 const { route } = require('./tool-router.cjs');
 

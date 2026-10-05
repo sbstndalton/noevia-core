@@ -1,7 +1,8 @@
 'use strict';
 // Task-conditional toolbox selection, decided BEFORE the first model call with no
 // extra model round. Pure: the caller supplies embeddings. Not wired into chat
-// until the router variant in experiments/tool-routing passes its measurement gate.
+// until the router variant in experiments/tool-routing passes its measurement gate (that
+// experiment was removed in #846; see git history at 0eee673f).
 
 function cosine(a, b) {
   let dot = 0, na = 0, nb = 0;

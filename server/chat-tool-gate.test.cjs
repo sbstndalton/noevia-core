@@ -20,7 +20,7 @@ const sse = (...frames) => ({ ok: true, status: 200, body: (async function* () {
 const text = (t) => sse({ choices: [{ delta: { content: t } }] });
 const call = (name, args) => sse({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'c1', function: { name, arguments: JSON.stringify(args) } }] } }] });
 
-async function run(t, { message, replies, gate, policy = () => 'allow', execute = async () => 'SYNTHETIC RESULT', durableChat = null, boxes = BOXES }) {
+async function run(t, { message, replies, gate, policy = () => 'allow', execute = async () => 'SYNTHETIC RESULT', boxes = BOXES }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-tool-gate-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const events = [];
   const res = new EventEmitter(); res.writeHead = () => {}; res.end = () => { res.writableEnded = true; res.emit('finish'); };
@@ -52,7 +52,7 @@ async function run(t, { message, replies, gate, policy = () => 'allow', execute 
     lastLoadedModel: () => null, classifyFastOrSmart: async () => 'fast', servedCatalogue: async () => [], modelsInstalled: async () => [], missingRoles: () => [], staleRolesError: () => null,
     allToolboxes: () => boxes, chatWideApproved: () => false, awaitApproval: async () => 'deny', recordUsage() {}, recordToolUse() {},
     executeToolCall: async (_p, name, args, _allowed, _signal, outcome) => { executed.push({ name, args: JSON.parse(args) }); return execute(name, outcome); },
-    ...(gate === undefined ? {} : { toolGate: gate }), ...(durableChat ? { durableChat } : {}),
+    ...(gate === undefined ? {} : { toolGate: gate }),
   });
   await handleChat({}, res, { projectId: 'fixture-project', chatId: 'fixture-chat', message });
   return { bodies, executed, events, dir };
@@ -169,23 +169,4 @@ test('a tool offered by two boxes is sent once in the forced choice and runs onc
   const { gate } = fakeGate();
   const r = await run(t, { message: 'latest news on synthetic widgets', gate, boxes, replies: [text('answer')] });
   assert.deepEqual(r.executed, [{ name: 'tavily_search', args: { query: 'latest news on synthetic widgets' } }]);
-});
-
-test('durable journal: the prefetched call is recorded like a model call and comes back on restore', async (t) => {
-  const { createChatTurns } = require('./chat-turns.cjs');
-  const real = createChatTurns({ enabled: true });
-  let started = null;
-  const durableChat = { enabled: true, start: (...args) => (started = real.start(...args)) };
-  const { gate } = fakeGate();
-  const r = await run(t, { message: 'latest news on synthetic widgets', gate, durableChat, replies: [text('answer from results')] });
-  const restored = createChatTurns({ enabled: true }).restore({ userId: 'synthetic-user', dir: r.dir }, started.id);
-  const call = restored.state.calls.find((c) => c.name === 'tavily_search');
-  assert.ok(call, 'prefetched call journaled');
-  assert.equal(call.status, 'completed');
-  assert.match(call.result, /SYNTHETIC RESULT/);
-  const toolMsg = restored.state.messages.find((m) => m.role === 'tool' && m.tool_call_id === call.id);
-  assert.ok(toolMsg, 'the tool_result message is rebuilt from the journal');
-  const asked = restored.state.messages.find((m) => m.tool_calls?.[0]?.id === call.id);
-  assert.equal(asked.tool_calls[0].function.name, 'tavily_search');
-  assert.equal(restored.next, 'completed');
 });

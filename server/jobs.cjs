@@ -217,7 +217,7 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
           rows.push(JSON.parse(line));
         } catch (e) {
           // Tolerate a torn last line left by a crash mid-write, but only for journals
-          // that don't hash-chain their events: a durable (e.g. chat-turns tool-call)
+          // that don't hash-chain their events: a durable (hash-chained)
           // journal must fail closed on any unreadable tail rather than silently resume
           // with the last recorded event possibly missing its effect.
           const hashChained = rows[0]?.hash || (durable && (!kinds || kinds.includes(rows[0]?.data?.kind)));

@@ -113,7 +113,7 @@ function normalizeReplayHistory(mapped, newMessage) {
 }
 
 function createChatHandler({
-  stepSupervision = null, durableChat = null, fs, path, crypto, fetch, codeTasksFor = () => [], reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, diaryStorageRetry = (send) => send(true), autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, toolGate = null, chatFramingEnabled = () => false, freeChats = () => [], framingReasoner = null, reasoningTraces = null, brainContext = null, DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse,
+  stepSupervision = null, fs, path, crypto, fetch, codeTasksFor = () => [], reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, diaryStorageRetry = (send) => send(true), autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, toolGate = null, chatFramingEnabled = () => false, freeChats = () => [], framingReasoner = null, reasoningTraces = null, brainContext = null, DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse,
   chatgptOAuth = null, chatgptEnabled = () => false, skillHistory = null,
   // #648: whether a tool is one of noevia's own project file edits, whose target is resolved and
   // shown on the approval card and pinned for the call. By name when not wired (the stricter side).
@@ -156,10 +156,6 @@ function createChatHandler({
     try{return await handleChatInner(req,res,body,authn,preparation,execution);}
     finally{
       preparation?.finish();
-      if (execution.turn) {
-        if (execution.turn.snapshot().phase === 'completed') execution.turn.complete();
-        else if (execution.turn.snapshot().phase !== 'interrupted') execution.turn.interrupt('Chat request ended before completion');
-      }
       // #679: the client went away mid-reply (reload, closed tab). Keep the reply as stopped, with
       // any write that ran, after the user message the client saved as the turn started.
       if (execution.record && execution.aborted?.()) {
@@ -891,14 +887,11 @@ function createChatHandler({
       // is resolved the same way before it is compared with a skill's stored name.
       const resolvedName = name ? require('./project-file-names.cjs').resolveProjectFile(project, name).file?.name ?? null : null;
       const text = String(result ?? '');
-      let added = false;
       for (const skill of instructionSkills.list(project)) {
         if (skill.status !== 'enabled' || loadedSkills.has(skill.file)) continue;
-        if (skill.file === name || skill.file === resolvedName || text.includes(skill.hash)) { loadedSkills.set(skill.file, { hash: skill.hash, name: skill.name }); rememberSkill(skill.file, skill.hash, skill.name, skill.content); added = true; }
+        if (skill.file === name || skill.file === resolvedName || text.includes(skill.hash)) { loadedSkills.set(skill.file, { hash: skill.hash, name: skill.name }); rememberSkill(skill.file, skill.hash, skill.name, skill.content); }
       }
-      if (added) recordLoadedSkills();
     };
-    const loadedSkillRecords = () => [...loadedSkills].map(([file, { hash, name }]) => ({ file, name, contentHash: hash }));
     const revocationText = () => `Skill ${skillRevocation.map((s) => JSON.stringify(s.name)).join(', ')} was disabled or changed during this reply, so no further steps were run.`;
     const refuseForRevokedSkill = (name, userId) => {
       authService?.audit?.('tool.denied', userId, userId, { tool: name, reason: 'skill-revoked' });
@@ -918,13 +911,9 @@ function createChatHandler({
       if (egressToolRefusal(chatUser?.id || userId, tool, JSON.stringify(args))) return null;
       const call = { id: `gate-${crypto.randomUUID()}`, name: tool, args: JSON.stringify(args) };
       const index = toolOffset;
-      // Journaled exactly like a model-requested call (output -> started -> result), so a resumed
-      // or replayed turn rebuilds the same chip and tool message.
-      turn?.output('', [call]);
       send({ type: 'tool', index, name: call.name, args: call.args });
       const outcome = { failed: false };
       const result = String(await runTool(call, async () => {
-        turn?.started(call.id);
         const out = await executeToolCall(project, call.name, call.args, allowedToolNames, chatSignal.signal, outcome, { chatKey, exchangeKey });
         recordToolUse(chatWorkspace, call.name);
         return out;
@@ -932,9 +921,6 @@ function createChatHandler({
       send({ type: 'tool_result', index, name: call.name, text: result.slice(0, 300) });
       toolOffset = index + 1;
       const framed = frameUntrusted('tool result', call.name, reduceToolResult(result, { maxChars: TOOL_RESULT_CAP }).text);
-      // A read has no side effects, so a failed prefetch has a known outcome: it is recorded as
-      // resolved with its error text rather than 'outcome_unknown', which would halt the turn.
-      turn?.result(call.id, framed, { failed: false, originalBytes: Buffer.byteLength(result) });
       if (outcome.failed === true || /^ERROR\b/.test(result)) return null;
       if (holdForCloud(call.name, result)) return null;
       noteSkillRead(call.args, result);
@@ -1004,18 +990,9 @@ function createChatHandler({
       send({type:'context',...prepared.meter});
     } catch(error) {send({type:'error',text:error.message});res.end();return;}
     if(body.compactOnly){send({type:'done',model});res.end();return;}
-    const turn = durableChat?.enabled && !spaceId?.startsWith('diary')
-      ? durableChat.start(chatWorkspace, { projectId, conversationId: chatId || contextId,
-          messages: wire, model: { providerId:provider.id, id:model, effort, maxTokens:prepared.maxTokens, limit }, skill: pinnedSkill?.record,
-          skills: loadedSkillRecords() }) : null;
-    execution.turn = turn;
-    // Every skill this exchange loaded is journaled on the turn (#272), so a continuation can verify
-    // all of them, not only the pin. Called again whenever a read loads another skill.
-    function recordLoadedSkills() { turn?.skillsLoaded(loadedSkillRecords()); }
     const reportRevocation = () => {
       if (!skillRevocation || skillRevocationReported) return;
       skillRevocationReported = true;
-      turn?.interrupt(`Skill revoked: ${skillRevocation.map((s) => s.file).join(', ')}`);
       send({ type: 'error', code: 'skill_revoked', text: revocationText() });
     };
     let roundMessages = prepared.messages;
@@ -1150,7 +1127,6 @@ function createChatHandler({
       }
       context.logRound({dir:chatWorkspace.dir,chatId:contextId,model,limit,round,compacted:!!continuationCompactedAt||!!prepared.meter.compactedAt&&prepared.meter.compactedAt>=requestStartedAt,messages:roundMessages,tools:activeTools,assertActive:assertWorkspaceActive});
       const snapshot=context.read(chatWorkspace.dir,contextId);snapshot.meter={...roundBudget,historyCount:prepared.meter.historyCount,compactedAt:continuationCompactedAt||prepared.meter.compactedAt,covered:continuationCompactedAt?continuationCovered:prepared.meter.covered};context.save(chatWorkspace.dir,contextId,snapshot,assertWorkspaceActive);
-      turn?.generation({ messages:roundMessages, tools:activeTools }, round);
       if (taint) { try { taint.ingestMessages(roundMessages); } catch { taintBroken = true; } }
       let upstream;
       roundStartedAt = Date.now();
@@ -1210,7 +1186,7 @@ function createChatHandler({
             try {
               const evt = JSON.parse(payload);
               if(evt.choices?.[0]?.finish_reason==='length')send({type:'warning',text:'The model reached its thinking/answer token budget. This reply may be incomplete; try Low thinking or a narrower question.'});
-              if(evt.error){const text=chatgptProvider&&evt.error?.source==='chatgpt'&&typeof evt.error.message==='string'?evt.error.message.slice(0,300):context.providerError(evt.error);turn?.interrupt(`Provider stream error: ${text}`);send({type:'error',text});res.end();return;}
+              if(evt.error){const text=chatgptProvider&&evt.error?.source==='chatgpt'&&typeof evt.error.message==='string'?evt.error.message.slice(0,300):context.providerError(evt.error);send({type:'error',text});res.end();return;}
               const delta = evt.choices?.[0]?.delta || {};
               const meaningfulToolFragment = Array.isArray(delta.tool_calls) && delta.tool_calls.some(tc => tc?.id || tc?.function?.name || tc?.function?.arguments);
               // Detect output before handling usage: a compact provider may put
@@ -1265,14 +1241,12 @@ function createChatHandler({
           }
         }
       } catch (err) {
-        turn?.partial(roundContent);
         if (chatSignal.signal.aborted) break; // client went away; stop quietly
         send({ type: 'error', text: String(err?.message || err) });
         break;
       }
       // Cut off mid-stream by a revoked skill: keep what was already shown, request no tools.
       if (skillRevocation) {
-        turn?.partial(roundContent);
         // Chips for calls already streamed this round would otherwise stay pending: each gets a
         // result saying it was not run (none of them was executed).
         for (const [i, slot] of toolCalls) send({ type: 'tool_result', index: toolOffset + i, name: slot.name, text: `ERROR: ${revocationText()} ${slot.name || 'This tool'} was not run.`.slice(0, 300) });
@@ -1283,7 +1257,6 @@ function createChatHandler({
       // non-streaming retry is safe for generation (no side effects, unlike diary).
       if (!sawAnything) {
         try {
-          turn?.fallbackRetry();
           // This is a new provider request. Keep the user-visible exchange
           // clock running, but do not attribute the empty streaming attempt's
           // wait to this request's passive prefill sample.
@@ -1327,7 +1300,6 @@ function createChatHandler({
         }
         toolGate.record('gate.miss', { tool: forcedTool });
       }
-      if (sawAnything) turn?.output(roundContent, [...toolCalls.values()]);
 
       // Execute each requested tool and append assistant tool_calls + results.
       // This runs even on the final round: the client has already received the
@@ -1352,7 +1324,6 @@ function createChatHandler({
               send({ type: 'tools_scope', text: 'all tools' });
             }
             send({ type: 'tool_result', index: toolOffset + toolIndex, name: tc.name, text: reply.slice(0, 300) });
-            turn?.result(tc.id, reply);
             roundMessages.push({ role: 'tool', tool_call_id: tc.id, content: reply });
             continue;
           }
@@ -1429,7 +1400,6 @@ function createChatHandler({
             const askedPerCall = permission === 'ask' && (!chatWideApproved(userId, chatId) || provenanceHits.length > 0);
             if (askedPerCall) {
               const approvalId = `ap-${crypto.randomUUID()}`;
-              turn?.approval(tc.id, { id:approvalId, action:'pending' });
               // #658: the same tool, target and arguments as a write that already succeeded in this
               // chat. Only a flag on the card: the person still decides, with all three actions.
               const repeat = writePrint !== null && (writesDone.has(userId, chatId, writePrint) || recentWriteFps.has(writePrint));
@@ -1444,7 +1414,7 @@ function createChatHandler({
                 ...(repeat ? { repeatOf: true } : {}),
                 ...(provenanceHits.length ? { provenance: provenanceHits } : {}),
               });
-              const decision = await awaitApproval({ id: approvalId, userId, chatId, abortSignal: chatSignal.signal, onDecision: action => turn?.approval(tc.id, {id:approvalId,action}) });
+              const decision = await awaitApproval({ id: approvalId, userId, chatId, abortSignal: chatSignal.signal });
               if (decision !== 'approve') {
                 // A refusal is a normal conversational turn: the model is told
                 // plainly so it can offer an alternative, rather than the stream
@@ -1485,12 +1455,9 @@ function createChatHandler({
                 return `ERROR: the project's files changed after approval, so ${JSON.stringify(editTarget)} ${again.error ? 'can no longer be edited' : `is no longer the file this name refers to (it now means ${JSON.stringify(again.path)})`}. ${tc.name} was not run and nothing was changed. Ask again if the edit is still wanted.`;
               }
             }
-            if (!(askedPerCall && provenanceHits.length) && chatWideApproved(userId, chatId)) turn?.approval(tc.id, {action:'approve_all', inherited:true});
-            turn?.started(tc.id);
             markWriteAttempt();
             const options = { chatKey, exchangeKey, ...(editTarget !== null ? { editTarget: editTargets.targetDigest(editTarget, editAccount) } : {}) };
-            try { result = await executeToolCall(project, tc.name, tc.args, allowedToolNames, chatSignal.signal, outcome, options); }
-            catch (error) { turn?.uncertain(tc.id); throw error; }
+            result = await executeToolCall(project, tc.name, tc.args, allowedToolNames, chatSignal.signal, outcome, options);
             ran = true;
             recordToolUse(chatWorkspace, tc.name);
             // Audit AFTER the fact and only for writes: "what did the model
@@ -1509,13 +1476,9 @@ function createChatHandler({
           // The chip gets the real result; this is the model's copy. Most
           // tools cap themselves, so this is a no-op for them — it is here so a
           // tool that does not cannot quietly spend the whole prefill budget.
-          // The durable turn stores the same reduced copy (replay/resume use it)
-          // plus the original size, never the raw megabytes.
           const forModel = reduceToolResult(result, { maxChars: TOOL_RESULT_CAP });
-          // Tool/MCP output is third-party data: framed once, and the same framed
-          // copy is journaled so a replay sends the model exactly what it saw.
+          // Tool/MCP output is third-party data: framed once.
           const framedResult = frameUntrusted('tool result', tc.name, forModel.text);
-          turn?.result(tc.id, framedResult, { failed: outcome.failed === true, originalBytes: Buffer.byteLength(String(result)) });
           // #658: a write that ran and succeeded. The chip carries it, so the client can tell the
           // model on later turns (and after a failed or paused reply) that this change is done.
           const applied = ran && writePrint !== null && outcome.failed !== true && !/^ERROR\b/.test(String(result));
@@ -1532,14 +1495,12 @@ function createChatHandler({
         }
       }
 
-      if (turn?.snapshot().calls.some(c => c.status === 'outcome_unknown')) break;
       if (toolCalls.size) toolOffset += Math.max(...toolCalls.keys()) + 1;
       if (declineEndsReply && declinedWrites.length && !skillRevocation) {
         // #666: the person declined a write. Small models ignore the declined result and still
         // say the change was made, so the model is not asked for more text: the reply ends here
         // with a fixed note (words the client shows in its own language, never model text). Every
         // call of this round has its result, and any approved write that ran is counted.
-        turn?.interrupt('A write was declined on its approval card');
         paused = true;
         const n = appliedWrites.length, names = [...new Set(declinedWrites)].join(', ');
         send({ type: 'paused', reason: 'declined', applied: n, declined: [...new Set(declinedWrites)],
@@ -1553,13 +1514,11 @@ function createChatHandler({
       const supervised = await require('./step-supervision.cjs').superviseNextStep(
         spaceId?.startsWith('diary') ? null : stepSupervision,
         { round, messages: roundMessages, signal: chatSignal.signal });
-      if (supervised.decision) turn?.supervision(supervised.decision);
       roundMessages = supervised.messages;
       if (supervised.pause) {
         // #658: the tool round before this checkpoint finished, and its writes are real. A pause
         // is not a failed request: the reply ends normally and says what was already applied, so
         // nobody retries (and repeats) a change that happened. No further model round or tool runs.
-        turn?.interrupt('Step supervision paused after completed tool steps');
         paused = true;
         const n = appliedWrites.length;
         send({ type: 'paused', reason: 'supervision', applied: n,
@@ -1574,7 +1533,6 @@ function createChatHandler({
     // ends the reply with one explicit error; nothing after the revocation was run.
     if (skillRevocation) { reportRevocation(); res.end(); return; }
     if (cloudHold && !paused) {
-      turn?.interrupt('A tool result looked sensitive on a cloud route');
       paused = true;
       send({ type: 'paused', reason: 'sensitive-tool-result', flag: cloudHold, applied: appliedWrites.length,
         text: 'A tool result looks sensitive and was not sent to the cloud model. Switch this chat to local or resend.' });

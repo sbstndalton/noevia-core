@@ -1,7 +1,7 @@
 'use strict';
 // CodeHarness contract v0: turn one ACP tool call into noevia's own action model and say
 // whether a human has to answer for it (spec-agent-execution §3, and the measured behaviour in
-// experiments/acp-spike).
+// experiments/acp-spike, removed in #846; see git history at cc1bc4a9).
 //
 // Two rules decide everything here:
 //  * Fail closed. An unfamiliar kind, an unreadable command or a missing permission option is

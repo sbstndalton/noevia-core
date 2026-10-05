@@ -8,7 +8,6 @@ const skills = require('./instruction-skills.cjs');
 const { createChatHandler } = require('./chat.cjs');
 const { createToolExchange } = require('./tool-exchange.cjs');
 const { createVisionProbe } = require('./vision.cjs');
-const { createChatTurns } = require('./chat-turns.cjs');
 
 const FILE = 'synthetic-helper/SKILL.md', OTHER = 'other-helper/SKILL.md';
 const body = ({ name = 'synthetic-helper', requires = '', text = 'Answer in synthetic haiku.' } = {}) =>
@@ -150,7 +149,6 @@ async function run(t, { reqBody = {}, fixture = project(), rounds = [], onExecut
       yield Buffer.from('data: [DONE]\n\n');
     })() };
   };
-  const durableChat = createChatTurns({ enabled: true });
   const workspace = { userId, dir, assetDir: () => '/synthetic-only' };
   const getProject = (id) => (id === fixture.id ? fixture : null); // the live store: edits show at once
   const writes = new Set(['synthetic_write']);
@@ -172,12 +170,10 @@ async function run(t, { reqBody = {}, fixture = project(), rounds = [], onExecut
     modelsInstalled: async () => [], missingRoles: () => [], staleRolesError: () => null, allToolboxes: () => known.map((id) => ({ id })), stepSupervision,
     executeToolCall: async (_p, name, args) => { executed.push(name); return (await onExecute?.(name, args)) ?? 'synthetic result'; },
     chatWideApproved: () => false,
-    awaitApproval: async () => { approvals++; await onApproval?.(); return 'approve'; }, recordUsage() {}, recordToolUse() {}, durableChat,
+    awaitApproval: async () => { approvals++; await onApproval?.(); return 'approve'; }, recordUsage() {}, recordToolUse() {},
   });
   await handleChat({}, res, { projectId: fixture.id, chatId: 'fixture-chat', message: 'synthetic question', ...reqBody }, { user: { id: 'user-a' } });
-  const job = require('./jobs.cjs').createJobs({ dir }).list({ kind: 'chat' })[0];
-  const turn = job ? durableChat.restore(workspace, job.id).state : null;
-  return { events, requests, reply, turn, approvals, executed, saved, audits, routerInput };
+  return { events, requests, reply, approvals, executed, saved, audits, routerInput };
 }
 const errorOf = (r) => r.events.find((e) => e.type === 'error');
 
@@ -187,7 +183,7 @@ test('chat: a pin whose required toolbox this request does not carry is refused 
   assert.equal(r.reply.status, 422);
   assert.equal(r.reply.payload.code, 'skill_requirements_unmet');
   assert.deepEqual(r.reply.payload.missing, ['web-search']);
-  assert.equal(r.requests.length, 0); assert.equal(r.turn, null); assert.deepEqual(r.saved, []);
+  assert.equal(r.requests.length, 0); assert.deepEqual(r.saved, []);
   // Selected for the project, or added for this one message: the pin resolves. The skill never adds it.
   const selected = project({ content: body({ requires: 'web-search' }), toolboxes: ['core', 'web-search'] });
   assert.equal((await run(t, { fixture: selected, reqBody: { skill: pinOf(selected) } })).reply, null);
@@ -203,7 +199,7 @@ test('chat: a pin whose required toolbox the provider strips stops before any mo
   assert.equal(r.reply, null, 'passed the early check: the project does carry diary');
   assert.equal(errorOf(r)?.code, 'skill_requirements_unmet');
   assert.match(errorOf(r).text, /External fixture cannot use: diary/);
-  assert.equal(r.requests.length, 0); assert.equal(r.turn, null);
+  assert.equal(r.requests.length, 0);
 });
 
 test('chat: automatic loading offers the router only skills whose requirements and assets are usable', async (t) => {
@@ -228,7 +224,6 @@ test('chat: disabling the pinned skill while its write waits for approval stops 
   assert.match(errorOf(r).text, /"synthetic-helper" was disabled or changed/);
   assert.equal(r.events.some((e) => e.type === 'done'), false);
   assert.match(r.events.find((e) => e.type === 'tool_result').text, /^ERROR: .*synthetic_write was not run/);
-  assert.equal(r.turn.phase, 'interrupted'); assert.match(r.turn.failure, /Skill revoked: synthetic-helper\/SKILL\.md/);
   assert.ok(r.audits.some(([kind, , , detail]) => kind === 'tool.denied' && detail.reason === 'skill-revoked'));
 });
 
@@ -282,24 +277,6 @@ test('chat: a reply streaming under a skill that is disabled mid-stream is cut o
   const text = r.events.filter((e) => e.type === 'delta').map((e) => e.text).join('');
   assert.equal(text, 'first words');
   assert.equal(errorOf(r)?.code, 'skill_revoked');
-  assert.equal(r.turn.phase, 'interrupted');
-});
-
-test('durable continuation of a pinned turn requires the pin to be still active', async (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-skill-resume-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const workspace = { dir, userId: 'tenant-a' }, service = createChatTurns({ enabled: true });
-  const fixture = project();
-  const record = { id: skills.skillId(fixture, FILE), file: FILE, name: 'synthetic-helper', versionLabel: '1.0.0', version: skills.hash(fixture.files[0].content), contentHash: skills.hash(fixture.files[0].content), origin: 'project-file' };
-  const start = () => { const turn = service.start(workspace, { projectId: fixture.id, conversationId: 'c', messages: [{ role: 'user', content: 'synthetic' }], model: { id: 'm' }, skill: record }); turn.interrupt('model died'); return turn.id; };
-  const opts = (skillActive) => ({ model: { id: 'm' }, project: (s) => s.messages, provider: async () => ({ content: 'resumed' }), ...(skillActive ? { skillActive } : {}) });
-  const noCheck = start();
-  await assert.rejects(service.resumeGeneration(workspace, noCheck, opts()), /continuation refused/);
-  assert.equal(service.restore(workspace, noCheck).state.retries.remaining, 1, 'refused before any attempt was spent');
-  const ok = start();
-  assert.equal((await service.resumeGeneration(workspace, ok, opts((r) => skills.pinActive(fixture, r)))).phase, 'completed');
-  disable(fixture);
-  const off = start();
-  await assert.rejects(service.resumeGeneration(workspace, off, opts((r) => skills.pinActive(fixture, r))), /continuation refused/);
 });
 
 // ── Review follow-ups ──
@@ -323,16 +300,6 @@ test('chat: any tool whose result carries a skill\'s SHA-256 loads that skill', 
   assert.equal(errorOf(r)?.code, 'skill_revoked');
 });
 
-test('chat: every loaded skill is journaled on the durable turn, including ones read mid-exchange', async (t) => {
-  const fixture = project({ other: true });
-  const r = await run(t, { fixture, rounds: [{ tool: 'project_read_file', args: { name: OTHER } }] });
-  assert.equal(r.requests.length, 2);
-  assert.deepEqual(r.turn.skills.map((s) => s.file).sort(), [FILE, OTHER].sort(), 'the auto-loaded skill and the read one');
-  for (const s of r.turn.skills) assert.match(s.contentHash, /^[a-f0-9]{64}$/);
-  const unloaded = await run(t, { fixture: project({ content: body({ requires: 'web-search' }), toolboxes: ['core'] }) });
-  assert.equal('skills' in unloaded.turn, false, 'absent when the exchange loaded no skill');
-});
-
 test('chat: after a revocation-refused tool, step supervision is not consulted and there is one error', async (t) => {
   const fixture = project();
   let supervisorCalls = 0;
@@ -353,18 +320,6 @@ test('chat: tool calls already streamed when a mid-stream revocation cuts the ro
   assert.match(result.text, /^ERROR: .*synthetic_write was not run/);
   assert.deepEqual(r.executed, []); assert.equal(r.approvals, 0); assert.equal(r.requests.length, 1);
   assert.equal(errorOf(r)?.code, 'skill_revoked');
-});
-
-test('durable continuation verifies every loaded skill, not only the pin', async (t) => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-skill-resume-all-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const workspace = { dir, userId: 'tenant-a' }, service = createChatTurns({ enabled: true });
-  const fixture = project({ other: true });
-  const other = { file: OTHER, name: 'other-helper', contentHash: skills.hash(fixture.files.find((f) => f.name === OTHER).content) };
-  const start = () => { const turn = service.start(workspace, { projectId: fixture.id, conversationId: 'c', messages: [{ role: 'user', content: 'synthetic' }], model: { id: 'm' }, skills: [other] }); turn.interrupt('model died'); return turn.id; };
-  const opts = { model: { id: 'm' }, project: (s) => s.messages, provider: async () => ({ content: 'resumed' }), skillActive: (rec) => skills.pinActive(fixture, rec) };
-  assert.equal((await service.resumeGeneration(workspace, start(), opts)).phase, 'completed');
-  disable(fixture, OTHER);
-  await assert.rejects(service.resumeGeneration(workspace, start(), opts), /continuation refused/);
 });
 
 // ── Revoked Skills in earlier turns (#546) ──
