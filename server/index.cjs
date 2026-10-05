@@ -44,7 +44,7 @@ const { createWorkspaceStore } = require('./workspace.cjs');
 const { createSecretStore } = require('./secrets.cjs');
 const { isPublicUrl, createEndpointApproved } = require('./ssrf.cjs');
 // One JSON reply shape, the 401, a bounded body read and the JSON fetch (http.cjs).
-const { json, unauthorized, fetchJson, readBody, readJson, authResult, errorResponse } = require('./http.cjs');
+const { json, unauthorized, fetchJson, readBody, readJson, authResult, errorResponse, answerUnhandled, parseRequestUrl, badRequestUrl } = require('./http.cjs');
 
 const PORT = Number(process.env.UI_PORT || 8021);
 const HOST = process.env.UI_HOST || '0.0.0.0';
@@ -957,7 +957,9 @@ async function handleRequestInner(req, res) {
 }
 
 async function handleRequestScoped(req, res) {
-  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  // A Host header that is not a valid host makes this parse fail even when the path did not.
+  const url = parseRequestUrl(req, `http://${req.headers.host || 'localhost'}`) || parseRequestUrl(req);
+  if (!url) return badRequestUrl(res);
   const p = url.pathname;
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'same-origin');
@@ -1041,7 +1043,10 @@ async function handleRequestScoped(req, res) {
 }
 
 async function handleRequest(req,res) {
-  const pathname=new URL(req.url,'http://localhost').pathname;
+  // An unparseable request target (e.g. `//[`) is the client's error: 400, no stack logged.
+  const parsed=parseRequestUrl(req);
+  if(!parsed)return badRequestUrl(res);
+  const pathname=parsed.pathname;
   // This is a browser/core contract marker, including unauthenticated and error
   // responses. Set it before the maintenance gate, which may return early.
   if (pathname.startsWith('/api/')) res.setHeader('X-Noevia-API', '1');
@@ -1060,7 +1065,9 @@ if (require.main === module) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
   authTokens.warnings.forEach((w) => console.warn(w));
   if (!DIARY_TENANT_KEY) console.warn('WARNING: DIARY_TENANT_KEY is unset; Diary calls carry no tenant assertion and remote storage secrets ride on every call.');
-  const server = http.createServer((req, res) => { handleRequest(req, res).catch(() => { if (!res.destroyed) res.destroy(); }); });
+  // A throw outside handleRequestScoped's own try (authentication, the workspace load) answers 500
+  // rather than resetting the connection, so one bad request input cannot look like a dead server (#781).
+  const server = http.createServer((req, res) => { handleRequest(req, res).catch((err) => answerUnhandled(res, err)); });
   staticFiles.warm();
   // A chat waiting on a write approval is a legitimately long request. Node's
   // default requestTimeout is 5 minutes measured from the START of the request,

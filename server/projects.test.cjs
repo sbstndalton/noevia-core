@@ -105,6 +105,15 @@ test('ownsFile allows only files directly inside an attached folder', () => {
   assert.equal(store.ownsFile(null, 'x'), false);
   const attachment = { name: 'noevia projects/P/Documents/e.docx', attachment: {}, source: 'noevia projects/P' };
   assert.equal(store.ownsFile({ ...project, files: [attachment] }, attachment.name), true, 'a managed upload sits one level down');
+  // #784: only the canonical form the storage client sends is accepted. A backslash is a
+  // separator to the storage client, so these would otherwise reach a sub-path.
+  assert.equal(store.ownsFile(project, 'Shared/Docs/nested\\c.pdf'), false, 'a backslash cannot smuggle a sub-path');
+  assert.equal(store.ownsFile(project, 'Shared/Docs\\b.pdf'), false);
+  assert.equal(store.ownsFile(project, 'Shared//Docs/b.pdf'), false, 'an empty segment is not collapsed into a match');
+  assert.equal(store.ownsFile(project, 'Shared/Docs/b.pdf '), false, 'a target the storage client would trim names another file');
+  assert.equal(store.ownsFile(project, ' Shared/Docs/b.pdf'), false);
+  assert.equal(store.ownsFile(project, 'Shared/Docs/./b.pdf'), false);
+  assert.equal(store.ownsFile({ ...project, files: [attachment] }, 'noevia projects/P/Documents\\e.docx'), false, 'the managed-upload branch is canonical too');
 });
 
 test('withSourceLock serializes operations on one project and prunes when the last one ends', async () => {

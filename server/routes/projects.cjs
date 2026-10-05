@@ -16,6 +16,7 @@ const MAX_PROJECT_IMAGES = 12;
 // Shared with projects.cjs's createProject and the create/edit dialogs (src/project-limits.ts,
 // #398) so a name is capped identically everywhere it can be set.
 const { nameMaxLength: PROJECT_NAME_MAX_LENGTH } = require('../project-limits.json');
+const { isJsonObject } = require('../http.cjs');
 // #409: the composer's Manual model pick had no server-side guard at all — unlike PUT
 // /api/auto-roles (#343) and benchmark/start, which both already reject an embedding,
 // reranking or Laya (routing) model through this same helper.
@@ -575,6 +576,7 @@ function createProjectRoutes({
       const project = getProject(id);
       if (!project) return json(res, 404, { error: 'no such project' });
       const body = await readJson(req);
+      if (!isJsonObject(body)) return json(res, 400, { error: 'request body must be a JSON object' });
       const target = String(body.path || '');
       if (!target) return json(res, 400, { error: 'a path is required' });
       if (!ownsFile(project, target)) {
@@ -603,7 +605,13 @@ function createProjectRoutes({
       const project = getProject(decodeURIComponent(originalUpload[1]));
       const file = project?.files.find(f => f.name === url.searchParams.get('name') && f.attachment);
       if (!file) return json(res, 404, { error: 'No such original' });
-      const bytes = fs.readFileSync(require('../uploads.cjs').original(currentWorkspace(), project.id, file));
+      // A row without a stored original, or one whose file is gone from disk, is a 404, not a 500 (#786).
+      let bytes;
+      try { bytes = fs.readFileSync(require('../uploads.cjs').original(currentWorkspace(), project.id, file)); }
+      catch (e) {
+        if (e?.code === 'ENOENT' || e?.message === 'Original not available') return json(res, 404, { error: 'No such original' });
+        throw e;
+      }
       res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(file.name.split('/').pop())}`, 'Cache-Control': 'private, no-store', 'Content-Length': bytes.length });
       return res.end(bytes);
     }

@@ -2,6 +2,7 @@
 
 const { normalizeS3Region, S3_REGION_RE } = require('../s3-region.cjs');
 const { checkLogin } = require('../storage-client.cjs');
+const { requireJsonObject } = require('../http.cjs');
 // The user's own storage connection (Settings → Diary & storage): read and save it, test it,
 // browse and read files over it for project knowledge, create one folder, and the Nextcloud
 // Login Flow v2 that turns a URL into an app password without the user typing a secret here.
@@ -34,7 +35,9 @@ const PASS = Symbol('unhandled');
  * @param {(...args) => Promise<Response>} deps.fetch     resolved per call so tests can swap the global
  * @param {{ randomUUID: () => string }} deps.crypto
  */
-function createStorageRoutes({ json, readJson, authService, storageClient, endpointApproved, fetch, crypto }) {
+function createStorageRoutes({ json, readJson: readAnyJson, authService, storageClient, endpointApproved, fetch, crypto }) {
+  // Every body these routes read is a JSON object; `null`, an array or a number is a 400 (#786).
+  const readJson = requireJsonObject(readAnyJson);
   const nextcloudFlows = new Map();
   async function storageEndpointAllowed(authn, rawUrl) {
     return endpointApproved(authn, rawUrl);

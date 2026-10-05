@@ -5,7 +5,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
-const { json, unauthorized, fetchJson, readBody, readJson, authResult, DEFAULT_MAX_RESPONSE_BYTES } = require('./http.cjs');
+const { json, unauthorized, fetchJson, readBody, readJson, authResult, requireJsonObject, answerUnhandled, DEFAULT_MAX_RESPONSE_BYTES } = require('./http.cjs');
 
 // A minimal streaming Response.body stand-in: a web ReadableStream-like object exposing
 // getReader().read() the same way Node's fetch() Response.body does.
@@ -152,4 +152,54 @@ test('fetchJson aborts on its timeout and on the caller\'s signal', async () => 
     const already = new AbortController(); already.abort();
     await assert.rejects(fetchJson('http://x/slow', { signal: already.signal }, 10000), /aborted/);
   } finally { globalThis.fetch = original; }
+});
+
+test('#786: requireJsonObject refuses a body that is not a JSON object with a 400', async () => {
+  const read = requireJsonObject(async (req) => readJson(req));
+  const req = (text) => Readable.from(text ? [Buffer.from(text)] : []);
+  for (const text of ['null', '[]', '5', '"text"', 'true']) {
+    await assert.rejects(read(req(text)), { status: 400, message: 'request body must be a JSON object' }, text);
+  }
+  assert.deepEqual(await read(req('')), {}, 'an empty body still reads as {}');
+  assert.deepEqual(await read(req('{"a":1}')), { a: 1 });
+  await assert.rejects(read(req('{')), { status: 400, message: 'invalid JSON' });
+});
+
+test('#781: answerUnhandled answers instead of resetting the connection', () => {
+  const fakeRes = (state = {}) => ({
+    headersSent: false, destroyed: false, writableEnded: false, ...state, destroyedBy: 0,
+    writeHead(status, headers) { this.status = status; this.headers = headers; this.headersSent = true; },
+    end(body) { this.body = body; this.writableEnded = true; },
+    destroy() { this.destroyedBy += 1; this.destroyed = true; },
+  });
+  const logged = [];
+  const log = (...args) => logged.push(args);
+
+  const plain = fakeRes();
+  answerUnhandled(plain, new URIError('URI malformed'), log);
+  assert.equal(plain.status, 500);
+  assert.deepEqual(JSON.parse(plain.body), { error: 'Internal error' }, 'an internal message never reaches the client');
+  assert.equal(plain.destroyedBy, 0);
+  assert.equal(logged.length, 1, 'a 500 is logged');
+
+  const gone = fakeRes();
+  answerUnhandled(gone, Object.assign(new Error('account no longer exists'), { status: 410 }), log);
+  assert.equal(gone.status, 410, 'a deliberate 4xx keeps its status');
+  assert.deepEqual(JSON.parse(gone.body), { error: 'account no longer exists' });
+  assert.equal(logged.length, 1, 'a 4xx is not logged as a fault');
+
+  const streaming = fakeRes({ headersSent: true });
+  answerUnhandled(streaming, new Error('mid-stream'), log);
+  assert.equal(streaming.destroyedBy, 1, 'a response already under way is cut, never presented as complete');
+  assert.equal(streaming.body, undefined);
+
+  const closed = fakeRes({ destroyed: true });
+  answerUnhandled(closed, new Error('late'), log);
+  assert.equal(closed.destroyedBy, 0);
+  assert.equal(closed.status, undefined);
+
+  const broken = fakeRes();
+  broken.writeHead = () => { throw new Error('socket gone'); };
+  assert.doesNotThrow(() => answerUnhandled(broken, new Error('x'), log));
+  assert.equal(broken.destroyedBy, 1, 'when even the answer fails, the socket is released');
 });

@@ -408,9 +408,16 @@ function createProjectStore({
    *  attached folder's files are the user's and deleting them is their call —
    *  but a project must not be a way to delete a path it was never given.
    *  Sub-paths are refused, so a nested directory cannot be reached through a
-   *  folder that merely contains it. */
+   *  folder that merely contains it.
+   *
+   *  The target must already be in the canonical form the storage client sends (#784):
+   *  storage-client's safeRelativePath turns a backslash into a separator and collapses
+   *  empty segments, so a target it would rewrite could reach a path these checks never
+   *  saw. A subfolder named directly inside an attached folder still passes here; the
+   *  storage client's deleteFile refuses a collection. */
   function ownsFile(project, target) {
     if (!project || typeof target !== 'string' || !target) return false;
+    if (require('./storage-client.cjs').safeRelativePath(target) !== target) return false;
     if ((project.files || []).some(f => f.name === target && f.attachment && f.source === project.projectFolder && require('./uploads.cjs').GROUPS.some(g => target.startsWith(`${project.projectFolder}/${g}/`) && !target.slice(`${project.projectFolder}/${g}/`.length).includes('/')))) return true;
     const folders = [
       ...(project.projectFolder ? [project.projectFolder] : []),

@@ -12,6 +12,8 @@
 // router between the two mounts; blocks keep their original order and an unmatched method
 // falls through as it did inline.
 
+const { requireJsonObject } = require('../http.cjs');
+
 const PASS = Symbol('unhandled');
 
 /**
@@ -35,7 +37,9 @@ const PASS = Symbol('unhandled');
  * @param {{ forgetUser: (userId:string) => void }} [deps.chatgptOAuth]  Sign in with ChatGPT tokens, keyed per user
  * @param {(actorId:string) => object} [deps.rotateSecrets]  re-encrypts stored credentials under the current key
  */
-function createAuthRoutes({ json, authResult, readJson, authService, publicAuthRoutes, davSettings, davConfig, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, diaryTenantHeaders = null, env, mcpOAuth, directoryMcp, chatgptOAuth = null, rotateSecrets }) {
+function createAuthRoutes({ json, authResult, readJson: readAnyJson, authService, publicAuthRoutes, davSettings, davConfig, workspaceStore, driveAccounts, fetchJson, DIARY_BASE, DIARY_TOKEN, diaryTenantHeaders = null, env, mcpOAuth, directoryMcp, chatgptOAuth = null, rotateSecrets }) {
+  // Every body these routes read is a JSON object; `null`, an array or a number is a 400 (#786).
+  const readJson = requireJsonObject(readAnyJson);
   async function open(req, res, { path: p }) {
     if (p === '/api/setup/status' && req.method === 'GET') {
       return json(res, 200, { configured: authService.userCount() > 0, publicOrigin: authService.origin || env.PUBLIC_ORIGIN || '' });
@@ -46,8 +50,9 @@ function createAuthRoutes({ json, authResult, readJson, authService, publicAuthR
     if (p === '/api/setup/complete' && req.method === 'POST') return authResult(res, await authService.setup(req, res, await readJson(req)));
     if (p === '/api/auth/login/password' && req.method === 'POST') return authResult(res, await authService.passwordLogin(req, res, await readJson(req)));
     if (p === '/api/auth/login/passkey/options' && req.method === 'POST') {
-      try { return json(res, 200, await authService.authenticationOptions((await readJson(req)).username)); }
+      try { return json(res, 200, await authService.authenticationOptions((await readJson(req)).username, req)); }
       catch (e) {
+        if (e.code === 'RATE_LIMITED') return json(res, 429, { error: 'too many sign-in attempts; try again later' });
         if (e.code === 'CHALLENGE_CAPACITY') return json(res, 503, { error: 'passkey sign-in is temporarily busy' });
         throw e;
       }

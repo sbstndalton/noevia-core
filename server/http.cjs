@@ -104,6 +104,42 @@ function isJsonObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+// Wraps a body reader so a body that parses to anything but an object is refused with a 400
+// before a route dereferences it (#786). An empty body still reads as {}.
+function requireJsonObject(read) {
+  return async (...args) => {
+    const body = await read(...args);
+    if (!isJsonObject(body)) throw Object.assign(new TypeError('request body must be a JSON object'), { status: 400 });
+    return body;
+  };
+}
+
+// The last-resort answer when a request handler rejected outside its own error handling (#781).
+// A client gets an HTTP answer (errorResponse: a deliberate 4xx keeps its status, anything else
+// is a generic 500) instead of a reset socket. A response already under way is still reset,
+// because its client must see it as cut short rather than complete. Never throws.
+function answerUnhandled(res, err, log = console.error) {
+  try {
+    if (!res || res.destroyed || res.writableEnded) return;
+    if (res.headersSent) { res.destroy(); return; }
+    const failure = errorResponse(err);
+    if (failure.status >= 500) { try { log('[request] unhandled error:', err); } catch { /* logging must not stop the answer */ } }
+    json(res, failure.status, failure.body);
+  } catch {
+    try { res.destroy(); } catch { /* nothing left to do */ }
+  }
+}
+
+// The request URL, or null when it cannot be parsed (a request target such as `//[` or a
+// malformed Host header). A client error, answered 400 without logging a stack per request.
+function parseRequestUrl(req, base = 'http://localhost') {
+  try { return new URL(req.url, base); } catch { return null; }
+}
+
+function badRequestUrl(res) {
+  return json(res, 400, { error: 'invalid URL' });
+}
+
 // What a failed request tells the client. Only errors that carry a 4xx status were raised
 // on purpose for the client; anything else is an internal fault whose message may leak
 // paths or internals, so the client gets a generic text and the caller logs the real one.
@@ -125,4 +161,4 @@ function decodePathPart(raw) {
   try { return decodeURIComponent(raw); } catch { return null; }
 }
 
-module.exports = { json, unauthorized, decodePathPart, fetchJson, readBody, readJson, authResult, isJsonObject, errorResponse, DEFAULT_MAX_RESPONSE_BYTES };
+module.exports = { json, unauthorized, decodePathPart, fetchJson, readBody, readJson, authResult, isJsonObject, requireJsonObject, answerUnhandled, parseRequestUrl, badRequestUrl, errorResponse, DEFAULT_MAX_RESPONSE_BYTES };

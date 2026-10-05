@@ -50,6 +50,53 @@ function decodeXmlEntities(s) {
   });
 }
 
+// ── PROPFIND parsing (#787) ───────────────────────────────────────────────────
+// A multistatus body comes from a server the user (or an administrator) configured, so it is
+// untrusted input up to LIST_BODY_CAP bytes. The old lazy `<response>([\s\S]*?)</response>`
+// regex rescanned to the end of the body from every unclosed opening tag, which is quadratic
+// on a hostile body and blocks the event loop for every tenant. These scans move forward only.
+
+const isTagNameChar = (code) => (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+
+/** At `i` (a '<'), the index just past `<[prefix:]name>` (or `</[prefix:]name>` when
+ *  `closing`), else -1. The prefix is the same [A-Za-z0-9]+ the old patterns accepted. */
+function tagEndAt(body, i, name, closing) {
+  let j = i + 1;
+  if (closing) { if (body.charCodeAt(j) !== 47 /* / */) return -1; j++; }
+  let k = j;
+  while (k < body.length && isTagNameChar(body.charCodeAt(k))) k++;
+  if (k > j && body.charCodeAt(k) === 58 /* : */) j = k + 1;
+  return body.startsWith(name, j) && body.charCodeAt(j + name.length) === 62 /* > */ ? j + name.length + 1 : -1;
+}
+
+/** The text inside each `<[p:]name>…</[p:]name>` in `body`, in order, at most `limit` of them.
+ *  Same matches as the lazy regex (nearest closing tag wins, any prefix on either side), in
+ *  time linear in the body: once no closing tag follows an opening one, none can follow a
+ *  later opening one either, so the scan stops. */
+function elementTexts(body, name, limit = Infinity) {
+  const out = [];
+  const text = String(body);
+  let pos = 0;
+  while (out.length < limit) {
+    let start = -1;
+    for (let i = text.indexOf('<', pos); i !== -1; i = text.indexOf('<', i + 1)) {
+      const end = tagEndAt(text, i, name, false);
+      if (end !== -1) { start = end; break; }
+    }
+    if (start === -1) break;
+    let close = -1, after = -1;
+    for (let i = text.indexOf('</', start); i !== -1; i = text.indexOf('</', i + 2)) {
+      const end = tagEndAt(text, i, name, true);
+      if (end !== -1) { close = i; after = end; break; }
+    }
+    if (close === -1) break;
+    out.push(text.slice(start, close));
+    pos = after;
+  }
+  return out;
+}
+const firstElementText = (body, name) => elementTexts(body, name, 1)[0];
+
 const READ_CAP = 200_000; // matches the project-file upload cap
 const TEXT_BODY_CAP = READ_CAP * 4; // bytes read for a text preview (UTF-8 is at most 4 bytes a char)
 const LIST_BODY_CAP = 4 * 1024 * 1024; // a directory listing response
@@ -158,12 +205,11 @@ async function davList(conn, fullPath) {
   const { text: body } = await readCappedText(response, LIST_BODY_CAP);
   const entries = [];
   const requestDir = decodeURIComponent(new URL(target).pathname).replace(/\/+$/, '');
-  for (const match of body.matchAll(/<(?:[a-zA-Z0-9]+:)?response>([\s\S]*?)<\/(?:[a-zA-Z0-9]+:)?response>/g)) {
-    const block = match[1];
-    const hrefMatch = block.match(/<(?:[a-zA-Z0-9]+:)?href>([\s\S]*?)<\/(?:[a-zA-Z0-9]+:)?href>/);
-    if (!hrefMatch) continue;
+  for (const block of elementTexts(body, 'response')) {
+    const hrefText = firstElementText(block, 'href');
+    if (hrefText === undefined) continue;
     let href;
-    try { href = decodeURIComponent(new URL(decodeXmlEntities(hrefMatch[1]).trim(), target).pathname).replace(/\/+$/, ''); } catch { continue; }
+    try { href = decodeURIComponent(new URL(decodeXmlEntities(hrefText).trim(), target).pathname).replace(/\/+$/, ''); } catch { continue; }
     if (href !== requestDir && !href.startsWith(`${requestDir}/`)) continue; // a foreign href: not under the browsed directory
     const relative = href.slice(requestDir.length + 1);
     if (!relative || relative.includes('/')) continue; // direct children only
@@ -440,20 +486,35 @@ async function writeFile(conn, rawPath, bytes, { ifMatch, ifNoneMatch } = {}) {
 
 /** Delete one file. Deliberately refuses a directory path: removing a file
  *  from a project must never be able to take a folder — and everything under
- *  it — with it. */
+ *  it — with it. A WebDAV DELETE of a collection is recursive, and a path does not say
+ *  whether it names one, so the target is asked first (PROPFIND Depth 0, via fileVersion):
+ *  a collection is refused, a missing path is reported missing without a DELETE, and an
+ *  answer that settles neither refuses rather than guessing (#784). S3 is refused outright
+ *  (it has no collections and no delete support here). */
 async function deleteFile(conn, rawPath) {
   const path = safeRelativePath(rawPath);
   if (!path) throw Object.assign(new Error('invalid path'), { status: 400 });
-  if (path.endsWith('/')) throw Object.assign(new Error('refusing to delete a directory'), { status: 400 });
   if (connectionKind(conn) === 's3') {
     throw Object.assign(new Error('deleting from S3 is not supported'), { status: 400 });
   }
+  let state;
+  try { state = await fileVersion(conn, path); }
+  catch (err) {
+    if (err && err.code === 'folder') throw Object.assign(new Error(`refusing to delete "${path}": it is a folder`), { status: 400, code: 'folder' });
+    throw err;
+  }
+  if (!state.exists) return { path, missing: true };
+  // With the file's ETag, the DELETE is conditional on it, so a path that became something else
+  // (a folder, or a changed file) between the check and the delete is refused (412), not removed.
   const response = await withRetry(() => fetch(davUrl(conn, path), {
     method: 'DELETE',
-    headers: davHeaders(conn, {}),
+    headers: davHeaders(conn, state.etag ? { 'If-Match': quoteEtag(state.etag) } : {}),
     signal: AbortSignal.timeout(30000),
     redirect: 'error',
   }));
+  if (response.status === 412) {
+    throw Object.assign(new Error(`"${path}" changed in storage before it could be deleted; refresh and try again`), { status: 409, code: 'changed' });
+  }
   if (response.status === 404) return { path, missing: true };
   if (!response.ok) {
     throw Object.assign(new Error(`could not delete "${path}" (${response.status})`), { status: 502 });
@@ -482,15 +543,14 @@ async function removeEmptyFolder(conn, rawPath) {
   const body = await response.text();
   const requestDir = decodeURIComponent(new URL(target).pathname).replace(/\/+$/, '');
   let etag = '', isCollection = false, children = 0;
-  for (const match of body.matchAll(/<(?:[a-zA-Z0-9]+:)?response>([\s\S]*?)<\/(?:[a-zA-Z0-9]+:)?response>/g)) {
-    const block = match[1];
-    const hrefMatch = block.match(/<(?:[a-zA-Z0-9]+:)?href>([\s\S]*?)<\/(?:[a-zA-Z0-9]+:)?href>/);
-    if (!hrefMatch) continue;
+  for (const block of elementTexts(body, 'response')) {
+    const hrefText = firstElementText(block, 'href');
+    if (hrefText === undefined) continue;
     let href;
-    try { href = decodeURIComponent(new URL(decodeXmlEntities(hrefMatch[1]).trim(), target).pathname).replace(/\/+$/, ''); } catch { children++; continue; }
+    try { href = decodeURIComponent(new URL(decodeXmlEntities(hrefText).trim(), target).pathname).replace(/\/+$/, ''); } catch { children++; continue; }
     if (href === requestDir) {
       isCollection = /<(?:[a-zA-Z0-9]+:)?collection\s*\/?>/.test(block);
-      etag = (block.match(/<(?:[a-zA-Z0-9]+:)?getetag>([\s\S]*?)<\/(?:[a-zA-Z0-9]+:)?getetag>/)?.[1] || '').trim()
+      etag = (firstElementText(block, 'getetag') || '').trim()
         .replace(/&quot;/g, '"').replace(/&amp;/g, '&');
     } else children++;
   }
@@ -532,12 +592,14 @@ async function fileVersion(conn, rawPath) {
   if (response.status === 404) return { exists: false };
   if (response.status !== 207) throw Object.assign(new Error(`storage returned ${response.status}`), { status: 502, upstream: response.status });
   const body = await response.text();
-  const block = body.match(/<(?:[a-zA-Z0-9]+:)?response>([\s\S]*?)<\/(?:[a-zA-Z0-9]+:)?response>/)?.[1];
+  const block = firstElementText(body, 'response');
   if (!block) throw Object.assign(new Error('storage returned no file state'), { status: 502 });
-  if (/<(?:[a-zA-Z0-9]+:)?collection\s*\/?>/.test(block)) throw Object.assign(new Error(`"${path}" is a folder in storage`), { status: 409, code: 'folder' });
-  const etag = (block.match(/<(?:[a-zA-Z0-9]+:)?getetag>([\s\S]*?)<\/(?:[a-zA-Z0-9]+:)?getetag>/)?.[1] || '').trim()
+  // Attributes on the element (`<d:collection xmlns:d="DAV:"/>`) still mean a folder. Bounded,
+  // so a hostile body of unterminated `<collection ` tags stays linear to scan.
+  if (/<(?:[a-zA-Z0-9]+:)?collection(?:\s[^>]{0,64})?\/?>/.test(block)) throw Object.assign(new Error(`"${path}" is a folder in storage`), { status: 409, code: 'folder' });
+  const etag = (firstElementText(block, 'getetag') || '').trim()
     .replace(/&quot;/g, '"').replace(/&amp;/g, '&');
   return { exists: true, etag: /[\r\n]/.test(etag) ? '' : etag };
 }
 
-module.exports = { checkLogin, removeEmptyFolder, listFiles, readTextFile, readBinaryFile, writeFile, fileVersion, deleteFile, createFolder, isBrowsable, safeRelativePath, TEXT_EXTENSIONS, READ_CAP };
+module.exports = { checkLogin, removeEmptyFolder, listFiles, readTextFile, readBinaryFile, writeFile, fileVersion, deleteFile, createFolder, isBrowsable, safeRelativePath, elementTexts, TEXT_EXTENSIONS, READ_CAP };

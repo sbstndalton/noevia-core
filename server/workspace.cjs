@@ -14,6 +14,34 @@ function atomicJson(file, value) {
   fs.renameSync(tmp, file);
 }
 
+// A stored provider key that no available secrets key opens (secrets.key restored without its
+// rows, or secrets.key.previous removed after a rotation that left failures). The row stays
+// usable with an empty key and `keyUnreadable: true`, so it can be re-entered, instead of the
+// throw taking down every request that loads the workspace (#782). Its original ciphertext is
+// kept off the enumerable row and written back unchanged on the next save, so restoring the
+// right key still recovers it; typing a new key replaces it.
+const UNREADABLE_CIPHERTEXT = Symbol('unreadableCiphertext');
+
+function openProviderKey(row, secrets) {
+  if (!secrets) return;
+  const stored = row.apiKey;
+  try { row.apiKey = secrets.decrypt(stored); delete row.keyUnreadable; }
+  catch {
+    row.apiKey = '';
+    row.keyUnreadable = true;
+    Object.defineProperty(row, UNREADABLE_CIPHERTEXT, { value: stored, enumerable: false, configurable: true, writable: true });
+  }
+}
+
+/** The on-disk form of a provider row: the key encrypted, or an unreadable key kept as it was.
+ *  The ciphertext is written back only while the row is still flagged keyUnreadable; a caller
+ *  that clears the flag (a new key, or a move to another origin) gets the key encrypted. */
+function sealProviderRow(row, secrets) {
+  const { keyUnreadable, ...rest } = row;
+  if (keyUnreadable && !row.apiKey && row[UNREADABLE_CIPHERTEXT]) return { ...rest, apiKey: row[UNREADABLE_CIPHERTEXT] };
+  return { ...rest, apiKey: secrets ? secrets.encrypt(row.apiKey) : row.apiKey };
+}
+
 function createWorkspaceStore(rootDir, defaultProvider, secrets) {
   // Per-user workspaces are cached, but shared providers are NEVER baked
   // into the cached object: the shared file is re-read and re-merged on
@@ -30,7 +58,7 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets) {
 
   function loadShared() {
     const rows = readJson(sharedFile, { providers: [] }).providers || [];
-    for (const row of rows) row.apiKey = secrets ? secrets.decrypt(row.apiKey) : row.apiKey;
+    for (const row of rows) openProviderKey(row, secrets);
     // A stale default row may exist in the file from before this fix. Prefer
     // the current env-derived defaultProvider values for that id (dropped on
     // the next saveShared()/removeProvider() write since both now exclude it).
@@ -96,7 +124,7 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets) {
     let needsEncryption = false;
     for (const provider of savedProviders) {
       if (provider.apiKey && !String(provider.apiKey).startsWith('enc:v1:')) needsEncryption = true;
-      provider.apiKey = secrets ? secrets.decrypt(provider.apiKey) : provider.apiKey;
+      openProviderKey(provider, secrets);
     }
     for (const provider of savedProviders) {
       if (provider.id === 'lemonade') { provider.id = defaultProvider.id; provider.label = defaultProvider.label; }
@@ -123,7 +151,7 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets) {
       saveProjects() { this.assertActive(); atomicJson(path.join(dir, 'projects.json'), { projects: this.projects }); },
       saveProviders() {
         this.assertActive();
-        const encode = p => ({ ...p, apiKey: secrets ? secrets.encrypt(p.apiKey) : p.apiKey });
+        const encode = p => sealProviderRow(p, secrets);
         // Adopt rows a consumer pushed directly onto the merged `providers`
         // view (the historical push-then-save contract). Existing rows are
         // shared by reference between the view and privateProviders, so
@@ -142,12 +170,25 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets) {
         atomicJson(providerFile, { providers: this.privateProviders.map(encode) });
         this.providers = mergeProviders(this.privateProviders);
       },
-      // Admin path for shared-provider changes: persists the shared rows
-      // from the (freshly merged) current view, then re-merges from disk.
-      saveShared() {
+      // Admin path for shared-provider changes. The change is applied BY ID onto a fresh read
+      // of shared-providers.json, never by writing this view's whole shared set: the view was
+      // merged when the request started, and another admin may have saved a shared provider
+      // while this request awaited its body (#785).
+      //   saveShared(id)  upserts this view's row `id`, or removes `id` when the view no longer
+      //                   holds it as a shared row
+      //   saveShared()    upserts every shared row of this view; never removes a row
+      saveShared(id) {
         this.assertActive();
-        const encode = p => ({ ...p, apiKey: secrets ? secrets.encrypt(p.apiKey) : p.apiKey });
-        atomicJson(sharedFile, { providers: this.providers.filter(p => p.shared && p.id !== defaultProvider.id).map(encode) });
+        const encode = p => sealProviderRow(p, secrets);
+        const viewShared = this.providers.filter(p => p.shared && p.id !== defaultProvider.id);
+        const changes = id === undefined ? viewShared : viewShared.filter(p => p.id === id);
+        let rows = loadShared().filter(p => p.id !== defaultProvider.id);
+        if (id !== undefined && !changes.length) rows = rows.filter(p => p.id !== id);
+        for (const row of changes) {
+          const at = rows.findIndex(p => p.id === row.id);
+          if (at === -1) rows.push(row); else rows[at] = row;
+        }
+        atomicJson(sharedFile, { providers: rows.map(encode) });
         this.providers = mergeProviders(this.privateProviders);
       },
       removeProvider(id) {
@@ -155,7 +196,7 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets) {
         const selected = this.providers.find(p => p.id === id);
         if (!selected || id === defaultProvider.id) return false;
         if (selected.shared) {
-          const encode = p => ({ ...p, apiKey: secrets ? secrets.encrypt(p.apiKey) : p.apiKey });
+          const encode = p => sealProviderRow(p, secrets);
           // Mirror saveShared(): never persist the built-in default row back
           // to shared-providers.json, or its env-sourced key gets baked into
           // the file and the env value is ignored from then on.

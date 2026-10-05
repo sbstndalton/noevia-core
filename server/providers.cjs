@@ -25,12 +25,13 @@ function createProviderRegistry({ currentWorkspace, PROVIDERS, DEFAULT_PROVIDER_
     ws.saveProviders();
   }
 
-  // Admin path: persists the shared half of the registry from the current
-  // merged view (private rows are synced in memory only, untouched on disk).
-  function saveSharedProviders() {
+  // Admin path: persists the shared row `id` from the current merged view onto a fresh read
+  // of the shared file (#785), so a concurrent admin's shared change is never overwritten by
+  // this request's stale view. Private rows are synced in memory only, untouched on disk.
+  function saveSharedProviders(id) {
     const ws = currentWorkspace();
     ws.privateProviders = Array.from(ws.providers).filter((p) => !p.shared && p.id !== DEFAULT_PROVIDER_ID);
-    ws.saveShared();
+    ws.saveShared(id);
   }
 
   function getProvider(id) {

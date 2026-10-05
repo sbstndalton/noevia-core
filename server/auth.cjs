@@ -21,6 +21,13 @@ const CHALLENGE_MS = 5 * 60 * 1000;
 // Allow concurrent ceremonies while bounding persistent storage from the public
 // options endpoint. At capacity, existing challenges keep their full lifetime.
 const MAX_PENDING_CHALLENGES = 4096;
+// Registration (signed-in only) has its own, separate budget, so anonymous sign-in
+// challenges filling theirs can never starve a signed-in account adding a passkey (#783).
+const MAX_PENDING_REGISTRATIONS = 256;
+// Anonymous sign-in options per client address per challenge lifetime (#783). Applied only when
+// the client address is real (trustProxy): behind a proxy without it every browser shares the
+// proxy's address, and a per-address limit would lock everyone out of passkey sign-in.
+const PASSKEY_OPTIONS_PER_ADDRESS = 30;
 
 // Client IP resolution. By default the direct socket address is used.
 // Behind a reverse proxy (a documented first-class deployment), every
@@ -108,11 +115,18 @@ function digest(value) {
   return crypto.createHash('sha256').update(String(value)).digest('hex');
 }
 
+// A cookie with a malformed % escape (set by any other app on the same host or a parent
+// domain) must not throw here: authenticate() runs before the request's error handling, so a
+// throw reset every request from that browser (#781). Such a value is kept raw.
 function parseCookies(req) {
   const out = {};
   for (const part of String(req.headers.cookie || '').split(';')) {
     const i = part.indexOf('=');
-    if (i > 0) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1));
+    if (i <= 0) continue;
+    const raw = part.slice(i + 1);
+    let value = raw;
+    try { value = decodeURIComponent(raw); } catch { /* keep the raw value */ }
+    out[part.slice(0, i).trim()] = value;
   }
   return out;
 }
@@ -356,12 +370,26 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
   }
 
   const deleteExpiredChallenges = db.prepare('DELETE FROM challenges WHERE expires_at<=?');
-  const pendingChallengeCount = db.prepare('SELECT count(*) AS n FROM challenges');
+  // Each kind is counted against its own cap: 'register' rows are created only by signed-in
+  // accounts, 'authenticate' rows by anyone, so the two never compete for one table budget.
+  const pendingChallengeCount = db.prepare("SELECT count(*) AS n FROM challenges WHERE kind=?");
   const insertChallenge = db.prepare('INSERT INTO challenges(id_hash,user_id,kind,challenge,expires_at) VALUES(?,?,?,?,?)');
+  // Sign-in at capacity evicts the oldest sign-in challenge, anonymous (unknown-username) rows
+  // first, so a flood of anonymous options requests delays nobody's real sign-in for long and
+  // never blocks it outright (#783).
+  const evictOldestSignIn = db.prepare(`DELETE FROM challenges WHERE id_hash=(SELECT id_hash FROM challenges
+    WHERE kind='authenticate' ORDER BY (user_id IS NOT NULL), expires_at LIMIT 1)`);
   const persistChallenge = db.transaction((idHash, userId, kind, challenge, now) => {
     deleteExpiredChallenges.run(now);
-    // Reject new work at capacity instead of invalidating a live passkey ceremony.
-    if (pendingChallengeCount.get().n >= MAX_PENDING_CHALLENGES) return false;
+    if (kind === 'authenticate') {
+      while (pendingChallengeCount.get(kind).n >= MAX_PENDING_CHALLENGES) {
+        if (!evictOldestSignIn.run().changes) return false;
+      }
+    } else {
+      // Registration rejects new work at capacity instead of invalidating a live ceremony.
+      const cap = kind === 'register' ? MAX_PENDING_REGISTRATIONS : MAX_PENDING_CHALLENGES;
+      if (pendingChallengeCount.get(kind).n >= cap) return false;
+    }
     insertChallenge.run(idHash, userId, kind, challenge, now + CHALLENGE_MS);
     return true;
   });
@@ -496,7 +524,14 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       audit('passkey.add', userId, userId, { credentialId: cred.id });
       return { verified: true };
     },
-    async authenticationOptions(username) {
+    /** `req` is the incoming request. With trustProxy on (a real client address), anonymous
+     *  options are limited per address before any lookup or challenge is stored (#783); without
+     *  it the address is the proxy's, shared by every browser, so only the table's eviction
+     *  bounds a flood. */
+    async authenticationOptions(username, req = null) {
+      if (trustProxy && req && rateLimited(`passkey-opt:${clientAddress(req, trustProxy)}`, PASSKEY_OPTIONS_PER_ADDRESS, CHALLENGE_MS)) {
+        throw Object.assign(new Error('too many passkey sign-in attempts'), { code: 'RATE_LIMITED' });
+      }
       const norm = String(username || '').toLowerCase();
       const user = db.prepare('SELECT * FROM users WHERE username_norm=? AND disabled_at IS NULL').get(norm);
       const all = user ? db.prepare('SELECT * FROM passkeys WHERE user_id=?').all(user.id) : [];
@@ -618,25 +653,6 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       audit('feature.diary', userId, userId, { enabled: !!enabled });
       return { diaryEnabled: !!enabled };
     },
-    insightsBadgeEnabled(userId) {
-      return !!db.prepare('SELECT insights_badge FROM user_features WHERE user_id=?').get(userId)?.insights_badge;
-    },
-    setInsightsBadge(userId, enabled) {
-      // UPSERT preserving the row's existing diary_enabled (read fresh rather
-      // than trusting the caller to send it).
-      db.prepare(`INSERT INTO user_features(user_id,diary_enabled,insights_badge,updated_at) VALUES(?,?,?,?)
-        ON CONFLICT(user_id) DO UPDATE SET insights_badge=excluded.insights_badge,updated_at=excluded.updated_at`)
-        .run(userId, this.diaryEnabled(userId) ? 1 : 0, enabled ? 1 : 0, Date.now());
-      audit('feature.insights_badge', userId, userId, { enabled: !!enabled });
-      return { insightsBadge: !!enabled };
-    },
-    markInsightsSeen(userId) {
-      db.prepare('UPDATE user_features SET insights_seen_at=?,updated_at=? WHERE user_id=?')
-        .run(Date.now(), Date.now(), userId);
-    },
-    insightsSeenAt(userId) {
-      return db.prepare('SELECT insights_seen_at FROM user_features WHERE user_id=?').get(userId)?.insights_seen_at ?? null;
-    },
     markOnboarded(userId) {
       // Completion is not consent: preserve the latest stored choice atomically.
       // With no feature row there is no recorded opt-in, so Diary stays off.
@@ -688,4 +704,4 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
   };
 }
 
-module.exports = { createAuth, USERNAME_RE, digest, createRateLimiter, clientAddress };
+module.exports = { createAuth, USERNAME_RE, digest, createRateLimiter, clientAddress, parseCookies };
