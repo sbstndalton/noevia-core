@@ -56,7 +56,7 @@ function createProjectRoutes({
   reasoningEffort, projectAppearance, diaryExtras, PROJECTS, DEFAULT_TOOLBOXES, sanitizeToolboxes, allToolboxes = () => [{ id: 'core' }], getProvider, ensureRolesLoaded, servedCatalogue, DEFAULT_PROVIDER_ID, store,
 }) {
   const {
-    getProject, saveProjects, createProject, pruneDocuments, sweepDeletedProject, purgeProjectChats, withSourceLock, ensureProjectFolder, indexSource, ownsFile,
+    getProject, saveProjects, createProject, deleteProject, pruneDocuments, withSourceLock, ensureProjectFolder, indexSource, ownsFile,
     loadChats, saveChats, deleteChat,
   } = store;
   // #659: when uploads first appear in a project, its Project documents box is turned on
@@ -98,6 +98,12 @@ function createProjectRoutes({
       const id = diaryExtras.chatProjectId(decodeURIComponent(freeContext[1]));
       if (!id) return json(res, 400, { error: 'Invalid chat identifier' });
       let project = getProject(id);
+      // A deleted chat's attachments project went with it (#788); a stale tab still showing that
+      // chat must not create it again, or it would outlive the chat for good. Chat ids that reach
+      // here are already in stored form (chatProjectId accepts only [A-Za-z0-9_-]).
+      if (!project && req.method === 'POST' && require('../chat-lists.cjs').readTombstones(currentWorkspace().dir).has(decodeURIComponent(freeContext[1]))) {
+        return json(res, 410, { error: 'This chat was deleted.' });
+      }
       if (!project && req.method === 'POST') {
         // diaryExtras.newProject() is written for the Diary project, which really does default
         // to manual — a standalone chat's shadow context must not inherit that (#352). It starts
@@ -134,21 +140,9 @@ function createProjectRoutes({
 
     const projMatch = p.match(/^\/api\/projects\/([^/]+)$/);
     if (projMatch && req.method === 'DELETE') {
-      const id = decodeURIComponent(projMatch[1]);
-      const removedProject = getProject(id);
-      const before = PROJECTS.length;
-      const keptProjects = Array.from(PROJECTS).filter((pr) => pr.id !== id);
-      PROJECTS.splice(0, PROJECTS.length, ...keptProjects);
-      if (PROJECTS.length === before) return json(res, 404, { error: 'no such project' });
-      if (removedProject) pruneDocuments(removedProject);
-      saveProjects(PROJECTS);
-      // Drop the project's RAG index too (best-effort).
-      try {
-        for (const suffix of ['.db', '.db-wal', '.db-shm']) {
-          fs.rmSync(path.join(currentWorkspace().ragDir(), `${id}${suffix}`), { force: true });
-        }
-      } catch { /* best effort */ }
-      if (removedProject) { purgeProjectChats?.(removedProject); sweepDeletedProject(removedProject); }
+      // The whole cleanup (record, local uploads/documents/assets, RAG index, chats, empty-dir
+      // sweep) lives in the store so a deleted chat's attachments project shares it (#788).
+      if (!deleteProject(decodeURIComponent(projMatch[1]))) return json(res, 404, { error: 'no such project' });
       return json(res, 200, { ok: true });
     }
 

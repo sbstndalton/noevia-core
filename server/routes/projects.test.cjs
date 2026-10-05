@@ -24,7 +24,10 @@ function fixture({ projects = [], diary = true, catalogue = null } = {}) {
     getProject: (id) => projects.find((p) => p.id === id) || null,
     saveProjects: () => { store.saves += 1; }, saves: 0,
     createProject: async (body) => { if (!body.name) throw Object.assign(Error('name required'), { status: 400 }); const p = { id: 'proj-new', ...body }; projects.unshift(p); return p; },
-    pruneDocuments() {}, sweepDeletedProject() {}, purgeProjectChats(project) { store.purged = project.id; }, withSourceLock: (_p, op) => op(), ensureProjectFolder: async () => null, indexSource() {},
+    pruneDocuments() {},
+    // The whole delete cleanup is the store's (projects.cjs deleteProject, shared with #788).
+    deleteProject: (id) => { const i = projects.findIndex((p) => p.id === id); if (i < 0) return false; projects.splice(i, 1); store.deleted = id; return true; },
+    withSourceLock: (_p, op) => op(), ensureProjectFolder: async () => null, indexSource() {},
     ownsFile: () => false, loadChats: (id) => (store.getProject(id) || { chats: [] }).chats || [], saveChats: (id, chats) => { store.savedChats = [id, chats]; },
     deleteChat: (id, chatId) => id === 'p1' && chatId === 'c1',
   };
@@ -53,7 +56,7 @@ function fixture({ projects = [], diary = true, catalogue = null } = {}) {
     Object.assign(req, { method, url: path + search, headers: { cookie: 'session=x' }, socket: {} });
     return routes(req, { writeHead() {}, end() {} }, { path, authn: { user: { id: 'u1', role } }, url: new URL(`http://localhost${path}${search}`) });
   };
-  return { call, sent, dispatched, store, projects, providers };
+  return { call, sent, dispatched, store, projects, providers, dir };
 }
 
 test('paths and methods outside the project surface fall through', async () => {
@@ -123,7 +126,7 @@ test('creating and deleting a project keeps the original status codes and messag
   assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'no such project' } });
   await f.call('DELETE', '/api/projects/proj-new');
   assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true } });
-  assert.equal(f.store.purged, 'proj-new', 'deleting a project purges its chats (#554)');
+  assert.equal(f.store.deleted, 'proj-new', "the route hands the delete to the store's deleteProject (chats purged there, #554)");
   assert.deepEqual(f.projects, []);
 });
 
@@ -269,6 +272,25 @@ test('chat attachments and the Diary context are created on POST and only read o
   assert.equal(created.routing, 'auto', "a standalone chat's context starts on Auto, not Diary's Manual default");
   await f.call('POST', '/api/diary/context');
   assert.deepEqual(f.sent.pop(), { status: 404, body: { error: 'Diary add-on is disabled' } });
+});
+
+test('a deleted chat cannot get its attachments project back from a stale tab (#788)', async () => {
+  const f = fixture({ diary: false });
+  const dir = f.dir;
+  require('../chat-lists.cjs').addTombstone(dir, 'gone');
+  await f.call('POST', '/api/chats/gone/context');
+  assert.deepEqual(f.sent.pop(), { status: 410, body: { error: 'This chat was deleted.' } });
+  assert.deepEqual(f.projects, [], 'nothing was created');
+  await f.call('GET', '/api/chats/gone/context');
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { project: null } }, 'a read still answers like a chat with no attachments');
+  await f.call('POST', '/api/chats/alive/context');
+  assert.equal(f.sent.pop().body.project.id, 'chat-alive', 'any other chat is unaffected');
+  // An existing attachments project is still served for a POST (deletion removes it; nothing
+  // here deletes on read).
+  f.projects.push({ id: 'chat-kept', chats: [] });
+  require('../chat-lists.cjs').addTombstone(dir, 'kept');
+  await f.call('POST', '/api/chats/kept/context');
+  assert.equal(f.sent.pop().body.project.id, 'chat-kept');
 });
 
 test('an explicit routing choice is marked so the #352 migration never reverts it', async () => {

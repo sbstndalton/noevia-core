@@ -122,7 +122,50 @@ function createProjectStore({
     } catch {
       /* no history file — fine */
     }
+    // A chat that started free and was moved here (#738) keeps its attachments project (#788).
+    removeChatAttachments(chatId);
     return true;
+  }
+
+  // ── A free chat's hidden attachments project (#788) ──────────────────────
+  // Opening a free chat creates `cowork-chat-context-<chatId>` (routes/projects.cjs, the free
+  // context route) to hold its attachments, images and model choice. It belongs to that chat id
+  // and to nothing else, so it goes when the chat is deleted, through deleteProject: the same
+  // cleanup a project delete runs. Only that one id, only in the caller's own workspace (PROJECTS
+  // is request-scoped), never a regular project: chatProjectId only ever yields the context prefix.
+  // Its chat list is NOT purged (a context project is not meant to hold chats; if one somehow
+  // does, those chats are not this delete's to remove). Best effort: the chat delete has already
+  // committed, and a failure here leaves an orphan that removeOrphanChatContexts retries.
+  function removeChatAttachments(chatId) {
+    const id = require('./diary-extras.cjs').chatProjectId(chatId);
+    if (!id || !PROJECTS.some((p) => p && p.id === id)) return false;
+    try { return deleteProject(id, { purgeChats: false }); }
+    catch (err) { console.warn(`[projects] could not remove the attachments of deleted chat ${chatId}: ${String((err && err.message) || err)}`); return false; }
+  }
+
+  // Attachments projects left behind by chats deleted before #788. Orphan-ness is proven only by
+  // a tombstone: a deleted chat's id is tombstoned and can never come back (mergeChats and moveChat
+  // refuse it), and ids are random, so a tombstoned id is gone for good. A context whose chat is
+  // merely absent from every list is NOT removed: a new chat creates its context when it opens,
+  // before its first message saves the meta, so absence alone may be a chat open in a tab right
+  // now. Idempotent; bounded per call so a large backlog cannot stall the request that runs it.
+  function removeOrphanChatContexts({ limit = 50 } = {}) {
+    const prefix = 'cowork-chat-context-';
+    const contexts = PROJECTS.filter((p) => p && typeof p.id === 'string' && p.id.startsWith(prefix));
+    if (!contexts.length) return 0;
+    const tombstones = require('./chat-lists.cjs').readTombstones(currentWorkspace().dir);
+    const listed = new Set();
+    for (const c of FREE_CHATS) if (c && typeof c.id === 'string') listed.add(c.id);
+    for (const p of PROJECTS) for (const c of (p && p.chats) || []) if (c && typeof c.id === 'string') listed.add(c.id);
+    let removed = 0;
+    for (const context of contexts) {
+      if (removed >= limit) break;
+      const chatId = context.id.slice(prefix.length);
+      if (!tombstones.has(chatId) || listed.has(chatId)) continue;
+      if (require('./diary-extras.cjs').chatProjectId(chatId) !== context.id) continue;
+      if (removeChatAttachments(chatId)) removed += 1;
+    }
+    return removed;
   }
 
   // Deleting a project deletes its chats too (#554): tombstone each so a late reply cannot write
@@ -135,6 +178,7 @@ function createProjectStore({
       try { context.remove(workspace.dir, chat.id); } catch { /* best effort */ }
       removeChatBrain(workspace.dir, chat.id);
       try { fs.unlinkSync(workspace.historyPath(chat.id)); } catch { /* no history file - fine */ }
+      removeChatAttachments(chat.id);
     }
   }
 
@@ -187,6 +231,32 @@ function createProjectStore({
     } catch {
       /* no history file — fine */
     }
+    removeChatAttachments(chatId);
+    return true;
+  }
+
+  // Project DELETE (moved here from routes/projects.cjs so a chat's attachments project, #788, is
+  // removed by exactly the same steps): drop the record; prune its local upload originals, document
+  // pages/originals and image assets (pruneDocuments against the now-absent live record); remove its
+  // RAG index files; tombstone its chats (#554) unless `purgeChats` is false; then sweep the
+  // directories it leaves (D8: empty ones only; in storage only the project's own noevia-allocated
+  // folder, and only when empty — files in storage are never deleted here). Returns whether a project
+  // with that id was removed. Tenant-scoped: PROJECTS and currentWorkspace() are the caller's own.
+  function deleteProject(id, { purgeChats = true } = {}) {
+    const removedProject = getProject(id);
+    const before = PROJECTS.length;
+    const keptProjects = Array.from(PROJECTS).filter((pr) => pr.id !== id);
+    PROJECTS.splice(0, PROJECTS.length, ...keptProjects);
+    if (PROJECTS.length === before) return false;
+    if (removedProject) pruneDocuments(removedProject);
+    saveProjects(PROJECTS);
+    // Drop the project's RAG index too (best-effort).
+    try {
+      for (const suffix of ['.db', '.db-wal', '.db-shm']) {
+        fs.rmSync(path.join(currentWorkspace().ragDir(), `${id}${suffix}`), { force: true });
+      }
+    } catch { /* best effort */ }
+    if (removedProject) { if (purgeChats) purgeProjectChats(removedProject); sweepDeletedProject(removedProject); }
     return true;
   }
 
@@ -587,6 +657,7 @@ function createProjectStore({
 
   return {
     saveProjects, getProject, sanitizeChats, loadChats, saveChats, chatIdsElsewhere, deleteChat, moveChat, purgeProjectChats, saveFreeChats, deleteFreeChat, createProject,
+    deleteProject, removeChatAttachments, removeOrphanChatContexts,
     historyPath, readHistory, writeHistory,
     ownsFile, ensureProjectFolder, withSourceLock, pruneDocuments, writeProjectTextFile, sweepDeletedProject, indexSource,
   };

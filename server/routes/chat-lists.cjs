@@ -44,6 +44,8 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
   async function handle(req, res, { path: p, authn }) {
     if (p === '/api/workspace') {
       try { sweepRetention(); } catch (e) { console.warn('[retention] sweep failed:', e?.message || e); }
+      // Attachments projects of chats deleted before #788 (only provably deleted ones; bounded).
+      try { store.removeOrphanChatContexts?.(); } catch (e) { console.warn('[projects] orphan chat attachments cleanup failed:', e?.message || e); }
       // PROJECTS is served raw everywhere else; here it crosses to the client,
       // so chats[] must be sanitized exactly as loadChats does.
       return json(res, 200, {
