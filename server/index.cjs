@@ -610,7 +610,7 @@ const { state: mcpState, oauthServerIds, accountReady, probeMcpAuth, syncDirecto
 
 // The approval gate's state lives in approvals.cjs; the chat loop below and the
 // /api/tool-approvals route are its only callers.
-const { pendingApprovals, chatWideApproved, awaitApproval } = require('./approvals.cjs').createApprovals();
+const { pendingApprovals, chatWideApproved, awaitApproval, awaitRouteChoice } = require('./approvals.cjs').createApprovals();
 
 // ── SKILL.md awareness (Hermes-style convention, master step 13) ─────────
 // A project knowledge file that starts with SKILL.md frontmatter is treated
@@ -754,6 +754,8 @@ for (const f of features.describe()) {
   if (['toolGate', 'stepSupervision', 'systemOneRouting', 'chatFraming'].includes(f.id) && f.enabled && f.unavailable) console.warn(`[system-one] ${f.id} is on but cannot run: ${f.unavailable}`);
 }
 
+// #778: one decision layer for the sensitivity check, rebuilt only when the backend changes.
+let sensitivityBackend = null, sensitivityDecisions = null;
 // ── Chat: the loop lives in chat.cjs; everything it needs is handed over here ──
 const { handleChat } = require('./chat.cjs').createChatHandler({
   stepSupervision: require('./step-supervision.cjs').createStepSupervision({
@@ -776,6 +778,36 @@ const { handleChat } = require('./chat.cjs').createChatHandler({
   framingReasoner, reasoningTraces,
   // #769: tainted sensitive arguments of a write always get their own approval card.
   provenancePolicy: { enabled: () => features.enabled('provenancePolicy') },
+  // #778: routing modes. The setting is the signed-in account's own; the sensitivity check is the
+  // router role through the decision service (cloud forbidden), failing closed to "ask".
+  routingModes: {
+    enabled: () => features.enabled('routingModes'),
+    settings: () => { const rm = require('./routing-modes.cjs'); const s = rm.read(currentWorkspace().dir); return { ...s, mode: rm.effectiveMode(s, rm.allowedModes(require('./features.cjs').settingsStore(authService.db))) }; },
+    sensitivity: require('./routing-modes.cjs').createSensitivity({
+      deadlineMs: () => decisionSettings.get().timeoutMs,
+      log: (entry) => recordDecision('sensitivity', entry),
+      decide: (request) => {
+        const backend = decisionSettings.backend();
+        if (!backend) throw Error('Decision service unavailable');
+        if (backend !== sensitivityBackend) { sensitivityBackend = backend; sensitivityDecisions = require('./decision/index.cjs').createDecisions({ backends: { configured: backend }, chains: { 'routing.sensitivity': ['configured'] } }); }
+        return sensitivityDecisions.decide(request);
+      },
+    }),
+    // #779: each router input is cut to the decision service's real state budget.
+    chunkChars: () => require('./routing-modes.cjs').chunkCharsFor(decisionSettings.backend()),
+    // Router calls per turn: 1 by default (Laya is single-worker), NOEVIA_ROUTER_CHUNKS 1-4.
+    maxChunks: () => require('./routing-modes.cjs').routerMaxChunks(),
+    awaitChoice: awaitRouteChoice,
+    log: (entry) => recordDecision('routing', entry),
+    setChatFlags: (projectId, chatId, patch) => {
+      const list = projectId ? getProject(projectId)?.chats : FREE_CHATS;
+      const meta = Array.isArray(list) ? list.find((c) => c && c.id === chatId) : null;
+      if (!meta) return false;
+      Object.assign(meta, patch);
+      if (projectId) saveProjects(PROJECTS); else saveFreeChats(FREE_CHATS);
+      return true;
+    },
+  },
   // #742: linked chats' brains, read from the signed-in user's own workspace and lists only.
   brainContext: { enabled: () => features.enabled('brainContext') && features.enabled('chatFraming'), maxChars: () => framingSettings.get().brainContextChars,
     chats: () => [...Array.from(FREE_CHATS), ...PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)).flatMap((proj) => proj.chats || [])],
@@ -865,6 +897,8 @@ const chatListRoutes = require('./routes/chat-lists.cjs').createChatListRoutes({
   chatLists: retentionLists, removeChat: removeRetainedChat, store: projectStore,
 });
 // The reasoning-effort default and per-project resolution (routes/reasoning-settings.cjs).
+const routingModeRoutes = require('./routes/routing-mode.cjs').createRoutingModeRoutes({ json, readBody, enabled: () => features.enabled('routingModes'), currentWorkspace,
+  store: require('./features.cjs').settingsStore(authService.db), audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) });
 const reasoningSettingsRoutes = require('./routes/reasoning-settings.cjs').createReasoningSettingsRoutes({ json, readBody, authService, getProject, getProvider, reasoningEffort, DEFAULT_PROVIDER_ID });
 // The automatic sampling presets on/off default (routes/sampling-settings.cjs). Selection and
 // precedence live in sampling-presets.cjs; this only toggles whether chat.cjs applies a preset.
@@ -970,6 +1004,7 @@ async function handleRequestScoped(req, res) {
 
     if (authn && await usageRoutes(req, res, { path: p, authn })) return;
     if (await reasoningSettingsRoutes(req, res, { path: p, authn, url })) return;
+    if (await routingModeRoutes(req, res, { path: p, authn, url })) return;
     if (await samplingSettingsRoutes(req, res, { path: p, authn, url })) return;
 
     if (await healthRoutes(req, res, { path: p, authn })) return;

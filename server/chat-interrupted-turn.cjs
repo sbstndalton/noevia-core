@@ -27,13 +27,15 @@ const count = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : undefine
 /** Follows one reply's stream events and builds the transcript entry the client would have saved. */
 function createTurnRecord({ now = Date.now } = {}) {
   const startedAt = now();
-  let content = '', reasoning = '', narration = '', model, routingDecision, sources, stats, paused, failed = false;
+  let content = '', reasoning = '', narration = '', model, routingDecision, routeTarget, sources, stats, paused, failed = false;
   const tools = [];
   function observe(ev) {
     if (!ev || typeof ev !== 'object') return;
     switch (ev.type) {
       case 'meta':
         if (ev.route) { model = `Assistant · Auto (${ev.route})`; routingDecision = ev.routingDecision; }
+        // #778: where the reply went and why (codes only).
+        if (ev.routing && ['local', 'cloud'].includes(ev.routing.route) && typeof ev.routing.reason === 'string') routeTarget = { route: ev.routing.route, reason: ev.routing.reason };
         break;
       case 'sources':
         if (Array.isArray(ev.sources)) sources = ev.sources;
@@ -86,7 +88,7 @@ function createTurnRecord({ now = Date.now } = {}) {
         const applied = Number.isInteger(ev.applied) && ev.applied >= 0 ? ev.applied : 0;
         paused = ev.reason === 'declined'
           ? { reason: 'declined', applied, declined: [...new Set((Array.isArray(ev.declined) ? ev.declined : []).filter((n) => typeof n === 'string' && TOOL_NAME.test(n)))].slice(0, 8) }
-          : { reason: 'supervision', applied };
+          : ev.reason === 'sensitive-tool-result' ? { reason: 'sensitive', applied } : { reason: 'supervision', applied };
         break;
       }
       case 'usage':
@@ -122,6 +124,7 @@ function createTurnRecord({ now = Date.now } = {}) {
       content: stopped ? '' : text,
       model: stopped ? STOPPED_SENDER : model,
       ...(routingDecision && !stopped ? { routingDecision } : {}),
+      ...(routeTarget ? { routeTarget } : {}),
       ...(reasoning && !stopped ? { reasoning } : {}),
       ...(calls.length ? { toolCalls: calls } : {}),
       ...(stats ? { stats } : {}),

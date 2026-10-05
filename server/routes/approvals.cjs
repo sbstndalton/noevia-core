@@ -34,6 +34,13 @@ function createApprovalRoutes({ json, readBody, pendingApprovals, requestScope }
       // this, any signed-in member could approve another member's write.
       const userId = requestScope.getStore()?.workspace?.userId || null;
       if (!userId || pending.userId !== userId) return json(res, 404, { error: 'no such pending approval' });
+      // #778: a routing question carries its own answers (and an optional remember-for-this-chat).
+      if (pending.kind === 'route') {
+        if (!pending.decide(String(body.decision || ''), { remember: body.remember === true })) {
+          return json(res, 400, { error: "decision must be 'cloud' or 'local'" });
+        }
+        return json(res, 200, { ok: true });
+      }
       if (!pending.decide(String(body.decision || ''))) {
         return json(res, 400, { error: "decision must be 'approve', 'deny' or 'approve_all'" });
       }

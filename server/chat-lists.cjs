@@ -40,6 +40,12 @@ function withKeptFields(current, chat) {
     const frame = require('./chat-framing.cjs').normalizeFrame(chat.frame);
     if (frame) next.frame = frame; else if (current && 'frame' in current) next.frame = current.frame; else delete next.frame;
   }
+  // #778: the per-chat routing flags follow the same rule: absent keeps the stored value (an older
+  // tab), a boolean replaces it, anything else is dropped.
+  for (const key of ['forceLocal', 'allowCloud']) {
+    if (!(key in chat)) { if (current && typeof current[key] === 'boolean') next[key] = current[key]; }
+    else if (typeof chat[key] !== 'boolean') { if (current && typeof current[key] === 'boolean') next[key] = current[key]; else delete next[key]; }
+  }
   const created = Number.isFinite(current?.createdAt) ? current.createdAt : Number.isFinite(chat.createdAt) ? chat.createdAt : undefined;
   if (created === undefined) delete next.createdAt; else next.createdAt = created;
   return next;

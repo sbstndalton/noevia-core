@@ -380,6 +380,9 @@ function createProjectRoutes({
                 // Chat framing (#737/#738): the frame (null clears it) and the first-saved time; the
                 // merge (chat-lists.cjs) validates the frame and keeps the first createdAt.
                 ...('frame' in c ? { frame: c.frame } : {}),
+                // #778: the per-chat routing flags; the merge keeps them when a save leaves them out.
+                ...(typeof c.forceLocal === 'boolean' ? { forceLocal: c.forceLocal } : {}),
+                ...(typeof c.allowCloud === 'boolean' ? { allowCloud: c.allowCloud } : {}),
                 ...(Number.isFinite(c.createdAt) ? { createdAt: c.createdAt } : {}),
                 // The session's harness (#236); absent means Chat. Only an admin may run Cowork, so a
                 // member's saved 'cowork' is coerced to Chat rather than failing every turn.

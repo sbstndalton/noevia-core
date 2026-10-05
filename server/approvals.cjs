@@ -72,7 +72,39 @@ function awaitApproval({ id, userId, chatId, abortSignal, onDecision = () => {} 
   });
 }
 
-  return { pendingApprovals, chatWideApproved, awaitApproval };
+// #778: the routing question for a sensitive-looking turn ("Send to cloud / Keep local"). It
+// shares the pending map, and so the decision route and its owner check, with the write gate, but
+// it never touches a write grant: its answers are its own. Resolves to { choice, remember } or
+// { choice: 'timeout' | 'aborted' }; never rejects.
+function awaitRouteChoice({ id, userId, chatId, abortSignal }) {
+  return new Promise((resolve) => {
+    if (abortSignal.aborted) { resolve({ choice: 'aborted' }); return; }
+    let settled = false;
+    const finish = (answer) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      abortSignal.removeEventListener('abort', onAbort);
+      pendingApprovals.delete(id);
+      resolve(answer);
+    };
+    const timer = setTimeout(() => finish({ choice: 'timeout' }), APPROVAL_TIMEOUT_MS);
+    const onAbort = () => finish({ choice: 'aborted' });
+    abortSignal.addEventListener('abort', onAbort, { once: true });
+    pendingApprovals.set(id, {
+      userId,
+      chatId,
+      kind: 'route',
+      decide(decision, extra) {
+        if (decision !== 'cloud' && decision !== 'local') return false;
+        finish({ choice: decision, remember: extra?.remember === true });
+        return true;
+      },
+    });
+  });
+}
+
+  return { pendingApprovals, chatWideApproved, awaitApproval, awaitRouteChoice };
 }
 
 module.exports = { createApprovals };
