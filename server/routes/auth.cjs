@@ -127,7 +127,14 @@ function createAuthRoutes({ json, authResult, readJson: readAnyJson, authService
       catch (e) { return json(res, 400, { error: e.message }); }
     }
     const passkeyRoute = p.match(/^\/api\/auth\/passkeys\/([^/]+)$/);
-    if (passkeyRoute && req.method === 'DELETE') return json(res, authService.deletePasskey(authn.user.id, decodeURIComponent(passkeyRoute[1])) ? 200 : 404, { ok: true });
+    if (passkeyRoute && req.method === 'DELETE') {
+      try { return json(res, authService.deletePasskey(authn.user.id, decodeURIComponent(passkeyRoute[1])) ? 200 : 404, { ok: true }); }
+      catch (e) {
+        // #863: the account's last sign-in method stays; say why instead of a bare failure.
+        if (e.code === 'LAST_CREDENTIAL') return json(res, 409, { error: e.message });
+        throw e;
+      }
+    }
     if (passkeyRoute && req.method === 'PATCH') {
       const ok = authService.renamePasskey(authn.user.id, decodeURIComponent(passkeyRoute[1]), (await readJson(req)).name);
       return json(res, ok ? 200 : 404, { ok });

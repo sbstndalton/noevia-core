@@ -26,7 +26,7 @@ function fixture({ users = 1, originOk = true, onToolsChange } = {}) {
     appPasswords: { list: () => [], create: async (_id, body) => { if (!body.name) throw new Error('name required'); return { id: 'ap', name: body.name }; }, revoke: (_id, id) => id === 'a'.repeat(32) },
     updateProfile: (...args) => calls.push(['updateProfile', ...args]), setDiaryEnabled: (_id, on) => ({ diaryEnabled: on }), markOnboarded: () => ({ onboarded: true }),
     registrationOptions: async () => ({ challenge: 'r' }), registrationVerify: async () => { throw new Error('verify failed'); },
-    deletePasskey: (_id, id) => id === 'pk1', renamePasskey: (_id, id) => id === 'pk1', revokeSession: (_id, id) => id === 's1',
+    deletePasskey: (_id, id) => { if (id === 'last') throw Object.assign(new Error('only way to sign in'), { code: 'LAST_CREDENTIAL' }); if (id === 'boom') throw new Error('db down'); return id === 'pk1'; }, renamePasskey: (_id, id) => id === 'pk1', revokeSession: (_id, id) => id === 's1',
     listUsers: () => [{ id: 'u1' }], createInvite: (_by, role) => ({ token: 't', role }),
     setDisabled: (_by, id) => id === 'u2', createRecovery: (_by, id) => (id === 'u2' ? { link: 'l' } : null),
     deleteUser: (_by, id, username) => { if (username !== 'two') throw new Error('username must match'); return id === 'u2'; },
@@ -123,6 +123,9 @@ test('passkeys and sessions answer 404 for an unknown id and the admin routes re
   assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'verify failed' } });
   await f.call('account', 'DELETE', '/api/auth/passkeys/pk9');
   assert.deepEqual(f.sent.pop(), { status: 404, body: { ok: true } });
+  await f.call('account', 'DELETE', '/api/auth/passkeys/last');
+  assert.deepEqual(f.sent.pop(), { status: 409, body: { error: 'only way to sign in' } }, '#863: the last credential is refused with its reason');
+  await assert.rejects(f.call('account', 'DELETE', '/api/auth/passkeys/boom'), /db down/, 'other failures are not disguised as 409');
   await f.call('account', 'PATCH', '/api/auth/passkeys/pk1', { name: 'Laptop' });
   assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true } });
   await f.call('account', 'DELETE', '/api/auth/sessions/s1');

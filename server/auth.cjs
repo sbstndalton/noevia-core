@@ -576,7 +576,22 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
         .map((s) => ({ ...s, current: !!currentId && s.id === currentId }));
     },
     revokeSession(userId, id) { return db.prepare('DELETE FROM sessions WHERE id_hash=? AND user_id=?').run(id, userId).changes > 0; },
-    deletePasskey(userId, id) { return db.prepare('DELETE FROM passkeys WHERE id=? AND user_id=?').run(id, userId).changes > 0; },
+    // #863: never remove the account's last way to sign in. A passkey is the last credential when
+    // the account has no usable password and no other passkey. Today every account carries a
+    // password hash (setup, invitations and recovery all require one), so this is the invariant that
+    // keeps a future password-less account from locking itself out. Throws code LAST_CREDENTIAL;
+    // the route answers 409. Today only the owner's own route calls this; any future caller (an admin acting for a user) inherits the rule.
+    deletePasskey(userId, id) {
+      const row = db.prepare('SELECT id FROM passkeys WHERE id=? AND user_id=?').get(id, userId);
+      if (!row) return false;
+      const user = db.prepare('SELECT password_hash FROM users WHERE id=?').get(userId);
+      const hasPassword = typeof user?.password_hash === 'string' && user.password_hash.trim() !== '';
+      const others = db.prepare('SELECT count(*) AS n FROM passkeys WHERE user_id=? AND id<>?').get(userId, id).n;
+      if (!hasPassword && others === 0) {
+        throw Object.assign(new Error('This is your only way to sign in. Add a password or another passkey before removing it.'), { code: 'LAST_CREDENTIAL' });
+      }
+      return db.prepare('DELETE FROM passkeys WHERE id=? AND user_id=?').run(id, userId).changes > 0;
+    },
     renamePasskey(userId, id, name) { return db.prepare('UPDATE passkeys SET name=? WHERE id=? AND user_id=?').run(String(name).trim().slice(0,80), id, userId).changes > 0; },
     listUsers() { return db.prepare('SELECT * FROM users ORDER BY created_at').all().map(publicUser); },
     createInvite(adminId, role = 'member') {
