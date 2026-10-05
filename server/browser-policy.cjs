@@ -3,7 +3,8 @@
 // action, independent of which executor (Playwright/CDP, Browser Use) eventually carries it out.
 // Pure and deterministic on purpose — model output can REQUEST an action but never mark it safe,
 // so nothing here reads model text as an instruction. The executor built around it is
-// browser-executor.cjs; neither is wired to a route, job or flag yet (no execution node exists).
+// browser-executor.cjs; browser-service.cjs drives it and routes/browser.cjs serves it (admin-only, behind the
+// browserExecutor flag).
 //
 // Three answers only: 'allow', 'needs_approval' (noevia's card: origin, element, typed values
 // with secrets masked), 'blocked'. Anything unrecognised needs approval; nothing unrecognised is

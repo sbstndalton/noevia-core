@@ -5,11 +5,12 @@
 // The server-wide backup connection (offsite-service, sealed with the backup key) doubles as
 // the personal connection of the administrator who made it: it records `owner` since
 // 2026-09-18, and a connection saved before that belongs to whichever administrator opens it,
-// since only administrators could create it. Everyone else gets their own sealed file.
+// since only administrators could create it. While its sign-in is pending it belongs to the one
+// who started it. Everyone else gets their own sealed file.
 const fs = require('node:fs');
 const path = require('node:path');
 
-function createDriveAccounts({ backupDrive, backupUsable = () => !!backupDrive, makeDrive, dataDir, userKey }) {
+function createDriveAccounts({ backupDrive, backupUsable = () => !!backupDrive, makeDrive, dataDir, userKey, userKeyPrevious = () => null }) {
   const dir = path.join(dataDir, 'google-drive-users');
   const personal = new Map();
 
@@ -17,6 +18,10 @@ function createDriveAccounts({ backupDrive, backupUsable = () => !!backupDrive, 
     if (!backupDrive || user.role !== 'admin' || !backupUsable()) return false;
     const s = backupDrive.state();
     if (s.state === 'connected' || s.state === 'error') return !s.owner || s.owner === user.id;
+    // Someone's sign-in is waiting for approval: only the administrator who started it may see its code
+    // or finish it (a second administrator completing it would bind their Google account) (#868).
+    // A pending sign-in with no recorded initiator keeps the old rule.
+    if (s.state === 'pending' && s.owner) return s.owner === user.id;
     // Nothing saved yet: an administrator connecting from Connectors fills the backup slot,
     // unless they already have a personal connection.
     return !fs.existsSync(path.join(dir, `${user.id}.sealed`));
@@ -28,7 +33,7 @@ function createDriveAccounts({ backupDrive, backupUsable = () => !!backupDrive, 
     if (!/^[\w-]+$/.test(user.id)) throw Error('unexpected user id');
     if (!personal.has(user.id)) {
       fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-      personal.set(user.id, makeDrive({ tokenFile: path.join(dir, `${user.id}.sealed`), backupKey: userKey }));
+      personal.set(user.id, makeDrive({ tokenFile: path.join(dir, `${user.id}.sealed`), backupKey: userKey, previousBackupKey: userKeyPrevious }));
     }
     return { drive: personal.get(user.id), backup: false };
   }
@@ -37,7 +42,7 @@ function createDriveAccounts({ backupDrive, backupUsable = () => !!backupDrive, 
   async function removeUser(userId) {
     const file = path.join(dir, `${userId}.sealed`);
     if (!/^[\w-]+$/.test(userId)) return;
-    const d = personal.get(userId) || (fs.existsSync(file) ? makeDrive({ tokenFile: file, backupKey: userKey }) : null);
+    const d = personal.get(userId) || (fs.existsSync(file) ? makeDrive({ tokenFile: file, backupKey: userKey, previousBackupKey: userKeyPrevious }) : null);
     if (d) await d.disconnect().catch(() => {});
     personal.delete(userId);
   }

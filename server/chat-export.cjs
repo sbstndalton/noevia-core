@@ -6,6 +6,21 @@
 const zlib = require('node:zlib');
 
 const FORMAT = 'noevia-conversations-v1';
+// The ZIP is built in memory and synchronously, so a very large history must be refused rather than
+// stall every tenant or throw halfway (#867). The limits bound the Markdown plus conversations.json
+// payload and the number of ZIP entries (classic ZIP allows 65,535).
+const MAX_EXPORT_BYTES = 64 * 1024 * 1024;
+const MAX_EXPORT_ENTRIES = 20000;
+
+class ExportTooLargeError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'ExportTooLargeError';
+    this.status = 413;
+    this.publicMessage = message;
+  }
+}
+const mb = (bytes) => `${Math.round(bytes / (1024 * 1024))} MB`;
 
 function dosDateTime(ms) {
   const d = new Date(ms);
@@ -57,31 +72,48 @@ function chatMarkdown(chat, history) {
   return lines.join('\n');
 }
 
-function buildExport({ freeChats = [], projects = [], readHistory, now = Date.now() }) {
-  const entries = [], taken = new Set(), chats = [];
+function buildExport({ freeChats = [], projects = [], readHistory, now = Date.now(), maxBytes = MAX_EXPORT_BYTES, maxEntries = MAX_EXPORT_ENTRIES }) {
+  const entries = [], taken = new Set(), chatJson = [];
+  let total = 0;
+  const tooLarge = () => new ExportTooLargeError(`Your conversations are too large to export in one file (the limit is ${mb(maxBytes)} and ${maxEntries.toLocaleString('en-US')} chats). Delete conversations you no longer need and try again.`);
+  const projectChats = projects.reduce((n, project) => n + (project.chats || []).length, 0);
+  // Two more entries: README.md and conversations.json. Checked before any history is read.
+  if (freeChats.length + projectChats + 2 > maxEntries) throw tooLarge();
+  const take = (bytes) => { total += bytes; if (total > maxBytes) throw tooLarge(); };
   const add = (name, text) => {
     let unique = name, n = 2;
     while (taken.has(unique)) unique = name.replace(/\.md$/, `-${n++}.md`);
     taken.add(unique);
-    entries.push({ name: unique, data: Buffer.from(text, 'utf8') });
+    const data = Buffer.from(text, 'utf8');
+    take(data.length);
+    entries.push({ name: unique, data });
   };
   const idPart = (id) => String(id).replace(/[^a-zA-Z0-9_-]/g, '');
-  for (const chat of freeChats) {
+  // conversations.json is assembled chat by chat, byte for byte what JSON.stringify(whole, null, 2)
+  // gives, so the size is known as it grows and no single giant string is ever built.
+  const addChat = (chat, project) => {
     const history = readHistory(chat.id);
-    add(`chats/${slug(chat.title, 'untitled-chat')}-${idPart(chat.id)}.md`, chatMarkdown(chat, history));
-    chats.push({ id: chat.id, title: chat.title || '', updatedAt: chat.updatedAt || null, project: null, history });
-  }
+    const md = chatMarkdown(chat, history);
+    let json;
+    try {
+      json = JSON.stringify({ id: chat.id, title: chat.title || '', updatedAt: chat.updatedAt || null, project, history: history.map(({ reasoning, ...m }) => m) }, null, 2).replace(/\n/g, '\n    ');
+    } catch (error) {
+      if (error instanceof RangeError) throw tooLarge(); // 'Invalid string length'
+      throw error;
+    }
+    take(Buffer.byteLength(json, 'utf8'));
+    chatJson.push(json);
+    return md;
+  };
+  for (const chat of freeChats) add(`chats/${slug(chat.title, 'untitled-chat')}-${idPart(chat.id)}.md`, addChat(chat, null));
   for (const project of projects) {
     const folder = `projects/${slug(project.name, idPart(project.id) || 'project')}`;
-    for (const chat of project.chats || []) {
-      const history = readHistory(chat.id);
-      add(`${folder}/${slug(chat.title, 'untitled-chat')}-${idPart(chat.id)}.md`, chatMarkdown(chat, history));
-      chats.push({ id: chat.id, title: chat.title || '', updatedAt: chat.updatedAt || null, project: { id: project.id, name: project.name }, history });
-    }
+    for (const chat of project.chats || []) add(`${folder}/${slug(chat.title, 'untitled-chat')}-${idPart(chat.id)}.md`, addChat(chat, { id: project.id, name: project.name }));
   }
-  add('README.md', `# noevia conversations\n\nExported ${new Date(now).toISOString()}. ${chats.length} chat${chats.length === 1 ? '' : 's'}.\n\n- \`chats/\`: chats outside projects, one Markdown file each.\n- \`projects/\`: chats grouped by project.\n- \`conversations.json\`: everything above in one file (format ${FORMAT}).\n\nThinking text is not included.\n`);
-  add('conversations.json', JSON.stringify({ format: FORMAT, exportedAt: new Date(now).toISOString(), chats: chats.map((c) => ({ ...c, history: c.history.map(({ reasoning, ...m }) => m) })) }, null, 2));
+  const count = chatJson.length;
+  add('README.md', `# noevia conversations\n\nExported ${new Date(now).toISOString()}. ${count} chat${count === 1 ? '' : 's'}.\n\n- \`chats/\`: chats outside projects, one Markdown file each.\n- \`projects/\`: chats grouped by project.\n- \`conversations.json\`: everything above in one file (format ${FORMAT}).\n\nThinking text is not included.\n`);
+  add('conversations.json', `{\n  "format": ${JSON.stringify(FORMAT)},\n  "exportedAt": ${JSON.stringify(new Date(now).toISOString())},\n  "chats": ${count ? `[\n    ${chatJson.join(',\n    ')}\n  ]` : '[]'}\n}`);
   return zipStore(entries, now);
 }
 
-module.exports = { zipStore, chatMarkdown, buildExport, FORMAT };
+module.exports = { zipStore, chatMarkdown, buildExport, FORMAT, ExportTooLargeError, MAX_EXPORT_BYTES, MAX_EXPORT_ENTRIES };

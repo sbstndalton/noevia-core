@@ -10,7 +10,13 @@ function createExportRoutes({ json, workspace, readHistory, audit = () => {}, no
     if (req.method !== 'GET') return json(res, 405, { error: 'method not allowed' }), true;
     const ws = workspace();
     const when = now();
-    const zip = buildExport({ freeChats: ws.freeChats || [], projects: ws.projects || [], readHistory, now: when });
+    let zip;
+    try { zip = buildExport({ freeChats: ws.freeChats || [], projects: ws.projects || [], readHistory, now: when }); }
+    catch (error) {
+      // Too large to build in memory (#867): a clear answer instead of a crash or a stalled server.
+      if (error && error.status === 413) return json(res, 413, { error: error.publicMessage }), true;
+      throw error;
+    }
     audit('export.conversations', authn.user.id, { bytes: zip.length });
     res.writeHead(200, {
       'Content-Type': 'application/zip',

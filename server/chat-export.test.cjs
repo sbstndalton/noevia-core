@@ -59,3 +59,81 @@ test('buildExport covers free and project chats with safe, unique file names', (
   assert.equal(json.chats.length, 3);
   assert.deepEqual(json.chats.find((c) => c.id === 'c-3').project, { id: 'p-1', name: 'Work / Stuff' });
 });
+
+// The pre-#867 implementation, kept as the reference: normal exports must stay byte for byte the same.
+function legacyExport({ freeChats = [], projects = [], readHistory, now }) {
+  const { FORMAT } = require('./chat-export.cjs');
+  const entries = [], taken = new Set(), chats = [];
+  const add = (name, text) => {
+    let unique = name, n = 2;
+    while (taken.has(unique)) unique = name.replace(/\.md$/, `-${n++}.md`);
+    taken.add(unique); entries.push({ name: unique, data: Buffer.from(text, 'utf8') });
+  };
+  const idPart = (id) => String(id).replace(/[^a-zA-Z0-9_-]/g, '');
+  const slug = (text, fallback) => String(text || '').normalize('NFKD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || fallback;
+  for (const chat of freeChats) {
+    const history = readHistory(chat.id);
+    add(`chats/${slug(chat.title, 'untitled-chat')}-${idPart(chat.id)}.md`, chatMarkdown(chat, history));
+    chats.push({ id: chat.id, title: chat.title || '', updatedAt: chat.updatedAt || null, project: null, history });
+  }
+  for (const project of projects) {
+    const folder = `projects/${slug(project.name, idPart(project.id) || 'project')}`;
+    for (const chat of project.chats || []) {
+      const history = readHistory(chat.id);
+      add(`${folder}/${slug(chat.title, 'untitled-chat')}-${idPart(chat.id)}.md`, chatMarkdown(chat, history));
+      chats.push({ id: chat.id, title: chat.title || '', updatedAt: chat.updatedAt || null, project: { id: project.id, name: project.name }, history });
+    }
+  }
+  add('README.md', `# noevia conversations\n\nExported ${new Date(now).toISOString()}. ${chats.length} chat${chats.length === 1 ? '' : 's'}.\n\n- \`chats/\`: chats outside projects, one Markdown file each.\n- \`projects/\`: chats grouped by project.\n- \`conversations.json\`: everything above in one file (format ${FORMAT}).\n\nThinking text is not included.\n`);
+  add('conversations.json', JSON.stringify({ format: FORMAT, exportedAt: new Date(now).toISOString(), chats: chats.map((c) => ({ ...c, history: c.history.map(({ reasoning, ...m }) => m) })) }, null, 2));
+  return zipStore(entries, now);
+}
+
+const fixtureHistories = {
+  'c-1': [{ role: 'user', content: 'hi "quoted"\nsecond line ü 😀  ' }, { role: 'assistant', content: 'About **ten hours**.', reasoning: 'private chain', toolCalls: [{ name: 'project_search', args: { q: 'x', nested: { a: [1, 2, { b: null }] } } }] }],
+  'c-2': [{ role: 'user', content: 'x' }], 'c-3': [], 'c-4': [{ role: 'user', content: 'in a project' }],
+};
+const fixtureArgs = (extra = {}) => ({
+  freeChats: [{ id: 'c-1', title: 'Battery notes', updatedAt: 1 }, { id: 'c-2', title: 'Battery notes', updatedAt: 2 }],
+  projects: [{ id: 'p-1', name: 'Work / Stuff', chats: [{ id: 'c-3', title: '' }, { id: 'c-4', title: 'Plan', updatedAt: 4 }] }, { id: 'p-2', name: 'Empty', chats: [] }],
+  readHistory: (id) => fixtureHistories[id] || [], now: Date.UTC(2026, 9, 5), ...extra,
+});
+
+test('a normal export is byte-identical to the pre-cap implementation (#867)', () => {
+  assert.ok(buildExport(fixtureArgs()).equals(legacyExport(fixtureArgs())));
+  // Nothing to export at all: still the same empty-chats document.
+  const none = { readHistory: () => [], now: Date.UTC(2026, 9, 5) };
+  assert.ok(buildExport(none).equals(legacyExport(none)));
+});
+
+test('a history over the byte cap is refused with a 413 error, not thrown mid-build (#867)', () => {
+  const { ExportTooLargeError } = require('./chat-export.cjs');
+  assert.throws(() => buildExport(fixtureArgs({ maxBytes: 200 })), (e) => e instanceof ExportTooLargeError && e.status === 413 && /too large to export in one file/.test(e.publicMessage));
+  // Just enough room still works.
+  assert.ok(buildExport(fixtureArgs({ maxBytes: 64 * 1024 })).length > 0);
+});
+
+test('more chats than the entry cap are refused before any history is read (#867)', () => {
+  let reads = 0;
+  const many = Array.from({ length: 50 }, (_, i) => ({ id: `c-${i}`, title: `t${i}` }));
+  assert.throws(() => buildExport({ freeChats: many, readHistory: () => { reads++; return []; }, maxEntries: 10 }), (e) => e.status === 413);
+  assert.equal(reads, 0);
+  assert.throws(() => buildExport({ projects: [{ id: 'p', name: 'p', chats: many }], readHistory: () => [], maxEntries: 51 }), (e) => e.status === 413, 'README and conversations.json count too');
+  assert.ok(buildExport({ projects: [{ id: 'p', name: 'p', chats: many }], readHistory: () => [], maxEntries: 52 }).length > 0);
+});
+
+test('a large synthetic history stops at the cap quickly and with bounded work (#867)', () => {
+  const { MAX_EXPORT_BYTES, ExportTooLargeError } = require('./chat-export.cjs');
+  const big = 'synthetic message text '.repeat(40000); // ~0.9 MB per message
+  let reads = 0;
+  const freeChats = Array.from({ length: 500 }, (_, i) => ({ id: `c-${i}`, title: `Chat ${i}`, updatedAt: i }));
+  const readHistory = () => { reads++; return [{ role: 'user', content: big }, { role: 'assistant', content: big }]; };
+  assert.throws(() => buildExport({ freeChats, readHistory }), ExportTooLargeError);
+  // Each chat is ~3.7 MB of Markdown plus JSON, so the cap trips after a bounded number of reads.
+  assert.ok(reads < Math.ceil(MAX_EXPORT_BYTES / (2 * big.length * 2)) + 2, `read ${reads} chats`);
+});
+
+test('a history too large to stringify becomes a 413, not a RangeError (#867)', () => {
+  const huge = { toJSON() { throw new RangeError('Invalid string length'); } };
+  assert.throws(() => buildExport({ freeChats: [{ id: 'c-1', title: 'x' }], readHistory: () => [{ role: 'user', content: 'x', extra: huge }] }), (e) => e.status === 413);
+});

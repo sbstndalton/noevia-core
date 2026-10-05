@@ -131,10 +131,10 @@ const offsiteRoutes = require('./routes/offsite-backup.cjs').createOffsiteRoutes
 const toolPolicy = require('./tool-policy.cjs').createToolPolicy({ db: authService.db, audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) });
 const driveAccounts = require('./drive-accounts.cjs').createDriveAccounts({
   backupDrive: offsiteBackup.drive, backupUsable: () => offsiteBackup.driveUsable(), dataDir: DATA_DIR,
-  userKey: () => secretStore.derive('google-drive-user'),
-  makeDrive: ({ tokenFile, backupKey }) => require('./gdrive.cjs').createGoogleDrive({
+  userKey: () => secretStore.derive('google-drive-user'), userKeyPrevious: () => secretStore.derivePrevious('google-drive-user'),
+  makeDrive: ({ tokenFile, backupKey, previousBackupKey }) => require('./gdrive.cjs').createGoogleDrive({
     clientId: String(process.env.GOOGLE_OAUTH_CLIENT_ID || '').trim(), clientSecret: String(process.env.GOOGLE_OAUTH_CLIENT_SECRET || '').trim(),
-    tokenFile, backupKey, oauthBase: process.env.GOOGLE_OAUTH_BASE_URL || undefined, apiBase: process.env.GOOGLE_DRIVE_API_BASE_URL || undefined,
+    tokenFile, backupKey, previousBackupKey, oauthBase: process.env.GOOGLE_OAUTH_BASE_URL || undefined, apiBase: process.env.GOOGLE_DRIVE_API_BASE_URL || undefined,
     uploadBase: process.env.GOOGLE_DRIVE_UPLOAD_BASE_URL || undefined, log: (event) => console.log('[gdrive]', JSON.stringify(event)),
   }),
 });

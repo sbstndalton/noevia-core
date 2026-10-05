@@ -58,6 +58,7 @@ function emailOf(idToken) {
 
 /**
  * @param {{clientId?: string, clientSecret?: string, tokenFile: string, backupKey: () => Buffer,
+ *   previousBackupKey?: () => Buffer|null,
  *   fetch?: typeof fetch, oauthBase?: string, apiBase?: string, uploadBase?: string,
  *   now?: () => number, log?: (e: object) => void, setTimeout?: typeof setTimeout, fs?: typeof nodeFs}} o
  */
@@ -72,7 +73,10 @@ function createGoogleDrive(o) {
 
   const readSaved = () => {
     let text; try { text = fs.readFileSync(o.tokenFile, 'utf8'); } catch { return null; }
-    try { return sealer(o.backupKey()).open(text); } catch { return { broken: true }; }
+    try { return sealer(o.backupKey()).open(text); } catch { /* try the retired key below */ }
+    // After a secrets.key rotation the file may still be sealed under the previous key (#866).
+    try { const prev = o.previousBackupKey && o.previousBackupKey(); if (prev) return sealer(prev).open(text); } catch { /* unreadable under both */ }
+    return { broken: true };
   };
   const save = (obj) => {
     const tmp = `${o.tokenFile}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
@@ -94,7 +98,8 @@ function createGoogleDrive(o) {
 
   function state() {
     if (!configured()) return { configured: false, state: 'not-configured', message: 'This noevia build has no Google sign-in registered.' };
-    if (pending && pending.expiresAt > now()) return { configured: true, state: 'pending', userCode: pending.userCode, verificationUrl: pending.verificationUrl, expiresAt: pending.expiresAt };
+    // `owner` is who started the sign-in, so a shared (backup) connection can show the code only to them (#868).
+    if (pending && pending.expiresAt > now()) return { configured: true, state: 'pending', userCode: pending.userCode, verificationUrl: pending.verificationUrl, expiresAt: pending.expiresAt, owner: pending.owner || null };
     const saved = readSaved();
     if (saved?.broken) return { configured: true, state: 'error', message: 'The saved Google connection could not be read (was the backup key replaced?). Connect again.' };
     if (saved?.refreshToken) return { configured: true, state: 'connected', email: saved.email || null, connectedAt: saved.connectedAt || null, owner: saved.owner || null };
@@ -108,9 +113,11 @@ function createGoogleDrive(o) {
     if (cur.state === 'pending') return cur;
     const r = await form(`${oauth}/device/code`, { client_id: o.clientId, scope: SCOPE });
     if (r.status !== 200 || !r.body.device_code) throw fail('Google did not start the sign-in. Try again in a minute.');
+    // Someone else's connect finished starting while this one waited on Google: keep theirs (#868).
+    if (pending && pending.expiresAt > now()) return state();
     const mine = ++generation;
     pollError = null;
-    pending = { userCode: r.body.user_code, verificationUrl: r.body.verification_url || r.body.verification_uri, expiresAt: now() + (r.body.expires_in || 1800) * 1000 };
+    pending = { userCode: r.body.user_code, verificationUrl: r.body.verification_url || r.body.verification_uri, expiresAt: now() + (r.body.expires_in || 1800) * 1000, owner: owner || null };
     let interval = Math.max(1, r.body.interval || 5) * 1000;
     const poll = async () => {
       if (mine !== generation) return;
@@ -292,4 +299,22 @@ function createGoogleDrive(o) {
   return { configured, state, connect, disconnect, mirror, FOLDER, call, request, api, upload };
 }
 
-module.exports = { createGoogleDrive, SCOPE, FOLDER, emailOf };
+/**
+ * Re-seals a token file written under `previousKey` with `currentKey` (#866). Returns 'current' when it
+ * already opens with the current key, 'rotated' when it was re-sealed, 'empty' for an empty file, and
+ * throws when neither key opens it. Token values never appear in the thrown message.
+ */
+function resealTokenFile(file, currentKey, previousKey) {
+  const text = nodeFs.readFileSync(file, 'utf8');
+  if (!text.trim()) return 'empty';
+  try { sealer(currentKey).open(text); return 'current'; } catch { /* maybe the previous key */ }
+  if (!previousKey) throw new Error('sealed under a key that is no longer available');
+  let obj;
+  try { obj = sealer(previousKey).open(text); } catch { throw new Error('sealed under a key that is no longer available'); }
+  const tmp = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+  nodeFs.writeFileSync(tmp, sealer(currentKey).seal(obj), { mode: 0o600 });
+  nodeFs.renameSync(tmp, file);
+  return 'rotated';
+}
+
+module.exports = { createGoogleDrive, resealTokenFile, SCOPE, FOLDER, emailOf };

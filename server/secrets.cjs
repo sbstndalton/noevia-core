@@ -92,7 +92,7 @@ function createSecretStore(dataDir, { env = process.env } = {}) {
   }
   /**
    * Re-encrypt every stored credential under the current key. Each table is
-   * { name, rows(): [{ ref, value, userId? }], write(ref, value) }. One bad row is
+   * { name, rows(): [{ ref, value, userId? }], write(ref, value), reseal?(row) }. One bad row is
    * counted and reported, never fatal. Idempotent: a second run finds all "current".
    */
   function rotate({ tables = [] } = {}) {
@@ -105,7 +105,8 @@ function createSecretStore(dataDir, { env = process.env } = {}) {
       }
       for (const row of rows) {
         try {
-          const out = reseal(row.value, row.userId);
+          // A table whose values are not enc: strings (a sealed file) brings its own reseal(row).
+          const out = table.reseal ? table.reseal(row) : reseal(row.value, row.userId);
           if (out.value !== undefined) table.write(row.ref, out.value);
           counts[out.status] += 1;
         } catch (e) {
@@ -122,11 +123,15 @@ function createSecretStore(dataDir, { env = process.env } = {}) {
   // capability token with the same bytes that encrypt stored credentials
   // would make a signing-oracle bug a credential-disclosure bug. HKDF gives
   // an independent key per label from the one file operators already back up.
-  function derive(label, bytes = 32) {
+  function deriveFrom(k, label, bytes) {
     if (!label || typeof label !== 'string') throw new Error('derive needs a label');
-    return Buffer.from(crypto.hkdfSync('sha256', key, Buffer.alloc(0), Buffer.from(`noevia:${label}`, 'utf8'), bytes));
+    return Buffer.from(crypto.hkdfSync('sha256', k, Buffer.alloc(0), Buffer.from(`noevia:${label}`, 'utf8'), bytes));
   }
-  return { encrypt, decrypt, canDecrypt, reseal, rotate, derive, keyFile, previousKeyFile, hasPreviousKey: () => !!previousKey };
+  const derive = (label, bytes = 32) => deriveFrom(key, label, bytes);
+  // The same derivation from the retired key (null when none is configured), so values sealed
+  // under a derived key (not enc: strings) can still be opened and re-sealed during a rotation (#866).
+  const derivePrevious = (label, bytes = 32) => (previousKey ? deriveFrom(previousKey, label, bytes) : null);
+  return { encrypt, decrypt, canDecrypt, reseal, rotate, derive, derivePrevious, keyFile, previousKeyFile, hasPreviousKey: () => !!previousKey };
 }
 
 module.exports = { createSecretStore };

@@ -6,19 +6,34 @@
 // POST /api/admin/offsite-backup/google/connect     -> start Google's device sign-in
 // POST /api/admin/offsite-backup/google/disconnect  -> revoke and forget the Google connection
 // GET  /api/admin/offsite-backup/recovery-key       -> the backup key as a text file download
+const OTHER_ADMIN = 'Another administrator is connecting Google Drive.';
+
 function createOffsiteRoutes({ service, json }) {
+  // Another administrator's sign-in is waiting for approval: its code belongs to them alone, and
+  // approving it would bind the wrong Google account to the backups (#868).
+  const foreignPending = (google, user) => !!(google && google.state === 'pending' && google.owner && google.owner !== user.id);
+  const publicStatus = (status, user) => {
+    if (!status.google) return status;
+    const { owner, ...google } = status.google;
+    if (!foreignPending(status.google, user)) return { ...status, google };
+    const { userCode, verificationUrl, expiresAt, ...rest } = google;
+    return { ...status, google: { ...rest, message: OTHER_ADMIN } };
+  };
+  const refuseForeign = (authn) => {
+    if (foreignPending(service.status().google, authn.user)) throw Object.assign(Error(OTHER_ADMIN), { status: 409, publicMessage: OTHER_ADMIN });
+  };
   const actions = {
     run: () => service.runNow(),
     verify: () => service.verifyNow(),
     copy: () => service.copyNow(),
-    'google/connect': (authn) => service.connectGoogle(authn.user.id),
-    'google/disconnect': () => service.disconnectGoogle(),
+    'google/connect': (authn) => { refuseForeign(authn); return service.connectGoogle(authn.user.id); },
+    'google/disconnect': (authn) => { refuseForeign(authn); return service.disconnectGoogle(); },
   };
   return async function offsiteRoutes(req, res, { path, authn }) {
     if (path !== '/api/admin/offsite-backup' && !path.startsWith('/api/admin/offsite-backup/')) return false;
     const send = (status, body) => (json(res, status, body), true);
     if (!authn || authn.user.role !== 'admin') return send(403, { error: 'Administrator required' });
-    if (path === '/api/admin/offsite-backup') return req.method === 'GET' ? send(200, service.status()) : send(405, { error: 'method not allowed' });
+    if (path === '/api/admin/offsite-backup') return req.method === 'GET' ? send(200, publicStatus(service.status(), authn.user)) : send(405, { error: 'method not allowed' });
     const action = path.slice('/api/admin/offsite-backup/'.length);
     if (action === 'recovery-key') {
       if (req.method !== 'GET') return send(405, { error: 'method not allowed' });

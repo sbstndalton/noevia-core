@@ -6,6 +6,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { atomicJson } = require('./workspace.cjs');
+const { resealTokenFile } = require('./gdrive.cjs');
 
 const hasTable = (db, name) => !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name);
 
@@ -40,7 +41,23 @@ function providerFile(name, file) {
   };
 }
 
-function rotationTables({ db, dataDir }) {
+// Members' Google Drive refresh tokens (google-drive-users/<id>.sealed) are sealed by gdrive.cjs under
+// a key derived from secrets.key, not as enc: strings, so they bring their own re-seal (#866).
+function googleDriveUserFiles(dir, secrets) {
+  return {
+    name: 'google_drive_users',
+    rows() {
+      if (!fs.existsSync(dir)) return [];
+      return fs.readdirSync(dir).filter((f) => f.endsWith('.sealed')).sort().map((f) => ({ ref: f, value: f }));
+    },
+    reseal(row) {
+      const status = resealTokenFile(path.join(dir, row.ref), secrets.derive('google-drive-user'), secrets.derivePrevious('google-drive-user'));
+      return { status };
+    },
+  };
+}
+
+function rotationTables({ db, dataDir, secrets = null }) {
   const tables = [
     sqlTable(db, 'storage_connections', { table: 'storage_connections', keys: ['user_id'], column: 'secret', bound: true }),
     sqlTable(db, 'mcp_oauth_tokens', { table: 'mcp_oauth_tokens', keys: ['user_id', 'server_id'], column: 'data_enc', bound: true }),
@@ -50,6 +67,7 @@ function rotationTables({ db, dataDir }) {
     sqlTable(db, 'chatgpt_oauth_tokens', { table: 'chatgpt_oauth_tokens', keys: ['user_id'], column: 'data_enc', bound: true }),
     providerFile('shared_providers', path.join(dataDir, 'shared-providers.json')),
   ];
+  if (secrets) tables.push(googleDriveUserFiles(path.join(dataDir, 'google-drive-users'), secrets));
   const usersDir = path.join(dataDir, 'users');
   if (fs.existsSync(usersDir)) {
     for (const id of fs.readdirSync(usersDir).sort()) {
@@ -62,7 +80,7 @@ function rotationTables({ db, dataDir }) {
 
 /** Run a rotation and record it in the audit log. Never throws for a bad row. */
 function runRotation({ secrets, db, dataDir, audit = () => {}, actorId = null }) {
-  const report = secrets.rotate({ tables: rotationTables({ db, dataDir }) });
+  const report = secrets.rotate({ tables: rotationTables({ db, dataDir, secrets }) });
   report.previousKey = secrets.hasPreviousKey();
   audit('secrets.rotate', actorId, actorId, { totals: report.totals, failed: report.failures.map((f) => ({ table: f.table, ref: f.ref })).slice(0, 50) });
   return report;
