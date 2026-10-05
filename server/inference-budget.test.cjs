@@ -533,3 +533,38 @@ test('the embed parity check samples many strings and requires cosine and top-5 
   await assert.rejects(check({ ...args, fetchImpl: async () => ({ ok: false, status: 404 }) }), /HTTP 404/);
   await assert.rejects(check({ ...args, fetchImpl: async () => ({ ok: true, json: async () => ({ data: [] }) }) }), /0 embeddings for/);
 });
+
+test('#874 a failed model listing is unknown, not idle: no baseline from it, and the tick is skipped', async () => {
+  const { loadedFromListing } = require('./inference-budget-watch.cjs');
+  assert.equal(loadedFromListing({ ok: false, status: 502, body: { error: 'down' } }), null);
+  assert.equal(loadedFromListing({ ok: true, status: 200, body: {} }), null);
+  assert.equal(loadedFromListing(null), null);
+  assert.deepEqual(loadedFromListing({ ok: true, body: { data: [{ id: 'a', status: { value: 'loaded' } }, { id: 'b', status: { value: 'unloaded' } }, { id: 'c', status: { value: 'loading' } }] } }), ['a', 'c']);
+  // A 13 GiB model is resident; the engine answers /models with an error for one reading.
+  const used = { gpu: { gttGib: 13, vramGib: 0.5 }, engine: null };
+  let listing = { ok: false, status: 503, body: {} };
+  const unloaded = [];
+  const w = createInferenceBudgetWatch({ env: {}, budgetGib: () => 12, readGpu: async () => used.gpu, readEngine: async () => used.engine,
+    listLoaded: async () => loadedFromListing(listing), unload: async m => { unloaded.push(m); return { ok: true }; }, log: () => {}, now: () => 0 });
+  assert.equal((await w.tick()).state, 'models-unknown');
+  listing = { ok: true, body: { data: [{ id: 'chat', status: { value: 'loaded' } }] } };
+  const r = await w.tick();
+  assert.equal(r.baselineGib, 0, 'the loaded model was not taken as the idle baseline');
+  assert.equal(r.state, 'over'); assert.equal(r.usedGib, 13.5);
+  assert.equal((await w.tick()).state, 'unloaded'); assert.deepEqual(unloaded, ['chat']);
+  // A thrown listing is unknown too.
+  const t = createInferenceBudgetWatch({ env: {}, budgetGib: () => 12, readGpu: async () => used.gpu, listLoaded: async () => { throw Error('ECONNREFUSED'); }, unload: async () => ({ ok: true }), log: () => {}, now: () => 0 });
+  assert.equal((await t.tick()).state, 'models-unknown');
+});
+
+test('#873 no idle baseline is taken while the maintenance gate is held (a llama-bench sweep owns the GPU)', async () => {
+  let held = true;
+  const used = { gpu: { gttGib: 11, vramGib: 0 }, engine: null };
+  const w = createInferenceBudgetWatch({ env: {}, budgetGib: () => 12, readGpu: async () => used.gpu, readEngine: async () => null,
+    listLoaded: async () => [], unload: async () => ({ ok: true }), log: () => {}, now: () => 0, baselineAllowed: () => !held });
+  assert.equal((await w.tick()).baselineGib, 0, 'the sweep\'s 11 GiB is not the idle baseline');
+  held = false; used.gpu.gttGib = 1;
+  assert.equal((await w.tick()).baselineGib, 1, 'a real idle reading after the sweep is');
+  const throwing = createInferenceBudgetWatch({ env: {}, budgetGib: () => 12, readGpu: async () => used.gpu, listLoaded: async () => [], unload: async () => ({ ok: true }), log: () => {}, now: () => 0, baselineAllowed: () => { throw Error('x'); } });
+  assert.equal((await throwing.tick()).baselineGib, 0);
+});

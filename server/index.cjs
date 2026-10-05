@@ -198,6 +198,8 @@ const folderSync = process.env.MODEL_LOADER_URL ? require('./model-folder-sync.c
     if (!r?.ok) throw Object.assign(Error(r?.body?.error || `model manager HTTP ${r?.status || 'unreachable'}`), { status: r?.status });
   },
   reloadPresets: () => modelManager.reloadPresets ? modelManager.reloadPresets({ unload: false }) : { ok: false },
+  // #872: never write models.ini while calibration/auto-tune runs or the maintenance gate is held.
+  busy: () => !!modelManager.tuningActive?.(),
   log: (message) => console.log(message),
 }) : null;
 
@@ -235,9 +237,12 @@ const inferenceBudgetWatch = modelManager.kind === 'llamacpp' ? (() => {
     budgetGib: inferenceBudget.budgetGib,
     readGpu: () => watch.readGpuMemory(files),
     readEngine: watch.engineReaderFromModelLoader({ env: process.env, fetchJson }),
-    listLoaded: async () => { const r = await modelManager.listModels(); return r.ok ? r.body.data.filter(m => ['loaded', 'loading'].includes(m.status.value)).map(m => m.id) : []; },
+    // #874: null (unknown) on a failed listing, so the watchdog skips that tick instead of treating it as idle.
+    listLoaded: async () => watch.loadedFromListing(await modelManager.listModels()),
     unload: model => modelManager.emergencyUnload(model),
     onUnloaded: (model, budgetGib) => modelManager.quarantine?.(model, budgetGib),
+    // #873 follow-up: a sweep's llama-bench memory (gate held) must never become the idle baseline.
+    baselineAllowed: () => !modelManager.maintenanceHeld?.(),
   });
 })() : null;
 inferenceBudgetWatch?.start();

@@ -758,3 +758,23 @@ test('#328 status reports the KV candidates this server really tries', async t =
   t.after(() => { delete process.env.NOEVIA_AUTOTUNE_ALLOW_BELOW_Q5_KV; });
   assert.deepEqual(f.manager.autotune.status('synthetic').body.kvCandidates, ['f16', 'q8_0', 'q5_1', 'q5_0', 'q4_0']);
 });
+
+test('#872 between model leases the gate is open but the folder sync still sees auto-tune running', async t => {
+  const f = fixture(t, { models: ['one', 'two'] });
+  assert.equal(f.manager.tuningActive(), false);
+  await f.manager.autotune.start('', { confirmPause: true, untuned: true });
+  let between = false;
+  for (let i = 0; i < 3000; i++) {
+    const j = f.manager.autotune.status().body.job;
+    if (j.models[0].status === 'passed' && j.models[1].status === 'pending') {
+      assert.equal(f.manager.maintenanceHeld(), false, 'chat may run between models');
+      assert.equal(f.manager.tuningActive(), true, 'models.ini must still not be written');
+      between = true; break;
+    }
+    await new Promise(r => setImmediate(r));
+  }
+  assert.equal(between, true);
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'passed', j.error);
+  assert.equal(f.manager.tuningActive(), false);
+});

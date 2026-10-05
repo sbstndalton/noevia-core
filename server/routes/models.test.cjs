@@ -14,7 +14,7 @@ function makeWorkspace(autoRoles = null) {
   return { autoRoles, saves: 0, saveAutoRoles() { this.saves += 1; } };
 }
 
-function fixture({ env = {}, enabled = true, kind = 'llamacpp', manager = {}, workspace = { userId: 'u1' }, catalogue = [{ name: 'm' }], servedCatalogue = async () => catalogue, modelsInstalled = async () => [{ name: 'm', loaded: true }], initialRoles = null, initialLastLoaded = null, otherWorkspaces = [], inferenceBudget = null } = {}) {
+function fixture({ env = {}, enabled = true, kind = 'llamacpp', manager = {}, workspace = { userId: 'u1' }, catalogue = [{ name: 'm' }], servedCatalogue = async () => catalogue, modelsInstalled = async () => [{ name: 'm', loaded: true }], initialRoles = null, initialLastLoaded = null, otherWorkspaces = [], inferenceBudget = null, sweepGuardOptions, fetchReply = null } = {}) {
   const sent = [], headers = [], fetched = [];
   const scan = new Map();
   let refreshes = 0;
@@ -47,8 +47,8 @@ function fixture({ env = {}, enabled = true, kind = 'llamacpp', manager = {}, wo
     json: (res, status, body) => { sent.push({ status, body }); },
     readBody: async (req) => { let s = ''; for await (const c of req) s += c; return s; },
     readJson: async (req) => { let s = ''; for await (const c of req) s += c; return s ? JSON.parse(s) : {}; },
-    fetchJson: async (url, init) => { fetched.push({ url, init }); return { ok: true, status: 200, body: { models: ['a'] } }; },
-    env, modelManager, inferenceBudget,
+    fetchJson: async (url, init) => { fetched.push({ url, init }); return fetchReply ? fetchReply(url, init) : { ok: true, status: 200, body: { models: ['a'] } }; },
+    env, modelManager, inferenceBudget, sweepGuardOptions,
     getProvider: () => ({ baseUrl: 'http://engine', apiKey: 'local' }), providerHeaders: () => ({}), DEFAULT_PROVIDER_ID: 'default',
     createVisionProbe: () => async () => ({ supported: true }),
     reportedTokenRate: (g) => g.tokens_per_second ?? null,
@@ -70,7 +70,7 @@ function fixture({ env = {}, enabled = true, kind = 'llamacpp', manager = {}, wo
     const res = { setHeader: (k, v) => headers.push([k, v]) };
     return routes(req, res, { path, authn: { user: { id: 'u1', role } }, url: new URL(`http://localhost${path}${search}`) });
   };
-  return { call, sent, headers, fetched, scan, refreshes: () => refreshes, roles, lastLoaded };
+  return { call, sent, headers, fetched, scan, refreshes: () => refreshes, roles, lastLoaded, ready: routes.sweepAdopted };
 }
 
 test('every write under /api/models/ is refused for members before anything else is looked at', async () => {
@@ -770,4 +770,83 @@ test('#697: a model manager section save that would exceed the budget is refused
   assert.deepEqual(seen[0], ['chat-syn', { 'ctx-size': '262144', jinja: 'true', LLAMA_ARG_CACHE_RAM: '512' }], 'values and extras, empty values dropped');
   await f.call('PUT', '/api/model-manager/sections/chat-syn', { baseRevision: 'r', values: { 'ctx-size': '8192' } }, 'admin');
   assert.equal(f.fetched.length, 1, 'a fitting save is forwarded');
+});
+
+test('#873: the throughput sweep checks every model against the budget and holds the gate while it runs', async () => {
+  const { createMaintenanceGate } = require('../inference-maintenance.cjs');
+  const { SWEEP_BUSY_ERROR } = require('../benchmark-sweep-guard.cjs');
+  const gate = createMaintenanceGate();
+  const refusal = { error: 'big needs about 30 GiB to load', code: 'inference_budget', budgetGib: 16 };
+  const timers = []; let progress = { active: true }, sweepReply = { ok: true, status: 200, body: { job: { active: true } } };
+  const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' },
+    manager: { loadRefusal: async (m) => (m === 'big' ? refusal : null), holdMaintenance: (reason) => gate.hold(reason) },
+    fetchReply: (url) => (url.endsWith('/benchmark/progress') ? { ok: true, status: 200, body: { job: progress } } : sweepReply),
+    sweepGuardOptions: { setTimer: (fn) => { timers.push(fn); return { unref() {} }; }, clearTimer: () => {} } });
+  assert.equal(await f.ready, false, 'no sweep was running at start');
+  assert.equal(gate.held(), false); f.fetched.length = 0;
+  const sweep = (aliases) => f.call('POST', '/api/model-manager/benchmark/sweep', { backend: 'b', aliases, nPrompt: 512, nGen: 128, depths: '0', reps: 1 }, 'admin');
+  // An over-budget model is refused like a load, whichever position it has.
+  await sweep(['small', 'big']);
+  assert.deepEqual(f.sent.pop(), { status: 409, body: refusal });
+  assert.equal(f.fetched.length, 0); assert.equal(gate.held(), false);
+  // Not while requests are in flight: the UI shows this message.
+  const chat = gate.enter();
+  await sweep(['small']);
+  assert.deepEqual(f.sent.pop(), { status: 409, body: { error: SWEEP_BUSY_ERROR } });
+  assert.equal(f.fetched.length, 0); chat();
+  // A refused start releases the gate at once.
+  sweepReply = { ok: false, status: 409, body: { detail: 'a benchmark is already running' } };
+  await sweep(['small']);
+  assert.deepEqual(f.sent.pop(), { status: 409, body: { error: 'a benchmark is already running' } });
+  assert.equal(gate.held(), false); assert.equal(timers.length, 0);
+  // An accepted sweep pauses chat until the model manager reports it is over.
+  sweepReply = { ok: true, status: 200, body: { job: { active: true } } };
+  await sweep(['small', 'other']);
+  assert.equal(f.sent.pop().status, 200);
+  assert.equal(gate.held(), true);
+  assert.throws(() => gate.enter(), (e) => e.status === 503 && /throughput sweep/.test(e.message));
+  await timers.shift()();
+  assert.equal(gate.held(), true, 'still running');
+  assert.ok(f.fetched.at(-1).url.endsWith('/api/v1/benchmark/progress'));
+  progress = { active: false, status: 'done' };
+  await timers.shift()();
+  assert.equal(gate.held(), false); assert.equal(timers.length, 0);
+  gate.enter()();
+  // A lost reply may hide a started sweep: the gate stays until progress says otherwise.
+  sweepReply = null; progress = { active: true };
+  await sweep(['small']);
+  assert.equal(f.sent.pop().status, 502);
+  assert.equal(gate.held(), true);
+  progress = { active: false };
+  await timers.shift()();
+  assert.equal(gate.held(), false);
+});
+
+test('#873: a sweep still running after a web restart takes the gate back at start', async () => {
+  const { createMaintenanceGate } = require('../inference-maintenance.cjs');
+  const timers = [];
+  const make = (job, gate = createMaintenanceGate()) => {
+    let current = job;
+    const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, manager: { holdMaintenance: (reason) => gate.hold(reason) },
+      fetchReply: (url) => (url.endsWith('/benchmark/progress') ? { ok: true, status: 200, body: { job: current } } : { ok: true, status: 200, body: {} }),
+      sweepGuardOptions: { setTimer: (fn) => { timers.push(fn); return { unref() {} }; }, clearTimer: () => {} } });
+    return { f, gate, finish: () => { current = { active: false, unit: 'models' }; } };
+  };
+  const running = make({ active: true, status: 'running', unit: 'models', total: 3, done: 1 });
+  assert.equal(await running.f.ready, true);
+  assert.equal(running.gate.held(), true);
+  assert.throws(() => running.gate.enter(), (e) => e.status === 503 && /throughput sweep/.test(e.message));
+  assert.ok(running.f.fetched[0].url.endsWith('/api/v1/benchmark/progress'));
+  running.finish(); await timers.shift()();
+  assert.equal(running.gate.held(), false);
+  // A prompt-suite run (counted in requests) or an idle manager leaves the gate alone.
+  const suite = make({ active: true, status: 'running', unit: 'requests', total: 9 });
+  assert.equal(await suite.f.ready, false); assert.equal(suite.gate.held(), false);
+  const idle = make({ active: false, unit: 'models' });
+  assert.equal(await idle.f.ready, false); assert.equal(idle.gate.held(), false);
+  // A gate already held (requests in flight cannot be at startup, but a calibration can) is not fought over.
+  const busyGate = createMaintenanceGate(); const release = busyGate.hold('calibrating');
+  const busy = make({ active: true, unit: 'models', total: 1 }, busyGate);
+  assert.equal(await busy.f.ready, false); release();
+  assert.equal(timers.length, 0);
 });

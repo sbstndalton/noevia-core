@@ -31,32 +31,6 @@ test('per-sub-question cap keeps earliest sources first and stops at the budget'
   assert.deepEqual(out.map((o) => o.id), [1, 2]);
 });
 
-test('citation verifier keeps supported markers and flags the rest without a model call', () => {
-  const reg = rs.createRegistry();
-  const a = reg.register({ kind: 'web', url: 'https://a.test', title: 'Cells', excerpts: ['The Zephyr cell stores 410 Wh per kilogram at room temperature.'] });
-  const b = reg.register({ kind: 'web', url: 'https://b.test', title: 'Other', excerpts: ['Tomatoes need well drained soil.'] });
-  const c = reg.register({ kind: 'project', file: 'unused.md', excerpts: ['The Zephyr cell stores 410 Wh per kilogram.'] });
-  const md = [
-    'The Zephyr cell stores 410 Wh per kilogram [1].',
-    'It was invented on the Moon [1].',
-    'Tomatoes need "well drained soil" to thrive [2].',
-    'Zephyr cell stores 410 Wh [3].',
-    'Unknown claim [9].',
-    '',
-    '## Next heading',
-  ].join('\n');
-  const r = rs.verifyCitations(md, reg, [a, b]);
-  assert.equal(r.total, 5); assert.equal(r.valid, 2); assert.equal(r.validity, 0.4);
-  assert.match(r.markdown, /per kilogram \[1\]\./);
-  assert.match(r.markdown, /soil" to thrive \[2\]\./);
-  assert.doesNotMatch(r.markdown, /Moon \[1\]|\[3\]|\[9\]/, 'unsupported, unused and unknown markers are removed');
-  assert.equal(r.unsupported.length, 3);
-  assert.match(r.markdown, /\n\n## Next heading/, 'layout is preserved');
-  assert.match(r.markdown, /\[\^u1\]: Unsupported/);
-  assert.equal(c, 3);
-  assert.equal(rs.verifyCitations('No citations here.', reg, []).validity, 1);
-});
-
 test('sources footer lists id order with location and retrieval date', () => {
   const reg = rs.createRegistry();
   reg.register({ kind: 'web', url: 'https://a.test', title: 'A', retrievedAt: Date.UTC(2026, 8, 17) });

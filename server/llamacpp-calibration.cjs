@@ -242,6 +242,9 @@ function createCalibrator(deps) {
       if (!applied.ok) throw Object.assign(Error(applied.body?.error || 'Could not write the test profile.'), { fatal: true });
       job.lastRevision = presets.get(job.model).revision;
       onWrite(job.lastRevision);
+      // Persist the revision now (#871): a restart during the load/test below must find
+      // it, or recover() restores nothing and the test context stays in models.ini.
+      save();
       const started = await request('/models/load', { method: 'POST', body: JSON.stringify({ model: job.model }), signal: controller.signal }, 120000);
       if (!started.ok) return finish('failed', 'The engine refused to load the model at this size.');
       const deadline = now() + limits.load;
@@ -340,6 +343,7 @@ function createCalibrator(deps) {
       if (!applied.ok) throw Object.assign(Error(applied.body?.error || 'Could not save the calibrated profile.'), { fatal: true });
       job.lastRevision = presets.get(job.model).revision;
       onWrite(job.lastRevision);
+      save();
       job.result.appliedCtx = chosen;
       // Leave the model loaded with its calibrated profile, ready for the next chat.
       job.phase = 'Loading the calibrated profile';

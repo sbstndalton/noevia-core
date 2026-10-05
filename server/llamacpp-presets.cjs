@@ -30,6 +30,23 @@ const fields={
 const canonical=key=>Object.keys(fields).find(k=>k===key||fields[k].aliases.includes(key));
 const error=(status,message)=>Object.assign(Error(message),{status});
 const revision=text=>crypto.createHash('sha256').update(text).digest('hex');
+// #874: recovery copies `<file>.noevia-backup-<revision>` are whole-file snapshots taken before each
+// web write; calibration and auto-tune write many. Keep the newest BACKUP_KEEP of this file.
+const BACKUP_KEEP=20;
+function pruneBackups(file,keep){
+  if(!(keep>0))return [];
+  const dir=path.dirname(file),prefix=path.basename(file)+'.noevia-backup-';
+  let names;try{names=fs.readdirSync(dir);}catch{return [];}
+  const rows=[];
+  for(const name of names){
+    if(!name.startsWith(prefix)||!/^[0-9a-f]{64}$/.test(name.slice(prefix.length)))continue;
+    try{const st=fs.lstatSync(path.join(dir,name));if(st.isFile())rows.push({name,mtime:st.mtimeMs});}catch{}
+  }
+  rows.sort((a,b)=>b.mtime-a.mtime||(a.name<b.name?-1:1));
+  const removed=[];
+  for(const {name} of rows.slice(keep)){try{fs.unlinkSync(path.join(dir,name));removed.push(name);}catch{}}
+  return removed;
+}
 function parse(text) {
   if (Buffer.byteLength(text)>1024*1024) throw error(413,'Preset file exceeds the editor limit');
   const sections=new Map();let current=null;
@@ -48,7 +65,7 @@ function parse(text) {
   });
   return {lines,sections};
 }
-function createPresetStore(file,{writer=null,cacheRam=null}={}) {
+function createPresetStore(file,{writer=null,cacheRam=null,backupKeep=BACKUP_KEEP}={}) {
   const budget=require('./inference-budget.cjs');
   const limits=()=>cacheRam||budget.cacheRamLimits();
   if(!file || !path.isAbsolute(file))throw error(500,'LLAMACPP_PRESET_PATH must be an absolute path');
@@ -121,6 +138,8 @@ function createPresetStore(file,{writer=null,cacheRam=null}={}) {
       fs.renameSync(temporary,file);
       const fdDir=fs.openSync(path.dirname(file),'r');try{fs.fsyncSync(fdDir);}finally{fs.closeSync(fdDir);}
     } finally {fs.rmSync(temporary,{force:true});}
+    // Only after the new file is in place; best-effort, never fails the write.
+    try{pruneBackups(file,backupKeep);}catch{}
   }
   // Container paths of the files a section loads. Read-only; used for size estimates.
   function files(model) {
@@ -142,4 +161,4 @@ function canonicalOptions(options){
   for(const [key,value] of Object.entries(options||{})){const c=canonical(String(key).trim().replace(/^-+/,''));if(c&&value!=null)out[c]=String(value).trim();}
   return out;
 }
-module.exports={createPresetStore,parse,fields,canonical,canonicalOptions};
+module.exports={createPresetStore,parse,fields,canonical,canonicalOptions,pruneBackups,BACKUP_KEEP};

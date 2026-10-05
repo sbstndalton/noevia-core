@@ -569,6 +569,14 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     withAdmission,
     close:tracker.close,
     enterInference: maintenance.enter,
+    // #872: read-only views for writers outside this process's gate (the model folder sync):
+    // the gate itself, or any calibration/auto-tune job still running (auto-tune releases the
+    // gate between models but still restores settings by revision).
+    maintenanceHeld: () => maintenance.held(),
+    // #873: the throughput sweep runs outside this process; the proxy holds the gate while it runs.
+    // Throws a 409 when requests are in flight or the gate is already held.
+    holdMaintenance: reason => maintenance.hold(reason),
+    tuningActive: () => maintenance.held() || calibrator?.status().body.job?.status === 'running' || autotuner?.status().body.job?.status === 'running',
     getPreset: model => presets ? Promise.resolve({ok:true,status:200,body:presets.get(model)}) : unsupported('Native preset editing'),
     applyPreset,
     suggestPreset,

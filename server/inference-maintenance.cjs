@@ -39,6 +39,8 @@ function createMaintenanceGate() {
     async exclusive(fn) {const release=hold();try{return await fn();}finally{release();}},
     hold,
     holdWhenIdle,
+    // Read-only: whether a calibration, auto-tune model or preset write holds the gate (#872).
+    held: () => maintenance,
   };
 }
 module.exports={createMaintenanceGate};

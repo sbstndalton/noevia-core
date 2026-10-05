@@ -62,3 +62,26 @@ test('sampling defaults are accepted as bounded decimals and rejected otherwise'
   assert.throws(()=>store.prepare({model:'synthetic',baseRevision:rev,options}),{status:400});
  assert.equal(fs.readFileSync(file,'utf8'),before);
 });
+
+test('#874 web writes keep only the newest recovery copies of models.ini',async t=>{
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'native-presets-prune-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+ const file=path.join(dir,'models.ini');fs.writeFileSync(file,'version = 1\n[synthetic]\nmodel = /models/test.gguf\nc = 8192\n');
+ // Unrelated neighbours are never touched: another file's backups, a non-revision suffix, a directory.
+ const keepers=['other.ini.noevia-backup-'+'a'.repeat(64),'models.ini.noevia-backup-notes','models.ini.bak-20260101-000000'];
+ for(const n of keepers)fs.writeFileSync(path.join(dir,n),'x');
+ fs.mkdirSync(path.join(dir,'models.ini.noevia-backup-'+'b'.repeat(64)));
+ const store=createPresetStore(file,{backupKeep:3});
+ const made=[];
+ for(let i=0;i<6;i++){
+  const before=store.get('synthetic').revision;
+  await store.commit(store.prepare({model:'synthetic',baseRevision:before,options:{'ctx-size':String(8192+1024*(i+1))}}));
+  made.push('models.ini.noevia-backup-'+before);
+  // Distinct, increasing mtimes so "newest" is unambiguous on coarse filesystems.
+  const at=new Date(Date.UTC(2020,0,1,0,0,i));fs.utimesSync(path.join(dir,made.at(-1)),at,at);
+ }
+ const left=fs.readdirSync(dir).filter(n=>/^models\.ini\.noevia-backup-[0-9a-f]{64}$/.test(n)&&fs.statSync(path.join(dir,n)).isFile()).sort();
+ assert.deepEqual(left,made.slice(-3).sort(),'the three newest copies remain');
+ for(const n of keepers)assert.ok(fs.existsSync(path.join(dir,n)),n);
+ assert.ok(fs.statSync(path.join(dir,'models.ini.noevia-backup-'+'b'.repeat(64))).isDirectory());
+ assert.match(fs.readFileSync(file,'utf8'),/c = 14336|ctx-size = 14336/);
+});

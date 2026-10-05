@@ -60,3 +60,23 @@ test('scans repeat on a timer and stop cleanly', async () => {
   assert.equal(timers.length, 2, 'reschedules itself');
   sync.stop();
 });
+
+test('#872 no models.ini write while calibration or auto-tune runs; the next tick registers', async () => {
+  const registered = []; let busy = true, listed = 0, reloads = 0;
+  const sync = createFolderSync({ busy: () => busy, listUnregistered: async () => { listed++; return ['new-a', 'new-b']; },
+    register: async (s) => { registered.push(s); if (registered.length === 1) busy = true; }, reloadPresets: async () => { reloads++; return { ok: true }; } });
+  const skipped = await sync.run();
+  assert.equal(skipped.deferred, true);
+  assert.equal(listed, 0); assert.deepEqual(registered, []); assert.equal(reloads, 0);
+  // A tune that starts mid-scan stops the remaining registrations.
+  busy = false;
+  const partial = await sync.run();
+  assert.deepEqual(registered, ['new-a']); assert.equal(partial.deferred, true); assert.equal(reloads, 1);
+  busy = false;
+  const rest = await sync.run();
+  assert.equal(rest.deferred, undefined);
+  assert.deepEqual(registered, ['new-a', 'new-a', 'new-b']);
+  // A busy check that throws counts as busy.
+  const failing = createFolderSync({ busy: () => { throw Error('no manager'); }, listUnregistered: async () => ['x'], register: async () => { throw Error('must not run'); }, reloadPresets: async () => ({ ok: true }) });
+  assert.equal((await failing.run()).deferred, true);
+});

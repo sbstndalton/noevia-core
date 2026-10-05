@@ -7,7 +7,12 @@ function location(workspace,day,id){
  if(!validDay(day)||!/^[a-zA-Z0-9-]{16,80}$/.test(id||''))throw Object.assign(Error('Valid diary day and exchange ID required.'),{status:400});
  return path.join(workspace.dir,'diary-conversations',day,id+'.json');
 }
-function start(workspace,{entryDay,exchangeId,message,kind,preparationId}){
+// #874: streamed text arrives as many small deltas; rewriting the whole record for each one is
+// quadratic in the reply length and blocks the event loop. Events that change what a recovery
+// decides on (the decision, done, error, tool calls) and finish() write at once; everything else
+// (text, reasoning, status) at most every `saveIntervalMs`, with a trailing timer for the last ones.
+const IMMEDIATE=new Set(['diary','done','error','tool','tool_pending','tool_result']);
+function start(workspace,{entryDay,exchangeId,message,kind,preparationId},{saveIntervalMs=500,now=Date.now,setTimer=setTimeout,clearTimer=clearTimeout}={}){
  const file=location(workspace,entryDay,exchangeId);
  if(fs.existsSync(file))throw Object.assign(Error('This exchange was already submitted. Recover its status before sending again.'),{status:409});
  if(preparationId){
@@ -17,7 +22,15 @@ function start(workspace,{entryDay,exchangeId,message,kind,preparationId}){
  const row={kind:kind==='preparation'?'preparation':'capture',preparationId:preparationId||null,tools:[],id:exchangeId,day:entryDay,message,startedAt:Date.now(),state:'running',content:'',reasoning:'',activity:[],decision:null};
  // Persist before dispatch. An orphaned running record is never replayed.
  atomicJson(file,row);active.add(file);
- const save=()=>atomicJson(file,row);
+ let lastSave=now(),timer=null,dirty=false;
+ // dirty/lastSave change only once the write succeeded, so a failed write is retried by the next
+ // event or by finish().
+ const save=()=>{if(timer){clearTimer(timer);timer=null;}atomicJson(file,row);dirty=false;lastSave=now();};
+ const saveSoon=()=>{
+  dirty=true;
+  if(now()-lastSave>=saveIntervalMs)return save();
+  if(!timer){timer=setTimer(()=>{timer=null;if(dirty)try{save();}catch{/* the next event or finish() retries */}},Math.max(0,saveIntervalMs-(now()-lastSave)));timer?.unref?.();}
+ };
  const append=(field,text)=>{if(typeof text!=='string')return;const value=row[field]+text;row.truncated ||= value.length>200000;row[field]=value.slice(0,200000);};
  return {
   event(event){
@@ -41,9 +54,10 @@ function start(workspace,{entryDay,exchangeId,message,kind,preparationId}){
    if(event.type==='diary'){row.decision=event.decision||null;row.xid=event.xid||null;}
    if(event.type==='error'){row.state='uncertain';row.error='The connection or save was interrupted. Check the saved diary before sending again.';}
    if(event.type==='done'){row.state=(row.kind==='preparation'||row.decision&&row.decision!=='error')&&row.state!=='uncertain'?'complete':'uncertain';}
-   row.updatedAt=Date.now();save();
+   row.updatedAt=Date.now();
+   if(IMMEDIATE.has(event.type))save();else saveSoon();
   },
-  finish(){try{if(row.state==='running'){row.state='uncertain';save();}}finally{active.delete(file);}},
+  finish(){try{const interrupted=row.state==='running';if(interrupted)row.state='uncertain';if(interrupted||dirty)save();}finally{if(timer){clearTimer(timer);timer=null;}active.delete(file);}},
  };
 }
 function list(workspace,day){

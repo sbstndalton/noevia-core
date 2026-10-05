@@ -126,50 +126,6 @@ function capExcerpts(excerptsBySource, maxTokens = 6000) {
   return out;
 }
 
-// §5: every [n] must name a source used by this section, and its sentence must share a quoted
-// span or a key phrase (three consecutive content words) with one of that source's excerpts.
-function supports(sentence, excerpts) {
-  const hay = excerpts.map((e) => normalise(e.text ?? e));
-  for (const [, quote] of sentence.matchAll(/["“]([^"”]{8,})["”]/g)) if (hay.some((h) => h.includes(normalise(quote)))) return true;
-  const w = words(sentence.replace(/\[\d+\]/g, ''));
-  const hayWords = hay.map((h) => ` ${h.split(' ').filter((x) => x.length > 2 && !STOP.has(x)).join(' ')} `);
-  for (let i = 0; i + 3 <= w.length; i++) {
-    const phrase = ` ${w.slice(i, i + 3).join(' ')} `;
-    if (hayWords.some((h) => h.includes(phrase))) return true;
-  }
-  return false;
-}
-
-function verifyCitations(markdown, registry, usedIds) {
-  const allowed = new Set(usedIds);
-  const unsupported = [];
-  let valid = 0, total = 0;
-  const sentences = String(markdown).split(/(?<=[.!?])\s+(?=\S)|\n/);
-  const text = sentences.map((sentence) => {
-    if (!/\[\d+\]/.test(sentence)) return sentence;
-    let flagged = false;
-    const cleaned = sentence.replace(/\s?\[(\d+)\]/g, (marker, n) => {
-      total++;
-      const id = Number(n), source = allowed.has(id) ? registry.get(id) : null;
-      if (source && supports(sentence, source.excerpts)) { valid++; return marker; }
-      flagged = true; return '';
-    });
-    if (!flagged) return cleaned;
-    unsupported.push(cleaned.trim());
-    return `${cleaned}[^u${unsupported.length}]`;
-  });
-  // Rejoin with the separators the split consumed: newlines stay newlines, sentences get a space.
-  let out = '', cursor = 0;
-  const src = String(markdown);
-  for (const [i, s] of sentences.entries()) {
-    const at = src.indexOf(sentences[i], cursor);
-    out += (i ? src.slice(cursor, at) : '') + text[i];
-    cursor = at + s.length;
-  }
-  if (unsupported.length) out += '\n\n' + unsupported.map((s, i) => `[^u${i + 1}]: Unsupported: no cited source contains this claim.`).join('\n');
-  return { markdown: out, total, valid, validity: total ? valid / total : 1, unsupported };
-}
-
 // ---- Sentence-level evidence pack and verifier (#707) ----
 
 // Text in a source must not read as an ID or a marker: brackets become parentheses and any
@@ -359,5 +315,5 @@ function sourcesFooter(registry) {
   return registry.list().map((s) => `${s.id}. ${s.title || s.url || s.file} — ${s.url || s.file} (retrieved ${new Date(s.retrievedAt).toISOString().slice(0, 10)})`).join('\n');
 }
 
-module.exports = { createRegistry, stripBoilerplate, chunk, lexicalScore, reduce, capExcerpts, verifyCitations, sourcesFooter, normalise,
+module.exports = { createRegistry, stripBoilerplate, chunk, lexicalScore, reduce, capExcerpts, sourcesFooter, normalise,
   splitSentences, evidencePack, supportsClaim, verifyClaims, numbersIn, looksLikeInstruction, VERIFY_REASONS: REASONS };

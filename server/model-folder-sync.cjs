@@ -12,10 +12,11 @@ const fs = require('node:fs');
 
 const RETRY_NEVER = new Set([400, 409, 404]);
 
-function createFolderSync({ listUnregistered, register, reloadPresets, stateFile = null, log = () => {},
+function createFolderSync({ listUnregistered, register, reloadPresets, busy = () => false, stateFile = null, log = () => {},
   intervalMs = 15 * 60 * 1000, firstDelayMs = 20000, now = () => Date.now(), setTimer = setTimeout, clearTimer = clearTimeout }) {
   let timer = null, running = false;
   let skip = new Set();
+  const isBusy = () => { try { return !!busy(); } catch { return true; } };
   try { if (stateFile) skip = new Set(JSON.parse(fs.readFileSync(stateFile, 'utf8')).skip || []); } catch { /* first run */ }
   const remember = (stem) => {
     skip.add(stem);
@@ -25,12 +26,17 @@ function createFolderSync({ listUnregistered, register, reloadPresets, stateFile
 
   async function run() {
     if (running) return { added: [], skipped: [] };
+    // #872: calibration and auto-tune restore models.ini by revision; a safe-defaults write
+    // in the middle of one breaks that restore. Wait for the next tick instead.
+    if (isBusy()) return { added: [], deferred: true, at: now() };
     running = true;
     try {
       const stems = await listUnregistered();
       const fresh = (stems || []).filter((s) => !skip.has(s));
       const added = [], failed = [];
+      let deferred = false;
       for (const stem of fresh) {
+        if (isBusy()) { deferred = true; break; }
         try { await register(stem); added.push(stem); }
         catch (e) {
           if (RETRY_NEVER.has(e?.status)) { remember(stem); continue; }
@@ -44,7 +50,7 @@ function createFolderSync({ listUnregistered, register, reloadPresets, stateFile
         log(`[models] set up ${added.length} new model${added.length === 1 ? '' : 's'} from the models folder: ${added.join(', ')}.${note}`);
       }
       if (failed.length) log(`[models] could not set up: ${failed.join(', ')}`);
-      return { added, skipped: [...skip], failed, at: now() };
+      return { added, skipped: [...skip], failed, ...(deferred ? { deferred } : {}), at: now() };
     } catch (e) {
       log(`[models] folder scan failed: ${e?.message || e}`);
       return { added: [], error: String(e?.message || e) };

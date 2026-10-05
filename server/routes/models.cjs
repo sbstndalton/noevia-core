@@ -45,8 +45,18 @@ function clientMessage(e, fallback) {
  * @param {() => object} deps.currentWorkspace
  * @param {object} deps.service   models.cjs
  */
-function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe, reportedTokenRate, missingRoles, currentWorkspace, service, inferenceBudget = null }) {
+function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe, reportedTokenRate, missingRoles, currentWorkspace, service, inferenceBudget = null, sweepGuardOptions = {} }) {
   const { modelScanCache, refreshModelScan, autoRoles, setAutoRoles, ensureRolesLoaded, servedCatalogue, modelsInstalled, deriveUserModelName, lastLoadedModel, clearLastLoadedModel, clearRoleReferences } = service;
+  const loaderHeaders = () => ({ 'Content-Type': 'application/json', ...(env.MODEL_LOADER_TOKEN ? { 'X-Model-Loader-Token': env.MODEL_LOADER_TOKEN } : {}) });
+  // #873: the throughput sweep holds the inference maintenance gate for as long as it runs.
+  const sweepGuard = typeof modelManager.holdMaintenance === 'function' ? require('../benchmark-sweep-guard.cjs').createSweepGuard({
+    hold: reason => modelManager.holdMaintenance(reason),
+    progress: () => fetchJson(`${String(env.MODEL_LOADER_URL || '').replace(/\/+$/, '')}/api/v1/benchmark/progress`, { method: 'GET', headers: loaderHeaders() }, 15000),
+    log: message => console.log(message),
+    ...sweepGuardOptions,
+  }) : null;
+  // A sweep that outlived a web restart gets the gate back (#873 follow-up).
+  const sweepAdopted = sweepGuard && env.MODEL_LOADER_URL ? sweepGuard.adopt().catch(() => false) : Promise.resolve(false);
 
   async function handle(req, res, { path: p, authn, url }) {
     if (p.startsWith('/api/models/') && !['GET', 'HEAD'].includes(req.method || 'GET') && authn.user.role !== 'admin') {
@@ -185,6 +195,23 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
           if(refusal)return json(res,409,refusal);
         }
       }
+      // #873: a throughput sweep loads every chosen model into its own llama-bench container, so
+      // each must fit the inference budget like any load; and it holds the maintenance gate while
+      // it runs, so Chat or Diary cannot load a second model beside it.
+      let sweepRelease=null, sweepModels=0;
+      if(method==='POST'&&rest==='benchmark/sweep'){
+        let payload; try{payload=JSON.parse(body||'{}');}catch{payload={};}
+        const aliases=(Array.isArray(payload.aliases)?payload.aliases:[]).filter(a=>typeof a==='string'&&a);
+        if(aliases.length>64)return json(res,400,{error:'Choose at most 64 models for one sweep.'});
+        if(modelManager.loadRefusal)for(const alias of aliases){
+          const refusal=await modelManager.loadRefusal(alias).catch(()=>null);
+          if(refusal)return json(res,409,refusal);
+        }
+        if(sweepGuard&&aliases.length){
+          try{sweepRelease=sweepGuard.acquire();}catch(e){return json(res,409,{error:e.publicMessage||'The sweep could not start.'});}
+          sweepModels=aliases.length;
+        }
+      }
       // Set only for POST models/delete, and read again once the forwarded delete has
       // succeeded (below): the folder-scan proxy deletes files directly through the model
       // management service, bypassing modelManager entirely — the only way to unload a model
@@ -258,6 +285,9 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
         search=q.toString()?'?'+q.toString():'';
       }
       const result=await fetchJson(`${env.MODEL_LOADER_URL.replace(/\/+$/,'')}/api/v1/${rest}${search}`,{method,headers:{'Content-Type':'application/json',...(env.MODEL_LOADER_TOKEN?{'X-Model-Loader-Token':env.MODEL_LOADER_TOKEN}:{})},body},10*60*1000).catch(()=>null);
+      // #873: a refused start releases the gate at once. An accepted one keeps it until the model
+      // manager reports the sweep over; so does a lost reply, since the sweep may have started.
+      if(sweepRelease){ if(result&&!result.ok)sweepRelease(); else sweepGuard.watch(sweepRelease,sweepModels); }
       res.setHeader('Cache-Control','no-store');
       if(!result)return json(res,502,{error:'The model management service is not responding.'});
       const detail=result.body&&typeof result.body==='object'?result.body:{error:String(result.body||'')};
@@ -583,9 +613,12 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
     return PASS;
   }
 
-  return async function modelRoutes(req, res, ctx) {
+  const modelRoutes = async function modelRoutes(req, res, ctx) {
     return (await handle(req, res, ctx)) !== PASS;
   };
+  // Settles once the startup check for a still-running sweep is done (tests await it).
+  modelRoutes.sweepAdopted = sweepAdopted;
+  return modelRoutes;
 }
 
 module.exports = { createModelRoutes };

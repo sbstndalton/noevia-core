@@ -229,3 +229,37 @@ test('memory that stays low with the model unloaded stops the run instead of fai
   assert.equal(job.status,'failed');assert.match(job.error,/stayed below 2 GiB even with the model unloaded/);
   assert.equal(job.steps.length,1);assert.equal(fs.readFileSync(ini,'utf8'),original);
 });
+
+test('#871 a restart during the first step restores the original profile',async t=>{
+  // The first load hangs (as a slow load poll would); noevia "restarts" mid-step.
+  let release;const hang=new Promise(r=>{release=r;});
+  const {manager,ini,stateFile,original,router,ctxOf}=fixture(t,{onLoad:ctx=>ctx===8192?hang:undefined});
+  assert.equal((await manager.calibration.start('synthetic',{promptBudgetSeconds:120,confirmPause:true})).status,202);
+  for(let i=0;i<200&&!router.loads.length;i++)await new Promise(r=>setImmediate(r));
+  assert.deepEqual(router.loads,[8192]);assert.equal(ctxOf(),8192);
+  assert.notEqual(fs.readFileSync(ini,'utf8'),original,'the test profile was written');
+  // The revision of the test profile is on disk before the load starts.
+  const persisted=JSON.parse(fs.readFileSync(stateFile,'utf8')).job;
+  const sha=require('node:crypto').createHash('sha256').update(fs.readFileSync(ini,'utf8')).digest('hex');
+  assert.equal(persisted.lastRevision,sha);
+  const fetchJson=async url=>new URL(url).pathname==='/models'?{ok:true,status:200,body:{data:[]}}:{ok:true,status:200,body:{}};
+  const restarted=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',presetPath:ini,fetchJson,calibrationStatePath:stateFile,autoconfig:{},calibrationOptions:{sleep:async()=>{},readMemory:()=>20}});
+  await restarted.calibration.recover();
+  const job=restarted.calibration.status().body.job;
+  assert.equal(job.status,'interrupted');assert.equal(job.restored,true);assert.doesNotMatch(job.error,/not restored/);
+  assert.equal(fs.readFileSync(ini,'utf8'),original);
+  // Let the stranded first run end; it must not overwrite the restored file.
+  manager.calibration.cancel();release();await finished(manager);
+  assert.equal(fs.readFileSync(ini,'utf8'),original);
+});
+
+test('#872 the manager reports a running calibration to the folder sync',async t=>{
+  let release;const gate=new Promise(r=>{release=r;});
+  const {manager}=fixture(t,{onLoad:ctx=>ctx===16384?gate:undefined});
+  assert.equal(manager.tuningActive(),false);assert.equal(manager.maintenanceHeld(),false);
+  await manager.calibration.start('synthetic',{promptBudgetSeconds:120,confirmPause:true});
+  for(let i=0;i<50;i++)await new Promise(r=>setImmediate(r));
+  assert.equal(manager.tuningActive(),true);assert.equal(manager.maintenanceHeld(),true);
+  release();await finished(manager);
+  assert.equal(manager.tuningActive(),false);assert.equal(manager.maintenanceHeld(),false);
+});

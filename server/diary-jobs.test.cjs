@@ -46,3 +46,38 @@ test('preparation history is bounded and explicitly marks truncated results',t=>
  for(let index=0;index<96;index++)j.event({type:'tool_result',index,name:'synthetic',text:'x'.repeat(20000)});
  j.finish();const [row]=jobs.list(w,data.entryDay);assert.equal(row.truncated,true);assert.ok(row.tools.reduce((n,t)=>n+t.args.length,0)<=64000);
 });
+test('#874 streamed deltas are written at most every interval; decisions, done and finish write at once',t=>{
+ const w=fixture(t);
+ let clock=1000;const timers=[];
+ const j=jobs.start(w,data,{saveIntervalMs:500,now:()=>clock,setTimer:(fn,ms)=>{const timer={fn,ms,unref(){}};timers.push(timer);return timer;},clearTimer:timer=>{const i=timers.indexOf(timer);if(i>=0)timers.splice(i,1);}});
+ const file=path.join(w.dir,'diary-conversations',data.entryDay,data.exchangeId+'.json');
+ const onDisk=()=>JSON.parse(fs.readFileSync(file,'utf8'));
+ let writes=0;const original=fs.renameSync;fs.renameSync=(...args)=>{if(String(args[1])===file)writes++;return original(...args);};t.after(()=>{fs.renameSync=original;});
+ for(let i=0;i<1000;i++)j.event({type:'delta',text:'x'});
+ assert.equal(writes,0,'1000 deltas inside one interval write nothing yet');
+ assert.equal(timers.length,1,'one trailing write is scheduled');assert.equal(timers[0].ms,500);
+ timers.shift().fn();
+ assert.equal(writes,1);assert.equal(onDisk().content.length,1000);
+ clock+=499;j.event({type:'delta',text:'y'});assert.equal(writes,1);
+ clock+=1;j.event({type:'delta',text:'z'});assert.equal(writes,2,'an interval has passed: written');
+ j.event({type:'delta',text:'w'});assert.equal(writes,2);
+ j.event({type:'diary',decision:'logged'});assert.equal(writes,3,'a decision is written at once');
+ assert.equal(onDisk().content,'x'.repeat(1000)+'yzw');assert.equal(timers.length,0,'nothing left pending');
+ j.event({type:'delta',text:'!'});j.event({type:'done'});assert.equal(writes,4);assert.equal(onDisk().state,'complete');
+ j.event({type:'reasoning',text:'tail'});j.finish();
+ assert.equal(writes,5,'finish flushes a pending write');assert.equal(onDisk().reasoning,'tail');assert.equal(timers.length,0);
+ assert.equal(jobs.list(w,data.entryDay)[0].state,'complete');
+});
+test('#874 a failed throttled write is retried by finish()',t=>{
+ const w=fixture(t);let clock=1000;const timers=[];
+ const j=jobs.start(w,data,{saveIntervalMs:500,now:()=>clock,setTimer:fn=>{const timer={fn,unref(){}};timers.push(timer);return timer;},clearTimer:timer=>{const i=timers.indexOf(timer);if(i>=0)timers.splice(i,1);}});
+ const file=path.join(w.dir,'diary-conversations',data.entryDay,data.exchangeId+'.json');
+ j.event({type:'delta',text:'kept '});j.event({type:'diary',decision:'logged'});j.event({type:'done'});
+ // A late text event after done: only the throttled path can write it.
+ j.event({type:'delta',text:'text'});
+ const original=fs.renameSync;let fail=true;fs.renameSync=(...args)=>{if(fail&&String(args[1])===file)throw Object.assign(Error('disk full'),{code:'ENOSPC'});return original(...args);};t.after(()=>{fs.renameSync=original;});
+ timers.shift().fn();
+ assert.equal(JSON.parse(fs.readFileSync(file,'utf8')).content,'kept ','the timer write failed');
+ fail=false;clock+=10;j.finish();
+ const row=JSON.parse(fs.readFileSync(file,'utf8'));assert.equal(row.content,'kept text');assert.equal(row.state,'complete');
+});

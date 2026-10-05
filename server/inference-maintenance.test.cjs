@@ -23,3 +23,17 @@ test('idle acquisition is bounded and cancellation does not hold chat', async ()
   leave();
   const chat = gate.enter(); chat();
 });
+
+test('#872 held() reports the gate without taking it', () => {
+  const gate = createMaintenanceGate();
+  assert.equal(gate.held(), false);
+  const leave = gate.enter();
+  assert.equal(gate.held(), false, 'requests in flight are not maintenance');
+  leave();
+  const release = gate.hold('calibrating');
+  assert.equal(gate.held(), true);
+  assert.throws(() => gate.enter(), /calibrating/);
+  release();
+  assert.equal(gate.held(), false);
+  gate.enter()();
+});
