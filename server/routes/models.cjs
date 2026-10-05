@@ -16,6 +16,7 @@
 // up on the shared engine (ensureRolesLoaded).
 
 const PASS = Symbol('unhandled');
+const { isJsonObject } = require('../http.cjs');
 const { isSystemModel, modelPathFromArgs, SYSTEM_MODEL_DELETE_REASON, SYSTEM_MODEL_LOAD_REASON, SIDECAR_MODEL_LOAD_REASON, MISSING_MODEL_FILE_REASON, isSidecarModel, SIDECAR_MODEL_DELETE_REASON } = require('../model-system.cjs');
 
 // A client sees e.message only when it was written for people (publicMessage, or a 4xx status).
@@ -115,6 +116,7 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
         } catch {
           return json(res, 400, { error: 'invalid JSON' });
         }
+        if (!isJsonObject(body)) return json(res, 400, { error: 'request body must be a JSON object' });
         const fast = typeof body.fast === 'string' ? body.fast.trim() : '';
         const smart = typeof body.smart === 'string' ? body.smart.trim() : '';
         const vision = typeof body.vision === 'string' ? body.vision.trim() : '';
@@ -241,6 +243,7 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
         }
       }
       if(method!=='GET')modelScanCache.clear();
+      const scanGeneration=modelScanCache.generation?.();
       if(method==='GET'&&rest==='models'&&!url.search){
         const hit=modelScanCache.get('models');
         if(hit){res.setHeader('Cache-Control','no-store');res.setHeader('X-Model-Scan','cached');if(Date.now()-hit.at>5000)refreshModelScan();return json(res,200,hit.body);}
@@ -262,7 +265,7 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
       if(result.ok&&method==='GET'&&/^benchmark\/runs\/\d+$/.test(rest)&&modelManager.recordEvidence){
         for(const {model,record} of require('../benchmark-evidence.cjs').throughputRecords(detail))modelManager.recordEvidence(model,record).catch(()=>undefined);
       }
-      if(result.ok&&method==='GET'&&rest==='models'&&!url.search)modelScanCache.set('models',{at:Date.now(),body:detail});
+      if(result.ok&&method==='GET'&&rest==='models'&&!url.search)modelScanCache.set('models',{at:Date.now(),body:detail},scanGeneration);
       // #302: the folder-scan delete above only removed files through the model management
       // service — it never touched the live engine or the auto-router roles. Run the same
       // cleanup /api/models/delete runs, for every engine id the deleted files backed.

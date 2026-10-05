@@ -104,7 +104,10 @@ test('stats and capabilities read the adapter; the roles round-trip and warm up'
   await f.call('PUT', '/api/auto-roles', { fast: 'f' });
   assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'both fast and smart model names are required' } });
   await f.call('PUT', '/api/auto-roles', '{');
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'invalid JSON' } });
+  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'invalid JSON' } });  for (const body of ['null', '7', '[]']) {
+    await f.call('PUT', '/api/auto-roles', body);
+    assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'request body must be a JSON object' } }, `a ${body} body is the client's mistake (#796)`);
+  }
 });
 
 test('a member may save their own auto-roles but never warms the shared engine, and unknown names 400', async () => {

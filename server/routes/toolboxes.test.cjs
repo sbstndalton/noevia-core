@@ -67,22 +67,23 @@ test('other paths and methods are left alone or refused', async () => {
 });
 
 // ── #237: GET /api/toolboxes/permitted ──
-function permittedFixture() {
+function permittedFixture({ cache } = {}) {
   const sent = [], calls = [];
+  let mode0 = 'ask';
   // Two tenants: each account sees only its own project, as the real getProject does.
   const projects = { 'u-a': { pa: { id: 'pa' } }, 'u-b': { pb: { id: 'pb' } } };
   const routes = createToolboxRoutes({
     discoverMcpTools: async () => {}, toolboxSummaries: () => [], prefill: { targetMs: 1, stats: () => ({}) },
-    mcp: () => ({ enabled: false }), json: (res, status, body) => { sent.push({ status, body }); return true; },
+    mcp: () => ({ enabled: false }), json: (res, status, body) => { sent.push({ status, body }); return true; }, ...(cache ? { cache } : {}),
     permitted: ({ authn, projectId, mode }) => {
       calls.push({ user: authn.user.id, projectId, mode });
       const project = projectId ? projects[authn.user.id][projectId] : null;
       if (projectId && !project) return null;
-      return { project, boxes: [{ id: 'core', owner: authn.user.id, mode }] };
+      return { project, boxes: [{ id: 'core', owner: authn.user.id, mode, policy: mode0 }] };
     },
   });
   const get = (user, query = '') => routes({ method: 'GET' }, {}, { path: '/api/toolboxes/permitted', authn: { user }, url: new URL(`http://x/api/toolboxes/permitted${query}`) });
-  return { get, sent, calls };
+  return { get, sent, calls, setPolicy: (v) => { mode0 = v; } };
 }
 const A = { id: 'u-a', role: 'member' }, B = { id: 'u-b', role: 'admin' };
 
@@ -115,4 +116,17 @@ test('an unknown mode is refused', async () => {
   const f = permittedFixture();
   await f.get(A, '?mode=code');
   assert.equal(f.sent[0].status, 400);
+});
+
+test('#796: clearing the shared cache (what a policy or toolbox save does) shows the new permission at once', async () => {
+  const cache = require('../toolboxes-permitted.cjs').createTtlCache({ ttlMs: 30000 });
+  const f = permittedFixture({ cache });
+  await f.get(A, '?projectId=pa&mode=chat');
+  f.setPolicy('block');
+  await f.get(A, '?projectId=pa&mode=chat');
+  assert.equal(f.sent[1].body.boxes[0].policy, 'ask', 'without invalidation the old view is served for the TTL');
+  cache.clear();
+  await f.get(A, '?projectId=pa&mode=chat');
+  assert.equal(f.sent[2].body.boxes[0].policy, 'block');
+  assert.equal(f.calls.length, 2);
 });

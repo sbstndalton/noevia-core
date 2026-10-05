@@ -10,7 +10,7 @@
 // Nextcloud has no connect button of its own: its tools use the account's storage connection
 // (Settings → Diary & storage), which is where it is connected and disconnected. This page says
 // whether that credential can be used, and owns what each of its tools may do.
-function createConnectorRoutes({ accounts, driveTools, policy, offsite, isWrite, json, readBody, nextcloud = null }) {
+function createConnectorRoutes({ accounts, driveTools, policy, offsite, isWrite, json, readBody, nextcloud = null, onPolicyChange = () => {} }) {
   function view(user) {
     const { drive, backup } = accounts.forUser(user);
     const s = drive.state();
@@ -46,6 +46,7 @@ function createConnectorRoutes({ accounts, driveTools, policy, offsite, isWrite,
         const body = await readBody(req);
         const offered = new Set(nextcloud.tools());
         policy.set(user.id, [].concat(body.tools || []).filter((t) => offered.has(t)), body.mode, isWrite);
+        onPolicyChange();
         return send(200, nextcloudView(user));
       }
       const action = path.slice('/api/connectors/gdrive/'.length);
@@ -60,6 +61,7 @@ function createConnectorRoutes({ accounts, driveTools, policy, offsite, isWrite,
         const body = await readBody(req);
         const tools = [].concat(body.tools || []).filter((t) => driveTools.names.has(t));
         policy.set(user.id, tools, body.mode, isWrite);
+        onPolicyChange();
         return send(200, view(user));
       }
       if (action === 'backup-copy' && req.method === 'PUT') {

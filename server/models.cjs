@@ -28,12 +28,27 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
   // Model files that appear in the models folder get safe defaults on their own (roadmap C3).
   // Needs the model management service; the engine's own preset file is edited through it.
   // Last model-folder scan, served instantly by the model-manager proxy (see there).
-  const modelScanCache = new Map();
+  // Every clear() starts a new generation. A scan that was requested before a clear (a delete,
+  // a preset write...) and resolves after it describes files that may no longer exist, so its
+  // result is discarded instead of resurrecting a deleted model in the cached list (#796).
+  const modelScanCache = (() => {
+    const entries = new Map();
+    let generation = 0;
+    return {
+      get: (key) => entries.get(key),
+      // `scanGeneration` is the generation read before the request was sent; omit it for a write
+      // that has no request in flight.
+      set(key, value, scanGeneration = generation) { if (scanGeneration === generation) entries.set(key, value); return this; },
+      clear() { generation++; entries.clear(); },
+      generation: () => generation,
+    };
+  })();
   let modelScanInflight = null;
   function refreshModelScan() {
     if (modelScanInflight || !env.MODEL_LOADER_URL) return;
+    const generation = modelScanCache.generation();
     modelScanInflight = fetchJson(`${env.MODEL_LOADER_URL.replace(/\/+$/, '')}/api/v1/models`, { method: 'GET', headers: { 'Content-Type': 'application/json', ...(env.MODEL_LOADER_TOKEN ? { 'X-Model-Loader-Token': env.MODEL_LOADER_TOKEN } : {}) } })
-      .then((r) => { if (r?.ok && r.body && typeof r.body === 'object') modelScanCache.set('models', { at: Date.now(), body: r.body }); })
+      .then((r) => { if (r?.ok && r.body && typeof r.body === 'object') modelScanCache.set('models', { at: Date.now(), body: r.body }, generation); })
       .catch(() => undefined).finally(() => { modelScanInflight = null; });
   }
 
@@ -160,9 +175,10 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
   async function folderScanFiles() {
     let files = modelScanCache.get('models')?.body?.models;
     if (!Array.isArray(files) && env.MODEL_LOADER_URL) {
+      const generation = modelScanCache.generation(); // a delete while this scan is in flight must win
       const fresh = await fetchJson(`${env.MODEL_LOADER_URL.replace(/\/+$/, '')}/api/v1/models`, { method: 'GET', headers: { 'Content-Type': 'application/json', ...(env.MODEL_LOADER_TOKEN ? { 'X-Model-Loader-Token': env.MODEL_LOADER_TOKEN } : {}) } }, 8000).catch(() => null);
       if (fresh?.ok && fresh.body && typeof fresh.body === 'object') {
-        modelScanCache.set('models', { at: Date.now(), body: fresh.body });
+        modelScanCache.set('models', { at: Date.now(), body: fresh.body }, generation);
         files = fresh.body.models;
       }
     }

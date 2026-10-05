@@ -7,7 +7,7 @@ const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
 const { createDiaryRoutes } = require('./diary.cjs');
 
-function fixture({ diaryOn = true, limited = false, connectorLimited = false, admin = false, reply, clientAddress } = {}) {
+function fixture({ diaryOn = true, limited = false, connectorLimited = false, admin = false, reply, clientAddress, addressesTrusted, rateLimitedKeys } = {}) {
   const sent = [], fetched = [], audits = [], headers = [];
   const rateKeys = [];
   const credentials = [{ id: 'a'.repeat(32), name: 'Claude Diary' }];
@@ -20,8 +20,8 @@ function fixture({ diaryOn = true, limited = false, connectorLimited = false, ad
     authService: { diaryEnabled: () => diaryOn, audit: (...args) => audits.push(args) },
     currentWorkspace: () => ({ userId: 'u1', dir: '/nowhere' }),
     rateLimited: () => limited,
-    connectorRate: { rateLimited: (key) => { rateKeys.push(key); return connectorLimited; } },
-    clientAddress,
+    connectorRate: { rateLimited: (key, limit) => { rateKeys.push(key); return rateLimitedKeys ? rateLimitedKeys.has(key) : connectorLimited; } },
+    clientAddress, addressesTrusted,
     diaryConnectors: {
       verify: (token) => (token === 'good' ? { id: credentials[0].id, userId: 'u1' } : null),
       list: () => credentials, create: (userId, name) => ({ id: 'b'.repeat(32), name, userId }), revoke: (userId, id) => id === credentials[0].id,
@@ -56,11 +56,24 @@ test('the connector endpoint is POST-only, refuses browsers, rate-limits and che
   assert.deepEqual(limited.sent.pop(), { status: 429, body: { error: 'Try later' } });
 });
 
-test('the connector rate limit key comes from the injected clientAddress, not the raw socket', async () => {
-  const f = fixture({ clientAddress: (req) => 'proxy-resolved-ip' });
+test('#796: the connector rate limit is per credential; unknown tokens use their own bucket and cannot lock out a connector', async () => {
+  // Shared tunnel address: a flooded invalid bucket must not touch the good credential's.
+  const f = fixture({ clientAddress: () => 'tunnel', rateLimitedKeys: new Set(['diary-connector:invalid']) });
+  await f.call('connector', 'POST', '/api/diary-connector', {}, { reqHeaders: { authorization: 'Bearer nope' } });
+  assert.deepEqual(f.sent.pop(), { status: 429, body: { error: 'Try later' } });
   await f.call('connector', 'POST', '/api/diary-connector', { action: 'list', path: 'Notes' }, { reqHeaders: { authorization: 'Bearer good' } });
-  assert.ok(f.rateKeys.some((k) => k === 'diary-connector:proxy-resolved-ip'));
-  assert.ok(!f.rateKeys.some((k) => k.includes('10.0.0.2')));
+  assert.equal(f.sent.pop().status, 200, 'a working connector is unaffected by the flood of bad tokens');
+  assert.deepEqual(f.rateKeys, ['diary-connector:invalid', 'diary-connector:credential:' + 'a'.repeat(32)]);
+  assert.ok(!f.rateKeys.some((k) => k.includes('tunnel')), 'the shared address is never a bucket key');
+  // A connector over its own budget is limited, and only that one.
+  const g = fixture({ rateLimitedKeys: new Set(['diary-connector:credential:' + 'a'.repeat(32)]) });
+  await g.call('connector', 'POST', '/api/diary-connector', {}, { reqHeaders: { authorization: 'Bearer good' } });
+  assert.deepEqual(g.sent.pop(), { status: 429, body: { error: 'Try later' } });
+  // The address joins the invalid bucket only when TRUST_PROXY makes it a real client address.
+  const t = fixture({ clientAddress: () => 'proxy-resolved-ip', addressesTrusted: true });
+  await t.call('connector', 'POST', '/api/diary-connector', {}, { reqHeaders: {} });
+  assert.deepEqual(t.rateKeys, ['diary-connector:invalid:proxy-resolved-ip']);
+  assert.equal(t.sent.pop().status, 401);
 });
 
 test('a verified connector write is forwarded and audited with its path and size', async () => {

@@ -380,6 +380,21 @@ const fileKey = (projectId, fileName, userId) => JSON.stringify([userId || null,
 // re-index is requested. Searches drop hits whose chunk version differs, so a chat that runs
 // while a newer version waits in the queue (or is mid-embed) never reads the old text (#122).
 const fileVersions = new Map(); // key -> version hash
+// Called when a file's queue has drained: nothing is running or waiting for it, so the generation
+// counter has no run left to supersede and, once the newest version is safely in the index, no
+// search needs the version to filter by. Without this both maps keep a key for every file ever
+// indexed (#796). The version stays when it is still doing work: after a delete that could not drop
+// the rows (null), or an index run that threw part-way and may have left the previous version's chunks.
+function pruneFileState(key, outcome) {
+  fileGenerations.delete(key);
+  if (fileVersions.get(key) === null) return;
+  if (outcome?.failed) return;
+  // `rag-unavailable` is also what a transient open error (disk full, EACCES, SQLITE_BUSY) returns:
+  // the index may still hold the previous version's chunks, so the wanted version must keep
+  // filtering them. Only when the deps themselves are missing is there no index to protect.
+  if (outcome?.ok === false && ragAvailable()) return;
+  fileVersions.delete(key);
+}
 const bumpGeneration = (key) => { const g = (fileGenerations.get(key) || 0) + 1; fileGenerations.set(key, g); return g; };
 
 async function embedBatchAndStore(index, rows, isCurrent = () => true) {
@@ -434,9 +449,13 @@ function indexProjectFile(projectId, fileName, text, userId) {
     .catch(() => {})
     .then(() => indexProjectFileNow(projectId, fileName, text, userId,
       () => fileGenerations.get(key) === generation && (!userId || userActive(userId)), version));
-  const tail = run.catch(() => {});
+  const tail = run.catch(() => ({ ok: false, failed: true }));
   fileQueues.set(key, tail);
-  tail.then(() => { if (fileQueues.get(key) === tail) fileQueues.delete(key); });
+  tail.then((outcome) => {
+    if (fileQueues.get(key) !== tail) return; // a newer run is queued behind this one
+    fileQueues.delete(key);
+    pruneFileState(key, outcome);
+  });
   return run;
 }
 
@@ -493,10 +512,22 @@ function deleteProjectFile(projectId, fileName, userId) {
   // remaining chunk of this file is filtered out of search.
   fileVersions.set(key, null);
   const index = openIndex(projectId, userId);
-  if (!index) return;
+  if (!index) {
+    // Without the deps there is no index to read, so no chunk can need filtering. With them, the
+    // open failed transiently (disk full, EACCES, SQLITE_BUSY) and the rows were NOT dropped: the
+    // null version must stay so they remain filtered out of search.
+    if (!ragAvailable()) {
+      fileVersions.delete(key);
+      if (!fileQueues.has(key)) fileGenerations.delete(key);
+    }
+    return;
+  }
   try {
     index.db.transaction(() => dropFileRows(index, fileName))();
     if (fileVersions.get(key) === null) fileVersions.delete(key);
+    // With no run queued the delete's generation bump has nothing left to supersede; a queued
+    // run still needs it to see that it is stale, and its drain prunes the key.
+    if (!fileQueues.has(key)) fileGenerations.delete(key);
   } finally {
     index.db.close();
   }
@@ -591,4 +622,7 @@ async function filesContext(projectId, files, query, userId, onSources) {
 // of the wrong dimensionality scores silently rather than failing.
 function embedModel() { return EMBED_MODEL; }
 
-module.exports = { init, indexProjectFile, deleteProjectFile, searchProject, filesContext, chunkText, ragAvailable, retrievalStatus, embed, embedModel, rerankPool };
+// How many per-file entries the process is tracking; for tests and diagnostics.
+const trackedFileState = () => ({ queues: fileQueues.size, generations: fileGenerations.size, versions: fileVersions.size });
+
+module.exports = { init, trackedFileState, indexProjectFile, deleteProjectFile, searchProject, filesContext, chunkText, ragAvailable, retrievalStatus, embed, embedModel, rerankPool };

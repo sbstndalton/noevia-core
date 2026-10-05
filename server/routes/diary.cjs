@@ -26,8 +26,9 @@ const PASS = Symbol('unhandled');
  * @param {{ rateLimited: (key:string, limit:number, windowMs:number) => boolean }} deps.connectorRate
  * @param {object} deps.diaryConnectors   diary-connectors.cjs credentials (verify, list, create, revoke)
  * @param {object} deps.diary             diary.cjs: diaryHeaders, corpusSource, connectorFiles
+ * @param {boolean} [deps.addressesTrusted]  TRUST_PROXY: only then is a client address a real, per-client key
  */
-function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, authService, currentWorkspace, rateLimited, connectorRate, diaryConnectors, diary, clientAddress = (req) => req.socket?.remoteAddress }) {
+function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, authService, currentWorkspace, rateLimited, connectorRate, diaryConnectors, diary, clientAddress = (req) => req.socket?.remoteAddress, addressesTrusted = false }) {
   const { diaryHeaders, corpusSource, connectorFiles } = diary;
   // Older fakes pass only diaryHeaders; fall back to a single send without the 428 retry.
   const diaryFetchJson = diary.diaryFetchJson || ((url, { method = 'GET', body } = {}, timeoutMs) => fetchJson(url, { method, headers: diaryHeaders(method, url, { body }), body }, timeoutMs));
@@ -37,10 +38,17 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
       res.setHeader('Cache-Control','no-store');
       if(req.method!=='POST')return json(res,405,{error:'POST required'});
       if(req.headers.origin)return json(res,403,{error:'Use the authenticated connector client'});
-      if(connectorRate.rateLimited('diary-connector:'+String(clientAddress(req)||'unknown'),120,60000))return json(res,429,{error:'Try later'});
+      // Behind the tunnel with TRUST_PROXY off every client shares one address, so the address alone
+      // is no bucket key (#796, like device-auth #555 F1): a verified credential is charged to
+      // itself, and unknown or malformed ones to a separate bucket (per address only when the
+      // address is real) that can never lock out a working connector.
       const token=String(req.headers.authorization||'').replace(/^Bearer /,'');
       const identity=diaryConnectors.verify(token);
-      if(!identity)return json(res,401,{error:'Diary connector credential required'});
+      if(!identity){
+        if(connectorRate.rateLimited(addressesTrusted?'diary-connector:invalid:'+String(clientAddress(req)||'unknown'):'diary-connector:invalid',300,60000))return json(res,429,{error:'Try later'});
+        return json(res,401,{error:'Diary connector credential required'});
+      }
+      if(connectorRate.rateLimited('diary-connector:credential:'+identity.id,120,60000))return json(res,429,{error:'Try later'});
       const body=await readJson(req,4*1024*1024);
       const result=await require('../diary-connectors.cjs').operate(identity,body,connectorFiles,()=>!!diaryConnectors.verify(token));
       if(body.action==='write')authService.audit('diary-connector.write',identity.userId,identity.userId,{credentialId:identity.id,path:body.path,bytes:Buffer.byteLength(body.content)});

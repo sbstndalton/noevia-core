@@ -250,10 +250,13 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
     if (lifecycleEvent && authority !== LIFECYCLE_AUTHORITY) throw Object.assign(Error('Task lifecycle events are server-only'), { status: 403 });
     const current = events(id);
     if (!current.length && type !== 'job.created') throw Object.assign(Error('No such job'), { status: 404 });
-    // One exception: a partial result the user explicitly saves after a cancel is recorded on the
-    // cancelled job (spec-deep-research §4 — never saved automatically).
+    // Two exceptions: a partial result the user explicitly saves after a cancel is recorded on the
+    // cancelled job (spec-deep-research §4 — never saved automatically), and so is the retry save of
+    // a research report whose first write failed (the job is `failed` but still holds its finished report).
     const finished = current.length ? derive(current) : null;
-    if (finished && TERMINAL.has(finished.status) && !(type === 'artifact.created' && finished.status === 'cancelled')) throw Object.assign(Error('Job already finished'), { status: 409 });
+    const lateArtifact = type === 'artifact.created' && finished
+      && (finished.status === 'cancelled' || (finished.status === 'failed' && finished.kind === 'deep_research' && typeof finished.result?.markdown === 'string' && Array.isArray(finished.result?.sources)));
+    if (finished && TERMINAL.has(finished.status) && !lateArtifact) throw Object.assign(Error('Job already finished'), { status: 409 });
     if (type === 'assistant.output') {
       if (finished?.kind !== 'code') throw Error('Assistant output belongs to Code jobs');
       if (current.filter((row) => row.type === type).length >= MAX_ASSISTANT_OUTPUT_EVENTS) throw Error('Assistant output event limit reached');

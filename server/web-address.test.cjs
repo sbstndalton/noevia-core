@@ -140,3 +140,18 @@ test('a pinned WEBAUTHN_RP_ID stops applying once the address moves to a name it
   assert.equal(parent.rpId, 'example.test', 'a parent-domain pin that fits still applies');
   parent.db.close();
 });
+
+test('#796: a JSON body that is not an object is a 400, never a TypeError', async () => {
+  const auth = createAuth({ dataDir: temp(), publicOrigin: 'https://cowork.example.test' });
+  const out = {};
+  const json = (res, status, body) => { out.status = status; out.body = body; };
+  const admin = { user: { id: 'a', role: 'admin' } };
+  for (const body of [null, 7, 'text', [1]]) {
+    out.status = undefined;
+    const handled = await createWebAddressRoutes({ auth, json, readBody: async () => body, fetchImpl: async () => { throw Error('must not probe'); } })({ method: 'POST' }, {}, { path: '/api/admin/web-address', authn: admin });
+    assert.equal(handled, true);
+    assert.equal(out.status, 400, JSON.stringify(body));
+    assert.match(out.body.error, /full address/);
+  }
+  assert.equal(auth.origin, 'https://cowork.example.test', 'nothing was saved');
+});

@@ -1,5 +1,6 @@
 'use strict';
 const crypto = require('node:crypto');
+const { isJsonObject } = require('../http.cjs');
 const previewKey = crypto.randomBytes(32);
 const PREVIEW_TTL_MS = 5 * 60 * 1000;
 // MCP servers that were added from the Plugins page, and each account's own sign-in or key.
@@ -21,6 +22,13 @@ const PREVIEW_TTL_MS = 5 * 60 * 1000;
 // `syncDirectoryServers`), never a copy.
 function createMcpDirectoryRoutes({ json, readJson, auth, servers: MCP_SERVERS, mcpState, directoryMcp, mcpOAuth, discoverOneServer, discoverMcpTools, probeMcpAuth, syncDirectoryServers, directoryUrlAllowed }) {
   const reply = (res, code, body) => (json(res, code, body), true);
+  // A body that parses but is not an object (null, a number, an array) is the client's mistake: it
+  // takes the same 400 as unparseable JSON instead of a TypeError further down (#796).
+  const readObject = async (req) => {
+    const body = await readJson(req);
+    if (!isJsonObject(body)) throw Object.assign(new SyntaxError('request body must be a JSON object'), { status: 400 });
+    return body;
+  };
   const catalog = (tools) => [...tools].map((entry) => entry.tool || entry).map((tool) => tool.function).sort((a, b) => String(a?.name).localeCompare(String(b?.name)));
   const previewSignature = (actor, form, catalogValue, expires) => crypto.createHmac('sha256', previewKey)
     .update(JSON.stringify([actor, form, catalogValue, expires])).digest('hex');
@@ -44,7 +52,7 @@ function createMcpDirectoryRoutes({ json, readJson, auth, servers: MCP_SERVERS, 
     if (authn && userKey && req.method === 'PUT') {
       const row = directoryMcp.list().find((s) => s.id === userKey[1] && s.personal);
       if (!row) return reply(res, 404, { error: 'No such server.' });
-      let body; try { body = await readJson(req); } catch { return reply(res, 400, { error: 'invalid JSON' }); }
+      let body; try { body = await readObject(req); } catch { return reply(res, 400, { error: 'invalid JSON' }); }
       let pendingHeaders;
       try { pendingHeaders = require('../directory-mcp.cjs').checkHeaderValues(row.declaredHeaders, body?.headers || {}); } catch (e) { return reply(res, e.status || 400, { error: e.message }); }
       try { await discoverOneServer({ id: row.id, url: row.url, auth: 'directory', directory: true, pendingHeaders }); }
@@ -95,7 +103,7 @@ function createMcpDirectoryRoutes({ json, readJson, auth, servers: MCP_SERVERS, 
       });
       if (p === '/api/admin/mcp-directory' && req.method === 'GET') return reply(res, 200, { servers: describe() });
       if (p === '/api/admin/mcp-directory' && req.method === 'POST') {
-        let body; try { body = await readJson(req); } catch { return reply(res, 400, { error: 'invalid JSON' }); }
+        let body; try { body = await readObject(req); } catch { return reply(res, 400, { error: 'invalid JSON' }); }
         let item;
         try { item = await require('./plugin-directory.cjs').findRegistryServer(body?.registryName); } catch (e) { return reply(res, e.status || 502, { error: e.message }); }
         if (!item) return reply(res, 404, { error: 'That server is not in the MCP registry.' });
@@ -136,7 +144,7 @@ function createMcpDirectoryRoutes({ json, readJson, auth, servers: MCP_SERVERS, 
       if (keys && req.method === 'PUT') {
         const row = directoryMcp.list().find((s) => s.id === keys[1]);
         if (!row) return reply(res, 404, { error: 'No such server.' });
-        let body; try { body = await readJson(req); } catch { return reply(res, 400, { error: 'invalid JSON' }); }
+        let body; try { body = await readObject(req); } catch { return reply(res, 400, { error: 'invalid JSON' }); }
         let item;
         try { item = await require('./plugin-directory.cjs').findRegistryServer(row.registryName); } catch (e) { return reply(res, e.status || 502, { error: e.message }); }
         const declared = item?.headers || [];
@@ -153,7 +161,7 @@ function createMcpDirectoryRoutes({ json, readJson, auth, servers: MCP_SERVERS, 
       // server: hosted https, public address, must answer, its own toolbox, every tool asks.
       if ((p === '/api/admin/mcp-directory/custom' || p === '/api/admin/mcp-directory/custom/preview') && req.method === 'POST') {
         const preview = p.endsWith('/preview');
-        let body; try { body = await readJson(req); } catch { return reply(res, 400, { error: 'invalid JSON' }); }
+        let body; try { body = await readObject(req); } catch { return reply(res, 400, { error: 'invalid JSON' }); }
         const title = String(body?.title || '').trim().slice(0, 80);
         const url = String(body?.url || '').trim();
         if (!title) return reply(res, 400, { error: 'Give the server a name.' });
@@ -225,7 +233,7 @@ function createMcpDirectoryRoutes({ json, readJson, auth, servers: MCP_SERVERS, 
       if (appRoute && req.method === 'PUT') {
         const sv = MCP_SERVERS.find((x) => x.id === appRoute[1] && x.auth === 'oauth');
         if (!sv) return reply(res, 404, { error: 'No such sign-in server.' });
-        let body; try { body = await readJson(req); } catch { return reply(res, 400, { error: 'invalid JSON' }); }
+        let body; try { body = await readObject(req); } catch { return reply(res, 400, { error: 'invalid JSON' }); }
         try {
           const challenge = (await probeMcpAuth(sv.url)).challenge;
           await mcpOAuth.setClient({ serverId: sv.id, serverUrl: sv.url, clientId: body?.clientId, clientSecret: body?.clientSecret, challenge });

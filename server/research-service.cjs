@@ -33,6 +33,10 @@ function reportFiles(result, when, taken = () => false) {
   ];
 }
 
+// A failed job's result is whatever the failing code attached; only a finished report (markdown and
+// its sources) can be written out again.
+const hasReport = (r) => typeof r.markdown === 'string' && Array.isArray(r.sources);
+
 /** Public view of a job: no excerpts, bounded markdown. */
 function view(job) {
   if (!job) return null;
@@ -41,7 +45,9 @@ function view(job) {
     checkpoint: job.checkpoint, artifacts: job.artifacts.map((a) => a.name),
     result: r ? { question: r.question, partial: r.partial, sections: r.sections, questions: r.questions, citationValidity: r.citationValidity,
       citations: r.citations, claims: r.claims || null, webCalls: r.webCalls, markdown: String(r.markdown || '').slice(0, 200000), sources: (r.sources || []).length } : null,
-    canSavePartial: job.status === 'cancelled' && !!r && r.sections > 0 && !job.artifacts.length };
+    // A cancelled job with finished sections, or a failed job that still holds its report (the save
+    // threw), until the sources file, which is always written last, has been saved.
+    canSavePartial: !!r && ((job.status === 'cancelled' && r.sections > 0) || (job.status === 'failed' && hasReport(r))) && !job.artifacts.some((a) => a.name.endsWith('.sources.json')) };
 }
 
 /**
@@ -65,23 +71,38 @@ function createResearchService({ tools, saveFile, getProject, now = Date.now }) 
     if (!job || job.kind !== 'deep_research' || job.projectId !== project.id) throw fail(404, 'No such research job.');
     return job;
   };
+  // Jobs whose report is being written right now. The artifact is recorded only after its file is
+  // written (a failed write must not leave an artifact that does not exist), so this in-memory guard,
+  // not the journal, is what stops two concurrent callers (natural finish, a double-clicked or
+  // retried save) from writing the same report twice.
+  const saving = new Set();
   async function save(workspace, project, id, result) {
     const jobs = storeFor(workspace);
-    // The job holds the `project` object from when it started, minutes before the report is
-    // ready; PROJECTS may have replaced or deleted it meanwhile. Look it up by id at save time
-    // instead of trusting the stale reference, so a rename/edit elsewhere doesn't lose the report.
-    const current = getProject ? getProject(project.id) : project;
-    if (!current) throw fail(410, 'The project was deleted while this research was running; the report could not be saved.');
-    const names = new Set((current.files || []).map((f) => String(f.name).split('/').pop()));
-    for (const file of reportFiles(result, now(), (name) => names.has(name))) {
-      // A natural finish and an explicit savePartial (or a retried request) can race to save
-      // the same job. jobs.append/get are synchronous, so reserving the artifact name here,
-      // before the async write below, makes the second concurrent caller see it already
-      // recorded and skip its write instead of saving the same report twice.
-      if (jobs.get(id).artifacts.some((a) => a.name === file.name)) continue;
-      jobs.append(id, 'artifact.created', { name: file.name, bytes: Buffer.byteLength(file.text) });
-      await saveFile(current, file.name, file.text);
-    }
+    if (saving.has(id)) throw fail(409, 'This report is already being saved.');
+    saving.add(id);
+    try {
+      // The job holds the `project` object from when it started, minutes before the report is
+      // ready; PROJECTS may have replaced or deleted it meanwhile. Look it up by id at save time
+      // instead of trusting the stale reference, so a rename/edit elsewhere doesn't lose the report.
+      const current = getProject ? getProject(project.id) : project;
+      if (!current) throw fail(410, 'The project was deleted while this research was running; the report could not be saved.');
+      const names = new Set((current.files || []).map((f) => String(f.name).split('/').pop()));
+      const files = reportFiles(result, now(), (name) => names.has(name));
+      // A retry after a partial failure keeps the names the first attempt already used, so the
+      // file that did get written is not duplicated as "(2)".
+      const first = jobs.get(id).artifacts.find((a) => a.name.endsWith('.md'));
+      if (first) { const base = first.name.slice(0, -3); files[0].name = `${base}.md`; files[1].name = `${base}.sources.json`; }
+      for (const file of files) {
+        if (jobs.get(id).artifacts.some((a) => a.name === file.name)) continue;
+        await saveFile(current, file.name, file.text);
+        jobs.append(id, 'artifact.created', { name: file.name, bytes: Buffer.byteLength(file.text) });
+      }
+    } catch (error) {
+      // Hand the finished report back so the failed job keeps it and a retry save can write it.
+      if (!error.status) error.publicMessage = 'The report was finished but could not be saved. Use the save button to try again.';
+      error.result = result;
+      throw error;
+    } finally { saving.delete(id); }
   }
   return {
     budget: BUDGET,
@@ -117,7 +138,7 @@ function createResearchService({ tools, saveFile, getProject, now = Date.now }) 
     },
     async savePartial(workspace, project, id) {
       const job = owned(workspace, project, id);
-      if (!view(job).canSavePartial) throw fail(409, job.artifacts.length ? 'This report is already saved.' : 'Only a cancelled job with finished sections can be saved.');
+      if (!view(job).canSavePartial) throw fail(409, job.artifacts.length ? 'This report is already saved.' : 'Only a cancelled job with finished sections, or a report that failed to save, can be saved.');
       await save(workspace, project, id, job.result);
       return view(storeFor(workspace).get(id));
     },

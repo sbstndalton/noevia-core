@@ -151,6 +151,7 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
       } catch {
         return json(res, 400, { error: 'invalid JSON' });
       }
+      if (!require('../http.cjs').isJsonObject(body)) return json(res, 400, { error: 'request body must be a JSON object' });
       const label = String(body.label || '').trim().slice(0, 80);
       let baseUrl = String(body.baseUrl || '').trim().replace(/\/+$/, '');
       const apiKey = String(body.apiKey || '').trim();

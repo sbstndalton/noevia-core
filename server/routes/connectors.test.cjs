@@ -8,7 +8,7 @@ const { createToolboxes } = require('../toolboxes.cjs');
 const WRITES = new Set(['nc_notes_create', 'drive_create_file']);
 const isWrite = (name) => WRITES.has(name);
 
-function harness({ state, modes = {} } = {}) {
+function harness({ state, modes = {}, onPolicyChange } = {}) {
   const set = [];
   const policy = {
     mode: (_u, tool, write) => (modes[tool] ? modes[tool] : write ? 'ask' : 'allow'),
@@ -17,7 +17,7 @@ function harness({ state, modes = {} } = {}) {
   const routes = createConnectorRoutes({
     accounts: { forUser: () => ({ drive: { state: () => ({ configured: false, state: 'not-configured' }) }, backup: null }) },
     driveTools: { names: new Set(['drive_create_file']), labels: { drive_create_file: 'Create file' } },
-    policy, offsite: { status: () => null }, isWrite,
+    policy, offsite: { status: () => null }, isWrite, onPolicyChange,
     json: (res, status, body) => { res.status = status; res.body = body; },
     readBody: async (req) => req.body,
     nextcloud: {
@@ -96,4 +96,24 @@ test('Drive connector reports four reads and three writes with the real classifi
   assert.equal(tools.find((t) => t.name === 'drive_read_file').mode, 'ask');
   assert.equal(tools.find((t) => t.name === 'drive_list_recent').mode, 'block');
   assert.equal(tools.find((t) => t.name === 'drive_trash_file').mode, 'ask');
+});
+
+test('#796: a saved tool permission clears the cached permitted-tools view; a refused one does not', async () => {
+  let cleared = 0;
+  const { routes } = harness({ state: { configured: true, state: 'connected', account: 'sam' }, onPolicyChange: () => { cleared += 1; } });
+  await run(routes, { method: 'PUT', body: { tools: ['nc_notes_search'], mode: 'block' } }, '/api/connectors/nextcloud/policy');
+  assert.equal(cleared, 1, 'the Nextcloud policy save clears it');
+  await run(routes, { method: 'PUT', body: { tools: ['drive_create_file'], mode: 'block' } }, '/api/connectors/gdrive/policy');
+  assert.equal(cleared, 2, 'the Drive policy save clears it');
+  await run(routes, { method: 'GET' }, '/api/connectors');
+  assert.equal(cleared, 2, 'reads leave it alone');
+  const refusing = createConnectorRoutes({
+    accounts: { forUser: () => ({ drive: { state: () => ({ configured: false, state: 'not-configured' }) }, backup: null }) },
+    driveTools: { names: new Set(['drive_create_file']), labels: {} }, offsite: { status: () => null }, isWrite,
+    policy: { mode: () => 'ask', set: () => { throw Object.assign(Error('no'), { status: 400 }); } },
+    onPolicyChange: () => { cleared += 1; }, json: (res, status, body) => { res.status = status; res.body = body; }, readBody: async (req) => req.body,
+  });
+  const refused = await run(refusing, { method: 'PUT', body: { tools: ['drive_create_file'], mode: 'allow' } }, '/api/connectors/gdrive/policy');
+  assert.equal(refused.status, 400);
+  assert.equal(cleared, 2, 'a refused save changed nothing, so nothing is cleared');
 });

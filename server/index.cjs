@@ -335,7 +335,11 @@ const {
   workspace: () => currentWorkspace(),
   executeMcp: (name, args, signal) => executeMcpToolCall(name, args, signal),
 });
+// The per-turn permitted-tools view is cached for 30 s; every write that changes what it shows
+// (a tool permission, a project's toolbox selection) clears it so the picker is never stale (#796).
+const permittedToolsCache = require('./toolboxes-permitted.cjs').createTtlCache({ ttlMs: 30000 });
 const connectorRoutes = require('./routes/connectors.cjs').createConnectorRoutes({
+  onPolicyChange: () => permittedToolsCache.clear(),
   accounts: driveAccounts, driveTools, policy: toolPolicy, offsite: offsiteBackup, isWrite: (name) => isWriteTool(name), json, readBody: (req) => readJson(req),
   // Nextcloud's tools ride on the account's storage connection, so this only reports what that
   // connection allows and owns the per-tool permissions.
@@ -836,6 +840,7 @@ const chatRoutes = require('./routes/chat.cjs').createChatRoutes({
 const projectRoutes = require('./routes/projects.cjs').createProjectRoutes({
   json, readBody, readJson, requestScope, dispatch: (req, res) => handleRequestScoped(req, res), currentWorkspace, authService, storageClient, documents, documentSources, rag, fs, path,
   reasoningEffort, projectAppearance, diaryExtras, PROJECTS, DEFAULT_TOOLBOXES, sanitizeToolboxes, allToolboxes, getProvider, ensureRolesLoaded, servedCatalogue, DEFAULT_PROVIDER_ID, store: projectStore,
+  onToolboxesChange: () => permittedToolsCache.clear(),
 });
 // The provider registry's routes: list, connect, test and remove (routes/providers.cjs), plus
 // Sign in with ChatGPT (chatgptOAuth, built beside mcpOAuth above) while features.chatgptOAuth is on.
@@ -855,6 +860,7 @@ const connectorRate = require('./auth.cjs').createRateLimiter();
 const diaryRoutes = require('./routes/diary.cjs').createDiaryRoutes({
   json, readBody, readJson, fetchJson, DIARY_BASE, authService, currentWorkspace, rateLimited: (userId) => llmRateLimited(userId), connectorRate, diaryConnectors, diary,
   clientAddress: (req) => require('./auth.cjs').clientAddress(req, process.env.TRUST_PROXY === 'true'),
+  addressesTrusted: process.env.TRUST_PROXY === 'true',
 });
 // Sign-in, the signed-in account and /api/admin/* (routes/auth.cjs). The open set is also the
 // router's own list of what a signed-out browser may call.
@@ -910,7 +916,7 @@ const readyRoutes = require('./routes/health.cjs').createReadyRoutes({
 });
 // GET /api/toolboxes: the picker view (routes/toolboxes.cjs). MCP state is read at call time.
 const toolboxRoutes = require('./routes/toolboxes.cjs').createToolboxRoutes({
-  discoverMcpTools: () => discoverMcpTools(), toolboxSummaries, connectedBoxes, json,
+  discoverMcpTools: () => discoverMcpTools(), toolboxSummaries, connectedBoxes, json, cache: permittedToolsCache,
   prefill: { targetMs: TOOL_PREFILL_TARGET_MS, stats: () => prefill.stats() },
   mcp: () => ({ enabled: mcpWiring.enabled(), state: mcpState, servers: MCP_SERVERS, manifest: MCP_TOOLBOX_MANIFEST }),
   // The per-turn catalogue (#237). getProject is scoped to the signed-in account's workspace.

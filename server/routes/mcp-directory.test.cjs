@@ -276,3 +276,15 @@ test('a concurrent delete during rediscovery still returns the drift 409', async
   assert.match(res.out.body.error, /not kept/);
   assert.ok(calls.includes('remove'));
 });
+
+test('#796: a body that is not a JSON object is a 400 on every admin directory write, not a TypeError', async () => {
+  const { routes, calls } = build();
+  for (const [method, path] of [['POST', '/api/admin/mcp-directory'], ['PUT', '/api/admin/mcp-directory/dir-a/keys'], ['POST', '/api/admin/mcp-directory/custom']]) {
+    for (const body of [null, 7, []]) {
+      const res = fakeRes();
+      assert.equal(await routes(req(method, body), res, { path, authn: admin }), true, `${method} ${path}`);
+      assert.deepEqual([res.out.code, res.out.body], [400, { error: 'invalid JSON' }], `${method} ${path} ${JSON.stringify(body)}`);
+    }
+  }
+  assert.deepEqual(calls, [], 'nothing was added or changed');
+});

@@ -51,6 +51,10 @@ test('registering validates, guards the origin for members and saves to the righ
   const f = fixture();
   await f.call('POST', '/api/providers', '{');
   assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'invalid JSON' } });
+  for (const body of ['null', '7', '[]']) {
+    await f.call('POST', '/api/providers', body);
+    assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'request body must be a JSON object' } }, `a ${body} body is the client's mistake (#796)`);
+  }
   await f.call('POST', '/api/providers', { label: 'x', baseUrl: 'https://approved.example', shared: true });
   assert.deepEqual(f.sent.pop(), { status: 403, body: { error: 'administrator required for shared providers' } });
   await f.call('POST', '/api/providers', { baseUrl: 'https://approved.example' });

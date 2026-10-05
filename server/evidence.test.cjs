@@ -209,3 +209,51 @@ test('the evidence log stays bounded and keeps the newest records per model, cat
     assert.ok(Object.keys(perKey).length >= 4, 'every identity keeps its evidence');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('#796: a log of ever more identities is capped globally, oldest identities first, with no rewrite on every append', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-evidence-global-'));
+  try {
+    // Each identity keeps only one record, so the per-key cap alone never shrinks this log.
+    const store = ev.createStore(dir, { maxBytes: 30_000, keepPerKey: 50, maxKeys: 40, maxRecords: 60 });
+    let rewrites = 0;
+    const realRename = fs.renameSync;
+    fs.renameSync = (...a) => { if (String(a[1]).endsWith('evidence.jsonl')) rewrites++; return realRename(...a); };
+    try {
+      for (let i = 0; i < 600; i++) store.append({ category: 'throughput', model: 'm', identityHash: 'id' + i, result: 'reported', value: { rate: i, note: 'x'.repeat(40) } });
+    } finally { fs.renameSync = realRename; }
+    const records = store.list();
+    const keys = new Set(records.map((r) => r.identityHash));
+    // The cap is enforced in batches: up to a quarter of maxRecords (15) may pile up before the next rewrite.
+    assert.ok(records.length <= 60 + 15, `${records.length} records kept`);
+    assert.ok(keys.size <= 60 + 15, `${keys.size} identities kept`);
+    assert.ok(fs.statSync(store.file).size <= 30_000, 'the log is back under its size budget');
+    assert.ok(keys.has('id599'), 'the newest identity is kept');
+    assert.ok(!keys.has('id0'), 'the oldest identity went first');
+    assert.deepEqual([...keys].map((k) => Number(k.slice(2))).sort((a, b) => a - b).slice(0, 1).map((n) => n > 500), [true], 'what remains is the newest run of identities');
+    assert.ok(rewrites < 600 / 5, `rewritten ${rewrites} times: compaction must leave headroom, not fire on every append`);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('#796: the global cap never empties the log: the newest identity survives even a tiny budget', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-evidence-global-min-'));
+  try {
+    const store = ev.createStore(dir, { maxBytes: 1, keepPerKey: 5, maxKeys: 1, maxRecords: 1 });
+    for (let i = 0; i < 4; i++) store.append({ category: 'vision', model: 'm', identityHash: 'id' + i, result: 'passed' });
+    assert.deepEqual(store.list().map((r) => r.identityHash), ['id3']);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('#796: the key cap drops the identities whose newest record is oldest, even when they were written first and touched last', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-evidence-keycap-'));
+  try {
+    const store = ev.createStore(dir, { maxBytes: 4_000, keepPerKey: 2, maxKeys: 2, maxRecords: 10_000 });
+    const add = (id) => store.append({ category: 'throughput', model: 'm', identityHash: id, result: 'reported', value: { rate: 1, note: 'y'.repeat(60) } });
+    add('old'); add('mid'); add('busy');
+    for (let i = 0; i < 12; i++) add('busy');
+    add('old'); // touched again: now newer than 'mid'
+    for (let i = 0; i < 40; i++) add('busy');
+    const keys = [...new Set(store.list().map((r) => r.identityHash))];
+    assert.ok(keys.includes('busy') && keys.includes('old'));
+    assert.ok(!keys.includes('mid'), 'the identity nobody touched since is the one that goes');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});

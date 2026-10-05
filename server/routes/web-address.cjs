@@ -3,6 +3,8 @@
 // GET  /api/instance                 -> { id } (public; lets a new address prove it reaches this server)
 // GET  /api/admin/web-address        -> current address, where it came from, earlier addresses
 // POST /api/admin/web-address        -> { origin, force? } check that it reaches this server, then save
+const { isJsonObject } = require('../http.cjs');
+
 function createWebAddressRoutes({ auth, json, readBody, fetchImpl = fetch, timeoutMs = 8000 }) {
   /** Asks the new address for its instance id. Same id = the name routes here. */
   async function reaches(origin) {
@@ -26,6 +28,8 @@ function createWebAddressRoutes({ auth, json, readBody, fetchImpl = fetch, timeo
     if (req.method === 'GET') return json(res, 200, view()), true;
     if (req.method !== 'POST') return json(res, 405, { error: 'method not allowed' }), true;
     const body = await readBody(req).catch(() => ({}));
+    // `null` (or a number, or an array) parses fine and used to throw on `body.origin`: a 500.
+    if (!isJsonObject(body)) return json(res, 400, { error: 'Enter a full address, such as https://noevia.example.com.' }), true;
     const next = String(body.origin || '').trim().replace(/\/+$/, '');
     let parsed; try { parsed = new URL(next); } catch { return json(res, 400, { error: 'Enter a full address, such as https://noevia.example.com.' }), true; }
     if (!body.force && parsed.origin !== auth.origin) {

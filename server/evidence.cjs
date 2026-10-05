@@ -33,8 +33,13 @@ function presetHash(options) {
 
 // Append-only in normal use. When the log passes maxBytes it is rewritten keeping the newest
 // keepPerKey records for each model/category/identity, so per-reply producers (MTP acceptance)
-// cannot grow it without bound while every identity keeps its latest evidence.
-function createStore(dir, { maxBytes = 1024 * 1024, keepPerKey = 50 } = {}) {
+// cannot grow it without bound while every identity keeps its latest evidence. The per-key cap
+// alone never expires a key, so a store that sees ever more identities (every preset edit or
+// artifact change is a new one) could stay over maxBytes forever and be rewritten and re-parsed
+// on every append; the rewrite therefore also caps the whole log at maxKeys identities and
+// maxRecords records, dropping the identities whose newest record is oldest first (#796), and
+// leaves headroom (a quarter of maxBytes) so the next appends do not trigger another rewrite.
+function createStore(dir, { maxBytes = 1024 * 1024, keepPerKey = 50, maxKeys = 200, maxRecords = 2000 } = {}) {
   const file = path.join(dir, 'evidence.jsonl');
   // A tiny sidecar, `{taskId: highestRevisionIssued}`, kept ONLY so a revision number is never
   // reissued: `evidence.jsonl` itself is bounded and compact() may drop the very record that
@@ -80,6 +85,9 @@ function createStore(dir, { maxBytes = 1024 * 1024, keepPerKey = 50 } = {}) {
     fs.writeFileSync(tmp, JSON.stringify(map), { mode: 0o600 });
     fs.renameSync(tmp, revisionsFile);
   }
+  // Records in the log, counted once per process and then kept up to date by append/compact, so the
+  // record cap is checked without parsing the file on every append.
+  let lines = null;
   function compact() {
     const records = list();
     const counts = new Map(), keep = new Array(records.length).fill(false);
@@ -88,9 +96,31 @@ function createStore(dir, { maxBytes = 1024 * 1024, keepPerKey = 50 } = {}) {
       const n = counts.get(key) || 0;
       if (n < keepPerKey) { keep[i] = true; counts.set(key, n + 1); }
     }
+    // Group what survives by identity, oldest-touched identity first, then drop whole identities
+    // until the global caps hold. The newest identity is never dropped.
+    const groups = new Map(); // key -> { last, records, bytes }, in order of each key's newest record
+    const keyOf = (r) => `${r.model}|${r.category}|${r.identityHash}`;
+    records.forEach((r, i) => {
+      if (!keep[i]) return;
+      const g = groups.get(keyOf(r)) || { last: i, count: 0, bytes: 0 };
+      g.last = i; g.count++; g.bytes += Buffer.byteLength(JSON.stringify(r)) + 1;
+      groups.set(keyOf(r), g);
+    });
+    const order = [...groups.entries()].sort((a, b) => a[1].last - b[1].last).map(([k]) => k);
+    let total = 0, bytes = 0;
+    for (const g of groups.values()) { total += g.count; bytes += g.bytes; }
+    const target = Math.floor(maxBytes * 0.75);
+    const dropped = new Set();
+    for (const key of order) {
+      if (groups.size - dropped.size <= 1) break;
+      if (groups.size - dropped.size <= maxKeys && total <= maxRecords && bytes <= target) break;
+      const g = groups.get(key);
+      dropped.add(key); total -= g.count; bytes -= g.bytes;
+    }
     const tmp = `${file}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, records.filter((_, i) => keep[i]).map((r) => JSON.stringify(r) + '\n').join(''), { mode: 0o600 });
+    fs.writeFileSync(tmp, records.filter((r, i) => keep[i] && !dropped.has(keyOf(r))).map((r) => JSON.stringify(r) + '\n').join(''), { mode: 0o600 });
     fs.renameSync(tmp, file);
+    lines = records.reduce((n, r, i) => n + (keep[i] && !dropped.has(keyOf(r)) ? 1 : 0), 0);
   }
   function list() {
     try { return fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean); }
@@ -136,7 +166,11 @@ function createStore(dir, { maxBytes = 1024 * 1024, keepPerKey = 50 } = {}) {
       revisions[entry.taskId] = entry.revision;
       try { saveRevisions(revisions); } catch { /* best-effort: the log fallback still holds */ }
     }
-    try { if (fs.statSync(file).size > maxBytes) compact(); } catch { /* compaction is best-effort */ }
+    try {
+      if (lines === null) lines = list().length; else lines++;
+      // A quarter of headroom over maxRecords, so the cap is enforced in batches, not per append.
+      if (lines > maxRecords + Math.ceil(maxRecords / 4) || fs.statSync(file).size > maxBytes) compact();
+    } catch { /* compaction is best-effort */ }
     return entry;
   }
   // Skip a record when the newest one for the same category and identity already says the same.
