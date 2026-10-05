@@ -22,4 +22,10 @@ function enabled(project, mode) {
   return (Array.isArray(project?.modes) && project.modes.length ? project.modes : ['chat']).includes(mode);
 }
 
-module.exports = { MODES, migrate, sanitize, enabled };
+// Where a chat may live (#810): a project with Chat mode that is not archived. A chat moved anywhere
+// else is hidden from the sidebar and every send is refused, so framing never offers or moves into one.
+function chatDestination(project) {
+  return !!project && typeof project === 'object' && project.archived !== true && enabled(project, 'chat');
+}
+
+module.exports = { MODES, migrate, sanitize, enabled, chatDestination };

@@ -71,13 +71,14 @@ function frameBlock(frame) {
  * What a frame kind asks of the tool gate, or null for no bias.
  *   prefer      gate rule kinds whose tools go first among the Stage 2 options (web search, then
  *               project/RAG search), when offered
- *   expectTool  the Stage 2 question says a tool is expected (still read-only, still confidence-bound)
+ *   hint        appended to the Stage 2 question (action: a tool is expected; still read-only, still
+ *               confidence-bound)
  *   noForce     the gate forces nothing for this message
  */
 function gateBias(frame) {
   switch (frame?.confirmed ? frame.kind : null) {
     case 'search': return { prefer: ['search', 'drive'], hint: 'The user framed this chat as a lookup.' };
-    case 'action': return { expectTool: true, hint: 'The user framed this chat as a request to get something done, so a tool is expected.' };
+    case 'action': return { hint: 'The user framed this chat as a request to get something done, so a tool is expected.' };
     case 'idea': return { noForce: true };
     default: return null; // question, code: nothing beyond the prompt block; never a mode switch
   }

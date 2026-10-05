@@ -231,6 +231,28 @@ test('scheduler: opt-out, a gone chat, a failed build and a switch-off mid-build
   assert.equal(st2.stored['u1/c1'], undefined);
 });
 
+test('scheduler: a chat deleted while its brain was being built gets no brain written back (#811)', async (t) => {
+  // Against the real store: the delete removes the brain file, then the in-flight build finishes.
+  const dir = tmp(t, 'noevia-brain-811-');
+  const chats = { c1: { id: 'c1', title: 'Shed', updatedAt: 10 } };
+  const deletedIds = new Set();
+  const store = { read: (_u, id) => readBrain(dir, id), write: (_u, id, r) => writeBrain(dir, id, r), remove: (_u, id) => removeBrain(dir, id) };
+  const deleteChat = (id) => { delete chats[id]; deletedIds.add(id); removeBrain(dir, id); };
+  const make = (onBuild) => createBrainScheduler({ enabled: () => true, chat: (_u, id) => chats[id] || null, readHistory: () => history,
+    deleted: () => deletedIds, store, builder: { build: async () => { onBuild(); return { ok: true, brain: good() }; } }, now: () => 99 });
+  const files = () => (fs.existsSync(path.join(dir, brainLib.BRAIN_DIR)) ? fs.readdirSync(path.join(dir, brainLib.BRAIN_DIR)) : []);
+  assert.equal(await make(() => deleteChat('c1')).run('u1', 'c1'), 'gone');
+  assert.deepEqual(files(), [], 'tombstoned mid-build: no brain file');
+  // Gone from the lists without a tombstone (a project purge in flight): nothing written either.
+  chats.c2 = { id: 'c2', title: 'Other', updatedAt: 10 };
+  assert.equal(await make(() => { delete chats.c2; }).run('u1', 'c2'), 'gone');
+  assert.deepEqual(files(), []);
+  // Control: no delete, the brain is written as before.
+  chats.c3 = { id: 'c3', title: 'Kept', updatedAt: 10 };
+  assert.equal(await make(() => {}).run('u1', 'c3'), 'built');
+  assert.equal(readBrain(dir, 'c3').brain.summary, good().summary);
+});
+
 // ── Vault note ───────────────────────────────────────────────────────────────────────────────
 const chat = { id: 'c-shed', title: 'Garden shed', createdAt: Date.UTC(2026, 0, 1), updatedAt: Date.UTC(2026, 0, 2), frame: { kind: 'idea', tags: ['garden'], links: [], confirmed: true, source: 'user' } };
 test('mirror note: with a brain, the five sections follow the frontmatter and brain_schema is 1', () => {
@@ -327,7 +349,7 @@ test('settings and flag: brainContextChars defaults to 2000 and is bounded; brai
 
 // ── handleChat: flag off is byte-identical; on, the block comes from the user's own data ─────
 const sse = (...frames) => ({ ok: true, status: 200, body: (async function* () { for (const f of frames) yield Buffer.from(`data: ${JSON.stringify(f)}\n\n`); })() });
-async function run(t, { framing = true, brainContext, chats, freeChats = [], reads }) {
+async function run(t, { framing = true, brainContext, chats, freeChats = [], reads, provider = null }) {
   const dir = tmp(t, 'noevia-brain-chat-');
   const res = new EventEmitter(); res.writeHead = () => {}; res.end = () => { res.writableEnded = true; res.emit('finish'); }; res.write = () => {};
   const bodies = [];
@@ -335,14 +357,14 @@ async function run(t, { framing = true, brainContext, chats, freeChats = [], rea
     if (!String(url).endsWith('/chat/completions')) return { ok: false, status: 404, json: async () => ({}), text: async () => '' };
     bodies.push(JSON.parse(init.body)); return sse({ choices: [{ delta: { content: 'ok' } }] });
   };
-  const project = { id: 'fixture-project', name: 'Fixture', model: 'answer-model', assets: [], toolboxes: [], chats };
+  const project = { id: 'fixture-project', name: 'Fixture', model: 'answer-model', assets: [], toolboxes: [], chats, ...(provider ? { provider: provider.id } : {}) };
   const { handleChat } = require('./chat.cjs').createChatHandler({
     modelManager: { enabled: true, health: async () => ({ ok: true, body: { all_models_loaded: [{ model_name: 'answer-model', loaded: true, recipe_options: { ctx_size: 32768 } }] } }) },
     reasoningEffort: require('./reasoning-effort.cjs'), authService: { audit() {}, diaryEnabled: () => false },
     crypto, path, fs, fetch, HISTORY_CAP: 20, DEFAULT_PROVIDER_ID: 'default', createToolExchange: require('./tool-exchange.cjs').createToolExchange,
     currentWorkspace: () => ({ userId: 'synthetic-user', dir, assetDir: () => '/synthetic-only' }),
     getProject: (id) => (id === 'fixture-project' ? project : null),
-    skillsIndexFor: () => [], getProvider: () => ({ id: 'default', baseUrl: 'http://fixture.invalid' }), providerHeaders: () => ({}), autoRoles: () => null,
+    skillsIndexFor: () => [], getProvider: (id) => (provider && id === provider.id ? provider : { id: 'default', baseUrl: 'http://fixture.invalid' }), providerHeaders: () => ({}), autoRoles: () => null,
     visionDescriptions: new Map(), visionProbe: require('./vision.cjs').createVisionProbe({ fetchImpl: fetch }),
     chatSkillRouter: { select: async () => ({ loaded: [] }) }, oauthServerIds: () => new Set(), accountReady: () => false,
     chatToolRouter: { select: async (ids) => ({ ids, routed: false }) }, DEFAULT_TOOLBOXES: [], CONNECTOR_BOXES: new Set(), connectedBoxes: () => [],
@@ -390,4 +412,19 @@ test('handleChat: brainContext on adds the linked chat\'s framed summary within 
   const small = await run(t, { chats: linkedChats(), brainContext: { enabled: () => true, maxChars: () => 160, chats: linkedChats, read: (id) => brains[id] } });
   const smallBlock = sys(small).slice(sys(small).indexOf(CONTEXT_INTRO));
   assert.ok(smallBlock.length <= 160, String(smallBlock.length));
+});
+
+test('handleChat: brain context never reaches an external or other off-box provider (#815)', async (t) => {
+  const brains = { 'linked-a': { brain: good({ summary: 'We chose timber.' }) } };
+  const ctx = () => ({ enabled: () => true, maxChars: () => 2000, chats: linkedChats, read: (id) => brains[id] });
+  const local = await run(t, { chats: linkedChats(), brainContext: ctx() });
+  assert.ok(sys(local).includes(CONTEXT_INTRO), 'the local default engine still gets it');
+  for (const provider of [{ id: 'synthetic-external', baseUrl: 'http://external.invalid', external: true, label: 'Synthetic external' },
+    { id: 'synthetic-custom', baseUrl: 'http://custom.invalid' }]) {
+    const base = await run(t, { chats: linkedChats(), provider });
+    const on = await run(t, { chats: linkedChats(), provider, brainContext: ctx() });
+    assert.equal(on.length, 1, provider.id);
+    assert.doesNotMatch(JSON.stringify(on), /We chose timber|chat brain/, `${provider.id}: no brain text leaves the box`);
+    assert.equal(JSON.stringify(on), JSON.stringify(base), `${provider.id}: the request is the one without brain context`);
+  }
 });

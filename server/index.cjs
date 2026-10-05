@@ -618,7 +618,7 @@ const { state: mcpState, oauthServerIds, accountReady, probeMcpAuth, syncDirecto
 
 // The approval gate's state lives in approvals.cjs; the chat loop below and the
 // /api/tool-approvals route are its only callers.
-const { pendingApprovals, chatWideApproved, awaitApproval, awaitRouteChoice } = require('./approvals.cjs').createApprovals();
+const { pendingApprovals, chatWideApproved, revokeChatGrant, awaitApproval, awaitRouteChoice } = require('./approvals.cjs').createApprovals();
 
 // ── SKILL.md awareness (Hermes-style convention, master step 13) ─────────
 // A project knowledge file that starts with SKILL.md frontmatter is treated
@@ -713,7 +713,8 @@ const FRAMING_RATE_LIMIT = 10;
 const chatFramingRoutes = require('./routes/chat-framing.cjs').createChatFramingRoutes({ json, readJson, framing: chatFraming, settings: framingSettings,
   rateLimited: (userId) => llmRateLimiter.rateLimited(`chat-frame:${userId}`, FRAMING_RATE_LIMIT, LLM_RATE_WINDOW_MS),
   preferences: { get: () => require('./chat-framing.cjs').readPreferences(currentWorkspace().dir), save: (value) => require('./chat-framing.cjs').writePreferences(currentWorkspace().dir, value) },
-  workspace: () => { const projects = PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)); return { projects: projects.map((proj) => ({ id: proj.id, name: proj.name })), chats: [...Array.from(FREE_CHATS), ...projects.flatMap((proj) => proj.chats || [])] }; } });
+  // #810: only Chat-mode, unarchived projects are offered as a destination; every own chat still counts for links and tags.
+  workspace: () => { const projects = PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)); return { projects: projects.filter(require('./project-modes.cjs').chatDestination).map((proj) => ({ id: proj.id, name: proj.name })), chats: [...Array.from(FREE_CHATS), ...projects.flatMap((proj) => proj.chats || [])] }; } });
 // #741: "Mirror chats to Diary", per user and off by default. One-way, debounced, through the Diary
 // files client above, as the chat's own user. Runs only with chatFraming on and the Diary add-on on.
 const vaultMirrorLib = require('./chat-vault-mirror.cjs');
@@ -904,7 +905,7 @@ const approvalRoutes = require('./routes/approvals.cjs').createApprovalRoutes({ 
 // runs the delete-old-chats sweep as the workspace loads, at most hourly.
 const chatListRoutes = require('./routes/chat-lists.cjs').createChatListRoutes({
   json, readBody, currentWorkspace, PROJECTS, FREE_CHATS, diaryExtras, crypto, STORED_HISTORY_BYTES, STORED_HISTORY_CAP,
-  chatLists: retentionLists, removeChat: removeRetainedChat, store: projectStore,
+  chatLists: retentionLists, removeChat: removeRetainedChat, store: projectStore, revokeChatGrant,
 });
 // The reasoning-effort default and per-project resolution (routes/reasoning-settings.cjs).
 const routingModeRoutes = require('./routes/routing-mode.cjs').createRoutingModeRoutes({ json, readBody, enabled: () => features.enabled('routingModes'), currentWorkspace,

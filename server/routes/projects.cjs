@@ -812,8 +812,10 @@ function createProjectRoutes({
 
     const chatDel = p.match(/^\/api\/projects\/([^/]+)\/chats\/([^/]+)$/);
     if (chatDel && req.method === 'DELETE') {
-      const projectId = decodeURIComponent(chatDel[1]);
-      const chatId = decodeURIComponent(chatDel[2]);
+      // #812: a malformed escape is a 400, not a server error.
+      const { decodePathPart } = require('../http.cjs');
+      const projectId = decodePathPart(chatDel[1]), chatId = decodePathPart(chatDel[2]);
+      if (projectId === null || chatId === null) return json(res, 400, { error: 'invalid chat id' });
       const removed = deleteChat(projectId, chatId);
       return json(res, removed ? 200 : 404, removed ? { ok: true } : { error: 'no such chat' });
     }

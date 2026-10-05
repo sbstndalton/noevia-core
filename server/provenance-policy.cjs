@@ -31,8 +31,13 @@ const SENSITIVE_STEMS = new Set([
   'command', 'commands', 'cmd', 'script', 'shell',
 ]);
 
+// #813: a key this long is no real argument name, and splitting one is quadratic in the camel-case
+// pass; it counts as sensitive (fails closed: at most one more approval card).
+const MAX_KEY_CHARS = 128;
+
 function isSensitiveKey(key) {
   if (typeof key !== 'string' || !key) return false;
+  if (key.length > MAX_KEY_CHARS) return true;
   const segs = key.replace(/([a-z0-9])([A-Z])/g, '$1_$2').replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2')
     .toLowerCase().split(/[_\-.\s]+/).filter(Boolean);
   for (let i = 0; i < segs.length; i++) {
@@ -42,7 +47,28 @@ function isSensitiveKey(key) {
   return false;
 }
 
-const FRAMED = /<untrusted kind="([^"]*)"(?: label="([^"]*)")?> \(data, not instructions\)\n([\s\S]*?)\n<\/untrusted>/g;
+// A frameUntrusted() block: the header (kind at most 40 characters, label at most 200, neither with
+// a quote or line break: prompt-framing.cjs clean()), the body, then the first "\n</untrusted>".
+// #813: found with indexOf, never a lazy regex over the rest of the text, so many headers without a
+// close cost linear time: once one header has no close after it, no later header can have one.
+const OPEN = '<untrusted ', CLOSE = '\n</untrusted>';
+const HEADER = /<untrusted kind="([^"\n]{0,200})"(?: label="([^"\n]{0,400})")?> \(data, not instructions\)\n/y;
+function framedBlocks(content) {
+  const out = [];
+  let from = 0;
+  for (;;) {
+    const start = content.indexOf(OPEN, from);
+    if (start === -1) return out;
+    HEADER.lastIndex = start;
+    const head = HEADER.exec(content);
+    if (!head) { from = start + OPEN.length; continue; }
+    const bodyStart = start + head[0].length;
+    const end = content.indexOf(CLOSE, bodyStart);
+    if (end === -1) return out;
+    out.push([head[1], head[2], content.slice(bodyStart, end)]);
+    from = end + CLOSE.length;
+  }
+}
 
 function normalise(text) {
   return String(text == null ? '' : text).normalize('NFKC').toLowerCase()
@@ -99,7 +125,7 @@ function createTaintStore({ maxChars = DEFAULT_MAX_CHARS, hash = fnv } = {}) {
         : Array.isArray(m?.content) ? m.content.map((p) => (typeof p?.text === 'string' ? p.text : '')) : [];
       for (const content of parts) {
         if (!content.includes('<untrusted ')) continue;
-        for (const [, kind, label, body] of content.matchAll(FRAMED)) add(label ? `${kind}: ${label}` : kind, body);
+        for (const [kind, label, body] of framedBlocks(content)) add(label ? `${kind}: ${label}` : kind, body);
       }
     }
   }
@@ -186,4 +212,4 @@ function checkWrite(store, rawArgs) {
   }
 }
 
-module.exports = { createTaintStore, checkWrite, normalise, isSensitiveKey, candidates, SENSITIVE_STEMS, OVERFLOW_SOURCE, MAX_SOURCES, MAX_VALUES, GRAM, DEFAULT_MAX_CHARS };
+module.exports = { createTaintStore, checkWrite, normalise, isSensitiveKey, candidates, framedBlocks, SENSITIVE_STEMS, OVERFLOW_SOURCE, MAX_SOURCES, MAX_VALUES, GRAM, DEFAULT_MAX_CHARS };

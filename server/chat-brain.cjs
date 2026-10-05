@@ -350,6 +350,13 @@ function createBrainScheduler({ enabled, chat, readHistory, store, builder, buil
       }
       // Re-checked after the model call: switching the mirror off stops the write at once.
       if (enabled(userId) !== true) return 'off';
+      // #811: so is deletion. A chat deleted (tombstoned) or gone from the user's lists while the
+      // model ran must not get its brain written back after the delete removed it.
+      const tombstoned = deleted(userId)?.has?.(chatId) === true;
+      if (tombstoned || !chat(userId, chatId)) {
+        if (tombstoned) store.remove?.(userId, chatId);
+        return 'gone';
+      }
       store.write(userId, chatId, { brain: result.brain, sourceUpdatedAt: updatedAt, builtAt: now() });
       try { built(userId, chatId); } catch { /* the mirror nudge never fails a build */ }
       return 'built';

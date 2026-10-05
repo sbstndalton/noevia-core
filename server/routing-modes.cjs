@@ -18,10 +18,9 @@ const path = require('node:path');
 
 const MODES = Object.freeze(['local', 'cloud', 'hybrid']);
 const WHEN_SENSITIVE = Object.freeze(['ask', 'local']);
-/** Why a reply went where it did. */
-const REASONS = Object.freeze(['mode', 'user-choice', 'force-local', 'sensitive-rule', 'fail-closed', 'remembered']);
-/** Why a turn was flagged, as shown on the card. */
-const FLAGS = Object.freeze(['diary', 'secret', 'iban', 'card', 'router', 'unavailable']);
+// Codes only, never text: a reply's reason is mode, user-choice, force-local, sensitive-rule,
+// fail-closed or remembered; a turn's flag (shown on the card) is diary, secret, iban, card, router
+// or unavailable.
 const ROLE_KEYS = Object.freeze(['fast', 'smart', 'code']);
 const MODEL_RE = /^[A-Za-z0-9._:/@+-]{1,200}$/;
 const PROVIDER_RE = /^[A-Za-z0-9_-]{1,80}$/;
@@ -121,9 +120,38 @@ function luhn(digits) {
 // its "has a digit and a letter" condition checked in code instead of with lookaheads.
 const SECRET_PATTERNS = [
   /-----BEGIN [A-Z ]{0,40}PRIVATE KEY-----/,
-  /\b(?:password|passwort|passwd|pwd|passcode|pin|api[ _-]?key|secret|access[ _-]?token|auth[ _-]?token|token)\s{0,8}[:=]\s{0,8}\S{4}/i,
   /\bBearer\s{1,8}[A-Za-z0-9._~+/-]{16}/,
 ];
+// #817: "<keyword> = value" / "<keyword>: value", tuned so code does not trip it. The keyword, then
+// one "=" or ":" that is not "==" or "::", then an optional quote and a bounded value: every part is
+// bounded, so it stays linear (matchAll, non-overlapping). Bare "pwd" (the shell command) is gone.
+const SECRET_ASSIGN_RE = /\b(password|passwort|passwd|passcode|pin|api[ _-]?key|secret|access[ _-]?token|auth[ _-]?token|token)\s{0,8}(?:=(?!=)|:(?!:))\s{0,8}(["'`]?)([^\s"'`;,)]{4,200})/gi;
+const PASSWORD_WORDS = new Set(['password', 'passwort', 'passwd']);
+const NOT_A_VALUE = /^(?:null|none|nil|true|false|undefined)$/i;
+const PLACEHOLDER = /^(?:x+|\*+|\.{3,}|…|<.*>|\$\{.*\}|your.*|changeme|example.*)$/i;
+const MEMBER_ACCESS = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/;
+const CALL = /^[A-Za-z_$][\w$.]*\(/;
+// A plain identifier whose only digits are a short suffix (value2, token10): code, not a secret.
+const CODE_NAME = /^[A-Za-z_$][A-Za-z_$]*\d{0,2}$/;
+/** True when a keyword is assigned something that looks like a real secret rather than code. */
+function secretAssignment(s) {
+  for (const m of s.matchAll(SECRET_ASSIGN_RE)) {
+    const keyword = m[1].toLowerCase(), quoted = m[2] !== '', value = m[3];
+    if (NOT_A_VALUE.test(value)) continue;
+    // A PIN is short and all digits; anything else follows the general rule.
+    if ((keyword === 'pin' || keyword === 'passcode') && /^\d{4,12}$/.test(value)) return true;
+    if (quoted) { if (value.length >= 6 && !PLACEHOLDER.test(value)) return true; continue; }
+    // A password is often a plain word ("letmein", "hunter2"): for the password family an unquoted
+    // value of 6+ characters counts unless it is a placeholder, a call or a member access.
+    if (PASSWORD_WORDS.has(keyword)) {
+      if (value.length >= 6 && !PLACEHOLDER.test(value) && !CALL.test(value) && !MEMBER_ACCESS.test(value)) return true;
+      continue;
+    }
+    // token, secret, API keys: code assigns these all the time, so an unquoted value must look like one.
+    if (value.length >= 8 && /\d/.test(value) && !PLACEHOLDER.test(value) && !CALL.test(value) && !MEMBER_ACCESS.test(value) && !CODE_NAME.test(value)) return true;
+  }
+  return false;
+}
 // A JWT: matched as a whole dotted run (a match never fails once started, so it is linear), then
 // its first three segments are checked in code.
 const JWT_RE = /\beyJ[A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]*)*/g;
@@ -146,7 +174,7 @@ function jwtShaped(s) {
 /** The first rule a text trips, as a flag code, or null. Pure; bounded; linear in the text. */
 function preRule(text) {
   const s = String(text || '').slice(0, SCAN_LIMIT);
-  if (SECRET_PATTERNS.some((re) => re.test(s)) || jwtShaped(s) || keyShaped(s)) return 'secret';
+  if (SECRET_PATTERNS.some((re) => re.test(s)) || secretAssignment(s) || jwtShaped(s) || keyShaped(s)) return 'secret';
   for (const m of s.matchAll(IBAN_RE)) if (ibanValid(m[0])) return 'iban';
   for (const m of s.matchAll(CARD_RE)) {
     const digits = m[0].replace(/\D/g, '');
@@ -244,13 +272,10 @@ function routerChunks({ message, system, history, attachments }, { chunkChars = 
   return chunks;
 }
 
-/** The router input as one string (all chunks joined); kept for callers that log or test it. */
-function digest(input, opts) { return routerChunks(input, opts).join('\n'); }
-
 // ── The router role ─────────────────────────────────────────────────────────
 
 const OPTIONS = Object.freeze([
-  { id: 'sensitive', label: 'Contains private or confidential information: health, finances, identity numbers, passwords, private relationships, legal or work secrets' },
+  { id: 'sensitive', label: 'Private or confidential: health, finances, ID numbers, passwords, relationships, legal or work secrets' },
   { id: 'not_sensitive', label: 'General, public or harmless content that is fine to send to an external service' },
 ]);
 
@@ -344,5 +369,5 @@ function cloudModel(cloud, role) {
   return cloud[role] || cloud.smart || cloud.fast || cloud.code || '';
 }
 
-module.exports = { MODES, WHEN_SENSITIVE, REASONS, FLAGS, OPTIONS, FILE, ALLOWED_KEY, normalize, read, write, validate, allowedModes, setAllowedModes,
-  effectiveMode, preRule, hasDiaryContent, digest, routerChunks, chunkCharsFor, ROUTER_CHUNK_CHARS, ROUTER_MAX_CHUNKS, routerMaxChunks, createSensitivity, resolveRoute, chatFlags, cloudModel, ibanValid, luhn };
+module.exports = { MODES, WHEN_SENSITIVE, OPTIONS, FILE, ALLOWED_KEY, normalize, read, write, validate, allowedModes, setAllowedModes,
+  effectiveMode, preRule, hasDiaryContent, routerChunks, chunkCharsFor, ROUTER_CHUNK_CHARS, ROUTER_MAX_CHUNKS, routerMaxChunks, createSensitivity, resolveRoute, chatFlags, cloudModel, ibanValid, luhn };

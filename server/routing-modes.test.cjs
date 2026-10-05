@@ -29,6 +29,28 @@ test('preRule: secrets, IBANs and card numbers are flagged; ordinary text is not
     'commit 3e7bbed8a1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6', 'DE00 1234 5678 9012 3456 78']) assert.equal(rm.preRule(clean), null, clean);
 });
 
+test('preRule secret keywords: real values flag, code and placeholders do not (#817)', () => {
+  // The password family keeps the plain-word rule (review of #828); token/secret/api_key need a real-looking value.
+  const positives = ['password: "hunter2xyz"', "password = 'Synthetic99'", 'token=abcd1234efgh', 'api_key: Sy7nthetic-Key-0001', 'auth token: zq81-x0p2-ww93',
+    'passwd=S3cretValue', 'secret: `fake-value-9`', 'password=hunter2', 'password: letmein', 'password = correct-horse-battery-staple', 'passwd=S3cret', 'pin: 4821', 'passcode=00112233', 'PASSWORD : "Synthetic-Pass"', 'access_token=ya29Synthetic01'];
+  const negatives = ['token = getToken()', 'token = fetchToken2(user)', 'a == b', 'token == expected', 'password: null', 'password = None', 'token: undefined',
+    'password: "xxxxxx"', 'password: "******"', 'password = user.password', 'password = getPassword()', 'password: <redacted>', 'api_key: "<your-api-key>"', 'token: "${TOKEN}"', 'password = "your-password"', 'password: changeme',
+    'secret: "example-secret"', 'token = response.data.token', 'token = this.session.token2', 'token = value2', 'token: abc', 'pwd: /home/synthetic',
+    'Token::fromString(x)', 'password = "abc"', 'token = tokenValue', 'pin: 12', 'cd $(pwd)'];
+  for (const text of positives) assert.equal(rm.preRule(text), 'secret', text);
+  for (const text of negatives) assert.equal(rm.preRule(text), null, text);
+  // Linear: a long run of near-misses for the assignment rule.
+  for (const text of ['token=' + 'a('.repeat(100000), 'password: "' + 'x'.repeat(300000), 'token ='.repeat(50000), 'pin:'.repeat(80000)]) {
+    const t0 = performance.now(); rm.preRule(text); const ms = performance.now() - t0;
+    assert.ok(ms < 100, `${text.slice(0, 12)} took ${ms.toFixed(1)} ms`);
+  }
+});
+
+test('the sensitivity option labels fit the 120-character option limit (#817)', () => {
+  for (const option of rm.OPTIONS) assert.ok(option.label.length <= 120, `${option.id}: ${option.label.length}`);
+  assert.equal(rm.OPTIONS.find((o) => o.id === 'sensitive').label, 'Private or confidential: health, finances, ID numbers, passwords, relationships, legal or work secrets');
+});
+
 test('preRule is linear on adversarial input for every pattern', () => {
   const cases = {
     keyShape: 'ab-'.repeat(60000), keyShapeDashes: ('ab' + '-'.repeat(30)).repeat(6000) + '!', jwt: 'eyJ-'.repeat(60000), jwtDots: 'eyJ.'.repeat(60000),
@@ -198,7 +220,7 @@ const LOCAL = 'http://local.invalid', CLOUD = 'http://cloud.invalid';
 const sse = (...frames) => ({ ok: true, status: 200, body: (async function* () { for (const f of frames) yield Buffer.from(`data: ${JSON.stringify(f)}\n\n`); })() });
 const PROVIDERS = { default: { id: 'default', baseUrl: LOCAL }, 'cloud-x': { id: 'cloud-x', baseUrl: CLOUD, label: 'Synthetic cloud', shared: true } };
 
-async function run(t, { flag, settings = null, chat = {}, project: projectOver = {}, message = 'Tell me about synthetic widgets', history = [], verdict = 'clear', answer = null, approvals = null, userId = 'synthetic-user', withRouting = true, toolResult = null }) {
+async function run(t, { flag, settings = null, chat = {}, project: projectOver = {}, message = 'Tell me about synthetic widgets', history = [], verdict = 'clear', answer = null, approvals = null, userId = 'synthetic-user', withRouting = true, toolResult = null, brainContext = null }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-routing-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const events = [], calls = [], logs = [], flagsSet = [], errors = [];
   const res = new EventEmitter();
@@ -243,6 +265,7 @@ async function run(t, { flag, settings = null, chat = {}, project: projectOver =
     lastLoadedModel: () => null, classifyFastOrSmart: async () => 'smart', servedCatalogue: async () => [], modelsInstalled: async () => [], missingRoles: () => [], staleRolesError: () => null,
     allToolboxes: () => [], chatWideApproved: () => false, awaitApproval: async () => 'deny', recordUsage() {}, recordToolUse() {},
     executeToolCall: async () => (toolResult === null ? 'SYNTHETIC' : toolResult), freeChats: () => [],
+    ...(brainContext ? { chatFramingEnabled: () => true, brainContext } : {}),
     ...(withRouting ? { routingModes: {
       enabled: () => flag === true,
       settings: () => rm.normalize(settings),
@@ -478,4 +501,24 @@ test('GET/PUT /api/routing-mode: own account, admin allow-list, flag off refuses
   assert.deepEqual((await call('GET', '/api/routing-mode')).body, { enabled: false });
   assert.equal((await call('PUT', '/api/routing-mode', JSON.stringify({ mode: 'local' }))).status, 409);
   assert.equal((await call('GET', '/api/other')).handled, false);
+});
+
+test('linked brain context stays local: dropped on a cloud route and from the router input, kept on a local route (#815)', async (t) => {
+  const { CONTEXT_INTRO } = require('./chat-brain.cjs');
+  const brain = { brain_schema: 1, summary: 'Synthetic linked summary marker.', decisions: [], facts: [], open_questions: [], entities: [] };
+  const frame = { kind: 'question', tags: [], links: ['linked-a'], confirmed: true, source: 'user' };
+  const chats = () => [{ id: 'fixture-chat', title: 't', updatedAt: 1, frame }, { id: 'linked-a', title: 'Linked', updatedAt: 1 }];
+  const brainContext = { enabled: () => true, maxChars: () => 2000, chats, read: (id) => (id === 'linked-a' ? { brain } : null) };
+  const opts = { chat: { frame }, project: { chats: chats() }, brainContext };
+  const cloud = await run(t, { ...opts, flag: true, settings: { ...HYBRID, mode: 'cloud' } });
+  assert.ok(cloud.upstream[0].url.startsWith(CLOUD));
+  assert.doesNotMatch(JSON.stringify(cloud.upstream), /Synthetic linked summary marker|chat brain/, 'cloud mode: no brain text');
+  const hybrid = await run(t, { ...opts, flag: true, settings: HYBRID, verdict: 'clear' });
+  assert.ok(hybrid.upstream[0].url.startsWith(CLOUD));
+  assert.doesNotMatch(JSON.stringify(hybrid.upstream), /Synthetic linked summary marker/, 'hybrid cloud route: no brain text');
+  assert.doesNotMatch(JSON.stringify(hybrid.sensitivityCalls), /Synthetic linked summary marker/, 'the router never weighs a brain');
+  const local = await run(t, { ...opts, flag: true, settings: { ...HYBRID, mode: 'local' } });
+  assert.ok(local.upstream[0].url.startsWith(LOCAL));
+  const system = local.upstream[0].body.messages.find((m) => m.role === 'system').content;
+  assert.ok(system.includes(CONTEXT_INTRO) && system.includes('Synthetic linked summary marker.'), 'a local route keeps it');
 });

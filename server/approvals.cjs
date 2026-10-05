@@ -31,6 +31,14 @@ function chatWideApproved(userId, chatId) {
   return true;
 }
 
+// #814: a chat's "Allow for this chat" grant was given for the project it was in. Moving the chat
+// changes which tools (and which targets) its writes reach, so the move revokes the grant and the
+// next write asks again. The three actions themselves are unchanged.
+function revokeChatGrant(userId, chatId) {
+  const key = chatApprovalKey(userId, chatId);
+  return key ? chatWideApprovals.delete(key) : false;
+}
+
 // Ask the human. Resolves to 'approve' | 'deny', never rejects: the caller
 // turns a denial into a tool result the model can read, so a refused call is
 // a normal conversational turn rather than a broken stream.
@@ -104,7 +112,7 @@ function awaitRouteChoice({ id, userId, chatId, abortSignal }) {
   });
 }
 
-  return { pendingApprovals, chatWideApproved, awaitApproval, awaitRouteChoice };
+  return { pendingApprovals, chatWideApproved, revokeChatGrant, awaitApproval, awaitRouteChoice };
 }
 
 module.exports = { createApprovals };

@@ -210,3 +210,27 @@ test('auto-accept chat frames is a per-user preference, off by default (#738, #7
   assert.equal((await put({ autoAccept: false })).status, 200);
   assert.deepEqual(await get(), prefs(false, true));
 });
+
+test('the move never puts a chat into a Code-only or archived project; moving out still works (#810)', async () => {
+  const code = JSON.parse((await post('/api/projects', { name: 'Synthetic code only', modes: ['code'] })).text);
+  const archived = JSON.parse((await post('/api/projects', { name: 'Synthetic archived' })).text);
+  assert.equal((await post(`/api/projects/${archived.id}/config`, { archived: true })).status, 200);
+  const chatProject = JSON.parse((await post('/api/projects', { name: 'Synthetic chat project' })).text);
+  await post('/api/freechats', { chats: [meta('c-810')] });
+  for (const target of [code, archived]) {
+    const refused = await post('/api/chats/c-810/move', { projectId: target.id, frame: frame({ projectId: target.id }) });
+    assert.equal(refused.status, 404, target.name);
+    assert.ok(await freeMeta('c-810'), `${target.name}: still in the free list`);
+  }
+  assert.equal((await post('/api/chats/c-810/move', { projectId: chatProject.id })).status, 200, 'a Chat-mode project still receives it');
+});
+
+test('a malformed chat id in the URL is a 400, not a server error (#812)', async () => {
+  for (const [method, url] of [['POST', '/api/chats/%E0%A4/move'], ['GET', '/api/chats/%E0%A4/history'], ['POST', '/api/chats/%E0%A4/history'],
+    ['GET', '/api/chats/%E0%A4/context-window'], ['DELETE', '/api/freechats/%E0%A4'], ['DELETE', '/api/projects/%E0%A4/chats/c1'],
+    ['DELETE', '/api/projects/p1/chats/%E0%A4']]) {
+    const r = await request(url, { method, headers: mutationHeaders(), body: method === 'GET' || method === 'DELETE' ? '' : JSON.stringify({ projectId: null, history: [] }) });
+    assert.equal(r.status, 400, `${method} ${url}`);
+    assert.deepEqual(JSON.parse(r.text), { error: 'invalid chat id' });
+  }
+});

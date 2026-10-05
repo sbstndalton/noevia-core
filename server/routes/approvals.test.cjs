@@ -50,3 +50,10 @@ test('a stale id, another account and a missing scope all get the same answer', 
   await unscoped.call('POST', '/api/tool-approvals/req-1', { decision: 'approve' });
   assert.deepEqual(unscoped.sent.pop(), { status: 404, body: { error: 'no such pending approval' } });
 });
+
+test('a malformed approval id in the URL is a 400, never reaching the gate (#812)', async () => {
+  const f = fixture();
+  assert.equal(await f.call('POST', '/api/tool-approvals/%E0%A4', { decision: 'approve' }), true);
+  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'invalid approval id' } });
+  assert.deepEqual(f.decisions, []);
+});

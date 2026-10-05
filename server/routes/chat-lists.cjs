@@ -28,9 +28,13 @@ const PASS = Symbol('unhandled');
  * @param {() => { freeChats:object[], projects:object[] }} deps.chatLists   what the retention sweep may delete from
  * @param {(chat:{ projectId?:string, id:string }) => boolean} deps.removeChat
  * @param {object} deps.store   projects.cjs: sanitizeChats, saveFreeChats, deleteFreeChat, readHistory, writeHistory, moveChat
+ * @param {(userId:string, chatId:string) => boolean} [deps.revokeChatGrant]  approvals.cjs: drops a chat's "Allow for this chat" grant
  */
-function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE_CHATS, diaryExtras, crypto, STORED_HISTORY_BYTES, STORED_HISTORY_CAP, chatLists, removeChat, store }) {
+function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE_CHATS, diaryExtras, crypto, STORED_HISTORY_BYTES, STORED_HISTORY_CAP, chatLists, removeChat, store, revokeChatGrant = () => false }) {
   const { sanitizeChats, saveFreeChats, deleteFreeChat, readHistory, writeHistory, moveChat } = store;
+  // #812: a malformed percent-escape in the URL is the caller's mistake (400), not a server error.
+  const decodeChatId = require('../http.cjs').decodePathPart;
+  const badChatId = (res) => json(res, 400, { error: 'invalid chat id' });
 
   // Delete-old-chats sweep (chat-retention.cjs): runs as the user's workspace loads, at most hourly.
   function sweepRetention() {
@@ -56,7 +60,8 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
 
     const windowMatch=p.match(/^\/api\/chats\/([^/]+)\/context-window$/);
     if(windowMatch && req.method==='GET') {
-      const dir=currentWorkspace().dir,lists=require('../chat-lists.cjs'),id=decodeURIComponent(windowMatch[1]);
+      const dir=currentWorkspace().dir,lists=require('../chat-lists.cjs'),id=decodeChatId(windowMatch[1]);
+      if(id===null) return badChatId(res);
       // A deleted chat answers exactly like one that never existed (#554), even if state was written back late.
       if(lists.readTombstones(dir).has(lists.safeChatId(id)||id)) return json(res,200,{meter:null});
       return json(res,200,{meter:require('../chat-context.cjs').read(dir,id).meter||null});
@@ -107,12 +112,16 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
 
     const freeDel = p.match(/^\/api\/freechats\/([^/]+)$/);
     if (freeDel && req.method === 'DELETE') {
-      const removed = deleteFreeChat(decodeURIComponent(freeDel[1]));
+      const id = decodeChatId(freeDel[1]);
+      if (id === null) return badChatId(res);
+      const removed = deleteFreeChat(id);
       return json(res, removed ? 200 : 404, removed ? { ok: true } : { error: 'no such chat' });
     }
 
     const moveMatch = p.match(/^\/api\/chats\/([^/]+)\/move$/);
     if (moveMatch && req.method === 'POST' && moveChat) {
+      const chatId = decodeChatId(moveMatch[1]);
+      if (chatId === null) return badChatId(res);
       let body;
       try { body = JSON.parse(await readBody(req)); } catch { return json(res, 400, { error: 'invalid JSON' }); }
       if (!body || typeof body !== 'object' || Array.isArray(body) || !(body.projectId === null || typeof body.projectId === 'string')) return json(res, 400, { error: 'projectId (or null) required' });
@@ -123,15 +132,22 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
         if (body.frame !== null && !require('../chat-framing.cjs').normalizeFrame(body.frame)) return json(res, 400, { error: 'invalid frame' });
         patch = { frame: body.frame };
       }
-      // Only the caller's own lists (the request-scoped workspace); Diary's internal project is not a destination.
-      const moved = moveChat(decodeURIComponent(moveMatch[1]), body.projectId, patch, (proj) => !diaryExtras.internalProject(proj));
+      // Only the caller's own lists (the request-scoped workspace); Diary's internal project is not a
+      // destination, and neither is a project without Chat mode or an archived one (#810).
+      const moved = moveChat(chatId, body.projectId, patch, (proj) => !diaryExtras.internalProject(proj), require('../project-modes.cjs').chatDestination);
+      // #814: a chat that changed lists loses its "Allow for this chat" grant; a frame saved in place keeps it.
+      if (moved.status === 200 && moved.from !== body.projectId) {
+        for (const userId of new Set([currentWorkspace().userId, authn?.user?.id])) if (userId) revokeChatGrant(userId, chatId);
+      }
       return json(res, moved.status, moved.status === 200 ? { ok: true, from: moved.from, projectId: body.projectId } : { error: 'no such chat or project' });
     }
 
     const historyMatch = p.match(/^\/api\/chats\/([^/]+)\/history$/);
     if (historyMatch) {
       // Sanitized here, exactly as storage does, so the tombstone check sees the stored id.
-      const spaceId = require('../chat-lists.cjs').safeChatId(decodeURIComponent(historyMatch[1]));
+      const rawId = decodeChatId(historyMatch[1]);
+      if (rawId === null) return badChatId(res);
+      const spaceId = require('../chat-lists.cjs').safeChatId(rawId);
       if (!spaceId) return json(res, 400, { error: 'invalid chat id' });
       const revisionOf = (history) => crypto.createHash('sha256').update(JSON.stringify(history)).digest('hex');
       if (req.method === 'GET') { const history = readHistory(spaceId); return json(res, 200, { history, revision: revisionOf(history) }); }

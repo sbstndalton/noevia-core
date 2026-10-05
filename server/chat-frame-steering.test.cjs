@@ -41,7 +41,7 @@ test('frameBlock: an injection-y tag stays inert data and the block stays bounde
 
 test('gateBias: search prefers, action expects a tool, idea forces nothing, question and code add nothing', () => {
   assert.deepEqual(gateBias(frame({ kind: 'search' })).prefer, ['search', 'drive']);
-  assert.equal(gateBias(frame({ kind: 'action' })).expectTool, true);
+  assert.deepEqual(gateBias(frame({ kind: 'action' })), { hint: 'The user framed this chat as a request to get something done, so a tool is expected.' });
   assert.deepEqual(gateBias(frame({ kind: 'idea' })), { noForce: true });
   assert.equal(gateBias(frame({ kind: 'question' })), null);
   assert.equal(gateBias(frame({ kind: 'code' })), null);
@@ -139,7 +139,7 @@ test('a confirmed stored frame adds the block and biases the gate; a frame in th
   const on = await run(t, { flag: true, chats: [{ id: 'fixture-chat', frame: frame({ kind: 'action' }) }], gateCalls: calls });
   assert.match(system(on), /Chat frame \(set by the user\): this chat is a request to get something done/);
   assert.match(system(on), /Stay within this project and its sources\./);
-  assert.equal(calls[0][2].expectTool, true);
+  assert.match(calls[0][2].hint, /a tool is expected/);
   // The client claims a confirmed search frame; the server has none stored: nothing changes.
   const baseline = await run(t, { flag: true, chats: [{ id: 'fixture-chat' }] });
   const spoofCalls = [];

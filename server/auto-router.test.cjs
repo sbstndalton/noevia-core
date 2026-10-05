@@ -7,9 +7,10 @@ const test = require('node:test');
 process.env.UI_DATA_DIR = require('node:fs').mkdtempSync(require('node:path').join(require('node:os').tmpdir(), 'cowork-autorouter-test-'));
 // The classifier is its own module now; it needs no server, so the test builds one directly
 // instead of booting index.cjs for a pure function.
-const { createAutoRouter, CLASSIFIER_MAX_TOKENS } = require('./auto-router.cjs');
+const { createAutoRouter } = require('./auto-router.cjs');
 const quiet = { warn: () => {}, log: () => {} };
-const { classifierVerdict, heuristicWantsSmart, heuristicWantsCode, classify } = createAutoRouter({
+// The budget is read from the router instance, the same value index.cjs takes from its own instance.
+const { classifierVerdict, heuristicWantsSmart, heuristicWantsCode, classify, classifierBody, CLASSIFIER_MAX_TOKENS } = createAutoRouter({
   roles: () => null, provider: () => ({ baseUrl: 'http://engine.test' }), headers: () => ({}),
   fetchJson: async () => ({ ok: false, status: 500 }), log: quiet,
 });
@@ -48,6 +49,8 @@ test('classifier token budget leaves room for a reasoning model to reach its ver
   // Measured need on the local roster: gemma-4-E2B ~162 tokens, Qwen3.5-9B
   // ~427. The old budget of 64 truncated both before any verdict appeared.
   assert.ok(CLASSIFIER_MAX_TOKENS >= 427, `budget ${CLASSIFIER_MAX_TOKENS} is below the measured worst case`);
+  // And it is the budget the classifier request actually carries.
+  assert.equal(JSON.parse(classifierBody('synthetic-model', 'hello', false)).max_tokens, CLASSIFIER_MAX_TOKENS);
 });
 
 test('the router fails open to fast, and only offers CODE when a code role exists', async () => {

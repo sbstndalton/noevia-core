@@ -346,3 +346,24 @@ test('moveChat refuses unknown chats and projects, deleted chats and disallowed 
   f.workspace.freeChats.push({ id: 'f1', title: 'stale copy' });
   assert.equal(f.store.moveChat('f1', a.id).status, 404, 'a tombstoned chat is never moved back to life');
 });
+
+test('moveChat never moves a chat into a project it cannot live in, but in place and out still work (#810)', async () => {
+  const f = fixture();
+  const { chatDestination } = require('./project-modes.cjs');
+  const chat = await f.store.createProject({ name: 'Chat' });
+  const code = await f.store.createProject({ name: 'Code only', modes: ['code'] });
+  const old = await f.store.createProject({ name: 'Archived' });
+  old.archived = true;
+  old.chats = [{ id: 'in-old', title: 'Kept', updatedAt: 1 }];
+  f.workspace.freeChats.push({ id: 'f1', title: 'Free', updatedAt: 1 });
+  const frame = { kind: 'idea', tags: [], links: [], confirmed: true, source: 'user' };
+  const before = f.workspace.saved;
+  assert.equal(f.store.moveChat('f1', code.id, { frame }, () => true, chatDestination).status, 404, 'not into a Code-only project');
+  assert.equal(f.store.moveChat('f1', old.id, { frame }, () => true, chatDestination).status, 404, 'not into an archived project');
+  assert.deepEqual(f.workspace.freeChats.map((c) => c.id), ['f1']);
+  assert.equal(f.workspace.saved, before, 'nothing was saved');
+  assert.equal(f.store.moveChat('in-old', old.id, { frame }, () => true, chatDestination).status, 200, 'a frame is still saved in place');
+  assert.equal(old.chats[0].frame.kind, 'idea');
+  assert.deepEqual(f.store.moveChat('in-old', chat.id, {}, () => true, chatDestination), { status: 200, from: old.id }, 'and the chat can be moved out');
+  assert.deepEqual(f.store.moveChat('f1', chat.id, {}, () => true, chatDestination), { status: 200, from: null });
+});

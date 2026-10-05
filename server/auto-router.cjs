@@ -161,4 +161,4 @@ function createAutoRouter({ roles, provider, headers, fetchJson, log = console, 
   return { classify: classifyFastOrSmart, heuristicWantsSmart, heuristicWantsCode, classifierVerdict, classifierBody, CLASSIFIER_MAX_TOKENS };
 }
 
-module.exports = { createAutoRouter, CLASSIFIER_MAX_TOKENS: 512 };
+module.exports = { createAutoRouter };

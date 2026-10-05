@@ -187,9 +187,12 @@ function createProjectStore({
   // a list, and a DELETE tombstones the id, so delete-then-add would lose it. This is the one
   // place a meta leaves a list without a tombstone. The transcript is keyed by chat id and does
   // not move. `patch` may carry a frame (or null), normalized by the same merge as a list save.
-  // `allowed(project)` refuses projects the caller may not use (Diary's internal one). Returns
-  // { status, from } — 200 moved (or already there, patch applied), 404 unknown chat or project.
-  function moveChat(chatId, toProjectId, patch = {}, allowed = () => true) {
+  // `allowed(project)` refuses projects the caller may not use (Diary's internal one).
+  // `receives(project)` refuses a destination a chat cannot live in (#810: no Chat mode, archived);
+  // it is not asked of the project the chat is already in, so a frame can still be saved in place
+  // and a chat can still be moved out. Returns { status, from } — 200 moved (or already there,
+  // patch applied), 404 unknown chat or project.
+  function moveChat(chatId, toProjectId, patch = {}, allowed = () => true, receives = () => true) {
     const id = typeof chatId === 'string' ? chatId : '';
     if (!id) return { status: 404 };
     const lists = require('./chat-lists.cjs');
@@ -199,6 +202,7 @@ function createProjectStore({
     const owner = PROJECTS.find((p) => Array.isArray(p.chats) && p.chats.some((c) => c && c.id === id)) || null;
     const meta = owner ? owner.chats.find((c) => c && c.id === id) : FREE_CHATS.find((c) => c && c.id === id);
     if (!meta || (owner && !allowed(owner))) return { status: 404 };
+    if (target && target !== owner && !receives(target)) return { status: 404 };
     const from = owner ? owner.id : null;
     const next = { ...meta, ...('frame' in patch ? { frame: patch.frame } : {}) };
     if (owner) owner.chats = owner.chats.filter((c) => !(c && c.id === id));

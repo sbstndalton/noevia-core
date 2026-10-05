@@ -6,7 +6,7 @@
 // only carries the decision across, and only from the account whose conversation it is:
 // a stale, foreign or unknown id all get the same 404, so it cannot be used to probe.
 
-const { isJsonObject } = require('../http.cjs');
+const { isJsonObject, decodePathPart } = require('../http.cjs');
 
 const PASS = Symbol('unhandled');
 
@@ -21,7 +21,8 @@ function createApprovalRoutes({ json, readBody, pendingApprovals, requestScope }
   async function handle(req, res, { path: p }) {
     const approvalMatch = p.match(/^\/api\/tool-approvals\/([^/]+)$/);
     if (approvalMatch && req.method === 'POST') {
-      const id = decodeURIComponent(approvalMatch[1]);
+      const id = decodePathPart(approvalMatch[1]);
+      if (id === null) return json(res, 400, { error: 'invalid approval id' });
       const raw = await readBody(req);
       let body;
       try { body = JSON.parse(raw); } catch { return json(res, 400, { error: 'invalid JSON' }); }

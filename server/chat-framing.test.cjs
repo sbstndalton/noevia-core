@@ -216,3 +216,30 @@ test('route: a burst over the per-user budget gets 429 rate-limited without call
   assert.equal(suggested, 10);
   assert.equal((await call('u-b')).status, 200, 'another user has their own budget');
 });
+
+test('the suggest list never offers a Code-only, Cowork-only or archived project (#810)', async () => {
+  const offered = [];
+  const { decide, seen } = stubDecide({ 'chat.frame.kind': 'question', 'chat.frame.project': (r) => { offered.push(...r.options.map((o) => o.id)); return 'p-code'; }, 'chat.frame.tag': NONE });
+  const mixed = [...projects, { id: 'p-code', name: 'Garden code', modes: ['code'] }, { id: 'p-cowork', name: 'Garden cowork', modes: ['cowork'] },
+    { id: 'p-old', name: 'Garden archive', modes: ['chat'], archived: true }, { id: 'p-both', name: 'Garden both', modes: ['chat', 'code'] }];
+  const { frame } = await make(decide).suggest({ message: 'Tomato garden plans', projects: mixed, chats });
+  assert.ok(seen.length > 0);
+  assert.deepEqual(offered.filter((id) => id !== NONE).sort(), ['p-both', 'p-garden', 'p-tax']);
+  assert.equal(frame.projectId, null, 'an answer naming a refused project is outside the options');
+});
+
+test('suggest embeds at most 64 project names and 64 tags, most used tags first (#816)', async () => {
+  const many = Array.from({ length: 2000 }, (_, i) => ({ id: `t${i}`, title: '', updatedAt: 0,
+    frame: { kind: 'idea', tags: [`tag-${i}`, ...(i < 500 ? ['popular'] : [])], links: [], confirmed: true, source: 'user' } }));
+  const lots = Array.from({ length: 300 }, (_, i) => ({ id: `p${i}`, name: `Project ${i}` }));
+  const inputs = [];
+  const { decide, seen } = stubDecide({ 'chat.frame.kind': 'idea', 'chat.frame.project': NONE, 'chat.frame.tag': NONE });
+  await make(decide, { embed: async (texts) => { inputs.push(texts); return texts.map(vec); } }).suggest({ message: 'Synthetic plans', projects: lots, chats: many });
+  assert.equal(inputs.length, 1);
+  // The message, the related-chat pool (untitled chats are not in it), then at most 64 + 64.
+  assert.ok(inputs[0].length <= 1 + 64 + 64, String(inputs[0].length));
+  assert.equal(inputs[0].filter((t) => t.startsWith('Project ')).length, 64);
+  assert.ok(inputs[0].includes('popular'), 'the most used tag is kept');
+  const tagRequest = seen.find((r) => r.purpose === 'chat.frame.tag');
+  assert.equal(tagRequest.options[0].id, 'popular');
+});

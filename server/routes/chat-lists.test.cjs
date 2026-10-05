@@ -170,3 +170,48 @@ test('POST /api/chats/:id/move validates, scopes to the caller and maps the stor
   assert.equal(moves.length, 0, 'malformed bodies never reach the store');
   assert.equal(await call('GET', '/api/chats/f1/move'), false, 'other methods fall through');
 });
+
+// Grants "Allow for this chat" the way the card does: a pending write answered with approve_all.
+async function grantAllowForChat(gate, userId, chatId) {
+  const ctl = new AbortController();
+  const waiting = gate.awaitApproval({ id: `grant-${userId}-${chatId}`, userId, chatId, abortSignal: ctl.signal });
+  assert.equal(gate.pendingApprovals.get(`grant-${userId}-${chatId}`).decide('approve_all'), true);
+  assert.equal(await waiting, 'approve');
+}
+
+test('moving a chat to another list revokes its "Allow for this chat" grant; a frame saved in place keeps it (#814)', async () => {
+  const gate = require('../approvals.cjs').createApprovals();
+  const f = fixture();
+  const lists = { f1: null, f2: null };
+  f.store.moveChat = (id, projectId) => {
+    if (!(id in lists)) return { status: 404 };
+    const from = lists[id]; lists[id] = projectId; return { status: 200, from };
+  };
+  const sent = [];
+  const routes = createChatListRoutes({
+    json: (res, status, body) => { sent.push({ status, body }); },
+    readBody: async (req) => { let s = ''; for await (const c of req) s += c; return s; },
+    currentWorkspace: () => ({ dir: f.dir, userId: 'u1' }), PROJECTS: f.projects, FREE_CHATS: f.freeChats,
+    diaryExtras: { internalProject: (p) => p.id === 'diary-extras' }, crypto, STORED_HISTORY_BYTES: 200, STORED_HISTORY_CAP: 3,
+    chatLists: () => ({ freeChats: [], projects: [] }), removeChat() {}, store: f.store, revokeChatGrant: gate.revokeChatGrant,
+  });
+  const move = (id, body) => { const req = Readable.from([Buffer.from(JSON.stringify(body))]); req.method = 'POST'; return routes(req, {}, { path: `/api/chats/${id}/move`, authn: { user: { id: 'u1', role: 'member' } } }); };
+  await grantAllowForChat(gate, 'u1', 'f1');
+  await grantAllowForChat(gate, 'u1', 'f2');
+  await grantAllowForChat(gate, 'u2', 'f1');
+  // In place (no list change): the next write in that chat is still not asked.
+  await move('f1', { projectId: null, frame: { kind: 'idea', tags: [], links: [], confirmed: true, source: 'user' } });
+  assert.equal(sent.pop().status, 200);
+  assert.equal(gate.chatWideApproved('u1', 'f1'), true, 'no move: still suppressed');
+  // Into a project: the next write asks again. Other chats and other users keep theirs.
+  await move('f1', { projectId: 'p1' });
+  assert.deepEqual(sent.pop(), { status: 200, body: { ok: true, from: null, projectId: 'p1' } });
+  assert.equal(gate.chatWideApproved('u1', 'f1'), false, 'moved: the next write asks again');
+  assert.equal(gate.chatWideApproved('u1', 'f2'), true, 'another chat keeps its grant');
+  assert.equal(gate.chatWideApproved('u2', 'f1'), true, 'another user keeps theirs');
+  // A refused move changes nothing.
+  await grantAllowForChat(gate, 'u1', 'f1');
+  await move('zz', { projectId: null });
+  assert.equal(sent.pop().status, 404);
+  assert.equal(gate.chatWideApproved('u1', 'f1'), true);
+});

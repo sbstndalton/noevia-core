@@ -437,13 +437,17 @@ function createChatHandler({
     if (frameBlock) sysParts.push(frameBlock);
     // #742 (features.brainContext): linked chats' brain summaries, as untrusted data, from the user's own
     // workspace and lists only. Flag off, no confirmed frame or no links: nothing is added.
+    let brainBlock = '';
     if (chatFrame && brainContext && brainContext.enabled() === true) {
       try {
-        const block = require('./chat-brain.cjs').linkedBrainBlock({ enabled: true, frame: chatFrame, chatId: body.chatId, chats: brainContext.chats(), read: brainContext.read, maxChars: brainContext.maxChars() });
-        if (block) sysParts.push(block);
-      } catch { /* fail open: no brain context */ }
+        brainBlock = require('./chat-brain.cjs').linkedBrainBlock({ enabled: true, frame: chatFrame, chatId: body.chatId, chats: brainContext.chats(), read: brainContext.read, maxChars: brainContext.maxChars() }) || '';
+        if (brainBlock) sysParts.push(brainBlock);
+      } catch { brainBlock = ''; /* fail open: no brain context */ }
     }
-    const sys = sysParts.join('\n\n');
+    let sys = sysParts.join('\n\n');
+    // #815: the system text without the brain block. Brains may summarise Diary-derived chats, so they
+    // stay on this box: the routing check never weighs them and an off-box provider never gets them.
+    const sysWithoutBrain = brainBlock ? sysParts.filter((part) => part !== brainBlock).join('\n\n') : sys;
     let wire = sys ? [{ role: 'system', content: sys }, ...msgs] : msgs;
 
     // A dedicated vision pass: the vision model describes the project's images,
@@ -559,7 +563,7 @@ function createChatHandler({
         if (settings.mode === 'cloud' && !hasCloud && !hardLocal && !flags.forceLocal) {
           return json(res, 409, { error: 'Cloud routing has no cloud provider and model yet. Choose them in Settings → Models & routing.' });
         }
-        const sentText = [sys, ...msgs.map((m) => (typeof m.content === 'string' ? m.content : ''))].join('\n');
+        const sentText = [sysWithoutBrain, ...msgs.map((m) => (typeof m.content === 'string' ? m.content : ''))].join('\n');
         const attachmentNames = [...(project?.assets || []).map((a) => a.name), ...(project?.files || []).map((f) => f.name)].filter((n) => typeof n === 'string');
         const routeUserId = requestScope.getStore()?.workspace?.userId || null;
         const decided = await rm.resolveRoute({
@@ -568,7 +572,7 @@ function createChatHandler({
           // #779 F4: the current message first, so the 400k scan limit can never cut it off.
           preFlag: settings.mode === 'hybrid' ? (rm.preRule(message) || rm.preRule(attachmentNames.join('\n')) || rm.preRule(sentText)) : null,
           // #779 F1: the router reads bounded chunks sized to the decision service's real budget.
-          check: () => routingModes.sensitivity(rm.routerChunks({ message, system: sys, history: mappedHistory, attachments: attachmentNames },
+          check: () => routingModes.sensitivity(rm.routerChunks({ message, system: sysWithoutBrain, history: mappedHistory, attachments: attachmentNames },
             { chunkChars: typeof routingModes.chunkChars === 'function' ? routingModes.chunkChars() : undefined,
               maxChunks: typeof routingModes.maxChunks === 'function' ? routingModes.maxChunks() : undefined })),
           ask: async (flag) => {
@@ -615,6 +619,13 @@ function createChatHandler({
     // ChatGPT connection is private to the account that made it and needs the feature flag.
     const egress = require('./provider-egress.cjs');
     const externalProvider = egress.isExternalProvider(provider);
+    // #815: linked chats' brains never reach an external provider or a cloud route; fail closed by
+    // dropping the block before anything below reads `sys` or `wire`. Local requests are unchanged.
+    if (brainBlock && (externalProvider || routeTarget?.route === 'cloud' || provider?.id !== DEFAULT_PROVIDER_ID)) {
+      sys = sysWithoutBrain;
+      wire = sys ? [{ role: 'system', content: sys }, ...msgs] : msgs;
+      brainBlock = '';
+    }
     const egressRefused = egress.egressRefusal({ provider, spaceId, projectId: project?.id, diaryProjectId: diaryExtras.PROJECT_ID });
     if (egressRefused) return json(res, 409, { error: egressRefused });
     const chatgptProvider = require('./chatgpt-oauth.cjs').isChatGptProvider(provider);

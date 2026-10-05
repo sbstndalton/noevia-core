@@ -8,6 +8,7 @@
 // Model roles are settings, not names: framingRouterModel classifies, framingReasonerModel (phase 4)
 // structures tool output. Empty means "the configured decision service".
 const { cosine } = require('./tool-router.cjs');
+const { chatDestination } = require('./project-modes.cjs');
 
 const KINDS = Object.freeze(['search', 'action', 'idea', 'question', 'code']);
 const KIND_LABELS = Object.freeze({
@@ -21,6 +22,9 @@ const NONE = '__none';
 const MAX_OPTIONS = 8; // what the decision service accepts per choice (decision-settings SERVICE_LIMITS)
 const MAX_TAGS = 20, MAX_LINKS = 20, MAX_TAG_CHARS = 64, MAX_ID_CHARS = 128;
 const RELATED_MIN = 0.5, RELATED_MAX = 3, RELATED_POOL = 50;
+// #816: only the top of each list is ever offered (MAX_OPTIONS - 1), so only this many project names and
+// tags (most used first) are embedded; a user with thousands of tags still makes one small request.
+const EMBED_PROJECTS = 64, EMBED_TAGS = 64;
 const DEFAULT_DEADLINE_MS = 1500;
 const SOURCES = new Set(['suggested', 'user']);
 
@@ -117,8 +121,10 @@ function createChatFraming({ enabled, decide, embed = null, roles = () => ({}), 
     const left = () => Math.max(1, budget - (now() - started));
     const pool = (chats || []).filter((c) => c && typeof c.id === 'string' && c.id !== chatId && typeof c.title === 'string' && c.title.trim())
       .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)).slice(0, RELATED_POOL);
-    const tags = existingTags(chats);
-    const ownProjects = (projects || []).filter((p) => p && typeof p.id === 'string' && typeof p.name === 'string');
+    const tags = existingTags(chats).slice(0, EMBED_TAGS);
+    // #810: only projects a chat can live in (Chat mode, not archived) are ever suggested.
+    const ownProjects = (projects || []).filter((p) => p && typeof p.id === 'string' && typeof p.name === 'string' && chatDestination(p))
+      .slice(0, EMBED_PROJECTS);
     // One embedding call: the message, the related-chat pool, then project names and tags for pre-ranking.
     const texts = [text, ...pool.map((c) => c.title), ...ownProjects.map((p) => p.name), ...tags];
     const vectors = await embedAll(texts, signal);
@@ -183,4 +189,4 @@ function writePreferences(dir, value) {
   return record;
 }
 
-module.exports = { createChatFraming, createFramingSettings, BRAIN_CONTEXT_CHARS, normalizeFrame, existingTags, readPreferences, writePreferences, KINDS, NONE };
+module.exports = { createChatFraming, createFramingSettings, normalizeFrame, existingTags, readPreferences, writePreferences, KINDS, NONE };

@@ -119,4 +119,10 @@ function authResult(res, result) {
   return json(res, result.status || 200, result.body ?? result);
 }
 
-module.exports = { json, unauthorized, fetchJson, readBody, readJson, authResult, isJsonObject, errorResponse, DEFAULT_MAX_RESPONSE_BYTES };
+// #812: one URL path segment, percent-decoded; null when the escape is malformed, so a route answers
+// 400 instead of letting decodeURIComponent's URIError become a 500.
+function decodePathPart(raw) {
+  try { return decodeURIComponent(raw); } catch { return null; }
+}
+
+module.exports = { json, unauthorized, decodePathPart, fetchJson, readBody, readJson, authResult, isJsonObject, errorResponse, DEFAULT_MAX_RESPONSE_BYTES };
