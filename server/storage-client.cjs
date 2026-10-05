@@ -269,6 +269,16 @@ async function checkLogin(conn, { fetchImpl = fetch, timeoutMs = 10000 } = {}) {
   return { ok: false, unverified: 'status', status: response.status };
 }
 
+/** #849: did the storage server refuse the saved login (401, or 403 as #770 words it)? True for
+ *  an error this module threw about a WebDAV answer: the folder/write errors carry `upstream`, the
+ *  list/read ones say "storage returned <status>". Nothing else counts, so a 404 or a network
+ *  failure keeps its own message. */
+const LOGIN_REJECTED_STATUSES = new Set([401, 403]);
+function refusedLogin(err) {
+  if (!err) return false;
+  if (LOGIN_REJECTED_STATUSES.has(err.upstream)) return true;
+  return /^storage returned (401|403)$/.test(String(err.message || ''));
+}
 
 // ── S3-compatible ────────────────────────────────────────────────────────────
 
@@ -393,7 +403,7 @@ async function createFolder(conn, rawPath) {
   if (!response.ok) {
     throw Object.assign(
       new Error(`could not create "${path}" (${response.status})`),
-      { status: response.status === 409 ? 400 : 502 },
+      { status: response.status === 409 ? 400 : 502, upstream: response.status },
     );
   }
   return { path, existed: false };
@@ -483,7 +493,7 @@ async function writeFile(conn, rawPath, bytes, { ifMatch, ifNoneMatch } = {}) {
     throw Object.assign(new Error(ifMatch ? `"${path}" changed in storage before it could be written (412)` : `"${path}" already exists in storage, so it was not overwritten (412)`), { status: 409, code: 'changed' });
   }
   if (!response.ok) {
-    throw Object.assign(new Error(`could not write "${path}" (${response.status})`), { status: response.status === 409 ? 400 : 502 });
+    throw Object.assign(new Error(`could not write "${path}" (${response.status})`), { status: response.status === 409 ? 400 : 502, upstream: response.status });
   }
   return { path };
 }
@@ -606,4 +616,4 @@ async function fileVersion(conn, rawPath) {
   return { exists: true, etag: /[\r\n]/.test(etag) ? '' : etag };
 }
 
-module.exports = { checkLogin, removeEmptyFolder, listFiles, readTextFile, readBinaryFile, writeFile, fileVersion, deleteFile, createFolder, isBrowsable, safeRelativePath, elementTexts, TEXT_EXTENSIONS, READ_CAP };
+module.exports = { checkLogin, refusedLogin, removeEmptyFolder, listFiles, readTextFile, readBinaryFile, writeFile, fileVersion, deleteFile, createFolder, isBrowsable, safeRelativePath, elementTexts, TEXT_EXTENSIONS, READ_CAP };

@@ -9,7 +9,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { createProjectStore } = require('./projects.cjs');
 
-function fixture({ browsable = false } = {}) {
+function fixture({ browsable = false, folderError = null } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-projects-'));
   const workspace = {
     dir, userId: 'u1', projects: [], freeChats: [],
@@ -24,7 +24,7 @@ function fixture({ browsable = false } = {}) {
     reasoningEffort: { validEffort: (e) => ['default', 'low', 'high'].includes(e) },
     projectAppearance: (body) => (body.icon === 'bad' ? (() => { throw new Error('unknown icon'); })() : { icon: body.icon || 'folder' }),
     rag: { indexProjectFile: async (...args) => { indexed.push(args); return { ok: true, stored: 1, embedded: 1 }; }, deleteProjectFile: (...args) => deleted.push(args) },
-    storageClient: { isBrowsable: () => browsable },
+    storageClient: { isBrowsable: () => browsable, refusedLogin: require('./storage-client.cjs').refusedLogin },
     documentSources: { prune() {}, directory: () => path.join(dir, 'docs') },
     authService: { getStorage: () => ({ kind: browsable ? 'webdav' : 'local' }) },
     currentWorkspace: () => workspace,
@@ -32,7 +32,7 @@ function fixture({ browsable = false } = {}) {
     sanitizeToolboxes: (boxes) => (Array.isArray(boxes) ? boxes : null),
     defaultToolboxes: () => ['core'],
     PROJECT_ROOT_FOLDER: 'noevia projects',
-    createProjectFolder: async (_storage, _connection, root, project) => `${root}/${project.name}`,
+    createProjectFolder: async (_storage, _connection, root, project) => { if (folderError) throw folderError; return `${root}/${project.name}`; },
     projectSweep: { afterDelete: async (args) => { swept.push(args); } },
   });
   return { store, workspace, indexed, deleted, swept, dir };
@@ -66,6 +66,19 @@ test('with browsable storage a new project makes no storage folder until its fir
   assert.deepEqual(project.sourceFolders, []);
   // The folder is allocated by the first upload path, which shares one allocation per project.
   assert.equal(await f.store.ensureProjectFolder(project), 'noevia projects/Trip');
+});
+
+test('#849: ensureProjectFolderDetailed says when storage refused the login, and ensureProjectFolder still just returns null', async () => {
+  const rejected = fixture({ browsable: true, folderError: Object.assign(new Error('could not create "noevia projects" (401)'), { status: 502, upstream: 401 }) });
+  const project = await rejected.store.createProject({ name: 'Trip' });
+  assert.deepEqual(await rejected.store.ensureProjectFolderDetailed(project), { folder: null, loginRejected: true });
+  assert.equal(await rejected.store.ensureProjectFolder(project), null);
+  const down = fixture({ browsable: true, folderError: Object.assign(new Error('could not create "noevia projects" (500)'), { status: 502, upstream: 500 }) });
+  assert.deepEqual(await down.store.ensureProjectFolderDetailed(await down.store.createProject({ name: 'Trip' })), { folder: null, loginRejected: false });
+  const none = fixture({ browsable: false });
+  assert.deepEqual(await none.store.ensureProjectFolderDetailed(await none.store.createProject({ name: 'Trip' })), { folder: null, loginRejected: false });
+  const ok = fixture({ browsable: true });
+  assert.deepEqual(await ok.store.ensureProjectFolderDetailed(await ok.store.createProject({ name: 'Trip' })), { folder: 'noevia projects/Trip', loginRejected: false });
 });
 
 test('chat metas are sanitized on read and deleting one leaves a tombstone and removes its transcript', async () => {

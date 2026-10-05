@@ -62,6 +62,15 @@ function createProjectRoutes({
     getProject, saveProjects, createProject, deleteProject, pruneDocuments, withSourceLock, ensureProjectFolder, indexSource, ownsFile,
     loadChats, saveChats, deleteChat,
   } = store;
+  // #849: a rejected storage login is its own answer, not "could not create the folder". The
+  // wording is the one the refresh toast and the Settings save already use (#770); `code` lets the
+  // client word it in the interface language. 502, never 401, which the client reads as "your
+  // noevia session expired".
+  const STORAGE_LOGIN_REJECTED_ERROR = 'Storage login rejected. Check your storage credentials in Settings → Diary & storage.';
+  const storageLoginRejected = (res) => json(res, 502, { error: STORAGE_LOGIN_REJECTED_ERROR, code: 'storageLoginRejected' });
+  const ensureFolder = (project) => typeof store.ensureProjectFolderDetailed === 'function'
+    ? store.ensureProjectFolderDetailed(project)
+    : Promise.resolve(ensureProjectFolder(project)).then((folder) => ({ folder, loginRejected: false }));
   // #659: when uploads first appear in a project, its Project documents box is turned on
   // (project-docs-default.cjs). `hadUploads` is taken under the source lock before the change,
   // so a project that already had uploads is never changed by a later upload or sync. Not for
@@ -496,10 +505,13 @@ function createProjectRoutes({
           uploads.validate(name,bytes);
           if (remote && !project.projectFolder) {
             progress('Creating upload folder');
-            project.projectFolder = await ensureProjectFolder(project);
-            if (!project.projectFolder) return json(res, 502, { error: 'Could not create the storage folder; retry.' });
+            const made = await ensureFolder(project);
+            project.projectFolder = made.folder;
+            if (!project.projectFolder) return made.loginRejected ? storageLoginRejected(res) : json(res, 502, { error: 'Could not create the storage folder; retry.' });
           }
-          const file = await uploads.ingest(currentWorkspace(), project, name, bytes, { connection: remote, progress });
+          let file;
+          try { file = await uploads.ingest(currentWorkspace(), project, name, bytes, { connection: remote, progress }); }
+          catch (e) { if (storageClient.refusedLogin?.(e)) return storageLoginRejected(res); throw e; }
           if(reduction){file.attachment.reduction=reduction;file.attachment.reason=[file.attachment.reason,reduction.note].filter(Boolean).join(' ');}
           if (getProject(id) !== project) return json(res, 409, { error: 'Project removed during upload.' });
           if (remote) project.sourceFolders = [...new Set([...(project.sourceFolders || []), project.projectFolder])];
@@ -541,15 +553,16 @@ function createProjectRoutes({
           return json(res, 200, { name: rawName, path: rawName, bytes: bytes.length, document: file.document });
         }
         if (!project.projectFolder) {
-          const folder = await ensureProjectFolder(project);
-          if (!folder) return json(res, 502, { error: 'Could not create the project storage folder. Check your storage connection and retry.' });
-          project.projectFolder = folder;
+          const made = await ensureFolder(project);
+          if (!made.folder) return made.loginRejected ? storageLoginRejected(res) : json(res, 502, { error: 'Could not create the project storage folder. Check your storage connection and retry.' });
+          project.projectFolder = made.folder;
         }
         project.sourceFolders = [...new Set([...(project.sourceFolders || []), project.projectFolder])];
         saveProjects(PROJECTS);
         try {
           await storageClient.writeFile(connection, `${project.projectFolder}/${rawName}`, bytes);
         } catch (e) {
+          if (storageClient.refusedLogin?.(e)) return storageLoginRejected(res);
           return json(res, (e && e.status) || 502, { error: (e && e.message) || 'could not save the file' });
         }
         let file;

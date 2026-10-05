@@ -675,7 +675,11 @@ function createChatHandler({
       model = lastLoadedModel();
     }
     if (!model) {
-      return json(res, 400, { error: 'no model selected and none loaded — pick one in the model popup' });
+      // #848: "none loaded" is true only of the local provider, the one place a loaded model is a
+      // fallback; for any other provider the loaded local model is irrelevant to this request.
+      return json(res, 400, { error: provider.id === DEFAULT_PROVIDER_ID
+        ? 'no model selected and none loaded — pick one in the model popup'
+        : `no model selected for ${provider.label || provider.id} — pick one in the model popup` });
     }
     // #409: project.model is a stored, explicit pick that (until now) had no server-side guard
     // when it was saved — a project saved before this guard existed, or written directly through

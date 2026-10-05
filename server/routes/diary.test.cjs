@@ -191,3 +191,16 @@ test('entry edits forward base_hash and relay a 409 conflict body unchanged', as
   await plain.call('diary', 'POST', '/api/diary/entries/edit', { xid: 'x1', me: 'draft' });
   assert.deepEqual(plain.sent.pop(), { status: 409, body: { error: 'etag clash' } }, 'non-conflict 409s keep the old shape');
 });
+
+test('#849: a storage login the sidecar reports as refused reaches the browser as a 4xx with its stable code', async () => {
+  const refused = { ok: false, status: 424, body: { detail: 'Storage login rejected. Check your storage credentials in Settings → Diary & storage.', code: 'storageLoginRejected' } };
+  const f = fixture({ reply: () => refused });
+  await f.call('diary', 'GET', '/api/diary/files', undefined, { search: '?path=Notes' });
+  assert.deepEqual(f.sent.pop(), { status: 424, body: { error: refused.body.detail, code: 'storageLoginRejected' } });
+  await f.call('diary', 'POST', '/api/diary/file', { path: 'a.md' });
+  assert.deepEqual(f.sent.pop(), { status: 424, body: { error: refused.body.detail, code: 'storageLoginRejected' } });
+  // No other sidecar field is passed on, and an ordinary failure keeps its old shape.
+  const other = fixture({ reply: () => ({ ok: false, status: 500, body: { detail: 'boom', code: 'internal-detail' } }) });
+  await other.call('diary', 'GET', '/api/diary/files');
+  assert.deepEqual(other.sent.pop(), { status: 500, body: { error: 'boom' } });
+});

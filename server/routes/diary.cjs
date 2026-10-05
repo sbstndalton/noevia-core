@@ -125,7 +125,10 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
         }, {withStorageCredential:diary.withStorageCredential, onEvent:event=>{if(event.type==='mtp')require('../mtp.cjs').record(authn.user.id,event.model,event.timings);}});
       }
       const r = await diaryFetchJson(`${DIARY_BASE}/api${suffix}`, { method: req.method, body }, local ? 600000 : 60000);
-      return json(res, r.status, r.ok ? r.body : { error: r.body?.detail || r.body?.error || 'Diary storage request failed' });
+      // #849: the sidecar tags a storage login the server refused (424, code storageLoginRejected); the
+      // code is passed on so the browser words it in the interface language. Nothing else is passed.
+      const code = r.body?.code === 'storageLoginRejected' ? { code: r.body.code } : {};
+      return json(res, r.status, r.ok ? r.body : { error: r.body?.detail || r.body?.error || 'Diary storage request failed', ...code });
     }
 
     if (p === '/api/diary/source') {

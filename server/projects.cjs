@@ -437,18 +437,26 @@ function createProjectStore({
    *  browsable storage to put it in. Never throws: a project must still be
    *  creatable when storage is down or unconfigured. */
   async function ensureProjectFolder(project) {
+    return (await ensureProjectFolderDetailed(project)).folder;
+  }
+
+  /** ensureProjectFolder with the reason it failed (#849): `{ folder }` on success, otherwise
+   *  `{ folder: null, loginRejected }` where loginRejected is true when the storage server
+   *  refused the saved login (401/403), so a caller can say that instead of a generic failure.
+   *  Never throws. */
+  async function ensureProjectFolderDetailed(project) {
     let connection;
     try {
       connection = authService.getStorage(currentWorkspace().userId, true);
     } catch {
-      return null;
+      return { folder: null, loginRejected: false };
     }
-    if (!storageClient.isBrowsable(connection)) return null;
+    if (!storageClient.isBrowsable(connection)) return { folder: null, loginRejected: false };
     try {
-      return await createProjectFolder(storageClient, connection, PROJECT_ROOT_FOLDER, project);
+      return { folder: await createProjectFolder(storageClient, connection, PROJECT_ROOT_FOLDER, project), loginRejected: false };
     } catch (err) {
       console.warn(`[projects] could not create folder for project ${project.id}: ${String((err && err.message) || err)}`);
-      return null;
+      return { folder: null, loginRejected: typeof storageClient.refusedLogin === 'function' && storageClient.refusedLogin(err) };
     }
   }
 
@@ -671,7 +679,7 @@ function createProjectStore({
     saveProjects, getProject, sanitizeChats, loadChats, saveChats, chatIdsElsewhere, deleteChat, moveChat, purgeProjectChats, saveFreeChats, deleteFreeChat, createProject,
     deleteProject, removeChatAttachments, removeOrphanChatContexts,
     historyPath, readHistory, writeHistory,
-    ownsFile, ensureProjectFolder, withSourceLock, pruneDocuments, writeProjectTextFile, sweepDeletedProject, indexSource,
+    ownsFile, ensureProjectFolder, ensureProjectFolderDetailed, withSourceLock, pruneDocuments, writeProjectTextFile, sweepDeletedProject, indexSource,
   };
 }
 

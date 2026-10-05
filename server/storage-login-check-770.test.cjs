@@ -195,3 +195,16 @@ test('a refresh 401/403 says the storage login was rejected and keeps the retain
   assert.equal(s.sourceRefreshFailure(new Error('storage returned 500')), 'Sources could not be refreshed — storage returned 500.');
   assert.match(s.sourceStatus({ document: { state: 'failed', stale: true, error: 'storage returned 401' } }), /Storage login rejected/);
 });
+
+test('#849: an upload the server failed with a refused storage login reads as that, in the interface language', () => {
+  const s = sourceStatus();
+  const t = (key) => `[${key}]`;
+  const rejected = Object.assign(new Error('Storage login rejected. Check your storage credentials in Settings → Diary & storage.'), { code: 'storageLoginRejected' });
+  assert.equal(s.uploadFailureText(rejected), 'Storage login rejected. Check your storage credentials in Settings → Diary & storage.');
+  assert.equal(s.uploadFailureText(rejected, t), '[storage.refreshLoginRejected]');
+  assert.ok(s.mentionsStorageLogin(s.uploadFailureText(rejected, t), t), 'the Settings link logic recognises it');
+  // Everything else keeps the server's message, or the caller's fallback for a non-Error.
+  assert.equal(s.uploadFailureText(new Error('Could not create the storage folder; retry.'), t), 'Could not create the storage folder; retry.');
+  assert.equal(s.uploadFailureText('boom', t, 'Upload failed'), 'Upload failed');
+  assert.equal(s.uploadFailureText(null, t, 'Upload failed'), 'Upload failed');
+});
