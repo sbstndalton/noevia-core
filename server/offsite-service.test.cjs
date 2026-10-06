@@ -229,3 +229,17 @@ test('#845: connectGoogle runs the caller hook when the Drive sign-in is approve
   service.connectGoogle('u1', () => { throw new Error('hook failed'); }); // must not throw
   service.connectGoogle('u1'); // no hook is fine
 });
+
+test('#892: a concurrent Google connect never returns another admin\'s pending sign-in', async () => {
+  const pendingOf = (owner) => ({ configured: true, state: 'pending', userCode: 'SYNTH-CODE', verificationUrl: 'https://example.invalid/device', expiresAt: 1, owner });
+  // Both admins passed refuseForeign before either sign-in existed; A's landed first.
+  const route = createOffsiteRoutes({ service: { status: () => ({}), connectGoogle: async () => pendingOf('admin-a') }, json: (res, status, body) => Object.assign(res, { status, body }) });
+  const call = async (id) => { const res = {}; await route({ method: 'POST' }, res, { path: '/api/admin/offsite-backup/google/connect', authn: { user: { id, role: 'admin' } } }); return res; };
+  const b = await call('admin-b');
+  assert.equal(b.status, 409);
+  assert.deepEqual(b.body, { error: 'Another administrator is connecting Google Drive.' });
+  const a = await call('admin-a');
+  assert.equal(a.status, 200);
+  assert.equal(a.body.userCode, 'SYNTH-CODE', 'the owner still sees their own code');
+  assert.equal('owner' in a.body, false, 'owner is not exposed');
+});

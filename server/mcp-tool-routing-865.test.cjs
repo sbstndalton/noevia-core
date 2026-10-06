@@ -228,3 +228,16 @@ test('more_tools: the rest of the round keeps the narrowed routes; the widened o
   await h.run();
   assert.deepEqual(h.seen, [{ name: 'search_files', route: 'narrow-server' }, { name: 'search_files', route: 'wide-server' }]);
 });
+
+test('#891: a fixed caller never falls back to a directory server when no operator server offers the tool', async () => {
+  const s = await setup();
+  // dir_only is offered only by the directory server: name routing alone would send it there.
+  await assert.rejects(s.asUser(() => s.wiring.executeOperatorToolCall('dir_only', { query: 'synthetic' })),
+    (e) => e.publicMessage === 'Web search is not configured on this server.');
+  assert.equal(s.mcp.calls.length, 0, 'the directory server received nothing');
+  // The operator server still takes the call when it offers the tool, even if the directory shares the name.
+  assert.equal(await s.asUser(() => s.wiring.executeOperatorToolCall('search_files', {})), `${NC_URL}:search_files`);
+  assert.deepEqual(s.mcp.calls.map((c) => c.url), [NC_URL]);
+  // Chat tool calls keep name routing: a directory-only tool still runs there.
+  assert.equal(await s.asUser(() => s.wiring.executeMcpToolCall('dir_only', {})), `${DIR_URL}:dir_only`);
+});

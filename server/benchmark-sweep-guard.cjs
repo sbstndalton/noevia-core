@@ -17,8 +17,9 @@ const SWEEP_PAUSE_REASON = 'Chat is paused while noevia runs a throughput sweep.
 const SWEEP_BUSY_ERROR = 'Requests are in progress, or a calibration, auto-tune or settings change is running. Wait for it to finish, then start the sweep.';
 
 function createSweepGuard({ hold, progress, log = () => {}, pollMs = 5000, perModelMs = 30 * 60 * 1000, slackMs = 5 * 60 * 1000,
-  unreachableMs = 2 * 60 * 1000, now = () => Date.now(), setTimer = setTimeout, clearTimer = clearTimeout }) {
-  let watching = null;
+  unreachableMs = 2 * 60 * 1000, now = () => Date.now(), setTimer = setTimeout, clearTimer = clearTimeout,
+  adoptRetryMs = 2000, adoptMaxDelayMs = 60 * 1000, adoptAttempts = 10 }) {
+  let watching = null, adoptTimer = null, adoptWake = null, adoptCancelled = false;
 
   // Takes the gate or throws a 409 for the client. Returns a release that is safe to call twice.
   function acquire() {
@@ -60,10 +61,26 @@ function createSweepGuard({ hold, progress, log = () => {}, pollMs = 5000, perMo
   }
 
   // After a web restart the gate is gone but a sweep may still be running in its container.
-  // Ask once and take the gate back for it; a busy gate or an unreachable manager is left alone.
+  // Ask until the model manager gives a definitive answer and take the gate back for a running
+  // sweep. A manager still starting (no reply, or not ok) is asked again with a doubling delay,
+  // at most `adoptAttempts` times (#895); the waits are unref'd and cancelAdopt() cancels them. A busy
+  // gate is left alone.
+  const pause = (ms) => new Promise((resolve) => {
+    adoptWake = resolve;
+    adoptTimer = setTimer(() => { adoptTimer = null; adoptWake = null; resolve(); }, ms);
+    if (adoptTimer?.unref) adoptTimer.unref();
+  });
   async function adopt() {
-    let job = null;
-    try { const r = await progress(); job = r?.ok && r.body && typeof r.body === 'object' ? r.body.job || null : null; } catch { return false; }
+    let job;
+    for (let attempt = 1, delay = adoptRetryMs; ; attempt += 1, delay = Math.min(delay * 2, adoptMaxDelayMs)) {
+      if (adoptCancelled) return false;
+      let r = null;
+      try { r = await progress(); } catch { r = null; }
+      if (adoptCancelled) return false;
+      if (r?.ok && r.body && typeof r.body === 'object') { job = r.body.job || null; break; }
+      if (attempt >= adoptAttempts) { log('[models] throughput sweep: the model manager did not answer after a restart; not adopting.'); return false; }
+      await pause(delay);
+    }
     // Only a throughput sweep (counted in models) runs outside the engine; the prompt suite does not.
     if (!job || job.active !== true || job.unit !== 'models' || watching) return false;
     let release;
@@ -73,7 +90,14 @@ function createSweepGuard({ hold, progress, log = () => {}, pollMs = 5000, perMo
     return true;
   }
 
-  return { acquire, watch, adopt, active: () => !!watching };
+  // Cancels a pending adopt() retry (shutdown, tests); adopt() then resolves false.
+  function cancelAdopt() {
+    adoptCancelled = true;
+    if (adoptTimer) { clearTimer(adoptTimer); adoptTimer = null; }
+    if (adoptWake) { const wake = adoptWake; adoptWake = null; wake(); }
+  }
+
+  return { acquire, watch, adopt, cancelAdopt, active: () => !!watching };
 }
 
 module.exports = { createSweepGuard, SWEEP_PAUSE_REASON, SWEEP_BUSY_ERROR };

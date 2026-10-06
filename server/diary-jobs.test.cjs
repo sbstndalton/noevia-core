@@ -81,3 +81,15 @@ test('#874 a failed throttled write is retried by finish()',t=>{
  fail=false;clock+=10;j.finish();
  const row=JSON.parse(fs.readFileSync(file,'utf8'));assert.equal(row.content,'kept text');assert.equal(row.state,'complete');
 });
+test('#894 a failed immediate write (done) is retried by finish()',t=>{
+ const w=fixture(t);
+ const j=jobs.start(w,data,{saveIntervalMs:500,now:()=>1000,setTimer:()=>({unref(){}}),clearTimer:()=>{}});
+ const file=path.join(w.dir,'diary-conversations',data.entryDay,data.exchangeId+'.json');
+ j.event({type:'diary',decision:'logged'});
+ const original=fs.renameSync;let fail=true;fs.renameSync=(...args)=>{if(fail&&String(args[1])===file)throw Object.assign(Error('disk full'),{code:'ENOSPC'});return original(...args);};t.after(()=>{fs.renameSync=original;});
+ assert.throws(()=>j.event({type:'done'}),/disk full/);
+ assert.equal(JSON.parse(fs.readFileSync(file,'utf8')).state,'running','the done write failed');
+ fail=false;j.finish();
+ assert.equal(JSON.parse(fs.readFileSync(file,'utf8')).state,'complete','finish() retried the failed write');
+ assert.equal(jobs.list(w,data.entryDay)[0].state,'complete');
+});

@@ -55,7 +55,8 @@ function start(workspace,{entryDay,exchangeId,message,kind,preparationId},{saveI
    if(event.type==='error'){row.state='uncertain';row.error='The connection or save was interrupted. Check the saved diary before sending again.';}
    if(event.type==='done'){row.state=(row.kind==='preparation'||row.decision&&row.decision!=='error')&&row.state!=='uncertain'?'complete':'uncertain';}
    row.updatedAt=Date.now();
-   if(IMMEDIATE.has(event.type))save();else saveSoon();
+   // dirty first: if this write fails, finish() still retries it (#894).
+   if(IMMEDIATE.has(event.type)){dirty=true;save();}else saveSoon();
   },
   finish(){try{const interrupted=row.state==='running';if(interrupted)row.state='uncertain';if(interrupted||dirty)save();}finally{if(timer){clearTimer(timer);timer=null;}active.delete(file);}},
  };

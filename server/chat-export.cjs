@@ -90,7 +90,8 @@ function buildExport({ freeChats = [], projects = [], readHistory, now = Date.no
   };
   const idPart = (id) => String(id).replace(/[^a-zA-Z0-9_-]/g, '');
   // conversations.json is assembled chat by chat, byte for byte what JSON.stringify(whole, null, 2)
-  // gives, so the size is known as it grows and no single giant string is ever built.
+  // gives. Each chat's bytes are counted once, as they are made; the file itself is joined as
+  // buffers, and only its wrapper (header, separators, footer) is counted when it is added (#893).
   const addChat = (chat, project) => {
     const history = readHistory(chat.id);
     const md = chatMarkdown(chat, history);
@@ -101,8 +102,9 @@ function buildExport({ freeChats = [], projects = [], readHistory, now = Date.no
       if (error instanceof RangeError) throw tooLarge(); // 'Invalid string length'
       throw error;
     }
-    take(Buffer.byteLength(json, 'utf8'));
-    chatJson.push(json);
+    const data = Buffer.from(json, 'utf8');
+    take(data.length);
+    chatJson.push(data);
     return md;
   };
   for (const chat of freeChats) add(`chats/${slug(chat.title, 'untitled-chat')}-${idPart(chat.id)}.md`, addChat(chat, null));
@@ -112,7 +114,15 @@ function buildExport({ freeChats = [], projects = [], readHistory, now = Date.no
   }
   const count = chatJson.length;
   add('README.md', `# noevia conversations\n\nExported ${new Date(now).toISOString()}. ${count} chat${count === 1 ? '' : 's'}.\n\n- \`chats/\`: chats outside projects, one Markdown file each.\n- \`projects/\`: chats grouped by project.\n- \`conversations.json\`: everything above in one file (format ${FORMAT}).\n\nThinking text is not included.\n`);
-  add('conversations.json', `{\n  "format": ${JSON.stringify(FORMAT)},\n  "exportedAt": ${JSON.stringify(new Date(now).toISOString())},\n  "chats": ${count ? `[\n    ${chatJson.join(',\n    ')}\n  ]` : '[]'}\n}`);
+  const head = Buffer.from(`{\n  "format": ${JSON.stringify(FORMAT)},\n  "exportedAt": ${JSON.stringify(new Date(now).toISOString())},\n  "chats": ${count ? '[\n    ' : '[]'}`, 'utf8');
+  const sep = Buffer.from(',\n    ', 'utf8'), tail = Buffer.from(`${count ? '\n  ]' : ''}\n}`, 'utf8');
+  const parts = [head];
+  chatJson.forEach((data, i) => { if (i) parts.push(sep); parts.push(data); });
+  parts.push(tail);
+  // The chats' own bytes were taken in addChat; count only the wrapper here.
+  take(head.length + tail.length + sep.length * Math.max(0, count - 1));
+  taken.add('conversations.json');
+  entries.push({ name: 'conversations.json', data: Buffer.concat(parts) });
   return zipStore(entries, now);
 }
 

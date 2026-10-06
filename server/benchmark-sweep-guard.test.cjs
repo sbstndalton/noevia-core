@@ -53,3 +53,48 @@ test('#873 a progress call that throws counts as unreachable', async () => {
   await h.tick();
   assert.equal(h.gate.held(), false); assert.equal(h.guard.active(), false);
 });
+
+test('#895 adopt() retries with bounded backoff until the model manager answers, then takes the gate', async () => {
+  const replies = [() => { throw Error('ECONNREFUSED'); }, () => ({ ok: false, status: 503 }), () => ({ ok: true, body: { job: { active: true, unit: 'models', total: 2 } } })];
+  let calls = 0;
+  const h = harness({ progress: async () => replies[calls++](), adoptRetryMs: 100, adoptMaxDelayMs: 150 });
+  const adopted = h.guard.adopt();
+  await new Promise(setImmediate);
+  assert.equal(calls, 1); assert.equal(h.gate.held(), false, 'not yet');
+  assert.equal(h.timers.length, 1); assert.equal(h.timers[0].ms, 100);
+  h.timers.shift().fn(); await new Promise(setImmediate);
+  assert.equal(calls, 2); assert.equal(h.timers[0].ms, 150, 'the delay doubles up to the cap');
+  h.timers.shift().fn();
+  assert.equal(await adopted, true);
+  assert.equal(calls, 3); assert.equal(h.gate.held(), true, 'the running sweep holds the gate again');
+  assert.throws(() => h.gate.enter(), (e) => e.message === SWEEP_PAUSE_REASON);
+  assert.equal(h.guard.active(), true);
+});
+
+test('#895 adopt() gives up after its attempts, and cancelAdopt() ends a pending retry', async () => {
+  let calls = 0;
+  const h = harness({ progress: async () => { calls++; return null; }, adoptRetryMs: 10, adoptAttempts: 3 });
+  const gaveUp = h.guard.adopt();
+  for (let i = 0; i < 2; i++) { await new Promise(setImmediate); h.timers.shift().fn(); }
+  assert.equal(await gaveUp, false); assert.equal(calls, 3); assert.equal(h.timers.length, 0); assert.equal(h.gate.held(), false);
+  const c = harness({ progress: async () => null, adoptRetryMs: 10 });
+  const cancelled = c.guard.adopt();
+  await new Promise(setImmediate);
+  assert.equal(c.timers.length, 1);
+  c.guard.cancelAdopt();
+  assert.equal(await cancelled, false); assert.equal(c.gate.held(), false);
+  // A definitive "nothing running" answers at once, without retrying.
+  const idle = harness({ progress: async () => ({ ok: true, body: { job: null } }) });
+  assert.equal(await idle.guard.adopt(), false); assert.equal(idle.timers.length, 0);
+});
+
+test('#895 the real timers are unref\'d, so a pending adopt() retry does not keep the process alive', async () => {
+  const unrefs = [];
+  const guard = createSweepGuard({ hold: () => () => {}, progress: async () => null, log: () => {}, adoptRetryMs: 60000,
+    setTimer: (fn, ms) => { const t = setTimeout(fn, ms); const unref = t.unref.bind(t); t.unref = () => { unrefs.push(ms); return unref(); }; return t; } });
+  const pending = guard.adopt();
+  await new Promise(setImmediate);
+  assert.deepEqual(unrefs, [60000]);
+  guard.cancelAdopt();
+  assert.equal(await pending, false);
+});

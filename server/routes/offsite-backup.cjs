@@ -26,7 +26,16 @@ function createOffsiteRoutes({ service, json }) {
     run: () => service.runNow(),
     verify: () => service.verifyNow(),
     copy: () => service.copyNow(),
-    'google/connect': (authn) => { refuseForeign(authn); return service.connectGoogle(authn.user.id); },
+    'google/connect': async (authn) => {
+      refuseForeign(authn);
+      // Two connects can pass refuseForeign together; the later one then gets the first one's
+      // pending sign-in back. Filter it like publicStatus: never another admin's code (#892).
+      const google = await service.connectGoogle(authn.user.id);
+      if (foreignPending(google, authn.user)) throw Object.assign(Error(OTHER_ADMIN), { status: 409, publicMessage: OTHER_ADMIN });
+      if (!google || typeof google !== 'object') return google;
+      const { owner, ...rest } = google;
+      return rest;
+    },
     'google/disconnect': (authn) => { refuseForeign(authn); return service.disconnectGoogle(); },
   };
   return async function offsiteRoutes(req, res, { path, authn }) {

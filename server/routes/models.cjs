@@ -618,6 +618,7 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
   };
   // Settles once the startup check for a still-running sweep is done (tests await it).
   modelRoutes.sweepAdopted = sweepAdopted;
+  modelRoutes.cancelSweepAdopt = () => sweepGuard?.cancelAdopt();
   return modelRoutes;
 }
 

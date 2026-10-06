@@ -137,3 +137,17 @@ test('a history too large to stringify becomes a 413, not a RangeError (#867)', 
   const huge = { toJSON() { throw new RangeError('Invalid string length'); } };
   assert.throws(() => buildExport({ freeChats: [{ id: 'c-1', title: 'x' }], readHistory: () => [{ role: 'user', content: 'x', extra: huge }] }), (e) => e.status === 413);
 });
+
+test('#893: the byte cap counts every exported byte once, so chats exactly at the cap still export', () => {
+  const { ExportTooLargeError } = require('./chat-export.cjs');
+  const files = unzip(buildExport(fixtureArgs()));
+  const exact = Object.values(files).reduce((n, text) => n + Buffer.byteLength(text, 'utf8'), 0);
+  // Exactly the content size fits; one byte less does not.
+  assert.ok(buildExport(fixtureArgs({ maxBytes: exact })).equals(buildExport(fixtureArgs())));
+  assert.throws(() => buildExport(fixtureArgs({ maxBytes: exact - 1 })), (e) => e instanceof ExportTooLargeError);
+  // Same with no chats at all (the "[]" wrapper).
+  const none = { readHistory: () => [], now: Date.UTC(2026, 9, 5) };
+  const noneSize = Object.values(unzip(buildExport(none))).reduce((n, text) => n + Buffer.byteLength(text, 'utf8'), 0);
+  assert.ok(buildExport({ ...none, maxBytes: noneSize }).length > 0);
+  assert.throws(() => buildExport({ ...none, maxBytes: noneSize - 1 }), (e) => e instanceof ExportTooLargeError);
+});

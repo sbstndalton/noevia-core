@@ -407,6 +407,20 @@ function createMcpWiring({
     return ids.length === 1 ? ids[0] : undefined;
   }
 
+  /** Run a fixed caller's tool (deep research's tavily_search / tavily_extract) on the one
+   *  operator server offering it. With no such server the call fails and nothing is sent: falling
+   *  back to name routing would hand the query, with that server's credential, to a directory
+   *  server (#891). Chat tool calls keep using executeMcpToolCall. */
+  async function executeOperatorToolCall(name, args, signal) {
+    const serverId = operatorServerFor(name);
+    if (serverId === undefined) {
+      logger.warn(`[mcp] refused "${name}" for a fixed caller: no single operator MCP server offers it`);
+      const message = 'Web search is not configured on this server.';
+      throw Object.assign(Error(message), { publicMessage: message });
+    }
+    return executeMcpToolCall(name, args, signal, serverId);
+  }
+
   async function executeMcpToolCall(name, args, signal, serverId) {
     const route = routeMcpTool(name, serverId);
     if (route.error) return route.error;
@@ -495,7 +509,7 @@ function createMcpWiring({
     oauthServerIds, accountReady, probeMcpAuth, syncDirectoryServers,
     discoverOneServer, discoverMcpTools,
     mcpStaticAuth, mcpAuthHeaders, mcpInternalAuth, internalCallProjectId, mcpDiscoveryAuth,
-    executeMcpToolCall, operatorServerFor,
+    executeMcpToolCall, operatorServerFor, executeOperatorToolCall,
   };
 }
 
