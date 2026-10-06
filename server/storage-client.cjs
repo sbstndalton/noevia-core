@@ -25,6 +25,7 @@
 
 const { signS3Request } = require('./s3-sign.cjs');
 const { normalizeS3Region } = require('./s3-region.cjs');
+const { readCappedText } = require('./http.cjs');
 
 
 // PROPFIND <href> text is XML-escaped (&amp; &lt; &gt; &quot; &apos; and numeric refs like &#38;);
@@ -101,31 +102,6 @@ const READ_CAP = 200_000; // matches the project-file upload cap
 const TEXT_BODY_CAP = READ_CAP * 4; // bytes read for a text preview (UTF-8 is at most 4 bytes a char)
 const LIST_BODY_CAP = 4 * 1024 * 1024; // a directory listing response
 
-/** Reads at most `cap` bytes of a response body as UTF-8, then cancels the rest of the stream. */
-async function readCappedText(response, cap) {
-  if (!response.body) return { text: '', capped: false };
-  const reader = response.body.getReader();
-  const chunks = [];
-  let size = 0, capped = false;
-  try {
-    while (size < cap) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      const room = cap - size;
-      const piece = value.byteLength > room ? value.subarray(0, room) : value;
-      chunks.push(Buffer.from(piece));
-      size += piece.byteLength;
-    }
-    if (size >= cap) {
-      const next = await reader.read().catch(() => ({ done: true }));
-      if (!next.done) { capped = true; await reader.cancel().catch(() => {}); }
-    }
-  } finally { reader.releaseLock(); }
-  // A multi-byte character cut at the cap decodes to U+FFFD; drop it.
-  let text = Buffer.concat(chunks, size).toString('utf8');
-  if (capped) text = text.replace(/\uFFFD$/, '');
-  return { text, capped };
-}
 const TEXT_EXTENSIONS = new Set([
   '.txt', '.md', '.markdown', '.json', '.csv', '.yml', '.yaml',
   '.ts', '.tsx', '.js', '.jsx', '.py', '.sh', '.html', '.css',
@@ -578,7 +554,10 @@ async function removeEmptyFolder(conn, rawPath) {
   }));
   if (response.status === 404) return { removed: false, reason: 'missing' };
   if (response.status !== 207) return { removed: false, reason: 'error' };
-  const body = await response.text();
+  // Capped like the listings (#902): an endless 207 must not be buffered. A cut-off listing
+  // could hide children, so it never leads to a DELETE.
+  const { text: body, capped } = await readCappedText(response, LIST_BODY_CAP);
+  if (capped) return { removed: false, reason: 'too-large' };
   const requestDir = decodeURIComponent(new URL(target).pathname).replace(/\/+$/, '');
   let etag = '', isCollection = false, children = 0;
   for (const block of elementTexts(body, 'response')) {
@@ -629,7 +608,9 @@ async function fileVersion(conn, rawPath) {
   }));
   if (response.status === 404) return { exists: false };
   if (response.status !== 207) throw Object.assign(new Error(`storage returned ${response.status}`), { status: 502, upstream: response.status });
-  const body = await response.text();
+  // Capped (#902); a cut-off reply is refused, never parsed for a partial file state.
+  const { text: body, capped } = await readCappedText(response, LIST_BODY_CAP);
+  if (capped) throw Object.assign(new Error('storage reply too large'), { status: 502, code: 'too_large' });
   const block = firstElementText(body, 'response');
   if (!block) throw Object.assign(new Error('storage returned no file state'), { status: 502 });
   // Attributes on the element (`<d:collection xmlns:d="DAV:"/>`) still mean a folder. Bounded,

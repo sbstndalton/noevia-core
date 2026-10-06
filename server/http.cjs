@@ -53,6 +53,65 @@ async function _readCappedText(res, limit) {
   return { overflow: false, text };
 }
 
+/** Reads at most `cap` bytes of a response body as UTF-8, then cancels the rest of the stream,
+ *  so a remote host (storage, model provider) streaming an endless body cannot make this
+ *  process buffer it (#787, #902, #903). Returns `{ text, capped }`; `capped` is true when
+ *  more than `cap` bytes were on offer. A body without a stream reader (a test stub) falls
+ *  back to its text(), cut to the cap. */
+async function readCappedText(response, cap) {
+  if (!response?.body || typeof response.body.getReader !== 'function') {
+    if (typeof response?.text !== 'function') return { text: '', capped: false };
+    const whole = Buffer.from(String(await response.text()), 'utf8');
+    if (whole.length <= cap) return { text: whole.toString('utf8'), capped: false };
+    return { text: whole.subarray(0, cap).toString('utf8').replace(/\uFFFD$/, ''), capped: true };
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let size = 0, capped = false;
+  try {
+    while (size < cap) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const room = cap - size;
+      const piece = value.byteLength > room ? value.subarray(0, room) : value;
+      chunks.push(Buffer.from(piece));
+      size += piece.byteLength;
+    }
+    if (size >= cap) {
+      const next = await reader.read().catch(() => ({ done: true }));
+      // Not awaited: cancelling one branch of a cloned (teed) body settles only once the other
+      // branch is cancelled or read too, so awaiting it here would hang.
+      if (!next.done) { capped = true; reader.cancel().catch(() => {}); }
+    }
+  } finally { reader.releaseLock(); }
+  // A multi-byte character cut at the cap decodes to U+FFFD; drop it.
+  let text = Buffer.concat(chunks, size).toString('utf8');
+  if (capped) text = text.replace(/\uFFFD$/, '');
+  return { text, capped };
+}
+
+/** Releases a reply that will not be read (a retry replaced it), so its socket closes instead
+ *  of staying open behind a locked, unread body. Never throws; a stub body without cancel is
+ *  left alone. */
+function discardBody(response) {
+  try {
+    const body = response?.body;
+    if (body && typeof body.cancel === 'function' && !body.locked) body.cancel().catch(() => {});
+  } catch { /* nothing to release */ }
+}
+
+/** A JSON reply of at most `cap` bytes. A longer one throws (`code: 'too_large'`, status 502)
+ *  instead of being parsed from a partial body. A test stub without a stream reader but with
+ *  json() keeps using it. */
+async function readCappedJson(response, cap) {
+  if ((!response?.body || typeof response.body.getReader !== 'function') && typeof response?.json === 'function' && typeof response?.text !== 'function') {
+    return response.json();
+  }
+  const { text, capped } = await readCappedText(response, cap);
+  if (capped) throw Object.assign(new Error(`reply exceeded the ${Math.round(cap / 1024)} KB limit`), { status: 502, code: 'too_large' });
+  return JSON.parse(text);
+}
+
 async function fetchJson(url, opts, timeoutMs, maxResponseBytes) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs || 15000);
@@ -161,4 +220,4 @@ function decodePathPart(raw) {
   try { return decodeURIComponent(raw); } catch { return null; }
 }
 
-module.exports = { json, unauthorized, decodePathPart, fetchJson, readBody, readJson, authResult, isJsonObject, requireJsonObject, answerUnhandled, parseRequestUrl, badRequestUrl, errorResponse, DEFAULT_MAX_RESPONSE_BYTES };
+module.exports = { json, unauthorized, decodePathPart, fetchJson, readBody, readJson, authResult, isJsonObject, requireJsonObject, answerUnhandled, parseRequestUrl, badRequestUrl, errorResponse, DEFAULT_MAX_RESPONSE_BYTES, readCappedText, readCappedJson, discardBody };

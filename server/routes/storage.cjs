@@ -2,7 +2,9 @@
 
 const { normalizeS3Region, S3_REGION_RE } = require('../s3-region.cjs');
 const { checkLogin } = require('../storage-client.cjs');
-const { requireJsonObject } = require('../http.cjs');
+const { requireJsonObject, readCappedJson } = require('../http.cjs');
+// A Nextcloud login-flow reply is a few hundred bytes; a server that streams more is refused (#902).
+const NEXTCLOUD_REPLY_CAP = 64 * 1024;
 // The user's own storage connection (Settings → Diary & storage): read and save it, test it,
 // browse and read files over it for project knowledge, create one folder, and the Nextcloud
 // Login Flow v2 that turns a URL into an app password without the user typing a secret here.
@@ -171,7 +173,7 @@ function createStorageRoutes({ json, readJson: readAnyJson, authService, storage
       try {
         const response = await fetch(`${baseUrl}/index.php/login/v2`, { method: 'POST', signal: AbortSignal.timeout(10000), redirect: 'error' });
         if (!response.ok) return json(res, 502, { error: `Nextcloud returned ${response.status}` });
-        const payload = await response.json(); const flowId = crypto.randomUUID();
+        const payload = await readCappedJson(response, NEXTCLOUD_REPLY_CAP); const flowId = crypto.randomUUID();
         for (const [id, flow] of nextcloudFlows) if (flow.expires < Date.now() || flow.userId === authn.user.id) nextcloudFlows.delete(id);
         if (nextcloudFlows.size >= 100) return json(res, 429, { error: 'Too many pending connections' });
         if (!endpointApproved(authn, payload.poll?.endpoint) || new URL(payload.login).protocol !== 'https:') return json(res, 400, { error: 'Invalid connection URLs' });
@@ -188,7 +190,10 @@ function createStorageRoutes({ json, readJson: readAnyJson, authService, storage
       const response = await fetch(flow.endpoint, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ token: flow.token }), signal: AbortSignal.timeout(10000), redirect: 'error' });
       if (response.status === 404) return json(res, 202, { pending: true });
       if (!response.ok) return json(res, 502, { error: `Nextcloud returned ${response.status}` });
-      const credentials = await response.json(); nextcloudFlows.delete(String(body.flowId));
+      let credentials;
+      try { credentials = await readCappedJson(response, NEXTCLOUD_REPLY_CAP); }
+      catch (e) { return json(res, 502, { error: e.code === 'too_large' ? 'Nextcloud reply too large' : 'Nextcloud returned an unreadable reply' }); }
+      nextcloudFlows.delete(String(body.flowId));
       const baseUrl = `${String(credentials.server).replace(/\/+$/, '')}/remote.php/dav/files/${encodeURIComponent(credentials.loginName)}`;
       if (!endpointApproved(authn, baseUrl)) return json(res, 403, { error: STORAGE_PRIVATE_URL_ERROR });
       return json(res, 200, authService.saveStorage(authn.user.id, { kind: 'nextcloud', baseUrl, username: credentials.loginName, secret: credentials.appPassword, corpusRoot: body.corpusRoot || 'Cowork/Diary' }));
