@@ -15,6 +15,8 @@ async function readCappedJson(response,limit=RESPONSE_CAP){
  } else {text=await response.text();if(Buffer.byteLength(text)>limit)throw tooLarge();}
  try{return JSON.parse(text);}catch{throw Error('Invalid PDF reduction response');}
 }
+// The worker's overall reduce budget (REDUCE_DEADLINE_SECONDS in services/ocr/pdf_reduce.py, 160 s)
+// must stay below this 180 s abort, or the worker keeps the single OCR slot after the web gives up (#914).
 async function prepare(name,bytes,{progress=()=>{},url=process.env.OCR_BASE_URL,fetchImpl=fetch}={}){
  if(bytes.length<=OUTPUT_CAP)return {name,bytes};
  if(!/\.pdf$/i.test(name) || bytes.length>INPUT_CAP)throw Object.assign(Error('Files are limited to 25 MB; PDFs up to 60 MB can be reduced automatically.'),{status:413});
