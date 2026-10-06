@@ -1,3 +1,4 @@
+const { readCappedJson } = require('./http.cjs');
 // Keep the browser/proxy connection alive throughout one journaled operation.
 // options.headers may be `(withSecret) => headers`; withStorageCredential (diary.cjs) then resends once
 // with the storage secret when the sidecar answers 428 before any stream starts.
@@ -34,7 +35,7 @@ async function proxyDiaryStream(res, url, options, { heartbeatMs = 5000, onEvent
       if (buffer.trim() && (!res.destroyed || job)) throw new Error('Incomplete diary stream');
     } else {
       // Compatibility with a previous sidecar during a rolling upgrade.
-      const full = await upstream.json(), choice = full.choices?.[0]?.message;
+      const full = await readCappedJson(upstream, 4 * 1024 * 1024), choice = full.choices?.[0]?.message;
       if (choice) {
         if (choice.reasoning_content) send({type:'reasoning',text:choice.reasoning_content});
         if (!choice.content) throw new Error('No companion answer');

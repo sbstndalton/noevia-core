@@ -1,4 +1,5 @@
 'use strict';
+const { readCappedJson } = require('./http.cjs');
 // Chat framing, phase 4 (#740): the reasoner pipeline, behind features.framingReasoner (which
 // also needs chatFraming). For a chat whose confirmed frame is "search" or "action", after the tool
 // gate pre-runs a READ-ONLY tool, the reasoner role (the framingReasonerModel admin setting; empty
@@ -76,7 +77,7 @@ function createEngineCompletion({ getProvider, providerHeaders, providerId, fetc
     const send = async (body) => {
       const r = await fetch(url, { method: 'POST', headers: providerHeaders(provider, { 'Content-Type': 'application/json' }), body: JSON.stringify(body), signal });
       if (!r.ok) return { ok: false, status: r.status };
-      return { ok: true, body: await r.json() };
+      return { ok: true, body: await readCappedJson(r, 4 * 1024 * 1024) };
     };
     const { body } = await requestPlanArtifact({ payload, send, constraint });
     const content = body?.choices?.[0]?.message?.content;

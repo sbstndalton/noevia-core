@@ -1,0 +1,11 @@
+[
+  { "file": "http.cjs", "match": "const text = await res.text();", "reason": "fetchJson's stub fallback (a test Response with no stream); the size is checked right after, and real replies take the streaming branch above it." },
+  { "file": "http.cjs", "match": "await response.text()", "reason": "readCappedText's own stub fallback (no stream reader); the result is cut to the cap." },
+  { "file": "http.cjs", "match": "await response.arrayBuffer()", "reason": "readCappedBuffer's own stub fallback (no stream reader); the result is cut to the cap." },
+  { "file": "http.cjs", "match": "return response.json();", "reason": "readCappedJson's fallback for a json()-only test stub; a real Response has a body stream and is read capped." },
+  { "file": "mcp.cjs", "match": "return await res.text();", "reason": "Fallback for a test double with no stream; real replies are read by the capped stream reader above it." },
+  { "file": "mcp-oauth.cjs", "match": "return r.json(); // test doubles", "reason": "Fallback for a test double with no stream; real replies go through readJsonCapped (256 KB)." },
+  { "file": "pdf-reduce.cjs", "match": "text=await response.text();", "reason": "Fallback for a test double with no stream; the size is checked straight after, and real replies stream with RESPONSE_CAP." },
+  { "file": "gdrive-files.cjs", "match": "await r.arrayBuffer()", "reason": "Fallback for a test double with no stream; real downloads go through the streaming readCapped(r, max) above it." },
+  { "file": "offsite-s3.cjs", "match": "await response.arrayBuffer()", "reason": "Fallback for a test double with no stream; real objects go through the streaming readCapped(response, limit) above it, with a declared-length pre-check." }
+]

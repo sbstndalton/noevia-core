@@ -44,7 +44,7 @@ const { createWorkspaceStore } = require('./workspace.cjs');
 const { createSecretStore } = require('./secrets.cjs');
 const { isPublicUrl, createEndpointApproved } = require('./ssrf.cjs');
 // One JSON reply shape, the 401, a bounded body read and the JSON fetch (http.cjs).
-const { json, unauthorized, fetchJson, readBody, readJson, authResult, errorResponse, answerUnhandled, parseRequestUrl, badRequestUrl } = require('./http.cjs');
+const { json, unauthorized, fetchJson, readBody, readJson, authResult, errorResponse, answerUnhandled, parseRequestUrl, badRequestUrl, readCappedJson } = require('./http.cjs');
 
 const PORT = Number(process.env.UI_PORT || 8021);
 const HOST = process.env.UI_HOST || '0.0.0.0';
@@ -558,7 +558,7 @@ const researchRoutes = require('./routes/research.cjs').createResearchRoutes({
           headers: providerHeaders(provider, { 'Content-Type': 'application/json' }), signal: AbortSignal.any([signal, AbortSignal.timeout(120000)]),
           body: JSON.stringify({ model, stream: false, max_tokens: maxTokens, messages }) });
         if (!r.ok) throw Object.assign(Error(`The model provider answered ${r.status}.`), { publicMessage: `The model provider answered ${r.status}.` });
-        const choice = (await r.json()).choices?.[0];
+        const choice = (await readCappedJson(r, 4 * 1024 * 1024)).choices?.[0];
         if (choice?.finish_reason === 'length') throw Object.assign(Error('A research step was cut off by the output limit.'), { publicMessage: 'A research step was cut off by the output limit.' });
         return String(choice?.message?.content || '');
         } finally { leave(); }

@@ -4,6 +4,7 @@ const { frameUntrusted } = require('./prompt-framing.cjs');
 // toolbox. Off unless features.kiwix is on and KIWIX_URL names the internal service.
 // Content is untrusted data: results are plain text, bounded, and labelled as reference.
 const { stripBoilerplate } = require('./research-sources.cjs');
+const { readCappedText } = require('./http.cjs');
 
 const ID = 'offline-wikipedia';
 const decode = (s) => String(s).replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'").replace(/&amp;/g, '&');
@@ -16,8 +17,8 @@ function createKiwixTools({ baseUrl, fetchImpl = fetch, cap = 8000, timeoutMs = 
   const get = async (pathAndQuery) => {
     const r = await fetchImpl(origin + pathAndQuery, { redirect: 'error', signal: AbortSignal.timeout(timeoutMs) });
     if (!r.ok) throw Error(`offline Wikipedia answered ${r.status}`);
-    const text = await r.text();
-    return text.length > 2_000_000 ? text.slice(0, 2_000_000) : text;
+    const { text } = await readCappedText(r, 2_000_000);
+    return text;
   };
   const schemas = [
     { type: 'function', function: { name: 'wikipedia_search', description: 'Search the offline Wikipedia. Returns titles with a path for wikipedia_read.',

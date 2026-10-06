@@ -1,4 +1,5 @@
 'use strict';
+const { readCappedText } = require('./http.cjs');
 
 // Scope results to endpoint and credentials as well as model name. Retry
 // failures shortly: a timeout or missing projector is not a model capability.
@@ -28,7 +29,7 @@ function createVisionProbe({ fetchImpl = fetch, now = Date.now, admit = null } =
       });
       if (response.ok) result = { supported: true, reason: null };
       else {
-        const body = await response.text();
+        const { text: body } = await readCappedText(response, 64 * 1024);
         const reason = /mmproj|projector/i.test(body)
           ? 'The inference server needs a multimodal projector (mmproj) configured.'
           : `The inference server rejected the image probe (HTTP ${response.status}). Check model configuration and server availability.`;

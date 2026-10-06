@@ -19,6 +19,7 @@
 const nodeFs = require('node:fs');
 const nodePath = require('node:path');
 const crypto = require('node:crypto');
+const { readCappedJson, readCappedBuffer } = require('./http.cjs');
 
 const SCOPE = 'https://www.googleapis.com/auth/drive.file openid email';
 const FOLDER = 'noevia-offsite';
@@ -93,7 +94,7 @@ function createGoogleDrive(o) {
 
   async function form(url, fields) {
     const r = await http(url, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(fields).toString() });
-    return { status: r.status, body: await r.json().catch(() => ({})) };
+    return { status: r.status, body: await readCappedJson(r, 256 * 1024).catch(() => ({})) };
   }
 
   function state() {
@@ -173,7 +174,7 @@ function createGoogleDrive(o) {
   async function call(url, init = {}) {
     const r = await request(url, init);
     if (!r.ok) throw fail(r.status === 404 ? 'Google Drive has no such file, or noevia cannot see it.' : `Google Drive answered ${r.status}.`, r.status === 404 ? 404 : 502, r.status === 404 ? undefined : 'driveAnswered', { status: r.status });
-    return r.status === 204 ? null : r.json();
+    return r.status === 204 ? null : readCappedJson(r, 8 * 1024 * 1024);
   }
 
   const folderQuery = (extra) => `${api}/files?q=${encodeURIComponent(extra)}`;
@@ -191,7 +192,9 @@ function createGoogleDrive(o) {
     if (!cfg) return false;
     const r = await request(`${api}/files/${encodeURIComponent(cfg.id)}?alt=media`);
     if (!r.ok) throw fail(`Google Drive answered ${r.status}.`, 502, 'driveAnswered', { status: r.status });
-    return Buffer.from(await r.arrayBuffer()).equals(localConfig);
+    // Only a reply of exactly the local config's size can match, so read one byte more than that.
+    const { bytes, capped } = await readCappedBuffer(r, localConfig.length + 1);
+    return !capped && bytes.equals(localConfig);
   }
 
   /**

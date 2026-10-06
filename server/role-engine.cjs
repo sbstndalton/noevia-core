@@ -48,6 +48,7 @@
 // message and no prompt text is ever logged. `call()` never throws: any failure is
 // `{ ok: false, code, reason }`.
 const crypto = require('node:crypto');
+const { readCappedJson } = require('./http.cjs');
 const { runGuardedStream, GuardAbortError, CorrectionFailedError } = require('./stream-guard.cjs');
 const { projectRoleContext, projectSharedDossier, serializeProjection, RoleContextLeakError, DOSSIER_ROLES } = require('./role-context.cjs');
 const { supportsJsonSchema, requestPlanArtifact } = require('./plan-constrained-decoding.cjs');
@@ -237,7 +238,7 @@ function createRoleEngine({ engine, fetch = (url, init) => globalThis.fetch(url,
       // The router's own listing (the model manager reads the same path without /v1).
       const res = await fetch(`${base(endpoint).replace(/\/v1$/, '')}/models`, { method: 'GET', redirect: 'error', signal: controller.signal, headers: headersFor(endpoint) });
       if (!res.ok) throw Object.assign(Error('model list failed'), { status: res.status });
-      return loadedFromModelList(await res.json(), kept);
+      return loadedFromModelList(await readCappedJson(res, 2 * 1024 * 1024), kept);
     } finally { clearTimeout(timer); }
   }
 

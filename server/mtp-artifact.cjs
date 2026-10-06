@@ -1,4 +1,5 @@
 'use strict';
+const { readCappedJson } = require('./http.cjs');
 // GGUF v2/v3 tensor directory inspection, bounded independently of weight size.
 // https://github.com/ggml-org/llama.cpp/blob/master/gguf-py/gguf/constants.py
 const LIMIT = 16 * 1024 * 1024;
@@ -51,7 +52,7 @@ async function check(repo,files,{fetchImpl=fetch}={}){
     try{
       const response=await fetchImpl(`https://huggingface.co/api/models/${repo}`,{signal:AbortSignal.timeout(10000)});
       if(!response.ok)throw Error('Public repository revision unavailable.');
-      const meta=await response.json(),revision=meta.sha;if(!/^[a-f0-9]{40,64}$/.test(revision||''))throw Error('Immutable repository revision unavailable.');
+      const meta=await readCappedJson(response,4*1024*1024),revision=meta.sha;if(!/^[a-f0-9]{40,64}$/.test(revision||''))throw Error('Immutable repository revision unavailable.');
       const evidence=[];
       for(const file of files){const url=`https://huggingface.co/${repo}/resolve/${revision}/${file.split('/').map(encodeURIComponent).join('/')}`;evidence.push({file,...inspect(await prefix(url,fetchImpl))});}
       if(evidence.some(e=>e.splitCount>files.length))throw Error('The selected variant does not enumerate every GGUF shard.');

@@ -1,4 +1,5 @@
 'use strict';
+const { readCappedJson } = require('./http.cjs');
 // The Planner's plan artifact, generated server-side (#517, #511; spec-agent-execution §2 output
 // contract). The JavaScript counterpart of the prompt-preparation experiment's local-architect step
 // (experiments/prompt-preparation/run.py `prepare`, P2): one non-streaming chat completion that
@@ -158,7 +159,7 @@ function createPlannerPlan({ enabled = () => false, engine, fetch = (url, init) 
       const send = async (payload, attemptSignal) => {
         const response = await fetch(url, { method: 'POST', redirect: 'error', signal: attemptSignal, headers, body: JSON.stringify(payload) });
         if (!response.ok) return { ok: false, status: response.status };
-        return { ok: true, status: response.status, body: await response.json() };
+        return { ok: true, status: response.status, body: await readCappedJson(response, 4 * 1024 * 1024) };
       };
 
       const controller = new AbortController();

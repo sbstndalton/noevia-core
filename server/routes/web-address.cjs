@@ -3,7 +3,7 @@
 // GET  /api/instance                 -> { id } (public; lets a new address prove it reaches this server)
 // GET  /api/admin/web-address        -> current address, where it came from, earlier addresses
 // POST /api/admin/web-address        -> { origin, force? } check that it reaches this server, then save
-const { isJsonObject } = require('../http.cjs');
+const { isJsonObject, readCappedJson } = require('../http.cjs');
 
 function createWebAddressRoutes({ auth, json, readBody, fetchImpl = fetch, timeoutMs = 8000 }) {
   /** Asks the new address for its instance id. Same id = the name routes here. */
@@ -11,7 +11,7 @@ function createWebAddressRoutes({ auth, json, readBody, fetchImpl = fetch, timeo
     try {
       const r = await fetchImpl(`${origin}/api/instance`, { signal: AbortSignal.timeout(timeoutMs), redirect: 'manual' });
       if (!r.ok) return `${new URL(origin).host} answered ${r.status}, not noevia.`;
-      const body = await r.json().catch(() => ({}));
+      const body = await readCappedJson(r, 64 * 1024).catch(() => ({}));
       return body.id === auth.instanceId ? null : `${new URL(origin).host} reaches a different server, not this noevia.`;
     } catch {
       return `${new URL(origin).host} can’t be reached yet. Check its DNS or tunnel route, then try again.`;

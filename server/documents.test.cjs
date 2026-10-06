@@ -157,7 +157,7 @@ test('audit: retrieval fallback retains source names but supplies only the head 
   const ragSource = fs.readFileSync(path.join(__dirname, 'rag.cjs'), 'utf8');
   const context = { module: { exports: {} }, process: { env: {} }, console: { warn: () => {} },
     require: name => {
-      if (['fs', 'path', 'crypto', './document-sources.cjs', './prompt-framing.cjs'].includes(name)) return require(name);
+      if (['fs', 'path', 'crypto', './document-sources.cjs', './prompt-framing.cjs', './http.cjs'].includes(name)) return require(name);
       throw new Error('Optional index intentionally unavailable in synthetic test');
     },
   };
@@ -275,7 +275,7 @@ test('retrieval fallback stays within the files-context budget, smallest first, 
   const ragSource = fs.readFileSync(path.join(__dirname, 'rag.cjs'), 'utf8');
   const context = { module: { exports: {} }, process: { env: {} }, console: { warn: () => {} },
     require: name => {
-      if (['fs', 'path', 'crypto', './document-sources.cjs', './prompt-framing.cjs'].includes(name)) return require(name);
+      if (['fs', 'path', 'crypto', './document-sources.cjs', './prompt-framing.cjs', './http.cjs'].includes(name)) return require(name);
       throw new Error('Optional index intentionally unavailable in synthetic test');
     },
   };

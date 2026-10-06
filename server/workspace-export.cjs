@@ -1,5 +1,6 @@
 const {Readable, Transform}=require('node:stream');
 const {pipeline}=require('node:stream/promises');
+const { readCappedJson } = require('./http.cjs');
 // `headers` is an object or `(withSecret) => headers`; `retry` resends once with the storage secret on a 428.
 async function proxyWorkspaceExport(res,url,headers,retry=(send)=>send(true)) {
   const headersFor=typeof headers==='function'?headers:()=>headers;
@@ -10,7 +11,7 @@ async function proxyWorkspaceExport(res,url,headers,retry=(send)=>send(true)) {
   try {
     const upstream=await retry((secret)=>fetch(url,{headers:headersFor(secret),signal:controller.signal}));
     if(!upstream.ok){
-      const body=await upstream.json().catch(()=>({}));
+      const body=await readCappedJson(upstream,64*1024).catch(()=>({}));
       res.writeHead(upstream.status,{'Content-Type':'application/json','Cache-Control':'no-store'});
       return res.end(JSON.stringify({error:typeof body.detail==='string'?body.detail:'Workspace export failed. Retry after checking storage.'}));
     }

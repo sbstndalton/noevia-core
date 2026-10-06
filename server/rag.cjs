@@ -15,6 +15,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { frameUntrusted } = require('./prompt-framing.cjs');
 const { notice: documentNotice } = require('./document-sources.cjs');
+const { readCappedText, readCappedJson } = require('./http.cjs');
 
 // Injected by init() from index.cjs (keeps this module testable standalone).
 let RAG_DIR = null;
@@ -152,7 +153,7 @@ async function probeEmbeddingSidecar(base) {
       signal: ctrl.signal,
     });
     if (!res.ok) return false;
-    const body = await res.json();
+    const body = await readCappedJson(res, 1024 * 1024);
     const items = Array.isArray(body?.data) ? body.data : [];
     return items.length >= 1 && Array.isArray(items[0]?.embedding) && items[0].embedding.length > 0;
   } catch {
@@ -178,7 +179,7 @@ async function probeEmbeddingRouter(base) {
       signal: ctrl.signal,
     });
     if (!res.ok) return false;
-    const body = await res.json();
+    const body = await readCappedJson(res, 2 * 1024 * 1024);
     const ids = Array.isArray(body?.data) ? body.data.map((m) => m?.id) : [];
     return ids.includes(EMBED_MODEL);
   } catch {
@@ -293,8 +294,9 @@ async function embedOnce(texts, signal) {
     body: JSON.stringify({ model: EMBED_MODEL, input: texts }),
     ...(signal ? { signal } : {}),
   });
-  if (!res.ok) throw new Error(`embeddings ${res.status}: ${(await res.text()).slice(0, 120)}`);
-  const body = await res.json();
+  if (!res.ok) throw new Error(`embeddings ${res.status}: ${(await readCappedText(res, 64 * 1024)).text.slice(0, 120)}`);
+  // A batch of 8 chunks, a few thousand floats each; 16 MB is far above that (#920).
+  const body = await readCappedJson(res, 16 * 1024 * 1024);
   return Array.isArray(body?.data) ? body.data : [];
   } finally {leave();}
 }

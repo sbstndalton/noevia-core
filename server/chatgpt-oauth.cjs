@@ -29,6 +29,7 @@
 // no dependencies; neither package is installed.
 
 const crypto = require('node:crypto');
+const { readCappedText } = require('./http.cjs');
 
 const KIND = 'chatgpt-oauth';
 const PROVIDER_ID = 'chatgpt-oauth';
@@ -451,7 +452,7 @@ function createChatGptOAuth({ db, secrets, fetchImpl = (...args) => globalThis.f
       headers: { 'content-type': form ? 'application/x-www-form-urlencoded' : 'application/json', accept: 'application/json', 'user-agent': USER_AGENT },
       body: form ? new URLSearchParams(body).toString() : JSON.stringify(body),
     });
-    const text = await r.text().catch(() => '');
+    const text = (await readCappedText(r, 256 * 1024).catch(() => ({ text: '' }))).text;
     let parsed = null;
     try { parsed = JSON.parse(text); } catch { parsed = null; }
     return { ok: r.ok, status: r.status, body: parsed };
@@ -698,7 +699,7 @@ function createChatGptOAuth({ db, secrets, fetchImpl = (...args) => globalThis.f
       }));
       if (r.headers.get('x-noevia-provider-message') === '1') return r;
       if (!r.ok || !r.body) {
-        const text = await r.text().catch(() => '');
+        const text = (await readCappedText(r, 64 * 1024).catch(() => ({ text: '' }))).text;
         return errorResponse(r.status || 502, upstreamMessage(text, r.status));
       }
       if (wantsStream) {
@@ -725,7 +726,7 @@ function createChatGptOAuth({ db, secrets, fetchImpl = (...args) => globalThis.f
     const r = await authorised(userId, (t) => fetchImpl(`${codexBase}/models?client_version=${encodeURIComponent(cfg.codexClientVersion)}`, {
       method: 'GET', redirect: 'error', signal: AbortSignal.timeout(TIMEOUT_MS), headers: upstreamHeaders(t, 'application/json'),
     }));
-    const text = await r.text().catch(() => '');
+    const text = (await readCappedText(r, 2 * 1024 * 1024).catch(() => ({ text: '' }))).text;
     if (r.headers.get('x-noevia-provider-message') === '1') { let m = ''; try { m = JSON.parse(text).error.message; } catch { /* fallthrough */ } throw fail(m || MESSAGES.reconnect, r.status); }
     const remember = (error) => { models.set(userId, { until: now() + MODEL_FAILURE_CACHE_MS, ids: null, error }); return fail(error, 502); };
     if (!r.ok) throw remember(upstreamMessage(text, r.status));

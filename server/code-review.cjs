@@ -1,4 +1,5 @@
 'use strict';
+const { readCappedJson } = require('./http.cjs');
 // Planner review of a finished Code change (#519, part of #511). Behind features.plannerReview, off.
 //
 // After a Code task's harness has finished and its workspace has been released, a reviewer model
@@ -201,7 +202,7 @@ function createEngineReviewer({ engine, fetch = (...args) => globalThis.fetch(..
       const send = async (payload) => {
         const response = await fetch(url, { method: 'POST', signal, headers, body: JSON.stringify(payload) });
         if (!response.ok) return { ok: false, status: response.status };
-        return { ok: true, status: response.status, body: await response.json() };
+        return { ok: true, status: response.status, body: await readCappedJson(response, 4 * 1024 * 1024) };
       };
       const payload = { ...(endpoint.model ? { model: endpoint.model } : {}), messages, temperature: 0, stream: false };
       let result;

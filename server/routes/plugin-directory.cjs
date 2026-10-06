@@ -1,4 +1,5 @@
 'use strict';
+const { readCappedText, readCappedJson } = require('../http.cjs');
 // GET /api/plugins/directory?kind=mcp|skills&q=  -> { items, source }   any signed-in user
 //
 // Read-only browsing of what other people publish: MCP servers from the public MCP registry
@@ -97,6 +98,9 @@ function skillItems(body) {
   }));
 }
 
+// A directory listing of 40 servers or one repo's skill folders; 4 MB is far above that (#920).
+const DIRECTORY_CAP = 4 * 1024 * 1024;
+
 function createPluginDirectoryRoutes({ json, fetchImpl = globalThis.fetch, now = () => Date.now() }) {
   const cache = new Map();
   async function load(kind, q) {
@@ -108,7 +112,8 @@ function createPluginDirectoryRoutes({ json, fetchImpl = globalThis.fetch, now =
       : 'https://api.github.com/repos/anthropics/skills/contents/skills';
     const r = await fetchImpl(url, { headers: { accept: 'application/json', 'user-agent': 'noevia' }, redirect: 'error', signal: AbortSignal.timeout(8000) });
     if (!r.ok) throw Object.assign(new Error(`The directory answered ${r.status}`), { status: 502 });
-    let items = kind === 'mcp' ? mcpItems(await r.json()) : skillItems(await r.json());
+    const listing = await readCappedJson(r, DIRECTORY_CAP);
+    let items = kind === 'mcp' ? mcpItems(listing) : skillItems(listing);
     if (kind === 'skills' && q) items = items.filter((i) => i.name.toLowerCase().includes(q.toLowerCase()));
     if (cache.size > 200) cache.clear();
     cache.set(key, { at: now(), items });
@@ -160,8 +165,8 @@ async function fetchPublishedSkill(name, { fetchImpl = globalThis.fetch } = {}) 
   const r = await fetchImpl(`https://raw.githubusercontent.com/anthropics/skills/main/skills/${name}/SKILL.md`, { headers: { 'user-agent': 'noevia' }, redirect: 'error', signal: AbortSignal.timeout(8000) });
   if (r.status === 404) throw Object.assign(new Error('That skill has no SKILL.md'), { status: 404 });
   if (!r.ok) throw Object.assign(new Error('The skills repository could not be reached right now.'), { status: 502 });
-  const content = await r.text();
-  if (Buffer.byteLength(content) > 32768) throw Object.assign(new Error('That skill is larger than the 32 KiB limit for project skills.'), { status: 422 });
+  const { text: content, capped } = await readCappedText(r, 32768);
+  if (capped) throw Object.assign(new Error('That skill is larger than the 32 KiB limit for project skills.'), { status: 422 });
   return content;
 }
 
@@ -172,7 +177,7 @@ async function findRegistryServer(name, { fetchImpl = globalThis.fetch } = {}) {
   const base = process.env.NOEVIA_QA_MCP_REGISTRY || 'https://registry.modelcontextprotocol.io';
   const r = await fetchImpl(`${base}/v0/servers?limit=40&search=${encodeURIComponent(name)}`, { headers: { accept: 'application/json', 'user-agent': 'noevia' }, redirect: 'error', signal: AbortSignal.timeout(8000) });
   if (!r.ok) throw Object.assign(new Error('The MCP registry could not be reached right now.'), { status: 502 });
-  return mcpItems(await r.json()).find((i) => i.id === name) || null;
+  return mcpItems(await readCappedJson(r, DIRECTORY_CAP)).find((i) => i.id === name) || null;
 }
 
 module.exports = { createPluginDirectoryRoutes, mcpItems, skillItems, fetchPublishedSkill, findRegistryServer, installable, RESERVED_HEADERS, fallbackServerName };

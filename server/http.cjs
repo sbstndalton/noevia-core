@@ -90,6 +90,36 @@ async function readCappedText(response, cap) {
   return { text, capped };
 }
 
+/** Reads at most `cap` bytes of a response body as raw bytes (for a byte-for-byte comparison).
+ *  Returns `{ bytes, capped }`; `capped` is true when more than `cap` bytes were on offer, and
+ *  the rest of the stream is cancelled. A stub without a stream reader falls back to
+ *  arrayBuffer(), cut to the cap. */
+async function readCappedBuffer(response, cap) {
+  if (!response?.body || typeof response.body.getReader !== 'function') {
+    if (typeof response?.arrayBuffer !== 'function') return { bytes: Buffer.alloc(0), capped: false };
+    const whole = Buffer.from(await response.arrayBuffer());
+    return whole.length <= cap ? { bytes: whole, capped: false } : { bytes: whole.subarray(0, cap), capped: true };
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let size = 0, capped = false;
+  try {
+    while (size < cap) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const room = cap - size;
+      const piece = value.byteLength > room ? value.subarray(0, room) : value;
+      chunks.push(Buffer.from(piece));
+      size += piece.byteLength;
+    }
+    if (size >= cap) {
+      const next = await reader.read().catch(() => ({ done: true }));
+      if (!next.done) { capped = true; reader.cancel().catch(() => {}); }
+    }
+  } finally { reader.releaseLock(); }
+  return { bytes: Buffer.concat(chunks, size), capped };
+}
+
 /** Releases a reply that will not be read (a retry replaced it), so its socket closes instead
  *  of staying open behind a locked, unread body. Never throws; a stub body without cancel is
  *  left alone. */
@@ -220,4 +250,4 @@ function decodePathPart(raw) {
   try { return decodeURIComponent(raw); } catch { return null; }
 }
 
-module.exports = { json, unauthorized, decodePathPart, fetchJson, readBody, readJson, authResult, isJsonObject, requireJsonObject, answerUnhandled, parseRequestUrl, badRequestUrl, errorResponse, DEFAULT_MAX_RESPONSE_BYTES, readCappedText, readCappedJson, discardBody };
+module.exports = { json, unauthorized, decodePathPart, fetchJson, readBody, readJson, authResult, isJsonObject, requireJsonObject, answerUnhandled, parseRequestUrl, badRequestUrl, errorResponse, DEFAULT_MAX_RESPONSE_BYTES, readCappedText, readCappedJson, readCappedBuffer, discardBody };

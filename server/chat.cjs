@@ -522,7 +522,7 @@ function createChatHandler({
           console.warn(`[vision] ${visionModel} could not describe (${r.status})`);
           return null;
         }
-        const body = await r.json();
+        const body = await readCappedJson(r, 4 * 1024 * 1024);
         const text = String(body?.choices?.[0]?.message?.content || '').trim();
         if (!text || body?.choices?.[0]?.finish_reason === 'length') return null;
         visionDescriptions.set(key, { text, until: Date.now() + 300000 });

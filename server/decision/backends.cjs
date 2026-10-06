@@ -1,4 +1,5 @@
 'use strict';
+const { readCappedJson } = require('../http.cjs');
 // Decision backends (docs/research/system-one/04 §4.4). Each answers `rank` for now; `choice` and
 // the llama-logit backend come with the routing prototype.
 
@@ -31,7 +32,7 @@ function llamaRerankBackend({ baseUrl, model = null, apiKey = null, fetchImpl = 
         body: JSON.stringify({ ...(model ? { model } : {}), query: String(request.question), documents, top_n: documents.length }),
       });
       if (!r.ok) throw Error(`rerank ${r.status}`);
-      const body = await r.json();
+      const body = await readCappedJson(r, 4 * 1024 * 1024);
       const rows = Array.isArray(body.results) ? body.results : [];
       const scores = {};
       for (const row of rows) {
@@ -88,7 +89,7 @@ function llamaLogitBackend({ baseUrl, fetchImpl = globalThis.fetch, nProbs = 50,
   async function call(method, route, body, signal) {
     const r = await fetchImpl(base + route, { method, headers: { 'content-type': 'application/json' }, ...(body ? { body: JSON.stringify(body) } : {}), signal });
     if (!r.ok) throw Error(`llama-logit ${route} ${r.status}`);
-    return r.json();
+    return readCappedJson(r, 4 * 1024 * 1024);
   }
   const post = (route, body, signal) => call('POST', route, body, signal);
   async function runtimeIdentity(signal) {

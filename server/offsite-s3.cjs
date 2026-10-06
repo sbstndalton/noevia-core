@@ -2,10 +2,13 @@
 // S3-compatible object store for offsite-backup.cjs (any provider speaking SigV4, path-style).
 // Credentials come from env and are only ever sent in signed headers, never in URLs or logs.
 const { signS3Request } = require('./s3-sign.cjs');
+const { readCappedText } = require('./http.cjs');
 
 // A data object is one sealed CHUNK (4 MiB + 28 bytes); manifests list files and stay far below
 // this. A destination that answers with more is refused while streaming, never buffered (#139).
 const MAX_OBJECT_BYTES = 64 * 1024 * 1024;
+// One page of a ListObjectsV2 reply (at most 1000 keys); 4 MB is far above that (#920).
+const LIST_PAGE_CAP = 4 * 1024 * 1024;
 const tooLarge = () => Object.assign(Error('A backup object from the destination is larger than any object this backup writes.'), { status: 502 });
 async function readCapped(response, limit) {
   const declared = Number(response.headers?.get?.('content-length'));
@@ -79,7 +82,8 @@ function createS3Store({ endpoint, bucket, region = 'us-east-1', accessKeyId, se
         if (token) target.searchParams.set('continuation-token', token);
         const r = await request('GET', target);
         if (!r.ok) throw Object.assign(Error(`The backup destination refused a listing (${r.status}).`), { status: 502 });
-        const xml = await r.text();
+        const { text: xml, capped } = await readCappedText(r, LIST_PAGE_CAP);
+        if (capped) throw Object.assign(Error('The backup destination sent a listing that was too large.'), { status: 502 });
         for (const m of xml.matchAll(/<Key>([\s\S]*?)<\/Key>/g)) keys.push(decode(m[1]).slice(skip));
         const next = xml.match(/<NextContinuationToken>([\s\S]*?)<\/NextContinuationToken>/);
         if (!/<IsTruncated>true<\/IsTruncated>/.test(xml) || !next) break;
