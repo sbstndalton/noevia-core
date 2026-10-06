@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { projectAppearance } = require('./project-appearance.cjs');
-const icons = require('./project-icons.json');
+const icons = require('../contracts/project-icons.json');
 test('legacy projects and unrelated patches do not reset identity', () => {
  assert.deepEqual(projectAppearance({name:'Existing project'}), {});
  assert.deepEqual({...{icon:'book',color:'#579fe5'},...projectAppearance({goal:'Updated'})},{icon:'book',color:'#579fe5'});

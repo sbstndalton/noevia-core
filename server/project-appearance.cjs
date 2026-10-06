@@ -1,4 +1,4 @@
-const icons = require('./project-icons.json');
+const icons = require('../contracts/project-icons.json');
 function projectAppearance(body) {
   const result = {};
   if (Object.hasOwn(body, 'icon')) {

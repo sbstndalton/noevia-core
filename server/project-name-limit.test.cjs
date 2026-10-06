@@ -11,7 +11,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { createProjectStore } = require('./projects.cjs');
-const { nameMaxLength } = require('./project-limits.json');
+const { nameMaxLength } = require('../contracts/project-limits.json');
 
 function fixture({ browsable = false } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-projects-'));
@@ -61,14 +61,14 @@ test('a name within the limit is preserved exactly (only trimmed, not shortened)
 
 test('projects.cjs reads the shared constant rather than a hardcoded 120', () => {
   const src = fs.readFileSync(path.join(__dirname, 'projects.cjs'), 'utf8');
-  assert.match(src, /require\(['"]\.\/project-limits\.json['"]\)/);
+  assert.match(src, /require\(['"]\.\.\/contracts\/project-limits\.json['"]\)/);
   assert.match(src, /slice\(0, PROJECT_NAME_MAX_LENGTH\)/);
   assert.doesNotMatch(src, /slice\(0, 120\)/, 'the literal 120 must not reappear once the shared constant exists');
 });
 
 test('routes/projects.cjs\'s PATCH handler reads the same shared constant, not its own literal 120', () => {
   const src = fs.readFileSync(path.join(__dirname, 'routes/projects.cjs'), 'utf8');
-  assert.match(src, /require\(['"]\.\.\/project-limits\.json['"]\)/);
+  assert.match(src, /require\(['"]\.\.\/\.\.\/contracts\/project-limits\.json['"]\)/);
   assert.match(src, /slice\(0, PROJECT_NAME_MAX_LENGTH\)/);
   assert.doesNotMatch(src, /patch\.name\.trim\(\)\.slice\(0, 120\)/, 'the PATCH path must not keep its own hardcoded 120');
 });

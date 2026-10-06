@@ -15,7 +15,7 @@ const DOCUMENT_UPLOAD_CAP = 25 * 1024 * 1024;
 const MAX_PROJECT_IMAGES = 12;
 // Shared with projects.cjs's createProject and the create/edit dialogs (src/project-limits.ts,
 // #398) so a name is capped identically everywhere it can be set.
-const { nameMaxLength: PROJECT_NAME_MAX_LENGTH } = require('../project-limits.json');
+const { nameMaxLength: PROJECT_NAME_MAX_LENGTH } = require('../../contracts/project-limits.json');
 const { isJsonObject } = require('../http.cjs');
 // #409: the composer's Manual model pick had no server-side guard at all — unlike PUT
 // /api/auto-roles (#343) and benchmark/start, which both already reject an embedding,

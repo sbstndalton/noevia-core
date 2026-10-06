@@ -1,7 +1,7 @@
 'use strict';
 // Which paths are the web client's own places (#359), so the static fallback answers them with
 // index.html and a shared link, a reload or Back/Forward to one of them opens the app there.
-// src/routes.ts is the client's half (the full path <-> place mapping); tests/routes.test.cjs
+// src/routes.ts is the client's half (the full path <-> place mapping); tests/server/routes.test.cjs
 // checks every path the client can produce is accepted here.
 //
 // Deliberately narrow: an unknown path still gets the JSON 404 it always did, /api/* is never a

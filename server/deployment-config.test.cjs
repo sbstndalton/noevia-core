@@ -1,4 +1,4 @@
-// Full-repository check: the web Docker build only includes apps/web and runs tests/*.test.cjs.
+// Full-repository check: the web Docker build only includes apps/web and runs tests/client and tests/server.
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');

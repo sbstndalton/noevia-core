@@ -13,7 +13,7 @@
 // The name length cap (#398) lives in one JSON file so the create/edit dialogs
 // (src/project-limits.ts) enforce the same limit the server applies here and in
 // routes/projects.cjs's PATCH handler.
-const { nameMaxLength: PROJECT_NAME_MAX_LENGTH } = require('./project-limits.json');
+const { nameMaxLength: PROJECT_NAME_MAX_LENGTH } = require('../contracts/project-limits.json');
 
 /**
  * @param {object} deps
