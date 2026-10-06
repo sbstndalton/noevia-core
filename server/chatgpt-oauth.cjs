@@ -553,7 +553,7 @@ function createChatGptOAuth({ db, secrets, fetchImpl = (...args) => globalThis.f
   // Known limit: if OpenAI completes a refresh but the answer never reaches us (timeout), the old
   // refresh token is already spent and the next refresh is refused, so the account shows
   // "Reconnect needed". There is no safe automatic recovery; signing in again fixes it.
-  const refreshing = new Map(); // userId -> Promise<tokens>
+  const refreshing = new Map(); // userId -> Promise<{ data, raw }>  (raw: ciphertext of the row those tokens live in)
   function refresh(userId, row) {
     if (refreshing.has(userId)) return refreshing.get(userId);
     const current = row.data;
@@ -566,7 +566,7 @@ function createChatGptOAuth({ db, secrets, fetchImpl = (...args) => globalThis.f
         markReconnect(userId, row.raw);
         const latest = read(userId);
         // A re-sign-in that landed meanwhile is still good: use it rather than failing.
-        if (latest && latest.raw !== row.raw && latest.state === 'connected' && latest.data) return latest.data;
+        if (latest && latest.raw !== row.raw && latest.state === 'connected' && latest.data) return { data: latest.data, raw: latest.raw };
         throw authError('reconnect');
       }
       if (!r.ok) throw authError('transient');
@@ -575,37 +575,41 @@ function createChatGptOAuth({ db, secrets, fetchImpl = (...args) => globalThis.f
       catch { throw authError('transient'); }
       // Compare-and-set on the ciphertext this refresh started from: a disconnect or a newer
       // sign-in that landed while the refresh was in flight wins, never the stale refresh.
+      const nextRaw = secrets.encrypt(JSON.stringify(next), String(userId));
       const kept = db.prepare("UPDATE chatgpt_oauth_tokens SET data_enc=?, updated_at=? WHERE user_id=? AND state='connected' AND data_enc=?")
-        .run(secrets.encrypt(JSON.stringify(next), String(userId)), now(), String(userId), row.raw);
-      if (kept.changes) return next;
+        .run(nextRaw, now(), String(userId), row.raw);
+      if (kept.changes) return { data: next, raw: nextRaw };
       const latest = read(userId);
-      if (latest && latest.state === 'connected' && latest.data) return latest.data;
+      if (latest && latest.state === 'connected' && latest.data) return { data: latest.data, raw: latest.raw };
       throw authError(latest ? 'reconnect' : 'disconnected');
     })();
     refreshing.set(userId, run);
     run.then(() => refreshing.delete(userId), () => refreshing.delete(userId));
     return run;
   }
-  /** Usable tokens for this user: refreshed near expiry, or after a 401 on `rejectedToken`. */
-  async function session(userId, { rejectedToken = null } = {}) {
+  /** Usable tokens for this user, with the ciphertext of the stored row they came from (`raw`, for
+   *  markReconnect; never returned to callers outside this module): refreshed near expiry, or after
+   *  a 401 on `rejectedToken`. */
+  async function sessionRow(userId, { rejectedToken = null } = {}) {
     const row = read(userId);
     if (!row) throw authError('disconnected');
     if (row.state !== 'connected' || !row.data || typeof row.data.accessToken !== 'string') throw authError('reconnect');
     const t = row.data;
     if (rejectedToken) {
       // Another request may already have refreshed; use that rather than burning a refresh token.
-      if (t.accessToken !== rejectedToken) return t;
+      if (t.accessToken !== rejectedToken) return { data: t, raw: row.raw };
       return refresh(userId, row);
     }
     if (t.expiresAt && t.expiresAt - now() <= REFRESH_MARGIN_MS) {
       try { return await refresh(userId, row); } catch (e) {
         // A soft failure inside the early-refresh window keeps the still-valid token (fork 3b04587).
-        if (e.code === 'transient' && t.expiresAt > now()) return t;
+        if (e.code === 'transient' && t.expiresAt > now()) return { data: t, raw: row.raw };
         throw e;
       }
     }
-    return t;
+    return { data: t, raw: row.raw };
   }
+  async function session(userId, opts) { return (await sessionRow(userId, opts)).data; }
 
   function status(userId) {
     const row = read(userId);
@@ -645,15 +649,17 @@ function createChatGptOAuth({ db, secrets, fetchImpl = (...args) => globalThis.f
   /** One authorised upstream call with the refresh-once-on-401 rule. Returns a Response or an error Response. */
   async function authorised(userId, send) {
     let t;
-    try { t = await session(userId); } catch (e) { return errorResponse(e.status || 401, e.message, e.code); }
+    let raw;
+    try { ({ data: t, raw } = await sessionRow(userId)); } catch (e) { return errorResponse(e.status || 401, e.message, e.code); }
     let r = await send(t);
     if (r.status !== 401) return r;
     try { await r.body?.cancel?.(); } catch { /* already closed */ }
-    try { t = await session(userId, { rejectedToken: t.accessToken }); } catch (e) { return errorResponse(e.status || 401, e.message, e.code); }
+    try { ({ data: t, raw } = await sessionRow(userId, { rejectedToken: t.accessToken })); } catch (e) { return errorResponse(e.status || 401, e.message, e.code); }
     r = await send(t);
     if (r.status === 401) {
       try { await r.body?.cancel?.(); } catch { /* already closed */ }
-      markReconnect(userId);
+      // Only the sign-in that actually failed: a newer one written meanwhile is left alone (#934).
+      markReconnect(userId, raw);
       return errorResponse(401, MESSAGES.reconnect, 'reconnect');
     }
     return r;

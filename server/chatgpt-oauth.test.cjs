@@ -272,6 +272,40 @@ test('refresh on 401: the request is retried once with the new bearer', async (t
   assert.equal(f.oauth.status('user-a').state, 'connected');
 });
 
+// #934: a second 401 after the refresh marks only the sign-in that failed, never a newer one.
+const chatBody = () => ({ method: 'POST', body: JSON.stringify({ model: 'gpt-synthetic', messages: [], stream: false }) });
+const storedTokens = (f) => JSON.parse(f.secrets.decrypt(f.db.prepare('SELECT data_enc FROM chatgpt_oauth_tokens WHERE user_id=?').get('user-a').data_enc, 'user-a'));
+function writeSignIn(f, tokens) {
+  f.db.prepare("UPDATE chatgpt_oauth_tokens SET data_enc=?, state='connected', updated_at=? WHERE user_id='user-a'")
+    .run(f.secrets.encrypt(JSON.stringify(tokens), 'user-a'), f.clock.t);
+}
+
+test('a 401 twice marks the signed-in row "reconnect" when nothing else changed', async (t) => {
+  const f = make(t);
+  await connect(f);
+  f.fake.state.upstream.push(() => json({}, 401));
+  f.fake.state.upstream.push(() => json({}, 401));
+  const r = await f.oauth.fetchFor('user-a')('https://c/v1/chat/completions', chatBody());
+  assert.equal(r.status, 401);
+  assert.equal(f.oauth.status('user-a').state, 'reconnect');
+});
+
+test('a 401 twice leaves a newer sign-in written between the calls "connected"', async (t) => {
+  const f = make(t);
+  await connect(f);
+  f.fake.state.upstream.push(() => json({}, 401));
+  f.fake.state.upstream.push(() => {
+    // The user finishes a fresh device sign-in while the retry is in flight.
+    writeSignIn(f, { ...storedTokens(f), accessToken: 'AT-NEW', refreshToken: 'RT-NEW' });
+    return json({}, 401);
+  });
+  const r = await f.oauth.fetchFor('user-a')('https://c/v1/chat/completions', chatBody());
+  assert.equal(r.status, 401, 'this request still fails');
+  assert.equal(f.oauth.status('user-a').state, 'connected', 'the fresh sign-in is not marked');
+  assert.equal(storedTokens(f).accessToken, 'AT-NEW');
+  assert.equal((await f.oauth.session('user-a')).accessToken, 'AT-NEW');
+});
+
 test('a refused refresh marks the account "reconnect"; a transient one does not; disconnect deletes the tokens', async (t) => {
   const f = make(t);
   await connect(f);
