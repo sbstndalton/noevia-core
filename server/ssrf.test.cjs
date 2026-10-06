@@ -45,6 +45,88 @@ test('classifies IPv6 loopback, ULA, link-local, and IPv4-mapped as private; glo
   }
 });
 
+// #930: special-purpose ranges, each with neighbours just outside that stay public.
+test('IPv4 TEST-NET-2/3 and the 6to4 relay range are private; their neighbours are public', () => {
+  for (const ip of ['198.51.100.0', '198.51.100.255', '203.0.113.0', '203.0.113.255', '192.88.99.0', '192.88.99.255']) {
+    assert.equal(isPrivateIp(ip), true, `${ip} should be private`);
+  }
+  for (const ip of ['198.51.99.255', '198.51.101.0', '203.0.112.255', '203.0.114.0', '192.88.98.255', '192.88.100.0']) {
+    assert.equal(isPrivateIp(ip), false, `${ip} should be public`);
+  }
+});
+
+test('6to4 2002::/16 is private, whatever IPv4 it embeds; 2001:ffff:: and 2003:: stay public', () => {
+  for (const ip of ['2002::', '2002:c0a8:0101::1', '2002:0a00:0001::1', '2002:7f00:1::', '2002:0808:0808::1', '2002:ffff:ffff:ffff:ffff:ffff:ffff:ffff']) {
+    assert.equal(isPrivateIp(ip), true, `${ip} should be private`);
+  }
+  for (const ip of ['2001:ffff:ffff:ffff:ffff:ffff:ffff:ffff', '2003::1']) {
+    assert.equal(isPrivateIp(ip), false, `${ip} should be public`);
+  }
+});
+
+test('Teredo 2001::/32 and documentation 2001:db8::/32 are private; the next /32s are public', () => {
+  for (const ip of ['2001::', '2001::1', '2001:0:ffff:ffff:ffff:ffff:ffff:ffff', '2001:db8::', '2001:db8:ffff:ffff:ffff:ffff:ffff:ffff']) {
+    assert.equal(isPrivateIp(ip), true, `${ip} should be private`);
+  }
+  for (const ip of ['2001:1::1', '2001:db7:ffff:ffff:ffff:ffff:ffff:ffff', '2001:db9::']) {
+    assert.equal(isPrivateIp(ip), false, `${ip} should be public`);
+  }
+});
+
+test('IPv6 classification is prefix-based: all of fe80::/10, v4-mapped by its IPv4, global unicast edges', () => {
+  // fe80::/10 runs fe80–febf; only fe80 used to be matched as text.
+  for (const ip of ['fe80::', 'fe81::1', 'fe9a::1', 'febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff', 'FE80::1']) {
+    assert.equal(isPrivateIp(ip), true, `${ip} should be private`);
+  }
+  // ::ffff:0:0/96 in any spelling is judged by the embedded IPv4 (the old text check never matched).
+  for (const ip of ['::ffff:0:0', '::ffff:0a00:0001', '0:0:0:0:0:ffff:192.168.0.1', '::ffff:198.51.100.7']) {
+    assert.equal(isPrivateIp(ip), true, `${ip} should be private`);
+  }
+  for (const ip of ['::ffff:8.8.8.8', '::ffff:0808:0808', '0:0:0:0:0:ffff:1.1.1.1']) {
+    assert.equal(isPrivateIp(ip), false, `${ip} should be public`);
+  }
+  // Just outside 2000::/3 on either side; inside it at both ends.
+  for (const ip of ['1fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff', '4000::', 'ff02::1', '64:ff9b::8.8.8.8']) {
+    assert.equal(isPrivateIp(ip), true, `${ip} should be private`);
+  }
+  for (const ip of ['2000::1', '3ffe:ffff::1', '2606:4700:0:0:0:0:1.2.3.4']) {
+    assert.equal(isPrivateIp(ip), false, `${ip} should be public`);
+  }
+});
+
+test('zone-scoped IPv6 and IPv4-compatible ::a.b.c.d are refused, even around a public address', () => {
+  for (const ip of ['2606:4700::1111%eth0', '2001:4860:4860::8888%1', 'fe80::1%lo0', '::8.8.8.8', '::1.1.1.1', '::0808:0808', '::2']) {
+    assert.equal(isPrivateIp(ip), true, `${ip} should be private`);
+  }
+  assert.equal(isPrivateIp('2606:4700::1111'), false, 'the same address without a zone is public');
+});
+
+test('192.0.0.0/24 and 192.0.2.0/24 are private; the rest of 192.0.0.0/16 is public', () => {
+  for (const ip of ['192.0.0.0', '192.0.0.255', '192.0.2.0', '192.0.2.255']) {
+    assert.equal(isPrivateIp(ip), true, `${ip} should be private`);
+  }
+  for (const ip of ['192.0.1.0', '192.0.1.255', '192.0.3.0', '192.0.78.9', '192.0.255.255', '191.255.255.255', '192.1.0.0']) {
+    assert.equal(isPrivateIp(ip), false, `${ip} should be public`);
+  }
+});
+
+test('malformed input is private and never throws', () => {
+  for (const ip of ['1:2:3:4:5:6:7:8:9', 'gggg::1', '::ffff:256.1.1.1', '[::1]', '[2606:4700::1111]', undefined, null, 123, {}, '', '1.2.3', '1.2.3.4.5', ' 8.8.8.8']) {
+    let result;
+    assert.doesNotThrow(() => { result = isPrivateIp(ip); }, `${String(ip)} must not throw`);
+    assert.equal(result, true, `${String(ip)} should be private`);
+  }
+});
+
+test('isPublicUrl refuses 6to4, Teredo and documentation literals without DNS (#930)', async () => {
+  assert.equal(await isPublicUrl('http://[2002:c0a8:101::1]/v1'), false);
+  assert.equal(await isPublicUrl('http://[2001::1]/v1'), false);
+  assert.equal(await isPublicUrl('http://[2001:db8::1]/v1'), false);
+  assert.equal(await isPublicUrl('http://[::8.8.8.8]/v1'), false);
+  assert.equal(await isPublicUrl('http://203.0.113.9/v1'), false);
+  assert.equal(await isPublicUrl('https://[2606:4700::1111]/v1'), true);
+});
+
 test('isPublicUrl rejects garbage and non-http schemes without DNS', async () => {
   assert.equal(await isPublicUrl('not a url'), false);
   assert.equal(await isPublicUrl(''), false);

@@ -23,7 +23,41 @@ const { isPrivateIp } = require('./ssrf.cjs');
 const ALLOWED_PORTS = Object.freeze([80, 443]);
 // A token dies after this long without traffic (#160). CODE_EGRESS_TOKEN_TTL_MS overrides.
 const DEFAULT_TOKEN_TTL_MS = 6 * 60 * 60 * 1000;
-const STATUS_TEXT = Object.freeze({ 400: 'Bad Request', 403: 'Forbidden', 407: 'Proxy Authentication Required', 502: 'Bad Gateway' });
+// Connection limits (#932), mirroring noevia-rs egress-proxy `Limits`. One task must not be able to
+// exhaust the web process's file descriptors. A client connection — a CONNECT tunnel above all —
+// holds its slot until it closes. 256 proxy-wide is the Rust default; 64 per task is well above
+// what a package install opens at once (npm keeps ≤15 sockets per registry by default, pip a pool
+// of 10, cargo/go a few dozen over HTTP/2) yet leaves room for four busy tasks at the proxy cap.
+// CODE_EGRESS_MAX_CONNECTIONS / CODE_EGRESS_MAX_CONNECTIONS_PER_TASK override.
+const DEFAULT_MAX_CONNECTIONS = 256;
+const DEFAULT_MAX_CONNECTIONS_PER_TASK = 64;
+// A CONNECT tunnel with no bytes in either direction for this long is closed (#932); without it a
+// tunnel lives as long as its grant. CODE_EGRESS_TUNNEL_IDLE_MS overrides.
+const DEFAULT_TUNNEL_IDLE_MS = 10 * 60 * 1000;
+const STATUS_TEXT = Object.freeze({ 400: 'Bad Request', 403: 'Forbidden', 407: 'Proxy Authentication Required',
+  429: 'Too Many Requests', 502: 'Bad Gateway', 503: 'Service Unavailable' });
+// Hop-by-hop headers (RFC 9110 §7.6.1) plus the proxy's own credential headers: they stop at the
+// proxy in both directions.
+const HOP_BY_HOP = Object.freeze(['connection', 'keep-alive', 'proxy-connection', 'proxy-authenticate',
+  'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade']);
+
+/**
+ * A copy of `headers` without hop-by-hop headers and without every header the message's own
+ * `Connection` names (#930). `Connection` may not strip `content-length` (a request body would be
+ * forwarded unframed) or `host` (the proxy sets it). node frames the outgoing message itself, so
+ * dropping `transfer-encoding` is safe: it re-chunks when there is no content-length.
+ */
+function stripHopByHop(headers) {
+  const out = { ...headers };
+  for (const name of String(headers.connection || '').split(',')) {
+    const h = name.trim().toLowerCase();
+    if (h && h !== 'content-length' && h !== 'host') delete out[h];
+  }
+  for (const h of HOP_BY_HOP) delete out[h];
+  return out;
+}
+
+const positive = (n, fallback) => (Number.isFinite(n) && n > 0 ? n : fallback);
 
 /** Exact host or a subdomain of a granted domain; a lookalike suffix (`notexample.com`) is not. */
 function hostAllowed(host, domains) {
@@ -53,8 +87,12 @@ function parseTarget(raw, defaultPort) {
  */
 function createEgressProxy({ now = Date.now, log = () => {}, lookup = defaultLookup,
   isPublicAddress = (ip) => !isPrivateIp(ip), connect = defaultConnect, allowedPorts = ALLOWED_PORTS,
-  ttlMs = DEFAULT_TOKEN_TTL_MS } = {}) {
+  ttlMs = DEFAULT_TOKEN_TTL_MS, maxConnections = DEFAULT_MAX_CONNECTIONS,
+  maxConnectionsPerTask = DEFAULT_MAX_CONNECTIONS_PER_TASK, tunnelIdleMs = DEFAULT_TUNNEL_IDLE_MS } = {}) {
   const ports = new Set(allowedPorts);
+  const limits = { maxConnections: positive(maxConnections, DEFAULT_MAX_CONNECTIONS),
+    maxConnectionsPerTask: positive(maxConnectionsPerTask, DEFAULT_MAX_CONNECTIONS_PER_TASK),
+    tunnelIdleMs: positive(tunnelIdleMs, DEFAULT_TUNNEL_IDLE_MS) };
   const grants = new Map(); // token -> { taskId, domains, grantedAt, lastUsed, sockets:Set }
   const ttl = Number.isFinite(ttlMs) && ttlMs > 0 ? ttlMs : DEFAULT_TOKEN_TTL_MS;
 
@@ -157,7 +195,39 @@ function createEgressProxy({ now = Date.now, log = () => {}, lookup = defaultLoo
 
   function record(entry) { tally(entry); log({ at: now(), ...entry }); }
 
+  // Per-task slots (#932): a CONNECT tunnel or a forwarded plain request holds one until its
+  // client socket / response closes. Keyed by task, so a re-grant does not reset the count.
+  const openByTask = new Map(); // taskId -> count
+  /** Takes a slot for the task, or returns null when it is at its cap. The release runs once. */
+  function takeTaskSlot(taskId) {
+    const n = openByTask.get(taskId) || 0;
+    if (n >= limits.maxConnectionsPerTask) return null;
+    openByTask.set(taskId, n + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const left = (openByTask.get(taskId) || 1) - 1;
+      if (left > 0) openByTask.set(taskId, left); else openByTask.delete(taskId);
+    };
+  }
+  const tooManyForTask = (verdict) => ({ ok: false, status: 429, taskId: verdict.taskId, host: verdict.host,
+    reason: `task has ${limits.maxConnectionsPerTask} connections open` });
+
   const server = http.createServer();
+
+  // Proxy-wide cap (#932): every client connection counts until it closes, and a CONNECT tunnel
+  // keeps its client socket, so open tunnels count too. Over the cap the socket is closed on accept.
+  let openConnections = 0;
+  server.on('connection', (socket) => {
+    if (openConnections >= limits.maxConnections) {
+      log({ at: now(), event: 'egress.connection_limit', limit: limits.maxConnections });
+      socket.destroy();
+      return;
+    }
+    openConnections++;
+    socket.once('close', () => { openConnections--; });
+  });
 
   // Plain HTTP: the client sends an absolute URL. Forwarded to the address we checked.
   server.on('request', async (req, res) => {
@@ -171,24 +241,34 @@ function createEgressProxy({ now = Date.now, log = () => {}, lookup = defaultLoo
     if (url && url.protocol !== 'http:' && url.protocol !== 'https:') {
       return refuse(res, { ok: false, status: 400, reason: `unsupported protocol "${url.protocol}"` }, record);
     }
+    // An absolute-form `https://` request would be forwarded below as plaintext HTTP on port 80:
+    // the task believes it has TLS and gets none. TLS goes through CONNECT only (#930).
+    if (url && url.protocol === 'https:') {
+      return refuse(res, { ok: false, status: 400, reason: 'https:// must be requested with CONNECT' }, record);
+    }
     const verdict = await check({ header: req.headers['proxy-authorization'],
       target: url ? url.host : null, defaultPort: 80 });
+    // The task may have hung up during the lookup. Its response has then already emitted 'close',
+    // so a slot taken now would never be released (#932) and the upstream request would dangle:
+    // stop here, as the CONNECT handler does.
+    if (req.socket?.destroyed || res.destroyed) return;
     if (!verdict.ok) return refuse(res, verdict, record);
     const { grant: owner } = verdict; delete verdict.grant;
+    const release = takeTaskSlot(verdict.taskId);
+    if (!release) return refuse(res, tooManyForTask(verdict), record);
+    res.on('close', release); // synchronously after taking the slot: no await in between
     record({ event: 'egress.allowed', taskId: verdict.taskId, host: verdict.host, port: verdict.port, method: req.method });
 
-    const headers = { ...req.headers };
-    delete headers['proxy-authorization'];       // never travels onward
-    delete headers['proxy-connection'];
-    // Hop-by-hop headers stop at the proxy (RFC 7230 §6.1): `connection` names further
-    // hop-by-hop headers to strip, and node itself manages keep-alive/transfer-encoding for the
-    // upstream request it builds, so those must not be forwarded verbatim either.
-    for (const h of ['connection', 'keep-alive', 'transfer-encoding', 'te', 'trailer', 'upgrade']) delete headers[h];
+    // Proxy-Authorization (the task token) never travels onward; hop-by-hop headers stop here.
+    const headers = stripHopByHop(req.headers);
     headers.host = url.host;
     const upstream = http.request({ host: verdict.address, port: verdict.port, method: req.method,
       path: url.pathname + url.search, headers, setHost: false }, (up) => {
       track(owner, up.socket);
-      res.writeHead(up.statusCode || 502, up.headers);
+      // The response hop too: the origin's hop-by-hop headers, the ones its Connection names, and
+      // a Proxy-Authenticate it might send (which would look like this proxy asking for
+      // credentials) stay on the upstream hop (#930).
+      res.writeHead(up.statusCode || 502, stripHopByHop(up.headers));
       up.pipe(res);
     });
     upstream.on('error', () => { if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' }); res.end('Upstream failed\n'); });
@@ -222,9 +302,23 @@ function createEgressProxy({ now = Date.now, log = () => {}, lookup = defaultLoo
       return;
     }
     const { grant: owner } = verdict; delete verdict.grant;
+    const release = takeTaskSlot(verdict.taskId);
+    if (!release) {
+      const refusal = tooManyForTask(verdict);
+      record({ event: 'egress.refused', ...refusal, ok: undefined });
+      clientSocket.end(`HTTP/1.1 429 ${STATUS_TEXT[429]}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`);
+      return;
+    }
+    clientSocket.once('close', release);
     record({ event: 'egress.allowed', taskId: verdict.taskId, host: verdict.host, port: verdict.port, method: 'CONNECT' });
     const upstream = connect({ address: verdict.address, port: verdict.port, host: verdict.host });
     track(owner, clientSocket, upstream);
+    // Idle tunnel (#932): no bytes either way on the client socket — which carries both
+    // directions — for tunnelIdleMs closes the tunnel and frees its slots.
+    clientSocket.setTimeout(limits.tunnelIdleMs, () => {
+      log({ at: now(), event: 'egress.tunnel_idle', taskId: verdict.taskId, host: verdict.host, idleMs: limits.tunnelIdleMs });
+      upstream.destroy(); clientSocket.destroy();
+    });
     upstream.on('connect', () => {
       clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
       if (head && head.length) upstream.write(head);
@@ -237,7 +331,9 @@ function createEgressProxy({ now = Date.now, log = () => {}, lookup = defaultLoo
     clientSocket.on('close', () => upstream.destroy());
   });
 
-  return { server, grant, revoke, check, hostAllowed, activity, sweep, ttlMs: ttl,
+  return { server, grant, revoke, check, hostAllowed, activity, sweep, ttlMs: ttl, limits: { ...limits },
+    /** Open client connections and per-task slots, for tests and diagnostics. */
+    openCounts: () => ({ connections: openConnections, byTask: Object.fromEntries(openByTask) }),
     /** Drop every live connection too: a tunnel outlives the listener otherwise. */
     closeAll: () => { server.closeAllConnections?.(); },
     listen: (port = 0, host = '127.0.0.1') => new Promise((r) => server.listen(port, host, () => r(server.address()))),
@@ -289,7 +385,11 @@ function startEgressFromEnv(env = process.env, { log = () => {}, create = create
   const host = String(env.CODE_EGRESS_HOST || 'egress').trim();
   if (!/^[a-z0-9.-]+$/i.test(host)) throw Error(`CODE_EGRESS_HOST should be a host name, not "${host}"`);
   const ttlMs = Number(env.CODE_EGRESS_TOKEN_TTL_MS) > 0 ? Number(env.CODE_EGRESS_TOKEN_TTL_MS) : DEFAULT_TOKEN_TTL_MS;
-  const proxy = create({ log, ttlMs });
+  const intEnv = (name, fallback) => { const n = Number(env[name]); return Number.isInteger(n) && n > 0 ? n : fallback; };
+  const proxy = create({ log, ttlMs,
+    maxConnections: intEnv('CODE_EGRESS_MAX_CONNECTIONS', DEFAULT_MAX_CONNECTIONS),
+    maxConnectionsPerTask: intEnv('CODE_EGRESS_MAX_CONNECTIONS_PER_TASK', DEFAULT_MAX_CONNECTIONS_PER_TASK),
+    tunnelIdleMs: intEnv('CODE_EGRESS_TUNNEL_IDLE_MS', DEFAULT_TUNNEL_IDLE_MS) });
   // A failed listen (e.g. the port is already taken, or EADDRNOTAVAIL on a bind that does not
   // exist on this host) must not fail silently: it is reported the same way any other startup
   // failure is — logged, then rethrown so the process crashes with it rather than limping on
@@ -314,4 +414,5 @@ function startEgressFromEnv(env = process.env, { log = () => {}, create = create
   return Object.assign(proxy, { endpoint: `${host}:${port}` });
 }
 
-module.exports = { DEFAULT_TOKEN_TTL_MS, createEgressProxy, hostAllowed, parseTarget, startEgressFromEnv, resolveEgressBind };
+module.exports = { DEFAULT_TOKEN_TTL_MS, DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_CONNECTIONS_PER_TASK, DEFAULT_TUNNEL_IDLE_MS,
+  createEgressProxy, stripHopByHop, hostAllowed, parseTarget, startEgressFromEnv, resolveEgressBind };
