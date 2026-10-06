@@ -23,6 +23,14 @@ test('the served version wins over runtime environment and package versions', ()
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('an assembled release version.json with web/core shas still reports `version` (#922)', () => {
+  const dist = JSON.stringify({ version: 'deadbee', web: 'a'.repeat(40), core: 'b'.repeat(40) });
+  const { baseDir, dir } = makeBaseDir({ dist, root: JSON.stringify({ version: '1.2.3' }) });
+  try {
+    assert.equal(resolveVersion({ STAMP_VERSION: 'other' }, baseDir), 'deadbee');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('STAMP_VERSION env is a fallback when the served artifact is unavailable', () => {
   const { baseDir, dir } = makeBaseDir({ root: JSON.stringify({ version: '1.2.3' }) });
   try {
