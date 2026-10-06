@@ -130,7 +130,7 @@ function normalizeReplayHistory(mapped, newMessage) {
 }
 
 function createChatHandler({
-  stepSupervision = null, fs, path, crypto, fetch, codeTasksFor = () => [], reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, diaryStorageRetry = (send) => send(true), autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, toolGate = null, chatFramingEnabled = () => false, freeChats = () => [], framingReasoner = null, reasoningTraces = null, brainContext = null, DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse,
+  stepSupervision = null, fs, path, crypto, fetch, codeTasksFor = () => [], reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, diaryStorageRetry = (send) => send(true), autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, toolGate = null, chatFramingEnabled = () => false, freeChats = () => [], framingReasoner = null, reasoningTraces = null, brainContext = null, DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse, chatListHolder = () => undefined,
   chatgptOAuth = null, chatgptEnabled = () => false, skillHistory = null,
   // #648: whether a tool is one of noevia's own project file edits, whose target is resolved and
   // shown on the approval card and pinned for the call. By name when not wired (the stricter side).
@@ -340,6 +340,20 @@ function createChatHandler({
       chatId = `p-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       saveChats(projectId, [{ id: chatId, title: 'New task', updatedAt: Date.now(), preview: '' }]);
     }
+    // #917: "Allow for this chat" belongs to the scope it was given in: this explicit project, the
+    // free chat's context project, or the free/diary space. It is checked and granted with that scope,
+    // so the same chat id sent with another projectId asks again. A chat id another list of this
+    // workspace holds (stale tab, hand-made request) gets no chat-wide grant here at all: it is
+    // neither honoured nor created, and "Allow for this chat" approves just that call. Read at gate
+    // time, so a move during the turn is seen. Chats no list holds yet (a first turn) are unaffected.
+    const writeGrantScope = project ? `${body.projectId ? 'project' : 'context'}:${project.id}` : `space:${typeof spaceId === 'string' && spaceId ? spaceId : 'free'}`;
+    const writeGrantChat = () => {
+      if (!chatId) return null;
+      const expected = project && body.projectId ? project.id : !body.projectId ? 'free' : undefined;
+      let holder;
+      try { holder = chatListHolder(chatId); } catch { return null; }
+      return typeof holder === 'string' && expected !== undefined && holder !== expected ? null : chatId;
+    };
     // Recorded once the chat id is known, so the ledger knows which chat loaded it (#546).
     if (pinnedSkill) rememberSkill(pinnedSkill.record.file, pinnedSkill.record.contentHash, pinnedSkill.record.name, pinnedSkill.content);
 
@@ -1429,7 +1443,8 @@ function createChatHandler({
               if (!Array.isArray(provenanceHits)) provenanceHits = unchecked;
             }
             if (provenanceHits.length) authService.audit('tool.provenance', userId, userId, { tool: tc.name, fields: provenanceHits.map((h) => h.field), unchecked: provenanceHits.some((h) => h.unchecked) || undefined });
-            const askedPerCall = permission === 'ask' && (!chatWideApproved(userId, chatId) || provenanceHits.length > 0);
+            const grantChat = writeGrantChat();
+            const askedPerCall = permission === 'ask' && (!chatWideApproved(userId, grantChat, writeGrantScope) || provenanceHits.length > 0);
             if (askedPerCall) {
               const approvalId = `ap-${crypto.randomUUID()}`;
               // #658: the same tool, target and arguments as a write that already succeeded in this
@@ -1448,7 +1463,7 @@ function createChatHandler({
                 ...(repeat ? { repeatOf: true } : {}),
                 ...(provenanceHits.length ? { provenance: provenanceHits } : {}),
               });
-              const decision = await awaitApproval({ id: approvalId, userId, chatId, abortSignal: chatSignal.signal });
+              const decision = await awaitApproval({ id: approvalId, userId, chatId: grantChat, scope: writeGrantScope, abortSignal: chatSignal.signal });
               if (decision !== 'approve') {
                 // A refusal is a normal conversational turn: the model is told
                 // plainly so it can offer an alternative, rather than the stream

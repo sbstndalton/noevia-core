@@ -631,6 +631,9 @@ const { state: mcpState, oauthServerIds, accountReady, probeMcpAuth, syncDirecto
 // The approval gate's state lives in approvals.cjs; the chat loop below and the
 // /api/tool-approvals route are its only callers.
 const { pendingApprovals, chatWideApproved, revokeChatGrant, awaitApproval, awaitRouteChoice } = require('./approvals.cjs').createApprovals();
+// #917: which of the signed-in workspace's lists holds a chat id ('free', a project id, or null).
+// Outside an authenticated request it throws, which the chat gate treats as "no chat-wide grant".
+const chatListHolder = (chatId) => require('./chat-lists.cjs').listHolding(chatId, Array.from(FREE_CHATS), Array.from(PROJECTS));
 
 // ── SKILL.md awareness (Hermes-style convention, master step 13) ─────────
 // A project knowledge file that starts with SKILL.md frontmatter is treated
@@ -835,6 +838,8 @@ const { handleChat } = require('./chat.cjs').createChatHandler({
     read: (chatId) => chatBrainLib.readBrain(currentWorkspace().dir, chatId) },
   DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall,
   oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse,
+  // #917: which of the signed-in workspace's lists holds a chat id ('free', a project id, or null).
+  chatListHolder,
   chatgptOAuth, chatgptEnabled: () => features.enabled('chatgptOAuth'),
   projectEditTool: (name) => require('./project-edit-target.cjs').EDIT_TOOLS.has(name) && !!MCP_INTERNAL_SERVER && mcpState.tools.get(name)?.serverId === MCP_INTERNAL_SERVER.id,
   // #687: a plain-named project file is edited by moving it into the project folder when storage is connected.
@@ -1197,4 +1202,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { handleRequest, sanitizeChats, MCP_SERVERS, toolboxOffered, ownsFile, projectFolderName, prefill, TOOL_PREFILL_TARGET_MS, isWriteTool, chatWideApproved, pendingApprovals, resolveTools, allToolboxes, mcpCredentialOriginAllowed, toolTokenBudgetFor, MCP_TOOLBOX_MANIFEST, toolboxSummaries, estimateToolTokens, toolCapFor, sanitizeToolboxes, executeToolCall, TOOLBOXES, classifierVerdict, heuristicWantsSmart, heuristicWantsCode, CLASSIFIER_MAX_TOKENS, recordUsage, recordToolUse, readUsage, usageDayKey, USAGE_RETENTION_DAYS };
+module.exports = { handleRequest, chatListHolder, sanitizeChats, MCP_SERVERS, toolboxOffered, ownsFile, projectFolderName, prefill, TOOL_PREFILL_TARGET_MS, isWriteTool, chatWideApproved, pendingApprovals, resolveTools, allToolboxes, mcpCredentialOriginAllowed, toolTokenBudgetFor, MCP_TOOLBOX_MANIFEST, toolboxSummaries, estimateToolTokens, toolCapFor, sanitizeToolboxes, executeToolCall, TOOLBOXES, classifierVerdict, heuristicWantsSmart, heuristicWantsCode, CLASSIFIER_MAX_TOKENS, recordUsage, recordToolUse, readUsage, usageDayKey, USAGE_RETENTION_DAYS };

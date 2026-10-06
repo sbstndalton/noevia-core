@@ -134,9 +134,9 @@ test('a box is never entirely writes without saying so in its name', () => {
 test('chat-wide approval is off by default and scoped to one chat and user', () => {
   // There is deliberately no global "never ask", so the default must be false
   // for every combination.
-  assert.equal(chatWideApproved('user-a', 'chat-1'), false);
-  assert.equal(chatWideApproved(null, null), false);
-  assert.equal(chatWideApproved('user-a', undefined), false);
+  assert.equal(chatWideApproved('user-a', 'chat-1', 'project:p1'), false);
+  assert.equal(chatWideApproved(null, null, 'project:p1'), false);
+  assert.equal(chatWideApproved('user-a', undefined, 'project:p1'), false);
 });
 
 test('no approval is pending in a fresh process', () => {

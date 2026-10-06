@@ -10,14 +10,14 @@ const { createApprovals } = require('./approvals.cjs');
 
 function pending(gate, overrides = {}) {
   const ctrl = new AbortController();
-  const p = gate.awaitApproval({ id: overrides.id || 'ap-1', userId: overrides.userId || 'u1', chatId: overrides.chatId || 'c1', abortSignal: ctrl.signal });
+  const p = gate.awaitApproval({ id: overrides.id || 'ap-1', userId: overrides.userId || 'u1', chatId: overrides.chatId || 'c1', scope: overrides.scope === undefined ? 'project:p1' : overrides.scope, abortSignal: ctrl.signal });
   return { promise: p, ctrl };
 }
 
 test('a fresh gate has nothing pending and no chat-wide grant', () => {
   const gate = createApprovals();
   assert.equal(gate.pendingApprovals.size, 0);
-  assert.equal(gate.chatWideApproved('u1', 'c1'), false);
+  assert.equal(gate.chatWideApproved('u1', 'c1', 'project:p1'), false);
   assert.equal(gate.chatWideApproved(null, null), false);
 });
 
@@ -32,7 +32,7 @@ test('approve and deny resolve the waiting call once and clear the id', async ()
   const b = pending(gate, { id: 'b' });
   assert.equal(gate.pendingApprovals.get('b').decide('deny'), true);
   assert.equal(await b.promise, 'deny');
-  assert.equal(gate.chatWideApproved('u1', 'c1'), false, 'a single approval never widens');
+  assert.equal(gate.chatWideApproved('u1', 'c1', 'project:p1'), false, 'a single approval never widens');
 });
 
 test('only the three decisions are accepted', () => {
@@ -51,11 +51,11 @@ test('approve_all grants this chat for this user only, and expires', async () =>
   const a = pending(gate, { id: 'a', userId: 'u1', chatId: 'c1' });
   gate.pendingApprovals.get('a').decide('approve_all');
   assert.equal(await a.promise, 'approve');
-  assert.equal(gate.chatWideApproved('u1', 'c1'), true);
-  assert.equal(gate.chatWideApproved('u1', 'c2'), false, 'another chat still asks');
-  assert.equal(gate.chatWideApproved('u2', 'c1'), false, 'another user still asks');
+  assert.equal(gate.chatWideApproved('u1', 'c1', 'project:p1'), true);
+  assert.equal(gate.chatWideApproved('u1', 'c2', 'project:p1'), false, 'another chat still asks');
+  assert.equal(gate.chatWideApproved('u2', 'c1', 'project:p1'), false, 'another user still asks');
   t += 60_001;
-  assert.equal(gate.chatWideApproved('u1', 'c1'), false, 'the grant expires with the process TTL');
+  assert.equal(gate.chatWideApproved('u1', 'c1', 'project:p1'), false, 'the grant expires with the process TTL');
 });
 
 test('a closed tab or stop is not an approval', async () => {
@@ -71,18 +71,33 @@ test('waiting too long is a denial, never an approval', async () => {
   const a = pending(gate, { id: 'a' });
   assert.equal(await a.promise, 'timeout');
   assert.equal(gate.pendingApprovals.size, 0);
-  assert.equal(gate.chatWideApproved('u1', 'c1'), false);
+  assert.equal(gate.chatWideApproved('u1', 'c1', 'project:p1'), false);
 });
 
 for (const action of ['approve','deny','approve_all']) test(`records original ${action} before granting`,async()=>{
   const gate=createApprovals(), recorded=[];
-  const promise=gate.awaitApproval({id:'recorded',userId:'u',chatId:'c',abortSignal:new AbortController().signal,onDecision:value=>recorded.push(value)});
+  const promise=gate.awaitApproval({id:'recorded',userId:'u',chatId:'c',scope:'project:p1',abortSignal:new AbortController().signal,onDecision:value=>recorded.push(value)});
   gate.pendingApprovals.get('recorded').decide(action);
   assert.deepEqual(recorded,[action]);assert.equal(await promise,action==='approve_all'?'approve':action);
 });
 test('checkpoint failure cannot grant an approval',async()=>{
   const gate=createApprovals(),ctrl=new AbortController();
-  const promise=gate.awaitApproval({id:'broken',userId:'u',chatId:'c',abortSignal:ctrl.signal,onDecision:()=>{throw Error('disk failure');}});
+  const promise=gate.awaitApproval({id:'broken',userId:'u',chatId:'c',scope:'project:p1',abortSignal:ctrl.signal,onDecision:()=>{throw Error('disk failure');}});
   assert.throws(()=>gate.pendingApprovals.get('broken').decide('approve_all'),/disk failure/);
-  assert.equal(gate.chatWideApproved('u','c'),false);ctrl.abort();assert.equal(await promise,'aborted');
+  assert.equal(gate.chatWideApproved('u','c','project:p1'),false);ctrl.abort();assert.equal(await promise,'aborted');
+});
+
+// #917: the gate fails closed without a scope. A scopeless check never auto-approves, and an
+// approve_all answered without a scope approves only that call (the next write asks again).
+test('a check or a grant without a scope never auto-approves (#917)', async () => {
+  const gate = createApprovals();
+  const scoped = pending(gate, { id: 'a' });
+  gate.pendingApprovals.get('a').decide('approve_all');
+  assert.equal(await scoped.promise, 'approve');
+  assert.equal(gate.chatWideApproved('u1', 'c1', 'project:p1'), true);
+  for (const missing of [undefined, null, '', 42]) assert.equal(gate.chatWideApproved('u1', 'c1', missing), false, `scope ${String(missing)} asks`);
+  const unscoped = pending(gate, { id: 'b', chatId: 'c2', scope: null });
+  assert.equal(gate.pendingApprovals.get('b').decide('approve_all'), true);
+  assert.equal(await unscoped.promise, 'approve', 'Allow for this chat still runs the call it answered');
+  for (const scope of [undefined, null, '', 'project:p1']) assert.equal(gate.chatWideApproved('u1', 'c2', scope), false, 'no unscoped grant was stored');
 });

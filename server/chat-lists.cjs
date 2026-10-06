@@ -68,4 +68,15 @@ function skippedElsewhere(incoming, elsewhere = new Set()) {
   return [...out];
 }
 
-module.exports = { mergeChats, skippedElsewhere, readTombstones, addTombstone, safeChatId, LIST_CAP };
+// #917: which of one workspace's lists holds a chat id: 'free', a project id, or null when none does
+// (a chat whose first turn has not been saved yet). The chat route uses it so a chat-wide write grant
+// is never honoured or created under a project that does not hold the chat.
+function listHolding(chatId, freeChats, projects) {
+  if (typeof chatId !== 'string' || !chatId) return null;
+  const has = (list) => Array.isArray(list) && list.some((c) => c && c.id === chatId);
+  if (has(freeChats)) return 'free';
+  const proj = (projects || []).find((p) => p && typeof p.id === 'string' && has(p.chats));
+  return proj ? proj.id : null;
+}
+
+module.exports = { mergeChats, skippedElsewhere, readTombstones, addTombstone, safeChatId, listHolding, LIST_CAP };

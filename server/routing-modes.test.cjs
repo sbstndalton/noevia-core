@@ -451,7 +451,7 @@ test('the routing answer is bound to the requesting user', async () => {
   assert.equal((await post('{"decision":"approve_all"}')).status, 400, 'a write answer is not a routing answer');
   assert.equal((await post('{"decision":"cloud","remember":true}')).status, 200);
   assert.deepEqual(await waiting, { choice: 'cloud', remember: true });
-  assert.equal(gate.chatWideApproved('owner', 'c1'), false, 'never grants writes');
+  assert.equal(gate.chatWideApproved('owner', 'c1', 'space:free'), false, 'never grants writes');
   assert.equal((await post('{"decision":"local"}')).status, 404, 'single use');
 });
 

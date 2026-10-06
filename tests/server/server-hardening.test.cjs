@@ -113,17 +113,17 @@ test('S4: the store refuses a history path for an id that sanitizes to nothing',
 test('S-P1: approve_all without a chat id approves only that call and grants nothing shared', async () => {
   const gate = createApprovals();
   const ctrl = new AbortController();
-  const p = gate.awaitApproval({ id: 'a', userId: 'u1', chatId: null, abortSignal: ctrl.signal });
+  const p = gate.awaitApproval({ id: 'a', userId: 'u1', chatId: null, scope: 'project:p1', abortSignal: ctrl.signal });
   assert.equal(gate.pendingApprovals.get('a').decide('approve_all'), true);
   assert.equal(await p, 'approve');
-  assert.equal(gate.chatWideApproved('u1', null), false, 'another id-less chat is still asked');
-  assert.equal(gate.chatWideApproved('u1', ''), false);
-  const q = gate.awaitApproval({ id: 'b', userId: 'u1', chatId: 'c1', abortSignal: ctrl.signal });
+  assert.equal(gate.chatWideApproved('u1', null, 'project:p1'), false, 'another id-less chat is still asked');
+  assert.equal(gate.chatWideApproved('u1', '', 'project:p1'), false);
+  const q = gate.awaitApproval({ id: 'b', userId: 'u1', chatId: 'c1', scope: 'project:p1', abortSignal: ctrl.signal });
   gate.pendingApprovals.get('b').decide('approve_all');
   assert.equal(await q, 'approve');
-  assert.equal(gate.chatWideApproved('u1', 'c1'), true, 'a real chat still gets its grant');
-  assert.equal(gate.chatWideApproved('u1', 'c2'), false);
-  assert.equal(gate.chatWideApproved('u2', 'c1'), false);
+  assert.equal(gate.chatWideApproved('u1', 'c1', 'project:p1'), true, 'a real chat still gets its grant');
+  assert.equal(gate.chatWideApproved('u1', 'c2', 'project:p1'), false);
+  assert.equal(gate.chatWideApproved('u2', 'c1', 'project:p1'), false);
 });
 
 test('S-P2: an already-aborted request resolves at once and parks nothing', async () => {

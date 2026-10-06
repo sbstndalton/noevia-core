@@ -174,7 +174,7 @@ test('POST /api/chats/:id/move validates, scopes to the caller and maps the stor
 // Grants "Allow for this chat" the way the card does: a pending write answered with approve_all.
 async function grantAllowForChat(gate, userId, chatId) {
   const ctl = new AbortController();
-  const waiting = gate.awaitApproval({ id: `grant-${userId}-${chatId}`, userId, chatId, abortSignal: ctl.signal });
+  const waiting = gate.awaitApproval({ id: `grant-${userId}-${chatId}`, userId, chatId, scope: 'space:free', abortSignal: ctl.signal });
   assert.equal(gate.pendingApprovals.get(`grant-${userId}-${chatId}`).decide('approve_all'), true);
   assert.equal(await waiting, 'approve');
 }
@@ -202,16 +202,16 @@ test('moving a chat to another list revokes its "Allow for this chat" grant; a f
   // In place (no list change): the next write in that chat is still not asked.
   await move('f1', { projectId: null, frame: { kind: 'idea', tags: [], links: [], confirmed: true, source: 'user' } });
   assert.equal(sent.pop().status, 200);
-  assert.equal(gate.chatWideApproved('u1', 'f1'), true, 'no move: still suppressed');
+  assert.equal(gate.chatWideApproved('u1', 'f1', 'space:free'), true, 'no move: still suppressed');
   // Into a project: the next write asks again. Other chats and other users keep theirs.
   await move('f1', { projectId: 'p1' });
   assert.deepEqual(sent.pop(), { status: 200, body: { ok: true, from: null, projectId: 'p1' } });
-  assert.equal(gate.chatWideApproved('u1', 'f1'), false, 'moved: the next write asks again');
-  assert.equal(gate.chatWideApproved('u1', 'f2'), true, 'another chat keeps its grant');
-  assert.equal(gate.chatWideApproved('u2', 'f1'), true, 'another user keeps theirs');
+  assert.equal(gate.chatWideApproved('u1', 'f1', 'space:free'), false, 'moved: the next write asks again');
+  assert.equal(gate.chatWideApproved('u1', 'f2', 'space:free'), true, 'another chat keeps its grant');
+  assert.equal(gate.chatWideApproved('u2', 'f1', 'space:free'), true, 'another user keeps theirs');
   // A refused move changes nothing.
   await grantAllowForChat(gate, 'u1', 'f1');
   await move('zz', { projectId: null });
   assert.equal(sent.pop().status, 404);
-  assert.equal(gate.chatWideApproved('u1', 'f1'), true);
+  assert.equal(gate.chatWideApproved('u1', 'f1', 'space:free'), true);
 });
