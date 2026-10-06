@@ -51,44 +51,80 @@ function clientAddress(req, trustProxy = false) {
 // periodically, and a hard cap plus eviction bound the map even under a
 // flood of unique keys (the old map grew forever, one permanent entry per
 // distinct key). Exported for tests.
-function createRateLimiter({ sweepMs = 60 * 1000, maxEntries = 10000 } = {}) {
+function createRateLimiter({ sweepMs = 60 * 1000, maxEntries = 10000, now: clock = Date.now } = {}) {
   const map = new Map();
-  let lastSweep = Date.now();
+  let lastSweep = clock();
   function sweep(now) {
     for (const [key, entry] of map) {
       if (entry.reset <= now) map.delete(key);
     }
   }
+  /** Count one call to `key`. `window` identifies the window it was counted in (its reset time). */
+  function charge(key, limit = 5, windowMs = 15 * 60 * 1000) {
+    const now = clock();
+    if (now - lastSweep >= sweepMs) {
+      lastSweep = now;
+      sweep(now);
+    }
+    if (!map.has(key) && map.size >= maxEntries) sweep(now); // reclaim space first
+    if (!map.has(key) && map.size >= maxEntries) {
+      // Still full after sweeping: hard-evict oldest-inserted entries.
+      for (const oldest of map.keys()) {
+        map.delete(oldest);
+        if (map.size < maxEntries) break;
+      }
+    }
+    const current = map.get(key);
+    if (!current || current.reset <= now) {
+      const entry = { count: 1, reset: now + windowMs };
+      map.set(key, entry);
+      return { limited: false, window: entry.reset };
+    }
+    current.count += 1;
+    return { limited: current.count > limit, window: current.reset };
+  }
   return {
+    charge,
     rateLimited(key, limit = 5, windowMs = 15 * 60 * 1000) {
-      const now = Date.now();
-      if (now - lastSweep >= sweepMs) {
-        lastSweep = now;
-        sweep(now);
-      }
-      if (!map.has(key) && map.size >= maxEntries) sweep(now); // reclaim space first
-      if (!map.has(key) && map.size >= maxEntries) {
-        // Still full after sweeping: hard-evict oldest-inserted entries.
-        for (const oldest of map.keys()) {
-          map.delete(oldest);
-          if (map.size < maxEntries) break;
-        }
-      }
-      const current = map.get(key);
-      if (!current || current.reset <= now) {
-        map.set(key, { count: 1, reset: now + windowMs });
-        return false;
-      }
-      current.count += 1;
-      return current.count > limit;
+      return charge(key, limit, windowMs).limited;
     },
     /** Whether `key` is over `limit` in its current window, without counting this call. */
     blocked(key, limit = 5) {
       const current = map.get(key);
-      return !!current && current.reset > Date.now() && current.count > limit;
+      return !!current && current.reset > clock() && current.count > limit;
+    },
+    /** Forget `key`'s window (a successful sign-in clears that account's failure count). */
+    clear(key) { map.delete(key); },
+    /** Give back one call counted by `charge` in `window`. A call counted in an earlier window is
+     *  not refunded from a later one, so refunds can never lift a window above its limit. */
+    release(key, window) {
+      const current = map.get(key);
+      if (current && current.reset === window && current.reset > clock() && current.count > 0) current.count -= 1;
     },
     size: () => map.size,
   };
+}
+
+// Password sign-in limits (#927), all fixed 15-minute windows.
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+// Failed sign-ins per address and username; the next attempt is refused even with the right
+// password, so a lock can't be used as a guessing oracle. Cleared by a successful sign-in.
+const LOGIN_FAILURES_PER_ACCOUNT = 5;
+// Failed sign-ins per address, for real and unknown usernames alike (counting only unknown ones
+// would make the 401-to-429 switch reveal which usernames exist). Past 30, further failures answer
+// 429 instead of 401; a correct username and password still signs in. Past 200, a last-resort
+// ceiling refuses every password sign-in from that address before any hashing (passkeys still
+// work), which bounds the Argon2 work one address can cause.
+const LOGIN_FAILURES_BEFORE_429 = 30;
+const LOGIN_FAILURES_PER_ADDRESS = 200;
+
+/** The startup warning for a public https address with TRUST_PROXY off, or '' (#927). Only says
+ *  what is wrong and what to set; no configuration values are included. */
+function trustProxyWarning(origin, trustProxy) {
+  if (trustProxy || !/^https:\/\//i.test(String(origin || ''))) return '';
+  return 'WARNING: the public address uses https but TRUST_PROXY is off. If noevia runs behind a reverse proxy or tunnel, '
+    + 'every visitor shares the proxy\'s address, so sign-in limits and audit-log addresses apply to everyone at once. '
+    + 'Set TRUST_PROXY=true when the proxy sets X-Forwarded-For.';
 }
 
 function randomToken(bytes = 32) {
@@ -228,6 +264,12 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
   // Native-client device grants (#555, device-auth.cjs). The tables exist whether or not the
   // feature is on, so disabling an account or resetting its password always revokes them.
   require('./device-auth.cjs').ensureDeviceSchema(db);
+  // Credential epoch (#928): bumped when recovery revokes every credential. Credential creation
+  // that awaits a slow step (passkey verification, app-password hashing) snapshots it first and
+  // inserts only if it is unchanged, so an in-flight request cannot add one after a recovery.
+  if (!db.prepare('PRAGMA table_info(users)').all().some((c) => c.name === 'credential_epoch')) {
+    db.exec('ALTER TABLE users ADD COLUMN credential_epoch INTEGER NOT NULL DEFAULT 0');
+  }
 
   const setting = (key) => db.prepare('SELECT value FROM settings WHERE key=?').get(key)?.value;
   const configuredOrigin = setting('public_origin');
@@ -287,9 +329,17 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
     console.warn(`Setup code file: ${setupFile} (deleted after setup)`);
   }
 
+  const proxyWarning = trustProxyWarning(origin, trustProxy);
+  if (proxyWarning) console.warn(proxyWarning);
+
   const rate = createRateLimiter();
   function rateLimited(key, limit = 5, windowMs = 15 * 60 * 1000) {
     return rate.rateLimited(key, limit, windowMs);
+  }
+
+  /** The user's credential epoch, or null when the account does not exist. */
+  function credentialEpoch(userId) {
+    return db.prepare('SELECT credential_epoch FROM users WHERE id=?').get(userId)?.credential_epoch ?? null;
   }
 
   function publicUser(row) {
@@ -318,11 +368,19 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
     return csrf;
   }
 
+  /** Issue a session only if the account is still active and no recovery revoked its credentials
+   *  since `epoch` was read (#929 review): a sign-in still checking a password or passkey when a
+   *  recovery commits must not come out signed in. Returns { user, csrfToken } or null. */
+  const issueSessionIfCurrent = db.transaction((req, res, userId, epoch) => {
+    const user = db.prepare('SELECT * FROM users WHERE id=? AND credential_epoch=? AND disabled_at IS NULL').get(userId, epoch);
+    return user ? { user, csrfToken: issueSession(req, res, user) } : null;
+  });
+
   function authenticate(req) {
     const raw = parseCookies(req).cowork_session;
     const now = Date.now();
     if (raw) {
-      const row = db.prepare(`SELECT s.*,u.id AS id,u.username,u.display_name,u.role,u.disabled_at
+      const row = db.prepare(`SELECT s.*,u.id AS id,u.username,u.display_name,u.role,u.disabled_at,u.credential_epoch
         FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.id_hash=?`).get(digest(raw));
       if (row && !row.disabled_at && row.expires_at > now && row.last_seen_at + IDLE_MS > now) {
         db.prepare('UPDATE sessions SET last_seen_at=? WHERE id_hash=?').run(now, row.id_hash);
@@ -476,20 +534,31 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
     },
     async passwordLogin(req, res, body) {
       const address = clientAddress(req, trustProxy);
-      const key = `login:${address}:${String(body.username || '').toLowerCase()}`;
-      // Probing many usernames from one address (password spraying, enumeration) blocks that address.
-      // Only attempts on usernames that do not exist count, because a whole household can share one
-      // address behind a tunnel; once blocked, every attempt from it gets the same answer.
-      const probes = `login-unknown:${address}`;
-      if (rate.blocked(probes, 30) || rateLimited(key)) return { status: 429, body: { error: 'sign-in failed' } };
-      const row = db.prepare('SELECT * FROM users WHERE username_norm=?').get(String(body.username || '').toLowerCase());
-      if (!row) rateLimited(probes, 30);
+      const username = String(body.username || '').toLowerCase();
+      const key = `login:${address}:${username}`;
+      const failures = `login-failed:${address}`;
+      // Limits that refuse even correct credentials apply before the lookup and the hash, the same
+      // for every username (#927). Each attempt is counted now, before the await, so concurrent
+      // requests cannot all slip past a limit; a successful sign-in gives its count back, so only
+      // failures remain counted.
+      if (rate.blocked(failures, LOGIN_FAILURES_PER_ADDRESS - 1)) return { status: 429, body: { error: 'sign-in failed' } };
+      if (rateLimited(key, LOGIN_FAILURES_PER_ACCOUNT, LOGIN_WINDOW_MS)) return { status: 429, body: { error: 'sign-in failed' } };
+      // Many failures from one address (spraying, enumeration) turn its failed sign-ins into 429s.
+      // That never refuses correct credentials: behind a tunnel without TRUST_PROXY every visitor
+      // shares one address.
+      const probing = rate.blocked(failures, LOGIN_FAILURES_BEFORE_429);
+      const charged = rate.charge(failures, LOGIN_FAILURES_PER_ADDRESS, LOGIN_WINDOW_MS);
+      const row = db.prepare('SELECT * FROM users WHERE username_norm=?').get(username);
       // Always pay for one Argon2 verification, so response time doesn't reveal whether a username exists.
       const usable = row && !row.disabled_at;
       const ok = await verify(usable ? row.password_hash : await timingHash(), String(body.password || '')).catch(() => false) && usable;
-      if (!ok) return { status: 401, body: { error: 'sign-in failed' } };
+      // The hash checked above was read before the await; a recovery since then makes it stale.
+      const signedIn = ok ? issueSessionIfCurrent(req, res, row.id, row.credential_epoch) : null;
+      if (!signedIn) return { status: probing ? 429 : 401, body: { error: 'sign-in failed' } };
+      rate.clear(key);
+      rate.release(failures, charged.window);
       audit('auth.password', row.id, row.id);
-      return { status: 200, body: { user: publicUser(row), csrfToken: issueSession(req, res, row) } };
+      return { status: 200, body: { user: publicUser(signedIn.user), csrfToken: signedIn.csrfToken } };
     },
     logout(req, res, authn) {
       const raw = parseCookies(req).cowork_session;
@@ -510,6 +579,7 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       return { options, challengeToken: saveChallenge(userId, 'register', options.challenge) };
     },
     async registrationVerify(userId, body) {
+      const epoch = credentialEpoch(userId);
       const challenge = takeChallenge(body.challengeToken || '', 'register');
       if (!challenge || challenge.user_id !== userId) throw new Error('registration challenge expired');
       const verification = await verifyRegistrationResponse({ response: body.response, expectedChallenge: challenge.challenge,
@@ -518,9 +588,13 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       const madeFor = relyingPartyId;
       if (!verification.verified || !verification.registrationInfo) throw new Error('passkey registration failed');
       const info = verification.registrationInfo; const cred = info.credential;
-      db.prepare('INSERT INTO passkeys(id,user_id,name,public_key,webauthn_user_id,counter,device_type,backed_up,transports,created_at,rp_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)')
-        .run(cred.id, userId, String(body.name || 'Passkey').slice(0, 80), Buffer.from(cred.publicKey), db.prepare('SELECT webauthn_user_id FROM users WHERE id=?').get(userId).webauthn_user_id,
-          cred.counter, info.credentialDeviceType, info.credentialBackedUp ? 1 : 0, JSON.stringify(cred.transports || []), Date.now(), madeFor);
+      db.transaction(() => {
+        // A recovery that committed while the response was verified revoked this ceremony too.
+        if (epoch === null || credentialEpoch(userId) !== epoch) throw new Error('registration challenge expired');
+        db.prepare('INSERT INTO passkeys(id,user_id,name,public_key,webauthn_user_id,counter,device_type,backed_up,transports,created_at,rp_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)')
+          .run(cred.id, userId, String(body.name || 'Passkey').slice(0, 80), Buffer.from(cred.publicKey), db.prepare('SELECT webauthn_user_id FROM users WHERE id=?').get(userId).webauthn_user_id,
+            cred.counter, info.credentialDeviceType, info.credentialBackedUp ? 1 : 0, JSON.stringify(cred.transports || []), Date.now(), madeFor);
+      })();
       audit('passkey.add', userId, userId, { credentialId: cred.id });
       return { verified: true };
     },
@@ -554,15 +628,20 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       const challenge = takeChallenge(body.challengeToken || '', 'authenticate');
       const key = db.prepare('SELECT * FROM passkeys WHERE id=?').get(body.response?.id || '');
       if (!challenge || !key || challenge.user_id !== key.user_id) throw new Error('authentication failed');
+      const epoch = credentialEpoch(key.user_id);
       const verification = await verifyAuthenticationResponse({ response: body.response, expectedChallenge: challenge.challenge,
         expectedOrigin: passkeyOrigins(), expectedRPID: keyRp(key),
         credential: { id: key.id, publicKey: new Uint8Array(key.public_key), counter: key.counter, transports: JSON.parse(key.transports) }, requireUserVerification: true });
       if (!verification.verified) throw new Error('authentication failed');
-      db.prepare('UPDATE passkeys SET counter=?,last_used_at=? WHERE id=?').run(verification.authenticationInfo.newCounter, Date.now(), key.id);
-      const user = db.prepare('SELECT * FROM users WHERE id=? AND disabled_at IS NULL').get(key.user_id);
-      if (!user) throw new Error('authentication failed');
-      audit('auth.passkey', user.id, user.id, { credentialId: key.id });
-      return { user: publicUser(user), csrfToken: issueSession(req, res, user) };
+      // The passkey must still exist (a recovery deletes it) and the account must be unchanged since
+      // the key was read, or the sign-in fails like any other (#929 review).
+      const signedIn = db.transaction(() => {
+        if (db.prepare('UPDATE passkeys SET counter=?,last_used_at=? WHERE id=? AND user_id=?').run(verification.authenticationInfo.newCounter, Date.now(), key.id, key.user_id).changes !== 1) return null;
+        return issueSessionIfCurrent(req, res, key.user_id, epoch);
+      })();
+      if (!signedIn) throw new Error('authentication failed');
+      audit('auth.passkey', signedIn.user.id, signedIn.user.id, { credentialId: key.id });
+      return { user: publicUser(signedIn.user), csrfToken: signedIn.csrfToken };
     },
     listPasskeys(userId) {
       return db.prepare('SELECT id,name,device_type AS deviceType,backed_up AS backedUp,created_at AS createdAt,last_used_at AS lastUsedAt FROM passkeys WHERE user_id=? ORDER BY created_at').all(userId);
@@ -641,12 +720,27 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       if (!row) return false; const passwordHash = await createPasswordHash(body.password);
       const claimed = db.transaction(() => {
         if (db.prepare('UPDATE recoveries SET used_at=? WHERE token_hash=? AND used_at IS NULL').run(Date.now(), row.token_hash).changes !== 1) return false;
-        db.prepare('UPDATE users SET password_hash=?,updated_at=? WHERE id=?').run(passwordHash, Date.now(), row.user_id); db.prepare('DELETE FROM sessions WHERE user_id=?').run(row.user_id);
+        db.prepare('UPDATE users SET password_hash=?,updated_at=?,credential_epoch=credential_epoch+1 WHERE id=?').run(passwordHash, Date.now(), row.user_id); db.prepare('DELETE FROM sessions WHERE user_id=?').run(row.user_id);
         db.prepare('DELETE FROM device_grants WHERE user_id=?').run(row.user_id);
-        return true;
+        // Approved native-app sign-in requests not yet redeemed would otherwise become grants later.
+        db.prepare('DELETE FROM device_authorizations WHERE user_id=?').run(row.user_id);
+        // Recovery revokes every other credential (#928): whoever had the account may have added a
+        // passkey, an app password or a Diary connector, or still hold another recovery link.
+        // The user signs in with the new password and sets passkeys and app passwords up again.
+        const revoked = {
+          // Only links that still work; used and expired ones are inert and stay as history.
+          recoveries: db.prepare('DELETE FROM recoveries WHERE user_id=? AND token_hash<>? AND used_at IS NULL AND expires_at>?').run(row.user_id, row.token_hash, Date.now()).changes,
+          passkeys: db.prepare('DELETE FROM passkeys WHERE user_id=?').run(row.user_id).changes,
+          appPasswords: db.prepare('DELETE FROM app_passwords WHERE user_id=?').run(row.user_id).changes,
+          // diary_connectors is created by diary-connectors.cjs when the server wires it up.
+          diaryConnectors: db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='diary_connectors'").get()
+            ? db.prepare('DELETE FROM diary_connectors WHERE user_id=?').run(row.user_id).changes : 0,
+        };
+        db.prepare('DELETE FROM challenges WHERE user_id=?').run(row.user_id);
+        return revoked;
       })();
       if (!claimed) return false;
-      audit('recovery.complete', row.user_id, row.user_id); return true;
+      audit('recovery.complete', row.user_id, row.user_id, { revoked: claimed }); return true;
     },
     getAppearance(userId) {
       const row=db.prepare('SELECT value FROM user_appearance WHERE user_id=?').get(userId);
@@ -719,4 +813,4 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
   };
 }
 
-module.exports = { createAuth, USERNAME_RE, digest, createRateLimiter, clientAddress, parseCookies };
+module.exports = { createAuth, USERNAME_RE, digest, createRateLimiter, clientAddress, parseCookies, trustProxyWarning };

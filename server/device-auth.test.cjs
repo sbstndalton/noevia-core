@@ -34,11 +34,14 @@ async function fixture(t) {
 
 async function approved(f, name = 'Unit Mac') {
   const started = f.deviceAuth.start(req(), { client_name: name }).body;
-  assert.equal(f.deviceAuth.decide(f.userId, started.user_code, true).status, 200);
+  assert.equal(f.deviceAuth.decide(f.userId, started.user_code, true, EPOCH).status, 200);
   const tokens = f.deviceAuth.token(req(), { grant_type: device.DEVICE_GRANT_TYPE, device_code: started.device_code });
   assert.equal(tokens.status, 200);
   return tokens.body;
 }
+
+// A new account's users.credential_epoch: approvals carry the epoch read with the session.
+const EPOCH = 0;
 
 const bearerReq = (token) => ({ headers: { authorization: `Bearer ${token}` } });
 
@@ -47,7 +50,7 @@ test('an unapproved device code expires after ten minutes and cannot be approved
   const started = f.deviceAuth.start(req(), { client_name: 'Slow Mac' }).body;
   f.clock.t += device.DEVICE_CODE_TTL_MS;
   assert.equal(f.deviceAuth.lookup(f.userId, started.user_code).status, 404);
-  assert.equal(f.deviceAuth.decide(f.userId, started.user_code, true).status, 404);
+  assert.equal(f.deviceAuth.decide(f.userId, started.user_code, true, EPOCH).status, 404);
   assert.equal(f.deviceAuth.token(req(), { grant_type: device.DEVICE_GRANT_TYPE, device_code: started.device_code }).body.error, 'expired_token');
 });
 
@@ -212,7 +215,7 @@ test('revokeAll also clears pending and approved sign-in requests', async (t) =>
   const f = await fixture(t);
   const pending = f.deviceAuth.start(req(), { client_name: 'Pending' }).body;
   const approvedCode = f.deviceAuth.start(req(), { client_name: 'Approved' }).body;
-  f.deviceAuth.decide(f.userId, approvedCode.user_code, true);
+  f.deviceAuth.decide(f.userId, approvedCode.user_code, true, EPOCH);
   f.deviceAuth.revokeAll('admin-actor', 'feature-off');
   assert.equal(f.auth.db.prepare('SELECT count(*) AS n FROM device_authorizations').get().n, 0);
   assert.equal(f.deviceAuth.token(req(), { grant_type: device.DEVICE_GRANT_TYPE, device_code: approvedCode.device_code }).body.error, 'invalid_grant', 'an approved code cannot be redeemed after the switch-off');
@@ -301,4 +304,17 @@ test('the request authenticator is exactly auth.cjs while the feature is off', a
   // Turning the feature off stops every device token at once.
   on = false;
   assert.equal(gate.authenticate(bearerReq(tokens.access_token)), null);
+});
+
+test('an approval without the session\'s credential epoch is refused (fails closed)', async (t) => {
+  const f = await fixture(t);
+  const started = f.deviceAuth.start(req(), { client_name: 'No epoch Mac' }).body;
+  for (const epoch of [undefined, null, EPOCH + 1]) {
+    assert.deepEqual(f.deviceAuth.decide(f.userId, started.user_code, true, epoch), { status: 404, body: { error: 'That code is not valid or has expired.' } }, `epoch ${epoch}`);
+  }
+  assert.equal(f.deviceAuth.token(req(), { grant_type: device.DEVICE_GRANT_TYPE, device_code: started.device_code }).body.error, 'authorization_pending', 'the request stays pending');
+  // Denying needs no epoch, and the right epoch still approves.
+  const other = f.deviceAuth.start(req(), { client_name: 'Denied Mac' }).body;
+  assert.equal(f.deviceAuth.decide(f.userId, other.user_code, false).status, 200);
+  assert.equal(f.deviceAuth.decide(f.userId, started.user_code, true, EPOCH).status, 200);
 });

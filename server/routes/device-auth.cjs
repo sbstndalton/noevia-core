@@ -79,7 +79,9 @@ function createDeviceAuthRoutes({ json, authResult, readJson, deviceAuth, authSe
     if (p === '/api/auth/device/approve' && req.method === 'POST') {
       const body = await readJson(req);
       if (typeof body?.approve !== 'boolean') return json(res, 400, { error: 'approve must be true or false' });
-      return authResult(res, deviceAuth.decide(authn.user.id, body.user_code, body.approve));
+      // The session was checked before the body was read: pass the account's credential epoch as
+      // read with it, so a recovery in between refuses the approval (#933). null never matches.
+      return authResult(res, deviceAuth.decide(authn.user.id, body.user_code, body.approve, authn.session.credential_epoch ?? null));
     }
     if (p === '/api/auth/devices' && req.method === 'GET') {
       res.setHeader('Cache-Control', 'no-store');

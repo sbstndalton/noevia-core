@@ -3,7 +3,8 @@ const crypto = require('node:crypto');
 const { hash, verify, Algorithm } = require('@node-rs/argon2');
 
 // DAV credentials have no connection to session issuance or account passwords.
-function createAppPasswords({ db, audit, rateLimited }) {
+// `hashPassword` is injectable for tests that need to hold the hashing step open.
+function createAppPasswords({ db, audit, rateLimited, hashPassword = (password) => hash(password, { algorithm: Algorithm.Argon2id, memoryCost: 19456, timeCost: 2, parallelism: 1 }) }) {
   db.exec(`CREATE TABLE IF NOT EXISTS app_passwords(
     id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     name TEXT NOT NULL, scope TEXT NOT NULL CHECK(scope IN ('lan','public')),
@@ -20,13 +21,15 @@ function createAppPasswords({ db, audit, rateLimited }) {
       if (!active(userId)) throw Error('Account unavailable.');
       if (rateLimited(`app-password:create:${userId}`, 5, 60000)) throw Error('Wait a minute before generating another app password.');
       if (list(userId).length >= 20) throw Error('Revoke an app password before creating another (limit 20).');
+      // #928: an account recovery while the password is hashed revokes this request too.
+      const epoch = db.prepare('SELECT credential_epoch FROM users WHERE id=?').get(userId)?.credential_epoch;
       const id = crypto.randomBytes(16).toString('hex');
       const password = `nv_dav_${id}.${crypto.randomBytes(32).toString('base64url')}`;
-      const passwordHash = await hash(password, { algorithm: Algorithm.Argon2id, memoryCost: 19456, timeCost: 2, parallelism: 1 });
+      const passwordHash = await hashPassword(password);
       const createdAt = Date.now();
       db.transaction(() => {
         // Recheck after asynchronous hashing: disable/delete and concurrent minting win.
-        if (!active(userId)) throw Error('Account unavailable.');
+        if (!active(userId) || db.prepare('SELECT credential_epoch FROM users WHERE id=?').get(userId)?.credential_epoch !== epoch) throw Error('Account unavailable.');
         if (list(userId).length >= 20) throw Error('Revoke an app password before creating another (limit 20).');
         db.prepare('INSERT INTO app_passwords(id,user_id,name,scope,password_hash,created_at) VALUES(?,?,?,?,?,?)')
           .run(id, userId, name.trim(), scope, passwordHash, createdAt);

@@ -4,8 +4,8 @@ const Database = require('better-sqlite3');
 const { createAppPasswords } = require('./app-passwords.cjs');
 function fixture(t, rateLimited = () => false) {
   const db = new Database(':memory:'); db.pragma('foreign_keys=ON');
-  db.exec(`CREATE TABLE users(id TEXT PRIMARY KEY,username_norm TEXT,disabled_at INTEGER);
-    INSERT INTO users VALUES('alice','alice',NULL),('bob','bob',NULL);`);
+  db.exec(`CREATE TABLE users(id TEXT PRIMARY KEY,username_norm TEXT,disabled_at INTEGER,credential_epoch INTEGER NOT NULL DEFAULT 0);
+    INSERT INTO users(id,username_norm,disabled_at) VALUES('alice','alice',NULL),('bob','bob',NULL);`);
   const events = [];
   const passwords = createAppPasswords({ db, audit: (...args) => events.push(args), rateLimited });
   t.after(() => db.close()); return { db, passwords, events };

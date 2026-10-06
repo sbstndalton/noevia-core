@@ -473,17 +473,22 @@ function createDeviceAuth({ db, audit, publicUser, rate, clientAddress, origin, 
       expiresAt: row.expires_at, ip: addressesTrusted ? row.ip : null, userAgent: row.user_agent } };
   }
 
-  /** Approve or deny a pending request for `userId`. Audited either way. */
-  function decide(userId, userCode, approve) {
+  /** Approve or deny a pending request for `userId`. Audited either way. `credentialEpoch` is the
+   *  account's users.credential_epoch as read with the approving session: an approval is refused
+   *  if an account recovery changed it since (the route reads the request body in between), and
+   *  refused when it is missing: approvals fail closed. */
+  function decide(userId, userCode, approve, credentialEpoch) {
     if (verifyLimited(userId)) return { status: 429, body: { error: 'Too many attempts. Wait a few minutes and try again.' } };
     const at = now();
     const found = pendingByUserCode(userCode, at);
     if (!found) return { status: 404, body: { error: 'That code is not valid or has expired.' } };
     const { row } = found;
     const status = approve ? 'approved' : 'denied';
-    if (q.decide.run(status, approve ? userId : null, at, row.device_code_hash, at).changes !== 1) {
-      return { status: 404, body: { error: 'That code is not valid or has expired.' } };
-    }
+    const decided = db.transaction(() => {
+      if (approve && (credentialEpoch === undefined || credentialEpoch === null || !db.prepare('SELECT 1 FROM users WHERE id=? AND credential_epoch=? AND disabled_at IS NULL').get(userId, credentialEpoch))) return false;
+      return q.decide.run(status, approve ? userId : null, at, row.device_code_hash, at).changes === 1;
+    })();
+    if (!decided) return { status: 404, body: { error: 'That code is not valid or has expired.' } };
     audit(approve ? 'device.approve' : 'device.deny', userId, userId, { clientName: row.client_name, ip: row.ip });
     return { status: 200, body: { ok: true, approved: !!approve, clientName: row.client_name } };
   }

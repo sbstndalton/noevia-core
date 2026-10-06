@@ -37,7 +37,7 @@ test.before(async () => {
   const deviceAuth = device.createDeviceAuth({ db: auth.db, audit: auth.audit, publicUser: auth.publicUser, rate: createRateLimiter(),
     clientAddress: () => '127.0.0.1', origin: () => ORIGIN });
   const started = deviceAuth.start({ headers: {} }, { client_name: 'Left over' }).body;
-  deviceAuth.decide(adminId, started.user_code, true);
+  deviceAuth.decide(adminId, started.user_code, true, 0); // a new account's credential epoch
   leftover = deviceAuth.token({ headers: {} }, { grant_type: DEVICE_GRANT, device_code: started.device_code }).body;
   assert.ok(leftover.access_token);
   auth.db.close();
