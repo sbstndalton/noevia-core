@@ -6,6 +6,27 @@
 #
 # The harness is pinned. An agent that updates itself under you is a supply-chain change you did
 # not review, in the one container allowed to run arbitrary commands.
+# sandbox-bridge.wasm (#999): the Rust/WebAssembly port of the bridge's framing, toolCallFor, start
+# line and containment decision, used only with SANDBOX_BRIDGE_IMPL=rust. sandbox-bridge.lock pins the
+# noevia-rs ref, its tarball sha256 and the module sha256; the tarball is checked before anything is
+# built and the module after (the same recipe as the web image's dav-parse.wasm).
+FROM node:22-bookworm-slim AS sandbox-bridge-src
+COPY sandbox-bridge.lock /lock
+RUN set -e; eval "$(grep -E '^(NOEVIA_RS_REF|NOEVIA_RS_SHA256)=[0-9a-f]+$' /lock)"; \
+    node -e 'fetch(process.argv[1]).then(r=>{if(!r.ok)throw new Error("HTTP "+r.status);return r.arrayBuffer()}).then(b=>require("fs").writeFileSync("/rs.tgz",Buffer.from(b))).catch(e=>{console.error(e.message);process.exit(1)})' \
+      "https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/$NOEVIA_RS_REF"; \
+    echo "$NOEVIA_RS_SHA256  /rs.tgz" | sha256sum -c -; \
+    mkdir /rs && tar -xzf /rs.tgz --strip-components=1 -C /rs && rm /rs.tgz
+
+FROM rust:1.99-slim-bookworm AS sandbox-bridge
+ENV RUSTUP_TOOLCHAIN=1.99.0 CARGO_TERM_COLOR=never
+COPY --from=sandbox-bridge-src /rs /src
+COPY sandbox-bridge.lock /lock
+WORKDIR /src
+RUN set -e; rustup target add wasm32-unknown-unknown; \
+    tools/build-sandbox-bridge-wasm.sh /out/sandbox-bridge.wasm; \
+    echo "$(sed -n 's/^SANDBOX_BRIDGE_WASM_SHA256=//p' /lock)  /out/sandbox-bridge.wasm" | sha256sum -c -
+
 FROM node:22-bookworm-slim
 
 ARG HARNESS_PACKAGE=opencode-ai
@@ -27,6 +48,10 @@ WORKDIR /srv
 # verifier.cjs: the server-measured test runner (#703). Runs ONLY in the separate `code-verify`
 # container (uid 1002, no network, workspaces read-only); never started in the agent sandbox.
 COPY supervisor.cjs pi-acp-bridge.cjs verifier.cjs ./
+# SANDBOX_BRIDGE_IMPL=rust (#999; default js): the loader, its lock and the checked module. Read-only
+# like everything else here; the loader re-checks the module's sha256 against the lock at startup.
+COPY sandbox-bridge-wasm.cjs sandbox-bridge.lock ./
+COPY --from=sandbox-bridge /out/sandbox-bridge.wasm ./wasm/sandbox-bridge.wasm
 # The verifier's socket directory: root's, 0770, so a fresh named volume inherits that owner and
 # neither the agent (1000), git (1002) nor the test command (1003) can enter it. Web connects as
 # root. Mount points for the verifier's tmpfs copies exist in the read-only root.

@@ -168,7 +168,70 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
-      - run: node --test ws/services/code-sandbox/pi-acp-bridge.test.cjs
+      # #999: sandbox-bridge.wasm at the noevia-rs ref pinned in code-sandbox/sandbox-bridge.lock,
+      # checksum-verified (tarball and module), so SANDBOX_BRIDGE_IMPL=rust runs for real against
+      # the built artifact. The shared fixture table must be byte-identical to noevia-rs's copy.
+      - uses: dtolnay/rust-toolchain@70dec6087f2cb6bab9fbac4da23160afbe848e91 # 1.99.0
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Build sandbox-bridge.wasm at the pinned noevia-rs ref
+        working-directory: self
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          eval "$(grep -E '^(NOEVIA_RS_REF|NOEVIA_RS_SHA256|SANDBOX_BRIDGE_WASM_SHA256)=[0-9a-f]+$' code-sandbox/sandbox-bridge.lock)"
+          [[ "$NOEVIA_RS_REF" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::sandbox-bridge.lock NOEVIA_RS_REF is not a 40-char SHA"; exit 1; }
+          # The pin must be on noevia-rs main, so core main never holds a ref from an unmerged or
+          # force-pushed-away PR head.
+          status=""
+          for attempt in 1 2 3 4 5; do
+            status=$(gh api "repos/sbstndalton/noevia-rs/compare/$NOEVIA_RS_REF...main" --jq .status 2>/dev/null) && break
+            sleep $((attempt * 5))
+          done
+          echo "sandbox-bridge NOEVIA_RS_REF $NOEVIA_RS_REF: noevia-rs main is '$status'"
+          case "$status" in identical|ahead) ;; *) echo "::error::sandbox-bridge.lock NOEVIA_RS_REF is not reachable from sbstndalton/noevia-rs main ('$status')"; exit 1 ;; esac
+          curl -fsSL "https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/$NOEVIA_RS_REF" -o "$RUNNER_TEMP/rs.tgz"
+          echo "$NOEVIA_RS_SHA256  $RUNNER_TEMP/rs.tgz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/rs" && tar -xzf "$RUNNER_TEMP/rs.tgz" --strip-components=1 -C "$RUNNER_TEMP/rs"
+          cmp "$RUNNER_TEMP/rs/crates/sandbox-bridge/tests/fixtures/sandbox-bridge.v1.json" tests/fixtures/sandbox-bridge.v1.json
+          rustup target add wasm32-unknown-unknown --toolchain 1.99.0
+          out="$GITHUB_WORKSPACE/ws/services/code-sandbox/wasm/sandbox-bridge.wasm"
+          "$RUNNER_TEMP/rs/tools/build-sandbox-bridge-wasm.sh" "$out"
+          echo "$SANDBOX_BRIDGE_WASM_SHA256  $out" | sha256sum -c -
+      - name: The fixture table is what the generator makes from the JS references
+        working-directory: self
+        run: node tools/gen-sandbox-bridge-fixtures.cjs | cmp - tests/fixtures/sandbox-bridge.v1.json
+      - run: node --test ws/services/code-sandbox/pi-acp-bridge.test.cjs ws/services/code-sandbox/sandbox-bridge-wasm.test.cjs
+        env:
+          SANDBOX_BRIDGE_WASM_REQUIRED: '1'
+      # The image a release ships: its own build stage rebuilds and checks the module, and the
+      # runtime image must load it (sha256 against the lock, no imports, the ABI) and run the
+      # framing and toolCallFor through it.
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3 (v3.12.0)
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6 (v6.19.2)
+        with:
+          context: self/code-sandbox
+          file: self/code-sandbox/Dockerfile
+          build-args: |
+            HARNESS_PACKAGE=@earendil-works/pi-coding-agent
+            HARNESS_VERSION=0.87.0
+          push: false
+          load: true
+          tags: noevia-code-sandbox:ci
+          cache-from: type=gha,scope=code-sandbox
+          cache-to: type=gha,mode=max,scope=code-sandbox
+      - name: The shipped image loads sandbox-bridge.wasm
+        run: |
+          set -euo pipefail
+          docker run --rm --read-only noevia-code-sandbox:ci node -e '
+            const sb = require("/srv/sandbox-bridge-wasm.cjs");
+            sb.ensure();
+            const seen = [];
+            sb.linesRust((m) => seen.push(m), () => {}, undefined, (e) => { throw e; })("{\"a\":1}\r\nnope\n");
+            const call = sb.toolCallForRust({ toolCallId: "c1", toolName: "bash", input: { command: "ls" } });
+            if (JSON.stringify(seen) !== "[{\"a\":1}]" || call.kind !== "execute" || call.title !== "ls") process.exit(1);
+            console.log("sandbox-bridge.wasm OK in the shipped image");'
 
   web-image:
     name: Web image build

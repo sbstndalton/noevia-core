@@ -128,3 +128,52 @@ bridges it with `pi-acp-bridge.cjs`, which turns the gate's confirm into an ACP
 `session/request_permission`, so pi's commands reach the same approval card as any harness. The
 bridge can only turn a question into "no" by itself. Installing pi in this image is the user's
 decision (a supply-chain change); see docs/spec-agent-execution.md.
+
+## SANDBOX_BRIDGE_IMPL=js|rust (#999)
+
+The bridge's and the supervisor's untrusted-input handling has a Rust port, built from
+sbstndalton/noevia-rs (`crates/sandbox-bridge`, `bins/sandbox-bridge-wasm`) into
+`wasm/sandbox-bridge.wasm` by this image's own build stage. `sandbox-bridge.lock` pins the noevia-rs
+ref, the tarball's sha256 and the module's sha256. The default is `js`; set
+`SANDBOX_BRIDGE_IMPL=rust` on the sandbox container to switch. Any other value means js, with one
+warning in the log. The supervisor reads the flag and passes it to the agent it starts, and
+`pi-acp-bridge.cjs` removes it again before starting pi.
+
+What goes through the module under `rust`:
+
+- `pi-acp-bridge.cjs`: `lines()`, the JSONL framing of pi's output and the client's messages
+  (state per stream, inside the module). Node still runs `JSON.parse` on every line the module
+  hands back, so a message's value (duplicate keys, numbers, `__proto__`) is the JS one.
+- `pi-acp-bridge.cjs`: `toolCallFor()`, the tool call noevia classifies and approves.
+- `supervisor.cjs`: the start line (`parseStartJs`) and `insideRoot`'s decision (`containedJs`).
+  The `realpathSync` of both paths stays in Node, because symlinks belong to the filesystem, not
+  to the string. Only the comparison of the two real paths is ported.
+
+It is WebAssembly and not a separate binary because framing runs once per stream chunk and
+`toolCallFor` once per tool call. A process per call would cost milliseconds per message, and a
+long-lived child would need its own framing in front of it. The module runs in-process, with no
+imports, under Node's built-in WebAssembly.
+
+It fails closed. A missing module, a checksum or ABI mismatch, a trap, a malformed reply, or a line
+the module passed that `JSON.parse` refuses has these effects:
+
+- the bridge ends the session with "the sandbox bridge (rust) failed; closing the session" and
+  refuses everything pending (a bridge that cannot load the module at all exits after one
+  JSON-RPC error with the same text);
+- the supervisor refuses the connection with "the sandbox bridge is unavailable" and starts
+  nothing.
+
+Nothing falls back to JS, and no failure can become a permission.
+
+Differential fixtures come from the JS references
+(`node tools/gen-sandbox-bridge-fixtures.cjs > tests/fixtures/sandbox-bridge.v1.json`). The file
+is byte-identical to noevia-rs's `crates/sandbox-bridge/tests/fixtures/sandbox-bridge.v1.json`.
+CI compares the two, rebuilds the module at the pinned ref, and runs
+`sandbox-bridge-wasm.test.cjs` against it (fixtures, seeded random input, live bridge and
+supervisor sessions, and failure cases).
+
+Two differences from JS are known, and neither shows on the wire:
+
+- For a tool named after an `Object.prototype` method (`toString`, `constructor` and so on), JS's
+  in-process `kind` is that function and Rust's is absent. `JSON.stringify` drops both.
+- `String()` of arrays nested more than 1,000 levels deep fails closed. V8 throws at about 5,000.

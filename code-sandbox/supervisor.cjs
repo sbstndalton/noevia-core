@@ -80,7 +80,13 @@ function parseStartJs(line) {
  *          log?: (line: string) => void, graceMs?: number}} deps
  */
 function createSupervisor({ command, args = [], root, spawnFn = spawn, log = () => {}, graceMs = 5000,
-  maxConnections = DEFAULT_MAX_CONNECTIONS, maxWallMs = DEFAULT_MAX_WALL_MS, kill = process.kill.bind(process) }) {
+  maxConnections = DEFAULT_MAX_CONNECTIONS, maxWallMs = DEFAULT_MAX_WALL_MS, kill = process.kill.bind(process), bridgeImpl = 'js' }) {
+  // SANDBOX_BRIDGE_IMPL=rust (#999): the start line and insideRoot's decision through
+  // sandbox-bridge.wasm, and the flag handed to the agent (pi-acp-bridge.cjs reads it). A module
+  // that is missing or fails refuses the connection with one fixed message; nothing falls back.
+  const rust = bridgeImpl === 'rust' ? require('./sandbox-bridge-wasm.cjs') : null;
+  const parseStart = rust ? rust.parseStartRust : parseStartJs;
+  const contained = rust ? rust.containedRust : containedJs;
   const cap = positive(maxConnections, DEFAULT_MAX_CONNECTIONS);
   const wall = positive(maxWallMs, DEFAULT_MAX_WALL_MS);
   let live = 0;
@@ -137,12 +143,17 @@ function createSupervisor({ command, args = [], root, spawnFn = spawn, log = () 
       const line = buffer.slice(0, end);
       const rest = buffer.slice(end + 1);
       buffer = '';
-      const start = parseStartJs(line);
+      let start, cwd;
+      try {
+        start = parseStart(line);
+        if (start.start) cwd = insideRoot(root, start.cwd, contained);
+      } catch { return refuse('the sandbox bridge is unavailable'); }
       if (!start.start) return refuse('the first line must be noevia’s start message');
-      const cwd = insideRoot(root, start.cwd);
       if (!cwd) return refuse('that workspace is not inside this sandbox');
 
-      const child = spawnFn(command, args, { cwd, env: cleanEnv(start.env), stdio: ['pipe', 'pipe', 'pipe'], detached: true });
+      const env = cleanEnv(start.env);
+      if (rust) env.SANDBOX_BRIDGE_IMPL = 'rust';
+      const child = spawnFn(command, args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
       agent = child;
       pid = child.pid || null;
       log(`started ${command} in ${cwd}`);
@@ -191,8 +202,19 @@ if (require.main === module) {
     console.error('code-sandbox: CODE_HARNESS_COMMAND and WORKSPACE_ROOT are required');
     process.exit(2);
   }
+  const log = (line) => console.log(`[code-sandbox] ${line}`);
+  let bridgeImpl = 'js';
+  if (process.env.SANDBOX_BRIDGE_IMPL !== undefined) {
+    const rust = require('./sandbox-bridge-wasm.cjs');
+    bridgeImpl = rust.resolveImpl(process.env.SANDBOX_BRIDGE_IMPL, log);
+    if (bridgeImpl === 'rust') {
+      try { rust.ensure(); log('SANDBOX_BRIDGE_IMPL=rust: sandbox-bridge.wasm loaded'); } catch {
+        log('SANDBOX_BRIDGE_IMPL=rust but sandbox-bridge.wasm is unavailable; every connection will be refused');
+      }
+    }
+  }
   const { listen } = createSupervisor({ command, args: String(process.env.CODE_HARNESS_ARGS || '').split(' ').filter(Boolean),
-    root, log: (line) => console.log(`[code-sandbox] ${line}`),
+    root, log, bridgeImpl,
     maxConnections: positive(process.env.CODE_SANDBOX_MAX_CONNECTIONS, DEFAULT_MAX_CONNECTIONS),
     maxWallMs: positive(process.env.CODE_SANDBOX_MAX_WALL_MS, DEFAULT_MAX_WALL_MS) });
   listen(Number(process.env.PORT || 8030)).then((address) => {
