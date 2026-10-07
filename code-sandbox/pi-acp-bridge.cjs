@@ -21,6 +21,8 @@ const { spawn } = require('node:child_process');
 const nodePath = require('node:path');
 
 const PROTOCOL_VERSION = 1;
+// Own names only (#1000): a tool named `toString`, `constructor` or `__proto__` is `other`, not
+// whatever Object.prototype holds under that name.
 const KIND = { bash: 'execute', write: 'edit', edit: 'edit', read: 'read', grep: 'search', find: 'search', ls: 'search' };
 const DIALOGS = new Set(['confirm', 'select', 'input', 'editor']);
 // The web gate (apps/web/server/code-service.cjs, APPROVAL_TIMEOUT_MS) times its own wait for a
@@ -94,7 +96,7 @@ function toolCallFor(payload) {
   return {
     toolCallId: String(payload.toolCallId || `pi-${name}`),
     title: name === 'bash' && typeof input.command === 'string' ? input.command : outside ? `${name} outside the workspace` : name,
-    kind: outside ? 'other' : KIND[name] || 'other',
+    kind: !outside && Object.hasOwn(KIND, name) ? KIND[name] : 'other',
     rawInput: outside ? { ...input, noeviaOutsideWorkspace: true } : input,
     ...(path ? { locations: [{ path }] } : {}),
   };

@@ -146,11 +146,13 @@ test('a Buffer chunk is coerced as JS does; a lone surrogate fails closed', { sk
   assert.equal(failures[0].message, sb.FAILED);
 });
 
-test('toolCallFor: the one in-process difference is a function-valued kind, absent on the wire', { skip }, () => {
-  const payload = { toolName: 'constructor', input: {} };
-  assert.equal(typeof toolCallFor(payload).kind, 'function');
-  assert.equal(sb.toolCallForRust(payload).kind, undefined);
-  assert.equal(JSON.stringify(sb.toolCallForRust(payload)), JSON.stringify(toolCallFor(payload)));
+test('toolCallFor: a tool named after an Object.prototype property is `other` in JS and Rust (#1000)', { skip }, () => {
+  for (const toolName of ['constructor', 'toString', 'hasOwnProperty', 'valueOf', '__proto__', '__defineGetter__']) {
+    const payload = { toolName, input: {} };
+    assert.equal(toolCallFor(payload).kind, 'other', toolName);
+    assert.equal(sb.toolCallForRust(payload).kind, 'other', toolName);
+    assert.deepEqual(sb.toolCallForRust(payload), toolCallFor(payload));
+  }
   assert.throws(() => sb.toolCallForRust({ toolName: { toString: 1 } }), TypeError);
   assert.throws(() => toolCallFor({ toolName: { toString: 1 } }), TypeError);
 });
