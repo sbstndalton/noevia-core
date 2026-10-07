@@ -223,6 +223,14 @@ test('#1012 dav-parse.wasm preset_reload: the real Rust check', { skip: skipWasm
   assert.deepEqual(glob.changed, ['other']);
   const dup = davParseWasm.presetReload({ baseline: BASE, current: BASE + '[other]\n', loaded: ['loaded-model'] });
   assert.deepEqual(dup, { safe: false, reason: 'ambiguous', changed: [], detail: 'duplicate_section' });
+  // #1039: llama.cpp's header/line grammar (common/preset.cpp 186-217 at eafe15a5e).
+  for (const bad of ['[a]x\n', '[a]\u000b\n', '[a\u00a0]\n', '[ a]\n', '  [a]\n', '[a:Q4]\n', '[default]\n']) {
+    assert.deepEqual(davParseWasm.presetReload({ baseline: BASE, current: BASE + bad, loaded: ['loaded-model'] }), { safe: false, reason: 'ambiguous', changed: [], detail: 'header' }, JSON.stringify(bad));
+  }
+  for (const bad of ['\ufeffversion = 1\n', '-ctx-size = 1\n', '= 1\n', '\u000bctx-size = 1\n']) {
+    assert.deepEqual(davParseWasm.presetReload({ baseline: BASE, current: BASE + bad, loaded: ['loaded-model'] }), { safe: false, reason: 'ambiguous', changed: [], detail: 'line' }, JSON.stringify(bad));
+  }
+  assert.equal(davParseWasm.presetReload({ baseline: BASE, current: BASE + '[new]\t; note\nload-on-startup = true\n', loaded: ['loaded-model'] }).safe, true);
   assert.throws(() => davParseWasm.presetReload({ baseline: 1, current: '', loaded: [] }), { reason: 'input' });
   assert.throws(() => davParseWasm.presetReload({ baseline: 'x'.repeat(davParseWasm.MAX_RELOAD_BYTES), current: '', loaded: [] }), { reason: 'too_large' });
   // The guard wired to the real module.
