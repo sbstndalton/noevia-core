@@ -147,7 +147,22 @@ function clientMessage(e, fallback) {
   return fallback;
 }
 
-function createFullAutotuner({ request, rawModels, presets, maintenance, applyUnlocked, identityFor,
+// #1049: a rejection from the engine's own transport (fetch errors, stream or HTTP failures, anything
+// the engine's words can reach) never becomes a step reason, phase reason, note or job error: those are
+// stored in the state file and returned by status(). The caller sees a fixed sentence; the original is
+// logged only. Errors noevia creates itself (literals in this file, publicFail) pass through untouched.
+function engineBoundary(call) {
+  return async (...args) => {
+    try { return await call(...args); }
+    catch (e) {
+      if (e?.cancelled || e?.name === 'AbortError' || e?.fatal || e?.publicMessage) throw e;
+      console.error('[autotune] engine request failed:', e?.stack || e);
+      throw Object.assign(Error(/timed out|timeout/i.test(String(e?.message)) ? 'The model server request timed out.' : 'The model server request failed.'), { engineFailure: true });
+    }
+  };
+}
+
+function createFullAutotuner({ request: engineRequest, rawModels: engineRawModels, presets, maintenance, applyUnlocked, identityFor,
   contextFactory, samplingFor = null, stateFile, now = Date.now, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
   betweenModelsMs = 1000, idleTimeoutMs = 300000,
   readMemory = require('./llamacpp-calibration.cjs').readMemAvailableGib, memoryFloorGib = 2, onResult = async () => {},
@@ -157,6 +172,7 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
   // or null) and the inference memory budget in GiB.
   planner = defaultPlanner(), planFacts = async () => null, budgetGib = () => 16, servicesReserveMib = SERVICES_RESERVE_MIB,
   loadAdvisor = defaultLoadAdvisor() }) {
+  const request = engineBoundary(engineRequest), rawModels = engineBoundary(engineRawModels);
   let state;
   try { state = JSON.parse(fs.readFileSync(stateFile, 'utf8')); } catch { state = {}; }
   state.history ||= {};
@@ -247,6 +263,7 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
       ...(quirksOf(model).reasoningEffort ? { reasoning_effort: quirksOf(model).reasoningEffort } : {}),
       chat_template_kwargs: { enable_thinking: false }, messages: [{ role: 'user', content: prompt }], ...(extra || {}),
     }) }, 180000); }
+    catch (e) { if (lowMemory) throw Error('Available memory fell below the safety floor.'); throw e; }
     finally { clearInterval(timer); inflight = null; }
     check();
     if (lowMemory) throw Error('Available memory fell below the safety floor.');

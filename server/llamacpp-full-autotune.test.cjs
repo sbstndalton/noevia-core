@@ -1212,3 +1212,28 @@ test('#1048 advisor on: an error body that never ends is cancelled at the deadli
   assert.deepEqual([probeRows(f)[0].outcome, phase(j.models[0], 'context').steps[0].classification.ruleId], ['oom', 'text_oom']);
   assert.equal(svc.asked.length, 0);
 });
+
+// ── #1049: an engine failure's own words never become a step reason, note or job error ──
+const noSecret = f => {
+  assert.ok(!JSON.stringify(f.manager.autotune.status().body).includes('SECRET-abc'));
+  assert.ok(!fs.readFileSync(f.stateFile, 'utf8').includes('SECRET-abc'));
+};
+test('#1049 a quality-probe failure carrying engine text stays out of status() and the state file', async t => {
+  const f = fixture(t, { onChat: ({ prompt }) => { if (QUALITY.some(q => q.prompt === prompt)) throw Error('fetch failed: SECRET-abc engine detail'); } });
+  const quiet = console.error; console.error = () => {}; t.after(() => { console.error = quiet; });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  assert.notEqual(j.status, 'passed');
+  assert.match(JSON.stringify(j), /The model server request failed\./);
+  noSecret(f);
+});
+test('#1049 the same failure inside the planned quality probe (withQuality catch) is not recorded either', { skip: skipWasm }, async t => {
+  let armed = false;
+  const f = fixture(t, { servingChecks: servingOff, autotuneExtra: planned(),
+    onChat: ({ prompt }) => { if (QUALITY.some(q => q.prompt === prompt)) { armed = true; throw Error('SECRET-abc engine detail: out of memory'); } } });
+  const quiet = console.error; console.error = () => {}; t.after(() => { console.error = quiet; });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  await finished(f.manager);
+  assert.ok(armed);
+  noSecret(f);
+});
