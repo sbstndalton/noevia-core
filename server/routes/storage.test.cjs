@@ -16,7 +16,7 @@ function fixture({ storage = { kind: 'local' }, browsable = false, approved = ()
     authService: { getStorage: (id, secret) => { storageReads.push([id, secret]); return storage; }, saveStorage: (_id, body) => { saved.push(body); return { ok: true, kind: body.kind }; } },
     storageClient: {
       isBrowsable: () => browsable,
-      listFiles: async (_c, dir) => (dir === 'boom' ? (() => { throw new Error('listing failed'); })() : [{ name: 'a.txt', path: `${dir}/a.txt` }]),
+      listFiles: async (_c, dir) => (dir === '..%2Fx' || dir === '../x' ? (() => { throw Object.assign(new Error('Use a relative path inside the storage folder.'), { status: 400 }); })() : dir === 'boom' ? (() => { throw new Error('listing failed'); })() : [{ name: 'a.txt', path: `${dir}/a.txt` }]),
       createFolder: async (_c, dir) => { if (dir === 'taken') throw Object.assign(new Error('exists'), { status: 409 }); return { created: dir }; },
       readTextFile: async (_c, file) => ({ path: file, content: 'hi' }),
     },
@@ -172,4 +172,12 @@ test('edited S3 endpoint path, bucket and access key are signed with the saved s
   const headers=f.requests[0].init.headers;
   assert.deepEqual(headers, signS3Request('GET', new URL(f.requests[0].url), '', 'edited-key', 'synthetic-secret', {amzDate:headers['x-amz-date']}));
   assert.deepEqual(f.sent,[{status:200,body:{ok:true}}]);
+});
+
+test('browsing a refused path answers 400, not 502 (#984)', async () => {
+  const f = fixture({ storage: { kind: 'webdav', baseUrl: 'https://cloud.example/dav' }, browsable: true });
+  await f.call('GET', '/api/integrations/storage/files/..%2Fx');
+  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'Use a relative path inside the storage folder.' } });
+  await f.call('GET', '/api/integrations/storage/files/boom');
+  assert.equal(f.sent.pop().status, 502);
 });
