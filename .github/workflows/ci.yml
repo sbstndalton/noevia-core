@@ -74,7 +74,7 @@ jobs:
       # #967: dav-parse.wasm at the noevia-rs ref pinned in server/dav-parse.lock, checksum-verified
       # (tarball and module), so the differential and DAV_PARSE_IMPL=wasm tests run for real; since
       # #976/#978 the same module carries s3-list-parse and storage-path (S3_PARSE_IMPL,
-      # STORAGE_PATH_IMPL), and since #977 upload-sniff (UPLOAD_SNIFF_IMPL), since #979 secret-envelope (SECRET_ENVELOPE_IMPL). The shared fixture tables must be byte-identical to noevia-rs's copies.
+      # STORAGE_PATH_IMPL), and since #977 upload-sniff (UPLOAD_SNIFF_IMPL), since #979 secret-envelope (SECRET_ENVELOPE_IMPL), since #980 mcp-frame (MCP_FRAME_IMPL). The shared fixture tables must be byte-identical to noevia-rs's copies.
       - uses: dtolnay/rust-toolchain@70dec6087f2cb6bab9fbac4da23160afbe848e91 # 1.99.0
         with:
           targets: wasm32-unknown-unknown
@@ -102,6 +102,7 @@ jobs:
           cmp "$RUNNER_TEMP/rs/crates/storage-path/tests/fixtures/storage-path.v1.json" tests/fixtures/storage-path.v1.json
           cmp "$RUNNER_TEMP/rs/crates/upload-sniff/tests/fixtures/upload-sniff.v1.json" tests/fixtures/upload-sniff.v1.json
           cmp "$RUNNER_TEMP/rs/crates/secret-envelope/tests/fixtures/secret-envelope.v1.json" tests/fixtures/secret-envelope.v1.json
+          cmp "$RUNNER_TEMP/rs/crates/mcp-frame/tests/fixtures/mcp-frame.v1.json" tests/fixtures/mcp-frame.v1.json
           rustup target add wasm32-unknown-unknown --toolchain 1.99.0
           "$RUNNER_TEMP/rs/tools/build-dav-parse-wasm.sh" "$PWD/server/wasm/dav-parse.wasm"
           echo "$DAV_PARSE_WASM_SHA256  server/wasm/dav-parse.wasm" | sha256sum -c -
@@ -310,11 +311,12 @@ jobs:
           cache-to: type=gha,mode=max
       # noevia #990: the differential tests compare Node's own decoders (TextDecoder windows-1252,
       # base64url) with the Rust module. The image build runs the tests on the alpine build stage;
-      # this runs the upload-sniff and secret-envelope ones on the exact runtime image that ships
+      # this runs the upload-sniff, secret-envelope and mcp-frame (JSON.parse, String#trim,
+      # Object.prototype) ones on the exact runtime image that ships
       # (node:22-bookworm, whatever Node 22.x it resolves to), not on the runner's Node.
       - name: Differential tests on the shipped runtime image
         run: |
           set -euo pipefail
           docker run --rm -e DAV_PARSE_WASM_REQUIRED=1 \
             -v "$TREE/core/tests:/app/tests:ro" -w /app noevia-web:ci sh -c \
-            'node --version && node --test tests/server/upload-sniff-differential.test.cjs tests/server/secret-envelope-differential.test.cjs'
+            'node --version && node --test tests/server/upload-sniff-differential.test.cjs tests/server/secret-envelope-differential.test.cjs tests/server/mcp-frame-differential.test.cjs'

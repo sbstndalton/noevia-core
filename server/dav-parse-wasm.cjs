@@ -13,6 +13,8 @@
 //                                                                             (UPLOAD_SNIFF_IMPL, #977)
 //   - crates/secret-envelope secretOpen/secretSeal = secret-envelope.cjs openJs/encryptJs
 //                                                                             (SECRET_ENVELOPE_IMPL, #979)
+//   - crates/mcp-frame     mcpRpcBody/mcpSchemaRefs = mcp.cjs parseRpcBody/resolveSchemaRefs
+//                                                                             (MCP_FRAME_IMPL, #980)
 //
 // Memory: WebAssembly memory only grows. A listing or path call needs at most ~16 MiB; an upload
 // decode copies the upload in (at most 25 MiB) and holds one copy of its text (at most 3 bytes per
@@ -43,7 +45,7 @@ const MAX_DECODE_BYTES = 25 * 1024 * 1024;
 // Only the first bytes decide an archive magic number (`ustar` ends at 262).
 const SNIFF_BYTES = 262;
 const RESET_AFTER_BYTES = 1024 * 1024;
-const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'secret_open', 'secret_seal', 'dav_output_ptr', 'dav_output_len'];
+const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'secret_open', 'secret_seal', 'mcp_rpc_body', 'mcp_schema_refs', 'dav_output_ptr', 'dav_output_len'];
 
 class DavParseError extends Error {
   constructor(message, reason) {
@@ -244,7 +246,10 @@ function uploadValidate(name, bytes) {
 function uploadClassify(name) {
   if (typeof name !== 'string') throw new DavParseError('upload name must be text', 'input');
   // A lone surrogate crosses as U+FFFD; neither can be part of a known extension.
-  const reply = invoke(encoder.encode(name), (e) => e.upload_classify(), 64 * 1024);
+  // Only the extension decides (#989): send 'x' + path.extname(name), whose extname is the same,
+  // so a name of any length crosses. An extension past 1024 units matches no group either way.
+  const ext = path.extname(name);
+  const reply = invoke(encoder.encode(`x${ext.length > 1024 ? ext.slice(0, 1024) : ext}`), (e) => e.upload_classify(), 64 * 1024);
   const value = reply && typeof reply === 'object' ? reply.value : undefined;
   if (!GROUPS.has(value)) throw new DavParseError('upload classify reply has an unexpected shape', 'reply');
   return value;
@@ -381,11 +386,72 @@ function secretSeal(key, nonce, plain, user) {
   return text;
 }
 
+// mcp_frame::MAX_BODY_UNITS and schema::MAX_SCHEMA_UNITS.
+const MCP_BODY_UNITS = 8 * 1024 * 1024;
+const MCP_SCHEMA_UNITS = 2 * 1024 * 1024;
+const MCP_KINDS = ['reply', 'mismatch', 'none', 'other', 'invalid'];
+
+/** A JS string as its UTF-16LE code units (lone surrogates included). */
+function utf16le(text) {
+  const out = new Uint8Array(text.length * 2);
+  const view = new DataView(out.buffer);
+  for (let i = 0; i < text.length; i++) view.setUint16(i * 2, text.charCodeAt(i), true);
+  return out;
+}
+
+/** `5 u32le(n) units`, a number, a boolean, null, or 0 (=== nothing parsed from JSON). */
+function mcpExpected(id) {
+  if (typeof id === 'number') { const b = new Uint8Array(9); b[0] = 4; new DataView(b.buffer).setFloat64(1, id, true); return b; }
+  if (typeof id === 'string') {
+    const u = utf16le(id), b = new Uint8Array(5 + u.length);
+    b[0] = 5; new DataView(b.buffer).setUint32(1, id.length, true); b.set(u, 5); return b;
+  }
+  if (id === null) return new Uint8Array([1]);
+  if (typeof id === 'boolean') return new Uint8Array([id ? 3 : 2]);
+  return new Uint8Array([0]);
+}
+
+/** mcp.cjs parseRpcBody's decision (#980), through the module: `{ kind, text? }` where kind is
+ *  'reply'|'mismatch' (with the message as JSON text), 'none', 'other' or 'invalid'. */
+function mcpRpcBody(sse, text, expectedId) {
+  if (typeof sse !== 'boolean' || typeof text !== 'string') throw new DavParseError('mcp body has the wrong type', 'input');
+  if (text.length > MCP_BODY_UNITS) throw new DavParseError('mcp body is too large', 'too_large');
+  const id = mcpExpected(expectedId), body = utf16le(text);
+  const input = new Uint8Array(1 + id.length + body.length);
+  input[0] = sse ? 1 : 0;
+  input.set(id, 1);
+  input.set(body, 1 + id.length);
+  const { status, bytes } = invokeRaw(input, (e) => e.mcp_rpc_body(), MAX_DECODE_BYTES);
+  if (status !== 0) {
+    let code = 'unknown';
+    try { const r = JSON.parse(utf8(bytes)); if (r && typeof r.error === 'string') code = r.error; } catch { /* keep unknown */ }
+    throw new DavParseError(`mcp body refused by dav-parse (${code})`, code);
+  }
+  const kind = MCP_KINDS[bytes[0]];
+  if (!bytes.length || !kind || (bytes[0] > 1 && bytes.length !== 1)) throw new DavParseError('mcp body reply has an unexpected shape', 'reply');
+  return bytes[0] > 1 ? { kind } : { kind, text: utf8(bytes.subarray(1)) };
+}
+
+/** mcp.cjs resolveSchemaRefs (#980), through the module, on mcp.cjs schemaWire's text:
+ *  `{ ok: true, text }` (the encoded tree) or `{ ok: false, text }` (`{"code","ref"}`). */
+function mcpSchemaRefs(wire) {
+  if (typeof wire !== 'string') throw new DavParseError('mcp schema has the wrong type', 'input');
+  if (wire.length > MCP_SCHEMA_UNITS) throw new DavParseError('mcp schema is too large', 'too_large');
+  const { status, bytes } = invokeRaw(utf16le(wire), (e) => e.mcp_schema_refs(), MAX_DECODE_BYTES);
+  if (status !== 0) {
+    let code = 'unknown';
+    try { const r = JSON.parse(utf8(bytes)); if (r && typeof r.error === 'string') code = r.error; } catch { /* keep unknown */ }
+    throw new DavParseError(`mcp schema refused by dav-parse (${code})`, code);
+  }
+  if (bytes.length < 2 || bytes[0] > 1) throw new DavParseError('mcp schema reply has an unexpected shape', 'reply');
+  return { ok: bytes[0] === 0, text: utf8(bytes.subarray(1)) };
+}
+
 /** Test hook: the cached instance's linear memory in bytes (0 when there is none). */
 function memoryBytes() { return cached?.instance ? cached.instance.exports.memory.buffer.byteLength : 0; }
 
 // Every switch that runs this module (#996). Each reads its value as trim().toLowerCase().
-const IMPL_FLAGS = ['DAV_PARSE_IMPL', 'S3_PARSE_IMPL', 'STORAGE_PATH_IMPL', 'UPLOAD_SNIFF_IMPL', 'SECRET_ENVELOPE_IMPL'];
+const IMPL_FLAGS = ['DAV_PARSE_IMPL', 'S3_PARSE_IMPL', 'STORAGE_PATH_IMPL', 'UPLOAD_SNIFF_IMPL', 'SECRET_ENVELOPE_IMPL', 'MCP_FRAME_IMPL'];
 
 /** The *_IMPL switches set to wasm in `env`. */
 function wasmFlags(env = process.env) {
@@ -412,4 +478,4 @@ function verifyAtStartup(env = process.env) {
 /** Test hook: forget the cached module (and its failure). */
 function reset() { cached = null; }
 
-module.exports = { wasmFlags, verifyAtStartup, IMPL_FLAGS, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
+module.exports = { wasmFlags, verifyAtStartup, IMPL_FLAGS, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
