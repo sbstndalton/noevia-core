@@ -22,7 +22,7 @@ function keepAlongside(env = process.env) {
   return [...(e && e !== 'default' ? [e] : []), ...(r ? [r] : [])];
 }
 
-function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig = {}, calibrationStatePath, calibrationOptions = {}, evidenceDir, autotuneStatePath, autotuneOptions = {}, presetWriter = null, unloadWait = {}, inferenceBudget = null }) {
+function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig = {}, calibrationStatePath, calibrationOptions = {}, evidenceDir, autotuneStatePath, autotuneOptions = {}, presetWriter = null, unloadWait = {}, inferenceBudget = null, reloadStatePath = null, reloadGuard: reloadGuardOption = null }) {
   const base = String(baseUrl || '').replace(/\/+$/, '').replace(/\/v1$/, '');
   const url = new URL(base);
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw Error('Invalid llama.cpp router URL');
@@ -55,6 +55,25 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
   const {commitReconciled}=require('./models-ini-writer.cjs');
   const presets=store ? {...store,commit:(candidate,options)=>commitReconciled(store,candidate,options)} : null;
   const maintenance=require('./inference-maintenance.cjs').createMaintenanceGate();
+  // #1012: what the router last read, so a reload can keep loaded models (PRESET_RELOAD_IMPL=wasm).
+  const reloadGuard=reloadGuardOption||require('./preset-reload.cjs').createReloadGuard({stateFile:reloadStatePath,log:m=>console.log(m)});
+  // Every router preset reload noevia makes goes through here: re-read the file just before the
+  // call, and afterwards record that text with the router's own view of it (or forget the
+  // baseline when the outcome is unclear), so the next reload can be judged.
+  async function routerReload(timeout=120000) {
+    let before=null;try{before=presets?.snapshot().text??null;}catch{}
+    let result;
+    try {result=await request('/models?reload=1',{},timeout);}
+    catch(e){reloadGuard.forget();throw e;}
+    if(!result.ok){reloadGuard.forget();return result;}
+    try {
+      const after=await rawModels();
+      let textAfter=null;try{textAfter=presets?.snapshot().text??null;}catch{}
+      if(after.ok&&Array.isArray(after.body?.data)&&before!==null)reloadGuard.record(before,after.body.data,textAfter);
+      else reloadGuard.forget();
+    } catch {reloadGuard.forget();}
+    return result;
+  }
   async function mutate(fn) {const leave=maintenance.enter();try{return await fn();}finally{leave();}}
   // Serialize only admission/eviction, never the inference that follows it.
   let admission = Promise.resolve();
@@ -242,7 +261,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
       throw e;
     }
     try {
-      const result=await request('/models?reload=1',{},120000);
+      const result=await routerReload(120000);
       if(!result.ok)throw Error('Native reload failed');
       return {ok:true,status:200,body:{...presets.get(body.model),applied:true,qualification:'unqualified; load and test this profile before relying on its capacity'}};
     } catch {
@@ -253,22 +272,36 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
         if(e?.retryable)return {ok:false,status:503,body:{error:'Reload failed or timed out, and the previous preset file could not be restored: models.ini still holds the new settings. Check router and Model Loader health before retrying.'}};
         return {ok:false,status:503,body:{error:'Reload failed or timed out, and restoring the previous preset file could not be confirmed. Stop inference and inspect native presets before retrying.'}};
       }
-      try {await request('/models?reload=1',{},120000);}catch {}
+      try {await routerReload(120000);}catch {}
       return {ok:false,status:503,body:{error:'Reload failed or timed out. Previous preset file restored; check router health before retrying.'}};
     }
   }
   // Re-read models.ini after an edit made outside noevia's own preset editor. With a model
   // loaded this refuses unless the caller asked to unload it: the router must not swap the
-  // settings under a running instance.
+  // settings under a running instance. #1012 (PRESET_RELOAD_IMPL=wasm): it may reload with models
+  // loaded when the router cannot change them (see preset-reload.cjs); they stay loaded.
   async function reloadPresets({unload=false}={}) {
     return maintenance.exclusive(async()=>{
       const listing=await rawModels();
       if(!listing.ok)return listing;
-      const loaded=(listing.body?.data||[]).filter(m=>['loaded','loading'].includes(m.status?.value));
-      if(loaded.length&&!unload)return {ok:false,status:409,body:{error:'A model is loaded. Unload it to apply the new settings.',loaded:loaded.map(m=>m.id)}};
-      for(const m of loaded)await post('/models/unload',{model:m.id},60000).catch(()=>null);
-      const result=await request('/models?reload=1',{},120000);
-      return result.ok?{ok:true,status:200,body:{reloaded:true,unloaded:loaded.map(m=>m.id)}}:{ok:false,status:502,body:{error:'The engine did not reload its settings. Check the Hardware tab.'}};
+      const rows=Array.isArray(listing.body?.data)?listing.body.data:[];
+      const loaded=rows.filter(m=>['loaded','loading'].includes(m.status?.value));
+      let kept=[];
+      if(loaded.length&&!unload){
+        const ids=loaded.map(m=>m.id);
+        const judge=()=>{let text=null;try{text=presets?.snapshot().text??null;}catch{}return reloadGuard.verdict(text,rows,ids);};
+        const verdict=judge();
+        if(!verdict.safe)return {ok:false,status:409,body:{error:'A model is loaded. Unload it to apply the new settings.',loaded:ids,...(verdict.reason!=='off'?{reason:verdict.reason}:{})}};
+        // Narrow the window for a write landing between the check and the router's read: check
+        // the file once more right before the call (a write after this is the residual race).
+        const again=judge();
+        if(!again.safe)return {ok:false,status:409,body:{error:'A model is loaded. Unload it to apply the new settings.',loaded:ids,reason:again.reason}};
+        kept=ids;
+      }
+      if(!kept.length)for(const m of loaded)await post('/models/unload',{model:m.id},60000).catch(()=>null);
+      const result=await routerReload(120000);
+      if(!result.ok)return {ok:false,status:502,body:{error:'The engine did not reload its settings. Check the Hardware tab.'}};
+      return {ok:true,status:200,body:{reloaded:true,unloaded:kept.length?[]:loaded.map(m=>m.id),...(kept.length?{kept}:{})}};
     });
   }
   // Maps an engine-side path (/models/..., /cache/...) onto noevia's read-only mounts.
