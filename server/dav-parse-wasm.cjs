@@ -8,6 +8,15 @@
 //   - crates/dav-parse      listRecords  = dav-listing.cjs listingRecordsJs  (DAV_PARSE_IMPL, #967)
 //   - crates/s3-list-parse  s3ListPage   = s3-listing.cjs s3PageRecordsJs    (S3_PARSE_IMPL, #976)
 //   - crates/storage-path   storagePath  = storage-path.cjs's rules          (STORAGE_PATH_IMPL, #978)
+//   - crates/upload-sniff   uploadValidate/uploadClassify/uploadDecode
+//                                        = upload-sniff.cjs validate/classify/decodeText
+//                                                                             (UPLOAD_SNIFF_IMPL, #977)
+//
+// Memory: WebAssembly memory only grows. A listing or path call needs at most ~16 MiB; an upload
+// decode copies the upload in (at most 25 MiB) and holds one copy of its text (at most 3 bytes per
+// input byte, so ~75 MiB), so one 25 MiB decode can leave the instance at ~100 MiB+. After any call
+// whose input or reply passes RESET_AFTER_BYTES the instance is dropped (the compiled module stays
+// cached, so the next call only re-instantiates, ~ms) and that memory is released to the GC.
 //
 // Everything here fails closed. The module must match the pinned sha256, import nothing and
 // export exactly the ABI below; a refusal, a trap or a reply of the wrong shape throws a
@@ -19,9 +28,14 @@ const path = require('node:path');
 
 const LOCK_FILE = path.join(__dirname, 'dav-parse.lock');
 const DEFAULT_WASM = path.join(__dirname, 'wasm', 'dav-parse.wasm');
-// URL + NUL + body; mirrors the module's own cap (dav_parse::MAX_BODY_BYTES + MAX_TARGET_BYTES + 1).
+// URL + NUL + body (dav_parse::MAX_BODY_BYTES + MAX_TARGET_BYTES + 1); each call's own cap.
 const MAX_INPUT_BYTES = 16 * 1024 * 1024 + 8 * 1024 + 1;
-const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'dav_output_ptr', 'dav_output_len'];
+// upload_sniff::MAX_DECODE_BYTES: the module-wide cap since #977, used only by uploadDecode.
+const MAX_DECODE_BYTES = 25 * 1024 * 1024;
+// Only the first bytes decide an archive magic number (`ustar` ends at 262).
+const SNIFF_BYTES = 262;
+const RESET_AFTER_BYTES = 1024 * 1024;
+const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'dav_output_ptr', 'dav_output_len'];
 
 class DavParseError extends Error {
   constructor(message, reason) {
@@ -73,6 +87,8 @@ function ensure() {
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder('utf-8', { fatal: true });
+// Decoded upload text may itself start with U+FEFF (a BOM after the BOM); it must come back as is.
+const textDecoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 
 function validRecords(reply) {
   if (!reply || typeof reply !== 'object' || !Array.isArray(reply.entries)) return null;
@@ -98,12 +114,12 @@ function validS3Records(reply) {
   return out;
 }
 
-/** Write `input` into the module, run `call(exports)` and return `{ status, reply }`; any trap,
- *  refusal of the size or non-JSON reply throws a DavParseError. */
-function invoke(input, call) {
-  if (input.length > MAX_INPUT_BYTES) throw new DavParseError('storage input is too large to check', 'too_large');
+/** Write `input` into the module, run `call(exports)` and return `{ status, bytes }` (the reply
+ *  bytes, copied out); a trap or a refusal of the size throws a DavParseError. */
+function invokeRaw(input, call, max = MAX_INPUT_BYTES) {
+  if (input.length > max) throw new DavParseError('storage input is too large to check', 'too_large');
   const wasm = ensure();
-  let status, text;
+  let status, bytes;
   try {
     const { exports } = wasm;
     const ptr = exports.dav_input(input.length) >>> 0;
@@ -111,13 +127,26 @@ function invoke(input, call) {
     new Uint8Array(exports.memory.buffer, ptr, input.length).set(input);
     status = call(exports) >>> 0;
     const outPtr = exports.dav_output_ptr() >>> 0, outLen = exports.dav_output_len() >>> 0;
-    text = decoder.decode(new Uint8Array(exports.memory.buffer, outPtr, outLen));
+    bytes = new Uint8Array(exports.memory.buffer, outPtr, outLen).slice();
   } catch (err) {
     // A trap leaves the instance in an unknown state: start the next call from a fresh one.
     if (cached) cached.instance = null;
     if (err instanceof DavParseError) throw err;
     throw new DavParseError('dav-parse module failed', 'trap');
   }
+  // Large calls leave the (never-shrinking) memory big: drop the instance, keep the module.
+  if (cached && (input.length > RESET_AFTER_BYTES || bytes.length > RESET_AFTER_BYTES)) cached.instance = null;
+  return { status, bytes };
+}
+
+function utf8(bytes, d = decoder) {
+  try { return d.decode(bytes); } catch { throw new DavParseError('dav-parse reply is not UTF-8', 'reply'); }
+}
+
+/** invokeRaw with a JSON reply: `reply` on status 0; a refusal or non-JSON reply throws. */
+function invoke(input, call, max) {
+  const { status, bytes } = invokeRaw(input, call, max);
+  const text = utf8(bytes);
   let reply;
   try { reply = JSON.parse(text); } catch { throw new DavParseError('dav-parse reply is not JSON', 'reply'); }
   if (status !== 0) {
@@ -176,7 +205,67 @@ function storagePath(op, a, b = '') {
   return value;
 }
 
+const GROUPS = new Set(['Documents', 'Images', 'Text', 'Other']);
+const REFUSALS = new Map([['filename', 400], ['empty', 400], ['too_big', 413], ['archive', 400]]);
+const UPLOAD_CAP = 25 * 1024 * 1024;
+
+/** upload-sniff.cjs validateJs (#977), through the module: null when accepted, else
+ *  `{ refusal: 'filename'|'empty'|'too_big'|'archive', status }`. Only what decides the answer
+ *  crosses: the name (cut to 201 UTF-16 units: anything longer fails the 200-unit rule either way),
+ *  the length (clamped to CAP + 1) and the first SNIFF_BYTES bytes. */
+function uploadValidate(name, bytes) {
+  if (typeof name !== 'string' || !(bytes instanceof Uint8Array)) throw new DavParseError('upload input has the wrong type', 'input');
+  // A lone surrogate crosses as U+FFFD: same length, not '/', '\\', '.', a control or ASCII, so
+  // every rule answers the same.
+  const en = encoder.encode(name.length > 200 ? name.slice(0, 201) : name);
+  const head = bytes.subarray(0, SNIFF_BYTES);
+  const input = new Uint8Array(8 + en.length + head.length);
+  const view = new DataView(input.buffer);
+  view.setUint32(0, Math.min(bytes.length, UPLOAD_CAP + 1), true);
+  view.setUint32(4, en.length, true);
+  input.set(en, 8);
+  input.set(head, 8 + en.length);
+  const reply = invoke(input, (e) => e.upload_validate());
+  const value = reply && typeof reply === 'object' ? reply.value : undefined;
+  if (value === null) return null;
+  if (!value || typeof value !== 'object' || REFUSALS.get(value.refusal) !== value.status) throw new DavParseError('upload validate reply has an unexpected shape', 'reply');
+  return { refusal: value.refusal, status: value.status };
+}
+
+/** upload-sniff.cjs classifyJs (#977), through the module. */
+function uploadClassify(name) {
+  if (typeof name !== 'string') throw new DavParseError('upload name must be text', 'input');
+  // A lone surrogate crosses as U+FFFD; neither can be part of a known extension.
+  const reply = invoke(encoder.encode(name), (e) => e.upload_classify(), 64 * 1024);
+  const value = reply && typeof reply === 'object' ? reply.value : undefined;
+  if (!GROUPS.has(value)) throw new DavParseError('upload classify reply has an unexpected shape', 'reply');
+  return value;
+}
+
+const ENCODINGS = [null, 'utf-8', 'utf-16le', 'utf-16be', 'windows-1252'];
+
+/** upload-sniff.cjs decodeTextJs (#977), through the module: null (not text) or
+ *  `{ text, encoding }`. The whole upload crosses (decoding needs it), at most MAX_DECODE_BYTES. */
+function uploadDecode(bytes) {
+  if (!(bytes instanceof Uint8Array)) throw new DavParseError('upload bytes have the wrong type', 'input');
+  const { status, bytes: out } = invokeRaw(bytes, (e) => e.upload_decode(), MAX_DECODE_BYTES);
+  if (status !== 0) {
+    let code = 'unknown';
+    try { const r = JSON.parse(utf8(out)); if (r && typeof r.error === 'string') code = r.error; } catch { /* keep unknown */ }
+    throw new DavParseError(`upload input refused by dav-parse (${code})`, code);
+  }
+  if (!out.length || out[0] >= ENCODINGS.length) throw new DavParseError('upload decode reply has an unexpected shape', 'reply');
+  if (out[0] === 0) {
+    if (out.length !== 1) throw new DavParseError('upload decode reply has an unexpected shape', 'reply');
+    return null;
+  }
+  return { text: utf8(out.subarray(1), textDecoder), encoding: ENCODINGS[out[0]] };
+}
+
+/** Test hook: the cached instance's linear memory in bytes (0 when there is none). */
+function memoryBytes() { return cached?.instance ? cached.instance.exports.memory.buffer.byteLength : 0; }
+
 /** Test hook: forget the cached module (and its failure). */
 function reset() { cached = null; }
 
-module.exports = { listRecords, s3ListPage, storagePath, load, readLock, reset, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES };
+module.exports = { listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
