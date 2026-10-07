@@ -235,7 +235,7 @@ function createCalibrator(deps) {
     const controller = new AbortController();
     inflight = controller;
     const memory = watchMemory(record, controller);
-    // cause (#1003): why a step failed, for auto-tune's planner: oom, load, time or recall.
+    // cause (#1003): why a step failed, for auto-tune's planner: oom, load, timeout, time or recall.
     const finish = (status, reason, cause) => { record.status = status; if (reason) record.reason = reason; if (cause) record.cause = cause; record.seconds = Math.round((now() - record.startedAt) / 1000); save(); return status === 'passed'; };
     try {
       await unloadAll();
@@ -252,7 +252,7 @@ function createCalibrator(deps) {
       for (;;) {
         if (cancelRequested) throw Object.assign(Error('cancelled'), { cancelled: true });
         if (!memory.check() || record.memoryFloorHit) return finish('failed', `Available memory fell below ${memoryFloorGib} GiB.`, 'oom');
-        if (now() > deadline) return finish('failed', 'Loading did not finish in time.', 'load');
+        if (now() > deadline) return finish('failed', 'Loading did not finish in time.', 'timeout');
         const rows = await listing(controller.signal).catch(e => { if (record.memoryFloorHit) return []; throw e; });
         if (loadedOthers(rows, job.model).length) throw Object.assign(Error('Another client loaded a model during calibration. Stop Diary background jobs and other clients, then retry.'), { fatal: true });
         const row = rows.find(m => m.id === job.model);

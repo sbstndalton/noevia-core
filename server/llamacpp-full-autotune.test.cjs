@@ -5,7 +5,7 @@ const { createModelManager } = require('./model-manager.cjs');
 const { createPresetStore } = require('./llamacpp-presets.cjs');
 const { QUALITY, qualityCheck, qualityFailure, newModel } = require('./llamacpp-full-autotune.cjs');
 
-function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnload, badQ4 = true, badF16 = false, noHead = false, rejectAll = false, rejectModel = '', badBatch = false, failFinal = false, formattedQuality = false, reasoningOnly = false, truncatedWorkloads = false, idleTimeoutMs = 300000, loseIdentityAfterStart = false, reloadFail = false, unloadPolls = 0, unloadStuck = false, answerFor = null, failLoadF16 = false, httpFor = null, chatTemplate = null, servingFor = null, servingChecks = null, autotuneExtra = {} } = {}) {
+function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnload, badQ4 = true, badF16 = false, noHead = false, rejectAll = false, rejectModel = '', badBatch = false, failFinal = false, formattedQuality = false, reasoningOnly = false, truncatedWorkloads = false, idleTimeoutMs = 300000, loseIdentityAfterStart = false, reloadFail = false, unloadPolls = 0, unloadStuck = false, answerFor = null, failLoadF16 = false, httpFor = null, chatTemplate = null, servingFor = null, servingChecks = null, autotuneExtra = {}, onLoad = null, loadHang = null, calibrationExtra = {} } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'full-tune-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const ini = path.join(dir, 'models.ini'), stateFile = path.join(dir, 'tune.json');
@@ -23,7 +23,7 @@ function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnl
       if (value === 'unloading' && !unloadStuck && --unloading[id] <= 0) status[id] = value = 'unloaded';
       return { id, status: { value, args: id === 'embed' ? ['--embedding'] : [] }, meta: { n_ctx_train: 16384 } };
     }) } };
-    if (u.pathname === '/models/load') { status[b.model] = failLoadF16 && options(b.model)['cache-type-k'] === 'f16' ? 'unloaded' : 'loaded'; return { ok: true, body: {} }; }
+    if (u.pathname === '/models/load') { onLoad?.({ ...options(b.model) }); if (loadHang?.(options(b.model))) { status[b.model] = 'loading'; return { ok: true, body: {} }; } status[b.model] = failLoadF16 && options(b.model)['cache-type-k'] === 'f16' ? 'unloaded' : 'loaded'; return { ok: true, body: {} }; }
     if (u.pathname === '/models/unload') { status[b.model] = unloadPolls || unloadStuck ? 'unloading' : 'unloaded'; unloading[b.model] = unloadPolls; onUnload?.({ manager, model: b.model }); return { ok: true, body: {} }; }
     if (u.pathname === '/tokenize') return { ok: true, body: { tokens: Array(600).fill(1) } };
     if (u.pathname === '/props') return { ok: true, body: { build_info: build, ...(chatTemplate ? { chat_template: chatTemplate } : {}) } };
@@ -58,7 +58,7 @@ function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnl
   };
   const makeManager = () => createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic', presetPath: ini, fetchJson, fetchStream,
     calibrationStatePath: path.join(dir, 'cal.json'), autotuneStatePath: stateFile,
-    calibrationOptions: { sleep: async () => {}, readMemory: () => 20 },
+    calibrationOptions: { sleep: async () => {}, readMemory: () => 20, ...calibrationExtra },
     autotuneOptions: { ...autotuneExtra, ...(servingChecks ? { servingChecks } : {}), ...(unloadPolls || unloadStuck ? { sleep: async () => {} } : {}), betweenModelsMs: 25, idleTimeoutMs, readMemory: () => 20, identityFor: async m => (++identityReads > 1 && loseIdentityAfterStart ? null : { model: m, hardware: 'fake', build }) } });
   let manager = makeManager();
   return { manager, ini, stateFile, original, requests, servingRequests, options, status, restart: () => { manager = makeManager(); return manager; }, setBuild: b => { build = b; } };
@@ -969,4 +969,62 @@ test('#1003 planned: a cancelled run resumes from its results without repeating 
     [[16384, 'f16', 'recall_failed'], [8192, 'f16', 'passed'], [12288, 'f16', 'recall_failed']]);
   assert.equal(j.models[0].result.context, 8192);
   assert.equal(backups(f.ini).length, 1);
+});
+
+// ── core#15 review: sized baseline (#1026), micro-batch headroom (#1027), fallbacks and load timeouts (#1029)
+// An 8 GB model with a projector whose saved profile (128k, f16) is far over the 16 GiB budget.
+const BIG_FACTS = { meta: { contextLength: 131072, blockCount: 32, headCount: 32, headCountKv: 8, embeddingLength: 4096 }, modelBytes: 8e9, mmprojBytes: 8e8 };
+const bigProfile = f => fs.writeFileSync(f.ini, fs.readFileSync(f.ini, 'utf8').replace('[synthetic]\nmodel = /models/synthetic.gguf\nctx-size = 8192', '[synthetic]\nmodel = /models/synthetic.gguf\nctx-size = 131072\ncache-type-k = f16\ncache-type-v = f16'));
+// Whether one load fits, by the planner's own estimate at the load's context, KV type and micro-batch.
+const fitsPlan = (request, o) => wasmPlanner().plan({ ...request, facts: { ...request.facts, ubatch: Math.max(Number(o['ubatch-size']) || 0, 0) }, ladder: [Number(o['ctx-size'])], kv: [o['cache-type-k'] || 'f16'], results: [] }).step === 'probe';
+
+test('#1026 #1027 planned: every load of the run fits the budget, the baseline and the micro-batch candidates included', { skip: skipWasm }, async t => {
+  const loads = [];
+  const f = fixture(t, { servingChecks: servingOff, autotuneExtra: planned({ planFacts: async () => BIG_FACTS }), onLoad: o => loads.push(o) });
+  bigProfile(f);
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'passed', j.error);
+  const request = JSON.parse(fs.readFileSync(f.stateFile, 'utf8')).job.models[0].plan.request;
+  assert.equal(request.facts.ubatch, 2048, 'sized for the largest micro-batch the batch phase tries');
+  // The saved profile itself (131072, f16) would not fit.
+  assert.equal(fitsPlan(request, { 'ctx-size': '131072', 'cache-type-k': 'f16' }), false);
+  assert.ok(loads.length > 5);
+  assert.equal(loads[0]['ctx-size'], '4096', 'the baseline runs at the smallest rung');
+  for (const o of loads) assert.ok(fitsPlan(request, o), `load at ${o['ctx-size']} ${o['cache-type-k']} ubatch ${o['ubatch-size']} is over the budget`);
+  assert.ok(loads.some(o => o['ubatch-size'] === '2048'));
+});
+
+test('#1029 planned: an unbounded prompt cache falls back to the standard order', async t => {
+  const f = fixture(t, { servingChecks: servingOff, autotuneExtra: planned() });
+  fs.writeFileSync(f.ini, fs.readFileSync(f.ini, 'utf8').replace('ctx-size = 8192\nparallel = 1\n', 'ctx-size = 8192\nparallel = 1\ncache-ram = -1\n'));
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  assert.match(j.models[0].planFallback, /prompt cache is unbounded/);
+  assert.deepEqual(j.models[0].phases.map(p => p.id), ['sampling', 'kv', 'context', 'drafting', 'batch']);
+});
+
+test('#1029 planned: one load timeout is retried and is never a memory failure', { skip: skipWasm }, async t => {
+  let hangs = 1;
+  const f = fixture(t, { servingChecks: servingOff, autotuneExtra: planned(), calibrationExtra: { timeouts: { load: 30 } },
+    loadHang: o => o['ctx-size'] === '16384' && hangs-- > 0 });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'passed', j.error);
+  const results = JSON.parse(fs.readFileSync(f.stateFile, 'utf8')).job.models[0].plan.results;
+  assert.deepEqual(results.filter(r => r.step === 'probe').map(r => [r.ctx, r.kv, r.outcome]),
+    [[16384, 'f16', 'recall_failed'], [8192, 'f16', 'passed'], [12288, 'f16', 'recall_failed']]);
+  assert.ok(j.log.some(l => /Loading timed out; trying the same setting once more/.test(l.text)));
+});
+
+test('#1029 planned: a second load timeout stops the run with a fixed message and restores models.ini', { skip: skipWasm }, async t => {
+  const f = fixture(t, { servingChecks: servingOff, autotuneExtra: planned(), calibrationExtra: { timeouts: { load: 30 } },
+    loadHang: o => o['ctx-size'] === '16384' });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'failed');
+  assert.match(j.error, /did not finish loading in time twice/);
+  const results = JSON.parse(fs.readFileSync(f.stateFile, 'utf8')).job.models[0].plan.results;
+  assert.equal(results.length, 0, 'a timeout is not a measured result');
+  assert.equal(fs.readFileSync(f.ini, 'utf8'), f.original);
 });

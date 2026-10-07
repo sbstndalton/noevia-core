@@ -372,9 +372,16 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
   // Measures the baseline when a phase needs it before the KV phase's f16 candidate can supply it
   // (sampling about to be applied, or f16 did not load). Tries f16 first, then the settings the
   // phase started from, and always leaves the KV and drafting keys as it found them.
-  async function ensureBaseline(j, original, { tryF16 = true } = {}) {
+  // sized (#1026, planned runs): { ctx, f16, kv } - the smallest rung, whether f16 fits there and
+  // the most precise type that does; every baseline write then carries that ctx-size.
+  async function ensureBaseline(j, original, { tryF16 = true, sized = null } = {}) {
     if (gate(j.model)) return;
     const restore = keysOf(original);
+    if (sized) {
+      tryF16 &&= sized.f16;
+      original = { ...original, 'cache-type-k': sized.kv, 'cache-type-v': sized.kv };
+    }
+    const at = options => (sized ? { ...options, 'ctx-size': String(sized.ctx) } : options);
     const attempt = async (reference, options) => {
       check(); note(j, 'Measuring the quality baseline at ' + REFERENCE_LABEL[reference] + '.');
       try {
@@ -388,8 +395,8 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
         return null;
       }
     };
-    let reference = 'f16', quality = tryF16 ? await attempt('f16', REFERENCE) : null;
-    if (!quality) { reference = 'current'; quality = await attempt('current', { ...restore, 'spec-type': 'none', 'spec-draft-n-max': '', 'spec-draft-p-min': '' }); }
+    let reference = 'f16', quality = tryF16 ? await attempt('f16', at(REFERENCE)) : null;
+    if (!quality) { reference = 'current'; quality = await attempt('current', at({ ...keysOf(original), 'spec-type': 'none', 'spec-draft-n-max': '', 'spec-draft-p-min': '' })); }
     await write(j, restore);
     if (!quality) throw Object.assign(Error('The quality baseline could not be measured at the reference or current settings.'), { fatal: true });
     setBaseline(j, reference, quality);
@@ -609,12 +616,18 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
   // model unloaded, so a resumed job plans from the same figures), the ladder and the KV types.
   async function planRequest(model) {
     const read = await planFacts(model);
-    if (!read?.meta) return null;
+    if (!read?.meta) return { fallback: 'its model file could not be read' };
     const m = read.meta, profile = presets.get(model), eff = { ...profile.defaults, ...profile.options };
     const { ladder } = require('./llamacpp-calibration.cjs');
     const { cacheRamMibOf } = require('./llamacpp-autoconfig.cjs');
     const native = uint(m.contextLength, 1 << 24);
-    const cacheMib = cacheRamMibOf(eff['cache-ram']);
+    // The prompt cache every auto-tune write leaves (llamacpp-presets prepare): unset becomes the
+    // cap, anything larger the hard maximum; -1 stays unbounded.
+    const budgetLib = require('./inference-budget.cjs'), rawCache = String(eff['cache-ram'] ?? '').trim();
+    const cacheMib = rawCache === '' ? budgetLib.cacheRamLimits().capMib
+      : rawCache === '-1' ? Infinity : cacheRamMibOf(budgetLib.clampCacheRam(rawCache));
+    // #1029: an unbounded prompt cache (cache-ram -1) cannot be sized; the standard order runs.
+    if (!Number.isFinite(cacheMib)) return { fallback: 'its prompt cache is unbounded (cache-ram -1)' };
     const free = readMemory();
     return {
       facts: { nCtxTrain: native, blockCount: uint(m.blockCount, 4096), headCount: uint(m.headCount, 1 << 20), headCountKv: layerList(m.headCountKv),
@@ -623,10 +636,12 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
         slidingWindowPattern: layerList(m.slidingWindowPattern), sharedKvLayers: uint(m.sharedKvLayers, 4096),
         fullAttentionInterval: uint(m.fullAttentionInterval, 4096), nextnPredictLayers: uint(m.nextnPredictLayers, 4096),
         modelBytes: uint(read.modelBytes, 2 ** 50), mmprojBytes: uint(read.mmprojBytes, 2 ** 50),
-        ubatch: uint(Number(eff['ubatch-size']), 1 << 24), slots: Math.max(1, uint(Number(eff.parallel), 1024)) },
+        // #1027: sized for the largest micro-batch the batch phase tries, so its candidates and the
+        // final check stay inside the estimate the context was chosen with.
+        ubatch: Math.max(uint(Number(eff['ubatch-size']), 1 << 24), ...UBATCH), slots: Math.max(1, uint(Number(eff.parallel), 1024)) },
       memory: { budgetMib: uint(Math.floor(Number(budgetGib()) * 1024), 2 ** 30), memAvailableMib: free == null ? null : uint(Math.floor(free * 1024), 2 ** 30),
         reserveMib: uint(servicesReserveMib, 2 ** 30), floorMib: uint(Math.round(memoryFloorGib * 1024), 2 ** 30),
-        cacheRamMib: Number.isFinite(cacheMib) ? uint(cacheMib, 2 ** 30) : 2 ** 30 },
+        cacheRamMib: uint(cacheMib, 2 ** 30) },
       ladder: ladder(native), kv: kvCandidates(),
     };
   }
@@ -665,7 +680,7 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
     try { r = await cal.probe(j.model, { ctx: step.ctx, fill: step.fill, base, baseRevision: j._revision, promptBudgetSeconds: j.promptBudgetSeconds }); }
     finally { child = null; }
     check();
-    if (!r.passed) return { outcome: PLAN_CAUSE[r.cause] || 'load_failed', reason: r.reason || 'The fill-and-recall test failed.' };
+    if (!r.passed) return { outcome: r.cause === 'timeout' ? 'timeout' : PLAN_CAUSE[r.cause] || 'load_failed', reason: r.reason || 'The fill-and-recall test failed.' };
     if (withQuality) {
       try {
         await load(j);
@@ -673,21 +688,39 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
         if (!quality.passed) return { outcome: 'quality_failed', reason: qualityFailure(quality) };
       } catch (e) {
         if (e.fatal || e.cancelled || cancelled) throw e;
-        return { outcome: /memory/i.test(e.message) ? 'oom' : 'load_failed', reason: e.message };
+        return { outcome: /memory/i.test(e.message) ? 'oom' : /timed out/i.test(e.message) ? 'timeout' : 'load_failed', reason: e.message };
       }
     }
     return { outcome: 'passed', reason: null, promptSeconds: r.promptSeconds };
   }
   const SPEC_OFF = { 'spec-type': 'none', 'spec-draft-n-max': '', 'spec-draft-p-min': '' };
+  // #1026: the baseline's size, by the planner's own estimate: the smallest rung, and the most
+  // precise KV type that fits there (asked as a one-rung, one-type plan; a probe means it fits).
+  function baselineSize(plan) {
+    const ctx = plan.request.ladder[0];
+    const fits = kv => { try { return planner.plan({ ...plan.request, ladder: [ctx], kv: [kv], results: [] }).step === 'probe'; } catch { return false; } };
+    const kv = plan.request.kv.find(fits);
+    if (!kv) throw publicFail('This model does not fit the inference memory budget even at the smallest context size.');
+    return { ctx, kv, f16: kv === 'f16' };
+  }
+  // #1029: a load that did not finish in time says nothing about memory. Tried once more; then the
+  // run stops (resumable) instead of stepping the context or KV type down.
+  const LOAD_TIMEOUT = 'The test profile did not finish loading in time twice, so auto-tune cannot judge this setting. Check the model server, then resume.';
   async function measureFill(j, item, p, step, kind) {
     const plan = item.plan;
     const row = { id: kind + '-' + plan.results.length, label: (kind === 'probe' ? 'Fill ' : 'Final fill ') + step.ctx.toLocaleString('en-US') + ' · ' + step.kv + ' KV cache',
       status: 'running', ctx: step.ctx, kv: step.kv, estimateMib: step.estimateMib, startedAt: now() };
     p.steps.push(row); save();
     note(j, (kind === 'probe' ? 'Filling ' : 'Final check: filling ') + step.ctx + ' tokens with ' + step.kv + ' KV cache (estimate ' + step.estimateMib + ' MiB).');
-    const r = kind === 'probe'
-      ? await fillCheck(j, step, { 'cache-type-k': step.kv, 'cache-type-v': step.kv, ...SPEC_OFF }, true)
-      : await fillCheck(j, step, {}, false);
+    const run = () => (kind === 'probe'
+      ? fillCheck(j, step, { 'cache-type-k': step.kv, 'cache-type-v': step.kv, ...SPEC_OFF }, true)
+      : fillCheck(j, step, {}, false));
+    let r = await run();
+    if (r.outcome === 'timeout') { note(j, 'Loading timed out; trying the same setting once more.'); r = await run(); }
+    if (r.outcome === 'timeout') {
+      Object.assign(row, { status: 'failed', reason: LOAD_TIMEOUT, finishedAt: now() });
+      throw publicFail(LOAD_TIMEOUT);
+    }
     Object.assign(row, { status: r.outcome === 'passed' ? 'passed' : 'failed', ...(r.reason ? { reason: r.reason } : {}),
       ...(r.promptSeconds != null ? { promptSeconds: r.promptSeconds } : {}), finishedAt: now() });
     plan.results.push({ step: kind, ctx: step.ctx, kv: step.kv, outcome: r.outcome }); save();
@@ -699,9 +732,9 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
     const plan = item.plan;
     if (!plan.request) {
       await unloadAll();
-      plan.request = await planRequest(item.model).catch(() => null);
-      if (!plan.request) return fallBack(j, item, 'its model file could not be read');
-      save();
+      const request = await planRequest(item.model).catch(() => ({ fallback: 'its model file could not be read' }));
+      if (request.fallback) return fallBack(j, item, request.fallback);
+      plan.request = request; save();
     }
     try { return await planSteps(j, item, release); } catch (e) {
       // A stop between steps (the planner's verdict, its failure) still puts back what an open
@@ -736,7 +769,7 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
         release.setReason('Chat is paused while noevia tunes ' + item.model + ': context and KV cache.');
         await inStage(j, context, async () => {
           if (!plan.before) { plan.before = keysOf(presets.get(j.model).options); save(); }
-          await ensureBaseline(j, presets.get(j.model).options);
+          await ensureBaseline(j, presets.get(j.model).options, { sized: baselineSize(plan) });
           await measureFill(j, item, context, step, 'probe');
         });
         continue;
