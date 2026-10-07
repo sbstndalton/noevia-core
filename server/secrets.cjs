@@ -3,6 +3,7 @@
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const envelope = require('./secret-envelope.cjs');
 
 function createSecretStore(dataDir, { env = process.env } = {}) {
   // A fresh install has no state directory yet. Create it before the key,
@@ -38,41 +39,11 @@ function createSecretStore(dataDir, { env = process.env } = {}) {
   }
   if (previousKey && previousKey.length !== 32) throw new Error('invalid previous credential-encryption key (need 32 bytes)');
   if (previousKey && previousKey.equals(key)) previousKey = null;
-  // Formats:
-  //   enc:v1:<iv|tag|body>  legacy, no associated data (still decrypts)
-  //   enc:v2:<iv|tag|body>  GCM with AAD = "noevia:user:<userId>", so a
-  //                         ciphertext copied from another account fails.
-  // encrypt() always encrypts its input: a caller-supplied string that merely
-  // looks like a ciphertext is treated as plaintext, never stored verbatim.
-  const aadFor = (userId) => Buffer.from(`noevia:user:${userId}`, 'utf8');
-  const hasUser = (userId) => userId !== undefined && userId !== null && userId !== '';
-  const versionOf = (text) => (text.startsWith('enc:v2:') ? 2 : text.startsWith('enc:v1:') ? 1 : 0);
-  function encrypt(value, userId) {
-    if (value === undefined || value === null || value === '') return '';
-    const bound = hasUser(userId);
-    const iv = crypto.randomBytes(12); const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
-    if (bound) cipher.setAAD(aadFor(userId));
-    const body = Buffer.concat([cipher.update(String(value), 'utf8'), cipher.final()]);
-    return `enc:${bound ? 'v2' : 'v1'}:${Buffer.concat([iv, cipher.getAuthTag(), body]).toString('base64url')}`;
-  }
-  function decryptWith(k, text, version, userId) {
-    const raw = Buffer.from(text.slice(7), 'base64url');
-    const decipher = crypto.createDecipheriv('aes-256-gcm', k, raw.subarray(0, 12));
-    if (version === 2) decipher.setAAD(aadFor(userId));
-    decipher.setAuthTag(raw.subarray(12, 28));
-    return Buffer.concat([decipher.update(raw.subarray(28)), decipher.final()]).toString('utf8');
-  }
+  // The envelope formats (enc:v1, enc:v2) live in secret-envelope.cjs (#979), which runs the JS
+  // code or its Rust port by SECRET_ENVELOPE_IMPL (default js; read per call).
+  const encrypt = (value, userId) => envelope.encrypt(key, value, userId);
   // Returns { plain, keyUsed: 'current'|'previous'|'none' }; throws when no key opens it.
-  function open(value, userId) {
-    const text = String(value || '');
-    const version = versionOf(text);
-    if (!version) return { plain: value || '', keyUsed: 'none' };
-    if (version === 2 && !hasUser(userId)) throw new Error('credential is bound to an account');
-    try { return { plain: decryptWith(key, text, version, userId), keyUsed: 'current' }; } catch (e) {
-      if (!previousKey) throw e;
-    }
-    return { plain: decryptWith(previousKey, text, version, userId), keyUsed: 'previous' };
-  }
+  const open = (value, userId) => envelope.open(key, previousKey, value, userId);
   const decrypt = (value, userId) => open(value, userId).plain;
   /** True when the value is empty, plaintext, or opens with the current or previous key. */
   function canDecrypt(value, userId) { try { open(value, userId); return true; } catch { return false; } }
@@ -82,8 +53,8 @@ function createSecretStore(dataDir, { env = process.env } = {}) {
   function reseal(value, userId) {
     const text = String(value || '');
     if (!text) return { status: 'empty' };
-    const version = versionOf(text);
-    const wanted = hasUser(userId) ? 2 : 1;
+    const version = envelope.versionOf(text);
+    const wanted = envelope.hasUser(userId) ? 2 : 1;
     // A v2 row in an unbound table cannot be opened without its owner; leave it.
     if (version === 2 && wanted === 1) throw new Error('credential is bound to an unknown account');
     const { plain, keyUsed } = open(text, userId);

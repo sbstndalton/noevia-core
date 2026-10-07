@@ -11,12 +11,20 @@
 //   - crates/upload-sniff   uploadValidate/uploadClassify/uploadDecode
 //                                        = upload-sniff.cjs validate/classify/decodeText
 //                                                                             (UPLOAD_SNIFF_IMPL, #977)
+//   - crates/secret-envelope secretOpen/secretSeal = secret-envelope.cjs openJs/encryptJs
+//                                                                             (SECRET_ENVELOPE_IMPL, #979)
 //
 // Memory: WebAssembly memory only grows. A listing or path call needs at most ~16 MiB; an upload
 // decode copies the upload in (at most 25 MiB) and holds one copy of its text (at most 3 bytes per
 // input byte, so ~75 MiB), so one 25 MiB decode can leave the instance at ~100 MiB+. After any call
 // whose input or reply passes RESET_AFTER_BYTES the instance is dropped (the compiled module stays
 // cached, so the next call only re-instantiates, ~ms) and that memory is released to the GC.
+//
+// Secret calls (#979) carry key bytes, so they never share an instance: after every secretOpen or
+// secretSeal, whatever happened, the whole linear memory is overwritten with zeros and the
+// instance dropped (the module itself also wipes its input buffer). The input this loader builds
+// is zeroed too. The caller's own Buffers (the key, the returned plaintext) are the caller's
+// responsibility.
 //
 // Everything here fails closed. The module must match the pinned sha256, import nothing and
 // export exactly the ABI below; a refusal, a trap or a reply of the wrong shape throws a
@@ -35,7 +43,7 @@ const MAX_DECODE_BYTES = 25 * 1024 * 1024;
 // Only the first bytes decide an archive magic number (`ustar` ends at 262).
 const SNIFF_BYTES = 262;
 const RESET_AFTER_BYTES = 1024 * 1024;
-const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'dav_output_ptr', 'dav_output_len'];
+const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'secret_open', 'secret_seal', 'dav_output_ptr', 'dav_output_len'];
 
 class DavParseError extends Error {
   constructor(message, reason) {
@@ -262,10 +270,121 @@ function uploadDecode(bytes) {
   return { text: utf8(out.subarray(1), textDecoder), encoding: ENCODINGS[out[0]] };
 }
 
+const KEY_BYTES = 32;
+const NONCE_BYTES = 12;
+// secret_envelope::MAX_PLAIN_BYTES, MAX_ENVELOPE_UNITS, MAX_USER_BYTES.
+const MAX_SECRET_PLAIN_BYTES = 8 * 1024 * 1024;
+const MAX_SECRET_UNITS = 12 * 1024 * 1024;
+const MAX_SECRET_USER_BYTES = 64 * 1024;
+const SECRET_REFUSALS = new Set(['bound', 'unopenable', 'too_large', 'input']);
+
+/** Run one secret call on `input` (zeroed afterwards), then wipe the instance's memory and drop
+ *  it. Returns `{ status, bytes }`; never puts input bytes in an error. */
+function invokeSecret(input, call) {
+  try {
+    // The module-wide cap (MAX_DECODE_BYTES): a value at MAX_SECRET_UNITS is ~24 MiB as UTF-16.
+    if (input.length > MAX_DECODE_BYTES) throw new DavParseError('secret input is too large', 'too_large');
+    const wasm = ensure();
+    try {
+      const { exports } = wasm;
+      const ptr = exports.dav_input(input.length) >>> 0;
+      if (!ptr) throw new DavParseError('dav-parse refused the input size', 'too_large');
+      new Uint8Array(exports.memory.buffer, ptr, input.length).set(input);
+      const status = call(exports) >>> 0;
+      const outPtr = exports.dav_output_ptr() >>> 0, outLen = exports.dav_output_len() >>> 0;
+      return { status, bytes: new Uint8Array(exports.memory.buffer, outPtr, outLen).slice() };
+    } catch (err) {
+      if (err instanceof DavParseError) throw err;
+      throw new DavParseError('dav-parse module failed', 'trap');
+    } finally {
+      try { new Uint8Array(wasm.exports.memory.buffer).fill(0); } catch { /* the instance is dropped anyway */ }
+      if (cached && cached.instance === wasm) cached.instance = null;
+    }
+  } finally {
+    input.fill(0);
+  }
+}
+
+function secretRefusal(status, bytes) {
+  let code = 'unknown';
+  try { const r = JSON.parse(utf8(bytes)); if (r && SECRET_REFUSALS.has(r.error)) code = r.error; } catch { /* keep unknown */ }
+  bytes.fill(0);
+  return new DavParseError(`secret refused by dav-parse (${status === 2 ? 'input' : code})`, status === 2 ? 'input' : code);
+}
+
+/** `0` or `1 u32le(len) utf8`. */
+function secretUser(user) {
+  if (user === null) return new Uint8Array([0]);
+  const u = encoder.encode(user);
+  if (u.length > MAX_SECRET_USER_BYTES) throw new DavParseError('secret user id is too large', 'too_large');
+  const out = new Uint8Array(5 + u.length);
+  out[0] = 1;
+  new DataView(out.buffer).setUint32(1, u.length, true);
+  out.set(u, 5);
+  return out;
+}
+
+const isKey = (k) => k instanceof Uint8Array && k.length === KEY_BYTES;
+
+/** secret-envelope.cjs openJs (#979), through the module. `keys` is [current] or [current,
+ *  previous]; `user` is String(userId) or null (no user); `text` is the stored value as a string.
+ *  Returns `{ keyUsed: 'none'|'current'|'previous', plain: Uint8Array }` (plain is empty for
+ *  'none'; the caller decodes and then zeroes it). Refusals throw a DavParseError whose reason is
+ *  'bound', 'unopenable', 'too_large' or 'input'. */
+function secretOpen(keys, user, text) {
+  if (!Array.isArray(keys) || keys.length < 1 || keys.length > 2 || !keys.every(isKey)) throw new DavParseError('secret keys have the wrong shape', 'input');
+  if (typeof text !== 'string' || !(user === null || typeof user === 'string')) throw new DavParseError('secret input has the wrong type', 'input');
+  if (text.length > MAX_SECRET_UNITS) throw new DavParseError('secret value is too large', 'too_large');
+  const u = secretUser(user);
+  const input = new Uint8Array(1 + keys.length * KEY_BYTES + u.length + text.length * 2);
+  input[0] = keys.length;
+  keys.forEach((k, i) => input.set(k, 1 + i * KEY_BYTES));
+  input.set(u, 1 + keys.length * KEY_BYTES);
+  const view = new DataView(input.buffer);
+  const at = 1 + keys.length * KEY_BYTES + u.length;
+  for (let i = 0; i < text.length; i++) view.setUint16(at + i * 2, text.charCodeAt(i), true);
+  u.fill(0);
+  const { status, bytes } = invokeSecret(input, (e) => e.secret_open());
+  if (status !== 0) throw secretRefusal(status, bytes);
+  const tag = bytes[0];
+  if (bytes.length < 1 || tag > keys.length || (tag === 0 && bytes.length !== 1)) {
+    bytes.fill(0);
+    throw new DavParseError('secret open reply has an unexpected shape', 'reply');
+  }
+  return { keyUsed: ['none', 'current', 'previous'][tag], plain: bytes.subarray(1) };
+}
+
+const ENVELOPE_TEXT = /^enc:v([12]):[A-Za-z0-9_-]+$/;
+
+/** secret-envelope.cjs encryptJs (#979) after its empty-value check, through the module.
+ *  `plain` is the UTF-8 bytes, `nonce` 12 bytes from crypto.randomBytes, `user` as secretOpen. */
+function secretSeal(key, nonce, plain, user) {
+  if (!isKey(key) || !(nonce instanceof Uint8Array) || nonce.length !== NONCE_BYTES || !(plain instanceof Uint8Array)) throw new DavParseError('secret seal input has the wrong shape', 'input');
+  if (!(user === null || typeof user === 'string')) throw new DavParseError('secret input has the wrong type', 'input');
+  if (plain.length > MAX_SECRET_PLAIN_BYTES) throw new DavParseError('secret value is too large', 'too_large');
+  const u = secretUser(user);
+  const input = new Uint8Array(KEY_BYTES + NONCE_BYTES + u.length + plain.length);
+  input.set(key, 0);
+  input.set(nonce, KEY_BYTES);
+  input.set(u, KEY_BYTES + NONCE_BYTES);
+  input.set(plain, KEY_BYTES + NONCE_BYTES + u.length);
+  u.fill(0);
+  const { status, bytes } = invokeSecret(input, (e) => e.secret_seal());
+  if (status !== 0) throw secretRefusal(status, bytes);
+  let text;
+  try { text = decoder.decode(bytes); } catch { text = ''; }
+  const m = ENVELOPE_TEXT.exec(text);
+  // iv + tag + body in unpadded base64url.
+  if (!m || Number(m[1]) !== (user === null ? 1 : 2) || text.length - 7 !== Math.ceil(((NONCE_BYTES + 16 + plain.length) * 4) / 3)) {
+    throw new DavParseError('secret seal reply has an unexpected shape', 'reply');
+  }
+  return text;
+}
+
 /** Test hook: the cached instance's linear memory in bytes (0 when there is none). */
 function memoryBytes() { return cached?.instance ? cached.instance.exports.memory.buffer.byteLength : 0; }
 
 /** Test hook: forget the cached module (and its failure). */
 function reset() { cached = null; }
 
-module.exports = { listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
+module.exports = { listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
