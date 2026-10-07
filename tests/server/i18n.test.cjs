@@ -23,7 +23,7 @@ const FILES={'de-DE':'DE_DE','es-ES':'ES_ES','fr-FR':'FR_FR','it-IT':'IT_IT','nb
 // (settings/index.ts etc., what the real view's chunk does), and the component(s) allowed to pull
 // its strings into their own chunk.
 const SEGMENT_DEFS={
-  settings:{suffix:'SETTINGS',owners:/^components\/(SettingsShell|ProviderForm|connectors\/)/},
+  settings:{suffix:'SETTINGS',owners:/^components\/(SettingsShell|ProviderForm|ChatGptConnect|connectors\/)/},
   // Diary's and Projects' child components rely on their lazy entry (DiaryView, ProjectsView)
   // having already registered the segment, rather than each importing it themselves.
   projects:{suffix:'PROJECTS',owners:/^components\/ProjectsView$/},
@@ -395,7 +395,9 @@ test('Settings search matches English keywords as well as the translated ones',(
 // ── Model manager segment (#293) ────────────────────────────────────────────────────────────────
 // Every module in the ModelManagerPage lazy chunk that renders text. ModelManagerPage registers
 // the segment; the rest are only reachable through it (checked below).
-const MODELS_MODULES=['components/models/ModelManagerPage.tsx','components/models/ModelsSettings.tsx','components/models/RoutingModeSection.tsx','components/models/OverviewTab.tsx','components/models/LibraryTab.tsx','components/models/DownloadTab.tsx','components/models/ConfigureTab.tsx','components/models/GuidedOptimize.tsx','components/models/HardwareTab.tsx','components/models/BenchmarksTab.tsx','components/models/AutoTune.tsx','components/models/EvidenceList.tsx','components/models/TimeChart.tsx','components/models/mm-text.ts','components/models/backend-errors.ts','components/models/register.ts','components/NativeCalibration.tsx','components/MtpControl.tsx','components/SamplingPresetsControl.tsx'];
+const MODELS_MODULES=['components/models/ModelManagerPage.tsx','components/models/ModelsSettings.tsx','components/models/RoutingModeSection.tsx','components/models/ModelCombobox.tsx','components/models/sections.ts','components/models/OverviewTab.tsx','components/models/LibraryTab.tsx','components/models/DownloadTab.tsx','components/models/ConfigureTab.tsx','components/models/GuidedOptimize.tsx','components/models/HardwareTab.tsx','components/models/BenchmarksTab.tsx','components/models/AutoTune.tsx','components/models/EvidenceList.tsx','components/models/TimeChart.tsx','components/models/mm-text.ts','components/models/backend-errors.ts','components/models/register.ts','components/NativeCalibration.tsx','components/MtpControl.tsx','components/SamplingPresetsControl.tsx']
+  // A module added on the web side (ModelCombobox, #1009) is listed before that web change lands.
+  .filter((f)=>fs.existsSync(path.join(__dirname,'../../src',f)));
 const SRC=path.join(__dirname,'../../src');
 function srcFiles(){const out=[];(function walk(d){for(const f of fs.readdirSync(d)){const p=path.join(d,f);if(fs.statSync(p).isDirectory()){if(f!=='i18n')walk(p);}else if(/\.tsx?$/.test(f))out.push(path.relative(SRC,p).replace(/\\/g,'/'));}})(SRC);return out;}
 const inSegment=(s,k)=>Object.prototype.hasOwnProperty.call(ENSEG[s],k)||(Object.prototype.hasOwnProperty.call(ENSEG[s],`${k}.one`)&&Object.prototype.hasOwnProperty.call(ENSEG[s],`${k}.other`));
