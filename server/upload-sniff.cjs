@@ -2,10 +2,22 @@
 
 // Upload checks (#977): validate (filename rule, 25 MB cap, archive refusal), classify and
 // decodeText, moved here unchanged from uploads.cjs.
+//
+// `upload-sniff` (sbstndalton/noevia-rs, in the dav-parse.wasm module pinned by
+// server/dav-parse.lock) is the Rust port. UPLOAD_SNIFF_IMPL=js|wasm picks one (default js; any
+// other value means js, with one warning). `wasm` FAILS CLOSED: a missing or tampered module, a
+// trap or an unexpected reply throws 500 'upload could not be checked'; input that cannot cross
+// (a non-string name, non-byte data, more than 25 MB to decode) throws 400 with the same message.
+// Nothing falls back to the JS rules; the details are logged server-side.
+//
+// Only what decides the answer crosses: validate sends the name, the length and the first 262
+// bytes; classify the name; decodeText the whole upload (it needs every byte; at most 25 MB, and
+// ingest only decodes validated uploads). See dav-parse-wasm.cjs for the module's memory policy.
 
 const path = require('node:path');
 const storage = require('./storage-client.cjs');
 const storagePath = require('./storage-path.cjs');
+const davParseWasm = require('./dav-parse-wasm.cjs');
 
 const CAP = 25 * 1024 * 1024;
 function classifyJs(name) {
@@ -56,6 +68,53 @@ function decodeTextJs(bytes) {
   try { return { text: decode('windows-1252'), encoding: 'windows-1252' }; } catch { return null; }
 }
 
-const classify = classifyJs, validate = validateJs, decodeText = decodeTextJs;
+const PUBLIC_FAILURE = 'upload could not be checked';
+const IMPLS = new Set(['js', 'wasm']);
+let warnedImpl = '';
 
-module.exports = { CAP, classify, validate, decodeText, classifyJs, validateJs, decodeTextJs };
+/** UPLOAD_SNIFF_IMPL, read per call so a test (or an owner flip plus restart) takes effect. */
+function uploadSniffImpl(env = process.env) {
+  const raw = env.UPLOAD_SNIFF_IMPL;
+  if (raw === undefined || raw === '') return 'js';
+  const value = String(raw).trim().toLowerCase();
+  if (IMPLS.has(value)) return value;
+  if (warnedImpl !== value) {
+    warnedImpl = value;
+    console.warn(`[uploads] UPLOAD_SNIFF_IMPL=${JSON.stringify(String(raw))} is not js or wasm; using js`);
+  }
+  return 'js';
+}
+
+function viaWasm(op, fn) {
+  try { return fn(); } catch (err) {
+    const reason = err instanceof davParseWasm.DavParseError ? err.reason : 'unexpected';
+    console.warn(`[uploads] upload-sniff ${op} failed (${reason}): ${err?.message || err}`);
+    throw Object.assign(new Error(PUBLIC_FAILURE), { status: reason === 'too_large' || reason === 'input' ? 400 : 500, code: 'upload_sniff_failed', reason });
+  }
+}
+
+// The messages validateJs throws, by the refusal code the module answers.
+const REFUSAL_MESSAGES = {
+  filename: 'Use a plain filename of at most 200 characters.',
+  empty: 'Files must be non-empty and no larger than 25 MB.',
+  too_big: 'Files must be non-empty and no larger than 25 MB.',
+  archive: 'Archive bundles are not supported. Upload their individual files instead.',
+};
+
+function validate(name, bytes, { impl = uploadSniffImpl() } = {}) {
+  if (impl !== 'wasm') return validateJs(name, bytes);
+  // As storage-path's wasm filename rule: a non-string (or empty) name is not a plain filename.
+  if (!name || typeof name !== 'string') throw Object.assign(new Error(REFUSAL_MESSAGES.filename), { status: 400 });
+  const refused = viaWasm('validate', () => davParseWasm.uploadValidate(name, bytes));
+  if (refused) throw Object.assign(new Error(REFUSAL_MESSAGES[refused.refusal]), { status: refused.status });
+}
+
+function classify(name, { impl = uploadSniffImpl() } = {}) {
+  return impl === 'wasm' ? viaWasm('classify', () => davParseWasm.uploadClassify(name)) : classifyJs(name);
+}
+
+function decodeText(bytes, { impl = uploadSniffImpl() } = {}) {
+  return impl === 'wasm' ? viaWasm('decodeText', () => davParseWasm.uploadDecode(bytes)) : decodeTextJs(bytes);
+}
+
+module.exports = { CAP, classify, validate, decodeText, uploadSniffImpl, PUBLIC_FAILURE, classifyJs, validateJs, decodeTextJs };
