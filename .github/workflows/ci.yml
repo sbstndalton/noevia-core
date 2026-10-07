@@ -240,6 +240,18 @@ jobs:
           context: ${{ env.TREE }}
           file: ws/build/web.Dockerfile
           push: false
+          # load: the next step runs tests inside the built (runtime-stage) image.
+          load: true
           tags: noevia-web:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      # noevia #990: the differential tests compare Node's own decoders (TextDecoder windows-1252,
+      # base64url) with the Rust module. The image build runs the tests on the alpine build stage;
+      # this runs the upload-sniff and secret-envelope ones on the exact runtime image that ships
+      # (node:22-bookworm, whatever Node 22.x it resolves to), not on the runner's Node.
+      - name: Differential tests on the shipped runtime image
+        run: |
+          set -euo pipefail
+          docker run --rm -e DAV_PARSE_WASM_REQUIRED=1 \
+            -v "$TREE/core/tests:/app/tests:ro" -w /app noevia-web:ci sh -c \
+            'node --version && node --test tests/server/upload-sniff-differential.test.cjs tests/server/secret-envelope-differential.test.cjs'
