@@ -125,12 +125,18 @@ function createCodeService({ repos, connect, egress = null, engine = undefined, 
   };
 
   // Every task run, the executor's and the pipeline's, holds an inference lease until it ends.
-  const leased = (jobs) => (!inference ? jobs : { ...jobs, run: (id, work) => jobs.run(id, async (ctx) => {
+  // #1069: the lease is taken before jobs.run, so a refusal rejects run() itself and the caller's
+  // own catch gives the worktree and network grant back; the job is recorded as failed here.
+  const leased = (jobs) => (!inference ? jobs : { ...jobs, run: async (id, work) => {
     let release;
     try { release = inference.enter(); }
-    catch (error) { throw error?.status === 503 ? fail(503, INFERENCE_PAUSED) : error; }
-    try { return await work(ctx); } finally { release?.(); }
-  }) });
+    catch (error) {
+      const refusal = error?.status === 503 ? fail(503, INFERENCE_PAUSED) : error;
+      try { jobs.append(id, 'job.failed', { error: String(refusal.publicMessage || refusal.message).slice(0, 500) }); } catch { /* the rejection says it */ }
+      throw refusal;
+    }
+    try { return await jobs.run(id, work); } finally { release(); }
+  } });
   const paused = () => { try { return inference?.paused?.() === true; } catch { return false; } };
 
   function storeFor(workspace) {

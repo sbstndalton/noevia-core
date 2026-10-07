@@ -436,6 +436,26 @@ test('#1062 a task that loses the race to auto-tune fails with the pause message
   assert.equal(done.error, INFERENCE_PAUSED);
   releaseGate();
   gate.hold('next')(); // nothing still counts as in flight
+  // #1069: the refusal gave the worktree back: the same task can start again on its branch.
+  releaseGate = () => {};
+  const again = await svc.start(ws, project, { repository: 'noevia', prompt: 'fix' });
+  assert.equal((await settle(svc, ws, again.taskId)).status, 'completed');
+});
+
+test('#1069 a lease refused at run time releases the claimed worktree and network grant', async () => {
+  const gate = createMaintenanceGate();
+  const released = [];
+  let refuse = true;
+  const egress = { endpoint: 'egress:3128', grant: () => ({ token: 't' }), revoke: (id) => released.push(id), activity: () => ({}) };
+  const { svc, ws } = service({ egress, inference: { enter: () => { if (refuse) throw Object.assign(Error('busy'), { status: 503 }); return gate.enter(); }, paused: () => false } });
+  const started = await svc.start(ws, project, { repository: 'noevia', prompt: 'fix', capabilities: ['read_file', 'network'], domains: ['x.test'] });
+  const done = await settle(svc, ws, started.taskId);
+  assert.equal(done.status, 'failed'); assert.equal(done.error, INFERENCE_PAUSED);
+  assert.deepEqual(released, [started.taskId], 'the network grant was revoked');
+  refuse = false;
+  const again = await svc.start(ws, project, { repository: 'noevia', prompt: 'fix' });
+  assert.equal((await settle(svc, ws, again.taskId)).status, 'completed');
+  gate.hold('idle')();
 });
 
 test('#1062 the lease is given back when a task fails or is cancelled', async () => {

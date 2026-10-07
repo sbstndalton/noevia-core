@@ -282,13 +282,19 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
       }
       if (d.action === 'give_up') throw Object.assign(Error('Another client kept using ' + idList(d.foreign) + ' for ' + Math.round(d.waitedMs / 60000) + ' min. Resume auto-tune when it is done.'), { fatal: true, foreignTimeout: true });
       if (d.action === 'unload') {
+        let raced = false;
         for (const id of d.unload) {
           if (!restoring) check();
+          // #1069: read the count again right before stopping it; a request that just arrived wins.
+          if ((await requestsProcessing(id)) > 0) { raced = true; break; }
           const u = await request('/models/unload', { method: 'POST', body: JSON.stringify({ model: id }) }, 60000);
           if (!u.ok) throw Error('Could not unload ' + id + ' before testing.');
         }
-        note(j, 'Unloaded ' + idList(d.unload) + ', idle after another client used it; tuning continues.');
-        return;
+        if (!raced) {
+          note(j, 'Unloaded ' + idList(d.unload) + ', idle after another client used it; tuning continues.');
+          return;
+        }
+        prev = null; await sleep(foreignPollMs); continue;
       }
       prev = { fingerprint: d.fingerprint, since: d.since };
       await sleep(foreignPollMs);
@@ -368,6 +374,21 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     const r = await rawModels();
     if (!r.ok || !Array.isArray(r.body?.data)) throw Error('The model server is not responding.');
     const asked = new Set(), gone = new Set();
+    // #1067: a live model other than the one being tuned is another client's until tune_contention
+    // says it is idle; yieldToForeign decides, and unloads it only then.
+    // Resident and known idle may be stopped here as before; so may a model of this job's own queue
+    // (left loaded by its tune) unless it is busy. Loading, busy or unreadable goes to the decision.
+    if (tuning) {
+      const queue = new Set((state.job?.models || []).map(m => m.model));
+      const held = [];
+      for (const row of r.body.data) {
+        if (row.id === tuning || !LIVE.includes(row.status?.value)) continue;
+        if (row.status.value === 'loading') { held.push(row.id); continue; }
+        const busy = await requestsProcessing(row.id);
+        if (busy > 0 || (busy === null && !queue.has(row.id))) held.push(row.id);
+      }
+      if (held.length) return 'Another client has ' + idList(held) + ' loaded.';
+    }
     for (const row of r.body.data) if (['loaded', 'loading'].includes(row.status?.value)) {
       asked.add(row.id);
       if (!restoring) check();
@@ -425,10 +446,18 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
       ...(quirksOf(model).reasoningEffort ? { reasoning_effort: quirksOf(model).reasoningEffort } : {}),
       chat_template_kwargs: { enable_thinking: false }, messages: [{ role: 'user', content: prompt }], ...(extra || {}),
     }) }, 180000); }
-    catch (e) { if (lowMemory) throw Error('Available memory fell below the safety floor.'); throw e; }
+    catch (e) {
+      if (lowMemory) throw Error('Available memory fell below the safety floor.');
+      if (!cancelled && !e?.cancelled && await evictedBy(model)) return retryAfterForeign(model, prompt, max, extra);
+      throw e;
+    }
     finally { clearInterval(timer); inflight = null; }
     check();
     if (lowMemory) throw Error('Available memory fell below the safety floor.');
+    // #1069: a failed answer while another client has a model live is that client's doing, not
+    // this candidate's: wait for it, reload the profile under test and ask again.
+    const failed = extra ? !(Number(r?.status) >= 200 && Number(r?.status) < 300) && !r?.ok : !r?.ok || !r.body?.choices?.length;
+    if (failed && await evictedBy(model)) return retryAfterForeign(model, prompt, max, extra);
     if (extra) return { status: Number.isInteger(r?.status) ? r.status : r?.ok ? 200 : 0, bodyText: typeof r?.body === 'string' ? r.body : JSON.stringify(r?.body ?? null) };
     if (!r.ok) return { failure: 'HTTP ' + (r.status || 'error') };
     if (!r.body?.choices?.length) return { failure: 'no response' };
@@ -436,6 +465,12 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     return { text: r.body.choices[0]?.message?.content || '', gen: Number(t.predicted_per_second),
       prompt: Number(t.prompt_per_second), drafted: Number(t.draft_n) || 0, accepted: Number(t.draft_n_accepted) || 0,
       finishReason: r.body.choices[0]?.finish_reason };
+  }
+  async function evictedBy(model) { return state.job?.model === model && (await othersLiveNow(model)) === true; }
+  async function retryAfterForeign(model, prompt, max, extra) {
+    await yieldToForeign(state.job, anotherClient());
+    await load(state.job);
+    return chat(model, prompt, max, extra);
   }
   async function load(j) {
     check();
@@ -512,10 +547,13 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     check();
     if (presets.snapshot().revision !== j._revision) throw Object.assign(Error('Settings changed outside auto-tune.'), { fatal: true });
     const offset = prefix ? p.steps.length : 0;
+    // A wait for another client that gave up (or was cancelled) inside the calibrator stops the
+    // tune as that, not as a context failure.
+    let foreignStop = null;
     child = contextFactory({
       applyUnlocked: guardedApply(j),
       // #1062: the calibrator waits for another client the same way, then repeats its step.
-      foreignWait: legacy => yieldToForeign(j, legacy),
+      foreignWait: async legacy => { try { await yieldToForeign(j, legacy); } catch (e) { if (e.foreignTimeout || e.cancelled) foreignStop = e; throw e; } },
       onWrite: revision => { j._revision = revision; save(); },
       onUpdate: c => {
         if (!c) return;
@@ -532,6 +570,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
       if (cancelled) child.cancel();
       await child.completion(); check();
       const result = child.status(j.model).body.job;
+      if (foreignStop && result.status !== 'passed') throw foreignStop;
       if (result.status !== 'passed') throw Object.assign(Error(result.error || 'Context measurement failed.'), { fatal: result.restored === false });
       return result.result;
     } finally { child = null; }
@@ -743,15 +782,59 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     if (p._beforeText == null) return true;
     if (presets.snapshot().revision !== j._revision) { p.restored = false; return false; }
     try {
-      await unloadAll({ restoring: true });
+      // #1068: restoring the file needs only the tuned model stopped, never another client's; the
+      // router's re-read waits while another client has a model live.
+      await unloadOwn(j);
       await presets.commit({ baseRevision: j._revision, text: p._beforeText }, j._backedUp ? { backup: false } : undefined);
       j._revision = presets.snapshot().revision; save();
-      const reload = await request('/models?reload=1', {}, 120000);
-      if (!reload.ok) throw Error('The router did not confirm restored settings.');
+      await reloadRouter(j);
       p.restored = true;
       delete p._beforeText; save();
       return true;
     } catch { p.restored = false; save(); return false; }
+  }
+  async function unloadOwn(j) {
+    const u = await request('/models/unload', { method: 'POST', body: JSON.stringify({ model: j.model }) }, 60000);
+    if (!u.ok) throw Error('Could not unload ' + j.model + '.');
+    const deadline = now() + 60000;
+    for (let poll = 0; poll < 120; poll++) {
+      const listing = await rawModels();
+      if (!listing.ok || !Array.isArray(listing.body?.data)) throw Error('The model server stopped responding while unloading.');
+      const row = listing.body.data.find(m => m.id === j.model);
+      if (!row || row.status?.value === 'unloaded') return;
+      if (now() >= deadline) break;
+      await sleep(500);
+    }
+    throw Error('Timed out waiting for router unload: ' + j.model + '.');
+  }
+  // The router re-reads models.ini now, or (#1068) once no other client has a model live.
+  async function othersLiveNow(model) {
+    try { const r = await rawModels(); return !r.ok || !Array.isArray(r.body?.data) ? null : r.body.data.some(row => row.id !== model && LIVE.includes(row.status?.value)); }
+    catch { return null; }
+  }
+  async function reloadRouter(j) {
+    if ((await othersLiveNow(j.model)) === false) {
+      const reload = await request('/models?reload=1', {}, 120000);
+      if (!reload.ok) throw Error('The router did not confirm restored settings.');
+      j._reloadPending = false; save();
+      return;
+    }
+    j._reloadPending = true;
+    note(j, 'models.ini is restored; the model server re-reads it once the other client is done.');
+    scheduleReload(j);
+  }
+  let reloadTimer = null;
+  function scheduleReload(j, tries = 0) {
+    clearTimeout(reloadTimer);
+    if (!j._reloadPending || tries > 120) return;
+    reloadTimer = setTimeout(async () => {
+      if (!j._reloadPending) return;
+      if ((await othersLiveNow(j.model)) === false) {
+        try { const r = await request('/models?reload=1', {}, 120000); if (r.ok) { j._reloadPending = false; note(j, 'The model server re-read the restored models.ini.'); return; } } catch { /* retried below */ }
+      }
+      scheduleReload(j, tries + 1);
+    }, Math.max(foreignPollMs * 15, 1));
+    reloadTimer.unref?.();
   }
   async function runPhase(j, item, p) {
     check();

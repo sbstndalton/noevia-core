@@ -123,6 +123,9 @@ function createCalibrator(deps) {
   async function unloadAllOnce(except) {
     const models = await listing();
     const asked = new Set(), gone = new Set(), own = except ?? state.job?.model;
+    // #1067 (auto-tune only): never stop another client's live model here; foreignWait decides.
+    if (foreignWait && models.some(m => m.id !== own && ['loaded', 'loading', 'sleeping'].includes(m.status?.value)))
+      throw Error('Another client has a model loaded.');
     for (const m of models) if (m.id !== except && ['loaded', 'loading'].includes(m.status?.value)) { asked.add(m.id); await request('/models/unload', { method: 'POST', body: JSON.stringify({ model: m.id }) }, limits.unload).catch(() => {}); }
     const deadline = now() + limits.unload;
     while (now() < deadline) {
