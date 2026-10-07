@@ -32,6 +32,7 @@ const DEFAULT_ASK_TIMEOUT_MS = 300000;
 // A pi child that spawns its own background children (or one that calls setsid) must still die
 // with the session: killing its process group, not just the one pid, is what reaches those.
 const KILL_GRACE_MS = 5000;
+const RUST_FAILED = 'the sandbox bridge (rust) failed; closing the session';
 
 /**
  * Pin pi's noninteractive surface as tightly as its v0.87 CLI permits. Discovered extensions can
@@ -105,7 +106,19 @@ function toolCallFor(payload) {
  */
 function createBridge({ input, output, piCommand = 'pi', piArgs = null, spawnFn = spawn, env = process.env,
   askTimeoutMs = Number(env?.PI_BRIDGE_ASK_TIMEOUT_MS) > 0 ? Number(env.PI_BRIDGE_ASK_TIMEOUT_MS) : DEFAULT_ASK_TIMEOUT_MS,
-  onLog = () => {} }) {
+  onLog = () => {}, bridgeImpl = 'js' }) {
+  // SANDBOX_BRIDGE_IMPL=rust (#999): framing and toolCallFor through sandbox-bridge.wasm. Its
+  // module is loaded here, so a missing or mismatched one throws before anything is read. Any later
+  // failure of it ends the session with one fixed message: refused, never allowed.
+  const rust = bridgeImpl === 'rust' ? require('./sandbox-bridge-wasm.cjs') : null;
+  if (rust) rust.ensure();
+  const frame = rust ? (onLine, onOverflow) => rust.linesRust(onLine, onOverflow, undefined, () => failSession(RUST_FAILED)) : lines;
+  const toolCallOf = rust ? (payload) => {
+    try { return rust.toolCallForRust(payload); } catch (err) {
+      if (err instanceof rust.SandboxBridgeError) failSession(RUST_FAILED);
+      throw err; // as a JS TypeError here would: this call never becomes a permission
+    }
+  } : toolCallFor;
   let nextId = 1;
   const waiting = new Map(); // our requests to the ACP client, by id -> resolver function
   let pi = null, sessionId = null, turn = null, piSeq = 0, closed = false;
@@ -199,7 +212,7 @@ function createBridge({ input, output, piCommand = 'pi', piArgs = null, spawnFn 
     if (request.method === 'input') {
       let asked; try { asked = JSON.parse(String(request.placeholder ?? '')); } catch { return refuse(); }
       if (!asked || asked.noevia !== 'refusal_reason') return refuse();
-      const key = toolCallFor({ toolCallId: asked.toolCallId, toolName: asked.toolName }).toolCallId;
+      const key = toolCallOf({ toolCallId: asked.toolCallId, toolName: asked.toolName }).toolCallId;
       const reason = refusals.get(key);
       refusals.delete(key);
       return reason ? toPi({ type: 'extension_ui_response', id: request.id, value: reason }) : refuse();
@@ -207,7 +220,7 @@ function createBridge({ input, output, piCommand = 'pi', piArgs = null, spawnFn 
     if (request.method !== 'confirm') return refuse();
     let payload; try { payload = JSON.parse(String(request.message ?? '')); } catch { return refuse(); }
     if (!payload || payload.noevia !== 'tool_call' || !payload.toolName) return refuse();
-    const toolCall = toolCallFor(payload);
+    const toolCall = toolCallOf(payload);
     const { result: answer, error } = await ask('session/request_permission', { sessionId, toolCall, options: [
       { optionId: 'allow_once', name: 'Allow once', kind: 'allow_once' },
       { optionId: 'reject_once', name: 'Decline', kind: 'reject_once' },
@@ -234,7 +247,7 @@ function createBridge({ input, output, piCommand = 'pi', piArgs = null, spawnFn 
     } else if (event.type === 'message_update' && event.assistantMessageEvent?.type === 'thinking_delta') {
       notify({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: String(event.assistantMessageEvent.delta ?? '') } });
     } else if (event.type === 'tool_execution_start') {
-      notify({ sessionUpdate: 'tool_call', ...toolCallFor({ toolCallId: event.toolCallId, toolName: event.toolName, input: event.args }), status: 'in_progress' });
+      notify({ sessionUpdate: 'tool_call', ...toolCallOf({ toolCallId: event.toolCallId, toolName: event.toolName, input: event.args }), status: 'in_progress' });
     } else if (event.type === 'tool_execution_end') {
       notify({ sessionUpdate: 'tool_call_update', toolCallId: String(event.toolCallId || ''), status: event.isError ? 'failed' : 'completed' });
     } else if (event.type === 'agent_settled' && turn) {
@@ -250,7 +263,7 @@ function createBridge({ input, output, piCommand = 'pi', piArgs = null, spawnFn 
     // with it, instead of surviving until a supervisor-level group kill, or escaping that too.
     pi = spawnFn(piCommand, piArgs || piArgsFor(env), { cwd, env, stdio: ['pipe', 'pipe', 'pipe'], detached: true });
     pi.stdout.setEncoding('utf8');
-    pi.stdout.on('data', lines(
+    pi.stdout.on('data', frame(
       (event) => { if (!closed) onPiEvent(event); },
       (size) => failSession(`pi's output exceeded the ${size}-byte line buffer; closing the session`),
     ));
@@ -301,7 +314,7 @@ function createBridge({ input, output, piCommand = 'pi', piArgs = null, spawnFn 
   }
 
   input.setEncoding?.('utf8');
-  input.on('data', lines(
+  input.on('data', frame(
     (message) => { if (!closed) onClientMessage(message); },
     (size) => failSession(`the client's message exceeded the ${size}-byte line buffer; closing the session`),
   ));
@@ -318,8 +331,21 @@ function createBridge({ input, output, piCommand = 'pi', piArgs = null, spawnFn 
 module.exports = { createBridge, toolCallFor, lines, piArgsFor, refusalReason };
 
 if (require.main === module) {
-  createBridge({ input: process.stdin, output: process.stdout,
-    piCommand: process.env.PI_COMMAND || 'pi',
-    // stderr is what the supervisor logs ("agent: …"): why a session ended is worth a line there.
-    onLog: (line) => { try { process.stderr.write(`pi-acp-bridge: ${String(line).slice(0, 2000)}\n`); } catch { /* gone */ } } });
+  // stderr is what the supervisor logs ("agent: …"): why a session ended is worth a line there.
+  const onLog = (line) => { try { process.stderr.write(`pi-acp-bridge: ${String(line).slice(0, 2000)}\n`); } catch { /* gone */ } };
+  const options = { input: process.stdin, output: process.stdout, piCommand: process.env.PI_COMMAND || 'pi', onLog };
+  if (process.env.SANDBOX_BRIDGE_IMPL !== undefined) {
+    // Set by the supervisor (#999); pi never sees it.
+    const { SANDBOX_BRIDGE_IMPL: flag, ...env } = process.env;
+    options.env = env;
+    options.bridgeImpl = require('./sandbox-bridge-wasm.cjs').resolveImpl(flag, onLog);
+  }
+  try {
+    createBridge(options);
+  } catch {
+    const message = options.bridgeImpl === 'rust' ? RUST_FAILED : 'the bridge could not start; closing the session';
+    onLog(message);
+    try { process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32000, message } }) + '\n'); } catch { /* gone */ }
+    process.exitCode = 1;
+  }
 }

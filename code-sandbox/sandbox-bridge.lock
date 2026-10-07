@@ -1,0 +1,12 @@
+# sandbox-bridge.wasm (#999): the Rust/WebAssembly port of the code sandbox bridge's untrusted-input
+# handling (pi-acp-bridge.cjs lines/toolCallFor, supervisor.cjs start line and insideRoot's decision).
+# Built from sbstndalton/noevia-rs at NOEVIA_RS_REF (tarball checksum NOEVIA_RS_SHA256) with
+# tools/build-sandbox-bridge-wasm.sh, reproducible on Linux x86_64 (CI and the image build); the
+# module's bytes must hash to SANDBOX_BRIDGE_WASM_SHA256 or the code-sandbox image build fails and
+# SANDBOX_BRIDGE_IMPL=rust refuses every session and connection. Separate from server/dav-parse.lock:
+# this module ships in the code-sandbox image (build context core/code-sandbox), not the web one.
+# Read by code-sandbox/sandbox-bridge-wasm.cjs, code-sandbox/Dockerfile and noevia-core CI. The ref
+# must be on noevia-rs main before a release pins this core commit.
+NOEVIA_RS_REF=8de8b60a802af1e52b20cd57e7491aa7512205b1
+NOEVIA_RS_SHA256=e612a187003924ec753bb122bdbf50e80c7fe88d5574e80f999d5b7b9d274c3f
+SANDBOX_BRIDGE_WASM_SHA256=16c2930f6780b5e4a992f6b41bdfc7db9a233580ee5f9fa203bf827d3cbfcaed
