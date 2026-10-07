@@ -85,3 +85,15 @@ test('#874 web writes keep only the newest recovery copies of models.ini',async 
  assert.ok(fs.statSync(path.join(dir,'models.ini.noevia-backup-'+'b'.repeat(64))).isDirectory());
  assert.match(fs.readFileSync(file,'utf8'),/c = 14336|ctx-size = 14336/);
 });
+
+test('#1003 commit with backup:false keeps no recovery copy; the default still does',async t=>{
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'native-presets-1003-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+ const file=path.join(dir,'models.ini');fs.writeFileSync(file,'version = 1\n[synthetic]\nmodel = /models/test.gguf\nc = 8192\n');
+ const store=createPresetStore(file);
+ const copies=()=>fs.readdirSync(dir).filter(n=>n.startsWith('models.ini.noevia-backup-'));
+ await store.commit(store.prepare({model:'synthetic',baseRevision:store.get('synthetic').revision,options:{'ctx-size':'4096'}}),{backup:false});
+ assert.deepEqual(copies(),[]);
+ assert.match(fs.readFileSync(file,'utf8'),/4096/);
+ await store.commit(store.prepare({model:'synthetic',baseRevision:store.get('synthetic').revision,options:{'ctx-size':'8192'}}));
+ assert.equal(copies().length,1);
+});

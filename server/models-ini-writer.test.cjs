@@ -288,3 +288,14 @@ test('llama.cpp compose files mount web /llamacpp-config :ro and default to the 
     assert.match(web,/MODEL_LOADER_URL: http:\/\/model-loader:8090/,rel);
   }
 });
+
+test('#1003 an auto-tune write after its run copy sends the skip-backup hint; others do not',async t=>{
+  const {file}=fixture(t),side=fakeSidecar(file);
+  const writer=createModelsIniWriter({mode:'model-loader',url:'http://ml:8090',token:'fixture-token',fetchJson:side.fetchJson});
+  const store=createPresetStore(file,{writer});
+  await store.commit(store.prepare({model:'synthetic',baseRevision:store.get('synthetic').revision,options:{parallel:'2'}}));
+  await store.commit(store.prepare({model:'synthetic',baseRevision:store.get('synthetic').revision,options:{parallel:'3'}}),{backup:false});
+  assert.equal(side.calls[0].body.backup,undefined);
+  assert.equal(side.calls[1].body.backup,false);
+  assert.deepEqual(Object.keys(side.calls[1].body).sort(),['backup','baseRevision','text']);
+});

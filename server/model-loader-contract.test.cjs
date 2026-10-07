@@ -100,7 +100,8 @@ test('every route web calls is served, and the doc marks each caller kind', () =
 test('the documented single-writer contract matches the web client', () => {
   const doc = read('docs', 'spec-model-loader-api-v1.md'), w = read('apps', 'web', 'server', 'models-ini-writer.cjs');
   assert.match(w, /X-Model-Loader-Token/);
-  assert.match(w, /JSON\.stringify\(\{baseRevision,text\}\)/);
+  // #1003: the only optional field is auto-tune's skip-backup hint, sent as backup:false.
+  assert.match(w, /JSON\.stringify\(\{baseRevision,text,\.\.\.\(backup===false\?\{backup:false\}:\{\}\)\}\)/);
   assert.match(w, /,30000\)/, 'PUT /models-ini timeout changed; update section 3 of the doc');
   assert.match(doc, /X-Model-Loader-Token/);
   assert.match(doc, /\| `PUT \/models-ini` \(web `models-ini-writer\.cjs`\) \| 30 s \|/);
