@@ -31,6 +31,9 @@ const { readCappedText } = require('./http.cjs');
 // The PROPFIND listing parser and the XML text helpers it shares with the S3 listing live in
 // dav-listing.cjs (#967: DAV_PARSE_IMPL=js|wasm picks the JS parser or its Rust/WebAssembly port).
 const { decodeXmlEntities, elementTexts, firstElementText, listingEntries } = require('./dav-listing.cjs');
+// The path rules (#978) live in storage-path.cjs; the S3 page scan (#976) in s3-listing.cjs.
+const { safeRelativePath, cleanRoot, joinRoot } = require('./storage-path.cjs');
+const { s3Page } = require('./s3-listing.cjs');
 
 const READ_CAP = 200_000; // matches the project-file upload cap
 const TEXT_BODY_CAP = READ_CAP * 4; // bytes read for a text preview (UTF-8 is at most 4 bytes a char)
@@ -41,28 +44,9 @@ const TEXT_EXTENSIONS = new Set([
   '.ts', '.tsx', '.js', '.jsx', '.py', '.sh', '.html', '.css',
 ]);
 
-function safeRelativePath(raw) {
-  const value = String(raw || '').trim().replace(/\\/g, '/');
-  if (!value || value.length > 500) return '';
-  if (value.startsWith('/')) return '';
-  const segments = value.split('/').filter(Boolean);
-  if (!segments.length) return '';
-  if (segments.some((s) => s === '.' || s === '..')) return '';
-  return segments.join('/');
-}
-
 function extensionOf(name) {
   const dot = name.lastIndexOf('.');
   return dot === -1 ? '' : name.slice(dot).toLowerCase();
-}
-
-function cleanRoot(corpusRoot) {
-  return String(corpusRoot || '').replace(/^\/+|\/+$/g, '');
-}
-
-function joinRoot(corpusRoot, relative) {
-  const root = cleanRoot(corpusRoot);
-  return [root, relative].filter(Boolean).join('/');
 }
 
 // One bounded retry on network-level failures (connection reset, pooled dead
@@ -214,32 +198,13 @@ async function s3List(conn, connectionPath) {
     }));
     if (!response.ok) throw new Error(`storage returned ${response.status}`);
     const { text: body } = await readCappedText(response, LIST_BODY_CAP);
-    // Forward-only scans (elementTexts, #787): a hostile endpoint's body of unclosed tags cannot make
-    // the old lazy regexes rescan the rest of the body from every opening tag (#833).
-    // Keys and prefixes are XML text: decode &amp; and friends back to the real key (#845, as #787 did
-    // for PROPFIND), or "a&b.md" lists as "a&amp;b.md" and 404s on read.
-    for (const block of elementTexts(body, 'CommonPrefixes')) {
-      const raw = firstElementText(block, 'Prefix');
-      if (raw === undefined) continue;
-      const full = decodeXmlEntities(raw).replace(/\/+$/, '');
-      const rel = queryPrefix && full.startsWith(queryPrefix) ? full.slice(queryPrefix.length) : full;
-      if (!rel) continue;
-      entries.push({ name: rel, path: rel, isDir: true, size: null, ext: '' });
+    const page = s3Page(body, queryPrefix);
+    for (const r of page.records) {
+      entries.push(r.isDir ? { name: r.name, path: r.name, isDir: true, size: null, ext: '' }
+        : { name: r.name, path: r.name, isDir: false, size: r.size === null ? null : Number(r.size), ext: extensionOf(r.name) });
     }
-    for (const block of elementTexts(body, 'Contents')) {
-      const raw = firstElementText(block, 'Key');
-      if (raw === undefined) continue;
-      const full = decodeXmlEntities(raw);
-      if (full.endsWith('/')) continue;
-      const rel = queryPrefix && full.startsWith(queryPrefix) ? full.slice(queryPrefix.length) : full;
-      if (!rel || rel.includes('/')) continue; // direct children only
-      const sizeText = firstElementText(block, 'Size');
-      entries.push({ name: rel, path: rel, isDir: false, size: sizeText !== undefined && /^\d+$/.test(sizeText) ? Number(sizeText) : null, ext: extensionOf(rel) });
-    }
-    const truncated = firstElementText(body, 'IsTruncated');
-    const next = firstElementText(body, 'NextContinuationToken');
-    if (String(truncated).trim().toLowerCase() !== 'true' || next === undefined) break;
-    const nextToken = decodeXmlEntities(next);
+    if (!page.truncated || page.next === null) break;
+    const nextToken = page.next;
     if (!nextToken || nextToken === token) break; // a token that never advances would loop to the cap
     token = nextToken;
     more = true;

@@ -72,8 +72,9 @@ jobs:
         working-directory: ws/apps/web/server
       - run: npm run check:boundaries
       # #967: dav-parse.wasm at the noevia-rs ref pinned in server/dav-parse.lock, checksum-verified
-      # (tarball and module), so the differential and DAV_PARSE_IMPL=wasm tests run for real. The
-      # shared fixture table must be byte-identical to noevia-rs's copy.
+      # (tarball and module), so the differential and DAV_PARSE_IMPL=wasm tests run for real; since
+      # #976/#978 the same module carries s3-list-parse and storage-path (S3_PARSE_IMPL,
+      # STORAGE_PATH_IMPL). The shared fixture tables must be byte-identical to noevia-rs's copies.
       - uses: dtolnay/rust-toolchain@70dec6087f2cb6bab9fbac4da23160afbe848e91 # 1.99.0
         with:
           targets: wasm32-unknown-unknown
@@ -97,6 +98,8 @@ jobs:
           echo "$NOEVIA_RS_SHA256  $RUNNER_TEMP/rs.tgz" | sha256sum -c -
           mkdir -p "$RUNNER_TEMP/rs" && tar -xzf "$RUNNER_TEMP/rs.tgz" --strip-components=1 -C "$RUNNER_TEMP/rs"
           cmp "$RUNNER_TEMP/rs/crates/dav-parse/tests/fixtures/dav-listing.v1.json" tests/fixtures/dav-listing.v1.json
+          cmp "$RUNNER_TEMP/rs/crates/s3-list-parse/tests/fixtures/s3-list.v1.json" tests/fixtures/s3-list.v1.json
+          cmp "$RUNNER_TEMP/rs/crates/storage-path/tests/fixtures/storage-path.v1.json" tests/fixtures/storage-path.v1.json
           rustup target add wasm32-unknown-unknown --toolchain 1.99.0
           "$RUNNER_TEMP/rs/tools/build-dav-parse-wasm.sh" "$PWD/server/wasm/dav-parse.wasm"
           echo "$DAV_PARSE_WASM_SHA256  server/wasm/dav-parse.wasm" | sha256sum -c -

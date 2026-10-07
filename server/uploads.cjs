@@ -6,6 +6,7 @@ const documents = require('./documents.cjs');
 const docx = require('./docx.cjs');
 const sources = require('./document-sources.cjs');
 const storage = require('./storage-client.cjs');
+const storagePath = require('./storage-path.cjs');
 const CAP = 25 * 1024 * 1024;
 const GROUPS = ['Documents', 'Images', 'Text', 'Other'];
 const images = { '.png':'image/png', '.jpg':'image/jpeg', '.jpeg':'image/jpeg', '.webp':'image/webp', '.gif':'image/gif' };
@@ -17,7 +18,7 @@ function classify(name) {
   return storage.TEXT_EXTENSIONS.has(ext) ? 'Text' : 'Other';
 }
 function validate(name, bytes) {
-  if (!name || name.length > 200 || /[\/\\\x00-\x1f]/.test(name) || name === '.' || name === '..') throw Object.assign(new Error('Use a plain filename of at most 200 characters.'), { status: 400 });
+  if (!storagePath.isPlainFilename(name)) throw Object.assign(new Error('Use a plain filename of at most 200 characters.'), { status: 400 });
   if (!bytes.length || bytes.length > CAP) throw Object.assign(new Error('Files must be non-empty and no larger than 25 MB.'), { status: bytes.length ? 413 : 400 });
   const ext = path.extname(name).toLowerCase();
   // Office/OpenDocument files are containers internally, but are documents, not archive bundles.
