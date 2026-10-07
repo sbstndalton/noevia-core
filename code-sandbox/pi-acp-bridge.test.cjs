@@ -153,6 +153,16 @@ test('an outside-the-workspace read from the gate goes to noevia as an ask that 
   assert.equal(c.standable, false);
 });
 
+test('toolCallFor: a tool named after an Object.prototype property gets kind other, never a prototype value (#1000)', () => {
+  const { toolCallFor } = require('./pi-acp-bridge.cjs');
+  for (const toolName of ['constructor', 'toString', 'hasOwnProperty', 'valueOf', 'isPrototypeOf', '__proto__', '__lookupGetter__']) {
+    const call = toolCallFor({ toolCallId: 'p', toolName, input: {} });
+    assert.equal(call.kind, 'other', toolName);
+    assert.equal(JSON.parse(JSON.stringify(call)).kind, 'other', toolName);
+  }
+  assert.equal(toolCallFor({ toolName: 'grep', input: {} }).kind, 'search');
+});
+
 test('noevia’s reason for a refusal reaches the pi gate as its block reason (#704); a plain Decline has none', async () => {
   const child = fakePi();
   const { send, out } = harness({ spawnFn: () => child, askTimeoutMs: 1000 });

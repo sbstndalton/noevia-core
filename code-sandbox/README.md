@@ -172,8 +172,6 @@ CI compares the two, rebuilds the module at the pinned ref, and runs
 `sandbox-bridge-wasm.test.cjs` against it (fixtures, seeded random input, live bridge and
 supervisor sessions, and failure cases).
 
-Two differences from JS are known, and neither shows on the wire:
+One difference from JS is known:
 
-- For a tool named after an `Object.prototype` method (`toString`, `constructor` and so on), JS's
-  in-process `kind` is that function and Rust's is absent. `JSON.stringify` drops both.
 - `String()` of arrays nested more than 1,000 levels deep fails closed. V8 throws at about 5,000.
