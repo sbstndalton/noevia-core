@@ -806,7 +806,9 @@ const { handleChat } = require('./chat.cjs').createChatHandler({
   // router role through the decision service (cloud forbidden), failing closed to "ask".
   routingModes: {
     enabled: () => features.enabled('routingModes'),
-    settings: () => { const rm = require('./routing-modes.cjs'); const s = rm.read(currentWorkspace().dir); return { ...s, mode: rm.effectiveMode(s, rm.allowedModes(require('./features.cjs').settingsStore(authService.db))) }; },
+    // #1007: a chat's or project's own override (project.routingMode) replaces the mode and the
+    // sensitive handling; an administrator's allowed list still applies to the result.
+    settings: (project) => { const rm = require('./routing-modes.cjs'); const s = rm.withProjectOverride(rm.read(currentWorkspace().dir), project); return { ...s, mode: rm.effectiveMode(s, rm.allowedModes(require('./features.cjs').settingsStore(authService.db))) }; },
     sensitivity: require('./routing-modes.cjs').createSensitivity({
       deadlineMs: () => decisionSettings.get().timeoutMs,
       log: (entry) => recordDecision('sensitivity', entry),
@@ -1031,7 +1033,7 @@ async function handleRequestScoped(req, res) {
 
     if (await chatListRoutes(req, res, { path: p, authn })) return;
 
-    if (await providerRoutes(req, res, { path: p, authn })) return;
+    if (await providerRoutes(req, res, { path: p, authn, url })) return;
 
     if (authn && await usageRoutes(req, res, { path: p, authn })) return;
     if (await reasoningSettingsRoutes(req, res, { path: p, authn, url })) return;

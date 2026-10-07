@@ -90,6 +90,26 @@ function effectiveMode(settings, allowed) {
   return allowed.includes(settings.mode) ? settings.mode : 'local';
 }
 
+// ── Per chat / project (#1007) ─────────────────────────────────────────────
+// A project (or a free chat's own context project) may override the account's mode and sensitive
+// handling. The cloud provider and models stay the account's. Absent means "as the account".
+
+/** A project's stored override, or null. Throws { status: 400 } when `strict` and it is malformed. */
+function projectOverride(raw, strict = false) {
+  if (raw === undefined || raw === null) return null;
+  const bad = (m) => { if (strict) throw Object.assign(Error(m), { status: 400 }); return null; };
+  if (typeof raw !== 'object' || Array.isArray(raw)) return bad('routingMode must be an object or null');
+  if (!MODES.includes(raw.mode)) return bad("routingMode.mode must be 'local', 'cloud' or 'hybrid'");
+  if (raw.whenSensitive !== undefined && !WHEN_SENSITIVE.includes(raw.whenSensitive)) return bad("routingMode.whenSensitive must be 'ask' or 'local'");
+  return { mode: raw.mode, whenSensitive: raw.whenSensitive || 'ask' };
+}
+
+/** The account settings with a project's override applied; effectiveMode still applies after. */
+function withProjectOverride(settings, project) {
+  const o = projectOverride(project && project.routingMode);
+  return o ? { ...settings, mode: o.mode, whenSensitive: o.whenSensitive } : settings;
+}
+
 // ── Deterministic pre-rules ─────────────────────────────────────────────────
 
 function ibanValid(raw) {
@@ -370,4 +390,4 @@ function cloudModel(cloud, role) {
 }
 
 module.exports = { MODES, WHEN_SENSITIVE, OPTIONS, FILE, ALLOWED_KEY, normalize, read, write, validate, allowedModes, setAllowedModes,
-  effectiveMode, preRule, hasDiaryContent, routerChunks, chunkCharsFor, ROUTER_CHUNK_CHARS, ROUTER_MAX_CHUNKS, routerMaxChunks, createSensitivity, resolveRoute, chatFlags, cloudModel, ibanValid, luhn };
+  effectiveMode, projectOverride, withProjectOverride, preRule, hasDiaryContent, routerChunks, chunkCharsFor, ROUTER_CHUNK_CHARS, ROUTER_MAX_CHUNKS, routerMaxChunks, createSensitivity, resolveRoute, chatFlags, cloudModel, ibanValid, luhn };

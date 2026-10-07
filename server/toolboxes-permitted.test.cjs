@@ -112,3 +112,14 @@ test('the TTL cache expires and evicts', () => {
   assert.equal(cache.get('a'), undefined);
   assert.equal(cache.get('c'), 3);
 });
+
+test('#1006: Tools Automatic uses the default set; Manual (or no mode) the project list', () => {
+  const { projectToolboxIds, selectedToolboxIds } = require('./toolboxes-permitted.cjs');
+  const defaults = ['core'];
+  assert.deepEqual(projectToolboxIds({ toolsMode: 'auto', toolboxes: ['core', 'web', 'storage'] }, defaults), ['core']);
+  assert.deepEqual(projectToolboxIds({ toolsMode: 'manual', toolboxes: ['web'] }, defaults), ['web']);
+  assert.deepEqual(projectToolboxIds({ toolboxes: [] }, defaults), [], 'an empty hand-picked list is honoured');
+  assert.deepEqual(projectToolboxIds({}, defaults), ['core']);
+  assert.deepEqual(projectToolboxIds(null, defaults), ['core']);
+  assert.deepEqual(selectedToolboxIds({ project: { toolsMode: 'auto', toolboxes: ['web'] }, defaultToolboxes: defaults, connectorBoxes: new Set(['gdrive']), connected: ['gdrive'] }), ['core', 'gdrive']);
+});
