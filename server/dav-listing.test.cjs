@@ -127,3 +127,21 @@ test('wasm path: same listing, and refusals fail closed', { skip: !haveWasm && !
     // A refusal does not poison the module: the next listing still parses.
     assert.deepEqual(davListing.listingEntries(BODY, T), EXPECTED);
   }));
+
+// #969-#971: hostile entries are skipped (never rewritten, never failing the listing).
+test('listingRecordsJs skips foreign origins, dot segments, controls, backslashes and bidi controls', () => {
+  const r = (h) => `<d:response><d:href>${h}</d:href></d:response>`;
+  const names = (hrefs) => davListing.listingRecordsJs(hrefs.map(r).join(''), T).map((e) => e.name);
+  // #969
+  assert.deepEqual(names([`https://evil.example.test${DIR}/x.md`, `https://dav.example.test:8443${DIR}/p.md`, `http://dav.example.test${DIR}/h.md`,
+    `//evil.example.test${DIR}/pr.md`, `https://dav.example.test@evil.example.test${DIR}/ui.md`, `file://${DIR}/f.md`]), []);
+  assert.deepEqual(names([`https://dav.example.test${DIR}/same.md`, `https://DAV.example.test:443${DIR}/port.md`, 'rel.md', `${DIR}/abs-path.md`]),
+    ['same.md', 'port.md', 'rel.md', 'abs-path.md']);
+  // #970
+  assert.deepEqual(names([`${DIR}/..%2f`, `${DIR}/%2e%2e`, `${DIR}/.%2F`, `${DIR}/..%5c`, `${DIR}/a%5Cb`, `${DIR}/...`]), ['...']);
+  // #971
+  const bidi = [0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069, 0x200e, 0x200f, 0x061c];
+  assert.deepEqual(names([`${DIR}/a%00`, `${DIR}/%7F`, `${DIR}/%1B`, `${DIR}/%C2%85`, `${DIR}/%C2%9F`, ...bidi.map((c) => `${DIR}/x${encodeURIComponent(String.fromCodePoint(c))}`), `${DIR}/ok%C2%A0.md`]), ['ok .md']);
+  for (const c of bidi) assert.equal(davListing.isListableName(`a${String.fromCodePoint(c)}`), false);
+  assert.equal(davListing.isListableName('​'), true); // zero-width space is not a bidi control; the UI isolates names
+});
