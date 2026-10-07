@@ -43,7 +43,9 @@ const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 // Nothing falls back to the JS. Differences, all refusals under wasm: a body over 8 Mi UTF-16
 // units, including from the uncapped res.text() fallback, throws the readBodyCapped limit error;
 // a schema whose JSON is over 2 Mi units, or that is not a JSON tree (a cycle, undefined, a
-// function, a class instance; tools/list never yields one), fails closed. For a plain body
+// function, a class instance; tools/list never yields one), fails closed. A schema nested so deep
+// that the runtime's JSON.stringify overflows (Node 22) makes the JS drop it with a RangeError but
+// resolves under wasm; listTools stringifies each tool first, so none reaches convertTool. For a plain body
 // JSON.parse rejects, the SyntaxError is the runtime's own (from JSON.parse on the refused text).
 const PUBLIC_FAILURE = 'MCP response could not be checked';
 const FRAME_IMPLS = new Set(['js', 'wasm']);
