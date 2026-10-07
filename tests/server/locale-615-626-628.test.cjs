@@ -85,7 +85,8 @@ test('#615 a third party’s box keeps the name and description it sent, even un
 
 test('#615 the composer, popup and catalogue read the server’s inApp flag through toolboxCopy', () => {
   assert.match(read('src/types.ts'), /inApp\?: boolean/);
-  for (const file of ['ComposerActions', 'ToolCatalogue', 'ModelPopup']) assert.match(read(`src/components/${file}.tsx`), /toolboxCopy\(t, /, file);
+  // #1006: the model dialog no longer lists toolsets; the composer's + menu does.
+  for (const file of ['ComposerActions', 'ToolCatalogue']) assert.match(read(`src/components/${file}.tsx`), /toolboxCopy\(t, /, file);
   // Spread first, so the flag reaches toolboxCopy from the server's summary.
   assert.match(read('src/components/ToolCatalogue.tsx'), /toolboxCopy\(t, box\)/);
 });

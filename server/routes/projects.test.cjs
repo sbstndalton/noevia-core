@@ -457,3 +457,26 @@ test('#796: saving a project\'s toolbox selection clears the cached permitted-to
   assert.equal(cleared, 1);
   assert.deepEqual(f.projects[0].toolboxes, ['core', 'web']);
 });
+
+test('#1007/#1006: a project keeps its own routing mode and tools mode; null goes back to the account', async () => {
+  const f = fixture({ projects: [{ id: 'p1', files: [], toolboxes: ['core', 'web'] }] });
+  for (const [body, error] of [
+    [{ routingMode: 'cloud' }, 'routingMode must be an object or null'],
+    [{ routingMode: { mode: 'everywhere' } }, "routingMode.mode must be 'local', 'cloud' or 'hybrid'"],
+    [{ routingMode: { mode: 'hybrid', whenSensitive: 'never' } }, "routingMode.whenSensitive must be 'ask' or 'local'"],
+    [{ toolsMode: 'sometimes' }, "toolsMode must be 'auto' or 'manual'"],
+  ]) {
+    await f.call('POST', '/api/projects/p1/config', body);
+    assert.deepEqual(f.sent.pop(), { status: 400, body: { error } });
+  }
+  assert.equal(f.store.saves, 0, 'a refused patch saves nothing');
+  await f.call('POST', '/api/projects/p1/config', { routingMode: { mode: 'hybrid', whenSensitive: 'local', extra: 1 }, toolsMode: 'auto' });
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true } });
+  assert.deepEqual(f.projects[0].routingMode, { mode: 'hybrid', whenSensitive: 'local' });
+  assert.equal(f.projects[0].toolsMode, 'auto');
+  assert.deepEqual(f.projects[0].toolboxes, ['core', 'web'], 'the hand-picked list is kept for Manual');
+  await f.call('POST', '/api/projects/p1/config', { routingMode: null, toolsMode: 'manual' });
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true } });
+  assert.equal(Object.hasOwn(f.projects[0], 'routingMode'), false);
+  assert.equal(f.projects[0].toolsMode, 'manual');
+});

@@ -112,3 +112,24 @@ test('the TTL cache expires and evicts', () => {
   assert.equal(cache.get('a'), undefined);
   assert.equal(cache.get('c'), 3);
 });
+
+test('#1006: Tools Automatic uses the default set; Manual (or no mode) the project list', () => {
+  const { projectToolboxIds, selectedToolboxIds } = require('./toolboxes-permitted.cjs');
+  const defaults = ['core'];
+  assert.deepEqual(projectToolboxIds({ toolsMode: 'auto', toolboxes: ['core', 'web', 'storage'] }, defaults), ['core']);
+  assert.deepEqual(projectToolboxIds({ toolsMode: 'manual', toolboxes: ['web'] }, defaults), ['web']);
+  assert.deepEqual(projectToolboxIds({ toolboxes: [] }, defaults), [], 'an empty hand-picked list is honoured');
+  assert.deepEqual(projectToolboxIds({}, defaults), ['core']);
+  assert.deepEqual(projectToolboxIds(null, defaults), ['core']);
+  assert.deepEqual(selectedToolboxIds({ project: { toolsMode: 'auto', toolboxes: ['web'] }, defaultToolboxes: defaults, connectorBoxes: new Set(['gdrive']), connected: ['gdrive'] }), ['core', 'gdrive']);
+});
+
+test('#1006 review: an Automatic project keeps the Project documents box its first upload added', () => {
+  const { projectToolboxIds } = require('./toolboxes-permitted.cjs');
+  const { applyProjectDocsDefault, BOX } = require('./project-docs-default.cjs');
+  const project = { id: 'proj-syn', toolsMode: 'auto', files: [{ name: 'synthetic.txt', content: 'x' }] };
+  assert.equal(applyProjectDocsDefault(project, { offered: () => true, defaults: ['core'], hadUploads: false }), true);
+  assert.deepEqual(projectToolboxIds(project, ['core']), ['core', BOX]);
+  assert.deepEqual(projectToolboxIds({ toolsMode: 'auto', toolboxes: ['core', BOX] }, ['core']), ['core'], 'only when the upload default added it');
+  assert.deepEqual(projectToolboxIds({ toolsMode: 'auto', toolboxes: ['web'], docsToolboxDefaulted: true }, ['core']), ['core']);
+});

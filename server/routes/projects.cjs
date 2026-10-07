@@ -288,6 +288,20 @@ function createProjectRoutes({
         project.routingChosen = true;
         if (patch.routing === 'auto') ensureRolesLoaded(); // no-op if unconfigured
       }
+      let clearRoutingMode = false;
+      // #1007: this chat's or project's own routing mode; null goes back to the account's.
+      if (patch.routingMode !== undefined) {
+        let next;
+        try { next = require('../routing-modes.cjs').projectOverride(patch.routingMode, true); } catch (e) { return json(res, 400, { error: e.message }); }
+        if (next) project.routingMode = next; else { delete project.routingMode; clearRoutingMode = true; }
+      }
+      // #1006: tools picked automatically (the default set, narrowed per message when tool routing
+      // is on) or by hand from `toolboxes`. The hand-picked list is kept either way.
+      if (patch.toolsMode !== undefined) {
+        if (patch.toolsMode !== 'auto' && patch.toolsMode !== 'manual') return json(res, 400, { error: "toolsMode must be 'auto' or 'manual'" });
+        project.toolsMode = patch.toolsMode;
+        onToolboxesChange();
+      }
       if (typeof patch.provider === 'string' && patch.provider) {
         // getProvider also resolves unknown IDs to the default for chat. An explicit
         // selection must match its registered ID (or the legacy lemonade alias).
@@ -354,6 +368,7 @@ function createProjectRoutes({
       project.updatedAt = Date.now();
       Object.assign(storedProject, project);
       if (clearSampling) delete storedProject.sampling;
+      if (clearRoutingMode) delete storedProject.routingMode;
       saveProjects(PROJECTS);
       pruneDocuments(storedProject);
       return json(res, 200, { ok: true });

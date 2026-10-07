@@ -244,7 +244,7 @@ function createToolboxes({
     // upgrading does not silently disarm existing projects. An empty ARRAY is a
     // deliberate choice — the operator unticked every box — and must be honoured,
     // or the UI checkbox would lie about what it does.
-    const wanted = Array.isArray(project && project.toolboxes) ? project.toolboxes : DEFAULT_TOOLBOXES;
+    const wanted = require('./toolboxes-permitted.cjs').projectToolboxIds(project, DEFAULT_TOOLBOXES);
     const available = allToolboxes();
     const boxes = [];
     const candidates = [];

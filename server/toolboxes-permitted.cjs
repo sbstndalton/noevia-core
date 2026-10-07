@@ -47,6 +47,21 @@ const REASONS = {
  * @param {boolean} input.harnessEnabled
  * @param {string[]} [input.repositories]
  */
+/** A project's own toolbox list. Tools: Automatic (#1006, toolsMode 'auto') is the operator
+ *  default, which tool routing then narrows per message; Manual (or no mode, as before) is the
+ *  hand-picked list, falling back to the default for a project predating toolboxes. Never more
+ *  than one of those two lists, so Automatic cannot add a write the default does not offer. */
+function projectToolboxIds(project, defaultToolboxes) {
+  if (project && project.toolsMode === 'auto') {
+    // The Project documents box (read-only) that project-docs-default.cjs added on the first upload
+    // stays in Automatic too, or an Automatic project could not read its own uploads.
+    const docs = require('./project-docs-default.cjs').BOX;
+    const keepDocs = project.docsToolboxDefaulted === true && Array.isArray(project.toolboxes) && project.toolboxes.includes(docs) && !defaultToolboxes.includes(docs);
+    return keepDocs ? [...defaultToolboxes, docs] : [...defaultToolboxes];
+  }
+  return Array.isArray(project && project.toolboxes) ? project.toolboxes : defaultToolboxes;
+}
+
 /** The toolbox ids one request will actually carry: the project's own list (or the operator
  *  default, for a project-less chat) with any connector id stripped, unioned with this account's
  *  actually-connected connectors. Every reader of "what tools are enabled" — the chat loop itself,
@@ -54,7 +69,7 @@ const REASONS = {
  *  or one of them under-reports what the next message really sends. */
 function selectedToolboxIds({ project, defaultToolboxes, connectorBoxes, connected }) {
   return [
-    ...(Array.isArray(project && project.toolboxes) ? project.toolboxes : defaultToolboxes).filter((id) => !connectorBoxes.has(id)),
+    ...projectToolboxIds(project, defaultToolboxes).filter((id) => !connectorBoxes.has(id)),
     ...connected,
   ];
 }
@@ -138,4 +153,4 @@ function createTtlCache({ ttlMs = 30000, now = Date.now, max = 500 } = {}) {
   };
 }
 
-module.exports = { REASONS, computePermittedTools, createTtlCache, CODE_BOX_ID, selectedToolboxIds };
+module.exports = { projectToolboxIds, REASONS, computePermittedTools, createTtlCache, CODE_BOX_ID, selectedToolboxIds };

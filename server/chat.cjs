@@ -581,7 +581,7 @@ function createChatHandler({
     let routeTarget = null;
     if (wantsAuto && routingModes && routingModes.enabled() === true) {
       const rm = require('./routing-modes.cjs');
-      const settings = routingModes.settings();
+      const settings = routingModes.settings(project);
       if (settings && settings.mode) {
         const listProjectId = body.projectId && project ? project.id : null;
         const flags = rm.chatFlags({ chatId, list: listProjectId ? getProject(listProjectId)?.chats : freeChats() });

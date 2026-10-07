@@ -52,7 +52,7 @@ function inspect(file, project = {}) {
   const selection = project.instructionSkills?.[file.name];
   result.status = !result.valid ? 'invalid' : !selection?.reviewedHash ? 'review' :
     selection.reviewedHash !== result.hash ? 'updated' : selection.enabled ? 'enabled' : 'disabled';
-  result.missingTools = result.requires.filter(id => !(project.toolboxes || ['core']).includes(id));
+  result.missingTools = result.requires.filter(id => !require('./toolboxes-permitted.cjs').projectToolboxIds(project, ['core']).includes(id));
   return result;
 }
 
@@ -79,7 +79,7 @@ function manifests(project, knownToolboxes = []) {
     const origin = file?.skillOrigin?.kind === 'published' && file.skillOrigin.digest === skill.hash
       ? file.skillOrigin : { kind: file?.source && file.source !== project.projectFolder ? 'attached-folder' : 'project-file' };
     const unsupportedToolboxes = skill.requires.filter(id => !known.has(id));
-    const unselectedToolboxes = skill.requires.filter(id => known.has(id) && !(project.toolboxes || ['core']).includes(id));
+    const unselectedToolboxes = skill.requires.filter(id => known.has(id) && !require('./toolboxes-permitted.cjs').projectToolboxIds(project, ['core']).includes(id));
     const bundled = assets(project, skill.file);
     const scripts = bundled.filter(a => a.executable).map(a => a.file);
     return {

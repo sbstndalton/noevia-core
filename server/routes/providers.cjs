@@ -5,6 +5,8 @@
 //   POST   /api/providers/test   probe an endpoint's /v1/models before saving it
 //   PUT    /api/providers/:id    edit one in place (#535); projects on it keep their provider/model
 //   DELETE /api/providers/:id    remove one; projects on it fall back to the default
+//   GET    /api/providers/:id/models[?refresh=1]  that provider's model ids (#1009), fetched with
+//                                the stored credential and cached per account for MODEL_LIST_TTL_MS
 //
 // Sign in with ChatGPT (#447, chatgpt-oauth.cjs), only while features.chatgptOAuth is on (404 off):
 //   GET    /api/providers/chatgpt              this account's connection: state + masked account
@@ -19,6 +21,21 @@
 // The SSRF guard (endpointApproved) is the same policy the storage routes apply.
 
 const PASS = Symbol('unhandled');
+const MODEL_LIST_TTL_MS = 10 * 60 * 1000;
+const MODEL_LIST_MAX = 200;
+const MODEL_REFRESH_GAP_MS = 10 * 1000;
+
+/** The model ids in an OpenAI-compatible /v1/models answer (untrusted remote JSON). */
+function modelIdsFrom(body, max = MODEL_LIST_MAX) {
+  const rows = Array.isArray(body?.data) ? body.data : [];
+  const ids = [];
+  for (const m of rows) {
+    const id = m && typeof m.id === 'string' ? m.id.trim() : '';
+    if (id && id.length <= 200 && !/[\u0000-\u001f\u007f]/.test(id) && !ids.includes(id)) ids.push(id);
+    if (ids.length >= max) break;
+  }
+  return ids;
+}
 
 /**
  * @param {object} deps
@@ -37,7 +54,7 @@ const PASS = Symbol('unhandled');
  * @param {object|null} [deps.chatgptOAuth]   chatgpt-oauth.cjs; null leaves Sign in with ChatGPT out entirely
  * @param {() => boolean} [deps.chatgptEnabled]   features.enabled('chatgptOAuth')
  */
-function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApproved, PROVIDERS, PROJECTS, DEFAULT_PROVIDER_ID, modelManager, currentWorkspace, saveProjects, registry, chatgptOAuth = null, chatgptEnabled = () => false }) {
+function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApproved, PROVIDERS, PROJECTS, DEFAULT_PROVIDER_ID, modelManager, currentWorkspace, saveProjects, registry, chatgptOAuth = null, chatgptEnabled = () => false, now = () => Date.now() }) {
   const { saveProviders, saveSharedProviders, maskKey } = registry;
   const { parseContextTokens, validContextTokens, parseCapabilities, effectiveCapabilities } = require('../providers.cjs');
   const chatgpt = require('../chatgpt-oauth.cjs');
@@ -98,6 +115,61 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
     return json(res, 405, { error: 'method not allowed' });
   }
 
+  // #1009: a stored provider's model list for the routing pickers. Keyed by account, provider id and
+  // the address and key it was fetched with, so an edit or another account never reads a stale or
+  // foreign list. The key is used server-side only and never returned.
+  const modelLists = new Map();
+  const inflight = new Map();
+  const lastRefresh = new Map();
+  async function providerModels(req, res, id, authn, url) {
+    const userId = authn?.user?.id;
+    if (!userId) return json(res, 401, { error: 'Sign in first.' });
+    if (id === DEFAULT_PROVIDER_ID || id === 'lemonade') return json(res, 400, { error: 'the default provider lists its models under Settings → Models' });
+    const row = Array.from(PROVIDERS).find((pr) => pr.id === id);
+    if (!row) return json(res, 404, { error: 'no such provider' });
+    const refresh = url?.searchParams?.get('refresh') === '1';
+    if (chatgpt.isChatGptProvider(row)) {
+      if (!chatgptOn() || row.shared) return json(res, 404, { error: 'Sign in with ChatGPT is turned off on this server.' });
+      try { return json(res, 200, { models: await chatgptOAuth.listModels(userId), cached: false }); }
+      catch (e) { return json(res, 502, { error: e.status ? e.message : 'ChatGPT did not list its models.' }); }
+    }
+    if (!/^https?:\/\//.test(String(row.baseUrl || ''))) return json(res, 400, { error: 'this provider has no address' });
+    // A member's own row passed this guard when it was saved; checking again keeps a later policy
+    // change in force. Shared rows are an administrator's and are used for chat as they are.
+    if (!row.shared && !endpointApproved(authn, row.baseUrl)) return json(res, 400, { error: 'Provider origin is not approved for member connections; contact an administrator.' });
+    const key = JSON.stringify([userId, row.id, row.baseUrl, hasRealKey(row.apiKey) ? row.apiKey : '']);
+    const owner = JSON.stringify([userId, row.id]);
+    const hit = modelLists.get(key);
+    // A refresh within MODEL_REFRESH_GAP_MS of the last one for this account and provider is served
+    // from the cache, so a held-down Refresh button cannot hammer the provider with the stored key.
+    const throttled = refresh && hit && now() - (lastRefresh.get(owner) || 0) < MODEL_REFRESH_GAP_MS;
+    if ((!refresh || throttled) && hit && hit.until > now()) return json(res, 200, { models: hit.models, cached: true, fetchedAt: hit.fetchedAt, ...(throttled ? { throttled: true } : {}) });
+    if (refresh) lastRefresh.set(owner, now());
+    // Concurrent requests for the same list share one upstream fetch.
+    let pending = inflight.get(key);
+    if (!pending) {
+      const headers = { 'Content-Type': 'application/json' };
+      if (hasRealKey(row.apiKey)) headers.Authorization = `Bearer ${row.apiKey}`;
+      pending = (async () => {
+        const result = await fetchJson(`${row.baseUrl.replace(/\/v1$/, '')}/v1/models`, { headers, redirect: 'error' }, 8000);
+        if (!result.ok) return { status: result.status };
+        const models = modelIdsFrom(result.body);
+        const fetchedAt = now();
+        for (const k of modelLists.keys()) { const [u, id] = JSON.parse(k); if (u === userId && id === row.id) modelLists.delete(k); }
+        modelLists.set(key, { models, until: fetchedAt + MODEL_LIST_TTL_MS, fetchedAt });
+        while (modelLists.size > 500) modelLists.delete(modelLists.keys().next().value);
+        while (lastRefresh.size > 500) lastRefresh.delete(lastRefresh.keys().next().value);
+        return { models, fetchedAt };
+      })().finally(() => inflight.delete(key));
+      inflight.set(key, pending);
+    }
+    try {
+      const out = await pending;
+      if (out.status) return json(res, 502, { error: `provider returned ${out.status}` });
+      return json(res, 200, { models: out.models, cached: false, fetchedAt: out.fetchedAt });
+    } catch { return json(res, 502, { error: 'The provider could not be reached.' }); }
+  }
+
   // One provider as the client sees it: never the plaintext key.
   function listRow(pr, authn) {
     const contextTokens = validContextTokens(pr.contextTokens);
@@ -136,7 +208,14 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
     return null;
   }
 
-  async function handle(req, res, { path: p, authn }) {
+  async function handle(req, res, { path: p, authn, url }) {
+    const listMatch = p.match(/^\/api\/providers\/([^/]+)\/models$/);
+    if (listMatch && listMatch[1] !== 'chatgpt') {
+      if (req.method !== 'GET') return json(res, 405, { error: 'method not allowed' });
+      let id;
+      try { id = decodeURIComponent(listMatch[1]); } catch { return json(res, 400, { error: 'no such provider' }); }
+      return providerModels(req, res, id, authn, url);
+    }
     if (p === '/api/providers/chatgpt' || p.startsWith('/api/providers/chatgpt/')) return handleChatGpt(req, res, p, authn);
     // ── Provider registry (step 9): list / connect / remove. GET never returns
     // a saved apiKey in plaintext — masked, e.g. sk-…last4.
@@ -203,7 +282,7 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
         // redirect:'error' — same rationale as the storage client: a member-
         // registered endpoint must not bounce the request inward.
         const result = await fetchJson(`${baseUrl.replace(/\/v1$/, '')}/v1/models`, { headers, redirect: 'error' }, 8000);
-        const models = Array.isArray(result.body?.data) ? result.body.data.map(m => m.id).filter(Boolean).slice(0, 100) : [];
+        const models = modelIdsFrom(result.body, 100);
         return json(res, result.ok ? 200 : 502, result.ok ? { ok: true, models } : { error: `provider returned ${result.status}` });
       } catch (e) { return json(res, 502, { error: e.message }); }
     }
@@ -288,4 +367,4 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
   };
 }
 
-module.exports = { createProviderRoutes };
+module.exports = { createProviderRoutes, modelIdsFrom, MODEL_LIST_TTL_MS, MODEL_REFRESH_GAP_MS };

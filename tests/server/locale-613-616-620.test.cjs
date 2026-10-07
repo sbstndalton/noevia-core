@@ -167,7 +167,8 @@ test('#615 the chat message controls, offline banner, scope line and tools menu 
     'What noevia gave the model', 'Using: {m', 'Skill: {m', 'aria-label="Edit']) assert.ok(!chat.includes(english), `ChatView still hard-codes ${english}`);
   for (const key of ['chat.edit.save', 'chat.edit.note', 'chat.edit.title', 'chat.edit.aria', 'chat.edit.inputAria', 'chat.offline.text', 'chat.offline.check', 'chat.scope.title', 'chat.scope.using', 'chat.scope.skill'])
     assert.ok(chat.includes(`'${key}'`), `ChatView uses ${key}`);
-  for (const file of ['ComposerActions', 'ToolCatalogue', 'ModelPopup'])
+  // #1006: the model dialog no longer lists toolsets; the composer's + menu does.
+  for (const file of ['ComposerActions', 'ToolCatalogue'])
     assert.match(fs.readFileSync(path.join(SRC, `components/${file}.tsx`), 'utf8'), /toolboxCopy\(t, /, `${file} words toolsets from the catalogue`);
   // The offline sentence keeps the Settings link where the language puts it.
   for (const locale of ['de-DE', 'fr-FR', 'en-GB']) assert.match(core.translate(locale, 'chat.offline.check', { settings: '@@' }), /@@/);

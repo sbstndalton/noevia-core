@@ -522,3 +522,15 @@ test('linked brain context stays local: dropped on a cloud route and from the ro
   const system = local.upstream[0].body.messages.find((m) => m.role === 'system').content;
   assert.ok(system.includes(CONTEXT_INTRO) && system.includes('Synthetic linked summary marker.'), 'a local route keeps it');
 });
+
+test('#1007: a project override replaces mode and sensitive handling, keeps the account cloud, and stays under the allowed list', () => {
+  const rm = require('./routing-modes.cjs');
+  const account = { mode: 'local', whenSensitive: 'ask', cloud: { providerId: 'prov-1', fast: 'f', smart: 's', code: '' } };
+  assert.equal(rm.withProjectOverride(account, null), account);
+  assert.equal(rm.withProjectOverride(account, { routingMode: { mode: 'bogus' } }), account, 'a malformed stored override is ignored');
+  const merged = rm.withProjectOverride(account, { routingMode: { mode: 'hybrid', whenSensitive: 'local' } });
+  assert.deepEqual(merged, { mode: 'hybrid', whenSensitive: 'local', cloud: account.cloud });
+  assert.equal(rm.effectiveMode(merged, ['local']), 'local', 'a disallowed project mode falls back to local');
+  assert.deepEqual(rm.projectOverride({ mode: 'cloud' }), { mode: 'cloud', whenSensitive: 'ask' });
+  assert.throws(() => rm.projectOverride([], true), /object or null/);
+});
