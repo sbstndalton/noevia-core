@@ -9,8 +9,32 @@
 //                         ciphertext copied from another account fails.
 // encrypt() always encrypts its input: a caller-supplied string that merely
 // looks like a ciphertext is treated as plaintext, never stored verbatim.
+//
+// `secret-envelope` (sbstndalton/noevia-rs, in the dav-parse.wasm module pinned by
+// server/dav-parse.lock) is the Rust port. SECRET_ENVELOPE_IMPL=js|wasm picks one (default js; any
+// other value means js, with one warning). Both read and write the same formats, so switching
+// needs no migration and every existing v1/v2 value opens either way; a value written by one opens
+// in the other.
+//
+// `wasm` FAILS CLOSED: a missing or tampered module, a trap or an unexpected reply throws; nothing
+// falls back to the JS code and nothing is re-encrypted on a failure. A value that cannot be opened
+// throws 'credential could not be opened' (a v2 value without a user keeps the JS message
+// 'credential is bound to an account'); a seal failure throws 'credential could not be sealed'.
+// Only the failure reason is logged (module failures only), never a key, plaintext or ciphertext.
+//
+// What crosses: the key bytes (current, and previous when configured), String(userId) when the
+// value is bound, and the value as UTF-16 units (so Node's lenient base64url reading of odd text is
+// reproduced exactly); for a seal, the key, a 12-byte nonce from crypto.randomBytes (the module has
+// no RNG and imports nothing) and the UTF-8 plaintext. The module wipes its input, and
+// dav-parse-wasm.cjs zeroes the whole linear memory and drops the instance after every secret call.
+// The plaintext copies made here are zeroed after use; the key Buffers belong to secrets.cjs.
+//
+// Differences (wasm refuses, js would try): values over 12 Mi UTF-16 units, plaintext over 8 MiB,
+// user ids over 64 KiB, and an envelope whose tag is shorter than 16 bytes (Node checks a
+// truncated tag; it never writes one).
 
 const crypto = require('crypto');
+const davParseWasm = require('./dav-parse-wasm.cjs');
 
 const aadFor = (userId) => Buffer.from(`noevia:user:${userId}`, 'utf8');
 const hasUser = (userId) => userId !== undefined && userId !== null && userId !== '';
@@ -45,4 +69,63 @@ function openJs(key, previousKey, value, userId) {
   return { plain: decryptWithJs(previousKey, text, version, userId), keyUsed: 'previous' };
 }
 
-module.exports = { aadFor, hasUser, versionOf, encryptJs, decryptWithJs, openJs };
+const OPEN_FAILURE = 'credential could not be opened';
+const SEAL_FAILURE = 'credential could not be sealed';
+const BOUND_FAILURE = 'credential is bound to an account';
+const IMPLS = new Set(['js', 'wasm']);
+let warnedImpl = '';
+
+/** SECRET_ENVELOPE_IMPL, read per call so a test (or an owner flip plus restart) takes effect. */
+function secretEnvelopeImpl(env = process.env) {
+  const raw = env.SECRET_ENVELOPE_IMPL;
+  if (raw === undefined || raw === '') return 'js';
+  const value = String(raw).trim().toLowerCase();
+  if (IMPLS.has(value)) return value;
+  if (warnedImpl !== value) {
+    warnedImpl = value;
+    console.warn(`[secrets] SECRET_ENVELOPE_IMPL=${JSON.stringify(String(raw))} is not js or wasm; using js`);
+  }
+  return 'js';
+}
+
+const MODULE_REASONS = new Set(['lock', 'missing', 'checksum', 'compile', 'abi', 'trap', 'reply', 'unknown']);
+
+function failure(op, err, message) {
+  const reason = err instanceof davParseWasm.DavParseError ? err.reason : 'unexpected';
+  // An unopenable value is an ordinary answer (the callers decide what to say); a module failure
+  // is logged, by reason only.
+  if (MODULE_REASONS.has(reason) || reason === 'unexpected') console.warn(`[secrets] secret-envelope ${op} failed (${reason})`);
+  return Object.assign(new Error(reason === 'bound' ? BOUND_FAILURE : message), { code: 'secret_envelope_failed', reason });
+}
+
+function openWasm(key, previousKey, value, userId) {
+  const text = String(value || '');
+  let r;
+  try {
+    r = davParseWasm.secretOpen(previousKey ? [key, previousKey] : [key], hasUser(userId) ? `${userId}` : null, text);
+  } catch (err) { throw failure('open', err, OPEN_FAILURE); }
+  if (r.keyUsed === 'none') return { plain: value || '', keyUsed: 'none' };
+  const plain = Buffer.from(r.plain.buffer, r.plain.byteOffset, r.plain.length).toString('utf8');
+  r.plain.fill(0);
+  return { plain, keyUsed: r.keyUsed };
+}
+
+function encryptWasm(key, value, userId) {
+  if (value === undefined || value === null || value === '') return '';
+  const plain = Buffer.from(String(value), 'utf8');
+  try {
+    return davParseWasm.secretSeal(key, crypto.randomBytes(12), plain, hasUser(userId) ? `${userId}` : null);
+  } catch (err) { throw failure('seal', err, SEAL_FAILURE); } finally { plain.fill(0); }
+}
+
+/** encryptJs or its Rust port, by SECRET_ENVELOPE_IMPL. */
+function encrypt(key, value, userId, { impl = secretEnvelopeImpl() } = {}) {
+  return impl === 'wasm' ? encryptWasm(key, value, userId) : encryptJs(key, value, userId);
+}
+
+/** openJs or its Rust port, by SECRET_ENVELOPE_IMPL. */
+function open(key, previousKey, value, userId, { impl = secretEnvelopeImpl() } = {}) {
+  return impl === 'wasm' ? openWasm(key, previousKey, value, userId) : openJs(key, previousKey, value, userId);
+}
+
+module.exports = { aadFor, hasUser, versionOf, encryptJs, decryptWithJs, openJs, encrypt, open, secretEnvelopeImpl, OPEN_FAILURE, SEAL_FAILURE, BOUND_FAILURE };

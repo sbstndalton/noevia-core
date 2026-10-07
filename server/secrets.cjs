@@ -39,10 +39,11 @@ function createSecretStore(dataDir, { env = process.env } = {}) {
   }
   if (previousKey && previousKey.length !== 32) throw new Error('invalid previous credential-encryption key (need 32 bytes)');
   if (previousKey && previousKey.equals(key)) previousKey = null;
-  // The envelope formats (enc:v1, enc:v2) live in secret-envelope.cjs (#979).
-  const encrypt = (value, userId) => envelope.encryptJs(key, value, userId);
+  // The envelope formats (enc:v1, enc:v2) live in secret-envelope.cjs (#979), which runs the JS
+  // code or its Rust port by SECRET_ENVELOPE_IMPL (default js; read per call).
+  const encrypt = (value, userId) => envelope.encrypt(key, value, userId);
   // Returns { plain, keyUsed: 'current'|'previous'|'none' }; throws when no key opens it.
-  const open = (value, userId) => envelope.openJs(key, previousKey, value, userId);
+  const open = (value, userId) => envelope.open(key, previousKey, value, userId);
   const decrypt = (value, userId) => open(value, userId).plain;
   /** True when the value is empty, plaintext, or opens with the current or previous key. */
   function canDecrypt(value, userId) { try { open(value, userId); return true; } catch { return false; } }
