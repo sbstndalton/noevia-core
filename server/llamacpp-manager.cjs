@@ -60,8 +60,13 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
   // Every router preset reload noevia makes goes through here: re-read the file just before the
   // call, and afterwards record that text with the router's own view of it (or forget the
   // baseline when the outcome is unclear), so the next reload can be judged.
-  async function routerReload(timeout=120000) {
+  // With the flag off this is just the router call, as before (#1040). `expectText`: the text a
+  // reload that keeps loaded models was judged on; the file is re-read here and must still match.
+  async function routerReload(timeout=120000,{expectText=null}={}) {
+    const tracking=reloadGuard.mode()==='wasm';
+    if(!tracking&&expectText===null)return request('/models?reload=1',{},timeout);
     let before=null;try{before=presets?.snapshot().text??null;}catch{}
+    if(expectText!==null&&before!==expectText)return {ok:false,status:409,refused:'file_changed',body:{}};
     let result;
     try {result=await request('/models?reload=1',{},timeout);}
     catch(e){reloadGuard.forget();throw e;}
@@ -281,27 +286,34 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
   // settings under a running instance. #1012 (PRESET_RELOAD_IMPL=wasm): it may reload with models
   // loaded when the router cannot change them (see preset-reload.cjs); they stay loaded.
   async function reloadPresets({unload=false}={}) {
+    const {liveIds}=require('./preset-reload.cjs');
+    const refuse=(ids,reason)=>({ok:false,status:409,body:{error:'A model is loaded. Unload it to apply the new settings.',loaded:ids,...(reason&&reason!=='off'?{reason}:{})}});
     return maintenance.exclusive(async()=>{
       const listing=await rawModels();
       if(!listing.ok)return listing;
       const rows=Array.isArray(listing.body?.data)?listing.body.data:[];
-      const loaded=rows.filter(m=>['loaded','loading'].includes(m.status?.value));
-      let kept=[];
+      // Sleeping models are running too: a reload unloads them if their preset changed (#1038).
+      const loaded=liveIds(rows);
+      let kept=[],expectText=null;
       if(loaded.length&&!unload){
-        const ids=loaded.map(m=>m.id);
-        const judge=()=>{let text=null;try{text=presets?.snapshot().text??null;}catch{}return reloadGuard.verdict(text,rows,ids);};
-        const verdict=judge();
-        if(!verdict.safe)return {ok:false,status:409,body:{error:'A model is loaded. Unload it to apply the new settings.',loaded:ids,...(verdict.reason!=='off'?{reason:verdict.reason}:{})}};
-        // Narrow the window for a write landing between the check and the router's read: check
-        // the file once more right before the call (a write after this is the residual race).
-        const again=judge();
-        if(!again.safe)return {ok:false,status:409,body:{error:'A model is loaded. Unload it to apply the new settings.',loaded:ids,reason:again.reason}};
-        kept=ids;
+        let judged=null;try{judged=presets?.snapshot().text??null;}catch{}
+        const verdict=reloadGuard.verdict(judged,rows,loaded);
+        if(!verdict.safe)return refuse(loaded,verdict.reason);
+        // Right before the call: list again; a model that started loading meanwhile, or a moved
+        // router, refuses (#1040). The file itself is re-read inside routerReload.
+        const again=await rawModels();
+        if(!again.ok||!Array.isArray(again.body?.data))return refuse(loaded,'unknown');
+        const now=liveIds(again.body.data);
+        if(now.some(id=>!loaded.includes(id)))return refuse(now,'loaded_changed');
+        const recheck=reloadGuard.verdict(judged,again.body.data,now);
+        if(!recheck.safe)return refuse(now,recheck.reason);
+        kept=now;expectText=judged;
       }
-      if(!kept.length)for(const m of loaded)await post('/models/unload',{model:m.id},60000).catch(()=>null);
-      const result=await routerReload(120000);
+      if(!kept.length)for(const id of loaded)await post('/models/unload',{model:id},60000).catch(()=>null);
+      const result=await routerReload(120000,{expectText});
+      if(result.refused)return refuse(kept,result.refused);
       if(!result.ok)return {ok:false,status:502,body:{error:'The engine did not reload its settings. Check the Hardware tab.'}};
-      return {ok:true,status:200,body:{reloaded:true,unloaded:kept.length?[]:loaded.map(m=>m.id),...(kept.length?{kept}:{})}};
+      return {ok:true,status:200,body:{reloaded:true,unloaded:kept.length?[]:loaded,...(kept.length?{kept}:{})}};
     });
   }
   // Maps an engine-side path (/models/..., /cache/...) onto noevia's read-only mounts.

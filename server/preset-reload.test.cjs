@@ -24,7 +24,7 @@ function fakeCheck({ baseline, current, loaded }) {
 }
 
 function tmp(t) { const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'preset-reload-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true })); return dir; }
-const rows = (loaded, presets = {}) => ['loaded-model', 'other'].map((id) => ({ id, status: { value: loaded.includes(id) ? 'loaded' : 'unloaded', preset: presets[id] ?? `[${id}]` } }));
+const rows = (loaded, presets = {}, sleeping = []) => ['loaded-model', 'other'].map((id) => ({ id, status: { value: sleeping.includes(id) ? 'sleeping' : loaded.includes(id) ? 'loaded' : 'unloaded', preset: presets[id] ?? `[${id}]` } }));
 
 test('#1012 guard: off by default, unknown without a baseline, and fails closed on a moved router or a failed check', (t) => {
   const off = createReloadGuard({ env: {}, check: fakeCheck });
@@ -55,9 +55,21 @@ test('#1012 guard: the baseline survives a core restart and forget() removes it'
   assert.equal(b.known(), true);
   assert.equal(b.verdict(BASE, rows([]), ['loaded-model']).safe, true);
   b.forget();
-  assert.equal(fs.existsSync(stateFile), false);
+  assert.equal(fs.readFileSync(stateFile, 'utf8'), '{}', 'forget() leaves a tombstone, not a missing file');
+  assert.equal(createReloadGuard({ stateFile, env: WASM, check: fakeCheck }).known(), false);
   fs.writeFileSync(stateFile, '{not json');
   assert.equal(createReloadGuard({ stateFile, env: WASM, check: fakeCheck }).known(), false);
+});
+
+test('#1037 a router row without a string status.preset leaves the baseline unknown', () => {
+  const bare = rows([]).map((r, i) => (i === 1 ? { ...r, status: { value: 'unloaded' } } : r));
+  assert.equal(engineView(bare), null);
+  assert.equal(engineView({}), null);
+  const g = createReloadGuard({ env: WASM, check: fakeCheck });
+  g.record(BASE, bare, BASE);
+  assert.equal(g.known(), false, 'no baseline from a partial view');
+  g.record(BASE, rows([]), BASE);
+  assert.deepEqual(g.verdict(BASE, bare, ['loaded-model']), { safe: false, reason: 'unknown' });
 });
 
 test('#1012 engineView is order-independent and sees preset changes and new or removed models', () => {
@@ -71,12 +83,14 @@ function managerFixture(t, env) {
   const dir = tmp(t);
   const file = path.join(dir, 'models.ini');
   fs.writeFileSync(file, BASE);
-  const state = { loaded: [], calls: [], presets: {} };
+  const state = { loaded: [], sleeping: [], calls: [], presets: {}, onList: null, bare: false };
   const fetchJson = async (url, opts = {}) => {
     const u = new URL(url);
     state.calls.push(`${opts.method || 'GET'} ${u.pathname}${u.search}`);
+    if (u.pathname === '/models' && !u.search && state.onList) state.onList(state.calls.filter((c) => c === 'GET /models').length);
     if (u.pathname === '/models/unload') { const id = JSON.parse(opts.body).model; state.loaded = state.loaded.filter((x) => x !== id); return { ok: true, status: 200, body: { success: true } }; }
-    return { ok: true, status: 200, body: { data: rows(state.loaded, state.presets) } };
+    const data = rows(state.loaded, state.presets, state.sleeping);
+    return { ok: true, status: 200, body: { data: state.bare ? data.map((r) => ({ ...r, status: { value: r.status.value } })) : data } };
   };
   const reloadGuard = createReloadGuard({ env, check: fakeCheck, stateFile: path.join(dir, 'reload.json') });
   const manager = createLlamaCppManager({ baseUrl: 'http://synthetic', presetPath: file, fetchJson, reloadGuard });
@@ -136,6 +150,59 @@ test('#1012 with the flag off, behaviour is exactly as before: refuse while load
   const r = await f.manager.reloadPresets();
   assert.equal(r.status, 409);
   assert.deepEqual(r.body, { error: 'A model is loaded. Unload it to apply the new settings.', loaded: ['loaded-model'] });
+});
+
+test('#1040 the file is re-read right before the reload and must be the text that was judged', async (t) => {
+  const f = managerFixture(t, WASM);
+  await f.manager.reloadPresets();
+  f.state.loaded = ['loaded-model'];
+  const lists = f.state.calls.filter((c) => c === 'GET /models').length;
+  // The second listing (right before the call) is where a concurrent write lands.
+  f.state.onList = (n) => { if (n === lists + 2) fs.writeFileSync(f.file, BASE.replace('ctx-size = 8192', 'ctx-size = 1')); };
+  const r = await f.manager.reloadPresets();
+  assert.equal(r.status, 409); assert.equal(r.body.reason, 'file_changed');
+  assert.equal(f.reloads(), 1);
+});
+
+test('#1040 a model that starts loading between the check and the call refuses the reload', async (t) => {
+  const f = managerFixture(t, WASM);
+  await f.manager.reloadPresets();
+  f.state.loaded = ['loaded-model'];
+  const lists = f.state.calls.filter((c) => c === 'GET /models').length;
+  f.state.onList = (n) => { if (n === lists + 2) f.state.loaded = ['loaded-model', 'other']; };
+  const r = await f.manager.reloadPresets();
+  assert.equal(r.status, 409); assert.equal(r.body.reason, 'loaded_changed'); assert.deepEqual(r.body.loaded, ['loaded-model', 'other']);
+  assert.equal(f.reloads(), 1);
+});
+
+test('#1038 a sleeping model counts as loaded', async (t) => {
+  const off = managerFixture(t, {});
+  off.state.sleeping = ['loaded-model'];
+  const r = await off.manager.reloadPresets();
+  assert.equal(r.status, 409); assert.deepEqual(r.body.loaded, ['loaded-model']);
+  const on = managerFixture(t, WASM);
+  await on.manager.reloadPresets();
+  on.state.sleeping = ['loaded-model'];
+  fs.writeFileSync(on.file, BASE.replace('ctx-size = 8192', 'ctx-size = 2'));
+  assert.equal((await on.manager.reloadPresets()).body.reason, 'changed');
+  fs.writeFileSync(on.file, BASE + '[new]\nmodel = /models/n.gguf\n');
+  assert.deepEqual((await on.manager.reloadPresets()).body.kept, ['loaded-model']);
+});
+
+test('#1037 a router listing without presets never yields a baseline, so loaded models refuse', async (t) => {
+  const f = managerFixture(t, WASM);
+  f.state.bare = true;
+  await f.manager.reloadPresets();
+  f.state.loaded = ['loaded-model'];
+  assert.equal((await f.manager.reloadPresets()).body.reason, 'unknown');
+});
+
+test('#1040 with the flag off a reload is only the router call: no extra listing, no state file', async (t) => {
+  const f = managerFixture(t, {});
+  const before = f.state.calls.length;
+  assert.equal((await f.manager.reloadPresets()).status, 200);
+  assert.deepEqual(f.state.calls.slice(before), ['GET /models', 'GET /models?reload=1']);
+  assert.equal(fs.existsSync(path.join(path.dirname(f.file), 'reload.json')), false);
 });
 
 test('#1012 a failed router reload forgets the baseline', async (t) => {

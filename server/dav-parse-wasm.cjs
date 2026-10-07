@@ -527,7 +527,7 @@ function autotunePlanText(text) {
 // preset_reload::MAX_INPUT_BYTES / MAX_FILE_BYTES / MAX_LOADED and its reply shape (#1012).
 const MAX_RELOAD_BYTES = 5 * 1024 * 1024;
 const RELOAD_REASONS = new Set(['unchanged', 'changed', 'ambiguous']);
-const RELOAD_DETAILS = new Set(['duplicate_section', 'header']);
+const RELOAD_DETAILS = new Set(['duplicate_section', 'header', 'line']);
 
 /** preset-reload (#1012): may the llama.cpp router re-read models.ini without unloading a loaded
  *  model? `{ baseline, current, loaded }` -> `{ safe, reason, changed, detail }`. Refusals throw
