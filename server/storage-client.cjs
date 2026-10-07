@@ -28,75 +28,9 @@ const { normalizeS3Region } = require('./s3-region.cjs');
 const { readCappedText } = require('./http.cjs');
 
 
-// PROPFIND <href> text is XML-escaped (&amp; &lt; &gt; &quot; &apos; and numeric refs like &#38;);
-// it has to be decoded back to the real path before parsing as a URL, or an escaped name (e.g.
-// "a&b.md" sent as "a&amp;b.md") lists under the escaped spelling and 404s on every read.
-function decodeXmlEntities(s) {
-  return String(s).replace(/&(#x[0-9a-fA-F]+|#\d+|[a-zA-Z]+);/g, (m, ent) => {
-    if (ent[0] === '#') {
-      const code = ent[1] === 'x' || ent[1] === 'X' ? parseInt(ent.slice(2), 16) : parseInt(ent.slice(1), 10);
-      // A hostile body can name a code point String.fromCodePoint refuses (out of range, or a
-      // lone surrogate): leave the original text alone rather than throwing and losing the listing.
-      const valid = Number.isFinite(code) && code > 0 && code <= 0x10FFFF && !(code >= 0xD800 && code <= 0xDFFF);
-      return valid ? String.fromCodePoint(code) : m;
-    }
-    switch (ent) {
-      case 'amp': return '&';
-      case 'lt': return '<';
-      case 'gt': return '>';
-      case 'quot': return '"';
-      case 'apos': return "'";
-      default: return m;
-    }
-  });
-}
-
-// ── PROPFIND parsing (#787) ───────────────────────────────────────────────────
-// A multistatus body comes from a server the user (or an administrator) configured, so it is
-// untrusted input up to LIST_BODY_CAP bytes. The old lazy `<response>([\s\S]*?)</response>`
-// regex rescanned to the end of the body from every unclosed opening tag, which is quadratic
-// on a hostile body and blocks the event loop for every tenant. These scans move forward only.
-
-const isTagNameChar = (code) => (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
-
-/** At `i` (a '<'), the index just past `<[prefix:]name>` (or `</[prefix:]name>` when
- *  `closing`), else -1. The prefix is the same [A-Za-z0-9]+ the old patterns accepted. */
-function tagEndAt(body, i, name, closing) {
-  let j = i + 1;
-  if (closing) { if (body.charCodeAt(j) !== 47 /* / */) return -1; j++; }
-  let k = j;
-  while (k < body.length && isTagNameChar(body.charCodeAt(k))) k++;
-  if (k > j && body.charCodeAt(k) === 58 /* : */) j = k + 1;
-  return body.startsWith(name, j) && body.charCodeAt(j + name.length) === 62 /* > */ ? j + name.length + 1 : -1;
-}
-
-/** The text inside each `<[p:]name>…</[p:]name>` in `body`, in order, at most `limit` of them.
- *  Same matches as the lazy regex (nearest closing tag wins, any prefix on either side), in
- *  time linear in the body: once no closing tag follows an opening one, none can follow a
- *  later opening one either, so the scan stops. */
-function elementTexts(body, name, limit = Infinity) {
-  const out = [];
-  const text = String(body);
-  let pos = 0;
-  while (out.length < limit) {
-    let start = -1;
-    for (let i = text.indexOf('<', pos); i !== -1; i = text.indexOf('<', i + 1)) {
-      const end = tagEndAt(text, i, name, false);
-      if (end !== -1) { start = end; break; }
-    }
-    if (start === -1) break;
-    let close = -1, after = -1;
-    for (let i = text.indexOf('</', start); i !== -1; i = text.indexOf('</', i + 2)) {
-      const end = tagEndAt(text, i, name, true);
-      if (end !== -1) { close = i; after = end; break; }
-    }
-    if (close === -1) break;
-    out.push(text.slice(start, close));
-    pos = after;
-  }
-  return out;
-}
-const firstElementText = (body, name) => elementTexts(body, name, 1)[0];
+// The PROPFIND listing parser and the XML text helpers it shares with the S3 listing live in
+// dav-listing.cjs (#967: DAV_PARSE_IMPL=js|wasm picks the JS parser or its Rust/WebAssembly port).
+const { decodeXmlEntities, elementTexts, firstElementText, listingEntries } = require('./dav-listing.cjs');
 
 const READ_CAP = 200_000; // matches the project-file upload cap
 const TEXT_BODY_CAP = READ_CAP * 4; // bytes read for a text preview (UTF-8 is at most 4 bytes a char)
@@ -179,26 +113,15 @@ async function davList(conn, fullPath) {
   if (response.status === 404) return [];
   if (!response.ok && response.status !== 207) throw new Error(`storage returned ${response.status}`);
   const { text: body } = await readCappedText(response, LIST_BODY_CAP);
-  const entries = [];
-  const requestDir = decodeURIComponent(new URL(target).pathname).replace(/\/+$/, '');
-  for (const block of elementTexts(body, 'response')) {
-    const hrefText = firstElementText(block, 'href');
-    if (hrefText === undefined) continue;
-    let href;
-    try { href = decodeURIComponent(new URL(decodeXmlEntities(hrefText).trim(), target).pathname).replace(/\/+$/, ''); } catch { continue; }
-    if (href !== requestDir && !href.startsWith(`${requestDir}/`)) continue; // a foreign href: not under the browsed directory
-    const relative = href.slice(requestDir.length + 1);
-    if (!relative || relative.includes('/')) continue; // direct children only
-    const isDir = /<(?:[a-zA-Z0-9]+:)?collection\s*\/?>/.test(block);
-    const sizeMatch = block.match(/<(?:[a-zA-Z0-9]+:)?getcontentlength>(\d+)</);
-    entries.push({
-      name: relative,
-      path: relative, // caller joins the browsed dir back on
-      isDir,
-      size: sizeMatch ? Number(sizeMatch[1]) : null,
-      ext: extensionOf(relative),
-    });
-  }
+  // Untrusted body: parsed by dav-listing.cjs (JS, or the fail-closed WebAssembly port with
+  // DAV_PARSE_IMPL=wasm). Only direct children of the browsed directory come back.
+  const entries = listingEntries(body, target).map((e) => ({
+    name: e.name,
+    path: e.name, // caller joins the browsed dir back on
+    isDir: e.isDir,
+    size: e.size,
+    ext: extensionOf(e.name),
+  }));
   return entries;
 }
 

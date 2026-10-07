@@ -71,7 +71,26 @@ jobs:
       - run: npm ci --no-fund --no-audit
         working-directory: ws/apps/web/server
       - run: npm run check:boundaries
+      # #967: dav-parse.wasm at the noevia-rs ref pinned in server/dav-parse.lock, checksum-verified
+      # (tarball and module), so the differential and DAV_PARSE_IMPL=wasm tests run for real. The
+      # shared fixture table must be byte-identical to noevia-rs's copy.
+      - uses: dtolnay/rust-toolchain@70dec6087f2cb6bab9fbac4da23160afbe848e91 # 1.99.0
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Build dav-parse.wasm at the pinned noevia-rs ref
+        run: |
+          set -euo pipefail
+          eval "$(grep -E '^(NOEVIA_RS_REF|NOEVIA_RS_SHA256|DAV_PARSE_WASM_SHA256)=[0-9a-f]+$' server/dav-parse.lock)"
+          curl -fsSL "https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/$NOEVIA_RS_REF" -o "$RUNNER_TEMP/rs.tgz"
+          echo "$NOEVIA_RS_SHA256  $RUNNER_TEMP/rs.tgz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/rs" && tar -xzf "$RUNNER_TEMP/rs.tgz" --strip-components=1 -C "$RUNNER_TEMP/rs"
+          cmp "$RUNNER_TEMP/rs/crates/dav-parse/tests/fixtures/dav-listing.v1.json" tests/fixtures/dav-listing.v1.json
+          rustup target add wasm32-unknown-unknown --toolchain 1.99.0
+          "$RUNNER_TEMP/rs/tools/build-dav-parse-wasm.sh" "$PWD/server/wasm/dav-parse.wasm"
+          echo "$DAV_PARSE_WASM_SHA256  server/wasm/dav-parse.wasm" | sha256sum -c -
       - run: npm run test:server
+        env:
+          DAV_PARSE_WASM_REQUIRED: '1'
       # The verifier's privilege separation (#703) needs root to drop to its git and test uids.
       - run: sudo "$(command -v node)" --test server/code-verify-root.test.cjs
       # The release build sets STAMP_VERSION (#317); re-run the stamp test with a SHA-shaped value.
