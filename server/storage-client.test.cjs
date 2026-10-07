@@ -149,6 +149,19 @@ function startFakeS3() {
 
 // ── client-level tests against the fakes ─────────────────────────────────────
 
+test('listFiles refuses a path safeRelativePath refuses instead of listing the root (#984)', async (t) => {
+  const { server, port } = await startFakeDav();
+  t.after(() => server.close());
+  const conn = { kind: 'webdav', baseUrl: `http://127.0.0.1:${port}/dav`, username: 'u', secret: 'p', corpusRoot: 'Cowork' };
+  for (const bad of ['../x', 'a/../../b', '/abs', 'a\0b', './x']) {
+    await assert.rejects(() => listFiles(conn, bad), (e) => e.status === 400 && e.message === 'Use a relative path inside the storage folder.', JSON.stringify(bad));
+  }
+  // Unchanged: '', whitespace, null and a bare '.' are the connection root (safeRelativePath
+  // answers '' for all of them; only a non-empty, non-'.' input that sanitises to '' is an error).
+  const root = await listFiles(conn, '');
+  for (const same of ['  ', null, undefined, '.', ' . ']) assert.deepEqual(await listFiles(conn, same), root, JSON.stringify(same));
+});
+
 test('webdav browsing is rooted at the connection, not at corpusRoot', async (t) => {
   const { server, port } = await startFakeDav();
   t.after(() => server.close());
@@ -426,8 +439,9 @@ test('browse route serves a nested directory and rejects traversal', async () =>
   assert.ok(JSON.parse(nested.text).entries.some((e) => e.name === 'notes.md'));
 
   const evil = await request('/api/integrations/storage/files/..%2F..%2Fetc', { headers: { cookie } });
-  // Traversal is neutralized to '' (root listing), never an escape.
-  assert.equal(evil.status, 200);
+  // #984: traversal is refused (400), no longer neutralized into a root listing.
+  assert.equal(evil.status, 400);
+  assert.match(JSON.parse(evil.text).error, /relative path inside the storage folder/);
 });
 
 test('file-read route returns content and enforces the text-extension rule', async () => {

@@ -238,6 +238,14 @@ function isBrowsable(conn) {
 async function listFiles(conn, rawPath, opts) {
   const scoped = !!(opts && opts.scope === 'corpus');
   const path = safeRelativePath(rawPath);
+  // #984: safeRelativePath answers '' both for "the root" and for "refused", so a
+  // refused path (`../x`, `/abs`, a NUL) used to silently list the connection root.
+  // Only '' / whitespace / a bare '.' mean the root (unchanged behaviour); any other
+  // non-empty input that sanitises to '' is an error. Holds for every STORAGE_PATH_IMPL.
+  if (!path) {
+    const asked = String(rawPath == null ? '' : rawPath).trim();
+    if (asked && asked !== '.') throw Object.assign(new Error('Use a relative path inside the storage folder.'), { status: 400 });
+  }
   // Deterministic order regardless of what the server returns, and every
   // entry's `path` must be connection-absolute (browsed dir prefixed) so it
   // can be passed straight back to readTextFile.

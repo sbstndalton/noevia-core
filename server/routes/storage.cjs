@@ -61,7 +61,7 @@ function createStorageRoutes({ json, readJson: readAnyJson, authService, storage
         const entries = await storageClient.listFiles(connection, decodeURIComponent(storageBrowse[1] || ''));
         return json(res, 200, { entries });
       } catch (e) {
-        return json(res, 502, { error: e?.message || 'storage browse failed' });
+        return json(res, e?.status === 400 ? 400 : 502, { error: e?.message || 'storage browse failed' });
       }
     }
     // Creating a directory is the one write this integration performs. It is
