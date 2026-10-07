@@ -4,6 +4,15 @@
 // passes through. Moved here unchanged from storage-client.cjs (safeRelativePath, cleanRoot,
 // joinRoot) and uploads.cjs validate (the plain-filename rule). One deliberate tightening since the
 // move: safeRelativePath refuses a path containing NUL.
+//
+// `storage-path` (sbstndalton/noevia-rs, in the dav-parse.wasm module pinned by
+// server/dav-parse.lock) is the Rust port. STORAGE_PATH_IMPL=js|wasm picks one (default js; any
+// other value means js, with one warning). `wasm` FAILS CLOSED: a missing or tampered module, a
+// refusal, a trap, an unexpected reply or input that cannot cross unchanged throws (500, or 400 for
+// an oversized input) instead of falling back to the JS rules. The thrown message is fixed; the
+// details are logged.
+
+const davParseWasm = require('./dav-parse-wasm.cjs');
 
 function safeRelativePathJs(raw) {
   const value = String(raw || '').trim().replace(/\\/g, '/');
@@ -31,7 +40,55 @@ function isPlainFilenameJs(name) {
   return !(!name || name.length > 200 || /[\/\\\x00-\x1f]/.test(name) || name === '.' || name === '..');
 }
 
+const PUBLIC_FAILURE = 'storage path could not be checked';
+const IMPLS = new Set(['js', 'wasm']);
+let warnedImpl = '';
+
+/** STORAGE_PATH_IMPL, read per call so a test (or an owner flip plus restart) takes effect. */
+function storagePathImpl(env = process.env) {
+  const raw = env.STORAGE_PATH_IMPL;
+  if (raw === undefined || raw === '') return 'js';
+  const value = String(raw).trim().toLowerCase();
+  if (IMPLS.has(value)) return value;
+  if (warnedImpl !== value) {
+    warnedImpl = value;
+    console.warn(`[storage] STORAGE_PATH_IMPL=${JSON.stringify(String(raw))} is not js or wasm; using js`);
+  }
+  return 'js';
+}
+
+function viaWasm(op, a, b) {
+  try { return davParseWasm.storagePath(op, a, b); } catch (err) {
+    const reason = err instanceof davParseWasm.DavParseError ? err.reason : 'unexpected';
+    console.warn(`[storage] storage-path ${op} failed (${reason}): ${err?.message || err}`);
+    throw Object.assign(new Error(PUBLIC_FAILURE), { status: reason === 'too_large' ? 400 : 500, code: 'storage_path_failed', reason });
+  }
+}
+
+// The JS coercions (String(raw || ''), filter(Boolean)) stay on this side: only strings cross.
+function safeRelativePath(raw, { impl = storagePathImpl() } = {}) {
+  return impl === 'wasm' ? viaWasm('safeRelativePath', String(raw || '')) : safeRelativePathJs(raw);
+}
+
+function cleanRoot(corpusRoot, { impl = storagePathImpl() } = {}) {
+  return impl === 'wasm' ? viaWasm('cleanRoot', String(corpusRoot || '')) : cleanRootJs(corpusRoot);
+}
+
+function joinRoot(corpusRoot, relative, { impl = storagePathImpl() } = {}) {
+  if (impl !== 'wasm') return joinRootJs(corpusRoot, relative);
+  // Every caller passes a string (or nothing); anything else is refused, not coerced.
+  if (relative !== undefined && relative !== null && typeof relative !== 'string') return viaWasm('joinRoot', String(corpusRoot || ''), null);
+  return viaWasm('joinRoot', String(corpusRoot || ''), relative || '');
+}
+
+function isPlainFilename(name, { impl = storagePathImpl() } = {}) {
+  if (impl !== 'wasm') return isPlainFilenameJs(name);
+  if (!name) return false;
+  // A non-string name (a number from JSON) is refused rather than coerced.
+  return typeof name === 'string' && viaWasm('isPlainFilename', name);
+}
+
 module.exports = {
-  safeRelativePath: safeRelativePathJs, cleanRoot: cleanRootJs, joinRoot: joinRootJs, isPlainFilename: isPlainFilenameJs,
+  safeRelativePath, cleanRoot, joinRoot, isPlainFilename, storagePathImpl, PUBLIC_FAILURE,
   safeRelativePathJs, cleanRootJs, joinRootJs, isPlainFilenameJs,
 };

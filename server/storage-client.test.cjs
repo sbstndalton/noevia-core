@@ -20,6 +20,7 @@ test('safeRelativePath rejects escapes and odd segments', () => {
   assert.equal(safeRelativePath('./ok.md'), ''); // strict: segments only come from our own listings
   assert.equal(safeRelativePath(''), '');
   assert.equal(safeRelativePath(null), '');
+  assert.equal(safeRelativePath('a\0b.md'), ''); // #978: NUL is refused
 });
 
 test('isBrowsable covers remote kinds only', () => {
