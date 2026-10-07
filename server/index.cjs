@@ -1080,6 +1080,15 @@ async function handleRequest(req,res) {
 let processReady = false;
 
 if (require.main === module) {
+  // #996: a *_IMPL=wasm switch with a missing or tampered dav-parse.wasm refuses to start, rather
+  // than failing closed on every request (for SECRET_ENVELOPE_IMPL: every stored credential).
+  try {
+    const wasmFlags = require('./dav-parse-wasm.cjs').verifyAtStartup();
+    if (wasmFlags.length) console.log(`[dav-parse] dav-parse.wasm verified for ${wasmFlags.join(', ')}`);
+  } catch (err) {
+    console.error(`FATAL: ${err.message}. Restore the pinned module (server/dav-parse.lock) or set the switch to js.`);
+    process.exit(1);
+  }
   fs.mkdirSync(DATA_DIR, { recursive: true });
   authTokens.warnings.forEach((w) => console.warn(w));
   if (!DIARY_TENANT_KEY) console.warn('WARNING: DIARY_TENANT_KEY is unset; Diary calls carry no tenant assertion and remote storage secrets ride on every call.');

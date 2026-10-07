@@ -30,8 +30,7 @@
 // The plaintext copies made here are zeroed after use; the key Buffers belong to secrets.cjs.
 //
 // Differences (wasm refuses, js would try): values over 12 Mi UTF-16 units, plaintext over 8 MiB,
-// user ids over 64 KiB, and an envelope whose tag is shorter than 16 bytes (Node checks a
-// truncated tag; it never writes one).
+// user ids over 64 KiB. Both refuse an envelope whose tag is shorter than 16 bytes (#995).
 
 const crypto = require('crypto');
 const davParseWasm = require('./dav-parse-wasm.cjs');
@@ -51,7 +50,10 @@ function encryptJs(key, value, userId) {
 
 function decryptWithJs(k, text, version, userId) {
   const raw = Buffer.from(text.slice(7), 'base64url');
-  const decipher = crypto.createDecipheriv('aes-256-gcm', k, raw.subarray(0, 12));
+  // iv(12) + tag(16) at least, and only a full 16-byte tag (#995): Node would otherwise check a
+  // truncated tag. encrypt never writes one, so no stored value is affected.
+  if (raw.length < 28) throw new Error('credential envelope is truncated');
+  const decipher = crypto.createDecipheriv('aes-256-gcm', k, raw.subarray(0, 12), { authTagLength: 16 });
   if (version === 2) decipher.setAAD(aadFor(userId));
   decipher.setAuthTag(raw.subarray(12, 28));
   return Buffer.concat([decipher.update(raw.subarray(28)), decipher.final()]).toString('utf8');
