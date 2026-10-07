@@ -1,0 +1,180 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  server:
+    name: Server tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ws/apps/web
+    steps:
+      # A noevia-shaped workspace: noevia main (integration files: deploy/, docs/, tools/,
+      # release/versions.lock), the sibling split repos at main, then this checkout on top, each at
+      # its monorepo path (the inverse of tools/repo-split's map). Tests that cross repo lines
+      # (server tests reading src/, the OCR test reading server/pdf-reduce.cjs) run unchanged.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: self
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: sbstndalton/noevia
+          path: ws
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: sbstndalton/noevia-web
+          path: sib/noevia-web
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: sbstndalton/noevia-services
+          path: sib/noevia-services
+      - name: Lay out the noevia-shaped workspace
+        env:
+          SELF: noevia-core
+        run: |
+          set -euo pipefail
+          place() { rm -rf "ws/$3"; mkdir -p "$(dirname "ws/$3")"; cp -R "$1/$2" "ws/$3"; }
+          overlay() {
+            local repo="$1" d e t
+            if [ "$repo" = "$SELF" ]; then d=self; else d="sib/$repo"; fi
+            for e in $(git -C "$d" ls-tree --name-only HEAD); do
+              case "$repo:$e" in
+                *:.github|*:README.md) ;;
+                noevia-services:*) place "$d" "$e" "services/$e" ;;
+                noevia-core:code-sandbox) place "$d" "$e" services/code-sandbox ;;
+                *:tests) for t in $(git -C "$d" ls-tree --name-only HEAD:tests); do place "$d" "tests/$t" "apps/web/tests/$t"; done ;;
+                *) place "$d" "$e" "apps/web/$e" ;;
+              esac
+            done
+          }
+          for r in noevia-services noevia-core noevia-web; do [ "$r" = "$SELF" ] || overlay "$r"; done
+          overlay "$SELF"
+          echo "noevia $(git -C ws rev-parse HEAD), $SELF $(git -C self rev-parse HEAD)"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            ws/apps/web/package-lock.json
+            ws/apps/web/server/package-lock.json
+      - run: npm ci --no-fund --no-audit
+      - run: npm ci --no-fund --no-audit
+        working-directory: ws/apps/web/server
+      - run: npm run check:boundaries
+      - run: npm run test:server
+      # The verifier's privilege separation (#703) needs root to drop to its git and test uids.
+      - run: sudo "$(command -v node)" --test server/code-verify-root.test.cjs
+      # The release build sets STAMP_VERSION (#317); re-run the stamp test with a SHA-shaped value.
+      - run: STAMP_VERSION=ci1234567 node --test tests/server/build-version-stamp.test.cjs
+
+  code-sandbox:
+    name: Code sandbox bridge tests
+    runs-on: ubuntu-latest
+    steps:
+      # A noevia-shaped workspace: noevia main (integration files: deploy/, docs/, tools/,
+      # release/versions.lock), the sibling split repos at main, then this checkout on top, each at
+      # its monorepo path (the inverse of tools/repo-split's map). Tests that cross repo lines
+      # (server tests reading src/, the OCR test reading server/pdf-reduce.cjs) run unchanged.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: self
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: sbstndalton/noevia
+          path: ws
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: sbstndalton/noevia-web
+          path: sib/noevia-web
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: sbstndalton/noevia-services
+          path: sib/noevia-services
+      - name: Lay out the noevia-shaped workspace
+        env:
+          SELF: noevia-core
+        run: |
+          set -euo pipefail
+          place() { rm -rf "ws/$3"; mkdir -p "$(dirname "ws/$3")"; cp -R "$1/$2" "ws/$3"; }
+          overlay() {
+            local repo="$1" d e t
+            if [ "$repo" = "$SELF" ]; then d=self; else d="sib/$repo"; fi
+            for e in $(git -C "$d" ls-tree --name-only HEAD); do
+              case "$repo:$e" in
+                *:.github|*:README.md) ;;
+                noevia-services:*) place "$d" "$e" "services/$e" ;;
+                noevia-core:code-sandbox) place "$d" "$e" services/code-sandbox ;;
+                *:tests) for t in $(git -C "$d" ls-tree --name-only HEAD:tests); do place "$d" "tests/$t" "apps/web/tests/$t"; done ;;
+                *) place "$d" "$e" "apps/web/$e" ;;
+              esac
+            done
+          }
+          for r in noevia-services noevia-core noevia-web; do [ "$r" = "$SELF" ] || overlay "$r"; done
+          overlay "$SELF"
+          echo "noevia $(git -C ws rev-parse HEAD), $SELF $(git -C self rev-parse HEAD)"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - run: node --test ws/services/code-sandbox/pi-acp-bridge.test.cjs
+
+  web-image:
+    name: Web image build
+    runs-on: ubuntu-latest
+    steps:
+      # A noevia-shaped workspace: noevia main (integration files: deploy/, docs/, tools/,
+      # release/versions.lock), the sibling split repos at main, then this checkout on top, each at
+      # its monorepo path (the inverse of tools/repo-split's map). Tests that cross repo lines
+      # (server tests reading src/, the OCR test reading server/pdf-reduce.cjs) run unchanged.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: self
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: sbstndalton/noevia
+          path: ws
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: sbstndalton/noevia-web
+          path: sib/noevia-web
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: sbstndalton/noevia-services
+          path: sib/noevia-services
+      - name: Lay out the noevia-shaped workspace
+        env:
+          SELF: noevia-core
+        run: |
+          set -euo pipefail
+          place() { rm -rf "ws/$3"; mkdir -p "$(dirname "ws/$3")"; cp -R "$1/$2" "ws/$3"; }
+          overlay() {
+            local repo="$1" d e t
+            if [ "$repo" = "$SELF" ]; then d=self; else d="sib/$repo"; fi
+            for e in $(git -C "$d" ls-tree --name-only HEAD); do
+              case "$repo:$e" in
+                *:.github|*:README.md) ;;
+                noevia-services:*) place "$d" "$e" "services/$e" ;;
+                noevia-core:code-sandbox) place "$d" "$e" services/code-sandbox ;;
+                *:tests) for t in $(git -C "$d" ls-tree --name-only HEAD:tests); do place "$d" "tests/$t" "apps/web/tests/$t"; done ;;
+                *) place "$d" "$e" "apps/web/$e" ;;
+              esac
+            done
+          }
+          for r in noevia-services noevia-core noevia-web; do [ "$r" = "$SELF" ] || overlay "$r"; done
+          overlay "$SELF"
+          echo "noevia $(git -C ws rev-parse HEAD), $SELF $(git -C self rev-parse HEAD)"
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3 (v3.12.0)
+      # The monorepo image build (apps/web/Dockerfile runs the client and server tests too).
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6 (v6.19.2)
+        with:
+          context: ws/apps/web
+          push: false
+          tags: noevia-web:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
