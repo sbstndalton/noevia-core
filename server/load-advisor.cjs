@@ -9,7 +9,8 @@
 // decided either way. The planner (autotune-plan) still picks every step from the outcome.
 //
 // The decision service is the private one already configured for chat (COWORK_DECISION_URL,
-// decision-endpoint.cjs). One question at a time (Laya runs with LAYA_MAX_CONCURRENCY=1; a
+// decision-endpoint.cjs). Its options never include a time out (#1046): that outcome re-runs the
+// same setting, so only a rule may name it. One question at a time (Laya runs with LAYA_MAX_CONCURRENCY=1; a
 // second question while one is open is not asked), within ADVICE_BUDGET_MS. A timeout, an error,
 // an unconfigured service or an unusable module all mean "no advice": the calibrator's own cause
 // stands, which is what auto-tune did before. Nothing here loads, unloads or runs a model.
@@ -22,7 +23,6 @@ const QUESTION = 'A local model server failed while loading or serving a model d
 const OPTIONS = [
   { id: 'oom', label: 'Out of memory: memory for the model, its cache or its buffers could not be allocated' },
   { id: 'load_failed', label: 'The model file or its format could not be loaded' },
-  { id: 'timeout', label: 'The server did not respond or finish in time' },
   { id: 'recall_failed', label: 'The prompt did not fit the context size the model was started with' },
   { id: 'template', label: "The model's chat template could not be parsed or applied" },
   { id: 'unknown', label: 'None of these, or the text does not say' },
@@ -41,7 +41,7 @@ function excerpt(text) {
 const int = (v, min, max) => (Number.isSafeInteger(v) && v >= min && v <= max ? v : null);
 function evidenceOf(e) {
   if (!e || typeof e !== 'object') return null;
-  return { status: int(e.status, 0, 999), exitCode: int(e.exitCode, -1024, 1024), text: excerpt(e.text) };
+  return { status: int(e.status, 0, 999), exitCode: int(e.exitCode, -1024, 1024), text: excerpt(e.text), crash: e.crash === true };
 }
 
 function defaultEndpoint(env) {
@@ -62,7 +62,8 @@ function createLoadAdvisor({ env = process.env, endpoint = undefined, verdict = 
     let timer;
     const deadline = new Promise(resolve => { timer = setTimeout(() => { controller.abort(); resolve({ status: 'timeout' }); }, budgetMs); });
     try {
-      const answer = svc.choice({ state: JSON.stringify({ engineError: text }), question: QUESTION, options: OPTIONS }, { signal: controller.signal })
+      // A synchronous throw from the client is an error too, never an escape from judge (#1048).
+      const answer = Promise.resolve().then(() => svc.choice({ state: JSON.stringify({ engineError: text }), question: QUESTION, options: OPTIONS }, { signal: controller.signal }))
         .then(r => (OPTIONS.some(o => o.id === r?.selected) && Number.isFinite(r.scores?.[r.selected])
           ? { status: 'answered', advice: { label: r.selected, confidence: Math.min(1, Math.max(0, r.scores[r.selected])) } }
           : { status: 'error' }))

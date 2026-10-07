@@ -64,7 +64,7 @@ test('no rule: the decision service is asked once with the fixed question, and i
   const a = createLoadAdvisor({ env: ON, endpoint: svc, verdict: fakeVerdict() });
   const r = await a.judge({ cause: 'oom', evidence: { status: 500, exitCode: 1, text: 'srv  operator(): process exited unexpectedly' } });
   assert.equal(svc.asked.length, 1);
-  assert.deepEqual(svc.asked[0].options.map(o => o.id), ['oom', 'load_failed', 'timeout', 'recall_failed', 'template', 'unknown']);
+  assert.deepEqual(svc.asked[0].options.map(o => o.id), ['oom', 'load_failed', 'recall_failed', 'template', 'unknown']);
   assert.deepEqual(JSON.parse(svc.asked[0].state), { engineError: 'srv  operator(): process exited unexpectedly' });
   assert.deepEqual([r.outcome, r.classification.source, r.classification.advisor, r.classification.adviceUsed], ['template', 'advisor', 'used', true]);
   assert.deepEqual(r.classification.advice, { label: 'template', permille: 820 });
@@ -147,4 +147,29 @@ test('with the real module: rules, advice on a tie, and a fixed reason', { skip:
   r = await a.judge({ cause: 'load', evidence: { exitCode: 1, text: '' } });
   assert.deepEqual([r.outcome, r.classification.source, r.classification.advisor], ['load_failed', 'fallback', 'not_asked']);
   assert.equal(svc.asked.length, 1);
+});
+
+test('#1048 a client that throws synchronously is an error, never an escape from judge', async () => {
+  const sync = { choice() { throw Error('boom'); } };
+  const r = await createLoadAdvisor({ env: ON, endpoint: sync, verdict: fakeVerdict() }).judge({ cause: 'load', evidence: { text: 'odd' } });
+  assert.deepEqual([r.outcome, r.classification.advisor], ['load_failed', 'error']);
+});
+
+test('#1046 the crash flag reaches the verdict; time out is never offered to the decision service', async () => {
+  const calls = [];
+  await createLoadAdvisor({ env: ON, endpoint: null, verdict: fakeVerdict(calls) }).judge({ cause: 'oom', evidence: { text: 'x', crash: true } });
+  await createLoadAdvisor({ env: ON, endpoint: null, verdict: fakeVerdict(calls) }).judge({ cause: 'oom', evidence: { text: 'x', crash: 'yes' } });
+  assert.deepEqual(calls.map(c => c.evidence.crash), [true, false]);
+  assert.ok(!OPTIONS.some(o => o.id === 'timeout'));
+});
+
+test('#1046 with the real module: a crash that says "timed out" stays oom, and advice cannot say timeout', { skip: skipWasm }, async () => {
+  davParseWasm.reset();
+  const svc = fakeService({ label: 'timeout', confidence: 0.95 });
+  const a = createLoadAdvisor({ env: ON, endpoint: { choice: (i, o) => svc.choice(i, o) } });
+  let r = await a.judge({ cause: 'oom', evidence: { text: 'The request timed out.', crash: true } });
+  assert.deepEqual([r.outcome, r.classification.rule], ['oom', 'unknown']);
+  r = await createLoadAdvisor({ env: ON, endpoint: null, verdict: req => davParseWasm.loadVerdict({ ...req, advice: { label: 'timeout', confidence: 0.9 } }) })
+    .judge({ cause: 'oom', evidence: { text: 'odd' } });
+  assert.deepEqual([r.outcome, r.classification.source], ['oom', 'fallback']);
 });

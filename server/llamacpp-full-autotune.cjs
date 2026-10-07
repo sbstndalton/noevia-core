@@ -681,7 +681,7 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
     const cal = contextFactory({ applyUnlocked: guardedApply(j), onWrite: revision => { j._revision = revision; save(); }, onUpdate: () => {} });
     child = { cancel: () => cal.cancelProbe() };
     let r;
-    try { r = await cal.probe(j.model, { ctx: step.ctx, fill: step.fill, base, baseRevision: j._revision, promptBudgetSeconds: j.promptBudgetSeconds }); }
+    try { r = await cal.probe(j.model, { ctx: step.ctx, fill: step.fill, base, baseRevision: j._revision, promptBudgetSeconds: j.promptBudgetSeconds, evidence: loadAdvisor.enabled() }); }
     finally { child = null; }
     check();
     if (!r.passed) {

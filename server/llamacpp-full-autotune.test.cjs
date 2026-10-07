@@ -1147,3 +1147,68 @@ test('#1004 advisor on: a rejected long prompt\'s error body is read (capped) an
   assert.deepEqual([probeRows(f)[0].outcome, c.source, c.ruleId], ['oom', 'rule', 'text_oom']);
   assert.equal(svc.asked.length, 0);
 });
+
+// ── core#18 review: #1047 engine words stay out of reasons, #1048 flag off reads nothing ──
+const sseError = message => `data: ${JSON.stringify({ error: { code: 500, message } })}\n\n`;
+for (const on of [false, true]) test(`#1047 a stream error's engine text never reaches status() or the state file (advisor ${on ? 'on' : 'off'})`, { skip: skipWasm }, async t => {
+  const f = fixture(t, { servingChecks: servingOff, streamReply: o => (o['ctx-size'] === '16384' ? new Response(sseError('SECRET-xyz engine detail')) : null),
+    autotuneExtra: planned({ loadAdvisor: createLoadAdvisor({ env: on ? ADVISOR_ON : {}, endpoint: decisionService({ label: 'oom' }) }) }) });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'passed', j.error);
+  assert.match(phase(j.models[0], 'context').steps[0].reason, /^The engine reported an error during the long prompt\./);
+  assert.ok(!JSON.stringify(f.manager.autotune.status().body).includes('SECRET-xyz'));
+  assert.ok(!fs.readFileSync(f.stateFile, 'utf8').includes('SECRET-xyz'));
+});
+
+// A 500 whose body stream records whether it was read and whether it was cancelled.
+function watchedBody({ endless = false } = {}) {
+  const seen = { pulled: 0, cancelled: false };
+  const body = new ReadableStream({
+    pull(c) { seen.pulled++; if (seen.pulled === 1) c.enqueue(new TextEncoder().encode('failed to allocate buffer ')); else if (!endless) c.close(); else return new Promise(() => {}); },
+    cancel() { seen.cancelled = true; },
+  }, { highWaterMark: 0 });
+  return { seen, response: () => new Response(body, { status: 500 }) };
+}
+
+test('#1048 advisor off: a rejected prompt\'s error body is not read and no evidence is attached', async t => {
+  const w = watchedBody();
+  const script = [{ step: 'probe', ctx: 16384, kv: 'f16', fill: 14000, estimateMib: 5000 }];
+  const planner = { mode: () => 'wasm', plan: r => script[r.results.length] || { step: 'fail', code: 'no_context', message: 'No context size passed the fill-and-recall test.' } };
+  let judged = 0;
+  const advisor = { enabled: () => false, judge: async () => { judged++; return null; } };
+  const f = fixture(t, { servingChecks: servingOff, streamReply: o => (o['ctx-size'] === '16384' && o['cache-type-k'] === 'f16' ? w.response() : null), autotuneExtra: planned({ planner, loadAdvisor: advisor }) });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  await finished(f.manager);
+  assert.equal(w.seen.pulled, 0);
+  assert.equal(judged, 0);
+});
+
+test('#1048 the calibrator attaches evidence only when asked', async () => {
+  const { createCalibrator } = require('./llamacpp-calibration.cjs');
+  // The calibrator alone, a refused load: probe without and with evidence.
+  const status = { synthetic: 'unloaded' };
+  const request = async (p) => (p === '/models/load' ? { ok: false, status: 500, body: { error: { message: 'out of memory' } } } : { ok: true, body: {} });
+  const presets = { get: () => ({ revision: 'r1', options: { parallel: '1' } }), snapshot: () => ({ text: '', revision: 'r1' }) };
+  const cal = createCalibrator({ request, rawModels: async () => ({ ok: true, body: { data: [{ id: 'synthetic', status: { value: status.synthetic } }] } }), presets,
+    maintenance: { hold: () => () => {} }, applyUnlocked: async () => ({ ok: true }), sleep: async () => {}, readMemory: () => 20, stream: async () => assert.fail('no stream') });
+  const off = await cal.probe('synthetic', { ctx: 4096, fill: 1000, baseRevision: 'r1' });
+  const on = await cal.probe('synthetic', { ctx: 4096, fill: 1000, baseRevision: 'r1', evidence: true });
+  assert.equal(off.passed, false);
+  assert.equal(off.evidence, undefined);
+  assert.deepEqual(on.evidence, { status: 500, text: '{"error":{"message":"out of memory"}}' });
+});
+
+test('#1048 advisor on: an error body that never ends is cancelled at the deadline, and what arrived is used', { skip: skipWasm }, async t => {
+  const w = watchedBody({ endless: true });
+  const svc = decisionService({ label: 'template' });
+  const f = fixture(t, { servingChecks: servingOff, streamReply: o => (o['ctx-size'] === '16384' && o['cache-type-k'] === 'f16' ? w.response() : null),
+    autotuneExtra: planned({ loadAdvisor: createLoadAdvisor({ env: ADVISOR_ON, endpoint: svc }) }) });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  for (let i = 0; i < 400 && f.manager.autotune.status().body.job?.status === 'running'; i++) await new Promise(r => setTimeout(r, 25));
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'passed', j.error);
+  assert.equal(w.seen.cancelled, true);
+  assert.deepEqual([probeRows(f)[0].outcome, phase(j.models[0], 'context').steps[0].classification.ruleId], ['oom', 'text_oom']);
+  assert.equal(svc.asked.length, 0);
+});

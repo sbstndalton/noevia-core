@@ -47,8 +47,9 @@ const normalize = t => t.replace(/[A-Z]/g, c => c.toLowerCase()).replace(/[_\-\s
 function classify(e) {
   if (e.exitCode === 137 || e.exitCode === -9) return ['oom', 'exit_killed'];
   const text = normalize(e.text || '');
-  for (const [id, label, needles] of RULES) if (needles.some(n => text.includes(n))) return [label, id];
-  if (e.status === 408 || e.status === 504) return ['timeout', 'status_timeout'];
+  // #1046: a crash (the engine went away) is never a time out, whatever its text says.
+  for (const [id, label, needles] of RULES) if (!(e.crash && label === 'timeout') && needles.some(n => text.includes(n))) return [label, id];
+  if (!e.crash && (e.status === 408 || e.status === 504)) return ['timeout', 'status_timeout'];
   return ['unknown', null];
 }
 
@@ -60,7 +61,8 @@ function refVerdict(input) {
   if (!input.evidence) return reply(fallback, 'measured', 'unknown', null, false, false);
   const [rule, ruleId] = classify(input.evidence);
   if (rule !== 'unknown') return reply(rule, 'rule', rule, ruleId, false, false);
-  if (advice && advice.permille >= LIMITS.minAdvicePermille && advice.label !== 'unknown')
+  // #1046: never a time out from advice (it would re-run the same setting).
+  if (advice && advice.permille >= LIMITS.minAdvicePermille && !['unknown', 'timeout'].includes(advice.label))
     return reply(advice.label, 'advisor', rule, ruleId, false, true);
   return reply(fallback, 'fallback', rule, ruleId, !advice && (input.evidence.text || '').trim() !== '', false);
 }
@@ -122,6 +124,13 @@ function cases() {
   }
   add('advice-without-text', { cause: 'oom', evidence: { text: '' }, advice: { label: 'template', confidence: 0.9 } });
   add('evidence-empty-object', { cause: 'oom', evidence: {} });
+  // #1046: the advice never says timeout; a crash's text never reads as one.
+  add('advice-timeout-ignored', { cause: 'oom', evidence: { text: 'odd' }, advice: { label: 'timeout', confidence: 0.9 } });
+  add('crash-text-timed-out', { cause: 'oom', evidence: { text: 'The model server request timed out.', crash: true } });
+  add('crash-text-deadline-advice-timeout', { cause: 'oom', evidence: { text: 'deadline exceeded', crash: true }, advice: { label: 'timeout', confidence: 1 } });
+  add('crash-status-504', { cause: 'oom', evidence: { status: 504, text: '', crash: true } });
+  add('crash-text-oom', { cause: 'oom', evidence: { text: 'timed out: out of memory', crash: true } });
+  add('crash-false-timed-out', { cause: 'load', evidence: { text: 'timed out', crash: false } });
   add('evidence-null-text', { cause: 'load', evidence: { text: null } });
   // Seeded combinations of fragments (deterministic LCG).
   let seed = 1004;
@@ -132,7 +141,7 @@ function cases() {
     const cause = Object.keys(CAUSE)[rnd(5)];
     const advice = rnd(3) ? null : { label: labels[rnd(labels.length)], confidence: rnd(1001) / 1000 };
     const exitCode = [null, null, 1, 137][rnd(4)];
-    add('seeded-' + i, { cause, evidence: { status: [null, 500, 504, 503][rnd(4)], exitCode, text }, ...(advice ? { advice } : {}) });
+    add('seeded-' + i, { cause, evidence: { status: [null, 500, 504, 503][rnd(4)], exitCode, text, ...(i % 4 === 3 ? { crash: true } : {}) }, ...(advice ? { advice } : {}) });
   }
   return out;
 }
@@ -155,6 +164,7 @@ const errors = [
   { name: 'advice-no-confidence', text: '{"cause":"load","advice":{"label":"oom"}}', pad: 0 },
   { name: 'advice-string-confidence', text: '{"cause":"load","advice":{"label":"oom","confidence":"0.9"}}', pad: 0 },
   { name: 'advice-extra', text: '{"cause":"load","advice":{"label":"oom","confidence":0.9,"why":"x"}}', pad: 0 },
+  { name: 'evidence-crash-number', text: '{"cause":"load","evidence":{"crash":1}}', pad: 0 },
   { name: 'evidence-array', text: '{"cause":"load","evidence":[]}', pad: 0 },
 ].map(e => ({ ...e, expect: { error: 'input' } }));
 errors.push({ name: 'text-too-long', text: JSON.stringify({ cause: 'load', evidence: { text: 'a'.repeat(LIMITS.maxTextBytes + 1) } }), pad: 0, expect: { error: 'too_large' } });
