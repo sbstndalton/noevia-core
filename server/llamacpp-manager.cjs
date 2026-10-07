@@ -646,7 +646,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     reloadPresets,
     evidence, recordEvidence, importEvidence,
     calibration: calibrator ? { start: calibrator.start, cancel: calibrator.cancel, status: calibrator.status, recover: calibrator.recover } : null,
-    autotune: autotuner ? { start: autotuner.start, resume: autotuner.resume, cancel: autotuner.cancel, status: autotuner.status, recover: autotuner.recover, untuned: autotuner.untuned } : null,
+    autotune: autotuner ? { start: autotuner.start, resume: autotuner.resume, cancel: autotuner.cancel, status: autotuner.status, setSettings: autotuner.setSettings, recover: autotuner.recover, untuned: autotuner.untuned } : null,
     unload: model => mutate(()=>withAdmission(()=>post('/models/unload', { model }))),
     // #697 watchdog: unload without waiting behind admission or maintenance; memory is running out.
     emergencyUnload: model => post('/models/unload', { model }, 60000),
