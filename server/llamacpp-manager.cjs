@@ -53,7 +53,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
   // Every commit (apply, calibration, auto-tune, restores) settles an uncertain Model Loader
   // write by reading models.ini back instead of assuming nothing changed (#339).
   const {commitReconciled}=require('./models-ini-writer.cjs');
-  const presets=store ? {...store,commit:candidate=>commitReconciled(store,candidate)} : null;
+  const presets=store ? {...store,commit:(candidate,options)=>commitReconciled(store,candidate,options)} : null;
   const maintenance=require('./inference-maintenance.cjs').createMaintenanceGate();
   async function mutate(fn) {const leave=maintenance.enter();try{return await fn();}finally{leave();}}
   // Serialize only admission/eviction, never the inference that follows it.
@@ -224,7 +224,8 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     });
   }
   // Caller must hold the maintenance gate (applyPreset or a calibration job).
-  async function applyUnlocked(body) {
+  // writeOptions.backup:false is auto-tune's alone (#1003); request bodies cannot ask for it.
+  async function applyUnlocked(body, writeOptions = {}) {
     const listing=await rawModels();
     if(!listing.ok) return listing;
     const models=listing.body?.data;
@@ -232,7 +233,8 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     if(!models.some(m=>m.id===body.model))return {ok:false,status:404,body:{error:'Choose an installed model'}};
     if(models.some(m=>!['unloaded'].includes(m.status?.value)))return {ok:false,status:409,body:{error:'Unload all router models and finish downloads before applying a profile. Other clients must remain stopped.'}};
     const candidate=presets.prepare(body);
-    try {await presets.commit(candidate);}
+    // #1003: auto-tune asks for one recovery copy per run (backup:false on its later writes).
+    try {await presets.commit(candidate,writeOptions.backup===false?{backup:false}:undefined);}
     catch(e) {
       // A settled Model Loader outcome carries its own message; a 5xx would otherwise reach
       // the admin as "Internal error". Nothing was reloaded: the file is not ours to apply.
@@ -557,6 +559,12 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
       ...(autotuneOptions.idleTimeoutMs!=null?{idleTimeoutMs:autotuneOptions.idleTimeoutMs}:{}),
       ...(autotuneOptions.sleep?{sleep:autotuneOptions.sleep}:{}),
       ...(autotuneOptions.servingChecks?{servingChecks:autotuneOptions.servingChecks}:{}),
+      // #1003 AUTOTUNE_PLAN_IMPL=wasm: the planner reads the GGUF facts and the sizing budget.
+      ...(autotuneOptions.planner?{planner:autotuneOptions.planner}:{}),
+      planFacts:async model=>{const r=await readModel(model);return r.error?null:{meta:r.meta,modelBytes:r.modelFile.size,mmprojBytes:r.mmproj?.size||0};},
+      budgetGib:()=>sizingBudgetGib()||require('./inference-budget.cjs').DEFAULT_BUDGET_GIB,
+      ...(autotuneOptions.planFacts?{planFacts:autotuneOptions.planFacts}:{}),
+      ...(autotuneOptions.budgetGib?{budgetGib:autotuneOptions.budgetGib}:{}),
       onResult:async({model,result})=>{for(const [category,value] of [['context_capacity',{ctx:result.context,appliedCtx:result.context,slots:Number(presets.get(model).options.parallel)||1}],['throughput',{rate:result.generation}],...(result.acceptance==null?[]:[['mtp_acceptance',{rate:result.acceptance/100}]])])await recordEvidence(model,{category,result:'passed',value,suite:{name:'full-autotune',version:3},source:'autotune',limitations:['Three deterministic quality smoke probes, not a general quality benchmark','120 s default prompt budget; existing MTP head only',...(result.baseline?.skipped?.length?[`Probes not used (failed at the model's reference settings): ${result.baseline.skipped.map(s=>s.id).join(', ')}`]:[])]});},
       contextFactory:hooks=>require('./llamacpp-calibration.cjs').createCalibrator({request,rawModels,presets,applyUnlocked,conservativeFor,maintenance:managedGate,
         stream:(path,opts={})=>(fetchStream||fetch)(base+path,{...opts,headers:headers(opts.headers),redirect:'error'}),

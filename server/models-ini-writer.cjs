@@ -42,10 +42,10 @@ function createModelsIniWriter({mode,url,token,fetchJson}) {
   const endpoint=String(url).replace(/\/+$/,'')+'/api/v1/models-ini';
   return {
     kind,
-    async write({baseRevision,text}) {
+    async write({baseRevision,text,backup}) {
       let result;
       try {
-        result=await fetchJson(endpoint,{method:'PUT',headers:{'Content-Type':'application/json',...(token?{'X-Model-Loader-Token':token}:{})},body:JSON.stringify({baseRevision,text})},30000);
+        result=await fetchJson(endpoint,{method:'PUT',headers:{'Content-Type':'application/json',...(token?{'X-Model-Loader-Token':token}:{})},body:JSON.stringify({baseRevision,text,...(backup===false?{backup:false}:{})})},30000);
       } catch {throw error(503,UNCERTAIN,{uncertain:true});}
       if(result?.ok&&result.body?.ok===true)return {revision:result.body.revision};
       // 401/403: token mismatch, told apart from an outage (the token itself is never echoed).
@@ -62,8 +62,8 @@ function createModelsIniWriter({mode,url,token,fetchJson}) {
 // Commit through a preset store, settling an uncertain write by reading the shared file back
 // (#339). Committed: resolves as a normal success, so the caller runs its usual guarded reload.
 // Still the base: an accurate, retryable 503. Anything else: a 409 that never overwrites it.
-async function commitReconciled(store,candidate) {
-  try {return await store.commit(candidate);}
+async function commitReconciled(store,candidate,options) {
+  try {return await store.commit(candidate,options);}
   catch(e) {
     if(!e?.uncertain)throw e;
     let current;

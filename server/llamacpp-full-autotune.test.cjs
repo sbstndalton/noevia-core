@@ -5,7 +5,7 @@ const { createModelManager } = require('./model-manager.cjs');
 const { createPresetStore } = require('./llamacpp-presets.cjs');
 const { QUALITY, qualityCheck, qualityFailure, newModel } = require('./llamacpp-full-autotune.cjs');
 
-function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnload, badQ4 = true, badF16 = false, noHead = false, rejectAll = false, rejectModel = '', badBatch = false, failFinal = false, formattedQuality = false, reasoningOnly = false, truncatedWorkloads = false, idleTimeoutMs = 300000, loseIdentityAfterStart = false, reloadFail = false, unloadPolls = 0, unloadStuck = false, answerFor = null, failLoadF16 = false, httpFor = null, chatTemplate = null, servingFor = null, servingChecks = null } = {}) {
+function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnload, badQ4 = true, badF16 = false, noHead = false, rejectAll = false, rejectModel = '', badBatch = false, failFinal = false, formattedQuality = false, reasoningOnly = false, truncatedWorkloads = false, idleTimeoutMs = 300000, loseIdentityAfterStart = false, reloadFail = false, unloadPolls = 0, unloadStuck = false, answerFor = null, failLoadF16 = false, httpFor = null, chatTemplate = null, servingFor = null, servingChecks = null, autotuneExtra = {} } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'full-tune-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const ini = path.join(dir, 'models.ini'), stateFile = path.join(dir, 'tune.json');
@@ -59,7 +59,7 @@ function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnl
   const makeManager = () => createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic', presetPath: ini, fetchJson, fetchStream,
     calibrationStatePath: path.join(dir, 'cal.json'), autotuneStatePath: stateFile,
     calibrationOptions: { sleep: async () => {}, readMemory: () => 20 },
-    autotuneOptions: { ...(servingChecks ? { servingChecks } : {}), ...(unloadPolls || unloadStuck ? { sleep: async () => {} } : {}), betweenModelsMs: 25, idleTimeoutMs, readMemory: () => 20, identityFor: async m => (++identityReads > 1 && loseIdentityAfterStart ? null : { model: m, hardware: 'fake', build }) } });
+    autotuneOptions: { ...autotuneExtra, ...(servingChecks ? { servingChecks } : {}), ...(unloadPolls || unloadStuck ? { sleep: async () => {} } : {}), betweenModelsMs: 25, idleTimeoutMs, readMemory: () => 20, identityFor: async m => (++identityReads > 1 && loseIdentityAfterStart ? null : { model: m, hardware: 'fake', build }) } });
   let manager = makeManager();
   return { manager, ini, stateFile, original, requests, servingRequests, options, status, restart: () => { manager = makeManager(); return manager; }, setBuild: b => { build = b; } };
 }
@@ -844,4 +844,129 @@ test('#1003: an unusable checker skips the check instead of failing the tune', a
   const j = await finished(f.manager);
   assert.equal(j.status, 'passed', j.error);
   assert.ok(j.log.some(l => /realistic chat check was skipped/.test(l.text)));
+});
+
+// ── #1003 AUTOTUNE_PLAN_IMPL=wasm: Rust's planner orders the run ────────────────────────────────
+// Synthetic facts: a small dense model whose f16 KV cache fits 16k context in the 16 GiB budget.
+// The fake engine recalls the marker up to 8k with f16 and up to 16k with a quantized cache.
+const SYNTHETIC_FACTS = { meta: { contextLength: 16384, blockCount: 16, headCount: 16, headCountKv: 4, embeddingLength: 2048 }, modelBytes: 1e9, mmprojBytes: 0 };
+const wasmPlanner = () => { const w = require('./dav-parse-wasm.cjs'); return { mode: () => 'wasm', plan: r => w.autotunePlan(r) }; };
+const servingOff = { mode: () => 'off', templateCaps: () => assert.fail(), verdict: () => assert.fail() };
+const backups = ini => fs.readdirSync(path.dirname(ini)).filter(n => n.startsWith('models.ini.noevia-backup-'));
+const planned = (extra = {}) => ({ planner: wasmPlanner(), planFacts: async () => SYNTHETIC_FACTS, budgetGib: () => 16, ...extra });
+
+test('#1003 planned: context first, then the KV type, a fill-and-recall search, phases once, one final check', { skip: skipWasm }, async t => {
+  const f = fixture(t, { servingChecks: servingOff, autotuneExtra: planned() });
+  assert.equal((await f.manager.autotune.start('synthetic', { confirmPause: true })).status, 202);
+  const j = await finished(f.manager), item = j.models[0];
+  assert.equal(j.status, 'passed', j.error);
+  assert.deepEqual(item.phases.map(p => p.id), ['context', 'sampling', 'drafting', 'batch', 'verify']);
+  const results = JSON.parse(fs.readFileSync(f.stateFile, 'utf8')).job.models[0].plan.results;
+  // 16k f16 forgets the marker, 8k passes, 12k forgets: 8k with f16.
+  assert.deepEqual(results.filter(r => r.step === 'probe').map(r => [r.ctx, r.kv, r.outcome]),
+    [[16384, 'f16', 'recall_failed'], [8192, 'f16', 'passed'], [12288, 'f16', 'recall_failed']]);
+  assert.deepEqual(results.filter(r => r.step !== 'probe').map(r => r.step + (r.id ? ':' + r.id : '') + ':' + r.outcome),
+    ['phase:sampling:skipped', 'phase:drafting:passed', 'phase:batch:passed', 'verify:passed', 'serving:skipped']);
+  assert.equal(item.result.context, 8192);
+  assert.equal(item.result.kv, 'f16');
+  assert.equal(item.result.plan, 'wasm');
+  assert.equal(f.options('synthetic')['ctx-size'], '8192');
+  assert.equal(f.options('synthetic')['cache-type-k'], 'f16');
+  // No repeated full context re-measurements in drafting or batch.
+  for (const id of ['drafting', 'batch']) assert.ok(!phase(item, id).steps.some(s => /Context check/.test(s.label)), id);
+  assert.deepEqual(phase(item, 'context').steps.map(s => s.label), ['Fill 16,384 · f16 KV cache', 'Fill 8,192 · f16 KV cache', 'Fill 12,288 · f16 KV cache']);
+  assert.equal(phase(item, 'verify').steps.length, 1);
+  // One recovery copy for the whole run: the profile as it was before tuning.
+  const kept = backups(f.ini);
+  assert.equal(kept.length, 1);
+  assert.equal(fs.readFileSync(path.join(path.dirname(f.ini), kept[0]), 'utf8'), f.original);
+});
+
+test('#1003 planned: probe outcomes reach the planner as memory, recall and quality failures', async t => {
+  const script = [{ step: 'probe', ctx: 8192, kv: 'q5_0', fill: 7000, estimateMib: 4000 }, { step: 'probe', ctx: 16384, kv: 'f16', fill: 14000, estimateMib: 5000 },
+    { step: 'probe', ctx: 8192, kv: 'f16', fill: 7000, estimateMib: 4000 }];
+  const seen = [];
+  const planner = { mode: () => 'wasm', plan: r => { seen.push(r); return script[r.results.length] || { step: 'fail', code: 'no_context', message: 'No context size passed the fill-and-recall test.' }; } };
+  const f = fixture(t, { servingChecks: servingOff, autotuneExtra: planned({ planner }) });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'failed');
+  assert.equal(j.models[0].error, 'No context size passed the fill-and-recall test.');
+  assert.deepEqual(seen.at(-1).results.map(r => r.outcome), ['quality_failed', 'recall_failed', 'passed']);
+  // The request the planner saw: the facts, the budget and the KV candidates this server tries.
+  assert.equal(seen[0].facts.nCtxTrain, 16384);
+  assert.equal(seen[0].memory.budgetMib, 16384);
+  assert.equal(seen[0].memory.memAvailableMib, 20480);
+  assert.equal(seen[0].memory.reserveMib, 2560);
+  assert.deepEqual(seen[0].kv, ['f16', 'q8_0', 'q5_1', 'q5_0']);
+  assert.deepEqual(seen[0].ladder, [4096, 8192, 12288, 16384]);
+  // The failed context stage put models.ini back.
+  assert.equal(fs.readFileSync(f.ini, 'utf8'), f.original);
+});
+
+test('#1003 planned: a model the planner cannot size falls back to the standard order', { skip: skipWasm }, async t => {
+  const f = fixture(t, { servingChecks: servingOff, autotuneExtra: planned({ planFacts: async () => ({ ...SYNTHETIC_FACTS, meta: { contextLength: 16384, blockCount: 16 } }) }) });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager), item = j.models[0];
+  assert.equal(j.status, 'passed', j.error);
+  assert.match(item.planFallback, /cannot be sized/);
+  assert.deepEqual(item.phases.map(p => p.id), ['sampling', 'kv', 'context', 'drafting', 'batch']);
+  assert.ok(j.log.some(l => /Using the standard tuning order/.test(l.text)));
+});
+
+test('#1003 planned: unreadable model facts fall back too', async t => {
+  const f = fixture(t, { servingChecks: servingOff, autotuneExtra: planned({ planFacts: async () => null }) });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'passed', j.error);
+  assert.match(j.models[0].planFallback, /could not be read/);
+});
+
+test('#1003 planned: a planner that breaks mid-run stops with a fixed message and restores models.ini', async t => {
+  const planner = { mode: () => 'wasm', plan: r => { if (r.results.length) throw Error('module gone: /secret/path'); return { step: 'probe', ctx: 8192, kv: 'f16', fill: 7000, estimateMib: 4000 }; } };
+  const f = fixture(t, { servingChecks: servingOff, autotuneExtra: planned({ planner }) });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'failed');
+  assert.equal(j.error, 'The auto-tune planner is unavailable.');
+  assert.equal(fs.readFileSync(f.ini, 'utf8'), f.original);
+});
+
+test('#1003 planned: with AUTOTUNE_PLAN_IMPL unset the standard order runs', async t => {
+  const f = fixture(t, { servingChecks: servingOff, autotuneExtra: { planFacts: async () => assert.fail('not planned') } });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'passed', j.error);
+  assert.equal(j.models[0].plan, undefined);
+  assert.equal(f.manager.autotune.status().body.planImpl, 'js');
+});
+
+test('#1003 one recovery copy of models.ini per tune run in the standard order too', async t => {
+  const f = fixture(t, { servingChecks: servingOff });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'passed', j.error);
+  const kept = backups(f.ini);
+  assert.equal(kept.length, 1);
+  assert.equal(fs.readFileSync(path.join(path.dirname(f.ini), kept[0]), 'utf8'), f.original);
+});
+
+test('#1003 planned: a cancelled run resumes from its results without repeating a probe', { skip: skipWasm }, async t => {
+  let cancelOnce = true;
+  const f = fixture(t, { servingChecks: servingOff, autotuneExtra: planned(), onChat: ({ manager, o }) => {
+    // The 8k probe's quality check: cancel there, after the 16k probe has its result.
+    if (cancelOnce && o['ctx-size'] === '8192' && o['cache-type-k'] === 'f16' && manager.autotune.status().body.job?.models[0].plan?.results.length === 1) { cancelOnce = false; manager.autotune.cancel(); }
+  } });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  let j = await finished(f.manager);
+  assert.equal(j.status, 'cancelled');
+  assert.equal(fs.readFileSync(f.ini, 'utf8'), f.original);
+  assert.equal((await f.manager.autotune.resume({ confirmPause: true })).status, 202);
+  j = await finished(f.manager);
+  assert.equal(j.status, 'passed', j.error);
+  const results = JSON.parse(fs.readFileSync(f.stateFile, 'utf8')).job.models[0].plan.results;
+  assert.deepEqual(results.filter(r => r.step === 'probe').map(r => [r.ctx, r.kv, r.outcome]),
+    [[16384, 'f16', 'recall_failed'], [8192, 'f16', 'passed'], [12288, 'f16', 'recall_failed']]);
+  assert.equal(j.models[0].result.context, 8192);
+  assert.equal(backups(f.ini).length, 1);
 });

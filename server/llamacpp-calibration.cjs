@@ -235,7 +235,8 @@ function createCalibrator(deps) {
     const controller = new AbortController();
     inflight = controller;
     const memory = watchMemory(record, controller);
-    const finish = (status, reason) => { record.status = status; if (reason) record.reason = reason; record.seconds = Math.round((now() - record.startedAt) / 1000); save(); return status === 'passed'; };
+    // cause (#1003): why a step failed, for auto-tune's planner: oom, load, time or recall.
+    const finish = (status, reason, cause) => { record.status = status; if (reason) record.reason = reason; if (cause) record.cause = cause; record.seconds = Math.round((now() - record.startedAt) / 1000); save(); return status === 'passed'; };
     try {
       await unloadAll();
       const applied = await applyUnlocked({ model: job.model, baseRevision: job.lastRevision || job.originalRevision, options: { ...job.base, 'ctx-size': String(ctx) } });
@@ -246,53 +247,53 @@ function createCalibrator(deps) {
       // it, or recover() restores nothing and the test context stays in models.ini.
       save();
       const started = await request('/models/load', { method: 'POST', body: JSON.stringify({ model: job.model }), signal: controller.signal }, 120000);
-      if (!started.ok) return finish('failed', 'The engine refused to load the model at this size.');
+      if (!started.ok) return finish('failed', 'The engine refused to load the model at this size.', 'load');
       const deadline = now() + limits.load;
       for (;;) {
         if (cancelRequested) throw Object.assign(Error('cancelled'), { cancelled: true });
-        if (!memory.check() || record.memoryFloorHit) return finish('failed', `Available memory fell below ${memoryFloorGib} GiB.`);
-        if (now() > deadline) return finish('failed', 'Loading did not finish in time.');
+        if (!memory.check() || record.memoryFloorHit) return finish('failed', `Available memory fell below ${memoryFloorGib} GiB.`, 'oom');
+        if (now() > deadline) return finish('failed', 'Loading did not finish in time.', 'load');
         const rows = await listing(controller.signal).catch(e => { if (record.memoryFloorHit) return []; throw e; });
         if (loadedOthers(rows, job.model).length) throw Object.assign(Error('Another client loaded a model during calibration. Stop Diary background jobs and other clients, then retry.'), { fatal: true });
         const row = rows.find(m => m.id === job.model);
-        if (row?.status?.value === 'loaded') { if (!memory.check()) return finish('failed', `Available memory fell below ${memoryFloorGib} GiB.`); break; }
-        if (!row || row.status?.failed || row.status?.value === 'unloaded') return finish('failed', 'The model failed to load at this size.');
+        if (row?.status?.value === 'loaded') { if (!memory.check()) return finish('failed', `Available memory fell below ${memoryFloorGib} GiB.`, 'oom'); break; }
+        if (!row || row.status?.failed || row.status?.value === 'unloaded') return finish('failed', 'The model failed to load at this size.', 'load');
         await sleep(limits.poll);
       }
       if (kind === 'load') {
         const smoke = await chat(job.model, { messages: [{ role: 'user', content: 'Reply with the single word OK.' }], max_tokens: 16 }, limits.smoke, controller.signal);
-        if (record.memoryFloorHit) return finish('failed', `Available memory fell below ${memoryFloorGib} GiB.`);
-        return smoke.ok && Array.isArray(smoke.body?.choices) ? finish('passed') : finish('failed', 'The loaded model did not answer a short request.');
+        if (record.memoryFloorHit) return finish('failed', `Available memory fell below ${memoryFloorGib} GiB.`, 'oom');
+        return smoke.ok && Array.isArray(smoke.body?.choices) ? finish('passed') : finish('failed', 'The loaded model did not answer a short request.', 'load');
       }
       // Near-capacity recall test against the per-slot window, streamed so progress can
       // be watched: the run stops as soon as the full prompt is predicted to exceed the
       // time limit, rather than waiting it out.
       const slots = Math.max(1, Number(job.base.parallel || presets.get(job.model).options.parallel) || 1);
-      const target = Math.floor((ctx / slots) * 0.9) - 256;
+      const target = Number.isInteger(job.fill) && job.fill > 0 ? job.fill : Math.floor((ctx / slots) * 0.9) - 256;
       const marker = `CAL-${crypto.randomInt(1000, 9999)}-${crypto.randomInt(1000, 9999)}`;
       const perLine = await tokensPerPadLine(job.model, controller.signal);
       const repeats = Math.max(1, Math.floor(target / perLine));
       const budgetMs = job.promptBudgetSeconds * 1000;
       const result = await streamLong(job.model, `Remember the start marker: ${marker}.\n${PAD.repeat(repeats)}\nReturn only the start marker.`, controller, record, budgetMs);
-      if (record.memoryFloorHit) return finish('failed', `Available memory fell below ${memoryFloorGib} GiB.`);
+      if (record.memoryFloorHit) return finish('failed', `Available memory fell below ${memoryFloorGib} GiB.`, 'oom');
       if (result.overBudget) return finish('failed', result.predicted
         ? `Filling this context would take about ${Math.ceil(result.etaMs / 1000)} s, over the ${job.promptBudgetSeconds} s limit.`
-        : `Filling this context took ${Math.ceil(result.etaMs / 1000)} s, over the ${job.promptBudgetSeconds} s limit.`);
-      if (!result.ok) return finish('failed', result.error || 'The long prompt failed.');
+        : `Filling this context took ${Math.ceil(result.etaMs / 1000)} s, over the ${job.promptBudgetSeconds} s limit.`, 'time');
+      if (!result.ok) return finish('failed', result.error || 'The long prompt failed.', 'oom');
       record.promptTokens = result.promptTokens;
       if (result.promptPerSecond) record.promptPerSecond = Math.round(result.promptPerSecond);
       if (result.promptSeconds) record.promptSeconds = result.promptSeconds;
-      if (!result.text.includes(marker)) return finish('failed', 'The model did not recall the marker from the start of the prompt.');
-      if (record.promptTokens && record.promptTokens < target * 0.8) return finish('failed', 'The engine accepted fewer prompt tokens than requested.');
+      if (!result.text.includes(marker)) return finish('failed', 'The model did not recall the marker from the start of the prompt.', 'recall');
+      if (record.promptTokens && record.promptTokens < target * 0.8) return finish('failed', 'The engine accepted fewer prompt tokens than requested.', 'recall');
       return finish('passed');
     } catch (e) {
       if (e.cancelled || cancelRequested) { finish('skipped', 'Cancelled.'); throw Object.assign(Error('cancelled'), { cancelled: true }); }
       if (e.fatal) { finish('failed', e.message); throw e; }
-      if (record.memoryFloorHit) return finish('failed', `Available memory fell below ${memoryFloorGib} GiB.`);
+      if (record.memoryFloorHit) return finish('failed', `Available memory fell below ${memoryFloorGib} GiB.`, 'oom');
       // The engine went away (for example an out-of-memory restart): that size failed.
       const back = await waitForBackend();
       if (!back) { finish('failed', 'The model server stopped responding.'); throw Object.assign(Error('The model server did not come back after a failed step.'), { fatal: true }); }
-      return finish('failed', 'The model server failed during this step.');
+      return finish('failed', 'The model server failed during this step.', 'oom');
     } finally {
       memory.stop();
       inflight = null;
@@ -412,6 +413,19 @@ function createCalibrator(deps) {
     return { ok: true, status: 202, body: publicJob(job) };
   }
 
+  // #1003: one fill-and-recall step for auto-tune's planner (AUTOTUNE_PLAN_IMPL=wasm). Writes
+  // `base` plus ctx-size over the profile at `baseRevision`, loads, fills `fill` tokens with a
+  // marker and checks recall, memory and the time limit, then unloads. The caller holds the gate
+  // and restores the profile; a failed step reports its cause (oom, load, time or recall).
+  async function probe(model, { ctx, fill, base = {}, baseRevision, promptBudgetSeconds = 120 }) {
+    cancelRequested = false;
+    const job = { model, base, originalRevision: baseRevision, promptBudgetSeconds, fill, steps: [] };
+    const passed = await step(job, ctx, 'long');
+    const record = job.steps.at(-1) || {};
+    return { passed, cause: passed ? null : record.cause || 'load', reason: record.reason || null, revision: job.lastRevision || null,
+      promptSeconds: record.promptSeconds ?? null, promptPerSecond: record.promptPerSecond ?? null };
+  }
+
   function cancel() {
     if (state.job?.status !== 'running') return { ok: false, status: 409, body: { error: 'No calibration is running.' } };
     cancelRequested = true;
@@ -424,7 +438,9 @@ function createCalibrator(deps) {
   }
 
   load();
-  return { start, cancel, status, recover, completion: () => completion, _state: () => state };
+  // A probe cancels through cancelProbe: cancel() answers only for a running calibration job.
+  const cancelProbe = () => { cancelRequested = true; inflight?.abort(); };
+  return { start, cancel, cancelProbe, probe, status, recover, completion: () => completion, _state: () => state };
 }
 
 module.exports = { createCalibrator, ladder, readMemAvailableGib };

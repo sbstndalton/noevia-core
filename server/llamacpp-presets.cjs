@@ -121,15 +121,17 @@ function createPresetStore(file,{writer=null,cacheRam=null,backupKeep=BACKUP_KEE
     return {before:data.text,baseRevision:data.revision,text,revision:revision(text)};
   }
   // Async in both modes so callers need not know who the writer is.
-  async function commit(candidate) {
+  // backup:false (#1003): a write inside an auto-tune run that already kept its one recovery copy.
+  // The web writer skips its copy; Model Loader gets the same hint (older sidecars ignore it).
+  async function commit(candidate,{backup=true}={}) {
     if(read().revision!==candidate.baseRevision)throw error(409,'Presets changed while applying. Reload before retrying.');
     // Single-writer mode: the sidecar does the revision check, backup and atomic rename.
-    if(writer){await writer.write({baseRevision:candidate.baseRevision,text:candidate.text});return;}
+    if(writer){await writer.write({baseRevision:candidate.baseRevision,text:candidate.text,...(backup===false?{backup:false}:{})});return;}
     // Web writer on a read-only mount: an explicit 503 before the backup, not a raw EROFS (#269).
     require('./models-ini-writer.cjs').assertWebWritable(file);
     // Immutable recovery copy precedes the new file; contains operator settings.
-    const backup=file+'.noevia-backup-'+candidate.baseRevision;
-    try {const fd=fs.openSync(backup,'wx',0o600);try{fs.writeFileSync(fd,read().text);fs.fsyncSync(fd);}finally{fs.closeSync(fd);}}catch(e){if(e.code!=='EEXIST')throw e;}
+    const backupFile=file+'.noevia-backup-'+candidate.baseRevision;
+    if(backup!==false)try {const fd=fs.openSync(backupFile,'wx',0o600);try{fs.writeFileSync(fd,read().text);fs.fsyncSync(fd);}finally{fs.closeSync(fd);}}catch(e){if(e.code!=='EEXIST')throw e;}
     const temporary=file+'.noevia-'+crypto.randomUUID();
     try {
       // Directory bind mount required: rename is atomic and router sees the new inode.

@@ -16,6 +16,7 @@
 //   - crates/mcp-frame     mcpRpcBody/mcpSchemaRefs = mcp.cjs parseRpcBody/resolveSchemaRefs
 //                                                                             (MCP_FRAME_IMPL, #980)
 //   - crates/chat-template-caps + provider-error  templateCaps/providerErrorKind/servingVerdict
+//   - crates/autotune-plan  autotunePlan = auto-tune's next step                (AUTOTUNE_PLAN_IMPL, #1003)
 //                                        new logic, no JS twin; see chat-template-caps.cjs
 //                                                                             (CHAT_TEMPLATE_CAPS_IMPL, #1002)
 //
@@ -48,7 +49,7 @@ const MAX_DECODE_BYTES = 25 * 1024 * 1024;
 // Only the first bytes decide an archive magic number (`ustar` ends at 262).
 const SNIFF_BYTES = 262;
 const RESET_AFTER_BYTES = 1024 * 1024;
-const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'secret_open', 'secret_seal', 'mcp_rpc_body', 'mcp_schema_refs', 'template_caps', 'provider_error', 'serving_verdict', 'dav_output_ptr', 'dav_output_len'];
+const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'secret_open', 'secret_seal', 'mcp_rpc_body', 'mcp_schema_refs', 'template_caps', 'provider_error', 'serving_verdict', 'autotune_plan', 'dav_output_ptr', 'dav_output_len'];
 
 class DavParseError extends Error {
   constructor(message, reason) {
@@ -495,13 +496,40 @@ function servingVerdict(status, body) {
   return { passed: reply.passed, kind: reply.kind, reason: reply.reason };
 }
 
+// autotune_plan::MAX_INPUT_BYTES and the step shapes it replies with (#1003).
+const MAX_PLAN_BYTES = 64 * 1024;
+const PLAN_STEPS = new Set(['probe', 'phase', 'verify', 'serving', 'done', 'fail']);
+const PLAN_KV = new Set(['f32', 'f16', 'bf16', 'q8_0', 'q5_1', 'q5_0', 'q4_1', 'q4_0', 'iq4_nl']);
+const PLAN_PHASES = new Set(['sampling', 'drafting', 'batch']);
+const PLAN_STOPS = new Set(['unsizeable', 'no_rung', 'does_not_fit', 'no_context', 'phase_failed', 'verify_failed', 'serving_failed']);
+const posInt = (n) => Number.isSafeInteger(n) && n >= 0;
+
+/** autotune-plan (#1003): auto-tune's next step for `request` (facts, memory, ladder, kv,
+ *  results). Refusals throw DavParseError ('input', 'too_large'); a reply of an unexpected shape
+ *  throws 'reply'. */
+function autotunePlan(request) { return autotunePlanText(JSON.stringify(request)); }
+/** autotunePlan on the request's JSON text as is. */
+function autotunePlanText(text) {
+  if (typeof text !== 'string') throw new DavParseError('autotune plan request must be text', 'input');
+  const bytes = encoder.encode(text.isWellFormed() ? text : text.toWellFormed());
+  if (bytes.length > MAX_PLAN_BYTES) throw new DavParseError('autotune plan request is too large', 'too_large');
+  const r = invoke(bytes, (e) => e.autotune_plan());
+  const ok = r && PLAN_STEPS.has(r.step) && (r.step === 'fail'
+    ? PLAN_STOPS.has(r.code) && typeof r.message === 'string'
+    : posInt(r.ctx) && PLAN_KV.has(r.kv)
+      && (r.step !== 'phase' || PLAN_PHASES.has(r.id))
+      && (!['probe', 'verify'].includes(r.step) || (posInt(r.fill) && posInt(r.estimateMib))));
+  if (!ok) throw new DavParseError('autotune plan reply has an unexpected shape', 'reply');
+  return r;
+}
+
 /** Test hook: the cached instance's linear memory in bytes (0 when there is none). */
 function memoryBytes() { return cached?.instance ? cached.instance.exports.memory.buffer.byteLength : 0; }
 
 // Every switch that runs this module (#996). Each reads its value as trim().toLowerCase().
 // CHAT_TEMPLATE_CAPS_IMPL counts only when set to wasm explicitly; its default (also wasm) is
 // checked by chat-template-caps.cjs startup(), which falls back to off instead of stopping.
-const IMPL_FLAGS = ['DAV_PARSE_IMPL', 'S3_PARSE_IMPL', 'STORAGE_PATH_IMPL', 'UPLOAD_SNIFF_IMPL', 'SECRET_ENVELOPE_IMPL', 'MCP_FRAME_IMPL', 'CHAT_TEMPLATE_CAPS_IMPL'];
+const IMPL_FLAGS = ['DAV_PARSE_IMPL', 'S3_PARSE_IMPL', 'STORAGE_PATH_IMPL', 'UPLOAD_SNIFF_IMPL', 'SECRET_ENVELOPE_IMPL', 'MCP_FRAME_IMPL', 'CHAT_TEMPLATE_CAPS_IMPL', 'AUTOTUNE_PLAN_IMPL'];
 
 /** The *_IMPL switches set to wasm in `env`. */
 function wasmFlags(env = process.env) {
@@ -528,4 +556,4 @@ function verifyAtStartup(env = process.env) {
 /** Test hook: forget the cached module (and its failure). */
 function reset() { cached = null; }
 
-module.exports = { wasmFlags, verifyAtStartup, IMPL_FLAGS, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
+module.exports = { wasmFlags, verifyAtStartup, IMPL_FLAGS, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };

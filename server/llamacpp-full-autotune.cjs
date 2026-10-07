@@ -15,6 +15,21 @@ const kvCandidates = () => allowBelowQ5Kv() ? ['f16', 'q8_0', 'q5_1', 'q5_0', 'q
 const UBATCH = [512, 1024, 2048];
 const PAD = 'The garden committee reviewed irrigation, seed orders, volunteer rotas and pump maintenance. ';
 const PHASES = [['sampling', 'Sampling'], ['kv', 'KV cache'], ['context', 'Context size'], ['drafting', 'Drafting'], ['batch', 'Batch and micro-batch']];
+// #1003 AUTOTUNE_PLAN_IMPL=wasm: Rust's planner (autotune-plan in dav-parse.wasm) orders the run.
+// Context first, then the KV cache type for it, each choice proven by filling ~90% of the context
+// and recalling a marker (plus the quality probes); then sampling, drafting and batch once each,
+// one final fill check and the serving check, never a measured step twice. Default js: the order
+// above. Read per job start, so a flip takes effect on the next tune.
+const PLANNED_PHASES = [['context', 'Context and KV cache'], ['sampling', 'Sampling'], ['drafting', 'Drafting'], ['batch', 'Batch and micro-batch'], ['verify', 'Final fill check']];
+const PLAN_FLAG = 'AUTOTUNE_PLAN_IMPL';
+const planModeOf = (env = process.env) => (String(env[PLAN_FLAG] ?? '').trim().toLowerCase() === 'wasm' ? 'wasm' : 'js');
+function defaultPlanner() {
+  return { mode: () => planModeOf(), plan: request => require('./dav-parse-wasm.cjs').autotunePlan(request) };
+}
+// Kept free beside the tuned model for the services that run alongside it (Laya).
+const SERVICES_RESERVE_MIB = 2560;
+const PLAN_CAUSE = { oom: 'oom', load: 'load_failed', time: 'over_time', recall: 'recall_failed' };
+const PLAN_STEP_LIMIT = 64;
 const QUALITY = [
   { id: 'arithmetic', prompt: 'Compute (17 * 4) - 9. Reply with only the integer.', expected: '59' },
   { id: 'extraction', prompt: 'Record: name=Juniper; code=AX-417; colour=blue. Return only the code, without quotes.', expected: 'AX-417' },
@@ -110,7 +125,10 @@ function stepsFor(id) {
     : id === 'batch' ? UBATCH.map(n => step(String(n), 'Micro-batch ' + n))
     : [step('capacity', 'Load and long-prompt recall')];
 }
-function newModel(model) {
+function newModel(model, planned = false) {
+  if (planned) return { model, status: 'pending', plan: { results: [] }, phases: PLANNED_PHASES.map(([id, label]) => ({
+    id, label, status: 'pending', steps: ['context', 'verify'].includes(id) ? [] : stepsFor(id),
+  })) };
   return { model, status: 'pending', phases: PHASES.map(([id, label]) => ({
     id, label, status: 'pending', steps: stepsFor(id),
   })) };
@@ -131,7 +149,10 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
   betweenModelsMs = 1000, idleTimeoutMs = 300000,
   readMemory = require('./llamacpp-calibration.cjs').readMemAvailableGib, memoryFloorGib = 2, onResult = async () => {},
   // #545: true when a router row is a preset whose model file is not in the models folder.
-  fileMissing = () => false, servingChecks = defaultServingChecks() }) {
+  fileMissing = () => false, servingChecks = defaultServingChecks(),
+  // #1003: the planner (AUTOTUNE_PLAN_IMPL), the model's GGUF facts ({ meta, modelBytes, mmprojBytes }
+  // or null) and the inference memory budget in GiB.
+  planner = defaultPlanner(), planFacts = async () => null, budgetGib = () => 16, servicesReserveMib = SERVICES_RESERVE_MIB }) {
   let state;
   try { state = JSON.parse(fs.readFileSync(stateFile, 'utf8')); } catch { state = {}; }
   state.history ||= {};
@@ -141,7 +162,12 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
   const note = (j, text) => { (j.log ||= []).push({ at: now(), text }); if (j.log.length > 400) j.log.shift(); save(); };
   const phaseOf = (item, id) => item.phases.find(p => p.id === id);
   // kvCandidates: the list this server really tries, so the panel never describes another build's.
-  const status = model => ({ ok: true, status: 200, body: { job: publicJob(state.job), history: model ? state.history[model] || [] : [], kvCandidates: kvCandidates() } });
+  const status = model => ({ ok: true, status: 200, body: { job: publicJob(state.job), history: model ? state.history[model] || [] : [], kvCandidates: kvCandidates(), planImpl: planner.mode() } });
+  // #1003: one recovery copy of models.ini per tune run. The first write of a job keeps the
+  // writer's usual copy (the profile as it was before tuning); every later write, restores
+  // included, asks for none (the web writer skips it, Model Loader gets the hint).
+  const writeOptions = j => (j._backedUp ? { backup: false } : {});
+  const wrote = j => { if (!j._backedUp) { j._backedUp = true; save(); } };
   async function signature(model, suppliedIdentity) {
     const identity = suppliedIdentity || await identityFor(model);
     if (!identity) throw publicFail('Model identity could not be read.');
@@ -196,7 +222,8 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
     check();
     if (presets.snapshot().revision !== j._revision) throw Object.assign(Error('Settings changed outside auto-tune.'), { fatal: true });
     await unloadAll();
-    const r = await applyUnlocked({ model: j.model, baseRevision: j._revision, options });
+    const r = await applyUnlocked({ model: j.model, baseRevision: j._revision, options }, writeOptions(j));
+    if (r.ok) wrote(j);
     if (!r.ok) throw Object.assign(Error(r.body?.error || 'Could not save settings; the profile may have changed.'), { fatal: r.status === 409 });
     j._revision = presets.snapshot().revision; save();
   }
@@ -284,16 +311,20 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
       return null;
     }
   }
+  // The calibrator's writes: only over the revision this job last wrote, models unloaded first.
+  const guardedApply = j => async body => {
+    if (body.baseRevision !== j._revision) throw Object.assign(Error('Settings changed outside auto-tune.'), { fatal: true });
+    await unloadAll();
+    const r = await applyUnlocked(body, writeOptions(j));
+    if (r?.ok) wrote(j);
+    return r;
+  };
   async function contextStage(j, p, prefix = '') {
     check();
     if (presets.snapshot().revision !== j._revision) throw Object.assign(Error('Settings changed outside auto-tune.'), { fatal: true });
     const offset = prefix ? p.steps.length : 0;
     child = contextFactory({
-      applyUnlocked: async body => {
-        if (body.baseRevision !== j._revision) throw Object.assign(Error('Settings changed outside auto-tune.'), { fatal: true });
-        await unloadAll();
-        return applyUnlocked(body);
-      },
+      applyUnlocked: guardedApply(j),
       onWrite: revision => { j._revision = revision; save(); },
       onUpdate: c => {
         if (!c) return;
@@ -447,7 +478,8 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
     await write(j, best.candidate.options);
     await load(j);
     const final = await validate(j.model);
-    await verifyContext(j, p);
+    // Planned runs (#1003) check the context once, after the last phase, instead of here.
+    if (!planOf(j)) await verifyContext(j, p);
     p.value = { spec: best.candidate.id, specLabel: best.candidate.label, generation: final.generation,
       acceptance: final.acceptance, quality: final.quality, baseline: off.generation };
     note(j, 'Committed drafting: ' + best.candidate.label + '.');
@@ -473,18 +505,19 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
     await write(j, { 'ubatch-size': String(best.ub), 'batch-size': String(Math.max(2048, best.ub)) });
     await load(j);
     const final = await validate(j.model);
-    await verifyContext(j, p);
+    if (!planOf(j)) await verifyContext(j, p);
     p.value = { ubatch: best.ub, batch: Math.max(2048, best.ub), promptPerSecond: best.promptPerSecond,
       generation: final.generation, acceptance: final.acceptance, quality: final.quality };
     note(j, 'Committed micro-batch ' + best.ub + '.');
   }
+  const planOf = j => j.models?.find(m => m.model === j.model)?.plan || null;
   const phaseRuns = { sampling: runSampling, kv: runKv, context: runContext, drafting: runDrafting, batch: runBatch };
   async function restorePhase(j, p) {
     if (p._beforeText == null) return true;
     if (presets.snapshot().revision !== j._revision) { p.restored = false; return false; }
     try {
       await unloadAll({ restoring: true });
-      await presets.commit({ baseRevision: j._revision, text: p._beforeText });
+      await presets.commit({ baseRevision: j._revision, text: p._beforeText }, j._backedUp ? { backup: false } : undefined);
       j._revision = presets.snapshot().revision; save();
       const reload = await request('/models?reload=1', {}, 120000);
       if (!reload.ok) throw Error('The router did not confirm restored settings.');
@@ -548,13 +581,13 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
     }
     return { passed: true, toolsSent: sendTools, templateKnown: template !== null, retriedWithoutTools: retried };
   }
-  async function finishModel(j, item, final) {
+  async function finishModel(j, item, final, planned = null) {
     const identity = await identityFor(item.model);
     if (!identity || hash({ ...identity, profile: undefined }) !== item._identity)
       throw Object.assign(Error('Model identity changed since tuning began.'), { fatal: true });
-    const kv = phaseOf(item, 'kv').value, ctx = phaseOf(item, 'context').value,
+    const kv = planned || phaseOf(item, 'kv').value, ctx = planned ? { context: planned.ctx } : phaseOf(item, 'context').value,
       draft = phaseOf(item, 'drafting').value, batch = phaseOf(item, 'batch').value;
-    const result = { kv: kv.kv, context: ctx.context, spec: draft.spec, specLabel: draft.specLabel,
+    const result = { kv: kv.kv, context: ctx.context, ...(planned ? { plan: 'wasm', probes: item.plan.results.filter(r => r.step === 'probe').length } : {}), spec: draft.spec, specLabel: draft.specLabel,
       generation: final.generation, acceptance: final.acceptance, ubatch: batch.ubatch,
       promptPerSecond: batch.promptPerSecond, quality: final.quality, extensions: [],
       sampling: phaseOf(item, 'sampling')?.value || null, ...(item.baseline ? { baseline: item.baseline } : {}),
@@ -566,6 +599,189 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
     state.history[item.model] = [{ at: now(), ...result }, ...(state.history[item.model] || [])].slice(0, 10);
     save();
     try { await onResult({ model: item.model, result }); } catch { note(j, 'Settings saved, but qualification evidence could not be recorded.'); }
+  }
+  // ── #1003: the planned order (AUTOTUNE_PLAN_IMPL=wasm) ─────────────────────────────────────
+  const uint = (v, max = 2 ** 40) => (Number.isSafeInteger(v) && v >= 0 && v <= max ? v : 0);
+  const layerList = v => (Array.isArray(v)
+    ? (v.length <= 4096 && v.every(x => typeof x === 'boolean' || uint(x, 1 << 20) === x) ? v : null)
+    : (uint(v, 1 << 20) === v ? v : null));
+  // The planner's request: the model's facts, the budget (MemAvailable read once, now, with every
+  // model unloaded, so a resumed job plans from the same figures), the ladder and the KV types.
+  async function planRequest(model) {
+    const read = await planFacts(model);
+    if (!read?.meta) return null;
+    const m = read.meta, profile = presets.get(model), eff = { ...profile.defaults, ...profile.options };
+    const { ladder } = require('./llamacpp-calibration.cjs');
+    const { cacheRamMibOf } = require('./llamacpp-autoconfig.cjs');
+    const native = uint(m.contextLength, 1 << 24);
+    const cacheMib = cacheRamMibOf(eff['cache-ram']);
+    const free = readMemory();
+    return {
+      facts: { nCtxTrain: native, blockCount: uint(m.blockCount, 4096), headCount: uint(m.headCount, 1 << 20), headCountKv: layerList(m.headCountKv),
+        embeddingLength: uint(m.embeddingLength, 1 << 20), keyLength: uint(m.keyLength, 1 << 20), valueLength: uint(m.valueLength, 1 << 20),
+        keyLengthSwa: uint(m.keyLengthSwa, 1 << 20), valueLengthSwa: uint(m.valueLengthSwa, 1 << 20), slidingWindow: uint(m.slidingWindow, 1 << 24),
+        slidingWindowPattern: layerList(m.slidingWindowPattern), sharedKvLayers: uint(m.sharedKvLayers, 4096),
+        fullAttentionInterval: uint(m.fullAttentionInterval, 4096), nextnPredictLayers: uint(m.nextnPredictLayers, 4096),
+        modelBytes: uint(read.modelBytes, 2 ** 50), mmprojBytes: uint(read.mmprojBytes, 2 ** 50),
+        ubatch: uint(Number(eff['ubatch-size']), 1 << 24), slots: Math.max(1, uint(Number(eff.parallel), 1024)) },
+      memory: { budgetMib: uint(Math.floor(Number(budgetGib()) * 1024), 2 ** 30), memAvailableMib: free == null ? null : uint(Math.floor(free * 1024), 2 ** 30),
+        reserveMib: uint(servicesReserveMib, 2 ** 30), floorMib: uint(Math.round(memoryFloorGib * 1024), 2 ** 30),
+        cacheRamMib: Number.isFinite(cacheMib) ? uint(cacheMib, 2 ** 30) : 2 ** 30 },
+      ladder: ladder(native), kv: kvCandidates(),
+    };
+  }
+  function fallBack(j, item, why) {
+    item.plan = null; item.planFallback = why;
+    item.phases = newModel(item.model).phases;
+    note(j, 'Using the standard tuning order for ' + item.model + ': ' + why + '.');
+    return false;
+  }
+  // Runs fn inside phase p: on a failure models.ini goes back to p's starting text (as runPhase).
+  async function inStage(j, p, fn) {
+    if (p.status !== 'running') { p._beforeText = presets.snapshot().text; p.status = 'running'; p.startedAt = now(); }
+    j.phase = p.label; save();
+    try { return await fn(); } catch (e) {
+      const restored = await restorePhase(j, p);
+      p.status = cancelled || e.cancelled ? 'interrupted' : 'failed'; p.reason = e.message;
+      for (const s of p.steps) if (s.status === 'running') { s.status = 'interrupted'; s.reason = e.message; }
+      p.finishedAt = now(); save();
+      if (!restored) throw Object.assign(Error(e.message + ' Settings changed or restoration failed; inspect models.ini before resuming.'), { unsafe: true });
+      throw e;
+    }
+  }
+  function closeStage(j, p, value) {
+    p.status = 'passed'; p.finishedAt = now(); p.value = value; p._committedRevision = j._revision;
+    delete p._beforeText; save();
+  }
+  // One fill-and-recall step through the calibrator, then (for a probe) the quality probes at the
+  // same profile. Returns the planner's outcome name and the reason.
+  async function fillCheck(j, step, base, withQuality) {
+    check();
+    if (presets.snapshot().revision !== j._revision) throw Object.assign(Error('Settings changed outside auto-tune.'), { fatal: true });
+    await unloadAll();
+    const cal = contextFactory({ applyUnlocked: guardedApply(j), onWrite: revision => { j._revision = revision; save(); }, onUpdate: () => {} });
+    child = { cancel: () => cal.cancelProbe() };
+    let r;
+    try { r = await cal.probe(j.model, { ctx: step.ctx, fill: step.fill, base, baseRevision: j._revision, promptBudgetSeconds: j.promptBudgetSeconds }); }
+    finally { child = null; }
+    check();
+    if (!r.passed) return { outcome: PLAN_CAUSE[r.cause] || 'load_failed', reason: r.reason || 'The fill-and-recall test failed.' };
+    if (withQuality) {
+      try {
+        await load(j);
+        const quality = await qualityCheck(j.model, chat, gate(j.model));
+        if (!quality.passed) return { outcome: 'quality_failed', reason: qualityFailure(quality) };
+      } catch (e) {
+        if (e.fatal || e.cancelled || cancelled) throw e;
+        return { outcome: /memory/i.test(e.message) ? 'oom' : 'load_failed', reason: e.message };
+      }
+    }
+    return { outcome: 'passed', reason: null, promptSeconds: r.promptSeconds };
+  }
+  const SPEC_OFF = { 'spec-type': 'none', 'spec-draft-n-max': '', 'spec-draft-p-min': '' };
+  async function measureFill(j, item, p, step, kind) {
+    const plan = item.plan;
+    const row = { id: kind + '-' + plan.results.length, label: (kind === 'probe' ? 'Fill ' : 'Final fill ') + step.ctx.toLocaleString('en-US') + ' · ' + step.kv + ' KV cache',
+      status: 'running', ctx: step.ctx, kv: step.kv, estimateMib: step.estimateMib, startedAt: now() };
+    p.steps.push(row); save();
+    note(j, (kind === 'probe' ? 'Filling ' : 'Final check: filling ') + step.ctx + ' tokens with ' + step.kv + ' KV cache (estimate ' + step.estimateMib + ' MiB).');
+    const r = kind === 'probe'
+      ? await fillCheck(j, step, { 'cache-type-k': step.kv, 'cache-type-v': step.kv, ...SPEC_OFF }, true)
+      : await fillCheck(j, step, {}, false);
+    Object.assign(row, { status: r.outcome === 'passed' ? 'passed' : 'failed', ...(r.reason ? { reason: r.reason } : {}),
+      ...(r.promptSeconds != null ? { promptSeconds: r.promptSeconds } : {}), finishedAt: now() });
+    plan.results.push({ step: kind, ctx: step.ctx, kv: step.kv, outcome: r.outcome }); save();
+  }
+  // Drives one model through the planner. True when the model finished; false when it fell back
+  // to the standard order (nothing measured yet). Each planner reply is one step; its result is
+  // kept on the item, so a resumed job continues where it stopped.
+  async function runPlanned(j, item, release) {
+    const plan = item.plan;
+    if (!plan.request) {
+      await unloadAll();
+      plan.request = await planRequest(item.model).catch(() => null);
+      if (!plan.request) return fallBack(j, item, 'its model file could not be read');
+      save();
+    }
+    try { return await planSteps(j, item, release); } catch (e) {
+      // A stop between steps (the planner's verdict, its failure) still puts back what an open
+      // stage changed; stages that failed inside inStage have already restored themselves.
+      let restored = true;
+      for (const p of item.phases) if (p._beforeText != null) {
+        restored = await restorePhase(j, p) && restored;
+        p.status = cancelled || e.cancelled ? 'interrupted' : 'failed'; p.reason = e.message; p.finishedAt = now();
+      }
+      save();
+      if (!restored && !e.unsafe) throw Object.assign(Error(e.message + ' Settings changed or restoration failed; inspect models.ini before resuming.'), { unsafe: true });
+      throw e;
+    }
+  }
+  async function planSteps(j, item, release) {
+    const plan = item.plan;
+    let final = null;
+    for (let n = 0; n < PLAN_STEP_LIMIT; n++) {
+      check();
+      let step;
+      try { step = planner.plan({ ...plan.request, results: plan.results }); }
+      catch {
+        if (!plan.results.length) return fallBack(j, item, 'the planner is unavailable');
+        throw Object.assign(publicFail('The auto-tune planner is unavailable.'), { fatal: true });
+      }
+      if (step.step === 'fail') {
+        if (step.code === 'unsizeable' && !plan.results.length) return fallBack(j, item, "its KV cache cannot be sized from the model's metadata");
+        throw publicFail(step.message);
+      }
+      const context = phaseOf(item, 'context');
+      if (step.step === 'probe') {
+        release.setReason('Chat is paused while noevia tunes ' + item.model + ': context and KV cache.');
+        await inStage(j, context, async () => {
+          if (!plan.before) { plan.before = keysOf(presets.get(j.model).options); save(); }
+          await ensureBaseline(j, presets.get(j.model).options);
+          await measureFill(j, item, context, step, 'probe');
+        });
+        continue;
+      }
+      if (context.status !== 'passed') {
+        // The search is over: write the chosen context and KV cache type, drafting as it was.
+        await inStage(j, context, async () => {
+          const spec = Object.fromEntries(Object.keys(SPEC_OFF).map(k => [k, plan.before?.[k] || '']));
+          await write(j, { 'ctx-size': String(step.ctx), 'cache-type-k': step.kv, 'cache-type-v': step.kv, ...spec });
+        });
+        closeStage(j, context, { context: step.ctx, kv: step.kv, probes: plan.results.filter(r => r.step === 'probe').length });
+        note(j, 'Chose context ' + step.ctx + ' with ' + step.kv + ' KV cache after the fill-and-recall test.');
+      }
+      if (step.step === 'phase') {
+        const p = phaseOf(item, step.id);
+        release.setReason('Chat is paused while noevia tunes ' + item.model + ': ' + p.label.toLowerCase() + '.');
+        await runPhase(j, item, p);
+        plan.results.push({ step: 'phase', id: step.id, outcome: p.value?.failed ? 'failed' : p.value?.skipped ? 'skipped' : 'passed' }); save();
+        continue;
+      }
+      const verify = phaseOf(item, 'verify');
+      if (step.step === 'verify') {
+        release.setReason('Chat is paused while noevia tunes ' + item.model + ': final fill check.');
+        await inStage(j, verify, () => measureFill(j, item, verify, step, 'verify'));
+        continue;
+      }
+      if (verify.status !== 'passed') closeStage(j, verify, { context: step.ctx });
+      if (presets.snapshot().revision !== j._revision) throw Object.assign(Error('Settings changed outside auto-tune.'), { fatal: true });
+      if (!final) {
+        j.phase = 'Verifying saved profile'; save();
+        await unloadAll(); await load(j);
+        final = await validate(item.model);
+        check();
+      }
+      if (step.step === 'serving') {
+        j.phase = 'Checking a realistic chat request'; save();
+        plan.serving = await servingCheck(j, item.model);
+        plan.results.push({ step: 'serving', outcome: plan.serving ? 'passed' : 'skipped' }); save();
+        continue;
+      }
+      final.serving = plan.serving || null;
+      await finishModel(j, item, final, { kv: step.kv, ctx: step.ctx });
+      return true;
+    }
+    throw publicFail('Auto-tune did not finish within its step limit.');
   }
   async function run(j) {
     try {
@@ -588,25 +804,28 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
           if (item._identity && item._identity !== stableIdentity) throw Object.assign(Error('Model identity changed since tuning began.'), { fatal: true });
           item._identity = stableIdentity;
           if (presets.snapshot().revision !== j._revision) throw Object.assign(Error('Settings changed outside auto-tune.'), { fatal: true });
-          for (const p of item.phases) {
-            if (p.status === 'passed') continue;
-            check(); j.phase = p.label;
-            release.setReason('Chat is paused while noevia tunes ' + item.model + ': ' + p.label.toLowerCase() + '.');
-            await runPhase(j, item, p);
+          // #1003: a planned item runs Rust's order; it falls back here when it cannot be planned.
+          if (!(item.plan && await runPlanned(j, item, release))) {
+            for (const p of item.phases) {
+              if (p.status === 'passed') continue;
+              check(); j.phase = p.label;
+              release.setReason('Chat is paused while noevia tunes ' + item.model + ': ' + p.label.toLowerCase() + '.');
+              await runPhase(j, item, p);
+            }
+            // A restart can land after the final phase committed but before this summary.
+            // Confirm the saved profile loads and passes again before reporting it ready.
+            if (presets.snapshot().revision !== j._revision)
+              throw Object.assign(Error('Settings changed outside auto-tune.'), { fatal: true });
+            j.phase = 'Verifying saved profile'; save();
+            await unloadAll();
+            await load(j);
+            const final = await validate(item.model);
+            check();
+            j.phase = 'Checking a realistic chat request'; save();
+            final.serving = await servingCheck(j, item.model);
+            check();
+            await finishModel(j, item, final);
           }
-          // A restart can land after the final phase committed but before this summary.
-          // Confirm the saved profile loads and passes again before reporting it ready.
-          if (presets.snapshot().revision !== j._revision)
-            throw Object.assign(Error('Settings changed outside auto-tune.'), { fatal: true });
-          j.phase = 'Verifying saved profile'; save();
-          await unloadAll();
-          await load(j);
-          const final = await validate(item.model);
-          check();
-          j.phase = 'Checking a realistic chat request'; save();
-          final.serving = await servingCheck(j, item.model);
-          check();
-          await finishModel(j, item, final);
         } finally {
           idleAbort = null; j.waiting = false; release?.(); save();
         }
@@ -644,7 +863,7 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
       if (!models.length) return { ok: false, status: 409, body: { error: 'All configured chat models already have current tunes.' } };
       cancelled = false;
       const j = { id: crypto.randomUUID(), model: models[0], bulk, promptBudgetSeconds, status: 'running',
-        phase: 'Preparing', startedAt: now(), log: [], models: models.map(newModel), _revision: presets.snapshot().revision,
+        phase: 'Preparing', startedAt: now(), log: [], models: models.map(m => newModel(m, planner.mode() === 'wasm')), _revision: presets.snapshot().revision,
         queueProgress: { done: 0, total: models.length } };
       state.job = j; save(); completion = run(j); completion.catch(() => {});
       return { ok: true, status: 202, body: publicJob(j) };
@@ -734,7 +953,9 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
         item.status = 'pending'; delete item.error;
         for (const p of item.phases) if (p.status !== 'passed') {
           p.status = 'pending'; delete p.reason; delete p.restored;
-          p.steps = p.steps.map(s => ({ ...s, status: 'pending', reason: undefined }));
+          // Planned stages (#1003) keep the rows the planner has results for; the rest re-run.
+          p.steps = item.plan && ['context', 'verify'].includes(p.id) ? p.steps.filter(s => ['passed', 'failed'].includes(s.status))
+            : p.steps.map(s => ({ ...s, status: 'pending', reason: undefined }));
         }
       }
       save(); completion = run(j); completion.catch(() => {});
