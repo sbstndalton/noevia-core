@@ -2,12 +2,15 @@
 
 // Storage path rules (#978): the guards every request-supplied storage path and upload filename
 // passes through. Moved here unchanged from storage-client.cjs (safeRelativePath, cleanRoot,
-// joinRoot) and uploads.cjs validate (the plain-filename rule).
+// joinRoot) and uploads.cjs validate (the plain-filename rule). One deliberate tightening since the
+// move: safeRelativePath refuses a path containing NUL.
 
 function safeRelativePathJs(raw) {
   const value = String(raw || '').trim().replace(/\\/g, '/');
   if (!value || value.length > 500) return '';
   if (value.startsWith('/')) return '';
+  // #978: no filesystem or object store names a file with NUL; refuse it rather than pass it on.
+  if (value.includes('\0')) return '';
   const segments = value.split('/').filter(Boolean);
   if (!segments.length) return '';
   if (segments.some((s) => s === '.' || s === '..')) return '';
