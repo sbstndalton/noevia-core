@@ -101,6 +101,7 @@ const errors = [
   { name: 'unknown model', status: 404, body: '{"error":{"message":"model not found: synthetic-model"}}', expect: { kind: 'bad_request', reason: 'model not found: synthetic-model' } },
   { name: 'secrets and internals are redacted', status: 500, body: '{"error":{"message":"upstream http://10.9.8.7:8080/v1/chat failed for Bearer synthetic.token.value with api_key=sk-synthetic0000 at /srv/models/synthetic/x.gguf via llama:8080 (198.51.100.4) ghp_000000000000syntheticxx"}}', expect: { kind: 'other', reason: 'upstream [url] failed for Bearer [redacted] with api_key=[redacted] at [path] via [address] [address] [redacted]' } },
   { name: 'a provider cannot put a link in the chat (#455)', status: 400, body: '{"error":{"message":"Visit evil.example to fix this"}}', expect: { kind: 'bad_request', reason: 'Visit [host] to fix this' } },
+  { name: 'markdown link and image syntax (#1017)', status: 400, body: '{"error":{"message":"Fix it [here](javascript:alert) or ![x](tracker) or [a][b]; [plain] stays"}}', expect: { kind: 'bad_request', reason: 'Fix it [link] or [link] or [link] [plain] stays' } },
   { name: 'non-JSON body', status: 500, body: 'segfault in worker\n\tat frame 3', expect: { kind: 'other', reason: '' } },
   { name: 'JSON without a message', status: 500, body: '{"code":7}', expect: { kind: 'other', reason: '' } },
   { name: 'long message is capped', status: 500, body: JSON.stringify({ error: 'x'.repeat(10) + ' word'.repeat(80) }), expect: { kind: 'other' } },

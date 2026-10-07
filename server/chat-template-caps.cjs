@@ -61,6 +61,17 @@ function classify(status, text) {
   try { return davParseWasm.providerErrorKind(status, String(text ?? '')); } catch { return null; }
 }
 
+// #1016: only these say the tools themselves were refused. A template that raises on the system role
+// or on role order without the parser wording is not fixed by dropping tools, so no retry.
+const TOOL_SPECIFIC = /unable to generate parser|tools param requires --jinja|does not support tools?\b/i;
+
+/** Whether a failed reply is worth one retry without tools: classified as a template/tools failure
+ *  (Rust) and worded as a tool-specific one. */
+function toolsRefused(status, text) {
+  const detail = String(text ?? '');
+  return TOOL_SPECIFIC.test(detail) && classify(status, detail)?.kind === 'template_or_tools_unsupported';
+}
+
 /** The chat text for a failed provider reply, or null (the caller keeps its fixed sentences). */
 function failureText(status, text) {
   const c = classify(status, text);
@@ -81,14 +92,14 @@ function failureText(status, text) {
  *  the reactive retry as the safety net. */
 function createToolsGate({ ttlMs = 10 * 60 * 1000, unknownTtlMs = 30 * 1000, max = 64, now = Date.now } = {}) {
   const cache = new Map();
+  // #1018: one /props lookup per model at a time; concurrent misses share it.
+  const inflight = new Map();
   const remember = (model, sendTools, ttl) => {
     cache.delete(model);
     cache.set(model, { sendTools, until: now() + ttl });
     while (cache.size > max) cache.delete(cache.keys().next().value);
   };
-  async function allowsTools(manager, model) {
-    const hit = cache.get(model);
-    if (hit && now() < hit.until) return hit.sendTools;
+  async function lookup(manager, model) {
     let template = null;
     try {
       const r = await manager.props(model);
@@ -100,6 +111,22 @@ function createToolsGate({ ttlMs = 10 * 60 * 1000, unknownTtlMs = 30 * 1000, max
     remember(model, sendTools, ttlMs);
     return sendTools;
   }
+  /** `signal` (the chat's) ends this caller's wait, as unknown (tools allowed); a shared lookup
+   *  keeps running for the others. */
+  async function allowsTools(manager, model, signal) {
+    const hit = cache.get(model);
+    if (hit && now() < hit.until) return hit.sendTools;
+    let p = inflight.get(model);
+    if (!p) {
+      p = lookup(manager, model).finally(() => inflight.delete(model));
+      inflight.set(model, p);
+    }
+    if (!signal) return p;
+    if (signal.aborted) return true;
+    let onAbort;
+    const aborted = new Promise((resolve) => { onAbort = () => resolve(true); signal.addEventListener('abort', onAbort, { once: true }); });
+    try { return await Promise.race([p, aborted]); } finally { signal.removeEventListener('abort', onAbort); }
+  }
   return {
     allowsTools,
     markUnsupported: (model) => remember(model, false, ttlMs),
@@ -110,4 +137,4 @@ function createToolsGate({ ttlMs = 10 * 60 * 1000, unknownTtlMs = 30 * 1000, max
 
 const toolsGate = createToolsGate();
 
-module.exports = { FLAG, mode, startup, classify, failureText, createToolsGate, toolsGate, TOOLS_OFF_NOTICE, TOOLS_RETRY_NOTICE };
+module.exports = { FLAG, mode, startup, classify, toolsRefused, failureText, createToolsGate, toolsGate, TOOLS_OFF_NOTICE, TOOLS_RETRY_NOTICE };

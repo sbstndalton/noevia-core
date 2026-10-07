@@ -1136,7 +1136,7 @@ function createChatHandler({
     // tools is sent none (nor tool_choice), and the user is told once. Unknown templates keep them.
     const templateGate = provider.id === DEFAULT_PROVIDER_ID && typeof modelManager?.props === 'function' && templateCaps.mode() === 'wasm';
     let templateToolsOff = false;
-    if (templateGate && activeTools.length && !(await templateToolsGate.allowsTools(modelManager, model))) {
+    if (templateGate && activeTools.length && !(await templateToolsGate.allowsTools(modelManager, model, chatSignal.signal))) {
       templateToolsOff = true;
       send({ type: 'warning', text: templateCaps.TOOLS_OFF_NOTICE });
     }
@@ -1203,15 +1203,17 @@ function createChatHandler({
         // not build a tool-call parser for it). Retry this round once without tools, and say so.
         if (templateGate && !templateToolsOff && activeTools.length && upstream.status >= 400) {
           const detail = (await readCappedText(upstream.clone(), PROVIDER_ERROR_BODY_CAP).catch(() => ({ text: '' }))).text;
-          if (templateCaps.classify(upstream.status, detail)?.kind === 'template_or_tools_unsupported') {
+          if (templateCaps.toolsRefused(upstream.status, detail)) {
             discardBody(upstream);
             templateToolsOff = true;
-            templateToolsGate.markUnsupported(model);
             send({ type: 'warning', text: templateCaps.TOOLS_RETRY_NOTICE });
             upstream = await reasoningEffort.requestWithEffort(providerFetch, upstreamUrl, {
               method: 'POST', headers: upstreamHeaders, signal: chatSignal.signal, redirect: 'error',
             }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:true,stream_options:{include_usage:true},
               ...sampling.params}, provider, model, effort, send);
+            // #1015: remembered only when dropping tools is what fixed it; a template that fails
+            // either way is not marked, so the next chat still offers tools.
+            if (upstream.ok) templateToolsGate.markUnsupported(model);
           }
         }
       } catch (err) {
