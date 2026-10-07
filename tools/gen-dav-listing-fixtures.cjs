@@ -32,7 +32,7 @@ add('upper-case tag names do not match', `<D:RESPONSE><D:HREF>${DIR}/u.md</D:HRE
 add('prefix with dash does not match', `<d-x:response><d:href>${DIR}/dash.md</d:href></d-x:response>`);
 add('relative hrefs', ms(file('a.md'), file('./b.md'), file('Notes/c.md'), file('../Notes/d.md')));
 add('absolute same-origin URL', ms(file(`https://dav.example.test${DIR}/abs.md`)));
-add('absolute foreign host, same path (host is not checked)', ms(file(`https://elsewhere.example.test${DIR}/foreign.md`)));
+add('absolute foreign host, same path (#969: skipped)', ms(file(`https://elsewhere.example.test${DIR}/foreign.md`)));
 add('protocol-relative', ms(file(`//elsewhere.example.test${DIR}/pr.md`)));
 add('non-http schemes', ms(file(`javascript:${DIR}/js.md`), file(`file://${DIR}/f.md`), file(`mailto:${DIR}/m.md`), file(`data:text/plain,${DIR}/d.md`)));
 add('backslashes', ms(file(`\\remote.php\\dav\\files\\alice\\Notes\\bs.md`), file(`${DIR}\\bs2.md`)));
@@ -62,6 +62,45 @@ add('NUL and controls in names', ms(file(`${DIR}/%00.md`), file(`${DIR}/a%01b`),
 add('raw controls stripped by the URL parser', ms(file(`${DIR}/ta\tb.md`), file(`${DIR}/n\nl.md`), file(`${DIR}/c\rr.md`)));
 add('dot names', ms(file(`${DIR}/.hidden`), file(`${DIR}/...`), file(`${DIR}/.`)));
 add('very long name', ms(file(`${DIR}/${'n'.repeat(3000)}.md`)));
+
+// ── #969: foreign origins are skipped, same-origin absolute and relative hrefs kept ──
+add('#969 hosts, ports and schemes', ms(
+  file(`https://dav.example.test${DIR}/same.md`), file(`https://DAV.Example.TEST${DIR}/case.md`), file(`https://dav.example.test:443${DIR}/default-port.md`),
+  file(`https://dav.example.test:8443${DIR}/other-port.md`), file(`http://dav.example.test${DIR}/http.md`), file(`ftp://dav.example.test${DIR}/ftp.md`),
+  file(`wss://dav.example.test${DIR}/wss.md`), file(`https://evil.example.test${DIR}/evil.md`), file(`https://dav.example.test.evil.test${DIR}/suffix.md`),
+  file(`https://evil.test/dav.example.test${DIR}/path.md`), file(`https://127.0.0.1${DIR}/ip.md`), file(`https://[::1]${DIR}/v6.md`),
+  file(`HTTPS://dav.example.test${DIR}/upper-scheme.md`), file(`https:dav.example.test${DIR}/no-slashes.md`), file(`https:/${DIR}/one-slash.md`),
+  file(`/\\evil.example.test${DIR}/bs-host.md`), file(`\\\\evil.example.test${DIR}/unc.md`), file(`//dav.example.test${DIR}/pr-same.md`), file(`rel.md`)));
+add('#969 userinfo', ms(
+  file(`https://user:pw@dav.example.test${DIR}/ui-same.md`), file(`https://dav.example.test@evil.example.test${DIR}/ui-evil.md`),
+  file(`https://evil.example.test@dav.example.test${DIR}/ui-trick.md`), file(`https://dav.example.test%40evil.example.test${DIR}/pct-at.md`)));
+add('#969 IDN', ms(
+  file(`https://bücher.example.test${DIR}/idn.md`), file(`https://xn--bcher-kva.example.test${DIR}/puny.md`), file(`https://dаv.example.test${DIR}/cyrillic-a.md`),
+  file(`https://ｄａｖ.example.test${DIR}/fullwidth.md`)));
+add('#969 IDN target', ms(file(`https://bücher.example.test${DIR}/u.md`), file(`https://xn--bcher-kva.example.test${DIR}/p.md`), file(`${DIR}/rel.md`)), `https://xn--bcher-kva.example.test${DIR}/`);
+add('#969 port target', ms(file(`https://dav.example.test${DIR}/noport.md`), file(`https://dav.example.test:8443${DIR}/port.md`), file(`${DIR}/rel.md`)), `https://dav.example.test:8443${DIR}/`);
+add('#969 http target', ms(file(`https://dav.example.test${DIR}/s.md`), file(`http://dav.example.test:80${DIR}/p.md`), file(`${DIR}/rel.md`)), `http://dav.example.test${DIR}/`);
+
+// ── #970: dot segments and encoded separators ──
+add('#970 encoded dot-dot names', ms(
+  file(`${DIR}/..%2f`), file(`${DIR}/..%2F`), file(`${DIR}/.%2f`), file(`${DIR}/%2e%2e%2f`), file(`${DIR}/%2e%2e%2F%2F`), file(`${DIR}/%2e%2e`),
+  file(`${DIR}/%2E%2e`), file(`${DIR}/.%2E`), file(`${DIR}/%2e`), file(`${DIR}/..%5c`), file(`${DIR}/%2e%2e%5C`), file(`${DIR}/..%5C..`),
+  file(`${DIR}/%5c`), file(`${DIR}/a%5cb`), file(`${DIR}/..%2fx`), file(`${DIR}/...%2f`), file(`${DIR}/..a`), file(`${DIR}/a..`), file(`${DIR}/ok.md`)));
+add('#970 dot-dot via entities', ms(file(`${DIR}/&#46;&#46;&#37;2f`), file(`${DIR}/&#x2e;&#x2E;%2F`), file(`${DIR}/&#46;%2f`)));
+
+// ── #971: controls, backslashes and bidi controls ──
+add('#971 NUL, DEL and C0', ms(file(`${DIR}/a%00b`), file(`${DIR}/%7Fx`), file(`${DIR}/x%1F`), file(`${DIR}/%1B[31m`), file(`${DIR}/bell%07`), file(`${DIR}/ok%20space`)));
+add('#971 C1', ms(file(`${DIR}/c1%C2%80`), file(`${DIR}/c1%C2%85`), file(`${DIR}/c1%C2%9B`), file(`${DIR}/c1%C2%9F`), file(`${DIR}/nbsp%C2%A0ok`), file(`${DIR}/raw\u0085nel`), file(`${DIR}/raw\u009fc1`)));
+add('#971 C1 via entities', ms(file(`${DIR}/e&#x85;`), file(`${DIR}/e&#159;`), file(`${DIR}/e&#127;`), file(`${DIR}/e&#1;`), file(`${DIR}/e&#160;ok`)));
+for (const cp of [0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069, 0x200e, 0x200f, 0x061c]) {
+  const ch = String.fromCodePoint(cp);
+  const pct = encodeURIComponent(ch);
+  add(`#971 bidi U+${cp.toString(16).toUpperCase().padStart(4, '0')}`, ms(file(`${DIR}/${pct}gnp.exe`), file(`${DIR}/a${ch}b`), file(`${DIR}/x&#${cp};`), file(`${DIR}/x&#x${cp.toString(16)};y`), file(`${DIR}/clean.md`)));
+}
+add('#971 near-bidi characters stay', ms(file(`${DIR}/zw%E2%80%8B.md`), file(`${DIR}/zwj%E2%80%8D.md`), file(`${DIR}/%E2%80%AF.md`), file(`${DIR}/%E2%81%A0.md`), file(`${DIR}/%E2%81%AA.md`), file(`${DIR}/%D8%9B.md`), file(`${DIR}/%D8%9D.md`)));
+add('#971 backslashes', ms(file(`${DIR}/a%5Cb.md`), file(`${DIR}/%5C`), file(`${DIR}/x&#92;y`), file(`${DIR}/x&#x5c;`)));
+add('#969-#971 mixed', ms(self, file(`${DIR}/good.md`), file(`https://evil.example.test${DIR}/%E2%80%AE..%2f`), file(`${DIR}/%E2%80%AE..%5c`), file(`${DIR}/..%2f%00`),
+  dir(`${DIR}/Sub%E2%81%A6/`), file(`${DIR}/also-good.md`), file(`https://dav.example.test${DIR}/%C2%9Bx`), file(`https://dav.example.test${DIR}/fine.md`)));
 
 // ── percent and unicode decoding ──
 add('percent-encoded utf-8', ms(file(`${DIR}/%C3%A9t%C3%A9.md`), file(`${DIR}/%E2%80%AE.md`), file(`${DIR}/%F0%9F%98%80.md`)));
@@ -127,8 +166,12 @@ const rand = () => { seed = (seed * 1103515245 + 12345) >>> 0; return seed / 2 *
 const pick = (a) => a[Math.floor(rand() * a.length)];
 const pieces = ['a', 'Z', '0', '.', '..', '/', '//', '%', '%2e', '%2E', '%2F', '%2f', '%25', '%C3%A9', '%E2%80%AE', '%C3', '%FF', '%00', '%5C', '\\',
   '&amp;', '&lt;', '&#38;', '&#x2F;', '&#47;', '&#0;', '&#xD800;', '&bogus;', '&', ';', '#', '?', ' ', '\t', ' ', '\u0085', '﻿',
-  'é', 'é', '日', '😀', '\ud800', '<', '>', '<d:x/>', ':', '@', 'Notes', 'alice', 'remote.php', '‮', '　'];
-const prefixes = [`${DIR}/`, `${DIR}/`, `${DIR}/`, '', '/', '../', `https://dav.example.test${DIR}/`, `//other.example.test${DIR}/`, `${DIR}`, `${DIR}/Sub/`, 'Notes/'];
+  'é', 'é', '日', '😀', '\ud800', '<', '>', '<d:x/>', ':', '@', 'Notes', 'alice', 'remote.php', '‮', '　',
+  '%2e%2e%2f', '..%2f', '..%5C', '%00', '%7F', '%C2%80', '%C2%9F', '%C2%85', '\u0085', '\u009b', '\u007f', '\u0001', '&#x85;', '&#127;', '&#92;',
+  '%E2%80%AA', '%E2%80%AB', '%E2%80%AC', '%E2%80%AD', '%E2%81%A6', '%E2%81%A7', '%E2%81%A8', '%E2%81%A9', '%E2%80%8E', '%E2%80%8F', '%D8%9C',
+  '\u202a', '\u202d', '\u2066', '\u2069', '\u200e', '\u200f', '\u061c', '&#x202E;', '&#8207;'];
+const prefixes = [`${DIR}/`, `${DIR}/`, `${DIR}/`, '', '/', '../', `https://dav.example.test${DIR}/`, `//other.example.test${DIR}/`, `${DIR}`, `https://dav.example.test:8443${DIR}/`,
+  `http://dav.example.test${DIR}/`, `https://u:p@dav.example.test${DIR}/`, `https://dav.example.test@other.example.test${DIR}/`, `https://xn--dv-ilb.example.test${DIR}/`, `${DIR}/Sub/`, 'Notes/'];
 const tagPrefixes = ['d', 'D', 'lp1', '', 'x-y', 'ns0'];
 const tag = (p, n) => (p ? `${p}:${n}` : n);
 for (let n = 0; n < 500; n++) {

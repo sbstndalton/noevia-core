@@ -41,8 +41,13 @@ test('dav-parse.wasm agrees with the JS reference on seeded random listings', { 
   const D = '/remote.php/dav/files/alice/Notes';
   const T = `https://dav.example.test${D}/`;
   const pieces = ['a', '.', '..', '/', '%', '%2e', '%2F', '%25', '%C3%A9', '%C3', '%ED%A0%80', '%00', '\\', '&amp;', '&#47;', '&#x2e;', '&#xD800;', '&#0;', '&x;', '&', '#', '?',
-    ' ', '\t', '\n', ' ', '\u0085', '﻿', '　', 'é', '😀', '\ud800', '\udc00', '<', '>', ':', '@', 'Notes', 'http://x', '//', '‮', 'ǅ', 'İ', 'ﬀ'];
-  const prefixes = [`${D}/`, `${D}/`, '', '../', `https://dav.example.test${D}/`, `//other.example.test${D}/`, D, `${D}/Sub/`, 'Notes/', 'file:', 'http://[::1]/'];
+    ' ', '\t', '\n', ' ', '\u0085', '﻿', '　', 'é', '😀', '\ud800', '\udc00', '<', '>', ':', '@', 'Notes', 'http://x', '//', '‮', 'ǅ', 'İ', 'ﬀ',
+    // #969-#971: encoded dot segments/separators, C0/DEL/C1 and every bidi control, raw and encoded.
+    '..%2f', '%2e%2e%2F', '..%5c', '%5C', '%7F', '\u007f', '%01', '\u0001', '%C2%80', '%C2%85', '%C2%9F', '\u0080', '\u009b', '&#x85;', '&#127;', '&#92;',
+    '\u202a', '\u202b', '\u202c', '\u202d', '\u202e', '\u2066', '\u2067', '\u2068', '\u2069', '\u200e', '\u200f', '\u061c', '%E2%80%8F', '%D8%9C', '&#x2069;', '\u200b', '\u206a'];
+  const prefixes = [`${D}/`, `${D}/`, '', '../', `https://dav.example.test${D}/`, `//other.example.test${D}/`, D, `${D}/Sub/`, 'Notes/', 'file:', 'http://[::1]/',
+    `https://dav.example.test:443${D}/`, `https://dav.example.test:8443${D}/`, `http://dav.example.test${D}/`, `HTTPS://DAV.example.test${D}/`, `https://u:p@dav.example.test${D}/`,
+    `https://dav.example.test@evil.example.test${D}/`, `https://bücher.example.test${D}/`, `https://xn--bcher-kva.example.test${D}/`, `https://ｄａｖ.example.test${D}/`, `ftp://dav.example.test${D}/`, `/\\evil.example.test${D}/`];
   const tp = ['d', 'D', '', 'lp1', 'x-y'];
   const tag = (p, n) => (p ? `${p}:${n}` : n);
   let n = 0;
@@ -57,7 +62,7 @@ test('dav-parse.wasm agrees with the JS reference on seeded random listings', { 
         + (rand() < 0.5 ? `<${tag(pick(tp), 'getcontentlength')}>${pick(['1', '007', '', 'x', '١', '99999999999999999999999'])}<` : '')
         + (rand() < 0.95 ? `</${tag(p, 'response')}>` : '');
     }
-    const target = rand() < 0.9 ? T : pick(['https://dav.example.test/', 'https://dav.example.test/a%2Fb/', 'https://dav.example.test/%C3%A9/', 'nope', 'https://dav.example.test/%zz/']);
+    const target = rand() < 0.9 ? T : pick(['https://dav.example.test/', 'https://dav.example.test/a%2Fb/', `https://dav.example.test:8443${D}/`, `http://dav.example.test${D}/`, `https://xn--bcher-kva.example.test${D}/`, 'https://dav.example.test/%C3%A9/', 'nope', 'https://dav.example.test/%zz/']);
     const js = run(listingRecordsJs, body, target), wasm = run(davParseWasm.listRecords, body, target);
     assert.deepEqual(wasm, js, `random case ${n}: ${JSON.stringify({ body, target })}`);
   }
