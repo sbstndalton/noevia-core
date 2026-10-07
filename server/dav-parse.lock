@@ -8,6 +8,6 @@
 # DAV_PARSE_WASM_SHA256 or the image build fails and every *_IMPL=wasm switch refuses to load it.
 # Read by server/dav-parse-wasm.cjs, noevia-core CI and noevia's build/web.Dockerfile. The ref must
 # be on noevia-rs main before a release pins this core commit (noevia CI checks it).
-NOEVIA_RS_REF=7d9bad6e8c900c25a61c14dc98fa064725c8dff3
-NOEVIA_RS_SHA256=0cd65084239726f6a20e054453b95703af9e10de08f5fce915a0dd0d5f2ed3c2
-DAV_PARSE_WASM_SHA256=74ee5e0977bd0436b4007975c37ab186baa89f0b6893f2de1e26a1921c5c3f34
+NOEVIA_RS_REF=214ec11b2ab58fda1786239cb7fdd5f45913a73b
+NOEVIA_RS_SHA256=587cd88c3a1232324a291ee7d67cb5471e10331705bb004e6981191e819fd594
+DAV_PARSE_WASM_SHA256=bf81aa5a9f6696d4a8a4c666212a54a735caf7fb529cb8f8b6d88441b6b30e3b
