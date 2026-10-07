@@ -23,6 +23,7 @@
 const PASS = Symbol('unhandled');
 const MODEL_LIST_TTL_MS = 10 * 60 * 1000;
 const MODEL_LIST_MAX = 200;
+const MODEL_REFRESH_GAP_MS = 10 * 1000;
 
 /** The model ids in an OpenAI-compatible /v1/models answer (untrusted remote JSON). */
 function modelIdsFrom(body, max = MODEL_LIST_MAX) {
@@ -118,6 +119,8 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
   // the address and key it was fetched with, so an edit or another account never reads a stale or
   // foreign list. The key is used server-side only and never returned.
   const modelLists = new Map();
+  const inflight = new Map();
+  const lastRefresh = new Map();
   async function providerModels(req, res, id, authn, url) {
     const userId = authn?.user?.id;
     if (!userId) return json(res, 401, { error: 'Sign in first.' });
@@ -135,19 +138,35 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
     // change in force. Shared rows are an administrator's and are used for chat as they are.
     if (!row.shared && !endpointApproved(authn, row.baseUrl)) return json(res, 400, { error: 'Provider origin is not approved for member connections; contact an administrator.' });
     const key = JSON.stringify([userId, row.id, row.baseUrl, hasRealKey(row.apiKey) ? row.apiKey : '']);
+    const owner = JSON.stringify([userId, row.id]);
     const hit = modelLists.get(key);
-    if (!refresh && hit && hit.until > now()) return json(res, 200, { models: hit.models, cached: true, fetchedAt: hit.fetchedAt });
-    const headers = { 'Content-Type': 'application/json' };
-    if (hasRealKey(row.apiKey)) headers.Authorization = `Bearer ${row.apiKey}`;
+    // A refresh within MODEL_REFRESH_GAP_MS of the last one for this account and provider is served
+    // from the cache, so a held-down Refresh button cannot hammer the provider with the stored key.
+    const throttled = refresh && hit && now() - (lastRefresh.get(owner) || 0) < MODEL_REFRESH_GAP_MS;
+    if ((!refresh || throttled) && hit && hit.until > now()) return json(res, 200, { models: hit.models, cached: true, fetchedAt: hit.fetchedAt, ...(throttled ? { throttled: true } : {}) });
+    if (refresh) lastRefresh.set(owner, now());
+    // Concurrent requests for the same list share one upstream fetch.
+    let pending = inflight.get(key);
+    if (!pending) {
+      const headers = { 'Content-Type': 'application/json' };
+      if (hasRealKey(row.apiKey)) headers.Authorization = `Bearer ${row.apiKey}`;
+      pending = (async () => {
+        const result = await fetchJson(`${row.baseUrl.replace(/\/v1$/, '')}/v1/models`, { headers, redirect: 'error' }, 8000);
+        if (!result.ok) return { status: result.status };
+        const models = modelIdsFrom(result.body);
+        const fetchedAt = now();
+        for (const k of modelLists.keys()) { const [u, id] = JSON.parse(k); if (u === userId && id === row.id) modelLists.delete(k); }
+        modelLists.set(key, { models, until: fetchedAt + MODEL_LIST_TTL_MS, fetchedAt });
+        while (modelLists.size > 500) modelLists.delete(modelLists.keys().next().value);
+        while (lastRefresh.size > 500) lastRefresh.delete(lastRefresh.keys().next().value);
+        return { models, fetchedAt };
+      })().finally(() => inflight.delete(key));
+      inflight.set(key, pending);
+    }
     try {
-      const result = await fetchJson(`${row.baseUrl.replace(/\/v1$/, '')}/v1/models`, { headers, redirect: 'error' }, 8000);
-      if (!result.ok) return json(res, 502, { error: `provider returned ${result.status}` });
-      const models = modelIdsFrom(result.body);
-      const fetchedAt = now();
-      for (const k of modelLists.keys()) if (JSON.parse(k)[0] === userId && JSON.parse(k)[1] === row.id) modelLists.delete(k);
-      modelLists.set(key, { models, until: fetchedAt + MODEL_LIST_TTL_MS, fetchedAt });
-      while (modelLists.size > 500) modelLists.delete(modelLists.keys().next().value);
-      return json(res, 200, { models, cached: false, fetchedAt });
+      const out = await pending;
+      if (out.status) return json(res, 502, { error: `provider returned ${out.status}` });
+      return json(res, 200, { models: out.models, cached: false, fetchedAt: out.fetchedAt });
     } catch { return json(res, 502, { error: 'The provider could not be reached.' }); }
   }
 
@@ -348,4 +367,4 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
   };
 }
 
-module.exports = { createProviderRoutes, modelIdsFrom, MODEL_LIST_TTL_MS };
+module.exports = { createProviderRoutes, modelIdsFrom, MODEL_LIST_TTL_MS, MODEL_REFRESH_GAP_MS };

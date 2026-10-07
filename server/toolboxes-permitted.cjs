@@ -52,7 +52,13 @@ const REASONS = {
  *  hand-picked list, falling back to the default for a project predating toolboxes. Never more
  *  than one of those two lists, so Automatic cannot add a write the default does not offer. */
 function projectToolboxIds(project, defaultToolboxes) {
-  if (project && project.toolsMode === 'auto') return [...defaultToolboxes];
+  if (project && project.toolsMode === 'auto') {
+    // The Project documents box (read-only) that project-docs-default.cjs added on the first upload
+    // stays in Automatic too, or an Automatic project could not read its own uploads.
+    const docs = require('./project-docs-default.cjs').BOX;
+    const keepDocs = project.docsToolboxDefaulted === true && Array.isArray(project.toolboxes) && project.toolboxes.includes(docs) && !defaultToolboxes.includes(docs);
+    return keepDocs ? [...defaultToolboxes, docs] : [...defaultToolboxes];
+  }
   return Array.isArray(project && project.toolboxes) ? project.toolboxes : defaultToolboxes;
 }
 

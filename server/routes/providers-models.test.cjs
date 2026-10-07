@@ -5,7 +5,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
-const { createProviderRoutes, modelIdsFrom, MODEL_LIST_TTL_MS } = require('./providers.cjs');
+const { createProviderRoutes, modelIdsFrom, MODEL_LIST_TTL_MS, MODEL_REFRESH_GAP_MS } = require('./providers.cjs');
 
 function fixture({ probe = async () => ({ ok: true, status: 200, body: { data: [{ id: 'syn-fast' }, { id: 'syn-smart' }] } }), chatgptOn = false } = {}) {
   const sent = [];
@@ -59,6 +59,7 @@ test('caches per account until the TTL or a refresh; another account never reads
   assert.equal(f.probes.length, 1);
   await f.call('/api/providers/mine/models', { user: 'u2' });
   assert.equal(f.probes.length, 2, 'u2 fetched its own list');
+  f.tick(MODEL_REFRESH_GAP_MS);
   const refreshed = await f.call('/api/providers/mine/models?refresh=1');
   assert.equal(refreshed.body.cached, false);
   assert.equal(f.probes.length, 3);
@@ -99,4 +100,32 @@ test('modelIdsFrom keeps distinct, bounded string ids from untrusted JSON', () =
   assert.deepEqual(modelIdsFrom({ data: [{ id: ' a ' }, { id: 'a' }, { id: 7 }, null, { id: 'b\u0000c' }, { id: 'x'.repeat(201) }, { id: 'ok/m:1' }] }), ['a', 'ok/m:1']);
   assert.equal(modelIdsFrom({ data: Array.from({ length: 300 }, (_, i) => ({ id: `m${i}` })) }).length, 200);
   assert.equal(modelIdsFrom({ data: Array.from({ length: 300 }, (_, i) => ({ id: `m${i}` })) }, 100).length, 100);
+});
+
+test('refreshes closer than the minimum gap are served from the cache', async () => {
+  const f = fixture();
+  await f.call('/api/providers/mine/models');
+  f.tick(MODEL_REFRESH_GAP_MS);
+  assert.equal((await f.call('/api/providers/mine/models?refresh=1')).body.cached, false);
+  f.tick(1000);
+  const again = await f.call('/api/providers/mine/models?refresh=1');
+  assert.equal(again.body.cached, true);
+  assert.equal(again.body.throttled, true);
+  assert.equal(f.probes.length, 2, 'the second refresh did not reach the provider');
+  f.tick(MODEL_REFRESH_GAP_MS);
+  assert.equal((await f.call('/api/providers/mine/models?refresh=1')).body.cached, false);
+  assert.equal(f.probes.length, 3);
+});
+
+test('concurrent requests for one list share a single upstream fetch', async () => {
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const f = fixture({ probe: async () => { await gate; return { ok: true, status: 200, body: { data: [{ id: 'syn-a' }] } }; } });
+  const both = Promise.all([f.call('/api/providers/mine/models'), f.call('/api/providers/mine/models')]);
+  await new Promise((r) => setImmediate(r));
+  release();
+  const [a, b] = await both;
+  assert.equal(f.probes.length, 1);
+  assert.deepEqual(a.body.models, ['syn-a']);
+  assert.deepEqual(b.body.models, ['syn-a']);
 });

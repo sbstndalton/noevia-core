@@ -120,3 +120,10 @@ test('a formerly-recorded candidate note is released by reconcile once it no lon
  assert.deepEqual(Object.keys(p.instructionSkills),[]);
  assert.deepEqual(skills.sources(p).map(f=>f.name),['meeting.md']);
 });
+
+test('#1006 review: missing tools follow Tools Automatic, not the stored hand-picked list',()=>{
+  const f=file('Body','name: Review\ndescription: Notes\nrequires: web');
+  assert.deepEqual(skills.inspect(f,{toolboxes:['core','web']}).missingTools,[]);
+  assert.deepEqual(skills.inspect(f,{toolsMode:'auto',toolboxes:['core','web']}).missingTools,['web'],'Automatic sends the default set');
+  assert.deepEqual(skills.inspect(f,{}).missingTools,['web']);
+});
