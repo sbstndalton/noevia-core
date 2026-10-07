@@ -103,6 +103,7 @@ function listingRecordsJs(body, target) {
   return records;
 }
 
+const PUBLIC_FAILURE = 'storage listing could not be read';
 const IMPLS = new Set(['js', 'wasm']);
 let warnedImpl = '';
 
@@ -122,8 +123,17 @@ function davParseImpl(env = process.env) {
 /** The listing as storage-client's davList used to build it inline: `{ name, isDir, size }` with
  *  `size` a Number or null. */
 function listingEntries(body, target, { impl = davParseImpl() } = {}) {
-  const records = impl === 'wasm' ? davParseWasm.listRecords(body, target) : listingRecordsJs(body, target);
+  let records;
+  if (impl === 'wasm') {
+    try { records = davParseWasm.listRecords(body, target); } catch (err) {
+      // Details (module path, checksums, refusal codes) stay in the server log: the message reaches
+      // the browser in the browse 502 and is stored as a project source's failure reason.
+      const reason = err instanceof davParseWasm.DavParseError ? err.reason : 'unexpected';
+      console.warn(`[storage] dav-parse failed (${reason}): ${err?.message || err}`);
+      throw Object.assign(new Error(PUBLIC_FAILURE), { status: 502, code: 'dav_parse_failed', reason });
+    }
+  } else records = listingRecordsJs(body, target);
   return records.map((r) => ({ name: r.name, isDir: r.isDir, size: r.size === null ? null : Number(r.size) }));
 }
 
-module.exports = { decodeXmlEntities, elementTexts, firstElementText, listingRecordsJs, listingEntries, davParseImpl };
+module.exports = { decodeXmlEntities, elementTexts, firstElementText, listingRecordsJs, listingEntries, davParseImpl, PUBLIC_FAILURE };

@@ -71,10 +71,18 @@ test('js path never touches the WebAssembly module, even when it is missing', ()
 test('wasm path fails closed when the module is missing', () => withEnv(
   { DAV_PARSE_IMPL: 'wasm', DAV_PARSE_WASM: path.join(os.tmpdir(), 'no-such-dav-parse.wasm') },
   async () => {
-    assert.throws(() => davListing.listingEntries(BODY, T), (e) => e instanceof davParseWasm.DavParseError && e.reason === 'missing' && e.status === 502);
-    await withFetch(BODY, async () => {
-      await assert.rejects(storageClient.listFiles({ kind: 'webdav', baseUrl: 'https://dav.example.test/remote.php/dav/files/alice' }, 'Notes'), /dav-parse module not found/);
-    });
+    const warn = test.mock.method(console, 'warn', () => {});
+    try {
+      assert.throws(() => davListing.listingEntries(BODY, T), (e) => e.reason === 'missing' && e.status === 502 && e.message === davListing.PUBLIC_FAILURE);
+      await withFetch(BODY, async () => {
+        // The message is what routes/storage.cjs puts in the browse 502 and routes/projects.cjs
+        // stores as the folder's failure reason: no path, no checksum, no refusal code.
+        const err = await storageClient.listFiles({ kind: 'webdav', baseUrl: 'https://dav.example.test/remote.php/dav/files/alice' }, 'Notes').then(() => null, (e) => e);
+        assert.equal(err?.message, 'storage listing could not be read');
+        assert.doesNotMatch(err.message, /no-such-dav-parse|sha256|wasm|missing/);
+      });
+      assert.match(String(warn.mock.calls[0].arguments[0]), /dav-parse failed \(missing\): .*no-such-dav-parse\.wasm/);
+    } finally { warn.mock.restore(); }
   }));
 
 test('wasm path fails closed on a tampered module', () => {
@@ -84,7 +92,8 @@ test('wasm path fails closed on a tampered module', () => {
   fs.writeFileSync(file, Buffer.from([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0]));
   try {
     withEnv({ DAV_PARSE_IMPL: 'wasm', DAV_PARSE_WASM: file }, () => {
-      assert.throws(() => davListing.listingEntries(BODY, T), (e) => e.reason === 'checksum');
+      assert.throws(() => davParseWasm.listRecords(BODY, T), (e) => e.reason === 'checksum');
+      assert.throws(() => davListing.listingEntries(BODY, T, { impl: 'wasm' }), (e) => e.message === davListing.PUBLIC_FAILURE && !/sha256|[0-9a-f]{64}/.test(e.message));
     });
     // Even with the "right" checksum, a module without the ABI is refused.
     const sha = crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
@@ -107,10 +116,13 @@ test('wasm path: same listing, and refusals fail closed', { skip: !haveWasm && !
   { DAV_PARSE_IMPL: 'wasm' },
   () => {
     assert.deepEqual(davListing.listingEntries(BODY, T), EXPECTED);
-    assert.throws(() => davListing.listingEntries(BODY, 'not a url'), (e) => e instanceof davParseWasm.DavParseError && e.reason === 'invalid_target');
-    assert.throws(() => davListing.listingEntries(BODY, `${T}\0`), (e) => e.reason === 'input');
-    assert.throws(() => davListing.listingEntries('<response></response>'.repeat(100_001), T), (e) => e.reason === 'too_many_responses');
-    assert.throws(() => davListing.listingEntries('x'.repeat(davParseWasm.MAX_INPUT_BYTES), T), (e) => e.reason === 'too_large');
+    const warn = test.mock.method(console, 'warn', () => {});
+    try {
+      assert.throws(() => davListing.listingEntries(BODY, 'not a url'), (e) => e.reason === 'invalid_target' && e.message === davListing.PUBLIC_FAILURE);
+      assert.throws(() => davListing.listingEntries(BODY, `${T}\0`), (e) => e.reason === 'input');
+      assert.throws(() => davListing.listingEntries('<response></response>'.repeat(100_001), T), (e) => e.reason === 'too_many_responses' && e.message === davListing.PUBLIC_FAILURE);
+      assert.throws(() => davListing.listingEntries('x'.repeat(davParseWasm.MAX_INPUT_BYTES), T), (e) => e.reason === 'too_large');
+    } finally { warn.mock.restore(); }
     assert.throws(() => davParseWasm.listRecords(null, T), (e) => e.reason === 'input');
     // A refusal does not poison the module: the next listing still parses.
     assert.deepEqual(davListing.listingEntries(BODY, T), EXPECTED);

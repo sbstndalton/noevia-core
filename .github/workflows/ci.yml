@@ -78,9 +78,21 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - name: Build dav-parse.wasm at the pinned noevia-rs ref
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           eval "$(grep -E '^(NOEVIA_RS_REF|NOEVIA_RS_SHA256|DAV_PARSE_WASM_SHA256)=[0-9a-f]+$' server/dav-parse.lock)"
+          [[ "$NOEVIA_RS_REF" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::dav-parse.lock NOEVIA_RS_REF is not a 40-char SHA"; exit 1; }
+          # The pin must be on noevia-rs main (as noevia CI requires of every release pin), so core
+          # main never holds a ref from an unmerged or force-pushed-away PR head.
+          status=""
+          for attempt in 1 2 3 4 5; do
+            status=$(gh api "repos/sbstndalton/noevia-rs/compare/$NOEVIA_RS_REF...main" --jq .status 2>/dev/null) && break
+            sleep $((attempt * 5))
+          done
+          echo "dav-parse NOEVIA_RS_REF $NOEVIA_RS_REF: noevia-rs main is '$status'"
+          case "$status" in identical|ahead) ;; *) echo "::error::dav-parse.lock NOEVIA_RS_REF is not reachable from sbstndalton/noevia-rs main ('$status')"; exit 1 ;; esac
           curl -fsSL "https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/$NOEVIA_RS_REF" -o "$RUNNER_TEMP/rs.tgz"
           echo "$NOEVIA_RS_SHA256  $RUNNER_TEMP/rs.tgz" | sha256sum -c -
           mkdir -p "$RUNNER_TEMP/rs" && tar -xzf "$RUNNER_TEMP/rs.tgz" --strip-components=1 -C "$RUNNER_TEMP/rs"
