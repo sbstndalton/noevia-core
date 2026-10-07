@@ -116,8 +116,9 @@ test('wasm: the S3 listing and the path rules match the JS, and refusals fail cl
 
     const warn = t.mock.method(console, 'warn', () => {});
     // Input that cannot cross unchanged, or past the caps, is refused (never answered differently).
-    assert.throws(() => storageClient.safeRelativePath('a\ud800'), (e) => e.reason === 'input' && e.status === 500 && e.message === storagePath.PUBLIC_FAILURE);
-    assert.throws(() => storagePath.joinRoot('r', 7), (e) => e.reason === 'input');
+    assert.throws(() => storageClient.safeRelativePath('a\ud800'), (e) => e.reason === 'input' && e.status === 400 && e.message === storagePath.PUBLIC_FAILURE);
+    assert.throws(() => storagePath.joinRoot('r', 7), (e) => e.reason === 'input' && e.status === 400);
+    assert.throws(() => storagePath.cleanRoot('\udfff'), (e) => e.reason === 'input' && e.status === 400 && e.code === 'storage_path_failed');
     assert.throws(() => storageClient.safeRelativePath('a'.repeat(64 * 1024 + 1)), (e) => e.reason === 'too_large' && e.status === 400 && e.message === storagePath.PUBLIC_FAILURE);
     assert.throws(() => s3Listing.s3Page('', 'p'.repeat(64 * 1024 + 1)), (e) => e.reason === 'prefix_too_long' && e.status === 502 && e.message === s3Listing.PUBLIC_FAILURE);
     assert.throws(() => s3Listing.s3Page('<Contents></Contents>'.repeat(200_001), ''), (e) => e.reason === 'too_many_entries');

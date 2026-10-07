@@ -9,7 +9,7 @@
 // server/dav-parse.lock) is the Rust port. STORAGE_PATH_IMPL=js|wasm picks one (default js; any
 // other value means js, with one warning). `wasm` FAILS CLOSED: a missing or tampered module, a
 // refusal, a trap, an unexpected reply or input that cannot cross unchanged throws (500, or 400 for
-// an oversized input) instead of falling back to the JS rules. The thrown message is fixed; the
+// an oversized input or one that cannot cross unchanged, e.g. a lone surrogate) instead of falling back to the JS rules. The thrown message is fixed; the
 // details are logged.
 
 const davParseWasm = require('./dav-parse-wasm.cjs');
@@ -61,7 +61,7 @@ function viaWasm(op, a, b) {
   try { return davParseWasm.storagePath(op, a, b); } catch (err) {
     const reason = err instanceof davParseWasm.DavParseError ? err.reason : 'unexpected';
     console.warn(`[storage] storage-path ${op} failed (${reason}): ${err?.message || err}`);
-    throw Object.assign(new Error(PUBLIC_FAILURE), { status: reason === 'too_large' ? 400 : 500, code: 'storage_path_failed', reason });
+    throw Object.assign(new Error(PUBLIC_FAILURE), { status: reason === 'too_large' || reason === 'input' ? 400 : 500, code: 'storage_path_failed', reason });
   }
 }
 
