@@ -191,6 +191,17 @@ for (let i = 0; i < 600; i++) {
   addOpen(`random mutation ${i}`, pick([['current'], ['current', 'previous']]), v, pick([user, user, OTHER_USER, undefined]));
 }
 
+// Truncated GCM tags that are otherwise valid (#995): a tag cut to n bytes over an empty body.
+// Node checked such a tag before authTagLength: 16; both implementations now refuse it.
+for (const [label, u] of [['v1', undefined], ['v2', USER]]) {
+  const iv = crypto.randomBytes(12);
+  const c = crypto.createCipheriv('aes-256-gcm', KEYS.current, iv);
+  if (u) c.setAAD(Buffer.from(`noevia:user:${u}`, 'utf8'));
+  c.final();
+  const tag = c.getAuthTag();
+  for (const n of [0, 4, 8, 12, 13, 14, 15, 16]) addOpen(`${label} empty body, tag cut to ${n} bytes`, ['current'], `enc:${label}:${Buffer.concat([iv, tag.subarray(0, n)]).toString('base64url')}`, u);
+}
+
 crypto.randomBytes = realRandomBytes;
 const out = { version: 1, generator: 'tools/gen-secret-fixtures.cjs', keys: Object.fromEntries(Object.entries(KEYS).map(([k, v]) => [k, v.toString('hex')])), open, seal };
 process.stdout.write(`${JSON.stringify(out, null, 1)}\n`);

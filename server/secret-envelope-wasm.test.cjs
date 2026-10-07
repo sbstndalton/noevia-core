@@ -152,10 +152,21 @@ test('wasm: caps (8 MiB plaintext round trips, one byte more is refused) and the
     assert.ok(envelope.open(key, null, envelope.encryptJs(key, big, USER), USER).plain === big);
     assert.throws(() => envelope.encrypt(key, `${big}b`, USER), (e) => e.message === envelope.SEAL_FAILURE && e.reason === 'too_large');
     assert.throws(() => envelope.open(key, null, `enc:v1:${'A'.repeat(davParseWasm.MAX_SECRET_UNITS)}`), (e) => e.message === envelope.OPEN_FAILURE && e.reason === 'too_large');
-    // A 12-byte tag over an empty body: Node may check a truncated tag; the port requires 16 bytes.
-    const iv = crypto.randomBytes(12);
-    const c = crypto.createCipheriv('aes-256-gcm', key, iv); c.final();
-    const short = `enc:v1:${Buffer.concat([iv, c.getAuthTag().subarray(0, 12)]).toString('base64url')}`;
-    assert.throws(() => envelope.open(key, null, short), (e) => e.message === envelope.OPEN_FAILURE && e.reason === 'unopenable');
   });
+});
+
+test('both js and wasm refuse a truncated GCM tag (a valid 12-byte tag over an empty body, #995)', (t) => {
+  t.mock.method(console, 'warn', () => {});
+  const key = Buffer.alloc(32, 3);
+  const iv = crypto.randomBytes(12);
+  const c = crypto.createCipheriv('aes-256-gcm', key, iv); c.final();
+  const tag = c.getAuthTag();
+  const full = `enc:v1:${Buffer.concat([iv, tag]).toString('base64url')}`;
+  for (const impl of skipWasm ? ['js'] : ['js', 'wasm']) {
+    assert.equal(envelope.open(key, null, full, undefined, { impl }).plain, '', `${impl}: the full tag opens`);
+    for (const n of [4, 8, 12, 15]) {
+      const short = `enc:v1:${Buffer.concat([iv, tag.subarray(0, n)]).toString('base64url')}`;
+      assert.throws(() => envelope.open(key, null, short, undefined, { impl }), impl === 'wasm' ? (e) => e.message === envelope.OPEN_FAILURE && e.reason === 'unopenable' : /truncated/, `${impl} ${n}-byte tag`);
+    }
+  }
 });

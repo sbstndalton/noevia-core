@@ -384,7 +384,32 @@ function secretSeal(key, nonce, plain, user) {
 /** Test hook: the cached instance's linear memory in bytes (0 when there is none). */
 function memoryBytes() { return cached?.instance ? cached.instance.exports.memory.buffer.byteLength : 0; }
 
+// Every switch that runs this module (#996). Each reads its value as trim().toLowerCase().
+const IMPL_FLAGS = ['DAV_PARSE_IMPL', 'S3_PARSE_IMPL', 'STORAGE_PATH_IMPL', 'UPLOAD_SNIFF_IMPL', 'SECRET_ENVELOPE_IMPL'];
+
+/** The *_IMPL switches set to wasm in `env`. */
+function wasmFlags(env = process.env) {
+  return IMPL_FLAGS.filter((k) => String(env[k] ?? '').trim().toLowerCase() === 'wasm');
+}
+
+/** Startup check (#996): when any switch is wasm, load and verify the module now (lock, sha256,
+ *  no imports, the full ABI) instead of failing on the first request. Returns the flags; throws
+ *  an Error naming them and the reason when the module is unusable. */
+function verifyAtStartup(env = process.env) {
+  const flags = wasmFlags(env);
+  if (!flags.length) return flags;
+  cached = null;
+  try {
+    cached = load({ file: env.DAV_PARSE_WASM || DEFAULT_WASM });
+  } catch (err) {
+    cached = null;
+    const reason = err instanceof DavParseError ? err.reason : 'unexpected';
+    throw Object.assign(new Error(`${flags.join(', ')} set to wasm, but dav-parse.wasm failed verification (${reason}): ${err?.message || err}`), { reason, flags });
+  }
+  return flags;
+}
+
 /** Test hook: forget the cached module (and its failure). */
 function reset() { cached = null; }
 
-module.exports = { listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
+module.exports = { wasmFlags, verifyAtStartup, IMPL_FLAGS, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
