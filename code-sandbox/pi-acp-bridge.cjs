@@ -343,8 +343,9 @@ if (require.main === module) {
   try {
     createBridge(options);
   } catch {
-    onLog(RUST_FAILED);
-    try { process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32000, message: RUST_FAILED } }) + '\n'); } catch { /* gone */ }
+    const message = options.bridgeImpl === 'rust' ? RUST_FAILED : 'the bridge could not start; closing the session';
+    onLog(message);
+    try { process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32000, message } }) + '\n'); } catch { /* gone */ }
     process.exitCode = 1;
   }
 }

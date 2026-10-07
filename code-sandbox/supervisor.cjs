@@ -209,7 +209,10 @@ if (require.main === module) {
     bridgeImpl = rust.resolveImpl(process.env.SANDBOX_BRIDGE_IMPL, log);
     if (bridgeImpl === 'rust') {
       try { rust.ensure(); log('SANDBOX_BRIDGE_IMPL=rust: sandbox-bridge.wasm loaded'); } catch {
-        log('SANDBOX_BRIDGE_IMPL=rust but sandbox-bridge.wasm is unavailable; every connection will be refused');
+        // Like a missing CODE_HARNESS_COMMAND: a sandbox that cannot do what it was configured to
+        // do does not start (connections would also be refused, per connection, if it got here).
+        console.error('code-sandbox: SANDBOX_BRIDGE_IMPL=rust but sandbox-bridge.wasm is unavailable (missing, or not the pinned module)');
+        process.exit(2);
       }
     }
   }

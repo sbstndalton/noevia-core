@@ -285,6 +285,22 @@ test('with no usable module, the bridge will not start and the supervisor refuse
   }
 });
 
+test('as processes: with rust and no module, the supervisor exits non-zero and the bridge answers one error', () => {
+  const { spawnSync } = require('node:child_process');
+  const missing = path.join(os.tmpdir(), 'noevia-no-such-sandbox-bridge.wasm');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-sbw-root-'));
+  try {
+    const sup = spawnSync(process.execPath, [path.join(__dirname, 'supervisor.cjs')], { timeout: 10000, encoding: 'utf8',
+      env: { PATH: process.env.PATH, CODE_HARNESS_COMMAND: 'true', WORKSPACE_ROOT: root, PORT: '0', SANDBOX_BRIDGE_IMPL: 'rust', SANDBOX_BRIDGE_WASM: missing } });
+    assert.equal(sup.status, 2, sup.stderr);
+    assert.match(sup.stderr, /SANDBOX_BRIDGE_IMPL=rust but sandbox-bridge\.wasm is unavailable/);
+    const bridge = spawnSync(process.execPath, [path.join(__dirname, 'pi-acp-bridge.cjs')], { timeout: 10000, encoding: 'utf8', input: '',
+      env: { PATH: process.env.PATH, HOME: root, SANDBOX_BRIDGE_IMPL: 'rust', SANDBOX_BRIDGE_WASM: missing } });
+    assert.equal(bridge.status, 1);
+    assert.equal(JSON.parse(bridge.stdout.trim()).error.message, 'the sandbox bridge (rust) failed; closing the session');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 // ---- the supervisor under SANDBOX_BRIDGE_IMPL=rust ----
 test('insideRoot with the Rust decision: realpaths in JS, symlinks included', { skip }, () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-sbw-root-')), outside = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-sbw-out-'));
