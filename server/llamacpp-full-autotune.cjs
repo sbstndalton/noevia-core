@@ -79,6 +79,23 @@ const baselineSummary = b => 'Quality baseline at ' + REFERENCE_LABEL[b.referenc
   ...b.skipped.map(s => s.id + ' skipped (the model gets this wrong at its reference settings'
     + (s.answer ? '; answered "' + s.answer + '"' : '') + ')'),
 ].join(', ') + '.';
+// #1003 (CHAT_TEMPLATE_CAPS_IMPL=wasm): before a profile is signed off, one chat request shaped
+// the way chat sends one (a system prompt, a user turn, the app's function-tool shape) must be
+// served. Tools go only where chat would send them (the template check, chat-template-caps.cjs);
+// an engine that still refuses them for the template gets the same one retry without tools that
+// chat makes. The verdict is Rust's (chat-template-caps serving_verdict). Synthetic text only.
+const SERVING_MESSAGES = [
+  { role: 'system', content: 'You are a helpful assistant in a project workspace. Use a tool only when it is needed, and answer briefly.' },
+  { role: 'user', content: 'Which seed orders did the garden committee approve last week?' },
+];
+const SERVING_TOOLS = [
+  { type: 'function', function: { name: 'search_files', description: 'Search the files of this project.', parameters: { type: 'object', properties: { query: { type: 'string', description: 'What to look for.' } }, required: ['query'] } } },
+  { type: 'function', function: { name: 'more_tools', description: "Call this only if none of the offered tools can do the user's task.", parameters: { type: 'object', properties: {} } } },
+];
+function defaultServingChecks() {
+  const caps = require('./chat-template-caps.cjs'), wasm = require('./dav-parse-wasm.cjs');
+  return { mode: () => caps.mode(), templateCaps: (t) => wasm.templateCaps(t), verdict: (status, body) => wasm.servingVerdict(status, body) };
+}
 const NO_PROBE_PASSED = 'The model failed every quality probe at its reference settings, so auto-tune cannot tell whether a setting harms it.';
 const hash = value => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const sorted = value => Object.fromEntries(Object.entries(value || {}).sort(([a], [b]) => a.localeCompare(b)));
@@ -114,7 +131,7 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
   betweenModelsMs = 1000, idleTimeoutMs = 300000,
   readMemory = require('./llamacpp-calibration.cjs').readMemAvailableGib, memoryFloorGib = 2, onResult = async () => {},
   // #545: true when a router row is a preset whose model file is not in the models folder.
-  fileMissing = () => false }) {
+  fileMissing = () => false, servingChecks = defaultServingChecks() }) {
   let state;
   try { state = JSON.parse(fs.readFileSync(stateFile, 'utf8')); } catch { state = {}; }
   state.history ||= {};
@@ -183,7 +200,7 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
     if (!r.ok) throw Object.assign(Error(r.body?.error || 'Could not save settings; the profile may have changed.'), { fatal: r.status === 409 });
     j._revision = presets.snapshot().revision; save();
   }
-  async function chat(model, prompt, max) {
+  async function chat(model, prompt, max, extra = null) {
     check();
     const rows = await rawModels();
     if (!rows.ok || !Array.isArray(rows.body?.data)) throw Error('The model server stopped responding.');
@@ -197,11 +214,12 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
     try { r = await request('/v1/chat/completions', { method: 'POST', signal: controller.signal, body: JSON.stringify({
       model, stream: false, temperature: 0, max_tokens: max, cache_prompt: false,
       ...(quirksOf(model).reasoningEffort ? { reasoning_effort: quirksOf(model).reasoningEffort } : {}),
-      chat_template_kwargs: { enable_thinking: false }, messages: [{ role: 'user', content: prompt }],
+      chat_template_kwargs: { enable_thinking: false }, messages: [{ role: 'user', content: prompt }], ...(extra || {}),
     }) }, 180000); }
     finally { clearInterval(timer); inflight = null; }
     check();
     if (lowMemory) throw Error('Available memory fell below the safety floor.');
+    if (extra) return { status: Number.isInteger(r?.status) ? r.status : r?.ok ? 200 : 0, bodyText: typeof r?.body === 'string' ? r.body : JSON.stringify(r?.body ?? null) };
     if (!r.ok) return { failure: 'HTTP ' + (r.status || 'error') };
     if (!r.body?.choices?.length) return { failure: 'no response' };
     const t = r.body.timings || {};
@@ -505,6 +523,31 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
       throw e;
     }
   }
+  async function servingCheck(j, model) {
+    if (servingChecks.mode() !== 'wasm') return null;
+    const props = await request('/props?model=' + encodeURIComponent(model) + '&autoload=false', {}, 8000).catch(() => null);
+    const template = props?.ok && typeof props.body?.chat_template === 'string' ? props.body.chat_template : null;
+    let sendTools = true;
+    // Unknown (no template, or one the check refuses as too large): send tools, as chat does.
+    if (template !== null) { try { sendTools = servingChecks.templateCaps(template).sendTools; } catch { sendTools = true; } }
+    const ask = (tools) => chat(model, '', 64, { messages: SERVING_MESSAGES, ...(tools ? { tools: SERVING_TOOLS } : {}) });
+    let r = await ask(sendTools);
+    let verdict;
+    // A module that cannot run means the switch is effectively off (as in chat): skip the check.
+    try { verdict = servingChecks.verdict(r.status, r.bodyText); } catch { note(j, 'The realistic chat check was skipped: its checker is unavailable.'); return null; }
+    let retried = false;
+    if (!verdict.passed && sendTools && verdict.kind === 'template_or_tools_unsupported') {
+      note(j, 'The engine refused tools for this chat template; checking again without tools, as chat would.');
+      retried = true; sendTools = false;
+      r = await ask(false);
+      try { verdict = servingChecks.verdict(r.status, r.bodyText); } catch { return null; }
+    }
+    if (!verdict.passed) {
+      throw publicFail('The saved profile cannot serve a realistic chat request' + (sendTools ? " with the app's tools" : '') + ': '
+        + (verdict.reason || verdict.kind.replace(/_/g, ' ')) + '.');
+    }
+    return { passed: true, toolsSent: sendTools, templateKnown: template !== null, retriedWithoutTools: retried };
+  }
   async function finishModel(j, item, final) {
     const identity = await identityFor(item.model);
     if (!identity || hash({ ...identity, profile: undefined }) !== item._identity)
@@ -515,6 +558,7 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
       generation: final.generation, acceptance: final.acceptance, ubatch: batch.ubatch,
       promptPerSecond: batch.promptPerSecond, quality: final.quality, extensions: [],
       sampling: phaseOf(item, 'sampling')?.value || null, ...(item.baseline ? { baseline: item.baseline } : {}),
+      ...(final.serving ? { serving: final.serving } : {}),
       loaded: true, version: VERSION, signature: await signature(item.model, identity) };
     if (presets.snapshot().revision !== j._revision)
       throw Object.assign(Error('Settings changed outside auto-tune.'), { fatal: true });
@@ -558,6 +602,9 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
           await unloadAll();
           await load(j);
           const final = await validate(item.model);
+          check();
+          j.phase = 'Checking a realistic chat request'; save();
+          final.serving = await servingCheck(j, item.model);
           check();
           await finishModel(j, item, final);
         } finally {

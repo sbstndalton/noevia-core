@@ -17,7 +17,7 @@ const FALLBACK_REPORTED = Symbol('fallback failure already reported');
 async function providerFailureText(response, chatgptProvider) {
   const context = require('./chat-context.cjs');
   const detail = (await readCappedText(response, PROVIDER_ERROR_BODY_CAP).catch(() => ({ text: '' }))).text;
-  let msg = context.providerError(detail);
+  let msg = context.providerError(detail, Number.isInteger(response?.status) ? response.status : undefined);
   if (chatgptProvider && response.headers?.get?.('x-noevia-provider-message') === '1') { try { msg = String(JSON.parse(detail).error.message).slice(0, 300) || msg; } catch { /* keep the generic text */ } }
   return msg;
 }
@@ -132,6 +132,8 @@ function normalizeReplayHistory(mapped, newMessage) {
 function createChatHandler({
   stepSupervision = null, fs, path, crypto, fetch, codeTasksFor = () => [], reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, diaryStorageRetry = (send) => send(true), autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, toolGate = null, chatFramingEnabled = () => false, freeChats = () => [], framingReasoner = null, reasoningTraces = null, brainContext = null, DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse, chatListHolder = () => undefined,
   chatgptOAuth = null, chatgptEnabled = () => false, skillHistory = null,
+  // #1002: per-model "may this request carry tools", from the engine's chat template.
+  templateCaps = require('./chat-template-caps.cjs'), templateToolsGate = templateCaps.toolsGate,
   // #648: whether a tool is one of noevia's own project file edits, whose target is resolved and
   // shown on the approval card and pinned for the call. By name when not wired (the stricter side).
   projectEditTool = (name) => require('./project-edit-target.cjs').EDIT_TOOLS.has(name),
@@ -1130,8 +1132,17 @@ function createChatHandler({
     let toolOffset = 0;
     let continuationCompactedAt=null,continuationCovered=0;
     let forcedTool = null, gateRetried = false;
+    // #1002 (CHAT_TEMPLATE_CAPS_IMPL=wasm): a native-engine model whose chat template cannot take
+    // tools is sent none (nor tool_choice), and the user is told once. Unknown templates keep them.
+    const templateGate = provider.id === DEFAULT_PROVIDER_ID && typeof modelManager?.props === 'function' && templateCaps.mode() === 'wasm';
+    let templateToolsOff = false;
+    if (templateGate && activeTools.length && !(await templateToolsGate.allowsTools(modelManager, model))) {
+      templateToolsOff = true;
+      send({ type: 'warning', text: templateCaps.TOOLS_OFF_NOTICE });
+    }
+    const requestTools = () => (!templateToolsOff && activeTools.length ? { tools: activeTools } : {});
     // tool_choice for the gate's required tool: the first model turn (and its one retry) only.
-    const forceChoice = (round) => (forcedTool && round === 0 && activeTools.some((t) => t.function?.name === forcedTool)
+    const forceChoice = (round) => (!templateToolsOff && forcedTool && round === 0 && activeTools.some((t) => t.function?.name === forcedTool)
       ? { tool_choice: { type: 'function', function: { name: forcedTool } } } : {});
     // The gate's enforcement. prefetch: run the read now and hand the model its result as an
     // ordinary tool exchange; if it cannot run, fall through to require. require: force that
@@ -1178,7 +1189,7 @@ function createChatHandler({
           method: 'POST', headers: upstreamHeaders, signal: chatSignal.signal, redirect: 'error',
         }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:true,stream_options:{include_usage:true},
           ...sampling.params,
-          ...(activeTools.length ? {tools:activeTools} : {}), ...forceChoice(round)}, provider, model, effort, send);
+          ...requestTools(), ...forceChoice(round)}, provider, model, effort, send);
         // A server that rejects the named-function form of tool_choice gets the equivalent it does
         // accept: only that tool, and a call required.
         if (forceChoice(round).tool_choice && upstream.status >= 400 && upstream.status < 500 && /tool_choice/i.test((await readCappedText(upstream.clone(), PROVIDER_ERROR_BODY_CAP).catch(() => ({ text: '' }))).text)) {
@@ -1187,6 +1198,21 @@ function createChatHandler({
             method: 'POST', headers: upstreamHeaders, signal: chatSignal.signal, redirect: 'error',
           }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:true,stream_options:{include_usage:true},
             ...sampling.params, tools:activeTools.filter((t) => t.function?.name === forcedTool), tool_choice:'required'}, provider, model, effort, send);
+        }
+        // #1002: the engine refused the tools because of the model's chat template (llama.cpp could
+        // not build a tool-call parser for it). Retry this round once without tools, and say so.
+        if (templateGate && !templateToolsOff && activeTools.length && upstream.status >= 400) {
+          const detail = (await readCappedText(upstream.clone(), PROVIDER_ERROR_BODY_CAP).catch(() => ({ text: '' }))).text;
+          if (templateCaps.classify(upstream.status, detail)?.kind === 'template_or_tools_unsupported') {
+            discardBody(upstream);
+            templateToolsOff = true;
+            templateToolsGate.markUnsupported(model);
+            send({ type: 'warning', text: templateCaps.TOOLS_RETRY_NOTICE });
+            upstream = await reasoningEffort.requestWithEffort(providerFetch, upstreamUrl, {
+              method: 'POST', headers: upstreamHeaders, signal: chatSignal.signal, redirect: 'error',
+            }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:true,stream_options:{include_usage:true},
+              ...sampling.params}, provider, model, effort, send);
+          }
         }
       } catch (err) {
         if (chatSignal.signal.aborted) break; // client went away; stop quietly
@@ -1303,7 +1329,7 @@ function createChatHandler({
           roundTimings = null;
           const response = await reasoningEffort.requestWithEffort(providerFetch, upstreamUrl, {
             method:'POST',headers:upstreamHeaders,signal:AbortSignal.any([chatSignal.signal,AbortSignal.timeout(300000)]),redirect:'error',
-          }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:false,...sampling.params,...(activeTools.length ? {tools:activeTools} : {}),...forceChoice(round)}, provider, model, effort, send);
+          }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:false,...sampling.params,...requestTools(),...forceChoice(round)}, provider, model, effort, send);
           // Status first (#918): a 5xx HTML page is a provider failure, not a JSON parse error.
           if (!response.ok) { send({ type: 'error', text: await providerFailureText(response, chatgptProvider) }); throw FALLBACK_REPORTED; }
           const full = {ok:true,status:response.status,body:await readCappedJson(response,FALLBACK_REPLY_CAP)};

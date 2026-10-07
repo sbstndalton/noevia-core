@@ -192,10 +192,18 @@ async function prepareUnlocked({dir,id,messages,tools,limit,limitSource,model,fo
  if(meter.used>meter.threshold)throw Error('Context is still too full after compaction. Reduce attached sources or start a new chat. No messages were deleted.');
  return {messages:wire,meter,maxTokens:meter.reserve};
 }
-function providerError(value) {const text=typeof value==='string'?value:JSON.stringify(value);return /context.*(exceed|full|length)|too many tokens|maximum context/i.test(text)?'The model ran out of context space. Compact this chat or reduce its sources before retrying.':'The model stream failed. Partial output was preserved; check the backend before retrying.';}
+const CONTEXT_FULL_TEXT='The model ran out of context space. Compact this chat or reduce its sources before retrying.';
+const STREAM_FAILED_TEXT='The model stream failed. Partial output was preserved; check the backend before retrying.';
+// The reference the Rust port's context test is checked against (tests/fixtures/chat-template-caps.v1.json).
+function providerErrorJs(value) {const text=typeof value==='string'?value:JSON.stringify(value);return /context.*(exceed|full|length)|too many tokens|maximum context/i.test(text)?CONTEXT_FULL_TEXT:STREAM_FAILED_TEXT;}
+// #1002: the upstream's own reason, classified and sanitised by the Rust provider-error crate
+// (chat-template-caps.cjs), instead of one fixed sentence. `status` is the HTTP status (a stream
+// error has none: its own numeric code, else 500). Falls back to the fixed sentences when the
+// module cannot run.
+function providerError(value,status) {const text=typeof value==='string'?value:JSON.stringify(value);const code=Number.isInteger(status)?status:Number.isInteger(value?.code)?value.code:500;return require('./chat-template-caps.cjs').failureText(code,text)??providerErrorJs(text);}
 const busy=new Set();
 async function prepare(options){const key=stateFile(options.dir,options.id);if(busy.has(key))throw Error('This chat is already preparing context. Wait for that request to finish.');busy.add(key);try{return await prepareUnlocked(options);}finally{busy.delete(key);}}
 // R1 measurement, opt-in with CONTEXT_LOG=1; never breaks a chat.
 function logRound({dir,assertActive,...entry}){if(process.env.CONTEXT_LOG!=='1')return;try{const log=require('./context-log.cjs');const record=log.record(entry);assertActive?.();log.append(dir,record);}catch(e){console.warn('[context-log] write failed:',e.message);}}
 function remove(dir,id){fs.rmSync(stateFile(dir,id),{force:true});}
-module.exports={logRound,remove,tokens,read,save,runtimeLimit,resolveRuntimeLimit,HOSTED_DEFAULT_LIMIT,applySummary,measure,prepare,compactContinuation,providerError};
+module.exports={logRound,remove,tokens,read,save,runtimeLimit,resolveRuntimeLimit,HOSTED_DEFAULT_LIMIT,applySummary,measure,prepare,compactContinuation,providerError,providerErrorJs,CONTEXT_FULL_TEXT,STREAM_FAILED_TEXT};

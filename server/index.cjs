@@ -1086,9 +1086,11 @@ if (require.main === module) {
     const wasmFlags = require('./dav-parse-wasm.cjs').verifyAtStartup();
     if (wasmFlags.length) console.log(`[dav-parse] dav-parse.wasm verified for ${wasmFlags.join(', ')}`);
   } catch (err) {
-    console.error(`FATAL: ${err.message}. Restore the pinned module (server/dav-parse.lock) or set the switch to js.`);
+    console.error(`FATAL: ${err.message}. Restore the pinned module (server/dav-parse.lock) or set the switch to js (CHAT_TEMPLATE_CAPS_IMPL: off).`);
     process.exit(1);
   }
+  // #1002: CHAT_TEMPLATE_CAPS_IMPL defaults to wasm; an unusable module then means off, with a warning.
+  console.log(`[chat-template-caps] CHAT_TEMPLATE_CAPS_IMPL=${require('./chat-template-caps.cjs').startup()}`);
   fs.mkdirSync(DATA_DIR, { recursive: true });
   authTokens.warnings.forEach((w) => console.warn(w));
   if (!DIARY_TENANT_KEY) console.warn('WARNING: DIARY_TENANT_KEY is unset; Diary calls carry no tenant assertion and remote storage secrets ride on every call.');
