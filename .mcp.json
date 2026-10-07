@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "repo-index": {
+      "command": "node",
+      "args": ["tools/repo-index/server.cjs"]
+    }
+  }
+}
