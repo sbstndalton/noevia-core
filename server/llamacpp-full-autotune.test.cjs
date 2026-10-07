@@ -1525,3 +1525,18 @@ test('#1058 js order: bf16 that does not load gets f16 once in its place', async
   assert.deepEqual(item.result.kvFallback, { from: 'bf16', to: 'f16' });
   assert.ok(j.log.some(l => /bf16 KV cache did not load; trying f16/.test(l.text)));
 });
+
+test('#1058 js order: no f16 retry when the estimate says bf16 does not fit the profile context (may be memory)', async t => {
+  // 5 GiB: bf16 fits 4k by the estimate, the profile asks 8k.
+  const f = fixture(t, { failLoadBf16: true, autotuneExtra: { planFacts: async () => DENSE_64K, budgetGib: () => 5 } });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager), kv = phase(j.models[0], 'kv');
+  assert.equal(j.status, 'passed', j.error);
+  assert.deepEqual(kv.steps.map(s => [s.id, s.status]), [['bf16', 'failed'], ['q8_0', 'passed']]);
+  assert.equal(j.models[0].result.kvFallback, undefined);
+  // At 6 GiB bf16 fits 12k, above the profile's 8k: the retry happens.
+  const g = fixture(t, { failLoadBf16: true, autotuneExtra: { planFacts: async () => DENSE_64K, budgetGib: () => 6 } });
+  await g.manager.autotune.start('synthetic', { confirmPause: true });
+  const k = await finished(g.manager);
+  assert.deepEqual(phase(k.models[0], 'kv').steps.map(s => s.id), ['bf16', 'f16', 'q8_0']);
+});

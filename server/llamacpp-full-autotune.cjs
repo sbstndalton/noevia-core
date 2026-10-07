@@ -547,7 +547,11 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
       // #1058: bf16 did not load (the engine refused it or died; this order sees no engine text):
       // f16 once in its place, before anything else, so it can still be the baseline.
       const failure = p.steps.find(s => s.id === kv)?.reason || '';
-      if (!measured && kv === 'bf16' && !order.includes('f16') && /failed to load|could not be loaded/i.test(failure)) {
+      // Not when the estimate says the profile's context does not fit bf16: that may be memory, and
+      // f16 is the same size. Unsizeable models (no ceilings) still get the one retry.
+      const profileCtx = Number({ ...presets.get(j.model).defaults, ...presets.get(j.model).options }['ctx-size']) || 0;
+      const fitsBf16 = !ceilings || (ceilings.bf16 != null && (!profileCtx || ceilings.bf16 >= profileCtx));
+      if (!measured && kv === 'bf16' && fitsBf16 && !order.includes('f16') && /failed to load|could not be loaded/i.test(failure)) {
         order.splice(i + 1, 0, 'f16');
         p.steps.splice(p.steps.findIndex(s => s.id === kv) + 1, 0, step('f16', 'f16 KV cache'));
         kvFallback = { from: 'bf16', to: 'f16' };
