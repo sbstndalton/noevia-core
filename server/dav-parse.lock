@@ -1,13 +1,13 @@
 # dav-parse.wasm (#967): the Rust/WebAssembly port of dav-listing.cjs's PROPFIND listing parser,
 # since #976/#978 also of s3-listing.cjs's page scan and storage-path.cjs's rules, and since #977
 # of upload-sniff.cjs's validate, classify and decodeText, and since #979 of secret-envelope.cjs's
-# open and seal (one module).
+# open and seal, and since #980 of mcp.cjs's parseRpcBody and resolveSchemaRefs (one module).
 # Built from sbstndalton/noevia-rs at NOEVIA_RS_REF (tarball checksum NOEVIA_RS_SHA256) with
 # tools/build-dav-parse-wasm.sh, reproducible on Linux x86_64 (CI and the image build; a macOS arm64
 # build was observed to match, but that is not guaranteed); the module's bytes must hash to
 # DAV_PARSE_WASM_SHA256 or the image build fails and every *_IMPL=wasm switch refuses to load it.
 # Read by server/dav-parse-wasm.cjs, noevia-core CI and noevia's build/web.Dockerfile. The ref must
 # be on noevia-rs main before a release pins this core commit (noevia CI checks it).
-NOEVIA_RS_REF=2f751aabc52f79b453c730b3e283ce2a9a2b4483
-NOEVIA_RS_SHA256=d734a4d23e5d070cea33284b8131df8a2627dc07f1850860339b35a57001a3a9
-DAV_PARSE_WASM_SHA256=4c6c8c59a886c7cf992c8eba4a28c1da68cf8d37ee72a65520ae8fdc36e82814
+NOEVIA_RS_REF=50c569d7c314f0fb1ebdd655e18f8cc161ec422e
+NOEVIA_RS_SHA256=93b167d345a1f1b952456ea4e31fd4b690b12eb471a3e6576b416857f52112a3
+DAV_PARSE_WASM_SHA256=d9d3ce85ee12fce61a4c5091738c08c118ffcd00a2385f78a75b46a8878f7d94
