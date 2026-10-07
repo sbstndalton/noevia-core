@@ -379,12 +379,15 @@ async function resolveEgressBind(env, host, { lookup = (h) => dns.promises.looku
  * sandbox as `CODE_EGRESS_HOST` (a network alias on the internal code network). Unset, there is
  * no proxy, and Code mode keeps network and installs unavailable rather than pretending.
  */
-function startEgressFromEnv(env = process.env, { log = () => {}, create = createEgressProxy, lookup } = {}) {
+function startEgressFromEnv(env = process.env, { log = () => {}, create = createEgressProxy, lookup, secrets = null } = {}) {
   const port = Number(env.CODE_EGRESS_PORT);
   if (!Number.isInteger(port) || port <= 0 || port > 65535) return null;
   const host = String(env.CODE_EGRESS_HOST || 'egress').trim();
   if (!/^[a-z0-9.-]+$/i.test(host)) throw Error(`CODE_EGRESS_HOST should be a host name, not "${host}"`);
   const ttlMs = Number(env.CODE_EGRESS_TOKEN_TTL_MS) > 0 ? Number(env.CODE_EGRESS_TOKEN_TTL_MS) : DEFAULT_TOKEN_TTL_MS;
+  // #926 dark switch: `rust` hands the sandbox the noevia-rs egress-proxy service instead of the
+  // in-process proxy. Anything else (default `node`) keeps the in-process proxy below.
+  if (String(env.CODE_EGRESS_IMPL || 'node').trim() === 'rust') return startRustEgressClient(env, { log, secrets, port, ttlMs });
   const intEnv = (name, fallback) => { const n = Number(env[name]); return Number.isInteger(n) && n > 0 ? n : fallback; };
   const proxy = create({ log, ttlMs,
     maxConnections: intEnv('CODE_EGRESS_MAX_CONNECTIONS', DEFAULT_MAX_CONNECTIONS),
@@ -414,5 +417,121 @@ function startEgressFromEnv(env = process.env, { log = () => {}, create = create
   return Object.assign(proxy, { endpoint: `${host}:${port}` });
 }
 
+// ---- Signed grants for the Rust proxy (#926, docs/egress-grant-contract.md) -------------------
+// Glue only: the web mints, noevia-rs `crates/egress` verifies and enforces. The byte-exact format
+// is pinned by apps/web/contracts/egress-grant.v1.vectors.json, which both sides test against.
+const GRANT_KEY_LABEL = 'code-egress-grant';
+const GRANT_MAX_LIFETIME_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_GRANT_LIFETIME_MS = 2 * 60 * 60 * 1000; // near a real task; a lost revoke expires soon
+const b64url = (buf) => Buffer.from(buf).toString('base64url');
+
+/** A task's domains as the contract carries them: lowercased, outer dots dropped, deduplicated. */
+function grantHosts(domains) {
+  const hosts = [];
+  for (const d of domains || []) {
+    const h = String(d || '').toLowerCase().replace(/^\.+|\.+$/g, '');
+    if (!h) continue;
+    if (h.length > 253 || !/^[a-z0-9-]+(\.[a-z0-9-]+)*$/.test(h)) throw Object.assign(Error(`"${d}" is not a domain the egress proxy can grant`), { status: 400 });
+    if (!hosts.includes(h)) hosts.push(h);
+  }
+  if (hosts.length > 64) throw Object.assign(Error('at most 64 domains per task'), { status: 400 });
+  return hosts;
+}
+
+/** `ngr1.` + base64url(canonical JSON) + `.` + base64url(HMAC-SHA256(key, everything before it)). */
+function mintGrant(key, { act = 'grant', task, hosts = [], iat, exp, idle, nonce }) {
+  const payload = `{"v":1,"act":${JSON.stringify(act)},"task":${JSON.stringify(task)},"hosts":${JSON.stringify(hosts)},`
+    + `"iat":${iat},"exp":${exp},"idle":${idle},"nonce":${JSON.stringify(nonce)}}`;
+  const signed = `ngr1.${b64url(payload)}`;
+  return `${signed}.${b64url(crypto.createHmac('sha256', key).update(signed).digest())}`;
+}
+
+/**
+ * The egress interface code-harness / browser-service already use (grant, revoke, endpoint), backed
+ * by the Rust proxy: `grant` mints a signed token instead of remembering one, `revoke` posts a signed
+ * revoke to the proxy. No `activity` (the per-task host summary stays a Node-proxy feature for now).
+ */
+function createRustEgressClient({ key, endpoint, now = Date.now, ttlMs = DEFAULT_TOKEN_TTL_MS,
+  lifetimeMs = DEFAULT_GRANT_LIFETIME_MS, log = () => {}, post = defaultRevokePost, revokeDelaysMs = [2000, 8000] }) {
+  if (!Buffer.isBuffer(key) || key.length !== 32) throw Error('the egress grant key must be 32 bytes');
+  const life = Math.min(positive(lifetimeMs, DEFAULT_GRANT_LIFETIME_MS), GRANT_MAX_LIFETIME_MS);
+  const nonce = () => b64url(crypto.randomBytes(16));
+  // taskId -> last iat, so a re-grant or revoke in the same millisecond still moves forward (the
+  // proxy orders a task's grants by iat). Bounded: the oldest entries go first.
+  const latest = new Map();
+  const stamp = (taskId) => {
+    const t = Math.max(now(), (latest.get(taskId) || 0) + 1);
+    latest.delete(taskId); latest.set(taskId, t);
+    if (latest.size > 10_000) latest.delete(latest.keys().next().value);
+    return t;
+  };
+  function grant({ taskId, domains = [] }) {
+    if (!taskId || !/^[A-Za-z0-9._:-]{1,128}$/.test(String(taskId))) throw Object.assign(Error('taskId required'), { status: 400 });
+    const hosts = grantHosts(domains);
+    if (!hosts.length) throw Object.assign(Error('a grant needs at least one domain'), { status: 400 });
+    const iat = stamp(taskId);
+    const token = mintGrant(key, { task: taskId, hosts, iat, exp: iat + life, idle: Math.min(positive(ttlMs, DEFAULT_TOKEN_TTL_MS), life), nonce: nonce() });
+    return { token, taskId, domains: hosts };
+  }
+  /** Always sent, even for a task this process never granted (it may predate a restart). */
+  function revoke(taskId) {
+    if (!taskId || !/^[A-Za-z0-9._:-]{1,128}$/.test(String(taskId))) return 0;
+    const iat = stamp(taskId);
+    const token = mintGrant(key, { act: 'revoke', task: taskId, hosts: [], iat, exp: iat + life, idle: 1, nonce: nonce() });
+    // Retried with backoff (a revoke is idempotent); only the last failure is logged.
+    const attempt = (n) => Promise.resolve().then(() => post(endpoint, token)).then(
+      (status) => (status === 204 ? null : { status }),
+      (err) => ({ error: String((err && err.code) || 'error') }),
+    ).then((failure) => {
+      if (!failure) return;
+      if (n < revokeDelaysMs.length) { const t = setTimeout(() => attempt(n + 1), revokeDelaysMs[n]); t.unref?.(); return; }
+      log({ event: 'egress.revoke_failed', taskId, attempts: n + 1, ...failure });
+    });
+    attempt(0);
+    return 1;
+  }
+  return { impl: 'rust', grant, revoke, endpoint, sweep: () => 0 };
+}
+
+function defaultRevokePost(endpoint, token) {
+  const [host, port] = endpoint.split(':');
+  return new Promise((resolve, reject) => {
+    const req = http.request({ host, port: Number(port), method: 'POST', path: '/v1/revoke', timeout: 5000,
+      headers: { authorization: `Bearer ${token}`, 'content-length': 0 } }, (res) => { res.resume(); resolve(res.statusCode); });
+    req.on('timeout', () => req.destroy(Object.assign(Error('timeout'), { code: 'ETIMEDOUT' })));
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+/**
+ * CODE_EGRESS_IMPL=rust: derive the grant key, hand it to the proxy through the shared key file
+ * (CODE_EGRESS_GRANT_KEY_FILE, a volume only web and the proxy mount), and point tasks at
+ * CODE_EGRESS_RUST_HOST:CODE_EGRESS_PORT. Fails loudly rather than falling back to no proxy.
+ */
+function startRustEgressClient(env, { log, secrets, port, ttlMs }) {
+  if (!secrets || typeof secrets.derive !== 'function') throw Error('CODE_EGRESS_IMPL=rust needs the secret store');
+  const host = String(env.CODE_EGRESS_RUST_HOST || 'egress-rs-code').trim();
+  if (!/^[a-z0-9.-]+$/i.test(host)) throw Error(`CODE_EGRESS_RUST_HOST should be a host name, not "${host}"`);
+  const file = String(env.CODE_EGRESS_GRANT_KEY_FILE || '').trim();
+  if (!file) throw Error('CODE_EGRESS_IMPL=rust needs CODE_EGRESS_GRANT_KEY_FILE');
+  const key = secrets.derive(GRANT_KEY_LABEL, 32);
+  const fs = require('node:fs'), path = require('node:path');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.tmp`;
+  // Owner + one shared group, never world-readable: the proxy reads it through group_add of
+  // CODE_EGRESS_KEY_GID (the override sets the same fixed gid on both containers).
+  const gid = Number(env.CODE_EGRESS_KEY_GID);
+  if (!Number.isInteger(gid) || gid <= 0) throw Error('CODE_EGRESS_IMPL=rust needs CODE_EGRESS_KEY_GID (a positive integer)');
+  try { fs.rmSync(tmp, { force: true }); } catch { /* none */ }
+  fs.writeFileSync(tmp, `${key.toString('hex')}\n`, { mode: 0o440, flag: 'wx' });
+  try { fs.chownSync(tmp, process.getuid?.() ?? -1, gid); fs.chmodSync(tmp, 0o440); fs.renameSync(tmp, file); }
+  catch (e) { try { fs.rmSync(tmp, { force: true }); } catch { /* ignore */ } throw e; }
+  const lifetimeMs = Number(env.CODE_EGRESS_GRANT_LIFETIME_MS) > 0 ? Number(env.CODE_EGRESS_GRANT_LIFETIME_MS) : DEFAULT_GRANT_LIFETIME_MS;
+  log({ event: 'egress.rust_client', endpoint: `${host}:${port}` });
+  return createRustEgressClient({ key, endpoint: `${host}:${port}`, ttlMs, lifetimeMs, log });
+}
+
 module.exports = { DEFAULT_TOKEN_TTL_MS, DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_CONNECTIONS_PER_TASK, DEFAULT_TUNNEL_IDLE_MS,
-  createEgressProxy, stripHopByHop, hostAllowed, parseTarget, startEgressFromEnv, resolveEgressBind };
+  createEgressProxy, stripHopByHop, hostAllowed, parseTarget, startEgressFromEnv, resolveEgressBind,
+  GRANT_KEY_LABEL, grantHosts, mintGrant, createRustEgressClient };

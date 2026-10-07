@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://noevia.local/contracts/egress-grant.v1.schema.json",
+  "title": "noevia egress grant payload, version 1",
+  "description": "The decoded payload of an `ngr1.` token (docs/egress-grant-contract.md). On the wire it is canonical JSON: these keys in exactly this order (v, act, task, hosts, iat, exp, idle, nonce), no whitespace, ASCII only, then base64url without padding and signed with HMAC-SHA256. The schema cannot express key order, canonical bytes or the cross-field rules (exp > iat, exp - iat <= 86400000, 1 <= idle <= exp - iat, hosts unique); the contract document and the vectors file do.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["v", "act", "task", "hosts", "iat", "exp", "idle", "nonce"],
+  "properties": {
+    "v": { "const": 1 },
+    "act": { "enum": ["grant", "revoke"] },
+    "task": { "type": "string", "pattern": "^[A-Za-z0-9._:-]{1,128}$" },
+    "hosts": {
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": { "type": "string", "maxLength": 253, "pattern": "^[a-z0-9-]+(\\.[a-z0-9-]+)*$" }
+    },
+    "iat": { "type": "integer", "minimum": 1, "description": "Issued at, Unix milliseconds." },
+    "exp": { "type": "integer", "minimum": 2, "description": "Absolute expiry, Unix milliseconds." },
+    "idle": { "type": "integer", "minimum": 1, "description": "Idle TTL in milliseconds." },
+    "nonce": { "type": "string", "pattern": "^[A-Za-z0-9_-]{22}$", "description": "16 random bytes, base64url without padding." }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "act": { "const": "grant" } } },
+      "then": { "properties": { "hosts": { "minItems": 1 } } },
+      "else": { "properties": { "hosts": { "maxItems": 0 } } }
+    }
+  ]
+}

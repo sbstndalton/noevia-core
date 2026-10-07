@@ -419,7 +419,7 @@ const toolboxOffered = createToolboxOffered(ENABLED_TOOLBOXES);
 // coding harness installed simply has nothing to start.
 // One proxy per deployment (it binds CODE_EGRESS_PORT): Code and Browser tasks share it, each
 // scoped by its own per-task grant/token.
-const codeEgress = require('./code-egress.cjs').startEgressFromEnv(process.env, { log: (entry) => console.log('[egress]', JSON.stringify(entry)) });
+const codeEgress = require('./code-egress.cjs').startEgressFromEnv(process.env, { secrets: secretStore, log: (entry) => console.log('[egress]', JSON.stringify(entry)) });
 // #853: the UI and file-sharing listeners refuse requests that arrive over the internal code
 // network (COWORK_CODE_NET_ADDR, code-net-guard.cjs). The egress proxy above is not wrapped.
 const codeNetGuard = require('./code-net-guard.cjs').createCodeNetGuard({ spec: process.env.COWORK_CODE_NET_ADDR || '',
