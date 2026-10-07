@@ -179,8 +179,12 @@ function createCalibrator(deps) {
   }
   async function errorBody(response) {
     try {
-      if (!response.body || typeof response.text !== 'function') return '';
-      return await Promise.race([response.text().then(t => t.slice(0, ENGINE_TEXT_UNITS)), new Promise(r => setTimeout(() => r(''), 2000).unref?.())]);
+      if (!response.body) return '';
+      // Capped in bytes (#920) and in time: an error body that never ends is not waited out.
+      let timer;
+      const read = require('./http.cjs').readCappedText(response, ENGINE_TEXT_UNITS * 4).then(r => r.text.slice(0, ENGINE_TEXT_UNITS));
+      try { return await Promise.race([read, new Promise(r => { timer = setTimeout(() => r(''), 2000); })]); }
+      finally { clearTimeout(timer); read.catch(() => {}); }
     } catch { return ''; }
   }
 

@@ -1134,3 +1134,16 @@ test('#1004 advisor on but the verdict module unusable: the calibrator\'s cause 
   await finished(f.manager);
   assert.deepEqual(seen.at(-1).results.map(r => r.outcome), ['load_failed']);
 });
+
+test('#1004 advisor on: a rejected long prompt\'s error body is read (capped) and a rule names it', { skip: skipWasm }, async t => {
+  const svc = decisionService({ label: 'template' });
+  const body = JSON.stringify({ error: { code: 500, message: 'ggml_backend_cpu_buffer_type_alloc_buffer: failed to allocate buffer of size 9126805504' } });
+  const f = fixture(t, { servingChecks: servingOff, streamReply: o => (o['ctx-size'] === '16384' ? new Response(body, { status: 500 }) : null),
+    autotuneExtra: planned({ loadAdvisor: createLoadAdvisor({ env: ADVISOR_ON, endpoint: svc }) }) });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'passed', j.error);
+  const c = phase(j.models[0], 'context').steps[0].classification;
+  assert.deepEqual([probeRows(f)[0].outcome, c.source, c.ruleId], ['oom', 'rule', 'text_oom']);
+  assert.equal(svc.asked.length, 0);
+});
