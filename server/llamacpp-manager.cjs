@@ -610,6 +610,8 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
       budgetGib:()=>sizingBudgetGib()||require('./inference-budget.cjs').DEFAULT_BUDGET_GIB,
       ...(autotuneOptions.planFacts?{planFacts:autotuneOptions.planFacts}:{}),
       ...(autotuneOptions.budgetGib?{budgetGib:autotuneOptions.budgetGib}:{}),
+      // #1004 LAYA_LOAD_ADVISOR: tests inject their own advisor (a fake decision service).
+      ...(autotuneOptions.loadAdvisor?{loadAdvisor:autotuneOptions.loadAdvisor}:{}),
       onResult:async({model,result})=>{for(const [category,value] of [['context_capacity',{ctx:result.context,appliedCtx:result.context,slots:Number(presets.get(model).options.parallel)||1}],['throughput',{rate:result.generation}],...(result.acceptance==null?[]:[['mtp_acceptance',{rate:result.acceptance/100}]])])await recordEvidence(model,{category,result:'passed',value,suite:{name:'full-autotune',version:3},source:'autotune',limitations:['Three deterministic quality smoke probes, not a general quality benchmark','120 s default prompt budget; existing MTP head only',...(result.baseline?.skipped?.length?[`Probes not used (failed at the model's reference settings): ${result.baseline.skipped.map(s=>s.id).join(', ')}`]:[])]});},
       contextFactory:hooks=>require('./llamacpp-calibration.cjs').createCalibrator({request,rawModels,presets,applyUnlocked,conservativeFor,maintenance:managedGate,
         stream:(path,opts={})=>(fetchStream||fetch)(base+path,{...opts,headers:headers(opts.headers),redirect:'error'}),
