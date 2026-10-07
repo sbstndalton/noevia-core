@@ -122,29 +122,41 @@ function refPlan(input) {
   const probes = results.filter(r => r.step === 'probe').map(r => ({ c: r.ctx, k: kv.indexOf(r.kv), o: r.outcome }));
   const memory = o => o === 'oom' || o === 'load_failed';
   const banned = Math.min(Infinity, ...probes.filter(p => p.o === 'quality_failed').map(p => p.k));
+  const allowed = Math.min(banned, kv.length);
   const hard = c => probes.some(p => (p.o === 'recall_failed' || p.o === 'over_time') && c >= p.c);
-  const kvFor = c => {
-    if (hard(c)) return null;
-    for (let k = 0; k < Math.min(banned, kv.length); k++) {
-      if (fits(c, kv[k]) && !probes.some(p => memory(p.o) && c >= p.c && k <= p.k) && !probes.some(p => p.c === c && p.k === k)) return k;
-    }
-    return null;
+  const openAt = (c, k) => !hard(c) && !probes.some(p => memory(p.o) && c >= p.c && k <= p.k) && !probes.some(p => p.c === c && p.k === k);
+  // #1057: one type's search: its best pass, the rungs above it that fit, and the open prefix.
+  const loOf = k => { const c = probes.filter(p => p.k === k && p.o === 'passed').map(p => p.c); return c.length ? Math.max(...c) : null; };
+  const ofType = k => {
+    const lo = loOf(k), above = rungs.filter(c => c > (lo ?? 0) && fits(c, kv[k])), open = [];
+    for (const c of above) { if (!openAt(c, k)) break; open.push(c); }
+    return { lo, above, open };
   };
-  let lo = null;
-  for (const p of probes) if (p.o === 'passed' && p.k < banned && (!lo || p.c > lo.c || (p.c === lo.c && p.k < lo.k))) lo = { c: p.c, k: p.k };
-  const above = rungs.filter(c => c > (lo ? lo.c : 0) && kv.slice(0, Math.min(banned, kv.length)).some(k => fits(c, k)));
-  const open = [];
-  for (const c of above) { if (kvFor(c) == null) break; open.push(c); }
-  let ctx, k;
-  if (probes.length >= LIMITS.maxProbes || !open.length) {
-    if (!lo) return fail('no_context');
-    ({ c: ctx, k } = lo);
+  const ceiling = k => rungs.filter(c => fits(c, kv[k])).at(-1) ?? null;
+  // Precision first: the most precise type still in play; a more compact one replaces the choice
+  // only when it fits at least twice the context.
+  let pick = null;
+  for (let k = 0; k < allowed; k++) {
+    const cap = ceiling(k);
+    if (cap == null) continue;
+    const t = ofType(k);
+    if (t.lo == null && !t.open.length) continue;
+    if (!pick || cap >= 2 * pick.cap) pick = { k, cap, t };
+  }
+  const settle = chosen => {
+    if (!chosen) for (let k = 0; k < allowed && !chosen; k++) { const c = loOf(k); if (c != null) chosen = { c, k }; }
+    return chosen;
+  };
+  let ctx, k, chosenPair = null;
+  if (!pick || probes.length >= LIMITS.maxProbes || !pick.t.open.length) {
+    chosenPair = settle(pick && pick.t.lo != null ? { c: pick.t.lo, k: pick.k } : null);
+    if (!chosenPair) return fail('no_context');
+    ({ c: ctx, k } = chosenPair);
   } else {
-    const last = probes.at(-1);
-    const retry = last && memory(last.o) && open.includes(last.c) ? last.c : null;
-    const c = retry ?? (!lo && open.length === above.length ? open.at(-1) : open[Math.floor(open.length / 2)]);
-    const kk = kvFor(c);
-    return { step: 'probe', ctx: c, kv: kv[kk], fill: fillFor(f, c), estimateMib: estMib(c, kv[kk]) };
+    const { t } = pick;
+    const hiKnown = t.open.length < t.above.length || probes.some(p => memory(p.o) && p.k < pick.k);
+    const c = t.lo == null && !hiKnown ? t.open.at(-1) : t.open[Math.floor(t.open.length / 2)];
+    return { step: 'probe', ctx: c, kv: kv[pick.k], fill: fillFor(f, c), estimateMib: estMib(c, kv[pick.k]) };
   }
   const chosen = kv[k];
   for (const id of PHASES) {
@@ -195,10 +207,13 @@ const MEMORY = {
   'budget16-unreadable': { budgetMib: 16384, memAvailableMib: null, reserveMib: 2560, floorMib: 2048, cacheRamMib: 512 },
   'budget8': { budgetMib: 8192, memAvailableMib: 60000, reserveMib: 2560, floorMib: 2048, cacheRamMib: 1024 },
 };
-const KV = { default: ['f16', 'q8_0', 'q5_1', 'q5_0'], below: ['f16', 'q8_0', 'q5_1', 'q5_0', 'q4_0'] };
+// #1057: bf16 then q8_0 (the floor) by default; q5 with the model's opt-in; q4_0 also behind the
+// operator's override; f16 where the engine refused bf16.
+const KV = { default: ['bf16', 'q8_0'], q5: ['bf16', 'q8_0', 'q5_1', 'q5_0'], below: ['bf16', 'q8_0', 'q5_1', 'q5_0', 'q4_0'], f16: ['f16', 'q8_0'] };
 const COMBOS = [
-  ['dense-gqa-8b', 'budget16-avail', 'default'], ['dense-gqa-8b', 'budget16-tight-avail', 'default'], ['dense-gqa-8b', 'budget8', 'below'],
-  ['dense-gqa-14b-32k', 'budget16-avail', 'default'], ['swa-pattern-12b-vision', 'budget16-avail', 'default'],
+  ['dense-gqa-8b', 'budget16-avail', 'default'], ['dense-gqa-8b', 'budget16-avail', 'q5'], ['dense-gqa-8b', 'budget16-avail', 'f16'],
+  ['dense-gqa-8b', 'budget16-tight-avail', 'default'], ['dense-gqa-8b', 'budget16-tight-avail', 'q5'], ['dense-gqa-8b', 'budget8', 'below'],
+  ['dense-gqa-14b-32k', 'budget16-avail', 'default'], ['swa-pattern-12b-vision', 'budget16-avail', 'default'], ['swa-pattern-12b-vision', 'budget16-avail', 'q5'],
   ['swa-pattern-12b-vision', 'budget8', 'below'], ['swa-no-pattern-9b', 'budget16-unreadable', 'default'],
   ['swa-per-layer-heads', 'budget16-avail', 'default'], ['swa-shared-kv-4b', 'budget16-avail', 'default'],
   ['hybrid-ssm-9b', 'budget16-avail', 'default'], ['hybrid-ssm-9b', 'budget8', 'below'], ['dense-mtp-head', 'budget16-unreadable', 'default'],
@@ -233,7 +248,7 @@ for (const [model, mem, kvName] of COMBOS) {
   }
 }
 
-const valid = { facts: MODELS['dense-gqa-8b'], memory: MEMORY['budget16-avail'], ladder: [4096, 8192], kv: ['f16'] };
+const valid = { facts: MODELS['dense-gqa-8b'], memory: MEMORY['budget16-avail'], ladder: [4096, 8192], kv: ['bf16'] };
 const variant = patch => JSON.stringify({ ...valid, ...patch });
 const errors = [
   { name: 'not JSON', text: '{', pad: 0, expect: { error: 'input' } },
@@ -243,14 +258,14 @@ const errors = [
   { name: 'ladder rung too small', text: variant({ ladder: [128] }), pad: 0, expect: { error: 'input' } },
   { name: 'ladder too long', text: variant({ ladder: Array.from({ length: 129 }, (_, i) => 4096 + i) }), pad: 0, expect: { error: 'input' } },
   { name: 'unknown cache type', text: variant({ kv: ['q2_k'] }), pad: 0, expect: { error: 'input' } },
-  { name: 'duplicate cache type', text: variant({ kv: ['f16', 'f16'] }), pad: 0, expect: { error: 'input' } },
+  { name: 'duplicate cache type', text: variant({ kv: ['bf16', 'bf16'] }), pad: 0, expect: { error: 'input' } },
   { name: 'negative fact', text: variant({ facts: { blockCount: -1 } }), pad: 0, expect: { error: 'input' } },
   { name: 'fractional fact', text: variant({ facts: { blockCount: 1.5 } }), pad: 0, expect: { error: 'input' } },
   { name: 'string fact', text: variant({ facts: { blockCount: '32' } }), pad: 0, expect: { error: 'input' } },
-  { name: 'no memory', text: JSON.stringify({ facts: {}, ladder: [4096], kv: ['f16'] }), pad: 0, expect: { error: 'input' } },
+  { name: 'no memory', text: JSON.stringify({ facts: {}, ladder: [4096], kv: ['bf16'] }), pad: 0, expect: { error: 'input' } },
   { name: 'result kv not offered', text: variant({ results: [{ step: 'probe', ctx: 4096, kv: 'q8_0', outcome: 'passed' }] }), pad: 0, expect: { error: 'input' } },
   { name: 'unknown step', text: variant({ results: [{ step: 'guess', outcome: 'passed' }] }), pad: 0, expect: { error: 'input' } },
-  { name: 'unknown outcome', text: variant({ results: [{ step: 'probe', ctx: 4096, kv: 'f16', outcome: 'maybe' }] }), pad: 0, expect: { error: 'input' } },
+  { name: 'unknown outcome', text: variant({ results: [{ step: 'probe', ctx: 4096, kv: 'bf16', outcome: 'maybe' }] }), pad: 0, expect: { error: 'input' } },
   { name: 'unknown phase', text: variant({ results: [{ step: 'phase', id: 'kv', outcome: 'passed' }] }), pad: 0, expect: { error: 'input' } },
   { name: 'too many results', text: variant({ results: Array.from({ length: 257 }, () => ({ step: 'serving', outcome: 'passed' })) }), pad: 0, expect: { error: 'input' } },
 ];

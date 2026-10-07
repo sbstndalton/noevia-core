@@ -5,6 +5,9 @@ const { createModelManager } = require('./model-manager.cjs');
 const { createPresetStore } = require('./llamacpp-presets.cjs');
 const { QUALITY, qualityCheck, qualityFailure, newModel } = require('./llamacpp-full-autotune.cjs');
 
+// #1057: the fake engine's f16 quirks (failLoadF16, badF16, the shorter recall) hold for both
+// unquantized cache types, bf16 being the first candidate now.
+const unq = o => ['bf16', 'f16'].includes(o['cache-type-k']);
 function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnload, badQ4 = true, badF16 = false, noHead = false, rejectAll = false, rejectModel = '', badBatch = false, failFinal = false, formattedQuality = false, reasoningOnly = false, truncatedWorkloads = false, idleTimeoutMs = 300000, loseIdentityAfterStart = false, reloadFail = false, unloadPolls = 0, unloadStuck = false, answerFor = null, failLoadF16 = false, httpFor = null, chatTemplate = null, servingFor = null, servingChecks = null, autotuneExtra = {}, onLoad = null, loadHang = null, calibrationExtra = {}, loadReply = null, streamReply = null } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'full-tune-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -23,7 +26,7 @@ function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnl
       if (value === 'unloading' && !unloadStuck && --unloading[id] <= 0) status[id] = value = 'unloaded';
       return { id, status: { value, args: id === 'embed' ? ['--embedding'] : [] }, meta: { n_ctx_train: 16384 } };
     }) } };
-    if (u.pathname === '/models/load') { onLoad?.({ ...options(b.model) }); const refused = loadReply?.(options(b.model)); if (refused) return refused; if (loadHang?.(options(b.model))) { status[b.model] = 'loading'; return { ok: true, body: {} }; } status[b.model] = failLoadF16 && options(b.model)['cache-type-k'] === 'f16' ? 'unloaded' : 'loaded'; return { ok: true, body: {} }; }
+    if (u.pathname === '/models/load') { onLoad?.({ ...options(b.model) }); const refused = loadReply?.(options(b.model)); if (refused) return refused; if (loadHang?.(options(b.model))) { status[b.model] = 'loading'; return { ok: true, body: {} }; } status[b.model] = failLoadF16 && unq(options(b.model)) ? 'unloaded' : 'loaded'; return { ok: true, body: {} }; }
     if (u.pathname === '/models/unload') { status[b.model] = unloadPolls || unloadStuck ? 'unloading' : 'unloaded'; unloading[b.model] = unloadPolls; onUnload?.({ manager, model: b.model }); return { ok: true, body: {} }; }
     if (u.pathname === '/tokenize') return { ok: true, body: { tokens: Array(600).fill(1) } };
     if (u.pathname === '/props') return { ok: true, body: { build_info: build, ...(chatTemplate ? { chat_template: chatTemplate } : {}) } };
@@ -38,7 +41,7 @@ function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnl
       const httpStatus = httpFor?.({ q, o });
       if (httpStatus) return { ok: false, status: httpStatus, body: {} };
       let text = q ? q.expected : prompt.startsWith('List the whole numbers') ? Array.from({ length: 60 }, (_, i) => i + 1).join(', ') : 'Synthetic answer';
-      if (q && (rejectAll || (badSampling && o.temp) || b.model === rejectModel || (badF16 && o['cache-type-k'] === 'f16') || (badQ4 && ['q5_0', 'q5_1', 'q4_0'].includes(o['cache-type-k'])))) text = 'wrong';
+      if (q && (rejectAll || (badSampling && o.temp) || b.model === rejectModel || (badF16 && unq(o)) || (badQ4 && ['q5_0', 'q5_1', 'q4_0'].includes(o['cache-type-k'])))) text = 'wrong';
       if (badBatch && q && o['ubatch-size']) text = 'wrong';
       if (failFinal && q && manager.autotune.status().body.job?.phase === 'Verifying saved profile') text = 'wrong';
       if (formattedQuality && q) text = q.id === 'extraction' ? '`' + text + '`' : '**' + text + '**';
@@ -54,7 +57,7 @@ function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnl
     const b = JSON.parse(opts.body), text = b.messages[0].content, marker = /start marker: (CAL-[\d-]+)/.exec(text)[1];
     const o = options(b.model);
     const replaced = streamReply?.(o); if (replaced) return replaced;
-    const content = Number(o['ctx-size']) <= (o['cache-type-k'] === 'f16' ? 8192 : 16384) ? marker : 'forgot';
+    const content = Number(o['ctx-size']) <= (unq(o) ? 8192 : 16384) ? marker : 'forgot';
     return new Response(`data: ${JSON.stringify({ choices: [{ delta: { content } }], timings: { prompt_n: Math.floor(text.length / 5), prompt_ms: 100, prompt_per_second: 100000 } })}\n\ndata: [DONE]\n\n`);
   };
   const makeManager = () => createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic', presetPath: ini, fetchJson, fetchStream,
@@ -81,18 +84,18 @@ test('ordered script commits KV, context, drafting and batch with measured evide
   const j = await finished(f.manager), item = j.models[0];
   assert.equal(j.status, 'passed', j.error);
   assert.deepEqual(item.phases.map(p => [p.id, p.status]), [['sampling','passed'],['kv','passed'],['context','passed'],['drafting','passed'],['batch','passed']]);
-  assert.equal(item.result.kv, 'q8_0'); assert.equal(item.result.spec, 'mtp-deep');
-  assert.equal(item.result.context, 16384); assert.equal(item.result.acceptance, 65);
-  assert.equal(item.result.generation, 60);
+  // #1057: precision first: bf16 although q8_0 measured faster (the model cannot be sized here).
+  assert.equal(item.result.kv, 'bf16'); assert.equal(item.result.spec, 'mtp-deep');
+  assert.equal(item.result.context, 8192); assert.equal(item.result.acceptance, 65);
+  assert.equal(item.result.generation, 50);
   assert.equal(item.result.ubatch, 1024);
-  assert.equal(phase(item, 'kv').steps.find(s => s.id === 'q5_0').status, 'failed');
-  assert.equal(phase(item, 'kv').steps.find(s => s.id === 'q5_1').status, 'failed');
-  assert.deepEqual(phase(item, 'kv').steps.map(s => s.id), ['f16', 'q8_0', 'q5_1', 'q5_0']);
-  assert.equal(phase(item, 'context').value.context, 16384);
+  assert.equal(phase(item, 'kv').steps.find(s => s.id === 'q8_0').status, 'passed');
+  assert.deepEqual(phase(item, 'kv').steps.map(s => s.id), ['bf16', 'q8_0']);
+  assert.equal(phase(item, 'context').value.context, 8192);
   assert.equal(phase(item, 'drafting').value.spec, 'mtp-deep');
   assert.equal(phase(item, 'batch').value.promptPerSecond, 800);
   const o = f.options('synthetic');
-  assert.equal(o['ctx-size'], '16384'); assert.equal(o['cache-type-k'], 'q8_0');
+  assert.equal(o['ctx-size'], '8192'); assert.equal(o['cache-type-k'], 'bf16');
   assert.equal(o['spec-type'], 'draft-mtp'); assert.equal(o['ubatch-size'], '1024');
   assert.equal((await f.manager.autotune.untuned()).body.models.length, 0);
   assert.equal(f.manager.autotune.status('synthetic').body.history.length, 1);
@@ -146,15 +149,17 @@ test('Laya is reported as a system model, not a chat model needing tuning, and c
 });
 
 test('quality rejection followed by asynchronous unload still reaches the next KV candidate', async t => {
-  // f16 is the reference, so the rejected candidate is q8_0 (it breaks arithmetic, which f16 passed).
+  // bf16 is the reference, so the rejected candidate is q8_0 (it breaks arithmetic, which bf16
+  // passed); with q5 allowed for this model the run still reaches q5_1 after it.
   const f = fixture(t, { badQ4: false, unloadPolls: 4, answerFor: ({ q, o }) => q.id === 'arithmetic' && o['cache-type-k'] === 'q8_0' ? '61' : null });
+  assert.equal(f.manager.autotune.setSettings('synthetic', { allowQ5Kv: true }).status, 200);
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   const j = await finished(f.manager), kv = phase(j.models[0], 'kv');
   assert.equal(j.status, 'passed', j.error);
   assert.equal(kv.steps.find(s => s.id === 'q8_0').status, 'failed');
   assert.match(kv.steps.find(s => s.id === 'q8_0').reason, /arithmetic \(mismatch\)/);
   assert.equal(kv.steps.find(s => s.id === 'q5_1').status, 'passed');
-  assert.equal(j.models[0].result.kv, 'q5_1');
+  assert.equal(j.models[0].result.kv, 'bf16');
 });
 
 test('an unload that never reaches unloaded stops without writing another profile', async t => {
@@ -163,8 +168,8 @@ test('an unload that never reaches unloaded stops without writing another profil
   const j = await finished(f.manager);
   assert.equal(j.status, 'failed');
   assert.match(j.error, /Timed out waiting for router unload: synthetic \(unloading\)/);
-  assert.equal(f.options('synthetic')['cache-type-k'], 'f16');
-  assert.ok(f.requests.length > 0 && f.requests.every(r => r.options['cache-type-k'] === 'f16'), 'only the first candidate was measured');
+  assert.equal(f.options('synthetic')['cache-type-k'], 'bf16');
+  assert.ok(f.requests.length > 0 && f.requests.every(r => r.options['cache-type-k'] === 'bf16'), 'only the first candidate was measured');
 });
 
 test('cancelling during router unload waits for safe rollback and releases chat', async t => {
@@ -206,7 +211,8 @@ test('model two failure preserves model one and leaves model three for Resume', 
   const j = await finished(f.manager);
   assert.equal(j.status, 'failed');
   assert.deepEqual(j.models.map(m => m.status), ['passed', 'failed', 'pending']);
-  assert.equal(f.options('one')['ctx-size'], '16384');
+  assert.equal(f.options('one')['ctx-size'], '8192');
+  assert.equal(f.options('one')['cache-type-k'], 'bf16');
   assert.equal(f.options('one')['spec-type'], 'draft-mtp');
   assert.equal(f.options('two')['ctx-size'], '8192');
   assert.equal(f.options('three')['ctx-size'], '8192');
@@ -250,8 +256,8 @@ test('cancel during drafting keeps committed KV/context and Resume starts at dra
   assert.equal(j.status, 'cancelled');
   assert.deepEqual(j.models[0].phases.slice(0,2).map(p => p.status), ['passed','passed']);
   assert.equal(phase(j.models[0], 'drafting').status, 'interrupted');
-  assert.equal(f.options('synthetic')['cache-type-k'], 'q8_0');
-  assert.equal(f.options('synthetic')['ctx-size'], '16384');
+  assert.equal(f.options('synthetic')['cache-type-k'], 'bf16');
+  assert.equal(f.options('synthetic')['ctx-size'], '8192');
   assert.equal(f.manager.autotune.status().body.history.length, 0);
   const before = f.requests.length;
   assert.equal((await f.manager.autotune.resume({ confirmPause: true })).status, 202);
@@ -272,8 +278,8 @@ test('batch quality failure restores only batch settings and leaves prior phase 
   assert.equal(phase(item, 'batch').status, 'failed');
   assert.equal(phase(item, 'batch').restored, true);
   assert.deepEqual(item.phases.slice(0,3).map(p => p.status), ['passed','passed','passed']);
-  assert.equal(f.options('synthetic')['cache-type-k'], 'q8_0');
-  assert.equal(f.options('synthetic')['ctx-size'], '16384');
+  assert.equal(f.options('synthetic')['cache-type-k'], 'bf16');
+  assert.equal(f.options('synthetic')['ctx-size'], '8192');
   assert.equal(f.options('synthetic')['spec-type'], 'draft-mtp');
   assert.equal(f.options('synthetic')['ubatch-size'], undefined);
   assert.equal(f.manager.autotune.status('synthetic').body.history.length, 0);
@@ -371,8 +377,18 @@ test('engine identity and setting edits invalidate previously complete tunes', a
   f.setBuild('fake-v2');
   assert.deepEqual((await f.manager.autotune.untuned()).body.models, ['synthetic']);
   f.setBuild('fake-v1');
-  fs.writeFileSync(f.ini, fs.readFileSync(f.ini, 'utf8').replace('ctx-size = 16384', 'ctx-size = 12288'));
+  fs.writeFileSync(f.ini, fs.readFileSync(f.ini, 'utf8').replace(/\[synthetic\]([^[]*?)ctx-size = 8192/, '[synthetic]$1ctx-size = 12288'));
   assert.deepEqual((await f.manager.autotune.untuned()).body.models, ['synthetic']);
+});
+
+test('#1057 allowing q5 for a model makes its earlier tune stale; turning it off again does not', async t => {
+  const f = fixture(t);
+  await f.manager.autotune.start('synthetic', { confirmPause: true }); await finished(f.manager);
+  assert.deepEqual((await f.manager.autotune.untuned()).body.models, []);
+  f.manager.autotune.setSettings('synthetic', { allowQ5Kv: true });
+  assert.deepEqual((await f.manager.autotune.untuned()).body.models, ['synthetic']);
+  f.manager.autotune.setSettings('synthetic', { allowQ5Kv: false });
+  assert.deepEqual((await f.manager.autotune.untuned()).body.models, []);
 });
 
 test('a model without an MTP head chooses measured n-gram drafting', async t => {
@@ -489,27 +505,29 @@ test('capped nonempty throughput samples remain measurable after independent qua
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   const job = await finished(f.manager);
   assert.equal(job.status, 'passed', job.error);
-  assert.equal(job.models[0].result.generation, 60);
+  assert.equal(job.models[0].result.generation, 50);
 });
 
-test('KV phase never offers q4_0 by default and picks a Q5-or-higher profile even when q4 would be fastest (issue #190)', async t => {
-  const f = fixture(t); // badQ4 defaults true: q5_0/q5_1/q4_0 all fail quality in this fixture
+test('#1057 KV phase offers bf16 and q8_0 by default: q8_0 is the floor, no q5 or q4 without opt-ins', async t => {
+  const f = fixture(t, { badQ4: false }); // q5/q4 would pass quality here and be fastest
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   const j = await finished(f.manager), item = j.models[0];
   assert.equal(j.status, 'passed', j.error);
-  assert.deepEqual(phase(item, 'kv').steps.map(s => s.id), ['f16', 'q8_0', 'q5_1', 'q5_0']);
-  assert.ok(!phase(item, 'kv').steps.some(s => s.id === 'q4_0'), 'q4_0 must not be a candidate by default');
-  assert.equal(item.result.kv, 'q8_0');
+  assert.deepEqual(phase(item, 'kv').steps.map(s => s.id), ['bf16', 'q8_0']);
+  assert.ok(!f.requests.some(r => ['q5_1', 'q5_0', 'q4_0', 'f16'].includes(r.options['cache-type-k'])), 'no type below the floor, and no f16, is ever loaded');
+  assert.equal(item.result.kv, 'bf16');
 });
 
-test('KV floor override env var adds q4_0 as a last-resort candidate, still below f16/q8_0/q5', async t => {
+test('#1057 the override env var alone adds nothing; with the model\'s q5 opt-in it adds q4_0 last', async t => {
   const prior = process.env.NOEVIA_AUTOTUNE_ALLOW_BELOW_Q5_KV;
   process.env.NOEVIA_AUTOTUNE_ALLOW_BELOW_Q5_KV = '1';
   t.after(() => { if (prior === undefined) delete process.env.NOEVIA_AUTOTUNE_ALLOW_BELOW_Q5_KV; else process.env.NOEVIA_AUTOTUNE_ALLOW_BELOW_Q5_KV = prior; });
   const f = fixture(t);
+  assert.deepEqual(f.manager.autotune.status('synthetic').body.kvCandidates, ['bf16', 'q8_0']);
+  f.manager.autotune.setSettings('synthetic', { allowQ5Kv: true });
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   const j = await finished(f.manager), item = j.models[0];
-  assert.deepEqual(phase(item, 'kv').steps.map(s => s.id), ['f16', 'q8_0', 'q5_1', 'q5_0', 'q4_0']);
+  assert.deepEqual(phase(item, 'kv').steps.map(s => s.id), ['bf16', 'q8_0', 'q5_1', 'q5_0', 'q4_0']);
 });
 
 test('KV floor override env var is off by default (no override, no q4_0 candidate)', async t => {
@@ -541,7 +559,7 @@ test('sampling step applies the family recommendation through the preset write p
   assert.match(p.value.source, /Qwen3 family table/);
   assert.equal(item.result.sampling.tier, 'family');
   // The later phases keep the sampling keys they did not touch.
-  assert.equal(o['cache-type-k'], 'q8_0');
+  assert.equal(o['cache-type-k'], 'bf16');
 });
 
 test('a failing sampling probe restores models.ini exactly, records why, and the tune carries on to complete', async t => {
@@ -552,12 +570,12 @@ test('a failing sampling probe restores models.ini exactly, records why, and the
   assert.equal(j.status, 'passed', j.error);
   assert.equal(p.status, 'passed'); assert.equal(p.value.skipped, true); assert.equal(p.value.failed, true);
   assert.match(p.value.reason, /Quality checks failed/); assert.equal(p.steps[0].status, 'failed');
-  assert.equal(phase(item, 'kv').status, 'passed'); assert.equal(item.result.kv, 'q8_0');
+  assert.equal(phase(item, 'kv').status, 'passed'); assert.equal(item.result.kv, 'bf16');
   assert.equal(item.result.sampling.failed, true);
   const o = f.options('Qwen3-8B-Instruct');
   for (const k of ['temp', 'top-p', 'top-k', 'min-p', 'repeat-penalty']) assert.equal(o[k], undefined, k);
   // Restored byte-identically before KV ran: the first KV probe saw no sampling keys.
-  atKv = f.requests.find(r => r.options['cache-type-k'] === 'f16');
+  atKv = f.requests.find(r => r.options['cache-type-k'] === 'bf16');
   assert.equal(atKv.options.temp, undefined);
   assert.ok(j.log.some(l => /models\.ini was restored/.test(l.text)));
 });
@@ -643,16 +661,18 @@ const probeRequests = (f, id) => f.requests.filter(r => r.prompt === QUALITY.fin
 // The 2026-09-30 E2B run: a plain wrong "69" for arithmetic at every setting, the other probes fine.
 const e2b = ({ q }) => q.id === 'arithmetic' ? '69' : null;
 
-test('#328 baseline passing every probe reuses the f16 candidate instead of loading f16 twice', async t => {
+test('#328 baseline passing every probe reuses the bf16 candidate instead of loading a reference as well', async t => {
   const f = fixture(t);
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   const j = await finished(f.manager), item = j.models[0];
   assert.equal(j.status, 'passed', j.error);
-  assert.deepEqual(item.baseline, { reference: 'f16', probes: ['arithmetic', 'extraction', 'reasoning'], skipped: [] });
-  // One probe set at f16 (the KV candidate, which is the baseline), none measured separately.
-  assert.equal(f.requests.filter(r => r.options['cache-type-k'] === 'f16' && QUALITY.some(q => q.prompt === r.prompt)).length, 3);
-  assert.equal(phase(item, 'kv').steps.find(s => s.id === 'f16').status, 'passed');
-  assert.ok(j.log.some(l => /^Quality baseline at f16 KV cache, drafting off: arithmetic passed, extraction passed, reasoning passed\.$/.test(l.text)));
+  assert.deepEqual(item.baseline, { reference: 'bf16', probes: ['arithmetic', 'extraction', 'reasoning'], skipped: [] });
+  // One probe set at bf16 (the KV candidate, which is the baseline), none at f16 or measured separately.
+  const beforeQ8 = f.requests.slice(0, f.requests.findIndex(r => r.options['cache-type-k'] === 'q8_0'));
+  assert.equal(beforeQ8.filter(r => r.options['cache-type-k'] === 'bf16' && QUALITY.some(q => q.prompt === r.prompt)).length, 3);
+  assert.ok(!f.requests.some(r => r.options['cache-type-k'] === 'f16'));
+  assert.equal(phase(item, 'kv').steps.find(s => s.id === 'bf16').status, 'passed');
+  assert.ok(j.log.some(l => /^Quality baseline at bf16 KV cache, drafting off: arithmetic passed, extraction passed, reasoning passed\.$/.test(l.text)));
   assert.deepEqual(item.result.baseline, item.baseline);
 });
 
@@ -661,11 +681,11 @@ test('#328 a probe the model fails at its reference settings is skipped, and the
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   const j = await finished(f.manager), item = j.models[0];
   assert.equal(j.status, 'passed', j.error);
-  assert.deepEqual(item.baseline, { reference: 'f16', probes: ['extraction', 'reasoning'], skipped: [{ id: 'arithmetic', reason: 'mismatch', answer: '69' }] });
+  assert.deepEqual(item.baseline, { reference: 'bf16', probes: ['extraction', 'reasoning'], skipped: [{ id: 'arithmetic', reason: 'mismatch', answer: '69' }] });
   assert.equal(probeRequests(f, 'arithmetic').length, 1, 'arithmetic is asked once, for the baseline, then never again');
   assert.ok(probeRequests(f, 'extraction').length > 5, 'the discriminative probes still gate every later step');
   assert.deepEqual(item.phases.map(p => p.status), ['passed', 'passed', 'passed', 'passed', 'passed']);
-  assert.equal(item.result.kv, 'q8_0');
+  assert.equal(item.result.kv, 'bf16');
   assert.deepEqual(item.result.quality.skipped, ['arithmetic']);
   assert.ok(item.result.quality.checks.every(c => c.id !== 'arithmetic' && c.passed));
   assert.ok(j.log.some(l => l.text.includes('arithmetic skipped (the model gets this wrong at its reference settings; answered "69")')));
@@ -673,6 +693,7 @@ test('#328 a probe the model fails at its reference settings is skipped, and the
 
 test('#328 a candidate that breaks a probe the baseline passed still fails', async t => {
   const f = fixture(t, { badQ4: false, answerFor: ({ q, o }) => e2b({ q }) ?? (q.id === 'extraction' && o['cache-type-k'] === 'q5_0' ? 'AX-471' : null) });
+  f.manager.autotune.setSettings('synthetic', { allowQ5Kv: true });
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   const j = await finished(f.manager), kv = phase(j.models[0], 'kv');
   assert.equal(j.status, 'passed', j.error);
@@ -680,7 +701,7 @@ test('#328 a candidate that breaks a probe the baseline passed still fails', asy
   assert.equal(q50.status, 'failed');
   assert.equal(q50.reason, 'Quality checks failed: extraction (mismatch). Answered extraction: "AX-471".');
   assert.equal(kv.steps.find(s => s.id === 'q5_1').status, 'passed');
-  assert.equal(j.models[0].result.kv, 'q5_1');
+  assert.equal(j.models[0].result.kv, 'bf16');
 });
 
 test('#328 a model that fails every probe at its reference settings stops with a clear reason', async t => {
@@ -691,7 +712,7 @@ test('#328 a model that fails every probe at its reference settings stops with a
   assert.match(j.error, /^The model failed every quality probe at its reference settings/);
   assert.match(j.error, /arithmetic \(mismatch\), extraction \(mismatch\), reasoning \(mismatch\)/);
   assert.equal(kv.status, 'failed'); assert.equal(kv.restored, true);
-  assert.deepEqual(kv.steps.map(s => s.status), ['failed', 'pending', 'pending', 'pending'], 'no further candidate is measured');
+  assert.deepEqual(kv.steps.map(s => s.status), ['failed', 'pending'], 'no further candidate is measured');
   assert.deepEqual(j.models[0].baseline.probes, []);
   assert.equal(fs.readFileSync(f.ini, 'utf8'), f.original);
   // Resume measures the baseline again rather than trusting the empty one.
@@ -726,20 +747,21 @@ test('#328 when f16 does not load, the baseline comes from the current settings'
   assert.equal(j.status, 'passed', j.error);
   assert.equal(item.baseline.reference, 'current');
   assert.deepEqual(item.baseline.probes, ['extraction', 'reasoning']);
-  assert.equal(phase(item, 'kv').steps.find(s => s.id === 'f16').status, 'failed');
+  assert.equal(phase(item, 'kv').steps.find(s => s.id === 'bf16').status, 'failed');
+  // bf16 failed, so the floor: q8_0.
   assert.equal(item.result.kv, 'q8_0');
   assert.ok(j.log.some(l => /^Quality baseline at the current settings, drafting off:/.test(l.text)));
 });
 
 test('#328 an engine error during the baseline never marks a probe as one the model gets wrong', async t => {
-  // f16 loads but the engine errors on one probe: that f16 run cannot be the baseline, so the
-  // current settings supply it, with every probe still counted.
-  const f = fixture(t, { httpFor: ({ q, o }) => q?.id === 'extraction' && o['cache-type-k'] === 'f16' ? 500 : 0 });
+  // bf16 (and f16) load but the engine errors on one probe: those runs cannot be the baseline, so
+  // the current settings supply it, with every probe still counted.
+  const f = fixture(t, { httpFor: ({ q, o }) => q?.id === 'extraction' && unq(o) ? 500 : 0 });
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   const j = await finished(f.manager), item = j.models[0];
   assert.equal(j.status, 'passed', j.error);
   assert.deepEqual(item.baseline, { reference: 'current', probes: ['arithmetic', 'extraction', 'reasoning'], skipped: [] });
-  assert.match(phase(item, 'kv').steps.find(s => s.id === 'f16').reason, /extraction \(HTTP 500\)/);
+  assert.match(phase(item, 'kv').steps.find(s => s.id === 'bf16').reason, /extraction \(HTTP 500\)/);
 });
 
 test('#328 qualityCheck sends only the probes the baseline passed and reports the rest as skipped', async () => {
@@ -756,10 +778,16 @@ test('#328 qualityCheck sends only the probes the baseline passed and reports th
 test('#328 status reports the KV candidates this server really tries', async t => {
   delete process.env.NOEVIA_AUTOTUNE_ALLOW_BELOW_Q5_KV;
   const f = fixture(t);
-  assert.deepEqual(f.manager.autotune.status('synthetic').body.kvCandidates, ['f16', 'q8_0', 'q5_1', 'q5_0']);
+  assert.deepEqual(f.manager.autotune.status('synthetic').body.kvCandidates, ['bf16', 'q8_0']);
+  assert.deepEqual(f.manager.autotune.status('synthetic').body.settings, { allowQ5Kv: false });
+  f.manager.autotune.setSettings('synthetic', { allowQ5Kv: true });
+  assert.deepEqual(f.manager.autotune.status('synthetic').body.kvCandidates, ['bf16', 'q8_0', 'q5_1', 'q5_0']);
+  assert.deepEqual(f.manager.autotune.status('synthetic').body.settings, { allowQ5Kv: true });
+  // Per model: another model keeps the default list.
+  assert.deepEqual(f.manager.autotune.status('embed').body.kvCandidates, ['bf16', 'q8_0']);
   process.env.NOEVIA_AUTOTUNE_ALLOW_BELOW_Q5_KV = '1';
   t.after(() => { delete process.env.NOEVIA_AUTOTUNE_ALLOW_BELOW_Q5_KV; });
-  assert.deepEqual(f.manager.autotune.status('synthetic').body.kvCandidates, ['f16', 'q8_0', 'q5_1', 'q5_0', 'q4_0']);
+  assert.deepEqual(f.manager.autotune.status('synthetic').body.kvCandidates, ['bf16', 'q8_0', 'q5_1', 'q5_0', 'q4_0']);
 });
 
 test('#872 between model leases the gate is open but the folder sync still sees auto-tune running', async t => {
@@ -848,8 +876,8 @@ test('#1003: an unusable checker skips the check instead of failing the tune', a
 });
 
 // ── #1003 AUTOTUNE_PLAN_IMPL=wasm: Rust's planner orders the run ────────────────────────────────
-// Synthetic facts: a small dense model whose f16 KV cache fits 16k context in the 16 GiB budget.
-// The fake engine recalls the marker up to 8k with f16 and up to 16k with a quantized cache.
+// Synthetic facts: a small dense model whose bf16 KV cache fits 16k context in the 16 GiB budget.
+// The fake engine recalls the marker up to 8k unquantized (bf16, f16) and up to 16k quantized.
 const SYNTHETIC_FACTS = { meta: { contextLength: 16384, blockCount: 16, headCount: 16, headCountKv: 4, embeddingLength: 2048 }, modelBytes: 1e9, mmprojBytes: 0 };
 const wasmPlanner = () => { const w = require('./dav-parse-wasm.cjs'); return { mode: () => 'wasm', plan: r => w.autotunePlan(r) }; };
 const servingOff = { mode: () => 'off', templateCaps: () => assert.fail(), verdict: () => assert.fail() };
@@ -863,19 +891,19 @@ test('#1003 planned: context first, then the KV type, a fill-and-recall search, 
   assert.equal(j.status, 'passed', j.error);
   assert.deepEqual(item.phases.map(p => p.id), ['context', 'sampling', 'drafting', 'batch', 'verify']);
   const results = JSON.parse(fs.readFileSync(f.stateFile, 'utf8')).job.models[0].plan.results;
-  // 16k f16 forgets the marker, 8k passes, 12k forgets: 8k with f16.
+  // 16k bf16 forgets the marker, 8k passes, 12k forgets: 8k with bf16.
   assert.deepEqual(results.filter(r => r.step === 'probe').map(r => [r.ctx, r.kv, r.outcome]),
-    [[16384, 'f16', 'recall_failed'], [8192, 'f16', 'passed'], [12288, 'f16', 'recall_failed']]);
+    [[16384, 'bf16', 'recall_failed'], [8192, 'bf16', 'passed'], [12288, 'bf16', 'recall_failed']]);
   assert.deepEqual(results.filter(r => r.step !== 'probe').map(r => r.step + (r.id ? ':' + r.id : '') + ':' + r.outcome),
     ['phase:sampling:skipped', 'phase:drafting:passed', 'phase:batch:passed', 'verify:passed', 'serving:skipped']);
   assert.equal(item.result.context, 8192);
-  assert.equal(item.result.kv, 'f16');
+  assert.equal(item.result.kv, 'bf16');
   assert.equal(item.result.plan, 'wasm');
   assert.equal(f.options('synthetic')['ctx-size'], '8192');
-  assert.equal(f.options('synthetic')['cache-type-k'], 'f16');
+  assert.equal(f.options('synthetic')['cache-type-k'], 'bf16');
   // No repeated full context re-measurements in drafting or batch.
   for (const id of ['drafting', 'batch']) assert.ok(!phase(item, id).steps.some(s => /Context check/.test(s.label)), id);
-  assert.deepEqual(phase(item, 'context').steps.map(s => s.label), ['Fill 16,384 · f16 KV cache', 'Fill 8,192 · f16 KV cache', 'Fill 12,288 · f16 KV cache']);
+  assert.deepEqual(phase(item, 'context').steps.map(s => s.label), ['Fill 16,384 · bf16 KV cache', 'Fill 8,192 · bf16 KV cache', 'Fill 12,288 · bf16 KV cache']);
   assert.equal(phase(item, 'verify').steps.length, 1);
   // One recovery copy for the whole run: the profile as it was before tuning.
   const kept = backups(f.ini);
@@ -899,7 +927,7 @@ test('#1003 planned: probe outcomes reach the planner as memory, recall and qual
   assert.equal(seen[0].memory.budgetMib, 16384);
   assert.equal(seen[0].memory.memAvailableMib, 20480);
   assert.equal(seen[0].memory.reserveMib, 2560);
-  assert.deepEqual(seen[0].kv, ['f16', 'q8_0', 'q5_1', 'q5_0']);
+  assert.deepEqual(seen[0].kv, ['bf16', 'q8_0']);
   assert.deepEqual(seen[0].ladder, [4096, 8192, 12288, 16384]);
   // The failed context stage put models.ini back.
   assert.equal(fs.readFileSync(f.ini, 'utf8'), f.original);
@@ -956,7 +984,7 @@ test('#1003 planned: a cancelled run resumes from its results without repeating 
   let cancelOnce = true;
   const f = fixture(t, { servingChecks: servingOff, autotuneExtra: planned(), onChat: ({ manager, o }) => {
     // The 8k probe's quality check: cancel there, after the 16k probe has its result.
-    if (cancelOnce && o['ctx-size'] === '8192' && o['cache-type-k'] === 'f16' && manager.autotune.status().body.job?.models[0].plan?.results.length === 1) { cancelOnce = false; manager.autotune.cancel(); }
+    if (cancelOnce && o['ctx-size'] === '8192' && o['cache-type-k'] === 'bf16' && manager.autotune.status().body.job?.models[0].plan?.results.length === 1) { cancelOnce = false; manager.autotune.cancel(); }
   } });
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   let j = await finished(f.manager);
@@ -967,7 +995,7 @@ test('#1003 planned: a cancelled run resumes from its results without repeating 
   assert.equal(j.status, 'passed', j.error);
   const results = JSON.parse(fs.readFileSync(f.stateFile, 'utf8')).job.models[0].plan.results;
   assert.deepEqual(results.filter(r => r.step === 'probe').map(r => [r.ctx, r.kv, r.outcome]),
-    [[16384, 'f16', 'recall_failed'], [8192, 'f16', 'passed'], [12288, 'f16', 'recall_failed']]);
+    [[16384, 'bf16', 'recall_failed'], [8192, 'bf16', 'passed'], [12288, 'bf16', 'recall_failed']]);
   assert.equal(j.models[0].result.context, 8192);
   assert.equal(backups(f.ini).length, 1);
 });
@@ -977,7 +1005,7 @@ test('#1003 planned: a cancelled run resumes from its results without repeating 
 const BIG_FACTS = { meta: { contextLength: 131072, blockCount: 32, headCount: 32, headCountKv: 8, embeddingLength: 4096 }, modelBytes: 8e9, mmprojBytes: 8e8 };
 const bigProfile = f => fs.writeFileSync(f.ini, fs.readFileSync(f.ini, 'utf8').replace('[synthetic]\nmodel = /models/synthetic.gguf\nctx-size = 8192', '[synthetic]\nmodel = /models/synthetic.gguf\nctx-size = 131072\ncache-type-k = f16\ncache-type-v = f16'));
 // Whether one load fits, by the planner's own estimate at the load's context, KV type and micro-batch.
-const fitsPlan = (request, o) => wasmPlanner().plan({ ...request, facts: { ...request.facts, ubatch: Math.max(Number(o['ubatch-size']) || 0, 0) }, ladder: [Number(o['ctx-size'])], kv: [o['cache-type-k'] || 'f16'], results: [] }).step === 'probe';
+const fitsPlan = (request, o) => wasmPlanner().plan({ ...request, facts: { ...request.facts, ubatch: Math.max(Number(o['ubatch-size']) || 0, 0) }, ladder: [Number(o['ctx-size'])], kv: [o['cache-type-k'] || 'bf16'], results: [] }).step === 'probe';
 
 test('#1026 #1027 planned: every load of the run fits the budget, the baseline and the micro-batch candidates included', { skip: skipWasm }, async t => {
   const loads = [];
@@ -1014,7 +1042,7 @@ test('#1029 planned: one load timeout is retried and is never a memory failure',
   assert.equal(j.status, 'passed', j.error);
   const results = JSON.parse(fs.readFileSync(f.stateFile, 'utf8')).job.models[0].plan.results;
   assert.deepEqual(results.filter(r => r.step === 'probe').map(r => [r.ctx, r.kv, r.outcome]),
-    [[16384, 'f16', 'recall_failed'], [8192, 'f16', 'passed'], [12288, 'f16', 'recall_failed']]);
+    [[16384, 'bf16', 'recall_failed'], [8192, 'bf16', 'passed'], [12288, 'bf16', 'recall_failed']]);
   assert.ok(j.log.some(l => /Loading timed out; trying the same setting once more/.test(l.text)));
 });
 
@@ -1042,8 +1070,8 @@ function decisionService({ label, confidence = 0.9, delayMs = 0 } = {}) {
     return { selected: label, scores: Object.fromEntries(ids.map(id => [id, id === label ? confidence : rest])) };
   } };
 }
-// The 16k f16 load is refused with `body`; everything else loads.
-const refuse16k = body => o => (o['ctx-size'] === '16384' && o['cache-type-k'] === 'f16' ? { ok: false, status: 500, body } : null);
+// The 16k bf16 load (the planner's first probe) is refused with `body`; everything else loads.
+const refuse16k = body => o => (o['ctx-size'] === '16384' && o['cache-type-k'] === 'bf16' ? { ok: false, status: 500, body } : null);
 const probeRows = f => JSON.parse(fs.readFileSync(f.stateFile, 'utf8')).job.models[0].plan.results.filter(r => r.step === 'probe');
 
 test('#1004 advisor on: a rule names an out-of-memory refusal; the decision service is not asked', { skip: skipWasm }, async t => {
@@ -1053,7 +1081,7 @@ test('#1004 advisor on: a rule names an out-of-memory refusal; the decision serv
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   const j = await finished(f.manager);
   assert.equal(j.status, 'passed', j.error);
-  assert.deepEqual(probeRows(f)[0], { step: 'probe', ctx: 16384, kv: 'f16', outcome: 'oom' });
+  assert.deepEqual(probeRows(f)[0], { step: 'probe', ctx: 16384, kv: 'bf16', outcome: 'oom' });
   const row = phase(j.models[0], 'context').steps[0];
   assert.deepEqual([row.classification.source, row.classification.rule, row.classification.ruleId, row.classification.advisor], ['rule', 'oom', 'text_oom', 'not_asked']);
   assert.match(row.reason, /^The engine refused to load the model at this size\. The engine ran out of memory at this setting \(from the engine's error\)\.$/);
@@ -1104,13 +1132,13 @@ test('#1004 advisor on: a context-size error in the stream steps the context dow
   const j = await finished(f.manager);
   assert.equal(j.status, 'passed', j.error);
   // Without the advisor this stream error counted as out of memory (a more compact cache type).
-  assert.deepEqual(probeRows(f)[0], { step: 'probe', ctx: 16384, kv: 'f16', outcome: 'recall_failed' });
+  assert.deepEqual(probeRows(f)[0], { step: 'probe', ctx: 16384, kv: 'bf16', outcome: 'recall_failed' });
   assert.equal(svc.asked.length, 0);
 });
 
 test('#1004 advisor off (default): outcomes are what they were and nothing is asked', async t => {
   const svc = decisionService({ label: 'template' });
-  const script = [{ step: 'probe', ctx: 16384, kv: 'f16', fill: 14000, estimateMib: 5000 }];
+  const script = [{ step: 'probe', ctx: 16384, kv: 'bf16', fill: 14000, estimateMib: 5000 }];
   const seen = [];
   const planner = { mode: () => 'wasm', plan: r => { seen.push(r); return script[r.results.length] || { step: 'fail', code: 'no_context', message: 'No context size passed the fill-and-recall test.' }; } };
   const f = fixture(t, { servingChecks: servingOff, loadReply: refuse16k({ error: { message: 'CUDA error: out of memory' } }),
@@ -1125,7 +1153,7 @@ test('#1004 advisor off (default): outcomes are what they were and nothing is as
 });
 
 test('#1004 advisor on but the verdict module unusable: the calibrator\'s cause stands', async t => {
-  const script = [{ step: 'probe', ctx: 16384, kv: 'f16', fill: 14000, estimateMib: 5000 }];
+  const script = [{ step: 'probe', ctx: 16384, kv: 'bf16', fill: 14000, estimateMib: 5000 }];
   const seen = [];
   const planner = { mode: () => 'wasm', plan: r => { seen.push(r); return script[r.results.length] || { step: 'fail', code: 'no_context', message: 'No context size passed the fill-and-recall test.' }; } };
   const f = fixture(t, { servingChecks: servingOff, loadReply: refuse16k({ error: { message: 'odd' } }),
@@ -1202,7 +1230,7 @@ test('#1048 the calibrator attaches evidence only when asked', async () => {
 test('#1048 advisor on: an error body that never ends is cancelled at the deadline, and what arrived is used', { skip: skipWasm }, async t => {
   const w = watchedBody({ endless: true });
   const svc = decisionService({ label: 'template' });
-  const f = fixture(t, { servingChecks: servingOff, streamReply: o => (o['ctx-size'] === '16384' && o['cache-type-k'] === 'f16' ? w.response() : null),
+  const f = fixture(t, { servingChecks: servingOff, streamReply: o => (o['ctx-size'] === '16384' && o['cache-type-k'] === 'bf16' ? w.response() : null),
     autotuneExtra: planned({ loadAdvisor: createLoadAdvisor({ env: ADVISOR_ON, endpoint: svc }) }) });
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   for (let i = 0; i < 400 && f.manager.autotune.status().body.job?.status === 'running'; i++) await new Promise(r => setTimeout(r, 25));
@@ -1236,4 +1264,179 @@ test('#1049 the same failure inside the planned quality probe (withQuality catch
   await finished(f.manager);
   assert.ok(armed);
   noSecret(f);
+});
+
+// ── #1057: the owner's KV policy: bf16 by default, q8_0 the floor, q5 per model, precision first ──
+const { kvCandidates, preferKv, bf16Unsupported } = require('./llamacpp-full-autotune.cjs');
+// A dense 32-layer model with a 64k trained context. At 6 GiB, q8_0 fits 24k against bf16's 12k
+// (exactly twice); at 10 GiB, 64k against 40k (1.6x). Sized like the planner (estimateFootprint).
+const DENSE_64K = { meta: { contextLength: 65536, blockCount: 32, headCount: 32, headCountKv: 8, embeddingLength: 4096 }, modelBytes: 2e9, mmprojBytes: 0 };
+
+test('#1057 kvCandidates: bf16 then q8_0; q5 only with the model opt-in; q4_0 only with both opt-ins', () => {
+  const prior = process.env.NOEVIA_AUTOTUNE_ALLOW_BELOW_Q5_KV;
+  try {
+    delete process.env.NOEVIA_AUTOTUNE_ALLOW_BELOW_Q5_KV;
+    assert.deepEqual(kvCandidates(), ['bf16', 'q8_0']);
+    assert.deepEqual(kvCandidates({ allowQ5Kv: true }), ['bf16', 'q8_0', 'q5_1', 'q5_0']);
+    assert.deepEqual(kvCandidates({ allowQ5Kv: 'yes' }), ['bf16', 'q8_0'], 'only a real true opts in');
+    process.env.NOEVIA_AUTOTUNE_ALLOW_BELOW_Q5_KV = 'on';
+    assert.deepEqual(kvCandidates(), ['bf16', 'q8_0']);
+    assert.deepEqual(kvCandidates({ allowQ5Kv: true }), ['bf16', 'q8_0', 'q5_1', 'q5_0', 'q4_0']);
+  } finally { if (prior === undefined) delete process.env.NOEVIA_AUTOTUNE_ALLOW_BELOW_Q5_KV; else process.env.NOEVIA_AUTOTUNE_ALLOW_BELOW_Q5_KV = prior; }
+});
+
+test('#1057 preferKv: the most precise passing type unless a more compact one fits twice the context', () => {
+  assert.equal(preferKv(['bf16', 'q8_0'], { bf16: 12288, q8_0: 24576 }), 'q8_0', 'exactly twice counts');
+  assert.equal(preferKv(['bf16', 'q8_0'], { bf16: 12288, q8_0: 20480 }), 'bf16');
+  assert.equal(preferKv(['bf16', 'q8_0'], null), 'bf16', 'unsizeable: precision alone');
+  assert.equal(preferKv(['q8_0'], { bf16: 12288, q8_0: 20480 }), 'q8_0', 'bf16 failed: the floor');
+  assert.equal(preferKv(['bf16', 'q8_0', 'q5_1', 'q5_0'], { bf16: 8192, q8_0: 12288, q5_1: 16384, q5_0: 16384 }), 'q5_1', 'q5 doubles bf16 where q8_0 does not');
+  assert.equal(preferKv(['bf16', 'q8_0', 'q5_1'], { bf16: 8192, q8_0: 16384, q5_1: 24576 }), 'q8_0', 'q5 must double q8_0 once q8_0 is chosen');
+  assert.equal(preferKv(['bf16', 'q8_0'], { bf16: null, q8_0: 4096 }), 'q8_0', 'bf16 fits no rung');
+  assert.equal(preferKv([], {}), null);
+});
+
+test('#1057 bf16Unsupported: only the engine saying it has no bf16 cache, never memory', () => {
+  for (const text of ['Unsupported cache type: bf16', 'error: unsupported KV cache type bf16', 'ggml_vulkan: Error: Missing op: FLASH_ATTN_EXT for BF16',
+    'the backend does not support BF16 K/V with flash attention', 'cache_type_k bf16 is not supported by this build'])
+    assert.equal(bf16Unsupported(text), true, text);
+  for (const text of ['', null, 'CUDA error: out of memory', 'failed to allocate bf16 buffer of size 9126805504', 'error loading model: missing tensor', 'unsupported template'])
+    assert.equal(bf16Unsupported(text), false, String(text));
+});
+
+test('#1057 js order: q8_0 replaces bf16 only when it fits at least twice the context', async t => {
+  const f = fixture(t, { autotuneExtra: { planFacts: async () => DENSE_64K, budgetGib: () => 6 } });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager), kv = phase(j.models[0], 'kv');
+  assert.equal(j.status, 'passed', j.error);
+  assert.equal(kv.value.kv, 'q8_0');
+  assert.deepEqual(kv.value.candidates.map(c => [c.kv, c.ceiling]), [['bf16', 12288], ['q8_0', 24576]]);
+  assert.ok(j.log.some(l => l.text === 'Committed q8_0 KV cache after quality checks (it fits 24576 tokens, at least twice what bf16 fits).'));
+  // 10 GiB: q8_0 fits 64k, bf16 40k: not twice, so bf16 stays although q8_0 measured faster.
+  const g = fixture(t, { autotuneExtra: { planFacts: async () => DENSE_64K, budgetGib: () => 10 } });
+  await g.manager.autotune.start('synthetic', { confirmPause: true });
+  const k = await finished(g.manager);
+  assert.equal(k.status, 'passed', k.error);
+  assert.equal(phase(k.models[0], 'kv').value.kv, 'bf16');
+  assert.ok(phase(k.models[0], 'kv').value.candidates.find(c => c.kv === 'q8_0').generation > phase(k.models[0], 'kv').value.candidates.find(c => c.kv === 'bf16').generation);
+});
+
+test('#1057 per-model settings: validated, saved with the tune state, survive a restart, never change a queued run', async t => {
+  let stop = true;
+  const f = fixture(t, { onChat: ({ manager }) => { if (stop) { stop = false; manager.autotune.cancel(); } } });
+  const set = (m, b) => f.manager.autotune.setSettings(m, b);
+  assert.equal(set('synthetic', { allowQ5Kv: 'true' }).status, 400);
+  assert.equal(set('synthetic', {}).status, 400);
+  assert.equal(set('synthetic', null).status, 400);
+  assert.equal(set('', { allowQ5Kv: true }).status, 400);
+  assert.equal(set('x'.repeat(201), { allowQ5Kv: true }).status, 400);
+  assert.equal(set('not-configured', { allowQ5Kv: true }).status, 404);
+  assert.equal(set('laya_multilingual_f16', { allowQ5Kv: true }).status, 400);
+  // Off by default; a job started now tries bf16 and q8_0 only.
+  assert.deepEqual(f.manager.autotune.status('synthetic').body.settings, { allowQ5Kv: false });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const cancelled = await finished(f.manager);
+  assert.equal(cancelled.status, 'cancelled');
+  assert.deepEqual(cancelled.models[0].kv, ['bf16', 'q8_0']);
+  const on = set('synthetic', { allowQ5Kv: true });
+  assert.equal(on.status, 200);
+  assert.deepEqual(on.body.settings, { allowQ5Kv: true });
+  assert.deepEqual(on.body.kvCandidates, ['bf16', 'q8_0', 'q5_1', 'q5_0']);
+  assert.deepEqual(JSON.parse(fs.readFileSync(f.stateFile, 'utf8')).settings, { synthetic: { allowQ5Kv: true } });
+  assert.deepEqual(f.restart().autotune.status('synthetic').body.settings, { allowQ5Kv: true });
+  // The resumed run keeps the list it started with.
+  const manager = f.restart();
+  assert.equal((await manager.autotune.resume({ confirmPause: true })).status, 202);
+  const resumed = await finished(manager);
+  assert.equal(resumed.status, 'passed', resumed.error);
+  assert.deepEqual(phase(resumed.models[0], 'kv').steps.map(s => s.id), ['bf16', 'q8_0']);
+  // Off again removes the entry.
+  manager.autotune.setSettings('synthetic', { allowQ5Kv: false });
+  assert.deepEqual(JSON.parse(fs.readFileSync(f.stateFile, 'utf8')).settings, {});
+});
+
+// A scripted planner that probes at 8k with the request's first type until a pass, then runs on.
+const scriptedFrom = seen => ({ mode: () => 'wasm', plan: r => {
+  seen.push(JSON.parse(JSON.stringify(r)));
+  const res = r.results, kv = r.kv[0], has = (step, id) => res.some(x => x.step === step && (!id || x.id === id));
+  if (!res.some(x => x.step === 'probe' && x.outcome === 'passed')) {
+    if (res.some(x => x.step === 'probe')) return { step: 'fail', code: 'no_context', message: 'No context size passed the fill-and-recall test.' };
+    return { step: 'probe', ctx: 8192, kv, fill: 7000, estimateMib: 4000 };
+  }
+  for (const id of ['sampling', 'drafting', 'batch']) if (!has('phase', id)) return { step: 'phase', id, ctx: 8192, kv };
+  if (!has('verify')) return { step: 'verify', ctx: 8192, kv, fill: 7000, estimateMib: 4000 };
+  if (!has('serving')) return { step: 'serving', ctx: 8192, kv };
+  return { step: 'done', ctx: 8192, kv };
+} });
+const refuseBf16 = text => o => (o['cache-type-k'] === 'bf16' ? { ok: false, status: 500, body: { error: { message: text } } } : null);
+
+test('#1057 planned: an engine that rejects bf16 gets f16 in its place, recorded on the plan and noted on the job', async t => {
+  const seen = [];
+  const f = fixture(t, { servingChecks: servingOff, loadReply: refuseBf16('llama_init_from_model: unsupported cache type: bf16 (Vulkan, flash attention)'),
+    autotuneExtra: planned({ planner: scriptedFrom(seen) }) });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager), item = j.models[0];
+  assert.equal(j.status, 'passed', j.error);
+  assert.equal(item.result.kv, 'f16');
+  assert.deepEqual(item.result.kvFallback, { from: 'bf16', to: 'f16', at: 8192 });
+  assert.equal(f.options('synthetic')['cache-type-k'], 'f16');
+  // The rejected bf16 step is not a planner result; the next request offers f16 instead. (The
+  // baseline's one-rung sizing questions are left out.)
+  const steps = seen.filter(r => r.ladder.length > 1);
+  assert.deepEqual(steps[0].kv, ['bf16', 'q8_0']);
+  assert.deepEqual(steps[1].kv, ['f16', 'q8_0']);
+  assert.deepEqual(steps[1].results, []);
+  const rows = phase(item, 'context').steps;
+  assert.deepEqual(rows.map(r => [r.kv, r.status]), [['bf16', 'failed'], ['f16', 'passed']]);
+  assert.match(rows[0].reason, /does not support a bf16 KV cache, so auto-tune uses f16/);
+  assert.ok(j.log.some(l => /does not support a bf16 KV cache/.test(l.text)));
+  // The engine's own words stay out of status() and the state file (#1047).
+  assert.ok(!JSON.stringify(f.manager.autotune.status().body).includes('llama_init_from_model'));
+  assert.ok(!fs.readFileSync(f.stateFile, 'utf8').includes('llama_init_from_model'));
+  assert.deepEqual(item.plan.request.kv, ['f16', 'q8_0']);
+});
+
+test('#1057 planned: a bf16 failure that is not "unsupported" (out of memory) stays a failure with bf16', async t => {
+  const seen = [];
+  const f = fixture(t, { servingChecks: servingOff, loadReply: refuseBf16('ggml_vulkan: failed to allocate bf16 buffer: out of device memory'),
+    autotuneExtra: planned({ planner: scriptedFrom(seen) }) });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'failed');
+  assert.deepEqual(seen.at(-1).results.map(r => [r.kv, r.outcome]), [['bf16', 'load_failed']]);
+  assert.deepEqual(seen.at(-1).kv, ['bf16', 'q8_0']);
+  assert.equal(j.models[0].plan.kvFallback, undefined);
+  assert.ok(!f.requests.some(r => r.options['cache-type-k'] === 'f16' && r.options['ctx-size'] === '8192'));
+});
+
+test('#1057 planned (wasm): bf16 rejected at its first probe, f16 runs the same search', { skip: skipWasm }, async t => {
+  const f = fixture(t, { servingChecks: servingOff, loadReply: refuseBf16('Unsupported cache type: bf16'), autotuneExtra: planned() });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager), item = j.models[0];
+  assert.equal(j.status, 'passed', j.error);
+  const results = JSON.parse(fs.readFileSync(f.stateFile, 'utf8')).job.models[0].plan.results;
+  assert.deepEqual(results.filter(r => r.step === 'probe').map(r => [r.ctx, r.kv, r.outcome]),
+    [[16384, 'f16', 'recall_failed'], [8192, 'f16', 'passed'], [12288, 'f16', 'recall_failed']]);
+  assert.equal(item.result.kv, 'f16');
+  assert.equal(item.result.context, 8192);
+  assert.equal(phase(item, 'context').steps[0].label, 'Fill 16,384 · bf16 KV cache');
+});
+
+test('#1057 planned (wasm): the request carries the model\'s list, and q5 wins only where it doubles the context', { skip: skipWasm }, async t => {
+  const w = require('./dav-parse-wasm.cjs'), { ladder } = require('./llamacpp-calibration.cjs');
+  const req = (kv, budgetMib) => ({ facts: { nCtxTrain: 65536, blockCount: 32, headCount: 32, headCountKv: 8, embeddingLength: 4096, modelBytes: 2e9, ubatch: 2048, slots: 1 },
+    memory: { budgetMib, memAvailableMib: null, reserveMib: 2560, floorMib: 2048, cacheRamMib: 1024 }, ladder: ladder(65536), kv, results: [] });
+  const first = (kv, mib) => { const s = w.autotunePlan(req(kv, mib)); return [s.ctx, s.kv]; };
+  // 7424 MiB: bf16 24k; q8_0 does not double it; q5_1 fits 64k, which does.
+  assert.deepEqual(first(kvCandidates(), 7424), [24576, 'bf16']);
+  assert.deepEqual(first(kvCandidates({ allowQ5Kv: true }), 7424), [65536, 'q5_1']);
+  // 16 GiB: bf16 at the trained maximum whatever is allowed.
+  assert.deepEqual(first(kvCandidates({ allowQ5Kv: true }), 16384), [65536, 'bf16']);
+  // The planned job sends the model's own list.
+  const seen = [];
+  const f = fixture(t, { servingChecks: servingOff, autotuneExtra: planned({ planner: { mode: () => 'wasm', plan: r => { seen.push(r); return w.autotunePlan(r); } } }) });
+  f.manager.autotune.setSettings('synthetic', { allowQ5Kv: true });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  assert.equal((await finished(f.manager)).status, 'passed');
+  assert.deepEqual(seen[0].kv, ['bf16', 'q8_0', 'q5_1', 'q5_0']);
 });

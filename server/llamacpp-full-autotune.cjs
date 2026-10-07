@@ -6,12 +6,44 @@ const { WORKLOADS, SPEC_CANDIDATES, geomean } = require('./llamacpp-tune-spec.cj
 const { hasHarmonyReasoning, quirksOf, toIniOptions, INI_KEY_LIST } = require('./sampling-recommendation.cjs');
 const { isSystemModel, modelPathFromArgs, SYSTEM_MODEL_REASON } = require('./model-system.cjs');
 const VERSION = 3;
-// Q5 is the automatic floor for KV cache quantization (issue #190): Q4 degrades quality too
-// much to select automatically. Q4 stays reachable only through an explicit override env var,
-// never as a routine candidate, and never below Q5 by default. f16/q8_0 remain above the floor.
+// #1057 (owner's KV policy): bf16 (unquantized) by default, q8_0 the floor. q5_1/q5_0 only with
+// the model's own opt-in (allowQ5Kv, saved with its tune settings below); q4_0 also needs the
+// operator's override env var (#190), so it is never reached without both. f16 is no longer a
+// candidate: it stands in for bf16 only when the engine rejects bf16 (see BF16_UNSUPPORTED).
+// Both orders prefer precision: a more compact type is taken only when it fits about twice the
+// context (the planner's rule in autotune-plan; preferKv for the js order's KV phase).
 const KV_FLOOR_OVERRIDE_ENV = 'NOEVIA_AUTOTUNE_ALLOW_BELOW_Q5_KV';
 const allowBelowQ5Kv = () => ['1', 'true', 'yes', 'on'].includes(String(process.env[KV_FLOOR_OVERRIDE_ENV] || '').toLowerCase());
-const kvCandidates = () => allowBelowQ5Kv() ? ['f16', 'q8_0', 'q5_1', 'q5_0', 'q4_0'] : ['f16', 'q8_0', 'q5_1', 'q5_0'];
+const kvCandidates = ({ allowQ5Kv = false } = {}) => [
+  'bf16', 'q8_0', ...(allowQ5Kv === true ? ['q5_1', 'q5_0', ...(allowBelowQ5Kv() ? ['q4_0'] : [])] : []),
+];
+const UNQUANTIZED = new Set(['bf16', 'f16']);
+// The engine's own words for "this build cannot use a bf16 cache" (llama.cpp's cache type checks,
+// a backend without the kernel). Read like load-verdict reads text: lowercase, _ and - as spaces.
+// Only these, on a bf16 probe, swap f16 in; anything else (memory above all) stays a failure.
+const BF16_UNSUPPORTED = [/unsupported (kv )?cache type/, /cache type .{0,24}not supported/,
+  /bf16.{0,80}(unsupported|not supported|missing op|no kernel)/, /(unsupported|not supported|does not support|missing op|no kernel).{0,80}bf16/];
+const bf16Unsupported = text => {
+  if (typeof text !== 'string' || !text) return false;
+  const flat = text.toLowerCase().replace(/[_-]/g, ' ').replace(/\s+/g, ' ');
+  return BF16_UNSUPPORTED.some(re => re.test(flat));
+};
+const BF16_FALLBACK = 'This engine does not support a bf16 KV cache, so auto-tune uses f16 (also unquantized) in its place.';
+/** Precision first (#1057): the most precise passing type; a later (more compact) one replaces it
+ *  only when its largest fitting context is at least twice the current choice's. `passed` is in
+ *  candidate order; `ceilings` maps a type to its largest fitting rung (null: none), or is null
+ *  when the model cannot be sized, and then the most precise passing type stands. */
+function preferKv(passed, ceilings) {
+  if (!passed.length) return null;
+  if (!ceilings) return passed[0];
+  let pick = null;
+  for (const kv of passed) {
+    const cap = ceilings[kv];
+    if (cap == null) continue;
+    if (!pick || cap >= 2 * pick.cap) pick = { kv, cap };
+  }
+  return pick ? pick.kv : passed[0];
+}
 const UBATCH = [512, 1024, 2048];
 const PAD = 'The garden committee reviewed irrigation, seed orders, volunteer rotas and pump maintenance. ';
 const PHASES = [['sampling', 'Sampling'], ['kv', 'KV cache'], ['context', 'Context size'], ['drafting', 'Drafting'], ['batch', 'Batch and micro-batch']];
@@ -87,7 +119,7 @@ const qualityFailure = quality => 'Quality checks failed: ' + quality.checks.fil
 // An HTTP error is the engine failing, not the model answering: it cannot mark a probe as one the
 // model gets wrong, so a baseline with one is not usable.
 const engineFailed = quality => quality.checks.some(c => /^HTTP\b/.test(c.reason || ''));
-const REFERENCE_LABEL = { f16: 'f16 KV cache, drafting off', current: 'the current settings, drafting off' };
+const REFERENCE_LABEL = { f16: 'f16 KV cache, drafting off', bf16: 'bf16 KV cache, drafting off', current: 'the current settings, drafting off' };
 function baselineOf(reference, quality) {
   return { reference, probes: quality.checks.filter(c => c.passed).map(c => c.id),
     skipped: quality.checks.filter(c => !c.passed).map(c => ({ id: c.id, reason: c.reason, ...(c.answer ? { answer: c.answer } : {}) })) };
@@ -121,19 +153,21 @@ const cancelledError = () => Object.assign(Error('Cancelled'), { cancelled: true
 const publicJob = job => job && JSON.parse(JSON.stringify(job, (key, value) =>
   key.startsWith('_') || ['originalText', 'lastRevision', 'originalRevision', 'beforeText'].includes(key) ? undefined : value));
 const step = (id, label) => ({ id, label, status: 'pending' });
-function stepsFor(id) {
+function stepsFor(id, kv = kvCandidates()) {
   return id === 'sampling' ? [step('apply', 'Recommended sampling')]
-    : id === 'kv' ? kvCandidates().map(k => step(k, k + ' KV cache'))
+    : id === 'kv' ? kv.map(k => step(k, k + ' KV cache'))
     : id === 'drafting' ? SPEC_CANDIDATES.map(c => step(c.id, c.label))
     : id === 'batch' ? UBATCH.map(n => step(String(n), 'Micro-batch ' + n))
     : [step('capacity', 'Load and long-prompt recall')];
 }
-function newModel(model, planned = false) {
-  if (planned) return { model, status: 'pending', plan: { results: [] }, phases: PLANNED_PHASES.map(([id, label]) => ({
-    id, label, status: 'pending', steps: ['context', 'verify'].includes(id) ? [] : stepsFor(id),
+// kv: the cache types this item tries, fixed when the job starts (#1057), so a settings change
+// mid-run or before a resume never changes a run that has measured already.
+function newModel(model, planned = false, kv = kvCandidates()) {
+  if (planned) return { model, status: 'pending', kv, plan: { results: [] }, phases: PLANNED_PHASES.map(([id, label]) => ({
+    id, label, status: 'pending', steps: ['context', 'verify'].includes(id) ? [] : stepsFor(id, kv),
   })) };
-  return { model, status: 'pending', phases: PHASES.map(([id, label]) => ({
-    id, label, status: 'pending', steps: stepsFor(id),
+  return { model, status: 'pending', kv, phases: PHASES.map(([id, label]) => ({
+    id, label, status: 'pending', steps: stepsFor(id, kv),
   })) };
 }
 
@@ -176,13 +210,30 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   let state;
   try { state = JSON.parse(fs.readFileSync(stateFile, 'utf8')); } catch { state = {}; }
   state.history ||= {};
+  // #1057: per-model tune settings, kept with the history: { [model]: { allowQ5Kv } }.
+  state.settings ||= {};
   let cancelled = false, child = null, completion = Promise.resolve(), starting = false, inflight = null, idleAbort = null;
   const save = () => { const tmp = stateFile + '.' + crypto.randomUUID(); fs.writeFileSync(tmp, JSON.stringify(state), { mode: 0o600 }); fs.renameSync(tmp, stateFile); };
   const check = () => { if (cancelled) throw cancelledError(); };
   const note = (j, text) => { (j.log ||= []).push({ at: now(), text }); if (j.log.length > 400) j.log.shift(); save(); };
   const phaseOf = (item, id) => item.phases.find(p => p.id === id);
-  // kvCandidates: the list this server really tries, so the panel never describes another build's.
-  const status = model => ({ ok: true, status: 200, body: { job: publicJob(state.job), history: model ? state.history[model] || [] : [], kvCandidates: kvCandidates(), planImpl: planner.mode(), loadAdvisor: loadAdvisor.enabled() ? 'on' : 'off' } });
+  const settingsOf = model => ({ allowQ5Kv: state.settings[model]?.allowQ5Kv === true });
+  const candidatesFor = model => kvCandidates(settingsOf(model));
+  // The list a queued item tries: its own snapshot, or (a job from before #1057) today's.
+  const itemKv = item => (Array.isArray(item?.kv) && item.kv.length ? item.kv : candidatesFor(item?.model));
+  // kvCandidates: the list this server really tries for this model, so the panel never describes
+  // another build's (or another model's); settings: the model's own tune settings (#1057).
+  const status = model => ({ ok: true, status: 200, body: { job: publicJob(state.job), history: model ? state.history[model] || [] : [], kvCandidates: candidatesFor(model), settings: settingsOf(model), planImpl: planner.mode(), loadAdvisor: loadAdvisor.enabled() ? 'on' : 'off' } });
+  /** #1057: saves a model's tune settings; they apply from its next tune. */
+  function setSettings(model, body) {
+    if (typeof model !== 'string' || !model || model.length > 200) return { ok: false, status: 400, body: { error: 'Choose a model.' } };
+    if (!body || typeof body !== 'object' || typeof body.allowQ5Kv !== 'boolean') return { ok: false, status: 400, body: { error: 'allowQ5Kv must be true or false.' } };
+    if (isSystemModel(model)) return { ok: false, status: 400, body: { error: SYSTEM_MODEL_REASON } };
+    if (!presets.get(model).exists) return { ok: false, status: 404, body: { error: 'Choose a configured chat model.' } };
+    if (body.allowQ5Kv) state.settings[model] = { allowQ5Kv: true }; else delete state.settings[model];
+    save();
+    return status(model);
+  }
   // #1003: one recovery copy of models.ini per tune run. The first write of a job keeps the
   // writer's usual copy (the profile as it was before tuning); every later write, restores
   // included, asks for none (the web writer skips it, Model Loader gets the hint).
@@ -192,7 +243,8 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     const identity = suppliedIdentity || await identityFor(model);
     if (!identity) throw publicFail('Model identity could not be read.');
     const profile = presets.get(model);
-    return hash({ version: VERSION, identity, options: sorted({ ...profile.defaults, ...profile.options }) });
+    // #1057: allowing q5 makes an earlier tune stale; off adds nothing, so existing tunes stay current.
+    return hash({ version: VERSION, identity, options: sorted({ ...profile.defaults, ...profile.options }), ...(settingsOf(model).allowQ5Kv ? { kv: 'q5' } : {}) });
   }
   async function candidates() {
     const r = await rawModels();
@@ -450,34 +502,43 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     note(j, 'Committed recommended sampling: ' + Object.entries(options).map(([k, v]) => k + ' ' + v).join(', ') + '.');
   }
   async function runKv(j, p) {
+    const item = j.models.find(m => m.model === j.model), kvs = itemKv(item);
     const before = { ...presets.get(j.model).options }, results = [];
-    for (const kv of kvCandidates()) {
+    // #1057: sized once, every model unloaded, for the precision-first choice below.
+    await unloadAll();
+    const ceilings = await kvCeilings(j.model, kvs);
+    for (const kv of kvs) {
       check(); note(j, 'Testing ' + kv + ' KV cache with drafting off.');
       await unloadAll();
-      // With no baseline yet, the f16 candidate is the reference setting itself: its probes become
-      // the baseline instead of loading the same profile twice.
-      const reuse = kv === 'f16' && !gate(j.model);
+      // With no baseline yet, an unquantized candidate (bf16, or f16) is a reference setting
+      // itself: its probes become the baseline instead of loading a reference profile as well.
+      const reuse = UNQUANTIZED.has(kv) && !gate(j.model);
       const measured = await measure(j, p, kv, { 'cache-type-k': kv, 'cache-type-v': kv,
         'spec-type': 'none', 'spec-draft-n-max': '', 'spec-draft-p-min': '' }, async () => {
         if (!reuse) return validate(j.model);
         const quality = await qualityCheck(j.model, chat);
         if (engineFailed(quality)) throw Error(qualityFailure(quality));
-        const b = setBaseline(j, 'f16', quality);
+        const b = setBaseline(j, kv, quality);
         // Judged like any later candidate: on the probes its own run passed, the rest skipped.
         return validate(j.model, { passed: true, checks: quality.checks.filter(c => b.probes.includes(c.id)),
           ...(b.skipped.length ? { skipped: b.skipped.map(s => s.id) } : {}) });
       });
       if (measured) results.push({ kv, ...measured });
-      if (kv === 'f16' && !gate(j.model)) await ensureBaseline(j, before, { tryF16: false });
+      // An unquantized candidate that could not be the baseline: measure one (f16 first, unless
+      // f16 itself just failed), as before #1057.
+      if (UNQUANTIZED.has(kv) && !gate(j.model)) await ensureBaseline(j, before, { tryF16: kv !== 'f16' });
     }
-    const best = results.sort((a, b) => b.generation - a.generation || kvCandidates().indexOf(a.kv) - kvCandidates().indexOf(b.kv))[0];
+    // Precision first, not the fastest: a more compact type only when it fits twice the context.
+    const chosen = preferKv(results.map(r => r.kv), ceilings);
+    const best = results.find(r => r.kv === chosen);
     if (!best) throw Error('No KV cache type passed quality and throughput checks.');
     const restoreSpec = Object.fromEntries(['spec-type', 'spec-draft-n-max', 'spec-draft-p-min'].map(k => [k, before[k] || '']));
     await write(j, { 'cache-type-k': best.kv, 'cache-type-v': best.kv, ...restoreSpec });
     await load(j);
     const final = await validate(j.model);
-    p.value = { kv: best.kv, generation: best.generation, quality: final.quality, candidates: results.map(r => ({ kv: r.kv, generation: r.generation })) };
-    note(j, 'Committed ' + best.kv + ' KV cache after quality checks.');
+    p.value = { kv: best.kv, generation: best.generation, quality: final.quality, candidates: results.map(r => ({ kv: r.kv, generation: r.generation, ...(ceilings ? { ceiling: ceilings[r.kv] ?? null } : {}) })) };
+    note(j, 'Committed ' + best.kv + ' KV cache after quality checks' + (ceilings && best.kv !== results[0].kv
+      ? ' (it fits ' + ceilings[best.kv] + ' tokens, at least twice what ' + results[0].kv + ' fits).' : '.'));
   }
   async function runContext(j, p) {
     const result = await contextStage(j, p);
@@ -559,7 +620,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     if (presets.snapshot().revision !== j._revision) throw Object.assign(Error('Settings changed outside auto-tune.'), { fatal: true });
     p._beforeText = presets.snapshot().text;
     p.status = 'running'; p.startedAt = now();
-    p.steps = stepsFor(p.id);
+    p.steps = stepsFor(p.id, itemKv(item));
     j.phase = p.label; save();
     try {
       await phaseRuns[p.id](j, p); check();
@@ -615,7 +676,8 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
       throw Object.assign(Error('Model identity changed since tuning began.'), { fatal: true });
     const kv = planned || phaseOf(item, 'kv').value, ctx = planned ? { context: planned.ctx } : phaseOf(item, 'context').value,
       draft = phaseOf(item, 'drafting').value, batch = phaseOf(item, 'batch').value;
-    const result = { kv: kv.kv, context: ctx.context, ...(planned ? { plan: 'wasm', probes: item.plan.results.filter(r => r.step === 'probe').length } : {}), spec: draft.spec, specLabel: draft.specLabel,
+    const result = { kv: kv.kv, context: ctx.context, ...(planned ? { plan: 'wasm', probes: item.plan.results.filter(r => r.step === 'probe').length } : {}),
+      ...(item.plan?.kvFallback ? { kvFallback: item.plan.kvFallback } : {}), spec: draft.spec, specLabel: draft.specLabel,
       generation: final.generation, acceptance: final.acceptance, ubatch: batch.ubatch,
       promptPerSecond: batch.promptPerSecond, quality: final.quality, extensions: [],
       sampling: phaseOf(item, 'sampling')?.value || null, ...(item.baseline ? { baseline: item.baseline } : {}),
@@ -633,20 +695,51 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   const layerList = v => (Array.isArray(v)
     ? (v.length <= 4096 && v.every(x => typeof x === 'boolean' || uint(x, 1 << 20) === x) ? v : null)
     : (uint(v, 1 << 20) === v ? v : null));
+  // The prompt cache every auto-tune write leaves (llamacpp-presets prepare): unset becomes the
+  // cap, anything larger the hard maximum; -1 stays unbounded.
+  function tuneCacheMib(eff) {
+    const { cacheRamMibOf } = require('./llamacpp-autoconfig.cjs');
+    const budgetLib = require('./inference-budget.cjs'), rawCache = String(eff['cache-ram'] ?? '').trim();
+    return rawCache === '' ? budgetLib.cacheRamLimits().capMib
+      : rawCache === '-1' ? Infinity : cacheRamMibOf(budgetLib.clampCacheRam(rawCache));
+  }
+  // #1057: the js order's KV phase, sized like the planner: per type, the largest ladder rung whose
+  // estimate (llamacpp-autoconfig estimateFootprint) fits the budget, MemAvailable less the
+  // services' reserve and the floor. Null when the model cannot be sized: precision alone decides.
+  async function kvCeilings(model, kvs) {
+    try {
+      const read = await planFacts(model);
+      if (!read?.meta) return null;
+      const profile = presets.get(model), eff = { ...profile.defaults, ...profile.options };
+      const cacheMib = tuneCacheMib(eff);
+      if (!Number.isFinite(cacheMib)) return null;
+      const { ladder } = require('./llamacpp-calibration.cjs');
+      const { estimateFootprint } = require('./llamacpp-autoconfig.cjs');
+      const free = readMemory();
+      const usableMib = Math.min(Number(budgetGib()) * 1024, free == null ? Infinity : free * 1024 - servicesReserveMib - memoryFloorGib * 1024);
+      const rungs = ladder(uint(read.meta.contextLength, 1 << 24));
+      const out = {};
+      for (const kv of kvs) {
+        const fit = rungs.filter(c => {
+          const e = estimateFootprint({ meta: read.meta, modelBytes: read.modelBytes, mmprojBytes: read.mmprojBytes || 0, model,
+            options: { ...eff, 'ctx-size': String(c), 'cache-type-k': kv, 'cache-type-v': kv, 'cache-ram': String(cacheMib), 'ubatch-size': String(Math.max(uint(Number(eff['ubatch-size']), 1 << 24), ...UBATCH)) } });
+          return e.sizeable && e.totalGib != null && e.totalGib * 1024 <= usableMib;
+        });
+        out[kv] = fit.length ? fit.at(-1) : null;
+      }
+      return Object.values(out).some(v => v != null) ? out : null;
+    } catch { return null; }
+  }
   // The planner's request: the model's facts, the budget (MemAvailable read once, now, with every
-  // model unloaded, so a resumed job plans from the same figures), the ladder and the KV types.
-  async function planRequest(model) {
+  // model unloaded, so a resumed job plans from the same figures), the ladder and the KV types
+  // (the item's list, #1057).
+  async function planRequest(model, kv = candidatesFor(model)) {
     const read = await planFacts(model);
     if (!read?.meta) return { fallback: 'its model file could not be read' };
     const m = read.meta, profile = presets.get(model), eff = { ...profile.defaults, ...profile.options };
     const { ladder } = require('./llamacpp-calibration.cjs');
-    const { cacheRamMibOf } = require('./llamacpp-autoconfig.cjs');
     const native = uint(m.contextLength, 1 << 24);
-    // The prompt cache every auto-tune write leaves (llamacpp-presets prepare): unset becomes the
-    // cap, anything larger the hard maximum; -1 stays unbounded.
-    const budgetLib = require('./inference-budget.cjs'), rawCache = String(eff['cache-ram'] ?? '').trim();
-    const cacheMib = rawCache === '' ? budgetLib.cacheRamLimits().capMib
-      : rawCache === '-1' ? Infinity : cacheRamMibOf(budgetLib.clampCacheRam(rawCache));
+    const cacheMib = tuneCacheMib(eff);
     // #1029: an unbounded prompt cache (cache-ram -1) cannot be sized; the standard order runs.
     if (!Number.isFinite(cacheMib)) return { fallback: 'its prompt cache is unbounded (cache-ram -1)' };
     const free = readMemory();
@@ -663,12 +756,12 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
       memory: { budgetMib: uint(Math.floor(Number(budgetGib()) * 1024), 2 ** 30), memAvailableMib: free == null ? null : uint(Math.floor(free * 1024), 2 ** 30),
         reserveMib: uint(servicesReserveMib, 2 ** 30), floorMib: uint(Math.round(memoryFloorGib * 1024), 2 ** 30),
         cacheRamMib: uint(cacheMib, 2 ** 30) },
-      ladder: ladder(native), kv: kvCandidates(),
+      ladder: ladder(native), kv,
     };
   }
   function fallBack(j, item, why) {
     item.plan = null; item.planFallback = why;
-    item.phases = newModel(item.model).phases;
+    item.phases = newModel(item.model, false, itemKv(item)).phases;
     note(j, 'Using the standard tuning order for ' + item.model + ': ' + why + '.');
     return false;
   }
@@ -698,10 +791,14 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     const cal = contextFactory({ applyUnlocked: guardedApply(j), onWrite: revision => { j._revision = revision; save(); }, onUpdate: () => {} });
     child = { cancel: () => cal.cancelProbe() };
     let r;
-    try { r = await cal.probe(j.model, { ctx: step.ctx, fill: step.fill, base, baseRevision: j._revision, promptBudgetSeconds: j.promptBudgetSeconds, evidence: loadAdvisor.enabled() }); }
+    // #1057: a bf16 step keeps the engine's evidence too, to tell "this build has no bf16 cache".
+    const bf16 = base['cache-type-k'] === 'bf16';
+    try { r = await cal.probe(j.model, { ctx: step.ctx, fill: step.fill, base, baseRevision: j._revision, promptBudgetSeconds: j.promptBudgetSeconds, evidence: loadAdvisor.enabled() || bf16 }); }
     finally { child = null; }
     check();
     if (!r.passed) {
+      if (bf16 && !j.models.find(m => m.model === j.model)?.plan?.request?.kv?.includes('f16') && bf16Unsupported(r.evidence?.text))
+        return { outcome: 'kv_unsupported', reason: BF16_FALLBACK };
       const own = { outcome: r.cause === 'timeout' ? 'timeout' : PLAN_CAUSE[r.cause] || 'load_failed', reason: r.reason || 'The fill-and-recall test failed.' };
       if (!loadAdvisor.enabled()) return own;
       // #1004: rules first, the decision service only on a tie; null keeps the calibrator's cause.
@@ -730,7 +827,8 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     const fits = kv => { try { return planner.plan({ ...plan.request, ladder: [ctx], kv: [kv], results: [] }).step === 'probe'; } catch { return false; } };
     const kv = plan.request.kv.find(fits);
     if (!kv) throw publicFail('This model does not fit the inference memory budget even at the smallest context size.');
-    return { ctx, kv, f16: kv === 'f16' };
+    // f16 and bf16 are the same size, so the f16 reference fits wherever bf16 does (#1057).
+    return { ctx, kv, f16: UNQUANTIZED.has(kv) };
   }
   // #1029: a load that did not finish in time says nothing about memory. Tried once more; then the
   // run stops (resumable) instead of stepping the context or KV type down.
@@ -760,6 +858,19 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
       Object.assign(row, { status: 'failed', reason: TEMPLATE_STOP, finishedAt: now() });
       throw publicFail(TEMPLATE_STOP);
     }
+    if (r.outcome === 'kv_unsupported') {
+      // #1057: f16 takes bf16's place in the list (and in anything measured with it), recorded on
+      // the plan and noted on the job. Nothing is recorded for this step: the planner asks for the
+      // same context with f16 next, as the two are the same size.
+      Object.assign(row, { status: 'failed', reason: BF16_FALLBACK, finishedAt: now() });
+      const swap = k => (k === 'bf16' ? 'f16' : k);
+      plan.request.kv = plan.request.kv.map(swap);
+      for (const e of plan.results) if (e.kv) e.kv = swap(e.kv);
+      item.kv = itemKv(item).map(swap);
+      plan.kvFallback = { from: 'bf16', to: 'f16', at: step.ctx };
+      note(j, BF16_FALLBACK); save();
+      return;
+    }
     Object.assign(row, { status: r.outcome === 'passed' ? 'passed' : 'failed', ...(r.reason ? { reason: r.reason } : {}),
       ...(r.promptSeconds != null ? { promptSeconds: r.promptSeconds } : {}), finishedAt: now() });
     plan.results.push({ step: kind, ctx: step.ctx, kv: step.kv, outcome: r.outcome }); save();
@@ -771,7 +882,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     const plan = item.plan;
     if (!plan.request) {
       await unloadAll();
-      const request = await planRequest(item.model).catch(() => ({ fallback: 'its model file could not be read' }));
+      const request = await planRequest(item.model, itemKv(item)).catch(() => ({ fallback: 'its model file could not be read' }));
       if (request.fallback) return fallBack(j, item, request.fallback);
       plan.request = request; save();
     }
@@ -935,7 +1046,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
       if (!models.length) return { ok: false, status: 409, body: { error: 'All configured chat models already have current tunes.' } };
       cancelled = false;
       const j = { id: crypto.randomUUID(), model: models[0], bulk, promptBudgetSeconds, status: 'running',
-        phase: 'Preparing', startedAt: now(), log: [], models: models.map(m => newModel(m, planner.mode() === 'wasm')), _revision: presets.snapshot().revision,
+        phase: 'Preparing', startedAt: now(), log: [], models: models.map(m => newModel(m, planner.mode() === 'wasm', candidatesFor(m))), _revision: presets.snapshot().revision,
         queueProgress: { done: 0, total: models.length } };
       state.job = j; save(); completion = run(j); completion.catch(() => {});
       return { ok: true, status: 202, body: publicJob(j) };
@@ -1035,6 +1146,6 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     } catch (e) { return { ok: false, status: 409, body: { error: clientMessage(e, 'Auto-tune could not resume.') } }; }
     finally { starting = false; }
   }
-  return { start, resume, cancel, status, untuned, recover, completion: () => completion };
+  return { start, resume, cancel, status, setSettings, untuned, recover, completion: () => completion };
 }
-module.exports = { createFullAutotuner, qualityCheck, qualityFailure, QUALITY, VERSION, newModel, hasHarmonyReasoning };
+module.exports = { createFullAutotuner, qualityCheck, qualityFailure, QUALITY, VERSION, newModel, hasHarmonyReasoning, kvCandidates, preferKv, bf16Unsupported };
