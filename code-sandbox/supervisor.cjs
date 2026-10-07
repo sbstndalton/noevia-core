@@ -34,12 +34,19 @@ const positive = (value, fallback) => { const n = Number(value); return Number.i
 const ALLOWED_ENV = new Set(['HOME', 'PATH', 'LANG', 'TMPDIR',
   'HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'NO_PROXY', 'CURL_HOME', 'WGETRC']);
 
-function insideRoot(root, candidate) {
+/** Whether a real path is the real root or inside it: the pure half of insideRoot (#999). */
+function containedJs(resolvedRoot, resolved) {
+  const rel = path.relative(resolvedRoot, resolved);
+  return !(rel !== '' && (rel.startsWith('..') || path.isAbsolute(rel)));
+}
+
+// Symlinks are the filesystem's: both sides are realpath'd here, and only the decision on the two
+// real paths is `contained` (containedJs, or the Rust port under SANDBOX_BRIDGE_IMPL=rust).
+function insideRoot(root, candidate, contained = containedJs) {
   let resolvedRoot, resolved;
   try { resolvedRoot = fs.realpathSync(root); } catch { return null; }
   try { resolved = fs.realpathSync(String(candidate || '')); } catch { return null; }
-  const rel = path.relative(resolvedRoot, resolved);
-  if (rel !== '' && (rel.startsWith('..') || path.isAbsolute(rel))) return null;
+  if (!contained(resolvedRoot, resolved)) return null;
   return resolved;
 }
 
@@ -52,6 +59,20 @@ function cleanEnv(env, fallbackHome = process.env.HOME) {
   // which is a tmpfs, inside the sandbox, and not the task's repository.
   if (!out.HOME && fallbackHome) out.HOME = fallbackHome;
   return out;
+}
+
+/**
+ * The first line on a connection (#999 split it out of the socket handler, unchanged): `{ start:
+ * false }` unless it is noevia's start message, else `String(start.cwd || '')` (null where that
+ * throws, which insideRoot refuses as before) and the allowlisted env (no HOME fallback yet).
+ */
+function parseStartJs(line) {
+  let start;
+  try { start = JSON.parse(line); } catch { return { start: false }; }
+  if (!start || start.noevia !== 'start') return { start: false };
+  let cwd;
+  try { cwd = String(start.cwd || ''); } catch { cwd = null; }
+  return { start: true, cwd, env: cleanEnv(start.env, null) };
 }
 
 /**
@@ -116,9 +137,8 @@ function createSupervisor({ command, args = [], root, spawnFn = spawn, log = () 
       const line = buffer.slice(0, end);
       const rest = buffer.slice(end + 1);
       buffer = '';
-      let start;
-      try { start = JSON.parse(line); } catch { return refuse('the first line must be noevia’s start message'); }
-      if (!start || start.noevia !== 'start') return refuse('the first line must be noevia’s start message');
+      const start = parseStartJs(line);
+      if (!start.start) return refuse('the first line must be noevia’s start message');
       const cwd = insideRoot(root, start.cwd);
       if (!cwd) return refuse('that workspace is not inside this sandbox');
 
@@ -162,7 +182,7 @@ function createSupervisor({ command, args = [], root, spawnFn = spawn, log = () 
     close: () => new Promise((r) => { for (const s of sockets) s.destroy(); server.close(() => r()); }) };
 }
 
-module.exports = { createSupervisor, insideRoot, cleanEnv, ALLOWED_ENV, DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_WALL_MS };
+module.exports = { createSupervisor, insideRoot, containedJs, parseStartJs, cleanEnv, ALLOWED_ENV, DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_WALL_MS };
 
 if (require.main === module) {
   const command = process.env.CODE_HARNESS_COMMAND;
