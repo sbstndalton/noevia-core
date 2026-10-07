@@ -602,6 +602,8 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
       readMemory:tuneDeps.readMemory,memoryFloorGib:tuneDeps.memoryFloorGib,
       ...(autotuneOptions.betweenModelsMs!=null?{betweenModelsMs:autotuneOptions.betweenModelsMs}:{}),
       ...(autotuneOptions.idleTimeoutMs!=null?{idleTimeoutMs:autotuneOptions.idleTimeoutMs}:{}),
+      // #1062: tests shorten the foreign-client wait and inject the decision.
+      ...Object.fromEntries(['foreignWaitMs','foreignQuietMs','foreignPollMs','contention'].filter(k=>autotuneOptions[k]!=null).map(k=>[k,autotuneOptions[k]])),
       ...(autotuneOptions.sleep?{sleep:autotuneOptions.sleep}:{}),
       ...(autotuneOptions.servingChecks?{servingChecks:autotuneOptions.servingChecks}:{}),
       // #1003 AUTOTUNE_PLAN_IMPL=wasm: the planner reads the GGUF facts and the sizing budget.

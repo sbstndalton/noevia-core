@@ -6,6 +6,8 @@ const { WORKLOADS, SPEC_CANDIDATES, geomean } = require('./llamacpp-tune-spec.cj
 const { hasHarmonyReasoning, quirksOf, toIniOptions, INI_KEY_LIST } = require('./sampling-recommendation.cjs');
 const { isSystemModel, modelPathFromArgs, SYSTEM_MODEL_REASON } = require('./model-system.cjs');
 const VERSION = 3;
+// #1062: waits for another router client per model before the tune stops as interrupted.
+const FOREIGN_YIELDS = 6;
 // #1057 (owner's KV policy): bf16 (unquantized) by default, q8_0 the floor. q5_1/q5_0 only with
 // the model's own opt-in (allowQ5Kv, saved with its tune settings below); q4_0 also needs the
 // operator's override env var (#190), so it is never reached without both. f16 is no longer a
@@ -211,7 +213,12 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   // #1003: the planner (AUTOTUNE_PLAN_IMPL), the model's GGUF facts ({ meta, modelBytes, mmprojBytes }
   // or null) and the inference memory budget in GiB.
   planner = defaultPlanner(), planFacts = async () => null, budgetGib = () => 16, servicesReserveMib = SERVICES_RESERVE_MIB,
-  loadAdvisor = defaultLoadAdvisor() }) {
+  loadAdvisor = defaultLoadAdvisor(),
+  // #1062: another client of the router (one that skips noevia's maintenance gate) may load its own
+  // model mid-tune. Auto-tune waits for it, at most foreignWaitMs per wait and FOREIGN_YIELDS waits
+  // per model, and resumes the step; Rust's tune_contention (dav-parse.wasm) decides each look.
+  foreignWaitMs = 15 * 60000, foreignQuietMs = 30000, foreignPollMs = 2000,
+  contention = req => require('./dav-parse-wasm.cjs').tuneContention(req) }) {
   const request = engineBoundary(engineRequest), rawModels = engineBoundary(engineRawModels);
   let state;
   try { state = JSON.parse(fs.readFileSync(stateFile, 'utf8')); } catch { state = {}; }
@@ -224,6 +231,69 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   const note = (j, text) => { (j.log ||= []).push({ at: now(), text }); if (j.log.length > 400) j.log.shift(); save(); };
   const phaseOf = (item, id) => item.phases.find(p => p.id === id);
   const settingsOf = model => ({ allowQ5Kv: state.settings[model]?.allowQ5Kv === true });
+  // #1062: rows the router reports as running (server-models.h is_running) other than `model`.
+  const LIVE = ['loaded', 'loading', 'sleeping'];
+  const anotherClient = () => Object.assign(Error('Another client loaded a model during tuning.'), { fatal: true });
+  // Requests in flight on a resident model (llamacpp:requests_processing), or null when unreadable.
+  async function requestsProcessing(id) {
+    try {
+      const r = await request('/metrics?model=' + encodeURIComponent(id) + '&autoload=false', {}, 6000);
+      if (!r?.ok || typeof r.body !== 'string') return null;
+      const n = require('./llamacpp-metrics.cjs').parseMetrics(r.body).requests_processing;
+      return Number.isSafeInteger(n) && n >= 0 && n <= 0xffffffff ? n : null;
+    } catch { return null; }
+  }
+  const idList = ids => ids.slice(0, 4).map(id => String(id).slice(0, 120)).join(', ') + (ids.length > 4 ? ' and ' + (ids.length - 4) + ' more' : '');
+  /**
+   * #1062: another client has a model live while `j.model` is being tuned. Waits (cancellable)
+   * until Rust's tune_contention says the router is clear, or that the other models are idle and
+   * quiet, in which case it sends the router's own unload for them (the path every step already
+   * takes) and returns; the caller then repeats its step. Never stops a model with requests in
+   * flight or still loading. Past the limit it throws { fatal, foreignTimeout } and the job stops
+   * as interrupted, resumable. When the decision cannot be had (module missing or refusing), it
+   * fails closed by throwing `legacy`, the error this caller threw before #1062.
+   */
+  async function yieldToForeign(j, legacy, { restoring = false } = {}) {
+    const tuning = j?.model;
+    if (typeof tuning !== 'string' || !tuning) throw legacy;
+    const item = j.models?.find(m => m.model === tuning);
+    const startedAt = now();
+    let prev = null, announced = false;
+    for (;;) {
+      if (!restoring) check();
+      const listing = await rawModels();
+      if (!listing.ok || !Array.isArray(listing.body?.data)) throw Error('The model server stopped responding.');
+      const rows = [];
+      for (const row of listing.body.data) {
+        const status = typeof row?.status?.value === 'string' ? row.status.value : '';
+        const resident = row?.id !== tuning && (status === 'loaded' || status === 'sleeping');
+        rows.push({ id: row?.id, status, busy: resident ? await requestsProcessing(row.id) : null });
+      }
+      let d;
+      try { d = contention({ tuning, rows, prev, startedAt, now: now(), maxWaitMs: foreignWaitMs, quietMs: foreignQuietMs }); }
+      catch { throw legacy; }
+      if (d.action === 'proceed') { if (announced) note(j, 'The other client is done; tuning continues.'); return; }
+      if (!announced) {
+        announced = true;
+        // Only real waits count; one that finds the router already clear does not.
+        const yields = item ? (item._foreignYields = (item._foreignYields || 0) + 1) : 1;
+        if (yields > FOREIGN_YIELDS) throw Object.assign(Error('Another client kept loading ' + idList(d.foreign) + ' during tuning. Stop it, then resume auto-tune.'), { fatal: true, foreignTimeout: true });
+        note(j, 'Another client is using ' + idList(d.foreign) + '. Tuning is paused until it is idle (at most ' + Math.round(foreignWaitMs / 60000) + ' min).');
+      }
+      if (d.action === 'give_up') throw Object.assign(Error('Another client kept using ' + idList(d.foreign) + ' for ' + Math.round(d.waitedMs / 60000) + ' min. Resume auto-tune when it is done.'), { fatal: true, foreignTimeout: true });
+      if (d.action === 'unload') {
+        for (const id of d.unload) {
+          if (!restoring) check();
+          const u = await request('/models/unload', { method: 'POST', body: JSON.stringify({ model: id }) }, 60000);
+          if (!u.ok) throw Error('Could not unload ' + id + ' before testing.');
+        }
+        note(j, 'Unloaded ' + idList(d.unload) + ', idle after another client used it; tuning continues.');
+        return;
+      }
+      prev = { fingerprint: d.fingerprint, since: d.since };
+      await sleep(foreignPollMs);
+    }
+  }
   const candidatesFor = model => kvCandidates(settingsOf(model));
   // The list a queued item tries: its own snapshot, or (a job from before #1057) today's.
   const itemKv = item => (Array.isArray(item?.kv) && item.kv.length ? item.kv : candidatesFor(item?.model));
@@ -284,10 +354,22 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   }
   async function untuned() { try { return { ok: true, status: 200, body: await candidates() }; } catch (e) { return { ok: false, status: 502, body: { error: clientMessage(e, 'Could not list untuned models.') } }; } }
   async function unloadAll({ restoring = false } = {}) {
+    for (;;) {
+      const foreign = await unloadAllOnce({ restoring });
+      if (!foreign) return;
+      // #1062: a model other than the tuned one came back (or would not go) while unloading: another
+      // client is using the router. Wait for it, then unload again.
+      await yieldToForeign(state.job, Error(foreign), { restoring });
+    }
+  }
+  async function unloadAllOnce({ restoring = false } = {}) {
     if (!restoring) check();
+    const tuning = state.job?.model;
     const r = await rawModels();
     if (!r.ok || !Array.isArray(r.body?.data)) throw Error('The model server is not responding.');
+    const asked = new Set(), gone = new Set();
     for (const row of r.body.data) if (['loaded', 'loading'].includes(row.status?.value)) {
+      asked.add(row.id);
       if (!restoring) check();
       const u = await request('/models/unload', { method: 'POST', body: JSON.stringify({ model: row.id }) }, 60000);
       if (!u.ok) throw Error('Could not unload ' + row.id + ' before testing.');
@@ -299,10 +381,16 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
       if (!restoring) check();
       const listing = await rawModels();
       if (!listing.ok || !Array.isArray(listing.body?.data)) throw Error('The model server stopped responding while unloading.');
+      for (const row of listing.body.data) if (row.status?.value === 'unloaded') gone.add(row.id);
       const pending = listing.body.data.filter(row => row.status?.value !== 'unloaded');
-      if (!pending.length) return;
-      if (poll === 119 || now() >= deadline) throw Error('Timed out waiting for router unload: ' + pending.map(row =>
-        row.id + ' (' + (row.status?.value || 'unknown') + ')').join(', ') + '.');
+      if (!pending.length) return null;
+      const message = 'Timed out waiting for router unload: ' + pending.map(row =>
+        row.id + ' (' + (row.status?.value || 'unknown') + ')').join(', ') + '.';
+      // Loading again after we asked it to stop, live again after it was gone, or live and never
+      // asked: someone else wants it.
+      const foreign = pending.filter(row => row.id !== tuning && LIVE.includes(row.status?.value));
+      if (foreign.some(row => row.status?.value === 'loading' || gone.has(row.id) || !asked.has(row.id))) return message;
+      if (poll === 119 || now() >= deadline) { if (foreign.length) return message; throw Error(message); }
       await sleep(500);
     }
   }
@@ -319,8 +407,14 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     check();
     const rows = await rawModels();
     if (!rows.ok || !Array.isArray(rows.body?.data)) throw Error('The model server stopped responding.');
-    if (rows.body.data.some(r => r.id !== model && ['loaded', 'loading'].includes(r.status?.value)))
-      throw Object.assign(Error('Another client loaded a model during tuning.'), { fatal: true });
+    if (rows.body.data.some(r => r.id !== model && ['loaded', 'loading'].includes(r.status?.value))) {
+      const j = state.job;
+      // #1062: wait for the other client, reload the profile under test and send this request then.
+      if (j?.model !== model) throw Object.assign(Error('Another client loaded a model during tuning.'), { fatal: true });
+      await yieldToForeign(j, anotherClient());
+      await load(j);
+      return chat(model, prompt, max, extra);
+    }
     const controller = new AbortController(); inflight = controller;
     let lowMemory = false;
     const guard = () => { const free = readMemory(); if (free != null && free < memoryFloorGib) { lowMemory = true; controller.abort(); } };
@@ -345,15 +439,21 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   }
   async function load(j) {
     check();
-    const response = await request('/models/load', { method: 'POST', body: JSON.stringify({ model: j.model }) }, 600000);
-    if (!response.ok) throw Error('The test profile could not be loaded.');
+    const ask = async () => {
+      const response = await request('/models/load', { method: 'POST', body: JSON.stringify({ model: j.model }) }, 600000);
+      if (!response.ok) throw Error('The test profile could not be loaded.');
+    };
+    await ask();
     for (let polls = 0; polls < 1200; polls++) {
       check();
       const free = readMemory(); if (free != null && free < memoryFloorGib) throw Error('Available memory fell below the safety floor.');
       const r = await rawModels();
       if (!r.ok) throw Error('The model server stopped responding.');
-      if (r.body.data.some(m => m.id !== j.model && ['loaded', 'loading'].includes(m.status?.value)))
-        throw Object.assign(Error('Another client loaded a model during tuning.'), { fatal: true });
+      if (r.body.data.some(m => m.id !== j.model && ['loaded', 'loading'].includes(m.status?.value))) {
+        // #1062: the router evicted the profile under test for another client: wait, load it again.
+        await yieldToForeign(j, anotherClient());
+        await ask(); polls = 0; continue;
+      }
       const row = r.body.data.find(m => m.id === j.model);
       if (row?.status?.value === 'loaded') return;
       if (!row || row.status?.failed || row.status?.value === 'unloaded') throw Error('The test profile failed to load.');
@@ -414,6 +514,8 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     const offset = prefix ? p.steps.length : 0;
     child = contextFactory({
       applyUnlocked: guardedApply(j),
+      // #1062: the calibrator waits for another client the same way, then repeats its step.
+      foreignWait: legacy => yieldToForeign(j, legacy),
       onWrite: revision => { j._revision = revision; save(); },
       onUpdate: c => {
         if (!c) return;
@@ -1081,7 +1183,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
       }
       j.status = 'passed'; j.phase = 'Done';
     } catch (e) {
-      j.status = cancelled || e.cancelled ? 'cancelled' : e.idleTimeout ? 'interrupted' : 'failed';
+      j.status = cancelled || e.cancelled ? 'cancelled' : e.idleTimeout || e.foreignTimeout ? 'interrupted' : 'failed';
       j.phase = j.status === 'cancelled' ? 'Cancelled' : j.status === 'interrupted' ? 'Waiting timed out' : 'Failed';
       j.error = e.message;
       if (e.unsafe) j._unsafe = true;
@@ -1194,7 +1296,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
       }
       cancelled = false; j.status = 'running'; j.error = undefined; j.finishedAt = undefined;
       for (const item of j.models) if (item.status !== 'passed') {
-        item.status = 'pending'; delete item.error;
+        item.status = 'pending'; delete item.error; delete item._foreignYields;
         for (const p of item.phases) if (p.status !== 'passed') {
           p.status = 'pending'; delete p.reason; delete p.restored;
           // Planned stages (#1003) keep the rows the planner has results for; the rest re-run.
