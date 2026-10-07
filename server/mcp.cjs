@@ -31,13 +31,59 @@ const CLIENT_INFO = { name: 'noevia', version: '1' };
 // fires. Cap how much of any response body noevia will read into memory.
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 
+// ── MCP_FRAME_IMPL (#980) ─────────────────────────────────────────────────
+//
+// `mcp-frame` (sbstndalton/noevia-rs, in the dav-parse.wasm module pinned by server/dav-parse.lock)
+// ports parseRpcBody and resolveSchemaRefs. MCP_FRAME_IMPL=js|wasm picks one (default js; any
+// other value means js, with one warning). Under wasm the Rust module decides everything a third
+// party's bytes decide (JSON grammar, SSE frames, id matching, $ref expansion and its budget);
+// Node keeps the transport, sessions, headers and tool policy, and builds the error messages
+// below exactly as the JS does. `wasm` FAILS CLOSED: a missing or tampered module, a trap or an
+// unexpected reply throws PUBLIC_FAILURE (rpc) or drops the tool with it as the reason (schemas).
+// Nothing falls back to the JS. Differences, all refusals under wasm: a body over 8 Mi UTF-16
+// units, including from the uncapped res.text() fallback, throws the readBodyCapped limit error;
+// a schema whose JSON is over 2 Mi units, or that is not a JSON tree (a cycle, undefined, a
+// function, a class instance; tools/list never yields one), fails closed. A schema nested so deep
+// that the runtime's JSON.stringify overflows (Node 22) makes the JS drop it with a RangeError but
+// resolves under wasm; listTools stringifies each tool first, so none reaches convertTool. For a plain body
+// JSON.parse rejects, the SyntaxError is the runtime's own (from JSON.parse on the refused text).
+const PUBLIC_FAILURE = 'MCP response could not be checked';
+const FRAME_IMPLS = new Set(['js', 'wasm']);
+let warnedFrameImpl = '';
+function mcpFrameImpl(env = process.env) {
+  const raw = env.MCP_FRAME_IMPL;
+  if (raw === undefined || raw === '') return 'js';
+  const value = String(raw).trim().toLowerCase();
+  if (FRAME_IMPLS.has(value)) return value;
+  if (warnedFrameImpl !== value) {
+    warnedFrameImpl = value;
+    console.warn(`[mcp] MCP_FRAME_IMPL=${JSON.stringify(String(raw))} is not js or wasm; using js`);
+  }
+  return 'js';
+}
+let davParseWasm = null;
+function frameWasm() { return davParseWasm || (davParseWasm = require('./dav-parse-wasm.cjs')); }
+function frameFailure(op, err) {
+  const reason = err && err.name === 'DavParseError' ? err.reason : 'unexpected';
+  console.warn(`[mcp] mcp-frame ${op} failed (${reason}): ${err?.message || err}`);
+  return Object.assign(new Error(PUBLIC_FAILURE), { status: 502, code: 'mcp_frame_failed', reason });
+}
+function bodyLimitError(capBytes) {
+  return new Error(`MCP: response body exceeded the ${Math.round(capBytes / (1024 * 1024))} MB limit`);
+}
+
 // Read a response body up to `capBytes`, aborting the underlying request (via
 // `controller`) and throwing a clear error the moment the cap is exceeded,
 // rather than buffering an unbounded stream. Falls back to res.text() when a
 // body reader isn't available (e.g. in tests using a plain Response-like
 // object without a streamable body).
-async function readBodyCapped(res, controller, capBytes = MAX_RESPONSE_BYTES) {
-  if (!res.body || typeof res.body.getReader !== 'function') return await res.text();
+async function readBodyCapped(res, controller, capBytes = MAX_RESPONSE_BYTES, { impl = 'js' } = {}) {
+  if (!res.body || typeof res.body.getReader !== 'function') {
+    const text = await res.text();
+    // Under wasm the fallback is capped too (the module refuses more than the cap anyway).
+    if (impl === 'wasm' && typeof text === 'string' && Buffer.byteLength(text) > capBytes) throw bodyLimitError(capBytes);
+    return text;
+  }
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let text = '', total = 0;
@@ -49,7 +95,7 @@ async function readBodyCapped(res, controller, capBytes = MAX_RESPONSE_BYTES) {
       if (total > capBytes) {
         controller.abort();
         try { await reader.cancel(); } catch { /* already aborted */ }
-        throw new Error(`MCP: response body exceeded the ${Math.round(capBytes / (1024 * 1024))} MB limit`);
+        throw bodyLimitError(capBytes);
       }
       text += decoder.decode(value, { stream: true });
     }
@@ -76,7 +122,7 @@ function requestId() { return ++nextRequestId; }
 // and its payload would have been handed back to the model as the tool result.
 // Matching on the id we actually sent is the fix, and it is also what lets the
 // ids above stop being constants.
-function parseRpcBody(contentType, text, expectedId) {
+function parseRpcBodyJs(contentType, text, expectedId) {
   if (String(contentType || '').includes('text/event-stream')) {
     let found = null;
     let sawOtherId = false;
@@ -105,6 +151,45 @@ function parseRpcBody(contentType, text, expectedId) {
     throw new Error(`MCP: reply id ${msg.id} does not match request ${expectedId}`);
   }
   return msg;
+}
+
+const noReplyMessage = (expectedId) => `MCP: no reply to request ${expectedId} in event stream (the server sent other traffic; noevia does not implement server-initiated requests)`;
+
+/** parseRpcBodyJs through mcp-frame: Rust decides; the message crosses back as JSON text that
+ *  JSON.parse turns into the value JSON.parse gives the original (same lexemes, same keys). */
+function parseRpcBodyWasm(contentType, text, expectedId) {
+  const sse = String(contentType || '').includes('text/event-stream');
+  if (typeof text !== 'string') throw frameFailure('parseRpcBody', new TypeError('body is not text'));
+  if (text.length > MAX_RESPONSE_BYTES) throw bodyLimitError(MAX_RESPONSE_BYTES);
+  let r;
+  try { r = frameWasm().mcpRpcBody(sse, text, expectedId); } catch (err) {
+    if (err && err.reason === 'too_large') throw bodyLimitError(MAX_RESPONSE_BYTES);
+    throw frameFailure('parseRpcBody', err);
+  }
+  const has = (m) => m !== null && typeof m === 'object' && Object.prototype.hasOwnProperty.call(m, 'id');
+  if (r.kind === 'reply' || r.kind === 'mismatch') {
+    let msg;
+    try { msg = JSON.parse(r.text); } catch (err) { throw frameFailure('parseRpcBody', err); }
+    // The module's verdict, re-checked on the value: anything else is a reply of the wrong shape.
+    const ok = sse ? has(msg) && msg.id === expectedId && !msg.method : !has(msg) || msg.id === expectedId;
+    if (ok !== (r.kind === 'reply') || (sse && r.kind === 'mismatch')) throw frameFailure('parseRpcBody', new Error('reply disagrees with its value'));
+    if (r.kind === 'mismatch') throw new Error(`MCP: reply id ${msg.id} does not match request ${expectedId}`);
+    return msg;
+  }
+  if (r.kind === 'other' && sse) throw new Error(noReplyMessage(expectedId));
+  if (r.kind === 'none' && sse) throw new Error('MCP: no JSON-RPC message in event stream');
+  if (r.kind === 'invalid' && !sse) {
+    // Refused by the module: the runtime's own SyntaxError, as the JS raises it.
+    let parsed = false;
+    try { JSON.parse(text); parsed = true; } catch (err) { throw err; }
+    if (parsed) throw frameFailure('parseRpcBody', new Error('module refused JSON that JSON.parse accepts'));
+  }
+  throw frameFailure('parseRpcBody', new Error(`unexpected outcome ${r.kind}`));
+}
+
+/** mcp.cjs parseRpcBody: parseRpcBodyJs or its Rust port, by MCP_FRAME_IMPL. */
+function parseRpcBody(contentType, text, expectedId, { impl = mcpFrameImpl() } = {}) {
+  return impl === 'wasm' ? parseRpcBodyWasm(contentType, text, expectedId) : parseRpcBodyJs(contentType, text, expectedId);
 }
 
 // Protocol headers noevia sets itself. Credentials (user keys, directory
@@ -161,8 +246,9 @@ async function rpc(baseUrl, session, body, { headers = {}, timeoutMs = 30000, no
     }
     // Notifications have no id and the server answers 202 with an empty body.
     if (notify) return null;
-    const text = await readBodyCapped(res, controller);
-    const msg = parseRpcBody(res.headers.get('content-type'), text, body.id);
+    const impl = mcpFrameImpl();
+    const text = await readBodyCapped(res, controller, MAX_RESPONSE_BYTES, { impl });
+    const msg = parseRpcBody(res.headers.get('content-type'), text, body.id, { impl });
     if (msg.error) throw new Error(`MCP error ${msg.error.code}: ${msg.error.message}`);
     return msg.result;
   } finally {
@@ -400,9 +486,117 @@ function inlineRefs(node, defs, stack, depth, budget) {
   return out;
 }
 
-function resolveSchemaRefs(schema) {
+function resolveSchemaRefsJs(schema) {
   const defs = { ...(schema.$defs || {}), ...(schema.definitions || {}) };
   return inlineRefs(schema, defs, [], 0, { nodes: 0, chars: 0 });
+}
+
+const SCHEMA_MESSAGES = {
+  nest: () => 'schema nests deeper than we will walk',
+  ref_depth: () => 'refs expand deeper than we will inline',
+  nodes: () => `schema expands past ${MAX_SCHEMA_NODES} nodes`,
+  chars: () => `schema expands past ${MAX_SCHEMA_CHARS} characters`,
+  non_local: (ref) => `cannot resolve non-local ref ${ref}`,
+  circular: (ref) => `circular ref ${ref}`,
+  missing: (ref) => `ref ${ref} points at a definition that is not present`,
+};
+
+class NotJsonTree extends Error {}
+
+/** The schema as JSON.stringify writes it, except -0 as `-0` and ±Infinity as `±1e400`, so every
+ *  value crosses unchanged; throws NotJsonTree for anything JSON cannot carry exactly (a cycle,
+ *  a hole, undefined, a function, a class instance). Iterative: JSON.stringify itself has no depth
+ *  limit, but one with a replacer stops near 2 700 levels, and listTools hands on any schema the
+ *  plain one could write. */
+function schemaWire(schema) {
+  const out = [];
+  const onPath = new Set();
+  const stack = [{ v: schema }];
+  while (stack.length) {
+    const item = stack.pop();
+    if (typeof item === 'string') { out.push(item); continue; }
+    if (item.leave) { onPath.delete(item.leave); continue; }
+    const v = item.v;
+    if (typeof v === 'number') {
+      if (Number.isNaN(v)) throw new NotJsonTree('NaN');
+      out.push(Object.is(v, -0) ? '-0' : Number.isFinite(v) ? String(JSON.stringify(v)) : v > 0 ? '1e400' : '-1e400');
+      continue;
+    }
+    if (v === null || typeof v === 'string' || typeof v === 'boolean') { out.push(JSON.stringify(v)); continue; }
+    if (typeof v !== 'object') throw new NotJsonTree(`not JSON: ${typeof v}`);
+    if (onPath.has(v)) throw new NotJsonTree('cycle');
+    const proto = Object.getPrototypeOf(v);
+    const parts = [];
+    if (Array.isArray(v)) {
+      if (proto !== Array.prototype || Object.keys(v).length !== v.length) throw new NotJsonTree('not a plain array');
+      for (let i = 0; i < v.length; i++) { if (i) parts.push(','); parts.push({ v: v[i] }); }
+      onPath.add(v);
+      stack.push({ leave: v }, ']', ...parts.reverse(), '[');
+      continue;
+    }
+    if ((proto !== Object.prototype && proto !== null) || typeof v.toJSON === 'function') throw new NotJsonTree('not a plain object');
+    for (const k of Object.keys(v)) { if (parts.length) parts.push(','); parts.push(`${JSON.stringify(k)}:`, { v: v[k] }); }
+    onPath.add(v);
+    stack.push({ leave: v }, '}', ...parts.reverse(), '{');
+  }
+  return out.join('');
+}
+
+/** mcp-frame's resolved tree from its JSON text: keys arrive as "=k", a set prototype as "^".
+ *  Rebuilt with defineProperty (so "__proto__" stays a key) and setPrototypeOf, iteratively
+ *  (copied siblings may nest deeply; a JSON.parse reviver stops near 2 700 levels). */
+function decodeTree(text) {
+  const root = { v: JSON.parse(text) };
+  // Post-order: children are rebuilt before the object that holds them.
+  const order = [];
+  const stack = [[root, 'v']];
+  while (stack.length) {
+    const [holder, key] = stack.pop();
+    const v = holder[key];
+    if (v === null || typeof v !== 'object') continue;
+    order.push([holder, key]);
+    for (const k of Object.keys(v)) stack.push([v, k]);
+  }
+  for (let i = order.length - 1; i >= 0; i--) {
+    const [holder, key] = order[i];
+    const v = holder[key];
+    if (Array.isArray(v)) continue;
+    const out = {};
+    let proto, hasProto = false;
+    for (const k of Object.keys(v)) {
+      if (k === '^') { hasProto = true; proto = v[k]; continue; }
+      if (k[0] !== '=') throw new NotJsonTree('reply key');
+      Object.defineProperty(out, k.slice(1), { value: v[k], writable: true, enumerable: true, configurable: true });
+    }
+    if (hasProto) {
+      if (proto !== null && typeof proto !== 'object') throw new NotJsonTree('reply prototype');
+      Object.setPrototypeOf(out, proto);
+    }
+    // holder is a parsed array/object or root; plain assignment is safe except for "__proto__".
+    Object.defineProperty(holder, key, { value: out, writable: true, enumerable: true, configurable: true });
+  }
+  return root.v;
+}
+
+/** resolveSchemaRefsJs through mcp-frame. */
+function resolveSchemaRefsWasm(schema) {
+  void schema.$defs; // null/undefined: the JS's own TypeError
+  let wire;
+  try { wire = schemaWire(schema); } catch (err) { throw frameFailure('resolveSchemaRefs', err); }
+  let r;
+  try { r = frameWasm().mcpSchemaRefs(wire); } catch (err) { throw frameFailure('resolveSchemaRefs', err); }
+  let v;
+  try { v = r.ok ? decodeTree(r.text) : JSON.parse(r.text); } catch (err) { throw frameFailure('resolveSchemaRefs', err); }
+  if (r.ok) return v;
+  const msg = v && typeof v.code === 'string' && Object.hasOwn(SCHEMA_MESSAGES, v.code) ? SCHEMA_MESSAGES[v.code] : null;
+  const hasRef = ['non_local', 'circular', 'missing'].includes(v?.code);
+  if (!msg || hasRef !== (typeof v.ref === 'string')) throw frameFailure('resolveSchemaRefs', new Error('unexpected error reply'));
+  throw new Error(msg(v.ref));
+}
+
+/** mcp.cjs resolveSchemaRefs: resolveSchemaRefsJs or its Rust port, by MCP_FRAME_IMPL. */
+function resolveSchemaRefs(schema, { impl = mcpFrameImpl() } = {}) {
+  return impl === 'wasm' ? resolveSchemaRefsWasm(schema) : resolveSchemaRefsJs(schema);
 }
 
 function convertTool(mcpTool) {
@@ -463,4 +657,6 @@ function readOnlyHint(mcpTool) {
 
 module.exports = {
   withBuiltInHeaders, connect, disconnect, listTools, callTool, withFetch, resultToText, convertTool, resolveSchemaRefs, readOnlyHint, parseRpcBody, PROTOCOL_VERSION, MAX_RESPONSE_BYTES,
-  MAX_SCHEMA_NODES, MAX_SCHEMA_CHARS };
+  MAX_SCHEMA_NODES, MAX_SCHEMA_CHARS,
+  // #980: the JS references, the switch and the wire helpers (tests and tools/gen-mcp-fixtures.cjs).
+  parseRpcBodyJs, resolveSchemaRefsJs, mcpFrameImpl, schemaWire, decodeTree, readBodyCapped, PUBLIC_FAILURE, MAX_REF_DEPTH, MAX_NODE_DEPTH };
