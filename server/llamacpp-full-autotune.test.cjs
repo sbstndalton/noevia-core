@@ -8,7 +8,7 @@ const { QUALITY, qualityCheck, qualityFailure, newModel } = require('./llamacpp-
 // #1057: the fake engine's f16 quirks (failLoadF16, badF16, the shorter recall) hold for both
 // unquantized cache types, bf16 being the first candidate now.
 const unq = o => ['bf16', 'f16'].includes(o['cache-type-k']);
-function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnload, badQ4 = true, badF16 = false, noHead = false, rejectAll = false, rejectModel = '', badBatch = false, failFinal = false, formattedQuality = false, reasoningOnly = false, truncatedWorkloads = false, idleTimeoutMs = 300000, loseIdentityAfterStart = false, reloadFail = false, unloadPolls = 0, unloadStuck = false, answerFor = null, failLoadF16 = false, httpFor = null, chatTemplate = null, servingFor = null, servingChecks = null, autotuneExtra = {}, onLoad = null, loadHang = null, calibrationExtra = {}, loadReply = null, streamReply = null } = {}) {
+function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnload, badQ4 = true, badF16 = false, noHead = false, rejectAll = false, rejectModel = '', badBatch = false, failFinal = false, formattedQuality = false, reasoningOnly = false, truncatedWorkloads = false, idleTimeoutMs = 300000, loseIdentityAfterStart = false, reloadFail = false, unloadPolls = 0, unloadStuck = false, answerFor = null, failLoadF16 = false, failLoadBf16 = false, httpFor = null, chatTemplate = null, servingFor = null, servingChecks = null, autotuneExtra = {}, onLoad = null, loadHang = null, calibrationExtra = {}, loadReply = null, streamReply = null } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'full-tune-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const ini = path.join(dir, 'models.ini'), stateFile = path.join(dir, 'tune.json');
@@ -26,7 +26,7 @@ function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnl
       if (value === 'unloading' && !unloadStuck && --unloading[id] <= 0) status[id] = value = 'unloaded';
       return { id, status: { value, args: id === 'embed' ? ['--embedding'] : [] }, meta: { n_ctx_train: 16384 } };
     }) } };
-    if (u.pathname === '/models/load') { onLoad?.({ ...options(b.model) }); const refused = loadReply?.(options(b.model)); if (refused) return refused; if (loadHang?.(options(b.model))) { status[b.model] = 'loading'; return { ok: true, body: {} }; } status[b.model] = failLoadF16 && unq(options(b.model)) ? 'unloaded' : 'loaded'; return { ok: true, body: {} }; }
+    if (u.pathname === '/models/load') { onLoad?.({ ...options(b.model) }); const refused = loadReply?.(options(b.model)); if (refused) return refused; if (loadHang?.(options(b.model))) { status[b.model] = 'loading'; return { ok: true, body: {} }; } status[b.model] = (failLoadF16 && unq(options(b.model))) || (options(b.model)['cache-type-k'] === 'bf16' && (failLoadBf16 === true || (typeof failLoadBf16 === 'function' && failLoadBf16(options(b.model))))) ? 'unloaded' : 'loaded'; return { ok: true, body: {} }; }
     if (u.pathname === '/models/unload') { status[b.model] = unloadPolls || unloadStuck ? 'unloading' : 'unloaded'; unloading[b.model] = unloadPolls; onUnload?.({ manager, model: b.model }); return { ok: true, body: {} }; }
     if (u.pathname === '/tokenize') return { ok: true, body: { tokens: Array(600).fill(1) } };
     if (u.pathname === '/props') return { ok: true, body: { build_info: build, ...(chatTemplate ? { chat_template: chatTemplate } : {}) } };
@@ -381,14 +381,31 @@ test('engine identity and setting edits invalidate previously complete tunes', a
   assert.deepEqual((await f.manager.autotune.untuned()).body.models, ['synthetic']);
 });
 
-test('#1057 allowing q5 for a model makes its earlier tune stale; turning it off again does not', async t => {
+test('#1060 the tune signature follows the list the run used: q5 on makes a default tune stale, off makes a q5 tune stale', async t => {
   const f = fixture(t);
   await f.manager.autotune.start('synthetic', { confirmPause: true }); await finished(f.manager);
   assert.deepEqual((await f.manager.autotune.untuned()).body.models, []);
-  f.manager.autotune.setSettings('synthetic', { allowQ5Kv: true });
+  assert.equal(f.manager.autotune.setSettings('synthetic', { allowQ5Kv: true }).status, 200);
   assert.deepEqual((await f.manager.autotune.untuned()).body.models, ['synthetic']);
+  await f.manager.autotune.start('synthetic', { confirmPause: true }); await finished(f.manager);
+  assert.deepEqual((await f.manager.autotune.untuned()).body.models, [], 'tuned with q5 allowed, the switch still on');
   f.manager.autotune.setSettings('synthetic', { allowQ5Kv: false });
+  assert.deepEqual((await f.manager.autotune.untuned()).body.models, ['synthetic'], 'a q5 tune is stale once q5 is off');
+});
+
+test('#1060 the switch cannot change under a queued model; after the job, the change makes it untuned', async t => {
+  const tried = [];
+  const f = fixture(t, { models: ['one', 'two'], onChat: ({ manager }) => {
+    if (!tried.length && manager.autotune.status().body.job?.model === 'one') tried.push(manager.autotune.setSettings('two', { allowQ5Kv: true }).status);
+  } });
+  await f.manager.autotune.start('', { confirmPause: true, untuned: true });
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'passed', j.error);
+  assert.deepEqual(tried, [409]);
+  assert.deepEqual(j.models.map(m => m.kv), [['bf16', 'q8_0'], ['bf16', 'q8_0']]);
   assert.deepEqual((await f.manager.autotune.untuned()).body.models, []);
+  assert.equal(f.manager.autotune.setSettings('two', { allowQ5Kv: true }).status, 200);
+  assert.deepEqual((await f.manager.autotune.untuned()).body.models, ['two']);
 });
 
 test('a model without an MTP head chooses measured n-gram drafting', async t => {
@@ -1298,8 +1315,11 @@ test('#1057 preferKv: the most precise passing type unless a more compact one fi
 
 test('#1057 bf16Unsupported: only the engine saying it has no bf16 cache, never memory', () => {
   for (const text of ['Unsupported cache type: bf16', 'error: unsupported KV cache type bf16', 'ggml_vulkan: Error: Missing op: FLASH_ATTN_EXT for BF16',
-    'the backend does not support BF16 K/V with flash attention', 'cache_type_k bf16 is not supported by this build'])
+    'the backend does not support BF16 K/V with flash attention', 'cache_type_k bf16 is not supported by this build',
+    'ggml_vulkan: Found 1 Vulkan devices\nllama_init_from_model: unsupported cache type: bf16'])
     assert.equal(bf16Unsupported(text), true, text);
+  // #1061: a device banner naming bf16, then an unrelated failure line, is not "unsupported".
+  assert.equal(bf16Unsupported('ggml_vulkan: 0 = AMD Radeon Graphics (RADV GFX1151) | uma: 1 | fp16: 1 | bf16: 0 | warp size: 64\nllama_init_from_model: failed to allocate KV buffer: memory type not supported, out of memory'), false);
   for (const text of ['', null, 'CUDA error: out of memory', 'failed to allocate bf16 buffer of size 9126805504', 'error loading model: missing tensor', 'unsupported template'])
     assert.equal(bf16Unsupported(text), false, String(text));
 });
@@ -1338,35 +1358,39 @@ test('#1057 per-model settings: validated, saved with the tune state, survive a 
   const cancelled = await finished(f.manager);
   assert.equal(cancelled.status, 'cancelled');
   assert.deepEqual(cancelled.models[0].kv, ['bf16', 'q8_0']);
+  // #1060: not while the cancelled run can be resumed.
+  assert.equal(set('synthetic', { allowQ5Kv: true }).status, 409);
+  const resumedFirst = f.manager;
+  assert.equal((await resumedFirst.autotune.resume({ confirmPause: true })).status, 202);
+  assert.equal((await finished(resumedFirst)).status, 'passed');
   const on = set('synthetic', { allowQ5Kv: true });
   assert.equal(on.status, 200);
   assert.deepEqual(on.body.settings, { allowQ5Kv: true });
   assert.deepEqual(on.body.kvCandidates, ['bf16', 'q8_0', 'q5_1', 'q5_0']);
   assert.deepEqual(JSON.parse(fs.readFileSync(f.stateFile, 'utf8')).settings, { synthetic: { allowQ5Kv: true } });
-  assert.deepEqual(f.restart().autotune.status('synthetic').body.settings, { allowQ5Kv: true });
-  // The resumed run keeps the list it started with.
   const manager = f.restart();
-  assert.equal((await manager.autotune.resume({ confirmPause: true })).status, 202);
-  const resumed = await finished(manager);
-  assert.equal(resumed.status, 'passed', resumed.error);
-  assert.deepEqual(phase(resumed.models[0], 'kv').steps.map(s => s.id), ['bf16', 'q8_0']);
+  assert.deepEqual(manager.autotune.status('synthetic').body.settings, { allowQ5Kv: true });
+  // The resumed run kept the list it started with.
+  assert.deepEqual(phase(manager.autotune.status().body.job.models[0], 'kv').steps.map(s => s.id), ['bf16', 'q8_0']);
   // Off again removes the entry.
   manager.autotune.setSettings('synthetic', { allowQ5Kv: false });
   assert.deepEqual(JSON.parse(fs.readFileSync(f.stateFile, 'utf8')).settings, {});
 });
 
 // A scripted planner that probes at 8k with the request's first type until a pass, then runs on.
-const scriptedFrom = seen => ({ mode: () => 'wasm', plan: r => {
+const scriptedFrom = (seen, at = r => (r.ladder.length === 1 ? r.ladder[0] : 8192)) => ({ mode: () => 'wasm', plan: r => {
   seen.push(JSON.parse(JSON.stringify(r)));
   const res = r.results, kv = r.kv[0], has = (step, id) => res.some(x => x.step === step && (!id || x.id === id));
   if (!res.some(x => x.step === 'probe' && x.outcome === 'passed')) {
     if (res.some(x => x.step === 'probe')) return { step: 'fail', code: 'no_context', message: 'No context size passed the fill-and-recall test.' };
-    return { step: 'probe', ctx: 8192, kv, fill: 7000, estimateMib: 4000 };
+    const c = at(r);
+    return { step: 'probe', ctx: c, kv, fill: Math.floor(c * 0.9) - 256, estimateMib: 4000 };
   }
-  for (const id of ['sampling', 'drafting', 'batch']) if (!has('phase', id)) return { step: 'phase', id, ctx: 8192, kv };
-  if (!has('verify')) return { step: 'verify', ctx: 8192, kv, fill: 7000, estimateMib: 4000 };
-  if (!has('serving')) return { step: 'serving', ctx: 8192, kv };
-  return { step: 'done', ctx: 8192, kv };
+  const ctx = Math.max(...res.filter(x => x.step === 'probe' && x.outcome === 'passed').map(x => x.ctx));
+  for (const id of ['sampling', 'drafting', 'batch']) if (!has('phase', id)) return { step: 'phase', id, ctx, kv };
+  if (!has('verify')) return { step: 'verify', ctx, kv, fill: Math.floor(ctx * 0.9) - 256, estimateMib: 4000 };
+  if (!has('serving')) return { step: 'serving', ctx, kv };
+  return { step: 'done', ctx, kv };
 } });
 const refuseBf16 = text => o => (o['cache-type-k'] === 'bf16' ? { ok: false, status: 500, body: { error: { message: text } } } : null);
 
@@ -1439,4 +1463,65 @@ test('#1057 planned (wasm): the request carries the model\'s list, and q5 wins o
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   assert.equal((await finished(f.manager)).status, 'passed');
   assert.deepEqual(seen[0].kv, ['bf16', 'q8_0', 'q5_1', 'q5_0']);
+});
+
+// ── #1058: an engine that dies loading bf16, saying nothing ──
+test('#1058 planned: bf16 crashing (no text) at the smallest rung gets f16 once; earlier bf16 failures are dropped', async t => {
+  const seen = [];
+  const f = fixture(t, { servingChecks: servingOff, failLoadBf16: true, autotuneExtra: planned({ planner: scriptedFrom(seen, r => r.ladder[0]) }) });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager), item = j.models[0];
+  assert.equal(j.status, 'passed', j.error);
+  assert.equal(item.result.kv, 'f16');
+  assert.deepEqual(item.result.kvFallback, { from: 'bf16', to: 'f16', at: 4096 });
+  assert.match(phase(item, 'context').steps[0].reason, /failed to load a bf16 KV cache even at the smallest context/);
+  assert.deepEqual(item.plan.results.filter(r => r.step === 'probe').map(r => [r.ctx, r.kv, r.outcome]), [[4096, 'f16', 'passed']]);
+});
+
+test('#1058 planned: before leaving bf16 after silent failures, one bf16 probe at the smallest rung decides', async t => {
+  // Dies everywhere: the smallest-rung check dies too, so f16 takes over.
+  const f = fixture(t, { servingChecks: servingOff, failLoadBf16: true, autotuneExtra: planned({ planner: scriptedFrom([]) }) });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager), item = j.models[0];
+  assert.equal(j.status, 'passed', j.error);
+  assert.deepEqual(phase(item, 'context').steps.map(r => [r.ctx, r.kv, r.status]), [[8192, 'bf16', 'failed'], [4096, 'bf16', 'failed'], [8192, 'f16', 'passed']]);
+  assert.equal(item.result.kv, 'f16');
+  // Dies only above 4k: bf16 loads at the smallest rung, so it is supported and stays.
+  const g = fixture(t, { servingChecks: servingOff, failLoadBf16: o => o['ctx-size'] !== '4096', autotuneExtra: planned({ planner: scriptedFrom([]) }) });
+  await g.manager.autotune.start('synthetic', { confirmPause: true });
+  const k = await finished(g.manager);
+  assert.equal(k.status, 'passed', k.error);
+  assert.equal(k.models[0].result.kv, 'bf16');
+  assert.equal(k.models[0].plan.kvFallback, undefined);
+  assert.deepEqual(k.models[0].plan.results.filter(r => r.step === 'probe').map(r => [r.ctx, r.kv, r.outcome]), [[8192, 'bf16', 'load_failed'], [4096, 'bf16', 'passed']]);
+});
+
+test('#1058 planned: a bf16 failure that says why (out of memory) is never retried at the smallest rung', async t => {
+  const seen = [];
+  const f = fixture(t, { servingChecks: servingOff, loadReply: refuseBf16('ggml_vulkan: out of device memory'), autotuneExtra: planned({ planner: scriptedFrom(seen) }) });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'failed');
+  assert.deepEqual(seen.filter(r => r.ladder.length > 1).at(-1).results.map(r => [r.ctx, r.kv, r.outcome]), [[8192, 'bf16', 'load_failed']]);
+});
+
+test('#1058 planned (wasm): bf16 crashing everywhere ends with f16, not q8_0', { skip: skipWasm }, async t => {
+  const f = fixture(t, { servingChecks: servingOff, failLoadBf16: true, autotuneExtra: planned() });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager), item = j.models[0];
+  assert.equal(j.status, 'passed', j.error);
+  assert.equal(item.result.kv, 'f16');
+  assert.ok(!item.plan.results.some(r => r.kv === 'bf16'), 'no bf16 failure carried over');
+  assert.equal(new Set(phase(item, 'context').steps.map(s => s.id)).size, phase(item, 'context').steps.length, 'row ids stay unique');
+});
+
+test('#1058 js order: bf16 that does not load gets f16 once in its place', async t => {
+  const f = fixture(t, { failLoadBf16: true });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager), item = j.models[0], kv = phase(item, 'kv');
+  assert.equal(j.status, 'passed', j.error);
+  assert.deepEqual(kv.steps.map(s => [s.id, s.status]), [['bf16', 'failed'], ['f16', 'passed'], ['q8_0', 'passed']]);
+  assert.equal(item.result.kv, 'f16');
+  assert.deepEqual(item.result.kvFallback, { from: 'bf16', to: 'f16' });
+  assert.ok(j.log.some(l => /bf16 KV cache did not load; trying f16/.test(l.text)));
 });

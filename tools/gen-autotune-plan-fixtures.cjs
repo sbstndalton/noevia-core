@@ -124,7 +124,8 @@ function refPlan(input) {
   const banned = Math.min(Infinity, ...probes.filter(p => p.o === 'quality_failed').map(p => p.k));
   const allowed = Math.min(banned, kv.length);
   const hard = c => probes.some(p => (p.o === 'recall_failed' || p.o === 'over_time') && c >= p.c);
-  const openAt = (c, k) => !hard(c) && !probes.some(p => memory(p.o) && c >= p.c && k <= p.k) && !probes.some(p => p.c === c && p.k === k);
+  const dominated = (c, k) => probes.some(p => memory(p.o) && c >= p.c && k <= p.k);
+  const openAt = (c, k) => !hard(c) && !dominated(c, k) && !probes.some(p => p.c === c && p.k === k);
   // #1057: one type's search: its best pass, the rungs above it that fit, and the open prefix.
   const loOf = k => { const c = probes.filter(p => p.k === k && p.o === 'passed').map(p => p.c); return c.length ? Math.max(...c) : null; };
   const ofType = k => {
@@ -132,7 +133,8 @@ function refPlan(input) {
     for (const c of above) { if (!openAt(c, k)) break; open.push(c); }
     return { lo, above, open };
   };
-  const ceiling = k => rungs.filter(c => fits(c, kv[k])).at(-1) ?? null;
+  // #1059: only rungs no measured failure rules out count toward the doubling rule.
+  const ceiling = k => rungs.filter(c => fits(c, kv[k]) && !hard(c) && !dominated(c, k)).at(-1) ?? null;
   // Precision first: the most precise type still in play; a more compact one replaces the choice
   // only when it fits at least twice the context.
   let pick = null;
