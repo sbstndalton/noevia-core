@@ -18,6 +18,7 @@
 //   - crates/chat-template-caps + provider-error  templateCaps/providerErrorKind/servingVerdict
 //   - crates/autotune-plan  autotunePlan = auto-tune's next step                (AUTOTUNE_PLAN_IMPL, #1003)
 //   - crates/preset-reload  presetReload = may the router re-read models.ini now (PRESET_RELOAD_IMPL, #1012)
+//   - crates/load-verdict   loadVerdict = why a failed auto-tune step failed   (LAYA_LOAD_ADVISOR, #1004)
 //                                        new logic, no JS twin; see chat-template-caps.cjs
 //                                                                             (CHAT_TEMPLATE_CAPS_IMPL, #1002)
 //
@@ -50,7 +51,7 @@ const MAX_DECODE_BYTES = 25 * 1024 * 1024;
 // Only the first bytes decide an archive magic number (`ustar` ends at 262).
 const SNIFF_BYTES = 262;
 const RESET_AFTER_BYTES = 1024 * 1024;
-const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'secret_open', 'secret_seal', 'mcp_rpc_body', 'mcp_schema_refs', 'template_caps', 'provider_error', 'serving_verdict', 'autotune_plan', 'preset_reload', 'dav_output_ptr', 'dav_output_len'];
+const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'secret_open', 'secret_seal', 'mcp_rpc_body', 'mcp_schema_refs', 'template_caps', 'provider_error', 'serving_verdict', 'autotune_plan', 'preset_reload', 'load_verdict', 'dav_output_ptr', 'dav_output_len'];
 
 class DavParseError extends Error {
   constructor(message, reason) {
@@ -548,6 +549,31 @@ function presetReload({ baseline, current, loaded }) {
   return { safe: r.safe, reason: r.reason, changed: r.changed, detail: r.detail };
 }
 
+// load_verdict::MAX_INPUT_BYTES and the names it replies with (#1004).
+const MAX_VERDICT_BYTES = 32 * 1024;
+const VERDICT_OUTCOMES = new Set(['oom', 'load_failed', 'timeout', 'over_time', 'recall_failed', 'template']);
+const VERDICT_LABELS = new Set(['oom', 'load_failed', 'timeout', 'recall_failed', 'template', 'unknown']);
+const VERDICT_SOURCES = new Set(['measured', 'rule', 'advisor', 'fallback']);
+
+/** load-verdict (#1004): a failed auto-tune step's outcome from the calibrator's `cause`, the
+ *  engine's `evidence` ({ status, exitCode, text } or null) and the decision service's `advice`
+ *  ({ label, confidence } or null). Refusals throw DavParseError ('input', 'too_large'); a reply
+ *  of an unexpected shape throws 'reply'. */
+function loadVerdict(request) { return loadVerdictText(JSON.stringify(request)); }
+/** loadVerdict on the request's JSON text as is. */
+function loadVerdictText(text) {
+  if (typeof text !== 'string') throw new DavParseError('load verdict request must be text', 'input');
+  const bytes = encoder.encode(text.isWellFormed() ? text : text.toWellFormed());
+  if (bytes.length > MAX_VERDICT_BYTES) throw new DavParseError('load verdict request is too large', 'too_large');
+  const r = invoke(bytes, (e) => e.load_verdict());
+  const ok = r && VERDICT_OUTCOMES.has(r.outcome) && VERDICT_SOURCES.has(r.source) && VERDICT_LABELS.has(r.rule)
+    && (r.ruleId === null || typeof r.ruleId === 'string') && typeof r.ask === 'boolean' && typeof r.adviceUsed === 'boolean'
+    && typeof r.reason === 'string'
+    && (r.advice === null || (r.advice && VERDICT_LABELS.has(r.advice.label) && posInt(r.advice.permille) && r.advice.permille <= 1000));
+  if (!ok) throw new DavParseError('load verdict reply has an unexpected shape', 'reply');
+  return r;
+}
+
 /** Test hook: the cached instance's linear memory in bytes (0 when there is none). */
 function memoryBytes() { return cached?.instance ? cached.instance.exports.memory.buffer.byteLength : 0; }
 
@@ -581,4 +607,4 @@ function verifyAtStartup(env = process.env) {
 /** Test hook: forget the cached module (and its failure). */
 function reset() { cached = null; }
 
-module.exports = { wasmFlags, verifyAtStartup, IMPL_FLAGS, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
+module.exports = { wasmFlags, verifyAtStartup, IMPL_FLAGS, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };

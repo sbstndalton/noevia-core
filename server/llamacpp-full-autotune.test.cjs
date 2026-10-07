@@ -5,7 +5,7 @@ const { createModelManager } = require('./model-manager.cjs');
 const { createPresetStore } = require('./llamacpp-presets.cjs');
 const { QUALITY, qualityCheck, qualityFailure, newModel } = require('./llamacpp-full-autotune.cjs');
 
-function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnload, badQ4 = true, badF16 = false, noHead = false, rejectAll = false, rejectModel = '', badBatch = false, failFinal = false, formattedQuality = false, reasoningOnly = false, truncatedWorkloads = false, idleTimeoutMs = 300000, loseIdentityAfterStart = false, reloadFail = false, unloadPolls = 0, unloadStuck = false, answerFor = null, failLoadF16 = false, httpFor = null, chatTemplate = null, servingFor = null, servingChecks = null, autotuneExtra = {}, onLoad = null, loadHang = null, calibrationExtra = {} } = {}) {
+function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnload, badQ4 = true, badF16 = false, noHead = false, rejectAll = false, rejectModel = '', badBatch = false, failFinal = false, formattedQuality = false, reasoningOnly = false, truncatedWorkloads = false, idleTimeoutMs = 300000, loseIdentityAfterStart = false, reloadFail = false, unloadPolls = 0, unloadStuck = false, answerFor = null, failLoadF16 = false, httpFor = null, chatTemplate = null, servingFor = null, servingChecks = null, autotuneExtra = {}, onLoad = null, loadHang = null, calibrationExtra = {}, loadReply = null, streamReply = null } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'full-tune-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const ini = path.join(dir, 'models.ini'), stateFile = path.join(dir, 'tune.json');
@@ -23,7 +23,7 @@ function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnl
       if (value === 'unloading' && !unloadStuck && --unloading[id] <= 0) status[id] = value = 'unloaded';
       return { id, status: { value, args: id === 'embed' ? ['--embedding'] : [] }, meta: { n_ctx_train: 16384 } };
     }) } };
-    if (u.pathname === '/models/load') { onLoad?.({ ...options(b.model) }); if (loadHang?.(options(b.model))) { status[b.model] = 'loading'; return { ok: true, body: {} }; } status[b.model] = failLoadF16 && options(b.model)['cache-type-k'] === 'f16' ? 'unloaded' : 'loaded'; return { ok: true, body: {} }; }
+    if (u.pathname === '/models/load') { onLoad?.({ ...options(b.model) }); const refused = loadReply?.(options(b.model)); if (refused) return refused; if (loadHang?.(options(b.model))) { status[b.model] = 'loading'; return { ok: true, body: {} }; } status[b.model] = failLoadF16 && options(b.model)['cache-type-k'] === 'f16' ? 'unloaded' : 'loaded'; return { ok: true, body: {} }; }
     if (u.pathname === '/models/unload') { status[b.model] = unloadPolls || unloadStuck ? 'unloading' : 'unloaded'; unloading[b.model] = unloadPolls; onUnload?.({ manager, model: b.model }); return { ok: true, body: {} }; }
     if (u.pathname === '/tokenize') return { ok: true, body: { tokens: Array(600).fill(1) } };
     if (u.pathname === '/props') return { ok: true, body: { build_info: build, ...(chatTemplate ? { chat_template: chatTemplate } : {}) } };
@@ -53,6 +53,7 @@ function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnl
   const fetchStream = async (url, opts) => {
     const b = JSON.parse(opts.body), text = b.messages[0].content, marker = /start marker: (CAL-[\d-]+)/.exec(text)[1];
     const o = options(b.model);
+    const replaced = streamReply?.(o); if (replaced) return replaced;
     const content = Number(o['ctx-size']) <= (o['cache-type-k'] === 'f16' ? 8192 : 16384) ? marker : 'forgot';
     return new Response(`data: ${JSON.stringify({ choices: [{ delta: { content } }], timings: { prompt_n: Math.floor(text.length / 5), prompt_ms: 100, prompt_per_second: 100000 } })}\n\ndata: [DONE]\n\n`);
   };
@@ -1027,4 +1028,109 @@ test('#1029 planned: a second load timeout stops the run with a fixed message an
   const results = JSON.parse(fs.readFileSync(f.stateFile, 'utf8')).job.models[0].plan.results;
   assert.equal(results.length, 0, 'a timeout is not a measured result');
   assert.equal(fs.readFileSync(f.ini, 'utf8'), f.original);
+});
+
+// ── #1004 LAYA_LOAD_ADVISOR=on: rules name a guessed failure, the decision service only on a tie ──
+const { createLoadAdvisor } = require('./load-advisor.cjs');
+const ADVISOR_ON = { LAYA_LOAD_ADVISOR: 'on' };
+function decisionService({ label, confidence = 0.9, delayMs = 0 } = {}) {
+  const asked = [];
+  return { asked, async choice(input, { signal } = {}) {
+    asked.push(input);
+    if (delayMs) await new Promise((resolve, reject) => { const t = setTimeout(resolve, delayMs); signal?.addEventListener('abort', () => { clearTimeout(t); reject(Error('aborted')); }); });
+    const ids = input.options.map(o => o.id), rest = (1 - confidence) / (ids.length - 1);
+    return { selected: label, scores: Object.fromEntries(ids.map(id => [id, id === label ? confidence : rest])) };
+  } };
+}
+// The 16k f16 load is refused with `body`; everything else loads.
+const refuse16k = body => o => (o['ctx-size'] === '16384' && o['cache-type-k'] === 'f16' ? { ok: false, status: 500, body } : null);
+const probeRows = f => JSON.parse(fs.readFileSync(f.stateFile, 'utf8')).job.models[0].plan.results.filter(r => r.step === 'probe');
+
+test('#1004 advisor on: a rule names an out-of-memory refusal; the decision service is not asked', { skip: skipWasm }, async t => {
+  const svc = decisionService({ label: 'template' });
+  const f = fixture(t, { servingChecks: servingOff, loadReply: refuse16k({ error: { message: 'ggml_vulkan: vk::Device::allocateMemory: ErrorOutOfDeviceMemory' } }),
+    autotuneExtra: planned({ loadAdvisor: createLoadAdvisor({ env: ADVISOR_ON, endpoint: svc }) }) });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'passed', j.error);
+  assert.deepEqual(probeRows(f)[0], { step: 'probe', ctx: 16384, kv: 'f16', outcome: 'oom' });
+  const row = phase(j.models[0], 'context').steps[0];
+  assert.deepEqual([row.classification.source, row.classification.rule, row.classification.ruleId, row.classification.advisor], ['rule', 'oom', 'text_oom', 'not_asked']);
+  assert.match(row.reason, /^The engine refused to load the model at this size\. The engine ran out of memory at this setting \(from the engine's error\)\.$/);
+  assert.equal(svc.asked.length, 0);
+  assert.equal(f.manager.autotune.status().body.loadAdvisor, 'on');
+  // The engine's own words reach neither the client nor the state file.
+  assert.ok(!JSON.stringify(f.manager.autotune.status().body).includes('ErrorOutOfDeviceMemory'));
+  assert.ok(!fs.readFileSync(f.stateFile, 'utf8').includes('ErrorOutOfDeviceMemory'));
+});
+
+test('#1004 advisor on: no rule matches, the decision service reads a template failure and the run stops instead of shrinking', { skip: skipWasm }, async t => {
+  const svc = decisionService({ label: 'template', confidence: 0.85 });
+  const f = fixture(t, { servingChecks: servingOff, loadReply: refuse16k({ error: { message: 'srv  load_model: SYNTHETIC-UNMATCHED startup problem' } }),
+    autotuneExtra: planned({ loadAdvisor: createLoadAdvisor({ env: ADVISOR_ON, endpoint: svc }) }) });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'failed');
+  assert.match(j.models[0].error, /chat template, so auto-tune stopped instead of trying smaller settings/);
+  assert.equal(svc.asked.length, 1);
+  assert.match(svc.asked[0].state, /SYNTHETIC-UNMATCHED/);
+  const row = phase(j.models[0], 'context').steps[0];
+  assert.deepEqual(row.classification, { source: 'advisor', rule: 'unknown', ruleId: null, advice: { label: 'template', permille: 850 }, adviceUsed: true, advisor: 'used' });
+  assert.ok(j.log.some(l => l.text === 'Decision service advice for this failure: used.'));
+  // Nothing was planned on a template outcome, and models.ini is back.
+  assert.equal(probeRows(f).length, 0);
+  assert.equal(fs.readFileSync(f.ini, 'utf8'), f.original);
+  assert.ok(!JSON.stringify(f.manager.autotune.status().body).includes('SYNTHETIC-UNMATCHED'));
+});
+
+test('#1004 advisor on: a decision service over its budget is ignored and the calibrator\'s cause stands', { skip: skipWasm }, async t => {
+  const svc = decisionService({ label: 'template', delayMs: 5000 });
+  const f = fixture(t, { servingChecks: servingOff, loadReply: refuse16k({ error: { message: 'SYNTHETIC-UNMATCHED' } }),
+    autotuneExtra: planned({ loadAdvisor: createLoadAdvisor({ env: ADVISOR_ON, endpoint: svc, budgetMs: 20 }) }) });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'passed', j.error);
+  assert.deepEqual(probeRows(f)[0].outcome, 'load_failed');
+  const c = phase(j.models[0], 'context').steps[0].classification;
+  assert.deepEqual([c.source, c.advisor, c.adviceUsed], ['fallback', 'timeout', false]);
+});
+
+test('#1004 advisor on: a context-size error in the stream steps the context down (recall), not the cache type', { skip: skipWasm }, async t => {
+  const svc = decisionService({ label: 'oom' });
+  const err = `data: ${JSON.stringify({ error: { code: 400, message: 'the request exceeds the available context size, try increasing it' } })}\n\n`;
+  const f = fixture(t, { servingChecks: servingOff, streamReply: o => (o['ctx-size'] === '16384' ? new Response(err) : null),
+    autotuneExtra: planned({ loadAdvisor: createLoadAdvisor({ env: ADVISOR_ON, endpoint: svc }) }) });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'passed', j.error);
+  // Without the advisor this stream error counted as out of memory (a more compact cache type).
+  assert.deepEqual(probeRows(f)[0], { step: 'probe', ctx: 16384, kv: 'f16', outcome: 'recall_failed' });
+  assert.equal(svc.asked.length, 0);
+});
+
+test('#1004 advisor off (default): outcomes are what they were and nothing is asked', async t => {
+  const svc = decisionService({ label: 'template' });
+  const script = [{ step: 'probe', ctx: 16384, kv: 'f16', fill: 14000, estimateMib: 5000 }];
+  const seen = [];
+  const planner = { mode: () => 'wasm', plan: r => { seen.push(r); return script[r.results.length] || { step: 'fail', code: 'no_context', message: 'No context size passed the fill-and-recall test.' }; } };
+  const f = fixture(t, { servingChecks: servingOff, loadReply: refuse16k({ error: { message: 'CUDA error: out of memory' } }),
+    autotuneExtra: planned({ planner, loadAdvisor: createLoadAdvisor({ env: {}, endpoint: svc, verdict: () => assert.fail('no verdict when off') }) }) });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'failed');
+  assert.deepEqual(seen.at(-1).results.map(r => r.outcome), ['load_failed']);
+  assert.equal(phase(j.models[0], 'context').steps[0].classification, undefined);
+  assert.equal(svc.asked.length, 0);
+  assert.equal(f.manager.autotune.status().body.loadAdvisor, 'off');
+});
+
+test('#1004 advisor on but the verdict module unusable: the calibrator\'s cause stands', async t => {
+  const script = [{ step: 'probe', ctx: 16384, kv: 'f16', fill: 14000, estimateMib: 5000 }];
+  const seen = [];
+  const planner = { mode: () => 'wasm', plan: r => { seen.push(r); return script[r.results.length] || { step: 'fail', code: 'no_context', message: 'No context size passed the fill-and-recall test.' }; } };
+  const f = fixture(t, { servingChecks: servingOff, loadReply: refuse16k({ error: { message: 'odd' } }),
+    autotuneExtra: planned({ planner, loadAdvisor: createLoadAdvisor({ env: ADVISOR_ON, endpoint: null, verdict: () => { throw Error('module gone'); }, log: () => {} }) }) });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  await finished(f.manager);
+  assert.deepEqual(seen.at(-1).results.map(r => r.outcome), ['load_failed']);
 });

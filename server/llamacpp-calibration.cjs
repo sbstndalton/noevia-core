@@ -65,6 +65,8 @@ function createCalibrator(deps) {
     fs.renameSync(temp, stateFile);
   }
   const publicJob = job => job && (({ originalText, ...rest }) => rest)(job);
+  // #1004: a failed step's engine evidence, by step record (see finish in step()).
+  const evidenceOf = new WeakMap();
 
   // A run that was still marked running when noevia stopped: put the preset back if the
   // file is still exactly what the job last wrote, so an operator's later edit survives.
@@ -168,13 +170,27 @@ function createCalibrator(deps) {
 
   // Streams a chat completion with prompt progress. Resolves with the generated text and
   // timing, or overBudget with the predicted total when the prompt would take too long.
+  // #1004: an excerpt of what the engine said, for load-verdict's rules (never shown to a client).
+  const ENGINE_TEXT_UNITS = 2048;
+  function engineText(body) {
+    if (body == null) return '';
+    let text; try { text = typeof body === 'string' ? body : JSON.stringify(body); } catch { return ''; }
+    return String(text ?? '').slice(0, ENGINE_TEXT_UNITS);
+  }
+  async function errorBody(response) {
+    try {
+      if (!response.body || typeof response.text !== 'function') return '';
+      return await Promise.race([response.text().then(t => t.slice(0, ENGINE_TEXT_UNITS)), new Promise(r => setTimeout(() => r(''), 2000).unref?.())]);
+    } catch { return ''; }
+  }
+
   async function streamLong(model, content, controller, record, budgetMs) {
     const startedAt = now();
     let response;
     try {
       response = await stream('/v1/chat/completions', { method: 'POST', signal: controller.signal, body: JSON.stringify({ model, stream: true, return_progress: true, temperature: 0, cache_prompt: false, max_tokens: 64, chat_template_kwargs: { enable_thinking: false }, messages: [{ role: 'user', content }] }) });
     } catch (e) { if (controller.signal.aborted) throw e; return { ok: false, error: 'The long prompt could not be sent.' }; }
-    if (!response.ok || !response.body) return { ok: false, error: `The engine rejected the long prompt (HTTP ${response.status}).` };
+    if (!response.ok || !response.body) return { ok: false, error: `The engine rejected the long prompt (HTTP ${response.status}).`, status: response.status, detail: await errorBody(response) };
     const decoder = new TextDecoder();
     let buffer = '', text = '', promptTokens = null, promptPerSecond = null, promptMs = null, lastSave = 0, stopped = null;
     // Leave the read loop before aborting: exiting a for-await over an already-aborted
@@ -189,7 +205,7 @@ function createCalibrator(deps) {
           const data = line.slice(5).trim();
           if (!data || data === '[DONE]') continue;
           let value; try { value = JSON.parse(data); } catch { continue; }
-          if (value.error) { stopped = { ok: false, error: value.error.message || 'The engine reported an error.' }; break read; }
+          if (value.error) { stopped = { ok: false, error: value.error.message || 'The engine reported an error.', status: Number(value.error.code) || null }; break read; }
           const progress = value.prompt_progress;
           if (progress && progress.total > 0) {
             const done = Math.max(0, progress.processed - (progress.cache || 0)), remaining = progress.total - progress.processed;
@@ -236,7 +252,9 @@ function createCalibrator(deps) {
     inflight = controller;
     const memory = watchMemory(record, controller);
     // cause (#1003): why a step failed, for auto-tune's planner: oom, load, timeout, time or recall.
-    const finish = (status, reason, cause) => { record.status = status; if (reason) record.reason = reason; if (cause) record.cause = cause; record.seconds = Math.round((now() - record.startedAt) / 1000); save(); return status === 'passed'; };
+    // evidence (#1004): for a cause only inferred from how the failure looked, what the engine said
+    // ({ status, exitCode, text }), kept off the record so it never reaches a client or the state file.
+    const finish = (status, reason, cause, evidence) => { record.status = status; if (reason) record.reason = reason; if (cause) record.cause = cause; if (evidence) evidenceOf.set(record, evidence); record.seconds = Math.round((now() - record.startedAt) / 1000); save(); return status === 'passed'; };
     try {
       await unloadAll();
       const applied = await applyUnlocked({ model: job.model, baseRevision: job.lastRevision || job.originalRevision, options: { ...job.base, 'ctx-size': String(ctx) } });
@@ -247,7 +265,7 @@ function createCalibrator(deps) {
       // it, or recover() restores nothing and the test context stays in models.ini.
       save();
       const started = await request('/models/load', { method: 'POST', body: JSON.stringify({ model: job.model }), signal: controller.signal }, 120000);
-      if (!started.ok) return finish('failed', 'The engine refused to load the model at this size.', 'load');
+      if (!started.ok) return finish('failed', 'The engine refused to load the model at this size.', 'load', { status: started.status, text: engineText(started.body) });
       const deadline = now() + limits.load;
       for (;;) {
         if (cancelRequested) throw Object.assign(Error('cancelled'), { cancelled: true });
@@ -257,7 +275,7 @@ function createCalibrator(deps) {
         if (loadedOthers(rows, job.model).length) throw Object.assign(Error('Another client loaded a model during calibration. Stop Diary background jobs and other clients, then retry.'), { fatal: true });
         const row = rows.find(m => m.id === job.model);
         if (row?.status?.value === 'loaded') { if (!memory.check()) return finish('failed', `Available memory fell below ${memoryFloorGib} GiB.`, 'oom'); break; }
-        if (!row || row.status?.failed || row.status?.value === 'unloaded') return finish('failed', 'The model failed to load at this size.', 'load');
+        if (!row || row.status?.failed || row.status?.value === 'unloaded') return finish('failed', 'The model failed to load at this size.', 'load', { exitCode: row?.status?.exit_code, text: '' });
         await sleep(limits.poll);
       }
       if (kind === 'load') {
@@ -279,7 +297,7 @@ function createCalibrator(deps) {
       if (result.overBudget) return finish('failed', result.predicted
         ? `Filling this context would take about ${Math.ceil(result.etaMs / 1000)} s, over the ${job.promptBudgetSeconds} s limit.`
         : `Filling this context took ${Math.ceil(result.etaMs / 1000)} s, over the ${job.promptBudgetSeconds} s limit.`, 'time');
-      if (!result.ok) return finish('failed', result.error || 'The long prompt failed.', 'oom');
+      if (!result.ok) return finish('failed', result.error || 'The long prompt failed.', 'oom', { status: result.status, text: result.detail ?? result.error ?? '' });
       record.promptTokens = result.promptTokens;
       if (result.promptPerSecond) record.promptPerSecond = Math.round(result.promptPerSecond);
       if (result.promptSeconds) record.promptSeconds = result.promptSeconds;
@@ -293,7 +311,7 @@ function createCalibrator(deps) {
       // The engine went away (for example an out-of-memory restart): that size failed.
       const back = await waitForBackend();
       if (!back) { finish('failed', 'The model server stopped responding.'); throw Object.assign(Error('The model server did not come back after a failed step.'), { fatal: true }); }
-      return finish('failed', 'The model server failed during this step.', 'oom');
+      return finish('failed', 'The model server failed during this step.', 'oom', { text: String(e?.message || '') });
     } finally {
       memory.stop();
       inflight = null;
@@ -423,6 +441,7 @@ function createCalibrator(deps) {
     const passed = await step(job, ctx, 'long');
     const record = job.steps.at(-1) || {};
     return { passed, cause: passed ? null : record.cause || 'load', reason: record.reason || null, revision: job.lastRevision || null,
+      ...(!passed && evidenceOf.has(record) ? { evidence: evidenceOf.get(record) } : {}),
       promptSeconds: record.promptSeconds ?? null, promptPerSecond: record.promptPerSecond ?? null };
   }
 

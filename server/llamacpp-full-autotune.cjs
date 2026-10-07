@@ -30,6 +30,9 @@ function defaultPlanner() {
 const SERVICES_RESERVE_MIB = 2560;
 const PLAN_CAUSE = { oom: 'oom', load: 'load_failed', time: 'over_time', recall: 'recall_failed' };
 const PLAN_STEP_LIMIT = 64;
+// #1004 LAYA_LOAD_ADVISOR=on: a guessed failure cause is named by Rust's rules (load-verdict), the
+// decision service advising only when no rule matches (load-advisor.cjs). Default off: unchanged.
+function defaultLoadAdvisor() { return require('./load-advisor.cjs').createLoadAdvisor(); }
 const QUALITY = [
   { id: 'arithmetic', prompt: 'Compute (17 * 4) - 9. Reply with only the integer.', expected: '59' },
   { id: 'extraction', prompt: 'Record: name=Juniper; code=AX-417; colour=blue. Return only the code, without quotes.', expected: 'AX-417' },
@@ -152,7 +155,8 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
   fileMissing = () => false, servingChecks = defaultServingChecks(),
   // #1003: the planner (AUTOTUNE_PLAN_IMPL), the model's GGUF facts ({ meta, modelBytes, mmprojBytes }
   // or null) and the inference memory budget in GiB.
-  planner = defaultPlanner(), planFacts = async () => null, budgetGib = () => 16, servicesReserveMib = SERVICES_RESERVE_MIB }) {
+  planner = defaultPlanner(), planFacts = async () => null, budgetGib = () => 16, servicesReserveMib = SERVICES_RESERVE_MIB,
+  loadAdvisor = defaultLoadAdvisor() }) {
   let state;
   try { state = JSON.parse(fs.readFileSync(stateFile, 'utf8')); } catch { state = {}; }
   state.history ||= {};
@@ -162,7 +166,7 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
   const note = (j, text) => { (j.log ||= []).push({ at: now(), text }); if (j.log.length > 400) j.log.shift(); save(); };
   const phaseOf = (item, id) => item.phases.find(p => p.id === id);
   // kvCandidates: the list this server really tries, so the panel never describes another build's.
-  const status = model => ({ ok: true, status: 200, body: { job: publicJob(state.job), history: model ? state.history[model] || [] : [], kvCandidates: kvCandidates(), planImpl: planner.mode() } });
+  const status = model => ({ ok: true, status: 200, body: { job: publicJob(state.job), history: model ? state.history[model] || [] : [], kvCandidates: kvCandidates(), planImpl: planner.mode(), loadAdvisor: loadAdvisor.enabled() ? 'on' : 'off' } });
   // #1003: one recovery copy of models.ini per tune run. The first write of a job keeps the
   // writer's usual copy (the profile as it was before tuning); every later write, restores
   // included, asks for none (the web writer skips it, Model Loader gets the hint).
@@ -680,7 +684,15 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
     try { r = await cal.probe(j.model, { ctx: step.ctx, fill: step.fill, base, baseRevision: j._revision, promptBudgetSeconds: j.promptBudgetSeconds }); }
     finally { child = null; }
     check();
-    if (!r.passed) return { outcome: r.cause === 'timeout' ? 'timeout' : PLAN_CAUSE[r.cause] || 'load_failed', reason: r.reason || 'The fill-and-recall test failed.' };
+    if (!r.passed) {
+      const own = { outcome: r.cause === 'timeout' ? 'timeout' : PLAN_CAUSE[r.cause] || 'load_failed', reason: r.reason || 'The fill-and-recall test failed.' };
+      if (!loadAdvisor.enabled()) return own;
+      // #1004: rules first, the decision service only on a tie; null keeps the calibrator's cause.
+      const judged = await loadAdvisor.judge({ cause: r.cause, evidence: r.evidence || null });
+      check();
+      if (!judged || judged.classification.source === 'measured') return own;
+      return { outcome: judged.outcome, reason: own.reason + ' ' + judged.reason, classification: judged.classification };
+    }
     if (withQuality) {
       try {
         await load(j);
@@ -706,6 +718,8 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
   // #1029: a load that did not finish in time says nothing about memory. Tried once more; then the
   // run stops (resumable) instead of stepping the context or KV type down.
   const LOAD_TIMEOUT = 'The test profile did not finish loading in time twice, so auto-tune cannot judge this setting. Check the model server, then resume.';
+  // #1004: no smaller context or more compact cache type fixes a chat template the engine rejects.
+  const TEMPLATE_STOP = "The engine could not use this model's chat template, so auto-tune stopped instead of trying smaller settings. Check the model's chat template, then resume.";
   async function measureFill(j, item, p, step, kind) {
     const plan = item.plan;
     const row = { id: kind + '-' + plan.results.length, label: (kind === 'probe' ? 'Fill ' : 'Final fill ') + step.ctx.toLocaleString('en-US') + ' · ' + step.kv + ' KV cache',
@@ -717,9 +731,17 @@ function createFullAutotuner({ request, rawModels, presets, maintenance, applyUn
       : fillCheck(j, step, {}, false));
     let r = await run();
     if (r.outcome === 'timeout') { note(j, 'Loading timed out; trying the same setting once more.'); r = await run(); }
+    if (r.classification) {
+      row.classification = r.classification;
+      if (r.classification.advisor !== 'not_asked') note(j, 'Decision service advice for this failure: ' + r.classification.advisor + '.');
+    }
     if (r.outcome === 'timeout') {
       Object.assign(row, { status: 'failed', reason: LOAD_TIMEOUT, finishedAt: now() });
       throw publicFail(LOAD_TIMEOUT);
+    }
+    if (r.outcome === 'template') {
+      Object.assign(row, { status: 'failed', reason: TEMPLATE_STOP, finishedAt: now() });
+      throw publicFail(TEMPLATE_STOP);
     }
     Object.assign(row, { status: r.outcome === 'passed' ? 'passed' : 'failed', ...(r.reason ? { reason: r.reason } : {}),
       ...(r.promptSeconds != null ? { promptSeconds: r.promptSeconds } : {}), finishedAt: now() });
