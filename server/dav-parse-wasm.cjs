@@ -15,6 +15,9 @@
 //                                                                             (SECRET_ENVELOPE_IMPL, #979)
 //   - crates/mcp-frame     mcpRpcBody/mcpSchemaRefs = mcp.cjs parseRpcBody/resolveSchemaRefs
 //                                                                             (MCP_FRAME_IMPL, #980)
+//   - crates/chat-template-caps + provider-error  templateCaps/providerErrorKind/servingVerdict
+//                                        new logic, no JS twin; see chat-template-caps.cjs
+//                                                                             (CHAT_TEMPLATE_CAPS_IMPL, #1002)
 //
 // Memory: WebAssembly memory only grows. A listing or path call needs at most ~16 MiB; an upload
 // decode copies the upload in (at most 25 MiB) and holds one copy of its text (at most 3 bytes per
@@ -45,7 +48,7 @@ const MAX_DECODE_BYTES = 25 * 1024 * 1024;
 // Only the first bytes decide an archive magic number (`ustar` ends at 262).
 const SNIFF_BYTES = 262;
 const RESET_AFTER_BYTES = 1024 * 1024;
-const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'secret_open', 'secret_seal', 'mcp_rpc_body', 'mcp_schema_refs', 'dav_output_ptr', 'dav_output_len'];
+const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'secret_open', 'secret_seal', 'mcp_rpc_body', 'mcp_schema_refs', 'template_caps', 'provider_error', 'serving_verdict', 'dav_output_ptr', 'dav_output_len'];
 
 class DavParseError extends Error {
   constructor(message, reason) {
@@ -447,11 +450,58 @@ function mcpSchemaRefs(wire) {
   return { ok: bytes[0] === 0, text: utf8(bytes.subarray(1)) };
 }
 
+// chat_template_caps::MAX_TEMPLATE_BYTES; provider_error classifies at most 256 KiB of a body, so
+// at most that many UTF-16 units (<= 768 KiB of UTF-8) cross.
+const MAX_TEMPLATE_BYTES = 256 * 1024;
+const MAX_ERROR_UNITS = 256 * 1024;
+const CAPS_FIELDS = ['known', 'tools', 'toolCalls', 'toolRole', 'systemRole', 'strictAlternation', 'raises', 'thinking', 'sendTools'];
+const ERROR_KINDS = new Set(['context_full', 'template_or_tools_unsupported', 'bad_request', 'backend_down', 'other']);
+
+/** chat-template-caps analyze (#1002): the capability booleans of a chat template. A template
+ *  over MAX_TEMPLATE_BYTES is refused (DavParseError 'too_large'). */
+function templateCaps(template) {
+  if (typeof template !== 'string') throw new DavParseError('chat template must be text', 'input');
+  const bytes = encoder.encode(template);
+  if (bytes.length > MAX_TEMPLATE_BYTES) throw new DavParseError('chat template is too large', 'too_large');
+  const reply = invoke(bytes, (e) => e.template_caps());
+  if (!reply || typeof reply !== 'object' || CAPS_FIELDS.some((k) => typeof reply[k] !== 'boolean')) throw new DavParseError('template caps reply has an unexpected shape', 'reply');
+  return Object.fromEntries(CAPS_FIELDS.map((k) => [k, reply[k]]));
+}
+
+/** `u32le(status) utf8(body)`, the body cut to MAX_ERROR_UNITS (the module cuts it further). */
+function statusBody(status, body) {
+  if (!Number.isInteger(status) || status < 0 || status > 0xffffffff || typeof body !== 'string') throw new DavParseError('provider error input has the wrong type', 'input');
+  let text = body.length > MAX_ERROR_UNITS ? body.slice(0, MAX_ERROR_UNITS) : body;
+  if (!text.isWellFormed()) text = text.toWellFormed();
+  const eb = encoder.encode(text);
+  const out = new Uint8Array(4 + eb.length);
+  new DataView(out.buffer).setUint32(0, status, true);
+  out.set(eb, 4);
+  return out;
+}
+
+/** provider-error classify (#1002): `{ kind, reason }`, the reason sanitised and capped. */
+function providerErrorKind(status, body) {
+  const reply = invoke(statusBody(status, body), (e) => e.provider_error());
+  if (!reply || !ERROR_KINDS.has(reply.kind) || typeof reply.reason !== 'string') throw new DavParseError('provider error reply has an unexpected shape', 'reply');
+  return { kind: reply.kind, reason: reply.reason };
+}
+
+/** Autotune's serving verdict (#1003): `{ passed, kind, reason }` for one chat reply. */
+function servingVerdict(status, body) {
+  const reply = invoke(statusBody(status, body), (e) => e.serving_verdict());
+  if (!reply || typeof reply.passed !== 'boolean' || typeof reply.reason !== 'string'
+    || !(reply.passed ? reply.kind === null : ERROR_KINDS.has(reply.kind))) throw new DavParseError('serving verdict reply has an unexpected shape', 'reply');
+  return { passed: reply.passed, kind: reply.kind, reason: reply.reason };
+}
+
 /** Test hook: the cached instance's linear memory in bytes (0 when there is none). */
 function memoryBytes() { return cached?.instance ? cached.instance.exports.memory.buffer.byteLength : 0; }
 
 // Every switch that runs this module (#996). Each reads its value as trim().toLowerCase().
-const IMPL_FLAGS = ['DAV_PARSE_IMPL', 'S3_PARSE_IMPL', 'STORAGE_PATH_IMPL', 'UPLOAD_SNIFF_IMPL', 'SECRET_ENVELOPE_IMPL', 'MCP_FRAME_IMPL'];
+// CHAT_TEMPLATE_CAPS_IMPL counts only when set to wasm explicitly; its default (also wasm) is
+// checked by chat-template-caps.cjs startup(), which falls back to off instead of stopping.
+const IMPL_FLAGS = ['DAV_PARSE_IMPL', 'S3_PARSE_IMPL', 'STORAGE_PATH_IMPL', 'UPLOAD_SNIFF_IMPL', 'SECRET_ENVELOPE_IMPL', 'MCP_FRAME_IMPL', 'CHAT_TEMPLATE_CAPS_IMPL'];
 
 /** The *_IMPL switches set to wasm in `env`. */
 function wasmFlags(env = process.env) {
@@ -478,4 +528,4 @@ function verifyAtStartup(env = process.env) {
 /** Test hook: forget the cached module (and its failure). */
 function reset() { cached = null; }
 
-module.exports = { wasmFlags, verifyAtStartup, IMPL_FLAGS, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
+module.exports = { wasmFlags, verifyAtStartup, IMPL_FLAGS, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };

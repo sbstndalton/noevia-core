@@ -5,7 +5,7 @@ const { createModelManager } = require('./model-manager.cjs');
 const { createPresetStore } = require('./llamacpp-presets.cjs');
 const { QUALITY, qualityCheck, qualityFailure, newModel } = require('./llamacpp-full-autotune.cjs');
 
-function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnload, badQ4 = true, badF16 = false, noHead = false, rejectAll = false, rejectModel = '', badBatch = false, failFinal = false, formattedQuality = false, reasoningOnly = false, truncatedWorkloads = false, idleTimeoutMs = 300000, loseIdentityAfterStart = false, reloadFail = false, unloadPolls = 0, unloadStuck = false, answerFor = null, failLoadF16 = false, httpFor = null } = {}) {
+function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnload, badQ4 = true, badF16 = false, noHead = false, rejectAll = false, rejectModel = '', badBatch = false, failFinal = false, formattedQuality = false, reasoningOnly = false, truncatedWorkloads = false, idleTimeoutMs = 300000, loseIdentityAfterStart = false, reloadFail = false, unloadPolls = 0, unloadStuck = false, answerFor = null, failLoadF16 = false, httpFor = null, chatTemplate = null, servingFor = null, servingChecks = null } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'full-tune-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const ini = path.join(dir, 'models.ini'), stateFile = path.join(dir, 'tune.json');
@@ -13,7 +13,7 @@ function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnl
   fs.writeFileSync(ini, original);
   const presets = createPresetStore(ini), status = Object.fromEntries([...models, 'embed'].map(m => [m, 'unloaded']));
   const unloading = {};
-  const requests = [], options = m => presets.get(m).options;
+  const requests = [], servingRequests = [], options = m => presets.get(m).options;
   let chats = 0, build = 'fake-v1', identityReads = 0;
   const fetchJson = async (url, opts = {}) => {
     const u = new URL(url), b = opts.body ? JSON.parse(opts.body) : {};
@@ -26,8 +26,10 @@ function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnl
     if (u.pathname === '/models/load') { status[b.model] = failLoadF16 && options(b.model)['cache-type-k'] === 'f16' ? 'unloaded' : 'loaded'; return { ok: true, body: {} }; }
     if (u.pathname === '/models/unload') { status[b.model] = unloadPolls || unloadStuck ? 'unloading' : 'unloaded'; unloading[b.model] = unloadPolls; onUnload?.({ manager, model: b.model }); return { ok: true, body: {} }; }
     if (u.pathname === '/tokenize') return { ok: true, body: { tokens: Array(600).fill(1) } };
-    if (u.pathname === '/props') return { ok: true, body: { build_info: build } };
+    if (u.pathname === '/props') return { ok: true, body: { build_info: build, ...(chatTemplate ? { chat_template: chatTemplate } : {}) } };
     if (u.pathname === '/v1/chat/completions') {
+      // #1003: the serving check is the only request with a system turn.
+      if (b.messages[0].role === 'system') { servingRequests.push(b); return servingFor ? servingFor(b) : { ok: true, status: 200, body: { choices: [{ message: { content: 'Synthetic answer' } }] } }; }
       chats++; const o = options(b.model), prompt = b.messages[0].content;
       requests.push({ model: b.model, options: { ...o }, prompt, maxTokens: b.max_tokens, reasoningEffort: b.reasoning_effort });
       await onChat?.({ manager, chats, o, prompt, ini, status, requests });
@@ -57,9 +59,9 @@ function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnl
   const makeManager = () => createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic', presetPath: ini, fetchJson, fetchStream,
     calibrationStatePath: path.join(dir, 'cal.json'), autotuneStatePath: stateFile,
     calibrationOptions: { sleep: async () => {}, readMemory: () => 20 },
-    autotuneOptions: { ...(unloadPolls || unloadStuck ? { sleep: async () => {} } : {}), betweenModelsMs: 25, idleTimeoutMs, readMemory: () => 20, identityFor: async m => (++identityReads > 1 && loseIdentityAfterStart ? null : { model: m, hardware: 'fake', build }) } });
+    autotuneOptions: { ...(servingChecks ? { servingChecks } : {}), ...(unloadPolls || unloadStuck ? { sleep: async () => {} } : {}), betweenModelsMs: 25, idleTimeoutMs, readMemory: () => 20, identityFor: async m => (++identityReads > 1 && loseIdentityAfterStart ? null : { model: m, hardware: 'fake', build }) } });
   let manager = makeManager();
-  return { manager, ini, stateFile, original, requests, options, status, restart: () => { manager = makeManager(); return manager; }, setBuild: b => { build = b; } };
+  return { manager, ini, stateFile, original, requests, servingRequests, options, status, restart: () => { manager = makeManager(); return manager; }, setBuild: b => { build = b; } };
 }
 async function finished(manager) {
   for (let i = 0; i < 15000; i++) {
@@ -777,4 +779,69 @@ test('#872 between model leases the gate is open but the folder sync still sees 
   const j = await finished(f.manager);
   assert.equal(j.status, 'passed', j.error);
   assert.equal(f.manager.tuningActive(), false);
+});
+
+// ── #1003: the realistic chat check before sign-off (CHAT_TEMPLATE_CAPS_IMPL) ──────────────
+const davParseWasm = require('./dav-parse-wasm.cjs');
+const wasmFile = process.env.DAV_PARSE_WASM || davParseWasm.DEFAULT_WASM;
+const skipWasm = !fs.existsSync(wasmFile) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
+const GEMMA3 = fs.readFileSync(path.join(__dirname, '..', 'tests', 'fixtures', 'chat-templates', 'google-gemma-3-12b-it.jinja'), 'utf8');
+const TEMPLATE_400 = { ok: false, status: 400, body: { error: { code: 400, message: 'Unable to generate parser for this template. Automatic parser generation failed: {{ raise_exception("Conversation roles must alternate user/assistant/user/assistant/...") }}' } } };
+const okReply = { ok: true, status: 200, body: { choices: [{ message: { content: 'Synthetic answer' } }] } };
+const realChecks = () => { const caps = require('./chat-template-caps.cjs'); return { mode: () => 'wasm', templateCaps: t => davParseWasm.templateCaps(t), verdict: (st, b) => davParseWasm.servingVerdict(st, b), caps }; };
+
+test('#1003: a Gemma 3 template is checked without tools and signed off', { skip: skipWasm }, async t => {
+  const f = fixture(t, { chatTemplate: GEMMA3, servingFor: b => (b.tools ? TEMPLATE_400 : okReply), servingChecks: realChecks() });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'passed', j.error);
+  assert.equal(f.servingRequests.length, 1);
+  assert.equal(f.servingRequests[0].tools, undefined);
+  assert.equal(f.servingRequests[0].messages[0].role, 'system');
+  assert.deepEqual(j.models[0].result.serving, { passed: true, toolsSent: false, templateKnown: true, retriedWithoutTools: false });
+});
+
+test('#1003: a template-unaware engine refusal is retried without tools, as chat does', { skip: skipWasm }, async t => {
+  const f = fixture(t, { servingFor: b => (b.tools ? TEMPLATE_400 : okReply), servingChecks: realChecks() });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'passed', j.error);
+  assert.deepEqual(f.servingRequests.map(b => !!b.tools), [true, false]);
+  assert.equal(f.servingRequests[0].tools[0].function.parameters.type, 'object');
+  assert.deepEqual(j.models[0].result.serving, { passed: true, toolsSent: false, templateKnown: false, retriedWithoutTools: true });
+});
+
+test('#1003: a profile that cannot serve the realistic request is not signed off', { skip: skipWasm }, async t => {
+  const f = fixture(t, { servingFor: () => ({ ok: false, status: 500, body: { error: { message: 'synthetic slot failure at http://10.0.0.9:8080' } } }), servingChecks: realChecks() });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'failed');
+  assert.match(j.models[0].error, /cannot serve a realistic chat request with the app's tools: synthetic slot failure at \[url\]\./);
+  assert.equal(j.models[0].result, undefined);
+  assert.equal(f.manager.autotune.status('synthetic').body.history.length, 0);
+});
+
+test('#1003: an engine reply without a message fails the check too', { skip: skipWasm }, async t => {
+  const f = fixture(t, { servingFor: () => ({ ok: true, status: 200, body: { choices: [] } }), servingChecks: realChecks() });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'failed');
+  assert.match(j.models[0].error, /answered without a chat message/);
+});
+
+test('#1003: with CHAT_TEMPLATE_CAPS_IMPL off there is no extra request', async t => {
+  const f = fixture(t, { servingChecks: { mode: () => 'off', templateCaps: () => assert.fail(), verdict: () => assert.fail() } });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'passed', j.error);
+  assert.equal(f.servingRequests.length, 0);
+  assert.equal(j.models[0].result.serving, undefined);
+});
+
+test('#1003: an unusable checker skips the check instead of failing the tune', async t => {
+  const f = fixture(t, { servingChecks: { mode: () => 'wasm', templateCaps: () => { throw Error('x'); }, verdict: () => { throw Error('module missing'); } } });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'passed', j.error);
+  assert.ok(j.log.some(l => /realistic chat check was skipped/.test(l.text)));
 });
