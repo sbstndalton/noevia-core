@@ -73,6 +73,10 @@ jobs:
       - run: sudo "$(command -v node)" --test server/code-verify-root.test.cjs
       # The release build sets STAMP_VERSION (#317); re-run the stamp test with a SHA-shaped value.
       - run: STAMP_VERSION=ci1234567 node --test tests/server/build-version-stamp.test.cjs
+      # Dev tooling (moved from noevia at the cutover, #952): no install step, but it imports
+      # server/tool-result-reduce.cjs, so it must not drift. Needs ripgrep.
+      - run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - run: node --test tools/repo-index/*.test.cjs
 
   code-sandbox:
     name: Code sandbox bridge tests
@@ -169,11 +173,27 @@ jobs:
           for r in noevia-services noevia-core noevia-web; do [ "$r" = "$SELF" ] || overlay "$r"; done
           overlay "$SELF"
           echo "noevia $(git -C ws rev-parse HEAD), $SELF $(git -C self rev-parse HEAD)"
+      # Since the repo split cutover (noevia #952) the web image is built the way a release builds
+      # it: noevia's build/web.Dockerfile over an assembled tree (web/ = noevia-web, core/ =
+      # noevia-core, release-refs), as deploy/tools/assemble-release.sh lays it out. The image
+      # build runs the client and server tests too.
+      - name: Lay out an assembled release tree
+        env:
+          WEB: sib/noevia-web
+          CORE: self
+        run: |
+          set -euo pipefail
+          t="$RUNNER_TEMP/tree"; mkdir -p "$t/web" "$t/core"
+          git -C "$WEB" archive HEAD | tar -x -C "$t/web"
+          git -C "$CORE" archive HEAD | tar -x -C "$t/core"
+          printf 'NOEVIA_SHA=%s\nNOEVIA_WEB_SHA=%s\nNOEVIA_CORE_SHA=%s\nNOEVIA_SERVICES_SHA=%s\n' "$(git -C ws rev-parse HEAD)" \
+            "$(git -C "$WEB" rev-parse HEAD)" "$(git -C "$CORE" rev-parse HEAD)" ci > "$t/release-refs"
+          echo "TREE=$t" >> "$GITHUB_ENV"
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3 (v3.12.0)
-      # The monorepo image build (apps/web/Dockerfile runs the client and server tests too).
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6 (v6.19.2)
         with:
-          context: ws/apps/web
+          context: ${{ env.TREE }}
+          file: ws/build/web.Dockerfile
           push: false
           tags: noevia-web:ci
           cache-from: type=gha
