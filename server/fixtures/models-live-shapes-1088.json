@@ -1,0 +1,592 @@
+{
+ "router": {
+  "data": [
+   {
+    "id": "Qwen3.5-4B-UD-Q8_K_XL",
+    "aliases": [],
+    "tags": [],
+    "object": "model",
+    "owned_by": "llamacpp",
+    "created": 1791440838,
+    "status": {
+     "value": "unloaded",
+     "args": [
+      "--alias",
+      "Qwen3.5-4B-UD-Q8_K_XL",
+      "--ctx-size",
+      "40960",
+      "--model",
+      "/models/Qwen3.5-4B-UD-Q8_K_XL/Qwen3.5-4B-UD-Q8_K_XL.gguf",
+      "--mmproj",
+      "/models/Qwen3.5-4B-UD-Q8_K_XL/mmproj-BF16.gguf"
+     ]
+    },
+    "architecture": {
+     "input_modalities": [
+      "text",
+      "image"
+     ],
+     "output_modalities": [
+      "text"
+     ]
+    },
+    "source": "preset",
+    "can_remove": false
+   },
+   {
+    "id": "Qwen3.5-9B-UD-Q4_K_XL",
+    "aliases": [],
+    "tags": [],
+    "object": "model",
+    "owned_by": "llamacpp",
+    "created": 1791440838,
+    "status": {
+     "value": "unloaded",
+     "args": [
+      "--alias",
+      "Qwen3.5-9B-UD-Q4_K_XL",
+      "--ctx-size",
+      "24576",
+      "--model",
+      "/models/Qwen3.5-9B-UD-Q4_K_XL/Qwen3.5-9B-UD-Q4_K_XL.gguf",
+      "--mmproj",
+      "/models/Qwen3.5-9B-UD-Q4_K_XL/mmproj-BF16.gguf"
+     ]
+    },
+    "architecture": {
+     "input_modalities": [
+      "text",
+      "image"
+     ],
+     "output_modalities": [
+      "text"
+     ]
+    },
+    "source": "preset",
+    "can_remove": false
+   },
+   {
+    "id": "gemma-4-12b-it-qat-q4_0",
+    "aliases": [],
+    "tags": [],
+    "object": "model",
+    "owned_by": "llamacpp",
+    "created": 1791440838,
+    "status": {
+     "value": "loaded",
+     "args": [
+      "--alias",
+      "gemma-4-12b-it-qat-q4_0",
+      "--ctx-size",
+      "12288",
+      "--model",
+      "/models/gemma-4-12b-it-qat-q4_0/gemma-4-12b-it-qat-q4_0.gguf",
+      "--mmproj",
+      "/models/gemma-4-12b-it-qat-q4_0/mmproj-gemma-4-12b-it-qat-q4_0.gguf"
+     ]
+    },
+    "architecture": {
+     "input_modalities": [
+      "text",
+      "image",
+      "audio"
+     ],
+     "output_modalities": [
+      "text"
+     ]
+    },
+    "source": "preset",
+    "can_remove": false,
+    "meta": {
+     "vocab_type": true,
+     "n_vocab": 262144,
+     "n_ctx": 12288,
+     "n_ctx_train": 262144,
+     "n_embd": 3840,
+     "n_params": 11907350576,
+     "size": 6960054464,
+     "ftype": "Q4_0"
+    }
+   },
+   {
+    "id": "gemma-4-E2B_q4_0-it",
+    "aliases": [],
+    "tags": [],
+    "object": "model",
+    "owned_by": "llamacpp",
+    "created": 1791440838,
+    "status": {
+     "value": "unloaded",
+     "args": [
+      "--alias",
+      "gemma-4-E2B_q4_0-it",
+      "--ctx-size",
+      "65536",
+      "--model",
+      "/models/gemma-4-E2B_q4_0-it/gemma-4-E2B_q4_0-it.gguf",
+      "--mmproj",
+      "/models/gemma-4-E2B_q4_0-it/gemma-4-E2B-it-mmproj.gguf"
+     ]
+    },
+    "architecture": {
+     "input_modalities": [
+      "text",
+      "image",
+      "audio"
+     ],
+     "output_modalities": [
+      "text"
+     ]
+    },
+    "source": "preset",
+    "can_remove": false
+   },
+   {
+    "id": "gemma-4-E4B-it-qat-UD-Q4_K_XL",
+    "aliases": [],
+    "tags": [],
+    "object": "model",
+    "owned_by": "llamacpp",
+    "created": 1791440838,
+    "status": {
+     "value": "unloaded",
+     "args": [
+      "--alias",
+      "gemma-4-E4B-it-qat-UD-Q4_K_XL",
+      "--ctx-size",
+      "49152",
+      "--model",
+      "/models/gemma-4-E4B-it-qat-UD-Q4_K_XL/gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf",
+      "--mmproj",
+      "/models/gemma-4-E4B-it-qat-UD-Q4_K_XL/mmproj-BF16.gguf"
+     ]
+    },
+    "architecture": {
+     "input_modalities": [
+      "text",
+      "image",
+      "audio"
+     ],
+     "output_modalities": [
+      "text"
+     ]
+    },
+    "source": "preset",
+    "can_remove": false
+   },
+   {
+    "id": "laya_multilingual_f16",
+    "aliases": [],
+    "tags": [],
+    "object": "model",
+    "owned_by": "llamacpp",
+    "created": 1791440838,
+    "status": {
+     "value": "unloaded",
+     "args": [
+      "--alias",
+      "laya_multilingual_f16",
+      "--ctx-size",
+      "8192",
+      "--model",
+      "/models/laya_multilingual_f16/laya_multilingual_f16.gguf"
+     ]
+    },
+    "architecture": {
+     "input_modalities": [
+      "text"
+     ],
+     "output_modalities": [
+      "text"
+     ]
+    },
+    "source": "preset",
+    "can_remove": false
+   },
+   {
+    "id": "nomic-embed-text-v1",
+    "aliases": [],
+    "tags": [],
+    "object": "model",
+    "owned_by": "llamacpp",
+    "created": 1791440838,
+    "status": {
+     "value": "unloaded",
+     "args": [
+      "--alias",
+      "nomic-embed-text-v1",
+      "--ctx-size",
+      "2048",
+      "--model",
+      "/models/nomic-embed-text-v1/nomic-embed-text-v1.Q8_0.gguf"
+     ]
+    },
+    "architecture": {
+     "input_modalities": [
+      "text"
+     ],
+     "output_modalities": [
+      "text"
+     ]
+    },
+    "source": "preset",
+    "can_remove": false
+   },
+   {
+    "id": "qwen3-reranker-0.6b-q8_0",
+    "aliases": [],
+    "tags": [],
+    "object": "model",
+    "owned_by": "llamacpp",
+    "created": 1791440838,
+    "status": {
+     "value": "unloaded",
+     "args": [
+      "--alias",
+      "qwen3-reranker-0.6b-q8_0",
+      "--ctx-size",
+      "8192",
+      "--model",
+      "/models/qwen3-reranker-0.6b/qwen3-reranker-0.6b-q8_0.gguf"
+     ]
+    },
+    "architecture": {
+     "input_modalities": [
+      "text"
+     ],
+     "output_modalities": [
+      "text"
+     ]
+    },
+    "source": "preset",
+    "can_remove": false
+   }
+  ]
+ },
+ "scan": {
+  "models": [
+   {
+    "key": "gemma-4-12b-it-qat-q4_0/gemma-4-12b-it-qat-q4_0.gguf",
+    "name": "gemma-4-12b-it-qat-q4_0.gguf",
+    "stem": "gemma-4-12b-it-qat-q4_0",
+    "subdir": "gemma-4-12b-it-qat-q4_0",
+    "bytes": 6975879296,
+    "size": "6.5 GB",
+    "modified": "2026-10-07 07:51",
+    "mtime": 1791359518.757244,
+    "sharded": false,
+    "parts": 1,
+    "companion": false,
+    "projector": {
+     "name": "mmproj-gemma-4-12b-it-qat-q4_0.gguf",
+     "bytes": 175115616
+    },
+    "sections": [
+     "gemma-4-12b-it-qat-q4_0"
+    ],
+    "modelId": "gemma-4-12b-it-qat-q4_0",
+    "file": "gemma-4-12b-it-qat-q4_0/gemma-4-12b-it-qat-q4_0.gguf",
+    "shape": {
+     "arch": "gemma4",
+     "moe": false,
+     "experts": 0,
+     "active": 0,
+     "label": "dense"
+    },
+    "loadedOn": [
+     "cowork-llama-1"
+    ],
+    "fit": [
+     {
+      "name": "cowork-llama-1",
+      "vram_gb": 14,
+      "verdict": "fits",
+      "ratio_pct": 46
+     },
+     {
+      "name": "cowork-embed-1",
+      "vram_gb": 21,
+      "verdict": "fits",
+      "ratio_pct": 31,
+      "is_cpu": true
+     }
+    ],
+    "badges": []
+   },
+   {
+    "key": "gemma-4-E2B_q4_0-it/gemma-4-E2B_q4_0-it.gguf",
+    "name": "gemma-4-E2B_q4_0-it.gguf",
+    "stem": "gemma-4-E2B_q4_0-it",
+    "subdir": "gemma-4-E2B_q4_0-it",
+    "bytes": 3349516256,
+    "size": "3.1 GB",
+    "modified": "2026-09-25 14:30",
+    "mtime": 1790346615.0907586,
+    "sharded": false,
+    "parts": 1,
+    "companion": false,
+    "projector": {
+     "name": "gemma-4-E2B-it-mmproj.gguf",
+     "bytes": 986833664
+    },
+    "sections": [
+     "gemma-4-E2B_q4_0-it"
+    ],
+    "modelId": "gemma-4-E2B_q4_0-it",
+    "file": "gemma-4-E2B_q4_0-it/gemma-4-E2B_q4_0-it.gguf",
+    "shape": {
+     "arch": "gemma4",
+     "moe": false,
+     "experts": 0,
+     "active": 0,
+     "label": "dense"
+    },
+    "loadedOn": [],
+    "fit": [
+     {
+      "name": "cowork-llama-1",
+      "vram_gb": 14,
+      "verdict": "fits",
+      "ratio_pct": 22
+     },
+     {
+      "name": "cowork-embed-1",
+      "vram_gb": 21,
+      "verdict": "fits",
+      "ratio_pct": 15,
+      "is_cpu": true
+     }
+    ],
+    "badges": []
+   },
+   {
+    "key": "gemma-4-E4B-it-qat-UD-Q4_K_XL/gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf",
+    "name": "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf",
+    "stem": "gemma-4-E4B-it-qat-UD-Q4_K_XL",
+    "subdir": "gemma-4-E4B-it-qat-UD-Q4_K_XL",
+    "bytes": 4215695776,
+    "size": "3.9 GB",
+    "modified": "2026-09-17 15:30",
+    "mtime": 1789659013.8785684,
+    "sharded": false,
+    "parts": 1,
+    "companion": false,
+    "projector": {
+     "name": "mmproj-BF16.gguf",
+     "bytes": 991552320
+    },
+    "sections": [
+     "gemma-4-E4B-it-qat-UD-Q4_K_XL"
+    ],
+    "modelId": "gemma-4-E4B-it-qat-UD-Q4_K_XL",
+    "file": "gemma-4-E4B-it-qat-UD-Q4_K_XL/gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf",
+    "shape": {
+     "arch": "gemma4",
+     "moe": false,
+     "experts": 0,
+     "active": 0,
+     "label": "dense"
+    },
+    "loadedOn": [],
+    "fit": [
+     {
+      "name": "cowork-llama-1",
+      "vram_gb": 14,
+      "verdict": "fits",
+      "ratio_pct": 28
+     },
+     {
+      "name": "cowork-embed-1",
+      "vram_gb": 21,
+      "verdict": "fits",
+      "ratio_pct": 19,
+      "is_cpu": true
+     }
+    ],
+    "badges": []
+   },
+   {
+    "key": "nomic-embed-text-v1/nomic-embed-text-v1.Q8_0.gguf",
+    "name": "nomic-embed-text-v1.Q8_0.gguf",
+    "stem": "nomic-embed-text-v1.Q8_0",
+    "subdir": "nomic-embed-text-v1",
+    "bytes": 146146432,
+    "size": "139.4 MB",
+    "modified": "2026-09-28 23:37",
+    "mtime": 1790638641.7048883,
+    "sharded": false,
+    "parts": 1,
+    "companion": false,
+    "projector": null,
+    "sections": [
+     "nomic-embed-text-v1"
+    ],
+    "modelId": "nomic-embed-text-v1",
+    "file": "nomic-embed-text-v1/nomic-embed-text-v1.Q8_0.gguf",
+    "shape": {
+     "arch": "nomic-bert",
+     "moe": false,
+     "experts": 0,
+     "active": 0,
+     "label": "dense"
+    },
+    "loadedOn": [
+     "cowork-embed-1"
+    ],
+    "fit": [
+     {
+      "name": "cowork-llama-1",
+      "vram_gb": 14,
+      "verdict": "fits",
+      "ratio_pct": 1
+     },
+     {
+      "name": "cowork-embed-1",
+      "vram_gb": 21,
+      "verdict": "fits",
+      "ratio_pct": 1,
+      "is_cpu": true
+     }
+    ],
+    "badges": []
+   },
+   {
+    "key": "qwen3-reranker-0.6b/qwen3-reranker-0.6b-q8_0.gguf",
+    "name": "qwen3-reranker-0.6b-q8_0.gguf",
+    "stem": "qwen3-reranker-0.6b-q8_0",
+    "subdir": "qwen3-reranker-0.6b",
+    "bytes": 639153184,
+    "size": "609.5 MB",
+    "modified": "2026-09-28 23:57",
+    "mtime": 1790639852.4284835,
+    "sharded": false,
+    "parts": 1,
+    "companion": false,
+    "projector": null,
+    "sections": [
+     "qwen3-reranker-0.6b-q8_0"
+    ],
+    "modelId": "qwen3-reranker-0.6b-q8_0",
+    "file": "qwen3-reranker-0.6b/qwen3-reranker-0.6b-q8_0.gguf",
+    "shape": {
+     "arch": "qwen3",
+     "moe": false,
+     "experts": 0,
+     "active": 0,
+     "label": "dense"
+    },
+    "loadedOn": [],
+    "fit": [
+     {
+      "name": "cowork-llama-1",
+      "vram_gb": 14,
+      "verdict": "fits",
+      "ratio_pct": 4
+     },
+     {
+      "name": "cowork-embed-1",
+      "vram_gb": 21,
+      "verdict": "fits",
+      "ratio_pct": 3,
+      "is_cpu": true
+     }
+    ],
+    "badges": []
+   },
+   {
+    "key": "Qwen3.5-4B-UD-Q8_K_XL/Qwen3.5-4B-UD-Q8_K_XL.gguf",
+    "name": "Qwen3.5-4B-UD-Q8_K_XL.gguf",
+    "stem": "Qwen3.5-4B-UD-Q8_K_XL",
+    "subdir": "Qwen3.5-4B-UD-Q8_K_XL",
+    "bytes": 6065971520,
+    "size": "5.6 GB",
+    "modified": "2026-09-21 12:49",
+    "mtime": 1789994987.7437944,
+    "sharded": false,
+    "parts": 1,
+    "companion": false,
+    "projector": {
+     "name": "mmproj-BF16.gguf, mmproj-F16.gguf, mmproj-F32.gguf",
+     "bytes": 2682067648
+    },
+    "sections": [
+     "Qwen3.5-4B-UD-Q8_K_XL"
+    ],
+    "modelId": "Qwen3.5-4B-UD-Q8_K_XL",
+    "file": "Qwen3.5-4B-UD-Q8_K_XL/Qwen3.5-4B-UD-Q8_K_XL.gguf",
+    "shape": {
+     "arch": "qwen35",
+     "moe": false,
+     "experts": 0,
+     "active": 0,
+     "label": "dense"
+    },
+    "loadedOn": [],
+    "fit": [
+     {
+      "name": "cowork-llama-1",
+      "vram_gb": 14,
+      "verdict": "fits",
+      "ratio_pct": 40
+     },
+     {
+      "name": "cowork-embed-1",
+      "vram_gb": 21,
+      "verdict": "fits",
+      "ratio_pct": 27,
+      "is_cpu": true
+     }
+    ],
+    "badges": []
+   },
+   {
+    "key": "Qwen3.5-9B-UD-Q4_K_XL/Qwen3.5-9B-UD-Q4_K_XL.gguf",
+    "name": "Qwen3.5-9B-UD-Q4_K_XL.gguf",
+    "stem": "Qwen3.5-9B-UD-Q4_K_XL",
+    "subdir": "Qwen3.5-9B-UD-Q4_K_XL",
+    "bytes": 6135034208,
+    "size": "5.7 GB",
+    "modified": "2026-09-21 13:26",
+    "mtime": 1789997210.339381,
+    "sharded": false,
+    "parts": 1,
+    "companion": false,
+    "projector": {
+     "name": "mmproj-BF16.gguf, mmproj-F16.gguf, mmproj-F32.gguf",
+     "bytes": 3663932832
+    },
+    "sections": [
+     "Qwen3.5-9B-UD-Q4_K_XL"
+    ],
+    "modelId": "Qwen3.5-9B-UD-Q4_K_XL",
+    "file": "Qwen3.5-9B-UD-Q4_K_XL/Qwen3.5-9B-UD-Q4_K_XL.gguf",
+    "shape": {
+     "arch": "qwen35",
+     "moe": false,
+     "experts": 0,
+     "active": 0,
+     "label": "dense"
+    },
+    "loadedOn": [],
+    "fit": [
+     {
+      "name": "cowork-llama-1",
+      "vram_gb": 14,
+      "verdict": "fits",
+      "ratio_pct": 41
+     },
+     {
+      "name": "cowork-embed-1",
+      "vram_gb": 21,
+      "verdict": "fits",
+      "ratio_pct": 27,
+      "is_cpu": true
+     }
+    ],
+    "badges": []
+   }
+  ],
+  "unregistered": [],
+  "revision": "41da90dd68ace0d50012a9b04c06c249b19342ae74570f0e159c75cff4c95d34"
+ }
+}
