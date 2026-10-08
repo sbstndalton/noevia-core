@@ -134,7 +134,9 @@ test('fail closed: a missing module, a refusal or a reply the JS would not accep
     assert.deepStrictEqual(quiet(() => mcp.parseEnabledToolboxes({ ENABLED_TOOLBOXES: 'a', MCP_SERVERS_IMPL: 'wasm' })), new Set());
     const offered = quiet(() => mcp.createToolboxOffered(new Set(['a']), { impl: 'wasm' }));
     assert.equal(quiet(() => offered('a')), false);
-    assert.equal(quiet(() => offered('core')), false);
+    // core and dir-* stay offered exactly as the JS offers them, whatever the port does.
+    assert.equal(quiet(() => offered('core')), true);
+    assert.equal(quiet(() => offered('dir-x')), true);
     assert.throws(() => davParseWasm.verifyAtStartup({ MCP_SERVERS_IMPL: 'wasm', DAV_PARSE_WASM: process.env.DAV_PARSE_WASM }), /MCP_SERVERS_IMPL/);
   } finally {
     if (saved === undefined) delete process.env.DAV_PARSE_WASM; else process.env.DAV_PARSE_WASM = saved;
@@ -157,12 +159,69 @@ test('fail closed: a missing module, a refusal or a reply the JS would not accep
   for (const [i, servers] of bad.entries()) assert.deepStrictEqual(quiet(() => mcp.parseMcpServers(benv, stub(servers))), [], `bad reply ${i}`);
   // A good reply passes through, and a bearer warning is printed only when its variable is unset.
   const good = stub([{ id: 'a', url: 'http://h.example', auth: 'bearer', tokenEnv: 'TOK' }], [{ bearer: 'TOK', id: 'a' }]);
-  const unset = capture(() => mcp.parseMcpServers(benv, good));
+  const genv = { ...benv, MCP_SERVERS: 'a|http://h.example|bearer:TOK' };
+  const unset = capture(() => mcp.parseMcpServers(genv, good));
   assert.deepStrictEqual(unset.value, [{ id: 'a', url: 'http://h.example', auth: 'bearer', tokenEnv: 'TOK' }]);
   assert.equal(unset.warnings.length, 1);
-  assert.equal(capture(() => mcp.parseMcpServers({ ...benv, TOK: 'synthetic' }, good)).warnings.length, 0);
+  assert.equal(capture(() => mcp.parseMcpServers({ ...genv, TOK: 'synthetic' }, good)).warnings.length, 0);
+  // The same bearer reply against an operator entry that asked for none is an upgrade: nothing.
+  assert.deepStrictEqual(quiet(() => mcp.parseMcpServers(benv, good)), []);
   // A value that is not a string is a fault, never a guess.
   assert.deepStrictEqual(quiet(() => mcp.parseMcpServers({ MCP_SERVERS: 5, MCP_SERVERS_IMPL: 'wasm' }, good)), []);
+});
+
+test('list mode binds every returned server to its operator entry, auth included (#1113)', () => {
+  const quiet = (fn) => capture(fn).value;
+  const stub = (servers) => ({ wasmLoader: () => ({ mcpServersParse: () => ({ servers, warnings: [] }) }) });
+  const env = { MCP_SERVERS: ' a | http://h.example | none , b|http://k.example|bearer:TOK_A, c|http://c.example|nextcloud', MCP_SERVERS_IMPL: 'wasm' };
+  const honest = [
+    { id: 'a', url: 'http://h.example', auth: 'none' },
+    { id: 'b', url: 'http://k.example', auth: 'bearer', tokenEnv: 'TOK_A' },
+    { id: 'c', url: 'http://c.example', auth: 'nextcloud' },
+  ];
+  assert.deepStrictEqual(quiet(() => mcp.parseMcpServers(env, stub(honest))), honest);
+  // A dropped server is fine: the port may configure less, never more.
+  assert.deepStrictEqual(quiet(() => mcp.parseMcpServers(env, stub([honest[2]]))), [honest[2]]);
+  const forged = [
+    [{ id: 'a', url: 'http://h.example', auth: 'nextcloud' }], // none upgraded to the user's password
+    [{ id: 'b', url: 'http://k.example', auth: 'bearer', tokenEnv: 'TOK_B' }], // another secret
+    [{ id: 'b', url: 'http://k.example', auth: 'none' }], // downgraded
+    [{ id: 'a', url: 'http://c.example', auth: 'nextcloud' }], // URL moved to another id
+    [{ id: 'x', url: 'http://h.example', auth: 'none' }], // id invented
+    [{ id: 'a', url: 'http://h.example', auth: 'none' }, { id: 'c', url: 'http://k.example', auth: 'nextcloud' }],
+  ];
+  for (const [i, servers] of forged.entries()) assert.deepStrictEqual(quiet(() => mcp.parseMcpServers(env, stub(servers))), [], `forged reply ${i}`);
+  // Same id and URL twice: the JS takes the first, so only the first entry's auth binds.
+  const twice = { MCP_SERVERS: 'a|http://h.example|none,a|http://h.example|nextcloud', MCP_SERVERS_IMPL: 'wasm' };
+  assert.deepStrictEqual(quiet(() => mcp.parseMcpServers(twice, stub([{ id: 'a', url: 'http://h.example', auth: 'none' }]))), [{ id: 'a', url: 'http://h.example', auth: 'none' }]);
+  assert.deepStrictEqual(quiet(() => mcp.parseMcpServers(twice, stub([{ id: 'a', url: 'http://h.example', auth: 'nextcloud' }]))), []);
+  // An id is derived as the JS derives it (characters dropped, 40 at most).
+  const long = 'q'.repeat(45);
+  const derived = { MCP_SERVERS: `a.b!|http://h.example|none,${long}|http://l.example|none`, MCP_SERVERS_IMPL: 'wasm' };
+  const ok = [{ id: 'ab', url: 'http://h.example', auth: 'none' }, { id: 'q'.repeat(40), url: 'http://l.example', auth: 'none' }];
+  assert.deepStrictEqual(quiet(() => mcp.parseMcpServers(derived, stub(ok))), ok);
+});
+
+test('wasm toolboxOffered: core and dir-* survive setup and per-id faults, never asking the port (#1114)', () => {
+  const quiet = (fn) => capture(fn).value;
+  let calls = 0;
+  const throwing = { wasmLoader: () => { calls++; throw Object.assign(new Error('boom'), { reason: 'throws' }); } };
+  const perId = quiet(() => mcp.createToolboxOffered(new Set(['a']), { impl: 'wasm', ...throwing }));
+  assert.equal(perId('core'), true);
+  assert.equal(perId('dir-anything'), true);
+  assert.equal(calls, 0);
+  assert.equal(quiet(() => perId('a')), false);
+  assert.equal(calls, 1);
+  // A setup fault (ENABLED_TOOLBOXES not a set of strings) still offers core and dir-*, and nothing else.
+  const setup = quiet(() => mcp.createToolboxOffered(new Set([5]), { impl: 'wasm', ...throwing }));
+  assert.equal(setup('core'), true);
+  assert.equal(setup('dir-x'), true);
+  assert.equal(quiet(() => setup('a')), false);
+  assert.equal(quiet(() => setup(5)), false);
+  assert.equal(calls, 1);
+  // Same answers as the JS for core and dir-* under any filter.
+  const js = mcp.createToolboxOfferedJs(new Set(['a']));
+  for (const id of ['core', 'dir-', 'dir-x']) assert.equal(perId(id), js(id), id);
 });
 
 test('reply checks and caps', { skip: skipWasm }, () => {

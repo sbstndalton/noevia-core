@@ -182,14 +182,48 @@ const ID_RE = /^[a-zA-Z0-9_-]{1,40}$/;
 const TOKEN_ENV_RE = /^[A-Z0-9_]+$/;
 const AUTHS = new Set(['none', 'nextcloud', 'internal', 'bearer']);
 
+/** The auth an MCP_SERVERS field asks for, as parseMcpServersJs reads it (`none` for anything else). */
+function rawAuthOf(rawAuth) {
+  if (rawAuth === 'internal' || rawAuth === 'nextcloud') return { auth: rawAuth, tokenEnv: null };
+  if (rawAuth && rawAuth.startsWith('bearer:')) {
+    const envName = rawAuth.slice('bearer:'.length).trim();
+    if (TOKEN_ENV_RE.test(envName)) return { auth: 'bearer', tokenEnv: envName };
+  }
+  return { auth: 'none', tokenEnv: null };
+}
+
+/** MCP_SERVERS split exactly as parseMcpServersJs splits it: `${id}|${url}` → the auths its entries ask for. */
+function operatorEntries(list) {
+  const byKey = new Map();
+  for (const entry of list.split(',').map((e) => e.trim()).filter(Boolean)) {
+    const [rawId, rawUrl, rawAuth] = entry.split('|').map((x) => (x || '').trim());
+    const id = (rawId || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40);
+    if (!id || !rawUrl) continue;
+    const key = `${id}|${rawUrl}`;
+    if (!byKey.has(key)) byKey.set(key, []);
+    byKey.get(key).push(rawAuthOf(rawAuth));
+  }
+  return byKey;
+}
+
 /** What the port returned, held to the JS's own rules again: never more than the JS accepts. */
 function checkServers(servers, list, single) {
+  // Each returned server must be an operator entry, auth and token variable included: the port may
+  // drop a server but never invent one, move a URL to another id, or change its credentials.
+  const entries = list ? operatorEntries(list) : null;
   const ids = new Set();
   let internal = 0;
   return servers.map((sv) => {
     if (!ID_RE.test(sv.id) || ids.has(sv.id) || typeof sv.url !== 'string' || !AUTHS.has(sv.auth)) throw fault('mcp server reply has an unexpected server');
     ids.add(sv.id);
-    if (list ? !list.includes(sv.url) : (sv.id !== 'nextcloud' || sv.auth !== 'nextcloud' || sv.url !== single.trim())) throw fault('mcp server reply has a server not in the environment');
+    if (list) {
+      const asked = entries.get(`${sv.id}|${sv.url}`);
+      // The JS takes the first entry with this id and URL; an earlier `internal` one may have been
+      // dropped (a second internal server), any other earlier one would have been taken.
+      const want = (a) => a.auth === sv.auth && a.tokenEnv === (sv.auth === 'bearer' ? sv.tokenEnv : null);
+      const at = asked ? asked.findIndex(want) : -1;
+      if (at < 0 || asked.slice(0, at).some((a) => a.auth !== 'internal')) throw fault('mcp server reply has a server not in the environment');
+    } else if (sv.id !== 'nextcloud' || sv.auth !== 'nextcloud' || sv.url !== single.trim()) throw fault('mcp server reply has a server not in the environment');
     let u;
     try { u = new URL(sv.url); } catch { throw fault('mcp server reply has an invalid URL'); }
     if (!['http:', 'https:'].includes(u.protocol) || u.username || u.password) throw fault('mcp server reply has a refused URL');
@@ -234,19 +268,26 @@ function parseEnabledToolboxes(env = process.env, { wasmLoader = defaultLoader }
 }
 
 /** toolboxOffered over `ENABLED_TOOLBOXES`; `opts.impl` pins 'js' or 'wasm' (tests), default
- *  MCP_SERVERS_IMPL when created. Through the port a fault (or an id that is not a string) is false. */
+ *  MCP_SERVERS_IMPL when created. core and dir-* are always offered; otherwise through the port a
+ *  fault (or an id that is not a string) is false. */
 function createToolboxOffered(ENABLED_TOOLBOXES, { impl, wasmLoader = defaultLoader } = {}) {
   if ((impl || mcpServersImpl()) !== 'wasm') return createToolboxOfferedJs(ENABLED_TOOLBOXES);
   let enabled;
+  let setupFault = false;
   try {
     if (!ENABLED_TOOLBOXES) enabled = null;
     else if (ENABLED_TOOLBOXES instanceof Set && [...ENABLED_TOOLBOXES].every((x) => typeof x === 'string')) enabled = [...ENABLED_TOOLBOXES];
     else throw fault('ENABLED_TOOLBOXES is not a set of strings', 'input');
   } catch (err) {
     warnFault(err);
-    return () => false;
+    setupFault = true;
   }
   return function toolboxOffered(id) {
+    // core and dir-* are offered exactly as the JS offers them, before the port is asked: no fault
+    // there (setup or per id) can take them away.
+    if (id === 'core') return true;
+    if (typeof id === 'string' && id.startsWith('dir-')) return true;
+    if (setupFault) return false;
     try {
       if (typeof id !== 'string') throw fault('toolbox id is not a string', 'input');
       return wasmLoader().mcpToolboxOffered(enabled, id);
