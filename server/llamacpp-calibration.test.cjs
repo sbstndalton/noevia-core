@@ -5,7 +5,7 @@ const {ladder}=require('./llamacpp-calibration.cjs');
 
 // Synthetic llama.cpp router: a model loads only while its preset context is at or below
 // `loadCap`, and recalls the start marker only at or below `longCap`.
-function fixture(t,{loadCap=40960,longCap=Infinity,native=131072,memory=()=>20,other=false,onLoad,speed=100000,presetWriter}={}){
+function fixture(t,{loadCap=40960,longCap=Infinity,native=131072,memory=()=>20,other=false,onLoad,speed=100000,presetWriter,extra={}}={}){
   const dir=fs.mkdtempSync(path.join(os.tmpdir(),'calibration-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
   const ini=path.join(dir,'models.ini'),stateFile=path.join(dir,'state.json');
   const original='version = 1\n[*]\ncache-type-k = q8_0\n[synthetic]\n; operator note stays\nmodel = /models/s.gguf\nc = 8192\nparallel = 1\n[other]\nc = 4096\n';
@@ -56,7 +56,7 @@ function fixture(t,{loadCap=40960,longCap=Infinity,native=131072,memory=()=>20,o
     });
     return new Response(readable,{status:200});
   };
-  const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',presetPath:ini,fetchJson,fetchStream,calibrationStatePath:stateFile,autoconfig:{},presetWriter,calibrationOptions:{sleep:async()=>{},readMemory:memory,now:()=>clock.t,timeouts:{memoryPoll:5}}});
+  const manager=createModelManager({kind:'llamacpp',baseUrl:'http://synthetic',presetPath:ini,fetchJson,fetchStream,calibrationStatePath:stateFile,autoconfig:{},presetWriter,calibrationOptions:{sleep:async()=>{},readMemory:memory,now:()=>clock.t,timeouts:{memoryPoll:5},...extra}});
   return {manager,ini,stateFile,original,router,ctxOf};
 }
 async function finished(manager){for(let i=0;i<2000;i++){const job=manager.calibration.status().body.job;if(job&&job.status!=='running')return job;await new Promise(r=>setImmediate(r));}throw Error('calibration did not finish');}
@@ -134,6 +134,36 @@ test('chat pauses with an explanation for the whole run and resumes afterwards',
   assert.equal((await manager.calibration.start('synthetic',{promptBudgetSeconds:120,confirmPause:true})).status,409);
   release();await finished(manager);
   const leave=manager.enterInference();leave();
+});
+
+test('#1062 with a foreignWait hook (auto-tune), another client\'s model is waited for and the step repeated, not failed',async t=>{
+  let fired=false;const waits=[];
+  const fx=fixture(t,{onLoad:(ctx,router)=>{if(ctx===16384&&!fired){fired=true;router.status.other='loaded';}},
+    // What auto-tune's wait ends with once the other model is idle: the router's own unload.
+    extra:{foreignWait:async error=>{waits.push(error.message);fx.router.status.other='unloaded';}}});
+  await fx.manager.calibration.start('synthetic',{promptBudgetSeconds:120,confirmPause:true});
+  const job=await finished(fx.manager);
+  assert.equal(job.status,'passed',job.error);
+  assert.deepEqual(waits,['Another client loaded a model during calibration. Stop Diary background jobs and other clients, then retry.']);
+  // One record per size: the interrupted attempt at 16384 was dropped and repeated.
+  const sizes=job.steps.filter(s=>s.kind==='load').map(s=>s.ctx);
+  assert.equal(new Set(sizes).size,sizes.length,JSON.stringify(sizes));
+  assert.ok(sizes.includes(16384));
+  // Exactly one load more at that size than an undisturbed run makes.
+  const control=fixture(t);
+  await control.manager.calibration.start('synthetic',{promptBudgetSeconds:120,confirmPause:true});
+  assert.equal((await finished(control.manager)).status,'passed');
+  assert.equal(fx.router.loads.filter(c=>c===16384).length,control.router.loads.filter(c=>c===16384).length+1);
+  assert.deepEqual(job.steps.map(s=>[s.kind,s.ctx,s.status]),(await finished(control.manager)).steps.map(s=>[s.kind,s.ctx,s.status]));
+});
+
+test('#1062 a foreignWait that gives up stops calibration as before',async t=>{
+  const {manager,ini,original}=fixture(t,{onLoad:(ctx,router)=>{if(ctx===16384)router.status.other='loaded';},
+    extra:{foreignWait:async()=>{throw Object.assign(Error('Another client kept using other for 15 min.'),{fatal:true,foreignTimeout:true});}}});
+  await manager.calibration.start('synthetic',{promptBudgetSeconds:120,confirmPause:true});
+  const job=await finished(manager);
+  assert.equal(job.status,'failed');assert.match(job.error,/kept using other/);assert.equal(job.restored,true);
+  assert.equal(fs.readFileSync(ini,'utf8'),original);
 });
 
 test('calibration will not start while requests are in flight',async t=>{

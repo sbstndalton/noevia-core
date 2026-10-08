@@ -15,6 +15,10 @@ const { ACTIONS } = require('./code-actions.cjs');
 const { pipelineView } = require('./auditor-report.cjs');
 
 const APPROVAL_TIMEOUT_MS = 5 * 60 * 1000;
+// #1062: the coding agent calls the engine itself, from the sandbox, so its requests never pass
+// noevia's maintenance gate. A task therefore holds the gate's inference lease for its whole run
+// (auto-tune and calibration wait for it, as for a chat request) and does not start while one runs.
+const INFERENCE_PAUSED = 'Coding tasks wait while noevia tunes or reconfigures models. Start this task when that finishes.';
 
 /**
  * Prompt preparation (spec §2). Direct is the default and the only one offered, and the others
@@ -92,7 +96,10 @@ function view(job, pending = null) {
 function createCodeService({ repos, connect, egress = null, engine = undefined, now = Date.now, log = () => {},
   timeoutMs = APPROVAL_TIMEOUT_MS, sandboxKind = process.env.CODE_HARNESS_ENDPOINT ? 'sandbox' : 'spawn',
   harnesses = defaultHarnesses(), treeRoot = process.env.CODE_WORKSPACE_ROOT || null,
-  harnessUser = parseUser(process.env.CODE_HARNESS_USER), sharedContext = () => '', review = null, pipeline = null }) {
+  harnessUser = parseUser(process.env.CODE_HARNESS_USER), sharedContext = () => '', review = null, pipeline = null,
+  // #1062: `{ enter(): release, paused(): boolean }`, the model manager's maintenance gate; null
+  // where there is no gate (a provider other than the native engine).
+  inference = null }) {
   // The pipeline (#705): `{ enabled(), create({ jobs, workspaces, harness, askApproval }) }`. It needs
   // the sandbox as well as its flag; anything less and the Planner preparation is simply not offered.
   const pipelineOn = () => {
@@ -117,10 +124,25 @@ function createCodeService({ repos, connect, egress = null, engine = undefined, 
     if (expired.size > 200) for (const [k, until] of expired) if (until <= now()) expired.delete(k);
   };
 
+  // Every task run, the executor's and the pipeline's, holds an inference lease until it ends.
+  // #1069: the lease is taken before jobs.run, so a refusal rejects run() itself and the caller's
+  // own catch gives the worktree and network grant back; the job is recorded as failed here.
+  const leased = (jobs) => (!inference ? jobs : { ...jobs, run: async (id, work) => {
+    let release;
+    try { release = inference.enter(); }
+    catch (error) {
+      const refusal = error?.status === 503 ? fail(503, INFERENCE_PAUSED) : error;
+      try { jobs.append(id, 'job.failed', { error: String(refusal.publicMessage || refusal.message).slice(0, 500) }); } catch { /* the rejection says it */ }
+      throw refusal;
+    }
+    try { return await jobs.run(id, work); } finally { release(); }
+  } });
+  const paused = () => { try { return inference?.paused?.() === true; } catch { return false; } };
+
   function storeFor(workspace) {
     let store = stores.get(workspace);
     if (!store) {
-      store = createJobs({ dir: workspace.dir, kinds: ['code'], maxJobs: 50, retainMs: 14 * 86400000, now });
+      store = leased(createJobs({ dir: workspace.dir, kinds: ['code'], maxJobs: 50, retainMs: 14 * 86400000, now }));
       store.recover();
       // With a sandbox the worktrees live on a volume mounted at the same path in both
       // containers, and are handed to the uid the harness runs as (noevia runs as root; the
@@ -227,6 +249,8 @@ function createCodeService({ repos, connect, egress = null, engine = undefined, 
       if (jobs.list({ projectId: project.id, kind: 'code', active: true }).length) {
         throw fail(409, 'This project already has a task running.');
       }
+      // Refused before anything is claimed: no job, worktree or network grant is left behind.
+      if (paused()) throw fail(503, INFERENCE_PAUSED);
       if (preparation.id === PLANNER_PREPARATION.id) {
         if (!pipelineRun) throw fail(409, 'The Planner pipeline is not set up on this server.');
         // Planner → Executor → verification → review → Auditor (#705), as one job. The person still
@@ -289,4 +313,4 @@ function defaultHarnesses(env = process.env) {
   return [{ id, label: labels[id] || id, version: env.CODE_HARNESS_VERSION || null }];
 }
 
-module.exports = { createCodeService, parseRepos, view, defaultHarnesses, parseUser, GRANTABLE, DEFAULT_CAPABILITIES, PROMPT_PREPARATION, PLANNER_PREPARATION, APPROVAL_TIMEOUT_MS };
+module.exports = { createCodeService, INFERENCE_PAUSED, parseRepos, view, defaultHarnesses, parseUser, GRANTABLE, DEFAULT_CAPABILITIES, PROMPT_PREPARATION, PLANNER_PREPARATION, APPROVAL_TIMEOUT_MS };

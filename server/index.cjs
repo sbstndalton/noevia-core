@@ -497,6 +497,12 @@ const codeService = require('./code-service.cjs').createCodeService({
   sharedContext: (workspace, project) => require('./shared-context.cjs').forCode(project, loadChats(project.id)),
   // Planner review (#519): see codeReview above.
   review: codeReview,
+  // #1062: the agent reaches the engine from the sandbox, outside the gate; a task holds the gate's
+  // inference lease while it runs, and none starts while auto-tune or calibration is active.
+  inference: typeof modelManager.enterInference === 'function' ? {
+    enter: () => modelManager.enterInference(),
+    paused: () => modelManager.tuningActive?.() === true,
+  } : null,
   pipeline: {
     enabled: () => features.enabled('codeHarness') && features.enabled('codePipeline'),
     create: ({ jobs, workspaces, harness, askApproval }) => createCodePipeline({ jobs, workspaces, harness, askApproval,

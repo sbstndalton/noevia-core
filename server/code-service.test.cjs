@@ -383,3 +383,93 @@ test('a task that fails with an approval waiting refuses it rather than leaving 
   assert.deepEqual(await ask, { outcome: 'selected', optionId: 'n' });
   assert.equal(svc.get(ws, project, started.taskId).approval, null);
 });
+
+// ── #1062: coding tasks and the maintenance gate ───────────────────────────────────────────────
+// The agent calls the engine from the sandbox, outside the gate; the task holds the gate's
+// inference lease for its whole run instead, and does not start while auto-tune holds the gate.
+const { createMaintenanceGate } = require('./inference-maintenance.cjs');
+const { INFERENCE_PAUSED } = require('./code-service.cjs');
+const gated = (gate, extra = {}, tuning = () => gate.held()) => service({ inference: { enter: () => gate.enter(), paused: tuning }, ...extra });
+
+test('#1062 a running coding task holds the inference lease: auto-tune waits for it, then gets the gate', async () => {
+  const gate = createMaintenanceGate();
+  let release;
+  const { svc, ws } = gated(gate, { connect: async () => ({ prompt: () => new Promise((r) => { release = () => r({ stopReason: 'end_turn' }); }) }) });
+  const started = await svc.start(ws, project, { repository: 'noevia', prompt: 'fix' });
+  for (let i = 0; i < 100 && !release; i++) await new Promise((r) => setTimeout(r, 5));
+  assert.ok(release, 'the agent is running');
+  await assert.rejects(() => gate.holdWhenIdle('tuning', { timeoutMs: 30 }), (e) => e.idleTimeout === true);
+  const holding = gate.holdWhenIdle('tuning', { timeoutMs: 2000 });
+  release();
+  const releaseGate = await holding;
+  assert.equal((await settle(svc, ws, started.taskId)).status, 'completed');
+  releaseGate();
+});
+
+test('#1062 no coding task starts while auto-tune holds the gate, and nothing is left claimed', async () => {
+  const gate = createMaintenanceGate();
+  let connects = 0;
+  const { svc, ws } = gated(gate, { connect: async () => { connects++; return { prompt: async () => ({ stopReason: 'end_turn' }) }; } });
+  const releaseGate = gate.hold('Chat is paused while noevia tunes synthetic: preparing.');
+  await assert.rejects(() => svc.start(ws, project, { repository: 'noevia', prompt: 'fix' }), (e) => e.status === 503 && e.publicMessage === INFERENCE_PAUSED);
+  assert.deepEqual(svc.list(ws, project), [], 'no job was created');
+  assert.equal(connects, 0);
+  releaseGate();
+  const started = await svc.start(ws, project, { repository: 'noevia', prompt: 'fix' });
+  assert.equal((await settle(svc, ws, started.taskId)).status, 'completed');
+});
+
+test('#1062 a tune that is active between models (gate briefly free) still refuses new tasks', async () => {
+  const gate = createMaintenanceGate();
+  const { svc, ws } = gated(gate, {}, () => true);
+  await assert.rejects(() => svc.start(ws, project, { repository: 'noevia', prompt: 'fix' }), (e) => e.status === 503);
+});
+
+test('#1062 a task that loses the race to auto-tune fails with the pause message and leaks no lease', async () => {
+  const gate = createMaintenanceGate();
+  let releaseGate = null;
+  // paused() says no, then the tune takes the gate before the run begins.
+  const { svc, ws } = gated(gate, {}, () => { if (!releaseGate) releaseGate = gate.hold('tuning'); return false; });
+  const started = await svc.start(ws, project, { repository: 'noevia', prompt: 'fix' });
+  const done = await settle(svc, ws, started.taskId);
+  assert.equal(done.status, 'failed');
+  assert.equal(done.error, INFERENCE_PAUSED);
+  releaseGate();
+  gate.hold('next')(); // nothing still counts as in flight
+  // #1069: the refusal gave the worktree back: the same task can start again on its branch.
+  releaseGate = () => {};
+  const again = await svc.start(ws, project, { repository: 'noevia', prompt: 'fix' });
+  assert.equal((await settle(svc, ws, again.taskId)).status, 'completed');
+});
+
+test('#1069 a lease refused at run time releases the claimed worktree and network grant', async () => {
+  const gate = createMaintenanceGate();
+  const released = [];
+  let refuse = true;
+  const egress = { endpoint: 'egress:3128', grant: () => ({ token: 't' }), revoke: (id) => released.push(id), activity: () => ({}) };
+  const { svc, ws } = service({ egress, inference: { enter: () => { if (refuse) throw Object.assign(Error('busy'), { status: 503 }); return gate.enter(); }, paused: () => false } });
+  const started = await svc.start(ws, project, { repository: 'noevia', prompt: 'fix', capabilities: ['read_file', 'network'], domains: ['x.test'] });
+  const done = await settle(svc, ws, started.taskId);
+  assert.equal(done.status, 'failed'); assert.equal(done.error, INFERENCE_PAUSED);
+  assert.deepEqual(released, [started.taskId], 'the network grant was revoked');
+  refuse = false;
+  const again = await svc.start(ws, project, { repository: 'noevia', prompt: 'fix' });
+  assert.equal((await settle(svc, ws, again.taskId)).status, 'completed');
+  gate.hold('idle')();
+});
+
+test('#1062 the lease is given back when a task fails or is cancelled', async () => {
+  const gate = createMaintenanceGate();
+  const failing = gated(gate, { connect: async () => { throw Object.assign(Error('The coding sandbox refused the connection.'), { publicMessage: 'The coding sandbox refused the connection.' }); } });
+  const a = await failing.svc.start(failing.ws, project, { repository: 'noevia', prompt: 'fix' });
+  assert.equal((await settle(failing.svc, failing.ws, a.taskId)).status, 'failed');
+  gate.hold('after failure')();
+  let started = false;
+  const hanging = gated(gate, { connect: async ({ signal }) => ({ prompt: () => new Promise((_, reject) => { started = true; signal.addEventListener('abort', () => reject(Object.assign(Error('Cancelled'), { publicMessage: 'The task was cancelled.' }))); }) }) });
+  const b = await hanging.svc.start(hanging.ws, project, { repository: 'noevia', prompt: 'fix' });
+  for (let i = 0; i < 100 && !started; i++) await new Promise((r) => setTimeout(r, 5));
+  assert.throws(() => gate.hold('while running'), (e) => e.status === 409);
+  hanging.svc.cancel(hanging.ws, project, b.taskId);
+  assert.equal((await settle(hanging.svc, hanging.ws, b.taskId)).status, 'cancelled');
+  gate.hold('after cancel')();
+});

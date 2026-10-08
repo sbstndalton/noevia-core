@@ -44,6 +44,11 @@ function createCalibrator(deps) {
     memoryFloorGib = 2,
     onResult = () => {},
     onUpdate = () => {}, onWrite = () => {},
+    // #1062: set by auto-tune only. Called with the error this calibrator would throw when another
+    // client has a model live; resolves once it may go on (the step is then repeated) or throws.
+    foreignWait = null,
+    // #1067: which live rows only foreignWait may stop (auto-tune's rule); unset, every live other.
+    foreignHeld = null,
     sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
     now = () => Date.now(),
     timeouts = {},
@@ -105,13 +110,38 @@ function createCalibrator(deps) {
     }
     return false;
   }
+  // #1062: a step that met another client's model and waited for it; run() repeats it.
+  const REPEAT = Symbol('repeat step');
+  const othersLive = async model => { try { return loadedOthers(await listing(), model).length > 0; } catch { return false; } };
   async function unloadAll(except) {
+    for (;;) {
+      try { return await unloadAllOnce(except); }
+      catch (e) {
+        if (!foreignWait || e.fatal || !(await othersLive(except ?? state.job?.model))) throw e;
+        await foreignWait(e);
+      }
+    }
+  }
+  async function unloadAllOnce(except) {
     const models = await listing();
-    for (const m of models) if (m.id !== except && ['loaded', 'loading'].includes(m.status?.value)) await request('/models/unload', { method: 'POST', body: JSON.stringify({ model: m.id }) }, limits.unload).catch(() => {});
+    const asked = new Set(), gone = new Set(), own = except ?? state.job?.model;
+    // #1067 (auto-tune only): never stop another client's live model here; foreignWait decides.
+    if (foreignWait) {
+      const live = models.filter(m => m.id !== own && ['loaded', 'loading', 'sleeping'].includes(m.status?.value));
+      const held = live.length && foreignHeld ? await foreignHeld(models) : live.map(m => m.id);
+      if (held.length) throw Error('Another client has a model loaded.');
+    }
+    for (const m of models) if (m.id !== except && ['loaded', 'loading'].includes(m.status?.value)) { asked.add(m.id); await request('/models/unload', { method: 'POST', body: JSON.stringify({ model: m.id }) }, limits.unload).catch(() => {}); }
     const deadline = now() + limits.unload;
     while (now() < deadline) {
       const rows = await listing();
       if (!rows.some(m => m.id !== except && m.status?.value !== 'unloaded')) return;
+      // #1062 (auto-tune only): another client loading a model again is not a slow unload.
+      if (foreignWait) {
+        for (const m of rows) if (m.status?.value === 'unloaded') gone.add(m.id);
+        if (rows.some(m => m.id !== own && ['loaded', 'loading'].includes(m.status?.value) && (m.status.value === 'loading' || gone.has(m.id) || !asked.has(m.id))))
+          throw Error('Another client loaded a model while models were unloading.');
+      }
       await sleep(limits.poll);
     }
     throw Error('Models did not unload in time.');
@@ -257,8 +287,18 @@ function createCalibrator(deps) {
     return { ok: true, text, promptTokens, promptPerSecond, promptSeconds: Math.round(tookMs / 100) / 10 };
   }
 
-  // One measured step: write the context, load, and test. Returns true when it passed.
+  // One measured step, repeated when it met another client's model and waited for it (#1062): the
+  // record of the interrupted attempt is dropped, so the step list shows one result per size.
   async function step(job, ctx, kind) {
+    for (;;) {
+      const before = job.steps.length;
+      const passed = await stepOnce(job, ctx, kind);
+      if (passed !== REPEAT) return passed;
+      job.steps.splice(before); save();
+    }
+  }
+  // One measured step: write the context, load, and test. Returns true when it passed.
+  async function stepOnce(job, ctx, kind) {
     if (cancelRequested) throw Object.assign(Error('cancelled'), { cancelled: true });
     const record = { ctx, kind, status: 'running', startedAt: now() };
     job.steps.push(record); job.phase = kind === 'long' ? `Long-prompt test at ${ctx.toLocaleString('en-US')} tokens` : `Loading at ${ctx.toLocaleString('en-US')} tokens`;
@@ -292,15 +332,27 @@ function createCalibrator(deps) {
         if (!memory.check() || record.memoryFloorHit) return finish('failed', `Available memory fell below ${memoryFloorGib} GiB.`, 'oom');
         if (now() > deadline) return finish('failed', 'Loading did not finish in time.', 'timeout');
         const rows = await listing(controller.signal).catch(e => { if (record.memoryFloorHit) return []; throw e; });
-        if (loadedOthers(rows, job.model).length) throw Object.assign(Error('Another client loaded a model during calibration. Stop Diary background jobs and other clients, then retry.'), { fatal: true });
+        if (loadedOthers(rows, job.model).length) {
+          const error = Object.assign(Error('Another client loaded a model during calibration. Stop Diary background jobs and other clients, then retry.'), { fatal: true });
+          if (!foreignWait) throw error;
+          await foreignWait(error);
+          return REPEAT;
+        }
         const row = rows.find(m => m.id === job.model);
         if (row?.status?.value === 'loaded') { if (!memory.check()) return finish('failed', `Available memory fell below ${memoryFloorGib} GiB.`, 'oom'); break; }
         if (!row || row.status?.failed || row.status?.value === 'unloaded') return finish('failed', 'The model failed to load at this size.', 'load', { exitCode: row?.status?.exit_code, text: '' });
         await sleep(limits.poll);
       }
+      // #1062: a failure while another client had its model live is not this size's failure.
+      const repeatIfForeign = async () => {
+        if (!foreignWait || !(await othersLive(job.model))) return false;
+        await foreignWait(Object.assign(Error('Another client loaded a model during calibration.'), { fatal: true }));
+        return true;
+      };
       if (kind === 'load') {
         const smoke = await chat(job.model, { messages: [{ role: 'user', content: 'Reply with the single word OK.' }], max_tokens: 16 }, limits.smoke, controller.signal);
         if (record.memoryFloorHit) return finish('failed', `Available memory fell below ${memoryFloorGib} GiB.`, 'oom');
+        if (!(smoke.ok && Array.isArray(smoke.body?.choices)) && await repeatIfForeign()) return REPEAT;
         return smoke.ok && Array.isArray(smoke.body?.choices) ? finish('passed') : finish('failed', 'The loaded model did not answer a short request.', 'load');
       }
       // Near-capacity recall test against the per-slot window, streamed so progress can
@@ -314,6 +366,7 @@ function createCalibrator(deps) {
       const budgetMs = job.promptBudgetSeconds * 1000;
       const result = await streamLong(job.model, `Remember the start marker: ${marker}.\n${PAD.repeat(repeats)}\nReturn only the start marker.`, controller, record, budgetMs, job.evidenceWanted === true);
       if (record.memoryFloorHit) return finish('failed', `Available memory fell below ${memoryFloorGib} GiB.`, 'oom');
+      if (!result.ok && !result.overBudget && await repeatIfForeign()) return REPEAT;
       if (result.overBudget) return finish('failed', result.predicted
         ? `Filling this context would take about ${Math.ceil(result.etaMs / 1000)} s, over the ${job.promptBudgetSeconds} s limit.`
         : `Filling this context took ${Math.ceil(result.etaMs / 1000)} s, over the ${job.promptBudgetSeconds} s limit.`, 'time');

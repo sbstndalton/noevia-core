@@ -8,7 +8,7 @@ const { QUALITY, qualityCheck, qualityFailure, newModel } = require('./llamacpp-
 // #1057: the fake engine's f16 quirks (failLoadF16, badF16, the shorter recall) hold for both
 // unquantized cache types, bf16 being the first candidate now.
 const unq = o => ['bf16', 'f16'].includes(o['cache-type-k']);
-function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnload, badQ4 = true, badF16 = false, noHead = false, rejectAll = false, rejectModel = '', badBatch = false, failFinal = false, formattedQuality = false, reasoningOnly = false, truncatedWorkloads = false, idleTimeoutMs = 300000, loseIdentityAfterStart = false, reloadFail = false, unloadPolls = 0, unloadStuck = false, answerFor = null, failLoadF16 = false, failLoadBf16 = false, httpFor = null, chatTemplate = null, servingFor = null, servingChecks = null, autotuneExtra = {}, onLoad = null, loadHang = null, calibrationExtra = {}, loadReply = null, streamReply = null } = {}) {
+function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnload, badQ4 = true, badF16 = false, noHead = false, rejectAll = false, rejectModel = '', badBatch = false, failFinal = false, formattedQuality = false, reasoningOnly = false, truncatedWorkloads = false, idleTimeoutMs = 300000, loseIdentityAfterStart = false, reloadFail = false, unloadPolls = 0, unloadStuck = false, answerFor = null, failLoadF16 = false, failLoadBf16 = false, httpFor = null, chatTemplate = null, servingFor = null, servingChecks = null, autotuneExtra = {}, onLoad = null, loadHang = null, calibrationExtra = {}, loadReply = null, streamReply = null, metricsFor = null, strictUnload = false, onReload = null } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'full-tune-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const ini = path.join(dir, 'models.ini'), stateFile = path.join(dir, 'tune.json');
@@ -21,13 +21,17 @@ function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnl
   const fetchJson = async (url, opts = {}) => {
     const u = new URL(url), b = opts.body ? JSON.parse(opts.body) : {};
     if (opts.signal?.aborted) throw Error('aborted');
-    if (u.pathname === '/models' && u.searchParams.has('reload')) return { ok: !reloadFail, body: {} };
+    if (u.pathname === '/models' && u.searchParams.has('reload')) { onReload?.({ status: { ...status } }); return { ok: !reloadFail, body: {} }; }
     if (u.pathname === '/models') return { ok: true, body: { data: Object.entries(status).map(([id, value]) => {
       if (value === 'unloading' && !unloadStuck && --unloading[id] <= 0) status[id] = value = 'unloaded';
       return { id, status: { value, args: id === 'embed' ? ['--embedding'] : [] }, meta: { n_ctx_train: 16384 } };
     }) } };
     if (u.pathname === '/models/load') { onLoad?.({ ...options(b.model) }); const refused = loadReply?.(options(b.model)); if (refused) return refused; if (loadHang?.(options(b.model))) { status[b.model] = 'loading'; return { ok: true, body: {} }; } status[b.model] = (failLoadF16 && unq(options(b.model))) || (options(b.model)['cache-type-k'] === 'bf16' && (failLoadBf16 === true || (typeof failLoadBf16 === 'function' && failLoadBf16(options(b.model))))) ? 'unloaded' : 'loaded'; return { ok: true, body: {} }; }
+    // Like the router: unloading a model that is not running is refused.
+    if (u.pathname === '/models/unload' && strictUnload && !['loaded', 'loading'].includes(status[b.model])) return { ok: false, status: 404, body: { error: 'model is not running' } };
     if (u.pathname === '/models/unload') { status[b.model] = unloadPolls || unloadStuck ? 'unloading' : 'unloaded'; unloading[b.model] = unloadPolls; onUnload?.({ manager, model: b.model }); return { ok: true, body: {} }; }
+    // #1062: llamacpp:requests_processing per model, when a test sets it.
+    if (u.pathname === '/metrics' && metricsFor) { const text = metricsFor(u.searchParams.get('model')); return text == null ? { ok: false, status: 503, body: {} } : { ok: true, body: text }; }
     if (u.pathname === '/tokenize') return { ok: true, body: { tokens: Array(600).fill(1) } };
     if (u.pathname === '/props') return { ok: true, body: { build_info: build, ...(chatTemplate ? { chat_template: chatTemplate } : {}) } };
     if (u.pathname === '/v1/chat/completions') {
@@ -1539,4 +1543,242 @@ test('#1058 js order: no f16 retry when the estimate says bf16 does not fit the 
   await g.manager.autotune.start('synthetic', { confirmPause: true });
   const k = await finished(g.manager);
   assert.deepEqual(phase(k.models[0], 'kv').steps.map(s => s.id), ['bf16', 'f16', 'q8_0']);
+});
+
+// ── #1062: another router client loads its own model mid-tune ─────────────────────────────────
+// The decision is Rust's tune_contention (dav-parse.wasm) when the module is built, otherwise the
+// independent JS reference the shared fixtures come from; skipped when neither is here.
+const contentionImpl = (() => {
+  const wasm = require('./dav-parse-wasm.cjs');
+  if (fs.existsSync(process.env.DAV_PARSE_WASM || wasm.DEFAULT_WASM)) return { name: 'wasm', decide: req => wasm.tuneContention(req) };
+  const ref = path.join(__dirname, '../tools/gen-tune-contention-fixtures.cjs');
+  return fs.existsSync(ref) ? { name: 'js-reference', decide: require(ref).refDecide } : null;
+})();
+const skipContention = !contentionImpl && 'no tune_contention implementation here';
+const foreignOptions = (extra = {}) => ({ contention: contentionImpl?.decide, foreignQuietMs: 5, foreignPollMs: 1, foreignWaitMs: 60000, ...extra });
+const logText = j => (j.log || []).map(l => l.text).join('\n');
+
+test('#1062 a client that evicts the tuned model mid-tune is waited for, then tuning resumes and passes', { skip: skipContention }, async t => {
+  let busy = 0, injected = false, metricsReads = 0;
+  const unloads = [];
+  const f = fixture(t, { models: ['synthetic', 'outside'], autotuneExtra: foreignOptions(),
+    metricsFor: model => { if (model === 'outside') { metricsReads++; if (metricsReads > 3) busy = 0; } return `llamacpp:requests_processing ${model === 'outside' ? busy : 0}\n`; },
+    onUnload: ({ model }) => unloads.push({ model, busy }),
+    onChat: ({ chats, status }) => { if (chats === 3 && !injected) { injected = true; busy = 1; status.synthetic = 'unloaded'; status.outside = 'loaded'; } } });
+  assert.equal((await f.manager.autotune.start('synthetic', { confirmPause: true })).status, 202);
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'passed', j.error);
+  assert.ok(injected);
+  assert.match(logText(j), /Another client is using outside\. Tuning is paused until it is idle/);
+  assert.match(logText(j), /Unloaded outside, idle after another client used it; tuning continues\./);
+  // The other client's model was never stopped while it had a request in flight.
+  assert.ok(unloads.filter(u => u.model === 'outside').length >= 1);
+  assert.ok(unloads.filter(u => u.model === 'outside').every(u => u.busy === 0), JSON.stringify(unloads));
+  assert.ok(metricsReads > 3);
+});
+
+test('#1062 a model another client keeps re-loading while auto-tune unloads is waited out, not a router-unload timeout', { skip: skipContention }, async t => {
+  let reloads = 0, loadingPolls = 0;
+  const f = fixture(t, { models: ['synthetic', 'outside'], autotuneExtra: foreignOptions(),
+    metricsFor: () => 'llamacpp:requests_processing 0\n',
+    // The incident shape: right after auto-tune asks the router to unload, a queued request for
+    // another model makes the router load it.
+    onUnload: ({ model }) => { if (model === 'synthetic' && reloads < 2) { reloads++; loadingPolls = 3; f.status.outside = 'loading'; } } });
+  const originalModels = f.status;
+  const list = () => originalModels;
+  // 'loading' settles to 'loaded' after a few listings.
+  const timer = setInterval(() => { if (list().outside === 'loading' && --loadingPolls <= 0) list().outside = 'loaded'; }, 1);
+  t.after(() => clearInterval(timer));
+  assert.equal((await f.manager.autotune.start('synthetic', { confirmPause: true })).status, 202);
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'passed', j.error);
+  assert.equal(reloads, 2);
+  assert.doesNotMatch(JSON.stringify(j), /Timed out waiting for router unload/);
+  assert.match(logText(j), /Another client is using outside/);
+});
+
+test('#1062 a client that stays busy past the wait stops the tune as interrupted, restored and resumable', { skip: skipContention }, async t => {
+  let injected = false, busy = 1, gaveUp = false;
+  const unloads = [];
+  const decide = req => { const d = contentionImpl.decide(req); if (d.action === 'give_up') gaveUp = true; return d; };
+  const f = fixture(t, { models: ['synthetic', 'outside'], autotuneExtra: foreignOptions({ foreignWaitMs: 40, contention: decide }),
+    metricsFor: model => `llamacpp:requests_processing ${model === 'outside' ? busy : 0}\n`,
+    onUnload: ({ model }) => unloads.push({ model, busy, gaveUp }),
+    onChat: ({ chats, status }) => { if (chats === 3 && !injected) { injected = true; status.synthetic = 'unloaded'; status.outside = 'loaded'; } } });
+  assert.equal((await f.manager.autotune.start('synthetic', { confirmPause: true })).status, 202);
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'interrupted', j.error);
+  assert.match(j.error, /Another client kept using outside for \d+ min\. Resume auto-tune when it is done\./);
+  assert.equal(j.models[0].status, 'failed');
+  // #1067/#1068: neither the wait nor the restore after it stopped the busy model; the file was
+  // restored and the router's re-read deferred.
+  assert.ok(gaveUp);
+  assert.ok(!unloads.some(u => u.model === 'outside' && u.busy > 0), 'a busy model was unloaded');
+  assert.equal(fs.readFileSync(f.ini, 'utf8'), f.original);
+  assert.match(logText(j), /models\.ini is restored; the model server re-reads it once the other client is done\./);
+  // The phase that was running put models.ini back; the job can be resumed once the client is done.
+  assert.ok(j.models[0].phases.every(p => p.restored !== false));
+  busy = 0; f.status.outside = 'unloaded';
+  assert.equal((await f.manager.autotune.resume({ confirmPause: true })).status, 202);
+  const resumed = await finished(f.manager);
+  assert.equal(resumed.status, 'passed', resumed.error);
+});
+
+test('#1062 without a usable decision the old refusal stands (fails closed)', async t => {
+  let injected = false;
+  const f = fixture(t, { models: ['synthetic', 'outside'], autotuneExtra: foreignOptions({ contention: () => { throw Error('module missing'); } }),
+    onChat: ({ chats, status }) => { if (chats === 3 && !injected) { injected = true; status.outside = 'loaded'; } } });
+  assert.equal((await f.manager.autotune.start('synthetic', { confirmPause: true })).status, 202);
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'failed');
+  assert.match(j.error, /Another client loaded a model during tuning\./);
+});
+
+test('#1062 cancelling while waiting for another client stops promptly', { skip: skipContention }, async t => {
+  let injected = false;
+  const f = fixture(t, { models: ['synthetic', 'outside'], autotuneExtra: foreignOptions({ foreignPollMs: 2 }),
+    metricsFor: model => `llamacpp:requests_processing ${model === 'outside' ? 1 : 0}\n`,
+    onChat: ({ chats, status, manager }) => { if (chats === 3 && !injected) { injected = true; status.outside = 'loaded'; setTimeout(() => manager.autotune.cancel(), 20); } } });
+  assert.equal((await f.manager.autotune.start('synthetic', { confirmPause: true })).status, 202);
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'cancelled');
+});
+
+test('#1062 a client that keeps coming back stops the tune as interrupted after a bounded number of waits', { skip: skipContention }, async t => {
+  let reloads = 0;
+  const f = fixture(t, { models: ['synthetic', 'outside'], autotuneExtra: foreignOptions(),
+    metricsFor: () => 'llamacpp:requests_processing 0\n',
+    // Like the router: a queued request for `outside` loads it right after auto-tune unloads.
+    onUnload: ({ model }) => { if (model === 'synthetic') { reloads++; f.status.outside = 'loading'; setTimeout(() => { f.status.outside = 'loaded'; }, 2); } } });
+  const started = Date.now();
+  assert.equal((await f.manager.autotune.start('synthetic', { confirmPause: true })).status, 202);
+  const j = await finished(f.manager);
+  assert.ok(Date.now() - started < 20000, 'no unload deadline was waited out');
+  assert.equal(j.status, 'interrupted', j.error);
+  assert.match(j.error, /Another client kept loading outside during tuning\. Stop it, then resume auto-tune\./);
+  assert.ok(reloads >= 6 && reloads < 40, String(reloads));
+  assert.ok(j.models[0].phases.every(p => p.restored !== false));
+});
+
+test('#1067 a model another client is using when a step is about to write is never unloaded while busy', { skip: skipContention }, async t => {
+  let busy = 1, reads = 0;
+  const unloads = [];
+  const f = fixture(t, { models: ['synthetic', 'outside'], autotuneExtra: foreignOptions(),
+    metricsFor: model => { if (model === 'outside' && ++reads > 6) busy = 0; return `llamacpp:requests_processing ${model === 'outside' ? busy : 0}\n`; },
+    onUnload: ({ model }) => unloads.push({ model, busy }) });
+  f.status.outside = 'loaded'; // already in use when the tune starts
+  assert.equal((await f.manager.autotune.start('synthetic', { confirmPause: true })).status, 202);
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'passed', j.error);
+  assert.ok(unloads.some(u => u.model === 'outside'));
+  assert.ok(unloads.filter(u => u.model === 'outside').every(u => u.busy === 0), JSON.stringify(unloads));
+});
+
+test('#1069 a request that arrives between the decision and the unload wins: the model is not stopped', { skip: skipContention }, async t => {
+  let injected = false, reads = 0;
+  const unloads = [];
+  // Idle on every read but one: the read right before the first unload sees a new request.
+  const decide = req => { const d = contentionImpl.decide(req); if (d.action === 'unload' && reads >= 0) reads = -1; return d; };
+  const f = fixture(t, { models: ['synthetic', 'outside'], autotuneExtra: foreignOptions({ contention: decide }),
+    metricsFor: model => { let n = 0; if (model === 'outside' && reads === -1) { reads = -2; n = 1; } return `llamacpp:requests_processing ${n}\n`; },
+    onUnload: ({ model }) => unloads.push({ model, readsAt: reads }),
+    onChat: ({ chats, status }) => { if (chats === 3 && !injected) { injected = true; status.synthetic = 'unloaded'; status.outside = 'loaded'; } } });
+  assert.equal((await f.manager.autotune.start('synthetic', { confirmPause: true })).status, 202);
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'passed', j.error);
+  assert.equal(reads, -2, 'the race was exercised');
+  // Without the re-read the unload would go out while the new request ran (readsAt -1).
+  assert.deepEqual(unloads.filter(u => u.model === 'outside').map(u => u.readsAt), [-2], 'stopped once, after the new request finished');
+});
+
+test('#1068 a client that keeps its model busy through the restore: cancel is prompt and models.ini is restored', { skip: skipContention }, async t => {
+  let injected = false;
+  const unloads = [];
+  const f = fixture(t, { models: ['synthetic', 'outside'], autotuneExtra: foreignOptions({ foreignPollMs: 2 }),
+    metricsFor: model => `llamacpp:requests_processing ${model === 'outside' ? 1 : 0}\n`,
+    onUnload: ({ model }) => { unloads.push(model); if (model === 'synthetic') f.status.outside = 'loaded'; },
+    onChat: ({ chats, status, manager }) => { if (chats === 3 && !injected) { injected = true; status.outside = 'loaded'; setTimeout(() => manager.autotune.cancel(), 20); } } });
+  assert.equal((await f.manager.autotune.start('synthetic', { confirmPause: true })).status, 202);
+  const t0 = Date.now();
+  const j = await finished(f.manager);
+  assert.ok(Date.now() - t0 < 5000, 'cancel was prompt');
+  assert.equal(j.status, 'cancelled');
+  assert.ok(!unloads.includes('outside'), 'the busy model was never stopped');
+  assert.ok(j.models[0].phases.every(p => p.restored !== false), JSON.stringify(j.models[0].phases.map(p => [p.id, p.restored])));
+  assert.equal(fs.readFileSync(f.ini, 'utf8'), f.original);
+});
+
+test('#1069 a request failed by another client evicting the model mid-request is retried, not recorded as a failed candidate', { skip: skipContention }, async t => {
+  const run = async (disturb) => {
+    let injected = false, failNext = false, busy = 0, reads = 0;
+    const f = fixture(t, { models: ['synthetic', 'outside'], autotuneExtra: foreignOptions(),
+      metricsFor: model => { if (model === 'outside' && ++reads > 3) busy = 0; return `llamacpp:requests_processing ${model === 'outside' ? busy : 0}\n`; },
+      httpFor: () => { if (failNext) { failNext = false; return 500; } return 0; },
+      onChat: ({ chats, status }) => { if (disturb && chats === 4 && !injected) { injected = true; failNext = true; busy = 1; status.synthetic = 'unloaded'; status.outside = 'loaded'; } } });
+    assert.equal((await f.manager.autotune.start('synthetic', { confirmPause: true })).status, 202);
+    const j = await finished(f.manager);
+    return { j, injected };
+  };
+  const control = await run(false), disturbed = await run(true);
+  assert.ok(disturbed.injected);
+  assert.equal(disturbed.j.status, 'passed', disturbed.j.error);
+  const steps = j => j.models[0].phases.map(p => [p.id, p.steps.map(s => [s.id, s.status])]);
+  assert.deepEqual(steps(disturbed.j), steps(control.j));
+  assert.match(logText(disturbed.j), /Another client is using outside/);
+});
+
+// #1062 re-review: restore with the tuned model already evicted, and the deferred re-read.
+async function gaveUpRestored(t, extra = {}) {
+  let injected = false;
+  const reloads = [];
+  const f = fixture(t, { models: ['synthetic', 'outside'], strictUnload: true, autotuneExtra: foreignOptions({ foreignWaitMs: 40, ...extra }),
+    metricsFor: model => `llamacpp:requests_processing ${model === 'outside' ? 1 : 0}\n`,
+    onReload: ({ status }) => reloads.push(status),
+    onChat: ({ chats, status }) => { if (chats === 3 && !injected) { injected = true; status.synthetic = 'unloaded'; status.outside = 'loaded'; } } });
+  assert.equal((await f.manager.autotune.start('synthetic', { confirmPause: true })).status, 202);
+  const j = await finished(f.manager);
+  return { f, j, reloads };
+}
+
+test('#1062 a tuned model already evicted at restore (unload refused with 404) still restores, and the tune resumes', { skip: skipContention }, async t => {
+  const { f, j } = await gaveUpRestored(t);
+  assert.equal(j.status, 'interrupted', j.error);
+  assert.ok(j.models[0].phases.every(p => p.restored !== false), JSON.stringify(j.models[0].phases.map(p => [p.id, p.restored])));
+  assert.equal(fs.readFileSync(f.ini, 'utf8'), f.original);
+  f.status.outside = 'unloaded';
+  assert.equal((await f.manager.autotune.resume({ confirmPause: true })).status, 202);
+  assert.equal((await finished(f.manager)).status, 'passed');
+});
+
+test('#1062 a deferred re-read happens before the tuned model next loads, and before a new tune', { skip: skipContention }, async t => {
+  const { f, reloads } = await gaveUpRestored(t);
+  const before = reloads.length;
+  // A chat load of the tuned model: the router re-reads models.ini first.
+  const loaded = await f.manager.load('synthetic');
+  assert.equal(reloads.length, before + 1, JSON.stringify(loaded));
+  assert.equal(reloads.at(-1).synthetic, 'unloaded', 're-read before the load');
+  // Nothing pending any more: a new tune does not re-read again for it.
+  f.status.outside = 'unloaded';
+  const n = reloads.length;
+  assert.equal((await f.manager.autotune.start('synthetic', { confirmPause: true })).status, 202);
+  await finished(f.manager);
+  assert.ok(reloads.length >= n);
+});
+
+test('#1062 a pending re-read is re-armed after a restart and forced by the next tune', { skip: skipContention }, async t => {
+  const { f, reloads } = await gaveUpRestored(t);
+  const manager = f.restart();
+  await manager.autotune.recover();
+  const before = reloads.length;
+  f.status.outside = 'unloaded';
+  assert.equal((await manager.autotune.start('synthetic', { confirmPause: true })).status, 202);
+  assert.ok(reloads.length > before);
+  assert.equal(reloads[before].synthetic, 'unloaded', 'the restored file was re-read before the new tune loaded anything');
+  await finished(manager);
+});
+
+test('#1062 a re-read that keeps waiting gives up with a note', { skip: skipContention }, async t => {
+  const { f } = await gaveUpRestored(t, { foreignPollMs: 0 });
+  for (let i = 0; i < 400 && !/has not re-read/.test(logText(f.manager.autotune.status().body.job)); i++) await new Promise(r => setTimeout(r, 10));
+  assert.match(logText(f.manager.autotune.status().body.job), /The model server has not re-read the restored models\.ini; it does so before this model next loads\./);
 });

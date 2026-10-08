@@ -21,6 +21,7 @@
 //   - crates/load-verdict   loadVerdict = why a failed auto-tune step failed   (LAYA_LOAD_ADVISOR, #1004)
 //                                        new logic, no JS twin; see chat-template-caps.cjs
 //                                                                             (CHAT_TEMPLATE_CAPS_IMPL, #1002)
+//   - crates/tune-contention tuneContention = auto-tune vs another router client (always on; fails closed, #1062)
 //
 // Memory: WebAssembly memory only grows. A listing or path call needs at most ~16 MiB; an upload
 // decode copies the upload in (at most 25 MiB) and holds one copy of its text (at most 3 bytes per
@@ -51,7 +52,7 @@ const MAX_DECODE_BYTES = 25 * 1024 * 1024;
 // Only the first bytes decide an archive magic number (`ustar` ends at 262).
 const SNIFF_BYTES = 262;
 const RESET_AFTER_BYTES = 1024 * 1024;
-const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'secret_open', 'secret_seal', 'mcp_rpc_body', 'mcp_schema_refs', 'template_caps', 'provider_error', 'serving_verdict', 'autotune_plan', 'preset_reload', 'load_verdict', 'dav_output_ptr', 'dav_output_len'];
+const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'secret_open', 'secret_seal', 'mcp_rpc_body', 'mcp_schema_refs', 'template_caps', 'provider_error', 'serving_verdict', 'autotune_plan', 'preset_reload', 'load_verdict', 'tune_contention', 'dav_output_ptr', 'dav_output_len'];
 
 class DavParseError extends Error {
   constructor(message, reason) {
@@ -574,6 +575,32 @@ function loadVerdictText(text) {
   return r;
 }
 
+// tune_contention::MAX_INPUT_BYTES and its reply vocabulary (#1062).
+const MAX_CONTENTION_BYTES = 64 * 1024;
+const CONTENTION_ACTIONS = new Set(['proceed', 'wait', 'unload', 'give_up']);
+const CONTENTION_REASONS = { proceed: ['clear'], wait: ['loading', 'other', 'busy', 'settling'], unload: ['idle', 'idle_unknown'], give_up: ['timed_out'] };
+
+/** tune-contention (#1062): may auto-tune go on while another router client has a model live?
+ *  `{ tuning, rows: [{ id, status, busy }], prev, startedAt, now, maxWaitMs, quietMs }` ->
+ *  `{ action, reason, foreign, unload, fingerprint, since, waitedMs }`. Refusals throw
+ *  DavParseError ('input', 'too_large'); a reply of an unexpected shape throws 'reply'. */
+function tuneContention(request) { return tuneContentionText(JSON.stringify(request)); }
+/** tuneContention on the request's JSON text as is. */
+function tuneContentionText(text) {
+  if (typeof text !== 'string') throw new DavParseError('tune contention request must be text', 'input');
+  const bytes = encoder.encode(text.isWellFormed() ? text : text.toWellFormed());
+  if (bytes.length > MAX_CONTENTION_BYTES) throw new DavParseError('tune contention request is too large', 'too_large');
+  const r = invoke(bytes, (e) => e.tune_contention());
+  const ids = (list) => Array.isArray(list) && list.every((id) => typeof id === 'string' && id.length > 0);
+  const ok = r && CONTENTION_ACTIONS.has(r.action) && CONTENTION_REASONS[r.action].includes(r.reason)
+    && ids(r.foreign) && ids(r.unload) && (r.action === 'proceed') === (r.foreign.length === 0)
+    && (r.action === 'unload' ? r.unload.length === r.foreign.length && r.unload.every((id) => r.foreign.includes(id)) : r.unload.length === 0)
+    && typeof r.fingerprint === 'string' && Number.isSafeInteger(r.since) && r.since >= 0
+    && Number.isSafeInteger(r.waitedMs) && r.waitedMs >= 0;
+  if (!ok) throw new DavParseError('tune contention reply has an unexpected shape', 'reply');
+  return { action: r.action, reason: r.reason, foreign: r.foreign, unload: r.unload, fingerprint: r.fingerprint, since: r.since, waitedMs: r.waitedMs };
+}
+
 /** Test hook: the cached instance's linear memory in bytes (0 when there is none). */
 function memoryBytes() { return cached?.instance ? cached.instance.exports.memory.buffer.byteLength : 0; }
 
@@ -607,4 +634,4 @@ function verifyAtStartup(env = process.env) {
 /** Test hook: forget the cached module (and its failure). */
 function reset() { cached = null; }
 
-module.exports = { wasmFlags, verifyAtStartup, IMPL_FLAGS, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
+module.exports = { wasmFlags, verifyAtStartup, IMPL_FLAGS, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, tuneContention, tuneContentionText, MAX_CONTENTION_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
