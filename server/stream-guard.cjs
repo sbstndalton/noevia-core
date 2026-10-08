@@ -18,6 +18,19 @@
 // This module makes no network calls and has no dependencies. It is not
 // wired into any live request path by default; see the `enabled` flags at
 // call sites that import it.
+//
+// STREAM_GUARD_IMPL=js|wasm (default js; any other value means js, with one warning), read by
+// the caller on each use (streamGuardImpl). `wasm` runs the same validator as the Rust port
+// (sbstndalton/noevia-rs crates/stream-guard, in the dav-parse.wasm module pinned by
+// server/dav-parse.lock): createValidatorWasm has IncrementalValidator's interface and gives the
+// same first violation after the same chunk; buildCorrectionRequestWasm is buildCorrectionRequest
+// after a clip. The validator state lives in the returned object as bytes between calls, so
+// nothing stays in the module and it is freed with the object. Under wasm a missing or tampered
+// module stops startup (dav-parse-wasm.cjs verifyAtStartup), and a trap, a refusal or a reply of
+// the wrong shape throws a DavParseError: nothing falls back to the JS. The port refuses (also a
+// DavParseError) a schema that is not plain JSON data, maxBytes over 2 MiB, maxDepth over 1024 and
+// non-integer options. createValidator and buildCorrectionRequest stay the JS reference
+// (tests/fixtures/stream-guard.v1.json is theirs).
 
 class SchemaViolation extends Error {
   constructor(message, path) {
@@ -447,6 +460,78 @@ function createValidator(schema, options) {
   return new IncrementalValidator(schema, options);
 }
 
+const IMPLS = new Set(['js', 'wasm']);
+let warnedImpl = '';
+/** STREAM_GUARD_IMPL: 'js' (default) or 'wasm'. */
+function streamGuardImpl(env = process.env) {
+  const raw = env.STREAM_GUARD_IMPL;
+  if (raw === undefined || raw === '') return 'js';
+  const value = String(raw).trim().toLowerCase();
+  if (IMPLS.has(value)) return value;
+  if (warnedImpl !== value) {
+    warnedImpl = value;
+    console.warn(`[stream-guard] STREAM_GUARD_IMPL=${JSON.stringify(String(raw))} is not js or wasm; using js`);
+  }
+  return 'js';
+}
+
+let davParseWasm = null;
+const guardWasm = () => davParseWasm || (davParseWasm = require('./dav-parse-wasm.cjs'));
+
+/**
+ * IncrementalValidator decided by the Rust port. Same methods and results; the first violation is
+ * a SchemaViolation and, as in the JS, the same object on every later call. Throws a
+ * DavParseError when the module cannot answer (the validator is then unusable).
+ */
+class WasmValidator {
+  constructor(schema, options = {}) {
+    const wasm = guardWasm();
+    this.schemaBytes = wasm.streamGuardSchema(schema);
+    this.state = wasm.streamGuardNew(this.schemaBytes, wasm.streamGuardOptions(options));
+    this.violation = null;
+    this.done = false;
+  }
+
+  getViolation() { return this.violation; }
+
+  isDone() { return this.done; }
+
+  _apply(r) {
+    this.state = r.state;
+    this.done = r.done;
+    if (r.violation && !this.violation) this.violation = new SchemaViolation(r.violation.message, r.violation.path);
+    return this.violation;
+  }
+
+  feed(text) {
+    if (this.violation) return this.violation;
+    // The JS takes text (a non-string is a TypeError there, or nonsense for a Buffer).
+    if (typeof text !== 'string') throw new TypeError('stream-guard feed() takes text');
+    return this._apply(guardWasm().streamGuardFeed(this.schemaBytes, this.state, text));
+  }
+
+  end() {
+    if (this.violation) return this.violation;
+    return this._apply(guardWasm().streamGuardEnd(this.schemaBytes, this.state));
+  }
+}
+
+function createValidatorWasm(schema, options) {
+  return new WasmValidator(schema, options);
+}
+
+/** `feed(text) || end()` on a fresh validator in one module call: a SchemaViolation or null. */
+function checkTextWasm(schema, text, options) {
+  const wasm = guardWasm();
+  const r = wasm.streamGuardCheck(wasm.streamGuardSchema(schema), wasm.streamGuardOptions(options), text);
+  return r.violation ? new SchemaViolation(r.violation.message, r.violation.path) : null;
+}
+
+/** buildCorrectionRequest({ message: message.slice(0, clip), path }) by the Rust port. */
+function buildCorrectionRequestWasm(violation, clip = null) {
+  return guardWasm().streamGuardCorrection(String(violation.message), violation.path || null, clip);
+}
+
 /**
  * Build a correction request containing only the violation — no
  * orchestrator meta-prompt, no restated schema, no conversation history.
@@ -526,4 +611,9 @@ module.exports = {
   createValidator,
   buildCorrectionRequest,
   runGuardedStream,
+  streamGuardImpl,
+  WasmValidator,
+  createValidatorWasm,
+  checkTextWasm,
+  buildCorrectionRequestWasm,
 };

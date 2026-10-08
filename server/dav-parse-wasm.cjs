@@ -31,6 +31,9 @@
 //                                                                             (S3_SIGN_IMPL)
 //   - crates/ssrf-policy   ssrfUrl/ssrfAddressesPublic = ssrf.cjs isPublicUrl (before DNS) and
 //                          isPrivateIp, public-fetch.cjs's URL check             (SSRF_IMPL, #795)
+//   - crates/stream-guard  streamGuardNew/Feed/End/Check, streamGuardCorrection = stream-guard.cjs's
+//                          IncrementalValidator and buildCorrectionRequest; the validator state is
+//                          bytes held here between calls, nothing stays in the module (STREAM_GUARD_IMPL, #516/#704)
 //
 // Memory: WebAssembly memory only grows. A listing or path call needs at most ~16 MiB; an upload
 // decode copies the upload in (at most 25 MiB) and holds one copy of its text (at most 3 bytes per
@@ -62,7 +65,7 @@ const MAX_DECODE_BYTES = 25 * 1024 * 1024;
 // Only the first bytes decide an archive magic number (`ustar` ends at 262).
 const SNIFF_BYTES = 262;
 const RESET_AFTER_BYTES = 1024 * 1024;
-const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'secret_open', 'secret_seal', 'mcp_rpc_body', 'mcp_schema_refs', 'template_caps', 'provider_error', 'serving_verdict', 'autotune_plan', 'preset_reload', 'load_verdict', 'tune_contention', 'frame_untrusted', 'escape_closing', 'provenance', 'task_packet', 'long_profile', 's3_sign', 's3_region', 'ssrf_policy', 'dav_output_ptr', 'dav_output_len'];
+const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'secret_open', 'secret_seal', 'mcp_rpc_body', 'mcp_schema_refs', 'template_caps', 'provider_error', 'serving_verdict', 'autotune_plan', 'preset_reload', 'load_verdict', 'tune_contention', 'frame_untrusted', 'escape_closing', 'provenance', 'task_packet', 'long_profile', 's3_sign', 's3_region', 'ssrf_policy', 'stream_guard', 'dav_output_ptr', 'dav_output_len'];
 
 class DavParseError extends Error {
   constructor(message, reason) {
@@ -882,6 +885,172 @@ function ssrfAddressesReply(r) {
   return r.public;
 }
 
+// stream_guard (#516, #704): stream-guard.cjs's IncrementalValidator and buildCorrectionRequest.
+// stream_guard::{DEFAULT_MAX_DEPTH, DEFAULT_MAX_BYTES, MAX_GUARD_BYTES, MAX_DEPTH_CAP,
+// MAX_SCHEMA_BYTES, MAX_STATE_BYTES, MAX_CORRECTION_UNITS, MAX_INPUT_BYTES}.
+const STREAM_GUARD_DEFAULT_DEPTH = 64;
+const STREAM_GUARD_DEFAULT_BYTES = 2 * 1024 * 1024;
+const MAX_GUARD_BYTES = 2 * 1024 * 1024;
+const MAX_GUARD_DEPTH = 1024;
+const MAX_GUARD_SCHEMA_BYTES = 256 * 1024;
+const MAX_GUARD_STATE_BYTES = 20 * 1024 * 1024;
+// A message past this is cut to it first when a clip at most this applies (the cut cannot reach
+// the reply); a path past it (only a key of over a million units can make one) is refused as
+// too_large, and code-tool-schemas.cjs then answers with its fixed UNCHECKED correction instead.
+const MAX_CORRECTION_UNITS = 1024 * 1024;
+const MAX_GUARD_INPUT_BYTES = MAX_GUARD_STATE_BYTES + MAX_GUARD_SCHEMA_BYTES + 2 * MAX_GUARD_BYTES + 64;
+const GUARD_REASONS = new Set(['max_bytes', 'unexpected_char', 'type_mismatch', 'max_depth', 'expected_key', 'expected_colon',
+  'expected_comma_or_brace', 'expected_comma_or_bracket', 'unknown_property', 'missing_required', 'max_items',
+  'invalid_unicode_escape', 'invalid_escape', 'max_length', 'enum_prefix', 'enum_string', 'invalid_number', 'not_integer',
+  'enum_number', 'invalid_literal', 'enum_literal', 'unterminated_string', 'unterminated_literal', 'unterminated_container', 'no_value']);
+const GUARD_REFUSALS = new Set(['too_large', 'input_shape', 'schema', 'state', 'options']);
+const GUARD_STATE_MAGIC = [0x53, 0x47, 0x31, 0x00];
+
+/** Plain JSON data only (what JSON.stringify writes back exactly): no undefined, functions,
+ *  symbols, holes, accessors, class instances or non-finite numbers, at most 64 levels. */
+function plainJson(v, depth = 0) {
+  if (v === null || typeof v === 'string' || typeof v === 'boolean') return true;
+  if (typeof v === 'number') return Number.isFinite(v);
+  if (typeof v !== 'object' || depth >= 64) return false;
+  if (Array.isArray(v)) {
+    for (let i = 0; i < v.length; i += 1) if (!Object.hasOwn(v, i) || !plainJson(v[i], depth + 1)) return false;
+    return Object.getOwnPropertyNames(v).length === v.length + 1;
+  }
+  const proto = Object.getPrototypeOf(v);
+  if (proto !== Object.prototype && proto !== null) return false;
+  if (Object.getOwnPropertySymbols(v).length) return false;
+  for (const k of Object.getOwnPropertyNames(v)) {
+    const d = Object.getOwnPropertyDescriptor(v, k);
+    if (!d.enumerable || !('value' in d) || !plainJson(d.value, depth + 1)) return false;
+  }
+  return true;
+}
+
+/** A schema as the module reads it: `schema || {}` as UTF-8 JSON. Throws for anything else. */
+function streamGuardSchema(schema) {
+  const root = schema || null;
+  if (!plainJson(root)) throw new DavParseError('stream-guard schema must be plain JSON data', 'input');
+  const bytes = encoder.encode(JSON.stringify(root));
+  if (bytes.length > MAX_GUARD_SCHEMA_BYTES) throw new DavParseError('stream-guard schema is too large', 'too_large');
+  return bytes;
+}
+
+/** IncrementalValidator's option rule (`typeof x === 'number' ? x : default`), then the port's
+ *  caps: an integer within ±1024 (maxDepth) / ±2 MiB (maxBytes). */
+function streamGuardOptions(options = {}) {
+  const maxDepth = typeof options.maxDepth === 'number' ? options.maxDepth : STREAM_GUARD_DEFAULT_DEPTH;
+  const maxBytes = typeof options.maxBytes === 'number' ? options.maxBytes : STREAM_GUARD_DEFAULT_BYTES;
+  if (!Number.isInteger(maxDepth) || Math.abs(maxDepth) > MAX_GUARD_DEPTH || !Number.isInteger(maxBytes) || Math.abs(maxBytes) > MAX_GUARD_BYTES) {
+    throw new DavParseError('stream-guard options are outside what the port takes', 'options');
+  }
+  return { maxDepth, maxBytes };
+}
+
+function guardRequest(parts) {
+  const size = parts.reduce((n, p) => n + p.length, 0);
+  if (size > MAX_GUARD_INPUT_BYTES) throw new DavParseError('stream-guard request is too large', 'too_large');
+  const out = new Uint8Array(size);
+  let at = 0;
+  for (const p of parts) { out.set(p, at); at += p.length; }
+  return out;
+}
+const u8 = (n) => Uint8Array.of(n);
+const u32 = (n) => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, n, true); return b; };
+const f64 = (n) => { const b = new Uint8Array(8); new DataView(b.buffer).setFloat64(0, n, true); return b; };
+const block = (b) => [u32(b.length), b];
+/** The chunk after its oversize flag: a chunk longer than MAX_GUARD_BYTES units is at least that
+ *  many UTF-8 bytes, so it exceeds every accepted maxBytes unread; only the flag crosses. */
+function guardChunk(text) {
+  if (text.length > MAX_GUARD_BYTES) return [u8(1)];
+  const b = Buffer.from(text, 'utf16le');
+  return [u8(0), new Uint8Array(b.buffer, b.byteOffset, b.length)];
+}
+
+function guardCall(parts) {
+  const r = invokeRaw(guardRequest(parts), (e) => e.stream_guard(), MAX_GUARD_INPUT_BYTES);
+  if (r.status !== 0) {
+    let code = 'unknown';
+    try { const e = JSON.parse(utf8(r.bytes)); if (exactKeys(e, ['error']) && GUARD_REFUSALS.has(e.error)) code = e.error; } catch { /* unknown */ }
+    throw new DavParseError(`stream-guard request refused (${code})`, code);
+  }
+  return r.bytes;
+}
+
+/** Check a validator reply (`u32 n`, ASCII JSON, state) and return `{ violation, done, state }`;
+ *  `withState` false for the one-shot check (exported for tests). */
+function streamGuardReply(bytes, withState) {
+  const bad = () => new DavParseError('stream-guard reply has an unexpected shape', 'reply');
+  if (!(bytes instanceof Uint8Array) || bytes.length < 4) throw bad();
+  const n = new DataView(bytes.buffer, bytes.byteOffset, 4).getUint32(0, true);
+  if (4 + n > bytes.length) throw bad();
+  const json = bytes.subarray(4, 4 + n);
+  if (json.some((c) => c < 0x20 || c > 0x7e)) throw bad();
+  let r;
+  try { r = JSON.parse(utf8(json)); } catch { throw bad(); }
+  if (!exactKeys(r, ['violation', 'done']) || typeof r.done !== 'boolean') throw bad();
+  const v = r.violation;
+  if (v !== null && !(exactKeys(v, ['message', 'path', 'reason']) && typeof v.message === 'string' && v.message
+    && typeof v.path === 'string' && v.path.startsWith('$') && GUARD_REASONS.has(v.reason))) throw bad();
+  if (v !== null && r.done && v.reason !== 'max_bytes') throw bad(); // only the cap can follow a finished document
+  const state = bytes.slice(4 + n);
+  if (withState ? (state.length < 4 || state.length > MAX_GUARD_STATE_BYTES || GUARD_STATE_MAGIC.some((c, i) => state[i] !== c)) : state.length) throw bad();
+  return { violation: v && { message: v.message, path: v.path, reason: v.reason }, done: r.done, state: withState ? state : null };
+}
+
+/** A fresh validator state for `schema` (the bytes from streamGuardSchema) and its options. */
+function streamGuardNew(schemaBytes, { maxDepth, maxBytes }) {
+  const r = streamGuardReply(guardCall([u8(0), f64(maxDepth), f64(maxBytes), ...block(schemaBytes)]), true);
+  if (r.violation || r.done) throw new DavParseError('stream-guard reply has an unexpected shape', 'reply');
+  return r.state;
+}
+
+/** feed(text) on a held state: `{ violation, done, state }`. */
+function streamGuardFeed(schemaBytes, state, text) {
+  if (typeof text !== 'string' || !(state instanceof Uint8Array)) throw new DavParseError('stream-guard feed input has the wrong type', 'input');
+  return streamGuardReply(guardCall([u8(1), ...block(schemaBytes), ...block(state), ...guardChunk(text)]), true);
+}
+
+/** end() on a held state: `{ violation, done, state }`. */
+function streamGuardEnd(schemaBytes, state) {
+  if (!(state instanceof Uint8Array)) throw new DavParseError('stream-guard end input has the wrong type', 'input');
+  return streamGuardReply(guardCall([u8(2), ...block(schemaBytes), ...block(state)]), true);
+}
+
+/** `feed(text) || end()` on a fresh validator, in one call: `{ violation, done }`. */
+function streamGuardCheck(schemaBytes, { maxDepth, maxBytes }, text) {
+  if (typeof text !== 'string') throw new DavParseError('stream-guard check input has the wrong type', 'input');
+  return streamGuardCheckReply(guardCall([u8(3), f64(maxDepth), f64(maxBytes), ...block(schemaBytes), ...guardChunk(text)]));
+}
+
+/** A one-shot check reply: it ran end(), so it holds a violation or a finished document; neither
+ *  is a module fault (exported for tests). */
+function streamGuardCheckReply(bytes) {
+  const r = streamGuardReply(bytes, false);
+  if (!r.violation && !r.done) throw new DavParseError('stream-guard check reply has neither a violation nor a document', 'reply');
+  return { violation: r.violation, done: r.done };
+}
+
+/** stream-guard.cjs buildCorrectionRequest({ message: message.slice(0, clip), path: path || null })
+ *  through the module; `clip` null for none. */
+function streamGuardCorrection(message, path, clip = null) {
+  if (typeof message !== 'string' || !(path === null || typeof path === 'string') || !(clip === null || (Number.isInteger(clip) && clip >= 0 && clip < 0xffffffff))) {
+    throw new DavParseError('stream-guard correction input has the wrong type', 'input');
+  }
+  // Units past the clip cannot reach the reply, so a long message may be cut at the cap first.
+  const m = clip !== null && clip <= MAX_CORRECTION_UNITS ? message.slice(0, MAX_CORRECTION_UNITS) : message;
+  if (m.length > MAX_CORRECTION_UNITS || (path && path.length > MAX_CORRECTION_UNITS)) throw new DavParseError('stream-guard correction is too large', 'too_large');
+  const units = (s) => { const b = Buffer.from(s, 'utf16le'); return new Uint8Array(b.buffer, b.byteOffset, b.length); };
+  const bytes = guardCall([u32(clip === null ? 0xffffffff : clip), u8(path === null ? 0 : 1), u32(m.length), units(m), units(path || '')].flatMap((p, i) => (i === 0 ? [u8(4), p] : [p])));
+  let r;
+  try { r = JSON.parse(utf8(bytes)); } catch { throw new DavParseError('stream-guard correction reply is not JSON', 'reply'); }
+  const expected = clip === null ? message : message.slice(0, clip);
+  if (!exactKeys(r, ['type', 'violation']) || r.type !== 'schema_violation_correction' || !exactKeys(r.violation, ['message', 'path'])
+    || r.violation.message !== expected || r.violation.path !== (path || null)) {
+    throw new DavParseError('stream-guard correction reply has an unexpected shape', 'reply');
+  }
+  return { type: r.type, violation: { message: r.violation.message, path: r.violation.path } };
+}
+
 // s3_sign::MAX_FIELD_BYTES, MAX_QUERY_PAIRS, MAX_PAYLOAD_BYTES (the JS has no caps; core's values
 // are far below them).
 const MAX_S3_FIELD_BYTES = 64 * 1024;
@@ -975,7 +1144,7 @@ function memoryBytes() { return cached?.instance ? cached.instance.exports.memor
 // Every switch that runs this module (#996). Each reads its value as trim().toLowerCase().
 // CHAT_TEMPLATE_CAPS_IMPL counts only when set to wasm explicitly; its default (also wasm) is
 // checked by chat-template-caps.cjs startup(), which falls back to off instead of stopping.
-const IMPL_FLAGS = ['DAV_PARSE_IMPL', 'S3_PARSE_IMPL', 'STORAGE_PATH_IMPL', 'UPLOAD_SNIFF_IMPL', 'SECRET_ENVELOPE_IMPL', 'MCP_FRAME_IMPL', 'CHAT_TEMPLATE_CAPS_IMPL', 'AUTOTUNE_PLAN_IMPL', 'PRESET_RELOAD_IMPL', 'PROMPT_FRAMING_IMPL', 'S3_SIGN_IMPL', 'SSRF_IMPL'];
+const IMPL_FLAGS = ['DAV_PARSE_IMPL', 'S3_PARSE_IMPL', 'STORAGE_PATH_IMPL', 'UPLOAD_SNIFF_IMPL', 'SECRET_ENVELOPE_IMPL', 'MCP_FRAME_IMPL', 'CHAT_TEMPLATE_CAPS_IMPL', 'AUTOTUNE_PLAN_IMPL', 'PRESET_RELOAD_IMPL', 'PROMPT_FRAMING_IMPL', 'S3_SIGN_IMPL', 'SSRF_IMPL', 'STREAM_GUARD_IMPL'];
 
 /** The *_IMPL switches set to wasm in `env`. */
 function wasmFlags(env = process.env) {
@@ -1013,4 +1182,4 @@ function verifyAtStartup(env = process.env, { hostname } = {}) {
 /** Test hook: forget the cached module (and its failure). */
 function reset() { cached = null; }
 
-module.exports = { s3Sign, s3Region, MAX_S3_FIELD_BYTES, MAX_S3_QUERY_PAIRS, MAX_S3_PAYLOAD_BYTES, wasmFlags, verifyAtStartup, framingRuntimeMatches, IMPL_FLAGS, ssrfUrl, ssrfAddressesPublic, ssrfUrlReply, ssrfAddressesReply, MAX_SSRF_BYTES, MAX_SSRF_ADDRESSES, frameUntrusted, escapeClosing, provenanceNew, provenanceIngest, provenanceAdd, provenanceSource, provenanceCheck, provenanceProbe, packetParse, packetValidate, packetRender, FRAME_TEXT_UNITS, FRAME_LABEL_UNITS, MAX_PROVENANCE_BYTES, MAX_PACKET_BYTES, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, tuneContention, tuneContentionText, MAX_CONTENTION_BYTES, longProfilePairs, longProfileSection, longProfilePick, longProfileText, MAX_LONG_PROFILE_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
+module.exports = { streamGuardSchema, streamGuardOptions, streamGuardNew, streamGuardFeed, streamGuardEnd, streamGuardCheck, streamGuardCheckReply, streamGuardCorrection, streamGuardReply, plainJson, MAX_GUARD_BYTES, MAX_GUARD_DEPTH, MAX_GUARD_SCHEMA_BYTES, MAX_GUARD_STATE_BYTES, MAX_GUARD_INPUT_BYTES, MAX_CORRECTION_UNITS, s3Sign, s3Region, MAX_S3_FIELD_BYTES, MAX_S3_QUERY_PAIRS, MAX_S3_PAYLOAD_BYTES, wasmFlags, verifyAtStartup, framingRuntimeMatches, IMPL_FLAGS, ssrfUrl, ssrfAddressesPublic, ssrfUrlReply, ssrfAddressesReply, MAX_SSRF_BYTES, MAX_SSRF_ADDRESSES, frameUntrusted, escapeClosing, provenanceNew, provenanceIngest, provenanceAdd, provenanceSource, provenanceCheck, provenanceProbe, packetParse, packetValidate, packetRender, FRAME_TEXT_UNITS, FRAME_LABEL_UNITS, MAX_PROVENANCE_BYTES, MAX_PACKET_BYTES, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, tuneContention, tuneContentionText, MAX_CONTENTION_BYTES, longProfilePairs, longProfileSection, longProfilePick, longProfileText, MAX_LONG_PROFILE_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
