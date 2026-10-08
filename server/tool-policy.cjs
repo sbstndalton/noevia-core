@@ -55,8 +55,9 @@ function createToolPolicy({ db, audit = () => {}, impl, wasmLoader = () => requi
     const list = [].concat(tools);
     if (useWasm()) {
       let r;
-      // Every tool's write flag crosses (the JS asks only when value is 'allow'; isWrite is pure).
-      try { r = wasm().toolPolicySet(value, MODES.has(value) ? list.map((t) => !!isWrite(t)) : list.map(() => false)); } catch (err) {
+      // Write flags matter only for allow, so isWrite runs only then, as in the JS.
+      const writes = value === 'allow' ? list.map((t) => !!isWrite(t)) : list.map(() => false);
+      try { r = wasm().toolPolicySet(value, writes); } catch (err) {
         warnFault(err);
         throw Object.assign(Error('The tool permission could not be checked.'), { status: 500 });
       }

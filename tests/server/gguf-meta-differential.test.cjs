@@ -5,7 +5,7 @@
 // headers, printed by tools/gen-gguf-meta-fixtures.cjs from the JS itself. Here every row runs
 // through readSummaryWasm (the file I/O here, the parse in dav-parse.wasm's gguf_summary) and must
 // return the same summary or throw the same message; rows nested past 64 must be refused. Then
-// the range reads (skipped bytes never read), the 16 MiB cap, seeded live JS-vs-wasm mutations, the reply-shape checks and
+// the range reads (skipped bytes never read), the 24 MiB cap, real-size vocabularies, bounded rounds, seeded live JS-vs-wasm mutations, the reply-shape checks and
 // the fail-closed paths. The WebAssembly half needs server/wasm/dav-parse.wasm (or
 // DAV_PARSE_WASM); skipped without it unless DAV_PARSE_WASM_REQUIRED=1.
 
@@ -71,7 +71,7 @@ test('every fixture row: the same summary or the same error through the Rust por
   assert.ok(same > 380 && refused === 2, `${same} ${refused}`);
 });
 
-test('ranges: a header is read in doubling steps, skipped bytes never; past 16 MiB of read bytes it is refused', { skip: skipWasm }, () => {
+test('ranges: a header is read in doubling steps, skipped bytes never; past 24 MiB of read bytes it is refused', { skip: skipWasm }, () => {
   const { gguf: build, kv, STR, S, T } = gen;
   // 3 MiB of kept strings, then the architecture: read in doubling steps from 4 KiB.
   const mid = Array.from({ length: 15 }, (_, i) => kv(`pad${i}`, STR('p'.repeat(200 * 1024))));
@@ -85,8 +85,8 @@ test('ranges: a header is read in doubling steps, skipped bytes never; past 16 M
   assert.ok(calls.length >= 5 && calls.length < 16 && calls[0] === 4096 && calls.at(-1) > 3_000_000, String(calls));
   // A small cap shows the refusal without a big file; the JS reads it fine.
   assert.deepEqual(rs(three, { maxWindow: 1024 * 1024 }), { error: 'GGUF header could not be checked (too_large)' });
-  // The real cap: 17 MiB of kept strings before the last key.
-  const big = Array.from({ length: 85 }, (_, i) => kv(`pad${i}`, STR('q'.repeat(210 * 1024))));
+  // The real cap: 25 MiB of kept strings before the last key.
+  const big = Array.from({ length: 125 }, (_, i) => kv(`pad${i}`, STR('q'.repeat(210 * 1024))));
   const seventeen = tmp(build([...big, kv('general.architecture', STR('x'))]));
   assert.equal(summarize(readGguf(seventeen)).arch, 'x');
   assert.deepEqual(rs(seventeen), { error: 'GGUF header could not be checked (too_large)' });
@@ -101,6 +101,62 @@ test('ranges: a header is read in doubling steps, skipped bytes never; past 16 M
   // Even with a 1 MiB cap the skipped regions cost nothing.
   assert.deepStrictEqual(rs(skipped, { maxWindow: 1024 * 1024 }), js(skipped));
   davParseWasm.reset();
+});
+
+test('realistic vocabularies cross in few ranges and rounds', { skip: skipWasm }, () => {
+  const { gguf: build, kv, STR, S, T, str, u32, u64 } = gen;
+  let seed = 7;
+  const rnd = (m) => { seed = (Math.imul(seed, 1103515245) + 12345) >>> 0; return seed % m; };
+  const word = () => 'ab▁cdéfgh'.slice(0, 1 + rnd(8)) + rnd(100000);
+  const strArr = (n, f) => [T.arr, Buffer.concat([u32(T.str), u64(n), ...Array.from({ length: n }, () => str(f()))])];
+  const numArr = (type, n, w) => [T.arr, Buffer.concat([u32(type), u64(n), Buffer.alloc(n * w, 1)])];
+  const shapes = {
+    gemma_262k: [kv('general.architecture', STR('gemma3')), kv('gemma3.block_count', S(T.u32, 48)), kv('tokenizer.ggml.model', STR('llama')),
+      kv('tokenizer.ggml.tokens', strArr(262144, word)), kv('tokenizer.ggml.scores', numArr(T.f32, 262144, 4)), kv('tokenizer.ggml.token_type', numArr(T.i32, 262144, 4)),
+      kv('tokenizer.chat_template', STR('{{ x }}'.repeat(2000))), kv('gemma3.context_length', S(T.u32, 131072))],
+    qwen_151k_merges: [kv('general.architecture', STR('qwen2')), kv('qwen2.block_count', S(T.u32, 28)),
+      kv('tokenizer.ggml.tokens', strArr(151936, word)), kv('tokenizer.ggml.token_type', numArr(T.i32, 151936, 4)),
+      kv('tokenizer.ggml.merges', strArr(151387, () => `${word()} ${word()}`)), kv('qwen2.context_length', S(T.u32, 32768))],
+  };
+  for (const [name, kvs] of Object.entries(shapes)) {
+    const file = tmp(build(kvs));
+    let rounds = 0, most = 0;
+    const spy = { ...davParseWasm, ggufSummary: (size, segs) => { rounds++; most = Math.max(most, segs.length); return davParseWasm.ggufSummary(size, segs); } };
+    assert.deepStrictEqual(readSummaryWasm(file, { wasm: spy }), summarize(readGguf(file)), name);
+    assert.ok(rounds < 40 && most < 16, `${name}: ${rounds} rounds, ${most} ranges`);
+    fs.rmSync(file);
+  }
+  davParseWasm.reset();
+});
+
+test('a crafted header cannot make the reads go on: rounds are bounded, the cap fails fast', { skip: skipWasm }, () => {
+  const { gguf: build, kv, STR, T, u32, u64, str } = gen;
+  // 6000 skipped strings of 5000 bytes: each skip jumps past a chunk, and the doubling reads that
+  // bridge them would pass the 24 MiB cap.
+  const many = tmp(build([kv('v', [T.arr, Buffer.concat([u32(T.str), u64(6000), ...Array.from({ length: 6000 }, () => str('z'.repeat(5000)))])]), kv('general.architecture', STR('m'))]));
+  let calls = 0;
+  const counting = { ...davParseWasm, ggufSummary: (size, segs) => { calls++; return davParseWasm.ggufSummary(size, segs); } };
+  assert.deepEqual(rs(many, { wasm: counting }), { error: 'GGUF header could not be checked (too_large)' });
+  assert.equal(js(many).summary.arch, 'm');
+  assert.ok(calls < 64, String(calls));
+  // Near a small cap the read fills it, so the next request over it fails at once.
+  calls = 0;
+  const three = tmp(build(Array.from({ length: 15 }, (_, i) => kv(`p${i}`, STR('p'.repeat(200 * 1024))))));
+  assert.deepEqual(rs(three, { wasm: counting, maxWindow: 1024 * 1024 }), { error: 'GGUF header could not be checked (too_large)' });
+  assert.ok(calls < 12, String(calls));
+  // A module that keeps asking for scraps further on is cut off by the round limit.
+  calls = 0;
+  const big = tmp(Buffer.alloc(64 * 1024 * 1024));
+  const scraps = { MAX_GGUF_WINDOW_BYTES: davParseWasm.MAX_GGUF_WINDOW_BYTES, MAX_GGUF_SEGMENTS: davParseWasm.MAX_GGUF_SEGMENTS, ggufSummary: () => { calls++; return { need: { at: calls * 10000, end: calls * 10000 + 1 } }; } };
+  assert.deepEqual(rs(big, { wasm: scraps }), { error: 'GGUF header could not be checked (too_large)' });
+  assert.ok(calls <= 2 * davParseWasm.MAX_GGUF_SEGMENTS + 65, String(calls));
+  // Scraps each just past the held run: every round doubles the run, so the cap ends it fast.
+  calls = 0;
+  let last = 0;
+  const onward = { ...scraps, ggufSummary: (size, segs) => { calls++; last = segs.at(-1).off + segs.at(-1).bytes.length; return { need: { at: last + 100, end: last + 101 } }; } };
+  assert.deepEqual(rs(big, { wasm: onward }), { error: 'GGUF header could not be checked (too_large)' });
+  assert.ok(calls < 20, String(calls));
+  fs.rmSync(big);
 });
 
 test('seeded live differential: mutated and truncated headers agree', { skip: skipWasm }, () => {

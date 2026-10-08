@@ -1145,7 +1145,7 @@ function s3Region(value) {
 
 // --- gguf-meta (GGUF_META_IMPL) ---------------------------------------------------------------
 // gguf::node::MAX_WINDOW_BYTES / MAX_SEGMENTS: the file bytes one call takes, in how many ranges.
-const MAX_GGUF_WINDOW_BYTES = 16 * 1024 * 1024;
+const MAX_GGUF_WINDOW_BYTES = 24 * 1024 * 1024;
 const MAX_GGUF_SEGMENTS = 512;
 const GGUF_FAILS = new Set(['not_gguf', 'limit', 'eof', 'range', 'nested']);
 const GGUF_SUMMARY_KEYS = ['arch', 'name', 'contextLength', 'embeddingLength', 'blockCount', 'headCount', 'headCountKv', 'keyLength', 'valueLength', 'keyLengthSwa', 'valueLengthSwa', 'slidingWindow', 'slidingWindowPattern', 'sharedKvLayers', 'fullAttentionInterval', 'ssmStateSize', 'expertCount', 'nextnPredictLayers', 'hasChatTemplate'];
@@ -1211,7 +1211,8 @@ function ggufSummary(size, segments) {
     input.set(s.bytes, at);
     at += s.bytes.length;
   });
-  const r = invoke(input, (e) => e.gguf_summary());
+  // Up to 24 MiB of header: the module-wide cap (MAX_DECODE_BYTES), not the 16 MiB listing one.
+  const r = invoke(input, (e) => e.gguf_summary(), MAX_DECODE_BYTES);
   if (exactKeys(r, ['summary'])) return { summary: ggufSummaryReply(r.summary) };
   if (exactKeys(r, ['need']) && exactKeys(r.need, ['at', 'end'])) {
     const { at: from, end } = r.need;
