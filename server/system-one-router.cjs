@@ -40,7 +40,7 @@ function createSystemOneRouter({ enabled, roles, fallback, env = process.env, ba
       const role = await fallback(message);
       return { role, routingDecision: { offered, scores: {}, selectedRole: null, effectiveRole: role,
         backend: 'legacy', model: null, calibrated: false, latencyMs: null, status: 'fallback',
-        fallbackReason: !enabled() ? 'disabled' : !routing ? 'no-backend' : 'missing-roles' } };
+        fallbackReason: !enabled() ? 'disabled' : !routing ? 'no-backend' : 'missing-roles', fallbackCause: null } };
     }
     const result = await routing.decisions.decide({ kind: 'choice', purpose: 'model.route',
       question: 'Which configured model role should answer this user message?',
@@ -50,11 +50,12 @@ function createSystemOneRouter({ enabled, roles, fallback, env = process.env, ba
     const scores = accepted ? Object.fromEntries(options.filter(o => Number.isFinite(result.scores?.[o.id]))
       .map(o => [o.id, result.scores[o.id]])) : {};
     const ranked = Object.values(scores).sort((a, b) => b - a);
+    // #682/#1070: the text-free cause behind a fallback (deadline, http-503, invalid-result, ...).
+    const cause = accepted ? null : (typeof result.metadata?.cause === 'string' && CAUSE_RE.test(result.metadata.cause) ? result.metadata.cause : null);
     log({ selected: accepted ? result.selected : 'legacy', options: options.length,
       margin: ranked.length > 1 ? Math.round((ranked[0] - ranked[1]) * 1000) / 1000 : null,
       ms: result.metadata?.latencyMs ?? null, fellBack: accepted ? null : (result.metadata?.fellBack || 'rejected'),
-      // #682: the text-free cause behind a fallback (deadline, http-503, invalid-result, ...).
-      cause: accepted ? null : (typeof result.metadata?.cause === 'string' && CAUSE_RE.test(result.metadata.cause) ? result.metadata.cause : null) });
+      cause });
     const role = accepted ? result.selected : await fallback(message);
     const fallbackReason = accepted ? null : (['deadline', 'no-backend-answered', 'low-confidence'].includes(result.metadata?.fellBack)
       ? result.metadata.fellBack : 'rejected');
@@ -62,7 +63,8 @@ function createSystemOneRouter({ enabled, roles, fallback, env = process.env, ba
       effectiveRole: role, backend: accepted ? (routing.backend.id === 'llama-logit' ? 'llama-logit' : 'decision-service') : 'legacy',
       model: accepted && result.metadata?.model === 'convaiinnovations/laya' ? 'convaiinnovations/laya' : null,
       calibrated: false, latencyMs: Number.isFinite(result.metadata?.latencyMs) ? result.metadata.latencyMs : null,
-      status: accepted ? 'accepted' : 'fallback', fallbackReason } };
+      // The badge states the real reason (#1070): e.g. http-503 is Laya missing its own deadline.
+      status: accepted ? 'accepted' : 'fallback', fallbackReason, fallbackCause: cause } };
   }
   return {
     classifyWithDetails,
