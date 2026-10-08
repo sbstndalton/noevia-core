@@ -39,6 +39,10 @@
 //   - crates/policy-leaves authTokens = auth-tokens.cjs resolveAuthTokens (#294, a secret call);
 //                          toolPolicyMode/toolPolicySet = tool-policy.cjs's decision and set()
 //                          checks, the database stays in the JS (POLICY_LEAVES_IMPL)
+//   - crates/review-verdict reviewVerdictRead/reviewEventBound = code-review-verdict.cjs readVerdict
+//                          and boundReviewEvent over a tagged copy of the JS value (CODE_REVIEW_VERDICT_IMPL, #519)
+//   - crates/tool-exchange toolExchangeCheck/toolExchangeError = tool-exchange.cjs's pre-run checks,
+//                          dedupe key and failed-call text; the exchange stays in the JS (TOOL_EXCHANGE_IMPL)
 //
 // Memory: WebAssembly memory only grows. A listing or path call needs at most ~16 MiB; an upload
 // decode copies the upload in (at most 25 MiB) and holds one copy of its text (at most 3 bytes per
@@ -70,7 +74,7 @@ const MAX_DECODE_BYTES = 25 * 1024 * 1024;
 // Only the first bytes decide an archive magic number (`ustar` ends at 262).
 const SNIFF_BYTES = 262;
 const RESET_AFTER_BYTES = 1024 * 1024;
-const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'secret_open', 'secret_seal', 'mcp_rpc_body', 'mcp_schema_refs', 'template_caps', 'provider_error', 'serving_verdict', 'autotune_plan', 'preset_reload', 'load_verdict', 'tune_contention', 'frame_untrusted', 'escape_closing', 'provenance', 'task_packet', 'long_profile', 's3_sign', 's3_region', 'ssrf_policy', 'stream_guard', 'gguf_summary', 'auth_tokens', 'tool_policy', 'dav_output_ptr', 'dav_output_len'];
+const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'secret_open', 'secret_seal', 'mcp_rpc_body', 'mcp_schema_refs', 'template_caps', 'provider_error', 'serving_verdict', 'autotune_plan', 'preset_reload', 'load_verdict', 'tune_contention', 'frame_untrusted', 'escape_closing', 'provenance', 'task_packet', 'long_profile', 's3_sign', 's3_region', 'ssrf_policy', 'stream_guard', 'gguf_summary', 'auth_tokens', 'tool_policy', 'review_verdict', 'tool_exchange', 'dav_output_ptr', 'dav_output_len'];
 
 class DavParseError extends Error {
   constructor(message, reason) {
@@ -1294,13 +1298,178 @@ function toolPolicySet(value, writes) {
   throw new DavParseError('tool policy reply has an unexpected shape', 'reply');
 }
 
+// --- review verdict (CODE_REVIEW_VERDICT_IMPL) -------------------------------------------------
+// review_verdict::MAX_INPUT_BYTES (the op byte and the tagged JSON).
+const MAX_REVIEW_BYTES = 4 * 1024 * 1024 + 1;
+// Containers deeper than this, and arrays or objects with more entries, cross as ['x']: the port
+// never looks inside them (readVerdict only looks three levels down).
+const REVIEW_TAG_DEPTH = 3;
+const REVIEW_TAG_ENTRIES = 65536;
+const REVIEW_VERDICTS = new Set(['approve', 'request_changes']);
+const REVIEW_SEVERITIES = new Set(['blocker', 'major', 'minor', 'note']);
+const REVIEW_INVALID = new Set(['fields', 'verdict', 'missing', 'too_many', 'malformed', 'no_message', 'no_summary', 'unspecified', 'blocked']);
+const REVIEW_SHA = /^[0-9a-f]{7,64}$/;
+
+/** A JS value in review-verdict's tagged JSON form (see that crate's docs): what JSON.stringify
+ *  would lose (undefined, -0, NaN, functions, keys holding undefined) crosses explicitly, and any
+ *  object that is not a plain object or a dense plain array crosses as ['x']. */
+function reviewTag(v, depth = 0) {
+  if (v === undefined) return ['u'];
+  if (v === null || typeof v === 'boolean' || typeof v === 'string') return v;
+  if (typeof v === 'number') {
+    if (Object.is(v, -0)) return ['n', '-0'];
+    if (Number.isNaN(v)) return ['n', 'NaN'];
+    if (!Number.isFinite(v)) return ['n', v > 0 ? 'Infinity' : '-Infinity'];
+    return v;
+  }
+  if (typeof v !== 'object') return ['f'];
+  if (depth >= REVIEW_TAG_DEPTH) return ['x'];
+  if (Array.isArray(v)) {
+    if (Object.getPrototypeOf(v) !== Array.prototype || v.length > REVIEW_TAG_ENTRIES) return ['x'];
+    const items = [];
+    for (let i = 0; i < v.length; i++) {
+      if (!Object.hasOwn(v, i)) return ['x'];
+      items.push(reviewTag(v[i], depth + 1));
+    }
+    return ['a', items];
+  }
+  const proto = Object.getPrototypeOf(v);
+  if (proto !== Object.prototype && proto !== null) return ['x'];
+  const keys = Object.keys(v);
+  if (keys.length > REVIEW_TAG_ENTRIES) return ['x'];
+  return ['o', keys.map((k) => [k, reviewTag(v[k], depth + 1)])];
+}
+
+function reviewRequest(op, value) {
+  const body = encoder.encode(JSON.stringify(value));
+  if (body.length + 1 > MAX_REVIEW_BYTES) throw new DavParseError('review verdict input is too large', 'too_large');
+  const input = new Uint8Array(body.length + 1);
+  input[0] = op; input.set(body, 1);
+  return invoke(input, (e) => e.review_verdict(), MAX_REVIEW_BYTES);
+}
+
+const codePoints = (s) => Array.from(s).length;
+const cleanText = (s, max) => typeof s === 'string' && s.length > 0 && codePoints(s) <= max;
+
+/** A verdict reply as readVerdict returns it, checked: the schema's fields only, cleaned text
+ *  within its limits, and consistent (request_changes lists something, approve has no blocker). */
+function reviewVerdictReply(v) {
+  if (!exactKeys(v, ['verdict', 'summary', 'findings']) || !REVIEW_VERDICTS.has(v.verdict) || !cleanText(v.summary, 600)
+    || !Array.isArray(v.findings) || v.findings.length > 12) throw new DavParseError('review verdict reply has an unexpected shape', 'reply');
+  const findings = v.findings.map((f) => {
+    const withFile = exactKeys(f, ['severity', 'file', 'message']);
+    if (!(withFile || exactKeys(f, ['severity', 'message'])) || !REVIEW_SEVERITIES.has(f.severity) || !cleanText(f.message, 600)
+      || (withFile && !cleanText(f.file, 240))) throw new DavParseError('review verdict reply has an unexpected finding', 'reply');
+    return withFile ? { severity: f.severity, file: f.file, message: f.message } : { severity: f.severity, message: f.message };
+  });
+  if ((v.verdict === 'request_changes' && !findings.length) || (v.verdict === 'approve' && findings.some((f) => f.severity === 'blocker'))) {
+    throw new DavParseError('review verdict reply is inconsistent', 'reply');
+  }
+  return { verdict: v.verdict, summary: v.summary, findings };
+}
+
+/** code-review-verdict.cjs readVerdict(raw) through the Rust port: `{ verdict }` (the cleaned
+ *  verdict) or `{ invalid: code }` (which ReviewVerdictError the JS throws). A refusal (including
+ *  'opaque': the JS would look inside an object the port is not shown) or a bad reply throws. */
+function reviewVerdictRead(raw) {
+  const r = reviewRequest(1, reviewTag(raw));
+  if (exactKeys(r, ['verdict'])) return { verdict: reviewVerdictReply(r.verdict) };
+  if (exactKeys(r, ['invalid']) && REVIEW_INVALID.has(r.invalid)) return { invalid: r.invalid };
+  throw new DavParseError('review verdict reply has an unexpected shape', 'reply');
+}
+
+const reviewSha = (v) => v === null || (typeof v === 'string' && REVIEW_SHA.test(v));
+
+/** code-review-verdict.cjs boundReviewEvent(type, data) through the Rust port (`data` after the
+ *  JS's `= {}` default). Returns the event, checked; a refusal or bad reply throws. */
+function reviewEventBound(type, data) {
+  const r = reviewRequest(2, [reviewTag(type), reviewTag(data)]);
+  const e = exactKeys(r, ['event']) ? r.event : null;
+  const base = (x) => x.reviewer === 'planner' && reviewSha(x.baseSha) && reviewSha(x.headSha);
+  if (e && e.status === 'pending' && exactKeys(e, ['status', 'reviewer', 'baseSha', 'headSha', 'files']) && base(e)
+    && (e.files === null || (Number.isInteger(e.files) && e.files >= 0 && e.files <= 100000))) {
+    return { status: 'pending', reviewer: 'planner', baseSha: e.baseSha, headSha: e.headSha, files: e.files };
+  }
+  if (e && e.status === 'failed' && exactKeys(e, ['status', 'reviewer', 'baseSha', 'headSha', 'code', 'reason']) && base(e)
+    && cleanText(e.code, 40) && cleanText(e.reason, 300)) {
+    return { status: 'failed', reviewer: 'planner', baseSha: e.baseSha, headSha: e.headSha, code: e.code, reason: e.reason };
+  }
+  if (e && e.status === 'completed' && exactKeys(e, ['status', 'reviewer', 'baseSha', 'headSha', 'verdict', 'summary', 'findings', 'corrected'])
+    && base(e) && typeof e.corrected === 'boolean') {
+    const v = reviewVerdictReply({ verdict: e.verdict, summary: e.summary, findings: e.findings });
+    return { status: 'completed', reviewer: 'planner', baseSha: e.baseSha, headSha: e.headSha, ...v, corrected: e.corrected };
+  }
+  throw new DavParseError('review event reply has an unexpected shape', 'reply');
+}
+
+// --- tool exchange (TOOL_EXCHANGE_IMPL) ---------------------------------------------------------
+// tool_exchange::MAX_ARGS_UNITS / MAX_NAME_UNITS / MAX_INPUT_BYTES.
+const MAX_EXCHANGE_ARGS_UNITS = 4 * 1024 * 1024;
+const MAX_EXCHANGE_NAME_UNITS = 65536;
+const MAX_EXCHANGE_BYTES = 1 + 2 + 4 + 2 * MAX_EXCHANGE_NAME_UNITS + 1 + 2 * MAX_EXCHANGE_ARGS_UNITS;
+
+const exchangeString = (s) => {
+  const out = new Uint8Array(4 + 2 * s.length);
+  new DataView(out.buffer).setUint32(0, s.length, true);
+  out.set(utf16le(s), 4);
+  return out;
+};
+
+function exchangeInvoke(parts) {
+  const input = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let at = 0;
+  for (const p of parts) { input.set(p, at); at += p.length; }
+  const { status, bytes } = invokeRaw(input, (e) => e.tool_exchange(), MAX_EXCHANGE_BYTES);
+  if (status !== 0) {
+    let code = 'unknown';
+    try { const r = JSON.parse(utf8(bytes)); if (r && typeof r.error === 'string') code = r.error; } catch { /* keep unknown */ }
+    throw new DavParseError(`tool exchange refused by dav-parse (${code})`, code);
+  }
+  if (!bytes.length || bytes[0] > 1) throw new DavParseError('tool exchange reply has an unexpected tag', 'reply');
+  return { tag: bytes[0], text: fromUtf16le(bytes.subarray(1)) };
+}
+
+/** tool-exchange.cjs's checks before a tool runs, through the Rust port. `args` is null for the
+ *  JS's falsy `call.args`, else `String(call.args)`. Returns `{ key }` (run it, deduplicated on
+ *  key) or `{ answer }` (the tool result; do not run it). A refusal or bad reply throws. */
+function toolExchangeCheck(aborted, allowed, name, args) {
+  if (typeof aborted !== 'boolean' || typeof allowed !== 'boolean' || typeof name !== 'string' || (args !== null && typeof args !== 'string')) {
+    throw new DavParseError('tool exchange input has the wrong type', 'input');
+  }
+  if (name.length > MAX_EXCHANGE_NAME_UNITS || (args !== null && args.length > MAX_EXCHANGE_ARGS_UNITS)) throw new DavParseError('tool exchange input is too large', 'too_large');
+  const parts = [Uint8Array.of(1, aborted ? 1 : 0, allowed ? 1 : 0), exchangeString(name), Uint8Array.of(args === null ? 0 : 1)];
+  if (args !== null) parts.push(utf16le(args));
+  const { tag, text } = exchangeInvoke(parts);
+  if (tag === 1) {
+    if (!text.startsWith('ERROR: ')) throw new DavParseError('tool exchange answer has an unexpected shape', 'reply');
+    return { answer: text };
+  }
+  // The key is JSON.stringify([name, canonical]): check it is exactly that shape for this name.
+  let k;
+  try { k = JSON.parse(text); } catch { k = null; }
+  if (!(Array.isArray(k) && k.length === 2 && k[0] === name && typeof k[1] === 'string' && k[1].startsWith('{') && k[1].endsWith('}'))) {
+    throw new DavParseError('tool exchange key has an unexpected shape', 'reply');
+  }
+  return { key: text };
+}
+
+/** `ERROR calling <name>: <message, first 300 units>` through the Rust port; `message` is the
+ *  coerced text (only its first MAX_EXCHANGE_NAME_UNITS units cross). */
+function toolExchangeError(name, message) {
+  if (typeof name !== 'string' || typeof message !== 'string') throw new DavParseError('tool exchange input has the wrong type', 'input');
+  if (name.length > MAX_EXCHANGE_NAME_UNITS) throw new DavParseError('tool exchange input is too large', 'too_large');
+  const { tag, text } = exchangeInvoke([Uint8Array.of(2), exchangeString(name), exchangeString(message.slice(0, MAX_EXCHANGE_NAME_UNITS))]);
+  if (tag !== 1 || !text.startsWith(`ERROR calling ${name}: `)) throw new DavParseError('tool exchange error text has an unexpected shape', 'reply');
+  return text;
+}
+
 /** Test hook: the cached instance's linear memory in bytes (0 when there is none). */
 function memoryBytes() { return cached?.instance ? cached.instance.exports.memory.buffer.byteLength : 0; }
 
 // Every switch that runs this module (#996). Each reads its value as trim().toLowerCase().
 // CHAT_TEMPLATE_CAPS_IMPL counts only when set to wasm explicitly; its default (also wasm) is
 // checked by chat-template-caps.cjs startup(), which falls back to off instead of stopping.
-const IMPL_FLAGS = ['DAV_PARSE_IMPL', 'S3_PARSE_IMPL', 'STORAGE_PATH_IMPL', 'UPLOAD_SNIFF_IMPL', 'SECRET_ENVELOPE_IMPL', 'MCP_FRAME_IMPL', 'CHAT_TEMPLATE_CAPS_IMPL', 'AUTOTUNE_PLAN_IMPL', 'PRESET_RELOAD_IMPL', 'PROMPT_FRAMING_IMPL', 'S3_SIGN_IMPL', 'SSRF_IMPL', 'STREAM_GUARD_IMPL', 'GGUF_META_IMPL', 'POLICY_LEAVES_IMPL'];
+const IMPL_FLAGS = ['DAV_PARSE_IMPL', 'S3_PARSE_IMPL', 'STORAGE_PATH_IMPL', 'UPLOAD_SNIFF_IMPL', 'SECRET_ENVELOPE_IMPL', 'MCP_FRAME_IMPL', 'CHAT_TEMPLATE_CAPS_IMPL', 'AUTOTUNE_PLAN_IMPL', 'PRESET_RELOAD_IMPL', 'PROMPT_FRAMING_IMPL', 'S3_SIGN_IMPL', 'SSRF_IMPL', 'STREAM_GUARD_IMPL', 'GGUF_META_IMPL', 'POLICY_LEAVES_IMPL', 'CODE_REVIEW_VERDICT_IMPL', 'TOOL_EXCHANGE_IMPL'];
 
 /** The *_IMPL switches set to wasm in `env`. */
 function wasmFlags(env = process.env) {
@@ -1338,4 +1507,4 @@ function verifyAtStartup(env = process.env, { hostname } = {}) {
 /** Test hook: forget the cached module (and its failure). */
 function reset() { cached = null; }
 
-module.exports = { ggufSummary, ggufSummaryReply, MAX_GGUF_WINDOW_BYTES, MAX_GGUF_SEGMENTS, authTokens, toolPolicyMode, toolPolicySet, MAX_POLICY_UNITS, MAX_POLICY_TOOLS, streamGuardSchema, streamGuardOptions, streamGuardNew, streamGuardFeed, streamGuardEnd, streamGuardCheck, streamGuardCheckReply, streamGuardCorrection, streamGuardReply, plainJson, MAX_GUARD_BYTES, MAX_GUARD_DEPTH, MAX_GUARD_SCHEMA_BYTES, MAX_GUARD_STATE_BYTES, MAX_GUARD_INPUT_BYTES, MAX_CORRECTION_UNITS, s3Sign, s3Region, MAX_S3_FIELD_BYTES, MAX_S3_QUERY_PAIRS, MAX_S3_PAYLOAD_BYTES, wasmFlags, verifyAtStartup, framingRuntimeMatches, IMPL_FLAGS, ssrfUrl, ssrfAddressesPublic, ssrfUrlReply, ssrfAddressesReply, MAX_SSRF_BYTES, MAX_SSRF_ADDRESSES, frameUntrusted, escapeClosing, provenanceNew, provenanceIngest, provenanceAdd, provenanceSource, provenanceCheck, provenanceProbe, packetParse, packetValidate, packetRender, FRAME_TEXT_UNITS, FRAME_LABEL_UNITS, MAX_PROVENANCE_BYTES, MAX_PACKET_BYTES, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, tuneContention, tuneContentionText, MAX_CONTENTION_BYTES, longProfilePairs, longProfileSection, longProfilePick, longProfileText, MAX_LONG_PROFILE_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
+module.exports = { reviewTag, reviewVerdictRead, reviewEventBound, reviewVerdictReply, MAX_REVIEW_BYTES, toolExchangeCheck, toolExchangeError, MAX_EXCHANGE_ARGS_UNITS, MAX_EXCHANGE_NAME_UNITS, ggufSummary, ggufSummaryReply, MAX_GGUF_WINDOW_BYTES, MAX_GGUF_SEGMENTS, authTokens, toolPolicyMode, toolPolicySet, MAX_POLICY_UNITS, MAX_POLICY_TOOLS, streamGuardSchema, streamGuardOptions, streamGuardNew, streamGuardFeed, streamGuardEnd, streamGuardCheck, streamGuardCheckReply, streamGuardCorrection, streamGuardReply, plainJson, MAX_GUARD_BYTES, MAX_GUARD_DEPTH, MAX_GUARD_SCHEMA_BYTES, MAX_GUARD_STATE_BYTES, MAX_GUARD_INPUT_BYTES, MAX_CORRECTION_UNITS, s3Sign, s3Region, MAX_S3_FIELD_BYTES, MAX_S3_QUERY_PAIRS, MAX_S3_PAYLOAD_BYTES, wasmFlags, verifyAtStartup, framingRuntimeMatches, IMPL_FLAGS, ssrfUrl, ssrfAddressesPublic, ssrfUrlReply, ssrfAddressesReply, MAX_SSRF_BYTES, MAX_SSRF_ADDRESSES, frameUntrusted, escapeClosing, provenanceNew, provenanceIngest, provenanceAdd, provenanceSource, provenanceCheck, provenanceProbe, packetParse, packetValidate, packetRender, FRAME_TEXT_UNITS, FRAME_LABEL_UNITS, MAX_PROVENANCE_BYTES, MAX_PACKET_BYTES, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, tuneContention, tuneContentionText, MAX_CONTENTION_BYTES, longProfilePairs, longProfileSection, longProfilePick, longProfileText, MAX_LONG_PROFILE_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
