@@ -74,7 +74,7 @@ jobs:
       # #967: dav-parse.wasm at the noevia-rs ref pinned in server/dav-parse.lock, checksum-verified
       # (tarball and module), so the differential and DAV_PARSE_IMPL=wasm tests run for real; since
       # #976/#978 the same module carries s3-list-parse and storage-path (S3_PARSE_IMPL,
-      # STORAGE_PATH_IMPL), and since #977 upload-sniff (UPLOAD_SNIFF_IMPL), since #979 secret-envelope (SECRET_ENVELOPE_IMPL), since #980 mcp-frame (MCP_FRAME_IMPL), since #1002 chat-template-caps and provider-error (CHAT_TEMPLATE_CAPS_IMPL), since #1003 autotune-plan (AUTOTUNE_PLAN_IMPL), since #1012 preset-reload (PRESET_RELOAD_IMPL), since #1004 load-verdict (LAYA_LOAD_ADVISOR), since #1062 tune-contention (always on, fails closed), since #769/#740 prompt-framing (PROMPT_FRAMING_IMPL), s3-sign (S3_SIGN_IMPL). The shared fixture tables must be byte-identical to noevia-rs's copies. Since #1079 long-profile (always on, fails closed). Since #795 ssrf-policy (SSRF_IMPL). Since #516/#704 stream-guard (STREAM_GUARD_IMPL). gguf-meta (GGUF_META_IMPL) and policy-leaves (POLICY_LEAVES_IMPL). review-verdict (CODE_REVIEW_VERDICT_IMPL) and tool-exchange (TOOL_EXCHANGE_IMPL).
+      # STORAGE_PATH_IMPL), and since #977 upload-sniff (UPLOAD_SNIFF_IMPL), since #979 secret-envelope (SECRET_ENVELOPE_IMPL), since #980 mcp-frame (MCP_FRAME_IMPL), since #1002 chat-template-caps and provider-error (CHAT_TEMPLATE_CAPS_IMPL), since #1003 autotune-plan (AUTOTUNE_PLAN_IMPL), since #1012 preset-reload (PRESET_RELOAD_IMPL), since #1004 load-verdict (LAYA_LOAD_ADVISOR), since #1062 tune-contention (always on, fails closed), since #769/#740 prompt-framing (PROMPT_FRAMING_IMPL), s3-sign (S3_SIGN_IMPL). The shared fixture tables must be byte-identical to noevia-rs's copies. Since #1079 long-profile (always on, fails closed). Since #795 ssrf-policy (SSRF_IMPL). Since #516/#704 stream-guard (STREAM_GUARD_IMPL). gguf-meta (GGUF_META_IMPL) and policy-leaves (POLICY_LEAVES_IMPL). review-verdict (CODE_REVIEW_VERDICT_IMPL) and tool-exchange (TOOL_EXCHANGE_IMPL). mcp-servers (MCP_SERVERS_IMPL) and decision (DECISION_IMPL).
       - uses: dtolnay/rust-toolchain@70dec6087f2cb6bab9fbac4da23160afbe848e91 # 1.99.0
         with:
           targets: wasm32-unknown-unknown
@@ -116,6 +116,8 @@ jobs:
           cmp "$RUNNER_TEMP/rs/crates/policy-leaves/tests/fixtures/policy-leaves.v1.json" tests/fixtures/policy-leaves.v1.json
           cmp "$RUNNER_TEMP/rs/crates/review-verdict/tests/fixtures/code-review-verdict.v1.json" tests/fixtures/code-review-verdict.v1.json
           cmp "$RUNNER_TEMP/rs/crates/tool-exchange/tests/fixtures/tool-exchange.v1.json" tests/fixtures/tool-exchange.v1.json
+          cmp "$RUNNER_TEMP/rs/crates/mcp-servers/tests/fixtures/mcp-servers.v1.json" tests/fixtures/mcp-servers.v1.json
+          cmp "$RUNNER_TEMP/rs/crates/decision/tests/fixtures/decision.v1.json" tests/fixtures/decision.v1.json
           rustup target add wasm32-unknown-unknown --toolchain 1.99.0
           "$RUNNER_TEMP/rs/tools/build-dav-parse-wasm.sh" "$PWD/server/wasm/dav-parse.wasm"
           echo "$DAV_PARSE_WASM_SHA256  server/wasm/dav-parse.wasm" | sha256sum -c -
@@ -324,7 +326,7 @@ jobs:
           cache-to: type=gha,mode=max
       # noevia #990: the differential tests compare Node's own decoders (TextDecoder windows-1252,
       # base64url) with the Rust module. The image build runs the tests on the alpine build stage;
-      # this runs the upload-sniff, secret-envelope, mcp-frame, s3-sign, stream-guard, gguf-meta, policy-leaves, code-review-verdict and tool-exchange (JSON.parse, String#trim, URL, /\s/, Number#toString, utf8 decoding,
+      # this runs the upload-sniff, secret-envelope, mcp-frame, s3-sign, stream-guard, gguf-meta, policy-leaves, code-review-verdict, tool-exchange, mcp-servers and decision (JSON.parse, String#trim, URL, /\s/, Number#toString, utf8 decoding,
       # Object.prototype) ones on the exact runtime image that ships
       # (node:22-bookworm, whatever Node 22.x it resolves to), not on the runner's Node.
       - name: Differential tests on the shipped runtime image
@@ -332,4 +334,4 @@ jobs:
           set -euo pipefail
           docker run --rm -e DAV_PARSE_WASM_REQUIRED=1 \
             -v "$TREE/core/tests:/app/tests:ro" -w /app noevia-web:ci sh -c \
-            'node --version && node --test tests/server/upload-sniff-differential.test.cjs tests/server/secret-envelope-differential.test.cjs tests/server/mcp-frame-differential.test.cjs tests/server/chat-template-caps-differential.test.cjs tests/server/autotune-plan-differential.test.cjs tests/server/load-verdict-differential.test.cjs tests/server/tune-contention-differential.test.cjs tests/server/long-profile-differential.test.cjs tests/server/s3-sign-differential.test.cjs tests/server/stream-guard-differential.test.cjs tests/server/gguf-meta-differential.test.cjs tests/server/policy-leaves-differential.test.cjs tests/server/code-review-verdict-differential.test.cjs tests/server/tool-exchange-differential.test.cjs'
+            'node --version && node --test tests/server/upload-sniff-differential.test.cjs tests/server/secret-envelope-differential.test.cjs tests/server/mcp-frame-differential.test.cjs tests/server/chat-template-caps-differential.test.cjs tests/server/autotune-plan-differential.test.cjs tests/server/load-verdict-differential.test.cjs tests/server/tune-contention-differential.test.cjs tests/server/long-profile-differential.test.cjs tests/server/s3-sign-differential.test.cjs tests/server/stream-guard-differential.test.cjs tests/server/gguf-meta-differential.test.cjs tests/server/policy-leaves-differential.test.cjs tests/server/code-review-verdict-differential.test.cjs tests/server/tool-exchange-differential.test.cjs tests/server/mcp-servers-differential.test.cjs tests/server/decision-differential.test.cjs'

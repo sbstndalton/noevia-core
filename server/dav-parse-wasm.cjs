@@ -43,6 +43,10 @@
 //                          and boundReviewEvent over a tagged copy of the JS value (CODE_REVIEW_VERDICT_IMPL, #519)
 //   - crates/tool-exchange toolExchangeCheck/toolExchangeError = tool-exchange.cjs's pre-run checks,
 //                          dedupe key and failed-call text; the exchange stays in the JS (TOOL_EXCHANGE_IMPL)
+//   - crates/mcp-servers   mcpServersParse/mcpToolboxes/mcpToolboxOffered = mcp-servers.cjs
+//                          parseMcpServers, parseEnabledToolboxes, toolboxOffered (MCP_SERVERS_IMPL)
+//   - crates/decision      decisionInvalidRequest/decisionInvalidResult/decisionCauseOf =
+//                          decision/index.cjs's pure checks over a projection (DECISION_IMPL)
 //
 // Memory: WebAssembly memory only grows. A listing or path call needs at most ~16 MiB; an upload
 // decode copies the upload in (at most 25 MiB) and holds one copy of its text (at most 3 bytes per
@@ -74,7 +78,7 @@ const MAX_DECODE_BYTES = 25 * 1024 * 1024;
 // Only the first bytes decide an archive magic number (`ustar` ends at 262).
 const SNIFF_BYTES = 262;
 const RESET_AFTER_BYTES = 1024 * 1024;
-const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'secret_open', 'secret_seal', 'mcp_rpc_body', 'mcp_schema_refs', 'template_caps', 'provider_error', 'serving_verdict', 'autotune_plan', 'preset_reload', 'load_verdict', 'tune_contention', 'frame_untrusted', 'escape_closing', 'provenance', 'task_packet', 'long_profile', 's3_sign', 's3_region', 'ssrf_policy', 'stream_guard', 'gguf_summary', 'auth_tokens', 'tool_policy', 'review_verdict', 'tool_exchange', 'dav_output_ptr', 'dav_output_len'];
+const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'secret_open', 'secret_seal', 'mcp_rpc_body', 'mcp_schema_refs', 'template_caps', 'provider_error', 'serving_verdict', 'autotune_plan', 'preset_reload', 'load_verdict', 'tune_contention', 'frame_untrusted', 'escape_closing', 'provenance', 'task_packet', 'long_profile', 's3_sign', 's3_region', 'ssrf_policy', 'stream_guard', 'gguf_summary', 'auth_tokens', 'tool_policy', 'review_verdict', 'tool_exchange', 'mcp_servers', 'decision', 'dav_output_ptr', 'dav_output_len'];
 
 class DavParseError extends Error {
   constructor(message, reason) {
@@ -1463,13 +1467,171 @@ function toolExchangeError(name, message) {
   return text;
 }
 
+// --- mcp servers (MCP_SERVERS_IMPL) -------------------------------------------------------------
+// mcp_servers::MAX_INPUT_BYTES (the op byte and the JSON).
+const MAX_MCP_SERVERS_BYTES = 1024 * 1024 + 1;
+const MCP_AUTHS = new Set(['none', 'nextcloud', 'internal', 'bearer']);
+
+function opJson(op, value, max, call, what) {
+  const body = encoder.encode(JSON.stringify(value));
+  if (body.length + 1 > max) throw new DavParseError(`${what} input is too large`, 'too_large');
+  const input = new Uint8Array(body.length + 1);
+  input[0] = op; input.set(body, 1);
+  return invoke(input, call, max);
+}
+const mcpRequest = (op, value) => opJson(op, value, MAX_MCP_SERVERS_BYTES, (e) => e.mcp_servers(), 'mcp servers');
+const nullOrString = (v) => v === null || typeof v === 'string';
+
+/** mcp-servers.cjs parseMcpServers through the Rust port, given MCP_SERVERS and MCP_SERVER_URL
+ *  (string or null). Returns `{ servers, warnings }`, shape-checked: a warning is its text or
+ *  `{ bearer, id }` (print only when that variable is unset). mcp-servers.cjs checks the servers
+ *  against the JS's rules again. A refusal or bad reply throws. */
+function mcpServersParse(list, single) {
+  if (!nullOrString(list) || !nullOrString(single)) throw new DavParseError('mcp servers input has the wrong type', 'input');
+  const r = mcpRequest(1, [list, single]);
+  if (!exactKeys(r, ['servers', 'warnings']) || !Array.isArray(r.servers) || !Array.isArray(r.warnings)) throw new DavParseError('mcp servers reply has an unexpected shape', 'reply');
+  for (const sv of r.servers) {
+    const bearer = sv?.auth === 'bearer';
+    if (!exactKeys(sv, bearer ? ['id', 'url', 'auth', 'tokenEnv'] : ['id', 'url', 'auth']) || typeof sv.id !== 'string' || typeof sv.url !== 'string'
+      || !MCP_AUTHS.has(sv.auth) || (bearer && typeof sv.tokenEnv !== 'string')) throw new DavParseError('mcp servers reply has an unexpected server', 'reply');
+  }
+  for (const w of r.warnings) {
+    if (typeof w !== 'string' && !(exactKeys(w, ['bearer', 'id']) && /^[A-Z0-9_]+$/.test(w.bearer) && typeof w.id === 'string')) {
+      throw new DavParseError('mcp servers reply has an unexpected warning', 'reply');
+    }
+  }
+  return { servers: r.servers, warnings: r.warnings };
+}
+
+/** mcp-servers.cjs parseEnabledToolboxes through the Rust port: null (offer everything) or the
+ *  distinct non-empty ids. A refusal or bad reply throws. */
+function mcpToolboxes(raw) {
+  if (!nullOrString(raw)) throw new DavParseError('mcp toolboxes input has the wrong type', 'input');
+  const r = mcpRequest(2, raw);
+  const ids = exactKeys(r, ['enabled']) ? r.enabled : undefined;
+  if (ids === null) return null;
+  if (!Array.isArray(ids) || !ids.length || !ids.every((x) => typeof x === 'string' && x.length > 0) || new Set(ids).size !== ids.length) {
+    throw new DavParseError('mcp toolboxes reply has an unexpected shape', 'reply');
+  }
+  return ids;
+}
+
+/** toolboxOffered(id) through the Rust port, `enabled` null or the ids. */
+function mcpToolboxOffered(enabled, id) {
+  if (typeof id !== 'string' || !(enabled === null || (Array.isArray(enabled) && enabled.every((x) => typeof x === 'string')))) {
+    throw new DavParseError('mcp toolbox input has the wrong type', 'input');
+  }
+  const r = mcpRequest(3, [enabled, id]);
+  if (!exactKeys(r, ['offered']) || typeof r.offered !== 'boolean') throw new DavParseError('mcp toolbox reply has an unexpected shape', 'reply');
+  return r.offered;
+}
+
+// --- decision (DECISION_IMPL) -------------------------------------------------------------------
+// decision::MAX_INPUT_BYTES (the op byte and the tagged JSON).
+const MAX_DECISION_BYTES = 4 * 1024 * 1024 + 1;
+// Arrays longer than this, sparse ones and ones with another prototype cross as ['h', length]; an
+// object with more keys as ['x'].
+const DECISION_ENTRIES = 65536;
+// A TypeError message longer than this is not read (causeOf answers 'exception').
+const MAX_DECISION_MESSAGE_UNITS = 1024 * 1024;
+const REQUEST_INVALID = new Set(['not an object', 'unknown kind', 'purpose required', 'fallback required', 'deadlineMs required', 'rank needs items', 'options required']);
+const RESULT_INVALID = new Set(['no scores', 'score for an id that was not offered', 'non-numeric score', 'ranking outside the items', 'duplicate in ranking', 'choice outside the options']);
+const DECISION_CAUSE = /^[a-z][a-z0-9-]{0,39}$/;
+
+/** A value the port never looks inside (decision crate docs): scalars as review-verdict's tagged
+ *  form, every object ['x'], functions, symbols and bigints ['f']. */
+function decisionLeaf(v) {
+  if (v === undefined) return ['u'];
+  if (v === null || typeof v === 'boolean' || typeof v === 'string') return v;
+  if (typeof v === 'number') {
+    if (Object.is(v, -0)) return ['n', '-0'];
+    if (Number.isNaN(v)) return ['n', 'NaN'];
+    if (!Number.isFinite(v)) return ['n', v > 0 ? 'Infinity' : '-Infinity'];
+    return v;
+  }
+  return typeof v === 'object' ? ['x'] : ['f'];
+}
+const isObjectLike = (v) => v !== null && (typeof v === 'object' || typeof v === 'function');
+function decisionList(x, each) {
+  if (!Array.isArray(x)) return decisionLeaf(x);
+  if (Object.getPrototypeOf(x) !== Array.prototype || x.length > DECISION_ENTRIES) return ['h', x.length];
+  const out = [];
+  for (let i = 0; i < x.length; i++) {
+    if (!Object.hasOwn(x, i)) return ['h', x.length];
+    out.push(each(x[i]));
+  }
+  return ['a', out];
+}
+// An option or item: only its id is read (`.id` of a primitive is undefined; of null it throws).
+const decisionItem = (o) => (isObjectLike(o) ? ['o', [['id', decisionLeaf(o.id)]]] : decisionLeaf(o));
+
+/** The request as invalidRequest / invalidResult read it. */
+function decisionRequestTag(r) {
+  if (r === null || typeof r !== 'object') return decisionLeaf(r);
+  const c = r.constraints;
+  return ['o', [
+    ['kind', decisionLeaf(r.kind)], ['purpose', decisionLeaf(r.purpose)], ['fallback', decisionLeaf(r.fallback)],
+    ['constraints', isObjectLike(c) ? ['o', [['deadlineMs', decisionLeaf(c.deadlineMs)]]] : decisionLeaf(c)],
+    ['items', decisionList(r.items, decisionItem)], ['options', decisionList(r.options, decisionItem)],
+  ]];
+}
+
+/** A backend's answer as invalidResult reads it: scores' own keys and values, selected. */
+function decisionResultTag(result) {
+  if (result === null || typeof result !== 'object') return decisionLeaf(result);
+  const s = result.scores;
+  let scores = decisionLeaf(s);
+  if (s !== null && typeof s === 'object') {
+    const keys = Object.keys(s);
+    scores = keys.length > DECISION_ENTRIES ? ['x'] : ['o', keys.map((k) => [k, decisionLeaf(s[k])])];
+  }
+  return ['o', [['scores', scores], ['selected', decisionList(result.selected, decisionLeaf)]]];
+}
+
+/** The raw decision call (op, tagged value) and its reply; the fixture tests use it directly. */
+const decisionRequest = (op, value) => opJson(op, value, MAX_DECISION_BYTES, (e) => e.decision(), 'decision');
+
+function decisionInvalid(r, allowed) {
+  if (exactKeys(r, ['invalid']) && (r.invalid === null || allowed.has(r.invalid))) return r.invalid;
+  throw new DavParseError('decision reply has an unexpected shape', 'reply');
+}
+
+/** decision/index.cjs invalidRequest(r) through the Rust port: the problem or null. A refusal
+ *  ('throws', 'opaque', 'too_large') or a bad reply throws. */
+function decisionInvalidRequest(r) {
+  return decisionInvalid(decisionRequest(1, decisionRequestTag(r)), REQUEST_INVALID);
+}
+
+/** decision/index.cjs invalidResult(r, result) through the Rust port. */
+function decisionInvalidResult(r, result) {
+  return decisionInvalid(decisionRequest(2, [decisionRequestTag(r), decisionResultTag(result)]), RESULT_INVALID);
+}
+
+/** What causeOf reads off an error, as the decision crate takes it. */
+function decisionErrorFacts(error) {
+  const text = (v) => (typeof v === 'string' ? v : null);
+  let message = null;
+  if (error instanceof TypeError) {
+    try { message = String(error.message); } catch { message = null; }
+    if (message !== null && message.length > MAX_DECISION_MESSAGE_UNITS) throw new DavParseError('decision error message is too large', 'too_large');
+  }
+  return { deadline: !!error?.deadline, reason: text(error?.reason), name: text(error?.name), syntax: error instanceof SyntaxError, typeError: error instanceof TypeError, message };
+}
+
+/** decision/index.cjs causeOf(error) through the Rust port, over what it reads off the error. */
+function decisionCauseOf(error) {
+  const r = decisionRequest(3, decisionErrorFacts(error));
+  if (!exactKeys(r, ['cause']) || typeof r.cause !== 'string' || !DECISION_CAUSE.test(r.cause)) throw new DavParseError('decision reply has an unexpected cause', 'reply');
+  return r.cause;
+}
+
 /** Test hook: the cached instance's linear memory in bytes (0 when there is none). */
 function memoryBytes() { return cached?.instance ? cached.instance.exports.memory.buffer.byteLength : 0; }
 
 // Every switch that runs this module (#996). Each reads its value as trim().toLowerCase().
 // CHAT_TEMPLATE_CAPS_IMPL counts only when set to wasm explicitly; its default (also wasm) is
 // checked by chat-template-caps.cjs startup(), which falls back to off instead of stopping.
-const IMPL_FLAGS = ['DAV_PARSE_IMPL', 'S3_PARSE_IMPL', 'STORAGE_PATH_IMPL', 'UPLOAD_SNIFF_IMPL', 'SECRET_ENVELOPE_IMPL', 'MCP_FRAME_IMPL', 'CHAT_TEMPLATE_CAPS_IMPL', 'AUTOTUNE_PLAN_IMPL', 'PRESET_RELOAD_IMPL', 'PROMPT_FRAMING_IMPL', 'S3_SIGN_IMPL', 'SSRF_IMPL', 'STREAM_GUARD_IMPL', 'GGUF_META_IMPL', 'POLICY_LEAVES_IMPL', 'CODE_REVIEW_VERDICT_IMPL', 'TOOL_EXCHANGE_IMPL'];
+const IMPL_FLAGS = ['DAV_PARSE_IMPL', 'S3_PARSE_IMPL', 'STORAGE_PATH_IMPL', 'UPLOAD_SNIFF_IMPL', 'SECRET_ENVELOPE_IMPL', 'MCP_FRAME_IMPL', 'CHAT_TEMPLATE_CAPS_IMPL', 'AUTOTUNE_PLAN_IMPL', 'PRESET_RELOAD_IMPL', 'PROMPT_FRAMING_IMPL', 'S3_SIGN_IMPL', 'SSRF_IMPL', 'STREAM_GUARD_IMPL', 'GGUF_META_IMPL', 'POLICY_LEAVES_IMPL', 'CODE_REVIEW_VERDICT_IMPL', 'TOOL_EXCHANGE_IMPL', 'MCP_SERVERS_IMPL', 'DECISION_IMPL'];
 
 /** The *_IMPL switches set to wasm in `env`. */
 function wasmFlags(env = process.env) {
@@ -1507,4 +1669,4 @@ function verifyAtStartup(env = process.env, { hostname } = {}) {
 /** Test hook: forget the cached module (and its failure). */
 function reset() { cached = null; }
 
-module.exports = { reviewTag, reviewVerdictRead, reviewEventBound, reviewVerdictReply, MAX_REVIEW_BYTES, toolExchangeCheck, toolExchangeError, MAX_EXCHANGE_ARGS_UNITS, MAX_EXCHANGE_NAME_UNITS, ggufSummary, ggufSummaryReply, MAX_GGUF_WINDOW_BYTES, MAX_GGUF_SEGMENTS, authTokens, toolPolicyMode, toolPolicySet, MAX_POLICY_UNITS, MAX_POLICY_TOOLS, streamGuardSchema, streamGuardOptions, streamGuardNew, streamGuardFeed, streamGuardEnd, streamGuardCheck, streamGuardCheckReply, streamGuardCorrection, streamGuardReply, plainJson, MAX_GUARD_BYTES, MAX_GUARD_DEPTH, MAX_GUARD_SCHEMA_BYTES, MAX_GUARD_STATE_BYTES, MAX_GUARD_INPUT_BYTES, MAX_CORRECTION_UNITS, s3Sign, s3Region, MAX_S3_FIELD_BYTES, MAX_S3_QUERY_PAIRS, MAX_S3_PAYLOAD_BYTES, wasmFlags, verifyAtStartup, framingRuntimeMatches, IMPL_FLAGS, ssrfUrl, ssrfAddressesPublic, ssrfUrlReply, ssrfAddressesReply, MAX_SSRF_BYTES, MAX_SSRF_ADDRESSES, frameUntrusted, escapeClosing, provenanceNew, provenanceIngest, provenanceAdd, provenanceSource, provenanceCheck, provenanceProbe, packetParse, packetValidate, packetRender, FRAME_TEXT_UNITS, FRAME_LABEL_UNITS, MAX_PROVENANCE_BYTES, MAX_PACKET_BYTES, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, tuneContention, tuneContentionText, MAX_CONTENTION_BYTES, longProfilePairs, longProfileSection, longProfilePick, longProfileText, MAX_LONG_PROFILE_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
+module.exports = { mcpServersParse, mcpToolboxes, mcpToolboxOffered, MAX_MCP_SERVERS_BYTES, decisionRequestTag, decisionResultTag, decisionInvalidRequest, decisionInvalidResult, decisionCauseOf, decisionErrorFacts, decisionRequest, MAX_DECISION_MESSAGE_UNITS, MAX_DECISION_BYTES, DECISION_ENTRIES, reviewTag, reviewVerdictRead, reviewEventBound, reviewVerdictReply, MAX_REVIEW_BYTES, toolExchangeCheck, toolExchangeError, MAX_EXCHANGE_ARGS_UNITS, MAX_EXCHANGE_NAME_UNITS, ggufSummary, ggufSummaryReply, MAX_GGUF_WINDOW_BYTES, MAX_GGUF_SEGMENTS, authTokens, toolPolicyMode, toolPolicySet, MAX_POLICY_UNITS, MAX_POLICY_TOOLS, streamGuardSchema, streamGuardOptions, streamGuardNew, streamGuardFeed, streamGuardEnd, streamGuardCheck, streamGuardCheckReply, streamGuardCorrection, streamGuardReply, plainJson, MAX_GUARD_BYTES, MAX_GUARD_DEPTH, MAX_GUARD_SCHEMA_BYTES, MAX_GUARD_STATE_BYTES, MAX_GUARD_INPUT_BYTES, MAX_CORRECTION_UNITS, s3Sign, s3Region, MAX_S3_FIELD_BYTES, MAX_S3_QUERY_PAIRS, MAX_S3_PAYLOAD_BYTES, wasmFlags, verifyAtStartup, framingRuntimeMatches, IMPL_FLAGS, ssrfUrl, ssrfAddressesPublic, ssrfUrlReply, ssrfAddressesReply, MAX_SSRF_BYTES, MAX_SSRF_ADDRESSES, frameUntrusted, escapeClosing, provenanceNew, provenanceIngest, provenanceAdd, provenanceSource, provenanceCheck, provenanceProbe, packetParse, packetValidate, packetRender, FRAME_TEXT_UNITS, FRAME_LABEL_UNITS, MAX_PROVENANCE_BYTES, MAX_PACKET_BYTES, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, tuneContention, tuneContentionText, MAX_CONTENTION_BYTES, longProfilePairs, longProfileSection, longProfilePick, longProfileText, MAX_LONG_PROFILE_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
