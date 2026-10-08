@@ -8,7 +8,7 @@ const { QUALITY, qualityCheck, qualityFailure, newModel } = require('./llamacpp-
 // #1057: the fake engine's f16 quirks (failLoadF16, badF16, the shorter recall) hold for both
 // unquantized cache types, bf16 being the first candidate now.
 const unq = o => ['bf16', 'f16'].includes(o['cache-type-k']);
-function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnload, badQ4 = true, badF16 = false, noHead = false, rejectAll = false, rejectModel = '', badBatch = false, failFinal = false, formattedQuality = false, reasoningOnly = false, truncatedWorkloads = false, idleTimeoutMs = 300000, loseIdentityAfterStart = false, reloadFail = false, unloadPolls = 0, unloadStuck = false, answerFor = null, failLoadF16 = false, failLoadBf16 = false, httpFor = null, chatTemplate = null, servingFor = null, servingChecks = null, autotuneExtra = {}, onLoad = null, loadHang = null, calibrationExtra = {}, loadReply = null, streamReply = null, metricsFor = null, strictUnload = false, onReload = null } = {}) {
+function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnload, badQ4 = true, badF16 = false, noHead = false, rejectAll = false, rejectModel = '', badBatch = false, failFinal = false, formattedQuality = false, reasoningOnly = false, truncatedWorkloads = false, idleTimeoutMs = 300000, loseIdentityAfterStart = false, reloadFail = false, unloadPolls = 0, unloadStuck = false, answerFor = null, failLoadF16 = false, failLoadBf16 = false, httpFor = null, chatTemplate = null, servingFor = null, servingChecks = null, autotuneExtra = {}, onLoad = null, loadHang = null, calibrationExtra = {}, loadReply = null, streamReply = null, metricsFor = null, strictUnload = false, onReload = null, reloadAddsSections = false } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'full-tune-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const ini = path.join(dir, 'models.ini'), stateFile = path.join(dir, 'tune.json');
@@ -21,7 +21,16 @@ function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnl
   const fetchJson = async (url, opts = {}) => {
     const u = new URL(url), b = opts.body ? JSON.parse(opts.body) : {};
     if (opts.signal?.aborted) throw Error('aborted');
-    if (u.pathname === '/models' && u.searchParams.has('reload')) { onReload?.({ status: { ...status } }); return { ok: !reloadFail, body: {} }; }
+    if (u.pathname === '/models' && u.searchParams.has('reload')) {
+      onReload?.({ status: { ...status } });
+      // #1079: like llama.cpp, a reload lists sections added to models.ini (unloaded) and drops removed ones.
+      if (reloadAddsSections && !reloadFail) {
+        const names = [...fs.readFileSync(ini, 'utf8').matchAll(/^\[([^\]]+)\]/gm)].map(m => m[1]).filter(n => n !== '*');
+        for (const n of names) if (!(n in status)) status[n] = 'unloaded';
+        for (const n of Object.keys(status)) if (!names.includes(n)) delete status[n];
+      }
+      return { ok: !reloadFail, body: {} };
+    }
     if (u.pathname === '/models') return { ok: true, body: { data: Object.entries(status).map(([id, value]) => {
       if (value === 'unloading' && !unloadStuck && --unloading[id] <= 0) status[id] = value = 'unloaded';
       return { id, status: { value, args: id === 'embed' ? ['--embedding'] : [] }, meta: { n_ctx_train: 16384 } };
@@ -69,7 +78,7 @@ function fixture(t, { badSampling = false, models = ['synthetic'], onChat, onUnl
     calibrationOptions: { sleep: async () => {}, readMemory: () => 20, ...calibrationExtra },
     autotuneOptions: { ...autotuneExtra, ...(servingChecks ? { servingChecks } : {}), ...(unloadPolls || unloadStuck ? { sleep: async () => {} } : {}), betweenModelsMs: 25, idleTimeoutMs, readMemory: () => 20, identityFor: async m => (++identityReads > 1 && loseIdentityAfterStart ? null : { model: m, hardware: 'fake', build }) } });
   let manager = makeManager();
-  return { manager, ini, stateFile, original, requests, servingRequests, options, status, restart: () => { manager = makeManager(); return manager; }, setBuild: b => { build = b; } };
+  return { manager, ini, stateFile, dir, original, requests, servingRequests, options, status, restart: () => { manager = makeManager(); return manager; }, setBuild: b => { build = b; } };
 }
 async function finished(manager) {
   for (let i = 0; i < 15000; i++) {
@@ -1781,4 +1790,168 @@ test('#1062 a re-read that keeps waiting gives up with a note', { skip: skipCont
   const { f } = await gaveUpRestored(t, { foreignPollMs: 0 });
   for (let i = 0; i < 400 && !/has not re-read/.test(logText(f.manager.autotune.status().body.job)); i++) await new Promise(r => setTimeout(r, 10));
   assert.match(logText(f.manager.autotune.status().body.job), /The model server has not re-read the restored models\.ini; it does so before this model next loads\./);
+});
+
+// ── #1079: Fast and Long tunes, the `<model>-long` section ──────────────────────────────────────
+// The decisions are Rust's (dav-parse.wasm long_profile); here the fixture generator's independent
+// reference stands in for it, so these run without the module. long-profile-differential.test.cjs
+// holds the two to the same table.
+const longRef = require('../tools/gen-long-profile-fixtures.cjs');
+const { createLongProfiles } = require('./long-profile.cjs');
+const { MODES, LONG_PROFILE_REASON } = require('./llamacpp-full-autotune.cjs');
+const refProfiles = (calls = []) => createLongProfiles({ log: () => {}, decide: {
+  pairs: rows => { calls.push('pairs'); return longRef.refPairs(rows); },
+  section: req => { calls.push('section'); return longRef.refSection(req); },
+  pick: req => longRef.refPick(req),
+} });
+const sectionText = (text, name) => { const m = new RegExp('^\\[' + name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\]\\n([\\s\\S]*?)(?=^\\[|(?![\\s\\S]))', 'm').exec(text); return m ? m[1] : null; };
+
+test('#1079 a Long tune adds <model>-long from the model\'s section and tunes only that section', async t => {
+  const calls = [];
+  const f = fixture(t, { reloadAddsSections: true, autotuneExtra: { longProfiles: refProfiles(calls) } });
+  fs.writeFileSync(f.ini, f.original.replace('[synthetic]\nmodel = /models/synthetic.gguf\n', '[synthetic]\nmodel = /models/synthetic.gguf\nload-on-startup = true\n'));
+  const before = fs.readFileSync(f.ini, 'utf8'), baseBefore = sectionText(before, 'synthetic');
+  const r = await f.manager.autotune.start('synthetic', { confirmPause: true, mode: 'long' });
+  assert.equal(r.status, 202, JSON.stringify(r.body));
+  assert.equal(r.body.mode, 'long');
+  assert.equal(r.body.promptBudgetSeconds, MODES.long.defaultSeconds);
+  assert.deepEqual(r.body.models.map(m => [m.model, m.base, m.mode]), [['synthetic-long', 'synthetic', 'long']]);
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'passed', j.error);
+  const after = fs.readFileSync(f.ini, 'utf8');
+  // The model's own section is exactly as it was; everything before the new section is untouched.
+  assert.equal(sectionText(after, 'synthetic'), baseBefore);
+  assert.ok(after.startsWith(before.replace(/\n+$/, '')), 'nothing before the new section moves');
+  const long = presetsOf(f).get('synthetic-long');
+  assert.equal(long.exists, true);
+  assert.equal(presetsOf(f).files('synthetic-long').model, '/models/synthetic.gguf');
+  assert.doesNotMatch(sectionText(after, 'synthetic-long'), /load-on-startup/);
+  assert.equal(long.options['cache-type-k'], j.models[0].result.kv);
+  // Every chat request of the tune went to the long profile, never the model itself.
+  assert.ok(f.requests.length > 0 && f.requests.every(req => req.model === 'synthetic-long'), [...new Set(f.requests.map(req => req.model))].join());
+  assert.match(j.log.map(l => l.text).join('\n'), /Added the long-context profile synthetic-long/);
+  const status = f.manager.autotune.status('synthetic').body;
+  assert.equal(status.history.length, 0);
+  assert.equal(status.longId, 'synthetic-long');
+  assert.equal(status.longHistory.length, 1);
+  assert.equal(status.longHistory[0].context, j.models[0].result.context);
+  // One recovery copy per run, made by the first write (the section added), of the file before it.
+  const copies = fs.readdirSync(f.dir).filter(n => n.startsWith('models.ini.noevia-backup-'));
+  assert.ok(copies.some(n => fs.readFileSync(path.join(f.dir, n), 'utf8') === before), copies.join());
+  assert.ok(calls.includes('section'));
+});
+
+test('#1079 a Fast tune never touches the -long section, and the untuned scan skips it', async t => {
+  // As on a real router, the long profile the Long tune leaves loaded reports no requests in flight.
+  const f = fixture(t, { reloadAddsSections: true, metricsFor: () => 'llamacpp:requests_processing 0\n', autotuneExtra: { longProfiles: refProfiles() } });
+  assert.equal((await f.manager.autotune.start('synthetic', { confirmPause: true, mode: 'long' })).status, 202);
+  assert.equal((await finished(f.manager)).status, 'passed');
+  const longBefore = sectionText(fs.readFileSync(f.ini, 'utf8'), 'synthetic-long');
+  const scan = (await f.manager.autotune.untuned()).body;
+  assert.deepEqual(scan.skipped.find(s => s.model === 'synthetic-long'), { model: 'synthetic-long', reason: LONG_PROFILE_REASON });
+  assert.ok(!scan.models.includes('synthetic-long'));
+  f.requests.length = 0;
+  const r = await f.manager.autotune.start('synthetic', { confirmPause: true });
+  assert.equal(r.status, 202);
+  assert.equal(r.body.mode, 'fast');
+  assert.equal(r.body.promptBudgetSeconds, MODES.fast.defaultSeconds);
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'passed', j.error);
+  assert.equal(sectionText(fs.readFileSync(f.ini, 'utf8'), 'synthetic-long'), longBefore);
+  assert.ok(f.requests.every(req => req.model === 'synthetic'));
+  // A bulk Fast tune does not queue the long profile either.
+  const bulk = await f.manager.autotune.start('', { confirmPause: true, untuned: true });
+  assert.ok(bulk.status === 409 || !bulk.body.models.some(m => m.model === 'synthetic-long'), JSON.stringify(bulk.body));
+});
+
+test('#1079 start refusals: an unknown mode, Long for all models, a long profile on its own, limits', async t => {
+  const f = fixture(t, { reloadAddsSections: true, autotuneExtra: { longProfiles: refProfiles() } });
+  const start = (model, o) => f.manager.autotune.start(model, { confirmPause: true, ...o });
+  assert.equal((await start('synthetic', { mode: 'medium' })).status, 400);
+  assert.equal((await start('synthetic', { mode: { toString: () => 'long' } })).status, 400);
+  assert.equal((await start('', { mode: 'long', untuned: true })).status, 400);
+  assert.equal((await start('synthetic', { mode: 'long', promptBudgetSeconds: 1801 })).status, 400);
+  assert.equal((await start('synthetic', { mode: 'long', promptBudgetSeconds: 14 })).status, 400);
+  const r = await start('synthetic', { mode: 'long', promptBudgetSeconds: 900 });
+  assert.equal(r.status, 202);
+  assert.equal(r.body.promptBudgetSeconds, 900);
+  assert.equal((await finished(f.manager)).status, 'passed');
+  for (const mode of ['fast', 'long']) {
+    const own = await start('synthetic-long', { mode });
+    assert.equal(own.status, 400, mode);
+    assert.match(own.body.error, /long-context profile/);
+  }
+});
+
+test('#1079 an existing -long section that loads another file is never tuned or overwritten', async t => {
+  const f = fixture(t, { reloadAddsSections: true, autotuneExtra: { longProfiles: refProfiles() } });
+  const text = f.original + '[synthetic-long]\nmodel = /models/unrelated.gguf\nctx-size = 4096\n';
+  fs.writeFileSync(f.ini, text);
+  f.status['synthetic-long'] = 'unloaded';
+  const r = await f.manager.autotune.start('synthetic', { confirmPause: true, mode: 'long' });
+  assert.equal(r.status, 409);
+  assert.match(r.body.error, /already has a section named synthetic-long that loads a different file/);
+  assert.equal(fs.readFileSync(f.ini, 'utf8'), text);
+  // Not a long profile, so the Fast scan treats it as a model of its own, as before.
+  assert.ok(!(await f.manager.autotune.untuned()).body.skipped.some(s => s.reason === LONG_PROFILE_REASON));
+});
+
+test('#1079 a section the router does not pick up is taken out again and the tune stops', async t => {
+  // The router never lists sections added after start (reloadAddsSections off).
+  const f = fixture(t, { autotuneExtra: { longProfiles: refProfiles() } });
+  const r = await f.manager.autotune.start('synthetic', { confirmPause: true, mode: 'long' });
+  assert.equal(r.status, 202);
+  const j = await finished(f.manager);
+  assert.equal(j.status, 'failed');
+  assert.match(j.error, /did not pick up the long-context profile synthetic-long\. models\.ini was put back/);
+  assert.equal(fs.readFileSync(f.ini, 'utf8'), f.original);
+  assert.equal(f.requests.length, 0, 'nothing was measured');
+});
+
+test('#1079 Long refuses up front when the section cannot be made (no model file to point at)', async t => {
+  const f = fixture(t, { reloadAddsSections: true, autotuneExtra: { longProfiles: refProfiles() } });
+  // A section without its own model line, and a router row without --model: nothing to copy from.
+  const text = f.original.replace('[synthetic]\nmodel = /models/synthetic.gguf\n', '[synthetic]\n');
+  fs.writeFileSync(f.ini, text);
+  const r = await f.manager.autotune.start('synthetic', { confirmPause: true, mode: 'long' });
+  assert.equal(r.status, 409);
+  assert.match(r.body.error, /does not say which file this model loads/);
+  assert.equal(fs.readFileSync(f.ini, 'utf8'), text);
+});
+
+test('#1079 without the long-profile module nothing pairs and Long refuses; Fast runs as before', async t => {
+  const broken = createLongProfiles({ log: () => {}, decide: { pairs: () => { throw Error('missing'); }, section: () => { throw Error('missing'); }, pick: () => { throw Error('missing'); } } });
+  const f = fixture(t, { reloadAddsSections: true, autotuneExtra: { longProfiles: broken } });
+  const r = await f.manager.autotune.start('synthetic', { confirmPause: true, mode: 'long' });
+  assert.equal(r.status, 409);
+  assert.match(r.body.error, /could not be prepared safely; nothing was changed/);
+  assert.equal(fs.readFileSync(f.ini, 'utf8'), f.original);
+  assert.equal((await f.manager.autotune.start('synthetic', { confirmPause: true })).status, 202);
+  assert.equal((await finished(f.manager)).status, 'passed');
+});
+
+test('#1079 the model\'s KV switch applies to its Long tune and is locked while that tune is unfinished', async t => {
+  let release; const gate = new Promise(r => { release = r; });
+  const f = fixture(t, { reloadAddsSections: true, autotuneExtra: { longProfiles: refProfiles() }, onChat: async () => { await gate; } });
+  assert.equal(f.manager.autotune.setSettings('synthetic', { allowQ5Kv: true }).status, 200);
+  const r = await f.manager.autotune.start('synthetic', { confirmPause: true, mode: 'long' });
+  assert.deepEqual(r.body.models[0].kv, ['bf16', 'q8_0', 'q5_1', 'q5_0']);
+  for (let i = 0; i < 2000 && !f.requests.length; i++) await new Promise(res => setImmediate(res));
+  assert.equal(f.manager.autotune.setSettings('synthetic', { allowQ5Kv: false }).status, 409);
+  f.manager.autotune.cancel(); release();
+  assert.equal((await finished(f.manager)).status, 'cancelled');
+});
+
+function presetsOf(f) { return createPresetStore(f.ini); }
+
+test('#1079 the engine listing marks a model and its long profile once the section is served', async t => {
+  const f = fixture(t, { reloadAddsSections: true, autotuneExtra: { longProfiles: refProfiles() } });
+  const before = (await f.manager.listModels()).body.data;
+  assert.ok(before.every(m => m.long_variant === null && m.long_of === null));
+  assert.equal((await f.manager.autotune.start('synthetic', { confirmPause: true, mode: 'long' })).status, 202);
+  assert.equal((await finished(f.manager)).status, 'passed');
+  const rows = Object.fromEntries((await f.manager.listModels()).body.data.map(m => [m.id, m]));
+  assert.equal(rows.synthetic.long_variant, 'synthetic-long');
+  assert.equal(rows['synthetic-long'].long_of, 'synthetic');
+  assert.equal(rows.embed.long_variant, null);
 });

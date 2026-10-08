@@ -220,10 +220,15 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
     const hasFile = (id) => scan.some((f) => f.modelId === id || (Array.isArray(f.sections) && f.sections.includes(id)));
     // A sidecar model that a live backend reports as loaded is running, whatever the folder scan says.
     const missingFile = (m) => !sidecarUp(m) && !!scan && m.source === 'preset' && !hasFile(m.id || m.model_name);
+    // #1079: a model's `<model>-long` profile is not a model of its own here: it rides on its model
+    // as longVariant (the chat's Context: High), so roles and pickers keep naming the model.
+    const longLoaded = new Set(rows.filter((m) => m.long_of && loadedNames.has(m.id)).map((m) => m.long_of));
     const installed = rows
       // Some managers register cosmetic hash-ID duplicates; hide bare hash names.
       .filter((m) => !/^[0-9a-f]{32,40}$/i.test(m.id || m.model_name || ''))
+      .filter((m) => !m.long_of)
       .map((m) => ({
+        ...(m.long_variant ? { longVariant: m.long_variant, longLoaded: longLoaded.has(m.id || m.model_name) } : {}),
         name: m.id || m.model_name,
         sizeGB: typeof m.size === 'number' ? Math.round(m.size * 10) / 10 : null,
         loaded: loadedNames.has(m.id || m.model_name) || sidecarUp(m),

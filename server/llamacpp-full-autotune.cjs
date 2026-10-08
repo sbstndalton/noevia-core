@@ -8,6 +8,22 @@ const { isSystemModel, modelPathFromArgs, SYSTEM_MODEL_REASON } = require('./mod
 const VERSION = 3;
 // #1062: waits for another router client per model before the tune stops as interrupted.
 const FOREIGN_YIELDS = 6;
+// #1079: Fast tunes a model's own models.ini section with today's prompt time limit; Long tunes its
+// `<model>-long` section with a limit up to 1800 s, so the context search can reach whatever the
+// memory budget allows (same planner, KV rules and memory budget; only the time limit differs).
+const MODES = { fast: { defaultSeconds: 120, maxSeconds: 1800 }, long: { defaultSeconds: 1800, maxSeconds: 1800 } };
+const LONG_SUFFIX = require('./long-profile.cjs').SUFFIX;
+const LONG_PROFILE_REASON = 'Long-context profile — tuned with Long mode from its model';
+const LONG_REFUSALS = {
+  invalid_id: "This model's name is too long, or not a valid models.ini name, for a long-context profile.",
+  ambiguous: 'models.ini has a section the model server would read differently (a duplicate or unusual header), so auto-tune does not add one. Check models.ini, then try again.',
+  no_base: 'This model has no section of its own in models.ini, so there is nothing to copy for a long-context profile.',
+  no_model: 'The model server does not say which file this model loads, so a long-context profile cannot point at it.',
+  bad_path: "This model's file path cannot be written to models.ini safely, so no long-context profile was added.",
+  too_large: 'models.ini would pass its 1 MiB limit with a long-context profile added.',
+};
+const longRefusal = reason => LONG_REFUSALS[reason] || 'The long-context profile could not be prepared safely; nothing was changed.';
+const longClash = item => 'models.ini already has a section named ' + item.model + ' that loads a different file. Rename or remove it, then run a Long tune.';
 // #1057 (owner's KV policy): bf16 (unquantized) by default, q8_0 the floor. q5_1/q5_0 only with
 // the model's own opt-in (allowQ5Kv, saved with its tune settings below); q4_0 also needs the
 // operator's override env var (#190), so it is never reached without both. f16 is no longer a
@@ -218,7 +234,10 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   // model mid-tune. Auto-tune waits for it, at most foreignWaitMs per wait and FOREIGN_YIELDS waits
   // per model, and resumes the step; Rust's tune_contention (dav-parse.wasm) decides each look.
   foreignWaitMs = 15 * 60000, foreignQuietMs = 30000, foreignPollMs = 2000,
-  contention = req => require('./dav-parse-wasm.cjs').tuneContention(req) }) {
+  contention = req => require('./dav-parse-wasm.cjs').tuneContention(req),
+  // #1079: a Long tune's `<model>-long` section (long-profile.cjs, Rust's decisions) and the router
+  // re-read after it is added (the manager's guarded reload; the plain router call by default).
+  longProfiles = require('./long-profile.cjs').createLongProfiles(), reloadRouter: routerReload = null }) {
   const request = engineBoundary(engineRequest), rawModels = engineBoundary(engineRawModels);
   let state;
   try { state = JSON.parse(fs.readFileSync(stateFile, 'utf8')); } catch { state = {}; }
@@ -316,11 +335,19 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     }
   }
   const candidatesFor = model => kvCandidates(settingsOf(model));
+  // #1079: the router's rows and which of them pair as a model and its long profile.
+  async function routerPairs() {
+    const r = await rawModels();
+    if (!r.ok || !Array.isArray(r.body?.data)) throw publicFail('The model server is not responding.');
+    return { rows: r.body.data, pairs: longProfiles.pairsOf(r.body.data, presets) };
+  }
   // The list a queued item tries: its own snapshot, or (a job from before #1057) today's.
   const itemKv = item => (Array.isArray(item?.kv) && item.kv.length ? item.kv : candidatesFor(item?.model));
   // kvCandidates: the list this server really tries for this model, so the panel never describes
   // another build's (or another model's); settings: the model's own tune settings (#1057).
-  const status = model => ({ ok: true, status: 200, body: { job: publicJob(state.job), history: model ? state.history[model] || [] : [], kvCandidates: candidatesFor(model), settings: settingsOf(model), planImpl: planner.mode(), loadAdvisor: loadAdvisor.enabled() ? 'on' : 'off' } });
+  // #1079: longId and longHistory are the model's Long tune (its `<model>-long` section).
+  const status = model => ({ ok: true, status: 200, body: { job: publicJob(state.job), history: model ? state.history[model] || [] : [], kvCandidates: candidatesFor(model), settings: settingsOf(model), planImpl: planner.mode(), loadAdvisor: loadAdvisor.enabled() ? 'on' : 'off',
+    modes: MODES, ...(model ? { longId: model + LONG_SUFFIX, longHistory: state.history[model + LONG_SUFFIX] || [] } : {}) } });
   /** #1057: saves a model's tune settings; they apply from its next tune. */
   function setSettings(model, body) {
     if (typeof model !== 'string' || !model || model.length > 200) return { ok: false, status: 400, body: { error: 'Choose a model.' } };
@@ -331,7 +358,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     // switch under it would make its result's signature disagree with what it measured.
     const j = state.job;
     if (j && Array.isArray(j.models) && (j.status === 'running' || ['cancelled', 'interrupted', 'failed'].includes(j.status))
-        && j.models.some(m => m.model === model && m.status !== 'passed'))
+        && j.models.some(m => (m.model === model || m.base === model) && m.status !== 'passed'))
       return { ok: false, status: 409, body: { error: 'This model is in an unfinished tune. Let it finish, or start a new tune, before changing this setting.' } };
     if (body.allowQ5Kv) state.settings[model] = { allowQ5Kv: true }; else delete state.settings[model];
     save();
@@ -355,7 +382,10 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     const r = await rawModels();
     if (!r.ok || !Array.isArray(r.body?.data)) throw publicFail('The model server is not responding.');
     const models = [], skipped = [];
+    // #1079: a long profile is tuned with Long mode from its model's page, never by a Fast scan.
+    const longs = new Set(longProfiles.pairsOf(r.body.data, presets).map(p => p.long));
     for (const row of r.body.data) {
+      if (longs.has(row.id)) { skipped.push({ model: row.id, reason: LONG_PROFILE_REASON }); continue; }
       const profile = presets.get(row.id), args = row.status?.args || [];
       if (isSystemModel(row.id, modelPathFromArgs(args))) {
         skipped.push({ model: row.id, reason: SYSTEM_MODEL_REASON }); continue;
@@ -1235,6 +1265,48 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     }
     throw publicFail('Auto-tune did not finish within its step limit.');
   }
+  /** #1079: makes sure `item.model` (`<base>-long`) is a section the router serves for the same
+   *  file as `item.base`, adding it once from the base section (Rust's long-profile decides the
+   *  text) through the usual writer and backup rules, then the router re-reads models.ini. A file
+   *  changed outside auto-tune, a refusal or a router that does not pick it up stops the job; a
+   *  section added here that the router did not pick up is taken out again. */
+  async function ensureLongSection(j, item) {
+    check();
+    if (presets.snapshot().revision !== j._revision) throw Object.assign(Error('Settings changed outside auto-tune.'), { fatal: true });
+    const before = await routerPairs();
+    if (presets.get(item.model).exists) {
+      if (!before.pairs.some(p => p.base === item.base && p.long === item.model)) throw Object.assign(publicFail(longClash(item)), { fatal: true });
+      return;
+    }
+    const row = before.rows.find(r => r.id === item.base);
+    if (!row) throw Object.assign(publicFail('A queued model is no longer configured.'), { fatal: true });
+    await unloadAll();
+    const snap = presets.snapshot();
+    if (snap.revision !== j._revision) throw Object.assign(Error('Settings changed outside auto-tune.'), { fatal: true });
+    const made = longProfiles.sectionFor(snap.text, row, presets);
+    if (!made.ok) throw Object.assign(publicFail(longRefusal(made.reason)), { fatal: true });
+    if (made.id !== item.model) throw Object.assign(publicFail(longRefusal('unavailable')), { fatal: true });
+    await presets.commit({ baseRevision: snap.revision, text: made.text }, writeOptions(j));
+    wrote(j);
+    j._revision = presets.snapshot().revision; item.sectionCreated = true; save();
+    let served = false;
+    try {
+      const r = await (routerReload ? routerReload() : request('/models?reload=1', {}, 120000));
+      served = !!r?.ok && (await routerPairs()).pairs.some(p => p.base === item.base && p.long === item.model);
+    } catch { served = false; }
+    if (!served) {
+      // Put the file back as it was, unless it moved on since (then it is left for the operator).
+      try {
+        if (presets.snapshot().revision === j._revision) {
+          await presets.commit({ baseRevision: j._revision, text: snap.text }, { backup: false });
+          j._revision = presets.snapshot().revision; item.sectionCreated = false; save();
+          await (routerReload ? routerReload() : request('/models?reload=1', {}, 120000)).catch(() => null);
+        }
+      } catch { /* reported below */ }
+      throw Object.assign(publicFail('The model server did not pick up the long-context profile ' + item.model + '. models.ini was put back; check the model server, then try again.'), { fatal: true });
+    }
+    note(j, 'Added the long-context profile ' + item.model + ' to models.ini, copied from ' + item.base + "'s settings. This tune changes only that profile.");
+  }
   async function run(j) {
     try {
       for (let index = 0; index < j.models.length; index++) {
@@ -1250,6 +1322,9 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
             timeoutMs: idleTimeoutMs, signal: idleAbort.signal,
           });
           idleAbort = null; j.waiting = false; item.status = 'running'; save();
+          // #1079: a Long tune's `<model>-long` section is added now, with chat paused and every
+          // model unloaded; every later write of this item goes to that section only.
+          if (item.mode === 'long') await ensureLongSection(j, item);
           const identity = await identityFor(item.model);
           if (!identity) throw Object.assign(Error('Model identity could not be read.'), { fatal: true });
           const stableIdentity = hash({ ...identity, profile: undefined });
@@ -1299,9 +1374,12 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
       j.finishedAt = now(); j.waiting = false; child = null; idleAbort = null; save();
     }
   }
-  async function start(model, { confirmPause, promptBudgetSeconds = 120, untuned: bulk = false } = {}) {
+  async function start(model, { confirmPause, promptBudgetSeconds, untuned: bulk = false, mode = 'fast' } = {}) {
     if (confirmPause !== true) return { ok: false, status: 400, body: { error: 'Confirm that chat can pause and other model-server clients are stopped.' } };
-    promptBudgetSeconds = Number(promptBudgetSeconds);
+    // #1079: Fast (the model's own section, today's limit) or Long (its `<model>-long` section).
+    if (typeof mode !== 'string' || !Object.hasOwn(MODES, mode)) return { ok: false, status: 400, body: { error: 'Choose Fast or Long.' } };
+    if (mode === 'long' && bulk) return { ok: false, status: 400, body: { error: 'A Long tune runs for one model at a time. Choose a model.' } };
+    promptBudgetSeconds = Number(promptBudgetSeconds ?? MODES[mode].defaultSeconds);
     if (!Number.isInteger(promptBudgetSeconds) || promptBudgetSeconds < 15 || promptBudgetSeconds > 1800)
       return { ok: false, status: 400, body: { error: 'Choose a prompt time limit between 15 and 1800 seconds.' } };
     if (starting || state.job?.status === 'running') return { ok: false, status: 409, body: { error: 'Auto-tune is already running.' } };
@@ -1310,14 +1388,30 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     try {
       await flushReload();
       const scan = await candidates();
+      // #1079: a long profile is never tuned on its own; its model is, in Long mode.
+      const asLong = !bulk && scan.skipped.find(s => s.model === model && s.reason === LONG_PROFILE_REASON);
+      if (asLong) return { ok: false, status: 400, body: { error: 'This is a long-context profile. Open its model and run a Long tune there.' } };
       const models = bulk ? scan.models : [model];
       if (!bulk && ![...scan.models, ...scan.skipped.filter(s => s.reason === 'Current tune already applied').map(s => s.model)].includes(model))
         return { ok: false, status: 400, body: { error: 'Choose a configured chat model.' } };
       if (!models.length) return { ok: false, status: 409, body: { error: 'All configured chat models already have current tunes.' } };
+      let items = models.map(m => newModel(m, planner.mode() === 'wasm', candidatesFor(m)));
+      if (mode === 'long') {
+        // The model's own KV switch applies to its long profile; the section is added in run().
+        const longId = model + LONG_SUFFIX, { pairs } = await routerPairs();
+        if (presets.get(longId).exists && !pairs.some(p => p.base === model && p.long === longId))
+          return { ok: false, status: 409, body: { error: longClash({ model: longId }) } };
+        if (!presets.get(longId).exists) {
+          const row = (await rawModels()).body?.data?.find(r => r.id === model);
+          const dry = row ? longProfiles.sectionFor(presets.snapshot().text, row, presets) : { ok: false, reason: 'no_base' };
+          if (!dry.ok) return { ok: false, status: 409, body: { error: longRefusal(dry.reason) } };
+        }
+        items = [{ ...newModel(longId, planner.mode() === 'wasm', candidatesFor(model)), base: model, mode: 'long' }];
+      }
       cancelled = false;
-      const j = { id: crypto.randomUUID(), model: models[0], bulk, promptBudgetSeconds, status: 'running',
-        phase: 'Preparing', startedAt: now(), log: [], models: models.map(m => newModel(m, planner.mode() === 'wasm', candidatesFor(m))), _revision: presets.snapshot().revision,
-        queueProgress: { done: 0, total: models.length } };
+      const j = { id: crypto.randomUUID(), model: items[0].model, bulk, mode, promptBudgetSeconds, status: 'running',
+        phase: 'Preparing', startedAt: now(), log: [], models: items, _revision: presets.snapshot().revision,
+        queueProgress: { done: 0, total: items.length } };
       state.job = j; save(); completion = run(j); completion.catch(() => {});
       return { ok: true, status: 202, body: publicJob(j) };
     } catch (e) { return { ok: false, status: 409, body: { error: clientMessage(e, 'Auto-tune could not start.') } }; }
@@ -1398,8 +1492,10 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     try {
       await flushReload();
       for (const item of j.models.filter(m => m.status !== 'passed')) {
-        if (!rows.body.data.some(row => row.id === item.model) || !presets.get(item.model).exists) throw publicFail('A queued model is no longer configured.');
-        const identity = await identityFor(item.model);
+        // #1079: a Long item stopped before its section was added is checked by its model.
+        const id = item.mode === 'long' && !presets.get(item.model).exists ? item.base : item.model;
+        if (!id || !rows.body.data.some(row => row.id === id) || !presets.get(id).exists) throw publicFail('A queued model is no longer configured.');
+        const identity = await identityFor(id);
         if (!identity) throw publicFail('A queued model identity could not be read.');
         if (item._identity && item._identity !== hash({ ...identity, profile: undefined })) throw publicFail('A queued model changed since tuning began.');
       }
@@ -1420,4 +1516,4 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   }
   return { start, resume, cancel, status, setSettings, untuned, recover, flushReload, completion: () => completion };
 }
-module.exports = { createFullAutotuner, qualityCheck, qualityFailure, QUALITY, VERSION, newModel, hasHarmonyReasoning, kvCandidates, preferKv, bf16Unsupported };
+module.exports = { createFullAutotuner, qualityCheck, qualityFailure, QUALITY, VERSION, newModel, hasHarmonyReasoning, kvCandidates, preferKv, bf16Unsupported, MODES, LONG_PROFILE_REASON };
