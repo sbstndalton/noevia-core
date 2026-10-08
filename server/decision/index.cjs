@@ -4,6 +4,16 @@
 // options/items and a deterministic fallback, the answer is validated against them, and every
 // failure — unavailable, slow, malformed, unsure — resolves to that fallback. Nothing here throws
 // into the caller. Used by offline experiments and the opt-in System-One auto-role router.
+//
+// DECISION_IMPL=js|wasm (default js; any other value means js, with one warning), read on every
+// call: wasm decides invalidRequest, invalidResult and causeOf in noevia-rs's decision crate (in
+// dav-parse.wasm) over a projection of exactly the values they read. The chain, deadlines,
+// benching and logging stay here. Fails closed: the flag is in dav-parse-wasm.cjs IMPL_FLAGS (a
+// missing or tampered module stops startup); a fault makes the request or the backend's answer
+// invalid (the caller's fallback answers) and a cause 'exception'. Stricter than the JS, as
+// faults: where the JS would throw (an item that is null, options that are not an array), compare
+// object identities (ids that are objects), coerce an object (a deadlineMs that is not a
+// primitive) or iterate a sparse array or one over 65,536 entries.
 
 const KINDS = new Set(['choice', 'multi', 'rank', 'noul', 'score']);
 
@@ -17,7 +27,8 @@ const KINDS = new Set(['choice', 'multi', 'rank', 'noul', 'score']);
  *   chains: purpose -> backend ids tried in order, e.g. { 'rag.rerank': ['llama-rerank'] }. The
  *   request's own fallback always follows the chain.
  */
-function createDecisions({ backends, chains = {}, log = () => {}, now = Date.now, onDiagnostic = null }) {
+function createDecisions({ backends, chains = {}, log = () => {}, now = Date.now, onDiagnostic = null, impl, wasmLoader }) {
+  const opts = { impl, wasmLoader };
   const benched = new Map(); // backend id -> until (ms): skipped after repeated deadline misses
   const misses = new Map();
 
@@ -27,7 +38,7 @@ function createDecisions({ backends, chains = {}, log = () => {}, now = Date.now
       const f = typeof request.fallback === 'function' ? request.fallback() : request.fallback;
       return { ...f, source: 'fallback', metadata: { ...(f?.metadata || {}), latencyMs: now() - started } };
     };
-    const problem = invalidRequest(request);
+    const problem = invalidRequest(request, opts);
     if (problem) return done(request, withReason(fallback(), `invalid-request: ${problem}`, 'invalid-request'));
     // #682: why the last backend in the chain did not answer, as a short code (never message text),
     // so a fallback record says more than "no-backend-answered".
@@ -44,13 +55,13 @@ function createDecisions({ backends, chains = {}, log = () => {}, now = Date.now
       } catch (error) {
         if (error?.deadline) { const n = (misses.get(id) || 0) + 1; misses.set(id, n); if (n >= 3) { benched.set(id, now() + 60_000); misses.set(id, 0); } }
         const reason = error?.deadline ? 'deadline' : String(error?.message || error);
-        cause = causeOf(error);
+        cause = causeOf(error, opts);
         log({ purpose: request.purpose, backend: id, failed: reason.slice(0, 200) });
         if (onDiagnostic) onDiagnostic({ purpose: request.purpose, backend: id, ok: false, reason, diagnostics: error?.diagnostics ?? null });
         continue;
       }
       misses.set(id, 0);
-      const invalid = invalidResult(request, result);
+      const invalid = invalidResult(request, result, opts);
       if (onDiagnostic) onDiagnostic({ purpose: request.purpose, backend: id, ok: !invalid, reason: invalid ? `invalid: ${invalid}` : null, diagnostics: result?.metadata?.diagnostics ?? null });
       if (invalid) { cause = 'invalid-result'; log({ purpose: request.purpose, backend: id, failed: `invalid: ${invalid}` }); continue; }
       const min = request.constraints.minConfidence;
@@ -79,7 +90,7 @@ const CAUSE_RE = /^[a-z][a-z0-9-]{0,39}$/;
  * our own code, or a classification of the error's type, is returned: never an error message, which
  * may echo a service body or model output.
  */
-function causeOf(error) {
+function causeOfJs(error) {
   if (error?.deadline) return 'deadline';
   if (typeof error?.reason === 'string' && CAUSE_RE.test(error.reason)) return error.reason;
   if (error?.name === 'AbortError' || error?.name === 'TimeoutError') return 'aborted';
@@ -97,7 +108,7 @@ function withDeadline(start, ms) {
     .finally(() => clearTimeout(timer));
 }
 
-function invalidRequest(r) {
+function invalidRequestJs(r) {
   if (!r || typeof r !== 'object') return 'not an object';
   if (!KINDS.has(r.kind)) return 'unknown kind';
   if (typeof r.purpose !== 'string' || !r.purpose) return 'purpose required';
@@ -109,7 +120,7 @@ function invalidRequest(r) {
 }
 
 /** A backend's answer must stay inside what the caller allowed. */
-function invalidResult(r, result) {
+function invalidResultJs(r, result) {
   if (!result || typeof result !== 'object' || !result.scores || typeof result.scores !== 'object') return 'no scores';
   const allowed = new Set((r.kind === 'rank' ? r.items : r.options || []).map((o) => o.id));
   if (Object.keys(result.scores).some((id) => !allowed.has(id))) return 'score for an id that was not offered';
@@ -121,4 +132,46 @@ function invalidResult(r, result) {
   return null;
 }
 
-module.exports = { createDecisions, invalidResult, invalidRequest, causeOf, CAUSE_RE };
+const IMPLS = new Set(['js', 'wasm']);
+let warnedImpl = '';
+/** DECISION_IMPL: 'js' (default) or 'wasm'. */
+function decisionImpl(env = process.env) {
+  const raw = env.DECISION_IMPL;
+  if (raw === undefined || raw === '') return 'js';
+  const value = String(raw).trim().toLowerCase();
+  if (IMPLS.has(value)) return value;
+  if (warnedImpl !== value) {
+    warnedImpl = value;
+    console.warn(`[decision] DECISION_IMPL=${JSON.stringify(String(raw))} is not js or wasm; using js`);
+  }
+  return 'js';
+}
+let warnedFault = '';
+function warnFault(err) {
+  const reason = String(err?.reason || 'unexpected');
+  if (warnedFault !== reason) { warnedFault = reason; console.warn(`[decision] the Rust port failed (${reason}); failing closed`); }
+}
+const defaultLoader = () => require('../dav-parse-wasm.cjs');
+const REQUEST_FAULT = 'the request could not be checked';
+const RESULT_FAULT = 'the result could not be checked';
+const useWasm = (impl) => (impl || decisionImpl()) === 'wasm';
+
+/** invalidRequest(r): the problem, or null. `opts` ({ impl, wasmLoader }) is for tests. */
+function invalidRequest(r, { impl, wasmLoader = defaultLoader } = {}) {
+  if (!useWasm(impl)) return invalidRequestJs(r);
+  try { return wasmLoader().decisionInvalidRequest(r); } catch (err) { warnFault(err); return REQUEST_FAULT; }
+}
+
+/** invalidResult(r, result): why the answer is not inside what was offered, or null. */
+function invalidResult(r, result, { impl, wasmLoader = defaultLoader } = {}) {
+  if (!useWasm(impl)) return invalidResultJs(r, result);
+  try { return wasmLoader().decisionInvalidResult(r, result); } catch (err) { warnFault(err); return RESULT_FAULT; }
+}
+
+/** causeOf(error): a short, text-free code. */
+function causeOf(error, { impl, wasmLoader = defaultLoader } = {}) {
+  if (!useWasm(impl)) return causeOfJs(error);
+  try { return wasmLoader().decisionCauseOf(error); } catch (err) { warnFault(err); return 'exception'; }
+}
+
+module.exports = { createDecisions, invalidResult, invalidRequest, causeOf, CAUSE_RE, invalidResultJs, invalidRequestJs, causeOfJs, decisionImpl, REQUEST_FAULT, RESULT_FAULT };
