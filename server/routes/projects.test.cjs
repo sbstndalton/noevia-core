@@ -480,3 +480,26 @@ test('#1007/#1006: a project keeps its own routing mode and tools mode; null goe
   assert.equal(Object.hasOwn(f.projects[0], 'routingMode'), false);
   assert.equal(f.projects[0].toolsMode, 'manual');
 });
+
+test('#1079 the context profile: High is stored, Low and null clear it, anything else is refused', async () => {
+  const f = fixture({ projects: [{ id: 'p1', routing: 'manual', model: 'Synthetic-12B-it' }] });
+  await f.call('POST', '/api/projects/p1/config', { contextProfile: 'high' });
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true } });
+  assert.equal(f.projects[0].contextProfile, 'high');
+  // The model pick, routing and the profile are independent: the pick still names the model.
+  assert.equal(f.projects[0].model, 'Synthetic-12B-it');
+  assert.equal(f.projects[0].routing, 'manual');
+  for (const bad of ['medium', 'HIGH', 1, true, {}]) {
+    await f.call('POST', '/api/projects/p1/config', { contextProfile: bad });
+    assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'Invalid context profile' } });
+    assert.equal(f.projects[0].contextProfile, 'high');
+  }
+  await f.call('POST', '/api/projects/p1/config', { name: 'Renamed' });
+  assert.equal(f.projects[0].contextProfile, 'high', 'a patch without the field keeps it');
+  await f.call('POST', '/api/projects/p1/config', { contextProfile: 'low' });
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true } });
+  assert.equal('contextProfile' in f.projects[0], false);
+  await f.call('POST', '/api/projects/p1/config', { contextProfile: 'high' });
+  await f.call('POST', '/api/projects/p1/config', { contextProfile: null });
+  assert.equal('contextProfile' in f.projects[0], false);
+});

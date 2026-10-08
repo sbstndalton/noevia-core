@@ -229,6 +229,13 @@ function createProjectRoutes({
       const project = { ...storedProject, ...appearance };
       if (patch.reasoningEffort === null) delete project.reasoningEffort;
       else if (patch.reasoningEffort !== undefined) project.reasoningEffort = patch.reasoningEffort;
+      // #1079: Context: Low (the default, stored as absent) or High, served by the model's
+      // `<model>-long` profile when it has one. null clears it, like 'low'.
+      let clearContextProfile = false;
+      if (patch.contextProfile !== undefined) {
+        if (patch.contextProfile !== null && patch.contextProfile !== 'low' && patch.contextProfile !== 'high') return json(res, 400, { error: 'Invalid context profile' });
+        if (patch.contextProfile === 'high') project.contextProfile = 'high'; else { delete project.contextProfile; clearContextProfile = true; }
+      }
       if (typeof patch.name === 'string' && patch.name.trim()) project.name = patch.name.trim().slice(0, PROJECT_NAME_MAX_LENGTH);
       if (typeof patch.goal === 'string') project.goal = patch.goal.slice(0, 2000);
       if (typeof patch.instructions === 'string') project.instructions = patch.instructions.slice(0, 8000);
@@ -369,6 +376,8 @@ function createProjectRoutes({
       Object.assign(storedProject, project);
       if (clearSampling) delete storedProject.sampling;
       if (clearRoutingMode) delete storedProject.routingMode;
+      // The merge above cannot remove a key, so Low is removed here.
+      if (clearContextProfile) delete storedProject.contextProfile;
       saveProjects(PROJECTS);
       pruneDocuments(storedProject);
       return json(res, 200, { ok: true });

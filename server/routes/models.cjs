@@ -382,7 +382,7 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
       // #1057: a model's own tune settings (allowQ5Kv), saved with its tune history; next tune on.
       else if(p.endsWith('/settings')){if(req.method!=='POST')return json(res,405,{error:'Method not allowed'});if(!modelManager.autotune.setSettings)return json(res,404,{error:'Auto-tune settings are unavailable'});const body=await readJson(req).catch(()=>null);result=modelManager.autotune.setSettings(String(body?.model||''),body);}
       else if(req.method==='GET')result=modelManager.autotune.status(url.searchParams.get('model')||'');
-      else if(req.method==='POST'){const body=await readJson(req);result=await modelManager.autotune.start(String(body?.model||''),{confirmPause:body?.confirmPause,promptBudgetSeconds:body?.promptBudgetSeconds,untuned:body?.untuned===true});}
+      else if(req.method==='POST'){const body=await readJson(req);result=await modelManager.autotune.start(String(body?.model||''),{confirmPause:body?.confirmPause,promptBudgetSeconds:body?.promptBudgetSeconds,untuned:body?.untuned===true,...(body?.mode!==undefined?{mode:body.mode}:{})});}
       else return json(res,405,{error:'Method not allowed'});
       res.setHeader('Cache-Control','no-store');
       return json(res,result.status,result.body);

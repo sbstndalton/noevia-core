@@ -66,12 +66,13 @@ test('every status id the server sends has a catalogue key in every locale', () 
   const chat = read('server/chat.cjs'), ctx = read('server/chat-context.cjs');
   for (const m of chat.matchAll(/type: 'status', id: (?:[^'?]*\? )?'(\w+)'(?: : '(\w+)')?/g)) { ids.add(m[1]); if (m[2]) ids.add(m[2]); }
   for (const m of ctx.matchAll(/onStatus\('[^']*','(\w+)'\)/g)) ids.add(m[1]);
-  assert.deepEqual([...ids].sort(), ['compactingOlder', 'compactingTools', 'generating', 'loadingModel', 'preparing', 'readingImages']);
+  assert.deepEqual([...ids].sort(), ['compactingOlder', 'compactingTools', 'generating', 'loadingLongContext', 'loadingModel', 'preparing', 'readingImages']);
   for (const id of ids) for (const l of ['en-GB', ...Object.keys(FILES)]) assert.ok(has(l, `chat.statusId.${id}`), `${l} chat.statusId.${id}`);
   // The English catalogue text is the text the server sends, so an older client and a newer one read the same.
   const en = tFor('en-GB');
   for (const [id, text] of [['generating', 'Generating response…'], ['preparing', 'Preparing response…'], ['loadingModel', 'Loading the selected model and checking its context allocation…'],
-    ['compactingTools', 'Compacting context before the next tool step… Your full transcript stays available.'], ['compactingOlder', 'Compacting older messages… Your full transcript stays available.']]) {
+    ['compactingTools', 'Compacting context before the next tool step… Your full transcript stays available.'], ['compactingOlder', 'Compacting older messages… Your full transcript stays available.'],
+    ['loadingLongContext', 'Loading the high-context profile — switching models may take a moment…']]) {
     assert.equal(en(`chat.statusId.${id}`), text, id);
     assert.ok(chat.includes(text) || ctx.includes(text), `the server still sends "${text}"`);
   }

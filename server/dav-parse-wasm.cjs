@@ -22,6 +22,9 @@
 //                                        new logic, no JS twin; see chat-template-caps.cjs
 //                                                                             (CHAT_TEMPLATE_CAPS_IMPL, #1002)
 //   - crates/tune-contention tuneContention = auto-tune vs another router client (always on; fails closed, #1062)
+//   - crates/long-profile   longProfilePairs/longProfileSection/longProfilePick = a model's
+//                           <id>-long profile: pairing, its models.ini section, the entry a chat
+//                           is served by (always on; fails closed, #1079)
 //   - crates/prompt-framing frameUntrusted/escapeClosing, provenance*, packet* = prompt-framing.cjs,
 //                          provenance-policy.cjs, task-packet.cjs                (PROMPT_FRAMING_IMPL, #769/#740)
 //
@@ -54,7 +57,7 @@ const MAX_DECODE_BYTES = 25 * 1024 * 1024;
 // Only the first bytes decide an archive magic number (`ustar` ends at 262).
 const SNIFF_BYTES = 262;
 const RESET_AFTER_BYTES = 1024 * 1024;
-const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'secret_open', 'secret_seal', 'mcp_rpc_body', 'mcp_schema_refs', 'template_caps', 'provider_error', 'serving_verdict', 'autotune_plan', 'preset_reload', 'load_verdict', 'tune_contention', 'frame_untrusted', 'escape_closing', 'provenance', 'task_packet', 'dav_output_ptr', 'dav_output_len'];
+const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'secret_open', 'secret_seal', 'mcp_rpc_body', 'mcp_schema_refs', 'template_caps', 'provider_error', 'serving_verdict', 'autotune_plan', 'preset_reload', 'load_verdict', 'tune_contention', 'frame_untrusted', 'escape_closing', 'provenance', 'task_packet', 'long_profile', 'dav_output_ptr', 'dav_output_len'];
 
 class DavParseError extends Error {
   constructor(message, reason) {
@@ -603,6 +606,47 @@ function tuneContentionText(text) {
   return { action: r.action, reason: r.reason, foreign: r.foreign, unload: r.unload, fingerprint: r.fingerprint, since: r.since, waitedMs: r.waitedMs };
 }
 
+// long_profile::MAX_INPUT_BYTES and the reasons it replies with (#1079).
+const MAX_LONG_PROFILE_BYTES = 3 * 1024 * 1024;
+const LONG_SUFFIX = '-long';
+const SECTION_REFUSALS = new Set(['invalid_id', 'is_long', 'ambiguous', 'no_base', 'exists', 'no_model', 'bad_path', 'too_large', 'unsafe']);
+const PICK_REASONS = new Set(['low', 'high', 'no_long', 'is_long']);
+/** long-profile (#1079) on a request's JSON text as is: the raw reply (status 0), or a
+ *  DavParseError carrying the module's refusal code. */
+function longProfileText(text) {
+  if (typeof text !== 'string') throw new DavParseError('long profile request must be text', 'input');
+  const bytes = encoder.encode(text.isWellFormed() ? text : text.toWellFormed());
+  if (bytes.length > MAX_LONG_PROFILE_BYTES) throw new DavParseError('long profile request is too large', 'too_large');
+  return invoke(bytes, (e) => e.long_profile());
+}
+const isPair = (p) => p && typeof p.base === 'string' && typeof p.long === 'string' && p.base && p.long === p.base + LONG_SUFFIX;
+/** Which of the router's rows ({ id, model: file path or null }) are a model and its long
+ *  profile: [{ base, long }] in byte order of base. */
+function longProfilePairs(rows) {
+  if (!Array.isArray(rows)) throw new DavParseError('long profile rows must be a list', 'input');
+  const r = longProfileText(JSON.stringify({ op: 'pairs', rows: rows.map((x) => ({ id: x?.id, model: x?.model ?? null })) }));
+  const ids = new Set(rows.map((x) => x?.id));
+  if (!r || !Array.isArray(r.pairs) || !r.pairs.every((p) => isPair(p) && ids.has(p.base) && ids.has(p.long))) throw new DavParseError('long profile reply has an unexpected shape', 'reply');
+  return r.pairs.map((p) => ({ base: p.base, long: p.long }));
+}
+/** models.ini `text` with [<base>-long] appended: { ok: true, id, text } or { ok: false, reason }. */
+function longProfileSection({ text, base, model = null, mmproj = null }) {
+  const r = longProfileText(JSON.stringify({ op: 'section', text: typeof text === 'string' ? text.toWellFormed() : text, base, model, mmproj }));
+  const ok = r && (r.ok === true
+    ? r.id === base + LONG_SUFFIX && typeof r.text === 'string' && r.text.startsWith(text) && r.text.length > text.length
+    : r.ok === false && SECTION_REFUSALS.has(r.reason));
+  if (!ok) throw new DavParseError('long profile reply has an unexpected shape', 'reply');
+  return r.ok ? { ok: true, id: r.id, text: r.text } : { ok: false, reason: r.reason };
+}
+/** The entry that serves `model` for `profile` ('low' | 'high'): { model, long, reason }. */
+function longProfilePick({ model, profile, pairs }) {
+  const r = longProfileText(JSON.stringify({ op: 'pick', model, profile, pairs: Array.isArray(pairs) ? pairs.map((p) => ({ base: p?.base, long: p?.long })) : pairs }));
+  const known = new Set([model, ...(pairs || []).flatMap((p) => [p.base, p.long])]);
+  const ok = r && typeof r.model === 'string' && known.has(r.model) && typeof r.long === 'boolean' && PICK_REASONS.has(r.reason);
+  if (!ok) throw new DavParseError('long profile reply has an unexpected shape', 'reply');
+  return { model: r.model, long: r.long, reason: r.reason };
+}
+
 // prompt_framing::MAX_TEXT_UNITS / MAX_LABEL_UNITS / MAX_PROVENANCE_BYTES / MAX_PACKET_BYTES.
 const FRAME_TEXT_UNITS = 8 * 1024 * 1024;
 const FRAME_LABEL_UNITS = 1024 * 1024;
@@ -816,4 +860,4 @@ function verifyAtStartup(env = process.env, { hostname } = {}) {
 /** Test hook: forget the cached module (and its failure). */
 function reset() { cached = null; }
 
-module.exports = { wasmFlags, verifyAtStartup, framingRuntimeMatches, IMPL_FLAGS, frameUntrusted, escapeClosing, provenanceNew, provenanceIngest, provenanceAdd, provenanceSource, provenanceCheck, provenanceProbe, packetParse, packetValidate, packetRender, FRAME_TEXT_UNITS, FRAME_LABEL_UNITS, MAX_PROVENANCE_BYTES, MAX_PACKET_BYTES, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, tuneContention, tuneContentionText, MAX_CONTENTION_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
+module.exports = { wasmFlags, verifyAtStartup, framingRuntimeMatches, IMPL_FLAGS, frameUntrusted, escapeClosing, provenanceNew, provenanceIngest, provenanceAdd, provenanceSource, provenanceCheck, provenanceProbe, packetParse, packetValidate, packetRender, FRAME_TEXT_UNITS, FRAME_LABEL_UNITS, MAX_PROVENANCE_BYTES, MAX_PACKET_BYTES, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, tuneContention, tuneContentionText, MAX_CONTENTION_BYTES, longProfilePairs, longProfileSection, longProfilePick, longProfileText, MAX_LONG_PROFILE_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };

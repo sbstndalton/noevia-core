@@ -105,11 +105,17 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
       if (acquired) release(); else void previous.then(release);
     }
   }
+  // #1079: which rows are a model and its `<model>-long` profile (Rust's pairing; none on failure).
+  const longProfiles=autotuneOptions.longProfiles||require('./long-profile.cjs').createLongProfiles();
   async function listModels() {
     const response = await rawModels();
     if (!response.ok) return response;
     if (!Array.isArray(response.body?.data)) throw Error('Invalid llama.cpp model listing');
+    const pairs = longProfiles.pairsOf(response.body.data, presets);
+    const longOf = new Map(pairs.map(p => [p.long, p.base])), longFor = new Map(pairs.map(p => [p.base, p.long]));
     return { ...response, body: { data: response.body.data.map(model => ({
+      // A model's long-context profile, or (on the profile's own row) the model it belongs to.
+      long_variant: longFor.get(model.id) || null, long_of: longOf.get(model.id) || null,
       id: model.id,
       status: { value: model.status?.value || 'unknown', failed: model.status?.failed === true },
       source: model.source || null, can_remove: model.can_remove === true,
@@ -601,6 +607,9 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
   const managedGate={hold:()=>()=>{}};
   const autotuner=presets&&autotuneStatePath?require('./llamacpp-full-autotune.cjs').createFullAutotuner({fileMissing:presetFileMissing,request,rawModels,presets,maintenance,applyUnlocked,identityFor:tuneDeps.identityFor,stateFile:autotuneStatePath,
       samplingFor,
+      // #1079: a Long tune adds its `<model>-long` section, then the router re-reads models.ini the
+      // way every other noevia write does (recorded for PRESET_RELOAD_IMPL's guard).
+      longProfiles,reloadRouter:()=>routerReload(120000),
       readMemory:tuneDeps.readMemory,memoryFloorGib:tuneDeps.memoryFloorGib,
       ...(autotuneOptions.betweenModelsMs!=null?{betweenModelsMs:autotuneOptions.betweenModelsMs}:{}),
       ...(autotuneOptions.idleTimeoutMs!=null?{idleTimeoutMs:autotuneOptions.idleTimeoutMs}:{}),

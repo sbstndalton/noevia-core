@@ -155,6 +155,8 @@ function createChatHandler({
   // #769 (features.provenancePolicy): { enabled() } — when on, a write whose recipient, URL, host,
   // path or command holds text from an untrusted source this exchange always gets its own card.
   provenancePolicy = null,
+  // #1079: a chat or project with Context: High is served by its model's `<model>-long` profile.
+  longProfiles = require('./long-profile.cjs').createLongProfiles(),
   // #778 (features.routingModes): { enabled(), settings(), sensitivity(digest), awaitChoice(...),
   // setChatFlags(projectId, chatId, patch), log(entry) }. Not wired or flag off: nothing changes.
   routingModes = null,
@@ -732,6 +734,22 @@ function createChatHandler({
         return json(res, 409, { error: `${model} is an embedding, reranking or routing model and cannot answer chat messages — pick a chat model in the model popup.` });
       }
     }
+    // #1079: Context: High (the chat's or project's own choice) is served by the model's long-context
+    // profile, `<model>-long` (Rust's long-profile decides); roles and the stored pick keep naming
+    // the model. Local models only: a cloud model has no such profile. The engine keeps one chat
+    // model resident, so a switch reloads; the status line says so.
+    let contextSwitch = false, contextProfile = null;
+    if (provider.id === DEFAULT_PROVIDER_ID && !routeTarget?.row && require('./long-profile.cjs').normalizeProfile(project?.contextProfile) === 'high') {
+      const catalogue = await servedCatalogue();
+      const rows = Array.isArray(catalogue) ? catalogue : [];
+      const pairs = rows.filter((m) => typeof m.longVariant === 'string').map((m) => ({ base: m.name, long: m.longVariant }));
+      const picked = longProfiles.pick(model, 'high', pairs);
+      contextProfile = picked.long ? 'high' : 'low';
+      if (picked.long && picked.model !== model) {
+        contextSwitch = rows.find((m) => m.name === model)?.longLoaded !== true;
+        model = picked.model;
+      }
+    }
 
     // Accept both bare-host and conventional /v1-suffixed base URLs (cloud
     // providers like OpenRouter use https://host/api/v1).
@@ -776,11 +794,13 @@ function createChatHandler({
     }
     send({ type: 'meta', model, chatId: chatId || undefined, route: routedRole || undefined,
       routing: routeTarget ? { route: routeTarget.route, reason: routeTarget.reason } : undefined,
-      routingDecision: routingDecision || undefined, skill: pinnedSkill?.record,
+      routingDecision: routingDecision || undefined, skill: pinnedSkill?.record, contextProfile: contextProfile || undefined,
       sampling: sampling.source === 'none' ? undefined : { preset: sampling.presetId || undefined, source: sampling.source, values: sampling.params } });
     if (replySources.length && !body.compactOnly) send({ type: 'sources', sources: replySources });
     send({ type: 'telemetry', phase: 'waiting', model });
-    send({ type: 'status', id: attachedImages.length ? 'readingImages' : 'preparing', text: attachedImages.length ? 'Reading image sources — model loading and visual processing may take a moment…' : 'Preparing response…' });
+    // #1079: a switch to the long-context profile reloads the model; say so instead of "Preparing".
+    if (contextSwitch && !attachedImages.length) send({ type: 'status', id: 'loadingLongContext', text: 'Loading the high-context profile — switching models may take a moment…' });
+    else send({ type: 'status', id: attachedImages.length ? 'readingImages' : 'preparing', text: attachedImages.length ? 'Reading image sources — model loading and visual processing may take a moment…' : 'Preparing response…' });
     let visionWarning = missingImages.length ? `Images were not read because their stored files are missing: ${missingImages.join(', ')}. Re-upload them.` : '';
     if (visionWarning) wire = [{ role: 'system', content: visionWarning + ' Do not guess their contents.' }, ...wire];
     // Rule 3 of provider-egress.cjs: project images are not sent to an external provider on their own.
