@@ -788,9 +788,20 @@ function wasmFlags(env = process.env) {
 /** Startup check (#996): when any switch is wasm, load and verify the module now (lock, sha256,
  *  no imports, the full ABI) instead of failing on the first request. Returns the flags; throws
  *  an Error naming them and the reason when the module is unusable. */
-function verifyAtStartup(env = process.env) {
+/** The runtime URL behaviour prompt-framing's port was pinned against (Node 22's ada maps U+1E9E
+ *  to "ss" in hosts; noevia-rs crates/prompt-framing idna_compat does the same). A runtime that
+ *  disagrees would make JS and wasm hosts differ, so PROMPT_FRAMING_IMPL=wasm refuses to start. */
+function framingRuntimeMatches(hostname = (h) => new URL(h).hostname) {
+  try { return hostname('http://\u1e9e.io') === 'ss.io'; } catch { return false; }
+}
+
+function verifyAtStartup(env = process.env, { hostname } = {}) {
   const flags = wasmFlags(env);
   if (!flags.length) return flags;
+  if (flags.includes('PROMPT_FRAMING_IMPL') && !framingRuntimeMatches(hostname)) {
+    cached = null;
+    throw Object.assign(new Error(`PROMPT_FRAMING_IMPL set to wasm, but this runtime's URL parser (Node ${process.version}) does not map U+1E9E to "ss" as the pinned port does (runtime)`), { reason: 'runtime', flags });
+  }
   cached = null;
   try {
     cached = load({ file: env.DAV_PARSE_WASM || DEFAULT_WASM });
@@ -805,4 +816,4 @@ function verifyAtStartup(env = process.env) {
 /** Test hook: forget the cached module (and its failure). */
 function reset() { cached = null; }
 
-module.exports = { wasmFlags, verifyAtStartup, IMPL_FLAGS, frameUntrusted, escapeClosing, provenanceNew, provenanceIngest, provenanceAdd, provenanceSource, provenanceCheck, provenanceProbe, packetParse, packetValidate, packetRender, FRAME_TEXT_UNITS, FRAME_LABEL_UNITS, MAX_PROVENANCE_BYTES, MAX_PACKET_BYTES, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, tuneContention, tuneContentionText, MAX_CONTENTION_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
+module.exports = { wasmFlags, verifyAtStartup, framingRuntimeMatches, IMPL_FLAGS, frameUntrusted, escapeClosing, provenanceNew, provenanceIngest, provenanceAdd, provenanceSource, provenanceCheck, provenanceProbe, packetParse, packetValidate, packetRender, FRAME_TEXT_UNITS, FRAME_LABEL_UNITS, MAX_PROVENANCE_BYTES, MAX_PACKET_BYTES, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, tuneContention, tuneContentionText, MAX_CONTENTION_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };

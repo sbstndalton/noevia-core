@@ -160,6 +160,13 @@ test('PROMPT_FRAMING_IMPL: default js, unknown values warn once and mean js; it 
   const missing = path.join(os.tmpdir(), 'no-such-prompt-framing.wasm');
   assert.throws(() => davParseWasm.verifyAtStartup({ PROMPT_FRAMING_IMPL: 'wasm', DAV_PARSE_WASM: missing }), (e) => e.reason === 'missing' && e.flags.includes('PROMPT_FRAMING_IMPL'));
   davParseWasm.reset();
+  // The runtime pin (Node 22's ada): checked at startup; a runtime that disagrees refuses wasm.
+  assert.equal(new URL('http://\u1e9e.io').hostname, 'ss.io', `Node ${process.version} no longer maps U+1E9E to "ss": regenerate the table and drop idna_compat`);
+  assert.equal(davParseWasm.framingRuntimeMatches(), true);
+  assert.equal(davParseWasm.framingRuntimeMatches(() => 'xn--zca.io'), false);
+  assert.throws(() => davParseWasm.verifyAtStartup({ PROMPT_FRAMING_IMPL: 'wasm' }, { hostname: () => 'xn--zca.io' }), (e) => e.reason === 'runtime' && e.flags.includes('PROMPT_FRAMING_IMPL'));
+  assert.throws(() => davParseWasm.verifyAtStartup({ MCP_FRAME_IMPL: 'wasm', DAV_PARSE_WASM: missing }, { hostname: () => 'x' }), (e) => e.reason === 'missing'); // only PROMPT_FRAMING_IMPL checks the runtime
+  davParseWasm.reset();
 });
 
 test('under wasm with no usable module everything fails closed', (t) => {
