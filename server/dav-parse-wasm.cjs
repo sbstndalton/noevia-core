@@ -34,6 +34,11 @@
 //   - crates/stream-guard  streamGuardNew/Feed/End/Check, streamGuardCorrection = stream-guard.cjs's
 //                          IncrementalValidator and buildCorrectionRequest; the validator state is
 //                          bytes held here between calls, nothing stays in the module (STREAM_GUARD_IMPL, #516/#704)
+//   - crates/gguf (node)   ggufSummary = gguf-meta.cjs summarize(readGguf(file)) over the byte
+//                          ranges the caller has read; file I/O stays in the JS (GGUF_META_IMPL)
+//   - crates/policy-leaves authTokens = auth-tokens.cjs resolveAuthTokens (#294, a secret call);
+//                          toolPolicyMode/toolPolicySet = tool-policy.cjs's decision and set()
+//                          checks, the database stays in the JS (POLICY_LEAVES_IMPL)
 //
 // Memory: WebAssembly memory only grows. A listing or path call needs at most ~16 MiB; an upload
 // decode copies the upload in (at most 25 MiB) and holds one copy of its text (at most 3 bytes per
@@ -65,7 +70,7 @@ const MAX_DECODE_BYTES = 25 * 1024 * 1024;
 // Only the first bytes decide an archive magic number (`ustar` ends at 262).
 const SNIFF_BYTES = 262;
 const RESET_AFTER_BYTES = 1024 * 1024;
-const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'secret_open', 'secret_seal', 'mcp_rpc_body', 'mcp_schema_refs', 'template_caps', 'provider_error', 'serving_verdict', 'autotune_plan', 'preset_reload', 'load_verdict', 'tune_contention', 'frame_untrusted', 'escape_closing', 'provenance', 'task_packet', 'long_profile', 's3_sign', 's3_region', 'ssrf_policy', 'stream_guard', 'dav_output_ptr', 'dav_output_len'];
+const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'secret_open', 'secret_seal', 'mcp_rpc_body', 'mcp_schema_refs', 'template_caps', 'provider_error', 'serving_verdict', 'autotune_plan', 'preset_reload', 'load_verdict', 'tune_contention', 'frame_untrusted', 'escape_closing', 'provenance', 'task_packet', 'long_profile', 's3_sign', 's3_region', 'ssrf_policy', 'stream_guard', 'gguf_summary', 'auth_tokens', 'tool_policy', 'dav_output_ptr', 'dav_output_len'];
 
 class DavParseError extends Error {
   constructor(message, reason) {
@@ -1138,13 +1143,163 @@ function s3Region(value) {
   return region;
 }
 
+// --- gguf-meta (GGUF_META_IMPL) ---------------------------------------------------------------
+// gguf::node::MAX_WINDOW_BYTES / MAX_SEGMENTS: the file bytes one call takes, in how many ranges.
+const MAX_GGUF_WINDOW_BYTES = 16 * 1024 * 1024;
+const MAX_GGUF_SEGMENTS = 512;
+const GGUF_FAILS = new Set(['not_gguf', 'limit', 'eof', 'range', 'nested']);
+const GGUF_SUMMARY_KEYS = ['arch', 'name', 'contextLength', 'embeddingLength', 'blockCount', 'headCount', 'headCountKv', 'keyLength', 'valueLength', 'keyLengthSwa', 'valueLengthSwa', 'slidingWindow', 'slidingWindowPattern', 'sharedKvLayers', 'fullAttentionInterval', 'ssmStateSize', 'expertCount', 'nextnPredictLayers', 'hasChatTemplate'];
+const GGUF_RAW_KEYS = new Set(['headCountKv', 'slidingWindowPattern']);
+const NUM_TAGS = { NaN: NaN, Infinity: Infinity, '-Infinity': -Infinity, '-0': -0 };
+
+/** One number of a summary reply: a JSON number or `{"$num":…}` for what JSON cannot carry. */
+function ggufNumber(v) {
+  if (typeof v === 'number') return v;
+  if (exactKeys(v, ['$num']) && Object.hasOwn(NUM_TAGS, v.$num)) return NUM_TAGS[v.$num];
+  return undefined;
+}
+/** A raw kv value: number, boolean, string, null, a list of values, or `{array: true, count}`. */
+function ggufValue(v, depth = 0) {
+  if (depth > 64) throw new DavParseError('gguf reply nests too deeply', 'reply');
+  if (v === null || typeof v === 'boolean' || typeof v === 'string') return v;
+  const n = ggufNumber(v);
+  if (n !== undefined) return n;
+  if (Array.isArray(v)) return v.map((x) => ggufValue(x, depth + 1));
+  if (exactKeys(v, ['array', 'count']) && v.array === true && Number.isSafeInteger(v.count) && v.count > 1024) return { array: true, count: v.count };
+  throw new DavParseError('gguf reply has an unexpected value', 'reply');
+}
+/** Check a summary reply's shape and revive its numbers (exported for tests). */
+function ggufSummaryReply(s) {
+  if (!exactKeys(s, GGUF_SUMMARY_KEYS)) throw new DavParseError('gguf summary has unexpected keys', 'reply');
+  if (typeof s.arch !== 'string' || typeof s.name !== 'string' || typeof s.hasChatTemplate !== 'boolean') throw new DavParseError('gguf summary has unexpected types', 'reply');
+  const out = {};
+  for (const k of GGUF_SUMMARY_KEYS) {
+    if (k === 'arch' || k === 'name' || k === 'hasChatTemplate') out[k] = s[k];
+    else if (GGUF_RAW_KEYS.has(k)) out[k] = ggufValue(s[k]);
+    else if (s[k] === null) out[k] = null;
+    else {
+      const n = ggufNumber(s[k]);
+      if (n === undefined) throw new DavParseError('gguf summary has an unexpected number', 'reply');
+      out[k] = n;
+    }
+  }
+  return out;
+}
+
+/** gguf-meta.cjs summarize(readGguf(file)) over `segments` ([{ off, bytes }], sorted, disjoint,
+ *  non-empty byte ranges of a file of `size` bytes). Returns `{ summary }`, `{ need: { at, end } }`
+ *  (read the file from `at` to at least `end`, as one range, and ask again) or `{ fail, value? }`
+ *  (the error the JS throws). A refusal or a bad reply throws. */
+function ggufSummary(size, segments) {
+  if (!Number.isSafeInteger(size) || size < 0 || !Array.isArray(segments)) throw new DavParseError('gguf input has the wrong type', 'input');
+  if (segments.length > MAX_GGUF_SEGMENTS) throw new DavParseError('gguf input has too many ranges', 'too_large');
+  let floor = 0, total = 0;
+  for (const s of segments) {
+    if (!s || !Number.isSafeInteger(s.off) || !(s.bytes instanceof Uint8Array) || !s.bytes.length || s.off < floor || s.off + s.bytes.length > size) throw new DavParseError('gguf input ranges are not sorted, disjoint and inside the file', 'input');
+    floor = s.off + s.bytes.length;
+    total += s.bytes.length;
+  }
+  if (total > MAX_GGUF_WINDOW_BYTES) throw new DavParseError('gguf input is too large', 'too_large');
+  const input = new Uint8Array(12 + 12 * segments.length + total);
+  const view = new DataView(input.buffer);
+  view.setBigUint64(0, BigInt(size), true);
+  view.setUint32(8, segments.length, true);
+  let at = 12 + 12 * segments.length;
+  segments.forEach((s, i) => {
+    view.setBigUint64(12 + 12 * i, BigInt(s.off), true);
+    view.setUint32(20 + 12 * i, s.bytes.length, true);
+    input.set(s.bytes, at);
+    at += s.bytes.length;
+  });
+  const r = invoke(input, (e) => e.gguf_summary());
+  if (exactKeys(r, ['summary'])) return { summary: ggufSummaryReply(r.summary) };
+  if (exactKeys(r, ['need']) && exactKeys(r.need, ['at', 'end'])) {
+    const { at: from, end } = r.need;
+    const held = segments.some((s) => s.off <= from && end <= s.off + s.bytes.length);
+    if (Number.isSafeInteger(from) && Number.isSafeInteger(end) && from >= 0 && from < end && end <= size && !held) return { need: { at: from, end } };
+  }
+  if (exactKeys(r, ['fail']) && GGUF_FAILS.has(r.fail)) return { fail: r.fail };
+  if (exactKeys(r, ['fail', 'value']) && (r.fail === 'version' || r.fail === 'type') && Number.isInteger(r.value) && r.value >= 0 && r.value <= 0xffffffff) return { fail: r.fail, value: r.value };
+  throw new DavParseError('gguf reply has an unexpected shape', 'reply');
+}
+
+// --- policy leaves (POLICY_LEAVES_IMPL) -------------------------------------------------------
+// policy_leaves::MAX_UNITS / MAX_TOOLS.
+const MAX_POLICY_UNITS = 65536;
+const MAX_POLICY_TOOLS = 65536;
+const AUTH_WARNINGS = new Set([
+  'WARNING: Set DIARY_AUTH_TOKEN to protect the internal diary connection. Browser accounts remain authenticated.',
+  'WARNING: LEGACY_AUTH_COMPAT is true but UI_AUTH_TOKEN is empty; the legacy bearer sign-in has no token to check requests against.',
+]);
+const POLICY_MODES = new Set(['allow', 'ask', 'block']);
+const POLICY_REASONS = new Set(['mode', 'empty', 'write']);
+
+/** `u8(0)` for a non-string, `u8(1) u32le(n) units` for a string. */
+function policyString(v) {
+  if (typeof v !== 'string') return new Uint8Array([0]);
+  if (v.length > MAX_POLICY_UNITS) throw new DavParseError('policy input is too large', 'too_large');
+  const u = utf16le(v), out = new Uint8Array(5 + u.length);
+  out[0] = 1; new DataView(out.buffer).setUint32(1, v.length, true); out.set(u, 5);
+  u.fill(0);
+  return out;
+}
+const concatBytes = (parts) => {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let at = 0;
+  for (const p of parts) { out.set(p, at); at += p.length; p.fill(0); }
+  return out;
+};
+
+/** auth-tokens.cjs resolveAuthTokens through the Rust port: `diary` and `ui` are the coerced
+ *  strings, `compat` LEGACY_AUTH_COMPAT as given. A secret call: nothing of the input or reply
+ *  outlives it in the module, and no error carries any of it. */
+function authTokens(diary, ui, compat) {
+  if (typeof diary !== 'string' || typeof ui !== 'string') throw new DavParseError('auth tokens input has the wrong type', 'input');
+  const { status, bytes } = invokeSecret(concatBytes([policyString(diary), policyString(ui), policyString(compat)]), (e) => e.auth_tokens());
+  if (status !== 0) {
+    let code = 'unknown';
+    try { const r = JSON.parse(utf8(bytes)); if (r && (r.error === 'input' || r.error === 'too_large')) code = r.error; } catch { /* keep unknown */ }
+    bytes.fill(0);
+    throw new DavParseError(`auth tokens refused by dav-parse (${code})`, code);
+  }
+  let r;
+  try { r = JSON.parse(utf8(bytes)); } catch { r = null; } finally { bytes.fill(0); }
+  if (!(exactKeys(r, ['diaryToken', 'uiAuthToken', 'legacyCompat', 'warnings']) && typeof r.diaryToken === 'string' && typeof r.uiAuthToken === 'string'
+    && typeof r.legacyCompat === 'boolean' && Array.isArray(r.warnings) && r.warnings.length <= 2 && r.warnings.every((w) => AUTH_WARNINGS.has(w)))) {
+    throw new DavParseError('auth tokens reply has an unexpected shape', 'reply');
+  }
+  return { diaryToken: r.diaryToken, uiAuthToken: r.uiAuthToken, legacyCompat: r.legacyCompat, warnings: [...r.warnings] };
+}
+
+/** tool-policy.cjs mode() through the Rust port: `stored` the row's mode (undefined/null: none). */
+function toolPolicyMode(stored, isWrite) {
+  if (typeof isWrite !== 'boolean') throw new DavParseError('tool policy input has the wrong type', 'input');
+  const input = concatBytes([new Uint8Array([1]), policyString(stored), new Uint8Array([isWrite ? 1 : 0])]);
+  const r = invoke(input, (e) => e.tool_policy());
+  if (exactKeys(r, ['mode']) && POLICY_MODES.has(r.mode)) return r.mode;
+  throw new DavParseError('tool policy reply has an unexpected shape', 'reply');
+}
+
+/** tool-policy.cjs set()'s checks through the Rust port: `{ ok: true, mode }` or `{ ok: false, reason }`. */
+function toolPolicySet(value, writes) {
+  if (!Array.isArray(writes) || !writes.every((w) => typeof w === 'boolean')) throw new DavParseError('tool policy input has the wrong type', 'input');
+  if (writes.length > MAX_POLICY_TOOLS) throw new DavParseError('too many tools to check', 'too_large');
+  const count = new Uint8Array(4);
+  new DataView(count.buffer).setUint32(0, writes.length, true);
+  const input = concatBytes([new Uint8Array([2]), policyString(value), count, Uint8Array.from(writes, (w) => (w ? 1 : 0))]);
+  const r = invoke(input, (e) => e.tool_policy());
+  if (exactKeys(r, ['ok', 'mode']) && r.ok === true && POLICY_MODES.has(r.mode)) return { ok: true, mode: r.mode };
+  if (exactKeys(r, ['ok', 'reason']) && r.ok === false && POLICY_REASONS.has(r.reason)) return { ok: false, reason: r.reason };
+  throw new DavParseError('tool policy reply has an unexpected shape', 'reply');
+}
+
 /** Test hook: the cached instance's linear memory in bytes (0 when there is none). */
 function memoryBytes() { return cached?.instance ? cached.instance.exports.memory.buffer.byteLength : 0; }
 
 // Every switch that runs this module (#996). Each reads its value as trim().toLowerCase().
 // CHAT_TEMPLATE_CAPS_IMPL counts only when set to wasm explicitly; its default (also wasm) is
 // checked by chat-template-caps.cjs startup(), which falls back to off instead of stopping.
-const IMPL_FLAGS = ['DAV_PARSE_IMPL', 'S3_PARSE_IMPL', 'STORAGE_PATH_IMPL', 'UPLOAD_SNIFF_IMPL', 'SECRET_ENVELOPE_IMPL', 'MCP_FRAME_IMPL', 'CHAT_TEMPLATE_CAPS_IMPL', 'AUTOTUNE_PLAN_IMPL', 'PRESET_RELOAD_IMPL', 'PROMPT_FRAMING_IMPL', 'S3_SIGN_IMPL', 'SSRF_IMPL', 'STREAM_GUARD_IMPL'];
+const IMPL_FLAGS = ['DAV_PARSE_IMPL', 'S3_PARSE_IMPL', 'STORAGE_PATH_IMPL', 'UPLOAD_SNIFF_IMPL', 'SECRET_ENVELOPE_IMPL', 'MCP_FRAME_IMPL', 'CHAT_TEMPLATE_CAPS_IMPL', 'AUTOTUNE_PLAN_IMPL', 'PRESET_RELOAD_IMPL', 'PROMPT_FRAMING_IMPL', 'S3_SIGN_IMPL', 'SSRF_IMPL', 'STREAM_GUARD_IMPL', 'GGUF_META_IMPL', 'POLICY_LEAVES_IMPL'];
 
 /** The *_IMPL switches set to wasm in `env`. */
 function wasmFlags(env = process.env) {
@@ -1182,4 +1337,4 @@ function verifyAtStartup(env = process.env, { hostname } = {}) {
 /** Test hook: forget the cached module (and its failure). */
 function reset() { cached = null; }
 
-module.exports = { streamGuardSchema, streamGuardOptions, streamGuardNew, streamGuardFeed, streamGuardEnd, streamGuardCheck, streamGuardCheckReply, streamGuardCorrection, streamGuardReply, plainJson, MAX_GUARD_BYTES, MAX_GUARD_DEPTH, MAX_GUARD_SCHEMA_BYTES, MAX_GUARD_STATE_BYTES, MAX_GUARD_INPUT_BYTES, MAX_CORRECTION_UNITS, s3Sign, s3Region, MAX_S3_FIELD_BYTES, MAX_S3_QUERY_PAIRS, MAX_S3_PAYLOAD_BYTES, wasmFlags, verifyAtStartup, framingRuntimeMatches, IMPL_FLAGS, ssrfUrl, ssrfAddressesPublic, ssrfUrlReply, ssrfAddressesReply, MAX_SSRF_BYTES, MAX_SSRF_ADDRESSES, frameUntrusted, escapeClosing, provenanceNew, provenanceIngest, provenanceAdd, provenanceSource, provenanceCheck, provenanceProbe, packetParse, packetValidate, packetRender, FRAME_TEXT_UNITS, FRAME_LABEL_UNITS, MAX_PROVENANCE_BYTES, MAX_PACKET_BYTES, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, tuneContention, tuneContentionText, MAX_CONTENTION_BYTES, longProfilePairs, longProfileSection, longProfilePick, longProfileText, MAX_LONG_PROFILE_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
+module.exports = { ggufSummary, ggufSummaryReply, MAX_GGUF_WINDOW_BYTES, MAX_GGUF_SEGMENTS, authTokens, toolPolicyMode, toolPolicySet, MAX_POLICY_UNITS, MAX_POLICY_TOOLS, streamGuardSchema, streamGuardOptions, streamGuardNew, streamGuardFeed, streamGuardEnd, streamGuardCheck, streamGuardCheckReply, streamGuardCorrection, streamGuardReply, plainJson, MAX_GUARD_BYTES, MAX_GUARD_DEPTH, MAX_GUARD_SCHEMA_BYTES, MAX_GUARD_STATE_BYTES, MAX_GUARD_INPUT_BYTES, MAX_CORRECTION_UNITS, s3Sign, s3Region, MAX_S3_FIELD_BYTES, MAX_S3_QUERY_PAIRS, MAX_S3_PAYLOAD_BYTES, wasmFlags, verifyAtStartup, framingRuntimeMatches, IMPL_FLAGS, ssrfUrl, ssrfAddressesPublic, ssrfUrlReply, ssrfAddressesReply, MAX_SSRF_BYTES, MAX_SSRF_ADDRESSES, frameUntrusted, escapeClosing, provenanceNew, provenanceIngest, provenanceAdd, provenanceSource, provenanceCheck, provenanceProbe, packetParse, packetValidate, packetRender, FRAME_TEXT_UNITS, FRAME_LABEL_UNITS, MAX_PROVENANCE_BYTES, MAX_PACKET_BYTES, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, tuneContention, tuneContentionText, MAX_CONTENTION_BYTES, longProfilePairs, longProfileSection, longProfilePick, longProfileText, MAX_LONG_PROFILE_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
