@@ -230,6 +230,8 @@ function checkFsCall(method, params, { maxBytes = Infinity } = {}) {
  * The structured violation the agent receives: the Laya correction shape (`buildCorrectionRequest`,
  * only the violation, no restated schema), plus which tool, how many strikes, and how to fix it.
  */
+/** The correction request a violation carries. Under wasm a module failure (or a path over
+ *  dav-parse-wasm.cjs MAX_CORRECTION_UNITS) gives the fixed UNCHECKED request. */
 function correctionFor(found) {
   if (streamGuardImpl() !== 'wasm') return buildCorrectionRequest({ message: clip(found.message), path: found.path || null });
   try {
@@ -349,5 +351,5 @@ function useExecutorGuard(enabled) {
 
 module.exports = {
   MAX_VIOLATIONS, ACP_KINDS, PATH_KEYS, RAW_INPUT_SCHEMAS, FS_SCHEMAS, toolCallSchema,
-  checkToolCall, checkFsCall, violationError, violationText, rejectOutcome, createExecutorGuard, executorGuardFlag, useExecutorGuard,
+  checkToolCall, checkFsCall, correctionFor, violationError, violationText, rejectOutcome, createExecutorGuard, executorGuardFlag, useExecutorGuard,
 };

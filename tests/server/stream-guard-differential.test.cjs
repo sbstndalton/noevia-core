@@ -226,6 +226,10 @@ test('the loader checks the reply shape', () => {
     assert.throws(() => R(reply(json, state), withState), (e) => e instanceof davParseWasm.DavParseError && e.reason === 'reply', json);
   }
   assert.throws(() => R(new Uint8Array([9, 0, 0, 0, 1]), true), (e) => e.reason === 'reply');
+  // A one-shot check ran end(): neither a violation nor a finished document is a module fault.
+  const C = davParseWasm.streamGuardCheckReply;
+  assert.deepEqual(C(reply('{"violation":null,"done":true}', [])), { violation: null, done: true });
+  assert.throws(() => C(reply('{"violation":null,"done":false}', [])), (e) => e instanceof davParseWasm.DavParseError && e.reason === 'reply');
   assert.ok(davParseWasm.plainJson({ a: [1, 'x', null, true, { b: -0 }] }));
   for (const bad of [undefined, NaN, [, 1], { a: undefined }, Object.create(null, { a: { get() { return 1; } , enumerable: true } }), new Date(), { [Symbol('s')]: 1 }].entries()) {
     assert.equal(davParseWasm.plainJson(bad[1]), false, `bad value ${bad[0]}`);
@@ -291,6 +295,20 @@ test('STREAM_GUARD_IMPL=wasm fails closed without a usable module: every call re
       assert.throws(() => davParseWasm.verifyAtStartup({ STREAM_GUARD_IMPL: 'wasm', DAV_PARSE_WASM: missing }), (e) => e.flags.includes('STREAM_GUARD_IMPL') && e.reason === 'missing');
     });
   } finally { davParseWasm.reset(); }
+});
+
+test('a path over MAX_CORRECTION_UNITS: refused by the loader, answered with the UNCHECKED correction', { skip: skipWasm }, async () => {
+  davParseWasm.reset();
+  const path = `$.${'k'.repeat(davParseWasm.MAX_CORRECTION_UNITS)}`;
+  assert.throws(() => davParseWasm.streamGuardCorrection('m', path, 300), (e) => e.reason === 'too_large');
+  const found = { message: `Unknown property at ${path}`, path };
+  await withEnv({ STREAM_GUARD_IMPL: 'wasm' }, async () => {
+    assert.deepEqual(tools.correctionFor(found), { type: 'schema_violation_correction', violation: { message: 'Arguments could not be checked.', path: '$' } });
+    // Within the cap it is the JS's answer.
+    const small = { message: 'x'.repeat(400), path: '$.a' };
+    const js = await withEnv({ STREAM_GUARD_IMPL: 'js' }, () => tools.correctionFor(small));
+    assert.deepEqual(tools.correctionFor(small), js);
+  });
 });
 
 test('a module that misanswers is refused, not believed', { skip: skipWasm }, async (t) => {

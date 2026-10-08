@@ -894,6 +894,9 @@ const MAX_GUARD_BYTES = 2 * 1024 * 1024;
 const MAX_GUARD_DEPTH = 1024;
 const MAX_GUARD_SCHEMA_BYTES = 256 * 1024;
 const MAX_GUARD_STATE_BYTES = 20 * 1024 * 1024;
+// A message past this is cut to it first when a clip at most this applies (the cut cannot reach
+// the reply); a path past it (only a key of over a million units can make one) is refused as
+// too_large, and code-tool-schemas.cjs then answers with its fixed UNCHECKED correction instead.
 const MAX_CORRECTION_UNITS = 1024 * 1024;
 const MAX_GUARD_INPUT_BYTES = MAX_GUARD_STATE_BYTES + MAX_GUARD_SCHEMA_BYTES + 2 * MAX_GUARD_BYTES + 64;
 const GUARD_REASONS = new Set(['max_bytes', 'unexpected_char', 'type_mismatch', 'max_depth', 'expected_key', 'expected_colon',
@@ -1016,7 +1019,14 @@ function streamGuardEnd(schemaBytes, state) {
 /** `feed(text) || end()` on a fresh validator, in one call: `{ violation, done }`. */
 function streamGuardCheck(schemaBytes, { maxDepth, maxBytes }, text) {
   if (typeof text !== 'string') throw new DavParseError('stream-guard check input has the wrong type', 'input');
-  const r = streamGuardReply(guardCall([u8(3), f64(maxDepth), f64(maxBytes), ...block(schemaBytes), ...guardChunk(text)]), false);
+  return streamGuardCheckReply(guardCall([u8(3), f64(maxDepth), f64(maxBytes), ...block(schemaBytes), ...guardChunk(text)]));
+}
+
+/** A one-shot check reply: it ran end(), so it holds a violation or a finished document; neither
+ *  is a module fault (exported for tests). */
+function streamGuardCheckReply(bytes) {
+  const r = streamGuardReply(bytes, false);
+  if (!r.violation && !r.done) throw new DavParseError('stream-guard check reply has neither a violation nor a document', 'reply');
   return { violation: r.violation, done: r.done };
 }
 
@@ -1172,4 +1182,4 @@ function verifyAtStartup(env = process.env, { hostname } = {}) {
 /** Test hook: forget the cached module (and its failure). */
 function reset() { cached = null; }
 
-module.exports = { streamGuardSchema, streamGuardOptions, streamGuardNew, streamGuardFeed, streamGuardEnd, streamGuardCheck, streamGuardCorrection, streamGuardReply, plainJson, MAX_GUARD_BYTES, MAX_GUARD_DEPTH, MAX_GUARD_SCHEMA_BYTES, MAX_GUARD_STATE_BYTES, MAX_GUARD_INPUT_BYTES, MAX_CORRECTION_UNITS, s3Sign, s3Region, MAX_S3_FIELD_BYTES, MAX_S3_QUERY_PAIRS, MAX_S3_PAYLOAD_BYTES, wasmFlags, verifyAtStartup, framingRuntimeMatches, IMPL_FLAGS, ssrfUrl, ssrfAddressesPublic, ssrfUrlReply, ssrfAddressesReply, MAX_SSRF_BYTES, MAX_SSRF_ADDRESSES, frameUntrusted, escapeClosing, provenanceNew, provenanceIngest, provenanceAdd, provenanceSource, provenanceCheck, provenanceProbe, packetParse, packetValidate, packetRender, FRAME_TEXT_UNITS, FRAME_LABEL_UNITS, MAX_PROVENANCE_BYTES, MAX_PACKET_BYTES, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, tuneContention, tuneContentionText, MAX_CONTENTION_BYTES, longProfilePairs, longProfileSection, longProfilePick, longProfileText, MAX_LONG_PROFILE_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
+module.exports = { streamGuardSchema, streamGuardOptions, streamGuardNew, streamGuardFeed, streamGuardEnd, streamGuardCheck, streamGuardCheckReply, streamGuardCorrection, streamGuardReply, plainJson, MAX_GUARD_BYTES, MAX_GUARD_DEPTH, MAX_GUARD_SCHEMA_BYTES, MAX_GUARD_STATE_BYTES, MAX_GUARD_INPUT_BYTES, MAX_CORRECTION_UNITS, s3Sign, s3Region, MAX_S3_FIELD_BYTES, MAX_S3_QUERY_PAIRS, MAX_S3_PAYLOAD_BYTES, wasmFlags, verifyAtStartup, framingRuntimeMatches, IMPL_FLAGS, ssrfUrl, ssrfAddressesPublic, ssrfUrlReply, ssrfAddressesReply, MAX_SSRF_BYTES, MAX_SSRF_ADDRESSES, frameUntrusted, escapeClosing, provenanceNew, provenanceIngest, provenanceAdd, provenanceSource, provenanceCheck, provenanceProbe, packetParse, packetValidate, packetRender, FRAME_TEXT_UNITS, FRAME_LABEL_UNITS, MAX_PROVENANCE_BYTES, MAX_PACKET_BYTES, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, tuneContention, tuneContentionText, MAX_CONTENTION_BYTES, longProfilePairs, longProfileSection, longProfilePick, longProfileText, MAX_LONG_PROFILE_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
