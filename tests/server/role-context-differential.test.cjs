@@ -98,7 +98,8 @@ test('an unpaired literal escape in a patch (\\uD800) is refused as ambiguous, n
   assert.ok(state.change.files[0].patch.includes('\\uD800'));
   const warn = console.warn; console.warn = () => {};
   try {
-    for (const [op, a] of [[1, 'reviewer'], [1, 'executor'], [2, ['planner', 'executor']]]) {
+    // Only the reviewer's projection carries the change; the executor's does not, so it is not ambiguous there.
+    for (const [op, a] of [[1, 'reviewer']]) {
       assert.throws(() => portReply(op, a, JSON.parse(JSON.stringify(state))), { reason: 'ambiguous' }, `${op} ${a}`);
       const switched = jsReply(op, a, JSON.parse(JSON.stringify(state)), WASM);
       assert.ok(!switched.startsWith('{"projection"') && !switched.startsWith('{"dossier"'), `switch must not hand it out: ${switched.slice(0, 120)}`);
