@@ -1,13 +1,13 @@
 # dav-parse.wasm (#967): the Rust/WebAssembly port of dav-listing.cjs's PROPFIND listing parser,
 # since #976/#978 also of s3-listing.cjs's page scan and storage-path.cjs's rules, and since #977
 # of upload-sniff.cjs's validate, classify and decodeText, and since #979 of secret-envelope.cjs's
-# open and seal, and since #980 of mcp.cjs's parseRpcBody and resolveSchemaRefs and since #1002 of the new chat-template-caps and provider-error crates, and since #1003 autotune-plan, and since #1004 load-verdict, and since #1012 preset-reload, and since #1062 tune-contention, and since #769/#740 prompt-framing and since #1079 long-profile, and s3-sign.cjs/s3-region.cjs (S3_SIGN_IMPL) (one module).
+# open and seal, and since #980 of mcp.cjs's parseRpcBody and resolveSchemaRefs and since #1002 of the new chat-template-caps and provider-error crates, and since #1003 autotune-plan, and since #1004 load-verdict, and since #1012 preset-reload, and since #1062 tune-contention, and since #769/#740 prompt-framing and since #1079 long-profile, and s3-sign.cjs/s3-region.cjs (S3_SIGN_IMPL) and since #795 ssrf-policy (one module).
 # Built from sbstndalton/noevia-rs at NOEVIA_RS_REF (tarball checksum NOEVIA_RS_SHA256) with
 # tools/build-dav-parse-wasm.sh, reproducible on Linux x86_64 (CI and the image build; a macOS arm64
 # build was observed to match, but that is not guaranteed); the module's bytes must hash to
 # DAV_PARSE_WASM_SHA256 or the image build fails and every *_IMPL=wasm switch refuses to load it.
 # Read by server/dav-parse-wasm.cjs, noevia-core CI and noevia's build/web.Dockerfile. The ref must
 # be on noevia-rs main before a release pins this core commit (noevia CI checks it).
-NOEVIA_RS_REF=ffb4b466cd0db06b1772a5a2c3e0da3b9cafa738
-NOEVIA_RS_SHA256=a9cee8d854f377fd1e1615f92515a048c6448bfa5c9f8c7dd000e59d4a296e0e
-DAV_PARSE_WASM_SHA256=c0f2287b88a7c620f5a6e6495111647a0e2ab86a4f4b4eaf617611ae6a9b83f2
+NOEVIA_RS_REF=4a06cbbfe1eb464e34944d4cfdbb41e869891343
+NOEVIA_RS_SHA256=6d2a255403d09f9bd26c26e127b7670140985b15f1940113e840031c3b1eade3
+DAV_PARSE_WASM_SHA256=59a7d4417ee063c39af1ebdfbc042d35f136bb94d1ef12e1d35a0dd094995b7b

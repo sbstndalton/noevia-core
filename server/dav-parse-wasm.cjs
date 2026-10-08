@@ -29,6 +29,8 @@
 //                          provenance-policy.cjs, task-packet.cjs                (PROMPT_FRAMING_IMPL, #769/#740)
 //   - crates/s3-sign        s3Sign/s3Region = s3-sign.cjs signS3RequestJs, s3-region.cjs normalizeS3Region
 //                                                                             (S3_SIGN_IMPL)
+//   - crates/ssrf-policy   ssrfUrl/ssrfAddressesPublic = ssrf.cjs isPublicUrl (before DNS) and
+//                          isPrivateIp, public-fetch.cjs's URL check             (SSRF_IMPL, #795)
 //
 // Memory: WebAssembly memory only grows. A listing or path call needs at most ~16 MiB; an upload
 // decode copies the upload in (at most 25 MiB) and holds one copy of its text (at most 3 bytes per
@@ -48,6 +50,7 @@
 
 const crypto = require('node:crypto');
 const fs = require('node:fs');
+const net = require('node:net');
 const path = require('node:path');
 
 const LOCK_FILE = path.join(__dirname, 'dav-parse.lock');
@@ -59,7 +62,7 @@ const MAX_DECODE_BYTES = 25 * 1024 * 1024;
 // Only the first bytes decide an archive magic number (`ustar` ends at 262).
 const SNIFF_BYTES = 262;
 const RESET_AFTER_BYTES = 1024 * 1024;
-const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'secret_open', 'secret_seal', 'mcp_rpc_body', 'mcp_schema_refs', 'template_caps', 'provider_error', 'serving_verdict', 'autotune_plan', 'preset_reload', 'load_verdict', 'tune_contention', 'frame_untrusted', 'escape_closing', 'provenance', 'task_packet', 'long_profile', 's3_sign', 's3_region', 'dav_output_ptr', 'dav_output_len'];
+const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'secret_open', 'secret_seal', 'mcp_rpc_body', 'mcp_schema_refs', 'template_caps', 'provider_error', 'serving_verdict', 'autotune_plan', 'preset_reload', 'load_verdict', 'tune_contention', 'frame_untrusted', 'escape_closing', 'provenance', 'task_packet', 'long_profile', 's3_sign', 's3_region', 'ssrf_policy', 'dav_output_ptr', 'dav_output_len'];
 
 class DavParseError extends Error {
   constructor(message, reason) {
@@ -818,6 +821,67 @@ function packetRender(packet, label) {
   return r.text;
 }
 
+// ssrf_policy (#795): the outbound-URL guard's decisions. ssrf_policy::MAX_INPUT_BYTES / MAX_ADDRESSES.
+const MAX_SSRF_BYTES = 128 * 1024;
+const MAX_SSRF_ADDRESSES = 512;
+const SSRF_REASONS = new Set(['unparseable', 'scheme', 'credentials', 'private_address', 'blocked_name', 'trailing_dot', 'idn']);
+
+function ssrfCall(request) {
+  const bytes = encoder.encode(JSON.stringify(request));
+  if (bytes.length > MAX_SSRF_BYTES) throw new DavParseError('ssrf policy request is too large', 'too_large');
+  const r = invokeRaw(bytes, (e) => e.ssrf_policy());
+  let reply;
+  try { reply = JSON.parse(utf8(r.bytes)); } catch { throw new DavParseError('ssrf policy reply is not JSON', 'reply'); }
+  if (r.status !== 0) {
+    const code = reply && typeof reply.error === 'string' && ['input', 'too_large', 'input_not_utf8'].includes(reply.error) ? reply.error : 'unknown';
+    throw new DavParseError(`ssrf policy request refused (${code})`, code);
+  }
+  return reply;
+}
+
+const exactKeys = (o, keys) => !!o && typeof o === 'object' && !Array.isArray(o) && Object.keys(o).length === keys.length && keys.every((k) => Object.hasOwn(o, k));
+
+/** The Rust decision for an outbound URL (#795): `{ ok: true, kind: 'ip'|'name', host }` or
+ *  `{ ok: false, reason }`. mode 'check' is ssrf.cjs isPublicUrl before its DNS step, 'fetch'
+ *  public-fetch.cjs before the socket (`loopback`: its QA allowLoopbackLiteral). An accepted host
+ *  must equal Node's own `new URL(url).hostname` (brackets stripped): the socket uses Node's parse,
+ *  so a parser difference is a refusal (`host_mismatch`), never a request to another host. */
+function ssrfUrl(url, { mode, loopback = false } = {}) {
+  if (typeof url !== 'string' || (mode !== 'check' && mode !== 'fetch') || typeof loopback !== 'boolean') throw new DavParseError('ssrf url input has the wrong type', 'input');
+  // A lone surrogate cannot cross as JSON text that Rust accepts; refuse it here instead.
+  if (!url.isWellFormed()) return { ok: false, reason: 'unparseable' };
+  return ssrfUrlReply(ssrfCall({ op: 'url', url, mode, loopback }), url);
+}
+
+/** Check one `url` reply against its shape and against Node's parse of `url` (exported for tests). */
+function ssrfUrlReply(r, url) {
+  if (exactKeys(r, ['ok', 'reason']) && r.ok === false && SSRF_REASONS.has(r.reason)) return { ok: false, reason: r.reason };
+  if (!(exactKeys(r, ['ok', 'kind', 'host']) && r.ok === true && (r.kind === 'ip' || r.kind === 'name') && typeof r.host === 'string' && r.host)) {
+    throw new DavParseError('ssrf url reply has an unexpected shape', 'reply');
+  }
+  let nodeHost;
+  try { nodeHost = new URL(url).hostname.replace(/^\[|\]$/g, ''); } catch { return { ok: false, reason: 'unparseable' }; }
+  // A name must not be an IP literal to Node (it would never be looked up) and vice versa.
+  if (nodeHost !== r.host || (r.kind === 'ip') !== (net.isIP(nodeHost) !== 0)) return { ok: false, reason: 'host_mismatch' };
+  return { ok: true, kind: r.kind, host: r.host };
+}
+
+/** True when `addresses` is non-empty and every entry is a public IP literal (isPrivateIp false
+ *  for all), decided by the Rust port (#795). */
+function ssrfAddressesPublic(addresses) {
+  if (!Array.isArray(addresses) || !addresses.every((a) => typeof a === 'string')) throw new DavParseError('ssrf addresses must be an array of text', 'input');
+  if (addresses.length > MAX_SSRF_ADDRESSES) throw new DavParseError('too many addresses to check', 'too_large');
+  // A lone surrogate is never part of an IP literal.
+  if (!addresses.every((a) => a.isWellFormed())) return false;
+  return ssrfAddressesReply(ssrfCall({ op: 'addresses', addresses }));
+}
+
+/** Check one `addresses` reply's shape (exported for tests). */
+function ssrfAddressesReply(r) {
+  if (!exactKeys(r, ['public']) || typeof r.public !== 'boolean') throw new DavParseError('ssrf addresses reply has an unexpected shape', 'reply');
+  return r.public;
+}
+
 // s3_sign::MAX_FIELD_BYTES, MAX_QUERY_PAIRS, MAX_PAYLOAD_BYTES (the JS has no caps; core's values
 // are far below them).
 const MAX_S3_FIELD_BYTES = 64 * 1024;
@@ -911,7 +975,7 @@ function memoryBytes() { return cached?.instance ? cached.instance.exports.memor
 // Every switch that runs this module (#996). Each reads its value as trim().toLowerCase().
 // CHAT_TEMPLATE_CAPS_IMPL counts only when set to wasm explicitly; its default (also wasm) is
 // checked by chat-template-caps.cjs startup(), which falls back to off instead of stopping.
-const IMPL_FLAGS = ['DAV_PARSE_IMPL', 'S3_PARSE_IMPL', 'STORAGE_PATH_IMPL', 'UPLOAD_SNIFF_IMPL', 'SECRET_ENVELOPE_IMPL', 'MCP_FRAME_IMPL', 'CHAT_TEMPLATE_CAPS_IMPL', 'AUTOTUNE_PLAN_IMPL', 'PRESET_RELOAD_IMPL', 'PROMPT_FRAMING_IMPL', 'S3_SIGN_IMPL'];
+const IMPL_FLAGS = ['DAV_PARSE_IMPL', 'S3_PARSE_IMPL', 'STORAGE_PATH_IMPL', 'UPLOAD_SNIFF_IMPL', 'SECRET_ENVELOPE_IMPL', 'MCP_FRAME_IMPL', 'CHAT_TEMPLATE_CAPS_IMPL', 'AUTOTUNE_PLAN_IMPL', 'PRESET_RELOAD_IMPL', 'PROMPT_FRAMING_IMPL', 'S3_SIGN_IMPL', 'SSRF_IMPL'];
 
 /** The *_IMPL switches set to wasm in `env`. */
 function wasmFlags(env = process.env) {
@@ -949,4 +1013,4 @@ function verifyAtStartup(env = process.env, { hostname } = {}) {
 /** Test hook: forget the cached module (and its failure). */
 function reset() { cached = null; }
 
-module.exports = { s3Sign, s3Region, MAX_S3_FIELD_BYTES, MAX_S3_QUERY_PAIRS, MAX_S3_PAYLOAD_BYTES, wasmFlags, verifyAtStartup, framingRuntimeMatches, IMPL_FLAGS, frameUntrusted, escapeClosing, provenanceNew, provenanceIngest, provenanceAdd, provenanceSource, provenanceCheck, provenanceProbe, packetParse, packetValidate, packetRender, FRAME_TEXT_UNITS, FRAME_LABEL_UNITS, MAX_PROVENANCE_BYTES, MAX_PACKET_BYTES, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, tuneContention, tuneContentionText, MAX_CONTENTION_BYTES, longProfilePairs, longProfileSection, longProfilePick, longProfileText, MAX_LONG_PROFILE_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
+module.exports = { s3Sign, s3Region, MAX_S3_FIELD_BYTES, MAX_S3_QUERY_PAIRS, MAX_S3_PAYLOAD_BYTES, wasmFlags, verifyAtStartup, framingRuntimeMatches, IMPL_FLAGS, ssrfUrl, ssrfAddressesPublic, ssrfUrlReply, ssrfAddressesReply, MAX_SSRF_BYTES, MAX_SSRF_ADDRESSES, frameUntrusted, escapeClosing, provenanceNew, provenanceIngest, provenanceAdd, provenanceSource, provenanceCheck, provenanceProbe, packetParse, packetValidate, packetRender, FRAME_TEXT_UNITS, FRAME_LABEL_UNITS, MAX_PROVENANCE_BYTES, MAX_PACKET_BYTES, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, tuneContention, tuneContentionText, MAX_CONTENTION_BYTES, longProfilePairs, longProfileSection, longProfilePick, longProfileText, MAX_LONG_PROFILE_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
