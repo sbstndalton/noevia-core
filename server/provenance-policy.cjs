@@ -85,7 +85,7 @@ function fnv(text) {
 
 /** One exchange's record of untrusted text. Bounded: past maxChars it is saturated, and then every
  *  sensitive value counts as tainted (the bound never turns into a way around the policy). */
-function createTaintStore({ maxChars = DEFAULT_MAX_CHARS, hash = fnv } = {}) {
+function createTaintStoreJs({ maxChars = DEFAULT_MAX_CHARS, hash = fnv } = {}) {
   const grams = new Map(); // hash -> index into sources
   const texts = []; // { source, text } normalised, for short whole-value matches
   const seen = new Set(); // the normalised blocks already ingested (each round resends history);
@@ -196,7 +196,7 @@ function sensitiveValues(node, key, out, depth = 0) {
  * nested deeper than MAX_DEPTH or hold more than MAX_VALUES sensitive strings, returns
  * [{ field: null, source: null, unchecked: true }]: the caller asks per call (fails closed).
  */
-function checkWrite(store, rawArgs) {
+function checkWriteJs(store, rawArgs) {
   try {
     const args = typeof rawArgs === 'string' ? (rawArgs.trim() ? JSON.parse(rawArgs) : {}) : rawArgs;
     if (args !== null && typeof args !== 'object') throw Error('arguments are not an object');
@@ -212,4 +212,72 @@ function checkWrite(store, rawArgs) {
   }
 }
 
-module.exports = { createTaintStore, checkWrite, normalise, isSensitiveKey, candidates, framedBlocks, SENSITIVE_STEMS, OVERFLOW_SOURCE, MAX_SOURCES, MAX_VALUES, GRAM, DEFAULT_MAX_CHARS };
+// ── PROMPT_FRAMING_IMPL=wasm (prompt-framing.cjs) ─────────────────────────────────────────────
+// The Rust port (noevia-rs crates/prompt-framing) decides everything above: block parsing,
+// normalisation, grams, key stems, candidate forms and the check. The store is plain data the
+// module hands back after each ingest (its gram map is rebuilt per check), so it holds what the JS
+// closure holds: the normalised blocks, their sources and the counters. A wasm store that failed
+// once stays failed: checkWrite on it is unchecked (asks per call), like any error here. A custom
+// `hash` is a JS test hook and is refused; `maxChars` must be an integer from 0 to 4,000,000.
+const WASM_STORE = Symbol('provenance wasm store');
+const UNCHECKED = () => [{ field: null, source: null, unchecked: true }];
+
+/** The text parts ingestMessages reads, exactly as the JS reads them (it throws where the JS does). */
+function contentParts(messages) {
+  const out = [];
+  for (const m of Array.isArray(messages) ? messages : []) {
+    const parts = typeof m?.content === 'string' ? [m.content]
+      : Array.isArray(m?.content) ? m.content.map((p) => (typeof p?.text === 'string' ? p.text : '')) : [];
+    for (const content of parts) if (content.includes('<untrusted ')) out.push(content);
+  }
+  return out;
+}
+
+function createTaintStoreWasm({ maxChars = DEFAULT_MAX_CHARS, hash } = {}) {
+  const wasm = require('./prompt-framing.cjs').framingWasm();
+  if (hash !== undefined) throw new TypeError('a custom hash is only for the JS taint store');
+  let { state, stats } = wasm.provenanceNew(maxChars);
+  let broken = false;
+  const run = (fn) => {
+    if (broken) throw new Error('provenance store failed earlier');
+    try { return fn(); } catch (err) { broken = true; throw err; }
+  };
+  return {
+    [WASM_STORE]: () => (broken ? null : state),
+    add(source, raw) {
+      run(() => ({ state, stats } = wasm.provenanceAdd(state, String(source || 'untrusted text'), String(raw == null ? '' : raw))));
+    },
+    ingestMessages(messages) {
+      run(() => { const contents = contentParts(messages); if (contents.length) ({ state, stats } = wasm.provenanceIngest(state, contents)); });
+    },
+    sourceOf(raw) { return run(() => wasm.provenanceSource(state, String(raw == null ? '' : raw))); },
+    stats: () => ({ ...stats }),
+  };
+}
+
+function checkWriteWasm(store, rawArgs) {
+  try {
+    const state = store[WASM_STORE]();
+    if (!state) return UNCHECKED();
+    let text, object = false;
+    if (typeof rawArgs === 'string') text = rawArgs;
+    else if (rawArgs === null || typeof rawArgs === 'object') { text = JSON.stringify(rawArgs); object = true; }
+    if (typeof text !== 'string') return UNCHECKED();
+    return require('./prompt-framing.cjs').framingWasm().provenanceCheck(state, text, object);
+  } catch {
+    return UNCHECKED();
+  }
+}
+
+/** createTaintStoreJs or its Rust port, by `impl` (default PROMPT_FRAMING_IMPL). */
+function createTaintStore(options = {}) {
+  const { impl = require('./prompt-framing.cjs').framingImpl(), ...rest } = options;
+  return impl === 'wasm' ? createTaintStoreWasm(rest) : createTaintStoreJs(rest);
+}
+
+/** checkWriteJs, or its Rust port for a store createTaintStore made under wasm. */
+function checkWrite(store, rawArgs) {
+  return store && typeof store[WASM_STORE] === 'function' ? checkWriteWasm(store, rawArgs) : checkWriteJs(store, rawArgs);
+}
+
+module.exports = { createTaintStore, checkWrite, createTaintStoreJs, checkWriteJs, contentParts, normalise, isSensitiveKey, candidates, framedBlocks, SENSITIVE_STEMS, OVERFLOW_SOURCE, MAX_SOURCES, MAX_VALUES, GRAM, DEFAULT_MAX_CHARS };
