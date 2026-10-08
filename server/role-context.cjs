@@ -33,6 +33,20 @@
 // Pure: no model calls, no I/O, no HTTP. NOT wired into any live chat path — no multi-role
 // runner exists yet. A future runner prepends nothing but this projection (plus the original
 // request, which the projection already carries as authoritative intent).
+//
+// ROLE_CONTEXT_IMPL=js|wasm (default js; any other value means js, with one warning), read from the
+// `env` option (process.env) on every call. wasm also asks noevia-rs's role-context crate
+// (dav-parse.wasm role_context) for the same projection or dossier. The JS answer is always what is
+// returned; the port can only refuse it, never add to it: a projection is handed out only when the
+// port returns the byte-identical projection and redaction count. A port leak verdict throws
+// RoleContextLeakError with the port's classes; a port refusal, fault, bad reply or any
+// disagreement throws RoleContextLeakError(['impl_refused'] / ['impl_mismatch']) (logged once per
+// reason, text-free), so every caller's existing "context refused, not sent" path handles it. When
+// the JS itself throws, the port is not asked. The flag is in dav-parse-wasm.cjs IMPL_FLAGS (a
+// missing or tampered module stops startup).
+// Stricter than the JS (the crate docs): a lone surrogate anywhere in the state (or one written by
+// decoding a literal \uXXXX in the projection), a state over 8 MiB as JSON, a state JSON.stringify
+// cannot write, or a leak search past the port's work bound is refused.
 
 const ROLES = Object.freeze(['planner', 'executor', 'auditor']);
 const ROLE_NAMES = Object.freeze({ planner: 'Planner', executor: 'Executor', auditor: 'Auditor', reviewer: 'Planner' });
@@ -659,11 +673,8 @@ function resolveSpec(role) {
   return ROLE_SPECS[role];
 }
 
-// Returns { projection, meta: { role, redactions } }. `redactions` counts credentials removed from
-// the user's own free text (request, project instructions). Sensitive content from anywhere else
-// in the state is never redacted: it throws RoleContextLeakError. The throw is also the backstop
-// for anything the redaction missed.
-function projectRoleContext(role, state) {
+// The JS projection (projectRoleContext below documents the result).
+function projectRoleContextJs(role, state) {
   const spec = resolveSpec(role);
   if (!isPlainObject(state)) throw new RoleContextError('state must be an object', 'invalid_state');
   if (state.tenantId === undefined || state.tenantId === null || state.tenantId === '') throw new RoleContextError('state.tenantId is required', 'missing_tenant');
@@ -697,7 +708,7 @@ const PERSONA_FIELDS = Object.freeze(['role', 'role_name', 'role_instructions', 
 const REVISION_FIELDS = Object.freeze(['plan', 'execution', 'change', 'lifecycle_state', 'approval_outcomes', 'feedback']);
 const DOSSIER_ROLES = Object.freeze([...ROLES, REVIEW_ROLE]);
 
-function projectSharedDossier(state, { roles = DOSSIER_ROLES } = {}) {
+function projectSharedDossierJs(state, roles) {
   if (!Array.isArray(roles) || roles.length === 0) throw new RoleContextError('at least one role is required', 'unknown_role');
   const specs = roles.map((role) => [role, resolveSpec(role)]);
   if (!isPlainObject(state)) throw new RoleContextError('state must be an object', 'invalid_state');
@@ -721,6 +732,70 @@ function projectSharedDossier(state, { roles = DOSSIER_ROLES } = {}) {
   if (Array.from(serializeProjection(canonical)).length > CAPS.total) throw new RoleContextError(`projection exceeds ${CAPS.total} characters`, 'too_large');
   for (const [role] of specs) guardProjection(canonical, state, role);
   return { dossier: deepFreeze(canonical), meta: Object.freeze({ roles: Object.freeze([...roles]), fields: Object.freeze(Object.keys(canonical)), redactions: counter.redactions }) };
+}
+
+// ── ROLE_CONTEXT_IMPL ───────────────────────────────────────────────────────
+
+const IMPLS = new Set(['js', 'wasm']);
+let warnedImpl = '';
+/** ROLE_CONTEXT_IMPL: 'js' (default) or 'wasm'. */
+function roleContextImpl(env = process.env) {
+  const raw = env?.ROLE_CONTEXT_IMPL;
+  if (raw === undefined || raw === '') return 'js';
+  const value = String(raw).trim().toLowerCase();
+  if (IMPLS.has(value)) return value;
+  if (warnedImpl !== value) {
+    warnedImpl = value;
+    console.warn(`[role-context] ROLE_CONTEXT_IMPL=${JSON.stringify(String(raw))} is not js or wasm; using js`);
+  }
+  return 'js';
+}
+const defaultLoader = () => require('./dav-parse-wasm.cjs');
+
+const warnedPort = new Set();
+function portWarn(event, reason) {
+  const key = `${event}:${reason}`;
+  if (warnedPort.has(key)) return;
+  warnedPort.add(key);
+  console.warn(`[role-context] ${event} (${reason}); the context was refused`);
+}
+
+// The JS answer stands only if the port gives the byte-identical one. Fails closed otherwise.
+function confirmWithPort(ask, jsValue, jsRedactions) {
+  let port;
+  try {
+    port = ask();
+  } catch (err) {
+    portWarn('role_context.wasm_fault', String(err?.reason || 'unexpected').slice(0, 40));
+    throw new RoleContextLeakError(['impl_refused']);
+  }
+  if (port && Array.isArray(port.leak)) {
+    portWarn('role_context.impl_mismatch', 'leak');
+    throw new RoleContextLeakError([...port.leak]);
+  }
+  if (!port || port.refused !== undefined || port.redactions !== jsRedactions || serializeProjection(port.value) !== serializeProjection(jsValue)) {
+    portWarn('role_context.impl_mismatch', port && port.refused !== undefined ? 'refused' : 'value');
+    throw new RoleContextLeakError(['impl_mismatch']);
+  }
+}
+
+/**
+ * Returns { projection, meta: { role, redactions } }. `redactions` counts credentials removed from
+ * the user's own free text (request, project instructions). Sensitive content from anywhere else
+ * in the state is never redacted: it throws RoleContextLeakError. The throw is also the backstop
+ * for anything the redaction missed. Options: `env` (ROLE_CONTEXT_IMPL), `impl`, `wasmLoader`.
+ */
+function projectRoleContext(role, state, { env = process.env, impl = roleContextImpl(env), wasmLoader = defaultLoader } = {}) {
+  const result = projectRoleContextJs(role, state);
+  if (impl === 'wasm') confirmWithPort(() => wasmLoader().roleContextProject(role, state), result.projection, result.meta.redactions);
+  return result;
+}
+
+/** The shared dossier (#702), as projectSharedDossierJs; with ROLE_CONTEXT_IMPL=wasm confirmed by the port. */
+function projectSharedDossier(state, { roles = DOSSIER_ROLES, env = process.env, impl = roleContextImpl(env), wasmLoader = defaultLoader } = {}) {
+  const result = projectSharedDossierJs(state, roles);
+  if (impl === 'wasm') confirmWithPort(() => wasmLoader().roleContextDossier(roles, state), result.dossier, result.meta.redactions);
+  return result;
 }
 
 function buildRoleContext(role, state) {
@@ -752,6 +827,7 @@ module.exports = {
   projectRoleContext,
   buildAllRoleContexts,
   projectSharedDossier,
+  roleContextImpl,
   PERSONA_FIELDS,
   REVISION_FIELDS,
   DOSSIER_ROLES,
