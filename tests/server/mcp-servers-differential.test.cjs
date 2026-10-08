@@ -206,7 +206,12 @@ test('list mode binds every returned server to its operator entry, auth included
   const dropped = [{ id: 'i', url: 'http://127.0.0.1:1/', auth: 'internal' }, { id: 'a', url: 'http://h.example', auth: 'none' }];
   assert.deepStrictEqual(quiet(() => mcp.parseMcpServersJs(second)), dropped);
   assert.deepStrictEqual(quiet(() => mcp.parseMcpServers(second, stub(dropped))), dropped);
-  assert.deepStrictEqual(quiet(() => mcp.parseMcpServers(second, stub([dropped[1]]))), []);
+  // Dropping a server is allowed; what remains must still be the JS's own for each id.
+  assert.deepStrictEqual(quiet(() => mcp.parseMcpServers(second, stub([dropped[1]]))), [dropped[1]]);
+  assert.deepStrictEqual(quiet(() => mcp.parseMcpServers(second, stub([dropped[0], { id: 'a', url: 'http://127.0.0.1:2/', auth: 'internal' }]))), []);
+  // The internal-accepted state is the list's, not the reply's: dropping x cannot revive a's internal.
+  const revived = { MCP_SERVERS: 'x|http://127.0.0.1:1/|internal,a|http://127.0.0.1:2/|internal', MCP_SERVERS_IMPL: 'wasm' };
+  assert.deepStrictEqual(quiet(() => mcp.parseMcpServers(revived, stub([{ id: 'a', url: 'http://127.0.0.1:2/', auth: 'internal' }]))), []);
   // An entry the JS drops for its URL does not claim the id.
   const badUrl = { MCP_SERVERS: 'a|ftp://x|nextcloud,a|http://h.example|none', MCP_SERVERS_IMPL: 'wasm' };
   assert.deepStrictEqual(quiet(() => mcp.parseMcpServers(badUrl, stub([{ id: 'a', url: 'http://h.example', auth: 'none' }]))), [{ id: 'a', url: 'http://h.example', auth: 'none' }]);

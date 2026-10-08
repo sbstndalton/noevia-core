@@ -47,75 +47,84 @@ function isLoopbackLiteral(hostname) {
   return h === '::1' || h === '0:0:0:0:0:0:0:1';
 }
 
-function parseMcpServersJs(env = process.env) {
-  const shapeOk = (raw, label) => {
+/** shapeOk as the JS applies it; `warn` receives the warning (a no-op when re-checking a reply). */
+function shapeOkWith(warn) {
+  return (raw, label) => {
     try {
       const u = new URL(raw);
       if (!['http:', 'https:'].includes(u.protocol) || u.username || u.password) {
-        console.warn(`[mcp] ignoring ${label}: must be http(s) with no embedded credentials`);
+        warn(`[mcp] ignoring ${label}: must be http(s) with no embedded credentials`);
         return false;
       }
       return true;
     } catch {
-      console.warn(`[mcp] ignoring ${label}: not a valid URL`);
+      warn(`[mcp] ignoring ${label}: not a valid URL`);
       return false;
     }
   };
+}
 
-  const list = (env.MCP_SERVERS || '').trim();
-  if (list) {
-    const out = [];
-    const seen = new Set();
-    for (const entry of list.split(',').map((e) => e.trim()).filter(Boolean)) {
-      const [rawId, rawUrl, rawAuth] = entry.split('|').map((x) => (x || '').trim());
-      const id = (rawId || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40);
-      if (!id || !rawUrl) { console.warn(`[mcp] ignoring malformed MCP_SERVERS entry "${entry}"`); continue; }
-      if (seen.has(id)) { console.warn(`[mcp] ignoring duplicate MCP server id "${id}"`); continue; }
-      if (!shapeOk(rawUrl, `MCP server "${id}"`)) continue;
-      // `bearer:ENV_NAME` reads a static token from that environment variable.
-      // The name, not the value, goes in the config: a key belongs in its own
-      // variable, never in a URL that gets logged, and never inline here where
-      // it would be printed by anything that echoes the server list.
-      let auth = 'none';
-      let tokenEnv = null;
-      if (rawAuth === 'internal') {
-        // Dropped rather than downgraded on any doubt. Silently demoting this
-        // to `none` would leave a server configured and unusable; leaving it
-        // out makes its two boxes disappear, which is the documented
-        // unconfigured state and is at least honest.
-        let host = '';
-        try { host = new URL(rawUrl).hostname; } catch { host = ''; }
-        if (!isLoopbackLiteral(host)) {
-          console.warn(`[mcp] ignoring internal server "${id}": ${host || 'that host'} is not a loopback IP literal. Use 127.0.0.1, not a name.`);
-          continue;
-        }
-        if (out.some((sv) => sv.auth === 'internal')) {
-          console.warn(`[mcp] ignoring internal server "${id}": there is only one in-process server and it is already configured`);
-          continue;
-        }
-        auth = 'internal';
-      } else if (rawAuth === 'nextcloud') {
-        auth = 'nextcloud';
-      } else if (rawAuth && rawAuth.startsWith('bearer:')) {
-        const envName = rawAuth.slice('bearer:'.length).trim();
-        if (!/^[A-Z0-9_]+$/.test(envName)) {
-          console.warn(`[mcp] server "${id}": bearer needs an environment variable name, got "${envName}" — treating as none`);
-        } else if (!env[envName]) {
-          console.warn(`[mcp] server "${id}": ${envName} is not set, so its tools will not authenticate`);
-          auth = 'bearer';
-          tokenEnv = envName;
-        } else {
-          auth = 'bearer';
-          tokenEnv = envName;
-        }
-      } else if (rawAuth && rawAuth !== 'none') {
-        console.warn(`[mcp] server "${id}": unknown auth "${rawAuth}", treating as none`);
+/** The MCP_SERVERS walk of parseMcpServersJs: the servers it configures, in order. `warn` gets each
+ *  warning; the reply check passes a no-op and compares what the port returned against this. */
+function walkMcpServers(list, env, warn) {
+  const shapeOk = shapeOkWith(warn);
+  const out = [];
+  const seen = new Set();
+  for (const entry of list.split(',').map((e) => e.trim()).filter(Boolean)) {
+    const [rawId, rawUrl, rawAuth] = entry.split('|').map((x) => (x || '').trim());
+    const id = (rawId || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40);
+    if (!id || !rawUrl) { warn(`[mcp] ignoring malformed MCP_SERVERS entry "${entry}"`); continue; }
+    if (seen.has(id)) { warn(`[mcp] ignoring duplicate MCP server id "${id}"`); continue; }
+    if (!shapeOk(rawUrl, `MCP server "${id}"`)) continue;
+    // `bearer:ENV_NAME` reads a static token from that environment variable.
+    // The name, not the value, goes in the config: a key belongs in its own
+    // variable, never in a URL that gets logged, and never inline here where
+    // it would be printed by anything that echoes the server list.
+    let auth = 'none';
+    let tokenEnv = null;
+    if (rawAuth === 'internal') {
+      // Dropped rather than downgraded on any doubt. Silently demoting this
+      // to `none` would leave a server configured and unusable; leaving it
+      // out makes its two boxes disappear, which is the documented
+      // unconfigured state and is at least honest.
+      let host = '';
+      try { host = new URL(rawUrl).hostname; } catch { host = ''; }
+      if (!isLoopbackLiteral(host)) {
+        warn(`[mcp] ignoring internal server "${id}": ${host || 'that host'} is not a loopback IP literal. Use 127.0.0.1, not a name.`);
+        continue;
       }
-      seen.add(id);
-      out.push({ id, url: rawUrl, auth, ...(tokenEnv ? { tokenEnv } : {}) });
+      if (out.some((sv) => sv.auth === 'internal')) {
+        warn(`[mcp] ignoring internal server "${id}": there is only one in-process server and it is already configured`);
+        continue;
+      }
+      auth = 'internal';
+    } else if (rawAuth === 'nextcloud') {
+      auth = 'nextcloud';
+    } else if (rawAuth && rawAuth.startsWith('bearer:')) {
+      const envName = rawAuth.slice('bearer:'.length).trim();
+      if (!/^[A-Z0-9_]+$/.test(envName)) {
+        warn(`[mcp] server "${id}": bearer needs an environment variable name, got "${envName}" — treating as none`);
+      } else if (!env[envName]) {
+        warn(`[mcp] server "${id}": ${envName} is not set, so its tools will not authenticate`);
+        auth = 'bearer';
+        tokenEnv = envName;
+      } else {
+        auth = 'bearer';
+        tokenEnv = envName;
+      }
+    } else if (rawAuth && rawAuth !== 'none') {
+      warn(`[mcp] server "${id}": unknown auth "${rawAuth}", treating as none`);
     }
-    return out;
+    seen.add(id);
+    out.push({ id, url: rawUrl, auth, ...(tokenEnv ? { tokenEnv } : {}) });
   }
+  return out;
+}
+
+function parseMcpServersJs(env = process.env) {
+  const shapeOk = shapeOkWith((m) => console.warn(m));
+  const list = (env.MCP_SERVERS || '').trim();
+  if (list) return walkMcpServers(list, env, (m) => console.warn(m));
 
   const single = (env.MCP_SERVER_URL || '').trim();
   if (!single) return [];
@@ -182,53 +191,20 @@ const ID_RE = /^[a-zA-Z0-9_-]{1,40}$/;
 const TOKEN_ENV_RE = /^[A-Z0-9_]+$/;
 const AUTHS = new Set(['none', 'nextcloud', 'internal', 'bearer']);
 
-/** The auth an MCP_SERVERS field asks for, as parseMcpServersJs reads it (`none` for anything else). */
-function rawAuthOf(rawAuth) {
-  if (rawAuth === 'internal' || rawAuth === 'nextcloud') return { auth: rawAuth, tokenEnv: null };
-  if (rawAuth && rawAuth.startsWith('bearer:')) {
-    const envName = rawAuth.slice('bearer:'.length).trim();
-    if (TOKEN_ENV_RE.test(envName)) return { auth: 'bearer', tokenEnv: envName };
-  }
-  return { auth: 'none', tokenEnv: null };
-}
-
-/** MCP_SERVERS split exactly as parseMcpServersJs splits it: id → its entries `{ url, auth, tokenEnv }`, in order. */
-function operatorEntries(list) {
-  const byId = new Map();
-  for (const entry of list.split(',').map((e) => e.trim()).filter(Boolean)) {
-    const [rawId, rawUrl, rawAuth] = entry.split('|').map((x) => (x || '').trim());
-    const id = (rawId || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40);
-    if (!id || !rawUrl) continue;
-    if (!byId.has(id)) byId.set(id, []);
-    byId.get(id).push({ url: rawUrl, ...rawAuthOf(rawAuth) });
-  }
-  return byId;
-}
-
-/** Whether parseMcpServersJs drops this entry before it can claim its id, whatever the port says. */
-function jsDrops(e, internalAccepted) {
-  let u;
-  try { u = new URL(e.url); } catch { return true; }
-  if (!['http:', 'https:'].includes(u.protocol) || u.username || u.password) return true;
-  return e.auth === 'internal' && (!isLoopbackLiteral(u.hostname) || internalAccepted);
-}
-
 /** What the port returned, held to the JS's own rules again: never more than the JS accepts. */
 function checkServers(servers, list, single) {
   // Each returned server must be an operator entry, auth and token variable included: the port may
   // drop a server but never invent one, move a URL to another id, or change its credentials.
-  const entries = list ? operatorEntries(list) : null;
+  const expected = list ? new Map(walkMcpServers(list.trim(), {}, () => {}).map((sv) => [sv.id, sv])) : null;
   const ids = new Set();
   let internal = 0;
   return servers.map((sv) => {
     if (!ID_RE.test(sv.id) || ids.has(sv.id) || typeof sv.url !== 'string' || !AUTHS.has(sv.auth)) throw fault('mcp server reply has an unexpected server');
     ids.add(sv.id);
     if (list) {
-      // First wins by id, as in the JS: the reply must be the first entry for its id that the JS
-      // would not drop on its own (a bad URL, a non-loopback internal, or an internal one after an
-      // internal server already accepted earlier in this reply). Any other earlier entry claims the id.
-      const first = (entries.get(sv.id) || []).find((e) => !jsDrops(e, internal > 0));
-      if (!first || first.url !== sv.url || first.auth !== sv.auth || first.tokenEnv !== (sv.auth === 'bearer' ? sv.tokenEnv : null)) throw fault('mcp server reply has a server not in the environment');
+      // The port may drop a server, never substitute one: each must be the JS's own for that id.
+      const e = expected.get(sv.id);
+      if (!e || e.url !== sv.url || e.auth !== sv.auth || (e.tokenEnv ?? null) !== (sv.auth === 'bearer' ? sv.tokenEnv : null)) throw fault('mcp server reply has a server not in the environment');
     } else if (sv.id !== 'nextcloud' || sv.auth !== 'nextcloud' || sv.url !== single.trim()) throw fault('mcp server reply has a server not in the environment');
     let u;
     try { u = new URL(sv.url); } catch { throw fault('mcp server reply has an invalid URL'); }
