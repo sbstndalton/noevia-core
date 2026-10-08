@@ -88,6 +88,24 @@ test('strict rows: the port refuses as ambiguous; the switch never hands them ou
   } finally { console.warn = warn; }
 });
 
+test('an unpaired literal escape in a patch (\\uD800) is refused as ambiguous, never handed out', { skip: skipWasm }, () => {
+  // Documents the port's strictness (sbstndalton/noevia#1120, measure only): the text is a backslash,
+  // "uD800", not a lone surrogate, and the port does not guess what a later JSON.parse would make of it.
+  const state = {
+    taskId: 't-1', tenantId: 'tenant-alice', request: 'Fix the parser',
+    change: { files: [{ path: 'parse.js', patch: '--- a/parse.js\n+++ b/parse.js\n@@ -1 +1 @@\n-const x = "\\u0041";\n+const x = "\\uD800";\n' }] },
+  };
+  assert.ok(state.change.files[0].patch.includes('\\uD800'));
+  const warn = console.warn; console.warn = () => {};
+  try {
+    for (const [op, a] of [[1, 'reviewer'], [1, 'executor'], [2, ['planner', 'executor']]]) {
+      assert.throws(() => portReply(op, a, JSON.parse(JSON.stringify(state))), { reason: 'ambiguous' }, `${op} ${a}`);
+      const switched = jsReply(op, a, JSON.parse(JSON.stringify(state)), WASM);
+      assert.ok(!switched.startsWith('{"projection"') && !switched.startsWith('{"dossier"'), `switch must not hand it out: ${switched.slice(0, 120)}`);
+    }
+  } finally { console.warn = warn; }
+});
+
 test('seeded live states: the port agrees with this runtime or refuses; the switch never widens', { skip: skipWasm }, () => {
   let seed = 515;
   const rnd = (m) => { seed = (Math.imul(seed, 1103515245) + 12345) >>> 0; return (seed >>> 16) % m; };
@@ -100,7 +118,7 @@ test('seeded live states: the port agrees with this runtime or refuses; the swit
   const text = () => Array.from({ length: 1 + rnd(4) }, () => (rnd(10) ? pick(PIECES) : pick(RISKY))).join(pick([' ', '', '\n']));
   const list = (n) => Array.from({ length: rnd(n) }, text);
   const ROLES = ['planner', 'executor', 'auditor', 'reviewer'];
-  let agreed = 0, refused = 0, handed = 0;
+  let agreed = 0, refused = 0, handed = 0, lost = 0;
   const warn = console.warn; console.warn = () => {};
   try {
     for (let n = 0; n < 600; n++) {
@@ -126,10 +144,16 @@ test('seeded live states: the port agrees with this runtime or refuses; the swit
       // The port's leak class list may differ only if the JS refused too (both refuse).
       if (port !== js) assert.ok(!port.startsWith('{"projection"') && !port.startsWith('{"dossier"'), `port handed out what the JS did not: ${a} ${js.slice(0, 120)} / ${port.slice(0, 120)}`);
       else agreed++;
+      // Where the JS hands the context out and the port answers (not ambiguous / too_large, which
+      // `continue` above) with a leak or a refusal, the switched function refuses what the JS
+      // would have sent: a false refusal. The seeded states must have none.
+      const handedOut = (r) => r.startsWith('{"projection"') || r.startsWith('{"dossier"');
+      if (handedOut(js) && !handedOut(port)) lost++;
       const switched = jsReply(op, a, live, WASM);
       if (switched.startsWith('{"projection"') || switched.startsWith('{"dossier"')) { assert.equal(switched, js); handed++; }
     }
   } finally { console.warn = warn; }
-  console.log(`live: ${agreed} agreed, ${refused} refused, ${handed} handed out`);
+  console.log(`live: ${agreed} agreed, ${refused} refused, ${handed} handed out, ${lost} handed out by the JS but refused by the port`);
+  assert.equal(lost, 0, `${lost} runs where the JS handed out and the port refused or flagged a leak`);
   assert.ok(agreed > 500 && handed > 100, `${agreed} agreed, ${refused} refused, ${handed} handed out`);
 });
