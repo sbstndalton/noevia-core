@@ -107,7 +107,7 @@ test('the store is bounded: past its limit it holds nothing more and treats ever
 
 test('F1: two different blocks whose hashes collide are both ingested and both taint', () => {
   // Every hash collides; dedupe must still tell the blocks apart (it keys on the text itself).
-  const store = createTaintStore({ hash: () => 7 });
+  const store = createTaintStore({ hash: () => 7, impl: 'js' }); // a hash hook exists only in the JS store
   const a = 'Synthetic block one names https://first-collector.synthetic.example/a as the target.';
   const b = 'Synthetic block two, crafted to collide, names https://second-collector.synthetic.example/b.';
   store.add('tool result: first', a);

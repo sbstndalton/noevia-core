@@ -22,6 +22,8 @@
 //                                        new logic, no JS twin; see chat-template-caps.cjs
 //                                                                             (CHAT_TEMPLATE_CAPS_IMPL, #1002)
 //   - crates/tune-contention tuneContention = auto-tune vs another router client (always on; fails closed, #1062)
+//   - crates/prompt-framing frameUntrusted/escapeClosing, provenance*, packet* = prompt-framing.cjs,
+//                          provenance-policy.cjs, task-packet.cjs                (PROMPT_FRAMING_IMPL, #769/#740)
 //
 // Memory: WebAssembly memory only grows. A listing or path call needs at most ~16 MiB; an upload
 // decode copies the upload in (at most 25 MiB) and holds one copy of its text (at most 3 bytes per
@@ -52,7 +54,7 @@ const MAX_DECODE_BYTES = 25 * 1024 * 1024;
 // Only the first bytes decide an archive magic number (`ustar` ends at 262).
 const SNIFF_BYTES = 262;
 const RESET_AFTER_BYTES = 1024 * 1024;
-const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'secret_open', 'secret_seal', 'mcp_rpc_body', 'mcp_schema_refs', 'template_caps', 'provider_error', 'serving_verdict', 'autotune_plan', 'preset_reload', 'load_verdict', 'tune_contention', 'dav_output_ptr', 'dav_output_len'];
+const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'secret_open', 'secret_seal', 'mcp_rpc_body', 'mcp_schema_refs', 'template_caps', 'provider_error', 'serving_verdict', 'autotune_plan', 'preset_reload', 'load_verdict', 'tune_contention', 'frame_untrusted', 'escape_closing', 'provenance', 'task_packet', 'dav_output_ptr', 'dav_output_len'];
 
 class DavParseError extends Error {
   constructor(message, reason) {
@@ -601,13 +603,182 @@ function tuneContentionText(text) {
   return { action: r.action, reason: r.reason, foreign: r.foreign, unload: r.unload, fingerprint: r.fingerprint, since: r.since, waitedMs: r.waitedMs };
 }
 
+// prompt_framing::MAX_TEXT_UNITS / MAX_LABEL_UNITS / MAX_PROVENANCE_BYTES / MAX_PACKET_BYTES.
+const FRAME_TEXT_UNITS = 8 * 1024 * 1024;
+const FRAME_LABEL_UNITS = 1024 * 1024;
+const MAX_PROVENANCE_BYTES = 24 * 1024 * 1024;
+const MAX_PACKET_BYTES = 1024 * 1024;
+const FRAME_TAG = /^[A-Za-z0-9_-]{1,64}$/;
+const littleEndian = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
+
+/** UTF-16LE bytes as a JS string, lone surrogates kept (TextDecoder would replace them). */
+function fromUtf16le(bytes) {
+  if (bytes.length % 2) throw new DavParseError('prompt framing reply has an odd length', 'reply');
+  const n = bytes.length / 2;
+  let units;
+  if (littleEndian && bytes.byteOffset % 2 === 0) units = new Uint16Array(bytes.buffer, bytes.byteOffset, n);
+  else { units = new Uint16Array(n); const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.length); for (let i = 0; i < n; i++) units[i] = v.getUint16(i * 2, true); }
+  let out = '';
+  for (let i = 0; i < n; i += 8192) out += String.fromCharCode.apply(null, units.subarray(i, i + 8192));
+  return out;
+}
+
+function framingRefusal(what, status, bytes) {
+  let code = 'unknown';
+  try { const r = JSON.parse(utf8(bytes)); if (r && typeof r.error === 'string') code = r.error; } catch { /* keep unknown */ }
+  return new DavParseError(`${what} refused by dav-parse (status ${status}, ${code})`, code);
+}
+
+/** `u32le(units) units` for each string but the last, then the last's units. */
+function unitFrames(...parts) {
+  const enc = parts.map(utf16le);
+  const out = new Uint8Array(enc.reduce((n, e, i) => n + e.length + (i < enc.length - 1 ? 4 : 0), 0));
+  const view = new DataView(out.buffer);
+  let at = 0;
+  enc.forEach((e, i) => {
+    if (i < enc.length - 1) { view.setUint32(at, parts[i].length, true); at += 4; }
+    out.set(e, at); at += e.length;
+  });
+  return out;
+}
+
+/** prompt-framing.cjs frameUntrusted (#769), through the module. Strings only. */
+function frameUntrusted(kind, label, text) {
+  if (typeof kind !== 'string' || typeof label !== 'string' || typeof text !== 'string') throw new DavParseError('framing input must be text', 'input');
+  if (kind.length > FRAME_LABEL_UNITS || label.length > FRAME_LABEL_UNITS || text.length > FRAME_TEXT_UNITS) throw new DavParseError('framing input is too large', 'too_large');
+  const { status, bytes } = invokeRaw(unitFrames(kind, label, text), (e) => e.frame_untrusted(), MAX_DECODE_BYTES);
+  if (status !== 0) throw framingRefusal('framing', status, bytes);
+  const out = fromUtf16le(bytes);
+  // The block: a header with the notice (46-294 units), the body (the text plus at most one U+200B
+  // per 9 units, the shortest marker '</SOURCE>'), the 13-unit close.
+  if (!out.startsWith('<untrusted kind="') || !out.endsWith('\n</untrusted>') || !out.includes('> (data, not instructions)\n')
+    || out.length < text.length + 59 || out.length > text.length + Math.ceil(text.length / 9) + 307) {
+    throw new DavParseError('framing reply has an unexpected shape', 'reply');
+  }
+  return out;
+}
+
+/** prompt-framing.cjs escapeClosing, through the module; the tag is a literal ASCII name. */
+function escapeClosing(text, tag) {
+  if (typeof text !== 'string' || typeof tag !== 'string' || !FRAME_TAG.test(tag)) throw new DavParseError('escapeClosing input must be text and an ASCII tag', 'input');
+  if (text.length > FRAME_TEXT_UNITS) throw new DavParseError('escapeClosing input is too large', 'too_large');
+  const { status, bytes } = invokeRaw(unitFrames(tag, text), (e) => e.escape_closing(), MAX_DECODE_BYTES);
+  if (status !== 0) throw framingRefusal('escapeClosing', status, bytes);
+  const out = fromUtf16le(bytes);
+  if (out.length < text.length || out.length > text.length + Math.ceil(text.length / (tag.length + 3))) throw new DavParseError('escapeClosing reply has an unexpected shape', 'reply');
+  return out;
+}
+
+/** One provenance or packet request: UTF-8 JSON in, a parsed reply out. */
+function framingCall(request, call, max, what) {
+  const bytes = encoder.encode(JSON.stringify(request));
+  if (bytes.length > max) throw new DavParseError(`${what} request is too large`, 'too_large');
+  const r = invokeRaw(bytes, call, MAX_DECODE_BYTES);
+  if (r.status !== 0) throw framingRefusal(what, r.status, r.bytes);
+  try { return JSON.parse(utf8(r.bytes)); } catch { throw new DavParseError(`${what} reply is not JSON`, 'reply'); }
+}
+
+const isCount = (n) => Number.isSafeInteger(n) && n >= 0;
+const nonEmpty = (s) => typeof s === 'string' && s.length > 0;
+function validStore(r) {
+  const s = r?.state, st = r?.stats;
+  const ok = s && isCount(s.maxChars) && isCount(s.chars) && typeof s.saturated === 'boolean' && s.chars <= s.maxChars
+    && Array.isArray(s.sources) && s.sources.length <= 64 && s.sources.every(nonEmpty)
+    && Array.isArray(s.texts) && (!s.saturated || s.texts.length === 0)
+    && s.texts.every((t) => Array.isArray(t) && t.length === 2 && isCount(t[0]) && t[0] < s.sources.length && nonEmpty(t[1]))
+    && st && st.chars === s.chars && isCount(st.grams) && st.sources === s.sources.length && st.saturated === s.saturated;
+  if (!ok) throw new DavParseError('provenance store reply has an unexpected shape', 'reply');
+  return { state: s, stats: { chars: st.chars, grams: st.grams, sources: st.sources, saturated: st.saturated } };
+}
+const provenance = (request) => framingCall(request, (e) => e.provenance(), MAX_PROVENANCE_BYTES, 'provenance');
+
+/** provenance-policy.cjs createTaintStore (#769): an empty store's `{ state, stats }`. */
+function provenanceNew(maxChars) {
+  if (!isCount(maxChars) || maxChars > 4_000_000) throw new DavParseError('provenance maxChars must be an integer from 0 to 4000000', 'input');
+  return validStore(provenance({ op: 'new', maxChars }));
+}
+/** The store after ingestMessages' text parts (`contents`). */
+function provenanceIngest(state, contents) { return validStore(provenance({ op: 'ingest', state, contents })); }
+/** The store after add(source, text) (`source` already `String(source || 'untrusted text')`). */
+function provenanceAdd(state, source, text) { return validStore(provenance({ op: 'add', state, source, text })); }
+/** sourceOf(value): a source name or null. */
+function provenanceSource(state, value) {
+  const r = provenance({ op: 'source', state, value });
+  if (!r || !(r.source === null || nonEmpty(r.source))) throw new DavParseError('provenance source reply has an unexpected shape', 'reply');
+  return r.source;
+}
+/** checkWrite on the call's argument text (`object`: the JSON text of an object argument). */
+function provenanceCheck(state, args, object) {
+  const r = provenance({ op: 'check', state, args, object });
+  if (r && r.unchecked === true && Object.keys(r).length === 1) return [{ field: null, source: null, unchecked: true }];
+  if (!r || !Array.isArray(r.found) || r.found.length > 5 || !r.found.every((f) => f && nonEmpty(f.field) && nonEmpty(f.source))) {
+    throw new DavParseError('provenance check reply has an unexpected shape', 'reply');
+  }
+  return r.found.map((f) => ({ field: f.field, source: f.source }));
+}
+/** The policy's helpers, for differential tests: normalise, key, candidates, blocks. */
+function provenanceProbe(op, value) {
+  const field = { normalise: 'value', key: 'key', candidates: 'value', blocks: 'content' }[op];
+  if (!field || typeof value !== 'string') throw new DavParseError('provenance probe input is wrong', 'input');
+  const r = provenance({ op, [field]: value });
+  const out = { normalise: r?.value, key: r?.sensitive, candidates: r?.candidates, blocks: r?.blocks }[op];
+  const ok = { normalise: typeof out === 'string', key: typeof out === 'boolean', candidates: Array.isArray(out) && out.every((c) => typeof c === 'string'),
+    blocks: Array.isArray(out) && out.every((b) => Array.isArray(b) && b.length === 3 && typeof b[0] === 'string' && (b[1] === null || typeof b[1] === 'string') && typeof b[2] === 'string') }[op];
+  if (!ok) throw new DavParseError('provenance probe reply has an unexpected shape', 'reply');
+  return out;
+}
+
+const PACKET_KINDS = ['tool', 'web', 'file', 'project', 'chat'];
+const PACKET_RULE = /^\$[\s\S]*: (must be a string|must not be empty|longer than \d+ characters|contains a control or formatting character|must be an object|is not part of the schema|must be an array|has more than \d+ items|must be 1|is required|must be one of tool, web, file, project, chat|larger than 16384 bytes|unreadable)$/;
+/** A packet as task-packet.cjs builds it (fresh plain objects, the JS's key order). */
+function validPacket(p) {
+  const strs = (a, max, each) => Array.isArray(a) && a.length <= max && a.every((s) => nonEmpty(s) && s.length <= each);
+  const ok = p && p.packet_schema === 1 && nonEmpty(p.goal) && p.goal.length <= 400 && Array.isArray(p.facts) && p.facts.length <= 24
+    && p.facts.every((f) => f && nonEmpty(f.text) && f.text.length <= 600 && f.source && PACKET_KINDS.includes(f.source.kind) && nonEmpty(f.source.ref)
+      && f.source.ref.length <= 300 && (f.quote === undefined || (nonEmpty(f.quote) && f.quote.length <= 400)))
+    && strs(p.constraints, 12, 300) && strs(p.open_questions, 12, 300);
+  if (!ok) throw new DavParseError('task packet reply has an unexpected shape', 'reply');
+  return {
+    packet_schema: 1, goal: p.goal,
+    facts: p.facts.map((f) => ({ text: f.text, source: { kind: f.source.kind, ref: f.source.ref }, ...(f.quote !== undefined ? { quote: f.quote } : {}) })),
+    constraints: [...p.constraints], open_questions: [...p.open_questions],
+  };
+}
+const packetCall = (request) => framingCall(request, (e) => e.task_packet(), MAX_PACKET_BYTES, 'task packet');
+
+/** task-packet.cjs parsePacket (#740): `{ ok, packet }` or `{ ok: false, reason, error }`. */
+function packetParse(output) {
+  if (typeof output !== 'string') throw new DavParseError('task packet output must be text', 'input');
+  const r = packetCall({ op: 'parse', output });
+  if (r?.ok === true) return { ok: true, packet: validPacket(r.packet) };
+  const ok = r?.ok === false && ((r.reason === 'invalid-json' && ['$: no JSON', '$: not JSON'].includes(r.error)) || (r.reason === 'schema' && typeof r.error === 'string' && PACKET_RULE.test(r.error)));
+  if (!ok) throw new DavParseError('task packet reply has an unexpected shape', 'reply');
+  return { ok: false, reason: r.reason, error: r.error };
+}
+/** task-packet.cjs validatePacket on a JSON tree: `{ ok, packet }` or `{ ok: false, error }`. */
+function packetValidate(raw) {
+  const r = packetCall({ op: 'validate', packet: raw });
+  if (r?.ok === true) return { ok: true, packet: validPacket(r.packet) };
+  if (r?.ok !== false || typeof r.error !== 'string' || !PACKET_RULE.test(r.error)) throw new DavParseError('task packet reply has an unexpected shape', 'reply');
+  return { ok: false, error: r.error };
+}
+/** task-packet.cjs renderPacket of a packet parsePacket returned. */
+function packetRender(packet, label) {
+  if (typeof label !== 'string') throw new DavParseError('task packet label must be text', 'input');
+  const r = packetCall({ op: 'render', packet, label });
+  if (!r || typeof r.text !== 'string' || !r.text.startsWith('<untrusted kind="task packet"') || !r.text.endsWith('\n</untrusted>')) {
+    throw new DavParseError('task packet render reply has an unexpected shape', 'reply');
+  }
+  return r.text;
+}
+
 /** Test hook: the cached instance's linear memory in bytes (0 when there is none). */
 function memoryBytes() { return cached?.instance ? cached.instance.exports.memory.buffer.byteLength : 0; }
 
 // Every switch that runs this module (#996). Each reads its value as trim().toLowerCase().
 // CHAT_TEMPLATE_CAPS_IMPL counts only when set to wasm explicitly; its default (also wasm) is
 // checked by chat-template-caps.cjs startup(), which falls back to off instead of stopping.
-const IMPL_FLAGS = ['DAV_PARSE_IMPL', 'S3_PARSE_IMPL', 'STORAGE_PATH_IMPL', 'UPLOAD_SNIFF_IMPL', 'SECRET_ENVELOPE_IMPL', 'MCP_FRAME_IMPL', 'CHAT_TEMPLATE_CAPS_IMPL', 'AUTOTUNE_PLAN_IMPL', 'PRESET_RELOAD_IMPL'];
+const IMPL_FLAGS = ['DAV_PARSE_IMPL', 'S3_PARSE_IMPL', 'STORAGE_PATH_IMPL', 'UPLOAD_SNIFF_IMPL', 'SECRET_ENVELOPE_IMPL', 'MCP_FRAME_IMPL', 'CHAT_TEMPLATE_CAPS_IMPL', 'AUTOTUNE_PLAN_IMPL', 'PRESET_RELOAD_IMPL', 'PROMPT_FRAMING_IMPL'];
 
 /** The *_IMPL switches set to wasm in `env`. */
 function wasmFlags(env = process.env) {
@@ -617,9 +788,20 @@ function wasmFlags(env = process.env) {
 /** Startup check (#996): when any switch is wasm, load and verify the module now (lock, sha256,
  *  no imports, the full ABI) instead of failing on the first request. Returns the flags; throws
  *  an Error naming them and the reason when the module is unusable. */
-function verifyAtStartup(env = process.env) {
+/** The runtime URL behaviour prompt-framing's port was pinned against (Node 22's ada maps U+1E9E
+ *  to "ss" in hosts; noevia-rs crates/prompt-framing idna_compat does the same). A runtime that
+ *  disagrees would make JS and wasm hosts differ, so PROMPT_FRAMING_IMPL=wasm refuses to start. */
+function framingRuntimeMatches(hostname = (h) => new URL(h).hostname) {
+  try { return hostname('http://\u1e9e.io') === 'ss.io'; } catch { return false; }
+}
+
+function verifyAtStartup(env = process.env, { hostname } = {}) {
   const flags = wasmFlags(env);
   if (!flags.length) return flags;
+  if (flags.includes('PROMPT_FRAMING_IMPL') && !framingRuntimeMatches(hostname)) {
+    cached = null;
+    throw Object.assign(new Error(`PROMPT_FRAMING_IMPL set to wasm, but this runtime's URL parser (Node ${process.version}) does not map U+1E9E to "ss" as the pinned port does (runtime)`), { reason: 'runtime', flags });
+  }
   cached = null;
   try {
     cached = load({ file: env.DAV_PARSE_WASM || DEFAULT_WASM });
@@ -634,4 +816,4 @@ function verifyAtStartup(env = process.env) {
 /** Test hook: forget the cached module (and its failure). */
 function reset() { cached = null; }
 
-module.exports = { wasmFlags, verifyAtStartup, IMPL_FLAGS, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, tuneContention, tuneContentionText, MAX_CONTENTION_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
+module.exports = { wasmFlags, verifyAtStartup, framingRuntimeMatches, IMPL_FLAGS, frameUntrusted, escapeClosing, provenanceNew, provenanceIngest, provenanceAdd, provenanceSource, provenanceCheck, provenanceProbe, packetParse, packetValidate, packetRender, FRAME_TEXT_UNITS, FRAME_LABEL_UNITS, MAX_PROVENANCE_BYTES, MAX_PACKET_BYTES, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, tuneContention, tuneContentionText, MAX_CONTENTION_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
