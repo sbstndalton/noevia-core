@@ -117,9 +117,13 @@ test('set rows: the same refusal (400, public message) or the same write', { ski
   }
 });
 
-test('a real table behaves the same under both settings', { skip: skipWasm }, () => {
-  // The server's own dependency, wherever the workspace put this test.
-  const Database = createRequire(path.join(__dirname, '../../server/index.cjs'))('better-sqlite3');
+// The server's own dependency, wherever the workspace put this test. The image build's test stage
+// has no native modules installed; the Server tests job does and runs this.
+const serverRequire = createRequire(path.join(__dirname, '../../server/index.cjs'));
+const noSqlite = (() => { try { serverRequire.resolve('better-sqlite3'); return false; } catch { return 'better-sqlite3 not installed here'; } })();
+
+test('a real table behaves the same under both settings', { skip: skipWasm || noSqlite }, () => {
+  const Database = serverRequire('better-sqlite3');
   for (const impl of ['js', 'wasm']) {
     const db = new Database(':memory:');
     db.exec("CREATE TABLE users(id TEXT PRIMARY KEY); INSERT INTO users VALUES('u1'),('u2');");
