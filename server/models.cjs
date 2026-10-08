@@ -227,8 +227,13 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
     // A sidecar model that a live backend reports as loaded is running, whatever the folder scan says.
     // A preset with no local file that belongs to a sidecar (Laya, or the configured embedding /
     // reranking model) is served by that service, so it is not a fault even when the sidecar is down.
-    const servedElsewhere = (m) => !sidecarUp(m) && noLocalFile(m)
-      && (isSystemModel(m.id || m.model_name, modelPathFromArgs(m.status?.args)) || isSidecarModel(m.id || m.model_name, env));
+    // Laya (the system routing model) never has a file the engine can load from the models folder, so
+    // it reads as served elsewhere even when no folder scan could be read (loader slow or down): it must
+    // never fall through to a plain "Unloaded" card with a Load button. Sidecar models need the scan,
+    // since a configured embedding/reranking model may legitimately have a local file.
+    const isSystem = (m) => isSystemModel(m.id || m.model_name, modelPathFromArgs(m.status?.args));
+    const servedElsewhere = (m) => !sidecarUp(m) && m.source === 'preset'
+      && ((isSystem(m) && (!scan || noLocalFile(m))) || (noLocalFile(m) && isSidecarModel(m.id || m.model_name, env)));
     const missingFile = (m) => !sidecarUp(m) && noLocalFile(m) && !servedElsewhere(m);
     // Decimal GB, as the router's own number is. The loader's byte count wins; the router's size is
     // the fallback for a row the scan does not cover.
