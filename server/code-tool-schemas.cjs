@@ -26,7 +26,12 @@
 // without counting, the harness stops the agent, and the job fails with `result.blocked` set (the
 // task lifecycle reads a failed job as `blocked`). #701 later records that as a formal
 // `task.stage` transition; this module does not depend on it.
-const { createValidator, buildCorrectionRequest } = require('./stream-guard.cjs');
+//
+// STREAM_GUARD_IMPL=wasm (default js; stream-guard.cjs) runs the validator and the correction
+// request through the Rust port, read on each check. Same violations. It fails closed: when the
+// module cannot answer, the call is refused as unchecked (UNCHECKED, counted like any other
+// violation), never let through.
+const { createValidator, buildCorrectionRequest, streamGuardImpl, checkTextWasm, buildCorrectionRequestWasm } = require('./stream-guard.cjs');
 const { classify, COMMAND_KEYS } = require('./code-actions.cjs');
 
 const MAX_VIOLATIONS = 3;
@@ -104,6 +109,9 @@ const HINTS = Object.freeze({
   'fs/write_text_file': 'Send { path, content } with a plain non-empty path and the whole file as a string.',
 });
 
+/** What a call is refused with when the Rust port cannot check it (STREAM_GUARD_IMPL=wasm). */
+const UNCHECKED = Object.freeze({ message: 'Arguments could not be checked.', path: '$' });
+
 const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const clip = (text, max = MESSAGE_MAX) => String(text ?? '').slice(0, max);
 
@@ -112,8 +120,13 @@ function validate(schema, value) {
   let text;
   try { text = JSON.stringify(value); } catch { return { message: 'Arguments are not valid JSON.', path: '$' }; }
   if (text === undefined) return { message: 'Arguments are missing.', path: '$' };
-  const validator = createValidator(schema);
-  const violation = validator.feed(text) || validator.end();
+  let violation;
+  if (streamGuardImpl() === 'wasm') {
+    try { violation = checkTextWasm(schema, text); } catch { return { ...UNCHECKED }; }
+  } else {
+    const validator = createValidator(schema);
+    violation = validator.feed(text) || validator.end();
+  }
   return violation ? { message: violation.message, path: violation.path || '$' } : null;
 }
 
@@ -217,9 +230,18 @@ function checkFsCall(method, params, { maxBytes = Infinity } = {}) {
  * The structured violation the agent receives: the Laya correction shape (`buildCorrectionRequest`,
  * only the violation, no restated schema), plus which tool, how many strikes, and how to fix it.
  */
+function correctionFor(found) {
+  if (streamGuardImpl() !== 'wasm') return buildCorrectionRequest({ message: clip(found.message), path: found.path || null });
+  try {
+    return buildCorrectionRequestWasm({ message: String(found.message ?? ''), path: found.path || null }, MESSAGE_MAX);
+  } catch {
+    return buildCorrectionRequest(UNCHECKED);
+  }
+}
+
 function structuredViolation(found, { tool, count, limit, blocked }) {
   return {
-    ...buildCorrectionRequest({ message: clip(found.message), path: found.path || null }),
+    ...correctionFor(found),
     tool, kind: found.kind || null, hint: found.hint || '',
     count, limit, blocked,
   };
