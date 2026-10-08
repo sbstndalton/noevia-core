@@ -149,7 +149,7 @@ test('a crafted header cannot make the reads go on: rounds are bounded, the cap 
   const big = tmp(Buffer.alloc(64 * 1024 * 1024));
   const scraps = { MAX_GGUF_WINDOW_BYTES: davParseWasm.MAX_GGUF_WINDOW_BYTES, MAX_GGUF_SEGMENTS: davParseWasm.MAX_GGUF_SEGMENTS, ggufSummary: () => { calls++; return { need: { at: calls * 10000, end: calls * 10000 + 1 } }; } };
   assert.deepEqual(rs(big, { wasm: scraps }), { error: 'GGUF header could not be checked (too_large)' });
-  assert.ok(calls <= 2 * davParseWasm.MAX_GGUF_SEGMENTS + 65, String(calls));
+  assert.ok(calls <= gguf.MAX_ROUNDS + 1, String(calls));
   // Scraps each just past the held run: every round doubles the run, so the cap ends it fast.
   calls = 0;
   let last = 0;
@@ -243,4 +243,30 @@ test('GGUF_META_IMPL: js by default, wasm when asked, anything else is js with a
     assert.throws(() => davParseWasm.verifyAtStartup(process.env), /GGUF_META_IMPL set to wasm/);
   });
   davParseWasm.reset();
+});
+
+test('a held 20 MiB window asking for jumped 4 KiB ranges stops at the byte budget (#1106)', () => {
+  const MiB = 1024 * 1024, maxWindow = 24 * MiB;
+  const big = tmp(Buffer.alloc(64 * MiB));
+  let calls = 0, sent = 0;
+  const stub = { MAX_GGUF_WINDOW_BYTES: maxWindow, MAX_GGUF_SEGMENTS: 512, ggufSummary: (size, segs) => {
+    calls++;
+    sent += segs.reduce((n, x) => n + x.bytes.length, 0);
+    if (calls === 1) return { need: { at: 0, end: 20 * MiB } };
+    const at = 21 * MiB + calls * 8192;
+    return { need: { at, end: at + 4096 } };
+  } };
+  assert.deepEqual(rs(big, { wasm: stub }), { error: 'GGUF header could not be checked (too_large)' });
+  assert.ok(sent <= gguf.MAX_SENT_WINDOWS * maxWindow, `${sent} bytes`);
+  assert.ok(calls <= 12, String(calls));
+  fs.rmSync(big);
+});
+
+test('a module asking for scraps forever stops at the round limit (#1106)', () => {
+  const big = tmp(Buffer.alloc(8 * 1024 * 1024));
+  let calls = 0;
+  const stub = { MAX_GGUF_WINDOW_BYTES: 24 * 1024 * 1024, MAX_GGUF_SEGMENTS: 512, ggufSummary: () => { calls++; return { need: { at: calls * 10000, end: calls * 10000 + 1 } }; } };
+  assert.deepEqual(rs(big, { wasm: stub }), { error: 'GGUF header could not be checked (too_large)' });
+  assert.ok(calls <= gguf.MAX_ROUNDS + 1, String(calls));
+  fs.rmSync(big);
 });

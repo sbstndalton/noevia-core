@@ -7,7 +7,7 @@
 // and returns exactly summarize(readGguf(file)). The file I/O stays here: the module gets the
 // file's size and the byte ranges read so far (the first 4 KiB, then each range it names: as
 // much again as the range it continues (a skip of at most 4 KiB past a range continues it), 4 KiB
-// after a jump; at most 24 MiB in 512 ranges and 1088 rounds);
+// after a jump; at most 24 MiB in 512 ranges, 64 rounds and 8 x 24 MiB handed over in all);
 // bytes the JS skips are not read. Fails closed: the flag is in dav-parse-wasm.cjs IMPL_FLAGS (a
 // missing or tampered module stops startup), and a refusal, a trap or a reply of the wrong shape
 // throws, never falls back to the JS. Stricter than the JS, as that refusal: more than 24 MiB of
@@ -140,6 +140,9 @@ function ggufImpl(env = process.env) {
 // The first read, and the read after a jump past skipped bytes; reading on from a held range
 // doubles that range, so a contiguous header takes a few rounds and a jump wastes little.
 const READ_CHUNK = 4 * 1024;
+// Limits on one readSummaryWasm call: rounds, and bytes handed over, in windows (#1106).
+const MAX_ROUNDS = 64;
+const MAX_SENT_WINDOWS = 8;
 const FAIL_MESSAGES = {
   not_gguf: () => 'Not a GGUF file',
   version: (v) => `Unsupported GGUF version ${v}`,
@@ -173,9 +176,16 @@ function readSummaryWasm(file, { wasm = require('./dav-parse-wasm.cjs'), maxWind
     // Every round grows what is held (doubling a run, or a new range), so a real header takes a
     // few dozen; a crafted one that keeps asking for scraps stops here instead of reparsing ~24
     // MiB thousands of times on the event loop.
-    const maxRounds = 2 * wasm.MAX_GGUF_SEGMENTS + 64;
+    // Real files take at most ~13 rounds. Both limits bound the work a crafted header can cause
+    // (sbstndalton/noevia#1106): the round count, and the bytes handed to the module in all
+    // rounds together (a held ~20 MiB window asking for jumped scraps would otherwise be copied
+    // and reparsed hundreds of times).
+    const byteBudget = MAX_SENT_WINDOWS * maxWindow;
+    let sent = 0;
     for (let round = 0; ; round++) {
-      if (round > maxRounds) throw tooLarge();
+      if (round > MAX_ROUNDS) throw tooLarge();
+      sent += segs.reduce((n, x) => n + x.bytes.length, 0);
+      if (sent > byteBudget) throw tooLarge();
       let reply;
       try { reply = wasm.ggufSummary(size, segs); } catch (err) {
         throw Error(`GGUF header could not be checked (${err?.reason || 'unexpected'})`);
@@ -214,4 +224,4 @@ function readSummary(file) {
   return ggufImpl() === 'wasm' ? readSummaryWasm(file) : summarize(readGguf(file));
 }
 
-module.exports = { readGguf, summarize, readSummary, readSummaryWasm, ggufImpl, MAX_ARRAY_KEPT };
+module.exports = { readGguf, summarize, readSummary, readSummaryWasm, ggufImpl, MAX_ARRAY_KEPT, MAX_ROUNDS, MAX_SENT_WINDOWS };
