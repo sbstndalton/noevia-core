@@ -798,8 +798,9 @@ function createChatHandler({
       sampling: sampling.source === 'none' ? undefined : { preset: sampling.presetId || undefined, source: sampling.source, values: sampling.params } });
     if (replySources.length && !body.compactOnly) send({ type: 'sources', sources: replySources });
     send({ type: 'telemetry', phase: 'waiting', model });
-    send({ type: 'status', id: attachedImages.length ? 'readingImages' : contextSwitch ? 'loadingLongContext' : 'preparing', text: attachedImages.length ? 'Reading image sources — model loading and visual processing may take a moment…'
-      : contextSwitch ? 'Loading the high-context profile — switching models may take a moment…' : 'Preparing response…' });
+    // #1079: a switch to the long-context profile reloads the model; say so instead of "Preparing".
+    if (contextSwitch && !attachedImages.length) send({ type: 'status', id: 'loadingLongContext', text: 'Loading the high-context profile — switching models may take a moment…' });
+    else send({ type: 'status', id: attachedImages.length ? 'readingImages' : 'preparing', text: attachedImages.length ? 'Reading image sources — model loading and visual processing may take a moment…' : 'Preparing response…' });
     let visionWarning = missingImages.length ? `Images were not read because their stored files are missing: ${missingImages.join(', ')}. Re-upload them.` : '';
     if (visionWarning) wire = [{ role: 'system', content: visionWarning + ' Do not guess their contents.' }, ...wire];
     // Rule 3 of provider-egress.cjs: project images are not sent to an external provider on their own.
