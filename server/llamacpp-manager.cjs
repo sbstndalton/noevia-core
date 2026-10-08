@@ -361,8 +361,8 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     if(!modelFile)return {error:'The model file is not visible under noevia\'s read-only model mounts.',status:404};
     const mmproj=files.mmproj?localFile(files.mmproj):null;
     if(files.mmproj&&!mmproj)return {error:'The vision projector is not visible under noevia\'s read-only model mounts.',status:404};
-    const {readGguf,summarize}=require('./gguf-meta.cjs');
-    try{return {meta:summarize(readGguf(modelFile.file)),modelFile,mmproj};}catch(e){return {error:'Could not read model metadata: '+e.message,status:422};}
+    const {readSummary}=require('./gguf-meta.cjs');
+    try{return {meta:readSummary(modelFile.file),modelFile,mmproj};}catch(e){return {error:'Could not read model metadata: '+e.message,status:422};}
   }
   // #697: the budget autoconfig sizes against: the inference budget (an admin setting), lowered
   // only by an explicit LLAMACPP_AUTOCONFIG_MEMORY_GIB. The engine container's memory limit
