@@ -27,6 +27,8 @@
 //                           is served by (always on; fails closed, #1079)
 //   - crates/prompt-framing frameUntrusted/escapeClosing, provenance*, packet* = prompt-framing.cjs,
 //                          provenance-policy.cjs, task-packet.cjs                (PROMPT_FRAMING_IMPL, #769/#740)
+//   - crates/s3-sign        s3Sign/s3Region = s3-sign.cjs signS3RequestJs, s3-region.cjs normalizeS3Region
+//                                                                             (S3_SIGN_IMPL)
 //
 // Memory: WebAssembly memory only grows. A listing or path call needs at most ~16 MiB; an upload
 // decode copies the upload in (at most 25 MiB) and holds one copy of its text (at most 3 bytes per
@@ -34,7 +36,7 @@
 // whose input or reply passes RESET_AFTER_BYTES the instance is dropped (the compiled module stays
 // cached, so the next call only re-instantiates, ~ms) and that memory is released to the GC.
 //
-// Secret calls (#979) carry key bytes, so they never share an instance: after every secretOpen or
+// Secret calls (#979, and s3Sign, which carries the S3 secret key) carry key bytes, so they never share an instance: after every secretOpen or
 // secretSeal, whatever happened, the whole linear memory is overwritten with zeros and the
 // instance dropped (the module itself also wipes its input buffer). The input this loader builds
 // is zeroed too. The caller's own Buffers (the key, the returned plaintext) are the caller's
@@ -57,7 +59,7 @@ const MAX_DECODE_BYTES = 25 * 1024 * 1024;
 // Only the first bytes decide an archive magic number (`ustar` ends at 262).
 const SNIFF_BYTES = 262;
 const RESET_AFTER_BYTES = 1024 * 1024;
-const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'secret_open', 'secret_seal', 'mcp_rpc_body', 'mcp_schema_refs', 'template_caps', 'provider_error', 'serving_verdict', 'autotune_plan', 'preset_reload', 'load_verdict', 'tune_contention', 'frame_untrusted', 'escape_closing', 'provenance', 'task_packet', 'long_profile', 'dav_output_ptr', 'dav_output_len'];
+const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'secret_open', 'secret_seal', 'mcp_rpc_body', 'mcp_schema_refs', 'template_caps', 'provider_error', 'serving_verdict', 'autotune_plan', 'preset_reload', 'load_verdict', 'tune_contention', 'frame_untrusted', 'escape_closing', 'provenance', 'task_packet', 'long_profile', 's3_sign', 's3_region', 'dav_output_ptr', 'dav_output_len'];
 
 class DavParseError extends Error {
   constructor(message, reason) {
@@ -816,13 +818,97 @@ function packetRender(packet, label) {
   return r.text;
 }
 
+// s3_sign::MAX_FIELD_BYTES, MAX_QUERY_PAIRS, MAX_PAYLOAD_BYTES (the JS has no caps; core's values
+// are far below them).
+const MAX_S3_FIELD_BYTES = 64 * 1024;
+const MAX_S3_QUERY_PAIRS = 256;
+const MAX_S3_PAYLOAD_BYTES = 16 * 1024 * 1024;
+const S3_REFUSALS = new Set(['input', 'too_large']);
+const HEX64 = /^[0-9a-f]{64}$/;
+const S3_REGION_TEXT = /^[a-z0-9-]{1,32}$/;
+const s3Input = (what) => new DavParseError(`s3 signing input refused (${what})`, 'input');
+
+function s3Refusal(status, bytes) {
+  let code = 'unknown';
+  try { const r = JSON.parse(utf8(bytes)); if (r && S3_REFUSALS.has(r.error)) code = r.error; } catch { /* keep unknown */ }
+  return new DavParseError(`s3 request refused by dav-parse (${status === 2 ? 'input' : code})`, status === 2 ? 'input' : code);
+}
+
+/** s3-sign.cjs signS3RequestJs, through the module (S3_SIGN_IMPL=wasm). Same arguments and the
+ *  same headers object (same keys, same order). `url` is what the JS reads: a string `host` and
+ *  `pathname` and a URLSearchParams `searchParams` (a URL). The method, secret and payload are
+ *  passed as UTF-8 (a lone surrogate as U+FFFD, exactly what the JS hashes). Text echoed in the
+ *  headers (access key, region, token, date) must be well-formed: the JS would send a lone
+ *  surrogate the module cannot express, so that is refused. The input (with the secret key) is
+ *  zeroed and the instance's memory wiped after the call; errors carry a reason, never input. */
+function s3Sign(method, url, payload, accessKey, secretKey, opts = {}) {
+  if (!url || typeof url.host !== 'string' || typeof url.pathname !== 'string' || !(url.searchParams instanceof URLSearchParams)) throw s3Input('url');
+  if (typeof method !== 'string' || typeof accessKey !== 'string' || typeof secretKey !== 'string') throw s3Input('type');
+  const o = opts || {};
+  const region = o.region || '';
+  const sessionToken = o.sessionToken || '';
+  const amzDate = o.amzDate || new Date().toISOString().replace(/[:-]|\.\d{3}/g, '');
+  if (typeof region !== 'string' || typeof sessionToken !== 'string' || typeof amzDate !== 'string') throw s3Input('type');
+  if (![accessKey, region, sessionToken, amzDate].every((x) => x.isWellFormed())) throw s3Input('text');
+  let body;
+  try { body = Buffer.isBuffer(payload) ? payload : Buffer.from(payload || ''); } catch { throw s3Input('payload'); }
+  if (body.length > MAX_S3_PAYLOAD_BYTES) throw new DavParseError('s3 payload is too large to sign', 'too_large');
+  const query = [...url.searchParams.entries()];
+  if (query.length > MAX_S3_QUERY_PAIRS) throw new DavParseError('s3 query is too large to sign', 'too_large');
+  const secret = Buffer.from(secretKey, 'utf8');
+  const fields = [encoder.encode(method), encoder.encode(url.host), encoder.encode(url.pathname), encoder.encode(accessKey), secret,
+    encoder.encode(region), encoder.encode(sessionToken), encoder.encode(amzDate)];
+  for (const [k, v] of query) fields.push(encoder.encode(k), encoder.encode(v));
+  let input;
+  try {
+    if (fields.some((f) => f.length > MAX_S3_FIELD_BYTES)) throw new DavParseError('s3 field is too large to sign', 'too_large');
+    input = new Uint8Array(fields.reduce((n, f) => n + 4 + f.length, 4) + body.length);
+    const view = new DataView(input.buffer);
+    let at = 0;
+    const put = (f) => { view.setUint32(at, f.length, true); input.set(f, at + 4); at += 4 + f.length; };
+    fields.slice(0, 8).forEach(put);
+    view.setUint32(at, query.length, true); at += 4;
+    fields.slice(8).forEach(put);
+    input.set(body, at);
+  } finally {
+    secret.fill(0);
+  }
+  const { status, bytes } = invokeSecret(input, (e) => e.s3_sign());
+  if (status !== 0) throw s3Refusal(status, bytes);
+  let reply;
+  try { reply = JSON.parse(utf8(bytes)); } catch { throw new DavParseError('s3 sign reply is not JSON', 'reply'); }
+  const names = ['host', 'x-amz-content-sha256', 'x-amz-date', ...(sessionToken ? ['x-amz-security-token'] : [])];
+  const keys = reply && typeof reply === 'object' && !Array.isArray(reply) ? Object.keys(reply) : [];
+  const auth = reply?.Authorization;
+  const prefix = `AWS4-HMAC-SHA256 Credential=${accessKey}/${amzDate.slice(0, 8)}/${region || 'us-east-1'}/s3/aws4_request, SignedHeaders=${names.join(';')}, Signature=`;
+  if (keys.join('\n') !== [...names, 'Authorization'].join('\n') || reply.host !== url.host || typeof reply['x-amz-content-sha256'] !== 'string' || !HEX64.test(reply['x-amz-content-sha256'])
+    || reply['x-amz-date'] !== amzDate || (sessionToken && reply['x-amz-security-token'] !== sessionToken)
+    || typeof auth !== 'string' || !auth.startsWith(prefix) || !HEX64.test(auth.slice(prefix.length))) {
+    throw new DavParseError('s3 sign reply has an unexpected shape', 'reply');
+  }
+  const out = {};
+  for (const k of [...names, 'Authorization']) out[k] = reply[k];
+  return out;
+}
+
+/** s3-region.cjs normalizeS3Region, through the module. */
+function s3Region(value) {
+  const text = String(value || '');
+  const input = encoder.encode(text);
+  const { status, bytes } = invokeRaw(input, (e) => e.s3_region());
+  if (status !== 0) throw s3Refusal(status, bytes);
+  const region = utf8(bytes);
+  if (!S3_REGION_TEXT.test(region)) throw new DavParseError('s3 region reply has an unexpected shape', 'reply');
+  return region;
+}
+
 /** Test hook: the cached instance's linear memory in bytes (0 when there is none). */
 function memoryBytes() { return cached?.instance ? cached.instance.exports.memory.buffer.byteLength : 0; }
 
 // Every switch that runs this module (#996). Each reads its value as trim().toLowerCase().
 // CHAT_TEMPLATE_CAPS_IMPL counts only when set to wasm explicitly; its default (also wasm) is
 // checked by chat-template-caps.cjs startup(), which falls back to off instead of stopping.
-const IMPL_FLAGS = ['DAV_PARSE_IMPL', 'S3_PARSE_IMPL', 'STORAGE_PATH_IMPL', 'UPLOAD_SNIFF_IMPL', 'SECRET_ENVELOPE_IMPL', 'MCP_FRAME_IMPL', 'CHAT_TEMPLATE_CAPS_IMPL', 'AUTOTUNE_PLAN_IMPL', 'PRESET_RELOAD_IMPL', 'PROMPT_FRAMING_IMPL'];
+const IMPL_FLAGS = ['DAV_PARSE_IMPL', 'S3_PARSE_IMPL', 'STORAGE_PATH_IMPL', 'UPLOAD_SNIFF_IMPL', 'SECRET_ENVELOPE_IMPL', 'MCP_FRAME_IMPL', 'CHAT_TEMPLATE_CAPS_IMPL', 'AUTOTUNE_PLAN_IMPL', 'PRESET_RELOAD_IMPL', 'PROMPT_FRAMING_IMPL', 'S3_SIGN_IMPL'];
 
 /** The *_IMPL switches set to wasm in `env`. */
 function wasmFlags(env = process.env) {
@@ -860,4 +946,4 @@ function verifyAtStartup(env = process.env, { hostname } = {}) {
 /** Test hook: forget the cached module (and its failure). */
 function reset() { cached = null; }
 
-module.exports = { wasmFlags, verifyAtStartup, framingRuntimeMatches, IMPL_FLAGS, frameUntrusted, escapeClosing, provenanceNew, provenanceIngest, provenanceAdd, provenanceSource, provenanceCheck, provenanceProbe, packetParse, packetValidate, packetRender, FRAME_TEXT_UNITS, FRAME_LABEL_UNITS, MAX_PROVENANCE_BYTES, MAX_PACKET_BYTES, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, tuneContention, tuneContentionText, MAX_CONTENTION_BYTES, longProfilePairs, longProfileSection, longProfilePick, longProfileText, MAX_LONG_PROFILE_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
+module.exports = { s3Sign, s3Region, MAX_S3_FIELD_BYTES, MAX_S3_QUERY_PAIRS, MAX_S3_PAYLOAD_BYTES, wasmFlags, verifyAtStartup, framingRuntimeMatches, IMPL_FLAGS, frameUntrusted, escapeClosing, provenanceNew, provenanceIngest, provenanceAdd, provenanceSource, provenanceCheck, provenanceProbe, packetParse, packetValidate, packetRender, FRAME_TEXT_UNITS, FRAME_LABEL_UNITS, MAX_PROVENANCE_BYTES, MAX_PACKET_BYTES, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, tuneContention, tuneContentionText, MAX_CONTENTION_BYTES, longProfilePairs, longProfileSection, longProfilePick, longProfileText, MAX_LONG_PROFILE_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
