@@ -23,6 +23,8 @@ const skipWasm = !haveWasm && !required && 'dav-parse.wasm not built (set DAV_PA
 const MISSING = path.join(os.tmpdir(), 'no-such-storage-dav-parse.wasm');
 
 function withEnv(vars, fn) {
+  // S3 signing stays on its js default here, so these tests see only their own switches.
+  vars = { S3_SIGN_IMPL: undefined, ...vars };
   const saved = {};
   for (const k of Object.keys(vars)) { saved[k] = process.env[k]; if (vars[k] === undefined) delete process.env[k]; else process.env[k] = vars[k]; }
   davParseWasm.reset();
