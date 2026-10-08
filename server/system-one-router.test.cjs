@@ -102,7 +102,27 @@ test('fallback detail has no fabricated classifier scores or private error text'
   const result = await router.classifyWithDetails('secret synthetic message');
   assert.equal(result.routingDecision.status, 'fallback');
   assert.equal(result.routingDecision.fallbackReason, 'no-backend-answered');
+  assert.equal(result.routingDecision.fallbackCause, 'exception');
   assert.deepEqual(result.routingDecision.scores, {});
   assert.ok(!JSON.stringify(result).includes('private synthetic'));
   assert.ok(!JSON.stringify(result).includes('secret synthetic'));
+});
+
+test('#1070: a decision-service 503 reaches the route detail as its cause, not message text', async () => {
+  const router = createSystemOneRouter({ enabled: () => true, roles: () => ({ fast: 'a', smart: 'b' }),
+    fallback: () => 'fast', log: () => {}, backend: { supports: () => true, locality: 'local',
+      decide: async () => { throw Object.assign(Error('synthetic 503 body'), { reason: 'http-503' }); } } });
+  const { routingDecision } = await router.classifyWithDetails('synthetic message');
+  assert.equal(routingDecision.backend, 'legacy');
+  assert.equal(routingDecision.fallbackReason, 'no-backend-answered');
+  assert.equal(routingDecision.fallbackCause, 'http-503');
+  assert.ok(!JSON.stringify(routingDecision).includes('synthetic 503'));
+});
+
+test('#1070: an accepted or unrouted decision has no fallback cause', async () => {
+  const off = createSystemOneRouter({ enabled: () => false, roles: () => ({ fast: 'a', smart: 'b' }), fallback: () => 'fast', log: () => {} });
+  assert.equal((await off.classifyWithDetails('x')).routingDecision.fallbackCause, null);
+  const ok = createSystemOneRouter({ enabled: () => true, roles: () => ({ fast: 'a', smart: 'b' }), fallback: () => assert.fail('no fallback'),
+    log: () => {}, backend: { supports: () => true, locality: 'local', decide: async () => ({ selected: 'fast', scores: { fast: 0.7, smart: 0.3 } }) } });
+  assert.equal((await ok.classifyWithDetails('x')).routingDecision.fallbackCause, null);
 });
