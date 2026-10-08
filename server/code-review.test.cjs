@@ -259,6 +259,22 @@ test('a diff carrying the engine key, the task proxy token or a credential is ne
   }
 });
 
+test('a context the Rust port could not confirm is refused with one generic line, never the impl_ codes', async () => {
+  const saved = { impl: process.env.ROLE_CONTEXT_IMPL, wasm: process.env.DAV_PARSE_WASM };
+  process.env.ROLE_CONTEXT_IMPL = 'wasm';
+  process.env.DAV_PARSE_WASM = path.join(os.tmpdir(), 'noevia-no-such-dav-parse.wasm'); // the port cannot load: impl_refused
+  const warn = console.warn; console.warn = () => {};
+  try {
+    const { provider, failed, r } = await failsClosed([APPROVE], 'context_refused');
+    assert.equal(provider.calls.length, 0);
+    assert.equal(failed.data.reason, 'The review context could not be verified, so it was not sent.');
+    assert.ok(!/impl/i.test(failed.data.reason) && !/impl/i.test(r.asked[0].reason), 'no internal code reaches the person');
+  } finally {
+    console.warn = warn;
+    for (const [k, v] of [['ROLE_CONTEXT_IMPL', saved.impl], ['DAV_PARSE_WASM', saved.wasm]]) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+  }
+});
+
 // ── the reviewer cannot grant ───────────────────────────────────────────────
 
 test('the reviewer cannot widen permissions, approve its own grants, or reach the approval card', async () => {

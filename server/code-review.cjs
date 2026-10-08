@@ -123,6 +123,11 @@ function createPlannerReview({ enabled = () => false, provider = null, roleEngin
       catch (error) {
         if (error instanceof RoleContextLeakError) {
           log({ event: 'code.review_refused', classes: error.classes });
+          // impl_* classes are the Rust port's disagreement with the JS (ROLE_CONTEXT_IMPL), not content:
+          // naming them tells the person nothing, so they get one generic line.
+          if (error.classes.length && error.classes.every((c) => String(c).startsWith('impl_'))) {
+            return fail('context_refused', 'The review context could not be verified, so it was not sent.');
+          }
           return fail('context_refused', `The change was not sent for review because it would have carried ${error.classes.join(', ').replaceAll('_', ' ')}.`);
         }
         // The diff is budgeted to fit (role-context.cjs capChange); what can still overflow is
