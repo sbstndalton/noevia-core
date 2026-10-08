@@ -13,7 +13,9 @@
 //              servers/url: MCP_SERVERS / MCP_SERVER_URL (string or null); set: the token variable
 //              names that are set; wire: the JSON body that crosses (op 1)
 //   strict:    { servers, url, set, wire, want }  rows the port refuses as ambiguous (see the
-//              mcp-servers crate docs); want is the JS's answer, for the record
+//              mcp-servers crate docs). Rows whose JS answer depends on the Node/ICU version (an
+//              xn-- label, '%' or a non-ASCII character in the host; #1115) record no JS answer:
+//              want is { refused: 'ambiguous' }. The other rows keep the JS's answer, for the record
 //   toolboxes: { enabled, wire, want: null | [ids] }
 //   offered:   { enabled: null | [ids], id, wire, want: bool }
 
@@ -90,6 +92,10 @@ function parse() {
   return rows;
 }
 
+// A host with an xn-- label (any case), '%' or non-ASCII: what the JS makes of it varies by Node.
+const hostDependsOnNode = (list) => /^[^|]*\|[a-z]+:\/\/[^/|]*(xn--|%|[^\x00-\x7f])/i.test(list);
+function refused(row) { return { ...row, want: { refused: 'ambiguous' } }; }
+
 function strict() {
   const single = ['not a url', 'http://nc.example/a b'].map((url) => parseRow(null, url));
   return single.concat([
@@ -98,7 +104,7 @@ function strict() {
     'a|http://%68.example/|none', 'a|http://h.example\t/|none', 'a|http://h.example/\u0000|none',
     'a|ftp://h1.example|none,a|http://h2.example|none', 'a|http://u@h1.example|none,a|http://h2.example|nextcloud',
     'i1|http://localhost/|internal,i2|http://127.0.0.1/|internal',
-  ].map((list) => parseRow(list, null)));
+  ].map((list) => (hostDependsOnNode(list) ? refused(parseRow(list, null)) : parseRow(list, null))));
 }
 
 function toolboxes() {
