@@ -16,7 +16,7 @@
  * @param {object} deps.modelManager         model-manager.cjs adapter
  * @param {() => object} deps.currentWorkspace
  */
-const { isSidecarModel } = require('./model-system.cjs');
+const { isSidecarModel, isSystemModel, modelPathFromArgs } = require('./model-system.cjs');
 
 function createModelService({ fetchJson, env, modelManager, currentWorkspace, listWorkspaces }) {
   // One call to the model management service, with its token. Same path the proxy route uses.
@@ -139,6 +139,7 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
     const m = installed.find((x) => x.name === name);
     if (!m) throw new Error(`model not installed: ${name}`);
     if (m.missingFile) throw new Error(`model file missing: ${name}`);
+    if (m.servedElsewhere) throw new Error(`model runs in its own service: ${name}`);
     if (!m.loaded) {
       const result = await modelManager.load(name);
       if (!result.ok) throw new Error(`model could not load: ${name}`);
@@ -201,8 +202,8 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
       }
     }
     // Only a router entry that comes from a models.ini preset has a file in the models folder;
-    // download-cache models legitimately have none. Laya is included on purpose: its preset points
-    // at a GGUF that does not exist (it runs in its own sidecar), so it reads as missing too.
+    // download-cache models legitimately have none. Laya's preset points at a GGUF that only exists
+    // inside its own sidecar; it is marked servedElsewhere (#1084) rather than missing.
     const rows = list.value.body?.data || [];
     // #580: the embedding (and reranking) sidecar is its own fixed llama-server, so the router's
     // status for its model ("unloaded") says nothing about it. The model manager probes each
@@ -217,24 +218,43 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
     }
     const sidecarUp = (m) => isSidecarModel(m.id || m.model_name, env) && sidecarLoaded.has(m.id || m.model_name);
     const scan = rows.some((m) => m.source === 'preset') ? await folderScanFiles().catch(() => null) : null;
-    const hasFile = (id) => scan.some((f) => f.modelId === id || (Array.isArray(f.sections) && f.sections.includes(id)));
+    // The loader's file for a row, joined by the section name or model id the scan reports (never by
+    // guessing from file names). The router's /v1/models carries no size and meta only for the loaded
+    // model, so the scan is where an unloaded model's size and shape come from.
+    const fileFor = (id) => (scan ? scan.find((f) => f.modelId === id || (Array.isArray(f.sections) && f.sections.includes(id))) : undefined);
+    const hasFile = (id) => !!fileFor(id);
+    const noLocalFile = (m) => !!scan && m.source === 'preset' && !hasFile(m.id || m.model_name);
     // A sidecar model that a live backend reports as loaded is running, whatever the folder scan says.
-    const missingFile = (m) => !sidecarUp(m) && !!scan && m.source === 'preset' && !hasFile(m.id || m.model_name);
+    // A preset with no local file that belongs to a sidecar (Laya, or the configured embedding /
+    // reranking model) is served by that service, so it is not a fault even when the sidecar is down.
+    const servedElsewhere = (m) => !sidecarUp(m) && noLocalFile(m)
+      && (isSystemModel(m.id || m.model_name, modelPathFromArgs(m.status?.args)) || isSidecarModel(m.id || m.model_name, env));
+    const missingFile = (m) => !sidecarUp(m) && noLocalFile(m) && !servedElsewhere(m);
+    // Decimal GB, as the router's own number is. The loader's byte count wins; the router's size is
+    // the fallback for a row the scan does not cover.
+    const sizeGBFor = (m) => {
+      const bytes = fileFor(m.id || m.model_name)?.bytes;
+      if (typeof bytes === 'number' && bytes > 0) return Math.round((bytes / 1e9) * 10) / 10;
+      return typeof m.size === 'number' ? Math.round(m.size * 10) / 10 : null;
+    };
     const installed = rows
       // Some managers register cosmetic hash-ID duplicates; hide bare hash names.
       .filter((m) => !/^[0-9a-f]{32,40}$/i.test(m.id || m.model_name || ''))
       .map((m) => ({
         name: m.id || m.model_name,
-        sizeGB: typeof m.size === 'number' ? Math.round(m.size * 10) / 10 : null,
+        sizeGB: sizeGBFor(m),
+        shape: fileFor(m.id || m.model_name)?.shape || null,
         loaded: loadedNames.has(m.id || m.model_name) || sidecarUp(m),
         labels: Array.isArray(m.labels) ? m.labels : [],
         mtp: require('./mtp.cjs').capability(m),
         maxContext: m.max_context_window || null,
         suggested: !!m.suggested,
-        status: missingFile(m) ? 'missing' : sidecarUp(m) ? 'loaded' : m.status?.value || (loadedNames.has(m.id || m.model_name) ? 'loaded' : 'unloaded'),
+        status: missingFile(m) ? 'missing' : servedElsewhere(m) ? 'served-elsewhere' : sidecarUp(m) ? 'loaded' : m.status?.value || (loadedNames.has(m.id || m.model_name) ? 'loaded' : 'unloaded'),
         failed: !sidecarUp(m) && (m.status?.failed === true || missingFile(m)),
         // #545: a preset whose GGUF is not in the models folder. Never offered for chat, loading or tuning.
         missingFile: missingFile(m),
+        // A preset with no file here because its own service (Laya, an embedding/reranking sidecar) runs it.
+        servedElsewhere: servedElsewhere(m),
         canDelete: m.can_remove !== false,
         // #336: distinct from canDelete (which the client falls back to a different delete path
         // for, when false — see routes/models.cjs). A model can_remove reports removable is still

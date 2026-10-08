@@ -37,7 +37,7 @@ test('modelsInstalled hides hash duplicates, marks loaded models and remembers t
   assert.equal(f.service.lastLoadedModel(), null);
   const installed = await f.service.modelsInstalled();
   assert.deepEqual(installed.map((m) => m.name), ['embed-1', 'chat-7b', 'failed-x']);
-  assert.deepEqual(installed[1], { name: 'chat-7b', sizeGB: 4.3, loaded: true, labels: [], mtp: installed[1].mtp, maxContext: 8192, suggested: true, status: 'loaded', failed: false, canDelete: false, sidecarProtected: false, missingFile: false, source: null });
+  assert.deepEqual(installed[1], { name: 'chat-7b', sizeGB: 4.3, loaded: true, labels: [], mtp: installed[1].mtp, maxContext: 8192, suggested: true, status: 'loaded', failed: false, canDelete: false, sidecarProtected: false, missingFile: false, servedElsewhere: false, shape: null, source: null });
   assert.equal(installed[0].sizeGB, 0.6);
   assert.equal(installed[2].status, 'failed');
   assert.equal(installed[2].failed, true);
@@ -225,7 +225,7 @@ test('#545: a models.ini preset whose file is not in the folder scan reads as mi
   const f = fixture({
     env: { MODEL_LOADER_URL: 'http://loader' },
     models: [
-      { id: 'laya_multilingual_f16', source: 'preset', size: 0 },
+      { id: 'gone-13b', source: 'preset', size: 0 },
       { id: 'present-7b', source: 'preset', size: 4 },
       { id: 'renamed-section', source: 'preset', size: 2 },
       { id: 'from-cache', source: 'cache', size: 1 },
@@ -237,13 +237,14 @@ test('#545: a models.ini preset whose file is not in the folder scan reads as mi
   });
   const installed = await f.service.modelsInstalled();
   const by = Object.fromEntries(installed.map((m) => [m.name, m]));
-  assert.equal(by.laya_multilingual_f16.missingFile, true);
-  assert.equal(by.laya_multilingual_f16.failed, true);
-  assert.equal(by.laya_multilingual_f16.status, 'missing');
+  assert.equal(by['gone-13b'].missingFile, true);
+  assert.equal(by['gone-13b'].failed, true);
+  assert.equal(by['gone-13b'].status, 'missing');
+  assert.equal(by['gone-13b'].servedElsewhere, false);
   assert.equal(by['present-7b'].missingFile, false);
   assert.equal(by['renamed-section'].missingFile, false, 'a section renamed to a short id still owns its file');
   assert.equal(by['from-cache'].missingFile, false, 'download-cache models have no folder file by design');
-  await assert.rejects(f.service.ensureModelLoaded('laya_multilingual_f16'), /file missing/);
+  await assert.rejects(f.service.ensureModelLoaded('gone-13b'), /file missing/);
 });
 
 test('#545: an unreadable or empty folder scan never marks presets missing', async () => {
@@ -291,4 +292,63 @@ test('#796 F2: a folder scan read before a delete cannot be written back after i
   release();
   await scan;
   assert.equal(f.service.modelScanCache.get('models'), undefined, 'the pre-delete list is not cached');
+});
+
+test('#1084: size and shape come from the loader scan, joined by section or model id, with the router size as fallback', async () => {
+  const shape = { arch: 'gemma4', moe: false, experts: 0, active: 0, label: 'dense' };
+  const f = fixture({
+    env: { MODEL_LOADER_URL: 'http://loader' },
+    models: [
+      { id: 'unloaded-4b', source: 'preset' },
+      { id: 'short-section', source: 'preset' },
+      { id: 'loaded-12b', source: 'preset', size: 7.04 },
+      { id: 'no-file-hit', source: 'preset', size: 1.26 },
+      { id: 'from-cache', source: 'cache', size: 2 },
+    ],
+    loaded: ['loaded-12b'],
+    fetchJson: async () => ({ ok: true, status: 200, body: { models: [
+      { key: 'a.gguf', modelId: 'a', sections: ['unloaded-4b'], bytes: 3_240_000_000, shape },
+      { key: 'b.gguf', modelId: 'short-section', sections: [], bytes: 1_000_000_000 },
+      { key: 'c.gguf', modelId: 'c', sections: ['loaded-12b'], bytes: 7_040_000_000, shape: { ...shape, label: 'moe', moe: true } },
+      { key: 'd.gguf', modelId: 'd', sections: ['no-file-hit'] },
+      // a similar file name must never be joined to a row
+      { key: 'unloaded-4b-copy.gguf', modelId: 'other', sections: ['other'], bytes: 9_000_000_000 },
+    ] } }),
+  });
+  const by = Object.fromEntries((await f.service.modelsInstalled()).map((m) => [m.name, m]));
+  assert.equal(by['unloaded-4b'].sizeGB, 3.2);
+  assert.deepEqual(by['unloaded-4b'].shape, shape);
+  assert.equal(by['short-section'].sizeGB, 1);
+  assert.equal(by['short-section'].shape, null);
+  assert.equal(by['loaded-12b'].sizeGB, 7);
+  assert.equal(by['loaded-12b'].shape.label, 'moe');
+  assert.equal(by['no-file-hit'].sizeGB, 1.3, 'a scan entry without bytes falls back to the router size');
+  assert.equal(by['from-cache'].sizeGB, 2);
+  assert.equal(by['from-cache'].shape, null);
+});
+
+test('#1084: a sidecar preset with no local file is served elsewhere, not missing; ordinary presets stay missing', async () => {
+  const f = fixture({
+    env: { MODEL_LOADER_URL: 'http://loader', EMBEDDING_MODEL: 'embed-x' },
+    models: [
+      { id: 'laya_multilingual_f16', source: 'preset' },
+      { id: 'embed-x', source: 'preset', labels: ['embedding'] },
+      { id: 'gone-13b', source: 'preset' },
+      { id: 'present-7b', source: 'preset' },
+    ],
+    fetchJson: async (url) => url.endsWith('/api/v1/backends')
+      ? { ok: true, status: 200, body: { backends: [] } }
+      : { ok: true, status: 200, body: { models: [{ key: 'a.gguf', modelId: 'present-7b', sections: ['present-7b'], bytes: 1e9 }] } },
+  });
+  const by = Object.fromEntries((await f.service.modelsInstalled()).map((m) => [m.name, m]));
+  for (const id of ['laya_multilingual_f16', 'embed-x']) {
+    assert.equal(by[id].servedElsewhere, true, id);
+    assert.equal(by[id].missingFile, false, id);
+    assert.equal(by[id].failed, false, id);
+    assert.equal(by[id].status, 'served-elsewhere', id);
+    await assert.rejects(f.service.ensureModelLoaded(id), /own service/);
+  }
+  assert.equal(by['gone-13b'].missingFile, true);
+  assert.equal(by['gone-13b'].servedElsewhere, false);
+  assert.equal(by['present-7b'].servedElsewhere, false);
 });
