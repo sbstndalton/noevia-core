@@ -14,7 +14,7 @@
 //     is ever an instruction, an approval or a capability; the tool layer ignores it (see
 //     framing-reasoner.cjs for the write guard).
 //   - A new schema version is a new number; validators reject numbers they do not know.
-const { frameUntrusted } = require('./prompt-framing.cjs');
+const { frameUntrustedJs, framingImpl, framingWasm } = require('./prompt-framing.cjs');
 
 const PACKET_SCHEMA = 1;
 const SOURCE_KINDS = Object.freeze(['tool', 'web', 'file', 'project', 'chat']);
@@ -84,7 +84,7 @@ function list(value, path, max, each) {
  * Validate a decoded packet. Returns { ok: true, packet } (a fresh, trimmed, frozen copy) or
  * { ok: false, error } with a short, text-free reason (a path and a rule, never packet content).
  */
-function validatePacket(raw) {
+function validatePacketJs(raw) {
   try {
     onlyKeys(raw, ['packet_schema', 'goal', 'facts', 'constraints', 'open_questions'], '$');
     if (raw.packet_schema !== PACKET_SCHEMA) throw new PacketError('$.packet_schema', `must be ${PACKET_SCHEMA}`);
@@ -117,14 +117,14 @@ function validatePacket(raw) {
  * Accepts the bare JSON object, or that object inside ONE ```json fence (unconstrained engines add
  * it). Nothing else is stripped or repaired.
  */
-function parsePacket(output) {
+function parsePacketJs(output) {
   if (typeof output !== 'string' || !output.trim() || output.length > LIMITS.inputChars) return { ok: false, reason: 'invalid-json', error: '$: no JSON' };
   let s = output.trim();
   const fenced = /^```(?:json)?\s*\n([\s\S]*?)\n?```$/.exec(s);
   if (fenced) s = fenced[1].trim();
   let raw;
   try { raw = JSON.parse(s); } catch { return { ok: false, reason: 'invalid-json', error: '$: not JSON' }; }
-  const checked = validatePacket(raw);
+  const checked = validatePacketJs(raw);
   return checked.ok ? checked : { ok: false, reason: 'schema', error: checked.error };
 }
 
@@ -132,7 +132,7 @@ function parsePacket(output) {
  * The packet as the answer model sees it: one untrusted-data block (prompt-framing.cjs), labelled
  * with the tool it came from. Facts keep their source refs so the answer can cite them.
  */
-function renderPacket(packet, label = '') {
+function renderPacketJs(packet, label = '') {
   const lines = [`Task packet (schema ${PACKET_SCHEMA}), condensed from the tool result.`, `Goal: ${packet.goal}`];
   if (packet.facts.length) {
     lines.push('Facts:');
@@ -143,7 +143,7 @@ function renderPacket(packet, label = '') {
   } else lines.push('Facts: none found.');
   if (packet.constraints.length) lines.push('Constraints:', ...packet.constraints.map((c) => `- ${c}`));
   if (packet.open_questions.length) lines.push('Open questions:', ...packet.open_questions.map((q) => `- ${q}`));
-  return frameUntrusted('task packet', label, lines.join('\n'));
+  return frameUntrustedJs('task packet', label, lines.join('\n'));
 }
 
 function deepFreeze(v) {
@@ -151,4 +151,48 @@ function deepFreeze(v) {
   return v;
 }
 
-module.exports = { PACKET_SCHEMA, PACKET_JSON_SCHEMA, SOURCE_KINDS, LIMITS, validatePacket, parsePacket, renderPacket };
+// ── PROMPT_FRAMING_IMPL=wasm (prompt-framing.cjs) ─────────────────────────────────────────────
+// The Rust port (noevia-rs crates/prompt-framing) parses, validates and renders; the replies are
+// the JS's, message for message. Failures throw (a DavParseError); nothing falls back to the JS.
+// validatePacket under wasm takes a JSON tree only (plain objects, dense arrays, strings, finite
+// numbers, booleans, null): any other value is '$: unreadable' (the JS also rejects every such
+// packet, with its own message). parsePacket sends at most LIMITS.inputChars + 1 units of the
+// output (anything longer is '$: no JSON' either way).
+
+/** Whether `v` is a value JSON.parse could have produced (what crosses into the module). */
+function jsonTree(v, depth = 0) {
+  if (depth > 64) return false;
+  if (v === null || typeof v === 'string' || typeof v === 'boolean') return true;
+  if (typeof v === 'number') return Number.isFinite(v);
+  if (Array.isArray(v)) {
+    for (let i = 0; i < v.length; i++) if (!(i in v) || !jsonTree(v[i], depth + 1)) return false;
+    return true;
+  }
+  if (!isPlain(v) || typeof v.toJSON === 'function') return false;
+  return Object.values(v).every((x) => jsonTree(x, depth + 1));
+}
+
+function validatePacketWasm(raw) {
+  if (!jsonTree(raw)) return { ok: false, error: '$: unreadable' };
+  const r = framingWasm().packetValidate(raw);
+  return r.ok ? { ok: true, packet: deepFreeze(r.packet) } : r;
+}
+
+function parsePacketWasm(output) {
+  if (typeof output !== 'string') return { ok: false, reason: 'invalid-json', error: '$: no JSON' };
+  const r = framingWasm().packetParse(output.length > LIMITS.inputChars ? output.slice(0, LIMITS.inputChars + 1) : output);
+  return r.ok ? { ok: true, packet: deepFreeze(r.packet) } : r;
+}
+
+function renderPacketWasm(packet, label = '') {
+  return framingWasm().packetRender(packet, String(label == null ? '' : label));
+}
+
+/** validatePacketJs or its Rust port, by PROMPT_FRAMING_IMPL. */
+function validatePacket(raw) { return framingImpl() === 'wasm' ? validatePacketWasm(raw) : validatePacketJs(raw); }
+/** parsePacketJs or its Rust port, by PROMPT_FRAMING_IMPL. */
+function parsePacket(output) { return framingImpl() === 'wasm' ? parsePacketWasm(output) : parsePacketJs(output); }
+/** renderPacketJs or its Rust port, by PROMPT_FRAMING_IMPL. */
+function renderPacket(packet, label = '') { return framingImpl() === 'wasm' ? renderPacketWasm(packet, label) : renderPacketJs(packet, label); }
+
+module.exports = { PACKET_SCHEMA, PACKET_JSON_SCHEMA, SOURCE_KINDS, LIMITS, validatePacket, parsePacket, renderPacket, validatePacketJs, parsePacketJs, renderPacketJs };
