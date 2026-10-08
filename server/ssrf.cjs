@@ -9,6 +9,19 @@
 // server's network position for SSRF. Administrators are exempt:
 // loopback/host.docker.internal addresses, and only an admin can
 // configure those.
+//
+// SSRF_IMPL=js|wasm (default js; any other value means js, with one warning) picks who decides,
+// read on every call. `wasm` asks the Rust port (sbstndalton/noevia-rs crates/ssrf-policy, in the
+// dav-parse.wasm module pinned by server/dav-parse.lock) "is this URL acceptable" and "is this
+// resolved address public"; the DNS lookup and the socket stay here and in public-fetch.cjs. It
+// covers isPrivateIp for every caller (public-fetch, code-egress, browser-policy, tool-gate),
+// isPublicUrl, and publicFetch's URL check. It FAILS CLOSED: a missing or tampered module stops
+// startup (dav-parse-wasm.cjs verifyAtStartup), and a trap, a refusal or a reply of the wrong
+// shape makes the address private / the URL refused; nothing falls back to the JS. The Rust host
+// must equal `new URL(url).hostname`, or the URL is refused. Stricter under wasm (refusals, see
+// the crate docs): names ending with a dot, internationalized (xn--) hosts, a URL over 64 KiB or
+// holding a lone surrogate, more than 512 DNS answers, and metadata.google.internal by name in
+// publicFetch. The *Js functions stay as the reference (tests/fixtures/ssrf.v1.json is theirs).
 
 const dns = require('dns');
 const net = require('net');
@@ -102,11 +115,37 @@ function isPrivateIPv6(ip) {
   return false;
 }
 
-function isPrivateIp(ip) {
+const IMPLS = new Set(['js', 'wasm']);
+let warnedImpl = '';
+/** SSRF_IMPL: 'js' (default) or 'wasm'. Read on every call. */
+function ssrfImpl(env = process.env) {
+  const raw = env.SSRF_IMPL;
+  if (raw === undefined || raw === '') return 'js';
+  const value = String(raw).trim().toLowerCase();
+  if (IMPLS.has(value)) return value;
+  if (warnedImpl !== value) {
+    warnedImpl = value;
+    console.warn(`[ssrf] SSRF_IMPL=${JSON.stringify(String(raw))} is not js or wasm; using js`);
+  }
+  return 'js';
+}
+
+let davParseWasm = null;
+/** The dav-parse.wasm loader, required on first use. */
+function ssrfWasm() { return davParseWasm || (davParseWasm = require('./dav-parse-wasm.cjs')); }
+
+function isPrivateIpJs(ip) {
   const version = net.isIP(ip);
   if (version === 4) return isPrivateIPv4(ip);
   if (version === 6) return isPrivateIPv6(ip);
   return true; // not an IP literal → treat as private
+}
+
+/** isPrivateIpJs or its Rust port, by SSRF_IMPL. Under wasm any failure is "private". */
+function isPrivateIp(ip) {
+  if (ssrfImpl() !== 'wasm') return isPrivateIpJs(ip);
+  if (typeof ip !== 'string') return true; // net.isIP of a non-string is 0: private
+  try { return !ssrfWasm().ssrfAddressesPublic([ip]); } catch { return true; }
 }
 
 async function resolveAll(hostname) {
@@ -118,7 +157,7 @@ async function resolveAll(hostname) {
 // Returns true when the URL is safe to request. Never throws: an
 // unparseable URL is treated as unsafe. DNS lookups are best-effort —
 // a hostname that fails to resolve is rejected as a precaution.
-async function isPublicUrl(rawUrl) {
+async function isPublicUrlJs(rawUrl) {
   let parsed;
   try {
     parsed = new URL(String(rawUrl));
@@ -129,10 +168,27 @@ async function isPublicUrl(rawUrl) {
   const hostname = parsed.hostname.replace(/^\[|\]$/g, '');
   if (!hostname) return false;
   if (BLOCKED_HOSTNAMES.has(hostname.toLowerCase())) return false;
-  if (net.isIP(hostname)) return !isPrivateIp(hostname);
+  if (net.isIP(hostname)) return !isPrivateIpJs(hostname);
   const addresses = await resolveAll(hostname);
   if (!addresses.length) return false;
-  return addresses.every((address) => !isPrivateIp(address));
+  return addresses.every((address) => !isPrivateIpJs(address));
+}
+
+/** The same rule decided by the Rust port: it parses the URL and judges a literal; a name is
+ *  resolved here and every answer judged there. Never throws; any failure is "not public". */
+async function isPublicUrlWasm(rawUrl) {
+  let decision;
+  try { decision = ssrfWasm().ssrfUrl(String(rawUrl), { mode: 'check' }); } catch { return false; }
+  if (!decision.ok) return false;
+  if (decision.kind === 'ip') return true;
+  const addresses = await resolveAll(decision.host);
+  if (!addresses.length) return false;
+  try { return ssrfWasm().ssrfAddressesPublic(addresses); } catch { return false; }
+}
+
+/** isPublicUrlJs or its Rust port, by SSRF_IMPL. */
+async function isPublicUrl(rawUrl) {
+  return ssrfImpl() === 'wasm' ? isPublicUrlWasm(rawUrl) : isPublicUrlJs(rawUrl);
 }
 
 // Origin policy for the endpoints a member may register: providers, storage
@@ -153,4 +209,4 @@ function createEndpointApproved({ env = process.env } = {}) {
   };
 }
 
-module.exports = { isPublicUrl, isPrivateIp, createEndpointApproved };
+module.exports = { isPublicUrl, isPrivateIp, isPublicUrlJs, isPrivateIpJs, ssrfImpl, ssrfWasm, createEndpointApproved };
