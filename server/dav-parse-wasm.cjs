@@ -844,12 +844,15 @@ function s3Refusal(status, bytes) {
 function s3Sign(method, url, payload, accessKey, secretKey, opts = {}) {
   if (!url || typeof url.host !== 'string' || typeof url.pathname !== 'string' || !(url.searchParams instanceof URLSearchParams)) throw s3Input('url');
   if (typeof method !== 'string' || typeof accessKey !== 'string' || typeof secretKey !== 'string') throw s3Input('type');
-  const o = opts || {};
+  // The JS reads opts.region etc. and throws on null; a non-object is refused the same way.
+  if (opts === null || typeof opts !== 'object') throw s3Input('opts');
+  const o = opts;
   const region = o.region || '';
   const sessionToken = o.sessionToken || '';
   const amzDate = o.amzDate || new Date().toISOString().replace(/[:-]|\.\d{3}/g, '');
   if (typeof region !== 'string' || typeof sessionToken !== 'string' || typeof amzDate !== 'string') throw s3Input('type');
-  if (![accessKey, region, sessionToken, amzDate].every((x) => x.isWellFormed())) throw s3Input('text');
+  // The pathname too: the JS's encodeURIComponent throws on a lone surrogate there.
+  if (![url.pathname, accessKey, region, sessionToken, amzDate].every((x) => x.isWellFormed())) throw s3Input('text');
   let body;
   try { body = Buffer.isBuffer(payload) ? payload : Buffer.from(payload || ''); } catch { throw s3Input('payload'); }
   if (body.length > MAX_S3_PAYLOAD_BYTES) throw new DavParseError('s3 payload is too large to sign', 'too_large');

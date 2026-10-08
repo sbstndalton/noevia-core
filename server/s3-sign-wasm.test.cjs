@@ -86,6 +86,9 @@ test('refusals: fixed reasons, the secret in no error, the memory wiped after ev
       [['GET', url, '', 'AK', SECRET, { amzDate: '2013052😀T' }], 'input'], // the stamp splits a pair
       [['GET', url, '', 'AK', SECRET, { region: 5, amzDate: DATE }], 'input'],
       [['GET', 'https://s3.example.com/b', '', 'AK', SECRET, { amzDate: DATE }], 'input'],
+      [['GET', { host: 's3.example.com', pathname: '/b/\ud800', searchParams: new URLSearchParams() }, '', 'AK', SECRET, { amzDate: DATE }], 'input'], // the JS throws URIError here
+      [['GET', url, '', 'AK', SECRET, null], 'input'],
+      [['GET', url, '', 'AK', SECRET, 'opts'], 'input'],
       [['GET', url, '', 'x'.repeat(davParseWasm.MAX_S3_FIELD_BYTES + 1), SECRET, { amzDate: DATE }], 'too_large'],
       [['PUT', url, Buffer.alloc(davParseWasm.MAX_S3_PAYLOAD_BYTES + 1), 'AK', SECRET, { amzDate: DATE }], 'too_large'],
     ];
