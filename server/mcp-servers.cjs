@@ -192,18 +192,25 @@ function rawAuthOf(rawAuth) {
   return { auth: 'none', tokenEnv: null };
 }
 
-/** MCP_SERVERS split exactly as parseMcpServersJs splits it: `${id}|${url}` → the auths its entries ask for. */
+/** MCP_SERVERS split exactly as parseMcpServersJs splits it: id → its entries `{ url, auth, tokenEnv }`, in order. */
 function operatorEntries(list) {
-  const byKey = new Map();
+  const byId = new Map();
   for (const entry of list.split(',').map((e) => e.trim()).filter(Boolean)) {
     const [rawId, rawUrl, rawAuth] = entry.split('|').map((x) => (x || '').trim());
     const id = (rawId || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40);
     if (!id || !rawUrl) continue;
-    const key = `${id}|${rawUrl}`;
-    if (!byKey.has(key)) byKey.set(key, []);
-    byKey.get(key).push(rawAuthOf(rawAuth));
+    if (!byId.has(id)) byId.set(id, []);
+    byId.get(id).push({ url: rawUrl, ...rawAuthOf(rawAuth) });
   }
-  return byKey;
+  return byId;
+}
+
+/** Whether parseMcpServersJs drops this entry before it can claim its id, whatever the port says. */
+function jsDrops(e, internalAccepted) {
+  let u;
+  try { u = new URL(e.url); } catch { return true; }
+  if (!['http:', 'https:'].includes(u.protocol) || u.username || u.password) return true;
+  return e.auth === 'internal' && (!isLoopbackLiteral(u.hostname) || internalAccepted);
 }
 
 /** What the port returned, held to the JS's own rules again: never more than the JS accepts. */
@@ -217,12 +224,11 @@ function checkServers(servers, list, single) {
     if (!ID_RE.test(sv.id) || ids.has(sv.id) || typeof sv.url !== 'string' || !AUTHS.has(sv.auth)) throw fault('mcp server reply has an unexpected server');
     ids.add(sv.id);
     if (list) {
-      const asked = entries.get(`${sv.id}|${sv.url}`);
-      // The JS takes the first entry with this id and URL; an earlier `internal` one may have been
-      // dropped (a second internal server), any other earlier one would have been taken.
-      const want = (a) => a.auth === sv.auth && a.tokenEnv === (sv.auth === 'bearer' ? sv.tokenEnv : null);
-      const at = asked ? asked.findIndex(want) : -1;
-      if (at < 0 || asked.slice(0, at).some((a) => a.auth !== 'internal')) throw fault('mcp server reply has a server not in the environment');
+      // First wins by id, as in the JS: the reply must be the first entry for its id that the JS
+      // would not drop on its own (a bad URL, a non-loopback internal, or an internal one after an
+      // internal server already accepted earlier in this reply). Any other earlier entry claims the id.
+      const first = (entries.get(sv.id) || []).find((e) => !jsDrops(e, internal > 0));
+      if (!first || first.url !== sv.url || first.auth !== sv.auth || first.tokenEnv !== (sv.auth === 'bearer' ? sv.tokenEnv : null)) throw fault('mcp server reply has a server not in the environment');
     } else if (sv.id !== 'nextcloud' || sv.auth !== 'nextcloud' || sv.url !== single.trim()) throw fault('mcp server reply has a server not in the environment');
     let u;
     try { u = new URL(sv.url); } catch { throw fault('mcp server reply has an invalid URL'); }

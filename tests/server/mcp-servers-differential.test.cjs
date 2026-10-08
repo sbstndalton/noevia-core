@@ -195,6 +195,21 @@ test('list mode binds every returned server to its operator entry, auth included
   const twice = { MCP_SERVERS: 'a|http://h.example|none,a|http://h.example|nextcloud', MCP_SERVERS_IMPL: 'wasm' };
   assert.deepStrictEqual(quiet(() => mcp.parseMcpServers(twice, stub([{ id: 'a', url: 'http://h.example', auth: 'none' }]))), [{ id: 'a', url: 'http://h.example', auth: 'none' }]);
   assert.deepStrictEqual(quiet(() => mcp.parseMcpServers(twice, stub([{ id: 'a', url: 'http://h.example', auth: 'nextcloud' }]))), []);
+  // First wins by id alone: a later same-id entry with another URL cannot be substituted.
+  const moved = { MCP_SERVERS: 'a|http://u1/|none,a|http://u2/|nextcloud', MCP_SERVERS_IMPL: 'wasm' };
+  assert.deepStrictEqual(quiet(() => mcp.parseMcpServers(moved, stub([{ id: 'a', url: 'http://u2/', auth: 'nextcloud' }]))), []);
+  assert.deepStrictEqual(quiet(() => mcp.parseMcpServers(moved, stub([{ id: 'a', url: 'http://u1/', auth: 'none' }]))), [{ id: 'a', url: 'http://u1/', auth: 'none' }]);
+  // An earlier internal entry is skipped only when an internal server was accepted before it.
+  const lone = { MCP_SERVERS: 'a|http://127.0.0.1/|internal,a|http://127.0.0.1/|nextcloud', MCP_SERVERS_IMPL: 'wasm' };
+  assert.deepStrictEqual(quiet(() => mcp.parseMcpServers(lone, stub([{ id: 'a', url: 'http://127.0.0.1/', auth: 'nextcloud' }]))), []);
+  const second = { MCP_SERVERS: 'i|http://127.0.0.1:1/|internal,a|http://127.0.0.1:2/|internal,a|http://h.example|none', MCP_SERVERS_IMPL: 'wasm' };
+  const dropped = [{ id: 'i', url: 'http://127.0.0.1:1/', auth: 'internal' }, { id: 'a', url: 'http://h.example', auth: 'none' }];
+  assert.deepStrictEqual(quiet(() => mcp.parseMcpServersJs(second)), dropped);
+  assert.deepStrictEqual(quiet(() => mcp.parseMcpServers(second, stub(dropped))), dropped);
+  assert.deepStrictEqual(quiet(() => mcp.parseMcpServers(second, stub([dropped[1]]))), []);
+  // An entry the JS drops for its URL does not claim the id.
+  const badUrl = { MCP_SERVERS: 'a|ftp://x|nextcloud,a|http://h.example|none', MCP_SERVERS_IMPL: 'wasm' };
+  assert.deepStrictEqual(quiet(() => mcp.parseMcpServers(badUrl, stub([{ id: 'a', url: 'http://h.example', auth: 'none' }]))), [{ id: 'a', url: 'http://h.example', auth: 'none' }]);
   // An id is derived as the JS derives it (characters dropped, 40 at most).
   const long = 'q'.repeat(45);
   const derived = { MCP_SERVERS: `a.b!|http://h.example|none,${long}|http://l.example|none`, MCP_SERVERS_IMPL: 'wasm' };
