@@ -68,10 +68,10 @@ add('string payload, non-ASCII', { method: 'PUT', target: 'https://s3.example.co
 add('string payload, lone surrogate', { method: 'PUT', target: 'https://s3.example.com/b/k', payload: 'a\ud800b' });
 add('session token', { target: 'https://s3.example.com/b', sessionToken: 'FQoGZXIvYXdzEXAMPLE//token+=' });
 add('session token, padded', { target: 'https://s3.example.com/b', sessionToken: ' \t tok \n' });
-add('session token, JS-only whitespace', { target: 'https://s3.example.com/b', sessionToken: '﻿tok　' });
-add('session token, not JS whitespace', { target: 'https://s3.example.com/b', sessionToken: '\u0085tok​' });
+add('session token, JS-only whitespace', { target: 'https://s3.example.com/b', sessionToken: '\uFEFFtok\u3000' });
+add('session token, not JS whitespace', { target: 'https://s3.example.com/b', sessionToken: '\u0085tok\u200B' });
 add('session token, only whitespace', { target: 'https://s3.example.com/b', sessionToken: '  ' });
-add('access key that needs JSON escaping', { target: 'https://s3.example.com/b', accessKey: 'a"b\\c\u0001 d' });
+add('access key that needs JSON escaping', { target: 'https://s3.example.com/b', accessKey: 'a"b\\c\u0001\u2028d' });
 add('empty access key and secret', { target: 'https://s3.example.com/b', accessKey: '', secretKey: '' });
 add('non-ASCII secret', { target: 'https://s3.example.com/b', secretKey: 'sécrêt-🔑' });
 add('lone surrogate secret', { target: 'https://s3.example.com/b', secretKey: 'x\udc00y' });
@@ -127,8 +127,8 @@ for (let i = 0; i < 120; i++) {
   });
 }
 
-const regions = ['', 'us-east-1', ' EU-West-1 ', 'us_east_1', 'a'.repeat(32), 'a'.repeat(33), 'Ka', 'İ', '﻿eu-west-1　',
-  '\u0085eu-west-1', 'eu-west-1​', 'ΣΑ', 'garage', '-', '0', 'a b', 'ＥＵ', 'auto', ' auto ', 'ſ3'].map((input) => ({ input, expect: normalizeS3Region(input) }));
+const regions = ['', 'us-east-1', ' EU-West-1 ', 'us_east_1', 'a'.repeat(32), 'a'.repeat(33), '\u212Aa', '\u0130', '\uFEFFeu-west-1\u3000',
+  '\u0085eu-west-1', 'eu-west-1\u200B', 'ΣΑ', 'garage', '-', '0', 'a b', '\uFF25\uFF35', 'auto', '\u00A0auto\u2029', '\u017F3'].map((input) => ({ input, expect: normalizeS3Region(input) }));
 
 const out = {
   version: 1,

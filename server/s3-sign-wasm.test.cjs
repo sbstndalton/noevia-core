@@ -3,10 +3,11 @@
 // S3_SIGN_IMPL: js is the default and unchanged; wasm signs through noevia-rs crates/s3-sign in
 // dav-parse.wasm and must return the very same headers (keys, order, values) as the JS, fail
 // closed with fixed messages, and never put the secret key in a reply, an error or a log line.
+// The case-by-case differential (fixtures, seeded random requests) is
+// tests/server/s3-sign-differential.test.cjs, which also runs on the shipped runtime image.
 // Synthetic credentials only (AKIA…/wJalr… is AWS's published documentation example).
 
 const assert = require('node:assert/strict');
-const { execFileSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -20,7 +21,6 @@ const wasmFile = process.env.DAV_PARSE_WASM || davParseWasm.DEFAULT_WASM;
 const required = process.env.DAV_PARSE_WASM_REQUIRED === '1';
 const skipWasm = !fs.existsSync(wasmFile) && !required && 'dav-parse.wasm not built (set DAV_PARSE_WASM_REQUIRED=1 to require it)';
 const MISSING = path.join(os.tmpdir(), 'no-such-s3-sign-dav-parse.wasm');
-const FIXTURE = path.join(__dirname, '..', 'tests', 'fixtures', 's3-sign.v1.json');
 const SECRET = 'synthetic-SECRET-k3y/0123456789abcdefXYZ';
 const DATE = '20130524T000000Z';
 
@@ -34,8 +34,6 @@ function withEnv(vars, fn) {
   }
 }
 
-/** The URL-like object the JS reads, from a fixture case. */
-const urlOf = (c) => ({ host: c.host, pathname: c.pathname, searchParams: new URLSearchParams(c.query) });
 const same = (a, b) => assert.deepEqual(Object.entries(a), Object.entries(b));
 
 test('S3_SIGN_IMPL defaults to js; unknown values mean js with one warning', (t) => {
@@ -47,11 +45,6 @@ test('S3_SIGN_IMPL defaults to js; unknown values mean js with one warning', (t)
   assert.equal(sign.s3SignImpl({ S3_SIGN_IMPL: 'rust' }), 'js');
   assert.equal(warn.mock.callCount(), 1);
   assert.ok(davParseWasm.IMPL_FLAGS.includes('S3_SIGN_IMPL'));
-});
-
-test('the shared fixture table is what the JS reference produces today', () => {
-  const out = execFileSync(process.execPath, [path.join(__dirname, '..', 'tools', 'gen-s3-sign-fixtures.cjs')]);
-  assert.ok(out.equals(fs.readFileSync(FIXTURE)), 'regenerate tests/fixtures/s3-sign.v1.json (and noevia-rs\'s copy)');
 });
 
 test('the default path is the JS code: it signs with no module at all', () => {
@@ -83,52 +76,6 @@ test('wasm fails closed when the module is missing or tampered: fixed message, t
 test('startup refuses S3_SIGN_IMPL=wasm without a verified module', () => {
   assert.deepEqual(davParseWasm.wasmFlags({ S3_SIGN_IMPL: 'wasm' }), ['S3_SIGN_IMPL']);
   assert.throws(() => davParseWasm.verifyAtStartup({ S3_SIGN_IMPL: 'wasm', DAV_PARSE_WASM: MISSING }), /S3_SIGN_IMPL set to wasm, but dav-parse\.wasm failed verification \(missing\)/);
-});
-
-test('differential: every fixture case signs identically through the module (keys, order, values)', { skip: skipWasm }, () => {
-  const f = JSON.parse(fs.readFileSync(FIXTURE, 'utf8'));
-  withEnv({ DAV_PARSE_WASM: wasmFile }, () => {
-    let n = 0;
-    for (const c of f.cases) {
-      const args = [c.method, urlOf(c), Buffer.from(c.payloadHex, 'hex'), c.accessKey, Buffer.from(c.secretHex, 'hex').toString('utf8'), { region: c.region, sessionToken: c.sessionToken, amzDate: c.amzDate }];
-      if (c.refused) {
-        assert.throws(() => davParseWasm.s3Sign(...args), (e) => e instanceof davParseWasm.DavParseError && e.reason === 'input', c.name);
-        continue;
-      }
-      const wasm = davParseWasm.s3Sign(...args);
-      same(wasm, sign.signS3RequestJs(...args));
-      same(wasm, Object.fromEntries(c.expect.headers));
-      n++;
-    }
-    assert.ok(n >= 170, `${n}`);
-    for (const r of f.regions) assert.equal(davParseWasm.s3Region(r.input), r.expect, JSON.stringify(r.input));
-  });
-});
-
-test('differential: seeded random requests, real URLs, lone surrogates where the JS hashes them', { skip: skipWasm }, () => {
-  let seed = 0x53;
-  const rand = () => { seed = (seed * 1103515245 + 12345) >>> 0; return seed / 2 ** 32; };
-  const pick = (a) => a[Math.floor(rand() * a.length)];
-  const segs = ['a', 'notes (1).md', "it's", '😀', '100%', '%41', 'a b', '~', ''];
-  withEnv({ DAV_PARSE_WASM: wasmFile }, () => {
-    for (let i = 0; i < 300; i++) {
-      const url = new URL(`${pick(['https://s3.example.com', 'http://127.0.0.1:9000', 'https://S3.Example.org:443'])}/${pick(segs)}/${pick(segs)}?${pick(['', 'list-type=2&prefix=a%2F', 'a=2&a=1', 'x=%F0%9F%98%80&y=%ED%A0%80'])}`);
-      const payload = pick(['', 'body', 'a\ud800b', Buffer.from([0, 255, 1]), undefined, null]);
-      const args = [pick(['GET', 'PUT', 'get', 'X\udc00']), url, payload, pick(['AK', 'AKIAIOSFODNN7EXAMPLE', '"q"\\']), pick([SECRET, 'é\ud800', '']),
-        { region: pick([undefined, '', 'eu-west-2']), sessionToken: pick([undefined, '', ' tok﻿']), amzDate: pick([undefined, DATE, '20260101T120000Z']) }];
-      if (args[5].amzDate === undefined) args[5].amzDate = DATE; // the clock must not differ between the two calls
-      same(davParseWasm.s3Sign(...args), sign.signS3RequestJs(...args));
-    }
-    // The flag routes signS3Request itself; normalizeS3Region likewise.
-    withEnv({ S3_SIGN_IMPL: 'wasm', DAV_PARSE_WASM: wasmFile }, () => {
-      const url = new URL('https://s3.example.com/diary-bucket?list-type=2&max-keys=1');
-      same(sign.signS3Request('GET', url, '', 'AK', SECRET, { amzDate: DATE }), sign.signS3RequestJs('GET', url, '', 'AK', SECRET, { amzDate: DATE }));
-      assert.equal(region.normalizeS3Region(' EU-West-1 '), 'eu-west-1');
-      assert.equal(region.normalizeS3Region(null), 'us-east-1');
-      // Without amzDate both stamp the clock: the format is the JS one.
-      assert.match(sign.signS3Request('GET', url, '', 'AK', SECRET)['x-amz-date'], /^\d{8}T\d{6}Z$/);
-    });
-  });
 });
 
 test('refusals: fixed reasons, the secret in no error, the memory wiped after every call', { skip: skipWasm }, () => {
