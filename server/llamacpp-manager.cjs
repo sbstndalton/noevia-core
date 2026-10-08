@@ -148,6 +148,8 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
   // small models in keepAlongside() may stay, but two chat models never share it.
   const admissionError = message => Object.assign(Error(message), { status: 409, publicMessage: message });
   async function makeRoomForUnlocked(model, keep, signal) {
+    // #1068: a restored models.ini the router has not re-read yet is re-read before this model loads.
+    await autotuner?.flushReload?.(model);
     // Refuse before evicting anything: an over-budget model must not cost the loaded one.
     const refusal = await overBudget(model);
     if (refusal) throw Object.assign(admissionError(refusal.body.error), { code: refusal.body.code });

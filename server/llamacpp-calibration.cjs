@@ -47,6 +47,8 @@ function createCalibrator(deps) {
     // #1062: set by auto-tune only. Called with the error this calibrator would throw when another
     // client has a model live; resolves once it may go on (the step is then repeated) or throws.
     foreignWait = null,
+    // #1067: which live rows only foreignWait may stop (auto-tune's rule); unset, every live other.
+    foreignHeld = null,
     sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
     now = () => Date.now(),
     timeouts = {},
@@ -124,8 +126,11 @@ function createCalibrator(deps) {
     const models = await listing();
     const asked = new Set(), gone = new Set(), own = except ?? state.job?.model;
     // #1067 (auto-tune only): never stop another client's live model here; foreignWait decides.
-    if (foreignWait && models.some(m => m.id !== own && ['loaded', 'loading', 'sleeping'].includes(m.status?.value)))
-      throw Error('Another client has a model loaded.');
+    if (foreignWait) {
+      const live = models.filter(m => m.id !== own && ['loaded', 'loading', 'sleeping'].includes(m.status?.value));
+      const held = live.length && foreignHeld ? await foreignHeld(models) : live.map(m => m.id);
+      if (held.length) throw Error('Another client has a model loaded.');
+    }
     for (const m of models) if (m.id !== except && ['loaded', 'loading'].includes(m.status?.value)) { asked.add(m.id); await request('/models/unload', { method: 'POST', body: JSON.stringify({ model: m.id }) }, limits.unload).catch(() => {}); }
     const deadline = now() + limits.unload;
     while (now() < deadline) {

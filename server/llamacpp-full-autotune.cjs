@@ -243,6 +243,20 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
       return Number.isSafeInteger(n) && n >= 0 && n <= 0xffffffff ? n : null;
     } catch { return null; }
   }
+  // #1067: live rows other than `tuning` that only tune_contention may stop. Resident and known idle
+  // may be stopped directly as before; so may a model this job already finished tuning (left loaded
+  // by its own tune) unless it is busy. Loading, busy or unreadable goes to the decision.
+  async function heldForeign(rows, tuning) {
+    const done = new Set((state.job?.models || []).filter(m => m.status === 'passed').map(m => m.model));
+    const held = [];
+    for (const row of rows) {
+      if (row.id === tuning || !LIVE.includes(row.status?.value)) continue;
+      if (row.status.value === 'loading') { held.push(row.id); continue; }
+      const busy = await requestsProcessing(row.id);
+      if (busy > 0 || (busy === null && !done.has(row.id))) held.push(row.id);
+    }
+    return held;
+  }
   const idList = ids => ids.slice(0, 4).map(id => String(id).slice(0, 120)).join(', ') + (ids.length > 4 ? ' and ' + (ids.length - 4) + ' more' : '');
   /**
    * #1062: another client has a model live while `j.model` is being tuned. Waits (cancellable)
@@ -286,7 +300,8 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
         for (const id of d.unload) {
           if (!restoring) check();
           // #1069: read the count again right before stopping it; a request that just arrived wins.
-          if ((await requestsProcessing(id)) > 0) { raced = true; break; }
+          const now2 = await requestsProcessing(id);
+          if (now2 > 0 || (now2 === null && d.reason === 'idle')) { raced = true; break; }
           const u = await request('/models/unload', { method: 'POST', body: JSON.stringify({ model: id }) }, 60000);
           if (!u.ok) throw Error('Could not unload ' + id + ' before testing.');
         }
@@ -376,17 +391,8 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     const asked = new Set(), gone = new Set();
     // #1067: a live model other than the one being tuned is another client's until tune_contention
     // says it is idle; yieldToForeign decides, and unloads it only then.
-    // Resident and known idle may be stopped here as before; so may a model of this job's own queue
-    // (left loaded by its tune) unless it is busy. Loading, busy or unreadable goes to the decision.
     if (tuning) {
-      const queue = new Set((state.job?.models || []).map(m => m.model));
-      const held = [];
-      for (const row of r.body.data) {
-        if (row.id === tuning || !LIVE.includes(row.status?.value)) continue;
-        if (row.status.value === 'loading') { held.push(row.id); continue; }
-        const busy = await requestsProcessing(row.id);
-        if (busy > 0 || (busy === null && !queue.has(row.id))) held.push(row.id);
-      }
+      const held = await heldForeign(r.body.data, tuning);
       if (held.length) return 'Another client has ' + idList(held) + ' loaded.';
     }
     for (const row of r.body.data) if (['loaded', 'loading'].includes(row.status?.value)) {
@@ -553,6 +559,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     child = contextFactory({
       applyUnlocked: guardedApply(j),
       // #1062: the calibrator waits for another client the same way, then repeats its step.
+      foreignHeld: rows => heldForeign(rows, j.model),
       foreignWait: async legacy => { try { await yieldToForeign(j, legacy); } catch (e) { if (e.foreignTimeout || e.cancelled) foreignStop = e; throw e; } },
       onWrite: revision => { j._revision = revision; save(); },
       onUpdate: c => {
@@ -794,8 +801,12 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     } catch { p.restored = false; save(); return false; }
   }
   async function unloadOwn(j) {
-    const u = await request('/models/unload', { method: 'POST', body: JSON.stringify({ model: j.model }) }, 60000);
-    if (!u.ok) throw Error('Could not unload ' + j.model + '.');
+    // The tuned model is often gone already (evicted by another client): ask only when it runs, and
+    // a refused unload is not a failure if the row goes (or is) unloaded anyway.
+    const first = await rawModels();
+    if (!first.ok || !Array.isArray(first.body?.data)) throw Error('The model server stopped responding while unloading.');
+    const own = first.body.data.find(m => m.id === j.model);
+    if (own && LIVE.includes(own.status?.value)) await request('/models/unload', { method: 'POST', body: JSON.stringify({ model: j.model }) }, 60000).catch(() => null);
     const deadline = now() + 60000;
     for (let poll = 0; poll < 120; poll++) {
       const listing = await rawModels();
@@ -826,7 +837,8 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   let reloadTimer = null;
   function scheduleReload(j, tries = 0) {
     clearTimeout(reloadTimer);
-    if (!j._reloadPending || tries > 120) return;
+    if (!j._reloadPending) return;
+    if (tries > 120) { note(j, 'The model server has not re-read the restored models.ini; it does so before this model next loads.'); return; }
     reloadTimer = setTimeout(async () => {
       if (!j._reloadPending) return;
       if ((await othersLiveNow(j.model)) === false) {
@@ -835,6 +847,17 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
       scheduleReload(j, tries + 1);
     }, Math.max(foreignPollMs * 15, 1));
     reloadTimer.unref?.();
+  }
+  /** #1068: before the tuned model loads again (chat or a new tune), the router re-reads the restored
+   *  file even with another client live (its unchanged preset keeps it running), so it never serves
+   *  the test profile. A no-op unless a re-read is pending (for `model`, when given). */
+  async function flushReload(model = null) {
+    const j = state.job;
+    if (!j?._reloadPending || (model && model !== j.model)) return;
+    clearTimeout(reloadTimer);
+    const r = await request('/models?reload=1', {}, 120000);
+    if (!r.ok) throw publicFail('The model server has not re-read the restored settings yet. Try again shortly.');
+    j._reloadPending = false; note(j, 'The model server re-read the restored models.ini.');
   }
   async function runPhase(j, item, p) {
     check();
@@ -1285,6 +1308,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     if (!bulk && isSystemModel(model)) return { ok: false, status: 400, body: { error: SYSTEM_MODEL_REASON } };
     starting = true;
     try {
+      await flushReload();
       const scan = await candidates();
       const models = bulk ? scan.models : [model];
       if (!bulk && ![...scan.models, ...scan.skipped.filter(s => s.reason === 'Current tune already applied').map(s => s.model)].includes(model))
@@ -1306,6 +1330,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   }
   async function recover() {
     const j = state.job;
+    if (j?._reloadPending) scheduleReload(j);
     if (j?.status !== 'running') return;
     // Pre-v3 jobs have a single snapshot. They cannot be resumed into the new phase schema.
     if (!Array.isArray(j.models)) {
@@ -1371,6 +1396,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     }
     starting = true;
     try {
+      await flushReload();
       for (const item of j.models.filter(m => m.status !== 'passed')) {
         if (!rows.body.data.some(row => row.id === item.model) || !presets.get(item.model).exists) throw publicFail('A queued model is no longer configured.');
         const identity = await identityFor(item.model);
@@ -1392,6 +1418,6 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     } catch (e) { return { ok: false, status: 409, body: { error: clientMessage(e, 'Auto-tune could not resume.') } }; }
     finally { starting = false; }
   }
-  return { start, resume, cancel, status, setSettings, untuned, recover, completion: () => completion };
+  return { start, resume, cancel, status, setSettings, untuned, recover, flushReload, completion: () => completion };
 }
 module.exports = { createFullAutotuner, qualityCheck, qualityFailure, QUALITY, VERSION, newModel, hasHarmonyReasoning, kvCandidates, preferKv, bf16Unsupported };
