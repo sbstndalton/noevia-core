@@ -2,9 +2,9 @@
 'use strict';
 // Regenerates the shared differential fixtures for the prompt-injection boundary: prompt framing,
 // the provenance policy (#769) and task packet schema 1 (#740). Expectations come from the JS
-// references (server/prompt-framing.cjs frameUntrustedJs/escapeClosingJs, server/provenance-
-// policy.cjs createTaintStoreJs/checkWriteJs and its helpers, server/task-packet.cjs
-// parsePacketJs/validatePacketJs/renderPacketJs). The same file is committed byte-for-byte in
+// references (tests/server/oracle/prompt-framing.cjs frameUntrustedJs/escapeClosingJs,
+// tests/server/oracle/provenance-policy.cjs createTaintStoreJs/checkWriteJs and its helpers,
+// tests/server/oracle/task-packet.cjs parsePacketJs/validatePacketJs/renderPacketJs). The same file is committed byte-for-byte in
 // sbstndalton/noevia-rs (crates/prompt-framing/tests/fixtures/prompt-framing.v1.json); noevia-core
 // CI compares them and regenerates this one.
 //   node tools/gen-prompt-framing-fixtures.cjs > tests/fixtures/prompt-framing.v1.json
@@ -29,9 +29,10 @@
 //   renders:    { packet, label, expect }             renderPacket(parsePacket(packet).packet, label)
 
 const { domainToUnicode } = require('node:url');
-const framing = require('../server/prompt-framing.cjs');
-const prov = require('../server/provenance-policy.cjs');
-const tp = require('../server/task-packet.cjs');
+const framing = require('../tests/server/oracle/prompt-framing.cjs');
+const prov = require('../tests/server/oracle/provenance-policy.cjs');
+const tpOracle = require('../tests/server/oracle/task-packet.cjs');
+const tp = { ...require('../server/task-packet.cjs'), ...tpOracle }; // constants from production, the *Js functions from the oracle
 
 // mulberry32: a small fixed-seed generator, so the table is the same on every run.
 function rng(seed) {

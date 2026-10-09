@@ -10,11 +10,11 @@
 //   - crates/storage-path   storagePath  = storage-path.cjs's rules          (STORAGE_PATH_IMPL, #978)
 //   - crates/upload-sniff   uploadValidate/uploadClassify/uploadDecode
 //                                        = upload-sniff.cjs validate/classify/decodeText
-//                                                                             (UPLOAD_SNIFF_IMPL, #977)
+//                                                                             (#977; always on, #1071)
 //   - crates/secret-envelope secretOpen/secretSeal = secret-envelope.cjs openJs/encryptJs
 //                                                                             (SECRET_ENVELOPE_IMPL, #979)
 //   - crates/mcp-frame     mcpRpcBody/mcpSchemaRefs = mcp.cjs parseRpcBody/resolveSchemaRefs
-//                                                                             (MCP_FRAME_IMPL, #980)
+//                                                                             (#980; always on, #1071)
 //   - crates/chat-template-caps + provider-error  templateCaps/providerErrorKind/servingVerdict
 //   - crates/autotune-plan  autotunePlan = auto-tune's next step                (always on, #1003/#1071)
 //   - crates/preset-reload  presetReload = may the router re-read models.ini now (always on, #1012/#1071)
@@ -26,11 +26,11 @@
 //                           <id>-long profile: pairing, its models.ini section, the entry a chat
 //                           is served by (always on; fails closed, #1079)
 //   - crates/prompt-framing frameUntrusted/escapeClosing, provenance*, packet* = prompt-framing.cjs,
-//                          provenance-policy.cjs, task-packet.cjs                (PROMPT_FRAMING_IMPL, #769/#740)
-//   - crates/s3-sign        s3Sign/s3Region = s3-sign.cjs signS3RequestJs, s3-region.cjs normalizeS3Region
-//                                                                             (S3_SIGN_IMPL)
+//                          provenance-policy.cjs, task-packet.cjs                (#769/#740; always on, #1071)
+//   - crates/s3-sign        s3Sign/s3Region = s3-sign.cjs signS3Request, s3-region.cjs normalizeS3Region
+//                                                                             (always on, #1071)
 //   - crates/ssrf-policy   ssrfUrl/ssrfAddressesPublic = ssrf.cjs isPublicUrl (before DNS) and
-//                          isPrivateIp, public-fetch.cjs's URL check             (SSRF_IMPL, #795)
+//                          isPrivateIp, public-fetch.cjs's URL check             (#795; always on, #1071)
 //   - crates/stream-guard  streamGuardNew/Feed/End/Check, streamGuardCorrection = stream-guard.cjs's
 //                          IncrementalValidator and buildCorrectionRequest; the validator state is
 //                          bytes held here between calls, nothing stays in the module (STREAM_GUARD_IMPL, #516/#704)
@@ -262,7 +262,7 @@ const GROUPS = new Set(['Documents', 'Images', 'Text', 'Other']);
 const REFUSALS = new Map([['filename', 400], ['empty', 400], ['too_big', 413], ['archive', 400]]);
 const UPLOAD_CAP = 25 * 1024 * 1024;
 
-/** upload-sniff.cjs validateJs (#977), through the module: null when accepted, else
+/** tests/server/oracle/upload-sniff.cjs validateJs (#977), through the module: null when accepted, else
  *  `{ refusal: 'filename'|'empty'|'too_big'|'archive', status }`. Only what decides the answer
  *  crosses: the name (cut to 201 UTF-16 units: anything longer fails the 200-unit rule either way),
  *  the length (clamped to CAP + 1) and the first SNIFF_BYTES bytes. */
@@ -285,7 +285,7 @@ function uploadValidate(name, bytes) {
   return { refusal: value.refusal, status: value.status };
 }
 
-/** upload-sniff.cjs classifyJs (#977), through the module. */
+/** tests/server/oracle/upload-sniff.cjs classifyJs (#977), through the module. */
 function uploadClassify(name) {
   if (typeof name !== 'string') throw new DavParseError('upload name must be text', 'input');
   // A lone surrogate crosses as U+FFFD; neither can be part of a known extension.
@@ -300,7 +300,7 @@ function uploadClassify(name) {
 
 const ENCODINGS = [null, 'utf-8', 'utf-16le', 'utf-16be', 'windows-1252'];
 
-/** upload-sniff.cjs decodeTextJs (#977), through the module: null (not text) or
+/** tests/server/oracle/upload-sniff.cjs decodeTextJs (#977), through the module: null (not text) or
  *  `{ text, encoding }`. The whole upload crosses (decoding needs it), at most MAX_DECODE_BYTES. */
 function uploadDecode(bytes) {
   if (!(bytes instanceof Uint8Array)) throw new DavParseError('upload bytes have the wrong type', 'input');
@@ -1090,7 +1090,7 @@ function s3Refusal(status, bytes) {
   return new DavParseError(`s3 request refused by dav-parse (${status === 2 ? 'input' : code})`, status === 2 ? 'input' : code);
 }
 
-/** s3-sign.cjs signS3RequestJs, through the module (S3_SIGN_IMPL=wasm). Same arguments and the
+/** tests/server/oracle/s3-sign.cjs signS3RequestJs, through the module (always, #1071). Same arguments and the
  *  same headers object (same keys, same order). `url` is what the JS reads: a string `host` and
  *  `pathname` and a URLSearchParams `searchParams` (a URL). The method, secret and payload are
  *  passed as UTF-8 (a lone surrogate as U+FFFD, exactly what the JS hashes). Text echoed in the
@@ -1848,12 +1848,12 @@ function llamacppAutoconfig(op, args) {
 // Every switch that runs this module (#996). Each reads its value as trim().toLowerCase().
 // Retired switches (#1071) are not listed: the Rust path they selected is always on, and
 // verifyAtStartup() always loads this module for it.
-const IMPL_FLAGS = ['STORAGE_PATH_IMPL', 'UPLOAD_SNIFF_IMPL', 'SECRET_ENVELOPE_IMPL', 'MCP_FRAME_IMPL', 'PROMPT_FRAMING_IMPL', 'S3_SIGN_IMPL', 'SSRF_IMPL', 'STREAM_GUARD_IMPL', 'GGUF_META_IMPL', 'POLICY_LEAVES_IMPL', 'CODE_REVIEW_VERDICT_IMPL', 'TOOL_EXCHANGE_IMPL', 'MCP_SERVERS_IMPL', 'DECISION_IMPL', 'CODE_NET_GUARD_IMPL', 'ROLE_CONTEXT_IMPL', 'COMPLETENESS_REPORT_IMPL', 'TASK_LIFECYCLE_IMPL', 'LLAMACPP_AUTOCONFIG_IMPL'];
+const IMPL_FLAGS = ['STORAGE_PATH_IMPL', 'SECRET_ENVELOPE_IMPL', 'STREAM_GUARD_IMPL', 'GGUF_META_IMPL', 'POLICY_LEAVES_IMPL', 'CODE_REVIEW_VERDICT_IMPL', 'TOOL_EXCHANGE_IMPL', 'MCP_SERVERS_IMPL', 'DECISION_IMPL', 'CODE_NET_GUARD_IMPL', 'ROLE_CONTEXT_IMPL', 'COMPLETENESS_REPORT_IMPL', 'TASK_LIFECYCLE_IMPL', 'LLAMACPP_AUTOCONFIG_IMPL'];
 
 /** Switches whose JS path was deleted once Rust had run in production (#1071). The old value that
  *  selected Rust ('wasm', or 'on' for the advisor) is accepted silently; anything else is ignored
  *  with one warning, because Rust is always used. */
-const RETIRED_FLAGS = { CHAT_TEMPLATE_CAPS_IMPL: 'wasm', AUTOTUNE_PLAN_IMPL: 'wasm', PRESET_RELOAD_IMPL: 'wasm', LAYA_LOAD_ADVISOR: 'on', DAV_PARSE_IMPL: 'wasm', S3_PARSE_IMPL: 'wasm' };
+const RETIRED_FLAGS = { CHAT_TEMPLATE_CAPS_IMPL: 'wasm', AUTOTUNE_PLAN_IMPL: 'wasm', PRESET_RELOAD_IMPL: 'wasm', LAYA_LOAD_ADVISOR: 'on', DAV_PARSE_IMPL: 'wasm', S3_PARSE_IMPL: 'wasm', MCP_FRAME_IMPL: 'wasm', UPLOAD_SNIFF_IMPL: 'wasm', S3_SIGN_IMPL: 'wasm', PROMPT_FRAMING_IMPL: 'wasm', SSRF_IMPL: 'wasm' };
 
 /** Log one warning per retired switch that `env` still sets to something other than its old
  *  Rust-selecting value (for example =js). Returns the names warned about. Never throws. */
@@ -1879,16 +1879,17 @@ function wasmFlags(env = process.env) {
  *  Error with the reason (naming those flags, if any) when the module is unusable. */
 /** The runtime URL behaviour prompt-framing's port was pinned against (Node 22's ada maps U+1E9E
  *  to "ss" in hosts; noevia-rs crates/prompt-framing idna_compat does the same). A runtime that
- *  disagrees would make JS and wasm hosts differ, so PROMPT_FRAMING_IMPL=wasm refuses to start. */
+ *  disagrees would make the port and the runtime's own URL parser differ, so startup refuses
+ *  (always, since #1071; it was PROMPT_FRAMING_IMPL=wasm). */
 function framingRuntimeMatches(hostname = (h) => new URL(h).hostname) {
   try { return hostname('http://\u1e9e.io') === 'ss.io'; } catch { return false; }
 }
 
 function verifyAtStartup(env = process.env, { hostname } = {}) {
   const flags = wasmFlags(env);
-  if (flags.includes('PROMPT_FRAMING_IMPL') && !framingRuntimeMatches(hostname)) {
+  if (!framingRuntimeMatches(hostname)) {
     cached = null;
-    throw Object.assign(new Error(`PROMPT_FRAMING_IMPL set to wasm, but this runtime's URL parser (Node ${process.version}) does not map U+1E9E to "ss" as the pinned port does (runtime)`), { reason: 'runtime', flags });
+    throw Object.assign(new Error(`prompt framing is always Rust, but this runtime's URL parser (Node ${process.version}) does not map U+1E9E to "ss" as the pinned port does (runtime)`), { reason: 'runtime', flags });
   }
   cached = null;
   try {

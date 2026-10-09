@@ -23,8 +23,6 @@ const skipWasm = !haveWasm && !required && 'dav-parse.wasm not built (set DAV_PA
 const MISSING = path.join(os.tmpdir(), 'no-such-storage-dav-parse.wasm');
 
 function withEnv(vars, fn) {
-  // S3 signing stays on its js default here, so these tests see only their own switches.
-  vars = { S3_SIGN_IMPL: undefined, ...vars };
   const saved = {};
   for (const k of Object.keys(vars)) { saved[k] = process.env[k]; if (vars[k] === undefined) delete process.env[k]; else process.env[k] = vars[k]; }
   davParseWasm.reset();
@@ -82,19 +80,23 @@ test('the S3 listing fails closed with a fixed public message when the module is
   { DAV_PARSE_WASM: MISSING },
   () => withS3(async () => {
     const warn = t.mock.method(console, 'warn', () => {});
-    const err = await storageClient.listFiles(s3Conn, 'Docs').then(() => null, (e) => e);
+    // The whole listing fails closed (the S3 region check, also Rust, is the first to stop it)...
+    const whole = await storageClient.listFiles(s3Conn, 'Docs').then(() => null, (e) => e);
+    assert.ok(whole && whole.status === 502 && /could not be (read|checked)$/.test(whole.message), String(whole?.message));
+    // ...and the page scan itself answers with its own fixed message.
+    const err = (() => { try { s3Listing.s3Page('<ListBucketResult/>', ''); } catch (e) { return e; } return null; })();
     assert.equal(err?.message, 'storage listing could not be read');
     assert.equal(err.status, 502);
     assert.equal(err.code, 's3_parse_failed');
     assert.doesNotMatch(err.message, /no-such|sha256|wasm|missing/);
-    assert.match(String(warn.mock.calls[0].arguments[0]), /s3-list-parse failed \(missing\): .*no-such-storage-dav-parse\.wasm/);
+    assert.ok(warn.mock.calls.some((c) => /s3-list-parse failed \(missing\): .*no-such-storage-dav-parse\.wasm/.test(String(c.arguments[0]))));
   })));
 
 test('STORAGE_PATH_IMPL=wasm fails closed with a fixed public message when the module is missing', (t) => withEnv(
   { STORAGE_PATH_IMPL: 'wasm', DAV_PARSE_WASM: MISSING },
   () => {
     const warn = t.mock.method(console, 'warn', () => {});
-    for (const call of [() => storageClient.safeRelativePath('a/b'), () => storagePath.cleanRoot('/r/'), () => storagePath.joinRoot('r', 'a'), () => uploads.validate('a.md', Buffer.from('x'))]) {
+    for (const call of [() => storageClient.safeRelativePath('a/b'), () => storagePath.cleanRoot('/r/'), () => storagePath.joinRoot('r', 'a'), () => storagePath.isPlainFilename('a.md')]) {
       assert.throws(call, (e) => e.message === storagePath.PUBLIC_FAILURE && e.status === 500 && e.code === 'storage_path_failed' && e.reason === 'missing');
     }
     assert.match(String(warn.mock.calls[0].arguments[0]), /storage-path safeRelativePath failed \(missing\)/);

@@ -24,11 +24,19 @@ function productionFiles(dir) {
   return out;
 }
 
-test('the oracle modules exist and are the ones the fixture generators use', () => {
+const TOOLS = path.join(__dirname, '..', 'tools');
+
+test('the oracle modules exist', { skip: !fs.existsSync(ORACLE) && 'no tests/server/oracle here' }, () => {
   const names = fs.readdirSync(ORACLE).filter((n) => n.endsWith('.cjs')).sort();
-  assert.deepEqual(names, ['chat-context.cjs', 'dav-listing.cjs', 's3-listing.cjs']);
-  for (const [tool, oracle] of [['gen-dav-listing-fixtures.cjs', 'dav-listing.cjs'], ['gen-storage-fixtures.cjs', 's3-listing.cjs'], ['gen-chat-template-caps-fixtures.cjs', 'chat-context.cjs']]) {
-    assert.match(fs.readFileSync(path.join(__dirname, '..', 'tools', tool), 'utf8'), new RegExp(`tests/server/oracle/${oracle.replace('.', '\\.')}`));
+  assert.deepEqual(names, ['chat-context.cjs', 'dav-listing.cjs', 'mcp.cjs', 'prompt-framing.cjs', 'provenance-policy.cjs', 'public-fetch.cjs', 's3-listing.cjs', 's3-sign.cjs', 'ssrf.cjs', 'task-packet.cjs', 'upload-sniff.cjs']);
+});
+
+// The shipped web image has no tools/ (like the differential tests' "no generator here").
+test('the oracle modules are the ones the fixture generators use', { skip: !fs.existsSync(TOOLS) && 'no tools/ here (no generators)' }, () => {
+  for (const [tool, oracle] of [['gen-dav-listing-fixtures.cjs', 'dav-listing.cjs'], ['gen-storage-fixtures.cjs', 's3-listing.cjs'], ['gen-chat-template-caps-fixtures.cjs', 'chat-context.cjs'],
+    ['gen-mcp-fixtures.cjs', 'mcp.cjs'], ['gen-upload-fixtures.cjs', 'upload-sniff.cjs'], ['gen-s3-sign-fixtures.cjs', 's3-sign.cjs'], ['gen-ssrf-fixtures.cjs', 'ssrf.cjs'], ['gen-ssrf-fixtures.cjs', 'public-fetch.cjs'],
+    ['gen-prompt-framing-fixtures.cjs', 'prompt-framing.cjs'], ['gen-prompt-framing-fixtures.cjs', 'provenance-policy.cjs'], ['gen-prompt-framing-fixtures.cjs', 'task-packet.cjs']]) {
+    assert.match(fs.readFileSync(path.join(TOOLS, tool), 'utf8'), new RegExp(`tests/server/oracle/${oracle.replace('.', '\\.')}`));
   }
 });
 
@@ -55,7 +63,7 @@ test('no production module under server/ requires an oracle module', () => {
 });
 
 test('requiring the production modules does not load any oracle file', () => {
-  for (const m of ['dav-listing', 's3-listing', 'chat-context', 'chat-template-caps', 'preset-reload', 'load-advisor', 'dav-parse-wasm', 'storage-client']) require(`./${m}.cjs`);
+  for (const m of ['dav-listing', 's3-listing', 'chat-context', 'chat-template-caps', 'preset-reload', 'load-advisor', 'dav-parse-wasm', 'storage-client', 'upload-sniff', 's3-sign', 's3-region', 'mcp', 'ssrf', 'public-fetch', 'prompt-framing', 'provenance-policy', 'task-packet']) require(`./${m}.cjs`);
   const loaded = Object.keys(require.cache).filter((f) => f.startsWith(ORACLE + path.sep));
   assert.deepEqual(loaded, []);
 });

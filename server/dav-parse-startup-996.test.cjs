@@ -18,9 +18,9 @@ const wasmFile = process.env.DAV_PARSE_WASM || davParseWasm.DEFAULT_WASM;
 const skipWasm = !fs.existsSync(wasmFile) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
 
 test('wasmFlags lists exactly the switches set to wasm, read as the switches read them', () => {
-  assert.deepEqual(davParseWasm.IMPL_FLAGS, ['STORAGE_PATH_IMPL', 'UPLOAD_SNIFF_IMPL', 'SECRET_ENVELOPE_IMPL', 'MCP_FRAME_IMPL', 'PROMPT_FRAMING_IMPL', 'S3_SIGN_IMPL', 'SSRF_IMPL', 'STREAM_GUARD_IMPL', 'GGUF_META_IMPL', 'POLICY_LEAVES_IMPL', 'CODE_REVIEW_VERDICT_IMPL', 'TOOL_EXCHANGE_IMPL', 'MCP_SERVERS_IMPL', 'DECISION_IMPL', 'CODE_NET_GUARD_IMPL', 'ROLE_CONTEXT_IMPL', 'COMPLETENESS_REPORT_IMPL', 'TASK_LIFECYCLE_IMPL', 'LLAMACPP_AUTOCONFIG_IMPL']);
+  assert.deepEqual(davParseWasm.IMPL_FLAGS, ['STORAGE_PATH_IMPL', 'SECRET_ENVELOPE_IMPL', 'STREAM_GUARD_IMPL', 'GGUF_META_IMPL', 'POLICY_LEAVES_IMPL', 'CODE_REVIEW_VERDICT_IMPL', 'TOOL_EXCHANGE_IMPL', 'MCP_SERVERS_IMPL', 'DECISION_IMPL', 'CODE_NET_GUARD_IMPL', 'ROLE_CONTEXT_IMPL', 'COMPLETENESS_REPORT_IMPL', 'TASK_LIFECYCLE_IMPL', 'LLAMACPP_AUTOCONFIG_IMPL']);
   assert.deepEqual(davParseWasm.wasmFlags({}), []);
-  assert.deepEqual(davParseWasm.wasmFlags({ STORAGE_PATH_IMPL: 'js', MCP_FRAME_IMPL: 'rust', UPLOAD_SNIFF_IMPL: '' }), []);
+  assert.deepEqual(davParseWasm.wasmFlags({ STORAGE_PATH_IMPL: 'js', GGUF_META_IMPL: 'rust', STREAM_GUARD_IMPL: '' }), []);
   assert.deepEqual(davParseWasm.wasmFlags({ SECRET_ENVELOPE_IMPL: ' WASM ', STORAGE_PATH_IMPL: 'wasm' }), ['STORAGE_PATH_IMPL', 'SECRET_ENVELOPE_IMPL']);
 });
 
@@ -42,7 +42,7 @@ test('with no switch set and the pinned module, startup verifies it and names no
 });
 
 test('retired switches: only a value other than the old Rust one warns, once per switch', () => {
-  assert.deepEqual(Object.keys(davParseWasm.RETIRED_FLAGS), ['CHAT_TEMPLATE_CAPS_IMPL', 'AUTOTUNE_PLAN_IMPL', 'PRESET_RELOAD_IMPL', 'LAYA_LOAD_ADVISOR', 'DAV_PARSE_IMPL', 'S3_PARSE_IMPL']);
+  assert.deepEqual(Object.keys(davParseWasm.RETIRED_FLAGS), ['CHAT_TEMPLATE_CAPS_IMPL', 'AUTOTUNE_PLAN_IMPL', 'PRESET_RELOAD_IMPL', 'LAYA_LOAD_ADVISOR', 'DAV_PARSE_IMPL', 'S3_PARSE_IMPL', 'MCP_FRAME_IMPL', 'UPLOAD_SNIFF_IMPL', 'S3_SIGN_IMPL', 'PROMPT_FRAMING_IMPL', 'SSRF_IMPL']);
   const warnings = [];
   const log = { warn: (m) => warnings.push(m) };
   assert.deepEqual(davParseWasm.warnRetiredFlags({}, log), []);
@@ -69,6 +69,21 @@ test('a wasm switch with a missing or tampered module throws, naming the switch 
   davParseWasm.reset();
 });
 
+test('the runtime URL parser check is unconditional: a runtime that maps U+1E9E differently stops startup (was PROMPT_FRAMING_IMPL=wasm)', (t) => {
+  davParseWasm.reset();
+  t.after(() => davParseWasm.reset());
+  assert.equal(davParseWasm.framingRuntimeMatches(() => 'ss.io'), true);
+  assert.equal(davParseWasm.framingRuntimeMatches(() => 'xn--zca.io'), false);
+  assert.equal(davParseWasm.framingRuntimeMatches(() => { throw new Error('bad url'); }), false);
+  // No switch set at all, and not even a wasm file consulted: the runtime check comes first.
+  for (const env of [{}, { PROMPT_FRAMING_IMPL: 'js' }, { PROMPT_FRAMING_IMPL: 'wasm', DAV_PARSE_WASM: MISSING }]) {
+    assert.throws(() => davParseWasm.verifyAtStartup(env, { hostname: () => 'xn--zca.io' }), (e) => e.reason === 'runtime' && /does not map U\+1E9E/.test(e.message));
+    assert.throws(() => davParseWasm.verifyAtStartup(env, { hostname: () => { throw new Error('bad url'); } }), (e) => e.reason === 'runtime');
+  }
+  // This runtime agrees with the pinned port (CI runs Node 22).
+  assert.equal(davParseWasm.framingRuntimeMatches(), true, `Node ${process.version}`);
+});
+
 test('a wasm switch with the pinned module verifies and leaves it ready', { skip: skipWasm }, () => {
   davParseWasm.reset();
   assert.deepEqual(davParseWasm.verifyAtStartup({ SECRET_ENVELOPE_IMPL: 'wasm', DAV_PARSE_WASM: wasmFile }), ['SECRET_ENVELOPE_IMPL']);
@@ -93,7 +108,8 @@ test('index.cjs refuses to start without the module even with every retired swit
   t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
   const r = spawnSync(process.execPath, [path.join(__dirname, 'index.cjs')], {
     env: { ...process.env, UI_DATA_DIR: dataDir, PORT: '0', HOST: '127.0.0.1', PUBLIC_ORIGIN: 'http://localhost', DIARY_AUTH_TOKEN: 'test-cowork-token', DAV_PARSE_WASM: MISSING,
-      DAV_PARSE_IMPL: 'js', S3_PARSE_IMPL: 'js', CHAT_TEMPLATE_CAPS_IMPL: 'off', AUTOTUNE_PLAN_IMPL: 'js', PRESET_RELOAD_IMPL: 'off', LAYA_LOAD_ADVISOR: 'off' },
+      DAV_PARSE_IMPL: 'js', S3_PARSE_IMPL: 'js', CHAT_TEMPLATE_CAPS_IMPL: 'off', AUTOTUNE_PLAN_IMPL: 'js', PRESET_RELOAD_IMPL: 'off', LAYA_LOAD_ADVISOR: 'off',
+      MCP_FRAME_IMPL: 'js', UPLOAD_SNIFF_IMPL: 'js', S3_SIGN_IMPL: 'js', PROMPT_FRAMING_IMPL: 'js', SSRF_IMPL: 'js' },
     encoding: 'utf8', timeout: 60000,
   });
   assert.equal(r.status, 1, `exit ${r.status} signal ${r.signal}\n${r.stderr.slice(-2000)}`);
@@ -107,7 +123,8 @@ test('index.cjs starts with the pinned module and every retired switch left at j
   t.after(() => fs.rmSync(dataDir, { recursive: true, force: true }));
   const child = require('node:child_process').spawn(process.execPath, [path.join(__dirname, 'index.cjs')], {
     env: { ...process.env, UI_DATA_DIR: dataDir, UI_PORT: '0', PORT: '0', HOST: '127.0.0.1', PUBLIC_ORIGIN: 'http://localhost', DIARY_AUTH_TOKEN: 'test-cowork-token', DAV_PARSE_WASM: wasmFile,
-      DAV_PARSE_IMPL: 'js', S3_PARSE_IMPL: 'js', CHAT_TEMPLATE_CAPS_IMPL: 'off', AUTOTUNE_PLAN_IMPL: 'js', PRESET_RELOAD_IMPL: 'off', LAYA_LOAD_ADVISOR: 'off' },
+      DAV_PARSE_IMPL: 'js', S3_PARSE_IMPL: 'js', CHAT_TEMPLATE_CAPS_IMPL: 'off', AUTOTUNE_PLAN_IMPL: 'js', PRESET_RELOAD_IMPL: 'off', LAYA_LOAD_ADVISOR: 'off',
+      MCP_FRAME_IMPL: 'js', UPLOAD_SNIFF_IMPL: 'js', S3_SIGN_IMPL: 'js', PROMPT_FRAMING_IMPL: 'js', SSRF_IMPL: 'js' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   t.after(() => child.kill('SIGKILL'));

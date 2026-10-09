@@ -1,10 +1,10 @@
 'use strict';
 
-// SSRF_IMPL (#795): tests/fixtures/ssrf.v1.json (byte-identical to noevia-rs
-// crates/ssrf-policy/tests/fixtures/; CI compares them) holds what the JS does, printed by
-// tools/gen-ssrf-fixtures.cjs from ssrf.cjs / public-fetch.cjs with the network stubbed. Here the
-// same rows run through dav-parse.wasm's ssrf_policy and through the JS entry points with
-// SSRF_IMPL=wasm: the Rust side must never accept what the JS refuses, and may refuse only for the
+// Outbound-URL guard (#795, #1071): tests/fixtures/ssrf.v1.json (byte-identical to noevia-rs
+// crates/ssrf-policy/tests/fixtures/; CI compares them) holds what the JS did, printed by
+// tools/gen-ssrf-fixtures.cjs from the JS references in tests/server/oracle/ (ssrf.cjs,
+// public-fetch.cjs) with the network stubbed. Here the same rows run through dav-parse.wasm's
+// ssrf_policy and through the production entry points, which are always Rust: the Rust side must never accept what the JS refuses, and may refuse only for the
 // documented extra strictness. Then the fail-closed paths. The WebAssembly half needs
 // server/wasm/dav-parse.wasm (or DAV_PARSE_WASM); skipped without it unless
 // DAV_PARSE_WASM_REQUIRED=1. Nothing here resolves a name or opens a socket.
@@ -21,6 +21,7 @@ const test = require('node:test');
 
 const davParseWasm = require('../../server/dav-parse-wasm.cjs');
 const ssrf = require('../../server/ssrf.cjs');
+const ssrfJs = require('./oracle/ssrf.cjs');
 const { createPublicFetch, createPublicOnlyLookup } = require('../../server/public-fetch.cjs');
 
 const FILE = path.join(__dirname, '../fixtures/ssrf.v1.json');
@@ -29,7 +30,7 @@ const wasmFile = process.env.DAV_PARSE_WASM || davParseWasm.DEFAULT_WASM;
 const skipWasm = !fs.existsSync(wasmFile) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
 const EXTRA = { check: ['trailing_dot', 'idn'], fetch: ['trailing_dot', 'idn', 'blocked_name'] };
 
-/** Run `fn` with SSRF_IMPL (and optionally DAV_PARSE_WASM) set, restoring both afterwards. */
+/** Run `fn` with the given env vars set (DAV_PARSE_WASM, a retired switch), restoring them afterwards. */
 async function withEnv(vars, fn) {
   const saved = Object.fromEntries(Object.keys(vars).map((k) => [k, process.env[k]]));
   Object.assign(process.env, vars);
@@ -40,7 +41,7 @@ async function withEnv(vars, fn) {
 
 const GENERATOR = path.join(__dirname, '../../tools/gen-ssrf-fixtures.cjs');
 test('the fixture file is what the generator prints', { skip: !fs.existsSync(GENERATOR) && 'no generator here' }, () => {
-  const out = execFileSync(process.execPath, [GENERATOR], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, env: { ...process.env, SSRF_IMPL: 'wasm' } });
+  const out = execFileSync(process.execPath, [GENERATOR], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
   assert.equal(out, fs.readFileSync(FILE, 'utf8'));
 });
 
@@ -50,12 +51,13 @@ test('limits match the loader', () => {
   assert.ok(fixtures.addresses.length >= 900 && fixtures.urls.length >= 4000);
 });
 
-test('addresses: wasm agrees with isPrivateIp exactly, and so does isPrivateIp under SSRF_IMPL=wasm', { skip: skipWasm }, async () => {
+test('addresses: wasm agrees with the JS isPrivateIpJs exactly, and so does isPrivateIp', { skip: skipWasm }, async () => {
   davParseWasm.reset();
-  await withEnv({ SSRF_IMPL: 'wasm' }, () => {
+  await withEnv({}, () => {
     for (const { address, private: priv } of fixtures.addresses) {
       assert.equal(davParseWasm.ssrfAddressesPublic([address]), !priv, address);
       assert.equal(ssrf.isPrivateIp(address), priv, address);
+      assert.equal(ssrfJs.isPrivateIpJs(address), priv, address);
     }
   });
   assert.equal(davParseWasm.ssrfAddressesPublic(['8.8.8.8', '2606:4700::1111']), true);
@@ -87,13 +89,13 @@ test('urls: wasm never accepts what the JS refuses, accepts the same host, refus
   assert.ok(extra['check:trailing_dot'] >= 1 && extra['fetch:blocked_name'] >= 1, JSON.stringify(extra));
 });
 
-test('isPublicUrl under SSRF_IMPL=wasm: same answers as the JS on every row, DNS stubbed', { skip: skipWasm }, async (t) => {
+test('isPublicUrl: same answers as the JS on every row, DNS stubbed', { skip: skipWasm }, async (t) => {
   davParseWasm.reset();
   const real = dns.promises.lookup;
   let answers = [];
   dns.promises.lookup = async () => answers;
   t.after(() => { dns.promises.lookup = real; });
-  await withEnv({ SSRF_IMPL: 'wasm' }, async () => {
+  await withEnv({}, async () => {
     for (const row of fixtures.urls) {
       if (row.loopback) continue;
       const js = row.check;
@@ -114,7 +116,7 @@ test('isPublicUrl under SSRF_IMPL=wasm: same answers as the JS on every row, DNS
   });
 });
 
-test('publicFetch under SSRF_IMPL=wasm: refuses what the JS refuses with the same error type, connects to the same host', { skip: skipWasm }, async (t) => {
+test('publicFetch: refuses what the JS refused with the same error type, connects to the same host', { skip: skipWasm }, async (t) => {
   davParseWasm.reset();
   const realHttp = http.request, realHttps = https.request;
   const NOT_CONNECTING = Symbol('not connecting');
@@ -123,7 +125,7 @@ test('publicFetch under SSRF_IMPL=wasm: refuses what the JS refuses with the sam
   t.after(() => { http.request = realHttp; https.request = realHttps; });
   const failResolve = (_h, _o, cb) => cb(Object.assign(new Error('no dns here'), { code: 'ENOTFOUND' }));
   const fetchers = { false: createPublicFetch({ resolve: failResolve }), true: createPublicFetch({ resolve: failResolve, allowLoopbackLiteral: true }) };
-  await withEnv({ SSRF_IMPL: 'wasm' }, async () => {
+  await withEnv({}, async () => {
     for (const row of fixtures.urls) {
       const js = row.fetch;
       const where = JSON.stringify(row.url);
@@ -146,9 +148,9 @@ test('publicFetch under SSRF_IMPL=wasm: refuses what the JS refuses with the sam
   });
 });
 
-test('the connect-time lookup under SSRF_IMPL=wasm refuses any private answer and keeps addresses out of the message', { skip: skipWasm }, async () => {
+test('the connect-time lookup refuses any private answer and keeps addresses out of the message', { skip: skipWasm }, async () => {
   davParseWasm.reset();
-  await withEnv({ SSRF_IMPL: 'wasm' }, async () => {
+  await withEnv({}, async () => {
     const lookupWith = (answers) => new Promise((resolve) => {
       createPublicOnlyLookup({ resolve: (_h, _o, cb) => cb(null, answers) })('svc.example', { all: true }, (err, list) => resolve({ err, list }));
     });
@@ -195,27 +197,27 @@ test('loader input checks: types, lone surrogates and the address cap', { skip: 
   assert.throws(() => davParseWasm.ssrfUrl(`http://x/${'a'.repeat(128 * 1024)}`, { mode: 'check' }), (e) => e.reason === 'too_large');
 });
 
-test('SSRF_IMPL=wasm fails closed without a usable module: private, not public, refused, startup stops', async () => {
+test('without a usable module (and no switch at all) it fails closed: private, not public, refused, startup stops', async () => {
   const missing = path.join(__dirname, 'no-such-dav-parse.wasm');
   davParseWasm.reset();
   try {
-    await withEnv({ SSRF_IMPL: 'wasm', DAV_PARSE_WASM: missing }, async () => {
+    await withEnv({ DAV_PARSE_WASM: missing }, async () => {
       assert.equal(ssrf.isPrivateIp('8.8.8.8'), true);
       assert.equal(await ssrf.isPublicUrl('http://8.8.8.8/'), false);
       const fetch = createPublicFetch({ resolve: () => { throw new Error('must not resolve'); } });
       await assert.rejects(fetch('http://8.8.8.8/'), (e) => e.code === 'EPRIVATEADDR' && !e.message.includes('8.8.8.8'));
       await assert.rejects(fetch('https://svc.example/'), (e) => e.code === 'EPRIVATEADDR');
-      assert.throws(() => davParseWasm.verifyAtStartup({ SSRF_IMPL: 'wasm', DAV_PARSE_WASM: missing }), (e) => e.flags.includes('SSRF_IMPL') && e.reason === 'missing');
+      assert.throws(() => davParseWasm.verifyAtStartup({ DAV_PARSE_WASM: missing }), (e) => e.flags.length === 0 && e.reason === 'missing');
     });
   } finally { davParseWasm.reset(); }
 });
 
-test('publicFetch under SSRF_IMPL=wasm keeps the JS scheme and credentials checks even if the module would accept', { skip: skipWasm }, async (t) => {
+test('publicFetch keeps its own scheme and credentials checks even if the module would accept', { skip: skipWasm }, async (t) => {
   const davParse = ssrf.ssrfWasm();
   // A module that accepts everything: the JS checks must still refuse first.
   t.mock.method(davParse, 'ssrfUrl', () => ({ ok: true, kind: 'name', host: 'x' }));
   const fetch = createPublicFetch({ resolve: () => { throw new Error('must not resolve'); } });
-  await withEnv({ SSRF_IMPL: 'wasm' }, async () => {
+  await withEnv({}, async () => {
     await assert.rejects(fetch('ftp://8.8.8.8/'), (e) => e instanceof TypeError && /is not http\(s\)$/.test(e.message));
     await assert.rejects(fetch('http://u:p@8.8.8.8/'), (e) => e instanceof TypeError && /credentials in the URL$/.test(e.message));
     await assert.rejects(fetch('http://:p@8.8.8.8/'), (e) => e instanceof TypeError && /credentials/.test(e.message));
@@ -225,20 +227,20 @@ test('publicFetch under SSRF_IMPL=wasm keeps the JS scheme and credentials check
   assert.equal(davParse.ssrfUrl.mock.callCount(), 1);
 });
 
-test('SSRF_IMPL: js by default, wasm when asked, anything else is js with a warning', async (t) => {
-  assert.equal(ssrf.ssrfImpl({}), 'js');
-  assert.equal(ssrf.ssrfImpl({ SSRF_IMPL: '' }), 'js');
-  assert.equal(ssrf.ssrfImpl({ SSRF_IMPL: ' WASM ' }), 'wasm');
-  const warn = t.mock.method(console, 'warn', () => {});
-  assert.equal(ssrf.ssrfImpl({ SSRF_IMPL: 'rust' }), 'js');
-  assert.equal(warn.mock.callCount(), 1);
-  assert.ok(davParseWasm.IMPL_FLAGS.includes('SSRF_IMPL'));
-  assert.deepEqual(davParseWasm.wasmFlags({ SSRF_IMPL: 'wasm' }), ['SSRF_IMPL']);
-  // The default path never touches the module, even a missing one.
-  await withEnv({ SSRF_IMPL: 'js', DAV_PARSE_WASM: path.join(__dirname, 'no-such.wasm') }, async () => {
+test('SSRF_IMPL is retired: no JS switch or reference in production, a stale =js changes nothing', async () => {
+  assert.equal(ssrf.ssrfImpl, undefined);
+  assert.equal(ssrf.isPrivateIpJs, undefined);
+  assert.equal(ssrf.isPublicUrlJs, undefined);
+  assert.ok(!davParseWasm.IMPL_FLAGS.includes('SSRF_IMPL'));
+  assert.ok(Object.hasOwn(davParseWasm.RETIRED_FLAGS, 'SSRF_IMPL'));
+  assert.deepEqual(davParseWasm.wasmFlags({ SSRF_IMPL: 'wasm' }), []);
+  // =js no longer selects the JS denylist: with the module missing nothing is public, whatever it says.
+  for (const value of ['js', 'wasm', '']) {
     davParseWasm.reset();
-    assert.equal(ssrf.isPrivateIp('8.8.8.8'), false);
-    assert.equal(await ssrf.isPublicUrl('http://8.8.8.8/'), true);
-  });
+    await withEnv({ SSRF_IMPL: value, DAV_PARSE_WASM: path.join(__dirname, 'no-such.wasm') }, async () => {
+      assert.equal(ssrf.isPrivateIp('8.8.8.8'), true, value);
+      assert.equal(await ssrf.isPublicUrl('http://8.8.8.8/'), false, value);
+    });
+  }
   davParseWasm.reset();
 });

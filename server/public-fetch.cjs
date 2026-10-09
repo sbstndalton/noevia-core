@@ -29,7 +29,7 @@ const dns = require('node:dns');
 const net = require('node:net');
 const zlib = require('node:zlib');
 const { Readable, pipeline } = require('node:stream');
-const { isPrivateIp, ssrfImpl, ssrfWasm } = require('./ssrf.cjs');
+const { isPrivateIp, ssrfWasm } = require('./ssrf.cjs');
 
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const NULL_BODY_STATUSES = new Set([101, 204, 205, 304]);
@@ -67,7 +67,7 @@ function createPublicOnlyLookup({ resolve = dns.lookup, isPublicAddress = (ip) =
 }
 
 /**
- * SSRF_IMPL=wasm (ssrf.cjs): after the JS scheme and credentials checks, the Rust port's URL check (#795). It throws
+ * The Rust port's URL check (ssrf.cjs; #795, always since #1071), after the scheme and credentials checks. It throws
  * what the JS check throws for the same URL: a TypeError for a non-http(s) scheme or credentials,
  * an EPRIVATEADDR refusal otherwise. Fails closed: an unusable module refuses the request.
  */
@@ -117,12 +117,12 @@ function createPublicFetch({ isPublicAddress = (ip) => !isPrivateIp(ip), resolve
   return async function publicFetch(input, init = {}) {
     const url = new URL(String(input));
     const host = url.hostname.replace(/^\[|\]$/g, '');
-    // The JS checks always run; under SSRF_IMPL=wasm the Rust port can only add refusals.
+    // The scheme and credentials checks run first, then the Rust port's URL check.
     if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new TypeError(`refused: ${url.protocol} is not http(s)`);
     if (url.username || url.password) throw new TypeError('refused: credentials in the URL');
-    if (ssrfImpl() === 'wasm') wasmUrlCheck(input, url, host, allowLoopbackLiteral);
-    // An IP literal is never looked up, so it is judged here instead. It cannot rebind. Under
-    // SSRF_IMPL=wasm this runs as well (the default isPublicAddress is then the Rust port too).
+    wasmUrlCheck(input, url, host, allowLoopbackLiteral);
+    // An IP literal is never looked up, so it is judged here instead. It cannot rebind. (The default
+    // isPublicAddress is the Rust port too.)
     if (net.isIP(host) && !isPublicAddress(host) && !(allowLoopbackLiteral && host === '127.0.0.1')) {
       throw refusal(`refused: ${host} is a private address`);
     }

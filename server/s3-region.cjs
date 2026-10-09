@@ -6,18 +6,10 @@
 const DEFAULT_S3_REGION = 'us-east-1';
 const S3_REGION_RE = /^[a-z0-9-]{1,32}$/;
 
-/** The JS reference rule. */
-function normalizeS3RegionJs(value) {
-  const region = String(value || '').trim().toLowerCase();
-  return S3_REGION_RE.test(region) ? region : DEFAULT_S3_REGION;
-}
-
-/** normalizeS3RegionJs or its Rust port (noevia-rs crates/s3-sign), by S3_SIGN_IMPL (default js).
- *  The wasm path fails closed: a module failure throws, it never falls back to js. */
+/** The Rust port's region rule (noevia-rs crates/s3-sign), always (since #1071). It fails closed: a
+ *  module failure throws, it never falls back to JS (the JS rule is tests/server/oracle/s3-sign.cjs). */
 function normalizeS3Region(value) {
-  // Required lazily: s3-sign.cjs pulls in the wasm loader.
-  const { s3SignImpl } = require('./s3-sign.cjs');
-  if (s3SignImpl() !== 'wasm') return normalizeS3RegionJs(value);
+  // Required lazily: the wasm loader is heavy and this module is also loaded for its constants.
   const davParseWasm = require('./dav-parse-wasm.cjs');
   try {
     return davParseWasm.s3Region(value);
@@ -28,4 +20,4 @@ function normalizeS3Region(value) {
   }
 }
 
-module.exports = { DEFAULT_S3_REGION, S3_REGION_RE, normalizeS3Region, normalizeS3RegionJs };
+module.exports = { DEFAULT_S3_REGION, S3_REGION_RE, normalizeS3Region };
