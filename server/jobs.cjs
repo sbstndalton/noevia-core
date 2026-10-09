@@ -108,7 +108,9 @@ function derive(events) {
   // Additive, read-only: a coarser vision-layer state (#512), folded above in the same loop.
   // Never affects `job.status` or any other field, and never throws — an event sequence this
   // layer can't make sense of just yields `null`.
-  job.lifecycle = lifecycleOk ? lifecycleState : null;
+  // With TASK_LIFECYCLE_IMPL=wasm the Rust port folds the same journal too; any disagreement or
+  // fault also yields `null`.
+  job.lifecycle = lifecycleOk ? taskLifecycle.confirmFold(events, lifecycleState, fold) : null;
   if (authoritative) Object.assign(job, { revision, stages });
   return job;
 }
