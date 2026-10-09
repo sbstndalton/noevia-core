@@ -16,8 +16,8 @@
 // appears only where it is private (isPrivateIp, which is the Rust port, fails closed to private
 // without the module, so the answer is the same either way). A row without `strict` is the JS's
 // own answer. A `strict` row is where the port is stricter by design (see noevia-rs
-// crates/browser-policy): a <button> in a form whose type is not button or reset, a local name
-// with a trailing dot, or text the port does not know. Its `want` is the port's answer, computed
+// crates/browser-policy): text the port does not know (#1218 and #1219 are fixed in the JS, so
+// form buttons and trailing-dot local names are ordinary rows). Its `want` is the port's answer, computed
 // here by the mirror below, and the generator checks it is never more permissive than the JS.
 
 const path = require('node:path');
@@ -38,8 +38,9 @@ const pick = (list) => list[Math.floor(rand() * list.length)];
 
 // ── The port, mirrored without ICU ──────────────────────────────────────────
 // browser_policy::KNOWN_RANGES.
-const KNOWN = [[0x0000, 0x052f], [0x1e00, 0x1fff], [0x2000, 0x206f], [0x3000, 0x30ff], [0x4e00, 0x9fff], [0xac00, 0xd7a3],
-  [0xff01, 0xff9f], [0x1f300, 0x1f6ff], [0x1f900, 0x1faff]];
+const KNOWN = [[0x0000, 0x052f], [0x0590, 0x05ff], [0x0600, 0x06ff], [0x0900, 0x097f], [0x0e00, 0x0e7f], [0x1e00, 0x1fff], [0x2000, 0x206f],
+  [0x2190, 0x21ff], [0x2500, 0x27bf], [0x3000, 0x30ff], [0x4e00, 0x9fff], [0xac00, 0xd7a3], [0xe000, 0xf8ff], [0xff01, 0xff9f], [0x1f300, 0x1f6ff],
+  [0x1f900, 0x1faff]];
 const knownCp = (cp) => KNOWN.some(([a, b]) => cp >= a && cp <= b);
 const ASCII = /^[\x00-\x7f]*$/;
 
@@ -60,8 +61,8 @@ const UNKNOWN = v(null, '');
 function portClick(el) {
   const tag = portFold(el.tag), kind = portFold(el.type);
   if (tag === null || kind === null) return UNKNOWN;
-  const buttonSubmits = kind !== 'button' && kind !== 'reset';
-  if (tag === 'button' && el.inForm && buttonSubmits && !(!kind || kind === 'submit')) touched = true;
+  const raw = el.type.replace(/[A-Z]/g, (c) => c.toLowerCase());
+  const buttonSubmits = raw !== 'button' && raw !== 'reset';
   const submits = kind === 'submit' || (tag === 'input' && kind === 'image') || (tag === 'button' && el.inForm && buttonSubmits);
   if (submits) return v('needs_approval', 'Submits a form.');
   const label = portFold([el.name, el.text, el.value].filter(Boolean).join(' '));
@@ -100,7 +101,6 @@ function portNav(rawUrl, domains) {
   let end = host.length;
   while (end > 0 && host[end - 1] === '.') end--;
   if (isLocal(host) || isLocal(host.slice(0, end))) {
-    if (!isLocal(host)) touched = true;
     return { ok: false, reason: 'Local addresses are not opened.' };
   }
   if (net.isIP(host)) {
@@ -189,7 +189,7 @@ const URLS = ['https://example.com/a', 'https://shop.example.com/cart', 'https:/
   'https://', 'https:///x', 'http:example.com', 'https:\\\\example.com\\x', 'HTTPS://EXAMPLE.COM/A', '  https://example.com/  ', 'https://exa\tmple.com/',
   'https://exa\nmple.com/', 'https://example.com/%2e%2e/x', 'https://ex%61mple.com/', 'https://example%2Ecom/', 'http://localhost:8080/',
   'http://LOCALHOST/', 'http://localhost./', 'http://localhost../', 'http://a.localhost/', 'http://a.localhost./', 'http://corp.internal/',
-  'http://corp.internal./', 'http://nas.local/', 'http://nas.local./', 'http://nas.local.:8080/', 'http://internal/', 'http://local/',
+  'http://corp.internal./', 'http://nas.local/', 'http://nas.local./', 'http://nas.local.:8080/', 'http://localhost../', 'http://corp.internal../', 'http://internal/', 'http://local/',
   'http://127.0.0.1/', 'http://127.1/', 'http://0x7f.1/', 'http://2130706433/', 'http://0177.0.0.1/', 'http://10.0.0.5/', 'http://192.168.1.1/',
   'http://172.16.0.1/', 'http://169.254.169.254/latest', 'http://0.0.0.0/', 'http://0/', 'http://[::1]/', 'http://[::]/', 'http://[fe80::1]/',
   'http://[::ffff:127.0.0.1]/', 'http://[fc00::1]/', 'http://127.0.0.1./', 'http://1.2.3.4.5/', 'http://256.0.0.1/',
@@ -223,7 +223,7 @@ classifyRow({ type: null }, undefined, PAGES[0]);
 classifyRow({ type: false }, undefined, PAGES[0]);
 
 const TAGS = ['button', 'a', 'input', 'summary', 'div', 'span', 'BUTTON', ' Button ', 'select', 'textarea', '', 'label', 'form', 'Input'];
-const ETYPES = ['', 'submit', 'button', 'reset', 'image', 'text', 'checkbox', 'radio', 'SUBMIT', 'xyz', 'Submit ', 'menu', 'Button', 'IMAGE', 'password', 'sub mit'];
+const ETYPES = [' button', 'button ', 'RESET', '', 'submit', 'button', 'reset', 'image', 'text', 'checkbox', 'radio', 'SUBMIT', 'xyz', 'Submit ', 'menu', 'Button', 'IMAGE', 'password', 'sub mit'];
 const ROLES = ['', 'button', 'link', 'menuitem', 'tab', 'switch', 'checkbox', 'radio', 'option', 'BUTTON', ' link ', 'menu', 'presentation', 'menuitemcheckbox'];
 const LABELS = ['', 'Send', 'Pay now', 'Buy', 'Place order', 'Place  order', 'place\torder', 'Delete repository', 'Publish', 'Save settings', 'Accept all cookies',
   'Jetzt kaufen', 'Loschen', 'Bestatigen', 'Supprimer', 'Envoyer le message', 'Comprar ahora', 'Eliminar cuenta', 'Next page', 'Read more', 'Documentation',
@@ -232,7 +232,7 @@ const LABELS = ['', 'Send', 'Pay now', 'Buy', 'Place order', 'Place  order', 'pl
   'Booking', 'Unsubscribe', 'Subscribe!', 'Push notifications', 'merge pull request', 'Deploy to production', 'I agree', 'Approve', 'pedir', 'borrar',
   'guardar', 'aceptar', 'payer', 'acheter', 'valider', 'zustimmen', 'akzeptieren', 'speichern', 'uberweisen', 'veroffentlichen', 'Remove item',
   'Transfer funds', 'Reserve', 'Donate', 'Confirm', 'Submit', 'Post comment', 'Purchase', 'a'.repeat(70) + ' send', 'send ' + 'b'.repeat(70),
-  'Close', 'Cancel', 'OK', 'Yes', 'Continue', ' ', 'ﬁnish', 'x\ud800', 'Se\ud83c', '؀ send', 'ok ﬃ'];
+  'Close', 'Cancel', 'OK', 'Yes', 'Continue', ' ', 'ﬁnish', 'x\ud800', 'Se\ud83c', '\u10d0 send', 'ok ﬃ'];
 for (let i = 0; i < 2500; i++) {
   const element = { tag: pick(TAGS), type: pick(ETYPES), role: pick(ROLES), inForm: rand() < 0.5 };
   for (const k of ['name', 'text', 'value']) if (rand() < 0.5) element[k] = pick(LABELS);
@@ -284,11 +284,11 @@ subRow('{{secret:0}}{{secret:length}}', 'abc', 'https://example.com');
 // Folds.
 for (const l of LABELS) if (ASCII.test(l) || l.includes('ﬁ') || l.includes('\ud800')) foldRow([l]);
 foldRow([' \t\n\v\f\r x  y ', 'A\u000bB', 'MiXeD CaSe 123', '', '   ']);
-foldRow(['؀', 'ﬁ', 'x\udc00', '\ud83d', '\u{10000}', '\u{1fb00}', 'a֐b']);
+foldRow(['\u10d0', 'ﬁ', 'x\udc00', '\ud83d', '\u{10000}', '\u{1fb00}', 'a\u0530b']);
 foldRow(TAGS.concat(ETYPES, ROLES, KEYS.filter((k) => typeof k === 'string' && ASCII.test(k))));
 
 const counts = rows.reduce((m, r) => { const k = `${r.op}${r.strict ? 's' : ''}`; m[k] = (m[k] || 0) + 1; return m; }, {});
-for (const k of ['1', '1s', '2', '2s', '3', '4', '4s']) if (!counts[k]) throw Error(`no ${k} rows`);
+for (const k of ['1', '1s', '2', '3', '4', '4s']) if (!counts[k]) throw Error(`no ${k} rows`);
 const want = (status) => rows.filter((r) => r.op === 1 && JSON.parse(r.want).status === status).length;
 if (want('allow') < 300 || want('needs_approval') < 300 || want('blocked') < 300 || want(null) < 20) throw Error(`thin coverage ${JSON.stringify(counts)}`);
 

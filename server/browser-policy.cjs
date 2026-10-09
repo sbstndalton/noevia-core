@@ -50,6 +50,9 @@ function hostAllowed(host, allowedDomains) {
   return (allowedDomains || []).some((d) => { const dom = String(d).toLowerCase().replace(/^\*?\./, '').replace(/\.$/, ''); return dom && (h === dom || h.endsWith('.' + dom)); });
 }
 
+const isLocalName = (h) => h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.internal') || h.endsWith('.local');
+const asciiLower = (t) => String(t || '').replace(/[A-Z]/g, (c) => c.toLowerCase());
+
 /**
  * Where the browser may go. Only http(s); never an IP literal on a private range, never
  * `localhost`; only allowlisted hosts. DNS-level rebinding is the egress proxy's job (D15).
@@ -60,7 +63,10 @@ function checkNavigationJs(rawUrl, allowedDomains) {
   if (url.protocol !== 'https:' && url.protocol !== 'http:') return { ok: false, reason: `${url.protocol} links are not opened.` };
   if (url.username || url.password) return { ok: false, reason: 'Addresses with embedded credentials are not opened.' };
   const host = url.hostname.replace(/^\[|\]$/g, '').toLowerCase();
-  if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.internal') || host.endsWith('.local')) return { ok: false, reason: 'Local addresses are not opened.' };
+  // #1219: `corp.internal.` is `corp.internal`; check the name without its trailing dots too.
+  let end = host.length;
+  while (end > 0 && host[end - 1] === '.') end--;
+  if (isLocalName(host) || isLocalName(host.slice(0, end))) return { ok: false, reason: 'Local addresses are not opened.' };
   if (net.isIP(host) && isPrivateIp(host)) return { ok: false, reason: 'Private network addresses are not opened.' };
   if (!hostAllowed(host, allowedDomains)) return { ok: false, reason: `${host} is not on this task’s allowed list.` };
   return { ok: true, origin: url.origin };
@@ -90,8 +96,12 @@ function classifyActionJs(action = {}, page = {}) {
   const label = fold([el.name, el.text, el.value].filter(Boolean).join(' '));
   if (type === 'click') {
     const tag = fold(el.tag), kind = fold(el.type);
-    // A <button> inside a form submits unless it says otherwise; so does <input type=submit|image>.
-    const submits = kind === 'submit' || (tag === 'input' && kind === 'image') || (tag === 'button' && el.inForm && (!kind || kind === 'submit'));
+    // <input type=submit|image> submits; so does a <button> inside a form unless it says otherwise.
+    // #1218: a <button>'s missing or invalid type is the Submit Button state; only an exact
+    // (ASCII case-insensitive) `button` or `reset` does not submit — ' button' or a full-width
+    // spelling is invalid, so it submits.
+    const buttonKind = asciiLower(el.type);
+    const submits = kind === 'submit' || (tag === 'input' && kind === 'image') || (tag === 'button' && el.inForm && buttonKind !== 'button' && buttonKind !== 'reset');
     if (submits) return { status: 'needs_approval', reason: 'Submits a form.' };
     if (CONSEQUENTIAL_RE.test(label)) return { status: 'needs_approval', reason: `“${label.slice(0, 60)}” looks consequential.` };
     return { status: 'allow', reason: '' };

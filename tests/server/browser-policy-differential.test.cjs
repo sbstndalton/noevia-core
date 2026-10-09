@@ -31,8 +31,9 @@ const WASM = { impl: 'wasm' };
 const RANK = { allow: 0, needs_approval: 1, blocked: 2 };
 
 // browser_policy::KNOWN_RANGES.
-const KNOWN = [[0x0000, 0x052f], [0x1e00, 0x1fff], [0x2000, 0x206f], [0x3000, 0x30ff], [0x4e00, 0x9fff], [0xac00, 0xd7a3],
-  [0xff01, 0xff9f], [0x1f300, 0x1f6ff], [0x1f900, 0x1faff]];
+const KNOWN = [[0x0000, 0x052f], [0x0590, 0x05ff], [0x0600, 0x06ff], [0x0900, 0x097f], [0x0e00, 0x0e7f], [0x1e00, 0x1fff], [0x2000, 0x206f],
+  [0x2190, 0x21ff], [0x2500, 0x27bf], [0x3000, 0x30ff], [0x4e00, 0x9fff], [0xac00, 0xd7a3], [0xe000, 0xf8ff], [0xff01, 0xff9f], [0x1f300, 0x1f6ff],
+  [0x1f900, 0x1faff]];
 const knownCp = (cp) => KNOWN.some(([a, b]) => cp >= a && cp <= b);
 
 function quietly(fn) {
@@ -90,7 +91,7 @@ test('fixture rows: the exact reply; the switched rules equal the JS, or (strict
       assert.deepEqual(quietly(() => bp.substituteSecrets(text, secrets, origin, WASM)), bp.substituteSecretsJs(text, secrets, origin), `row ${i}`);
     }
   }
-  assert.ok(strict > 300, `${strict} strict rows`);
+  assert.ok(strict > 200, `${strict} strict rows`);
 });
 
 /** Fold `texts` through the port in batches; every known one must equal this runtime's fold. */
@@ -108,7 +109,10 @@ function checkFolds(texts, label) {
 
 test('every code point of the fold table folds as this runtime does: alone, between letters, doubled, with marks', { skip: skipWasm }, () => {
   let checked = 0;
-  const MARKS = ['́', '̣́', '̣́', 'ͅ', '゙', '҃'];
+  // Latin, Greek, kana and Cyrillic marks, and the new scripts' (Hebrew points, Arabic harakat and
+  // shadda, Devanagari nukta/virama, Thai vowels/tones), in both canonical orders where they differ.
+  const MARKS = ['\u0301', '\u0323\u0301', '\u0301\u0323', '\u0345', '\u3099', '\u0483', '\u05b0', '\u05bc\u05b8', '\u05b8\u05bc',
+    '\u0651\u064e', '\u064e\u0651', '\u0670', '\u093c\u094d', '\u094d\u093c', '\u0e38\u0e48', '\u0e48\u0e38'];
   for (const [a, b] of KNOWN) {
     const batch = [];
     for (let cp = a; cp <= b; cp++) {

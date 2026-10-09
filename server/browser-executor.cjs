@@ -50,7 +50,8 @@ function describeInPage(target) {
   const form = el.form || (el.closest && el.closest('form'));
   return {
     tag: el.tagName.toLowerCase(),
-    type: el.getAttribute('type') || '',
+    // A button's DOM type is its real state (an invalid attribute is 'submit'); #1218.
+    type: el.tagName === 'BUTTON' ? el.type : (el.getAttribute('type') || ''),
     role: el.getAttribute('role') || '',
     name: text(el.getAttribute('aria-label') || byId || label || el.getAttribute('title') || el.getAttribute('alt') || ''),
     text: text(el.innerText || el.textContent || ''),
