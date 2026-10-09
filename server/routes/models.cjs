@@ -266,7 +266,9 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
             if (m) options[m[1]] = m[2];
           }
           const refusal = await modelManager.presetRefusal(name, Object.fromEntries(Object.entries(options).filter(([, v]) => typeof v === 'string' && v !== '')));
-          if (refusal) return json(res, 409, refusal);
+          // #1158: an invalid size is a bad request, not a revision conflict. The client reads 409 as
+          // "the settings file changed" and tells the person to reload, which hid the real reason.
+          if (refusal) return json(res, refusal.code === 'invalid_size' ? 400 : 409, refusal);
         }
       }
       if(method!=='GET')modelScanCache.clear();

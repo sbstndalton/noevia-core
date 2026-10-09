@@ -533,3 +533,16 @@ test('pinModel gets the task’s signal: a pin stuck in admission is ended by th
   assert.equal(cancelled.job.status, 'cancelled');
   assert.equal(cancelled.job.lifecycle, 'blocked');
 });
+
+test('#1157: a task blocked before the agent starts still carries its prompt and branch', async () => {
+  const run = await runPipeline({ pin: async () => ({ ok: false, reason: 'no model is loaded' }) });
+  assert.equal(run.job.status, 'failed');
+  assert.match(run.job.error, /No model was pinned for this task: no model is loaded/);
+  assert.equal(run.sent.length, 0, 'the agent never started');
+  assert.equal(run.view.task, 'Make the widget return two.');
+  assert.equal(typeof run.view.branch, 'string');
+  assert.ok(run.view.branch.length > 0);
+  assert.equal(run.view.baseSha, git(run.source, 'rev-parse', 'main'));
+  const long = await runPipeline({ pin: async () => ({ ok: false, reason: 'x' }) });
+  assert.ok(long.view.task.length <= 120);
+});
