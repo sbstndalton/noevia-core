@@ -1955,3 +1955,20 @@ test('#1079 the engine listing marks a model and its long profile once the secti
   assert.equal(rows['synthetic-long'].long_of, 'synthetic');
   assert.equal(rows.embed.long_variant, null);
 });
+
+test('noevia#1133: the KV ceilings are planned with the JS estimate, so LLAMACPP_AUTOCONFIG_IMPL=wasm (even with no usable module) keeps them', async t => {
+  const davParseWasm = require('./dav-parse-wasm.cjs');
+  const saved = { impl: process.env.LLAMACPP_AUTOCONFIG_IMPL, file: process.env.DAV_PARSE_WASM };
+  process.env.LLAMACPP_AUTOCONFIG_IMPL = 'wasm';
+  process.env.DAV_PARSE_WASM = require('node:path').join(require('node:os').tmpdir(), 'no-such-dav-parse.wasm');
+  davParseWasm.reset();
+  t.after(() => {
+    for (const [k, v] of [['LLAMACPP_AUTOCONFIG_IMPL', saved.impl], ['DAV_PARSE_WASM', saved.file]]) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    davParseWasm.reset();
+  });
+  const f = fixture(t, { autotuneExtra: { planFacts: async () => DENSE_64K, budgetGib: () => 6 } });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager), kv = phase(j.models[0], 'kv');
+  assert.deepEqual(kv.value.candidates.map(c => [c.kv, c.ceiling]), [['bf16', 12288], ['q8_0', 24576]]);
+  assert.equal(kv.value.kv, 'q8_0');
+});
