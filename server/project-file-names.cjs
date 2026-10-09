@@ -19,6 +19,17 @@
 // like an escape attempt (`..` or `.` segments, an absolute or drive path, backslashes, control
 // characters, percent-encoded dots/separators) are refused outright rather than matched, so a
 // traversal-shaped argument can never succeed by accident of a suffix match either.
+//
+// PROJECT_FILE_NAMES_IMPL=js|wasm (default js; any other value means js, with one warning), read from
+// the `env` option (process.env) on every call of resolveProjectFile. wasm also asks noevia-rs's
+// project-file-names crate (dav-parse.wasm project_file_names) with the project's file names and the
+// raw argument. The JS answer is computed first; a name resolves only when the port resolves it to
+// the same file. A JS refusal (invalid, missing, ambiguous) is returned as is, without asking. When
+// the port refuses, faults, replies badly or names another file, nothing resolves: code
+// 'unverified' with a model-readable error (logged once per reason, name-free). The port reads no
+// normalization tables: a name, or a file name it is compared with, outside its NFC-inert set
+// (see the crate docs) is refused, so such names do not resolve under wasm. The flag is in
+// dav-parse-wasm.cjs IMPL_FLAGS (a missing or tampered module stops startup).
 
 const MAX_NAME = 1024;
 
@@ -46,7 +57,7 @@ const norm = (s) => String(s).normalize('NFC');
  * @returns {{file?: any, error?: string, code?: 'invalid'|'missing'|'ambiguous', candidates?: string[]}}
  *   `file` on success; otherwise `error` (model-readable), `code`, and `candidates` when ambiguous.
  */
-function resolveProjectFile(project, raw) {
+function resolveProjectFileJs(project, raw) {
   const files = project && Array.isArray(project.files) ? project.files.filter((f) => f && typeof f.name === 'string') : [];
   const reason = invalidReason(raw);
   const shown = JSON.stringify(typeof raw === 'string' ? raw.slice(0, 200) : String(raw ?? ''));
@@ -64,4 +75,52 @@ function resolveProjectFile(project, raw) {
   return { code: 'missing', error: `no project file named ${shown}. Available: ${names}` };
 }
 
-module.exports = { resolveProjectFile, invalidReason, MAX_NAME };
+// ── PROJECT_FILE_NAMES_IMPL ─────────────────────────────────────────────────
+
+const IMPLS = new Set(['js', 'wasm']);
+let warnedImpl = '';
+/** PROJECT_FILE_NAMES_IMPL: 'js' (default) or 'wasm'. */
+function projectFileNamesImpl(env = process.env) {
+  const raw = env?.PROJECT_FILE_NAMES_IMPL;
+  if (raw === undefined || raw === '') return 'js';
+  const value = String(raw).trim().toLowerCase();
+  if (IMPLS.has(value)) return value;
+  if (warnedImpl !== value) {
+    warnedImpl = value;
+    console.warn(`[project-file-names] PROJECT_FILE_NAMES_IMPL=${JSON.stringify(String(raw))} is not js or wasm; using js`);
+  }
+  return 'js';
+}
+const defaultLoader = () => require('./dav-parse-wasm.cjs');
+const implOf = ({ env = process.env, impl = projectFileNamesImpl(env) } = {}) => impl;
+
+const warnedPort = new Set();
+function portWarn(event, reason) {
+  const key = `${event}:${reason}`;
+  if (warnedPort.has(key)) return;
+  warnedPort.add(key);
+  console.warn(`[project-file-names] ${event} (${reason}); the name was not resolved`);
+}
+
+/**
+ * resolveProjectFileJs (above), confirmed by the Rust port under PROJECT_FILE_NAMES_IMPL=wasm: a
+ * name resolves only when both resolve it to the same file. Options: `env`, `impl`, `wasmLoader`.
+ * @returns {{file?: any, error?: string, code?: 'invalid'|'missing'|'ambiguous'|'unverified', candidates?: string[]}}
+ */
+function resolveProjectFile(project, raw, { wasmLoader = defaultLoader, ...opts } = {}) {
+  const js = resolveProjectFileJs(project, raw);
+  if (!js.file || implOf(opts) !== 'wasm') return js;
+  const files = project.files.filter((f) => f && typeof f.name === 'string');
+  let port = null;
+  try {
+    port = wasmLoader().projectFileNames(files.map((f) => f.name), raw);
+  } catch (err) {
+    portWarn('project_file_names.wasm_fault', String(err?.reason || 'unexpected').slice(0, 40));
+  }
+  if (port && port.file === files.indexOf(js.file)) return js;
+  if (port) portWarn('project_file_names.impl_mismatch', port.code || 'file');
+  const shown = JSON.stringify(/** @type {string} */ (raw).slice(0, 200));
+  return { code: 'unverified', error: `${shown} could not be confirmed as exactly one project file, so nothing was read or changed. Use a name exactly as listed.` };
+}
+
+module.exports = { resolveProjectFile, resolveProjectFileJs, invalidReason, projectFileNamesImpl, MAX_NAME };

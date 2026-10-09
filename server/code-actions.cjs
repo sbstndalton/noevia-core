@@ -10,6 +10,24 @@
 //  * ACP permission is evidence of intent, not the boundary. The spike showed an agent writing
 //    and running commands in its own process without asking; the OS sandbox and the workspace
 //    root are what actually contain it. Nothing here may be read as making that unnecessary.
+//
+// CODE_ACTIONS_IMPL=js|wasm (default js; any other value means js, with one warning), read from the
+// `env` option (process.env) on every call of classify, decide and pickOption. wasm also asks
+// noevia-rs's code-actions crate (dav-parse.wasm code_actions) for the same answer. The JS answer is
+// always computed first and is the only one returned as is, and only when the port's reply is
+// byte-identical to JSON.stringify of it: an action is auto-allowed, stands, or is answered with an
+// allow option only when both say so. When the JS throws, the port is not asked. When the port
+// refuses, faults, replies badly or disagrees (logged once per reason, command-text free):
+//   - classify hands back the JS classification made stricter: approval 'always', simple and
+//     standable false, the union of both answers' classes and paths, the worse action, and
+//     `unverified: true`. decide() then never allows it and a standing approval never covers it;
+//   - decide answers at least 'ask' ('deny' when the JS or the port says deny);
+//   - pickOption answers { outcome: 'cancelled' } (a refusal), unless the JS already cancelled.
+// The port is sent only what each function reads (classifyInput, decideInput, pickInput). The flag
+// is in dav-parse-wasm.cjs IMPL_FLAGS (a missing or tampered module stops startup). Stricter than the
+// JS (the crate docs): a command array element that is not a string, boolean, null or safe integer;
+// in the network branch of decide, a URL host outside the plain-ASCII, non-IP-shorthand subset; more
+// than 64 MiB-units of reading work or `find -exec find` nested past 64 levels; input over 8 MiB.
 
 /** noevia's action classes (spec §3 "Permissions"). */
 const ACTIONS = Object.freeze({
@@ -477,7 +495,7 @@ function commandOf(rawInput) {
  * @returns {{action: string, approval: 'never'|'always'|'capability', command: string, paths: string[], readable: boolean,
  *            actions: string[], simple: boolean, standable: boolean}}
  */
-function classify(call = {}) {
+function classifyJs(call = {}) {
   const kind = typeof call.kind === 'string' ? call.kind : '';
   // An unknown kind is not a read. Treat it like `other`.
   let action = Object.prototype.hasOwnProperty.call(KIND_ACTIONS, kind) ? KIND_ACTIONS[kind] : ACTIONS.EXECUTE;
@@ -513,11 +531,11 @@ function approvalFor(action) {
  * widen mid-run. Everything else asks. `deny` is for what the job may not do at all: a write
  * outside the workspace root, or a class the job was never granted.
  *
- * @param {{classified: ReturnType<typeof classify>, capabilities?: string[], domains?: string[],
+ * @param {{classified: ReturnType<typeof classifyJs>, capabilities?: string[], domains?: string[],
  *          inWorkspace?: boolean|null}} input
  * @returns {{decision: 'allow'|'ask'|'deny', reason: string}}
  */
-function decide({ classified, capabilities = [], domains = [], inWorkspace = null } = {}) {
+function decideJs({ classified, capabilities = [], domains = [], inWorkspace = null } = {}) {
   const { action, approval, command, readable, paths } = classified;
   const all = Array.isArray(classified.actions) && classified.actions.length ? classified.actions : [action];
   // Containment first: an edit or delete outside the worktree is refused, never offered — also
@@ -584,7 +602,7 @@ function hostOf(command) {
  * @param {Array<{optionId: string, kind?: string}>} options
  * @param {'allow_once'|'allow_always'|'reject_once'|'reject_always'} wanted
  */
-function pickOption(options, wanted) {
+function pickOptionJs(options, wanted) {
   const list = (Array.isArray(options) ? options : []).filter((o) => o && typeof o.optionId === 'string');
   const byKind = (kind) => list.find((o) => o.kind === kind || o.optionId === kind);
   const order = wanted.startsWith('allow')
@@ -595,4 +613,140 @@ function pickOption(options, wanted) {
   return { outcome: 'cancelled' };
 }
 
-module.exports = { ACTIONS, KIND_ACTIONS, COMMAND_KEYS, classify, classifyCommand, analyzeCommand, commandOf, approvalFor, worst, decide, pickOption, hostOf };
+// ── CODE_ACTIONS_IMPL ───────────────────────────────────────────────────────
+
+const IMPLS = new Set(['js', 'wasm']);
+let warnedImpl = '';
+/** CODE_ACTIONS_IMPL: 'js' (default) or 'wasm'. */
+function codeActionsImpl(env = process.env) {
+  const raw = env?.CODE_ACTIONS_IMPL;
+  if (raw === undefined || raw === '') return 'js';
+  const value = String(raw).trim().toLowerCase();
+  if (IMPLS.has(value)) return value;
+  if (warnedImpl !== value) {
+    warnedImpl = value;
+    console.warn(`[code-actions] CODE_ACTIONS_IMPL=${JSON.stringify(String(raw))} is not js or wasm; using js`);
+  }
+  return 'js';
+}
+const defaultLoader = () => require('./dav-parse-wasm.cjs');
+const implOf = ({ env = process.env, impl = codeActionsImpl(env) } = {}) => impl;
+
+const warnedPort = new Set();
+function portWarn(event, reason) {
+  const key = `${event}:${reason}`;
+  if (warnedPort.has(key)) return;
+  warnedPort.add(key);
+  console.warn(`[code-actions] ${event} (${reason}); the call was handled as unverified`);
+}
+
+/** The port's `{ text, reply }`, or null after a refusal or fault (logged). */
+function askPort(what, ask) {
+  try {
+    return ask();
+  } catch (err) {
+    portWarn(`code_actions.${what}.wasm_fault`, String(err?.reason || 'unexpected').slice(0, 40));
+    return null;
+  }
+}
+
+// What classify() reads of a call, each value as commandOf reads it: a string as is, an array's
+// elements as String() reads them when that is fixed (strings, booleans, null, finite numbers; any
+// other element becomes {} and the port refuses), anything else null (not a command).
+const projectElement = (e) => (typeof e === 'string' || typeof e === 'boolean' || e === null
+  || (typeof e === 'number' && Number.isFinite(e)) ? e : {});
+const projectValue = (v) => (typeof v === 'string' ? v : Array.isArray(v) ? Array.from(v, projectElement) : null);
+function classifyInput(call) {
+  const raw = call.rawInput;
+  let rawInput = null;
+  if (raw && typeof raw === 'object') {
+    rawInput = {};
+    for (const key of [...COMMAND_KEYS, 'args']) {
+      const value = raw[key];
+      if (value !== undefined) rawInput[key] = projectValue(value);
+    }
+    rawInput.noeviaOutsideWorkspace = raw.noeviaOutsideWorkspace === true;
+  }
+  return {
+    kind: typeof call.kind === 'string' ? call.kind : null,
+    rawInput,
+    locations: Array.isArray(call.locations) ? Array.from(call.locations, (l) => (l && typeof l.path === 'string' ? l.path : null)) : [],
+  };
+}
+
+/** The JS classification made stricter after the port refused or disagreed (see the header). */
+function unverifiedClassification(js, port) {
+  const actions = [...js.actions], paths = [...js.paths];
+  let action = js.action;
+  if (port) {
+    for (const a of port.actions) if (!actions.includes(a)) actions.push(a);
+    for (const p of port.paths) if (!paths.includes(p)) paths.push(p);
+    action = worst(action, port.action);
+  }
+  return { ...js, action, approval: 'always', paths, actions, simple: false, standable: false, unverified: true };
+}
+
+/**
+ * Classify one ACP tool call (classifyJs), confirmed by the Rust port under CODE_ACTIONS_IMPL=wasm.
+ * Options: `env`, `impl`, `wasmLoader`.
+ */
+function classify(call = {}, { wasmLoader = defaultLoader, ...opts } = {}) {
+  const js = classifyJs(call);
+  if (implOf(opts) !== 'wasm') return js;
+  const port = askPort('classify', () => wasmLoader().codeActionsClassify(classifyInput(call)));
+  if (port && port.text === JSON.stringify(js)) return js;
+  if (port) portWarn('code_actions.classify.impl_mismatch', 'reply');
+  return unverifiedClassification(js, port && port.reply);
+}
+
+const isStrings = (a) => Array.isArray(a) && a.every((x) => typeof x === 'string');
+/** What decide() reads, shape-checked (a classification from classify() always passes). */
+function decideInput({ classified: c, capabilities = [], domains = [], inWorkspace = null }) {
+  const actions = Array.isArray(c?.actions) ? c.actions : [];
+  if (!c || typeof c !== 'object' || typeof c.action !== 'string' || typeof c.approval !== 'string'
+    || typeof c.command !== 'string' || typeof c.readable !== 'boolean' || typeof c.simple !== 'boolean'
+    || !isStrings(c.paths) || !isStrings(actions) || !isStrings(capabilities) || !isStrings(domains)
+    || !(inWorkspace === true || inWorkspace === false || inWorkspace === null)) {
+    throw Object.assign(new Error('decide input has an unexpected shape'), { reason: 'input' });
+  }
+  return [{ action: c.action, approval: c.approval, command: c.command, readable: c.readable, paths: c.paths,
+    actions, simple: c.simple }, capabilities, domains, inWorkspace];
+}
+
+const UNVERIFIED_ASK = 'This action could not be verified, so a person has to approve it.';
+const UNVERIFIED_DENY = 'This action could not be verified, so it was refused.';
+
+/**
+ * What noevia does with one classified call (decideJs), confirmed by the Rust port under
+ * CODE_ACTIONS_IMPL=wasm: never more permissive than either. Options: `env`, `impl`, `wasmLoader`.
+ */
+function decide(input = {}, { wasmLoader = defaultLoader, ...opts } = {}) {
+  const js = decideJs(input);
+  if (js.decision === 'deny' || implOf(opts) !== 'wasm') return js;
+  const port = askPort('decide', () => wasmLoader().codeActionsDecide(...decideInput(input)));
+  if (port && port.text === JSON.stringify(js)) return js;
+  if (port) portWarn('code_actions.decide.impl_mismatch', 'reply');
+  const decision = port && port.reply.decision === 'deny' ? 'deny' : 'ask';
+  if (decision === js.decision) return js;
+  return { decision, reason: decision === 'deny' ? UNVERIFIED_DENY : UNVERIFIED_ASK };
+}
+
+/** What pickOption() reads of the offered options. */
+const pickInput = (options) => (Array.isArray(options) ? Array.from(options, (o) => (o && typeof o.optionId === 'string'
+  ? { optionId: o.optionId, kind: typeof o.kind === 'string' ? o.kind : null } : null)) : []);
+
+/**
+ * The ACP permission option for a human decision (pickOptionJs), confirmed by the Rust port under
+ * CODE_ACTIONS_IMPL=wasm; on any doubt the request is cancelled. Options: `env`, `impl`, `wasmLoader`.
+ */
+function pickOption(options, wanted, { wasmLoader = defaultLoader, ...opts } = {}) {
+  const js = pickOptionJs(options, wanted);
+  if (js.outcome !== 'selected' || implOf(opts) !== 'wasm') return js;
+  const port = askPort('pick', () => wasmLoader().codeActionsPick(pickInput(options), wanted));
+  if (port && port.text === JSON.stringify(js)) return js;
+  if (port) portWarn('code_actions.pick.impl_mismatch', 'reply');
+  return { outcome: 'cancelled' };
+}
+
+module.exports = { ACTIONS, KIND_ACTIONS, COMMAND_KEYS, classify, classifyCommand, analyzeCommand, commandOf, approvalFor, worst, decide, pickOption, hostOf,
+  classifyJs, decideJs, pickOptionJs, classifyInput, decideInput, pickInput, codeActionsImpl, UNVERIFIED_ASK, UNVERIFIED_DENY, lex };
