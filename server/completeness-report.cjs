@@ -239,35 +239,20 @@ function reportHash(report) {
   return crypto.createHash('sha256').update(canonical(report)).digest('hex');
 }
 
-// ── COMPLETENESS_REPORT_IMPL ────────────────────────────────────────────────
-// js (default; any other value means js, with one warning) or wasm, read from the `env` option
-// (process.env) on every call. wasm also asks noevia-rs's completeness-report crate (dav-parse.wasm
-// completeness_report) for the same report. The JS report is always what is returned, and it is
-// handed out as is only when the port gives the byte-identical canonical JSON and hash (or, for a
-// report reportHash refuses, the same refusal and statuses). A port refusal, fault, bad reply or any
-// disagreement returns the JS report marked `unverified` ('impl_refused' / 'impl_mismatch'), with
-// `overall` 'fail' if the JS said fail and 'unknown' otherwise; canEnterReviewing() is false for it,
-// so the port can keep a task out of `reviewing` but never let one in. Logged once per reason,
-// text-free. When the JS throws, the port is not asked. The flag is in dav-parse-wasm.cjs IMPL_FLAGS
-// (a missing or tampered module stops startup).
+// ── Rust confirmation (COMPLETENESS_REPORT_IMPL, retired in #1071: always on) ──────────────
+// buildCompletenessReport also asks noevia-rs's completeness-report crate (dav-parse.wasm
+// completeness_report) for the same report. The JS report (buildCompletenessReportJs) is still the
+// authority and is always what is returned, and it is handed out as is only when the port gives the
+// byte-identical canonical JSON and hash (or, for a report reportHash refuses, the same refusal and
+// statuses). A port refusal, fault, bad reply or any disagreement returns the JS report marked
+// `unverified` ('impl_refused' / 'impl_mismatch'), with `overall` 'fail' if the JS said fail and
+// 'unknown' otherwise; canEnterReviewing() is false for it, so the port can keep a task out of
+// `reviewing` but never let one in. Logged once per reason, text-free. When the JS throws, the port
+// is not asked. A missing or tampered module stops startup.
 // Stricter than the JS (the crate docs): a truthy non-array `uncertain`, an expectedArtifacts string
 // or one holding non-strings, a not-completed step whose id or status is an object or array, and a
 // job over 8 MiB as JSON (or one JSON.stringify cannot write) are refused, so marked unverified.
 
-const IMPLS = new Set(['js', 'wasm']);
-let warnedImpl = '';
-/** COMPLETENESS_REPORT_IMPL: 'js' (default) or 'wasm'. */
-function completenessReportImpl(env = process.env) {
-  const raw = env?.COMPLETENESS_REPORT_IMPL;
-  if (raw === undefined || raw === '') return 'js';
-  const value = String(raw).trim().toLowerCase();
-  if (IMPLS.has(value)) return value;
-  if (warnedImpl !== value) {
-    warnedImpl = value;
-    console.warn(`[completeness-report] COMPLETENESS_REPORT_IMPL=${JSON.stringify(String(raw))} is not js or wasm; using js`);
-  }
-  return 'js';
-}
 const defaultLoader = () => require('./dav-parse-wasm.cjs');
 
 const warnedPort = new Set();
@@ -304,12 +289,11 @@ function unverified(report, reason) {
 }
 
 /**
- * The completeness report, as buildCompletenessReportJs. With COMPLETENESS_REPORT_IMPL=wasm
- * confirmed by the Rust port (see above). Options: `env`, `impl`, `wasmLoader`.
+ * The completeness report, as buildCompletenessReportJs, confirmed by the Rust port (see above).
+ * Option: `wasmLoader`.
  */
-function buildCompletenessReport(input = {}, { env = process.env, impl = completenessReportImpl(env), wasmLoader = defaultLoader } = {}) {
+function buildCompletenessReport(input = {}, { wasmLoader = defaultLoader } = {}) {
   const report = buildCompletenessReportJs(input);
-  if (impl !== 'wasm') return report;
   let port;
   try {
     port = wasmLoader().completenessReport(input.job, input.expectedArtifacts ?? null);
@@ -326,4 +310,4 @@ function buildCompletenessReport(input = {}, { env = process.env, impl = complet
   return report;
 }
 
-module.exports = { reportHash, CHECK_NAMES, TEST_STEP_IDS, TEST_ARTIFACT_KIND, buildCompletenessReport, buildCompletenessReportJs, canEnterReviewing, completenessReportImpl };
+module.exports = { reportHash, CHECK_NAMES, TEST_STEP_IDS, TEST_ARTIFACT_KIND, buildCompletenessReport, buildCompletenessReportJs, canEnterReviewing };

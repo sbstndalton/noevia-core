@@ -1,6 +1,6 @@
 'use strict';
 
-// LLAMACPP_AUTOCONFIG_IMPL: tests/fixtures/llamacpp-autoconfig.v1.json (byte-identical to noevia-rs
+// llama.cpp autoconfig (LLAMACPP_AUTOCONFIG_IMPL, retired in #1071: the port always confirms the JS): tests/fixtures/llamacpp-autoconfig.v1.json (byte-identical to noevia-rs
 // crates/llamacpp-autoconfig/tests/fixtures/; CI compares them) holds llamacpp-autoconfig.cjs's
 // answers (suggest, estimateInputs, estimateFootprint and the helpers) as the exact replies the Rust
 // port must give, printed by tools/gen-llamacpp-autoconfig-fixtures.cjs from the JS itself
@@ -25,7 +25,7 @@ const GENERATOR = path.join(__dirname, '../../tools/gen-llamacpp-autoconfig-fixt
 const fixtures = JSON.parse(fs.readFileSync(FILE, 'utf8'));
 const wasmFile = process.env.DAV_PARSE_WASM || davParseWasm.DEFAULT_WASM;
 const skipWasm = !fs.existsSync(wasmFile) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
-const WASM = { impl: 'wasm' };
+const WASM = {};
 const SWITCHED = { 1: ac.suggest, 2: ac.estimateInputs, 3: ac.estimateFootprint };
 const JS = { 1: ac.suggestJs, 2: ac.estimateInputsJs, 3: ac.estimateFootprintJs };
 const GIB = 1024 ** 3;
@@ -61,7 +61,7 @@ test('throws rows are refused as input (the JS throws, so the port is never aske
     assert.throws(() => davParseWasm.llamacppAutoconfig(row.op, args), (e) => e.reason === 'input', `throws row ${i}`);
     if (SWITCHED[row.op]) {
       let asked = false;
-      assert.throws(() => SWITCHED[row.op](args, { impl: 'wasm', wasmLoader: () => { asked = true; return davParseWasm; } }), `throws row ${i}: the JS throws`);
+      assert.throws(() => SWITCHED[row.op](args, { wasmLoader: () => { asked = true; return davParseWasm; } }), `throws row ${i}: the JS throws`);
       assert.equal(asked, false);
     }
   }

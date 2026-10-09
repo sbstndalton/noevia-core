@@ -108,7 +108,7 @@ function derive(events) {
   // Additive, read-only: a coarser vision-layer state (#512), folded above in the same loop.
   // Never affects `job.status` or any other field, and never throws — an event sequence this
   // layer can't make sense of just yields `null`.
-  // With TASK_LIFECYCLE_IMPL=wasm the Rust port folds the same journal too; any disagreement or
+  // The Rust port (TASK_LIFECYCLE_IMPL, retired in #1071) folds the same journal too; any disagreement or
   // fault also yields `null`.
   job.lifecycle = lifecycleOk ? taskLifecycle.confirmFold(events, lifecycleState, fold) : null;
   if (authoritative) Object.assign(job, { revision, stages });
@@ -132,7 +132,7 @@ function boundAuthorityEvent(id, type, data, current, known) {
   let state;
   try { state = taskLifecycle.foldEvents(current, taskLifecycle.INITIAL_STATE, { authoritative: true }); }
   catch (error) {
-    // A TASK_LIFECYCLE_IMPL refusal (impl_refused / impl_mismatch) says nothing about the journal
+    // A Rust-confirmation refusal (impl_refused / impl_mismatch) says nothing about the journal
     // itself (#1127).
     if (error instanceof taskLifecycle.TaskLifecycleError) {
       throw lifecycleConflict(String(error.code || '').startsWith('impl_')
@@ -165,7 +165,7 @@ function boundAuthorityEvent(id, type, data, current, known) {
     const report = buildCompletenessReport({ job: { ...revisionWindow(current, known), id }, expectedArtifacts: expected ?? null });
     if (!canEnterReviewing(report)) {
       const open = report.checks.filter((c) => c.status !== 'pass').map((c) => `${c.name}: ${c.status}`);
-      if (report.unverified) open.push(`unverified: ${report.unverified}`); // COMPLETENESS_REPORT_IMPL=wasm
+      if (report.unverified) open.push(`unverified: ${report.unverified}`); // the Rust confirmation (COMPLETENESS_REPORT_IMPL, retired)
       throw lifecycleConflict(`The completeness report does not allow review (${open.join('; ')})`);
     }
     out.reportHash = reportHash(report);

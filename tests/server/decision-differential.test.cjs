@@ -1,11 +1,11 @@
 'use strict';
 
-// DECISION_IMPL: tests/fixtures/decision.v1.json (byte-identical to noevia-rs
+// Decision (DECISION_IMPL, retired in #1071): tests/fixtures/decision.v1.json (byte-identical to noevia-rs
 // crates/decision/tests/fixtures/; CI compares them) holds decision/index.cjs's invalidRequest,
 // invalidResult and causeOf answers over dav-parse-wasm.cjs's own projection, printed by
-// tools/gen-decision-fixtures.cjs from the JS itself (synthetic values only). Here every row runs
+// tools/gen-decision-fixtures.cjs from the JS references (tests/server/oracle/decision.cjs; synthetic values only). Here every row runs
 // through dav-parse.wasm's decision call and must agree (a refusal where the JS throws); then
-// seeded live requests and answers, whole decide() calls under both settings, the switch, and the
+// seeded live requests and answers, whole decide() calls against the JS reference's verdicts, the retired switch, and the
 // fail-closed paths: a fault never lets a backend's answer through. The WebAssembly half needs
 // server/wasm/dav-parse.wasm (or DAV_PARSE_WASM); skipped without it unless DAV_PARSE_WASM_REQUIRED=1.
 
@@ -17,6 +17,7 @@ const test = require('node:test');
 
 const davParseWasm = require('../../server/dav-parse-wasm.cjs');
 const decision = require('../../server/decision/index.cjs');
+const oracle = require('./oracle/decision.cjs');
 
 const FILE = path.join(__dirname, '../fixtures/decision.v1.json');
 const GENERATOR = path.join(__dirname, '../../tools/gen-decision-fixtures.cjs');
@@ -66,21 +67,21 @@ test('seeded live requests and answers agree; a fault only where the JS throws',
   let faults = 0;
   for (let i = 0; i < 3000; i++) {
     const r = request();
-    const jsReq = attempt(() => decision.invalidRequestJs(r));
-    const wasmReq = quiet(() => decision.invalidRequest(r, { impl: 'wasm' }));
+    const jsReq = attempt(() => oracle.invalidRequestJs(r));
+    const wasmReq = quiet(() => decision.invalidRequest(r));
     if (jsReq && jsReq.throws) { assert.equal(wasmReq, decision.REQUEST_FAULT, `iteration ${i}`); faults++; } else assert.equal(wasmReq, jsReq, `iteration ${i}: request`);
     const res = result();
-    const jsRes = attempt(() => decision.invalidResultJs(r, res));
-    const wasmRes = quiet(() => decision.invalidResult(r, res, { impl: 'wasm' }));
+    const jsRes = attempt(() => oracle.invalidResultJs(r, res));
+    const wasmRes = quiet(() => decision.invalidResult(r, res));
     if (jsRes && jsRes.throws) { assert.equal(wasmRes, decision.RESULT_FAULT, `iteration ${i}`); faults++; } else assert.equal(wasmRes, jsRes, `iteration ${i}: result`);
   }
   assert.ok(faults > 100, `${faults} faults`);
   for (const e of [new TypeError('fetch failed'), Object.assign(new Error('x'), { reason: 'http-502' }), new SyntaxError('x'), null, 'x', { deadline: true }]) {
-    assert.equal(decision.causeOf(e, { impl: 'wasm' }), decision.causeOfJs(e));
+    assert.equal(decision.causeOf(e), oracle.causeOfJs(e));
   }
 });
 
-test('whole decide() calls: the same answer under both settings', { skip: skipWasm }, async () => {
+test('whole decide() calls: the answer the JS reference\'s checks call for', { skip: skipWasm }, async () => {
   const items = [{ id: 'a' }, { id: 'b' }, { id: 'c' }];
   const fallback = { selected: ['c', 'b', 'a'], scores: { a: 0, b: 0, c: 0 } };
   const answers = [
@@ -88,14 +89,42 @@ test('whole decide() calls: the same answer under both settings', { skip: skipWa
     { selected: ['a'], scores: { z: 1 } }, { selected: ['a'], scores: { a: '1' } }, null, { scores: {} },
   ];
   const errors = [Object.assign(new Error('x'), { reason: 'http-503' }), new TypeError('fetch failed'), new SyntaxError('x')];
-  const run = async (impl, answer, error, request) => {
+  const run = async (answer, error, request) => {
     const logs = [];
     const backend = { locality: 'local', supports: () => true, decide: async () => { if (error) throw error; return answer; } };
-    const d = createWith(impl, backend, logs);
-    const out = await d.decide(request);
-    return { out, logs };
+    const d = decision.createDecisions({ backends: { b: backend }, chains: { p: ['b'] }, log: (e) => logs.push(e), now: () => 0 });
+    return { out: await d.decide(request), logs };
   };
-  const createWith = (impl, backend, logs) => decision.createDecisions({ backends: { b: backend }, chains: { p: ['b'] }, log: (e) => logs.push(e), now: () => 0, impl });
+  // What the JS reference's checks call for, which the Rust-only decide() must reproduce.
+  let served = 0, invalidRequests = 0, invalidResults = 0, failed = 0;
+  const expectOne = async (answer, error, request) => {
+    const { out, logs } = await run(answer, error, request);
+    const badRequest = attempt(() => oracle.invalidRequestJs(request));
+    if (badRequest) {
+      invalidRequests++;
+      assert.equal(out.source, 'fallback');
+      assert.equal(out.metadata.fellBack, `invalid-request: ${badRequest.throws ? decision.REQUEST_FAULT : badRequest}`);
+      return;
+    }
+    if (error) {
+      failed++;
+      assert.equal(out.source, 'fallback');
+      assert.equal(out.metadata.cause, oracle.causeOfJs(error));
+      assert.equal(logs[0].failed, String(error.message));
+      return;
+    }
+    const badResult = attempt(() => oracle.invalidResultJs(request, answer));
+    if (badResult) {
+      invalidResults++;
+      assert.equal(out.source, 'fallback');
+      assert.equal(out.metadata.cause, 'invalid-result');
+      assert.match(logs[0].failed, /^invalid: /);
+      return;
+    }
+    served++;
+    assert.equal(out.source, 'b');
+    assert.deepStrictEqual(out.selected, answer.selected);
+  };
   const requests = [
     { kind: 'rank', purpose: 'p', items, fallback, constraints: { deadlineMs: 100 } },
     { kind: 'rank', purpose: 'p', items: [], fallback, constraints: { deadlineMs: 100 } },
@@ -103,22 +132,25 @@ test('whole decide() calls: the same answer under both settings', { skip: skipWa
     { kind: 'score', purpose: 'p', fallback, constraints: {} },
   ];
   for (const request of requests) {
-    for (const answer of answers) assert.deepStrictEqual(await run('wasm', answer, null, request), await run('js', answer, null, request));
-    for (const error of errors) assert.deepStrictEqual(await run('wasm', null, error, request), await run('js', null, error, request));
+    for (const answer of answers) await expectOne(answer, null, request);
+    for (const error of errors) await expectOne(null, error, request);
   }
+  assert.ok(served > 0 && invalidRequests > 0 && invalidResults > 0 && failed > 0, `${served} ${invalidRequests} ${invalidResults} ${failed}`);
 });
 
-test('DECISION_IMPL: default js, wasm by name, anything else js with one warning', () => {
-  assert.equal(decision.decisionImpl({}), 'js');
-  assert.equal(decision.decisionImpl({ DECISION_IMPL: 'Wasm ' }), 'wasm');
-  const warn = console.warn, seen = [];
-  console.warn = (m) => seen.push(m);
+test('DECISION_IMPL is retired: no switch, no JS checks in production', () => {
+  for (const gone of ['decisionImpl', 'invalidRequestJs', 'invalidResultJs', 'causeOfJs']) assert.equal(decision[gone], undefined, gone);
+  assert.ok(!davParseWasm.IMPL_FLAGS.includes('DECISION_IMPL'));
+  assert.equal(davParseWasm.RETIRED_FLAGS.DECISION_IMPL, 'wasm');
+  // An old =js is ignored: a faulting port still makes the request invalid (no fallback to JS checks).
+  const saved = process.env.DECISION_IMPL;
+  process.env.DECISION_IMPL = 'js';
   try {
-    assert.equal(decision.decisionImpl({ DECISION_IMPL: 'yes' }), 'js');
-    assert.equal(decision.decisionImpl({ DECISION_IMPL: 'yes' }), 'js');
-  } finally { console.warn = warn; }
-  assert.equal(seen.length, 1);
-  assert.ok(davParseWasm.IMPL_FLAGS.includes('DECISION_IMPL'));
+    const trap = () => { throw Object.assign(new Error('trap'), { reason: 'trap' }); };
+    const valid = { kind: 'rank', purpose: 'p', items: [{ id: 'a' }], fallback: { selected: ['a'] }, constraints: { deadlineMs: 100 } };
+    assert.equal(oracle.invalidRequestJs(valid), null);
+    assert.equal(quiet(() => decision.invalidRequest(valid, { wasmLoader: () => ({ decisionInvalidRequest: trap }) })), decision.REQUEST_FAULT);
+  } finally { if (saved === undefined) delete process.env.DECISION_IMPL; else process.env.DECISION_IMPL = saved; }
 });
 
 test('fail closed: a fault makes the request or the answer invalid, and the fallback answers', async () => {
@@ -129,26 +161,26 @@ test('fail closed: a fault makes the request or the answer invalid, and the fall
   const backend = { locality: 'local', supports: () => true, decide: async () => { reached++; return { selected: ['a'], scores: { a: 1 } }; } };
   const trap = () => { throw Object.assign(new Error('trap'), { reason: 'trap' }); };
   // invalidRequest faults: the backend is never reached.
-  const d1 = decision.createDecisions({ backends: { b: backend }, chains: { p: ['b'] }, impl: 'wasm', wasmLoader: () => ({ decisionInvalidRequest: trap }) });
+  const d1 = decision.createDecisions({ backends: { b: backend }, chains: { p: ['b'] }, wasmLoader: () => ({ decisionInvalidRequest: trap }) });
   const r1 = await quiet(() => d1.decide(request));
   assert.equal(r1.source, 'fallback');
   assert.match(r1.metadata.fellBack, /could not be checked/);
   assert.equal(reached, 0);
   // invalidResult faults: the backend's answer is never used.
-  const d2 = decision.createDecisions({ backends: { b: backend }, chains: { p: ['b'] }, impl: 'wasm', wasmLoader: () => ({ decisionInvalidRequest: () => null, decisionInvalidResult: trap }) });
+  const d2 = decision.createDecisions({ backends: { b: backend }, chains: { p: ['b'] }, wasmLoader: () => ({ decisionInvalidRequest: () => null, decisionInvalidResult: trap }) });
   const r2 = await quiet(() => d2.decide(request));
   assert.equal(r2.source, 'fallback');
   assert.equal(r2.metadata.cause, 'invalid-result');
   assert.equal(reached, 1);
-  assert.equal(quiet(() => decision.causeOf(new TypeError('fetch failed'), { impl: 'wasm', wasmLoader: () => ({ decisionCauseOf: trap }) })), 'exception');
+  assert.equal(quiet(() => decision.causeOf(new TypeError('fetch failed'), { wasmLoader: () => ({ decisionCauseOf: trap }) })), 'exception');
   // A missing module.
   const saved = process.env.DAV_PARSE_WASM;
   process.env.DAV_PARSE_WASM = path.join(__dirname, 'no-such-dav-parse.wasm');
   try {
     davParseWasm.reset();
-    assert.equal(quiet(() => decision.invalidRequest(request, { impl: 'wasm' })), decision.REQUEST_FAULT);
-    assert.equal(quiet(() => decision.invalidResult(request, { selected: ['a'], scores: { a: 1 } }, { impl: 'wasm' })), decision.RESULT_FAULT);
-    assert.throws(() => davParseWasm.verifyAtStartup({ DECISION_IMPL: 'wasm', DAV_PARSE_WASM: process.env.DAV_PARSE_WASM }), /DECISION_IMPL/);
+    assert.equal(quiet(() => decision.invalidRequest(request)), decision.REQUEST_FAULT);
+    assert.equal(quiet(() => decision.invalidResult(request, { selected: ['a'], scores: { a: 1 } })), decision.RESULT_FAULT);
+    assert.throws(() => davParseWasm.verifyAtStartup({ DAV_PARSE_WASM: process.env.DAV_PARSE_WASM }, { hostname: () => 'ss.io' }), /dav-parse\.wasm \(always required\) failed verification \(missing\)/);
   } finally {
     if (saved === undefined) delete process.env.DAV_PARSE_WASM; else process.env.DAV_PARSE_WASM = saved;
     davParseWasm.reset();
@@ -158,17 +190,17 @@ test('fail closed: a fault makes the request or the answer invalid, and the fall
 test('strict: identities, sparse arrays and object coercion are faults, never a pass', { skip: skipWasm }, () => {
   const shared = { k: 1 };
   const r = { kind: 'choice', purpose: 'p', options: [{ id: shared }], fallback: {}, constraints: { deadlineMs: 5 } };
-  assert.equal(decision.invalidResultJs(r, { scores: {}, selected: shared }), null);
-  assert.equal(quiet(() => decision.invalidResult(r, { scores: {}, selected: shared }, { impl: 'wasm' })), decision.RESULT_FAULT);
+  assert.equal(oracle.invalidResultJs(r, { scores: {}, selected: shared }), null);
+  assert.equal(quiet(() => decision.invalidResult(r, { scores: {}, selected: shared })), decision.RESULT_FAULT);
   const rank = { kind: 'rank', purpose: 'p', items: [{ id: 'a' }, { id: 'b' }], fallback: {}, constraints: { deadlineMs: { valueOf: () => 5 } } };
-  assert.equal(decision.invalidRequestJs(rank), null);
-  assert.equal(quiet(() => decision.invalidRequest(rank, { impl: 'wasm' })), decision.REQUEST_FAULT);
+  assert.equal(oracle.invalidRequestJs(rank), null);
+  assert.equal(quiet(() => decision.invalidRequest(rank)), decision.REQUEST_FAULT);
   // Over the entry cap a ranking is not iterated; within it, the same answer.
   const many = Array.from({ length: davParseWasm.DECISION_ENTRIES + 1 }, (_, i) => ({ id: `i${i}` }));
   const big = { ...rank, constraints: { deadlineMs: 5 }, items: many };
-  assert.equal(quiet(() => decision.invalidRequest(big, { impl: 'wasm' })), null);
-  assert.equal(quiet(() => decision.invalidResult(big, { scores: {}, selected: ['i1'] }, { impl: 'wasm' })), decision.RESULT_FAULT);
+  assert.equal(quiet(() => decision.invalidRequest(big)), null);
+  assert.equal(quiet(() => decision.invalidResult(big, { scores: {}, selected: ['i1'] })), decision.RESULT_FAULT);
   const fit = { ...big, items: many.slice(0, davParseWasm.DECISION_ENTRIES) };
   const sel = fit.items.map((o) => o.id).reverse();
-  assert.equal(decision.invalidResult(fit, { scores: { i0: 1 }, selected: sel }, { impl: 'wasm' }), decision.invalidResultJs(fit, { scores: { i0: 1 }, selected: sel }));
+  assert.equal(decision.invalidResult(fit, { scores: { i0: 1 }, selected: sel }), oracle.invalidResultJs(fit, { scores: { i0: 1 }, selected: sel }));
 });

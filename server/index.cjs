@@ -58,6 +58,22 @@ const DIARY_BASE = process.env.DIARY_BASE_URL || 'http://cowork-diary-companion:
 // Per-request Diary tenant assertion key (M2, docs/spec-managed-diary.md). Deploy the sidecar first.
 const DIARY_TENANT_KEY = (process.env.DIARY_TENANT_KEY || '').trim();
 const DIARY_SOURCE = process.env.DIARY_SOURCE || 'sidecar';
+// #996, #1071: dav-parse.wasm is always required (the retired switches' Rust paths have no JS twin),
+// and so is any *_IMPL=wasm switch's: a missing or tampered module refuses to start, rather than
+// failing closed on every request (for SECRET_ENVELOPE_IMPL: every stored credential). Checked
+// first, before the auth tokens (decided in Rust since POLICY_LEAVES_IMPL was retired) and the code
+// network guard below read the module, so a missing module stops startup with this one clear line.
+if (require.main === module) {
+  const davParseWasm = require('./dav-parse-wasm.cjs');
+  davParseWasm.warnRetiredFlags();
+  try {
+    const wasmFlags = davParseWasm.verifyAtStartup();
+    console.log(`[dav-parse] dav-parse.wasm verified${wasmFlags.length ? ` for ${wasmFlags.join(', ')}` : ''}`);
+  } catch (err) {
+    console.error(`FATAL: ${err.message}. Restore the pinned module (server/dav-parse.lock).`);
+    process.exit(1);
+  }
+}
 // #294: DIARY_AUTH_TOKEN and UI_AUTH_TOKEN are independent — see auth-tokens.cjs.
 const authTokens = require('./auth-tokens.cjs').resolveAuthTokens(process.env);
 const DIARY_TOKEN = authTokens.diaryToken;
@@ -1090,18 +1106,6 @@ async function handleRequest(req,res) {
 let processReady = false;
 
 if (require.main === module) {
-  // #996, #1071: dav-parse.wasm is always required (the retired switches' Rust paths have no JS
-  // twin), and so is any *_IMPL=wasm switch's: a missing or tampered module refuses to start,
-  // rather than failing closed on every request (for SECRET_ENVELOPE_IMPL: every stored credential).
-  const davParseWasm = require('./dav-parse-wasm.cjs');
-  davParseWasm.warnRetiredFlags();
-  try {
-    const wasmFlags = davParseWasm.verifyAtStartup();
-    console.log(`[dav-parse] dav-parse.wasm verified${wasmFlags.length ? ` for ${wasmFlags.join(', ')}` : ''}`);
-  } catch (err) {
-    console.error(`FATAL: ${err.message}. Restore the pinned module (server/dav-parse.lock).`);
-    process.exit(1);
-  }
   fs.mkdirSync(DATA_DIR, { recursive: true });
   authTokens.warnings.forEach((w) => console.warn(w));
   if (!DIARY_TENANT_KEY) console.warn('WARNING: DIARY_TENANT_KEY is unset; Diary calls carry no tenant assertion and remote storage secrets ride on every call.');

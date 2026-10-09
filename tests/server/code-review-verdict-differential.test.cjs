@@ -1,11 +1,11 @@
 'use strict';
 
-// CODE_REVIEW_VERDICT_IMPL: tests/fixtures/code-review-verdict.v1.json (byte-identical to noevia-rs
+// Review verdict (CODE_REVIEW_VERDICT_IMPL, retired in #1071): tests/fixtures/code-review-verdict.v1.json (byte-identical to noevia-rs
 // crates/review-verdict/tests/fixtures/; CI compares them) holds what code-review-verdict.cjs
 // readVerdict and boundReviewEvent return, printed by tools/gen-code-review-verdict-fixtures.cjs
-// from the JS itself (synthetic text only). Here every row runs through dav-parse.wasm's
+// from the JS references (tests/server/oracle/code-review-verdict.cjs; synthetic text only). Here every row runs through dav-parse.wasm's
 // review_verdict and must agree exactly (-0 included); a row marked `stricter` may instead take the
-// JS's own failure path. Then seeded live JS-vs-wasm verdicts and events, the switch, the reply
+// JS's own failure path. Then seeded live JS-vs-wasm verdicts and events, the retired switch, the reply
 // checks and the fail-closed paths. The WebAssembly half needs server/wasm/dav-parse.wasm (or
 // DAV_PARSE_WASM); skipped without it unless DAV_PARSE_WASM_REQUIRED=1.
 
@@ -17,6 +17,7 @@ const test = require('node:test');
 
 const davParseWasm = require('../../server/dav-parse-wasm.cjs');
 const verdict = require('../../server/code-review-verdict.cjs');
+const oracle = require('./oracle/code-review-verdict.cjs');
 
 const FILE = path.join(__dirname, '../fixtures/code-review-verdict.v1.json');
 const GENERATOR = path.join(__dirname, '../../tools/gen-code-review-verdict-fixtures.cjs');
@@ -49,7 +50,7 @@ async function withEnv(vars, fn) {
 }
 
 test('the fixture file is what the generator prints', { skip: !fs.existsSync(GENERATOR) && 'no generator here' }, () => {
-  const out = execFileSync(process.execPath, [GENERATOR], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, env: { ...process.env, CODE_REVIEW_VERDICT_IMPL: 'wasm' } });
+  const out = execFileSync(process.execPath, [GENERATOR], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, env: { ...process.env } });
   assert.equal(out, fs.readFileSync(FILE, 'utf8'));
 });
 
@@ -64,8 +65,8 @@ test('read rows: the same verdict or the same ReviewVerdictError through the Rus
     const raw = untag(row.raw);
     const want = row.want.ok ? { ok: untag(row.want.ok) } : { error: row.want.error };
     // (An opaque value's contents are not in the fixture, so only full rows replay in the JS.)
-    if (!row.stricter) assert.deepStrictEqual(outcome(() => verdict.readVerdictJs(raw)), want, `row ${i} (js)`);
-    const got = outcome(() => verdict.readVerdictWasm(raw));
+    if (!row.stricter) assert.deepStrictEqual(outcome(() => oracle.readVerdictJs(raw)), want, `row ${i} (js)`);
+    const got = outcome(() => verdict.readVerdict(raw));
     if (row.stricter && got.error === verdict.FAULT_MESSAGE) {
       // An object the port is not shown: it refuses, which is ReviewVerdictError (never a verdict).
       assert.equal(got.error, verdict.FAULT_MESSAGE, `row ${i} (stricter)`);
@@ -80,8 +81,8 @@ test('read rows: the same verdict or the same ReviewVerdictError through the Rus
 test('bound rows: the same event through the Rust port, -0 included', { skip: skipWasm }, () => {
   fixtures.bound.forEach((row, i) => {
     const type = untag(row.type), data = untag(row.data), want = untag(row.want);
-    if (!row.stricter) assert.deepStrictEqual(verdict.boundReviewEventJs(type, data), want, `row ${i} (js)`);
-    const got = verdict.boundReviewEventWasm(type, data);
+    if (!row.stricter) assert.deepStrictEqual(oracle.boundReviewEventJs(type, data), want, `row ${i} (js)`);
+    const got = verdict.boundReviewEvent(type, data);
     if (row.stricter && got.status === 'failed' && got.code === 'invalid') {
       assert.equal(got.code, 'invalid', `row ${i} (stricter)`);
       return;
@@ -90,7 +91,7 @@ test('bound rows: the same event through the Rust port, -0 included', { skip: sk
     if (Object.is(want.files, -0)) assert.ok(Object.is(got.files, -0), `row ${i}: -0`);
   });
   // The default for a missing data argument.
-  assert.deepStrictEqual(verdict.boundReviewEventWasm('review.requested'), verdict.boundReviewEventJs('review.requested'));
+  assert.deepStrictEqual(verdict.boundReviewEvent('review.requested'), oracle.boundReviewEventJs('review.requested'));
 });
 
 test('seeded live verdicts and events agree', { skip: skipWasm }, () => {
@@ -122,31 +123,24 @@ test('seeded live verdicts and events agree', { skip: skipWasm }, () => {
   };
   for (let i = 0; i < 3000; i++) {
     const r = raw();
-    assert.deepStrictEqual(outcome(() => verdict.readVerdictWasm(r)), outcome(() => verdict.readVerdictJs(r)), `read ${i}: ${JSON.stringify(r)}`);
+    assert.deepStrictEqual(outcome(() => verdict.readVerdict(r)), outcome(() => oracle.readVerdictJs(r)), `read ${i}: ${JSON.stringify(r)}`);
     const data = rnd(10) ? { ...(r && typeof r === 'object' ? r : {}), baseSha: scalar(), headSha: pick(['abcdef0', 'ABCDEF0', str()]), files: scalar(), code: scalar(), reason: scalar(), corrected: scalar() } : scalar();
     const type = pick(['review.requested', 'review.failed', 'review.completed', 'review.x', 5]);
-    const want = verdict.boundReviewEventJs(type, data), got = verdict.boundReviewEventWasm(type, data);
+    const want = oracle.boundReviewEventJs(type, data), got = verdict.boundReviewEvent(type, data);
     assert.deepStrictEqual(got, want, `bound ${i}`);
     assert.equal(Object.is(got.files, -0), Object.is(want.files, -0), `bound ${i}: -0`);
   }
 });
 
-test('CODE_REVIEW_VERDICT_IMPL: default js, wasm by name, anything else js with one warning', { skip: skipWasm }, async () => {
-  assert.equal(verdict.codeReviewVerdictImpl({}), 'js');
-  assert.equal(verdict.codeReviewVerdictImpl({ CODE_REVIEW_VERDICT_IMPL: ' WASM ' }), 'wasm');
-  const warn = console.warn, seen = [];
-  console.warn = (m) => seen.push(m);
-  try {
-    assert.equal(verdict.codeReviewVerdictImpl({ CODE_REVIEW_VERDICT_IMPL: 'rust' }), 'js');
-    assert.equal(verdict.codeReviewVerdictImpl({ CODE_REVIEW_VERDICT_IMPL: 'rust' }), 'js');
-  } finally { console.warn = warn; }
-  assert.equal(seen.length, 1);
-  assert.ok(davParseWasm.IMPL_FLAGS.includes('CODE_REVIEW_VERDICT_IMPL'));
-  // Under wasm the public functions go through the port: an object it is not shown fails closed.
-  await withEnv({ CODE_REVIEW_VERDICT_IMPL: 'wasm' }, () => {
+test('CODE_REVIEW_VERDICT_IMPL is retired: no switch, no JS twin in production, an object the port is not shown fails closed', { skip: skipWasm }, async () => {
+  for (const gone of ['codeReviewVerdictImpl', 'readVerdictJs', 'boundReviewEventJs', 'readVerdictWasm', 'boundReviewEventWasm']) assert.equal(verdict[gone], undefined, gone);
+  assert.ok(!davParseWasm.IMPL_FLAGS.includes('CODE_REVIEW_VERDICT_IMPL'));
+  assert.equal(davParseWasm.RETIRED_FLAGS.CODE_REVIEW_VERDICT_IMPL, 'wasm');
+  // An old =js changes nothing: the public functions go through the port.
+  await withEnv({ CODE_REVIEW_VERDICT_IMPL: 'js' }, () => {
     const inst = new Opaque();
     Object.assign(inst, { verdict: 'approve', summary: 'S.', findings: [] });
-    assert.deepStrictEqual(verdict.readVerdictJs(inst), { verdict: 'approve', summary: 'S.', findings: [] });
+    assert.deepStrictEqual(oracle.readVerdictJs(inst), { verdict: 'approve', summary: 'S.', findings: [] });
     assert.throws(() => verdict.readVerdict(inst), { name: 'ReviewVerdictError', message: verdict.FAULT_MESSAGE });
     assert.deepStrictEqual(verdict.readVerdict({ verdict: 'approve', summary: ' S. ', findings: [] }), { verdict: 'approve', summary: 'S.', findings: [] });
     assert.equal(verdict.boundReviewEvent('review.requested', { files: 2 }).files, 2);
@@ -173,12 +167,12 @@ test('fail closed: a missing module throws ReviewVerdictError and keeps a failed
   const warn = console.warn;
   console.warn = () => {};
   try {
-    await withEnv({ DAV_PARSE_WASM: path.join(__dirname, 'no-such-dav-parse.wasm'), CODE_REVIEW_VERDICT_IMPL: 'wasm' }, () => {
+    await withEnv({ DAV_PARSE_WASM: path.join(__dirname, 'no-such-dav-parse.wasm'), CODE_REVIEW_VERDICT_IMPL: 'js' }, () => {
       davParseWasm.reset();
       assert.throws(() => verdict.readVerdict({ verdict: 'approve', summary: 'S.', findings: [] }), { name: 'ReviewVerdictError', message: verdict.FAULT_MESSAGE });
       assert.deepStrictEqual(verdict.boundReviewEvent('review.completed', { verdict: 'approve', summary: 'S.', findings: [], baseSha: 'abcdef0' }),
         { status: 'failed', reviewer: 'planner', baseSha: null, headSha: null, code: 'invalid', reason: 'The recorded verdict could not be read.' });
-      assert.throws(() => davParseWasm.verifyAtStartup({ CODE_REVIEW_VERDICT_IMPL: 'wasm', DAV_PARSE_WASM: process.env.DAV_PARSE_WASM }), /CODE_REVIEW_VERDICT_IMPL/);
+      assert.throws(() => davParseWasm.verifyAtStartup({ DAV_PARSE_WASM: process.env.DAV_PARSE_WASM }, { hostname: () => 'ss.io' }), /dav-parse\.wasm \(always required\) failed verification \(missing\)/);
     });
   } finally { console.warn = warn; davParseWasm.reset(); }
 });

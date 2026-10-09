@@ -14,10 +14,13 @@
 //   bound: { type: T, data: T, want: T, stricter? }                       boundReviewEvent(type, data)
 // `stricter: true` marks a row whose input holds ['x'] (an object the port is not shown): there the
 // port may refuse ('opaque'), which the host turns into the JS's own failure path.
+//
+// The JS references (retired from production in #1071, so they live with the tests):
+//   tests/server/oracle/code-review-verdict.cjs
 
 const path = require('node:path');
 const server = path.join(__dirname, '..', 'server');
-const { readVerdictJs, boundReviewEventJs } = require(path.join(server, 'code-review-verdict.cjs'));
+const { readVerdictJs, boundReviewEventJs } = require(path.join(__dirname, '..', 'tests', 'server', 'oracle', 'code-review-verdict.cjs'));
 const { reviewTag } = require(path.join(server, 'dav-parse-wasm.cjs'));
 
 const hasOpaque = (t) => Array.isArray(t) && (t[0] === 'x' || t.some(hasOpaque));

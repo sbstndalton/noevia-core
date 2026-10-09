@@ -1,11 +1,11 @@
 'use strict';
 
-// MCP_SERVERS_IMPL: tests/fixtures/mcp-servers.v1.json (byte-identical to noevia-rs
+// MCP servers (MCP_SERVERS_IMPL, retired in #1071): tests/fixtures/mcp-servers.v1.json (byte-identical to noevia-rs
 // crates/mcp-servers/tests/fixtures/; CI compares them) holds mcp-servers.cjs's server lists and
 // warnings, box filters and toolboxOffered answers, printed by tools/gen-mcp-servers-fixtures.cjs
-// from the JS itself (synthetic URLs and names only). Here every row runs through dav-parse.wasm's
-// mcp_servers and through parseMcpServers with the switch on, and must agree, warnings included;
-// then seeded live lists, the switch, and the fail-closed paths: a fault or a reply the JS would
+// from the JS references (tests/server/oracle/mcp-servers.cjs; synthetic URLs and names only). Here every row runs through dav-parse.wasm's
+// mcp_servers and through parseMcpServers, and must agree, warnings included;
+// then seeded live lists, the retired switch, and the fail-closed paths: a fault or a reply the JS would
 // not accept configures no server. The WebAssembly half needs server/wasm/dav-parse.wasm (or
 // DAV_PARSE_WASM); skipped without it unless DAV_PARSE_WASM_REQUIRED=1.
 
@@ -17,6 +17,7 @@ const test = require('node:test');
 
 const davParseWasm = require('../../server/dav-parse-wasm.cjs');
 const mcp = require('../../server/mcp-servers.cjs');
+const oracle = require('./oracle/mcp-servers.cjs');
 
 const FILE = path.join(__dirname, '../fixtures/mcp-servers.v1.json');
 const GENERATOR = path.join(__dirname, '../../tools/gen-mcp-servers-fixtures.cjs');
@@ -39,8 +40,8 @@ function envOf(row) {
   return env;
 }
 
-/** parseMcpServers under one setting: the servers and every warning printed. */
-const parseWith = (impl, env, opts) => capture(() => mcp.parseMcpServers({ ...env, MCP_SERVERS_IMPL: impl }, opts));
+/** The servers and every warning printed, by the JS reference ('js') or the Rust-only production function ('wasm'). */
+const parseWith = (impl, env, opts) => capture(() => (impl === 'js' ? oracle.parseMcpServersJs(env) : mcp.parseMcpServers(env, opts)));
 
 test('the fixture file is what the generator prints', { skip: !fs.existsSync(GENERATOR) && 'no generator here' }, () => {
   const out = execFileSync(process.execPath, [GENERATOR], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
@@ -67,11 +68,11 @@ test('strict rows: the port refuses and no server is configured', { skip: skipWa
 test('box filter and toolboxOffered rows', { skip: skipWasm }, () => {
   fixtures.toolboxes.forEach((row, i) => {
     assert.deepStrictEqual(davParseWasm.mcpToolboxes(row.enabled || null), row.want, `row ${i}`);
-    const set = mcp.parseEnabledToolboxes(row.enabled === null ? { MCP_SERVERS_IMPL: 'wasm' } : { ENABLED_TOOLBOXES: row.enabled, MCP_SERVERS_IMPL: 'wasm' });
+    const set = mcp.parseEnabledToolboxes(row.enabled === null ? {} : { ENABLED_TOOLBOXES: row.enabled });
     assert.deepStrictEqual(set === null ? null : [...set], row.want, `row ${i} (switch)`);
   });
   fixtures.offered.forEach((row, i) => {
-    const offered = mcp.createToolboxOffered(row.enabled === null ? null : new Set(row.enabled), { impl: 'wasm' });
+    const offered = mcp.createToolboxOffered(row.enabled === null ? null : new Set(row.enabled));
     assert.equal(offered(row.id), row.want, `row ${i}`);
   });
 });
@@ -108,36 +109,32 @@ test('seeded live lists agree, or the port refuses and configures nothing', { sk
   assert.ok(refused < 100, `${refused} refused`);
 });
 
-test('MCP_SERVERS_IMPL: default js, wasm by name, anything else js with one warning', () => {
-  assert.equal(mcp.mcpServersImpl({}), 'js');
-  assert.equal(mcp.mcpServersImpl({ MCP_SERVERS_IMPL: ' WASM ' }), 'wasm');
-  const seen = capture(() => [mcp.mcpServersImpl({ MCP_SERVERS_IMPL: 'rust' }), mcp.mcpServersImpl({ MCP_SERVERS_IMPL: 'rust' })]);
-  assert.deepStrictEqual(seen.value, ['js', 'js']);
-  assert.equal(seen.warnings.length, 1);
-  assert.ok(davParseWasm.IMPL_FLAGS.includes('MCP_SERVERS_IMPL'));
-  // The JS path never touches the module.
+test('MCP_SERVERS_IMPL is retired: no switch, no JS parsing in production, an old =js still asks the port', () => {
+  for (const gone of ['mcpServersImpl', 'parseMcpServersJs', 'parseEnabledToolboxesJs', 'createToolboxOfferedJs']) assert.equal(mcp[gone], undefined, gone);
+  assert.ok(!davParseWasm.IMPL_FLAGS.includes('MCP_SERVERS_IMPL'));
+  assert.equal(davParseWasm.RETIRED_FLAGS.MCP_SERVERS_IMPL, 'wasm');
   let loads = 0;
-  const loader = () => { loads++; throw new Error('not loaded'); };
-  const env = { MCP_SERVERS: 'a|http://h.example|none' };
-  assert.deepStrictEqual(capture(() => mcp.parseMcpServers(env, { wasmLoader: loader })).value, [{ id: 'a', url: 'http://h.example', auth: 'none' }]);
-  assert.equal(loads, 0);
+  const loader = () => { loads++; throw new Error('not usable'); };
+  const env = { MCP_SERVERS: 'a|http://h.example|none', MCP_SERVERS_IMPL: 'js' };
+  assert.deepStrictEqual(capture(() => mcp.parseMcpServers(env, { wasmLoader: loader })).value, [], 'no JS fallback: a port that cannot answer configures nothing');
+  assert.equal(loads, 1);
 });
 
 test('fail closed: a missing module, a refusal or a reply the JS would not accept configures nothing', async () => {
   const quiet = (fn) => capture(fn).value;
-  const env = { MCP_SERVERS: 'a|http://h.example|none,i|http://127.0.0.1/|internal', MCP_SERVERS_IMPL: 'wasm' };
+  const env = { MCP_SERVERS: 'a|http://h.example|none,i|http://127.0.0.1/|internal' };
   const saved = process.env.DAV_PARSE_WASM;
   process.env.DAV_PARSE_WASM = path.join(__dirname, 'no-such-dav-parse.wasm');
   try {
     davParseWasm.reset();
     assert.deepStrictEqual(quiet(() => mcp.parseMcpServers(env)), []);
-    assert.deepStrictEqual(quiet(() => mcp.parseEnabledToolboxes({ ENABLED_TOOLBOXES: 'a', MCP_SERVERS_IMPL: 'wasm' })), new Set());
-    const offered = quiet(() => mcp.createToolboxOffered(new Set(['a']), { impl: 'wasm' }));
+    assert.deepStrictEqual(quiet(() => mcp.parseEnabledToolboxes({ ENABLED_TOOLBOXES: 'a' })), new Set());
+    const offered = quiet(() => mcp.createToolboxOffered(new Set(['a'])));
     assert.equal(quiet(() => offered('a')), false);
     // core and dir-* stay offered exactly as the JS offers them, whatever the port does.
     assert.equal(quiet(() => offered('core')), true);
     assert.equal(quiet(() => offered('dir-x')), true);
-    assert.throws(() => davParseWasm.verifyAtStartup({ MCP_SERVERS_IMPL: 'wasm', DAV_PARSE_WASM: process.env.DAV_PARSE_WASM }), /MCP_SERVERS_IMPL/);
+    assert.throws(() => davParseWasm.verifyAtStartup({ DAV_PARSE_WASM: process.env.DAV_PARSE_WASM }, { hostname: () => 'ss.io' }), /dav-parse\.wasm \(always required\) failed verification \(missing\)/);
   } finally {
     if (saved === undefined) delete process.env.DAV_PARSE_WASM; else process.env.DAV_PARSE_WASM = saved;
     davParseWasm.reset();
@@ -155,7 +152,7 @@ test('fail closed: a missing module, a refusal or a reply the JS would not accep
     [{ id: 'a', url: 'http://h.example', auth: 'bearer' }],
     [{ id: 'a', url: 'http://h.example', auth: 'root' }],
   ];
-  const benv = { MCP_SERVERS: 'a|http://h.example|none,i|http://127.0.0.1/|internal,j|http://localhost/|none', MCP_SERVERS_IMPL: 'wasm' };
+  const benv = { MCP_SERVERS: 'a|http://h.example|none,i|http://127.0.0.1/|internal,j|http://localhost/|none' };
   for (const [i, servers] of bad.entries()) assert.deepStrictEqual(quiet(() => mcp.parseMcpServers(benv, stub(servers))), [], `bad reply ${i}`);
   // A good reply passes through, and a bearer warning is printed only when its variable is unset.
   const good = stub([{ id: 'a', url: 'http://h.example', auth: 'bearer', tokenEnv: 'TOK' }], [{ bearer: 'TOK', id: 'a' }]);
@@ -167,13 +164,13 @@ test('fail closed: a missing module, a refusal or a reply the JS would not accep
   // The same bearer reply against an operator entry that asked for none is an upgrade: nothing.
   assert.deepStrictEqual(quiet(() => mcp.parseMcpServers(benv, good)), []);
   // A value that is not a string is a fault, never a guess.
-  assert.deepStrictEqual(quiet(() => mcp.parseMcpServers({ MCP_SERVERS: 5, MCP_SERVERS_IMPL: 'wasm' }, good)), []);
+  assert.deepStrictEqual(quiet(() => mcp.parseMcpServers({ MCP_SERVERS: 5 }, good)), []);
 });
 
 test('list mode binds every returned server to its operator entry, auth included (#1113)', () => {
   const quiet = (fn) => capture(fn).value;
   const stub = (servers) => ({ wasmLoader: () => ({ mcpServersParse: () => ({ servers, warnings: [] }) }) });
-  const env = { MCP_SERVERS: ' a | http://h.example | none , b|http://k.example|bearer:TOK_A, c|http://c.example|nextcloud', MCP_SERVERS_IMPL: 'wasm' };
+  const env = { MCP_SERVERS: ' a | http://h.example | none , b|http://k.example|bearer:TOK_A, c|http://c.example|nextcloud' };
   const honest = [
     { id: 'a', url: 'http://h.example', auth: 'none' },
     { id: 'b', url: 'http://k.example', auth: 'bearer', tokenEnv: 'TOK_A' },
@@ -192,32 +189,32 @@ test('list mode binds every returned server to its operator entry, auth included
   ];
   for (const [i, servers] of forged.entries()) assert.deepStrictEqual(quiet(() => mcp.parseMcpServers(env, stub(servers))), [], `forged reply ${i}`);
   // Same id and URL twice: the JS takes the first, so only the first entry's auth binds.
-  const twice = { MCP_SERVERS: 'a|http://h.example|none,a|http://h.example|nextcloud', MCP_SERVERS_IMPL: 'wasm' };
+  const twice = { MCP_SERVERS: 'a|http://h.example|none,a|http://h.example|nextcloud' };
   assert.deepStrictEqual(quiet(() => mcp.parseMcpServers(twice, stub([{ id: 'a', url: 'http://h.example', auth: 'none' }]))), [{ id: 'a', url: 'http://h.example', auth: 'none' }]);
   assert.deepStrictEqual(quiet(() => mcp.parseMcpServers(twice, stub([{ id: 'a', url: 'http://h.example', auth: 'nextcloud' }]))), []);
   // First wins by id alone: a later same-id entry with another URL cannot be substituted.
-  const moved = { MCP_SERVERS: 'a|http://u1/|none,a|http://u2/|nextcloud', MCP_SERVERS_IMPL: 'wasm' };
+  const moved = { MCP_SERVERS: 'a|http://u1/|none,a|http://u2/|nextcloud' };
   assert.deepStrictEqual(quiet(() => mcp.parseMcpServers(moved, stub([{ id: 'a', url: 'http://u2/', auth: 'nextcloud' }]))), []);
   assert.deepStrictEqual(quiet(() => mcp.parseMcpServers(moved, stub([{ id: 'a', url: 'http://u1/', auth: 'none' }]))), [{ id: 'a', url: 'http://u1/', auth: 'none' }]);
   // An earlier internal entry is skipped only when an internal server was accepted before it.
-  const lone = { MCP_SERVERS: 'a|http://127.0.0.1/|internal,a|http://127.0.0.1/|nextcloud', MCP_SERVERS_IMPL: 'wasm' };
+  const lone = { MCP_SERVERS: 'a|http://127.0.0.1/|internal,a|http://127.0.0.1/|nextcloud' };
   assert.deepStrictEqual(quiet(() => mcp.parseMcpServers(lone, stub([{ id: 'a', url: 'http://127.0.0.1/', auth: 'nextcloud' }]))), []);
-  const second = { MCP_SERVERS: 'i|http://127.0.0.1:1/|internal,a|http://127.0.0.1:2/|internal,a|http://h.example|none', MCP_SERVERS_IMPL: 'wasm' };
+  const second = { MCP_SERVERS: 'i|http://127.0.0.1:1/|internal,a|http://127.0.0.1:2/|internal,a|http://h.example|none' };
   const dropped = [{ id: 'i', url: 'http://127.0.0.1:1/', auth: 'internal' }, { id: 'a', url: 'http://h.example', auth: 'none' }];
-  assert.deepStrictEqual(quiet(() => mcp.parseMcpServersJs(second)), dropped);
+  assert.deepStrictEqual(quiet(() => oracle.parseMcpServersJs(second)), dropped);
   assert.deepStrictEqual(quiet(() => mcp.parseMcpServers(second, stub(dropped))), dropped);
   // Dropping a server is allowed; what remains must still be the JS's own for each id.
   assert.deepStrictEqual(quiet(() => mcp.parseMcpServers(second, stub([dropped[1]]))), [dropped[1]]);
   assert.deepStrictEqual(quiet(() => mcp.parseMcpServers(second, stub([dropped[0], { id: 'a', url: 'http://127.0.0.1:2/', auth: 'internal' }]))), []);
   // The internal-accepted state is the list's, not the reply's: dropping x cannot revive a's internal.
-  const revived = { MCP_SERVERS: 'x|http://127.0.0.1:1/|internal,a|http://127.0.0.1:2/|internal', MCP_SERVERS_IMPL: 'wasm' };
+  const revived = { MCP_SERVERS: 'x|http://127.0.0.1:1/|internal,a|http://127.0.0.1:2/|internal' };
   assert.deepStrictEqual(quiet(() => mcp.parseMcpServers(revived, stub([{ id: 'a', url: 'http://127.0.0.1:2/', auth: 'internal' }]))), []);
   // An entry the JS drops for its URL does not claim the id.
-  const badUrl = { MCP_SERVERS: 'a|ftp://x|nextcloud,a|http://h.example|none', MCP_SERVERS_IMPL: 'wasm' };
+  const badUrl = { MCP_SERVERS: 'a|ftp://x|nextcloud,a|http://h.example|none' };
   assert.deepStrictEqual(quiet(() => mcp.parseMcpServers(badUrl, stub([{ id: 'a', url: 'http://h.example', auth: 'none' }]))), [{ id: 'a', url: 'http://h.example', auth: 'none' }]);
   // An id is derived as the JS derives it (characters dropped, 40 at most).
   const long = 'q'.repeat(45);
-  const derived = { MCP_SERVERS: `a.b!|http://h.example|none,${long}|http://l.example|none`, MCP_SERVERS_IMPL: 'wasm' };
+  const derived = { MCP_SERVERS: `a.b!|http://h.example|none,${long}|http://l.example|none` };
   const ok = [{ id: 'ab', url: 'http://h.example', auth: 'none' }, { id: 'q'.repeat(40), url: 'http://l.example', auth: 'none' }];
   assert.deepStrictEqual(quiet(() => mcp.parseMcpServers(derived, stub(ok))), ok);
 });
@@ -226,21 +223,21 @@ test('wasm toolboxOffered: core and dir-* survive setup and per-id faults, never
   const quiet = (fn) => capture(fn).value;
   let calls = 0;
   const throwing = { wasmLoader: () => { calls++; throw Object.assign(new Error('boom'), { reason: 'throws' }); } };
-  const perId = quiet(() => mcp.createToolboxOffered(new Set(['a']), { impl: 'wasm', ...throwing }));
+  const perId = quiet(() => mcp.createToolboxOffered(new Set(['a']), throwing));
   assert.equal(perId('core'), true);
   assert.equal(perId('dir-anything'), true);
   assert.equal(calls, 0);
   assert.equal(quiet(() => perId('a')), false);
   assert.equal(calls, 1);
   // A setup fault (ENABLED_TOOLBOXES not a set of strings) still offers core and dir-*, and nothing else.
-  const setup = quiet(() => mcp.createToolboxOffered(new Set([5]), { impl: 'wasm', ...throwing }));
+  const setup = quiet(() => mcp.createToolboxOffered(new Set([5]), throwing));
   assert.equal(setup('core'), true);
   assert.equal(setup('dir-x'), true);
   assert.equal(quiet(() => setup('a')), false);
   assert.equal(quiet(() => setup(5)), false);
   assert.equal(calls, 1);
   // Same answers as the JS for core and dir-* under any filter.
-  const js = mcp.createToolboxOfferedJs(new Set(['a']));
+  const js = oracle.createToolboxOfferedJs(new Set(['a']));
   for (const id of ['core', 'dir-', 'dir-x']) assert.equal(perId(id), js(id), id);
 });
 

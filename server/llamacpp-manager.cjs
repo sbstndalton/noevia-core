@@ -433,7 +433,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     if (!(budgetGib > 0)) return null;
     const held = quarantineRefusal(model, budgetGib);
     if (held) return held;
-    // LLAMACPP_AUTOCONFIG_IMPL=wasm: an estimate the Rust port could not confirm (and the JS one not
+    // Rust confirmation (LLAMACPP_AUTOCONFIG_IMPL, retired in #1071): an estimate the Rust port could not confirm (and the JS one not
     // the larger) refuses the load; any other failure is "no estimate", as before.
     let est;
     try { est = await footprint(model); } catch (err) {
