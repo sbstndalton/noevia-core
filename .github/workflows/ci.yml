@@ -239,6 +239,8 @@ jobs:
         with:
           # Docker Hub pull-through mirror, docker.io fallback (noevia #1221).
           buildkitd-config: self/.github/buildkitd-mirror.toml
+          # The driver image itself is a Docker Hub pull; take it from the mirror (same tag).
+          driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6 (v6.19.2)
         with:
           context: self/code-sandbox
@@ -334,6 +336,8 @@ jobs:
         with:
           # Docker Hub pull-through mirror, docker.io fallback (noevia #1221).
           buildkitd-config: self/.github/buildkitd-mirror.toml
+          # The driver image itself is a Docker Hub pull; take it from the mirror (same tag).
+          driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6 (v6.19.2)
         with:
           context: ${{ env.TREE }}
