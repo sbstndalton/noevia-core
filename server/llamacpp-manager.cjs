@@ -373,14 +373,18 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     if (inference > 0) return explicit > 0 ? Math.min(inference, explicit) : inference;
     return Number(autoconfig.budgetGib) > 0 ? Number(autoconfig.budgetGib) : 0;
   }
-  // noevia#1132: ctx-size (c), ubatch-size and batch-size, when set, must be positive whole numbers;
-  // -1, 0, Infinity, 1e400 or NaN would make the estimate meaningless. The reason, or null.
+  // noevia#1132: ctx-size (c), ubatch-size and batch-size, when set, must be whole numbers (a leading
+  // '+' allowed, as llama.cpp reads them): positive, except that ctx-size 0 means the model's native
+  // context (llama.cpp's meaning, and how estimateFootprint sizes it). -1, Infinity, 1e400 or NaN
+  // would make the estimate meaningless. The reason, or null.
   function sizeKnobProblem(options) {
     for (const key of ['ctx-size', 'c', 'ubatch-size', 'batch-size']) {
       const raw = options[key];
       if (raw === undefined || raw === null || String(raw).trim() === '') continue;
-      const text = String(raw).trim(), n = Number(text);
-      if (!/^\d+$/.test(text) || !Number.isSafeInteger(n) || n <= 0) return `${key} must be a positive whole number (got ${JSON.stringify(String(raw).slice(0, 40))}).`;
+      const text = String(raw).trim(), n = Number(text), ctx = key === 'ctx-size' || key === 'c';
+      if (!/^\+?\d+$/.test(text) || !Number.isSafeInteger(n) || n < 0 || (n === 0 && !ctx)) {
+        return `${key} must be ${ctx ? 'a whole number (0 for the native context)' : 'a positive whole number'} (got ${JSON.stringify(String(raw).slice(0, 40))}).`;
+      }
     }
     return null;
   }

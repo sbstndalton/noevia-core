@@ -580,18 +580,28 @@ test('a ctx-size of Infinity, 1e400 or -1 is refused at load and at save, with n
       const refused = await manager.loadRefusal(`bad${i}`);
       assert.ok(refused, `load ${v} (budget ${budget})`);
       assert.doesNotMatch(refused.error, /null GiB|NaN/);
-      assert.match(refused.error, /positive whole number/);
+      assert.match(refused.error, /ctx-size must be a whole number/);
       const r = await manager.load(`bad${i}`);
       assert.equal(r.ok, false); assert.equal(r.status, 409);
     }
     assert.ok(!calls.some(c => c.startsWith('POST /models/load')), calls.join('\n'));
   }
   const { manager } = fixture(t, { budget: 64 });
-  for (const v of [...bad, '0', 'NaN', '4096.5']) {
+  for (const v of [...bad, 'NaN', '4096.5', '-0', '0x10']) {
     const r = await manager.presetRefusal('small', { 'ctx-size': v });
-    assert.equal(r?.code, 'invalid_size', v); assert.match(r.error, /^Not saved: ctx-size must be a positive whole number/);
+    assert.equal(r?.code, 'invalid_size', v); assert.match(r.error, /^Not saved: ctx-size must be a whole number \(0 for the native context\)/);
   }
-  for (const k of ['ubatch-size', 'batch-size']) assert.equal((await manager.presetRefusal('small', { [k]: '-1' }))?.code, 'invalid_size', k);
+  for (const k of ['ubatch-size', 'batch-size']) for (const v of ['-1', '0']) assert.equal((await manager.presetRefusal('small', { [k]: v }))?.code, 'invalid_size', `${k}=${v}`);
   assert.equal(await manager.presetRefusal('small', { 'ctx-size': '4096', 'cache-ram': '0' }), null);
+  assert.equal(await manager.presetRefusal('small', { 'ctx-size': '+4096', 'cache-ram': '0' }), null, 'a leading + as llama.cpp reads it');
+  assert.equal(await manager.presetRefusal('small', { 'ubatch-size': '+512', 'cache-ram': '0' }), null);
+  // ctx-size 0 is the native context (262144 here): estimated there, refused only when that does not fit.
+  const tight = fixture(t, { budget: 3 }).manager;
+  assert.equal(await tight.presetRefusal('small', { 'ctx-size': '4096', 'cache-ram': '0' }), null, '4096 fits 3 GiB');
+  const native = await tight.presetRefusal('small', { 'ctx-size': '0', 'cache-ram': '0' });
+  assert.equal(native?.code, 'inference_budget'); assert.equal(native.estimate.ctx, 262144);
+  const roomy = fixture(t, { budget: 1024 }).manager;
+  assert.equal(await roomy.presetRefusal('small', { 'ctx-size': '0', 'cache-ram': '0' }), null);
+  assert.equal(await roomy.loadRefusal('small'), null);
 });
 
