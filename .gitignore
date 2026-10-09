@@ -1,2 +1,3 @@
 server/wasm/
 code-sandbox/wasm/
+tests/fixtures/real-gguf-headers/
