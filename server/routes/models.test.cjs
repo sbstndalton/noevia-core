@@ -870,3 +870,12 @@ test('#873: a sweep still running after a web restart takes the gate back at sta
   assert.equal(await busy.f.ready, false); release();
   assert.equal(timers.length, 0);
 });
+
+test('#1158: an invalid size on a model manager section save is a 400 with its code, not a 409 revision conflict', async () => {
+  const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' },
+    manager: { presetRefusal: async (name, options) => options['ctx-size'] === '-1'
+      ? { error: 'Not saved: ctx-size must be a whole number (0 for the native context) (got "-1").', code: 'invalid_size' } : null } });
+  await f.call('PUT', '/api/model-manager/sections/chat-syn', { baseRevision: 'r', values: { 'ctx-size': '-1' } }, 'admin');
+  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'Not saved: ctx-size must be a whole number (0 for the native context) (got "-1").', code: 'invalid_size' } });
+  assert.equal(f.fetched.length, 0, 'nothing is forwarded to the model manager');
+});

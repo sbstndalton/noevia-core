@@ -91,16 +91,24 @@ test('manager suggestion reads only files inside the read-only model mount and n
 
 test('the context ladder matches the Python planner exactly', () => {
   // These two lists are the same list in two languages. The planner
-  // (services/model-manager/app/autoconfig.py) decides what to recommend; the
+  // (services/model-manager/app/autoconfig_core.py) decides what to recommend; the
   // calibrator (llamacpp-calibration.cjs) walks the JS copy to verify what
   // actually loads. When they drift, noevia recommends contexts it can never
   // verify — which is what had happened: six values existed only in Python,
   // added by the densification explained in that file's own comment and never
   // carried across.
-  const py = fs.readFileSync(
-    path.join(__dirname, '..', '..', '..', 'services', 'model-manager', 'app', 'autoconfig.py'), 'utf8');
-  const block = /_CTX_CANDIDATES = \(([\s\S]*?)\)/.exec(py);
-  assert.ok(block, 'the planner still declares _CTX_CANDIDATES as a tuple');
+  // The tuple moved from autoconfig.py to autoconfig_core.py (noevia-services#8/#10): read the core
+  // module first, then the old one, and fail by naming both when neither declares it.
+  const dir = path.join(__dirname, '..', '..', '..', 'services', 'model-manager', 'app');
+  let block = null; const looked = [];
+  for (const file of ['autoconfig_core.py', 'autoconfig.py']) {
+    const full = path.join(dir, file);
+    if (!fs.existsSync(full)) { looked.push(`${file} (missing)`); continue; }
+    block = /^_CTX_CANDIDATES = \(([\s\S]*?)\)/m.exec(fs.readFileSync(full, 'utf8'));
+    if (block) break;
+    looked.push(`${file} (no _CTX_CANDIDATES tuple)`);
+  }
+  assert.ok(block, `the planner declares _CTX_CANDIDATES as a tuple in neither file: ${looked.join(', ')}`);
   const expected = block[1].match(/\d+/g).map(Number);
   assert.deepEqual(CTX_CANDIDATES, expected);
   // Alignment invariant the Python comment relies on.

@@ -191,6 +191,10 @@ function createCodePipeline({ jobs, workspaces, harness, roleEngine = null, plan
       if (baseSha === null || !FULL_SHA.test(String(baseSha))) throw new Blocked('The repository has no commit to start from.');
       // Authoritative from the first moment, so the task shows its lifecycle while it plans.
       stage('planned', 'Planning');
+      // #1157: name the task and its branch from the first moment. runExecutor writes the same
+      // checkpoint later, but a task blocked before the agent ever starts (no model pinned, the
+      // Planner failing) would otherwise be listed as an untitled task with no branch.
+      ctx.checkpoint({ branch, task: String(prompt).slice(0, 120), baseSha });
       ctx.artifact({ name: 'pipeline', kind: 'pipeline', version: 1, maxLoops, merge: settings.merge });
 
       // ── plan ──────────────────────────────────────────────────────────────────────────────
