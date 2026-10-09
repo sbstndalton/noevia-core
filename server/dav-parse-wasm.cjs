@@ -51,6 +51,8 @@
 //                          parseCodeNetSpec, resolveOnce's address filter and refuses (CODE_NET_GUARD_IMPL)
 //   - crates/role-context  roleContextProject/roleContextDossier = role-context.cjs
 //                          projectRoleContext/projectSharedDossier, a secret call (ROLE_CONTEXT_IMPL)
+//   - crates/completeness-report completenessReport = completeness-report.cjs
+//                          buildCompletenessReport and reportHash (COMPLETENESS_REPORT_IMPL)
 //
 // Memory: WebAssembly memory only grows. A listing or path call needs at most ~16 MiB; an upload
 // decode copies the upload in (at most 25 MiB) and holds one copy of its text (at most 3 bytes per
@@ -82,7 +84,7 @@ const MAX_DECODE_BYTES = 25 * 1024 * 1024;
 // Only the first bytes decide an archive magic number (`ustar` ends at 262).
 const SNIFF_BYTES = 262;
 const RESET_AFTER_BYTES = 1024 * 1024;
-const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'secret_open', 'secret_seal', 'mcp_rpc_body', 'mcp_schema_refs', 'template_caps', 'provider_error', 'serving_verdict', 'autotune_plan', 'preset_reload', 'load_verdict', 'tune_contention', 'frame_untrusted', 'escape_closing', 'provenance', 'task_packet', 'long_profile', 's3_sign', 's3_region', 'ssrf_policy', 'stream_guard', 'gguf_summary', 'auth_tokens', 'tool_policy', 'review_verdict', 'tool_exchange', 'mcp_servers', 'decision', 'code_net_guard', 'role_context', 'dav_output_ptr', 'dav_output_len'];
+const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'secret_open', 'secret_seal', 'mcp_rpc_body', 'mcp_schema_refs', 'template_caps', 'provider_error', 'serving_verdict', 'autotune_plan', 'preset_reload', 'load_verdict', 'tune_contention', 'frame_untrusted', 'escape_closing', 'provenance', 'task_packet', 'long_profile', 's3_sign', 's3_region', 'ssrf_policy', 'stream_guard', 'gguf_summary', 'auth_tokens', 'tool_policy', 'review_verdict', 'tool_exchange', 'mcp_servers', 'decision', 'code_net_guard', 'role_context', 'completeness_report', 'dav_output_ptr', 'dav_output_len'];
 
 class DavParseError extends Error {
   constructor(message, reason) {
@@ -1723,10 +1725,42 @@ function roleContextProject(role, state) { return roleContextCall(1, role, state
 /** role-context.cjs projectSharedDossier(state, { roles }) through the Rust port, as above. */
 function roleContextDossier(roles, state) { return roleContextCall(2, roles, state, 'dossier'); }
 
+// --- completeness report (COMPLETENESS_REPORT_IMPL) --------------------------------------------
+// completeness_report::MAX_INPUT_BYTES (the op byte and the JSON).
+const MAX_COMPLETENESS_BYTES = 8 * 1024 * 1024 + 1;
+const COMPLETENESS_STATUSES = new Set(['pass', 'fail', 'unknown']);
+const COMPLETENESS_UNHASHABLE = new Set(['deep', 'large']);
+
+/** Check one completeness_report reply's shape: `{ hash, report }` (a sha256 hex digest and the
+ *  report object) or `{ unhashable, overall, statuses }`. */
+function completenessReply(r) {
+  if (exactKeys(r, ['hash', 'report']) && typeof r.hash === 'string' && /^[0-9a-f]{64}$/.test(r.hash)
+    && r.report && typeof r.report === 'object' && !Array.isArray(r.report)) return { hash: r.hash, report: r.report };
+  if (exactKeys(r, ['unhashable', 'overall', 'statuses']) && COMPLETENESS_UNHASHABLE.has(r.unhashable) && COMPLETENESS_STATUSES.has(r.overall)
+    && Array.isArray(r.statuses) && r.statuses.length === 5 && r.statuses.every((s) => COMPLETENESS_STATUSES.has(s))) {
+    return { unhashable: r.unhashable, overall: r.overall, statuses: r.statuses };
+  }
+  throw new DavParseError('completeness report reply has an unexpected shape', 'reply');
+}
+
+/** completeness-report.cjs buildCompletenessReport({ job, expectedArtifacts }) and reportHash
+ *  through the Rust port. A refusal ('input', 'too_large', 'ambiguous': see the crate docs), a job
+ *  JSON.stringify cannot write or a bad reply throws. */
+function completenessReport(job, expectedArtifacts) {
+  let body;
+  try { body = JSON.stringify([job, expectedArtifacts ?? null]); } catch { body = undefined; }
+  if (typeof body !== 'string') throw new DavParseError('completeness report input cannot be serialised', 'input');
+  const bytes = encoder.encode(body);
+  if (bytes.length + 1 > MAX_COMPLETENESS_BYTES) throw new DavParseError('completeness report input is too large', 'too_large');
+  const input = new Uint8Array(bytes.length + 1);
+  input[0] = 1; input.set(bytes, 1);
+  return completenessReply(invoke(input, (e) => e.completeness_report(), MAX_COMPLETENESS_BYTES));
+}
+
 // Every switch that runs this module (#996). Each reads its value as trim().toLowerCase().
 // CHAT_TEMPLATE_CAPS_IMPL counts only when set to wasm explicitly; its default (also wasm) is
 // checked by chat-template-caps.cjs startup(), which falls back to off instead of stopping.
-const IMPL_FLAGS = ['DAV_PARSE_IMPL', 'S3_PARSE_IMPL', 'STORAGE_PATH_IMPL', 'UPLOAD_SNIFF_IMPL', 'SECRET_ENVELOPE_IMPL', 'MCP_FRAME_IMPL', 'CHAT_TEMPLATE_CAPS_IMPL', 'AUTOTUNE_PLAN_IMPL', 'PRESET_RELOAD_IMPL', 'PROMPT_FRAMING_IMPL', 'S3_SIGN_IMPL', 'SSRF_IMPL', 'STREAM_GUARD_IMPL', 'GGUF_META_IMPL', 'POLICY_LEAVES_IMPL', 'CODE_REVIEW_VERDICT_IMPL', 'TOOL_EXCHANGE_IMPL', 'MCP_SERVERS_IMPL', 'DECISION_IMPL', 'CODE_NET_GUARD_IMPL', 'ROLE_CONTEXT_IMPL'];
+const IMPL_FLAGS = ['DAV_PARSE_IMPL', 'S3_PARSE_IMPL', 'STORAGE_PATH_IMPL', 'UPLOAD_SNIFF_IMPL', 'SECRET_ENVELOPE_IMPL', 'MCP_FRAME_IMPL', 'CHAT_TEMPLATE_CAPS_IMPL', 'AUTOTUNE_PLAN_IMPL', 'PRESET_RELOAD_IMPL', 'PROMPT_FRAMING_IMPL', 'S3_SIGN_IMPL', 'SSRF_IMPL', 'STREAM_GUARD_IMPL', 'GGUF_META_IMPL', 'POLICY_LEAVES_IMPL', 'CODE_REVIEW_VERDICT_IMPL', 'TOOL_EXCHANGE_IMPL', 'MCP_SERVERS_IMPL', 'DECISION_IMPL', 'CODE_NET_GUARD_IMPL', 'ROLE_CONTEXT_IMPL', 'COMPLETENESS_REPORT_IMPL'];
 
 /** The *_IMPL switches set to wasm in `env`. */
 function wasmFlags(env = process.env) {
@@ -1764,4 +1798,4 @@ function verifyAtStartup(env = process.env, { hostname } = {}) {
 /** Test hook: forget the cached module (and its failure). */
 function reset() { cached = null; }
 
-module.exports = { roleContextProject, roleContextDossier, roleContextReply, MAX_ROLE_CONTEXT_BYTES, codeNetSpec, codeNetResolved, codeNetRefuses, MAX_CODE_NET_BYTES, MAX_CODE_NET_ENTRIES, mcpServersParse, mcpToolboxes, mcpToolboxOffered, MAX_MCP_SERVERS_BYTES, decisionRequestTag, decisionResultTag, decisionInvalidRequest, decisionInvalidResult, decisionCauseOf, decisionErrorFacts, decisionRequest, MAX_DECISION_MESSAGE_UNITS, MAX_DECISION_BYTES, DECISION_ENTRIES, reviewTag, reviewVerdictRead, reviewEventBound, reviewVerdictReply, MAX_REVIEW_BYTES, toolExchangeCheck, toolExchangeError, MAX_EXCHANGE_ARGS_UNITS, MAX_EXCHANGE_NAME_UNITS, ggufSummary, ggufSummaryReply, MAX_GGUF_WINDOW_BYTES, MAX_GGUF_SEGMENTS, authTokens, toolPolicyMode, toolPolicySet, MAX_POLICY_UNITS, MAX_POLICY_TOOLS, streamGuardSchema, streamGuardOptions, streamGuardNew, streamGuardFeed, streamGuardEnd, streamGuardCheck, streamGuardCheckReply, streamGuardCorrection, streamGuardReply, plainJson, MAX_GUARD_BYTES, MAX_GUARD_DEPTH, MAX_GUARD_SCHEMA_BYTES, MAX_GUARD_STATE_BYTES, MAX_GUARD_INPUT_BYTES, MAX_CORRECTION_UNITS, s3Sign, s3Region, MAX_S3_FIELD_BYTES, MAX_S3_QUERY_PAIRS, MAX_S3_PAYLOAD_BYTES, wasmFlags, verifyAtStartup, framingRuntimeMatches, IMPL_FLAGS, ssrfUrl, ssrfAddressesPublic, ssrfUrlReply, ssrfAddressesReply, MAX_SSRF_BYTES, MAX_SSRF_ADDRESSES, frameUntrusted, escapeClosing, provenanceNew, provenanceIngest, provenanceAdd, provenanceSource, provenanceCheck, provenanceProbe, packetParse, packetValidate, packetRender, FRAME_TEXT_UNITS, FRAME_LABEL_UNITS, MAX_PROVENANCE_BYTES, MAX_PACKET_BYTES, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, tuneContention, tuneContentionText, MAX_CONTENTION_BYTES, longProfilePairs, longProfileSection, longProfilePick, longProfileText, MAX_LONG_PROFILE_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
+module.exports = { completenessReport, completenessReply, MAX_COMPLETENESS_BYTES, roleContextProject, roleContextDossier, roleContextReply, MAX_ROLE_CONTEXT_BYTES, codeNetSpec, codeNetResolved, codeNetRefuses, MAX_CODE_NET_BYTES, MAX_CODE_NET_ENTRIES, mcpServersParse, mcpToolboxes, mcpToolboxOffered, MAX_MCP_SERVERS_BYTES, decisionRequestTag, decisionResultTag, decisionInvalidRequest, decisionInvalidResult, decisionCauseOf, decisionErrorFacts, decisionRequest, MAX_DECISION_MESSAGE_UNITS, MAX_DECISION_BYTES, DECISION_ENTRIES, reviewTag, reviewVerdictRead, reviewEventBound, reviewVerdictReply, MAX_REVIEW_BYTES, toolExchangeCheck, toolExchangeError, MAX_EXCHANGE_ARGS_UNITS, MAX_EXCHANGE_NAME_UNITS, ggufSummary, ggufSummaryReply, MAX_GGUF_WINDOW_BYTES, MAX_GGUF_SEGMENTS, authTokens, toolPolicyMode, toolPolicySet, MAX_POLICY_UNITS, MAX_POLICY_TOOLS, streamGuardSchema, streamGuardOptions, streamGuardNew, streamGuardFeed, streamGuardEnd, streamGuardCheck, streamGuardCheckReply, streamGuardCorrection, streamGuardReply, plainJson, MAX_GUARD_BYTES, MAX_GUARD_DEPTH, MAX_GUARD_SCHEMA_BYTES, MAX_GUARD_STATE_BYTES, MAX_GUARD_INPUT_BYTES, MAX_CORRECTION_UNITS, s3Sign, s3Region, MAX_S3_FIELD_BYTES, MAX_S3_QUERY_PAIRS, MAX_S3_PAYLOAD_BYTES, wasmFlags, verifyAtStartup, framingRuntimeMatches, IMPL_FLAGS, ssrfUrl, ssrfAddressesPublic, ssrfUrlReply, ssrfAddressesReply, MAX_SSRF_BYTES, MAX_SSRF_ADDRESSES, frameUntrusted, escapeClosing, provenanceNew, provenanceIngest, provenanceAdd, provenanceSource, provenanceCheck, provenanceProbe, packetParse, packetValidate, packetRender, FRAME_TEXT_UNITS, FRAME_LABEL_UNITS, MAX_PROVENANCE_BYTES, MAX_PACKET_BYTES, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, tuneContention, tuneContentionText, MAX_CONTENTION_BYTES, longProfilePairs, longProfileSection, longProfilePick, longProfileText, MAX_LONG_PROFILE_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };

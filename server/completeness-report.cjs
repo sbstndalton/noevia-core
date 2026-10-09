@@ -191,7 +191,7 @@ function overallOf(checks) {
  *   - `expectedArtifacts`: names the caller expects `artifact.created` to have produced for this
  *     job. `null`/omitted means no expectation was declared (check is 'unknown', not 'pass').
  */
-function buildCompletenessReport({ job, expectedArtifacts = null } = {}) {
+function buildCompletenessReportJs({ job, expectedArtifacts = null } = {}) {
   if (!job || typeof job !== 'object') throw Object.assign(Error('buildCompletenessReport requires a derived job'), { status: 400 });
   const checks = [
     testsRunCheck(job),
@@ -206,7 +206,7 @@ function buildCompletenessReport({ job, expectedArtifacts = null } = {}) {
 // Pure guard: false whenever any required check failed OR is unknown — "unknown" is treated the
 // same as "not proven", not as a pass. True only when every check explicitly passed.
 function canEnterReviewing(report) {
-  if (!report || !Array.isArray(report.checks) || !report.checks.length) return false;
+  if (!report || report.unverified !== undefined || !Array.isArray(report.checks) || !report.checks.length) return false;
   return report.checks.every((c) => c.status === 'pass');
 }
 
@@ -239,4 +239,91 @@ function reportHash(report) {
   return crypto.createHash('sha256').update(canonical(report)).digest('hex');
 }
 
-module.exports = { reportHash, CHECK_NAMES, TEST_STEP_IDS, TEST_ARTIFACT_KIND, buildCompletenessReport, canEnterReviewing };
+// ── COMPLETENESS_REPORT_IMPL ────────────────────────────────────────────────
+// js (default; any other value means js, with one warning) or wasm, read from the `env` option
+// (process.env) on every call. wasm also asks noevia-rs's completeness-report crate (dav-parse.wasm
+// completeness_report) for the same report. The JS report is always what is returned, and it is
+// handed out as is only when the port gives the byte-identical canonical JSON and hash (or, for a
+// report reportHash refuses, the same refusal and statuses). A port refusal, fault, bad reply or any
+// disagreement returns the JS report marked `unverified` ('impl_refused' / 'impl_mismatch'), with
+// `overall` 'fail' if the JS said fail and 'unknown' otherwise; canEnterReviewing() is false for it,
+// so the port can keep a task out of `reviewing` but never let one in. Logged once per reason,
+// text-free. When the JS throws, the port is not asked. The flag is in dav-parse-wasm.cjs IMPL_FLAGS
+// (a missing or tampered module stops startup).
+// Stricter than the JS (the crate docs): a truthy non-array `uncertain`, an expectedArtifacts string
+// or one holding non-strings, a not-completed step whose id or status is an object or array, and a
+// job over 8 MiB as JSON (or one JSON.stringify cannot write) are refused, so marked unverified.
+
+const IMPLS = new Set(['js', 'wasm']);
+let warnedImpl = '';
+/** COMPLETENESS_REPORT_IMPL: 'js' (default) or 'wasm'. */
+function completenessReportImpl(env = process.env) {
+  const raw = env?.COMPLETENESS_REPORT_IMPL;
+  if (raw === undefined || raw === '') return 'js';
+  const value = String(raw).trim().toLowerCase();
+  if (IMPLS.has(value)) return value;
+  if (warnedImpl !== value) {
+    warnedImpl = value;
+    console.warn(`[completeness-report] COMPLETENESS_REPORT_IMPL=${JSON.stringify(String(raw))} is not js or wasm; using js`);
+  }
+  return 'js';
+}
+const defaultLoader = () => require('./dav-parse-wasm.cjs');
+
+const warnedPort = new Set();
+function portWarn(event, reason) {
+  const key = `${event}:${reason}`;
+  if (warnedPort.has(key)) return;
+  warnedPort.add(key);
+  console.warn(`[completeness-report] ${event} (${reason}); the report is unverified`);
+}
+
+const UNHASHABLE_REASONS = [['nested too deeply', 'deep'], ['too large', 'large']];
+// What reportHash makes of the JS report: { text, hash } or { unhashable } (circular included).
+function jsHashed(report) {
+  try {
+    const text = canonical(report);
+    return { text, hash: crypto.createHash('sha256').update(text).digest('hex') };
+  } catch (err) {
+    const hit = UNHASHABLE_REASONS.find(([m]) => String(err?.message).includes(m));
+    return { unhashable: hit ? hit[1] : 'circular' };
+  }
+}
+
+function portAgrees(port, report) {
+  const js = jsHashed(report);
+  if (js.unhashable) {
+    return port.unhashable === js.unhashable && port.overall === report.overall
+      && port.statuses.length === report.checks.length && port.statuses.every((s, i) => s === report.checks[i].status);
+  }
+  return port.unhashable === undefined && port.hash === js.hash && canonical(port.report) === js.text;
+}
+
+function unverified(report, reason) {
+  return { ...report, overall: report.overall === 'fail' ? 'fail' : 'unknown', unverified: reason };
+}
+
+/**
+ * The completeness report, as buildCompletenessReportJs. With COMPLETENESS_REPORT_IMPL=wasm
+ * confirmed by the Rust port (see above). Options: `env`, `impl`, `wasmLoader`.
+ */
+function buildCompletenessReport(input = {}, { env = process.env, impl = completenessReportImpl(env), wasmLoader = defaultLoader } = {}) {
+  const report = buildCompletenessReportJs(input);
+  if (impl !== 'wasm') return report;
+  let port;
+  try {
+    port = wasmLoader().completenessReport(input.job, input.expectedArtifacts ?? null);
+  } catch (err) {
+    portWarn('completeness_report.wasm_fault', String(err?.reason || 'unexpected').slice(0, 40));
+    return unverified(report, 'impl_refused');
+  }
+  let agrees = false;
+  try { agrees = !!port && portAgrees(port, report); } catch { agrees = false; }
+  if (!agrees) {
+    portWarn('completeness_report.impl_mismatch', port && port.unhashable !== undefined ? 'unhashable' : 'report');
+    return unverified(report, 'impl_mismatch');
+  }
+  return report;
+}
+
+module.exports = { reportHash, CHECK_NAMES, TEST_STEP_IDS, TEST_ARTIFACT_KIND, buildCompletenessReport, buildCompletenessReportJs, canEnterReviewing, completenessReportImpl };
