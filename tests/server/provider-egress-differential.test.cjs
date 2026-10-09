@@ -167,12 +167,18 @@ test('seeded live calls: the switched rules never let out more than the JS', { s
   assert.ok(refusedMore > 100 && agreed > 500, `${refusedMore} refused more, ${agreed} agreed`);
 });
 
-test('the inputs that make the JS regexes quadratic (#1209) stay linear in the port', { skip: skipWasm }, () => {
+test('the #1209 inputs are bounded in the port and through the switched paths (js and wasm)', { skip: skipWasm }, () => {
   const t = process.hrtime.bigint();
   const s = '/remote.php/webdav/x'.repeat(100_000) + '\n';
   const { canonical } = davParseWasm.providerEgressCanonical([s]);
   assert.equal(typeof canonical[0], 'string');
   const r = davParseWasm.providerEgressExternal({ kind: null, external: false, baseUrl: `http://a${'.'.repeat(1_000_000)}b/`, label: '' });
   assert.equal(r.external, false);
+  const storage = { kind: 'nextcloud', corpusRoot: 'Diary', baseUrl: 'https://nc.example/remote.php/dav/files/alice' };
+  const call = { provider: { kind: 'chatgpt-oauth' }, toolName: 'nc_webdav_read_file', rawArgs: JSON.stringify({ path: s }), storage };
+  for (const opts of [{ impl: 'js' }, WASM]) {
+    assert.match(quietly(() => pe.toolRefusal(call, opts)), /in the Diary folder/);
+    assert.equal(quietly(() => pe.isExternalProvider({ baseUrl: `http://a${'.'.repeat(1_000_000)}b/` }, opts)), false);
+  }
   assert.ok(Number(process.hrtime.bigint() - t) / 1e9 < 5);
 });

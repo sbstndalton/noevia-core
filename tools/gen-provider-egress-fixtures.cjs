@@ -111,6 +111,7 @@ function portToolRefusal(p, name, rawArgs, s) {
   if (tree && !paths.length) return `ERROR: ${name} needs a folder to search in when used with ${label}, so it was not run. Search a specific folder outside the Diary.`;
   const inside = `ERROR: ${name} was not run: that path is in the Diary folder, and Diary content is never sent to ${label}. Do not retry; tell the user to use a local model for Diary files.`;
   for (const value of paths) {
+    if (value.length > 4096) return inside;
     const target = portCanonical(value);
     if (target === null || target === folder || target.startsWith(`${folder}/`)) return inside;
     if (tree && (target === '' || folder.startsWith(`${target}/`))) {
@@ -233,6 +234,9 @@ for (const name of TOOLS) for (const a of ARGS) toolRow(CHATGPT, name, a, MAIN);
 for (const s of STORAGES) for (const a of ARGS.slice(0, 34)) toolRow(CHATGPT, 'nc_webdav_search_files', a, s);
 for (const s of STORAGES) for (const a of ARGS.slice(0, 34)) toolRow(NIM, 'nc_webdav_read_file', a, s);
 for (const p of PROVIDERS) for (const a of ['{"path":"Diary/x"}', '{"path":"Work/x"}', '{"q":"x"}']) for (const name of ['nc_webdav_read_file', 'nc_webdav_search_files', 'diary_read']) toolRow(p, name, a, MAIN);
+// #1209: path arguments over 4096 code units are refused before any regex.
+for (const n of [4096, 4097]) for (const p of [CHATGPT, LOCAL]) toolRow(p, 'nc_webdav_read_file', JSON.stringify({ path: 'W'.repeat(n) }), MAIN);
+toolRow(CHATGPT, 'nc_webdav_read_file', JSON.stringify({ path: 'Work', to: `${'/remote.php/webdav/x'.repeat(250)}\n` }), MAIN);
 // Non-string arguments (already parsed): falsy values are {}.
 for (const raw of [{ path: 'Diary/x' }, { path: 'Work' }, null, 0, false, [], [{ path: 'Diary' }], { recursive: true }, 7, true])
   for (const name of ['nc_webdav_read_file', 'nc_webdav_search_files']) toolRow(CHATGPT, name, raw, MAIN);

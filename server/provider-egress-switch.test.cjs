@@ -116,6 +116,9 @@ test('stripPrivateToolboxes: the port can take more private toolboxes, never oth
   sel = ['files', 'diary', 'web'];
   assert.deepEqual(strip(sel, () => ({ removed: [0, 1] })), ['diary'], 'a non-private toolbox is never removed');
   assert.deepEqual(sel, ['files', 'web']);
+  sel = ['diary', 'files', 'diary'];
+  assert.deepEqual(strip(sel, () => ({ removed: [0] })), ['diary', 'diary'], 'any removal takes every private toolbox');
+  assert.deepEqual(sel, ['files']);
   sel = ['files', 'diary'];
   assert.deepEqual(strip(sel, fault), ['diary']);
   assert.deepEqual(sel, ['files']);
@@ -142,6 +145,13 @@ test('toolRefusal: a JS null stands only when the port agrees; only diary_* and 
   pe.toolRefusal({ ...call, rawArgs: { path: 'Work' } }, wasm(port));
   assert.deepEqual(port.calls[0][1], [{ kind: 'chatgpt-oauth', external: false, baseUrl: CHATGPT.baseUrl, label: 'ChatGPT' }, 'nc_webdav_read_file',
     { path: 'Work' }, { kind: 'nextcloud', corpusRoot: 'Diary', baseUrl: STORAGE.baseUrl }]);
+  // User names and passwords never reach the port.
+  const creds = fakePort({ tool: () => ({ refusal: null }) });
+  pe.toolRefusal({ ...call, provider: { ...CHATGPT, baseUrl: 'https://u:pw@chatgpt.example/v1' },
+    storage: { ...STORAGE, baseUrl: 'https://alice:secret@nc.example/remote.php/dav/files/alice' } }, wasm(creds));
+  assert.equal(creds.calls[0][1][0].baseUrl, 'https://chatgpt.example/v1');
+  assert.equal(creds.calls[0][1][3].baseUrl, 'https://nc.example/remote.php/dav/files/alice');
+  assert.equal(pe.providerProjection({ baseUrl: 'not a url' }).baseUrl, 'not a url');
   // Other tools: the port refuses nothing else, so nothing is asked.
   const other = fakePort();
   assert.equal(pe.toolRefusal({ provider: CHATGPT, toolName: 'web_fetch', rawArgs: '{}', storage: STORAGE }, wasm(other)), null);
@@ -157,4 +167,32 @@ test('warnings carry no input: no path, label, URL or argument text', () => {
   // Each event and reason is logged once per process; this reason is new here.
   assert.ok(seen.some((l) => /wasm_fault \(reply\)/.test(l)), seen.join('\n'));
   for (const line of seen) assert.doesNotMatch(line, /Private|Secret|private\.example|path/);
+});
+
+test('#1208: a percent-encoded decomposed spelling of the Diary folder is refused (js and wasm)', () => {
+  const storage = { kind: 'nextcloud', corpusRoot: 'Tageb\u00fccher', baseUrl: 'https://nc.example/remote.php/dav/files/alice' };
+  for (const path of ['Tagebu%CC%88cher/x.md', 'Tagebu\u0308cher/x.md', 'TAGEBU%CC%88CHER', 'Tageb%C3%BCcher/x.md']) {
+    const args = { provider: CHATGPT, toolName: 'nc_webdav_read_file', rawArgs: JSON.stringify({ path }), storage };
+    assert.match(pe.toolRefusalJs(args), /in the Diary folder/, path);
+    assert.match(quietly(() => pe.toolRefusal(args, { impl: 'js' })).value, /in the Diary folder/, path);
+    assert.match(quietly(() => pe.toolRefusal(args, wasm(fakePort({ tool: () => ({ refusal: null }) })))).value, /in the Diary folder/, path);
+  }
+  assert.equal(pe.canonicalPath('Tagebu%CC%88cher'), 'tageb\u00fccher');
+});
+
+test('#1209: long path arguments are refused before any regex, and the trailing-dot trim is a loop', () => {
+  const storage = STORAGE;
+  const long = { provider: CHATGPT, toolName: 'nc_webdav_read_file', storage,
+    rawArgs: JSON.stringify({ path: `${'/remote.php/webdav/x'.repeat(50_000)}\n` }) };
+  const t0 = process.hrtime.bigint();
+  for (const opts of [{ impl: 'js' }, wasm(fakePort({ tool: () => ({ refusal: null }) }))]) {
+    assert.match(quietly(() => pe.toolRefusal(long, opts)).value, /in the Diary folder/);
+  }
+  assert.equal(pe.toolRefusal({ ...long, rawArgs: JSON.stringify({ path: 'W'.repeat(4096) }) }, { impl: 'js' }), null);
+  assert.match(pe.toolRefusal({ ...long, rawArgs: JSON.stringify({ path: 'W'.repeat(4097) }) }, { impl: 'js' }), /in the Diary folder/);
+  const dots = { baseUrl: `http://a${'.'.repeat(320_000)}b/` };
+  assert.equal(pe.isExternalProvider(dots, { impl: 'js' }), false);
+  assert.equal(quietly(() => pe.isExternalProvider(dots, wasm(fakePort({ external: () => ({ external: false, trial: false }) })))).value, false);
+  assert.equal(pe.isTrialTermsHost({ baseUrl: 'https://api.nvidia.com.../v1' }, { impl: 'js' }), true);
+  assert.ok(Number(process.hrtime.bigint() - t0) / 1e9 < 2, 'bounded');
 });

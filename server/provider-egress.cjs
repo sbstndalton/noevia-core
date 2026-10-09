@@ -99,7 +99,12 @@ function validateToolArguments(toolName, rawArgs) {
 const TRIAL_TERMS_HOSTS = ['nvidia.com'];
 
 function hostOf(baseUrl) {
-  try { return new URL(String(baseUrl)).hostname.toLowerCase().replace(/\.+$/, ''); } catch { return ''; }
+  let host;
+  try { host = new URL(String(baseUrl)).hostname.toLowerCase(); } catch { return ''; }
+  // A loop, not /\.+$/: that regex is quadratic on a long run of dots (#1209).
+  let end = host.length;
+  while (end > 0 && host[end - 1] === '.') end--;
+  return host.slice(0, end);
 }
 
 /** True when the provider's endpoint is a third-party trial service (e.g. build.nvidia.com's
@@ -141,10 +146,14 @@ const TREE_TOOL = /^nc_webdav_(?:search_files|find_by_name|find_by_type)$/;
 const recursiveArgs = (args) => Object.entries(args || {}).some(([k, v]) => /recurs|depth|deep/i.test(k) && v !== false && v !== 0 && v !== '0' && v !== 1 && v !== '1' && v !== null);
 const PATH_KEY = /path|dir|folder|file|scope|source|destination|target|href|url|location|from|to$/i;
 
+const MAX_PATH_UNITS = 4096;
+
 /** One path, reduced to its canonical folder-relative form ('' is the files root). */
 function canonicalPath(value) {
   let text = String(value ?? '').normalize('NFC');
   for (let i = 0; i < 3 && /%[0-9a-f]{2}/i.test(text); i++) { try { text = decodeURIComponent(text); } catch { break; } }
+  // Decoded text is normalised too: a percent-encoded decomposed name is the same folder (#1208).
+  text = text.normalize('NFC');
   text = text.replace(/\\/g, '/');
   // A full DAV URL or a /remote.php/... path: keep what follows the user's files root.
   const dav = /(?:^[a-z][a-z0-9+.-]*:\/\/[^/]*)?\/?remote\.php\/(?:dav\/files\/[^/]+|webdav)(\/.*)?$/i.exec(text);
@@ -156,7 +165,7 @@ function canonicalPath(value) {
     if (segment === '..') { out.pop(); continue; }
     out.push(segment);
   }
-  return out.join('/').toLowerCase();
+  return out.join('/').toLowerCase().normalize('NFC');
 }
 
 /** The Diary folder relative to the Nextcloud files root, or null when it cannot be worked out. */
@@ -201,6 +210,11 @@ function toolRefusalJs({ provider, toolName, rawArgs, storage }) {
   // A search with no folder to search in would search the Diary too.
   if (tree && !paths.length) return `ERROR: ${name} needs a folder to search in when used with ${label}, so it was not run. Search a specific folder outside the Diary.`;
   for (const value of paths) {
+    // #1209: no real path is this long, and the URL regex below is quadratic in it. Refused as if
+    // it were in the Diary folder (fail closed).
+    if (value.length > MAX_PATH_UNITS) {
+      return `ERROR: ${name} was not run: that path is in the Diary folder, and Diary content is never sent to ${label}. Do not retry; tell the user to use a local model for Diary files.`;
+    }
     const target = canonicalPath(value);
     if (target === folder || target.startsWith(`${folder}/`)) {
       return `ERROR: ${name} was not run: that path is in the Diary folder, and Diary content is never sent to ${label}. Do not retry; tell the user to use a local model for Diary files.`;
@@ -261,12 +275,24 @@ function ask(wasmLoader, fn) {
   }
 }
 
+/** `url` without a user name or password (defence in depth: the port never needs them). Removing
+ *  them changes neither the host nor the path the rules read. */
+function withoutUserinfo(url) {
+  try {
+    const u = new URL(url);
+    if (!u.username && !u.password) return url;
+    u.username = '';
+    u.password = '';
+    return u.href;
+  } catch { return url; }
+}
+
 /** What the rules read of a provider row: kind, the external flag, String(baseUrl) and the label
  *  as the messages print it. */
 function providerProjection(provider) {
   if (!provider) return null;
   let baseUrl = '';
-  try { baseUrl = String(provider.baseUrl); } catch { baseUrl = ''; } // hostOf: a throw is ''
+  try { baseUrl = withoutUserinfo(String(provider.baseUrl)); } catch { baseUrl = ''; } // hostOf: a throw is ''
   return {
     kind: typeof provider.kind === 'string' ? provider.kind : null,
     external: provider.external === true,
@@ -281,7 +307,7 @@ function storageProjection(storage) {
   return {
     kind: typeof storage.kind === 'string' ? storage.kind : null,
     corpusRoot: String(storage.corpusRoot || ''),
-    baseUrl: String(storage.baseUrl || ''),
+    baseUrl: withoutUserinfo(String(storage.baseUrl || '')),
   };
 }
 
@@ -334,9 +360,9 @@ function stripPrivateToolboxes(selected, provider, { wasmLoader = defaultLoader,
     selected.map((id) => (typeof id === 'string' ? id : null))));
   if (port && !port.removed.length) return removed;
   if (port) portWarn('provider_egress.impl_mismatch', 'strip');
-  const take = port ? new Set(port.removed) : null;
+  // The port removed something (or failed): every private toolbox goes, not only the ones listed.
   for (let k = selected.length - 1; k >= 0; k--) {
-    if (PRIVATE_TOOLBOXES.has(selected[k]) && (!take || take.has(k))) removed.unshift(...selected.splice(k, 1));
+    if (PRIVATE_TOOLBOXES.has(selected[k])) removed.unshift(...selected.splice(k, 1));
   }
   return removed;
 }
