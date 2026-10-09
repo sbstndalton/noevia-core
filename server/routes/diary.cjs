@@ -32,6 +32,7 @@ const PASS = Symbol('unhandled');
  */
 function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, authService, currentWorkspace, rateLimited, connectorRate, diaryConnectors, diary, clientAddress = (req) => req.socket?.remoteAddress, addressesTrusted = false }) {
   const { diaryHeaders, corpusSource, connectorFiles } = diary;
+  const log = diary.log || ((line) => console.info(line));
   // The connector bodies are JSON objects; `null`, an array or a number is a 400 (#786).
   const readObject = requireJsonObject(readJson);
   // Older fakes pass only diaryHeaders; fall back to a single send without the 428 retry.
@@ -127,6 +128,9 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
       // #1168: only an explicit Retry press (the browser sends X-Cowork-Storage-Retry: 1) may reset the
       // sidecar's rejected-login cool-down; every automatic read goes without it.
       const storageRetry = !local && req.headers['x-cowork-storage-retry'] === '1';
+      // #1198: live QA could not tell whether a Retry press reached this point. Method, route and the
+      // account's id only: no path, no storage address, no credential.
+      if (storageRetry) log(`[diary] forwarding X-Cowork-Storage-Retry: 1 (${req.method} ${p}, user ${authn.user.id})`);
       const r = await diaryFetchJson(`${DIARY_BASE}/api${suffix}`, { method: req.method, body, storageRetry }, local ? 600000 : 60000);
       if (r.ok) return json(res, r.status, r.body);
       // #849 / #1166: the sidecar tags a storage login the server refused (424 storageLoginRejected) and a
