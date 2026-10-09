@@ -112,6 +112,9 @@ const INTERPRETERS = new Set(['python', 'python2', 'python3', 'node', 'nodejs', 
 // git options that come before the subcommand, and whether they take a separate argument.
 const GIT_GLOBAL_WITH_ARG = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path', '--super-prefix', '--config-env', '--list-cmds', '--attr-source']);
 const MAX_DEPTH = 6;
+// `find`'s actions that run a command, and how many one find may carry before it is read as anything.
+const FIND_EXEC = ['-exec', '-execdir', '-ok', '-okdir'];
+const MAX_FIND_EXECS = 64;
 
 /**
  * A small POSIX-shell reader: enough to see what a command line runs, never enough to run it.
@@ -263,7 +266,7 @@ function classifyCommand(command) { return analyzeCommand(command).action; }
 const one = (action, standable = true) => ({ actions: [action], standable });
 
 /** Classify one simple command (already unquoted words). */
-function classifyWords(input, depth) {
+function classifyWords(input, depth, viaExec = false) {
   let words = input.slice();
   let standable = true;
   let prefixed = false; // an env prefix or wrapper ran before the real command
@@ -312,6 +315,15 @@ function classifyWords(input, depth) {
     return one(ACTIONS.EXECUTE, false);
   }
   if (name === 'find') {
+    // noevia#1201: every `-exec` slice of the outer find is classified by the outer loop below,
+    // including the `-exec`s of a find that is itself run by `-exec` (the slices nest), and the
+    // outer loop sees every -delete/-fprint word too. So a find reached through -exec scans its
+    // own words but does not classify its own -exec slices again: re-reading them made nested
+    // `find -exec find -exec …` exponential. More -exec's than MAX_FIND_EXECS cannot be read
+    // cheaply: every class, never standing.
+    if (rest.filter((w) => FIND_EXEC.includes(w)).length > MAX_FIND_EXECS) {
+      return { actions: SEVERITY.filter((a) => a !== ACTIONS.NONE && a !== ACTIONS.READ), standable: false };
+    }
     const actions = new Set([ACTIONS.EXECUTE]);
     const writes = [];
     let own = true;
@@ -324,10 +336,11 @@ function classifyWords(input, depth) {
         if (k + 1 < rest.length) writes.push(rest[k + 1]);
         own = false;
       }
-      if (['-exec', '-execdir', '-ok', '-okdir'].includes(w)) {
+      if (FIND_EXEC.includes(w)) {
         own = false;
+        if (viaExec) return;
         const end = rest.findIndex((x, m) => m > k && (x === ';' || x === '+' || x === '\;'));
-        const r = classifyWords(rest.slice(k + 1, end === -1 ? undefined : end), depth + 1);
+        const r = classifyWords(rest.slice(k + 1, end === -1 ? undefined : end), depth + 1, true);
         r.actions.forEach((a) => actions.add(a));
       }
     });

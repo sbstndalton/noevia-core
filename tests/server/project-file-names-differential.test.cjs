@@ -27,7 +27,9 @@ const skipWasm = !fs.existsSync(wasmFile) && process.env.DAV_PARSE_WASM_REQUIRED
 const WASM = { impl: 'wasm' };
 
 // project_file_names::NFC_INERT_RANGES
-const INERT = [[0x0000, 0x02ff], [0x0400, 0x0482], [0x048a, 0x04ff], [0x3041, 0x3096], [0x30a1, 0x30fa], [0x4e00, 0x9fff], [0xac00, 0xd7a3]];
+const INERT = [[0x0000, 0x02ff], [0x0400, 0x0482], [0x048a, 0x04ff], [0x2010, 0x2027], [0x2030, 0x205e], [0x3001, 0x3029],
+  [0x3041, 0x3096], [0x30a1, 0x30fc], [0x4e00, 0x9fff], [0xac00, 0xd7a3], [0xff01, 0xff60], [0x1f300, 0x1f64f], [0x1f680, 0x1f6ff],
+  [0x1f900, 0x1f9ff], [0x1fa70, 0x1faff]];
 
 function quietly(fn) {
   const warn = console.warn;
@@ -62,7 +64,7 @@ test('every NFC-inert code point is its own NFC form, has class 0 and never comp
       checked++;
     }
   }
-  assert.ok(checked > 33_000, `${checked}`);
+  assert.ok(checked > 34_000, `${checked}`);
 });
 
 test('fixture rows: the same file, reason, candidates or refusal; the switched resolver agrees or refuses', { skip: skipWasm }, () => {

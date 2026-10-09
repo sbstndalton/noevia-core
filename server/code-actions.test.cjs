@@ -319,3 +319,24 @@ test('a redirect under a command still goes through the edit containment check (
   assert.equal(exec('make >> build.log').standable, true);
   assert.deepEqual(exec('make > /dev/null 2>&1').paths, []);
 });
+
+test('nested find -exec chains classify in linear time and keep every class (noevia#1201)', () => {
+  const chain = (n, tail = '') => `find ${'-exec find '.repeat(n)}${tail}`;
+  for (const n of [1, 5, 20, 40]) {
+    const t = process.hrtime.bigint();
+    const c = classify({ kind: 'execute', rawInput: { command: chain(n, '-delete') } });
+    assert.ok(Number(process.hrtime.bigint() - t) / 1e6 < 50, `${n} levels`);
+    assert.equal(c.action, ACTIONS.DELETE);
+    assert.equal(c.standable, false);
+  }
+  // What a nested find runs is still seen: the outer loop classifies every -exec slice.
+  assert.equal(classify({ kind: 'execute', rawInput: { command: 'find . -exec find . -exec git push ;' } }).action, ACTIONS.GIT_PUSH);
+  assert.equal(classify({ kind: 'execute', rawInput: { command: 'find . -exec sudo find . -exec gh pr create +' } }).action, ACTIONS.EXTERNAL);
+  // Past the -exec cap: every class, never standing, so it always needs approval (or is refused).
+  const over = classify({ kind: 'execute', rawInput: { command: `find . ${'-exec ls \\; '.repeat(65)}` } });
+  assert.equal(over.action, ACTIONS.EXTERNAL);
+  assert.ok(over.actions.includes(ACTIONS.DELETE) && over.actions.includes(ACTIONS.GIT_PUSH) && !over.actions.includes(ACTIONS.READ));
+  assert.equal(over.standable, false);
+  assert.equal(decide({ classified: over }).decision, 'ask');
+  assert.equal(decide({ classified: over, capabilities: [ACTIONS.EXECUTE] }).decision, 'deny');
+});

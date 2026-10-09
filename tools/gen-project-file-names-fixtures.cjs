@@ -30,19 +30,40 @@ function mulberry32(seed) {
 const rand = mulberry32(0xf11e);
 const pick = (list) => list[Math.floor(rand() * list.length)];
 
-// project_file_names::NFC_INERT_RANGES
-const INERT = [[0x0000, 0x02ff], [0x0400, 0x0482], [0x048a, 0x04ff], [0x3041, 0x3096], [0x30a1, 0x30fa], [0x4e00, 0x9fff], [0xac00, 0xd7a3]];
-const inertUnit = (c) => INERT.some(([a, b]) => c >= a && c <= b);
-const inert = (s) => { for (let i = 0; i < s.length; i++) if (!inertUnit(s.charCodeAt(i))) return false; return true; };
+// project_file_names::NFC_INERT_RANGES (code points) and inert_tail_len.
+const INERT = [[0x0000, 0x02ff], [0x0400, 0x0482], [0x048a, 0x04ff], [0x2010, 0x2027], [0x2030, 0x205e], [0x3001, 0x3029],
+  [0x3041, 0x3096], [0x30a1, 0x30fc], [0x4e00, 0x9fff], [0xac00, 0xd7a3], [0xff01, 0xff60], [0x1f300, 0x1f64f], [0x1f680, 0x1f6ff],
+  [0x1f900, 0x1f9ff], [0x1fa70, 0x1faff]];
+const inertCp = (cp) => INERT.some(([a, b]) => cp >= a && cp <= b);
+function tailLen(s) {
+  let i = s.length;
+  while (i > 0) {
+    const lo = s.charCodeAt(i - 1);
+    if (lo >= 0xdc00 && lo <= 0xdfff) {
+      const hi = i >= 2 ? s.charCodeAt(i - 2) : 0;
+      if (!(hi >= 0xd800 && hi <= 0xdbff) || !inertCp(0x10000 + ((hi - 0xd800) << 10) + (lo - 0xdc00))) break;
+      i -= 2;
+    } else if ((lo >= 0xd800 && lo <= 0xdbff) || !inertCp(lo)) break;
+    else i--;
+  }
+  return s.length - i;
+}
 
-/** Whether the port refuses: mirrors resolve() (invalid names are answered first). */
+/** Whether the port refuses: mirrors resolve() (invalid names are answered first; a stored name is
+ *  decided by its inert tail when that is enough, see the crate docs). */
 function strict(names, raw) {
   if (typeof raw !== 'string' || invalidReason(raw)) return false;
   const wanted = raw.trim();
-  if (!inert(wanted)) return true;
+  if (tailLen(wanted) !== wanted.length) return true;
   for (const n of names) {
-    if (!inert(n)) return true;
-    if (n === wanted) return false;
+    const at = n.length - tailLen(n);
+    if (at === 0) { if (n === wanted) return false; } else if (wanted.endsWith(n.slice(at))) return true;
+  }
+  const suffix = `/${wanted}`;
+  for (const n of names) {
+    const t = tailLen(n);
+    if (t === n.length || t >= suffix.length) continue;
+    if (suffix.endsWith(n.slice(n.length - t))) return true;
   }
   return false;
 }
@@ -90,7 +111,8 @@ rows.push(row(['cafe\u0301.md', 'caf\u00e9.md'], 'caf\u00e9.md'), row(['caf\u00e
   row(['x/\u03b1.md', 'y/b.md'], 'b.md'), row(['b.md', 'x/\u03b1.md'], 'b.md'), row(['\ud800', 'z.md'], 'z.md'));
 
 // Seeded projects and names.
-const SEG = ['a', 'b', 'notes', 'Text', 'Skills', 'noevia projects', 'P', '\u65e5\u672c', '\u0444\u0430\u0439\u043b', 'caf\u00e9', '\ud55c', 'x y', 'v1.2', '-', '_'];
+const SEG = ['a', 'b', 'notes', 'Text', 'Skills', 'noevia projects', 'P', '\u65e5\u672c', '\u0444\u0430\u0439\u043b', 'caf\u00e9', '\ud55c', 'x y', 'v1.2', '-', '_',
+  '\u03b1\u03b2', 'e\u0301', '\u2014', '\uff21', '\ud83d\ude00'];
 const EXT = ['.md', '.txt', '', '.pdf', '.MD'];
 const seg = () => pick(SEG);
 const name = () => Array.from({ length: 1 + Math.floor(rand() * 3) }, seg).join('/') + pick(EXT);
@@ -106,6 +128,14 @@ for (let i = 0; i < 400; i++) {
   if (rand() < 0.1) raw = ` ${raw}\t`;
   rows.push(row(names, raw));
 }
+
+// Wider safe table and names that are unsafe only at their head (decided by the tail).
+rows.push(row(['αβ/notes.md', 'x/notes.md'], 'x/notes.md'), row(['αβ/notes.md', 'b.md'], 'b.md'),
+  row(['αβ/notes.md'], 'notes.md'), row(['α/x/notes.md', 'y/notes.md'], 'notes.md'), row(['אב/plan.md'], 'plan.md'),
+  row(['α.md', 'x/b.md'], 'b.md'), row(['café́', 'z.md'], 'z.md'), row(['é/notes.md'], 'notes.md'),
+  row(['— draft —.md', '【memo】.md', 'ＡＢ.md', '😀.md', '🤖/ノート・1.md'], '😀.md'),
+  row(['ＡＢ.md', 'a/【memo】.md'], '【memo】.md'), row(['x/🤖.md', 'y/🤖.md'], '🤖.md'),
+  row(['☃.md'], '☃.md'), row(['a‍.md'], 'a‍.md'));
 
 // Seeded shared tails: two or more folders holding the same trailing name.
 for (let i = 0; i < 40; i++) {
