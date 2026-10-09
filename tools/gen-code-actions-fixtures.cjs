@@ -193,6 +193,11 @@ for (const n of [40, 64, 65, 1000]) {
   const call = execute(`find .${' -exec find .'.repeat(n)} -print${' \\;'.repeat(n)}`);
   classify.push({ wire: JSON.stringify([ca.classifyInput(call)]), want: JSON.stringify(ca.classifyJs(call)) });
 }
+// The JS's `'\;'` is the string ';': a literal `\;` word does not end an -exec slice (port agrees).
+{
+  const call = execute("find . -exec git fetch '\\;' --upload-pack x");
+  classify.push({ wire: JSON.stringify([ca.classifyInput(call)]), want: JSON.stringify(ca.classifyJs(call)) });
+}
 for (const n of [64, 65, 200]) {
   const call = execute(`find ${'-exec find '.repeat(n)}`);
   classify.push({ wire: JSON.stringify([ca.classifyInput(call)]), want: JSON.stringify(ca.classifyJs(call)) });
