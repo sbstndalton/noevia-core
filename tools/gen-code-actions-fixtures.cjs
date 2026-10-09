@@ -186,10 +186,16 @@ for (const call of calls) {
   classify.push({ wire, want: JSON.stringify(answer) });
   classified.push(answer);
 }
-// `find -exec find \u2026` nested past the port's limit: the JS re-reads every later -exec from each
-// earlier one (exponential), the port refuses. No JS answer is computed for these.
-for (const n of [65, 200]) {
-  classify.push({ wire: JSON.stringify([ca.classifyInput(execute(`find ${'-exec find '.repeat(n)}`))]), refused: 'too_large' });
+// noevia#1201/#1212: nested `find -exec find \u2026` chains are linear in the JS and in the port (a find
+// reached through -exec does not re-read its own -exec's); past 64 -exec's both answer every class.
+// The #1212 probe shape (`find .`, n \u00d7 `-exec find .`, `-print`, n \u00d7 `\;`) and the bare shape.
+for (const n of [40, 64, 65, 1000]) {
+  const call = execute(`find .${' -exec find .'.repeat(n)} -print${' \\;'.repeat(n)}`);
+  classify.push({ wire: JSON.stringify([ca.classifyInput(call)]), want: JSON.stringify(ca.classifyJs(call)) });
+}
+for (const n of [64, 65, 200]) {
+  const call = execute(`find ${'-exec find '.repeat(n)}`);
+  classify.push({ wire: JSON.stringify([ca.classifyInput(call)]), want: JSON.stringify(ca.classifyJs(call)) });
 }
 
 // \u2500\u2500 decide \u2500\u2500

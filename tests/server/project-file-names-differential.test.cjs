@@ -7,7 +7,7 @@
 // live projects with non-ASCII names check that the port agrees or refuses (never another file) and
 // that the switched resolver never resolves what the JS does not. The port's NFC-inert table is
 // checked exhaustively against this runtime's own normalize(), so the shortcut holds on the shipped
-// ICU too. The WebAssembly half needs server/wasm/dav-parse.wasm (or DAV_PARSE_WASM); skipped
+// ICU too; so is its base + combining-mark composition table (noevia#1211). The WebAssembly half needs server/wasm/dav-parse.wasm (or DAV_PARSE_WASM); skipped
 // without it unless DAV_PARSE_WASM_REQUIRED=1.
 
 const assert = require('node:assert/strict');
@@ -65,6 +65,46 @@ test('every NFC-inert code point is its own NFC form, has class 0 and never comp
     }
   }
   assert.ok(checked > 34_000, `${checked}`);
+});
+
+test('every base + mark composition the port reads is one NFC-inert code point, stable across inert neighbours (noevia#1211)', () => {
+  let pairs = 0;
+  for (let base = 0; base < 0x300; base++) {
+    for (let mark = 0x300; mark < 0x370; mark++) {
+      const nfc = [...String.fromCharCode(base, mark).normalize('NFC')];
+      if (nfc.length !== 1 || nfc[0].codePointAt(0) >= 0x300) continue;
+      pairs++;
+      // NFC of (inert) + pair + (inert) is the parts' NFC: the crate's compose_pairs argument.
+      for (const [x, y] of [['a', '.md'], ['\u00e9', '\u65e5'], ['\u0430', '\ud83d\ude00'], ['', '']]) {
+        const s = `${x}${String.fromCharCode(base, mark)}${y}`;
+        assert.equal(s.normalize('NFC'), `${x}${nfc[0]}${y}`, `U+${base.toString(16)} U+${mark.toString(16)}`);
+      }
+    }
+  }
+  assert.ok(pairs >= 300, `${pairs}`);
+});
+
+test('the port composes exactly the runtime\u2019s base + mark pairs, and refuses every other one (noevia#1211)', { skip: skipWasm }, () => {
+  let composed = 0, refused = 0;
+  for (let base = 0; base < 0x300; base++) {
+    for (let mark = 0x300; mark < 0x370; mark++) {
+      for (const raw of [`a${String.fromCharCode(base, mark)}.md`, `a${String.fromCharCode(base, mark)}`]) {
+        if (pf.invalidReason(raw)) continue;
+        const nfc = raw.normalize('NFC');
+        const pair = [...String.fromCharCode(base, mark).normalize('NFC')];
+        let port = null;
+        try { port = davParseWasm.projectFileNames([nfc], raw); } catch (e) { assert.equal(e.reason, 'ambiguous'); }
+        if (pair.length === 1 && pair[0].codePointAt(0) < 0x300) {
+          assert.deepEqual(port, { file: 0 }, `U+${base.toString(16)} U+${mark.toString(16)}`);
+          composed++;
+        } else {
+          assert.equal(port, null, `U+${base.toString(16)} U+${mark.toString(16)}`);
+          refused++;
+        }
+      }
+    }
+  }
+  assert.ok(composed >= 500 && refused > 100_000, `${composed} composed, ${refused} refused`);
 });
 
 test('fixture rows: the same file, reason, candidates or refusal; the switched resolver agrees or refuses', { skip: skipWasm }, () => {

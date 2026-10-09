@@ -142,9 +142,18 @@ test('seeded live calls: the port agrees or refuses as documented; the switched 
   assert.ok(agreed > 8000 && refusedUnsure > 0, `${agreed} agreed, ${refusedUnsure} refused (unsure hosts)`);
 });
 
-test('find -exec chains: the port refuses past its bound instead of the JS blow-up', { skip: skipWasm }, () => {
-  const t = Date.now();
-  const projection = ca.classifyInput({ kind: 'execute', rawInput: { command: `find ${'-exec find '.repeat(5000)}` } });
-  assert.equal(refusal(() => davParseWasm.codeActionsClassify(projection)), 'too_large');
-  assert.ok(Date.now() - t < 10_000);
+test('find -exec chains: linear, the same answer as the JS, and refusals in well under 10 ms (noevia#1212)', { skip: skipWasm }, () => {
+  const call = (command) => ({ kind: 'execute', rawInput: { command }, locations: [] });
+  const timed = (fn) => { let best = Infinity, out; for (let i = 0; i < 5; i++) { const t = process.hrtime.bigint(); out = fn(); best = Math.min(best, Number(process.hrtime.bigint() - t) / 1e6); } return [out, best]; };
+  for (const n of [40, 64, 65, 1000, 5000]) {
+    const c = call(`find .${' -exec find .'.repeat(n)} -print${' \\;'.repeat(n)}`);
+    const [r, ms] = timed(() => davParseWasm.codeActionsClassify(ca.classifyInput(c)).text);
+    assert.equal(r, JSON.stringify(ca.classifyJs(c)), `${n}`);
+    assert.ok(ms < 10, `${n} levels: ${ms} ms`);
+  }
+  for (const command of [`find .${' -exec find .'.repeat(64)}${' x'.repeat(20_000)}`, 'a;'.repeat(120_000), '$(a) '.repeat(30_000), 'x'.repeat(2 * 1024 * 1024)]) {
+    const [why, ms] = timed(() => refusal(() => davParseWasm.codeActionsClassify(ca.classifyInput(call(command)))));
+    assert.equal(why, 'too_large');
+    assert.ok(ms < 10, `${command.length} chars: ${ms} ms`);
+  }
 });

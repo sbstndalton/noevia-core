@@ -11,8 +11,12 @@
 // {"code":"missing"} or {"code":"ambiguous","candidates":[i,\u2026]}. Names are synthetic and the random
 // ones come from a seeded mulberry32. Nothing recorded depends on ICU (#1115): the JS compares NFC
 // forms, so a row is recorded with its answer only when every string the port compares is made of
-// NFC-inert code units (the crate's table, mirrored below), where NFC is the identity on every ICU.
-// The other rows are strict: the port refuses them (ambiguous) and no JS answer is recorded.
+// NFC-inert code units (the crate's table, mirrored below), where NFC is the identity on every ICU,
+// after the port's one composition step (noevia#1211, project_file_names::compose_pairs): an inert
+// base U+0000-U+02FF, one mark U+0300-U+036F and then an inert code point or the end, composed when
+// NFC makes one code point below U+0300 of the pair (canonical compositions, fixed by Unicode's
+// stability policy). The other rows are strict: the port refuses them (ambiguous) and no JS answer
+// is recorded.
 //
 // Each row is { wire, want } or { wire, refused }: `wire` is JSON [names, raw] (op 1).
 
@@ -49,12 +53,37 @@ function tailLen(s) {
   return s.length - i;
 }
 
+// project_file_names::compose_pairs (its NFC_PAIRS table is these pairs, generated from normalize()).
+const pairOf = (base, mark) => {
+  const nfc = [...String.fromCharCode(base, mark).normalize('NFC')];
+  return nfc.length === 1 && nfc[0].codePointAt(0) < 0x300 ? nfc[0] : null;
+};
+/** project_file_names::inert_head: `s` starts with a whole NFC-inert code point. */
+function inertHead(s) {
+  const cp = s.codePointAt(0);
+  if (cp === undefined || (cp >= 0xd800 && cp <= 0xdfff)) return false;
+  return inertCp(cp);
+}
+function composePairs(s) {
+  let out = '';
+  for (let i = 0; i < s.length;) {
+    const c = s.charCodeAt(i), m = s.charCodeAt(i + 1);
+    if (c < 0x300 && m >= 0x300 && m < 0x370 && (i + 2 === s.length || inertHead(s.slice(i + 2)))) {
+      const p = pairOf(c, m);
+      if (p) { out += p; i += 2; continue; }
+    }
+    out += s[i]; i++;
+  }
+  return out;
+}
+
 /** Whether the port refuses: mirrors resolve() (invalid names are answered first; a stored name is
  *  decided by its inert tail when that is enough, see the crate docs). */
 function strict(names, raw) {
   if (typeof raw !== 'string' || invalidReason(raw)) return false;
-  const wanted = raw.trim();
+  const wanted = composePairs(raw.trim());
   if (tailLen(wanted) !== wanted.length) return true;
+  names = names.map(composePairs);
   for (const n of names) {
     const at = n.length - tailLen(n);
     if (at === 0) { if (n === wanted) return false; } else if (wanted.endsWith(n.slice(at))) return true;
@@ -79,7 +108,7 @@ function row(names, raw) {
   else if (r.code === 'missing') want = { code: 'missing' };
   else if (r.code === 'ambiguous') {
     const w = raw.trim();
-    const candidates = names.flatMap((n, i) => (n.endsWith(`/${w}`) ? [i] : []));
+    const candidates = names.flatMap((n, i) => (n.normalize('NFC').endsWith(`/${w.normalize('NFC')}`) ? [i] : []));
     if (candidates.length !== r.candidates.length || candidates.some((i, k) => names[i] !== r.candidates[k])) throw Error('candidate indices');
     want = { code: 'ambiguous', candidates };
   } else throw Error(`unexpected answer ${r.code}`);
@@ -97,8 +126,11 @@ const RAW = [
   '', '   ', '../notes.md', './notes.md', 'Text/../notes.md', 'Text//notes.md', 'notes.md/', '/notes.md', 'C:/notes.md', 'c:/x', 'C:notes.md',
   'Text\\notes.md', 'notes\u0000.md', 'notes\u001f.md', 'notes\u007f.md', '%2e%2e/notes.md', '%2Fetc', '%5c', '%00', '%2', '%41notes.md',
   '..', '.', 'a/./b', 'x'.repeat(1024), 'x'.repeat(1025), ` ${'y'.repeat(1024)} `, 5, null, undefined, true, ['notes.md'], { name: 'notes.md' },
-  // strict: the port does not normalise
-  'cafe\u0301.md', 'notes.md\u0301', '\u03b1.md', '\u05d0.md', '\ud800.md', 'n\u00e9e\u0300.md',
+  // one table mark after an inert base composes (noevia#1211)
+  'cafe\u0301.md', 'Cafe\u0301.md', 'n\u00e9e\u0300.md', 'Text/cafe\u0301.md', 'cafe\u0340.md',
+  // strict: the port does not normalise anything else
+  'notes.md\u0301', '\u03b1.md', '\u05d0.md', '\ud800.md', 'cafu\u0308\u0301.md', 'cafe\u0301\u0301.md', 'cafe\u0301\u03b1.md',
+  'caq\u0301.md', '\u0301notes.md', 'cafe\u0323\u0301.md',
 ];
 const rows = [];
 for (const raw of RAW) rows.push(row(PROJECT, raw));
@@ -136,6 +168,11 @@ rows.push(row(['αβ/notes.md', 'x/notes.md'], 'x/notes.md'), row(['αβ/notes.m
   row(['— draft —.md', '【memo】.md', 'ＡＢ.md', '😀.md', '🤖/ノート・1.md'], '😀.md'),
   row(['ＡＢ.md', 'a/【memo】.md'], '【memo】.md'), row(['x/🤖.md', 'y/🤖.md'], '🤖.md'),
   row(['☃.md'], '☃.md'), row(['a‍.md'], 'a‍.md'));
+
+// noevia#1211: NFD names (one table mark) on either side, in an exact or a suffix match.
+rows.push(row(['Caf\u00e9.md'], 'Cafe\u0301.md'), row(['Cafe\u0301.md'], 'Caf\u00e9.md'), row(['x/Cafe\u0301.md', 'y/Caf\u00e9.md'], 'Caf\u00e9.md'),
+  row(['Text/Cafe\u0301.md', 'b.md'], 'b.md'), row(['Caf\u00e9/x.md'], 'Cafe\u0301/x.md'), row(['u\u0308\u0301.md'], '\u01d8.md'),
+  row(['\u00fc\u0301.md'], '\u01d8.md'), row(['\u01d8.md'], 'u\u0308\u0301.md'), row(['A\u030a.md'], '\u00c5.md'), row(['A\u030a.md'], '\u212b.md'));
 
 // Seeded shared tails: two or more folders holding the same trailing name.
 for (let i = 0; i < 40; i++) {

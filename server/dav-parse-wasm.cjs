@@ -1855,7 +1855,7 @@ function llamacppAutoconfig(op, args) {
 // --- code actions (CODE_ACTIONS_IMPL) and project file names (PROJECT_FILE_NAMES_IMPL) ----------
 // code_actions::MAX_INPUT_BYTES and project_file_names::MAX_INPUT_BYTES (the op byte and the JSON).
 // A tool call's command text and a project's file names carry no credentials: ordinary calls.
-const MAX_CODE_ACTIONS_BYTES = 8 * 1024 * 1024 + 1;
+const MAX_CODE_ACTIONS_BYTES = 2 * 1024 * 1024 + 1;
 const MAX_PROJECT_FILE_NAMES_BYTES = 8 * 1024 * 1024 + 1;
 const CODE_ACTION_NAMES = new Set(['read_repository', 'edit_file', 'execute_command', 'install_dependency', 'network',
   'delete', 'git_push', 'open_browser', 'external_account', 'none']);

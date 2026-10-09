@@ -27,7 +27,7 @@
 // is in dav-parse-wasm.cjs IMPL_FLAGS (a missing or tampered module stops startup). Stricter than the
 // JS (the crate docs): a command array element that is not a string, boolean, null or safe integer;
 // in the network branch of decide, a URL host outside the plain-ASCII, non-IP-shorthand subset; more
-// than 64 MiB-units of reading work or `find -exec find` nested past 64 levels; input over 8 MiB.
+// than 256 Ki-units of reading work (noevia#1212: every refusal in well under 10 ms); input over 2 MiB.
 
 /** noevia's action classes (spec §3 "Permissions"). */
 const ACTIONS = Object.freeze({
