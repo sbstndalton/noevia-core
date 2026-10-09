@@ -56,11 +56,13 @@ function createDiary({ fs, path, fetchJson, DIARY_BASE, DIARY_TOKEN, DIARY_TENAN
    * the header-less DIARY_LEGACY_USER_ID fallback when keyed.
    * @param {string} [method]
    * @param {string} [url]
-   * @param {{ secret?: boolean, body?: string|Buffer, contentType?: string }} [opts]
+   * @param {{ secret?: boolean, body?: string|Buffer, contentType?: string, storageRetry?: boolean }} [opts]
    *   secret: attach the remote storage secret (428 retry, backup)
+   *   storageRetry: the person pressed Retry (#1168), so the sidecar may reset a rejected-login cool-down
    */
-  function diaryHeaders(method = 'GET', url = '', { secret = false, body, contentType = 'application/json' } = {}) {
+  function diaryHeaders(method = 'GET', url = '', { secret = false, body, contentType = 'application/json', storageRetry = false } = {}) {
     const h = { 'Content-Type': contentType };
+    if (storageRetry === true) h['X-Cowork-Storage-Retry'] = '1';
     if (DIARY_TOKEN) h.Authorization = `Bearer ${DIARY_TOKEN}`;
     const workspace = requestScope.getStore()?.workspace;
     if (workspace) {
@@ -100,8 +102,8 @@ function createDiary({ fs, path, fetchJson, DIARY_BASE, DIARY_TOKEN, DIARY_TENAN
   }
 
   /** fetchJson against the sidecar with tenant headers and the 428 retry. */
-  function diaryFetchJson(url, { method = 'GET', body } = {}, timeoutMs) {
-    return withStorageCredential((secret) => fetchJson(url, { method, headers: diaryHeaders(method, url, { secret, body }), body }, timeoutMs));
+  function diaryFetchJson(url, { method = 'GET', body, storageRetry = false } = {}, timeoutMs) {
+    return withStorageCredential((secret) => fetchJson(url, { method, headers: diaryHeaders(method, url, { secret, body, storageRetry }), body }, timeoutMs));
   }
 
   // ── Corpus-source adapter (Diary tab reads) ────────────────────────────────

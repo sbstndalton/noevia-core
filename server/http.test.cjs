@@ -203,3 +203,12 @@ test('#781: answerUnhandled answers instead of resetting the connection', () => 
   assert.doesNotThrow(() => answerUnhandled(broken, new Error('x'), log));
   assert.equal(broken.destroyedBy, 1, 'when even the answer fails, the socket is released');
 });
+
+test('json: extra headers (Retry-After) ride along without replacing the JSON defaults', () => {
+  const seen = [];
+  const res = { writeHead: (code, headers) => seen.push([code, headers]), end: (text) => seen.push(text) };
+  json(res, 503, { error: 'wait' }, { 'Retry-After': '9' });
+  assert.deepEqual(seen, [[503, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'Retry-After': '9' }], '{"error":"wait"}']);
+  json(res, 200, {});
+  assert.deepEqual(seen[2], [200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }]);
+});

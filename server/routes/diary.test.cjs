@@ -12,7 +12,7 @@ function fixture({ diaryOn = true, limited = false, connectorLimited = false, ad
   const rateKeys = [];
   const credentials = [{ id: 'a'.repeat(32), name: 'Claude Diary' }];
   const routes = createDiaryRoutes({
-    json: (res, status, body) => { sent.push({ status, body }); },
+    json: (res, status, body, extra) => { sent.push({ status, body, ...(extra ? { headers: extra } : {}) }); },
     readBody: async (req) => { let s = ''; for await (const c of req) s += c; return s; },
     readJson: require('../http.cjs').readJson,
     fetchJson: async (url, init) => { fetched.push({ url, init }); return reply ? reply(url, init) : { ok: true, status: 200, body: { ok: true } }; },
@@ -27,7 +27,7 @@ function fixture({ diaryOn = true, limited = false, connectorLimited = false, ad
       list: () => credentials, create: (userId, name) => ({ id: 'b'.repeat(32), name, userId }), revoke: (userId, id) => id === credentials[0].id,
     },
     diary: {
-      diaryHeaders: () => ({ 'X-Cowork-User-ID': 'u1' }),
+      diaryHeaders: (method, url, opts) => ({ 'X-Cowork-User-ID': 'u1', ...(opts?.storageRetry ? { 'X-Cowork-Storage-Retry': '1' } : {}) }),
       corpusSource: { name: 'sidecar', listMonths: async () => [{ id: '2026-09', label: '2026-09' }], readMonth: async (m) => ({ todayLog: m || 'today', standing: '' }) },
       connectorFiles: { list: async () => [], read: async () => ({}), write: async () => ({}) },
     },
@@ -203,4 +203,38 @@ test('#849: a storage login the sidecar reports as refused reaches the browser a
   const other = fixture({ reply: () => ({ ok: false, status: 500, body: { detail: 'boom', code: 'internal-detail' } }) });
   await other.call('diary', 'GET', '/api/diary/files');
   assert.deepEqual(other.sent.pop(), { status: 500, body: { error: 'boom' } });
+});
+
+test('#1168: a storage throttle reaches the browser with its code, wait and Retry-After header', async () => {
+  const throttled = { ok: false, status: 503, body: { detail: 'The storage server is limiting sign-ins. Try again in 42 seconds.', code: 'storageThrottled', retryAfter: 41.2 } };
+  const f = fixture({ reply: () => throttled });
+  await f.call('diary', 'GET', '/api/diary/files', undefined, { search: '?path=Notes' });
+  assert.deepEqual(f.sent.pop(), { status: 503, body: { error: throttled.body.detail, code: 'storageThrottled', retryAfter: 42 }, headers: { 'Retry-After': '42' } });
+  // A missing or nonsense wait is dropped, not invented; the code still passes.
+  for (const retryAfter of [undefined, 'soon', -5, 0]) {
+    const odd = fixture({ reply: () => ({ ok: false, status: 503, body: { detail: 'wait', code: 'storageThrottled', retryAfter } }) });
+    await odd.call('diary', 'POST', '/api/diary/file', { path: 'a.md' });
+    assert.deepEqual(odd.sent.pop(), { status: 503, body: { error: 'wait', code: 'storageThrottled' } }, String(retryAfter));
+  }
+  // The wait is capped so a hostile sidecar value cannot become a day-long header.
+  const huge = fixture({ reply: () => ({ ok: false, status: 503, body: { detail: 'wait', code: 'storageThrottled', retryAfter: 1e9 } }) });
+  await huge.call('diary', 'GET', '/api/diary/files');
+  assert.equal(huge.sent.pop().headers['Retry-After'], '86400');
+});
+
+test('#1168: X-Cowork-Storage-Retry: 1 from the browser reaches the sidecar only on a files/file read, and only as "1"', async () => {
+  const f = fixture();
+  await f.call('diary', 'GET', '/api/diary/files', undefined, { search: '?path=Notes', reqHeaders: { 'x-cowork-storage-retry': '1' } });
+  assert.equal(f.fetched.pop().init.headers['X-Cowork-Storage-Retry'], '1', 'an explicit Retry is forwarded');
+  await f.call('diary', 'GET', '/api/diary/files', undefined, { search: '?path=Notes' });
+  assert.equal('X-Cowork-Storage-Retry' in f.fetched.pop().init.headers, false, 'an automatic read is not');
+  for (const value of ['0', 'true', '1,1', '']) {
+    await f.call('diary', 'GET', '/api/diary/files', undefined, { reqHeaders: { 'x-cowork-storage-retry': value } });
+    assert.equal('X-Cowork-Storage-Retry' in f.fetched.pop().init.headers, false, JSON.stringify(value));
+  }
+  await f.call('diary', 'POST', '/api/diary/file', { path: 'a.md' }, { reqHeaders: { 'x-cowork-storage-retry': '1' } });
+  assert.equal(f.fetched.pop().init.headers['X-Cowork-Storage-Retry'], '1');
+  // Not on the chat exchange: a retry press is a file-list action.
+  await f.call('diary', 'POST', '/api/diary/local-exchange', { message: 'hi' }, { reqHeaders: { 'x-cowork-storage-retry': '1' } });
+  assert.equal('X-Cowork-Storage-Retry' in f.fetched.pop().init.headers, false);
 });

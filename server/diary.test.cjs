@@ -92,3 +92,12 @@ test('callDiaryFile runs as the named user and refuses accounts without the Diar
   const silent = fixture({ reply: () => ({ ok: false, status: 0, body: null }) });
   await assert.rejects(silent.diary.connectorFiles.read('u1', 'x.md'), (e) => e.status === 502 && /read the current version before retrying a write/.test(e.message));
 });
+
+test('#1168: diaryFetchJson sends X-Cowork-Storage-Retry only when asked, and the 428 resend keeps it', async () => {
+  const { diary, fetched, asUser } = fixture();
+  await asUser('u1', () => diary.diaryFetchJson('http://diary:8010/api/files?path=', {}, 1000));
+  assert.equal('X-Cowork-Storage-Retry' in fetched.pop().init.headers, false, 'automatic reads never carry it');
+  await asUser('u1', () => diary.diaryFetchJson('http://diary:8010/api/files?path=', { storageRetry: true }, 1000));
+  assert.equal(fetched.pop().init.headers['X-Cowork-Storage-Retry'], '1');
+  assert.equal(diary.diaryHeaders('GET', 'http://diary:8010/api/files', { storageRetry: false })['X-Cowork-Storage-Retry'], undefined);
+});

@@ -35,7 +35,7 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
   // The connector bodies are JSON objects; `null`, an array or a number is a 400 (#786).
   const readObject = requireJsonObject(readJson);
   // Older fakes pass only diaryHeaders; fall back to a single send without the 428 retry.
-  const diaryFetchJson = diary.diaryFetchJson || ((url, { method = 'GET', body } = {}, timeoutMs) => fetchJson(url, { method, headers: diaryHeaders(method, url, { body }), body }, timeoutMs));
+  const diaryFetchJson = diary.diaryFetchJson || ((url, { method = 'GET', body, storageRetry = false } = {}, timeoutMs) => fetchJson(url, { method, headers: diaryHeaders(method, url, { body, storageRetry }), body }, timeoutMs));
 
   async function connector(req, res, { path: p }) {
     if(p==='/api/diary-connector') {
@@ -124,11 +124,21 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
           method:'POST', headers:(secret)=>diaryHeaders('POST', target, { secret, body }), body,
         }, {withStorageCredential:diary.withStorageCredential, onEvent:event=>{if(event.type==='mtp')require('../mtp.cjs').record(authn.user.id,event.model,event.timings);}});
       }
-      const r = await diaryFetchJson(`${DIARY_BASE}/api${suffix}`, { method: req.method, body }, local ? 600000 : 60000);
-      // #849: the sidecar tags a storage login the server refused (424, code storageLoginRejected); the
-      // code is passed on so the browser words it in the interface language. Nothing else is passed.
-      const code = r.body?.code === 'storageLoginRejected' ? { code: r.body.code } : {};
-      return json(res, r.status, r.ok ? r.body : { error: r.body?.detail || r.body?.error || 'Diary storage request failed', ...code });
+      // #1168: only an explicit Retry press (the browser sends X-Cowork-Storage-Retry: 1) may reset the
+      // sidecar's rejected-login cool-down; every automatic read goes without it.
+      const storageRetry = !local && req.headers['x-cowork-storage-retry'] === '1';
+      const r = await diaryFetchJson(`${DIARY_BASE}/api${suffix}`, { method: req.method, body, storageRetry }, local ? 600000 : 60000);
+      if (r.ok) return json(res, r.status, r.body);
+      // #849 / #1166: the sidecar tags a storage login the server refused (424 storageLoginRejected) and a
+      // storage server that is throttling us (503 storageThrottled + Retry-After). The code and the wait
+      // are passed on so the browser words them in the interface language. Nothing else is passed.
+      const error = r.body?.detail || r.body?.error || 'Diary storage request failed';
+      if (r.body?.code === 'storageThrottled') {
+        const wait = Number(r.body.retryAfter);
+        const retryAfter = Number.isFinite(wait) && wait > 0 ? Math.min(Math.ceil(wait), 86400) : null;
+        return json(res, r.status, { error, code: 'storageThrottled', ...(retryAfter ? { retryAfter } : {}) }, retryAfter ? { 'Retry-After': String(retryAfter) } : undefined);
+      }
+      return json(res, r.status, { error, ...(r.body?.code === 'storageLoginRejected' ? { code: r.body.code } : {}) });
     }
 
     if (p === '/api/diary/source') {
