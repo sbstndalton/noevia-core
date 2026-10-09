@@ -262,7 +262,7 @@ const GROUPS = new Set(['Documents', 'Images', 'Text', 'Other']);
 const REFUSALS = new Map([['filename', 400], ['empty', 400], ['too_big', 413], ['archive', 400]]);
 const UPLOAD_CAP = 25 * 1024 * 1024;
 
-/** upload-sniff.cjs validateJs (#977), through the module: null when accepted, else
+/** tests/server/oracle/upload-sniff.cjs validateJs (#977), through the module: null when accepted, else
  *  `{ refusal: 'filename'|'empty'|'too_big'|'archive', status }`. Only what decides the answer
  *  crosses: the name (cut to 201 UTF-16 units: anything longer fails the 200-unit rule either way),
  *  the length (clamped to CAP + 1) and the first SNIFF_BYTES bytes. */
@@ -285,7 +285,7 @@ function uploadValidate(name, bytes) {
   return { refusal: value.refusal, status: value.status };
 }
 
-/** upload-sniff.cjs classifyJs (#977), through the module. */
+/** tests/server/oracle/upload-sniff.cjs classifyJs (#977), through the module. */
 function uploadClassify(name) {
   if (typeof name !== 'string') throw new DavParseError('upload name must be text', 'input');
   // A lone surrogate crosses as U+FFFD; neither can be part of a known extension.
@@ -300,7 +300,7 @@ function uploadClassify(name) {
 
 const ENCODINGS = [null, 'utf-8', 'utf-16le', 'utf-16be', 'windows-1252'];
 
-/** upload-sniff.cjs decodeTextJs (#977), through the module: null (not text) or
+/** tests/server/oracle/upload-sniff.cjs decodeTextJs (#977), through the module: null (not text) or
  *  `{ text, encoding }`. The whole upload crosses (decoding needs it), at most MAX_DECODE_BYTES. */
 function uploadDecode(bytes) {
   if (!(bytes instanceof Uint8Array)) throw new DavParseError('upload bytes have the wrong type', 'input');
