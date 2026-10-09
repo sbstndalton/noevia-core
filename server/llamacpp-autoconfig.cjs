@@ -107,7 +107,7 @@ const round2 = n => Math.round(n * 100) / 100;
  * @param {object} [p.current]  current section options
  * @param {number} [p.cacheRamMaxMib]
  */
-function suggest({ meta, modelBytes, mmprojBytes = 0, budgetGib, current = {}, cacheRamMaxMib = 1024 }) {
+function suggestJs({ meta, modelBytes, mmprojBytes = 0, budgetGib, current = {}, cacheRamMaxMib = 1024 }) {
   const m = meta || {};
   if (!(budgetGib > RESERVE_GIB)) return { error: 'No inference memory budget is configured to size against.' };
   if (!m.hasChatTemplate || /bert/i.test(m.arch || '')) return { error: 'Suggestions cover chat models only. Embedding and projector files keep their qualified settings.' };
@@ -176,7 +176,7 @@ function suggest({ meta, modelBytes, mmprojBytes = 0, budgetGib, current = {}, c
  * KV rows are sized at q8_0 (the cache type suggest() uses); the client rescales them per
  * cache type. Nothing here depends on the budget, so it is safe to return without one.
  */
-function estimateInputs({ meta, modelBytes, mmprojBytes = 0, current = {} }) {
+function estimateInputsJs({ meta, modelBytes, mmprojBytes = 0, current = {} }) {
   const m = meta || {};
   const chat = !!m.hasChatTemplate && !/bert/i.test(m.arch || '');
   let pinnedGib = 0;
@@ -218,7 +218,7 @@ function cacheRamMibOf(value) {
  *           + cache-ram
  * `options` are the effective preset options ({...'*', ...section}).
  */
-function estimateFootprint({ meta, modelBytes, mmprojBytes = 0, options = {}, model = '' }) {
+function estimateFootprintJs({ meta, modelBytes, mmprojBytes = 0, options = {}, model = '' }) {
   const m = meta || {};
   const native = m.contextLength || 0;
   const ctx = Number(options['ctx-size'] || options.c) || native || 4096;
@@ -250,4 +250,156 @@ function parseMemoryLimit(value) {
   return Number(match[1]) * scale;
 }
 
-module.exports = { isPromptCacheFree, suggest, estimateInputs, estimateFootprint, cacheRamMibOf, kvCacheBytes, parseMemoryLimit, CTX_CANDIDATES, KV_TYPE_BYTES, LLAMA_CACHE_RAM_DEFAULT_MIB };
+// ── LLAMACPP_AUTOCONFIG_IMPL ────────────────────────────────────────────────────────────────
+// js (default; any other value means js, with one warning) or wasm, read from the `env` option
+// (process.env) on every call. wasm also asks noevia-rs's llamacpp-autoconfig crate (dav-parse.wasm
+// llamacpp_autoconfig) for suggest, estimateInputs and estimateFootprint. The JS stays authoritative:
+// its answer is returned as is when the port's reply is byte-identical to JSON.stringify of it. When
+// the port refuses, faults or disagrees, the JS answer is still returned if it is the conservative
+// one (logged once per reason, text-free):
+//   suggest           the JS offered no settings (an error), or every sized knob (ctx-size,
+//                     cache-ram, n-gpu-layers, parallel, ubatch/batch-size, image-max-tokens) is at
+//                     most the port's and the rest (cache types, flash-attn, spec-type) are equal;
+//   estimateFootprint the JS estimate already refuses the load (unbounded prompt cache, or a NaN
+//                     total), or its total is at least the port's, the port's prompt cache is
+//                     bounded and the port can size every model the JS sizes;
+//   estimateInputs    every JS figure (model, projector, each KV row, prompt cache) is at least the
+//                     port's, over the same context rows, with chat, moe, nativeCtx and the current
+//                     ctx and kv equal (noevia#1134).
+// Otherwise suggest returns an error (no settings, code 'autoconfig_impl') and the two estimates
+// throw an AutoconfigImplError, which llamacpp-manager.cjs turns into a refused load or save (or a
+// 503 for the read-only panel). So the port never makes a suggestion or a load larger than the JS
+// would, and nothing here loads a model. When the JS throws, the port is not asked. The flag is in
+// dav-parse-wasm.cjs IMPL_FLAGS (a missing or tampered module stops startup).
+// cacheRamMibOf, isPromptCacheFree, parseMemoryLimit and kvCacheBytes are ported too (and checked by
+// the differential tests) but not switched: their switched callers above verify their results.
+// Stricter than the JS (the crate docs): see llamacpp-autoconfig-differential.test.cjs's strict
+// table; those inputs are a port refusal, handled as above.
+
+const IMPLS = new Set(['js', 'wasm']);
+let warnedImpl = '';
+/** LLAMACPP_AUTOCONFIG_IMPL: 'js' (default) or 'wasm'. */
+function autoconfigImpl(env = process.env) {
+  const raw = env?.LLAMACPP_AUTOCONFIG_IMPL;
+  if (raw === undefined || raw === '') return 'js';
+  const value = String(raw).trim().toLowerCase();
+  if (IMPLS.has(value)) return value;
+  if (warnedImpl !== value) {
+    warnedImpl = value;
+    console.warn(`[llamacpp-autoconfig] LLAMACPP_AUTOCONFIG_IMPL=${JSON.stringify(String(raw))} is not js or wasm; using js`);
+  }
+  return 'js';
+}
+const defaultLoader = () => require('./dav-parse-wasm.cjs');
+
+/** The port could not confirm an estimate and the JS one is not the conservative answer. */
+class AutoconfigImplError extends Error {
+  constructor(what) {
+    super(`the memory estimate (${what}) could not be confirmed by the Rust sizing port (LLAMACPP_AUTOCONFIG_IMPL=wasm), and the JS estimate is not the larger one. Set LLAMACPP_AUTOCONFIG_IMPL=js to size with the JS alone.`);
+    this.name = 'AutoconfigImplError';
+    this.code = 'autoconfig_impl';
+    this.status = 503;
+  }
+}
+const IMPL_SUGGEST_ERROR = 'No settings suggested: the Rust sizing port (LLAMACPP_AUTOCONFIG_IMPL=wasm) did not confirm this suggestion and the JS one is not the smaller. Set LLAMACPP_AUTOCONFIG_IMPL=js, or size the context manually and load-test it.';
+
+const warnedPort = new Set();
+function portWarn(fn, event, reason) {
+  const key = `${fn}:${event}:${reason}`;
+  if (warnedPort.has(key)) return;
+  warnedPort.add(key);
+  console.warn(`[llamacpp-autoconfig] ${fn}.${event} (${reason})`);
+}
+
+const isObj = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
+const num = (v) => (typeof v === 'number' ? v : NaN);
+const SIZED_KNOBS = new Set(['ctx-size', 'parallel', 'n-gpu-layers', 'cache-ram', 'ubatch-size', 'batch-size', 'image-max-tokens']);
+const EQUAL_KNOBS = new Set(['flash-attn', 'cache-type-k', 'cache-type-v', 'spec-type']);
+
+/** True when the JS suggestion is no larger than the port's (or suggests nothing). */
+function suggestionIsConservative(js, port) {
+  if (!isObj(js)) return false;
+  if (typeof js.error === 'string' && js.values === undefined) return true;
+  if (!isObj(js.values) || !isObj(port) || !isObj(port.values)) return false;
+  const keys = Object.keys(js.values);
+  if (keys.length !== Object.keys(port.values).length) return false;
+  return keys.every((k) => {
+    if (!Object.prototype.hasOwnProperty.call(port.values, k)) return false;
+    const a = js.values[k], b = port.values[k];
+    if (EQUAL_KNOBS.has(k)) return a === b;
+    if (!SIZED_KNOBS.has(k) || typeof a !== 'string' || typeof b !== 'string') return false;
+    return Number(a) <= Number(b);
+  });
+}
+
+/** True when the JS footprint refuses at least whatever the port's would. */
+function footprintIsConservative(js, port) {
+  if (!isObj(js)) return false;
+  if (js.cacheRamUnbounded === true) return true;
+  if (Number.isNaN(js.totalGib)) return true; // NaN <= budget is false: the load is refused
+  if (!isObj(port) || port.cacheRamUnbounded !== false) return false;
+  if (typeof js.totalGib !== 'number' || typeof port.totalGib !== 'number') return false;
+  if (js.sizeable === true && port.sizeable !== true) return false;
+  return js.totalGib >= port.totalGib;
+}
+
+/** True when every JS figure of the Will-it-fit inputs is at least the port's. */
+function inputsAreConservative(js, port) {
+  if (!isObj(js) || !isObj(port) || !Array.isArray(js.rows) || !Array.isArray(port.rows)) return false;
+  if (js.rows.length !== port.rows.length || js.reserveGib !== port.reserveGib || js.safety !== port.safety) return false;
+  // noevia#1134: the facts the panel shows beside the figures must be the same, not just no smaller.
+  if (js.moe !== port.moe || js.chat !== port.chat || js.nativeCtx !== port.nativeCtx) return false;
+  if (!isObj(js.current) || !isObj(port.current) || js.current.ctx !== port.current.ctx || js.current.kv !== port.current.kv) return false;
+  const atLeast = (a, b) => typeof a === 'number' && typeof b === 'number' && a >= b;
+  if (!atLeast(js.modelGib, port.modelGib) || !atLeast(js.pinnedGib, port.pinnedGib)) return false;
+  if (js.cacheRamGib !== null && !atLeast(js.cacheRamGib, port.cacheRamGib)) return false;
+  return js.rows.every((r, i) => isObj(r) && isObj(port.rows[i]) && r.ctx === port.rows[i].ctx && atLeast(r.kvQ8Gib, port.rows[i].kvQ8Gib));
+}
+
+// `undefined` when the port agrees or the JS answer is the conservative one (return the JS answer);
+// otherwise the reason it is not.
+function disagreement(fn, op, args, js, conservative, wasmLoader) {
+  let port = null, refused = null;
+  try {
+    port = wasmLoader().llamacppAutoconfig(op, args);
+  } catch (err) {
+    refused = String(err?.reason || 'unexpected').slice(0, 40);
+  }
+  let jsText;
+  try { jsText = JSON.stringify(js); } catch { jsText = undefined; }
+  if (port && typeof jsText === 'string' && port.text === jsText) return undefined;
+  let ok = false;
+  try { ok = !!conservative(js, port ? port.reply : null); } catch { ok = false; }
+  portWarn(fn, refused ? 'wasm_refused' : 'impl_mismatch', `${refused || 'answer'}; ${ok ? 'the JS answer is the conservative one' : 'refused'}`);
+  return ok ? undefined : (refused ? 'impl_refused' : 'impl_mismatch');
+}
+
+/**
+ * suggestJs, with LLAMACPP_AUTOCONFIG_IMPL=wasm confirmed by the Rust port (see above).
+ * Options: `env`, `impl`, `wasmLoader`.
+ */
+function suggest(args, { env = process.env, impl = autoconfigImpl(env), wasmLoader = defaultLoader } = {}) {
+  const js = suggestJs(args);
+  if (impl !== 'wasm') return js;
+  const why = disagreement('suggest', 1, args, js, suggestionIsConservative, wasmLoader);
+  return why ? { error: IMPL_SUGGEST_ERROR, code: 'autoconfig_impl', unverified: why } : js;
+}
+
+/** estimateInputsJs, confirmed as suggest is; throws an AutoconfigImplError when it cannot be. */
+function estimateInputs(args, { env = process.env, impl = autoconfigImpl(env), wasmLoader = defaultLoader } = {}) {
+  const js = estimateInputsJs(args);
+  if (impl !== 'wasm') return js;
+  if (disagreement('estimateInputs', 2, args, js, inputsAreConservative, wasmLoader)) throw new AutoconfigImplError('Will it fit?');
+  return js;
+}
+
+/** estimateFootprintJs, confirmed as suggest is; throws an AutoconfigImplError when it cannot be. */
+function estimateFootprint(args, { env = process.env, impl = autoconfigImpl(env), wasmLoader = defaultLoader } = {}) {
+  const js = estimateFootprintJs(args);
+  if (impl !== 'wasm') return js;
+  if (disagreement('estimateFootprint', 3, args, js, footprintIsConservative, wasmLoader)) throw new AutoconfigImplError('load footprint');
+  return js;
+}
+
+module.exports = { isPromptCacheFree, suggest, suggestJs, estimateInputs, estimateInputsJs, estimateFootprint, estimateFootprintJs, autoconfigImpl, AutoconfigImplError,
+  suggestionIsConservative, footprintIsConservative, inputsAreConservative, cacheRamMibOf, kvCacheBytes, parseMemoryLimit, CTX_CANDIDATES, KV_TYPE_BYTES, LLAMA_CACHE_RAM_DEFAULT_MIB };

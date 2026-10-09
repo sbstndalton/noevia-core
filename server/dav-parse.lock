@@ -1,13 +1,13 @@
 # dav-parse.wasm (#967): the Rust/WebAssembly port of dav-listing.cjs's PROPFIND listing parser,
 # since #976/#978 also of s3-listing.cjs's page scan and storage-path.cjs's rules, and since #977
 # of upload-sniff.cjs's validate, classify and decodeText, and since #979 of secret-envelope.cjs's
-# open and seal, and since #980 of mcp.cjs's parseRpcBody and resolveSchemaRefs and since #1002 of the new chat-template-caps and provider-error crates, and since #1003 autotune-plan, and since #1004 load-verdict, and since #1012 preset-reload, and since #1062 tune-contention, and since #769/#740 prompt-framing and since #1079 long-profile, and s3-sign.cjs/s3-region.cjs (S3_SIGN_IMPL) and since #795 ssrf-policy and since #516/#704 stream-guard, and gguf-meta (gguf::node, GGUF_META_IMPL) and policy-leaves (POLICY_LEAVES_IMPL), and review-verdict (CODE_REVIEW_VERDICT_IMPL) and tool-exchange (TOOL_EXCHANGE_IMPL), and mcp-servers (MCP_SERVERS_IMPL) and decision (DECISION_IMPL), and code-net-guard (CODE_NET_GUARD_IMPL), and role-context (ROLE_CONTEXT_IMPL), and completeness-report (COMPLETENESS_REPORT_IMPL), and task-lifecycle (TASK_LIFECYCLE_IMPL) (one module).
+# open and seal, and since #980 of mcp.cjs's parseRpcBody and resolveSchemaRefs and since #1002 of the new chat-template-caps and provider-error crates, and since #1003 autotune-plan, and since #1004 load-verdict, and since #1012 preset-reload, and since #1062 tune-contention, and since #769/#740 prompt-framing and since #1079 long-profile, and s3-sign.cjs/s3-region.cjs (S3_SIGN_IMPL) and since #795 ssrf-policy and since #516/#704 stream-guard, and gguf-meta (gguf::node, GGUF_META_IMPL) and policy-leaves (POLICY_LEAVES_IMPL), and review-verdict (CODE_REVIEW_VERDICT_IMPL) and tool-exchange (TOOL_EXCHANGE_IMPL), and mcp-servers (MCP_SERVERS_IMPL) and decision (DECISION_IMPL), and code-net-guard (CODE_NET_GUARD_IMPL), and role-context (ROLE_CONTEXT_IMPL), and completeness-report (COMPLETENESS_REPORT_IMPL), and task-lifecycle (TASK_LIFECYCLE_IMPL), and llamacpp-autoconfig (LLAMACPP_AUTOCONFIG_IMPL) (one module).
 # Built from sbstndalton/noevia-rs at NOEVIA_RS_REF (tarball checksum NOEVIA_RS_SHA256) with
 # tools/build-dav-parse-wasm.sh, reproducible on Linux x86_64 (CI and the image build; a macOS arm64
 # build was observed to match, but that is not guaranteed); the module's bytes must hash to
 # DAV_PARSE_WASM_SHA256 or the image build fails and every *_IMPL=wasm switch refuses to load it.
 # Read by server/dav-parse-wasm.cjs, noevia-core CI and noevia's build/web.Dockerfile. The ref must
 # be on noevia-rs main before a release pins this core commit (noevia CI checks it).
-NOEVIA_RS_REF=5f4975423fbad3ed701929cf3dcc1a1a22a30568
-NOEVIA_RS_SHA256=2c0de8f9f04f513202b7e58885e1fb581dce74a0076eeebd0d1164e53e4162db
-DAV_PARSE_WASM_SHA256=b7e769641ea283bd042e13ef300d4584adc2135ee997d485b31dacf59a69c132
+NOEVIA_RS_REF=743be45c3d47274e8b01bc113a65ff260c09af61
+NOEVIA_RS_SHA256=fb8026900e018478c5b6845c765b72470735e09c1091a9ed737faa3bada3bf9f
+DAV_PARSE_WASM_SHA256=a0388ae5b2fe889a039c9dfa648b303eb7c6813b889aab16384ccae9a412f1c3
