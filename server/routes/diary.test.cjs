@@ -7,7 +7,7 @@ const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
 const { createDiaryRoutes } = require('./diary.cjs');
 
-function fixture({ diaryOn = true, limited = false, connectorLimited = false, admin = false, reply, clientAddress, addressesTrusted, rateLimitedKeys } = {}) {
+function fixture({ diaryOn = true, limited = false, connectorLimited = false, admin = false, reply, clientAddress, addressesTrusted, rateLimitedKeys, log } = {}) {
   const sent = [], fetched = [], audits = [], headers = [];
   const rateKeys = [];
   const credentials = [{ id: 'a'.repeat(32), name: 'Claude Diary' }];
@@ -28,6 +28,7 @@ function fixture({ diaryOn = true, limited = false, connectorLimited = false, ad
     },
     diary: {
       diaryHeaders: (method, url, opts) => ({ 'X-Cowork-User-ID': 'u1', ...(opts?.storageRetry ? { 'X-Cowork-Storage-Retry': '1' } : {}) }),
+      log: log || (() => {}),
       corpusSource: { name: 'sidecar', listMonths: async () => [{ id: '2026-09', label: '2026-09' }], readMonth: async (m) => ({ todayLog: m || 'today', standing: '' }) },
       connectorFiles: { list: async () => [], read: async () => ({}), write: async () => ({}) },
     },
@@ -220,6 +221,15 @@ test('#1168: a storage throttle reaches the browser with its code, wait and Retr
   const huge = fixture({ reply: () => ({ ok: false, status: 503, body: { detail: 'wait', code: 'storageThrottled', retryAfter: 1e9 } }) });
   await huge.call('diary', 'GET', '/api/diary/files');
   assert.equal(huge.sent.pop().headers['Retry-After'], '86400');
+});
+
+test('#1198: forwarding an explicit Retry is logged once with no path, address or secret; automatic reads are silent', async () => {
+  const lines = [];
+  const f = fixture({ log: (line) => lines.push(line) });
+  await f.call('diary', 'GET', '/api/diary/files', undefined, { search: '?path=Private%20Notes', reqHeaders: { 'x-cowork-storage-retry': '1' } });
+  await f.call('diary', 'GET', '/api/diary/files', undefined, { search: '?path=Private%20Notes' });
+  assert.deepEqual(lines, ['[diary] forwarding X-Cowork-Storage-Retry: 1 (GET /api/diary/files, user u1)']);
+  assert.doesNotMatch(lines[0], /Private|Notes|http/);
 });
 
 test('#1168: X-Cowork-Storage-Retry: 1 from the browser reaches the sidecar only on a files/file read, and only as "1"', async () => {
