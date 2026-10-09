@@ -55,16 +55,14 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
   const {commitReconciled}=require('./models-ini-writer.cjs');
   const presets=store ? {...store,commit:(candidate,options)=>commitReconciled(store,candidate,options)} : null;
   const maintenance=require('./inference-maintenance.cjs').createMaintenanceGate();
-  // #1012: what the router last read, so a reload can keep loaded models (PRESET_RELOAD_IMPL=wasm).
+  // #1012: what the router last read, so a reload can keep loaded models (preset-reload.cjs, #1071: always on).
   const reloadGuard=reloadGuardOption||require('./preset-reload.cjs').createReloadGuard({stateFile:reloadStatePath,log:m=>console.log(m)});
   // Every router preset reload noevia makes goes through here: re-read the file just before the
   // call, and afterwards record that text with the router's own view of it (or forget the
   // baseline when the outcome is unclear), so the next reload can be judged.
-  // With the flag off this is just the router call, as before (#1040). `expectText`: the text a
+  // `expectText`: the text a
   // reload that keeps loaded models was judged on; the file is re-read here and must still match.
   async function routerReload(timeout=120000,{expectText=null}={}) {
-    const tracking=reloadGuard.mode()==='wasm';
-    if(!tracking&&expectText===null)return request('/models?reload=1',{},timeout);
     let before=null;try{before=presets?.snapshot().text??null;}catch{}
     if(expectText!==null&&before!==expectText)return {ok:false,status:409,refused:'file_changed',body:{}};
     let result;
@@ -291,11 +289,11 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
   }
   // Re-read models.ini after an edit made outside noevia's own preset editor. With a model
   // loaded this refuses unless the caller asked to unload it: the router must not swap the
-  // settings under a running instance. #1012 (PRESET_RELOAD_IMPL=wasm): it may reload with models
+  // settings under a running instance. #1012: it may reload with models
   // loaded when the router cannot change them (see preset-reload.cjs); they stay loaded.
   async function reloadPresets({unload=false}={}) {
     const {liveIds}=require('./preset-reload.cjs');
-    const refuse=(ids,reason)=>({ok:false,status:409,body:{error:'A model is loaded. Unload it to apply the new settings.',loaded:ids,...(reason&&reason!=='off'?{reason}:{})}});
+    const refuse=(ids,reason)=>({ok:false,status:409,body:{error:'A model is loaded. Unload it to apply the new settings.',loaded:ids,...(reason?{reason}:{})}});
     return maintenance.exclusive(async()=>{
       const listing=await rawModels();
       if(!listing.ok)return listing;
@@ -650,7 +648,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
   const autotuner=presets&&autotuneStatePath?require('./llamacpp-full-autotune.cjs').createFullAutotuner({fileMissing:presetFileMissing,request,rawModels,presets,maintenance,applyUnlocked,identityFor:tuneDeps.identityFor,stateFile:autotuneStatePath,
       samplingFor,
       // #1079: a Long tune adds its `<model>-long` section, then the router re-reads models.ini the
-      // way every other noevia write does (recorded for PRESET_RELOAD_IMPL's guard).
+      // way every other noevia write does (recorded for the preset reload guard).
       longProfiles,reloadRouter:()=>routerReload(120000),
       readMemory:tuneDeps.readMemory,memoryFloorGib:tuneDeps.memoryFloorGib,
       ...(autotuneOptions.betweenModelsMs!=null?{betweenModelsMs:autotuneOptions.betweenModelsMs}:{}),
@@ -659,13 +657,13 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
       ...Object.fromEntries(['foreignWaitMs','foreignQuietMs','foreignPollMs','contention'].filter(k=>autotuneOptions[k]!=null).map(k=>[k,autotuneOptions[k]])),
       ...(autotuneOptions.sleep?{sleep:autotuneOptions.sleep}:{}),
       ...(autotuneOptions.servingChecks?{servingChecks:autotuneOptions.servingChecks}:{}),
-      // #1003 AUTOTUNE_PLAN_IMPL=wasm: the planner reads the GGUF facts and the sizing budget.
+      // #1003: the planner reads the GGUF facts and the sizing budget.
       ...(autotuneOptions.planner?{planner:autotuneOptions.planner}:{}),
       planFacts:async model=>{const r=await readModel(model);return r.error?null:{meta:r.meta,modelBytes:r.modelFile.size,mmprojBytes:r.mmproj?.size||0};},
       budgetGib:()=>sizingBudgetGib()||require('./inference-budget.cjs').DEFAULT_BUDGET_GIB,
       ...(autotuneOptions.planFacts?{planFacts:autotuneOptions.planFacts}:{}),
       ...(autotuneOptions.budgetGib?{budgetGib:autotuneOptions.budgetGib}:{}),
-      // #1004 LAYA_LOAD_ADVISOR: tests inject their own advisor (a fake decision service).
+      // #1004: tests inject their own advisor (a fake decision service).
       ...(autotuneOptions.loadAdvisor?{loadAdvisor:autotuneOptions.loadAdvisor}:{}),
       onResult:async({model,result})=>{for(const [category,value] of [['context_capacity',{ctx:result.context,appliedCtx:result.context,slots:Number(presets.get(model).options.parallel)||1}],['throughput',{rate:result.generation}],...(result.acceptance==null?[]:[['mtp_acceptance',{rate:result.acceptance/100}]])])await recordEvidence(model,{category,result:'passed',value,suite:{name:'full-autotune',version:3},source:'autotune',limitations:['Three deterministic quality smoke probes, not a general quality benchmark','120 s default prompt budget; existing MTP head only',...(result.baseline?.skipped?.length?[`Probes not used (failed at the model's reference settings): ${result.baseline.skipped.map(s=>s.id).join(', ')}`]:[])]});},
       contextFactory:hooks=>require('./llamacpp-calibration.cjs').createCalibrator({request,rawModels,presets,applyUnlocked,conservativeFor,maintenance:managedGate,

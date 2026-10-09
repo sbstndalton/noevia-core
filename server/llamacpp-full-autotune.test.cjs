@@ -840,14 +840,14 @@ test('#872 between model leases the gate is open but the folder sync still sees 
   assert.equal(f.manager.tuningActive(), false);
 });
 
-// ── #1003: the realistic chat check before sign-off (CHAT_TEMPLATE_CAPS_IMPL) ──────────────
+// ── #1003: the realistic chat check before sign-off ──────────────
 const davParseWasm = require('./dav-parse-wasm.cjs');
 const wasmFile = process.env.DAV_PARSE_WASM || davParseWasm.DEFAULT_WASM;
 const skipWasm = !fs.existsSync(wasmFile) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
 const GEMMA3 = fs.readFileSync(path.join(__dirname, '..', 'tests', 'fixtures', 'chat-templates', 'google-gemma-3-12b-it.jinja'), 'utf8');
 const TEMPLATE_400 = { ok: false, status: 400, body: { error: { code: 400, message: 'Unable to generate parser for this template. Automatic parser generation failed: {{ raise_exception("Conversation roles must alternate user/assistant/user/assistant/...") }}' } } };
 const okReply = { ok: true, status: 200, body: { choices: [{ message: { content: 'Synthetic answer' } }] } };
-const realChecks = () => { const caps = require('./chat-template-caps.cjs'); return { mode: () => 'wasm', templateCaps: t => davParseWasm.templateCaps(t), verdict: (st, b) => davParseWasm.servingVerdict(st, b), caps }; };
+const realChecks = () => { const caps = require('./chat-template-caps.cjs'); return { templateCaps: t => davParseWasm.templateCaps(t), verdict: (st, b) => davParseWasm.servingVerdict(st, b), caps }; };
 
 test('#1003: a Gemma 3 template is checked without tools and signed off', { skip: skipWasm }, async t => {
   const f = fixture(t, { chatTemplate: GEMMA3, servingFor: b => (b.tools ? TEMPLATE_400 : okReply), servingChecks: realChecks() });
@@ -888,29 +888,23 @@ test('#1003: an engine reply without a message fails the check too', { skip: ski
   assert.match(j.models[0].error, /answered without a chat message/);
 });
 
-test('#1003: with CHAT_TEMPLATE_CAPS_IMPL off there is no extra request', async t => {
-  const f = fixture(t, { servingChecks: { mode: () => 'off', templateCaps: () => assert.fail(), verdict: () => assert.fail() } });
-  await f.manager.autotune.start('synthetic', { confirmPause: true });
-  const j = await finished(f.manager);
-  assert.equal(j.status, 'passed', j.error);
-  assert.equal(f.servingRequests.length, 0);
-  assert.equal(j.models[0].result.serving, undefined);
-});
-
 test('#1003: an unusable checker skips the check instead of failing the tune', async t => {
-  const f = fixture(t, { servingChecks: { mode: () => 'wasm', templateCaps: () => { throw Error('x'); }, verdict: () => { throw Error('module missing'); } } });
+  const f = fixture(t, { servingChecks: { templateCaps: () => { throw Error('x'); }, verdict: () => { throw Error('module missing'); } } });
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   const j = await finished(f.manager);
   assert.equal(j.status, 'passed', j.error);
   assert.ok(j.log.some(l => /realistic chat check was skipped/.test(l.text)));
 });
 
-// ── #1003 AUTOTUNE_PLAN_IMPL=wasm: Rust's planner orders the run ────────────────────────────────
+// ── #1003: Rust's planner orders the run ────────────────────────────────
 // Synthetic facts: a small dense model whose bf16 KV cache fits 16k context in the 16 GiB budget.
 // The fake engine recalls the marker up to 8k unquantized (bf16, f16) and up to 16k quantized.
 const SYNTHETIC_FACTS = { meta: { contextLength: 16384, blockCount: 16, headCount: 16, headCountKv: 4, embeddingLength: 2048 }, modelBytes: 1e9, mmprojBytes: 0 };
-const wasmPlanner = () => { const w = require('./dav-parse-wasm.cjs'); return { mode: () => 'wasm', plan: r => w.autotunePlan(r) }; };
-const servingOff = { mode: () => 'off', templateCaps: () => assert.fail(), verdict: () => assert.fail() };
+const wasmPlanner = () => { const w = require('./dav-parse-wasm.cjs'); return { plan: r => w.autotunePlan(r) }; };
+// A checker that cannot run: the realistic chat check is skipped with a note, so these tests stay
+// about the planner and the order, not about the check.
+const standardOrder = { plan() { throw Error('standard order forced'); } }; // no step planned: the model falls back to the standard order
+const servingOff = { templateCaps: () => { throw Error('unusable'); }, verdict: () => { throw Error('unusable'); } };
 const backups = ini => fs.readdirSync(path.dirname(ini)).filter(n => n.startsWith('models.ini.noevia-backup-'));
 const planned = (extra = {}) => ({ planner: wasmPlanner(), planFacts: async () => SYNTHETIC_FACTS, budgetGib: () => 16, ...extra });
 
@@ -945,7 +939,7 @@ test('#1003 planned: probe outcomes reach the planner as memory, recall and qual
   const script = [{ step: 'probe', ctx: 8192, kv: 'q5_0', fill: 7000, estimateMib: 4000 }, { step: 'probe', ctx: 16384, kv: 'f16', fill: 14000, estimateMib: 5000 },
     { step: 'probe', ctx: 8192, kv: 'f16', fill: 7000, estimateMib: 4000 }];
   const seen = [];
-  const planner = { mode: () => 'wasm', plan: r => { seen.push(r); return script[r.results.length] || { step: 'fail', code: 'no_context', message: 'No context size passed the fill-and-recall test.' }; } };
+  const planner = { plan: r => { seen.push(r); return script[r.results.length] || { step: 'fail', code: 'no_context', message: 'No context size passed the fill-and-recall test.' }; } };
   const f = fixture(t, { servingChecks: servingOff, autotuneExtra: planned({ planner }) });
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   const j = await finished(f.manager);
@@ -982,7 +976,7 @@ test('#1003 planned: unreadable model facts fall back too', async t => {
 });
 
 test('#1003 planned: a planner that breaks mid-run stops with a fixed message and restores models.ini', async t => {
-  const planner = { mode: () => 'wasm', plan: r => { if (r.results.length) throw Error('module gone: /secret/path'); return { step: 'probe', ctx: 8192, kv: 'f16', fill: 7000, estimateMib: 4000 }; } };
+  const planner = { plan: r => { if (r.results.length) throw Error('module gone: /secret/path'); return { step: 'probe', ctx: 8192, kv: 'f16', fill: 7000, estimateMib: 4000 }; } };
   const f = fixture(t, { servingChecks: servingOff, autotuneExtra: planned({ planner }) });
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   const j = await finished(f.manager);
@@ -991,13 +985,19 @@ test('#1003 planned: a planner that breaks mid-run stops with a fixed message an
   assert.equal(fs.readFileSync(f.ini, 'utf8'), f.original);
 });
 
-test('#1003 planned: with AUTOTUNE_PLAN_IMPL unset the standard order runs', async t => {
-  const f = fixture(t, { servingChecks: servingOff, autotuneExtra: { planFacts: async () => assert.fail('not planned') } });
+test('#1003 planned: every new run is planned, whatever a retired AUTOTUNE_PLAN_IMPL says', async t => {
+  const prev = process.env.AUTOTUNE_PLAN_IMPL;
+  process.env.AUTOTUNE_PLAN_IMPL = 'js';
+  t.after(() => { if (prev === undefined) delete process.env.AUTOTUNE_PLAN_IMPL; else process.env.AUTOTUNE_PLAN_IMPL = prev; });
+  let facts = 0;
+  const f = fixture(t, { servingChecks: servingOff, autotuneExtra: { planFacts: async () => { facts++; return null; } } });
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   const j = await finished(f.manager);
   assert.equal(j.status, 'passed', j.error);
-  assert.equal(j.models[0].plan, undefined);
-  assert.equal(f.manager.autotune.status().body.planImpl, 'js');
+  assert.ok(facts >= 1, 'the planner was asked for facts');
+  assert.match(j.models[0].planFallback, /could not be read/, 'the item was planned, then fell back');
+  assert.equal(f.manager.autotune.status().body.planImpl, undefined);
+  assert.equal(f.manager.autotune.status().body.loadAdvisor, undefined);
 });
 
 test('#1003 one recovery copy of models.ini per tune run in the standard order too', async t => {
@@ -1088,9 +1088,9 @@ test('#1029 planned: a second load timeout stops the run with a fixed message an
   assert.equal(fs.readFileSync(f.ini, 'utf8'), f.original);
 });
 
-// ── #1004 LAYA_LOAD_ADVISOR=on: rules name a guessed failure, the decision service only on a tie ──
+// ── #1004: rules name a guessed failure, the decision service only on a tie ──
 const { createLoadAdvisor } = require('./load-advisor.cjs');
-const ADVISOR_ON = { LAYA_LOAD_ADVISOR: 'on' };
+const ADVISOR_ON = {}; // the advisor is always on since #1071; a retired LAYA_LOAD_ADVISOR value changes nothing
 function decisionService({ label, confidence = 0.9, delayMs = 0 } = {}) {
   const asked = [];
   return { asked, async choice(input, { signal } = {}) {
@@ -1104,7 +1104,7 @@ function decisionService({ label, confidence = 0.9, delayMs = 0 } = {}) {
 const refuse16k = body => o => (o['ctx-size'] === '16384' && o['cache-type-k'] === 'bf16' ? { ok: false, status: 500, body } : null);
 const probeRows = f => JSON.parse(fs.readFileSync(f.stateFile, 'utf8')).job.models[0].plan.results.filter(r => r.step === 'probe');
 
-test('#1004 advisor on: a rule names an out-of-memory refusal; the decision service is not asked', { skip: skipWasm }, async t => {
+test('#1004 advisor: a rule names an out-of-memory refusal; the decision service is not asked', { skip: skipWasm }, async t => {
   const svc = decisionService({ label: 'template' });
   const f = fixture(t, { servingChecks: servingOff, loadReply: refuse16k({ error: { message: 'ggml_vulkan: vk::Device::allocateMemory: ErrorOutOfDeviceMemory' } }),
     autotuneExtra: planned({ loadAdvisor: createLoadAdvisor({ env: ADVISOR_ON, endpoint: svc }) }) });
@@ -1116,13 +1116,12 @@ test('#1004 advisor on: a rule names an out-of-memory refusal; the decision serv
   assert.deepEqual([row.classification.source, row.classification.rule, row.classification.ruleId, row.classification.advisor], ['rule', 'oom', 'text_oom', 'not_asked']);
   assert.match(row.reason, /^The engine refused to load the model at this size\. The engine ran out of memory at this setting \(from the engine's error\)\.$/);
   assert.equal(svc.asked.length, 0);
-  assert.equal(f.manager.autotune.status().body.loadAdvisor, 'on');
   // The engine's own words reach neither the client nor the state file.
   assert.ok(!JSON.stringify(f.manager.autotune.status().body).includes('ErrorOutOfDeviceMemory'));
   assert.ok(!fs.readFileSync(f.stateFile, 'utf8').includes('ErrorOutOfDeviceMemory'));
 });
 
-test('#1004 advisor on: no rule matches, the decision service reads a template failure and the run stops instead of shrinking', { skip: skipWasm }, async t => {
+test('#1004 advisor: no rule matches, the decision service reads a template failure and the run stops instead of shrinking', { skip: skipWasm }, async t => {
   const svc = decisionService({ label: 'template', confidence: 0.85 });
   const f = fixture(t, { servingChecks: servingOff, loadReply: refuse16k({ error: { message: 'srv  load_model: SYNTHETIC-UNMATCHED startup problem' } }),
     autotuneExtra: planned({ loadAdvisor: createLoadAdvisor({ env: ADVISOR_ON, endpoint: svc }) }) });
@@ -1141,7 +1140,7 @@ test('#1004 advisor on: no rule matches, the decision service reads a template f
   assert.ok(!JSON.stringify(f.manager.autotune.status().body).includes('SYNTHETIC-UNMATCHED'));
 });
 
-test('#1004 advisor on: a decision service over its budget is ignored and the calibrator\'s cause stands', { skip: skipWasm }, async t => {
+test('#1004 advisor: a decision service over its budget is ignored and the calibrator\'s cause stands', { skip: skipWasm }, async t => {
   const svc = decisionService({ label: 'template', delayMs: 5000 });
   const f = fixture(t, { servingChecks: servingOff, loadReply: refuse16k({ error: { message: 'SYNTHETIC-UNMATCHED' } }),
     autotuneExtra: planned({ loadAdvisor: createLoadAdvisor({ env: ADVISOR_ON, endpoint: svc, budgetMs: 20 }) }) });
@@ -1153,7 +1152,7 @@ test('#1004 advisor on: a decision service over its budget is ignored and the ca
   assert.deepEqual([c.source, c.advisor, c.adviceUsed], ['fallback', 'timeout', false]);
 });
 
-test('#1004 advisor on: a context-size error in the stream steps the context down (recall), not the cache type', { skip: skipWasm }, async t => {
+test('#1004 advisor: a context-size error in the stream steps the context down (recall), not the cache type', { skip: skipWasm }, async t => {
   const svc = decisionService({ label: 'oom' });
   const err = `data: ${JSON.stringify({ error: { code: 400, message: 'the request exceeds the available context size, try increasing it' } })}\n\n`;
   const f = fixture(t, { servingChecks: servingOff, streamReply: o => (o['ctx-size'] === '16384' ? new Response(err) : null),
@@ -1166,26 +1165,10 @@ test('#1004 advisor on: a context-size error in the stream steps the context dow
   assert.equal(svc.asked.length, 0);
 });
 
-test('#1004 advisor off (default): outcomes are what they were and nothing is asked', async t => {
-  const svc = decisionService({ label: 'template' });
+test('#1004 advisor but the verdict module unusable: the calibrator\'s cause stands', async t => {
   const script = [{ step: 'probe', ctx: 16384, kv: 'bf16', fill: 14000, estimateMib: 5000 }];
   const seen = [];
-  const planner = { mode: () => 'wasm', plan: r => { seen.push(r); return script[r.results.length] || { step: 'fail', code: 'no_context', message: 'No context size passed the fill-and-recall test.' }; } };
-  const f = fixture(t, { servingChecks: servingOff, loadReply: refuse16k({ error: { message: 'CUDA error: out of memory' } }),
-    autotuneExtra: planned({ planner, loadAdvisor: createLoadAdvisor({ env: {}, endpoint: svc, verdict: () => assert.fail('no verdict when off') }) }) });
-  await f.manager.autotune.start('synthetic', { confirmPause: true });
-  const j = await finished(f.manager);
-  assert.equal(j.status, 'failed');
-  assert.deepEqual(seen.at(-1).results.map(r => r.outcome), ['load_failed']);
-  assert.equal(phase(j.models[0], 'context').steps[0].classification, undefined);
-  assert.equal(svc.asked.length, 0);
-  assert.equal(f.manager.autotune.status().body.loadAdvisor, 'off');
-});
-
-test('#1004 advisor on but the verdict module unusable: the calibrator\'s cause stands', async t => {
-  const script = [{ step: 'probe', ctx: 16384, kv: 'bf16', fill: 14000, estimateMib: 5000 }];
-  const seen = [];
-  const planner = { mode: () => 'wasm', plan: r => { seen.push(r); return script[r.results.length] || { step: 'fail', code: 'no_context', message: 'No context size passed the fill-and-recall test.' }; } };
+  const planner = { plan: r => { seen.push(r); return script[r.results.length] || { step: 'fail', code: 'no_context', message: 'No context size passed the fill-and-recall test.' }; } };
   const f = fixture(t, { servingChecks: servingOff, loadReply: refuse16k({ error: { message: 'odd' } }),
     autotuneExtra: planned({ planner, loadAdvisor: createLoadAdvisor({ env: ADVISOR_ON, endpoint: null, verdict: () => { throw Error('module gone'); }, log: () => {} }) }) });
   await f.manager.autotune.start('synthetic', { confirmPause: true });
@@ -1193,7 +1176,7 @@ test('#1004 advisor on but the verdict module unusable: the calibrator\'s cause 
   assert.deepEqual(seen.at(-1).results.map(r => r.outcome), ['load_failed']);
 });
 
-test('#1004 advisor on: a rejected long prompt\'s error body is read (capped) and a rule names it', { skip: skipWasm }, async t => {
+test('#1004 advisor: a rejected long prompt\'s error body is read (capped) and a rule names it', { skip: skipWasm }, async t => {
   const svc = decisionService({ label: 'template' });
   const body = JSON.stringify({ error: { code: 500, message: 'ggml_backend_cpu_buffer_type_alloc_buffer: failed to allocate buffer of size 9126805504' } });
   const f = fixture(t, { servingChecks: servingOff, streamReply: o => (o['ctx-size'] === '16384' ? new Response(body, { status: 500 }) : null),
@@ -1206,11 +1189,11 @@ test('#1004 advisor on: a rejected long prompt\'s error body is read (capped) an
   assert.equal(svc.asked.length, 0);
 });
 
-// ── core#18 review: #1047 engine words stay out of reasons, #1048 flag off reads nothing ──
+// ── core#18 review: #1047 engine words stay out of reasons ──
 const sseError = message => `data: ${JSON.stringify({ error: { code: 500, message } })}\n\n`;
-for (const on of [false, true]) test(`#1047 a stream error's engine text never reaches status() or the state file (advisor ${on ? 'on' : 'off'})`, { skip: skipWasm }, async t => {
+for (const on of [false, true]) test(`#1047 a stream error's engine text never reaches status() or the state file (decision service ${on ? 'configured' : 'absent'})`, { skip: skipWasm }, async t => {
   const f = fixture(t, { servingChecks: servingOff, streamReply: o => (o['ctx-size'] === '16384' ? new Response(sseError('SECRET-xyz engine detail')) : null),
-    autotuneExtra: planned({ loadAdvisor: createLoadAdvisor({ env: on ? ADVISOR_ON : {}, endpoint: decisionService({ label: 'oom' }) }) }) });
+    autotuneExtra: planned({ loadAdvisor: createLoadAdvisor({ env: ADVISOR_ON, endpoint: on ? decisionService({ label: 'oom' }) : null }) }) });
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   const j = await finished(f.manager);
   assert.equal(j.status, 'passed', j.error);
@@ -1228,19 +1211,6 @@ function watchedBody({ endless = false } = {}) {
   }, { highWaterMark: 0 });
   return { seen, response: () => new Response(body, { status: 500 }) };
 }
-
-test('#1048 advisor off: a rejected prompt\'s error body is not read and no evidence is attached', async t => {
-  const w = watchedBody();
-  const script = [{ step: 'probe', ctx: 16384, kv: 'f16', fill: 14000, estimateMib: 5000 }];
-  const planner = { mode: () => 'wasm', plan: r => script[r.results.length] || { step: 'fail', code: 'no_context', message: 'No context size passed the fill-and-recall test.' } };
-  let judged = 0;
-  const advisor = { enabled: () => false, judge: async () => { judged++; return null; } };
-  const f = fixture(t, { servingChecks: servingOff, streamReply: o => (o['ctx-size'] === '16384' && o['cache-type-k'] === 'f16' ? w.response() : null), autotuneExtra: planned({ planner, loadAdvisor: advisor }) });
-  await f.manager.autotune.start('synthetic', { confirmPause: true });
-  await finished(f.manager);
-  assert.equal(w.seen.pulled, 0);
-  assert.equal(judged, 0);
-});
 
 test('#1048 the calibrator attaches evidence only when asked', async () => {
   const { createCalibrator } = require('./llamacpp-calibration.cjs');
@@ -1338,7 +1308,7 @@ test('#1057 bf16Unsupported: only the engine saying it has no bf16 cache, never 
 });
 
 test('#1057 js order: q8_0 replaces bf16 only when it fits at least twice the context', async t => {
-  const f = fixture(t, { autotuneExtra: { planFacts: async () => DENSE_64K, budgetGib: () => 6 } });
+  const f = fixture(t, { autotuneExtra: { planner: standardOrder, planFacts: async () => DENSE_64K, budgetGib: () => 6 } });
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   const j = await finished(f.manager), kv = phase(j.models[0], 'kv');
   assert.equal(j.status, 'passed', j.error);
@@ -1346,7 +1316,7 @@ test('#1057 js order: q8_0 replaces bf16 only when it fits at least twice the co
   assert.deepEqual(kv.value.candidates.map(c => [c.kv, c.ceiling]), [['bf16', 12288], ['q8_0', 24576]]);
   assert.ok(j.log.some(l => l.text === 'Committed q8_0 KV cache after quality checks (it fits 24576 tokens, at least twice what bf16 fits).'));
   // 10 GiB: q8_0 fits 64k, bf16 40k: not twice, so bf16 stays although q8_0 measured faster.
-  const g = fixture(t, { autotuneExtra: { planFacts: async () => DENSE_64K, budgetGib: () => 10 } });
+  const g = fixture(t, { autotuneExtra: { planner: standardOrder, planFacts: async () => DENSE_64K, budgetGib: () => 10 } });
   await g.manager.autotune.start('synthetic', { confirmPause: true });
   const k = await finished(g.manager);
   assert.equal(k.status, 'passed', k.error);
@@ -1391,7 +1361,7 @@ test('#1057 per-model settings: validated, saved with the tune state, survive a 
 });
 
 // A scripted planner that probes at 8k with the request's first type until a pass, then runs on.
-const scriptedFrom = (seen, at = r => (r.ladder.length === 1 ? r.ladder[0] : 8192)) => ({ mode: () => 'wasm', plan: r => {
+const scriptedFrom = (seen, at = r => (r.ladder.length === 1 ? r.ladder[0] : 8192)) => ({ plan: r => {
   seen.push(JSON.parse(JSON.stringify(r)));
   const res = r.results, kv = r.kv[0], has = (step, id) => res.some(x => x.step === step && (!id || x.id === id));
   if (!res.some(x => x.step === 'probe' && x.outcome === 'passed')) {
@@ -1440,7 +1410,7 @@ test('#1057 planned: a bf16 failure that is not "unsupported" (out of memory) st
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   const j = await finished(f.manager);
   assert.equal(j.status, 'failed');
-  assert.deepEqual(seen.at(-1).results.map(r => [r.kv, r.outcome]), [['bf16', 'load_failed']]);
+  assert.deepEqual(seen.at(-1).results.map(r => [r.kv, r.outcome]), [['bf16', 'oom']]);
   assert.deepEqual(seen.at(-1).kv, ['bf16', 'q8_0']);
   assert.equal(j.models[0].plan.kvFallback, undefined);
   assert.ok(!f.requests.some(r => r.options['cache-type-k'] === 'f16' && r.options['ctx-size'] === '8192'));
@@ -1471,7 +1441,7 @@ test('#1057 planned (wasm): the request carries the model\'s list, and q5 wins o
   assert.deepEqual(first(kvCandidates({ allowQ5Kv: true }), 16384), [65536, 'bf16']);
   // The planned job sends the model's own list.
   const seen = [];
-  const f = fixture(t, { servingChecks: servingOff, autotuneExtra: planned({ planner: { mode: () => 'wasm', plan: r => { seen.push(r); return w.autotunePlan(r); } } }) });
+  const f = fixture(t, { servingChecks: servingOff, autotuneExtra: planned({ planner: { plan: r => { seen.push(r); return w.autotunePlan(r); } } }) });
   f.manager.autotune.setSettings('synthetic', { allowQ5Kv: true });
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   assert.equal((await finished(f.manager)).status, 'passed');
@@ -1515,7 +1485,7 @@ test('#1058 planned: a bf16 failure that says why (out of memory) is never retri
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   const j = await finished(f.manager);
   assert.equal(j.status, 'failed');
-  assert.deepEqual(seen.filter(r => r.ladder.length > 1).at(-1).results.map(r => [r.ctx, r.kv, r.outcome]), [[8192, 'bf16', 'load_failed']]);
+  assert.deepEqual(seen.filter(r => r.ladder.length > 1).at(-1).results.map(r => [r.ctx, r.kv, r.outcome]), [[8192, 'bf16', 'oom']]);
 });
 
 test('#1058 planned (wasm): bf16 crashing everywhere ends with f16, not q8_0', { skip: skipWasm }, async t => {
@@ -1541,14 +1511,14 @@ test('#1058 js order: bf16 that does not load gets f16 once in its place', async
 
 test('#1058 js order: no f16 retry when the estimate says bf16 does not fit the profile context (may be memory)', async t => {
   // 5 GiB: bf16 fits 4k by the estimate, the profile asks 8k.
-  const f = fixture(t, { failLoadBf16: true, autotuneExtra: { planFacts: async () => DENSE_64K, budgetGib: () => 5 } });
+  const f = fixture(t, { failLoadBf16: true, autotuneExtra: { planner: standardOrder, planFacts: async () => DENSE_64K, budgetGib: () => 5 } });
   await f.manager.autotune.start('synthetic', { confirmPause: true });
   const j = await finished(f.manager), kv = phase(j.models[0], 'kv');
   assert.equal(j.status, 'passed', j.error);
   assert.deepEqual(kv.steps.map(s => [s.id, s.status]), [['bf16', 'failed'], ['q8_0', 'passed']]);
   assert.equal(j.models[0].result.kvFallback, undefined);
   // At 6 GiB bf16 fits 12k, above the profile's 8k: the retry happens.
-  const g = fixture(t, { failLoadBf16: true, autotuneExtra: { planFacts: async () => DENSE_64K, budgetGib: () => 6 } });
+  const g = fixture(t, { failLoadBf16: true, autotuneExtra: { planner: standardOrder, planFacts: async () => DENSE_64K, budgetGib: () => 6 } });
   await g.manager.autotune.start('synthetic', { confirmPause: true });
   const k = await finished(g.manager);
   assert.deepEqual(phase(k.models[0], 'kv').steps.map(s => s.id), ['bf16', 'f16', 'q8_0']);

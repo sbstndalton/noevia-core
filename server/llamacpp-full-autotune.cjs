@@ -71,23 +71,24 @@ function preferKv(passed, ceilings) {
 const UBATCH = [512, 1024, 2048];
 const PAD = 'The garden committee reviewed irrigation, seed orders, volunteer rotas and pump maintenance. ';
 const PHASES = [['sampling', 'Sampling'], ['kv', 'KV cache'], ['context', 'Context size'], ['drafting', 'Drafting'], ['batch', 'Batch and micro-batch']];
-// #1003 AUTOTUNE_PLAN_IMPL=wasm: Rust's planner (autotune-plan in dav-parse.wasm) orders the run.
-// Context first, then the KV cache type for it, each choice proven by filling ~90% of the context
-// and recalling a marker (plus the quality probes); then sampling, drafting and batch once each,
-// one final fill check and the serving check, never a measured step twice. Default js: the order
-// above. Read per job start, so a flip takes effect on the next tune.
+// #1003: Rust's planner (autotune-plan in dav-parse.wasm) orders every new run (always on since
+// #1071; it was AUTOTUNE_PLAN_IMPL=wasm). Context first, then the KV cache type for it, each choice
+// proven by filling ~90% of the context and recalling a marker (plus the quality probes); then
+// sampling, drafting and batch once each, one final fill check and the serving check, never a
+// measured step twice. PHASES above is the standard order a model falls back to when it cannot be
+// planned (unreadable file, planner unavailable before any step), and the order an item already
+// saved by an older run keeps.
 const PLANNED_PHASES = [['context', 'Context and KV cache'], ['sampling', 'Sampling'], ['drafting', 'Drafting'], ['batch', 'Batch and micro-batch'], ['verify', 'Final fill check']];
-const PLAN_FLAG = 'AUTOTUNE_PLAN_IMPL';
-const planModeOf = (env = process.env) => (String(env[PLAN_FLAG] ?? '').trim().toLowerCase() === 'wasm' ? 'wasm' : 'js');
 function defaultPlanner() {
-  return { mode: () => planModeOf(), plan: request => require('./dav-parse-wasm.cjs').autotunePlan(request) };
+  return { plan: request => require('./dav-parse-wasm.cjs').autotunePlan(request) };
 }
 // Kept free beside the tuned model for the services that run alongside it (Laya).
 const SERVICES_RESERVE_MIB = 2560;
 const PLAN_CAUSE = { oom: 'oom', load: 'load_failed', time: 'over_time', recall: 'recall_failed' };
 const PLAN_STEP_LIMIT = 64;
-// #1004 LAYA_LOAD_ADVISOR=on: a guessed failure cause is named by Rust's rules (load-verdict), the
-// decision service advising only when no rule matches (load-advisor.cjs). Default off: unchanged.
+// #1004: a guessed failure cause is named by Rust's rules (load-verdict), the decision service
+// advising only when no rule matches (load-advisor.cjs). Always on since #1071 (it was
+// LAYA_LOAD_ADVISOR=on); an unconfigured decision service just means no advice.
 function defaultLoadAdvisor() { return require('./load-advisor.cjs').createLoadAdvisor(); }
 const QUALITY = [
   { id: 'arithmetic', prompt: 'Compute (17 * 4) - 9. Reply with only the integer.', expected: '59' },
@@ -153,7 +154,7 @@ const baselineSummary = b => 'Quality baseline at ' + REFERENCE_LABEL[b.referenc
   ...b.skipped.map(s => s.id + ' skipped (the model gets this wrong at its reference settings'
     + (s.answer ? '; answered "' + s.answer + '"' : '') + ')'),
 ].join(', ') + '.';
-// #1003 (CHAT_TEMPLATE_CAPS_IMPL=wasm): before a profile is signed off, one chat request shaped
+// #1003: before a profile is signed off, one chat request shaped
 // the way chat sends one (a system prompt, a user turn, the app's function-tool shape) must be
 // served. Tools go only where chat would send them (the template check, chat-template-caps.cjs);
 // an engine that still refuses them for the template gets the same one retry without tools that
@@ -167,8 +168,8 @@ const SERVING_TOOLS = [
   { type: 'function', function: { name: 'more_tools', description: "Call this only if none of the offered tools can do the user's task.", parameters: { type: 'object', properties: {} } } },
 ];
 function defaultServingChecks() {
-  const caps = require('./chat-template-caps.cjs'), wasm = require('./dav-parse-wasm.cjs');
-  return { mode: () => caps.mode(), templateCaps: (t) => wasm.templateCaps(t), verdict: (status, body) => wasm.servingVerdict(status, body) };
+  const wasm = require('./dav-parse-wasm.cjs');
+  return { templateCaps: (t) => wasm.templateCaps(t), verdict: (status, body) => wasm.servingVerdict(status, body) };
 }
 const NO_PROBE_PASSED = 'The model failed every quality probe at its reference settings, so auto-tune cannot tell whether a setting harms it.';
 const hash = value => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -226,7 +227,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   readMemory = require('./llamacpp-calibration.cjs').readMemAvailableGib, memoryFloorGib = 2, onResult = async () => {},
   // #545: true when a router row is a preset whose model file is not in the models folder.
   fileMissing = () => false, servingChecks = defaultServingChecks(),
-  // #1003: the planner (AUTOTUNE_PLAN_IMPL), the model's GGUF facts ({ meta, modelBytes, mmprojBytes }
+  // #1003: the planner, the model's GGUF facts ({ meta, modelBytes, mmprojBytes }
   // or null) and the inference memory budget in GiB.
   planner = defaultPlanner(), planFacts = async () => null, budgetGib = () => 16, servicesReserveMib = SERVICES_RESERVE_MIB,
   loadAdvisor = defaultLoadAdvisor(),
@@ -346,7 +347,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   // kvCandidates: the list this server really tries for this model, so the panel never describes
   // another build's (or another model's); settings: the model's own tune settings (#1057).
   // #1079: longId and longHistory are the model's Long tune (its `<model>-long` section).
-  const status = model => ({ ok: true, status: 200, body: { job: publicJob(state.job), history: model ? state.history[model] || [] : [], kvCandidates: candidatesFor(model), settings: settingsOf(model), planImpl: planner.mode(), loadAdvisor: loadAdvisor.enabled() ? 'on' : 'off',
+  const status = model => ({ ok: true, status: 200, body: { job: publicJob(state.job), history: model ? state.history[model] || [] : [], kvCandidates: candidatesFor(model), settings: settingsOf(model),
     modes: MODES, ...(model ? { longId: model + LONG_SUFFIX, longHistory: state.history[model + LONG_SUFFIX] || [] } : {}) } });
   /** #1057: saves a model's tune settings; they apply from its next tune. */
   function setSettings(model, body) {
@@ -920,7 +921,6 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     }
   }
   async function servingCheck(j, model) {
-    if (servingChecks.mode() !== 'wasm') return null;
     const props = await request('/props?model=' + encodeURIComponent(model) + '&autoload=false', {}, 8000).catch(() => null);
     const template = props?.ok && typeof props.body?.chat_template === 'string' ? props.body.chat_template : null;
     let sendTools = true;
@@ -929,7 +929,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     const ask = (tools) => chat(model, '', 64, { messages: SERVING_MESSAGES, ...(tools ? { tools: SERVING_TOOLS } : {}) });
     let r = await ask(sendTools);
     let verdict;
-    // A module that cannot run means the switch is effectively off (as in chat): skip the check.
+    // A call the module cannot run (a trap; startup already proved it loads): skip the check.
     try { verdict = servingChecks.verdict(r.status, r.bodyText); } catch { note(j, 'The realistic chat check was skipped: its checker is unavailable.'); return null; }
     let retried = false;
     if (!verdict.passed && sendTools && verdict.kind === 'template_or_tools_unsupported') {
@@ -964,7 +964,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     save();
     try { await onResult({ model: item.model, result }); } catch { note(j, 'Settings saved, but qualification evidence could not be recorded.'); }
   }
-  // ── #1003: the planned order (AUTOTUNE_PLAN_IMPL=wasm) ─────────────────────────────────────
+  // ── #1003: the planned order ─────────────────────────────────────
   const uint = (v, max = 2 ** 40) => (Number.isSafeInteger(v) && v >= 0 && v <= max ? v : 0);
   const layerList = v => (Array.isArray(v)
     ? (v.length <= 4096 && v.every(x => typeof x === 'boolean' || uint(x, 1 << 20) === x) ? v : null)
@@ -1068,7 +1068,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     let r;
     // #1057: a bf16 step keeps the engine's evidence too, to tell "this build has no bf16 cache".
     const bf16 = base['cache-type-k'] === 'bf16';
-    try { r = await cal.probe(j.model, { ctx: step.ctx, fill: step.fill, base, baseRevision: j._revision, promptBudgetSeconds: j.promptBudgetSeconds, evidence: loadAdvisor.enabled() || bf16 }); }
+    try { r = await cal.probe(j.model, { ctx: step.ctx, fill: step.fill, base, baseRevision: j._revision, promptBudgetSeconds: j.promptBudgetSeconds, evidence: true }); }
     finally { child = null; }
     check();
     if (!r.passed) {
@@ -1082,7 +1082,6 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
         if (silent) return { outcome: 'load_failed', reason: r.reason || 'The fill-and-recall test failed.', silent: true };
       }
       const own = { outcome: r.cause === 'timeout' ? 'timeout' : PLAN_CAUSE[r.cause] || 'load_failed', reason: r.reason || 'The fill-and-recall test failed.' };
-      if (!loadAdvisor.enabled()) return own;
       // #1004: rules first, the decision service only on a tie; null keeps the calibrator's cause.
       const judged = await loadAdvisor.judge({ cause: r.cause, evidence: r.evidence || null });
       check();
@@ -1396,7 +1395,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
       if (!bulk && ![...scan.models, ...scan.skipped.filter(s => s.reason === 'Current tune already applied').map(s => s.model)].includes(model))
         return { ok: false, status: 400, body: { error: 'Choose a configured chat model.' } };
       if (!models.length) return { ok: false, status: 409, body: { error: 'All configured chat models already have current tunes.' } };
-      let items = models.map(m => newModel(m, planner.mode() === 'wasm', candidatesFor(m)));
+      let items = models.map(m => newModel(m, true, candidatesFor(m)));
       if (mode === 'long') {
         // The model's own KV switch applies to its long profile; the section is added in run().
         const longId = model + LONG_SUFFIX, { pairs } = await routerPairs();
@@ -1407,7 +1406,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
           const dry = row ? longProfiles.sectionFor(presets.snapshot().text, row, presets) : { ok: false, reason: 'no_base' };
           if (!dry.ok) return { ok: false, status: 409, body: { error: longRefusal(dry.reason) } };
         }
-        items = [{ ...newModel(longId, planner.mode() === 'wasm', candidatesFor(model)), base: model, mode: 'long' }];
+        items = [{ ...newModel(longId, true, candidatesFor(model)), base: model, mode: 'long' }];
       }
       cancelled = false;
       const j = { id: crypto.randomUUID(), model: items[0].model, bulk, mode, promptBudgetSeconds, status: 'running',

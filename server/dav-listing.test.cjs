@@ -1,6 +1,7 @@
 'use strict';
 
-// DAV_PARSE_IMPL switch (#967): js is the default and unchanged; wasm fails closed.
+// PROPFIND listing (#967, #1071): dav-parse.wasm is the only parser and fails closed. The JS
+// reference (tests/server/oracle/dav-listing.cjs) is exercised here only to keep the oracle honest.
 
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
@@ -10,6 +11,7 @@ const path = require('node:path');
 const test = require('node:test');
 
 const davListing = require('./dav-listing.cjs');
+const oracle = require('../tests/server/oracle/dav-listing.cjs');
 const davParseWasm = require('./dav-parse-wasm.cjs');
 const storageClient = require('./storage-client.cjs');
 
@@ -44,32 +46,28 @@ async function withFetch(body, fn) {
   try { return await fn(seen); } finally { globalThis.fetch = real; }
 }
 
-test('DAV_PARSE_IMPL defaults to js; unknown values mean js with a warning', (t) => {
-  assert.equal(davListing.davParseImpl({}), 'js');
-  assert.equal(davListing.davParseImpl({ DAV_PARSE_IMPL: '' }), 'js');
-  assert.equal(davListing.davParseImpl({ DAV_PARSE_IMPL: 'js' }), 'js');
-  assert.equal(davListing.davParseImpl({ DAV_PARSE_IMPL: ' WASM ' }), 'wasm');
-  const warn = t.mock.method(console, 'warn', () => {});
-  assert.equal(davListing.davParseImpl({ DAV_PARSE_IMPL: 'rust' }), 'js');
-  assert.equal(davListing.davParseImpl({ DAV_PARSE_IMPL: 'rust' }), 'js');
-  assert.equal(warn.mock.callCount(), 1);
-});
+const skipWasm = !haveWasm && !required && 'dav-parse.wasm not built (set DAV_PARSE_WASM_REQUIRED=1 to require it)';
 
-test('js path: the listing is what davList always produced', () => {
-  assert.deepEqual(davListing.listingEntries(BODY, T, { impl: 'js' }), EXPECTED);
-  assert.throws(() => davListing.listingEntries(BODY, 'not a url', { impl: 'js' }), TypeError);
-});
-
-test('js path never touches the WebAssembly module, even when it is missing', () => withEnv(
-  { DAV_PARSE_IMPL: undefined, DAV_PARSE_WASM: path.join(os.tmpdir(), 'no-such-dav-parse.wasm') },
+test('the listing is what davList always produced, through Rust', { skip: skipWasm }, () => withEnv(
+  { DAV_PARSE_WASM: undefined },
   () => withFetch(BODY, async (seen) => {
+    assert.deepEqual(davListing.listingEntries(BODY, T), EXPECTED);
     const entries = await storageClient.listFiles({ kind: 'webdav', baseUrl: 'https://dav.example.test/remote.php/dav/files/alice' }, 'Notes');
     assert.deepEqual(entries.map((e) => [e.name, e.path, e.isDir, e.size, e.ext]), [['a&b.md', 'Notes/a&b.md', false, 42, '.md'], ['Sub', 'Notes/Sub', true, null, '']]);
     assert.equal(seen[0].method, 'PROPFIND');
   })));
 
+test('a retired DAV_PARSE_IMPL=js is ignored: Rust still parses, and there is no JS option', { skip: skipWasm }, () => withEnv(
+  { DAV_PARSE_IMPL: 'js' },
+  () => {
+    assert.deepEqual(davListing.listingEntries(BODY, T), EXPECTED);
+    assert.deepEqual(davListing.listingEntries(BODY, T, { impl: 'js' }), EXPECTED, 'an old impl option is not read');
+    assert.equal(davListing.davParseImpl, undefined);
+    assert.equal(davListing.listingRecordsJs, undefined);
+  }));
+
 test('wasm path fails closed when the module is missing', () => withEnv(
-  { DAV_PARSE_IMPL: 'wasm', DAV_PARSE_WASM: path.join(os.tmpdir(), 'no-such-dav-parse.wasm') },
+  { DAV_PARSE_WASM: path.join(os.tmpdir(), 'no-such-dav-parse.wasm') },
   async () => {
     const warn = test.mock.method(console, 'warn', () => {});
     try {
@@ -91,9 +89,9 @@ test('wasm path fails closed on a tampered module', () => {
   // A valid, empty WebAssembly module: compiles, but is not the pinned bytes.
   fs.writeFileSync(file, Buffer.from([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0]));
   try {
-    withEnv({ DAV_PARSE_IMPL: 'wasm', DAV_PARSE_WASM: file }, () => {
+    withEnv({ DAV_PARSE_WASM: file }, () => {
       assert.throws(() => davParseWasm.listRecords(BODY, T), (e) => e.reason === 'checksum');
-      assert.throws(() => davListing.listingEntries(BODY, T, { impl: 'wasm' }), (e) => e.message === davListing.PUBLIC_FAILURE && !/sha256|[0-9a-f]{64}/.test(e.message));
+      assert.throws(() => davListing.listingEntries(BODY, T), (e) => e.message === davListing.PUBLIC_FAILURE && !/sha256|[0-9a-f]{64}/.test(e.message));
     });
     // Even with the "right" checksum, a module without the ABI is refused.
     const sha = crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
@@ -112,8 +110,8 @@ test('the lock pins a 40-char noevia-rs ref and both checksums', () => {
   assert.match(lock.DAV_PARSE_WASM_SHA256, /^[0-9a-f]{64}$/);
 });
 
-test('wasm path: same listing, and refusals fail closed', { skip: !haveWasm && !required && 'dav-parse.wasm not built (set DAV_PARSE_WASM_REQUIRED=1 to require it)' }, () => withEnv(
-  { DAV_PARSE_IMPL: 'wasm' },
+test('refusals fail closed and do not poison the module', { skip: skipWasm }, () => withEnv(
+  { DAV_PARSE_WASM: undefined },
   () => {
     assert.deepEqual(davListing.listingEntries(BODY, T), EXPECTED);
     const warn = test.mock.method(console, 'warn', () => {});
@@ -129,9 +127,9 @@ test('wasm path: same listing, and refusals fail closed', { skip: !haveWasm && !
   }));
 
 // #969-#971: hostile entries are skipped (never rewritten, never failing the listing).
-test('listingRecordsJs skips foreign origins, dot segments, controls, backslashes and bidi controls', () => {
+test('the oracle listingRecordsJs skips foreign origins, dot segments, controls, backslashes and bidi controls', () => {
   const r = (h) => `<d:response><d:href>${h}</d:href></d:response>`;
-  const names = (hrefs) => davListing.listingRecordsJs(hrefs.map(r).join(''), T).map((e) => e.name);
+  const names = (hrefs) => oracle.listingRecordsJs(hrefs.map(r).join(''), T).map((e) => e.name);
   // #969
   assert.deepEqual(names([`https://evil.example.test${DIR}/x.md`, `https://dav.example.test:8443${DIR}/p.md`, `http://dav.example.test${DIR}/h.md`,
     `//evil.example.test${DIR}/pr.md`, `https://dav.example.test@evil.example.test${DIR}/ui.md`, `file://${DIR}/f.md`]), []);
@@ -142,6 +140,6 @@ test('listingRecordsJs skips foreign origins, dot segments, controls, backslashe
   // #971
   const bidi = [0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069, 0x200e, 0x200f, 0x061c];
   assert.deepEqual(names([`${DIR}/a%00`, `${DIR}/%7F`, `${DIR}/%1B`, `${DIR}/%C2%85`, `${DIR}/%C2%9F`, ...bidi.map((c) => `${DIR}/x${encodeURIComponent(String.fromCodePoint(c))}`), `${DIR}/ok%C2%A0.md`]), ['ok .md']);
-  for (const c of bidi) assert.equal(davListing.isListableName(`a${String.fromCodePoint(c)}`), false);
-  assert.equal(davListing.isListableName('​'), true); // zero-width space is not a bidi control; the UI isolates names
+  for (const c of bidi) assert.equal(oracle.isListableName(`a${String.fromCodePoint(c)}`), false);
+  assert.equal(oracle.isListableName('​'), true); // zero-width space is not a bidi control; the UI isolates names
 });

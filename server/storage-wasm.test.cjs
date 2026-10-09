@@ -1,7 +1,7 @@
 'use strict';
 
-// S3_PARSE_IMPL (#976) and STORAGE_PATH_IMPL (#978) switches: js is the default and unchanged;
-// wasm runs the Rust ports inside dav-parse.wasm and fails closed with fixed public messages.
+// The S3 page scan (#976, always Rust since #1071) and the STORAGE_PATH_IMPL switch (#978): js is the
+// default and unchanged; Rust runs inside dav-parse.wasm and fails closed with fixed public messages.
 // Synthetic buckets, keys and paths only.
 
 const assert = require('node:assert/strict');
@@ -51,26 +51,26 @@ async function withS3(fn) {
 const EXPECTED_S3 = [['a&b.md', 'Docs/a&b.md', false, 42, '.md'], ['huge.bin', 'Docs/huge.bin', false, 1e20, '.bin'], ['R&D', 'Docs/R&D', true, null, ''], ['two.txt', 'Docs/two.txt', false, null, '.txt']];
 const shape = (list) => list.map((e) => [e.name, e.path, e.isDir, e.size, e.ext]);
 
-for (const [name, fn, key] of [['S3_PARSE_IMPL', s3Listing.s3ParseImpl, 'S3_PARSE_IMPL'], ['STORAGE_PATH_IMPL', storagePath.storagePathImpl, 'STORAGE_PATH_IMPL']]) {
-  test(`${name} defaults to js; unknown values mean js with one warning`, (t) => {
-    assert.equal(fn({}), 'js');
-    assert.equal(fn({ [key]: '' }), 'js');
-    assert.equal(fn({ [key]: 'js' }), 'js');
-    assert.equal(fn({ [key]: ' WASM ' }), 'wasm');
-    const warn = t.mock.method(console, 'warn', () => {});
-    assert.equal(fn({ [key]: 'rust' }), 'js');
-    assert.equal(fn({ [key]: 'rust' }), 'js');
-    assert.equal(warn.mock.callCount(), 1);
-  });
-}
-
-test('the flags are independent of DAV_PARSE_IMPL and of each other', () => {
-  assert.equal(s3Listing.s3ParseImpl({ DAV_PARSE_IMPL: 'wasm', STORAGE_PATH_IMPL: 'wasm' }), 'js');
-  assert.equal(storagePath.storagePathImpl({ DAV_PARSE_IMPL: 'wasm', S3_PARSE_IMPL: 'wasm' }), 'js');
+test('STORAGE_PATH_IMPL defaults to js; unknown values mean js with one warning', (t) => {
+  const fn = storagePath.storagePathImpl, key = 'STORAGE_PATH_IMPL';
+  assert.equal(fn({}), 'js');
+  assert.equal(fn({ [key]: '' }), 'js');
+  assert.equal(fn({ [key]: 'js' }), 'js');
+  assert.equal(fn({ [key]: ' WASM ' }), 'wasm');
+  const warn = t.mock.method(console, 'warn', () => {});
+  assert.equal(fn({ [key]: 'rust' }), 'js');
+  assert.equal(fn({ [key]: 'rust' }), 'js');
+  assert.equal(warn.mock.callCount(), 1);
 });
 
-test('js paths never touch the WebAssembly module, even when it is missing', () => withEnv(
-  { S3_PARSE_IMPL: undefined, STORAGE_PATH_IMPL: undefined, DAV_PARSE_WASM: MISSING },
+test('STORAGE_PATH_IMPL is independent of the retired S3_PARSE_IMPL and DAV_PARSE_IMPL', () => {
+  assert.equal(storagePath.storagePathImpl({ DAV_PARSE_IMPL: 'wasm', S3_PARSE_IMPL: 'wasm' }), 'js');
+  assert.equal(s3Listing.s3ParseImpl, undefined);
+  assert.equal(s3Listing.s3PageRecordsJs, undefined);
+});
+
+test('the S3 listing is Rust even with the retired S3_PARSE_IMPL=js, and the js path rules never touch the module', { skip: skipWasm }, () => withEnv(
+  { S3_PARSE_IMPL: 'js', STORAGE_PATH_IMPL: undefined, DAV_PARSE_WASM: undefined },
   () => withS3(async (seen) => {
     assert.deepEqual(shape(await storageClient.listFiles(s3Conn, 'Docs')), EXPECTED_S3);
     assert.deepEqual(seen, [null, 'tok&1'], 'the repeated token stops the walk');
@@ -78,8 +78,8 @@ test('js paths never touch the WebAssembly module, even when it is missing', () 
     assert.doesNotThrow(() => uploads.validate('a.md', Buffer.from('x')));
   })));
 
-test('S3_PARSE_IMPL=wasm fails closed with a fixed public message when the module is missing', (t) => withEnv(
-  { S3_PARSE_IMPL: 'wasm', DAV_PARSE_WASM: MISSING },
+test('the S3 listing fails closed with a fixed public message when the module is missing', (t) => withEnv(
+  { DAV_PARSE_WASM: MISSING },
   () => withS3(async () => {
     const warn = t.mock.method(console, 'warn', () => {});
     const err = await storageClient.listFiles(s3Conn, 'Docs').then(() => null, (e) => e);
@@ -103,7 +103,7 @@ test('STORAGE_PATH_IMPL=wasm fails closed with a fixed public message when the m
   }));
 
 test('wasm: the S3 listing and the path rules match the JS, and refusals fail closed', { skip: skipWasm }, (t) => withEnv(
-  { S3_PARSE_IMPL: 'wasm', STORAGE_PATH_IMPL: 'wasm' },
+  { STORAGE_PATH_IMPL: 'wasm' },
   () => withS3(async (seen) => {
     assert.deepEqual(shape(await storageClient.listFiles(s3Conn, 'Docs')), EXPECTED_S3);
     assert.deepEqual(seen, [null, 'tok&1']);

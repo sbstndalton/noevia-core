@@ -29,7 +29,7 @@ const { readCappedText } = require('./http.cjs');
 
 
 // The PROPFIND listing parser and the XML text helpers it shares with the S3 listing live in
-// dav-listing.cjs (#967: DAV_PARSE_IMPL=js|wasm picks the JS parser or its Rust/WebAssembly port).
+// dav-listing.cjs (#967: always the Rust/WebAssembly parser since #1071).
 const { decodeXmlEntities, elementTexts, firstElementText, listingEntries } = require('./dav-listing.cjs');
 // The path rules (#978) live in storage-path.cjs; the S3 page scan (#976) in s3-listing.cjs.
 const { safeRelativePath, cleanRoot, joinRoot } = require('./storage-path.cjs');
@@ -97,8 +97,8 @@ async function davList(conn, fullPath) {
   if (response.status === 404) return [];
   if (!response.ok && response.status !== 207) throw new Error(`storage returned ${response.status}`);
   const { text: body } = await readCappedText(response, LIST_BODY_CAP);
-  // Untrusted body: parsed by dav-listing.cjs (JS, or the fail-closed WebAssembly port with
-  // DAV_PARSE_IMPL=wasm). Only direct children of the browsed directory come back.
+  // Untrusted body: parsed by dav-listing.cjs (the fail-closed WebAssembly port,
+  // always, #1071). Only direct children of the browsed directory come back.
   const entries = listingEntries(body, target).map((e) => ({
     name: e.name,
     path: e.name, // caller joins the browsed dir back on

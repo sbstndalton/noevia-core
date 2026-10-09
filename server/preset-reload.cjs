@@ -5,7 +5,7 @@
 // not pass through noevia's maintenance gate). So reloadPresets used to refuse whenever anything
 // was loaded, and a newly added model stayed invisible to the engine until a manual restart.
 //
-// PRESET_RELOAD_IMPL=wasm (default off, read per call) lets a reload go ahead with models loaded
+// Always on since #1071 (it was PRESET_RELOAD_IMPL=wasm): a reload goes ahead with models loaded
 // when all of these hold, and otherwise keeps the old refusal:
 //   1. noevia knows what the router last read: the models.ini text recorded right after the last
 //      reload noevia made (kept in stateFile so a core restart does not forget it), and
@@ -16,9 +16,6 @@
 // Anything unknown, unreadable or ambiguous fails closed (no reload with models loaded).
 
 const fs = require('node:fs');
-
-const FLAG = 'PRESET_RELOAD_IMPL';
-const modeOf = (env = process.env) => (String(env[FLAG] ?? '').trim().toLowerCase() === 'wasm' ? 'wasm' : 'off');
 
 // Statuses the router counts as running (server-models.h is_running(): loaded, loading, sleeping);
 // a reload unloads any of them whose preset changed.
@@ -37,7 +34,7 @@ function engineView(rows) {
   return JSON.stringify(Object.keys(out).sort().map((id) => [id, out[id]]));
 }
 
-function createReloadGuard({ stateFile = null, env = process.env, check = (req) => require('./dav-parse-wasm.cjs').presetReload(req), log = () => {} } = {}) {
+function createReloadGuard({ stateFile = null, check = (req) => require('./dav-parse-wasm.cjs').presetReload(req), log = () => {} } = {}) {
   let baseline = null; // { text, view }
   try {
     if (stateFile) {
@@ -55,7 +52,6 @@ function createReloadGuard({ stateFile = null, env = process.env, check = (req) 
     } catch (e) { log(`[models] could not save the preset reload baseline: ${e?.message || e}`); }
   };
   return {
-    mode: () => modeOf(env),
     /** After a reload noevia made: the text it read just before and the router's rows just after.
      *  `textAfter` is the file re-read after the rows; if it moved, the router may have read either. */
     record(textBefore, rows, textAfter) {
@@ -67,7 +63,6 @@ function createReloadGuard({ stateFile = null, env = process.env, check = (req) 
     known: () => !!baseline,
     /** May the router reload `currentText` now without unloading any of `loadedIds`? */
     verdict(currentText, rows, loadedIds) {
-      if (modeOf(env) !== 'wasm') return { safe: false, reason: 'off' };
       if (!baseline) return { safe: false, reason: 'unknown' };
       const view = engineView(rows);
       if (view === null) return { safe: false, reason: 'unknown' };
@@ -84,4 +79,4 @@ function createReloadGuard({ stateFile = null, env = process.env, check = (req) 
   };
 }
 
-module.exports = { createReloadGuard, engineView, liveIds, modeOf, FLAG, LIVE };
+module.exports = { createReloadGuard, engineView, liveIds, LIVE };

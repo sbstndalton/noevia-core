@@ -9,54 +9,26 @@
 // tools gets HTTP 400 ("Unable to generate parser for this template… Conversation roles must
 // alternate…"). Only the template text decides; model and file names never do.
 //
-// CHAT_TEMPLATE_CAPS_IMPL=off|wasm (default wasm, the owner's decision for #1002):
-//   wasm  Before a local (native engine) chat sends tools, the model's template is read from the
-//         engine's /props (`chat_template`, per model, autoload=false so it never loads a model)
-//         and analysed; when it cannot take tools, they are not sent and the user sees a small
-//         notice. When the engine still answers with the template/tools error, the round is
-//         retried once without tools, with a notice. The answer is cached per model.
-//         Autotune's final check also sends one realistic chat request (#1003).
-//   off   Requests are sent as before.
-// Either way, a provider failure shows the upstream's own (sanitised, capped) reason instead of
-// one fixed sentence (failureText); when the module cannot run, the old sentences stay.
+// Always on (#1071; it was CHAT_TEMPLATE_CAPS_IMPL=wasm, the default since #1002): before a local
+// (native engine) chat sends tools, the model's template is read from the engine's /props
+// (`chat_template`, per model, autoload=false so it never loads a model) and analysed; when it
+// cannot take tools, they are not sent and the user sees a small notice. When the engine still
+// answers with the template/tools error, the round is retried once without tools, with a notice.
+// The answer is cached per model. Autotune's final check also sends one realistic chat request
+// (#1003). A provider failure shows the upstream's own (sanitised, capped) reason instead of one
+// fixed sentence (failureText).
 //
-// Unset means wasm. An explicit `wasm` with an unusable module stops the server at startup (#996,
-// dav-parse-wasm.cjs IMPL_FLAGS); the default instead logs a warning and runs as `off`, so a
-// build without the module behaves as before this change. Any other value is off.
+// A missing or tampered dav-parse.wasm stops the server at startup (dav-parse-wasm.cjs
+// verifyAtStartup). An old CHAT_TEMPLATE_CAPS_IMPL value in the environment is ignored with one
+// warning (warnRetiredFlags); the template check and the error text are Rust's alone.
 
 const davParseWasm = require('./dav-parse-wasm.cjs');
 
-const FLAG = 'CHAT_TEMPLATE_CAPS_IMPL';
 const TOOLS_OFF_NOTICE = "This model's chat template can't use tools, so it answers without them.";
 const TOOLS_RETRY_NOTICE = "The model's chat template can't use tools; retrying without tools.";
 
-let defaultDisabled = false;
-
-const raw = (env) => String(env[FLAG] ?? '').trim().toLowerCase();
-
-/** 'wasm' or 'off'. */
-function mode(env = process.env) {
-  const value = raw(env);
-  if (value === 'wasm') return 'wasm';
-  if (value === '') return defaultDisabled ? 'off' : 'wasm';
-  return 'off';
-}
-
-/** Startup (index.cjs, after dav-parse-wasm verifyAtStartup): when the switch is left at its
- *  default, check the module now; if it is unusable, warn and run as off. Returns the mode. */
-function startup(env = process.env, log = console) {
-  defaultDisabled = false;
-  if (raw(env) !== '') return mode(env);
-  try {
-    davParseWasm.verifyAtStartup({ DAV_PARSE_WASM: env.DAV_PARSE_WASM, [FLAG]: 'wasm' });
-  } catch (err) {
-    defaultDisabled = true;
-    log.warn(`[chat-template-caps] ${FLAG} defaults to wasm, but dav-parse.wasm is unusable (${err?.reason || 'unexpected'}); running with it off.`);
-  }
-  return mode(env);
-}
-
-/** `{ kind, reason }` from the Rust classifier, or null when the module cannot run. */
+/** `{ kind, reason }` from the Rust classifier, or null when this call could not run it (a trap,
+ *  say; startup already proved the module loads). */
 function classify(status, text) {
   try { return davParseWasm.providerErrorKind(status, String(text ?? '')); } catch { return null; }
 }
@@ -137,4 +109,4 @@ function createToolsGate({ ttlMs = 10 * 60 * 1000, unknownTtlMs = 30 * 1000, max
 
 const toolsGate = createToolsGate();
 
-module.exports = { FLAG, mode, startup, classify, toolsRefused, failureText, createToolsGate, toolsGate, TOOLS_OFF_NOTICE, TOOLS_RETRY_NOTICE };
+module.exports = { classify, toolsRefused, failureText, createToolsGate, toolsGate, TOOLS_OFF_NOTICE, TOOLS_RETRY_NOTICE };

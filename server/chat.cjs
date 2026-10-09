@@ -1152,9 +1152,9 @@ function createChatHandler({
     let toolOffset = 0;
     let continuationCompactedAt=null,continuationCovered=0;
     let forcedTool = null, gateRetried = false;
-    // #1002 (CHAT_TEMPLATE_CAPS_IMPL=wasm): a native-engine model whose chat template cannot take
+    // #1002: a native-engine model whose chat template cannot take
     // tools is sent none (nor tool_choice), and the user is told once. Unknown templates keep them.
-    const templateGate = provider.id === DEFAULT_PROVIDER_ID && typeof modelManager?.props === 'function' && templateCaps.mode() === 'wasm';
+    const templateGate = provider.id === DEFAULT_PROVIDER_ID && typeof modelManager?.props === 'function';
     let templateToolsOff = false;
     if (templateGate && activeTools.length && !(await templateToolsGate.allowsTools(modelManager, model, chatSignal.signal))) {
       templateToolsOff = true;

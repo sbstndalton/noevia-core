@@ -14,12 +14,12 @@
 //   errors:     { name, status, body, expect: { kind, reason? } }  synthetic upstream errors;
 //               every host, key and path in them is made up.
 //   context:    { text, jsContextFull }  jsContextFull is the JS reference itself: whether
-//               chat-context.cjs providerErrorJs(text) returns its context-full sentence.
+//               tests/server/oracle/chat-context.cjs providerErrorJs(text) returns its context-full sentence.
 //   verdicts:   { name, status, body, expect: { passed, kind } }  autotune's serving check.
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { providerErrorJs, CONTEXT_FULL_TEXT } = require('../server/chat-context.cjs');
+const { providerErrorJs, CONTEXT_FULL_TEXT } = require('../tests/server/oracle/chat-context.cjs');
 
 const DIR = path.join(__dirname, '..', 'tests', 'fixtures', 'chat-templates');
 // Public chat templates (short, quoted as test data only). llama.cpp's copies are from
