@@ -4,9 +4,9 @@
 // sbstndalton/noevia-rs (bins/dav-parse-wasm) at the ref in server/dav-parse.lock and placed at
 // server/wasm/dav-parse.wasm by the image build (or DAV_PARSE_WASM). Node's built-in WebAssembly
 // runs it: no imports, no WASI, no native addon. It carries three Rust ports, each behind its own
-// switch (default js):
-//   - crates/dav-parse      listRecords  = dav-listing.cjs listingRecordsJs  (DAV_PARSE_IMPL, #967)
-//   - crates/s3-list-parse  s3ListPage   = s3-listing.cjs s3PageRecordsJs    (S3_PARSE_IMPL, #976)
+// switch (default js), except the ones marked always on (#1071: no JS twin at runtime, tests/server/oracle/ keeps it for the fixtures):
+//   - crates/dav-parse      listRecords  = tests/server/oracle/dav-listing.cjs listingRecordsJs  (#967; always on, #1071)
+//   - crates/s3-list-parse  s3ListPage   = tests/server/oracle/s3-listing.cjs s3PageRecordsJs    (#976; always on, #1071)
 //   - crates/storage-path   storagePath  = storage-path.cjs's rules          (STORAGE_PATH_IMPL, #978)
 //   - crates/upload-sniff   uploadValidate/uploadClassify/uploadDecode
 //                                        = upload-sniff.cjs validate/classify/decodeText
@@ -16,11 +16,11 @@
 //   - crates/mcp-frame     mcpRpcBody/mcpSchemaRefs = mcp.cjs parseRpcBody/resolveSchemaRefs
 //                                                                             (MCP_FRAME_IMPL, #980)
 //   - crates/chat-template-caps + provider-error  templateCaps/providerErrorKind/servingVerdict
-//   - crates/autotune-plan  autotunePlan = auto-tune's next step                (AUTOTUNE_PLAN_IMPL, #1003)
-//   - crates/preset-reload  presetReload = may the router re-read models.ini now (PRESET_RELOAD_IMPL, #1012)
-//   - crates/load-verdict   loadVerdict = why a failed auto-tune step failed   (LAYA_LOAD_ADVISOR, #1004)
+//   - crates/autotune-plan  autotunePlan = auto-tune's next step                (always on, #1003/#1071)
+//   - crates/preset-reload  presetReload = may the router re-read models.ini now (always on, #1012/#1071)
+//   - crates/load-verdict   loadVerdict = why a failed auto-tune step failed   (always on, #1004/#1071)
 //                                        new logic, no JS twin; see chat-template-caps.cjs
-//                                                                             (CHAT_TEMPLATE_CAPS_IMPL, #1002)
+//                                                                             (always on, #1002/#1071)
 //   - crates/tune-contention tuneContention = auto-tune vs another router client (always on; fails closed, #1062)
 //   - crates/long-profile   longProfilePairs/longProfileSection/longProfilePick = a model's
 //                           <id>-long profile: pairing, its models.ini section, the entry a chat
@@ -1846,18 +1846,37 @@ function llamacppAutoconfig(op, args) {
 }
 
 // Every switch that runs this module (#996). Each reads its value as trim().toLowerCase().
-// CHAT_TEMPLATE_CAPS_IMPL counts only when set to wasm explicitly; its default (also wasm) is
-// checked by chat-template-caps.cjs startup(), which falls back to off instead of stopping.
-const IMPL_FLAGS = ['DAV_PARSE_IMPL', 'S3_PARSE_IMPL', 'STORAGE_PATH_IMPL', 'UPLOAD_SNIFF_IMPL', 'SECRET_ENVELOPE_IMPL', 'MCP_FRAME_IMPL', 'CHAT_TEMPLATE_CAPS_IMPL', 'AUTOTUNE_PLAN_IMPL', 'PRESET_RELOAD_IMPL', 'PROMPT_FRAMING_IMPL', 'S3_SIGN_IMPL', 'SSRF_IMPL', 'STREAM_GUARD_IMPL', 'GGUF_META_IMPL', 'POLICY_LEAVES_IMPL', 'CODE_REVIEW_VERDICT_IMPL', 'TOOL_EXCHANGE_IMPL', 'MCP_SERVERS_IMPL', 'DECISION_IMPL', 'CODE_NET_GUARD_IMPL', 'ROLE_CONTEXT_IMPL', 'COMPLETENESS_REPORT_IMPL', 'TASK_LIFECYCLE_IMPL', 'LLAMACPP_AUTOCONFIG_IMPL'];
+// Retired switches (#1071) are not listed: the Rust path they selected is always on, and
+// verifyAtStartup() always loads this module for it.
+const IMPL_FLAGS = ['STORAGE_PATH_IMPL', 'UPLOAD_SNIFF_IMPL', 'SECRET_ENVELOPE_IMPL', 'MCP_FRAME_IMPL', 'PROMPT_FRAMING_IMPL', 'S3_SIGN_IMPL', 'SSRF_IMPL', 'STREAM_GUARD_IMPL', 'GGUF_META_IMPL', 'POLICY_LEAVES_IMPL', 'CODE_REVIEW_VERDICT_IMPL', 'TOOL_EXCHANGE_IMPL', 'MCP_SERVERS_IMPL', 'DECISION_IMPL', 'CODE_NET_GUARD_IMPL', 'ROLE_CONTEXT_IMPL', 'COMPLETENESS_REPORT_IMPL', 'TASK_LIFECYCLE_IMPL', 'LLAMACPP_AUTOCONFIG_IMPL'];
+
+/** Switches whose JS path was deleted once Rust had run in production (#1071). The old value that
+ *  selected Rust ('wasm', or 'on' for the advisor) is accepted silently; anything else is ignored
+ *  with one warning, because Rust is always used. */
+const RETIRED_FLAGS = { CHAT_TEMPLATE_CAPS_IMPL: 'wasm', AUTOTUNE_PLAN_IMPL: 'wasm', PRESET_RELOAD_IMPL: 'wasm', LAYA_LOAD_ADVISOR: 'on', DAV_PARSE_IMPL: 'wasm', S3_PARSE_IMPL: 'wasm' };
+
+/** Log one warning per retired switch that `env` still sets to something other than its old
+ *  Rust-selecting value (for example =js). Returns the names warned about. Never throws. */
+function warnRetiredFlags(env = process.env, log = console) {
+  const warned = [];
+  for (const [flag, rust] of Object.entries(RETIRED_FLAGS)) {
+    const value = String(env[flag] ?? '').trim().toLowerCase();
+    if (value === '' || value === rust) continue;
+    warned.push(flag);
+    log.warn(`${flag} is retired; Rust is always used`);
+  }
+  return warned;
+}
 
 /** The *_IMPL switches set to wasm in `env`. */
 function wasmFlags(env = process.env) {
   return IMPL_FLAGS.filter((k) => String(env[k] ?? '').trim().toLowerCase() === 'wasm');
 }
 
-/** Startup check (#996): when any switch is wasm, load and verify the module now (lock, sha256,
- *  no imports, the full ABI) instead of failing on the first request. Returns the flags; throws
- *  an Error naming them and the reason when the module is unusable. */
+/** Startup check (#996, #1071): load and verify the module now (lock, sha256, no imports, the
+ *  full ABI) instead of failing on the first request. Always required, since the retired
+ *  switches' Rust paths have no JS fallback. Returns the *_IMPL flags set to wasm; throws an
+ *  Error with the reason (naming those flags, if any) when the module is unusable. */
 /** The runtime URL behaviour prompt-framing's port was pinned against (Node 22's ada maps U+1E9E
  *  to "ss" in hosts; noevia-rs crates/prompt-framing idna_compat does the same). A runtime that
  *  disagrees would make JS and wasm hosts differ, so PROMPT_FRAMING_IMPL=wasm refuses to start. */
@@ -1867,7 +1886,6 @@ function framingRuntimeMatches(hostname = (h) => new URL(h).hostname) {
 
 function verifyAtStartup(env = process.env, { hostname } = {}) {
   const flags = wasmFlags(env);
-  if (!flags.length) return flags;
   if (flags.includes('PROMPT_FRAMING_IMPL') && !framingRuntimeMatches(hostname)) {
     cached = null;
     throw Object.assign(new Error(`PROMPT_FRAMING_IMPL set to wasm, but this runtime's URL parser (Node ${process.version}) does not map U+1E9E to "ss" as the pinned port does (runtime)`), { reason: 'runtime', flags });
@@ -1878,7 +1896,9 @@ function verifyAtStartup(env = process.env, { hostname } = {}) {
   } catch (err) {
     cached = null;
     const reason = err instanceof DavParseError ? err.reason : 'unexpected';
-    throw Object.assign(new Error(`${flags.join(', ')} set to wasm, but dav-parse.wasm failed verification (${reason}): ${err?.message || err}`), { reason, flags });
+    // Without a switch the module is still required (the retired switches' Rust paths, #1071).
+    const who = flags.length ? `${flags.join(', ')} set to wasm, but dav-parse.wasm` : 'dav-parse.wasm (always required)';
+    throw Object.assign(new Error(`${who} failed verification (${reason}): ${err?.message || err}`), { reason, flags });
   }
   return flags;
 }
@@ -1886,4 +1906,4 @@ function verifyAtStartup(env = process.env, { hostname } = {}) {
 /** Test hook: forget the cached module (and its failure). */
 function reset() { cached = null; }
 
-module.exports = { llamacppAutoconfig, autoconfigReply, MAX_AUTOCONFIG_BYTES, taskLifecycleCanTransition, taskLifecycleTransition, taskLifecycleStageMove, taskLifecycleFold, taskLifecycleDerive, taskLifecycleReply, MAX_TASK_LIFECYCLE_BYTES, completenessReport, completenessReply, MAX_COMPLETENESS_BYTES, roleContextProject, roleContextDossier, roleContextReply, MAX_ROLE_CONTEXT_BYTES, codeNetSpec, codeNetResolved, codeNetRefuses, MAX_CODE_NET_BYTES, MAX_CODE_NET_ENTRIES, mcpServersParse, mcpToolboxes, mcpToolboxOffered, MAX_MCP_SERVERS_BYTES, decisionRequestTag, decisionResultTag, decisionInvalidRequest, decisionInvalidResult, decisionCauseOf, decisionErrorFacts, decisionRequest, MAX_DECISION_MESSAGE_UNITS, MAX_DECISION_BYTES, DECISION_ENTRIES, reviewTag, reviewVerdictRead, reviewEventBound, reviewVerdictReply, MAX_REVIEW_BYTES, toolExchangeCheck, toolExchangeError, MAX_EXCHANGE_ARGS_UNITS, MAX_EXCHANGE_NAME_UNITS, ggufSummary, ggufSummaryReply, MAX_GGUF_WINDOW_BYTES, MAX_GGUF_SEGMENTS, authTokens, toolPolicyMode, toolPolicySet, MAX_POLICY_UNITS, MAX_POLICY_TOOLS, streamGuardSchema, streamGuardOptions, streamGuardNew, streamGuardFeed, streamGuardEnd, streamGuardCheck, streamGuardCheckReply, streamGuardCorrection, streamGuardReply, plainJson, MAX_GUARD_BYTES, MAX_GUARD_DEPTH, MAX_GUARD_SCHEMA_BYTES, MAX_GUARD_STATE_BYTES, MAX_GUARD_INPUT_BYTES, MAX_CORRECTION_UNITS, s3Sign, s3Region, MAX_S3_FIELD_BYTES, MAX_S3_QUERY_PAIRS, MAX_S3_PAYLOAD_BYTES, wasmFlags, verifyAtStartup, framingRuntimeMatches, IMPL_FLAGS, ssrfUrl, ssrfAddressesPublic, ssrfUrlReply, ssrfAddressesReply, MAX_SSRF_BYTES, MAX_SSRF_ADDRESSES, frameUntrusted, escapeClosing, provenanceNew, provenanceIngest, provenanceAdd, provenanceSource, provenanceCheck, provenanceProbe, packetParse, packetValidate, packetRender, FRAME_TEXT_UNITS, FRAME_LABEL_UNITS, MAX_PROVENANCE_BYTES, MAX_PACKET_BYTES, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, tuneContention, tuneContentionText, MAX_CONTENTION_BYTES, longProfilePairs, longProfileSection, longProfilePick, longProfileText, MAX_LONG_PROFILE_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
+module.exports = { llamacppAutoconfig, autoconfigReply, MAX_AUTOCONFIG_BYTES, taskLifecycleCanTransition, taskLifecycleTransition, taskLifecycleStageMove, taskLifecycleFold, taskLifecycleDerive, taskLifecycleReply, MAX_TASK_LIFECYCLE_BYTES, completenessReport, completenessReply, MAX_COMPLETENESS_BYTES, roleContextProject, roleContextDossier, roleContextReply, MAX_ROLE_CONTEXT_BYTES, codeNetSpec, codeNetResolved, codeNetRefuses, MAX_CODE_NET_BYTES, MAX_CODE_NET_ENTRIES, mcpServersParse, mcpToolboxes, mcpToolboxOffered, MAX_MCP_SERVERS_BYTES, decisionRequestTag, decisionResultTag, decisionInvalidRequest, decisionInvalidResult, decisionCauseOf, decisionErrorFacts, decisionRequest, MAX_DECISION_MESSAGE_UNITS, MAX_DECISION_BYTES, DECISION_ENTRIES, reviewTag, reviewVerdictRead, reviewEventBound, reviewVerdictReply, MAX_REVIEW_BYTES, toolExchangeCheck, toolExchangeError, MAX_EXCHANGE_ARGS_UNITS, MAX_EXCHANGE_NAME_UNITS, ggufSummary, ggufSummaryReply, MAX_GGUF_WINDOW_BYTES, MAX_GGUF_SEGMENTS, authTokens, toolPolicyMode, toolPolicySet, MAX_POLICY_UNITS, MAX_POLICY_TOOLS, streamGuardSchema, streamGuardOptions, streamGuardNew, streamGuardFeed, streamGuardEnd, streamGuardCheck, streamGuardCheckReply, streamGuardCorrection, streamGuardReply, plainJson, MAX_GUARD_BYTES, MAX_GUARD_DEPTH, MAX_GUARD_SCHEMA_BYTES, MAX_GUARD_STATE_BYTES, MAX_GUARD_INPUT_BYTES, MAX_CORRECTION_UNITS, s3Sign, s3Region, MAX_S3_FIELD_BYTES, MAX_S3_QUERY_PAIRS, MAX_S3_PAYLOAD_BYTES, wasmFlags, RETIRED_FLAGS, warnRetiredFlags, verifyAtStartup, framingRuntimeMatches, IMPL_FLAGS, ssrfUrl, ssrfAddressesPublic, ssrfUrlReply, ssrfAddressesReply, MAX_SSRF_BYTES, MAX_SSRF_ADDRESSES, frameUntrusted, escapeClosing, provenanceNew, provenanceIngest, provenanceAdd, provenanceSource, provenanceCheck, provenanceProbe, packetParse, packetValidate, packetRender, FRAME_TEXT_UNITS, FRAME_LABEL_UNITS, MAX_PROVENANCE_BYTES, MAX_PACKET_BYTES, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, tuneContention, tuneContentionText, MAX_CONTENTION_BYTES, longProfilePairs, longProfileSection, longProfilePick, longProfileText, MAX_LONG_PROFILE_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };

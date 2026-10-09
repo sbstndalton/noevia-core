@@ -1,7 +1,7 @@
 'use strict';
 
 // Differential tests for the S3 page scan (#976) and the storage path rules (#978): the JS
-// references (server/s3-listing.cjs s3PageRecordsJs, server/storage-path.cjs *Js) and their Rust
+// references (tests/server/oracle/s3-listing.cjs s3PageRecordsJs, server/storage-path.cjs *Js) and their Rust
 // ports in dav-parse.wasm (sbstndalton/noevia-rs crates/s3-list-parse, crates/storage-path) must
 // agree on every synthetic fixture in tests/fixtures/s3-list.v1.json and storage-path.v1.json
 // (byte-identical to noevia-rs's copies; CI compares them) and on seeded random inputs that also
@@ -14,7 +14,7 @@ const path = require('node:path');
 const test = require('node:test');
 const { isDeepStrictEqual } = require('node:util');
 
-const { s3PageRecordsJs } = require('../../server/s3-listing.cjs');
+const { s3PageRecordsJs } = require('./oracle/s3-listing.cjs');
 const paths = require('../../server/storage-path.cjs');
 const davParseWasm = require('../../server/dav-parse-wasm.cjs');
 

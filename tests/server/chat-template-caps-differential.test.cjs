@@ -15,7 +15,7 @@ const path = require('node:path');
 const test = require('node:test');
 
 const davParseWasm = require('../../server/dav-parse-wasm.cjs');
-const { providerErrorJs, CONTEXT_FULL_TEXT } = require('../../server/chat-context.cjs');
+const { providerErrorJs, CONTEXT_FULL_TEXT } = require('./oracle/chat-context.cjs');
 
 const FILE = path.join(__dirname, '../fixtures/chat-template-caps.v1.json');
 const fixtures = JSON.parse(fs.readFileSync(FILE, 'utf8'));

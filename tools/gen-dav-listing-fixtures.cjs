@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 'use strict';
 // Regenerates tests/fixtures/dav-listing.v1.json (#967): a synthetic, adversarial PROPFIND fixture
-// table whose expectations come from the JS reference (server/dav-listing.cjs listingRecordsJs).
+// table whose expectations come from the JS reference (tests/server/oracle/dav-listing.cjs listingRecordsJs).
 // The same file is committed byte-for-byte in sbstndalton/noevia-rs
 // (crates/dav-parse/tests/fixtures/dav-listing.v1.json); both repos' CI compare it.
 //   node tools/gen-dav-listing-fixtures.cjs > tests/fixtures/dav-listing.v1.json
 // Every name, host and path below is made up. No real storage content.
 
-const { listingRecordsJs } = require('../server/dav-listing.cjs');
+const { listingRecordsJs } = require('../tests/server/oracle/dav-listing.cjs');
 
 const T = 'https://dav.example.test/remote.php/dav/files/alice/Notes/';
 const DIR = '/remote.php/dav/files/alice/Notes';

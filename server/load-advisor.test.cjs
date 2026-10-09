@@ -3,7 +3,7 @@
 // texts; the decision service is a fake (no Laya, no model, no network).
 const test = require('node:test'), assert = require('node:assert/strict');
 const fs = require('node:fs');
-const { createLoadAdvisor, enabled, excerpt, OPTIONS, ADVICE_BUDGET_MS, EXCERPT_UNITS } = require('./load-advisor.cjs');
+const { createLoadAdvisor, excerpt, OPTIONS, ADVICE_BUDGET_MS, EXCERPT_UNITS } = require('./load-advisor.cjs');
 const davParseWasm = require('./dav-parse-wasm.cjs');
 const wasmFile = process.env.DAV_PARSE_WASM || davParseWasm.DEFAULT_WASM;
 const skipWasm = !fs.existsSync(wasmFile) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
@@ -38,12 +38,10 @@ function fakeVerdict(calls = []) {
   };
 }
 
-test('LAYA_LOAD_ADVISOR is on only when set to on', () => {
-  assert.equal(enabled({}), false);
-  for (const v of ['on', ' ON ', 'On']) assert.equal(enabled({ LAYA_LOAD_ADVISOR: v }), true, v);
-  for (const v of ['1', 'true', 'yes', 'off', 'wasm', '']) assert.equal(enabled({ LAYA_LOAD_ADVISOR: v }), false, v);
-  assert.equal(createLoadAdvisor({ env: {}, endpoint: null }).enabled(), false);
-  assert.equal(createLoadAdvisor({ env: ON, endpoint: null }).enabled(), true);
+test('LAYA_LOAD_ADVISOR is retired: there is no enabled switch, whatever the environment says', () => {
+  assert.equal(require('./load-advisor.cjs').enabled, undefined);
+  assert.equal(require('./load-advisor.cjs').FLAG, undefined);
+  for (const env of [{}, ON, { LAYA_LOAD_ADVISOR: 'off' }]) assert.equal(createLoadAdvisor({ env, endpoint: null }).enabled, undefined);
   assert.equal(ADVICE_BUDGET_MS, 2000);
 });
 

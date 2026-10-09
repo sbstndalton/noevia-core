@@ -505,7 +505,7 @@ function createCalibrator(deps) {
     return { ok: true, status: 202, body: publicJob(job) };
   }
 
-  // #1003: one fill-and-recall step for auto-tune's planner (AUTOTUNE_PLAN_IMPL=wasm). Writes
+  // #1003: one fill-and-recall step for auto-tune's planner (planned runs). Writes
   // `base` plus ctx-size over the profile at `baseRevision`, loads, fills `fill` tokens with a
   // marker and checks recall, memory and the time limit, then unloads. The caller holds the gate
   // and restores the profile; a failed step reports its cause (oom, load, time or recall).

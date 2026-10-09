@@ -1,5 +1,5 @@
 'use strict';
-// #1004 LAYA_LOAD_ADVISOR=on (default off): the decision service (Laya) as an advisor inside
+// #1004 (always on since #1071; it was LAYA_LOAD_ADVISOR=on): the decision service (Laya) as an advisor inside
 // auto-tune's script, never its driver. When a fill-and-recall step fails for a reason the
 // calibrator only guessed (a refused load, a failed router row, a stream error, an engine that
 // went away), Rust's load-verdict (dav-parse.wasm load_verdict) names the outcome from the
@@ -14,7 +14,6 @@
 // second question while one is open is not asked), within ADVICE_BUDGET_MS. A timeout, an error,
 // an unconfigured service or an unusable module all mean "no advice": the calibrator's own cause
 // stands, which is what auto-tune did before. Nothing here loads, unloads or runs a model.
-const FLAG = 'LAYA_LOAD_ADVISOR';
 const ADVICE_BUDGET_MS = 2000;
 // The engine's text goes to the decision service and the verdict as a short excerpt.
 const EXCERPT_UNITS = 2048;
@@ -27,8 +26,6 @@ const OPTIONS = [
   { id: 'template', label: "The model's chat template could not be parsed or applied" },
   { id: 'unknown', label: 'None of these, or the text does not say' },
 ];
-
-const enabled = (env = process.env) => String(env[FLAG] ?? '').trim().toLowerCase() === 'on';
 
 // Printable, bounded and well-formed: control characters (other than line breaks and tabs) become
 // spaces, then the first EXCERPT_UNITS UTF-16 units are kept.
@@ -72,7 +69,6 @@ function createLoadAdvisor({ env = process.env, endpoint = undefined, verdict = 
     } finally { clearTimeout(timer); open = false; }
   }
   return {
-    enabled: () => enabled(env),
     /** The outcome for a failed step, and what decided it; null when the verdict is unavailable
      *  (the caller keeps its own outcome). Never throws. */
     async judge({ cause, evidence }) {
@@ -94,4 +90,4 @@ function createLoadAdvisor({ env = process.env, endpoint = undefined, verdict = 
   };
 }
 
-module.exports = { createLoadAdvisor, enabled, excerpt, FLAG, ADVICE_BUDGET_MS, EXCERPT_UNITS, OPTIONS, QUESTION };
+module.exports = { createLoadAdvisor, excerpt, ADVICE_BUDGET_MS, EXCERPT_UNITS, OPTIONS, QUESTION };

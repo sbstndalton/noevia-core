@@ -1,6 +1,6 @@
 'use strict';
 
-// #1002: CHAT_TEMPLATE_CAPS_IMPL. A native-engine model whose chat template cannot take tools
+// #1002 (always on since #1071). A native-engine model whose chat template cannot take tools
 // (Gemma 3) is sent none; an engine that still answers with the template/tools 400 gets one retry
 // without tools; failures show the upstream's sanitised reason. Synthetic models, templates and
 // hosts only; nothing is loaded or run.
@@ -28,39 +28,23 @@ const GEMMA_400 = JSON.stringify({ error: { code: 400, message: 'Unable to gener
 const TOOL = { type: 'function', function: { name: 'synthetic_search', description: 'Search synthetic notes.', parameters: { type: 'object', properties: { q: { type: 'string' } }, required: ['q'] } } };
 const SSE_OK = 'data: {"choices":[{"delta":{"content":"Hi"}}]}\n\ndata: [DONE]\n\n';
 
-test('mode: unset is wasm, off and unknown values are off, explicit wasm is wasm', () => {
-  assert.equal(caps.mode({}), 'wasm');
-  assert.equal(caps.mode({ CHAT_TEMPLATE_CAPS_IMPL: ' WASM ' }), 'wasm');
-  assert.equal(caps.mode({ CHAT_TEMPLATE_CAPS_IMPL: 'off' }), 'off');
-  assert.equal(caps.mode({ CHAT_TEMPLATE_CAPS_IMPL: 'js' }), 'off');
-  assert.ok(davParseWasm.IMPL_FLAGS.includes('CHAT_TEMPLATE_CAPS_IMPL'));
-  assert.deepEqual(davParseWasm.wasmFlags({}), [], 'the default does not make startup fatal');
+test('CHAT_TEMPLATE_CAPS_IMPL is retired: no mode, no startup fallback, not a wasm switch', () => {
+  assert.equal(caps.mode, undefined);
+  assert.equal(caps.startup, undefined);
+  assert.equal(caps.FLAG, undefined);
+  assert.ok(!davParseWasm.IMPL_FLAGS.includes('CHAT_TEMPLATE_CAPS_IMPL'));
+  assert.deepEqual(davParseWasm.wasmFlags({ CHAT_TEMPLATE_CAPS_IMPL: 'wasm' }), []);
 });
 
-test('startup: the default with an unusable module warns and runs off; explicit values are kept', () => {
-  const warnings = [];
-  assert.equal(caps.startup({ DAV_PARSE_WASM: MISSING }, { warn: (m) => warnings.push(m) }), 'off');
-  assert.match(warnings[0], /defaults to wasm, but dav-parse.wasm is unusable \(missing\); running with it off/);
-  assert.equal(caps.mode({}), 'off');
-  assert.equal(caps.startup({ CHAT_TEMPLATE_CAPS_IMPL: 'off', DAV_PARSE_WASM: MISSING }, { warn() {} }), 'off');
-  davParseWasm.reset();
-  caps.startup({ CHAT_TEMPLATE_CAPS_IMPL: 'wasm' }, { warn() {} });
-  assert.equal(caps.mode({}), 'wasm', 'defaultDisabled cleared');
-});
-
-test('startup: the default with the pinned module stays wasm', { skip: skipWasm }, () => {
-  davParseWasm.reset();
-  assert.equal(caps.startup({ DAV_PARSE_WASM: wasmFile }, { warn: () => assert.fail('no warning') }), 'wasm');
-});
-
-test('failureText falls back to null (the fixed sentences) when the module cannot run', () => {
+test('failureText is null and the generic sentence shows when a call cannot run the module', () => {
   const prev = process.env.DAV_PARSE_WASM;
   process.env.DAV_PARSE_WASM = MISSING;
   davParseWasm.reset();
   try {
     assert.equal(caps.failureText(400, GEMMA_400), null);
     assert.equal(context.providerError(GEMMA_400, 400), context.STREAM_FAILED_TEXT);
-    assert.equal(context.providerError({ message: 'Context size has been exceeded.' }), context.CONTEXT_FULL_TEXT);
+    // No JS context-full twin any more (#1071): a call Rust cannot run shows the generic sentence.
+    assert.equal(context.providerError({ message: 'Context size has been exceeded.' }), context.STREAM_FAILED_TEXT);
   } finally {
     if (prev === undefined) delete process.env.DAV_PARSE_WASM; else process.env.DAV_PARSE_WASM = prev;
     davParseWasm.reset();
@@ -97,13 +81,14 @@ test('the tools gate reads /props once per model, caches, and treats unknown as 
   assert.equal(await gate.allowsTools(manager, 'unloaded'), false);
 });
 
-async function chatWith(t, { fetch, props, env = 'wasm', tools = [TOOL], gate = caps.createToolsGate(), project = { id: 'fixture-project', routing: 'manual', assets: [], toolboxes: [] }, provider = { id: 'default', label: 'Local', baseUrl: 'http://fixture.invalid' } }) {
+async function chatWith(t, { fetch, props, env = undefined, tools = [TOOL], gate = caps.createToolsGate(), project = { id: 'fixture-project', routing: 'manual', assets: [], toolboxes: [] }, provider = { id: 'default', label: 'Local', baseUrl: 'http://fixture.invalid' } }) {
   const { createChatHandler } = require('./chat.cjs');
   const { createToolExchange } = require('./tool-exchange.cjs');
   const { createVisionProbe } = require('./vision.cjs');
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-1002-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  // `env`: a retired CHAT_TEMPLATE_CAPS_IMPL value left in the environment; it must change nothing.
   const prev = process.env.CHAT_TEMPLATE_CAPS_IMPL;
-  process.env.CHAT_TEMPLATE_CAPS_IMPL = env;
+  if (env === undefined) delete process.env.CHAT_TEMPLATE_CAPS_IMPL; else process.env.CHAT_TEMPLATE_CAPS_IMPL = env;
   t.after(() => { if (prev === undefined) delete process.env.CHAT_TEMPLATE_CAPS_IMPL; else process.env.CHAT_TEMPLATE_CAPS_IMPL = prev; });
   const events = [];
   const res = new EventEmitter(); res.writeHead = () => {}; res.write = (c) => { events.push(String(c)); }; res.end = () => { res.emit('finish'); };
@@ -196,15 +181,14 @@ test('wasm: another 400 is not retried', { skip: skipWasm }, async (t) => {
   assert.match(events.find((v) => v.type === 'error').text, /synthetic bad sampling value/);
 });
 
-test('off: tools are sent as before and no retry, but the error shows the real reason', { skip: skipWasm }, async (t) => {
+test('a retired CHAT_TEMPLATE_CAPS_IMPL=off in the environment changes nothing: the template check still runs', { skip: skipWasm }, async (t) => {
   davParseWasm.reset();
   let propsCalls = 0;
   const e = engine(toolsRefused);
   const events = await chatWith(t, { env: 'off', fetch: e.fetch, props: async () => { propsCalls++; return { ok: true, body: { chat_template: GEMMA3 } }; } });
-  assert.equal(propsCalls, 0);
-  assert.ok(e.bodies.every((b) => b.tools));
-  assert.ok(!events.some((v) => v.type === 'warning' && /chat template/.test(v.text)));
-  assert.match(events.find((v) => v.type === 'error').text, /chat template cannot handle this request: Unable to generate parser/);
+  assert.equal(propsCalls, 1);
+  assert.ok(e.bodies.every((b) => !b.tools), 'Gemma 3 gets no tools');
+  assert.ok(events.some((v) => v.type === 'warning' && v.text === caps.TOOLS_OFF_NOTICE));
 });
 
 test('#1015: a template that fails with or without tools is not remembered; the next chat still sends tools', { skip: skipWasm }, async (t) => {

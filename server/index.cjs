@@ -1090,17 +1090,18 @@ async function handleRequest(req,res) {
 let processReady = false;
 
 if (require.main === module) {
-  // #996: a *_IMPL=wasm switch with a missing or tampered dav-parse.wasm refuses to start, rather
-  // than failing closed on every request (for SECRET_ENVELOPE_IMPL: every stored credential).
+  // #996, #1071: dav-parse.wasm is always required (the retired switches' Rust paths have no JS
+  // twin), and so is any *_IMPL=wasm switch's: a missing or tampered module refuses to start,
+  // rather than failing closed on every request (for SECRET_ENVELOPE_IMPL: every stored credential).
+  const davParseWasm = require('./dav-parse-wasm.cjs');
+  davParseWasm.warnRetiredFlags();
   try {
-    const wasmFlags = require('./dav-parse-wasm.cjs').verifyAtStartup();
-    if (wasmFlags.length) console.log(`[dav-parse] dav-parse.wasm verified for ${wasmFlags.join(', ')}`);
+    const wasmFlags = davParseWasm.verifyAtStartup();
+    console.log(`[dav-parse] dav-parse.wasm verified${wasmFlags.length ? ` for ${wasmFlags.join(', ')}` : ''}`);
   } catch (err) {
-    console.error(`FATAL: ${err.message}. Restore the pinned module (server/dav-parse.lock) or set the switch to js (CHAT_TEMPLATE_CAPS_IMPL: off).`);
+    console.error(`FATAL: ${err.message}. Restore the pinned module (server/dav-parse.lock).`);
     process.exit(1);
   }
-  // #1002: CHAT_TEMPLATE_CAPS_IMPL defaults to wasm; an unusable module then means off, with a warning.
-  console.log(`[chat-template-caps] CHAT_TEMPLATE_CAPS_IMPL=${require('./chat-template-caps.cjs').startup()}`);
   fs.mkdirSync(DATA_DIR, { recursive: true });
   authTokens.warnings.forEach((w) => console.warn(w));
   if (!DIARY_TENANT_KEY) console.warn('WARNING: DIARY_TENANT_KEY is unset; Diary calls carry no tenant assertion and remote storage secrets ride on every call.');

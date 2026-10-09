@@ -1,7 +1,7 @@
 'use strict';
 
 // Differential test for the PROPFIND listing parser (#967): the JS reference
-// (server/dav-listing.cjs listingRecordsJs) and dav-parse.wasm (sbstndalton/noevia-rs
+// (tests/server/oracle/dav-listing.cjs listingRecordsJs) and dav-parse.wasm (sbstndalton/noevia-rs
 // crates/dav-parse) must agree on every synthetic fixture in tests/fixtures/dav-listing.v1.json
 // (byte-identical to noevia-rs's copy; CI compares them) and on seeded random listings that also
 // carry raw lone surrogates. The WebAssembly half needs server/wasm/dav-parse.wasm (or
@@ -12,7 +12,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const test = require('node:test');
 
-const { listingRecordsJs } = require('../../server/dav-listing.cjs');
+const { listingRecordsJs } = require('./oracle/dav-listing.cjs');
 const davParseWasm = require('../../server/dav-parse-wasm.cjs');
 
 const fixtures = JSON.parse(fs.readFileSync(path.join(__dirname, '../fixtures/dav-listing.v1.json'), 'utf8'));
