@@ -14,11 +14,15 @@
 //   mode:  { stored: units|null, isWrite, want }   createToolPolicy(...).mode() with the row's stored
 //          mode (null: no row, or no user); stored strings outside the CHECK constraint included
 //   set:   { value: units|null, writes: [bool], want: 'ok'|message }   set() up to its write
+//
+// The JS references (retired from production in #1071, so they live with the tests):
+//   tests/server/oracle/auth-tokens.cjs
+//   tests/server/oracle/tool-policy.cjs
 
 const path = require('node:path');
-const server = path.join(__dirname, '..', 'server');
-const { resolveAuthTokensJs: resolveAuthTokens } = require(path.join(server, 'auth-tokens.cjs'));
-const { createToolPolicyJs: createToolPolicy } = require(path.join(server, 'tool-policy.cjs'));
+const oracle = path.join(__dirname, '..', 'tests', 'server', 'oracle');
+const { resolveAuthTokensJs: resolveAuthTokens } = require(path.join(oracle, 'auth-tokens.cjs'));
+const { createToolPolicyJs: createToolPolicy } = require(path.join(oracle, 'tool-policy.cjs'));
 
 const units = (s) => Array.from({ length: s.length }, (_, i) => s.charCodeAt(i));
 const fromUnits = (u) => String.fromCharCode(...u);

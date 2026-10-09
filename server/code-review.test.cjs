@@ -260,9 +260,12 @@ test('a diff carrying the engine key, the task proxy token or a credential is ne
 });
 
 test('a context the Rust port could not confirm is refused with one generic line, never the impl_ codes', async () => {
-  const saved = { impl: process.env.ROLE_CONTEXT_IMPL, wasm: process.env.DAV_PARSE_WASM };
+  const davParseWasm = require('./dav-parse-wasm.cjs');
+  const saved = { impl: process.env.ROLE_CONTEXT_IMPL, project: davParseWasm.roleContextProject, dossier: davParseWasm.roleContextDossier };
   process.env.ROLE_CONTEXT_IMPL = 'wasm';
-  process.env.DAV_PARSE_WASM = path.join(os.tmpdir(), 'noevia-no-such-dav-parse.wasm'); // the port cannot load: impl_refused
+  // Only the role-context port fails (impl_refused); the other Rust paths (always on since #1071) keep working.
+  const refuse = () => { throw new davParseWasm.DavParseError('role-context port unavailable', 'missing'); };
+  davParseWasm.roleContextProject = refuse; davParseWasm.roleContextDossier = refuse;
   const warn = console.warn; console.warn = () => {};
   try {
     const { provider, failed, r } = await failsClosed([APPROVE], 'context_refused');
@@ -271,7 +274,8 @@ test('a context the Rust port could not confirm is refused with one generic line
     assert.ok(!/impl/i.test(failed.data.reason) && !/impl/i.test(r.asked[0].reason), 'no internal code reaches the person');
   } finally {
     console.warn = warn;
-    for (const [k, v] of [['ROLE_CONTEXT_IMPL', saved.impl], ['DAV_PARSE_WASM', saved.wasm]]) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    if (saved.impl === undefined) delete process.env.ROLE_CONTEXT_IMPL; else process.env.ROLE_CONTEXT_IMPL = saved.impl;
+    davParseWasm.roleContextProject = saved.project; davParseWasm.roleContextDossier = saved.dossier;
   }
 });
 

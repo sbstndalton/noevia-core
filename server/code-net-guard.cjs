@@ -15,14 +15,14 @@
 //
 // The egress proxy is a different listener on its own port and never goes through this guard.
 //
-// CODE_NET_GUARD_IMPL=js|wasm (default js; any other value means js, with one warning), read from
-// the `env` handed to createCodeNetGuard (process.env) when the guard is created. wasm asks
-// noevia-rs's code-net-guard crate (dav-parse.wasm code_net_guard) as well, and a request is served
-// only when BOTH answer "not the code network": the port can add refusals, never remove one. The
-// spec must parse the same in both (a refusal, a fault or a disagreement stops startup, as a
-// malformed entry does); a fault while reading a lookup's answers refuses every request from then
-// on; a fault on a request refuses that request. DNS, retries, timers, logs and the 403 stay here.
-// The flag is in dav-parse-wasm.cjs IMPL_FLAGS (a missing or tampered module stops startup).
+// Rust confirmation (CODE_NET_GUARD_IMPL, retired in #1071: always on). The guard also asks
+// noevia-rs's code-net-guard crate (dav-parse.wasm code_net_guard), and a request is served only
+// when BOTH this JS and the port answer "not the code network": the port can add refusals, never
+// remove one. The JS stays the other half of that AND, so it stays here. The spec must parse the
+// same in both (a refusal, a fault or a disagreement stops startup, as a malformed entry does); a
+// fault while reading a lookup's answers refuses every request from then on; a fault on a request
+// refuses that request. DNS, retries, timers, logs and the 403 stay here. A missing or tampered
+// dav-parse.wasm stops startup.
 // Stricter than the JS (the crate docs): a spec with non-ASCII text, a %zone literal, or a host
 // name with an xn-- label, all-numeric/0x labels or an all-digit last label is refused; a local
 // address that is the same IP as a guarded one in another spelling (0:0::1 / ::1,
@@ -52,20 +52,6 @@ function parseCodeNetSpec(raw) {
   return { literals, hosts };
 }
 
-const IMPLS = new Set(['js', 'wasm']);
-let warnedImpl = '';
-/** CODE_NET_GUARD_IMPL: 'js' (default) or 'wasm'. */
-function codeNetGuardImpl(env = process.env) {
-  const raw = env.CODE_NET_GUARD_IMPL;
-  if (raw === undefined || raw === '') return 'js';
-  const value = String(raw).trim().toLowerCase();
-  if (IMPLS.has(value)) return value;
-  if (warnedImpl !== value) {
-    warnedImpl = value;
-    console.warn(`[code-net] CODE_NET_GUARD_IMPL=${JSON.stringify(String(raw))} is not js or wasm; using js`);
-  }
-  return 'js';
-}
 const defaultLoader = () => require('./dav-parse-wasm.cjs');
 
 const sameList = (a, b) => Array.isArray(b) && a.length === b.length && a.every((x, i) => x === b[i]);
@@ -78,10 +64,10 @@ function parseCodeNetSpecBoth(raw, wasmLoader) {
   try {
     port = wasmLoader().codeNetSpec(String(raw || ''));
   } catch (err) {
-    throw Error(`CODE_NET_GUARD_IMPL=wasm, but the Rust port refused COWORK_CODE_NET_ADDR (${String(err?.reason || 'unexpected')}); list plain IP addresses or host names, or set CODE_NET_GUARD_IMPL=js`);
+    throw Error(`the Rust port refused COWORK_CODE_NET_ADDR (${String(err?.reason || 'unexpected')}); list plain IP addresses or host names`);
   }
   if (port.malformed !== undefined || !sameList([...js.literals], port.literals) || !sameList(js.hosts, port.hosts)) {
-    throw Error('CODE_NET_GUARD_IMPL=wasm, but the Rust port reads COWORK_CODE_NET_ADDR differently from the JS; refusing to start');
+    throw Error('the Rust port reads COWORK_CODE_NET_ADDR differently from the JS; refusing to start');
   }
   return js;
 }
@@ -93,16 +79,15 @@ async function defaultLookup(host) {
 /**
  * @param {{spec?: string, lookup?: (host: string) => Promise<Array<{address: string}|string>>,
  *          log?: (entry: object) => void, resolveTimeoutMs?: number, retryMs?: number,
- *          now?: () => number, env?: object, impl?: 'js'|'wasm', wasmLoader?: () => object}} options
+ *          now?: () => number, wasmLoader?: () => object}} options
  */
 function createCodeNetGuard({ spec = '', lookup = defaultLookup, log = () => {}, resolveTimeoutMs = RESOLVE_TIMEOUT_MS,
-  retryMs = RETRY_MS, maxRetryMs = MAX_RETRY_MS, now = Date.now, env = process.env, impl = codeNetGuardImpl(env),
+  retryMs = RETRY_MS, maxRetryMs = MAX_RETRY_MS, now = Date.now,
   wasmLoader = defaultLoader } = {}) {
-  const both = impl === 'wasm';
-  const { literals, hosts } = both ? parseCodeNetSpecBoth(spec, wasmLoader) : parseCodeNetSpec(spec);
+  const { literals, hosts } = parseCodeNetSpecBoth(spec, wasmLoader);
   const enabled = literals.size > 0 || hosts.length > 0;
   const addresses = new Set(literals);
-  // wasm: the port's own copy of the guarded addresses (literals agreed above; lookups read by it).
+  // The port's own copy of the guarded addresses (literals agreed above; lookups read by it).
   const portAddresses = new Set(literals);
   let portBroken = false, warnedPort = '', warnedMismatch = false;
   function portFault(err, where) {
@@ -128,7 +113,7 @@ function createCodeNetGuard({ spec = '', lookup = defaultLookup, log = () => {},
           .map((a) => normalizeAddress(typeof a === 'string' ? a : a?.address)).filter((a) => net.isIP(a));
         if (!found.length) throw Error('no address');
         for (const address of found) addresses.add(address);
-        if (both && !portBroken) {
+        if (!portBroken) {
           try {
             const raw = (Array.isArray(answers) ? answers : [answers])
               .map((a) => (typeof a === 'string' ? a : (typeof a?.address === 'string' ? a.address : null)));
@@ -165,7 +150,6 @@ function createCodeNetGuard({ spec = '', lookup = defaultLookup, log = () => {},
     if (!enabled) return false;
     await ready;
     const js = addresses.has(normalizeAddress(localAddress));
-    if (!both) return js;
     if (portBroken) return true;
     let port;
     try {
@@ -204,4 +188,4 @@ function createCodeNetGuard({ spec = '', lookup = defaultLookup, log = () => {},
   return { enabled, ready, refuses, wrap, stop: () => { if (retryTimer) clearTimeout(retryTimer); } };
 }
 
-module.exports = { createCodeNetGuard, parseCodeNetSpec, normalizeAddress, codeNetGuardImpl };
+module.exports = { createCodeNetGuard, parseCodeNetSpec, normalizeAddress };

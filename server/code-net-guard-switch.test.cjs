@@ -1,9 +1,10 @@
 'use strict';
-// CODE_NET_GUARD_IMPL: the switch and its fail-closed paths, with a stand-in for the Rust port (no
+// CODE_NET_GUARD_IMPL (retired in #1071: the port always joins the JS): the fail-closed paths, with a stand-in for the Rust port (no
 // dav-parse.wasm needed; the differential test runs the real module). A request is served only when
 // both the JS and the port say it did not arrive on the code network; any fault refuses.
 const test = require('node:test'), assert = require('node:assert/strict');
-const { createCodeNetGuard, codeNetGuardImpl } = require('./code-net-guard.cjs');
+const codeNetGuard = require('./code-net-guard.cjs');
+const { createCodeNetGuard } = codeNetGuard;
 const davParseWasm = require('./dav-parse-wasm.cjs');
 
 const CODE_ADDR = '172.30.0.2';
@@ -21,36 +22,29 @@ function fakePort(over = {}) {
   return { loader: () => port, calls };
 }
 const fail = (reason) => () => { throw Object.assign(Error('port fault'), { reason }); };
-const guard = (spec, port, extra = {}) => createCodeNetGuard({ spec, impl: 'wasm', wasmLoader: port.loader, lookup: async () => [CODE_ADDR], ...extra });
+const guard = (spec, port, extra = {}) => createCodeNetGuard({ spec, wasmLoader: port.loader, lookup: async () => [CODE_ADDR], ...extra });
 
-test('CODE_NET_GUARD_IMPL: default js, wasm when set, anything else js with one warning', () => {
-  const warn = console.warn, seen = [];
-  console.warn = (m) => seen.push(String(m));
+test('CODE_NET_GUARD_IMPL is retired: no switch, the port is always asked, an old =js changes nothing', async () => {
+  assert.equal(codeNetGuard.codeNetGuardImpl, undefined);
+  assert.ok(!davParseWasm.IMPL_FLAGS.includes('CODE_NET_GUARD_IMPL'));
+  assert.equal(davParseWasm.RETIRED_FLAGS.CODE_NET_GUARD_IMPL, 'wasm');
+  for (const [env, impl] of [[{}, undefined], [{ CODE_NET_GUARD_IMPL: 'js' }, 'js'], [{ CODE_NET_GUARD_IMPL: 'wasm' }, 'wasm']]) {
+    const port = fakePort();
+    // `env` and `impl` are not options any more; whatever an old caller passes, the port is asked.
+    const g = createCodeNetGuard({ spec: CODE_ADDR, env, impl, wasmLoader: port.loader });
+    assert.equal(await g.refuses(CODE_ADDR), true);
+    assert.equal(await g.refuses(OTHER), false);
+    assert.deepEqual(port.calls, ['spec', 'refuses', 'refuses']);
+  }
+  const saved = process.env.CODE_NET_GUARD_IMPL;
+  process.env.CODE_NET_GUARD_IMPL = 'js';
   try {
-    assert.equal(codeNetGuardImpl({}), 'js');
-    assert.equal(codeNetGuardImpl({ CODE_NET_GUARD_IMPL: '' }), 'js');
-    assert.equal(codeNetGuardImpl({ CODE_NET_GUARD_IMPL: ' WASM ' }), 'wasm');
-    assert.equal(codeNetGuardImpl({ CODE_NET_GUARD_IMPL: 'js' }), 'js');
-    assert.equal(codeNetGuardImpl({ CODE_NET_GUARD_IMPL: 'rust' }), 'js');
-    assert.equal(codeNetGuardImpl({ CODE_NET_GUARD_IMPL: 'rust' }), 'js');
-  } finally { console.warn = warn; }
-  assert.deepEqual(seen, ['[code-net] CODE_NET_GUARD_IMPL="rust" is not js or wasm; using js']);
-  assert.ok(davParseWasm.IMPL_FLAGS.includes('CODE_NET_GUARD_IMPL'), 'a missing or tampered module stops startup');
+    const port = fakePort({ codeNetRefuses: () => true });
+    assert.equal(await createCodeNetGuard({ spec: CODE_ADDR, wasmLoader: port.loader }).refuses(OTHER), true, 'a port refusal stands even with the old =js in the environment');
+  } finally { if (saved === undefined) delete process.env.CODE_NET_GUARD_IMPL; else process.env.CODE_NET_GUARD_IMPL = saved; }
 });
 
-test('js (the default) never asks the port', async () => {
-  const port = fakePort();
-  const g = createCodeNetGuard({ spec: CODE_ADDR, env: {}, wasmLoader: port.loader });
-  assert.equal(await g.refuses(CODE_ADDR), true);
-  assert.equal(await g.refuses(OTHER), false);
-  assert.deepEqual(port.calls, []);
-  const viaEnv = fakePort();
-  const w = createCodeNetGuard({ spec: CODE_ADDR, env: { CODE_NET_GUARD_IMPL: 'wasm' }, wasmLoader: viaEnv.loader });
-  assert.equal(await w.refuses(OTHER), false);
-  assert.deepEqual(viaEnv.calls, ['spec', 'refuses'], 'the env handed in picks wasm');
-});
-
-test('wasm: served only when both serve; the port can add a refusal, never remove one', async () => {
+test('served only when both serve; the port can add a refusal, never remove one', async () => {
   const logs = [];
   // The port claims nothing is the code network: the JS still refuses.
   const lax = guard('egress', fakePort({ codeNetRefuses: () => false }), { log: (e) => logs.push(e) });
@@ -64,7 +58,7 @@ test('wasm: served only when both serve; the port can add a refusal, never remov
   lax.stop(); strict.stop();
 });
 
-test('wasm: a fault on a request refuses that request; a fault reading a lookup refuses all from then on', async () => {
+test('a fault on a request refuses that request; a fault reading a lookup refuses all from then on', async () => {
   const logs = [];
   const perRequest = guard(CODE_ADDR, fakePort({ codeNetRefuses: fail('trap') }), { log: (e) => logs.push(e) });
   assert.equal(await perRequest.refuses(OTHER), true);
@@ -88,7 +82,7 @@ test('wasm: a fault on a request refuses that request; a fault reading a lookup 
   assert.equal(await off.refuses(CODE_ADDR), false);
 });
 
-test('wasm: the spec must read the same in both, or startup stops', () => {
+test('the spec must read the same in both, or startup stops', () => {
   assert.throws(() => guard('egress', fakePort({ codeNetSpec: fail('ambiguous') })), /Rust port refused COWORK_CODE_NET_ADDR \(ambiguous\)/);
   assert.throws(() => guard('egress', fakePort({ codeNetSpec: fail('missing') })), /\(missing\)/);
   assert.throws(() => guard('egress', fakePort({ codeNetSpec: () => ({ literals: [], hosts: [] }) })), /reads COWORK_CODE_NET_ADDR differently/);
@@ -100,7 +94,7 @@ test('wasm: the spec must read the same in both, or startup stops', () => {
   assert.deepEqual(port.calls, []);
 });
 
-test('wasm: the 403 path is unchanged when refused by a fault', async () => {
+test('the 403 path is unchanged when refused by a fault', async () => {
   const g = guard(CODE_ADDR, fakePort({ codeNetRefuses: fail('trap') }));
   let status = null, served = false;
   const res = { writeHead(s) { status = s; }, end() {}, destroy() {} };

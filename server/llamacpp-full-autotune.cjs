@@ -988,7 +988,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
       const cacheMib = tuneCacheMib(eff);
       if (!Number.isFinite(cacheMib)) return null;
       const { ladder } = require('./llamacpp-calibration.cjs');
-      // noevia#1133: planning, not the gate: the JS estimate, so LLAMACPP_AUTOCONFIG_IMPL=wasm keeps the ceilings.
+      // noevia#1133: planning, not the gate: the JS estimate, so the Rust confirmation (LLAMACPP_AUTOCONFIG_IMPL, retired) cannot remove the ceilings.
       const { estimateFootprintJs: estimateFootprint } = require('./llamacpp-autoconfig.cjs');
       const free = readMemory();
       const usableMib = Math.min(Number(budgetGib()) * 1024, free == null ? Infinity : free * 1024 - servicesReserveMib - memoryFloorGib * 1024);

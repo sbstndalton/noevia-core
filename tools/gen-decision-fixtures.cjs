@@ -16,10 +16,13 @@
 //   cause:   { wire, want: code }                            op 3
 //   strict:  { op, wire, want }  rows the port refuses (see the decision crate docs); want is the
 //            JS's answer, for the record
+//
+// The JS references (retired from production in #1071, so they live with the tests):
+//   tests/server/oracle/decision.cjs
 
 const path = require('node:path');
 const server = path.join(__dirname, '..', 'server');
-const { invalidRequestJs, invalidResultJs, causeOfJs } = require(path.join(server, 'decision', 'index.cjs'));
+const { invalidRequestJs, invalidResultJs, causeOfJs } = require(path.join(__dirname, '..', 'tests', 'server', 'oracle', 'decision.cjs'));
 const { decisionRequestTag, decisionResultTag, decisionErrorFacts } = require(path.join(server, 'dav-parse-wasm.cjs'));
 
 const answer = (fn) => { try { return fn(); } catch { return { throws: true }; } };

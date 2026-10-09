@@ -4,17 +4,17 @@
 // filter (`ENABLED_TOOLBOXES`). Pure functions of the environment they are handed, so the
 // credential pass-through rules are testable without booting the server.
 //
-// MCP_SERVERS_IMPL=js|wasm (default js; any other value means js, with one warning), read from the
-// environment handed in (createToolboxOffered: process.env, when it is created): wasm decides the
-// server list, the box filter and toolboxOffered in noevia-rs's mcp-servers crate (in
-// dav-parse.wasm). The token variables' values never cross; this file prints the warnings. Fails
-// closed: the flag is in dav-parse-wasm.cjs IMPL_FLAGS (a missing or tampered module stops
-// startup); a fault or an unexpected reply configures no MCP server, offers no curated box but
-// core and dir-* (ENABLED_TOOLBOXES as an empty set), and a toolboxOffered fault answers false.
-// Every server the port returns is checked again here (http(s), no credentials, internal only on a
-// loopback IP literal and at most once, ids unique and well-formed, the URL from the environment).
+// The server list, the box filter and toolboxOffered are decided in noevia-rs's mcp-servers crate
+// (in dav-parse.wasm; MCP_SERVERS_IMPL, retired in #1071: Rust is always used). The token
+// variables' values never cross; this file prints the warnings. Fails closed: a missing or
+// tampered module stops startup; a fault or an unexpected reply configures no MCP server, offers no
+// curated box but core and dir-* (ENABLED_TOOLBOXES as an empty set), and a toolboxOffered fault
+// answers false. Every server the port returns is checked again here against the operator's own
+// entries: the JS walk below (walkMcpServers) still runs at runtime for that (http(s), no
+// credentials, internal only on a loopback IP literal and at most once, ids unique and well-formed,
+// the URL from the environment).
 // Stricter than the JS: a list where the Rust and V8 URL parsers could disagree configures nothing
-// (see the crate docs).
+// (see the crate docs). The other JS references are tests/server/oracle/mcp-servers.cjs (tests only).
 
 // An MCP server URL is the same class of thing as a member-supplied provider
 // or storage endpoint, so it reuses the existing policy rather than inventing
@@ -64,7 +64,7 @@ function shapeOkWith(warn) {
   };
 }
 
-/** The MCP_SERVERS walk of parseMcpServersJs: the servers it configures, in order. `warn` gets each
+/** The MCP_SERVERS walk (the oracle's parseMcpServersJs uses it too): the servers it configures, in order. `warn` gets each
  *  warning; the reply check passes a no-op and compares what the port returned against this. */
 function walkMcpServers(list, env, warn) {
   const shapeOk = shapeOkWith(warn);
@@ -121,57 +121,6 @@ function walkMcpServers(list, env, warn) {
   return out;
 }
 
-function parseMcpServersJs(env = process.env) {
-  const shapeOk = shapeOkWith((m) => console.warn(m));
-  const list = (env.MCP_SERVERS || '').trim();
-  if (list) return walkMcpServers(list, env, (m) => console.warn(m));
-
-  const single = (env.MCP_SERVER_URL || '').trim();
-  if (!single) return [];
-  if (!shapeOk(single, 'MCP_SERVER_URL')) return [];
-  // The historical single-server deployment is the Nextcloud MCP, and it has
-  // always received the credential — keep that exactly.
-  return [{ id: 'nextcloud', url: single, auth: 'nextcloud' }];
-}
-
-// Which curated boxes are actually offered. Curation says what a box WOULD
-// contain; this says whether anyone wants it. Unset means all of them.
-//
-// Separate from the manifest on purpose: a deployment that has no use for
-// Cookbook should not have to delete its curation to stop seeing it, and
-// turning it back on should be one environment variable rather than a commit.
-function parseEnabledToolboxesJs(env = process.env) {
-  const raw = (env.ENABLED_TOOLBOXES || '').trim();
-  if (!raw) return null; // null means "no opinion" — offer everything
-  const ids = raw.split(',').map((x) => x.trim()).filter(Boolean);
-  return ids.length ? new Set(ids) : null;
-}
-
-function createToolboxOfferedJs(ENABLED_TOOLBOXES) {
-  return function toolboxOffered(id) {
-  // core is built-in and always safe, so it is never filtered out — a
-  // deployment that named only MCP boxes should not lose the clock.
-  if (id === 'core') return true;
-  // An administrator adding a directory server is the opt-in; ENABLED_TOOLBOXES curates the operator's boxes.
-  if (id.startsWith('dir-')) return true;
-  return !ENABLED_TOOLBOXES || ENABLED_TOOLBOXES.has(id);
-  };
-}
-
-const IMPLS = new Set(['js', 'wasm']);
-let warnedImpl = '';
-/** MCP_SERVERS_IMPL: 'js' (default) or 'wasm'. */
-function mcpServersImpl(env = process.env) {
-  const raw = env.MCP_SERVERS_IMPL;
-  if (raw === undefined || raw === '') return 'js';
-  const value = String(raw).trim().toLowerCase();
-  if (IMPLS.has(value)) return value;
-  if (warnedImpl !== value) {
-    warnedImpl = value;
-    console.warn(`[mcp] MCP_SERVERS_IMPL=${JSON.stringify(String(raw))} is not js or wasm; using js`);
-  }
-  return 'js';
-}
 let warnedFault = '';
 function warnFault(err) {
   const reason = String(err?.reason || 'unexpected');
@@ -234,12 +183,11 @@ function parseMcpServersWasm(env, wasmLoader) {
 
 /** The MCP server list. `opts.wasmLoader` is for tests. */
 function parseMcpServers(env = process.env, { wasmLoader = defaultLoader } = {}) {
-  return mcpServersImpl(env) === 'wasm' ? parseMcpServersWasm(env, wasmLoader) : parseMcpServersJs(env);
+  return parseMcpServersWasm(env, wasmLoader);
 }
 
 /** The curated-box filter; on a fault an empty set (only core and dir-* boxes are offered). */
 function parseEnabledToolboxes(env = process.env, { wasmLoader = defaultLoader } = {}) {
-  if (mcpServersImpl(env) !== 'wasm') return parseEnabledToolboxesJs(env);
   try {
     const ids = wasmLoader().mcpToolboxes(envText(env.ENABLED_TOOLBOXES));
     return ids === null ? null : new Set(ids);
@@ -249,11 +197,9 @@ function parseEnabledToolboxes(env = process.env, { wasmLoader = defaultLoader }
   }
 }
 
-/** toolboxOffered over `ENABLED_TOOLBOXES`; `opts.impl` pins 'js' or 'wasm' (tests), default
- *  MCP_SERVERS_IMPL when created. core and dir-* are always offered; otherwise through the port a
- *  fault (or an id that is not a string) is false. */
-function createToolboxOffered(ENABLED_TOOLBOXES, { impl, wasmLoader = defaultLoader } = {}) {
-  if ((impl || mcpServersImpl()) !== 'wasm') return createToolboxOfferedJs(ENABLED_TOOLBOXES);
+/** toolboxOffered over `ENABLED_TOOLBOXES`. core and dir-* are always offered; otherwise through the
+ *  port, where a fault (or an id that is not a string) is false. */
+function createToolboxOffered(ENABLED_TOOLBOXES, { wasmLoader = defaultLoader } = {}) {
   let enabled;
   let setupFault = false;
   try {
@@ -265,7 +211,7 @@ function createToolboxOffered(ENABLED_TOOLBOXES, { impl, wasmLoader = defaultLoa
     setupFault = true;
   }
   return function toolboxOffered(id) {
-    // core and dir-* are offered exactly as the JS offers them, before the port is asked: no fault
+    // core and dir-* are offered exactly as the old JS offered them, before the port is asked: no fault
     // there (setup or per id) can take them away.
     if (id === 'core') return true;
     if (typeof id === 'string' && id.startsWith('dir-')) return true;
@@ -280,4 +226,4 @@ function createToolboxOffered(ENABLED_TOOLBOXES, { impl, wasmLoader = defaultLoa
   };
 }
 
-module.exports = { isLoopbackLiteral, parseMcpServers, parseEnabledToolboxes, createToolboxOffered, parseMcpServersJs, parseEnabledToolboxesJs, createToolboxOfferedJs, mcpServersImpl };
+module.exports = { isLoopbackLiteral, parseMcpServers, parseEnabledToolboxes, createToolboxOffered, walkMcpServers, shapeOkWith };

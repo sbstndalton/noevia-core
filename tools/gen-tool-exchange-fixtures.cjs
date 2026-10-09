@@ -13,10 +13,13 @@
 //   check: { aborted, allowed, name, args: string|null, want: { key } | { answer } }
 //          `args` is what crosses: null for a falsy call.args, else String(call.args)
 //   error: { name, message, want }   `message` is String(err?.message || err)
+//
+// The JS references (retired from production in #1071, so they live with the tests):
+//   tests/server/oracle/tool-exchange.cjs
 
 const path = require('node:path');
 const server = path.join(__dirname, '..', 'server');
-const { checkCallJs, callErrorJs } = require(path.join(server, 'tool-exchange.cjs'));
+const { checkCallJs, callErrorJs } = require(path.join(__dirname, '..', 'tests', 'server', 'oracle', 'tool-exchange.cjs'));
 
 const ARGS = [undefined, null, '', 0, false, NaN, 5, true, ['{"a":1}'], { toString: () => '{"z":1}' },
   '{}', '[]', 'null', '1', '"s"', 'true', 'false', '{"a":1}', '{"b":2,"a":1}', '{"a":{"d":[3,{"z":1,"y":2}],"c":null},"b":[]}',

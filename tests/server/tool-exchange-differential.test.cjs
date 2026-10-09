@@ -1,10 +1,10 @@
 'use strict';
 
-// TOOL_EXCHANGE_IMPL: tests/fixtures/tool-exchange.v1.json (byte-identical to noevia-rs
+// Tool exchange (TOOL_EXCHANGE_IMPL, retired in #1071): tests/fixtures/tool-exchange.v1.json (byte-identical to noevia-rs
 // crates/tool-exchange/tests/fixtures/; CI compares them) holds tool-exchange.cjs's answers,
 // dedupe keys and failed-call texts, printed by tools/gen-tool-exchange-fixtures.cjs from the JS
-// itself (synthetic text only). Here every row runs through dav-parse.wasm's tool_exchange and must
-// agree unit for unit; then whole exchanges under both settings (the same results, the same
+// references (tests/server/oracle/tool-exchange.cjs; synthetic text only). Here every row runs through dav-parse.wasm's tool_exchange and must
+// agree unit for unit; then whole exchanges against the JS reference (the same results, the same
 // executions, the same dedupe and write invalidation), seeded live JSON arguments, the depth and
 // size refusals, and the fail-closed paths: a fault never runs the tool. The WebAssembly half needs
 // server/wasm/dav-parse.wasm (or DAV_PARSE_WASM); skipped without it unless DAV_PARSE_WASM_REQUIRED=1.
@@ -17,6 +17,7 @@ const test = require('node:test');
 
 const davParseWasm = require('../../server/dav-parse-wasm.cjs');
 const exchange = require('../../server/tool-exchange.cjs');
+const oracle = require('./oracle/tool-exchange.cjs');
 
 const FILE = path.join(__dirname, '../fixtures/tool-exchange.v1.json');
 const GENERATOR = path.join(__dirname, '../../tools/gen-tool-exchange-fixtures.cjs');
@@ -35,7 +36,8 @@ async function withEnv(vars, fn) {
 /** Run `calls` through one exchange; every result and every execution. */
 async function session(impl, calls, { allowed = ['read', 'write', 't'], aborted = false, fail = () => null } = {}) {
   const executed = [];
-  const run = exchange.createToolExchange({ allowed: new Set(allowed), isWrite: (n) => n === 'write', signal: { aborted }, impl });
+  const make = impl === 'js' ? oracle.createToolExchangeJs : exchange.createToolExchange;
+  const run = make({ allowed: new Set(allowed), isWrite: (n) => n === 'write', signal: { aborted } });
   const results = [];
   for (const call of calls) {
     results.push(await run(call, async (mark) => {
@@ -50,7 +52,7 @@ async function session(impl, calls, { allowed = ['read', 'write', 't'], aborted 
 }
 
 test('the fixture file is what the generator prints', { skip: !fs.existsSync(GENERATOR) && 'no generator here' }, () => {
-  const out = execFileSync(process.execPath, [GENERATOR], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, env: { ...process.env, TOOL_EXCHANGE_IMPL: 'wasm' } });
+  const out = execFileSync(process.execPath, [GENERATOR], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, env: { ...process.env } });
   assert.equal(out, fs.readFileSync(FILE, 'utf8'));
 });
 
@@ -64,7 +66,7 @@ test('error rows: the same failed-call text', { skip: skipWasm }, () => {
   fixtures.error.forEach((row, i) => assert.equal(davParseWasm.toolExchangeError(row.name, row.message), row.want, `row ${i}`));
   // Only the first 64 Ki units cross; the text keeps 300.
   const huge = 'é'.repeat(200000);
-  assert.equal(davParseWasm.toolExchangeError('t', huge), exchange.callErrorJs('t', { message: huge }));
+  assert.equal(davParseWasm.toolExchangeError('t', huge), oracle.callErrorJs('t', { message: huge }));
 });
 
 test('whole exchanges: the same results, executions, dedupe and write invalidation', { skip: skipWasm }, async () => {
@@ -112,7 +114,7 @@ test('seeded live arguments agree', { skip: skipWasm }, () => {
     const args = rnd(4) ? object(0) : mutate(object(0));
     const call = { name: pick(['t', 'read']), args };
     const allowed = new Set(['t', 'read']);
-    const js = exchange.checkCallJs(call, allowed, { aborted: false });
+    const js = oracle.checkCallJs(call, allowed, { aborted: false });
     assert.deepStrictEqual(davParseWasm.toolExchangeCheck(false, true, call.name, args || null), js, `iteration ${i}: ${JSON.stringify(args)}`);
   }
 });
@@ -136,25 +138,18 @@ test('depth and size: the port refuses past its caps and the tool is never run',
     // Large but within the cap: the same key.
     const large = { name: 't', args: `{"a":"${'y'.repeat(2 * 1024 * 1024)}"}` };
     const allowed = new Set(['t']);
-    assert.deepStrictEqual(davParseWasm.toolExchangeCheck(false, true, 't', large.args), exchange.checkCallJs(large, allowed, { aborted: false }));
+    assert.deepStrictEqual(davParseWasm.toolExchangeCheck(false, true, 't', large.args), oracle.checkCallJs(large, allowed, { aborted: false }));
   } finally { console.warn = warn; }
 });
 
-test('TOOL_EXCHANGE_IMPL: default js, wasm by name, anything else js with one warning', async () => {
-  assert.equal(exchange.toolExchangeImpl({}), 'js');
-  assert.equal(exchange.toolExchangeImpl({ TOOL_EXCHANGE_IMPL: ' Wasm' }), 'wasm');
-  const warn = console.warn, seen = [];
-  console.warn = (m) => seen.push(m);
-  try {
-    assert.equal(exchange.toolExchangeImpl({ TOOL_EXCHANGE_IMPL: 'on' }), 'js');
-    assert.equal(exchange.toolExchangeImpl({ TOOL_EXCHANGE_IMPL: 'on' }), 'js');
-  } finally { console.warn = warn; }
-  assert.equal(seen.length, 1);
-  assert.ok(davParseWasm.IMPL_FLAGS.includes('TOOL_EXCHANGE_IMPL'));
-  // The switch is read when an exchange is created.
+test('TOOL_EXCHANGE_IMPL is retired: no switch, no JS checks in production, the port always decides', async () => {
+  for (const gone of ['toolExchangeImpl', 'checkCallJs', 'callErrorJs', 'canonical']) assert.equal(exchange[gone], undefined, gone);
+  assert.ok(!davParseWasm.IMPL_FLAGS.includes('TOOL_EXCHANGE_IMPL'));
+  assert.equal(davParseWasm.RETIRED_FLAGS.TOOL_EXCHANGE_IMPL, 'wasm');
+  // An old =js is ignored and an exchange asks the port for every call.
   let loads = 0;
   const loader = () => { loads++; return { toolExchangeCheck: () => ({ answer: 'ERROR: stub' }) }; };
-  await withEnv({ TOOL_EXCHANGE_IMPL: 'wasm' }, async () => {
+  await withEnv({ TOOL_EXCHANGE_IMPL: 'js' }, async () => {
     const run = exchange.createToolExchange({ allowed: new Set(['t']), isWrite: () => false, signal: { aborted: false }, wasmLoader: loader });
     assert.equal(await run({ name: 't', args: '{}' }, async () => 'ran'), 'ERROR: stub');
   });
@@ -168,11 +163,11 @@ test('fail closed: a missing module, a bad reply or a non-string name never runs
     await withEnv({ DAV_PARSE_WASM: path.join(__dirname, 'no-such-dav-parse.wasm') }, async () => {
       davParseWasm.reset();
       assert.deepStrictEqual(await session('wasm', [{ name: 'write', args: '{}' }]), { results: [exchange.CHECK_FAULT], executed: [] });
-      assert.throws(() => davParseWasm.verifyAtStartup({ TOOL_EXCHANGE_IMPL: 'wasm', DAV_PARSE_WASM: process.env.DAV_PARSE_WASM }), /TOOL_EXCHANGE_IMPL/);
+      assert.throws(() => davParseWasm.verifyAtStartup({ DAV_PARSE_WASM: process.env.DAV_PARSE_WASM }, { hostname: () => 'ss.io' }), /dav-parse\.wasm \(always required\) failed verification \(missing\)/);
     });
     davParseWasm.reset();
     const stub = (check, error) => () => ({ toolExchangeCheck: check, toolExchangeError: error });
-    const make = (loader) => exchange.createToolExchange({ allowed: new Set(['t', 5]), isWrite: () => true, signal: { aborted: false }, impl: 'wasm', wasmLoader: loader });
+    const make = (loader) => exchange.createToolExchange({ allowed: new Set(['t', 5]), isWrite: () => true, signal: { aborted: false }, wasmLoader: loader });
     let ran = 0;
     const exec = async () => { ran++; return 'ran'; };
     assert.equal(await make(stub(() => { throw Object.assign(new Error('x'), { reason: 'trap' }); }))({ name: 't', args: '{}' }, exec), exchange.CHECK_FAULT);

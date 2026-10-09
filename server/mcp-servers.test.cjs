@@ -43,7 +43,7 @@ test('malformed, duplicate and credential-bearing entries are dropped, not guess
       'nourl',                            // no url
       'creds|http://u:p@d:8000/mcp|none', // credentials in the URL
       'ftp|ftp://e:8000/mcp|none',        // wrong protocol
-      'bad|not a url|none',
+      'bad|not-a-url|none',
     ].join(','),
   });
   assert.deepEqual(servers.map((s) => s.id), ['ok']);

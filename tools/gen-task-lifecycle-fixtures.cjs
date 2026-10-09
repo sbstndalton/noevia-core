@@ -6,8 +6,8 @@
 // (crates/task-lifecycle/tests/fixtures/task-lifecycle.v1.json); noevia-core CI compares them.
 //   node tools/gen-task-lifecycle-fixtures.cjs > tests/fixtures/task-lifecycle.v1.json
 //
-// Every expectation is what the JS itself returns or throws (TaskLifecycleError's code), with
-// TASK_LIFECYCLE_IMPL=js. Journals are synthetic (no Diary or user text) and the random ones come
+// Every expectation is what the JS itself returns or throws (TaskLifecycleError's code), (the *Js
+// functions of task-lifecycle.cjs, which stay in production as the authority the port confirms). Journals are synthetic (no Diary or user text) and the random ones come
 // from a seeded mulberry32, so the table is the same on every Node version. Nothing here depends on
 // ICU, locale or number formatting (#1115): states and types compare as code units. A reportHash
 // that is not a string (an array, an object with its own toString) is refused by the JS itself since
@@ -23,7 +23,6 @@
 const path = require('node:path');
 const lifecycle = require(path.join(__dirname, '..', 'server', 'task-lifecycle.cjs'));
 
-const JS = { impl: 'js' };
 const HASH = 'ab'.repeat(32);
 
 function answer(fn, key) {
@@ -43,9 +42,9 @@ function pairRow(from, to) {
   return {
     wire: JSON.stringify([from, to]),
     want: {
-      canTransition: answer(() => lifecycle.canTransition(from, to, JS), 'allowed'),
-      transition: answer(() => lifecycle.transition(from, to, JS), 'state'),
-      stageMove: answer(() => lifecycle.assertStageMove(from, to, JS), 'state'),
+      canTransition: answer(() => lifecycle.canTransitionJs(from, to), 'allowed'),
+      transition: answer(() => lifecycle.transitionJs(from, to), 'state'),
+      stageMove: answer(() => lifecycle.assertStageMoveJs(from, to), 'state'),
     },
   };
 }
@@ -150,22 +149,22 @@ const NON_STRING_HASHES = [[HASH], [[HASH]], [HASH, HASH], {}, { toString: HASH 
   .map((reportHash) => [stage('planned', 'implementing'), stage('implementing', 'reviewing', { reportHash })]);
 
 const derive = [...HAND, ...NON_STRING_HASHES, ...SEEDED].map((events) => ({
-  wire: JSON.stringify([events]), want: answer(() => lifecycle.deriveLifecycle(events, JS), 'state'),
+  wire: JSON.stringify([events]), want: answer(() => lifecycle.deriveLifecycleJs(events), 'state'),
 }));
-derive.push({ wire: JSON.stringify([null]), want: answer(() => lifecycle.deriveLifecycle(null, JS), 'state') });
+derive.push({ wire: JSON.stringify([null]), want: answer(() => lifecycle.deriveLifecycleJs(null), 'state') });
 
 const folds = [];
 for (const [i, events] of HAND.entries()) {
   for (const from of [lifecycle.STATES[i % 7], 'blocked', 'merged']) {
     for (const authoritative of [false, true]) {
       folds.push({ wire: JSON.stringify([events, from, authoritative]),
-        want: answer(() => lifecycle.foldEvents(events, from, { authoritative, ...JS }), 'state') });
+        want: answer(() => lifecycle.foldEventsJs(events, from, { authoritative }), 'state') });
     }
   }
 }
 for (const from of ODD) {
   folds.push({ wire: JSON.stringify([[], from, false]),
-    want: answer(() => lifecycle.foldEvents([], from, JS), 'state') });
+    want: answer(() => lifecycle.foldEventsJs([], from, {}), 'state') });
 }
 
 

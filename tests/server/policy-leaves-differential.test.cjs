@@ -1,12 +1,12 @@
 'use strict';
 
-// POLICY_LEAVES_IMPL: tests/fixtures/policy-leaves.v1.json (byte-identical to noevia-rs
+// Policy leaves (POLICY_LEAVES_IMPL, retired in #1071): tests/fixtures/policy-leaves.v1.json (byte-identical to noevia-rs
 // crates/policy-leaves/tests/fixtures/; CI compares them) holds what auth-tokens.cjs and
-// tool-policy.cjs return, printed by tools/gen-policy-leaves-fixtures.cjs from the JS itself
-// (synthetic tokens only). Here every row runs through dav-parse.wasm's auth_tokens and
+// tool-policy.cjs return, printed by tools/gen-policy-leaves-fixtures.cjs from the JS references
+// (tests/server/oracle/auth-tokens.cjs and tool-policy.cjs; synthetic tokens only). Here every row runs through dav-parse.wasm's auth_tokens and
 // tool_policy: auth and set must agree exactly; mode must agree wherever the stored mode is one
-// the table allows, and be `block` (never weaker) otherwise. Then a real database under both
-// settings, seeded live JS-vs-wasm tokens, and the fail-closed paths: mode() blocks, set() writes
+// the table allows, and be `block` (never weaker) otherwise. Then a real database against the JS
+// reference, seeded live JS-vs-wasm tokens, and the fail-closed paths: mode() blocks, set() writes
 // nothing, startup stops, and no error ever carries a token. The WebAssembly half needs
 // server/wasm/dav-parse.wasm (or DAV_PARSE_WASM); skipped without it unless DAV_PARSE_WASM_REQUIRED=1.
 
@@ -19,7 +19,9 @@ const { createRequire } = require('node:module');
 
 const davParseWasm = require('../../server/dav-parse-wasm.cjs');
 const auth = require('../../server/auth-tokens.cjs');
-const { createToolPolicy, createToolPolicyJs } = require('../../server/tool-policy.cjs');
+const { createToolPolicy } = require('../../server/tool-policy.cjs');
+const { resolveAuthTokensJs } = require('./oracle/auth-tokens.cjs');
+const { createToolPolicyJs } = require('./oracle/tool-policy.cjs');
 
 const FILE = path.join(__dirname, '../fixtures/policy-leaves.v1.json');
 const GENERATOR = path.join(__dirname, '../../tools/gen-policy-leaves-fixtures.cjs');
@@ -48,7 +50,7 @@ async function withEnv(vars, fn) {
 }
 
 test('the fixture file is what the generator prints', { skip: !fs.existsSync(GENERATOR) && 'no generator here' }, () => {
-  const out = execFileSync(process.execPath, [GENERATOR], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, env: { ...process.env, POLICY_LEAVES_IMPL: 'wasm' } });
+  const out = execFileSync(process.execPath, [GENERATOR], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, env: { ...process.env } });
   assert.equal(out, fs.readFileSync(FILE, 'utf8'));
 });
 
@@ -56,17 +58,15 @@ test('auth rows: the same tokens, flag and warnings through the Rust port', { sk
   for (const row of fixtures.auth) {
     const env = Object.fromEntries(Object.entries(row.env).map(([k, v]) => [k, str(v)]));
     const want = { diaryToken: str(row.want.diaryToken), uiAuthToken: str(row.want.uiAuthToken), legacyCompat: row.want.legacyCompat, warnings: row.want.warnings };
-    assert.deepStrictEqual(auth.resolveAuthTokensJs(env), want);
-    assert.deepStrictEqual(auth.resolveAuthTokensWasm(env), want);
+    assert.deepStrictEqual(resolveAuthTokensJs(env), want);
+    assert.deepStrictEqual(auth.resolveAuthTokens(env), want);
     // A secret call: the instance is dropped (and its memory wiped) every time.
     assert.equal(davParseWasm.memoryBytes(), 0);
   }
-  await withEnv({ POLICY_LEAVES_IMPL: 'wasm' }, () => {
-    assert.deepStrictEqual(auth.resolveAuthTokens({ DIARY_AUTH_TOKEN: ' d ', UI_AUTH_TOKEN: 'u' }), auth.resolveAuthTokensJs({ DIARY_AUTH_TOKEN: ' d ', UI_AUTH_TOKEN: 'u' }));
-  });
+  assert.deepStrictEqual(auth.resolveAuthTokens({ DIARY_AUTH_TOKEN: ' d ', UI_AUTH_TOKEN: 'u' }), resolveAuthTokensJs({ DIARY_AUTH_TOKEN: ' d ', UI_AUTH_TOKEN: 'u' }));
   // The coercion stays in the JS: non-string fakes behave as String(v || '').
   for (const env of [{ DIARY_AUTH_TOKEN: 0 }, { DIARY_AUTH_TOKEN: 42, UI_AUTH_TOKEN: null, LEGACY_AUTH_COMPAT: true }, {}]) {
-    assert.deepStrictEqual(auth.resolveAuthTokensWasm(env), auth.resolveAuthTokensJs(env));
+    assert.deepStrictEqual(auth.resolveAuthTokens(env), resolveAuthTokensJs(env));
   }
 });
 
@@ -77,7 +77,7 @@ test('seeded live tokens agree', { skip: skipWasm }, () => {
   const s = () => Array.from({ length: rnd(12) }, () => pool[rnd(pool.length)]).join('');
   for (let i = 0; i < 300; i++) {
     const env = { DIARY_AUTH_TOKEN: s(), UI_AUTH_TOKEN: s(), LEGACY_AUTH_COMPAT: rnd(2) ? 'true' : s() };
-    assert.deepStrictEqual(auth.resolveAuthTokensWasm(env), auth.resolveAuthTokensJs(env), `iteration ${i}`);
+    assert.deepStrictEqual(auth.resolveAuthTokens(env), resolveAuthTokensJs(env), `iteration ${i}`);
   }
 });
 
@@ -85,7 +85,7 @@ test('mode rows: never weaker than the JS; exact for every stored mode the table
   let exact = 0, stronger = 0;
   for (const row of fixtures.mode) {
     const stored = row.stored === null ? null : str(row.stored);
-    const policy = createToolPolicy({ db: fakeDb(stored), impl: 'wasm' });
+    const policy = createToolPolicy({ db: fakeDb(stored) });
     const got = policy.mode('user-1', 'tool', row.isWrite);
     assert.equal(createToolPolicyJs({ db: fakeDb(stored) }).mode('user-1', 'tool', row.isWrite), row.want);
     if (stored === null || stored === '' || Object.hasOwn(STRENGTH, stored)) { assert.equal(got, row.want); exact++; } else {
@@ -96,7 +96,7 @@ test('mode rows: never weaker than the JS; exact for every stored mode the table
   }
   assert.ok(exact >= 10 && stronger >= 16, `${exact} ${stronger}`);
   // No user: the row is never read, as in the JS.
-  assert.equal(createToolPolicy({ db: fakeDb('block'), impl: 'wasm' }).mode('', 'tool', false), 'allow');
+  assert.equal(createToolPolicy({ db: fakeDb('block') }).mode('', 'tool', false), 'allow');
 });
 
 test('set rows: the same refusal (400, public message) or the same write', { skip: skipWasm }, () => {
@@ -105,7 +105,7 @@ test('set rows: the same refusal (400, public message) or the same write', { ski
     const isWrite = (t) => row.writes[Number(t.slice(1))];
     const value = row.value === null ? undefined : str(row.value);
     const db = fakeDb(null);
-    const policy = createToolPolicy({ db, impl: 'wasm' });
+    const policy = createToolPolicy({ db });
     let got = 'ok';
     try { policy.set('user-1', tools, value, isWrite); } catch (e) {
       assert.equal(e.status, 400);
@@ -122,12 +122,12 @@ test('set rows: the same refusal (400, public message) or the same write', { ski
 const serverRequire = createRequire(path.join(__dirname, '../../server/index.cjs'));
 const noSqlite = (() => { try { serverRequire.resolve('better-sqlite3'); return false; } catch { return 'better-sqlite3 not installed here'; } })();
 
-test('a real table behaves the same under both settings', { skip: skipWasm || noSqlite }, () => {
+test('a real table behaves the same through Rust as through the JS reference', { skip: skipWasm || noSqlite }, () => {
   const Database = serverRequire('better-sqlite3');
-  for (const impl of ['js', 'wasm']) {
+  for (const [impl, make] of [['oracle', createToolPolicyJs], ['rust', createToolPolicy]]) {
     const db = new Database(':memory:');
     db.exec("CREATE TABLE users(id TEXT PRIMARY KEY); INSERT INTO users VALUES('u1'),('u2');");
-    const policy = createToolPolicy({ db, impl });
+    const policy = make({ db });
     const isWrite = (t) => !t.startsWith('read');
     assert.equal(policy.mode('u1', 'read_a', false), 'allow');
     assert.equal(policy.mode('u1', 'write_a', true), 'ask');
@@ -150,17 +150,17 @@ test('fails closed: mode() blocks, set() writes nothing, auth stops without echo
   t.mock.method(console, 'warn', () => {});
   const broken = () => { throw new davParseWasm.DavParseError('dav-parse module failed', 'trap'); };
   const db = fakeDb('allow');
-  const policy = createToolPolicy({ db, impl: 'wasm', wasmLoader: () => ({ toolPolicyMode: broken, toolPolicySet: broken }) });
+  const policy = createToolPolicy({ db, wasmLoader: () => ({ toolPolicyMode: broken, toolPolicySet: broken }) });
   assert.equal(policy.mode('u1', 'read_a', false), 'block');
   assert.throws(() => policy.set('u1', ['read_a'], 'ask', () => false), (e) => e.status === 500 && !e.publicMessage);
   assert.equal(db.writes.length, 0);
   // A reply of the wrong shape is a fault too.
-  const odd = createToolPolicy({ db: fakeDb(null), impl: 'wasm', wasmLoader: () => ({ toolPolicyMode: () => { throw new davParseWasm.DavParseError('x', 'reply'); } }) });
+  const odd = createToolPolicy({ db: fakeDb(null), wasmLoader: () => ({ toolPolicyMode: () => { throw new davParseWasm.DavParseError('x', 'reply'); } }) });
   assert.equal(odd.mode('u1', 'x', false), 'block');
 
   const token = 'synthetic-secret-token-7f3a';
   const leaky = { authTokens: () => { throw Object.assign(new Error(`bad ${token}`), { reason: `trap ${token}` }); } };
-  assert.throws(() => auth.resolveAuthTokensWasm({ DIARY_AUTH_TOKEN: token }, { wasm: leaky }), (e) => {
+  assert.throws(() => auth.resolveAuthTokens({ DIARY_AUTH_TOKEN: token }, { wasm: leaky }), (e) => {
     assert.ok(!e.message.includes(token) && !/7f3a|synthetic|secret/.test(e.message), e.message);
     assert.equal(e.message, 'Auth tokens could not be checked by the Rust port (unexpected).');
     assert.match(e.message, /Auth tokens could not be checked/);
@@ -180,24 +180,23 @@ test('loader: refusals and shape checks never carry a token', { skip: skipWasm }
   assert.deepEqual(davParseWasm.toolPolicySet('block', [true]), { ok: true, mode: 'block' });
 });
 
-test('POLICY_LEAVES_IMPL: js by default, wasm when asked, anything else is js with a warning', async (t) => {
-  assert.equal(auth.policyLeavesImpl({}), 'js');
-  assert.equal(auth.policyLeavesImpl({ POLICY_LEAVES_IMPL: ' Wasm' }), 'wasm');
-  const warn = t.mock.method(console, 'warn', () => {});
-  assert.equal(auth.policyLeavesImpl({ POLICY_LEAVES_IMPL: 'rust' }), 'js');
-  assert.equal(warn.mock.callCount(), 1);
-  assert.ok(davParseWasm.IMPL_FLAGS.includes('POLICY_LEAVES_IMPL'));
-  assert.deepEqual(davParseWasm.wasmFlags({ POLICY_LEAVES_IMPL: 'wasm' }), ['POLICY_LEAVES_IMPL']);
-  await withEnv({ POLICY_LEAVES_IMPL: 'js', DAV_PARSE_WASM: path.join(__dirname, 'no-such.wasm') }, () => {
-    davParseWasm.reset();
-    assert.equal(auth.resolveAuthTokens({ DIARY_AUTH_TOKEN: 'd' }).diaryToken, 'd');
-    assert.equal(createToolPolicy({ db: fakeDb(null) }).mode('u', 't', false), 'allow');
-  });
-  await withEnv({ POLICY_LEAVES_IMPL: 'wasm', DAV_PARSE_WASM: path.join(__dirname, 'no-such.wasm') }, () => {
-    davParseWasm.reset();
-    assert.throws(() => auth.resolveAuthTokens({ DIARY_AUTH_TOKEN: 'synthetic-d' }), (e) => /could not be checked/.test(e.message) && !e.message.includes('synthetic-d'));
-    assert.equal(createToolPolicy({ db: fakeDb(null) }).mode('u', 't', false), 'block');
-    assert.throws(() => davParseWasm.verifyAtStartup(process.env), /POLICY_LEAVES_IMPL set to wasm/);
-  });
+test('POLICY_LEAVES_IMPL is retired: no switch, no JS path, a missing module fails closed whatever the environment says', async () => {
+  assert.equal(auth.policyLeavesImpl, undefined);
+  assert.equal(auth.resolveAuthTokensJs, undefined);
+  assert.equal(auth.resolveAuthTokensWasm, undefined);
+  assert.equal(require('../../server/tool-policy.cjs').createToolPolicyJs, undefined);
+  assert.ok(!davParseWasm.IMPL_FLAGS.includes('POLICY_LEAVES_IMPL'));
+  assert.deepEqual(davParseWasm.wasmFlags({ POLICY_LEAVES_IMPL: 'wasm' }), []);
+  assert.equal(davParseWasm.RETIRED_FLAGS.POLICY_LEAVES_IMPL, 'wasm');
+  // An old =js is ignored: with no usable module the Rust path fails closed, it does not fall back.
+  for (const old of ['js', 'wasm', undefined]) {
+    await withEnv({ POLICY_LEAVES_IMPL: old, DAV_PARSE_WASM: path.join(__dirname, 'no-such.wasm') }, () => {
+      if (old === undefined) delete process.env.POLICY_LEAVES_IMPL;
+      davParseWasm.reset();
+      assert.throws(() => auth.resolveAuthTokens({ DIARY_AUTH_TOKEN: 'synthetic-d' }), (e) => /could not be checked/.test(e.message) && !e.message.includes('synthetic-d'));
+      assert.equal(createToolPolicy({ db: fakeDb(null) }).mode('u', 't', false), 'block');
+      assert.throws(() => davParseWasm.verifyAtStartup(process.env), /dav-parse\.wasm \(always required\) failed verification/);
+    });
+  }
   davParseWasm.reset();
 });

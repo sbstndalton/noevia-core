@@ -1,5 +1,5 @@
 'use strict';
-// COMPLETENESS_REPORT_IMPL: the switch and its fail-closed paths, with a stand-in for the Rust port
+// COMPLETENESS_REPORT_IMPL (retired in #1071: the port always confirms the JS): the fail-closed paths, with a stand-in for the Rust port
 // (no dav-parse.wasm needed; tests/server/completeness-report-differential.test.cjs runs the real
 // module). The JS report is handed out as is only when the port returns the byte-identical
 // canonical report and hash; anything else marks it unverified, which canEnterReviewing() refuses
@@ -11,7 +11,7 @@ const path = require('node:path');
 const cr = require('./completeness-report.cjs');
 const davParseWasm = require('./dav-parse-wasm.cjs');
 
-const { buildCompletenessReport, buildCompletenessReportJs, canEnterReviewing, completenessReportImpl, reportHash } = cr;
+const { buildCompletenessReport, buildCompletenessReportJs, canEnterReviewing, reportHash } = cr;
 
 const SHA = 'b'.repeat(40);
 const passingJob = () => ({
@@ -37,7 +37,7 @@ function fakePort(over) {
   };
   return { loader: () => port, calls };
 }
-const wasm = (port) => ({ impl: 'wasm', wasmLoader: port.loader });
+const wasm = (port) => ({ wasmLoader: port.loader });
 
 function quietly(fn) {
   const warn = console.warn, seen = [];
@@ -45,26 +45,19 @@ function quietly(fn) {
   try { return { value: fn(), seen }; } finally { console.warn = warn; }
 }
 
-test('COMPLETENESS_REPORT_IMPL: default js, wasm when set, anything else js with one warning', () => {
-  const { seen } = quietly(() => {
-    assert.equal(completenessReportImpl({}), 'js');
-    assert.equal(completenessReportImpl({ COMPLETENESS_REPORT_IMPL: '' }), 'js');
-    assert.equal(completenessReportImpl({ COMPLETENESS_REPORT_IMPL: ' WASM ' }), 'wasm');
-    assert.equal(completenessReportImpl({ COMPLETENESS_REPORT_IMPL: 'js' }), 'js');
-    assert.equal(completenessReportImpl({ COMPLETENESS_REPORT_IMPL: 'rust' }), 'js');
-    assert.equal(completenessReportImpl({ COMPLETENESS_REPORT_IMPL: 'rust' }), 'js');
-  });
-  assert.deepEqual(seen, ['[completeness-report] COMPLETENESS_REPORT_IMPL="rust" is not js or wasm; using js']);
-  assert.ok(davParseWasm.IMPL_FLAGS.includes('COMPLETENESS_REPORT_IMPL'), 'a missing or tampered module stops startup');
-});
-
-test('js (the default) never asks the port; wasm reads the env on every call', () => {
+test('COMPLETENESS_REPORT_IMPL is retired: no switch, the port is always asked, an old =js changes nothing', () => {
+  assert.equal(cr.completenessReportImpl, undefined);
+  assert.ok(!davParseWasm.IMPL_FLAGS.includes('COMPLETENESS_REPORT_IMPL'));
+  assert.equal(davParseWasm.RETIRED_FLAGS.COMPLETENESS_REPORT_IMPL, 'wasm');
   const port = fakePort();
-  buildCompletenessReport({ job: passingJob() }, { env: {}, wasmLoader: port.loader });
-  assert.equal(port.calls.length, 0);
-  buildCompletenessReport({ job: passingJob(), expectedArtifacts: ['patch.diff'] }, { env: { COMPLETENESS_REPORT_IMPL: 'wasm' }, wasmLoader: port.loader });
+  // `env` and `impl` are not options any more; whatever an old caller passes, the port is asked.
+  buildCompletenessReport({ job: passingJob(), expectedArtifacts: ['patch.diff'] }, { env: { COMPLETENESS_REPORT_IMPL: 'js' }, impl: 'js', wasmLoader: port.loader });
   assert.deepEqual(port.calls, [[passingJob(), ['patch.diff']]]);
-  buildCompletenessReport({ job: passingJob() }, { env: { COMPLETENESS_REPORT_IMPL: 'wasm' }, wasmLoader: port.loader });
+  const saved = process.env.COMPLETENESS_REPORT_IMPL;
+  process.env.COMPLETENESS_REPORT_IMPL = 'js';
+  try {
+    buildCompletenessReport({ job: passingJob() }, { wasmLoader: port.loader });
+  } finally { if (saved === undefined) delete process.env.COMPLETENESS_REPORT_IMPL; else process.env.COMPLETENESS_REPORT_IMPL = saved; }
   assert.deepEqual(port.calls[1][1], null, 'an omitted expectedArtifacts crosses as null');
 });
 
@@ -165,7 +158,7 @@ function toVerifying(jobs, id, AUTHORITY) {
   jobs.append(id, 'artifact.created', { name: 'test-report', kind: 'test-report', passed: true, exitCode: 0, headSha: SHA1 });
 }
 
-test('jobs.cjs: under wasm an unusable module keeps a complete task out of reviewing (409, unverified); js lets it in', async () => {
+test('jobs.cjs: an unusable module keeps a complete task out of reviewing (409, unverified); the real module lets it in', async () => {
   const { createJobs, claimLifecycleAuthority } = require('./jobs.cjs');
   const AUTHORITY = claimLifecycleAuthority();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cr-switch-'));
@@ -177,13 +170,13 @@ test('jobs.cjs: under wasm an unusable module keeps a complete task out of revie
     await jobs.run(id, async () => {
       toVerifying(jobs, id, AUTHORITY);
       const move = { from: 'verifying', to: 'reviewing', revision: 1, expectedArtifacts: ['test-report'] };
-      process.env.COMPLETENESS_REPORT_IMPL = 'wasm';
+      process.env.COMPLETENESS_REPORT_IMPL = 'js'; // retired: changes nothing
       process.env.DAV_PARSE_WASM = path.join(dir, 'missing.wasm');
       davParseWasm.reset();
       quietly(() => assert.throws(() => jobs.append(id, 'task.stage', move, AUTHORITY),
         (e) => e.status === 409 && /unverified: impl_refused/.test(e.message)));
-      assert.equal(jobs.get(id).lifecycle, 'verifying', 'nothing was written');
       restore();
+      assert.equal(jobs.get(id).lifecycle, 'verifying', 'nothing was written');
       const entered = jobs.append(id, 'task.stage', move, AUTHORITY);
       assert.match(entered.data.reportHash, /^[0-9a-f]{64}$/);
       return { ok: true };

@@ -1,7 +1,7 @@
 'use strict';
-// TASK_LIFECYCLE_IMPL: the switch and its fail-closed paths, with a stand-in for the Rust port (no
+// TASK_LIFECYCLE_IMPL (retired in #1071: the port always confirms the JS): the fail-closed paths, with a stand-in for the Rust port (no
 // dav-parse.wasm needed; tests/server/task-lifecycle-differential.test.cjs runs the real module).
-// The JS answer is the only one ever returned, and under wasm only when the port gives the same:
+// The JS answer is the only one ever returned, and only when the port gives the same:
 // a move is allowed only when both allow it. A port refusal, fault, bad reply or disagreement makes
 // canTransition false and every throwing entry point throw TaskLifecycleError (impl_refused /
 // impl_mismatch, 409); through jobs.cjs that refuses the stage write (nothing is appended) and
@@ -15,7 +15,6 @@ const { CHECK_NAMES } = require('./completeness-report.cjs');
 
 const AUTHORITY = claimLifecycleAuthority();
 const { TaskLifecycleError } = lc;
-const JS = { impl: 'js' };
 const ev = (type, data) => ({ type, ...(data === undefined ? {} : { data }) });
 const stage = (from, to, extra = {}) => ev('task.stage', { from, to, revision: 0, ...extra });
 
@@ -26,16 +25,16 @@ const answer = (fn, key) => {
 function fakePort(over = {}) {
   const calls = [];
   const port = {
-    taskLifecycleCanTransition: (f, t) => { calls.push('can'); return answer(() => lc.canTransition(f, t, JS), 'allowed'); },
-    taskLifecycleTransition: (f, t) => { calls.push('transition'); return answer(() => lc.transition(f, t, JS), 'state'); },
-    taskLifecycleStageMove: (f, t) => { calls.push('stage'); return answer(() => lc.assertStageMove(f, t, JS), 'state'); },
-    taskLifecycleFold: (e, f, a) => { calls.push('fold'); return answer(() => lc.foldEvents(e, f, { authoritative: a, ...JS }), 'state'); },
-    taskLifecycleDerive: (e) => { calls.push('derive'); return answer(() => lc.deriveLifecycle(e, JS), 'state'); },
+    taskLifecycleCanTransition: (f, t) => { calls.push('can'); return answer(() => lc.canTransitionJs(f, t), 'allowed'); },
+    taskLifecycleTransition: (f, t) => { calls.push('transition'); return answer(() => lc.transitionJs(f, t), 'state'); },
+    taskLifecycleStageMove: (f, t) => { calls.push('stage'); return answer(() => lc.assertStageMoveJs(f, t), 'state'); },
+    taskLifecycleFold: (e, f, a) => { calls.push('fold'); return answer(() => lc.foldEventsJs(e, f, { authoritative: a }), 'state'); },
+    taskLifecycleDerive: (e) => { calls.push('derive'); return answer(() => lc.deriveLifecycleJs(e), 'state'); },
     ...over,
   };
   return { loader: () => port, calls };
 }
-const wasm = (port) => ({ impl: 'wasm', wasmLoader: port.loader });
+const wasm = (port) => ({ wasmLoader: port.loader });
 const fault = () => { throw new davParseWasm.DavParseError('dav-parse module failed', 'trap'); };
 
 function quietly(fn) {
@@ -45,33 +44,24 @@ function quietly(fn) {
 }
 const refused = (fn, code) => quietly(() => assert.throws(fn, (err) => err instanceof TaskLifecycleError && err.code === code && err.status === 409)).seen;
 
-test('TASK_LIFECYCLE_IMPL: default js, wasm when set, anything else js with one warning', () => {
-  const { seen } = quietly(() => {
-    assert.equal(lc.taskLifecycleImpl({}), 'js');
-    assert.equal(lc.taskLifecycleImpl({ TASK_LIFECYCLE_IMPL: '' }), 'js');
-    assert.equal(lc.taskLifecycleImpl({ TASK_LIFECYCLE_IMPL: ' WASM ' }), 'wasm');
-    assert.equal(lc.taskLifecycleImpl({ TASK_LIFECYCLE_IMPL: 'js' }), 'js');
-    assert.equal(lc.taskLifecycleImpl({ TASK_LIFECYCLE_IMPL: 'rust' }), 'js');
-    assert.equal(lc.taskLifecycleImpl({ TASK_LIFECYCLE_IMPL: 'rust' }), 'js');
-  });
-  assert.equal(seen.length, 1);
-  assert.match(seen[0], /TASK_LIFECYCLE_IMPL="rust" is not js or wasm; using js/);
-  assert.ok(davParseWasm.IMPL_FLAGS.includes('TASK_LIFECYCLE_IMPL'));
+test('TASK_LIFECYCLE_IMPL is retired: no switch, the port is always asked, an old =js changes nothing', () => {
+  assert.equal(lc.taskLifecycleImpl, undefined);
+  assert.ok(!davParseWasm.IMPL_FLAGS.includes('TASK_LIFECYCLE_IMPL'));
+  assert.equal(davParseWasm.RETIRED_FLAGS.TASK_LIFECYCLE_IMPL, 'wasm');
+  for (const opts of [{}, { env: {}, impl: 'js' }, { env: { TASK_LIFECYCLE_IMPL: 'js' } }]) {
+    const port = fakePort();
+    const o = { ...opts, wasmLoader: port.loader };
+    assert.equal(lc.canTransition('planned', 'implementing', o), true);
+    assert.equal(lc.transition('planned', 'implementing', o), 'implementing');
+    assert.equal(lc.assertStageMove('reviewing', 'merged', o), 'merged');
+    assert.equal(lc.foldEvents([ev('job.started')], 'planned', o), 'implementing');
+    assert.equal(lc.deriveLifecycle([ev('job.started')], o), 'implementing');
+    assert.equal(lc.confirmFold([ev('job.started')], 'implementing', o), 'implementing');
+    assert.deepEqual(port.calls, ['can', 'transition', 'stage', 'fold', 'derive', 'fold'], 'the port is asked for every call');
+  }
 });
 
-test('js (the default) never asks the port', () => {
-  const port = fakePort();
-  const opts = { env: {}, wasmLoader: port.loader };
-  assert.equal(lc.canTransition('planned', 'implementing', opts), true);
-  assert.equal(lc.transition('planned', 'implementing', opts), 'implementing');
-  assert.equal(lc.assertStageMove('reviewing', 'merged', opts), 'merged');
-  assert.equal(lc.foldEvents([ev('job.started')], 'planned', opts), 'implementing');
-  assert.equal(lc.deriveLifecycle([ev('job.started')], opts), 'implementing');
-  assert.equal(lc.confirmFold([ev('job.started')], 'implementing', opts), 'implementing');
-  assert.deepEqual(port.calls, []);
-});
-
-test('wasm: an agreeing port leaves every answer as the JS gives it', () => {
+test('an agreeing port leaves every answer as the JS gives it', () => {
   const port = fakePort();
   const o = wasm(port);
   assert.equal(lc.canTransition('planned', 'implementing', o), true);
@@ -85,7 +75,7 @@ test('wasm: an agreeing port leaves every answer as the JS gives it', () => {
   assert.deepEqual(port.calls, ['can', 'transition', 'stage', 'fold', 'derive', 'derive', 'fold']);
 });
 
-test('wasm: when the JS refuses or throws, the port is not asked and the JS error stands', () => {
+test('when the JS refuses or throws, the port is not asked and the JS error stands', () => {
   const port = fakePort();
   const o = wasm(port);
   assert.equal(lc.canTransition('planned', 'merged', o), false);
@@ -143,12 +133,12 @@ test('#1126: the port is sent only the events and fields the fold reads, and agr
   for (const authoritative of [false, true]) {
     for (const k of [0, 3, 5, 11, journal.length]) {
       const part = journal.slice(0, k);
-      assert.deepEqual(answer(() => lc.foldEvents(lc.foldInput(part), 'planned', { authoritative, ...JS }), 'state'),
-        answer(() => lc.foldEvents(part, 'planned', { authoritative, ...JS }), 'state'), `${k} ${authoritative}`);
+      assert.deepEqual(answer(() => lc.foldEventsJs(lc.foldInput(part), 'planned', { authoritative }), 'state'),
+        answer(() => lc.foldEventsJs(part, 'planned', { authoritative }), 'state'), `${k} ${authoritative}`);
     }
   }
   const seen = [];
-  const port = fakePort({ taskLifecycleDerive: (e) => { seen.push(e); return answer(() => lc.deriveLifecycle(e, JS), 'state'); } });
+  const port = fakePort({ taskLifecycleDerive: (e) => { seen.push(e); return answer(() => lc.deriveLifecycleJs(e), 'state'); } });
   assert.equal(lc.deriveLifecycle(journal, wasm(port)), 'blocked');
   assert.ok(JSON.stringify(seen[0]).length < 300, 'no payload sent');
 });
@@ -157,11 +147,11 @@ test('#1125: a non-string reportHash is a TaskLifecycleError (report_hash), neve
   const hash = 'ab'.repeat(32);
   for (const reportHash of [[hash], [[hash]], { toString: hash }, { valueOf: hash }, {}, 1, true]) {
     const journal = [stage('planned', 'implementing'), stage('implementing', 'reviewing', { reportHash })];
-    assert.throws(() => lc.deriveLifecycle(journal, JS), (e) => e instanceof TaskLifecycleError && e.code === 'report_hash');
-    assert.equal(lc.safeDeriveLifecycle(journal, JS), null);
+    assert.throws(() => lc.deriveLifecycleJs(journal), (e) => e instanceof TaskLifecycleError && e.code === 'report_hash');
+    assert.equal(lc.safeDeriveLifecycle(journal, { wasmLoader: () => { throw Error('asked'); } }), null, 'the JS throws first: the port is not asked');
     assert.equal(derive([{ type: 'job.created', job: 'x', data: { kind: 'code' } }, ...journal]).lifecycle, null);
   }
-  assert.equal(lc.deriveLifecycle([stage('planned', 'implementing'), stage('implementing', 'reviewing', { reportHash: hash })], JS), 'reviewing');
+  assert.equal(lc.deriveLifecycleJs([stage('planned', 'implementing'), stage('implementing', 'reviewing', { reportHash: hash })]), 'reviewing');
 });
 
 test('port warnings are logged once per reason and carry no journal text', () => {
@@ -183,17 +173,15 @@ test('port warnings are logged once per reason and carry no journal text', () =>
 const temps = [];
 test.after(() => { for (const d of temps) fs.rmSync(d, { recursive: true, force: true }); });
 function withPort(over, fn) {
-  const names = Object.keys(over), saved = names.map((n) => davParseWasm[n]), env = process.env.TASK_LIFECYCLE_IMPL;
+  const names = Object.keys(over), saved = names.map((n) => davParseWasm[n]);
   names.forEach((n) => { davParseWasm[n] = over[n]; });
-  process.env.TASK_LIFECYCLE_IMPL = 'wasm';
   try { return quietly(fn).value; } finally {
     names.forEach((n, i) => { davParseWasm[n] = saved[i]; });
-    if (env === undefined) delete process.env.TASK_LIFECYCLE_IMPL; else process.env.TASK_LIFECYCLE_IMPL = env;
   }
 }
 const agree = fakePort().loader();
 
-test('jobs.cjs under wasm: an agreeing port writes the stage; a refusing one writes nothing and yields 409', () => {
+test('jobs.cjs: an agreeing port writes the stage; a refusing one writes nothing and yields 409', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-tl-')); temps.push(dir);
   const jobs = createJobs({ dir, kinds: ['code'], maxJobs: 10 });
   const id = jobs.create({ kind: 'code', projectId: 'p-synthetic', capabilities: ['read'] });
@@ -216,7 +204,7 @@ test('jobs.cjs under wasm: an agreeing port writes the stage; a refusing one wri
   assert.deepEqual({ ...disagree, lifecycle: plain.lifecycle }, plain);
   assert.equal(withPort({ ...agree, taskLifecycleFold: fault }, () => jobs.get(id)).lifecycle, null);
   assert.equal(withPort(agree, () => jobs.get(id)).lifecycle, 'implementing');
-  // The completeness checks are untouched by the switch.
+  // The completeness checks are untouched by the confirmation.
   assert.ok(CHECK_NAMES.length > 0);
 });
 

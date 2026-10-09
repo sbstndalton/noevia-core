@@ -1926,10 +1926,10 @@ test('#1079 the engine listing marks a model and its long profile once the secti
   assert.equal(rows.embed.long_variant, null);
 });
 
-test('noevia#1133: the KV ceilings are planned with the JS estimate, so LLAMACPP_AUTOCONFIG_IMPL=wasm (even with no usable module) keeps them', async t => {
+test('noevia#1133: the KV ceilings are planned with the JS estimate, so the Rust confirmation (even with no usable module) cannot remove them', async t => {
   const davParseWasm = require('./dav-parse-wasm.cjs');
   const saved = { impl: process.env.LLAMACPP_AUTOCONFIG_IMPL, file: process.env.DAV_PARSE_WASM };
-  process.env.LLAMACPP_AUTOCONFIG_IMPL = 'wasm';
+  process.env.LLAMACPP_AUTOCONFIG_IMPL = 'js'; // retired: changes nothing
   process.env.DAV_PARSE_WASM = require('node:path').join(require('node:os').tmpdir(), 'no-such-dav-parse.wasm');
   davParseWasm.reset();
   t.after(() => {

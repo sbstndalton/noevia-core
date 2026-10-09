@@ -50,20 +50,20 @@
 // ignored, and only the run ending without the pipeline's say-so (failed, cancelled,
 // interrupted) still forces `blocked`. A journal without one folds exactly as before.
 //
-// TASK_LIFECYCLE_IMPL=js|wasm (default js; any other value means js, with one warning), read from the
-// `env` option (process.env) on every call of canTransition, transition, assertStageMove,
-// foldEvents, deriveLifecycle, safeDeriveLifecycle and confirmFold. wasm also asks noevia-rs's
-// task-lifecycle crate (dav-parse.wasm task_lifecycle) for the same answer. The JS answer is always
-// computed first and is the only one ever returned: a move is allowed only when both allow it.
+// Rust confirmation (TASK_LIFECYCLE_IMPL, retired in #1071: always on), in canTransition,
+// transition, assertStageMove, foldEvents, deriveLifecycle, safeDeriveLifecycle and confirmFold.
+// Each also asks noevia-rs's task-lifecycle crate (dav-parse.wasm task_lifecycle) for the same
+// answer. The JS answer (the *Js functions below) is still computed first, is the authority and is
+// the only one ever returned: a move is allowed only when both allow it.
 // When the JS throws, the port is not asked. When the JS allows and the port refuses, faults,
 // replies badly or disagrees, canTransition answers false and the others throw TaskLifecycleError
 // (code 'impl_refused' / 'impl_mismatch', status 409; logged once per reason, journal-text free),
 // so jobs.cjs's existing paths refuse the stage write and derive no lifecycle (null). step() is
-// the JS alone; jobs.cjs derive() confirms its whole fold once through confirmFold(). The flag is
-// in dav-parse-wasm.cjs IMPL_FLAGS (a missing or tampered module stops startup).
+// the JS alone; jobs.cjs derive() confirms its whole fold once through confirmFold(). A missing or
+// tampered dav-parse.wasm stops startup.
 // The port is sent only what the fold reads (#1126, foldInput): the event types that can move the
 // lifecycle or make a journal authoritative, each with only the data fields step() reads, so a large
-// tool payload costs nothing and is never re-sent. Every dropped event is a no-op in both modes.
+// tool payload costs nothing and is never re-sent. Every dropped event is a no-op for the JS.
 // Stricter than the JS (the crate docs): fold input over 8 MiB as JSON, or one JSON.stringify cannot
 // write, is refused. canTransitionToReviewing's completeness half
 // (completeness-report.cjs canEnterReviewing) is not part of this port.
@@ -108,7 +108,7 @@ class TaskLifecycleError extends Error {
     this.name = 'TaskLifecycleError';
     this.from = from;
     this.to = to;
-    // What went wrong, for TASK_LIFECYCLE_IMPL's comparison: unknown_state, illegal, stale,
+    // What went wrong, for the Rust comparison: unknown_state, illegal, stale,
     // report_hash, merge_from_reviewing, or (the port's refusal) impl_refused / impl_mismatch.
     this.code = code;
     this.status = 409;
@@ -122,7 +122,7 @@ function assertKnownState(state, label) {
 }
 
 // True/false; throws only for an unknown state. Staying in the same state is always allowed (a
-// no-op transition). The JS table alone; canTransition below adds TASK_LIFECYCLE_IMPL.
+// no-op transition). The JS table alone; canTransition below adds the Rust confirmation.
 function canTransitionJs(from, to) {
   assertKnownState(from, 'from');
   assertKnownState(to, 'to');
@@ -252,24 +252,9 @@ function foldEventsJs(events, fromState, options) {
   return state;
 }
 
-// ── TASK_LIFECYCLE_IMPL ─────────────────────────────────────────────────────
+// ── Rust confirmation ───────────────────────────────────────────────────────
 
-const IMPLS = new Set(['js', 'wasm']);
-let warnedImpl = '';
-/** TASK_LIFECYCLE_IMPL: 'js' (default) or 'wasm'. */
-function taskLifecycleImpl(env = process.env) {
-  const raw = env?.TASK_LIFECYCLE_IMPL;
-  if (raw === undefined || raw === '') return 'js';
-  const value = String(raw).trim().toLowerCase();
-  if (IMPLS.has(value)) return value;
-  if (warnedImpl !== value) {
-    warnedImpl = value;
-    console.warn(`[task-lifecycle] TASK_LIFECYCLE_IMPL=${JSON.stringify(String(raw))} is not js or wasm; using js`);
-  }
-  return 'js';
-}
 const defaultLoader = () => require('./dav-parse-wasm.cjs');
-const implOf = ({ env = process.env, impl = taskLifecycleImpl(env) } = {}) => impl;
 
 const warnedPort = new Set();
 function portWarn(event, reason) {
@@ -321,11 +306,11 @@ function confirmState(ask, state) {
   return state;
 }
 
-/** canTransition(from, to): with TASK_LIFECYCLE_IMPL=wasm, true only when the port also allows.
- *  Throws (unknown state) only where the JS does. Options: `env`, `impl`, `wasmLoader`. */
-function canTransition(from, to, { wasmLoader = defaultLoader, ...opts } = {}) {
+/** canTransition(from, to): true only when the JS table and the port both allow.
+ *  Throws (unknown state) only where the JS does. Option: `wasmLoader`. */
+function canTransition(from, to, { wasmLoader = defaultLoader } = {}) {
   const allowed = canTransitionJs(from, to);
-  if (!allowed || implOf(opts) !== 'wasm') return allowed;
+  if (!allowed) return allowed;
   const port = askPort(() => wasmLoader().taskLifecycleCanTransition(from, to));
   if (port && port.allowed === true) return true;
   if (port) portWarn('task_lifecycle.impl_mismatch', port.throws !== undefined ? 'throws' : 'allowed');
@@ -334,35 +319,31 @@ function canTransition(from, to, { wasmLoader = defaultLoader, ...opts } = {}) {
 
 /** Guarded transition: returns `to` on success, throws TaskLifecycleError on an illegal move
  *  (including moves out of the terminal `merged` state, or into/out of an unknown state), and
- *  with TASK_LIFECYCLE_IMPL=wasm when the port does not allow it too. */
-function transition(from, to, { wasmLoader = defaultLoader, ...opts } = {}) {
+ *  when the port does not allow it too. */
+function transition(from, to, { wasmLoader = defaultLoader } = {}) {
   const state = transitionJs(from, to);
-  if (implOf(opts) !== 'wasm') return state;
   return confirmState(() => wasmLoader().taskLifecycleTransition(from, to), state);
 }
 
-/** The pipeline's own move (see assertStageMoveJs), confirmed by the port under wasm. */
-function assertStageMove(from, to, { wasmLoader = defaultLoader, ...opts } = {}) {
+/** The pipeline's own move (see assertStageMoveJs), confirmed by the port. */
+function assertStageMove(from, to, { wasmLoader = defaultLoader } = {}) {
   const state = assertStageMoveJs(from, to);
-  if (implOf(opts) !== 'wasm') return state;
   return confirmState(() => wasmLoader().taskLifecycleStageMove(from, to), state);
 }
 
-/** foldEventsJs (below the module header's rules), confirmed by the port under wasm. Options:
- *  `authoritative`, `env`, `impl`, `wasmLoader`. */
+/** foldEventsJs (below the module header's rules), confirmed by the port. Options:
+ *  `authoritative`, `wasmLoader`. */
 function foldEvents(events, fromState = INITIAL_STATE, options = {}) {
   const { wasmLoader = defaultLoader, ...opts } = options || {};
   const state = foldEventsJs(events, fromState, options);
-  if (implOf(opts) !== 'wasm') return state;
   return confirmState(() => wasmLoader().taskLifecycleFold(foldInput(events), fromState, Boolean(opts.authoritative)), state);
 }
 
 /** For a caller that folded `events` itself with step() from INITIAL_STATE (jobs.cjs derive()):
- *  `state` under js; under wasm `state` only when the port folds the same journal to it, else
- *  null ("no derived lifecycle available"). Never throws. */
+ *  `state` only when the port folds the same journal to it, else null ("no derived lifecycle
+ *  available"). Never throws. */
 function confirmFold(events, state, options = {}) {
   const { wasmLoader = defaultLoader, ...opts } = options || {};
-  if (implOf(opts) !== 'wasm') return state;
   try {
     return confirmState(() => wasmLoader().taskLifecycleFold(foldInput(events), INITIAL_STATE, Boolean(opts.authoritative)), state);
   } catch {
@@ -370,11 +351,12 @@ function confirmFold(events, state, options = {}) {
   }
 }
 
+const deriveLifecycleJs = (events) => foldEventsJs(events, INITIAL_STATE, { authoritative: isAuthoritative(events) });
+
 // Convenience: derive the lifecycle state for a full journal from the beginning. Whether the
 // journal is authoritative is decided by the whole journal (see the module header).
-function deriveLifecycle(events, { wasmLoader = defaultLoader, ...opts } = {}) {
-  const state = foldEventsJs(events, INITIAL_STATE, { authoritative: isAuthoritative(events) });
-  if (implOf(opts) !== 'wasm') return state;
+function deriveLifecycle(events, { wasmLoader = defaultLoader } = {}) {
+  const state = deriveLifecycleJs(events);
   return confirmState(() => wasmLoader().taskLifecycleDerive(foldInput(events)), state);
 }
 
@@ -419,5 +401,9 @@ module.exports = {
   canTransitionToReviewing,
   confirmFold,
   foldInput,
-  taskLifecycleImpl,
+  canTransitionJs,
+  transitionJs,
+  assertStageMoveJs,
+  foldEventsJs,
+  deriveLifecycleJs,
 };

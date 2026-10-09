@@ -1,9 +1,9 @@
 'use strict';
-// LLAMACPP_AUTOCONFIG_IMPL (js|wasm): the switch's reading, and every path where the Rust port
+// LLAMACPP_AUTOCONFIG_IMPL (retired in #1071: the port always confirms the JS): every path where the Rust port
 // refuses, faults or disagrees, with stand-in ports (no WebAssembly needed). The JS answer is
 // returned only when the port agrees byte for byte or the JS answer is the conservative one;
 // otherwise suggest offers no settings and the estimates refuse the load or save. Then the model
-// manager under wasm with an unusable module: loads, preset saves and the Will-it-fit panel refuse
+// manager with an unusable module: loads, preset saves and the Will-it-fit panel refuse
 // instead of passing unconfirmed. Synthetic GGUF headers and a fake router only: nothing is loaded.
 const test = require('node:test'), assert = require('node:assert/strict'), fs = require('node:fs'), os = require('node:os'), path = require('node:path');
 const ac = require('./llamacpp-autoconfig.cjs');
@@ -23,19 +23,21 @@ function capture(fn) {
 }
 const reply = (value) => () => ({ llamacppAutoconfig: () => ({ text: JSON.stringify(value), reply: value }) });
 const faulty = (reason) => () => ({ llamacppAutoconfig: () => { throw Object.assign(Error('refused'), { reason }); } });
-const wasm = (wasmLoader) => ({ impl: 'wasm', wasmLoader });
+const wasm = (wasmLoader) => ({ wasmLoader });
 
-test('LLAMACPP_AUTOCONFIG_IMPL: js by default, wasm when set, anything else js with one warning', () => {
-  assert.equal(ac.autoconfigImpl({}), 'js');
-  assert.equal(ac.autoconfigImpl({ LLAMACPP_AUTOCONFIG_IMPL: '' }), 'js');
-  assert.equal(ac.autoconfigImpl({ LLAMACPP_AUTOCONFIG_IMPL: ' WASM ' }), 'wasm');
-  const { lines } = capture(() => { ac.autoconfigImpl({ LLAMACPP_AUTOCONFIG_IMPL: 'rust' }); ac.autoconfigImpl({ LLAMACPP_AUTOCONFIG_IMPL: 'rust' }); });
-  assert.equal(lines.length, 1); assert.match(lines[0], /LLAMACPP_AUTOCONFIG_IMPL="rust" is not js or wasm; using js/);
-  // js never asks the port, whatever the module would say.
+test('LLAMACPP_AUTOCONFIG_IMPL is retired: no switch, the port is always asked, an old =js changes nothing', () => {
+  assert.equal(ac.autoconfigImpl, undefined);
+  assert.ok(!davParseWasm.IMPL_FLAGS.includes('LLAMACPP_AUTOCONFIG_IMPL'));
+  assert.equal(davParseWasm.RETIRED_FLAGS.LLAMACPP_AUTOCONFIG_IMPL, 'wasm');
+  // `env` and `impl` are not options any more: even an old =js, the port is asked and its refusal withholds the JS settings.
   const never = () => { throw Error('asked'); };
-  assert.deepEqual(ac.suggest(SUGGEST, { env: {}, wasmLoader: never }), ac.suggestJs(SUGGEST));
-  assert.deepEqual(ac.estimateFootprint(FOOT, { env: { LLAMACPP_AUTOCONFIG_IMPL: 'js' }, wasmLoader: never }), ac.estimateFootprintJs(FOOT));
-  assert.equal(ac.suggest(SUGGEST, { env: { LLAMACPP_AUTOCONFIG_IMPL: 'wasm' }, wasmLoader: reply(ac.suggestJs(SUGGEST)) }).values['ctx-size'], ac.suggestJs(SUGGEST).values['ctx-size']);
+  const r = capture(() => ac.suggest(SUGGEST, { env: { LLAMACPP_AUTOCONFIG_IMPL: 'js' }, impl: 'js', wasmLoader: never })).value;
+  assert.equal(r.code, 'autoconfig_impl'); assert.equal(r.values, undefined); assert.equal(r.unverified, 'impl_refused');
+  assert.throws(() => capture(() => ac.estimateFootprint(FOOT, { env: { LLAMACPP_AUTOCONFIG_IMPL: 'js' }, wasmLoader: never })), (e) => e.code === 'autoconfig_impl');
+  assert.equal(ac.suggest(SUGGEST, { wasmLoader: reply(ac.suggestJs(SUGGEST)) }).values['ctx-size'], ac.suggestJs(SUGGEST).values['ctx-size']);
+  // The messages no longer advise a switch that is gone.
+  assert.doesNotMatch(r.error, /LLAMACPP_AUTOCONFIG_IMPL/);
+  assert.throws(() => capture(() => ac.estimateFootprint(FOOT, wasm(faulty('trap')))), (e) => !/LLAMACPP_AUTOCONFIG_IMPL/.test(e.message));
 });
 
 test('an agreeing port: the JS answer, unchanged and unlogged', () => {
@@ -49,7 +51,7 @@ test('an agreeing port: the JS answer, unchanged and unlogged', () => {
 test('suggest: a port that refuses or faults withholds JS settings, but a JS error passes', () => {
   const { value, lines } = capture(() => ac.suggest(SUGGEST, wasm(faulty('trap'))));
   assert.equal(value.code, 'autoconfig_impl'); assert.equal(value.values, undefined); assert.equal(value.unverified, 'impl_refused');
-  assert.match(value.error, /LLAMACPP_AUTOCONFIG_IMPL=wasm/);
+  assert.match(value.error, /^No settings suggested: the Rust sizing port did not confirm this suggestion/);
   assert.equal(lines.length, 1); assert.match(lines[0], /suggest\.wasm_refused \(trap; refused\)/);
   // Logged once per reason.
   assert.equal(capture(() => ac.suggest(SUGGEST, wasm(faulty('trap')))).lines.length, 0);
@@ -106,7 +108,7 @@ test('estimateInputs: JS figures at least the port\'s stand; anything else refus
   assert.throws(() => capture(() => ac.estimateInputs(INPUTS, wasm(faulty('trap')))), (e) => e.code === 'autoconfig_impl');
 });
 
-test('property: whatever the port answers, the switched suggestion is the JS one or none', () => {
+test('property: whatever the port answers, the confirmed suggestion is the JS one or none', () => {
   let x = 0x5eed;
   const rnd = () => { x ^= x << 13; x >>>= 0; x ^= x >>> 17; x ^= x << 5; x >>>= 0; return x / 4294967296; };
   for (let i = 0; i < 300; i++) {
@@ -121,7 +123,7 @@ test('property: whatever the port answers, the switched suggestion is the JS one
   }
 });
 
-// ── llamacpp-manager.cjs under wasm with an unusable module ─────────────────────────────────
+// ── llamacpp-manager.cjs with an unusable module ─────────────────────────────────
 
 function gguf(kv) {
   const u32 = (n) => { const b = Buffer.alloc(4); b.writeUInt32LE(n); return b; };
@@ -152,7 +154,7 @@ function manager(t, budget = 64) {
 
 function withUnusableModule(t) {
   const saved = { impl: process.env.LLAMACPP_AUTOCONFIG_IMPL, file: process.env.DAV_PARSE_WASM };
-  process.env.LLAMACPP_AUTOCONFIG_IMPL = 'wasm';
+  process.env.LLAMACPP_AUTOCONFIG_IMPL = 'js'; // retired: changes nothing
   process.env.DAV_PARSE_WASM = path.join(os.tmpdir(), 'no-such-dav-parse.wasm');
   davParseWasm.reset();
   const warn = console.warn; console.warn = () => {};
@@ -163,9 +165,11 @@ function withUnusableModule(t) {
   });
 }
 
-test('manager: under js the small model loads; under wasm with no usable module the load is refused, not waved through', async (t) => {
-  const js = manager(t);
-  assert.equal((await js.m.load('small')).ok, true);
+test('manager: the small model loads with the real module; with no usable module the load is refused, not waved through', async (t) => {
+  if (fs.existsSync(process.env.DAV_PARSE_WASM || davParseWasm.DEFAULT_WASM)) {
+    const real = manager(t);
+    assert.equal((await real.m.load('small')).ok, true);
+  }
   withUnusableModule(t);
   const { m, calls } = manager(t);
   const r = await m.load('small');
@@ -174,7 +178,7 @@ test('manager: under js the small model loads; under wasm with no usable module 
   assert.ok(!calls.includes('POST /models/load'), calls.join('\n'));
 });
 
-test('manager: under wasm with no usable module a preset save is refused, the panel is a 503 and no settings are suggested', async (t) => {
+test('manager: with no usable module a preset save is refused, the panel is a 503 and no settings are suggested', async (t) => {
   withUnusableModule(t);
   const { m, ini } = manager(t);
   const before = fs.readFileSync(ini, 'utf8');

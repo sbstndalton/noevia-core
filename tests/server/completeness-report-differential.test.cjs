@@ -1,6 +1,6 @@
 'use strict';
 
-// COMPLETENESS_REPORT_IMPL: tests/fixtures/completeness-report.v1.json (byte-identical to noevia-rs
+// Completeness report (COMPLETENESS_REPORT_IMPL, retired in #1071: the port always confirms the JS): tests/fixtures/completeness-report.v1.json (byte-identical to noevia-rs
 // crates/completeness-report/tests/fixtures/; CI compares them) holds completeness-report.cjs's
 // reports as the exact replies the Rust port must give (canonical report JSON and its sha256),
 // printed by tools/gen-completeness-report-fixtures.cjs from the JS itself (synthetic jobs). Here
@@ -24,7 +24,6 @@ const GENERATOR = path.join(__dirname, '../../tools/gen-completeness-report-fixt
 const fixtures = JSON.parse(fs.readFileSync(FILE, 'utf8'));
 const wasmFile = process.env.DAV_PARSE_WASM || davParseWasm.DEFAULT_WASM;
 const skipWasm = !fs.existsSync(wasmFile) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
-const WASM = { impl: 'wasm' };
 
 // Key-sorted JSON (the canonical text reportHash hashes, for values within its limits).
 function canonical(v) {
@@ -57,7 +56,7 @@ test('report and deep rows: the exact reply through the port; the switch hands o
       const [job, expected] = parts(row);
       assert.equal(portReply(job, expected), row.reply, `${key} row ${i}`);
       const js = cr.buildCompletenessReportJs({ job, expectedArtifacts: expected });
-      const switched = cr.buildCompletenessReport({ job, expectedArtifacts: expected }, WASM);
+      const switched = cr.buildCompletenessReport({ job, expectedArtifacts: expected });
       assert.deepEqual(switched, js, `${key} row ${i}: verified, unchanged`);
       assert.equal(cr.canEnterReviewing(switched), js.overall === 'pass');
       seen[js.overall]++;
@@ -70,7 +69,7 @@ test('throws rows are refused as input (the JS throws, so the port is never aske
   for (const [i, row] of fixtures.throws.entries()) {
     const [job, expected] = parts(row);
     assert.throws(() => davParseWasm.completenessReport(job, expected), (e) => e.reason === 'input', `throws row ${i}`);
-    assert.throws(() => cr.buildCompletenessReport({ job, expectedArtifacts: expected }, WASM), `throws row ${i}: the JS throws`);
+    assert.throws(() => cr.buildCompletenessReport({ job, expectedArtifacts: expected }), `throws row ${i}: the JS throws`);
   }
   const warn = console.warn; console.warn = () => {};
   try {
@@ -78,7 +77,7 @@ test('throws rows are refused as input (the JS throws, so the port is never aske
       const [job, expected] = parts(row);
       assert.throws(() => davParseWasm.completenessReport(job, expected), (e) => e.reason === 'ambiguous', `strict row ${i}`);
       const js = cr.buildCompletenessReportJs({ job, expectedArtifacts: expected });
-      const switched = cr.buildCompletenessReport({ job, expectedArtifacts: expected }, WASM);
+      const switched = cr.buildCompletenessReport({ job, expectedArtifacts: expected });
       assert.equal(switched.unverified, 'impl_refused', `strict row ${i}`);
       assert.equal(switched.overall, js.overall === 'fail' ? 'fail' : 'unknown');
       assert.equal(cr.canEnterReviewing(switched), false);
@@ -123,7 +122,7 @@ test('seeded live jobs: the port agrees with this runtime\'s JS on every one (no
   let pass = 0, refusals = 0;
   for (const [job, expected] of liveJobs(800, 0xc0ffee)) {
     const js = cr.buildCompletenessReportJs({ job, expectedArtifacts: expected });
-    const switched = cr.buildCompletenessReport({ job, expectedArtifacts: expected }, WASM);
+    const switched = cr.buildCompletenessReport({ job, expectedArtifacts: expected });
     if (switched.unverified) refusals++;
     else assert.deepEqual(switched, js);
     if (cr.canEnterReviewing(switched)) { assert.equal(js.overall, 'pass'); pass++; }
@@ -137,7 +136,7 @@ test('a report too large to hash: the port gives the same refusal and statuses',
   const js = cr.buildCompletenessReportJs({ job });
   assert.throws(() => cr.reportHash(js), /too large/);
   assert.deepEqual(davParseWasm.completenessReport(job, null), { unhashable: 'large', overall: 'fail', statuses: js.checks.map((c) => c.status) });
-  assert.deepEqual(cr.buildCompletenessReport({ job }, WASM), js);
+  assert.deepEqual(cr.buildCompletenessReport({ job }), js);
 });
 
 test('in-memory values JSON cannot carry never make the switch more permissive', { skip: skipWasm }, () => {
@@ -152,7 +151,7 @@ test('in-memory values JSON cannot carry never make the switch more permissive',
       { ...base(), steps: [{ id: NaN, status: 'running' }] }, // "NaN" vs null
     ]) {
       const js = cr.buildCompletenessReportJs({ job });
-      const switched = cr.buildCompletenessReport({ job }, WASM);
+      const switched = cr.buildCompletenessReport({ job });
       if (switched.unverified === undefined) assert.deepEqual(switched, js);
       if (cr.canEnterReviewing(switched)) assert.equal(js.overall, 'pass');
       if (js.overall === 'fail') assert.equal(switched.overall, 'fail');

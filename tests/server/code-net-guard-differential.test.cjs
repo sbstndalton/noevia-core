@@ -1,6 +1,6 @@
 'use strict';
 
-// CODE_NET_GUARD_IMPL: tests/fixtures/code-net-guard.v1.json (byte-identical to noevia-rs
+// Code net guard (CODE_NET_GUARD_IMPL, retired in #1071: the port always joins the JS): tests/fixtures/code-net-guard.v1.json (byte-identical to noevia-rs
 // crates/code-net-guard/tests/fixtures/; CI compares them) holds code-net-guard.cjs's spec readings,
 // kept lookup answers and refusals, printed by tools/gen-code-net-guard-fixtures.cjs from the JS
 // itself (synthetic addresses only). Here every row runs through dav-parse.wasm's code_net_guard and
@@ -25,14 +25,14 @@ const fixtures = JSON.parse(fs.readFileSync(FILE, 'utf8'));
 const wasmFile = process.env.DAV_PARSE_WASM || davParseWasm.DEFAULT_WASM;
 const skipWasm = !fs.existsSync(wasmFile) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
 
-const guardOf = (spec, extra = {}) => createCodeNetGuard({ spec, impl: 'wasm', lookup: async () => [], ...extra });
+const guardOf = (spec, extra = {}) => createCodeNetGuard({ spec, lookup: async () => [], ...extra });
 
 test('the fixture file is what the generator prints', { skip: !fs.existsSync(GENERATOR) && 'no generator here' }, () => {
   const out = execFileSync(process.execPath, [GENERATOR], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
   assert.equal(out, fs.readFileSync(FILE, 'utf8'));
 });
 
-test('spec rows: the same reading through the Rust port and the switched guard', { skip: skipWasm }, async () => {
+test('spec rows: the same reading through the Rust port and the guard', { skip: skipWasm }, async () => {
   assert.ok(fixtures.spec.length >= 60);
   for (const [i, row] of fixtures.spec.entries()) {
     assert.deepStrictEqual(davParseWasm.codeNetSpec(row.spec), row.want, `row ${i}: ${JSON.stringify(row.spec)}`);
@@ -49,7 +49,7 @@ test('spec rows: the same reading through the Rust port and the switched guard',
   }
 });
 
-test('strict rows: the port refuses as ambiguous; the switched guard will not start', { skip: skipWasm }, () => {
+test('strict rows: the port refuses as ambiguous; the guard will not start', { skip: skipWasm }, () => {
   const groups = [['strictSpec', (r) => davParseWasm.codeNetSpec(r.spec)], ['strictAnswers', (r) => davParseWasm.codeNetResolved(r.answers)],
     ['strictRefuses', (r) => davParseWasm.codeNetRefuses(r.addresses, r.local)]];
   // Startup stops either way: the JS throws on a malformed entry, the switch on the port's refusal.
@@ -71,12 +71,13 @@ test('answer and refusal rows agree; stricter rows refuse where the JS serves', 
   });
 });
 
-test('the switched guard: refused where either refuses, served only where both serve', { skip: skipWasm }, async () => {
+test('the guard: refused where either refuses, served only where both serve', { skip: skipWasm }, async () => {
   const resolved = ['172.30.0.2', '0:0::1'];
   const g = guardOf('egress', { lookup: async () => resolved.map((address) => ({ address })) });
   await g.ready;
-  const js = createCodeNetGuard({ spec: 'egress', impl: 'js', lookup: async () => resolved.map((address) => ({ address })) });
-  await js.ready;
+  // The JS half alone: the set of guarded addresses, matched the way the guard matches them.
+  const guarded = new Set(resolved.map(normalizeAddress));
+  const js = { refuses: async (local) => guarded.has(normalizeAddress(local)), stop() {} };
   for (const local of ['172.30.0.2', '::ffff:172.30.0.2', '0:0::1']) {
     assert.equal(await g.refuses(local), true, local);
     assert.equal(await js.refuses(local), true, `${local} (js)`);

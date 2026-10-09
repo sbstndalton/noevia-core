@@ -18,10 +18,13 @@
 //              want is { refused: 'ambiguous' }. The other rows keep the JS's answer, for the record
 //   toolboxes: { enabled, wire, want: null | [ids] }
 //   offered:   { enabled: null | [ids], id, wire, want: bool }
+//
+// The JS references (retired from production in #1071, so they live with the tests):
+//   tests/server/oracle/mcp-servers.cjs
 
 const path = require('node:path');
 const server = path.join(__dirname, '..', 'server');
-const { parseMcpServersJs, parseEnabledToolboxesJs, createToolboxOfferedJs } = require(path.join(server, 'mcp-servers.cjs'));
+const { parseMcpServersJs, parseEnabledToolboxesJs, createToolboxOfferedJs } = require(path.join(__dirname, '..', 'tests', 'server', 'oracle', 'mcp-servers.cjs'));
 
 function capture(fn) {
   const warn = console.warn;

@@ -38,25 +38,25 @@
 //                          ranges the caller has read; file I/O stays in the JS (GGUF_META_IMPL)
 //   - crates/policy-leaves authTokens = auth-tokens.cjs resolveAuthTokens (#294, a secret call);
 //                          toolPolicyMode/toolPolicySet = tool-policy.cjs's decision and set()
-//                          checks, the database stays in the JS (POLICY_LEAVES_IMPL)
+//                          checks, the database stays in the JS (was POLICY_LEAVES_IMPL, retired #1071)
 //   - crates/review-verdict reviewVerdictRead/reviewEventBound = code-review-verdict.cjs readVerdict
-//                          and boundReviewEvent over a tagged copy of the JS value (CODE_REVIEW_VERDICT_IMPL, #519)
+//                          and boundReviewEvent over a tagged copy of the JS value (was CODE_REVIEW_VERDICT_IMPL, retired #1071, #519)
 //   - crates/tool-exchange toolExchangeCheck/toolExchangeError = tool-exchange.cjs's pre-run checks,
-//                          dedupe key and failed-call text; the exchange stays in the JS (TOOL_EXCHANGE_IMPL)
+//                          dedupe key and failed-call text; the exchange stays in the JS (was TOOL_EXCHANGE_IMPL, retired #1071)
 //   - crates/mcp-servers   mcpServersParse/mcpToolboxes/mcpToolboxOffered = mcp-servers.cjs
-//                          parseMcpServers, parseEnabledToolboxes, toolboxOffered (MCP_SERVERS_IMPL)
+//                          parseMcpServers, parseEnabledToolboxes, toolboxOffered (was MCP_SERVERS_IMPL, retired #1071)
 //   - crates/decision      decisionInvalidRequest/decisionInvalidResult/decisionCauseOf =
-//                          decision/index.cjs's pure checks over a projection (DECISION_IMPL)
+//                          decision/index.cjs's pure checks over a projection (was DECISION_IMPL, retired #1071)
 //   - crates/code-net-guard codeNetSpec/codeNetResolved/codeNetRefuses = code-net-guard.cjs
-//                          parseCodeNetSpec, resolveOnce's address filter and refuses (CODE_NET_GUARD_IMPL)
+//                          parseCodeNetSpec, resolveOnce's address filter and refuses (was CODE_NET_GUARD_IMPL, retired #1071)
 //   - crates/role-context  roleContextProject/roleContextDossier = role-context.cjs
 //                          projectRoleContext/projectSharedDossier, a secret call (ROLE_CONTEXT_IMPL)
 //   - crates/completeness-report completenessReport = completeness-report.cjs
-//                          buildCompletenessReport and reportHash (COMPLETENESS_REPORT_IMPL)
+//                          buildCompletenessReport and reportHash (was COMPLETENESS_REPORT_IMPL, retired #1071)
 //   - crates/task-lifecycle taskLifecycleCanTransition/Transition/StageMove/Fold/Derive =
-//                          task-lifecycle.cjs's table, stage moves and journal fold (TASK_LIFECYCLE_IMPL)
+//                          task-lifecycle.cjs's table, stage moves and journal fold (was TASK_LIFECYCLE_IMPL, retired #1071)
 //   - crates/llamacpp-autoconfig llamacppAutoconfig = llamacpp-autoconfig.cjs suggest,
-//                          estimateInputs, estimateFootprint and helpers (LLAMACPP_AUTOCONFIG_IMPL)
+//                          estimateInputs, estimateFootprint and helpers (was LLAMACPP_AUTOCONFIG_IMPL, retired #1071)
 //
 // Memory: WebAssembly memory only grows. A listing or path call needs at most ~16 MiB; an upload
 // decode copies the upload in (at most 25 MiB) and holds one copy of its text (at most 3 bytes per
@@ -1848,12 +1848,13 @@ function llamacppAutoconfig(op, args) {
 // Every switch that runs this module (#996). Each reads its value as trim().toLowerCase().
 // Retired switches (#1071) are not listed: the Rust path they selected is always on, and
 // verifyAtStartup() always loads this module for it.
-const IMPL_FLAGS = ['STORAGE_PATH_IMPL', 'SECRET_ENVELOPE_IMPL', 'STREAM_GUARD_IMPL', 'GGUF_META_IMPL', 'POLICY_LEAVES_IMPL', 'CODE_REVIEW_VERDICT_IMPL', 'TOOL_EXCHANGE_IMPL', 'MCP_SERVERS_IMPL', 'DECISION_IMPL', 'CODE_NET_GUARD_IMPL', 'ROLE_CONTEXT_IMPL', 'COMPLETENESS_REPORT_IMPL', 'TASK_LIFECYCLE_IMPL', 'LLAMACPP_AUTOCONFIG_IMPL'];
+const IMPL_FLAGS = ['STORAGE_PATH_IMPL', 'SECRET_ENVELOPE_IMPL', 'STREAM_GUARD_IMPL', 'GGUF_META_IMPL', 'ROLE_CONTEXT_IMPL'];
 
 /** Switches whose JS path was deleted once Rust had run in production (#1071). The old value that
  *  selected Rust ('wasm', or 'on' for the advisor) is accepted silently; anything else is ignored
  *  with one warning, because Rust is always used. */
-const RETIRED_FLAGS = { CHAT_TEMPLATE_CAPS_IMPL: 'wasm', AUTOTUNE_PLAN_IMPL: 'wasm', PRESET_RELOAD_IMPL: 'wasm', LAYA_LOAD_ADVISOR: 'on', DAV_PARSE_IMPL: 'wasm', S3_PARSE_IMPL: 'wasm', MCP_FRAME_IMPL: 'wasm', UPLOAD_SNIFF_IMPL: 'wasm', S3_SIGN_IMPL: 'wasm', PROMPT_FRAMING_IMPL: 'wasm', SSRF_IMPL: 'wasm' };
+const RETIRED_FLAGS = { CHAT_TEMPLATE_CAPS_IMPL: 'wasm', AUTOTUNE_PLAN_IMPL: 'wasm', PRESET_RELOAD_IMPL: 'wasm', LAYA_LOAD_ADVISOR: 'on', DAV_PARSE_IMPL: 'wasm', S3_PARSE_IMPL: 'wasm', MCP_FRAME_IMPL: 'wasm', UPLOAD_SNIFF_IMPL: 'wasm', S3_SIGN_IMPL: 'wasm', PROMPT_FRAMING_IMPL: 'wasm', SSRF_IMPL: 'wasm',
+  POLICY_LEAVES_IMPL: 'wasm', CODE_REVIEW_VERDICT_IMPL: 'wasm', TOOL_EXCHANGE_IMPL: 'wasm', DECISION_IMPL: 'wasm', COMPLETENESS_REPORT_IMPL: 'wasm', TASK_LIFECYCLE_IMPL: 'wasm', MCP_SERVERS_IMPL: 'wasm', CODE_NET_GUARD_IMPL: 'wasm', LLAMACPP_AUTOCONFIG_IMPL: 'wasm' };
 
 /** Log one warning per retired switch that `env` still sets to something other than its old
  *  Rust-selecting value (for example =js). Returns the names warned about. Never throws. */

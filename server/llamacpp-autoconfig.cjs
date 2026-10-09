@@ -250,10 +250,9 @@ function parseMemoryLimit(value) {
   return Number(match[1]) * scale;
 }
 
-// ── LLAMACPP_AUTOCONFIG_IMPL ────────────────────────────────────────────────────────────────
-// js (default; any other value means js, with one warning) or wasm, read from the `env` option
-// (process.env) on every call. wasm also asks noevia-rs's llamacpp-autoconfig crate (dav-parse.wasm
-// llamacpp_autoconfig) for suggest, estimateInputs and estimateFootprint. The JS stays authoritative:
+// ── Rust confirmation (LLAMACPP_AUTOCONFIG_IMPL, retired in #1071: always on) ────────────────
+// suggest, estimateInputs and estimateFootprint also ask noevia-rs's llamacpp-autoconfig crate
+// (dav-parse.wasm llamacpp_autoconfig). The JS (suggestJs and friends) stays authoritative:
 // its answer is returned as is when the port's reply is byte-identical to JSON.stringify of it. When
 // the port refuses, faults or disagrees, the JS answer is still returned if it is the conservative
 // one (logged once per reason, text-free):
@@ -269,39 +268,25 @@ function parseMemoryLimit(value) {
 // Otherwise suggest returns an error (no settings, code 'autoconfig_impl') and the two estimates
 // throw an AutoconfigImplError, which llamacpp-manager.cjs turns into a refused load or save (or a
 // 503 for the read-only panel). So the port never makes a suggestion or a load larger than the JS
-// would, and nothing here loads a model. When the JS throws, the port is not asked. The flag is in
-// dav-parse-wasm.cjs IMPL_FLAGS (a missing or tampered module stops startup).
+// would, and nothing here loads a model. When the JS throws, the port is not asked. A missing or
+// tampered dav-parse.wasm stops startup.
 // cacheRamMibOf, isPromptCacheFree, parseMemoryLimit and kvCacheBytes are ported too (and checked by
 // the differential tests) but not switched: their switched callers above verify their results.
 // Stricter than the JS (the crate docs): see llamacpp-autoconfig-differential.test.cjs's strict
 // table; those inputs are a port refusal, handled as above.
 
-const IMPLS = new Set(['js', 'wasm']);
-let warnedImpl = '';
-/** LLAMACPP_AUTOCONFIG_IMPL: 'js' (default) or 'wasm'. */
-function autoconfigImpl(env = process.env) {
-  const raw = env?.LLAMACPP_AUTOCONFIG_IMPL;
-  if (raw === undefined || raw === '') return 'js';
-  const value = String(raw).trim().toLowerCase();
-  if (IMPLS.has(value)) return value;
-  if (warnedImpl !== value) {
-    warnedImpl = value;
-    console.warn(`[llamacpp-autoconfig] LLAMACPP_AUTOCONFIG_IMPL=${JSON.stringify(String(raw))} is not js or wasm; using js`);
-  }
-  return 'js';
-}
 const defaultLoader = () => require('./dav-parse-wasm.cjs');
 
 /** The port could not confirm an estimate and the JS one is not the conservative answer. */
 class AutoconfigImplError extends Error {
   constructor(what) {
-    super(`the memory estimate (${what}) could not be confirmed by the Rust sizing port (LLAMACPP_AUTOCONFIG_IMPL=wasm), and the JS estimate is not the larger one. Set LLAMACPP_AUTOCONFIG_IMPL=js to size with the JS alone.`);
+    super(`the memory estimate (${what}) could not be confirmed by the Rust sizing port, and the JS estimate is not the larger one.`);
     this.name = 'AutoconfigImplError';
     this.code = 'autoconfig_impl';
     this.status = 503;
   }
 }
-const IMPL_SUGGEST_ERROR = 'No settings suggested: the Rust sizing port (LLAMACPP_AUTOCONFIG_IMPL=wasm) did not confirm this suggestion and the JS one is not the smaller. Set LLAMACPP_AUTOCONFIG_IMPL=js, or size the context manually and load-test it.';
+const IMPL_SUGGEST_ERROR = 'No settings suggested: the Rust sizing port did not confirm this suggestion and the JS one is not the smaller. Size the context manually and load-test it.';
 
 const warnedPort = new Set();
 function portWarn(fn, event, reason) {
@@ -375,31 +360,27 @@ function disagreement(fn, op, args, js, conservative, wasmLoader) {
 }
 
 /**
- * suggestJs, with LLAMACPP_AUTOCONFIG_IMPL=wasm confirmed by the Rust port (see above).
- * Options: `env`, `impl`, `wasmLoader`.
+ * suggestJs, confirmed by the Rust port (see above). Option: `wasmLoader`.
  */
-function suggest(args, { env = process.env, impl = autoconfigImpl(env), wasmLoader = defaultLoader } = {}) {
+function suggest(args, { wasmLoader = defaultLoader } = {}) {
   const js = suggestJs(args);
-  if (impl !== 'wasm') return js;
   const why = disagreement('suggest', 1, args, js, suggestionIsConservative, wasmLoader);
   return why ? { error: IMPL_SUGGEST_ERROR, code: 'autoconfig_impl', unverified: why } : js;
 }
 
 /** estimateInputsJs, confirmed as suggest is; throws an AutoconfigImplError when it cannot be. */
-function estimateInputs(args, { env = process.env, impl = autoconfigImpl(env), wasmLoader = defaultLoader } = {}) {
+function estimateInputs(args, { wasmLoader = defaultLoader } = {}) {
   const js = estimateInputsJs(args);
-  if (impl !== 'wasm') return js;
   if (disagreement('estimateInputs', 2, args, js, inputsAreConservative, wasmLoader)) throw new AutoconfigImplError('Will it fit?');
   return js;
 }
 
 /** estimateFootprintJs, confirmed as suggest is; throws an AutoconfigImplError when it cannot be. */
-function estimateFootprint(args, { env = process.env, impl = autoconfigImpl(env), wasmLoader = defaultLoader } = {}) {
+function estimateFootprint(args, { wasmLoader = defaultLoader } = {}) {
   const js = estimateFootprintJs(args);
-  if (impl !== 'wasm') return js;
   if (disagreement('estimateFootprint', 3, args, js, footprintIsConservative, wasmLoader)) throw new AutoconfigImplError('load footprint');
   return js;
 }
 
-module.exports = { isPromptCacheFree, suggest, suggestJs, estimateInputs, estimateInputsJs, estimateFootprint, estimateFootprintJs, autoconfigImpl, AutoconfigImplError,
+module.exports = { isPromptCacheFree, suggest, suggestJs, estimateInputs, estimateInputsJs, estimateFootprint, estimateFootprintJs, AutoconfigImplError,
   suggestionIsConservative, footprintIsConservative, inputsAreConservative, cacheRamMibOf, kvCacheBytes, parseMemoryLimit, CTX_CANDIDATES, KV_TYPE_BYTES, LLAMA_CACHE_RAM_DEFAULT_MIB };
