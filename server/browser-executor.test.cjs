@@ -222,3 +222,20 @@ test('two downloads at once keep both files, each under its own number', async (
   assert.equal(new Set(saved).size, 2, 'distinct paths');
   assert.deepEqual(s.executor.state(s.id).downloads.map((d) => path.basename(d.path)).sort(), ['1-r.csv', '2-r.csv']);
 });
+
+test('#1218: describeInPage reports a button’s DOM type (its real state), other elements’ attribute', () => {
+  const { describeInPage } = require('./browser-executor.cjs');
+  const node = (tagName, attrs, type) => ({ tagName, type, closest: () => null, labels: [], form: { getAttribute: () => 'post', action: 'https://example.com/f' },
+    getAttribute: (k) => (k in attrs ? attrs[k] : null), innerText: 'Next' });
+  const saved = globalThis.location;
+  globalThis.location = { origin: 'https://example.com' };
+  try {
+    // The DOM maps an invalid, padded or full-width type attribute to 'submit'.
+    for (const attr of ['x', ' button', 'ｂｕｔｔｏｎ']) assert.equal(describeInPage(node('BUTTON', { type: attr }, 'submit')).type, 'submit', attr);
+    assert.equal(describeInPage(node('BUTTON', { type: 'button' }, 'button')).type, 'button');
+    assert.equal(describeInPage(node('INPUT', { type: 'Submit' }, 'submit')).type, 'Submit');
+    assert.equal(describeInPage(node('A', {}, undefined)).type, '');
+  } finally {
+    globalThis.location = saved;
+  }
+});

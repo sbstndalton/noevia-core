@@ -18,7 +18,7 @@ const wasmFile = process.env.DAV_PARSE_WASM || davParseWasm.DEFAULT_WASM;
 const skipWasm = !fs.existsSync(wasmFile) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built';
 
 test('wasmFlags lists exactly the switches set to wasm, read as the switches read them', () => {
-  assert.deepEqual(davParseWasm.IMPL_FLAGS, ['STORAGE_PATH_IMPL', 'SECRET_ENVELOPE_IMPL', 'STREAM_GUARD_IMPL', 'GGUF_META_IMPL', 'ROLE_CONTEXT_IMPL', 'CODE_ACTIONS_IMPL', 'PROJECT_FILE_NAMES_IMPL', 'PROVIDER_EGRESS_IMPL']);
+  assert.deepEqual(davParseWasm.IMPL_FLAGS, ['STORAGE_PATH_IMPL', 'SECRET_ENVELOPE_IMPL', 'STREAM_GUARD_IMPL', 'GGUF_META_IMPL', 'ROLE_CONTEXT_IMPL', 'CODE_ACTIONS_IMPL', 'PROJECT_FILE_NAMES_IMPL', 'PROVIDER_EGRESS_IMPL', 'BROWSER_POLICY_IMPL']);
   assert.deepEqual(davParseWasm.wasmFlags({}), []);
   assert.deepEqual(davParseWasm.wasmFlags({ STORAGE_PATH_IMPL: 'js', GGUF_META_IMPL: 'rust', STREAM_GUARD_IMPL: '' }), []);
   assert.deepEqual(davParseWasm.wasmFlags({ SECRET_ENVELOPE_IMPL: ' WASM ', STORAGE_PATH_IMPL: 'wasm' }), ['STORAGE_PATH_IMPL', 'SECRET_ENVELOPE_IMPL']);
@@ -70,7 +70,7 @@ test('the nine switches retired in #1071 batch 3: =wasm is silent, anything else
   assert.deepEqual(warnings, batch3.map((f) => `${f} is retired; Rust is always used`));
   assert.deepEqual(davParseWasm.wasmFlags(Object.fromEntries(batch3.map((f) => [f, 'wasm']))), []);
   // The switches left are exactly the ones this batch did not touch.
-  assert.deepEqual(davParseWasm.IMPL_FLAGS, ['STORAGE_PATH_IMPL', 'SECRET_ENVELOPE_IMPL', 'STREAM_GUARD_IMPL', 'GGUF_META_IMPL', 'ROLE_CONTEXT_IMPL', 'CODE_ACTIONS_IMPL', 'PROJECT_FILE_NAMES_IMPL', 'PROVIDER_EGRESS_IMPL']);
+  assert.deepEqual(davParseWasm.IMPL_FLAGS, ['STORAGE_PATH_IMPL', 'SECRET_ENVELOPE_IMPL', 'STREAM_GUARD_IMPL', 'GGUF_META_IMPL', 'ROLE_CONTEXT_IMPL', 'CODE_ACTIONS_IMPL', 'PROJECT_FILE_NAMES_IMPL', 'PROVIDER_EGRESS_IMPL', 'BROWSER_POLICY_IMPL']);
 });
 
 test('a wasm switch with a missing or tampered module throws, naming the switch and the reason', (t) => {

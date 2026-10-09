@@ -65,3 +65,23 @@ test('secrets are substituted only on their own site, and never shown back', () 
   assert.equal(substituteSecrets('plain text', secrets, 'https://github.com').value, 'plain text');
   assert.equal(maskSecrets('saw ghp_abcdef123456 in page', secrets), 'saw {{secret:github_token}} in page');
 });
+
+test('#1218: a form <button> submits unless its type is exactly button or reset', () => {
+  for (const type of ['', 'submit', 'x', 'buton', ' button', 'button ', 'ｂｕｔｔｏｎ', 'reset ']) {
+    assert.equal(status({ type: 'click', element: { tag: 'button', type, inForm: true, text: 'Next' } }), 'needs_approval', JSON.stringify(type));
+    assert.equal(status({ type: 'press', key: 'Enter', element: { tag: 'button', type, inForm: true, text: 'Next' } }), 'needs_approval', JSON.stringify(type));
+  }
+  for (const type of ['button', 'BUTTON', 'reset', 'Reset']) {
+    assert.equal(status({ type: 'click', element: { tag: 'button', type, inForm: true, text: 'Next' } }), 'allow', type);
+  }
+  assert.equal(status({ type: 'click', element: { tag: 'button', type: 'x', inForm: false, text: 'Next' } }), 'allow', 'outside a form');
+});
+
+test('#1219: local names with trailing dots are local', () => {
+  for (const [url, domains] of [['http://corp.internal./', ['corp.internal']], ['http://localhost../', ['localhost']],
+    ['http://nas.local.:8080/', ['nas.local']], ['https://a.localhost./', ['localhost']]]) {
+    assert.deepEqual(checkNavigation(url, domains), { ok: false, reason: 'Local addresses are not opened.' }, url);
+    assert.equal(classifyAction({ type: 'navigate', url }, { allowedDomains: domains }).status, 'blocked', url);
+  }
+  assert.equal(checkNavigation('https://example.com./', ['example.com']).ok, true, 'a public name with a trailing dot still opens');
+});
