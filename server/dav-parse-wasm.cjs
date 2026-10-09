@@ -1090,7 +1090,7 @@ function s3Refusal(status, bytes) {
   return new DavParseError(`s3 request refused by dav-parse (${status === 2 ? 'input' : code})`, status === 2 ? 'input' : code);
 }
 
-/** s3-sign.cjs signS3RequestJs, through the module (always, #1071). Same arguments and the
+/** tests/server/oracle/s3-sign.cjs signS3RequestJs, through the module (always, #1071). Same arguments and the
  *  same headers object (same keys, same order). `url` is what the JS reads: a string `host` and
  *  `pathname` and a URLSearchParams `searchParams` (a URL). The method, secret and payload are
  *  passed as UTF-8 (a lone surrogate as U+FFFD, exactly what the JS hashes). Text echoed in the
