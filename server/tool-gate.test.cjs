@@ -160,3 +160,24 @@ test('a tool name offered by two boxes is one option and one decision', async ()
   assert.deepEqual(seen.options.map((o) => o.id), ['core_time', 'none']);
   assert.equal(r.decision.tool, 'core_time');
 });
+
+test('#1223: a long run of trailing punctuation after a URL is stripped in linear time', async () => {
+  const { createToolGate } = require('./tool-gate.cjs');
+  const g = createToolGate({ enabled: () => true, decide: async () => ({ source: 'fallback' }), isWriteTool: () => false, log: () => {} });
+  const tools = [{ type: 'function', function: { name: 'web_fetch', parameters: { properties: { url: {} } } } }];
+  const message = `see http://a.com/${'.,'.repeat(100_000)}x`;
+  const started = Date.now();
+  const out = await g.evaluate(message, tools);
+  assert.ok(Date.now() - started < 1000, `${Date.now() - started} ms`); // loose for shared runners; was ~10 s
+  assert.equal(out.decision.mode, 'prefetch');
+  assert.equal(require('./tool-gate.cjs').searchQuery(`news${'?!.'.repeat(30)}`), 'news');
+});
+
+test('#1224: a host with an empty label is never a public URL pattern', () => {
+  const { publicUrlPattern } = require('./tool-gate.cjs');
+  for (const u of ['http://nas.local../x', 'http://corp.internal../', 'http://10.0.0.1../x', 'http://intranet../x', 'http://a..b.com/', 'http://../']) {
+    assert.equal(publicUrlPattern(u), false, u);
+  }
+  assert.equal(publicUrlPattern('https://example.com./a'), true);
+  assert.equal(publicUrlPattern('https://example.com/a'), true);
+});

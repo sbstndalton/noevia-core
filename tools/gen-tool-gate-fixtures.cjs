@@ -18,8 +18,8 @@
 // whatever this runtime's IDNA says); an IP literal appears only where it is private (isPrivateIp
 // is the Rust port and fails closed to private without the module, so the answer is the same
 // either way). A row without `strict` is the JS's own answer. A `strict` row is where the port is
-// stricter by design (see noevia-rs crates/tool-gate): a URL that is not ASCII, has an xn-- label,
-// or names a local host behind more than one trailing dot is required, not prefetched. Its `want`
+// stricter by design (see noevia-rs crates/tool-gate): a URL that is not ASCII or has an xn-- label
+// is required, not prefetched. Its `want`
 // is computed here and the generator checks it never forces more than the JS.
 
 const path = require('node:path');
@@ -39,20 +39,13 @@ const pick = (list) => list[Math.floor(rand() * list.length)];
 
 // ── The port's stricter URL rule, mirrored ──────────────────────────────────
 const PRIVATE_LITERALS = new Set(['127.0.0.1', '10.0.0.5', '192.168.1.1', '172.16.0.1', '169.254.169.254', '0.0.0.0', '::1', '::', 'fe80::1', 'fc00::1', '::ffff:7f00:1', '127.0.0.2']);
-const LOCAL = /(^|\.)(localhost|local|internal|lan|home\.arpa|intranet|corp)$/i;
 let touched = false;
 // A URL whose answer could depend on this runtime's IDNA tables: never public to the port, and its
 // rows are always marked strict (whatever the JS says here), so the file is the same on every ICU.
 const risky = (raw) => /[^\x00-\x7f]/.test(raw) || /xn--/i.test(raw);
 function portPublic(raw) {
   if (risky(raw)) { touched = true; return false; }
-  const js = tg.publicUrlPattern(raw);
-  if (!js) return false;
-  const host = new URL(raw).hostname.replace(/^\[|\]$/g, '').toLowerCase();
-  const bare = host.replace(/\.+$/, '');
-  const port = bare !== '' && bare.includes('.') && !LOCAL.test(bare);
-  if (!port) touched = true;
-  return port;
+  return tg.publicUrlPattern(raw);
 }
 const URL_RE = /\bhttps?:\/\/[^\s<>"')\]]+/i;
 const riskyMessage = (m) => { const u = String(m).match(URL_RE)?.[0]; return !!u && risky(u); };
@@ -144,7 +137,7 @@ const URLS = ['https://example.com/a', 'https://example.com/a.', 'https://exampl
   'https://ex%61mple.com/', 'https://exa%2Emple.com/', 'https://xn--exmple-cua.com/', 'https://XN--exmple-cua.com/', 'https://a.xn--p1ai/',
   'https://exämple.com/', 'https://例え.jp/', 'https://example.com/ü', 'https://ex\ud800ample.com/', 'http://example.com:99999/', 'http://exa_mple.com/',
   'http://example.com\\x', 'https://' + 'a.'.repeat(40) + 'example.com/', 'https://example.com/' + 'p'.repeat(2000), 'http://example.com.:80/',
-  'http:example.com', 'http://-/', 'https://a-.example.com/', 'https://docs.python.org/3/', 'http://1.2.3.4.5/', 'http://256.0.0.1/', 'http://foo.0x10/'];
+  'http:example.com', 'http://-/', 'https://a-.example.com/', 'https://docs.python.org/3/', 'http://1.2.3.4.5/', 'http://256.0.0.1/', 'http://foo.0x10/', 'http://10.0.0.1../x', 'http://intranet../x'];
 
 const MESSAGES = [
   'hello there', 'What is 2+2?', '', '   ', 'Can you search the web for the latest news on Rust?', 'look up the weather in Paris', 'lookup flights',

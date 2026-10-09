@@ -75,9 +75,18 @@ function publicUrlPattern(raw) {
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return false;
   const host = url.hostname.replace(/^\[|\]$/g, '').replace(/\.$/, '').toLowerCase();
   if (!host) return false;
+  // #1224: an empty label (`nas.local..`, `10.0.0.1..`, which WHATWG parses as a name) is not public.
+  if (host.split('.').some((l) => !l)) return false;
   if (require('node:net').isIP(host)) return !require('./ssrf.cjs').isPrivateIp(host);
   if (!host.includes('.') || LOCAL_SUFFIX_RE.test(host)) return false;
   return true;
+}
+
+/** `.replace(/[set]+$/, '')` as one backwards scan (#1223: the regex is quadratic in V8). */
+function stripTrailing(s, set) {
+  let e = s.length;
+  while (e > 0 && set.includes(s[e - 1])) e--;
+  return s.slice(0, e);
 }
 
 const pad = (n) => String(n).padStart(2, '0');
@@ -85,7 +94,7 @@ const monthKey = (d) => `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}`;
 
 /** A search query from the message: filler words and trailing punctuation removed. */
 function searchQuery(message) {
-  const q = String(message || '').replace(FILLER_RE, ' ').replace(/[?!.]+$/g, '').replace(/\s+/g, ' ').trim();
+  const q = stripTrailing(String(message || '').replace(FILLER_RE, ' '), '?!.').replace(/\s+/g, ' ').trim();
   return (q || String(message || '').trim()).slice(0, 300);
 }
 
@@ -114,7 +123,8 @@ function deriveArgs(kind, tool, message, now, stage = 'rule') {
   const props = propsOf(tool), required = requiredOf(tool);
   const fits = (args) => required.every((k) => Object.hasOwn(args, k)) && Object.keys(args).every((k) => Object.hasOwn(props, k) || !Object.keys(props).length) ? args : null;
   if (kind === 'url') {
-    const url = String(message).match(URL_RE)?.[0].replace(/[.,;:!?]+$/, '');
+    const match = String(message).match(URL_RE)?.[0];
+    const url = match === undefined ? undefined : stripTrailing(match, '.,;:!?');
     if (!url || !publicUrlPattern(url)) return null;
     if (props.urls) return fits({ urls: [url] });
     if (props.url) return fits({ url });
