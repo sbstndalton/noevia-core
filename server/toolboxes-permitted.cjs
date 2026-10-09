@@ -40,7 +40,7 @@ const REASONS = {
   codeOff: 'The coding harness is off on this server.',
   codeNeedsProject: 'Open a project chat to run a Cowork task.',
   codeNoRepository: 'No repository is registered on this server.',
-  unchecked: 'This could not be double-checked on this server, so it is not offered.',
+  unchecked: "This tool's permission couldn't be checked, so it's unavailable for now.",
 };
 
 /**
