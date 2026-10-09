@@ -157,6 +157,7 @@ function boundAuthorityEvent(id, type, data, current, known) {
     const report = buildCompletenessReport({ job: { ...revisionWindow(current, known), id }, expectedArtifacts: expected ?? null });
     if (!canEnterReviewing(report)) {
       const open = report.checks.filter((c) => c.status !== 'pass').map((c) => `${c.name}: ${c.status}`);
+      if (report.unverified) open.push(`unverified: ${report.unverified}`); // COMPLETENESS_REPORT_IMPL=wasm
       throw lifecycleConflict(`The completeness report does not allow review (${open.join('; ')})`);
     }
     out.reportHash = reportHash(report);
