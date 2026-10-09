@@ -132,7 +132,13 @@ function boundAuthorityEvent(id, type, data, current, known) {
   let state;
   try { state = taskLifecycle.foldEvents(current, taskLifecycle.INITIAL_STATE, { authoritative: true }); }
   catch (error) {
-    if (error instanceof taskLifecycle.TaskLifecycleError) throw lifecycleConflict('This task’s lifecycle journal is inconsistent; review required');
+    // A TASK_LIFECYCLE_IMPL refusal (impl_refused / impl_mismatch) says nothing about the journal
+    // itself (#1127).
+    if (error instanceof taskLifecycle.TaskLifecycleError) {
+      throw lifecycleConflict(String(error.code || '').startsWith('impl_')
+        ? 'This task’s lifecycle could not be verified; review required'
+        : 'This task’s lifecycle journal is inconsistent; review required');
+    }
     throw error;
   }
   const revision = known.revision?.n ?? 0;

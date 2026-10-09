@@ -6,7 +6,7 @@
 // JS itself (synthetic journals only). Here every row runs through dav-parse.wasm's task_lifecycle
 // and through the switched functions; then seeded live journals with non-ASCII text against the
 // runtime's own JS: the port either agrees or refuses, the switched answer is always the JS one or
-// a refusal, and false refusals are counted (none expected outside the strict rows). The
+// a refusal, and false refusals are counted (none expected). The
 // WebAssembly half needs server/wasm/dav-parse.wasm (or DAV_PARSE_WASM); skipped without it unless
 // DAV_PARSE_WASM_REQUIRED=1.
 
@@ -68,22 +68,6 @@ test('fold and derive rows: the same states and throw codes', { skip: skipWasm }
   }
 });
 
-test('strict rows: the port refuses as ambiguous; the switched derive refuses', { skip: skipWasm }, () => {
-  for (const [i, row] of fixtures.strict.entries()) {
-    const [events] = JSON.parse(row.wire);
-    assert.deepStrictEqual(row.want, { refused: 'ambiguous' });
-    assert.throws(() => davParseWasm.taskLifecycleDerive(events), { reason: 'ambiguous' }, `strict ${i}`);
-    // Where the JS throws itself (a TypeError, or report_hash for [h, h]) that error stands;
-    // where it answers (a [hash] passes String()), the switched call refuses.
-    let jsError = null;
-    try { lc.deriveLifecycle(events, JS); } catch (e) { jsError = e; }
-    quietly(() => assert.throws(() => lc.deriveLifecycle(events, WASM),
-      (e) => (jsError ? e.constructor === jsError.constructor && e.code === jsError.code : e.code === 'impl_refused'), `strict ${i}`));
-    if (!jsError || jsError instanceof lc.TaskLifecycleError) quietly(() => assert.equal(lc.safeDeriveLifecycle(events, WASM), null, `strict ${i}`));
-    else assert.throws(() => lc.safeDeriveLifecycle(events, WASM), TypeError, `strict ${i}`);
-  }
-});
-
 // Seeded live journals: the fixture vocabulary plus non-ASCII and odd text the table avoids.
 function mulberry32(seed) {
   return () => {
@@ -135,8 +119,45 @@ test('600 seeded live journals: the switched answer is the JS one or a refusal; 
   assert.ok(agreed >= 100, `${agreed}`);
 });
 
+test('#1126: a journal with over 8 MiB of tool payloads still confirms; the port sees only the fold input', { skip: skipWasm }, () => {
+  const payload = 'p'.repeat(1024 * 1024);
+  const events = [{ type: 'job.created', data: { kind: 'code' } }, { type: 'job.started' },
+    ...Array.from({ length: 10 }, (_, i) => ({ type: 'tool.completed', data: { i, output: payload } })), { type: 'job.completed' }];
+  assert.ok(JSON.stringify(events).length > davParseWasm.MAX_TASK_LIFECYCLE_BYTES);
+  assert.equal(lc.deriveLifecycle(events, WASM), 'verifying');
+  assert.equal(lc.foldEvents(events, 'planned', WASM), 'verifying');
+  assert.equal(lc.confirmFold(events, 'verifying', WASM), 'verifying');
+});
+
+test('#1126: 5,000 appends under wasm stay close to the js cost (no quadratic re-send)', { skip: skipWasm }, () => {
+  const os = require('node:os');
+  const { createJobs } = require('../../server/jobs.cjs');
+  const run = (impl) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-tl-diff-'));
+    const saved = process.env.TASK_LIFECYCLE_IMPL;
+    process.env.TASK_LIFECYCLE_IMPL = impl;
+    try {
+      const jobs = createJobs({ dir, kinds: ['code'], maxJobs: 10 });
+      const id = jobs.create({ kind: 'code', projectId: 'p-synthetic', capabilities: ['read'] });
+      jobs.append(id, 'job.started', {});
+      const started = process.hrtime.bigint();
+      for (let i = 0; i < 5000; i++) jobs.append(id, i % 50 ? 'tool.completed' : 'progress', i % 50 ? { i, output: 'o'.repeat(512) } : { stage: 'implementing' });
+      const ms = Number(process.hrtime.bigint() - started) / 1e6;
+      return { ms, lifecycle: jobs.get(id).lifecycle };
+    } finally {
+      if (saved === undefined) delete process.env.TASK_LIFECYCLE_IMPL; else process.env.TASK_LIFECYCLE_IMPL = saved;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  };
+  const js = run('js'), w = run('wasm');
+  assert.equal(js.lifecycle, 'implementing');
+  assert.equal(w.lifecycle, 'implementing');
+  assert.ok(w.ms < js.ms * 1.5 + 3000, `wasm ${Math.round(w.ms)} ms vs js ${Math.round(js.ms)} ms`);
+});
+
 test('an over-size journal is refused (too_large), the JS answer is not', { skip: skipWasm }, () => {
-  const events = [{ type: 'job.started', data: { note: 'x'.repeat(davParseWasm.MAX_TASK_LIFECYCLE_BYTES) } }];
+  // Over the cap in the fold input itself (a progress stage the fold reads).
+  const events = [{ type: 'job.started' }, { type: 'progress', data: { stage: 'x'.repeat(davParseWasm.MAX_TASK_LIFECYCLE_BYTES) } }];
   assert.throws(() => davParseWasm.taskLifecycleDerive(events), { reason: 'too_large' });
   assert.equal(lc.deriveLifecycle(events, JS), 'implementing');
   quietly(() => assert.equal(lc.safeDeriveLifecycle(events, WASM), null));

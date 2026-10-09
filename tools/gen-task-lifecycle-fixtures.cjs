@@ -9,9 +9,9 @@
 // Every expectation is what the JS itself returns or throws (TaskLifecycleError's code), with
 // TASK_LIFECYCLE_IMPL=js. Journals are synthetic (no Diary or user text) and the random ones come
 // from a seeded mulberry32, so the table is the same on every Node version. Nothing here depends on
-// ICU, locale or number formatting (#1115): states and types compare as code units. Rows where the
-// JS runs a reportHash array or object through String() record no JS answer: they sit in `strict`
-// with want { refused: 'ambiguous' }.
+// ICU, locale or number formatting (#1115): states and types compare as code units. A reportHash
+// that is not a string (an array, an object with its own toString) is refused by the JS itself since
+// #1125, so those rows carry the JS answer like any other.
 //
 // Sections:
 // Each row is { wire, want }: `wire` is the request JSON (JSON.parse it for the arguments).
@@ -19,7 +19,6 @@
 //           stageMove: { state } | { throws } }                                  ops 1, 2, 3
 //   folds:  wire [events, from, authoritative], want { state } | { throws }      op 4
 //   derive: wire [events], want { state } | { throws }                           op 5
-//   strict: wire [events], want { refused: 'ambiguous' }                         op 5
 
 const path = require('node:path');
 const lifecycle = require(path.join(__dirname, '..', 'server', 'task-lifecycle.cjs'));
@@ -145,7 +144,12 @@ function randomJournal() {
 }
 const SEEDED = Array.from({ length: 300 }, randomJournal);
 
-const derive = [...HAND, ...SEEDED].map((events) => ({
+// A reportHash that is not a string (#1125): before, String() let [hash] through and an own
+// toString key threw a TypeError; now each is a report_hash refusal.
+const NON_STRING_HASHES = [[HASH], [[HASH]], [HASH, HASH], {}, { toString: HASH }, { valueOf: HASH }, []]
+  .map((reportHash) => [stage('planned', 'implementing'), stage('implementing', 'reviewing', { reportHash })]);
+
+const derive = [...HAND, ...NON_STRING_HASHES, ...SEEDED].map((events) => ({
   wire: JSON.stringify([events]), want: answer(() => lifecycle.deriveLifecycle(events, JS), 'state'),
 }));
 derive.push({ wire: JSON.stringify([null]), want: answer(() => lifecycle.deriveLifecycle(null, JS), 'state') });
@@ -164,13 +168,6 @@ for (const from of ODD) {
     want: answer(() => lifecycle.foldEvents([], from, JS), 'state') });
 }
 
-// A reportHash the JS reads through String(): [hash] passes, an own toString key throws a
-// TypeError. No JS answer is recorded; the port refuses.
-const STRICT_HASHES = [[HASH], [[HASH]], [HASH, HASH], {}, { toString: HASH }, { valueOf: HASH }, []];
-const strict = STRICT_HASHES.map((reportHash) => {
-  const events = [stage('planned', 'implementing'), stage('implementing', 'reviewing', { reportHash })];
-  return { wire: JSON.stringify([events]), want: { refused: 'ambiguous' } };
-});
 
 const counts = (rows) => rows.reduce((m, r) => { const k = r.want.state ?? r.want.throws; m[k] = (m[k] || 0) + 1; return m; }, {});
 const c = counts(derive);
@@ -178,4 +175,4 @@ for (const k of ['planned', 'implementing', 'verifying', 'reviewing', 'merged', 
   if (!c[k]) throw Error(`derive rows never reach ${k}`);
 }
 
-process.stdout.write(`${JSON.stringify({ version: 1, pairs, folds, derive, strict })}\n`);
+process.stdout.write(`${JSON.stringify({ version: 1, pairs, folds, derive })}\n`);

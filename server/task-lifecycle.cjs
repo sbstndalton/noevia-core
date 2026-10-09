@@ -61,9 +61,11 @@
 // so jobs.cjs's existing paths refuse the stage write and derive no lifecycle (null). step() is
 // the JS alone; jobs.cjs derive() confirms its whole fold once through confirmFold(). The flag is
 // in dav-parse-wasm.cjs IMPL_FLAGS (a missing or tampered module stops startup).
-// Stricter than the JS (the crate docs): a journal over 8 MiB as JSON, one JSON.stringify cannot
-// write, and a task.stage entering reviewing whose reportHash is an array or object (the JS reads
-// it through String()) are refused. canTransitionToReviewing's completeness half
+// The port is sent only what the fold reads (#1126, foldInput): the event types that can move the
+// lifecycle or make a journal authoritative, each with only the data fields step() reads, so a large
+// tool payload costs nothing and is never re-sent. Every dropped event is a no-op in both modes.
+// Stricter than the JS (the crate docs): fold input over 8 MiB as JSON, or one JSON.stringify cannot
+// write, is refused. canTransitionToReviewing's completeness half
 // (completeness-report.cjs canEnterReviewing) is not part of this port.
 
 const { canEnterReviewing } = require('./completeness-report.cjs');
@@ -215,7 +217,9 @@ function stageStep(state, data) {
   if (data.from !== state) {
     throw new TaskLifecycleError(`Stale task-lifecycle stage: recorded from ${JSON.stringify(data.from)} but the task is ${state}`, { from: data.from, to: data.to, code: 'stale' });
   }
-  if (data.to === 'reviewing' && data.to !== state && !REPORT_HASH.test(String(data.reportHash || ''))) {
+  // Only a string can be a report hash (#1125): an array or object is refused here as itself, never
+  // run through String() (where [hash] would pass and an own toString key would throw a TypeError).
+  if (data.to === 'reviewing' && data.to !== state && (typeof data.reportHash !== 'string' || !REPORT_HASH.test(data.reportHash))) {
     throw new TaskLifecycleError('Entering reviewing needs the hash of the completeness report that allowed it', { from: state, to: data.to, code: 'report_hash' });
   }
   return assertStageMoveJs(state, data.to);
@@ -286,6 +290,26 @@ function askPort(ask) {
   }
 }
 
+// What the fold reads (#1126). Any other event type is a no-op in both modes (see step()), and these
+// are the only data fields step() reads, each read as step() reads it (`(event.data || {})[k]`).
+const FOLD_FIELDS = new Map([['task.stage', ['from', 'to', 'reportHash']], ['task.revision', []], ['job.started', []],
+  ['progress', ['stage']], ['job.completed', []], ['job.failed', []], ['job.cancelled', []], ['job.interrupted', []]]);
+/** The port's view of `events`: `null` for none, a non-array as is (the host refuses it). */
+function foldInput(events) {
+  if (events === undefined || events === null) return null;
+  if (!Array.isArray(events)) return events;
+  const out = [];
+  for (const event of events) {
+    if (!event || typeof event.type !== 'string' || !FOLD_FIELDS.has(event.type)) continue;
+    const fields = FOLD_FIELDS.get(event.type);
+    if (!fields.length) { out.push({ type: event.type }); continue; }
+    const data = event.data || {}, kept = {};
+    for (const k of fields) { const v = data[k]; if (v !== undefined) kept[k] = v; }
+    out.push({ type: event.type, data: kept });
+  }
+  return out;
+}
+
 // The JS answer `state` stands only if the port gives the same state. Throws otherwise.
 function confirmState(ask, state) {
   const port = askPort(ask);
@@ -330,7 +354,7 @@ function foldEvents(events, fromState = INITIAL_STATE, options = {}) {
   const { wasmLoader = defaultLoader, ...opts } = options || {};
   const state = foldEventsJs(events, fromState, options);
   if (implOf(opts) !== 'wasm') return state;
-  return confirmState(() => wasmLoader().taskLifecycleFold(events ?? null, fromState, Boolean(opts.authoritative)), state);
+  return confirmState(() => wasmLoader().taskLifecycleFold(foldInput(events), fromState, Boolean(opts.authoritative)), state);
 }
 
 /** For a caller that folded `events` itself with step() from INITIAL_STATE (jobs.cjs derive()):
@@ -340,7 +364,7 @@ function confirmFold(events, state, options = {}) {
   const { wasmLoader = defaultLoader, ...opts } = options || {};
   if (implOf(opts) !== 'wasm') return state;
   try {
-    return confirmState(() => wasmLoader().taskLifecycleFold(events ?? null, INITIAL_STATE, Boolean(opts.authoritative)), state);
+    return confirmState(() => wasmLoader().taskLifecycleFold(foldInput(events), INITIAL_STATE, Boolean(opts.authoritative)), state);
   } catch {
     return null;
   }
@@ -351,7 +375,7 @@ function confirmFold(events, state, options = {}) {
 function deriveLifecycle(events, { wasmLoader = defaultLoader, ...opts } = {}) {
   const state = foldEventsJs(events, INITIAL_STATE, { authoritative: isAuthoritative(events) });
   if (implOf(opts) !== 'wasm') return state;
-  return confirmState(() => wasmLoader().taskLifecycleDerive(events ?? null), state);
+  return confirmState(() => wasmLoader().taskLifecycleDerive(foldInput(events)), state);
 }
 
 // Defensive variant for wiring into read paths that must never throw: returns null instead
@@ -394,5 +418,6 @@ module.exports = {
   safeDeriveLifecycle,
   canTransitionToReviewing,
   confirmFold,
+  foldInput,
   taskLifecycleImpl,
 };

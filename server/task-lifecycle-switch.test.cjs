@@ -123,6 +123,47 @@ test('wasm fails closed: a refusing, faulting, malformed or disagreeing port ref
   }
 });
 
+test('#1126: the port is sent only the events and fields the fold reads, and agrees on them', () => {
+  const big = 'x'.repeat(4096);
+  const journal = [
+    { job: 'j', seq: 1, type: 'job.created', at: 1, data: { kind: 'code', prompt: big } },
+    { type: 'tool.completed', data: { output: big } }, { type: 'approval.requested', data: { to: 'merged', review: true } },
+    { type: 'job.started', data: { note: big } }, { type: 'progress', data: { stage: 'verifying', detail: big } },
+    null, 3, { type: 7 }, { type: 'progress', data: 'verifying' }, { type: 'progress' },
+    { type: 'task.stage', at: 2, hash: 'h', data: { from: 'planned', to: 'blocked', revision: 0, reason: big } },
+    { type: 'task.revision', data: { n: 1, headSha: 'a'.repeat(40) } },
+  ];
+  assert.deepEqual(lc.foldInput(journal), [
+    { type: 'job.started' }, { type: 'progress', data: { stage: 'verifying' } }, { type: 'progress', data: {} }, { type: 'progress', data: {} },
+    { type: 'task.stage', data: { from: 'planned', to: 'blocked' } }, { type: 'task.revision' },
+  ]);
+  assert.equal(lc.foldInput(undefined), null);
+  assert.equal(lc.foldInput(null), null);
+  // Every dropped event is a no-op: the projection folds to the same answer, both modes.
+  for (const authoritative of [false, true]) {
+    for (const k of [0, 3, 5, 11, journal.length]) {
+      const part = journal.slice(0, k);
+      assert.deepEqual(answer(() => lc.foldEvents(lc.foldInput(part), 'planned', { authoritative, ...JS }), 'state'),
+        answer(() => lc.foldEvents(part, 'planned', { authoritative, ...JS }), 'state'), `${k} ${authoritative}`);
+    }
+  }
+  const seen = [];
+  const port = fakePort({ taskLifecycleDerive: (e) => { seen.push(e); return answer(() => lc.deriveLifecycle(e, JS), 'state'); } });
+  assert.equal(lc.deriveLifecycle(journal, wasm(port)), 'blocked');
+  assert.ok(JSON.stringify(seen[0]).length < 300, 'no payload sent');
+});
+
+test('#1125: a non-string reportHash is a TaskLifecycleError (report_hash), never a TypeError', () => {
+  const hash = 'ab'.repeat(32);
+  for (const reportHash of [[hash], [[hash]], { toString: hash }, { valueOf: hash }, {}, 1, true]) {
+    const journal = [stage('planned', 'implementing'), stage('implementing', 'reviewing', { reportHash })];
+    assert.throws(() => lc.deriveLifecycle(journal, JS), (e) => e instanceof TaskLifecycleError && e.code === 'report_hash');
+    assert.equal(lc.safeDeriveLifecycle(journal, JS), null);
+    assert.equal(derive([{ type: 'job.created', job: 'x', data: { kind: 'code' } }, ...journal]).lifecycle, null);
+  }
+  assert.equal(lc.deriveLifecycle([stage('planned', 'implementing'), stage('implementing', 'reviewing', { reportHash: hash })], JS), 'reviewing');
+});
+
 test('port warnings are logged once per reason and carry no journal text', () => {
   // A fresh copy of the module: the warnings above already used this copy's once-per-reason set.
   delete require.cache[require.resolve('./task-lifecycle.cjs')];
@@ -160,9 +201,12 @@ test('jobs.cjs under wasm: an agreeing port writes the stage; a refusing one wri
   withPort(agree, () => jobs.append(id, 'task.stage', { from: 'planned', to: 'implementing', revision: 0 }, AUTHORITY));
   assert.equal(jobs.get(id).lifecycle, 'implementing');
   const before = fs.readFileSync(file, 'utf8');
-  for (const over of [{ ...agree, taskLifecycleStageMove: fault }, { ...agree, taskLifecycleFold: () => ({ state: 'blocked' }) }]) {
+  for (const [over, message] of [[{ ...agree, taskLifecycleStageMove: fault }, /refused by the Rust port/],
+    [{ ...agree, taskLifecycleFold: () => ({ state: 'blocked' }) }, /^This task’s lifecycle could not be verified; review required$/],
+    [{ ...agree, taskLifecycleFold: fault }, /^This task’s lifecycle could not be verified; review required$/]]) {
+    // #1127: a port refusal is not reported as an inconsistent journal.
     assert.throws(() => withPort(over, () => jobs.append(id, 'task.stage', { from: 'implementing', to: 'verifying', revision: 0 }, AUTHORITY)),
-      (e) => e.status === 409);
+      (e) => e.status === 409 && message.test(e.message) && !/inconsistent/.test(e.message));
     assert.equal(fs.readFileSync(file, 'utf8'), before, 'nothing appended');
   }
   // The read path: a disagreeing port derives no lifecycle; the rest of the job is unchanged.
