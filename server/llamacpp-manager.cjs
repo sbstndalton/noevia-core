@@ -373,6 +373,17 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     if (inference > 0) return explicit > 0 ? Math.min(inference, explicit) : inference;
     return Number(autoconfig.budgetGib) > 0 ? Number(autoconfig.budgetGib) : 0;
   }
+  // noevia#1132: ctx-size (c), ubatch-size and batch-size, when set, must be positive whole numbers;
+  // -1, 0, Infinity, 1e400 or NaN would make the estimate meaningless. The reason, or null.
+  function sizeKnobProblem(options) {
+    for (const key of ['ctx-size', 'c', 'ubatch-size', 'batch-size']) {
+      const raw = options[key];
+      if (raw === undefined || raw === null || String(raw).trim() === '') continue;
+      const text = String(raw).trim(), n = Number(text);
+      if (!/^\d+$/.test(text) || !Number.isSafeInteger(n) || n <= 0) return `${key} must be a positive whole number (got ${JSON.stringify(String(raw).slice(0, 40))}).`;
+    }
+    return null;
+  }
   const footprints = new Map();
   // What loading `model` with its current preset would use, or null when it cannot be told
   // (no read-only model mount, file not visible, unreadable metadata). Cached per preset revision.
@@ -411,6 +422,11 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
   // The refusal for a load whose estimate is above the budget, or null (fits, no budget, or no
   // estimate: the runtime watchdog still covers what cannot be estimated).
   async function overBudget(model) {
+    // noevia#1132: a context or batch size that is not a positive integer never loads, budget or not.
+    let effective = null;
+    try { effective = presets ? { ...presets.get(model).defaults, ...presets.get(model).options } : null; } catch { effective = null; }
+    const badKnob = effective && sizeKnobProblem(effective);
+    if (badKnob) return { body: { error: `${model} was not loaded: ${badKnob}`, code: 'invalid_size' } };
     const budgetGib = Number(inferenceBudget?.budgetGib?.());
     if (!(budgetGib > 0)) return null;
     const held = quarantineRefusal(model, budgetGib);
@@ -427,6 +443,11 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
       const error = `${model} has an unbounded prompt cache (cache-ram = -1), so it cannot be loaded within the ${budgetGib} GiB inference memory budget. Set its prompt cache in Settings → Models & routing.`;
       return { body: { error, code: 'inference_budget', budgetGib, estimate: est } };
     }
+    // noevia#1132: an estimate that is not a finite number (an infinite context) never fits.
+    if (!Number.isFinite(est.totalGib)) {
+      const error = `${model} was not loaded: its memory need cannot be estimated as a finite figure (context ${est.ctx === null ? 'unbounded' : est.ctx} tokens), so it cannot be checked against the ${budgetGib} GiB inference memory budget. Set a whole-number context in Settings → Models & routing.`;
+      return { body: { error, code: 'inference_budget', budgetGib, estimate: est } };
+    }
     if (est.totalGib <= budgetGib) return null;
     const error = `${model} needs about ${est.totalGib} GiB to load (weights ${est.modelGib}, context ${est.kvGib} at ${est.ctx.toLocaleString('en-US')} tokens, prompt cache ${est.cacheRamGib}, runtime ${est.extraGib}), above the ${budgetGib} GiB inference memory budget. Lower its context or prompt cache, use a smaller quantization, or raise the budget in Settings → Models & routing.`;
     return { body: { error, code: 'inference_budget', budgetGib, estimate: est } };
@@ -436,6 +457,8 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
   // not be written at all. `options` are the section's own options after the save; the global
   // section and the explicit prompt cache every write adds are applied here as the write would.
   async function presetRefusal(model, options) {
+    const badKnob = sizeKnobProblem(options || {});
+    if (badKnob) return { error: `Not saved: ${badKnob}`, code: 'invalid_size' };
     const budgetGib = Number(inferenceBudget?.budgetGib?.());
     if (!(budgetGib > 0) || !presets || !autoconfig.modelsPath) return null;
     const read = await readModel(model).catch(() => ({ error: 'unreadable' }));
@@ -451,9 +474,10 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
       if (err?.code !== 'autoconfig_impl') throw err;
       return { error: `Not saved: ${err.message}`, code: 'autoconfig_impl', budgetGib };
     }
-    if (!est.cacheRamUnbounded && est.totalGib <= budgetGib) return null;
+    if (!est.cacheRamUnbounded && Number.isFinite(est.totalGib) && est.totalGib <= budgetGib) return null;
     const error = est.cacheRamUnbounded
       ? `Not saved: an unbounded prompt cache (cache-ram = -1) cannot fit the ${budgetGib} GiB inference memory budget.`
+      : !Number.isFinite(est.totalGib) ? `Not saved: with these settings the memory need of ${model} cannot be estimated as a finite figure, so it cannot be checked against the ${budgetGib} GiB inference memory budget. Set a whole-number context.`
       : `Not saved: with these settings ${model} needs about ${est.totalGib} GiB (weights ${est.modelGib}, context ${est.kvGib} at ${est.ctx.toLocaleString('en-US')} tokens, prompt cache ${est.cacheRamGib}, runtime ${est.extraGib}), above the ${budgetGib} GiB inference memory budget. Lower the context or prompt cache, or raise the budget.`;
     return { error, code: 'inference_budget', budgetGib, estimate: est };
   }
@@ -469,7 +493,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
       const est = await footprint(m.id).catch(() => null);
       rows.push({ model: m.id, loaded: m.status?.value === 'loaded', labels: nativeLabels(m),
         system: isSystemModel(m.id, modelPathFromArgs(m.status?.args)), estimate: est,
-        fits: est && budgetGib ? !est.cacheRamUnbounded && est.totalGib <= budgetGib : null });
+        fits: est && budgetGib ? !est.cacheRamUnbounded && Number.isFinite(est.totalGib) && est.totalGib <= budgetGib : null });
     }
     return { ok: true, status: 200, body: { budgetGib, models: rows } };
   }

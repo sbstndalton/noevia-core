@@ -568,3 +568,30 @@ test('#873 no idle baseline is taken while the maintenance gate is held (a llama
   const throwing = createInferenceBudgetWatch({ env: {}, budgetGib: () => 12, readGpu: async () => used.gpu, listLoaded: async () => [], unload: async () => ({ ok: true }), log: () => {}, now: () => 0, baselineAllowed: () => { throw Error('x'); } });
   assert.equal((await throwing.tick()).baselineGib, 0);
 });
+
+// noevia#1132: an infinite or non-integer context never passes the load gate or a save.
+test('a ctx-size of Infinity, 1e400 or -1 is refused at load and at save, with no "null GiB"', async t => {
+  const bad = ['Infinity', '1e400', '-1'];
+  const section = bad.map((v, i) => `\n[bad${i}]\nmodel = /models/q.gguf\nctx-size = ${v}\ncache-ram = 1024\n`).join('');
+  const state = { chat: 'loaded', ...Object.fromEntries(bad.map((_, i) => [`bad${i}`, 'unloaded'])) };
+  for (const budget of [64, 0]) {
+    const { manager, calls } = fixture(t, { section, budget, state: { ...state } });
+    for (const [i, v] of bad.entries()) {
+      const refused = await manager.loadRefusal(`bad${i}`);
+      assert.ok(refused, `load ${v} (budget ${budget})`);
+      assert.doesNotMatch(refused.error, /null GiB|NaN/);
+      assert.match(refused.error, /positive whole number/);
+      const r = await manager.load(`bad${i}`);
+      assert.equal(r.ok, false); assert.equal(r.status, 409);
+    }
+    assert.ok(!calls.some(c => c.startsWith('POST /models/load')), calls.join('\n'));
+  }
+  const { manager } = fixture(t, { budget: 64 });
+  for (const v of [...bad, '0', 'NaN', '4096.5']) {
+    const r = await manager.presetRefusal('small', { 'ctx-size': v });
+    assert.equal(r?.code, 'invalid_size', v); assert.match(r.error, /^Not saved: ctx-size must be a positive whole number/);
+  }
+  for (const k of ['ubatch-size', 'batch-size']) assert.equal((await manager.presetRefusal('small', { [k]: '-1' }))?.code, 'invalid_size', k);
+  assert.equal(await manager.presetRefusal('small', { 'ctx-size': '4096', 'cache-ram': '0' }), null);
+});
+
