@@ -67,6 +67,12 @@
 //   - crates/browser-policy browserPolicy* = browser-policy.cjs classifyAction, checkNavigation,
 //                          the decision of substituteSecrets (names and domains, never a value)
 //                          and the label fold over the host's projections (BROWSER_POLICY_IMPL)
+//   - crates/tool-gate toolGate* = tool-gate.cjs ruleDecision, readout's options and answer
+//                          reading, searchQuery, diaryMonth and publicUrlPattern over the host's
+//                          projections (TOOL_GATE_IMPL)
+//   - crates/toolboxes-permitted toolboxes* = toolboxes-permitted.cjs projectToolboxIds,
+//                          selectedToolboxIds and computePermittedTools over the host's
+//                          projections (TOOLBOXES_PERMITTED_IMPL)
 //
 // Memory: WebAssembly memory only grows. A listing or path call needs at most ~16 MiB; an upload
 // decode copies the upload in (at most 25 MiB) and holds one copy of its text (at most 3 bytes per
@@ -98,7 +104,7 @@ const MAX_DECODE_BYTES = 25 * 1024 * 1024;
 // Only the first bytes decide an archive magic number (`ustar` ends at 262).
 const SNIFF_BYTES = 262;
 const RESET_AFTER_BYTES = 1024 * 1024;
-const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'secret_open', 'secret_seal', 'mcp_rpc_body', 'mcp_schema_refs', 'template_caps', 'provider_error', 'serving_verdict', 'autotune_plan', 'preset_reload', 'load_verdict', 'tune_contention', 'frame_untrusted', 'escape_closing', 'provenance', 'task_packet', 'long_profile', 's3_sign', 's3_region', 'ssrf_policy', 'stream_guard', 'gguf_summary', 'auth_tokens', 'tool_policy', 'review_verdict', 'tool_exchange', 'mcp_servers', 'decision', 'code_net_guard', 'role_context', 'completeness_report', 'task_lifecycle', 'llamacpp_autoconfig', 'code_actions', 'project_file_names', 'provider_egress', 'browser_policy', 'dav_output_ptr', 'dav_output_len'];
+const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'secret_open', 'secret_seal', 'mcp_rpc_body', 'mcp_schema_refs', 'template_caps', 'provider_error', 'serving_verdict', 'autotune_plan', 'preset_reload', 'load_verdict', 'tune_contention', 'frame_untrusted', 'escape_closing', 'provenance', 'task_packet', 'long_profile', 's3_sign', 's3_region', 'ssrf_policy', 'stream_guard', 'gguf_summary', 'auth_tokens', 'tool_policy', 'review_verdict', 'tool_exchange', 'mcp_servers', 'decision', 'code_net_guard', 'role_context', 'completeness_report', 'task_lifecycle', 'llamacpp_autoconfig', 'code_actions', 'project_file_names', 'provider_egress', 'browser_policy', 'tool_gate', 'toolboxes_permitted', 'dav_output_ptr', 'dav_output_len'];
 
 class DavParseError extends Error {
   constructor(message, reason) {
@@ -2044,10 +2050,142 @@ function browserPolicyFold(texts) {
   return r;
 }
 
+// --- tool gate (TOOL_GATE_IMPL) ------------------------------------------------------------------
+// tool_gate::MAX_INPUT_BYTES. The host sends its projections of the offered tools ({name, readOnly,
+// description, own, truthy, anyProps, required}), the boxes ([[kind, [name|null]]]) and the clock;
+// numbers JSON cannot carry travel as 'Infinity', '-Infinity' or 'NaN'. Every reply is checked for
+// shape; a refusal or bad reply throws a DavParseError, which tool-gate.cjs answers with 'none'.
+const MAX_TOOL_GATE_BYTES = 4 * 1024 * 1024 + 1;
+const gateCall = (op, args) => jsonOpCall(op, args, MAX_TOOL_GATE_BYTES, (e) => e.tool_gate(), 'tool gate').reply;
+const GATE_TOOL_KEYS = ['name', 'readOnly', 'description', 'own', 'truthy', 'anyProps', 'required'];
+const GATE_ARG_KEYS = new Set(['urls', 'url', 'query', 'q', 'month']);
+const GATE_KINDS = new Set(['url', 'search', 'diary', 'drive']);
+const GATE_REASONS = new Set(['none', 'not-offered', 'low-confidence']);
+const stringsOrNull = (a) => Array.isArray(a) && a.every((x) => x === null || typeof x === 'string');
+const wireNumber = (n) => (typeof n === 'number' && Number.isFinite(n)) || n === 'Infinity' || n === '-Infinity' || n === 'NaN';
+function gateTools(tools) {
+  return Array.isArray(tools) && tools.every((t) => exactKeys(t, GATE_TOOL_KEYS) && typeof t.name === 'string' && typeof t.readOnly === 'boolean'
+    && typeof t.description === 'string' && allStrings(t.own) && t.own.every((k) => GATE_ARG_KEYS.has(k)) && allStrings(t.truthy)
+    && t.truthy.every((k) => GATE_ARG_KEYS.has(k)) && typeof t.anyProps === 'boolean' && stringsOrNull(t.required));
+}
+const gateBoxes = (b) => Array.isArray(b) && b.every((p) => Array.isArray(p) && p.length === 2 && typeof p[0] === 'string' && stringsOrNull(p[1]));
+const gateClock = (n) => n === null || (typeof n === 'number' && Number.isFinite(n));
+function gateDecision(d) {
+  if (exactKeys(d, ['tool', 'mode']) && d.mode === 'require') return typeof d.tool === 'string';
+  if (!exactKeys(d, ['tool', 'mode', 'args']) || d.mode !== 'prefetch' || typeof d.tool !== 'string') return false;
+  const keys = d.args && typeof d.args === 'object' && !Array.isArray(d.args) ? Object.keys(d.args) : null;
+  if (!keys || keys.length > 1) return false;
+  if (!keys.length) return true;
+  const [k] = keys, v = d.args[k];
+  return GATE_ARG_KEYS.has(k) && (k === 'urls' ? allStrings(v) && v.length === 1 : typeof v === 'string');
+}
+function gateInput(ok, what) { if (!ok) throw new DavParseError(`tool gate ${what} input has the wrong shape`, 'input'); }
+
+/** ruleDecision: `{ rule: null }` or `{ rule, decision }`. */
+function toolGateRule(message, tools, now, boxes) {
+  gateInput(typeof message === 'string' && gateTools(tools) && gateClock(now) && gateBoxes(boxes), 'rule');
+  const r = gateCall(1, [message, tools, now, boxes]);
+  const ok = (exactKeys(r, ['rule']) && r.rule === null) || (exactKeys(r, ['rule', 'decision']) && GATE_KINDS.has(r.rule) && gateDecision(r.decision));
+  if (!ok) badReply('tool gate rule');
+  return r;
+}
+
+/** readout's options: `{ trimmed, options: [{ id, label }] }`. */
+function toolGateOptions(tools, prefer, hint, limits, boxes) {
+  const limitsOk = limits === null || (exactKeys(limits, ['maxOptions', 'maxLabelChars', 'maxChoiceChars']) && typeof limits.maxOptions === 'number'
+    && Number.isFinite(limits.maxOptions) && wireNumber(limits.maxLabelChars) && wireNumber(limits.maxChoiceChars));
+  gateInput(gateTools(tools) && (prefer === null || stringsOrNull(prefer)) && (hint === null || typeof hint === 'string') && limitsOk && gateBoxes(boxes), 'options');
+  const r = gateCall(2, [tools, prefer, hint, limits, boxes]);
+  if (!exactKeys(r, ['trimmed', 'options']) || !isCount(r.trimmed) || !Array.isArray(r.options)
+    || !r.options.every((o) => exactKeys(o, ['id', 'label']) && typeof o.id === 'string' && typeof o.label === 'string')) badReply('tool gate options');
+  return r;
+}
+
+/** readout's reading of an answer: `{ reason }` or `{ decision }`. */
+function toolGateAnswer(message, tools, now, boxes, selected, lower, score, confidence, min) {
+  const num = (n) => n === null || (typeof n === 'number' && Number.isFinite(n));
+  gateInput(typeof message === 'string' && gateTools(tools) && gateClock(now) && gateBoxes(boxes)
+    && (selected === null || selected === true || typeof selected === 'string') && num(lower) && num(score) && num(confidence) && wireNumber(min), 'answer');
+  const r = gateCall(3, [message, tools, now, boxes, selected, lower, score, confidence, min]);
+  if (!((exactKeys(r, ['reason']) && GATE_REASONS.has(r.reason)) || (exactKeys(r, ['decision']) && gateDecision(r.decision)))) badReply('tool gate answer');
+  return r;
+}
+
+/** searchQuery and prefetchableSearch of each message: `{ queries, prefetchable }`. */
+function toolGateQueries(messages) {
+  gateInput(allStrings(messages), 'query');
+  const r = gateCall(4, [messages]);
+  if (!exactKeys(r, ['queries', 'prefetchable']) || !allStrings(r.queries) || r.queries.length !== messages.length
+    || !Array.isArray(r.prefetchable) || r.prefetchable.length !== messages.length || !r.prefetchable.every((b) => typeof b === 'boolean')) badReply('tool gate query');
+  return r;
+}
+
+/** diaryMonth of each message: `{ months }` (a month or null each). */
+function toolGateMonths(messages, now) {
+  gateInput(allStrings(messages) && gateClock(now), 'month');
+  const r = gateCall(5, [messages, now]);
+  if (!exactKeys(r, ['months']) || !stringsOrNull(r.months) || r.months.length !== messages.length) badReply('tool gate month');
+  return r;
+}
+
+/** publicUrlPattern of each URL (the port's stricter rules): `{ public }`. */
+function toolGatePublic(urls) {
+  gateInput(allStrings(urls), 'public');
+  const r = gateCall(6, [urls]);
+  if (!exactKeys(r, ['public']) || !Array.isArray(r.public) || r.public.length !== urls.length || !r.public.every((b) => typeof b === 'boolean')) badReply('tool gate public');
+  return r;
+}
+
+// --- toolboxes permitted (TOOLBOXES_PERMITTED_IMPL) ----------------------------------------------
+// toolboxes_permitted::MAX_INPUT_BYTES. The host sends its projections of the project ({auto,
+// docsDefaulted, toolboxes}), id lists (a string or null each) and, for the catalogue, what the JS
+// run read from its callbacks. A refusal or bad reply throws a DavParseError, which
+// toolboxes-permitted.cjs answers by offering nothing.
+const MAX_TOOLBOXES_BYTES = 4 * 1024 * 1024 + 1;
+const boxesCall = (op, args) => jsonOpCall(op, args, MAX_TOOLBOXES_BYTES, (e) => e.toolboxes_permitted(), 'toolboxes permitted').reply;
+const PERMISSIONS = new Set(['allowed', 'needs-approval', 'unavailable']);
+const projectShape = (p) => p === null || (exactKeys(p, ['auto', 'docsDefaulted', 'toolboxes']) && typeof p.auto === 'boolean'
+  && typeof p.docsDefaulted === 'boolean' && (p.toolboxes === null || stringsOrNull(p.toolboxes)));
+function boxesInput(ok) { if (!ok) throw new DavParseError('toolboxes permitted input has the wrong shape', 'input'); }
+const idsReply = (r) => (exactKeys(r, ['ids']) && stringsOrNull(r.ids) ? r : badReply('toolboxes permitted ids'));
+
+/** projectToolboxIds: `{ ids }`. */
+function toolboxesProjectIds(project, defaults, docs) {
+  boxesInput(projectShape(project) && stringsOrNull(defaults) && typeof docs === 'string');
+  return idsReply(boxesCall(1, [project, defaults, docs]));
+}
+
+/** selectedToolboxIds: `{ ids }`. */
+function toolboxesSelectedIds(project, defaults, docs, connectorBoxes, connected) {
+  boxesInput(projectShape(project) && stringsOrNull(defaults) && typeof docs === 'string' && allStrings(connectorBoxes) && stringsOrNull(connected));
+  return idsReply(boxesCall(2, [project, defaults, docs, connectorBoxes, connected]));
+}
+
+const PERMITTED_KEYS = ['isAdmin', 'project', 'cowork', 'defaults', 'docsBox', 'connectorBoxes', 'connected', 'oauthServerIds', 'diaryEnabled',
+  'harnessEnabled', 'hasRepositories', 'boxes', 'manifest'];
+/** computePermittedTools: `{ boxes: [{ id, state, reasonCode, active, tools: [{ permission, reasonCode }] }] }`. */
+function toolboxesPermitted(input) {
+  const i = input;
+  boxesInput(exactKeys(i, PERMITTED_KEYS) && ['isAdmin', 'cowork', 'diaryEnabled', 'harnessEnabled', 'hasRepositories'].every((k) => typeof i[k] === 'boolean')
+    && projectShape(i.project) && stringsOrNull(i.defaults) && typeof i.docsBox === 'string' && allStrings(i.connectorBoxes) && stringsOrNull(i.connected)
+    && allStrings(i.oauthServerIds) && Array.isArray(i.boxes) && i.boxes.every((b) => exactKeys(b, ['id', 'ready', 'tools']) && typeof b.id === 'string'
+      && (b.ready === null || typeof b.ready === 'boolean') && Array.isArray(b.tools)
+      && b.tools.every((t) => exactKeys(t, ['write', 'policy']) && typeof t.write === 'boolean' && ['block', 'ask', 'other'].includes(t.policy)))
+    && Array.isArray(i.manifest) && i.manifest.every((e) => e === null || (exactKeys(e, ['id']) && (e.id === null || typeof e.id === 'string'))));
+  const r = boxesCall(3, [input]);
+  const code = (c) => c === null || typeof c === 'string';
+  if (!exactKeys(r, ['boxes']) || !Array.isArray(r.boxes) || !r.boxes.every((b) => exactKeys(b, ['id', 'state', 'reasonCode', 'active', 'tools'])
+    && (b.id === null || typeof b.id === 'string') && (b.state === 'available' || b.state === 'unavailable') && code(b.reasonCode)
+    && typeof b.active === 'boolean' && Array.isArray(b.tools) && b.tools.every((t) => exactKeys(t, ['permission', 'reasonCode']) && PERMISSIONS.has(t.permission) && code(t.reasonCode)))) {
+    badReply('toolboxes permitted');
+  }
+  return r;
+}
+
 // Every switch that runs this module (#996). Each reads its value as trim().toLowerCase().
 // Retired switches (#1071) are not listed: the Rust path they selected is always on, and
 // verifyAtStartup() always loads this module for it.
-const IMPL_FLAGS = ['STORAGE_PATH_IMPL', 'SECRET_ENVELOPE_IMPL', 'STREAM_GUARD_IMPL', 'GGUF_META_IMPL', 'ROLE_CONTEXT_IMPL', 'CODE_ACTIONS_IMPL', 'PROJECT_FILE_NAMES_IMPL', 'PROVIDER_EGRESS_IMPL', 'BROWSER_POLICY_IMPL'];
+const IMPL_FLAGS = ['STORAGE_PATH_IMPL', 'SECRET_ENVELOPE_IMPL', 'STREAM_GUARD_IMPL', 'GGUF_META_IMPL', 'ROLE_CONTEXT_IMPL', 'CODE_ACTIONS_IMPL', 'PROJECT_FILE_NAMES_IMPL', 'PROVIDER_EGRESS_IMPL', 'BROWSER_POLICY_IMPL', 'TOOL_GATE_IMPL', 'TOOLBOXES_PERMITTED_IMPL'];
 
 /** Switches whose JS path was deleted once Rust had run in production (#1071). The old value that
  *  selected Rust ('wasm', or 'on' for the advisor) is accepted silently; anything else is ignored
@@ -2107,4 +2245,5 @@ function verifyAtStartup(env = process.env, { hostname } = {}) {
 /** Test hook: forget the cached module (and its failure). */
 function reset() { cached = null; }
 
-module.exports = { browserPolicyClassify, browserPolicyNavigation, browserPolicySubstitute, browserPolicyFold, MAX_BROWSER_POLICY_BYTES, providerEgressExternal, providerEgressRefusal, providerEgressStrip, providerEgressToolRefusal, providerEgressCanonical, providerEgressFolder, MAX_PROVIDER_EGRESS_BYTES, codeActionsClassify, codeActionsDecide, codeActionsPick, MAX_CODE_ACTIONS_BYTES, projectFileNames, MAX_PROJECT_FILE_NAMES_BYTES, llamacppAutoconfig, autoconfigReply, MAX_AUTOCONFIG_BYTES, taskLifecycleCanTransition, taskLifecycleTransition, taskLifecycleStageMove, taskLifecycleFold, taskLifecycleDerive, taskLifecycleReply, MAX_TASK_LIFECYCLE_BYTES, completenessReport, completenessReply, MAX_COMPLETENESS_BYTES, roleContextProject, roleContextDossier, roleContextReply, MAX_ROLE_CONTEXT_BYTES, codeNetSpec, codeNetResolved, codeNetRefuses, MAX_CODE_NET_BYTES, MAX_CODE_NET_ENTRIES, mcpServersParse, mcpToolboxes, mcpToolboxOffered, MAX_MCP_SERVERS_BYTES, decisionRequestTag, decisionResultTag, decisionInvalidRequest, decisionInvalidResult, decisionCauseOf, decisionErrorFacts, decisionRequest, MAX_DECISION_MESSAGE_UNITS, MAX_DECISION_BYTES, DECISION_ENTRIES, reviewTag, reviewVerdictRead, reviewEventBound, reviewVerdictReply, MAX_REVIEW_BYTES, toolExchangeCheck, toolExchangeError, MAX_EXCHANGE_ARGS_UNITS, MAX_EXCHANGE_NAME_UNITS, ggufSummary, ggufSummaryReply, MAX_GGUF_WINDOW_BYTES, MAX_GGUF_SEGMENTS, authTokens, toolPolicyMode, toolPolicySet, MAX_POLICY_UNITS, MAX_POLICY_TOOLS, streamGuardSchema, streamGuardOptions, streamGuardNew, streamGuardFeed, streamGuardEnd, streamGuardCheck, streamGuardCheckReply, streamGuardCorrection, streamGuardReply, plainJson, MAX_GUARD_BYTES, MAX_GUARD_DEPTH, MAX_GUARD_SCHEMA_BYTES, MAX_GUARD_STATE_BYTES, MAX_GUARD_INPUT_BYTES, MAX_CORRECTION_UNITS, s3Sign, s3Region, MAX_S3_FIELD_BYTES, MAX_S3_QUERY_PAIRS, MAX_S3_PAYLOAD_BYTES, wasmFlags, RETIRED_FLAGS, warnRetiredFlags, verifyAtStartup, framingRuntimeMatches, IMPL_FLAGS, ssrfUrl, ssrfAddressesPublic, ssrfUrlReply, ssrfAddressesReply, MAX_SSRF_BYTES, MAX_SSRF_ADDRESSES, frameUntrusted, escapeClosing, provenanceNew, provenanceIngest, provenanceAdd, provenanceSource, provenanceCheck, provenanceProbe, packetParse, packetValidate, packetRender, FRAME_TEXT_UNITS, FRAME_LABEL_UNITS, MAX_PROVENANCE_BYTES, MAX_PACKET_BYTES, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, tuneContention, tuneContentionText, MAX_CONTENTION_BYTES, longProfilePairs, longProfileSection, longProfilePick, longProfileText, MAX_LONG_PROFILE_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
+module.exports = { toolGateRule, toolGateOptions, toolGateAnswer, toolGateQueries, toolGateMonths, toolGatePublic, MAX_TOOL_GATE_BYTES,
+  toolboxesProjectIds, toolboxesSelectedIds, toolboxesPermitted, MAX_TOOLBOXES_BYTES, browserPolicyClassify, browserPolicyNavigation, browserPolicySubstitute, browserPolicyFold, MAX_BROWSER_POLICY_BYTES, providerEgressExternal, providerEgressRefusal, providerEgressStrip, providerEgressToolRefusal, providerEgressCanonical, providerEgressFolder, MAX_PROVIDER_EGRESS_BYTES, codeActionsClassify, codeActionsDecide, codeActionsPick, MAX_CODE_ACTIONS_BYTES, projectFileNames, MAX_PROJECT_FILE_NAMES_BYTES, llamacppAutoconfig, autoconfigReply, MAX_AUTOCONFIG_BYTES, taskLifecycleCanTransition, taskLifecycleTransition, taskLifecycleStageMove, taskLifecycleFold, taskLifecycleDerive, taskLifecycleReply, MAX_TASK_LIFECYCLE_BYTES, completenessReport, completenessReply, MAX_COMPLETENESS_BYTES, roleContextProject, roleContextDossier, roleContextReply, MAX_ROLE_CONTEXT_BYTES, codeNetSpec, codeNetResolved, codeNetRefuses, MAX_CODE_NET_BYTES, MAX_CODE_NET_ENTRIES, mcpServersParse, mcpToolboxes, mcpToolboxOffered, MAX_MCP_SERVERS_BYTES, decisionRequestTag, decisionResultTag, decisionInvalidRequest, decisionInvalidResult, decisionCauseOf, decisionErrorFacts, decisionRequest, MAX_DECISION_MESSAGE_UNITS, MAX_DECISION_BYTES, DECISION_ENTRIES, reviewTag, reviewVerdictRead, reviewEventBound, reviewVerdictReply, MAX_REVIEW_BYTES, toolExchangeCheck, toolExchangeError, MAX_EXCHANGE_ARGS_UNITS, MAX_EXCHANGE_NAME_UNITS, ggufSummary, ggufSummaryReply, MAX_GGUF_WINDOW_BYTES, MAX_GGUF_SEGMENTS, authTokens, toolPolicyMode, toolPolicySet, MAX_POLICY_UNITS, MAX_POLICY_TOOLS, streamGuardSchema, streamGuardOptions, streamGuardNew, streamGuardFeed, streamGuardEnd, streamGuardCheck, streamGuardCheckReply, streamGuardCorrection, streamGuardReply, plainJson, MAX_GUARD_BYTES, MAX_GUARD_DEPTH, MAX_GUARD_SCHEMA_BYTES, MAX_GUARD_STATE_BYTES, MAX_GUARD_INPUT_BYTES, MAX_CORRECTION_UNITS, s3Sign, s3Region, MAX_S3_FIELD_BYTES, MAX_S3_QUERY_PAIRS, MAX_S3_PAYLOAD_BYTES, wasmFlags, RETIRED_FLAGS, warnRetiredFlags, verifyAtStartup, framingRuntimeMatches, IMPL_FLAGS, ssrfUrl, ssrfAddressesPublic, ssrfUrlReply, ssrfAddressesReply, MAX_SSRF_BYTES, MAX_SSRF_ADDRESSES, frameUntrusted, escapeClosing, provenanceNew, provenanceIngest, provenanceAdd, provenanceSource, provenanceCheck, provenanceProbe, packetParse, packetValidate, packetRender, FRAME_TEXT_UNITS, FRAME_LABEL_UNITS, MAX_PROVENANCE_BYTES, MAX_PACKET_BYTES, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, tuneContention, tuneContentionText, MAX_CONTENTION_BYTES, longProfilePairs, longProfileSection, longProfilePick, longProfileText, MAX_LONG_PROFILE_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };

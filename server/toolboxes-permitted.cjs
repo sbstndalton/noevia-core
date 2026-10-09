@@ -9,6 +9,19 @@
 //            unavailable     blocked by the account's permissions, or its box is unavailable
 // Per box:   available / unavailable (+ reason), and `active` when the project or chat already
 //            selects it, so the catalogue can show what is on by default versus on for one turn.
+//
+// TOOLBOXES_PERMITTED_IMPL=js|wasm (default js; any other value means js, with one warning), read
+// from the `env` option (process.env) on every call. wasm also asks noevia-rs's
+// toolboxes-permitted crate (dav-parse.wasm toolboxes_permitted) with the host's projections (the
+// project's mode and list, id lists, and for the catalogue what the JS run read from its
+// callbacks: each tool's write flag and policy mode, each sign-in box's readiness; nothing is read
+// twice). The JS answer is computed first and the port can only offer less: a box id is carried
+// only if both carry it (projectToolboxIds, selectedToolboxIds: what chat.cjs and resolveTools
+// really send), a box is available or active only if both say so, and a tool's permission is the
+// stricter of the two (unavailable over needs-approval over allowed). A fault or a reply of another
+// shape carries no box and shows every box and tool unavailable (reasonCode 'unchecked'). Warnings
+// are logged once per event and reason and carry no input. The flag is in dav-parse-wasm.cjs
+// IMPL_FLAGS (a missing or tampered module stops startup).
 
 const { isInAppBox, isManifestBoxInApp } = require('./toolbox-flags.cjs');
 
@@ -27,6 +40,7 @@ const REASONS = {
   codeOff: 'The coding harness is off on this server.',
   codeNeedsProject: 'Open a project chat to run a Cowork task.',
   codeNoRepository: 'No repository is registered on this server.',
+  unchecked: 'This could not be double-checked on this server, so it is not offered.',
 };
 
 /**
@@ -51,7 +65,7 @@ const REASONS = {
  *  default, which tool routing then narrows per message; Manual (or no mode, as before) is the
  *  hand-picked list, falling back to the default for a project predating toolboxes. Never more
  *  than one of those two lists, so Automatic cannot add a write the default does not offer. */
-function projectToolboxIds(project, defaultToolboxes) {
+function projectToolboxIdsJs(project, defaultToolboxes) {
   if (project && project.toolsMode === 'auto') {
     // The Project documents box (read-only) that project-docs-default.cjs added on the first upload
     // stays in Automatic too, or an Automatic project could not read its own uploads.
@@ -67,18 +81,18 @@ function projectToolboxIds(project, defaultToolboxes) {
  *  actually-connected connectors. Every reader of "what tools are enabled" — the chat loop itself,
  *  this catalogue, and the model picker / composer menu (#354) — must compute this the same way,
  *  or one of them under-reports what the next message really sends. */
-function selectedToolboxIds({ project, defaultToolboxes, connectorBoxes, connected }) {
+function selectedToolboxIdsJs({ project, defaultToolboxes, connectorBoxes, connected }) {
   return [
-    ...projectToolboxIds(project, defaultToolboxes).filter((id) => !connectorBoxes.has(id)),
+    ...projectToolboxIdsJs(project, defaultToolboxes).filter((id) => !connectorBoxes.has(id)),
     ...connected,
   ];
 }
 
-function computePermittedTools(input) {
+function computePermittedToolsJs(input) {
   const { user, project, mode, boxes, manifest = [], defaultToolboxes, connectorBoxes, connected, oauthServerIds,
     accountReady, policyMode, isWriteTool, diaryEnabled, harnessEnabled, repositories = [] } = input;
   const isAdmin = user.role === 'admin';
-  const selected = new Set(selectedToolboxIds({ project, defaultToolboxes, connectorBoxes, connected }));
+  const selected = new Set(selectedToolboxIdsJs({ project, defaultToolboxes, connectorBoxes, connected }));
   const out = [];
   for (const box of boxes) {
     let reason = null, reasonCode = null;
@@ -153,4 +167,158 @@ function createTtlCache({ ttlMs = 30000, now = Date.now, max = 500 } = {}) {
   };
 }
 
-module.exports = { projectToolboxIds, REASONS, computePermittedTools, createTtlCache, CODE_BOX_ID, selectedToolboxIds };
+// ── TOOLBOXES_PERMITTED_IMPL ────────────────────────────────────────────────
+
+const IMPLS = new Set(['js', 'wasm']);
+let warnedImpl = '';
+/** TOOLBOXES_PERMITTED_IMPL: 'js' (default) or 'wasm'. */
+function toolboxesPermittedImpl(env = process.env) {
+  const raw = env?.TOOLBOXES_PERMITTED_IMPL;
+  if (raw === undefined || raw === '') return 'js';
+  const v = String(raw).trim().toLowerCase();
+  if (IMPLS.has(v)) return v;
+  if (warnedImpl !== v) {
+    warnedImpl = v;
+    console.warn(`[toolboxes-permitted] TOOLBOXES_PERMITTED_IMPL=${JSON.stringify(String(raw))} is not js or wasm; using js`);
+  }
+  return 'js';
+}
+const defaultLoader = () => require('./dav-parse-wasm.cjs');
+const implOf = ({ env = process.env, impl = toolboxesPermittedImpl(env) } = {}) => impl;
+const warnedPort = new Set();
+function portWarn(event, reason) {
+  const key = `${event}:${reason}`;
+  if (warnedPort.has(key)) return;
+  warnedPort.add(key);
+  console.warn(`[toolboxes-permitted] ${event} (${reason}); the stricter answer was used`);
+}
+/** Asks the port; undefined (after a warning) when it throws or a projection cannot be built. */
+function ask(wasmLoader, fn) {
+  try { return fn(wasmLoader()); } catch (err) {
+    portWarn('toolboxes_permitted.wasm_fault', String(err?.reason || 'unexpected').slice(0, 40));
+    return undefined;
+  }
+}
+
+const docsBox = () => require('./project-docs-default.cjs').BOX;
+const idOf = (x) => (typeof x === 'string' ? x : null);
+/** A list as the JS reads it (holes are undefined); a non-list cannot be projected. */
+function idsProjection(list) {
+  if (!Array.isArray(list)) throw Object.assign(Error('not a list'), { reason: 'list' });
+  return Array.from(list, idOf);
+}
+function stringsProjection(iterable) {
+  const out = [...iterable];
+  if (!out.every((x) => typeof x === 'string')) throw Object.assign(Error('a non-string id'), { reason: 'ids' });
+  return out;
+}
+/** The project as projectToolboxIds reads it; null for a falsy project. */
+function projectProjection(project) {
+  if (!project) return null;
+  return { auto: project.toolsMode === 'auto', docsDefaulted: project.docsToolboxDefaulted === true,
+    toolboxes: Array.isArray(project.toolboxes) ? idsProjection(project.toolboxes) : null };
+}
+/** The JS list where the port carries the same ids; else only the string ids both carry. */
+function intersectIds(js, port, what) {
+  if (port === undefined) return [];
+  if (port.ids.length === js.length && port.ids.every((id, i) => id === idOf(js[i]))) return js;
+  portWarn('toolboxes_permitted.impl_mismatch', what);
+  const carried = new Set(port.ids.filter((id) => id !== null));
+  return js.filter((id) => typeof id === 'string' && carried.has(id));
+}
+
+/** projectToolboxIdsJs; under TOOLBOXES_PERMITTED_IMPL=wasm only the ids the port carries too. */
+function projectToolboxIds(project, defaultToolboxes, { wasmLoader = defaultLoader, ...opts } = {}) {
+  const js = projectToolboxIdsJs(project, defaultToolboxes);
+  if (implOf(opts) !== 'wasm') return js;
+  const port = ask(wasmLoader, (m) => m.toolboxesProjectIds(projectProjection(project), idsProjection(defaultToolboxes), docsBox()));
+  return intersectIds(js, port, 'project');
+}
+
+/** selectedToolboxIdsJs; under TOOLBOXES_PERMITTED_IMPL=wasm only the ids the port carries too. */
+function selectedToolboxIds(input, { wasmLoader = defaultLoader, ...opts } = {}) {
+  const js = selectedToolboxIdsJs(input);
+  if (implOf(opts) !== 'wasm') return js;
+  const { project, defaultToolboxes, connectorBoxes, connected } = input;
+  const port = ask(wasmLoader, (m) => m.toolboxesSelectedIds(projectProjection(project), idsProjection(defaultToolboxes), docsBox(),
+    stringsProjection(connectorBoxes), idsProjection(connected)));
+  return intersectIds(js, port, 'selected');
+}
+
+const RANK = { allowed: 0, 'needs-approval': 1, unavailable: 2 };
+const reasonFor = (code) => (code && Object.hasOwn(REASONS, code) ? [REASONS[code], code] : [REASONS.unchecked, 'unchecked']);
+/** Every box and tool unavailable: what a fault shows. */
+function allUnavailable(boxes) {
+  const [reason, reasonCode] = reasonFor('unchecked');
+  return boxes.map((b) => ({ ...b, state: 'unavailable', reason, reasonCode, active: false,
+    tools: b.tools.map((t) => ({ ...t, permission: 'unavailable', reason, reasonCode })) }));
+}
+/** One JS box with the port's answer for it: never more available, active or permitted. */
+function mergeBox(b, p) {
+  let changed = false;
+  const out = { ...b };
+  if (b.state === 'available' && p.state !== 'available') {
+    changed = true;
+    [out.reason, out.reasonCode] = reasonFor(p.reasonCode);
+    out.state = 'unavailable';
+  }
+  if (out.active && !(p.active && out.state === 'available')) { changed = true; out.active = false; }
+  out.tools = b.tools.map((t, i) => {
+    const q = p.tools[i];
+    if (RANK[q.permission] <= RANK[t.permission]) return t;
+    changed = true;
+    const [reason, reasonCode] = q.reasonCode === 'blocked' ? [REASONS.blocked, 'blocked'] : reasonFor(q.reasonCode);
+    return { ...t, permission: q.permission, reason, reasonCode };
+  });
+  if (!changed && (p.state !== b.state || p.active !== b.active || p.reasonCode !== b.reasonCode
+    || p.tools.some((q, i) => q.permission !== b.tools[i].permission || q.reasonCode !== b.tools[i].reasonCode))) changed = true;
+  return { box: out, changed };
+}
+
+/** computePermittedToolsJs; under TOOLBOXES_PERMITTED_IMPL=wasm the port reads what the JS run read
+ *  (its callbacks are recorded, not called twice) and every box and tool is the stricter answer. */
+function computePermittedTools(input, { wasmLoader = defaultLoader, ...opts } = {}) {
+  if (implOf(opts) !== 'wasm') return computePermittedToolsJs(input);
+  const calls = { ready: [], write: [], policy: [] };
+  const record = (list, fn) => (...args) => { const v = fn(...args); list.push(v); return v; };
+  const js = computePermittedToolsJs({ ...input, accountReady: record(calls.ready, input.accountReady),
+    isWriteTool: record(calls.write, input.isWriteTool), policyMode: record(calls.policy, input.policyMode) });
+  const port = ask(wasmLoader, (m) => m.toolboxesPermitted(permittedProjection(input, calls)));
+  if (port === undefined) return allUnavailable(js);
+  if (port.boxes.length !== js.length || !port.boxes.every((p, i) => p.id === idOf(js[i].id) && p.tools.length === js[i].tools.length)) {
+    portWarn('toolboxes_permitted.impl_mismatch', 'shape');
+    return allUnavailable(js);
+  }
+  let changed = false;
+  const out = js.map((b, i) => { const m = mergeBox(b, port.boxes[i]); changed ||= m.changed; return m.box; });
+  if (changed) portWarn('toolboxes_permitted.impl_mismatch', 'catalogue');
+  return out;
+}
+
+/** What computePermittedToolsJs read, in its order: the recorded callback answers per box and tool. */
+function permittedProjection(input, calls) {
+  const { user, project, mode, boxes, manifest = [], defaultToolboxes, connectorBoxes, connected, oauthServerIds, diaryEnabled,
+    harnessEnabled, repositories = [] } = input;
+  let r = 0, w = 0, q = 0;
+  return {
+    isAdmin: user.role === 'admin', project: projectProjection(project), cowork: mode === 'cowork', defaults: idsProjection(defaultToolboxes),
+    docsBox: docsBox(), connectorBoxes: stringsProjection(connectorBoxes), connected: idsProjection(connected),
+    oauthServerIds: stringsProjection(oauthServerIds), diaryEnabled: !!diaryEnabled, harnessEnabled: !!harnessEnabled,
+    hasRepositories: repositories.length > 0,
+    boxes: boxes.map((box) => {
+      if (typeof box.id !== 'string') throw Object.assign(Error('a box id is not a string'), { reason: 'box' });
+      const asked = !(connectorBoxes.has(box.id) && !connected.includes(box.id)) && oauthServerIds.has(box.id);
+      const ready = asked ? !!calls.ready[r++] : null;
+      const tools = (box.tools || []).filter((tool) => tool && tool.function && tool.function.name).map(() => {
+        const write = calls.write[w++], policy = calls.policy[q++];
+        return { write: !!write, policy: policy === 'block' ? 'block' : policy === 'ask' ? 'ask' : 'other' };
+      });
+      return { id: box.id, ready, tools };
+    }),
+    manifest: manifest.map((e) => (e ? { id: idOf(e.id) } : null)),
+  };
+}
+
+module.exports = { projectToolboxIds, REASONS, computePermittedTools, createTtlCache, CODE_BOX_ID, selectedToolboxIds,
+  projectToolboxIdsJs, selectedToolboxIdsJs, computePermittedToolsJs, toolboxesPermittedImpl, projectProjection, permittedProjection,
+  idsProjection, mergeBox };
