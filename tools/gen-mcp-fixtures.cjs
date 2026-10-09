@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 // Regenerates the shared differential fixtures for MCP framing (#980). Expectations come from the
-// JS references (server/mcp.cjs parseRpcBodyJs, resolveSchemaRefsJs). The same file is committed
+// JS references (tests/server/oracle/mcp.cjs parseRpcBodyJs, resolveSchemaRefsJs). The same file is committed
 // byte-for-byte in sbstndalton/noevia-rs (crates/mcp-frame/tests/fixtures/mcp-frame.v1.json);
 // noevia-core CI compares them.
 //   node tools/gen-mcp-fixtures.cjs > tests/fixtures/mcp-frame.v1.json
@@ -17,6 +17,7 @@
 // encoded tree (keys "=k", a set prototype "^") or {"code","ref"} for what the JS throws.
 
 const mcp = require('../server/mcp.cjs');
+const mcpOracle = require('../tests/server/oracle/mcp.cjs');
 
 const { encodeTree } = require('../tests/server/mcp-frame-tree.cjs');
 
@@ -37,7 +38,7 @@ const SCHEMA_ERRORS = [
 /** The JS reference's answer as the module's reply (after the tag byte). */
 function schemaExpect(schema) {
   try {
-    return { ok: true, out: encodeTree(mcp.resolveSchemaRefsJs(schema)) };
+    return { ok: true, out: encodeTree(mcpOracle.resolveSchemaRefsJs(schema)) };
   } catch (err) {
     for (const [re, code] of SCHEMA_ERRORS) {
       const m = re.exec(err.message);
@@ -66,7 +67,7 @@ function ssePick(text, expectedId) {
 function rpcExpect(sse, text, expectedId) {
   const ct = sse ? 'text/event-stream' : 'application/json';
   try {
-    const msg = mcp.parseRpcBodyJs(ct, text, expectedId);
+    const msg = mcpOracle.parseRpcBodyJs(ct, text, expectedId);
     const payload = sse ? ssePick(text, expectedId) : text;
     if (encodeTree(JSON.parse(payload)) !== encodeTree(msg)) throw new Error('generator picked a different frame');
     return { kind: 'reply', out: escapeLone(payload) };

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 'use strict';
 // Regenerates the shared differential fixtures for the upload checks (#977). Expectations come from
-// the JS references (server/upload-sniff.cjs validateJs, classifyJs, decodeTextJs). The same file is
+// the JS references (tests/server/oracle/upload-sniff.cjs validateJs, classifyJs, decodeTextJs). The same file is
 // committed byte-for-byte in sbstndalton/noevia-rs (crates/upload-sniff/tests/fixtures/
 // upload-sniff.v1.json); noevia-core CI compares them.
 //   node tools/gen-upload-fixtures.cjs > tests/fixtures/upload-sniff.v1.json
@@ -11,7 +11,7 @@
 // the upload is zero bytes. A refusal is { refusal, status }, acceptance null. decode cases carry
 // all bytes as hex; the expectation is null (not text) or { encoding, text }.
 
-const { CAP, validateJs, classifyJs, decodeTextJs } = require('../server/upload-sniff.cjs');
+const { CAP, validateJs, classifyJs, decodeTextJs } = require('../tests/server/oracle/upload-sniff.cjs');
 
 let seed = 0x977;
 const rand = () => { seed = (seed * 1103515245 + 12345) >>> 0; return seed / 2 ** 32; };

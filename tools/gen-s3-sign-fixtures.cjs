@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 'use strict';
 // Regenerates the shared differential fixtures for the SigV4 signer and the region rule.
-// Expectations come from the JS references (server/s3-sign.cjs signS3Parts, server/s3-region.cjs
-// normalizeS3Region). The same file is committed byte-for-byte in sbstndalton/noevia-rs
+// Expectations come from the JS references (tests/server/oracle/s3-sign.cjs signS3Parts and
+// normalizeS3RegionJs). The same file is committed byte-for-byte in sbstndalton/noevia-rs
 // (crates/s3-sign/tests/fixtures/s3-sign.v1.json); noevia-core CI compares them.
 //   node tools/gen-s3-sign-fixtures.cjs > tests/fixtures/s3-sign.v1.json
 // Every key, token, host and path below is made up (the AKIA…/wJalr… pair is AWS's published
@@ -16,8 +16,7 @@
 // as U+FFFD, which is what Buffer.from and TextEncoder both produce). `headers` is the returned
 // object's entries, in order.
 
-const { signS3Parts } = require('../server/s3-sign.cjs');
-const { normalizeS3RegionJs: normalizeS3Region } = require('../server/s3-region.cjs');
+const { signS3Parts, normalizeS3RegionJs: normalizeS3Region } = require('../tests/server/oracle/s3-sign.cjs');
 
 let seed = 0x5195;
 const rand = () => { seed = (seed * 1103515245 + 12345) >>> 0; return seed / 2 ** 32; };

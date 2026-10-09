@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 'use strict';
-// Regenerates the shared fixtures for the outbound-URL guard (SSRF_IMPL, ssrf.cjs + public-fetch.cjs
-// #795). The same file is committed byte-for-byte in sbstndalton/noevia-rs
+// Regenerates the shared fixtures for the outbound-URL guard (ssrf.cjs + public-fetch.cjs, #795;
+// the JS references are the oracles in tests/server/oracle/ssrf.cjs and public-fetch.cjs). The same file is committed byte-for-byte in sbstndalton/noevia-rs
 // (crates/ssrf-policy/tests/fixtures/ssrf.v1.json); noevia-core CI compares them.
 //   node tools/gen-ssrf-fixtures.cjs > tests/fixtures/ssrf.v1.json
 //
-// Every expectation is what the JS itself does (isPublicUrl, createPublicFetch, isPrivateIp), run
+// Every expectation is what the JS itself does (isPublicUrlJs, createPublicFetchJs, isPrivateIpJs), run
 // here with the network replaced: dns.promises.lookup records the name it was asked for and
 // answers nothing, and http/https.request record the host they were asked to connect to and
 // throw. Nothing is resolved or connected. Hosts are synthetic or documentation addresses.
@@ -22,13 +22,10 @@ const dns = require('node:dns');
 const http = require('node:http');
 const https = require('node:https');
 const net = require('node:net');
-const path = require('node:path');
 
-// The JS reference, whatever this shell's SSRF_IMPL says.
-delete process.env.SSRF_IMPL;
-const server = path.join(__dirname, '..', 'server');
-const { isPrivateIpJs: isPrivateIp, isPublicUrlJs: isPublicUrl } = require(path.join(server, 'ssrf.cjs'));
-const { createPublicFetch } = require(path.join(server, 'public-fetch.cjs'));
+// The JS references (test oracles since #1071).
+const { isPrivateIpJs: isPrivateIp, isPublicUrlJs: isPublicUrl } = require('../tests/server/oracle/ssrf.cjs');
+const { createPublicFetchJs: createPublicFetch } = require('../tests/server/oracle/public-fetch.cjs');
 
 // --- deterministic PRNG (mulberry32) ---------------------------------------------------------
 let seed = 0x5357f1;

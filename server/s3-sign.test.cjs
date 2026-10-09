@@ -6,7 +6,8 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 
-const { signS3Request, canonicalUri } = require('./s3-sign.cjs');
+const { signS3Request } = require('./s3-sign.cjs');
+const { canonicalUri } = require('../tests/server/oracle/s3-sign.cjs');
 
 // SigV4 probe signer tests. The expected signature is produced by the diary
 // sidecar's Python signer (services/diary/agent/s3_storage.py), which is
@@ -48,7 +49,7 @@ test('signS3Request canonicalizes query params in sorted order with AWS encoding
   assert.equal(a.Authorization, b.Authorization, 'signature must not depend on query param order');
 });
 
-test('canonical URI encodes each segment once, including ! \' ( ) *', () => {
+test('the oracle canonical URI encodes each segment once, including ! \' ( ) *', () => {
   // s3Url builds this with encodeURIComponent, which leaves ( ) unescaped.
   const url = new URL(`https://s3.example.com/diary-bucket/Cowork/${encodeURIComponent('notes (1).md')}`);
   assert.equal(url.pathname, '/diary-bucket/Cowork/notes%20(1).md');

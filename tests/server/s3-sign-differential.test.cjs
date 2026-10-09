@@ -2,7 +2,7 @@
 
 // Shared fixtures for the SigV4 signer: tests/fixtures/s3-sign.v1.json (byte-identical to
 // noevia-rs crates/s3-sign/tests/fixtures/; CI compares them) replayed through dav-parse.wasm's
-// s3_sign and s3_region, and the JS reference (server/s3-sign.cjs signS3RequestJs) run on the same
+// s3_sign and s3_region, and the JS reference (tests/server/oracle/s3-sign.cjs signS3RequestJs) run on the same
 // inputs here, so Node's own URL, TextEncoder and String#trim on this runtime are part of the
 // comparison. Then seeded random requests with real URLs. Synthetic credentials only. The
 // WebAssembly half needs server/wasm/dav-parse.wasm (or DAV_PARSE_WASM); skipped without it
@@ -16,6 +16,7 @@ const test = require('node:test');
 
 const davParseWasm = require('../../server/dav-parse-wasm.cjs');
 const sign = require('../../server/s3-sign.cjs');
+const oracle = require('./oracle/s3-sign.cjs');
 const region = require('../../server/s3-region.cjs');
 
 const FIXTURE = path.join(__dirname, '../fixtures/s3-sign.v1.json');
@@ -57,7 +58,7 @@ test('differential: every fixture case signs identically through the module (key
         continue;
       }
       const wasm = davParseWasm.s3Sign(...args);
-      same(wasm, sign.signS3RequestJs(...args));
+      same(wasm, oracle.signS3RequestJs(...args));
       same(wasm, Object.fromEntries(c.expect.headers));
       n++;
     }
@@ -78,12 +79,12 @@ test('differential: seeded random requests, real URLs, lone surrogates where the
       const args = [pick(['GET', 'PUT', 'get', 'X\udc00']), url, payload, pick(['AK', 'AKIAIOSFODNN7EXAMPLE', '"q"\\']), pick([SECRET, 'é\ud800', '']),
         { region: pick([undefined, '', 'eu-west-2']), sessionToken: pick([undefined, '', ' tok\ufeff']), amzDate: pick([undefined, DATE, '20260101T120000Z']) }];
       if (args[5].amzDate === undefined) args[5].amzDate = DATE; // the clock must not differ between the two calls
-      same(davParseWasm.s3Sign(...args), sign.signS3RequestJs(...args));
+      same(davParseWasm.s3Sign(...args), oracle.signS3RequestJs(...args));
     }
-    // The flag routes signS3Request itself; normalizeS3Region likewise.
-    withEnv({ S3_SIGN_IMPL: 'wasm', DAV_PARSE_WASM: wasmFile }, () => {
+    // signS3Request itself goes through the module; normalizeS3Region likewise.
+    withEnv({ DAV_PARSE_WASM: wasmFile }, () => {
       const url = new URL('https://s3.example.com/diary-bucket?list-type=2&max-keys=1');
-      same(sign.signS3Request('GET', url, '', 'AK', SECRET, { amzDate: DATE }), sign.signS3RequestJs('GET', url, '', 'AK', SECRET, { amzDate: DATE }));
+      same(sign.signS3Request('GET', url, '', 'AK', SECRET, { amzDate: DATE }), oracle.signS3RequestJs('GET', url, '', 'AK', SECRET, { amzDate: DATE }));
       assert.equal(region.normalizeS3Region(' EU-West-1 '), 'eu-west-1');
       assert.equal(region.normalizeS3Region(null), 'us-east-1');
       // Without amzDate both stamp the clock: the format is the JS one.
