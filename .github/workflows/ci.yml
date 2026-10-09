@@ -232,7 +232,15 @@ jobs:
       # The image a release ships: its own build stage rebuilds and checks the module, and the
       # runtime image must load it (sha256 against the lock, no imports, the ABI) and run the
       # framing and toolCallFor through it.
+      # The buildx driver image (moby/buildkit) is itself a Docker Hub pull: mirror the daemon too.
+      - name: Docker Hub pull-through mirror (daemon)
+        run: self/.github/scripts/docker-hub-mirror.sh
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3 (v3.12.0)
+        with:
+          # Docker Hub pull-through mirror, docker.io fallback (noevia #1221).
+          buildkitd-config: self/.github/buildkitd-mirror.toml
+          # The driver image itself is a Docker Hub pull; take it from the mirror (same tag).
+          driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6 (v6.19.2)
         with:
           context: self/code-sandbox
@@ -321,7 +329,15 @@ jobs:
           printf 'NOEVIA_SHA=%s\nNOEVIA_WEB_SHA=%s\nNOEVIA_CORE_SHA=%s\nNOEVIA_SERVICES_SHA=%s\n' "$(git -C ws rev-parse HEAD)" \
             "$(git -C "$WEB" rev-parse HEAD)" "$(git -C "$CORE" rev-parse HEAD)" ci > "$t/release-refs"
           echo "TREE=$t" >> "$GITHUB_ENV"
+      # The buildx driver image (moby/buildkit) is itself a Docker Hub pull: mirror the daemon too.
+      - name: Docker Hub pull-through mirror (daemon)
+        run: self/.github/scripts/docker-hub-mirror.sh
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3 (v3.12.0)
+        with:
+          # Docker Hub pull-through mirror, docker.io fallback (noevia #1221).
+          buildkitd-config: self/.github/buildkitd-mirror.toml
+          # The driver image itself is a Docker Hub pull; take it from the mirror (same tag).
+          driver-opts: image=mirror.gcr.io/moby/buildkit:buildx-stable-1
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6 (v6.19.2)
         with:
           context: ${{ env.TREE }}

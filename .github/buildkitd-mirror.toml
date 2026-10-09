@@ -1,0 +1,5 @@
+# Pull Docker Hub base images through Google's pull-through mirror (anonymous docker.io pulls
+# hit 429). Image references and digests are unchanged; buildkit verifies digests either way and
+# falls back to docker.io when the mirror lacks an image (noevia #1221).
+[registry."docker.io"]
+  mirrors = ["mirror.gcr.io"]
