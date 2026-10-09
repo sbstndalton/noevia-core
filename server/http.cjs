@@ -5,8 +5,8 @@
 // results that auth.cjs returns. fetch is the global, resolved per call, because tests and
 // QA swap it at runtime.
 
-function json(res, code, body) {
-  res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+function json(res, code, body, headers) {
+  res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...headers });
   res.end(JSON.stringify(body));
 }
 
