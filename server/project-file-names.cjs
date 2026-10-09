@@ -27,8 +27,10 @@
 // the same file. A JS refusal (invalid, missing, ambiguous) is returned as is, without asking. When
 // the port refuses, faults, replies badly or names another file, nothing resolves: code
 // 'unverified' with a model-readable error (logged once per reason, name-free). The port reads no
-// normalization tables: a name, or a file name it is compared with, outside its NFC-inert set
-// (see the crate docs) is refused, so such names do not resolve under wasm. The flag is in
+// normalization tables beyond one small composition table (an inert Latin base + one combining
+// mark, noevia#1211, so an NFD `Cafe\u0301.md` resolves): a name, or a file name it is compared
+// with, outside its NFC-inert set after that step (see the crate docs) is refused, so such names
+// do not resolve under wasm. The flag is in
 // dav-parse-wasm.cjs IMPL_FLAGS (a missing or tampered module stops startup).
 
 const MAX_NAME = 1024;
