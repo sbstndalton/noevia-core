@@ -693,7 +693,12 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     inferenceEstimates,
     // #697: the load guard and the budget, for the proxied benchmark start and the watchdog.
     loadRefusal: model => overBudget(model).then(r => r ? r.body : null),
-    presetRefusal: (model, options) => presetRefusal(model, require('./llamacpp-presets.cjs').canonicalOptions(options)),
+    // LLAMACPP_PRESETS_IMPL=wasm: an entry the Rust port folds differently is refused (400), never dropped.
+    presetRefusal: (model, options) => {
+      const checked = require('./llamacpp-presets.cjs').checkedCanonicalOptions(options);
+      if (checked.refused !== null) return Promise.resolve({ error: `Not saved: the preset option ${JSON.stringify(String(checked.refused).slice(0, 40))} could not be checked.`, code: 'invalid_size' });
+      return presetRefusal(model, checked.options);
+    },
     quarantine,
     sizingBudgetGib,
     reloadPresets,

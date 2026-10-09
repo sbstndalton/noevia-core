@@ -73,6 +73,9 @@
 //   - crates/toolboxes-permitted toolboxes* = toolboxes-permitted.cjs projectToolboxIds,
 //                          selectedToolboxIds and computePermittedTools over the host's
 //                          projections (TOOLBOXES_PERMITTED_IMPL)
+//   - crates/llamacpp-presets llamacppPresets* = llamacpp-presets.cjs prepare's option check (with
+//                          inference-budget.cjs clampCacheRam), canonicalOptions, the micro-batch
+//                          check and the model name pattern (LLAMACPP_PRESETS_IMPL)
 //
 // Memory: WebAssembly memory only grows. A listing or path call needs at most ~16 MiB; an upload
 // decode copies the upload in (at most 25 MiB) and holds one copy of its text (at most 3 bytes per
@@ -104,7 +107,7 @@ const MAX_DECODE_BYTES = 25 * 1024 * 1024;
 // Only the first bytes decide an archive magic number (`ustar` ends at 262).
 const SNIFF_BYTES = 262;
 const RESET_AFTER_BYTES = 1024 * 1024;
-const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'secret_open', 'secret_seal', 'mcp_rpc_body', 'mcp_schema_refs', 'template_caps', 'provider_error', 'serving_verdict', 'autotune_plan', 'preset_reload', 'load_verdict', 'tune_contention', 'frame_untrusted', 'escape_closing', 'provenance', 'task_packet', 'long_profile', 's3_sign', 's3_region', 'ssrf_policy', 'stream_guard', 'gguf_summary', 'auth_tokens', 'tool_policy', 'review_verdict', 'tool_exchange', 'mcp_servers', 'decision', 'code_net_guard', 'role_context', 'completeness_report', 'task_lifecycle', 'llamacpp_autoconfig', 'code_actions', 'project_file_names', 'provider_egress', 'browser_policy', 'tool_gate', 'toolboxes_permitted', 'dav_output_ptr', 'dav_output_len'];
+const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'secret_open', 'secret_seal', 'mcp_rpc_body', 'mcp_schema_refs', 'template_caps', 'provider_error', 'serving_verdict', 'autotune_plan', 'preset_reload', 'load_verdict', 'tune_contention', 'frame_untrusted', 'escape_closing', 'provenance', 'task_packet', 'long_profile', 's3_sign', 's3_region', 'ssrf_policy', 'stream_guard', 'gguf_summary', 'auth_tokens', 'tool_policy', 'review_verdict', 'tool_exchange', 'mcp_servers', 'decision', 'code_net_guard', 'role_context', 'completeness_report', 'task_lifecycle', 'llamacpp_autoconfig', 'code_actions', 'project_file_names', 'provider_egress', 'browser_policy', 'tool_gate', 'toolboxes_permitted', 'llamacpp_presets', 'dav_output_ptr', 'dav_output_len'];
 
 class DavParseError extends Error {
   constructor(message, reason) {
@@ -2182,10 +2185,54 @@ function toolboxesPermitted(input) {
   return r;
 }
 
+// --- llamacpp presets (LLAMACPP_PRESETS_IMPL) ------------------------------------------------------
+// llamacpp_presets::MAX_INPUT_BYTES. The host sends option keys and values as strings (values
+// already String()-ed where the JS would), the cache-ram hard maximum (a number or null) and the
+// effective micro-batch and batch values (a string or null each). Every reply is checked for shape;
+// a refusal or bad reply throws a DavParseError, which llamacpp-presets.cjs answers by refusing.
+const MAX_LLAMACPP_PRESETS_BYTES = 4 * 1024 * 1024 + 1;
+const presetsCall = (op, args) => jsonOpCall(op, args, MAX_LLAMACPP_PRESETS_BYTES, (e) => e.llamacpp_presets(), 'llamacpp presets').reply;
+const stringPairs = (pairs, nullable) => Array.isArray(pairs) && pairs.every((p) => Array.isArray(p) && p.length === 2 && typeof p[0] === 'string'
+  && (typeof p[1] === 'string' || (nullable && p[1] === null)));
+function presetsInput(ok, what) { if (!ok) throw new DavParseError(`llamacpp presets ${what} input has the wrong shape`, 'input'); }
+
+/** prepare's option check: `{ values }`, each the value as it would be written or null (refused). */
+function llamacppPresetsValues(pairs, hardMaxMib) {
+  presetsInput(stringPairs(pairs, false) && (hardMaxMib === null || (typeof hardMaxMib === 'number' && Number.isFinite(hardMaxMib))), 'values');
+  const r = presetsCall(1, [pairs, hardMaxMib]);
+  if (!exactKeys(r, ['values']) || !stringsOrNull(r.values) || r.values.length !== pairs.length) badReply('llamacpp presets values');
+  return r;
+}
+
+/** canonicalOptions per entry: `{ options: [[field|null, trimmed|null]] }`. */
+function llamacppPresetsCanonical(pairs) {
+  presetsInput(stringPairs(pairs, true), 'canonical');
+  const r = presetsCall(2, [pairs]);
+  if (!exactKeys(r, ['options']) || !Array.isArray(r.options) || r.options.length !== pairs.length
+    || !r.options.every((o) => Array.isArray(o) && o.length === 2 && stringsOrNull(o))) badReply('llamacpp presets canonical');
+  return r;
+}
+
+/** Number(ubatch) > Number(batch): `{ exceeds }`, true, false or null (undecided). */
+function llamacppPresetsBatch(ubatch, batch) {
+  presetsInput((ubatch === null || typeof ubatch === 'string') && (batch === null || typeof batch === 'string'), 'batch');
+  const r = presetsCall(3, [ubatch, batch]);
+  if (!exactKeys(r, ['exceeds']) || !(r.exceeds === null || typeof r.exceeds === 'boolean')) badReply('llamacpp presets batch');
+  return r;
+}
+
+/** The model name pattern: `{ ok }`. */
+function llamacppPresetsModel(model) {
+  presetsInput(typeof model === 'string', 'model');
+  const r = presetsCall(4, [model]);
+  if (!exactKeys(r, ['ok']) || typeof r.ok !== 'boolean') badReply('llamacpp presets model');
+  return r;
+}
+
 // Every switch that runs this module (#996). Each reads its value as trim().toLowerCase().
 // Retired switches (#1071) are not listed: the Rust path they selected is always on, and
 // verifyAtStartup() always loads this module for it.
-const IMPL_FLAGS = ['STORAGE_PATH_IMPL', 'SECRET_ENVELOPE_IMPL', 'STREAM_GUARD_IMPL', 'GGUF_META_IMPL', 'ROLE_CONTEXT_IMPL', 'CODE_ACTIONS_IMPL', 'PROJECT_FILE_NAMES_IMPL', 'PROVIDER_EGRESS_IMPL', 'BROWSER_POLICY_IMPL', 'TOOL_GATE_IMPL', 'TOOLBOXES_PERMITTED_IMPL'];
+const IMPL_FLAGS = ['STORAGE_PATH_IMPL', 'SECRET_ENVELOPE_IMPL', 'STREAM_GUARD_IMPL', 'GGUF_META_IMPL', 'ROLE_CONTEXT_IMPL', 'CODE_ACTIONS_IMPL', 'PROJECT_FILE_NAMES_IMPL', 'PROVIDER_EGRESS_IMPL', 'BROWSER_POLICY_IMPL', 'TOOL_GATE_IMPL', 'TOOLBOXES_PERMITTED_IMPL', 'LLAMACPP_PRESETS_IMPL'];
 
 /** Switches whose JS path was deleted once Rust had run in production (#1071). The old value that
  *  selected Rust ('wasm', or 'on' for the advisor) is accepted silently; anything else is ignored
@@ -2245,5 +2292,5 @@ function verifyAtStartup(env = process.env, { hostname } = {}) {
 /** Test hook: forget the cached module (and its failure). */
 function reset() { cached = null; }
 
-module.exports = { toolGateRule, toolGateOptions, toolGateAnswer, toolGateQueries, toolGateMonths, toolGatePublic, MAX_TOOL_GATE_BYTES,
+module.exports = { llamacppPresetsValues, llamacppPresetsCanonical, llamacppPresetsBatch, llamacppPresetsModel, MAX_LLAMACPP_PRESETS_BYTES, toolGateRule, toolGateOptions, toolGateAnswer, toolGateQueries, toolGateMonths, toolGatePublic, MAX_TOOL_GATE_BYTES,
   toolboxesProjectIds, toolboxesSelectedIds, toolboxesPermitted, MAX_TOOLBOXES_BYTES, browserPolicyClassify, browserPolicyNavigation, browserPolicySubstitute, browserPolicyFold, MAX_BROWSER_POLICY_BYTES, providerEgressExternal, providerEgressRefusal, providerEgressStrip, providerEgressToolRefusal, providerEgressCanonical, providerEgressFolder, MAX_PROVIDER_EGRESS_BYTES, codeActionsClassify, codeActionsDecide, codeActionsPick, MAX_CODE_ACTIONS_BYTES, projectFileNames, MAX_PROJECT_FILE_NAMES_BYTES, llamacppAutoconfig, autoconfigReply, MAX_AUTOCONFIG_BYTES, taskLifecycleCanTransition, taskLifecycleTransition, taskLifecycleStageMove, taskLifecycleFold, taskLifecycleDerive, taskLifecycleReply, MAX_TASK_LIFECYCLE_BYTES, completenessReport, completenessReply, MAX_COMPLETENESS_BYTES, roleContextProject, roleContextDossier, roleContextReply, MAX_ROLE_CONTEXT_BYTES, codeNetSpec, codeNetResolved, codeNetRefuses, MAX_CODE_NET_BYTES, MAX_CODE_NET_ENTRIES, mcpServersParse, mcpToolboxes, mcpToolboxOffered, MAX_MCP_SERVERS_BYTES, decisionRequestTag, decisionResultTag, decisionInvalidRequest, decisionInvalidResult, decisionCauseOf, decisionErrorFacts, decisionRequest, MAX_DECISION_MESSAGE_UNITS, MAX_DECISION_BYTES, DECISION_ENTRIES, reviewTag, reviewVerdictRead, reviewEventBound, reviewVerdictReply, MAX_REVIEW_BYTES, toolExchangeCheck, toolExchangeError, MAX_EXCHANGE_ARGS_UNITS, MAX_EXCHANGE_NAME_UNITS, ggufSummary, ggufSummaryReply, MAX_GGUF_WINDOW_BYTES, MAX_GGUF_SEGMENTS, authTokens, toolPolicyMode, toolPolicySet, MAX_POLICY_UNITS, MAX_POLICY_TOOLS, streamGuardSchema, streamGuardOptions, streamGuardNew, streamGuardFeed, streamGuardEnd, streamGuardCheck, streamGuardCheckReply, streamGuardCorrection, streamGuardReply, plainJson, MAX_GUARD_BYTES, MAX_GUARD_DEPTH, MAX_GUARD_SCHEMA_BYTES, MAX_GUARD_STATE_BYTES, MAX_GUARD_INPUT_BYTES, MAX_CORRECTION_UNITS, s3Sign, s3Region, MAX_S3_FIELD_BYTES, MAX_S3_QUERY_PAIRS, MAX_S3_PAYLOAD_BYTES, wasmFlags, RETIRED_FLAGS, warnRetiredFlags, verifyAtStartup, framingRuntimeMatches, IMPL_FLAGS, ssrfUrl, ssrfAddressesPublic, ssrfUrlReply, ssrfAddressesReply, MAX_SSRF_BYTES, MAX_SSRF_ADDRESSES, frameUntrusted, escapeClosing, provenanceNew, provenanceIngest, provenanceAdd, provenanceSource, provenanceCheck, provenanceProbe, packetParse, packetValidate, packetRender, FRAME_TEXT_UNITS, FRAME_LABEL_UNITS, MAX_PROVENANCE_BYTES, MAX_PACKET_BYTES, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, tuneContention, tuneContentionText, MAX_CONTENTION_BYTES, longProfilePairs, longProfileSection, longProfilePick, longProfileText, MAX_LONG_PROFILE_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };

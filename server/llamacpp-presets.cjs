@@ -1,4 +1,15 @@
 'use strict';
+// LLAMACPP_PRESETS_IMPL=js|wasm (default js; any other value means js, with one warning), read from
+// the store's `env` option (process.env) on every call. Preset values reach llama-server's command
+// line and an oversized one can livelock the host (#697, #1132), so wasm also asks noevia-rs's
+// llamacpp-presets crate (dav-parse.wasm llamacpp_presets) and can only refuse more: the JS answer
+// is computed first; an option is written only if the port accepts it with the identical value
+// (after the cache-ram clamp), the model name only if both accept it, the micro-batch check passes
+// only if both say it passes, and canonicalOptions() is used only if the port folds every entry to
+// the same field and value. A mismatch, a fault or an undecided answer refuses with the caller's
+// existing refusal (400 Invalid preset option / Invalid preset model name; presetRefusal's
+// invalid_size, also a 400). Warnings are logged once per event and reason and carry no input. The
+// flag is in dav-parse-wasm.cjs IMPL_FLAGS (a missing or tampered module stops startup).
 const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto');
 const integer=(min,max)=>v=>/^\d+$/.test(v)&&Number(v)>=min&&Number(v)<=max;
 const decimal=(min,max)=>v=>/^\d+(\.\d{1,3})?$/.test(v)&&Number(v)>=min&&Number(v)<=max;
@@ -28,6 +39,20 @@ const fields={
   'repeat-penalty':{aliases:[],valid:decimal(0,3)},
 };
 const canonical=key=>Object.keys(fields).find(k=>k===key||fields[k].aliases.includes(key));
+// The pure checks prepare() makes, at module level so the Rust port is asked with the same inputs.
+const modelNameOk=model=>typeof model==='string'&&/^[\w./:-]{1,200}$/.test(model);
+/** One entry of prepare()'s option loop: the value as it would be written (cache-ram clamped to
+ *  `limits`, inference-budget.cjs clampCacheRam), or undefined where the write is refused. */
+function optionValue(key,value,limits){
+  if(key==='cache-ram'&&typeof value==='string'&&value!=='')value=require('./inference-budget.cjs').clampCacheRam(value,limits);
+  if(!Object.hasOwn(fields,key) || typeof value!=='string' || value!==''&&!fields[key].valid(value))return undefined;
+  return value;
+}
+/** One canonicalOptions() entry over its projection (the key and String(value), or null for a
+ *  null/undefined value): [field or null, trimmed value or null]. */
+const canonicalEntry=(key,value)=>[canonical(key.trim().replace(/^-+/,''))??null,value===null?null:value.trim()];
+/** prepare()'s micro-batch check over the effective values (strings or undefined). */
+const microBatchExceeds=(ubatch,batch)=>Number(ubatch)>Number(batch);
 const error=(status,message)=>Object.assign(Error(message),{status});
 const revision=text=>crypto.createHash('sha256').update(text).digest('hex');
 // #874: recovery copies `<file>.noevia-backup-<revision>` are whole-file snapshots taken before each
@@ -65,8 +90,42 @@ function parse(text) {
   });
   return {lines,sections};
 }
-const modelNameOk=model=>typeof model==='string'&&/^[\w./:-]{1,200}$/.test(model);
-function createPresetStore(file,{writer=null,cacheRam=null,backupKeep=BACKUP_KEEP}={}) {
+// ── LLAMACPP_PRESETS_IMPL ───────────────────────────────────────────────────
+const IMPLS=new Set(['js','wasm']);
+let warnedImpl='';
+/** LLAMACPP_PRESETS_IMPL: 'js' (default) or 'wasm'. */
+function llamacppPresetsImpl(env=process.env){
+  const raw=env?.LLAMACPP_PRESETS_IMPL;
+  if(raw===undefined||raw==='')return 'js';
+  const v=String(raw).trim().toLowerCase();
+  if(IMPLS.has(v))return v;
+  if(warnedImpl!==v){warnedImpl=v;console.warn(`[llamacpp-presets] LLAMACPP_PRESETS_IMPL=${JSON.stringify(String(raw))} is not js or wasm; using js`);}
+  return 'js';
+}
+const defaultLoader=()=>require('./dav-parse-wasm.cjs');
+const warnedPort=new Set();
+function portWarn(event,reason){
+  const key=`${event}:${reason}`;
+  if(warnedPort.has(key))return;
+  warnedPort.add(key);
+  console.warn(`[llamacpp-presets] ${event} (${reason}); the option was refused`);
+}
+/** Asks the port; undefined (after a warning) when it throws. */
+function ask(wasmLoader,fn){
+  try{return fn(wasmLoader());}catch(err){portWarn('llamacpp_presets.wasm_fault',String(err?.reason||'unexpected').slice(0,40));return undefined;}
+}
+// The hard maximum clampCacheRam reads, as the port takes it (a finite number or null).
+const hardMaxOf=limits=>{const h=limits?.hardMaxMib;return typeof h==='number'&&Number.isFinite(h)?h:null;};
+/** Under wasm: the key of the first option the port does not accept with the identical value, or
+ *  null when it accepts them all. `raw` are the options as sent, `updates` what the JS accepted. */
+function portRefusedOption(wasmLoader,raw,updates,limits){
+  const pairs=Object.entries(raw);
+  const r=ask(wasmLoader,w=>w.llamacppPresetsValues(pairs,hardMaxOf(limits)));
+  if(!r)return pairs[0][0];
+  for(let i=0;i<pairs.length;i++)if(r.values[i]!==updates[pairs[i][0]]){portWarn('llamacpp_presets.mismatch','option');return pairs[i][0];}
+  return null;
+}
+function createPresetStore(file,{writer=null,cacheRam=null,backupKeep=BACKUP_KEEP,env=process.env,wasmLoader=defaultLoader}={}) {
   const budget=require('./inference-budget.cjs');
   const limits=()=>cacheRam||budget.cacheRamLimits();
   if(!file || !path.isAbsolute(file))throw error(500,'LLAMACPP_PRESET_PATH must be an absolute path');
@@ -81,14 +140,17 @@ function createPresetStore(file,{writer=null,cacheRam=null,backupKeep=BACKUP_KEE
   }
   function prepare({model,baseRevision,options}) {
     if(!modelNameOk(model))throw error(400,'Invalid preset model name');
+    const wasm=llamacppPresetsImpl(env)==='wasm';
+    if(wasm&&(ask(wasmLoader,w=>w.llamacppPresetsModel(model))?.ok!==true))throw error(400,'Invalid preset model name');
     if(!options||typeof options!=='object'||Array.isArray(options))throw error(400,'Preset options are required');
     const updates={};
-    for(let [key,value] of Object.entries(options)) {
-      if(key==='cache-ram'&&typeof value==='string'&&value!=='')value=budget.clampCacheRam(value,limits());
-      if(!Object.hasOwn(fields,key) || typeof value!=='string' || value!==''&&!fields[key].valid(value))throw error(400,`Invalid preset option: ${key}`);
+    for(const [key,raw] of Object.entries(options)) {
+      const value=optionValue(key,raw,limits());
+      if(value===undefined)throw error(400,`Invalid preset option: ${key}`);
       updates[key]=value;
     }
     if(!Object.keys(updates).length)throw error(400,'No preset changes supplied');
+    if(wasm){const refused=portRefusedOption(wasmLoader,options,updates,limits());if(refused!==null)throw error(400,`Invalid preset option: ${refused}`);}
     const data=read();if(baseRevision!==data.revision)throw error(409,'Presets changed. Reload the profile before saving; your draft is retained.');
     const section=data.sections.get(model);let lines=[...data.lines];
     // #697: every write leaves this model with an explicit, bounded prompt cache. Unset (or a
@@ -118,7 +180,13 @@ function createPresetStore(file,{writer=null,cacheRam=null,backupKeep=BACKUP_KEE
     const local={...(section?.options||{})};
     for(const [key,value] of Object.entries(updates)){if(value==='')delete local[key];else local[key]=value;}
     const effective={...(data.sections.get('*')?.options||{}),...local};
-    if(Number(effective['ubatch-size'])>Number(effective['batch-size']))throw error(400,'Micro batch cannot exceed batch size');
+    if(microBatchExceeds(effective['ubatch-size'],effective['batch-size']))throw error(400,'Micro batch cannot exceed batch size');
+    if(wasm){
+      const v=k=>effective[k]===undefined?null:effective[k];
+      const r=ask(wasmLoader,w=>w.llamacppPresetsBatch(v('ubatch-size'),v('batch-size')));
+      if(r?.exceeds===true)throw error(400,'Micro batch cannot exceed batch size');
+      if(r?.exceeds!==false){if(r)portWarn('llamacpp_presets.undecided','batch');throw error(400,'Invalid preset option: ubatch-size');}
+    }
     return {before:data.text,baseRevision:data.revision,text,revision:revision(text)};
   }
   // Async in both modes so callers need not know who the writer is.
@@ -164,4 +232,23 @@ function canonicalOptions(options){
   for(const [key,value] of Object.entries(options||{})){const c=canonical(String(key).trim().replace(/^-+/,''));if(c&&value!=null)out[c]=String(value).trim();}
   return out;
 }
-module.exports={createPresetStore,parse,fields,canonical,canonicalOptions,pruneBackups,BACKUP_KEEP};
+/** canonicalOptions(options) and, under LLAMACPP_PRESETS_IMPL=wasm, the key of the first entry the
+ *  port folds to another field or value (or the first key, on a fault): `{ options, refused }`.
+ *  A refused entry is never dropped quietly; the caller refuses the whole save. */
+function checkedCanonicalOptions(options,{env=process.env,wasmLoader=defaultLoader}={}){
+  const out=canonicalOptions(options);
+  if(llamacppPresetsImpl(env)!=='wasm')return {options:out,refused:null};
+  const entries=Object.entries(options||{});
+  if(!entries.length)return {options:out,refused:null};
+  let pairs;
+  try{pairs=entries.map(([k,v])=>[String(k),v==null?null:String(v)]);}catch{portWarn('llamacpp_presets.wasm_fault','projection');return {options:out,refused:String(entries[0][0])};}
+  const r=ask(wasmLoader,w=>w.llamacppPresetsCanonical(pairs));
+  if(!r)return {options:out,refused:pairs[0][0]};
+  for(let i=0;i<pairs.length;i++){
+    const [c,t]=canonicalEntry(...pairs[i]),k=pairs[i][0];
+    const [pc,pv]=r.options[i];
+    if(pc!==c||pv!==t){portWarn('llamacpp_presets.mismatch','canonical');return {options:out,refused:k};}
+  }
+  return {options:out,refused:null};
+}
+module.exports={createPresetStore,parse,fields,canonical,canonicalOptions,checkedCanonicalOptions,llamacppPresetsImpl,modelNameOk,optionValue,canonicalEntry,microBatchExceeds,pruneBackups,BACKUP_KEEP};
