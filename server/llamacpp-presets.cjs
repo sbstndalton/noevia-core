@@ -65,6 +65,7 @@ function parse(text) {
   });
   return {lines,sections};
 }
+const modelNameOk=model=>typeof model==='string'&&/^[\w./:-]{1,200}$/.test(model);
 function createPresetStore(file,{writer=null,cacheRam=null,backupKeep=BACKUP_KEEP}={}) {
   const budget=require('./inference-budget.cjs');
   const limits=()=>cacheRam||budget.cacheRamLimits();
@@ -79,7 +80,7 @@ function createPresetStore(file,{writer=null,cacheRam=null,backupKeep=BACKUP_KEE
     return {model,revision:data.revision,exists:!!section,options:section?.options || {},defaults:data.sections.get('*')?.options || {},fields:Object.keys(fields)};
   }
   function prepare({model,baseRevision,options}) {
-    if(!/^[\w./:-]{1,200}$/.test(model || ''))throw error(400,'Invalid preset model name');
+    if(!modelNameOk(model))throw error(400,'Invalid preset model name');
     if(!options||typeof options!=='object'||Array.isArray(options))throw error(400,'Preset options are required');
     const updates={};
     for(let [key,value] of Object.entries(options)) {

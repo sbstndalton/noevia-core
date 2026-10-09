@@ -97,3 +97,12 @@ test('#1003 commit with backup:false keeps no recovery copy; the default still d
  await store.commit(store.prepare({model:'synthetic',baseRevision:store.get('synthetic').revision,options:{'ctx-size':'8192'}}));
  assert.equal(copies().length,1);
 });
+
+test('#1231 a non-string model name is refused, not coerced into a section name',t=>{
+ for(const [model,section] of [[['m'],'m'],[123,'123']]){
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'native-presets-1231-'));t.after(()=>fs.rmSync(dir,{recursive:true,force:true}));
+  const file=path.join(dir,'models.ini');fs.writeFileSync(file,`version = 1\n[${section}]\nmodel = /models/test.gguf\nc = 8192\n`);
+  const store=createPresetStore(file);
+  assert.throws(()=>store.prepare({model,baseRevision:store.get(section).revision,options:{'ctx-size':'4096'}}),e=>e.status===400&&/Invalid preset model name/.test(e.message));
+ }
+});
