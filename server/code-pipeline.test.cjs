@@ -68,7 +68,7 @@ function fakeVerifier(outcomes) {
 async function runPipeline({ verdicts = ['approve'], tests = ['pass'], merge = true, answers = {}, approvePlan = false,
   plan = PLAN, verify = null, agent = null, onReview = null, onAccept = null, deadlines = {}, maxLoops = 2,
   auditText = JSON.stringify({ completeness: 'complete', summary: 'All plan steps have evidence.', evidence: [{ source: 'tests', note: 'Measured at head.' }], gaps: [] }),
-  cancelDuring = null, detach = true, wrapJobs = (j) => j, pin = null } = {}) {
+  cancelDuring = null, detach = true, wrapJobs = (j) => j, pin = null, prompt = 'Make the widget return two.' } = {}) {
   const dir = temp('noevia-pjobs-');
   const source = repo();
   const jobs = createJobs({ dir });
@@ -117,7 +117,7 @@ async function runPipeline({ verdicts = ['approve'], tests = ['pass'], merge = t
     git(cwd, 'add', 'widget.js'); git(cwd, 'commit', '-qm', `round ${round}`);
     return { stopReason: 'end_turn' };
   } });
-  const started = pipeline.start({ projectId: 'p-synthetic', repo: { id: 'fixture', path: source }, prompt: 'Make the widget return two.',
+  const started = pipeline.start({ projectId: 'p-synthetic', repo: { id: 'fixture', path: source }, prompt,
     capabilities: ['read', 'edit', 'execute'], connect, tenantId: 'tenant-synthetic', approvePlan });
   // noevia never moves a base that is checked out (#715 review): the owner's tree is on no branch.
   if (detach) git(source, 'checkout', '-q', '--detach');
@@ -543,6 +543,6 @@ test('#1157: a task blocked before the agent starts still carries its prompt and
   assert.equal(typeof run.view.branch, 'string');
   assert.ok(run.view.branch.length > 0);
   assert.equal(run.view.baseSha, git(run.source, 'rev-parse', 'main'));
-  const long = await runPipeline({ pin: async () => ({ ok: false, reason: 'x' }) });
-  assert.ok(long.view.task.length <= 120);
+  const long = await runPipeline({ prompt: 'Make the widget return two. '.repeat(10), pin: async () => ({ ok: false, reason: 'x' }) });
+  assert.equal(long.view.task.length, 120);
 });
