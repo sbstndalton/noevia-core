@@ -95,6 +95,11 @@ test('estimateInputs: JS figures at least the port\'s stand; anything else refus
   const js = ac.estimateInputsJs(INPUTS);
   const lower = { ...js, modelGib: js.modelGib - 0.5, rows: js.rows.map((r) => ({ ...r, kvQ8Gib: r.kvQ8Gib / 2 })) };
   assert.deepEqual(capture(() => ac.estimateInputs(INPUTS, wasm(reply(lower)))).value, js);
+  // noevia#1134: lower figures do not excuse different facts.
+  for (const port of [{ ...lower, moe: !js.moe }, { ...lower, chat: !js.chat }, { ...lower, nativeCtx: 4096 }, { ...lower, current: { ...js.current, ctx: 8192 } },
+    { ...lower, current: { ...js.current, kv: 'q4_0' } }, { ...lower, current: null }]) {
+    assert.throws(() => capture(() => ac.estimateInputs(INPUTS, wasm(reply(port)))), (e) => e.code === 'autoconfig_impl', JSON.stringify(port).slice(0, 60));
+  }
   for (const port of [{ ...js, pinnedGib: js.pinnedGib + 1 }, { ...js, rows: js.rows.slice(1) }, { ...js, cacheRamGib: 99 }, { ...js, rows: js.rows.map((r) => ({ ...r, kvQ8Gib: r.kvQ8Gib + 1 })) }]) {
     assert.throws(() => capture(() => ac.estimateInputs(INPUTS, wasm(reply(port)))), (e) => e.code === 'autoconfig_impl');
   }

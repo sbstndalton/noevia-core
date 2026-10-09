@@ -264,7 +264,8 @@ function parseMemoryLimit(value) {
 //                     total), or its total is at least the port's, the port's prompt cache is
 //                     bounded and the port can size every model the JS sizes;
 //   estimateInputs    every JS figure (model, projector, each KV row, prompt cache) is at least the
-//                     port's, over the same context rows.
+//                     port's, over the same context rows, with chat, moe, nativeCtx and the current
+//                     ctx and kv equal (noevia#1134).
 // Otherwise suggest returns an error (no settings, code 'autoconfig_impl') and the two estimates
 // throw an AutoconfigImplError, which llamacpp-manager.cjs turns into a refused load or save (or a
 // 503 for the read-only panel). So the port never makes a suggestion or a load larger than the JS
@@ -346,6 +347,9 @@ function footprintIsConservative(js, port) {
 function inputsAreConservative(js, port) {
   if (!isObj(js) || !isObj(port) || !Array.isArray(js.rows) || !Array.isArray(port.rows)) return false;
   if (js.rows.length !== port.rows.length || js.reserveGib !== port.reserveGib || js.safety !== port.safety) return false;
+  // noevia#1134: the facts the panel shows beside the figures must be the same, not just no smaller.
+  if (js.moe !== port.moe || js.chat !== port.chat || js.nativeCtx !== port.nativeCtx) return false;
+  if (!isObj(js.current) || !isObj(port.current) || js.current.ctx !== port.current.ctx || js.current.kv !== port.current.kv) return false;
   const atLeast = (a, b) => typeof a === 'number' && typeof b === 'number' && a >= b;
   if (!atLeast(js.modelGib, port.modelGib) || !atLeast(js.pinnedGib, port.pinnedGib)) return false;
   if (js.cacheRamGib !== null && !atLeast(js.cacheRamGib, port.cacheRamGib)) return false;
