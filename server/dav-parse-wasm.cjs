@@ -61,6 +61,9 @@
 //                          pickOption over the host's projection (CODE_ACTIONS_IMPL)
 //   - crates/project-file-names projectFileNames = project-file-names.cjs resolveProjectFile over
 //                          the project's file names (PROJECT_FILE_NAMES_IMPL)
+//   - crates/provider-egress providerEgress* = provider-egress.cjs isExternalProvider,
+//                          isTrialTermsHost, egressRefusal, stripPrivateToolboxes, toolRefusal,
+//                          canonicalPath and diaryFolderFor over the host's projections (PROVIDER_EGRESS_IMPL)
 //
 // Memory: WebAssembly memory only grows. A listing or path call needs at most ~16 MiB; an upload
 // decode copies the upload in (at most 25 MiB) and holds one copy of its text (at most 3 bytes per
@@ -92,7 +95,7 @@ const MAX_DECODE_BYTES = 25 * 1024 * 1024;
 // Only the first bytes decide an archive magic number (`ustar` ends at 262).
 const SNIFF_BYTES = 262;
 const RESET_AFTER_BYTES = 1024 * 1024;
-const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'secret_open', 'secret_seal', 'mcp_rpc_body', 'mcp_schema_refs', 'template_caps', 'provider_error', 'serving_verdict', 'autotune_plan', 'preset_reload', 'load_verdict', 'tune_contention', 'frame_untrusted', 'escape_closing', 'provenance', 'task_packet', 'long_profile', 's3_sign', 's3_region', 'ssrf_policy', 'stream_guard', 'gguf_summary', 'auth_tokens', 'tool_policy', 'review_verdict', 'tool_exchange', 'mcp_servers', 'decision', 'code_net_guard', 'role_context', 'completeness_report', 'task_lifecycle', 'llamacpp_autoconfig', 'code_actions', 'project_file_names', 'dav_output_ptr', 'dav_output_len'];
+const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'secret_open', 'secret_seal', 'mcp_rpc_body', 'mcp_schema_refs', 'template_caps', 'provider_error', 'serving_verdict', 'autotune_plan', 'preset_reload', 'load_verdict', 'tune_contention', 'frame_untrusted', 'escape_closing', 'provenance', 'task_packet', 'long_profile', 's3_sign', 's3_region', 'ssrf_policy', 'stream_guard', 'gguf_summary', 'auth_tokens', 'tool_policy', 'review_verdict', 'tool_exchange', 'mcp_servers', 'decision', 'code_net_guard', 'role_context', 'completeness_report', 'task_lifecycle', 'llamacpp_autoconfig', 'code_actions', 'project_file_names', 'provider_egress', 'dav_output_ptr', 'dav_output_len'];
 
 class DavParseError extends Error {
   constructor(message, reason) {
@@ -1929,10 +1932,65 @@ function projectFileNames(names, raw) {
   return badReply('project file names');
 }
 
+// --- provider egress (PROVIDER_EGRESS_IMPL) ------------------------------------------------------
+// provider_egress::MAX_INPUT_BYTES (the op byte and the JSON). The host sends its projections of a
+// provider row ({kind, external, baseUrl, label}), a storage connection ({kind, corpusRoot,
+// baseUrl}: no credentials) and a tool call's name and arguments. Every reply is checked for shape;
+// a refusal or bad reply throws a DavParseError, which provider-egress.cjs answers strictly.
+const MAX_PROVIDER_EGRESS_BYTES = 8 * 1024 * 1024 + 1;
+const egressCall = (op, args) => jsonOpCall(op, args, MAX_PROVIDER_EGRESS_BYTES, (e) => e.provider_egress(), 'provider egress').reply;
+const boolOrNull = (v) => v === true || v === false || v === null;
+const refusalOf = (r, what) => (exactKeys(r, ['refusal']) && (r.refusal === null || (typeof r.refusal === 'string' && r.refusal !== '')) ? r : badReply(what));
+
+/** isExternalProvider / isTrialTermsHost: `{ external, trial }`, each true, false or null (unknown). */
+function providerEgressExternal(provider) {
+  const r = egressCall(1, [provider]);
+  if (!exactKeys(r, ['external', 'trial']) || !boolOrNull(r.external) || !boolOrNull(r.trial)) badReply('provider egress external');
+  return r;
+}
+
+/** egressRefusal: `{ refusal }` (null or the text). */
+function providerEgressRefusal(provider, spaceId, projectId, diaryProjectId) {
+  return refusalOf(egressCall(2, [provider, spaceId, projectId, diaryProjectId]), 'provider egress refusal');
+}
+
+/** stripPrivateToolboxes: `{ removed }`, ascending indices into `selected`. */
+function providerEgressStrip(provider, selected) {
+  if (!Array.isArray(selected)) throw new DavParseError('provider egress selection must be an array', 'input');
+  const r = egressCall(3, [provider, selected]);
+  const ok = exactKeys(r, ['removed']) && Array.isArray(r.removed)
+    && r.removed.every((i, k) => Number.isSafeInteger(i) && i >= 0 && i < selected.length && (k === 0 || i > r.removed[k - 1]));
+  if (!ok) badReply('provider egress strip');
+  return r;
+}
+
+/** toolRefusal: `{ refusal }` (null or the text). `rawArgs` is the string or the value itself. */
+function providerEgressToolRefusal(provider, toolName, rawArgs, storage) {
+  if (typeof toolName !== 'string') throw new DavParseError('provider egress tool name must be a string', 'input');
+  return refusalOf(egressCall(4, [provider, toolName, rawArgs, storage]), 'provider egress tool refusal');
+}
+
+/** canonicalPath over each path: `{ canonical }`, a string or null (unknown to the port) each. */
+function providerEgressCanonical(paths) {
+  if (!allStrings(paths)) throw new DavParseError('provider egress paths must be strings', 'input');
+  const r = egressCall(5, [paths]);
+  if (!exactKeys(r, ['canonical']) || !Array.isArray(r.canonical) || r.canonical.length !== paths.length
+    || !r.canonical.every((c) => c === null || typeof c === 'string')) badReply('provider egress canonical');
+  return r;
+}
+
+/** diaryFolderFor: `{ folder, known }` (folder null and known true: the JS's null too). */
+function providerEgressFolder(storage) {
+  const r = egressCall(6, [storage]);
+  if (!exactKeys(r, ['folder', 'known']) || typeof r.known !== 'boolean' || !(r.folder === null || (typeof r.folder === 'string' && r.folder !== ''))
+    || (!r.known && r.folder !== null)) badReply('provider egress folder');
+  return r;
+}
+
 // Every switch that runs this module (#996). Each reads its value as trim().toLowerCase().
 // Retired switches (#1071) are not listed: the Rust path they selected is always on, and
 // verifyAtStartup() always loads this module for it.
-const IMPL_FLAGS = ['STORAGE_PATH_IMPL', 'SECRET_ENVELOPE_IMPL', 'STREAM_GUARD_IMPL', 'GGUF_META_IMPL', 'ROLE_CONTEXT_IMPL', 'CODE_ACTIONS_IMPL', 'PROJECT_FILE_NAMES_IMPL'];
+const IMPL_FLAGS = ['STORAGE_PATH_IMPL', 'SECRET_ENVELOPE_IMPL', 'STREAM_GUARD_IMPL', 'GGUF_META_IMPL', 'ROLE_CONTEXT_IMPL', 'CODE_ACTIONS_IMPL', 'PROJECT_FILE_NAMES_IMPL', 'PROVIDER_EGRESS_IMPL'];
 
 /** Switches whose JS path was deleted once Rust had run in production (#1071). The old value that
  *  selected Rust ('wasm', or 'on' for the advisor) is accepted silently; anything else is ignored
@@ -1992,4 +2050,4 @@ function verifyAtStartup(env = process.env, { hostname } = {}) {
 /** Test hook: forget the cached module (and its failure). */
 function reset() { cached = null; }
 
-module.exports = { codeActionsClassify, codeActionsDecide, codeActionsPick, MAX_CODE_ACTIONS_BYTES, projectFileNames, MAX_PROJECT_FILE_NAMES_BYTES, llamacppAutoconfig, autoconfigReply, MAX_AUTOCONFIG_BYTES, taskLifecycleCanTransition, taskLifecycleTransition, taskLifecycleStageMove, taskLifecycleFold, taskLifecycleDerive, taskLifecycleReply, MAX_TASK_LIFECYCLE_BYTES, completenessReport, completenessReply, MAX_COMPLETENESS_BYTES, roleContextProject, roleContextDossier, roleContextReply, MAX_ROLE_CONTEXT_BYTES, codeNetSpec, codeNetResolved, codeNetRefuses, MAX_CODE_NET_BYTES, MAX_CODE_NET_ENTRIES, mcpServersParse, mcpToolboxes, mcpToolboxOffered, MAX_MCP_SERVERS_BYTES, decisionRequestTag, decisionResultTag, decisionInvalidRequest, decisionInvalidResult, decisionCauseOf, decisionErrorFacts, decisionRequest, MAX_DECISION_MESSAGE_UNITS, MAX_DECISION_BYTES, DECISION_ENTRIES, reviewTag, reviewVerdictRead, reviewEventBound, reviewVerdictReply, MAX_REVIEW_BYTES, toolExchangeCheck, toolExchangeError, MAX_EXCHANGE_ARGS_UNITS, MAX_EXCHANGE_NAME_UNITS, ggufSummary, ggufSummaryReply, MAX_GGUF_WINDOW_BYTES, MAX_GGUF_SEGMENTS, authTokens, toolPolicyMode, toolPolicySet, MAX_POLICY_UNITS, MAX_POLICY_TOOLS, streamGuardSchema, streamGuardOptions, streamGuardNew, streamGuardFeed, streamGuardEnd, streamGuardCheck, streamGuardCheckReply, streamGuardCorrection, streamGuardReply, plainJson, MAX_GUARD_BYTES, MAX_GUARD_DEPTH, MAX_GUARD_SCHEMA_BYTES, MAX_GUARD_STATE_BYTES, MAX_GUARD_INPUT_BYTES, MAX_CORRECTION_UNITS, s3Sign, s3Region, MAX_S3_FIELD_BYTES, MAX_S3_QUERY_PAIRS, MAX_S3_PAYLOAD_BYTES, wasmFlags, RETIRED_FLAGS, warnRetiredFlags, verifyAtStartup, framingRuntimeMatches, IMPL_FLAGS, ssrfUrl, ssrfAddressesPublic, ssrfUrlReply, ssrfAddressesReply, MAX_SSRF_BYTES, MAX_SSRF_ADDRESSES, frameUntrusted, escapeClosing, provenanceNew, provenanceIngest, provenanceAdd, provenanceSource, provenanceCheck, provenanceProbe, packetParse, packetValidate, packetRender, FRAME_TEXT_UNITS, FRAME_LABEL_UNITS, MAX_PROVENANCE_BYTES, MAX_PACKET_BYTES, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, tuneContention, tuneContentionText, MAX_CONTENTION_BYTES, longProfilePairs, longProfileSection, longProfilePick, longProfileText, MAX_LONG_PROFILE_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
+module.exports = { providerEgressExternal, providerEgressRefusal, providerEgressStrip, providerEgressToolRefusal, providerEgressCanonical, providerEgressFolder, MAX_PROVIDER_EGRESS_BYTES, codeActionsClassify, codeActionsDecide, codeActionsPick, MAX_CODE_ACTIONS_BYTES, projectFileNames, MAX_PROJECT_FILE_NAMES_BYTES, llamacppAutoconfig, autoconfigReply, MAX_AUTOCONFIG_BYTES, taskLifecycleCanTransition, taskLifecycleTransition, taskLifecycleStageMove, taskLifecycleFold, taskLifecycleDerive, taskLifecycleReply, MAX_TASK_LIFECYCLE_BYTES, completenessReport, completenessReply, MAX_COMPLETENESS_BYTES, roleContextProject, roleContextDossier, roleContextReply, MAX_ROLE_CONTEXT_BYTES, codeNetSpec, codeNetResolved, codeNetRefuses, MAX_CODE_NET_BYTES, MAX_CODE_NET_ENTRIES, mcpServersParse, mcpToolboxes, mcpToolboxOffered, MAX_MCP_SERVERS_BYTES, decisionRequestTag, decisionResultTag, decisionInvalidRequest, decisionInvalidResult, decisionCauseOf, decisionErrorFacts, decisionRequest, MAX_DECISION_MESSAGE_UNITS, MAX_DECISION_BYTES, DECISION_ENTRIES, reviewTag, reviewVerdictRead, reviewEventBound, reviewVerdictReply, MAX_REVIEW_BYTES, toolExchangeCheck, toolExchangeError, MAX_EXCHANGE_ARGS_UNITS, MAX_EXCHANGE_NAME_UNITS, ggufSummary, ggufSummaryReply, MAX_GGUF_WINDOW_BYTES, MAX_GGUF_SEGMENTS, authTokens, toolPolicyMode, toolPolicySet, MAX_POLICY_UNITS, MAX_POLICY_TOOLS, streamGuardSchema, streamGuardOptions, streamGuardNew, streamGuardFeed, streamGuardEnd, streamGuardCheck, streamGuardCheckReply, streamGuardCorrection, streamGuardReply, plainJson, MAX_GUARD_BYTES, MAX_GUARD_DEPTH, MAX_GUARD_SCHEMA_BYTES, MAX_GUARD_STATE_BYTES, MAX_GUARD_INPUT_BYTES, MAX_CORRECTION_UNITS, s3Sign, s3Region, MAX_S3_FIELD_BYTES, MAX_S3_QUERY_PAIRS, MAX_S3_PAYLOAD_BYTES, wasmFlags, RETIRED_FLAGS, warnRetiredFlags, verifyAtStartup, framingRuntimeMatches, IMPL_FLAGS, ssrfUrl, ssrfAddressesPublic, ssrfUrlReply, ssrfAddressesReply, MAX_SSRF_BYTES, MAX_SSRF_ADDRESSES, frameUntrusted, escapeClosing, provenanceNew, provenanceIngest, provenanceAdd, provenanceSource, provenanceCheck, provenanceProbe, packetParse, packetValidate, packetRender, FRAME_TEXT_UNITS, FRAME_LABEL_UNITS, MAX_PROVENANCE_BYTES, MAX_PACKET_BYTES, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, tuneContention, tuneContentionText, MAX_CONTENTION_BYTES, longProfilePairs, longProfileSection, longProfilePick, longProfileText, MAX_LONG_PROFILE_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };

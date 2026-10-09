@@ -59,6 +59,8 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
   const { parseContextTokens, validContextTokens, parseCapabilities, effectiveCapabilities } = require('../providers.cjs');
   const chatgpt = require('../chatgpt-oauth.cjs');
   const egress = require('../provider-egress.cjs');
+  // #1209: provider addresses are short; a long one only costs every listing and chat.
+  const MAX_BASE_URL = 2048;
   const chatgptOn = () => !!chatgptOAuth && chatgptEnabled();
 
   // The provider row that points this account's chats at its ChatGPT connection (no credential in it).
@@ -243,6 +245,7 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
       const context = parseContextTokens(body.contextTokens);
       if (context.error) return json(res, 400, { error: context.error });
       if (!/^https?:\/\//.test(baseUrl)) return json(res, 400, { error: 'baseUrl must be an http(s) URL' });
+      if (baseUrl.length > MAX_BASE_URL) return json(res, 400, { error: 'baseUrl is too long' });
       // SSRF guard: a member must not register an endpoint the server can
       // only reach from its own internal network (RFC1918, metadata, etc.).
       // Admins are exempt — local-inference setups legitimately do this.
@@ -264,6 +267,7 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
       const body = await readJson(req);
       const baseUrl = String(body.baseUrl || '').trim().replace(/\/+$/, '');
       if (!/^https?:\/\//.test(baseUrl)) return json(res, 400, { error: 'valid baseUrl required' });
+      if (baseUrl.length > MAX_BASE_URL) return json(res, 400, { error: 'baseUrl is too long' });
       // Same SSRF guard as registration: the test route must not become a
       // prober for internal addresses on behalf of a member.
       if (!endpointApproved(authn, baseUrl)) {
@@ -308,6 +312,7 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
       const defaultModel = body.defaultModel === undefined ? (row.defaultModel || '') : String(body.defaultModel || '').trim().slice(0, 200);
       if (!label) return json(res, 400, { error: 'label required' });
       if (!/^https?:\/\//.test(baseUrl)) return json(res, 400, { error: 'baseUrl must be an http(s) URL' });
+      if (baseUrl.length > MAX_BASE_URL) return json(res, 400, { error: 'baseUrl is too long' });
       // Same SSRF guard as POST whenever the address changes.
       if (baseUrl !== row.baseUrl && !endpointApproved(authn, baseUrl)) {
         return json(res, 400, { error: 'Provider origin is not approved for member connections; contact an administrator.' });
