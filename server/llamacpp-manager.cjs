@@ -415,7 +415,13 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     if (!(budgetGib > 0)) return null;
     const held = quarantineRefusal(model, budgetGib);
     if (held) return held;
-    const est = await footprint(model).catch(() => null);
+    // LLAMACPP_AUTOCONFIG_IMPL=wasm: an estimate the Rust port could not confirm (and the JS one not
+    // the larger) refuses the load; any other failure is "no estimate", as before.
+    let est;
+    try { est = await footprint(model); } catch (err) {
+      if (err?.code !== 'autoconfig_impl') est = null;
+      else return { body: { error: `${model} was not loaded: ${err.message}`, code: 'autoconfig_impl', budgetGib } };
+    }
     if (!est) return null;
     if (est.cacheRamUnbounded) {
       const error = `${model} has an unbounded prompt cache (cache-ram = -1), so it cannot be loaded within the ${budgetGib} GiB inference memory budget. Set its prompt cache in Settings → Models & routing.`;
@@ -438,7 +444,13 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     try { defaults = presets.get(model).defaults || {}; } catch {}
     const opts = { ...defaults, ...options };
     if (opts['cache-ram'] === undefined || opts['cache-ram'] === '') opts['cache-ram'] = require('./llamacpp-autoconfig.cjs').isPromptCacheFree(model, opts) ? '0' : String((autoconfig.cacheRam || require('./inference-budget.cjs').cacheRamLimits()).capMib);
-    const est = require('./llamacpp-autoconfig.cjs').estimateFootprint({ meta: read.meta, modelBytes: read.modelFile.size, mmprojBytes: read.mmproj?.size || 0, options: opts, model });
+    let est;
+    try {
+      est = require('./llamacpp-autoconfig.cjs').estimateFootprint({ meta: read.meta, modelBytes: read.modelFile.size, mmprojBytes: read.mmproj?.size || 0, options: opts, model });
+    } catch (err) {
+      if (err?.code !== 'autoconfig_impl') throw err;
+      return { error: `Not saved: ${err.message}`, code: 'autoconfig_impl', budgetGib };
+    }
     if (!est.cacheRamUnbounded && est.totalGib <= budgetGib) return null;
     const error = est.cacheRamUnbounded
       ? `Not saved: an unbounded prompt cache (cache-ram = -1) cannot fit the ${budgetGib} GiB inference memory budget.`
@@ -481,7 +493,9 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     const profile=presets.get(model);
     const read=await readModel(model);
     if(read.error)return {ok:false,status:read.status,body:{error:read.error}};
-    const inputs=require('./llamacpp-autoconfig.cjs').estimateInputs({meta:read.meta,modelBytes:read.modelFile.size,mmprojBytes:read.mmproj?.size||0,current:{...profile.defaults,...profile.options}});
+    let inputs;
+    try{inputs=require('./llamacpp-autoconfig.cjs').estimateInputs({meta:read.meta,modelBytes:read.modelFile.size,mmprojBytes:read.mmproj?.size||0,current:{...profile.defaults,...profile.options}});}
+    catch(err){if(err?.code!=='autoconfig_impl')throw err;return {ok:false,status:503,body:{error:'Estimate unavailable: '+err.message,code:'autoconfig_impl'}};}
     const budgetGib=sizingBudgetGib();
     return {ok:true,status:200,body:{model,budgetGib:budgetGib>0?budgetGib:null,...inputs}};
   }
