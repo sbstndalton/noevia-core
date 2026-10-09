@@ -64,6 +64,9 @@
 //   - crates/provider-egress providerEgress* = provider-egress.cjs isExternalProvider,
 //                          isTrialTermsHost, egressRefusal, stripPrivateToolboxes, toolRefusal,
 //                          canonicalPath and diaryFolderFor over the host's projections (PROVIDER_EGRESS_IMPL)
+//   - crates/browser-policy browserPolicy* = browser-policy.cjs classifyAction, checkNavigation,
+//                          the decision of substituteSecrets (names and domains, never a value)
+//                          and the label fold over the host's projections (BROWSER_POLICY_IMPL)
 //
 // Memory: WebAssembly memory only grows. A listing or path call needs at most ~16 MiB; an upload
 // decode copies the upload in (at most 25 MiB) and holds one copy of its text (at most 3 bytes per
@@ -95,7 +98,7 @@ const MAX_DECODE_BYTES = 25 * 1024 * 1024;
 // Only the first bytes decide an archive magic number (`ustar` ends at 262).
 const SNIFF_BYTES = 262;
 const RESET_AFTER_BYTES = 1024 * 1024;
-const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'secret_open', 'secret_seal', 'mcp_rpc_body', 'mcp_schema_refs', 'template_caps', 'provider_error', 'serving_verdict', 'autotune_plan', 'preset_reload', 'load_verdict', 'tune_contention', 'frame_untrusted', 'escape_closing', 'provenance', 'task_packet', 'long_profile', 's3_sign', 's3_region', 'ssrf_policy', 'stream_guard', 'gguf_summary', 'auth_tokens', 'tool_policy', 'review_verdict', 'tool_exchange', 'mcp_servers', 'decision', 'code_net_guard', 'role_context', 'completeness_report', 'task_lifecycle', 'llamacpp_autoconfig', 'code_actions', 'project_file_names', 'provider_egress', 'dav_output_ptr', 'dav_output_len'];
+const EXPORTS = ['memory', 'dav_input', 'dav_list', 's3_list', 'storage_path', 'upload_validate', 'upload_classify', 'upload_decode', 'secret_open', 'secret_seal', 'mcp_rpc_body', 'mcp_schema_refs', 'template_caps', 'provider_error', 'serving_verdict', 'autotune_plan', 'preset_reload', 'load_verdict', 'tune_contention', 'frame_untrusted', 'escape_closing', 'provenance', 'task_packet', 'long_profile', 's3_sign', 's3_region', 'ssrf_policy', 'stream_guard', 'gguf_summary', 'auth_tokens', 'tool_policy', 'review_verdict', 'tool_exchange', 'mcp_servers', 'decision', 'code_net_guard', 'role_context', 'completeness_report', 'task_lifecycle', 'llamacpp_autoconfig', 'code_actions', 'project_file_names', 'provider_egress', 'browser_policy', 'dav_output_ptr', 'dav_output_len'];
 
 class DavParseError extends Error {
   constructor(message, reason) {
@@ -1987,10 +1990,64 @@ function providerEgressFolder(storage) {
   return r;
 }
 
+// --- browser policy (BROWSER_POLICY_IMPL) --------------------------------------------------------
+// browser_policy::MAX_INPUT_BYTES (the op byte and the JSON). The host sends its projections of an
+// action ({type, url, method, key}), the element the executor read ({tag, type, role, name, text,
+// value, inForm}) and the page ({origin, allowedDomains}); for secrets only their names and
+// domains. Every reply is checked for shape; a refusal or bad reply throws a DavParseError, which
+// browser-policy.cjs answers strictly (asks, or refuses).
+const MAX_BROWSER_POLICY_BYTES = 4 * 1024 * 1024 + 1;
+const browserCall = (op, args) => jsonOpCall(op, args, MAX_BROWSER_POLICY_BYTES, (e) => e.browser_policy(), 'browser policy').reply;
+const BROWSER_STATUSES = new Set(['allow', 'needs_approval', 'blocked']);
+const ACTION_KEYS = ['type', 'url', 'method', 'key'];
+const ELEMENT_TEXT_KEYS = ['tag', 'type', 'role', 'name', 'text', 'value'];
+
+/** classifyAction: `{ status, reason }`, status null when the port cannot be sure (reason ''). */
+function browserPolicyClassify(action, element, page) {
+  const ok = exactKeys(action, ACTION_KEYS) && typeof action.type === 'string' && ACTION_KEYS.slice(1).every((k) => action[k] === null || typeof action[k] === 'string')
+    && exactKeys(element, [...ELEMENT_TEXT_KEYS, 'inForm']) && ELEMENT_TEXT_KEYS.every((k) => typeof element[k] === 'string') && typeof element.inForm === 'boolean'
+    && exactKeys(page, ['origin', 'allowedDomains']) && (page.origin === null || typeof page.origin === 'string') && allStrings(page.allowedDomains);
+  if (!ok) throw new DavParseError('browser policy action projection has the wrong shape', 'input');
+  const r = browserCall(1, [action, element, page]);
+  if (!exactKeys(r, ['status', 'reason']) || typeof r.reason !== 'string'
+    || !(r.status === null ? r.reason === '' : BROWSER_STATUSES.has(r.status))) badReply('browser policy classify');
+  return r;
+}
+
+const navReply = (r, what) => ((exactKeys(r, ['ok', 'origin']) && r.ok === true && nonEmpty(r.origin))
+  || (exactKeys(r, ['ok', 'reason']) && r.ok === false && nonEmpty(r.reason)) ? r : badReply(what));
+
+/** checkNavigation: `{ ok: true, origin }` or `{ ok: false, reason }`. */
+function browserPolicyNavigation(url, domains) {
+  if (typeof url !== 'string' || !allStrings(domains)) throw new DavParseError('browser policy navigation input has the wrong type', 'input');
+  return navReply(browserCall(2, [url, domains]), 'browser policy navigation');
+}
+
+/** substituteSecrets' decision over `[[name, domains], ...]`: `{ ok: true, used }` or `{ ok: false, reason }`. */
+function browserPolicySubstitute(text, secrets, origin) {
+  const ok = typeof text === 'string' && typeof origin === 'string' && Array.isArray(secrets)
+    && secrets.every((p) => Array.isArray(p) && p.length === 2 && typeof p[0] === 'string' && allStrings(p[1]));
+  if (!ok) throw new DavParseError('browser policy secrets input has the wrong type', 'input');
+  const r = browserCall(3, [text, secrets, origin]);
+  const shaped = (exactKeys(r, ['ok', 'used']) && r.ok === true && allStrings(r.used) && r.used.every(nonEmpty))
+    || (exactKeys(r, ['ok', 'reason']) && r.ok === false && nonEmpty(r.reason));
+  if (!shaped) badReply('browser policy substitute');
+  return r;
+}
+
+/** The label fold over each text: `{ folded }`, a string or null (unknown to the port) each. */
+function browserPolicyFold(texts) {
+  if (!allStrings(texts)) throw new DavParseError('browser policy fold input must be strings', 'input');
+  const r = browserCall(4, [texts]);
+  if (!exactKeys(r, ['folded']) || !Array.isArray(r.folded) || r.folded.length !== texts.length
+    || !r.folded.every((f) => f === null || typeof f === 'string')) badReply('browser policy fold');
+  return r;
+}
+
 // Every switch that runs this module (#996). Each reads its value as trim().toLowerCase().
 // Retired switches (#1071) are not listed: the Rust path they selected is always on, and
 // verifyAtStartup() always loads this module for it.
-const IMPL_FLAGS = ['STORAGE_PATH_IMPL', 'SECRET_ENVELOPE_IMPL', 'STREAM_GUARD_IMPL', 'GGUF_META_IMPL', 'ROLE_CONTEXT_IMPL', 'CODE_ACTIONS_IMPL', 'PROJECT_FILE_NAMES_IMPL', 'PROVIDER_EGRESS_IMPL'];
+const IMPL_FLAGS = ['STORAGE_PATH_IMPL', 'SECRET_ENVELOPE_IMPL', 'STREAM_GUARD_IMPL', 'GGUF_META_IMPL', 'ROLE_CONTEXT_IMPL', 'CODE_ACTIONS_IMPL', 'PROJECT_FILE_NAMES_IMPL', 'PROVIDER_EGRESS_IMPL', 'BROWSER_POLICY_IMPL'];
 
 /** Switches whose JS path was deleted once Rust had run in production (#1071). The old value that
  *  selected Rust ('wasm', or 'on' for the advisor) is accepted silently; anything else is ignored
@@ -2050,4 +2107,4 @@ function verifyAtStartup(env = process.env, { hostname } = {}) {
 /** Test hook: forget the cached module (and its failure). */
 function reset() { cached = null; }
 
-module.exports = { providerEgressExternal, providerEgressRefusal, providerEgressStrip, providerEgressToolRefusal, providerEgressCanonical, providerEgressFolder, MAX_PROVIDER_EGRESS_BYTES, codeActionsClassify, codeActionsDecide, codeActionsPick, MAX_CODE_ACTIONS_BYTES, projectFileNames, MAX_PROJECT_FILE_NAMES_BYTES, llamacppAutoconfig, autoconfigReply, MAX_AUTOCONFIG_BYTES, taskLifecycleCanTransition, taskLifecycleTransition, taskLifecycleStageMove, taskLifecycleFold, taskLifecycleDerive, taskLifecycleReply, MAX_TASK_LIFECYCLE_BYTES, completenessReport, completenessReply, MAX_COMPLETENESS_BYTES, roleContextProject, roleContextDossier, roleContextReply, MAX_ROLE_CONTEXT_BYTES, codeNetSpec, codeNetResolved, codeNetRefuses, MAX_CODE_NET_BYTES, MAX_CODE_NET_ENTRIES, mcpServersParse, mcpToolboxes, mcpToolboxOffered, MAX_MCP_SERVERS_BYTES, decisionRequestTag, decisionResultTag, decisionInvalidRequest, decisionInvalidResult, decisionCauseOf, decisionErrorFacts, decisionRequest, MAX_DECISION_MESSAGE_UNITS, MAX_DECISION_BYTES, DECISION_ENTRIES, reviewTag, reviewVerdictRead, reviewEventBound, reviewVerdictReply, MAX_REVIEW_BYTES, toolExchangeCheck, toolExchangeError, MAX_EXCHANGE_ARGS_UNITS, MAX_EXCHANGE_NAME_UNITS, ggufSummary, ggufSummaryReply, MAX_GGUF_WINDOW_BYTES, MAX_GGUF_SEGMENTS, authTokens, toolPolicyMode, toolPolicySet, MAX_POLICY_UNITS, MAX_POLICY_TOOLS, streamGuardSchema, streamGuardOptions, streamGuardNew, streamGuardFeed, streamGuardEnd, streamGuardCheck, streamGuardCheckReply, streamGuardCorrection, streamGuardReply, plainJson, MAX_GUARD_BYTES, MAX_GUARD_DEPTH, MAX_GUARD_SCHEMA_BYTES, MAX_GUARD_STATE_BYTES, MAX_GUARD_INPUT_BYTES, MAX_CORRECTION_UNITS, s3Sign, s3Region, MAX_S3_FIELD_BYTES, MAX_S3_QUERY_PAIRS, MAX_S3_PAYLOAD_BYTES, wasmFlags, RETIRED_FLAGS, warnRetiredFlags, verifyAtStartup, framingRuntimeMatches, IMPL_FLAGS, ssrfUrl, ssrfAddressesPublic, ssrfUrlReply, ssrfAddressesReply, MAX_SSRF_BYTES, MAX_SSRF_ADDRESSES, frameUntrusted, escapeClosing, provenanceNew, provenanceIngest, provenanceAdd, provenanceSource, provenanceCheck, provenanceProbe, packetParse, packetValidate, packetRender, FRAME_TEXT_UNITS, FRAME_LABEL_UNITS, MAX_PROVENANCE_BYTES, MAX_PACKET_BYTES, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, tuneContention, tuneContentionText, MAX_CONTENTION_BYTES, longProfilePairs, longProfileSection, longProfilePick, longProfileText, MAX_LONG_PROFILE_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
+module.exports = { browserPolicyClassify, browserPolicyNavigation, browserPolicySubstitute, browserPolicyFold, MAX_BROWSER_POLICY_BYTES, providerEgressExternal, providerEgressRefusal, providerEgressStrip, providerEgressToolRefusal, providerEgressCanonical, providerEgressFolder, MAX_PROVIDER_EGRESS_BYTES, codeActionsClassify, codeActionsDecide, codeActionsPick, MAX_CODE_ACTIONS_BYTES, projectFileNames, MAX_PROJECT_FILE_NAMES_BYTES, llamacppAutoconfig, autoconfigReply, MAX_AUTOCONFIG_BYTES, taskLifecycleCanTransition, taskLifecycleTransition, taskLifecycleStageMove, taskLifecycleFold, taskLifecycleDerive, taskLifecycleReply, MAX_TASK_LIFECYCLE_BYTES, completenessReport, completenessReply, MAX_COMPLETENESS_BYTES, roleContextProject, roleContextDossier, roleContextReply, MAX_ROLE_CONTEXT_BYTES, codeNetSpec, codeNetResolved, codeNetRefuses, MAX_CODE_NET_BYTES, MAX_CODE_NET_ENTRIES, mcpServersParse, mcpToolboxes, mcpToolboxOffered, MAX_MCP_SERVERS_BYTES, decisionRequestTag, decisionResultTag, decisionInvalidRequest, decisionInvalidResult, decisionCauseOf, decisionErrorFacts, decisionRequest, MAX_DECISION_MESSAGE_UNITS, MAX_DECISION_BYTES, DECISION_ENTRIES, reviewTag, reviewVerdictRead, reviewEventBound, reviewVerdictReply, MAX_REVIEW_BYTES, toolExchangeCheck, toolExchangeError, MAX_EXCHANGE_ARGS_UNITS, MAX_EXCHANGE_NAME_UNITS, ggufSummary, ggufSummaryReply, MAX_GGUF_WINDOW_BYTES, MAX_GGUF_SEGMENTS, authTokens, toolPolicyMode, toolPolicySet, MAX_POLICY_UNITS, MAX_POLICY_TOOLS, streamGuardSchema, streamGuardOptions, streamGuardNew, streamGuardFeed, streamGuardEnd, streamGuardCheck, streamGuardCheckReply, streamGuardCorrection, streamGuardReply, plainJson, MAX_GUARD_BYTES, MAX_GUARD_DEPTH, MAX_GUARD_SCHEMA_BYTES, MAX_GUARD_STATE_BYTES, MAX_GUARD_INPUT_BYTES, MAX_CORRECTION_UNITS, s3Sign, s3Region, MAX_S3_FIELD_BYTES, MAX_S3_QUERY_PAIRS, MAX_S3_PAYLOAD_BYTES, wasmFlags, RETIRED_FLAGS, warnRetiredFlags, verifyAtStartup, framingRuntimeMatches, IMPL_FLAGS, ssrfUrl, ssrfAddressesPublic, ssrfUrlReply, ssrfAddressesReply, MAX_SSRF_BYTES, MAX_SSRF_ADDRESSES, frameUntrusted, escapeClosing, provenanceNew, provenanceIngest, provenanceAdd, provenanceSource, provenanceCheck, provenanceProbe, packetParse, packetValidate, packetRender, FRAME_TEXT_UNITS, FRAME_LABEL_UNITS, MAX_PROVENANCE_BYTES, MAX_PACKET_BYTES, listRecords, s3ListPage, storagePath, uploadValidate, uploadClassify, uploadDecode, secretOpen, secretSeal, mcpRpcBody, mcpSchemaRefs, templateCaps, providerErrorKind, servingVerdict, autotunePlan, autotunePlanText, MAX_PLAN_BYTES, presetReload, MAX_RELOAD_BYTES, loadVerdict, loadVerdictText, MAX_VERDICT_BYTES, tuneContention, tuneContentionText, MAX_CONTENTION_BYTES, longProfilePairs, longProfileSection, longProfilePick, longProfileText, MAX_LONG_PROFILE_BYTES, MAX_TEMPLATE_BYTES, MCP_BODY_UNITS, MCP_SCHEMA_UNITS, MAX_SECRET_PLAIN_BYTES, MAX_SECRET_UNITS, MAX_SECRET_USER_BYTES, load, readLock, reset, memoryBytes, DavParseError, DEFAULT_WASM, MAX_INPUT_BYTES, MAX_DECODE_BYTES, SNIFF_BYTES, RESET_AFTER_BYTES };
