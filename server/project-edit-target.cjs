@@ -21,6 +21,18 @@
 // This module only looks names up in the project's own file list (project-file-names.cjs); it
 // never touches storage. The write path (projects.writeProjectTextFile) checks again, under the
 // source lock, that the destination it would write is this same stored file.
+//
+// PROJECT_EDIT_TARGET_IMPL=js|wasm (default js; any other value means js, with one warning), read
+// from the `env` option (process.env) on every planEdit call. wasm also asks noevia-rs's
+// project-edit-target crate (dav-parse.wasm project_edit_target) with a projection of the project
+// (its folders, every file's stored name), whether storage is connected, and the resolved file's
+// source, attachment state and group, and whether it has a document. The JS plan is computed
+// first; a JS refusal is thrown as is, without asking. The edit goes ahead only when the port gives
+// the identical plan (writeName, target, adopt). When the port refuses, faults, replies badly or
+// plans anything else, or the project cannot be projected (a folder or source that is not a
+// string), the edit is refused with a model-readable error and nothing is written (logged once
+// per reason, name-free). The flag is in dav-parse-wasm.cjs IMPL_FLAGS (a missing or tampered
+// module stops startup).
 
 const crypto = require('node:crypto');
 const { resolveProjectFile } = require('./project-file-names.cjs');
@@ -57,7 +69,7 @@ function storageAccount(connection) {
  * Throws a model-readable Error when the name does not resolve or the file may not be edited.
  * @returns {{ file: any, writeName: string, target: string, adopt: boolean, account: string|null }}
  */
-function planEdit(project, raw, { storageAccount: account = null } = {}) {
+function planEditJs(project, raw, { storageAccount: account = null } = {}) {
   const found = resolveProjectFile(project, raw);
   if (!found.file) throw new Error(found.error);
   const file = found.file;
@@ -92,17 +104,90 @@ function planEdit(project, raw, { storageAccount: account = null } = {}) {
   return { file, writeName, target, adopt, account: adopt ? account : null };
 }
 
+// ── PROJECT_EDIT_TARGET_IMPL ────────────────────────────────────────────────
+
+const IMPLS = new Set(['js', 'wasm']);
+let warnedImpl = '';
+/** PROJECT_EDIT_TARGET_IMPL: 'js' (default) or 'wasm'. */
+function projectEditTargetImpl(env = process.env) {
+  const raw = env?.PROJECT_EDIT_TARGET_IMPL;
+  if (raw === undefined || raw === '') return 'js';
+  const value = String(raw).trim().toLowerCase();
+  if (IMPLS.has(value)) return value;
+  if (warnedImpl !== value) {
+    warnedImpl = value;
+    console.warn(`[project-edit-target] PROJECT_EDIT_TARGET_IMPL=${JSON.stringify(String(raw))} is not js or wasm; using js`);
+  }
+  return 'js';
+}
+const defaultLoader = () => require('./dav-parse-wasm.cjs');
+
+const warnedPort = new Set();
+function portWarn(event, reason) {
+  const key = `${event}:${reason}`;
+  if (warnedPort.has(key)) return;
+  warnedPort.add(key);
+  console.warn(`[project-edit-target] ${event} (${reason}); the edit was refused`);
+}
+
+/** A folder or source the port reads: a string, '' and other falsy values as null; undefined
+ *  (not projectable: a truthy non-string) otherwise. */
+const projected = (v) => (typeof v === 'string' ? (v || null) : (v ? undefined : null));
+const stringOrNull = (v) => (typeof v === 'string' ? v : null);
+
+/**
+ * The port's request for `file` (one of project.files) as the JS planned it, or null when the
+ * project cannot be projected: `[folder, reserved, connected, index, names, [source, attachment,
+ * document]]` (see noevia-rs crates/project-edit-target).
+ */
+function editTargetInput(project, file, account = null) {
+  const files = project && Array.isArray(project.files) ? project.files : null;
+  const index = files ? files.indexOf(file) : -1;
+  if (index < 0 || typeof file.name !== 'string') return null;
+  const folder = projected(project.projectFolder), reserved = projected(project.reservedFolder), source = projected(file.source);
+  if (folder === undefined || reserved === undefined || source === undefined) return null;
+  const a = file.attachment;
+  return [folder, reserved, typeof account === 'string' && !!account, index,
+    files.map((f) => (f && typeof f.name === 'string' ? f.name : null)),
+    [source, a ? [stringOrNull(a.state), stringOrNull(a.group)] : null, !!file.document]];
+}
+
+/**
+ * The file an edit named `raw` would change (planEditJs above), confirmed by the Rust port under
+ * PROJECT_EDIT_TARGET_IMPL=wasm: the plan stands only when both give the same one. Options:
+ * `storageAccount`, `env`, `impl`, `wasmLoader`. Throws a model-readable Error otherwise.
+ * @returns {{ file: any, writeName: string, target: string, adopt: boolean, account: string|null }}
+ */
+function planEdit(project, raw, { storageAccount: account = null, env = process.env, impl = projectEditTargetImpl(env), wasmLoader = defaultLoader } = {}) {
+  const plan = planEditJs(project, raw, { storageAccount: account });
+  if (impl !== 'wasm') return plan;
+  const input = editTargetInput(project, plan.file, account);
+  let port = null;
+  if (!input) portWarn('project_edit_target.unprojectable', 'shape');
+  else {
+    try {
+      port = wasmLoader().projectEditTarget(input);
+    } catch (err) {
+      portWarn('project_edit_target.wasm_fault', String(err?.reason || 'unexpected').slice(0, 40));
+    }
+  }
+  const p = port && port.plan;
+  if (p && p.write === plan.writeName && p.target === plan.target && p.adopt === plan.adopt) return plan;
+  if (port) portWarn('project_edit_target.impl_mismatch', p ? 'plan' : String(port.refused || 'reply').slice(0, 40));
+  throw new Error(`"${plan.file.name}" could not be confirmed as a file that can be edited in place, so nothing was changed. Ask again, or use project_create_file to write a new file.`);
+}
+
 /**
  * For the chat loop: the stored path an edit tool call would change (for a plain-named file in a
  * project with connected storage, the path it is moved to), resolved against the project as it is
  * now. `{ path, account }` (account: the storage account a move is bound to, else null) or `{ error }`.
  */
-function resolveEditTarget(project, rawArgs, { storageAccount: account = null } = {}) {
+function resolveEditTarget(project, rawArgs, { storageAccount: account = null, ...opts } = {}) {
   if (!project) return { error: 'this chat is not in a project, so there are no project files to edit.' };
   let args;
   try { args = JSON.parse(rawArgs || '{}'); } catch { return { error: 'the tool arguments were not valid JSON.' }; }
   if (!args || typeof args !== 'object' || Array.isArray(args)) return { error: 'the tool arguments must be a JSON object.' };
-  try { const plan = planEdit(project, args.name, { storageAccount: account }); return { path: plan.target, account: plan.account }; }
+  try { const plan = planEdit(project, args.name, { ...opts, storageAccount: account }); return { path: plan.target, account: plan.account }; }
   catch (err) { return { error: String((err && err.message) || err) }; }
 }
 
@@ -112,4 +197,4 @@ function targetDigest(storedPath, account = null) {
   return crypto.createHash('sha256').update(`noevia-edit-target\0${String(storedPath)}${account ? `\0${account}` : ''}`).digest('hex');
 }
 
-module.exports = { EDIT_TOOLS, uploadPathFor, isProjectUpload, planEdit, resolveEditTarget, targetDigest, storageAccount };
+module.exports = { EDIT_TOOLS, uploadPathFor, isProjectUpload, planEdit, planEditJs, editTargetInput, projectEditTargetImpl, resolveEditTarget, targetDigest, storageAccount };
