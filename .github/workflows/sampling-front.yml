@@ -50,7 +50,7 @@ jobs:
         working-directory: rs
         run: |
           set -euo pipefail
-          node --test ../core/server/routes/sampling-settings.test.cjs ../core/server/rust-auth.test.cjs
+          node --test ../core/server/routes/sampling-settings.test.cjs ../core/server/rust-auth.test.cjs ../core/server/contract-corpus-sampling-env.test.cjs
           node tools/gen-sampling-fixtures.cjs ../core "$RUNNER_TEMP/node-sampling.json"
           NOEVIA_SAMPLING_FIXTURE="$RUNNER_TEMP/node-sampling.json" NOEVIA_SAMPLING_CORE_SHA="$(git -C ../core rev-parse HEAD)" cargo test --locked -p server-sampling-settings
           cargo test --locked -p noevia-server --test sampling_settings
