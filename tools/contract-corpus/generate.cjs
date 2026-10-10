@@ -26,6 +26,9 @@ const { MODEL, SERVER, GUARD, startMocks, serverEnv } = require('./mocks.cjs');
 // manifest; the recorder itself writes only placeholders.
 const ADMIN = { username: 'synthetic-admin', displayName: 'Synthetic Admin', password: 'contract-corpus-Synthetic-pw-1' };
 const MEMBER = { username: 'synthetic-member', displayName: 'Synthetic Member', password: 'contract-corpus-Synthetic-pw-2' };
+// The member's password after an account recovery (M3). Typed by the replayer as a generated value:
+// the recovered sign-in uses another spelling of the username, so no manifest input names it.
+const RECOVERED = 'contract-corpus-Synthetic-pw-3';
 
 function arg(name) {
   const i = process.argv.indexOf(name);
@@ -150,6 +153,7 @@ async function main() {
     // Setup signs the admin in.
     await step(admin, 'POST', '/api/setup/complete', { setupCode, publicOrigin: base, ...ADMIN, diaryEnabled: false }, [201]);
     await step(admin, 'GET', '/api/auth/session', undefined, [200]);
+    await step(anon, 'GET', '/api/setup/status', undefined, [200]);
     await step(admin, 'GET', '/api/profile', undefined, [200]);
     await step(admin, 'PATCH', '/api/profile', { displayName: 'Synthetic Admin Renamed' }, [200]);
     await step(admin, 'POST', '/api/profile/onboarding', {}, [200]);
@@ -187,8 +191,59 @@ async function main() {
     await step(member, 'GET', '/api/admin/users');
     const users = await step(admin, 'GET', '/api/admin/users', undefined, [200]);
     const memberId = (users.json?.users || users.json || []).find?.((u) => u.username === MEMBER.username)?.id;
+
+    // M3: the account routes the Rust front can take over (NOEVIA_RUST_AUTH), end to end.
+    const evil = new Client(base, 'https://evil.example.test');
+    await step(evil, 'POST', '/api/auth/login/password', { username: ADMIN.username, password: 'not-the-password-synthetic' }, [403]);
+    await step(new Client(base, base), 'POST', '/api/auth/invitations/accept', { token: invite.json.token, ...MEMBER, username: 'synthetic-late' }, [400]);
+    await step(admin, 'PUT', '/api/profile/appearance', { theme: 'dark', light: 'warm', dark: 'iris' }, [200]);
+    await step(admin, 'GET', '/api/profile/appearance', undefined, [200]);
+    await step(admin, 'PUT', '/api/profile/appearance', { theme: 'neon' }, [400]);
+    await step(admin, 'PUT', '/api/account/instructions', { text: ' Answer briefly. ', style: 'concise', language: 'Norwegian', advanced: { tone: 'formal' } }, [200]);
+    await step(admin, 'GET', '/api/account/instructions', undefined, [200]);
+    await step(admin, 'PUT', '/api/account/instructions', { text: 'x', style: 'loud' }, [400]);
+    await step(admin, 'PUT', '/api/account/memory', { memories: ['Likes tea', ' Likes   tea ', 'Works nights'], useProjectMemories: false }, [200]);
+    await step(admin, 'GET', '/api/account/memory', undefined, [200]);
+    await step(admin, 'PUT', '/api/account/memory', { memories: 'not a list' }, [400]);
+    await step(admin, 'PUT', '/api/account/preferences', { sendKey: 'mod-enter', notifications: { replyFinished: false } }, [200]);
+    await step(admin, 'PUT', '/api/account/preferences', { locale: 'xx-XX' }, [400]);
+    await step(admin, 'GET', '/api/account/preferences', undefined, [200]);
+    await step(admin, 'PUT', '/api/profile/features', { diaryEnabled: true }, [200]);
+    await step(admin, 'PUT', '/api/profile/features', { diaryEnabled: false }, [200]);
+    const app = await step(admin, 'POST', '/api/profile/app-passwords', { name: ' Synthetic phone ', scope: 'lan' }, [201]);
+    await step(admin, 'POST', '/api/profile/app-passwords', { name: '', scope: 'lan' }, [400]);
+    await step(admin, 'POST', '/api/profile/app-passwords', { name: 'Synthetic tablet', scope: 'everywhere' }, [400]);
+    await step(admin, 'GET', '/api/profile/app-passwords', undefined, [200]);
+    if (app.json?.id) await step(admin, 'DELETE', `/api/profile/app-passwords/${app.json.id}`, undefined, [200]);
+    await step(anon, 'POST', '/api/auth/login/passkey/options', { username: 'nobody-synthetic' }, [200]);
+    await step(anon, 'POST', '/api/auth/login/passkey/verify', { challengeToken: 'not-a-challenge', response: { id: 'not-a-passkey' } }, [401]);
+    await step(admin, 'POST', '/api/auth/passkeys/register/verify', { challengeToken: 'not-a-challenge', response: {} }, [400]);
+    await step(admin, 'PATCH', '/api/auth/passkeys/missing-passkey-id', { name: 'Renamed' }, [404]);
+    // A recovery link replaces the member's password and revokes the member's session.
+    if (memberId) {
+      const rec = await step(admin, 'POST', `/api/admin/users/${encodeURIComponent(memberId)}/recovery`, undefined, [201]);
+      await step(anon, 'POST', '/api/auth/recovery/complete', { token: rec.json.token, password: 'short' }, [400]);
+      await step(anon, 'POST', '/api/auth/recovery/complete', { token: rec.json.token, password: RECOVERED }, [200]);
+      await step(anon, 'POST', '/api/auth/recovery/complete', { token: rec.json.token, password: RECOVERED }, [400]);
+      await step(member, 'GET', '/api/auth/session', undefined, [401]);
+      await step(member, 'POST', '/api/auth/login/password', { username: 'Synthetic-Member', password: RECOVERED }, [200]);
+      await step(member, 'GET', '/api/auth/session', undefined, [200]);
+    }
+    await step(admin, 'POST', '/api/admin/users/00000000-0000-4000-8000-000000000000/recovery', undefined, [404]);
+    // A second admin session, revoked from the first.
+    const second = new Client(base, base);
+    await step(second, 'POST', '/api/auth/login/password', { username: ADMIN.username, password: ADMIN.password }, [200]);
+    const prof = await step(admin, 'GET', '/api/profile', undefined, [200]);
+    const other = (prof.json?.sessions || []).find((x) => !x.current);
+    if (other) await step(admin, 'DELETE', `/api/auth/sessions/${encodeURIComponent(other.id)}`, undefined, [200]);
+    await step(second, 'GET', '/api/auth/session', undefined, [401]);
+    // Too many failed sign-ins for one username from one address.
+    const prober = new Client(base, base);
+    for (let i = 0; i < 6; i += 1) await step(prober, 'POST', '/api/auth/login/password', { username: 'nobody-synthetic', password: 'not-the-password-synthetic' });
+
     if (memberId) await step(admin, 'PUT', `/api/admin/users/${encodeURIComponent(memberId)}/disabled`, { disabled: true });
     await step(member, 'GET', '/api/profile');
+    if (memberId) await step(admin, 'PUT', `/api/admin/users/${encodeURIComponent(memberId)}/disabled`, { disabled: false }, [200]);
 
     // Sign-in, wrong password, sign-out.
     const relog = new Client(base, base);
@@ -247,7 +302,7 @@ async function main() {
 
   // Belt and braces over the recorder's own check: the run's real secret values must not appear.
   const setupCode = log.join('').match(/FIRST-RUN SETUP CODE: (\S+)/)?.[1];
-  const raw = [ADMIN.password, MEMBER.password, setupCode].filter(Boolean);
+  const raw = [ADMIN.password, MEMBER.password, RECOVERED, setupCode].filter(Boolean);
   for (const f of fs.readdirSync(exchanges)) {
     const text = fs.readFileSync(path.join(exchanges, f), 'utf8');
     for (const v of raw) if (text.includes(v)) throw new Error(`${f} holds a raw secret`);
