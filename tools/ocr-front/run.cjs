@@ -106,8 +106,10 @@ async function scenario(front, mode, workerBase, fixtures, root, calls) {
       return { control: mode, detected: true };
     }
     requireScan(scan, pages);
+    console.log(`PASS: ${front ? 'Rust front' : 'Node reference'} recovered every scan row via native OCR`);
     const docx = await upload('body.docx');
     assert.equal(docx.attachment.state, 'partial');
+    console.log(`PASS: ${front ? 'Rust front' : 'Node reference'} dispatched DOCX extraction`);
     const large = await upload('large.pdf');
     assert.ok(large.bytes <= 25 * 1024 * 1024);
     assert.equal(large.attachment.reduction.originalBytes, fs.statSync(path.join(fixtures, 'large.pdf')).size);
@@ -164,14 +166,16 @@ async function main() {
     const workerPort = await port(); const workerBase = `http://127.0.0.1:${workerPort}`;
     native = child(worker, [], { PATH: process.env.PATH, NOEVIA_OCR_IMPL: 'rust', NOEVIA_OCR_LISTEN: `127.0.0.1:${workerPort}` });
     await ready(workerBase, '/health', native);
-    const reference = await scenario(null, 'good', workerBase, fixtures, root, []);
-    const actual = await scenario(front, 'good', workerBase, fixtures, root, []);
-    assert.deepEqual(actual, reference, 'Rust front document contracts must have zero diffs');
-    console.log('PASS: native OCR/DOCX/reduction through Rust front; zero document contract diffs; tenant isolation');
+    // Run controls first so a later front forwarding gap still records proof
+    // that failures are detected; any failed positive keeps the job red.
     for (const mode of ['unavailable', 'incorrect']) {
       await scenario(front, mode, workerBase, fixtures, root, []);
       console.log(`PASS: ${mode} native OCR rejected by the same scan oracle`);
     }
+    const reference = await scenario(null, 'good', workerBase, fixtures, root, []);
+    const actual = await scenario(front, 'good', workerBase, fixtures, root, []);
+    assert.deepEqual(actual, reference, 'Rust front document contracts must have zero diffs');
+    console.log('PASS: native OCR/DOCX/reduction through Rust front; zero document contract diffs; tenant isolation');
   } finally { await stop(native); fs.rmSync(root, { recursive: true, force: true }); }
 }
 main().catch(async error => { console.error(error); await Promise.all([...children].map(stop)); process.exitCode = 1; });
