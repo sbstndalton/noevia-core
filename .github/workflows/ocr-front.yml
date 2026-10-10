@@ -25,7 +25,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: sbstndalton/noevia-rs
-          ref: f96cafe6a964a775054c1d995a8ad80935dd02ca
+          # Reviewed sbstndalton/noevia#1273 upload-bound fix; acceptance input only.
+          ref: 00885e594c77c529f9fd034064852faf104ce5ea
           path: rs
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
