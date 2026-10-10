@@ -467,7 +467,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
       let globals = {};
       try { globals = presets?.get(model).defaults || {}; } catch {}
       const eff = { ...globals, ...(options || {}) };
-      if (require('./llamacpp-presets.cjs').microBatchExceeds(String(eff['ubatch-size'] ?? '').trim() || undefined, String(eff['batch-size'] ?? '').trim() || undefined)) {
+      if (require('./llamacpp-presets.cjs').microBatchExceedsEffective(String(eff['ubatch-size'] ?? '').trim() || undefined, String(eff['batch-size'] ?? '').trim() || undefined)) {
         return { error: 'Not saved: Micro batch cannot exceed batch size', code: 'invalid_size' };
       }
     }

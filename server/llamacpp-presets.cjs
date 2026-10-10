@@ -52,9 +52,11 @@ function optionValue(key,value,limits){
  *  null/undefined value): [field or null, trimmed value or null]. */
 const canonicalEntry=(key,value)=>[canonical(key.trim().replace(/^-+/,''))??null,value===null?null:value.trim()];
 /** prepare()'s micro-batch check over the effective values (strings or undefined). */
+const microBatchExceeds=(ubatch,batch)=>Number(ubatch)>Number(batch);
 // #1248: llama.cpp's own batch size is 2048 when none is set, so an unset batch-size is compared as that.
-const DEFAULT_BATCH_SIZE=2048;
-const microBatchExceeds=(ubatch,batch)=>Number(ubatch)>Number(batch===undefined||batch===null||batch===''?DEFAULT_BATCH_SIZE:batch);
+// Kept out of microBatchExceeds, whose behaviour the Rust port mirrors byte for byte (differential fixtures).
+const DEFAULT_BATCH_SIZE='2048';
+const microBatchExceedsEffective=(ubatch,batch)=>microBatchExceeds(ubatch,batch===undefined||batch===null||batch===''?DEFAULT_BATCH_SIZE:batch);
 const error=(status,message)=>Object.assign(Error(message),{status});
 const revision=text=>crypto.createHash('sha256').update(text).digest('hex');
 // #874: recovery copies `<file>.noevia-backup-<revision>` are whole-file snapshots taken before each
@@ -182,7 +184,7 @@ function createPresetStore(file,{writer=null,cacheRam=null,backupKeep=BACKUP_KEE
     const local={...(section?.options||{})};
     for(const [key,value] of Object.entries(updates)){if(value==='')delete local[key];else local[key]=value;}
     const effective={...(data.sections.get('*')?.options||{}),...local};
-    if(microBatchExceeds(effective['ubatch-size'],effective['batch-size']))throw error(400,'Micro batch cannot exceed batch size');
+    if(microBatchExceedsEffective(effective['ubatch-size'],effective['batch-size']))throw error(400,'Micro batch cannot exceed batch size');
     if(wasm){
       const v=k=>effective[k]===undefined?null:effective[k];
       const r=ask(wasmLoader,w=>w.llamacppPresetsBatch(v('ubatch-size'),v('batch-size')));
@@ -253,4 +255,4 @@ function checkedCanonicalOptions(options,{env=process.env,wasmLoader=defaultLoad
   }
   return {options:out,refused:null};
 }
-module.exports={createPresetStore,parse,fields,canonical,canonicalOptions,checkedCanonicalOptions,llamacppPresetsImpl,modelNameOk,optionValue,canonicalEntry,microBatchExceeds,pruneBackups,BACKUP_KEEP};
+module.exports={createPresetStore,parse,fields,canonical,canonicalOptions,checkedCanonicalOptions,llamacppPresetsImpl,modelNameOk,optionValue,canonicalEntry,microBatchExceeds,microBatchExceedsEffective,pruneBackups,BACKUP_KEEP};
