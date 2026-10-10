@@ -356,10 +356,16 @@ function sortKeys(o) {
   return Object.fromEntries(Object.keys(o).sort().map((k) => [k, o[k]]));
 }
 
-/** null unless NOEVIA_CONTRACT_RECORD names a directory. */
-function fromEnv(env = process.env, opts = {}) {
+/** null unless NOEVIA_CONTRACT_RECORD names a directory. `accounts` is how many accounts the data
+ *  dir held at boot: recording needs a fresh synthetic data dir, because prose (chat text, names,
+ *  file contents) is kept verbatim, so a dir that already has accounts is refused. */
+function fromEnv(env = process.env, { accounts = 0, ...opts } = {}) {
   const dir = String(env.NOEVIA_CONTRACT_RECORD || '').trim();
   if (!dir) return null;
+  if (accounts > 0) {
+    console.error(`[contract-record] NOEVIA_CONTRACT_RECORD is set but this data dir already has ${accounts} account(s); not recording. Record only against a fresh synthetic UI_DATA_DIR.`);
+    return null;
+  }
   const recorder = createContractRecorder({ dir: path.resolve(dir), env, origin: String(env.PUBLIC_ORIGIN || '').replace(/\/$/, ''), ...opts });
   console.warn(`[contract-record] NOEVIA_CONTRACT_RECORD is set: recording normalised /api/ exchanges to ${recorder.dir}. Never enable this on a deployment that serves real users.`);
   return recorder;

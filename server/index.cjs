@@ -1114,7 +1114,7 @@ if (require.main === module) {
   const uiHandler = (req, res) => handleRequest(req, res).catch((err) => answerUnhandled(res, err));
   // M0 contract corpus (noevia-rs tools/replay): only when NOEVIA_CONTRACT_RECORD names a directory;
   // unset, the listener gets uiHandler itself.
-  const contractRecorder = require('./contract-record.cjs').fromEnv(process.env);
+  const contractRecorder = require('./contract-record.cjs').fromEnv(process.env, { accounts: authService.userCount() });
   const server = http.createServer(codeNetGuard.wrap(contractRecorder ? contractRecorder.wrap(uiHandler) : uiHandler, 'ui'));
   staticFiles.warm();
   // A chat waiting on a write approval is a legitimately long request. Node's

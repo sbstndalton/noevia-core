@@ -224,3 +224,15 @@ test('measured timings are <num>, counts stay literal', () => {
   assert.deepEqual(norm.value({ type: 'telemetry', timeToFirstToken: 12.5, tokensPerSecond: 40.1, durationMs: 830, promptTokens: 12, count: 3 }),
     { type: 'telemetry', timeToFirstToken: '<num>', tokensPerSecond: '<num>', durationMs: '<num>', promptTokens: 12, count: 3 });
 });
+
+test('a data dir that already has accounts is never recorded', () => {
+  const dir = path.join(tmp(), 'out');
+  const errors = [];
+  const original = console.error;
+  console.error = (m) => errors.push(String(m));
+  try { assert.equal(fromEnv({ NOEVIA_CONTRACT_RECORD: dir }, { accounts: 2 }), null); } finally { console.error = original; }
+  assert.equal(fs.existsSync(dir), false, 'not even the directory is created');
+  assert.match(errors.join('\n'), /already has 2 account/);
+  const quiet = console.warn; console.warn = () => {};
+  try { assert.ok(fromEnv({ NOEVIA_CONTRACT_RECORD: dir }, { accounts: 0 })); } finally { console.warn = quiet; }
+});
