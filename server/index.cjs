@@ -92,7 +92,7 @@ const serveStatic = require('./spa-routes.cjs').createStaticFallback({ staticFil
 const secretStore = createSecretStore(DATA_DIR);
 // M3 of the full-Rust migration: NOEVIA_RUST_AUTH=1 with NOEVIA_FRONT=rust hands sign-in, the
 // account routes and their tables to the Rust front (rust-auth.cjs). Off by default.
-const rustAuth = require('./rust-auth.cjs').createRustAuthGuard({ enabled: require('./rust-auth.cjs').enabledFrom(process.env) });
+const rustAuth = require('./rust-auth.cjs').createRustAuthGuard({ enabled: require('./rust-auth.cjs').enabledFrom(process.env), samplingSettingsEnabled: require('./routes/sampling-settings.cjs').enabledFrom(process.env) });
 // M4: NOEVIA_RUST_PROJECTS=1 (on top of M3) shares projects.json with the Rust front, which answers
 // the project image routes (rust-projects.cjs). Off by default.
 const RUST_PROJECTS = require('./rust-projects.cjs').enabledFrom(process.env);

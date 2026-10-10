@@ -17,7 +17,13 @@ const { PRESETS, PRESETS_VERSION } = require('../sampling-presets.cjs');
  * @param {(req) => Promise<string>} deps.readBody
  * @param {object} deps.authService   db and audit
  */
-function createSamplingSettingsRoutes({ json, readBody, authService }) {
+function enabledFrom(env = process.env) {
+  return env.NOEVIA_FRONT === 'rust' && env.NOEVIA_RUST_AUTH === '1'
+    && env.NOEVIA_RUST_AUTH_CONFIRMED === '1' && env.NOEVIA_RUST_SAMPLING_SETTINGS === '1'
+    && env.NOEVIA_RUST_SAMPLING_SETTINGS_CONFIRMED === '1';
+}
+function createSamplingSettingsRoutes({ json, readBody, authService, env = process.env }) {
+  const rustOwned = enabledFrom(env);
   const KEY = 'auto_sampling_presets_enabled';
   const currentlyEnabled = () => {
     const raw = authService.db.prepare('SELECT value FROM settings WHERE key=?').get(KEY)?.value;
@@ -25,6 +31,7 @@ function createSamplingSettingsRoutes({ json, readBody, authService }) {
   };
   async function handle(req, res, { path: p, authn }) {
     if (p === '/api/sampling-settings') {
+      if (rustOwned) return json(res, 503, { error: 'Sampling settings are owned by the Rust front.' });
       if (req.method === 'GET') {
         return json(res, 200, { enabled: currentlyEnabled(), presets: PRESETS, version: PRESETS_VERSION, admin: authn.user.role === 'admin' });
       }
@@ -32,8 +39,10 @@ function createSamplingSettingsRoutes({ json, readBody, authService }) {
         if (authn.user.role !== 'admin') return json(res, 403, { error: 'Administrator required' });
         let body; try { body = JSON.parse(await readBody(req)); } catch { return json(res, 400, { error: 'invalid JSON' }); }
         if (!body || typeof body !== 'object' || Array.isArray(body) || typeof body.enabled !== 'boolean') return json(res, 400, { error: 'enabled must be true or false' });
-        authService.db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)").run(KEY, String(body.enabled));
-        authService.audit('sampling.autoPresets', authn.user.id, null, { enabled: body.enabled });
+        authService.db.transaction(() => {
+          authService.db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)").run(KEY, String(body.enabled));
+          authService.audit('sampling.autoPresets', authn.user.id, null, { enabled: body.enabled });
+        })();
         return json(res, 200, { enabled: body.enabled });
       }
       return json(res, 405, { error: 'Method not allowed' });
@@ -45,4 +54,4 @@ function createSamplingSettingsRoutes({ json, readBody, authService }) {
   };
 }
 
-module.exports = { createSamplingSettingsRoutes };
+module.exports = { createSamplingSettingsRoutes, enabledFrom };
