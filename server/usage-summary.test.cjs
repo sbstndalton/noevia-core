@@ -46,3 +46,37 @@ test('merged counters stay numeric and cannot carry prototype-shaped tool names'
  assert.equal(merged.days['2026-09-13'].hours[14],1);
  assert.equal({}.x,undefined);
 });
+
+test('aggregate model ties and fractional sums follow account order, not file completion (#1281)',async()=>{
+ const fs=require('node:fs'),path=require('node:path'),os=require('node:os');
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'noevia-usage-order-'));
+ const read=fs.promises.readFile;
+ try{
+  for(const [id,n]of [['a',0.1],['b',0.2],['c',0.3]]){
+   fs.mkdirSync(path.join(dir,id));fs.writeFileSync(path.join(dir,id,'usage.json'),JSON.stringify({days:{'2026-09-13':{input:n,models:{[id]:{input:1}}}}}));
+  }
+  const {aggregateUsage}=require('./usage-summary.cjs');
+  for(const slow of ['a','b']){
+   fs.promises.readFile=async(...args)=>{if(path.basename(path.dirname(args[0]))===slow)await new Promise(resolve=>setTimeout(resolve,15));return read.apply(fs.promises,args);};
+   const result=await aggregateUsage(['a','b','c'].map(id=>({id})),id=>path.join(dir,id),slow==='a'?100000:140000);
+   assert.deepEqual(summarizeUsage(result.store,options).models.map(x=>x.name),['a','b','c']);
+   assert.equal(result.unreadableAccounts,0);
+   assert.equal(result.store.days['2026-09-13'].input,(0.1+0.2)+0.3,slow);
+   assert.equal(result.store.days['2026-09-13'].input,0.6000000000000001,slow);
+  }
+ }finally{fs.promises.readFile=read;fs.rmSync(dir,{recursive:true,force:true});}
+});
+
+// #1286: subtraction must compare combined weights; stable ties retain input order.
+test('large fractional model weights have a consistent stable ordering',()=>{
+  const store=require('./fixtures/usage-model-sort.json');
+  const {usageDayKey}=require('./usage.cjs');
+  const got=summarizeUsage(store,{dayKey:usageDayKey,now:new Date('2026-10-10T12:00:00Z')});
+  const max=Number.MAX_SAFE_INTEGER;
+  const rows=Object.entries(store.days['2026-10-10'].models).map(([name,v])=>({name,input:Math.min(max,v.input),output:Math.min(max,v.output)}));
+  const weight=v=>v.input+v.output;
+  const expected=rows.slice().sort((a,b)=>weight(b)-weight(a));
+  assert.deepEqual(got.models.map(v=>v.name),expected.map(v=>v.name));
+  for(const row of rows) assert.equal(weight(row)-weight(row),0);
+  for(let i=1;i<got.models.length;i++) assert.ok(weight(got.models[i-1])>=weight(got.models[i]));
+});

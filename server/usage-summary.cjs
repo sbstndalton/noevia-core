@@ -37,7 +37,7 @@ function summarizeUsage(store,{dayKey,retentionDays=365,now=new Date()}) {
   for(let i=days.length-1;i>=0;i--){if(days[i].replies>0)streak++;else if(days[i].day!==today)break;}
   for(const day of days){run=day.replies>0?run+1:0;longest=Math.max(longest,run);}
   return {days,allTime:totals(days.length),last7:totals(7),last30:totals(30),activeDays:days.filter(day=>day.replies>0).length,currentStreak:streak,longestStreak:longest,
-    models:Object.entries(models).map(([name,value])=>({name,...value})).sort((a,b)=>b.input+b.output-a.input-a.output),
+    models:Object.entries(models).map(([name,value])=>({name,...value})).sort((a,b)=>(b.input+b.output)-(a.input+a.output)),
     tools:Object.entries(tools).map(([name,calls])=>({name,calls})).filter(t=>t.calls>0).sort((a,b)=>b.calls-a.calls||a.name.localeCompare(b.name)),
     // 24 buckets in the same local clock the day keys use. peakHour is null
     // until something has actually been recorded, so the view can say so.
@@ -52,15 +52,23 @@ async function aggregateUsage(users,userDir,now=Date.now()) {
   const paths=users.map(user=>require('path').join(userDir(user.id),'usage.json'));
   const signature=JSON.stringify(paths);
   if(aggregateCache?.signature===signature&&now-aggregateCache.at<30000)return aggregateCache.value;
-  const fs=require('fs').promises;let next=0,unreadableAccounts=0,merged={days:{}};
-  await Promise.all(Array.from({length:Math.min(8,paths.length)},async()=>{
-    while(next<paths.length){const file=paths[next++];try{
-      const stat=await fs.stat(file);if(stat.size>2*1024*1024)throw Error('oversize');
-      const value=JSON.parse(await fs.readFile(file,'utf8'));
-      if(!value?.days||typeof value.days!=='object'||Array.isArray(value.days))throw Error('invalid');
-      merged=mergeUsage([value],merged);
-    }catch(error){if(error.code!=='ENOENT')unreadableAccounts++;}}
-  }));
+  const fs=require('fs').promises;let unreadableAccounts=0,merged={days:{}};
+  // #1281: completion order must not choose fractional sums or stable model ties.
+  // Read at most eight files concurrently and merge each bounded batch in account order.
+  for(let start=0;start<paths.length;start+=8){
+    const results=await Promise.all(paths.slice(start,start+8).map(async file=>{
+      try{
+        const stat=await fs.stat(file);if(stat.size>2*1024*1024)throw Error('oversize');
+        const value=JSON.parse(await fs.readFile(file,'utf8'));
+        if(!value?.days||typeof value.days!=='object'||Array.isArray(value.days))throw Error('invalid');
+        return {value};
+      }catch(error){return {unreadable:error.code!=='ENOENT'};}
+    }));
+    for(const result of results){
+      if(result.value)merged=mergeUsage([result.value],merged);
+      else if(result.unreadable)unreadableAccounts++;
+    }
+  }
   const value={store:merged,accounts:users.length,unreadableAccounts,checkedAt:now};
   aggregateCache={signature,at:now,value};return value;
 }
