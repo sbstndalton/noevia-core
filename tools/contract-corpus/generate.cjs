@@ -163,6 +163,7 @@ async function main() {
     const step = async (client, method, p, body, expect) => {
       const r = await client.call(method, p, body);
       steps.push({ method, path: p.replace(/\?.*/, ''), status: r.status });
+      console.log(`${r.status} ${method} ${p.replace(/\?.*/, '')}`);
       if (expect && !expect.includes(r.status)) throw new Error(`${method} ${p}: expected ${expect.join('/')}, got ${r.status}: ${r.text.slice(0, 300)}`);
       return r;
     };
@@ -172,7 +173,7 @@ async function main() {
     await step(anon, 'GET', '/api/health');
     await step(anon, 'GET', '/api/setup/status', undefined, [200]);
     await step(anon, 'GET', '/api/auth/session', undefined, [401]);
-    await step(anon, 'GET', '/api/projects', undefined, [401]);
+    await step(anon, 'GET', '/api/workspace');
     await step(anon, 'POST', '/api/setup/complete', { setupCode: 'wrong-code-synthetic', publicOrigin: base, ...ADMIN, diaryEnabled: false }, [401]);
     // Setup signs the admin in.
     await step(admin, 'POST', '/api/setup/complete', { setupCode, publicOrigin: base, ...ADMIN, diaryEnabled: false }, [201]);
@@ -190,7 +191,7 @@ async function main() {
     const created = await step(admin, 'POST', '/api/projects', { name: 'Synthetic project', goal: 'Contract corpus', instructions: 'Answer briefly.', files: [{ name: 'notes.md', content: '# Synthetic notes\n\nAlpha beta gamma.' }] }, [200, 201]);
     const projectId = created.json?.id || created.json?.project?.id;
     if (!projectId) throw new Error(`project id missing from ${created.text.slice(0, 200)}`);
-    await step(admin, 'GET', '/api/projects', undefined, [200]);
+    await step(admin, 'GET', '/api/workspace', undefined, [200]);
     await step(admin, 'GET', `/api/projects/${encodeURIComponent(projectId)}`);
     await step(admin, 'GET', `/api/projects/${encodeURIComponent(projectId)}/config`);
     await step(admin, 'PUT', `/api/projects/${encodeURIComponent(projectId)}/config`, { instructions: 'Answer very briefly.' });
@@ -211,7 +212,7 @@ async function main() {
     // A second account: the tenant boundary is part of the contract.
     const invite = await step(admin, 'POST', '/api/admin/invitations', { role: 'member' }, [201]);
     await step(member, 'POST', '/api/auth/invitations/accept', { token: invite.json.token, ...MEMBER, diaryEnabled: false });
-    await step(member, 'GET', '/api/projects');
+    await step(member, 'GET', '/api/workspace');
     await step(member, 'GET', `/api/projects/${encodeURIComponent(projectId)}`);
     if (chatId) await step(member, 'GET', `/api/chats/${encodeURIComponent(chatId)}/history`);
     await step(member, 'GET', '/api/admin/users');
@@ -235,7 +236,7 @@ async function main() {
     // Clean-up is part of the contract too.
     if (chatId) await step(admin, 'DELETE', `/api/projects/${encodeURIComponent(projectId)}/chats/${encodeURIComponent(chatId)}`);
     await step(admin, 'DELETE', `/api/projects/${encodeURIComponent(projectId)}`);
-    await step(admin, 'GET', '/api/projects', undefined, [200]);
+    await step(admin, 'GET', '/api/workspace', undefined, [200]);
     covered.push(...new Set(steps.map((s) => `${s.method} ${s.path}`)));
   } finally {
     child.kill('SIGTERM');
