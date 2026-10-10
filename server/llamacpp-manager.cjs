@@ -461,6 +461,16 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
   async function presetRefusal(model, options) {
     const badKnob = sizeKnobProblem(options || {});
     if (badKnob) return { error: `Not saved: ${badKnob}`, code: 'invalid_size' };
+    // #1234: the micro batch is split out of the batch, so it cannot be larger. Checked over the
+    // effective values (the global [*] section under the section's own), as prepare() does.
+    {
+      let globals = {};
+      try { globals = presets?.get(model).defaults || {}; } catch {}
+      const eff = { ...globals, ...(options || {}) };
+      if (require('./llamacpp-presets.cjs').microBatchExceeds(String(eff['ubatch-size'] ?? '').trim() || undefined, String(eff['batch-size'] ?? '').trim() || undefined)) {
+        return { error: 'Not saved: Micro batch cannot exceed batch size', code: 'invalid_size' };
+      }
+    }
     const budgetGib = Number(inferenceBudget?.budgetGib?.());
     if (!(budgetGib > 0) || !presets || !autoconfig.modelsPath) return null;
     const read = await readModel(model).catch(() => ({ error: 'unreadable' }));
