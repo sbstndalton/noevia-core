@@ -117,7 +117,6 @@ async function main() {
   child.stdout.on('data', (d) => log.push(String(d)));
   child.stderr.on('data', (d) => log.push(String(d)));
   const steps = [];
-  const covered = [];
   try {
     await waitReady(base, child);
     const admin = new Client(base, base);
@@ -200,7 +199,6 @@ async function main() {
     await step(admin, 'DELETE', `/api/projects/${encodeURIComponent(projectId)}`);
     await step(admin, 'GET', '/api/workspace', undefined, [200]);
     if (memberId) await step(admin, 'DELETE', `/api/admin/users/${encodeURIComponent(memberId)}`, { username: MEMBER.username });
-    covered.push(...new Set(steps.map((s) => `${s.method} ${s.path}`)));
   } finally {
     child.kill('SIGTERM');
     await new Promise((r) => (child.exitCode !== null ? r() : child.once('exit', r)));
@@ -230,7 +228,8 @@ async function main() {
     inputs,
     exchanges: files.length,
     dropped: dropped.length,
-    covered,
+    // Normalised, so two runs write the same manifest.
+    covered: [...new Set(files.map((f) => { const ex = JSON.parse(fs.readFileSync(path.join(exchanges, f), 'utf8')); return `${ex.request.method} ${ex.request.path}`; }))],
   };
   fs.writeFileSync(path.join(out, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
 

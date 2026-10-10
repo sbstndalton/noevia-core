@@ -236,3 +236,9 @@ test('a data dir that already has accounts is never recorded', () => {
   const quiet = console.warn; console.warn = () => {};
   try { assert.ok(fromEnv({ NOEVIA_CONTRACT_RECORD: dir }, { accounts: 0 })); } finally { console.warn = quiet; }
 });
+
+test('upstream URLs are <url:name> and IP addresses are not ids', () => {
+  const norm = createNormaliser({ upstreams: { 'http://127.0.0.1:34455': 'inference', 'http://127.0.0.1:34456/': 'diary' } });
+  assert.deepEqual(norm.value({ baseUrl: 'http://127.0.0.1:34455', diary: 'http://127.0.0.1:34456/api/x', host: '127.0.0.1', hostId: '10.0.0.12' }),
+    { baseUrl: '<url:inference>', diary: '<url:diary>/api/x', host: '127.0.0.1', hostId: '10.0.0.12' });
+});

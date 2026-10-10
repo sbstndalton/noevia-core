@@ -9,6 +9,7 @@
 //     any value of a secret-named JSON field or query parameter, long random-looking strings, and
 //     the values of secret-named environment variables) become `<secret:N>`;
 //   - ids (UUIDs, long hex, values of id-named fields) become `<id:N>`;
+//   - configured upstream URLs (INFERENCE_BASE_URL, DIARY_BASE_URL, ...) become `<url:name>`;
 //   - timestamps (ISO strings, epoch-ms numbers in time-named fields) become `<ts>`, measured
 //     durations and rates (`*Ms`, `tokensPerSecond`, `timeToFirstToken`, ...) `<num>`.
 // N numbers values in order of first sight across the whole recording, so the same session
@@ -44,14 +45,18 @@ const REQUEST_HEADERS = /^(content-type|accept|x-csrf-token|cookie|origin|author
 const ENV_SECRET = /KEY|TOKEN|SECRET|PASSWORD|PASS$|CREDENTIAL|COOKIE/i;
 
 function idLike(s) {
-  return s.length >= 8 && /\d/.test(s) && /^[A-Za-z0-9_.:-]+$/.test(s);
+  // A letter and a digit: `proj-1791600933849-w10hvg`, a UUID; not `127.0.0.1` or a count.
+  return s.length >= 8 && /\d/.test(s) && /[A-Za-z]/.test(s) && /^[A-Za-z0-9_.:-]+$/.test(s);
 }
 
 function isRandomish(s) {
   return /\d/.test(s) && /[a-z]/.test(s) && /[A-Z]/.test(s);
 }
 
-function createNormaliser({ envSecrets = [], origin = '' } = {}) {
+// `upstreams` maps a configured service URL (the model server, the Diary) to a name: it is
+// `<url:name>` in the corpus, because its host and port belong to the run, not the contract.
+function createNormaliser({ envSecrets = [], origin = '', upstreams = {} } = {}) {
+  const upstreamPairs = Object.entries(upstreams).filter(([u]) => u).map(([u, n]) => [u.replace(/\/+$/, ''), `<url:${n}>`]).sort((a, b) => b[0].length - a[0].length);
   const secrets = new Map(); // raw -> placeholder
   const ids = new Map();
   let secretN = 0; let idN = 0;
@@ -77,6 +82,7 @@ function createNormaliser({ envSecrets = [], origin = '' } = {}) {
     let s = String(input);
     // The server's own origin (a run-specific port in a corpus run) is <origin> wherever it appears.
     if (origin && s.includes(origin)) s = s.split(origin).join('<origin>');
+    for (const [u, name] of upstreamPairs) if (s.includes(u)) s = s.split(u).join(name);
     const known = [...secrets.keys(), ...ids.keys()].filter((k) => k.length >= 6).sort((a, b) => b.length - a.length);
     for (const k of known) if (s.includes(k)) s = s.split(k).join(secrets.get(k) || ids.get(k));
     s = s.replace(ISO_TS, '<ts>');
@@ -237,7 +243,12 @@ function createContractRecorder({ dir, env = {}, origin = '', filter } = {}) {
   if (!dir) return null;
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const envSecrets = Object.entries(env).filter(([k, v]) => ENV_SECRET.test(k) && typeof v === 'string').map(([, v]) => v);
-  const norm = createNormaliser({ envSecrets, origin });
+  const upstreams = {};
+  for (const [k, name] of [['INFERENCE_BASE_URL', 'inference'], ['LEMONADE_BASE_URL', 'inference'], ['MODEL_MANAGER_BASE_URL', 'model-manager'], ['MODEL_LOADER_URL', 'model-loader'], ['DIARY_BASE_URL', 'diary'], ['OCR_BASE_URL', 'ocr']]) {
+    const u = String(env[k] || '').trim();
+    if (u && !upstreams[u]) upstreams[u] = name;
+  }
+  const norm = createNormaliser({ envSecrets, origin, upstreams });
   const keep = filter || ((p) => p.startsWith('/api/'));
   let seq = 0;
   let scanned = 0; // secrets every written file has been checked against
