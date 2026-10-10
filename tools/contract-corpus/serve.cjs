@@ -19,7 +19,8 @@ async function main() {
   const env = serverEnv({ port, dataDir, origin: process.env.PUBLIC_ORIGIN || `http://127.0.0.1:${port}`, mocks });
   // noevia-rs replays the corpus through its front with the M3 switch on (sign-in and the account
   // in Rust): Node then runs read-only for those tables, as it would behind that front.
-  if (process.env.NOEVIA_RUST_AUTH === '1') Object.assign(env, { NOEVIA_RUST_AUTH: '1', NOEVIA_FRONT: 'rust' });
+  // The guard also needs the supervisor's confirmation (rust-auth.cjs enabledFrom), passed through.
+  if (process.env.NOEVIA_RUST_AUTH === '1') Object.assign(env, { NOEVIA_RUST_AUTH: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH_CONFIRMED: process.env.NOEVIA_RUST_AUTH_CONFIRMED === '1' ? '1' : '' });
   const child = spawn(process.execPath, ['--require', GUARD, SERVER], { env, stdio: ['ignore', 'ignore', 'pipe'] });
   // Server warnings go to stderr, minus the first-run setup code (the replayer reads it from the
   // data dir; a log is no place for it, synthetic or not).
