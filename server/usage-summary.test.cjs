@@ -66,3 +66,17 @@ test('aggregate model ties and fractional sums follow account order, not file co
   }
  }finally{fs.promises.readFile=read;fs.rmSync(dir,{recursive:true,force:true});}
 });
+
+// #1286: subtraction must compare combined weights; stable ties retain input order.
+test('large fractional model weights have a consistent stable ordering',()=>{
+  const store=require('./fixtures/usage-model-sort.json');
+  const {usageDayKey}=require('./usage.cjs');
+  const got=summarizeUsage(store,{dayKey:usageDayKey,now:new Date('2026-10-10T12:00:00Z')});
+  const max=Number.MAX_SAFE_INTEGER;
+  const rows=Object.entries(store.days['2026-10-10'].models).map(([name,v])=>({name,input:Math.min(max,v.input),output:Math.min(max,v.output)}));
+  const weight=v=>v.input+v.output;
+  const expected=rows.slice().sort((a,b)=>weight(b)-weight(a));
+  assert.deepEqual(got.models.map(v=>v.name),expected.map(v=>v.name));
+  for(const row of rows) assert.equal(weight(row)-weight(row),0);
+  for(let i=1;i<got.models.length;i++) assert.ok(weight(got.models[i-1])>=weight(got.models[i]));
+});

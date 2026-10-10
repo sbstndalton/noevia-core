@@ -37,7 +37,7 @@ function summarizeUsage(store,{dayKey,retentionDays=365,now=new Date()}) {
   for(let i=days.length-1;i>=0;i--){if(days[i].replies>0)streak++;else if(days[i].day!==today)break;}
   for(const day of days){run=day.replies>0?run+1:0;longest=Math.max(longest,run);}
   return {days,allTime:totals(days.length),last7:totals(7),last30:totals(30),activeDays:days.filter(day=>day.replies>0).length,currentStreak:streak,longestStreak:longest,
-    models:Object.entries(models).map(([name,value])=>({name,...value})).sort((a,b)=>b.input+b.output-a.input-a.output),
+    models:Object.entries(models).map(([name,value])=>({name,...value})).sort((a,b)=>(b.input+b.output)-(a.input+a.output)),
     tools:Object.entries(tools).map(([name,calls])=>({name,calls})).filter(t=>t.calls>0).sort((a,b)=>b.calls-a.calls||a.name.localeCompare(b.name)),
     // 24 buckets in the same local clock the day keys use. peakHour is null
     // until something has actually been recorded, so the view can say so.
