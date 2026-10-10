@@ -200,7 +200,11 @@ const oauthError = (error, description, status = 400) => ({ status, body: { erro
  * @param {boolean} [deps.addressesTrusted]  TRUST_PROXY: only then is a client address a real,
  *        per-client value worth showing or rate limiting on. Off, it is the tunnel's address.
  */
-function createDeviceAuth({ db, audit, publicUser, rate, clientAddress, origin, now = Date.now, addressesTrusted = false }) {
+function createDeviceAuth({ db, audit, publicUser, rate, clientAddress, origin, now = Date.now, addressesTrusted = false, guard = null }) {
+  // M3 (rust-auth.cjs): with the Rust front owning device sign-in, this process only reads the
+  // device tables, except revokeAll (switching the feature off stays Node's: an exemption).
+  const rustOwned = !!guard?.enabled;
+  const exempt = guard ? guard.exempt : (fn) => fn();
   ensureDeviceSchema(db);
   const q = {
     sweep: db.prepare('DELETE FROM device_authorizations WHERE expires_at<=?'),
@@ -440,8 +444,9 @@ function createDeviceAuth({ db, audit, publicUser, rate, clientAddress, origin, 
     if (!row || row.kind !== 'access' || row.token_expires_at <= at || row.grant_expires_at <= at) return null;
     const user = q.userRow.get(row.user_id);
     if (!user || user.disabled_at) return null;
-    // Writes at most once a minute per grant: last-used is shown in Settings, not audited.
-    if (at - row.last_used_at >= 60 * 1000) q.touchGrant.run(at, row.grant_id);
+    // Writes at most once a minute per grant: last-used is shown in Settings, not audited. With the
+    // Rust front owning the grants it made this write before proxying (server-auth upkeep).
+    if (!rustOwned && at - row.last_used_at >= 60 * 1000) q.touchGrant.run(at, row.grant_id);
     const account = publicUser(user);
     return {
       user: { ...account, role: 'member' }, session: null, legacy: false, accountRole: account.role,
@@ -504,6 +509,10 @@ function createDeviceAuth({ db, audit, publicUser, rate, clientAddress, origin, 
    * revoke, not a pause). One audit entry per affected account. Returns the number deleted.
    */
   function revokeAll(actorId, reason) {
+    return exempt(() => revokeAllNow(actorId, reason));
+  }
+
+  function revokeAllNow(actorId, reason) {
     const affected = q.grantsByUser.all();
     // Pending and approved-but-unredeemed requests too: none may turn into a grant afterwards.
     q.deleteAllAuthorizations.run();

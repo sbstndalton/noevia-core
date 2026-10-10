@@ -4,7 +4,10 @@ const { hash, verify, Algorithm } = require('@node-rs/argon2');
 
 // DAV credentials have no connection to session issuance or account passwords.
 // `hashPassword` is injectable for tests that need to hold the hashing step open.
-function createAppPasswords({ db, audit, rateLimited, hashPassword = (password) => hash(password, { algorithm: Algorithm.Argon2id, memoryCost: 19456, timeCost: 2, parallelism: 1 }) }) {
+function createAppPasswords({ db, audit, rateLimited, guard = null, hashPassword = (password) => hash(password, { algorithm: Algorithm.Argon2id, memoryCost: 19456, timeCost: 2, parallelism: 1 }) }) {
+  // The DAV listener stays Node's while the Rust front owns app passwords (rust-auth.cjs): its
+  // last_used_at write is the one exemption here.
+  const exempt = guard ? guard.exempt : (fn) => fn();
   db.exec(`CREATE TABLE IF NOT EXISTS app_passwords(
     id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     name TEXT NOT NULL, scope TEXT NOT NULL CHECK(scope IN ('lan','public')),
@@ -54,9 +57,9 @@ function createAppPasswords({ db, audit, rateLimited, hashPassword = (password) 
         WHERE a.id=? AND u.username_norm=? AND u.disabled_at IS NULL AND a.scope=?`).get(match[1], username.toLowerCase(), scope);
       if (!row || !await verify(row.password_hash, password).catch(() => false)) return null;
       // Revocation or account disable while Argon2 runs must take effect now.
-      const updated = db.prepare(`UPDATE app_passwords SET last_used_at=? WHERE id=? AND password_hash=?
+      const updated = exempt(() => db.prepare(`UPDATE app_passwords SET last_used_at=? WHERE id=? AND password_hash=?
         AND EXISTS (SELECT 1 FROM users WHERE id=app_passwords.user_id AND disabled_at IS NULL)`)
-        .run(Date.now(), row.id, row.password_hash).changes;
+        .run(Date.now(), row.id, row.password_hash).changes);
       return updated ? { userId: row.user_id, credentialId: row.id, scope: row.scope } : null;
     },
   };

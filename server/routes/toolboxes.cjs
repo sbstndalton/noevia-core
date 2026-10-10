@@ -23,7 +23,7 @@ const { createTtlCache } = require('../toolboxes-permitted.cjs');
  *        null when the project is not this account's (the caller's getProject is tenant-scoped)
  * @param {{ get:(k:string)=>any, set:(k:string, v:any)=>void }} [deps.cache]
  */
-function createToolboxRoutes({ discoverMcpTools, toolboxSummaries, connectedBoxes = () => [], prefill, mcp, json, permitted = null, cache = createTtlCache({ ttlMs: 30000 }) }) {
+function createToolboxRoutes({ discoverMcpTools, toolboxSummaries, connectedBoxes = () => [], prefill, mcp, json, permitted = null, cache = createTtlCache({ ttlMs: 30000 }), cacheKeyExtra = () => null }) {
   return async function toolboxRoutes(req, res, { path, authn, url }) {
     if (path === '/api/toolboxes/permitted' && permitted) {
       if (req.method !== 'GET') return json(res, 405, { error: 'method not allowed' }), true;
@@ -32,7 +32,9 @@ function createToolboxRoutes({ discoverMcpTools, toolboxSummaries, connectedBoxe
       const projectId = params.get('projectId') || null;
       const mode = params.get('mode') || 'chat';
       if (mode !== 'chat' && mode !== 'cowork') return json(res, 400, { error: 'mode must be "chat" or "cowork"' }), true;
-      const key = JSON.stringify([authn.user.id, authn.user.role, projectId, mode]);
+      // cacheKeyExtra: per-user state another process may change (the Diary preference, which the
+      // Rust front writes under NOEVIA_RUST_AUTH without clearing this cache), so a change shows at once.
+      const key = JSON.stringify([authn.user.id, authn.user.role, projectId, mode, cacheKeyExtra(authn)]);
       let view = cache.get(key);
       if (!view) {
         await discoverMcpTools();

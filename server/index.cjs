@@ -90,7 +90,11 @@ const staticFiles = require('./static-files.cjs').createStaticFiles(DIST_DIR);
 // The build, with index.html for the client's own places (/c/<id>, /p/<id>, /settings/<section>…, #359).
 const serveStatic = require('./spa-routes.cjs').createStaticFallback({ staticFiles, indexFile: path.join(DIST_DIR, 'index.html'), json });
 const secretStore = createSecretStore(DATA_DIR);
+// M3 of the full-Rust migration: NOEVIA_RUST_AUTH=1 with NOEVIA_FRONT=rust hands sign-in, the
+// account routes and their tables to the Rust front (rust-auth.cjs). Off by default.
+const rustAuth = require('./rust-auth.cjs').createRustAuthGuard({ enabled: require('./rust-auth.cjs').enabledFrom(process.env) });
 const authService = createAuth({
+  rustAuth,
   dataDir: DATA_DIR,
   publicOrigin: process.env.PUBLIC_ORIGIN || '',
   rpId: process.env.WEBAUTHN_RP_ID || '',
@@ -928,6 +932,7 @@ const deviceAuth = require('./device-auth.cjs').createDeviceAuth({
   origin: () => authService.origin || process.env.PUBLIC_ORIGIN || '',
   // Without TRUST_PROXY every request carries the tunnel's address: not shown, not rate-limited on.
   addressesTrusted: process.env.TRUST_PROXY === 'true',
+  guard: rustAuth,
 });
 // Started with the feature off: grants from an earlier "on" period are revoked, not kept dormant.
 if (!nativeClientAuth()) deviceAuth.revokeAll(null, 'feature-off');
@@ -967,6 +972,7 @@ const readyRoutes = require('./routes/health.cjs').createReadyRoutes({
 // GET /api/toolboxes: the picker view (routes/toolboxes.cjs). MCP state is read at call time.
 const toolboxRoutes = require('./routes/toolboxes.cjs').createToolboxRoutes({
   discoverMcpTools: () => discoverMcpTools(), toolboxSummaries, connectedBoxes, json, cache: permittedToolsCache,
+  cacheKeyExtra: (authn) => authService.diaryEnabled(authn.user.id),
   prefill: { targetMs: TOOL_PREFILL_TARGET_MS, stats: () => prefill.stats() },
   mcp: () => ({ enabled: mcpWiring.enabled(), state: mcpState, servers: MCP_SERVERS, manifest: MCP_TOOLBOX_MANIFEST }),
   // The per-turn catalogue (#237). getProject is scoped to the signed-in account's workspace.

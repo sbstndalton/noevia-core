@@ -167,7 +167,10 @@ function parseCookies(req) {
   return out;
 }
 
-function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompat = false, secrets = null, trustProxy = false, additionalOrigins = [] }) {
+function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompat = false, secrets = null, trustProxy = false, additionalOrigins = [], rustAuth = null }) {
+  // M3 (rust-auth.cjs): with NOEVIA_RUST_AUTH on, the Rust front writes the account tables and this
+  // process only reads them. Off (the default), nothing here changes.
+  const guard = rustAuth || require('./rust-auth.cjs').createRustAuthGuard({ enabled: false });
   fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   const db = new Database(path.join(dataDir, 'cowork.db'));
   db.pragma('journal_mode = WAL');
@@ -304,15 +307,29 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
   // though only one origin can ever be the WebAuthn RP — passkeys are bound to
   // `origin`/`relyingPartyId` and will never work from an IP-address origin
   // regardless of this list, per the WebAuthn spec (RP ID must be a domain).
-  const trustedOrigins = new Set(additionalOrigins.filter(Boolean));
+  let trustedOrigins = new Set(additionalOrigins.filter(Boolean));
   // Earlier addresses keep working for sign-in after a rename, so nobody is locked out mid-move.
   let previousOrigins = [];
   try { previousOrigins = JSON.parse(setting('previous_origins') || '[]').filter((o) => typeof o === 'string'); } catch { previousOrigins = []; }
   for (const o of previousOrigins) trustedOrigins.add(o);
   const setupFile = path.join(dataDir, 'first-run-setup-code');
 
+  /** With the Rust front owning first-run setup (M3), the address it chose is in settings only:
+   *  every use reads it again, the way a restart would (settings -> PUBLIC_ORIGIN -> setup). */
+  function refreshOrigin() {
+    if (!guard.enabled) return;
+    const admin = setting('public_origin_admin');
+    const configured = setting('public_origin');
+    origin = admin || publicOrigin || configured || '';
+    originSource = admin ? 'settings' : publicOrigin ? 'environment' : configured ? 'setup' : 'none';
+    relyingPartyId = rpFor(origin);
+    try { previousOrigins = JSON.parse(setting('previous_origins') || '[]').filter((o) => typeof o === 'string'); } catch { previousOrigins = []; }
+    trustedOrigins = new Set([...additionalOrigins.filter(Boolean), ...previousOrigins]);
+  }
+
   /** Every address a passkey ceremony may come from: the current one and earlier ones. */
   function passkeyOrigins() {
+    refreshOrigin();
     const current = origin || setting('public_origin');
     return [...new Set([current, ...previousOrigins].filter(Boolean))];
   }
@@ -331,6 +348,10 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
 
   const proxyWarning = trustProxyWarning(origin, trustProxy);
   if (proxyWarning) console.warn(proxyWarning);
+
+  // Everything above is the boot (migrations, the first-run setup code); from here on the
+  // Rust-owned tables are written only by the Rust front while the switch is on.
+  guard.install(db);
 
   const rate = createRateLimiter();
   function rateLimited(key, limit = 5, windowMs = 15 * 60 * 1000) {
@@ -382,11 +403,13 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
     if (raw) {
       const row = db.prepare(`SELECT s.*,u.id AS id,u.username,u.display_name,u.role,u.disabled_at,u.credential_epoch
         FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.id_hash=?`).get(digest(raw));
+      // With the Rust front owning sessions (M3) the gate is read-only: the front made these two
+      // writes before it proxied the request (noevia-rs server-auth upkeep).
       if (row && !row.disabled_at && row.expires_at > now && row.last_seen_at + IDLE_MS > now) {
-        db.prepare('UPDATE sessions SET last_seen_at=? WHERE id_hash=?').run(now, row.id_hash);
+        if (!guard.enabled) db.prepare('UPDATE sessions SET last_seen_at=? WHERE id_hash=?').run(now, row.id_hash);
         return { user: publicUser(row), session: row, legacy: false };
       }
-      db.prepare('DELETE FROM sessions WHERE id_hash=?').run(digest(raw));
+      if (!guard.enabled) db.prepare('DELETE FROM sessions WHERE id_hash=?').run(digest(raw));
     }
     if (legacyCompat && legacyToken && userCount() > 0) {
       const supplied = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
@@ -407,6 +430,7 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
   }
 
   function originValid(req) {
+    refreshOrigin();
     if (!origin) return true;
     const supplied = String(req.headers.origin || '');
     return !supplied || supplied === origin || trustedOrigins.has(supplied);
@@ -470,34 +494,42 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       .run(actor || null, target || null, action, JSON.stringify(detail), Date.now());
   }
 
+  /** Settings -> Web address. Returns an error message, or null once saved. */
+  function changeOriginNow(next, actorId) {
+    const clean = String(next || '').trim().replace(/\/+$/, '');
+    let u; try { u = new URL(clean); } catch { return 'Enter a full address, such as https://noevia.example.com.'; }
+    if (u.origin !== clean) return 'Enter just the address, without a path, such as https://noevia.example.com.';
+    if (!isAcceptablePublicOrigin(clean)) return 'Use https://, or a private-network address over http://.';
+    if (clean === origin) return null;
+    const before = origin;
+    previousOrigins = [...new Set([...(before ? [before] : []), ...previousOrigins])].filter((o) => o !== clean).slice(0, 5);
+    db.transaction(() => {
+      db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('public_origin_admin',?)").run(clean);
+      db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('previous_origins',?)").run(JSON.stringify(previousOrigins));
+    })();
+    for (const o of previousOrigins) trustedOrigins.add(o);
+    trustedOrigins.delete(clean);
+    origin = clean; originSource = 'settings';
+    // Existing passkeys keep the name they were made under; new ones use the new address.
+    db.prepare('UPDATE passkeys SET rp_id=? WHERE rp_id IS NULL').run(relyingPartyId);
+    relyingPartyId = rpFor(clean);
+    audit('settings.public_origin', actorId, actorId);
+    return null;
+  }
+
   return {
-    appPasswords: require('./app-passwords.cjs').createAppPasswords({ db, audit, rateLimited }),
-    db, get origin() { return origin; }, get rpId() { return relyingPartyId; }, get originSource() { return originSource; }, instanceId,
-    get previousOrigins() { return [...previousOrigins]; },
+    appPasswords: require('./app-passwords.cjs').createAppPasswords({ db, audit, rateLimited, guard }),
+    /** The M3 single-writer guard (rust-auth.cjs), for the modules wired to this database. */
+    rustAuth: guard,
+    db, get origin() { refreshOrigin(); return origin; }, get rpId() { refreshOrigin(); return relyingPartyId; }, get originSource() { refreshOrigin(); return originSource; }, instanceId,
+    get previousOrigins() { refreshOrigin(); return [...previousOrigins]; },
     /** WebAuthn related origins, served at /.well-known/webauthn on the passkey name's host. */
     relatedOrigins: () => passkeyOrigins(),
-    /** Settings → Web address. Returns an error message, or null once saved. */
-    changeOrigin(next, actorId) {
-      const clean = String(next || '').trim().replace(/\/+$/, '');
-      let u; try { u = new URL(clean); } catch { return 'Enter a full address, such as https://noevia.example.com.'; }
-      if (u.origin !== clean) return 'Enter just the address, without a path, such as https://noevia.example.com.';
-      if (!isAcceptablePublicOrigin(clean)) return 'Use https://, or a private-network address over http://.';
-      if (clean === origin) return null;
-      const before = origin;
-      previousOrigins = [...new Set([...(before ? [before] : []), ...previousOrigins])].filter((o) => o !== clean).slice(0, 5);
-      db.transaction(() => {
-        db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('public_origin_admin',?)").run(clean);
-        db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('previous_origins',?)").run(JSON.stringify(previousOrigins));
-      })();
-      for (const o of previousOrigins) trustedOrigins.add(o);
-      trustedOrigins.delete(clean);
-      origin = clean; originSource = 'settings';
-      // Existing passkeys keep the name they were made under; new ones use the new address.
-      db.prepare('UPDATE passkeys SET rp_id=? WHERE rp_id IS NULL').run(relyingPartyId);
-      relyingPartyId = rpFor(clean);
-      audit('settings.public_origin', actorId, actorId);
-      return null;
-    }, userCount, authenticate, csrfValid, originValid, publicUser, issueSession,
+    /** Settings → Web address. Returns an error message, or null once saved. It stays Node's
+     *  while the Rust front owns sign-in: it writes the address settings and freezes the
+     *  passkeys' RP ID (rust-auth.cjs exemption). */
+    changeOrigin(next, actorId) { refreshOrigin(); return guard.exempt(() => changeOriginNow(next, actorId)); },
+    userCount, authenticate, csrfValid, originValid, publicUser, issueSession,
     // Exposed for the tool permission gate (step 16): every write tool call is
     // recorded here, so "what did the model actually do on my behalf" is
     // answerable from the same log as logins and storage changes.
@@ -572,7 +604,9 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
     },
     logout(req, res, authn) {
       const raw = parseCookies(req).cowork_session;
-      if (raw) db.prepare('DELETE FROM sessions WHERE id_hash=?').run(digest(raw));
+      // The cookies are cleared even when the delete throws (a read-only or guarded database): the
+      // browser must not keep a cookie the user asked to drop.
+      if (raw) { try { db.prepare('DELETE FROM sessions WHERE id_hash=?').run(digest(raw)); } catch (e) { console.warn(`logout: session delete failed (${e.code || e.message})`); } }
       res.setHeader('Set-Cookie', [
         'cowork_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0',
         'cowork_csrf=; Path=/; SameSite=Lax; Max-Age=0',
@@ -784,14 +818,15 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       const user = db.prepare('SELECT * FROM users WHERE id=?').get(userId); if (!user || user.username !== username) return false;
       if (user.role === 'admin' && (db.prepare("SELECT count(*) AS n FROM users WHERE role='admin'").get().n <= 1 ||
           (!user.disabled_at && db.prepare("SELECT count(*) AS n FROM users WHERE role='admin' AND disabled_at IS NULL").get().n <= 1))) throw new Error('cannot delete the last active administrator');
-      db.transaction(() => {
+      // Account deletion stays Node's (its cleanup spans Node's own stores): rust-auth.cjs exemption.
+      guard.exempt(() => db.transaction(() => {
         // Issued tokens reference their creator without ON DELETE CASCADE.
         // Revoke them with the account, retaining provenance in audit_events.
         db.prepare('DELETE FROM invitations WHERE created_by=?').run(userId);
         db.prepare('DELETE FROM recoveries WHERE created_by=?').run(userId);
         db.prepare('DELETE FROM users WHERE id=?').run(userId);
         audit('user.delete', actorId, userId);
-      })();
+      })());
       return true;
     },    getStorage(userId, includeSecret = false) {
       const row = db.prepare('SELECT * FROM storage_connections WHERE user_id=?').get(userId);
