@@ -4,7 +4,7 @@
 // NOEVIA_FRONT=rust. auth-rust-mode.test.cjs covers the same on createAuth's real database.
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { createRustAuthGuard, enabledFrom, writeTarget, OWNED_TABLES } = require('./rust-auth.cjs');
+const { createRustAuthGuard, enabledFrom, writeTarget, writeTargets, OWNED_TABLES } = require('./rust-auth.cjs');
 
 function fakeDb() {
   const ran = [];
@@ -28,14 +28,20 @@ const on = () => createRustAuthGuard({ enabled: true });
 test('the switch needs NOEVIA_RUST_AUTH=1 and NOEVIA_FRONT=rust', () => {
   const warned = [];
   const warn = (m) => warned.push(m);
-  assert.equal(enabledFrom({ NOEVIA_RUST_AUTH: '1', NOEVIA_FRONT: 'rust' }, warn), true);
-  for (const env of [{}, { NOEVIA_RUST_AUTH: 'true', NOEVIA_FRONT: 'rust' }, { NOEVIA_RUST_AUTH: ' 1', NOEVIA_FRONT: 'rust' }, { NOEVIA_FRONT: 'rust' }]) {
+  assert.equal(enabledFrom({ NOEVIA_RUST_AUTH: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH_CONFIRMED: '1' }, warn), true);
+  for (const env of [{}, { NOEVIA_RUST_AUTH: 'true', NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH_CONFIRMED: '1' }, { NOEVIA_RUST_AUTH: ' 1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH_CONFIRMED: '1' }, { NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH_CONFIRMED: '1' }]) {
     assert.equal(enabledFrom(env, warn), false, JSON.stringify(env));
   }
   assert.equal(warned.length, 0);
   assert.equal(enabledFrom({ NOEVIA_RUST_AUTH: '1', NOEVIA_FRONT: 'node' }, warn), false);
   assert.equal(enabledFrom({ NOEVIA_RUST_AUTH: '1' }, warn), false);
   assert.equal(warned.length, 2);
+  // Without the supervisor's confirmation the switch stays off and says so.
+  for (const c of [undefined, '', '0', 'true']) {
+    assert.equal(enabledFrom({ NOEVIA_RUST_AUTH: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH_CONFIRMED: c }, warn), false, String(c));
+  }
+  assert.equal(warned.length, 6);
+  assert.match(warned[5], /NOEVIA_RUST_AUTH_CONFIRMED/);
   assert.ok(!warned.join('').match(/[0-9a-f]{32}/), 'no values in the warning');
 });
 
@@ -102,4 +108,57 @@ test('off, nothing changes', () => {
   db.prepare('DELETE FROM sessions').run();
   db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('public_origin',?)").run('x');
   assert.equal(db.ran.length, 2);
+});
+
+test('write detection: CTE writes, schema-qualified and quoted names, REPLACE/UPSERT, multi-target', () => {
+  const owned = (sql) => writeTargets(sql).some((t) => OWNED_TABLES.has(t.table));
+  for (const sql of [
+    'WITH x AS (SELECT 1) INSERT INTO sessions(id_hash) SELECT 1 FROM x',
+    'WITH x AS (SELECT id FROM users) UPDATE users SET disabled_at=1 WHERE id IN (SELECT id FROM x)',
+    'WITH RECURSIVE x(n) AS (SELECT 1) DELETE FROM sessions WHERE 1',
+    'INSERT INTO main.users(id) VALUES(?)',
+    'UPDATE "main"."users" SET x=1',
+    'DELETE FROM `main`.`sessions`',
+    'DELETE FROM [passkeys]',
+    'INSERT INTO "users" VALUES(1)',
+    'REPLACE INTO main.challenges VALUES(?)',
+    'UPSERT INTO invitations VALUES(?)',
+    'INSERT INTO users(id) VALUES(?) ON CONFLICT(id) DO UPDATE SET x=1',
+    'INSERT INTO audit_events(a) VALUES(1); DELETE FROM sessions',
+    '/* note */ UPDATE -- c\n sessions SET x=1',
+    'INSERT OR IGNORE INTO temp.recoveries VALUES(1)',
+    'update   OR  ROLLBACK users set a=1',
+  ]) assert.equal(owned(sql), true, sql);
+  assert.deepEqual(writeTargets("INSERT OR REPLACE INTO main.settings(key,value) VALUES('public_origin',?)"), [{ table: 'settings', key: 'public_origin' }]);
+  for (const sql of [
+    'SELECT * FROM users',
+    "INSERT INTO audit_events(detail) VALUES('DELETE FROM users')",
+    'INSERT INTO diary_connectors(a) VALUES(1) ON CONFLICT(a) DO UPDATE SET b=1',
+    'WITH x AS (SELECT 1) INSERT INTO storage_connections SELECT * FROM x',
+    '-- DELETE FROM users\nSELECT 1',
+    'SELECT updated_at FROM users',
+  ]) assert.equal(owned(sql), false, sql);
+});
+
+test('while on, CTE and schema-qualified owned writes throw when they run', () => {
+  const db = on().install(fakeDb());
+  for (const sql of [
+    'WITH x AS (SELECT 1) INSERT INTO sessions(id_hash) SELECT 1 FROM x',
+    'UPDATE main.users SET disabled_at=1',
+    'INSERT INTO audit_events(a) VALUES(1); REPLACE INTO "users" VALUES(1)',
+  ]) {
+    assert.throws(() => db.prepare(sql).run(), (e) => e.code === 'RUST_AUTH_OWNED', sql);
+  }
+  assert.throws(() => db.exec('WITH x AS (SELECT 1) DELETE FROM main.sessions'), (e) => e.code === 'RUST_AUTH_OWNED');
+});
+
+test('secrets-rotate.cjs\'s separate database handle writes no owned table', () => {
+  const src = require('node:fs').readFileSync(require('node:path').join(__dirname, 'secrets-rotate.cjs'), 'utf8');
+  // Every table the rotation names, and every statement it runs, are checked against the owned list.
+  const named = [...src.matchAll(/sqlTable\(db, '([a-z_]+)'/g)].map((m) => m[1]);
+  assert.ok(named.length >= 6);
+  for (const t of named) assert.ok(!OWNED_TABLES.has(t), t);
+  for (const m of src.matchAll(/prepare\(([`'"])((?:(?!\1)[\s\S])*)\1/g)) {
+    for (const target of writeTargets(m[2])) assert.ok(!OWNED_TABLES.has(target.table) || target.table === 'audit_events', m[2]);
+  }
 });

@@ -594,7 +594,9 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
     },
     logout(req, res, authn) {
       const raw = parseCookies(req).cowork_session;
-      if (raw) db.prepare('DELETE FROM sessions WHERE id_hash=?').run(digest(raw));
+      // The cookies are cleared even when the delete throws (a read-only or guarded database): the
+      // browser must not keep a cookie the user asked to drop.
+      if (raw) { try { db.prepare('DELETE FROM sessions WHERE id_hash=?').run(digest(raw)); } catch (e) { console.warn(`logout: session delete failed (${e.code || e.message})`); } }
       res.setHeader('Set-Cookie', [
         'cowork_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0',
         'cowork_csrf=; Path=/; SameSite=Lax; Max-Age=0',

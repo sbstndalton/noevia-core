@@ -64,7 +64,13 @@ test('the request gate reads and never writes', async (t) => {
 test('sign-in and account writers are refused with 503', async (t) => {
   const f = await fixture(t);
   await assert.rejects(f.auth.passwordLogin(req(), res(), { username: 'owner', password: PASSWORD }), owned);
-  assert.throws(() => f.auth.logout(req(`cowork_session=${f.session}`), res(), null), owned);
+  // Logout clears the cookies even though the guarded session delete throws, and the row stays.
+  const out = res();
+  const originalWarn = console.warn;
+  console.warn = () => {};
+  try { assert.equal(f.auth.logout(req(`cowork_session=${f.session}`), out, null).status, 200); } finally { console.warn = originalWarn; }
+  assert.match(out.headers['Set-Cookie'].join('\n'), /cowork_session=; .*Max-Age=0[\s\S]*cowork_csrf=; .*Max-Age=0/);
+  assert.ok(row(f.auth.db, 'SELECT 1 AS x FROM sessions WHERE id_hash=?', digest(f.session)));
   assert.throws(() => f.auth.createInvite(f.userId, 'member'), owned);
   assert.throws(() => f.auth.createRecovery(f.userId, f.userId), owned);
   assert.throws(() => f.auth.updateProfile(f.userId, 'Renamed'), owned);
