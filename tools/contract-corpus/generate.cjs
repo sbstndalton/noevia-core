@@ -188,14 +188,11 @@ async function main() {
     await step(noCsrf, 'PATCH', '/api/profile', { displayName: 'no csrf' });
 
     // Projects.
-    const created = await step(admin, 'POST', '/api/projects', { name: 'Synthetic project', goal: 'Contract corpus', instructions: 'Answer briefly.', files: [{ name: 'notes.md', content: '# Synthetic notes\n\nAlpha beta gamma.' }] }, [200, 201]);
+    const created = await step(admin, 'POST', '/api/projects', { name: 'Synthetic project', goal: 'Contract corpus', instructions: 'Answer briefly.', model: MODEL, files: [{ name: 'notes.md', content: '# Synthetic notes\n\nAlpha beta gamma.' }] }, [200, 201]);
     const projectId = created.json?.id || created.json?.project?.id;
     if (!projectId) throw new Error(`project id missing from ${created.text.slice(0, 200)}`);
     await step(admin, 'GET', '/api/workspace', undefined, [200]);
-    await step(admin, 'GET', `/api/projects/${encodeURIComponent(projectId)}`);
-    await step(admin, 'GET', `/api/projects/${encodeURIComponent(projectId)}/config`);
-    await step(admin, 'PUT', `/api/projects/${encodeURIComponent(projectId)}/config`, { instructions: 'Answer very briefly.' });
-    await step(admin, 'GET', `/api/projects/${encodeURIComponent(projectId)}/files`);
+    await step(admin, 'POST', `/api/projects/${encodeURIComponent(projectId)}/config`, { instructions: 'Answer very briefly.' });
     await step(admin, 'GET', `/api/projects/${encodeURIComponent(projectId)}/chats`);
 
     // A streamed chat turn against the mock model.
@@ -213,7 +210,7 @@ async function main() {
     const invite = await step(admin, 'POST', '/api/admin/invitations', { role: 'member' }, [201]);
     await step(member, 'POST', '/api/auth/invitations/accept', { token: invite.json.token, ...MEMBER, diaryEnabled: false });
     await step(member, 'GET', '/api/workspace');
-    await step(member, 'GET', `/api/projects/${encodeURIComponent(projectId)}`);
+    await step(member, 'GET', `/api/projects/${encodeURIComponent(projectId)}/chats`);
     if (chatId) await step(member, 'GET', `/api/chats/${encodeURIComponent(chatId)}/history`);
     await step(member, 'GET', '/api/admin/users');
     const users = await step(admin, 'GET', '/api/admin/users', undefined, [200]);

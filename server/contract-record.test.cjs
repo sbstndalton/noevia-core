@@ -212,3 +212,9 @@ test('a value revealed as a secret by a later exchange is removed from the earli
   assert.deepEqual(files.map((f) => f.replace(/^\d+-/, '')), ['GET-api-one.dropped', 'POST-api-two.json']);
   assert.ok(!readAll(dir).includes(phrase));
 });
+
+test('the server origin is <origin> in bodies and paths too, not only in the Origin header', () => {
+  const norm = createNormaliser({ origin: 'http://127.0.0.1:44345' });
+  assert.deepEqual(norm.value({ publicOrigin: 'http://127.0.0.1:44345', link: 'http://127.0.0.1:44345/s/x' }), { publicOrigin: '<origin>', link: '<origin>/s/x' });
+  assert.equal(norm.header('location', 'http://127.0.0.1:44345/next', { origin: 'http://127.0.0.1:44345' }), '<origin>/next');
+});

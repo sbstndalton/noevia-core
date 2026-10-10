@@ -48,7 +48,7 @@ function isRandomish(s) {
   return /\d/.test(s) && /[a-z]/.test(s) && /[A-Z]/.test(s);
 }
 
-function createNormaliser({ envSecrets = [] } = {}) {
+function createNormaliser({ envSecrets = [], origin = '' } = {}) {
   const secrets = new Map(); // raw -> placeholder
   const ids = new Map();
   let secretN = 0; let idN = 0;
@@ -72,6 +72,8 @@ function createNormaliser({ envSecrets = [] } = {}) {
   // Known values first (longest first so a token containing an id is replaced whole), then shapes.
   function text(input) {
     let s = String(input);
+    // The server's own origin (a run-specific port in a corpus run) is <origin> wherever it appears.
+    if (origin && s.includes(origin)) s = s.split(origin).join('<origin>');
     const known = [...secrets.keys(), ...ids.keys()].filter((k) => k.length >= 6).sort((a, b) => b.length - a.length);
     for (const k of known) if (s.includes(k)) s = s.split(k).join(secrets.get(k) || ids.get(k));
     s = s.replace(ISO_TS, '<ts>');
@@ -231,7 +233,7 @@ function createContractRecorder({ dir, env = {}, origin = '', filter } = {}) {
   if (!dir) return null;
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const envSecrets = Object.entries(env).filter(([k, v]) => ENV_SECRET.test(k) && typeof v === 'string').map(([, v]) => v);
-  const norm = createNormaliser({ envSecrets });
+  const norm = createNormaliser({ envSecrets, origin });
   const keep = filter || ((p) => p.startsWith('/api/'));
   let seq = 0;
   let scanned = 0; // secrets every written file has been checked against
