@@ -52,12 +52,14 @@ const PASS = Symbol('unhandled');
  * @param {string} deps.DEFAULT_PROVIDER_ID
  * @param {object} deps.store   projects.cjs
  * @param {() => void} [deps.onToolboxesChange]  called after a project's toolbox selection changes (clears the permitted-tools cache)
+ * @param {boolean} [deps.rustProjects]  M4 (rust-projects.cjs): the Rust front owns the image writes; this copy refuses them
  */
 function createProjectRoutes({
   json, readBody, readJson, requestScope, dispatch, currentWorkspace, authService, storageClient, documents, documentSources, rag, fs, path,
   reasoningEffort, projectAppearance, diaryExtras, PROJECTS, DEFAULT_TOOLBOXES, sanitizeToolboxes, allToolboxes = () => [{ id: 'core' }], getProvider, ensureRolesLoaded, servedCatalogue, DEFAULT_PROVIDER_ID, store,
-  onToolboxesChange = () => {},
+  onToolboxesChange = () => {}, rustProjects = false,
 }) {
+  const { refuseOwned } = require('../rust-projects.cjs');
   const {
     getProject, saveProjects, createProject, deleteProject, pruneDocuments, withSourceLock, ensureProjectFolder, indexSource, ownsFile,
     loadChats, saveChats, deleteChat,
@@ -655,6 +657,7 @@ function createProjectRoutes({
 
     const projAssets = p.match(/^\/api\/projects\/([^/]+)\/assets$/);
     if (projAssets && req.method === 'POST') {
+      if (refuseOwned(rustProjects, json, res)) return true;
       const id = decodeURIComponent(projAssets[1]);
       const project = getProject(id);
       if (!project) return json(res, 404, { error: 'no such project' });
@@ -719,6 +722,7 @@ function createProjectRoutes({
         return res.end(bytes);
       }
       if (req.method === 'DELETE') {
+        if (refuseOwned(rustProjects, json, res)) return true;
         project.assets = (project.assets || []).filter((a) => a.id !== assetId);
         saveProjects(PROJECTS);
         try { fs.unlinkSync(file); } catch { /* already gone */ }

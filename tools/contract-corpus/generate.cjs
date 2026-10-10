@@ -171,6 +171,26 @@ async function main() {
     await step(admin, 'POST', `/api/projects/${encodeURIComponent(projectId)}/config`, { instructions: 'Answer very briefly.' });
     await step(admin, 'GET', `/api/projects/${encodeURIComponent(projectId)}/chats`);
 
+    // M4 (NOEVIA_RUST_PROJECTS): a project's images, with the refusals and the tenant boundary.
+    // A 1x1 PNG, synthetic.
+    const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==';
+    const assets = `/api/projects/${encodeURIComponent(projectId)}/assets`;
+    const image = await step(admin, 'POST', assets, { name: 'pixel.png', mime: 'IMAGE/PNG', dataBase64: PNG }, [200]);
+    const assetId = image.json?.asset?.id;
+    if (!assetId) throw new Error(`asset id missing from ${image.text.slice(0, 200)}`);
+    await step(admin, 'POST', assets, { name: 'notes.txt', mime: 'text/plain', dataBase64: PNG }, [400]);
+    await step(admin, 'POST', assets, { name: 'empty.png', mime: 'image/png', dataBase64: '' }, [400]);
+    await step(admin, 'POST', assets, { name: 'loose.gif', mime: 'image/gif', dataBase64: 'R0lG OD lh\nAQAB!AAAA=ignored' }, [200]);
+    await step(admin, 'POST', assets, { name: ['a', null, 7], mime: 'image/webp', dataBase64: PNG }, [200]);
+    // Node reads each UTF-16 unit of a two-byte string by its low byte: U+0144 is 'D', U+D83D '='.
+    await step(admin, 'POST', assets, { name: 'two-byte.png', mime: 'image/png', dataBase64: 'QUJ\u0144QU\u{1F600}JD' }, [200]);
+    await step(admin, 'POST', `/api/projects/no-such-project/assets`, { name: 'x.png', mime: 'image/png', dataBase64: PNG }, [404]);
+    await step(admin, 'GET', `${assets}/${encodeURIComponent(assetId)}`, undefined, [200]);
+    await step(admin, 'GET', `${assets}/no-such-image`, undefined, [404]);
+    await step(noCsrf, 'POST', assets, { name: 'x.png', mime: 'image/png', dataBase64: PNG }, [403]);
+    await step(anon, 'GET', `${assets}/${encodeURIComponent(assetId)}`, undefined, [401]);
+    await step(admin, 'GET', '/api/workspace', undefined, [200]);
+
     // A streamed chat turn against the mock model.
     const chat = await step(admin, 'POST', '/api/chat', { spaceId: projectId, projectId, chatId: null, message: 'Say hello.', history: [] });
     const chatId = sseEvents(chat.text).map((e) => e.chatId).find(Boolean);
@@ -187,6 +207,9 @@ async function main() {
     await step(member, 'POST', '/api/auth/invitations/accept', { token: invite.json.token, ...MEMBER, diaryEnabled: false });
     await step(member, 'GET', '/api/workspace');
     await step(member, 'GET', `/api/projects/${encodeURIComponent(projectId)}/chats`);
+    // Another account's project image is not this account's (M4).
+    await step(member, 'GET', `/api/projects/${encodeURIComponent(projectId)}/assets/${encodeURIComponent(assetId)}`, undefined, [404]);
+    await step(member, 'DELETE', `/api/projects/${encodeURIComponent(projectId)}/assets/${encodeURIComponent(assetId)}`, undefined, [404]);
     if (chatId) await step(member, 'GET', `/api/chats/${encodeURIComponent(chatId)}/history`);
     await step(member, 'GET', '/api/admin/users');
     const users = await step(admin, 'GET', '/api/admin/users', undefined, [200]);
@@ -262,6 +285,8 @@ async function main() {
     for (const [method, p, body] of WRITE_PROBES) await step(admin, method, p, body);
 
     // Clean-up is part of the contract too.
+    await step(admin, 'DELETE', `/api/projects/${encodeURIComponent(projectId)}/assets/${encodeURIComponent(assetId)}`, undefined, [200]);
+    await step(admin, 'GET', `/api/projects/${encodeURIComponent(projectId)}/assets/${encodeURIComponent(assetId)}`, undefined, [404]);
     if (chatId) await step(admin, 'DELETE', `/api/projects/${encodeURIComponent(projectId)}/chats/${encodeURIComponent(chatId)}`);
     await step(admin, 'DELETE', `/api/projects/${encodeURIComponent(projectId)}`);
     await step(admin, 'GET', '/api/workspace', undefined, [200]);
