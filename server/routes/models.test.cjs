@@ -893,3 +893,19 @@ test('#1233: a model section save with a non-string model path is refused with 4
   await f.call('PUT', '/api/model-manager/sections/chat-syn', { baseRevision: 'r', values: { model: '/models/x.gguf' } }, 'admin');
   assert.equal(f.fetched.length, 1, 'a string path still goes through');
 });
+
+test('#1235: aliases of the model path options (m, mm, md, LLAMA_ARG_*) with a non-string value are refused with 400 invalid_path', async () => {
+  const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, manager: { presetRefusal: async () => null } });
+  const keys = { m: 'model', LLAMA_ARG_MODEL: 'model', '-m': 'model', mm: 'mmproj', LLAMA_ARG_MMPROJ: 'mmproj', md: 'model-draft', LLAMA_ARG_MODEL_DRAFT: 'model-draft', '--model-draft': 'model-draft' };
+  for (const [alias, canonical] of Object.entries(keys)) {
+    for (const bad of [123, { a: 1 }, ['x'], true]) {
+      await f.call('PUT', '/api/model-manager/sections/chat-syn', { baseRevision: 'r', values: { [alias]: bad } }, 'admin');
+      const last = f.sent.pop();
+      assert.equal(last.status, 400, `${alias} ${JSON.stringify(bad)}`); assert.equal(last.body.code, 'invalid_path');
+      assert.match(last.body.error, new RegExp(canonical));
+    }
+  }
+  assert.equal(f.fetched.length, 0, 'nothing is forwarded');
+  await f.call('PUT', '/api/model-manager/sections/chat-syn', { baseRevision: 'r', values: { m: '/models/x.gguf', LLAMA_ARG_MMPROJ: '/models/p.gguf' } }, 'admin');
+  assert.equal(f.fetched.length, 1, 'string aliases still go through');
+});
