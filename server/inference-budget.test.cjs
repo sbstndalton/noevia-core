@@ -605,3 +605,13 @@ test('a ctx-size of Infinity, 1e400 or -1 is refused at load and at save, with n
   assert.equal(await roomy.loadRefusal('small'), null);
 });
 
+
+test('#1234: a preset save with ubatch-size above batch-size is refused as invalid_size', async (t) => {
+  const { manager } = fixture(t, { budget: 64 });
+  // #1234: the micro batch cannot exceed the batch (effective values), whatever the spelling.
+  for (const o of [{ 'ubatch-size': '4096', 'batch-size': '2048' }, { ub: '4096', b: '2048' }, { 'ubatch-size': '+4096', LLAMA_ARG_BATCH: '2048' }]) {
+    const r = await manager.presetRefusal('small', { ...o, 'cache-ram': '0' });
+    assert.equal(r?.code, 'invalid_size', JSON.stringify(o)); assert.equal(r.error, 'Not saved: Micro batch cannot exceed batch size');
+  }
+  assert.notEqual((await manager.presetRefusal('small', { 'ubatch-size': '2048', 'batch-size': '2048', 'cache-ram': '0' }))?.code, 'invalid_size');
+});

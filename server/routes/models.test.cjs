@@ -879,3 +879,17 @@ test('#1158: an invalid size on a model manager section save is a 400 with its c
   assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'Not saved: ctx-size must be a whole number (0 for the native context) (got "-1").', code: 'invalid_size' } });
   assert.equal(f.fetched.length, 0, 'nothing is forwarded to the model manager');
 });
+
+test('#1233: a model section save with a non-string model path is refused with 400 and never forwarded', async () => {
+  const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, manager: { presetRefusal: async () => null } });
+  for (const bad of [123, { a: 1 }, ['x'], true]) {
+    await f.call('PUT', '/api/model-manager/sections/chat-syn', { baseRevision: 'r', values: { model: bad } }, 'admin');
+    const last = f.sent.pop();
+    assert.equal(last.status, 400, JSON.stringify(bad)); assert.equal(last.body.code, 'invalid_path');
+  }
+  await f.call('PUT', '/api/model-manager/sections/chat-syn', { baseRevision: 'r', values: { mmproj: 5 } }, 'admin');
+  assert.equal(f.sent.pop().status, 400);
+  assert.equal(f.fetched.length, 0);
+  await f.call('PUT', '/api/model-manager/sections/chat-syn', { baseRevision: 'r', values: { model: '/models/x.gguf' } }, 'admin');
+  assert.equal(f.fetched.length, 1, 'a string path still goes through');
+});

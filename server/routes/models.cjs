@@ -258,6 +258,14 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
         }
         // #697: a section saved through the model manager replaces the whole section; refuse it when
         // the settings would not fit the inference memory budget, as the preset editor does.
+        // #1233: file paths are strings. A number or object is refused, not coerced into models.ini.
+        if (method === 'PUT' && !rest.endsWith('/rename')) {
+          let sent; try { sent = JSON.parse(body || '{}'); } catch { sent = {}; }
+          const vals = sent && typeof sent.values === 'object' && sent.values ? sent.values : {};
+          for (const key of ['model', 'mmproj', 'model-draft']) {
+            if (vals[key] !== undefined && vals[key] !== null && typeof vals[key] !== 'string') return json(res, 400, { error: `Not saved: ${key} must be a text path`, code: 'invalid_path' });
+          }
+        }
         if (method === 'PUT' && !rest.endsWith('/rename') && modelManager.presetRefusal) {
           let payload; try { payload = JSON.parse(body || '{}'); } catch { payload = {}; }
           const options = { ...(payload.values && typeof payload.values === 'object' ? payload.values : {}) };
