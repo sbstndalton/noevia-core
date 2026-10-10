@@ -20,6 +20,7 @@ const path = require('node:path');
 const http = require('node:http');
 const { spawn } = require('node:child_process');
 
+const { MARKER } = require('../../server/contract-record.cjs');
 const { MODEL, SERVER, GUARD, startMocks, serverEnv } = require('./mocks.cjs');
 // Synthetic credentials for a throwaway data dir. The replayer is given this password through the
 // manifest; the recorder itself writes only placeholders.
@@ -104,9 +105,18 @@ async function main() {
   const out = path.resolve(arg('--out') || '');
   if (!arg('--out')) throw new Error('usage: generate.cjs --out <dir>');
   const exchanges = path.join(out, 'exchanges');
-  fs.rmSync(out, { recursive: true, force: true });
+  // --out is wiped before a run, so it may only be a directory this tool made: missing, empty, or
+  // holding nothing but manifest.json and exchanges/. Only those two are deleted.
+  if (fs.existsSync(out)) {
+    if (!fs.statSync(out).isDirectory()) throw new Error(`refusing --out ${out}: not a directory`);
+    const foreign = fs.readdirSync(out).filter((n) => n !== 'manifest.json' && n !== 'exchanges');
+    if (foreign.length) throw new Error(`refusing --out ${out}: it holds ${foreign.slice(0, 3).join(', ')}${foreign.length > 3 ? ', ...' : ''}; use a new or previous-corpus directory`);
+    fs.rmSync(path.join(out, 'manifest.json'), { force: true });
+    fs.rmSync(exchanges, { recursive: true, force: true });
+  }
   fs.mkdirSync(exchanges, { recursive: true });
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-contract-data-'));
+  fs.writeFileSync(path.join(dataDir, MARKER), 'synthetic data dir made by tools/contract-corpus/generate.cjs\n', { mode: 0o600 });
   const mocks = await startMocks();
   const port = await new Promise((resolve) => { const srv = http.createServer(); srv.listen(0, '127.0.0.1', () => { const p = srv.address().port; srv.close(() => resolve(p)); }); });
   const base = `http://127.0.0.1:${port}`;

@@ -5,7 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const http = require('node:http');
-const { createContractRecorder, createNormaliser, fromEnv, parseSse } = require('./contract-record.cjs');
+const { MARKER, createContractRecorder, createNormaliser, fromEnv, parseSse } = require('./contract-record.cjs');
 
 // Synthetic values only. Each must never appear in anything the recorder writes.
 const SECRETS = {
@@ -252,4 +252,79 @@ test('build stamps are <version>; the request user-agent is kept for the replay'
     await (await fetch(`${base}/api/ua`, { headers: { 'User-Agent': 'synthetic-agent/1' } })).text();
   });
   assert.equal(records(dir)[0].request.headers['user-agent'], 'synthetic-agent/1');
+});
+
+function quietly(fn) {
+  const e = console.error; const w = console.warn;
+  console.error = () => {}; console.warn = () => {};
+  try { return fn(); } finally { console.error = e; console.warn = w; }
+}
+
+test('a public deployment is never recorded unless its data dir carries the synthetic marker', () => {
+  const out = () => path.join(tmp(), 'out');
+  assert.equal(quietly(() => fromEnv({ NOEVIA_CONTRACT_RECORD: out(), PUBLIC_ORIGIN: 'https://x.example' })), null);
+  assert.equal(quietly(() => fromEnv({ NOEVIA_CONTRACT_RECORD: out(), UI_HOST: '0.0.0.0' })), null);
+  assert.equal(quietly(() => fromEnv({ NOEVIA_CONTRACT_RECORD: out(), UI_HOST: '127.0.0.1', PUBLIC_ORIGIN: 'not a url' })), null);
+  assert.ok(quietly(() => fromEnv({ NOEVIA_CONTRACT_RECORD: out(), UI_HOST: '127.0.0.1', PUBLIC_ORIGIN: 'http://localhost:8021' })));
+  assert.ok(quietly(() => fromEnv({ NOEVIA_CONTRACT_RECORD: out() })), 'unset host and origin are loopback');
+  const dataDir = tmp();
+  const env = { NOEVIA_CONTRACT_RECORD: out(), UI_HOST: '0.0.0.0', PUBLIC_ORIGIN: 'https://x.example', UI_DATA_DIR: dataDir };
+  assert.equal(quietly(() => fromEnv(env)), null, 'no marker yet');
+  fs.writeFileSync(path.join(dataDir, MARKER), 'synthetic\n');
+  assert.ok(quietly(() => fromEnv(env)), 'the marker allows a synthetic non-loopback run');
+});
+
+test('a non-empty record directory is refused', () => {
+  const dir = tmp();
+  fs.writeFileSync(path.join(dir, '000001-GET-api-old.json'), '{}');
+  assert.throws(() => createContractRecorder({ dir }), /not empty/);
+  assert.equal(quietly(() => fromEnv({ NOEVIA_CONTRACT_RECORD: dir })), null);
+  assert.deepEqual(fs.readdirSync(dir), ['000001-GET-api-old.json'], 'the stale file is untouched');
+  assert.ok(createContractRecorder({ dir: tmp() }), 'an empty directory is fine');
+});
+
+test('the leak check also finds percent-encoded, base64 and JSON-escaped secrets and short ones', () => {
+  const norm = createNormaliser();
+  const raw = 'pa ss"w/ord&1';
+  norm.secret(raw);
+  assert.equal(norm.leaks('{"a":"nothing"}'), false);
+  assert.equal(norm.leaks(`{"a":"${encodeURIComponent(raw)}"}`), true, 'percent-encoded');
+  assert.equal(norm.leaks(`{"a":"${JSON.stringify(raw).slice(1, -1)}"}`), true, 'JSON-escaped');
+  assert.equal(norm.leaks(`{"a":"${Buffer.from(raw).toString('base64')}"}`), true, 'base64');
+  assert.equal(norm.leaks(`{"a":"${Buffer.from(raw).toString('base64url')}"}`), true, 'base64url');
+  const short = createNormaliser();
+  short.secret('xK9z');
+  assert.equal(short.leaks('{"pin":"xK9z"}'), true, 'a 4-character secret is scanned');
+  assert.equal(short.leaks('{"word":"xK9zebra"}'), false, 'not inside a longer word');
+  assert.equal(short.leaks('{"a":"<secret:12>","b":"<id:3>","c":"<ts>"}'), false, 'placeholders never match');
+  const tiny = createNormaliser();
+  tiny.secret('ab');
+  assert.equal(tiny.leaks('{"a":"ab"}'), false, 'below the minimum nothing is scanned');
+  assert.equal(norm.text('x'), 'x');
+});
+
+test('a short secret echoed in a body is dropped, not written', async () => {
+  const dir = tmp();
+  const recorder = createContractRecorder({ dir });
+  recorder.normaliser.secret('qZ7!');
+  await serve(recorder.wrap((req, res) => { res.setHeader('Content-Type', 'application/json'); res.end('{"note":"pin qZ7! given"}'); }), async (base) => { await (await fetch(`${base}/api/short`)).text(); });
+  assert.equal(fs.readdirSync(dir).filter((f) => f.endsWith('.json')).length, 0);
+  assert.equal(fs.readdirSync(dir).filter((f) => f.endsWith('.dropped')).length, 1);
+});
+
+test('generate.cjs refuses an --out that holds anything but a previous corpus, and deletes nothing', () => {
+  const { spawnSync } = require('node:child_process');
+  const gen = path.join(__dirname, '..', 'tools', 'contract-corpus', 'generate.cjs');
+  const dir = tmp();
+  fs.writeFileSync(path.join(dir, 'precious.txt'), 'keep');
+  fs.mkdirSync(path.join(dir, 'exchanges'));
+  fs.writeFileSync(path.join(dir, 'exchanges', 'a.json'), '{}');
+  const r = spawnSync(process.execPath, [gen, '--out', dir], { encoding: 'utf8', timeout: 20000 });
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /refusing --out/);
+  assert.ok(fs.existsSync(path.join(dir, 'precious.txt')));
+  assert.ok(fs.existsSync(path.join(dir, 'exchanges', 'a.json')));
+  const file = path.join(tmp(), 'f');
+  fs.writeFileSync(file, 'x');
+  assert.match(spawnSync(process.execPath, [gen, '--out', file], { encoding: 'utf8', timeout: 20000 }).stderr, /not a directory/);
 });

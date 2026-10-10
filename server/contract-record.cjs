@@ -23,9 +23,14 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
-// Shorter secrets are still replaced in their own field; scanning every file for a 3-letter value
-// would drop exchanges that merely contain the same common word.
-const LEAK_SCAN_MIN = 6;
+// Secrets this short are still replaced in their own field. Down to LEAK_SCAN_MIN they are also
+// scanned for in every file, but only as a whole token (not inside a longer word) and with the
+// placeholders removed first; anything shorter would drop exchanges that merely hold a common
+// letter pair.
+const LEAK_SCAN_MIN = 4;
+const LEAK_WORD_MIN = 6; // from this length a raw substring hit counts, whatever surrounds it
+const PLACEHOLDER = /<(?:secret|id):\d+>|<url:[^>]*>|<(?:origin|ts|num|version)>/g;
+const MARKER = '.noevia-contract-synthetic';
 const CAPTURE_LIMIT = 1024 * 1024;
 const SECRET_KEY = /pass(word|phrase)?|secret|token|api[-_]?key|^key$|keys?$|authorization|cookie|credential|session(?!s)|csrf|nonce|challenge|otp|recovery|setup[-_]?code|private|signature|^code$|refresh|bearer/i;
 const NUMERIC_SECRET_KEY = /pass|secret|otp|pin$|setup[-_]?code|^code$/i;
@@ -178,8 +183,27 @@ function createNormaliser({ envSecrets = [], origin = '', upstreams = {} } = {})
 
   // Raw values that must never reach disk: every secret, plus nothing else (ids may repeat in
   // prose, timestamps are harmless).
-  function leaks(serialised) {
-    for (const raw of secrets.keys()) if (raw.length >= LEAK_SCAN_MIN && serialised.includes(raw)) return true;
+  // The forms a file can hold a value in: as is, percent-encoded (path, query, form), base64 /
+  // base64url, and escaped inside a JSON string (the files are pretty-printed JSON).
+  function forms(raw) {
+    const out = new Set([raw]);
+    const b64 = Buffer.from(raw, 'utf8').toString('base64');
+    for (const f of [encodeURIComponent(raw), encodeURIComponent(raw).replace(/%20/g, '+'), JSON.stringify(raw).slice(1, -1),
+      b64, b64.replace(/=+$/, ''), b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')]) out.add(f);
+    return [...out].filter((f) => f.length >= LEAK_SCAN_MIN);
+  }
+  const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  function holds(text, raw) {
+    for (const form of forms(raw)) {
+      if (form.length >= LEAK_WORD_MIN) { if (text.includes(form)) return true; continue; }
+      if (new RegExp(`(?<![A-Za-z0-9])${escapeRe(form)}(?![A-Za-z0-9])`).test(text)) return true;
+    }
+    return false;
+  }
+  // `only` limits the check to those raw values (rescan); default is every secret seen so far.
+  function leaks(serialised, only) {
+    const text = String(serialised).replace(PLACEHOLDER, '');
+    for (const raw of only || secrets.keys()) if (raw.length >= LEAK_SCAN_MIN && holds(text, raw)) return true;
     return false;
   }
 
@@ -254,6 +278,8 @@ function createContractRecorder({ dir, env = {}, origin = '', filter } = {}) {
     if (u && !upstreams[u]) upstreams[u] = name;
   }
   const norm = createNormaliser({ envSecrets, origin, upstreams });
+  // A reused directory restarts the numbering and keeps stale files the rescan never checks.
+  if (fs.readdirSync(dir).length) throw new Error(`contract recorder: ${dir} is not empty; record into a new directory`);
   const keep = filter || ((p) => p.startsWith('/api/'));
   let seq = 0;
   let scanned = 0; // secrets every written file has been checked against
@@ -347,7 +373,7 @@ function createContractRecorder({ dir, env = {}, origin = '', filter } = {}) {
       const file = path.join(dir, `${base}.json`);
       let content;
       try { content = fs.readFileSync(file, 'utf8'); } catch { continue; }
-      if (!fresh.some((raw) => content.includes(raw))) continue;
+      if (!norm.leaks(content, fresh)) continue;
       fs.writeFileSync(path.join(dir, `${base}.dropped`), `${JSON.stringify({ seq: Number(base.slice(0, 6)), reason: 'a secret value seen in a later exchange' })}\n`, { mode: 0o600 });
       fs.rmSync(file, { force: true });
       written.splice(i, 1);
@@ -372,6 +398,26 @@ function sortKeys(o) {
   return Object.fromEntries(Object.keys(o).sort().map((k) => [k, o[k]]));
 }
 
+function loopbackHost(h) {
+  const host = String(h || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
+  return host === '' || host === 'localhost' || host === '::1' || /^127\.\d+\.\d+\.\d+$/.test(host);
+}
+
+function loopbackOrigin(o) {
+  const v = String(o || '').trim();
+  if (!v) return true;
+  try { return loopbackHost(new URL(v).hostname); } catch { return false; }
+}
+
+/** A recording needs a synthetic deployment: UI_HOST and PUBLIC_ORIGIN loopback or unset, or the
+ *  marker generate.cjs writes into the throwaway data dir it hands the server. A real deploy that
+ *  keeps the variable set after its first boot has neither, so it records nothing. */
+function syntheticDeployment(env) {
+  if (loopbackHost(env.UI_HOST) && loopbackOrigin(env.PUBLIC_ORIGIN)) return true;
+  const dataDir = String(env.UI_DATA_DIR || '').trim();
+  return Boolean(dataDir) && fs.existsSync(path.join(dataDir, MARKER));
+}
+
 /** null unless NOEVIA_CONTRACT_RECORD names a directory. `accounts` is how many accounts the data
  *  dir held at boot: recording needs a fresh synthetic data dir, because prose (chat text, names,
  *  file contents) is kept verbatim, so a dir that already has accounts is refused. */
@@ -382,9 +428,19 @@ function fromEnv(env = process.env, { accounts = 0, ...opts } = {}) {
     console.error(`[contract-record] NOEVIA_CONTRACT_RECORD is set but this data dir already has ${accounts} account(s); not recording. Record only against a fresh synthetic UI_DATA_DIR.`);
     return null;
   }
-  const recorder = createContractRecorder({ dir: path.resolve(dir), env, origin: String(env.PUBLIC_ORIGIN || '').replace(/\/$/, ''), ...opts });
+  if (!syntheticDeployment(env)) {
+    console.error('[contract-record] NOEVIA_CONTRACT_RECORD is set but UI_HOST / PUBLIC_ORIGIN are not loopback and the data dir has no synthetic marker; not recording. Only tools/contract-corpus/generate.cjs may record a non-loopback server.');
+    return null;
+  }
+  let recorder;
+  try {
+    recorder = createContractRecorder({ dir: path.resolve(dir), env, origin: String(env.PUBLIC_ORIGIN || '').replace(/\/$/, ''), ...opts });
+  } catch (err) {
+    console.error(`[contract-record] not recording: ${err.message}`);
+    return null;
+  }
   console.warn(`[contract-record] NOEVIA_CONTRACT_RECORD is set: recording normalised /api/ exchanges to ${recorder.dir}. Never enable this on a deployment that serves real users.`);
   return recorder;
 }
 
-module.exports = { createContractRecorder, createNormaliser, fromEnv, parseSse };
+module.exports = { MARKER, syntheticDeployment, createContractRecorder, createNormaliser, fromEnv, parseSse };
