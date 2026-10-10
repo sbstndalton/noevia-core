@@ -14,17 +14,24 @@
 // metas in it. So while the switch is on, both processes write it only under one shared lock and
 // never from a stale copy:
 //
-//   - the lock is `projects.json.lock` beside the file, created with O_CREAT|O_EXCL (mode 0600,
-//     content "<pid> <ms>\n") and unlinked on release. A writer waits up to LOCK_WAIT_MS, retrying
-//     every LOCK_RETRY_MS; a lock older than LOCK_STALE_MS (a writer that died mid-write) is
-//     removed. Holds are one read-modify-write, a few milliseconds. noevia-rs
-//     crates/server-projects `lock` is the other half; keep the constants equal.
+//   - the lock is an OS advisory lock, flock(2) LOCK_EX, on `projects.json.lock` beside the file
+//     (mode 0600), created once and never unlinked: unlinking would let two writers lock two
+//     different inodes. flock and fcntl locks do not interoperate on Linux, so both sides use
+//     flock: Rust through std's File::try_lock, Node (no flock in node:fs, no native addon) through
+//     util-linux flock(1) run on an inherited descriptor: flock belongs to the open file
+//     description, so the lock the child takes stays held by this process's descriptor after the
+//     child exits, until it is closed. A holder that dies releases it with its descriptors: no
+//     staleness rule. A writer waits up to LOCK_WAIT_MS, then answers 503 PROJECTS_BUSY. Holds
+//     are one read-modify-write, a few milliseconds. noevia-rs crates/server-projects `lock` is
+//     the other half; keep LOCK_SUFFIX and LOCK_WAIT_MS equal.
 //   - Rust re-reads the file under the lock and changes only the project it serves.
 //   - Node keeps its cached workspace, but a save is a three-way merge under the lock: the
 //     projects this process changed, added or removed since it last read the file are applied to
 //     what is on disk now; every other project is taken from disk. A project both sides changed
 //     between two reads is merged per top-level field (this process's value where it changed the
-//     field), so a chat save does not drop an image Rust added meanwhile; only the same field
+//     field), so a chat save does not drop an image Rust added meanwhile. The id-keyed lists
+//     (assets, retiredAssets) are merged per item: additions from both sides, removals since
+//     the base from either side, an item both changed is this process's. Any other field
 //     changed on both sides is last-writer-wins. Every request start re-reads the file
 //     when its (ino, size, mtime) changed, refreshing unchanged projects in place, so a handler
 //     holding a project object still sees the current one.
@@ -34,11 +41,12 @@
 // Removed, with Node's copies of the routes, once Rust owns every projects.json writer.
 
 const fs = require('fs');
+const { spawnSync } = require('child_process');
 
 const LOCK_SUFFIX = '.lock';
-const LOCK_STALE_MS = 10000;
 const LOCK_WAIT_MS = 3000;
-const LOCK_RETRY_MS = 5;
+// flock(1)'s exit status when -w ran out (-E); anything else non-zero is a failure, not "busy".
+const FLOCK_BUSY_STATUS = 75;
 
 /** The routes the Rust front answers under the switch: METHOD path-pattern. noevia-rs
  *  contracts/http/routes.toml (switch = "NOEVIA_RUST_PROJECTS") is the other half. */
@@ -70,34 +78,23 @@ function busy() {
   return Object.assign(new Error('The project store is busy. Try again shortly.'), { status: 503, code: 'PROJECTS_BUSY' });
 }
 
-const sleeper = new Int32Array(new SharedArrayBuffer(4));
-function sleepSync(ms) { Atomics.wait(sleeper, 0, 0, ms); }
-
-/** Runs `fn` (synchronously) holding `<file>.lock`. Throws 503 PROJECTS_BUSY after LOCK_WAIT_MS. */
-function withFileLock(file, fn, { now = Date.now, sleep = sleepSync, pid = process.pid } = {}) {
-  const lock = file + LOCK_SUFFIX;
-  const deadline = now() + LOCK_WAIT_MS;
-  for (;;) {
-    let fd;
-    try { fd = fs.openSync(lock, 'wx', 0o600); }
-    catch (err) {
-      if (err.code !== 'EEXIST') throw err;
-      let st = null;
-      try { st = fs.statSync(lock); } catch (e) { if (e.code !== 'ENOENT') throw e; }
-      if (st && now() - st.mtimeMs > LOCK_STALE_MS) {
-        try { fs.unlinkSync(lock); } catch (e) { if (e.code !== 'ENOENT') throw e; }
-        continue;
-      }
-      if (now() >= deadline) throw busy();
-      if (st) sleep(LOCK_RETRY_MS);
-      continue;
+/** Runs `fn` (synchronously) holding flock(LOCK_EX) on `<file>.lock` (see the header). Throws
+ *  503 PROJECTS_BUSY after LOCK_WAIT_MS. `flockBin`: tests. */
+function withFileLock(file, fn, { flockBin = 'flock' } = {}) {
+  const fd = fs.openSync(file + LOCK_SUFFIX, fs.constants.O_RDWR | fs.constants.O_CREAT, 0o600);
+  try {
+    const r = spawnSync(flockBin, ['-x', '-w', String(LOCK_WAIT_MS / 1000), '-E', String(FLOCK_BUSY_STATUS), '3'], {
+      stdio: ['ignore', 'ignore', 'pipe', fd],
+    });
+    if (r.error) {
+      if (r.error.code === 'ENOENT') throw Object.assign(new Error('NOEVIA_RUST_PROJECTS needs flock(1) (util-linux) on PATH to lock projects.json'), { status: 500, code: 'PROJECTS_LOCK_UNAVAILABLE' });
+      throw r.error;
     }
-    try {
-      try { fs.writeSync(fd, `${pid} ${now()}\n`); } finally { fs.closeSync(fd); }
-      return fn();
-    } finally {
-      try { fs.unlinkSync(lock); } catch { /* removed as stale by another writer: nothing to release */ }
-    }
+    if (r.status === FLOCK_BUSY_STATUS) throw busy();
+    if (r.status !== 0) throw new Error(`flock(1) failed (status ${r.status}${r.signal ? ', ' + r.signal : ''}): ${String(r.stderr || '').trim()}`);
+    return fn();
+  } finally {
+    fs.closeSync(fd); // releases the lock (the child's copy closed when it exited)
   }
 }
 
@@ -111,18 +108,66 @@ const blank = (v) => v === undefined || (Array.isArray(v) ? v.length === 0 : v !
 // other writer put in that field meanwhile.
 const unchangedHere = (o, b) => same(o, b) || (b === undefined && blank(o));
 
+// Lists of `{ id, ... }` merged per item rather than as one value (see the header).
+const ID_LISTS = new Set(['assets', 'retiredAssets']);
+const listOrNull = (v) => (v === undefined || v === null ? [] : Array.isArray(v) ? v : null);
+
+/** The id-keyed three-way merge of one list: disk order, items new here appended. An item removed
+ *  since `base` on either side is gone (even if the other side changed it); one added on either
+ *  side is kept; one both have is the disk's unless this process changed it. Items without a
+ *  string id are the disk's. */
+function mergeIdList(ours, base, theirs) {
+  const map = (l) => { const m = new Map(); for (const x of l) { const id = idOf(x); if (id !== null && !m.has(id)) m.set(id, x); } return m; };
+  const o = map(ours); const b = map(base);
+  const out = []; const placed = new Set();
+  for (const t of theirs) {
+    const id = idOf(t);
+    if (id === null) { out.push(t); continue; }
+    if (placed.has(id)) continue;
+    placed.add(id);
+    if (!o.has(id)) { if (!b.has(id)) out.push(t); continue; } // added there / removed here
+    const mine = o.get(id);
+    out.push(b.has(id) && same(mine, b.get(id)) ? t : mine);
+  }
+  for (const x of ours) {
+    const id = idOf(x);
+    if (id === null || placed.has(id)) continue;
+    placed.add(id);
+    if (!b.has(id)) out.push(x); // new here; in base and not on disk: removed there
+  }
+  return out;
+}
+
 /** One project both sides changed since the last read: per top-level field, this process's value
- *  where it changed the field, the disk's otherwise (disk key order, new local fields appended). */
+ *  where it changed the field, the disk's otherwise (disk key order, new local fields appended);
+ *  ID_LISTS per item (mergeIdList). */
 function mergeFields(ours, baseJson, theirs) {
   let base;
   try { base = JSON.parse(baseJson); } catch { base = {}; }
+  if (!base || typeof base !== 'object') base = {};
   const out = {};
+  const list = (k) => {
+    if (!ID_LISTS.has(k)) return undefined;
+    const o = listOrNull(ours[k]); const b = listOrNull(base[k]); const t = listOrNull(theirs[k]);
+    if (o === null || b === null || t === null) return undefined; // not lists: the general rule
+    const merged = mergeIdList(o, b, t);
+    // Empty: kept as a field only where a side still has it (Node deletes an empty retiredAssets).
+    if (!merged.length && !Array.isArray(ours[k]) && !(Array.isArray(theirs[k]) && unchangedHere(ours[k], base[k]))) return { omit: true };
+    return { value: merged };
+  };
   for (const k of Object.keys(theirs)) {
-    if (unchangedHere(ours[k], base[k])) out[k] = theirs[k];
+    const l = list(k);
+    if (l) { if (!l.omit) out[k] = l.value; }
+    else if (unchangedHere(ours[k], base[k])) out[k] = theirs[k];
     else if (own(ours, k) && ours[k] !== undefined) out[k] = ours[k];
     // removed here: left out
   }
-  for (const k of Object.keys(ours)) if (!own(out, k) && !own(theirs, k) && !same(ours[k], base[k])) out[k] = ours[k];
+  for (const k of Object.keys(ours)) {
+    if (own(out, k) || own(theirs, k)) continue;
+    const l = list(k);
+    if (l) { if (!l.omit) out[k] = l.value; }
+    else if (!same(ours[k], base[k])) out[k] = ours[k];
+  }
   return out;
 }
 
@@ -284,6 +329,6 @@ function refuseOwned(enabled, json, res) {
 }
 
 module.exports = {
-  enabledFrom, withFileLock, merge, mergeFields, createProjectsFile, readProjectsFile, refuseOwned, replaceContents,
-  OWNED_ROUTES, LOCK_SUFFIX, LOCK_STALE_MS, LOCK_WAIT_MS, LOCK_RETRY_MS,
+  enabledFrom, withFileLock, merge, mergeFields, mergeIdList, createProjectsFile, readProjectsFile, refuseOwned, replaceContents,
+  OWNED_ROUTES, LOCK_SUFFIX, LOCK_WAIT_MS, FLOCK_BUSY_STATUS,
 };
