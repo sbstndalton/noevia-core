@@ -52,7 +52,7 @@ test('aggregate model ties and fractional sums follow account order, not file co
  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'noevia-usage-order-'));
  const read=fs.promises.readFile;
  try{
-  for(const [id,n]of [['a',Number.MAX_SAFE_INTEGER],['b',0.5],['c',0.5]]){
+  for(const [id,n]of [['a',0.1],['b',0.2],['c',0.3]]){
    fs.mkdirSync(path.join(dir,id));fs.writeFileSync(path.join(dir,id,'usage.json'),JSON.stringify({days:{'2026-09-13':{input:n,models:{[id]:{input:1}}}}}));
   }
   const {aggregateUsage}=require('./usage-summary.cjs');
@@ -61,6 +61,8 @@ test('aggregate model ties and fractional sums follow account order, not file co
    const result=await aggregateUsage(['a','b','c'].map(id=>({id})),id=>path.join(dir,id),slow==='a'?100000:140000);
    assert.deepEqual(summarizeUsage(result.store,options).models.map(x=>x.name),['a','b','c']);
    assert.equal(result.unreadableAccounts,0);
+   assert.equal(result.store.days['2026-09-13'].input,(0.1+0.2)+0.3,slow);
+   assert.equal(result.store.days['2026-09-13'].input,0.6000000000000001,slow);
   }
  }finally{fs.promises.readFile=read;fs.rmSync(dir,{recursive:true,force:true});}
 });
