@@ -14,7 +14,7 @@ function fixture() {
     json: (res, status, body) => { sent.push({ status, body }); },
     readBody: async (req) => { let s = ''; for await (const c of req) s += c; return s; },
     authService: {
-      db: { prepare: () => ({ get: () => (settings.has('k') ? { value: settings.get('k') } : undefined), run: (_k, v) => settings.set('k', v) }) },
+      db: { transaction: (fn) => fn, prepare: () => ({ get: () => (settings.has('k') ? { value: settings.get('k') } : undefined), run: (_k, v) => settings.set('k', v) }) },
       audit: (...args) => audits.push(args),
     },
   });
@@ -75,5 +75,48 @@ test('checks administrator before parsing null or malformed bodies', async () =>
     assert.deepEqual(f.sent, [{ status: 403, body: { error: 'Administrator required' } }]);
     assert.equal(f.settings.size, 0);
     assert.deepEqual(f.audits, []);
+  }
+});
+
+// #1298: exercise the real createAuth database and audit collaborator, including SQL refusal.
+test('setting and authenticated audit commit together or both roll back in real SQLite', async () => {
+  const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'sampling-atomic-'));
+  let auth;
+  try {
+    const warn = console.warn;
+    try {
+      console.warn = () => {}; // Never emit the synthetic first-run setup code.
+      auth = require('../auth.cjs').createAuth({ dataDir: dir, publicOrigin: 'http://127.0.0.1:8021', rpId: '127.0.0.1' });
+    } finally { console.warn = warn; }
+    auth.db.prepare("INSERT INTO users(id,username,username_norm,display_name,role,password_hash,webauthn_user_id,created_at,updated_at) VALUES('synthetic-admin','a','a','Synthetic','admin','x','a',1,1)").run();
+    auth.db.prepare("INSERT OR REPLACE INTO settings VALUES('auto_sampling_presets_enabled','true')").run();
+    const sent = [];
+    const route = createSamplingSettingsRoutes({ json: (_r, status, body) => sent.push({ status, body }), readBody: require('../http.cjs').readBody, authService: auth });
+    const invoke = () => { const req = Readable.from(['{"enabled":false}']); req.method = 'PUT'; return route(req, {}, { path: '/api/sampling-settings', authn: { user: { id: 'synthetic-admin', role: 'admin' } } }); };
+    auth.db.exec("CREATE TRIGGER reject_audit BEFORE INSERT ON audit_events BEGIN SELECT RAISE(ABORT,'synthetic audit refusal'); END;");
+    await assert.rejects(invoke(), { code: 'SQLITE_CONSTRAINT_TRIGGER' });
+    assert.deepEqual(sent, []);
+    assert.equal(auth.db.prepare("SELECT value FROM settings WHERE key='auto_sampling_presets_enabled'").get().value, 'true');
+    assert.equal(auth.db.prepare("SELECT count(*) AS n FROM audit_events WHERE action='sampling.autoPresets'").get().n, 0);
+    auth.db.exec('DROP TRIGGER reject_audit;');
+    await invoke();
+    assert.deepEqual(sent, [{ status: 200, body: { enabled: false } }]);
+    assert.equal(auth.db.prepare("SELECT value FROM settings WHERE key='auto_sampling_presets_enabled'").get().value, 'false');
+    const row = auth.db.prepare("SELECT actor_user_id,target_user_id,action,detail FROM audit_events WHERE action='sampling.autoPresets'").get();
+    assert.deepEqual(row, { actor_user_id: 'synthetic-admin', target_user_id: null, action: 'sampling.autoPresets', detail: '{"enabled":false}' });
+  } finally { auth?.db.close(); fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('only confirmed native sampling ownership refuses Node decisions and writes', async () => {
+  const { enabledFrom } = require('./sampling-settings.cjs');
+  const env = { NOEVIA_FRONT:'rust',NOEVIA_RUST_AUTH:'1',NOEVIA_RUST_AUTH_CONFIRMED:'1',NOEVIA_RUST_SAMPLING_SETTINGS:'1',NOEVIA_RUST_SAMPLING_SETTINGS_CONFIRMED:'1' };
+  assert.equal(enabledFrom(env),true);
+  for (const key of Object.keys(env)) assert.equal(enabledFrom({...env,[key]:undefined}),false,key);
+  for (const method of ['GET','PUT','DELETE']) {
+    let sent;
+    const routes = createSamplingSettingsRoutes({env,json:(_res,status,body)=>{sent={status,body};},readBody:()=>{throw Error('must not read body');},authService:{db:{prepare:()=>{throw Error('must not read or write settings');}},audit:()=>{throw Error('must not audit');}}});
+    assert.equal(await routes({method},{},{path:'/api/sampling-settings',authn:{user:{role:'admin'}}}),true);
+    assert.deepEqual(sent,{status:503,body:{error:'Sampling settings are owned by the Rust front.'}});
   }
 });

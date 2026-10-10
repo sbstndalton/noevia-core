@@ -79,7 +79,7 @@ function writeTargets(sql) {
     if (table === 'set') continue; // ON CONFLICT DO UPDATE SET
     if (table !== 'settings') { out.push({ table, key: null }); continue; }
     const k = SETTING_KEY_RE.exec(raw);
-    out.push({ table, key: k ? (k[1] ?? k[2]) : null });
+    out.push(Object.defineProperty({ table, key: k ? (k[1] ?? k[2]) : null }, 'sql', { value: raw }));
   }
   return out;
 }
@@ -94,7 +94,20 @@ function statements(sql) {
   return String(sql).split(';').map((s) => s.trim()).filter(Boolean);
 }
 
-function createRustAuthGuard({ enabled = false } = {}) {
+// Sampling is a distinct capability. Recognize only bounded, single-key SQL shapes used by
+// current Node callers; ambiguous writes may affect the native key and fail closed.
+function samplingKey(sql, args) {
+  const source = String(sql).trim().replace(/;$/, '').trim();
+  const insert = /^(?:INSERT(?: OR (?:REPLACE|IGNORE))?|REPLACE) INTO settings\s*\(\s*key\s*,\s*value\s*\) VALUES\s*\(\s*(\?|'[^']*')\s*,\s*\?\s*\)$/i.exec(source);
+  if (insert) {
+    if (insert[1] !== '?') return insert[1].slice(1, -1);
+    const value = Array.isArray(args[0]) ? args[0][0] : args[0];
+    return typeof value === 'string' ? value : null;
+  }
+  const del = /^DELETE FROM settings WHERE key='([^']*)'(?: AND value=\?)?$/i.exec(source);
+  return del ? del[1] : null;
+}
+function createRustAuthGuard({ enabled = false, samplingSettingsEnabled = false } = {}) {
   let exemptDepth = 0;
 
   function refuse(what) {
@@ -103,17 +116,23 @@ function createRustAuthGuard({ enabled = false } = {}) {
 
   /** Throws when running `target` (with `args`) would write what Rust owns. */
   function check(targets, args) {
-    if (!enabled || exemptDepth > 0 || !targets) return;
+    if ((!enabled && !samplingSettingsEnabled) || !targets) return;
     for (const target of Array.isArray(targets) ? targets : [targets]) checkOne(target, args);
   }
 
   function checkOne(target, args) {
-    if (OWNED_TABLES.has(target.table)) refuse(target.table);
+    if (enabled && exemptDepth === 0 && OWNED_TABLES.has(target.table)) refuse(target.table);
     if (target.table === 'settings') {
+      if (samplingSettingsEnabled) {
+        const sampling = samplingKey(target.sql, args);
+        if (sampling === null || sampling === 'auto_sampling_presets_enabled') {
+          throw Object.assign(new Error('Sampling settings are written by the Rust front'), { status: 503, code: 'RUST_SAMPLING_SETTINGS_OWNED' });
+        }
+      }
       // A key bound as the first parameter (features.cjs settingsStore.set) is checked per run.
       const first = args.length && typeof args[0] === 'object' && args[0] !== null && !Array.isArray(args[0]) ? args[0].key : (Array.isArray(args[0]) ? args[0][0] : args[0]);
       const key = target.key ?? first;
-      if (OWNED_SETTING_KEYS.has(String(key))) refuse(`settings key ${key}`);
+      if (enabled && exemptDepth === 0 && OWNED_SETTING_KEYS.has(String(key))) refuse(`settings key ${key}`);
     }
   }
 
@@ -143,7 +162,7 @@ function createRustAuthGuard({ enabled = false } = {}) {
     },
     /** Installs the guard on a better-sqlite3 database (a no-op while the switch is off). */
     install(db) {
-      if (!enabled || db.__rustAuthGuard) return db;
+      if ((!enabled && !samplingSettingsEnabled) || db.__rustAuthGuard) return db;
       const prepare = db.prepare.bind(db);
       const exec = db.exec.bind(db);
       db.prepare = (sql, ...rest) => {

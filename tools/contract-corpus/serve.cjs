@@ -25,6 +25,8 @@ async function main() {
   if (process.env.NOEVIA_RUST_PROJECTS === '1') Object.assign(env, { NOEVIA_RUST_PROJECTS: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_PROJECTS_CONFIRMED: process.env.NOEVIA_RUST_PROJECTS_CONFIRMED === '1' ? '1' : '' });
   // M6 reporting refusal proves a clean replay was native, never a silent proxy fallback.
   if (process.env.NOEVIA_RUST_USAGE === '1') Object.assign(env, { NOEVIA_RUST_USAGE: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_USAGE_CONFIRMED: process.env.NOEVIA_RUST_USAGE_CONFIRMED === '1' ? '1' : '' });
+  // M6 sampling owns one setting; carry the same confirmed refusal through the child boundary.
+  if (process.env.NOEVIA_RUST_SAMPLING_SETTINGS === '1') Object.assign(env, { NOEVIA_RUST_SAMPLING_SETTINGS: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_SAMPLING_SETTINGS_CONFIRMED: process.env.NOEVIA_RUST_SAMPLING_SETTINGS_CONFIRMED === '1' ? '1' : '' });
   const child = spawn(process.execPath, ['--require', GUARD, SERVER], { env, stdio: ['ignore', 'ignore', 'pipe'] });
   // Server warnings go to stderr, minus the first-run setup code (the replayer reads it from the
   // data dir; a log is no place for it, synthetic or not).

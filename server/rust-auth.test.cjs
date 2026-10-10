@@ -162,3 +162,38 @@ test('secrets-rotate.cjs\'s separate database handle writes no owned table', () 
     for (const target of writeTargets(m[2])) assert.ok(!OWNED_TABLES.has(target.table) || target.table === 'audit_events', m[2]);
   }
 });
+
+test('sampling capability refuses only its key and ambiguous writes in real SQLite', () => {
+  const Database = require('better-sqlite3');
+  for (const samplingSettingsEnabled of [false, true]) {
+    const db = new Database(':memory:');
+    try {
+      db.exec("CREATE TABLE settings(key TEXT PRIMARY KEY,value); INSERT INTO settings VALUES('auto_sampling_presets_enabled','true'),('reasoning_effort_default','medium')");
+      const guard = createRustAuthGuard({ enabled: true, samplingSettingsEnabled });
+      guard.install(db);
+      db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run('reasoning_effort_default','high');
+      db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('reasoning_effort_default',?)").run('low');
+      assert.equal(db.prepare("SELECT value FROM settings WHERE key='reasoning_effort_default'").get().value,'low');
+      const attempts = [
+        () => db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run('auto_sampling_presets_enabled','false'),
+        () => db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('auto_sampling_presets_enabled',?)").run('false'),
+        () => db.prepare('UPDATE settings SET value=? WHERE key=?').run('false','auto_sampling_presets_enabled'),
+        () => db.prepare("UPDATE settings SET value='false'").run(),
+        () => db.exec('DELETE FROM settings'),
+        () => db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').bind('auto_sampling_presets_enabled','false').run(),
+        () => db.prepare("/* synthetic */ INSERT OR REPLACE INTO settings(key,value) VALUES('auto_sampling_presets_enabled',?)").run('false'),
+        () => db.prepare('INSERT OR REPLACE INTO main."settings"(key,value) VALUES(?,?)').run('auto_sampling_presets_enabled','false'),
+        () => db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('reasoning_effort_default',?),('auto_sampling_presets_enabled',?)").run('low','false'),
+        () => db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('auto_sampling_presets_enabled', lower(?))").run('FALSE'),
+        () => guard.exempt(() => db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run('auto_sampling_presets_enabled','false')),
+      ];
+      if (samplingSettingsEnabled) {
+        for (const attempt of attempts) assert.throws(attempt,{code:'RUST_SAMPLING_SETTINGS_OWNED',status:503});
+        assert.equal(db.prepare("SELECT value FROM settings WHERE key='auto_sampling_presets_enabled'").get().value,'true');
+      } else {
+        attempts[0]();
+        assert.equal(db.prepare("SELECT value FROM settings WHERE key='auto_sampling_presets_enabled'").get().value,'false');
+      }
+    } finally { db.close(); }
+  }
+});
