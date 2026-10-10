@@ -1,0 +1,58 @@
+name: Native OCR front contracts
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  ocr-front:
+    name: Required native OCR front contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: core
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: sbstndalton/noevia-web
+          path: web
+      # Acceptance dependencies while S3 is draft. These exact heads are explicit
+      # test inputs, not release pins. The release ancestry guard is unchanged.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: sbstndalton/noevia-rs
+          ref: f96cafe6a964a775054c1d995a8ad80935dd02ca
+          path: rs
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: sbstndalton/noevia-services
+          ref: 82517ee160200a6838f249e9678144004da7b3c9
+          path: services
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@70dec6087f2cb6bab9fbac4da23160afbe848e91 # 1.99.0
+      - name: Install real document engines (required)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng tesseract-ocr-deu ghostscript poppler-utils
+      - name: Assemble core and web for the real Node upstream
+        run: |
+          mkdir -p ws
+          cp -R web/. ws/
+          cp -R core/server core/tools core/tests core/contracts ws/
+          cd ws
+          npm ci --no-fund --no-audit
+          cd server
+          npm ci --no-fund --no-audit
+      - name: Build native worker and Rust front
+        working-directory: rs
+        run: cargo build --locked -p noevia-server -p noevia-ocr --features native-ocr
+      - name: Required front contracts and omission controls
+        env:
+          NOEVIA_OCR_FRONT_BIN: ${{ github.workspace }}/rs/target/debug/noevia-server
+          NOEVIA_OCR_NATIVE_BIN: ${{ github.workspace }}/rs/target/debug/noevia-ocr
+          NOEVIA_OCR_FIXTURE_SOURCE: ${{ github.workspace }}/services/ocr
+        run: node ws/tools/ocr-front/run.cjs
