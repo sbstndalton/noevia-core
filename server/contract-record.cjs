@@ -9,6 +9,7 @@
 //     any value of a secret-named JSON field or query parameter, long random-looking strings, and
 //     the values of secret-named environment variables) become `<secret:N>`;
 //   - ids (UUIDs, long hex, values of id-named fields) become `<id:N>`;
+//   - build stamps (`version`, `commit`, ...) become `<version>`;
 //   - configured upstream URLs (INFERENCE_BASE_URL, DIARY_BASE_URL, ...) become `<url:name>`;
 //   - timestamps (ISO strings, epoch-ms numbers in time-named fields) become `<ts>`, measured
 //     durations and rates (`*Ms`, `tokensPerSecond`, `timeToFirstToken`, ...) `<num>`.
@@ -32,6 +33,8 @@ const ID_KEY = /^(id|xid|uid)$|Id$|_id$|^(ids|.*Ids)$/;
 const TIME_KEY = /(At|_at|Time|_time|^ts|Ts$|^time$|^date$|^created$|^updated$|^expires$|^lastModified$|^mtime$|^modified$)$/;
 // Measured durations and rates differ on every run; their value is not contract, their presence is.
 const TIMING_KEY = /(Ms|_ms|Millis|Seconds|_s|PerSecond|perSecond|Duration|duration|elapsed|Elapsed|latency|Latency|uptime|Uptime|^timeToFirstToken$|^tps$|^tokensPerSecond$)$/;
+// A build stamp is the release's, not the contract's.
+const VERSION_KEY = /^(version|serverVersion|buildVersion|commit|gitSha)$/;
 const ISO_TS = /\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?\b/g;
 const HTTP_DATE = /^(Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT$/;
 const UUID = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
@@ -39,9 +42,10 @@ const UUID_ONE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
 const LONG_HEX = /\b[0-9a-f]{12,}\b/g;
 // Base64url-ish runs of 24+ chars with at least one digit and mixed case: tokens, not words.
 const RANDOMISH = /[A-Za-z0-9_-]{24,}={0,2}/g;
-const VOLATILE_HEADERS = new Set(['date', 'connection', 'keep-alive', 'transfer-encoding', 'content-length', 'etag', 'last-modified', 'age', 'server-timing', 'x-response-time', 'host', 'user-agent', 'accept-encoding', 'accept-language', 'referer', 'sec-fetch-site', 'sec-fetch-mode', 'sec-fetch-dest', 'sec-ch-ua', 'sec-ch-ua-mobile', 'sec-ch-ua-platform', 'x-forwarded-for', 'x-real-ip', 'cf-connecting-ip']);
+const VOLATILE_HEADERS = new Set(['date', 'connection', 'keep-alive', 'transfer-encoding', 'content-length', 'etag', 'last-modified', 'age', 'server-timing', 'x-response-time', 'host', 'accept-encoding', 'accept-language', 'referer', 'sec-fetch-site', 'sec-fetch-mode', 'sec-fetch-dest', 'sec-ch-ua', 'sec-ch-ua-mobile', 'sec-ch-ua-platform', 'x-forwarded-for', 'x-real-ip', 'cf-connecting-ip']);
 const SECRET_HEADERS = new Set(['authorization', 'proxy-authorization', 'x-csrf-token', 'x-api-key', 'x-cowork-tenant-assertion', 'x-diary-tenant-key']);
-const REQUEST_HEADERS = /^(content-type|accept|x-csrf-token|cookie|origin|authorization|x-cowork-.*|x-noevia-.*|last-event-id|if-none-match|range)$/;
+// user-agent is kept: the server stores it on the session, so a replay must send the same one.
+const REQUEST_HEADERS = /^(content-type|accept|user-agent|x-csrf-token|cookie|origin|authorization|x-cowork-.*|x-noevia-.*|last-event-id|if-none-match|range)$/;
 const ENV_SECRET = /KEY|TOKEN|SECRET|PASSWORD|PASS$|CREDENTIAL|COOKIE/i;
 
 function idLike(s) {
@@ -103,6 +107,7 @@ function createNormaliser({ envSecrets = [], origin = '', upstreams = {} } = {})
     }
     if (typeof v === 'string') {
       if (key && SECRET_KEY.test(key) && v !== '') return secret(v);
+      if (key && VERSION_KEY.test(key)) return '<version>';
       if (key && ID_KEY.test(key)) return id(v);
       if (key && TIME_KEY.test(key) && !Number.isNaN(Date.parse(v)) && /\d{4}/.test(v)) return '<ts>';
       return text(v);

@@ -242,3 +242,14 @@ test('upstream URLs are <url:name> and IP addresses are not ids', () => {
   assert.deepEqual(norm.value({ baseUrl: 'http://127.0.0.1:34455', diary: 'http://127.0.0.1:34456/api/x', host: '127.0.0.1', hostId: '10.0.0.12' }),
     { baseUrl: '<url:inference>', diary: '<url:diary>/api/x', host: '127.0.0.1', hostId: '10.0.0.12' });
 });
+
+test('build stamps are <version>; the request user-agent is kept for the replay', async () => {
+  const norm = createNormaliser();
+  assert.deepEqual(norm.value({ ready: true, version: '0.2.0', name: 'noevia' }), { ready: true, version: '<version>', name: 'noevia' });
+  const dir = tmp();
+  const recorder = createContractRecorder({ dir, env: {} });
+  await serve(recorder.wrap((req, res) => { res.setHeader('Content-Type', 'application/json'); res.end('{}'); }), async (base) => {
+    await (await fetch(`${base}/api/ua`, { headers: { 'User-Agent': 'synthetic-agent/1' } })).text();
+  });
+  assert.equal(records(dir)[0].request.headers['user-agent'], 'synthetic-agent/1');
+});
