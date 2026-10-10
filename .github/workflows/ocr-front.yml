@@ -17,6 +17,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: sbstndalton/noevia-web
+          # sbstndalton/noevia#1275: reproducible web input at authoritative main.
+          ref: e80b44931f7b6062d0c99644932d450bb6cca848
           path: web
       # Acceptance dependencies while S3 is draft. These exact heads are explicit
       # test inputs, not release pins. The release ancestry guard is unchanged.
