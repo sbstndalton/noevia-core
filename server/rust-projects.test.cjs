@@ -94,6 +94,36 @@ test('merge: changes on either side survive, a project both changed is merged pe
   assert.deepEqual(removed, [{ id: 'a', chats: [], x: 1 }]);
 });
 
+test('merge: a list Node only normalised after its save ([] for a missing one) does not beat the other writer', () => {
+  // The config route saves, then pruneDocuments sets project.assets = (project.assets || []).filter(...):
+  // [] in memory, absent on disk. Meanwhile the front adds images.
+  const saved = { id: 'a', name: 'A', chats: [] };
+  const base = new Map([['a', JSON.stringify(saved)]]);
+  const local = [{ ...saved, assets: [], retired: {} }];
+  const disk = [{ ...saved, assets: [{ id: 'img-1' }, { id: 'img-2' }] }];
+  const { result } = rp.merge(local, base, disk);
+  assert.deepEqual(result[0].assets, [{ id: 'img-1' }, { id: 'img-2' }]);
+  // A real change here still wins, and a normalised-but-absent-there field is kept as Node has it.
+  assert.deepEqual(rp.merge([{ ...saved, assets: [{ id: 'mine' }] }], base, disk).result[0].assets, [{ id: 'mine' }]);
+  assert.deepEqual(rp.merge(local, base, [{ ...saved, name: 'B' }]).result[0], { id: 'a', name: 'B', chats: [], assets: [], retired: {} });
+});
+
+test('the coordinated file: a post-save normalisation, then the front adds images, then a refresh and a save keep them', () => {
+  const dir = tmp(); const file = path.join(dir, 'projects.json');
+  const pf = rp.createProjectsFile(file, { atomicJson, warn: () => {} });
+  const projects = pf.load();
+  projects.push({ id: 'p', name: 'P', chats: [] });
+  pf.save(projects);
+  projects[0].assets = (projects[0].assets || []).filter(() => true); // uploads.prune after the save
+  write(file, [{ id: 'p', name: 'P', chats: [], assets: [{ id: 'img-1' }] }]);
+  pf.refresh(projects);
+  assert.deepEqual(projects[0].assets, [{ id: 'img-1' }]);
+  write(file, [{ id: 'p', name: 'P', chats: [], assets: [{ id: 'img-1' }, { id: 'img-2' }] }]);
+  projects[0].chats.push({ id: 'c' });
+  pf.save(projects);
+  assert.deepEqual(read(file)[0], { id: 'p', name: 'P', chats: [{ id: 'c' }], assets: [{ id: 'img-1' }, { id: 'img-2' }] });
+});
+
 test('merge: deletes and creations on either side, and where new projects go', () => {
   const p = (id) => ({ id, name: id });
   const base = new Map(['a', 'b', 'c'].map((id) => [id, JSON.stringify(p(id))]));

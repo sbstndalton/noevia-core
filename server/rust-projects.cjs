@@ -104,6 +104,12 @@ function withFileLock(file, fn, { now = Date.now, sleep = sleepSync, pid = proce
 const idOf = (p) => (p && typeof p === 'object' && typeof p.id === 'string' ? p.id : null);
 const own = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+const blank = (v) => v === undefined || (Array.isArray(v) ? v.length === 0 : v !== null && typeof v === 'object' && Object.keys(v).length === 0);
+// Node normalises absent lists in memory after a save (uploads.prune: `project.assets =
+// (project.assets || []).filter(...)` runs after the config route's save). An absent field turned
+// into an empty list or object is not a change of this process's: it must not erase what the
+// other writer put in that field meanwhile.
+const unchangedHere = (o, b) => same(o, b) || (b === undefined && blank(o));
 
 /** One project both sides changed since the last read: per top-level field, this process's value
  *  where it changed the field, the disk's otherwise (disk key order, new local fields appended). */
@@ -112,7 +118,7 @@ function mergeFields(ours, baseJson, theirs) {
   try { base = JSON.parse(baseJson); } catch { base = {}; }
   const out = {};
   for (const k of Object.keys(theirs)) {
-    if (same(ours[k], base[k])) out[k] = theirs[k];
+    if (unchangedHere(ours[k], base[k])) out[k] = theirs[k];
     else if (own(ours, k) && ours[k] !== undefined) out[k] = ours[k];
     // removed here: left out
   }
