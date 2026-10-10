@@ -180,6 +180,11 @@ test('sampling capability refuses only its key and ambiguous writes in real SQLi
         () => db.prepare('UPDATE settings SET value=? WHERE key=?').run('false','auto_sampling_presets_enabled'),
         () => db.prepare("UPDATE settings SET value='false'").run(),
         () => db.exec('DELETE FROM settings'),
+        () => db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').bind('auto_sampling_presets_enabled','false').run(),
+        () => db.prepare("/* synthetic */ INSERT OR REPLACE INTO settings(key,value) VALUES('auto_sampling_presets_enabled',?)").run('false'),
+        () => db.prepare('INSERT OR REPLACE INTO main."settings"(key,value) VALUES(?,?)').run('auto_sampling_presets_enabled','false'),
+        () => db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('reasoning_effort_default',?),('auto_sampling_presets_enabled',?)").run('low','false'),
+        () => db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('auto_sampling_presets_enabled', lower(?))").run('FALSE'),
         () => guard.exempt(() => db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run('auto_sampling_presets_enabled','false')),
       ];
       if (samplingSettingsEnabled) {
