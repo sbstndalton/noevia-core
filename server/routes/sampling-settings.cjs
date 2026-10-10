@@ -31,7 +31,7 @@ function createSamplingSettingsRoutes({ json, readBody, authService }) {
       if (req.method === 'PUT') {
         if (authn.user.role !== 'admin') return json(res, 403, { error: 'Administrator required' });
         let body; try { body = JSON.parse(await readBody(req)); } catch { return json(res, 400, { error: 'invalid JSON' }); }
-        if (typeof body.enabled !== 'boolean') return json(res, 400, { error: 'enabled must be true or false' });
+        if (!body || typeof body !== 'object' || Array.isArray(body) || typeof body.enabled !== 'boolean') return json(res, 400, { error: 'enabled must be true or false' });
         authService.db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)").run(KEY, String(body.enabled));
         authService.audit('sampling.autoPresets', authn.user.id, null, { enabled: body.enabled });
         return json(res, 200, { enabled: body.enabled });
