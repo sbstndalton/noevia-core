@@ -144,6 +144,16 @@ jobs:
       # server/tool-result-reduce.cjs, so it must not drift. Needs ripgrep.
       - run: sudo apt-get update && sudo apt-get install -y ripgrep
       - run: node --test tools/repo-index/*.test.cjs
+      # Full-Rust migration M0: boot the real server on a throwaway synthetic data dir (mock model
+      # and Diary, outbound connections refused) with NOEVIA_CONTRACT_RECORD set, drive the web
+      # client's paths, and fail if a secret reached the corpus. The corpus is the artifact
+      # noevia-rs contracts/http/corpus is refreshed from.
+      - name: Record the synthetic HTTP contract corpus
+        run: node tools/contract-corpus/generate.cjs --out "$RUNNER_TEMP/contract-corpus"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: contract-corpus
+          path: ${{ runner.temp }}/contract-corpus
 
   code-sandbox:
     name: Code sandbox bridge tests

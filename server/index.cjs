@@ -1111,7 +1111,11 @@ if (require.main === module) {
   if (!DIARY_TENANT_KEY) console.warn('WARNING: DIARY_TENANT_KEY is unset; Diary calls carry no tenant assertion and remote storage secrets ride on every call.');
   // A throw outside handleRequestScoped's own try (authentication, the workspace load) answers 500
   // rather than resetting the connection, so one bad request input cannot look like a dead server (#781).
-  const server = http.createServer(codeNetGuard.wrap((req, res) => handleRequest(req, res).catch((err) => answerUnhandled(res, err)), 'ui'));
+  const uiHandler = (req, res) => handleRequest(req, res).catch((err) => answerUnhandled(res, err));
+  // M0 contract corpus (noevia-rs tools/replay): only when NOEVIA_CONTRACT_RECORD names a directory;
+  // unset, the listener gets uiHandler itself.
+  const contractRecorder = require('./contract-record.cjs').fromEnv(process.env);
+  const server = http.createServer(codeNetGuard.wrap(contractRecorder ? contractRecorder.wrap(uiHandler) : uiHandler, 'ui'));
   staticFiles.warm();
   // A chat waiting on a write approval is a legitimately long request. Node's
   // default requestTimeout is 5 minutes measured from the START of the request,
