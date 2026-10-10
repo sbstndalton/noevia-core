@@ -17,6 +17,12 @@
 
 const PASS = Symbol('unhandled');
 const { isJsonObject } = require('../http.cjs');
+// File-path options of a models.ini section and every spelling llama-server accepts for them (#1235).
+const PATH_OPTION_ALIASES = Object.fromEntries([
+  ['model', ['model', 'm', 'LLAMA_ARG_MODEL']],
+  ['mmproj', ['mmproj', 'mm', 'LLAMA_ARG_MMPROJ']],
+  ['model-draft', ['model-draft', 'md', 'LLAMA_ARG_MODEL_DRAFT']],
+].flatMap(([canonical, names]) => names.map(n => [n, canonical])));
 const { isSystemModel, modelPathFromArgs, SYSTEM_MODEL_DELETE_REASON, SYSTEM_MODEL_LOAD_REASON, SIDECAR_MODEL_LOAD_REASON, MISSING_MODEL_FILE_REASON, isSidecarModel, SIDECAR_MODEL_DELETE_REASON } = require('../model-system.cjs');
 
 // A client sees e.message only when it was written for people (publicMessage, or a 4xx status).
@@ -262,8 +268,11 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
         if (method === 'PUT' && !rest.endsWith('/rename')) {
           let sent; try { sent = JSON.parse(body || '{}'); } catch { sent = {}; }
           const vals = sent && typeof sent.values === 'object' && sent.values ? sent.values : {};
-          for (const key of ['model', 'mmproj', 'model-draft']) {
-            if (vals[key] !== undefined && vals[key] !== null && typeof vals[key] !== 'string') return json(res, 400, { error: `Not saved: ${key} must be a text path`, code: 'invalid_path' });
+          // #1235: fold the llama-server aliases first (-m, LLAMA_ARG_MODEL, mm, md, ...), same key
+          // normalisation as llamacpp-presets canonicalOptions, so an alias cannot dodge the check.
+          for (const [rawKey, value] of Object.entries(vals)) {
+            const key = PATH_OPTION_ALIASES[String(rawKey).trim().replace(/^-+/, '')];
+            if (key && value !== undefined && value !== null && typeof value !== 'string') return json(res, 400, { error: `Not saved: ${key} must be a text path`, code: 'invalid_path' });
           }
         }
         if (method === 'PUT' && !rest.endsWith('/rename') && modelManager.presetRefusal) {
