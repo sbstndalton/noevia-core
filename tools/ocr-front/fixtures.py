@@ -4,6 +4,7 @@ import sys
 import zipfile
 from pathlib import Path
 
+sys.dont_write_bytecode = True
 source, destination = map(Path, sys.argv[1:])
 spec = importlib.util.spec_from_file_location('synthetic', source / 'synthetic_pdfs.py')
 synthetic = importlib.util.module_from_spec(spec)

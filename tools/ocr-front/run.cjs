@@ -151,6 +151,10 @@ async function scenario(front, mode, workerBase, fixtures, root, calls) {
 }
 async function main() {
   const front = required('NOEVIA_OCR_FRONT_BIN'); const worker = required('NOEVIA_OCR_NATIVE_BIN'); const services = required('NOEVIA_OCR_FIXTURE_SOURCE');
+  for (const [engine, option] of [['tesseract', '--version'], ['gs', '--version'], ['pdftoppm', '-v'], ['pdftotext', '-v']]) {
+    const probe = spawnSync(engine, [option], { encoding: 'utf8' });
+    assert.equal(probe.status, 0, `${engine} is required; this gate cannot skip`);
+  }
   const features = spawnSync(worker, ['--features'], { encoding: 'utf8' });
   assert.equal(features.status, 0, 'native OCR feature probe must succeed');
   assert.ok(features.stdout.split('\n').includes('native-ocr'), 'native OCR required');
