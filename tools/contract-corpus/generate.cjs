@@ -29,6 +29,9 @@ const MEMBER = { username: 'synthetic-member', displayName: 'Synthetic Member', 
 // The member's password after an account recovery (M3). Typed by the replayer as a generated value:
 // the recovered sign-in uses another spelling of the username, so no manifest input names it.
 const RECOVERED = 'contract-corpus-Synthetic-pw-3';
+// A 1x1 PNG for the project image steps (M4). The recorder takes a value this random-looking for a
+// secret, so the manifest hands it to the replayer as an input like the passwords.
+const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==';
 
 function arg(name) {
   const i = process.argv.indexOf(name);
@@ -172,8 +175,6 @@ async function main() {
     await step(admin, 'GET', `/api/projects/${encodeURIComponent(projectId)}/chats`);
 
     // M4 (NOEVIA_RUST_PROJECTS): a project's images, with the refusals and the tenant boundary.
-    // A 1x1 PNG, synthetic.
-    const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==';
     const assets = `/api/projects/${encodeURIComponent(projectId)}/assets`;
     const image = await step(admin, 'POST', assets, { name: 'pixel.png', mime: 'IMAGE/PNG', dataBase64: PNG }, [200]);
     const assetId = image.json?.asset?.id;
@@ -309,6 +310,7 @@ async function main() {
     const b = ex.request.body?.json;
     if (!b) continue;
     if (ex.request.path === '/api/setup/complete' && ex.response.status === 201) inputs[b.setupCode] = { file: 'first-run-setup-code' };
+    if (typeof b.dataBase64 === 'string' && b.dataBase64.startsWith('<secret:')) inputs[b.dataBase64] = { value: PNG };
     if (typeof b.password === 'string' && b.password.startsWith('<secret:')) {
       const known = [ADMIN, MEMBER].find((u) => u.username === b.username);
       if (known && ex.response.status < 300) inputs[b.password] = { value: known.password };
@@ -318,7 +320,7 @@ async function main() {
     v: 1,
     generator: 'noevia-core tools/contract-corpus/generate.cjs',
     seed: 'empty',
-    note: 'Replay against a server started on an empty UI_DATA_DIR; the setup code is read from that dir once the server has written it. Passwords are synthetic.',
+    note: 'Replay against a server started on an empty UI_DATA_DIR; the setup code is read from that dir once the server has written it. Passwords and the image data are synthetic.',
     inputs,
     exchanges: files.length,
     dropped: dropped.length,
