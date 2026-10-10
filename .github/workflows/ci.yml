@@ -343,7 +343,10 @@ jobs:
           CORE: self
         run: |
           set -euo pipefail
-          t="$RUNNER_TEMP/tree"; mkdir -p "$t/web" "$t/core"
+          t="$RUNNER_TEMP/tree"; mkdir -p "$t/web" "$t/core" "$t/noevia/build" "$t/rs"
+          # noevia #1243: the web image copies noevia/build/web-supervisor.sh and builds the Rust front
+          # from rs/ when present (empty here: the CI image carries the Node front only).
+          cp ws/build/web-supervisor.sh "$t/noevia/build/web-supervisor.sh"
           git -C "$WEB" archive HEAD | tar -x -C "$t/web"
           git -C "$CORE" archive HEAD | tar -x -C "$t/core"
           printf 'NOEVIA_SHA=%s\nNOEVIA_WEB_SHA=%s\nNOEVIA_CORE_SHA=%s\nNOEVIA_SERVICES_SHA=%s\n' "$(git -C ws rev-parse HEAD)" \

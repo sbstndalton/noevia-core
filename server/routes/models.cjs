@@ -272,6 +272,8 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
           // normalisation as llamacpp-presets canonicalOptions, so an alias cannot dodge the check.
           for (const [rawKey, value] of Object.entries(vals)) {
             const key = PATH_OPTION_ALIASES[String(rawKey).trim().replace(/^-+/, '')];
+            // #1249: the model path cannot be removed (null or blank); mmproj and model-draft can (the UI sends '' to clear).
+            if (key === 'model' && (value === null || (typeof value === 'string' && value.trim() === ''))) return json(res, 400, { error: 'Not saved: model must be a text path', code: 'invalid_path' });
             if (key && value !== undefined && value !== null && typeof value !== 'string') return json(res, 400, { error: `Not saved: ${key} must be a text path`, code: 'invalid_path' });
           }
         }

@@ -909,3 +909,17 @@ test('#1235: aliases of the model path options (m, mm, md, LLAMA_ARG_*) with a n
   await f.call('PUT', '/api/model-manager/sections/chat-syn', { baseRevision: 'r', values: { m: '/models/x.gguf', LLAMA_ARG_MMPROJ: '/models/p.gguf' } }, 'admin');
   assert.equal(f.fetched.length, 1, 'string aliases still go through');
 });
+
+test('#1249: a null or blank model path is refused (400 invalid_path) under every alias; mmproj and model-draft can still be cleared', async () => {
+  const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, manager: { presetRefusal: async () => null } });
+  for (const alias of ['model', 'm', 'LLAMA_ARG_MODEL', '-m', '--model']) {
+    for (const bad of [null, '', '   ']) {
+      await f.call('PUT', '/api/model-manager/sections/chat-syn', { baseRevision: 'r', values: { [alias]: bad } }, 'admin');
+      const last = f.sent.pop();
+      assert.equal(last.status, 400, `${alias} ${JSON.stringify(bad)}`); assert.equal(last.body.code, 'invalid_path');
+    }
+  }
+  assert.equal(f.fetched.length, 0, 'nothing is forwarded');
+  await f.call('PUT', '/api/model-manager/sections/chat-syn', { baseRevision: 'r', values: { mmproj: '', mm: null, 'model-draft': null, md: '' } }, 'admin');
+  assert.equal(f.fetched.length, 1, 'clearing mmproj / model-draft still goes through');
+});
