@@ -9,7 +9,8 @@
 //     any value of a secret-named JSON field or query parameter, long random-looking strings, and
 //     the values of secret-named environment variables) become `<secret:N>`;
 //   - ids (UUIDs, long hex, values of id-named fields) become `<id:N>`;
-//   - timestamps (ISO strings, epoch-ms numbers in time-named fields) become `<ts>`.
+//   - timestamps (ISO strings, epoch-ms numbers in time-named fields) become `<ts>`, measured
+//     durations and rates (`*Ms`, `tokensPerSecond`, `timeToFirstToken`, ...) `<num>`.
 // N numbers values in order of first sight across the whole recording, so the same session
 // cookie, CSRF token or project id carries the same placeholder in every file: the replayer binds
 // `<id:3>` to whatever the server under test answered and substitutes it into later requests.
@@ -28,6 +29,8 @@ const SECRET_KEY = /pass(word|phrase)?|secret|token|api[-_]?key|^key$|keys?$|aut
 const NUMERIC_SECRET_KEY = /pass|secret|otp|pin$|setup[-_]?code|^code$/i;
 const ID_KEY = /^(id|xid|uid)$|Id$|_id$|^(ids|.*Ids)$/;
 const TIME_KEY = /(At|_at|Time|_time|^ts|Ts$|^time$|^date$|^created$|^updated$|^expires$|^lastModified$|^mtime$|^modified$)$/;
+// Measured durations and rates differ on every run; their value is not contract, their presence is.
+const TIMING_KEY = /(Ms|_ms|Millis|Seconds|_s|PerSecond|perSecond|Duration|duration|elapsed|Elapsed|latency|Latency|uptime|Uptime|^timeToFirstToken$|^tps$|^tokensPerSecond$)$/;
 const ISO_TS = /\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?\b/g;
 const HTTP_DATE = /^(Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} GMT$/;
 const UUID = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
@@ -88,6 +91,7 @@ function createNormaliser({ envSecrets = [], origin = '' } = {}) {
     if (v === null || v === undefined || typeof v === 'boolean') return v;
     if (typeof v === 'number') {
       if (TIME_KEY.test(key) && v > 1e9) return '<ts>';
+      if (key && TIMING_KEY.test(key)) return '<num>';
       if (key && NUMERIC_SECRET_KEY.test(key)) return secret(v);
       return v;
     }

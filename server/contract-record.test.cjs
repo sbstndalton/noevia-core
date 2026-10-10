@@ -218,3 +218,9 @@ test('the server origin is <origin> in bodies and paths too, not only in the Ori
   assert.deepEqual(norm.value({ publicOrigin: 'http://127.0.0.1:44345', link: 'http://127.0.0.1:44345/s/x' }), { publicOrigin: '<origin>', link: '<origin>/s/x' });
   assert.equal(norm.header('location', 'http://127.0.0.1:44345/next', { origin: 'http://127.0.0.1:44345' }), '<origin>/next');
 });
+
+test('measured timings are <num>, counts stay literal', () => {
+  const norm = createNormaliser();
+  assert.deepEqual(norm.value({ type: 'telemetry', timeToFirstToken: 12.5, tokensPerSecond: 40.1, durationMs: 830, promptTokens: 12, count: 3 }),
+    { type: 'telemetry', timeToFirstToken: '<num>', tokensPerSecond: '<num>', durationMs: '<num>', promptTokens: 12, count: 3 });
+});
