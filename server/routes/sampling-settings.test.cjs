@@ -56,3 +56,24 @@ test('defaults to enabled, exposes the preset catalogue, and only an admin may c
   await f.call('DELETE', '/api/sampling-settings');
   assert.deepEqual(f.sent.pop(), { status: 405, body: { error: 'Method not allowed' } });
 });
+
+// #1282: every valid JSON non-object shape returns validation, without writes or audit.
+test('rejects null, arrays and scalar bodies without changing settings or audit', async () => {
+  for (const raw of ['null', '[]', '[true]', '"text"', '0', 'false', '{}', '{"enabled":null}', '{"enabled":1}']) {
+    const f = fixture();
+    await f.call('PUT', '/api/sampling-settings', raw, 'admin');
+    assert.deepEqual(f.sent, [{ status: 400, body: { error: 'enabled must be true or false' } }], raw);
+    assert.equal(f.settings.size, 0, raw);
+    assert.deepEqual(f.audits, [], raw);
+  }
+});
+
+test('checks administrator before parsing null or malformed bodies', async () => {
+  for (const raw of ['null', '{', '']) {
+    const f = fixture();
+    await f.call('PUT', '/api/sampling-settings', raw, 'member');
+    assert.deepEqual(f.sent, [{ status: 403, body: { error: 'Administrator required' } }]);
+    assert.equal(f.settings.size, 0);
+    assert.deepEqual(f.audits, []);
+  }
+});
