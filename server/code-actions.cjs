@@ -273,7 +273,9 @@ function classifyWords(input, depth, viaExec = false) {
   // Peel `FOO=bar` prefixes and wrappers until the command that actually runs.
   for (;;) {
     while (words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0])) { words = words.slice(1); prefixed = true; }
-    if (!words.length) return one(ACTIONS.NONE);
+    // `xargs FOO=bar` leaves nothing after the prefix, but xargs still runs a program chosen at run
+    // time: keep the standable=false a dynamic wrapper set (noevia#1255; matches noevia-rs code-actions).
+    if (!words.length) return one(ACTIONS.NONE, standable);
     const name = words[0].split('/').pop();
     if (!WRAPPERS.has(name)) break;
     if (DYNAMIC_WRAPPERS.has(name)) standable = false;

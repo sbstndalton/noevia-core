@@ -174,6 +174,16 @@ test('commands built at run time never earn a standing approval', () => {
   assert.deepEqual(exec('curl https://x.test').actions, NET);
 });
 
+// noevia#1255: an env prefix after a dynamic wrapper must not drop the "never stands" mark when it
+// leaves no command word (xargs then runs a program named by its input).
+test('xargs with only a FOO=bar prefix never earns a standing approval', () => {
+  for (const cmd of ['xargs FOO=bar', 'xargs FOO=bar \u00a0', 'xargs A=1 B=2', 'xargs -r FOO=bar', 'xargs env FOO=bar']) {
+    assert.equal(exec(cmd).standable, false, JSON.stringify(cmd));
+  }
+  // An env prefix alone, or after a wrapper that runs a fixed command, is unchanged.
+  for (const cmd of ['FOO=bar', 'env FOO=bar', 'nice FOO=bar']) assert.equal(exec(cmd).standable, true, JSON.stringify(cmd));
+});
+
 // ---- #179 / #170: a network command is only auto-allowed with read-only flags ----
 const everything = { capabilities: [], domains: ['allowed.com', 'x.test'] };
 test('network commands with writing, uploading or remote-exec flags always ask', () => {

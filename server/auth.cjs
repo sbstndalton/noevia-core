@@ -509,6 +509,7 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
       if (!expected || digest(body.setupCode || '') !== expected) return { status: 401, body: { error: 'setup could not be completed' } };
       if (!USERNAME_RE.test(String(body.username || ''))) return { status: 400, body: { error: 'invalid username' } };
       const selectedOrigin = String(body.publicOrigin || origin || '').replace(/\/$/, '');
+      const envOrigin = String(publicOrigin || '').replace(/\/$/, '');
       if (!isAcceptablePublicOrigin(selectedOrigin)) {
         return { status: 400, body: { error: 'use https://, or a private-network address (a LAN IP, a bare LAN hostname, or localhost) over http://' } };
       }
@@ -523,9 +524,18 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
         db.prepare('INSERT INTO user_features(user_id,diary_enabled,onboarded,updated_at) VALUES(?,?,?,?)')
           .run(id, body.diaryEnabled ? 1 : 0, 0, now);
         db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('public_origin',?)").run(selectedOrigin);
+        // PUBLIC_ORIGIN outranks the setup address at boot. When the operator chose another
+        // address here, record it as the administrator's choice so the origin served until the next
+        // restart is the one served after it (noevia#1254). There is no earlier address to keep:
+        // no account exists yet.
+        if (envOrigin && selectedOrigin !== envOrigin) {
+          db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('public_origin_admin',?)").run(selectedOrigin);
+        }
       });
       try { tx(); } catch (e) { if (e.raced) return { status: 409, body: { error: 'setup already complete' } }; throw e; }
       origin = selectedOrigin;
+      if (envOrigin && selectedOrigin !== envOrigin) originSource = 'settings';
+      else if (!originSource || originSource === 'none') originSource = 'setup';
       relyingPartyId = rpFor(selectedOrigin);
       try { fs.unlinkSync(setupFile); } catch {}
       const user = db.prepare('SELECT * FROM users WHERE id=?').get(id);
