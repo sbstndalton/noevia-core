@@ -1,0 +1,79 @@
+name: Native OCR front contracts
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  ocr-front:
+    name: Required native OCR front contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: core
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: sbstndalton/noevia-web
+          # sbstndalton/noevia#1275: reproducible web input at authoritative main.
+          ref: e80b44931f7b6062d0c99644932d450bb6cca848
+          path: web
+      # Acceptance dependencies while S3 is draft. These exact heads are explicit
+      # test inputs, not release pins. The release ancestry guard is unchanged.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: sbstndalton/noevia-rs
+          # Reviewed sbstndalton/noevia#1273 upload-bound fix; acceptance input only.
+          ref: 00885e594c77c529f9fd034064852faf104ce5ea
+          path: rs
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: sbstndalton/noevia-services
+          ref: 82517ee160200a6838f249e9678144004da7b3c9
+          path: services
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@70dec6087f2cb6bab9fbac4da23160afbe848e91 # 1.99.0
+      - name: Install real document engines (required)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng tesseract-ocr-deu ghostscript poppler-utils
+      - name: Assemble core and web for the real Node upstream
+        run: |
+          mkdir -p ws
+          cp -R web/. ws/
+          cp -R core/server core/tools core/tests core/contracts ws/
+          cd ws
+          npm ci --no-fund --no-audit
+          cd server
+          npm ci --no-fund --no-audit
+      - name: Build the independently pinned required server WASM
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          eval "$(grep -E '^(NOEVIA_RS_REF|NOEVIA_RS_SHA256|DAV_PARSE_WASM_SHA256)=[0-9a-f]+$' core/server/dav-parse.lock)"
+          [[ "$NOEVIA_RS_REF" =~ ^[0-9a-f]{40}$ ]]
+          status=$(gh api "repos/sbstndalton/noevia-rs/compare/$NOEVIA_RS_REF...main" --jq .status)
+          case "$status" in identical|ahead) ;; *) echo "Required WASM pin is not on main"; exit 1 ;; esac
+          curl -fsSL "https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/$NOEVIA_RS_REF" -o "$RUNNER_TEMP/wasm-rs.tgz"
+          echo "$NOEVIA_RS_SHA256  $RUNNER_TEMP/wasm-rs.tgz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/wasm-rs"
+          tar -xzf "$RUNNER_TEMP/wasm-rs.tgz" --strip-components=1 -C "$RUNNER_TEMP/wasm-rs"
+          rustup target add wasm32-unknown-unknown --toolchain 1.99.0
+          "$RUNNER_TEMP/wasm-rs/tools/build-dav-parse-wasm.sh" "$GITHUB_WORKSPACE/ws/server/wasm/dav-parse.wasm"
+          echo "$DAV_PARSE_WASM_SHA256  ws/server/wasm/dav-parse.wasm" | sha256sum -c -
+      - name: Scan oracle unit tests
+        run: node --test ws/tools/ocr-front/contracts.test.cjs
+      - name: Build native worker and Rust front
+        working-directory: rs
+        run: cargo build --locked -p noevia-server -p noevia-ocr --features native-ocr
+      - name: Required front contracts and omission controls
+        env:
+          NOEVIA_OCR_FRONT_BIN: ${{ github.workspace }}/rs/target/debug/noevia-server
+          NOEVIA_OCR_NATIVE_BIN: ${{ github.workspace }}/rs/target/debug/noevia-ocr
+          NOEVIA_OCR_FIXTURE_SOURCE: ${{ github.workspace }}/services/ocr
+        run: node ws/tools/ocr-front/run.cjs
