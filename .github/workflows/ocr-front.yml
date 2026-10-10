@@ -47,6 +47,24 @@ jobs:
           npm ci --no-fund --no-audit
           cd server
           npm ci --no-fund --no-audit
+      - name: Build the independently pinned required server WASM
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          eval "$(grep -E '^(NOEVIA_RS_REF|NOEVIA_RS_SHA256|DAV_PARSE_WASM_SHA256)=[0-9a-f]+$' core/server/dav-parse.lock)"
+          [[ "$NOEVIA_RS_REF" =~ ^[0-9a-f]{40}$ ]]
+          status=$(gh api "repos/sbstndalton/noevia-rs/compare/$NOEVIA_RS_REF...main" --jq .status)
+          case "$status" in identical|ahead) ;; *) echo "Required WASM pin is not on main"; exit 1 ;; esac
+          curl -fsSL "https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/$NOEVIA_RS_REF" -o "$RUNNER_TEMP/wasm-rs.tgz"
+          echo "$NOEVIA_RS_SHA256  $RUNNER_TEMP/wasm-rs.tgz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/wasm-rs"
+          tar -xzf "$RUNNER_TEMP/wasm-rs.tgz" --strip-components=1 -C "$RUNNER_TEMP/wasm-rs"
+          rustup target add wasm32-unknown-unknown --toolchain 1.99.0
+          "$RUNNER_TEMP/wasm-rs/tools/build-dav-parse-wasm.sh" "$GITHUB_WORKSPACE/ws/server/wasm/dav-parse.wasm"
+          echo "$DAV_PARSE_WASM_SHA256  ws/server/wasm/dav-parse.wasm" | sha256sum -c -
+      - name: Scan oracle unit tests
+        run: node --test ws/tools/ocr-front/contracts.test.cjs
       - name: Build native worker and Rust front
         working-directory: rs
         run: cargo build --locked -p noevia-server -p noevia-ocr --features native-ocr

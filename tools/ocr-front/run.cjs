@@ -22,7 +22,7 @@ function child(command, args, env) {
   return proc;
 }
 async function stop(proc) {
-  if (!proc || proc.exitCode !== null || proc.signalCode !== null) return;
+  if (!proc || !proc.pid || proc.exitCode !== null || proc.signalCode !== null) return;
   const done = once(proc, 'exit');
   proc.kill('SIGTERM');
   const timeout = setTimeout(() => proc.kill('SIGKILL'), 3000);
@@ -128,7 +128,19 @@ async function scenario(front, mode, workerBase, fixtures, root, calls) {
     assert.ok(calls.find(call => call.path === '/reduce-pdf').bytes > 25 * 1024 * 1024);
     // Compare complete upload and page response bodies, plus persisted source
     // content/attachment/document contracts; omit only background index progress.
-    const stable = value => JSON.parse(JSON.stringify(value), (key, item) => key === 'indexing' ? undefined : item);
+    // Ghostscript embeds generation metadata, so a reduced PDF's byte
+    // fingerprint can differ between runs. Bind only those derived identities,
+    // preserving their relationships just as the broad replayer binds IDs.
+    const reduced = files.find(file => file.name === large.path);
+    if (large.document) assert.equal(large.attachment.id, large.document.byteHash);
+    const identities = new Map([[large.attachment.id, '<reduced-bytes>']]);
+    if (reduced.document?.version) identities.set(reduced.document.version, '<reduced-version>');
+    const stable = value => JSON.parse(JSON.stringify(value), (key, item) => {
+      if (key === 'indexing') return undefined;
+      if (typeof item !== 'string') return item;
+      for (const [identity, replacement] of identities) item = item.replaceAll(identity, replacement);
+      return key === 'notice' ? item.replace(/; index: [a-z]+\.$/, '; index: <progress>.') : item;
+    });
     return stable({ scan, pages, docx, large, files: files.map(({ name, content, document, attachment }) => ({ name, content, document, attachment })), deniedPages, deniedOriginal, deniedUpload });
   } finally {
     await stop(rust); await stop(node); mocks.close(); relay.closeAllConnections(); await new Promise(resolve => relay.close(resolve));
@@ -146,6 +158,9 @@ async function main() {
     const fixtures = path.join(root, 'fixtures');
     const generated = spawnSync('python3', [path.join(__dirname, 'fixtures.py'), services, fixtures], { encoding: 'utf8' });
     assert.equal(generated.status, 0, generated.stderr);
+    const textLayer = spawnSync('pdftotext', [path.join(fixtures, 'scan.pdf'), '-'], { encoding: 'utf8' });
+    assert.equal(textLayer.status, 0, 'Poppler is required');
+    assert.equal(textLayer.stdout.trim(), '', 'synthetic scan must have no native text layer');
     const workerPort = await port(); const workerBase = `http://127.0.0.1:${workerPort}`;
     native = child(worker, [], { PATH: process.env.PATH, NOEVIA_OCR_IMPL: 'rust', NOEVIA_OCR_LISTEN: `127.0.0.1:${workerPort}` });
     await ready(workerBase, '/health', native);
