@@ -67,14 +67,14 @@ test('other paths and methods are left alone or refused', async () => {
 });
 
 // ── #237: GET /api/toolboxes/permitted ──
-function permittedFixture({ cache } = {}) {
+function permittedFixture({ cache, cacheKeyExtra } = {}) {
   const sent = [], calls = [];
   let mode0 = 'ask';
   // Two tenants: each account sees only its own project, as the real getProject does.
   const projects = { 'u-a': { pa: { id: 'pa' } }, 'u-b': { pb: { id: 'pb' } } };
   const routes = createToolboxRoutes({
     discoverMcpTools: async () => {}, toolboxSummaries: () => [], prefill: { targetMs: 1, stats: () => ({}) },
-    mcp: () => ({ enabled: false }), json: (res, status, body) => { sent.push({ status, body }); return true; }, ...(cache ? { cache } : {}),
+    mcp: () => ({ enabled: false }), json: (res, status, body) => { sent.push({ status, body }); return true; }, ...(cache ? { cache } : {}), ...(cacheKeyExtra ? { cacheKeyExtra } : {}),
     permitted: ({ authn, projectId, mode }) => {
       calls.push({ user: authn.user.id, projectId, mode });
       const project = projectId ? projects[authn.user.id][projectId] : null;
@@ -129,4 +129,15 @@ test('#796: clearing the shared cache (what a policy or toolbox save does) shows
   await f.get(A, '?projectId=pa&mode=chat');
   assert.equal(f.sent[2].body.boxes[0].policy, 'block');
   assert.equal(f.calls.length, 2);
+});
+
+test('M3: a Diary preference written elsewhere (the Rust front) shows at once: it is part of the cache key', async () => {
+  let diary = false;
+  const f = permittedFixture({ cacheKeyExtra: () => diary });
+  await f.get(A, '?projectId=pa&mode=chat');
+  await f.get(A, '?projectId=pa&mode=chat');
+  assert.equal(f.calls.length, 1);
+  diary = true;
+  await f.get(A, '?projectId=pa&mode=chat');
+  assert.equal(f.calls.length, 2, 'a changed preference is not served from the old entry');
 });
