@@ -52,15 +52,23 @@ async function aggregateUsage(users,userDir,now=Date.now()) {
   const paths=users.map(user=>require('path').join(userDir(user.id),'usage.json'));
   const signature=JSON.stringify(paths);
   if(aggregateCache?.signature===signature&&now-aggregateCache.at<30000)return aggregateCache.value;
-  const fs=require('fs').promises;let next=0,unreadableAccounts=0,merged={days:{}};
-  await Promise.all(Array.from({length:Math.min(8,paths.length)},async()=>{
-    while(next<paths.length){const file=paths[next++];try{
-      const stat=await fs.stat(file);if(stat.size>2*1024*1024)throw Error('oversize');
-      const value=JSON.parse(await fs.readFile(file,'utf8'));
-      if(!value?.days||typeof value.days!=='object'||Array.isArray(value.days))throw Error('invalid');
-      merged=mergeUsage([value],merged);
-    }catch(error){if(error.code!=='ENOENT')unreadableAccounts++;}}
-  }));
+  const fs=require('fs').promises;let unreadableAccounts=0,merged={days:{}};
+  // #1281: completion order must not choose fractional sums or stable model ties.
+  // Read at most eight files concurrently and merge each bounded batch in account order.
+  for(let start=0;start<paths.length;start+=8){
+    const results=await Promise.all(paths.slice(start,start+8).map(async file=>{
+      try{
+        const stat=await fs.stat(file);if(stat.size>2*1024*1024)throw Error('oversize');
+        const value=JSON.parse(await fs.readFile(file,'utf8'));
+        if(!value?.days||typeof value.days!=='object'||Array.isArray(value.days))throw Error('invalid');
+        return {value};
+      }catch(error){return {unreadable:error.code!=='ENOENT'};}
+    }));
+    for(const result of results){
+      if(result.value)merged=mergeUsage([result.value],merged);
+      else if(result.unreadable)unreadableAccounts++;
+    }
+  }
   const value={store:merged,accounts:users.length,unreadableAccounts,checkedAt:now};
   aggregateCache={signature,at:now,value};return value;
 }

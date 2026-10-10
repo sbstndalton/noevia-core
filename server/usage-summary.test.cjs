@@ -46,3 +46,21 @@ test('merged counters stay numeric and cannot carry prototype-shaped tool names'
  assert.equal(merged.days['2026-09-13'].hours[14],1);
  assert.equal({}.x,undefined);
 });
+
+test('aggregate model ties and fractional sums follow account order, not file completion (#1281)',async()=>{
+ const fs=require('node:fs'),path=require('node:path'),os=require('node:os');
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'noevia-usage-order-'));
+ const read=fs.promises.readFile;
+ try{
+  for(const [id,n]of [['a',Number.MAX_SAFE_INTEGER],['b',0.5],['c',0.5]]){
+   fs.mkdirSync(path.join(dir,id));fs.writeFileSync(path.join(dir,id,'usage.json'),JSON.stringify({days:{'2026-09-13':{input:n,models:{[id]:{input:1}}}}}));
+  }
+  const {aggregateUsage}=require('./usage-summary.cjs');
+  for(const slow of ['a','b']){
+   fs.promises.readFile=async(...args)=>{if(path.basename(path.dirname(args[0]))===slow)await new Promise(resolve=>setTimeout(resolve,15));return read.apply(fs.promises,args);};
+   const result=await aggregateUsage(['a','b','c'].map(id=>({id})),id=>path.join(dir,id),slow==='a'?100000:140000);
+   assert.deepEqual(summarizeUsage(result.store,options).models.map(x=>x.name),['a','b','c']);
+   assert.equal(result.unreadableAccounts,0);
+  }
+ }finally{fs.promises.readFile=read;fs.rmSync(dir,{recursive:true,force:true});}
+});

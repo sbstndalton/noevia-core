@@ -7,9 +7,17 @@
 // this file only decides who may ask for which scope.
 const { summarizeUsage, aggregateUsage } = require('../usage-summary.cjs');
 
-function createUsageRoutes({ readUsage, usageDayKey, retentionDays, workspace, listUsers, userDir, json }) {
+// Only the supervisor confirms a compiled native owner. Recording remains Node-owned.
+function enabledFrom(env = process.env) {
+  return env.NOEVIA_FRONT === 'rust' && env.NOEVIA_RUST_AUTH === '1'
+    && env.NOEVIA_RUST_AUTH_CONFIRMED === '1' && env.NOEVIA_RUST_USAGE === '1'
+    && env.NOEVIA_RUST_USAGE_CONFIRMED === '1';
+}
+function createUsageRoutes({ readUsage, usageDayKey, retentionDays, workspace, listUsers, userDir, json, env = process.env }) {
+  const rustOwned = enabledFrom(env);
   return async function usageRoutes(req, res, { path, authn }) {
     if (path !== '/api/usage' && path !== '/api/usage/aggregate') return false;
+    if (rustOwned) return json(res, 503, { error: 'Usage reporting is owned by the Rust front.' }), true;
     if (req.method !== 'GET') return json(res, 405, { error: 'method not allowed' }), true;
 
     const everyone = path === '/api/usage/aggregate';
@@ -34,4 +42,4 @@ function createUsageRoutes({ readUsage, usageDayKey, retentionDays, workspace, l
   };
 }
 
-module.exports = { createUsageRoutes };
+module.exports = { createUsageRoutes, enabledFrom };

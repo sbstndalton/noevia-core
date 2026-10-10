@@ -50,3 +50,14 @@ test('anything that is not a usage GET is left alone or refused by method', asyn
   await f.routes({ method: 'POST' }, {}, { path: '/api/usage', authn: f.authn });
   assert.equal(f.sent[0].status, 405);
 });
+
+test('confirmed Rust usage ownership refuses every Node reporting method without reading',async()=>{
+ const {enabledFrom}=require('./usage.cjs');
+ const env={NOEVIA_FRONT:'rust',NOEVIA_RUST_AUTH:'1',NOEVIA_RUST_AUTH_CONFIRMED:'1',NOEVIA_RUST_USAGE:'1',NOEVIA_RUST_USAGE_CONFIRMED:'1'};
+ assert.equal(enabledFrom(env),true);
+ for(const key of Object.keys(env))assert.equal(enabledFrom({...env,[key]:'0'}),false,key);
+ const routes=createUsageRoutes({env,json:(res,status,body)=>{res.status=status;res.body=body;},readUsage:()=>{throw Error('Node reporting ran');}});
+ for(const path of ['/api/usage','/api/usage/aggregate'])for(const method of ['GET','HEAD','POST','DELETE']){
+  const res={};assert.equal(await routes({method},res,{path,authn:{user:{role:'admin'}}}),true);assert.equal(res.status,503);
+ }
+});
