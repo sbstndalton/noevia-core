@@ -85,7 +85,7 @@ class Client {
     const csrf = this.jar.get('cowork_csrf');
     if (csrf && !['GET', 'HEAD'].includes(method)) headers['X-CSRF-Token'] = csrf;
     if (body !== undefined) headers['Content-Type'] = 'application/json';
-    const res = await fetch(this.base + p, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), redirect: 'manual' });
+    const res = await fetch(this.base + p, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), redirect: 'manual', signal: AbortSignal.timeout(60000) });
     for (const c of res.headers.getSetCookie()) {
       const [pair] = c.split(';'); const eq = pair.indexOf('=');
       const name = pair.slice(0, eq).trim(); const value = pair.slice(eq + 1).trim();
@@ -125,6 +125,25 @@ const PROBES = [
   '/api/providers', '/api/providers/chatgpt', '/api/providers/{providerId}/models', '/api/reasoning-settings', '/api/routing-default', '/api/routing-mode', '/api/routing-mode/allowed',
   '/api/sampling-settings', '/api/stats', '/api/toolboxes', '/api/toolboxes/permitted', '/api/usage', '/api/usage/aggregate',
   '/api/projects/{projectId}/browser', '/api/projects/{projectId}/code', '/api/projects/{projectId}/instruction-skills', '/api/projects/{projectId}/instruction-skills/manifests', '/api/projects/{projectId}/research',
+];
+
+// Validation-path probes for writes no scenario step makes: an empty or minimal body on the
+// throwaway data dir. Anything they would reach outside loopback is refused by net-guard.cjs.
+// Left out on purpose: offsite-backup run/copy/google connect, gdrive connect/backup-copy and
+// uploads (multipart), which start flows a probe cannot finish.
+const WRITE_PROBES = [
+  ['POST', '/api/admin/decision-settings/test', {}], ['POST', '/api/admin/mcp-directory/custom/preview', {}],
+  ['POST', '/api/admin/offsite-backup/verify', {}], ['POST', '/api/auth/device/lookup', { code: 'ABCD-EFGH' }],
+  ['POST', '/api/auth/login/passkey/options', { username: 'synthetic-admin' }], ['POST', '/api/auth/passkeys/register/options', {}],
+  ['POST', '/api/auth/recovery/complete', { token: 'not-a-recovery-token', password: 'x' }],
+  ['POST', '/api/chat-framing/suggest', {}], ['POST', '/api/connectors/gdrive/disconnect', {}],
+  ['POST', '/api/integrations/storage/test', { kind: 'local' }], ['POST', '/api/models/estimate', {}],
+  ['POST', '/api/models/presets/reload', {}], ['POST', '/api/models/autotune/cancel', {}], ['POST', '/api/models/calibration/cancel', {}],
+  ['POST', '/api/providers/test', {}], ['PUT', '/api/profile/features', { diaryEnabled: false }],
+  ['GET', '/api/diary/today'], ['GET', '/api/integrations/storage/files'], ['GET', '/api/export/conversations'],
+  ['DELETE', '/api/auth/sessions/missing-session-id'], ['DELETE', '/api/auth/passkeys/missing-passkey-id'],
+  ['DELETE', '/api/auth/devices/missing-device-id'], ['DELETE', '/api/profile/app-passwords/missing-app-password'],
+  ['DELETE', '/api/freechats/missing-free-chat'],
 ];
 
 async function main() {
@@ -230,10 +249,13 @@ async function main() {
     const fill = { projectId, providerId: 'default', chatId: chatId || 'missing-chat' };
     for (const p of PROBES) await step(admin, 'GET', p.replace(/\{(\w+)\}/g, (_, k) => encodeURIComponent(fill[k] || k)));
 
+    for (const [method, p, body] of WRITE_PROBES) await step(admin, method, p, body);
+
     // Clean-up is part of the contract too.
     if (chatId) await step(admin, 'DELETE', `/api/projects/${encodeURIComponent(projectId)}/chats/${encodeURIComponent(chatId)}`);
     await step(admin, 'DELETE', `/api/projects/${encodeURIComponent(projectId)}`);
     await step(admin, 'GET', '/api/workspace', undefined, [200]);
+    if (memberId) await step(admin, 'DELETE', `/api/admin/users/${encodeURIComponent(memberId)}`, { username: MEMBER.username });
     covered.push(...new Set(steps.map((s) => `${s.method} ${s.path}`)));
   } finally {
     child.kill('SIGTERM');
