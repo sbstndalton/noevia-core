@@ -114,8 +114,10 @@ async function scenario(front, mode, workerBase, fixtures, root, calls) {
     assert.ok(large.bytes <= 25 * 1024 * 1024);
     assert.equal(large.attachment.reduction.originalBytes, fs.statSync(path.join(fixtures, 'large.pdf')).size);
     assert.ok(['pdf', 'text'].includes(large.attachment.reduction.kind));
-    const project = await admin.call('GET', route);
-    const files = project.files || project.project?.files; assert.ok(Array.isArray(files));
+    const workspace = await admin.call('GET', '/api/workspace');
+    const project = workspace.projects.find(item => item.id === id);
+    assert.ok(project, 'synthetic project must be present in its tenant workspace');
+    const files = project.files; assert.ok(Array.isArray(files));
     assert.ok(files.find(file => file.name === 'body.docx')?.content.includes('SYNTHETIC DOCX REF 1271'));
     assert.ok(files.find(file => file.name === large.path)?.content.includes('SYNTHETIC NATIVE TEXT FOR REDUCTION'));
     const invite = await admin.call('POST', '/api/admin/invitations', { role: 'member' }, 201);
