@@ -205,7 +205,8 @@ async function main() {
     await step(admin, 'PUT', '/api/account/memory', { memories: ['Likes tea', ' Likes   tea ', 'Works nights'], useProjectMemories: false }, [200]);
     await step(admin, 'GET', '/api/account/memory', undefined, [200]);
     await step(admin, 'PUT', '/api/account/memory', { memories: 'not a list' }, [400]);
-    await step(admin, 'PUT', '/api/account/preferences', { sendKey: 'mod-enter', notifications: { replyFinished: false } }, [200]);
+    // Not sendKey: the recorder treats a `*Key` field as a secret, so a replay would type a stand-in.
+    await step(admin, 'PUT', '/api/account/preferences', { locale: 'nb-NO', notifications: { replyFinished: false } }, [200]);
     await step(admin, 'PUT', '/api/account/preferences', { locale: 'xx-XX' }, [400]);
     await step(admin, 'GET', '/api/account/preferences', undefined, [200]);
     await step(admin, 'PUT', '/api/profile/features', { diaryEnabled: true }, [200]);
@@ -222,7 +223,8 @@ async function main() {
     // A recovery link replaces the member's password and revokes the member's session.
     if (memberId) {
       const rec = await step(admin, 'POST', `/api/admin/users/${encodeURIComponent(memberId)}/recovery`, undefined, [201]);
-      await step(anon, 'POST', '/api/auth/recovery/complete', { token: rec.json.token, password: 'pw' }, [400]);
+      // Empty, so it stays literal: a non-empty password is a secret the replay types a long stand-in for.
+      await step(anon, 'POST', '/api/auth/recovery/complete', { token: rec.json.token, password: '' }, [400]);
       await step(anon, 'POST', '/api/auth/recovery/complete', { token: rec.json.token, password: RECOVERED }, [200]);
       await step(anon, 'POST', '/api/auth/recovery/complete', { token: rec.json.token, password: RECOVERED }, [400]);
       await step(member, 'GET', '/api/auth/session', undefined, [401]);
