@@ -106,6 +106,12 @@ test('the micro-batch check: the port saying it exceeds, or not deciding, refuse
     { status: 400, message: 'Micro batch cannot exceed batch size' });
 });
 
+test('#1248: prepare() compares an unset batch-size against the default 2048', (t) => {
+  const file = fixture(t);
+  assert.throws(() => store(file, {}).prepare(body(file, { 'ubatch-size': '2049' })), { status: 400, message: 'Micro batch cannot exceed batch size' });
+  assert.doesNotThrow(() => store(file, {}).prepare(body(file, { 'ubatch-size': '2048' })));
+});
+
 test('a model name that is not a string is refused under js and wasm alike (noevia#1231)', (t) => {
   const file = fixture(t);
   for (const model of [123, ['synthetic']]) {

@@ -52,7 +52,9 @@ function optionValue(key,value,limits){
  *  null/undefined value): [field or null, trimmed value or null]. */
 const canonicalEntry=(key,value)=>[canonical(key.trim().replace(/^-+/,''))??null,value===null?null:value.trim()];
 /** prepare()'s micro-batch check over the effective values (strings or undefined). */
-const microBatchExceeds=(ubatch,batch)=>Number(ubatch)>Number(batch);
+// #1248: llama.cpp's own batch size is 2048 when none is set, so an unset batch-size is compared as that.
+const DEFAULT_BATCH_SIZE=2048;
+const microBatchExceeds=(ubatch,batch)=>Number(ubatch)>Number(batch===undefined||batch===null||batch===''?DEFAULT_BATCH_SIZE:batch);
 const error=(status,message)=>Object.assign(Error(message),{status});
 const revision=text=>crypto.createHash('sha256').update(text).digest('hex');
 // #874: recovery copies `<file>.noevia-backup-<revision>` are whole-file snapshots taken before each

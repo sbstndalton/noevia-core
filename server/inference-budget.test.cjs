@@ -615,3 +615,13 @@ test('#1234: a preset save with ubatch-size above batch-size is refused as inval
   }
   assert.notEqual((await manager.presetRefusal('small', { 'ubatch-size': '2048', 'batch-size': '2048', 'cache-ram': '0' }))?.code, 'invalid_size');
 });
+
+test('#1248: with batch-size unset the micro batch is compared against llama.cpp default batch of 2048', async (t) => {
+  const { manager } = fixture(t, { budget: 64 });
+  for (const v of ['2049', '99999']) {
+    const r = await manager.presetRefusal('small', { 'ubatch-size': v, 'cache-ram': '0' });
+    assert.equal(r?.code, 'invalid_size', v); assert.equal(r.error, 'Not saved: Micro batch cannot exceed batch size');
+  }
+  for (const v of ['512', '2048']) assert.notEqual((await manager.presetRefusal('small', { 'ubatch-size': v, 'cache-ram': '0' }))?.code, 'invalid_size', v);
+  assert.notEqual((await manager.presetRefusal('small', { 'ubatch-size': '4096', 'batch-size': '8192', 'cache-ram': '0' }))?.code, 'invalid_size', 'an explicit larger batch still allows it');
+});
