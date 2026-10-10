@@ -20,8 +20,8 @@ jobs:
       - name: Fetch verified native usage acceptance source
         run: |
           set -euo pipefail
-          curl -fsSL https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/54365851e2645de84ba0681a4391ef1673c824eb -o "$RUNNER_TEMP/usage-rs.tgz"
-          echo "171402c6868a400469e97ca83aade73ca979ea262d6ea590eb1f0c5c7ec84e54  $RUNNER_TEMP/usage-rs.tgz" | sha256sum -c -
+          curl -fsSL https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/83674e7cd31d60f2a967d4cf8e4dc4e8db6db4b6 -o "$RUNNER_TEMP/usage-rs.tgz"
+          echo "5e28e9fddda428e1349d12697eb0e70e8777e69a8f8086fb6e38284625082262  $RUNNER_TEMP/usage-rs.tgz" | sha256sum -c -
           mkdir rs
           tar -xzf "$RUNNER_TEMP/usage-rs.tgz" --strip-components=1 -C rs
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
