@@ -222,7 +222,7 @@ async function main() {
     // A recovery link replaces the member's password and revokes the member's session.
     if (memberId) {
       const rec = await step(admin, 'POST', `/api/admin/users/${encodeURIComponent(memberId)}/recovery`, undefined, [201]);
-      await step(anon, 'POST', '/api/auth/recovery/complete', { token: rec.json.token, password: 'short' }, [400]);
+      await step(anon, 'POST', '/api/auth/recovery/complete', { token: rec.json.token, password: 'pw' }, [400]);
       await step(anon, 'POST', '/api/auth/recovery/complete', { token: rec.json.token, password: RECOVERED }, [200]);
       await step(anon, 'POST', '/api/auth/recovery/complete', { token: rec.json.token, password: RECOVERED }, [400]);
       await step(member, 'GET', '/api/auth/session', undefined, [401]);
