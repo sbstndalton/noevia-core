@@ -83,6 +83,7 @@ async function ingest(workspace, project, name, bytes, { connection, source, rem
   // old model input. Otherwise chat silently describes the previous bytes.
   // The replaced asset is retired, not forgotten: prune() keeps its bytes while a chat still
   // references its id (#218).
+  refreshShared(workspace);
   retire(project, (project.assets || []).filter(a => a.sourceName === fullName));
   project.assets = (project.assets || []).filter(a => a.sourceName !== fullName);
   if (mime) {
@@ -117,7 +118,14 @@ function referencedAssets(workspace, project, candidates) {
   }
   return found;
 }
+// M4 (rust-projects.cjs): while projects.json is shared with the Rust front, re-read it before
+// filtering a project's image lists, so a writer that awaited (ingest) filters the current lists.
+// Refreshes the held project object in place; the save after still merges under the lock.
+function refreshShared(workspace) {
+  if (workspace && workspace.projectsFile && Array.isArray(workspace.projects)) workspace.projectsFile.refresh(workspace.projects);
+}
 function prune(workspace, project) {
+  refreshShared(workspace);
   const dir = directory(workspace, project.id);
   if (fs.existsSync(dir)) {
     const keep = new Set((project.files || []).map(f => f.attachment?.id).filter(Boolean));
