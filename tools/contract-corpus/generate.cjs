@@ -203,6 +203,8 @@ async function main() {
     child.kill('SIGTERM');
     await new Promise((r) => (child.exitCode !== null ? r() : child.once('exit', r)));
     mocks.close();
+    // The throwaway data dir goes whether or not the run got through.
+    fs.rmSync(dataDir, { recursive: true, force: true });
   }
 
   // Inputs the replayer must supply: values a client typed (passwords) or read out of band (the
@@ -241,7 +243,6 @@ async function main() {
     for (const v of raw) if (text.includes(v)) throw new Error(`${f} holds a raw secret`);
     if (/cowork_(session|csrf)=(?!<secret:)[^;"\s]/.test(text)) throw new Error(`${f} holds a raw cookie`);
   }
-  fs.rmSync(dataDir, { recursive: true, force: true });
   console.log(`contract corpus: ${files.length} exchanges (${dropped.length} dropped) from ${steps.length} steps in ${out}`);
   if (dropped.length) process.exitCode = 1;
 }
