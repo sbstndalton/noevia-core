@@ -150,6 +150,12 @@ jobs:
       # noevia-rs contracts/http/corpus is refreshed from.
       - name: Record the synthetic HTTP contract corpus
         run: node tools/contract-corpus/generate.cjs --out "$RUNNER_TEMP/contract-corpus"
+      # A replay can only be clean if Node agrees with itself: a second run on a new data dir must
+      # record the same normalised corpus (the diff shows placeholders, never secret values).
+      - name: A second recording is identical
+        run: |
+          node tools/contract-corpus/generate.cjs --out "$RUNNER_TEMP/contract-corpus-2" > /dev/null
+          diff -r "$RUNNER_TEMP/contract-corpus" "$RUNNER_TEMP/contract-corpus-2"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: contract-corpus
