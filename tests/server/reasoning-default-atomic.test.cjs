@@ -1,7 +1,9 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const Database = require('better-sqlite3');
+const { createRequire } = require('node:module');
+const serverRequire = createRequire(require.resolve('../../server/auth.cjs'));
+const Database = serverRequire('better-sqlite3');
 const { createReasoningSettingsRoutes } = require('../../server/routes/reasoning-settings.cjs');
 const reasoningEffort = require('../../server/reasoning-effort.cjs');
 function fixture() {
