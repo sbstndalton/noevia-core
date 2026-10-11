@@ -53,8 +53,9 @@ function modelIdsFrom(body, max = MODEL_LIST_MAX) {
  * @param {object} deps.registry   providers.cjs
  * @param {object|null} [deps.chatgptOAuth]   chatgpt-oauth.cjs; null leaves Sign in with ChatGPT out entirely
  * @param {() => boolean} [deps.chatgptEnabled]   features.enabled('chatgptOAuth')
+ * @param {() => boolean} [deps.chatgptStatusOwned]   confirmed native GET handoff
  */
-function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApproved, PROVIDERS, PROJECTS, DEFAULT_PROVIDER_ID, modelManager, currentWorkspace, saveProjects, registry, chatgptOAuth = null, chatgptEnabled = () => false, now = () => Date.now() }) {
+function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApproved, PROVIDERS, PROJECTS, DEFAULT_PROVIDER_ID, modelManager, currentWorkspace, saveProjects, registry, chatgptOAuth = null, chatgptEnabled = () => false, chatgptStatusOwned = () => false, now = () => Date.now() }) {
   const { saveProviders, saveSharedProviders, maskKey } = registry;
   const { parseContextTokens, validContextTokens, parseCapabilities, effectiveCapabilities } = require('../providers.cjs');
   const chatgpt = require('../chatgpt-oauth.cjs');
@@ -82,6 +83,11 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
   }
 
   async function handleChatGpt(req, res, p, authn) {
+    // The main router's auth/browser gate has already run. Never execute Node
+    // status when a selected native GET reaches this mount through a failed front.
+    if (p === '/api/providers/chatgpt' && req.method === 'GET' && chatgptStatusOwned()) {
+      return json(res, 503, { error: 'ChatGPT status is owned by the Rust front.', code: 'RUST_CHATGPT_STATUS_OWNED' });
+    }
     if (!chatgptOn()) return json(res, 404, { error: 'Sign in with ChatGPT is turned off on this server.' });
     const userId = authn?.user?.id;
     if (!userId) return json(res, 401, { error: 'Sign in to noevia first.' });

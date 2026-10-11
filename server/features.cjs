@@ -89,6 +89,14 @@ function unavailableId(name, reason) {
 
 const SETTING_PREFIX = 'feature:';
 
+// This GET handoff needs the same confirmed RustAuth owner as the front. The
+// supervisor must scrub inherited confirmations and validate both capabilities.
+function rustChatgptStatusOwned(env = process.env) {
+  return env.NOEVIA_RUST_CHATGPT_STATUS === '1'
+    && env.NOEVIA_RUST_CHATGPT_STATUS_CONFIRMED === '1'
+    && require('./rust-auth.cjs').enabledFrom(env, () => {});
+}
+
 function parseEnv(raw) {
   if (raw === undefined || raw === null || String(raw).trim() === '') return undefined;
   const value = String(raw).trim().toLowerCase();
@@ -151,6 +159,18 @@ function createFeatures({ env = process.env, store = null, audit = () => {}, reg
     state.set('routingModes', { ...s, value: valid ? saved === 'true' : false, source: valid ? 'admin' : 'default' });
   };
   const known = name => state.has(name);
+  // Native status reads only typed SQLite truth for this product flag. Keep the
+  // Node writers synchronized even when a committed save reports a later error.
+  const refreshChatgptOAuth = () => {
+    if (!store || !state.has('chatgptOAuth') || !rustChatgptStatusOwned(env)) return;
+    const s = state.get('chatgptOAuth');
+    if (s.source === 'env') return;
+    let saved;
+    try { saved = store.get(SETTING_PREFIX + 'chatgptOAuth'); }
+    catch { throw Object.assign(new Error('ChatGPT feature settings are unavailable.'), { status: 503 }); }
+    const valid = saved === 'true' || saved === 'false';
+    state.set('chatgptOAuth', { ...s, value: valid ? saved === 'true' : false, source: valid ? 'admin' : 'default' });
+  };
   const unavailable = name => availability[name] ? availability[name]() : state.get(name).unavailable;
   return {
     names: () => [...state.keys()],
@@ -158,16 +178,17 @@ function createFeatures({ env = process.env, store = null, audit = () => {}, reg
     resolve,
     enabled(name) {
       refreshRoutingModes();
+      refreshChatgptOAuth();
       name = resolve(name);
       if (!known(name)) throw new Error(`Unknown feature: ${name}`);
       const s = state.get(name);
       return !unavailable(name) && (registry[name].restart ? s.boot : s.value);
     },
     /** Booleans only: safe to send to any signed-in user. */
-    flags: () => { refreshRoutingModes(); return Object.fromEntries([...state].map(([name, s]) => [name, !unavailable(name) && (registry[name].restart ? s.boot : s.value)])); },
+    flags: () => { refreshRoutingModes(); refreshChatgptOAuth(); return Object.fromEntries([...state].map(([name, s]) => [name, !unavailable(name) && (registry[name].restart ? s.boot : s.value)])); },
     // `id` is the flag name: the stable key the client translates the label and description by
     // (features.item.<id>.*, #618). `label` and `description` remain the English fallback.
-    describe: () => { refreshRoutingModes(); return [...state].map(([name, s]) => ({ id: name, name, label: registry[name].label, description: registry[name].description,
+    describe: () => { refreshRoutingModes(); refreshChatgptOAuth(); return [...state].map(([name, s]) => ({ id: name, name, label: registry[name].label, description: registry[name].description,
       enabled: s.value, source: s.source, locked: s.source === 'env', env: registry[name].env,
       ...(registry[name].experimental ? { experimental: true, unavailable: unavailable(name), unavailableId: unavailableId(name, unavailable(name)) }
         : registry[name].unavailable ? { unavailable: unavailable(name), unavailableId: unavailableId(name, unavailable(name)) } : {}),
@@ -192,11 +213,11 @@ function createFeatures({ env = process.env, store = null, audit = () => {}, reg
 /** The auth database's key/value settings table as a feature store. */
 function settingsStore(db) {
   return {
-    get: key => key === 'feature:routingModes'
+    get: key => key === 'feature:routingModes' || key === 'feature:chatgptOAuth'
       ? db.prepare("SELECT CASE WHEN typeof(value)='text' AND value IN ('true','false') THEN value ELSE NULL END AS value FROM settings WHERE key=?").get(key)?.value
       : db.prepare('SELECT value FROM settings WHERE key=?').get(key)?.value,
     set: (key, value) => db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run(key, value),
   };
 }
 
-module.exports = { browserRuntimeReason, codeSandboxReason, unavailableId, REGISTRY, createFeatures, settingsStore, parseEnv, migrateLegacySetting };
+module.exports = { browserRuntimeReason, codeSandboxReason, unavailableId, REGISTRY, createFeatures, settingsStore, parseEnv, migrateLegacySetting, rustChatgptStatusOwned };

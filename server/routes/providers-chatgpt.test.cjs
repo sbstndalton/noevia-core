@@ -179,3 +179,93 @@ test('review: too many sign-in starts answer 429 through the route', async (t) =
   assert.equal(sixth.status, 429);
   assert.match(sixth.body.error, /Too many ChatGPT sign-in attempts/);
 });
+
+function nativeStatusFixture({ env, enabled = () => true } = {}) {
+  const { rustChatgptStatusOwned } = require('../features.cjs');
+  const calls = { status: 0, disconnect: 0, device: 0, poll: 0, cancel: 0, models: 0 };
+  const sent = [];
+  const oauth = {
+    status: () => { calls.status++; return { state: 'disconnected' }; },
+    disconnect: () => { calls.disconnect++; },
+    startDeviceLogin: async () => { calls.device++; return { state: 'sentinel-device' }; },
+    pollDeviceLogin: async () => { calls.poll++; return { state: 'pending' }; },
+    cancelDeviceLogin: () => { calls.cancel++; return true; },
+    listModels: async () => { calls.models++; return ['sentinel-model']; },
+  };
+  const routes = createProviderRoutes({
+    json: (_res, status, body) => { sent.push({ status, body }); },
+    readJson: async () => ({ loginId: 'synthetic' }), readBody: async () => '{}',
+    fetchJson: async () => { throw new Error('unexpected network collaborator'); },
+    endpointApproved: () => false, PROVIDERS: [], PROJECTS: [], DEFAULT_PROVIDER_ID: 'default',
+    modelManager: { enabled: false }, currentWorkspace: () => ({ removeProvider: () => false }), saveProjects: () => {},
+    registry: { saveProviders: () => {}, saveSharedProviders: () => {}, maskKey: () => null },
+    chatgptOAuth: oauth, chatgptEnabled: enabled,
+    chatgptStatusOwned: () => rustChatgptStatusOwned(env),
+  });
+  const call = async (method, target) => {
+    const req = { method, url: target, headers: {} };
+    const url = require('../http.cjs').parseRequestUrl(req);
+    const handled = await routes(req, {}, { path: url.pathname, url, authn: { user: { id: 'synthetic-owner', role: 'member' } } });
+    return handled ? sent.pop() : null;
+  };
+  return { call, calls };
+}
+const confirmedStatusEnv = () => ({ NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_AUTH_CONFIRMED: '1', NOEVIA_RUST_CHATGPT_STATUS: '1', NOEVIA_RUST_CHATGPT_STATUS_CONFIRMED: '1' });
+
+test('native ChatGPT status: exact GET refuses before product and never falls back', async () => {
+  const first = nativeStatusFixture({ env: confirmedStatusEnv(), enabled: () => false });
+  assert.equal((await first.call('GET', '/api/providers/chatgpt')).status, 503, 'M6_STATUS_POLICY:owned_get');
+  const refusal = { status: 503, body: { error: 'ChatGPT status is owned by the Rust front.', code: 'RUST_CHATGPT_STATUS_OWNED' } };
+  for (const enabled of [() => false, () => true, () => { throw new Error('product must not run for owned GET'); }]) {
+    const f = nativeStatusFixture({ env: confirmedStatusEnv(), enabled });
+    for (const target of ['/api/providers/chatgpt', '/api/providers/chatgpt?query=synthetic', '/api/providers/x/../chatgpt', '/api/providers/%2e/chatgpt']) {
+      assert.deepEqual(await f.call('GET', target), refusal);
+    }
+    assert.equal(f.calls.status, 0);
+  }
+  const owned = nativeStatusFixture({ env: confirmedStatusEnv() });
+  for (const [method, target, status] of [
+    ['get', '/api/providers/chatgpt', 405], ['HEAD', '/api/providers/chatgpt', 405], ['OPTIONS', '/api/providers/chatgpt', 405],
+    ['POST', '/api/providers/chatgpt', 405], ['GET', '/api/providers/chatgpt/', 405], ['GET', '/api/providers/chatgpt/sibling', 405],
+    ['GET', '/api/providers/chatgpt/models', 200], ['POST', '/api/providers/chatgpt/device', 200],
+    ['POST', '/api/providers/chatgpt/device/poll', 200], ['POST', '/api/providers/chatgpt/device/cancel', 200],
+    ['DELETE', '/api/providers/chatgpt', 200],
+  ]) assert.equal((await owned.call(method, target)).status, status, `${method} ${target}`);
+  assert.equal(await owned.call('GET', '/api/providers/chatgpt-sibling'), null);
+  assert.deepEqual(owned.calls, { status: 0, disconnect: 1, device: 1, poll: 1, cancel: 1, models: 1 });
+  for (const env of [{}, { ...confirmedStatusEnv(), NOEVIA_FRONT: 'node' }, { ...confirmedStatusEnv(), NOEVIA_RUST_CHATGPT_STATUS: '0' }, { ...confirmedStatusEnv(), NOEVIA_RUST_AUTH_CONFIRMED: '0' }, { ...confirmedStatusEnv(), NOEVIA_RUST_CHATGPT_STATUS_CONFIRMED: '0' }]) {
+    const f = nativeStatusFixture({ env });
+    assert.equal((await f.call('GET', '/api/providers/chatgpt')).status, 200);
+    assert.equal(f.calls.status, 1, 'Node retains status only while the handoff is unconfirmed');
+  }
+});
+
+test('native ChatGPT status: Node writes use current feature truth and device gate stays prior', async () => {
+  const { createFeatures, REGISTRY } = require('../features.cjs');
+  const rows = new Map([['feature:chatgptOAuth', 'true']]);
+  const store = { get: key => rows.get(key), set: (key, value) => { rows.set(key, value); } };
+  const features = createFeatures({ env: confirmedStatusEnv(), store, registry: { chatgptOAuth: REGISTRY.chatgptOAuth } });
+  const f = nativeStatusFixture({ env: confirmedStatusEnv(), enabled: () => features.enabled('chatgptOAuth') });
+  rows.set('feature:chatgptOAuth', 'false');
+  assert.equal((await f.call('POST', '/api/providers/chatgpt/device')).status, 404);
+  assert.equal(f.calls.device, 0);
+  rows.set('feature:chatgptOAuth', 'true');
+  assert.equal((await f.call('POST', '/api/providers/chatgpt/device')).status, 200);
+  store.set = (key, value) => { rows.set(key, value); throw new Error('synthetic committed write then throw'); };
+  assert.throws(() => features.set('chatgptOAuth', false, 'synthetic'), /committed write/);
+  assert.equal((await f.call('POST', '/api/providers/chatgpt/device')).status, 404);
+  assert.equal(f.calls.device, 1, 'a failed cache update cannot start a second Node sign-in');
+  store.get = () => { throw new Error('synthetic read failure'); };
+  await assert.rejects(() => f.call('POST', '/api/providers/chatgpt/device'), e => e.status === 503);
+  assert.equal(f.calls.device, 1);
+  assert.equal((await f.call('GET', '/api/providers/chatgpt')).status, 503, 'the native handoff precedes feature read failures');
+
+  // Actual request-auth collaborator methods, without starting index.cjs or reimplementing its gate.
+  const { createRequestAuth } = require('../device-auth.cjs');
+  const device = { user: { id: 'synthetic-owner' }, device: { id: 'synthetic-device' } };
+  const browser = { user: { id: 'synthetic-owner' }, session: { id: 'synthetic-session' } };
+  const gate = createRequestAuth({ enabled: () => true, deviceAuth: { authenticate: () => device }, authService: { authenticate: () => browser, csrfValid: () => true } });
+  assert.equal(gate.browserOnly(gate.authenticate({ headers: { authorization: 'Bearer nva_synthetic' } }), '/api/providers/chatgpt', 'GET'), true);
+  assert.equal(gate.authenticate({ headers: { authorization: 'Bearer nva_synthetic', cookie: 'cowork_session=synthetic' } }), null);
+  assert.equal(gate.browserOnly(gate.authenticate({ headers: {} }), '/api/providers/chatgpt', 'GET'), false);
+});
