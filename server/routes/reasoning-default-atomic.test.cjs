@@ -2,10 +2,10 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { createRequire } = require('node:module');
-const serverRequire = createRequire(require.resolve('../../server/auth.cjs'));
+const serverRequire = createRequire(require.resolve('../auth.cjs'));
 const Database = serverRequire('better-sqlite3');
-const { createReasoningSettingsRoutes } = require('../../server/routes/reasoning-settings.cjs');
-const reasoningEffort = require('../../server/reasoning-effort.cjs');
+const { createReasoningSettingsRoutes } = require('./reasoning-settings.cjs');
+const reasoningEffort = require('../reasoning-effort.cjs');
 function fixture() {
   const db = new Database(':memory:');
   db.exec("CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL); CREATE TABLE audit_events(actor_user_id TEXT,target_user_id TEXT,action TEXT,detail TEXT,created_at INTEGER); INSERT INTO settings VALUES('reasoning_effort_default','low');");
