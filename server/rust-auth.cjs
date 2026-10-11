@@ -43,10 +43,15 @@ const SETTING_KEY_RE = /\bkey\s*=\s*'([^']*)'|VALUES\s*\(\s*'([^']*)'/i;
 
 /** `sql` without comments and string literals, so a quoted "DELETE FROM users" is not a write. */
 function scrub(sql) {
-  return String(sql)
-    .replace(/--[^\n]*/g, ' ')
-    .replace(/\/\*[\s\S]*?\*\//g, ' ')
-    .replace(/'(?:[^']|'')*'/g, "''");
+  // One token pass: comment delimiters inside quoted values/identifiers are not comments.
+  // SQLite accepts a single-quoted identifier in a table position. Preserve lexical identifier
+  // tokens as double-quoted names; a quoted write verb has no following whitespace, so ordinary
+  // string payloads cannot become a write. All non-identifier string contents are removed.
+  return String(sql).replace(/--[^\n]*|\/\*[\s\S]*?\*\/|"(?:[^"]|"")*"|`(?:[^`]|``)*`|\[[^\]]*\]|'(?:[^']|'')*'/g, (token) => {
+    if (token.startsWith('--') || token.startsWith('/*')) return ' ';
+    if (!token.startsWith("'")) return token;
+    return /^'[A-Za-z_][A-Za-z0-9_$]*'$/.test(token) ? `"${token.slice(1, -1)}"` : "''";
+  });
 }
 
 const unquote = (id) => id.replace(/^["`[]|["`\]]$/g, '').toLowerCase();
@@ -94,9 +99,9 @@ function statements(sql) {
   return String(sql).split(';').map((s) => s.trim()).filter(Boolean);
 }
 
-// Sampling is a distinct capability. Recognize only bounded, single-key SQL shapes used by
-// current Node callers; ambiguous writes may affect the native key and fail closed.
-function samplingKey(sql, args) {
+// Recognize only single-key SQL shapes proven by current Node callers. Other settings writes
+// may affect any native key and fail closed; this is not a general SQL parser.
+function singleSettingKey(sql, args) {
   const source = String(sql).trim().replace(/;$/, '').trim();
   const insert = /^(?:INSERT(?: OR (?:REPLACE|IGNORE))?|REPLACE) INTO settings\s*\(\s*key\s*,\s*value\s*\) VALUES\s*\(\s*(\?|'[^']*')\s*,\s*\?\s*\)$/i.exec(source);
   if (insert) {
@@ -124,27 +129,35 @@ function createRustAuthGuard({ enabled = false, samplingSettingsEnabled = false 
     if (enabled && exemptDepth === 0 && OWNED_TABLES.has(target.table)) refuse(target.table);
     if (target.table === 'settings') {
       if (samplingSettingsEnabled) {
-        const sampling = samplingKey(target.sql, args);
+        const sampling = singleSettingKey(target.sql, args);
         if (sampling === null || sampling === 'auto_sampling_presets_enabled') {
           throw Object.assign(new Error('Sampling settings are written by the Rust front'), { status: 503, code: 'RUST_SAMPLING_SETTINGS_OWNED' });
         }
       }
-      // A key bound as the first parameter (features.cjs settingsStore.set) is checked per run.
-      const first = args.length && typeof args[0] === 'object' && args[0] !== null && !Array.isArray(args[0]) ? args[0].key : (Array.isArray(args[0]) ? args[0][0] : args[0]);
-      const key = target.key ?? first;
-      if (enabled && exemptDepth === 0 && OWNED_SETTING_KEYS.has(String(key))) refuse(`settings key ${key}`);
+      if (enabled && exemptDepth === 0) {
+        const key = singleSettingKey(target.sql, args);
+        if (key === null || OWNED_SETTING_KEYS.has(key)) refuse(`settings key ${key ?? 'unknown'}`);
+      }
     }
   }
 
   const RUNS = new Set(['run', 'get', 'all', 'iterate']);
 
   function guardStatement(stmt, target) {
+    let boundArgs = null;
     const proxy = new Proxy(stmt, {
       get(t, prop) {
         const value = Reflect.get(t, prop, t);
         if (typeof value !== 'function') return value;
-        if (RUNS.has(prop)) return (...args) => { check(target, args); return value.apply(t, args); };
-        // bind(), pluck(), raw(), safeIntegers() return the statement itself: keep the guard on it.
+        if (RUNS.has(prop)) return (...args) => { check(target, boundArgs ?? args); return value.apply(t, args); };
+        if (prop === 'bind') return (...args) => {
+          const out = value.apply(t, args);
+          // SQLite has already copied its bindings. Snapshot the only supported bound key now,
+          // so later caller-array mutation cannot change the guard's view of that binding.
+          boundArgs = [Array.isArray(args[0]) ? [args[0][0]] : args[0]];
+          return out === t ? proxy : out;
+        };
+        // pluck(), raw(), safeIntegers() return the statement itself: keep the guard on it.
         return (...args) => { const out = value.apply(t, args); return out === t ? proxy : out; };
       },
     });
