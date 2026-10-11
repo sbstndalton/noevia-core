@@ -34,8 +34,10 @@ function createReasoningSettingsRoutes({ json, readBody, authService, getProject
         if (authn.user.role !== 'admin') return json(res,403,{error:'Administrator required'});
         let body; try { body = JSON.parse(await readBody(req)); } catch { return json(res,400,{error:'invalid JSON'}); }
         if (!reasoningEffort.validEffort(body.default)) return json(res,400,{error:'default must be default, low or high'});
-        authService.db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('reasoning_effort_default',?)").run(body.default);
-        authService.audit('reasoning.default',authn.user.id,null,{effort:body.default});
+        authService.db.transaction(() => {
+          authService.db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('reasoning_effort_default',?)").run(body.default);
+          authService.audit('reasoning.default',authn.user.id,null,{effort:body.default});
+        })();
         return json(res,200,{default:body.default});
       }
       return json(res,405,{error:'Method not allowed'});
