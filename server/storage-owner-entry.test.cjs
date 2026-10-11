@@ -122,7 +122,17 @@ test('M4_ENTRY/complete_original_index', { concurrency: false }, async t => {
     const secrets = createSecretStore(dir);
     // Existing genuine setup/session constructor, before index installs its native
     // auth guard. No fake authenticate/getStorage/saveStorage implementation.
-    auth = createAuth({ dataDir: dir, publicOrigin: 'http://localhost', secrets });
+    const realWarn = console.warn;
+    try {
+      console.warn = (...args) => {
+        if (args.length === 1 && typeof args[0] === 'string' && args[0].startsWith('FIRST-RUN SETUP CODE: ')) {
+          realWarn.call(console, 'FIRST-RUN SETUP CODE: [redacted synthetic fixture]');
+          return;
+        }
+        realWarn.apply(console, args);
+      };
+      auth = createAuth({ dataDir: dir, publicOrigin: 'http://localhost', secrets });
+    } finally { console.warn = realWarn; }
     const setupHeaders = {};
     const setupReq = { headers: { origin: 'http://localhost' }, socket: { remoteAddress: '127.0.0.1' } };
     const setup = await auth.setup(setupReq, { setHeader(name, value) { setupHeaders[name.toLowerCase()] = value; } }, {
