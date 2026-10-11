@@ -27,6 +27,15 @@ const PROVIDER_RE = /^[A-Za-z0-9_-]{1,80}$/;
 const FILE = 'routing-mode.json';
 const ALLOWED_KEY = 'routing_modes_allowed';
 
+function rustOwned(env = process.env) {
+  return env.NOEVIA_FRONT === 'rust' && env.NOEVIA_RUST_AUTH === '1'
+    && env.NOEVIA_RUST_AUTH_CONFIRMED === '1' && env.NOEVIA_RUST_ROUTING_MODE === '1'
+    && env.NOEVIA_RUST_ROUTING_MODE_CONFIRMED === '1';
+}
+function refuseNativeWrite(env) {
+  if (rustOwned(env)) throw Object.assign(Error('Routing settings are owned by the Rust front.'), { status: 503, code: 'RUST_ROUTING_MODE_OWNED' });
+}
+
 // ── Account settings ────────────────────────────────────────────────────────
 
 /** The stored setting, normalized. `mode: null` means "not chosen": routing behaves as before. */
@@ -60,7 +69,8 @@ function validate(body, allowed) {
   return normalize(body);
 }
 
-function write(dir, value) {
+function write(dir, value, env = process.env) {
+  refuseNativeWrite(env);
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, FILE), tmp = `${file}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(normalize(value)));
@@ -76,7 +86,8 @@ function allowedModes(store) {
   return [...MODES];
 }
 
-function setAllowedModes(store, list) {
+function setAllowedModes(store, list, env = process.env) {
+  refuseNativeWrite(env);
   if (!Array.isArray(list) || list.some((m) => !MODES.includes(m))) throw Object.assign(Error("allowed must list 'local', 'cloud' and/or 'hybrid'"), { status: 400 });
   const out = MODES.filter((m) => list.includes(m));
   store.set(ALLOWED_KEY, JSON.stringify(out));
@@ -389,5 +400,5 @@ function cloudModel(cloud, role) {
   return cloud[role] || cloud.smart || cloud.fast || cloud.code || '';
 }
 
-module.exports = { MODES, WHEN_SENSITIVE, OPTIONS, FILE, ALLOWED_KEY, normalize, read, write, validate, allowedModes, setAllowedModes,
+module.exports = { rustOwned, MODES, WHEN_SENSITIVE, OPTIONS, FILE, ALLOWED_KEY, normalize, read, write, validate, allowedModes, setAllowedModes,
   effectiveMode, projectOverride, withProjectOverride, preRule, hasDiaryContent, routerChunks, chunkCharsFor, ROUTER_CHUNK_CHARS, ROUTER_MAX_CHUNKS, routerMaxChunks, createSensitivity, resolveRoute, chatFlags, cloudModel, ibanValid, luhn };

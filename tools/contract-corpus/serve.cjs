@@ -29,6 +29,7 @@ async function main() {
   if (process.env.NOEVIA_RUST_SAMPLING_SETTINGS === '1') Object.assign(env, { NOEVIA_RUST_SAMPLING_SETTINGS: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_SAMPLING_SETTINGS_CONFIRMED: process.env.NOEVIA_RUST_SAMPLING_SETTINGS_CONFIRMED === '1' ? '1' : '' });
   // M6 default PUT is refused only after native auth and its capability are confirmed.
   if (process.env.NOEVIA_RUST_REASONING_SETTINGS === '1') Object.assign(env, { NOEVIA_RUST_REASONING_SETTINGS: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_REASONING_SETTINGS_CONFIRMED: process.env.NOEVIA_RUST_REASONING_SETTINGS_CONFIRMED === '1' ? '1' : '' });
+  if (process.env.NOEVIA_RUST_ROUTING_MODE === '1') Object.assign(env, { NOEVIA_RUST_ROUTING_MODE: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_ROUTING_MODE_CONFIRMED: process.env.NOEVIA_RUST_ROUTING_MODE_CONFIRMED === '1' ? '1' : '' });
   const child = spawn(process.execPath, ['--require', GUARD, SERVER], { env, stdio: ['ignore', 'ignore', 'pipe'] });
   // Server warnings go to stderr, minus the first-run setup code (the replayer reads it from the
   // data dir; a log is no place for it, synthetic or not).
@@ -42,4 +43,63 @@ async function main() {
   child.on('exit', (code) => { mocks.close(); process.exit(code ?? 0); });
 }
 
-main().catch((err) => { console.error(err.message); process.exit(1); });
+// Fixed actual-factory collaborator seam. Rust owns every input case, source check, output
+// assertion, hash and process lifetime. This branch never boots index.cjs or an engine.
+async function routingModeOracle() {
+  const fs = require('node:fs'), path = require('node:path'), os = require('node:os'), { Readable } = require('node:stream');
+  const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-routing-oracle-'));
+  const now = Date.now, warn = console.warn;
+  Date.now = () => 1800000000000; console.warn = () => {};
+  let auth;
+  try {
+    auth = require('../../server/auth.cjs').createAuth({ dataDir: dir, publicOrigin: 'http://127.0.0.1:8021', rpId: '127.0.0.1' });
+    const db = auth.db, http = require('../../server/http.cjs'), rm = require('../../server/routing-modes.cjs'), featureLib = require('../../server/features.cjs');
+    const actor = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+    db.prepare("INSERT INTO users(id,username,username_norm,display_name,role,password_hash,webauthn_user_id,created_at,updated_at) VALUES(?,?,?,?,?,'x','synthetic',1,1)").run(actor, 'synthetic', 'synthetic', 'Synthetic', 'admin');
+      const store = featureLib.settingsStore(db), out = [];
+    for (const c of input.cases) {
+      db.exec('DROP TRIGGER IF EXISTS routing_audit_abort; DELETE FROM settings; DELETE FROM audit_events;');
+      const file = path.join(dir, rm.FILE); fs.rmSync(file, { force: true });
+      if (c.file !== null) fs.writeFileSync(file, Buffer.from(c.file, 'hex'));
+      if (c.allowed !== null) store.set(rm.ALLOWED_KEY, c.allowed);
+      if (c.feature !== null) store.set('feature:routingModes', c.feature);
+      let features, featureError = null;
+      try { features = featureLib.createFeatures({ env: c.env, store, registry: { routingModes: featureLib.REGISTRY.routingModes }, audit: (action, id, detail) => auth.audit(action, id, id, detail) }); }
+      catch (e) { featureError = e.message; }
+      if (c.auditAbort) db.exec("CREATE TRIGGER routing_audit_abort BEFORE INSERT ON audit_events BEGIN SELECT RAISE(ABORT,'synthetic audit refusal'); END;");
+      if (c.featureUpdate !== null && features) { try { features.set('routingModes', c.featureUpdate, actor); } catch {} }
+      if (c.directFeature !== null) store.set('feature:routingModes', c.directFeature);
+      let response = null;
+      if (features) {
+        const route = require('../../server/routes/routing-mode.cjs').createRoutingModeRoutes({ json: http.json, readBody: http.readBody, enabled: () => features.enabled('routingModes'), currentWorkspace: () => ({ dir }), store, audit: (action, id, detail) => auth.audit(action, id, id, detail), env: c.routeEnv });
+        const req = c.readError ? Readable.from((async function* () { throw Error('synthetic read failure'); })()) : Readable.from([Buffer.from(c.body, 'hex')]); req.method = c.method;
+        const res = { writeHead: status => { response = { status }; }, end: raw => { response.body = JSON.parse(raw); } };
+        await route(req, res, { path: c.path, authn: { user: { id: actor, role: c.role } } });
+      }
+      let guardError = null;
+      if (c.guardAction) {
+        if (c.guardAction === 'indirect') db.exec("CREATE TEMP TABLE synthetic_routing_sink(x); CREATE TEMP TRIGGER synthetic_routing_write AFTER INSERT ON synthetic_routing_sink BEGIN INSERT OR REPLACE INTO settings VALUES('routing_modes_allowed','[]'); END;");
+        require('../../server/rust-auth.cjs').createRustAuthGuard({ routingModeEnabled: rm.rustOwned(c.routeEnv) }).install(db);
+        try {
+          if (c.guardAction === 'file') rm.write(dir, { mode: 'local' }, c.routeEnv);
+          else if (c.guardAction === 'allowed') rm.setAllowedModes(store, ['local'], c.routeEnv);
+          else if (c.guardAction === 'insert') db.prepare('INSERT OR REPLACE INTO settings VALUES(?,?)').run(rm.ALLOWED_KEY, '["local"]');
+          else if (c.guardAction === 'update') db.prepare("UPDATE settings SET value='[]' WHERE key='routing_modes_allowed'").run();
+          else if (c.guardAction === 'delete') db.prepare("DELETE FROM settings WHERE key='routing_modes_allowed'").run();
+          else if (c.guardAction === 'indirect') db.prepare('INSERT INTO synthetic_routing_sink VALUES(1)').run();
+          else if (c.guardAction === 'feature') store.set('feature:routingModes', 'true');
+          else throw Error('unsupported fixed routing guard collaborator');
+        } catch (e) { guardError = e.code || e.message; }
+      }
+      out.push({ response, featureError, featureEnabled: features ? features.enabled('routingModes') : null,
+        guardError,
+        featureDescription: features ? features.describe()[0] : null,
+        file: fs.existsSync(file) ? fs.readFileSync(file).toString('hex') : null,
+        allowed: store.get(rm.ALLOWED_KEY) ?? null, feature: store.get('feature:routingModes') ?? null,
+        audit: db.prepare('SELECT actor_user_id,target_user_id,action,detail,created_at FROM audit_events ORDER BY id').all().map(a => ({ ...a, detail: JSON.parse(a.detail) })) });
+    }
+    process.stdout.write(JSON.stringify(out));
+  } finally { auth?.db.close(); Date.now = now; console.warn = warn; fs.rmSync(dir, { recursive: true, force: true }); }
+}
+(process.argv[2] === '--routing-mode-oracle' ? routingModeOracle() : main()).catch((err) => { console.error(err.message); process.exit(1); });

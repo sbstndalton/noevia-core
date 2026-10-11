@@ -21,7 +21,7 @@ const PASS = Symbol('unhandled');
  * @param {{ get: (k:string) => string|undefined, set: (k:string, v:string) => void }} deps.store
  * @param {(action:string, actor:string, detail:object) => void} [deps.audit]
  */
-function createRoutingModeRoutes({ json, readBody, enabled, currentWorkspace, store, audit = () => {} }) {
+function createRoutingModeRoutes({ json, readBody, enabled, currentWorkspace, store, audit = () => {}, env = process.env }) {
   const rm = require('../routing-modes.cjs');
   async function readJsonBody(req, res) {
     try { return JSON.parse(await readBody(req)); } catch { json(res, 400, { error: 'invalid JSON' }); return PASS; }
@@ -29,6 +29,7 @@ function createRoutingModeRoutes({ json, readBody, enabled, currentWorkspace, st
   const view = (stored, allowed, admin) => ({ enabled: true, ...stored, mode: rm.effectiveMode(stored, allowed), storedMode: stored.mode, allowed, admin });
   async function handle(req, res, { path: p, authn }) {
     if (p !== '/api/routing-mode' && p !== '/api/routing-mode/allowed') return PASS;
+    if (rm.rustOwned(env)) return json(res, 503, { error: 'Routing settings are owned by the Rust front.' });
     const admin = authn?.user?.role === 'admin';
     if (p === '/api/routing-mode' && req.method === 'GET') {
       if (enabled() !== true) return json(res, 200, { enabled: false });
