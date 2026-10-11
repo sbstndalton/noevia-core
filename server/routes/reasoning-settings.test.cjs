@@ -13,7 +13,17 @@ function fixture() {
     json: (res, status, body) => { sent.push({ status, body }); },
     readBody: async (req) => { let s = ''; for await (const c of req) s += c; return s; },
     authService: {
-      db: { prepare: (sql) => (sql.startsWith('SELECT') ? { get: () => (settings.has('d') ? { value: settings.get('d') } : undefined) } : { run: (v) => settings.set('d', v) }) },
+      db: {
+        transaction: (fn) => (...args) => {
+          const before = new Map(settings), auditLength = audits.length;
+          try { return fn(...args); } catch (error) {
+            settings.clear();
+            for (const [key, value] of before) settings.set(key, value);
+            audits.length = auditLength;
+            throw error;
+          }
+        },
+        prepare: (sql) => (sql.startsWith('SELECT') ? { get: () => (settings.has('d') ? { value: settings.get('d') } : undefined) } : { run: (v) => settings.set('d', v) }) },
       audit: (...args) => audits.push(args),
     },
     getProject: (id) => (id === 'p1' ? { id: 'p1', provider: 'mine', model: 'm', reasoningEffort: 'high' } : null),
