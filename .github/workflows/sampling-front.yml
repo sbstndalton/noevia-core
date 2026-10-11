@@ -15,13 +15,13 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           path: core
-      # Immutable M6 acceptance input (rs #70), not a release pin.
+      # Merged rs #72 acceptance tooling (#1308), not a runtime release pin.
       # Independently downloaded twice; byte-identical archive hash.
       - name: Fetch verified native sampling settings acceptance source
         run: |
           set -euo pipefail
-          curl -fsSL https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/79b4f3c62be8336d7e73591d6746ce85f23b9e10 -o "$RUNNER_TEMP/sampling-rs.tgz"
-          echo "a760fc5c6ab8ec754c71f354ae4aebc378d185486c6fba78c4b4350647748236  $RUNNER_TEMP/sampling-rs.tgz" | sha256sum -c -
+          curl -fsSL https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/cfb5196f23942450c115cd6cb9891949207a14e0 -o "$RUNNER_TEMP/sampling-rs.tgz"
+          echo "02b37158aa057069809a1fb4966ea93e00c6ba91dd73f11f66bad5e4d9e25d96  $RUNNER_TEMP/sampling-rs.tgz" | sha256sum -c -
           mkdir rs
           tar -xzf "$RUNNER_TEMP/sampling-rs.tgz" --strip-components=1 -C rs
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
