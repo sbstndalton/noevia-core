@@ -112,7 +112,7 @@ function singleSettingKey(sql, args) {
   const del = /^DELETE FROM settings WHERE key='([^']*)'(?: AND value=\?)?$/i.exec(source);
   return del ? del[1] : null;
 }
-function createRustAuthGuard({ enabled = false, samplingSettingsEnabled = false } = {}) {
+function createRustAuthGuard({ enabled = false, samplingSettingsEnabled = false, reasoningSettingsEnabled = false } = {}) {
   let exemptDepth = 0;
 
   function refuse(what) {
@@ -121,13 +121,19 @@ function createRustAuthGuard({ enabled = false, samplingSettingsEnabled = false 
 
   /** Throws when running `target` (with `args`) would write what Rust owns. */
   function check(targets, args) {
-    if ((!enabled && !samplingSettingsEnabled) || !targets) return;
+    if ((!enabled && !samplingSettingsEnabled && !reasoningSettingsEnabled) || !targets) return;
     for (const target of Array.isArray(targets) ? targets : [targets]) checkOne(target, args);
   }
 
   function checkOne(target, args) {
     if (enabled && exemptDepth === 0 && OWNED_TABLES.has(target.table)) refuse(target.table);
     if (target.table === 'settings') {
+      if (reasoningSettingsEnabled) {
+        const reasoning = singleSettingKey(target.sql, args);
+        if (reasoning === null || reasoning === 'reasoning_effort_default') {
+          throw Object.assign(new Error('Reasoning settings are written by the Rust front'), { status: 503, code: 'RUST_REASONING_SETTINGS_OWNED' });
+        }
+      }
       if (samplingSettingsEnabled) {
         const sampling = singleSettingKey(target.sql, args);
         if (sampling === null || sampling === 'auto_sampling_presets_enabled') {
@@ -175,7 +181,7 @@ function createRustAuthGuard({ enabled = false, samplingSettingsEnabled = false 
     },
     /** Installs the guard on a better-sqlite3 database (a no-op while the switch is off). */
     install(db) {
-      if ((!enabled && !samplingSettingsEnabled) || db.__rustAuthGuard) return db;
+      if ((!enabled && !samplingSettingsEnabled && !reasoningSettingsEnabled) || db.__rustAuthGuard) return db;
       const prepare = db.prepare.bind(db);
       const exec = db.exec.bind(db);
       db.prepare = (sql, ...rest) => {

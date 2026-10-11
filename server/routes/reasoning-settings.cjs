@@ -19,9 +19,16 @@ const PASS = Symbol('unhandled');
  * @param {object} deps.reasoningEffort
  * @param {string} deps.DEFAULT_PROVIDER_ID
  */
-function createReasoningSettingsRoutes({ json, readBody, authService, getProject, getProvider, reasoningEffort, DEFAULT_PROVIDER_ID }) {
+function enabledFrom(env = process.env) {
+  return env.NOEVIA_FRONT === 'rust' && env.NOEVIA_RUST_AUTH === '1'
+    && env.NOEVIA_RUST_AUTH_CONFIRMED === '1' && env.NOEVIA_RUST_REASONING_SETTINGS === '1'
+    && env.NOEVIA_RUST_REASONING_SETTINGS_CONFIRMED === '1';
+}
+function createReasoningSettingsRoutes({ json, readBody, authService, getProject, getProvider, reasoningEffort, DEFAULT_PROVIDER_ID, env = process.env }) {
+  const rustOwned = enabledFrom(env);
   async function handle(req, res, { path: p, authn, url }) {
     if (p === '/api/reasoning-settings') {
+      if (rustOwned && req.method === 'PUT') return json(res, 503, { error: 'Reasoning settings are owned by the Rust front.' });
       const globalDefault = () => authService.db.prepare("SELECT value FROM settings WHERE key='reasoning_effort_default'").get()?.value || 'default';
       if (req.method === 'GET') {
         const project = url.searchParams.has('projectId') ? getProject(url.searchParams.get('projectId')) : null;
@@ -50,4 +57,4 @@ function createReasoningSettingsRoutes({ json, readBody, authService, getProject
   };
 }
 
-module.exports = { createReasoningSettingsRoutes };
+module.exports = { createReasoningSettingsRoutes, enabledFrom };

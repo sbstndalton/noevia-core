@@ -216,6 +216,15 @@ async function main() {
     const users = await step(admin, 'GET', '/api/admin/users', undefined, [200]);
     const memberId = (users.json?.users || users.json || []).find?.((u) => u.username === MEMBER.username)?.id;
 
+    // M6: actual default PUT contract; reset before later GET resolution snapshots.
+    await step(anon, 'PUT', '/api/reasoning-settings', { default: 'high' }, [401]);
+    await step(member, 'PUT', '/api/reasoning-settings', { default: 'high' }, [403]);
+    await step(admin, 'PUT', '/api/reasoning-settings', { default: 'HIGH' }, [400]);
+    for (const effort of ['low', 'high', 'default']) {
+      await step(admin, 'PUT', '/api/reasoning-settings', { default: effort }, [200]);
+      await step(admin, 'GET', '/api/reasoning-settings', undefined, [200]);
+    }
+
     // M3: the account routes the Rust front can take over (NOEVIA_RUST_AUTH), end to end.
     const evil = new Client(base, 'https://evil.example.test');
     await step(evil, 'POST', '/api/auth/login/password', { username: ADMIN.username, password: 'not-the-password-synthetic' }, [403]);
