@@ -28,6 +28,8 @@ jobs:
       - run: cargo fmt --manifest-path tools/qualification/routing-acceptance/Cargo.toml --check
       - run: cargo clippy --locked --manifest-path tools/qualification/routing-acceptance/Cargo.toml --all-targets -- -D warnings
       - run: cargo build --locked --manifest-path tools/qualification/routing-acceptance/Cargo.toml
+      - name: Bounded child and assertion classification fault controls
+        run: tools/qualification/routing-acceptance/target/debug/routing-acceptance --selftest > "$RUNNER_TEMP/routing-lifecycle.log"
       - name: Actual candidate factory, bounded feature truth and persisted failure states
         run: tools/qualification/routing-acceptance/target/debug/routing-acceptance "$PWD" mutants > "$RUNNER_TEMP/routing-ownership.log"
       - name: Wrong source must refuse before executing Node
@@ -36,6 +38,12 @@ jobs:
           if ROUTING_CORE_HEAD=0000000000000000000000000000000000000000 tools/qualification/routing-acceptance/target/debug/routing-acceptance "$PWD" > "$RUNNER_TEMP/routing-wrong-source.log" 2>&1; then exit 1; fi
           grep -q 'candidate HEAD does not match workflow input' "$RUNNER_TEMP/routing-wrong-source.log"
           test -z "$(git status --porcelain --untracked-files=no)"
+      - name: Infrastructure failure during an actual production mutant must fail qualification
+        run: |
+          set -euo pipefail
+          if tools/qualification/routing-acceptance/target/debug/routing-acceptance "$PWD" mutant-infrastructure > "$RUNNER_TEMP/routing-mutant-infrastructure.log" 2>&1; then exit 1; fi
+          grep -q 'infrastructure: mutant confirmation: child spawn failed' "$RUNNER_TEMP/routing-mutant-infrastructure.log"
+          test -z "$(git status --porcelain --untracked-files=no)"
       - if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -43,4 +51,6 @@ jobs:
           path: |
             ${{ runner.temp }}/routing-ownership.log
             ${{ runner.temp }}/routing-wrong-source.log
+            ${{ runner.temp }}/routing-lifecycle.log
+            ${{ runner.temp }}/routing-mutant-infrastructure.log
           if-no-files-found: error

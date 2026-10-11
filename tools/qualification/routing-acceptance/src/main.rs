@@ -1,11 +1,35 @@
 //! Required actual-candidate Node ownership qualification. Rust owns cases and assertions.
+mod process;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    io::Write,
     path::{Path, PathBuf},
-    process::{Command, ExitCode, Stdio},
+    process::{Command, ExitCode},
+    time::Duration,
 };
+#[derive(Debug)]
+enum Failure {
+    Infrastructure(String),
+    Assertion(String),
+}
+impl From<String> for Failure {
+    fn from(s: String) -> Self {
+        Self::Infrastructure(s)
+    }
+}
+impl From<&str> for Failure {
+    fn from(s: &str) -> Self {
+        Self::Infrastructure(s.into())
+    }
+}
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Infrastructure(s) => write!(f, "infrastructure: {s}"),
+            Self::Assertion(s) => write!(f, "assertion: {s}"),
+        }
+    }
+}
 const ACTOR: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 fn at<'a>(v: &'a Value, key: &str) -> &'a Value {
     v.get(key).unwrap_or(&Value::Null)
@@ -37,28 +61,23 @@ fn hex(bytes: &[u8]) -> String {
 fn case() -> Value {
     json!({"file":null,"allowed":"[\"cloud\",\"hybrid\"]","feature":"false","env":{},"routeEnv":{},"featureUpdate":null,"directFeature":null,"auditAbort":false,"readError":false,"method":"GET","path":"/api/routing-mode","role":"admin","body":""})
 }
-fn actual(core: &Path, case: Value) -> Result<Value, String> {
+fn actual(core: &Path, case: Value) -> Result<Value, Failure> {
     let node = std::env::var("NOEVIA_ORACLE_NODE").unwrap_or_else(|_| "node".into());
-    let mut child = Command::new(node)
+    let mut command = Command::new(node);
+    command
         .arg(core.join("tools/contract-corpus/serve.cjs"))
-        .arg("--routing-mode-oracle")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    child
-        .stdin
-        .take()
-        .ok_or("oracle stdin unavailable")?
-        .write_all(json!({"cases":[case]}).to_string().as_bytes())
-        .map_err(|e| e.to_string())?;
-    let o = child.wait_with_output().map_err(|e| e.to_string())?;
+        .arg("--routing-mode-oracle");
+    let o = process::bounded(
+        command,
+        process::json_input(&json!({"cases":[case]}))?,
+        Duration::from_secs(10),
+    )?;
     if !o.status.success() {
         return Err(format!(
             "actual oracle failed: {}",
             String::from_utf8_lossy(&o.stderr)
-        ));
+        )
+        .into());
     }
     let v: Value = serde_json::from_slice(&o.stdout).map_err(|e| e.to_string())?;
     v.as_array()
@@ -66,17 +85,56 @@ fn actual(core: &Path, case: Value) -> Result<Value, String> {
         .cloned()
         .ok_or("oracle result missing".into())
 }
-fn require(ok: bool, msg: &str) -> Result<(), String> {
+fn require(ok: bool, msg: &str) -> Result<(), Failure> {
     if ok {
         Ok(())
     } else {
-        Err(msg.into())
+        Err(Failure::Assertion(msg.into()))
     }
 }
-fn qualify(core: &Path) -> Result<usize, String> {
+fn qualify(core: &Path) -> Result<usize, Failure> {
     let mut count = 0;
+    for runtime in [false, true] {
+        for path in ["/api/routing-mode", "/api/routing-mode/allowed"] {
+            for method in [
+                "GET", "PUT", "POST", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE", "CONNECT",
+            ] {
+                let mut c = case();
+                put(&mut c, "routeEnv", full())?;
+                put(&mut c, "runtimeDefaults", json!(runtime))?;
+                put(&mut c, "path", json!(path))?;
+                put(&mut c, "method", json!(method))?;
+                put(&mut c, "feature", json!("true"))?;
+                put(
+                    &mut c,
+                    "body",
+                    json!(hex(br#"{"mode":"local","allowed":["local"]}"#)),
+                )?;
+                let out = actual(core, c)?;
+                require(
+                    at(at(&out, "response"), "status") == 503
+                        && at(&out, "bodyConsumed") == false
+                        && at(&out, "file").is_null()
+                        && at(&out, "allowed") == "[\"cloud\",\"hybrid\"]"
+                        && at(&out, "audit") == &json!([]),
+                    "route/all-methods-state",
+                )?;
+                count += 1;
+            }
+        }
+    }
     for action in [
-        "file", "allowed", "insert", "update", "delete", "indirect", "feature",
+        "file",
+        "allowed",
+        "insert",
+        "update",
+        "delete",
+        "indirect",
+        "indirect-update",
+        "indirect-delete",
+        "rename-in",
+        "rename-out",
+        "feature",
     ] {
         let mut c = case();
         put(&mut c, "routeEnv", full())?;
@@ -94,12 +152,37 @@ fn qualify(core: &Path) -> Result<usize, String> {
         } else {
             require(
                 !at(&out, "guardError").is_null()
-                    && at(&out, "allowed") == "[\"cloud\",\"hybrid\"]"
-                    && at(&out, "file").is_null(),
-                "confirmed direct/indirect writer refusal missing",
+                    && (if action == "rename-in" {
+                        at(&out, "allowed").is_null()
+                            && at(&out, "unowned") == "[\"cloud\",\"hybrid\"]"
+                    } else {
+                        at(&out, "allowed") == "[\"cloud\",\"hybrid\"]"
+                    })
+                    && at(&out, "file").is_null()
+                    && at(&out, "audit") == &json!([]),
+                &format!("writer/{action}"),
             )?;
         }
         count += 1;
+    }
+    for probe in ["flags", "describe"] {
+        for direct in ["true", "false", "malformed"] {
+            let mut c = case();
+            put(&mut c, "env", full())?;
+            put(
+                &mut c,
+                "feature",
+                json!(if direct == "true" { "false" } else { "true" }),
+            )?;
+            put(&mut c, "directFeature", json!(direct))?;
+            put(&mut c, "featureProbe", json!(probe))?;
+            let out = actual(core, c)?;
+            require(
+                at(&out, "featureProbe") == (direct == "true"),
+                &format!("feature/{probe}-fresh"),
+            )?;
+            count += 1;
+        }
     }
     for key in full().as_object().ok_or("full guard env invalid")?.keys() {
         for bad in [Value::Null, json!("0"), json!("true"), json!(" 1")] {
@@ -230,6 +313,10 @@ fn qualify(core: &Path) -> Result<usize, String> {
                 "actual Node partial audit failure qualifier changed",
             )?;
         } else {
+            require(
+                at(&out, "audit").as_array().is_some_and(|a| !a.is_empty()),
+                "routing audit missing",
+            )?;
             let a = at(&out, "audit")
                 .as_array()
                 .and_then(|a| a.first())
@@ -269,37 +356,84 @@ impl Drop for Restore {
         let _ = std::fs::write(&self.path, &self.original);
     }
 }
-fn mutants(core: &Path) -> Result<(), String> {
-    for (name, file, old, new) in [
+fn mutants(core: &Path, inject_fault: bool) -> Result<(), Failure> {
+    for (name, file, old, new, expected) in [
         (
             "confirmation",
             "server/routing-modes.cjs",
             "return env.NOEVIA_FRONT === 'rust'",
             "return false && env.NOEVIA_FRONT === 'rust'",
+            "route/all-methods-state",
         ),
         (
             "feature-refresh",
             "server/features.cjs",
             "if (!store || !state.has('routingModes')",
             "if (true || !store || !state.has('routingModes')",
+            "feature/flags-fresh",
         ),
         (
             "indirect-insert",
             "server/rust-auth.cjs",
             "WHEN NEW.key='routing_modes_allowed' BEGIN",
             "WHEN NEW.key='synthetic_unowned' BEGIN",
+            "writer/indirect",
+        ),
+        (
+            "indirect-update",
+            "server/rust-auth.cjs",
+            "WHEN OLD.key='routing_modes_allowed' OR NEW.key='routing_modes_allowed' BEGIN",
+            "WHEN OLD.key='synthetic_unowned' OR NEW.key='synthetic_unowned' BEGIN",
+            "writer/indirect-update",
+        ),
+        (
+            "indirect-delete",
+            "server/rust-auth.cjs",
+            "WHEN OLD.key='routing_modes_allowed' BEGIN",
+            "WHEN OLD.key='synthetic_unowned' BEGIN",
+            "writer/indirect-delete",
+        ),
+        (
+            "rename-into-owned",
+            "server/rust-auth.cjs",
+            "WHEN OLD.key='routing_modes_allowed' OR NEW.key='routing_modes_allowed' BEGIN",
+            "WHEN OLD.key='routing_modes_allowed' BEGIN",
+            "writer/rename-in",
+        ),
+        (
+            "rename-out-of-owned",
+            "server/rust-auth.cjs",
+            "WHEN OLD.key='routing_modes_allowed' OR NEW.key='routing_modes_allowed' BEGIN",
+            "WHEN NEW.key='routing_modes_allowed' BEGIN",
+            "writer/rename-out",
+        ),
+        (
+            "description-refresh",
+            "server/features.cjs",
+            "describe: () => { refreshRoutingModes();",
+            "describe: () => {",
+            "feature/describe-fresh",
+        ),
+        (
+            "route-get-only",
+            "server/routes/routing-mode.cjs",
+            "if (rm.rustOwned(env))",
+            "if (req.method === 'GET' && rm.rustOwned(env))",
+            "route/all-methods-state",
         ),
         (
             "allowed-persistence",
             "server/routes/routing-mode.cjs",
             "const allowed = rm.setAllowedModes(store, body?.allowed);",
             "const allowed = rm.setAllowedModes({ ...store, set: () => {} }, body?.allowed);",
+            "allowed list write-then-audit partial commit changed",
         ),
         (
             "audit-append",
             "server/routes/routing-mode.cjs",
             "audit('routing.allowed', authn.user.id, { allowed });",
             "void allowed;",
+            "routing audit missing",
         ),
     ] {
         let path = core.join(file);
@@ -313,20 +447,44 @@ fn mutants(core: &Path) -> Result<(), String> {
             original: original.clone(),
         };
         std::fs::write(&path, original.replacen(old, new, 1)).map_err(|e| e.to_string())?;
+        let original_node = std::env::var_os("NOEVIA_ORACLE_NODE");
+        if inject_fault {
+            std::env::set_var("NOEVIA_ORACLE_NODE", core.join("synthetic-missing-runtime"));
+        }
         let result = qualify(core);
+        if inject_fault {
+            match original_node {
+                Some(v) => std::env::set_var("NOEVIA_ORACLE_NODE", v),
+                None => std::env::remove_var("NOEVIA_ORACLE_NODE"),
+            }
+        }
         drop(guard);
-        require(
-            result.is_err(),
-            &format!("production mutant {name} survived"),
-        )?;
-        println!(
-            "production mutant {name} rejected: {}",
-            result.err().unwrap_or_default()
-        );
+        reject_mutant(name, expected, result)?;
     }
     Ok(())
 }
-fn run() -> Result<(), String> {
+fn reject_mutant(
+    name: &str,
+    expected: &str,
+    result: Result<usize, Failure>,
+) -> Result<(), Failure> {
+    match result {
+        Err(Failure::Assertion(id)) if id == expected => {
+            println!("production mutant {name} rejected by assertion {id}");
+            Ok(())
+        }
+        Err(Failure::Infrastructure(error)) => {
+            Err(Failure::Infrastructure(format!("mutant {name}: {error}")))
+        }
+        Err(Failure::Assertion(id)) => Err(Failure::Infrastructure(format!(
+            "mutant {name}: unexpected assertion {id}; expected {expected}"
+        ))),
+        Ok(_) => Err(Failure::Assertion(format!(
+            "production mutant {name} survived"
+        ))),
+    }
+}
+fn run() -> Result<(), Failure> {
     let mut args = std::env::args().skip(1);
     let core = PathBuf::from(args.next().ok_or("candidate core path required")?)
         .canonicalize()
@@ -371,14 +529,26 @@ fn run() -> Result<(), String> {
     println!("{}", json!({"core":head,"sources":source}));
     let n = qualify(&core)?;
     println!("actual Node routing ownership/product/state cases={n}");
-    if mode == "mutants" {
-        mutants(&core)?;
+    if mode == "mutants" || mode == "mutant-infrastructure" {
+        mutants(&core, mode == "mutant-infrastructure")?;
     } else {
         require(mode == "qualify", "unknown routing qualification mode")?;
     }
     Ok(())
 }
 fn main() -> ExitCode {
+    if std::env::args().nth(1).as_deref() == Some("--probe-child") {
+        return probe_child();
+    }
+    if std::env::args().nth(1).as_deref() == Some("--selftest") {
+        return match selftest() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("infrastructure control failed: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -386,4 +556,67 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+fn probe_child() -> ExitCode {
+    use std::io::Write;
+    match std::env::args().nth(2).as_deref() {
+        Some("exit") => ExitCode::SUCCESS,
+        Some("oversized") => match std::io::stdout().write_all(&vec![b'x'; process::INPUT + 1]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::FAILURE,
+        },
+        _ => loop {
+            std::thread::sleep(Duration::from_secs(1));
+        },
+    }
+}
+fn selftest() -> Result<(), Failure> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    for (mode, expected) in [
+        ("stall", "child deadline exceeded"),
+        ("oversized", "child output limit exceeded"),
+        ("exit", "child stdin failed"),
+    ] {
+        let mut command = Command::new(&exe);
+        command.args(["--probe-child", mode]);
+        let mut pid = None;
+        let result = process::bounded_with(
+            &mut command,
+            vec![b'x'; process::INPUT],
+            Duration::from_millis(300),
+            |id| pid = rustix::process::Pid::from_raw(id as i32),
+        );
+        require(
+            result.as_ref().err().is_some_and(|e| e.contains(expected)),
+            &format!("lifecycle/{mode}"),
+        )?;
+        require(
+            pid.is_some_and(|p| rustix::process::test_kill_process(p).is_err()),
+            &format!("lifecycle/{mode}-reaped"),
+        )?;
+        println!("bounded child control {mode} rejected");
+    }
+    require(
+        process::json_input(&json!("x".repeat(process::INPUT))).is_err(),
+        "bounded serialization",
+    )?;
+    require(
+        reject_mutant(
+            "synthetic",
+            "expected",
+            Err(Failure::Infrastructure("synthetic spawn failure".into())),
+        )
+        .is_err(),
+        "infrastructure never qualifies mutant",
+    )?;
+    require(
+        reject_mutant(
+            "synthetic",
+            "expected",
+            Err(Failure::Assertion("wrong assertion".into())),
+        )
+        .is_err(),
+        "wrong assertion never qualifies mutant",
+    )?;
+    Ok(())
 }
