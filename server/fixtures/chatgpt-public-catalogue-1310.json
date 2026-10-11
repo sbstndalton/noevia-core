@@ -1,0 +1,123 @@
+{
+  "source": {
+    "repository": "openai/codex",
+    "revision": "cc7ba33601286a751477832b01de7b6f8de0dd9c",
+    "payloadSha256": "943ca7fe1d19ed019054158303f0dbbd80b3bef43b3aa425a71aa7cb3fb52c2b",
+    "note": "Public metadata subset only; availability is not account entitlement or inference proof."
+  },
+  "models": [
+    {
+      "slug": "gpt-6-astra",
+      "visibility": "list",
+      "supported_in_api": true,
+      "default_reasoning_level": "low",
+      "default_reasoning_summary": "none",
+      "supports_reasoning_summary_parameter": true,
+      "minimal_client_version": "0.153.0",
+      "supported_reasoning_levels": [
+        {
+          "effort": "low"
+        },
+        {
+          "effort": "medium"
+        },
+        {
+          "effort": "high"
+        },
+        {
+          "effort": "xhigh"
+        },
+        {
+          "effort": "max"
+        },
+        {
+          "effort": "ultra"
+        }
+      ]
+    },
+    {
+      "slug": "gpt-6.1-sol",
+      "visibility": "list",
+      "supported_in_api": true,
+      "default_reasoning_level": "low",
+      "default_reasoning_summary": "none",
+      "supports_reasoning_summary_parameter": true,
+      "minimal_client_version": "0.153.0",
+      "supported_reasoning_levels": [
+        {
+          "effort": "low"
+        },
+        {
+          "effort": "medium"
+        },
+        {
+          "effort": "high"
+        },
+        {
+          "effort": "xhigh"
+        },
+        {
+          "effort": "max"
+        },
+        {
+          "effort": "ultra"
+        }
+      ]
+    },
+    {
+      "slug": "gpt-6-sol",
+      "visibility": "list",
+      "supported_in_api": true,
+      "default_reasoning_level": "medium",
+      "default_reasoning_summary": "none",
+      "supports_reasoning_summary_parameter": true,
+      "minimal_client_version": "0.155.0",
+      "supported_reasoning_levels": [
+        {
+          "effort": "low"
+        },
+        {
+          "effort": "medium"
+        },
+        {
+          "effort": "high"
+        },
+        {
+          "effort": "xhigh"
+        },
+        {
+          "effort": "max"
+        },
+        {
+          "effort": "ultra"
+        }
+      ]
+    },
+    {
+      "slug": "gpt-6-luna",
+      "visibility": "list",
+      "supported_in_api": true,
+      "default_reasoning_level": "medium",
+      "default_reasoning_summary": "none",
+      "supports_reasoning_summary_parameter": true,
+      "minimal_client_version": "0.155.0",
+      "supported_reasoning_levels": [
+        {
+          "effort": "low"
+        },
+        {
+          "effort": "medium"
+        },
+        {
+          "effort": "high"
+        },
+        {
+          "effort": "xhigh"
+        },
+        {
+          "effort": "max"
+        }
+      ]
+    }
+  ]
+}

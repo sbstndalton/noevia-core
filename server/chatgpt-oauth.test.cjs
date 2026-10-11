@@ -62,6 +62,7 @@ function fakeOpenAI() {
       return next ? next(init) : sse([{ type: 'response.output_text.delta', delta: 'Hello' }, { type: 'response.completed', response: { usage: { input_tokens: 7, output_tokens: 2, total_tokens: 9 } } }]);
     }
     if (url.startsWith(`${CODEX}/models?`) && state.modelsDown) return json({ detail: 'down' }, 503);
+    if (url.startsWith(`${CODEX}/models?`) && state.catalogue) return json(state.catalogue);
     if (url.startsWith(`${CODEX}/models?`)) return json({ models: [{ slug: 'gpt-synthetic', visibility: 'list' }, { slug: 'hidden', visibility: 'hide' }, { slug: 'no-api', supported_in_api: false },
       { slug: 'gpt-thinker', default_reasoning_level: 'medium', default_reasoning_summary: 'detailed' }, { slug: 'gpt-plain', supports_reasoning_summary_parameter: false }, { slug: 'gpt-quiet', default_reasoning_summary: 'none' }] });
     return json({ error: 'unexpected ' + url }, 599);
@@ -69,14 +70,14 @@ function fakeOpenAI() {
   return { fetchImpl, seen, state };
 }
 
-function make(t, fake = fakeOpenAI(), clock = { t: 1_800_000_000_000 }) {
+function make(t, fake = fakeOpenAI(), clock = { t: 1_800_000_000_000 }, config = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-chatgpt-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const db = new Database(':memory:');
   const secrets = createSecretStore(dir, { env: {} });
   const audits = [];
   const oauth = chatgpt.createChatGptOAuth({ db, secrets, fetchImpl: fake.fetchImpl, now: () => clock.t, audit: (a, u, d) => audits.push({ a, u, d }),
-    config: { issuer: ISSUER, codexBaseUrl: CODEX } });
+    config: { issuer: ISSUER, codexBaseUrl: CODEX, ...config } });
   return { oauth, db, secrets, fake, clock, audits, dir };
 }
 async function connect(f, userId = 'user-a') {
@@ -354,7 +355,7 @@ test('the model list is the account’s public models; forgetUser removes a dele
   await connect(f);
   assert.deepEqual(await f.oauth.listModels('user-a'), ['gpt-synthetic', 'gpt-thinker', 'gpt-plain', 'gpt-quiet']);
   const modelCall = f.fake.seen.calls.find((c) => c.url.startsWith(`${CODEX}/models?`));
-  assert.match(modelCall.url, /client_version=0\.144\.1/);
+  assert.match(modelCall.url, /client_version=0\.155\.0/);
   assert.equal(modelCall.init.headers.authorization, 'Bearer AT-1');
   await assert.rejects(f.oauth.listModels('user-b'), (e) => e.status === 401);
   const tables = rotationTables({ db: f.db, dataDir: f.dir });
@@ -576,4 +577,53 @@ test('fork QuartzWarrior@7100902, checked against openai/codex: per-conversation
   await g.oauth.fetchFor('user-f')('https://c/v1/chat/completions', { method: 'POST', body: JSON.stringify({ model: 'gpt-synthetic', messages: [] }) });
   assert.equal(g.fake.seen.responses.at(-1).headers['x-openai-fedramp'], 'true');
   assert.equal('x-openai-fedramp' in a.headers, false);
+});
+
+
+// Public OpenAI metadata only: this tests protocol compatibility with a wholly fake account,
+// not entitlement, model availability on any real account, or actual model inference.
+const publicCatalogue1310 = require('./fixtures/chatgpt-public-catalogue-1310.json');
+test('catalogue compatibility #1310: published GPT-6 metadata uses the exact new default and filters private/disabled rows', async (t) => {
+  const f = make(t);
+  await connect(f);
+  f.fake.state.catalogue = { unknownTopLevel: { ignored: true }, models: [
+    ...publicCatalogue1310.models.map((row) => ({ ...row, unknownFutureField: { ignored: true } })),
+    { slug: 'synthetic-hidden', visibility: 'hide', supported_in_api: true },
+    { slug: 'synthetic-api-disabled', visibility: 'list', supported_in_api: false },
+  ] };
+  assert.equal(publicCatalogue1310.source.revision, 'cc7ba33601286a751477832b01de7b6f8de0dd9c');
+  assert.equal(chatgpt.DEFAULTS.codexClientVersion, '0.155.0');
+  const ids = await f.oauth.listModels('user-a');
+  assert.deepEqual(ids, ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna']);
+  const call = f.fake.seen.calls.find((c) => c.url.startsWith(`${CODEX}/models?`));
+  assert.equal(call.url, `${CODEX}/models?client_version=0.155.0`);
+  assert.equal(call.init.method, 'GET');
+  assert.equal(call.init.redirect, 'error');
+  assert.ok(ids.every((id) => typeof id === 'string'));
+  assert.doesNotMatch(JSON.stringify({ ids, status: f.oauth.status('user-a'), audits: f.audits }), /AT-1|RT-1|AUTHCODE|VERIFIER/);
+  await assert.rejects(f.oauth.listModels('user-b'), (e) => e.status === 401);
+
+  // Exercise the existing catalogue-default adapter with fake Response objects only.
+  for (const row of publicCatalogue1310.models) {
+    assert.ok(row.supported_reasoning_levels.some((level) => level.effort === 'max'));
+    const response = await post(f, { model: row.slug });
+    assert.equal(response.status, 200);
+    assert.deepEqual(lastSent(f).reasoning, { effort: row.default_reasoning_level });
+    assert.equal(lastSent(f).model, row.slug);
+    assert.equal('unknownFutureField' in lastSent(f), false);
+    // Metadata assurance only: explicit max/ultra forwarding is a separate inherited adapter
+    // limitation, not changed or claimed by this compatibility-default repair.
+    assert.deepEqual(row.supported_reasoning_levels.map((level) => level.effort),
+      row.slug === 'gpt-6-luna' ? ['low', 'medium', 'high', 'xhigh', 'max'] : ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
+    assert.equal(row.minimal_client_version, ['gpt-6-astra', 'gpt-6.1-sol'].includes(row.slug) ? '0.153.0' : '0.155.0');
+  }
+  assert.equal(publicCatalogue1310.models.find((row) => row.slug === 'gpt-6-luna').supported_reasoning_levels.some((level) => level.effort === 'ultra'), false);
+});
+
+test('catalogue compatibility #1310: the existing configured version override remains authoritative', async (t) => {
+  const f = make(t, fakeOpenAI(), { t: 1_800_000_000_000 }, { codexClientVersion: '0.199.2-fixture' });
+  await connect(f);
+  f.fake.state.catalogue = { models: publicCatalogue1310.models };
+  assert.deepEqual(await f.oauth.listModels('user-a'), publicCatalogue1310.models.map((row) => row.slug));
+  assert.equal(f.fake.seen.calls.find((c) => c.url.startsWith(`${CODEX}/models?`)).url, `${CODEX}/models?client_version=0.199.2-fixture`);
 });
