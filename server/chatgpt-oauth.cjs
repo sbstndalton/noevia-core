@@ -37,7 +37,7 @@ const DEFAULTS = Object.freeze({
   issuer: 'https://auth.openai.com',
   clientId: 'app_EMoamEEZ73f0CkXaXp7hrann', // the Codex CLI's public OAuth client
   codexBaseUrl: 'https://chatgpt.com/backend-api/codex',
-  codexClientVersion: '0.144.1', // only the model catalogue reads it
+  codexClientVersion: '0.155.0', // only the model catalogue reads it
 });
 const DEVICE_TTL_MS = 15 * 60 * 1000;
 const MAX_PENDING_PER_USER = 3;
