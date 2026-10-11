@@ -8,7 +8,7 @@ const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
 const { createStorageRoutes, STORAGE_PRIVATE_URL_ERROR } = require('./storage.cjs');
 
-function fixture({ storage = { kind: 'local' }, browsable = false, approved = () => true, network = async () => ({ ok: true, status: 200, json: async () => ({}) }) } = {}) {
+function fixture({ storage = { kind: 'local' }, browsable = false, approved = () => true, network = async () => ({ ok: true, status: 200, json: async () => ({}) }), storageReadsOwned } = {}) {
   const sent = [], saved = [], requests = [], storageReads = [];
   const routes = createStorageRoutes({
     json: (res, status, body) => { sent.push({ status, body }); },
@@ -23,6 +23,7 @@ function fixture({ storage = { kind: 'local' }, browsable = false, approved = ()
     endpointApproved: (authn, url) => approved(authn, url),
     fetch: async (url, init) => { requests.push({ url, init }); return network(url, init); },
     crypto: { randomUUID: () => 'flow-1' },
+    storageReadsOwned,
   });
   const call = (method, path, body, userId = 'u1') => {
     const req = Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body))]);
@@ -31,6 +32,41 @@ function fixture({ storage = { kind: 'local' }, browsable = false, approved = ()
   };
   return { call, sent, saved, requests, storageReads };
 }
+
+test('confirmed storage metadata ownership refuses scoped GET before any storage collaborator', async () => {
+  const { RUST_STORAGE_READS_REFUSAL } = require('../features.cjs');
+  const poison = () => assert.fail('owned metadata GET touched a collaborator');
+  const sent = [];
+  const routes = createStorageRoutes({
+    json: (_res, status, body) => sent.push({ status, body }), readJson: poison,
+    authService: new Proxy({}, { get: poison }), storageClient: new Proxy({}, { get: poison }),
+    endpointApproved: poison, fetch: poison, crypto: new Proxy({}, { get: poison }),
+    storageReadsOwned: () => true,
+  });
+  assert.equal(await routes({ method: 'GET' }, {}, { path: '/api/integrations/storage', authn: null }), true);
+  assert.deepEqual(sent, [{ status: 503, body: RUST_STORAGE_READS_REFUSAL }]);
+});
+
+test('storage ownership preserves default reads, other methods and adjacent routes', async () => {
+  const off = fixture();
+  await off.call('GET', '/api/integrations/storage');
+  assert.deepEqual(off.storageReads, [['u1', undefined]]);
+  const owned = fixture({ storageReadsOwned: () => true, browsable: true });
+  for (const method of [undefined, 'HEAD', 'OPTIONS', 'POST', 'DELETE', 'get']) {
+    assert.equal(await owned.call(method, '/api/integrations/storage'), false);
+  }
+  for (const target of ['/api/integrations/storage/', '/api/integrations/storage-other']) {
+    assert.equal(await owned.call('GET', target), false);
+  }
+  await owned.call('PUT', '/api/integrations/storage', { kind: 'local' });
+  assert.equal(owned.saved.length, 1);
+  await owned.call('GET', '/api/integrations/storage/files');
+  await owned.call('POST', '/api/integrations/storage/file', { path: 'synthetic.txt' });
+  await owned.call('POST', '/api/integrations/storage/folder', { path: 'synthetic' });
+  await owned.call('POST', '/api/integrations/storage/test', { kind: 'local' });
+  assert.equal(owned.storageReads.length, 3);
+  assert.equal(owned.sent.some(reply => reply.status === 503), false);
+});
 
 test('reading, saving and the local shortcut keep their shapes; other paths fall through', async () => {
   const f = fixture();

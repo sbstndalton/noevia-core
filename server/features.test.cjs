@@ -5,6 +5,25 @@ const { createFeatures, REGISTRY, parseEnv } = require('./features.cjs');
 
 const memoryStore = (seed = {}) => { const m = new Map(Object.entries(seed)); return { m, get: k => m.get(k), set: (k, v) => m.set(k, v) }; };
 
+test('storage read ownership requires exact selector, confirmations and native auth', () => {
+  const { rustStorageReadsOwned } = require('./features.cjs');
+  const confirmed = {
+    NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_AUTH_CONFIRMED: '1',
+    NOEVIA_RUST_STORAGE_READS: '1', NOEVIA_RUST_STORAGE_READS_CONFIRMED: '1',
+  };
+  assert.equal(rustStorageReadsOwned(confirmed), true);
+  assert.equal(rustStorageReadsOwned({}), false);
+  for (const key of Object.keys(confirmed)) {
+    for (const value of [undefined, '', '0', 'true', '01', ' 1 ', '1\n', 'node']) {
+      assert.equal(rustStorageReadsOwned({ ...confirmed, [key]: value }), false, `${key}=${JSON.stringify(value)}`);
+    }
+  }
+  const features = createFeatures({ env: confirmed, store: memoryStore() });
+  assert.equal(features.names().includes('rustStorageReads'), false);
+  assert.equal(Object.values(REGISTRY).some(row => row.env === 'NOEVIA_RUST_STORAGE_READS'), false);
+  assert.throws(() => features.set('rustStorageReads', true, 'synthetic-admin'), e => e.status === 404);
+});
+
 test('every registered feature is off by default', () => {
   const features = createFeatures({ env: {}, store: memoryStore() });
   for (const name of Object.keys(REGISTRY)) assert.equal(features.enabled(name), false, name);

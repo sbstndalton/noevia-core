@@ -951,7 +951,9 @@ const authRoutes = require('./routes/auth.cjs').createAuthRoutes({
 });
 // The user's own storage connection: read, save, test, browse, one folder, the Nextcloud login flow
 // (routes/storage.cjs). fetch is resolved per call: tests swap the global at runtime.
-const storageRoutes = require('./routes/storage.cjs').createStorageRoutes({ json, readJson, authService, storageClient, endpointApproved, fetch: (...args) => globalThis.fetch(...args), crypto });
+const storageRoutes = require('./routes/storage.cjs').createStorageRoutes({ json, readJson, authService, storageClient, endpointApproved, fetch: (...args) => globalThis.fetch(...args), crypto,
+  storageReadsOwned: () => require('./features.cjs').rustStorageReadsOwned(process.env),
+});
 // The human's answer to a pending write (routes/approvals.cjs); the gate itself is approvals.cjs.
 const approvalRoutes = require('./routes/approvals.cjs').createApprovalRoutes({ json, readBody, pendingApprovals, requestScope });
 // The workspace view, free-chat metas, context meters and transcripts (routes/chat-lists.cjs); it also
@@ -1001,6 +1003,9 @@ const mcpDirectoryRoutes = require('./routes/mcp-directory.cjs').createMcpDirect
 });
 
 async function handleRequestInner(req, res) {
+  if (require('./features.cjs').refuseRustStorageRead(req, res, {
+    owned: require('./features.cjs').rustStorageReadsOwned(process.env), parseRequestUrl, badRequestUrl, json,
+  })) return;
   const preAuth = requestAuth.authenticate(req);
   // accountRole: a device token acts as a member, but its account's workspace is the same one.
   const workspace = preAuth ? workspaceStore.get(preAuth.user.id, { claim: (preAuth.accountRole || preAuth.user.role) === 'admin' }) : null;

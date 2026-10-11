@@ -97,6 +97,36 @@ function rustChatgptStatusOwned(env = process.env) {
     && require('./rust-auth.cjs').enabledFrom(env, () => {});
 }
 
+// Ownership selectors are deployment contracts, never admin feature toggles.
+function rustStorageReadsOwned(env = process.env) {
+  return env.NOEVIA_RUST_STORAGE_READS === '1'
+    && env.NOEVIA_RUST_STORAGE_READS_CONFIRMED === '1'
+    && require('./rust-auth.cjs').enabledFrom(env, () => {});
+}
+
+const RUST_STORAGE_READS_REFUSAL = Object.freeze({
+  error: 'Storage metadata reads are owned by the Rust front.',
+  code: 'RUST_STORAGE_READS_OWNED',
+});
+
+// Called before request authentication or workspace construction. Unowned requests
+// keep their original parse/order; an owned exact GET cannot reach Node's reseal.
+function refuseRustStorageRead(req, res, { owned = false, parseRequestUrl, badRequestUrl, json }) {
+  if (req.method !== 'GET' || !owned) return false;
+  const url = parseRequestUrl(req, `http://${req.headers.host || 'localhost'}`) || parseRequestUrl(req);
+  if (!url) {
+    badRequestUrl(res);
+    return true;
+  }
+  if (url.pathname !== '/api/integrations/storage') return false;
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'same-origin');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");
+  json(res, 503, RUST_STORAGE_READS_REFUSAL);
+  return true;
+}
+
 function parseEnv(raw) {
   if (raw === undefined || raw === null || String(raw).trim() === '') return undefined;
   const value = String(raw).trim().toLowerCase();
@@ -220,4 +250,4 @@ function settingsStore(db) {
   };
 }
 
-module.exports = { browserRuntimeReason, codeSandboxReason, unavailableId, REGISTRY, createFeatures, settingsStore, parseEnv, migrateLegacySetting, rustChatgptStatusOwned };
+module.exports = { browserRuntimeReason, codeSandboxReason, unavailableId, REGISTRY, createFeatures, settingsStore, parseEnv, migrateLegacySetting, rustChatgptStatusOwned, rustStorageReadsOwned, refuseRustStorageRead, RUST_STORAGE_READS_REFUSAL };
