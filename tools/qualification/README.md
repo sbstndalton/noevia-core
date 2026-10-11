@@ -20,7 +20,8 @@ archive and three exact host input/spawn/verification template hashes. It emits
 those original templates with the actual candidate paths. The only compatibility
 shim is an explicit three-line `corpus-launcher` script in an isolated acceptance
 bin directory; it delegates to `core-acceptance`, with the original native/replay
-binaries symlinked alongside it. It neither replaces nor edits the merged launcher.
+binaries symlinked alongside it. The unchanged host-control binary is copied
+so its current_exe sibling lookup resolves this declared acceptance directory. It neither replaces nor edits the merged launcher.
 Artifact provenance records candidate HEAD, fixture core, Rust input, template,
 adapter and shim hashes. There is no production runtime change or release pin.
 

@@ -69,7 +69,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir "$RUNNER_TEMP/acceptance-bin" "$RUNNER_TEMP/reasoning-evidence"
-          for name in noevia-server replay host-control; do ln -s "$GITHUB_WORKSPACE/rs/target/debug/$name" "$RUNNER_TEMP/acceptance-bin/$name"; done
+          for name in noevia-server replay; do ln -s "$GITHUB_WORKSPACE/rs/target/debug/$name" "$RUNNER_TEMP/acceptance-bin/$name"; done
+          cp "$GITHUB_WORKSPACE/rs/target/debug/host-control" "$RUNNER_TEMP/acceptance-bin/host-control"
           ln -s "$GITHUB_WORKSPACE/core/tools/qualification/reasoning-acceptance/target/debug/core-acceptance" "$RUNNER_TEMP/acceptance-bin/core-acceptance"
           printf '%s\n' '#!/bin/sh' '# Explicit candidate-core acceptance seam; original RS launcher is untouched.' 'exec "$(dirname "$0")/core-acceptance" "$@"' > "$RUNNER_TEMP/acceptance-bin/corpus-launcher"
           chmod +x "$RUNNER_TEMP/acceptance-bin/corpus-launcher"
