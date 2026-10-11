@@ -905,6 +905,7 @@ const projectRoutes = require('./routes/projects.cjs').createProjectRoutes({
 const providerRoutes = require('./routes/providers.cjs').createProviderRoutes({
   json, readBody, readJson, fetchJson, endpointApproved, PROVIDERS, PROJECTS, DEFAULT_PROVIDER_ID, modelManager, currentWorkspace, saveProjects, registry: providerRegistry,
   chatgptOAuth, chatgptEnabled: () => features.enabled('chatgptOAuth'),
+  chatgptStatusOwned: () => require('./features.cjs').rustChatgptStatusOwned(process.env),
 });
 // Statistics, the auto-router roles, the model manager proxy and /api/models/* (routes/models.cjs).
 const modelRoutes = require('./routes/models.cjs').createModelRoutes({
