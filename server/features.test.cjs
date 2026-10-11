@@ -281,6 +281,7 @@ test('native ChatGPT status: refreshed cache follows typed truth on all read sur
   for (const read of [f => f.enabled('chatgptOAuth'), f => f.flags().chatgptOAuth, f => f.describe().find(row => row.name === 'chatgptOAuth').enabled]) {
     for (const raw of ['true', 'false', undefined, null, 1, true, Buffer.from('true'), 'TRUE', ' true ', '1', '']) {
       store.set('feature:chatgptOAuth', raw === 'true' ? 'false' : 'true');
+      store.set('feature:previews', 'false');
       const f = createFeatures({ env: nativeStatusEnv(), store, registry });
       if (raw === undefined) store.m.delete('feature:chatgptOAuth'); else store.set('feature:chatgptOAuth', raw);
       store.set('feature:previews', 'true');
