@@ -9,7 +9,7 @@ const http = require('node:http');
 const { spawn, spawnSync } = require('node:child_process');
 const { once } = require('node:events');
 const { SERVER, GUARD, startMocks, serverEnv } = require('../contract-corpus/mocks.cjs');
-const { requireScan } = require('./contracts.cjs');
+const { requireScan, requireReducedPdf, REDUCED_CAP } = require('./contracts.cjs');
 const required = name => { assert.ok(process.env[name], `${name} is required; this gate cannot skip`); return path.resolve(process.env[name]); };
 const children = new Set();
 function child(command, args, env) {
@@ -58,6 +58,20 @@ class Client {
     assert.equal(response.status, status, `${method} ${route}: ${text.slice(0, 300)}`);
     return JSON.parse(text);
   }
+  async download(route) {
+    const response = await fetch(this.base + route, { headers: { Origin: this.base, Cookie: [...this.cookies].map(([key, value]) => `${key}=${value}`).join('; ') }, redirect: 'manual', signal: AbortSignal.timeout(30000) });
+    assert.equal(response.status, 200, 'authenticated reduced original download must succeed');
+    const contentLength = response.headers.get('content-length');
+    assert.ok(Number(contentLength) > 0 && Number(contentLength) <= REDUCED_CAP, 'reduced download declared length must fit cap');
+    const chunks = []; let count = 0;
+    for await (const chunk of response.body) {
+      count += chunk.length;
+      assert.ok(count <= REDUCED_CAP, 'reduced download stream must fit cap');
+      chunks.push(Buffer.from(chunk));
+    }
+    return { bytes: Buffer.concat(chunks), contentLength, contentType: response.headers.get('content-type') };
+  }
+
 }
 async function scenario(front, mode, workerBase, fixtures, root, calls) {
   const dataDir = fs.mkdtempSync(path.join(root, 'data-'));
@@ -133,9 +147,23 @@ async function scenario(front, mode, workerBase, fixtures, root, calls) {
     // Compare complete upload and page response bodies, plus persisted source
     // content/attachment/document contracts; omit only background index progress.
     // Ghostscript embeds generation metadata, so a reduced PDF's byte
-    // fingerprint can differ between runs. Bind only those derived identities,
+    // fingerprint and length can differ between runs. Validate actual downloads before
+    // binding only those derived identities and the five byte counts,
     // preserving their relationships just as the broad replayer binds IDs.
     const reduced = files.find(file => file.name === large.path);
+    let comparedLarge = large, comparedReduced = reduced;
+    if (large.attachment.reduction.kind === 'pdf') {
+      const downloaded = await admin.download(route + '/documents/original?name=' + encodeURIComponent(large.path));
+      const saved = path.join(dataDir, 'downloaded-reduced-contract.pdf');
+      fs.writeFileSync(saved, downloaded.bytes);
+      const text = spawnSync('pdftotext', [saved, '-'], { encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 });
+      assert.equal(text.status, 0, 'downloaded reduced PDF text extraction must succeed');
+      const info = spawnSync('pdfinfo', [saved], { encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 });
+      assert.equal(info.status, 0, 'downloaded reduced PDF page count must succeed');
+      const pages = Number(/^Pages:\s+(\d+)$/m.exec(info.stdout)?.[1]);
+      ({ large: comparedLarge, reduced: comparedReduced } = requireReducedPdf(large, reduced, downloaded, { text: text.stdout, pages }));
+    }
+
     if (large.document) assert.equal(large.attachment.id, large.document.byteHash);
     const identities = new Map([[large.attachment.id, '<reduced-bytes>']]);
     if (reduced.document?.version) identities.set(reduced.document.version, '<reduced-version>');
@@ -145,7 +173,7 @@ async function scenario(front, mode, workerBase, fixtures, root, calls) {
       for (const [identity, replacement] of identities) item = item.replaceAll(identity, replacement);
       return key === 'notice' ? item.replace(/; index: [a-z]+\.$/, '; index: <progress>.') : item;
     });
-    return stable({ scan, pages, docx, large, files: files.map(({ name, content, document, attachment }) => ({ name, content, document, attachment })), deniedPages, deniedOriginal, deniedUpload });
+    return stable({ scan, pages, docx, large: comparedLarge, files: files.map(file => file === reduced ? comparedReduced : file).map(({ name, content, document, attachment }) => ({ name, content, document, attachment })), deniedPages, deniedOriginal, deniedUpload });
   } finally {
     await stop(rust); await stop(node); mocks.close(); relay.closeAllConnections(); await new Promise(resolve => relay.close(resolve));
     fs.rmSync(dataDir, { recursive: true, force: true });
@@ -153,7 +181,7 @@ async function scenario(front, mode, workerBase, fixtures, root, calls) {
 }
 async function main() {
   const front = required('NOEVIA_OCR_FRONT_BIN'); const worker = required('NOEVIA_OCR_NATIVE_BIN'); const services = required('NOEVIA_OCR_FIXTURE_SOURCE');
-  for (const [engine, option] of [['tesseract', '--version'], ['gs', '--version'], ['pdftoppm', '-v'], ['pdftotext', '-v']]) {
+  for (const [engine, option] of [['tesseract', '--version'], ['gs', '--version'], ['pdftoppm', '-v'], ['pdftotext', '-v'], ['pdfinfo', '-v']]) {
     const probe = spawnSync(engine, [option], { encoding: 'utf8' });
     assert.equal(probe.status, 0, `${engine} is required; this gate cannot skip`);
   }
