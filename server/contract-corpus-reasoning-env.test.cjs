@@ -9,7 +9,7 @@ async function childEnv(overrides) {
   const child=new EventEmitter();child.stderr=new EventEmitter();child.kill=()=>{};
   await vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../tools/contract-corpus/serve.cjs'),'utf8'),{
     require:name=>name==='node:child_process'?{spawn:(_bin,_args,options)=>{captured=options.env;return child;}}:name==='./mocks.cjs'?{...mocks,startMocks:async()=>fakeMocks}:require(name),
-    process:{env:{UI_DATA_DIR:'/synthetic/corpus',UI_PORT:'18021',PRIVATE_TEST_VALUE:'must-not-inherit',...overrides},execPath:process.execPath,on:()=>{},exit:()=>{throw Error('unexpected launcher exit');}},console,
+    process:{argv:[process.execPath,path.join(__dirname,'../tools/contract-corpus/serve.cjs')],env:{UI_DATA_DIR:'/synthetic/corpus',UI_PORT:'18021',PRIVATE_TEST_VALUE:'must-not-inherit',...overrides},execPath:process.execPath,on:()=>{},exit:()=>{throw Error('unexpected launcher exit');}},console,
   },{filename:'tools/contract-corpus/serve.cjs'});
   assert.ok(captured);assert.equal(captured.PRIVATE_TEST_VALUE,undefined);return captured;
 }

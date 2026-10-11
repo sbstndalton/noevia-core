@@ -139,6 +139,17 @@ function createFeatures({ env = process.env, store = null, audit = () => {}, reg
     state.set(name, { value, source, boot: value, unavailable: spec.unavailable?.(env) || null });
   }
   const resolve = name => (state.has(name) ? name : aliases.get(name) || name);
+  // Confirmed native routing configuration reads this one product flag independently. Keep
+  // Node's chat/read surfaces consistent with its SQLite truth, including a failed audit after
+  // a committed admin save. Node remains the sole feature:routingModes writer.
+  const refreshRoutingModes = () => {
+    if (!store || !state.has('routingModes') || !require('./routing-modes.cjs').rustOwned(env)) return;
+    const s = state.get('routingModes');
+    if (s.source === 'env') return;
+    const saved = store.get(SETTING_PREFIX + 'routingModes');
+    const valid = saved === 'true' || saved === 'false';
+    state.set('routingModes', { ...s, value: valid ? saved === 'true' : false, source: valid ? 'admin' : 'default' });
+  };
   const known = name => state.has(name);
   const unavailable = name => availability[name] ? availability[name]() : state.get(name).unavailable;
   return {
@@ -146,20 +157,21 @@ function createFeatures({ env = process.env, store = null, audit = () => {}, reg
     /** The current name for a flag, mapping a legacy alias (e.g. astraReview) to its new name. */
     resolve,
     enabled(name) {
+      refreshRoutingModes();
       name = resolve(name);
       if (!known(name)) throw new Error(`Unknown feature: ${name}`);
       const s = state.get(name);
       return !unavailable(name) && (registry[name].restart ? s.boot : s.value);
     },
     /** Booleans only: safe to send to any signed-in user. */
-    flags: () => Object.fromEntries([...state].map(([name, s]) => [name, !unavailable(name) && (registry[name].restart ? s.boot : s.value)])),
+    flags: () => { refreshRoutingModes(); return Object.fromEntries([...state].map(([name, s]) => [name, !unavailable(name) && (registry[name].restart ? s.boot : s.value)])); },
     // `id` is the flag name: the stable key the client translates the label and description by
     // (features.item.<id>.*, #618). `label` and `description` remain the English fallback.
-    describe: () => [...state].map(([name, s]) => ({ id: name, name, label: registry[name].label, description: registry[name].description,
+    describe: () => { refreshRoutingModes(); return [...state].map(([name, s]) => ({ id: name, name, label: registry[name].label, description: registry[name].description,
       enabled: s.value, source: s.source, locked: s.source === 'env', env: registry[name].env,
       ...(registry[name].experimental ? { experimental: true, unavailable: unavailable(name), unavailableId: unavailableId(name, unavailable(name)) }
         : registry[name].unavailable ? { unavailable: unavailable(name), unavailableId: unavailableId(name, unavailable(name)) } : {}),
-      pendingRestart: !!registry[name].restart && s.value !== s.boot })),
+      pendingRestart: !!registry[name].restart && s.value !== s.boot })); },
     set(name, enabled, actorId) {
       name = resolve(name);
       if (!known(name)) throw Object.assign(new Error('Unknown feature'), { status: 404 });
@@ -180,7 +192,9 @@ function createFeatures({ env = process.env, store = null, audit = () => {}, reg
 /** The auth database's key/value settings table as a feature store. */
 function settingsStore(db) {
   return {
-    get: key => db.prepare('SELECT value FROM settings WHERE key=?').get(key)?.value,
+    get: key => key === 'feature:routingModes'
+      ? db.prepare("SELECT CASE WHEN typeof(value)='text' AND value IN ('true','false') THEN value ELSE NULL END AS value FROM settings WHERE key=?").get(key)?.value
+      : db.prepare('SELECT value FROM settings WHERE key=?').get(key)?.value,
     set: (key, value) => db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run(key, value),
   };
 }

@@ -225,6 +225,34 @@ async function main() {
       await step(admin, 'GET', '/api/reasoning-settings', undefined, [200]);
     }
 
+    // Opt-in synthetic routing corpus: default recording stays the existing193 exchanges.
+    // No provider is used; these are configuration records only.
+    if (process.env.NOEVIA_ROUTING_CORPUS === '1') {
+      await step(admin, 'PUT', '/api/admin/features/routingModes', { enabled: true }, [200]);
+      await step(anon, 'GET', '/api/routing-mode', undefined, [401]);
+      await step(anon, 'PUT', '/api/routing-mode', { mode: 'local' }, [401]);
+      await step(member, 'PUT', '/api/routing-mode', { mode: 'hybrid', whenSensitive: 'local' }, [200]);
+      await step(admin, 'PUT', '/api/routing-mode', { mode: 'cloud', cloud: { providerId: 'synthetic-cloud', code: 'synthetic/model' } }, [200]);
+      await step(admin, 'GET', '/api/routing-mode', undefined, [200]);
+      await step(member, 'GET', '/api/routing-mode', undefined, [200]);
+      await step(member, 'PUT', '/api/routing-mode/allowed', { allowed: ['local'] }, [403]);
+      await step(admin, 'PUT', '/api/routing-mode/allowed', { allowed: ['hybrid','local','local'] }, [200]);
+      await step(admin, 'GET', '/api/routing-mode', undefined, [200]);
+      await step(admin, 'PUT', '/api/routing-mode', { mode: 'cloud', cloud: {} }, [403]);
+      await step(admin, 'PUT', '/api/routing-mode/allowed', { allowed: [] }, [200]);
+      await step(member, 'GET', '/api/routing-mode', undefined, [200]);
+      await step(member, 'PUT', '/api/routing-mode', { mode: null }, [200]);
+      await step(admin, 'PUT', '/api/routing-mode/allowed', { allowed: ['local','cloud','hybrid'] }, [200]);
+      for (const method of ['POST','PATCH','DELETE','OPTIONS']) {
+        await step(admin, method, '/api/routing-mode', undefined, [405]);
+        await step(admin, method, '/api/routing-mode/allowed', undefined, [405]);
+      }
+      await step(admin, 'PUT', '/api/admin/features/routingModes', { enabled: false }, [200]);
+      await step(admin, 'PUT', '/api/routing-mode', { mode: 'local' }, [409]);
+      await step(member, 'PUT', '/api/routing-mode/allowed', { allowed: [] }, [409]);
+      await step(admin, 'GET', '/api/routing-mode', undefined, [200]);
+    }
+
     // M3: the account routes the Rust front can take over (NOEVIA_RUST_AUTH), end to end.
     const evil = new Client(base, 'https://evil.example.test');
     await step(evil, 'POST', '/api/auth/login/password', { username: ADMIN.username, password: 'not-the-password-synthetic' }, [403]);
