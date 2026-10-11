@@ -24,7 +24,7 @@ const EN_SETTINGS = load('settings/en-GB').EN_GB_SETTINGS;
 const base = (l) => load(l)[FILES[l]];
 const settings = (l) => load('settings/' + l)[FILES[l] + '_SETTINGS'];
 const src = (p) => fs.readFileSync(path.join(__dirname, '../../src', p), 'utf8');
-const { REGISTRY } = require('../../server/features.cjs');
+const { REGISTRY, unavailableId } = require('../../server/features.cjs');
 
 // Words that are the same in every one of these languages (product terms and loanwords).
 const SAME_EVERYWHERE = /^(Auto|Harness|Code|Terminal|Worktrees|Hooks|Google Drive)$/;
@@ -47,7 +47,7 @@ test('the English catalogue says what the server registry says, apart from spell
 });
 
 test('every reason id the server can send has a translation (#618)', () => {
-  const ids = [...src('../server/features.cjs').matchAll(/\? '([a-zA-Z]+)' :/g)].map((m) => m[1]);
+  const ids = [...unavailableId.toString().matchAll(/(?:\breturn\s+|\?\s*|:\s*)'([a-zA-Z]+)'/g)].map((m) => m[1]);
   assert.ok(ids.includes('browserPlaywright') && ids.includes('trustProxy') && ids.includes('notUsed'), ids.join());
   for (const id of new Set(ids)) assert.ok(EN_SETTINGS[`features.unavailable.${id}`], id);
 });
