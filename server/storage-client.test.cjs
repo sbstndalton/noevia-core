@@ -47,10 +47,12 @@ function startFakeDav() {
     'Cowork/Docs/huge.md': 'x'.repeat(250_000),
     'Cowork/Docs/image.png': '\u0089PNG-data',
   };
+  const listingStatuses = new Map();
   const server = http.createServer((req, res) => {
     const decoded = decodeURIComponent(req.url.split('?')[0]).replace(/\/+$/, '');
     const relative = decoded.replace(/^\/dav\/?/, '');
     if (req.method === 'PROPFIND') {
+      if (listingStatuses.has(relative)) { res.writeHead(listingStatuses.get(relative)); res.end(); return; }
       if (relative === 'Unavailable') { res.writeHead(503); res.end(); return; }
       const children = tree[relative] || [];
       const self = relative ? relative.split('/').pop() : 'root';
@@ -97,7 +99,7 @@ function startFakeDav() {
     res.end();
   });
   return new Promise((resolve) => {
-    server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port }));
+    server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port, tree, bodies, listingStatuses }));
   });
 }
 
@@ -247,6 +249,19 @@ test('an out-of-range or surrogate numeric entity in a hostile PROPFIND body doe
   assert.equal(entries.length, 3);
 });
 
+test('Nextcloud DAV listing refuses HTTP errors but accepts a valid empty 207 (#1313)', async (t) => {
+  const dav = await startFakeDav(); t.after(() => dav.server.close());
+  const conn = { kind: 'nextcloud', baseUrl: `http://127.0.0.1:${dav.port}/dav`, username: 'synthetic', secret: 'synthetic', corpusRoot: 'Cowork' };
+  for (const status of [404, 401, 403, 503]) {
+    dav.listingStatuses.set('Cowork/Docs', status);
+    await assert.rejects(() => listFiles(conn, 'Cowork/Docs'), e => e.message === `storage returned ${status}`);
+  }
+  dav.listingStatuses.delete('Cowork/Docs');
+  assert.ok((await listFiles(conn, 'Cowork/Docs')).some(e => e.name === 'notes.md'), '404 recovery returns current listing');
+  dav.tree['Cowork/Docs'] = [];
+  assert.deepEqual(await listFiles(conn, 'Cowork/Docs'), [], 'valid 207 empty inventory remains authoritative');
+});
+
 test('createFolder makes a directory, tolerates one that exists, and refuses S3', async (t) => {
   const { server, port } = await startFakeDav();
   t.after(() => server.close());
@@ -360,7 +375,7 @@ process.env.UI_DATA_DIR = testDataDir;
 process.env.LEGACY_AUTH_COMPAT = 'true';
 process.env.PUBLIC_ORIGIN = 'http://localhost';
 
-const { handleRequest } = require('./index.cjs');
+let handleRequest; // Initialised after the synthetic DAV endpoint also isolates RAG HTTP calls.
 
 test.after(() => {
   if (sharedDav) sharedDav.server.close();
@@ -401,6 +416,9 @@ let sharedDav = null;
 
 test.before(async () => {
   sharedDav = await startFakeDav();
+  // No model/inference endpoint: the owned DAV fixture refuses embedding POSTs with 405.
+  process.env.EMBEDDING_BASE_URL = `http://127.0.0.1:${sharedDav.port}/dav`;
+  ({ handleRequest } = require('./index.cjs'));
   const setupCode = fs.readFileSync(path.join(testDataDir, 'first-run-setup-code'), 'utf8').trim();
   const setup = await request('/api/setup/complete', {
     method: 'POST', headers: { origin: 'http://localhost' },
@@ -520,6 +538,70 @@ test('a temporary folder failure preserves its sources, while explicit detachmen
   await request(`/api/projects/${project.id}/config`, { method: 'POST', headers: mutationHeaders(), body: JSON.stringify({ sourceFolders: [] }) });
   await request(syncUrl, { method: 'POST', headers: mutationHeaders() });
   assert.deepEqual((await workspaceProject(project.id)).files, []);
+});
+
+test('DAV HTTP listing failures retain attached project sources and cached originals (#1313)', async (t) => {
+  const storage = kind => request('/api/integrations/storage', { method: 'PUT', headers: mutationHeaders(), body: JSON.stringify({ kind, baseUrl: `http://127.0.0.1:${sharedDav.port}/dav`, username: 'u', secret: 'p', corpusRoot: 'Cowork' }) });
+  t.after(async () => { await storage('webdav'); });
+  assert.equal((await storage('nextcloud')).status, 200);
+  const { tree, bodies, listingStatuses } = sharedDav;
+  tree.SyntheticLinked = ['notes.md']; bodies['SyntheticLinked/notes.md'] = 'linked knowledge';
+  tree.SyntheticOther = ['other.md']; bodies['SyntheticOther/other.md'] = 'other knowledge';
+  const project = await createTestProject('DAV retention');
+  const config = patch => request(`/api/projects/${project.id}/config`, { method: 'POST', headers: mutationHeaders(), body: JSON.stringify(patch) });
+  const sync = async () => {
+    const response = await request(`/api/projects/${project.id}/sources/sync`, { method: 'POST', headers: mutationHeaders() });
+    assert.equal(response.status, 200); return JSON.parse(response.text);
+  };
+  await config({ files: [{ name: 'local.txt', content: 'unrelated local upload' }] });
+  const upload = await request(`/api/projects/${project.id}/upload`, { method: 'POST', headers: mutationHeaders(), body: JSON.stringify({ name: 'remote.txt', organized: true, dataBase64: Buffer.from('original remote bytes').toString('base64') }) });
+  assert.equal(upload.status, 200, upload.text);
+  const owned = (await workspaceProject(project.id)).projectFolder;
+  await config({ sourceFolders: [owned, 'SyntheticLinked', 'SyntheticOther'] });
+  await sync();
+  const before = await workspaceProject(project.id);
+  const original = before.files.find(f => f.attachment);
+  assert.ok(original && original.name === `${owned}/Text/remote.txt`);
+  const user = fs.readdirSync(path.join(testDataDir, 'users')).find(id => /^[a-f0-9-]{36}$/.test(id));
+  const cacheDir = path.join(testDataDir, 'users', user, 'project-uploads', require('node:crypto').createHash('sha256').update(project.id).digest('hex'));
+  const cache = () => Object.fromEntries(fs.readdirSync(cacheDir).sort().map(name => [name, fs.readFileSync(path.join(cacheDir, name)).toString('base64')]));
+  const previousCache = cache(); assert.ok(Object.keys(previousCache).length);
+  const rag = require('./rag.cjs'), deleteFile = rag.deleteProjectFile, deleted = [];
+  rag.deleteProjectFile = (...args) => { deleted.push(args[1]); return deleteFile(...args); };
+  try {
+    for (const [folder, status] of [[owned, 404], ['SyntheticLinked', 404], ['SyntheticLinked', 401], ['SyntheticLinked', 403], ['SyntheticLinked', 503], [`${owned}/Text`, 404]]) {
+      listingStatuses.set(folder, status); deleted.length = 0;
+      const result = await sync();
+      assert.deepEqual((await workspaceProject(project.id)).files, before.files, `HTTP ${status} at ${folder} must retain exact sources`);
+      assert.deepEqual(result.files.map(f => [f.name, f.bytes]), before.files.map(f => [f.name, f.content.length]));
+      assert.deepEqual((await workspaceProject(project.id)).sourceFolders, before.sourceFolders);
+      assert.ok(result.skipped.some(s => (s.folder === folder || s.file === folder) && s.retained === true));
+      assert.deepEqual(deleted, [], 'failed listing must not delete RAG entries');
+      assert.deepEqual(cache(), previousCache, 'failed listing must not prune original cache bytes');
+      listingStatuses.delete(folder);
+    }
+    bodies[original.name] = 'recovered remote bytes';
+    const recovered = await sync(); assert.deepEqual(recovered.skipped, []);
+    assert.equal((await workspaceProject(project.id)).files.find(f => f.name === original.name).content, 'recovered remote bytes');
+    tree.SyntheticLinked = []; deleted.length = 0;
+    const empty = await sync(); assert.deepEqual(empty.skipped, []);
+    const afterEmpty = await workspaceProject(project.id);
+    assert.ok(afterEmpty.sourceFolders.includes('SyntheticLinked'), 'valid empty folder stays attached');
+    assert.ok(!afterEmpty.files.some(f => f.source === 'SyntheticLinked'), 'valid 207 emptiness remains authoritative');
+    assert.deepEqual(deleted, ['SyntheticLinked/notes.md']);
+    deleted.length = 0;
+    await config({ sourceFolders: [owned, 'SyntheticLinked'] });
+    await sync();
+    const detached = await workspaceProject(project.id);
+    assert.ok(!detached.files.some(f => f.source === 'SyntheticOther'));
+    assert.ok(detached.files.some(f => f.name === 'local.txt'));
+    assert.ok(detached.files.some(f => f.name === original.name));
+    assert.deepEqual(deleted, ['SyntheticOther/other.md'], 'explicit detach removes only selected folder');
+  } finally {
+    rag.deleteProjectFile = deleteFile; listingStatuses.clear();
+    delete tree.SyntheticLinked; delete tree.SyntheticOther;
+    delete bodies['SyntheticLinked/notes.md']; delete bodies['SyntheticOther/other.md'];
+  }
 });
 
 test('uploads work without remote storage and gain a folder after connecting it', async () => {
