@@ -549,6 +549,15 @@ fn main() -> ExitCode {
             }
         };
     }
+    if std::env::args().nth(1).as_deref() == Some("--lifecycle-selftest") {
+        return match lifecycle_selftest() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("lifecycle control failed: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -560,6 +569,32 @@ fn main() -> ExitCode {
 fn probe_child() -> ExitCode {
     use std::io::Write;
     match std::env::args().nth(2).as_deref() {
+        Some("detached-pipes") => {
+            use std::os::unix::process::CommandExt;
+            let result = (|| -> Result<(), String> {
+                let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+                let child = Command::new(exe)
+                    .args(["--probe-child", "pipe-holder"])
+                    .process_group(0)
+                    .stdin(std::process::Stdio::null())
+                    .spawn()
+                    .map_err(|e| e.to_string())?;
+                let path = std::env::args()
+                    .nth(3)
+                    .ok_or("missing synthetic pid file")?;
+                std::fs::write(path, child.id().to_string()).map_err(|e| e.to_string())
+            })();
+            if result.is_ok() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Some("pipe-holder") => {
+            // Finite emergency lifetime even if the synthetic control is interrupted.
+            std::thread::sleep(Duration::from_secs(5));
+            ExitCode::SUCCESS
+        }
         Some("exit") => ExitCode::SUCCESS,
         Some("oversized") => match std::io::stdout().write_all(&vec![b'x'; process::INPUT + 1]) {
             Ok(()) => ExitCode::SUCCESS,
@@ -569,6 +604,93 @@ fn probe_child() -> ExitCode {
             std::thread::sleep(Duration::from_secs(1));
         },
     }
+}
+fn lifecycle_selftest() -> Result<(), Failure> {
+    use rustix::process::{waitid, WaitId, WaitIdOptions};
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let mut command = Command::new(&exe);
+    command.args(["--probe-child", "exit"]);
+    let mut retained = false;
+    let mut child_pid = None;
+    let output = process::bounded_observed(
+        &mut command,
+        Vec::new(),
+        Duration::from_millis(300),
+        |id| child_pid = rustix::process::Pid::from_raw(id as i32),
+        |id| {
+            retained = rustix::process::Pid::from_raw(id as i32).is_some_and(|pid| {
+                waitid(
+                    WaitId::Pid(pid),
+                    WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+                )
+                .is_ok_and(|status| status.is_some())
+            });
+        },
+    )?;
+    require(
+        output.status.success() && retained,
+        "lifecycle/signal-before-reap",
+    )?;
+    require(
+        child_pid.is_some_and(|pid| {
+            waitid(
+                WaitId::Pid(pid),
+                WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+            )
+            .is_err()
+        }),
+        "lifecycle/after-signal-reaped",
+    )?;
+    println!("signal-before-reap control: exited leader remained waitable before group signal and was reaped afterward");
+
+    use std::os::unix::fs::DirBuilderExt;
+    let directory =
+        std::env::temp_dir().join(format!("routing-detached-pipe-{}", std::process::id()));
+    // Exclusive private directory prevents a preexisting /tmp entry from supplying
+    // the synthetic PID or redirecting the child's PID-file write.
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&directory)
+        .map_err(|e| e.to_string())?;
+    let path = directory.join("holder.pid");
+    command = Command::new(exe);
+    command.args(["--probe-child", "detached-pipes"]).arg(&path);
+    let start = std::time::Instant::now();
+    let result =
+        process::bounded_with(&mut command, Vec::new(), Duration::from_millis(300), |id| {
+            child_pid = rustix::process::Pid::from_raw(id as i32)
+        });
+    let elapsed = start.elapsed();
+    // Clean only the PID recorded by this fixed synthetic child, before asserting.
+    let pid_text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let holder = pid_text
+        .parse::<i32>()
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .ok_or("invalid synthetic holder pid")?;
+    let alive = rustix::process::test_kill_process(holder).is_ok();
+    rustix::process::kill_process_group(holder, rustix::process::Signal::KILL)
+        .map_err(|e| e.to_string())?;
+    std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+    std::fs::remove_dir(&directory).map_err(|e| e.to_string())?;
+    require(alive, "lifecycle/escaped-holder-outside-authority")?;
+    require(
+        result
+            .as_ref()
+            .err()
+            .is_some_and(|e| e == "child deadline exceeded"),
+        "lifecycle/detached-pipe-deadline",
+    )?;
+    require(
+        elapsed < Duration::from_millis(1500),
+        "lifecycle/detached-pipe-return-bound",
+    )?;
+    require(
+        child_pid.is_some_and(|pid| rustix::process::test_kill_process(pid).is_err()),
+        "lifecycle/detached-leader-reaped",
+    )?;
+    println!("detached inherited stdout/stderr control: 300ms deadline returned in {}ms; escaped synthetic holder alive outside group authority, explicitly signalled; direct leader reaped", elapsed.as_millis());
+    Ok(())
 }
 fn selftest() -> Result<(), Failure> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;

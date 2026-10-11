@@ -1,9 +1,11 @@
-//! Fixed finite child limits. All pipe workers are joined after process-group kill/reap.
+//! Bounded nonblocking pipe IO; signal the owned group before reaping its leader.
+//! Descendants that leave that group are outside cleanup authority. Their inherited
+//! pipe descriptors cannot delay deadline return because no IO worker is joined.
 use std::{
     io::{Read, Write},
+    os::fd::AsFd,
     os::unix::process::CommandExt,
     process::{Child, Command, ExitStatus, Stdio},
-    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -12,36 +14,71 @@ const OUTPUT: usize = 2 * 1024 * 1024;
 const STDERR: usize = 64 * 1024;
 struct Owned(Child, bool);
 impl Owned {
-    fn stop(&mut self) {
+    fn pid(&self) -> Result<rustix::process::Pid, String> {
+        i32::try_from(self.0.id())
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+            .ok_or_else(|| "invalid child identity".into())
+    }
+    fn exited(&self) -> Result<bool, String> {
+        use rustix::process::{waitid, WaitId, WaitIdOptions};
+        waitid(
+            WaitId::Pid(self.pid()?),
+            WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+        )
+        .map(|status| status.is_some())
+        .map_err(|e| format!("child observation failed: {e}"))
+    }
+    fn stop(&mut self, before_signal: impl FnOnce(u32)) -> Result<ExitStatus, String> {
         if self.1 {
-            return;
+            return Err("child already reaped".into());
         }
-        self.1 = true;
-        if let Some(pid) = rustix::process::Pid::from_raw(self.0.id() as i32) {
+        // No try_wait/wait has consumed the leader. Even an exited leader retains
+        // this numeric identity until the wait below, after the owned group signal.
+        before_signal(self.0.id());
+        if let Ok(pid) = self.pid() {
             let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
         }
         let _ = self.0.kill();
-        let _ = self.0.wait();
+        let status = self.0.wait().map_err(|e| format!("child reap failed: {e}"));
+        self.1 = status.is_ok();
+        status
     }
 }
 impl Drop for Owned {
     fn drop(&mut self) {
-        self.stop();
+        if !self.1 {
+            let _ = self.stop(|_| {});
+        }
     }
 }
-fn read(mut pipe: impl Read, cap: usize) -> Result<Vec<u8>, String> {
-    let mut bytes = Vec::new();
+fn nonblocking(pipe: &impl AsFd) -> Result<(), String> {
+    let flags = rustix::fs::fcntl_getfl(pipe).map_err(|e| e.to_string())?;
+    rustix::fs::fcntl_setfl(pipe, flags | rustix::fs::OFlags::NONBLOCK).map_err(|e| e.to_string())
+}
+// One bounded syscall per stream per iteration prevents a continuously producing
+// child from starving another stream or the monotonic deadline check.
+fn read_step(pipe: &mut impl Read, bytes: &mut Vec<u8>, cap: usize) -> Result<bool, String> {
     let mut buf = [0; 4096];
-    loop {
-        let n = pipe.read(&mut buf).map_err(|e| e.to_string())?;
-        if n == 0 {
-            return Ok(bytes);
+    match pipe.read(&mut buf) {
+        Ok(0) => Ok(true),
+        Ok(n) => {
+            if bytes.len() + n > cap {
+                return Err("child output limit exceeded".into());
+            }
+            bytes.try_reserve(n).map_err(|e| e.to_string())?;
+            bytes.extend(buf.get(..n).ok_or("invalid child read count")?);
+            Ok(false)
         }
-        if bytes.len() + n > cap {
-            return Err("child output limit exceeded".into());
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+            ) =>
+        {
+            Ok(false)
         }
-        bytes.try_reserve(n).map_err(|e| e.to_string())?;
-        bytes.extend(buf.get(..n).ok_or("invalid child read count")?);
+        Err(e) => Err(format!("child output failed: {e}")),
     }
 }
 pub struct Output {
@@ -57,6 +94,15 @@ pub fn bounded_with(
     input: Vec<u8>,
     deadline: Duration,
     spawned: impl FnOnce(u32),
+) -> Result<Output, String> {
+    bounded_observed(command, input, deadline, spawned, |_| {})
+}
+pub fn bounded_observed(
+    command: &mut Command,
+    input: Vec<u8>,
+    deadline: Duration,
+    spawned: impl FnOnce(u32),
+    before_signal: impl FnOnce(u32),
 ) -> Result<Output, String> {
     if input.len() > INPUT {
         return Err("child input limit exceeded".into());
@@ -74,62 +120,82 @@ pub fn bounded_with(
         false,
     );
     spawned(child.0.id());
-    let stdin = child.0.stdin.take().ok_or("child stdin unavailable")?;
-    let stdout = child.0.stdout.take().ok_or("child stdout unavailable")?;
-    let stderr = child.0.stderr.take().ok_or("child stderr unavailable")?;
-    let (send, receive) = mpsc::channel();
-    let tx = send.clone();
-    let write = thread::spawn(move || {
-        let result = {
-            let mut stdin = stdin;
-            stdin
-                .write_all(&input)
-                .map(|_| Vec::new())
-                .map_err(|e| format!("child stdin failed: {e}"))
-        };
-        let _ = tx.send((0, result));
-    });
-    let tx = send.clone();
-    let out = thread::spawn(move || {
-        let _ = tx.send((1, read(stdout, OUTPUT)));
-    });
-    let err = thread::spawn(move || {
-        let _ = send.send((2, read(stderr, STDERR)));
-    });
-    let mut stdout = None;
-    let mut stderr = None;
-    let mut wrote = false;
+    let mut stdin = Some(child.0.stdin.take().ok_or("child stdin unavailable")?);
+    let mut stdout_pipe = child.0.stdout.take().ok_or("child stdout unavailable")?;
+    let mut stderr_pipe = child.0.stderr.take().ok_or("child stderr unavailable")?;
+    nonblocking(stdin.as_ref().ok_or("child stdin absent")?)?;
+    nonblocking(&stdout_pipe)?;
+    nonblocking(&stderr_pipe)?;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut written = 0;
+    let mut out_done = false;
+    let mut err_done = false;
     let result = (|| loop {
-        while let Ok((stream, result)) = receive.try_recv() {
-            let bytes = result?;
-            match stream {
-                0 => wrote = true,
-                1 => stdout = Some(bytes),
-                2 => stderr = Some(bytes),
-                _ => return Err("unknown child stream".into()),
-            }
-        }
-        if let Some(status) = child.0.try_wait().map_err(|e| e.to_string())? {
-            if wrote && stdout.is_some() && stderr.is_some() {
-                return Ok(Output {
-                    status,
-                    stdout: stdout.take().ok_or("child stdout absent")?,
-                    stderr: stderr.take().ok_or("child stderr absent")?,
-                });
-            }
-        }
         if start.elapsed() >= deadline {
             return Err("child deadline exceeded".into());
         }
-        thread::sleep(Duration::from_millis(2));
-    })();
-    child.stop();
-    for worker in [write, out, err] {
-        if worker.join().is_err() {
-            return Err("child pipe worker panicked".into());
+        let previous = (
+            written,
+            stdout.len(),
+            stderr.len(),
+            stdin.is_none(),
+            out_done,
+            err_done,
+        );
+        if let Some(pipe) = stdin.as_mut() {
+            if written == input.len() {
+                stdin = None;
+            } else {
+                let remaining = input.get(written..).ok_or("invalid child write count")?;
+                let chunk = remaining
+                    .get(..remaining.len().min(4096))
+                    .ok_or("invalid child input slice")?;
+                match pipe.write(chunk) {
+                    Ok(0) => return Err("child stdin failed: write zero".into()),
+                    Ok(n) => written += n,
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(e) => return Err(format!("child stdin failed: {e}")),
+                }
+            }
         }
-    }
-    result
+        if !out_done {
+            out_done = read_step(&mut stdout_pipe, &mut stdout, OUTPUT)?;
+        }
+        if !err_done {
+            err_done = read_step(&mut stderr_pipe, &mut stderr, STDERR)?;
+        }
+        if child.exited()? && stdin.is_none() && out_done && err_done {
+            return Ok(());
+        }
+        if previous
+            == (
+                written,
+                stdout.len(),
+                stderr.len(),
+                stdin.is_none(),
+                out_done,
+                err_done,
+            )
+        {
+            thread::sleep(Duration::from_millis(2).min(deadline.saturating_sub(start.elapsed())));
+        }
+    })();
+    // Close local pipes before cleanup; remote holders have no bearing on this.
+    drop(stdin);
+    drop(stdout_pipe);
+    drop(stderr_pipe);
+    let status = child.stop(before_signal)?;
+    result?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 pub fn json_input(value: &serde_json::Value) -> Result<Vec<u8>, String> {
     struct Limited(Vec<u8>);
