@@ -94,7 +94,7 @@ async function davList(conn, fullPath) {
     signal: AbortSignal.timeout(15000),
     redirect: 'error',
   }));
-  if (response.status === 404) return [];
+  // #1313: an unavailable attached path is a failed listing, not authoritative emptiness.
   if (!response.ok && response.status !== 207) throw new Error(`storage returned ${response.status}`);
   const { text: body } = await readCappedText(response, LIST_BODY_CAP);
   // Untrusted body: parsed by dav-listing.cjs (the fail-closed WebAssembly port,
