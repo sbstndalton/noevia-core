@@ -923,3 +923,26 @@ test('#1249: a null or blank model path is refused (400 invalid_path) under ever
   await f.call('PUT', '/api/model-manager/sections/chat-syn', { baseRevision: 'r', values: { mmproj: '', mm: null, 'model-draft': null, md: '' } }, 'admin');
   assert.equal(f.fetched.length, 1, 'clearing mmproj / model-draft still goes through');
 });
+
+test('#1461 /api/stats is shared for a moment, and a model or role write drops the shared answer', async () => {
+  let statsCalls = 0;
+  const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, manager: { stats: async () => { statsCalls += 1; return { ok: true, body: { scope: 'engine', tokens_per_second: 41.5, mtp: [] } }; } } });
+  await Promise.all([f.call('GET', '/api/stats'), f.call('GET', '/api/stats')]);
+  assert.equal(statsCalls, 1, 'concurrent tabs share one engine read');
+  await f.call('GET', '/api/stats');
+  assert.equal(statsCalls, 1, 'a poll inside the TTL is served the shared answer');
+  assert.equal(f.sent.pop().body.tokensPerSecond, 41.5, 'the shared answer still carries the engine numbers');
+  await f.call('PUT', '/api/auto-roles', { fast: 'm', smart: 'm' }, 'admin');
+  await f.call('GET', '/api/stats');
+  assert.equal(statsCalls, 2, 'a role save makes the next stats read fresh');
+});
+
+test('#1461 /api/stats keeps the tenant-scoped tokens figure per request, not inside the shared read', async () => {
+  let statsCalls = 0;
+  const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, manager: { stats: async () => { statsCalls += 1; return { ok: true, body: { scope: 'engine', tokens_per_second: 9, mtp: [] } }; } } });
+  await f.call('GET', '/api/stats');
+  await f.call('GET', '/api/stats', undefined, 'member');
+  assert.equal(statsCalls, 1);
+  assert.equal(f.sent.length, 2);
+  assert.equal(f.sent[0].body.tokensPerSecond, f.sent[1].body.tokensPerSecond);
+});
