@@ -1038,6 +1038,10 @@ async function handleRequestScoped(req, res) {
   res.setHeader('Referrer-Policy', 'same-origin');
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");
+  // #1480: HSTS for six months, no includeSubDomains (nothing else on this host is known to need HTTP).
+  res.setHeader('Strict-Transport-Security', 'max-age=15552000');
+  // #1480: the browser features this app never calls are switched off for every page and API reply.
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), bluetooth=(), hid=(), midi=(), magnetometer=(), gyroscope=(), accelerometer=()');
 
   try {
     if ((req.method === 'GET' || req.method === 'HEAD') && publicPage(p)) {
