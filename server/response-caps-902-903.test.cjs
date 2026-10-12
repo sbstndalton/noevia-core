@@ -218,6 +218,7 @@ test('#918: a non-streaming fallback 502 with an HTML body sends providerError t
   assert.equal(errors.length, 1);
   assert.equal(errors[0].text, providerError(html));
   assert.doesNotMatch(errors[0].text, /</);
+  assert.doesNotMatch(errors[0].text, /Partial output/, '#1547: nothing was shown, so no partial-output claim');
   assert.doesNotMatch(errors[0].text, /Unexpected token|JSON/);
 });
 
@@ -231,6 +232,8 @@ test('#918: a stream that breaks mid-read sends mapped text, not the runtime err
   const out = await chatWith(t, async () => new Response(broken(), { status: 200, headers: { 'content-type': 'text/event-stream' } }), { message: 'hello' });
   const errors = out.split('\n').filter((l) => l.startsWith('data: ')).map((l) => JSON.parse(l.slice(6))).filter((e) => e.type === 'error');
   assert.equal(errors.length, 1);
-  assert.equal(errors[0].text, providerError(internal));
+  // #1547: "Hi" was already shown, so the failure keeps the partial-output sentence.
+  assert.equal(errors[0].text, providerError(internal, undefined, { partial: true }));
+  assert.match(errors[0].text, /Partial output was preserved/);
   assert.doesNotMatch(errors[0].text, /other side closed|</);
 });

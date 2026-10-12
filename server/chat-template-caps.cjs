@@ -44,18 +44,21 @@ function toolsRefused(status, text) {
   return TOOL_SPECIFIC.test(detail) && classify(status, detail)?.kind === 'template_or_tools_unsupported';
 }
 
-/** The chat text for a failed provider reply, or null (the caller keeps its fixed sentences). */
-function failureText(status, text) {
+/** The chat text for a failed provider reply, or null (the caller keeps its fixed sentences).
+ *  #1547: `partial` (text already shown for this reply) decides whether the reply says partial output
+ *  was preserved; with nothing shown that claim is left out. */
+function failureText(status, text, { partial = false } = {}) {
   const c = classify(status, text);
   if (!c) return null;
-  const { CONTEXT_FULL_TEXT, STREAM_FAILED_TEXT } = require('./chat-context.cjs');
+  const { CONTEXT_FULL_TEXT, STREAM_FAILED_TEXT, STREAM_FAILED_PARTIAL_TEXT } = require('./chat-context.cjs');
   const r = c.reason;
+  const kept = partial ? ' Partial output was preserved.' : '';
   switch (c.kind) {
     case 'context_full': return CONTEXT_FULL_TEXT;
     case 'template_or_tools_unsupported': return `The model's chat template cannot handle this request${r ? `: ${r}` : ''}. Try another model, or ask without tools.`;
     case 'backend_down': return `The model backend is not responding${r ? ` (${r})` : ''}. Check that the engine is running, then retry.`;
-    case 'bad_request': return `The model provider refused the request${r ? `: ${r}` : ''}. Partial output was preserved.`;
-    default: return r ? `The model stream failed: ${r}. Partial output was preserved; check the backend before retrying.` : STREAM_FAILED_TEXT;
+    case 'bad_request': return `The model provider refused the request${r ? `: ${r}` : ''}.${kept}`;
+    default: return r ? `The model stream failed: ${r}. ${partial ? 'Partial output was preserved; check' : 'Check'} the backend before retrying.` : (partial ? STREAM_FAILED_PARTIAL_TEXT : STREAM_FAILED_TEXT);
   }
 }
 
