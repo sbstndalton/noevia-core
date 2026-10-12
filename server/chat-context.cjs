@@ -20,24 +20,46 @@ function hostedLimit(provider) {
 }
 // `hosted` is the provider row for a non-default (hosted/custom) provider, or null for the local
 // default. The model-manager path ignores it entirely.
-async function resolveRuntimeLimit({manager,model,dir,scope,onStatus=()=>{},signal,assertActive,hosted=null}) {
+// #1449: the wait for a role change is the model load. Load times are measured in this process (the
+// last few per model); the status names a number only when one was measured, else it omits it.
+const LOAD_SAMPLES = 5;
+const loadSamples = new Map();
+function recordLoad(model, ms) {
+  if (!Number.isFinite(ms) || ms < 0) return;
+  loadSamples.set(model, [...(loadSamples.get(model) || []), ms].slice(-LOAD_SAMPLES));
+}
+/** Whole seconds from the median recent load of `model`, at least 1, or null when none was measured. */
+function expectedLoadSeconds(model) {
+  const list = loadSamples.get(model);
+  if (!list?.length) return null;
+  const sorted = [...list].sort((a, b) => a - b);
+  return Math.max(1, Math.round(sorted[Math.floor(sorted.length / 2)] / 1000));
+}
+function loadingStatus(model, role, seconds) {
+  const who = role ? `${model} for the ${role} role` : model;
+  return `Loading the selected model ${who} and checking its context allocation…${seconds ? ` Expected wait about ${seconds} s.` : ''}`;
+}
+async function resolveRuntimeLimit({manager,model,dir,scope,onStatus=()=>{},signal,assertActive,hosted=null,role=null}) {
   assertActive?.();
-  if (manager?.enabled) return resolveManagedLimit({manager,model,dir,scope,onStatus,signal,assertActive});
+  if (manager?.enabled) return resolveManagedLimit({manager,model,dir,scope,onStatus,signal,assertActive,role});
   if (hosted) return hostedLimit(hosted);
   return runtimeLimit(null,model);
 }
-async function resolveManagedLimit({manager,model,dir,scope,onStatus,signal,assertActive}) {
+async function resolveManagedLimit({manager,model,dir,scope,onStatus,signal,assertActive,role=null}) {
   signal?.throwIfAborted();
   let response=await manager.health();
   assertActive?.();
   if (!response.ok) throw Error('Could not read the model backend context. Try again when the backend is available.');
   let health=response.body;
   if (!health?.all_models_loaded?.some(m=>m.model_name===model && m.loaded && m.backend_alive!==false)) {
-    onStatus('Loading the selected model and checking its context allocation…','loadingModel');
+    const seconds=expectedLoadSeconds(model);
+    onStatus(loadingStatus(model,role,seconds),'loadingModel',{model,...(role?{role}:{}),...(seconds?{expectedSeconds:seconds}:{})});
     signal?.throwIfAborted();
+    const started=Date.now();
     const loaded=await manager.load(model,{},signal);
     assertActive?.();
     if (!loaded.ok) throw Error('The selected model could not load. Its context allocation was not changed.');
+    recordLoad(model,Date.now()-started);
     signal?.throwIfAborted();
     response=await manager.health();
     assertActive?.();
@@ -71,7 +93,7 @@ function applySummary(messages,state) {
 function measure(messages,tools,limit,source,model) {
  const system=messages.filter(m=>m.role==='system'), other=messages.filter(m=>m.role!=='system');
  const parts=[{name:'Messages & summary',tokens:other.reduce((n,m)=>n+tokens(m),0)}, {name:'Instructions, memory & sources',tokens:system.reduce((n,m)=>n+tokens(m),0)}, {name:'Tools',tokens:tools.length?tokens(tools):0}];
- const used=parts.reduce((n,p)=>n+p.tokens,0), reserve=Math.min(4096,Math.floor(limit*.25)), safety=Math.ceil(limit*.15);
+ const used=parts.reduce((n,p)=>n+p.tokens,0), reserve=require('./thinking-budget.cjs').outputBudget(limit), safety=Math.ceil(limit*.15);
  return {model,limit,limitSource:source,estimated:true,used,reserve,safety,parts,free:Math.max(0,limit-used-reserve-safety),threshold:limit-reserve-safety,updatedAt:Date.now()};
 }
 function biggestPart(parts) { return parts.reduce((a,b)=>b.tokens>a.tokens?b:a); }
@@ -241,4 +263,4 @@ async function prepare(options){const key=stateFile(options.dir,options.id);if(b
 // R1 measurement, opt-in with CONTEXT_LOG=1; never breaks a chat.
 function logRound({dir,assertActive,...entry}){if(process.env.CONTEXT_LOG!=='1')return;try{const log=require('./context-log.cjs');const record=log.record(entry);assertActive?.();log.append(dir,record);}catch(e){console.warn('[context-log] write failed:',e.message);}}
 function remove(dir,id){fs.rmSync(stateFile(dir,id),{force:true});}
-module.exports={logRound,remove,tokens,read,save,runtimeLimit,resolveRuntimeLimit,HOSTED_DEFAULT_LIMIT,applySummary,measure,prepare,compactContinuation,providerError,CONTEXT_FULL_TEXT,STREAM_FAILED_TEXT};
+module.exports={logRound,remove,tokens,read,save,runtimeLimit,resolveRuntimeLimit,recordLoad,expectedLoadSeconds,loadingStatus,HOSTED_DEFAULT_LIMIT,applySummary,measure,prepare,compactContinuation,providerError,CONTEXT_FULL_TEXT,STREAM_FAILED_TEXT};

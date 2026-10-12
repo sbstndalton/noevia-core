@@ -230,10 +230,12 @@ function createChatHandler({
       if (execution.record && execution.aborted?.()) {
         try {
           const outcome = require('./chat-interrupted-turn.cjs').saveInterruptedTurn({ fs, workspace: execution.workspace, chatId: body.chatId,
-            message: body.message, entry: execution.record.assistantEntry(), cap: STORED_HISTORY_CAP });
+            message: body.message, entry: execution.record.partialEntry() || execution.record.assistantEntry(), cap: STORED_HISTORY_CAP });
           if (outcome !== 'saved' && outcome !== 'not-last') console.log(`[chat] interrupted reply not kept: ${outcome}`);
         } catch (error) { console.warn('[chat] could not keep an interrupted reply:', error?.message || error); }
       }
+      // #1507: the reply has ended (completed, failed, or kept above), so its saved partial is cleared.
+      execution.partials?.finish();
       // A chat deleted while this reply ran leaves no context state (summaries hold conversation text).
       const id=typeof body?.chatId==='string'?require('./chat-lists.cjs').safeChatId(body.chatId):null;
       try{const dir=currentWorkspace().dir;if(id&&require('./chat-lists.cjs').readTombstones(dir).has(id))require('./chat-context.cjs').remove(dir,id);}catch{/* best effort */}
@@ -512,6 +514,10 @@ function createChatHandler({
     const record = typeof body.chatId === 'string' && body.chatId && !spaceId?.startsWith('diary') && !body.compactOnly && chatWorkspace
       ? require('./chat-interrupted-turn.cjs').createTurnRecord() : null;
     if (record) Object.assign(execution, { record, workspace: chatWorkspace, aborted: () => chatSignal.signal.aborted });
+    // #1507: the partial reply is saved every few seconds, so a reload or a restart keeps what was written.
+    // (keyed by the same sanitised id the history route reads, so the two always agree.)
+    const partialId = record ? require('./chat-lists.cjs').safeChatId(body.chatId) : null;
+    if (partialId) execution.partials = require('./chat-partial.cjs').startPartialSaves({ dir: chatWorkspace.dir, chatId: partialId, record });
     // An error raised after the client left is the disconnect itself (an aborted compaction or
     // request), not a failed reply: the kept reply must not be dropped as failed (#679 review).
     const send = (obj) => { preparation?.event(obj); if (!(obj?.type === 'error' && chatSignal.signal.aborted)) record?.observe(obj); if (!res.destroyed && !chatSignal.signal.aborted) res.write(`data: ${JSON.stringify(obj)}\n\n`); };
@@ -1182,8 +1188,10 @@ function createChatHandler({
       ({limit,limitSource}=await context.resolveRuntimeLimit({
         manager:provider.id===DEFAULT_PROVIDER_ID?modelManager:null,model,dir:chatWorkspace.dir,
         scope:require('node:crypto').createHash('sha256').update(JSON.stringify([provider.baseUrl,provider.apiKey,modelManager.baseUrl])).digest('hex'),
-        signal:chatSignal.signal,onStatus:(text,id)=>send({type:'status',text,...(id?{id}:{})}),
+        signal:chatSignal.signal,onStatus:(text,id,detail)=>send({type:'status',text,...(id?{id}:{}),...(detail?{detail}:{})}),
         assertActive:assertWorkspaceActive,
+        // #1449: the routed role (fast/smart/code) names the model that is loading.
+        role:routedRole||null,
         // #536: a hosted/custom provider's own context setting (or the hosted default); the local default is unchanged.
         hosted:provider.id===DEFAULT_PROVIDER_ID?null:provider,
       }));
@@ -1200,6 +1208,8 @@ function createChatHandler({
       send({type:'context',...prepared.meter});
     } catch(error) {send({type:'error',text:error.message});res.end();return;}
     if(body.compactOnly){send({type:'done',model});res.end();return;}
+    // #1475/#1477: the local engine's thinking cap for this effort, leaving the answer its room (thinking-budget.cjs).
+    const localThinkingCap = provider.id===DEFAULT_PROVIDER_ID ? require('./thinking-budget.cjs').thinkingCap(effort, prepared.maxTokens) : null;
     const reportRevocation = () => {
       if (!skillRevocation || skillRevocationReported) return;
       skillRevocationReported = true;
@@ -1361,7 +1371,7 @@ function createChatHandler({
           method: 'POST', headers: upstreamHeaders, signal: chatSignal.signal, redirect: 'error',
         }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:true,stream_options:{include_usage:true},
           ...sampling.params,
-          ...requestTools(), ...forceChoice(round)}, provider, model, effort, send);
+          ...requestTools(), ...forceChoice(round)}, provider, model, effort, send, localThinkingCap);
         // A server that rejects the named-function form of tool_choice gets the equivalent it does
         // accept: only that tool, and a call required.
         if (forceChoice(round).tool_choice && upstream.status >= 400 && upstream.status < 500 && /tool_choice/i.test((await readCappedText(upstream.clone(), PROVIDER_ERROR_BODY_CAP).catch(() => ({ text: '' }))).text)) {
@@ -1369,7 +1379,7 @@ function createChatHandler({
           upstream = await reasoningEffort.requestWithEffort(providerFetch, upstreamUrl, {
             method: 'POST', headers: upstreamHeaders, signal: chatSignal.signal, redirect: 'error',
           }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:true,stream_options:{include_usage:true},
-            ...sampling.params, tools:activeTools.filter((t) => t.function?.name === forcedTool), tool_choice:'required'}, provider, model, effort, send);
+            ...sampling.params, tools:activeTools.filter((t) => t.function?.name === forcedTool), tool_choice:'required'}, provider, model, effort, send, localThinkingCap);
         }
         // #1002: the engine refused the tools because of the model's chat template (llama.cpp could
         // not build a tool-call parser for it). Retry this round once without tools, and say so.
@@ -1383,7 +1393,7 @@ function createChatHandler({
             upstream = await reasoningEffort.requestWithEffort(providerFetch, upstreamUrl, {
               method: 'POST', headers: upstreamHeaders, signal: chatSignal.signal, redirect: 'error',
             }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:true,stream_options:{include_usage:true},
-              ...sampling.params}, provider, model, effort, send);
+              ...sampling.params}, provider, model, effort, send, localThinkingCap);
             // #1015: remembered only when dropping tools is what fixed it; a template that fails
             // either way is not marked, so the next chat still offers tools.
             if (upstream.ok) templateToolsGate.markUnsupported(model);
@@ -1511,7 +1521,7 @@ function createChatHandler({
           roundTimings = null;
           const response = await reasoningEffort.requestWithEffort(providerFetch, upstreamUrl, {
             method:'POST',headers:upstreamHeaders,signal:AbortSignal.any([chatSignal.signal,AbortSignal.timeout(300000)]),redirect:'error',
-          }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:false,...sampling.params,...requestTools(),...forceChoice(round)}, provider, model, effort, send);
+          }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:false,...sampling.params,...requestTools(),...forceChoice(round)}, provider, model, effort, send, localThinkingCap);
           // Status first (#918): a 5xx HTML page is a provider failure, not a JSON parse error.
           if (!response.ok) { send({ type: 'error', text: await providerFailureText(response, chatgptProvider) }); throw FALLBACK_REPORTED; }
           const full = {ok:true,status:response.status,body:await readCappedJson(response,FALLBACK_REPLY_CAP)};

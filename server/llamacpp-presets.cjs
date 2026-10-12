@@ -136,7 +136,10 @@ function createPresetStore(file,{writer=null,cacheRam=null,backupKeep=BACKUP_KEE
   function read() {
     const stat=fs.lstatSync(file);
     if(!stat.isFile()||stat.isSymbolicLink())throw error(409,'Preset path must be a regular file');
-    const text=fs.readFileSync(file,'utf8');return {text,revision:revision(text),...parse(text)};
+    const text=fs.readFileSync(file,'utf8');
+    // #1179: the explicit `role = laya` of each section, for isSystemModel (the parser drops unknown keys).
+    require('./model-system.cjs').rememberSectionRoles(text);
+    return {text,revision:revision(text),...parse(text)};
   }
   function get(model) {
     const data=read(),section=data.sections.get(model);
