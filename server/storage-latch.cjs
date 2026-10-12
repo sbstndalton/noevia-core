@@ -127,13 +127,18 @@ function createStorageLatch({ now = Date.now } = {}) {
   }
 
   /** Records a Diary reply to an automatic storage call (its storage-backup): a refused login or a
-   *  throttle latches the account, a success clears the latch. Returns nothing. */
+   *  throttle latches the account; a success clears the latch only when the reply proves the storage
+   *  server was reached (`storageContacted: true`, set by the Diary only for a run that read and wrote
+   *  the remote and verified it, #1609). The Diary answers 200 without leaving its host when the
+   *  account is kept in the app, has no backup destination, is not due, is already complete or is
+   *  busy, and when a run failed: none of those proves the saved login, so the hold stays.
+   *  Returns nothing. */
   function noteDiaryReply(userId, readConnection, reply, ok) {
     const conn = connectionOf(readConnection, userId);
     if (!conn) return;
     const failure = failureFromDiaryReply(reply);
     if (failure) note(userId, conn, failure);
-    else if (ok) clear(userId);
+    else if (ok && reply && typeof reply === 'object' && reply.storageContacted === true) clear(userId);
   }
 
   return { note, blocked, status, statusFor, clear, fingerprintOf, suspendedFor, noteDiaryReply };

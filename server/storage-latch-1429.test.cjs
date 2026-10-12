@@ -77,7 +77,7 @@ test('the Diary backup reply latches a refused login or a throttle; a success cl
   now = 46_000;
   assert.equal(latch.suspendedFor('u1', readOk), false, 'the throttle has run its course');
   latch.noteDiaryReply('u1', readOk, { code: 'storageLoginRejected' }, false);
-  latch.noteDiaryReply('u1', readOk, { mode: 'ok', backup: 'complete' }, true);
+  latch.noteDiaryReply('u1', readOk, { mode: 'managed', backup: 'complete', storageContacted: true }, true);
   assert.equal(latch.suspendedFor('u1', readOk), false, 'a successful backup clears the latch');
   latch.noteDiaryReply('u1', readOk, { detail: 'Diary is busy' }, false);
   assert.equal(latch.suspendedFor('u1', readOk), false, 'an unrelated failure does not latch');
@@ -125,9 +125,36 @@ test('#1589: the Diary backup worker resumes on its own after one transient refu
   assert.equal(latch.suspendedFor('u1', read), true);
   now = 15 * 60_000;
   assert.equal(latch.suspendedFor('u1', read), false, 'the backup is allowed one probing run');
-  latch.noteDiaryReply('u1', read, { mode: 'ok', backup: 'complete' }, true);
+  latch.noteDiaryReply('u1', read, { mode: 'managed', backup: 'complete', storageContacted: true }, true);
   assert.equal(latch.suspendedFor('u1', read), false);
   assert.equal(latch.status('u1', CONN), null, 'and the success cleared the hold');
+});
+
+test('#1609: an OK backup reply that never reached the storage server keeps the hold; one that did clears it', () => {
+  const read = () => CONN;
+  // What the Diary answers 200 without contacting storage: no destination (managed.status), an account kept in the
+  // app (legacy mode, nothing to back up), not due / already complete / busy, and a run whose verification failed.
+  const earlyReturns = [
+    { mode: 'managed', backup: 'not_configured', lastBackedUp: null, retryAt: null, error: null },
+    { mode: 'legacy' },
+    { mode: 'managed', backup: 'complete', lastBackedUp: 1, retryAt: null, error: null },
+    { mode: 'managed', backup: 'pending', lastBackedUp: null, retryAt: null, error: null },
+    { mode: 'managed', backup: 'failed', lastBackedUp: null, retryAt: 5, error: 'Backup could not be verified.' },
+    { mode: 'managed', backup: 'complete', storageContacted: 'yes' },
+    {}, null, 'ok',
+  ];
+  for (const reply of earlyReturns) {
+    const latch = createStorageLatch({ now: () => 0 });
+    latch.noteDiaryReply('u1', read, { code: 'storageLoginRejected' }, false);
+    latch.noteDiaryReply('u1', read, reply, true);
+    assert.deepEqual(latch.blocked('u1', CONN), { kind: 'login' }, `the hold stays for ${JSON.stringify(reply)}`);
+  }
+  const latch = createStorageLatch({ now: () => 0 });
+  latch.noteDiaryReply('u1', read, { code: 'storageLoginRejected' }, false);
+  latch.noteDiaryReply('u1', read, { mode: 'managed', backup: 'complete', storageContacted: true }, false);
+  assert.deepEqual(latch.blocked('u1', CONN), { kind: 'login' }, 'a reply that was not OK never clears');
+  latch.noteDiaryReply('u1', read, { mode: 'managed', backup: 'complete', storageContacted: true }, true);
+  assert.equal(latch.status('u1', CONN), null, 'a backup that reached the storage server clears the hold');
 });
 
 test('#1589: status reports the kind and the next attempt, and never changes the hold', () => {
