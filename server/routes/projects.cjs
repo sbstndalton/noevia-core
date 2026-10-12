@@ -381,6 +381,8 @@ function createProjectRoutes({
       if (clearRoutingMode) delete storedProject.routingMode;
       // The merge above cannot remove a key, so Low is removed here.
       if (clearContextProfile) delete storedProject.contextProfile;
+      // #1090: null clears the stored effort the same way; the merge above never removes a key.
+      if (patch.reasoningEffort === null) delete storedProject.reasoningEffort;
       saveProjects(PROJECTS);
       pruneDocuments(storedProject);
       return json(res, 200, { ok: true });
