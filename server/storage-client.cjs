@@ -124,6 +124,7 @@ async function davRead(conn, fullPath) {
  *  connection is saved. Never throws and never puts the secret in what it returns.
  *  - { ok: true }                      the server accepted the login
  *  - { ok: false, rejected: true }     401: the username or app password is wrong
+ *  - { ok: false, throttled: true }    429: the server is throttling logins from this address
  *  - { ok: false, unverified: reason } 403 (some layouts refuse an unreadable root to an
  *                                      authenticated user), network error, timeout or another
  *                                      status: save with a warning */
@@ -148,6 +149,12 @@ async function checkLogin(conn, { fetchImpl = fetch, timeoutMs = 10000 } = {}) {
   }
   try { await response.body?.cancel?.(); } catch { /* body not needed */ }
   if (response.status === 401) return { ok: false, rejected: true, status: 401 };
+  // #1427: Nextcloud's brute-force protection answers 429 once a source address has failed too
+  // often. That is neither a wrong password nor an outage, so it gets its own answer.
+  if (response.status === 429) {
+    const wait = Number(response.headers?.get?.('retry-after'));
+    return { ok: false, throttled: true, status: 429, ...(Number.isFinite(wait) && wait > 0 ? { retryAfter: Math.min(Math.ceil(wait), 86400) } : {}) };
+  }
   if (response.ok || response.status === 207) return { ok: true };
   return { ok: false, unverified: 'status', status: response.status };
 }
