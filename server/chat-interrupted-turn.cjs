@@ -20,6 +20,8 @@
 const STOPPED_SENDER = 'Stopped'; // src/chat-labels.ts STOPPED_SENDER (language-neutral token, #634)
 const TOOL_RESULT_LIMIT = 4000; // src/components/ToolCalls.tsx TOOL_RESULT_LIMIT
 const TOOL_NAME = /^[\w.-]{1,80}$/;
+// The same shape the badge accepts (web RouteControls.tsx) and the cause codes routing-modes.cjs makes.
+const DETAIL_CODE = /^[a-z][a-z0-9-]{0,39}$/;
 
 const str = (v) => (typeof v === 'string' ? v : '');
 const count = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : undefined);
@@ -34,8 +36,13 @@ function createTurnRecord({ now = Date.now } = {}) {
     switch (ev.type) {
       case 'meta':
         if (ev.route) { model = `Assistant · Auto (${ev.route})`; routingDecision = ev.routingDecision; }
-        // #778: where the reply went and why (codes only).
-        if (ev.routing && ['local', 'cloud'].includes(ev.routing.route) && typeof ev.routing.reason === 'string') routeTarget = { route: ev.routing.route, reason: ev.routing.reason };
+        // #778: where the reply went and why (codes only). #1421 follow-up: a check that could not
+        // answer also carries its short cause, which the badge shows as "(cause)"; keep it here too,
+        // or a saved interrupted turn loses the suffix that the live reply shows.
+        if (ev.routing && ['local', 'cloud'].includes(ev.routing.route) && typeof ev.routing.reason === 'string') {
+          const cause = ev.routing.reason === 'check-unavailable' && typeof ev.routing.detail === 'string' && DETAIL_CODE.test(ev.routing.detail) ? ev.routing.detail : null;
+          routeTarget = { route: ev.routing.route, reason: ev.routing.reason, ...(cause ? { detail: cause } : {}) };
+        }
         break;
       case 'sources':
         if (Array.isArray(ev.sources)) sources = ev.sources;
