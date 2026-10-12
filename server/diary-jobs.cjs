@@ -52,8 +52,14 @@ function start(workspace,{entryDay,exchangeId,message,kind,preparationId},{saveI
     }else row.truncated=true;
    }
    if(event.type==='diary'){row.decision=event.decision||null;row.xid=event.xid||null;}
-   if(event.type==='error'){row.state='uncertain';row.error='The connection or save was interrupted. Check the saved diary before sending again.';}
-   if(event.type==='done'){row.state=(row.kind==='preparation'||row.decision&&row.decision!=='error')&&row.state!=='uncertain'?'complete':'uncertain';}
+   if(event.type==='error'){
+    // #1422: a failure after which the server KNOWS nothing was saved (the proxy proves it from the
+    // companion's stage or an HTTP refusal before the exchange started) is `failed`, not `uncertain`:
+    // there is nothing to check, the message can simply be resent.
+    if(event.saved===false){row.state='failed';row.code=typeof event.code==='string'?event.code.slice(0,40):undefined;row.error=String(event.text||'Nothing was saved. You can resend.').slice(0,400);}
+    else if(row.state!=='failed'){row.state='uncertain';row.error='The connection or save was interrupted. Check the saved diary before sending again.';}
+   }
+   if(event.type==='done'){row.state=(row.kind==='preparation'||row.decision&&row.decision!=='error')&&row.state!=='uncertain'&&row.state!=='failed'?'complete':row.state==='failed'?'failed':'uncertain';}
    row.updatedAt=Date.now();
    // dirty first: if this write fails, finish() still retries it (#894).
    if(IMMEDIATE.has(event.type)){dirty=true;save();}else saveSoon();
@@ -70,4 +76,17 @@ function list(workspace,day){
   const file=path.join(dir,name);try{const row=JSON.parse(fs.readFileSync(file,'utf8'));if(row.state==='running'&&!active.has(file))row.state='uncertain';return row;}catch{return null;}
  }).filter(Boolean).sort((a,b)=>a.startedAt-b.startedAt).slice(-100);
 }
-module.exports={start,list,validDay};
+// #1422: an uncertain (or failed) exchange stays in the day's record, but the person can mark it as
+// reviewed so it stops raising the "uncertain save" banner. This records that someone looked; it
+// never claims the entry was or was not saved, and it never edits the diary.
+function acknowledge(workspace,day,id,{now=Date.now}={}){
+ const file=location(workspace,day,id);
+ if(!fs.existsSync(file))throw Object.assign(Error('No such exchange.'),{status:404});
+ if(active.has(file))throw Object.assign(Error('This exchange is still running.'),{status:409});
+ let row;try{row=JSON.parse(fs.readFileSync(file,'utf8'));}catch{throw Object.assign(Error('This exchange record cannot be read.'),{status:500});}
+ if(row.state==='running')row.state='uncertain'; // an orphaned record, as list() reports it
+ if(row.state!=='uncertain'&&row.state!=='failed')throw Object.assign(Error('This exchange has nothing to resolve.'),{status:409});
+ if(!row.acknowledgedAt){row.acknowledgedAt=now();row.updatedAt=now();atomicJson(file,row);}
+ return row;
+}
+module.exports={start,list,acknowledge,validDay};

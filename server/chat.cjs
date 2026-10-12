@@ -472,9 +472,34 @@ function createChatHandler({
       const diaryBody = JSON.stringify({stream:true, diary_events:true, messages:msgs,
           session_id:body.sessionId, entryTime:body.entryTime, entryDay:body.entryDay,
           extrasEnabled:body.extrasEnabled === true, extraContext:diaryExtras.reference(body)});
+      // #1422: asked once, only when the companion fails while generating: is the model it is set to
+      // use one the local engine serves at all? (#1065: its configured name need not be a router id.)
+      // Diary turns are local-only by construction: this branch returns before any routing, cloud
+      // provider or sensitivity check, and the diagnosis reads only the companion and the local manager.
+      const diagnose = async () => {
+        const healthUrl = `${DIARY_BASE}/api/health`;
+        const health = await fetch(healthUrl, { headers: diaryHeaders('GET', healthUrl), signal: AbortSignal.timeout(3000) });
+        if (!health.ok) return null;
+        const reported = await require('./http.cjs').readCappedJson(health, 64 * 1024);
+        const model = String(reported?.model || '');
+        // `model_source` says how the companion chose it. Only a name taken as configured (or unchecked)
+        // can be a name the engine does not serve; an unreachable engine or one serving no chat model is
+        // a model failure, and a model it picked from the served list is served by definition.
+        const source = reported?.model_source;
+        if (!model || model === 'default' || (source !== undefined && source !== 'configured' && source !== 'unverified')) return null;
+        if (typeof modelManager?.listModels !== 'function') return null;
+        // The manager's full served list, not modelsInstalled(): that hides `-long` profiles and hash-ID rows,
+        // which are served names too.
+        let timer;
+        const listed = await Promise.race([modelManager.listModels(), new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('timeout')), 4000); })]).finally(() => clearTimeout(timer));
+        const rows = listed?.ok && Array.isArray(listed.body?.data) ? listed.body.data : null;
+        if (!rows || !rows.length) return null;
+        const names = new Set(rows.flatMap((m) => [m.id, m.model_name].filter((x) => typeof x === 'string' && x)));
+        return names.size && !names.has(model) ? { code: 'modelNotServed', model } : null;
+      };
       return require('./diary-stream.cjs').proxyDiaryStream(res, diaryUrl, {
         method: 'POST', headers: (secret) => diaryHeaders('POST', diaryUrl, { secret, body: diaryBody }), body: diaryBody
-      }, {job,withStorageCredential:diaryStorageRetry,onEvent:event=>{if(event.type==='mtp')require('./mtp.cjs').record(chatWorkspace?.userId,event.model,event.timings);}});
+      }, {job,diagnose,withStorageCredential:diaryStorageRetry,onEvent:event=>{if(event.type==='mtp')require('./mtp.cjs').record(chatWorkspace?.userId,event.model,event.timings);}});
     }
 
     // ── Ordinary space / project chat: routed via the project's provider ──

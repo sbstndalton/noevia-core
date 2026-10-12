@@ -93,3 +93,29 @@ test('#894 a failed immediate write (done) is retried by finish()',t=>{
  assert.equal(JSON.parse(fs.readFileSync(file,'utf8')).state,'complete','finish() retried the failed write');
  assert.equal(jobs.list(w,data.entryDay)[0].state,'complete');
 });
+test('#1422 an error that proves nothing was saved is failed, not uncertain; a later done cannot complete it', t=>{
+ const w=fixture(t),j=jobs.start(w,data);
+ j.event({type:'error',saved:false,code:'modelFailed',text:"Couldn't reach the local model — nothing was saved. You can resend."});j.event({type:'done'});j.finish();
+ const [row]=jobs.list(w,data.entryDay);assert.equal(row.state,'failed');assert.equal(row.code,'modelFailed');assert.match(row.error,/nothing was saved/);
+});
+test('#1422 an exchange can be marked reviewed once; only uncertain or failed ones, never a running or complete one',t=>{
+ const w=fixture(t),j=jobs.start(w,data);
+ assert.throws(()=>jobs.acknowledge(w,data.entryDay,data.exchangeId),e=>e.status===409,'still running in this process');
+ j.event({type:'error',text:'The connection dropped'});j.finish();
+ let at=1000;const row=jobs.acknowledge(w,data.entryDay,data.exchangeId,{now:()=>at});
+ assert.equal(row.state,'uncertain');assert.equal(row.acknowledgedAt,1000);
+ at=2000;assert.equal(jobs.acknowledge(w,data.entryDay,data.exchangeId,{now:()=>at}).acknowledgedAt,1000,'idempotent');
+ assert.equal(jobs.list(w,data.entryDay)[0].acknowledgedAt,1000);assert.equal(jobs.list(w,data.entryDay)[0].state,'uncertain','the outcome itself is never rewritten');
+ const done=jobs.start(w,{...data,exchangeId:'complete-exchange-12345'});done.event({type:'diary',decision:'logged'});done.event({type:'done'});done.finish();
+ assert.throws(()=>jobs.acknowledge(w,data.entryDay,'complete-exchange-12345'),e=>e.status===409);
+ assert.throws(()=>jobs.acknowledge(w,data.entryDay,'missing-exchange-123456'),e=>e.status===404);
+ assert.throws(()=>jobs.acknowledge(w,data.entryDay,'../../x'),e=>e.status===400);
+ assert.throws(()=>jobs.acknowledge(fixture(t),data.entryDay,data.exchangeId),e=>e.status===404,'another tenant has no such exchange');
+});
+test('#1422 an orphaned running record (written by an earlier process) can be marked reviewed and reads as uncertain',t=>{
+ // A record still `running` on disk that this process never started: the old process died.
+ const w=fixture(t),orphan=path.join(w.dir,'diary-conversations',data.entryDay);fs.mkdirSync(orphan,{recursive:true});
+ fs.writeFileSync(path.join(orphan,data.exchangeId+'.json'),JSON.stringify({kind:'capture',tools:[],id:data.exchangeId,day:data.entryDay,message:'Synthetic',startedAt:1,state:'running',content:'',reasoning:'',activity:[],decision:null}));
+ const other=w;assert.equal(jobs.list(other,data.entryDay)[0].state,'uncertain');
+ assert.equal(jobs.acknowledge(other,data.entryDay,data.exchangeId).state,'uncertain');
+});
