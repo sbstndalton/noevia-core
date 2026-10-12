@@ -72,6 +72,17 @@ function chatMarkdown(chat, history) {
   return lines.join('\n');
 }
 
+// #1517: Regenerate and Edit & re-run keep earlier answers and versions on the history entries
+// (answers/answer, branches/branch). An export carries only the reply or version that is chosen, i.e.
+// the entry's own content, so those fields never leave. Reasoning is left out as well (see above).
+const VARIANT_FIELDS = ['answers', 'answer', 'branches', 'branch'];
+function exportedEntry(entry) {
+  if (!entry || typeof entry !== 'object') return entry;
+  const { reasoning, ...rest } = entry;
+  for (const field of VARIANT_FIELDS) delete rest[field];
+  return rest;
+}
+
 function buildExport({ freeChats = [], projects = [], readHistory, now = Date.now(), maxBytes = MAX_EXPORT_BYTES, maxEntries = MAX_EXPORT_ENTRIES }) {
   const entries = [], taken = new Set(), chatJson = [];
   let total = 0;
@@ -97,7 +108,7 @@ function buildExport({ freeChats = [], projects = [], readHistory, now = Date.no
     const md = chatMarkdown(chat, history);
     let json;
     try {
-      json = JSON.stringify({ id: chat.id, title: chat.title || '', updatedAt: chat.updatedAt || null, project, history: history.map(({ reasoning, ...m }) => m) }, null, 2).replace(/\n/g, '\n    ');
+      json = JSON.stringify({ id: chat.id, title: chat.title || '', updatedAt: chat.updatedAt || null, project, history: history.map(exportedEntry) }, null, 2).replace(/\n/g, '\n    ');
     } catch (error) {
       if (error instanceof RangeError) throw tooLarge(); // 'Invalid string length'
       throw error;

@@ -129,6 +129,16 @@ test('an assistant turn keeps its sources across a reload, re-bounded on save (#
   assert.equal('sources' in stored[1], false, 'only assistant turns carry sources');
 });
 
+test('a saved turn keeps its last 10 variants; the chosen one is never dropped (#1517)', async () => {
+  const answers = Array.from({ length: 11 }, (_, i) => ({ content: `synthetic answer ${i}` }));
+  const history = [{ role: 'user', content: 'q', answers, answer: 0 }, { role: 'assistant', content: 'synthetic answer 0' }];
+  assert.equal((await post('/api/chats/c-variants-1517/history', { history })).status, 200);
+  const read = JSON.parse((await request('/api/chats/c-variants-1517/history', { headers: mutationHeaders() })).text).history;
+  assert.equal(read[0].answers.length, 10);
+  assert.equal(read[0].answers[read[0].answer].content, 'synthetic answer 0', 'the chosen answer survives although it is the oldest');
+  assert.equal(read[0].answers[1].content, 'synthetic answer 2', 'the oldest of the others went');
+});
+
 test('a user turn keeps its exact Skill pin across a reload; anything else is dropped on save (#571)', async () => {
   const pin = `skill_${'a'.repeat(32)}@${'b'.repeat(64)}`;
   const history = [{ role: 'user', content: 'q', skill: pin }, { role: 'assistant', content: 'a', skill: pin }];

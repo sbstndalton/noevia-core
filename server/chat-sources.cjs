@@ -54,7 +54,9 @@ function sanitizePin(value) {
 }
 
 function sanitizeHistory(history) {
-  return history.map((m) => {
+  const { capEntry } = require('./chat-variants.cjs');
+  return history.map((entry) => {
+    const m = capEntry(entry); // #1517: the stored alternatives of a turn are bounded here
     if (!m || typeof m !== 'object' || !('sources' in m || 'skill' in m)) return m;
     const { sources, skill, ...rest } = m;
     const cleanSources = m.role === 'assistant' ? sanitizeStored(sources) : undefined;
