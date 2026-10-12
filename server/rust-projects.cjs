@@ -9,7 +9,11 @@
 // (NOEVIA_RUST_AUTH=1, confirmed: the front gates Rust-owned routes itself) and the supervisor's
 // NOEVIA_RUST_PROJECTS_CONFIRMED=1 (set only once the front's --features lists rust-projects).
 // Anything less and the switch is ignored here (a warning is printed) and Node keeps doing
-// everything, as before.
+// everything, as before. Each slice after the first is confirmed on its own, because a front that
+// lists rust-projects may predate it: the chat-list save is refused here only with
+// NOEVIA_RUST_PROJECT_CHATS_CONFIRMED=1 as well (set only once the front's --features lists
+// rust-project-chats; chatsEnabledFrom). Without it a front that answers only the images forwards
+// the chat-list save here, and Node keeps answering it (sbstndalton/noevia#1409).
 //
 // projects.json cannot have one writer yet: Node's other routes (the chat turn, a chat's move or
 // delete, the config route) still change it. So while the switch is on, both processes write it only under one shared lock and
@@ -50,8 +54,10 @@ const LOCK_WAIT_MS = 3000;
 // flock(1)'s exit status when -w ran out (-E); anything else non-zero is a failure, not "busy".
 const FLOCK_BUSY_STATUS = 75;
 
-/** The routes the Rust front answers under the switch: METHOD path-pattern. noevia-rs
- *  contracts/http/routes.toml (switch = "NOEVIA_RUST_PROJECTS") is the other half. */
+/** The routes a Rust front can answer under the switch: METHOD path-pattern. noevia-rs
+ *  contracts/http/routes.toml (switch = "NOEVIA_RUST_PROJECTS") is the other half; noevia's
+ *  deploy/tools/assemble-release.sh refuses a release whose front owns a project route missing
+ *  here. The chat-list routes are the front's only with chatsEnabledFrom. */
 const OWNED_ROUTES = Object.freeze(new Set([
   'POST /api/projects/{id}/assets',
   'GET /api/projects/{id}/assets/{assetId}',
@@ -325,6 +331,13 @@ function createProjectsFile(file, { atomicJson, warn = console.warn, lock = with
   };
 }
 
+/** Whether the chat-list slice is on (see the header): the switch, and the supervisor's
+ *  NOEVIA_RUST_PROJECT_CHATS_CONFIRMED=1. Silent when only that is missing: a front that answers
+ *  the images alone is a supported pairing, not a misconfiguration. */
+function chatsEnabledFrom(env = process.env, warn = console.warn) {
+  return enabledFrom(env, warn) && env.NOEVIA_RUST_PROJECT_CHATS_CONFIRMED === '1';
+}
+
 /** For Node's copies of the Rust-owned write routes: true when it answered 503. */
 function refuseOwned(enabled, json, res) {
   if (!enabled) return false;
@@ -333,6 +346,6 @@ function refuseOwned(enabled, json, res) {
 }
 
 module.exports = {
-  enabledFrom, withFileLock, merge, mergeFields, mergeIdList, createProjectsFile, readProjectsFile, refuseOwned, replaceContents,
+  enabledFrom, chatsEnabledFrom, withFileLock, merge, mergeFields, mergeIdList, createProjectsFile, readProjectsFile, refuseOwned, replaceContents,
   OWNED_ROUTES, LOCK_SUFFIX, LOCK_WAIT_MS, FLOCK_BUSY_STATUS,
 };

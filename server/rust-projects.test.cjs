@@ -34,6 +34,20 @@ test('the switch needs the M3 switch confirmed, NOEVIA_FRONT=rust and its own co
   assert.equal(warned.length, 5);
 });
 
+test('the chat-list slice needs the switch and its own confirmation, and is silent without it (#1409)', () => {
+  const warned = [];
+  const warn = (m) => warned.push(m);
+  const full = { NOEVIA_RUST_PROJECTS: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_AUTH_CONFIRMED: '1', NOEVIA_RUST_PROJECTS_CONFIRMED: '1' };
+  assert.equal(rp.chatsEnabledFrom({ ...full, NOEVIA_RUST_PROJECT_CHATS_CONFIRMED: '1' }, warn), true);
+  assert.equal(rp.chatsEnabledFrom(full, warn), false, 'a front with the images only');
+  assert.equal(rp.chatsEnabledFrom({ ...full, NOEVIA_RUST_PROJECT_CHATS_CONFIRMED: 'true' }, warn), false);
+  assert.equal(warned.length, 0, 'an images-only front is not a misconfiguration');
+  for (const drop of ['NOEVIA_RUST_PROJECTS', 'NOEVIA_FRONT', 'NOEVIA_RUST_AUTH', 'NOEVIA_RUST_AUTH_CONFIRMED', 'NOEVIA_RUST_PROJECTS_CONFIRMED']) {
+    const env = { ...full, NOEVIA_RUST_PROJECT_CHATS_CONFIRMED: '1' }; delete env[drop];
+    assert.equal(rp.chatsEnabledFrom(env, () => {}), false, drop);
+  }
+});
+
 // flock(1) is util-linux (the web image, CI); without it (a Mac) the lock tests are skipped.
 const NO_FLOCK = spawnSync('flock', ['--version']).error ? 'flock(1) not on PATH' : false;
 const RP = JSON.stringify(path.join(__dirname, 'rust-projects.cjs'));

@@ -348,6 +348,29 @@ test('moveChat takes a meta out of one list and into another without a tombstone
   assert.ok(!require('./chat-lists.cjs').readTombstones(f.dir).has('f1'), 'never tombstoned');
 });
 
+test('moveChat out of a project writes the free list before the project (#1410)', async () => {
+  const f = fixture();
+  const order = [];
+  f.workspace.saveProjects = () => order.push('projects');
+  f.workspace.saveFreeChats = () => order.push('free');
+  const a = await f.store.createProject({ name: 'A' }), b = await f.store.createProject({ name: 'B' });
+  f.workspace.freeChats.push({ id: 'f1', title: 'Free one', updatedAt: 1 });
+  order.length = 0;
+  assert.equal(f.store.moveChat('f1', a.id).status, 200);
+  assert.deepEqual(order, ['projects', 'free'], 'into a project: the project first, never in neither list');
+  order.length = 0;
+  assert.equal(f.store.moveChat('f1', b.id).status, 200);
+  assert.deepEqual(order, ['projects'], 'project to project: one write');
+  order.length = 0;
+  assert.equal(f.store.moveChat('f1', null).status, 200);
+  assert.deepEqual(order, ['free', 'projects'], 'out of a project: the free list first');
+  assert.deepEqual(b.chats, []);
+  assert.deepEqual(f.workspace.freeChats.map((c) => c.id), ['f1']);
+  order.length = 0;
+  assert.equal(f.store.moveChat('f1', null, { frame: null }).status, 200);
+  assert.deepEqual(order, ['free'], 'free in place: the free list only');
+});
+
 test('moveChat refuses unknown chats and projects, deleted chats and disallowed projects, changing nothing (#738)', async () => {
   const f = fixture();
   const a = await f.store.createProject({ name: 'A' });

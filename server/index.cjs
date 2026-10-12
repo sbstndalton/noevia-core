@@ -96,6 +96,8 @@ const rustAuth = require('./rust-auth.cjs').createRustAuthGuard({ enabled: requi
 // M4: NOEVIA_RUST_PROJECTS=1 (on top of M3) shares projects.json with the Rust front, which answers
 // the project image routes (rust-projects.cjs). Off by default.
 const RUST_PROJECTS = require('./rust-projects.cjs').enabledFrom(process.env);
+// Its chat-list slice only with the supervisor's separate confirmation (rust-project-chats).
+const RUST_PROJECT_CHATS = RUST_PROJECTS && require('./rust-projects.cjs').chatsEnabledFrom(process.env, () => {});
 const authService = createAuth({
   rustAuth,
   dataDir: DATA_DIR,
@@ -904,7 +906,7 @@ const projectRoutes = require('./routes/projects.cjs').createProjectRoutes({
   json, readBody, readJson, requestScope, dispatch: (req, res) => handleRequestScoped(req, res), currentWorkspace, authService, storageClient, documents, documentSources, rag, fs, path,
   reasoningEffort, projectAppearance, diaryExtras, PROJECTS, DEFAULT_TOOLBOXES, sanitizeToolboxes, allToolboxes, getProvider, ensureRolesLoaded, servedCatalogue, DEFAULT_PROVIDER_ID, store: projectStore,
   onToolboxesChange: () => permittedToolsCache.clear(),
-  rustProjects: RUST_PROJECTS,
+  rustProjects: RUST_PROJECTS, rustProjectChats: RUST_PROJECT_CHATS,
 });
 // The provider registry's routes: list, connect, test and remove (routes/providers.cjs), plus
 // Sign in with ChatGPT (chatgptOAuth, built beside mcpOAuth above) while features.chatgptOAuth is on.
