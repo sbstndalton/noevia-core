@@ -23,7 +23,7 @@ function fakeMcp(catalogues) {
   };
 }
 
-function build({ servers, catalogues, directoryServers = [], env = {}, storage = { kind: 'local' }, origins = '', manifest = [], isUserDisabled, discoveryFailTtlMs } = {}) {
+function build({ servers, catalogues, directoryServers = [], env = {}, storage = { kind: 'local' }, origins = '', manifest = [], isUserDisabled, discoveryFailTtlMs, discoveryTtlMs, discoveryRetryMs } = {}) {
   const mcp = fakeMcp(catalogues);
   const scope = new AsyncLocalStorage();
   const minted = [];
@@ -39,6 +39,8 @@ function build({ servers, catalogues, directoryServers = [], env = {}, storage =
     reduceToolResult: (text) => ({ text, reduced: false }), env, logger: { log() {}, warn() {} },
     ...(isUserDisabled ? { isUserDisabled } : {}),
     ...(discoveryFailTtlMs !== undefined ? { discoveryFailTtlMs } : {}),
+    ...(discoveryTtlMs !== undefined ? { discoveryTtlMs } : {}),
+    ...(discoveryRetryMs !== undefined ? { discoveryRetryMs } : {}),
   });
   return { wiring, mcp, scope, minted };
 }
@@ -84,6 +86,47 @@ test('a discovery where every server fails is still cached for the failure TTL, 
   // Forced discovery (admin add/remove, OAuth finish) bypasses the TTL regardless.
   await wiring.discoverMcpTools(true);
   assert.equal(mcp.sessions.length, afterFirst * 2, 'a forced refresh always reconnects to every server');
+});
+
+// #1081: a remote server that fails its first discovery (fetch failed before DNS was up) was hidden
+// for the whole 10-minute TTL. It is now retried on a short backoff, and a healthy discovery keeps the TTL.
+test('#1081: a remote server that failed discovery is retried on the short backoff and offered once it answers', async () => {
+  const servers = [{ id: 'tavily', url: 'http://t/mcp', auth: 'none' }, { id: 'nc', url: 'http://n/mcp', auth: 'none' }];
+  const catalogues = { 'http://t/mcp': new Error('fetch failed'), 'http://n/mcp': [rawTool('nc_list')] };
+  const manifest = [{ id: 'web-search', server: 'tavily', tools: ['tavily_search'] }, { id: 'nextcloud', server: 'nc', tools: ['nc_list'] }];
+  const { wiring, mcp } = build({ servers, catalogues, manifest, discoveryTtlMs: 10 * 60 * 1000, discoveryRetryMs: [0] });
+  const first = await wiring.discoverMcpTools();
+  assert.match(first.servers.get('tavily').error, /fetch failed/);
+  assert.equal(first.boxes.find((b) => b.id === 'web-search').tools.length, 0, 'the failed server offers nothing yet');
+  assert.equal(first.boxes.find((b) => b.id === 'nextcloud').tools.length, 1, 'the healthy server is offered at once');
+
+  catalogues['http://t/mcp'] = [rawTool('tavily_search', true)];
+  const second = await wiring.discoverMcpTools();
+  assert.equal(second.servers.get('tavily').error, null);
+  assert.equal(second.boxes.find((b) => b.id === 'web-search').tools.length, 1, 'the next unforced request retries it, without waiting for the TTL');
+  assert.ok(mcp.sessions.length >= 3, 'the failing server was reconnected');
+});
+
+test('#1081: a failed remote server is not retried before its first backoff step has passed', async () => {
+  const servers = [{ id: 'tavily', url: 'http://t/mcp', auth: 'none' }];
+  const catalogues = { 'http://t/mcp': new Error('fetch failed') };
+  const manifest = [{ id: 'web-search', server: 'tavily', tools: ['tavily_search'] }];
+  const { wiring, mcp } = build({ servers, catalogues, manifest, discoveryTtlMs: 10 * 60 * 1000, discoveryRetryMs: [60000, 120000] });
+  await wiring.discoverMcpTools();
+  const afterFirst = mcp.sessions.length;
+  await wiring.discoverMcpTools();
+  assert.equal(mcp.sessions.length, afterFirst, 'inside the 60 s step an unforced request does not reconnect');
+});
+
+test('#1081: a healthy discovery keeps the whole TTL, so the short retry never applies to it', async () => {
+  const servers = [{ id: 'nc', url: 'http://n/mcp', auth: 'none' }];
+  const catalogues = { 'http://n/mcp': [rawTool('nc_list')] };
+  const manifest = [{ id: 'nextcloud', server: 'nc', tools: ['nc_list'] }];
+  const { wiring, mcp } = build({ servers, catalogues, manifest, discoveryTtlMs: 10 * 60 * 1000, discoveryRetryMs: [0] });
+  await wiring.discoverMcpTools();
+  const afterFirst = mcp.sessions.length;
+  await wiring.discoverMcpTools();
+  assert.equal(mcp.sessions.length, afterFirst, 'a healthy server is not re-discovered within the TTL');
 });
 
 test('with no servers nothing is offered and discovery is a no-op', async () => {

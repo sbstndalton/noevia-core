@@ -424,6 +424,8 @@ function createChatHandler({
     // injection (small files whole, big files capped) — the old behavior.
     let filesBlock = null;
     let replySources = [];
+    // #1513: sources of which this reply read only part (excerpts, the start, or nothing).
+    let partialReads = [];
     // #1441: a free chat's attachments live in a hidden shadow project. Its files are shown to the model
     // with the user's turn as "attached to this chat"; the shadow project's name and a "knowledge-file"
     // framing in the system message made a small model deny having them. Real projects are unchanged.
@@ -432,7 +434,7 @@ function createChatHandler({
       const readable = require('./instruction-skills.cjs').sources(project);
       // #552: the chunks that went into the prompt, reported to the browser as a `sources` event.
       filesBlock = await rag.filesContext(project.id, readable, message, currentWorkspace().userId,
-        (placed) => { replySources = require('./chat-sources.cjs').buildSources(placed, readable); }, { attached: chatAttachments });
+        (placed) => { replySources = require('./chat-sources.cjs').buildSources(placed, readable); partialReads = require('./source-coverage.cjs').partialSources(readable, placed); }, { attached: chatAttachments });
     }
 
     const sysParts = [];
@@ -472,6 +474,8 @@ function createChatHandler({
       if (sourcesNotReady.length) {
         sysParts.push(`The user just attached ${sourcesNotReady.map((f) => JSON.stringify(f.name)).join(', ')}, but ${sourcesNotReady.length === 1 ? 'it was' : 'they were'} not ${sourcesNotReady.every((f) => f.reason === 'failed') ? 'processed' : 'finished processing'} in time, so ${sourcesNotReady.length === 1 ? 'its' : 'their'} contents are not available to you for this message. Say so if asked about ${sourcesNotReady.length === 1 ? 'it' : 'them'}; do not guess at the contents.`);
       }
+      // #1513: a source only partly read for this reply is said so, with what was read.
+      { const coverageNote = require('./source-coverage.cjs').coverageNote(partialReads); if (coverageNote) sysParts.push(coverageNote); }
       // Skills index (L0): name+description only, always visible. The model
       // pulls the full SKILL.md body on demand via read_project_file (L1).
       const skills = skillsIndexFor(project);
@@ -575,6 +579,12 @@ function createChatHandler({
         brainBlock = require('./chat-brain.cjs').linkedBrainBlock({ enabled: true, frame: chatFrame, chatId: body.chatId, chats: brainContext.chats(), read: brainContext.read, maxChars: brainContext.maxChars() }) || '';
         if (brainBlock) sysParts.push(brainBlock);
       } catch { brainBlock = ''; /* fail open: no brain context */ }
+    }
+    // #1520 / #1521: a named storage connector's tools (or its absence), and Web search off for a
+    // time-sensitive question. Notes only; the tools offered and the gate are unchanged. Empty for most chats.
+    if (!body.compactOnly) {
+      const routeNote = require('./tool-route-notes.cjs').toolRouteNotes({ message, offered: requestToolboxes(), onServer: allToolboxes().map((b) => b.id) });
+      if (routeNote) sysParts.push(routeNote);
     }
     let sys = sysParts.join('\n\n');
     // #815: the system text without the brain block. Brains may summarise Diary-derived chats, so they
@@ -1013,7 +1023,7 @@ function createChatHandler({
 
     send({ type: 'status', id: 'generating', text: 'Generating response…' });
     const imageWarning = visionWarning;
-    const replyWarning = () => [imageWarning, revokedInHistory.length ? historyNote(revokedInHistory) : ''].filter(Boolean).join(' ');
+    const replyWarning = () => [imageWarning, revokedInHistory.length ? historyNote(revokedInHistory) : '', require('./source-coverage.cjs').coverageWarning(partialReads)].filter(Boolean).join(' ');
     if (replyWarning()) send({ type: 'warning', text: replyWarning() });
 
     // ── Tool rounds (Pi-style loop, master step 13): stream a completion; if
@@ -1461,7 +1471,8 @@ function createChatHandler({
                   // fragments made the client render one chip per delta, most
                   // of them nameless with partial args like `/T`. The client
                   // upserts on index and always sees the best-known state.
-                  send({ type: 'tool', index: toolOffset + i, name: slot.name, args: slot.args });
+                  // #1523: a complete search query is shown as the question (partial JSON is shown as it arrives).
+                  send({ type: 'tool', index: toolOffset + i, name: slot.name, args: require('./search-query.cjs').cleanSearchArgs(slot.name, slot.args) });
                 }
               }
             } catch {
@@ -1513,7 +1524,7 @@ function createChatHandler({
             for (const tc of msg.tool_calls) {
               const index = toolCalls.size;
               toolCalls.set(index, { id: tc.id || `call-${index}`, name: tc.function?.name || '', args: tc.function?.arguments || '' });
-              send({ type: 'tool', index: toolOffset + index, name: tc.function?.name || '', args: tc.function?.arguments || '' });
+              send({ type: 'tool', index: toolOffset + index, name: tc.function?.name || '', args: require('./search-query.cjs').cleanSearchArgs(tc.function?.name || '', tc.function?.arguments || '') });
             }
           }
           reportRoundUsage(full.body?.usage, full.body?.timings);
@@ -1545,6 +1556,8 @@ function createChatHandler({
       // cannot be fed back to the model), but they are still streamed to the
       // user instead of dangling.
       if (toolCalls.size > 0) {
+        // #1523: a search query is the question, not the request wrapper around it.
+        for (const tc of toolCalls.values()) tc.args = require('./search-query.cjs').cleanSearchArgs(tc.name, tc.args);
         if (roundContent.trim()) { send({ type: 'preamble', text: roundContent }); roundHasContent = false; }
         const assistantMsg = { role: 'assistant', content: null, tool_calls: [...toolCalls.entries()].map(([i, tc]) => ({ id: tc.id, type: 'function', function: { name: tc.name, arguments: tc.args } })) };
         roundMessages = [...roundMessages, assistantMsg];
