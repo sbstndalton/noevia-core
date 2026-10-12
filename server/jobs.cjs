@@ -39,79 +39,100 @@ function claimLifecycleAuthority() {
   return LIFECYCLE_AUTHORITY;
 }
 
-function derive(events) {
-  const job = { id: null, kind: null, projectId: null, parentId: null, capabilities: [], status: 'queued', stage: null,
-    steps: [], artifacts: [], plan: null, assistantOutput: null, checkpoint: null, pendingApproval: null, uncertain: [], result: null, error: null, createdAt: null, updatedAt: null,
-    lifecycle: null };
-  // Folded alongside the switch below in the same single pass over `events`, rather than
-  // re-reading the whole journal a second time after the loop: `lifecycleState` only advances
-  // while `lifecycleOk` stays true, and one illegal jump (a journal never shaped with this
-  // layer in mind) just stops the fold there — the rest of `derive()` above is unaffected.
-  let lifecycleState = taskLifecycle.INITIAL_STATE, lifecycleOk = true;
-  // A journal with any lifecycle authority event folds authoritatively throughout (#701), and
-  // only such a journal gains `revision`/`stages`: every other derived job keeps its exact shape.
-  const authoritative = taskLifecycle.isAuthoritative(events);
-  const fold = { authoritative };
-  let revision = null; const stages = [];
-  for (const e of events) {
-    job.updatedAt = e.at;
-    const d = e.data || {};
-    if (lifecycleOk) {
-      try { lifecycleState = taskLifecycle.step(lifecycleState, e, fold); }
-      catch (err) { if (err instanceof taskLifecycle.TaskLifecycleError) lifecycleOk = false; else throw err; }
-    }
-    switch (e.type) {
-      case 'job.created': Object.assign(job, { id: e.job, kind: d.kind, projectId: d.projectId ?? null, parentId: d.parentId ?? null, capabilities: d.capabilities || [], createdAt: e.at }); break;
-      case 'job.started': job.status = 'running'; break;
-      case 'progress': job.stage = d.stage ?? job.stage; break;
-      case 'step.started': job.steps.push({ id: d.id, title: d.title, status: 'running' }); break;
-      // In a pipeline journal (#705, authoritative) a step id recurs once per revision (`tests`), so a
-      // completion closes the latest one still running. Every other journal keeps the original rule:
-      // the first step with that id.
-      case 'step.completed': { const s = (authoritative && job.steps.findLast((x) => x.id === d.id && x.status === 'running')) || job.steps.find((x) => x.id === d.id); if (s) s.status = d.failed ? 'failed' : 'completed'; break; }
-      case 'approval.requested': job.pendingApproval = d; job.status = 'waiting_approval'; break;
-      case 'approval.decided': job.pendingApproval = null; if (!TERMINAL.has(job.status)) job.status = 'running'; break;
-      case 'tool.uncertain': job.uncertain.push(d); break;
-      case 'artifact.created': job.artifacts.push(d); break;
-      case 'plan.proposed': case 'plan.edited': job.plan = job.kind === 'code'
-        ? { status: e.type.slice(5), question: null, ...boundCodePlan(d) }
-        : { status: e.type.slice(5), question: d.question ?? null, subQuestions: d.subQuestions || [] }; break;
-      case 'plan.skipped': job.plan = job.kind === 'code'
-        ? { status: 'skipped', question: null, subQuestions: [], truncated: false }
-        : { status: 'skipped', question: d.question ?? null, subQuestions: [] }; break;
-      case 'assistant.output': {
-        const previous = job.assistantOutput || { text: '', truncated: false };
-        const incoming = typeof d.text === 'string' ? d.text : '';
-        const remaining = MAX_ASSISTANT_OUTPUT_BYTES - Buffer.byteLength(previous.text);
-        const text = previous.truncated ? '' : clipUtf8(incoming, remaining);
-        if (text || d.truncated === true || previous.text) job.assistantOutput = {
-          text: previous.text + text,
-          truncated: previous.truncated || d.truncated === true || text.length < incoming.length,
-        };
-        break;
-      }
-      case 'checkpoint.created': job.checkpoint = d; break;
-      // Only a job that was reviewed ever carries `review`: every other job's derived shape,
-      // and so every API response built from it, is exactly what it was before #519.
-      case 'review.requested': case 'review.completed': case 'review.failed':
-        job.review = boundReviewEvent(e.type, d); break;
-      case 'task.stage': if (d.revision !== (revision?.n ?? 0)) lifecycleOk = false; stages.push({ from: d.from ?? null, to: d.to ?? null, revision: d.revision ?? 0, reason: d.reason ?? null,
-        ...(d.reportHash ? { reportHash: d.reportHash } : {}), at: e.at }); break;
-      case 'task.revision': if (d.n !== (revision?.n ?? 0) + 1) lifecycleOk = false; revision = { n: d.n, headSha: d.headSha ?? null, planHash: d.planHash ?? null, at: e.at }; break;
-      case 'job.completed': job.status = 'completed'; job.result = d.result ?? null; job.pendingApproval = null; break;
-      case 'job.failed': job.status = 'failed'; job.error = d.error ?? 'failed'; job.result = d.result ?? null; job.pendingApproval = null; break;
-      case 'job.cancelled': job.status = 'cancelled'; job.result = d.result ?? null; job.pendingApproval = null; break;
-      case 'job.interrupted': job.status = 'interrupted'; job.error = d.reason ?? 'interrupted'; job.pendingApproval = null; break;
-      default: break;
-    }
+// The journal fold, one event at a time (#1126). derive() folds a whole journal through this
+// accumulator; createJobs keeps one per cached journal and folds only each event it appends, so an
+// append no longer re-folds the whole journal. `authoritative` is decided by the whole journal (see
+// the comment on the fold rules in foldEvent), so an accumulator that sees its first authority event
+// is rebuilt from the journal rather than advanced.
+function newAccumulator(authoritative) {
+  return {
+    authoritative, count: 0, revision: null, stages: [],
+    job: { id: null, kind: null, projectId: null, parentId: null, capabilities: [], status: 'queued', stage: null,
+      steps: [], artifacts: [], plan: null, assistantOutput: null, checkpoint: null, pendingApproval: null, uncertain: [], result: null, error: null, createdAt: null, updatedAt: null,
+      lifecycle: null },
+    // Folded alongside the switch below in the same single pass over `events`, rather than
+    // re-reading the whole journal a second time after the loop: `lifecycleState` only advances
+    // while `lifecycleOk` stays true, and one illegal jump (a journal never shaped with this
+    // layer in mind) just stops the fold there — the rest of the fold is unaffected.
+    lifecycleState: taskLifecycle.INITIAL_STATE, lifecycleOk: true,
+    // A journal with any lifecycle authority event folds authoritatively throughout (#701), and
+    // only such a journal gains `revision`/`stages`: every other derived job keeps its exact shape.
+    fold: { authoritative },
+  };
+}
+function foldEvent(acc, e) {
+  const job = acc.job, d = e.data || {}, authoritative = acc.authoritative;
+  job.updatedAt = e.at;
+  if (acc.lifecycleOk) {
+    try { acc.lifecycleState = taskLifecycle.step(acc.lifecycleState, e, acc.fold); }
+    catch (err) { if (err instanceof taskLifecycle.TaskLifecycleError) acc.lifecycleOk = false; else throw err; }
   }
-  // Additive, read-only: a coarser vision-layer state (#512), folded above in the same loop.
-  // Never affects `job.status` or any other field, and never throws — an event sequence this
-  // layer can't make sense of just yields `null`.
-  // The Rust port (TASK_LIFECYCLE_IMPL, retired in #1071) folds the same journal too; any disagreement or
-  // fault also yields `null`.
-  job.lifecycle = lifecycleOk ? taskLifecycle.confirmFold(events, lifecycleState, fold) : null;
-  if (authoritative) Object.assign(job, { revision, stages });
+  switch (e.type) {
+    case 'job.created': Object.assign(job, { id: e.job, kind: d.kind, projectId: d.projectId ?? null, parentId: d.parentId ?? null, capabilities: d.capabilities || [], createdAt: e.at }); break;
+    case 'job.started': job.status = 'running'; break;
+    case 'progress': job.stage = d.stage ?? job.stage; break;
+    case 'step.started': job.steps.push({ id: d.id, title: d.title, status: 'running' }); break;
+    // In a pipeline journal (#705, authoritative) a step id recurs once per revision (`tests`), so a
+    // completion closes the latest one still running. Every other journal keeps the original rule:
+    // the first step with that id.
+    case 'step.completed': { const s = (authoritative && job.steps.findLast((x) => x.id === d.id && x.status === 'running')) || job.steps.find((x) => x.id === d.id); if (s) s.status = d.failed ? 'failed' : 'completed'; break; }
+    case 'approval.requested': job.pendingApproval = d; job.status = 'waiting_approval'; break;
+    case 'approval.decided': job.pendingApproval = null; if (!TERMINAL.has(job.status)) job.status = 'running'; break;
+    case 'tool.uncertain': job.uncertain.push(d); break;
+    case 'artifact.created': job.artifacts.push(d); break;
+    case 'plan.proposed': case 'plan.edited': job.plan = job.kind === 'code'
+      ? { status: e.type.slice(5), question: null, ...boundCodePlan(d) }
+      : { status: e.type.slice(5), question: d.question ?? null, subQuestions: d.subQuestions || [] }; break;
+    case 'plan.skipped': job.plan = job.kind === 'code'
+      ? { status: 'skipped', question: null, subQuestions: [], truncated: false }
+      : { status: 'skipped', question: d.question ?? null, subQuestions: [] }; break;
+    case 'assistant.output': {
+      const previous = job.assistantOutput || { text: '', truncated: false };
+      const incoming = typeof d.text === 'string' ? d.text : '';
+      const remaining = MAX_ASSISTANT_OUTPUT_BYTES - Buffer.byteLength(previous.text);
+      const text = previous.truncated ? '' : clipUtf8(incoming, remaining);
+      if (text || d.truncated === true || previous.text) job.assistantOutput = {
+        text: previous.text + text,
+        truncated: previous.truncated || d.truncated === true || text.length < incoming.length,
+      };
+      break;
+    }
+    case 'checkpoint.created': job.checkpoint = d; break;
+    // Only a job that was reviewed ever carries `review`: every other job's derived shape,
+    // and so every API response built from it, is exactly what it was before #519.
+    case 'review.requested': case 'review.completed': case 'review.failed':
+      job.review = boundReviewEvent(e.type, d); break;
+    case 'task.stage': if (d.revision !== (acc.revision?.n ?? 0)) acc.lifecycleOk = false; acc.stages.push({ from: d.from ?? null, to: d.to ?? null, revision: d.revision ?? 0, reason: d.reason ?? null,
+      ...(d.reportHash ? { reportHash: d.reportHash } : {}), at: e.at }); break;
+    case 'task.revision': if (d.n !== (acc.revision?.n ?? 0) + 1) acc.lifecycleOk = false; acc.revision = { n: d.n, headSha: d.headSha ?? null, planHash: d.planHash ?? null, at: e.at }; break;
+    case 'job.completed': job.status = 'completed'; job.result = d.result ?? null; job.pendingApproval = null; break;
+    case 'job.failed': job.status = 'failed'; job.error = d.error ?? 'failed'; job.result = d.result ?? null; job.pendingApproval = null; break;
+    case 'job.cancelled': job.status = 'cancelled'; job.result = d.result ?? null; job.pendingApproval = null; break;
+    case 'job.interrupted': job.status = 'interrupted'; job.error = d.reason ?? 'interrupted'; job.pendingApproval = null; break;
+    default: break;
+  }
+  acc.count++;
+}
+// The job as the accumulator stands: a fresh object, so a caller cannot alter the accumulator.
+function snapshot(acc) {
+  const job = { ...acc.job };
+  if (acc.authoritative) Object.assign(job, { revision: acc.revision, stages: acc.stages });
+  return job;
+}
+function buildAccumulator(events) {
+  const acc = newAccumulator(taskLifecycle.isAuthoritative(events));
+  for (const e of events) foldEvent(acc, e);
+  return acc;
+}
+// Additive, read-only: a coarser vision-layer state (#512), folded in the same pass. Never affects
+// `job.status` or any other field, and never throws — an event sequence this layer can't make sense
+// of just yields `null`. The Rust port (TASK_LIFECYCLE_IMPL, retired in #1071) folds the same journal
+// too; any disagreement or fault also yields `null`. Only get() and the job reads it serves compute
+// this confirmation; append() folds without it (#1126).
+function derive(events) {
+  const acc = buildAccumulator(events);
+  const job = snapshot(acc);
+  job.lifecycle = acc.lifecycleOk ? taskLifecycle.confirmFold(events, acc.lifecycleState, acc.fold) : null;
   return job;
 }
 
@@ -209,7 +230,31 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
     if (!/^[0-9a-f-]{36}$/.test(String(id))) throw Object.assign(Error('Invalid job id'), { status: 400 });
     return path.join(root, id + '.jsonl');
   };
+  // #1126: the parsed journal of each job this process has read or written, kept while the file's
+  // size, mtime and inode still match what was last read or written here. Appends (this process is the
+  // only writer) extend it and its fold; any other change to the file misses the cache and re-reads it,
+  // so the hash chain and every fault are still checked whenever the bytes on disk change.
+  const cache = new Map();
+  const CACHE_LIMIT = 64;
+  const stampOf = (stat) => (stat ? { size: stat.size, mtimeMs: stat.mtimeMs, ino: stat.ino } : null);
+  const sameStamp = (a, b) => !!a && !!b && a.size === b.size && a.mtimeMs === b.mtimeMs && a.ino === b.ino;
+  function remember(id, entry) {
+    cache.delete(id);
+    cache.set(id, entry);
+    while (cache.size > CACHE_LIMIT) cache.delete(cache.keys().next().value);
+  }
   function events(id) {
+    const p = file(id);
+    let stamp = null;
+    try { stamp = stampOf(fs.statSync(p)); } catch { stamp = null; }
+    const hit = cache.get(id);
+    if (stamp && hit && sameStamp(hit.stamp, stamp)) return hit.events;
+    cache.delete(id);
+    const rows = readJournal(id);
+    if (stamp) remember(id, { stamp, events: rows, acc: null });
+    return rows;
+  }
+  function readJournal(id) {
     let raw;
     try {
       raw = fs.readFileSync(file(id), 'utf8');
@@ -262,7 +307,7 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
     // Two exceptions: a partial result the user explicitly saves after a cancel is recorded on the
     // cancelled job (spec-deep-research §4 — never saved automatically), and so is the retry save of
     // a research report whose first write failed (the job is `failed` but still holds its finished report).
-    const finished = current.length ? derive(current) : null;
+    const finished = current.length ? foldedJob(id, current) : null;
     const lateArtifact = type === 'artifact.created' && finished
       && (finished.status === 'cancelled' || (finished.status === 'failed' && finished.kind === 'deep_research' && typeof finished.result?.markdown === 'string' && Array.isArray(finished.result?.sources)));
     if (finished && TERMINAL.has(finished.status) && !lateArtifact) throw Object.assign(Error('Job already finished'), { status: 409 });
@@ -294,13 +339,30 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
       event.hash = crypto.createHash('sha256').update(JSON.stringify(event)).digest('hex');
     }
     const fd = fs.openSync(file(id), 'a', 0o600);
-    try { fs.writeFileSync(fd, JSON.stringify(event) + '\n'); if (sync) fs.fsyncSync(fd); }
+    let written = null;
+    try { fs.writeFileSync(fd, JSON.stringify(event) + '\n'); if (sync) fs.fsyncSync(fd); written = stampOf(fs.fstatSync(fd)); }
     finally { fs.closeSync(fd); }
     if (sync) {
       const directory = fs.openSync(root, 'r');
       try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
     }
+    // The cached journal is `current` (read or written here moments ago); extend it with this event.
+    const entry = cache.get(id);
+    if (entry && entry.events === current && written) {
+      current.push(event);
+      entry.stamp = written;
+      if (entry.acc && !(!entry.acc.authoritative && AUTHORITY_TYPES.has(type))) foldEvent(entry.acc, event);
+      else entry.acc = null;
+    }
     return event;
+  }
+  // The job as the journal stands, for append()'s own checks: the cached fold when there is one, else
+  // a fold of `current` (kept for the next append). It skips the lifecycle confirmation get() makes.
+  function foldedJob(id, current) {
+    const entry = cache.get(id);
+    if (!entry || entry.events !== current) return snapshot(buildAccumulator(current));
+    if (!entry.acc) entry.acc = buildAccumulator(current);
+    return snapshot(entry.acc);
   }
   function get(id) { const e = events(id); return e.length ? derive(e) : null; }
   function ids() { try { return fs.readdirSync(root).filter((n) => n.endsWith('.jsonl')).map((n) => n.slice(0, -6)); } catch { return []; } }
@@ -404,9 +466,11 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
       if (job) all.push(job);
     }
     const done = all.filter((j) => TERMINAL.has(j.status) && (!kinds || kinds.includes(j.kind))).sort((a, b) => b.updatedAt - a.updatedAt);
-    for (const [i, j] of done.entries()) if (now() - j.updatedAt > retainMs || i >= maxJobs) fs.rmSync(file(j.id), { force: true });
+    for (const [i, j] of done.entries()) if (now() - j.updatedAt > retainMs || i >= maxJobs) { fs.rmSync(file(j.id), { force: true }); cache.delete(j.id); }
   }
   return { create, run, append, get, list, cancel, recover, can, prune };
 }
 
-module.exports = { createJobs, derive, claimLifecycleAuthority, TYPES, MAX_ASSISTANT_OUTPUT_BYTES, MAX_ASSISTANT_OUTPUT_EVENTS };
+module.exports = { createJobs, derive, claimLifecycleAuthority, TYPES, MAX_ASSISTANT_OUTPUT_BYTES, MAX_ASSISTANT_OUTPUT_EVENTS,
+  // The fold one event at a time (#1126): derive() is this, applied to a whole journal.
+  journalFold: { newAccumulator, foldEvent, snapshot, buildAccumulator } };
