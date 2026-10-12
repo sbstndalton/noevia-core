@@ -21,6 +21,54 @@ process.env.PUBLIC_ORIGIN = 'http://localhost';
 const { handleRequest } = require('./index.cjs');
 const { parseCookies } = require('./auth.cjs');
 
+test('storage early refusal uses the real parser and fixed no-store reply before identity access', () => {
+  const { refuseRustStorageRead, RUST_STORAGE_READS_REFUSAL } = require('./features.cjs');
+  const { parseRequestUrl, badRequestUrl, json } = require('./http.cjs');
+  function gate(target, { method = 'GET', owned = true, host = 'localhost' } = {}) {
+    const headers = { host };
+    for (const key of ['cookie', 'authorization']) {
+      Object.defineProperty(headers, key, { get() { assert.fail(`identity header ${key} was read`); } });
+    }
+    const req = { method, url: target, headers };
+    Object.defineProperty(req, 'socket', { get() { assert.fail('identity socket was read'); } });
+    const response = { headers: {}, status: null, body: null };
+    const res = {
+      setHeader(name, value) { response.headers[name] = value; },
+      writeHead(status, values) { response.status = status; Object.assign(response.headers, values); },
+      end(body) { response.body = JSON.parse(body); },
+    };
+    const handled = refuseRustStorageRead(req, res, { owned, parseRequestUrl, badRequestUrl, json });
+    return { handled, ...response };
+  }
+  for (const target of ['/api/integrations/storage', '/api/integrations/storage?q=secret', '/api/integrations/./storage', '/api/integrations/x/../storage', '/api/integrations/%2e/storage']) {
+    const reply = gate(target);
+    assert.equal(reply.handled, true, target);
+    assert.equal(reply.status, 503);
+    assert.deepEqual(reply.body, RUST_STORAGE_READS_REFUSAL);
+    assert.equal(reply.headers['Cache-Control'], 'no-store');
+    assert.equal(reply.headers['X-Content-Type-Options'], 'nosniff');
+    assert.equal(reply.headers['X-Frame-Options'], 'DENY');
+    assert.equal(reply.headers['Referrer-Policy'], 'same-origin');
+    assert.ok(reply.headers['Content-Security-Policy'].includes("frame-ancestors 'none'"));
+  }
+  assert.equal(gate('/api/integrations/storage', { host: 'a b[' }).status, 503);
+  for (const target of ['//[', 'http://[', '//a b']) {
+    const reply = gate(target);
+    assert.equal(reply.handled, true);
+    assert.equal(reply.status, 400);
+    assert.deepEqual(reply.body, { error: 'invalid URL' });
+    assert.equal(reply.headers['Cache-Control'], 'no-store');
+  }
+  for (const target of ['/api/integrations/storage/', '/api/integrations/storage/files', '/api/integrations/%73torage', '/api/integrations/storage-other']) {
+    assert.equal(gate(target).handled, false, target);
+  }
+  const poison = () => assert.fail('unowned/non-GET request parsed early');
+  for (const method of [undefined, 'HEAD', 'PUT', 'POST', 'OPTIONS', 'DELETE', 'get']) {
+    assert.equal(refuseRustStorageRead({ method }, {}, { owned: true, parseRequestUrl: poison }), false);
+  }
+  assert.equal(refuseRustStorageRead({ method: 'GET' }, {}, { owned: false, parseRequestUrl: poison }), false);
+});
+
 const realFetch = global.fetch;
 test.before(() => { global.fetch = async () => { throw new Error('Unexpected network in request hardening test'); }; });
 test.after(() => {
