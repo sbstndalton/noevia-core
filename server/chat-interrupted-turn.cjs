@@ -132,7 +132,22 @@ function createTurnRecord({ now = Date.now } = {}) {
       ...(note ? { paused: note } : {}),
     };
   }
-  return { observe, assistantEntry };
+  /**
+   * #1507: the reply so far, marked interrupted, for the partial file and for a stored turn whose
+   * client left. Unlike assistantEntry() it keeps the thinking when no answer was written yet, which is
+   * the case that lost the reply in the report. A failed reply is not kept; nothing at all is null.
+   */
+  function partialEntry() {
+    if (failed) return null;
+    const base = assistantEntry();
+    if (!base) return null;
+    const stopped = base.model === STOPPED_SENDER && !base.content;
+    const entry = stopped ? { role: 'assistant', content: '', model: base.model, ...(base.toolCalls ? { toolCalls: base.toolCalls } : {}) } : { ...base };
+    if (stopped && reasoning.trim()) entry.reasoning = reasoning;
+    if (!entry.content && !entry.reasoning && !(Array.isArray(entry.toolCalls) && entry.toolCalls.length) && !entry.paused) return null;
+    return { ...entry, interrupted: true };
+  }
+  return { observe, assistantEntry, partialEntry };
 }
 
 /**

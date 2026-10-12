@@ -234,3 +234,20 @@ test('M4: while the Rust front owns it, the free-chat save is refused here befor
   assert.equal(g.sent.at(-1).status, 200);
   assert.deepEqual(g.store.savedFree.map((c) => c.id), ['f2', 'f1']);
 });
+
+test('#1507: a saved partial reply comes with the transcript, and a saved transcript supersedes it', async () => {
+  const f = fixture();
+  const partial = require('../chat-partial.cjs');
+  fs.mkdirSync(path.join(f.dir, 'chat-partials'), { recursive: true });
+  fs.writeFileSync(partial.fileFor(f.dir, 'c1'), JSON.stringify({ role: 'assistant', content: 'half a rep', interrupted: true }));
+  await f.call('GET', '/api/chats/c1/history');
+  const got = f.sent.pop();
+  assert.equal(got.status, 200);
+  assert.deepEqual(got.body.partial, { role: 'assistant', content: 'half a rep', interrupted: true });
+  assert.deepEqual(got.body.history, [], 'the transcript itself is unchanged by the partial');
+  await f.call('POST', '/api/chats/c1/history', { history: [{ role: 'user', content: 'next' }] });
+  assert.equal(f.sent.pop().status, 200);
+  assert.equal(fs.existsSync(partial.fileFor(f.dir, 'c1')), false, 'the saved transcript supersedes the partial');
+  await f.call('GET', '/api/chats/c1/history');
+  assert.equal(f.sent.pop().body.partial, undefined);
+});

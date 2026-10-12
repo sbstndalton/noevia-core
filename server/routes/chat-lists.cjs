@@ -154,7 +154,12 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
       const spaceId = require('../chat-lists.cjs').safeChatId(rawId);
       if (!spaceId) return json(res, 400, { error: 'invalid chat id' });
       const revisionOf = (history) => crypto.createHash('sha256').update(JSON.stringify(history)).digest('hex');
-      if (req.method === 'GET') { const history = readHistory(spaceId); return json(res, 200, { history, revision: revisionOf(history) }); }
+      // #1507: a reply the client lost (reload, restart) is offered as `partial`, an interrupted turn.
+      if (req.method === 'GET') {
+        const history = readHistory(spaceId);
+        const partial = require('../chat-partial.cjs').partialFor(currentWorkspace().dir, spaceId);
+        return json(res, 200, { history, revision: revisionOf(history), ...(partial ? { partial } : {}) });
+      }
       if (req.method === 'POST') {
         // A reply that finishes after its chat was deleted must not write the transcript back.
         if (require('../chat-lists.cjs').readTombstones(currentWorkspace().dir).has(spaceId)) return json(res, 410, { error: 'This chat was deleted.' });
@@ -173,6 +178,8 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
           }
           const next = Array.isArray(body.history) ? require('../chat-sources.cjs').sanitizeHistory(body.history.slice(-STORED_HISTORY_CAP)) : [];
           writeHistory(spaceId, next);
+          // #1507: a transcript saved by the client (not by a running reply) supersedes a saved partial.
+          require('../chat-partial.cjs').supersedePartial(currentWorkspace().dir, spaceId);
           return json(res, 200, { ok: true, revision: revisionOf(next) });
         } catch {
           return json(res, 400, { error: 'invalid JSON' });

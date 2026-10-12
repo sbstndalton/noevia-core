@@ -184,10 +184,12 @@ function createChatHandler({
       if (execution.record && execution.aborted?.()) {
         try {
           const outcome = require('./chat-interrupted-turn.cjs').saveInterruptedTurn({ fs, workspace: execution.workspace, chatId: body.chatId,
-            message: body.message, entry: execution.record.assistantEntry(), cap: STORED_HISTORY_CAP });
+            message: body.message, entry: execution.record.partialEntry() || execution.record.assistantEntry(), cap: STORED_HISTORY_CAP });
           if (outcome !== 'saved' && outcome !== 'not-last') console.log(`[chat] interrupted reply not kept: ${outcome}`);
         } catch (error) { console.warn('[chat] could not keep an interrupted reply:', error?.message || error); }
       }
+      // #1507: the reply has ended (completed, failed, or kept above), so its saved partial is cleared.
+      execution.partials?.finish();
       // A chat deleted while this reply ran leaves no context state (summaries hold conversation text).
       const id=typeof body?.chatId==='string'?require('./chat-lists.cjs').safeChatId(body.chatId):null;
       try{const dir=currentWorkspace().dir;if(id&&require('./chat-lists.cjs').readTombstones(dir).has(id))require('./chat-context.cjs').remove(dir,id);}catch{/* best effort */}
@@ -459,6 +461,10 @@ function createChatHandler({
     const record = typeof body.chatId === 'string' && body.chatId && !spaceId?.startsWith('diary') && !body.compactOnly && chatWorkspace
       ? require('./chat-interrupted-turn.cjs').createTurnRecord() : null;
     if (record) Object.assign(execution, { record, workspace: chatWorkspace, aborted: () => chatSignal.signal.aborted });
+    // #1507: the partial reply is saved every few seconds, so a reload or a restart keeps what was written.
+    // (keyed by the same sanitised id the history route reads, so the two always agree.)
+    const partialId = record ? require('./chat-lists.cjs').safeChatId(body.chatId) : null;
+    if (partialId) execution.partials = require('./chat-partial.cjs').startPartialSaves({ dir: chatWorkspace.dir, chatId: partialId, record });
     // An error raised after the client left is the disconnect itself (an aborted compaction or
     // request), not a failed reply: the kept reply must not be dropped as failed (#679 review).
     const send = (obj) => { preparation?.event(obj); if (!(obj?.type === 'error' && chatSignal.signal.aborted)) record?.observe(obj); if (!res.destroyed && !chatSignal.signal.aborted) res.write(`data: ${JSON.stringify(obj)}\n\n`); };
