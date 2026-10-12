@@ -60,7 +60,9 @@ test('failureText shows the sanitised upstream reason, per kind', { skip: skipWa
   const leaky = caps.failureText(500, '{"error":"failed at http://10.1.2.3:8080/v1 key=sk-synthetic000000"}');
   assert.doesNotMatch(leaky, /10\.1\.2\.3|sk-synthetic|http:/);
   // Off: only this text change remains.
-  assert.equal(caps.failureText(422, '{"detail":"temperature must be <= 2"}'), 'The model provider refused the request: temperature must be <= 2. Partial output was preserved.');
+  // #1547: the preserved-output sentence only when text was shown for this reply.
+  assert.equal(caps.failureText(422, '{"detail":"temperature must be <= 2"}'), 'The model provider refused the request: temperature must be <= 2.');
+  assert.equal(caps.failureText(422, '{"detail":"temperature must be <= 2"}', { partial: true }), 'The model provider refused the request: temperature must be <= 2. Partial output was preserved.');
 });
 
 test('the tools gate reads /props once per model, caches, and treats unknown as allowed', { skip: skipWasm }, async () => {

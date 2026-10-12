@@ -14,10 +14,10 @@ const FALLBACK_REPLY_CAP = 16 * 1024 * 1024;
 const FALLBACK_REPORTED = Symbol('fallback failure already reported');
 // The text shown for a provider reply that failed: a mapped message, never the raw body (#918).
 // The ChatGPT adapter marks messages written for people (reconnect, usage limit); those show as they are.
-async function providerFailureText(response, chatgptProvider) {
+async function providerFailureText(response, chatgptProvider, partial = false) {
   const context = require('./chat-context.cjs');
   const detail = (await readCappedText(response, PROVIDER_ERROR_BODY_CAP).catch(() => ({ text: '' }))).text;
-  let msg = context.providerError(detail, Number.isInteger(response?.status) ? response.status : undefined);
+  let msg = context.providerError(detail, Number.isInteger(response?.status) ? response.status : undefined, { partial });
   if (chatgptProvider && response.headers?.get?.('x-noevia-provider-message') === '1') { try { msg = String(JSON.parse(detail).error.message).slice(0, 300) || msg; } catch { /* keep the generic text */ } }
   return msg;
 }
@@ -1201,6 +1201,9 @@ function createChatHandler({
     // Track final-answer content separately for each round. Reasoning may contain
     // internal planning or unfinished narration; it is never promoted to an answer.
     let roundHasContent = false;
+    // #1547: whether any answer text has been shown to the client for this reply (across rounds).
+    // Only then does a failure say that partial output was preserved.
+    let shownText = false;
     // Text streamed in a round that then calls tools is narration, not the answer.
     let roundContent = '';
     let roundReasoning = '';
@@ -1326,7 +1329,7 @@ function createChatHandler({
             try {
               const evt = JSON.parse(payload);
               if(evt.choices?.[0]?.finish_reason==='length')send({type:'warning',text:'The model reached its thinking/answer token budget. This reply may be incomplete; try Low thinking or a narrower question.'});
-              if(evt.error){const text=chatgptProvider&&evt.error?.source==='chatgpt'&&typeof evt.error.message==='string'?evt.error.message.slice(0,300):context.providerError(evt.error);send({type:'error',text});res.end();return;}
+              if(evt.error){const text=chatgptProvider&&evt.error?.source==='chatgpt'&&typeof evt.error.message==='string'?evt.error.message.slice(0,300):context.providerError(evt.error,undefined,{partial:shownText});send({type:'error',text});res.end();return;}
               const delta = evt.choices?.[0]?.delta || {};
               const meaningfulToolFragment = Array.isArray(delta.tool_calls) && delta.tool_calls.some(tc => tc?.id || tc?.function?.name || tc?.function?.arguments);
               // Detect output before handling usage: a compact provider may put
@@ -1354,6 +1357,7 @@ function createChatHandler({
               if (delta.content) {
                 sawAnything = true;
                 roundHasContent = true;
+                shownText = true;
                 roundContent += delta.content;
                 send({ type: 'delta', text: delta.content });
               }
@@ -1383,7 +1387,7 @@ function createChatHandler({
       } catch (err) {
         if (chatSignal.signal.aborted) break; // client went away; stop quietly
         // Mapped text (#918): a stream that breaks mid-read must not show undici internals.
-        send({ type: 'error', text: context.providerError(String(err?.message || '')) });
+        send({ type: 'error', text: context.providerError(String(err?.message || ''), undefined, { partial: shownText }) });
         break;
       }
       // Cut off mid-stream by a revoked skill: keep what was already shown, request no tools.
@@ -1408,13 +1412,13 @@ function createChatHandler({
             method:'POST',headers:upstreamHeaders,signal:AbortSignal.any([chatSignal.signal,AbortSignal.timeout(300000)]),redirect:'error',
           }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:false,...sampling.params,...requestTools(),...forceChoice(round)}, provider, model, effort, send);
           // Status first (#918): a 5xx HTML page is a provider failure, not a JSON parse error.
-          if (!response.ok) { send({ type: 'error', text: await providerFailureText(response, chatgptProvider) }); throw FALLBACK_REPORTED; }
+          if (!response.ok) { send({ type: 'error', text: await providerFailureText(response, chatgptProvider, shownText) }); throw FALLBACK_REPORTED; }
           const full = {ok:true,status:response.status,body:await readCappedJson(response,FALLBACK_REPLY_CAP)};
           require('./mtp.cjs').record(chatWorkspace?.userId,model,full.body?.timings);
           const msg = full.body?.choices?.[0]?.message;
           if (msg?.reasoning_content || msg?.content || (Array.isArray(msg?.tool_calls) && msg.tool_calls.length)) markFirstOutput();
           if (msg?.reasoning_content) { roundReasoning += msg.reasoning_content; send({ type: 'reasoning', text: msg.reasoning_content }); }
-          if (msg?.content) { roundHasContent = true; roundContent += msg.content; send({ type: 'delta', text: msg.content }); }
+          if (msg?.content) { roundHasContent = true; shownText = true; roundContent += msg.content; send({ type: 'delta', text: msg.content }); }
           if (Array.isArray(msg?.tool_calls)) {
             for (const tc of msg.tool_calls) {
               const index = toolCalls.size;
@@ -1426,7 +1430,7 @@ function createChatHandler({
           sawAnything = true;
         } catch (err) {
           // Mapped or fixed text (#918): never a V8 SyntaxError quoting the body, or undici internals.
-          if (err !== FALLBACK_REPORTED) send({ type: 'error', text: context.providerError(String(err?.message || '')) });
+          if (err !== FALLBACK_REPORTED) send({ type: 'error', text: context.providerError(String(err?.message || ''), undefined, { partial: shownText }) });
         }
       }
 
