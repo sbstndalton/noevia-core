@@ -85,6 +85,10 @@ function declinedToolNote(entry) {
   const clipped = text.length > REPLAY_TOOL_RESULT_MAX ? `${text.slice(0, REPLAY_TOOL_RESULT_MAX)}…` : text;
   return `Not run earlier in this chat: the user did not approve ${name}, so it did not run and nothing was changed by it.\n${frameUntrusted('tool result', name, clipped)}`;
 }
+// #1448: a user message with no reply kept after it (stopped, failed or lost) is not an open request. The
+// model is told so by this note between it and the next turn, instead of the two being merged into one
+// user turn, which made the model answer the abandoned prompt again.
+const ABANDONED_TURN_NOTE = '(No reply was kept for the message above: it was stopped or failed before an answer. It is not an open request. Answer only the newest message unless the user asks about it.)';
 function normalizeReplayHistory(mapped, newMessage) {
   const out = [];
   // Applied changes with no turn before them (the first message was edited and re-run, #658
@@ -109,8 +113,11 @@ function normalizeReplayHistory(mapped, newMessage) {
       if (last && last.role === 'assistant') last.content = `${last.content}\n\n${foldToolMessage(entry)}`;
       continue;
     }
-    if (last && last.role === entry.role && (entry.role === 'user' || entry.role === 'assistant')) {
+    if (last && last.role === entry.role && entry.role === 'assistant') {
       last.content = `${last.content}\n\n${entry.content}`;
+    } else if (entry.role === 'user' && last && last.role === 'user') {
+      // #1448: the earlier prompt got no reply; it stays its own turn, marked as abandoned.
+      out.push({ role: 'assistant', content: ABANDONED_TURN_NOTE }, { ...entry });
     } else {
       out.push({ ...entry });
     }
@@ -120,13 +127,50 @@ function normalizeReplayHistory(mapped, newMessage) {
   while (out.length && out[0].role === 'assistant') out.shift();
   if (typeof newMessage === 'string') {
     const last = out[out.length - 1];
-    if (last && last.role === 'user') last.content = `${last.content}\n\n${newMessage}`;
-    else out.push({ role: 'user', content: newMessage });
+    // #1448: a history that ends on a prompt with no reply kept is abandoned; the new message is its own turn.
+    if (last && last.role === 'user') out.push({ role: 'assistant', content: ABANDONED_TURN_NOTE });
+    out.push({ role: 'user', content: newMessage });
   }
   if (leading.length && out[0] && out[0].role === 'user') {
     out[0] = { ...out[0], content: `${leading.join('\n\n')}\n\n${out[0].content}` };
   }
   return out;
+}
+
+// #1553: a reply whose chat template cannot take tools is told so in the request itself. Without this the model
+// said no search tool existed, or wrote search results it never had. The note is ours and holds no tool output.
+const TOOLS_OFF_MODEL_NOTE = 'No tools can run in this reply: this model\'s chat template cannot use them. If the person asks for a web search, a file, a live lookup or any other tool, say so in one line at the start. Do not write results, sources, excerpts or simulated output for it.';
+function withToolsOffNote(messages) {
+  const at = messages.findIndex((m) => m?.role === 'system' && typeof m.content === 'string');
+  if (at < 0) return [{ role: 'system', content: TOOLS_OFF_MODEL_NOTE }, ...messages];
+  return messages.map((m, i) => (i === at ? { ...m, content: `${m.content}\n\n${TOOLS_OFF_MODEL_NOTE}` } : m));
+}
+
+// #1574: a local reply that stops sending bytes after its first output is ended after `ms` with a named
+// error, instead of sitting until the browser gives up with "network error" minutes later. Nothing is
+// limited before the first output (a long prefill is not a stall), and `ms` of 0 limits nothing.
+class StreamIdleError extends Error {
+  constructor(ms) { super(`no output for ${ms} ms`); this.name = 'StreamIdleError'; this.ms = ms; }
+}
+async function* withIdleLimit(iterable, ms) {
+  if (!(ms > 0)) { yield* iterable; return; }
+  const it = iterable[Symbol.asyncIterator]();
+  let started = false;
+  try {
+    for (;;) {
+      let timer = null;
+      const pending = it.next();
+      const next = started
+        ? await Promise.race([pending, new Promise((_, reject) => { timer = setTimeout(() => reject(new StreamIdleError(ms)), ms); })]).finally(() => clearTimeout(timer))
+        : await pending;
+      if (next.done) return;
+      started = true;
+      yield next.value;
+    }
+  } finally {
+    // Closing the provider stream; not awaited, so a read that is still pending cannot hold the reply open.
+    try { it.return?.().catch?.(() => {}); } catch { /* already closed */ }
+  }
 }
 
 function createChatHandler({
@@ -162,6 +206,8 @@ function createChatHandler({
   routingModes = null,
   // #1441: how a turn waits for the project's file jobs still running; the wait is bounded.
   sourceJobs = require('./source-jobs.cjs'), sourceWaitMs = 30000,
+  // #1574: how long a local reply may go silent after its first output before it is ended (0 = no limit).
+  streamIdleMs = 120000,
 }) {
   const jsonOut = json;
   // Revoked Skill content in earlier turns (#546): one ledger per handler, cached in memory.
@@ -1251,6 +1297,7 @@ function createChatHandler({
     if (templateGate && activeTools.length && !(await templateToolsGate.allowsTools(modelManager, model, chatSignal.signal))) {
       templateToolsOff = true;
       send({ type: 'warning', text: templateCaps.TOOLS_OFF_NOTICE });
+      roundMessages = withToolsOffNote(roundMessages);
     }
     const requestTools = () => (!templateToolsOff && activeTools.length ? { tools: activeTools } : {});
     // tool_choice for the gate's required tool: the first model turn (and its one retry) only.
@@ -1322,6 +1369,7 @@ function createChatHandler({
             discardBody(upstream);
             templateToolsOff = true;
             send({ type: 'warning', text: templateCaps.TOOLS_RETRY_NOTICE });
+            roundMessages = withToolsOffNote(roundMessages);
             upstream = await reasoningEffort.requestWithEffort(providerFetch, upstreamUrl, {
               method: 'POST', headers: upstreamHeaders, signal: chatSignal.signal, redirect: 'error',
             }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:true,stream_options:{include_usage:true},
@@ -1353,7 +1401,7 @@ function createChatHandler({
       // (same pattern as the client-side reader in src/api.ts).
       let buffer = '';
       try {
-        for await (const chunk of upstream.body) {
+        for await (const chunk of withIdleLimit(upstream.body, provider.id === DEFAULT_PROVIDER_ID ? streamIdleMs : 0)) {
           // Leaving the loop cancels the provider stream; checked at most once a second (#272).
           if (loadedSkills.size && Date.now() - skillCheckedAt >= 1000 && revokedSkills()) break;
           buffer += decoder.decode(chunk, { stream: true });
@@ -1423,6 +1471,11 @@ function createChatHandler({
         }
       } catch (err) {
         if (chatSignal.signal.aborted) break; // client went away; stop quietly
+        // #1574: named, with the wait it ran into. Tools run only after a round's stream ends, so none ran.
+        if (err instanceof StreamIdleError) {
+          send({ type: 'error', text: `The model sent no output for ${Number((err.ms / 1000).toFixed(1))} s after it started, so the reply was ended. No tool ran for this step. Try again, or choose another model.` });
+          break;
+        }
         // Mapped text (#918): a stream that breaks mid-read must not show undici internals.
         send({ type: 'error', text: context.providerError(String(err?.message || '')) });
         break;
@@ -1752,4 +1805,4 @@ function createChatHandler({
   return { handleChat, handleChatInner };
 }
 
-module.exports = { createChatHandler, normalizeReplayHistory };
+module.exports = { createChatHandler, normalizeReplayHistory, withIdleLimit };
