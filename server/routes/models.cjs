@@ -52,6 +52,13 @@ function clientMessage(e, fallback) {
  * @param {() => object} deps.currentWorkspace
  * @param {object} deps.service   models.cjs
  */
+// The Rust front owns GET /api/routing-default only while NOEVIA_RUST_ROUTING_DEFAULT=1 and the
+// supervisor has confirmed it (NOEVIA_RUST_ROUTING_DEFAULT_CONFIRMED=1), under NOEVIA_RUST_AUTH
+// with NOEVIA_FRONT=rust (the same conditions as routes/reasoning-settings.cjs enabledFrom).
+function routingDefaultRustOwned(env) {
+  return env.NOEVIA_FRONT === 'rust' && env.NOEVIA_RUST_AUTH === '1' && env.NOEVIA_RUST_AUTH_CONFIRMED === '1'
+    && env.NOEVIA_RUST_ROUTING_DEFAULT === '1' && env.NOEVIA_RUST_ROUTING_DEFAULT_CONFIRMED === '1';
+}
 function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe, reportedTokenRate, missingRoles, currentWorkspace, service, inferenceBudget = null, sweepGuardOptions = {} }) {
   const { modelScanCache, refreshModelScan, autoRoles, setAutoRoles, ensureRolesLoaded, servedCatalogue, modelsInstalled, deriveUserModelName, lastLoadedModel, clearLastLoadedModel, clearRoleReferences } = service;
   // #1461: the installed list is shared for a moment (service.modelsInstalled). A decision that must confirm
@@ -117,6 +124,9 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
     // The default mode new projects start in, and (on request) a one-off switch of every existing
     // project of this user to it. Per workspace, so tenants never touch each other's projects.
     if (p === '/api/routing-default') {
+      // M6 (#1305): the Rust front answers GET under its confirmed switch. Node refuses that GET
+      // before any workspace work, so a confirmed front is the only reader; PUT stays Node's.
+      if (req.method === 'GET' && routingDefaultRustOwned(env)) return json(res, 503, { error: 'Routing default is owned by the Rust front.' });
       const ws = currentWorkspace();
       if (req.method === 'GET') return json(res, 200, { routing: ws.preferences?.defaultRouting === 'manual' ? 'manual' : 'auto' });
       if (req.method === 'PUT') {
@@ -661,4 +671,4 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
   return modelRoutes;
 }
 
-module.exports = { createModelRoutes };
+module.exports = { createModelRoutes, routingDefaultRustOwned };
