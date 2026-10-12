@@ -52,7 +52,13 @@ function createToolPolicy({ db, audit = () => {}, wasmLoader = () => require('./
       warnFault(err);
       throw Object.assign(Error('The tool permission could not be checked.'), { status: 500 });
     }
-    if (!r.ok) throw fail(SET_MESSAGES[r.reason]);
+    // A refusal with a reason this file has no message for (the loader only passes known ones, but a
+    // future port could add one) is a fault, not a 400 with no message (#1109): fail closed.
+    if (r?.ok === false && Object.hasOwn(SET_MESSAGES, r.reason)) throw fail(SET_MESSAGES[r.reason]);
+    if (r?.ok !== true) {
+      warnFault({ reason: 'reply' });
+      throw Object.assign(Error('The tool permission could not be checked.'), { status: 500 });
+    }
     const put = db.prepare(`INSERT INTO tool_policies VALUES(?,?,?,?) ON CONFLICT(user_id, tool) DO UPDATE SET mode=excluded.mode, updated_at=excluded.updated_at`);
     const now = Date.now();
     db.transaction(() => { for (const t of list) put.run(userId, t, value, now); })();
