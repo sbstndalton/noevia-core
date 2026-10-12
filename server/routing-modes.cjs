@@ -318,7 +318,11 @@ const OPTIONS = Object.freeze([
  * ('router', which also stops further calls) or any chunk fails ('unavailable'); an empty input is
  * a failure too. Never throws.
  */
-function createSensitivity({ decide, deadlineMs = () => 1500, minConfidence = 0.6, maxChunks = MAX_CHUNKS_CAP, log = () => {} }) {
+// #1437: the sensitivity check's deadline. 1.5 s was too tight for Laya under load (a 503 or a
+// deadline miss on benign turns, which then stay local). 2 s is the ceiling the owner approved for
+// Laya deadlines; the admin deadline field (decision-settings, 100-2000 ms) does not govern this check.
+const SENSITIVITY_DEADLINE_MS = 2000;
+function createSensitivity({ decide, deadlineMs = () => SENSITIVITY_DEADLINE_MS, minConfidence = 0.6, maxChunks = MAX_CHUNKS_CAP, log = () => {} }) {
   // A short code for why the check could not answer (never message or model text).
   const causeOfFailure = (result, error) => {
     if (error) return /unavailable|no decision service/i.test(String(error.message || '')) ? 'no-service' : error.deadline ? 'deadline' : 'error';
@@ -343,7 +347,8 @@ function createSensitivity({ decide, deadlineMs = () => 1500, minConfidence = 0.
   }
   return async function check(input) {
     const list = (Array.isArray(input) ? input : [input]).map((t) => String(t || '')).filter(Boolean).slice(0, Math.max(1, maxChunks));
-    const deadline = Math.max(100, Number(deadlineMs()) || 1500);
+    const deadline = Math.max(100, Number(deadlineMs()) || SENSITIVITY_DEADLINE_MS);
+    const started = Date.now();
     let verdicts;
     try {
       // One overall deadline as well, so a backend that ignores its own cannot hold the turn.
@@ -368,7 +373,8 @@ function createSensitivity({ decide, deadlineMs = () => 1500, minConfidence = 0.
     const bad = verdicts.find((v) => v.verdict === 'unavailable');
     const flag = verdicts.some((v) => v.verdict === 'router') ? 'router' : bad ? 'unavailable' : null;
     const out = flag === 'unavailable' ? { flagged: true, flag, cause: bad.cause } : flag ? { flagged: true, flag } : { flagged: false, flag: null };
-    try { log({ verdict: out.flag || 'clear', fellBack: !!bad, ...(out.cause ? { cause: out.cause } : {}), chunks: list.length }); } catch { /* codes only, never breaks routing */ }
+    // #1437: one line per check: outcome, cause code (an http status for a service fault), latency. Never text.
+    try { log({ verdict: out.flag || 'clear', fellBack: !!bad, ...(out.cause ? { cause: out.cause } : {}), chunks: list.length, deadlineMs: deadline, latencyMs: Date.now() - started }); } catch { /* codes only, never breaks routing */ }
     return out;
   };
 }
@@ -418,5 +424,19 @@ function cloudModel(cloud, role) {
   return cloud[role] || cloud.smart || cloud.fast || cloud.code || '';
 }
 
+/**
+ * The decision layer's own log entry (decision/index.cjs), reduced to codes and numbers (#1437). The
+ * layer's `failed` field carries an error message, and the request is never logged; neither is kept.
+ */
+function decisionCodes(entry) {
+  const e = entry && typeof entry === 'object' ? entry : {};
+  const code = (v) => (typeof v === 'string' && /^[a-z][a-z0-9-]{0,39}$/.test(v) ? v : null);
+  const num = (v) => (Number.isFinite(v) ? v : null);
+  const purpose = typeof e.purpose === 'string' && /^[a-z][a-z0-9.-]{0,39}$/.test(e.purpose) ? e.purpose : null;
+  return { purpose, source: code(e.source), fellBack: code(e.fellBack), cause: code(e.cause),
+    latencyMs: num(e.latencyMs), confidence: num(e.confidence) };
+}
+
 module.exports = { rustOwned, MODES, WHEN_SENSITIVE, OPTIONS, FILE, ALLOWED_KEY, normalize, read, write, validate, allowedModes, setAllowedModes,
-  effectiveMode, projectOverride, withProjectOverride, preRule, hasDiaryContent, routerChunks, chunkCharsFor, ROUTER_CHUNK_CHARS, ROUTER_MAX_CHUNKS, routerMaxChunks, createSensitivity, resolveRoute, chatFlags, cloudModel, ibanValid, luhn };
+  effectiveMode, projectOverride, withProjectOverride, preRule, hasDiaryContent, routerChunks, chunkCharsFor, ROUTER_CHUNK_CHARS, ROUTER_MAX_CHUNKS, routerMaxChunks, createSensitivity, resolveRoute, chatFlags, cloudModel, ibanValid, luhn,
+  SENSITIVITY_DEADLINE_MS, decisionCodes };

@@ -852,12 +852,14 @@ const { handleChat } = require('./chat.cjs').createChatHandler({
     // sensitive handling; an administrator's allowed list still applies to the result.
     settings: (project) => { const rm = require('./routing-modes.cjs'); const s = rm.withProjectOverride(rm.read(currentWorkspace().dir), project); return { ...s, mode: rm.effectiveMode(s, rm.allowedModes(require('./features.cjs').settingsStore(authService.db))) }; },
     sensitivity: require('./routing-modes.cjs').createSensitivity({
-      deadlineMs: () => decisionSettings.get().timeoutMs,
+      // #1437: a named 2 s deadline (routing-modes.cjs), and the decision layer's own log (outcome, cause, latency) is kept.
+      deadlineMs: () => require('./routing-modes.cjs').SENSITIVITY_DEADLINE_MS,
       log: (entry) => recordDecision('sensitivity', entry),
       decide: (request) => {
         const backend = decisionSettings.backend();
         if (!backend) throw Error('Decision service unavailable');
-        if (backend !== sensitivityBackend) { sensitivityBackend = backend; sensitivityDecisions = require('./decision/index.cjs').createDecisions({ backends: { configured: backend }, chains: { 'routing.sensitivity': ['configured'] } }); }
+        if (backend !== sensitivityBackend) { sensitivityBackend = backend; sensitivityDecisions = require('./decision/index.cjs').createDecisions({ backends: { configured: backend }, chains: { 'routing.sensitivity': ['configured'] },
+          log: (entry) => recordDecision('sensitivity-backend', require('./routing-modes.cjs').decisionCodes(entry)) }); }
         return sensitivityDecisions.decide(request);
       },
     }),
