@@ -85,6 +85,10 @@ function declinedToolNote(entry) {
   const clipped = text.length > REPLAY_TOOL_RESULT_MAX ? `${text.slice(0, REPLAY_TOOL_RESULT_MAX)}…` : text;
   return `Not run earlier in this chat: the user did not approve ${name}, so it did not run and nothing was changed by it.\n${frameUntrusted('tool result', name, clipped)}`;
 }
+// #1448: a user message with no reply kept after it (stopped, failed or lost) is not an open request. The
+// model is told so by this note between it and the next turn, instead of the two being merged into one
+// user turn, which made the model answer the abandoned prompt again.
+const ABANDONED_TURN_NOTE = '(No reply was kept for the message above: it was stopped or failed before an answer. It is not an open request. Answer only the newest message unless the user asks about it.)';
 function normalizeReplayHistory(mapped, newMessage) {
   const out = [];
   // Applied changes with no turn before them (the first message was edited and re-run, #658
@@ -109,8 +113,11 @@ function normalizeReplayHistory(mapped, newMessage) {
       if (last && last.role === 'assistant') last.content = `${last.content}\n\n${foldToolMessage(entry)}`;
       continue;
     }
-    if (last && last.role === entry.role && (entry.role === 'user' || entry.role === 'assistant')) {
+    if (last && last.role === entry.role && entry.role === 'assistant') {
       last.content = `${last.content}\n\n${entry.content}`;
+    } else if (entry.role === 'user' && last && last.role === 'user') {
+      // #1448: the earlier prompt got no reply; it stays its own turn, marked as abandoned.
+      out.push({ role: 'assistant', content: ABANDONED_TURN_NOTE }, { ...entry });
     } else {
       out.push({ ...entry });
     }
@@ -120,8 +127,9 @@ function normalizeReplayHistory(mapped, newMessage) {
   while (out.length && out[0].role === 'assistant') out.shift();
   if (typeof newMessage === 'string') {
     const last = out[out.length - 1];
-    if (last && last.role === 'user') last.content = `${last.content}\n\n${newMessage}`;
-    else out.push({ role: 'user', content: newMessage });
+    // #1448: a history that ends on a prompt with no reply kept is abandoned; the new message is its own turn.
+    if (last && last.role === 'user') out.push({ role: 'assistant', content: ABANDONED_TURN_NOTE });
+    out.push({ role: 'user', content: newMessage });
   }
   if (leading.length && out[0] && out[0].role === 'user') {
     out[0] = { ...out[0], content: `${leading.join('\n\n')}\n\n${out[0].content}` };
