@@ -753,21 +753,40 @@ test('#328 a model that fails every probe at its reference settings stops with a
   assert.equal(f.requests.length - before, 3);
 });
 
-test('#328 with sampling to apply, the baseline is measured first at f16 and the KV and drafting keys are put back', async t => {
+test('#328 with sampling to apply, the baseline is measured first at bf16 (#1078) and the KV and drafting keys are put back', async t => {
   const f = fixture(t, { models: ['Qwen3-8B-Instruct'], answerFor: e2b });
   await f.manager.autotune.start('Qwen3-8B-Instruct', { confirmPause: true });
   const j = await finished(f.manager), item = j.models[0];
   assert.equal(j.status, 'passed', j.error);
   // The sampling step is judged on extraction and reasoning, so the E2B-style "69" no longer blocks it.
   assert.equal(phase(item, 'sampling').value.applied, true);
-  assert.equal(item.baseline.reference, 'f16');
+  assert.equal(item.baseline.reference, 'bf16');
   assert.deepEqual(item.baseline.skipped.map(s => s.id), ['arithmetic']);
   const first = f.requests[0];
-  assert.equal(first.options['cache-type-k'], 'f16'); assert.equal(first.options['spec-type'], 'none'); assert.equal(first.options.temp, undefined);
+  assert.equal(first.options['cache-type-k'], 'bf16'); assert.equal(first.options['spec-type'], 'none'); assert.equal(first.options.temp, undefined);
   // The sampling probe ran on the profile as it was (no KV keys), not on the baseline's f16.
   const samplingProbe = f.requests.find(r => r.options.temp);
   assert.equal(samplingProbe.options['cache-type-k'], undefined); assert.equal(samplingProbe.options['spec-type'], undefined);
   assert.equal(probeRequests(f, 'arithmetic').length, 1);
+});
+
+test('#1078: the sampling baseline is bf16; an engine that rejects bf16 gets f16 as the reference, not the current settings', async t => {
+  const f = fixture(t, { models: ['Qwen3-8B-Instruct'], answerFor: e2b, loadReply: refuseBf16('llama_init_from_model: unsupported cache type: bf16') });
+  await f.manager.autotune.start('Qwen3-8B-Instruct', { confirmPause: true });
+  const j = await finished(f.manager), item = j.models[0];
+  assert.equal(j.status, 'passed', j.error);
+  assert.equal(item.baseline.reference, 'f16');
+  assert.deepEqual(item.baseline.probes, ['extraction', 'reasoning']);
+  assert.ok(j.log.some(l => /^Measuring the quality baseline at bf16 KV cache, drafting off\./.test(l.text)));
+});
+
+test('#1078: a bf16 baseline that fails for another reason (no refusal) does not fall back to f16', async t => {
+  const f = fixture(t, { models: ['Qwen3-8B-Instruct'], answerFor: e2b, httpFor: ({ q, o }) => q?.id === 'extraction' && o['cache-type-k'] === 'bf16' ? 500 : 0 });
+  await f.manager.autotune.start('Qwen3-8B-Instruct', { confirmPause: true });
+  const j = await finished(f.manager), item = j.models[0];
+  assert.equal(j.status, 'passed', j.error);
+  assert.notEqual(item.baseline.reference, 'f16');
+  assert.ok(!j.log.some(l => /^Measuring the quality baseline at f16 KV cache/.test(l.text)));
 });
 
 test('#328 when f16 does not load, the baseline comes from the current settings', async t => {
@@ -1740,8 +1759,51 @@ test('#1062 a deferred re-read happens before the tuned model next loads, and be
   f.status.outside = 'unloaded';
   const n = reloads.length;
   assert.equal((await f.manager.autotune.start('synthetic', { confirmPause: true })).status, 202);
+  // #1072: nothing was pending, so start() re-read nothing before it returned (the old check was >=).
+  assert.equal(reloads.length, n, 'no re-read before the new tune started');
   await finished(f.manager);
-  assert.ok(reloads.length >= n);
+});
+
+// #1072: a re-read owed by an interrupted job, with the model server reached through a fake request.
+function owedReread(t, { request, rawModels }) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'full-tune-owed-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const { createFullAutotuner } = require('./llamacpp-full-autotune.cjs');
+  const stateFile = path.join(dir, 'tune.json');
+  fs.writeFileSync(stateFile, JSON.stringify({ job: { status: 'interrupted', model: 'synthetic', _reloadPending: true, models: [] } }));
+  const presets = { get: () => ({ exists: true, options: {}, defaults: {} }), files: () => ({}), snapshot: () => ({ text: '', revision: '' }) };
+  const autotune = createFullAutotuner({ request, rawModels, presets, maintenance: {}, applyUnlocked: async () => ({ ok: true }),
+    identityFor: async m => ({ model: m }), stateFile, foreignPollMs: 1 });
+  const owed = () => JSON.parse(fs.readFileSync(stateFile, 'utf8')).job._reloadPending;
+  return { autotune, owed };
+}
+
+test('#1072 a flush the model server cannot answer is a plain refusal, and the re-read is still owed', async t => {
+  let reloads = 0, failing = true;
+  const request = async url => { if (url.startsWith('/models?reload')) { reloads++; if (failing) throw Error('socket hang up'); } return { ok: true, body: {} }; };
+  const { autotune, owed } = owedReread(t, { request, rawModels: async () => ({ ok: true, body: { data: [] } }) });
+  const err = await autotune.flushReload().catch(e => e);
+  assert.equal(err.publicMessage, 'The model server has not re-read the restored settings yet. Try again shortly.', String(err && err.message));
+  assert.equal(reloads, 1);
+  assert.equal(owed(), true, 'still owed after the failed flush');
+  failing = false;
+  await new Promise(r => setTimeout(r, 200));  // the re-armed re-read delivers it
+  assert.ok(reloads >= 2);
+  assert.equal(owed(), false);
+});
+
+test('#1072 a flush that lands while the background re-read is checking the router is not followed by a second re-read', async t => {
+  let reloads = 0;
+  const request = async url => { if (url.startsWith('/models?reload')) reloads++; return { ok: true, body: {} }; };
+  // The router answers slowly, so the background timer has fired and is still inside its check when the flush runs.
+  const rawModels = async () => { await new Promise(r => setTimeout(r, 80)); return { ok: true, body: { data: [] } }; };
+  const { autotune } = owedReread(t, { request, rawModels });
+  await autotune.recover();
+  await new Promise(r => setTimeout(r, 40));
+  await autotune.flushReload();
+  assert.equal(reloads, 1);
+  await new Promise(r => setTimeout(r, 150));
+  assert.equal(reloads, 1, 'the in-flight check did not re-read again');
 });
 
 test('#1062 a pending re-read is re-armed after a restart and forced by the next tune', { skip: skipContention }, async t => {
@@ -1878,6 +1940,76 @@ test('#1079 a section the router does not pick up is taken out again and the tun
   assert.equal(f.requests.length, 0, 'nothing was measured');
 });
 
+// #1093: a crash can land after the -long section is written and before the router re-reads it, or
+// between the write and the save that records its revision. Both states are rebuilt from a snapshot
+// taken at the router re-read (the first point the section is on disk and recorded), then a restart.
+const revisionOfText = text => require('node:crypto').createHash('sha256').update(text).digest('hex');
+
+test('#1093 a crash after the -long section is written resumes as "added but not yet served", not as a different file', async t => {
+  let crashed = null;
+  const f = fixture(t, { autotuneExtra: { longProfiles: refProfiles() }, onReload: () => {
+    const ini = fs.readFileSync(f.ini, 'utf8');
+    if (!crashed && /^\[synthetic-long\]/m.test(ini)) crashed = { ini, state: fs.readFileSync(f.stateFile, 'utf8') };
+  } });
+  await f.manager.autotune.start('synthetic', { confirmPause: true, mode: 'long' });
+  await finished(f.manager);
+  assert.ok(crashed, 'the section was written before the re-read');
+  // The crash: the file and the job as they were at the re-read, the router never having listed the section.
+  fs.writeFileSync(f.ini, crashed.ini); fs.writeFileSync(f.stateFile, crashed.state);
+  const manager = f.restart(); await manager.autotune.recover();
+  const r = await manager.autotune.resume({ confirmPause: true });
+  assert.equal(r.status, 202, JSON.stringify(r.body));
+  const j = await finished(manager);
+  assert.equal(j.status, 'failed');
+  assert.match(j.error, /long-context profile synthetic-long is in models\.ini, but the model server has not picked it up yet/);
+  assert.doesNotMatch(j.error, /different file/);
+  assert.equal(fs.readFileSync(f.ini, 'utf8'), crashed.ini, 'the section this job wrote is kept for a Resume');
+});
+
+test('#1093 a crash between the -long write and the save of its revision does not refuse the resume', async t => {
+  let crashed = null;
+  const f = fixture(t, { reloadAddsSections: true, autotuneExtra: { longProfiles: refProfiles() }, onReload: () => {
+    const ini = fs.readFileSync(f.ini, 'utf8');
+    if (!crashed && /^\[synthetic-long\]/m.test(ini)) crashed = { ini, state: fs.readFileSync(f.stateFile, 'utf8') };
+  } });
+  await f.manager.autotune.start('synthetic', { confirmPause: true, mode: 'long' });
+  await finished(f.manager);
+  assert.ok(crashed, 'the section was written before the re-read');
+  // The window: the write landed (the file is at the new revision) but the job still holds the old one,
+  // with the revision the write was going to produce saved before it (#1093).
+  const state = JSON.parse(crashed.state), job = state.job;
+  job._pendingRevision = revisionOfText(crashed.ini);
+  job._revision = revisionOfText(f.original);
+  job.status = 'running';
+  job.models[0].status = 'interrupted';
+  fs.writeFileSync(f.ini, crashed.ini); fs.writeFileSync(f.stateFile, JSON.stringify(state));
+  const manager = f.restart(); await manager.autotune.recover();
+  const r = await manager.autotune.resume({ confirmPause: true });
+  assert.equal(r.status, 202, JSON.stringify(r.body));
+  const j = await finished(manager);
+  assert.doesNotMatch(j.error || '', /Settings changed outside auto-tune/);
+  assert.notEqual(j.status, 'failed', j.error);
+});
+
+test('#1093 an unrelated change to models.ini still refuses the resume', async t => {
+  let crashed = null;
+  const f = fixture(t, { reloadAddsSections: true, autotuneExtra: { longProfiles: refProfiles() }, onReload: () => {
+    const ini = fs.readFileSync(f.ini, 'utf8');
+    if (!crashed && /^\[synthetic-long\]/m.test(ini)) crashed = { ini, state: fs.readFileSync(f.stateFile, 'utf8') };
+  } });
+  await f.manager.autotune.start('synthetic', { confirmPause: true, mode: 'long' });
+  await finished(f.manager);
+  const state = JSON.parse(crashed.state), job = state.job;
+  job._pendingRevision = revisionOfText(crashed.ini);   // what the job wrote; the file then changed by hand
+  job._revision = revisionOfText(f.original);
+  job.status = 'interrupted';
+  fs.writeFileSync(f.ini, crashed.ini + '# edited by hand\n'); fs.writeFileSync(f.stateFile, JSON.stringify(state));
+  const manager = f.restart(); await manager.autotune.recover();
+  const r = await manager.autotune.resume({ confirmPause: true });
+  assert.equal(r.status, 409);
+  assert.match(r.body.error, /Settings changed outside auto-tune/);
+});
+
 test('#1079 Long refuses up front when the section cannot be made (no model file to point at)', async t => {
   const f = fixture(t, { reloadAddsSections: true, autotuneExtra: { longProfiles: refProfiles() } });
   // A section without its own model line, and a router row without --model: nothing to copy from.
@@ -1924,6 +2056,23 @@ test('#1079 the engine listing marks a model and its long profile once the secti
   assert.equal(rows.synthetic.long_variant, 'synthetic-long');
   assert.equal(rows['synthetic-long'].long_of, 'synthetic');
   assert.equal(rows.embed.long_variant, null);
+});
+
+test('#1133: when no KV context rung fits the memory budget, the job log says the ceilings were not planned', async t => {
+  const f = fixture(t, { autotuneExtra: { planner: standardOrder, planFacts: async () => DENSE_64K, budgetGib: () => 0.5 } });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  const lines = (j.log || []).map(l => l.text);
+  assert.ok(lines.some(text => /KV ceilings could not be planned/.test(text) && /memory budget/.test(text)), JSON.stringify(lines));
+});
+
+test('#1133: a sizing failure during KV planning is logged, not silently treated as "no ceilings"', async t => {
+  const f = fixture(t, { autotuneExtra: { planFacts: async () => { throw new Error('synthetic sizing failure'); }, budgetGib: () => 6 } });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  const lines = (j.log || []).map(l => l.text);
+  assert.ok(lines.some(text => /KV ceilings could not be planned/.test(text) && /sizing check failed/.test(text)), JSON.stringify(lines));
+  assert.ok(!lines.some(text => /synthetic sizing failure/.test(text)), 'the raw error text must not reach the job log');
 });
 
 test('noevia#1133: the KV ceilings are planned with the JS estimate, so the Rust confirmation (even with no usable module) cannot remove them', async t => {

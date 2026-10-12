@@ -119,8 +119,9 @@ const snippetOf = text => {
   const flat = String(text).replace(/[\p{Cc}\p{Zl}\p{Zp}]+/gu, ' ').replace(/\s+/g, ' ').trim();
   return flat.length > 24 ? flat.slice(0, 23) + '…' : flat;
 };
-// #328: the gate is relative. A baseline measured once per model at its reference settings (f16
-// KV cache and drafting off, or the current profile when f16 does not load) decides which probes
+// #328: the gate is relative. A baseline measured once per model at its reference settings (bf16
+// KV cache and drafting off, f16 when the engine refuses bf16, or the current profile when neither
+// loads; #1078) decides which probes
 // can discriminate for this model: a probe the model already gets wrong there says nothing about
 // the tuned settings, so candidates are judged only on the probes the baseline passed and are not
 // sent the others. Without a baseline (an older resumed job) every probe is required, as before.
@@ -625,7 +626,10 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     }
   }
   const BASELINE_KEYS = ['cache-type-k', 'cache-type-v', 'spec-type', 'spec-draft-n-max', 'spec-draft-p-min'];
-  const REFERENCE = { 'cache-type-k': 'f16', 'cache-type-v': 'f16', 'spec-type': 'none', 'spec-draft-n-max': '', 'spec-draft-p-min': '' };
+  // #1078: the reference is bf16, the #1057 default. f16 stands in only when the engine rejects bf16
+  // (bf16Unsupported, the same words the KV phase reads); if that fails too, the current settings.
+  const REFERENCE = { 'cache-type-k': 'bf16', 'cache-type-v': 'bf16', 'spec-type': 'none', 'spec-draft-n-max': '', 'spec-draft-p-min': '' };
+  const REFERENCE_F16 = { ...REFERENCE, 'cache-type-k': 'f16', 'cache-type-v': 'f16' };
   const keysOf = options => Object.fromEntries(BASELINE_KEYS.map(k => [k, options[k] || '']));
   // Records the baseline on the model's queue entry (kept across Resume) and stops the job when
   // no probe passed: then no setting can be judged. That is fatal on purpose, so the optional
@@ -642,11 +646,16 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   // phase started from, and always leaves the KV and drafting keys as it found them.
   // sized (#1026, planned runs): { ctx, f16, kv } - the smallest rung, whether f16 fits there and
   // the most precise type that does; every baseline write then carries that ctx-size.
-  async function ensureBaseline(j, original, { tryF16 = true, sized = null } = {}) {
+  // skipBf16: the caller's bf16 candidate is the one that could not be measured; bf16Refused: that
+  // candidate's own failure refused bf16 (an engine message, or bf16 did not load); f16Standin: f16
+  // may take bf16's place (the #1058 fit guard in the JS order; the sized.f16 gate in planned runs).
+  async function ensureBaseline(j, original, { skipBf16 = false, bf16Refused = false, f16Standin = true, sized = null } = {}) {
     if (gate(j.model)) return;
     const restore = keysOf(original);
+    let tryBf16 = !skipBf16, refused = bf16Refused;
     if (sized) {
-      tryF16 &&= sized.f16;
+      // f16 and bf16 are the same size, so the reference fits wherever f16 did (#1057).
+      tryBf16 &&= sized.f16;
       original = { ...original, 'cache-type-k': sized.kv, 'cache-type-v': sized.kv };
     }
     const at = options => (sized ? { ...options, 'ctx-size': String(sized.ctx) } : options);
@@ -659,11 +668,14 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
         return quality;
       } catch (e) {
         if (e.fatal || e.cancelled || cancelled) throw e;
+        // The engine's own words, or a bf16 load that failed (the JS order reads no engine text).
+        if (reference === 'bf16' && (bf16Unsupported(e.message) || /failed to load|could not be loaded/i.test(e.message))) refused = true;
         note(j, 'The baseline at ' + REFERENCE_LABEL[reference] + ' could not be measured: ' + e.message);
         return null;
       }
     };
-    let reference = 'f16', quality = tryF16 ? await attempt('f16', at(REFERENCE)) : null;
+    let reference = 'bf16', quality = tryBf16 ? await attempt('bf16', at(REFERENCE)) : null;
+    if (!quality && refused && f16Standin && (!sized || sized.f16)) { reference = 'f16'; quality = await attempt('f16', at(REFERENCE_F16)); }
     if (!quality) { reference = 'current'; quality = await attempt('current', at({ ...keysOf(original), 'spec-type': 'none', 'spec-draft-n-max': '', 'spec-draft-p-min': '' })); }
     await write(j, restore);
     if (!quality) throw Object.assign(Error('The quality baseline could not be measured at the reference or current settings.'), { fatal: true });
@@ -701,7 +713,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     const before = { ...presets.get(j.model).options }, results = [];
     // #1057: sized once, every model unloaded, for the precision-first choice below.
     await unloadAll();
-    const ceilings = await kvCeilings(j.model, kvs);
+    const ceilings = await kvCeilings(j, j.model, kvs);
     // #1058: the order can grow by one, f16 right after a bf16 that failed to load.
     const order = [...kvs];
     let kvFallback = null;
@@ -739,9 +751,9 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
         save();
         continue;
       }
-      // An unquantized candidate that could not be the baseline: measure one (f16 first, unless
-      // f16 itself just failed), as before #1057.
-      if (UNQUANTIZED.has(kv) && !gate(j.model)) await ensureBaseline(j, before, { tryF16: kv !== 'f16' });
+      // An unquantized candidate that could not be the baseline: measure one (bf16 first, unless
+      // bf16 itself just failed; f16 stands in only when bf16 was refused, #1078).
+      if (UNQUANTIZED.has(kv) && !gate(j.model)) await ensureBaseline(j, before, { skipBf16: kv === 'bf16', bf16Refused: kv === 'bf16' && (bf16Unsupported(failure) || /failed to load|could not be loaded/i.test(failure)), f16Standin: fitsBf16 });
     }
     // Precision first, not the fastest: a more compact type only when it fits twice the context.
     const chosen = preferKv(results.map(r => r.kv), ceilings);
@@ -873,6 +885,8 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     reloadTimer = setTimeout(async () => {
       if (!j._reloadPending) return;
       if ((await othersLiveNow(j.model)) === false) {
+        // #1072: a flush may have re-read the file while this check was in flight; no second re-read.
+        if (!j._reloadPending) return;
         try { const r = await request('/models?reload=1', {}, 120000); if (r.ok) { j._reloadPending = false; note(j, 'The model server re-read the restored models.ini.'); return; } } catch { /* retried below */ }
       }
       scheduleReload(j, tries + 1);
@@ -886,8 +900,13 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     const j = state.job;
     if (!j?._reloadPending || (model && model !== j.model)) return;
     clearTimeout(reloadTimer);
-    const r = await request('/models?reload=1', {}, 120000);
-    if (!r.ok) throw publicFail('The model server has not re-read the restored settings yet. Try again shortly.');
+    // #1072: a request that throws (the server unreachable) is the same refusal as a bad answer, and the
+    // re-read is still owed, so it is re-armed rather than left for the next flush alone.
+    const r = await request('/models?reload=1', {}, 120000).catch(() => null);
+    if (!r?.ok) {
+      scheduleReload(j);
+      throw publicFail('The model server has not re-read the restored settings yet. Try again shortly.');
+    }
     j._reloadPending = false; note(j, 'The model server re-read the restored models.ini.');
   }
   async function runPhase(j, item, p) {
@@ -980,13 +999,16 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   // #1057: the js order's KV phase, sized like the planner: per type, the largest ladder rung whose
   // estimate (llamacpp-autoconfig estimateFootprint) fits the budget, MemAvailable less the
   // services' reserve and the floor. Null when the model cannot be sized: precision alone decides.
-  async function kvCeilings(model, kvs) {
+  // #1133: every null says why in the job log (the precision order then decides alone); the raw
+  // error text stays out of the log.
+  async function kvCeilings(j, model, kvs) {
+    const unplanned = why => note(j, 'KV ceilings could not be planned (' + why + '), so the precision order alone decides.');
     try {
       const read = await planFacts(model);
-      if (!read?.meta) return null;
+      if (!read?.meta) { unplanned('the model\'s sizing facts are unavailable'); return null; }
       const profile = presets.get(model), eff = { ...profile.defaults, ...profile.options };
       const cacheMib = tuneCacheMib(eff);
-      if (!Number.isFinite(cacheMib)) return null;
+      if (!Number.isFinite(cacheMib)) { unplanned('the cache size is not a number'); return null; }
       const { ladder } = require('./llamacpp-calibration.cjs');
       // noevia#1133: planning, not the gate: the JS estimate, so the Rust confirmation (LLAMACPP_AUTOCONFIG_IMPL, retired) cannot remove the ceilings.
       const { estimateFootprintJs: estimateFootprint } = require('./llamacpp-autoconfig.cjs');
@@ -1002,8 +1024,13 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
         });
         out[kv] = fit.length ? fit.at(-1) : null;
       }
-      return Object.values(out).some(v => v != null) ? out : null;
-    } catch { return null; }
+      if (Object.values(out).some(v => v != null)) return out;
+      unplanned('no context rung fits the memory budget');
+      return null;
+    } catch {
+      unplanned('the sizing check failed');
+      return null;
+    }
   }
   // The planner's request: the model's facts, the budget (MemAvailable read once, now, with every
   // model unloaded, so a resumed job plans from the same figures), the ladder and the KV types
@@ -1265,6 +1292,28 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     }
     throw publicFail('Auto-tune did not finish within its step limit.');
   }
+  // #1093: the revision models.ini has after a write of `text` (the preset store's own rule).
+  const revisionOf = text => crypto.createHash('sha256').update(text).digest('hex');
+  // #1093: a crash between presets.commit and the save that records its revision leaves the job one
+  // revision behind the file. The revision the write was going to produce was saved before the write
+  // (j._pendingRevision): a file at that revision is this job's own write and is adopted. Any other
+  // file keeps the job's revision, so the revision check still refuses a change made outside auto-tune.
+  function adoptPendingRevision(j) {
+    if (j._pendingRevision === undefined) return;
+    if (presets.snapshot().revision === j._pendingRevision) j._revision = j._pendingRevision;
+    delete j._pendingRevision; save();
+  }
+  // #1093: the section this job wrote is in models.ini but the router has not listed it (a crash or a
+  // restart before the re-read). Re-read once more; if it lists the pair, the tune goes on. Otherwise the
+  // job stops with that said, and keeps the section for a Resume (it is not a different file).
+  async function finishPendingLongSection(j, item) {
+    try { await (routerReload ? routerReload() : request('/models?reload=1', {}, 120000)); } catch { /* checked below */ }
+    if ((await routerPairs()).pairs.some(p => p.base === item.base && p.long === item.model)) {
+      note(j, 'The long-context profile ' + item.model + ' is served; continuing.');
+      return;
+    }
+    throw Object.assign(publicFail('The long-context profile ' + item.model + ' is in models.ini, but the model server has not picked it up yet. Check the model server, then Resume.'), { fatal: true });
+  }
   /** #1079: makes sure `item.model` (`<base>-long`) is a section the router serves for the same
    *  file as `item.base`, adding it once from the base section (Rust's long-profile decides the
    *  text) through the usual writer and backup rules, then the router re-reads models.ini. A file
@@ -1275,8 +1324,10 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     if (presets.snapshot().revision !== j._revision) throw Object.assign(Error('Settings changed outside auto-tune.'), { fatal: true });
     const before = await routerPairs();
     if (presets.get(item.model).exists) {
-      if (!before.pairs.some(p => p.base === item.base && p.long === item.model)) throw Object.assign(publicFail(longClash(item)), { fatal: true });
-      return;
+      if (before.pairs.some(p => p.base === item.base && p.long === item.model)) return;
+      // #1093: a section this job wrote, which a crash or restart left before the router listed it.
+      if (item.sectionCreated) return finishPendingLongSection(j, item);
+      throw Object.assign(publicFail(longClash(item)), { fatal: true });
     }
     const row = before.rows.find(r => r.id === item.base);
     if (!row) throw Object.assign(publicFail('A queued model is no longer configured.'), { fatal: true });
@@ -1286,9 +1337,12 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     const made = longProfiles.sectionFor(snap.text, row, presets);
     if (!made.ok) throw Object.assign(publicFail(longRefusal(made.reason)), { fatal: true });
     if (made.id !== item.model) throw Object.assign(publicFail(longRefusal('unavailable')), { fatal: true });
+    // #1093: the section and the revision it produces are recorded before the write, so a crash in
+    // between leaves a job that can tell its own write from a change made outside auto-tune.
+    item.sectionCreated = true; j._pendingRevision = revisionOf(made.text); save();
     await presets.commit({ baseRevision: snap.revision, text: made.text }, writeOptions(j));
     wrote(j);
-    j._revision = presets.snapshot().revision; item.sectionCreated = true; save();
+    j._revision = j._pendingRevision; delete j._pendingRevision; save();
     let served = false;
     try {
       const r = await (routerReload ? routerReload() : request('/models?reload=1', {}, 120000));
@@ -1425,6 +1479,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   async function recover() {
     const j = state.job;
     if (j?._reloadPending) scheduleReload(j);
+    if (j) adoptPendingRevision(j);
     if (j?.status !== 'running') return;
     // Pre-v3 jobs have a single snapshot. They cannot be resumed into the new phase schema.
     if (!Array.isArray(j.models)) {
@@ -1465,6 +1520,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
       return { ok: false, status: 409, body: { error: 'No resumable auto-tune is available.' } };
     if (j._unsafe || j.models.some(m => m.phases.some(p => p.restored === false)))
       return { ok: false, status: 409, body: { error: 'Settings could not safely be restored; inspect models.ini before starting a new tune.' } };
+    adoptPendingRevision(j);
     if (presets.snapshot().revision !== j._revision)
       return { ok: false, status: 409, body: { error: 'Settings changed outside auto-tune. Start a new tune after reviewing them.' } };
     // A job persisted by a pre-patch build may still list a system routing model (e.g. Laya) in
@@ -1492,8 +1548,9 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     try {
       await flushReload();
       for (const item of j.models.filter(m => m.status !== 'passed')) {
-        // #1079: a Long item stopped before its section was added is checked by its model.
-        const id = item.mode === 'long' && !presets.get(item.model).exists ? item.base : item.model;
+        // #1079: a Long item stopped before its section was added is checked by its model. #1093: so is
+        // one whose section this job wrote, which the router may not list yet (ensureLongSection decides).
+        const id = item.mode === 'long' && (!presets.get(item.model).exists || item.sectionCreated) ? item.base : item.model;
         if (!id || !rows.body.data.some(row => row.id === id) || !presets.get(id).exists) throw publicFail('A queued model is no longer configured.');
         const identity = await identityFor(id);
         if (!identity) throw publicFail('A queued model identity could not be read.');
