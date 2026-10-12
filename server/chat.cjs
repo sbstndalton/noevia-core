@@ -152,7 +152,9 @@ function withToolsOffNote(messages) {
 class StreamIdleError extends Error {
   constructor(ms) { super(`no output for ${ms} ms`); this.name = 'StreamIdleError'; this.ms = ms; }
 }
-async function* withIdleLimit(iterable, ms) {
+// `onIdle` runs the moment the limit passes, before the error is thrown: the caller uses it to abort the upstream
+// request, because closing the iterator cannot (return() queues behind the read that is still pending, #1584).
+async function* withIdleLimit(iterable, ms, onIdle = null) {
   if (!(ms > 0)) { yield* iterable; return; }
   const it = iterable[Symbol.asyncIterator]();
   let started = false;
@@ -161,7 +163,7 @@ async function* withIdleLimit(iterable, ms) {
       let timer = null;
       const pending = it.next();
       const next = started
-        ? await Promise.race([pending, new Promise((_, reject) => { timer = setTimeout(() => reject(new StreamIdleError(ms)), ms); })]).finally(() => clearTimeout(timer))
+        ? await Promise.race([pending, new Promise((_, reject) => { timer = setTimeout(() => { try { onIdle?.(); } catch { /* best effort */ } reject(new StreamIdleError(ms)); }, ms); })]).finally(() => clearTimeout(timer))
         : await pending;
       if (next.done) return;
       started = true;
@@ -1366,12 +1368,16 @@ function createChatHandler({
       if(!roundCompacted&&(round>0||roundMessages!==prepared.messages))send({type:'context',...snapshot.meter});
       if (taint) { try { taint.ingestMessages(roundMessages); } catch { taintBroken = true; } }
       let upstream;
+      // #1584: this round's own abort, combined with the client's. A stalled local stream aborts it so the engine
+      // connection and slot are released instead of staying held behind the next "Try again".
+      const roundAbort = new AbortController();
+      const roundSignal = AbortSignal.any([chatSignal.signal, roundAbort.signal]);
       roundStartedAt = Date.now();
       roundFirstTokenMs = null;
       roundTimings = null;
       try {
         upstream = await reasoningEffort.requestWithEffort(providerFetch, upstreamUrl, {
-          method: 'POST', headers: upstreamHeaders, signal: chatSignal.signal, redirect: 'error',
+          method: 'POST', headers: upstreamHeaders, signal: roundSignal, redirect: 'error',
         }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:true,stream_options:{include_usage:true},
           ...sampling.params,
           ...requestTools(), ...forceChoice(round)}, provider, model, effort, send, localThinkingCap);
@@ -1380,7 +1386,7 @@ function createChatHandler({
         if (forceChoice(round).tool_choice && upstream.status >= 400 && upstream.status < 500 && /tool_choice/i.test((await readCappedText(upstream.clone(), PROVIDER_ERROR_BODY_CAP).catch(() => ({ text: '' }))).text)) {
           discardBody(upstream); // the rejected reply is replaced; close it
           upstream = await reasoningEffort.requestWithEffort(providerFetch, upstreamUrl, {
-            method: 'POST', headers: upstreamHeaders, signal: chatSignal.signal, redirect: 'error',
+            method: 'POST', headers: upstreamHeaders, signal: roundSignal, redirect: 'error',
           }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:true,stream_options:{include_usage:true},
             ...sampling.params, tools:activeTools.filter((t) => t.function?.name === forcedTool), tool_choice:'required'}, provider, model, effort, send, localThinkingCap);
         }
@@ -1394,7 +1400,7 @@ function createChatHandler({
             send({ type: 'warning', text: templateCaps.TOOLS_RETRY_NOTICE });
             roundMessages = withToolsOffNote(roundMessages);
             upstream = await reasoningEffort.requestWithEffort(providerFetch, upstreamUrl, {
-              method: 'POST', headers: upstreamHeaders, signal: chatSignal.signal, redirect: 'error',
+              method: 'POST', headers: upstreamHeaders, signal: roundSignal, redirect: 'error',
             }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:true,stream_options:{include_usage:true},
               ...sampling.params}, provider, model, effort, send, localThinkingCap);
             // #1015: remembered only when dropping tools is what fixed it; a template that fails
@@ -1424,7 +1430,7 @@ function createChatHandler({
       // (same pattern as the client-side reader in src/api.ts).
       let buffer = '';
       try {
-        for await (const chunk of withIdleLimit(upstream.body, provider.id === DEFAULT_PROVIDER_ID ? streamIdleMs : 0)) {
+        for await (const chunk of withIdleLimit(upstream.body, provider.id === DEFAULT_PROVIDER_ID ? streamIdleMs : 0, () => roundAbort.abort())) {
           // Leaving the loop cancels the provider stream; checked at most once a second (#272).
           if (loadedSkills.size && Date.now() - skillCheckedAt >= 1000 && revokedSkills()) break;
           buffer += decoder.decode(chunk, { stream: true });

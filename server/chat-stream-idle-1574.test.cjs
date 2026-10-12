@@ -18,7 +18,7 @@ async function run(t, { providerId = 'default', streamIdleMs, body }) {
   res.writeHead = () => {}; res.write = (line) => events.push(JSON.parse(line.slice(6))); res.end = () => { res.writableEnded = true; res.emit('finish'); };
   const requests = [];
   const fetch = async (url, init) => {
-    requests.push({ url: String(url), body: JSON.parse(init.body) });
+    requests.push({ url: String(url), body: JSON.parse(init.body), signal: init.signal });
     return { ok: true, body: body() };
   };
   const { handleChat } = createChatHandler({
@@ -83,4 +83,31 @@ test('withIdleLimit throws once the source is silent past the limit, after outpu
   const seen = [];
   await assert.rejects(async () => { for await (const chunk of gen) seen.push(chunk); }, (err) => err.name === 'StreamIdleError' && err.ms === 100);
   assert.deepEqual(seen, ['a']);
+});
+
+test('a stalled local stream aborts the upstream request, so the engine slot is released (#1584)', async (t) => {
+  const r = await run(t, {
+    streamIdleMs: 100,
+    body: () => (async function* () { yield frame('Thinking about it'); await forever(); })(),
+  });
+  assert.equal(errors(r).length, 1, JSON.stringify(r.events));
+  assert.match(errors(r)[0].text, /^The model sent no output for 0\.1 s/);
+  assert.equal(r.requests.length, 1);
+  assert.equal(r.requests[0].signal.aborted, true, 'the request signal was aborted when the reply was ended');
+});
+
+test('a healthy local stream leaves its request signal alone (#1584)', async (t) => {
+  const r = await run(t, { streamIdleMs: 100, body: () => (async function* () { yield frame('fine'); })() });
+  assert.deepEqual(errors(r), [], JSON.stringify(r.events));
+  assert.equal(r.requests[0].signal.aborted, false);
+});
+
+test('withIdleLimit calls onIdle before it throws, and not when the source ends on time (#1584)', async () => {
+  const order = [];
+  const gen = withIdleLimit((async function* () { yield 'a'; await forever(); })(), 80, () => order.push('idle'));
+  await assert.rejects(async () => { for await (const _ of gen) order.push('chunk'); }, (err) => { order.push(err.name); return true; });
+  assert.deepEqual(order, ['chunk', 'idle', 'StreamIdleError']);
+  const quiet = [];
+  for await (const _ of withIdleLimit((async function* () { yield 'a'; yield 'b'; })(), 80, () => quiet.push('idle'))) quiet.push('chunk');
+  assert.deepEqual(quiet, ['chunk', 'chunk']);
 });
