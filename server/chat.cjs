@@ -1089,8 +1089,10 @@ function createChatHandler({
       ({limit,limitSource}=await context.resolveRuntimeLimit({
         manager:provider.id===DEFAULT_PROVIDER_ID?modelManager:null,model,dir:chatWorkspace.dir,
         scope:require('node:crypto').createHash('sha256').update(JSON.stringify([provider.baseUrl,provider.apiKey,modelManager.baseUrl])).digest('hex'),
-        signal:chatSignal.signal,onStatus:(text,id)=>send({type:'status',text,...(id?{id}:{})}),
+        signal:chatSignal.signal,onStatus:(text,id,detail)=>send({type:'status',text,...(id?{id}:{}),...(detail?{detail}:{})}),
         assertActive:assertWorkspaceActive,
+        // #1449: the routed role (fast/smart/code) names the model that is loading.
+        role:routedRole||null,
         // #536: a hosted/custom provider's own context setting (or the hosted default); the local default is unchanged.
         hosted:provider.id===DEFAULT_PROVIDER_ID?null:provider,
       }));
