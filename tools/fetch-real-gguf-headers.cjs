@@ -16,8 +16,18 @@ const SOURCES = [
   { name: 'qwen3-151k', license: 'apache-2.0', url: 'https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf' },
 ];
 
+// #1195: --mib is a whole number of MiB from 1 to MAX_MIB. Anything else (NaN, a fraction, zero) would
+// make the Range header bytes=0-NaN, or ask for no bytes at all.
+const MAX_MIB = 256;
+function parseMib(arg) {
+  if (arg === undefined || arg === '') return 32;
+  const mib = Number(arg);
+  if (!Number.isInteger(mib) || mib < 1 || mib > MAX_MIB) throw Error(`--mib must be a whole number of MiB from 1 to ${MAX_MIB}, got ${JSON.stringify(arg)}`);
+  return mib;
+}
+
 async function main() {
-  const mib = Number(process.argv[2] || 32);
+  const mib = parseMib(process.argv[2]);
   const bytes = mib * 1024 * 1024;
   fs.mkdirSync(DIR, { recursive: true });
   const manifest = [];
@@ -34,4 +44,6 @@ async function main() {
   }
   fs.writeFileSync(path.join(DIR, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
 }
-main().catch((e) => { console.error(e.message); process.exit(1); });
+if (require.main === module) main().catch((e) => { console.error(e.message); process.exit(1); });
+
+module.exports = { parseMib, MAX_MIB };
