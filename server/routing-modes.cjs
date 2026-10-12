@@ -319,18 +319,27 @@ const OPTIONS = Object.freeze([
  * a failure too. Never throws.
  */
 function createSensitivity({ decide, deadlineMs = () => 1500, minConfidence = 0.6, maxChunks = MAX_CHUNKS_CAP, log = () => {} }) {
+  // A short code for why the check could not answer (never message or model text).
+  const causeOfFailure = (result, error) => {
+    if (error) return /unavailable|no decision service/i.test(String(error.message || '')) ? 'no-service' : error.deadline ? 'deadline' : 'error';
+    const meta = result?.metadata || {};
+    if (meta.fellBack === 'low-confidence') return 'low-confidence';
+    if (meta.fellBack === 'deadline' || meta.cause === 'deadline') return 'deadline';
+    if (typeof meta.cause === 'string' && /^[a-z][a-z0-9-]{0,39}$/.test(meta.cause)) return meta.cause;
+    return typeof result?.confidence === 'number' && result.confidence < minConfidence ? 'low-confidence' : 'no-answer';
+  };
   async function one(text, deadline) {
-    let result;
+    let result, error = null;
     try {
       if (typeof decide !== 'function') throw Error('no decision service');
       result = await decide({ kind: 'choice', purpose: 'routing.sensitivity',
         question: 'Does this content contain sensitive personal or confidential information?',
         context: { cloud: 'forbidden', stateText: String(text || '').slice(0, DIGEST_MAX) }, options: OPTIONS.map((o) => ({ ...o })),
         constraints: { deadlineMs: deadline, minConfidence }, fallback: { selected: null, scores: {} } });
-    } catch { result = null; }
+    } catch (e) { result = null; error = e || Error('error'); }
     const answered = result && result.source !== 'fallback' && OPTIONS.some((o) => o.id === result.selected);
     const confident = answered && (typeof result.confidence !== 'number' || result.confidence >= minConfidence);
-    return !confident ? 'unavailable' : result.selected === 'sensitive' ? 'router' : null;
+    return !confident ? { verdict: 'unavailable', cause: causeOfFailure(result, error) } : { verdict: result.selected === 'sensitive' ? 'router' : null };
   }
   return async function check(input) {
     const list = (Array.isArray(input) ? input : [input]).map((t) => String(t || '')).filter(Boolean).slice(0, Math.max(1, maxChunks));
@@ -339,26 +348,27 @@ function createSensitivity({ decide, deadlineMs = () => 1500, minConfidence = 0.
     try {
       // One overall deadline as well, so a backend that ignores its own cannot hold the turn.
       let timer;
-      const late = new Promise((resolve) => { timer = setTimeout(() => resolve(['unavailable']), deadline + 250); });
+      const late = new Promise((resolve) => { timer = setTimeout(() => resolve([{ verdict: 'unavailable', cause: 'deadline' }]), deadline + 250); });
       const run = async () => {
-        if (!list.length) return ['unavailable'];
+        if (!list.length) return [{ verdict: 'unavailable', cause: 'no-input' }];
         const out = [];
         const start = Date.now();
         for (const t of list) {
           const left = deadline - (Date.now() - start);
-          if (left < 50) { out.push('unavailable'); break; } // budget spent: send nothing more
+          if (left < 50) { out.push({ verdict: 'unavailable', cause: 'deadline' }); break; } // budget spent: send nothing more
           const v = await one(t, left);
           out.push(v);
-          if (v === 'router') break;
+          if (v.verdict === 'router') break;
         }
         return out;
       };
       verdicts = await Promise.race([run(), late]);
       clearTimeout(timer);
-    } catch { verdicts = ['unavailable']; }
-    const flag = verdicts.includes('router') ? 'router' : verdicts.includes('unavailable') ? 'unavailable' : null;
-    const out = flag ? { flagged: true, flag } : { flagged: false, flag: null };
-    try { log({ verdict: out.flag || 'clear', fellBack: verdicts.includes('unavailable'), chunks: list.length }); } catch { /* codes only, never breaks routing */ }
+    } catch { verdicts = [{ verdict: 'unavailable', cause: 'error' }]; }
+    const bad = verdicts.find((v) => v.verdict === 'unavailable');
+    const flag = verdicts.some((v) => v.verdict === 'router') ? 'router' : bad ? 'unavailable' : null;
+    const out = flag === 'unavailable' ? { flagged: true, flag, cause: bad.cause } : flag ? { flagged: true, flag } : { flagged: false, flag: null };
+    try { log({ verdict: out.flag || 'clear', fellBack: !!bad, ...(out.cause ? { cause: out.cause } : {}), chunks: list.length }); } catch { /* codes only, never breaks routing */ }
     return out;
   };
 }
@@ -375,10 +385,18 @@ async function resolveRoute({ mode, whenSensitive = 'ask', hasCloud, hasLocal = 
   if (mode === 'local' || !hasCloud) return local('mode');
   if (mode === 'cloud') return { route: 'cloud', reason: 'mode' };
   // hybrid
-  let flag = preFlag;
-  if (!flag) { const verdict = await check(); if (!verdict || verdict.flagged !== false) flag = verdict?.flag || 'unavailable'; }
+  let flag = preFlag, cause = null;
+  if (!flag) { const verdict = await check(); if (!verdict || verdict.flagged !== false) { flag = verdict?.flag || 'unavailable'; cause = verdict?.cause || null; } }
   if (!flag) return { route: 'cloud', reason: 'mode' };
-  const flagReason = flag === 'unavailable' ? 'fail-closed' : 'sensitive-rule';
+  // #1421: a check that could not answer is not a sensitivity verdict. Nothing says the content is
+  // private, so the person is not asked about it on every message; the turn stays local (never
+  // cloud without a clear check or a choice) and carries a notice with the reason. A remembered
+  // "allow cloud" for the chat still applies, as that is an earlier explicit choice.
+  if (flag === 'unavailable') {
+    if (allowCloud) return { route: 'cloud', reason: 'remembered', flag };
+    return local('check-unavailable', { flag, ...(cause ? { cause } : {}) });
+  }
+  const flagReason = 'sensitive-rule';
   if (allowCloud) return { route: 'cloud', reason: 'remembered', flag };
   if (whenSensitive === 'local') return local(flagReason, { flag });
   let answer;

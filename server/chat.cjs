@@ -627,7 +627,7 @@ function createChatHandler({
           try { routingModes.setChatFlags(listProjectId, chatId, patch); } catch { /* the client saves it too */ }
           send({ type: 'route_remembered', ...patch });
         }
-        routeTarget = { route: decided.route, reason: decided.reason, cloud: settings.cloud, row: decided.route === 'cloud' ? cloudRow : null };
+        routeTarget = { route: decided.route, reason: decided.reason, ...(decided.reason === 'check-unavailable' && decided.cause ? { detail: decided.cause } : {}), cloud: settings.cloud, row: decided.route === 'cloud' ? cloudRow : null };
       }
     }
     // #779 F2: on a cloud route chosen by routing modes (hybrid and cloud alike: the check is
@@ -793,7 +793,7 @@ function createChatHandler({
     res.once('finish',()=>clearInterval(heartbeat));
     }
     send({ type: 'meta', model, chatId: chatId || undefined, route: routedRole || undefined,
-      routing: routeTarget ? { route: routeTarget.route, reason: routeTarget.reason } : undefined,
+      routing: routeTarget ? { route: routeTarget.route, reason: routeTarget.reason, ...(routeTarget.detail ? { detail: routeTarget.detail } : {}) } : undefined,
       routingDecision: routingDecision || undefined, skill: pinnedSkill?.record, contextProfile: contextProfile || undefined,
       sampling: sampling.source === 'none' ? undefined : { preset: sampling.presetId || undefined, source: sampling.source, values: sampling.params } });
     if (replySources.length && !body.compactOnly) send({ type: 'sources', sources: replySources });

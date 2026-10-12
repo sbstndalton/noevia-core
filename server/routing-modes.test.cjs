@@ -124,7 +124,7 @@ test('sensitivity: a default max-size turn makes exactly 1 decide call; setting 
 test('sensitivity: no further chunk is sent once the deadline budget is spent, and that fails closed', async () => {
   const calls = [];
   const check = rm.createSensitivity({ deadlineMs: () => 300, decide: (r) => { calls.push(r.constraints.deadlineMs); return new Promise((res) => setTimeout(() => res({ selected: 'not_sensitive', scores: { not_sensitive: 0.9 }, confidence: 0.9 }), 200)); } });
-  assert.deepEqual(await check(['a', 'b', 'c', 'd']), { flagged: true, flag: 'unavailable' });
+  assert.deepEqual(await check(['a', 'b', 'c', 'd']), { flagged: true, flag: 'unavailable', cause: 'deadline' });
   assert.equal(calls.length, 2, 'the third chunk is never sent');
   assert.ok(calls[1] < 300, 'the second call only gets what is left');
 });
@@ -136,15 +136,15 @@ test('sensitivity over chunks: chunks are asked one at a time; any sensitive or 
   assert.deepEqual(await byText(() => 'not_sensitive')(['a', 'b', 'c', 'd']), { flagged: false, flag: null });
   assert.deepEqual(seen.sort(), ['a', 'b', 'c', 'd']);
   assert.deepEqual(await byText((t) => (t === 'c' ? 'sensitive' : 'not_sensitive'))(['a', 'b', 'c', 'd']), { flagged: true, flag: 'router' });
-  assert.deepEqual(await byText((t) => (t === 'b' ? Error('over budget') : 'not_sensitive'))(['a', 'b', 'c']), { flagged: true, flag: 'unavailable' });
-  assert.deepEqual(await byText(() => 'not_sensitive')([]), { flagged: true, flag: 'unavailable' }, 'nothing to ask is not a clear verdict');
+  assert.deepEqual(await byText((t) => (t === 'b' ? Error('over budget') : 'not_sensitive'))(['a', 'b', 'c']), { flagged: true, flag: 'unavailable', cause: 'error' });
+  assert.deepEqual(await byText(() => 'not_sensitive')([]), { flagged: true, flag: 'unavailable', cause: 'no-input' }, 'nothing to ask is not a clear verdict');
   // Sequential: a sensitive chunk stops the rest.
   seen.length = 0;
   assert.deepEqual(await byText((t) => (t === 'a' ? 'sensitive' : 'not_sensitive'))(['a', 'b']), { flagged: true, flag: 'router' });
   assert.deepEqual(seen, ['a']);
   // A backend that ignores the deadline is cut off by the overall one, and that fails closed.
   const hung = rm.createSensitivity({ deadlineMs: () => 100, decide: () => new Promise(() => {}) });
-  assert.deepEqual(await hung(['a']), { flagged: true, flag: 'unavailable' });
+  assert.deepEqual(await hung(['a']), { flagged: true, flag: 'unavailable', cause: 'deadline' });
 });
 
 test('settings: normalize, validate and the admin allow-list', () => {
@@ -185,7 +185,12 @@ test('sensitivity fails closed: error, timeout, unavailable, low confidence, out
     outside: rm.createSensitivity({ decide: layer(async () => ({ selected: 'maybe', scores: { maybe: 1 } })) }),
     nullAnswer: rm.createSensitivity({ decide: async () => ({ selected: 'not_sensitive', scores: {}, source: 'fallback' }) }),
   };
-  for (const [name, check] of Object.entries(cases)) assert.deepEqual(await check('text'), { flagged: true, flag: 'unavailable' }, name);
+  const causes = { error: 'exception', thrown: 'no-service', unavailable: 'no-service', timeout: 'deadline', lowConfidence: 'low-confidence', outside: 'invalid-result', nullAnswer: 'no-answer' };
+  for (const [name, check] of Object.entries(cases)) {
+    const out = await check('text');
+    assert.equal(out.flagged, true, name); assert.equal(out.flag, 'unavailable', name);
+    assert.equal(out.cause, causes[name], name);
+  }
 });
 
 // ── Route resolution ─────────────────────────────────────────────────────────
@@ -201,7 +206,11 @@ test('resolveRoute: each mode, force-local, hard bans, remembered and the answer
   assert.deepEqual(await rm.resolveRoute({ mode: 'cloud', hasCloud: true, hardLocal: true, allowCloud: true, ask: never }), { route: 'local', reason: 'sensitive-rule', flag: 'diary' });
   assert.deepEqual(await rm.resolveRoute({ mode: 'hybrid', hasCloud: true, check: flagged, allowCloud: true, ask: never }), { route: 'cloud', reason: 'remembered', flag: 'router' });
   assert.deepEqual(await rm.resolveRoute({ mode: 'hybrid', hasCloud: true, whenSensitive: 'local', preFlag: 'iban', ask: never }), { route: 'local', reason: 'sensitive-rule', flag: 'iban' });
-  assert.deepEqual(await rm.resolveRoute({ mode: 'hybrid', hasCloud: true, whenSensitive: 'local', check: async () => ({ flagged: true, flag: 'unavailable' }), ask: never }), { route: 'local', reason: 'fail-closed', flag: 'unavailable' });
+  assert.deepEqual(await rm.resolveRoute({ mode: 'hybrid', hasCloud: true, whenSensitive: 'local', check: async () => ({ flagged: true, flag: 'unavailable' }), ask: never }), { route: 'local', reason: 'check-unavailable', flag: 'unavailable' });
+  // #1421: a check that could not answer never asks, never goes to cloud, and says why.
+  assert.deepEqual(await rm.resolveRoute({ mode: 'hybrid', hasCloud: true, check: async () => ({ flagged: true, flag: 'unavailable', cause: 'deadline' }), ask: never }), { route: 'local', reason: 'check-unavailable', flag: 'unavailable', cause: 'deadline' });
+  assert.deepEqual(await rm.resolveRoute({ mode: 'hybrid', hasCloud: true, check: async () => undefined, ask: never }), { route: 'local', reason: 'check-unavailable', flag: 'unavailable' });
+  assert.deepEqual(await rm.resolveRoute({ mode: 'hybrid', hasCloud: true, hasLocal: false, check: async () => ({ flagged: true, flag: 'unavailable' }), ask: never }), { cancel: true, reason: 'check-unavailable' });
   assert.deepEqual(await rm.resolveRoute({ mode: 'hybrid', hasCloud: true, check: flagged, ask: async () => ({ choice: 'cloud', remember: true }) }), { route: 'cloud', reason: 'user-choice', flag: 'router', remember: 'cloud' });
   assert.deepEqual(await rm.resolveRoute({ mode: 'hybrid', hasCloud: true, check: flagged, ask: async () => ({ choice: 'local' }) }), { route: 'local', reason: 'user-choice', flag: 'router' });
   for (const answer of [{ choice: 'timeout' }, { choice: 'aborted' }, null, { choice: 'approve' }]) {
@@ -209,9 +218,9 @@ test('resolveRoute: each mode, force-local, hard bans, remembered and the answer
   }
   assert.equal((await rm.resolveRoute({ mode: 'hybrid', hasCloud: true, check: flagged, ask: async () => { throw Error('x'); } })).route, 'local');
   assert.deepEqual(await rm.resolveRoute({ mode: 'hybrid', hasCloud: true, hasLocal: false, check: flagged, ask: async () => ({ choice: 'timeout' }) }), { cancel: true, reason: 'fail-closed' });
-  // A check that does not answer `flagged: false` explicitly is a flag.
+  // A check that does not answer `flagged: false` explicitly is not clear (it stays local, see above).
   let asked = 0;
-  await rm.resolveRoute({ mode: 'hybrid', hasCloud: true, check: async () => undefined, ask: async () => { asked++; return { choice: 'local' }; } });
+  await rm.resolveRoute({ mode: 'hybrid', hasCloud: true, check: async () => ({ flagged: true, flag: 'router' }), ask: async () => { asked++; return { choice: 'local' }; } });
   assert.equal(asked, 1);
 });
 
@@ -328,9 +337,9 @@ test('hybrid: a clear turn goes to cloud; the digest covers the history', async 
   assert.equal(r.events.some((e) => e.type === 'route_pending'), false);
 });
 
-test('hybrid: pre-rules and every fail-closed verdict land on the card, never on cloud', async (t) => {
+test('hybrid: pre-rules and router verdicts land on the card, never on cloud', async (t) => {
   for (const c of [{ message: `pay ${SYN_IBAN}`, flag: 'iban' }, { message: `my card ${SYN_CARD}`, flag: 'card' }, { message: SYN_SECRET, flag: 'secret' },
-    { verdict: 'fail', flag: 'unavailable' }, { verdict: 'sensitive', flag: 'router' }]) {
+    { verdict: 'sensitive', flag: 'router' }]) {
     const r = await run(t, { flag: true, settings: HYBRID, message: c.message, verdict: c.verdict, answer: { choice: 'local' } });
     const pending = r.events.find((e) => e.type === 'route_pending');
     assert.equal(pending?.flag, c.flag, JSON.stringify(c));
@@ -389,9 +398,23 @@ test('the card timing out never sends to cloud', async (t) => {
 });
 
 test('"always local" when sensitive keeps it local without asking', async (t) => {
-  const r = await run(t, { flag: true, settings: { ...HYBRID, whenSensitive: 'local' }, verdict: 'fail' });
+  const r = await run(t, { flag: true, settings: { ...HYBRID, whenSensitive: 'local' }, verdict: 'sensitive' });
   assert.equal(r.events.some((e) => e.type === 'route_pending'), false);
-  assert.ok(r.upstream[0].url.startsWith(LOCAL)); assert.deepEqual(r.meta.routing, { route: 'local', reason: 'fail-closed' });
+  assert.ok(r.upstream[0].url.startsWith(LOCAL)); assert.deepEqual(r.meta.routing, { route: 'local', reason: 'sensitive-rule' });
+});
+
+test('#1421: a failing sensitivity check does not hold the turn: local, no card, reason in the notice', async (t) => {
+  for (const whenSensitive of ['ask', 'local']) {
+    const r = await run(t, { flag: true, settings: { ...HYBRID, whenSensitive }, message: 'Reply with the word ok.', verdict: 'fail' });
+    assert.equal(r.events.some((e) => e.type === 'route_pending'), false, `${whenSensitive}: no card`);
+    assert.equal(r.upstream.length, 1); assert.ok(r.upstream[0].url.startsWith(LOCAL), 'answered by the local model');
+    assert.equal(r.upstream.some((u) => u.url.startsWith(CLOUD)), false, 'nothing reached the cloud');
+    assert.equal(r.meta.routing.route, 'local'); assert.equal(r.meta.routing.reason, 'check-unavailable');
+    assert.ok(r.events.some((e) => e.type === 'done'));
+  }
+  // A real sensitive verdict still asks; a pre-rule hit still asks.
+  const asked = await run(t, { flag: true, settings: HYBRID, verdict: 'sensitive', answer: { choice: 'local' } });
+  assert.ok(asked.events.some((e) => e.type === 'route_pending'));
 });
 
 test('force local skips the question; remember sets the chat flag; allow-cloud is remembered', async (t) => {
