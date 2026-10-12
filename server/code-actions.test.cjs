@@ -92,6 +92,27 @@ test('hosts are read without being fooled by credentials or ports', () => {
   assert.equal(hostOf('no url here'), null);
 });
 
+test('hostsOf stays linear on a long http:// run and still reads every host (noevia#1215)', () => {
+  const task = { domains: ['ok.test'] };
+  // 256Ki units of `http://` in one word: the old per-match re-scan of the word was quadratic
+  // (about 3 s here; the budget is far above the linear cost and far below the quadratic one).
+  const run = 'http://'.repeat(Math.ceil((256 * 1024) / 7)).slice(0, 256 * 1024);
+  const t = process.hrtime.bigint();
+  const c = exec(`curl ${run}`);
+  const d = decide({ classified: c, domains: ['ok.test'] });
+  const ms = Number(process.hrtime.bigint() - t) / 1e6;
+  assert.ok(ms < 500, `hostsOf took ${ms.toFixed(0)} ms`);
+  assert.equal(d.decision, 'ask');
+  assert.equal(hostOf(`curl ${run}`), 'http');
+  // The WHATWG special-scheme rules still apply: extra slashes are skipped, so the host is evil.test.
+  assert.equal(hostOf('curl http:///evil.test/x'), 'evil.test');
+  assert.equal(hostOf('curl http://ok.test/a?next=http://evil.test'), 'ok.test');
+  assert.equal(hostOf('curl http://a:b@evil.test#http://ok.test'), 'evil.test');
+  assert.equal(decide({ classified: exec('curl -q http:///evil.test/x'), ...task }).decision, 'ask');
+  assert.equal(decide({ classified: exec('curl -q http://ok.test/a http://ok.test/b'), ...task }).decision, 'allow');
+  assert.equal(decide({ classified: exec('curl -q http://ok.test/a http:///evil.test'), ...task }).decision, 'ask');
+});
+
 test('permission options fail closed when the harness omits one', () => {
   const full = [{ optionId: 'a', kind: 'allow_once' }, { optionId: 'b', kind: 'allow_always' },
     { optionId: 'c', kind: 'reject_once' }, { optionId: 'd', kind: 'reject_always' }];
