@@ -21,6 +21,16 @@ function initialToolsMode(body) {
   return body && Array.isArray(body.toolboxes) ? 'manual' : 'auto';
 }
 
+/**
+ * #1550: whether the tool gate's verdict (tool-gate.cjs evaluate) says this turn needs a tool. A rule or
+ * the decision service picking a tool is `decision` = { tool, mode }. Everything else is not a verdict
+ * that a tool is needed: 'none' (chit-chat, low confidence, a timeout, an error, the gate off, or no gate
+ * at all). An unavailable gate therefore keeps the routed model.
+ */
+function gateSaysToolNeeded(gate) {
+  return !!gate && !!gate.decision && gate.decision !== 'none';
+}
+
 // Roles tried, in order, when the routed role's model cannot take tools (#1550): Smart first, the
 // model meant for tool work; then Code, then Fast. The routed role itself is never retried.
 const FALLBACK_ROLES = ['smart', 'code', 'fast'];
@@ -45,4 +55,4 @@ async function toolCapableRoute({ model, routedRole, roles = {}, allowsTools }) 
   return { rerouted: false, model, role: routedRole };
 }
 
-module.exports = { toolsModeOf, initialToolsMode, toolCapableRoute, FALLBACK_ROLES };
+module.exports = { toolsModeOf, initialToolsMode, gateSaysToolNeeded, toolCapableRoute, FALLBACK_ROLES };

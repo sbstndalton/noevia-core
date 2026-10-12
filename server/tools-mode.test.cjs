@@ -83,3 +83,17 @@ test('#1550: a missing role, or one that names the routed model, is skipped with
   assert.deepEqual(g.asked, ['fast-model']);
   assert.equal((await toolCapableRoute({ model: 'fast-model', routedRole: 'fast', roles: undefined, allowsTools: g.allowsTools })).rerouted, false);
 });
+
+// #1550: only a verdict that picks a tool counts as "the turn needs a tool".
+const { gateSaysToolNeeded } = require('./tools-mode.cjs');
+
+test('gateSaysToolNeeded: a rule or the decision service picking a tool counts; none, unavailable and no gate do not', () => {
+  assert.equal(gateSaysToolNeeded({ decision: { tool: 'tavily_search', mode: 'prefetch', args: { query: 'x' } }, source: 'rule' }), true);
+  assert.equal(gateSaysToolNeeded({ decision: { tool: 'synthetic_search', mode: 'require' }, source: 'decision' }), true);
+  assert.equal(gateSaysToolNeeded({ decision: 'none', source: 'none' }), false, 'chit-chat');
+  assert.equal(gateSaysToolNeeded({ decision: 'none', source: 'none', reason: 'deadline' }), false, 'timed out');
+  assert.equal(gateSaysToolNeeded({ decision: 'none', source: 'none', reason: 'error' }), false, 'errored');
+  assert.equal(gateSaysToolNeeded({ source: 'none' }), false, 'no decision at all');
+  assert.equal(gateSaysToolNeeded(null), false, 'no gate: the feature is off');
+  assert.equal(gateSaysToolNeeded(undefined), false);
+});
