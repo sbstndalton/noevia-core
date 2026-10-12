@@ -959,7 +959,9 @@ const authRoutes = require('./routes/auth.cjs').createAuthRoutes({
 });
 // The user's own storage connection: read, save, test, browse, one folder, the Nextcloud login flow
 // (routes/storage.cjs). fetch is resolved per call: tests swap the global at runtime.
+// #1431: pending Login Flow v2 sign-ins survive a web restart; the poll token is sealed with the credential key.
 const storageRoutes = require('./routes/storage.cjs').createStorageRoutes({ json, readJson, authService, storageClient, endpointApproved, fetch: (...args) => globalThis.fetch(...args), crypto,
+  flowStore: require('./nextcloud-flows.cjs').createNextcloudFlowStore({ file: path.join(DATA_DIR, 'nextcloud-login-flows.json'), secrets: secretStore }),
   storageReadsOwned: () => require('./features.cjs').rustStorageReadsOwned(process.env),
 });
 // The human's answer to a pending write (routes/approvals.cjs); the gate itself is approvals.cjs.

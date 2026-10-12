@@ -33,6 +33,7 @@ const DAV_KINDS = new Set(['nextcloud', 'webdav']);
 // #1427: the name Nextcloud gives the app password (it shows "grant <name> access" and lists the
 // device under Security). Without it the token was called "node".
 const NEXTCLOUD_CLIENT_NAME = 'Noevia';
+const { createNextcloudFlowStore } = require('../nextcloud-flows.cjs');
 const NEXTCLOUD_TIMEOUT_MS = 10000;
 
 /** #1427: the address a person opens Nextcloud with, from whatever they pasted: the browser URL of
@@ -88,10 +89,12 @@ const PASS = Symbol('unhandled');
  * @param {{ randomUUID: () => string }} deps.crypto
  * @param {() => boolean} [deps.storageReadsOwned] confirmed deployment owner; defaults off
  */
-function createStorageRoutes({ json, readJson: readAnyJson, authService, storageClient, endpointApproved, fetch, crypto, storageReadsOwned = () => false }) {
+function createStorageRoutes({ json, readJson: readAnyJson, authService, storageClient, endpointApproved, fetch, crypto, storageReadsOwned = () => false, flowStore }) {
   // Every body these routes read is a JSON object; `null`, an array or a number is a 400 (#786).
   const readJson = requireJsonObject(readAnyJson);
-  const nextcloudFlows = new Map();
+  // #1431: the pending sign-ins. index.cjs passes the persisted, sealed store; without one (tests) they
+  // are held in memory only.
+  const nextcloudFlows = flowStore || createNextcloudFlowStore();
   async function storageEndpointAllowed(authn, rawUrl) {
     return endpointApproved(authn, rawUrl);
   }
@@ -238,7 +241,7 @@ function createStorageRoutes({ json, readJson: readAnyJson, authService, storage
       try { payload = await readCappedJson(response, NEXTCLOUD_REPLY_CAP); }
       catch { return json(res, 502, { error: `${host} answered, but not like a Nextcloud server. Check the address.`, code: 'nextcloudNotFound' }); }
       const flowId = crypto.randomUUID();
-      for (const [id, flow] of nextcloudFlows) if (flow.expires < Date.now() || flow.userId === authn.user.id) nextcloudFlows.delete(id);
+      nextcloudFlows.dropExpiredOr(authn.user.id);
       if (nextcloudFlows.size >= 100) return json(res, 429, { error: 'Too many pending connections' });
       let loginHttps = false;
       try { loginHttps = new URL(payload?.login).protocol === 'https:'; } catch { /* fails closed */ }
@@ -279,7 +282,7 @@ function createStorageRoutes({ json, readJson: readAnyJson, authService, storage
       // Nextcloud hands the app password out once; the flow is spent whatever happens next.
       // #1433: a flow that is no longer the one stored was cancelled (or replaced) while this
       // poll was in flight; its app password is revoked below instead of saved.
-      const stillWanted = nextcloudFlows.get(String(body.flowId)) === flow;
+      const stillWanted = !!nextcloudFlows.get(String(body.flowId)) && nextcloudFlows.get(String(body.flowId)).nonce === flow.nonce;
       nextcloudFlows.delete(String(body.flowId));
       const server = nextcloudServerRoot(credentials?.server);
       const loginName = String(credentials?.loginName || '');
