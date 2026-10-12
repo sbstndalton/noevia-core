@@ -119,8 +119,9 @@ const snippetOf = text => {
   const flat = String(text).replace(/[\p{Cc}\p{Zl}\p{Zp}]+/gu, ' ').replace(/\s+/g, ' ').trim();
   return flat.length > 24 ? flat.slice(0, 23) + '…' : flat;
 };
-// #328: the gate is relative. A baseline measured once per model at its reference settings (f16
-// KV cache and drafting off, or the current profile when f16 does not load) decides which probes
+// #328: the gate is relative. A baseline measured once per model at its reference settings (bf16
+// KV cache and drafting off, f16 when the engine refuses bf16, or the current profile when neither
+// loads; #1078) decides which probes
 // can discriminate for this model: a probe the model already gets wrong there says nothing about
 // the tuned settings, so candidates are judged only on the probes the baseline passed and are not
 // sent the others. Without a baseline (an older resumed job) every probe is required, as before.
@@ -625,7 +626,10 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     }
   }
   const BASELINE_KEYS = ['cache-type-k', 'cache-type-v', 'spec-type', 'spec-draft-n-max', 'spec-draft-p-min'];
-  const REFERENCE = { 'cache-type-k': 'f16', 'cache-type-v': 'f16', 'spec-type': 'none', 'spec-draft-n-max': '', 'spec-draft-p-min': '' };
+  // #1078: the reference is bf16, the #1057 default. f16 stands in only when the engine rejects bf16
+  // (bf16Unsupported, the same words the KV phase reads); if that fails too, the current settings.
+  const REFERENCE = { 'cache-type-k': 'bf16', 'cache-type-v': 'bf16', 'spec-type': 'none', 'spec-draft-n-max': '', 'spec-draft-p-min': '' };
+  const REFERENCE_F16 = { ...REFERENCE, 'cache-type-k': 'f16', 'cache-type-v': 'f16' };
   const keysOf = options => Object.fromEntries(BASELINE_KEYS.map(k => [k, options[k] || '']));
   // Records the baseline on the model's queue entry (kept across Resume) and stops the job when
   // no probe passed: then no setting can be judged. That is fatal on purpose, so the optional
@@ -642,11 +646,16 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   // phase started from, and always leaves the KV and drafting keys as it found them.
   // sized (#1026, planned runs): { ctx, f16, kv } - the smallest rung, whether f16 fits there and
   // the most precise type that does; every baseline write then carries that ctx-size.
-  async function ensureBaseline(j, original, { tryF16 = true, sized = null } = {}) {
+  // skipBf16: the caller's bf16 candidate is the one that could not be measured; bf16Refused: that
+  // candidate's own failure refused bf16 (an engine message, or bf16 did not load); f16Standin: f16
+  // may take bf16's place (the #1058 fit guard in the JS order; the sized.f16 gate in planned runs).
+  async function ensureBaseline(j, original, { skipBf16 = false, bf16Refused = false, f16Standin = true, sized = null } = {}) {
     if (gate(j.model)) return;
     const restore = keysOf(original);
+    let tryBf16 = !skipBf16, refused = bf16Refused;
     if (sized) {
-      tryF16 &&= sized.f16;
+      // f16 and bf16 are the same size, so the reference fits wherever f16 did (#1057).
+      tryBf16 &&= sized.f16;
       original = { ...original, 'cache-type-k': sized.kv, 'cache-type-v': sized.kv };
     }
     const at = options => (sized ? { ...options, 'ctx-size': String(sized.ctx) } : options);
@@ -659,11 +668,14 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
         return quality;
       } catch (e) {
         if (e.fatal || e.cancelled || cancelled) throw e;
+        // The engine's own words, or a bf16 load that failed (the JS order reads no engine text).
+        if (reference === 'bf16' && (bf16Unsupported(e.message) || /failed to load|could not be loaded/i.test(e.message))) refused = true;
         note(j, 'The baseline at ' + REFERENCE_LABEL[reference] + ' could not be measured: ' + e.message);
         return null;
       }
     };
-    let reference = 'f16', quality = tryF16 ? await attempt('f16', at(REFERENCE)) : null;
+    let reference = 'bf16', quality = tryBf16 ? await attempt('bf16', at(REFERENCE)) : null;
+    if (!quality && refused && f16Standin && (!sized || sized.f16)) { reference = 'f16'; quality = await attempt('f16', at(REFERENCE_F16)); }
     if (!quality) { reference = 'current'; quality = await attempt('current', at({ ...keysOf(original), 'spec-type': 'none', 'spec-draft-n-max': '', 'spec-draft-p-min': '' })); }
     await write(j, restore);
     if (!quality) throw Object.assign(Error('The quality baseline could not be measured at the reference or current settings.'), { fatal: true });
@@ -739,9 +751,9 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
         save();
         continue;
       }
-      // An unquantized candidate that could not be the baseline: measure one (f16 first, unless
-      // f16 itself just failed), as before #1057.
-      if (UNQUANTIZED.has(kv) && !gate(j.model)) await ensureBaseline(j, before, { tryF16: kv !== 'f16' });
+      // An unquantized candidate that could not be the baseline: measure one (bf16 first, unless
+      // bf16 itself just failed; f16 stands in only when bf16 was refused, #1078).
+      if (UNQUANTIZED.has(kv) && !gate(j.model)) await ensureBaseline(j, before, { skipBf16: kv === 'bf16', bf16Refused: kv === 'bf16' && (bf16Unsupported(failure) || /failed to load|could not be loaded/i.test(failure)), f16Standin: fitsBf16 });
     }
     // Precision first, not the fastest: a more compact type only when it fits twice the context.
     const chosen = preferKv(results.map(r => r.kv), ceilings);

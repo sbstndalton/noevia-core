@@ -753,21 +753,40 @@ test('#328 a model that fails every probe at its reference settings stops with a
   assert.equal(f.requests.length - before, 3);
 });
 
-test('#328 with sampling to apply, the baseline is measured first at f16 and the KV and drafting keys are put back', async t => {
+test('#328 with sampling to apply, the baseline is measured first at bf16 (#1078) and the KV and drafting keys are put back', async t => {
   const f = fixture(t, { models: ['Qwen3-8B-Instruct'], answerFor: e2b });
   await f.manager.autotune.start('Qwen3-8B-Instruct', { confirmPause: true });
   const j = await finished(f.manager), item = j.models[0];
   assert.equal(j.status, 'passed', j.error);
   // The sampling step is judged on extraction and reasoning, so the E2B-style "69" no longer blocks it.
   assert.equal(phase(item, 'sampling').value.applied, true);
-  assert.equal(item.baseline.reference, 'f16');
+  assert.equal(item.baseline.reference, 'bf16');
   assert.deepEqual(item.baseline.skipped.map(s => s.id), ['arithmetic']);
   const first = f.requests[0];
-  assert.equal(first.options['cache-type-k'], 'f16'); assert.equal(first.options['spec-type'], 'none'); assert.equal(first.options.temp, undefined);
+  assert.equal(first.options['cache-type-k'], 'bf16'); assert.equal(first.options['spec-type'], 'none'); assert.equal(first.options.temp, undefined);
   // The sampling probe ran on the profile as it was (no KV keys), not on the baseline's f16.
   const samplingProbe = f.requests.find(r => r.options.temp);
   assert.equal(samplingProbe.options['cache-type-k'], undefined); assert.equal(samplingProbe.options['spec-type'], undefined);
   assert.equal(probeRequests(f, 'arithmetic').length, 1);
+});
+
+test('#1078: the sampling baseline is bf16; an engine that rejects bf16 gets f16 as the reference, not the current settings', async t => {
+  const f = fixture(t, { models: ['Qwen3-8B-Instruct'], answerFor: e2b, loadReply: refuseBf16('llama_init_from_model: unsupported cache type: bf16') });
+  await f.manager.autotune.start('Qwen3-8B-Instruct', { confirmPause: true });
+  const j = await finished(f.manager), item = j.models[0];
+  assert.equal(j.status, 'passed', j.error);
+  assert.equal(item.baseline.reference, 'f16');
+  assert.deepEqual(item.baseline.probes, ['extraction', 'reasoning']);
+  assert.ok(j.log.some(l => /^Measuring the quality baseline at bf16 KV cache, drafting off\./.test(l.text)));
+});
+
+test('#1078: a bf16 baseline that fails for another reason (no refusal) does not fall back to f16', async t => {
+  const f = fixture(t, { models: ['Qwen3-8B-Instruct'], answerFor: e2b, httpFor: ({ q, o }) => q?.id === 'extraction' && o['cache-type-k'] === 'bf16' ? 500 : 0 });
+  await f.manager.autotune.start('Qwen3-8B-Instruct', { confirmPause: true });
+  const j = await finished(f.manager), item = j.models[0];
+  assert.equal(j.status, 'passed', j.error);
+  assert.notEqual(item.baseline.reference, 'f16');
+  assert.ok(!j.log.some(l => /^Measuring the quality baseline at f16 KV cache/.test(l.text)));
 });
 
 test('#328 when f16 does not load, the baseline comes from the current settings', async t => {
