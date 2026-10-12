@@ -48,3 +48,28 @@ test('heartbeats cannot split a fragmented upstream SSE event',async t=>{
  assert.equal(events.find(e=>e.type==='reasoning').text,'Synthetic');
  assert.match(text(),/keep-alive/);
 });
+test('#1422 a refusal the companion names before its stream starts is "nothing was saved", with the wait for a throttle', async t => {
+ t.mock.method(globalThis,'fetch',async()=>new Response(JSON.stringify({detail:'slow down',code:'storageThrottled',retryAfter:41.2}),{status:503,headers:{'Content-Type':'application/json','Retry-After':'42'}}));
+ const events=[];const {res,text}=response();await proxyDiaryStream(res,'http://synthetic',{}, {job:{event:e=>events.push(e),finish(){}}});
+ const error=events.find(e=>e.type==='error');
+ assert.equal(error.code,'storageThrottled');assert.equal(error.saved,false);assert.equal(error.retryAfter,42);
+ assert.match(text(),/nothing was saved/);assert.doesNotMatch(text(),/may still be saving/);
+});
+test('#1422 no connection at all (refused) means the request never ran; a dropped stream stays unknown', async t => {
+ t.mock.method(globalThis,'fetch',async()=>{throw Object.assign(new TypeError('fetch failed'),{cause:Object.assign(new Error('connect ECONNREFUSED'),{code:'ECONNREFUSED'})});});
+ let r=response();await proxyDiaryStream(r.res,'http://synthetic',{});
+ assert.match(r.text(),/"code":"diaryUnavailable"/);assert.match(r.text(),/nothing was saved/);
+ t.mock.restoreAll();
+ t.mock.method(globalThis,'fetch',async()=>new Response(new ReadableStream({start(c){c.enqueue(new TextEncoder().encode('data: {"type":"status","text":"Generating companion response…"}\n\ndata: {"type":"del'));c.close();}}),{headers:{'Content-Type':'text/event-stream'}}));
+ r=response();await proxyDiaryStream(r.res,'http://synthetic',{});
+ assert.match(r.text(),/may still be saving/);assert.doesNotMatch(r.text(),/"saved":false/);
+});
+test('#1422 the companion stage decides: an error before saving began is not saved, once saving began it is unknown', async t => {
+ const stream=events=>new Response(new ReadableStream({start(c){for(const e of events)c.enqueue(new TextEncoder().encode('data: '+JSON.stringify(e)+'\n\n'));c.close();}}),{headers:{'Content-Type':'text/event-stream'}});
+ const failed={type:'error',text:'Diary processing failed.'};
+ for(const [statuses,expected] of [[[],undefined],[['Opening diary context…'],'contextFailed'],[['Opening diary context…','Generating companion response…'],'modelFailed'],[['Opening diary context…','Generating companion response…','Checking whether to save this exchange…'],undefined],[['Opening diary context…','Generating companion response…','A step added by a newer companion…'],undefined]]){
+  t.mock.restoreAll();t.mock.method(globalThis,'fetch',async()=>stream([...statuses.map(text=>({type:'status',text})),failed]));
+  const events=[];const {res}=response();await proxyDiaryStream(res,'http://synthetic',{}, {job:{event:e=>events.push(e),finish(){}}});
+  assert.equal(events.find(e=>e.type==='error').code,expected,statuses.join('|'));
+ }
+});

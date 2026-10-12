@@ -76,6 +76,18 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
       try{return json(res,200,{exchanges:require('../diary-jobs.cjs').list(currentWorkspace(),url.searchParams.get('day'))});}
       catch(e){return json(res,e.status||500,{error:e.status?e.message:'Could not read recovery records'});}
     }
+    // #1422: mark an uncertain or failed exchange as reviewed so it stops raising the banner. Only the
+    // exchange's own record changes; the diary is never touched. (Same path as the list, so the
+    // route inventory shared with the Rust front does not change.)
+    if(p==='/api/diary/exchanges' && req.method==='POST') {
+      if(!authService.diaryEnabled(authn.user.id))return json(res,404,{error:'Diary add-on is disabled'});
+      const body=await readObject(req,4096);
+      if(body.action!=='dismiss')return json(res,400,{error:'Unknown action'});
+      try{
+        const row=require('../diary-jobs.cjs').acknowledge(currentWorkspace(),body.day,body.id);
+        return json(res,200,{exchange:{id:row.id,day:row.day,state:row.state,acknowledgedAt:row.acknowledgedAt}});
+      }catch(e){return json(res,e.status||500,{error:e.status?e.message:'Could not update the recovery record'});}
+    }
 
     if (p === '/api/diary/workspace-trash') {
       if (!authService.diaryEnabled(authn.user.id)) return json(res, 404, { error: 'Diary add-on is disabled' });

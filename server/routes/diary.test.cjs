@@ -7,7 +7,7 @@ const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
 const { createDiaryRoutes } = require('./diary.cjs');
 
-function fixture({ diaryOn = true, limited = false, connectorLimited = false, admin = false, reply, clientAddress, addressesTrusted, rateLimitedKeys, log } = {}) {
+function fixture({ dir = '/nowhere', diaryOn = true, limited = false, connectorLimited = false, admin = false, reply, clientAddress, addressesTrusted, rateLimitedKeys, log } = {}) {
   const sent = [], fetched = [], audits = [], headers = [];
   const rateKeys = [];
   const credentials = [{ id: 'a'.repeat(32), name: 'Claude Diary' }];
@@ -18,7 +18,7 @@ function fixture({ diaryOn = true, limited = false, connectorLimited = false, ad
     fetchJson: async (url, init) => { fetched.push({ url, init }); return reply ? reply(url, init) : { ok: true, status: 200, body: { ok: true } }; },
     DIARY_BASE: 'http://diary:8010',
     authService: { diaryEnabled: () => diaryOn, audit: (...args) => audits.push(args) },
-    currentWorkspace: () => ({ userId: 'u1', dir: '/nowhere' }),
+    currentWorkspace: () => ({ userId: 'u1', dir }),
     rateLimited: () => limited,
     connectorRate: { rateLimited: (key, limit) => { rateKeys.push(key); return rateLimitedKeys ? rateLimitedKeys.has(key) : connectorLimited; } },
     clientAddress, addressesTrusted,
@@ -247,4 +247,30 @@ test('#1168: X-Cowork-Storage-Retry: 1 from the browser reaches the sidecar only
   // Not on the chat exchange: a retry press is a file-list action.
   await f.call('diary', 'POST', '/api/diary/local-exchange', { message: 'hi' }, { reqHeaders: { 'x-cowork-storage-retry': '1' } });
   assert.equal('X-Cowork-Storage-Retry' in f.fetched.pop().init.headers, false);
+});
+
+test('#1422 POST /api/diary/exchanges dismisses an uncertain or failed exchange and nothing else', async (t) => {
+  const fs = require('node:fs'), os = require('node:os'), path = require('node:path');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'diary-routes-1422-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const jobs = require('../diary-jobs.cjs');
+  const job = jobs.start({ dir }, { entryDay: '2026-10-12', exchangeId: 'exchange-1422-synthetic-a', message: 'Synthetic' });
+  job.event({ type: 'error', text: 'dropped' }); job.finish();
+  const f = fixture({ dir });
+  await f.call('diary', 'POST', '/api/diary/exchanges', { action: 'dismiss', day: '2026-10-12', id: 'exchange-1422-synthetic-a' });
+  const ok = f.sent.pop();
+  assert.equal(ok.status, 200);
+  assert.equal(ok.body.exchange.state, 'uncertain');
+  assert.equal(typeof ok.body.exchange.acknowledgedAt, 'number');
+  await f.call('diary', 'GET', '/api/diary/exchanges', undefined, { search: '?day=2026-10-12' });
+  assert.equal(f.sent.pop().body.exchanges[0].acknowledgedAt, ok.body.exchange.acknowledgedAt);
+  await f.call('diary', 'POST', '/api/diary/exchanges', { action: 'delete', day: '2026-10-12', id: 'exchange-1422-synthetic-a' });
+  assert.equal(f.sent.pop().status, 400);
+  await f.call('diary', 'POST', '/api/diary/exchanges', { action: 'dismiss', day: '2026-10-12', id: 'no-such-exchange-123456' });
+  assert.equal(f.sent.pop().status, 404);
+  await f.call('diary', 'POST', '/api/diary/exchanges', { action: 'dismiss', day: 'nope', id: 'exchange-1422-synthetic-a' });
+  assert.equal(f.sent.pop().status, 400);
+  const off = fixture({ dir, diaryOn: false });
+  await off.call('diary', 'POST', '/api/diary/exchanges', { action: 'dismiss', day: '2026-10-12', id: 'exchange-1422-synthetic-a' });
+  assert.deepEqual(off.sent.pop(), { status: 404, body: { error: 'Diary add-on is disabled' } });
 });

@@ -445,9 +445,23 @@ function createChatHandler({
       const diaryBody = JSON.stringify({stream:true, diary_events:true, messages:msgs,
           session_id:body.sessionId, entryTime:body.entryTime, entryDay:body.entryDay,
           extrasEnabled:body.extrasEnabled === true, extraContext:diaryExtras.reference(body)});
+      // #1422: asked once, only when the companion fails while generating: is the model it is set to
+      // use one the local engine serves at all? (#1065: its configured name need not be a router id.)
+      // Diary turns are local-only by construction: this branch returns before any routing, cloud
+      // provider or sensitivity check, and the diagnosis reads only the companion and the local manager.
+      const diagnose = async () => {
+        const healthUrl = `${DIARY_BASE}/api/health`;
+        const health = await fetch(healthUrl, { headers: diaryHeaders('GET', healthUrl), signal: AbortSignal.timeout(3000) });
+        const model = health.ok ? String((await health.json())?.model || '') : '';
+        if (!model || model === 'default') return null;
+        let timer;
+        const installed = await Promise.race([modelsInstalled(), new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('timeout')), 4000); })]).finally(() => clearTimeout(timer));
+        const names = new Set((installed || []).map((m) => m.name));
+        return names.size && !names.has(model) ? { code: 'modelNotServed', model } : null;
+      };
       return require('./diary-stream.cjs').proxyDiaryStream(res, diaryUrl, {
         method: 'POST', headers: (secret) => diaryHeaders('POST', diaryUrl, { secret, body: diaryBody }), body: diaryBody
-      }, {job,withStorageCredential:diaryStorageRetry,onEvent:event=>{if(event.type==='mtp')require('./mtp.cjs').record(chatWorkspace?.userId,event.model,event.timings);}});
+      }, {job,diagnose,withStorageCredential:diaryStorageRetry,onEvent:event=>{if(event.type==='mtp')require('./mtp.cjs').record(chatWorkspace?.userId,event.model,event.timings);}});
     }
 
     // ── Ordinary space / project chat: routed via the project's provider ──
