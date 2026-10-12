@@ -137,6 +137,15 @@ function normalizeReplayHistory(mapped, newMessage) {
   return out;
 }
 
+// #1553: a reply whose chat template cannot take tools is told so in the request itself. Without this the model
+// said no search tool existed, or wrote search results it never had. The note is ours and holds no tool output.
+const TOOLS_OFF_MODEL_NOTE = 'No tools can run in this reply: this model\'s chat template cannot use them. If the person asks for a web search, a file, a live lookup or any other tool, say so in one line at the start. Do not write results, sources, excerpts or simulated output for it.';
+function withToolsOffNote(messages) {
+  const at = messages.findIndex((m) => m?.role === 'system' && typeof m.content === 'string');
+  if (at < 0) return [{ role: 'system', content: TOOLS_OFF_MODEL_NOTE }, ...messages];
+  return messages.map((m, i) => (i === at ? { ...m, content: `${m.content}\n\n${TOOLS_OFF_MODEL_NOTE}` } : m));
+}
+
 // #1574: a local reply that stops sending bytes after its first output is ended after `ms` with a named
 // error, instead of sitting until the browser gives up with "network error" minutes later. Nothing is
 // limited before the first output (a long prefill is not a stall), and `ms` of 0 limits nothing.
@@ -1251,6 +1260,7 @@ function createChatHandler({
     if (templateGate && activeTools.length && !(await templateToolsGate.allowsTools(modelManager, model, chatSignal.signal))) {
       templateToolsOff = true;
       send({ type: 'warning', text: templateCaps.TOOLS_OFF_NOTICE });
+      roundMessages = withToolsOffNote(roundMessages);
     }
     const requestTools = () => (!templateToolsOff && activeTools.length ? { tools: activeTools } : {});
     // tool_choice for the gate's required tool: the first model turn (and its one retry) only.
@@ -1319,6 +1329,7 @@ function createChatHandler({
             discardBody(upstream);
             templateToolsOff = true;
             send({ type: 'warning', text: templateCaps.TOOLS_RETRY_NOTICE });
+            roundMessages = withToolsOffNote(roundMessages);
             upstream = await reasoningEffort.requestWithEffort(providerFetch, upstreamUrl, {
               method: 'POST', headers: upstreamHeaders, signal: chatSignal.signal, redirect: 'error',
             }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:true,stream_options:{include_usage:true},
