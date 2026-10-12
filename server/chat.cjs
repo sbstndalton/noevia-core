@@ -1372,7 +1372,8 @@ function createChatHandler({
                   // fragments made the client render one chip per delta, most
                   // of them nameless with partial args like `/T`. The client
                   // upserts on index and always sees the best-known state.
-                  send({ type: 'tool', index: toolOffset + i, name: slot.name, args: slot.args });
+                  // #1523: a complete search query is shown as the question (partial JSON is shown as it arrives).
+                  send({ type: 'tool', index: toolOffset + i, name: slot.name, args: require('./search-query.cjs').cleanSearchArgs(slot.name, slot.args) });
                 }
               }
             } catch {
@@ -1419,7 +1420,7 @@ function createChatHandler({
             for (const tc of msg.tool_calls) {
               const index = toolCalls.size;
               toolCalls.set(index, { id: tc.id || `call-${index}`, name: tc.function?.name || '', args: tc.function?.arguments || '' });
-              send({ type: 'tool', index: toolOffset + index, name: tc.function?.name || '', args: tc.function?.arguments || '' });
+              send({ type: 'tool', index: toolOffset + index, name: tc.function?.name || '', args: require('./search-query.cjs').cleanSearchArgs(tc.function?.name || '', tc.function?.arguments || '') });
             }
           }
           reportRoundUsage(full.body?.usage, full.body?.timings);
@@ -1451,6 +1452,8 @@ function createChatHandler({
       // cannot be fed back to the model), but they are still streamed to the
       // user instead of dangling.
       if (toolCalls.size > 0) {
+        // #1523: a search query is the question, not the request wrapper around it.
+        for (const tc of toolCalls.values()) tc.args = require('./search-query.cjs').cleanSearchArgs(tc.name, tc.args);
         if (roundContent.trim()) { send({ type: 'preamble', text: roundContent }); roundHasContent = false; }
         const assistantMsg = { role: 'assistant', content: null, tool_calls: [...toolCalls.entries()].map(([i, tc]) => ({ id: tc.id, type: 'function', function: { name: tc.name, arguments: tc.args } })) };
         roundMessages = [...roundMessages, assistantMsg];
