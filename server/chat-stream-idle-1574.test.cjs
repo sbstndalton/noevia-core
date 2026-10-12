@@ -12,14 +12,14 @@ const frame = (text) => Buffer.from('data: ' + JSON.stringify({ choices: [{ delt
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const forever = () => new Promise(() => {});
 
-async function run(t, { providerId = 'default', streamIdleMs, body }) {
+async function run(t, { providerId = 'default', streamIdleMs, body, bodies = null }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-stream-idle-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const events = [], res = new EventEmitter();
   res.writeHead = () => {}; res.write = (line) => events.push(JSON.parse(line.slice(6))); res.end = () => { res.writableEnded = true; res.emit('finish'); };
   const requests = [];
   const fetch = async (url, init) => {
     requests.push({ url: String(url), body: JSON.parse(init.body), signal: init.signal });
-    return { ok: true, body: body() };
+    return { ok: true, body: bodies ? bodies[Math.min(requests.length, bodies.length) - 1]() : body() };
   };
   const { handleChat } = createChatHandler({
     modelManager: { enabled: true, health: async () => ({ ok: true, body: { all_models_loaded: [{ model_name: 'answer-model', loaded: true, recipe_options: { ctx_size: 32768 } }] } }) },
@@ -110,4 +110,48 @@ test('withIdleLimit calls onIdle before it throws, and not when the source ends 
   const quiet = [];
   for await (const _ of withIdleLimit((async function* () { yield 'a'; yield 'b'; })(), 80, () => quiet.push('idle'))) quiet.push('chunk');
   assert.deepEqual(quiet, ['chunk', 'chunk']);
+});
+
+// --- #1585: the thinking cap in the chat route ---------------------------------------------------
+
+const thought = (text) => Buffer.from('data: ' + JSON.stringify({ choices: [{ delta: { reasoning_content: text } }] }) + '\n\n');
+const longThought = () => (async function* () { for (let i = 0; i < 20; i++) yield thought('hm '.repeat(1000)); })();
+const { FORCED_ANSWER, CUT_MARK } = require('./thinking-budget.cjs');
+
+test('a local reply that thinks past its cap is cut and answered by a second request; a hosted reply is not (#1585)', async (t) => {
+  const local = await run(t, { bodies: [longThought, () => (async function* () { yield frame('The answer.'); })()] });
+  assert.deepEqual(errors(local), [], JSON.stringify(local.events));
+  assert.equal(local.requests.length, 2, 'cut, then the forced-answer request');
+  const forced = local.requests[1].body;
+  assert.equal(forced.messages[forced.messages.length - 1].content.endsWith(FORCED_ANSWER), true);
+  assert.equal(forced.tools, undefined);
+  assert.ok(local.events.some((e) => e.type === 'warning' && /thinking reached its budget/i.test(e.text)));
+  assert.equal(local.events.filter((e) => e.type === 'delta').map((e) => e.text).join(''), 'The answer.');
+  assert.ok(local.events.some((e) => e.type === 'meta' && e.thinkingCap > 0));
+
+  const hosted = await run(t, { providerId: 'cloud-fixture', body: () => (async function* () { yield* longThought(); yield frame('Hosted answer.'); })() });
+  assert.deepEqual(errors(hosted), [], JSON.stringify(hosted.events));
+  assert.equal(hosted.requests.length, 1, 'a hosted reply is never cut');
+  assert.equal(hosted.events.some((e) => e.type === 'warning'), false);
+  assert.equal(hosted.events.some((e) => e.type === 'meta' && e.thinkingCap !== undefined), false);
+});
+
+test('the idle clock restarts at the thinking cut, so a slow re-prefill is not a stall (#1585)', async (t) => {
+  const r = await run(t, {
+    streamIdleMs: 100,
+    bodies: [
+      () => (async function* () { yield thought('hm '.repeat(1000)); yield thought('hm '.repeat(9000)); })(),
+      // The forced-answer request takes longer than the idle limit to send its first byte.
+      () => (async function* () { await pause(300); yield frame('Late answer.'); })(),
+    ],
+  });
+  assert.deepEqual(errors(r), [], JSON.stringify(r.events));
+  assert.equal(r.events.filter((e) => e.type === 'delta').map((e) => e.text).join(''), 'Late answer.');
+});
+
+test('withIdleLimit restarts its clock on the cut mark and limits again after the next output (#1585)', async () => {
+  const gen = withIdleLimit((async function* () { yield Buffer.from('a'); yield Buffer.from(CUT_MARK); await pause(150); yield Buffer.from('b'); await forever(); })(), 80);
+  const seen = [];
+  await assert.rejects(async () => { for await (const chunk of gen) seen.push(String(chunk).trim()[0]); }, (err) => err.name === 'StreamIdleError');
+  assert.deepEqual(seen, ['a', ':', 'b']);
 });

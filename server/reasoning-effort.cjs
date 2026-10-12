@@ -27,14 +27,17 @@ function documented(provider, model) {
 function budgetFieldFor(provider) {
   return provider?.capabilities?.tokenBudgetField === 'max_completion_tokens' ? 'max_completion_tokens' : 'max_tokens';
 }
-function nativeThinking(provider, model) {
-  // Only the configured local llama.cpp/Lemonade endpoint and documented Qwen3 templates.
+// The configured local llama.cpp/Lemonade endpoint, whatever model it serves.
+function localEngine(provider) {
   try {
     const normalize = value => new URL(value).href.replace(/\/+$/, '');
     return ['lemonade','llamacpp'].includes(process.env.MODEL_MANAGER_KIND) &&
-      normalize(provider.baseUrl) === normalize(process.env.INFERENCE_BASE_URL) &&
-      /(?:^|[/_])qwen3(?:\.5)?[-_]/i.test(model);
+      normalize(provider.baseUrl) === normalize(process.env.INFERENCE_BASE_URL);
   } catch { return false; }
+}
+function nativeThinking(provider, model) {
+  // Only the configured local llama.cpp/Lemonade endpoint and documented Qwen3 templates.
+  return localEngine(provider) && /(?:^|[/_])qwen3(?:\.5)?[-_]/i.test(model);
 }
 function modeFor(provider, model, effort) {
   return effort === 'default' ? 'off' : (documented(provider, model) || nativeThinking(provider, model)) && !rejected.has(capabilityKey(provider, model)) ? 'real' : 'hint';
@@ -54,8 +57,17 @@ function requestBody(body, effort, mode, provider) {
 function forcedAnswerBody(request, provider, model) {
   const { tools, tool_choice, ...rest } = request;
   const messages = Array.isArray(request.messages) ? request.messages : [];
-  const body = { ...rest, stream: true, messages: [{ role: 'system', content: thinkingBudget.FORCED_ANSWER }, ...messages] };
-  if (nativeThinking(provider, model)) body.chat_template_kwargs = { ...rest.chat_template_kwargs, enable_thinking: false };
+  // The note goes last, so the engine keeps the prompt it already cached and does not re-prefill from the
+  // start while the reply's idle clock runs (#1585). Joined to a trailing user turn when there is one, so a
+  // strict template still sees alternating roles.
+  const last = messages[messages.length - 1];
+  const withNote = last?.role === 'user' && typeof last.content === 'string'
+    ? [...messages.slice(0, -1), { ...last, content: `${last.content}\n\n${thinkingBudget.FORCED_ANSWER}` }]
+    : [...messages, { role: 'user', content: thinkingBudget.FORCED_ANSWER }];
+  const body = { ...rest, stream: true, messages: withNote };
+  // Thinking is switched off on the local engine whatever the model: a template without the switch ignores
+  // it (the other local callers send it the same way), and no model or file name decides here (#1585).
+  if (localEngine(provider)) body.chat_template_kwargs = { ...rest.chat_template_kwargs, enable_thinking: false };
   return body;
 }
 // thinkingCap (tokens, or null for no cap) is set by chat.cjs for the local engine only. Only a
@@ -65,9 +77,16 @@ async function requestWithEffort(fetcher, url, options, body, provider, model, e
   if(body.max_tokens && budgetFieldFor(provider)==='max_completion_tokens'){body={...body,max_completion_tokens:body.max_tokens};delete body.max_tokens;}
   let mode = modeFor(provider, model, effort);
   const key = capabilityKey(provider,model);
+  // #1585: a cap of 0 means the output budget leaves no room to think (a context of about 4,100 tokens or
+  // less). A reply with no tools is asked for its answer directly, in one request, instead of being cut at its
+  // first reasoning token and sent again. One with tools stays uncapped: the forced answer would drop them.
+  const noRoomToThink = thinkingCap === 0 && body.stream === true;
+  const answerDirectly = noRoomToThink && !(Array.isArray(body.tools) && body.tools.length);
+  if (noRoomToThink) thinkingCap = answerDirectly ? 0 : null;
   const prepare = () => {
-    const value=requestBody(body,effort,mode,provider);
+    let value=requestBody(body,effort,mode,provider);
     if (mode === 'hint' && !explicitBudget && rejectedBudget.has(key)) {delete value.max_tokens;delete value.max_completion_tokens;}
+    if (answerDirectly) value=forcedAnswerBody(value,provider,model);
     return value;
   };
   let request=prepare();
@@ -89,7 +108,7 @@ async function requestWithEffort(fetcher, url, options, body, provider, model, e
     }
   }
   let capped = response;
-  if (thinkingCap !== null && request.stream === true && response.ok && response.body) {
+  if (thinkingCap !== null && !answerDirectly && request.stream === true && response.ok && response.body) {
     capped = thinkingBudget.capReasoning(response, {
       cap: thinkingCap,
       retry: () => fetcher(url, { ...options, body: JSON.stringify(forcedAnswerBody(request, provider, model)) }),

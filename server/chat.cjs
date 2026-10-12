@@ -149,6 +149,7 @@ function withToolsOffNote(messages) {
 // #1574: a local reply that stops sending bytes after its first output is ended after `ms` with a named
 // error, instead of sitting until the browser gives up with "network error" minutes later. Nothing is
 // limited before the first output (a long prefill is not a stall), and `ms` of 0 limits nothing.
+const { isCutMark } = require('./thinking-budget.cjs');
 class StreamIdleError extends Error {
   constructor(ms) { super(`no output for ${ms} ms`); this.name = 'StreamIdleError'; this.ms = ms; }
 }
@@ -166,7 +167,9 @@ async function* withIdleLimit(iterable, ms, onIdle = null) {
         ? await Promise.race([pending, new Promise((_, reject) => { timer = setTimeout(() => { try { onIdle?.(); } catch { /* best effort */ } reject(new StreamIdleError(ms)); }, ms); })]).finally(() => clearTimeout(timer))
         : await pending;
       if (next.done) return;
-      started = true;
+      // The thinking cap's cut mark: a new request follows, which may re-prefill before it sends a byte, so the
+      // clock waits for its first output again (#1585).
+      started = !isCutMark(next.value);
       yield next.value;
     }
   } finally {

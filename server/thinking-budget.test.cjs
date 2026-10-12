@@ -123,8 +123,11 @@ test('requestWithEffort cuts a long thought and asks again with the forced answe
   assert.match(text, /1 2 3/);
   assert.equal(sent.length, 2, 'one forced request after the cut');
   const forced = sent[1];
+  // The note comes last, joined to the final user turn, so the engine's cached prompt prefix is kept (#1585).
   assert.equal(forced.messages[0].role, 'system');
-  assert.equal(forced.messages[0].content, tb.FORCED_ANSWER);
+  assert.notEqual(forced.messages[0].content, tb.FORCED_ANSWER);
+  assert.equal(forced.messages[forced.messages.length - 1].role, 'user');
+  assert.equal(forced.messages[forced.messages.length - 1].content, `Count to 3.\n\n${tb.FORCED_ANSWER}`);
   assert.equal(forced.tools, undefined, 'tools are dropped for the answer');
   assert.equal(forced.tool_choice, undefined);
   assert.equal(forced.stream, true);
@@ -166,8 +169,74 @@ test('without a thinking cap, or for a non-streamed reply, the engine reply is r
 
 test('forcedAnswerBody keeps the conversation and drops tools for every request shape', () => {
   const forced = reasoningEffort.forcedAnswerBody(baseBody({ chat_template_kwargs: { keep: 1 } }), LOCAL, 'plain-model');
-  assert.equal(forced.messages.length, 3);
-  assert.equal(forced.messages[1].content, 'You are a helper.');
+  assert.equal(forced.messages.length, 2, 'the note joins the final user turn');
+  assert.equal(forced.messages[0].content, 'You are a helper.');
   assert.deepEqual(forced.chat_template_kwargs, { keep: 1 });
   assert.equal(forced.tools, undefined);
+});
+
+test('forcedAnswerBody puts the note at the end and leaves every earlier message byte-identical (#1585)', () => {
+  const messages = [{ role: 'system', content: 'S' }, { role: 'user', content: 'U1' }, { role: 'assistant', content: 'A1' }, { role: 'tool', tool_call_id: 'c', content: 'T' }];
+  const forced = reasoningEffort.forcedAnswerBody(baseBody({ messages }), LOCAL, 'plain-model');
+  assert.deepEqual(forced.messages.slice(0, 4), messages, 'the cached prefix is untouched');
+  assert.deepEqual(forced.messages[4], { role: 'user', content: tb.FORCED_ANSWER });
+  const parts = [{ role: 'user', content: [{ type: 'text', text: 'look' }] }];
+  assert.deepEqual(reasoningEffort.forcedAnswerBody(baseBody({ messages: parts }), LOCAL, 'm').messages.slice(0, 1), parts, 'a multipart user turn is not rewritten');
+});
+
+test('the forced answer switches thinking off on the local engine for any model name, and never elsewhere (#1585)', () => {
+  const saved = { kind: process.env.MODEL_MANAGER_KIND, base: process.env.INFERENCE_BASE_URL };
+  process.env.MODEL_MANAGER_KIND = 'llamacpp'; process.env.INFERENCE_BASE_URL = LOCAL.baseUrl;
+  try {
+    for (const model of ['Some-Model-Q4_K_M.gguf', 'unrelated-name', 'qwen3-8b']) {
+      assert.equal(reasoningEffort.forcedAnswerBody(baseBody({ model }), LOCAL, model).chat_template_kwargs.enable_thinking, false, model);
+    }
+    const hosted = { id: 'cloud', baseUrl: 'https://api.example.test/v1', apiKey: 'k' };
+    assert.equal(reasoningEffort.forcedAnswerBody(baseBody({ model: 'qwen3-8b' }), hosted, 'qwen3-8b').chat_template_kwargs, undefined);
+  } finally {
+    if (saved.kind === undefined) delete process.env.MODEL_MANAGER_KIND; else process.env.MODEL_MANAGER_KIND = saved.kind;
+    if (saved.base === undefined) delete process.env.INFERENCE_BASE_URL; else process.env.INFERENCE_BASE_URL = saved.base;
+  }
+});
+
+test('the cut closes a half-written line, so the forced answer\'s first event is not glued onto it (#1585)', async () => {
+  // The chunk that crosses the cap completes a line whose first half was already forwarded.
+  const half = 'data: {"choices":[{"delta":{"reasoning_content":"' + words(3);
+  const rest = words(400) + '"}}]}\n\n';
+  const response = tb.capReasoning(upstream([thought('a'), half, rest]), {
+    cap: 10, retry: async () => upstream([sse({ content: 'First.' }), sse({ content: ' Second.' }), 'data: [DONE]\n\n']),
+  });
+  // Split into lines the way chat.cjs does and keep the data events that parse.
+  const events = (await drain(response)).split('\n').map((l) => l.trim()).filter((l) => l.startsWith('data:') && !l.includes('[DONE]'))
+    .flatMap((l) => { try { return [JSON.parse(l.slice(5))]; } catch { return []; } });
+  assert.deepEqual(events.filter((e) => e.choices[0].delta.content).map((e) => e.choices[0].delta.content), ['First.', ' Second.']);
+});
+
+test('the cut mark leads the forced answer, and is recognised (#1585)', async () => {
+  const seen = [];
+  const response = tb.capReasoning(upstream([thought(words(400))]), { cap: 10, retry: async () => upstream([sse({ content: 'x' })]) });
+  for await (const chunk of response.body) seen.push(tb.isCutMark(chunk) ? 'mark' : new TextDecoder().decode(chunk));
+  assert.deepEqual(seen, ['mark', sse({ content: 'x' })], 'the mark comes first, then the forced answer');
+  assert.equal(tb.isCutMark(new TextEncoder().encode('data: {}\n\n')), false);
+  assert.equal(tb.isCutMark('text'), false);
+});
+
+test('a cap of 0 (a context of about 4,100 tokens or less) asks for the answer directly when there are no tools (#1585)', async () => {
+  const sent = [], reports = [];
+  const fetcher = async (url, options) => { sent.push(JSON.parse(options.body)); return upstream([sse({ content: 'direct' }), 'data: [DONE]\n\n']); };
+  const noTools = baseBody(); delete noTools.tools; delete noTools.tool_choice;
+  const response = await reasoningEffort.requestWithEffort(fetcher, 'http://engine.test/v1/chat/completions', { method: 'POST', headers: {} }, noTools, LOCAL, 'plain-model', 'default', (r) => reports.push(r), 0);
+  assert.match(await drain(response), /direct/);
+  assert.equal(sent.length, 1, 'one request, not a cut and a retry');
+  assert.equal(sent[0].messages[sent[0].messages.length - 1].content.endsWith(tb.FORCED_ANSWER), true);
+  assert.equal(reports.find((r) => r.type === 'meta').thinkingCap, 0);
+});
+
+test('a cap of 0 with tools in the request is left uncapped, so the tools are kept (#1585)', async () => {
+  const sent = [];
+  const fetcher = async (url, options) => { sent.push(JSON.parse(options.body)); return upstream([thought(words(300)), sse({ content: 'ok' })]); };
+  const response = await reasoningEffort.requestWithEffort(fetcher, 'http://engine.test/v1/chat/completions', { method: 'POST', headers: {} }, baseBody(), LOCAL, 'plain-model', 'default', () => {}, 0);
+  assert.match(await drain(response), /ok/);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].tools.length, 1);
 });

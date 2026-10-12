@@ -18,6 +18,14 @@ const MIN_ANSWER_TOKENS = 1024;
 const OUTPUT_CAP_MAX = 8192;
 const OUTPUT_CONTEXT_SHARE = 0.25;
 const CHARS_PER_TOKEN = 4;
+// Sent to the reader at the cut, before the forced-answer request runs (#1585). It starts with a newline,
+// so a forwarded chunk that ended mid-line is closed off and the retry's first `data:` line is not glued
+// onto it; and the idle limit (chat.cjs withIdleLimit) restarts its clock on it, because the new request may
+// re-prefill the whole prompt before it sends a byte.
+const CUT_MARK = new TextEncoder().encode('\n\n: thinking cap reached; answer requested\n\n');
+function isCutMark(chunk) {
+  return chunk instanceof Uint8Array && chunk.length === CUT_MARK.length && CUT_MARK.every((byte, i) => chunk[i] === byte);
+}
 const FORCED_ANSWER = 'Your thinking budget for this reply is used up. Write the final answer now, concisely and completely, without further reasoning. Do not call tools.';
 
 /** Output budget (max_tokens) for a context of `limit` tokens: a quarter of it, at most 8,192. */
@@ -69,9 +77,18 @@ function capReasoning(response, { cap, retry, onCut = () => {} }) {
     return !answered && reasoningChars > limitChars;
   }
 
+  let retryDue = false;
   const body = new ReadableStream({
     async pull(controller) {
       for (;;) {
+        if (retryDue) {
+          retryDue = false;
+          try {
+            const next = await retry();
+            if (!next.ok || !next.body) throw Error(`The forced answer request failed (HTTP ${next.status}). Try again.`);
+            reader = readerOf(next.body);
+          } catch (error) { controller.error(error); return; }
+        }
         let read;
         try { read = await reader.read(); } catch (error) { controller.error(error); return; }
         if (read.done) { controller.close(); return; }
@@ -79,12 +96,9 @@ function capReasoning(response, { cap, retry, onCut = () => {} }) {
         forced = true;
         await reader.cancel().catch(() => {});
         onCut();
-        let next;
-        try {
-          next = await retry();
-          if (!next.ok || !next.body) throw Error(`The forced answer request failed (HTTP ${next.status}). Try again.`);
-        } catch (error) { controller.error(error); return; }
-        reader = readerOf(next.body);
+        retryDue = true;
+        controller.enqueue(CUT_MARK);
+        return;
       }
     },
     cancel(reason) { return reader.cancel(reason); },
@@ -92,4 +106,4 @@ function capReasoning(response, { cap, retry, onCut = () => {} }) {
   return new Response(body, { status: response.status, headers: response.headers });
 }
 
-module.exports = { THINKING_CAP_TOKENS, MIN_ANSWER_TOKENS, OUTPUT_CAP_MAX, OUTPUT_CONTEXT_SHARE, CHARS_PER_TOKEN, FORCED_ANSWER, outputBudget, thinkingCap, capReasoning };
+module.exports = { CUT_MARK, isCutMark, THINKING_CAP_TOKENS, MIN_ANSWER_TOKENS, OUTPUT_CAP_MAX, OUTPUT_CONTEXT_SHARE, CHARS_PER_TOKEN, FORCED_ANSWER, outputBudget, thinkingCap, capReasoning };
