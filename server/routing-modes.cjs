@@ -19,8 +19,8 @@ const path = require('node:path');
 const MODES = Object.freeze(['local', 'cloud', 'hybrid']);
 const WHEN_SENSITIVE = Object.freeze(['ask', 'local']);
 // Codes only, never text: a reply's reason is mode, user-choice, force-local, sensitive-rule,
-// fail-closed or remembered; a turn's flag (shown on the card) is diary, secret, iban, card, router
-// or unavailable.
+// fail-closed, check-unavailable (a check that could not answer, with a cause code in detail) or
+// remembered; a turn's flag (shown on the card) is diary, secret, iban, card, router or unavailable.
 const ROLE_KEYS = Object.freeze(['fast', 'smart', 'code']);
 const MODEL_RE = /^[A-Za-z0-9._:/@+-]{1,200}$/;
 const PROVIDER_RE = /^[A-Za-z0-9_-]{1,80}$/;

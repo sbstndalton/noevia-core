@@ -248,3 +248,22 @@ test('the record follows the stream the way the client does', () => {
   assert.deepEqual(declined.assistantEntry().paused, { reason: 'declined', applied: 0, declined: ['synthetic_append'] });
   assert.equal(saveInterruptedTurn({ fs, workspace: null, chatId: 'x', message: 'm', entry: {} }), 'no-chat');
 });
+
+test('#1438: a saved interrupted turn keeps the cause of a check that could not answer, and nothing else', () => {
+  const kept = createTurnRecord();
+  kept.observe({ type: 'meta', route: 'local', routing: { route: 'local', reason: 'check-unavailable', detail: 'deadline' } });
+  kept.observe({ type: 'delta', text: 'Answer.' });
+  assert.deepEqual(kept.assistantEntry().routeTarget, { route: 'local', reason: 'check-unavailable', detail: 'deadline' });
+
+  // A cause only rides with check-unavailable, as the live reply's meta does.
+  const otherReason = createTurnRecord();
+  otherReason.observe({ type: 'meta', route: 'local', routing: { route: 'local', reason: 'mode', detail: 'deadline' } });
+  otherReason.observe({ type: 'delta', text: 'Answer.' });
+  assert.deepEqual(otherReason.assistantEntry().routeTarget, { route: 'local', reason: 'mode' });
+
+  // Only the badge's code shape is kept; anything else is dropped rather than stored.
+  const malformed = createTurnRecord();
+  malformed.observe({ type: 'meta', route: 'local', routing: { route: 'local', reason: 'check-unavailable', detail: 'Bad Cause!' } });
+  malformed.observe({ type: 'delta', text: 'Answer.' });
+  assert.deepEqual(malformed.assistantEntry().routeTarget, { route: 'local', reason: 'check-unavailable' });
+});
