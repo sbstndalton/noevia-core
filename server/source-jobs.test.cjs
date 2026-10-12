@@ -59,12 +59,11 @@ test('settle waits for a project\'s running file jobs, reports failures and time
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('settle gives up at its bound and stops at once when the client cancels (#1441)', async () => {
+test('settle stops at once when the client cancels (#1441)', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-source-settle-cancel-'));
   try {
     const jobs = fresh(), ws = { dir };
     jobs.start(ws, 'p1', () => new Promise(() => {}), { name: 'stuck.md' });
-    assert.deepEqual(await jobs.settle(ws, 'p1', { timeoutMs: 20 }), { notReady: [{ name: 'stuck.md', reason: 'timeout' }], aborted: false });
     const cancel = new AbortController();
     setTimeout(() => cancel.abort(), 10);
     const started = Date.now();
@@ -73,4 +72,20 @@ test('settle gives up at its bound and stops at once when the client cancels (#1
     const gone = new AbortController(); gone.abort();
     assert.equal((await jobs.settle(ws, 'p1', { timeoutMs: 5000, signal: gone.signal })).aborted, true);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('a job that never settles costs one bounded wait, not one per later turn, and is forgotten after a while (#1441)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-source-settle-stuck-'));
+  const realNow = Date.now;
+  try {
+    const jobs = fresh(), ws = { dir };
+    jobs.start(ws, 'p1', () => new Promise(() => {}), { name: 'stuck.md' });
+    const stuck = [{ name: 'stuck.md', reason: 'timeout' }];
+    assert.deepEqual(await jobs.settle(ws, 'p1', { timeoutMs: 20 }), { notReady: stuck, aborted: false });
+    const started = realNow();
+    for (let i = 0; i < 3; i++) assert.deepEqual(await jobs.settle(ws, 'p1', { timeoutMs: 5000 }), { notReady: stuck, aborted: false }, 'still reported as not ready');
+    assert.ok(realNow() - started < 500, 'later turns do not wait for it again');
+    Date.now = () => realNow() + 11 * 60000;
+    assert.deepEqual(await jobs.settle(ws, 'p1', { timeoutMs: 5000 }), { notReady: [], aborted: false }, 'forgotten after ten minutes');
+  } finally { Date.now = realNow; fs.rmSync(dir, { recursive: true, force: true }); }
 });

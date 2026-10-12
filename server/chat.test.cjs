@@ -10,7 +10,7 @@ const { createToolExchange } = require('./tool-exchange.cjs');
 const { createApprovals } = require('./approvals.cjs');
 const { createApprovalRoutes } = require('./routes/approvals.cjs');
 
-async function runDriveCall(t, { name, files = [], ragOverride = null, savedMode = null, connected = true, decision = 'approve', policyDuringApproval = null, autoDecision = null, history = [], sampling = undefined, autoSamplingEnabled = undefined, message = 'Synthetic Drive request', codeRoleConfigured = false, beforeChat = null, sourceWaitMs = undefined, projectId = undefined, realRag = false }) {
+async function runDriveCall(t, { name, files = [], ragOverride = null, savedMode = null, connected = true, decision = 'approve', policyDuringApproval = null, autoDecision = null, history = [], sampling = undefined, autoSamplingEnabled = undefined, message = 'Synthetic Drive request', codeRoleConfigured = false, beforeChat = null, sourceWaitMs = undefined, projectId = undefined, realRag = false, stepSupervision = null }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-drive-chat-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const user = { id: 'synthetic-user' }, project = { id: projectId || 'synthetic-project', model: 'synthetic-model', routing: autoDecision ? 'auto' : 'manual', toolboxes: ['core'], files, ...(sampling !== undefined ? { sampling } : {}) };
@@ -48,6 +48,7 @@ async function runDriveCall(t, { name, files = [], ragOverride = null, savedMode
     return { ok: true, body: (async function* () { yield Buffer.from(`data: ${JSON.stringify(frame)}\n\n`); })() };
   };
   const handler = createChatHandler({
+    stepSupervision,
     fs, path, crypto, fetch, reasoningEffort: require('./reasoning-effort.cjs'), createToolExchange,
     rag: ragOverride || (realRag ? require('./rag.cjs') : { filesContext: async () => null }), prefill: { recordSample() {} }, reduceToolResult: require('./tool-result-reduce.cjs').reduceToolResult,
     HISTORY_CAP: 20, DEFAULT_PROVIDER_ID: 'default', DIARY_BASE: 'http://fixture.invalid', TOOL_RESULT_CAP: 8000,
@@ -457,4 +458,13 @@ test('a real project keeps its project and knowledge-file framing in the system 
   const system = r.requests[0].messages.filter((m) => m.role === 'system').map((m) => m.content).join('\n');
   assert.match(system, /Relevant knowledge-file excerpts for this message:\nSources attached to this project \(1\)/);
   assert.equal(r.requests[0].messages.filter((m) => m.role === 'user').at(-1).content, 'Summarize this file in one sentence.');
+});
+
+test('step supervision is given the user\'s own message as the goal, not the attached file text (#1441)', async (t) => {
+  const files = [{ name: 'note.md', content: 'Synthetic codeword: PINEAPPLE-7.', attachment: { id: 'att-1', state: 'ready' } }];
+  const goals = [];
+  const stepSupervision = require('./step-supervision.cjs').createStepSupervision({ enabled: () => true, deadlineMs: 500, log() {},
+    provider: { decide: async (state) => { goals.push(state.goal); return { action: 'continue' }; } } });
+  await runDriveCall(t, { name: 'drive_read_file', projectId: 'cowork-chat-context-c-synthetic2', files, realRag: true, stepSupervision, message: 'Summarize this file in one sentence.' });
+  assert.deepEqual(goals, ['Summarize this file in one sentence.']);
 });

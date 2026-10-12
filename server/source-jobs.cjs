@@ -15,6 +15,7 @@ function storeFor(workspace) {
 }
 // In-process record of the file-bearing jobs still running, so a chat turn can wait for them (#1441).
 // Names are kept in memory only (never in the journal); results are re-read from the job store.
+const STALE_MS = 10 * 60000;
 const registries = new WeakMap();
 const registryFor = (workspace) => { let r = registries.get(workspace); if (!r) { r = new Map(); registries.set(workspace, r); } return r; };
 function start(workspace, projectId, operation, { name = null } = {}) {
@@ -41,8 +42,14 @@ function start(workspace, projectId, operation, { name = null } = {}) {
 // project's running file jobs, at most `timeoutMs`, ending early if `signal` aborts (the client left).
 // Resolves { notReady: [{ name, reason: 'failed' | 'timeout' }], aborted } for the jobs it waited on.
 async function settle(workspace, projectId, { timeoutMs = 30000, signal } = {}) {
-  const waiting = [...registryFor(workspace).values()].filter((e) => e.projectId === projectId);
-  if (!waiting.length) return { notReady: [], aborted: false };
+  const registry = registryFor(workspace), now = Date.now();
+  // A job that already outlasted one wait is reported as not ready without making every later turn
+  // wait the full bound again; one that never settles is forgotten after STALE_MS.
+  for (const [id, e] of registry) if (e.timedOutAt && now - e.timedOutAt > STALE_MS) registry.delete(id);
+  const mine = [...registry.values()].filter((e) => e.projectId === projectId);
+  const waiting = mine.filter((e) => !e.timedOutAt);
+  const report = () => mine.filter((e) => e.outcome !== 'ready').map((e) => ({ name: e.name, reason: e.outcome === 'failed' ? 'failed' : 'timeout' }));
+  if (!waiting.length) return { notReady: report(), aborted: false };
   let timer, onAbort;
   const stop = new Promise((resolve) => {
     timer = setTimeout(() => resolve('timeout'), timeoutMs);
@@ -51,7 +58,8 @@ async function settle(workspace, projectId, { timeoutMs = 30000, signal } = {}) 
   try {
     const result = await Promise.race([Promise.all(waiting.map((e) => e.finished)).then(() => 'done'), stop]);
     if (result === 'aborted') return { notReady: [], aborted: true };
-    return { notReady: waiting.filter((e) => e.outcome !== 'ready').map((e) => ({ name: e.name, reason: e.outcome === 'failed' ? 'failed' : 'timeout' })), aborted: false };
+    for (const e of waiting) if (!e.outcome && !e.timedOutAt) e.timedOutAt = Date.now();
+    return { notReady: report(), aborted: false };
   } finally { clearTimeout(timer); if (signal && onAbort) signal.removeEventListener('abort', onAbort); }
 }
 function read(workspace, projectId, id) {

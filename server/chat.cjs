@@ -622,6 +622,9 @@ function createChatHandler({
           return json(res, 409, { error: 'Cloud routing has no cloud provider and model yet. Choose them in Settings → Models & routing.' });
         }
         const sentText = [sysWithoutBrain, ...msgs.map((m) => (typeof m.content === 'string' ? m.content : ''))].join('\n');
+        // #1441: the router reads what the model gets, including a free chat's attached files, which ride
+        // with the user's turn rather than the system message.
+        const routerSystem = chatAttachments && filesBlock && !body.compactOnly ? [sysWithoutBrain, filesBlock].join('\n\n') : sysWithoutBrain;
         const attachmentNames = [...(project?.assets || []).map((a) => a.name), ...(project?.files || []).map((f) => f.name)].filter((n) => typeof n === 'string');
         const routeUserId = requestScope.getStore()?.workspace?.userId || null;
         const decided = await rm.resolveRoute({
@@ -630,7 +633,7 @@ function createChatHandler({
           // #779 F4: the current message first, so the 400k scan limit can never cut it off.
           preFlag: settings.mode === 'hybrid' ? (rm.preRule(message) || rm.preRule(attachmentNames.join('\n')) || rm.preRule(sentText)) : null,
           // #779 F1: the router reads bounded chunks sized to the decision service's real budget.
-          check: () => routingModes.sensitivity(rm.routerChunks({ message, system: sysWithoutBrain, history: mappedHistory, attachments: attachmentNames },
+          check: () => routingModes.sensitivity(rm.routerChunks({ message, system: routerSystem, history: mappedHistory, attachments: attachmentNames },
             { chunkChars: typeof routingModes.chunkChars === 'function' ? routingModes.chunkChars() : undefined,
               maxChunks: typeof routingModes.maxChunks === 'function' ? routingModes.maxChunks() : undefined })),
           ask: async (flag) => {
@@ -1638,7 +1641,7 @@ function createChatHandler({
       if (skillRevocation) break; // revoked during this round's tools: no supervisor call, one error
       const supervised = await require('./step-supervision.cjs').superviseNextStep(
         spaceId?.startsWith('diary') ? null : stepSupervision,
-        { round, messages: roundMessages, signal: chatSignal.signal });
+        { round, messages: roundMessages, signal: chatSignal.signal, goal: message });
       roundMessages = supervised.messages;
       if (supervised.pause) {
         // #658: the tool round before this checkpoint finished, and its writes are real. A pause

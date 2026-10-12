@@ -229,7 +229,7 @@ const LOCAL = 'http://local.invalid', CLOUD = 'http://cloud.invalid';
 const sse = (...frames) => ({ ok: true, status: 200, body: (async function* () { for (const f of frames) yield Buffer.from(`data: ${JSON.stringify(f)}\n\n`); })() });
 const PROVIDERS = { default: { id: 'default', baseUrl: LOCAL }, 'cloud-x': { id: 'cloud-x', baseUrl: CLOUD, label: 'Synthetic cloud', shared: true } };
 
-async function run(t, { flag, settings = null, chat = {}, project: projectOver = {}, message = 'Tell me about synthetic widgets', history = [], verdict = 'clear', answer = null, approvals = null, userId = 'synthetic-user', withRouting = true, toolResult = null, brainContext = null }) {
+async function run(t, { freeChatId = null, ragOverride = null, flag, settings = null, chat = {}, project: projectOver = {}, message = 'Tell me about synthetic widgets', history = [], verdict = 'clear', answer = null, approvals = null, userId = 'synthetic-user', withRouting = true, toolResult = null, brainContext = null }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-routing-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const events = [], calls = [], logs = [], flagsSet = [], errors = [];
   const res = new EventEmitter();
@@ -253,7 +253,7 @@ async function run(t, { flag, settings = null, chat = {}, project: projectOver =
     }
     return sse({ choices: [{ delta: { content: 'ok' } }] });
   };
-  const project = { id: 'fixture-project', name: 'Fixture', routing: 'auto', assets: [], chats: [{ id: 'fixture-chat', title: 't', updatedAt: 1, ...chat }], ...projectOver };
+  const project = { id: freeChatId ? `cowork-chat-context-${freeChatId}` : 'fixture-project', name: 'Fixture', routing: 'auto', assets: [], chats: [{ id: 'fixture-chat', title: 't', updatedAt: 1, ...chat }], ...projectOver };
   const verdicts = { clear: { flagged: false, flag: null }, sensitive: { flagged: true, flag: 'router' }, fail: { flagged: true, flag: 'unavailable' } };
   const sensitivityCalls = [];
   const { handleChat } = require('./chat.cjs').createChatHandler({
@@ -261,7 +261,7 @@ async function run(t, { flag, settings = null, chat = {}, project: projectOver =
     reasoningEffort: require('./reasoning-effort.cjs'), authService: { audit() {}, diaryEnabled: () => false },
     crypto: require('node:crypto'), path, fs, fetch, HISTORY_CAP: 20, DEFAULT_PROVIDER_ID: 'default', createToolExchange: require('./tool-exchange.cjs').createToolExchange,
     currentWorkspace: () => ({ userId, dir, assetDir: () => dir }),
-    getProject: (id) => (id === 'fixture-project' ? project : null),
+    getProject: (id) => (id === project.id ? project : null),
     skillsIndexFor: () => [], getProvider: (id) => PROVIDERS[id] || PROVIDERS.default, providerHeaders: () => ({}), autoRoles: () => ({ fast: 'local-fast', smart: 'local-smart' }),
     visionDescriptions: new Map(), visionProbe: async () => ({ supported: true }),
     chatSkillRouter: { select: async () => ({ loaded: [] }) }, oauthServerIds: () => new Set(), accountReady: () => false,
@@ -269,7 +269,7 @@ async function run(t, { flag, settings = null, chat = {}, project: projectOver =
     toolPolicy: { mode: () => 'allow' },
     requestScope: { getStore: () => ({ authn: { user: { id: userId, role: 'member' } }, workspace: { userId } }) },
     resolveTools: () => ({ tools: toolResult === null ? [] : [{ type: 'function', function: { name: 'synthetic_read', description: 'Synthetic read', parameters: { type: 'object', properties: {} } } }], dropped: [] }), isWriteTool: () => false,
-    rag: { filesContext: async () => null }, prefill: { recordSample() {} }, reduceToolResult: (r) => ({ text: String(r) }), diaryExtras: require('./diary-extras.cjs'),
+    rag: ragOverride || { filesContext: async () => null }, prefill: { recordSample() {} }, reduceToolResult: (r) => ({ text: String(r) }), diaryExtras: require('./diary-extras.cjs'),
     DIARY_BASE: 'http://diary.invalid', TOOL_RESULT_CAP: 8000, json: (r, status, body) => { errors.push({ status, body }); r.end(); }, saveChats() {}, endpointApproved: () => true, diaryHeaders: () => ({}),
     lastLoadedModel: () => null, classifyFastOrSmart: async () => 'smart', servedCatalogue: async () => [], modelsInstalled: async () => [], missingRoles: () => [], staleRolesError: () => null,
     allToolboxes: () => [], chatWideApproved: () => false, awaitApproval: async () => 'deny', recordUsage() {}, recordToolUse() {},
@@ -288,7 +288,7 @@ async function run(t, { flag, settings = null, chat = {}, project: projectOver =
   const consoleLines = [];
   console.log = (...a) => consoleLines.push(a.join(' ')); console.warn = (...a) => consoleLines.push(a.join(' ')); console.info = (...a) => consoleLines.push(a.join(' '));
   try {
-    await handleChat({}, res, { projectId: 'fixture-project', chatId: 'fixture-chat', message, history });
+    await handleChat({}, res, freeChatId ? { spaceId: 'free', chatId: freeChatId, message, history } : { projectId: 'fixture-project', chatId: 'fixture-chat', message, history });
   } finally { console.log = origLog; console.warn = origWarn; console.info = origInfo; }
   const upstream = calls.filter((c) => c.url);
   const meta = events.find((e) => e.type === 'meta');
@@ -556,4 +556,17 @@ test('#1007: a project override replaces mode and sensitive handling, keeps the 
   assert.equal(rm.effectiveMode(merged, ['local']), 'local', 'a disallowed project mode falls back to local');
   assert.deepEqual(rm.projectOverride({ mode: 'cloud' }), { mode: 'cloud', whenSensitive: 'ask' });
   assert.throws(() => rm.projectOverride([], true), /object or null/);
+});
+
+// #1441: a free chat's attached files ride with the user's turn, and the hybrid sensitivity check reads
+// the same text the model gets, so a file's sensitive content still decides the route.
+test('hybrid routing: the sensitivity check reads the attached file text of a free chat (#1441)', async (t) => {
+  const MARKER = 'SYNTHETIC-ATTACHED-MARKER-7731';
+  const ragOverride = { filesContext: async (_p, files, _q, _u, onSources, opts) => {
+    onSources([]);
+    return `${opts?.attached ? 'The user attached these files to this chat' : 'Sources'} (1): "a.md"\n<untrusted kind="file">${MARKER}</untrusted>`;
+  } };
+  const r = await run(t, { flag: true, settings: HYBRID, freeChatId: 'c-synthetic', ragOverride, project: { files: [{ name: 'a.md', content: MARKER }] }, message: 'Summarize this file.' });
+  assert.equal(r.sensitivityCalls.length, 1);
+  assert.ok(r.sensitivityCalls[0].join('\n').includes(MARKER), 'the router saw the attached file text');
 });
