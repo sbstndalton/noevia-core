@@ -6,7 +6,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
-const { createStorageRoutes, STORAGE_PRIVATE_URL_ERROR } = require('./storage.cjs');
+const { createStorageRoutes, STORAGE_PRIVATE_URL_ERROR, nextcloudServerRoot } = require('./storage.cjs');
 
 function fixture({ storage = { kind: 'local' }, browsable = false, approved = () => true, network = async () => ({ ok: true, status: 200, json: async () => ({}) }), storageReadsOwned } = {}) {
   const sent = [], saved = [], requests = [], storageReads = [];
@@ -126,35 +126,129 @@ test('the WebDAV probe accepts 207 and reports the status otherwise', async () =
   assert.deepEqual(down.sent.pop(), { status: 502, body: { error: 'ECONNREFUSED' } });
 });
 
-test('the Nextcloud login flow starts, polls and saves an app password, guarding every URL', async () => {
+// A Nextcloud on a fake network: login/v2 start, the poll, the OCS "who am I" and the DAV check.
+function nextcloud(opts = {}) {
+  const state = { poll: () => ({ ok: false, status: 404 }), whoami: () => ({ ok: true, status: 200, json: async () => ({ ocs: { data: { id: 'Ada Lovelace' } } }) }), dav: () => ({ ok: false, status: 207 }) };
   const f = fixture({
     approved: (_authn, url) => !url.startsWith('http://10.'),
-    network: async (url) => {
+    network: async (url, init) => {
       if (url.endsWith('/index.php/login/v2')) return { ok: true, status: 200, json: async () => ({ login: 'https://cloud.example/login/flow/abc', poll: { endpoint: 'https://cloud.example/login/v2/poll', token: 'ptok' } }) };
-      if (url.endsWith('/poll')) return f.pollReply();
+      if (url.endsWith('/login/v2/poll')) return state.poll();
+      if (url.includes('/ocs/v2.php/cloud/user')) return state.whoami(init);
+      if (url.includes('/ocs/v2.php/core/apppassword')) { if (state.revokeThrows) throw new TypeError('fetch failed'); return { ok: true, status: 200 }; }
+      if (url.includes('/remote.php/dav/files/')) return state.dav(url, init);
       throw new Error(`unexpected ${url}`);
     },
+    ...opts,
   });
-  f.pollReply = () => ({ ok: false, status: 404 });
+  return Object.assign(f, { state });
+}
+const granted = (loginName = 'ada@example.com') => () => ({ ok: true, status: 200, json: async () => ({ server: 'https://cloud.example/', loginName, appPassword: 'app-pw' }) });
+
+test('the Nextcloud login flow starts, polls and saves an app password, guarding every URL', async () => {
+  const f = nextcloud();
   await f.call('POST', '/api/integrations/storage/nextcloud/start', { baseUrl: 'http://cloud.example' });
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'HTTPS Nextcloud URL required' } });
+  assert.equal(f.sent.pop().body.code, 'nextcloudHttpsRequired');
   await f.call('POST', '/api/integrations/storage/nextcloud/start', { baseUrl: 'https://cloud.example/' });
   const started = f.sent.pop();
   assert.equal(started.status, 200);
   assert.equal(started.body.flowId, 'flow-1');
   assert.equal(started.body.loginUrl, 'https://cloud.example/login/flow/abc');
   assert.equal(f.requests[0].url, 'https://cloud.example/index.php/login/v2');
+  assert.equal(f.requests[0].init.headers['User-Agent'], 'Noevia', 'the app password is named after noevia, not "node"');
   await f.call('POST', '/api/integrations/storage/nextcloud/poll', { flowId: 'flow-1' });
   assert.deepEqual(f.sent.pop(), { status: 202, body: { pending: true } });
   assert.equal(f.requests.at(-1).init.body.toString(), 'token=ptok');
   await f.call('POST', '/api/integrations/storage/nextcloud/poll', { flowId: 'flow-1' }, 'u2');
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'login flow expired' } }, 'a flow belongs to the account that started it');
-  f.pollReply = () => ({ ok: true, status: 200, json: async () => ({ server: 'https://cloud.example/', loginName: 'one two', appPassword: 'app-pw' }) });
+  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'login flow expired', code: 'nextcloudFlowExpired' } }, 'a flow belongs to the account that started it');
+  f.state.poll = granted('one two');
+  f.state.whoami = () => ({ ok: true, status: 200, json: async () => ({ ocs: { data: { id: 'one two' } } }) });
   await f.call('POST', '/api/integrations/storage/nextcloud/poll', { flowId: 'flow-1', corpusRoot: 'Diary' });
   assert.deepEqual(f.sent.pop(), { status: 200, body: { ok: true, kind: 'nextcloud' } });
   assert.deepEqual(f.saved.pop(), { kind: 'nextcloud', baseUrl: 'https://cloud.example/remote.php/dav/files/one%20two', username: 'one two', secret: 'app-pw', corpusRoot: 'Diary' });
   await f.call('POST', '/api/integrations/storage/nextcloud/poll', { flowId: 'flow-1' });
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'login flow expired' } }, 'a finished flow is gone');
+  assert.equal(f.sent.pop().body.code, 'nextcloudFlowExpired', 'a finished flow is gone');
+});
+
+test('#1427: an e-mail login is saved under the Nextcloud user id, and the login is checked first', async () => {
+  const f = nextcloud();
+  await f.call('POST', '/api/integrations/storage/nextcloud/start', { baseUrl: 'https://cloud.example' });
+  f.state.poll = granted('ada@example.com');
+  await f.call('POST', '/api/integrations/storage/nextcloud/poll', { flowId: 'flow-1', corpusRoot: 'Documents/Diary' });
+  assert.equal(f.sent.pop().status, 200);
+  const row = f.saved.pop();
+  assert.equal(row.baseUrl, 'https://cloud.example/remote.php/dav/files/Ada%20Lovelace', 'the DAV home is the user id, not the login name');
+  assert.equal(row.username, 'ada@example.com', 'the app password is bound to the login name it was issued for');
+  const who = f.requests.find(r => r.url.includes('/ocs/'));
+  assert.equal(who.init.headers['OCS-APIRequest'], 'true');
+  assert.equal(who.init.headers.Authorization, `Basic ${Buffer.from('ada@example.com:app-pw').toString('base64')}`);
+  const dav = f.requests.find(r => r.url.includes('/remote.php/dav/'));
+  assert.equal(dav.url, 'https://cloud.example/remote.php/dav/files/Ada%20Lovelace/');
+  assert.equal(dav.init.method, 'PROPFIND');
+});
+
+test('#1427: the existing folder is kept when the browser sends none', async () => {
+  const f = nextcloud({ storage: { kind: 'webdav', baseUrl: 'http://10.0.0.5/dav', corpusRoot: 'Documents/Important Documents/Diary' } });
+  await f.call('POST', '/api/integrations/storage/nextcloud/start', { baseUrl: 'https://cloud.example' });
+  f.state.poll = granted();
+  await f.call('POST', '/api/integrations/storage/nextcloud/poll', { flowId: 'flow-1' });
+  assert.equal(f.saved.pop().corpusRoot, 'Documents/Important Documents/Diary');
+  const fresh = nextcloud();
+  await fresh.call('POST', '/api/integrations/storage/nextcloud/start', { baseUrl: 'https://cloud.example' });
+  fresh.state.poll = granted();
+  await fresh.call('POST', '/api/integrations/storage/nextcloud/poll', { flowId: 'flow-1' });
+  assert.equal(fresh.saved.pop().corpusRoot, 'Cowork/Diary');
+});
+
+test('#1427: a refused or throttled login after sign-in never replaces the saved connection', async () => {
+  for (const [dav, code, status] of [[() => ({ ok: false, status: 401 }), 'storageLoginRejected', 502], [() => ({ ok: false, status: 429, headers: new Headers({ 'Retry-After': '120' }) }), 'nextcloudThrottled', 429]]) {
+    const f = nextcloud();
+    await f.call('POST', '/api/integrations/storage/nextcloud/start', { baseUrl: 'https://cloud.example' });
+    f.state.poll = granted(); f.state.dav = dav;
+    await f.call('POST', '/api/integrations/storage/nextcloud/poll', { flowId: 'flow-1' });
+    const reply = f.sent.pop();
+    assert.equal(reply.status, status);
+    assert.equal(reply.body.code, code);
+    if (code === 'nextcloudThrottled') assert.equal(reply.body.retryAfter, 120);
+    assert.equal(f.saved.length, 0);
+    assert.doesNotMatch(JSON.stringify(reply), /app-pw/);
+  }
+  const refused = nextcloud();
+  await refused.call('POST', '/api/integrations/storage/nextcloud/start', { baseUrl: 'https://cloud.example' });
+  refused.state.poll = granted(); refused.state.whoami = () => ({ ok: false, status: 401 });
+  await refused.call('POST', '/api/integrations/storage/nextcloud/poll', { flowId: 'flow-1' });
+  assert.equal(refused.sent.pop().body.code, 'storageLoginRejected');
+  assert.equal(refused.saved.length, 0);
+});
+
+test('#1427: when Nextcloud cannot say who the user is, the login name is used and an unreachable check saves with a warning', async () => {
+  const f = nextcloud();
+  await f.call('POST', '/api/integrations/storage/nextcloud/start', { baseUrl: 'https://cloud.example' });
+  f.state.poll = granted('ada');
+  f.state.whoami = () => { throw new TypeError('fetch failed'); };
+  f.state.dav = () => { throw Object.assign(new Error('slow'), { name: 'TimeoutError' }); };
+  await f.call('POST', '/api/integrations/storage/nextcloud/poll', { flowId: 'flow-1' });
+  const reply = f.sent.pop();
+  assert.equal(reply.status, 200);
+  assert.equal(reply.body.warningCode, 'storageUnverified');
+  assert.equal(reply.body.reason, 'timeout');
+  assert.match(reply.body.warning, /within 10 seconds/);
+  assert.equal(f.saved.pop().baseUrl, 'https://cloud.example/remote.php/dav/files/ada');
+});
+
+test('#1427: sign-in starts from the server root whatever URL the field holds', async () => {
+  assert.equal(nextcloudServerRoot('https://cloud.example/remote.php/dav/files/ada%20l/Documents'), 'https://cloud.example');
+  assert.equal(nextcloudServerRoot('https://cloud.example/nc/index.php/apps/files/?dir=/'), 'https://cloud.example/nc');
+  assert.equal(nextcloudServerRoot('https://cloud.example/apps/files'), 'https://cloud.example');
+  assert.equal(nextcloudServerRoot(' https://cloud.example:8443/ '), 'https://cloud.example:8443');
+  assert.equal(nextcloudServerRoot('https://u:p@cloud.example'), '', 'credentials in the URL are refused');
+  assert.equal(nextcloudServerRoot('not a url'), '');
+  const f = nextcloud();
+  await f.call('POST', '/api/integrations/storage/nextcloud/start', { baseUrl: 'https://cloud.example/remote.php/dav/files/ada' });
+  assert.equal(f.sent.pop().status, 200);
+  assert.equal(f.requests[0].url, 'https://cloud.example/index.php/login/v2');
+  await f.call('POST', '/api/integrations/storage/nextcloud/start', { baseUrl: 'http://10.0.0.5:11000/remote.php/dav/files/ada' });
+  assert.equal(f.sent.pop().body.code, 'nextcloudHttpsRequired', 'an internal plain-http WebDAV URL is not a sign-in address');
 });
 
 test('a Nextcloud that answers with an internal poll endpoint or a plain-http login is refused', async () => {
@@ -163,13 +257,29 @@ test('a Nextcloud that answers with an internal poll endpoint or a plain-http lo
     network: async () => ({ ok: true, status: 200, json: async () => ({ login: 'https://cloud.example/login', poll: { endpoint: 'http://10.0.0.9/poll', token: 't' } }) }),
   });
   await f.call('POST', '/api/integrations/storage/nextcloud/start', { baseUrl: 'https://cloud.example' });
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'Invalid connection URLs' } });
+  assert.equal(f.sent.pop().body.code, 'nextcloudHttpsRequired');
   const plain = fixture({ network: async () => ({ ok: true, status: 200, json: async () => ({ login: 'http://cloud.example/login', poll: { endpoint: 'https://cloud.example/poll', token: 't' } }) }) });
   await plain.call('POST', '/api/integrations/storage/nextcloud/start', { baseUrl: 'https://cloud.example' });
   assert.deepEqual(plain.sent.pop(), { status: 400, body: { error: 'Invalid connection URLs' } });
-  const down = fixture({ network: async () => ({ ok: false, status: 503 }) });
-  await down.call('POST', '/api/integrations/storage/nextcloud/start', { baseUrl: 'https://cloud.example' });
-  assert.deepEqual(down.sent.pop(), { status: 502, body: { error: 'Nextcloud returned 503' } });
+});
+
+test('#1427: start says whether Nextcloud was unreachable, missing, throttling or failing', async () => {
+  const cases = [
+    [() => { throw Object.assign(new Error('t'), { name: 'TimeoutError' }); }, 504, 'nextcloudUnreachable'],
+    [() => { throw new TypeError('fetch failed'); }, 502, 'nextcloudUnreachable'],
+    [() => ({ ok: false, status: 404 }), 502, 'nextcloudNotFound'],
+    [() => ({ ok: false, status: 429, headers: new Headers({ 'Retry-After': '30' }) }), 429, 'nextcloudThrottled'],
+    [() => ({ ok: false, status: 503 }), 502, 'nextcloudError'],
+    [() => ({ ok: true, status: 200, json: async () => { throw new SyntaxError('html'); } }), 502, 'nextcloudNotFound'],
+  ];
+  for (const [network, status, code] of cases) {
+    const f = fixture({ network });
+    await f.call('POST', '/api/integrations/storage/nextcloud/start', { baseUrl: 'https://cloud.example' });
+    const reply = f.sent.pop();
+    assert.equal(reply.status, status, code);
+    assert.equal(reply.body.code, code);
+    assert.match(reply.body.error, /cloud\.example|Nextcloud returned/);
+  }
 });
 
 test('edited WebDAV fields use only the current account secret without returning or saving it', async () => {
@@ -216,4 +326,131 @@ test('browsing a refused path answers 400, not 502 (#984)', async () => {
   assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'Use a relative path inside the storage folder.' } });
   await f.call('GET', '/api/integrations/storage/files/boom');
   assert.equal(f.sent.pop().status, 502);
+});
+
+test('#1427: a manual save says when the server was throttling or too slow to check the login', async () => {
+  const body = { kind: 'webdav', baseUrl: 'https://cloud.example/remote.php/dav/files/ada', username: 'ada', secret: 'synthetic-secret' };
+  const throttled = fixture({ network: async () => ({ ok: false, status: 429, headers: new Headers({ 'Retry-After': '60' }), body: null }) });
+  await throttled.call('PUT', '/api/integrations/storage', body);
+  const t = throttled.sent.pop();
+  assert.equal(t.status, 200);
+  assert.equal(t.body.warningCode, 'storageThrottled');
+  assert.equal(t.body.retryAfter, 60);
+  assert.match(t.body.warning, /throttling/);
+  const slow = fixture({ network: async () => { throw Object.assign(new Error('slow'), { name: 'TimeoutError' }); } });
+  await slow.call('PUT', '/api/integrations/storage', body);
+  const s = slow.sent.pop();
+  assert.equal(s.body.warningCode, 'storageUnverified');
+  assert.equal(s.body.reason, 'timeout');
+  assert.match(s.body.warning, /could not be reached within 10 seconds/);
+  assert.doesNotMatch(JSON.stringify([t, s]), /synthetic-secret/);
+});
+
+// #1432 / #1433: the poll token and the app password only go over https to the origin sign-in
+// started at; an issued app password that is not saved is revoked; Cancel ends the flow server-side.
+const revocations = (f) => f.requests.filter(r => r.init?.method === 'DELETE' && r.url.endsWith('/ocs/v2.php/core/apppassword'));
+
+test('#1432: start refuses a poll endpoint that is plain http or on another origin, and never contacts it', async () => {
+  for (const [endpoint, code] of [['http://cloud.example/login/v2/poll', 'nextcloudHttpsRequired'], ['https://other.example/login/v2/poll', 'nextcloudOriginMismatch']]) {
+    const f = fixture({ network: async () => ({ ok: true, status: 200, json: async () => ({ login: 'https://cloud.example/login/flow/x', poll: { endpoint, token: 'ptok' } }) }) });
+    await f.call('POST', '/api/integrations/storage/nextcloud/start', { baseUrl: 'https://cloud.example' });
+    const reply = f.sent.pop();
+    assert.equal(reply.status, 400);
+    assert.equal(reply.body.code, code);
+    if (code === 'nextcloudOriginMismatch') assert.match(reply.body.error, /overwritehost.*overwrite\.cli\.url/);
+    await f.call('POST', '/api/integrations/storage/nextcloud/poll', { flowId: 'flow-1' });
+    assert.equal(f.sent.pop().body.code, 'nextcloudFlowExpired', 'no flow was stored');
+    assert.deepEqual(f.requests.map(r => r.url), ['https://cloud.example/index.php/login/v2'], 'only the https start request went out');
+  }
+});
+
+test('#1432: an issued app password for a plain-http or other-origin server is refused and never sent anywhere', async () => {
+  for (const [server, code] of [['http://cloud.example/', 'nextcloudHttpsRequired'], ['https://evil.example/', 'nextcloudOriginMismatch']]) {
+    const f = nextcloud();
+    await f.call('POST', '/api/integrations/storage/nextcloud/start', { baseUrl: 'https://cloud.example' });
+    f.state.poll = () => ({ ok: true, status: 200, json: async () => ({ server, loginName: 'ada', appPassword: 'app-pw' }) });
+    const before = f.requests.length;
+    await f.call('POST', '/api/integrations/storage/nextcloud/poll', { flowId: 'flow-1' });
+    const reply = f.sent.pop();
+    assert.equal(reply.body.code, code);
+    if (code === 'nextcloudOriginMismatch') assert.match(reply.body.error, /overwritehost/);
+    assert.equal(f.saved.length, 0);
+    const after = f.requests.slice(before).map(r => r.url);
+    assert.deepEqual(after, ['https://cloud.example/login/v2/poll'], 'nothing but the poll itself: no OCS, DAV or revoke request');
+    assert.doesNotMatch(JSON.stringify(reply), /app-pw/);
+  }
+});
+
+test('#1433: every failure after the app password is issued revokes it on the trusted server', async () => {
+  const cases = [
+    ['OCS 401', (f) => { f.state.whoami = () => ({ ok: false, status: 401 }); }, 'storageLoginRejected'],
+    ['OCS 429', (f) => { f.state.whoami = () => ({ ok: false, status: 429, headers: new Headers() }); }, 'nextcloudThrottled'],
+    ['DAV 401', (f) => { f.state.dav = () => ({ ok: false, status: 401 }); }, 'storageLoginRejected'],
+    ['DAV 429', (f) => { f.state.dav = () => ({ ok: false, status: 429, headers: new Headers() }); }, 'nextcloudThrottled'],
+  ];
+  for (const [name, arrange, code] of cases) {
+    const f = nextcloud();
+    await f.call('POST', '/api/integrations/storage/nextcloud/start', { baseUrl: 'https://cloud.example' });
+    f.state.poll = granted('ada@example.com'); arrange(f);
+    await f.call('POST', '/api/integrations/storage/nextcloud/poll', { flowId: 'flow-1' });
+    assert.equal(f.sent.pop().body.code, code, name);
+    assert.equal(f.saved.length, 0, name);
+    const revoked = revocations(f);
+    assert.equal(revoked.length, 1, `${name} revokes once`);
+    assert.equal(revoked[0].url, 'https://cloud.example/ocs/v2.php/core/apppassword');
+    assert.equal(revoked[0].init.headers.Authorization, `Basic ${Buffer.from('ada@example.com:app-pw').toString('base64')}`);
+    assert.equal(revoked[0].init.headers['OCS-APIRequest'], 'true');
+    assert.equal(revoked[0].init.redirect, 'error');
+  }
+  const blocked = nextcloud({ approved: (_a, url) => !url.includes('/remote.php/dav/') && !url.startsWith('http://10.') });
+  await blocked.call('POST', '/api/integrations/storage/nextcloud/start', { baseUrl: 'https://cloud.example' });
+  blocked.state.poll = granted();
+  await blocked.call('POST', '/api/integrations/storage/nextcloud/poll', { flowId: 'flow-1' });
+  assert.equal(blocked.sent.pop().body.error, STORAGE_PRIVATE_URL_ERROR);
+  assert.equal(revocations(blocked).length, 1, 'an unapproved DAV home revokes the password');
+  const ok = nextcloud();
+  await ok.call('POST', '/api/integrations/storage/nextcloud/start', { baseUrl: 'https://cloud.example' });
+  ok.state.poll = granted();
+  await ok.call('POST', '/api/integrations/storage/nextcloud/poll', { flowId: 'flow-1' });
+  assert.equal(ok.saved.length, 1);
+  assert.equal(revocations(ok).length, 0, 'a saved app password is kept');
+});
+
+test('#1433: a failed revoke never changes the answer', async () => {
+  const f = nextcloud();
+  await f.call('POST', '/api/integrations/storage/nextcloud/start', { baseUrl: 'https://cloud.example' });
+  f.state.poll = granted(); f.state.dav = () => ({ ok: false, status: 401 }); f.state.revokeThrows = true;
+  await f.call('POST', '/api/integrations/storage/nextcloud/poll', { flowId: 'flow-1' });
+  const reply = f.sent.pop();
+  assert.equal(reply.status, 502);
+  assert.equal(reply.body.code, 'storageLoginRejected');
+  assert.equal(revocations(f).length, 1, 'the revoke was attempted');
+  assert.equal(f.saved.length, 0);
+});
+
+test('#1433: cancel ends the flow for its own account only, and a cancel during a poll revokes instead of saving', async () => {
+  const f = nextcloud();
+  await f.call('POST', '/api/integrations/storage/nextcloud/start', { baseUrl: 'https://cloud.example' });
+  await f.call('POST', '/api/integrations/storage/nextcloud/cancel', { flowId: 'flow-1' }, 'u2');
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { cancelled: false } }, 'another account cannot cancel it');
+  await f.call('POST', '/api/integrations/storage/nextcloud/poll', { flowId: 'flow-1' });
+  assert.deepEqual(f.sent.pop(), { status: 202, body: { pending: true } });
+  await f.call('POST', '/api/integrations/storage/nextcloud/cancel', { flowId: 'flow-1' });
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { cancelled: true } });
+  await f.call('POST', '/api/integrations/storage/nextcloud/poll', { flowId: 'flow-1' });
+  assert.equal(f.sent.pop().body.code, 'nextcloudFlowExpired');
+
+  const race = nextcloud();
+  await race.call('POST', '/api/integrations/storage/nextcloud/start', { baseUrl: 'https://cloud.example' });
+  race.state.poll = () => {
+    // The person presses Cancel while Nextcloud is handing the password over.
+    const reply = granted('ada')();
+    return { ...reply, json: async () => { await race.call('POST', '/api/integrations/storage/nextcloud/cancel', { flowId: 'flow-1' }); race.sent.pop(); return reply.json(); } };
+  };
+  await race.call('POST', '/api/integrations/storage/nextcloud/poll', { flowId: 'flow-1' });
+  const reply = race.sent.pop();
+  assert.equal(reply.status, 409);
+  assert.equal(reply.body.code, 'nextcloudFlowCancelled');
+  assert.equal(race.saved.length, 0);
+  assert.equal(revocations(race).length, 1);
 });

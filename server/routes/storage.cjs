@@ -23,8 +23,57 @@ const STORAGE_UNVERIFIED = 'Saved, but the storage server could not be reached t
 const STORAGE_REDIRECTED = 'Saved, but the server redirected the login check. Check the URL (https, trailing slash).';
 // #773: the server answered, just not with a usable reply, so it was reached.
 const storageUncheckedMessage = (status) => `Saved, but the login could not be checked (the storage server answered ${status}).`;
+// #1427: the server answered quickly enough before; a timeout is worth its own words, because a
+// Nextcloud that has seen repeated failed logins from this address delays every login attempt.
+const STORAGE_TIMED_OUT = 'Saved, but the storage server could not be reached within 10 seconds to check the login. Nextcloud slows logins down after repeated failures; press Test again in a few minutes.';
+// #1427: 429 is Nextcloud's brute-force protection, not a wrong password and not an outage.
+const STORAGE_THROTTLED = 'Saved, but the storage server is throttling logins from noevia after too many failed attempts, so the login was not checked. Wait, then press Test.';
 // Kinds that authenticate with a WebDAV username and app password (#770).
 const DAV_KINDS = new Set(['nextcloud', 'webdav']);
+// #1427: the name Nextcloud gives the app password (it shows "grant <name> access" and lists the
+// device under Security). Without it the token was called "node".
+const NEXTCLOUD_CLIENT_NAME = 'Noevia';
+const NEXTCLOUD_TIMEOUT_MS = 10000;
+
+/** #1427: the address a person opens Nextcloud with, from whatever they pasted: the browser URL of
+ *  the Files app, a WebDAV URL from a saved connection, or the bare server. Only the scheme, host,
+ *  port and any sub-path Nextcloud is installed under are kept. Returns '' for a non-URL. */
+function nextcloudServerRoot(raw) {
+  let url;
+  try { url = new URL(String(raw || '').trim()); } catch { return ''; }
+  if (url.username || url.password) return '';
+  const path = url.pathname.replace(/\/(?:remote\.php|index\.php|apps|ocs|login|status\.php)(?:\/.*)?$/i, '').replace(/\/+$/, '');
+  return `${url.protocol}//${url.host}${path}`;
+}
+
+/** #1427: a Nextcloud error the browser can word: what happened, in a stable `code`. */
+function nextcloudFailure(err, host) {
+  const timeout = err && (err.name === 'TimeoutError' || err.name === 'AbortError');
+  if (timeout) return { status: 504, body: { error: `Nextcloud at ${host} did not answer within 10 seconds.`, code: 'nextcloudUnreachable', reason: 'timeout' } };
+  if (err && err.name === 'TypeError' && /redirect/i.test(String(err.cause?.message || ''))) {
+    return { status: 502, body: { error: `Nextcloud at ${host} redirected the request. Use the exact https:// address you open Nextcloud with.`, code: 'nextcloudUnreachable', reason: 'redirect' } };
+  }
+  return { status: 502, body: { error: `Could not reach Nextcloud at ${host}.`, code: 'nextcloudUnreachable', reason: 'network' } };
+}
+
+function nextcloudStatusFailure(status, host, headers) {
+  if (status === 429) {
+    const wait = Number(headers?.get?.('retry-after'));
+    const retryAfter = Number.isFinite(wait) && wait > 0 ? Math.min(Math.ceil(wait), 86400) : undefined;
+    return { status: 429, body: { error: `Nextcloud at ${host} is throttling sign-ins from noevia after too many failed attempts. Wait a few minutes and try again.`, code: 'nextcloudThrottled', ...(retryAfter ? { retryAfter } : {}) } };
+  }
+  if (status === 404) return { status: 502, body: { error: `No Nextcloud sign-in was found at ${host} (404). Check the address.`, code: 'nextcloudNotFound', status } };
+  return { status: 502, body: { error: `Nextcloud returned ${status}`, code: 'nextcloudError', status } };
+}
+
+const hostOf = (url) => { try { return new URL(url).host; } catch { return 'that address'; } };
+const originOf = (url) => { try { return new URL(url).origin; } catch { return ''; } };
+const isHttps = (url) => { try { return new URL(url).protocol === 'https:'; } catch { return false; } };
+const NEXTCLOUD_HTTPS_REQUIRED = 'Enter the https:// address you open Nextcloud with, for example https://cloud.example.com.';
+// #1432: Nextcloud builds the poll endpoint and the returned server address from its own settings.
+// When they name another origin than the one sign-in started at, the usual cause is a stale
+// overwritehost / overwrite.cli.url, and noevia will not send the token or app password there.
+const nextcloudOriginMismatch = (expected, got) => ({ error: `Nextcloud answered with the address ${hostOf(got)}, not ${hostOf(expected)} where sign-in started. Check Nextcloud's overwritehost and overwrite.cli.url settings, or sign in at the address Nextcloud reports.`, code: 'nextcloudOriginMismatch' });
 
 const PASS = Symbol('unhandled');
 
@@ -120,7 +169,10 @@ function createStorageRoutes({ json, readJson: readAnyJson, authService, storage
       if (DAV_KINDS.has(body.kind)) {
         const check = await checkLogin({ baseUrl: body.baseUrl, username: body.username, secret: body.secret }, { fetchImpl: (...a) => fetch(...a) });
         if (check.rejected) return json(res, 400, { error: STORAGE_LOGIN_REJECTED, code: 'storageLoginRejected', status: check.status });
-        if (!check.ok) warning = check.unverified === 'redirect' ? { warning: STORAGE_REDIRECTED, warningCode: 'storageUnverified', reason: 'redirect' } : check.status ? { warning: storageUncheckedMessage(check.status), warningCode: 'storageUnverified', status: check.status } : { warning: STORAGE_UNVERIFIED, warningCode: 'storageUnverified' };
+        if (!check.ok) warning = check.throttled ? { warning: STORAGE_THROTTLED, warningCode: 'storageThrottled', status: 429, ...(check.retryAfter ? { retryAfter: check.retryAfter } : {}) }
+          : check.unverified === 'redirect' ? { warning: STORAGE_REDIRECTED, warningCode: 'storageUnverified', reason: 'redirect' }
+          : check.unverified === 'timeout' ? { warning: STORAGE_TIMED_OUT, warningCode: 'storageUnverified', reason: 'timeout' }
+          : check.status ? { warning: storageUncheckedMessage(check.status), warningCode: 'storageUnverified', status: check.status } : { warning: STORAGE_UNVERIFIED, warningCode: 'storageUnverified' };
       }
       const saved = authService.saveStorage(authn.user.id, body);
       return json(res, 200, warning ? { ...saved, ...warning } : saved);
@@ -172,36 +224,105 @@ function createStorageRoutes({ json, readJson: readAnyJson, authService, storage
       } catch (e) { return json(res, 502, { error: e.message }); }
     }
     if (p === '/api/integrations/storage/nextcloud/start' && req.method === 'POST') {
-      const baseUrl = String((await readJson(req)).baseUrl || '').replace(/\/+$/, '');
-      if (!/^https:\/\//.test(baseUrl)) return json(res, 400, { error: 'HTTPS Nextcloud URL required' });
+      // #1427: the field may hold a saved WebDAV URL or the Files app URL; sign-in needs the root.
+      const baseUrl = nextcloudServerRoot((await readJson(req)).baseUrl);
+      if (!/^https:\/\//.test(baseUrl)) return json(res, 400, { error: NEXTCLOUD_HTTPS_REQUIRED, code: 'nextcloudHttpsRequired' });
       if (!(await storageEndpointAllowed(authn, baseUrl))) return json(res, 400, { error: STORAGE_PRIVATE_URL_ERROR });
+      const host = hostOf(baseUrl);
+      let response;
       try {
-        const response = await fetch(`${baseUrl}/index.php/login/v2`, { method: 'POST', signal: AbortSignal.timeout(10000), redirect: 'error' });
-        if (!response.ok) return json(res, 502, { error: `Nextcloud returned ${response.status}` });
-        const payload = await readCappedJson(response, NEXTCLOUD_REPLY_CAP); const flowId = crypto.randomUUID();
-        for (const [id, flow] of nextcloudFlows) if (flow.expires < Date.now() || flow.userId === authn.user.id) nextcloudFlows.delete(id);
-        if (nextcloudFlows.size >= 100) return json(res, 429, { error: 'Too many pending connections' });
-        if (!endpointApproved(authn, payload.poll?.endpoint) || new URL(payload.login).protocol !== 'https:') return json(res, 400, { error: 'Invalid connection URLs' });
-        nextcloudFlows.set(flowId, { userId: authn.user.id, endpoint: payload.poll.endpoint, token: payload.poll.token, expires: Date.now() + 10 * 60 * 1000 });
-        return json(res, 200, { flowId, loginUrl: payload.login, expiresAt: Date.now() + 10 * 60 * 1000 });
-      } catch (e) { return json(res, 502, { error: e.message }); }
+        response = await fetch(`${baseUrl}/index.php/login/v2`, { method: 'POST', headers: { 'User-Agent': NEXTCLOUD_CLIENT_NAME }, signal: AbortSignal.timeout(NEXTCLOUD_TIMEOUT_MS), redirect: 'error' });
+      } catch (e) { const f = nextcloudFailure(e, host); return json(res, f.status, f.body); }
+      if (!response.ok) { const f = nextcloudStatusFailure(response.status, host, response.headers); return json(res, f.status, f.body); }
+      let payload;
+      try { payload = await readCappedJson(response, NEXTCLOUD_REPLY_CAP); }
+      catch { return json(res, 502, { error: `${host} answered, but not like a Nextcloud server. Check the address.`, code: 'nextcloudNotFound' }); }
+      const flowId = crypto.randomUUID();
+      for (const [id, flow] of nextcloudFlows) if (flow.expires < Date.now() || flow.userId === authn.user.id) nextcloudFlows.delete(id);
+      if (nextcloudFlows.size >= 100) return json(res, 429, { error: 'Too many pending connections' });
+      let loginHttps = false;
+      try { loginHttps = new URL(payload?.login).protocol === 'https:'; } catch { /* fails closed */ }
+      if (typeof payload?.poll?.endpoint !== 'string' || !loginHttps) return json(res, 400, { error: 'Invalid connection URLs' });
+      // #1432: the poll token only ever goes over https, to the origin sign-in started at.
+      if (!isHttps(payload.poll.endpoint)) return json(res, 400, { error: NEXTCLOUD_HTTPS_REQUIRED, code: 'nextcloudHttpsRequired' });
+      const origin = originOf(baseUrl);
+      if (originOf(payload.poll.endpoint) !== origin) return json(res, 400, nextcloudOriginMismatch(baseUrl, payload.poll.endpoint));
+      if (!endpointApproved(authn, payload.poll.endpoint)) return json(res, 400, { error: 'Invalid connection URLs' });
+      nextcloudFlows.set(flowId, { userId: authn.user.id, endpoint: payload.poll.endpoint, token: payload.poll.token, origin, expires: Date.now() + 10 * 60 * 1000 });
+      return json(res, 200, { flowId, loginUrl: payload.login, expiresAt: Date.now() + 10 * 60 * 1000 });
+    }
+    // #1433: Cancel in Settings ends the flow here too, so a poll already on its way cannot save
+    // afterwards (it finds the flow gone and revokes the app password instead).
+    if (p === '/api/integrations/storage/nextcloud/cancel' && req.method === 'POST') {
+      const flowId = String((await readJson(req)).flowId || '');
+      const flow = nextcloudFlows.get(flowId);
+      const cancelled = !!flow && flow.userId === authn.user.id;
+      if (cancelled) nextcloudFlows.delete(flowId);
+      return json(res, 200, { cancelled });
     }
     if (p === '/api/integrations/storage/nextcloud/poll' && req.method === 'POST') {
       const body = await readJson(req); const flow = nextcloudFlows.get(String(body.flowId || ''));
-      if (!flow || flow.userId !== authn.user.id || flow.expires < Date.now()) return json(res, 400, { error: 'login flow expired' });
+      if (!flow || flow.userId !== authn.user.id || flow.expires < Date.now()) return json(res, 400, { error: 'login flow expired', code: 'nextcloudFlowExpired' });
       // The poll endpoint comes from the remote server's own response, so a
       // malicious Nextcloud could redirect it inward — guard it too.
       if (!(await storageEndpointAllowed(authn, flow.endpoint))) return json(res, 400, { error: STORAGE_PRIVATE_URL_ERROR });
-      const response = await fetch(flow.endpoint, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ token: flow.token }), signal: AbortSignal.timeout(10000), redirect: 'error' });
+      const host = hostOf(flow.endpoint);
+      let response;
+      try {
+        response = await fetch(flow.endpoint, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': NEXTCLOUD_CLIENT_NAME }, body: new URLSearchParams({ token: flow.token }), signal: AbortSignal.timeout(NEXTCLOUD_TIMEOUT_MS), redirect: 'error' });
+      } catch (e) { const f = nextcloudFailure(e, host); return json(res, f.status, f.body); }
       if (response.status === 404) return json(res, 202, { pending: true });
-      if (!response.ok) return json(res, 502, { error: `Nextcloud returned ${response.status}` });
+      if (!response.ok) { const f = nextcloudStatusFailure(response.status, host, response.headers); return json(res, f.status, f.body); }
       let credentials;
       try { credentials = await readCappedJson(response, NEXTCLOUD_REPLY_CAP); }
       catch (e) { return json(res, 502, { error: e.code === 'too_large' ? 'Nextcloud reply too large' : 'Nextcloud returned an unreadable reply' }); }
+      // Nextcloud hands the app password out once; the flow is spent whatever happens next.
+      // #1433: a flow that is no longer the one stored was cancelled (or replaced) while this
+      // poll was in flight; its app password is revoked below instead of saved.
+      const stillWanted = nextcloudFlows.get(String(body.flowId)) === flow;
       nextcloudFlows.delete(String(body.flowId));
-      const baseUrl = `${String(credentials.server).replace(/\/+$/, '')}/remote.php/dav/files/${encodeURIComponent(credentials.loginName)}`;
-      if (!endpointApproved(authn, baseUrl)) return json(res, 403, { error: STORAGE_PRIVATE_URL_ERROR });
-      return json(res, 200, authService.saveStorage(authn.user.id, { kind: 'nextcloud', baseUrl, username: credentials.loginName, secret: credentials.appPassword, corpusRoot: body.corpusRoot || 'Cowork/Diary' }));
+      const server = nextcloudServerRoot(credentials?.server);
+      const loginName = String(credentials?.loginName || '');
+      const appPassword = String(credentials?.appPassword || '');
+      if (!server || !loginName || !appPassword) return json(res, 502, { error: 'Nextcloud returned an unreadable reply' });
+      // #1432: the app password only ever goes over https, to the origin sign-in started at.
+      if (!isHttps(server)) return json(res, 502, { error: NEXTCLOUD_HTTPS_REQUIRED, code: 'nextcloudHttpsRequired' });
+      if (originOf(server) !== flow.origin) return json(res, 502, nextcloudOriginMismatch(flow.origin, server));
+      if (!endpointApproved(authn, server)) return json(res, 403, { error: STORAGE_PRIVATE_URL_ERROR });
+      const auth = { Authorization: `Basic ${Buffer.from(`${loginName}:${appPassword}`).toString('base64')}` };
+      // #1433: from here on the server is trusted (https, same origin, approved), so every exit that
+      // does not save the app password asks Nextcloud to delete it. Best effort: a failure to
+      // revoke never changes the answer, and the credential is never logged.
+      const revoke = async () => {
+        try {
+          const r = await fetch(`${server}/ocs/v2.php/core/apppassword`, { method: 'DELETE', headers: { ...auth, 'OCS-APIRequest': 'true', 'User-Agent': NEXTCLOUD_CLIENT_NAME }, signal: AbortSignal.timeout(NEXTCLOUD_TIMEOUT_MS), redirect: 'error' });
+          try { await r.body?.cancel?.(); } catch { /* not needed */ }
+        } catch { /* best effort */ }
+      };
+      const fail = async (status, payload) => { await revoke(); return json(res, status, payload); };
+      if (!stillWanted) return fail(409, { error: 'Sign-in was cancelled. Nothing was changed.', code: 'nextcloudFlowCancelled' });
+      // #1427: the WebDAV home is /files/<user id>, and the login name (what was typed on the
+      // sign-in page: often the e-mail) is not the user id. Ask Nextcloud who this app password is.
+      let userId = '';
+      try {
+        const who = await fetch(`${server}/ocs/v2.php/cloud/user?format=json`, { headers: { ...auth, 'OCS-APIRequest': 'true', Accept: 'application/json', 'User-Agent': NEXTCLOUD_CLIENT_NAME }, signal: AbortSignal.timeout(NEXTCLOUD_TIMEOUT_MS), redirect: 'error' });
+        if (who.status === 401) return fail(502, { error: 'Nextcloud issued an app password and then refused it. Sign in again.', code: 'storageLoginRejected' });
+        if (who.status === 429) { const f = nextcloudStatusFailure(429, host, who.headers); return fail(f.status, f.body); }
+        if (who.ok) userId = String((await readCappedJson(who, NEXTCLOUD_REPLY_CAP))?.ocs?.data?.id || '');
+      } catch { /* fall back to the login name below; the DAV check decides */ }
+      const baseUrl = `${server}/remote.php/dav/files/${encodeURIComponent(userId || loginName)}`;
+      if (!endpointApproved(authn, baseUrl)) return fail(403, { error: STORAGE_PRIVATE_URL_ERROR });
+      // Keep the folder the person already uses; a fresh setup gets the default.
+      let corpusRoot = typeof body.corpusRoot === 'string' ? body.corpusRoot.trim() : '';
+      if (!corpusRoot) { try { corpusRoot = String(authService.getStorage(authn.user.id)?.corpusRoot || ''); } catch { /* none saved */ } }
+      const connection = { kind: 'nextcloud', baseUrl, username: loginName, secret: appPassword, corpusRoot: corpusRoot || 'Cowork/Diary' };
+      // Same check as a manual save (#770): a refused login never replaces the working row.
+      const check = await checkLogin(connection, { fetchImpl: (...a) => fetch(...a) });
+      if (check.rejected) return fail(502, { error: 'Nextcloud refused the new app password for WebDAV. Sign in again.', code: 'storageLoginRejected', status: check.status });
+      if (check.throttled) { const f = nextcloudStatusFailure(429, host, { get: () => check.retryAfter }); return fail(f.status, f.body); }
+      const saved = authService.saveStorage(authn.user.id, connection);
+      if (check.ok) return json(res, 200, saved);
+      return json(res, 200, { ...saved, warningCode: 'storageUnverified', ...(check.status ? { status: check.status, warning: storageUncheckedMessage(check.status) } : { reason: check.unverified, warning: check.unverified === 'timeout' ? STORAGE_TIMED_OUT : STORAGE_UNVERIFIED }) });
     }
     return PASS;
   }
@@ -211,4 +332,4 @@ function createStorageRoutes({ json, readJson: readAnyJson, authService, storage
   };
 }
 
-module.exports = { createStorageRoutes, STORAGE_PRIVATE_URL_ERROR };
+module.exports = { createStorageRoutes, STORAGE_PRIVATE_URL_ERROR, nextcloudServerRoot };
