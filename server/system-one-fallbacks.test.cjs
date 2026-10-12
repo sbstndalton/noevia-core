@@ -43,9 +43,12 @@ function fakeLaya(pick, seen = []) {
   };
 }
 
+// A port of its own per service object: the requests of one service share a lane (decision-endpoint.cjs, #1591),
+// and a fetch that never answers holds it, which must not carry over into the next case.
+let nextPort = 8040;
 function configured(fetchImpl, kinds) {
   const settings = createDecisionSettings({ store: store(), env: {}, fetchImpl, ...(kinds ? { kinds } : {}) });
-  settings.save({ url: 'http://laya:8040', timeoutMs: 1500 }, 'admin');
+  settings.save({ url: `http://laya:${nextPort++}`, timeoutMs: 1500 }, 'admin');
   return settings;
 }
 

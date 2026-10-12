@@ -20,8 +20,12 @@ const abandoned=()=>failure('aborted','Decision endpoint unreachable');
 // the lane. Once sent, the place is kept until Laya answers, because Laya keeps working on a request
 // whose client has gone; the hold is capped, so a service that never answers cannot hold the lane.
 const SLOT_HOLD_MAX_MS = 5000;
-// One lane per endpoint (decision-settings keeps one endpoint per configuration, so every caller of
-// the service shares it). A lane is a plain object: { busy, urgent: [], normal: [] }.
+// One lane per service URL, shared by every endpoint object made for it (#1591): decision-settings keeps
+// one endpoint per configuration for chat, but the auto-tune load advisor makes its own, and an endpoint
+// with its own lane could send Laya a second request while the first was running (the http-503 above).
+// A lane is a plain object: { busy, urgent: [], normal: [] }.
+const lanes=new Map();
+const laneFor=(baseUrl)=>{ let lane=lanes.get(baseUrl); if(!lane){ lane={busy:false,urgent:[],normal:[]}; lanes.set(baseUrl,lane); } return lane; };
 function startNext(lane){ if(!lane.busy){ const next=lane.urgent.shift()||lane.normal.shift(); if(next) next(); } }
 /** Resolves to a release function once it is this request's turn; rejects if the caller gives up first. */
 function takeTurn(lane,{signal,urgent}){
@@ -77,7 +81,7 @@ async function exchange(fetchImpl,url,body,signal){
 function createDecisionEndpoint({ env=process.env, fetchImpl=globalThis.fetch, holdMaxMs=SLOT_HOLD_MAX_MS }={}) {
   const config=configuration(env);
   if (config.reason) return null;
-  const lane={busy:false,urgent:[],normal:[]};
+  const lane=laneFor(config.baseUrl);
   return {
     async decide(input,{signal}={}) {
       const state=JSON.stringify({goal:input.goal.slice(0,300),outputs:input.outputs.slice(-3).map(o=>({role:o.role,content:o.content.slice(-150)}))});

@@ -48,7 +48,15 @@ function defaultEndpoint(env) {
 function createLoadAdvisor({ env = process.env, endpoint = undefined, verdict = request => require('./dav-parse-wasm.cjs').loadVerdict(request),
   budgetMs = ADVICE_BUDGET_MS, log = (...a) => console.warn('[autotune]', ...a) } = {}) {
   let open = false;
-  const service = () => (endpoint === undefined ? defaultEndpoint(env) : endpoint);
+  // One endpoint for the advisor's life (rebuilt only if the configured URL changes); its lane is the
+  // service's shared one either way (decision-endpoint.cjs), so a question here queues behind chat's (#1591).
+  let made = null, madeFor = null;
+  const service = () => {
+    if (endpoint !== undefined) return endpoint;
+    const url = env.COWORK_DECISION_URL ?? null;
+    if (!made || madeFor !== url) { made = defaultEndpoint(env); madeFor = url; }
+    return made;
+  };
   // The decision service's label and confidence, or why there is none.
   async function ask(text) {
     const svc = service();

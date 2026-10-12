@@ -171,3 +171,15 @@ test('#1046 with the real module: a crash that says "timed out" stays oom, and a
     .judge({ cause: 'oom', evidence: { text: 'odd' } });
   assert.deepEqual([r.outcome, r.classification.source], ['oom', 'fallback']);
 });
+
+test('#1591 the advisor builds its default endpoint once, not on every question', async () => {
+  const made = [];
+  const decisionEndpoint = require('./decision-endpoint.cjs');
+  const real = decisionEndpoint.createDecisionEndpoint;
+  decisionEndpoint.createDecisionEndpoint = (options) => { made.push(options); return fakeService({ label: 'oom', confidence: 0.9 }); };
+  try {
+    const advisor = createLoadAdvisor({ env: { COWORK_DECISION_URL: 'http://10.0.2.1:8040' }, verdict: fakeVerdict() });
+    for (let i = 0; i < 3; i++) await advisor.judge({ cause: 'load', evidence: { text: 'some unfamiliar engine text', status: 0, exitCode: 1 } });
+    assert.equal(made.length, 1);
+  } finally { decisionEndpoint.createDecisionEndpoint = real; }
+});

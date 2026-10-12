@@ -114,3 +114,17 @@ test('a service that never answers gives up its place after the hold cap (#1437)
   await assert.rejects(second,{reason:'aborted'});
   assert.deepEqual(sent,['first','second']);
 });
+test('every endpoint made for one service URL shares its lane, and another URL has its own (#1591)',{timeout:2000},async()=>{
+  const sent=[],held={};
+  const url='http://10.0.1.7:8040';
+  // The chat's endpoint and the auto-tune advisor's own are different objects for the same Laya.
+  const chat=createDecisionEndpoint({env:{COWORK_DECISION_URL:url},fetchImpl:heldLaya(sent,held)});
+  const advisor=createDecisionEndpoint({env:{COWORK_DECISION_URL:url},fetchImpl:heldLaya(sent,held)});
+  const elsewhere=createDecisionEndpoint({env:{COWORK_DECISION_URL:'http://10.0.1.8:8040'},fetchImpl:heldLaya(sent,held)});
+  const first=chat.choice({state:'chat',question:'q',options:two});
+  const second=advisor.choice({state:'advisor',question:'q',options:two});
+  const other=elsewhere.choice({state:'other',question:'q',options:two});
+  await tick(); assert.deepEqual(sent,['chat','other'], 'the advisor waits for chat; another service is not held up');
+  held.chat(); await first; await tick(); assert.deepEqual(sent,['chat','other','advisor']);
+  held.advisor(); held.other(); await second; await other;
+});
