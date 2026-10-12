@@ -5,7 +5,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
-const { createModelRoutes } = require('./models.cjs');
+const { createModelRoutes, routingDefaultRustOwned } = require('./models.cjs');
 const { createModelService } = require('../models.cjs');
 
 // A workspace-shaped test double (autoRoles + saveAutoRoles), for tests that pass
@@ -455,6 +455,32 @@ test('the default model mode round-trips, and only an explicit apply switches ex
   assert.equal(saves, 1);
   await f.call('PUT', '/api/routing-default', { routing: 'fast' });
   assert.equal(f.sent.pop().status, 400);
+});
+
+test('#1305: a confirmed Rust front owns GET /api/routing-default, so Node refuses it before reading the workspace; PUT stays Node\'s', async () => {
+  let reads = 0;
+  // Reading `preferences` is what a workspace-backed answer does; counting it shows whether the refused GET touched the workspace.
+  const workspace = { userId: 'u1', projects: [], get preferences() { reads += 1; return { defaultRouting: 'manual' }; }, set preferences(v) { this.stored = v; }, savePreferences() {}, saveProjects() {} };
+  const owned = { NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_AUTH_CONFIRMED: '1', NOEVIA_RUST_ROUTING_DEFAULT: '1', NOEVIA_RUST_ROUTING_DEFAULT_CONFIRMED: '1' };
+  const confirmed = fixture({ env: owned, workspace });
+  await confirmed.call('GET', '/api/routing-default');
+  assert.deepEqual(confirmed.sent.pop(), { status: 503, body: { error: 'Routing default is owned by the Rust front.' } });
+  assert.equal(reads, 0, 'the refused GET never reads the workspace');
+  await confirmed.call('PUT', '/api/routing-default', { routing: 'auto' });
+  assert.equal(confirmed.sent.pop().status, 200, 'PUT keeps answering in Node');
+  for (const env of [
+    { ...owned, NOEVIA_RUST_ROUTING_DEFAULT_CONFIRMED: '0' },
+    { ...owned, NOEVIA_RUST_ROUTING_DEFAULT: '0' },
+    { ...owned, NOEVIA_RUST_AUTH_CONFIRMED: undefined },
+    { ...owned, NOEVIA_FRONT: 'node' },
+    { ...owned, NOEVIA_RUST_ROUTING_DEFAULT_CONFIRMED: 'true' },
+  ]) {
+    const f = fixture({ env, workspace });
+    await f.call('GET', '/api/routing-default');
+    assert.deepEqual(f.sent.pop(), { status: 200, body: { routing: 'manual' } });
+  }
+  assert.equal(routingDefaultRustOwned(owned), true);
+  assert.equal(routingDefaultRustOwned({}), false);
 });
 
 test('deleting a loaded model unloads first, clears its auto-role and the last-loaded default, and reports what changed', async () => {
