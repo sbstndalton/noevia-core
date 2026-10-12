@@ -1278,6 +1278,9 @@ function createChatHandler({
       }
       context.logRound({dir:chatWorkspace.dir,chatId:contextId,model,limit,round,compacted:!!continuationCompactedAt||!!prepared.meter.compactedAt&&prepared.meter.compactedAt>=requestStartedAt,messages:roundMessages,tools:activeTools,assertActive:assertWorkspaceActive});
       const snapshot=context.read(chatWorkspace.dir,contextId);snapshot.meter={...roundBudget,historyCount:prepared.meter.historyCount,compactedAt:continuationCompactedAt||prepared.meter.compactedAt,covered:continuationCompactedAt?continuationCovered:prepared.meter.covered};context.save(chatWorkspace.dir,contextId,snapshot,assertWorkspaceActive);
+      // #1551: the meter counts this round's tool output, so it goes out after each tool round (and at the first
+      // round only if the messages changed since prepare). A compaction in this round already sent its own.
+      if(!roundCompacted&&(round>0||roundMessages!==prepared.messages))send({type:'context',...snapshot.meter});
       if (taint) { try { taint.ingestMessages(roundMessages); } catch { taintBroken = true; } }
       let upstream;
       roundStartedAt = Date.now();
@@ -1327,6 +1330,7 @@ function createChatHandler({
       }
 
       const toolCalls = new Map(); // index -> {id, name, args}
+      let roundWrote = false; // #1456: a write tool was about to run this round (its escalation is always honoured)
       let sawAnything = false;
       roundReasoning = '';
       roundHasContent = false;
@@ -1632,6 +1636,8 @@ function createChatHandler({
               }
             }
             markWriteAttempt();
+            // Set before the call, so a write that throws still counts as a round that wrote (#1456).
+            if (isWriteTool(tc.name)) roundWrote = true;
             const options = { chatKey, exchangeKey, routes: toolRoutes, ...(editTarget !== null ? { editTarget: editTargets.targetDigest(editTarget, editAccount) } : {}) };
             result = await executeToolCall(project, tc.name, tc.args, allowedToolNames, chatSignal.signal, outcome, options);
             ran = true;
@@ -1690,7 +1696,7 @@ function createChatHandler({
       if (skillRevocation) break; // revoked during this round's tools: no supervisor call, one error
       const supervised = await require('./step-supervision.cjs').superviseNextStep(
         spaceId?.startsWith('diary') ? null : stepSupervision,
-        { round, messages: roundMessages, signal: chatSignal.signal, goal: message });
+        { round, messages: roundMessages, signal: chatSignal.signal, goal: message, wrote: roundWrote });
       roundMessages = supervised.messages;
       if (supervised.pause) {
         // #658: the tool round before this checkpoint finished, and its writes are real. A pause
