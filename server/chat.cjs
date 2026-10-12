@@ -1254,6 +1254,9 @@ function createChatHandler({
       }
       context.logRound({dir:chatWorkspace.dir,chatId:contextId,model,limit,round,compacted:!!continuationCompactedAt||!!prepared.meter.compactedAt&&prepared.meter.compactedAt>=requestStartedAt,messages:roundMessages,tools:activeTools,assertActive:assertWorkspaceActive});
       const snapshot=context.read(chatWorkspace.dir,contextId);snapshot.meter={...roundBudget,historyCount:prepared.meter.historyCount,compactedAt:continuationCompactedAt||prepared.meter.compactedAt,covered:continuationCompactedAt?continuationCovered:prepared.meter.covered};context.save(chatWorkspace.dir,contextId,snapshot,assertWorkspaceActive);
+      // #1551: the meter counts this round's tool output, so it goes out after each tool round (and at the first
+      // round only if the messages changed since prepare). A compaction in this round already sent its own.
+      if(!roundCompacted&&(round>0||roundMessages!==prepared.messages))send({type:'context',...snapshot.meter});
       if (taint) { try { taint.ingestMessages(roundMessages); } catch { taintBroken = true; } }
       let upstream;
       roundStartedAt = Date.now();

@@ -106,14 +106,42 @@ function validToolGroups(messages) {
  }
  return expected.length===0;
 }
+// #1551: a tool result shortened to its head and tail, with a marker, when the turn cannot fit otherwise.
+// The untrusted frame (<untrusted ...> ... </untrusted>) stays on both ends, so it still wraps what is kept.
+const TOOL_RESULT_FLOOR=600;
+const UNTRUSTED_FRAME=/^(<untrusted\b[^\n]*\n)([\s\S]*)(\n<\/untrusted>)$/;
+const isHighSurrogate=code=>code>=0xd800&&code<=0xdbff, isLowSurrogate=code=>code>=0xdc00&&code<=0xdfff;
+function keepHeadAndTail(text,keep) {
+ const frame=UNTRUSTED_FRAME.exec(text);
+ const open=frame?frame[1]:'',close=frame?frame[3]:'',body=frame?frame[2]:text;
+ if(body.length<=keep) return text;
+ // 70% head, 30% tail; a cut never splits a surrogate pair.
+ let head=Math.ceil(keep*.7);if(isHighSurrogate(body.charCodeAt(head-1)))head--;
+ let from=body.length-(keep-head);if(isLowSurrogate(body.charCodeAt(from)))from++;
+ return `${open}${body.slice(0,head)}\n[truncated ${from-head} chars]\n${body.slice(from)}${close}`;
+}
+// Shrinks the largest tool results of a protected turn, to one common length, until the turn fits
+// `room` tokens beside the system messages. Null when even the floor does not fit. The input is never changed.
+function shrinkToolResults({system,tail,tools,limit,limitSource,model,room}) {
+ const fits=messages=>{const m=measure([...system,...messages],tools,limit,limitSource,model);return m.used+room<=m.threshold;};
+ const isToolText=m=>m?.role==='tool'&&typeof m.content==='string';
+ if(fits(tail)) return {tail,truncated:0};
+ const capAt=keep=>tail.map(m=>isToolText(m)&&m.content.length>keep?{...m,content:keepHeadAndTail(m.content,keep)}:m);
+ let low=TOOL_RESULT_FLOOR, high=Math.max(0,...tail.filter(isToolText).map(m=>m.content.length));
+ if(!fits(capAt(low))) return null;
+ while(low<high){const mid=Math.ceil((low+high)/2);if(fits(capAt(mid)))low=mid;else high=mid-1;}
+ const shrunk=capAt(low);
+ return {tail:shrunk,truncated:shrunk.filter((m,i)=>m!==tail[i]).length};
+}
 // Rebuild the model-facing projection between tool rounds. This is intentionally
 // transient: the authoritative transcript and the persisted cross-turn summary do
 // not contain an exchange until the turn has completed. The current user message
-// and every tool call/result after it stay byte-identical and tool groups remain
-// atomic; only older context may become a continuation summary.
+// and every tool call stay byte-identical and tool groups remain atomic. Only older
+// context may become a continuation summary; when nothing older can go, the newest
+// tool results are shortened instead (#1551, marked in place, frame kept).
 async function compactContinuation({messages,tools,limit,limitSource,model,summarize,onStatus=()=>{}}) {
  const before=measure(messages,tools,limit,limitSource,model);
- if(before.used<=before.threshold) return {messages,meter:before,compacted:false,covered:0};
+ if(before.used<=before.threshold) return {messages,meter:before,compacted:false,covered:0,truncated:0};
  let systemCount=0;while(messages[systemCount]?.role==='system')systemCount++;
  const system=messages.slice(0,systemCount),original=messages.slice(systemCount);
  if(messages.slice(systemCount).some(message=>message?.role==='system') || !validToolGroups(original)) {
@@ -122,13 +150,22 @@ async function compactContinuation({messages,tools,limit,limitSource,model,summa
  let protectedStart=-1;
  for(let i=original.length-1;i>=0;i--)if(original[i]?.role==='user'){protectedStart=i;break;}
  const compactable=protectedStart>0?original.slice(0,protectedStart):[];
- const protectedTail=protectedStart>=0?original.slice(protectedStart):original;
- if(!compactable.length) throw Error('Tool results filled the available context. Reduce the result size or choose a model with more context. No messages were deleted.');
+ const tailBefore=protectedStart>=0?original.slice(protectedStart):original;
  const summaryAllowance=Math.min(1800,Math.floor(limit*.2));
- const protectedMeter=measure([...system,...protectedTail],tools,limit,limitSource,model);
- if(protectedMeter.used+summaryAllowance>protectedMeter.threshold) {
+ // The current turn and its tool results must fit, with room for a summary only when there is something
+ // older to summarise. Oversized tool results are shortened before the turn is refused (#1551).
+ const shrunk=shrinkToolResults({system,tail:tailBefore,tools,limit,limitSource,model,room:compactable.length?summaryAllowance:0});
+ if(!shrunk) {
+  if(!compactable.length) throw Error('Tool results filled the available context. Reduce the result size or choose a model with more context. No messages were deleted.');
+  const protectedMeter=measure([...system,...tailBefore],tools,limit,limitSource,model);
   const biggest=biggestPart([...protectedMeter.parts,{name:'Summary allowance',tokens:summaryAllowance}]);
   throw Error(`Tool-loop context cannot fit because ${biggest.name.toLowerCase()} uses about ${biggest.tokens} tokens. Reduce it or choose a model with more context. No messages were deleted.`);
+ }
+ const protectedTail=shrunk.tail;
+ if(!compactable.length) {
+  // Nothing older to compact: the shortened turn is the whole request. No message was deleted.
+  const next=[...system,...protectedTail];
+  return {messages:next,meter:measure(next,tools,limit,limitSource,model),compacted:false,covered:0,truncated:shrunk.truncated};
  }
  onStatus('Compacting context before the next tool step… Your full transcript stays available.','compactingTools');
  const maxTokens=Math.min(1536,Math.floor(limit*.15));
@@ -147,7 +184,7 @@ async function compactContinuation({messages,tools,limit,limitSource,model,summa
  if(tokens(next)>=tokens(messages)) throw Error('Tool-loop compaction did not reduce the context. No messages were deleted.');
  const meter=measure(next,tools,limit,limitSource,model);
  if(meter.used>meter.threshold) throw Error('Tool-loop context is still too full after compaction. Reduce tool results or choose a model with more context. No messages were deleted.');
- return {messages:next,meter,compacted:true,covered:compactable.length};
+ return {messages:next,meter,compacted:true,covered:compactable.length,truncated:shrunk.truncated};
 }
 async function prepareUnlocked({dir,id,messages,tools,limit,limitSource,model,force=false,summarize,onStatus=()=>{},assertActive}) {
  assertActive?.();

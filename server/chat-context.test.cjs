@@ -120,9 +120,48 @@ test('tool-loop compaction never repairs, drops, or replays an invalid tool grou
  await assert.rejects(ctx.compactContinuation({messages,tools:[],limit:1200,limitSource:'test',model:'q',summarize:async()=>{calls++;return 'summary';}}),/invalid message sequence/);
  assert.equal(calls,0);
 });
-test('tool-loop compaction fails before inference when the protected turn cannot fit',async()=>{
+test('tool-loop compaction fails before inference when the protected turn cannot fit even shortened (#1551)',async()=>{
  let calls=0;
- const messages=[{role:'assistant',content:'older '.repeat(500)},{role:'user',content:'current'},{role:'assistant',content:null,tool_calls:[{id:'c',type:'function',function:{name:'read',arguments:'{}'}}]},{role:'tool',tool_call_id:'c',content:'large '.repeat(1000)}];
+ // The user message alone is too big, so shortening the tool result cannot make the turn fit.
+ const messages=[{role:'assistant',content:'older '.repeat(500)},{role:'user',content:'current '.repeat(1200)},{role:'assistant',content:null,tool_calls:[{id:'c',type:'function',function:{name:'read',arguments:'{}'}}]},{role:'tool',tool_call_id:'c',content:'large '.repeat(1000)}];
  await assert.rejects(ctx.compactContinuation({messages,tools:[],limit:1800,limitSource:'test',model:'q',summarize:async()=>{calls++;return 'summary';}}),/cannot fit/);
  assert.equal(calls,0);
+});
+// #1551: nothing older can be compacted, so the newest tool result is shortened (head and tail kept, marked, frame intact).
+test('tool-loop compaction shortens the newest tool result when nothing older can go (#1551)',async()=>{
+ let calls=0;
+ const body=Array.from({length:4000},(_,i)=>`line ${i} synthetic result`).join('\n');
+ const framed='<untrusted kind="tool result" label="search">\n'+body+'\n</untrusted>';
+ const messages=[{role:'system',content:'Pinned instructions.'},{role:'user',content:'Find the synthetic codeword.'},{role:'assistant',content:null,tool_calls:[{id:'c1',type:'function',function:{name:'search',arguments:'{}'}}]},{role:'tool',tool_call_id:'c1',content:framed}];
+ const out=await ctx.compactContinuation({messages,tools:[],limit:4096,limitSource:'test',model:'q',summarize:async()=>{calls++;return 'summary';}});
+ assert.equal(calls,0);assert.equal(out.compacted,false);assert.equal(out.covered,0);assert.equal(out.truncated,1);
+ assert.ok(out.meter.used<=out.meter.threshold,`${out.meter.used} <= ${out.meter.threshold}`);
+ assert.deepEqual(out.messages.slice(0,3),messages.slice(0,3));
+ const sent=out.messages[3].content;
+ assert.ok(sent.startsWith('<untrusted kind="tool result" label="search">\n'),'opening frame kept');
+ assert.ok(sent.endsWith('\n</untrusted>'),'closing frame kept');
+ const inner=sent.slice('<untrusted kind="tool result" label="search">\n'.length,-'\n</untrusted>'.length);
+ const [head,tail]=inner.split(/\n\[truncated \d+ chars\]\n/);
+ const removed=Number(/\[truncated (\d+) chars\]/.exec(inner)[1]);
+ assert.ok(body.startsWith(head)&&body.endsWith(tail),'head and tail are the start and end of the original');
+ assert.equal(body.length-head.length-tail.length,removed,'the marker counts the characters left out');
+ assert.equal(messages[3].content,framed,'the input messages are not changed');
+});
+// #1551: a turn that cannot fit even with its tool result shortened is still refused, and nothing is deleted.
+test('tool-loop compaction still refuses a turn that cannot fit once shortened (#1551)',async()=>{
+ const messages=[{role:'system',content:'x'},{role:'user',content:'word '.repeat(3000)},{role:'assistant',content:null,tool_calls:[{id:'c',type:'function',function:{name:'read',arguments:'{}'}}]},{role:'tool',tool_call_id:'c',content:'result '.repeat(500)}];
+ await assert.rejects(ctx.compactContinuation({messages,tools:[],limit:2048,limitSource:'test',model:'q',summarize:async()=>'summary'}),/No messages were deleted/);
+});
+// #1551: with older turns present, small tool results stay whole, the largest is shortened, and older turns are still summarised.
+test('tool-loop shortening leaves small results whole and still summarises older turns (#1551)',async()=>{
+ const older=[{role:'user',content:'Old question. '+'x'.repeat(2800)},{role:'assistant',content:'Old answer. '+'y'.repeat(2800)}];
+ const small='<untrusted kind="tool result" label="a">\nsmall\n</untrusted>';
+ const big='<untrusted kind="tool result" label="b">\n'+'big data. '.repeat(3000)+'\n</untrusted>';
+ const messages=[{role:'system',content:'Pinned.'},...older,{role:'user',content:'Use the results.'},{role:'assistant',content:null,tool_calls:[{id:'s',type:'function',function:{name:'a',arguments:'{}'}},{id:'b',type:'function',function:{name:'b',arguments:'{}'}}]},{role:'tool',tool_call_id:'s',content:small},{role:'tool',tool_call_id:'b',content:big}];
+ const summarized=[];
+ const out=await ctx.compactContinuation({messages,tools:[],limit:4000,limitSource:'test',model:'q',summarize:async(_previous,batch)=>{summarized.push(...batch);return 'Earlier exchange.';}});
+ assert.equal(out.compacted,true);assert.deepEqual(summarized,older);
+ assert.equal(out.messages.at(-2).content,small,'the small result is byte-identical');
+ assert.match(out.messages.at(-1).content,/^<untrusted kind="tool result" label="b">\n[\s\S]*\n\[truncated \d+ chars\]\n[\s\S]*\n<\/untrusted>$/);
+ assert.ok(out.truncated===1&&out.meter.used<=out.meter.threshold);
 });

@@ -122,3 +122,21 @@ test('a read-only round pauses on a confident stop verdict and not on a weak one
   assert.equal(stopped.events.find((x) => x.type === 'paused')?.reason, 'supervision');
 });
 
+// #1551: a tool result too big for the context is shrunk (head and tail kept, marked), not an error.
+test('a tool result too big for a small context is shrunk and the reply goes on (#1551)', async (t) => {
+  const r = await run(t, { readOnly: true, passThrough: true, ctxSize: 4096, toolResult: 'synthetic line of text. '.repeat(600) });
+  assert.deepEqual(errors(r), [], JSON.stringify(errors(r)));
+  assert.equal(r.requests.length, 2, 'the model gets its one more round with the shrunk result');
+  const sent = r.requests[1].body.messages.at(-1);
+  assert.equal(sent.role, 'tool');
+  assert.match(sent.content, /^<untrusted kind="tool result"[^\n]*\n[\s\S]*\n\[truncated \d+ chars\]\n[\s\S]*\n<\/untrusted>$/);
+  assert.ok(r.events.some((e) => e.type === 'done'));
+});
+
+// #1551: the meter is sent again after a tool round, so it counts that round's tool output.
+test('the context meter is sent again after a tool round and counts its output (#1551)', async (t) => {
+  const r = await run(t, { readOnly: true, passThrough: true, toolResult: 'synthetic line of text. '.repeat(200) });
+  const meters = r.events.filter((e) => e.type === 'context');
+  assert.equal(meters.length, 2, 'one when the request is prepared, one after the tool round');
+  assert.ok(meters[1].used > meters[0].used + 1000, `${meters[0].used} -> ${meters[1].used}`);
+});
