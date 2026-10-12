@@ -98,6 +98,8 @@ const rustAuth = require('./rust-auth.cjs').createRustAuthGuard({ enabled: requi
 const RUST_PROJECTS = require('./rust-projects.cjs').enabledFrom(process.env);
 // Its chat-list slice only with the supervisor's separate confirmation (rust-project-chats).
 const RUST_PROJECT_CHATS = RUST_PROJECTS && require('./rust-projects.cjs').chatsEnabledFrom(process.env, () => {});
+// And its free-chat slice (rust-free-chats): free-chats.json shared under its own lock, the save refused here.
+const RUST_FREE_CHATS = RUST_PROJECTS && require('./rust-projects.cjs').freeChatsEnabledFrom(process.env, () => {});
 const authService = createAuth({
   rustAuth,
   dataDir: DATA_DIR,
@@ -174,9 +176,10 @@ const DEFAULT_PROVIDER_CAPABILITIES = require('./providers.cjs').engineCapabilit
 // Set once the chat vault mirror exists (below); until then there is nothing to nudge.
 let projectsChangedElsewhere = () => {};
 const workspaceStore = createWorkspaceStore(DATA_DIR, { id: DEFAULT_PROVIDER_ID, label: DEFAULT_PROVIDER_LABEL, baseUrl: INFERENCE_BASE, apiKey: INFERENCE_KEY, shared: true,
-  ...(DEFAULT_PROVIDER_CAPABILITIES ? { capabilities: DEFAULT_PROVIDER_CAPABILITIES } : {}) }, secretStore, { rustProjects: RUST_PROJECTS,
-  // M4: the front saved a project write Node's request would have followed with a mirror nudge
-  // (chat-vault-mirror.cjs mirrorTrigger: any successful write under /api/projects).
+  ...(DEFAULT_PROVIDER_CAPABILITIES ? { capabilities: DEFAULT_PROVIDER_CAPABILITIES } : {}) }, secretStore, { rustProjects: RUST_PROJECTS, rustFreeChats: RUST_FREE_CHATS,
+  // M4: the front saved a project or free-chat write Node's request would have followed with a
+  // mirror nudge (chat-vault-mirror.cjs mirrorTrigger: any successful write under /api/projects or
+  // /api/freechats).
   onProjectsChanged: (userId) => projectsChangedElsewhere(userId) });
 
 // Per-user throttle for LLM-backed routes. Every hit is a full model call
@@ -429,7 +432,7 @@ const projectSweep = require('./project-sweep.cjs').createProjectSweep({ storage
 const projectStore = require('./projects.cjs').createProjectStore({
   fs, path, reasoningEffort, projectAppearance, rag, storageClient, documentSources, authService, currentWorkspace,
   PROJECTS, FREE_CHATS, sanitizeToolboxes: (boxes) => sanitizeToolboxes(boxes), defaultToolboxes: () => DEFAULT_TOOLBOXES,
-  PROJECT_ROOT_FOLDER, createProjectFolder, projectSweep,
+  PROJECT_ROOT_FOLDER, createProjectFolder, projectSweep, onProjectsChanged: (userId) => projectsChangedElsewhere(userId),
 });
 const {
   saveProjects, getProject, sanitizeChats, loadChats, saveChats, deleteChat, saveFreeChats, deleteFreeChat, createProject,
@@ -864,14 +867,8 @@ const { handleChat } = require('./chat.cjs').createChatHandler({
     maxChunks: () => require('./routing-modes.cjs').routerMaxChunks(),
     awaitChoice: awaitRouteChoice,
     log: (entry) => recordDecision('routing', entry),
-    setChatFlags: (projectId, chatId, patch) => {
-      const list = projectId ? getProject(projectId)?.chats : FREE_CHATS;
-      const meta = Array.isArray(list) ? list.find((c) => c && c.id === chatId) : null;
-      if (!meta) return false;
-      Object.assign(meta, patch);
-      if (projectId) saveProjects(PROJECTS); else saveFreeChats(FREE_CHATS);
-      return true;
-    },
+    // projects.cjs: reads the lists again first (sbstndalton/noevia#1426).
+    setChatFlags: (projectId, chatId, patch) => projectStore.setChatFlags(projectId, chatId, patch),
   },
   // #742: linked chats' brains, read from the signed-in user's own workspace and lists only.
   brainContext: { enabled: () => features.enabled('brainContext') && features.enabled('chatFraming'), maxChars: () => framingSettings.get().brainContextChars,
@@ -969,6 +966,7 @@ const approvalRoutes = require('./routes/approvals.cjs').createApprovalRoutes({ 
 const chatListRoutes = require('./routes/chat-lists.cjs').createChatListRoutes({
   json, readBody, currentWorkspace, PROJECTS, FREE_CHATS, diaryExtras, crypto, STORED_HISTORY_BYTES, STORED_HISTORY_CAP,
   chatLists: retentionLists, removeChat: removeRetainedChat, store: projectStore, revokeChatGrant,
+  rustFreeChats: RUST_FREE_CHATS,
 });
 // The reasoning-effort default and per-project resolution (routes/reasoning-settings.cjs).
 const routingModeRoutes = require('./routes/routing-mode.cjs').createRoutingModeRoutes({ json, readBody, enabled: () => features.enabled('routingModes'), currentWorkspace,

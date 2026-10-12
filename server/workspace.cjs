@@ -44,10 +44,12 @@ function sealProviderRow(row, secrets) {
 
 // `rustProjects`: M4 of the full-Rust migration (rust-projects.cjs). While it is on, projects.json
 // is shared with the Rust front: read again when it changed, saved by a merge under a shared lock.
-// `onProjectsChanged(userId)` is called when a request start took in the front's changes: a write
-// Node used to make itself (and follow with its own nudges, such as the chat vault mirror's) was
-// made by the front instead.
-function createWorkspaceStore(rootDir, defaultProvider, secrets, { rustProjects = false, onProjectsChanged = () => {} } = {}) {
+// `rustFreeChats` (the free-chat slice, rust-projects.cjs freeChatsEnabledFrom): free-chats.json is
+// shared the same way, under its own lock.
+// `onProjectsChanged(userId)` is called when a request start took in the front's changes (to
+// projects.json or free-chats.json): a write Node used to make itself (and follow with its own
+// nudges, such as the chat vault mirror's) was made by the front instead.
+function createWorkspaceStore(rootDir, defaultProvider, secrets, { rustProjects = false, rustFreeChats = false, onProjectsChanged = () => {} } = {}) {
   // Per-user workspaces are cached, but shared providers are NEVER baked
   // into the cached object: the shared file is re-read and re-merged on
   // every workspace access. This closes the load-time-merge race where a
@@ -119,13 +121,16 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { rustProjects 
     const cached = cache.get(userId);
     if (cached) {
       cached.providers = mergeProviders(cached.privateProviders);
-      if (cached.projectsFile && cached.projectsFile.refresh(cached.projects)) onProjectsChanged(userId);
+      const projectsChanged = cached.projectsFile ? cached.projectsFile.refresh(cached.projects) : false;
+      const freeChatsChanged = cached.freeChatsFile ? cached.freeChatsFile.refresh(cached) : false;
+      if (projectsChanged || freeChatsChanged) onProjectsChanged(userId);
       return cached;
     }
 
     const dir = userDir(userId); fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     const projectsFile = rustProjects ? require('./rust-projects.cjs').createProjectsFile(path.join(dir, 'projects.json'), { atomicJson }) : null;
     const projects = projectsFile ? projectsFile.load() : readJson(path.join(dir, 'projects.json'), { projects: [] }).projects || [];
+    const freeChatsFile = rustFreeChats ? require('./rust-projects.cjs').createFreeChatsFile(path.join(dir, 'free-chats.json'), { atomicJson }) : null;
     const providerFile = path.join(dir, 'providers.json');
     const savedProviders = readJson(providerFile, { providers: [] }).providers || [];
     let needsEncryption = false;
@@ -143,6 +148,7 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { rustProjects 
     const workspace = {
       userId, dir, projects,
       projectsFile,
+      freeChatsFile,
       revoked: false,
       assertActive() {
         if (this.revoked) throw Object.assign(new Error('account no longer exists'), { status: 410 });
@@ -152,7 +158,7 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { rustProjects 
       // the current shared set.
       privateProviders: uniqueProviders.filter(p => p.id !== defaultProvider.id),
       providers: [],
-      freeChats: readJson(path.join(dir, 'free-chats.json'), []),
+      freeChats: freeChatsFile ? freeChatsFile.load() : readJson(path.join(dir, 'free-chats.json'), []),
       autoRoles: readJson(path.join(dir, 'auto-roles.json'), null),
       // Per-user settings with no better home. defaultRouting: what new projects start as.
       preferences: readJson(path.join(dir, 'preferences.json'), {}) || {},
@@ -221,7 +227,11 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { rustProjects 
         this.providers = mergeProviders(this.privateProviders);
         return true;
       },
-      saveFreeChats() { this.assertActive(); atomicJson(path.join(dir, 'free-chats.json'), this.freeChats); },
+      saveFreeChats() {
+        this.assertActive();
+        if (freeChatsFile) freeChatsFile.save(this);
+        else atomicJson(path.join(dir, 'free-chats.json'), this.freeChats);
+      },
       savePreferences() { this.assertActive(); atomicJson(path.join(dir, 'preferences.json'), this.preferences); },
       saveAutoRoles() { this.assertActive(); atomicJson(path.join(dir, 'auto-roles.json'), this.autoRoles); },
       historyPath(id) { return path.join(dir, `history-${String(id).replace(/[^a-zA-Z0-9_-]/g, '')}.json`); },

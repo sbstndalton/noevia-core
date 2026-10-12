@@ -12,7 +12,7 @@ const path = require('node:path');
 const { Readable } = require('node:stream');
 const { createChatListRoutes } = require('./chat-lists.cjs');
 
-function fixture() {
+function fixture({ rustFreeChats = false } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-chat-lists-'));
   const sent = [], removed = [];
   const projects = [{ id: 'p1', name: 'One', chats: [{ id: 'c1' }, 'orphan'] }, { id: 'diary-extras', name: 'Diary', chats: [] }];
@@ -34,7 +34,7 @@ function fixture() {
     crypto, STORED_HISTORY_BYTES: 200, STORED_HISTORY_CAP: 3,
     chatLists: () => ({ freeChats: Array.from(freeChats), projects }),
     removeChat: (chat) => removed.push(chat),
-    store,
+    store, rustFreeChats,
   });
   const call = (method, path, body, role = 'member') => {
     const req = Readable.from(body === undefined ? [] : [Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))]);
@@ -214,4 +214,23 @@ test('moving a chat to another list revokes its "Allow for this chat" grant; a f
   await move('zz', { projectId: null });
   assert.equal(sent.pop().status, 404);
   assert.equal(gate.chatWideApproved('u1', 'f1', 'space:free'), true);
+});
+
+test('M4: while the Rust front owns it, the free-chat save is refused here before the body is read; the list and the delete stay', async () => {
+  const f = fixture({ rustFreeChats: true });
+  assert.equal(await f.call('POST', '/api/freechats', { chats: [{ id: 'f2', title: 'Two' }] }), true);
+  assert.equal(f.sent.at(-1).status, 503);
+  assert.equal(f.sent.at(-1).body.code, 'RUST_PROJECTS_OWNED');
+  assert.equal(await f.call('POST', '/api/freechats', '{'), true, 'refused before the body is parsed');
+  assert.equal(f.sent.at(-1).status, 503);
+  assert.equal(f.store.savedFree, undefined, 'nothing saved');
+  assert.equal(await f.call('GET', '/api/freechats'), true);
+  assert.deepEqual(f.sent.at(-1), { status: 200, body: { chats: [{ id: 'f1', title: 'Free' }] } });
+  assert.equal(await f.call('DELETE', '/api/freechats/f1'), true);
+  assert.deepEqual(f.sent.at(-1), { status: 200, body: { ok: true } });
+  // Off, as before.
+  const g = fixture();
+  assert.equal(await g.call('POST', '/api/freechats', { chats: [{ id: 'f2', title: 'Two' }] }), true);
+  assert.equal(g.sent.at(-1).status, 200);
+  assert.deepEqual(g.store.savedFree.map((c) => c.id), ['f2', 'f1']);
 });

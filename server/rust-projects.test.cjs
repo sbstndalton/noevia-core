@@ -48,6 +48,24 @@ test('the chat-list slice needs the switch and its own confirmation, and is sile
   }
 });
 
+test('the free-chat slice needs the switch and its own confirmation, and is silent without it', () => {
+  const warned = [];
+  const warn = (m) => warned.push(m);
+  const full = { NOEVIA_RUST_PROJECTS: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_AUTH_CONFIRMED: '1', NOEVIA_RUST_PROJECTS_CONFIRMED: '1' };
+  assert.equal(rp.freeChatsEnabledFrom({ ...full, NOEVIA_RUST_FREE_CHATS_CONFIRMED: '1' }, warn), true);
+  assert.equal(rp.freeChatsEnabledFrom(full, warn), false, 'a front without the slice');
+  assert.equal(rp.freeChatsEnabledFrom({ ...full, NOEVIA_RUST_FREE_CHATS_CONFIRMED: 'true' }, warn), false);
+  // Each slice is confirmed on its own: the project chat-list confirmation is not this one.
+  assert.equal(rp.freeChatsEnabledFrom({ ...full, NOEVIA_RUST_PROJECT_CHATS_CONFIRMED: '1' }, warn), false);
+  assert.equal(rp.chatsEnabledFrom({ ...full, NOEVIA_RUST_FREE_CHATS_CONFIRMED: '1' }, warn), false);
+  assert.equal(warned.length, 0);
+  for (const drop of ['NOEVIA_RUST_PROJECTS', 'NOEVIA_FRONT', 'NOEVIA_RUST_AUTH', 'NOEVIA_RUST_AUTH_CONFIRMED', 'NOEVIA_RUST_PROJECTS_CONFIRMED']) {
+    const env = { ...full, NOEVIA_RUST_FREE_CHATS_CONFIRMED: '1' }; delete env[drop];
+    assert.equal(rp.freeChatsEnabledFrom(env, () => {}), false, drop);
+  }
+  assert.equal(rp.FREE_LIST_CAP, require('./chat-lists.cjs').LIST_CAP);
+});
+
 // flock(1) is util-linux (the web image, CI); without it (a Mac) the lock tests are skipped.
 const NO_FLOCK = spawnSync('flock', ['--version']).error ? 'flock(1) not on PATH' : false;
 const RP = JSON.stringify(path.join(__dirname, 'rust-projects.cjs'));
@@ -288,7 +306,8 @@ test("Node's copies of the Rust-owned writes answer 503 only while the switch is
   assert.equal(rp.refuseOwned(true, json, {}), true);
   assert.equal(sent[0][0], 503);
   assert.equal(sent[0][1].code, 'RUST_PROJECTS_OWNED');
-  assert.deepEqual([...rp.OWNED_ROUTES].sort(), ['DELETE /api/projects/{id}/assets/{assetId}', 'GET /api/projects/{id}/assets/{assetId}', 'GET /api/projects/{id}/chats', 'POST /api/projects/{id}/assets', 'POST /api/projects/{id}/chats']);
+  assert.deepEqual([...rp.OWNED_ROUTES].sort(), ['DELETE /api/projects/{id}/assets/{assetId}', 'GET /api/freechats', 'GET /api/projects/{id}/assets/{assetId}', 'GET /api/projects/{id}/chats', 'POST /api/freechats', 'POST /api/projects/{id}/assets', 'POST /api/projects/{id}/chats']);
+  assert.ok(![...rp.OWNED_ROUTES].some((r) => r.startsWith('DELETE /api/freechats')), "a free chat's delete stays Node's");
   // Off by default in a server that is not told otherwise.
   const r = spawnSync(process.execPath, ['-e', `process.stdout.write(String(require(${JSON.stringify(path.join(__dirname, 'rust-projects.cjs'))}).enabledFrom({}, () => {})))`]);
   assert.equal(String(r.stdout), 'false');
@@ -334,4 +353,173 @@ test('a request start that takes in the front\'s change says so once; Node\'s ow
   write(path.join(w2.dir, 'projects.json'), [{ id: 'q', modes: ['chat'], chats: [] }]);
   plain.get(USER);
   assert.deepEqual(off, []);
+});
+
+// ── free-chats.json (the free-chat slice) ──────────────────────────────────
+const freeFile = (dir) => path.join(dir, 'free-chats.json');
+const readFree = (file) => JSON.parse(fs.readFileSync(file, 'utf8'));
+const meta = (id, updatedAt, extra = {}) => ({ id, title: id, updatedAt, preview: '', pinned: false, archived: false, ...extra });
+
+test('free chats, merged: additions from both sides, removals from either, a meta both changed is ours, newest first, capped', () => {
+  const base = [meta('a', 5), meta('b', 4), meta('c', 3)];
+  // Here: b removed, a retitled, n added. There: c removed, a and b retitled, r added.
+  const ours = [meta('n', 9), meta('a', 5, { title: 'ours' }), meta('c', 3)];
+  const theirs = [meta('r', 7), meta('a', 6, { title: 'theirs' }), meta('b', 4, { title: 'theirs' })];
+  assert.deepEqual(rp.mergeFreeChats(ours, base, theirs).map((c) => [c.id, c.title]), [['n', 'n'], ['r', 'r'], ['a', 'ours']]);
+  // Equal times keep the merged order (a stable sort); a non-number time counts as 0.
+  assert.deepEqual(rp.mergeFreeChats([meta('x', 1), meta('y', 'soon')], [], [meta('z', 1), meta('w', null)]).map((c) => c.id), ['z', 'x', 'w', 'y']);
+  const many = Array.from({ length: 1001 }, (_, i) => meta(`m${i}`, i));
+  assert.equal(rp.mergeFreeChats(many, [], [meta('t', 5000)]).length, rp.FREE_LIST_CAP);
+  assert.equal(rp.mergeFreeChats(many, [], [meta('t', 5000)])[0].id, 't');
+});
+
+test('the coordinated free list: refresh takes in the front in place; an unchanged save keeps this order; a stale one merges', { skip: NO_FLOCK }, () => {
+  const dir = tmp(); const file = freeFile(dir);
+  atomicJson(file, [meta('a', 2), meta('b', 1)]);
+  const ff = rp.createFreeChatsFile(file, { atomicJson, warn: () => {} });
+  const ws = { freeChats: ff.load() };
+  const held = ws.freeChats;
+  assert.equal(ff.refresh(ws), false, 'unchanged file: nothing to do');
+  // The front saves a new chat (its own atomic write).
+  atomicJson(file, [meta('f', 3), meta('a', 2), meta('b', 1)]);
+  assert.equal(ff.refresh(ws), true);
+  assert.equal(ws.freeChats, held, 'the array is updated in place');
+  assert.deepEqual(ws.freeChats.map((c) => c.id), ['f', 'a', 'b']);
+  assert.equal(ff.refresh(ws), false);
+  // Nobody else wrote: this process's list is written as it is (its order too).
+  ws.freeChats.splice(0, ws.freeChats.length, meta('b', 1), meta('a', 2));
+  ff.save(ws);
+  assert.deepEqual(readFree(file).map((c) => c.id), ['b', 'a']);
+  assert.equal(ff.refresh(ws), false, 'its own write is not taken for the other writer');
+  // A delete here (a) while the front saved a new meta (g) and retitled b: both stand.
+  ws.freeChats.splice(0, ws.freeChats.length, ...ws.freeChats.filter((c) => c.id !== 'a'));
+  atomicJson(file, [meta('g', 9), meta('b', 1, { title: 'B2' }), meta('a', 2)]);
+  ff.save(ws);
+  assert.deepEqual(readFree(file).map((c) => [c.id, c.title]), [['g', 'g'], ['b', 'B2']]);
+  assert.deepEqual(ws.freeChats.map((c) => c.id), ['g', 'b'], 'this view is what was written');
+  // Bytes are atomicJson's.
+  assert.equal(fs.readFileSync(file, 'utf8'), JSON.stringify(readFree(file), null, 2));
+  assert.ok(fs.existsSync(file + '.lock'), 'the lock file is long-lived');
+});
+
+test('the coordinated free list: unsaved changes here survive a refresh; an unreadable file is kept until the next save', { skip: NO_FLOCK }, () => {
+  const dir = tmp(); const file = freeFile(dir);
+  atomicJson(file, [meta('a', 1)]);
+  const warned = [];
+  const ff = rp.createFreeChatsFile(file, { atomicJson, warn: (m) => warned.push(m) });
+  const ws = { freeChats: ff.load() };
+  ws.freeChats.push(meta('local', 5)); // a failed save left this here
+  atomicJson(file, [meta('a', 1), meta('front', 3)]);
+  assert.equal(ff.refresh(ws), true);
+  assert.deepEqual(ws.freeChats.map((c) => c.id), ['local', 'front', 'a']);
+  fs.writeFileSync(file, '[{');
+  assert.equal(ff.refresh(ws), false);
+  assert.deepEqual(ws.freeChats.map((c) => c.id), ['local', 'front', 'a']);
+  ff.save(ws);
+  assert.deepEqual(readFree(file).map((c) => c.id), ['local', 'front', 'a']);
+  assert.equal(warned.length, 1);
+  // A file that holds no list is read as Node's readJson reads it, and taken as it is.
+  const odd = path.join(dir, 'odd.json');
+  fs.writeFileSync(odd, '{"a":1}');
+  const f2 = rp.createFreeChatsFile(odd, { atomicJson });
+  const w2 = { freeChats: f2.load() };
+  assert.deepEqual(w2.freeChats, { a: 1 });
+  fs.writeFileSync(odd, '[{"id":"x"}]');
+  fs.utimesSync(odd, new Date(), new Date(Date.now() + 5000));
+  assert.equal(f2.refresh(w2), true);
+  assert.deepEqual(w2.freeChats, [{ id: 'x' }]);
+  assert.deepEqual(rp.createFreeChatsFile(path.join(dir, 'none.json'), { atomicJson }).load(), []);
+  fs.writeFileSync(path.join(dir, 'bad.json'), 'nope');
+  assert.deepEqual(rp.createFreeChatsFile(path.join(dir, 'bad.json'), { atomicJson }).load(), []);
+});
+
+test('the workspace store with rustFreeChats: a request sees the front, says so once, and a delete here keeps the front\'s save', { skip: NO_FLOCK }, () => {
+  const changed = [];
+  const store = createWorkspaceStore(tmp(), DEFAULT, null, { rustProjects: true, rustFreeChats: true, onProjectsChanged: (id) => changed.push(id) });
+  const ws = store.get(USER);
+  assert.ok(ws.freeChatsFile);
+  ws.freeChats = [meta('keep', 2), meta('gone', 1)];
+  ws.saveFreeChats();
+  store.get(USER);
+  assert.deepEqual(changed, [], "Node's own save is not news");
+  const file = freeFile(ws.dir);
+  atomicJson(file, [meta('front', 3), ...readFree(file)]);
+  store.get(USER); store.get(USER);
+  assert.deepEqual(changed, [USER]);
+  assert.deepEqual(ws.freeChats.map((c) => c.id), ['front', 'keep', 'gone']);
+  // A delete here (no refresh since it started) while the front saved again.
+  ws.freeChats = ws.freeChats.filter((c) => c.id !== 'gone');
+  atomicJson(file, [meta('front2', 4), ...readFree(file)]);
+  ws.saveFreeChats();
+  assert.deepEqual(readFree(file).map((c) => c.id), ['front2', 'front', 'keep']);
+  // Without the slice (the switch alone): Node writes its own view, as before.
+  const plain = createWorkspaceStore(tmp(), DEFAULT, null, { rustProjects: true });
+  const w2 = plain.get(USER);
+  assert.equal(w2.freeChatsFile, null);
+  w2.freeChats = [meta('q', 1)]; w2.saveFreeChats();
+  atomicJson(freeFile(w2.dir), [meta('other', 2), meta('q', 1)]);
+  plain.get(USER).saveFreeChats();
+  assert.deepEqual(readFree(freeFile(w2.dir)).map((c) => c.id), ['q']);
+  assert.ok(!fs.existsSync(freeFile(w2.dir) + '.lock'));
+});
+
+test('moveChat and deleteFreeChat through the coordinated free list keep a meta the front saved meanwhile', { skip: NO_FLOCK }, () => {
+  const { createProjectStore } = require('./projects.cjs');
+  const store = createWorkspaceStore(tmp(), DEFAULT, null, { rustProjects: true, rustFreeChats: true });
+  const ws = store.get(USER);
+  ws.projects.push({ id: 'p1', name: 'One', modes: ['chat'], chats: [] });
+  ws.saveProjects();
+  ws.freeChats = [meta('f1', 2), meta('f2', 1)];
+  ws.saveFreeChats();
+  const proxy = (field) => new Proxy([], {
+    get(_t, prop) { const v = ws[field][prop]; return typeof v === 'function' ? v.bind(ws[field]) : v; },
+    set(_t, prop, v) { ws[field][prop] = v; return true; },
+    ownKeys() { return Reflect.ownKeys(ws[field]); },
+    getOwnPropertyDescriptor(_t, prop) { return Reflect.getOwnPropertyDescriptor(ws[field], prop); },
+  });
+  const projects = createProjectStore({ fs, path, currentWorkspace: () => ws, PROJECTS: proxy('projects'), FREE_CHATS: proxy('freeChats') });
+  const file = freeFile(ws.dir);
+  // The front saves a new free chat after this request started; the request moves f1 into p1.
+  atomicJson(file, [meta('front', 5), ...readFree(file)]);
+  assert.equal(projects.moveChat('f1', 'p1').status, 200);
+  assert.deepEqual(readFree(file).map((c) => c.id), ['front', 'f2']);
+  assert.deepEqual(read(path.join(ws.dir, 'projects.json'))[0].chats.map((c) => c.id), ['f1']);
+  // Again for a delete.
+  atomicJson(file, [meta('front2', 6), ...readFree(file)]);
+  assert.equal(projects.deleteFreeChat('f2'), true);
+  assert.deepEqual(readFree(file).map((c) => c.id), ['front2', 'front']);
+});
+
+test('setChatFlags reads both lists again first: a meta the front retitled during the turn keeps its title and gets the flags (sbstndalton/noevia#1426)', { skip: NO_FLOCK }, () => {
+  const { createProjectStore } = require('./projects.cjs');
+  const changed = [];
+  const store = createWorkspaceStore(tmp(), DEFAULT, null, { rustProjects: true, rustFreeChats: true });
+  const ws = store.get(USER);
+  ws.projects.push({ id: 'p1', name: 'One', modes: ['chat'], chats: [meta('c1', 1)] });
+  ws.saveProjects();
+  ws.freeChats = [meta('f1', 2)];
+  ws.saveFreeChats();
+  const proxy = (field) => new Proxy([], {
+    get(_t, prop) { const v = ws[field][prop]; return typeof v === 'function' ? v.bind(ws[field]) : v; },
+    set(_t, prop, v) { ws[field][prop] = v; return true; },
+    ownKeys() { return Reflect.ownKeys(ws[field]); },
+    getOwnPropertyDescriptor(_t, prop) { return Reflect.getOwnPropertyDescriptor(ws[field], prop); },
+  });
+  const projects = createProjectStore({ fs, path, currentWorkspace: () => ws, PROJECTS: proxy('projects'), FREE_CHATS: proxy('freeChats'), onProjectsChanged: (id) => changed.push(id) });
+  const free = freeFile(ws.dir), projectsJson = path.join(ws.dir, 'projects.json');
+  // While the turn waited for its route choice, the front retitled f1 and saved a new chat n1.
+  atomicJson(free, [{ ...meta('f1', 9), title: 'Retitled' }, meta('n1', 8)]);
+  assert.equal(projects.setChatFlags(null, 'n1', { allowCloud: true }), true, 'a chat the front first saved during the turn');
+  assert.equal(projects.setChatFlags(null, 'f1', { forceLocal: true }), true);
+  const saved = readFree(free);
+  assert.deepEqual(saved.map((c) => [c.id, c.title, c.forceLocal, c.allowCloud]), [['f1', 'Retitled', true, undefined], ['n1', meta('n1', 8).title, undefined, true]]);
+  // The same for a project's chat list.
+  const onDisk = read(projectsJson);
+  onDisk[0].chats = [{ ...meta('c1', 9), title: 'Retitled' }];
+  atomicJson(projectsJson, { projects: onDisk });
+  assert.equal(projects.setChatFlags('p1', 'c1', { forceLocal: false }), true);
+  const chat = read(projectsJson)[0].chats[0];
+  assert.deepEqual([chat.id, chat.title, chat.forceLocal], ['c1', 'Retitled', false]);
+  assert.deepEqual(changed, [USER, USER], 'each refresh that took in the front nudged the mirror once');
+  assert.equal(projects.setChatFlags(null, 'missing', { forceLocal: true }), false);
 });

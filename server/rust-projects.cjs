@@ -3,7 +3,8 @@
 // 2026-10-10"): the Rust front (noevia-rs bins/noevia-server, crates/server-projects) takes over
 // project routes slice by slice. The first slice is a project's image assets
 // (POST /api/projects/{id}/assets, GET and DELETE /api/projects/{id}/assets/{assetId}); the second
-// its chat list (GET and POST /api/projects/{id}/chats).
+// its chat list (GET and POST /api/projects/{id}/chats); the third the free-chat list (GET and POST
+// /api/freechats; DELETE /api/freechats/{id} stays Node's, see "free-chats.json" below).
 //
 // The switch is NOEVIA_RUST_PROJECTS=1 (exactly) together with NOEVIA_FRONT=rust, the M3 switch
 // (NOEVIA_RUST_AUTH=1, confirmed: the front gates Rust-owned routes itself) and the supervisor's
@@ -13,7 +14,9 @@
 // lists rust-projects may predate it: the chat-list save is refused here only with
 // NOEVIA_RUST_PROJECT_CHATS_CONFIRMED=1 as well (set only once the front's --features lists
 // rust-project-chats; chatsEnabledFrom). Without it a front that answers only the images forwards
-// the chat-list save here, and Node keeps answering it (sbstndalton/noevia#1409).
+// the chat-list save here, and Node keeps answering it (sbstndalton/noevia#1409). The free-chat
+// list likewise needs NOEVIA_RUST_FREE_CHATS_CONFIRMED=1 (the front lists rust-free-chats;
+// freeChatsEnabledFrom).
 //
 // projects.json cannot have one writer yet: Node's other routes (the chat turn, a chat's move or
 // delete, the config route) still change it. So while the switch is on, both processes write it only under one shared lock and
@@ -44,7 +47,22 @@
 //   - Node's copies of the Rust-owned write routes answer 503 RUST_PROJECTS_OWNED (refuseOwned),
 //     so a request that reaches Node directly cannot write behind the front's back. The reads stay.
 //
-// Removed, with Node's copies of the routes, once Rust owns every projects.json writer.
+// free-chats.json (the free-chat slice) has the same problem and the same answer: Node's chat turn
+// (the routing flags), a chat's move, a free chat's delete, the retention sweep and an import still
+// write it. While the slice is on, both processes write it only under `free-chats.json.lock` (the
+// same flock and wait). Rust re-reads it under the lock for every save. Node keeps its cached list,
+// re-reads it at each request start when its (ino, size, mtime) changed, and saves under the lock:
+// when the file still holds what this process last read or wrote, its list as it is; otherwise
+// the chat metas are merged per item against that base (mergeIdList: additions from both sides,
+// removals since the base from either side, a meta both changed is this process's), newest first
+// as mergeChats orders them, at most LIST_CAP. A file that is not a JSON array on either side is
+// not merged: the other side's value is taken (refresh) or replaced (save), as before.
+// DELETE /api/freechats/{id} stays Node's: it also removes the chat's transcript, context meter,
+// brain note and attachments project (a whole project delete, with its RAG index and storage
+// sweep), which the front does not do yet.
+//
+// Removed, with Node's copies of the routes, once Rust owns every projects.json and
+// free-chats.json writer.
 
 const fs = require('fs');
 const { spawnSync } = require('child_process');
@@ -57,13 +75,16 @@ const FLOCK_BUSY_STATUS = 75;
 /** The routes a Rust front can answer under the switch: METHOD path-pattern. noevia-rs
  *  contracts/http/routes.toml (switch = "NOEVIA_RUST_PROJECTS") is the other half; noevia's
  *  deploy/tools/assemble-release.sh refuses a release whose front owns a project route missing
- *  here. The chat-list routes are the front's only with chatsEnabledFrom. */
+ *  here. The chat-list routes are the front's only with chatsEnabledFrom, the free-chat routes
+ *  only with freeChatsEnabledFrom. */
 const OWNED_ROUTES = Object.freeze(new Set([
   'POST /api/projects/{id}/assets',
   'GET /api/projects/{id}/assets/{assetId}',
   'DELETE /api/projects/{id}/assets/{assetId}',
   'GET /api/projects/{id}/chats',
   'POST /api/projects/{id}/chats',
+  'GET /api/freechats',
+  'POST /api/freechats',
 ]));
 
 /** Whether the switch is on for this process (see the header). */
@@ -338,6 +359,88 @@ function chatsEnabledFrom(env = process.env, warn = console.warn) {
   return enabledFrom(env, warn) && env.NOEVIA_RUST_PROJECT_CHATS_CONFIRMED === '1';
 }
 
+/** Whether the free-chat slice is on (see the header): the switch, and the supervisor's
+ *  NOEVIA_RUST_FREE_CHATS_CONFIRMED=1. Silent when only that is missing (a front without the
+ *  slice is a supported pairing). */
+function freeChatsEnabledFrom(env = process.env, warn = console.warn) {
+  return enabledFrom(env, warn) && env.NOEVIA_RUST_FREE_CHATS_CONFIRMED === '1';
+}
+
+// chat-lists.cjs LIST_CAP (required lazily there; equal by test).
+const FREE_LIST_CAP = 1000;
+
+/** free-chats.json as workspace.cjs readJson(file, []) reads it, through one descriptor, with its
+ *  stamp: `value` is the parsed JSON, [] when the file is missing or not JSON (`invalid` set for
+ *  the latter). An I/O error other than a missing file is thrown. */
+function readFreeChatsFile(file) {
+  let fd;
+  try { fd = fs.openSync(file, 'r'); } catch (e) { if (e.code === 'ENOENT') return { value: [], stamp: null, invalid: false }; throw e; }
+  try {
+    const stamp = stampOf(fs.fstatSync(fd));
+    try { return { value: JSON.parse(fs.readFileSync(fd, 'utf8')), stamp, invalid: false }; }
+    catch { return { value: [], stamp, invalid: true }; }
+  } finally { fs.closeSync(fd); }
+}
+
+/** The free list merged with the other writer's (see the header): mergeIdList, then newest first
+ *  as mergeChats orders (a stable sort on `updatedAt || 0`, a non-number counting as 0), capped. */
+function mergeFreeChats(ours, base, theirs) {
+  const key = (c) => (c && typeof c === 'object' && typeof c.updatedAt === 'number' && !Number.isNaN(c.updatedAt) ? c.updatedAt : 0);
+  return mergeIdList(ours, base, theirs).sort((a, b) => (key(b) > key(a) ? 1 : key(b) < key(a) ? -1 : 0)).slice(0, FREE_LIST_CAP);
+}
+
+/**
+ * The coordinated free-chats.json of one workspace while the free-chat slice is on (see the
+ * header). The workspace calls load() once for its `freeChats`, refresh(workspace) at each request
+ * start and save(workspace) for saveFreeChats; an array is updated in place.
+ */
+function createFreeChatsFile(file, { atomicJson, warn = console.warn, lock = withFileLock } = {}) {
+  // base: JSON.stringify of the value as last read from (or written to) disk.
+  const state = { base: JSON.stringify([]), stamp: null };
+  const baseList = () => { try { const v = JSON.parse(state.base); return Array.isArray(v) ? v : null; } catch { return null; } };
+  const put = (workspace, value) => {
+    if (Array.isArray(workspace.freeChats) && Array.isArray(value)) { if (workspace.freeChats !== value) workspace.freeChats.splice(0, workspace.freeChats.length, ...value); }
+    else workspace.freeChats = value;
+  };
+  return {
+    state,
+    /** The first read: workspace.cjs readJson(file, []), plus the base and stamp. */
+    load() {
+      let read;
+      try { read = readFreeChatsFile(file); } catch { read = { value: [], stamp: null, invalid: true }; }
+      state.base = JSON.stringify(read.value);
+      state.stamp = read.stamp;
+      return read.value;
+    },
+    /** At each request start: takes in the other writer's change (no lock: its writes are renames). */
+    refresh(workspace) {
+      if (stampOf(statOrNull(file)) === state.stamp) return false;
+      const read = readFreeChatsFile(file);
+      if (read.invalid) return false; // keep this view; the next save replaces the file
+      const local = workspace.freeChats, base = baseList();
+      const unchanged = JSON.stringify(local) === state.base;
+      put(workspace, !unchanged && Array.isArray(local) && Array.isArray(read.value) && base ? mergeFreeChats(local, base, read.value) : read.value);
+      state.base = JSON.stringify(read.value);
+      state.stamp = read.stamp;
+      return true;
+    },
+    /** saveFreeChats: this process's list, merged with the other writer's when it wrote since. */
+    save(workspace) {
+      lock(file, () => {
+        const read = readFreeChatsFile(file);
+        const local = workspace.freeChats, base = baseList();
+        let out = local;
+        if (read.invalid) warn(`[rust-projects] ${file} is not JSON; replacing it with this process's list`);
+        else if (JSON.stringify(read.value) !== state.base && Array.isArray(local) && Array.isArray(read.value) && base) out = mergeFreeChats(local, base, read.value);
+        atomicJson(file, out);
+        put(workspace, out);
+        state.base = JSON.stringify(out);
+        state.stamp = stampOf(statOrNull(file));
+      });
+    },
+  };
+}
+
 /** For Node's copies of the Rust-owned write routes: true when it answered 503. */
 function refuseOwned(enabled, json, res) {
   if (!enabled) return false;
@@ -346,6 +449,7 @@ function refuseOwned(enabled, json, res) {
 }
 
 module.exports = {
-  enabledFrom, chatsEnabledFrom, withFileLock, merge, mergeFields, mergeIdList, createProjectsFile, readProjectsFile, refuseOwned, replaceContents,
-  OWNED_ROUTES, LOCK_SUFFIX, LOCK_WAIT_MS, FLOCK_BUSY_STATUS,
+  enabledFrom, chatsEnabledFrom, freeChatsEnabledFrom, withFileLock, merge, mergeFields, mergeIdList, createProjectsFile, readProjectsFile, refuseOwned, replaceContents,
+  createFreeChatsFile, readFreeChatsFile, mergeFreeChats,
+  OWNED_ROUTES, LOCK_SUFFIX, LOCK_WAIT_MS, FLOCK_BUSY_STATUS, FREE_LIST_CAP,
 };
