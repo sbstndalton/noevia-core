@@ -8,7 +8,7 @@ const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
 const { createStorageRoutes, STORAGE_PRIVATE_URL_ERROR, nextcloudServerRoot } = require('./storage.cjs');
 
-function fixture({ storage = { kind: 'local' }, browsable = false, approved = () => true, network = async () => ({ ok: true, status: 200, json: async () => ({}) }), storageReadsOwned } = {}) {
+function fixture({ storage = { kind: 'local' }, browsable = false, approved = () => true, network = async () => ({ ok: true, status: 200, json: async () => ({}) }), storageReadsOwned, storageLatch } = {}) {
   const sent = [], saved = [], requests = [], storageReads = [];
   const routes = createStorageRoutes({
     json: (res, status, body) => { sent.push({ status, body }); },
@@ -23,7 +23,7 @@ function fixture({ storage = { kind: 'local' }, browsable = false, approved = ()
     endpointApproved: (authn, url) => approved(authn, url),
     fetch: async (url, init) => { requests.push({ url, init }); return network(url, init); },
     crypto: { randomUUID: () => 'flow-1' },
-    storageReadsOwned,
+    storageReadsOwned, storageLatch,
   });
   const call = (method, path, body, userId = 'u1') => {
     const req = Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body))]);
@@ -453,4 +453,59 @@ test('#1433: cancel ends the flow for its own account only, and a cancel during 
   assert.equal(reply.body.code, 'nextcloudFlowCancelled');
   assert.equal(race.saved.length, 0);
   assert.equal(revocations(race).length, 1);
+});
+
+// #1589: an explicit storage call that works ends the hold on automatic calls; one that fails, or that tried
+// other credentials than the saved ones, does not.
+const HELD = { kind: 'webdav', baseUrl: 'https://cloud.example/dav', username: 'ada', secret: 'synthetic-pw' };
+function held(opts = {}) {
+  const { createStorageLatch } = require('../storage-latch.cjs');
+  const storageLatch = createStorageLatch({ now: () => 0 });
+  const f = fixture({ storage: HELD, browsable: true, storageLatch, ...opts });
+  storageLatch.note('u1', HELD, { kind: 'login' });
+  return Object.assign(f, { isHeld: () => storageLatch.status('u1', HELD) !== null });
+}
+
+test('#1589: browsing, reading and creating a folder over the saved login end the hold when they work', async () => {
+  for (const [method, path, body] of [['GET', '/api/integrations/storage/files/Docs'], ['POST', '/api/integrations/storage/file', { path: 'a.txt' }], ['POST', '/api/integrations/storage/folder', { path: 'new' }]]) {
+    const f = held();
+    assert.equal(f.isHeld(), true);
+    await f.call(method, path, body);
+    assert.equal(f.sent.pop().status, 200, path);
+    assert.equal(f.isHeld(), false, path);
+  }
+  const failing = held();
+  await failing.call('GET', '/api/integrations/storage/files/boom');
+  assert.equal(failing.sent.pop().status, 502);
+  assert.equal(failing.isHeld(), true, 'a failed call proves nothing');
+});
+
+test('#1589: Test connection with the saved login ends the hold; a failed test or other credentials do not', async () => {
+  const ok = held({ network: async () => ({ ok: true, status: 207 }) });
+  await ok.call('POST', '/api/integrations/storage/test', { kind: 'webdav', baseUrl: HELD.baseUrl, username: HELD.username, secret: HELD.secret });
+  assert.equal(ok.sent.pop().status, 200);
+  assert.equal(ok.isHeld(), false);
+  const savedSecret = held({ network: async () => ({ ok: true, status: 207 }) });
+  await savedSecret.call('POST', '/api/integrations/storage/test', { kind: 'webdav', baseUrl: HELD.baseUrl, username: HELD.username, useSavedSecret: true });
+  assert.equal(savedSecret.sent.pop().status, 200);
+  assert.equal(savedSecret.isHeld(), false, 'the saved secret was the one tested');
+  const other = held({ network: async () => ({ ok: true, status: 207 }) });
+  await other.call('POST', '/api/integrations/storage/test', { kind: 'webdav', baseUrl: HELD.baseUrl, username: HELD.username, secret: 'another-pw' });
+  assert.equal(other.sent.pop().status, 200);
+  assert.equal(other.isHeld(), true, 'a different password says nothing about the saved one');
+  const refused = held({ network: async () => ({ ok: false, status: 401 }) });
+  await refused.call('POST', '/api/integrations/storage/test', { kind: 'webdav', baseUrl: HELD.baseUrl, username: HELD.username, secret: HELD.secret });
+  assert.equal(refused.sent.pop().status, 502);
+  assert.equal(refused.isHeld(), true);
+});
+
+test('#1589: saving a login the server accepted ends the hold, and an unchecked save does not', async () => {
+  const accepted = held({ network: async () => ({ ok: true, status: 207 }) });
+  await accepted.call('PUT', '/api/integrations/storage', { kind: 'webdav', baseUrl: HELD.baseUrl, username: HELD.username, secret: HELD.secret });
+  assert.equal(accepted.sent.pop().status, 200);
+  assert.equal(accepted.isHeld(), false);
+  const unchecked = held({ network: async () => { throw new TypeError('fetch failed'); } });
+  await unchecked.call('PUT', '/api/integrations/storage', { kind: 'webdav', baseUrl: HELD.baseUrl, username: HELD.username, secret: HELD.secret });
+  assert.equal(unchecked.sent.pop().body.warningCode, 'storageUnverified');
+  assert.equal(unchecked.isHeld(), true, 'the server was not reached, so the login is still unproven');
 });

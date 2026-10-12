@@ -930,6 +930,7 @@ const diaryRoutes = require('./routes/diary.cjs').createDiaryRoutes({
   json, readBody, readJson, fetchJson, DIARY_BASE, authService, currentWorkspace, rateLimited: (userId) => llmRateLimited(userId), connectorRate, diaryConnectors, diary,
   clientAddress: (req) => require('./auth.cjs').clientAddress(req, process.env.TRUST_PROXY === 'true'),
   addressesTrusted: process.env.TRUST_PROXY === 'true',
+  storageLatch,
 });
 // Sign-in, the signed-in account and /api/admin/* (routes/auth.cjs). The open set is also the
 // router's own list of what a signed-out browser may call.
@@ -965,6 +966,7 @@ const authRoutes = require('./routes/auth.cjs').createAuthRoutes({
 const storageRoutes = require('./routes/storage.cjs').createStorageRoutes({ json, readJson, authService, storageClient, endpointApproved, fetch: (...args) => globalThis.fetch(...args), crypto,
   flowStore: require('./nextcloud-flows.cjs').createNextcloudFlowStore({ file: path.join(DATA_DIR, 'nextcloud-login-flows.json'), secrets: secretStore }),
   storageReadsOwned: () => require('./features.cjs').rustStorageReadsOwned(process.env),
+  storageLatch,
 });
 // The human's answer to a pending write (routes/approvals.cjs); the gate itself is approvals.cjs.
 const approvalRoutes = require('./routes/approvals.cjs').createApprovalRoutes({ json, readBody, pendingApprovals, requestScope });

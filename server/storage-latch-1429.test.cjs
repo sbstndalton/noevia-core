@@ -83,3 +83,63 @@ test('the Diary backup reply latches a refused login or a throttle; a success cl
   assert.equal(latch.suspendedFor('u1', readOk), false, 'an unrelated failure does not latch');
   assert.equal(latch.suspendedFor('u2', () => { throw new Error('no storage'); }), false, 'an account with no readable storage is not held');
 });
+
+test('#1589: a refused login holds automatic calls for a backoff, then lets one probe through and holds the rest', () => {
+  let now = 0;
+  const latch = createStorageLatch({ now: () => now });
+  latch.note('u1', CONN, { kind: 'login' });
+  now = 14 * 60_000;
+  assert.deepEqual(latch.blocked('u1', CONN), { kind: 'login' }, 'still held inside the backoff');
+  now = 15 * 60_000;
+  assert.equal(latch.blocked('u1', CONN), null, 'the backoff has passed: this one call is the probe');
+  assert.deepEqual(latch.blocked('u1', CONN), { kind: 'login' }, 'others are held while the probe runs');
+  now = 15 * 60_000 + 61_000;
+  assert.equal(latch.blocked('u1', CONN), null, 'a probe that recorded nothing is not held forever');
+});
+
+test('#1589: a probe that works clears the hold; one that is refused again waits twice as long, up to a cap', () => {
+  let now = 0;
+  const latch = createStorageLatch({ now: () => now });
+  latch.note('u1', CONN, { kind: 'login' });
+  now = 15 * 60_000; assert.equal(latch.blocked('u1', CONN), null);
+  latch.clear('u1');
+  assert.equal(latch.blocked('u1', CONN), null);
+  latch.note('u1', CONN, { kind: 'login' });
+  for (const expected of [30, 60, 120, 240, 360, 360]) {
+    now += 15 * 60_000 * 64; // well past any backoff
+    assert.equal(latch.blocked('u1', CONN), null, 'probe');
+    latch.note('u1', CONN, { kind: 'login' });
+    assert.equal(latch.status('u1', CONN).nextAttemptAt - now, expected * 60_000, `${expected} min`);
+  }
+  // An explicit press that is refused renews the wait without making it longer.
+  const before = latch.status('u1', CONN).nextAttemptAt - now;
+  latch.note('u1', CONN, { kind: 'login' });
+  assert.equal(latch.status('u1', CONN).nextAttemptAt - now, before);
+});
+
+test('#1589: the Diary backup worker resumes on its own after one transient refusal', async () => {
+  let now = 0;
+  const latch = createStorageLatch({ now: () => now });
+  const read = () => CONN;
+  latch.noteDiaryReply('u1', read, { code: 'storageLoginRejected' }, false);
+  assert.equal(latch.suspendedFor('u1', read), true);
+  now = 15 * 60_000;
+  assert.equal(latch.suspendedFor('u1', read), false, 'the backup is allowed one probing run');
+  latch.noteDiaryReply('u1', read, { mode: 'ok', backup: 'complete' }, true);
+  assert.equal(latch.suspendedFor('u1', read), false);
+  assert.equal(latch.status('u1', CONN), null, 'and the success cleared the hold');
+});
+
+test('#1589: status reports the kind and the next attempt, and never changes the hold', () => {
+  let now = 5;
+  const latch = createStorageLatch({ now: () => now });
+  assert.equal(latch.status('u1', CONN), null);
+  latch.note('u1', CONN, { kind: 'throttled', retryAfter: 30 });
+  assert.deepEqual(latch.status('u1', CONN), { kind: 'throttled', nextAttemptAt: 5 + 30_000 });
+  latch.clear('u1');
+  latch.note('u1', CONN, { kind: 'login' });
+  now = 10 * 60 * 60_000;
+  assert.equal(latch.status('u1', CONN).kind, 'login');
+  assert.deepEqual(latch.blocked('u1', CONN), null, 'blocked() is what lets the probe through');
+  assert.equal(latch.status('u1', { ...CONN, secret: 'changed-pw' }), null);
+});

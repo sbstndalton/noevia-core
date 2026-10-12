@@ -89,12 +89,22 @@ const PASS = Symbol('unhandled');
  * @param {{ randomUUID: () => string }} deps.crypto
  * @param {() => boolean} [deps.storageReadsOwned] confirmed deployment owner; defaults off
  */
-function createStorageRoutes({ json, readJson: readAnyJson, authService, storageClient, endpointApproved, fetch, crypto, storageReadsOwned = () => false, flowStore }) {
+function createStorageRoutes({ json, readJson: readAnyJson, authService, storageClient, endpointApproved, fetch, crypto, storageReadsOwned = () => false, flowStore, storageLatch = null }) {
   // Every body these routes read is a JSON object; `null`, an array or a number is a 400 (#786).
   const readJson = requireJsonObject(readAnyJson);
   // #1431: the pending sign-ins. index.cjs passes the persisted, sealed store; without one (tests) they
   // are held in memory only.
   const nextcloudFlows = flowStore || createNextcloudFlowStore();
+  // #1589: an explicit storage call that works proves the saved login is good again, so the hold on this
+  // account's automatic calls (storage-latch.cjs) ends. `connection` is what the call used; a try with other
+  // credentials proves nothing about the saved ones.
+  const loginProven = (authn, connection) => {
+    try {
+      if (!storageLatch || !authn?.user) return;
+      const saved = authService.getStorage(authn.user.id, true);
+      if (storageLatch.fingerprintOf(saved) === storageLatch.fingerprintOf(connection)) storageLatch.clear(authn.user.id);
+    } catch { /* the hold simply stays */ }
+  };
   async function storageEndpointAllowed(authn, rawUrl) {
     return endpointApproved(authn, rawUrl);
   }
@@ -116,6 +126,7 @@ function createStorageRoutes({ json, readJson: readAnyJson, authService, storage
       if (!(await storageEndpointAllowed(authn, connection.baseUrl))) return json(res, 400, { error: STORAGE_PRIVATE_URL_ERROR });
       try {
         const entries = await storageClient.listFiles(connection, decodeURIComponent(storageBrowse[1] || ''));
+        loginProven(authn, connection);
         return json(res, 200, { entries });
       } catch (e) {
         return json(res, e?.status === 400 ? 400 : 502, { error: e?.message || 'storage browse failed' });
@@ -131,6 +142,7 @@ function createStorageRoutes({ json, readJson: readAnyJson, authService, storage
       if (!(await storageEndpointAllowed(authn, connection.baseUrl))) return json(res, 400, { error: STORAGE_PRIVATE_URL_ERROR });
       try {
         const made = await storageClient.createFolder(connection, body.path);
+        loginProven(authn, connection);
         return json(res, 200, made);
       } catch (e) {
         const status = e && e.status ? e.status : 502;
@@ -146,6 +158,7 @@ function createStorageRoutes({ json, readJson: readAnyJson, authService, storage
       if (!(await storageEndpointAllowed(authn, connection.baseUrl))) return json(res, 400, { error: STORAGE_PRIVATE_URL_ERROR });
       try {
         const file = await storageClient.readTextFile(connection, body.path);
+        loginProven(authn, connection);
         return json(res, 200, file);
       } catch (e) {
         const status = e && e.status ? e.status : 502;
@@ -178,6 +191,8 @@ function createStorageRoutes({ json, readJson: readAnyJson, authService, storage
           : check.status ? { warning: storageUncheckedMessage(check.status), warningCode: 'storageUnverified', status: check.status } : { warning: STORAGE_UNVERIFIED, warningCode: 'storageUnverified' };
       }
       const saved = authService.saveStorage(authn.user.id, body);
+      // A login that was just checked and accepted ends the hold even when the credentials are unchanged.
+      if (DAV_KINDS.has(body.kind) && !warning) loginProven(authn, body);
       return json(res, 200, warning ? { ...saved, ...warning } : saved);
     }
     if (p === '/api/integrations/storage/test' && req.method === 'POST') {
@@ -213,7 +228,7 @@ function createStorageRoutes({ json, readJson: readAnyJson, authService, storage
           const target = `${endpoint}/${encodeURIComponent(bucket)}?list-type=2&max-keys=1`;
           const signed = signS3Request('GET', new URL(target), '', saved.username || '', saved.secret || '', { region: normalizeS3Region(saved.region) });
           const response = await fetch(target, { headers: signed, signal: AbortSignal.timeout(10000), redirect: 'error' });
-          if (response.ok) return json(res, 200, { ok: true });
+          if (response.ok) { loginProven(authn, saved); return json(res, 200, { ok: true }); }
           const detail = response.status === 403 ? ' — check the access key and secret'
             : response.status === 404 ? ' — no such bucket'
             : response.status === 400 ? ' — server rejected the request (unsupported endpoint?)' : '';
@@ -223,6 +238,7 @@ function createStorageRoutes({ json, readJson: readAnyJson, authService, storage
       try {
         const target = `${String(saved.baseUrl).replace(/\/+$/, '')}/${String(saved.corpusRoot || '').split('/').map(encodeURIComponent).join('/')}`;
         const response = await fetch(target, { method: 'PROPFIND', headers: { Authorization: `Basic ${Buffer.from(`${saved.username}:${saved.secret}`).toString('base64')}`, Depth: '0' }, signal: AbortSignal.timeout(10000), redirect: 'error' });
+        if (response.ok || response.status === 207) loginProven(authn, saved);
         return json(res, response.ok || response.status === 207 ? 200 : 502, response.ok || response.status === 207 ? { ok: true } : { error: `WebDAV returned ${response.status}` });
       } catch (e) { return json(res, 502, { error: e.message }); }
     }
