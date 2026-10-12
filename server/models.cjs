@@ -256,6 +256,8 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
         shape: fileFor(m.id || m.model_name)?.shape || null,
         loaded: loadedNames.has(m.id || m.model_name) || sidecarUp(m),
         labels: Array.isArray(m.labels) ? m.labels : [],
+        // #1179: the explicit system kind (`role = laya`), so the web does not match names.
+        system: isSystem(m),
         mtp: require('./mtp.cjs').capability(m),
         maxContext: m.max_context_window || null,
         suggested: !!m.suggested,

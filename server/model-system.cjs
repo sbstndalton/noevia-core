@@ -1,12 +1,38 @@
 'use strict';
 // Some router entries are internal system routing models, not chat models a person configures
 // or tunes — Laya (the multilingual detector the Auto route consults) is the only one today.
-// Match is case-insensitive and covers both the preset/router id (e.g. "laya_multilingual_f16")
-// and any "--model"/"-m" path segment, so a differently-cased id or a renamed folder still counts.
+// #1179: the marker is an explicit `role = laya` key in the models.ini section. The name/path rule
+// below is only a deprecated fallback for a section that has no role key; it is logged once per id.
 const LAYA_PREFIX = /^laya(?:[_.-]|$)/i;
+const LAYA_ROLE = 'laya';
 
 function isLayaToken(value) {
   return LAYA_PREFIX.test(String(value || '').trim());
+}
+
+// Section name -> lower-cased role, as models.ini last read it (rememberSectionRoles). Routers name
+// a preset by its section, so a router id is the section name.
+const sectionRoles = new Map();
+const nameRuleLogged = new Set();
+
+/** The explicit `role` of each models.ini section in `text` (same section headers as the preset parser). */
+function sectionRolesOf(text) {
+  const roles = new Map();
+  let current = null;
+  for (const line of String(text || '').split('\n')) {
+    const header = /^\s*\[([^\]\r\n]+)\]\s*(?:[;#].*)?$/.exec(line);
+    if (header) { current = header[1]; continue; }
+    if (current === null || current === '*') continue;
+    const match = /^\s*role\s*=\s*(.*?)\s*$/i.exec(line);
+    if (match && !roles.has(current)) roles.set(current, match[1].trim().toLowerCase());
+  }
+  return roles;
+}
+
+/** Replaces what the explicit roles of the models.ini just read say (called by the preset store). */
+function rememberSectionRoles(text) {
+  sectionRoles.clear();
+  for (const [name, role] of sectionRolesOf(text)) if (role) sectionRoles.set(name, role);
 }
 
 /** The value that follows a "--model"/"-m" flag in a router process's argv, if any. */
@@ -16,17 +42,32 @@ function modelPathFromArgs(args) {
   return i >= 0 && typeof args[i + 1] === 'string' ? args[i + 1] : '';
 }
 
+// The deprecated fallback, for a section with no role key: logged once per name.
+function fallbackLaya(token, where) {
+  if (!nameRuleLogged.has(token)) {
+    nameRuleLogged.add(token);
+    console.warn(`[model-system] ${token} is treated as Laya by the deprecated ${where} rule; add "role = laya" to its models.ini section (#1179)`);
+  }
+  return true;
+}
+
 /**
  * True when `id` (a router/preset model id) or `modelPath` (a "--model" argument or preset file
  * path) identifies Laya, noevia's internal multilingual routing model. Laya is never offered for
- * tuning or manual configuration: it fits the system rather than a person tuning it.
+ * tuning or manual configuration: it fits the system rather than a person tuning it. An explicit
+ * `role = laya` in the id's models.ini section decides; only without one does the name/path rule apply.
  */
 function isSystemModel(id, modelPath) {
-  if (isLayaToken(id)) return true;
+  const key = id === undefined || id === null ? '' : String(id).trim();
+  if (key && sectionRoles.has(key)) return sectionRoles.get(key) === LAYA_ROLE;
+  if (isLayaToken(key)) return fallbackLaya(key, 'name');
   const path = String(modelPath || '');
   if (!path) return false;
   const segments = path.split(/[\\/]/).filter(Boolean);
-  return segments.some(seg => isLayaToken(seg.replace(/\.gguf$/i, '')));
+  return segments.some(seg => {
+    const token = seg.replace(/\.gguf$/i, '');
+    return isLayaToken(token) && fallbackLaya(token, 'path');
+  });
 }
 
 const SYSTEM_MODEL_REASON = 'System routing model — not tuned';
@@ -65,6 +106,6 @@ const MISSING_MODEL_FILE_REASON = 'This preset points at a model file that is no
 
 module.exports = {
   SYSTEM_MODEL_LOAD_REASON, SIDECAR_MODEL_LOAD_REASON, MISSING_MODEL_FILE_REASON,
-  isSystemModel, modelPathFromArgs, SYSTEM_MODEL_REASON, SYSTEM_MODEL_DELETE_REASON,
+  isSystemModel, modelPathFromArgs, SYSTEM_MODEL_REASON, SYSTEM_MODEL_DELETE_REASON, sectionRolesOf, rememberSectionRoles, LAYA_ROLE,
   sidecarModelNames, isSidecarModel, SIDECAR_MODEL_DELETE_REASON,
 };
