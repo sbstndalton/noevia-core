@@ -1109,6 +1109,8 @@ function createChatHandler({
       send({type:'context',...prepared.meter});
     } catch(error) {send({type:'error',text:error.message});res.end();return;}
     if(body.compactOnly){send({type:'done',model});res.end();return;}
+    // #1475/#1477: the local engine's thinking cap for this effort, leaving the answer its room (thinking-budget.cjs).
+    const localThinkingCap = provider.id===DEFAULT_PROVIDER_ID ? require('./thinking-budget.cjs').thinkingCap(effort, prepared.maxTokens) : null;
     const reportRevocation = () => {
       if (!skillRevocation || skillRevocationReported) return;
       skillRevocationReported = true;
@@ -1266,7 +1268,7 @@ function createChatHandler({
           method: 'POST', headers: upstreamHeaders, signal: chatSignal.signal, redirect: 'error',
         }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:true,stream_options:{include_usage:true},
           ...sampling.params,
-          ...requestTools(), ...forceChoice(round)}, provider, model, effort, send);
+          ...requestTools(), ...forceChoice(round)}, provider, model, effort, send, localThinkingCap);
         // A server that rejects the named-function form of tool_choice gets the equivalent it does
         // accept: only that tool, and a call required.
         if (forceChoice(round).tool_choice && upstream.status >= 400 && upstream.status < 500 && /tool_choice/i.test((await readCappedText(upstream.clone(), PROVIDER_ERROR_BODY_CAP).catch(() => ({ text: '' }))).text)) {
@@ -1274,7 +1276,7 @@ function createChatHandler({
           upstream = await reasoningEffort.requestWithEffort(providerFetch, upstreamUrl, {
             method: 'POST', headers: upstreamHeaders, signal: chatSignal.signal, redirect: 'error',
           }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:true,stream_options:{include_usage:true},
-            ...sampling.params, tools:activeTools.filter((t) => t.function?.name === forcedTool), tool_choice:'required'}, provider, model, effort, send);
+            ...sampling.params, tools:activeTools.filter((t) => t.function?.name === forcedTool), tool_choice:'required'}, provider, model, effort, send, localThinkingCap);
         }
         // #1002: the engine refused the tools because of the model's chat template (llama.cpp could
         // not build a tool-call parser for it). Retry this round once without tools, and say so.
@@ -1287,7 +1289,7 @@ function createChatHandler({
             upstream = await reasoningEffort.requestWithEffort(providerFetch, upstreamUrl, {
               method: 'POST', headers: upstreamHeaders, signal: chatSignal.signal, redirect: 'error',
             }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:true,stream_options:{include_usage:true},
-              ...sampling.params}, provider, model, effort, send);
+              ...sampling.params}, provider, model, effort, send, localThinkingCap);
             // #1015: remembered only when dropping tools is what fixed it; a template that fails
             // either way is not marked, so the next chat still offers tools.
             if (upstream.ok) templateToolsGate.markUnsupported(model);
@@ -1408,7 +1410,7 @@ function createChatHandler({
           roundTimings = null;
           const response = await reasoningEffort.requestWithEffort(providerFetch, upstreamUrl, {
             method:'POST',headers:upstreamHeaders,signal:AbortSignal.any([chatSignal.signal,AbortSignal.timeout(300000)]),redirect:'error',
-          }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:false,...sampling.params,...requestTools(),...forceChoice(round)}, provider, model, effort, send);
+          }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:false,...sampling.params,...requestTools(),...forceChoice(round)}, provider, model, effort, send, localThinkingCap);
           // Status first (#918): a 5xx HTML page is a provider failure, not a JSON parse error.
           if (!response.ok) { send({ type: 'error', text: await providerFailureText(response, chatgptProvider) }); throw FALLBACK_REPORTED; }
           const full = {ok:true,status:response.status,body:await readCappedJson(response,FALLBACK_REPLY_CAP)};

@@ -93,7 +93,7 @@ function applySummary(messages,state) {
 function measure(messages,tools,limit,source,model) {
  const system=messages.filter(m=>m.role==='system'), other=messages.filter(m=>m.role!=='system');
  const parts=[{name:'Messages & summary',tokens:other.reduce((n,m)=>n+tokens(m),0)}, {name:'Instructions, memory & sources',tokens:system.reduce((n,m)=>n+tokens(m),0)}, {name:'Tools',tokens:tools.length?tokens(tools):0}];
- const used=parts.reduce((n,p)=>n+p.tokens,0), reserve=Math.min(4096,Math.floor(limit*.25)), safety=Math.ceil(limit*.15);
+ const used=parts.reduce((n,p)=>n+p.tokens,0), reserve=require('./thinking-budget.cjs').outputBudget(limit), safety=Math.ceil(limit*.15);
  return {model,limit,limitSource:source,estimated:true,used,reserve,safety,parts,free:Math.max(0,limit-used-reserve-safety),threshold:limit-reserve-safety,updatedAt:Date.now()};
 }
 function biggestPart(parts) { return parts.reduce((a,b)=>b.tokens>a.tokens?b:a); }
