@@ -87,6 +87,10 @@ function createMcpWiring({
   env = process.env, fetch = globalThis.fetch, publicFetch = null, discoveryTtlMs = 10 * 60 * 1000,
   discoveryFailTtlMs = Number(process.env.MCP_DISCOVERY_FAIL_TTL_MS || 30 * 1000), logger = console,
   isUserDisabled = () => false,
+  // #1081: when a remote server failed discovery (its DNS or network may not be up yet at startup),
+  // it is retried after these steps, one per consecutive failed discovery, instead of after the whole
+  // discoveryTtlMs. The last step holds. Capped at discoveryTtlMs.
+  discoveryRetryMs = [5000, 15000, 45000, 120000],
 }) {
   const MCP_SERVERS = servers;
   if (publicFetch && typeof mcp.withFetch !== 'function') throw new TypeError('publicFetch needs an MCP client with withFetch');
@@ -159,6 +163,8 @@ function createMcpWiring({
     // configured yet), the moment it finished — kept separately from discoveredAt so the
     // internal-server-down retry-sooner behaviour below cannot also defeat the failure TTL.
     failedAt: 0,
+    // #1081: consecutive discoveries in which a remote server failed (reset when every server answers).
+    remoteFailStreak: 0,
     error: null,
     inflight: null,
   };
@@ -362,7 +368,15 @@ function createMcpWiring({
         // minutes of backoff — retry on the next request instead of hiding its
         // boxes for the whole TTL.
         const internalDown = [...found.values()].some((sv) => sv.auth === 'internal' && sv.error);
-        mcpState.discoveredAt = internalDown ? 0 : Date.now();
+        // #1081: a remote server that failed (fetch failed at startup, before DNS was up) is retried on a
+        // short backoff rather than hidden for the whole TTL. Discovery still runs lazily on the next request.
+        const remoteDown = [...found.values()].some((sv) => sv.auth !== 'internal' && sv.error);
+        mcpState.remoteFailStreak = remoteDown ? mcpState.remoteFailStreak + 1 : 0;
+        const retryMs = remoteDown && discoveryRetryMs.length
+          ? Math.min(discoveryTtlMs, discoveryRetryMs[Math.min(mcpState.remoteFailStreak, discoveryRetryMs.length) - 1])
+          : discoveryTtlMs;
+        // discoveredAt is set so the next unforced request is fresh for exactly `retryMs`.
+        mcpState.discoveredAt = internalDown ? 0 : Date.now() - (discoveryTtlMs - retryMs);
         // A run that produced no boxes at all (every server failed, including the case above, or
         // none are configured) is remembered for the short failure TTL regardless — an internal
         // server that keeps failing must not turn into an unthrottled retry loop either.
