@@ -360,6 +360,45 @@ async function main() {
     await step(noCsrf, 'POST', list, { chats: [] }, [403]);
     await step(anon, 'GET', list, undefined, [401]);
     await step(anon, 'POST', list, { chats: [] }, [401]);
+
+    // M4 (NOEVIA_RUST_PROJECTS, rust-free-chats): the free-chat list, saved and read back while
+    // Node's own writers of free-chats.json (a chat's move, a free chat's delete) run between the
+    // saves, with the refusals. Appended, so every earlier exchange keeps its place.
+    const free = '/api/freechats';
+    await step(admin, 'GET', free, undefined, [200]);
+    await step(admin, 'POST', free, { chats: [
+      { id: 'free-beta', title: 'Beta', updatedAt: 600, preview: 'Second', pinned: true, archived: false, forceLocal: false, createdAt: 50, mode: 'cowork',
+        frame: { kind: 'idea', tags: ['#beta  one', 'beta-one', 3], links: ['free-alpha', 'free-alpha'], confirmed: true, source: 'user' } },
+      { id: 'free gamma/../x', title: { a: 1 }, preview: ['p', null, 3], updatedAt: 550 },
+      // A project's list holds it: skipped, and said so.
+      { id: 'chat-alpha', title: 'Moved elsewhere', updatedAt: 700 },
+      // Deleted above: tombstoned, never comes back.
+      ...(chatId ? [{ id: chatId, title: 'Deleted chat', updatedAt: 800 }] : []),
+      { id: 'free-delta', title: `${'d'.repeat(118)}\u{1F600}tail`, preview: '', updatedAt: 500, frame: { kind: 'bogus' }, mode: 'code' },
+      'stray', null, { title: 'no id' },
+    ] }, [200]);
+    await step(admin, 'GET', free, undefined, [200]);
+    // A later save keeps the stored flags and first createdAt; frame null clears the frame.
+    await step(admin, 'POST', free, { chats: [{ id: 'free-beta', title: 'Beta renamed', updatedAt: 650, frame: null }, { id: 'free-alpha', updatedAt: 6, allowCloud: false, createdAt: 7 }] }, [200]);
+    await step(admin, 'GET', free, undefined, [200]);
+    // Node moves a free chat into a project and back (both lists, both files) between the saves.
+    await step(admin, 'POST', `/api/chats/free-alpha/move`, { projectId: listId }, [200]);
+    await step(admin, 'GET', free, undefined, [200]);
+    await step(admin, 'POST', free, { chats: [{ id: 'free-alpha', title: 'Stale tab', updatedAt: 9 }] }, [200]);
+    await step(admin, 'GET', list, undefined, [200]);
+    await step(admin, 'POST', `/api/chats/free-alpha/move`, { projectId: null }, [200]);
+    await step(admin, 'GET', free, undefined, [200]);
+    // Node deletes one (tombstone, transcript); a stale save cannot bring it back.
+    await step(admin, 'DELETE', `${free}/free-delta`, undefined, [200]);
+    await step(admin, 'GET', free, undefined, [200]);
+    await step(admin, 'POST', free, { chats: [{ id: 'free-delta', title: 'Stale tab', updatedAt: 900 }] }, [200]);
+    await step(admin, 'GET', free, undefined, [200]);
+    await step(admin, 'POST', free, { chats: 'not a list' }, [400]);
+    await step(admin, 'POST', free, null, [400]);
+    await step(admin, 'POST', free, { chats: [{ id: 'free-eps', updatedAt: 1, createdAt: 2 }], extra: 'ignored' }, [200]);
+    await step(noCsrf, 'POST', free, { chats: [] }, [403]);
+    await step(anon, 'GET', free, undefined, [401]);
+    await step(anon, 'POST', free, { chats: [] }, [401]);
     // The recorder writes an exchange on the response's 'finish', which can come after the client
     // has the whole answer: wait for the last files before stopping the server.
     // Done when every file parses and none has appeared for 150 ms (bounded at 5 s).
