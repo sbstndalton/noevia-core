@@ -1,5 +1,8 @@
 'use strict';
 const { frameUntrusted } = require('./prompt-framing.cjs');
+// A file's name is not ours to trust (#1588, #1605): each is quoted and escaped, as in source-coverage.cjs, so a quote or a
+// newline in it cannot start a line of its own in the system text. The one place a list of names is worded for the model.
+const quotedNames = (names) => names.map((n) => JSON.stringify(String(n))).join(', ');
 const provenance = require('./provenance-policy.cjs');
 const { isChatGenerationModel } = require('./chat-model-kind.cjs');
 const { isInAppBox } = require('./toolbox-flags.cjs');
@@ -461,7 +464,7 @@ function createChatHandler({
     const memoryPart = accountMemory.systemPart(accountMemory.read(currentWorkspace().dir), project?.memories);
     if (!project && memoryPart) sysParts.push(memoryPart);
     if (project) {
-      if (project.name && !chatAttachments) sysParts.push(`You are working inside the user's project "${project.name}".`);
+      if (project.name && !chatAttachments) sysParts.push(`You are working inside the user's project ${JSON.stringify(String(project.name))}.`);
       if (project.goal) sysParts.push(`Project goal: ${project.goal}`);
       if (project.instructions) sysParts.push(`Project instructions (follow closely):\n${project.instructions}`);
       if (memoryPart) sysParts.push(memoryPart);
@@ -484,7 +487,7 @@ function createChatHandler({
         }
       }
       if (sourcesNotReady.length) {
-        sysParts.push(`The user just attached ${sourcesNotReady.map((f) => JSON.stringify(f.name)).join(', ')}, but ${sourcesNotReady.length === 1 ? 'it was' : 'they were'} not ${sourcesNotReady.every((f) => f.reason === 'failed') ? 'processed' : 'finished processing'} in time, so ${sourcesNotReady.length === 1 ? 'its' : 'their'} contents are not available to you for this message. Say so if asked about ${sourcesNotReady.length === 1 ? 'it' : 'them'}; do not guess at the contents.`);
+        sysParts.push(`The user just attached ${quotedNames(sourcesNotReady.map((f) => f.name))}, but ${sourcesNotReady.length === 1 ? 'it was' : 'they were'} not ${sourcesNotReady.every((f) => f.reason === 'failed') ? 'processed' : 'finished processing'} in time, so ${sourcesNotReady.length === 1 ? 'its' : 'their'} contents are not available to you for this message. Say so if asked about ${sourcesNotReady.length === 1 ? 'it' : 'them'}; do not guess at the contents.`);
       }
       // #1513: a source only partly read for this reply is said so, with what was read.
       { const coverageNote = require('./source-coverage.cjs').coverageNote(partialReads); if (coverageNote) sysParts.push(coverageNote); }
@@ -574,7 +577,7 @@ function createChatHandler({
     // ── Ordinary space / project chat: routed via the project's provider ──
     // Unreadable text originals (#586) are not offered to the model at all, not even by name.
     const storedOnly = require('./source-readability.cjs').readable(project?.files).filter(f => f.attachment?.state === 'stored');
-    if (storedOnly.length) sysParts.push('These sources are stored only; their contents are NOT available to the model: ' + storedOnly.map(f => f.name).join(', ') + '. Do not claim to know their contents.');
+    if (storedOnly.length) sysParts.push('These sources are stored only; their contents are NOT available to the model: ' + quotedNames(storedOnly.map(f => f.name)) + '. Do not claim to know their contents.');
     // Chat framing (#739): a confirmed frame stored in the user's own lists steers the answer. The
     // request body's frame is never read. Flag off or no confirmed frame: nothing changes.
     const steering = require('./chat-frame-steering.cjs');
@@ -967,19 +970,19 @@ function createChatHandler({
     // #1079: a switch to the long-context profile reloads the model; say so instead of "Preparing".
     if (contextSwitch && !attachedImages.length) send({ type: 'status', id: 'loadingLongContext', text: 'Loading the high-context profile — switching models may take a moment…' });
     else send({ type: 'status', id: attachedImages.length ? 'readingImages' : 'preparing', text: attachedImages.length ? 'Reading image sources — model loading and visual processing may take a moment…' : 'Preparing response…' });
-    let visionWarning = missingImages.length ? `Images were not read because their stored files are missing: ${missingImages.join(', ')}. Re-upload them.` : '';
+    let visionWarning = missingImages.length ? `Images were not read because their stored files are missing: ${quotedNames(missingImages)}. Re-upload them.` : '';
     if (visionWarning) wire = [{ role: 'system', content: visionWarning + ' Do not guess their contents.' }, ...wire];
     // Rule 3 of provider-egress.cjs: project images are not sent to an external provider on their own.
     if (externalProvider && attachedImages.length) {
       attachedImages = [];
       visionWarning += `${visionWarning ? ' ' : ''}Project images were not sent: images are never sent to ${provider.label || 'an external provider'} automatically.`;
-      const unsent = `This project has image sources (${loadedImageNames.join(', ')}) that were not sent to this external provider. Say so if asked about them; do not guess at their contents.`;
+      const unsent = `This project has image sources (${quotedNames(loadedImageNames)}) that were not sent to this external provider. Say so if asked about them; do not guess at their contents.`;
       wire = wire.map((m) => (m.role === 'system' ? { ...m, content: `${m.content}\n\n${unsent}` } : m));
       if (!sys) wire = [{ role: 'system', content: unsent }, ...wire];
     }
     // #1512: project images this turn does not attach are named, so the answer says so instead of guessing.
     if (unattachedImageNames.length) {
-      const notAttached = `This project has image sources (${unattachedImageNames.join(', ')}) that are not attached to this message. Say so if asked about them; do not guess at their contents.`;
+      const notAttached = `This project has image sources (${quotedNames(unattachedImageNames)}) that are not attached to this message. Say so if asked about them; do not guess at their contents.`;
       wire = wire.some((m) => m.role === 'system') ? wire.map((m) => (m.role === 'system' ? { ...m, content: `${m.content}\n\n${notAttached}` } : m)) : [{ role: 'system', content: notAttached }, ...wire];
     }
     if (attachedImages.length && !body.compactOnly) {
@@ -1014,7 +1017,7 @@ function createChatHandler({
           if (lastUser) {
             const text = typeof lastUser.content === 'string' ? lastUser.content : '';
             lastUser.content = [
-              { type: 'text', text: `${text}\n\n(Attached images: ${loadedImageNames.join(', ')})` },
+              { type: 'text', text: `${text}\n\n(Attached images: ${quotedNames(loadedImageNames)})` },
               ...attachedImages,
             ];
           }
@@ -1024,7 +1027,7 @@ function createChatHandler({
           // like the images were read and found uninteresting.
           attachedImages = [];
           visionWarning += `${visionWarning ? ' ' : ''}Images were not read. ${vision.reason}`;
-          const blind = `This project has image sources (${loadedImageNames.join(', ')}) but image input is currently unavailable for ${model}: ${vision.reason}${visionModel ? '; the configured vision model also could not describe them' : ''}. Say so if asked about them; do not guess at their contents.`;
+          const blind = `This project has image sources (${quotedNames(loadedImageNames)}) but image input is currently unavailable for ${model}: ${vision.reason}${visionModel ? '; the configured vision model also could not describe them' : ''}. Say so if asked about them; do not guess at their contents.`;
           wire = wire.map((m) => (m.role === 'system' ? { ...m, content: `${m.content}\n\n${blind}` } : m));
           if (!sys) wire = [{ role: 'system', content: blind }, ...wire];
         }

@@ -142,7 +142,7 @@ test('#1512: a text-only follow-up does not describe or send the project images 
   assert.ok(noVisionWork(out), 'no description call and no probe for the project images');
   assert.equal(readingImages(out), false);
   assert.equal(JSON.stringify(out.answer).includes('data:image'), false);
-  assert.match(systemText(out), /image sources \(statement\.png, copy\.png\) that are not attached to this message/);
+  assert.match(systemText(out), /image sources \("statement\.png", "copy\.png"\) that are not attached to this message/);
 });
 
 test('#1512: a turn that names one image describes only that image and names the other', async () => {
@@ -151,7 +151,7 @@ test('#1512: a turn that names one image describes only that image and names the
   assert.equal(described.length, 1);
   assert.equal(described[0].messages[0].content.filter((c) => c.type === 'image_url').length, 1);
   assert.match(out.answer.messages[0].content, /INV-2042 total 34\.95/);
-  assert.match(systemText(out), /image sources \(copy\.png\) that are not attached/);
+  assert.match(systemText(out), /image sources \("copy\.png"\) that are not attached/);
 });
 
 test('#1512: turnImageIds is a short list of image source ids; anything else is a 400', () => {

@@ -602,10 +602,10 @@ async function filesContext(projectId, files, query, userId, onSources, { attach
   // `attached`: a free chat's own attachments (#1441). They are the user's files for this chat, not a
   // project's knowledge, and are worded that way so a small model does not deny having them.
   let manifest = `${attached ? 'The user attached these files to this chat' : 'Sources attached to this project'} (${files.length}): ${files
-    .map((f) => `"${f.name}"`)
+    .map((f) => JSON.stringify(String(f.name)))
     .join(', ')}. Excerpts of the relevant ones follow; ask to read a file in full if you need more of it.`;
 
-  const notices = files.map(f => documentNotice(f) || (f.attachment?.reason ? `${f.name}: ${f.attachment.reason}` : '')).filter(Boolean);
+  const notices = files.map(f => documentNotice(f) || (f.attachment?.reason ? `${JSON.stringify(String(f.name))}: ${f.attachment.reason}` : '')).filter(Boolean);
   const parts = [];
   // What is placed in the prompt, in order, for the caller's optional onSources (#552).
   const placed = [];
@@ -629,7 +629,7 @@ async function filesContext(projectId, files, query, userId, onSources, { attach
     if (c.text.length <= budget) { parts.push(c.text); budget -= c.text.length; if (questionNames(c.f.name)) placed.push({ file: c.f.name, body: c.body, kind: 'file' }); }
     else omitted.push(c.f.name);
   }
-  if (omitted.length) manifest += ` ${omitted.length} more file${omitted.length === 1 ? '' : 's'} not included (prompt size limit): ${omitted.map((n) => `"${n}"`).join(', ')}.`;
+  if (omitted.length) manifest += ` ${omitted.length} more file${omitted.length === 1 ? '' : 's'} not included (prompt size limit): ${omitted.map((n) => JSON.stringify(String(n))).join(', ')}.`;
   if (typeof onSources === 'function') { try { onSources(placed); } catch { /* a reporting hook never breaks the prompt */ } }
   const coverage = 'Source completeness: ' + (notices.join('\n') || 'Legacy text sources have no page completeness metadata.') + '\nContext may contain excerpts only. Use read_project_file with PDF startPage/endPage and offset for pages beyond the summary. Do not treat missing excerpts or failed/partial sources as evidence of absence.';
   return parts.length ? [manifest, coverage, ...parts].join('\n\n') : [manifest, coverage].join("\n");

@@ -63,7 +63,7 @@ function problem(file) {
 function notice(file) {
   const d = file.document;
   if (!d) return '';
-  return `${file.name}: ${problem(file)}` +
+  return `${JSON.stringify(String(file.name))}: ${problem(file)}` +
     `${d.version ? ' Source version ' + d.version : ''}${d.availableVersion ? '; text version ' + d.availableVersion : ''}` +
     `; index: ${d.indexing || 'unavailable'}.`;
 }
