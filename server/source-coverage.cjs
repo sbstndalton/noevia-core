@@ -34,7 +34,9 @@ function partialSources(files, placed) {
 /** The system-text note for the model. Empty when every source was read in full. */
 function coverageNote(partial) {
   if (!Array.isArray(partial) || !partial.length) return '';
-  const parts = partial.map((p) => `"${p.name}" is ${number(p.length)} characters long and this reply read ${p.read ? `only ${number(p.read)} characters of it (excerpts or the start)` : 'none of it (it was not included)'}`);
+  // A synced file's name is not ours to trust: quoted and escaped, so a quote or a newline in it cannot start
+  // a line of its own in the system text (#1588).
+  const parts = partial.map((p) => `${JSON.stringify(String(p.name))} is ${number(p.length)} characters long and this reply read ${p.read ? `only ${number(p.read)} characters of it (excerpts or the start)` : 'none of it (it was not included)'}`);
   return `Source text was truncated for this reply: ${parts.join('; ')}. The rest of each file was NOT read. Do not say that some text is absent from a file, or answer "no", from the part you read; say which part you read. read_project_file with an offset can read more of a file.`;
 }
 
