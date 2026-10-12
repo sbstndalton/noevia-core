@@ -202,6 +202,22 @@ function jwtShaped(s) {
   return false;
 }
 
+// #1526: clear health or medical-diagnosis text. Narrow on purpose: a diagnosis word (diagnosis,
+// diagnoses, diagnosed, diagnose) with a named condition within 60 characters either side, or a
+// personal health-record phrase ("my diagnosis", "their medical history"). Generic words such as
+// "disease" or "disorder" are not enough, and "aids" is left out (it is also a verb). Each window is
+// bounded, so the scan stays linear.
+const DIAGNOSIS_RE = /\bdiagnos(?:is|es|ed|e)\b/gi;
+const HEALTH_CONDITION_RE = /\b(?:hypertension|hypertensive|diabet\w*|cancer|asthma|depressi\w*|bipolar|schizophreni\w*|epilep\w*|dementia|alzheimer\w*|arthritis|pneumonia|hepatitis|hiv|covid\w*|migraine|tuberculosis|malaria|lupus|psoriasis|glaucoma|adhd|autism|ptsd|copd|an(?:a)?emia|thyroid|stroke|heart attack)\b/i;
+const HEALTH_RECORD_RE = /\b(?:my|his|her|their)\s{1,3}(?:medical\s{1,3}(?:records?|history)|diagnosis)\b/i;
+function healthShaped(s) {
+  for (const m of s.matchAll(DIAGNOSIS_RE)) {
+    const from = Math.max(0, m.index - 60);
+    if (HEALTH_CONDITION_RE.test(s.slice(from, m.index + m[0].length + 60))) return true;
+  }
+  return HEALTH_RECORD_RE.test(s);
+}
+
 /** The first rule a text trips, as a flag code, or null. Pure; bounded; linear in the text. */
 function preRule(text) {
   const s = String(text || '').slice(0, SCAN_LIMIT);
@@ -211,6 +227,7 @@ function preRule(text) {
     const digits = m[0].replace(/\D/g, '');
     if (digits.length >= 13 && digits.length <= 19 && luhn(digits)) return 'card';
   }
+  if (healthShaped(s)) return 'health';
   return null;
 }
 

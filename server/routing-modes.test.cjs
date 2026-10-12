@@ -570,3 +570,39 @@ test('hybrid routing: the sensitivity check reads the attached file text of a fr
   assert.equal(r.sensitivityCalls.length, 1);
   assert.ok(r.sensitivityCalls[0].join('\n').includes(MARKER), 'the router saw the attached file text');
 });
+
+// ── #1526: a clear health or medical-diagnosis text is a pre-rule (synthetic examples only) ──
+test('preRule health (#1526): a diagnosis with a condition, or a personal health record, flags; ordinary text does not', () => {
+  for (const text of [
+    'Test only: what does a fictional diagnosis of hypertension mean?',
+    'Synthetic note: the doctor diagnosed the patient with asthma last week.',
+    'Synthetic chart: diagnosed with diabetes in 2019.',
+    'Their diagnosis is listed as depression in the synthetic report.',
+    'Please summarise my medical history for the synthetic clinic visit.',
+  ]) assert.equal(rm.preRule(text), 'health', text);
+  for (const text of [
+    'What is the capital of Norway?', 'Say hi in one word.',
+    'The network diagnosis tool found a DNS fault in the synthetic lab.',
+    'The engine diagnosis reports fault code P0301 on the synthetic car.',
+    'I was diagnosed with a flat tyre on the synthetic road.',
+    'Hypertension is a term that appears in this synthetic history book.',
+    'My prescription glasses frame is broken.',
+    'Describe the diagnostic chart for synthetic widgets.',
+  ]) assert.equal(rm.preRule(text), null, text);
+});
+
+test('preRule health (#1526) is linear on adversarial input', () => {
+  const cases = { diagnosis: 'diagnosis '.repeat(40000), diagnosisGap: 'diagnosis ' + 'a '.repeat(30000) + 'asthma',
+    record: 'my '.repeat(50000) + 'medical', recordSpaces: 'my' + ' '.repeat(200000) + 'medical record' };
+  for (const [name, text] of Object.entries(cases)) {
+    const t0 = performance.now(); rm.preRule(text); const ms = performance.now() - t0;
+    assert.ok(ms < 200, `${name} took ${ms.toFixed(1)} ms`);
+  }
+});
+
+test('#1526: a health question raises the card even when the check cannot answer, and the service is not asked first', async (t) => {
+  const r = await run(t, { flag: true, settings: HYBRID, verdict: 'fail', message: 'Test only: what does a fictional diagnosis of hypertension mean?', answer: { choice: 'local' } });
+  assert.equal(r.events.find((e) => e.type === 'route_pending')?.flag, 'health');
+  assert.equal(r.sensitivityCalls.length, 0, 'the pre-rule answers the question; the service is not asked');
+  assert.equal(r.upstream.some((u) => u.url.startsWith(CLOUD)), false, 'nothing reached the cloud');
+});
