@@ -540,6 +540,50 @@ test('a temporary folder failure preserves its sources, while explicit detachmen
   assert.deepEqual((await workspaceProject(project.id)).files, []);
 });
 
+test('#1429 at the route: a refresh without the Retry header is held after a refused login, and the Retry header runs and clears the hold', async (t) => {
+  const storage = kind => request('/api/integrations/storage', { method: 'PUT', headers: mutationHeaders(), body: JSON.stringify({ kind, baseUrl: `http://127.0.0.1:${sharedDav.port}/dav`, username: 'u', secret: 'p', corpusRoot: 'Cowork' }) });
+  t.after(async () => { await storage('webdav'); });
+  assert.equal((await storage('nextcloud')).status, 200);
+  const { tree, bodies, listingStatuses } = sharedDav;
+  tree.SyntheticLatch = ['notes.md']; bodies['SyntheticLatch/notes.md'] = 'latch knowledge';
+  const project = await createTestProject('Latch hold');
+  const config = patch => request(`/api/projects/${project.id}/config`, { method: 'POST', headers: mutationHeaders(), body: JSON.stringify(patch) });
+  const refresh = (retry) => request(`/api/projects/${project.id}/sources/sync`, { method: 'POST', headers: retry ? { ...mutationHeaders(), 'x-cowork-storage-retry': '1' } : mutationHeaders() });
+  await config({ sourceFolders: ['SyntheticLatch'] });
+  const first = await refresh(true);
+  assert.equal(first.status, 200, first.text);
+  assert.deepEqual(JSON.parse(first.text).skipped, []);
+  assert.ok((await workspaceProject(project.id)).files.some((f) => f.name.endsWith('notes.md')));
+  // The saved login is refused: the explicit refresh runs, reports the refusal and keeps the sources.
+  const client = require('./storage-client.cjs'), list = client.listFiles;
+  let calls = 0;
+  client.listFiles = async (...args) => { calls++; return list(...args); };
+  try {
+    listingStatuses.set('SyntheticLatch', 401);
+    const refused = JSON.parse((await refresh(true)).text);
+    assert.equal(refused.skipped[0].code, 'storageLoginRejected');
+    assert.ok(refused.skipped[0].retained);
+    // Automatic (headerless) refreshes now stop: a 502 with the login code, and no storage call at all.
+    calls = 0;
+    const held = await refresh(false);
+    assert.equal(held.status, 502);
+    assert.equal(JSON.parse(held.text).code, 'storageLoginRejected');
+    assert.equal(calls, 0, 'a held refresh makes no storage call');
+    assert.ok((await workspaceProject(project.id)).files.some((f) => f.name.endsWith('notes.md')), 'sources are kept while held');
+    // The explicit Retry always runs; once the login works again it clears the hold for automatic refreshes.
+    listingStatuses.delete('SyntheticLatch');
+    const retried = await refresh(true);
+    assert.equal(retried.status, 200, retried.text);
+    assert.deepEqual(JSON.parse(retried.text).skipped, []);
+    assert.ok(calls >= 1, 'the explicit Retry made the storage call');
+    const automatic = await refresh(false);
+    assert.equal(automatic.status, 200, 'a working call cleared the latch, so automatic refreshes run again');
+  } finally {
+    client.listFiles = list;
+    listingStatuses.delete('SyntheticLatch');
+  }
+});
+
 test('DAV HTTP listing failures retain attached project sources and cached originals (#1313)', async (t) => {
   const storage = kind => request('/api/integrations/storage', { method: 'PUT', headers: mutationHeaders(), body: JSON.stringify({ kind, baseUrl: `http://127.0.0.1:${sharedDav.port}/dav`, username: 'u', secret: 'p', corpusRoot: 'Cowork' }) });
   t.after(async () => { await storage('webdav'); });
@@ -549,8 +593,10 @@ test('DAV HTTP listing failures retain attached project sources and cached origi
   tree.SyntheticOther = ['other.md']; bodies['SyntheticOther/other.md'] = 'other knowledge';
   const project = await createTestProject('DAV retention');
   const config = patch => request(`/api/projects/${project.id}/config`, { method: 'POST', headers: mutationHeaders(), body: JSON.stringify(patch) });
+  // #1429: a refresh without the explicit Retry header is held after a refused login (see the route's
+  // automaticHold). Every refresh here is an explicit one, so the earlier 401 below cannot hold the case under test.
   const sync = async () => {
-    const response = await request(`/api/projects/${project.id}/sources/sync`, { method: 'POST', headers: mutationHeaders() });
+    const response = await request(`/api/projects/${project.id}/sources/sync`, { method: 'POST', headers: { ...mutationHeaders(), 'x-cowork-storage-retry': '1' } });
     assert.equal(response.status, 200); return JSON.parse(response.text);
   };
   await config({ files: [{ name: 'local.txt', content: 'unrelated local upload' }] });
