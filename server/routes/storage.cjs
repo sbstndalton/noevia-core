@@ -3,6 +3,7 @@
 const { normalizeS3Region, S3_REGION_RE } = require('../s3-region.cjs');
 const { checkLogin } = require('../storage-client.cjs');
 const { requireJsonObject, readCappedJson } = require('../http.cjs');
+const { RUST_STORAGE_READS_REFUSAL } = require('../features.cjs');
 // A Nextcloud login-flow reply is a few hundred bytes; a server that streams more is refused (#902).
 const NEXTCLOUD_REPLY_CAP = 64 * 1024;
 // The user's own storage connection (Settings → Diary & storage): read and save it, test it,
@@ -36,8 +37,9 @@ const PASS = Symbol('unhandled');
  * @param {(authn, url:string) => boolean} deps.endpointApproved
  * @param {(...args) => Promise<Response>} deps.fetch     resolved per call so tests can swap the global
  * @param {{ randomUUID: () => string }} deps.crypto
+ * @param {() => boolean} [deps.storageReadsOwned] confirmed deployment owner; defaults off
  */
-function createStorageRoutes({ json, readJson: readAnyJson, authService, storageClient, endpointApproved, fetch, crypto }) {
+function createStorageRoutes({ json, readJson: readAnyJson, authService, storageClient, endpointApproved, fetch, crypto, storageReadsOwned = () => false }) {
   // Every body these routes read is a JSON object; `null`, an array or a number is a 400 (#786).
   const readJson = requireJsonObject(readAnyJson);
   const nextcloudFlows = new Map();
@@ -46,7 +48,10 @@ function createStorageRoutes({ json, readJson: readAnyJson, authService, storage
   }
 
   async function handle(req, res, { path: p, authn }) {
-    if (p === '/api/integrations/storage' && req.method === 'GET') return json(res, 200, authService.getStorage(authn.user.id));
+    if (p === '/api/integrations/storage' && req.method === 'GET') {
+      if (storageReadsOwned()) return json(res, 503, RUST_STORAGE_READS_REFUSAL);
+      return json(res, 200, authService.getStorage(authn.user.id));
+    }
     // Browse/read over the user's own connected storage (project knowledge
     // intake; read-only). The saved connection's own credentials are used
     // server-side and never returned to the client.

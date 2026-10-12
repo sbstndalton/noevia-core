@@ -5,6 +5,25 @@ const { createFeatures, REGISTRY, parseEnv } = require('./features.cjs');
 
 const memoryStore = (seed = {}) => { const m = new Map(Object.entries(seed)); return { m, get: k => m.get(k), set: (k, v) => m.set(k, v) }; };
 
+test('storage read ownership requires exact selector, confirmations and native auth', () => {
+  const { rustStorageReadsOwned } = require('./features.cjs');
+  const confirmed = {
+    NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_AUTH_CONFIRMED: '1',
+    NOEVIA_RUST_STORAGE_READS: '1', NOEVIA_RUST_STORAGE_READS_CONFIRMED: '1',
+  };
+  assert.equal(rustStorageReadsOwned(confirmed), true);
+  assert.equal(rustStorageReadsOwned({}), false);
+  for (const key of Object.keys(confirmed)) {
+    for (const value of [undefined, '', '0', 'true', '01', ' 1 ', '1\n', 'node']) {
+      assert.equal(rustStorageReadsOwned({ ...confirmed, [key]: value }), false, `${key}=${JSON.stringify(value)}`);
+    }
+  }
+  const features = createFeatures({ env: confirmed, store: memoryStore() });
+  assert.equal(features.names().includes('rustStorageReads'), false);
+  assert.equal(Object.values(REGISTRY).some(row => row.env === 'NOEVIA_RUST_STORAGE_READS'), false);
+  assert.throws(() => features.set('rustStorageReads', true, 'synthetic-admin'), e => e.status === 404);
+});
+
 test('every registered feature is off by default', () => {
   const features = createFeatures({ env: {}, store: memoryStore() });
   for (const name of Object.keys(REGISTRY)) assert.equal(features.enabled(name), false, name);
@@ -227,4 +246,103 @@ test('#705: the Code pipeline and merge flags are off by default and need the co
   assert.equal(createFeatures({ env: { ...sandbox, NOEVIA_FEATURE_CODE_PIPELINE: 'true' } }).enabled('codePipeline'), true);
   assert.equal(createFeatures({ env: { ...sandbox, NOEVIA_FEATURE_CODE_MERGE: 'true' } }).enabled('codeMerge'), true);
   assert.equal(createFeatures({ env: { NOEVIA_FEATURE_CONSTRAINED_PLAN_DECODING: 'true' } }).enabled('constrainedPlanDecoding'), true);
+});
+
+const nativeStatusEnv = () => ({ NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_AUTH_CONFIRMED: '1', NOEVIA_RUST_CHATGPT_STATUS: '1', NOEVIA_RUST_CHATGPT_STATUS_CONFIRMED: '1' });
+
+test('native ChatGPT status: every ownership selector is exact and confirmed', () => {
+  const { rustChatgptStatusOwned } = require('./features.cjs');
+  const baseline = nativeStatusEnv();
+  for (const key of Object.keys(baseline)) {
+    for (const value of [undefined, '', '0', 'true', 'yes', ' 1', '1 ', 'Rust', ' rust', 'rust ', 1]) {
+      assert.equal(rustChatgptStatusOwned({ ...baseline, [key]: value }), false, 'M6_STATUS_POLICY:confirmed_owner');
+    }
+  }
+  // Finite property: all 32 subsets, only the complete confirmed owner may hand off.
+  const keys = Object.keys(baseline);
+  for (let mask = 0; mask < 32; mask++) {
+    const env = Object.fromEntries(keys.map((key, i) => [key, mask & (1 << i) ? baseline[key] : '0']));
+    assert.equal(rustChatgptStatusOwned(env), mask === 31, 'M6_STATUS_POLICY:confirmed_owner');
+  }
+});
+
+test('native ChatGPT status: typed SQL projection affects only the two product keys', () => {
+  const Database = require('better-sqlite3');
+  const { settingsStore } = require('./features.cjs');
+  const db = new Database(':memory:');
+  try {
+    db.exec('CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT)');
+    const store = settingsStore(db);
+    db.prepare('INSERT INTO settings VALUES(?,?)').run('feature:chatgptOAuth', Buffer.from('true'));
+    assert.equal(store.get('feature:chatgptOAuth') === null, true, 'M6_STATUS_POLICY:typed_projection');
+    for (const key of ['feature:chatgptOAuth', 'feature:routingModes']) {
+      for (const raw of [Buffer.from('true'), Buffer.from('false'), null, 1, 0, 'TRUE', ' true ', '1', '', 'true', 'false']) {
+        db.prepare('INSERT OR REPLACE INTO settings VALUES(?,?)').run(key, raw);
+        const expected = raw === 'true' || raw === 'false' ? raw : null;
+        assert.equal(store.get(key), expected);
+      }
+      db.prepare('DELETE FROM settings WHERE key=?').run(key);
+      assert.equal(store.get(key), undefined);
+    }
+    const opaque = Buffer.from('true');
+    store.set('other', opaque);
+    assert.deepEqual(store.get('other'), opaque, 'unrelated settings retain their original projection');
+  } finally { db.close(); }
+});
+
+test('native ChatGPT status: refreshed cache follows typed truth on all read surfaces', () => {
+  const store = memoryStore({ 'feature:chatgptOAuth': 'true', 'feature:previews': 'false' });
+  const registry = { chatgptOAuth: REGISTRY.chatgptOAuth, previews: REGISTRY.previews };
+  const features = createFeatures({ env: nativeStatusEnv(), store, registry });
+  store.set('feature:chatgptOAuth', 'false');
+  assert.equal(features.enabled('chatgptOAuth'), false, 'M6_STATUS_POLICY:refreshed_cache');
+  // Construct before every change so each API independently has to refresh its own stale cache.
+  for (const read of [f => f.enabled('chatgptOAuth'), f => f.flags().chatgptOAuth, f => f.describe().find(row => row.name === 'chatgptOAuth').enabled]) {
+    for (const raw of ['true', 'false', undefined, null, 1, true, Buffer.from('true'), 'TRUE', ' true ', '1', '']) {
+      store.set('feature:chatgptOAuth', raw === 'true' ? 'false' : 'true');
+      store.set('feature:previews', 'false');
+      const f = createFeatures({ env: nativeStatusEnv(), store, registry });
+      if (raw === undefined) store.m.delete('feature:chatgptOAuth'); else store.set('feature:chatgptOAuth', raw);
+      store.set('feature:previews', 'true');
+      assert.equal(read(f), raw === 'true');
+      assert.equal(f.enabled('previews'), false, 'refresh does not broaden to other flags');
+      const row = f.describe().find(row => row.name === 'chatgptOAuth');
+      assert.equal(row.source, raw === 'true' || raw === 'false' ? 'admin' : 'default');
+      assert.equal(row.locked, false);
+    }
+  }
+  for (const env of [{}, { ...nativeStatusEnv(), NOEVIA_FRONT: 'node' }, { ...nativeStatusEnv(), NOEVIA_RUST_CHATGPT_STATUS_CONFIRMED: '0' }]) {
+    store.set('feature:chatgptOAuth', 'true');
+    const f = createFeatures({ env, store, registry });
+    store.set('feature:chatgptOAuth', 'false');
+    assert.equal(f.enabled('chatgptOAuth'), true, 'unconfirmed Node ownership retains the existing cache');
+  }
+});
+
+test('native ChatGPT status: env locks and read failures cannot resurrect stale truth', () => {
+  const registry = { chatgptOAuth: REGISTRY.chatgptOAuth };
+  for (const [raw, expected] of [[' TRUE ', true], ['On', true], ['yes', true], ['1', true], [' OFF ', false], ['No', false], ['false', false], ['0', false]]) {
+    let reads = 0;
+    const f = createFeatures({ env: { ...nativeStatusEnv(), NOEVIA_FEATURE_CHATGPT_OAUTH: raw }, registry, store: { get() { reads++; throw new Error('synthetic read'); }, set() { throw new Error('unexpected write'); } } });
+    assert.equal(f.enabled('chatgptOAuth'), expected);
+    assert.equal(f.flags().chatgptOAuth, expected);
+    assert.deepEqual([f.describe()[0].source, f.describe()[0].locked], ['env', true]);
+    assert.throws(() => f.set('chatgptOAuth', !expected, 'synthetic'), e => e.status === 409);
+    assert.equal(reads, 0, 'env override precedes store access');
+  }
+  assert.throws(() => createFeatures({ env: { ...nativeStatusEnv(), NOEVIA_FEATURE_CHATGPT_OAUTH: 'invalid' }, registry }));
+  const store = memoryStore({ 'feature:chatgptOAuth': 'true' });
+  const f = createFeatures({ env: { ...nativeStatusEnv(), NOEVIA_FEATURE_CHATGPT_OAUTH: ' ' }, store, registry });
+  const save = store.set;
+  store.set = (key, value) => { save(key, value); throw new Error('synthetic committed write then throw'); };
+  assert.throws(() => f.set('chatgptOAuth', false, 'synthetic'), /committed write/);
+  assert.equal(f.enabled('chatgptOAuth'), false, 'committed false survives failed cache update');
+  assert.equal(f.flags().chatgptOAuth, false);
+  assert.equal(f.describe()[0].enabled, false);
+  assert.throws(() => f.set('chatgptOAuth', true, 'synthetic'), /committed write/);
+  assert.equal(f.enabled('chatgptOAuth'), true);
+  store.get = () => { throw new Error('synthetic store unavailable'); };
+  for (const read of [() => f.enabled('chatgptOAuth'), () => f.flags(), () => f.describe()]) {
+    assert.throws(read, e => e.status === 503 && e.message === 'ChatGPT feature settings are unavailable.');
+  }
 });
