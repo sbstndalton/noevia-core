@@ -160,6 +160,8 @@ function createChatHandler({
   // #778 (features.routingModes): { enabled(), settings(), sensitivity(digest), awaitChoice(...),
   // setChatFlags(projectId, chatId, patch), log(entry) }. Not wired or flag off: nothing changes.
   routingModes = null,
+  // #1441: how a turn waits for the project's file jobs still running; the wait is bounded.
+  sourceJobs = require('./source-jobs.cjs'), sourceWaitMs = 30000,
 }) {
   const jsonOut = json;
   // Revoked Skill content in earlier turns (#546): one ledger per handler, cached in memory.
@@ -273,6 +275,16 @@ function createChatHandler({
     }
     let chatId = body.chatId || null;
     let project = null;
+    // #1441: a file attached just before this message may still be ingesting (its upload returned
+    // 202). Wait for it, bounded and abortable, so the turn is built from a project that has it. A
+    // file that failed or is still not done lets the turn go on without it; the reply says which.
+    let sourcesNotReady = [];
+    if (projectId && spaceId !== 'diary' && !body.compactOnly && chatWorkspace) {
+      const settled = await sourceJobs.settle(chatWorkspace, projectId, { timeoutMs: sourceWaitMs, signal: chatSignal.signal });
+      if (settled.aborted) return;
+      sourcesNotReady = settled.notReady;
+      if (sourcesNotReady.length) console.log(`[chat] ${sourcesNotReady.length} attached file(s) not ready for this turn`);
+    }
     if (projectId && spaceId !== 'diary') {
       project = getProject(projectId);
       if (!project && body.projectId) return json(res, 404, { error: 'no such project' });
@@ -395,6 +407,9 @@ function createChatHandler({
       }
       if (filesBlock) {
         sysParts.push(`Relevant knowledge-file excerpts for this message:\n${filesBlock}`);
+      }
+      if (sourcesNotReady.length) {
+        sysParts.push(`The user just attached ${sourcesNotReady.map((f) => JSON.stringify(f.name)).join(', ')}, but ${sourcesNotReady.length === 1 ? 'it was' : 'they were'} not ${sourcesNotReady.every((f) => f.reason === 'failed') ? 'processed' : 'finished processing'} in time, so ${sourcesNotReady.length === 1 ? 'its' : 'their'} contents are not available to you for this message. Say so if asked about ${sourcesNotReady.length === 1 ? 'it' : 'them'}; do not guess at the contents.`);
       }
       // Skills index (L0): name+description only, always visible. The model
       // pulls the full SKILL.md body on demand via read_project_file (L1).
@@ -792,7 +807,7 @@ function createChatHandler({
     res.once('close',()=>clearInterval(heartbeat));
     res.once('finish',()=>clearInterval(heartbeat));
     }
-    send({ type: 'meta', model, chatId: chatId || undefined, route: routedRole || undefined,
+    send({ type: 'meta', model, chatId: chatId || undefined, route: routedRole || undefined, sourcesNotReady: sourcesNotReady.length ? sourcesNotReady : undefined,
       routing: routeTarget ? { route: routeTarget.route, reason: routeTarget.reason, ...(routeTarget.detail ? { detail: routeTarget.detail } : {}) } : undefined,
       routingDecision: routingDecision || undefined, skill: pinnedSkill?.record, contextProfile: contextProfile || undefined,
       sampling: sampling.source === 'none' ? undefined : { preset: sampling.presetId || undefined, source: sampling.source, values: sampling.params } });

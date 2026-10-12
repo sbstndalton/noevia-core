@@ -10,10 +10,11 @@ const { createToolExchange } = require('./tool-exchange.cjs');
 const { createApprovals } = require('./approvals.cjs');
 const { createApprovalRoutes } = require('./routes/approvals.cjs');
 
-async function runDriveCall(t, { name, files = [], ragOverride = null, savedMode = null, connected = true, decision = 'approve', policyDuringApproval = null, autoDecision = null, history = [], sampling = undefined, autoSamplingEnabled = undefined, message = 'Synthetic Drive request', codeRoleConfigured = false }) {
+async function runDriveCall(t, { name, files = [], ragOverride = null, savedMode = null, connected = true, decision = 'approve', policyDuringApproval = null, autoDecision = null, history = [], sampling = undefined, autoSamplingEnabled = undefined, message = 'Synthetic Drive request', codeRoleConfigured = false, beforeChat = null, sourceWaitMs = undefined }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-drive-chat-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const user = { id: 'synthetic-user' }, project = { id: 'synthetic-project', model: 'synthetic-model', routing: autoDecision ? 'auto' : 'manual', toolboxes: ['core'], files, ...(sampling !== undefined ? { sampling } : {}) };
+  const workspace = { userId: user.id, dir };
   const store = { workspace: { userId: user.id }, authn: { user } };
   const requestScope = { getStore: () => store, run: (_scope, fn) => fn() };
   const accounts = { forUser: () => ({ drive: { state: () => ({ state: connected ? 'connected' : 'disconnected' }) } }) };
@@ -53,7 +54,7 @@ async function runDriveCall(t, { name, files = [], ragOverride = null, savedMode
     authService: { audit: (...args) => audits.push(args), db: autoSamplingEnabled === undefined ? undefined : { prepare: () => ({ get: () => ({ value: String(autoSamplingEnabled) }) }) } },
     toolPolicy: { mode: (_user, _tool, write) => currentMode === 'block' ? 'block' : write ? 'ask' : currentMode || 'allow' },
     modelManager: { enabled: true, load: async () => ({ ok: true }), health: async () => ({ ok: true, body: { all_models_loaded: ['synthetic-model', 'fast-model', 'smart-model', ...(codeRoleConfigured ? ['code-model'] : [])].map(model_name => ({ model_name, loaded: true, recipe_options: { ctx_size: 32768 } })) } }) },
-    requestScope, currentWorkspace: () => ({ userId: user.id, dir }), json() {}, getProject: () => project,
+    requestScope, currentWorkspace: () => workspace, json() {}, getProject: () => project,
     getProvider: () => ({ id: 'default', baseUrl: 'http://fixture.invalid', label: 'Mock' }), providerHeaders: () => ({}), saveChats() {}, endpointApproved: () => true,
     diaryHeaders: () => ({}), diaryExtras: require('./diary-extras.cjs'), autoRoles: () => autoDecision ? { fast: 'fast-model', smart: 'smart-model', ...(codeRoleConfigured ? { code: 'code-model' } : {}) } : null, lastLoadedModel: () => null,
     classifyFastOrSmart: async (message) => typeof autoDecision === 'function' ? autoDecision(message) : autoDecision || 'fast', servedCatalogue: async () => [], modelsInstalled: async () => [], missingRoles: () => [], staleRolesError: () => null,
@@ -68,11 +69,12 @@ async function runDriveCall(t, { name, files = [], ragOverride = null, savedMode
         { method: 'POST', body: JSON.stringify({ decision: action }) }, {}, { path: `/api/tool-approvals/${request.id}` }) });
       return waiting;
     },
-    recordUsage() {}, recordToolUse() {},
+    recordUsage() {}, recordToolUse() {}, ...(sourceWaitMs === undefined ? {} : { sourceWaitMs }),
   });
+  if (beforeChat) beforeChat({ project, workspace });
   await handler.handleChat({}, res, { message, projectId: project.id, chatId: 'synthetic-chat', history });
   assert.equal(events.some((event) => event.type === 'error'), false, JSON.stringify(events.filter((event) => event.type === 'error')));
-  return { executions, approvals, requests, events, audits };
+  return { executions, approvals, requests, events, audits, project };
 }
 
 test('connected Drive read runs in chat without approval when omitted from ENABLED_TOOLBOXES', async (t) => {
@@ -394,4 +396,44 @@ test('an ordinary manual project model is unaffected by the #409 guard', async (
   const { requests, jsonReplies } = await runFreeChat(t, { project, rolesConfigured: true });
   assert.equal(jsonReplies.length, 0);
   assert.equal(requests[0].model, 'project-model');
+});
+
+// #1441: a file attached to a new chat whose upload was accepted (202) but not yet ingested.
+const attachDuringTurn = ({ name, after = 40, fail = false, never = false }) => ({ project, workspace }) => {
+  require('./source-jobs.cjs').start(workspace, project.id, async () => {
+    if (never) return new Promise(() => {});
+    await new Promise((r) => setTimeout(r, after));
+    if (fail) throw Object.assign(new Error('ocr crashed at /secret/path with synthetic body'), { status: 422 });
+    project.files = [...project.files, { name, content: 'Synthetic attached body.' }];
+    return { status: 200, body: { name } };
+  }, { name });
+};
+const seeFiles = () => { const seen = []; return { seen, ragOverride: { filesContext: async (_p, readable) => { seen.push(readable.map((f) => f.name)); return null; } } }; };
+
+test('a message sent right after an accepted background upload waits for it and includes the file (#1441)', async (t) => {
+  const { seen, ragOverride } = seeFiles();
+  const r = await runDriveCall(t, { name: 'drive_read_file', files: [{ name: 'old.md', content: 'Old' }], ragOverride, beforeChat: attachDuringTurn({ name: 'attached.md' }) });
+  assert.deepEqual(seen, [['old.md', 'attached.md']]);
+  assert.equal(r.events.find((e) => e.type === 'meta').sourcesNotReady, undefined);
+  assert.equal(JSON.stringify(r.requests[0]).includes('not available to you'), false);
+});
+
+test('a file whose job failed does not hold the turn back and the reply meta names it, without contents (#1441)', async (t) => {
+  const { seen, ragOverride } = seeFiles();
+  const logs = []; const log = console.log; console.log = (...a) => { logs.push(a.join(' ')); };
+  let r;
+  try { r = await runDriveCall(t, { name: 'drive_read_file', ragOverride, beforeChat: attachDuringTurn({ name: 'broken.md', fail: true }) }); }
+  finally { console.log = log; }
+  assert.deepEqual(seen, []);
+  assert.deepEqual(r.events.find((e) => e.type === 'meta').sourcesNotReady, [{ name: 'broken.md', reason: 'failed' }]);
+  const system = r.requests[0].messages.filter((m) => m.role === 'system').map((m) => m.content).join('\n');
+  assert.match(system, /"broken\.md".*not processed/);
+  assert.equal(JSON.stringify(logs).includes('secret'), false);
+  assert.equal(JSON.stringify(logs).includes('broken.md'), false);
+});
+
+test('a file still processing after the bounded wait is reported as not ready and the turn goes on (#1441)', async (t) => {
+  const r = await runDriveCall(t, { name: 'drive_read_file', sourceWaitMs: 30, beforeChat: attachDuringTurn({ name: 'slow.md', never: true }) });
+  assert.deepEqual(r.events.find((e) => e.type === 'meta').sourcesNotReady, [{ name: 'slow.md', reason: 'timeout' }]);
+  assert.ok(r.events.some((e) => e.type === 'delta'), 'the turn still replied');
 });

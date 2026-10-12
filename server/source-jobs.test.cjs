@@ -37,3 +37,40 @@ test('a poll after a restart reports interruption instead of a missing job', asy
     assert.equal(polled.done, true); assert.equal(polled.status, 503); assert.match(polled.body.error, /restarted/);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('settle waits for a project\'s running file jobs, reports failures and timeouts, and ignores the rest (#1441)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-source-settle-'));
+  try {
+    const jobs = fresh(), ws = { dir };
+    assert.deepEqual(await jobs.settle(ws, 'p1'), { notReady: [], aborted: false }, 'nothing running');
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    jobs.start(ws, 'p1', async () => { await gate; return { status: 200, body: {} }; }, { name: 'ok.md' });
+    let free; jobs.start(ws, 'p2', () => new Promise((r) => { free = r; }), { name: 'elsewhere.md' });
+    assert.deepEqual(await jobs.settle(ws, 'p3'), { notReady: [], aborted: false }, 'another project is not waited for');
+    setTimeout(release, 20);
+    assert.deepEqual(await jobs.settle(ws, 'p1', { timeoutMs: 2000 }), { notReady: [], aborted: false });
+    free({ status: 200, body: {} });
+    await new Promise((r) => setTimeout(r, 20));
+    jobs.start(ws, 'p1', async () => ({ status: 422, body: { error: 'unreadable' } }), { name: 'bad.pdf' });
+    jobs.start(ws, 'p1', async () => { throw new Error('boom'); }, { name: 'crash.pdf' });
+    assert.deepEqual((await jobs.settle(ws, 'p1', { timeoutMs: 2000 })).notReady, [{ name: 'bad.pdf', reason: 'failed' }, { name: 'crash.pdf', reason: 'failed' }]);
+    assert.deepEqual(await jobs.settle(ws, 'p1'), { notReady: [], aborted: false }, 'finished jobs are not waited for again');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('settle gives up at its bound and stops at once when the client cancels (#1441)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-source-settle-cancel-'));
+  try {
+    const jobs = fresh(), ws = { dir };
+    jobs.start(ws, 'p1', () => new Promise(() => {}), { name: 'stuck.md' });
+    assert.deepEqual(await jobs.settle(ws, 'p1', { timeoutMs: 20 }), { notReady: [{ name: 'stuck.md', reason: 'timeout' }], aborted: false });
+    const cancel = new AbortController();
+    setTimeout(() => cancel.abort(), 10);
+    const started = Date.now();
+    assert.deepEqual(await jobs.settle(ws, 'p1', { timeoutMs: 5000, signal: cancel.signal }), { notReady: [], aborted: true });
+    assert.ok(Date.now() - started < 1000);
+    const gone = new AbortController(); gone.abort();
+    assert.equal((await jobs.settle(ws, 'p1', { timeoutMs: 5000, signal: gone.signal })).aborted, true);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
