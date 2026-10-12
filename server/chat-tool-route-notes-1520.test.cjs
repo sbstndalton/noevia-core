@@ -10,7 +10,7 @@ const { createVisionProbe } = require('./vision.cjs');
 
 const stream = (...frames) => ({ ok: true, body: (async function* () { for (const f of frames) yield Buffer.from('data: ' + JSON.stringify(f) + '\n\n'); })() });
 
-async function systemTextFor(t, message, { onServer = [{ id: 'nextcloud-files' }, { id: 'web-search' }, { id: 'core' }] } = {}) {
+async function systemTextFor(t, message, { onServer = [{ id: 'nextcloud-files' }, { id: 'web-search' }, { id: 'core' }], body = {}, overrides = {}, all = false } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-route-note-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const res = new EventEmitter();
   res.writeHead = () => {}; res.write = () => {}; res.end = () => { res.writableEnded = true; res.emit('finish'); };
@@ -36,10 +36,12 @@ async function systemTextFor(t, message, { onServer = [{ id: 'nextcloud-files' }
     lastLoadedModel: () => null, classifyFastOrSmart: async () => 'fast', servedCatalogue: async () => [], modelsInstalled: async () => [], missingRoles: () => [], staleRolesError: () => null,
     allToolboxes: () => onServer, chatWideApproved: () => false, recordUsage() {}, recordToolUse() {},
     executeToolCall: async () => 'unused', awaitApproval: async () => 'approve',
+    ...overrides,
   });
-  await handleChat({}, res, { projectId: 'fixture-project', chatId: 'fixture-chat', message });
+  await handleChat({}, res, { projectId: 'fixture-project', chatId: 'fixture-chat', message, ...body });
   const system = requests[0].body.messages.find((m) => m.role === 'system');
-  return system ? system.content : '';
+  const text = system ? system.content : '';
+  return all ? { text, requests } : text;
 }
 
 test('#1520: a Nextcloud request with Nextcloud Files off reaches the model with the not-available note', async (t) => {
@@ -56,4 +58,49 @@ test('#1521: a latest-version question with Web search off reaches the model wit
 test('an ordinary message gets no route note in its system text', async (t) => {
   const sys = await systemTextFor(t, 'Summarise the plan for the garden.');
   assert.doesNotMatch(sys, /named|Web search is|Connectors in this chat/);
+});
+
+const FILES_TOOL = { type: 'function', function: { name: 'nc_webdav_list', description: 'List files', parameters: { type: 'object', properties: {} } } };
+const CORE_TOOL = { type: 'function', function: { name: 'core_clock', description: 'Time', parameters: { type: 'object', properties: {} } } };
+const BOXES = [{ id: 'nextcloud-files', tools: [FILES_TOOL] }, { id: 'web-search', tools: [] }, { id: 'core', tools: [CORE_TOOL] }];
+const NC_MESSAGE = 'List the folders at the top of my Nextcloud files (names only).';
+
+test('#1586: with the Files tools really offered, the note names them (the baseline)', async (t) => {
+  const sys = await systemTextFor(t, NC_MESSAGE, { onServer: BOXES, body: { turnToolboxes: ['nextcloud-files'] },
+    overrides: { resolveTools: () => ({ tools: [FILES_TOOL, CORE_TOOL], dropped: [] }) } });
+  assert.match(sys, /Answer that request with the Nextcloud Files tools/);
+});
+
+test('#1586: a requested toolbox whose tools were all removed by policy or budget is reported as not available', async (t) => {
+  const sys = await systemTextFor(t, NC_MESSAGE, { onServer: BOXES, body: { turnToolboxes: ['nextcloud-files'] },
+    overrides: { resolveTools: () => ({ tools: [CORE_TOOL], dropped: [] }) } });
+  assert.doesNotMatch(sys, /Answer that request with the Nextcloud Files tools/);
+  assert.match(sys, /named Nextcloud Files, but Nextcloud Files is not available in this chat/);
+});
+
+test('#1586: a template that cannot take tools gets the tools-off notice and no "use the Files tools" note', async (t) => {
+  const { text, requests } = await systemTextFor(t, NC_MESSAGE, { onServer: BOXES, body: { turnToolboxes: ['nextcloud-files'] }, all: true,
+    overrides: { resolveTools: () => ({ tools: [FILES_TOOL, CORE_TOOL], dropped: [] }),
+      modelManager: { enabled: true, props: async () => ({}), health: async () => ({ ok: true, body: { all_models_loaded: [{ model_name: 'answer-model', loaded: true, recipe_options: { ctx_size: 32768 } }] } }) },
+      templateToolsGate: { allowsTools: async () => false, markUnsupported() {} } } });
+  assert.match(text, /No tools can run in this reply/);
+  assert.doesNotMatch(text, /Answer that request with the Nextcloud Files tools|Connectors in this chat/);
+  assert.equal(requests[0].body.tools, undefined);
+});
+
+test('#1586: when the engine refuses the tools and the round is retried without them, the connector note is taken out', async (t) => {
+  const seen = [];
+  const fetch = async (url, init) => {
+    const body = JSON.parse(init.body); seen.push(body);
+    if (body.tools) return new Response('Unable to generate parser for this template. Conversation roles must alternate', { status: 400 });
+    return stream({ choices: [{ delta: { content: 'synthetic reply' } }] });
+  };
+  await systemTextFor(t, NC_MESSAGE, { onServer: BOXES, body: { turnToolboxes: ['nextcloud-files'] },
+    overrides: { fetch, resolveTools: () => ({ tools: [FILES_TOOL, CORE_TOOL], dropped: [] }),
+      modelManager: { enabled: true, props: async () => ({}), health: async () => ({ ok: true, body: { all_models_loaded: [{ model_name: 'answer-model', loaded: true, recipe_options: { ctx_size: 32768 } }] } }) } } }).catch(() => {});
+  const retried = seen.find((b) => !b.tools);
+  assert.ok(retried, 'a retry without tools was sent');
+  const system = retried.messages.find((m) => m.role === 'system').content;
+  assert.match(system, /No tools can run in this reply/);
+  assert.doesNotMatch(system, /Answer that request with the Nextcloud Files tools/);
 });

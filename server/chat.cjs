@@ -140,10 +140,15 @@ function normalizeReplayHistory(mapped, newMessage) {
 // #1553: a reply whose chat template cannot take tools is told so in the request itself. Without this the model
 // said no search tool existed, or wrote search results it never had. The note is ours and holds no tool output.
 const TOOLS_OFF_MODEL_NOTE = 'No tools can run in this reply: this model\'s chat template cannot use them. If the person asks for a web search, a file, a live lookup or any other tool, say so in one line at the start. Do not write results, sources, excerpts or simulated output for it.';
-function withToolsOffNote(messages) {
+function withSystemNote(messages, note) {
   const at = messages.findIndex((m) => m?.role === 'system' && typeof m.content === 'string');
-  if (at < 0) return [{ role: 'system', content: TOOLS_OFF_MODEL_NOTE }, ...messages];
-  return messages.map((m, i) => (i === at ? { ...m, content: `${m.content}\n\n${TOOLS_OFF_MODEL_NOTE}` } : m));
+  if (at < 0) return [{ role: 'system', content: note }, ...messages];
+  return messages.map((m, i) => (i === at ? { ...m, content: `${m.content}\n\n${note}` } : m));
+}
+const withToolsOffNote = (messages) => withSystemNote(messages, TOOLS_OFF_MODEL_NOTE);
+function withoutSystemNote(messages, note) {
+  if (!note) return messages;
+  return messages.map((m) => (m?.role === 'system' && typeof m.content === 'string' && m.content.includes(`\n\n${note}`) ? { ...m, content: m.content.replace(`\n\n${note}`, '') } : m));
 }
 
 // #1574: a local reply that stops sending bytes after its first output is ended after `ms` with a named
@@ -590,12 +595,6 @@ function createChatHandler({
         brainBlock = require('./chat-brain.cjs').linkedBrainBlock({ enabled: true, frame: chatFrame, chatId: body.chatId, chats: brainContext.chats(), read: brainContext.read, maxChars: brainContext.maxChars() }) || '';
         if (brainBlock) sysParts.push(brainBlock);
       } catch { brainBlock = ''; /* fail open: no brain context */ }
-    }
-    // #1520 / #1521: a named storage connector's tools (or its absence), and Web search off for a
-    // time-sensitive question. Notes only; the tools offered and the gate are unchanged. Empty for most chats.
-    if (!body.compactOnly) {
-      const routeNote = require('./tool-route-notes.cjs').toolRouteNotes({ message, offered: requestToolboxes(), onServer: allToolboxes().map((b) => b.id) });
-      if (routeNote) sysParts.push(routeNote);
     }
     let sys = sysParts.join('\n\n');
     // #815: the system text without the brain block. Brains may summarise Diary-derived chats, so they
@@ -1327,6 +1326,22 @@ function createChatHandler({
       send({ type: 'warning', text: templateCaps.TOOLS_OFF_NOTICE });
       roundMessages = withToolsOffNote(roundMessages);
     }
+    // #1520 / #1521: a named storage connector's tools (or its absence), and Web search off for a time-sensitive
+    // question. Notes only; the tools offered and the gate are unchanged. Built from the tools this request really
+    // carries (after the external-provider strip, tool routing, policy blocks and the budget), and left out when the
+    // template cannot take tools at all, where "answer with the Files tools" would contradict the tools-off notice
+    // (#1586). Empty for most chats.
+    let routeNoteText = '';
+    if (!templateToolsOff) {
+      const names = new Set(activeTools.map((tool) => tool.function?.name));
+      const boxes = allToolboxes();
+      const offered = (routing.routed ? routing.ids : selectedBoxes).filter((id) => {
+        const tools = boxes.find((b) => b.id === id)?.tools;
+        return !Array.isArray(tools) || tools.some((tool) => names.has(tool.function?.name));
+      });
+      routeNoteText = require('./tool-route-notes.cjs').toolRouteNotes({ message, offered, onServer: boxes.map((b) => b.id) });
+      if (routeNoteText) roundMessages = withSystemNote(roundMessages, routeNoteText);
+    }
     const requestTools = () => (!templateToolsOff && activeTools.length ? { tools: activeTools } : {});
     // tool_choice for the gate's required tool: the first model turn (and its one retry) only.
     const forceChoice = (round) => (!templateToolsOff && forcedTool && round === 0 && activeTools.some((t) => t.function?.name === forcedTool)
@@ -1401,7 +1416,7 @@ function createChatHandler({
             discardBody(upstream);
             templateToolsOff = true;
             send({ type: 'warning', text: templateCaps.TOOLS_RETRY_NOTICE });
-            roundMessages = withToolsOffNote(roundMessages);
+            roundMessages = withToolsOffNote(withoutSystemNote(roundMessages, routeNoteText));
             upstream = await reasoningEffort.requestWithEffort(providerFetch, upstreamUrl, {
               method: 'POST', headers: upstreamHeaders, signal: roundSignal, redirect: 'error',
             }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:true,stream_options:{include_usage:true},
