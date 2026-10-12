@@ -8,6 +8,9 @@
 // it. This module owns the two persistence paths, the lookup with its legacy
 // alias, key masking for the client, and the request headers a provider gets.
 
+// Keys shorter than this show no characters at all when masked (#1482).
+const MASK_MIN_LENGTH = 12;
+
 /**
  * @param {object} deps
  * @param {() => object} deps.currentWorkspace
@@ -41,9 +44,12 @@ function createProviderRegistry({ currentWorkspace, PROVIDERS, DEFAULT_PROVIDER_
     return row ? { ...row, capabilities: effectiveCapabilities(row) } : null;
   }
 
+  // What the client may show of a stored key (#1482): the last four characters and nothing else.
+  // No vendor prefix (it reveals the key family) and no leading characters. A key too short for
+  // its last four to be a small share of it shows only the placeholder, never any characters.
   function maskKey(key) {
     if (!key || key === 'local') return null;
-    return key.length > 8 ? `${key.slice(0, 3)}…${key.slice(-4)}` : `…${key.slice(-4)}`;
+    return key.length >= MASK_MIN_LENGTH ? `…${key.slice(-4)}` : '••••';
   }
 
   function providerHeaders(provider, extra) {
