@@ -68,6 +68,32 @@ class Reader {
   }
 }
 
+// #1197: the parameter count is the element counts of the tensor-info block, summed. The same limits as
+// the Rust reader (crates/gguf tensor_params): at most 100,000 tensors, four dimensions each, every
+// dimension at most 2^53-1, and the total within an unsigned 64-bit value. Past any of them there is no count.
+const MAX_TENSOR_COUNT = 100000, MAX_TENSOR_DIMS = 4, MAX_SAFE_DIM = BigInt(Number.MAX_SAFE_INTEGER), MAX_ELEMENTS = (1n << 64n) - 1n;
+const TENSOR_PARAMS = Symbol('tensorParams');
+function tensorParams(r, count) {
+  if (count > MAX_TENSOR_COUNT) throw Error('implausible tensor_count');
+  let total = 0n;
+  for (let i = 0; i < count; i++) {
+    r.skip(r.u64()); // name
+    const dims = r.u32();
+    if (dims > MAX_TENSOR_DIMS) throw Error('tensor declares too many dimensions');
+    let elements = 1n;
+    for (let d = 0; d < dims; d++) {
+      const dim = r.take(8).readBigUInt64LE(0);
+      if (dim > MAX_SAFE_DIM) throw Error('tensor dimension out of range');
+      elements *= dim;
+      if (elements > MAX_ELEMENTS) throw Error('tensor element count overflows');
+    }
+    total += elements;
+    if (total > MAX_ELEMENTS) throw Error('parameter count overflows');
+    r.skip(4 + 8); // ggml type, data offset
+  }
+  return Number(total);
+}
+
 function readGguf(file) {
   const fd = fs.openSync(file, 'r');
   try {
@@ -75,11 +101,15 @@ function readGguf(file) {
     if (r.take(4).toString('latin1') !== 'GGUF') throw Error('Not a GGUF file');
     const version = r.u32();
     if (version < 2 || version > 3) throw Error(`Unsupported GGUF version ${version}`);
-    r.u64(); // tensor count
+    const tensorCount = r.u64();
     const kvCount = r.u64(), kv = {};
     for (let i = 0; i < kvCount; i++) {
       const key = r.string(), type = r.u32();
       kv[key] = r.value(type);
+    }
+    // #1197: read only after the KV pairs were read whole; a block cut short or malformed leaves no count.
+    if (tensorCount > 0) {
+      try { Object.defineProperty(kv, TENSOR_PARAMS, { value: tensorParams(r, tensorCount) }); } catch { /* no count */ }
     }
     return kv;
   } finally { fs.closeSync(fd); }
@@ -94,12 +124,22 @@ function mode(values) {
   return best;
 }
 
+// #1197: a declared general.parameter_count when it is a usable number (as Python's _fmt_params reads it),
+// else the tensor-info count; null when neither.
+function parameterCount(kv) {
+  const declared = kv['general.parameter_count'];
+  if (typeof declared === 'number' && Number.isFinite(declared) && declared > 0) return declared;
+  return kv[TENSOR_PARAMS] ?? null;
+}
+
 // Architecture-scoped fields the memory estimator needs.
 function summarize(kv) {
   const arch = typeof kv['general.architecture'] === 'string' ? kv['general.architecture'] : '';
   const a = key => kv[`${arch}.${key}`];
   const template = typeof kv['tokenizer.chat_template'] === 'string' ? kv['tokenizer.chat_template'] : '';
+  const params = parameterCount(kv);
   return {
+    ...(params === null ? {} : { parameterCount: params }),
     arch,
     name: typeof kv['general.name'] === 'string' ? kv['general.name'] : '',
     contextLength: int(a('context_length')),
