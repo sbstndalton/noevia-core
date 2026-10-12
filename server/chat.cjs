@@ -394,6 +394,9 @@ function createChatHandler({
     const accountSettings = require('./account-instructions.cjs').read(currentWorkspace().dir);
     const accountPart = require('./account-instructions.cjs').systemPart(accountSettings); // style, advanced controls and response language
     if (accountPart) sysParts.push(accountPart);
+    // #1573: today's date and the rule for time-sensitive answers, so a "latest" question is answered from the
+    // tool results, not from the model's training data. The day, not the time: see current-time-part.cjs.
+    sysParts.push(require('./current-time-part.cjs').systemPart());
     const accountMemory = require('./account-memory.cjs');
     const memoryPart = accountMemory.systemPart(accountMemory.read(currentWorkspace().dir), project?.memories);
     if (!project && memoryPart) sysParts.push(memoryPart);
@@ -789,6 +792,38 @@ function createChatHandler({
         return json(res, 409, { error: `${model} is an embedding, reranking or routing model and cannot answer chat messages — pick a chat model in the model popup.` });
       }
     }
+    // The tools this turn would offer, and the tool gate's verdict on them, are settled before the model is fixed:
+    // an Automatic turn whose gate says a tool is needed may move to a tool-capable role (#1550). The selection,
+    // routing, resolution and gate are the ones that used to run after the stream opened; nothing is sent here.
+    // Project and turn boxes with the Diary add-on and OAuth sign-in filters (requestToolboxes, above).
+    const selectedBoxes = requestToolboxes();
+    // Rule 2 of provider-egress.cjs: private tools (the Diary) are not offered through an external provider.
+    egress.stripPrivateToolboxes(selectedBoxes, provider);
+    const routing = await chatToolRouter.select(selectedBoxes, message);
+    if (routing.routed) console.log(`[tools] routed ${selectedBoxes.length} toolboxes to ${routing.ids.join(', ')}`);
+    // A tool the account blocked is never offered, so the model cannot even ask for it.
+    const blocked = (name) => toolPolicy.mode(chatUser?.id, name, isWriteTool(name)) === 'block';
+    const resolveFor = (m) => resolveTools({ ...project, toolboxes: routing.routed ? routing.ids : selectedBoxes }, m, blocked);
+    let resolved = resolveFor(model), resolvedFor = model;
+    // Tool gate (features.toolGate, tool-gate.cjs): runs on the tools this request really offers
+    // (after policy blocks and tool routing). Off, it returns 'none' without doing anything, and
+    // the request below is exactly what it was without the gate. It never picks a write.
+    const gate = toolGate && !body.compactOnly ? await toolGate.evaluate(message, resolved.tools, ...(chatFrame ? [steering.gateBias(chatFrame)] : [])) : null;
+    // #1550: only a turn the gate says needs a tool moves. Chit-chat, a gate that says no tool, and an unavailable
+    // gate (off, timed out, errored) keep the routed model; the template gate below then says the tools are off.
+    const toolModes = require('./tools-mode.cjs');
+    if (wantsAuto && !body.compactOnly && !routeTarget?.row && provider.id === DEFAULT_PROVIDER_ID && typeof modelManager?.props === 'function'
+      && toolModes.toolsModeOf(project) === 'auto' && toolModes.gateSaysToolNeeded(gate)) {
+      const moved = await toolModes.toolCapableRoute({ model, routedRole, roles: autoRoles(),
+        allowsTools: (m) => templateToolsGate.allowsTools(modelManager, m, chatSignal.signal) });
+      if (moved.rerouted) {
+        console.log(`[tools] ${model} cannot take tools; this Automatic turn needs a tool and goes to ${moved.role} (${moved.model})`);
+        model = moved.model;
+        routedRole = moved.role;
+        if (routingDecision) routingDecision = { ...routingDecision, effectiveRole: routedRole };
+        resolved = resolveFor(model); resolvedFor = model;
+      }
+    }
     // #1079: Context: High (the chat's or project's own choice) is served by the model's long-context
     // profile, `<model>-long` (Rust's long-profile decides); roles and the stored pick keep naming
     // the model. Local models only: a cloud model has no such profile. The engine keeps one chat
@@ -805,6 +840,8 @@ function createChatHandler({
         model = picked.model;
       }
     }
+    // The offered tools follow the answering model: the long-context profile above may have named its variant.
+    if (model !== resolvedFor) { resolved = resolveFor(model); resolvedFor = model; }
 
     // Accept both bare-host and conventional /v1-suffixed base URLs (cloud
     // providers like OpenRouter use https://host/api/v1).
@@ -929,10 +966,6 @@ function createChatHandler({
     // Resolve the project's toolboxes once for the whole exchange: every round
     // must offer the same list, or the model gets told a tool exists and then
     // punished for calling it.
-    // Project and turn boxes with the Diary add-on and OAuth sign-in filters (requestToolboxes, above).
-    const selectedBoxes = requestToolboxes();
-    // Rule 2 of provider-egress.cjs: private tools (the Diary) are not offered through an external provider.
-    egress.stripPrivateToolboxes(selectedBoxes, provider);
     // The provider can remove a box a skill requires (#272). A pinned skill then stops here, before
     // any model request; an automatically loaded one is taken back out of the prompt instead.
     if (pinnedSkill) {
@@ -944,11 +977,6 @@ function createChatHandler({
       for (const s of autoSkills) loadedSkills.delete(s.file);
       autoSkills = [];
     }
-    const routing = await chatToolRouter.select(selectedBoxes, message);
-    if (routing.routed) console.log(`[tools] routed ${selectedBoxes.length} toolboxes to ${routing.ids.join(', ')}`);
-    // A tool the account blocked is never offered, so the model cannot even ask for it.
-    const blocked = (name) => toolPolicy.mode(chatUser?.id, name, isWriteTool(name)) === 'block';
-    const resolved = resolveTools({ ...project, toolboxes: routing.routed ? routing.ids : selectedBoxes }, model, blocked);
     let activeTools = resolved.tools;
     const allowedToolNames = new Set(activeTools.map((t) => t.function.name));
     // The MCP server each offered name came from (#865): every call goes to the server whose tool
@@ -975,10 +1003,6 @@ function createChatHandler({
       console.warn(`[tools] ${model}: ${resolved.tools.length} tools ~${resolved.estTokens} tok (cap ${resolved.cap}, budget ${resolved.budget}); dropped ${resolved.dropped.length}: ${resolved.dropped.join(', ')}`);
     }
     const runTool = createToolExchange({ allowed: allowedToolNames, isWrite: isWriteTool, signal: chatSignal.signal });
-    // Tool gate (features.toolGate, tool-gate.cjs): runs on the tools this request really offers
-    // (after policy blocks and tool routing). Off, it returns 'none' without doing anything, and
-    // the request below is exactly what it was without the gate. It never picks a write.
-    const gate = toolGate && !body.compactOnly ? await toolGate.evaluate(message, resolved.tools, ...(chatFrame ? [steering.gateBias(chatFrame)] : [])) : null;
     // In-flight revocation (#272): the loaded skills against the project as stored now. Once revoked
     // it stays revoked for the rest of the exchange: no further tool runs and no further model round
     // starts, and a round already streaming is cut off at its next check (at most once a second).

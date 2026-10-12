@@ -124,7 +124,8 @@ function createProjectRoutes({
         // to manual — a standalone chat's shadow context must not inherit that (#352). It starts
         // on Auto like any other free chat with no explicit choice, until routingChosen (below)
         // records that a person actually picked one.
-        project = { ...diaryExtras.newProject(), id, name: 'Chat attachments ' + freeContext[1], instructions: '', toolboxes: [...DEFAULT_TOOLBOXES], routing: 'auto' };
+        // #1522: the Automatic mode is stated, not implied by the list (a stored list alone reads as Manual).
+        project = { ...diaryExtras.newProject(), id, name: 'Chat attachments ' + freeContext[1], instructions: '', toolboxes: [...DEFAULT_TOOLBOXES], routing: 'auto', toolsMode: 'auto' };
         PROJECTS.push(project); saveProjects(PROJECTS);
       }
       return json(res, 200, { project });

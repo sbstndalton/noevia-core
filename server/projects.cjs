@@ -327,6 +327,8 @@ function createProjectStore({
       routing: body.routing === 'manual' || body.routing === 'auto' ? body.routing : currentWorkspace()?.preferences?.defaultRouting === 'manual' ? 'manual' : 'auto',
       modes,
       toolboxes: sanitizeToolboxes(body.toolboxes) || [...defaultToolboxes()], // step 14: core only by default
+      // #1522: Automatic unless the request chose Manual. Without this the stored list alone reads as Manual.
+      toolsMode: require('./tools-mode.cjs').initialToolsMode(body),
       // (files normalization below is shared with the config route's RAG bookkeeping)
       chats: [],
       createdAt: Date.now(),

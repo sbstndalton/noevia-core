@@ -412,3 +412,15 @@ test('moveChat never moves a chat into a project it cannot live in, but in place
   assert.deepEqual(f.store.moveChat('in-old', chat.id, {}, () => true, chatDestination), { status: 200, from: old.id }, 'and the chat can be moved out');
   assert.deepEqual(f.store.moveChat('f1', chat.id, {}, () => true, chatDestination), { status: 200, from: null });
 });
+
+test('#1522: a new project starts on Automatic tools unless the request chose Manual', async () => {
+  const f = fixture();
+  const auto = await f.store.createProject({ name: 'Plan' });
+  assert.equal(auto.toolsMode, 'auto', 'the web sends no toolboxes or toolsMode: Automatic, not a Manual list');
+  assert.equal(require('./tools-mode.cjs').toolsModeOf(auto), 'auto');
+  const hand = await f.store.createProject({ name: 'Hand', toolboxes: ['core'] });
+  assert.equal(hand.toolsMode, 'manual', 'an explicit toolbox list is a hand pick');
+  assert.deepEqual(hand.toolboxes, ['core']);
+  assert.equal((await f.store.createProject({ name: 'Chosen', toolsMode: 'manual' })).toolsMode, 'manual');
+  assert.equal((await f.store.createProject({ name: 'Auto', toolsMode: 'auto', toolboxes: ['core'] })).toolsMode, 'auto');
+});
