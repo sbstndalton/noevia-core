@@ -1077,7 +1077,7 @@ async function handleRequestScoped(req, res) {
 
     if (await toolboxRoutes(req, res, { path: p, authn, url })) return;
 
-    if (await chatListRoutes(req, res, { path: p, authn })) return;
+    if (await chatListRoutes(req, res, { path: p, authn, url })) return;
 
     if (await providerRoutes(req, res, { path: p, authn, url })) return;
 

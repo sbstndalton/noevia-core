@@ -273,3 +273,42 @@ test('#1471 a chat exports as one Markdown file from its own lists; unknown, del
   assert.equal(bad.handled, true);
   assert.equal(await reply('POST', '/api/chats/f1/export').then(r => r.handled), false, 'only GET reads the export');
 });
+
+// #1450: the transcript search finds the chats whose message text holds the query, within this person's own lists.
+test('#1450 search matches message text in this person chats, not the internal list, and answers a short query with nothing', async () => {
+  const f = fixture();
+  f.histories.set('f1', [{ role: 'user', content: 'What is 12 times 3?' }, { role: 'assistant', content: 'Thirty-six.' }]);
+  f.projects[0].chats = [{ id: 'c1', title: 'Project chat' }];
+  f.histories.set('c1', [{ role: 'user', content: 'PINEAPPLE recipe' }]);
+  f.projects.push({ id: 'diary-extras', name: 'Diary', chats: [{ id: 'dx', title: 'Diary' }] });
+  f.histories.set('dx', [{ role: 'user', content: 'PINEAPPLE in the diary' }]);
+  const search = async (q) => {
+    const req = Readable.from([]);
+    req.method = 'GET';
+    const url = new URL(`http://localhost/api/chats/search?q=${encodeURIComponent(q)}`);
+    const handled = await f.routes(req, {}, { path: '/api/chats/search', authn: { user: { id: 'u1', role: 'member' } }, url });
+    assert.equal(handled, true);
+    return f.sent.pop();
+  };
+  assert.deepEqual(await search('thirty'), { status: 200, body: { chats: ['f1'], truncated: false } });
+  assert.deepEqual(await search('pineapple'), { status: 200, body: { chats: ['c1'], truncated: false } }, 'the internal diary project is not searched');
+  assert.deepEqual(await search('x'), { status: 200, body: { chats: [], truncated: false } }, 'a one-letter query reads nothing');
+  assert.deepEqual(await search('nothing-matches-this'), { status: 200, body: { chats: [], truncated: false } });
+  assert.equal((await search('a'.repeat(201))).status, 400);
+});
+
+test('#1450 search reads only the chats that are still in the lists', async () => {
+  const f = fixture();
+  f.histories.set('f1', [{ role: 'user', content: 'findme' }]);
+  f.histories.set('c1', [{ role: 'user', content: 'findme' }]);
+  f.projects[0].chats = [{ id: 'c1', title: 'x' }];
+  const search = async (q) => {
+    const req = Readable.from([]); req.method = 'GET';
+    await f.routes(req, {}, { path: '/api/chats/search', authn: { user: { id: 'u1', role: 'member' } }, url: new URL(`http://localhost/api/chats/search?q=${encodeURIComponent(q)}`) });
+    return f.sent.pop();
+  };
+  assert.deepEqual((await search('findme')).body.chats.sort(), ['c1', 'f1']);
+  f.freeChats.length = 0;
+  f.projects[0].chats = [];
+  assert.deepEqual((await search('findme')).body.chats, [], 'a chat no longer in the lists is not reported');
+});

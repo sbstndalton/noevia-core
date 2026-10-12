@@ -4,6 +4,7 @@
 //                                          delete-old-chats sweep has had its hourly chance to run
 //   GET  /api/chats/:id/context-window     the last context meter recorded for a chat
 //   GET  /api/chats/:id/export             one chat as a Markdown file (#1471)
+//   GET  /api/chats/search?q=              the chat ids whose message text holds q (#1450)
 //   GET/POST /api/freechats                the free-chat metas, merged against tombstones
 //   DELETE /api/freechats/:id
 //   GET/POST /api/chats/:id/history        the transcript, with a revision for optimistic saves
@@ -14,6 +15,8 @@
 // Blocks keep their original order and an unmatched method falls through as it did inline.
 
 const PASS = Symbol('unhandled');
+// #1450: the transcript search's bounds (one query reads at most this many chats).
+const SEARCH_MIN_QUERY = 2, SEARCH_MAX_QUERY = 200, SEARCH_MAX_CHATS = 500, SEARCH_MAX_RESULTS = 100;
 
 /**
  * @param {object} deps
@@ -47,7 +50,36 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
     retention.markSwept(dir);
   }
 
-  async function handle(req, res, { path: p, authn }) {
+  async function handle(req, res, { path: p, authn, url }) {
+    // #1450: the chats whose message text holds the query. Titles are matched in the client; this covers the
+    // transcripts, which the sidebar does not load. Only this person's own lists are read, and the scan is capped.
+    if (p === '/api/chats/search' && req.method === 'GET') {
+      const q = String(url?.searchParams?.get('q') ?? '').trim();
+      if (q.length > SEARCH_MAX_QUERY) return json(res, 400, { error: `Search for at most ${SEARCH_MAX_QUERY} characters.` });
+      if (q.length < SEARCH_MIN_QUERY) return json(res, 200, { chats: [], truncated: false });
+      const needle = q.toLowerCase();
+      const dir = currentWorkspace().dir, lists = require('../chat-lists.cjs');
+      const tombstones = lists.readTombstones(dir);
+      const candidates = [];
+      for (const chat of FREE_CHATS) if (chat && typeof chat.id === 'string') candidates.push(chat);
+      for (const project of PROJECTS) {
+        if (diaryExtras.internalProject(project)) continue;
+        for (const chat of project.chats || []) if (chat && typeof chat.id === 'string') candidates.push(chat);
+      }
+      const matches = [];
+      let scanned = 0, truncated = false;
+      for (const chat of candidates) {
+        if (tombstones.has(chat.id)) continue;
+        if (scanned >= SEARCH_MAX_CHATS) { truncated = true; break; }
+        scanned++;
+        const history = store.readHistory(chat.id) || [];
+        if (history.some((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string' && m.content.toLowerCase().includes(needle))) {
+          matches.push(chat.id);
+          if (matches.length >= SEARCH_MAX_RESULTS) { truncated = true; break; }
+        }
+      }
+      return json(res, 200, { chats: matches, truncated });
+    }
     if (p === '/api/workspace') {
       try { sweepRetention(); } catch (e) { console.warn('[retention] sweep failed:', e?.message || e); }
       // Attachments projects of chats deleted before #788 (only provably deleted ones; bounded).
