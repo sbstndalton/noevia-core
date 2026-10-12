@@ -141,6 +141,8 @@ function toolChoice(choice) {
  *  allowlist, so nothing the backend rejects is ever forwarded: temperature, top_p, top_k, min_p,
  *  max_tokens / max_output_tokens, stream_options, user, safety_identifier (openai-oauth #22),
  *  prompt_cache_retention (#38), metadata, service_tier, seed, stop, n, logprobs and the like. */
+// The levels this adapter forwards on any model (#1311 covers the rest, checked against the catalogue).
+const BASIC_EFFORTS = ['minimal', 'low', 'medium', 'high'];
 function toResponsesRequest(body) {
   const input = [];
   for (const m of Array.isArray(body.messages) ? body.messages : []) {
@@ -175,7 +177,7 @@ function toResponsesRequest(body) {
   // An explicit effort also asks for the reasoning summary, or the summary deltas chatParts
   // forwards never arrive (forks YangKeao@d72dec5, twaldin@b471a45). Model defaults are added in
   // fetchFor from the account catalogue.
-  if (['minimal', 'low', 'medium', 'high'].includes(body.reasoning_effort)) out.reasoning = { effort: body.reasoning_effort, summary: 'auto' };
+  if (BASIC_EFFORTS.includes(body.reasoning_effort)) out.reasoning = { effort: body.reasoning_effort, summary: 'auto' };
   // Structured output (openai-oauth #9/#40): chat's response_format becomes Responses text.format,
   // the same field the Codex CLI's --output-schema sends to this backend.
   const format = responseFormat(body.response_format);
@@ -688,6 +690,20 @@ function createChatGptOAuth({ db, secrets, fetchImpl = (...args) => globalThis.f
       const wantsStream = body.stream === true;
       const request = toResponsesRequest(body);
       const info = catalogue?.find((m) => m.slug === model);
+      // #1311: an explicit effort the basic mapping does not forward (xhigh, max, ultra, or any
+      // other level) is either sent, when this model's published list offers it, or refused with
+      // the levels it does offer. It is never dropped, which would answer at a level nobody chose.
+      const asked = typeof body.reasoning_effort === 'string' ? body.reasoning_effort : null;
+      if (asked && asked !== 'default' && !BASIC_EFFORTS.includes(asked)) {
+        const offered = info?.levels;
+        if (!Array.isArray(offered) || !offered.includes(asked)) {
+          const shown = asked.slice(0, 40);
+          return errorResponse(400, Array.isArray(offered) && offered.length
+            ? `ChatGPT does not offer "${shown}" reasoning for ${model.slice(0, 80)}. It offers ${offered.join(', ')}, or Default.`
+            : `ChatGPT's model list could not be read, so "${shown}" reasoning cannot be checked for ${model.slice(0, 80)}. Choose Default, Low, Medium or High.`);
+        }
+        request.reasoning = { ...(request.reasoning || {}), effort: asked, summary: request.reasoning?.summary || 'auto' };
+      }
       if (info) {
         // The model's own defaults, as the Codex client applies them (ModelInfo in
         // codex-rs/protocol/src/openai_models.rs: default_reasoning_level, default_reasoning_summary,
@@ -742,7 +758,9 @@ function createChatGptOAuth({ db, secrets, fetchImpl = (...args) => globalThis.f
     const ids = (Array.isArray(parsed?.models) ? parsed.models : [])
       .filter((m) => record(m) && typeof m.slug === 'string' && m.slug && m.supported_in_api !== false && (m.visibility === undefined || m.visibility === 'list'))
       .map((m) => ({ slug: m.slug.slice(0, 120), effort: word(m.default_reasoning_level), summary: word(m.default_reasoning_summary),
-        summaryParam: m.supports_reasoning_summary_parameter !== false })).slice(0, 50);
+        summaryParam: m.supports_reasoning_summary_parameter !== false,
+        // #1311: the levels this model publishes (null when the list is absent), so an explicit choice is checked.
+        levels: Array.isArray(m.supported_reasoning_levels) ? m.supported_reasoning_levels.map((l) => word(record(l) ? l.effort : null)).filter(Boolean).slice(0, 12) : null })).slice(0, 50);
     if (!ids.length) throw remember('ChatGPT returned no models for this account.');
     models.set(userId, { until: now() + MODEL_CACHE_MS, ids });
     return ids;
