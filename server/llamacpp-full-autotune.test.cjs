@@ -1759,8 +1759,51 @@ test('#1062 a deferred re-read happens before the tuned model next loads, and be
   f.status.outside = 'unloaded';
   const n = reloads.length;
   assert.equal((await f.manager.autotune.start('synthetic', { confirmPause: true })).status, 202);
+  // #1072: nothing was pending, so start() re-read nothing before it returned (the old check was >=).
+  assert.equal(reloads.length, n, 'no re-read before the new tune started');
   await finished(f.manager);
-  assert.ok(reloads.length >= n);
+});
+
+// #1072: a re-read owed by an interrupted job, with the model server reached through a fake request.
+function owedReread(t, { request, rawModels }) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'full-tune-owed-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const { createFullAutotuner } = require('./llamacpp-full-autotune.cjs');
+  const stateFile = path.join(dir, 'tune.json');
+  fs.writeFileSync(stateFile, JSON.stringify({ job: { status: 'interrupted', model: 'synthetic', _reloadPending: true, models: [] } }));
+  const presets = { get: () => ({ exists: true, options: {}, defaults: {} }), files: () => ({}), snapshot: () => ({ text: '', revision: '' }) };
+  const autotune = createFullAutotuner({ request, rawModels, presets, maintenance: {}, applyUnlocked: async () => ({ ok: true }),
+    identityFor: async m => ({ model: m }), stateFile, foreignPollMs: 1 });
+  const owed = () => JSON.parse(fs.readFileSync(stateFile, 'utf8')).job._reloadPending;
+  return { autotune, owed };
+}
+
+test('#1072 a flush the model server cannot answer is a plain refusal, and the re-read is still owed', async t => {
+  let reloads = 0, failing = true;
+  const request = async url => { if (url.startsWith('/models?reload')) { reloads++; if (failing) throw Error('socket hang up'); } return { ok: true, body: {} }; };
+  const { autotune, owed } = owedReread(t, { request, rawModels: async () => ({ ok: true, body: { data: [] } }) });
+  const err = await autotune.flushReload().catch(e => e);
+  assert.equal(err.publicMessage, 'The model server has not re-read the restored settings yet. Try again shortly.', String(err && err.message));
+  assert.equal(reloads, 1);
+  assert.equal(owed(), true, 'still owed after the failed flush');
+  failing = false;
+  await new Promise(r => setTimeout(r, 200));  // the re-armed re-read delivers it
+  assert.ok(reloads >= 2);
+  assert.equal(owed(), false);
+});
+
+test('#1072 a flush that lands while the background re-read is checking the router is not followed by a second re-read', async t => {
+  let reloads = 0;
+  const request = async url => { if (url.startsWith('/models?reload')) reloads++; return { ok: true, body: {} }; };
+  // The router answers slowly, so the background timer has fired and is still inside its check when the flush runs.
+  const rawModels = async () => { await new Promise(r => setTimeout(r, 80)); return { ok: true, body: { data: [] } }; };
+  const { autotune } = owedReread(t, { request, rawModels });
+  await autotune.recover();
+  await new Promise(r => setTimeout(r, 40));
+  await autotune.flushReload();
+  assert.equal(reloads, 1);
+  await new Promise(r => setTimeout(r, 150));
+  assert.equal(reloads, 1, 'the in-flight check did not re-read again');
 });
 
 test('#1062 a pending re-read is re-armed after a restart and forced by the next tune', { skip: skipContention }, async t => {

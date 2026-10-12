@@ -885,6 +885,8 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     reloadTimer = setTimeout(async () => {
       if (!j._reloadPending) return;
       if ((await othersLiveNow(j.model)) === false) {
+        // #1072: a flush may have re-read the file while this check was in flight; no second re-read.
+        if (!j._reloadPending) return;
         try { const r = await request('/models?reload=1', {}, 120000); if (r.ok) { j._reloadPending = false; note(j, 'The model server re-read the restored models.ini.'); return; } } catch { /* retried below */ }
       }
       scheduleReload(j, tries + 1);
@@ -898,8 +900,13 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     const j = state.job;
     if (!j?._reloadPending || (model && model !== j.model)) return;
     clearTimeout(reloadTimer);
-    const r = await request('/models?reload=1', {}, 120000);
-    if (!r.ok) throw publicFail('The model server has not re-read the restored settings yet. Try again shortly.');
+    // #1072: a request that throws (the server unreachable) is the same refusal as a bad answer, and the
+    // re-read is still owed, so it is re-armed rather than left for the next flush alone.
+    const r = await request('/models?reload=1', {}, 120000).catch(() => null);
+    if (!r?.ok) {
+      scheduleReload(j);
+      throw publicFail('The model server has not re-read the restored settings yet. Try again shortly.');
+    }
     j._reloadPending = false; note(j, 'The model server re-read the restored models.ini.');
   }
   async function runPhase(j, item, p) {
