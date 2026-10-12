@@ -52,15 +52,23 @@ test('filesContext reports retrieved excerpts (with score) and whole small files
   const files = [{ name: 'small.md', content: 'tiny note' }, { name: 'big.txt', content: 'Z'.repeat(5000) }];
   let placed = null;
   const text = await load([{ file: 'big.txt', body: 'EXCERPT', score: 0.7 }, { file: 'gone.md', body: 'STALE', score: 0.9 }], true)
-    .filesContext('p', files, 'q', 'tenant', (p) => { placed = p; });
+    .filesContext('p', files, 'q small.md', 'tenant', (p) => { placed = p; });
   assert.deepEqual(Array.from(placed, (p) => [p.file, p.kind, p.score]), [['big.txt', 'excerpt', 0.7], ['small.md', 'file', undefined]]);
   assert.ok(!text.includes('STALE'));
+});
+
+test('#1457: a whole file the question does not name is injected but not reported as a source', async () => {
+  const files = [{ name: 'small.md', content: 'tiny note' }, { name: 'big.txt', content: 'Z'.repeat(5000) }];
+  let placed = null;
+  const text = await load([], false).filesContext('p', files, 'Name three colours of the rainbow', 'tenant', (p) => { placed = p; });
+  assert.match(text, /label="small\.md"/, 'still in the prompt');
+  assert.equal(placed.length, 0, 'no source chip for a file the question did not name');
 });
 
 test('without retrieval the fallback heads that reach the prompt are reported; omitted files are not', async () => {
   const files = [{ name: 'big.txt', content: 'Z'.repeat(5000) }, { name: 'huge.txt', content: 'Y'.repeat(5000) }];
   let placed = null;
-  await load([], false, { FILES_CONTEXT_MAX_CHARS: 5300 }).filesContext('p', files, 'q', 't', (p) => { placed = p; });
+  await load([], false, { FILES_CONTEXT_MAX_CHARS: 5300 }).filesContext('p', files, 'q big.txt huge.txt', 't', (p) => { placed = p; });
   assert.equal(placed.length, 1, 'the file that did not fit the prompt budget is not claimed as a source');
   assert.equal(placed[0].kind, 'file');
 });

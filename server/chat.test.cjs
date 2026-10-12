@@ -441,14 +441,15 @@ test('a file still processing after the bounded wait is reported as not ready an
 
 test('a free chat\'s attachment is shown with the user\'s turn as attached to the chat, not as project knowledge (#1441)', async (t) => {
   const files = [{ name: 'note.md', content: 'Synthetic codeword: PINEAPPLE-7.', attachment: { id: 'att-1', state: 'ready' } }];
-  const r = await runDriveCall(t, { name: 'drive_read_file', projectId: 'cowork-chat-context-c-synthetic1', files, realRag: true, message: 'Summarize this file in one sentence.' });
+  // The question names the file: a whole file is reported as a source only when named (#1457).
+  const r = await runDriveCall(t, { name: 'drive_read_file', projectId: 'cowork-chat-context-c-synthetic1', files, realRag: true, message: 'Summarize note.md in one sentence.' });
   const messages = r.requests[0].messages;
   const system = messages.filter((m) => m.role === 'system').map((m) => m.content).join('\n');
   assert.doesNotMatch(system, /Chat attachments|knowledge-file|user's project|PINEAPPLE/);
   const user = messages.filter((m) => m.role === 'user').at(-1).content;
   assert.match(user, /^The user attached these files to this chat \(1\): "note\.md"/);
   assert.match(user, /<untrusted[^>]*kind="file"[\s\S]*PINEAPPLE-7/);
-  assert.ok(user.endsWith('Summarize this file in one sentence.'), 'the file comes before the question');
+  assert.ok(user.endsWith('Summarize note.md in one sentence.'), 'the file comes before the question');
   assert.deepEqual(r.events.find((e) => e.type === 'sources').sources.map((s) => s.file), ['note.md']);
 });
 

@@ -522,3 +522,41 @@ test('#796 F1: a re-index that could not open the index keeps the previous versi
   assert.equal(rag.trackedFileState().versions, base.versions + 1, 'the wanted version is kept after the failed run');
   assert.deepEqual(await rag.searchProject('p-trans-idx', 'zebra', null), [], 'the old version must not become current again');
 });
+
+// #1457: the reply's source chips list what the answer used. Whole files are always injected (small
+// ones verbatim whatever the question), so the prompt cannot say which of them an answer drew on; only
+// a file the question names is reported. Retrieved excerpts are still reported as before.
+test('#1457: a whole small file is a reported source only when the question names it', async () => {
+  reset();
+  const files = [file('qa-fixture-a.md', 'alpha note'), file('qa-fixture-b.md', 'beta note'), file('qa-fixture-c.md', 'gamma note')];
+  const reported = async (query) => {
+    let placed = null;
+    const out = await rag.filesContext('p-1457', files, query, null, (p) => { placed = p; });
+    assert.match(out, /label="qa-fixture-a\.md"/, 'every small file is still injected whole');
+    return placed.map((e) => e.file);
+  };
+  assert.deepEqual(await reported('Name three colours of the rainbow'), [], 'a question about nothing in the sources reports none');
+  assert.deepEqual(await reported('In one short sentence, what is the heading of qa-fixture-b.md?'), ['qa-fixture-b.md']);
+  assert.deepEqual(await reported('compare qa-fixture-c.md with qa-fixture-a.md'), ['qa-fixture-a.md', 'qa-fixture-c.md'], 'in prompt order');
+  assert.deepEqual(await reported('what is in qa-fixture-b.md.bak?'), [], 'a longer name does not count as naming a shorter one');
+});
+
+test('#1457: a name only counts when it is a whole token, and a path names its last segment', async () => {
+  reset();
+  const files = [file('notes/data.md', 'x'), file('a.md', 'y')];
+  let placed = null;
+  await rag.filesContext('p-1457b', files, 'what is in mydata.md and Data.md?', null, (p) => { placed = p; });
+  assert.deepEqual(placed.map((e) => e.file), ['notes/data.md'], 'Data.md names the file, mydata.md does not name a.md');
+  placed = null;
+  await rag.filesContext('p-1457b', files, 'summarise a.md', null, (p) => { placed = p; });
+  assert.deepEqual(placed.map((e) => e.file), ['a.md']);
+});
+
+test('#1457: a retrieved excerpt is still reported as a source', async () => {
+  reset();
+  await rag.indexProjectFile('p-1457c', 'big.txt', big('walrus'), null);
+  let placed = null;
+  await rag.filesContext('p-1457c', [file('big.txt', big('walrus')), file('small.md', 'zebra note')], 'walrus', null, (p) => { placed = p; });
+  assert.ok(placed.some((e) => e.file === 'big.txt' && e.kind === 'excerpt'), 'the retrieved excerpt is reported');
+  assert.ok(!placed.some((e) => e.file === 'small.md'), 'the unnamed small file is not');
+});
