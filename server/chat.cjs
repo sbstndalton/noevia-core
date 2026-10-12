@@ -394,6 +394,9 @@ function createChatHandler({
     const accountSettings = require('./account-instructions.cjs').read(currentWorkspace().dir);
     const accountPart = require('./account-instructions.cjs').systemPart(accountSettings); // style, advanced controls and response language
     if (accountPart) sysParts.push(accountPart);
+    // #1573: today's date and the rule for time-sensitive answers, so a "latest" question is answered from the
+    // tool results, not from the model's training data. The day, not the time: see current-time-part.cjs.
+    sysParts.push(require('./current-time-part.cjs').systemPart());
     const accountMemory = require('./account-memory.cjs');
     const memoryPart = accountMemory.systemPart(accountMemory.read(currentWorkspace().dir), project?.memories);
     if (!project && memoryPart) sysParts.push(memoryPart);
