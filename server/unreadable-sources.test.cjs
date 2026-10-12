@@ -59,7 +59,8 @@ test('chat context never offers or cites an unreadable file', async () => {
     frameUntrusted: require('./prompt-framing.cjs').frameUntrusted, ragAvailable: () => false, searchProject: async () => [] };
   vm.createContext(context); vm.runInContext(body, context);
   let placed = [];
-  const text = await context.filesContext('p', skills.sources(project), 'plan', 'u', (p) => { placed = p; });
+  // The question names the readable file, so it is reported as a source (#1457: unnamed whole files are not).
+  const text = await context.filesContext('p', skills.sources(project), 'plan in notes.txt', 'u', (p) => { placed = p; });
   assert.ok(!text.includes('broken.txt'));
   assert.deepEqual(Array.from(placed, (p) => p.file), ['notes.txt']);
   // Defence in depth: even if a caller hands the unreadable file to the citation builder, it is dropped.

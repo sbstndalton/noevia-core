@@ -579,6 +579,18 @@ async function searchProject(projectId, query, userId) {
 // for anything <= DIRECT_INJECT_MAX). Never throws. `{ attached: true }` words it for a chat's own attachments.
 async function filesContext(projectId, files, query, userId, onSources, { attached = false } = {}) {
   if (!Array.isArray(files) || files.length === 0) return null;
+  // #1457: whether the question names a file, by its full stored name or its last path segment, as a
+  // whole token ("data.md" is not named by "mydata.md" or "data.md.bak"). Whole files are reported as
+  // sources only when named: every small file is injected whole whatever the question, so the prompt
+  // cannot say which of them an answer drew on, and naming the file is the one signal we have.
+  // (Defined inside the function, not beside it: unreadable-sources.test.cjs runs this body as a slice.)
+  const questionNames = (name) => {
+    const q = String(query || '').toLowerCase();
+    const escape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const whole = (s) => new RegExp(`(?<![a-z0-9_.\\-])${escape(s)}(?![a-z0-9_\\-]|\\.[a-z0-9])`);
+    const full = String(name).toLowerCase();
+    return whole(full).test(q) || whole(full.split('/').pop()).test(q);
+  };
   const small = files.filter((f) => String(f.content || '').length <= DIRECT_INJECT_MAX);
   const large = files.filter((f) => String(f.content || '').length > DIRECT_INJECT_MAX);
 
@@ -613,7 +625,8 @@ async function filesContext(projectId, files, query, userId, onSources, { attach
   candidates.sort((a, b) => a.text.length - b.text.length);
   const omitted = [];
   for (const c of candidates) {
-    if (c.text.length <= budget) { parts.push(c.text); budget -= c.text.length; placed.push({ file: c.f.name, body: c.body, kind: 'file' }); }
+    // #1457: injected either way, but reported as a source only when the question names it.
+    if (c.text.length <= budget) { parts.push(c.text); budget -= c.text.length; if (questionNames(c.f.name)) placed.push({ file: c.f.name, body: c.body, kind: 'file' }); }
     else omitted.push(c.f.name);
   }
   if (omitted.length) manifest += ` ${omitted.length} more file${omitted.length === 1 ? '' : 's'} not included (prompt size limit): ${omitted.map((n) => `"${n}"`).join(', ')}.`;
