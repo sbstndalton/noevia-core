@@ -259,6 +259,7 @@ test('scope limits: a device token never reaches administration or account secur
     ['POST', '/api/auth/device/approve', { user_code: 'BCDF-GHJK', approve: true }],
     ['PUT', '/api/integrations/storage', { kind: 'local' }],
     ['POST', '/api/integrations/storage/nextcloud/start', {}],
+    ['POST', '/api/integrations/storage/nextcloud/cancel', {}],
   ];
   for (const [method, url, body] of refused) {
     const r = await asDevice(tokens.access_token, url, { method, body });
