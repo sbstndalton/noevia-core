@@ -54,3 +54,12 @@ test('supervision deadline cap is 2000 ms (#682)',async()=>{
   assert.deepEqual(await at(2001).decide(input),{action:'continue',source:'existing'});
   assert.equal(called,1);
 });
+
+test('an explicit goal from the caller wins over the last user message (#1441)',async()=>{
+  const goals=[];
+  const attached={round:0,goal:'Summarize this file.',messages:[{role:'user',content:'The user attached these files to this chat (1): "a.md"\n<untrusted>file text</untrusted>\n\nSummarize this file.'},{role:'tool',tool_call_id:'c',content:'result'}]};
+  await active(async s=>{goals.push(s.goal);return {action:'continue'};}).decide(attached);
+  await active(async s=>{goals.push(s.goal);return {action:'continue'};}).decide({...attached,goal:undefined});
+  assert.equal(goals[0],'Summarize this file.');
+  assert.match(goals[1],/^The user attached/,'without one it still reads the last user message');
+});

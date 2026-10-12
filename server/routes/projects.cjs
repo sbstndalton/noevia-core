@@ -104,7 +104,7 @@ function createProjectRoutes({
         let status = 500, data = '';
         await requestScope.run({ ...requestScope.getStore(), sourceProgress: progress }, () => dispatch(inner, { setHeader() {}, writeHead(code) { status = code; }, end(value) { data = String(value || '{}'); } }));
         return { status, body: JSON.parse(data) };
-      });
+      }, { name: backgroundSource[2] === 'sources/sync' ? null : String(body?.name || '').split('/').pop() });
       return json(res, 202, { poll: `/api/projects/${encodeURIComponent(projectId)}/source-jobs/${jobId}` });
     }
 

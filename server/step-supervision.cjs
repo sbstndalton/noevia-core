@@ -6,7 +6,7 @@ function createStepSupervision({ enabled = () => false, provider = null, deadlin
   log = (entry) => console.info('[system-one] supervise', JSON.stringify(entry)) } = {}) {
   if (!Number.isFinite(deadlineMs) || deadlineMs < 1 || deadlineMs > 2000) throw Error('Invalid supervision deadline');
   return {
-    async decide({ round, messages, signal }) {
+    async decide({ round, messages, signal, goal: requested }) {
       const fallback = { action: 'continue', source: 'existing' };
       if (!enabled() || !provider || signal?.aborted || round >= 2) return fallback;
       // Explicit, bounded model-facing outputs only: no credentials, reasoning or approval grants.
@@ -26,7 +26,9 @@ function createStepSupervision({ enabled = () => false, provider = null, deadlin
           if (signal?.aborted) abort();
         });
         const request = messages.findLast(m => m.role === 'user');
-        const goal = typeof request?.content === 'string' ? request.content.slice(0, 1500) : '';
+        // The caller's own words for the goal when it has them: the last user message can start with
+        // attached file text (#1441), which is not the request.
+        const goal = typeof requested === 'string' ? requested.slice(0, 1500) : typeof request?.content === 'string' ? request.content.slice(0, 1500) : '';
         const result = await Promise.race([
           Promise.resolve().then(() => controller.signal.aborted ? null : provider.decide({ round, goal, outputs, choices: ['continue', 'verify', 'escalate'] }, { signal: controller.signal })),
           unavailable,
