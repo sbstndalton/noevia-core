@@ -9,6 +9,10 @@
 // under /assets/ that the build does not have. The page itself decides access: index.html carries
 // no data, and a signed-out browser gets the sign-in screen, then the app at the same path.
 // WebDAV is a separate listener (COWORK_DAV_PORT) and never reaches this.
+//
+// #1469: a browser *navigation* to an unknown page gets the shell with a 404 status, so the app
+// can show its own not-found page (with a way back into the app) instead of a raw JSON body. Only
+// navigations get it: a script's fetch, curl, or any /api/ path keeps the JSON 404.
 
 const ID = '[A-Za-z0-9_-]{1,120}';
 const SEG = '[^/]{1,600}';
@@ -37,13 +41,34 @@ function isClientRoute(pathname) {
   return CLIENT_ROUTES.some((re) => re.test(pathname));
 }
 
+// Paths that are protocol endpoints, never a page a person could navigate to: they keep JSON 404s.
+function isProtocolPath(pathname) {
+  return pathname === '/api' || pathname.startsWith('/api/') || pathname.startsWith('/assets/')
+    || pathname.startsWith('/remote.php') || pathname.startsWith('/dav') || pathname.startsWith('/.well-known');
+}
+
+/** A top-level page load (typed address, link, reload), as opposed to a script's fetch or a tool's
+ *  request. Sec-Fetch-Dest is authoritative where the browser sends it; otherwise the Accept header
+ *  is the only signal left. */
+function isBrowserNavigation(req) {
+  const dest = req.headers && req.headers['sec-fetch-dest'];
+  if (dest) return dest === 'document';
+  return /text\/html/.test(String((req.headers && req.headers.accept) || ''));
+}
+
 /** The last mount in index.cjs: a file from the build if there is one, index.html for a client
- *  place, a JSON 404 for anything else. `staticFiles` is static-files.cjs; `json` is http.cjs's. */
+ *  place, the shell with a 404 for a browser navigation to an unknown page (#1469), a JSON 404 for
+ *  anything else. `staticFiles` is static-files.cjs; `json` is http.cjs's. */
 function createStaticFallback({ staticFiles, indexFile, json }) {
   return function serveStatic(req, res, pathname) {
     const found = staticFiles.resolve(pathname);
     if (found && found.forbidden) return json(res, 403, { error: 'forbidden' });
-    if (!found && !isClientRoute(pathname)) return json(res, 404, { error: 'not found' });
+    if (!found && !isClientRoute(pathname)) {
+      if (!isProtocolPath(pathname) && isBrowserNavigation(req)) {
+        try { return staticFiles.send(req, res, indexFile, '/', 404); } catch { /* fall through to JSON */ }
+      }
+      return json(res, 404, { error: 'not found' });
+    }
     try {
       return staticFiles.send(req, res, found ? found.filePath : indexFile, found ? pathname : '/');
     } catch {

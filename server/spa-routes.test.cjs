@@ -85,3 +85,73 @@ test('isClientRoute: narrow on purpose', () => {
     assert.equal(isClientRoute(p), false, String(p));
   }
 });
+
+// #1469: a browser navigation to an unknown page gets the app shell with a 404 status (so the app
+// can show its own not-found page); a script's request, and every protocol path, keeps JSON.
+function callWith(serve, pathname, headers) {
+  return new Promise((resolve) => {
+    const res = {
+      headersSent: false, status: 0, headers: {}, body: '',
+      writeHead(status, h) { this.status = status; this.headers = h || {}; this.headersSent = true; },
+      setHeader(k, v) { this.headers[k] = v; },
+      end(body) { this.body = body === undefined ? '' : String(body); resolve(this); },
+    };
+    serve({ method: 'GET', headers }, res, pathname);
+  });
+}
+const NAVIGATE = { 'sec-fetch-dest': 'document', accept: 'text/html,application/xhtml+xml,*/*;q=0.8' };
+
+test('a browser navigation to an unknown page gets the app shell with a 404 status (#1469)', async () => {
+  const root = build();
+  const serve = createStaticFallback({ staticFiles: createStaticFiles(root), indexFile: path.join(root, 'index.html'), json });
+  for (const p of ['/qa-missing-page-check-2', '/this-page-does-not-exist-qa', '/c/a/b', '/p/proj-1/unknown', '/settings/a/b']) {
+    const res = await callWith(serve, p, NAVIGATE);
+    assert.equal(res.status, 404, p);
+    assert.equal(res.body, INDEX, p);
+    assert.match(res.headers['Content-Type'], /text\/html/, p);
+    assert.equal(res.headers['Cache-Control'], 'no-store', p);
+  }
+});
+
+test('the shell fallback also works without Sec-Fetch-Dest (Accept text/html only) (#1469)', async () => {
+  const root = build();
+  const serve = createStaticFallback({ staticFiles: createStaticFiles(root), indexFile: path.join(root, 'index.html'), json });
+  const res = await callWith(serve, '/nope', { accept: 'text/html' });
+  assert.equal(res.status, 404);
+  assert.equal(res.body, INDEX);
+});
+
+test('scripts, tools and protocol paths keep the JSON 404 even when they accept HTML (#1469)', async () => {
+  const root = build();
+  const serve = createStaticFallback({ staticFiles: createStaticFiles(root), indexFile: path.join(root, 'index.html'), json });
+  const notNavigations = [
+    { 'sec-fetch-dest': 'empty', accept: 'text/html' },
+    { 'sec-fetch-dest': 'empty', accept: '*/*' },
+    { accept: 'application/json' },
+    {},
+  ];
+  for (const headers of notNavigations) {
+    const res = await callWith(serve, '/nope', headers);
+    assert.equal(res.status, 404, JSON.stringify(headers));
+    assert.equal(JSON.parse(res.body).error, 'not found', JSON.stringify(headers));
+  }
+  for (const p of ['/api/nope', '/api', '/api/chats/c-1/history', '/assets/missing-999.js', '/remote.php/dav/files/x', '/dav/files/x', '/.well-known/caldav']) {
+    const res = await callWith(serve, p, NAVIGATE);
+    assert.equal(res.status, 404, p);
+    assert.match(res.headers['Content-Type'], /application\/json/, p);
+    assert.equal(JSON.parse(res.body).error, 'not found', p);
+  }
+});
+
+test('a navigation to a real client place or built file is unchanged (#1469)', async () => {
+  const root = build();
+  const serve = createStaticFallback({ staticFiles: createStaticFiles(root), indexFile: path.join(root, 'index.html'), json });
+  const place = await callWith(serve, '/diary', NAVIGATE);
+  assert.equal(place.status, 200);
+  assert.equal(place.body, INDEX);
+  const file = await callWith(serve, '/theme.js', NAVIGATE);
+  assert.equal(file.status, 200);
+  assert.equal(file.body, '/* synthetic */');
+  const traversal = await callWith(serve, '/../../etc/passwd', NAVIGATE);
+  assert.equal(traversal.status, 403);
+});
