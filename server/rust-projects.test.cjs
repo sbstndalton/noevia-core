@@ -489,3 +489,37 @@ test('moveChat and deleteFreeChat through the coordinated free list keep a meta 
   assert.equal(projects.deleteFreeChat('f2'), true);
   assert.deepEqual(readFree(file).map((c) => c.id), ['front2', 'front']);
 });
+
+test('setChatFlags reads both lists again first: a meta the front retitled during the turn keeps its title and gets the flags (sbstndalton/noevia#1426)', { skip: NO_FLOCK }, () => {
+  const { createProjectStore } = require('./projects.cjs');
+  const changed = [];
+  const store = createWorkspaceStore(tmp(), DEFAULT, null, { rustProjects: true, rustFreeChats: true });
+  const ws = store.get(USER);
+  ws.projects.push({ id: 'p1', name: 'One', modes: ['chat'], chats: [meta('c1', 1)] });
+  ws.saveProjects();
+  ws.freeChats = [meta('f1', 2)];
+  ws.saveFreeChats();
+  const proxy = (field) => new Proxy([], {
+    get(_t, prop) { const v = ws[field][prop]; return typeof v === 'function' ? v.bind(ws[field]) : v; },
+    set(_t, prop, v) { ws[field][prop] = v; return true; },
+    ownKeys() { return Reflect.ownKeys(ws[field]); },
+    getOwnPropertyDescriptor(_t, prop) { return Reflect.getOwnPropertyDescriptor(ws[field], prop); },
+  });
+  const projects = createProjectStore({ fs, path, currentWorkspace: () => ws, PROJECTS: proxy('projects'), FREE_CHATS: proxy('freeChats'), onProjectsChanged: (id) => changed.push(id) });
+  const free = freeFile(ws.dir), projectsJson = path.join(ws.dir, 'projects.json');
+  // While the turn waited for its route choice, the front retitled f1 and saved a new chat n1.
+  atomicJson(free, [{ ...meta('f1', 9), title: 'Retitled' }, meta('n1', 8)]);
+  assert.equal(projects.setChatFlags(null, 'n1', { allowCloud: true }), true, 'a chat the front first saved during the turn');
+  assert.equal(projects.setChatFlags(null, 'f1', { forceLocal: true }), true);
+  const saved = readFree(free);
+  assert.deepEqual(saved.map((c) => [c.id, c.title, c.forceLocal, c.allowCloud]), [['f1', 'Retitled', true, undefined], ['n1', meta('n1', 8).title, undefined, true]]);
+  // The same for a project's chat list.
+  const onDisk = read(projectsJson);
+  onDisk[0].chats = [{ ...meta('c1', 9), title: 'Retitled' }];
+  atomicJson(projectsJson, { projects: onDisk });
+  assert.equal(projects.setChatFlags('p1', 'c1', { forceLocal: false }), true);
+  const chat = read(projectsJson)[0].chats[0];
+  assert.deepEqual([chat.id, chat.title, chat.forceLocal], ['c1', 'Retitled', false]);
+  assert.deepEqual(changed, [USER, USER], 'each refresh that took in the front nudged the mirror once');
+  assert.equal(projects.setChatFlags(null, 'missing', { forceLocal: true }), false);
+});

@@ -432,7 +432,7 @@ const projectSweep = require('./project-sweep.cjs').createProjectSweep({ storage
 const projectStore = require('./projects.cjs').createProjectStore({
   fs, path, reasoningEffort, projectAppearance, rag, storageClient, documentSources, authService, currentWorkspace,
   PROJECTS, FREE_CHATS, sanitizeToolboxes: (boxes) => sanitizeToolboxes(boxes), defaultToolboxes: () => DEFAULT_TOOLBOXES,
-  PROJECT_ROOT_FOLDER, createProjectFolder, projectSweep,
+  PROJECT_ROOT_FOLDER, createProjectFolder, projectSweep, onProjectsChanged: (userId) => projectsChangedElsewhere(userId),
 });
 const {
   saveProjects, getProject, sanitizeChats, loadChats, saveChats, deleteChat, saveFreeChats, deleteFreeChat, createProject,
@@ -867,14 +867,8 @@ const { handleChat } = require('./chat.cjs').createChatHandler({
     maxChunks: () => require('./routing-modes.cjs').routerMaxChunks(),
     awaitChoice: awaitRouteChoice,
     log: (entry) => recordDecision('routing', entry),
-    setChatFlags: (projectId, chatId, patch) => {
-      const list = projectId ? getProject(projectId)?.chats : FREE_CHATS;
-      const meta = Array.isArray(list) ? list.find((c) => c && c.id === chatId) : null;
-      if (!meta) return false;
-      Object.assign(meta, patch);
-      if (projectId) saveProjects(PROJECTS); else saveFreeChats(FREE_CHATS);
-      return true;
-    },
+    // projects.cjs: reads the lists again first (sbstndalton/noevia#1426).
+    setChatFlags: (projectId, chatId, patch) => projectStore.setChatFlags(projectId, chatId, patch),
   },
   // #742: linked chats' brains, read from the signed-in user's own workspace and lists only.
   brainContext: { enabled: () => features.enabled('brainContext') && features.enabled('chatFraming'), maxChars: () => framingSettings.get().brainContextChars,
