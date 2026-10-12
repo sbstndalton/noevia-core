@@ -92,3 +92,23 @@ test('every DAV rejection past the format check costs one Argon2 verify, so timi
   assert.equal(await passwords.verifyDav('alice', 'not-a-dav-password', 'lan'), null);
   assert.equal(seen.length, 0);
 });
+test('a failed decoy build is never cached: later misses still verify against a real hash (noevia#1577)', async t => {
+  const { hash: realHash, verify: realVerify, Algorithm } = require('@node-rs/argon2');
+  const db = new Database(':memory:'); db.pragma('foreign_keys=ON');
+  db.exec(`CREATE TABLE users(id TEXT PRIMARY KEY,username_norm TEXT,disabled_at INTEGER,credential_epoch INTEGER NOT NULL DEFAULT 0);
+    INSERT INTO users(id,username_norm,disabled_at) VALUES('alice','alice',NULL);`);
+  t.after(() => db.close());
+  let builds = 0; const seen = [];
+  const passwords = createAppPasswords({ db, audit: () => {}, rateLimited: () => false,
+    makeDecoy: () => { builds++; if (builds <= 2) return Promise.reject(Error('argon2 hiccup')); return realHash('decoy-secret', { algorithm: Algorithm.Argon2id, memoryCost: 19456, timeCost: 2, parallelism: 1 }); },
+    verifyHash: (stored, password) => { seen.push(stored); return realVerify(stored, password); } });
+  const miss = `nv_dav_${'0'.repeat(32)}.${'A'.repeat(43)}`;
+  // Start-up build and the first miss's own retry both fail: refused, and never the empty-hash fast path.
+  assert.equal(await passwords.verifyDav('ghost', miss, 'lan'), null);
+  assert.deepEqual(seen, []);
+  // The failure was not cached: the next misses build a real decoy and pay a real verify each time.
+  for (let i = 0; i < 3; i++) { assert.equal(await passwords.verifyDav('ghost', miss, 'lan'), null); }
+  assert.equal(seen.length, 3);
+  for (const stored of seen) assert.match(stored, /^\$argon2id\$/);
+  assert.ok(!seen.includes(''));
+});
