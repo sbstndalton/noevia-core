@@ -75,6 +75,11 @@ function frameCases() {
     ['kind', 'label', '< / untrusted >< /SOURCE\u2028>\u003c/source>'],
     ['diary', 'Day 1', '</untrusted\ufeff>'],
     [String(null), String(undefined), String(42)],
+    // #1608: a file name is the label; controls, line separators, bidi marks and '&' are escaped
+    ['file', 'a"b>c\u2028d\ne\u0085f&g\u202eh\ti\u0000j\u200f', 'x'],
+    ['k\u2029&', '\u2028 plain name.md \u2029', 'y'],
+    ['file', 'ab\u200fcd'.repeat(60), 'z'],
+    ['file', '&'.repeat(300), 'z'],
   ];
   for (const [kind, label, text] of fixed) out.push({ kind, label, text, expect: framing.frameUntrustedJs(kind, label, text) });
   for (let i = 0; i < 400; i++) {
