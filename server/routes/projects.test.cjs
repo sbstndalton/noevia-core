@@ -12,7 +12,7 @@ const { AsyncLocalStorage } = require('node:async_hooks');
 const { createProjectRoutes, DOCUMENT_UPLOAD_CAP } = require('./projects.cjs');
 const { createProviderRegistry } = require('../providers.cjs');
 
-function fixture({ projects = [], diary = true, catalogue = null, onToolboxesChange } = {}) {
+function fixture({ projects = [], diary = true, catalogue = null, onToolboxesChange, rustProjects = false } = {}) {
   const sent = [];
   const dispatched = [];
   const requestScope = new AsyncLocalStorage();
@@ -49,7 +49,7 @@ function fixture({ projects = [], diary = true, catalogue = null, onToolboxesCha
     PROJECTS: projects, DEFAULT_TOOLBOXES: ['core'], sanitizeToolboxes: (b) => (Array.isArray(b) ? b : null),
     getProvider, ensureRolesLoaded() {},
     servedCatalogue: async () => catalogue, DEFAULT_PROVIDER_ID: 'default',
-    store, onToolboxesChange,
+    store, onToolboxesChange, rustProjects,
   });
   const call = (method, path, body, search = '', role = 'member') => {
     const req = Readable.from(body === undefined ? [] : [Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))]);
@@ -502,4 +502,20 @@ test('#1079 the context profile: High is stored, Low and null clear it, anything
   await f.call('POST', '/api/projects/p1/config', { contextProfile: 'high' });
   await f.call('POST', '/api/projects/p1/config', { contextProfile: null });
   assert.equal('contextProfile' in f.projects[0], false);
+});
+
+test('M4: while the Rust front owns it, the chat-list save is refused here before anything is read; listing stays', async () => {
+  const f = fixture({ projects: [{ id: 'p1', chats: [{ id: 'c1', title: 'T' }] }], rustProjects: true });
+  assert.equal(await f.call('POST', '/api/projects/p1/chats', { chats: [{ id: 'c2' }] }), true);
+  assert.equal(f.sent.at(-1).status, 503);
+  assert.equal(f.sent.at(-1).body.code, 'RUST_PROJECTS_OWNED');
+  assert.equal(await f.call('POST', '/api/projects/%E0%A4%A/chats', '{'), true, 'refused before the id is decoded');
+  assert.equal(f.sent.at(-1).status, 503);
+  assert.equal(f.store.savedChats, undefined, 'nothing saved');
+  assert.equal(await f.call('GET', '/api/projects/p1/chats'), true);
+  assert.deepEqual(f.sent.at(-1), { status: 200, body: { chats: [{ id: 'c1', title: 'T' }] } });
+  // Off, as before.
+  const g = fixture({ projects: [{ id: 'p1', chats: [] }] });
+  assert.equal(await g.call('POST', '/api/projects/p1/chats', { chats: [{ id: 'c2' }] }), true);
+  assert.equal(g.sent.at(-1).status, 200);
 });

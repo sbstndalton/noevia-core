@@ -274,8 +274,50 @@ test("Node's copies of the Rust-owned writes answer 503 only while the switch is
   assert.equal(rp.refuseOwned(true, json, {}), true);
   assert.equal(sent[0][0], 503);
   assert.equal(sent[0][1].code, 'RUST_PROJECTS_OWNED');
-  assert.deepEqual([...rp.OWNED_ROUTES].sort(), ['DELETE /api/projects/{id}/assets/{assetId}', 'GET /api/projects/{id}/assets/{assetId}', 'POST /api/projects/{id}/assets']);
+  assert.deepEqual([...rp.OWNED_ROUTES].sort(), ['DELETE /api/projects/{id}/assets/{assetId}', 'GET /api/projects/{id}/assets/{assetId}', 'GET /api/projects/{id}/chats', 'POST /api/projects/{id}/assets', 'POST /api/projects/{id}/chats']);
   // Off by default in a server that is not told otherwise.
   const r = spawnSync(process.execPath, ['-e', `process.stdout.write(String(require(${JSON.stringify(path.join(__dirname, 'rust-projects.cjs'))}).enabledFrom({}, () => {})))`]);
   assert.equal(String(r.stdout), 'false');
+});
+
+test('chat metas are merged per item: a list the front saved survives a move or delete here, and the delete stands', () => {
+  const store = createWorkspaceStore(tmp(), DEFAULT, null, { rustProjects: true });
+  const ws = store.get(USER);
+  ws.projects.push({ id: 'p1', name: 'One', modes: ['chat'], chats: [{ id: 'keep', title: 'K' }, { id: 'gone', title: 'G' }] });
+  ws.saveProjects();
+  const file = path.join(ws.dir, 'projects.json');
+  // This request (no refresh since its start) deletes a chat; meanwhile the front saved a new one
+  // and retitled another.
+  ws.projects[0].chats = ws.projects[0].chats.filter((c) => c.id !== 'gone');
+  write(file, [{ ...read(file)[0], chats: [{ id: 'new', title: 'N' }, { id: 'keep', title: 'K2' }, { id: 'gone', title: 'G' }] }]);
+  ws.saveProjects();
+  assert.deepEqual(read(file)[0].chats, [{ id: 'new', title: 'N' }, { id: 'keep', title: 'K2' }]);
+  // Both changed one meta: this process's wins; both added: both kept.
+  ws.projects[0].chats = [...ws.projects[0].chats.map((c) => (c.id === 'new' ? { ...c, title: 'mine' } : c)), { id: 'local', title: 'L' }];
+  write(file, [{ ...read(file)[0], chats: [...read(file)[0].chats.map((c) => (c.id === 'new' ? { ...c, title: 'theirs' } : c)), { id: 'front', title: 'F' }] }]);
+  ws.saveProjects();
+  assert.deepEqual(read(file)[0].chats.map((c) => [c.id, c.title]), [['new', 'mine'], ['keep', 'K2'], ['front', 'F'], ['local', 'L']]);
+});
+
+test('a request start that takes in the front\'s change says so once; Node\'s own saves do not', () => {
+  const changed = [];
+  const store = createWorkspaceStore(tmp(), DEFAULT, null, { rustProjects: true, onProjectsChanged: (id) => changed.push(id) });
+  const ws = store.get(USER);
+  ws.projects.push({ id: 'p1', name: 'One', modes: ['chat'], chats: [] });
+  ws.saveProjects();
+  store.get(USER);
+  assert.deepEqual(changed, []);
+  const file = path.join(ws.dir, 'projects.json');
+  write(file, [{ ...read(file)[0], chats: [{ id: 'c' }] }]);
+  store.get(USER);
+  store.get(USER);
+  assert.deepEqual(changed, [USER]);
+  // Off: never called.
+  const off = [];
+  const plain = createWorkspaceStore(tmp(), DEFAULT, null, { onProjectsChanged: (id) => off.push(id) });
+  const w2 = plain.get(USER);
+  w2.projects.push({ id: 'q', modes: ['chat'] }); w2.saveProjects();
+  write(path.join(w2.dir, 'projects.json'), [{ id: 'q', modes: ['chat'], chats: [] }]);
+  plain.get(USER);
+  assert.deepEqual(off, []);
 });

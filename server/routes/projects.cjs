@@ -52,7 +52,7 @@ const PASS = Symbol('unhandled');
  * @param {string} deps.DEFAULT_PROVIDER_ID
  * @param {object} deps.store   projects.cjs
  * @param {() => void} [deps.onToolboxesChange]  called after a project's toolbox selection changes (clears the permitted-tools cache)
- * @param {boolean} [deps.rustProjects]  M4 (rust-projects.cjs): the Rust front owns the image writes; this copy refuses them
+ * @param {boolean} [deps.rustProjects]  M4 (rust-projects.cjs): the Rust front owns the image writes and the chat-list save; this copy refuses them
  */
 function createProjectRoutes({
   json, readBody, readJson, requestScope, dispatch, currentWorkspace, authService, storageClient, documents, documentSources, rag, fs, path,
@@ -387,6 +387,8 @@ function createProjectRoutes({
 
     const projChats = p.match(/^\/api\/projects\/([^/]+)\/chats$/);
     if (projChats) {
+      // M4: the Rust front saves a project's chat list while NOEVIA_RUST_PROJECTS is on.
+      if (req.method === 'POST' && refuseOwned(rustProjects, json, res)) return true;
       const id = decodeURIComponent(projChats[1]);
       if (req.method === 'GET') {
         if (!getProject(id)) return json(res, 404, { error: 'no such project' });

@@ -2,7 +2,8 @@
 // M4 of the full-Rust migration (noevia docs/adr-0001-rust-and-repo-split.md, "Amendment
 // 2026-10-10"): the Rust front (noevia-rs bins/noevia-server, crates/server-projects) takes over
 // project routes slice by slice. The first slice is a project's image assets
-// (POST /api/projects/{id}/assets, GET and DELETE /api/projects/{id}/assets/{assetId}).
+// (POST /api/projects/{id}/assets, GET and DELETE /api/projects/{id}/assets/{assetId}); the second
+// its chat list (GET and POST /api/projects/{id}/chats).
 //
 // The switch is NOEVIA_RUST_PROJECTS=1 (exactly) together with NOEVIA_FRONT=rust, the M3 switch
 // (NOEVIA_RUST_AUTH=1, confirmed: the front gates Rust-owned routes itself) and the supervisor's
@@ -10,8 +11,8 @@
 // Anything less and the switch is ignored here (a warning is printed) and Node keeps doing
 // everything, as before.
 //
-// projects.json cannot have one writer yet: the chat routes, still Node's, keep each project's chat
-// metas in it. So while the switch is on, both processes write it only under one shared lock and
+// projects.json cannot have one writer yet: Node's other routes (the chat turn, a chat's move or
+// delete, the config route) still change it. So while the switch is on, both processes write it only under one shared lock and
 // never from a stale copy:
 //
 //   - the lock is an OS advisory lock, flock(2) LOCK_EX, on `projects.json.lock` beside the file
@@ -30,8 +31,9 @@
 //     what is on disk now; every other project is taken from disk. A project both sides changed
 //     between two reads is merged per top-level field (this process's value where it changed the
 //     field), so a chat save does not drop an image Rust added meanwhile. The id-keyed lists
-//     (assets, retiredAssets) are merged per item: additions from both sides, removals since
-//     the base from either side, an item both changed is this process's. Any other field
+//     (assets, retiredAssets, chats) are merged per item: additions from both sides, removals since
+//     the base from either side, an item both changed is this process's (so a chat meta the front
+//     saved survives a move or delete of another chat here, and a delete here is not undone). Any other field
 //     changed on both sides is last-writer-wins. Every request start re-reads the file
 //     when its (ino, size, mtime) changed, refreshing unchanged projects in place, so a handler
 //     holding a project object still sees the current one.
@@ -54,6 +56,8 @@ const OWNED_ROUTES = Object.freeze(new Set([
   'POST /api/projects/{id}/assets',
   'GET /api/projects/{id}/assets/{assetId}',
   'DELETE /api/projects/{id}/assets/{assetId}',
+  'GET /api/projects/{id}/chats',
+  'POST /api/projects/{id}/chats',
 ]));
 
 /** Whether the switch is on for this process (see the header). */
@@ -109,7 +113,7 @@ const blank = (v) => v === undefined || (Array.isArray(v) ? v.length === 0 : v !
 const unchangedHere = (o, b) => same(o, b) || (b === undefined && blank(o));
 
 // Lists of `{ id, ... }` merged per item rather than as one value (see the header).
-const ID_LISTS = new Set(['assets', 'retiredAssets']);
+const ID_LISTS = new Set(['assets', 'retiredAssets', 'chats']);
 const listOrNull = (v) => (v === undefined || v === null ? [] : Array.isArray(v) ? v : null);
 
 /** The id-keyed three-way merge of one list: disk order, items new here appended. An item removed
