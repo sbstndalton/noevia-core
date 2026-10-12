@@ -899,7 +899,10 @@ const chatRoutes = require('./routes/chat.cjs').createChatRoutes({
 });
 
 // Projects, sources and uploads (routes/projects.cjs). Background source jobs re-enter the router.
+// #1429: one latch per process, shared by the project source refresh and the Diary backup worker.
+const storageLatch = require('./storage-latch.cjs').createStorageLatch();
 const projectRoutes = require('./routes/projects.cjs').createProjectRoutes({
+  storageLatch,
   json, readBody, readJson, requestScope, dispatch: (req, res) => handleRequestScoped(req, res), currentWorkspace, authService, storageClient, documents, documentSources, rag, fs, path,
   reasoningEffort, projectAppearance, diaryExtras, PROJECTS, DEFAULT_TOOLBOXES, sanitizeToolboxes, allToolboxes, getProvider, ensureRolesLoaded, servedCatalogue, DEFAULT_PROVIDER_ID, store: projectStore,
   onToolboxesChange: () => permittedToolsCache.clear(),
@@ -1217,9 +1220,13 @@ if (require.main === module) {
   }
 
   offsiteBackup.schedule();
+  const readStorage = (userId) => authService.getStorage(userId, true);
   require('./diary-backup-worker.cjs').startDiaryBackupWorker({
     users: () => authService.listUsers(),
     enabled: id => authService.diaryEnabled(id),
+    // #1429: an account whose saved login was refused (or is throttled) gets no automatic backup
+    // until its credentials change or the backoff passes; it is not counted as a failure either.
+    suspended: user => storageLatch.suspendedFor(user.id, readStorage),
     // Default 30 s so an idle tenant does not build a new ManagedCorpusBackend every
     // 3 s; DIARY_BACKUP_WORKER_INTERVAL_MS keeps the old cadence available for tests.
     interval: Number(process.env.DIARY_BACKUP_WORKER_INTERVAL_MS) > 0 ? Number(process.env.DIARY_BACKUP_WORKER_INTERVAL_MS) : 30000,
@@ -1228,6 +1235,9 @@ if (require.main === module) {
       // always carries the storage secret (#292); every other call sends only its ref.
       const target = `${DIARY_BASE}/api/storage-backup`;
       const r = await fetchJson(target, { method: 'POST', headers: diaryHeaders('POST', target, { secret: true }) }, 300000);
+      // #1429: the Diary tags a refused login (424 storageLoginRejected) and a throttle (503 storageThrottled);
+      // either one holds this account's automatic calls (storage-latch.cjs) until the credentials change.
+      storageLatch.noteDiaryReply(user.id, readStorage, r.body, r.ok);
       if (!r.ok) throw new Error(`storage-backup failed: ${r.status}`);
       return r.body;
     }),

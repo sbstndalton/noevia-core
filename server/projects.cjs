@@ -477,14 +477,17 @@ function createProjectStore({
     try {
       connection = authService.getStorage(currentWorkspace().userId, true);
     } catch {
-      return { folder: null, loginRejected: false };
+      return { folder: null, loginRejected: false, failure: null };
     }
-    if (!storageClient.isBrowsable(connection)) return { folder: null, loginRejected: false };
+    if (!storageClient.isBrowsable(connection)) return { folder: null, loginRejected: false, failure: null };
     try {
-      return { folder: await createProjectFolder(storageClient, connection, PROJECT_ROOT_FOLDER, project), loginRejected: false };
+      return { folder: await createProjectFolder(storageClient, connection, PROJECT_ROOT_FOLDER, project), loginRejected: false, failure: null };
     } catch (err) {
       console.warn(`[projects] could not create folder for project ${project.id}: ${String((err && err.message) || err)}`);
-      return { folder: null, loginRejected: typeof storageClient.refusedLogin === 'function' && storageClient.refusedLogin(err) };
+      // #1428: the failure kind rides along, so the caller says "throttled" or "timed out" rather than
+      // a generic failure; loginRejected stays for callers that only ask about the login.
+      const failure = typeof storageClient.storageFailure === 'function' ? storageClient.storageFailure(err) : null;
+      return { folder: null, loginRejected: typeof storageClient.refusedLogin === 'function' && storageClient.refusedLogin(err), failure };
     }
   }
 

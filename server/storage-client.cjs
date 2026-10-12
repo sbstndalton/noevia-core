@@ -57,12 +57,36 @@ async function withRetry(fn, { once = false } = {}) {
   try {
     return await fn();
   } catch (err) {
-    if (!once && err instanceof TypeError && err.message === 'fetch failed') {
+    if (!once && isTransportFailure(err)) {
       await new Promise((r) => setTimeout(r, 250));
-      return fn();
+      try { return await fn(); } catch (again) { throw transportError(again); }
     }
-    throw err;
+    throw transportError(err);
   }
+}
+
+// #1428: a transport failure is not a storage answer. A timed-out request and a server that could
+// not be reached get their own codes, so the caller can say so and does not call it a rejected login.
+function isTransportFailure(err) {
+  return err instanceof TypeError && err.message === 'fetch failed';
+}
+function transportError(err) {
+  if (err && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
+    return Object.assign(new Error('the storage server did not answer in time'), { status: 504, code: 'timeout', cause: err });
+  }
+  if (isTransportFailure(err)) return Object.assign(new Error('the storage server could not be reached'), { status: 502, code: 'unreachable', cause: err });
+  return err;
+}
+
+// An HTTP answer that is not usable. `upstream` is the status storage gave; a 429 keeps its
+// Retry-After (Nextcloud's brute-force protection sends one) so the caller can wait that long.
+function upstreamError(response) {
+  const status = response.status;
+  const wait = Number(response.headers?.get?.('retry-after'));
+  return Object.assign(new Error(`storage returned ${status}`), {
+    upstream: status,
+    ...(status === 429 && Number.isFinite(wait) && wait > 0 ? { retryAfter: Math.min(Math.ceil(wait), 86400) } : {}),
+  });
 }
 
 // ── WebDAV ───────────────────────────────────────────────────────────────────
@@ -95,7 +119,7 @@ async function davList(conn, fullPath) {
     redirect: 'error',
   }));
   // #1313: an unavailable attached path is a failed listing, not authoritative emptiness.
-  if (!response.ok && response.status !== 207) throw new Error(`storage returned ${response.status}`);
+  if (!response.ok && response.status !== 207) throw upstreamError(response);
   const { text: body } = await readCappedText(response, LIST_BODY_CAP);
   // Untrusted body: parsed by dav-listing.cjs (the fail-closed WebAssembly port,
   // always, #1071). Only direct children of the browsed directory come back.
@@ -116,7 +140,7 @@ async function davRead(conn, fullPath) {
     signal: AbortSignal.timeout(20000),
     redirect: 'error',
   }));
-  if (!response.ok) throw new Error(`storage returned ${response.status}`);
+  if (!response.ok) throw upstreamError(response);
   return readCappedText(response, TEXT_BODY_CAP);
 }
 
@@ -159,15 +183,34 @@ async function checkLogin(conn, { fetchImpl = fetch, timeoutMs = 10000 } = {}) {
   return { ok: false, unverified: 'status', status: response.status };
 }
 
-/** #849: did the storage server refuse the saved login (401, or 403 as #770 words it)? True for
- *  an error this module threw about a WebDAV answer: the folder/write errors carry `upstream`, the
- *  list/read ones say "storage returned <status>". Nothing else counts, so a 404 or a network
+/** #849: did the storage server refuse the saved login? Only a 401 counts (#1428). A 403 is not a
+ *  wrong password: Nextcloud answers it for a folder the user may not read, so it is reported as
+ *  `storageFailure(err).kind === 'forbidden'` instead. Nothing else counts, so a 404 or a network
  *  failure keeps its own message. */
-const LOGIN_REJECTED_STATUSES = new Set([401, 403]);
 function refusedLogin(err) {
   if (!err) return false;
-  if (LOGIN_REJECTED_STATUSES.has(err.upstream)) return true;
-  return /^storage returned (401|403)$/.test(String(err.message || ''));
+  if (err.upstream === 401) return true;
+  return /^storage returned 401$/.test(String(err.message || ''));
+}
+
+/** #1428: what went wrong talking to storage, for the callers that must word it or retry it.
+ *  { kind: 'login' | 'forbidden' | 'throttled' | 'timeout' | 'unreachable', retryAfter? } or null.
+ *  - login:       401, the saved username or app password is refused (sign in again)
+ *  - forbidden:   403, storage answered but will not let this login read that path
+ *  - throttled:   429, Nextcloud's brute-force protection; `retryAfter` seconds when it says so
+ *  - timeout:     the request ran out of time (no answer)
+ *  - unreachable: no connection at all (refused, reset, DNS, a redirect that was refused)
+ *  Any other failure (a 404, a 500, a bad path) is null: it keeps its own message. */
+function storageFailure(err) {
+  if (!err) return null;
+  if (err.code === 'timeout') return { kind: 'timeout' };
+  if (err.code === 'unreachable') return { kind: 'unreachable' };
+  const status = err.upstream !== undefined ? err.upstream : (/^storage returned (\d{3})$/.exec(String(err.message || '')) || [])[1];
+  const n = Number(status);
+  if (n === 401) return { kind: 'login' };
+  if (n === 403) return { kind: 'forbidden' };
+  if (n === 429) return { kind: 'throttled', ...(Number.isFinite(err.retryAfter) && err.retryAfter > 0 ? { retryAfter: err.retryAfter } : {}) };
+  return null;
 }
 
 // ── S3-compatible ────────────────────────────────────────────────────────────
@@ -203,7 +246,7 @@ async function s3List(conn, connectionPath) {
       signal: AbortSignal.timeout(15000),
       redirect: 'error',
     }));
-    if (!response.ok) throw new Error(`storage returned ${response.status}`);
+    if (!response.ok) throw upstreamError(response);
     const { text: body } = await readCappedText(response, LIST_BODY_CAP);
     const page = s3Page(body, queryPrefix);
     for (const r of page.records) {
@@ -227,7 +270,7 @@ async function s3Read(conn, connectionPath) {
     signal: AbortSignal.timeout(20000),
     redirect: 'error',
   }));
-  if (!response.ok) throw new Error(`storage returned ${response.status}`);
+  if (!response.ok) throw upstreamError(response);
   return readCappedText(response, TEXT_BODY_CAP);
 }
 
@@ -524,4 +567,4 @@ async function fileVersion(conn, rawPath) {
   return { exists: true, etag: /[\r\n]/.test(etag) ? '' : etag };
 }
 
-module.exports = { checkLogin, refusedLogin, removeEmptyFolder, listFiles, readTextFile, readBinaryFile, writeFile, fileVersion, deleteFile, createFolder, isBrowsable, safeRelativePath, elementTexts, TEXT_EXTENSIONS, READ_CAP };
+module.exports = { checkLogin, refusedLogin, storageFailure, removeEmptyFolder, listFiles, readTextFile, readBinaryFile, writeFile, fileVersion, deleteFile, createFolder, isBrowsable, safeRelativePath, elementTexts, TEXT_EXTENSIONS, READ_CAP };

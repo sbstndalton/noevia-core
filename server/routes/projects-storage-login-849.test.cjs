@@ -1,5 +1,5 @@
 'use strict';
-// #849: a storage login the server rejected (401/403) is reported as that on every upload path,
+// #849: a storage login the server rejected (401) is reported as that on every upload path,
 // not as "could not create the storage folder; retry". A WebDAV stand-in answers 401; the real
 // storage client talks to it. Synthetic fixtures only.
 const test = require('node:test');
@@ -83,8 +83,8 @@ test('#849: any other folder failure keeps its generic, retryable wording', asyn
   assert.equal(f.sent.at(-1).body.code, undefined);
 });
 
-test('#849: a folder that exists but whose write is refused (401, 403) is also a rejected login', async (t) => {
-  for (const status of [401, 403]) {
+test('#849: a folder that exists but whose write is refused (401) is a rejected login; 403 is its own answer (#1428)', async (t) => {
+  for (const status of [401]) {
     const base = await dav(t, status);
     const project = () => ({ id: 'p1', name: 'P', projectFolder: 'noevia projects/P', files: [], assets: [] });
     const organized = fixture(t, { baseUrl: base, project: project() });
@@ -96,14 +96,21 @@ test('#849: a folder that exists but whose write is refused (401, 403) is also a
     assert.equal(plain.sent.at(-1).status, 502, `plain ${status}`);
     assert.equal(plain.sent.at(-1).body.code, 'storageLoginRejected');
   }
+  // #1428: a 403 is not a wrong password. It gets its own code and words, on the same path.
+  const forbidden = await dav(t, 403);
+  const plain403 = fixture(t, { baseUrl: forbidden, project: { id: 'p1', name: 'P', projectFolder: 'noevia projects/P', files: [], assets: [] } });
+  await plain403.upload(NOTE);
+  assert.equal(plain403.sent.at(-1).status, 502);
+  assert.equal(plain403.sent.at(-1).body.code, 'storageForbidden');
+  assert.notEqual(plain403.sent.at(-1).body.code, 'storageLoginRejected');
 });
 
-test('#849: refusedLogin recognises only a 401/403 answer from storage', () => {
+test('#849/#1428: refusedLogin recognises only a 401 answer from storage (a 403 is not a refused login)', () => {
   const { refusedLogin } = storageClient;
   assert.equal(refusedLogin(Object.assign(new Error('x'), { upstream: 401 })), true);
-  assert.equal(refusedLogin(Object.assign(new Error('x'), { upstream: 403 })), true);
+  assert.equal(refusedLogin(Object.assign(new Error('x'), { upstream: 403 })), false);
   assert.equal(refusedLogin(new Error('storage returned 401')), true);
-  assert.equal(refusedLogin(new Error('storage returned 403')), true);
+  assert.equal(refusedLogin(new Error('storage returned 403')), false);
   assert.equal(refusedLogin(Object.assign(new Error('x'), { upstream: 404 })), false);
   assert.equal(refusedLogin(new Error('storage returned 404')), false);
   assert.equal(refusedLogin(new Error('could not write "a" (500)')), false);
