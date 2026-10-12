@@ -1,4 +1,5 @@
 'use strict';
+const { quoteName } = require('./quoted-name.cjs');
 // #1513: a large text source is never read whole into one reply. The reply sees the excerpts that
 // matched the question, or the start of each file when there is no index, and a file that is not
 // placed at all is only named. An answer that says some text is absent from such a file is confidently
@@ -36,7 +37,7 @@ function coverageNote(partial) {
   if (!Array.isArray(partial) || !partial.length) return '';
   // A synced file's name is not ours to trust: quoted and escaped, so a quote or a newline in it cannot start
   // a line of its own in the system text (#1588).
-  const parts = partial.map((p) => `${JSON.stringify(String(p.name))} is ${number(p.length)} characters long and this reply read ${p.read ? `only ${number(p.read)} characters of it (excerpts or the start)` : 'none of it (it was not included)'}`);
+  const parts = partial.map((p) => `${quoteName(p.name)} is ${number(p.length)} characters long and this reply read ${p.read ? `only ${number(p.read)} characters of it (excerpts or the start)` : 'none of it (it was not included)'}`);
   return `Source text was truncated for this reply: ${parts.join('; ')}. The rest of each file was NOT read. Do not say that some text is absent from a file, or answer "no", from the part you read; say which part you read. read_project_file with an offset can read more of a file.`;
 }
 

@@ -1,8 +1,8 @@
 'use strict';
 const { frameUntrusted } = require('./prompt-framing.cjs');
-// A file's name is not ours to trust (#1588, #1605): each is quoted and escaped, as in source-coverage.cjs, so a quote or a
-// newline in it cannot start a line of its own in the system text. The one place a list of names is worded for the model.
-const quotedNames = (names) => names.map((n) => JSON.stringify(String(n))).join(', ');
+// A file's name is not ours to trust (#1588, #1605, #1606): each is quoted and escaped by the one shared helper (quoted-name.cjs),
+// so a quote, a newline or a Unicode line break or bidi control in it cannot start a line of its own in the system text.
+const { quoteName, quotedNames } = require('./quoted-name.cjs');
 const provenance = require('./provenance-policy.cjs');
 const { isChatGenerationModel } = require('./chat-model-kind.cjs');
 const { isInAppBox } = require('./toolbox-flags.cjs');
@@ -464,7 +464,7 @@ function createChatHandler({
     const memoryPart = accountMemory.systemPart(accountMemory.read(currentWorkspace().dir), project?.memories);
     if (!project && memoryPart) sysParts.push(memoryPart);
     if (project) {
-      if (project.name && !chatAttachments) sysParts.push(`You are working inside the user's project ${JSON.stringify(String(project.name))}.`);
+      if (project.name && !chatAttachments) sysParts.push(`You are working inside the user's project ${quoteName(project.name)}.`);
       if (project.goal) sysParts.push(`Project goal: ${project.goal}`);
       if (project.instructions) sysParts.push(`Project instructions (follow closely):\n${project.instructions}`);
       if (memoryPart) sysParts.push(memoryPart);
