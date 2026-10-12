@@ -1926,6 +1926,23 @@ test('#1079 the engine listing marks a model and its long profile once the secti
   assert.equal(rows.embed.long_variant, null);
 });
 
+test('#1133: when no KV context rung fits the memory budget, the job log says the ceilings were not planned', async t => {
+  const f = fixture(t, { autotuneExtra: { planner: standardOrder, planFacts: async () => DENSE_64K, budgetGib: () => 0.5 } });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  const lines = (j.log || []).map(l => l.text);
+  assert.ok(lines.some(text => /KV ceilings could not be planned/.test(text) && /memory budget/.test(text)), JSON.stringify(lines));
+});
+
+test('#1133: a sizing failure during KV planning is logged, not silently treated as "no ceilings"', async t => {
+  const f = fixture(t, { autotuneExtra: { planFacts: async () => { throw new Error('synthetic sizing failure'); }, budgetGib: () => 6 } });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  const lines = (j.log || []).map(l => l.text);
+  assert.ok(lines.some(text => /KV ceilings could not be planned/.test(text) && /sizing check failed/.test(text)), JSON.stringify(lines));
+  assert.ok(!lines.some(text => /synthetic sizing failure/.test(text)), 'the raw error text must not reach the job log');
+});
+
 test('noevia#1133: the KV ceilings are planned with the JS estimate, so the Rust confirmation (even with no usable module) cannot remove them', async t => {
   const davParseWasm = require('./dav-parse-wasm.cjs');
   const saved = { impl: process.env.LLAMACPP_AUTOCONFIG_IMPL, file: process.env.DAV_PARSE_WASM };

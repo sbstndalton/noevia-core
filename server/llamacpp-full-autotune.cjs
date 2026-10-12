@@ -701,7 +701,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     const before = { ...presets.get(j.model).options }, results = [];
     // #1057: sized once, every model unloaded, for the precision-first choice below.
     await unloadAll();
-    const ceilings = await kvCeilings(j.model, kvs);
+    const ceilings = await kvCeilings(j, j.model, kvs);
     // #1058: the order can grow by one, f16 right after a bf16 that failed to load.
     const order = [...kvs];
     let kvFallback = null;
@@ -980,13 +980,16 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   // #1057: the js order's KV phase, sized like the planner: per type, the largest ladder rung whose
   // estimate (llamacpp-autoconfig estimateFootprint) fits the budget, MemAvailable less the
   // services' reserve and the floor. Null when the model cannot be sized: precision alone decides.
-  async function kvCeilings(model, kvs) {
+  // #1133: every null says why in the job log (the precision order then decides alone); the raw
+  // error text stays out of the log.
+  async function kvCeilings(j, model, kvs) {
+    const unplanned = why => note(j, 'KV ceilings could not be planned (' + why + '), so the precision order alone decides.');
     try {
       const read = await planFacts(model);
-      if (!read?.meta) return null;
+      if (!read?.meta) { unplanned('the model\'s sizing facts are unavailable'); return null; }
       const profile = presets.get(model), eff = { ...profile.defaults, ...profile.options };
       const cacheMib = tuneCacheMib(eff);
-      if (!Number.isFinite(cacheMib)) return null;
+      if (!Number.isFinite(cacheMib)) { unplanned('the cache size is not a number'); return null; }
       const { ladder } = require('./llamacpp-calibration.cjs');
       // noevia#1133: planning, not the gate: the JS estimate, so the Rust confirmation (LLAMACPP_AUTOCONFIG_IMPL, retired) cannot remove the ceilings.
       const { estimateFootprintJs: estimateFootprint } = require('./llamacpp-autoconfig.cjs');
@@ -1002,8 +1005,13 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
         });
         out[kv] = fit.length ? fit.at(-1) : null;
       }
-      return Object.values(out).some(v => v != null) ? out : null;
-    } catch { return null; }
+      if (Object.values(out).some(v => v != null)) return out;
+      unplanned('no context rung fits the memory budget');
+      return null;
+    } catch {
+      unplanned('the sizing check failed');
+      return null;
+    }
   }
   // The planner's request: the model's facts, the budget (MemAvailable read once, now, with every
   // model unloaded, so a resumed job plans from the same figures), the ladder and the KV types
