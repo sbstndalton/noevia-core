@@ -694,8 +694,14 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
     // which row is "this device" so the client can show a real current/other state instead of an
     // unconditional dot. A legacy bearer-token caller (session: null) has no row of its own —
     // every session then reads as "other", which is correct: none of them is this request.
+    // #1483: a row past its absolute expiry, or idle longer than IDLE_MS, can never authenticate
+    // (authenticate refuses it), so it is not listed; where this process may write, it is also
+    // removed. `expiresAt` is the moment the session actually ends: the earlier of the absolute
+    // limit and the idle limit counted from its last use.
     listSessions(userId, currentId) {
-      return db.prepare('SELECT id_hash AS id,created_at AS createdAt,last_seen_at AS lastSeenAt,expires_at AS expiresAt,user_agent AS userAgent,ip FROM sessions WHERE user_id=? ORDER BY last_seen_at DESC').all(userId)
+      const now = Date.now();
+      if (!guard.enabled) db.prepare('DELETE FROM sessions WHERE user_id=? AND (expires_at<=? OR last_seen_at+?<=?)').run(userId, now, IDLE_MS, now);
+      return db.prepare('SELECT id_hash AS id,created_at AS createdAt,last_seen_at AS lastSeenAt,MIN(expires_at,last_seen_at+?) AS expiresAt,user_agent AS userAgent,ip FROM sessions WHERE user_id=? AND expires_at>? AND last_seen_at+?>? ORDER BY last_seen_at DESC').all(IDLE_MS, userId, now, IDLE_MS, now)
         .map((s) => ({ ...s, current: !!currentId && s.id === currentId }));
     },
     revokeSession(userId, id) { return db.prepare('DELETE FROM sessions WHERE id_hash=? AND user_id=?').run(id, userId).changes > 0; },
