@@ -753,6 +753,20 @@ function createChatHandler({
       // empty model name upstream.
       if (!roles[routedRole]) routedRole = roles.smart ? 'smart' : 'fast';
       model = routeTarget?.row ? require('./routing-modes.cjs').cloudModel(routeTarget.cloud, routedRole) : roles[routedRole];
+      // #1550: in Automatic tools mode a turn routed to a local model whose chat template cannot take
+      // tools would be answered without them. The first tool-capable role takes it instead. Manual
+      // tools, a pinned model and a cloud route keep the user's choice (the template gate below still
+      // says so when no role can take tools).
+      if (!body.compactOnly && !routeTarget?.row && provider.id === DEFAULT_PROVIDER_ID && typeof modelManager?.props === 'function'
+        && require('./tools-mode.cjs').toolsModeOf(project) === 'auto' && requestToolboxes().length) {
+        const moved = await require('./tools-mode.cjs').toolCapableRoute({ model, routedRole, roles,
+          allowsTools: (m) => templateToolsGate.allowsTools(modelManager, m, chatSignal.signal) });
+        if (moved.rerouted) {
+          console.log(`[tools] ${model} cannot take tools; this Automatic turn goes to ${moved.role} (${moved.model})`);
+          model = moved.model;
+          routedRole = moved.role;
+        }
+      }
       if (routingDecision) routingDecision = { ...routingDecision, effectiveRole: routedRole };
       recordResend(body.resend, { auto: true, role: routedRole, status: routingDecision?.status || null });
     } else if (!model && provider.id === DEFAULT_PROVIDER_ID && modelManager.enabled) {
