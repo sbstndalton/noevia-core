@@ -96,6 +96,8 @@ const rustAuth = require('./rust-auth.cjs').createRustAuthGuard({ enabled: requi
 // M4: NOEVIA_RUST_PROJECTS=1 (on top of M3) shares projects.json with the Rust front, which answers
 // the project image routes (rust-projects.cjs). Off by default.
 const RUST_PROJECTS = require('./rust-projects.cjs').enabledFrom(process.env);
+// Its chat-list slice only with the supervisor's separate confirmation (rust-project-chats).
+const RUST_PROJECT_CHATS = RUST_PROJECTS && require('./rust-projects.cjs').chatsEnabledFrom(process.env, () => {});
 const authService = createAuth({
   rustAuth,
   dataDir: DATA_DIR,
@@ -169,8 +171,13 @@ if (process.env.LEMONADE_BASE_URL && !process.env.INFERENCE_BASE_URL) console.wa
 if (process.env.LEMONADE_API_KEY && !process.env.INFERENCE_API_KEY) console.warn('LEMONADE_API_KEY is deprecated; use INFERENCE_API_KEY');
 // The default row's capabilities come from the engine kind the deployment declares (providers.cjs).
 const DEFAULT_PROVIDER_CAPABILITIES = require('./providers.cjs').engineCapabilities(MODEL_MANAGER_KIND);
+// Set once the chat vault mirror exists (below); until then there is nothing to nudge.
+let projectsChangedElsewhere = () => {};
 const workspaceStore = createWorkspaceStore(DATA_DIR, { id: DEFAULT_PROVIDER_ID, label: DEFAULT_PROVIDER_LABEL, baseUrl: INFERENCE_BASE, apiKey: INFERENCE_KEY, shared: true,
-  ...(DEFAULT_PROVIDER_CAPABILITIES ? { capabilities: DEFAULT_PROVIDER_CAPABILITIES } : {}) }, secretStore, { rustProjects: RUST_PROJECTS });
+  ...(DEFAULT_PROVIDER_CAPABILITIES ? { capabilities: DEFAULT_PROVIDER_CAPABILITIES } : {}) }, secretStore, { rustProjects: RUST_PROJECTS,
+  // M4: the front saved a project write Node's request would have followed with a mirror nudge
+  // (chat-vault-mirror.cjs mirrorTrigger: any successful write under /api/projects).
+  onProjectsChanged: (userId) => projectsChangedElsewhere(userId) });
 
 // Per-user throttle for LLM-backed routes. Every hit is a full model call
 // against the shared inference endpoint, so one member (or a runaway client)
@@ -776,6 +783,7 @@ const chatVaultMirror = vaultMirrorLib.createChatVaultMirror({
   index: { read: (userId) => vaultMirrorLib.readIndex(workspaceStore.get(userId).dir), write: (userId, state) => vaultMirrorLib.writeIndex(workspaceStore.get(userId).dir, state) },
   log: (...args) => console.warn(...args),
 });
+projectsChangedElsewhere = (userId) => chatVaultMirror.schedule(userId, null);
 // #742: each mirrored chat gets a small "brain" when it goes idle, built by the reasoner role (same
 // engine and budget gate as #740; skipped without a reasoner model). Needs framingReasoner +
 // chatFraming AND the user's mirror opt-in. Stored per chat in the user's own workspace.
@@ -898,7 +906,7 @@ const projectRoutes = require('./routes/projects.cjs').createProjectRoutes({
   json, readBody, readJson, requestScope, dispatch: (req, res) => handleRequestScoped(req, res), currentWorkspace, authService, storageClient, documents, documentSources, rag, fs, path,
   reasoningEffort, projectAppearance, diaryExtras, PROJECTS, DEFAULT_TOOLBOXES, sanitizeToolboxes, allToolboxes, getProvider, ensureRolesLoaded, servedCatalogue, DEFAULT_PROVIDER_ID, store: projectStore,
   onToolboxesChange: () => permittedToolsCache.clear(),
-  rustProjects: RUST_PROJECTS,
+  rustProjects: RUST_PROJECTS, rustProjectChats: RUST_PROJECT_CHATS,
 });
 // The provider registry's routes: list, connect, test and remove (routes/providers.cjs), plus
 // Sign in with ChatGPT (chatgptOAuth, built beside mcpOAuth above) while features.chatgptOAuth is on.

@@ -44,7 +44,10 @@ function sealProviderRow(row, secrets) {
 
 // `rustProjects`: M4 of the full-Rust migration (rust-projects.cjs). While it is on, projects.json
 // is shared with the Rust front: read again when it changed, saved by a merge under a shared lock.
-function createWorkspaceStore(rootDir, defaultProvider, secrets, { rustProjects = false } = {}) {
+// `onProjectsChanged(userId)` is called when a request start took in the front's changes: a write
+// Node used to make itself (and follow with its own nudges, such as the chat vault mirror's) was
+// made by the front instead.
+function createWorkspaceStore(rootDir, defaultProvider, secrets, { rustProjects = false, onProjectsChanged = () => {} } = {}) {
   // Per-user workspaces are cached, but shared providers are NEVER baked
   // into the cached object: the shared file is re-read and re-merged on
   // every workspace access. This closes the load-time-merge race where a
@@ -116,7 +119,7 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { rustProjects 
     const cached = cache.get(userId);
     if (cached) {
       cached.providers = mergeProviders(cached.privateProviders);
-      if (cached.projectsFile) cached.projectsFile.refresh(cached.projects);
+      if (cached.projectsFile && cached.projectsFile.refresh(cached.projects)) onProjectsChanged(userId);
       return cached;
     }
 

@@ -210,8 +210,15 @@ function createProjectStore({
     else FREE_CHATS.splice(0, FREE_CHATS.length, ...FREE_CHATS.filter((c) => !(c && c.id === id)));
     if (target) target.chats = lists.mergeChats(target.chats || [], [next]);
     else FREE_CHATS.splice(0, FREE_CHATS.length, ...lists.mergeChats(Array.from(FREE_CHATS), [next]));
+    // Out of a project, the free list is written first (sbstndalton/noevia#1410): a chat-list
+    // save landing between the two writes (the Rust front's, M4) then sees the chat in the free
+    // list and leaves it out, and the project save that follows removes it from the project; in
+    // the other order that save would find the chat in neither list and keep it in the project,
+    // and it would stay in both for good. Into a project the project goes first, so the chat is
+    // never in neither list.
+    if (owner && !target) saveFreeChats(FREE_CHATS);
     if (owner || target) saveProjects(PROJECTS);
-    if (!owner || !target) saveFreeChats(FREE_CHATS);
+    if (!owner) saveFreeChats(FREE_CHATS);
     return { status: 200, from };
   }
 

@@ -53,11 +53,12 @@ const PASS = Symbol('unhandled');
  * @param {object} deps.store   projects.cjs
  * @param {() => void} [deps.onToolboxesChange]  called after a project's toolbox selection changes (clears the permitted-tools cache)
  * @param {boolean} [deps.rustProjects]  M4 (rust-projects.cjs): the Rust front owns the image writes; this copy refuses them
+ * @param {boolean} [deps.rustProjectChats]  M4 (rust-projects.cjs chatsEnabledFrom): the front owns the chat-list save too; this copy refuses it
  */
 function createProjectRoutes({
   json, readBody, readJson, requestScope, dispatch, currentWorkspace, authService, storageClient, documents, documentSources, rag, fs, path,
   reasoningEffort, projectAppearance, diaryExtras, PROJECTS, DEFAULT_TOOLBOXES, sanitizeToolboxes, allToolboxes = () => [{ id: 'core' }], getProvider, ensureRolesLoaded, servedCatalogue, DEFAULT_PROVIDER_ID, store,
-  onToolboxesChange = () => {}, rustProjects = false,
+  onToolboxesChange = () => {}, rustProjects = false, rustProjectChats = false,
 }) {
   const { refuseOwned } = require('../rust-projects.cjs');
   const {
@@ -387,6 +388,9 @@ function createProjectRoutes({
 
     const projChats = p.match(/^\/api\/projects\/([^/]+)\/chats$/);
     if (projChats) {
+      // M4: the Rust front saves a project's chat list while NOEVIA_RUST_PROJECTS is on and the
+      // supervisor confirmed that this front has the chat-list slice (rust-project-chats).
+      if (req.method === 'POST' && refuseOwned(rustProjects && rustProjectChats, json, res)) return true;
       const id = decodeURIComponent(projChats[1]);
       if (req.method === 'GET') {
         if (!getProject(id)) return json(res, 404, { error: 'no such project' });

@@ -225,7 +225,7 @@ async function main() {
       await step(admin, 'GET', '/api/reasoning-settings', undefined, [200]);
     }
 
-    // Opt-in synthetic routing corpus: default recording stays the existing193 exchanges.
+    // Opt-in synthetic routing corpus: default recording stays the baseline exchanges.
     // No provider is used; these are configuration records only.
     if (process.env.NOEVIA_ROUTING_CORPUS === '1') {
       await step(admin, 'PUT', '/api/admin/features/routingModes', { enabled: true }, [200]);
@@ -329,6 +329,48 @@ async function main() {
     await step(admin, 'DELETE', `/api/projects/${encodeURIComponent(projectId)}`);
     await step(admin, 'GET', '/api/workspace', undefined, [200]);
     if (memberId) await step(admin, 'DELETE', `/api/admin/users/${encodeURIComponent(memberId)}`, { username: MEMBER.username });
+
+    // M4 (NOEVIA_RUST_PROJECTS): a project's chat list, saved and read back, with the refusals. After
+    // the clean-up, so every earlier exchange keeps its place; the list's project is left in place.
+    const listed = await step(admin, 'POST', '/api/projects', { name: 'Synthetic chat list' }, [200]);
+    const listId = listed.json?.id;
+    if (!listId) throw new Error(`project id missing from ${listed.text.slice(0, 200)}`);
+    const list = `/api/projects/${encodeURIComponent(listId)}/chats`;
+    await step(admin, 'POST', '/api/freechats', { chats: [{ id: 'free-alpha', title: 'Free alpha', updatedAt: 5, preview: '' }] }, [200]);
+    await step(admin, 'GET', list, undefined, [200]);
+    await step(admin, 'POST', list, { chats: [
+      { id: 'chat-alpha', title: 'Alpha', updatedAt: 300, preview: 'First', pinned: true, forceLocal: true, createdAt: 100, mode: 'cowork',
+        frame: { kind: 'question', tags: ['#alpha  beta', 'alpha-beta', 7], links: ['chat-beta', 'chat-beta'], confirmed: true, source: 'user' } },
+      { id: 'chat beta/../x', title: { a: 1 }, preview: ['p', null, 3], updatedAt: 200 },
+      // Another list holds it: skipped, and said so.
+      { id: 'free-alpha', title: 'Moved elsewhere', updatedAt: 400 },
+      // Deleted above: tombstoned, never comes back.
+      ...(chatId ? [{ id: chatId, title: 'Deleted chat', updatedAt: 500 }] : []),
+      { id: 'chat-gamma', title: `${'g'.repeat(118)}\u{1F600}tail`, preview: '', updatedAt: 250, frame: { kind: 'bogus' } },
+      'stray', null, { title: 'no id' },
+    ] }, [200]);
+    await step(admin, 'GET', list, undefined, [200]);
+    // A later save keeps the stored flags and first createdAt; frame null clears the frame.
+    await step(admin, 'POST', list, { chats: [{ id: 'chat-alpha', title: 'Alpha renamed', updatedAt: 350, frame: null }, { id: 'chat-gamma', updatedAt: 260, allowCloud: false, createdAt: 7 }] }, [200]);
+    await step(admin, 'GET', list, undefined, [200]);
+    await step(admin, 'POST', list, { chats: 'not a list' }, [400]);
+    await step(admin, 'POST', list, null, [400]);
+    await step(admin, 'POST', '/api/projects/no-such-project/chats', { chats: [] }, [404]);
+    await step(admin, 'GET', '/api/projects/no-such-project/chats', undefined, [404]);
+    await step(noCsrf, 'POST', list, { chats: [] }, [403]);
+    await step(anon, 'GET', list, undefined, [401]);
+    await step(anon, 'POST', list, { chats: [] }, [401]);
+    // The recorder writes an exchange on the response's 'finish', which can come after the client
+    // has the whole answer: wait for the last files before stopping the server.
+    // Done when every file parses and none has appeared for 150 ms (bounded at 5 s).
+    let last = -1, quiet = 0;
+    for (let i = 0; i < 100 && quiet < 3; i += 1) {
+      await new Promise((r) => setTimeout(r, 50));
+      const names = fs.readdirSync(exchanges);
+      const complete = names.filter((f) => f.endsWith('.json')).every((f) => { try { JSON.parse(fs.readFileSync(path.join(exchanges, f), 'utf8')); return true; } catch { return false; } });
+      quiet = complete && names.length === last ? quiet + 1 : 0;
+      last = names.length;
+    }
   } finally {
     child.kill('SIGTERM');
     await new Promise((r) => (child.exitCode !== null ? r() : child.once('exit', r)));

@@ -2,16 +2,21 @@
 // M4 of the full-Rust migration (noevia docs/adr-0001-rust-and-repo-split.md, "Amendment
 // 2026-10-10"): the Rust front (noevia-rs bins/noevia-server, crates/server-projects) takes over
 // project routes slice by slice. The first slice is a project's image assets
-// (POST /api/projects/{id}/assets, GET and DELETE /api/projects/{id}/assets/{assetId}).
+// (POST /api/projects/{id}/assets, GET and DELETE /api/projects/{id}/assets/{assetId}); the second
+// its chat list (GET and POST /api/projects/{id}/chats).
 //
 // The switch is NOEVIA_RUST_PROJECTS=1 (exactly) together with NOEVIA_FRONT=rust, the M3 switch
 // (NOEVIA_RUST_AUTH=1, confirmed: the front gates Rust-owned routes itself) and the supervisor's
 // NOEVIA_RUST_PROJECTS_CONFIRMED=1 (set only once the front's --features lists rust-projects).
 // Anything less and the switch is ignored here (a warning is printed) and Node keeps doing
-// everything, as before.
+// everything, as before. Each slice after the first is confirmed on its own, because a front that
+// lists rust-projects may predate it: the chat-list save is refused here only with
+// NOEVIA_RUST_PROJECT_CHATS_CONFIRMED=1 as well (set only once the front's --features lists
+// rust-project-chats; chatsEnabledFrom). Without it a front that answers only the images forwards
+// the chat-list save here, and Node keeps answering it (sbstndalton/noevia#1409).
 //
-// projects.json cannot have one writer yet: the chat routes, still Node's, keep each project's chat
-// metas in it. So while the switch is on, both processes write it only under one shared lock and
+// projects.json cannot have one writer yet: Node's other routes (the chat turn, a chat's move or
+// delete, the config route) still change it. So while the switch is on, both processes write it only under one shared lock and
 // never from a stale copy:
 //
 //   - the lock is an OS advisory lock, flock(2) LOCK_EX, on `projects.json.lock` beside the file
@@ -30,8 +35,9 @@
 //     what is on disk now; every other project is taken from disk. A project both sides changed
 //     between two reads is merged per top-level field (this process's value where it changed the
 //     field), so a chat save does not drop an image Rust added meanwhile. The id-keyed lists
-//     (assets, retiredAssets) are merged per item: additions from both sides, removals since
-//     the base from either side, an item both changed is this process's. Any other field
+//     (assets, retiredAssets, chats) are merged per item: additions from both sides, removals since
+//     the base from either side, an item both changed is this process's (so a chat meta the front
+//     saved survives a move or delete of another chat here, and a delete here is not undone). Any other field
 //     changed on both sides is last-writer-wins. Every request start re-reads the file
 //     when its (ino, size, mtime) changed, refreshing unchanged projects in place, so a handler
 //     holding a project object still sees the current one.
@@ -48,12 +54,16 @@ const LOCK_WAIT_MS = 3000;
 // flock(1)'s exit status when -w ran out (-E); anything else non-zero is a failure, not "busy".
 const FLOCK_BUSY_STATUS = 75;
 
-/** The routes the Rust front answers under the switch: METHOD path-pattern. noevia-rs
- *  contracts/http/routes.toml (switch = "NOEVIA_RUST_PROJECTS") is the other half. */
+/** The routes a Rust front can answer under the switch: METHOD path-pattern. noevia-rs
+ *  contracts/http/routes.toml (switch = "NOEVIA_RUST_PROJECTS") is the other half; noevia's
+ *  deploy/tools/assemble-release.sh refuses a release whose front owns a project route missing
+ *  here. The chat-list routes are the front's only with chatsEnabledFrom. */
 const OWNED_ROUTES = Object.freeze(new Set([
   'POST /api/projects/{id}/assets',
   'GET /api/projects/{id}/assets/{assetId}',
   'DELETE /api/projects/{id}/assets/{assetId}',
+  'GET /api/projects/{id}/chats',
+  'POST /api/projects/{id}/chats',
 ]));
 
 /** Whether the switch is on for this process (see the header). */
@@ -109,7 +119,7 @@ const blank = (v) => v === undefined || (Array.isArray(v) ? v.length === 0 : v !
 const unchangedHere = (o, b) => same(o, b) || (b === undefined && blank(o));
 
 // Lists of `{ id, ... }` merged per item rather than as one value (see the header).
-const ID_LISTS = new Set(['assets', 'retiredAssets']);
+const ID_LISTS = new Set(['assets', 'retiredAssets', 'chats']);
 const listOrNull = (v) => (v === undefined || v === null ? [] : Array.isArray(v) ? v : null);
 
 /** The id-keyed three-way merge of one list: disk order, items new here appended. An item removed
@@ -321,6 +331,13 @@ function createProjectsFile(file, { atomicJson, warn = console.warn, lock = with
   };
 }
 
+/** Whether the chat-list slice is on (see the header): the switch, and the supervisor's
+ *  NOEVIA_RUST_PROJECT_CHATS_CONFIRMED=1. Silent when only that is missing: a front that answers
+ *  the images alone is a supported pairing, not a misconfiguration. */
+function chatsEnabledFrom(env = process.env, warn = console.warn) {
+  return enabledFrom(env, warn) && env.NOEVIA_RUST_PROJECT_CHATS_CONFIRMED === '1';
+}
+
 /** For Node's copies of the Rust-owned write routes: true when it answered 503. */
 function refuseOwned(enabled, json, res) {
   if (!enabled) return false;
@@ -329,6 +346,6 @@ function refuseOwned(enabled, json, res) {
 }
 
 module.exports = {
-  enabledFrom, withFileLock, merge, mergeFields, mergeIdList, createProjectsFile, readProjectsFile, refuseOwned, replaceContents,
+  enabledFrom, chatsEnabledFrom, withFileLock, merge, mergeFields, mergeIdList, createProjectsFile, readProjectsFile, refuseOwned, replaceContents,
   OWNED_ROUTES, LOCK_SUFFIX, LOCK_WAIT_MS, FLOCK_BUSY_STATUS,
 };
