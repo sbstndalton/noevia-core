@@ -24,7 +24,7 @@ function fixture({ browsable = false, folderError = null } = {}) {
     reasoningEffort: { validEffort: (e) => ['default', 'low', 'high'].includes(e) },
     projectAppearance: (body) => (body.icon === 'bad' ? (() => { throw new Error('unknown icon'); })() : { icon: body.icon || 'folder' }),
     rag: { indexProjectFile: async (...args) => { indexed.push(args); return { ok: true, stored: 1, embedded: 1 }; }, deleteProjectFile: (...args) => deleted.push(args) },
-    storageClient: { isBrowsable: () => browsable, refusedLogin: require('./storage-client.cjs').refusedLogin },
+    storageClient: { isBrowsable: () => browsable, refusedLogin: require('./storage-client.cjs').refusedLogin, storageFailure: require('./storage-client.cjs').storageFailure },
     documentSources: { prune() {}, directory: () => path.join(dir, 'docs') },
     authService: { getStorage: () => ({ kind: browsable ? 'webdav' : 'local' }) },
     currentWorkspace: () => workspace,
@@ -71,14 +71,14 @@ test('with browsable storage a new project makes no storage folder until its fir
 test('#849: ensureProjectFolderDetailed says when storage refused the login, and ensureProjectFolder still just returns null', async () => {
   const rejected = fixture({ browsable: true, folderError: Object.assign(new Error('could not create "noevia projects" (401)'), { status: 502, upstream: 401 }) });
   const project = await rejected.store.createProject({ name: 'Trip' });
-  assert.deepEqual(await rejected.store.ensureProjectFolderDetailed(project), { folder: null, loginRejected: true });
+  assert.deepEqual(await rejected.store.ensureProjectFolderDetailed(project), { folder: null, loginRejected: true, failure: { kind: 'login' } });
   assert.equal(await rejected.store.ensureProjectFolder(project), null);
   const down = fixture({ browsable: true, folderError: Object.assign(new Error('could not create "noevia projects" (500)'), { status: 502, upstream: 500 }) });
-  assert.deepEqual(await down.store.ensureProjectFolderDetailed(await down.store.createProject({ name: 'Trip' })), { folder: null, loginRejected: false });
+  assert.deepEqual(await down.store.ensureProjectFolderDetailed(await down.store.createProject({ name: 'Trip' })), { folder: null, loginRejected: false, failure: null });
   const none = fixture({ browsable: false });
-  assert.deepEqual(await none.store.ensureProjectFolderDetailed(await none.store.createProject({ name: 'Trip' })), { folder: null, loginRejected: false });
+  assert.deepEqual(await none.store.ensureProjectFolderDetailed(await none.store.createProject({ name: 'Trip' })), { folder: null, loginRejected: false, failure: null });
   const ok = fixture({ browsable: true });
-  assert.deepEqual(await ok.store.ensureProjectFolderDetailed(await ok.store.createProject({ name: 'Trip' })), { folder: 'noevia projects/Trip', loginRejected: false });
+  assert.deepEqual(await ok.store.ensureProjectFolderDetailed(await ok.store.createProject({ name: 'Trip' })), { folder: 'noevia projects/Trip', loginRejected: false, failure: null });
 });
 
 test('chat metas are sanitized on read and deleting one leaves a tombstone and removes its transcript', async () => {

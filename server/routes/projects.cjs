@@ -16,7 +16,7 @@ const MAX_PROJECT_IMAGES = 12;
 // Shared with projects.cjs's createProject and the create/edit dialogs (src/project-limits.ts,
 // #398) so a name is capped identically everywhere it can be set.
 const { nameMaxLength: PROJECT_NAME_MAX_LENGTH } = require('../../contracts/project-limits.json');
-const { isJsonObject } = require('../http.cjs');
+const { isJsonObject, saveFailureReply } = require('../http.cjs');
 // #409: the composer's Manual model pick had no server-side guard at all — unlike PUT
 // /api/auto-roles (#343) and benchmark/start, which both already reject an embedding,
 // reranking or Laya (routing) model through this same helper.
@@ -59,6 +59,7 @@ function createProjectRoutes({
   json, readBody, readJson, requestScope, dispatch, currentWorkspace, authService, storageClient, documents, documentSources, rag, fs, path,
   reasoningEffort, projectAppearance, diaryExtras, PROJECTS, DEFAULT_TOOLBOXES, sanitizeToolboxes, allToolboxes = () => [{ id: 'core' }], getProvider, ensureRolesLoaded, servedCatalogue, DEFAULT_PROVIDER_ID, store,
   onToolboxesChange = () => {}, rustProjects = false, rustProjectChats = false,
+  storageLatch = require('../storage-latch.cjs').createStorageLatch(),
 }) {
   const { refuseOwned } = require('../rust-projects.cjs');
   const {
@@ -71,9 +72,42 @@ function createProjectRoutes({
   // noevia session expired".
   const STORAGE_LOGIN_REJECTED_ERROR = 'Storage login rejected. Check your storage credentials in Settings → Diary & storage.';
   const storageLoginRejected = (res) => json(res, 502, { error: STORAGE_LOGIN_REJECTED_ERROR, code: 'storageLoginRejected' });
+  // #1428: each way storage can fail gets its own status, code and words. A 429 is a wait (503 with
+  // Retry-After), a timeout is 504, an unreachable server 502; only a 401 says the login was refused.
+  const STORAGE_FAILURE = {
+    login: { status: 502, code: 'storageLoginRejected', error: STORAGE_LOGIN_REJECTED_ERROR },
+    forbidden: { status: 502, code: 'storageForbidden', error: 'Storage refused access to this folder. Check its sharing and permissions in your storage app, then retry.' },
+    throttled: { status: 503, code: 'storageThrottled', error: 'Storage is limiting logins from noevia after too many failed attempts. Wait a few minutes, then retry.' },
+    timeout: { status: 504, code: 'storageTimeout', error: 'Storage did not answer in time. Try again shortly.' },
+    unreachable: { status: 502, code: 'storageUnreachable', error: 'Storage could not be reached. Check the server address and that it is online, then retry.' },
+  };
+  // Answers a storage failure (storageClient.storageFailure) and returns true; false when `failure` is null.
+  const replyStorageFailure = (res, failure) => {
+    if (!failure || !STORAGE_FAILURE[failure.kind]) return false;
+    const m = STORAGE_FAILURE[failure.kind];
+    const wait = failure.kind === 'throttled' ? (failure.retryAfter || 60) : null;
+    json(res, m.status, { error: m.error, code: m.code, ...(wait ? { retryAfter: wait } : {}) }, wait ? { 'Retry-After': String(wait) } : undefined);
+    return true;
+  };
+  // A storage error's words for a skipped source (the refresh toast shows them).
+  const storageReason = (err, fallback) => { const f = storageClient.storageFailure?.(err); return f ? STORAGE_FAILURE[f.kind].error : (err?.message || fallback); };
+  const storageCode = (err) => { const f = storageClient.storageFailure?.(err); return f ? STORAGE_FAILURE[f.kind].code : undefined; };
+  // #1429: an automatic source refresh waits while this account's saved login is refused or
+  // throttled, so it does not keep feeding Nextcloud's brute-force protection. An explicit Retry
+  // press carries X-Cowork-Storage-Retry: 1 (the same contract as the Diary, #1168) and always runs;
+  // it re-latches on another refusal.
+  const automaticHold = (authn, req) => {
+    if (req.headers?.['x-cowork-storage-retry'] === '1' || !authn?.user) return null;
+    let connection;
+    try { connection = authService.getStorage(authn.user.id, true); } catch { return null; }
+    return storageLatch.blocked(authn.user.id, connection);
+  };
+  // A folder step's failure: its kind (#1428), or the older loginRejected flag (a 401) when that is all it says.
+  const folderFailure = (made) => made.failure || (made.loginRejected ? { kind: 'login' } : null);
+  const holdReply = (res, hold) => (hold.kind === 'login' ? storageLoginRejected(res) : replyStorageFailure(res, { kind: 'throttled', retryAfter: hold.retryAfter }));
   const ensureFolder = (project) => typeof store.ensureProjectFolderDetailed === 'function'
     ? store.ensureProjectFolderDetailed(project)
-    : Promise.resolve(ensureProjectFolder(project)).then((folder) => ({ folder, loginRejected: false }));
+    : Promise.resolve(ensureProjectFolder(project)).then((folder) => ({ folder, loginRejected: false, failure: null }));
   // #659: when uploads first appear in a project, its Project documents box is turned on
   // (project-docs-default.cjs). `hadUploads` is taken under the source lock before the change,
   // so a project that already had uploads is never changed by a later upload or sync. Not for
@@ -97,6 +131,8 @@ function createProjectRoutes({
     if (backgroundSource && req.method === 'POST' && url.searchParams.get('background') === '1') {
       const projectId = decodeURIComponent(backgroundSource[1]);
       if (!getProject(projectId)) return json(res, 404, { error: 'project not found' });
+      const hold = backgroundSource[2] === 'sources/sync' ? automaticHold(authn, req) : null;
+      if (hold) return holdReply(res, hold);
       const body = await readJson(req, Math.ceil((backgroundSource[2] === 'upload' ? require('../pdf-reduce.cjs').INPUT_CAP : DOCUMENT_UPLOAD_CAP) / 3) * 4 + 512 * 1024);
       const jobId = require('../source-jobs.cjs').start(currentWorkspace(), projectId, async (progress) => {
         const inner = require('node:stream').Readable.from([Buffer.from(JSON.stringify(body))]);
@@ -382,6 +418,8 @@ function createProjectRoutes({
       if (clearRoutingMode) delete storedProject.routingMode;
       // The merge above cannot remove a key, so Low is removed here.
       if (clearContextProfile) delete storedProject.contextProfile;
+      // #1090: null clears the stored effort the same way; the merge above never removes a key.
+      if (patch.reasoningEffort === null) delete storedProject.reasoningEffort;
       saveProjects(PROJECTS);
       pruneDocuments(storedProject);
       return json(res, 200, { ok: true });
@@ -400,9 +438,11 @@ function createProjectRoutes({
       if (req.method === 'POST') {
         const raw = await readBody(req);
         if (!getProject(id)) return json(res, 404, { error: 'no such project' });
+        let body;
+        try { body = JSON.parse(raw); } catch { return json(res, 400, { error: 'invalid JSON' }); }
+        if (!body || typeof body !== 'object' || !Array.isArray(body.chats)) return json(res, 400, { error: 'chats array required' });
+        // #1406: only the reading of the request is a 400; a busy store (503) or a disk failure is not.
         try {
-          const body = JSON.parse(raw);
-          if (!Array.isArray(body.chats)) return json(res, 400, { error: 'chats array required' });
           const skipped = saveChats(
             id,
             body.chats
@@ -429,8 +469,8 @@ function createProjectRoutes({
           );
           // Ids another list holds were not saved here (#765): say so, so the client refreshes.
           return json(res, 200, Array.isArray(skipped) && skipped.length ? { ok: true, skipped } : { ok: true });
-        } catch {
-          return json(res, 400, { error: 'invalid JSON' });
+        } catch (e) {
+          return saveFailureReply(json, res, e, 'could not save the chats; nothing was changed');
         }
       }
     }
@@ -538,11 +578,11 @@ function createProjectRoutes({
             progress('Creating upload folder');
             const made = await ensureFolder(project);
             project.projectFolder = made.folder;
-            if (!project.projectFolder) return made.loginRejected ? storageLoginRejected(res) : json(res, 502, { error: 'Could not create the storage folder; retry.' });
+            if (!project.projectFolder) return replyStorageFailure(res, folderFailure(made)) || json(res, 502, { error: 'Could not create the storage folder; retry.' });
           }
           let file;
           try { file = await uploads.ingest(currentWorkspace(), project, name, bytes, { connection: remote, progress }); }
-          catch (e) { if (storageClient.refusedLogin?.(e)) return storageLoginRejected(res); throw e; }
+          catch (e) { if (replyStorageFailure(res, storageClient.storageFailure?.(e))) return; throw e; }
           if(reduction){file.attachment.reduction=reduction;file.attachment.reason=[file.attachment.reason,reduction.note].filter(Boolean).join(' ');}
           if (getProject(id) !== project) return json(res, 409, { error: 'Project removed during upload.' });
           if (remote) project.sourceFolders = [...new Set([...(project.sourceFolders || []), project.projectFolder])];
@@ -585,7 +625,7 @@ function createProjectRoutes({
         }
         if (!project.projectFolder) {
           const made = await ensureFolder(project);
-          if (!made.folder) return made.loginRejected ? storageLoginRejected(res) : json(res, 502, { error: 'Could not create the project storage folder. Check your storage connection and retry.' });
+          if (!made.folder) return replyStorageFailure(res, folderFailure(made)) || json(res, 502, { error: 'Could not create the project storage folder. Check your storage connection and retry.' });
           project.projectFolder = made.folder;
         }
         project.sourceFolders = [...new Set([...(project.sourceFolders || []), project.projectFolder])];
@@ -593,7 +633,7 @@ function createProjectRoutes({
         try {
           await storageClient.writeFile(connection, `${project.projectFolder}/${rawName}`, bytes);
         } catch (e) {
-          if (storageClient.refusedLogin?.(e)) return storageLoginRejected(res);
+          if (replyStorageFailure(res, storageClient.storageFailure?.(e))) return;
           return json(res, (e && e.status) || 502, { error: (e && e.message) || 'could not save the file' });
         }
         let file;
@@ -633,6 +673,7 @@ function createProjectRoutes({
         try {
           await storageClient.deleteFile(connection, target);
         } catch (e) {
+          if (replyStorageFailure(res, storageClient.storageFailure?.(e))) return;
           return json(res, (e && e.status) || 502, { error: (e && e.message) || 'could not delete the file' });
         }
         project.files = (project.files || []).filter((f) => f.name !== target);
@@ -740,6 +781,8 @@ function createProjectRoutes({
       const id = decodeURIComponent(projSync[1]);
       const project = getProject(id);
       if (!project) return json(res, 404, { error: 'no such project' });
+      const hold = automaticHold(authn, req);
+      if (hold) return holdReply(res, hold);
       return await withSourceLock(project, async () => {
         if (getProject(id) !== project) return json(res, 409, { error: 'Project changed; retry.' });
         const hadUploads = hasUploads(project); // #659: the box is added only when uploads first appear
@@ -772,22 +815,39 @@ function createProjectRoutes({
         // other attached folders) stays, so it counts against the 60 cap.
         const sourceLimit = Math.max(0, 60 - (project.files || []).filter(f => !f.source || !folders.includes(f.source)).length);
 
+        // #1429: a refused or throttled login stops every further storage call in this refresh; the
+        // rest of the folders and files keep what they had and say why, with no more attempts made.
+        let halted = null;
+        const haltFor = (err) => {
+          const failure = storageClient.storageFailure?.(err);
+          if (!failure) return;
+          storageLatch.note(authn.user.id, connection, failure);
+          if (failure.kind === 'login' || failure.kind === 'throttled') halted = { reason: storageReason(err), code: storageCode(err) };
+        };
         for (const folder of folders) {
+          if (halted) {
+            const previous = (project.files || []).filter(f => f.source === folder);
+            fromFolders.push(...previous.map(f => documents.isDocument(f.name) ? { ...documentSources.failed(f, f.name, halted.reason), source: folder } : f));
+            skipped.push({ folder, reason: halted.reason, code: halted.code, retained: previous.some(f => !!f.content) });
+            continue;
+          }
           let entries;
           try {
             entries = await storageClient.listFiles(connection, folder);
+            storageLatch.clear(authn.user.id);
           } catch (e) {
-            const reason = e?.message || 'could not list folder';
+            haltFor(e);
+            const reason = storageReason(e, 'could not list folder');
             const previous = (project.files || []).filter(f => f.source === folder);
             fromFolders.push(...previous.map(f => documents.isDocument(f.name) ? { ...documentSources.failed(f, f.name, reason), source: folder } : f));
-            skipped.push({ folder, reason, retained: previous.some(f => !!f.content) });
+            skipped.push({ folder, reason, code: storageCode(e), retained: previous.some(f => !!f.content) });
             continue;
           }
           if (folder === project.projectFolder) {
             for (const entry of [...entries]) {
               if (entry.isDir && require('../uploads.cjs').GROUPS.includes(entry.name)) {
                 try { entries.push(...await storageClient.listFiles(connection, entry.path)); }
-                catch (err) { fromFolders.push(...(project.files || []).filter(f => f.source === folder && f.name.startsWith(entry.path + '/'))); skipped.push({ folder, file: entry.path, reason: 'Could not refresh this category; previous sources retained.', retained: true }); }
+                catch (err) { haltFor(err); fromFolders.push(...(project.files || []).filter(f => f.source === folder && f.name.startsWith(entry.path + '/'))); skipped.push({ folder, file: entry.path, reason: 'Could not refresh this category; previous sources retained.', retained: true }); }
               }
             }
           }
@@ -800,6 +860,13 @@ function createProjectRoutes({
             const managed = folder === project.projectFolder && require('../uploads.cjs').GROUPS.some(g => entry.path.startsWith(`${folder}/${g}/`));
             if (!isText && !isDoc && !isDocx && !managed) continue;
             if (fromFolders.length >= sourceLimit) { skipped.push({ folder, file: entry.path, reason: LIMIT_REASON, code: 'limit', retained: false }); continue; } // a cap, so one big folder cannot blow up a project
+            const previous = (project.files || []).find((f) => f.source === folder && f.name === entry.path);
+            if (halted) {
+              if (isDoc) fromFolders.push({ ...documentSources.failed(previous, entry.path, halted.reason), source: folder });
+              else if (previous) fromFolders.push(previous);
+              skipped.push({ folder, file: entry.path, reason: halted.reason, code: halted.code, retained: !!previous?.content });
+              continue;
+            }
             try {
               if (managed || isDocx) {
                 const bytes = await storageClient.readBinaryFile(connection, entry.path);
@@ -810,7 +877,6 @@ function createProjectRoutes({
                 // A document is converted to text here, so a PDF in an attached
                 // folder becomes a readable source rather than being skipped.
                 const bytes = await storageClient.readBinaryFile(connection, entry.path);
-                const previous = (project.files || []).find(f => f.source === folder && f.name === entry.path);
                 const file = await documentSources.ingest(currentWorkspace(), id, entry.path, bytes, previous);
                 fromFolders.push({ ...file, source: folder });
                 if (file.document.state !== 'ready') skipped.push({ folder, file: entry.path, reason: documentSources.problem(file), retained: file.document.stale });
@@ -819,11 +885,11 @@ function createProjectRoutes({
                 fromFolders.push({ name: entry.path, content: file.content, source: folder });
               }
             } catch (e) {
-              const previous = (project.files || []).find((f) => f.source === folder && f.name === entry.path);
-              const reason = e?.message || 'could not read';
+              haltFor(e);
+              const reason = storageReason(e, 'could not read');
               if (isDoc) fromFolders.push({ ...documentSources.failed(previous, entry.path, reason), source: folder });
               else if (previous) fromFolders.push(previous);
-              skipped.push({ folder, file: entry.path, reason, retained: !!previous?.content });
+              skipped.push({ folder, file: entry.path, reason, code: storageCode(e), retained: !!previous?.content });
             }
           }
         }

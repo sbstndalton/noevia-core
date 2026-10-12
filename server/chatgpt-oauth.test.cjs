@@ -627,3 +627,47 @@ test('catalogue compatibility #1310: the existing configured version override re
   assert.deepEqual(await f.oauth.listModels('user-a'), publicCatalogue1310.models.map((row) => row.slug));
   assert.equal(f.fake.seen.calls.find((c) => c.url.startsWith(`${CODEX}/models?`)).url, `${CODEX}/models?client_version=0.199.2-fixture`);
 });
+
+// #1311: an explicit reasoning effort the adapter does not map by default is sent when the model's
+// published list offers it, and refused with the offered levels otherwise. It is never silently dropped.
+test('#1311: explicit xhigh/max/ultra reach upstream only when the model publishes them; others are refused, not dropped', async (t) => {
+  const f = make(t);
+  await connect(f);
+  f.fake.state.catalogue = { models: [
+    { slug: 'gpt-levels', default_reasoning_level: 'low', supported_reasoning_levels: [{ effort: 'low' }, { effort: 'max' }] },
+    { slug: 'gpt-basic', default_reasoning_level: 'medium', supported_reasoning_levels: [{ effort: 'low' }, { effort: 'medium' }] },
+  ] };
+  const before = f.fake.seen.responses.length;
+
+  // A published level is forwarded as the explicit choice (not the model default).
+  let r = await post(f, { model: 'gpt-levels', reasoning_effort: 'max' });
+  assert.equal(r.status, 200);
+  assert.equal(lastSent(f).reasoning.effort, 'max');
+  assert.equal(lastSent(f).reasoning.summary, 'auto');
+
+  // A level the model does not publish is a clear 400 that names what it does offer; nothing is sent.
+  r = await post(f, { model: 'gpt-basic', reasoning_effort: 'xhigh' });
+  assert.equal(r.status, 400);
+  const message = (await r.json()).error.message;
+  assert.match(message, /does not offer "xhigh" reasoning for gpt-basic/);
+  assert.match(message, /low, medium/);
+  assert.equal(f.fake.seen.responses.length, before + 1, 'the refused request never reached ChatGPT');
+
+  // The basic levels and Default behave as before.
+  r = await post(f, { model: 'gpt-basic', reasoning_effort: 'low' });
+  assert.equal(lastSent(f).reasoning.effort, 'low');
+  r = await post(f, { model: 'gpt-basic', reasoning_effort: 'default' });
+  assert.equal(r.status, 200);
+  assert.equal(lastSent(f).reasoning.effort, 'medium', 'Default takes the model default, as before');
+});
+
+test('#1311: when the model list cannot be read, an explicit level that needs it is refused with the basic choices', async (t) => {
+  const f = make(t);
+  await connect(f);
+  f.fake.state.modelsDown = true;
+  const before = f.fake.seen.responses.length;
+  const r = await post(f, { model: 'gpt-synthetic', reasoning_effort: 'ultra' });
+  assert.equal(r.status, 400);
+  assert.match((await r.json()).error.message, /could not be read, so "ultra" reasoning cannot be checked.*Default, Low, Medium or High/);
+  assert.equal(f.fake.seen.responses.length, before);
+});

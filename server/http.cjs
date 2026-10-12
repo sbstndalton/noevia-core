@@ -250,4 +250,17 @@ function decodePathPart(raw) {
   try { return decodeURIComponent(raw); } catch { return null; }
 }
 
-module.exports = { json, unauthorized, decodePathPart, fetchJson, readBody, readJson, authResult, isJsonObject, requireJsonObject, answerUnhandled, parseRequestUrl, badRequestUrl, errorResponse, DEFAULT_MAX_RESPONSE_BYTES, readCappedText, readCappedJson, readCappedBuffer, discardBody };
+/** #1406/#1419: `send` is the caller's json(res, status, body, headers). A save that failed after the request was understood. A 400 means the request was
+ *  bad, so it is never used here: the error's own status is kept when it is a 4xx/5xx (a busy store
+ *  is 503 PROJECTS_BUSY, a retired account 410), and anything else is a 500 with a fixed message, so
+ *  an internal error text is not shown. A 503 says when to retry. */
+function saveFailureReply(send, res, err, fallback = 'could not save; nothing was changed') {
+  // 400 is not kept: the body was read before the save, so a 400 out of the save is a server-side fault.
+  const status = Number.isInteger(err?.status) && err.status >= 401 && err.status <= 599 ? err.status : 500;
+  if (status === 500) return send(res, 500, { error: fallback });
+  const body = { error: String(err.message || fallback) };
+  if (err.code) body.code = err.code;
+  return send(res, status, body, status === 503 ? { 'Retry-After': '1' } : undefined);
+}
+
+module.exports = { json, saveFailureReply, unauthorized, decodePathPart, fetchJson, readBody, readJson, authResult, isJsonObject, requireJsonObject, answerUnhandled, parseRequestUrl, badRequestUrl, errorResponse, DEFAULT_MAX_RESPONSE_BYTES, readCappedText, readCappedJson, readCappedBuffer, discardBody };

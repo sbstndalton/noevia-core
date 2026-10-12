@@ -23,7 +23,7 @@ function isIdleReply(reply) {
   return false;
 }
 
-function startDiaryBackupWorker({ users, enabled, run, interval = 30000, onError = () => {} }) {
+function startDiaryBackupWorker({ users, enabled, run, suspended = () => false, interval = 30000, onError = () => {} }) {
   let stopped = false, timer;
   // userId -> { backoffMs, nextAt, loggedThisWindow }
   const state = new Map();
@@ -35,6 +35,9 @@ function startDiaryBackupWorker({ users, enabled, run, interval = 30000, onError
   }
 
   async function runUser(user, now) {
+    // #1429: a suspended account is not called at all, and its backoff is left alone; the first
+    // call after the suspension ends runs straight away.
+    if (suspended(user)) return;
     const s = stateFor(user.id);
     if (now < s.nextAt) return;
     // A new window has started (we are actually calling `run` again): a fresh
