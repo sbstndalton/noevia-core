@@ -53,3 +53,42 @@ test('revocation and account disable during asynchronous verification prevent au
   pending=p.verifyDav('alice',a.password,'lan'); db.prepare("UPDATE users SET disabled_at=1 WHERE id='alice'").run();
   assert.equal(await pending,null);
 });
+test('every DAV rejection past the format check costs one Argon2 verify, so timing does not reveal accounts (noevia#1253)', async t => {
+  const { verify: realVerify } = require('@node-rs/argon2');
+  const db = new Database(':memory:'); db.pragma('foreign_keys=ON');
+  db.exec(`CREATE TABLE users(id TEXT PRIMARY KEY,username_norm TEXT,disabled_at INTEGER,credential_epoch INTEGER NOT NULL DEFAULT 0);
+    INSERT INTO users(id,username_norm,disabled_at) VALUES('alice','alice',NULL),('carol','carol',1);`);
+  t.after(() => db.close());
+  const seen = [];
+  const passwords = createAppPasswords({ db, audit: () => {}, rateLimited: () => false,
+    verifyHash: (stored, password) => { seen.push(stored); return realVerify(stored, password); } });
+  const a = await passwords.create('alice', { name: 'Laptop', scope: 'lan' });
+  const d = await passwords.create('alice', { name: 'Public', scope: 'public' });
+  // Attack inputs: a well-formed `nv_dav_<32 hex>.<43 base64url>` password (the attacker's own, or a
+  // random one with an id that exists for no account), sent with a username that is real, unknown,
+  // disabled, or real with the other scope.
+  const unknownId = `nv_dav_${'0'.repeat(32)}.${'A'.repeat(43)}`;
+  const cases = [
+    ['alice', a.password, 'lan', true],            // right user, right credential, right scope
+    ['alice', a.password.slice(0, -1) + 'A', 'lan', false], // right id, wrong secret
+    ['ghost', a.password, 'lan', false],           // unknown username
+    ['alice', unknownId, 'lan', false],            // real username, credential that does not exist
+    ['carol', a.password, 'lan', false],           // disabled account (its own credential does not exist here)
+    ['alice', d.password, 'lan', false],           // credential of the other scope
+  ];
+  for (const [username, password, scope, ok] of cases) {
+    seen.length = 0;
+    const result = await passwords.verifyDav(username, password, scope);
+    assert.equal(seen.length, 1, `${username} ${scope}: exactly one Argon2 verify`);
+    assert.match(seen[0], /^\$argon2id\$/);
+    assert.equal(result !== null, ok, `${username} ${scope}`);
+  }
+  // The decoy is a real hash of the same parameters, not a stored credential.
+  const stored = db.prepare('SELECT password_hash FROM app_passwords WHERE id=?').all(a.id).map(r => r.password_hash);
+  seen.length = 0; await passwords.verifyDav('ghost', a.password, 'lan');
+  assert.ok(!stored.includes(seen[0]));
+  // A malformed secret never reaches the database or Argon2 (no account is named by that shape).
+  seen.length = 0;
+  assert.equal(await passwords.verifyDav('alice', 'not-a-dav-password', 'lan'), null);
+  assert.equal(seen.length, 0);
+});
