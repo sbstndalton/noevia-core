@@ -10,10 +10,10 @@ const { createToolExchange } = require('./tool-exchange.cjs');
 const { createApprovals } = require('./approvals.cjs');
 const { createApprovalRoutes } = require('./routes/approvals.cjs');
 
-async function runDriveCall(t, { name, files = [], ragOverride = null, savedMode = null, connected = true, decision = 'approve', policyDuringApproval = null, autoDecision = null, history = [], sampling = undefined, autoSamplingEnabled = undefined, message = 'Synthetic Drive request', codeRoleConfigured = false, beforeChat = null, sourceWaitMs = undefined }) {
+async function runDriveCall(t, { name, files = [], ragOverride = null, savedMode = null, connected = true, decision = 'approve', policyDuringApproval = null, autoDecision = null, history = [], sampling = undefined, autoSamplingEnabled = undefined, message = 'Synthetic Drive request', codeRoleConfigured = false, beforeChat = null, sourceWaitMs = undefined, projectId = undefined, realRag = false }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-drive-chat-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const user = { id: 'synthetic-user' }, project = { id: 'synthetic-project', model: 'synthetic-model', routing: autoDecision ? 'auto' : 'manual', toolboxes: ['core'], files, ...(sampling !== undefined ? { sampling } : {}) };
+  const user = { id: 'synthetic-user' }, project = { id: projectId || 'synthetic-project', model: 'synthetic-model', routing: autoDecision ? 'auto' : 'manual', toolboxes: ['core'], files, ...(sampling !== undefined ? { sampling } : {}) };
   const workspace = { userId: user.id, dir };
   const store = { workspace: { userId: user.id }, authn: { user } };
   const requestScope = { getStore: () => store, run: (_scope, fn) => fn() };
@@ -49,7 +49,7 @@ async function runDriveCall(t, { name, files = [], ragOverride = null, savedMode
   };
   const handler = createChatHandler({
     fs, path, crypto, fetch, reasoningEffort: require('./reasoning-effort.cjs'), createToolExchange,
-    rag: ragOverride || { filesContext: async () => null }, prefill: { recordSample() {} }, reduceToolResult: require('./tool-result-reduce.cjs').reduceToolResult,
+    rag: ragOverride || (realRag ? require('./rag.cjs') : { filesContext: async () => null }), prefill: { recordSample() {} }, reduceToolResult: require('./tool-result-reduce.cjs').reduceToolResult,
     HISTORY_CAP: 20, DEFAULT_PROVIDER_ID: 'default', DIARY_BASE: 'http://fixture.invalid', TOOL_RESULT_CAP: 8000,
     authService: { audit: (...args) => audits.push(args), db: autoSamplingEnabled === undefined ? undefined : { prepare: () => ({ get: () => ({ value: String(autoSamplingEnabled) }) }) } },
     toolPolicy: { mode: (_user, _tool, write) => currentMode === 'block' ? 'block' : write ? 'ask' : currentMode || 'allow' },
@@ -436,4 +436,25 @@ test('a file still processing after the bounded wait is reported as not ready an
   const r = await runDriveCall(t, { name: 'drive_read_file', sourceWaitMs: 30, beforeChat: attachDuringTurn({ name: 'slow.md', never: true }) });
   assert.deepEqual(r.events.find((e) => e.type === 'meta').sourcesNotReady, [{ name: 'slow.md', reason: 'timeout' }]);
   assert.ok(r.events.some((e) => e.type === 'delta'), 'the turn still replied');
+});
+
+test('a free chat\'s attachment is shown with the user\'s turn as attached to the chat, not as project knowledge (#1441)', async (t) => {
+  const files = [{ name: 'note.md', content: 'Synthetic codeword: PINEAPPLE-7.', attachment: { id: 'att-1', state: 'ready' } }];
+  const r = await runDriveCall(t, { name: 'drive_read_file', projectId: 'cowork-chat-context-c-synthetic1', files, realRag: true, message: 'Summarize this file in one sentence.' });
+  const messages = r.requests[0].messages;
+  const system = messages.filter((m) => m.role === 'system').map((m) => m.content).join('\n');
+  assert.doesNotMatch(system, /Chat attachments|knowledge-file|user's project|PINEAPPLE/);
+  const user = messages.filter((m) => m.role === 'user').at(-1).content;
+  assert.match(user, /^The user attached these files to this chat \(1\): "note\.md"/);
+  assert.match(user, /<untrusted[^>]*kind="file"[\s\S]*PINEAPPLE-7/);
+  assert.ok(user.endsWith('Summarize this file in one sentence.'), 'the file comes before the question');
+  assert.deepEqual(r.events.find((e) => e.type === 'sources').sources.map((s) => s.file), ['note.md']);
+});
+
+test('a real project keeps its project and knowledge-file framing in the system message (#1441)', async (t) => {
+  const files = [{ name: 'note.md', content: 'Synthetic codeword: PINEAPPLE-7.' }];
+  const r = await runDriveCall(t, { name: 'drive_read_file', files, realRag: true, message: 'Summarize this file in one sentence.' });
+  const system = r.requests[0].messages.filter((m) => m.role === 'system').map((m) => m.content).join('\n');
+  assert.match(system, /Relevant knowledge-file excerpts for this message:\nSources attached to this project \(1\)/);
+  assert.equal(r.requests[0].messages.filter((m) => m.role === 'user').at(-1).content, 'Summarize this file in one sentence.');
 });

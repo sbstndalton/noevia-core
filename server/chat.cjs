@@ -378,11 +378,15 @@ function createChatHandler({
     // injection (small files whole, big files capped) — the old behavior.
     let filesBlock = null;
     let replySources = [];
+    // #1441: a free chat's attachments live in a hidden shadow project. Its files are shown to the model
+    // with the user's turn as "attached to this chat"; the shadow project's name and a "knowledge-file"
+    // framing in the system message made a small model deny having them. Real projects are unchanged.
+    const chatAttachments = !!project && String(project.id).startsWith('cowork-chat-context-');
     if (project && Array.isArray(project.files) && project.files.length) {
       const readable = require('./instruction-skills.cjs').sources(project);
       // #552: the chunks that went into the prompt, reported to the browser as a `sources` event.
       filesBlock = await rag.filesContext(project.id, readable, message, currentWorkspace().userId,
-        (placed) => { replySources = require('./chat-sources.cjs').buildSources(placed, readable); });
+        (placed) => { replySources = require('./chat-sources.cjs').buildSources(placed, readable); }, { attached: chatAttachments });
     }
 
     const sysParts = [];
@@ -394,7 +398,7 @@ function createChatHandler({
     const memoryPart = accountMemory.systemPart(accountMemory.read(currentWorkspace().dir), project?.memories);
     if (!project && memoryPart) sysParts.push(memoryPart);
     if (project) {
-      if (project.name) sysParts.push(`You are working inside the user's project "${project.name}".`);
+      if (project.name && !chatAttachments) sysParts.push(`You are working inside the user's project "${project.name}".`);
       if (project.goal) sysParts.push(`Project goal: ${project.goal}`);
       if (project.instructions) sysParts.push(`Project instructions (follow closely):\n${project.instructions}`);
       if (memoryPart) sysParts.push(memoryPart);
@@ -405,8 +409,16 @@ function createChatHandler({
         const codePart = require('./shared-context.cjs').forChat(project, tasks);
         if (codePart) sysParts.push(codePart);
       }
-      if (filesBlock) {
+      if (filesBlock && (!chatAttachments || body.compactOnly)) {
         sysParts.push(`Relevant knowledge-file excerpts for this message:\n${filesBlock}`);
+      }
+      if (filesBlock && chatAttachments && !body.compactOnly) {
+        // Right before the latest user message (which normalizeReplayHistory placed last).
+        const last = msgs[msgs.length - 1];
+        if (last && last.role === 'user' && typeof last.content === 'string') {
+          const at = last.content.endsWith(message) ? last.content.length - message.length : 0;
+          msgs = [...msgs.slice(0, -1), { ...last, content: `${last.content.slice(0, at)}${filesBlock}\n\n${last.content.slice(at)}` }];
+        }
       }
       if (sourcesNotReady.length) {
         sysParts.push(`The user just attached ${sourcesNotReady.map((f) => JSON.stringify(f.name)).join(', ')}, but ${sourcesNotReady.length === 1 ? 'it was' : 'they were'} not ${sourcesNotReady.every((f) => f.reason === 'failed') ? 'processed' : 'finished processing'} in time, so ${sourcesNotReady.length === 1 ? 'its' : 'their'} contents are not available to you for this message. Say so if asked about ${sourcesNotReady.length === 1 ? 'it' : 'them'}; do not guess at the contents.`);
