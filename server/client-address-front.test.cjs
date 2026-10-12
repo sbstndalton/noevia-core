@@ -37,16 +37,44 @@ test('without NOEVIA_FRONT=rust the header is ignored, even from loopback (the t
   const req = fakeReq({ 'x-noevia-client-ip': '6.6.6.6' }, '127.0.0.1');
   assert.equal(clientAddress(req, false, { front: false }), '127.0.0.1');
   assert.equal(clientAddress(req, false, { front: false }), '127.0.0.1');
-  const saved = process.env.NOEVIA_FRONT;
+  const saved = process.env.NOEVIA_FRONT, savedConfirm = process.env.NOEVIA_FRONT_CLIENT_IP;
   try {
     process.env.NOEVIA_FRONT = 'node';
     assert.equal(clientAddress(req), '127.0.0.1');
     process.env.NOEVIA_FRONT = 'RUST';
     assert.equal(clientAddress(req), '127.0.0.1', 'the switch is exactly rust');
     process.env.NOEVIA_FRONT = 'rust';
+    process.env.NOEVIA_FRONT_CLIENT_IP = '1';
     assert.equal(clientAddress(req), '6.6.6.6', 'read from the environment when no option is given');
   } finally {
     if (saved === undefined) delete process.env.NOEVIA_FRONT; else process.env.NOEVIA_FRONT = saved;
+    if (savedConfirm === undefined) delete process.env.NOEVIA_FRONT_CLIENT_IP; else process.env.NOEVIA_FRONT_CLIENT_IP = savedConfirm;
+  }
+});
+
+test('NOEVIA_FRONT=rust alone is not enough: the supervisor must confirm the front strips client copies (#1578)', () => {
+  const req = fakeReq({ 'x-noevia-client-ip': '6.6.6.6' }, '127.0.0.1');
+  const saved = { front: process.env.NOEVIA_FRONT, confirm: process.env.NOEVIA_FRONT_CLIENT_IP };
+  try {
+    process.env.NOEVIA_FRONT = 'rust';
+    delete process.env.NOEVIA_FRONT_CLIENT_IP;
+    assert.equal(clientAddress(req), '127.0.0.1', 'a front that predates the strip: header ignored');
+    assert.equal(clientAddress(req, true), '127.0.0.1');
+    for (const v of ['', '0', 'true', 'yes']) {
+      process.env.NOEVIA_FRONT_CLIENT_IP = v;
+      assert.equal(clientAddress(req), '127.0.0.1', `confirmation is exactly 1, not ${JSON.stringify(v)}`);
+    }
+    // With a trusted proxy the unconfirmed header still cannot override the XFF rule.
+    delete process.env.NOEVIA_FRONT_CLIENT_IP;
+    assert.equal(clientAddress(fakeReq({ 'x-noevia-client-ip': '6.6.6.6', 'x-forwarded-for': '203.0.113.7' }, '127.0.0.1'), true), '203.0.113.7');
+    process.env.NOEVIA_FRONT_CLIENT_IP = '1';
+    assert.equal(clientAddress(req), '6.6.6.6');
+    // The confirmation without NOEVIA_FRONT=rust does nothing either.
+    process.env.NOEVIA_FRONT = 'node';
+    assert.equal(clientAddress(req), '127.0.0.1');
+  } finally {
+    if (saved.front === undefined) delete process.env.NOEVIA_FRONT; else process.env.NOEVIA_FRONT = saved.front;
+    if (saved.confirm === undefined) delete process.env.NOEVIA_FRONT_CLIENT_IP; else process.env.NOEVIA_FRONT_CLIENT_IP = saved.confirm;
   }
 });
 

@@ -41,8 +41,13 @@ const PASSKEY_OPTIONS_PER_ADDRESS = 30;
 // The Rust front (NOEVIA_FRONT=rust) answers for the address in X-Noevia-Client-Ip, with or without
 // TRUST_PROXY, and drops any copy the client sent (noevia-rs legacy_proxy.rs, #1245). Node believes
 // that header only from a loopback peer (the front is the only thing that reaches Node on loopback
-// in that deployment) and only with NOEVIA_FRONT=rust. With NOEVIA_FRONT=node, or from any other
-// peer, the header is ignored, so a client that reaches Node directly cannot choose its address.
+// in that deployment), only with NOEVIA_FRONT=rust, and only when the web supervisor confirmed that
+// this front strips client copies of it (NOEVIA_FRONT_CLIENT_IP=1, set when `noevia-server
+// --features` lists client-address-header; #1578). A front that predates the strip would forward a
+// client-chosen value from its own loopback peer, so version skew or an rs rollback fails closed:
+// the header is ignored and the socket (or TRUST_PROXY's XFF) decides. With NOEVIA_FRONT=node, or
+// from any other peer, the header is ignored too, so a client that reaches Node directly cannot
+// choose its address.
 const FRONT_CLIENT_ADDRESS = 'x-noevia-client-ip';
 function isLoopbackAddress(addr) {
   const a = String(addr || '').toLowerCase().replace(/^::ffff:(?=\d+\.\d+\.\d+\.\d+$)/, '');
@@ -55,7 +60,7 @@ function frontClientAddress(req, front) {
   return net.isIP(addr) ? addr : null;
 }
 
-function clientAddress(req, trustProxy = false, { front = process.env.NOEVIA_FRONT === 'rust' } = {}) {
+function clientAddress(req, trustProxy = false, { front = process.env.NOEVIA_FRONT === 'rust' && process.env.NOEVIA_FRONT_CLIENT_IP === '1' } = {}) {
   const remote = String(req.socket?.remoteAddress || 'unknown');
   const fromFront = frontClientAddress(req, front);
   if (fromFront) return fromFront;
