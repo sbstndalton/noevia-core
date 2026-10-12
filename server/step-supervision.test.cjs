@@ -23,8 +23,38 @@ test('cancel and final round never invoke the provider',async()=>{
 test('verification adds fixed instruction without modifying input; escalation only pauses',async()=>{
   const verified=await superviseNextStep(active(async()=>({action:'verify'})),input);
   assert.equal(input.messages.length,3);assert.equal(verified.messages.length,4);assert.equal(verified.pause,false);
-  const escalated=await superviseNextStep(active(async()=>({action:'escalate'})),input);
+  // A round that wrote (#1456): its escalation is honoured without any score.
+  const escalated=await superviseNextStep(active(async()=>({action:'escalate'})),{...input,wrote:true});
   assert.equal(escalated.messages,input.messages);assert.equal(escalated.pause,true);
+});
+// #1456: 'escalate' is a three-way argmax, so on a read-only round it pauses only when the classifier is confident.
+test('a read-only round pauses on a confident escalation and not on a weak one (#1456)',async()=>{
+  const lines=[];
+  const confident=createStepSupervision({enabled:()=>true,provider:{decide:async()=>({action:'escalate',scores:{continue:0.1,verify:0.2,escalate:0.7}})},deadlineMs:50,log:e=>lines.push(e)});
+  assert.equal((await superviseNextStep(confident,input)).pause,true);
+  const weak=createStepSupervision({enabled:()=>true,provider:{decide:async()=>({action:'escalate',scores:{continue:0.3,verify:0.3,escalate:0.4}})},deadlineMs:50,log:e=>lines.push(e)});
+  const out=await superviseNextStep(weak,input);
+  assert.equal(out.pause,false);assert.equal(out.messages,input.messages);
+  assert.deepEqual(out.decision,{action:'continue',source:'existing'});
+  assert.deepEqual(lines.at(-1),{round:0,action:'continue',fellBack:'weak-escalate',cause:null});
+});
+test('the escalation bound is inclusive at its edges and needs a clear margin (#1456)',async()=>{
+  const pauses=async scores=>(await superviseNextStep(createStepSupervision({enabled:()=>true,provider:{decide:async()=>({action:'escalate',scores})},deadlineMs:50,log:()=>{}}),input)).pause;
+  assert.equal(await pauses({continue:0,verify:0.3,escalate:0.6}),true,'exactly 0.6 with a 0.3 margin');
+  assert.equal(await pauses({continue:0,verify:0.35,escalate:0.65}),true,'exactly 0.3 margin at 0.65');
+  assert.equal(await pauses({continue:0.05,verify:0.35,escalate:0.6}),false,'0.6 against 0.35 is only a 0.25 margin');
+  assert.equal(await pauses({continue:0.2,verify:0.2,escalate:0.6}),true,'0.6 with a 0.4 margin');
+  assert.equal(await pauses({continue:0,verify:0.4,escalate:0.6}),false,'a 0.6-vs-0.4 split is weak');
+  assert.equal(await pauses({continue:0.25,verify:0.2,escalate:0.55}),false,'0.55 is under the absolute bound');
+  assert.equal(await pauses({continue:0.1,verify:0.1,escalate:0.8}),true);
+});
+test('a read-only round whose stop verdict has no scores is not a stop (#1456)',async()=>{
+  for(const value of [{action:'escalate'},{action:'escalate',scores:'x'},{action:'escalate',scores:{escalate:0.9}}]){
+    const out=await superviseNextStep(active(async()=>value),input);
+    assert.equal(out.pause,false,JSON.stringify(value));
+  }
+  // The same verdict on a round that wrote still pauses.
+  assert.equal((await superviseNextStep(active(async()=>({action:'escalate'})),{...input,wrote:true})).pause,true);
 });
 test('simultaneous requests have no shared state',async()=>{
   const supervisor=active(async s=>({action:s.outputs[0].content==='one'?'verify':'continue'}));

@@ -69,7 +69,8 @@ function harness(t, { supervisor = null, recentWrites = createRecentWrites(), ex
   return { state, send };
 }
 
-const escalate = () => createStepSupervision({ enabled: () => true, provider: { decide: async () => ({ action: 'escalate' }) } });
+// A confident stop (#1456): a read-only round honours it only with scores that clear the bound.
+const escalate = () => createStepSupervision({ enabled: () => true, provider: { decide: async () => ({ action: 'escalate', scores: { continue: 0.1, verify: 0.1, escalate: 0.8 } }) } });
 
 test('supervision escalating after a successful approved write ends the reply cleanly and says the change was saved', async (t) => {
   const h = harness(t, { supervisor: escalate() });

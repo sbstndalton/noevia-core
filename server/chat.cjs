@@ -1303,6 +1303,7 @@ function createChatHandler({
       }
 
       const toolCalls = new Map(); // index -> {id, name, args}
+      let roundWrote = false; // #1456: a write tool was about to run this round (its escalation is always honoured)
       let sawAnything = false;
       roundReasoning = '';
       roundHasContent = false;
@@ -1608,6 +1609,8 @@ function createChatHandler({
               }
             }
             markWriteAttempt();
+            // Set before the call, so a write that throws still counts as a round that wrote (#1456).
+            if (isWriteTool(tc.name)) roundWrote = true;
             const options = { chatKey, exchangeKey, routes: toolRoutes, ...(editTarget !== null ? { editTarget: editTargets.targetDigest(editTarget, editAccount) } : {}) };
             result = await executeToolCall(project, tc.name, tc.args, allowedToolNames, chatSignal.signal, outcome, options);
             ran = true;
@@ -1666,7 +1669,7 @@ function createChatHandler({
       if (skillRevocation) break; // revoked during this round's tools: no supervisor call, one error
       const supervised = await require('./step-supervision.cjs').superviseNextStep(
         spaceId?.startsWith('diary') ? null : stepSupervision,
-        { round, messages: roundMessages, signal: chatSignal.signal, goal: message });
+        { round, messages: roundMessages, signal: chatSignal.signal, goal: message, wrote: roundWrote });
       roundMessages = supervised.messages;
       if (supervised.pause) {
         // #658: the tool round before this checkpoint finished, and its writes are real. A pause

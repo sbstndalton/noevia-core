@@ -16,7 +16,8 @@ test('typed decision transport has no answering provider identity or credentials
     assert.deepEqual(Object.keys(JSON.parse(init.body)).sort(),['options','question','state']);
     return Response.json(valid);
   }});
-  assert.deepEqual(await provider.decide(input,{signal}),{action:'verify'});
+  // The validated scores come with the action, so the supervisor can bound an escalation (#1456).
+  assert.deepEqual(await provider.decide(input,{signal}),{action:'verify',scores:valid.scores});
 });
 test('rejects partial, tied, contradictory, nonfinite and oversized replies',async()=>{
   for(const value of [{selected:'verify',scores:{}},{selected:'continue',scores:valid.scores},{selected:'verify',scores:{continue:0.5,verify:0.5,escalate:0}},{selected:'verify',scores:{continue:0,verify:null,escalate:0}},'x'.repeat(9000)]){
