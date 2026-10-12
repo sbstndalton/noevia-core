@@ -50,6 +50,8 @@ test('storage early refusal uses the real parser and fixed no-store reply before
     assert.equal(reply.headers['X-Frame-Options'], 'DENY');
     assert.equal(reply.headers['Referrer-Policy'], 'same-origin');
     assert.ok(reply.headers['Content-Security-Policy'].includes("frame-ancestors 'none'"));
+    assert.equal(reply.headers['Strict-Transport-Security'], 'max-age=15552000');
+    assert.match(reply.headers['Permissions-Policy'], /microphone=\(\).*geolocation=\(\)/);
   }
   assert.equal(gate('/api/integrations/storage', { host: 'a b[' }).status, 503);
   for (const target of ['//[', 'http://[', '//a b']) {
@@ -218,4 +220,18 @@ test('L3: an unparseable request target is a 400 without a logged stack; a malfo
     assert.equal(badHost.status, 200, 'the path alone is enough to route');
   } finally { console.error = realError; }
   assert.deepEqual(logged, [], 'no stack is logged for a client error');
+});
+
+// #1480: every reply the Node layer answers, not only the storage refusal, carries HSTS (six months,
+// no includeSubDomains) and a Permissions-Policy that turns off the features the app never calls.
+test('the public site sends Strict-Transport-Security and Permissions-Policy on every reply (#1480)', async () => {
+  for (const target of ['/api/ready', '/api/features', '/api/nope-not-a-route', '/settings/providers']) {
+    const reply = await request(target);
+    assert.equal(reply.headers['Strict-Transport-Security'], 'max-age=15552000', target);
+    const policy = reply.headers['Permissions-Policy'];
+    for (const feature of ['camera', 'microphone', 'geolocation', 'payment', 'usb']) {
+      assert.ok(policy.includes(`${feature}=()`), `${target}: ${feature} is off`);
+    }
+    assert.ok(!/includeSubDomains/i.test(reply.headers['Strict-Transport-Security']), target);
+  }
 });
