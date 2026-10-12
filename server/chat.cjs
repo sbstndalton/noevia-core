@@ -452,11 +452,22 @@ function createChatHandler({
       const diagnose = async () => {
         const healthUrl = `${DIARY_BASE}/api/health`;
         const health = await fetch(healthUrl, { headers: diaryHeaders('GET', healthUrl), signal: AbortSignal.timeout(3000) });
-        const model = health.ok ? String((await require('./http.cjs').readCappedJson(health, 64 * 1024))?.model || '') : '';
-        if (!model || model === 'default') return null;
+        if (!health.ok) return null;
+        const reported = await require('./http.cjs').readCappedJson(health, 64 * 1024);
+        const model = String(reported?.model || '');
+        // `model_source` says how the companion chose it. Only a name taken as configured (or unchecked)
+        // can be a name the engine does not serve; an unreachable engine or one serving no chat model is
+        // a model failure, and a model it picked from the served list is served by definition.
+        const source = reported?.model_source;
+        if (!model || model === 'default' || (source !== undefined && source !== 'configured' && source !== 'unverified')) return null;
+        if (typeof modelManager?.listModels !== 'function') return null;
+        // The manager's full served list, not modelsInstalled(): that hides `-long` profiles and hash-ID rows,
+        // which are served names too.
         let timer;
-        const installed = await Promise.race([modelsInstalled(), new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('timeout')), 4000); })]).finally(() => clearTimeout(timer));
-        const names = new Set((installed || []).map((m) => m.name));
+        const listed = await Promise.race([modelManager.listModels(), new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('timeout')), 4000); })]).finally(() => clearTimeout(timer));
+        const rows = listed?.ok && Array.isArray(listed.body?.data) ? listed.body.data : null;
+        if (!rows || !rows.length) return null;
+        const names = new Set(rows.flatMap((m) => [m.id, m.model_name].filter((x) => typeof x === 'string' && x)));
         return names.size && !names.has(model) ? { code: 'modelNotServed', model } : null;
       };
       return require('./diary-stream.cjs').proxyDiaryStream(res, diaryUrl, {

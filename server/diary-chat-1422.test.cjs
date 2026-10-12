@@ -15,7 +15,7 @@ const DAY = '2026-10-12';
 const sse = (events) => new Response(new ReadableStream({ start(c) { for (const e of events) c.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(e)}\n\n`)); c.close(); } }), { headers: { 'Content-Type': 'text/event-stream' } });
 const STARTED = [{ type: 'status', text: 'Opening diary context…' }, { type: 'status', text: 'Reading diary entries and memory…' }, { type: 'status', text: 'Generating companion response…' }];
 
-function setup(t, { diary, health = { ok: true, model: 'configured-model' }, installed = [{ name: 'router-model' }] } = {}) {
+function setup(t, { diary, health = { ok: true, model: 'configured-model' }, served = ['router-model'] } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'diary-chat-1422-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const fetched = [];
@@ -41,12 +41,12 @@ function setup(t, { diary, health = { ok: true, model: 'configured-model' }, ins
     const user = { id: 'user-a', role: 'member' };
     const { handleChat } = createChatHandler({
       fetch, reasoningEffort: require('./reasoning-effort.cjs'), createToolExchange, fs, path, crypto: require('node:crypto'),
-      authService: { audit() {}, diaryEnabled: () => true }, modelManager: { enabled: true }, HISTORY_CAP: 20, DEFAULT_PROVIDER_ID: 'default',
+      authService: { audit() {}, diaryEnabled: () => true }, modelManager: { enabled: true, listModels: async () => ({ ok: true, body: { data: served.map((id) => ({ id })) } }) }, HISTORY_CAP: 20, DEFAULT_PROVIDER_ID: 'default',
       currentWorkspace: () => ({ userId: user.id, dir }), requestScope: { getStore: () => ({ authn: { user } }) },
       getProject: () => null, getProvider: spy('getProvider'), providerHeaders: () => ({}), saveChats() {}, endpointApproved: () => false,
       diaryHeaders: () => ({}), diaryExtras: require('./diary-extras.cjs'), DIARY_BASE: 'http://diary.invalid', TOOL_RESULT_CAP: 8000,
       json: (_res, status, b) => { refused = { status, body: b }; },
-      autoRoles: spy('autoRoles'), classifyFastOrSmart: spy('classifyFastOrSmart'), servedCatalogue: async () => [], modelsInstalled: async () => installed,
+      autoRoles: spy('autoRoles'), classifyFastOrSmart: spy('classifyFastOrSmart'), servedCatalogue: async () => [], modelsInstalled: async () => { throw new Error('the filtered list is not used for the diagnosis'); },
       lastLoadedModel: () => null, missingRoles: () => [], staleRolesError: () => null, visionDescriptions: new Map(), visionProbe: spy('visionProbe'),
       skillsIndexFor: () => [], chatSkillRouter: { select: async () => ({ loaded: [] }) }, chatToolRouter: { select: spy('chatToolRouter') },
       oauthServerIds: () => new Set(), accountReady: () => true, DEFAULT_TOOLBOXES: ['core'], CONNECTOR_BOXES: new Set(), connectedBoxes: () => [],
@@ -64,7 +64,7 @@ function setup(t, { diary, health = { ok: true, model: 'configured-model' }, ins
 }
 
 test('the companion failing while it generates: a clear "nothing was saved" error and a failed (not uncertain) record', async (t) => {
-  const f = setup(t, { diary: () => sse([...STARTED, { type: 'error', text: 'Diary processing failed. Saving may be incomplete; check the saved entry before sending again.' }]), health: { ok: true, model: 'router-model' } });
+  const f = setup(t, { diary: () => sse([...STARTED, { type: 'error', text: 'Diary processing failed. Saving may be incomplete; check the saved entry before sending again.' }]), health: { ok: true, model: 'router-model' }, served: ['router-model'] });
   const r = await f.run();
   const error = r.events.find((e) => e.type === 'error');
   assert.equal(error.code, 'modelFailed');
@@ -77,7 +77,7 @@ test('the companion failing while it generates: a clear "nothing was saved" erro
 });
 
 test('the companion set to a model the local engine does not serve: that cause is named', async (t) => {
-  const f = setup(t, { diary: () => sse([...STARTED, { type: 'error', text: 'Diary processing failed.' }]), health: { ok: true, model: 'configured-model' }, installed: [{ name: 'router-model' }, { name: 'other-model' }] });
+  const f = setup(t, { diary: () => sse([...STARTED, { type: 'error', text: 'Diary processing failed.' }]), health: { ok: true, model: 'configured-model', model_source: 'configured' }, served: ['router-model', 'other-model'] });
   const r = await f.run();
   const error = r.events.find((e) => e.type === 'error');
   assert.equal(error.code, 'modelNotServed');
@@ -124,4 +124,29 @@ test('Diary turns are local-only: no routing check, role router, provider or sen
   await f.run();
   assert.deepEqual(f.touched, []);
   assert.ok(f.fetched.every((url) => url.startsWith('http://diary.invalid/')), `only the Diary companion is called: ${f.fetched}`);
+});
+
+test('a model the companion reports as unreachable or none-served is a model failure, never "not served"', async (t) => {
+  for (const model_source of ['unreachable', 'none_served', 'served', 'role']) {
+    const f = setup(t, { diary: () => sse([...STARTED, { type: 'error', text: 'x' }]), health: { ok: true, model: 'x', model_source }, served: ['router-model'] });
+    const r = await f.run();
+    assert.equal(r.events.find((e) => e.type === 'error').code, 'modelFailed', model_source);
+  }
+  for (const model_source of [undefined, 'configured', 'unverified']) {
+    const f = setup(t, { diary: () => sse([...STARTED, { type: 'error', text: 'x' }]), health: { ok: true, model: 'x', ...(model_source ? { model_source } : {}) }, served: ['router-model'] });
+    assert.equal((await f.run()).events.find((e) => e.type === 'error').code, 'modelNotServed', String(model_source));
+  }
+});
+
+test('a served name the filtered model list hides (a -long profile, a hash-ID row) is not reported as not served', async (t) => {
+  const hash = 'a'.repeat(32);
+  for (const name of ['router-model-long', hash]) {
+    const f = setup(t, { diary: () => sse([...STARTED, { type: 'error', text: 'x' }]), health: { ok: true, model: name, model_source: 'configured' }, served: ['router-model', name] });
+    assert.equal((await f.run()).events.find((e) => e.type === 'error').code, 'modelFailed', name);
+  }
+});
+
+test('an empty served list: the diagnosis is skipped, not guessed', async (t) => {
+  const f = setup(t, { diary: () => sse([...STARTED, { type: 'error', text: 'x' }]), health: { ok: true, model: 'x', model_source: 'configured' }, served: [] });
+  assert.equal((await f.run()).events.find((e) => e.type === 'error').code, 'modelFailed');
 });
