@@ -452,7 +452,7 @@ function createChatHandler({
       const diagnose = async () => {
         const healthUrl = `${DIARY_BASE}/api/health`;
         const health = await fetch(healthUrl, { headers: diaryHeaders('GET', healthUrl), signal: AbortSignal.timeout(3000) });
-        const model = health.ok ? String((await health.json())?.model || '') : '';
+        const model = health.ok ? String((await require('./http.cjs').readCappedJson(health, 64 * 1024))?.model || '') : '';
         if (!model || model === 'default') return null;
         let timer;
         const installed = await Promise.race([modelsInstalled(), new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('timeout')), 4000); })]).finally(() => clearTimeout(timer));
