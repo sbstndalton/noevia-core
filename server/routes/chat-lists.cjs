@@ -29,8 +29,9 @@ const PASS = Symbol('unhandled');
  * @param {(chat:{ projectId?:string, id:string }) => boolean} deps.removeChat
  * @param {object} deps.store   projects.cjs: sanitizeChats, saveFreeChats, deleteFreeChat, readHistory, writeHistory, moveChat
  * @param {(userId:string, chatId:string) => boolean} [deps.revokeChatGrant]  approvals.cjs: drops a chat's "Allow for this chat" grant
+ * @param {boolean} [deps.rustFreeChats]  M4 (rust-projects.cjs freeChatsEnabledFrom): the Rust front saves the free-chat list; this copy refuses it
  */
-function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE_CHATS, diaryExtras, crypto, STORED_HISTORY_BYTES, STORED_HISTORY_CAP, chatLists, removeChat, store, revokeChatGrant = () => false }) {
+function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE_CHATS, diaryExtras, crypto, STORED_HISTORY_BYTES, STORED_HISTORY_CAP, chatLists, removeChat, store, revokeChatGrant = () => false, rustFreeChats = false }) {
   const { sanitizeChats, saveFreeChats, deleteFreeChat, readHistory, writeHistory, moveChat } = store;
   // #812: a malformed percent-escape in the URL is the caller's mistake (400), not a server error.
   const decodeChatId = require('../http.cjs').decodePathPart;
@@ -71,6 +72,9 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
     if (p === '/api/freechats') {
       if (req.method === 'GET') return json(res, 200, { chats: FREE_CHATS });
       if (req.method === 'POST') {
+        // M4: the Rust front saves the free-chat list while NOEVIA_RUST_PROJECTS is on and the
+        // supervisor confirmed that this front has the slice (rust-free-chats). The read stays.
+        if (require('../rust-projects.cjs').refuseOwned(rustFreeChats, json, res)) return true;
         const raw = await readBody(req);
         try {
           const body = JSON.parse(raw);

@@ -33,10 +33,13 @@ const { nameMaxLength: PROJECT_NAME_MAX_LENGTH } = require('../contracts/project
  * @param {string} deps.PROJECT_ROOT_FOLDER
  * @param {(storage, connection, root, project) => Promise<string>} deps.createProjectFolder
  * @param {{ afterDelete: (args:object) => Promise<any> }} deps.projectSweep
+ * @param {(userId:string) => void} [deps.onProjectsChanged]  workspace.cjs's nudge (the chat vault
+ *   mirror) when a refresh took in another writer's change
  */
 function createProjectStore({
   fs, path, reasoningEffort, projectAppearance, rag, storageClient, documentSources, authService, currentWorkspace,
   PROJECTS, FREE_CHATS, sanitizeToolboxes, defaultToolboxes, PROJECT_ROOT_FOLDER, createProjectFolder, projectSweep,
+  onProjectsChanged = () => {},
 }) {
   // ── Projects config: instructions, files, memories, model ─────────────────
 
@@ -224,6 +227,24 @@ function createProjectStore({
 
   // Free (non-project) chat metas — persisted server-side so recent chats
   // survive across browsers/devices (localStorage was the only home before).
+  // #778 routing flags on a chat's meta, set by a chat turn after its route choice (which can
+  // wait a long time). The workspace's lists were read when the turn started; while the Rust
+  // front saves the lists (M4), it may have changed this chat meanwhile (a new title, or the chat
+  // itself first saved there), so both coordinated files are read again first and only the flags
+  // are changed on what is on disk now (sbstndalton/noevia#1426).
+  function setChatFlags(projectId, chatId, patch) {
+    const workspace = currentWorkspace();
+    const projectsChanged = workspace.projectsFile ? workspace.projectsFile.refresh(workspace.projects) : false;
+    const freeChanged = workspace.freeChatsFile ? workspace.freeChatsFile.refresh(workspace) : false;
+    if (projectsChanged || freeChanged) onProjectsChanged(workspace.userId);
+    const list = projectId ? getProject(projectId)?.chats : FREE_CHATS;
+    const meta = Array.isArray(list) ? list.find((c) => c && c.id === chatId) : null;
+    if (!meta) return false;
+    Object.assign(meta, patch);
+    if (projectId) saveProjects(PROJECTS); else saveFreeChats(FREE_CHATS);
+    return true;
+  }
+
   function saveFreeChats(list) {
     currentWorkspace().freeChats = Array.from(list);
     currentWorkspace().saveFreeChats();
@@ -683,7 +704,7 @@ function createProjectStore({
   }
 
   return {
-    saveProjects, getProject, sanitizeChats, loadChats, saveChats, chatIdsElsewhere, deleteChat, moveChat, purgeProjectChats, saveFreeChats, deleteFreeChat, createProject,
+    saveProjects, getProject, sanitizeChats, loadChats, saveChats, chatIdsElsewhere, deleteChat, moveChat, purgeProjectChats, saveFreeChats, deleteFreeChat, setChatFlags, createProject,
     deleteProject, removeChatAttachments, removeOrphanChatContexts,
     historyPath, readHistory, writeHistory,
     ownsFile, ensureProjectFolder, ensureProjectFolderDetailed, withSourceLock, pruneDocuments, writeProjectTextFile, sweepDeletedProject, indexSource,
