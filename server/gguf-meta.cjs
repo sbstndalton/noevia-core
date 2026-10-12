@@ -129,6 +129,8 @@ function mode(values) {
 function parameterCount(kv) {
   const declared = kv['general.parameter_count'];
   if (typeof declared === 'number' && Number.isFinite(declared) && declared > 0) return declared;
+  // #1591: shard 1 of a split model lists only its own tensors, so their sum is a fraction of the model.
+  if (typeof kv['split.count'] === 'number' && kv['split.count'] > 1) return null;
   return kv[TENSOR_PARAMS] ?? null;
 }
 

@@ -48,3 +48,11 @@ test('#1197 the KV reader is unchanged: the same keys come back as before', (t) 
   const kvs = readGguf(write(t, build(BASE, TENSORS)));
   assert.deepEqual(Object.keys(kvs).sort(), ['general.architecture', 'llama.block_count']);
 });
+
+test('#1591 shard 1 of a split model has no count of its own: its tensors are a fraction of the model', (t) => {
+  const split = (count) => [...BASE, kv('split.no', S(2, 0)), kv('split.count', S(2, count))];
+  assert.equal(Object.hasOwn(summarize(readGguf(write(t, build(split(3), TENSORS)))), 'parameterCount'), false, 'three shards: no count');
+  assert.equal(countOf(t, build([...split(3), kv('general.parameter_count', S(10, 7000000000))], TENSORS)), 7000000000, 'a declared count still wins');
+  assert.equal(countOf(t, build(split(1), TENSORS)), TOTAL, 'split.count 1 is a whole file');
+  assert.equal(countOf(t, build(split(0), TENSORS)), TOTAL, 'split.count 0 is a whole file');
+});
