@@ -601,7 +601,7 @@ function createProjectStore({
       let current = null;
       if (edit) {
         if (typeof expectName !== 'string' || !expectName) throw new Error('an edit must name the stored file it changes; nothing was saved');
-        current = (project.files || []).find((f) => f.name === expectName);
+        current = (project.files || []).find((f) => f && f.name === expectName);
         if (!current) throw new Error(`"${expectName}" is no longer in this project; nothing was saved`);
         if (expectContent !== undefined && String(current.content || '') !== expectContent) throw new Error(`"${expectName}" changed while this edit was being made; nothing was saved. Read it again and retry.`);
         // Same stored version as planned, and still fully read text: a sync that re-read the file
@@ -660,7 +660,7 @@ function createProjectStore({
       if (remote) project.sourceFolders = [...new Set([...(project.sourceFolders || []), project.projectFolder])];
       // A moved file (#687) leaves its plain-named copy behind in neither the list nor the index.
       if (adopt) rag.deleteProjectFile(project.id, expectName, currentWorkspace().userId);
-      project.files = [...(project.files || []).filter((f) => f.name !== file.name && !(adopt && f === current)), file];
+      project.files = [...(project.files || []).filter((f) => f && f.name !== file.name && !(adopt && f === current)), file];
       project.updatedAt = Date.now();
       indexSource(project, file);
       saveProjects(PROJECTS);

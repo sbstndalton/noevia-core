@@ -142,6 +142,9 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { rustProjects 
       if (provider.id === 'lemonade') { provider.id = defaultProvider.id; provider.label = defaultProvider.label; }
     }
     const uniqueProviders = savedProviders.filter((provider, index, all) => all.findIndex(p => p.id === provider.id) === index);
+    // #1236: a null entry in project.files (a damaged projects.json) is dropped on load, so no reader
+    // (uploads.prune, instruction-skills reconcile, the edit planner) meets a null and throws a TypeError.
+    for (const project of projects) if (project && Array.isArray(project.files)) project.files = project.files.filter((f) => f && typeof f === 'object');
     for (const project of projects) if (project.provider === 'lemonade') project.provider = defaultProvider.id;
     let modesMigrated = false;
     for (const project of projects) if (require('./project-modes.cjs').migrate(project)) modesMigrated = true;

@@ -79,7 +79,7 @@ function planEdit(project, raw, { storageAccount: account = null } = {}) {
       if (!folder) throw new Error(`"${file.name}" is kept only in noevia and this project has no storage folder yet, so it cannot be edited in place. Nothing was changed. Add it again from the project's Sources to store it in the project folder.`);
       if (classify(file.name) !== 'Text') throw new Error(`"${file.name}" is not a text file type that can be stored in the project folder, so it cannot be edited in place. Nothing was changed.`);
       target = `${folder}/Text/${file.name}`;
-      if ((project.files || []).some((f) => f !== file && f.name === target)) throw new Error(`"${target}" is already a separate file in this project, so "${file.name}" cannot be moved there. Nothing was changed. Edit "${target}" instead.`);
+      if ((project.files || []).some((f) => f && f !== file && f.name === target)) throw new Error(`"${target}" is already a separate file in this project, so "${file.name}" cannot be moved there. Nothing was changed. Edit "${target}" instead.`);
       adopt = true;
     }
   }
