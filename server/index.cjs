@@ -1162,7 +1162,7 @@ if (require.main === module) {
     const davServer = http.createServer(codeNetGuard.wrap((req, res) => handler(req, res).catch(() => res.destroy()), 'file-sharing'));
     davServer.requestTimeout = 60000; davServer.headersTimeout = 15000;
     davServer.setTimeout(60000, socket => socket.destroy());
-    davServer.listen(davConfig.port, HOST, () => console.log(`Diary file sharing listener on port ${davConfig.port}; scope ${davConfig.scope}; per-user opt-in required`));
+    davServer.listen(davConfig.port, davConfig.bindHost, () => console.log(`Diary file sharing listener on port ${davConfig.port}; scope ${davConfig.scope}; per-user opt-in required`));
   }
   // ── noevia's own MCP server ──────────────────────────────────────────
   //

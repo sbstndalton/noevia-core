@@ -183,7 +183,8 @@ function readSummaryWasm(file, { wasm = require('./dav-parse-wasm.cjs'), maxWind
     const byteBudget = MAX_SENT_WINDOWS * maxWindow;
     let sent = 0;
     for (let round = 0; ; round++) {
-      if (round > MAX_ROUNDS) throw tooLarge();
+      // MAX_ROUNDS calls in all: round 0 is the first, so the (MAX_ROUNDS+1)th never goes out (#1107).
+      if (round >= MAX_ROUNDS) throw tooLarge();
       sent += segs.reduce((n, x) => n + x.bytes.length, 0);
       if (sent > byteBudget) throw tooLarge();
       let reply;

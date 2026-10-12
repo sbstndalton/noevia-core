@@ -37,8 +37,28 @@ const PASSKEY_OPTIONS_PER_ADDRESS = 30;
 // entry is used: it is the value the trusted proxy appended, so a client
 // cannot spoof it via its own leftmost XFF entries. The header is only
 // consulted when trustProxy is on, and its value must parse as an IP.
-function clientAddress(req, trustProxy = false) {
+//
+// The Rust front (NOEVIA_FRONT=rust) answers for the address in X-Noevia-Client-Ip, with or without
+// TRUST_PROXY, and drops any copy the client sent (noevia-rs legacy_proxy.rs, #1245). Node believes
+// that header only from a loopback peer (the front is the only thing that reaches Node on loopback
+// in that deployment) and only with NOEVIA_FRONT=rust. With NOEVIA_FRONT=node, or from any other
+// peer, the header is ignored, so a client that reaches Node directly cannot choose its address.
+const FRONT_CLIENT_ADDRESS = 'x-noevia-client-ip';
+function isLoopbackAddress(addr) {
+  const a = String(addr || '').toLowerCase().replace(/^::ffff:(?=\d+\.\d+\.\d+\.\d+$)/, '');
+  return a === '::1' || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(a);
+}
+function frontClientAddress(req, front) {
+  if (!front || !isLoopbackAddress(req.socket?.remoteAddress)) return null;
+  const v = req.headers?.[FRONT_CLIENT_ADDRESS];
+  const addr = typeof v === 'string' ? v.trim() : '';
+  return net.isIP(addr) ? addr : null;
+}
+
+function clientAddress(req, trustProxy = false, { front = process.env.NOEVIA_FRONT === 'rust' } = {}) {
   const remote = String(req.socket?.remoteAddress || 'unknown');
+  const fromFront = frontClientAddress(req, front);
+  if (fromFront) return fromFront;
   if (!trustProxy) return remote;
   const forwarded = String(req.headers['x-forwarded-for'] || '');
   const entries = forwarded.split(',').map((s) => s.trim()).filter(Boolean);
