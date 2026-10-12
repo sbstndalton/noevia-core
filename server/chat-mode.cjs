@@ -9,6 +9,8 @@
 
 const MODES = new Set(['chat', 'cowork']);
 const TURN_BOX_CAP = 20;
+// #1512: the image sources a turn attaches (a project holds at most 12 vision images, uploads.cjs).
+const TURN_IMAGE_CAP = 12;
 
 /**
  * Validate the request's `mode` and per-turn toolbox overrides.
@@ -23,6 +25,12 @@ function requestShapeError(body) {
     const v = body.turnToolboxes;
     if (!Array.isArray(v) || v.length > TURN_BOX_CAP || v.some((id) => typeof id !== 'string' || !id || id.length > 80)) {
       return { status: 400, error: `turnToolboxes must be a list of at most ${TURN_BOX_CAP} toolbox ids` };
+    }
+  }
+  if (body.turnImageIds !== undefined) {
+    const v = body.turnImageIds;
+    if (!Array.isArray(v) || v.length > TURN_IMAGE_CAP || v.some((id) => typeof id !== 'string' || !id || id.length > 80)) {
+      return { status: 400, error: `turnImageIds must be a list of at most ${TURN_IMAGE_CAP} image source ids` };
     }
   }
   return null;
@@ -40,4 +48,4 @@ function coworkRefusal({ authn, harnessEnabled, projectId }) {
   return null;
 }
 
-module.exports = { MODES, TURN_BOX_CAP, requestShapeError, coworkRefusal };
+module.exports = { MODES, TURN_BOX_CAP, TURN_IMAGE_CAP, requestShapeError, coworkRefusal };

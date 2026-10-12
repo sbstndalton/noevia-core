@@ -545,6 +545,8 @@ function createChatHandler({
     // The description is cached per image AND per question, because "what is in
     // this picture" and "what is the serial number in this picture" want
     // different descriptions of the same bytes.
+    // #1512: the wait for one description, named (a model swap for the vision role comes before it).
+    const VISION_DESCRIBE_TIMEOUT_MS = 180000;
     const describeImages = async (visionModel, baseUrl, headers, question) => {
       const key = crypto.createHash('sha256').update(JSON.stringify([currentWorkspace().userId, baseUrl, visionModel, project.id, headers, attachedImages, question])).digest('hex');
       const cached = visionDescriptions.get(key);
@@ -571,7 +573,7 @@ function createChatHandler({
             max_tokens: 4096,
             messages: [{ role: 'user', content: [{ type: 'text', text: prompt }, ...attachedImages] }],
           }),
-          signal: AbortSignal.any([chatSignal.signal, AbortSignal.timeout(180000)]),
+          signal: AbortSignal.any([chatSignal.signal, AbortSignal.timeout(VISION_DESCRIBE_TIMEOUT_MS)]),
           redirect: 'error',
         });
         if (!r.ok) {
@@ -599,12 +601,18 @@ function createChatHandler({
     // turn re-sends the same megabytes each message and crowds out the
     // conversation, and the model has already been told what it saw.
     const projectImages = project ? (project.assets || []) : [];
+    // #1512: a turn that names the image sources it attaches (turnImageIds, checked in chat-mode.cjs)
+    // sends only those. The project's other images are named to the model (below), never described
+    // or sent, so a text-only turn does no vision work. Without the field every project image rides
+    // along, as before.
+    const namedImageIds = Array.isArray(body.turnImageIds) ? new Set(body.turnImageIds) : null;
+    const unattachedImageNames = namedImageIds ? projectImages.filter((a) => !namedImageIds.has(a.id)).map((a) => a.name) : [];
     let attachedImages = [];
     const missingImages = [];
     const loadedImageNames = [];
     if (projectImages.length) {
       const dir = currentWorkspace().assetDir(project.id);
-      for (const asset of projectImages) {
+      for (const asset of projectImages.filter((a) => !namedImageIds || namedImageIds.has(a.id))) {
         try {
           const bytes = fs.readFileSync(path.join(dir, asset.id));
           loadedImageNames.push(asset.name);
@@ -865,6 +873,11 @@ function createChatHandler({
       const unsent = `This project has image sources (${loadedImageNames.join(', ')}) that were not sent to this external provider. Say so if asked about them; do not guess at their contents.`;
       wire = wire.map((m) => (m.role === 'system' ? { ...m, content: `${m.content}\n\n${unsent}` } : m));
       if (!sys) wire = [{ role: 'system', content: unsent }, ...wire];
+    }
+    // #1512: project images this turn does not attach are named, so the answer says so instead of guessing.
+    if (unattachedImageNames.length) {
+      const notAttached = `This project has image sources (${unattachedImageNames.join(', ')}) that are not attached to this message. Say so if asked about them; do not guess at their contents.`;
+      wire = wire.some((m) => m.role === 'system') ? wire.map((m) => (m.role === 'system' ? { ...m, content: `${m.content}\n\n${notAttached}` } : m)) : [{ role: 'system', content: notAttached }, ...wire];
     }
     if (attachedImages.length && !body.compactOnly) {
       const roles = autoRoles();
