@@ -294,14 +294,40 @@ test('#1589: the storage status says when a refused login is holding automatic s
   assert.equal(f.sent.pop().body.automaticStorage.held, true);
 });
 
-test('#1589: an explicit Retry that works ends the hold; an automatic read that works does not', async () => {
+// The sidecar's storage-status tells whether an account is kept in the app ('managed') or on the storage server ('legacy').
+const listingReply = (mode) => (url) => (String(url).endsWith('/api/storage-status')
+  ? (mode ? { ok: true, status: 200, body: { mode } } : { ok: false, status: 500, body: { detail: 'down' } })
+  : { ok: true, status: 200, body: { files: [] } });
+const RETRY = { search: '?path=Notes', reqHeaders: { 'x-cowork-storage-retry': '1' } };
+const heldFixture = (mode) => {
   const { createStorageLatch } = require('../storage-latch.cjs');
   const storageLatch = createStorageLatch({ now: () => 0 });
   const conn = { kind: 'nextcloud', baseUrl: 'https://cloud.example/dav', username: 'ada', secret: 'synthetic-pw' };
-  const f = fixture({ storageLatch, reply: () => ({ ok: true, status: 200, body: { files: [] } }) });
+  const f = fixture({ storageLatch, reply: listingReply(mode) });
   storageLatch.note('u1', conn, { kind: 'login' });
+  return { f, storageLatch, conn };
+};
+
+test('#1589: an explicit Retry that works ends the hold; an automatic read that works does not', async () => {
+  const { f, storageLatch, conn } = heldFixture('legacy');
   await f.call('diary', 'GET', '/api/diary/files', undefined, { search: '?path=Notes' });
   assert.notEqual(storageLatch.status('u1', conn), null, 'an automatic read proves nothing');
-  await f.call('diary', 'GET', '/api/diary/files', undefined, { search: '?path=Notes', reqHeaders: { 'x-cowork-storage-retry': '1' } });
-  assert.equal(storageLatch.status('u1', conn), null, 'the person pressed Retry and it worked');
+  await f.call('diary', 'GET', '/api/diary/files', undefined, RETRY);
+  assert.equal(storageLatch.status('u1', conn), null, 'the person pressed Retry and the storage server answered');
+});
+
+test('#1607: a Retry listing that the sidecar answered from its own database (managed mode) does not end the hold', async () => {
+  const { f, storageLatch, conn } = heldFixture('managed');
+  await f.call('diary', 'GET', '/api/diary/files', undefined, RETRY);
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { files: [] } }, 'the listing itself is still returned');
+  assert.notEqual(storageLatch.status('u1', conn), null, 'a local answer says nothing about the saved login');
+  await f.call('diary', 'POST', '/api/diary/file', { path: 'a.md' }, RETRY);
+  assert.notEqual(storageLatch.status('u1', conn), null, 'nor does a local file read');
+});
+
+test('#1607: when the sidecar cannot say which kind of account it is, the hold stays', async () => {
+  const { f, storageLatch, conn } = heldFixture(null);
+  await f.call('diary', 'GET', '/api/diary/files', undefined, RETRY);
+  assert.equal(f.sent.pop().status, 200);
+  assert.notEqual(storageLatch.status('u1', conn), null);
 });

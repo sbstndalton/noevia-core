@@ -7,7 +7,9 @@
 // explicit storage call works (clear), or the hold's backoff ends and one automatic call is let through
 // as a probe (#1589). The backoff doubles after each failed probe, so a login that stays refused is tried
 // rarely, while one transient 401 does not stop backups for good. A throttle holds automatic calls
-// until its Retry-After has passed.
+// until its Retry-After has passed. A throttle that lands on a still-refused login (the probe itself drew the
+// 429) keeps that login's strikes (#1607): when the throttle has run its course the login latch is back, so the
+// next probe that is refused doubles the wait instead of starting again at the base.
 //
 // The latch is per account (userId), in memory: a restart allows one automatic attempt per account,
 // which is the bounded cost this design accepts. It stores a fingerprint of the connection
@@ -31,33 +33,54 @@ function fingerprintOf(connection) {
 }
 
 function createStorageLatch({ now = Date.now } = {}) {
-  const latches = new Map(); // userId -> { fingerprint, kind, until, strikes, probing }
+  // userId -> { fingerprint, kind, until, strikes, probing }. A throttle over a refused login also has
+  // `login: { strikes, until }`, what the login latch is restored to when the throttle has passed (#1607).
+  const latches = new Map();
+
+  /** A throttle that has run its course is dropped, or, when it sat on a refused login of the same
+   *  credentials, gives way to that login latch with the strikes it had. A login that is already due
+   *  is still the probe in flight, so a refusal that follows counts as the probe's. */
+  function settle(userId) {
+    const latch = latches.get(userId);
+    if (latch && latch.kind === 'throttled' && now() >= latch.until) {
+      if (latch.login) latches.set(userId, { fingerprint: latch.fingerprint, kind: 'login', until: latch.login.until, strikes: latch.login.strikes, probing: latch.login.until <= now() });
+      else latches.delete(userId);
+    }
+    return latches.get(userId) || null;
+  }
 
   /** Records a failure of a call made with `connection`. Only login and throttle failures latch;
    *  anything else (a 404, a timeout, a network failure) is left for the next call to find out. */
   function note(userId, connection, failure) {
     if (!userId || !failure) return;
     const fingerprint = fingerprintOf(connection);
+    const before = settle(userId);
     if (failure.kind === 'login') {
-      const before = latches.get(userId);
-      const same = before && before.fingerprint === fingerprint && before.kind === 'login';
+      const sameLogin = before && before.fingerprint === fingerprint && before.kind === 'login';
+      const sameThrottle = before && before.fingerprint === fingerprint && before.kind === 'throttled' && before.login;
       // A probe that was refused again doubles the wait; an explicit press that was refused only renews it.
-      const strikes = same ? (before.probing ? before.strikes + 1 : before.strikes) : 1;
+      const strikes = sameLogin ? (before.probing ? before.strikes + 1 : before.strikes) : sameThrottle ? before.login.strikes : 1;
       const wait = Math.min(LOGIN_PROBE_MAX_MS, LOGIN_PROBE_BASE_MS * 2 ** Math.min(strikes - 1, 16));
       latches.set(userId, { fingerprint, kind: 'login', until: now() + wait, strikes, probing: false });
     } else if (failure.kind === 'throttled') {
       const wait = Number.isFinite(failure.retryAfter) && failure.retryAfter > 0 ? failure.retryAfter * 1000 : DEFAULT_THROTTLE_WAIT_MS;
-      latches.set(userId, { fingerprint, kind: 'throttled', until: now() + wait, strikes: 0, probing: false });
+      // The login strikes survive a throttle on the same credentials. A probe was past its base wait, so
+      // the login is due again the moment the throttle ends; any other 429 leaves the login hold as it was.
+      let login = null;
+      if (before && before.fingerprint === fingerprint) {
+        if (before.kind === 'login') login = { strikes: before.strikes, until: before.probing ? 0 : before.until };
+        else if (before.kind === 'throttled' && before.login) login = before.login;
+      }
+      latches.set(userId, { fingerprint, kind: 'throttled', until: now() + wait, strikes: 0, probing: false, ...(login ? { login } : {}) });
     }
   }
 
-  /** The latch holding this account, or null, without changing anything. A latch for other credentials
-   *  and a throttle that has run its course are dropped. */
+  /** The latch holding this account, or null. A latch for other credentials is dropped; a throttle that
+   *  has run its course is dropped too, or gives way to the refused login it sat on (#1607). */
   function inspect(userId, connection) {
-    const latch = latches.get(userId);
+    const latch = settle(userId);
     if (!latch) return null;
     if (latch.fingerprint !== fingerprintOf(connection)) { latches.delete(userId); return null; }
-    if (latch.kind === 'throttled' && now() >= latch.until) { latches.delete(userId); return null; }
     return latch;
   }
 

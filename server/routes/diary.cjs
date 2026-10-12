@@ -153,7 +153,18 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
       const r = await diaryFetchJson(`${DIARY_BASE}/api${suffix}`, { method: req.method, body, storageRetry }, local ? 600000 : 60000);
       if (r.ok) {
         // #1589: an explicit Retry that works proves the saved login is good, so automatic calls resume.
-        if (storageRetry) { try { storageLatch?.clear(authn.user.id); } catch { /* the hold stays */ } }
+        // #1607: but only when the listing really went to the storage server. A Diary account kept in the app
+        // (managed mode) answers /files and /file from its own database and never contacts Nextcloud
+        // (diary/agent/app.py workspace_files -> ManagedCorpusBackend.list_dir), so that reply proves nothing
+        // about the saved login; the Diary's own storage-status tells which kind of account this is.
+        if (storageRetry && storageLatch) {
+          let reachedStorage = false;
+          try {
+            const st = await diaryFetchJson(`${DIARY_BASE}/api/storage-status`, { method: 'GET' }, 60000);
+            reachedStorage = !!(st.ok && st.body && st.body.mode === 'legacy');
+          } catch { /* unknown: the hold stays */ }
+          if (reachedStorage) { try { storageLatch.clear(authn.user.id); } catch { /* the hold stays */ } }
+        }
         return json(res, r.status, r.body);
       }
       // #849 / #1166: the sidecar tags a storage login the server refused (424 storageLoginRejected) and a

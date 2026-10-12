@@ -143,3 +143,67 @@ test('#1589: status reports the kind and the next attempt, and never changes the
   assert.deepEqual(latch.blocked('u1', CONN), null, 'blocked() is what lets the probe through');
   assert.equal(latch.status('u1', { ...CONN, secret: 'changed-pw' }), null);
 });
+
+// #1607: a 429 on the probe of a still-refused login must not forget the login's strikes.
+test('#1607: login, probe, throttled, throttle ends, login again: the wait is 30 min, not 15', () => {
+  let now = 0;
+  const latch = createStorageLatch({ now: () => now });
+  latch.note('u1', CONN, { kind: 'login' });
+  now = 15 * 60_000;
+  assert.equal(latch.blocked('u1', CONN), null, 'the probe');
+  latch.note('u1', CONN, { kind: 'throttled', retryAfter: 120 });
+  assert.deepEqual(latch.blocked('u1', CONN), { kind: 'throttled', retryAfter: 120 }, 'held for the Retry-After');
+  now += 120_000;
+  assert.equal(latch.blocked('u1', CONN), null, 'the throttle has ended and the login is due: this call is the next probe, not a free pass');
+  assert.deepEqual(latch.blocked('u1', CONN), { kind: 'login' }, 'and the other callers are held again');
+  latch.note('u1', CONN, { kind: 'login' });
+  assert.equal(latch.status('u1', CONN).nextAttemptAt - now, 30 * 60_000, 'the refused probe doubled the wait');
+});
+
+test('#1607: repeated throttled probes keep climbing to the 6 h cap; a throttle alone still just ends', () => {
+  let now = 0;
+  const latch = createStorageLatch({ now: () => now });
+  latch.note('u1', CONN, { kind: 'login' });
+  for (const expected of [30, 60, 120, 240, 360, 360]) {
+    now += 7 * 60 * 60_000;
+    assert.equal(latch.blocked('u1', CONN), null, 'probe');
+    latch.note('u1', CONN, { kind: 'throttled', retryAfter: 60 });
+    now += 61_000;
+    assert.equal(latch.blocked('u1', CONN), null, 'probe after the throttle');
+    latch.note('u1', CONN, { kind: 'login' });
+    assert.equal(latch.status('u1', CONN).nextAttemptAt - now, expected * 60_000, `${expected} min`);
+  }
+  latch.clear('u1');
+  latch.note('u1', CONN, { kind: 'throttled', retryAfter: 30 });
+  now += 31_000;
+  assert.equal(latch.status('u1', CONN), null, 'a throttle with no refused login behind it is simply dropped when it ends');
+});
+
+test('#1607: a throttle on an explicit press leaves the rest of the login hold; a 401 right after the throttle is the refused probe', () => {
+  let now = 0;
+  const latch = createStorageLatch({ now: () => now });
+  latch.note('u1', CONN, { kind: 'login' }); // held until 15 min
+  now = 5 * 60_000;
+  latch.note('u1', CONN, { kind: 'throttled', retryAfter: 60 }); // an explicit press drew a 429
+  now = 5 * 60_000 + 61_000;
+  assert.deepEqual(latch.blocked('u1', CONN), { kind: 'login' }, 'the 15 min hold was not shortened by the throttle ending');
+  now = 15 * 60_000;
+  assert.equal(latch.blocked('u1', CONN), null, 'the probe');
+  latch.note('u1', CONN, { kind: 'throttled', retryAfter: 10 });
+  now += 11_000;
+  latch.note('u1', CONN, { kind: 'login' }); // refused again with no blocked() call in between
+  assert.equal(latch.status('u1', CONN).nextAttemptAt - now, 30 * 60_000);
+});
+
+test('#1607: the strikes belong to the credentials: a throttle never carries them to a changed password', () => {
+  let now = 0;
+  const latch = createStorageLatch({ now: () => now });
+  const NEW = { ...CONN, secret: 'a-new-synthetic-app-pw' };
+  latch.note('u1', CONN, { kind: 'login' });
+  now = 15 * 60_000; latch.blocked('u1', CONN);
+  latch.note('u1', CONN, { kind: 'throttled', retryAfter: 30 });
+  assert.equal(latch.blocked('u1', NEW), null, 'new credentials are not held');
+  latch.note('u1', NEW, { kind: 'login' });
+  assert.equal(latch.status('u1', NEW).nextAttemptAt - now, 15 * 60_000, 'a fresh login starts at the base wait');
+  assert.equal(latch.blocked('u2', CONN), null, 'another account has nothing');
+});
