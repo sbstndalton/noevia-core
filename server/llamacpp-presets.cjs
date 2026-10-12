@@ -133,12 +133,12 @@ function createPresetStore(file,{writer=null,cacheRam=null,backupKeep=BACKUP_KEE
   const budget=require('./inference-budget.cjs');
   const limits=()=>cacheRam||budget.cacheRamLimits();
   if(!file || !path.isAbsolute(file))throw error(500,'LLAMACPP_PRESET_PATH must be an absolute path');
+  // #1596: the Laya marker is models.roles.json beside models.ini, never a key in models.ini.
+  require('./model-system.cjs').useRolesBeside(file);
   function read() {
     const stat=fs.lstatSync(file);
     if(!stat.isFile()||stat.isSymbolicLink())throw error(409,'Preset path must be a regular file');
     const text=fs.readFileSync(file,'utf8');
-    // #1179: the explicit `role = laya` of each section, for isSystemModel (the parser drops unknown keys).
-    require('./model-system.cjs').rememberSectionRoles(text);
     return {text,revision:revision(text),...parse(text)};
   }
   function get(model) {

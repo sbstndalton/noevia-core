@@ -1,38 +1,78 @@
 'use strict';
 // Some router entries are internal system routing models, not chat models a person configures
 // or tunes — Laya (the multilingual detector the Auto route consults) is the only one today.
-// #1179: the marker is an explicit `role = laya` key in the models.ini section. The name/path rule
-// below is only a deprecated fallback for a section that has no role key; it is logged once per id.
+// #1179/#1596: the marker is an entry in noevia's own roles file beside models.ini
+// (models.roles.json: {"<section>": "laya"}). It is NOT a key in models.ini: llama-server reads that
+// file too and its preset loader throws on an option it does not know. The name/path rule below is only
+// a deprecated fallback for a section that has no role; it is logged once per id.
+const fs = require('node:fs');
+const path = require('node:path');
 const LAYA_PREFIX = /^laya(?:[_.-]|$)/i;
 const LAYA_ROLE = 'laya';
+const ROLES_FILENAME = 'models.roles.json';
 
 function isLayaToken(value) {
   return LAYA_PREFIX.test(String(value || '').trim());
 }
 
-// Section name -> lower-cased role, as models.ini last read it (rememberSectionRoles). Routers name
-// a preset by its section, so a router id is the section name.
+// Section name -> lower-cased role, as the roles file last read it. Routers name a preset by its
+// section, so a router id is the section name.
 const sectionRoles = new Map();
 const nameRuleLogged = new Set();
+let rolesFile = null;      // absolute path of the roles file, once a preset store has named models.ini
+let rolesStamp = null;     // "mtimeMs:size:ino" of the file as last read ('' = missing)
+let rolesBadLogged = null;
 
-/** The explicit `role` of each models.ini section in `text` (same section headers as the preset parser). */
+/** The roles file that belongs to a models.ini path. */
+function rolesFileFor(presetFile) {
+  return path.join(path.dirname(presetFile), ROLES_FILENAME);
+}
+
+/** The explicit role of each section in the roles-file `text` (a JSON object of id -> role). */
 function sectionRolesOf(text) {
   const roles = new Map();
-  let current = null;
-  for (const line of String(text || '').split('\n')) {
-    const header = /^\s*\[([^\]\r\n]+)\]\s*(?:[;#].*)?$/.exec(line);
-    if (header) { current = header[1]; continue; }
-    if (current === null || current === '*') continue;
-    const match = /^\s*role\s*=\s*(.*?)\s*$/i.exec(line);
-    if (match && !roles.has(current)) roles.set(current, match[1].trim().toLowerCase());
+  let data;
+  try { data = JSON.parse(String(text || '')); } catch { return roles; }
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return roles;
+  for (const [name, role] of Object.entries(data)) {
+    if (typeof role === 'string' && role.trim() && name !== '*') roles.set(name, role.trim().toLowerCase());
   }
   return roles;
 }
 
-/** Replaces what the explicit roles of the models.ini just read say (called by the preset store). */
+/** Replaces what the explicit roles say (the roles-file text; '' clears them). */
 function rememberSectionRoles(text) {
   sectionRoles.clear();
-  for (const [name, role] of sectionRolesOf(text)) if (role) sectionRoles.set(name, role);
+  for (const [name, role] of sectionRolesOf(text)) sectionRoles.set(name, role);
+}
+
+/** Names the models.ini whose sibling roles file isSystemModel follows (called when a preset store is made). */
+function useRolesBeside(presetFile) {
+  const next = presetFile ? rolesFileFor(presetFile) : null;
+  if (next === rolesFile) return;
+  rolesFile = next;
+  rolesStamp = null;
+  rememberSectionRoles('');
+}
+
+/** Re-reads the roles file when it changed on disk (a missing or unusable file means no explicit roles). */
+function refreshRoles() {
+  if (!rolesFile) return;
+  let stamp = '', text = '';
+  try {
+    const st = fs.statSync(rolesFile);
+    stamp = `${st.mtimeMs}:${st.size}:${st.ino}`;
+    if (stamp === rolesStamp) return;
+    text = fs.readFileSync(rolesFile, 'utf8');
+  } catch (err) {
+    if (err?.code !== 'ENOENT' && rolesBadLogged !== rolesFile) {
+      rolesBadLogged = rolesFile;
+      console.warn(`[model-system] ${rolesFile} is ignored: ${err?.code || 'unreadable'} (#1596)`);
+    }
+    stamp = '';
+  }
+  rolesStamp = stamp;
+  rememberSectionRoles(text);
 }
 
 /** The value that follows a "--model"/"-m" flag in a router process's argv, if any. */
@@ -46,7 +86,7 @@ function modelPathFromArgs(args) {
 function fallbackLaya(token, where) {
   if (!nameRuleLogged.has(token)) {
     nameRuleLogged.add(token);
-    console.warn(`[model-system] ${token} is treated as Laya by the deprecated ${where} rule; add "role = laya" to its models.ini section (#1179)`);
+    console.warn(`[model-system] ${token} is treated as Laya by the deprecated ${where} rule; mark it in ${ROLES_FILENAME} beside models.ini ({"${token}": "laya"}), not in models.ini, which llama.cpp also reads (#1179, #1596)`);
   }
   return true;
 }
@@ -55,10 +95,11 @@ function fallbackLaya(token, where) {
  * True when `id` (a router/preset model id) or `modelPath` (a "--model" argument or preset file
  * path) identifies Laya, noevia's internal multilingual routing model. Laya is never offered for
  * tuning or manual configuration: it fits the system rather than a person tuning it. An explicit
- * `role = laya` in the id's models.ini section decides; only without one does the name/path rule apply.
+ * an explicit "laya" role for the id in models.roles.json decides; only without one does the name/path rule apply.
  */
 function isSystemModel(id, modelPath) {
   const key = id === undefined || id === null ? '' : String(id).trim();
+  refreshRoles();
   if (key && sectionRoles.has(key)) return sectionRoles.get(key) === LAYA_ROLE;
   if (isLayaToken(key)) return fallbackLaya(key, 'name');
   const path = String(modelPath || '');
@@ -106,6 +147,6 @@ const MISSING_MODEL_FILE_REASON = 'This preset points at a model file that is no
 
 module.exports = {
   SYSTEM_MODEL_LOAD_REASON, SIDECAR_MODEL_LOAD_REASON, MISSING_MODEL_FILE_REASON,
-  isSystemModel, modelPathFromArgs, SYSTEM_MODEL_REASON, SYSTEM_MODEL_DELETE_REASON, sectionRolesOf, rememberSectionRoles, LAYA_ROLE,
+  isSystemModel, modelPathFromArgs, SYSTEM_MODEL_REASON, SYSTEM_MODEL_DELETE_REASON, sectionRolesOf, rememberSectionRoles, useRolesBeside, refreshRoles, rolesFileFor, ROLES_FILENAME, LAYA_ROLE,
   sidecarModelNames, isSidecarModel, SIDECAR_MODEL_DELETE_REASON,
 };
