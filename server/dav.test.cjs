@@ -29,6 +29,18 @@ test('DAV deployment transport configuration fails closed',()=>{
  assert.throws(()=>configuration(base,'http://files.local:8031'));
  assert.equal(configuration({...base,COWORK_DAV_SCOPE:'public',COWORK_DAV_ORIGIN:'https://files.example',COWORK_DAV_PROXY_TOKEN:'a'.repeat(64)}).available,true);
 });
+// #1245: the DAV listener has its own bind address, so the web server can be loopback-only while DAV is not.
+test('the DAV listener binds COWORK_DAV_HOST, else UI_HOST as before, and only an IP when it is set explicitly',()=>{
+ const base={COWORK_DAV_PORT:'8031',COWORK_DAV_SCOPE:'lan',COWORK_DAV_ORIGIN:'http://files.local:8031'};
+ assert.equal(configuration(base).bindHost,'0.0.0.0');
+ assert.equal(configuration({...base,UI_HOST:'10.1.2.3'}).bindHost,'10.1.2.3');
+ assert.equal(configuration({...base,UI_HOST:'127.0.0.1',COWORK_DAV_HOST:'100.64.0.9'}).bindHost,'100.64.0.9');
+ assert.equal(configuration({...base,UI_HOST:'127.0.0.1',COWORK_DAV_HOST:'::'}).bindHost,'::');
+ assert.equal(configuration({...base,UI_HOST:'localhost'}).bindHost,'localhost');
+ assert.throws(()=>configuration({...base,COWORK_DAV_HOST:'files.local'}),/COWORK_DAV_HOST must be an IP address/);
+ assert.throws(()=>configuration({...base,COWORK_DAV_HOST:'0.0.0.0 '}),/COWORK_DAV_HOST must be an IP address/);
+ assert.equal(configuration({}).available,false);
+});
 test('sharing opt-in requires eligibility, matching endpoint and explicit cleartext acknowledgement',t=>{
  const f=fixture(t);assert.equal(f.settings.get(f.user('alice')).scope,'off');
  assert.throws(()=>f.settings.save(f.user('alice'),{scope:'lan'}),/Acknowledge/);
