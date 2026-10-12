@@ -96,6 +96,12 @@ function isPrivateIPv6(ip) {
   // (RFC 7526), no service a member legitimately registers is reached only by a 6to4 address,
   // and the relay path ends at whatever IPv4 the attacker picked — public or not.
   if (inPrefix(b, [0x20, 0x02], 16)) return true;
+  // Non-global blocks that were counted as public (#1099): documentation 3fff::/20 (RFC 9637),
+  // benchmarking 2001:2::/48 (RFC 5180), ORCHID 2001:10::/28 (RFC 4843), ORCHIDv2 2001:20::/28 (RFC 7343).
+  if (inPrefix(b, [0x3f, 0xff], 20)) return true;
+  if (inPrefix(b, [0x20, 0x01, 0x00, 0x02], 48)) return true;
+  if (inPrefix(b, [0x20, 0x01, 0x00, 0x10], 28)) return true;
+  if (inPrefix(b, [0x20, 0x01, 0x00, 0x20], 28)) return true;
   return false;
 }
 
