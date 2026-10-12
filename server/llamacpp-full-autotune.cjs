@@ -1285,6 +1285,28 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     }
     throw publicFail('Auto-tune did not finish within its step limit.');
   }
+  // #1093: the revision models.ini has after a write of `text` (the preset store's own rule).
+  const revisionOf = text => crypto.createHash('sha256').update(text).digest('hex');
+  // #1093: a crash between presets.commit and the save that records its revision leaves the job one
+  // revision behind the file. The revision the write was going to produce was saved before the write
+  // (j._pendingRevision): a file at that revision is this job's own write and is adopted. Any other
+  // file keeps the job's revision, so the revision check still refuses a change made outside auto-tune.
+  function adoptPendingRevision(j) {
+    if (j._pendingRevision === undefined) return;
+    if (presets.snapshot().revision === j._pendingRevision) j._revision = j._pendingRevision;
+    delete j._pendingRevision; save();
+  }
+  // #1093: the section this job wrote is in models.ini but the router has not listed it (a crash or a
+  // restart before the re-read). Re-read once more; if it lists the pair, the tune goes on. Otherwise the
+  // job stops with that said, and keeps the section for a Resume (it is not a different file).
+  async function finishPendingLongSection(j, item) {
+    try { await (routerReload ? routerReload() : request('/models?reload=1', {}, 120000)); } catch { /* checked below */ }
+    if ((await routerPairs()).pairs.some(p => p.base === item.base && p.long === item.model)) {
+      note(j, 'The long-context profile ' + item.model + ' is served; continuing.');
+      return;
+    }
+    throw Object.assign(publicFail('The long-context profile ' + item.model + ' is in models.ini, but the model server has not picked it up yet. Check the model server, then Resume.'), { fatal: true });
+  }
   /** #1079: makes sure `item.model` (`<base>-long`) is a section the router serves for the same
    *  file as `item.base`, adding it once from the base section (Rust's long-profile decides the
    *  text) through the usual writer and backup rules, then the router re-reads models.ini. A file
@@ -1295,8 +1317,10 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     if (presets.snapshot().revision !== j._revision) throw Object.assign(Error('Settings changed outside auto-tune.'), { fatal: true });
     const before = await routerPairs();
     if (presets.get(item.model).exists) {
-      if (!before.pairs.some(p => p.base === item.base && p.long === item.model)) throw Object.assign(publicFail(longClash(item)), { fatal: true });
-      return;
+      if (before.pairs.some(p => p.base === item.base && p.long === item.model)) return;
+      // #1093: a section this job wrote, which a crash or restart left before the router listed it.
+      if (item.sectionCreated) return finishPendingLongSection(j, item);
+      throw Object.assign(publicFail(longClash(item)), { fatal: true });
     }
     const row = before.rows.find(r => r.id === item.base);
     if (!row) throw Object.assign(publicFail('A queued model is no longer configured.'), { fatal: true });
@@ -1306,9 +1330,12 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     const made = longProfiles.sectionFor(snap.text, row, presets);
     if (!made.ok) throw Object.assign(publicFail(longRefusal(made.reason)), { fatal: true });
     if (made.id !== item.model) throw Object.assign(publicFail(longRefusal('unavailable')), { fatal: true });
+    // #1093: the section and the revision it produces are recorded before the write, so a crash in
+    // between leaves a job that can tell its own write from a change made outside auto-tune.
+    item.sectionCreated = true; j._pendingRevision = revisionOf(made.text); save();
     await presets.commit({ baseRevision: snap.revision, text: made.text }, writeOptions(j));
     wrote(j);
-    j._revision = presets.snapshot().revision; item.sectionCreated = true; save();
+    j._revision = j._pendingRevision; delete j._pendingRevision; save();
     let served = false;
     try {
       const r = await (routerReload ? routerReload() : request('/models?reload=1', {}, 120000));
@@ -1445,6 +1472,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
   async function recover() {
     const j = state.job;
     if (j?._reloadPending) scheduleReload(j);
+    if (j) adoptPendingRevision(j);
     if (j?.status !== 'running') return;
     // Pre-v3 jobs have a single snapshot. They cannot be resumed into the new phase schema.
     if (!Array.isArray(j.models)) {
@@ -1485,6 +1513,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
       return { ok: false, status: 409, body: { error: 'No resumable auto-tune is available.' } };
     if (j._unsafe || j.models.some(m => m.phases.some(p => p.restored === false)))
       return { ok: false, status: 409, body: { error: 'Settings could not safely be restored; inspect models.ini before starting a new tune.' } };
+    adoptPendingRevision(j);
     if (presets.snapshot().revision !== j._revision)
       return { ok: false, status: 409, body: { error: 'Settings changed outside auto-tune. Start a new tune after reviewing them.' } };
     // A job persisted by a pre-patch build may still list a system routing model (e.g. Laya) in
@@ -1512,8 +1541,9 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
     try {
       await flushReload();
       for (const item of j.models.filter(m => m.status !== 'passed')) {
-        // #1079: a Long item stopped before its section was added is checked by its model.
-        const id = item.mode === 'long' && !presets.get(item.model).exists ? item.base : item.model;
+        // #1079: a Long item stopped before its section was added is checked by its model. #1093: so is
+        // one whose section this job wrote, which the router may not list yet (ensureLongSection decides).
+        const id = item.mode === 'long' && (!presets.get(item.model).exists || item.sectionCreated) ? item.base : item.model;
         if (!id || !rows.body.data.some(row => row.id === id) || !presets.get(id).exists) throw publicFail('A queued model is no longer configured.');
         const identity = await identityFor(id);
         if (!identity) throw publicFail('A queued model identity could not be read.');

@@ -1897,6 +1897,76 @@ test('#1079 a section the router does not pick up is taken out again and the tun
   assert.equal(f.requests.length, 0, 'nothing was measured');
 });
 
+// #1093: a crash can land after the -long section is written and before the router re-reads it, or
+// between the write and the save that records its revision. Both states are rebuilt from a snapshot
+// taken at the router re-read (the first point the section is on disk and recorded), then a restart.
+const revisionOfText = text => require('node:crypto').createHash('sha256').update(text).digest('hex');
+
+test('#1093 a crash after the -long section is written resumes as "added but not yet served", not as a different file', async t => {
+  let crashed = null;
+  const f = fixture(t, { autotuneExtra: { longProfiles: refProfiles() }, onReload: () => {
+    const ini = fs.readFileSync(f.ini, 'utf8');
+    if (!crashed && /^\[synthetic-long\]/m.test(ini)) crashed = { ini, state: fs.readFileSync(f.stateFile, 'utf8') };
+  } });
+  await f.manager.autotune.start('synthetic', { confirmPause: true, mode: 'long' });
+  await finished(f.manager);
+  assert.ok(crashed, 'the section was written before the re-read');
+  // The crash: the file and the job as they were at the re-read, the router never having listed the section.
+  fs.writeFileSync(f.ini, crashed.ini); fs.writeFileSync(f.stateFile, crashed.state);
+  const manager = f.restart(); await manager.autotune.recover();
+  const r = await manager.autotune.resume({ confirmPause: true });
+  assert.equal(r.status, 202, JSON.stringify(r.body));
+  const j = await finished(manager);
+  assert.equal(j.status, 'failed');
+  assert.match(j.error, /long-context profile synthetic-long is in models\.ini, but the model server has not picked it up yet/);
+  assert.doesNotMatch(j.error, /different file/);
+  assert.equal(fs.readFileSync(f.ini, 'utf8'), crashed.ini, 'the section this job wrote is kept for a Resume');
+});
+
+test('#1093 a crash between the -long write and the save of its revision does not refuse the resume', async t => {
+  let crashed = null;
+  const f = fixture(t, { reloadAddsSections: true, autotuneExtra: { longProfiles: refProfiles() }, onReload: () => {
+    const ini = fs.readFileSync(f.ini, 'utf8');
+    if (!crashed && /^\[synthetic-long\]/m.test(ini)) crashed = { ini, state: fs.readFileSync(f.stateFile, 'utf8') };
+  } });
+  await f.manager.autotune.start('synthetic', { confirmPause: true, mode: 'long' });
+  await finished(f.manager);
+  assert.ok(crashed, 'the section was written before the re-read');
+  // The window: the write landed (the file is at the new revision) but the job still holds the old one,
+  // with the revision the write was going to produce saved before it (#1093).
+  const state = JSON.parse(crashed.state), job = state.job;
+  job._pendingRevision = revisionOfText(crashed.ini);
+  job._revision = revisionOfText(f.original);
+  job.status = 'running';
+  job.models[0].status = 'interrupted';
+  fs.writeFileSync(f.ini, crashed.ini); fs.writeFileSync(f.stateFile, JSON.stringify(state));
+  const manager = f.restart(); await manager.autotune.recover();
+  const r = await manager.autotune.resume({ confirmPause: true });
+  assert.equal(r.status, 202, JSON.stringify(r.body));
+  const j = await finished(manager);
+  assert.doesNotMatch(j.error || '', /Settings changed outside auto-tune/);
+  assert.notEqual(j.status, 'failed', j.error);
+});
+
+test('#1093 an unrelated change to models.ini still refuses the resume', async t => {
+  let crashed = null;
+  const f = fixture(t, { reloadAddsSections: true, autotuneExtra: { longProfiles: refProfiles() }, onReload: () => {
+    const ini = fs.readFileSync(f.ini, 'utf8');
+    if (!crashed && /^\[synthetic-long\]/m.test(ini)) crashed = { ini, state: fs.readFileSync(f.stateFile, 'utf8') };
+  } });
+  await f.manager.autotune.start('synthetic', { confirmPause: true, mode: 'long' });
+  await finished(f.manager);
+  const state = JSON.parse(crashed.state), job = state.job;
+  job._pendingRevision = revisionOfText(crashed.ini);   // what the job wrote; the file then changed by hand
+  job._revision = revisionOfText(f.original);
+  job.status = 'interrupted';
+  fs.writeFileSync(f.ini, crashed.ini + '# edited by hand\n'); fs.writeFileSync(f.stateFile, JSON.stringify(state));
+  const manager = f.restart(); await manager.autotune.recover();
+  const r = await manager.autotune.resume({ confirmPause: true });
+  assert.equal(r.status, 409);
+  assert.match(r.body.error, /Settings changed outside auto-tune/);
+});
+
 test('#1079 Long refuses up front when the section cannot be made (no model file to point at)', async t => {
   const f = fixture(t, { reloadAddsSections: true, autotuneExtra: { longProfiles: refProfiles() } });
   // A section without its own model line, and a router row without --model: nothing to copy from.
