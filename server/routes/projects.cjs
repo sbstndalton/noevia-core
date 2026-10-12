@@ -16,7 +16,7 @@ const MAX_PROJECT_IMAGES = 12;
 // Shared with projects.cjs's createProject and the create/edit dialogs (src/project-limits.ts,
 // #398) so a name is capped identically everywhere it can be set.
 const { nameMaxLength: PROJECT_NAME_MAX_LENGTH } = require('../../contracts/project-limits.json');
-const { isJsonObject } = require('../http.cjs');
+const { isJsonObject, saveFailureReply } = require('../http.cjs');
 // #409: the composer's Manual model pick had no server-side guard at all — unlike PUT
 // /api/auto-roles (#343) and benchmark/start, which both already reject an embedding,
 // reranking or Laya (routing) model through this same helper.
@@ -401,9 +401,11 @@ function createProjectRoutes({
       if (req.method === 'POST') {
         const raw = await readBody(req);
         if (!getProject(id)) return json(res, 404, { error: 'no such project' });
+        let body;
+        try { body = JSON.parse(raw); } catch { return json(res, 400, { error: 'invalid JSON' }); }
+        if (!body || typeof body !== 'object' || !Array.isArray(body.chats)) return json(res, 400, { error: 'chats array required' });
+        // #1406: only the reading of the request is a 400; a busy store (503) or a disk failure is not.
         try {
-          const body = JSON.parse(raw);
-          if (!Array.isArray(body.chats)) return json(res, 400, { error: 'chats array required' });
           const skipped = saveChats(
             id,
             body.chats
@@ -430,8 +432,8 @@ function createProjectRoutes({
           );
           // Ids another list holds were not saved here (#765): say so, so the client refreshes.
           return json(res, 200, Array.isArray(skipped) && skipped.length ? { ok: true, skipped } : { ok: true });
-        } catch {
-          return json(res, 400, { error: 'invalid JSON' });
+        } catch (e) {
+          return saveFailureReply(json, res, e, 'could not save the chats; nothing was changed');
         }
       }
     }

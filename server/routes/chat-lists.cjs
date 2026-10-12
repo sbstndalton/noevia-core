@@ -13,6 +13,7 @@
 // Blocks keep their original order and an unmatched method falls through as it did inline.
 
 const PASS = Symbol('unhandled');
+const { saveFailureReply } = require('../http.cjs');
 
 /**
  * @param {object} deps
@@ -70,15 +71,22 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
 
     // ── Free-chat metas (server-side so they survive browser switches) ──
     if (p === '/api/freechats') {
-      if (req.method === 'GET') return json(res, 200, { chats: FREE_CHATS });
+      if (req.method === 'GET') {
+        // #1420: the list is read before the status line goes out, so a broken store is a clean 500.
+        let chats;
+        try { chats = Array.from(FREE_CHATS); } catch { return json(res, 500, { error: 'could not read the free chats' }); }
+        return json(res, 200, { chats });
+      }
       if (req.method === 'POST') {
         // M4: the Rust front saves the free-chat list while NOEVIA_RUST_PROJECTS is on and the
         // supervisor confirmed that this front has the slice (rust-free-chats). The read stays.
         if (require('../rust-projects.cjs').refuseOwned(rustFreeChats, json, res)) return true;
         const raw = await readBody(req);
+        let body;
+        try { body = JSON.parse(raw); } catch { return json(res, 400, { error: 'invalid JSON' }); }
+        if (!body || typeof body !== 'object' || !Array.isArray(body.chats)) return json(res, 400, { error: 'chats array required' });
+        // #1419: only the reading of the request is a 400; a lock or disk failure below is 503/500.
         try {
-          const body = JSON.parse(raw);
-          if (!Array.isArray(body.chats)) return json(res, 400, { error: 'chats array required' });
           const nextFreeChats = body.chats
             .filter((c) => c && typeof c.id === 'string')
             .slice(0, require('../chat-lists.cjs').LIST_CAP)
@@ -108,8 +116,8 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
           // Ids a project holds were not saved here (#765): say so, so a stale tab refreshes.
           const skipped = lists.skippedElsewhere(nextFreeChats, elsewhere);
           return json(res, 200, skipped.length ? { ok: true, skipped } : { ok: true });
-        } catch {
-          return json(res, 400, { error: 'invalid JSON' });
+        } catch (e) {
+          return saveFailureReply(json, res, e, 'could not save the free chats; nothing was changed');
         }
       }
     }

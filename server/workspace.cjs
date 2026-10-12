@@ -161,7 +161,8 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { rustProjects 
       // the current shared set.
       privateProviders: uniqueProviders.filter(p => p.id !== defaultProvider.id),
       providers: [],
-      freeChats: freeChatsFile ? freeChatsFile.load() : readJson(path.join(dir, 'free-chats.json'), []),
+      // #1420: free-chats.json holding null (or any non-list) is an empty list, never a null the routes trip on.
+      freeChats: (() => { const list = freeChatsFile ? freeChatsFile.load() : readJson(path.join(dir, 'free-chats.json'), []); return Array.isArray(list) ? list : []; })(),
       autoRoles: readJson(path.join(dir, 'auto-roles.json'), null),
       // Per-user settings with no better home. defaultRouting: what new projects start as.
       preferences: readJson(path.join(dir, 'preferences.json'), {}) || {},
