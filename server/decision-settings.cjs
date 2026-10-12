@@ -45,8 +45,9 @@ function createDecisionSettings({store,env=process.env,fetchImpl=globalThis.fetc
           const options=request.options||[];
           if(options.length<2 || options.length>SERVICE_LIMITS.maxOptions) throw Object.assign(Error('Option count outside the service limit'),{reason:'too-many-options'});
           const {shaped,toCaller}=serviceOptions(options);
+          // #1437: the sensitivity check is served ahead of other decision calls in the Laya lane.
           const result=await endpoint.choice({state:String(request.context?.stateText||'').slice(0,SERVICE_LIMITS.maxStateChars),
-            question:String(request.question||'').slice(0,SERVICE_LIMITS.maxQuestionChars),options:shaped},opts);
+            question:String(request.question||'').slice(0,SERVICE_LIMITS.maxQuestionChars),options:shaped},{...opts,urgent:request.purpose==='routing.sensitivity'});
           return {...result,selected:toCaller.get(result.selected),scores:Object.fromEntries(Object.entries(result.scores).map(([id,v])=>[toCaller.get(id),v]))};
         },
         supervise:(...args)=>endpoint.decide(...args)};

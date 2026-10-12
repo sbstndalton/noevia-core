@@ -12,9 +12,72 @@ function configuration(env = process.env) {
 }
 // A failure with a short text-free cause code (decision/index.cjs causeOf) for the decision log.
 const failure=(reason,message)=>Object.assign(Error(message),{reason});
-function createDecisionEndpoint({ env=process.env, fetchImpl=globalThis.fetch }={}) {
+const abandoned=()=>failure('aborted','Decision endpoint unreachable');
+// #1437: Laya serves one request at a time (services/laya is a single worker), and a second request
+// that arrives while one is running came back as http-503. So every request this process sends it
+// waits in one lane per service, whichever caller sent it: the sensitivity check first (urgent),
+// then everything else in arrival order. A caller that gives up before its request is sent leaves
+// the lane. Once sent, the place is kept until Laya answers, because Laya keeps working on a request
+// whose client has gone; the hold is capped, so a service that never answers cannot hold the lane.
+const SLOT_HOLD_MAX_MS = 5000;
+// One lane per endpoint (decision-settings keeps one endpoint per configuration, so every caller of
+// the service shares it). A lane is a plain object: { busy, urgent: [], normal: [] }.
+function startNext(lane){ if(!lane.busy){ const next=lane.urgent.shift()||lane.normal.shift(); if(next) next(); } }
+/** Resolves to a release function once it is this request's turn; rejects if the caller gives up first. */
+function takeTurn(lane,{signal,urgent}){
+  return new Promise((resolve,reject)=>{
+    if(signal?.aborted) return reject(abandoned());
+    const queue=urgent?lane.urgent:lane.normal;
+    const granted=()=>{ signal?.removeEventListener('abort',leave); lane.busy=true; resolve(()=>{ lane.busy=false; startNext(lane); }); };
+    const leave=()=>{ const i=queue.indexOf(granted); if(i>=0) queue.splice(i,1); reject(abandoned()); };
+    signal?.addEventListener('abort',leave,{once:true});
+    queue.push(granted);
+    startNext(lane);
+  });
+}
+/** Runs one exchange in the lane. The exchange gets its own signal, cut only by the hold cap; a
+ *  caller's abort rejects the caller at once but leaves the lane held until the exchange settles. */
+async function inTurn(lane,{signal,urgent=false},run,holdMaxMs){
+  const release=await takeTurn(lane,{signal,urgent});
+  const hold=new AbortController();
+  const cap=setTimeout(()=>hold.abort(),holdMaxMs);
+  const sent=run(hold.signal).finally(()=>{ clearTimeout(cap); release(); });
+  sent.catch(()=>{}); // a caller that gave up does not leave this rejection unhandled
+  if(!signal) return sent;
+  return new Promise((resolve,reject)=>{
+    const gaveUp=()=>reject(abandoned());
+    if(signal.aborted) return gaveUp();
+    signal.addEventListener('abort',gaveUp,{once:true});
+    sent.then(resolve,reject).finally(()=>signal.removeEventListener('abort',gaveUp));
+  });
+}
+/** One POST to the decision endpoint; resolves to the response text (size-capped). */
+async function exchange(fetchImpl,url,body,signal){
+  let response;
+  try {
+    response=await fetchImpl(url,{method:'POST',redirect:'error',signal,
+      headers:{'Content-Type':'application/json'},body});
+  } catch (error) { throw failure(error?.name==='AbortError' ? 'aborted' : 'network','Decision endpoint unreachable'); }
+  // The status is the whole diagnosis for the Laya service: 422 is a request it refused
+  // (shape or token budget), 503 a worker that missed its deadline or is reloading (#682).
+  if(!response.ok) throw failure(`http-${Number(response.status)||0}`,'Decision endpoint unavailable');
+  if(!response.body) throw failure('empty-response','Decision endpoint returned no decision');
+  const reader=response.body.getReader();
+  const chunks=[]; let size=0;
+  try {
+    for (;;) {
+      const {done,value}=await reader.read(); if(done) break;
+      size+=value.byteLength;
+      if(size>8192) throw failure('response-too-large','Decision response too large');
+      chunks.push(Buffer.from(value));
+    }
+  } finally { await reader.cancel(); }
+  return Buffer.concat(chunks).toString('utf8');
+}
+function createDecisionEndpoint({ env=process.env, fetchImpl=globalThis.fetch, holdMaxMs=SLOT_HOLD_MAX_MS }={}) {
   const config=configuration(env);
   if (config.reason) return null;
+  const lane={busy:false,urgent:[],normal:[]};
   return {
     async decide(input,{signal}={}) {
       const state=JSON.stringify({goal:input.goal.slice(0,300),outputs:input.outputs.slice(-3).map(o=>({role:o.role,content:o.content.slice(-150)}))});
@@ -28,27 +91,10 @@ function createDecisionEndpoint({ env=process.env, fetchImpl=globalThis.fetch }=
       // The validated scores ride along so the supervisor can bound an 'escalate' (#1456). Nothing else.
       return {action:result.selected,scores:result.scores};
     },
-    async choice({state,question,options},{signal}={}) {
-      let response;
-      try {
-        response=await fetchImpl(config.baseUrl+'/v1/decisions',{method:'POST',redirect:'error',signal,
-          headers:{'Content-Type':'application/json'},body:JSON.stringify({state,question,options})});
-      } catch (error) { throw failure(signal?.aborted || error?.name==='AbortError' ? 'aborted' : 'network','Decision endpoint unreachable'); }
-      // The status is the whole diagnosis for the Laya service: 422 is a request it refused
-      // (shape or token budget), 503 a worker that missed its deadline or is reloading (#682).
-      if(!response.ok) throw failure(`http-${Number(response.status)||0}`,'Decision endpoint unavailable');
-      if(!response.body) throw failure('empty-response','Decision endpoint returned no decision');
-      const reader=response.body.getReader();
-      const chunks=[]; let size=0;
-      try {
-        for (;;) {
-          const {done,value}=await reader.read(); if(done) break;
-          size+=value.byteLength;
-          if(size>8192) throw failure('response-too-large','Decision response too large');
-          chunks.push(Buffer.from(value));
-        }
-      } finally { await reader.cancel(); }
-      const text=Buffer.concat(chunks).toString('utf8');
+    /** `urgent` (#1437): served before queued calls, for the sensitivity check. */
+    async choice({state,question,options},{signal,urgent=false}={}) {
+      const body=JSON.stringify({state,question,options});
+      const text=await inTurn(lane,{signal,urgent},(holdSignal)=>exchange(fetchImpl,config.baseUrl+'/v1/decisions',body,holdSignal),holdMaxMs);
       if(!text.trim()) throw failure('empty-response','Decision endpoint returned no decision');
       let result; try { result=JSON.parse(text); } catch { throw failure('parse','Decision response is not JSON'); }
       const ids=options.map(o=>o.id);
@@ -62,4 +108,4 @@ function createDecisionEndpoint({ env=process.env, fetchImpl=globalThis.fetch }=
     }
   };
 }
-module.exports={configuration,createDecisionEndpoint};
+module.exports={configuration,createDecisionEndpoint,SLOT_HOLD_MAX_MS};
