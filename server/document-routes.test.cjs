@@ -161,6 +161,19 @@ test('background upload survives a short response and polling remains authentica
   assert.deepEqual((await request(docUrl(p.id, 'original'), { headers: { cookie } })).bytes, fixture('text.pdf'));
 });
 
+test('a chat turn sent right after a 202 background upload waits for that upload to finish (#1441)', async () => {
+  const p = await project('Race synthetic upload');
+  const up = await post(`/api/projects/${p.id}/upload?background=1`, { name: 'statement.pdf', dataBase64: fixture('text.pdf').toString('base64') });
+  assert.equal(up.status, 202);
+  const { poll } = JSON.parse(up.text);
+  // The turn itself may be refused later (no model is served in this test); what matters is that it
+  // was not built until the file job had finished, so the first poll afterwards is already done.
+  await post('/api/chat', { spaceId: 'project', projectId: p.id, message: 'Summarize this file in one sentence.', history: [] });
+  const job = JSON.parse((await request(poll, { headers: { cookie } })).text);
+  assert.equal(job.done, true, 'the turn was prepared before the attached file was ingested');
+  assert.equal(job.status, 200, JSON.stringify(job));
+});
+
 test('unified uploads accept DOCX, preserve opaque bytes, protect metadata and expose authenticated downloads', async () => {
   const p = await project('Opaque synthetic uploads');
   // Larger than the old background wrapper's accidental 1 MB limit.

@@ -576,8 +576,8 @@ async function searchProject(projectId, query, userId) {
 
 // The files-context for one chat message: retrieved chunks when the index has
 // vectors, otherwise the verbatim small files (old behavior, still the path
-// for anything <= DIRECT_INJECT_MAX). Never throws.
-async function filesContext(projectId, files, query, userId, onSources) {
+// for anything <= DIRECT_INJECT_MAX). Never throws. `{ attached: true }` words it for a chat's own attachments.
+async function filesContext(projectId, files, query, userId, onSources, { attached = false } = {}) {
   if (!Array.isArray(files) || files.length === 0) return null;
   const small = files.filter((f) => String(f.content || '').length <= DIRECT_INJECT_MAX);
   const large = files.filter((f) => String(f.content || '').length > DIRECT_INJECT_MAX);
@@ -587,7 +587,9 @@ async function filesContext(projectId, files, query, userId, onSources) {
   // "what have you got?", "is my file attached?" — was answered from whatever
   // happened to be retrieved, and looked exactly like a file that had not
   // attached. The manifest costs a few tokens and settles it.
-  let manifest = `Sources attached to this project (${files.length}): ${files
+  // `attached`: a free chat's own attachments (#1441). They are the user's files for this chat, not a
+  // project's knowledge, and are worded that way so a small model does not deny having them.
+  let manifest = `${attached ? 'The user attached these files to this chat' : 'Sources attached to this project'} (${files.length}): ${files
     .map((f) => `"${f.name}"`)
     .join(', ')}. Excerpts of the relevant ones follow; ask to read a file in full if you need more of it.`;
 

@@ -160,6 +160,8 @@ function createChatHandler({
   // #778 (features.routingModes): { enabled(), settings(), sensitivity(digest), awaitChoice(...),
   // setChatFlags(projectId, chatId, patch), log(entry) }. Not wired or flag off: nothing changes.
   routingModes = null,
+  // #1441: how a turn waits for the project's file jobs still running; the wait is bounded.
+  sourceJobs = require('./source-jobs.cjs'), sourceWaitMs = 30000,
 }) {
   const jsonOut = json;
   // Revoked Skill content in earlier turns (#546): one ledger per handler, cached in memory.
@@ -273,6 +275,16 @@ function createChatHandler({
     }
     let chatId = body.chatId || null;
     let project = null;
+    // #1441: a file attached just before this message may still be ingesting (its upload returned
+    // 202). Wait for it, bounded and abortable, so the turn is built from a project that has it. A
+    // file that failed or is still not done lets the turn go on without it; the reply says which.
+    let sourcesNotReady = [];
+    if (projectId && spaceId !== 'diary' && !body.compactOnly && chatWorkspace) {
+      const settled = await sourceJobs.settle(chatWorkspace, projectId, { timeoutMs: sourceWaitMs, signal: chatSignal.signal });
+      if (settled.aborted) return;
+      sourcesNotReady = settled.notReady;
+      if (sourcesNotReady.length) console.log(`[chat] ${sourcesNotReady.length} attached file(s) not ready for this turn`);
+    }
     if (projectId && spaceId !== 'diary') {
       project = getProject(projectId);
       if (!project && body.projectId) return json(res, 404, { error: 'no such project' });
@@ -366,11 +378,15 @@ function createChatHandler({
     // injection (small files whole, big files capped) — the old behavior.
     let filesBlock = null;
     let replySources = [];
+    // #1441: a free chat's attachments live in a hidden shadow project. Its files are shown to the model
+    // with the user's turn as "attached to this chat"; the shadow project's name and a "knowledge-file"
+    // framing in the system message made a small model deny having them. Real projects are unchanged.
+    const chatAttachments = !!project && String(project.id).startsWith('cowork-chat-context-');
     if (project && Array.isArray(project.files) && project.files.length) {
       const readable = require('./instruction-skills.cjs').sources(project);
       // #552: the chunks that went into the prompt, reported to the browser as a `sources` event.
       filesBlock = await rag.filesContext(project.id, readable, message, currentWorkspace().userId,
-        (placed) => { replySources = require('./chat-sources.cjs').buildSources(placed, readable); });
+        (placed) => { replySources = require('./chat-sources.cjs').buildSources(placed, readable); }, { attached: chatAttachments });
     }
 
     const sysParts = [];
@@ -382,7 +398,7 @@ function createChatHandler({
     const memoryPart = accountMemory.systemPart(accountMemory.read(currentWorkspace().dir), project?.memories);
     if (!project && memoryPart) sysParts.push(memoryPart);
     if (project) {
-      if (project.name) sysParts.push(`You are working inside the user's project "${project.name}".`);
+      if (project.name && !chatAttachments) sysParts.push(`You are working inside the user's project "${project.name}".`);
       if (project.goal) sysParts.push(`Project goal: ${project.goal}`);
       if (project.instructions) sysParts.push(`Project instructions (follow closely):\n${project.instructions}`);
       if (memoryPart) sysParts.push(memoryPart);
@@ -393,8 +409,19 @@ function createChatHandler({
         const codePart = require('./shared-context.cjs').forChat(project, tasks);
         if (codePart) sysParts.push(codePart);
       }
-      if (filesBlock) {
+      if (filesBlock && (!chatAttachments || body.compactOnly)) {
         sysParts.push(`Relevant knowledge-file excerpts for this message:\n${filesBlock}`);
+      }
+      if (filesBlock && chatAttachments && !body.compactOnly) {
+        // Right before the latest user message (which normalizeReplayHistory placed last).
+        const last = msgs[msgs.length - 1];
+        if (last && last.role === 'user' && typeof last.content === 'string') {
+          const at = last.content.endsWith(message) ? last.content.length - message.length : 0;
+          msgs = [...msgs.slice(0, -1), { ...last, content: `${last.content.slice(0, at)}${filesBlock}\n\n${last.content.slice(at)}` }];
+        }
+      }
+      if (sourcesNotReady.length) {
+        sysParts.push(`The user just attached ${sourcesNotReady.map((f) => JSON.stringify(f.name)).join(', ')}, but ${sourcesNotReady.length === 1 ? 'it was' : 'they were'} not ${sourcesNotReady.every((f) => f.reason === 'failed') ? 'processed' : 'finished processing'} in time, so ${sourcesNotReady.length === 1 ? 'its' : 'their'} contents are not available to you for this message. Say so if asked about ${sourcesNotReady.length === 1 ? 'it' : 'them'}; do not guess at the contents.`);
       }
       // Skills index (L0): name+description only, always visible. The model
       // pulls the full SKILL.md body on demand via read_project_file (L1).
@@ -620,6 +647,9 @@ function createChatHandler({
           return json(res, 409, { error: 'Cloud routing has no cloud provider and model yet. Choose them in Settings → Models & routing.' });
         }
         const sentText = [sysWithoutBrain, ...msgs.map((m) => (typeof m.content === 'string' ? m.content : ''))].join('\n');
+        // #1441: the router reads what the model gets, including a free chat's attached files, which ride
+        // with the user's turn rather than the system message.
+        const routerSystem = chatAttachments && filesBlock && !body.compactOnly ? [sysWithoutBrain, filesBlock].join('\n\n') : sysWithoutBrain;
         const attachmentNames = [...(project?.assets || []).map((a) => a.name), ...(project?.files || []).map((f) => f.name)].filter((n) => typeof n === 'string');
         const routeUserId = requestScope.getStore()?.workspace?.userId || null;
         const decided = await rm.resolveRoute({
@@ -628,7 +658,7 @@ function createChatHandler({
           // #779 F4: the current message first, so the 400k scan limit can never cut it off.
           preFlag: settings.mode === 'hybrid' ? (rm.preRule(message) || rm.preRule(attachmentNames.join('\n')) || rm.preRule(sentText)) : null,
           // #779 F1: the router reads bounded chunks sized to the decision service's real budget.
-          check: () => routingModes.sensitivity(rm.routerChunks({ message, system: sysWithoutBrain, history: mappedHistory, attachments: attachmentNames },
+          check: () => routingModes.sensitivity(rm.routerChunks({ message, system: routerSystem, history: mappedHistory, attachments: attachmentNames },
             { chunkChars: typeof routingModes.chunkChars === 'function' ? routingModes.chunkChars() : undefined,
               maxChunks: typeof routingModes.maxChunks === 'function' ? routingModes.maxChunks() : undefined })),
           ask: async (flag) => {
@@ -817,7 +847,7 @@ function createChatHandler({
     res.once('close',()=>clearInterval(heartbeat));
     res.once('finish',()=>clearInterval(heartbeat));
     }
-    send({ type: 'meta', model, chatId: chatId || undefined, route: routedRole || undefined,
+    send({ type: 'meta', model, chatId: chatId || undefined, route: routedRole || undefined, sourcesNotReady: sourcesNotReady.length ? sourcesNotReady : undefined,
       routing: routeTarget ? { route: routeTarget.route, reason: routeTarget.reason, ...(routeTarget.detail ? { detail: routeTarget.detail } : {}) } : undefined,
       routingDecision: routingDecision || undefined, skill: pinnedSkill?.record, contextProfile: contextProfile || undefined,
       sampling: sampling.source === 'none' ? undefined : { preset: sampling.presetId || undefined, source: sampling.source, values: sampling.params } });
@@ -1636,7 +1666,7 @@ function createChatHandler({
       if (skillRevocation) break; // revoked during this round's tools: no supervisor call, one error
       const supervised = await require('./step-supervision.cjs').superviseNextStep(
         spaceId?.startsWith('diary') ? null : stepSupervision,
-        { round, messages: roundMessages, signal: chatSignal.signal });
+        { round, messages: roundMessages, signal: chatSignal.signal, goal: message });
       roundMessages = supervised.messages;
       if (supervised.pause) {
         // #658: the tool round before this checkpoint finished, and its writes are real. A pause

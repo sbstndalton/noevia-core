@@ -13,15 +13,54 @@ function storeFor(workspace) {
   }
   return store;
 }
-function start(workspace, projectId, operation) {
+// In-process record of the file-bearing jobs still running, so a chat turn can wait for them (#1441).
+// Names are kept in memory only (never in the journal); results are re-read from the job store.
+const STALE_MS = 10 * 60000;
+const registries = new WeakMap();
+const registryFor = (workspace) => { let r = registries.get(workspace); if (!r) { r = new Map(); registries.set(workspace, r); } return r; };
+function start(workspace, projectId, operation, { name = null } = {}) {
   const jobs = storeFor(workspace);
   if (jobs.list({ kind: 'source', active: true }).length >= 2) throw Object.assign(new Error('Source processing is busy; wait for the current operation and retry.'), { status: 429 });
   const id = jobs.create({ kind: 'source', projectId, capabilities: ['project.sources.write'] });
-  jobs.run(id, async (ctx) => {
+  const running = jobs.run(id, async (ctx) => {
     try { return await operation((stage) => ctx.progress(stage)); }
     catch (err) { throw Object.assign(new Error('Source processing failed; refresh or re-upload to retry.'), { result: { status: err.status || 500 } }); }
   }).catch(() => undefined);
+  if (typeof name === 'string' && name) {
+    const registry = registryFor(workspace);
+    const entry = { projectId, name: name.slice(0, 200), outcome: null };
+    entry.finished = running.then(() => {
+      let job = null; try { job = jobs.get(id); } catch { /* unreadable journal: treated as failed */ }
+      entry.outcome = job && job.status === 'completed' && !(job.result?.status >= 400) ? 'ready' : 'failed';
+    }).finally(() => registry.delete(id));
+    registry.set(id, entry);
+  }
   return id;
+}
+
+// A chat turn sent right after an upload was accepted (202) must see that file (#1441): wait for the
+// project's running file jobs, at most `timeoutMs`, ending early if `signal` aborts (the client left).
+// Resolves { notReady: [{ name, reason: 'failed' | 'timeout' }], aborted } for the jobs it waited on.
+async function settle(workspace, projectId, { timeoutMs = 30000, signal } = {}) {
+  const registry = registryFor(workspace), now = Date.now();
+  // A job that already outlasted one wait is reported as not ready without making every later turn
+  // wait the full bound again; one that never settles is forgotten after STALE_MS.
+  for (const [id, e] of registry) if (e.timedOutAt && now - e.timedOutAt > STALE_MS) registry.delete(id);
+  const mine = [...registry.values()].filter((e) => e.projectId === projectId);
+  const waiting = mine.filter((e) => !e.timedOutAt);
+  const report = () => mine.filter((e) => e.outcome !== 'ready').map((e) => ({ name: e.name, reason: e.outcome === 'failed' ? 'failed' : 'timeout' }));
+  if (!waiting.length) return { notReady: report(), aborted: false };
+  let timer, onAbort;
+  const stop = new Promise((resolve) => {
+    timer = setTimeout(() => resolve('timeout'), timeoutMs);
+    if (signal) { onAbort = () => resolve('aborted'); if (signal.aborted) onAbort(); else signal.addEventListener('abort', onAbort, { once: true }); }
+  });
+  try {
+    const result = await Promise.race([Promise.all(waiting.map((e) => e.finished)).then(() => 'done'), stop]);
+    if (result === 'aborted') return { notReady: [], aborted: true };
+    for (const e of waiting) if (!e.outcome && !e.timedOutAt) e.timedOutAt = Date.now();
+    return { notReady: report(), aborted: false };
+  } finally { clearTimeout(timer); if (signal && onAbort) signal.removeEventListener('abort', onAbort); }
 }
 function read(workspace, projectId, id) {
   let job;
@@ -32,4 +71,4 @@ function read(workspace, projectId, id) {
   if (job.status === 'interrupted' || job.status === 'cancelled') return { done: true, status: 503, body: { error: 'The server restarted before processing finished; refresh or re-upload to retry.' } };
   return { done: false, ...(job.stage ? { stage: job.stage } : {}) };
 }
-module.exports = { start, read };
+module.exports = { start, read, settle };
