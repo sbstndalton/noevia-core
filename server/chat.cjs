@@ -527,6 +527,12 @@ function createChatHandler({
         if (brainBlock) sysParts.push(brainBlock);
       } catch { brainBlock = ''; /* fail open: no brain context */ }
     }
+    // #1520 / #1521: a named storage connector's tools (or its absence), and Web search off for a
+    // time-sensitive question. Notes only; the tools offered and the gate are unchanged. Empty for most chats.
+    if (!body.compactOnly) {
+      const routeNote = require('./tool-route-notes.cjs').toolRouteNotes({ message, offered: requestToolboxes(), onServer: allToolboxes().map((b) => b.id) });
+      if (routeNote) sysParts.push(routeNote);
+    }
     let sys = sysParts.join('\n\n');
     // #815: the system text without the brain block. Brains may summarise Diary-derived chats, so they
     // stay on this box: the routing check never weighs them and an off-box provider never gets them.
