@@ -3,6 +3,7 @@
 //   GET  /api/workspace                    the projects and free chats, chats[] sanitized, after the
 //                                          delete-old-chats sweep has had its hourly chance to run
 //   GET  /api/chats/:id/context-window     the last context meter recorded for a chat
+//   GET  /api/chats/:id/export             one chat as a Markdown file (#1471)
 //   GET/POST /api/freechats                the free-chat metas, merged against tombstones
 //   DELETE /api/freechats/:id
 //   GET/POST /api/chats/:id/history        the transcript, with a revision for optimistic saves
@@ -66,6 +67,40 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
       // A deleted chat answers exactly like one that never existed (#554), even if state was written back late.
       if(lists.readTombstones(dir).has(lists.safeChatId(id)||id)) return json(res,200,{meter:null});
       return json(res,200,{meter:require('../chat-context.cjs').read(dir,id).meter||null});
+    }
+
+    // #1471: one chat as a Markdown file, from the same writer as the conversation export (chat-export.cjs).
+    // Only a chat in this person's own lists can be read; a deleted or unknown id answers 404.
+    const exportMatch = p.match(/^\/api\/chats\/([^/]+)\/export$/);
+    if (exportMatch) {
+      if (req.method !== 'GET') return PASS;
+      const rawId = decodeChatId(exportMatch[1]);
+      if (rawId === null) return badChatId(res);
+      const lists = require('../chat-lists.cjs');
+      const spaceId = lists.safeChatId(rawId);
+      if (!spaceId) return json(res, 400, { error: 'invalid chat id' });
+      const dir = currentWorkspace().dir;
+      let chat = FREE_CHATS.find((c) => c && c.id === spaceId) || null;
+      if (!chat && !lists.readTombstones(dir).has(spaceId)) {
+        for (const project of PROJECTS) {
+          if (diaryExtras.internalProject(project)) continue;
+          const hit = (project.chats || []).find((c) => c && c.id === spaceId);
+          if (hit) { chat = hit; break; }
+        }
+      }
+      if (!chat || lists.readTombstones(dir).has(spaceId)) return json(res, 404, { error: 'This chat was not found.' });
+      const { chatMarkdown } = require('../chat-export.cjs');
+      const text = chatMarkdown(chat, store.readHistory(spaceId));
+      const name = `noevia-chat-${String(chat.title || 'untitled-chat').normalize('NFKD').replace(/[^\x20-\x7e]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'untitled-chat'}-${spaceId}.md`;
+      const body = Buffer.from(text, 'utf8');
+      res.writeHead(200, {
+        'Content-Type': 'text/markdown; charset=utf-8',
+        'Content-Length': body.length,
+        'Content-Disposition': `attachment; filename="${name}"`,
+        'Cache-Control': 'no-store',
+      });
+      res.end(body);
+      return true;
     }
 
     // ── Free-chat metas (server-side so they survive browser switches) ──
