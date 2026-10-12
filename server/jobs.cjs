@@ -133,7 +133,10 @@ function derive(events) {
   const acc = buildAccumulator(events);
   const job = snapshot(acc);
   job.lifecycle = acc.lifecycleOk ? taskLifecycle.confirmFold(events, acc.lifecycleState, acc.fold) : null;
-  return job;
+  // snapshot() is shallow, and the fold points into the events' own data (the pending approval, the result,
+  // the artifacts). A caller that edited what get() returned would edit the cached journal, which would then
+  // differ from the file; the approval card depends on these not changing (#1590). So the job is a copy.
+  return structuredClone(job);
 }
 
 const lifecycleConflict = (message) => Object.assign(Error(message), { status: 409 });
@@ -338,9 +341,24 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
       event.previous = current.at(-1)?.hash || null;
       event.hash = crypto.createHash('sha256').update(JSON.stringify(event)).digest('hex');
     }
-    const fd = fs.openSync(file(id), 'a', 0o600);
+    const line = JSON.stringify(event);
+    const fd = fs.openSync(file(id), 'a+', 0o600);
     let written = null;
-    try { fs.writeFileSync(fd, JSON.stringify(event) + '\n'); if (sync) fs.fsyncSync(fd); written = stampOf(fs.fstatSync(fd)); }
+    try {
+      // #1590: a crash mid-write can leave a last line with no newline. Readers drop it, but writing after it
+      // would glue this event onto the fragment and the journal would read as unreadable after a restart.
+      // Cut the file back to its last complete line first.
+      const size = fs.fstatSync(fd).size;
+      if (size > 0) {
+        const last = Buffer.alloc(1);
+        fs.readSync(fd, last, 0, 1, size - 1);
+        if (last[0] !== 0x0a) {
+          const whole = fs.readFileSync(file(id));
+          fs.ftruncateSync(fd, whole.lastIndexOf(0x0a) + 1);
+        }
+      }
+      fs.writeFileSync(fd, line + '\n'); if (sync) fs.fsyncSync(fd); written = stampOf(fs.fstatSync(fd));
+    }
     finally { fs.closeSync(fd); }
     if (sync) {
       const directory = fs.openSync(root, 'r');
@@ -349,7 +367,8 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
     // The cached journal is `current` (read or written here moments ago); extend it with this event.
     const entry = cache.get(id);
     if (entry && entry.events === current && written) {
-      current.push(event);
+      // The cache holds its own copy of what was written, never the caller's objects (#1590).
+      current.push(JSON.parse(line));
       entry.stamp = written;
       if (entry.acc && !(!entry.acc.authoritative && AUTHORITY_TYPES.has(type))) foldEvent(entry.acc, event);
       else entry.acc = null;

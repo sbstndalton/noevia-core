@@ -130,3 +130,52 @@ test('#1126 the cached fold is the same job object shape get() reports (keys and
   assert.equal(job.id, id);
   assert.equal(crypto.createHash('sha256').update(JSON.stringify(Object.keys(job))).digest('hex').length, 64);
 });
+
+test('#1590 the cache holds its own copy: editing the data given to append, or a job from get(), never changes the journal', (t) => {
+  const dir = tmp(t);
+  const jobs = createJobs({ dir, kinds: ['code'], maxJobs: 10 });
+  const id = jobs.create({ kind: 'code', projectId: 'p-synthetic', capabilities: ['read'] });
+  const card = { id: 'approval-1', tool: 'write_file', args: { path: 'a.txt' } };
+  jobs.append(id, 'approval.requested', card);
+  card.args.path = '/etc/passwd'; card.tool = 'something_else'; // the caller reuses its object
+  const first = jobs.get(id);
+  assert.deepEqual(first.pendingApproval, { id: 'approval-1', tool: 'write_file', args: { path: 'a.txt' } });
+  first.pendingApproval.args.path = 'tampered'; first.steps.push({ id: 'fake' }); first.status = 'completed';
+  const second = jobs.get(id);
+  assert.equal(second.pendingApproval.args.path, 'a.txt', 'a job from get() is a copy');
+  assert.deepEqual(second.steps, []);
+  assert.deepEqual(second, derive(journalOnDisk(dir, id)), 'and it still equals a fold of the file');
+  const event = jobs.append(id, 'approval.decided', { id: 'approval-1', decision: 'approve' });
+  event.data.decision = 'deny';
+  assert.equal(journalOnDisk(dir, id).at(-1).data.decision, 'approve');
+  assert.equal(jobs.get(id).pendingApproval, null);
+});
+
+test('#1590 an append after a torn last line cuts the fragment off, so the result survives a restart', (t) => {
+  const dir = tmp(t);
+  const jobs = createJobs({ dir, maxJobs: 10 }); // no hash chain: a torn last line is tolerated on read
+  const id = jobs.create({ kind: 'research', projectId: 'p-synthetic', capabilities: [] });
+  jobs.append(id, 'job.started', {});
+  const journal = path.join(dir, 'jobs', `${id}.jsonl`);
+  fs.appendFileSync(journal, '{"job":"' + id + '","seq":3,"type":"progr'); // a crash mid-write
+  assert.equal(jobs.get(id).status, 'running', 'the torn tail is ignored on read');
+  jobs.append(id, 'job.completed', { result: { answer: 'synthetic result' } });
+  const text = fs.readFileSync(journal, 'utf8');
+  assert.ok(text.endsWith('\n'));
+  assert.equal(text.split('\n').filter(Boolean).length, 3, 'created, started, completed: the fragment is gone');
+  assert.deepEqual(journalOnDisk(dir, id).map((e) => e.seq), [1, 2, 3]);
+  // After a restart, a fresh reader sees the finished job, not "Unreadable job journal".
+  const restarted = createJobs({ dir, maxJobs: 10 });
+  assert.deepEqual(restarted.get(id).result, { answer: 'synthetic result' });
+  assert.equal(restarted.get(id).status, 'completed');
+});
+
+test('#1590 a journal that is only a torn fragment still takes its first event', (t) => {
+  const dir = tmp(t);
+  const jobs = createJobs({ dir, maxJobs: 10 });
+  const id = '00000000-0000-4000-8000-0000000000aa';
+  fs.mkdirSync(path.join(dir, 'jobs'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'jobs', `${id}.jsonl`), '{"job":"x","seq":1,"ty');
+  jobs.append(id, 'job.created', { kind: 'research', projectId: 'p-synthetic', capabilities: [] });
+  assert.deepEqual(journalOnDisk(dir, id).map((e) => e.type), ['job.created']);
+});
