@@ -137,6 +137,33 @@ function normalizeReplayHistory(mapped, newMessage) {
   return out;
 }
 
+// #1574: a local reply that stops sending bytes after its first output is ended after `ms` with a named
+// error, instead of sitting until the browser gives up with "network error" minutes later. Nothing is
+// limited before the first output (a long prefill is not a stall), and `ms` of 0 limits nothing.
+class StreamIdleError extends Error {
+  constructor(ms) { super(`no output for ${ms} ms`); this.name = 'StreamIdleError'; this.ms = ms; }
+}
+async function* withIdleLimit(iterable, ms) {
+  if (!(ms > 0)) { yield* iterable; return; }
+  const it = iterable[Symbol.asyncIterator]();
+  let started = false;
+  try {
+    for (;;) {
+      let timer = null;
+      const pending = it.next();
+      const next = started
+        ? await Promise.race([pending, new Promise((_, reject) => { timer = setTimeout(() => reject(new StreamIdleError(ms)), ms); })]).finally(() => clearTimeout(timer))
+        : await pending;
+      if (next.done) return;
+      started = true;
+      yield next.value;
+    }
+  } finally {
+    // Closing the provider stream; not awaited, so a read that is still pending cannot hold the reply open.
+    try { it.return?.().catch?.(() => {}); } catch { /* already closed */ }
+  }
+}
+
 function createChatHandler({
   stepSupervision = null, fs, path, crypto, fetch, codeTasksFor = () => [], reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, diaryStorageRetry = (send) => send(true), autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, toolGate = null, chatFramingEnabled = () => false, freeChats = () => [], framingReasoner = null, reasoningTraces = null, brainContext = null, DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse, chatListHolder = () => undefined,
   chatgptOAuth = null, chatgptEnabled = () => false, skillHistory = null,
@@ -170,6 +197,8 @@ function createChatHandler({
   routingModes = null,
   // #1441: how a turn waits for the project's file jobs still running; the wait is bounded.
   sourceJobs = require('./source-jobs.cjs'), sourceWaitMs = 30000,
+  // #1574: how long a local reply may go silent after its first output before it is ended (0 = no limit).
+  streamIdleMs = 120000,
 }) {
   const jsonOut = json;
   // Revoked Skill content in earlier turns (#546): one ledger per handler, cached in memory.
@@ -1320,7 +1349,7 @@ function createChatHandler({
       // (same pattern as the client-side reader in src/api.ts).
       let buffer = '';
       try {
-        for await (const chunk of upstream.body) {
+        for await (const chunk of withIdleLimit(upstream.body, provider.id === DEFAULT_PROVIDER_ID ? streamIdleMs : 0)) {
           // Leaving the loop cancels the provider stream; checked at most once a second (#272).
           if (loadedSkills.size && Date.now() - skillCheckedAt >= 1000 && revokedSkills()) break;
           buffer += decoder.decode(chunk, { stream: true });
@@ -1390,6 +1419,11 @@ function createChatHandler({
         }
       } catch (err) {
         if (chatSignal.signal.aborted) break; // client went away; stop quietly
+        // #1574: named, with the wait it ran into. Tools run only after a round's stream ends, so none ran.
+        if (err instanceof StreamIdleError) {
+          send({ type: 'error', text: `The model sent no output for ${Number((err.ms / 1000).toFixed(1))} s after it started, so the reply was ended. No tool ran for this step. Try again, or choose another model.` });
+          break;
+        }
         // Mapped text (#918): a stream that breaks mid-read must not show undici internals.
         send({ type: 'error', text: context.providerError(String(err?.message || '')) });
         break;
@@ -1717,4 +1751,4 @@ function createChatHandler({
   return { handleChat, handleChatInner };
 }
 
-module.exports = { createChatHandler, normalizeReplayHistory };
+module.exports = { createChatHandler, normalizeReplayHistory, withIdleLimit };
