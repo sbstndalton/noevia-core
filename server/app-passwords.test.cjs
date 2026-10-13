@@ -10,6 +10,10 @@ function fixture(t, rateLimited = () => false) {
   const passwords = createAppPasswords({ db, audit: (...args) => events.push(args), rateLimited });
   t.after(() => db.close()); return { db, passwords, events };
 }
+// #1642: a wrong secret must differ from the real one whatever its last character is. The last
+// base64url character of a 32-byte secret carries only four random bits, so 'A' is one of 16
+// values and a fixed 'A' suffix was the real password about 1 run in 16.
+const otherLastCharacter = (password) => password.slice(0, -1) + (password.endsWith('A') ? 'B' : 'A');
 test('app passwords are hashed, shown once, tenant/scoped, individually revocable and audited without secrets', async t => {
   const { db, passwords:p, events } = fixture(t);
   const a = await p.create('alice', { name: ' Laptop ', scope: 'lan' });
@@ -70,7 +74,7 @@ test('every DAV rejection past the format check costs one Argon2 verify, so timi
   const unknownId = `nv_dav_${'0'.repeat(32)}.${'A'.repeat(43)}`;
   const cases = [
     ['alice', a.password, 'lan', true],            // right user, right credential, right scope
-    ['alice', a.password.slice(0, -1) + 'A', 'lan', false], // right id, wrong secret
+    ['alice', otherLastCharacter(a.password), 'lan', false], // right id, wrong secret
     ['ghost', a.password, 'lan', false],           // unknown username
     ['alice', unknownId, 'lan', false],            // real username, credential that does not exist
     ['carol', a.password, 'lan', false],           // disabled account (its own credential does not exist here)
@@ -111,4 +115,15 @@ test('a failed decoy build is never cached: later misses still verify against a 
   assert.equal(seen.length, 3);
   for (const stored of seen) assert.match(stored, /^\$argon2id\$/);
   assert.ok(!seen.includes(''));
+});
+test('a wrong secret that differs only in its last character is refused when the real secret ends in A (noevia#1642)', async t => {
+  // Zero random bytes make the id 32 zeros and the secret 43 'A' characters (base64url of 32 zero bytes).
+  t.mock.method(require('node:crypto'), 'randomBytes', n => Buffer.alloc(n));
+  const { passwords: p } = fixture(t);
+  const a = await p.create('alice', { name: 'Laptop', scope: 'lan' });
+  assert.equal(a.password, `nv_dav_${'0'.repeat(32)}.${'A'.repeat(43)}`);
+  // The old test built its wrong secret as slice(0, -1) + 'A', which here is the real password and verified.
+  assert.equal(await p.verifyDav('alice', otherLastCharacter(a.password), 'lan'), null);
+  assert.equal(await p.verifyDav('alice', a.password.slice(0, -1) + 'B', 'lan'), null);
+  assert.ok(await p.verifyDav('alice', a.password, 'lan'));
 });

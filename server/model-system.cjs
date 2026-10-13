@@ -123,10 +123,14 @@ const SYSTEM_MODEL_DELETE_REASON = 'System routing model — not deleted';
 // an unused, merely embeddings-labelled install is not protected, only the one actually wired up.
 // `env` is read at call time (same convention as the rest of the model routes), defaulting to
 // process.env so callers outside a request (e.g. the installed-list mapper) need not pass it.
+// #1636: also the model a re-index is building (EMBEDDING_NEXT_MODEL) and, once the process's
+// embedding configuration (embedding-config.cjs) is installed, its active, next and previous
+// (rollback) models: each of them still has a server and stored vectors that depend on it.
 function sidecarModelNames(env = process.env) {
   const names = new Set();
-  const embed = String(env.EMBEDDING_MODEL || env.EMBED_MODEL || '').trim();
-  if (embed && embed.toLowerCase() !== 'default') names.add(embed);
+  const embedNames = [String(env.EMBEDDING_MODEL || env.EMBED_MODEL || '').trim(), String(env.EMBEDDING_NEXT_MODEL || '').trim(),
+    ...(require('./embedding-config.cjs').current()?.modelNames() || [])];
+  for (const embed of embedNames) if (embed && embed.toLowerCase() !== 'default') names.add(embed);
   const rerankOn = /^(1|true|on)$/i.test(String(env.NOEVIA_FEATURE_RAG_RERANK || ''));
   const rerank = rerankOn ? String(env.RERANK_MODEL || '').trim() : '';
   if (rerank) names.add(rerank);

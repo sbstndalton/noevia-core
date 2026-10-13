@@ -15,11 +15,15 @@ function nativeLabels(model) {
 // Small models that may stay beside the chat model on a multi-slot engine: the embedding model,
 // only while embeddings are served by this engine (no EMBEDDING_BASE_URL sidecar), and the RAG
 // reranker, only where it is allowed on the shared engine (rerank-target.cjs, #697).
+// #1636: the process's embedding configuration (embedding-config.cjs) decides once installed; the
+// environment is the fallback (tests, tools). A re-index embedding on the engine keeps both models.
 function keepAlongside(env = process.env) {
-  const e = String(env.EMBEDDING_BASE_URL || '').trim() ? '' : (env.EMBEDDING_MODEL || env.EMBED_MODEL || '');
+  const config = require('./embedding-config.cjs').current();
+  const onEngine = config ? [config.active(), config.next()].filter((t) => t && !t.baseUrl).map((t) => t.model) : null;
+  const e = onEngine ? onEngine.join('\u0000') : (String(env.EMBEDDING_BASE_URL || '').trim() ? '' : (env.EMBEDDING_MODEL || env.EMBED_MODEL || ''));
   const target = require('./rerank-target.cjs').rerankTarget(env);
   const r = target.enabled && target.shared ? target.model || '' : '';
-  return [...(e && e !== 'default' ? [e] : []), ...(r ? [r] : [])];
+  return [...String(e || '').split('\u0000').filter((m) => m && m !== 'default'), ...(r ? [r] : [])];
 }
 
 function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig = {}, calibrationStatePath, calibrationOptions = {}, evidenceDir, autotuneStatePath, autotuneOptions = {}, presetWriter = null, unloadWait = {}, inferenceBudget = null, reloadStatePath = null, reloadGuard: reloadGuardOption = null }) {
