@@ -52,3 +52,13 @@ test('non-string or empty input is never a note', () => {
   assert.equal(toolRouteNotes({ message: undefined, offered: [], onServer: [] }), '');
   assert.equal(toolRouteNotes({ message: '', offered: null, onServer: null }), '');
 });
+
+test('#1550: in Automatic there is no list to tick, so the notes point at the connection instead of + > Tools', () => {
+  const nc = toolRouteNotes({ message: 'List my Nextcloud folders', offered: ['core'], onServer: ALL, automatic: true });
+  assert.match(nc, /Nextcloud Files is not available in this chat \(connect it under Settings > Connectors/);
+  assert.doesNotMatch(nc, /\+ > Tools/);
+  const web = toolRouteNotes({ message: 'What is the latest Rust version?', offered: ['core'], onServer: ALL, automatic: true });
+  assert.match(web, /Web search could not be used for this message/);
+  assert.doesNotMatch(web, /\+ > Tools/);
+  assert.equal(toolRouteNotes({ message: 'What is the latest Rust version?', offered: ['web-search'], onServer: ALL, automatic: true }), '');
+});

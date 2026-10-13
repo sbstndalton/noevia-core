@@ -23,9 +23,11 @@ const TIME_SENSITIVE = /\b(latest|newest|current(?:ly)?|today|tonight|right now|
  * @param {string} input.message        the user's message for this turn
  * @param {Iterable<string>} input.offered   box ids this request carries (requestToolboxes)
  * @param {Iterable<string>} input.onServer  box ids this server offers at all (allToolboxes)
+ * @param {boolean} [input.automatic]        Tools: Automatic (#1550). It shows no tool list to tick, and it already
+ *   adds Web search and a named Nextcloud when they are usable, so what is missing is a connection, not a tick.
  * @returns {string} the note for the system text, or '' when none applies
  */
-function toolRouteNotes({ message, offered, onServer }) {
+function toolRouteNotes({ message, offered, onServer, automatic = false }) {
   const text = typeof message === 'string' ? message : '';
   const on = new Set(offered || []);
   const exists = new Set(onServer || []);
@@ -36,16 +38,19 @@ function toolRouteNotes({ message, offered, onServer }) {
     if (on.has(c.boxId)) {
       notes.push(`The user named ${c.label}. Answer that request with the ${c.label} tools (${c.prefix}*), and do not search another storage in its place.`);
     } else {
-      notes.push(`The user named ${c.label}, but ${c.label} is not available in this chat (turn it on under + > Tools, or connect it under Settings > Connectors if it is not connected yet). Do not use another storage's tools in its place: say that ${c.label} is not available in this chat.`);
+      const how = automatic ? 'connect it under Settings > Connectors, or ask the administrator to offer it on this server' : 'turn it on under + > Tools, or connect it under Settings > Connectors if it is not connected yet';
+      notes.push(`The user named ${c.label}, but ${c.label} is not available in this chat (${how}). Do not use another storage's tools in its place: say that ${c.label} is not available in this chat.`);
     }
   }
   if (notes.length && onConnectors.length) {
     notes.push(`Connectors in this chat, and the tools that belong to each: ${onConnectors.map((c) => `${c.label} (${c.prefix}* tools)`).join('; ')}. Tools from one connector do not read another's files.`);
   }
   if (!on.has(WEB_BOX) && TIME_SENSITIVE.test(text)) {
-    notes.push(exists.has(WEB_BOX)
+    notes.push(exists.has(WEB_BOX) && !automatic
       ? 'Web search is off for this chat, so you cannot check current information. For a question about the latest or current state of something, say that you cannot verify it right now, give what you knew at your training cutoff and say it may be out of date, and suggest the user turn Web search on under + > Tools to check. Do not say that you cannot browse the internet in general, and do not present an older answer as the latest.'
-      : 'Web search is not available on this server, so you cannot check current information. For a question about the latest or current state of something, say that you cannot verify it right now, give what you knew at your training cutoff and say it may be out of date. Do not present an older answer as the latest.');
+      : exists.has(WEB_BOX)
+        ? 'Web search could not be used for this message, so you cannot check current information. For a question about the latest or current state of something, say that you cannot verify it right now, give what you knew at your training cutoff and say it may be out of date. Do not say that you cannot browse the internet in general, and do not present an older answer as the latest.'
+        : 'Web search is not available on this server, so you cannot check current information. For a question about the latest or current state of something, say that you cannot verify it right now, give what you knew at your training cutoff and say it may be out of date. Do not present an older answer as the latest.');
   }
   return notes.join(' ');
 }

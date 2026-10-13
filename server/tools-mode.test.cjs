@@ -97,3 +97,90 @@ test('gateSaysToolNeeded: a rule or the decision service picking a tool counts; 
   assert.equal(gateSaysToolNeeded(null), false, 'no gate: the feature is off');
   assert.equal(gateSaysToolNeeded(undefined), false);
 });
+
+// #1550: what an Automatic turn adds for its message. Pure, over synthetic box records.
+const { automaticBoxesFor, automaticPool, automaticAdditions, MAX_ADDED, createAutomaticToolsReady } = require('./tools-mode.cjs');
+
+test('automaticBoxesFor: current-information and search questions need Web search', () => {
+  for (const message of [
+    'What are the latest stable versions of Rust and Node LTS? Cite sources.',
+    "What's the weather in Oslo today?",
+    'Search the web for this week\'s top news',
+    'Look up the current EUR to NOK exchange rate',
+    'Read https://example.com/synthetic-page and summarise it',
+  ]) assert.deepEqual(automaticBoxesFor(message), ['web-search'], message);
+});
+
+test('automaticBoxesFor: a Nextcloud question needs Nextcloud Files, or the Nextcloud app it names', () => {
+  assert.deepEqual(automaticBoxesFor('List my Nextcloud top-level folders.'), ['nextcloud-files']);
+  assert.deepEqual(automaticBoxesFor('use your nextcloud tools now'), ['nextcloud-files']);
+  assert.deepEqual(automaticBoxesFor('Which files are in my Documents folder?'), ['nextcloud-files']);
+  assert.deepEqual(automaticBoxesFor('Search my Nextcloud notes for the synthetic recipe'), ['nextcloud-notes']);
+  assert.deepEqual(automaticBoxesFor("What's on my calendar on Friday?"), ['nextcloud-calendar']);
+  assert.deepEqual(automaticBoxesFor('Add a reminder to my Nextcloud tasks'), ['nextcloud-tasks']);
+  assert.deepEqual(automaticBoxesFor('Find the synthetic report in my Nextcloud files and my notes'), ['nextcloud-notes', 'nextcloud-files']);
+});
+
+test('automaticBoxesFor: chit-chat, general topics and other connectors need nothing extra', () => {
+  for (const message of ['hello', 'Thanks, that helps a lot.', 'Summarise the plan for the garden.', 'Write a function that searches an array',
+    'Find the synthetic budget sheet in Google Drive.', 'How do calendars work in the Julian system?', '', '   ']) {
+    assert.deepEqual(automaticBoxesFor(message), [], JSON.stringify(message));
+  }
+  assert.deepEqual(automaticBoxesFor(undefined), []);
+  assert.deepEqual(automaticBoxesFor({ text: 'latest news' }), [], 'only a string message is read');
+});
+
+const box = (id, tools, reads, extra = {}) => ({ id, tools: tools.map((name) => ({ type: 'function', function: { name } })), reads, ...extra });
+const POOL_BOXES = [
+  box('core', ['get_current_time'], ['get_current_time']),
+  box('web-search', ['tavily_search'], ['tavily_search'], { server: 'synthetic-search' }),
+  box('nextcloud-files', ['nc_list', 'nc_delete'], ['nc_list'], { server: 'nextcloud' }),
+  box('nextcloud-mail-send', ['nc_send'], [], { server: 'nextcloud' }),
+  box('gdrive', ['drive_search'], ['drive_search']),
+];
+const READS = new Set(POOL_BOXES.flatMap((b) => b.reads));
+const isWrite = (name) => !READS.has(name);
+
+test('automaticPool: offered boxes with a read tool, ready for the account; never a connector or a box of writes only', () => {
+  const pool = automaticPool({ boxes: POOL_BOXES, connectorBoxes: new Set(['gdrive']), isWriteTool: isWrite });
+  assert.deepEqual([...pool], ['core', 'web-search', 'nextcloud-files']);
+  const noNextcloud = automaticPool({ boxes: POOL_BOXES, connectorBoxes: new Set(['gdrive']), isWriteTool: isWrite, ready: (b) => b.server !== 'nextcloud' });
+  assert.deepEqual([...noNextcloud], ['core', 'web-search'], 'a Nextcloud box waits for the account\'s Nextcloud connection');
+  const throws = automaticPool({ boxes: POOL_BOXES, connectorBoxes: new Set(), isWriteTool: isWrite, ready: () => { throw new Error('synthetic'); } });
+  assert.deepEqual([...throws], [], 'a readiness check that fails adds nothing');
+  assert.deepEqual([...automaticPool({ boxes: null, connectorBoxes: new Set(), isWriteTool: isWrite })], []);
+});
+
+test('automaticAdditions: only pooled boxes the base lacks, in the order the message needs them, at most MAX_ADDED', () => {
+  const pool = new Set(['web-search', 'nextcloud-files', 'nextcloud-notes', 'nextcloud-calendar', 'nextcloud-tasks']);
+  assert.deepEqual(automaticAdditions({ message: 'latest Rust release?', base: ['core'], pool }), ['web-search']);
+  assert.deepEqual(automaticAdditions({ message: 'latest Rust release?', base: ['core', 'web-search'], pool }), [], 'already carried');
+  assert.deepEqual(automaticAdditions({ message: 'latest Rust release?', base: ['core'], pool: new Set(['nextcloud-files']) }), [], 'not offered here');
+  const many = automaticAdditions({ message: 'Compare my Nextcloud notes, my calendar and my tasks with the latest news', base: [], pool });
+  assert.equal(many.length, MAX_ADDED);
+  assert.deepEqual(many, ['nextcloud-notes', 'nextcloud-calendar', 'nextcloud-tasks']);
+});
+
+test('createAutomaticToolsReady: a Nextcloud box needs the account\'s own connection on an allowed origin; others are ready', () => {
+  const storages = {
+    'connected-user': { kind: 'nextcloud', username: 'synthetic', secret: 'synthetic-app-password', baseUrl: 'https://cloud.example.test' },
+    'webdav-user': { kind: 'webdav', username: 'synthetic', secret: 'synthetic-app-password', baseUrl: 'https://cloud.example.test' },
+    'other-origin': { kind: 'nextcloud', username: 'synthetic', secret: 'synthetic-app-password', baseUrl: 'https://elsewhere.example.test' },
+    'local-user': { kind: 'local' },
+    'no-secret': { kind: 'nextcloud', username: 'synthetic', baseUrl: 'https://cloud.example.test' },
+  };
+  const ready = createAutomaticToolsReady({
+    getStorage: (id) => { if (id === 'broken') throw new Error('synthetic'); return storages[id] || { kind: 'local' }; },
+    originAllowed: (url) => url === 'https://cloud.example.test',
+  });
+  const nc = { server: 'nextcloud' };
+  assert.equal(ready({ id: 'connected-user' }, nc), true);
+  assert.equal(ready({ id: 'webdav-user' }, nc), true, 'a WebDAV connection to Nextcloud carries the same app password');
+  assert.equal(ready({ id: 'other-origin' }, nc), false, 'an origin the operator did not allow is never sent the credential');
+  assert.equal(ready({ id: 'local-user' }, nc), false);
+  assert.equal(ready({ id: 'no-secret' }, nc), false);
+  assert.equal(ready({ id: 'broken' }, nc), false, 'a storage read that fails adds nothing');
+  assert.equal(ready(null, nc), false);
+  assert.equal(ready(null, { server: 'synthetic-search' }), true, 'a box on another server needs nothing from the account here');
+  assert.equal(ready({ id: 'local-user' }, { id: 'core' }), true);
+});

@@ -188,6 +188,8 @@ async function* withIdleLimit(iterable, ms, onIdle = null) {
 
 function createChatHandler({
   stepSupervision = null, fs, path, crypto, fetch, codeTasksFor = () => [], reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, diaryStorageRetry = (send) => send(true), autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, toolGate = null, chatFramingEnabled = () => false, freeChats = () => [], framingReasoner = null, reasoningTraces = null, brainContext = null, DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse, chatListHolder = () => undefined,
+  // #1550: whether a box Automatic may add is usable by this account (its Nextcloud connection, for one).
+  automaticToolsReady = () => true,
   chatgptOAuth = null, chatgptEnabled = () => false, skillHistory = null,
   // #1002: per-model "may this request carry tools", from the engine's chat template.
   templateCaps = require('./chat-template-caps.cjs'), templateToolsGate = templateCaps.toolsGate,
@@ -379,8 +381,11 @@ function createChatHandler({
     // The toolbox ids this request carries, before the provider is known (the external-provider
     // strip comes later). One function, so the Skill requirement check (#272) and the tool loop
     // read the same selection; calling it never enables anything.
-    const requestToolboxes = () => {
-      const selectedBoxes = require('./toolboxes-permitted.cjs').selectedToolboxIds({ project, defaultToolboxes: DEFAULT_TOOLBOXES, connectorBoxes: CONNECTOR_BOXES, connected: connectedBoxes(chatUser) });
+    // `automaticAdded` (#1550): boxes an Automatic turn adds for this message, put first so they win the
+    // tool cap and budget; they pass the same Diary add-on and sign-in filters as everything else.
+    const requestToolboxes = (automaticAdded = []) => {
+      const base = require('./toolboxes-permitted.cjs').selectedToolboxIds({ project, defaultToolboxes: DEFAULT_TOOLBOXES, connectorBoxes: CONNECTOR_BOXES, connected: connectedBoxes(chatUser) });
+      const selectedBoxes = [...automaticAdded.filter((id) => !base.includes(id)), ...base];
       // Per-turn overrides from the composer catalogue (#237): only boxes this server already offers
       // may be added, never a connector box; the OAuth filter below and the write gate still apply.
       if (Array.isArray(body.turnToolboxes)) {
@@ -875,14 +880,34 @@ function createChatHandler({
     // an Automatic turn whose gate says a tool is needed may move to a tool-capable role (#1550). The selection,
     // routing, resolution and gate are the ones that used to run after the stream opened; nothing is sent here.
     // Project and turn boxes with the Diary add-on and OAuth sign-in filters (requestToolboxes, above).
-    const selectedBoxes = requestToolboxes();
+    // #1550: Automatic's own list is the default (core) plus connected connectors, and routing only narrows it, so
+    // the boxes this message plainly needs (Web search for current information, Nextcloud when named) are added here
+    // from what this server offers this account. Manual, the Diary extras project and compaction add nothing.
+    const toolModes = require('./tools-mode.cjs');
+    const automaticTools = toolModes.toolsModeOf(project) === 'auto' && project?.id !== diaryExtras?.PROJECT_ID;
+    let automaticAdded = [];
+    if (automaticTools && !body.compactOnly) {
+      const pool = toolModes.automaticPool({ boxes: allToolboxes(), connectorBoxes: CONNECTOR_BOXES, isWriteTool, ready: (box) => automaticToolsReady(chatUser, box) });
+      automaticAdded = toolModes.automaticAdditions({ message, base: requestToolboxes(), pool });
+    }
+    const selectedBoxes = requestToolboxes(automaticAdded);
     // Rule 2 of provider-egress.cjs: private tools (the Diary) are not offered through an external provider.
     egress.stripPrivateToolboxes(selectedBoxes, provider);
-    const routing = await chatToolRouter.select(selectedBoxes, message);
+    automaticAdded = automaticAdded.filter((id) => selectedBoxes.includes(id));
+    if (automaticAdded.length) console.log(`[tools] Automatic added ${automaticAdded.join(', ')} for this message`);
+    let routing = await chatToolRouter.select(selectedBoxes, message);
+    // Routing ranks and may narrow the rest, but never drops a box this message asked for, and those stay first.
+    if (routing.routed && automaticAdded.length) {
+      const ids = [...automaticAdded, ...routing.ids.filter((id) => !automaticAdded.includes(id))];
+      routing = { ...routing, ids, narrowed: ids.length < selectedBoxes.length };
+    }
     if (routing.routed) console.log(`[tools] routed ${selectedBoxes.length} toolboxes to ${routing.ids.join(', ')}`);
     // A tool the account blocked is never offered, so the model cannot even ask for it.
     const blocked = (name) => toolPolicy.mode(chatUser?.id, name, isWriteTool(name)) === 'block';
-    const resolveFor = (m) => resolveTools({ ...project, toolboxes: routing.routed ? routing.ids : selectedBoxes }, m, blocked);
+    // The ids are already this request's selection (Automatic included), so resolve exactly them: resolveTools reads
+    // an Automatic project's list as the default set and would otherwise drop connectors, turn boxes and additions.
+    const asSelection = (ids) => ({ ...project, toolsMode: 'manual', toolboxes: ids });
+    const resolveFor = (m) => resolveTools(asSelection(routing.routed ? routing.ids : selectedBoxes), m, blocked);
     let resolved = resolveFor(model), resolvedFor = model;
     // Tool gate (features.toolGate, tool-gate.cjs): runs on the tools this request really offers
     // (after policy blocks and tool routing). Off, it returns 'none' without doing anything, and
@@ -890,7 +915,6 @@ function createChatHandler({
     const gate = toolGate && !body.compactOnly ? await toolGate.evaluate(message, resolved.tools, ...(chatFrame ? [steering.gateBias(chatFrame)] : [])) : null;
     // #1550: only a turn the gate says needs a tool moves. Chit-chat, a gate that says no tool, and an unavailable
     // gate (off, timed out, errored) keep the routed model; the template gate below then says the tools are off.
-    const toolModes = require('./tools-mode.cjs');
     if (wantsAuto && !body.compactOnly && !routeTarget?.row && provider.id === DEFAULT_PROVIDER_ID && typeof modelManager?.props === 'function'
       && toolModes.toolsModeOf(project) === 'auto' && toolModes.gateSaysToolNeeded(gate)) {
       const moved = await toolModes.toolCapableRoute({ model, routedRole, roles: autoRoles(),
@@ -1073,7 +1097,9 @@ function createChatHandler({
     // `boxes` carries the stable ids next to the joined English text (#624), so the client words
     // the list in the interface language; `text` stays for clients that only read the string.
     const boxInfo = (id) => { const b = allToolboxes().find((x) => x.id === id); return { id, label: b?.label || id, inApp: isInAppBox(b) }; };
-    send({ type: 'tools_scope', text: routing.narrowed ? routing.ids.map(boxLabel).join(', ') : '', ...(routing.narrowed ? { boxes: routing.ids.map(boxInfo) } : {}) });
+    // An Automatic turn that added boxes (#1550) says so too, so the reply shows which tools it was given.
+    const scopeIds = routing.narrowed ? routing.ids : automaticAdded.length ? (routing.routed ? routing.ids : selectedBoxes) : null;
+    send({ type: 'tools_scope', text: scopeIds ? scopeIds.map(boxLabel).join(', ') : '', ...(scopeIds ? { boxes: scopeIds.map(boxInfo) } : {}) });
     if (pinnedSkill) send({ type: 'skills_scope', text: pinnedSkill.record.name });
     else if (autoSkills.length) send({ type: 'skills_scope', text: autoSkills.map((s) => s.name).join(', ') });
     // When routing narrowed the list, the model may ask once for the rest. Widening only restores
@@ -1344,7 +1370,7 @@ function createChatHandler({
         const tools = boxes.find((b) => b.id === id)?.tools;
         return !Array.isArray(tools) || tools.some((tool) => names.has(tool.function?.name));
       });
-      routeNoteText = require('./tool-route-notes.cjs').toolRouteNotes({ message, offered, onServer: boxes.map((b) => b.id) });
+      routeNoteText = require('./tool-route-notes.cjs').toolRouteNotes({ message, offered, onServer: boxes.map((b) => b.id), automatic: automaticTools });
       if (routeNoteText) roundMessages = withSystemNote(roundMessages, routeNoteText);
     }
     const requestTools = () => (!templateToolsOff && activeTools.length ? { tools: activeTools } : {});
@@ -1610,7 +1636,7 @@ function createChatHandler({
             let reply = 'All of this project\'s tools are already available.';
             if (!widened) {
               widened = true;
-              const fullResolved = resolveTools({ ...project, toolboxes: selectedBoxes }, model, blocked);
+              const fullResolved = resolveTools(asSelection(selectedBoxes), model, blocked);
               const full = fullResolved.tools;
               activeTools = full;
               for (const t of full) allowedToolNames.add(t.function.name);
