@@ -59,6 +59,13 @@ function routingDefaultRustOwned(env) {
   return env.NOEVIA_FRONT === 'rust' && env.NOEVIA_RUST_AUTH === '1' && env.NOEVIA_RUST_AUTH_CONFIRMED === '1'
     && env.NOEVIA_RUST_ROUTING_DEFAULT === '1' && env.NOEVIA_RUST_ROUTING_DEFAULT_CONFIRMED === '1';
 }
+// The Rust front owns GET /api/stats (#1650) only while NOEVIA_RUST_STATS=1 and the supervisor has
+// confirmed it (NOEVIA_RUST_STATS_CONFIRMED=1, once `noevia-server --features` lists rust-stats),
+// under NOEVIA_RUST_AUTH with NOEVIA_FRONT=rust, as routingDefaultRustOwned above.
+function statsRustOwned(env) {
+  return env.NOEVIA_FRONT === 'rust' && env.NOEVIA_RUST_AUTH === '1' && env.NOEVIA_RUST_AUTH_CONFIRMED === '1'
+    && env.NOEVIA_RUST_STATS === '1' && env.NOEVIA_RUST_STATS_CONFIRMED === '1';
+}
 function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe, reportedTokenRate, missingRoles, currentWorkspace, service, inferenceBudget = null, sweepGuardOptions = {} }) {
   const { modelScanCache, refreshModelScan, autoRoles, setAutoRoles, ensureRolesLoaded, servedCatalogue, modelsInstalled, deriveUserModelName, lastLoadedModel, clearLastLoadedModel, clearRoleReferences } = service;
   // #1461: the installed list is shared for a moment (service.modelsInstalled). A decision that must confirm
@@ -100,6 +107,9 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
 
     // ── Optional model-manager statistics.
     if (p === '/api/stats') {
+      // M6 (#1650): a confirmed Rust front answers GET; Node refuses it before any engine read, so
+      // the front is its only reader. Every other method is still answered here.
+      if (req.method === 'GET' && statsRustOwned(env)) return json(res, 503, { error: 'Engine statistics are owned by the Rust front.' });
       const { gen, sys, mtpHealth, mtpMetrics, mtpModels } = await statsRead.get();
       const g = gen.status === 'fulfilled' && gen.value.ok ? gen.value.body : {};
       const s = sys.status === 'fulfilled' && sys.value.ok ? sys.value.body : {};
@@ -671,4 +681,4 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
   return modelRoutes;
 }
 
-module.exports = { createModelRoutes, routingDefaultRustOwned };
+module.exports = { createModelRoutes, routingDefaultRustOwned, statsRustOwned };
