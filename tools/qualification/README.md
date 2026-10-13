@@ -9,11 +9,11 @@ Historical #1212 negative control uses rs main-before-fix `68d8fbce93309ea30bca9
 # Candidate native reasoning qualification (#1320)
 
 `reasoning-front.yml` adds one required gate to the existing six. Its immutable
-merged Rust input is e7f746d8f510dee1cf11aa06200a8f2a975a79f7 (noevia-rs#94, core#82 web#30 parity),
-archive SHA256 2cb576495a77146a350e4f028e9e083b782aaad79813b8211856ee09c74978e5.
-Its corpus records core 83064ce1bc9baddb51e1054327db2a4aac2c54d1 (contracts/http/core.ref,
+merged Rust input is e88e7fa4c39470dd02a385a30c5c353853555f79 (noevia-rs#99, core#93 calendar facts, #1603),
+archive SHA256 69203abfd0608040944d686a5d50d10cad9540fe73840dec0bf80d92e0493b11.
+Its corpus records core d7ed7dd9bdd006166b4083abfac0c8ec09428a38 (contracts/http/core.ref,
 recorded with NOEVIA_CONTRACT_FIXED_NOW); the candidate core is separately the exact
-workflow checkout HEAD, clean and descended from 83064ce. The launch template at c90210ee
+workflow checkout HEAD, clean and descended from d7ed7dd. The launch template at c90210ee
 carries the launcher's `__PROMPTS_OVERRIDE__` slot, which the adapter fills with nothing,
 as the merged launcher does outside its prompts modes. Earlier input: 592d94a7, archive
 74be654e, corpus core 641917e2.

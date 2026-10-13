@@ -32,8 +32,8 @@ jobs:
       - name: Fetch verified merged acceptance tooling
         run: |
           set -euo pipefail
-          curl -fsSL https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/e7f746d8f510dee1cf11aa06200a8f2a975a79f7 -o "$RUNNER_TEMP/accept-rs.tgz"
-          echo "2cb576495a77146a350e4f028e9e083b782aaad79813b8211856ee09c74978e5  $RUNNER_TEMP/accept-rs.tgz" | sha256sum -c -
+          curl -fsSL https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/e88e7fa4c39470dd02a385a30c5c353853555f79 -o "$RUNNER_TEMP/accept-rs.tgz"
+          echo "69203abfd0608040944d686a5d50d10cad9540fe73840dec0bf80d92e0493b11  $RUNNER_TEMP/accept-rs.tgz" | sha256sum -c -
           mkdir rs-accept
           tar -xzf "$RUNNER_TEMP/accept-rs.tgz" --strip-components=1 -C rs-accept
           echo "CORE_ACCEPTANCE_RS=$GITHUB_WORKSPACE/rs-accept" >> "$GITHUB_ENV"
