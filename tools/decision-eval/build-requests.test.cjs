@@ -1,0 +1,114 @@
+'use strict';
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { buildRequests, loadCases, smokeSubset, rotate, LANGS, PERMUTED_ITEMS } = require('./build-requests.cjs');
+
+const SERVER = path.join(__dirname, '..', '..', 'server');
+let built;
+const records = async () => (built ||= await buildRequests());
+
+// services/laya/server.py validate(): what the live service accepts.
+function layaRefuses(b) {
+  if (!b || Object.keys(b).sort().join() !== 'options,question,state') return 'keys';
+  if (typeof b.state !== 'string' || b.state.length > 4000) return 'state';
+  if (typeof b.question !== 'string' || b.question.length < 1 || b.question.length > 500) return 'question';
+  if (!Array.isArray(b.options) || b.options.length < 2 || b.options.length > 8) return 'options';
+  for (const o of b.options) {
+    if (Object.keys(o).sort().join() !== 'id,label' || !/^[a-z][a-z0-9_]{0,31}$/.test(o.id) || typeof o.label !== 'string' || o.label.length < 1 || o.label.length > 120) return 'option';
+  }
+  if (new Set(b.options.map((o) => o.id)).size !== b.options.length) return 'duplicate';
+  return null;
+}
+
+test('every synthetic case becomes exactly one production request; none is caught earlier by a rule', async () => {
+  const { records: rows, skipped } = await records();
+  assert.deepEqual(skipped, [], 'a tool-gate rule or a sensitivity pre-rule answered without the decision service');
+  const { rows: cases } = loadCases();
+  const base = rows.filter((r) => r.variant === 'base');
+  assert.equal(base.length, cases.length);
+  assert.equal(new Set(base.map((r) => r.id)).size, base.length);
+});
+
+test('every request is one the live decision service accepts, and its label is one of its options', async () => {
+  for (const r of (await records()).records) {
+    assert.equal(layaRefuses(r.body), null, `${r.id}/${r.variant}: ${layaRefuses(r.body)}`);
+    assert.ok(r.body.options.some((o) => o.id === r.label), `${r.id}: label ${r.label} not offered`);
+  }
+});
+
+test('coverage: about 750 labelled cases in the nine UI languages, every purpose in English', async () => {
+  const main = (await records()).records.filter((r) => r.variant === 'base');
+  assert.ok(main.length >= 700, `${main.length} cases`);
+  assert.deepEqual([...new Set(main.map((r) => r.lang))].sort(), [...LANGS].sort());
+  const count = (purpose, lang) => main.filter((r) => r.purpose === purpose && (!lang || r.lang === lang)).length;
+  assert.equal(count('model.route', 'en'), 96);
+  for (const lang of LANGS.filter((l) => l !== 'en')) {
+    assert.equal(count('model.route', lang), 15, lang);
+    assert.ok(count('routing.sensitivity', lang) >= 15, lang);
+    assert.ok(count('tool.gate', lang) >= 8, lang);
+    assert.ok(count('chat.frame.kind', lang) >= 5, lang);
+  }
+  assert.ok(count('step.supervise', 'en') >= 60);
+  assert.equal(count('routing.sensitivity', 'en'), 80);
+  assert.equal(count('tool.gate', 'en'), 60);
+  assert.equal(count('load.advisor', 'en'), 25);
+  // Both sensitivity classes and all three supervision actions are present in every language that has them.
+  for (const lang of new Set(main.filter((r) => r.purpose === 'step.supervise').map((r) => r.lang))) {
+    for (const label of ['continue', 'verify', 'escalate']) assert.ok(main.some((r) => r.purpose === 'step.supervise' && r.lang === lang && r.label === label), `${lang} ${label}`);
+  }
+});
+
+test('the captured bodies are the production ones: router roles, sensitivity options, tool-gate read tools only', async () => {
+  const rows = (await records()).records;
+  const route = rows.find((r) => r.purpose === 'model.route' && r.variant === 'base');
+  assert.deepEqual(route.body.options.map((o) => o.id), ['fast', 'smart', 'code']);
+  assert.ok(rows.filter((r) => r.variant === 'nocode').every((r) => r.body.options.map((o) => o.id).join() === 'fast,smart' && r.label !== 'code'));
+  const { OPTIONS } = require(path.join(SERVER, 'routing-modes.cjs'));
+  const sens = rows.filter((r) => r.purpose === 'routing.sensitivity');
+  assert.ok(sens.every((r) => JSON.stringify(r.body.options) === JSON.stringify(OPTIONS) && r.body.state.startsWith('Message:\n') && r.body.state.length <= 1000));
+  const gate = rows.filter((r) => r.purpose === 'tool.gate' && r.variant === 'base');
+  assert.ok(gate.every((r) => r.body.options.at(-1).id === 'none' && !r.body.options.some((o) => /create/.test(o.id))));
+  const sup = rows.find((r) => r.purpose === 'step.supervise');
+  assert.deepEqual(Object.keys(JSON.parse(sup.body.state)), ['goal', 'outputs']);
+  assert.deepEqual(sup.body.options.map((o) => o.id), ['continue', 'verify', 'escalate']);
+  const advice = rows.find((r) => r.purpose === 'load.advisor');
+  assert.deepEqual(Object.keys(JSON.parse(advice.body.state)), ['engineError']);
+});
+
+test('order-flip variants are rotations of the base request on a fixed set of English items', async () => {
+  const rows = (await records()).records;
+  const perm1 = rows.filter((r) => r.variant === 'perm1');
+  assert.equal(perm1.length, PERMUTED_ITEMS);
+  assert.equal(rows.filter((r) => r.variant === 'perm2').length, PERMUTED_ITEMS);
+  for (const p of perm1) {
+    const base = rows.find((r) => r.id === p.id && r.variant === 'base');
+    assert.equal(p.lang, 'en');
+    assert.deepEqual(p.body.options, rotate(base.body.options, 1));
+    assert.equal(p.body.state, base.body.state);
+  }
+  assert.deepEqual(rotate([1, 2, 3], 2), [3, 1, 2]);
+});
+
+test('the smoke subset is stratified and stable', async () => {
+  const rows = (await records()).records;
+  const a = smokeSubset(rows, 20), b = smokeSubset(rows, 20);
+  assert.deepEqual(a.map((r) => r.id), b.map((r) => r.id));
+  assert.equal(a.length, 20);
+  assert.equal(new Set(a.map((r) => r.purpose)).size, 6);
+  assert.ok(new Set(a.map((r) => r.lang)).size >= 5);
+  assert.ok(a.every((r) => r.variant === 'base'));
+});
+
+test('loadCases refuses a label outside the purpose and an unknown language', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'decision-cases-'));
+  const src = path.join(__dirname, 'cases');
+  for (const f of fs.readdirSync(src)) fs.copyFileSync(path.join(src, f), path.join(dir, f));
+  const route = JSON.parse(fs.readFileSync(path.join(dir, 'route.json'), 'utf8'));
+  fs.writeFileSync(path.join(dir, 'route.json'), JSON.stringify({ ...route, en: [['slow', 'hi'], ...route.en] }));
+  assert.throws(() => loadCases(dir), /route-en-001: label "slow"/);
+  fs.writeFileSync(path.join(dir, 'route.json'), JSON.stringify({ ...route, xx: [['fast', 'hi']] }));
+  assert.throws(() => loadCases(dir), /unknown language xx/);
+});

@@ -229,7 +229,7 @@ const LOCAL = 'http://local.invalid', CLOUD = 'http://cloud.invalid';
 const sse = (...frames) => ({ ok: true, status: 200, body: (async function* () { for (const f of frames) yield Buffer.from(`data: ${JSON.stringify(f)}\n\n`); })() });
 const PROVIDERS = { default: { id: 'default', baseUrl: LOCAL }, 'cloud-x': { id: 'cloud-x', baseUrl: CLOUD, label: 'Synthetic cloud', shared: true } };
 
-async function run(t, { freeChatId = null, ragOverride = null, flag, settings = null, chat = {}, project: projectOver = {}, message = 'Tell me about synthetic widgets', history = [], verdict = 'clear', answer = null, approvals = null, userId = 'synthetic-user', withRouting = true, toolResult = null, brainContext = null, localRoles = { fast: 'local-fast', smart: 'local-smart' } }) {
+async function run(t, { freeChatId = null, ragOverride = null, flag, settings = null, chat = {}, project: projectOver = {}, message = 'Tell me about synthetic widgets', history = [], verdict = 'clear', answer = null, approvals = null, userId = 'synthetic-user', withRouting = true, toolResult = null, brainContext = null, localRoles = { fast: 'local-fast', smart: 'local-smart' }, sensitivity = null }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-routing-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const events = [], calls = [], logs = [], flagsSet = [], errors = [];
   const res = new EventEmitter();
@@ -257,7 +257,7 @@ async function run(t, { freeChatId = null, ragOverride = null, flag, settings = 
   // 'fail-cause' is a check that could not answer and says why, as createSensitivity reports it (#1438).
   const verdicts = { clear: { flagged: false, flag: null }, sensitive: { flagged: true, flag: 'router' }, fail: { flagged: true, flag: 'unavailable' },
     'fail-cause': { flagged: true, flag: 'unavailable', cause: 'deadline' } };
-  const sensitivityCalls = [];
+  const sensitivityCalls = [], sensitivityInputs = [];
   const { handleChat } = require('./chat.cjs').createChatHandler({
     modelManager: { enabled: true, health: async () => ({ ok: true, body: { all_models_loaded: ['local-fast', 'local-smart'].map((n) => ({ model_name: n, loaded: true, recipe_options: { ctx_size: 32768 } })) } }) },
     reasoningEffort: require('./reasoning-effort.cjs'), authService: { audit() {}, diaryEnabled: () => false },
@@ -280,7 +280,9 @@ async function run(t, { freeChatId = null, ragOverride = null, flag, settings = 
     ...(withRouting ? { routingModes: {
       enabled: () => flag === true,
       settings: () => rm.normalize(settings),
-      sensitivity: async (digest) => { sensitivityCalls.push(digest); return verdicts[verdict]; },
+      // `sensitivity`: a real createSensitivity check (#1640) in place of the fixture verdict.
+      // chat.cjs sends routerInput's { chunks, complete } (#1640 review); the calls record the chunks.
+      sensitivity: async (digest) => { sensitivityCalls.push(Array.isArray(digest) ? digest : digest?.chunks); sensitivityInputs.push(digest); return sensitivity ? sensitivity(digest) : verdicts[verdict]; },
       awaitChoice: gate.awaitRouteChoice,
       log: (entry) => logs.push(entry),
       setChatFlags: (projectId, chatId, patch) => { flagsSet.push({ projectId, chatId, patch }); return true; },
@@ -294,7 +296,7 @@ async function run(t, { freeChatId = null, ragOverride = null, flag, settings = 
   } finally { console.log = origLog; console.warn = origWarn; console.info = origInfo; }
   const upstream = calls.filter((c) => c.url);
   const meta = events.find((e) => e.type === 'meta');
-  return { events, calls, upstream, meta, logs, flagsSet, errors, consoleLines, sensitivityCalls };
+  return { events, calls, upstream, meta, logs, flagsSet, errors, consoleLines, sensitivityCalls, sensitivityInputs };
 }
 // Wall-clock fields differ between any two runs; everything else must match byte for byte.
 const stable = (events) => JSON.stringify(events, (k, v) => (['updatedAt', 'timeToFirstToken'].includes(k) ? 0 : v));
@@ -641,4 +643,136 @@ test('#1438: a check that could not answer, with no local model, is refused: 409
   assert.equal(r.errors.length, 1);
   assert.equal(r.errors[0].status, 409);
   assert.match(r.errors[0].body.error, /Nothing was sent/);
+});
+
+// ── #1640: the real decision-service chain inside a chat turn ────────────────
+// A synthetic decision service on loopback answering in Laya's shape, wired as server/index.cjs wires
+// it (decision settings -> endpoint -> decision layer -> createSensitivity). Before #1640 its
+// confidence was null, so every answer fell back as "unavailable (low-confidence)" and no card showed.
+async function decisionServiceCheck(t, reply, { log = () => {}, seen = [] } = {}) {
+  const server = require('node:http').createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => { body += c; });
+    req.on('end', () => {
+      let parsed = null; try { parsed = JSON.parse(body); } catch { /* recorded as null */ }
+      seen.push(parsed);
+      const r = typeof reply === 'function' ? reply(parsed) : reply;
+      res.writeHead(200, { 'content-type': 'application/json' }); res.end(typeof r === 'string' ? r : JSON.stringify(r));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => { server.closeAllConnections(); return new Promise((resolve) => server.close(resolve)); });
+  const kv = new Map();
+  const settings = require('./decision-settings.cjs').createDecisionSettings({ store: { get: (k) => kv.get(k), set: (k, v) => kv.set(k, v) }, env: {} });
+  settings.save({ url: `http://127.0.0.1:${server.address().port}`, timeoutMs: 1500 }, 'admin');
+  const decisions = createDecisions({ backends: { configured: settings.backend() }, chains: { 'routing.sensitivity': ['configured'] } });
+  return rm.createSensitivity({ decide: decisions.decide, log });
+}
+const layaReply = (selected, sensitive) => ({ selected, scores: { sensitive, not_sensitive: Math.round((1 - sensitive) * 100) / 100 }, model: 'convaiinnovations/laya', calibrated: false });
+
+test('#1640: through the real decision service, "sensitive" at 0.97 shows the card and "not sensitive" at 0.97 goes to cloud', async (t) => {
+  const message = 'Synthetic test: Ada (fictional) keeps her made-up account numbers in a notebook.';
+  const flagged = await run(t, { flag: true, settings: HYBRID, message, answer: { choice: 'local' }, sensitivity: await decisionServiceCheck(t, layaReply('sensitive', 0.97)) });
+  assert.equal(flagged.events.find((e) => e.type === 'route_pending')?.flag, 'router', 'the "This looks sensitive" card is shown');
+  assert.deepEqual(flagged.meta.routing, { route: 'local', reason: 'user-choice' });
+  assert.equal(flagged.upstream.some((u) => u.url.startsWith(CLOUD)), false, 'nothing reached the cloud');
+  const clear = await run(t, { flag: true, settings: HYBRID, message: 'Reply with the word ok.', sensitivity: await decisionServiceCheck(t, layaReply('not_sensitive', 0.03)) });
+  assert.equal(clear.events.some((e) => e.type === 'route_pending'), false);
+  assert.deepEqual(clear.meta.routing, { route: 'cloud', reason: 'mode' });
+  assert.ok(clear.upstream[0].url.startsWith(CLOUD));
+});
+
+test('#1640: through the real decision service, a low score or a garbled reply stays local with no card', async (t) => {
+  for (const [reply, detail] of [[layaReply('not_sensitive', 0.45), 'low-confidence'], ['{"selected":"not_sensitive"', 'parse']]) {
+    const r = await run(t, { flag: true, settings: HYBRID, message: 'Reply with the word ok.', sensitivity: await decisionServiceCheck(t, reply) });
+    assert.equal(r.events.some((e) => e.type === 'route_pending'), false, detail);
+    assert.deepEqual(r.meta.routing, { route: 'local', reason: 'check-unavailable', detail }, detail);
+    assert.equal(r.upstream.some((u) => u.url.startsWith(CLOUD)), false, `${detail}: nothing reached the cloud`);
+  }
+});
+
+// ── #1640 review: only a check that saw everything a cloud route sends may clear it ──
+// The router reads one 1,000-character chunk by default. A fake decision service that answers
+// "sensitive" only when it sees the marker, else "not sensitive" at 0.9: if the marker was past what
+// the router could read, the old check cleared the turn and sent the marker to the cloud.
+const PRIVATE_MARKER = 'ZEBRA-PRIVATE-MARKER-4471';
+const markerAware = (body) => (String(body?.state || '').includes(PRIVATE_MARKER) ? layaReply('sensitive', 0.97) : layaReply('not_sensitive', 0.1));
+const padding = (n) => 'Synthetic filler about widgets and gears. '.repeat(Math.ceil(n / 42)).slice(0, n);
+
+async function partialRun(t, options) {
+  const logs = [], seen = [];
+  const r = await run(t, { flag: true, settings: HYBRID, answer: { choice: 'cloud' }, ...options, sensitivity: await decisionServiceCheck(t, markerAware, { log: (e) => logs.push(e), seen }) });
+  return { ...r, checkLogs: logs, seen };
+}
+function assertKeptLocal(r, label) {
+  assert.equal(r.upstream.some((u) => u.url.startsWith(CLOUD)), false, `${label}: nothing reached the cloud`);
+  assert.ok(r.upstream.length >= 1 && r.upstream.every((u) => u.url.startsWith(LOCAL)), `${label}: answered locally`);
+  assert.deepEqual(r.meta.routing, { route: 'local', reason: 'check-unavailable', detail: 'partial' }, label);
+  assert.equal(r.events.some((e) => e.type === 'route_pending'), false, `${label}: no card (#1421)`);
+  assert.deepEqual(r.checkLogs.map((e) => [e.verdict, e.cause]), [['unavailable', 'partial']], `${label}: the decision log says partial`);
+  assert.equal(r.seen.length, 0, `${label}: a partial view is not asked`);
+}
+
+test('#1640 review: a marker past character 1,000 of the message keeps the turn local (partial), never cloud', async (t) => {
+  const message = `Synthetic test, please tidy this note. ${padding(1100)} ${PRIVATE_MARKER} ends here.`;
+  assert.ok(message.indexOf(PRIVATE_MARKER) > 1000);
+  assertKeptLocal(await partialRun(t, { message }), 'long message');
+});
+
+test('#1640 review: a marker deep in project excerpts or a free chat\'s attached file keeps the turn local (partial)', async (t) => {
+  const excerpt = (opts) => `${opts?.attached ? 'The user attached these files to this chat' : 'Sources'} (1): "notes.md"\n<untrusted kind="file">${padding(1200)} ${PRIVATE_MARKER}</untrusted>`;
+  const ragOverride = { filesContext: async (_p, _files, _q, _u, onSources, opts) => { onSources([]); return excerpt(opts); } };
+  const files = [{ name: 'notes.md', content: 'synthetic' }];
+  // A project's knowledge-file excerpts ride in the system prompt; a free chat's attached file with the turn.
+  assertKeptLocal(await partialRun(t, { message: 'Summarize my notes.', ragOverride, project: { files } }), 'project excerpts');
+  assertKeptLocal(await partialRun(t, { message: 'Summarize this file.', ragOverride, freeChatId: 'c-synthetic-1640', project: { files } }), 'free-chat attached file');
+});
+
+test('#1640 review: a short turn the router sees whole is still decided by the service: clear goes to cloud, the marker shows the card', async (t) => {
+  const clear = await partialRun(t, { message: 'Reply with the word ok.' });
+  assert.deepEqual(clear.meta.routing, { route: 'cloud', reason: 'mode' });
+  assert.ok(clear.upstream[0].url.startsWith(CLOUD));
+  assert.equal(clear.seen.length, 1);
+  assert.deepEqual(clear.checkLogs.map((e) => e.verdict), ['clear']);
+  const marked = await partialRun(t, { message: `Synthetic: keep ${PRIVATE_MARKER} to yourself.`, answer: { choice: 'local' } });
+  assert.equal(marked.events.find((e) => e.type === 'route_pending')?.flag, 'router');
+  assert.equal(marked.upstream.some((u) => u.url.startsWith(CLOUD)), false);
+});
+
+test('#1640 review: routerInput reports complete only when nothing that is sent was dropped or cut', () => {
+  const small = rm.routerInput({ message: 'hi', system: 'short context', history: [{ role: 'user', content: 'earlier' }], attachments: ['a.md'] });
+  assert.equal(small.complete, true);
+  assert.equal(small.chunks.length, 1);
+  assert.deepEqual(rm.routerChunks({ message: 'hi' }), rm.routerInput({ message: 'hi' }).chunks, 'routerChunks is routerInput\'s chunks');
+  const cut = (input, label) => assert.equal(rm.routerInput(input).complete, false, label);
+  cut({ message: padding(1200) }, 'a long message');
+  cut({ message: 'hi', system: padding(1200) }, 'long context');
+  cut({ message: 'hi', history: [{ role: 'user', content: padding(1200) }] }, 'a long history entry');
+  cut({ message: 'hi', history: Array.from({ length: 41 }, () => ({ role: 'user', content: 'x' })) }, 'more than 40 history entries');
+  cut({ message: 'hi', attachments: Array.from({ length: 80 }, (_, i) => `file-${i}-synthetic-name.md`) }, 'many attachment names');
+  // Every section that fits is complete, also with several chunks.
+  assert.equal(rm.routerInput({ message: padding(1200) }, { maxChunks: 2 }).complete, true);
+  // An applied write's target and arguments are sent with it, so the router reads them too.
+  const applied = rm.routerInput({ message: 'hi', history: [{ role: 'tool', content: '', name: 'write_file', applied: true, target: 'notes/a.md', args: `{"text":"${PRIVATE_MARKER}"}` }] });
+  assert.ok(applied.chunks.join('').includes(PRIVATE_MARKER));
+  // Empty input: nothing to ask (the check fails closed on it as no-input).
+  assert.deepEqual(rm.routerInput({}), { chunks: [], complete: true });
+});
+
+test('#1640 review: createSensitivity does not ask about a partial input, and a plain array keeps its meaning', async () => {
+  let asked = 0;
+  const decide = async () => { asked += 1; return { selected: 'not_sensitive', scores: { sensitive: 0.1, not_sensitive: 0.9 }, confidence: 0.9 }; };
+  const logs = [];
+  const check = rm.createSensitivity({ decide, log: (e) => logs.push(e) });
+  assert.deepEqual(await check({ chunks: ['a'], complete: false }), { flagged: true, flag: 'unavailable', cause: 'partial' });
+  assert.deepEqual(await check({ chunks: ['a'] }), { flagged: true, flag: 'unavailable', cause: 'partial' }, 'no complete:true is partial');
+  assert.equal(asked, 0);
+  assert.equal(logs[0].cause, 'partial');
+  // More chunks than the check may ask about is partial too.
+  const capped = rm.createSensitivity({ decide, maxChunks: 1 });
+  assert.deepEqual(await capped({ chunks: ['a', 'b'], complete: true }), { flagged: true, flag: 'unavailable', cause: 'partial' });
+  assert.deepEqual(await check({ chunks: ['a'], complete: true }), { flagged: false, flag: null });
+  assert.deepEqual(await check({ chunks: [], complete: true }), { flagged: true, flag: 'unavailable', cause: 'no-input' });
+  assert.deepEqual(await check(['a']), { flagged: false, flag: null });
+  assert.equal(asked, 2);
 });
