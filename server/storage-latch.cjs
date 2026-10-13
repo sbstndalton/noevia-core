@@ -159,10 +159,13 @@ function createStorageLatch({ now = Date.now } = {}) {
 }
 
 /** The storage failure a Diary reply reports, in the shape `note` takes, or null. The Diary tags a
- *  refused login (424 storageLoginRejected) and a throttle (503 storageThrottled + retryAfter). */
+ *  refused login (424 storageLoginRejected, or `loginRefused: true` on a backup's 200 reply) and a throttle
+ *  (503 storageThrottled + retryAfter). */
 function failureFromDiaryReply(reply) {
   if (!reply || typeof reply !== 'object') return null;
   if (reply.code === 'storageLoginRejected') return { kind: 'login' };
+  // #1617: the Diary answers a storage-backup the remote refused the login for as a 200 'failed' status, with this flag.
+  if (reply.loginRefused === true) return { kind: 'login' };
   if (reply.code === 'storageThrottled') {
     const wait = Number(reply.retryAfter);
     return { kind: 'throttled', ...(Number.isFinite(wait) && wait > 0 ? { retryAfter: wait } : {}) };

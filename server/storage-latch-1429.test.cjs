@@ -279,3 +279,28 @@ test('#1615: a reply that tested nothing hands the probe back, keeps the strikes
   latch.note('u1', CONN, { kind: 'login' });
   assert.equal(latch.status('u1', CONN).nextAttemptAt - now, 30 * 60_000, 'the strikes were kept: a refused probe doubles');
 });
+
+test('#1617: a backup reply that says loginRefused latches the login like a 401, with strikes on a refused probe', () => {
+  let now = 0;
+  const latch = createStorageLatch({ now: () => now });
+  const read = () => CONN;
+  const refused = { mode: 'managed', backup: 'failed', error: 'Backup could not be verified.', loginRefused: true };
+  latch.noteDiaryReply('u1', read, refused, true); // a 200 from the Diary
+  assert.deepEqual(latch.blocked('u1', CONN), { kind: 'login' });
+  assert.equal(latch.status('u1', CONN).nextAttemptAt, 15 * 60_000, 'the base wait');
+  now = 15 * 60_000;
+  assert.equal(latch.blocked('u1', CONN), null, 'probe');
+  latch.noteDiaryReply('u1', read, refused, true);
+  assert.equal(latch.status('u1', CONN).nextAttemptAt - now, 30 * 60_000, 'a probe refused again doubles the wait');
+  assert.equal(latch.suspendedFor('u2', read), false, 'another account is not held');
+  assert.equal(latch.suspendedFor('u1', () => ({ ...CONN, secret: 'changed-synthetic' })), false, 'a changed password resumes it');
+});
+
+test('#1617: only loginRefused === true latches; a failed backup without it, or with a look-alike, does not', () => {
+  const read = () => CONN;
+  for (const reply of [{ backup: 'failed' }, { backup: 'failed', loginRefused: false }, { backup: 'failed', loginRefused: 'true' }, { backup: 'failed', loginRefused: 1 }]) {
+    const latch = createStorageLatch({ now: () => 0 });
+    latch.noteDiaryReply('u1', read, reply, true);
+    assert.equal(latch.blocked('u1', CONN), null, `no hold for ${JSON.stringify(reply)}`);
+  }
+});
