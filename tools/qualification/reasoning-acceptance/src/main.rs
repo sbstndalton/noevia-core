@@ -7,9 +7,9 @@ use std::{
     process::{Command, ExitCode},
     time::{SystemTime, UNIX_EPOCH},
 };
-const FIXTURE: &str = "641917e2447a0b6c91d7e54cc665085b32555b92";
-const RS_REF: &str = "592d94a7dc6373d2adf188547c079d69b47f3d28";
-const ARCHIVE: &str = "74be654e0f943b7ec43e3ac06099a3c39257f8f772b42636d49ea445eec382bb";
+const FIXTURE: &str = "f59155d9effbed083e911326bd74187613a7025c";
+const RS_REF: &str = "c90210ee5be06024b2a4b477e60db188247aba33";
+const ARCHIVE: &str = "a5c04fc61927ce9fd0e4425f6aa6923bfaa40f14bbe06b136b120197682b2411";
 const TEMPLATES: [(&str, &str); 3] = [
     (
         "input",
@@ -17,7 +17,7 @@ const TEMPLATES: [(&str, &str); 3] = [
     ),
     (
         "launch",
-        "0bc54c0ca7377a7529761130248915bd4493825e5c5ad22b3909e80398f1c29a",
+        "b38e7b6aa6c12c66717032694f6b66c844ee5518e99804a35d0e21e955416492",
     ),
     (
         "verify",
@@ -181,6 +181,9 @@ fn run() -> Result<(), String> {
             launch = launch.replace(key, &js(&value.to_string_lossy())?);
         }
         launch = launch.replace("__ARGS__", "[]");
+        // The merged launcher fills this with a dependency override in its prompts modes only and
+        // with nothing otherwise (corpus-launcher.rs prepare); none of these modes is a prompts mode.
+        launch = launch.replace("__PROMPTS_OVERRIDE__", "");
         if mode == "verify-omission" {
             let omitted = launch.replace("[args[0],args[1],'--require',preload,args[2]]", "args");
             if omitted == launch {
