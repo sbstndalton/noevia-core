@@ -105,6 +105,14 @@ function createProjectRoutes({
   // A folder step's failure: its kind (#1428), or the older loginRejected flag (a 401) when that is all it says.
   const folderFailure = (made) => made.failure || (made.loginRejected ? { kind: 'login' } : null);
   const holdReply = (res, hold) => (hold.kind === 'login' ? storageLoginRejected(res) : replyStorageFailure(res, { kind: 'throttled', retryAfter: hold.retryAfter }));
+  // #1454: an upload never replaces an existing source unless the request says `replace: true`.
+  // The refusal is a 409 with a stable code, so the client can save a numbered copy or ask the person.
+  const sourceExistsReply = (res, name) => json(res, 409, {
+    code: 'sourceExists', name,
+    error: `A source named "${name}" already exists in this project, so it was not replaced. Upload it under another name, or choose to replace it.`,
+  });
+  // True when the write error is storage saying the path is already taken (a create-only PUT met a 412).
+  const pathTaken = (e) => !!e && e.code === 'changed' && e.status === 409;
   const ensureFolder = (project) => typeof store.ensureProjectFolderDetailed === 'function'
     ? store.ensureProjectFolderDetailed(project)
     : Promise.resolve(ensureProjectFolder(project)).then((folder) => ({ folder, loginRejected: false, failure: null }));
@@ -513,6 +521,7 @@ function createProjectRoutes({
         const uploads = (project.files || []).filter(f => !f.source);
         if (uploads.length >= 20 && !uploads.some(f => f.name === name)) return json(res, 400, { error: 'A project holds at most 20 uploaded sources.' });
         const previous = uploads.find(f => f.name === name);
+        if (previous && body.replace !== true) return sourceExistsReply(res, name);
         const file = await documentSources.ingest(currentWorkspace(), id, name, bytes, previous);
         if (getProject(id) !== project || project.files.find(f => !f.source && f.name === name) !== previous) return json(res, 409, { error: 'Project changed; retry.' });
         project.files = [...(project.files || []).filter(f => f.source || f.name !== name), file];
@@ -572,8 +581,13 @@ function createProjectRoutes({
           const connection = authService.getStorage(authn.user.id, true);
           const remote = storageClient.isBrowsable(connection) ? connection : null;
           const progress = requestScope.getStore()?.sourceProgress || (() => {});
+          const replace = body.replace === true;
+          // #1454: refuse before any work when the name is taken; checked again for a reduced file's new name.
+          const exists = (n) => (project.files || []).some(f => f.name === (remote && project.projectFolder ? uploads.destinationFor(project, n, { connection: remote }) : remote ? null : n));
+          if (!replace && exists(inputName)) return sourceExistsReply(res, inputName);
           const {name,bytes,reduction} = await require('../pdf-reduce.cjs').prepare(inputName,inputBytes,{progress});
           uploads.validate(name,bytes);
+          if (!replace && name !== inputName && exists(name)) return sourceExistsReply(res, name);
           if (remote && !project.projectFolder) {
             progress('Creating upload folder');
             const made = await ensureFolder(project);
@@ -581,8 +595,11 @@ function createProjectRoutes({
             if (!project.projectFolder) return replyStorageFailure(res, folderFailure(made)) || json(res, 502, { error: 'Could not create the storage folder; retry.' });
           }
           let file;
-          try { file = await uploads.ingest(currentWorkspace(), project, name, bytes, { connection: remote, progress }); }
-          catch (e) { if (replyStorageFailure(res, storageClient.storageFailure?.(e))) return; throw e; }
+          try { file = await uploads.ingest(currentWorkspace(), project, name, bytes, { connection: remote, progress, ...(remote && !replace ? { ifNoneMatch: '*' } : {}) }); }
+          catch (e) {
+            if (!replace && remote && pathTaken(e)) return sourceExistsReply(res, name);
+            if (replyStorageFailure(res, storageClient.storageFailure?.(e))) return; throw e;
+          }
           if(reduction){file.attachment.reduction=reduction;file.attachment.reason=[file.attachment.reason,reduction.note].filter(Boolean).join(' ');}
           if (getProject(id) !== project) return json(res, 409, { error: 'Project removed during upload.' });
           if (remote) project.sourceFolders = [...new Set([...(project.sourceFolders || []), project.projectFolder])];
@@ -614,6 +631,7 @@ function createProjectRoutes({
             return json(res, 400, { error: 'A project holds at most 20 uploaded sources.' });
           }
           const previous = uploads.find(f => f.name === rawName);
+          if (previous && body.replace !== true) return sourceExistsReply(res, rawName);
           const file = documents.isDocument(rawName)
             ? await documentSources.ingest(currentWorkspace(), id, rawName, bytes, previous)
             : { name: rawName, content: bytes.toString('utf8').slice(0, 200000) };
@@ -630,9 +648,13 @@ function createProjectRoutes({
         }
         project.sourceFolders = [...new Set([...(project.sourceFolders || []), project.projectFolder])];
         saveProjects(PROJECTS);
+        const replace = body.replace === true;
+        if (!replace && (project.files || []).some(f => f.name === `${project.projectFolder}/${rawName}`)) return sourceExistsReply(res, rawName);
         try {
-          await storageClient.writeFile(connection, `${project.projectFolder}/${rawName}`, bytes);
+          await (replace ? storageClient.writeFile(connection, `${project.projectFolder}/${rawName}`, bytes)
+            : storageClient.writeFile(connection, `${project.projectFolder}/${rawName}`, bytes, { ifNoneMatch: '*' }));
         } catch (e) {
+          if (!replace && pathTaken(e)) return sourceExistsReply(res, rawName);
           if (replyStorageFailure(res, storageClient.storageFailure?.(e))) return;
           return json(res, (e && e.status) || 502, { error: (e && e.message) || 'could not save the file' });
         }

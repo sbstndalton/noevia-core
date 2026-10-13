@@ -85,7 +85,8 @@ function harness(remote = false) {
   });
   const run = async (p, req) => { last = undefined; await routes(req, {}, { path: p, authn: { user: { id: 'fixture-user' } }, url: new URL('http://localhost' + p) }); return last; };
   return { project, stored, workspace, extracts: () => extracts,
-    upload: (name, bytes, id = project.id, organized = false) => run('/api/projects/' + id + '/upload', { method: 'POST', body: { name, organized, dataBase64: bytes.toString('base64') } }),
+    // `replace` is the explicit overwrite of an existing source (#1454); without it a taken name is refused.
+    upload: (name, bytes, id = project.id, organized = false, replace = false) => run('/api/projects/' + id + '/upload', { method: 'POST', body: { name, organized, ...(replace ? { replace: true } : {}), dataBase64: bytes.toString('base64') } }),
     remove: name => run('/api/projects/' + project.id + '/files', { method: 'DELETE', body: { path: name } }),
     sync: () => run('/api/projects/' + project.id + '/sources/sync', { method: 'POST' }),
   };
@@ -95,7 +96,7 @@ test('local PDF upload extracts text; failed replacement preserves prior text', 
   const h = harness();
   assert.equal((await h.upload('statement.pdf', fixture('text.pdf'))).status, 200);
   const before = h.project.files[0].content;
-  assert.equal((await h.upload('statement.pdf', fixture('scanned.pdf'))).body.document.stale, true);
+  assert.equal((await h.upload('statement.pdf', fixture('scanned.pdf'), undefined, false, true)).body.document.stale, true);
   assert.equal(h.project.files[0].content, before);
   assert.deepEqual(documentSources.readOriginal(h.workspace, h.project.id, h.project.files[0]), fixture('scanned.pdf'));
   assert.match(documentSources.readPages(h.workspace, h.project.id, h.project.files[0]).text, /TEXT-P1/);
@@ -107,7 +108,7 @@ test('remote upload preserves original bytes; sync distinguishes existing and ne
   assert.deepEqual(h.stored.get('fixture/old.pdf'), fixture('text.pdf'));
   await h.sync();
   const before = h.project.files[0].content;
-  await h.upload('old.pdf', fixture('scanned.pdf'));
+  await h.upload('old.pdf', fixture('scanned.pdf'), undefined, false, true);
   await h.upload('new.pdf', fixture('scanned.pdf'));
   const out = await h.sync();
   assert.equal(out.body.skipped.length, 2);
@@ -209,7 +210,7 @@ test('concurrent source operations serialize so a stale refresh cannot overwrite
   documentSources.ingest = async (...args) => { if (first) { first = false; entered(); await wait; } return ingest(...args); };
   try {
     const refresh = h.sync(); await started;
-    const upload = h.upload('a.pdf', fixture('scanned.pdf'));
+    const upload = h.upload('a.pdf', fixture('scanned.pdf'), undefined, false, true);
     release(); await Promise.all([refresh, upload]);
     const f = h.project.files[0];
     assert.equal(f.document.state, 'failed'); assert.equal(f.document.stale, true);

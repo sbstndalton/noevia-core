@@ -191,8 +191,8 @@ const ctx = (w, p, target, account = w.storage.account()) => ({ userId: 'user-a'
 test('create with files, storage connected: the file is stored in the project folder like an upload', async (t) => {
   const w = world(t);
   const p = await w.store.createProject({ name: 'Trip', files: [{ name: 'qa-687-notes.md', content: NOTES }] });
-  const stored = `${ROOT}/Trip/Text/qa-687-notes.md`;
-  assert.equal(p.projectFolder, `${ROOT}/Trip`);
+  const stored = `${ROOT}/${p.id}/Text/qa-687-notes.md`;
+  assert.equal(p.projectFolder, `${ROOT}/${p.id}`, 'the folder is keyed by the project id, not its name (#1458)');
   assert.deepEqual(p.sourceFolders, [p.projectFolder]);
   assert.equal(p.files.length, 1);
   assert.equal(p.files[0].name, stored);
@@ -208,7 +208,7 @@ test('create with files, storage connected: the file is stored in the project fo
 test('create with files, then append: edited in place with If-Match, the card path is the stored path', async (t) => {
   const w = world(t);
   const p = await w.store.createProject({ name: 'Trip', files: [{ name: 'qa-687-notes.md', content: NOTES }] });
-  const stored = `${ROOT}/Trip/Text/qa-687-notes.md`;
+  const stored = `${ROOT}/${p.id}/Text/qa-687-notes.md`;
   const r = await chat(t, w, p, { rounds: [{ tool: 'project_append_file', args: { name: 'qa-687-notes.md', text: 'Zusatz: 687' } }] });
   assert.equal(r.pending.length, 1);
   assert.equal(r.pending[0].target, stored, 'the card shows the storage path, not the bare name');
@@ -337,9 +337,9 @@ test('the refusal stays when the destination genuinely differs from the stored f
   const w = world(t);
   // A connected upload moved away from the upload path: never rewritten at the upload path.
   const p = await w.store.createProject({ name: 'Trip', files: [{ name: 'notes.md', content: 'a\n' }] });
-  const stored = `${ROOT}/Trip/Text/notes.md`;
+  const stored = `${ROOT}/${p.id}/Text/notes.md`;
   await assert.rejects(w.store.writeProjectTextFile(p, 'other.md', 'x', { expectName: stored, expectContent: 'a\n', expectAttachment: p.files[0].attachment.id }),
-    /saving now would write "noevia projects\/Trip\/Text\/other\.md" instead of editing "noevia projects\/Trip\/Text\/notes\.md" in place; nothing was saved/);
+    new RegExp(`saving now would write "${ROOT}/${p.id}/Text/other\\.md" instead of editing "${ROOT}/${p.id}/Text/notes\\.md" in place; nothing was saved`));
   // A plain-named file with a separate stored file already at its destination: refused at the card.
   const q = legacyProject(w, 'Dup', 'notes.md');
   q.projectFolder = `${ROOT}/Dup`;
@@ -397,16 +397,17 @@ test('create-time storing is create-only: a case-variant name on case-insensitiv
   const w = world(t);
   w.storage.caseInsensitive = true;
   const p = await w.store.createProject({ name: 'Case', files: [{ name: 'Notes.md', content: 'first\n' }, { name: 'notes.md', content: 'second\n' }] });
-  const upper = `${ROOT}/Case/Text/Notes.md`;
+  const upper = `${ROOT}/${p.id}/Text/Notes.md`;
   assert.equal(w.storage.objects.get(upper), 'first\n', 'the first file is not overwritten');
   assert.deepEqual(w.storage.writeCalls.map((c) => c.ifNoneMatch), ['*', '*'], 'every create-time PUT is create-only');
   assert.deepEqual(p.files.map((f) => f.name), [upper, 'notes.md'], 'the refused one stays in noevia');
   assert.equal(p.files[1].content, 'second\n');
   // A file already in the folder (an upload that landed first) is not replaced either.
   const w2 = world(t);
-  w2.storage.put(`${ROOT}/Pre/Text/a.md`, 'already there\n');
+  t.mock.method(Date, 'now', () => 1234); t.mock.method(Math, 'random', () => 0.5); // a known project id: proj-1234-i
+  w2.storage.put(`${ROOT}/proj-1234-i/Text/a.md`, 'already there\n');
   const q = await w2.store.createProject({ name: 'Pre', files: [{ name: 'a.md', content: 'dialog\n' }] });
-  assert.equal(w2.storage.objects.get(`${ROOT}/Pre/Text/a.md`), 'already there\n');
+  assert.equal(w2.storage.objects.get(`${ROOT}/proj-1234-i/Text/a.md`), 'already there\n');
   assert.deepEqual(q.files.map((f) => f.name), ['a.md']);
 });
 
@@ -420,7 +421,7 @@ test('create-time storing makes no folder when no file will be stored (#589)', a
   assert.equal(p.files.length, 3, 'the files stay in noevia');
   // One storable file among them: the folder is made and only that file stored.
   const q = await w.store.createProject({ name: 'Some', files: [{ name: 'empty.md', content: '' }, { name: 'ok.md', content: 'ok\n' }] });
-  assert.equal(q.projectFolder, `${ROOT}/Some`);
-  assert.deepEqual(w.storage.writeCalls.map((c) => c.path), [`${ROOT}/Some/Text/ok.md`]);
-  assert.deepEqual(q.files.map((f) => f.name), ['empty.md', `${ROOT}/Some/Text/ok.md`]);
+  assert.equal(q.projectFolder, `${ROOT}/${q.id}`);
+  assert.deepEqual(w.storage.writeCalls.map((c) => c.path), [`${ROOT}/${q.id}/Text/ok.md`]);
+  assert.deepEqual(q.files.map((f) => f.name), ['empty.md', `${ROOT}/${q.id}/Text/ok.md`]);
 });
