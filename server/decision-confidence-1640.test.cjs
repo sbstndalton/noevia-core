@@ -15,7 +15,12 @@ const { createToolGate } = require('./tool-gate.cjs');
 const { createStepSupervision } = require('./step-supervision.cjs');
 
 const HANG = Symbol('hang');
-const laya = (selected, scores, extra = {}) => ({ json: { selected, scores, model: 'convaiinnovations/laya', calibrated: false, ...extra } });
+// #1647: the replies come from a synthetic model that reports its identity and sits on a test-only
+// qualified list, so these tests exercise the confidence path; the gate itself (the shipped list has no
+// qualified model): sensitivity-qualification-1647.test.cjs.
+const SYN_IDENTITY = { model: 'synthetic/sensitivity-test', revision: 'a'.repeat(40) };
+const SYN_QUALIFIED = [{ ...SYN_IDENTITY, evidence: { set: 'synthetic', sensitiveRecall: 1, measured: '2026-10-13' } }];
+const laya = (selected, scores, extra = {}) => ({ json: { selected, scores, model: SYN_IDENTITY.model, model_revision: SYN_IDENTITY.revision, calibrated: false, ...extra } });
 
 /** A synthetic decision service. `reply(body)` returns { json } | { text, status } | HANG. */
 async function fakeService(t, reply) {
@@ -47,7 +52,7 @@ function stack(url, { sensitivityDeadlineMs } = {}) {
   const decisions = createDecisions({ backends: { configured: backend }, chains: { 'routing.sensitivity': ['configured'], 'tool.gate': ['configured'] },
     log: (entry) => logs.push(rm.decisionCodes(entry)) });
   const checkLogs = [];
-  const check = rm.createSensitivity({ decide: decisions.decide, log: (e) => checkLogs.push(e),
+  const check = rm.createSensitivity({ decide: decisions.decide, log: (e) => checkLogs.push(e), qualified: SYN_QUALIFIED,
     ...(sensitivityDeadlineMs ? { deadlineMs: () => sensitivityDeadlineMs } : {}) });
   return { backend, decisions, check, logs, checkLogs };
 }
@@ -66,7 +71,8 @@ const BENIGN_TEXT = 'Synthetic test: how do widgets work?';
 // ── The endpoint ─────────────────────────────────────────────────────────────
 
 test('#1640: the endpoint answers with the winning option share as confidence, uncalibrated, from the scores only', async (t) => {
-  const svc = await fakeService(t, laya('sensitive', { sensitive: 0.97, not_sensitive: 0.03 }));
+  // Laya's own reply carries no revision (noevia-services laya/server.py), so it has no identity (#1647).
+  const svc = await fakeService(t, laya('sensitive', { sensitive: 0.97, not_sensitive: 0.03 }, { model: 'convaiinnovations/laya', model_revision: undefined }));
   const endpoint = createDecisionEndpoint({ env: { COWORK_DECISION_URL: svc.url } });
   const two = [{ id: 'sensitive', label: 'a' }, { id: 'not_sensitive', label: 'b' }];
   const result = await endpoint.choice({ state: 'synthetic', question: 'q', options: two });
@@ -144,7 +150,7 @@ test('#1640 fail safe: an answer without a numeric confidence never clears a tur
   // A decide() that does not apply minConfidence itself (not the production layer) answering
   // "not sensitive" with no confidence, or a non-finite one: the check fails closed on its own.
   for (const confidence of [undefined, null, NaN, '0.97', Infinity]) {
-    const check = rm.createSensitivity({ decide: async () => ({ selected: 'not_sensitive', scores: { sensitive: 0.03, not_sensitive: 0.97 }, confidence, source: 'configured' }) });
+    const check = rm.createSensitivity({ qualified: SYN_QUALIFIED, decide: async () => ({ selected: 'not_sensitive', scores: { sensitive: 0.03, not_sensitive: 0.97 }, confidence, source: 'configured', metadata: { identity: SYN_IDENTITY } }) });
     assert.deepEqual(await check(BENIGN_TEXT), { flagged: true, flag: 'unavailable', cause: 'low-confidence' }, String(confidence));
   }
 });
