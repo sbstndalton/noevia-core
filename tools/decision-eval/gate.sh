@@ -8,7 +8,8 @@
 #     or one of those files changed in the last QUIET_MIN minutes;
 #   - chat activity in the last QUIET_MIN minutes: a decision-log write, or a routing/tool/System-One
 #     line in the web log;
-#   - the answering engine logged anything in the last 2 minutes (it logs every request it serves);
+#   - the answering engine started a task or a model in the last 2 minutes (launch_slot_,
+#     print_timing, a spawned instance; its status-poll proxy lines do not count);
 #   - a Coding job: the code sandbox or verifier using more than 5% CPU;
 #   - less than MIN_AVAILABLE_GB of available memory (the iGPU shares system RAM, #697).
 set -u
@@ -39,8 +40,8 @@ fi
 chat=$(docker logs --since "${QUIET_MIN}m" "$WEB" 2>&1 | grep -cE '^\[(system-one\]|routing\]|tools\] routed)')
 [ "$chat" -gt 0 ] && busy chat "$chat routing lines in ${QUIET_MIN} min"
 
-engine=$(docker logs --since 2m "$ENGINE" 2>&1 | wc -l)
-[ "$engine" -gt 0 ] && busy engine "$engine engine log lines in 2 min"
+engine=$(docker logs --since 2m "$ENGINE" 2>&1 | grep -cE "launch_slot_|print_timing|spawning server instance")
+[ "$engine" -gt 0 ] && busy engine "$engine engine task lines in 2 min"
 
 for c in $CODE_CONTAINERS; do
   cpu=$(docker stats --no-stream --format '{{.CPUPerc}}' "$c" 2>/dev/null | tr -d '%')
