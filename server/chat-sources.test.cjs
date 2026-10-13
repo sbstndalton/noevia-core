@@ -77,3 +77,50 @@ test('a throwing onSources hook never breaks the prompt', async () => {
   const text = await load([], false).filesContext('p', [{ name: 'a.md', content: 'x' }], 'q', 't', () => { throw new Error('boom'); });
   assert.match(text, /Sources attached/);
 });
+
+test('#1616: skill pins and sources inside stored alternatives are cleaned by the same rules as the turn itself', () => {
+  const pin = `skill_${'1'.repeat(32)}@${'e'.repeat(64)}`;
+  const long = 'z'.repeat(999);
+  const bad = { id: 'x', file: 'a.md', snippet: long, kind: 'weird', score: 'high', extra: 'drop' };
+  const [turn] = sanitizeHistory([{
+    role: 'user', content: 'q', skill: pin,
+    answers: [{ content: 'a1', sources: [bad], skill: pin }, { content: 'a2', sources: 'junk' }],
+    answer: 0,
+    branches: [
+      { content: 'v0', skill: { label: 'not a pin' }, sources: [bad], answers: [{ content: 'va', sources: [bad, { snippet: 'no file' }] }], answer: 0,
+        tail: [
+          { role: 'user', content: 't-u', skill: 'skill_1@2', sources: [bad] },
+          { role: 'assistant', content: 't-a', skill: pin, sources: [bad, { snippet: 'no file' }], answers: [{ content: 'ta1', sources: [bad] }], answer: 0 },
+        ] },
+      { content: 'v1', skill: pin, tail: [] },
+    ],
+    branch: 1,
+  }]);
+  assert.equal(turn.skill, pin);
+  assert.equal(turn.answers[0].sources.length, 1);
+  assert.equal(turn.answers[0].sources[0].snippet.length <= SNIPPET_MAX, true, 'answer sources are re-bounded');
+  assert.deepEqual(Object.keys(turn.answers[0].sources[0]).sort(), ['file', 'id', 'kind', 'snippet']);
+  assert.equal('skill' in turn.answers[0], false, 'a pin is never kept on an assistant reply');
+  assert.equal('sources' in turn.answers[1], false);
+  const [v0, v1] = turn.branches;
+  assert.equal('skill' in v0, false, 'a malformed pin on a version is dropped');
+  assert.equal('sources' in v0, false, 'sources are never kept on a user version');
+  assert.equal(v1.skill, pin, 'an exact pin on a version stays');
+  assert.equal(v0.answers[0].sources.length, 1);
+  assert.equal(v0.answers[0].sources[0].file, 'a.md');
+  const [tu, ta] = v0.tail;
+  assert.equal('skill' in tu, false);
+  assert.equal('sources' in tu, false);
+  assert.equal('skill' in ta, false);
+  assert.equal(ta.sources.length, 1);
+  assert.equal(ta.sources[0].snippet.length <= SNIPPET_MAX, true);
+  assert.equal(ta.answers[0].sources[0].snippet.length <= SNIPPET_MAX, true);
+});
+
+test('#1616: a tail without variants of its own is cleaned too, and a clean history is returned untouched', () => {
+  const pin = `skill_${'2'.repeat(32)}@${'d'.repeat(64)}`;
+  const [turn] = sanitizeHistory([{ role: 'user', content: 'q', branches: [{ content: 'v', tail: [{ role: 'user', content: 'u', skill: 'bad' }] }], branch: 0 }]);
+  assert.equal('skill' in turn.branches[0].tail[0], false);
+  const clean = { role: 'user', content: 'q', skill: pin, answers: [{ content: 'a' }], answer: 0, branches: [{ content: 'v', skill: pin, tail: [{ role: 'assistant', content: 'r' }] }], branch: 0 };
+  assert.equal(sanitizeHistory([clean])[0], clean);
+});

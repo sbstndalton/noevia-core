@@ -53,15 +53,24 @@ function sanitizePin(value) {
   return typeof value === 'string' && STORED_PIN.test(value) ? value : undefined;
 }
 
+// One history item with its client-supplied `sources` and `skill` bounded by its role: sources survive on an
+// assistant turn only, a skill pin on a user turn only. The same object when it carries neither field.
+function cleanItem(m, role) {
+  if (!m || typeof m !== 'object' || !('sources' in m || 'skill' in m)) return m;
+  if (!('sources' in m) && role === 'user' && sanitizePin(m.skill) === m.skill) return m; // an exact pin on a user turn: nothing to remove
+  const { sources, skill, ...rest } = m;
+  const cleanSources = role === 'assistant' ? sanitizeStored(sources) : undefined;
+  const cleanSkill = role === 'user' ? sanitizePin(skill) : undefined;
+  return { ...rest, ...(cleanSources ? { sources: cleanSources } : {}), ...(cleanSkill ? { skill: cleanSkill } : {}) };
+}
+
 function sanitizeHistory(history) {
   const { capEntry } = require('./chat-variants.cjs');
+  // #1517: the stored alternatives of a turn are bounded here; #1616: and every alternative, edited version and
+  // follow-up turn inside them is cleaned by the same rules as the turn itself.
   return history.map((entry) => {
-    const m = capEntry(entry); // #1517: the stored alternatives of a turn are bounded here
-    if (!m || typeof m !== 'object' || !('sources' in m || 'skill' in m)) return m;
-    const { sources, skill, ...rest } = m;
-    const cleanSources = m.role === 'assistant' ? sanitizeStored(sources) : undefined;
-    const cleanSkill = m.role === 'user' ? sanitizePin(skill) : undefined;
-    return { ...rest, ...(cleanSources ? { sources: cleanSources } : {}), ...(cleanSkill ? { skill: cleanSkill } : {}) };
+    const m = capEntry(entry, 0, cleanItem);
+    return m && typeof m === 'object' ? cleanItem(m, m.role) : m;
   });
 }
 

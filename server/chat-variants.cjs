@@ -39,16 +39,29 @@ function capAnswers(owner) {
   return list === owner.answers ? owner : { ...owner, answers: list, answer: chosen };
 }
 
-/** One history entry with its stored alternatives bounded; the same object when nothing changes. */
-function capEntry(entry, depth = 0) {
+// #1616: `clean(item, role)` is the caller's per-item sanitiser (chat-sources.cjs: sources and skill pins
+// of client-supplied history); it returns the same object when there is nothing to remove. It reaches every
+// alternative the entry holds: each answer (an assistant reply), each edited version (a turn of the owner's
+// role) and each entry of a version's tail, whatever those carry.
+function cleanAnswers(owner, clean) {
+  if (!clean || !Array.isArray(owner.answers)) return owner;
+  const list = owner.answers.map((a) => (a && typeof a === 'object' ? clean(a, 'assistant') : a));
+  return list.some((a, i) => a !== owner.answers[i]) ? { ...owner, answers: list } : owner;
+}
+
+/** One history entry with its stored alternatives bounded (and, with `clean`, sanitised); the same object when
+ *  nothing changes. The entry's own top-level fields are the caller's to clean. */
+function capEntry(entry, depth = 0, clean = null) {
   if (!entry || typeof entry !== 'object' || (!('answers' in entry) && !('branches' in entry))) return entry;
   if (depth > MAX_DEPTH) { const { answers, answer, branches, branch, ...rest } = entry; return rest; }
-  let next = capAnswers(entry);
+  let next = cleanAnswers(capAnswers(entry), clean);
   if (Array.isArray(next.branches)) {
     const versions = next.branches.map((version) => {
       if (!version || typeof version !== 'object') return version;
-      const withAnswers = capAnswers(version);
-      const tail = Array.isArray(withAnswers.tail) ? withAnswers.tail.map((h) => capEntry(h, depth + 1)) : withAnswers.tail;
+      const withAnswers = cleanAnswers(capAnswers(clean ? clean(version, entry.role) : version), clean);
+      const tail = Array.isArray(withAnswers.tail)
+        ? withAnswers.tail.map((h) => { const capped = capEntry(h, depth + 1, clean); return clean && capped && typeof capped === 'object' ? clean(capped, capped.role) : capped; })
+        : withAnswers.tail;
       const tailChanged = Array.isArray(tail) && tail.some((h, i) => h !== withAnswers.tail[i]);
       return withAnswers === version && !tailChanged ? version : { ...withAnswers, tail };
     });
