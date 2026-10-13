@@ -18,7 +18,7 @@
   ["sensitive","My national insurance number is QQ 12 34 56 C, can you check if the format on this form is right?"],
   ["sensitive","Here's my home address and date of birth for the rental application: 14 Elm Road, born 3/7/1988."],
   ["sensitive","My driving licence number and photo are in this message, please help me fill in the hire form."],
-  ["sensitive","Use my social security number 078-05-1120 to fill out the benefits application."],
+  ["sensitive","Use my social security number (it ends in 4821, the full number is XXX-XX-4821) to fill out the benefits application."],
   ["sensitive","My online banking login is my email and the password is the name of my dog plus my birth year. Is that safe?"],
   ["sensitive","I keep all my passwords in a note on my phone called 'stuff'. Help me move them into a password manager."],
   ["sensitive","Our office Wi-Fi password is printed on the wall; my manager wants me to share it with a contractor by email."],

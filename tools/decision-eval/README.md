@@ -22,6 +22,12 @@ node run.cjs --requests requests.jsonl --out decima.jsonl --target ollaya --url 
 node score.cjs --out report.json --md report.md --rss rss.json laya.jsonl decima.jsonl
 ```
 
+`run.cjs` sends only to loopback or private IP literals (or `localhost`) unless `--allow-remote` is
+given, since the requests and the Ollaya bearer key go to `--url`. `host.sh start offline` points
+Ollaya's registry and Hugging Face endpoint at a closed port, so it downloads nothing during a run, but
+it does not block outbound traffic: the container is on an ordinary bridge network so its port can be
+published on 127.0.0.1. Use a `--internal` network for a hard block.
+
 Limits: the sensitivity state carries a short synthetic stand-in for the system prompt (production's
 `Context` section is the real one, usually longer); supervision states are first-round, read-only
 rounds; the tool gate offers one fixed set of four read tools, so its labels are cut to 44 characters

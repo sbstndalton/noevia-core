@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { send, run, parseArgs, readJsonl, EXIT_PAUSED, EXIT_FAILING } = require('./run.cjs');
+const { send, run, parseArgs, urlProblem, readJsonl, EXIT_PAUSED, EXIT_FAILING } = require('./run.cjs');
 
 const body = { state: 's', question: 'q?', options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }] };
 const req = (id, variant = 'base') => ({ id, purpose: 'model.route', variant, lang: 'en', label: 'a', body });
@@ -94,9 +94,28 @@ test('run: a closed idle gate pauses before sending; failures in a row stop the 
 });
 
 test('parseArgs requires a model for the adapter target and trims the URL', () => {
-  assert.throws(() => parseArgs(['--requests', 'r', '--out', 'o', '--target', 'ollaya', '--url', 'http://x']), /usage/);
-  const a = parseArgs(['--requests', 'r', '--out', 'o', '--target', 'laya', '--url', 'http://x/', '--min-interval-ms', '1000']);
-  assert.equal(a.url, 'http://x');
+  assert.throws(() => parseArgs(['--requests', 'r', '--out', 'o', '--target', 'ollaya', '--url', 'http://127.0.0.1:1']), /usage/);
+  const a = parseArgs(['--requests', 'r', '--out', 'o', '--target', 'laya', '--url', 'http://127.0.0.1:8040/', '--min-interval-ms', '1000']);
+  assert.equal(a.url, 'http://127.0.0.1:8040');
   assert.equal(a.minIntervalMs, 1000);
   assert.equal(a.label, 'laya-en (live)');
+  assert.equal(a.allowRemote, false);
+});
+
+test('the requests and the bearer key only go to loopback or private hosts unless --allow-remote', () => {
+  for (const url of ['http://127.0.0.1:11535', 'http://localhost:1', 'http://[::1]:1', 'http://10.0.0.5:1', 'http://172.29.0.2:8040', 'http://192.168.1.20:8040']) {
+    assert.equal(urlProblem(url), null, url);
+  }
+  for (const url of ['http://8.8.8.8', 'http://172.32.0.1', 'http://example.com', 'http://laya:8040', 'http://127.0.0.1.nip.io']) {
+    assert.match(urlProblem(url), /not a loopback or private address/, url);
+  }
+  assert.equal(urlProblem('http://example.com', true), null);
+  assert.match(urlProblem('ftp://127.0.0.1'), /only http/);
+  assert.match(urlProblem('http://u:p@127.0.0.1'), /no credentials/);
+  assert.match(urlProblem('nonsense'), /not a URL/);
+  const args = ['--requests', 'r', '--out', 'o', '--target', 'ollaya', '--model', 'm', '--url', 'http://example.com'];
+  assert.throws(() => parseArgs(args), /--url refused: example\.com/);
+  // The flag takes no value; the arguments after it are still read in pairs.
+  const a = parseArgs([...args.slice(0, 6), '--allow-remote', ...args.slice(6), '--timeout-ms', '500']);
+  assert.deepEqual([a.allowRemote, a.model, a.url, a.timeoutMs], [true, 'm', 'http://example.com', 500]);
 });

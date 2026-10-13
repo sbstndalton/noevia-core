@@ -4,7 +4,11 @@
 #
 #   host.sh setup               create EVAL_DIR (models/, run/, results/), the API key and the network
 #   host.sh start online|offline  (re)create the one container; offline points the registry and
-#                               Hugging Face at a closed port, so nothing can download during a run
+#                               Hugging Face at a closed port, so Ollaya itself downloads nothing
+#                               during a run. It does NOT block outbound traffic: the container stays
+#                               on an ordinary bridge network (it must, for the 127.0.0.1 port), so
+#                               a process in it could still reach the internet. For a hard block,
+#                               run on a --internal network and reach the container by its bridge IP.
 #   host.sh pull NAME@sha256:D  pull one model by manifest digest (waits until done)
 #   host.sh load NAME           load it (keep_alive -1) after checking MemAvailable >= MIN_AVAILABLE_GB;
 #                               prints the cold-load time

@@ -11,11 +11,16 @@
 // and so do --max-failures failures in a row (exit 3). Output is appended per request, so a
 // stopped run resumes where it stopped: requests already in --out are skipped.
 //
+// --url must be a loopback or private IP literal (or localhost): the requests and, for ollaya, the
+// bearer key go there. Any other host (a public address, or a name that could resolve anywhere)
+// is refused unless --allow-remote is given.
+//
 // Usage: node run.cjs --requests requests.jsonl --out results.jsonl --target laya|ollaya --url URL
 //          [--model NAME] [--label NAME] [--api-key-file FILE] [--min-interval-ms 0] [--timeout-ms 10000]
-//          [--warmup 0] [--gate CMD --gate-every 50] [--max-failures 5] [--backoff-ms 3000]
+//          [--warmup 0] [--gate CMD --gate-every 50] [--max-failures 5] [--backoff-ms 3000] [--allow-remote]
 
 const fs = require('node:fs');
+const { isIP } = require('node:net');
 const { execFileSync } = require('node:child_process');
 const { toTypeSafe, fromTypeSafe, contractProblem } = require('./adapter.cjs');
 
@@ -23,10 +28,29 @@ const EXIT_PAUSED = 75, EXIT_FAILING = 3;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const keyOf = (r) => `${r.id}\u0000${r.variant}`;
 
+/** Loopback or private: localhost, 127/8, ::1, 10/8, 172.16/12, 192.168/16 (IP literals only). */
+function localHost(hostname) {
+  const h = String(hostname).replace(/^\[|\]$/g, '').toLowerCase();
+  if (h === 'localhost' || h === '::1') return true;
+  if (isIP(h) !== 4) return false;
+  return /^(127|10)\./.test(h) || /^192\.168\./.test(h) || /^172\.(1[6-9]|2\d|3[01])\./.test(h);
+}
+
+/** Why `url` may not be used, or null. Credentials, query and fragment are never allowed. */
+function urlProblem(url, allowRemote = false) {
+  let u;
+  try { u = new URL(url); } catch { return 'not a URL'; }
+  if (!['http:', 'https:'].includes(u.protocol)) return 'only http and https';
+  if (u.username || u.password || u.search || u.hash) return 'no credentials, query or fragment';
+  if (!allowRemote && !localHost(u.hostname)) return `${u.hostname} is not a loopback or private address (pass --allow-remote to send there anyway)`;
+  return null;
+}
+
 function parseArgs(argv) {
-  const a = { minIntervalMs: 0, timeoutMs: 10000, warmup: 0, gateEvery: 50, maxFailures: 5, backoffMs: 3000 };
+  const a = { minIntervalMs: 0, timeoutMs: 10000, warmup: 0, gateEvery: 50, maxFailures: 5, backoffMs: 3000, allowRemote: false };
   const names = { 'min-interval-ms': 'minIntervalMs', 'timeout-ms': 'timeoutMs', 'gate-every': 'gateEvery', 'max-failures': 'maxFailures', 'backoff-ms': 'backoffMs', 'api-key-file': 'apiKeyFile' };
   for (let i = 0; i < argv.length; i += 2) {
+    if (argv[i] === '--allow-remote') { a.allowRemote = true; i -= 1; continue; }
     const k = argv[i].replace(/^--/, '');
     const name = names[k] || k;
     a[name] = ['minIntervalMs', 'timeoutMs', 'warmup', 'gateEvery', 'maxFailures', 'backoffMs'].includes(name) ? Number(argv[i + 1]) : argv[i + 1];
@@ -35,6 +59,8 @@ function parseArgs(argv) {
     throw Error('usage: node run.cjs --requests FILE --out FILE --target laya|ollaya --url URL [--model NAME] ...');
   }
   a.url = String(a.url).replace(/\/+$/, '');
+  const problem = urlProblem(a.url, a.allowRemote);
+  if (problem) throw Error(`--url refused: ${problem}`);
   a.label ||= a.target === 'laya' ? 'laya-en (live)' : a.model;
   return a;
 }
@@ -127,4 +153,4 @@ if (require.main === module) {
   })().catch((e) => { console.error(e.message); process.exit(1); });
 }
 
-module.exports = { send, run, parseArgs, readJsonl, EXIT_PAUSED, EXIT_FAILING };
+module.exports = { send, run, parseArgs, urlProblem, readJsonl, EXIT_PAUSED, EXIT_FAILING };
