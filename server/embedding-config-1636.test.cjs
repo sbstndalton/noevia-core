@@ -9,7 +9,7 @@ const path = require('node:path');
 
 const { frame, profileNamed, DEFAULT_PROFILE } = require('./embedding-profile.cjs');
 const { createEmbeddingConfig, seedFromEnv, normalizeTarget } = require('./embedding-config.cjs');
-const { checkEmbeddingAddress, guardSeededAddresses } = require('./embedding-address.cjs');
+const { checkEmbeddingAddress, guardSeededAddresses, deniedAddress } = require('./embedding-address.cjs');
 const { createEmbeddingRoutes } = require('./routes/embedding.cjs');
 
 const SAMPLE = ['Plain text.', '  spaced  ', 'title: looks like a prefix | text: but is content', '', 'Zeilen\nUmbruch'];
@@ -117,7 +117,8 @@ const DNS = {
   'embed-next': ['10.0.0.7'], embed: ['10.0.0.6'],
   'public.example': ['93.184.216.34'], 'public.example.': ['93.184.216.34'],
   'mixed.example': ['10.0.0.8', '93.184.216.34'], 'mixed6.example': ['::1', '2606:2800:220:1:248:1893:25c8:1946'],
-  'xn--bcher-kva.example': ['93.184.216.34'], 'private.example.': ['192.168.1.20'],
+  'xn--bcher-kva.example': ['93.184.216.34'], 'xn--mnchen-3ya.example': ['10.0.0.9'], 'private.example.': ['192.168.1.20'],
+  'linklocal.example': ['169.254.169.254'], 'unspecified.example': ['0.0.0.0'], 'mapped.example': ['::ffff:8.8.8.8'],
 };
 const fakeLookup = async (host) => {
   if (!DNS[host]) throw Object.assign(Error(`getaddrinfo ENOTFOUND ${host}`), { code: 'ENOTFOUND' });
@@ -194,7 +195,10 @@ test('a public embeddings address is refused before anything is sent (local-firs
     { model: 'm', baseUrl: 'http://embed-next:8080/v1', diaryBaseUrl: 'https://public.example/v1' },
     // The old check asked "is it public" and let every one of these through:
     { model: 'm', baseUrl: 'http://public.example./v1' }, // trailing dot
-    { model: 'm', baseUrl: 'http://xn--bcher-kva.example/v1' }, // internationalised name
+    { model: 'm', baseUrl: 'http://xn--bcher-kva.example/v1' }, // internationalised name, public answer
+    { model: 'm', baseUrl: 'http://mapped.example/v1' }, // an IPv4-mapped public answer
+    { model: 'm', baseUrl: 'http://169.254.169.254/latest' }, // link-local (cloud metadata)
+    { model: 'm', baseUrl: 'http://0.0.0.0:8080/v1' },
     { model: 'm', baseUrl: 'http://no-such-host.example/v1' }, // does not resolve
     { model: 'm', baseUrl: 'http://mixed.example/v1' }, // one private and one public answer
     { model: 'm', baseUrl: 'http://embed-next:8080/v1', diaryBaseUrl: 'http://mixed6.example/v1' },
@@ -244,11 +248,15 @@ test('a name is accepted only when every answer is private, and the resolver get
   assert.equal((await checkEmbeddingAddress('http://public.example./v1', { lookup })).ok, false);
   assert.equal((await checkEmbeddingAddress('http://mixed.example/v1', { lookup })).ok, false);
   assert.equal((await checkEmbeddingAddress('http://mixed6.example/v1', { lookup })).ok, false);
-  assert.equal((await checkEmbeddingAddress('http://xn--bcher-kva.example/v1', { lookup })).ok, false);
+  // An internationalised name reaches the resolver in its xn-- form and is judged by its answers like any other.
+  assert.equal((await checkEmbeddingAddress('http://xn--bcher-kva.example/v1', { lookup })).ok, false, 'resolves to a public address');
+  assert.deepEqual(await checkEmbeddingAddress('http://münchen.example/v1', { lookup }), { ok: true }, 'resolves to a private address');
+  assert.equal(asked.at(-1)[0], 'xn--mnchen-3ya.example');
   assert.equal((await checkEmbeddingAddress('http://empty.example/v1', { lookup: async () => [] })).ok, false, 'no answer at all');
   assert.equal((await checkEmbeddingAddress('http://odd.example/v1', { lookup: async () => [{ address: 'not-an-address' }] })).ok, false);
   assert.equal((await checkEmbeddingAddress('http://slow.example/v1', { lookup: async () => { throw new Error('boom'); } })).ok, false);
   assert.deepEqual(asked.slice(0, 2), [['embed-next', true], ['private.example.', true]]);
+  for (const bad of ['linklocal.example', 'unspecified.example', 'mapped.example']) assert.equal((await checkEmbeddingAddress(`http://${bad}/v1`, { lookup })).ok, false, bad);
 });
 
 test('addresses the environment seeded are checked at start-up: refused ones are logged and not used, nothing is saved', async () => {
@@ -314,4 +322,117 @@ test('switching is only for the next that was checked', () => {
   assert.equal(c.next().model, 'other-model');
   c.switchToNext(c.next());
   assert.equal(c.active().model, 'other-model');
+});
+
+test('addresses that are not public but name no host on this network are refused: unspecified, link-local, multicast, reserved', async () => {
+  for (const bad of ['http://0.0.0.0:8080/v1', 'http://0.1.2.3/v1', 'http://169.254.169.254/latest', 'http://224.0.0.1/', 'http://239.255.255.250/', 'http://240.0.0.1/', 'http://255.255.255.255/',
+    'http://192.0.2.10/', 'http://203.0.113.5/', 'http://[::]/', 'http://[fe80::1]/', 'http://[febf::1]/', 'http://[ff02::1]/', 'http://[::ffff:0.0.0.0]/', 'http://[::ffff:169.254.1.1]/',
+    'http://[::ffff:8.8.8.8]/', 'http://[::8.8.8.8]/', 'http://[::10.0.0.1]/', 'http://[64:ff9b::a00:1]/', 'http://[2001:db8::1]/']) {
+    const r = await checkEmbeddingAddress(bad);
+    assert.equal(r.ok, false, bad);
+    assert.equal(r.transient, false, `${bad} is a permanent refusal`);
+  }
+  for (const ok of ['http://127.0.0.1/', 'http://127.255.0.1/', 'http://10.0.0.1/', 'http://172.16.0.1/', 'http://172.31.255.255/', 'http://192.168.255.255/', 'http://100.64.1.1/', 'http://[::1]/', 'http://[fd00::5]/', 'http://[::ffff:127.0.0.1]/', 'http://[::ffff:10.1.2.3]/']) {
+    assert.deepEqual(await checkEmbeddingAddress(ok), { ok: true }, ok);
+  }
+  // The deny list on its own (no policy module involved).
+  assert.equal(deniedAddress('127.0.0.1'), null);
+  assert.equal(deniedAddress('::1'), null);
+  assert.equal(deniedAddress('fd12:3456::1'), null);
+  assert.match(deniedAddress('0.0.0.0'), /unspecified/);
+  assert.match(deniedAddress('::ffff:0.0.0.0'), /unspecified/);
+  assert.match(deniedAddress('fe80::abcd%eth0'), /link-local/);
+  assert.match(deniedAddress('239.1.1.1'), /multicast/);
+  assert.match(deniedAddress('ff00::1'), /multicast/);
+  assert.match(deniedAddress('::'), /unspecified/);
+});
+
+test('a trap in the address policy refuses; it does not call the address private', async () => {
+  const r = await checkEmbeddingAddress('http://10.0.0.1/v1', { addressesPublic: () => { throw new Error('wasm trap'); } });
+  assert.equal(r.ok, false);
+  assert.equal(r.transient, false);
+  assert.match(r.reason, /could not decide/);
+  assert.deepEqual(await checkEmbeddingAddress('http://10.0.0.1/v1', { addressesPublic: () => false }), { ok: true });
+});
+
+test('an unresolvable name is not the same as a public one: only a public answer is a permanent refusal', async () => {
+  const down = async () => { throw Object.assign(new Error('getaddrinfo EAI_AGAIN embed'), { code: 'EAI_AGAIN' }); };
+  const r = await checkEmbeddingAddress('http://embed:8080/v1', { lookup: down });
+  assert.deepEqual([r.ok, r.transient], [false, true]);
+  assert.equal((await checkEmbeddingAddress('http://embed:8080/v1', { lookup: async () => [] })).transient, true);
+  assert.equal((await checkEmbeddingAddress('http://public.example/v1', { lookup: fakeLookup })).transient, false);
+  assert.equal((await checkEmbeddingAddress('http://mixed.example/v1', { lookup: fakeLookup })).transient, false);
+  assert.equal((await checkEmbeddingAddress('nonsense')).transient, false);
+});
+
+function startupGuard({ env = { EMBEDDING_MODEL: 'nomic-embed-text-v1', EMBEDDING_BASE_URL: 'http://embed:8080/v1' }, failures = 0 } = {}) {
+  const logs = [], slept = [], scheduled = [];
+  const dns = { failing: failures, answers: { embed: ['10.0.0.6'], 'embed-next': ['10.0.0.7'] } };
+  const lookup = async (host) => {
+    if (dns.failing > 0 || !dns.answers[host]) { dns.failing -= 1; throw Object.assign(new Error(`getaddrinfo EAI_AGAIN ${host}`), { code: 'EAI_AGAIN' }); }
+    return dns.answers[host].map((address) => ({ address }));
+  };
+  const config = createEmbeddingConfig({ env, log: () => {} });
+  const options = { log: (line) => logs.push(line), check: (url) => checkEmbeddingAddress(url, { lookup }),
+    sleep: async (ms) => { slept.push(ms); }, schedule: (fn, ms) => scheduled.push({ fn, ms }) };
+  return { config, dns, logs, slept, scheduled, run: () => guardSeededAddresses(config, options) };
+}
+
+test('a resolver that is not up yet at start-up is retried; the seeded address is used once it answers', async () => {
+  const g = startupGuard({ failures: 2 });
+  await g.run();
+  assert.deepEqual(g.slept, [1000, 2000], 'backed off, then the third lookup answered');
+  assert.equal(g.config.active().profile, 'nomic-v1');
+  assert.equal(g.config.active().baseUrl, 'http://embed:8080/v1');
+  assert.equal(g.config.damaged, undefined);
+  assert.deepEqual(g.scheduled, []);
+  assert.deepEqual(g.logs, []);
+});
+
+test('a name that stays unresolvable for ~30 s is held back, re-checked, and used again when it resolves', async () => {
+  const g = startupGuard({ failures: 1000, env: { EMBEDDING_MODEL: 'nomic-embed-text-v1', EMBEDDING_BASE_URL: 'http://embed:8080/v1',
+    EMBEDDING_NEXT_MODEL: 'embeddinggemma-2', EMBEDDING_NEXT_PROFILE: 'embeddinggemma-2', EMBEDDING_NEXT_BASE_URL: 'http://embed-next:8080/v1' } });
+  await g.run();
+  assert.equal(g.slept.reduce((a, b) => a + b, 0), 2 * 30000, 'about half a minute of back-off for each of the two addresses before they are held back');
+  assert.equal(g.config.active().profile, 'unavailable', 'held back, not trusted unchecked');
+  assert.equal(g.config.next(), null);
+  assert.match(g.config.damaged, /not used yet/);
+  assert.equal(g.scheduled.length, 2);
+  assert.ok(g.scheduled.every((s) => s.ms === 60000));
+  assert.throws(() => g.config.setNext({ model: 'm' }), (e) => e.code === 'badState');
+  // The network comes up: the next round of checks gives the seeded values back.
+  g.dns.failing = 0;
+  await Promise.all(g.scheduled.splice(0).map((s) => s.fn()));
+  assert.equal(g.config.active().profile, 'nomic-v1');
+  assert.equal(g.config.next().baseUrl, 'http://embed-next:8080/v1');
+  assert.equal(g.config.damaged, undefined);
+  assert.deepEqual(g.scheduled, [], 'no further rounds once both are back');
+  assert.equal(g.config.get().source, 'environment', 'nothing was saved on the way');
+  assert.match(g.logs.join('\n'), /resolves to this network now; in use/);
+  g.config.setNext({ model: 'other', profile: 'nomic-v1' }); // changes work again
+});
+
+test('a name that later resolves to a public address is a permanent refusal', async () => {
+  const g = startupGuard({ failures: 1000 });
+  await g.run();
+  assert.equal(g.config.active().profile, 'unavailable');
+  g.dns.failing = 0;
+  g.dns.answers.embed = ['93.184.216.34'];
+  await g.scheduled.splice(0)[0].fn();
+  assert.equal(g.config.active().profile, 'unavailable');
+  assert.match(g.config.damaged, /refused: embed is not on this network/);
+  assert.deepEqual(g.scheduled, [], 'not re-checked again');
+  g.config.releaseSeeded('active');
+  assert.equal(g.config.active().profile, 'unavailable', 'a permanent refusal cannot be released');
+});
+
+test('an administrator choosing a next model while the seeded one is held back keeps their choice', async () => {
+  const g = startupGuard({ failures: 1000, env: { EMBEDDING_MODEL: 'nomic-embed-text-v1', EMBEDDING_NEXT_MODEL: 'embeddinggemma-2',
+    EMBEDDING_NEXT_PROFILE: 'embeddinggemma-2', EMBEDDING_NEXT_BASE_URL: 'http://embed-next:8080/v1' } });
+  await g.run();
+  assert.equal(g.config.next(), null);
+  g.config.setNext({ model: 'chosen', profile: 'nomic-v1', baseUrl: 'http://127.0.0.1:9000/v1' });
+  g.dns.failing = 0;
+  await g.scheduled.splice(0)[0].fn();
+  assert.equal(g.config.next().model, 'chosen');
 });

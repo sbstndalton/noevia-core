@@ -102,6 +102,7 @@ function createEmbeddingConfig({ env = process.env, stateFile = null, fallbackMo
   const saved = readState(stateFile);
   let state = saved || seedFromEnv(env, fallbackModel, log);
   let locked = null; // set by refuseSeeded: changes are refused until the operator fixes the environment
+  const held = {}; // 'active' | 'next' -> { reason, transient, target }: seeded values refused at start-up
   const source = saved ? 'saved' : 'environment';
   let version = 0;
   let savedChange = false; // a change was written to stateFile (a refusal at startup is not)
@@ -122,6 +123,11 @@ function createEmbeddingConfig({ env = process.env, stateFile = null, fallbackMo
     try { persist(); } catch (err) { state = before; throw err; }
     version += 1;
     savedChange = true;
+    for (const fn of listeners) { try { fn(get()); } catch { /* a listener never blocks a change */ } }
+    return get();
+  }
+  function bump() {
+    version += 1;
     for (const fn of listeners) { try { fn(get()); } catch { /* a listener never blocks a change */ } }
     return get();
   }
@@ -163,17 +169,35 @@ function createEmbeddingConfig({ env = process.env, stateFile = null, fallbackMo
     },
     /**
      * Startup guard (embedding-address.cjs): an address the environment seeded is not on this
-     * network. In memory only, nothing is saved. A refused next is dropped; a refused active turns
-     * embedding off (unknown profile: every embed call refuses) and locks changes, like a damaged
-     * saved file, because falling back to the inference engine would send it the same text.
+     * network. `reasons` is { active?, next? }, each a text. In memory only, nothing is saved. A
+     * refused next is dropped; a refused active turns embedding off (unknown profile: every embed
+     * call refuses) and locks changes, like a damaged saved file, because falling back to the
+     * inference engine would send it the same text. `transient` (the name did not resolve yet) can
+     * be undone by releaseSeeded; anything else stays until the process restarts.
      */
-    refuseSeeded({ active = null, next = null } = {}) {
-      if (saved || version !== 0) return get();
-      if (next) state = { ...state, next: null };
-      if (active) { state = { ...state, active: { ...state.active, profile: 'unavailable' } }; locked = active; api.damaged = active; }
-      version += 1;
-      for (const fn of listeners) { try { fn(get()); } catch { /* a listener never blocks a change */ } }
-      return get();
+    refuseSeeded(reasons = {}, { transient = false } = {}) {
+      if (saved || savedChange) return get();
+      for (const which of ['active', 'next']) {
+        const reason = reasons?.[which];
+        if (!reason) continue;
+        if (held[which]) held[which] = { ...held[which], reason, transient };
+        else {
+          held[which] = { reason, transient, target: state[which] };
+          if (which === 'next') state = { ...state, next: null };
+          else state = { ...state, active: { ...state.active, profile: 'unavailable' } };
+        }
+        if (which === 'active') { locked = reason; api.damaged = reason; }
+      }
+      return bump();
+    },
+    /** Takes back a transient refusal once the address resolves to this network. */
+    releaseSeeded(which) {
+      const h = held[which];
+      if (!h || !h.transient || saved || savedChange) return get();
+      delete held[which];
+      if (which === 'next') { if (!state.next) state = { ...state, next: h.target }; } // not over an administrator's own choice
+      else { state = { ...state, active: h.target }; locked = null; delete api.damaged; }
+      return bump();
     },
   };
   return api;

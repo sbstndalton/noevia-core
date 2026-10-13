@@ -49,14 +49,14 @@ const USER_B = '22222222-2222-4222-8222-222222222222';
 
 function freshRag() { delete require.cache[require.resolve('./rag.cjs')]; return require('./rag.cjs'); }
 
-async function setup({ active, next = null, users = [USER_A], removed = [], refuse = null, baseUrl = null, batch = null, onPause = null } = {}) {
+async function setup({ active, next = null, users = [USER_A], removed = [], refuse = null, baseUrl = null, engineUrl = 'http://engine.invalid', batch = null, onPause = null } = {}) {
   const server = await startServer({ refuse });
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rag-1636-'));
-  const env = { EMBEDDING_BASE_URL: baseUrl || server.url, EMBEDDING_MODEL: active?.model || 'nomic-test', EMBEDDING_PROFILE: active?.profile || '' };
+  const env = { ...(baseUrl === '' ? {} : { EMBEDDING_BASE_URL: baseUrl || server.url }), EMBEDDING_MODEL: active?.model || 'nomic-test', EMBEDDING_PROFILE: active?.profile || '' };
   if (next) Object.assign(env, { EMBEDDING_NEXT_MODEL: next.model, EMBEDDING_NEXT_PROFILE: next.profile, EMBEDDING_NEXT_BASE_URL: server.url });
   const config = createEmbeddingConfig({ env, stateFile: path.join(dir, 'embedding-config.json') });
   const rag = freshRag();
-  rag.init({ dataDir: dir, inferenceUrl: 'http://engine.invalid', embeddingConfig: config,
+  rag.init({ dataDir: dir, inferenceUrl: engineUrl, embeddingConfig: config,
     userDataDirFn: (id) => path.join(dir, 'users', id), listUserIds: () => users, userActive: (id) => !removed.includes(id) });
   const pauses = [];
   const migration = createEmbeddingMigration({ config, rag, env: { EMBEDDING_REINDEX_DUTY: '0.5', EMBEDDING_REINDEX_MIN_PAUSE_MS: '0', ...(batch ? { EMBEDDING_REINDEX_BATCH: String(batch) } : {}) },
@@ -254,10 +254,27 @@ dbTest('an embeddings server that redirects gets the text no further: the reques
     assert.deepEqual(sink.seen, [], 'the second server saw nothing');
     // The health probe of the active sidecar follows the same rule.
     assert.equal(await s.rag.retrievalStatus(), 'degraded');
+    assert.equal(hops.length, 2, 'the sidecar probe asked once and was not followed');
     assert.deepEqual(sink.seen, []);
-    // So does the router probe (no dedicated address).
-    await assert.rejects(s.rag.embed(['text'], { target: { baseUrl: null, model: 'm', profile: 'nomic-v1' } }), 'the engine (unreachable here) is not followed anywhere either');
-  } finally { s.done(); redirector.close(); sink.close(); }
+  } finally { s.done(); redirector.close(); }
+  // The engine path (no dedicated address) is the same: embeddings and the router probe (GET /v1/models).
+  const engineHops = [];
+  const engine = http.createServer((req, res) => {
+    engineHops.push(`${req.method} ${req.url}`);
+    res.statusCode = 308;
+    res.setHeader('Location', `${sink.url.replace(/\/v1$/, '')}${req.url}`);
+    res.end();
+  });
+  await new Promise((resolve) => engine.listen(0, '127.0.0.1', resolve));
+  const viaEngine = await setup({ baseUrl: '', engineUrl: `http://127.0.0.1:${engine.address().port}` });
+  try {
+    assert.equal(viaEngine.config.active().baseUrl, null, 'no dedicated server: the engine');
+    assert.equal(await viaEngine.rag.retrievalStatus(), 'degraded');
+    assert.deepEqual(engineHops, ['GET /v1/models'], 'probeEmbeddingRouter asked once and was not followed');
+    await assert.rejects(viaEngine.rag.embed(['text'], { target: viaEngine.config.active() }));
+    assert.deepEqual(engineHops, ['GET /v1/models', 'POST /v1/embeddings']);
+    assert.deepEqual(sink.seen, [], 'nothing reached the other address');
+  } finally { viaEngine.done(); engine.close(); sink.close(); }
 });
 
 dbTest('the fill is paced: busy at most the duty share of the wall time (fake clock)', async () => {
