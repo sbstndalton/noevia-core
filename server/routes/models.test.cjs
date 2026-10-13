@@ -5,7 +5,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
-const { createModelRoutes, routingDefaultRustOwned } = require('./models.cjs');
+const { createModelRoutes, routingDefaultRustOwned, statsRustOwned } = require('./models.cjs');
 const { createModelService } = require('../models.cjs');
 
 // A workspace-shaped test double (autoRoles + saveAutoRoles), for tests that pass
@@ -961,6 +961,51 @@ test('#1461 /api/stats is shared for a moment, and a model or role write drops t
   await f.call('PUT', '/api/auto-roles', { fast: 'm', smart: 'm' }, 'admin');
   await f.call('GET', '/api/stats');
   assert.equal(statsCalls, 2, 'a role save makes the next stats read fresh');
+});
+
+test('#1650: a confirmed Rust front owns GET /api/stats, so Node refuses it before any engine read; other methods stay Node\'s', async () => {
+  const reads = [];
+  const count = (name, value) => async () => { reads.push(name); return value; };
+  const manager = {
+    stats: count('stats', { ok: true, body: { scope: 'engine', tokens_per_second: 9, mtp: [] } }),
+    systemStats: count('systemStats', { ok: true, body: { cpu_percent: 1 } }),
+    health: count('health', { ok: true, body: { all_models_loaded: [] } }),
+    metrics: count('metrics', { ok: false }),
+    listModels: count('listModels', { ok: true, body: { data: [] } }),
+  };
+  const owned = { NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_AUTH_CONFIRMED: '1', NOEVIA_RUST_STATS: '1', NOEVIA_RUST_STATS_CONFIRMED: '1' };
+  const confirmed = fixture({ env: owned, manager });
+  for (const role of ['member', 'admin']) {
+    await confirmed.call('GET', '/api/stats', undefined, role);
+    assert.deepEqual(confirmed.sent.pop(), { status: 503, body: { error: 'Engine statistics are owned by the Rust front.' } });
+  }
+  assert.deepEqual(reads, [], 'the refused GET reads nothing from the engine');
+  for (const method of ['POST', 'HEAD']) {
+    await confirmed.call(method, '/api/stats');
+    const sent = confirmed.sent.pop();
+    assert.equal(sent.status, 200, `${method} keeps answering in Node`);
+    assert.equal(sent.body.up, true);
+  }
+  // The routing default is a separate switch.
+  await confirmed.call('GET', '/api/routing-default');
+  assert.equal(confirmed.sent.pop().status, 200);
+  for (const env of [
+    { ...owned, NOEVIA_RUST_STATS_CONFIRMED: '0' },
+    { ...owned, NOEVIA_RUST_STATS_CONFIRMED: 'true' },
+    { ...owned, NOEVIA_RUST_STATS: '0' },
+    { ...owned, NOEVIA_RUST_AUTH_CONFIRMED: undefined },
+    { ...owned, NOEVIA_RUST_AUTH: '0' },
+    { ...owned, NOEVIA_FRONT: 'node' },
+    { NOEVIA_RUST_ROUTING_DEFAULT: '1', NOEVIA_RUST_ROUTING_DEFAULT_CONFIRMED: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_AUTH_CONFIRMED: '1' },
+  ]) {
+    const f = fixture({ env, manager });
+    await f.call('GET', '/api/stats');
+    const sent = f.sent.pop();
+    assert.equal(sent.status, 200, JSON.stringify(env));
+    assert.equal(sent.body.tokensPerSecond, 9);
+  }
+  assert.equal(statsRustOwned(owned), true);
+  assert.equal(statsRustOwned({}), false);
 });
 
 test('#1461 /api/stats keeps the tenant-scoped tokens figure per request, not inside the shared read', async () => {
