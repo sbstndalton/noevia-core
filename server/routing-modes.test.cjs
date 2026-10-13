@@ -227,9 +227,10 @@ test('resolveRoute: each mode, force-local, hard bans, remembered and the answer
 // ── handleChat end to end ────────────────────────────────────────────────────
 const LOCAL = 'http://local.invalid', CLOUD = 'http://cloud.invalid';
 const sse = (...frames) => ({ ok: true, status: 200, body: (async function* () { for (const f of frames) yield Buffer.from(`data: ${JSON.stringify(f)}\n\n`); })() });
+const fnTool = (name) => ({ type: 'function', function: { name, description: 'Synthetic tool', parameters: { type: 'object', properties: {} } } });
 const PROVIDERS = { default: { id: 'default', baseUrl: LOCAL }, 'cloud-x': { id: 'cloud-x', baseUrl: CLOUD, label: 'Synthetic cloud', shared: true } };
 
-async function run(t, { freeChatId = null, ragOverride = null, flag, settings = null, chat = {}, project: projectOver = {}, message = 'Tell me about synthetic widgets', history = [], verdict = 'clear', answer = null, approvals = null, userId = 'synthetic-user', withRouting = true, toolResult = null, brainContext = null, localRoles = { fast: 'local-fast', smart: 'local-smart' }, sensitivity = null }) {
+async function run(t, { freeChatId = null, ragOverride = null, flag, settings = null, chat = {}, project: projectOver = {}, message = 'Tell me about synthetic widgets', history = [], verdict = 'clear', answer = null, approvals = null, userId = 'synthetic-user', withRouting = true, toolResult = null, brainContext = null, localRoles = { fast: 'local-fast', smart: 'local-smart' }, sensitivity = null, toolBoxes = null, toolName = 'synthetic_read', historyCap = 20, turnToolboxes = undefined, offerAll = false }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-routing-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const events = [], calls = [], logs = [], flagsSet = [], errors = [];
   const res = new EventEmitter();
@@ -249,7 +250,7 @@ async function run(t, { freeChatId = null, ragOverride = null, flag, settings = 
     calls.push({ url: String(url), body: JSON.parse(init.body) });
     // With a tool result fixture, the first round asks for the synthetic read tool.
     if (toolResult !== null && calls.filter((c) => c.url).length === 1) {
-      return sse({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'call-1', type: 'function', function: { name: 'synthetic_read', arguments: '{}' } }] } }] }, { choices: [{ delta: {}, finish_reason: 'tool_calls' }] });
+      return sse({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'call-1', type: 'function', function: { name: toolName, arguments: '{}' } }] } }] }, { choices: [{ delta: {}, finish_reason: 'tool_calls' }] });
     }
     return sse({ choices: [{ delta: { content: 'ok' } }] });
   };
@@ -261,7 +262,7 @@ async function run(t, { freeChatId = null, ragOverride = null, flag, settings = 
   const { handleChat } = require('./chat.cjs').createChatHandler({
     modelManager: { enabled: true, health: async () => ({ ok: true, body: { all_models_loaded: ['local-fast', 'local-smart'].map((n) => ({ model_name: n, loaded: true, recipe_options: { ctx_size: 32768 } })) } }) },
     reasoningEffort: require('./reasoning-effort.cjs'), authService: { audit() {}, diaryEnabled: () => false },
-    crypto: require('node:crypto'), path, fs, fetch, HISTORY_CAP: 20, DEFAULT_PROVIDER_ID: 'default', createToolExchange: require('./tool-exchange.cjs').createToolExchange,
+    crypto: require('node:crypto'), path, fs, fetch, HISTORY_CAP: historyCap, DEFAULT_PROVIDER_ID: 'default', createToolExchange: require('./tool-exchange.cjs').createToolExchange,
     currentWorkspace: () => ({ userId, dir, assetDir: () => dir }),
     getProject: (id) => (id === project.id ? project : null),
     skillsIndexFor: () => [], getProvider: (id) => PROVIDERS[id] || PROVIDERS.default, providerHeaders: () => ({}), autoRoles: () => localRoles,
@@ -270,11 +271,14 @@ async function run(t, { freeChatId = null, ragOverride = null, flag, settings = 
     chatToolRouter: { select: async (ids) => ({ ids, routed: false }) }, DEFAULT_TOOLBOXES: [], CONNECTOR_BOXES: new Set(), connectedBoxes: () => [],
     toolPolicy: { mode: () => 'allow' },
     requestScope: { getStore: () => ({ authn: { user: { id: userId, role: 'member' } }, workspace: { userId } }) },
-    resolveTools: () => ({ tools: toolResult === null ? [] : [{ type: 'function', function: { name: 'synthetic_read', description: 'Synthetic read', parameters: { type: 'object', properties: {} } } }], dropped: [] }), isWriteTool: () => false,
+    // #1646: with `toolBoxes` ({ id, tools: [name] }) the fixture offers the named boxes' tools, minus what `skip` refuses.
+    resolveTools: (selection, _model, skip = () => false) => ({ dropped: [], boxes: [], routes: new Map(), tools: toolBoxes
+      ? toolBoxes.filter((b) => offerAll || (selection?.toolboxes || []).includes(b.id)).flatMap((b) => b.tools).filter((n) => offerAll || !skip(n)).map(fnTool)
+      : toolResult === null ? [] : [fnTool('synthetic_read')] }), isWriteTool: () => false,
     rag: ragOverride || { filesContext: async () => null }, prefill: { recordSample() {} }, reduceToolResult: (r) => ({ text: String(r) }), diaryExtras: require('./diary-extras.cjs'),
     DIARY_BASE: 'http://diary.invalid', TOOL_RESULT_CAP: 8000, json: (r, status, body) => { errors.push({ status, body }); r.end(); }, saveChats() {}, endpointApproved: () => true, diaryHeaders: () => ({}),
     lastLoadedModel: () => null, classifyFastOrSmart: async () => 'smart', servedCatalogue: async () => [], modelsInstalled: async () => [], missingRoles: () => [], staleRolesError: () => null,
-    allToolboxes: () => [], chatWideApproved: () => false, awaitApproval: async () => 'deny', recordUsage() {}, recordToolUse() {},
+    allToolboxes: () => (toolBoxes || []).map((b) => ({ id: b.id, label: b.id, tools: b.tools.map(fnTool) })), chatWideApproved: () => false, awaitApproval: async () => 'deny', recordUsage() {}, recordToolUse() {},
     executeToolCall: async () => (toolResult === null ? 'SYNTHETIC' : toolResult), freeChats: () => [],
     ...(brainContext ? { chatFramingEnabled: () => true, brainContext } : {}),
     ...(withRouting ? { routingModes: {
@@ -292,7 +296,7 @@ async function run(t, { freeChatId = null, ragOverride = null, flag, settings = 
   const consoleLines = [];
   console.log = (...a) => consoleLines.push(a.join(' ')); console.warn = (...a) => consoleLines.push(a.join(' ')); console.info = (...a) => consoleLines.push(a.join(' '));
   try {
-    await handleChat({}, res, freeChatId ? { spaceId: 'free', chatId: freeChatId, message, history } : { projectId: 'fixture-project', chatId: 'fixture-chat', message, history });
+    await handleChat({}, res, freeChatId ? { spaceId: 'free', chatId: freeChatId, message, history } : { projectId: 'fixture-project', chatId: 'fixture-chat', message, history, ...(turnToolboxes ? { turnToolboxes } : {}) });
   } finally { console.log = origLog; console.warn = origWarn; console.info = origInfo; }
   const upstream = calls.filter((c) => c.url);
   const meta = events.find((e) => e.type === 'meta');
@@ -382,6 +386,126 @@ test('a sensitive tool result on a cloud route never reaches the cloud model', a
   const local = await run(t, { flag: true, settings: { ...HYBRID, mode: 'local' }, toolResult: `Account on file: ${SYN_IBAN}` });
   assert.equal(local.upstream.length, 2); assert.ok(local.upstream[1].url.startsWith(LOCAL));
   assert.equal(local.events.some((e) => e.type === 'paused'), false);
+});
+
+// ── #1646: tool results that read the person's own data ──────────────────────
+// The router role reads the conversation, not what a tool fetches later, and a tool result is screened by
+// the regex pre-rule alone. The marker below is invisible to that rule, as a medical letter without a
+// diagnosis-plus-condition phrase would be. On a hybrid cloud route with no allowCloud grant no box that
+// reads private data is offered; a turn that carries one goes local.
+const LETTER = `Letter from the clinic: ${'ZEBRA-PRIVATE-MARKER-4471'} follow-up scheduled.`;
+const FILES_BOX = [{ id: 'nextcloud-files', tools: ['files_read_synthetic'] }];
+const PRIVATE_ROUTING = { route: 'local', reason: 'sensitive-rule', detail: 'private-tools' };
+const reachedCloud = (r, text) => r.upstream.some((u) => u.url.startsWith(CLOUD) && JSON.stringify(u.body).includes(text));
+function assertPrivateToolsStayLocal(r, label, { marker = 'ZEBRA-PRIVATE-MARKER-4471' } = {}) {
+  assert.equal(r.upstream.some((u) => u.url.startsWith(CLOUD)), false, `${label}: nothing reached the cloud URL`);
+  assert.equal(reachedCloud(r, marker), false, `${label}: the marker never reached the cloud`);
+  assert.ok(r.upstream.length >= 1 && r.upstream.every((u) => u.url.startsWith(LOCAL)), `${label}: the turn ended local`);
+  assert.deepEqual(r.meta.routing, PRIVATE_ROUTING, `${label}: the routing detail says why`);
+  assert.equal(r.events.some((e) => e.type === 'route_pending'), false, `${label}: no card, nothing was flagged`);
+  assert.ok(r.events.some((e) => e.type === 'done'), label);
+}
+
+test('#1646: a cleared hybrid turn whose project reads private data (storage, Nextcloud, Drive, project sources) ends local', async (t) => {
+  for (const id of ['nextcloud-files', 'nextcloud-notes', 'project-docs', 'gdrive', 'some-future-connector']) {
+    const r = await run(t, { flag: true, settings: HYBRID, verdict: 'clear', message: 'Summarize my latest letter.', project: { toolboxes: [id] },
+      toolBoxes: [{ id, tools: ['private_read'] }], toolName: 'private_read', toolResult: LETTER });
+    assertPrivateToolsStayLocal(r, id);
+    assert.equal(r.upstream.length, 2, `${id}: the local model got the tool result and answered`);
+    assert.ok(r.upstream[0].body.tools.some((x) => x.function.name === 'private_read'), `${id}: the local model is offered the box`);
+  }
+});
+
+test('#1646: a box a turn picks, or one Automatic would add for the message, sends the turn local', async (t) => {
+  const picked = await run(t, { flag: true, settings: HYBRID, message: 'Summarize my latest letter.', toolBoxes: FILES_BOX, project: { toolboxes: ['core'] },
+    turnToolboxes: ['nextcloud-files'], toolName: 'files_read_synthetic', toolResult: LETTER });
+  assertPrivateToolsStayLocal(picked, 'turn pick');
+  const auto = await run(t, { flag: true, settings: HYBRID, message: 'List my Nextcloud files.', toolBoxes: FILES_BOX, project: { toolsMode: 'auto', toolboxes: ['core'] },
+    toolName: 'files_read_synthetic', toolResult: LETTER });
+  assertPrivateToolsStayLocal(auto, 'automatic tools');
+  // Automatic adds nothing for a message that names no private data: that turn stays on the cloud.
+  const plain = await run(t, { flag: true, settings: HYBRID, message: 'Tell me about synthetic widgets', toolBoxes: FILES_BOX, project: { toolsMode: 'auto', toolboxes: ['core'] } });
+  assert.deepEqual(plain.meta.routing, { route: 'cloud', reason: 'mode' });
+  assert.ok(plain.upstream[0].url.startsWith(CLOUD));
+});
+
+test('#1646: the check unavailable (503, timeout, low confidence) keeps a private-data turn local too', async (t) => {
+  const failing = [
+    ['503', rm.createSensitivity({ decide: async () => { throw Object.assign(Error('decision service unavailable'), { status: 503 }); } })],
+    ['timeout', rm.createSensitivity({ decide: () => new Promise(() => {}), deadlineMs: () => 100 })],
+    ['low confidence', rm.createSensitivity({ decide: async () => ({ selected: 'not_sensitive', scores: { sensitive: 0.4, not_sensitive: 0.6 }, confidence: 0.5, source: 'model' }) })],
+  ];
+  for (const [label, sensitivity] of failing) {
+    const r = await run(t, { flag: true, settings: HYBRID, message: 'Summarize my latest letter.', project: { toolboxes: ['nextcloud-files'] }, toolBoxes: FILES_BOX,
+      toolName: 'files_read_synthetic', toolResult: LETTER, sensitivity });
+    assert.equal(r.upstream.some((u) => u.url.startsWith(CLOUD)), false, `${label}: nothing reached the cloud`);
+    assert.equal(reachedCloud(r, 'ZEBRA-PRIVATE-MARKER-4471'), false, label);
+    assert.ok(r.upstream.length >= 1 && r.upstream.every((u) => u.url.startsWith(LOCAL)), `${label}: answered locally`);
+    assert.equal(r.meta.routing.route, 'local', label);
+    assert.equal(r.meta.routing.reason, 'check-unavailable', label);
+    assert.equal(r.events.some((e) => e.type === 'route_pending'), false, label);
+  }
+});
+
+test('#1646: web search results are not private data: a cloud route offers the box and sends the result on', async (t) => {
+  const r = await run(t, { flag: true, settings: HYBRID, message: 'Search the web for synthetic widgets.', project: { toolboxes: ['core', 'web-search'] },
+    toolBoxes: [{ id: 'web-search', tools: ['tavily_search'] }], toolName: 'tavily_search', toolResult: 'Public headline: synthetic widgets are in season.' });
+  assert.deepEqual(r.meta.routing, { route: 'cloud', reason: 'mode' });
+  assert.equal(r.upstream.length, 2);
+  assert.ok(r.upstream.every((u) => u.url.startsWith(CLOUD)));
+  assert.ok(r.upstream[0].body.tools.some((x) => x.function.name === 'tavily_search'));
+  assert.match(JSON.stringify(r.upstream[1].body), /synthetic widgets are in season/);
+  assert.equal(r.events.some((e) => e.type === 'paused'), false);
+});
+
+test('#1646: an explicit allowCloud chat is unchanged: the private box is offered to the cloud model', async (t) => {
+  const r = await run(t, { flag: true, settings: HYBRID, message: 'Summarize my latest letter.', chat: { allowCloud: true }, project: { toolboxes: ['nextcloud-files'] },
+    toolBoxes: FILES_BOX, toolName: 'files_read_synthetic', toolResult: LETTER });
+  assert.deepEqual(r.meta.routing, { route: 'cloud', reason: 'mode' });
+  assert.equal(r.upstream.length, 2);
+  assert.ok(r.upstream.every((u) => u.url.startsWith(CLOUD)));
+  assert.ok(r.upstream[0].body.tools.some((x) => x.function.name === 'files_read_synthetic'));
+  assert.ok(reachedCloud(r, 'ZEBRA-PRIVATE-MARKER-4471'), 'the grant is the owner\'s: the result goes on');
+  // A pre-rule hit is still held, as before.
+  const held = await run(t, { flag: true, settings: HYBRID, message: 'Summarize my latest letter.', chat: { allowCloud: true }, project: { toolboxes: ['nextcloud-files'] },
+    toolBoxes: FILES_BOX, toolName: 'files_read_synthetic', toolResult: `Account on file: ${SYN_IBAN}` });
+  assert.equal(held.events.find((e) => e.type === 'paused')?.reason, 'sensitive-tool-result');
+  assert.equal(JSON.stringify(held.upstream).includes(SYN_IBAN), false);
+});
+
+test('#1646: a mode other than hybrid is unchanged (cloud mode keeps its boxes; local mode is local anyway)', async (t) => {
+  const r = await run(t, { flag: true, settings: { ...HYBRID, mode: 'cloud' }, message: 'Summarize my latest letter.', project: { toolboxes: ['nextcloud-files'] },
+    toolBoxes: FILES_BOX, toolName: 'files_read_synthetic', toolResult: LETTER });
+  assert.deepEqual(r.meta.routing, { route: 'cloud', reason: 'mode' });
+  assert.ok(r.upstream[0].body.tools.some((x) => x.function.name === 'files_read_synthetic'));
+});
+
+test('#1646: with no local model to move to, the cloud route keeps going without any private-data box, and the model is told', async (t) => {
+  const r = await run(t, { flag: true, settings: HYBRID, message: 'Summarize my latest letter.', localRoles: {}, project: { toolboxes: ['core', 'web-search', 'nextcloud-files'] },
+    toolBoxes: [...FILES_BOX, { id: 'web-search', tools: ['tavily_search'] }], toolName: 'files_read_synthetic', toolResult: LETTER });
+  assert.ok(r.upstream.length >= 1 && r.upstream.every((u) => u.url.startsWith(CLOUD)));
+  for (const u of r.upstream) assert.equal(JSON.stringify(u.body.tools || []).includes('files_read_synthetic'), false, 'the private tool is not offered');
+  assert.ok(r.upstream[0].body.tools.some((x) => x.function.name === 'tavily_search'), 'the public box still is');
+  assert.equal(reachedCloud(r, 'ZEBRA-PRIVATE-MARKER-4471'), false, 'a model that asks for the stripped tool anyway gets a refusal, not the file');
+  assert.match(JSON.stringify(r.upstream[0].body.messages), /not available in this reply/);
+  assert.match(JSON.stringify(r.upstream[1].body.messages), /not enabled for this project/);
+  // The backstop: even if a tool list were wrongly built with the private tool in it, the call is refused before it runs.
+  const wrong = await run(t, { flag: true, settings: HYBRID, message: 'Summarize my latest letter.', localRoles: {}, project: { toolboxes: ['core'] },
+    toolBoxes: FILES_BOX, offerAll: true, toolName: 'files_read_synthetic', toolResult: LETTER });
+  assert.ok(wrong.upstream[0].body.tools.some((x) => x.function.name === 'files_read_synthetic'), 'the fixture offered it');
+  assert.equal(reachedCloud(wrong, 'ZEBRA-PRIVATE-MARKER-4471'), false);
+  assert.match(JSON.stringify(wrong.upstream[1].body.messages), /reads private data and is not available/);
+});
+
+test('#1646: the project-file reader is taken out of a cloud route and stays on a local one', async (t) => {
+  const core = [{ id: 'core', tools: ['get_current_time', 'read_project_file'] }];
+  const cloud = await run(t, { flag: true, settings: HYBRID, message: 'Tell me about synthetic widgets', project: { toolboxes: ['core'], files: [{ name: 'notes.md', content: 'synthetic' }] }, toolBoxes: core });
+  assert.deepEqual(cloud.meta.routing, { route: 'cloud', reason: 'mode' });
+  assert.deepEqual(cloud.upstream[0].body.tools.map((x) => x.function.name), ['get_current_time']);
+  assert.match(JSON.stringify(cloud.upstream[0].body.messages), /not available in this reply/);
+  const local = await run(t, { flag: true, settings: { ...HYBRID, mode: 'local' }, message: 'Tell me about synthetic widgets', project: { toolboxes: ['core'], files: [{ name: 'notes.md', content: 'synthetic' }] }, toolBoxes: core });
+  assert.deepEqual(local.upstream[0].body.tools.map((x) => x.function.name), ['get_current_time', 'read_project_file']);
+  assert.doesNotMatch(JSON.stringify(local.upstream[0].body.messages), /not available in this reply/);
 });
 
 test('the card: Send to cloud goes to cloud; Keep local stays local', async (t) => {
@@ -726,6 +850,21 @@ test('#1640 review: a marker deep in project excerpts or a free chat\'s attached
   // A project's knowledge-file excerpts ride in the system prompt; a free chat's attached file with the turn.
   assertKeptLocal(await partialRun(t, { message: 'Summarize my notes.', ragOverride, project: { files } }), 'project excerpts');
   assertKeptLocal(await partialRun(t, { message: 'Summarize this file.', ragOverride, freeChatId: 'c-synthetic-1640', project: { files } }), 'free-chat attached file');
+});
+
+test('#1640 review: a marker in a 1,200-character history entry keeps the turn local (partial), also past the history truncation', async (t) => {
+  const entry = (role, content) => ({ role, content });
+  // One long entry, the marker past the router's first 1,000 characters.
+  const long = [entry('user', `Earlier note. ${padding(1200)} ${PRIVATE_MARKER} end.`), entry('assistant', 'Noted.')];
+  assert.ok(long[0].content.length >= 1200 && long[0].content.indexOf(PRIVATE_MARKER) > 1000);
+  assertKeptLocal(await partialRun(t, { message: 'Reply with the word ok.', history: long }), 'one 1,200-character history entry');
+  // More than 40 entries reach the server (the fixture's cap is raised past it): the router reads the newest 40, so the
+  // oldest entry, which carries the marker and is still sent, is not covered.
+  const many = [entry('user', `Earliest: ${PRIVATE_MARKER}`), ...Array.from({ length: 44 }, (_, i) => entry(i % 2 ? 'assistant' : 'user', `Short synthetic turn ${i}.`))];
+  assertKeptLocal(await partialRun(t, { message: 'Reply with the word ok.', history: many, historyCap: 100 }), '45 history entries');
+  // With the fixture's own cap of 20 the oldest entries are dropped before anything is sent, so only what is sent is judged.
+  const capped = await partialRun(t, { message: 'Reply with the word ok.', history: many });
+  assert.equal(JSON.stringify(capped.upstream.map((u) => u.body)).includes(PRIVATE_MARKER), false, 'a truncated entry is not sent');
 });
 
 test('#1640 review: a short turn the router sees whole is still decided by the service: clear goes to cloud, the marker shows the card', async (t) => {

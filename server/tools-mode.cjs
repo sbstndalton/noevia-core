@@ -106,6 +106,14 @@ const WIKIPEDIA_RE = /\bwikipedia\b/i;
 const MAX_ADDED = 3;
 // Boxes that hold no user data: Automatic may add them whichever provider answers.
 const PUBLIC_BOXES = new Set(['web-search', 'offline-wikipedia']);
+// #1646: boxes whose results hold no user data, so a hybrid cloud route may offer them. An allow-list:
+// every other box (storage, Nextcloud, Drive, Project documents, the Diary, any connector or MCP box
+// this server learns about later) counts as private-data and fails closed. `core` is the clock and
+// the project-file reader; the reader is private-data and is taken out of it (PRIVATE_CORE_TOOLS).
+const CLOUD_SAFE_BOXES = new Set(['core', 'web-search', 'web-crawl', 'offline-wikipedia']);
+const PRIVATE_CORE_TOOLS = new Set(['read_project_file']);
+/** Whether a toolbox may be offered to a hybrid cloud route that has no per-chat allowCloud grant. */
+function isPrivateDataBox(id) { return !CLOUD_SAFE_BOXES.has(id); }
 
 const possessive = (words) => new RegExp(`\\b(?:my|our)\\s+(?:[\\w-]+\\s+){0,2}(?:${words})\\b`, 'i');
 const bare = (words) => new RegExp(`\\b(?:${words})\\b`, 'i');
@@ -220,4 +228,5 @@ function createAutomaticToolsReady({ getStorage, originAllowed }) {
 
 module.exports = { toolsModeOf, initialToolsMode, gateSaysToolNeeded, toolCapableRoute, FALLBACK_ROLES,
   automaticBoxesFor, automaticEligible, automaticAdditions, orderWithAdditions, wantsWeb, MAX_ADDED, PUBLIC_BOXES,
+  CLOUD_SAFE_BOXES, PRIVATE_CORE_TOOLS, isPrivateDataBox,
   nextcloudStorageConnected, createAutomaticToolsReady };
