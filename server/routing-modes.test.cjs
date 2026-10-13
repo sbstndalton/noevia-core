@@ -229,7 +229,7 @@ const LOCAL = 'http://local.invalid', CLOUD = 'http://cloud.invalid';
 const sse = (...frames) => ({ ok: true, status: 200, body: (async function* () { for (const f of frames) yield Buffer.from(`data: ${JSON.stringify(f)}\n\n`); })() });
 const PROVIDERS = { default: { id: 'default', baseUrl: LOCAL }, 'cloud-x': { id: 'cloud-x', baseUrl: CLOUD, label: 'Synthetic cloud', shared: true } };
 
-async function run(t, { freeChatId = null, ragOverride = null, flag, settings = null, chat = {}, project: projectOver = {}, message = 'Tell me about synthetic widgets', history = [], verdict = 'clear', answer = null, approvals = null, userId = 'synthetic-user', withRouting = true, toolResult = null, brainContext = null, localRoles = { fast: 'local-fast', smart: 'local-smart' } }) {
+async function run(t, { freeChatId = null, ragOverride = null, flag, settings = null, chat = {}, project: projectOver = {}, message = 'Tell me about synthetic widgets', history = [], verdict = 'clear', answer = null, approvals = null, userId = 'synthetic-user', withRouting = true, toolResult = null, brainContext = null, localRoles = { fast: 'local-fast', smart: 'local-smart' }, sensitivity = null }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-routing-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const events = [], calls = [], logs = [], flagsSet = [], errors = [];
   const res = new EventEmitter();
@@ -280,7 +280,8 @@ async function run(t, { freeChatId = null, ragOverride = null, flag, settings = 
     ...(withRouting ? { routingModes: {
       enabled: () => flag === true,
       settings: () => rm.normalize(settings),
-      sensitivity: async (digest) => { sensitivityCalls.push(digest); return verdicts[verdict]; },
+      // `sensitivity`: a real createSensitivity check (#1640) in place of the fixture verdict.
+      sensitivity: async (digest) => { sensitivityCalls.push(digest); return sensitivity ? sensitivity(digest) : verdicts[verdict]; },
       awaitChoice: gate.awaitRouteChoice,
       log: (entry) => logs.push(entry),
       setChatFlags: (projectId, chatId, patch) => { flagsSet.push({ projectId, chatId, patch }); return true; },
@@ -641,4 +642,44 @@ test('#1438: a check that could not answer, with no local model, is refused: 409
   assert.equal(r.errors.length, 1);
   assert.equal(r.errors[0].status, 409);
   assert.match(r.errors[0].body.error, /Nothing was sent/);
+});
+
+// ── #1640: the real decision-service chain inside a chat turn ────────────────
+// A synthetic decision service on loopback answering in Laya's shape, wired as server/index.cjs wires
+// it (decision settings -> endpoint -> decision layer -> createSensitivity). Before #1640 its
+// confidence was null, so every answer fell back as "unavailable (low-confidence)" and no card showed.
+async function decisionServiceCheck(t, reply) {
+  const server = require('node:http').createServer((req, res) => {
+    req.resume();
+    req.on('end', () => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(typeof reply === 'string' ? reply : JSON.stringify(reply)); });
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => { server.closeAllConnections(); return new Promise((resolve) => server.close(resolve)); });
+  const kv = new Map();
+  const settings = require('./decision-settings.cjs').createDecisionSettings({ store: { get: (k) => kv.get(k), set: (k, v) => kv.set(k, v) }, env: {} });
+  settings.save({ url: `http://127.0.0.1:${server.address().port}`, timeoutMs: 1500 }, 'admin');
+  const decisions = createDecisions({ backends: { configured: settings.backend() }, chains: { 'routing.sensitivity': ['configured'] } });
+  return rm.createSensitivity({ decide: decisions.decide });
+}
+const layaReply = (selected, sensitive) => ({ selected, scores: { sensitive, not_sensitive: Math.round((1 - sensitive) * 100) / 100 }, model: 'convaiinnovations/laya', calibrated: false });
+
+test('#1640: through the real decision service, "sensitive" at 0.97 shows the card and "not sensitive" at 0.97 goes to cloud', async (t) => {
+  const message = 'Synthetic test: Ada (fictional) keeps her made-up account numbers in a notebook.';
+  const flagged = await run(t, { flag: true, settings: HYBRID, message, answer: { choice: 'local' }, sensitivity: await decisionServiceCheck(t, layaReply('sensitive', 0.97)) });
+  assert.equal(flagged.events.find((e) => e.type === 'route_pending')?.flag, 'router', 'the "This looks sensitive" card is shown');
+  assert.deepEqual(flagged.meta.routing, { route: 'local', reason: 'user-choice' });
+  assert.equal(flagged.upstream.some((u) => u.url.startsWith(CLOUD)), false, 'nothing reached the cloud');
+  const clear = await run(t, { flag: true, settings: HYBRID, message: 'Reply with the word ok.', sensitivity: await decisionServiceCheck(t, layaReply('not_sensitive', 0.03)) });
+  assert.equal(clear.events.some((e) => e.type === 'route_pending'), false);
+  assert.deepEqual(clear.meta.routing, { route: 'cloud', reason: 'mode' });
+  assert.ok(clear.upstream[0].url.startsWith(CLOUD));
+});
+
+test('#1640: through the real decision service, a low score or a garbled reply stays local with no card', async (t) => {
+  for (const [reply, detail] of [[layaReply('not_sensitive', 0.45), 'low-confidence'], ['{"selected":"not_sensitive"', 'parse']]) {
+    const r = await run(t, { flag: true, settings: HYBRID, message: 'Reply with the word ok.', sensitivity: await decisionServiceCheck(t, reply) });
+    assert.equal(r.events.some((e) => e.type === 'route_pending'), false, detail);
+    assert.deepEqual(r.meta.routing, { route: 'local', reason: 'check-unavailable', detail }, detail);
+    assert.equal(r.upstream.some((u) => u.url.startsWith(CLOUD)), false, `${detail}: nothing reached the cloud`);
+  }
 });

@@ -340,6 +340,10 @@ const OPTIONS = Object.freeze([
 // Laya deadlines; the admin deadline field (decision-settings, 100-2000 ms) does not govern this check.
 const SENSITIVITY_DEADLINE_MS = 2000;
 function createSensitivity({ decide, deadlineMs = () => SENSITIVITY_DEADLINE_MS, minConfidence = 0.6, maxChunks = MAX_CHUNKS_CAP, log = () => {} }) {
+  // #1640: an answer counts only with a numeric confidence at the bound (the selected option's share,
+  // decision-endpoint.cjs). A missing, non-numeric or low one fails closed alike: a "not sensitive"
+  // nobody vouched for must never unlock cloud. decide() applies the same bound; this does not rely on it.
+  const vouched = (result) => Number.isFinite(result?.confidence) && result.confidence >= minConfidence;
   // A short code for why the check could not answer (never message or model text).
   const causeOfFailure = (result, error) => {
     if (error) return /unavailable|no decision service/i.test(String(error.message || '')) ? 'no-service' : error.deadline ? 'deadline' : 'error';
@@ -347,7 +351,8 @@ function createSensitivity({ decide, deadlineMs = () => SENSITIVITY_DEADLINE_MS,
     if (meta.fellBack === 'low-confidence') return 'low-confidence';
     if (meta.fellBack === 'deadline' || meta.cause === 'deadline') return 'deadline';
     if (typeof meta.cause === 'string' && /^[a-z][a-z0-9-]{0,39}$/.test(meta.cause)) return meta.cause;
-    return typeof result?.confidence === 'number' && result.confidence < minConfidence ? 'low-confidence' : 'no-answer';
+    const answered = result && result.source !== 'fallback' && OPTIONS.some((o) => o.id === result.selected);
+    return answered && !vouched(result) ? 'low-confidence' : 'no-answer';
   };
   async function one(text, deadline) {
     let result, error = null;
@@ -359,7 +364,7 @@ function createSensitivity({ decide, deadlineMs = () => SENSITIVITY_DEADLINE_MS,
         constraints: { deadlineMs: deadline, minConfidence }, fallback: { selected: null, scores: {} } });
     } catch (e) { result = null; error = e || Error('error'); }
     const answered = result && result.source !== 'fallback' && OPTIONS.some((o) => o.id === result.selected);
-    const confident = answered && (typeof result.confidence !== 'number' || result.confidence >= minConfidence);
+    const confident = answered && vouched(result);
     return !confident ? { verdict: 'unavailable', cause: causeOfFailure(result, error) } : { verdict: result.selected === 'sensitive' ? 'router' : null };
   }
   return async function check(input) {
