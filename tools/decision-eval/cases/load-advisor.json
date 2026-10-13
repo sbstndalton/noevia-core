@@ -1,0 +1,29 @@
+{
+ "en": [
+  ["oom","ggml_vulkan: Device memory allocation of size 4831838208 failed.\nggml_vulkan: vk::Device::allocateMemory: ErrorOutOfDeviceMemory\nllama_model_load: error loading model: unable to allocate Vulkan0 buffer"],
+  ["oom","llama_kv_cache_init: failed to allocate buffer for kv cache\nllama_init_from_model: llama_kv_cache_init() failed for self-attention cache\nsrv load_model: failed to create context"],
+  ["oom","ggml_backend_cpu_buffer_type_alloc_buffer: failed to allocate buffer of size 9126805504\nllama_model_load: error loading model: failed to allocate CPU buffer"],
+  ["oom","common_init_from_params: failed to create context with model\ncannot allocate memory for compute buffers (requested 2.1 GiB)"],
+  ["oom","Killed\nprocess exited with signal 9 while loading tensors (78%)"],
+  ["load_failed","gguf_init_from_file_impl: invalid magic characters: 'PK\\x03\\x04', expected 'GGUF'\nllama_model_load: error loading model: llama_model_loader: failed to load model"],
+  ["load_failed","llama_model_load: error loading model: error loading model architecture: unknown model architecture: 'qwen9moe'"],
+  ["load_failed","gguf_init_from_file: failed to read tensor info\nllama_model_load: error loading model: llama_model_loader: failed to load model from /models/model.gguf (file is truncated)"],
+  ["load_failed","llama_model_load: error loading model: missing tensor 'blk.0.attn_q.weight'"],
+  ["load_failed","error: failed to open /models/gemma.gguf: No such file or directory"],
+  ["recall_failed","srv send_error: task id = 12, error: the request exceeds the available context size (8192 tokens), try increasing it"],
+  ["recall_failed","slot update_slots: id 0 | task 3 | input truncated: n_ctx = 4096, n_prompt_tokens = 6210\nerror: prompt is too long for the context window"],
+  ["recall_failed","error: requested tokens (16384) exceed context size (8192)"],
+  ["recall_failed","srv log_server_r: request: POST /completion 400\n{\"error\":{\"code\":400,\"message\":\"the request exceeds the available context size, try increasing it\",\"type\":\"exceed_context_size_error\"}}"],
+  ["recall_failed","slot launch_slot_: id 0 | prompt tokens 12002 > n_ctx_slot 8192, cannot fit prompt"],
+  ["template","common_chat_templates_init: failed to parse chat template (defaulting to chatml): Expected value expression at row 14, column 33"],
+  ["template","srv operator(): got exception: {\"code\":500,\"message\":\"Unknown method: startswith at row 7, column 21\",\"type\":\"server_error\"}"],
+  ["template","error: chat template is not supported for tool calls: Conversation roles must alternate user/assistant/user/assistant"],
+  ["template","minja: Expected closing statement at row 22, column 3 while rendering the chat template"],
+  ["template","srv handle_completions: failed to apply chat template: raise_exception('System role not supported')"],
+  ["unknown","srv main: server is listening on http://0.0.0.0:8080 - starting the main loop\nsrv update_slots: all slots are idle"],
+  ["unknown","warning: no usable GPU found, --gpu-layers option will be ignored"],
+  ["unknown","main: HTTP server is listening, hostname: 0.0.0.0, port: 8080, http threads: 4"],
+  ["unknown","load_tensors: offloaded 35/35 layers to GPU\nllama_context: n_ctx_per_seq (8192) < n_ctx_train (131072) -- the full capacity of the model will not be utilized"],
+  ["unknown","request cancelled by client after 2 s"]
+ ]
+}
