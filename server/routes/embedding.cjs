@@ -12,6 +12,10 @@
 // Administrators only; the session and CSRF checks run before routes are mounted. The Diary half
 // goes to the sidecar with the service token only (no tenant header): the Diary re-embeds every
 // tenant's index with its own code, and no tenant's data passes through here.
+//
+// Local-first: a re-index sends every account's project text (and the Diary its entries) to the
+// target address, so a target must be on this network. A public address is refused (ssrf.cjs
+// isPublicUrl); cloud models are reached as chat providers, never as the embedding server.
 
 const PASS = Symbol('unhandled');
 const ACTIONS = new Set(['set-next', 'clear-next', 'switch', 'rollback', 'finish']);
@@ -27,7 +31,7 @@ const SCOPES = new Set(['all', 'projects', 'diary']);
  * @param {string} [deps.DIARY_BASE]
  * @param {() => object} [deps.diaryServiceHeaders]
  */
-function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJson, DIARY_BASE = '', diaryServiceHeaders = () => ({ 'Content-Type': 'application/json' }) }) {
+function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJson, DIARY_BASE = '', diaryServiceHeaders = () => ({ 'Content-Type': 'application/json' }), isPublicUrl = require('../ssrf.cjs').isPublicUrl }) {
   const diaryUrl = DIARY_BASE ? `${String(DIARY_BASE).replace(/\/+$/, '')}/api/internal/embedding` : '';
 
   async function diary(method, body) {
@@ -70,6 +74,13 @@ function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJs
     if (!ACTIONS.has(action)) return json(res, 400, { error: `action must be one of ${[...ACTIONS].join(', ')}` });
     if (!SCOPES.has(scope)) return json(res, 400, { error: 'scope must be all, projects or diary' });
     if (action === 'set-next' && (!body.target || typeof body.target !== 'object')) return json(res, 400, { error: 'set-next needs a target { baseUrl, model, profile }' });
+    if (action === 'set-next') {
+      for (const address of [body.target.baseUrl, body.target.diaryBaseUrl]) {
+        if (typeof address === 'string' && address.trim() && await isPublicUrl(address.trim())) {
+          return json(res, 400, { error: 'The embeddings server must be on this network: it receives the text of every project and the Diary.', code: 'publicEndpoint' });
+        }
+      }
+    }
     const out = {};
     if (scope !== 'diary') out.projects = await projects(action, body);
     if (scope !== 'projects') {

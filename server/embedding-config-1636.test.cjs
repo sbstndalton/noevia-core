@@ -118,6 +118,7 @@ function routes({ migration, fetchCalls = [], diaryReply = { ok: true, status: 2
     json, readJson: async (req) => req.body, migration, authService: { audit: (...a) => audits.push(a) },
     fetchJson: async (url, init) => { fetchCalls.push({ url, init }); return diaryReply; },
     DIARY_BASE: 'http://diary:8010', diaryServiceHeaders: () => ({ 'Content-Type': 'application/json', Authorization: 'Bearer service' }),
+    isPublicUrl: async (url) => /public\.example/.test(url),
   });
   return { handler, audits, fetchCalls };
 }
@@ -170,4 +171,18 @@ test('a refused switch reports why, per side, without hiding the other side', as
   const bad = fakeRes();
   await handler({ method: 'POST', body: { action: 'drop-everything' } }, bad, { path: '/api/embedding', authn: admin });
   assert.equal(bad.status, 400);
+});
+
+test('a public embeddings address is refused before anything is sent (local-first)', async () => {
+  const calls = [];
+  const migration = { status: () => ({}), setNext: (t) => { calls.push(t); return {}; } };
+  const { handler, fetchCalls } = routes({ migration });
+  for (const target of [{ model: 'm', baseUrl: 'https://public.example/v1' }, { model: 'm', baseUrl: 'http://embed-next:8080/v1', diaryBaseUrl: 'https://public.example/v1' }]) {
+    const res = fakeRes();
+    await handler({ method: 'POST', body: { action: 'set-next', target } }, res, { path: '/api/embedding', authn: admin });
+    assert.equal(res.status, 400);
+    assert.equal(res.body.code, 'publicEndpoint');
+  }
+  assert.deepEqual(calls, []);
+  assert.deepEqual(fetchCalls, [], 'the Diary is not asked either');
 });
