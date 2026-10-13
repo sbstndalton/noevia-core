@@ -112,7 +112,8 @@ function createChatFraming({ enabled, decide, embed = null, roles = () => ({}), 
 
   async function embedAll(texts, signal) {
     if (!embed || !texts.length) return null;
-    try { const v = await embed(texts, { signal }); return Array.isArray(v) && v.length === texts.length ? v : null; } catch { return null; }
+    // #1636: the message (first) is the query; chat titles, project names and tags are what it is matched against.
+    try { const v = await embed(texts, { signal, kind: texts.map((_, i) => (i === 0 ? 'query' : 'document')) }); return Array.isArray(v) && v.length === texts.length ? v : null; } catch { return null; }
   }
 
   async function run({ message, projects, chats, chatId, started, budget, signal }) {

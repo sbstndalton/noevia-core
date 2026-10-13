@@ -32,6 +32,15 @@ const LABELS = Object.freeze({
 // "Context" section (chat.cjs routerSystem), which takes part of the 1,000-character chunk.
 const SENSITIVITY_SYSTEM = 'You are noevia, a helpful assistant running on a self-hosted server. Answer clearly and briefly. Use the tools you are offered when they help. Ask before doing anything that changes data.';
 const PERMUTED_ITEMS = 100;
+// #1647: production's sensitivity check asks the decision service only when some model is on the
+// qualified list (server/decision-qualification.cjs; it ships empty), and trusts an answer only from
+// that model. The capture fetch below is not a model under evaluation: it answers with this
+// identity, and only this harness passes a list holding it (createSensitivity's `qualified`, the same
+// injection point the tests use), so the real request path runs unchanged and records the exact body
+// production would send. Production never passes `qualified`; nothing here changes the shipped list.
+const CAPTURE_IDENTITY = Object.freeze({ model: 'decision-eval/capture', revision: '0'.repeat(64) });
+const CAPTURE_QUALIFIED = Object.freeze([Object.freeze({ ...CAPTURE_IDENTITY,
+  evidence: Object.freeze({ set: 'decision-eval request capture only (not a model)', sensitiveRecall: 1, measured: 'capture' }) })]);
 
 function permissiveDecisionChecks() {
   const file = require.resolve(path.join(SERVER, 'dav-parse-wasm.cjs'));
@@ -50,7 +59,8 @@ function createCapture() {
     seen.push({ url: String(url), body });
     const ids = body.options.map((o) => o.id);
     const scores = Object.fromEntries(ids.map((id, i) => [id, i === 0 ? 0.6 : 0.4 / (ids.length - 1)]));
-    return new Response(JSON.stringify({ selected: ids[0], scores, model: 'capture', calibrated: false }), { status: 200, headers: { 'content-type': 'application/json' } });
+    return new Response(JSON.stringify({ selected: ids[0], scores, model: CAPTURE_IDENTITY.model, model_revision: CAPTURE_IDENTITY.revision, calibrated: false }),
+      { status: 200, headers: { 'content-type': 'application/json' } });
   }
   return { fetchImpl, take: () => seen.splice(0) };
 }
@@ -77,7 +87,8 @@ function createCallers() {
 
   const rm = require(path.join(SERVER, 'routing-modes.cjs'));
   const sensitivityLayer = layer(['routing.sensitivity']);
-  const sensitivity = rm.createSensitivity({ decide: (r) => sensitivityLayer.decide(r), deadlineMs: () => rm.SENSITIVITY_DEADLINE_MS, log: () => {} });
+  const sensitivity = rm.createSensitivity({ decide: (r) => sensitivityLayer.decide(r), deadlineMs: () => rm.SENSITIVITY_DEADLINE_MS, log: () => {},
+    qualified: CAPTURE_QUALIFIED });
 
   const gateLayer = layer(['tool.gate']);
   const framingLayer = layer(['chat.frame.kind', 'chat.frame.project', 'chat.frame.tag']);

@@ -111,9 +111,11 @@ test('authenticated upload persists metadata/original/pages and config cannot fo
 
 test('legacy PDF upload also saves failures, originals and explicit stale state', async () => {
   const p = await project('Legacy document upload');
-  const legacy = bytes => post(`/api/projects/${p.id}/documents`, { name: 'statement.pdf', dataBase64: bytes.toString('base64') });
+  const legacy = (bytes, replace) => post(`/api/projects/${p.id}/documents`, { name: 'statement.pdf', ...(replace ? { replace: true } : {}), dataBase64: bytes.toString('base64') });
   assert.equal((await legacy(fixture('text.pdf'))).status, 200);
-  const failed = JSON.parse((await legacy(fixture('encrypted.pdf'))).text);
+  const refused = await legacy(fixture('encrypted.pdf'));
+  assert.equal(refused.status, 409); assert.equal(JSON.parse(refused.text).code, 'sourceExists'); // #1454: never a silent replace
+  const failed = JSON.parse((await legacy(fixture('encrypted.pdf'), true)).text);
   assert.equal(failed.document.state, 'failed'); assert.equal(failed.document.stale, true);
   const pages = await request(docUrl(p.id, 'pages'), { headers: { cookie } });
   assert.match(pages.text, /STALE/); assert.match(pages.text, /TEXT-P1/);

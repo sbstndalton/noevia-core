@@ -6,7 +6,9 @@
 //
 // In hybrid, a flagged turn is never sent to cloud silently. Cheap deterministic rules run first
 // (Diary content, obvious secrets and account numbers); otherwise the router role is asked through
-// decide() with `cloud: 'forbidden'`. Every failure of that call is treated as "flagged". A flagged
+// decide() with `cloud: 'forbidden'`. Every failure of that call is treated as "flagged", and so is an
+// answer from a decision model that is not qualified for this check (#1647, decision-qualification.cjs;
+// none is today, so the router is not asked and Hybrid keeps every such turn local). A flagged
 // turn either stays local (the account's "always local" choice) or the person is asked, through the
 // same pending-card mechanism as the write approvals, and nothing reaches the cloud provider until
 // they pick "Send to cloud". A timeout, a cancel or a lost connection keeps it local.
@@ -15,6 +17,7 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
+const qualification = require('./decision-qualification.cjs');
 
 const MODES = Object.freeze(['local', 'cloud', 'hybrid']);
 const WHEN_SENSITIVE = Object.freeze(['ask', 'local']);
@@ -358,7 +361,14 @@ const OPTIONS = Object.freeze([
 // deadline miss on benign turns, which then stay local). 2 s is the ceiling the owner approved for
 // Laya deadlines; the admin deadline field (decision-settings, 100-2000 ms) does not govern this check.
 const SENSITIVITY_DEADLINE_MS = 2000;
-function createSensitivity({ decide, deadlineMs = () => SENSITIVITY_DEADLINE_MS, minConfidence = 0.6, maxChunks = MAX_CHUNKS_CAP, log = () => {} }) {
+// #1647: `qualified` is the list of decision models qualified for this check (decision-qualification.cjs;
+// tests pass their own). A verdict counts only from a model on it, matched by the identity the service
+// reports with the answer. With no qualified model the service is not asked at all: the check is
+// unavailable (cause 'not-qualified') and the turn stays local with no card, as before #1640. The #1639
+// evaluation showed why: the live model answered "not sensitive" to every English sensitive text.
+function createSensitivity({ decide, deadlineMs = () => SENSITIVITY_DEADLINE_MS, minConfidence = 0.6, maxChunks = MAX_CHUNKS_CAP, log = () => {},
+  qualified = qualification.QUALIFIED.sensitivity }) {
+  const anyQualified = () => qualification.qualifiedEntries('sensitivity', qualified).length > 0;
   // #1640: an answer counts only with a numeric confidence at the bound (the selected option's share,
   // decision-endpoint.cjs). A missing, non-numeric or low one fails closed alike: a "not sensitive"
   // nobody vouched for must never unlock cloud. decide() applies the same bound; this does not rely on it.
@@ -384,7 +394,11 @@ function createSensitivity({ decide, deadlineMs = () => SENSITIVITY_DEADLINE_MS,
     } catch (e) { result = null; error = e || Error('error'); }
     const answered = result && result.source !== 'fallback' && OPTIONS.some((o) => o.id === result.selected);
     const confident = answered && vouched(result);
-    return !confident ? { verdict: 'unavailable', cause: causeOfFailure(result, error) } : { verdict: result.selected === 'sensitive' ? 'router' : null };
+    if (!confident) return { verdict: 'unavailable', cause: causeOfFailure(result, error) };
+    // #1647: either verdict counts only from a qualified model. An unknown, missing or mismatched
+    // identity (another model, other weights, a service that does not say) is not a verdict.
+    if (!qualification.qualifiedFor('sensitivity', result.metadata?.identity, qualified)) return { verdict: 'unavailable', cause: 'not-qualified' };
+    return { verdict: result.selected === 'sensitive' ? 'router' : null };
   }
   return async function check(input) {
     // #1640 review: routerInput's { chunks, complete }. A check that cannot see everything a cloud
@@ -397,6 +411,10 @@ function createSensitivity({ decide, deadlineMs = () => SENSITIVITY_DEADLINE_MS,
     if (covered && (covered.complete !== true || list.length < given.length) && list.length) {
       try { log({ verdict: 'unavailable', fellBack: true, cause: 'partial', chunks: list.length, deadlineMs: 0, latencyMs: 0 }); } catch { /* codes only */ }
       return { flagged: true, flag: 'unavailable', cause: 'partial' };
+    }
+    if (!anyQualified()) {
+      try { log({ verdict: 'unavailable', fellBack: true, cause: 'not-qualified', chunks: list.length, deadlineMs: 0, latencyMs: 0 }); } catch { /* codes only */ }
+      return { flagged: true, flag: 'unavailable', cause: 'not-qualified' };
     }
     const deadline = Math.max(100, Number(deadlineMs()) || SENSITIVITY_DEADLINE_MS);
     const started = Date.now();
@@ -414,7 +432,7 @@ function createSensitivity({ decide, deadlineMs = () => SENSITIVITY_DEADLINE_MS,
           if (left < 50) { out.push({ verdict: 'unavailable', cause: 'deadline' }); break; } // budget spent: send nothing more
           const v = await one(t, left);
           out.push(v);
-          if (v.verdict === 'router') break;
+          if (v.verdict === 'router' || v.cause === 'not-qualified') break; // a model that is not qualified will not be for the next chunk
         }
         return out;
       };

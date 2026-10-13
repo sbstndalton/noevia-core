@@ -530,3 +530,15 @@ test('M4: while the Rust front owns it, the chat-list save is refused here befor
   assert.equal(await k.call('POST', '/api/projects/p1/chats', { chats: [{ id: 'c2' }] }), true);
   assert.equal(k.sent.at(-1).status, 200);
 });
+
+test('#1458: renaming a project moves nothing: its storage folder and every source path stay as they are', async () => {
+  const file = { name: 'noevia projects/proj-1/Text/a.md', content: 'a', source: 'noevia projects/proj-1', attachment: { id: 'x'.repeat(64), bytes: 1, group: 'Text', state: 'ready' } };
+  const project = { id: 'p1', name: 'Before', projectFolder: 'noevia projects/proj-1', sourceFolders: ['noevia projects/proj-1'], files: [file], assets: [], chats: [] };
+  const f = fixture({ projects: [project] });
+  await f.call('POST', '/api/projects/p1/config', { name: 'After' });
+  assert.equal(f.sent.at(-1).status, 200);
+  assert.equal(project.name, 'After');
+  assert.equal(project.projectFolder, 'noevia projects/proj-1');
+  assert.deepEqual(project.sourceFolders, ['noevia projects/proj-1']);
+  assert.deepEqual(project.files.map((x) => x.name), ['noevia projects/proj-1/Text/a.md']);
+});

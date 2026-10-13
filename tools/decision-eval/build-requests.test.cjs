@@ -112,3 +112,19 @@ test('loadCases refuses a label outside the purpose and an unknown language', ()
   fs.writeFileSync(path.join(dir, 'route.json'), JSON.stringify({ ...route, xx: [['fast', 'hi']] }));
   assert.throws(() => loadCases(dir), /unknown language xx/);
 });
+
+test('#1647: the capture identity is qualified only inside this harness; the shipped production check still asks nothing', async () => {
+  const { createCallers } = require('./build-requests.cjs');
+  const callers = createCallers(); // installs the capture backend and the permissive checks
+  const harness = await callers.sensitivity('Synthetic: how do widgets work?');
+  assert.equal(harness.sent.length, 1, 'the harness records the production request');
+  const qualification = require(path.join(SERVER, 'decision-qualification.cjs'));
+  assert.deepEqual(qualification.qualifiedEntries('sensitivity'), [], 'the shipped list stays empty');
+  assert.equal(qualification.qualifiedFor('sensitivity', { model: 'decision-eval/capture', revision: '0'.repeat(64) }), null);
+  // The same capture backend behind a check built as server/index.cjs builds it (no `qualified`): not asked.
+  const rm = require(path.join(SERVER, 'routing-modes.cjs'));
+  let asked = 0;
+  const production = rm.createSensitivity({ decide: async (r) => { asked += 1; return callers.backend.decide(r, {}); } });
+  assert.deepEqual(await production({ chunks: ['Synthetic: how do widgets work?'], complete: true }), { flagged: true, flag: 'unavailable', cause: 'not-qualified' });
+  assert.equal(asked, 0);
+});
