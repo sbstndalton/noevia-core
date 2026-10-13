@@ -45,7 +45,10 @@ test('test results and refusals carry a stable message id, in the body and in th
   let res={};await route({method:'POST',body:{url:'http://laya:8040',timeoutMs:500}},res,{path:'/api/admin/decision-settings/test',authn:admin});
   assert.equal(res.body.messageId,'ready');assert.match(res.body.message,/ready/);
   res={};await route({method:'PUT',body:{url:'http://public.example',timeoutMs:500}},res,{path:'/api/admin/decision-settings',authn:admin});
-  assert.equal(res.status,400);assert.equal(res.body.errorId,'invalidUrl');assert.match(res.body.error,/private HTTP origin/,'the English stays for older clients');
+  assert.equal(res.status,400);assert.equal(res.body.errorId,'invalidUrl');assert.match(res.body.error,/private HTTP address/,'the English stays for older clients');
+  // #1499: the example address the refusal suggests is one this service accepts.
+  const example=res.body.error.match(/https?:\/\/[^\s,]+/)[0];
+  assert.equal(fixture().settings.save({url:example,timeoutMs:500},'admin').url,example);
   res={};await route({method:'PUT',get body(){throw Error('unreadable');}},res,{path:'/api/admin/decision-settings',authn:admin});
   assert.equal('errorId' in res.body,false,'an error without an id sends none');
   const info=features.describe();

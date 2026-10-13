@@ -119,6 +119,13 @@ test('decision-service reasons, test messages and refusals have a key in every l
     assert.ok(settings.includes(core.translate('en-GB', `decision.msg.${id}`)), `the server's English for ${id} is the catalogue's`);
   }
   assert.equal(core.translate('de-DE', 'decision.msg.ready'), 'Der Entscheidungsdienst ist bereit. Es wurde keine Inferenz ausgeführt.');
+  // #1499: the address a refusal offers as an example is one the server accepts, in every locale.
+  const { configuration } = require('../../server/decision-endpoint.cjs');
+  for (const l of ['en-GB', ...Object.keys(FILES)]) {
+    const example = (core.translate(l, 'decision.msg.invalidUrl').match(/https?:\/\/[^\s,]+/) || [])[0];
+    assert.ok(example, `${l} decision.msg.invalidUrl gives an example address`);
+    assert.equal(configuration({ COWORK_DECISION_URL: example }).reason, null, `${l} example ${example} is accepted`);
+  }
 });
 
 test('the tool approval card, Code task cards and the sidebar note are catalogue text, not literals', () => {

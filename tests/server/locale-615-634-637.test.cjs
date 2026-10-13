@@ -97,7 +97,17 @@ test('#634 only a stopped assistant reply with no real content is a placeholder'
   const t = tFor('de-DE');
   assert.equal(isStoppedPlaceholder({ role: 'assistant', senderLabel: 'Assistant · Stopped', content: '' }), true);
   assert.equal(isStoppedPlaceholder({ role: 'assistant', senderLabel: STOPPED_SENDER, content: 'A partial answer the model had written.' }), false);
-  assert.equal(isStoppedPlaceholder({ role: 'assistant', senderLabel: STOPPED_SENDER, content: '', reasoning: 'thought before Stop' }), false);
+  // #1447: Stop during the thinking phase. The Stop handler labels a thinking-only reply Stopped exactly
+  // when the body draws it as the Stopped placeholder (its thinking is drawn on its own); a reply labelled
+  // Stopped with an empty body, or a placeholder that never gets the label, is the #1447 bug.
+  const app = read('src/App.tsx');
+  const oldStop = /m\.id === replyId && !m\.content && !m\.reasoning\s*\? \{ \.\.\.m, senderLabel: STOPPED_SENDER \}/.test(app);
+  const newStop = /m\.id === replyId && !m\.content\s*\? \{ \.\.\.m, senderLabel: STOPPED_SENDER \}/.test(app);
+  assert.ok(oldStop !== newStop, 'the Stop handler labels a reply Stopped in exactly one of the two known ways');
+  const thinkingOnly = { role: 'assistant', senderLabel: STOPPED_SENDER, content: '', reasoning: 'thought before Stop' };
+  assert.equal(isStoppedPlaceholder(thinkingOnly), newStop, 'a thinking-only reply is the placeholder exactly when Stop labels it');
+  if (newStop) assert.equal(messageBodyText(t, thinkingOnly), core.translate('de-DE', 'chat.stopped.content'));
+  assert.equal(isStoppedPlaceholder({ role: 'assistant', senderLabel: STOPPED_SENDER, content: 'A partial answer.', reasoning: 'thought before Stop' }), false, 'an answer after thinking is kept');
   assert.equal(isStoppedPlaceholder({ role: 'assistant', senderLabel: 'Auto (fast)', content: '' }), false, 'an empty reply that was not stopped is not one');
   assert.equal(isStoppedPlaceholder({ role: 'user', senderLabel: STOPPED_SENDER, content: '' }), false);
   assert.equal(isStoppedPlaceholder({ role: 'assistant', senderLabel: STOPPED_SENDER, content: 'x', error: true }), false);
