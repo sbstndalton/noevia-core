@@ -18,14 +18,13 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           path: core
-      # The native GET /api/stats source (noevia-rs#98 head while that PR is open; re-pinned to its
-      # merge commit once it merges, before this file's PR merges). Downloaded twice locally;
+      # The native GET /api/stats source: the noevia-rs#98 merge commit on rs main. Downloaded twice;
       # byte-identical archive hash.
       - name: Fetch verified native engine statistics source
         run: |
           set -euo pipefail
-          curl -fsSL https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/3019df14241694cc139f5a29d3bc6de8e1c47d6a -o "$RUNNER_TEMP/stats-rs.tgz"
-          echo "02829fc1f7275620cd8cf8dc709c6e4da02f39d1bf4229f6e1d8033fc73855a6  $RUNNER_TEMP/stats-rs.tgz" | sha256sum -c -
+          curl -fsSL https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/bbd8f99136ded14ca56e286b35c6ce1ad6c4efc6 -o "$RUNNER_TEMP/stats-rs.tgz"
+          echo "faeee548c55cb75d8b415a805a37f57f73dc19fdb1a81d99f4dccb7caa6f404f  $RUNNER_TEMP/stats-rs.tgz" | sha256sum -c -
           mkdir rs
           tar -xzf "$RUNNER_TEMP/stats-rs.tgz" --strip-components=1 -C rs
       # Merged rs #94 acceptance tooling (#1308/#1320): the core-acceptance adapter verifies this

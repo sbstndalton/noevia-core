@@ -42,9 +42,10 @@ WASM040738 remain intact. Owner flags remain default off.
 # Native engine statistics front qualification (#1650)
 
 `stats-front.yml` qualifies Node's half of GET /api/stats moving to the Rust front
-(`statsRustOwned` in `server/routes/models.cjs`). Its native source is noevia-rs#98
-(pinned by commit and twice-fetched codeload archive SHA-256; re-pinned to the rs merge commit
-once rs#98 merges, before this gate's PR merges). The merged rs#94 archive above still feeds the
+(`statsRustOwned` in `server/routes/models.cjs`). Its native source is the noevia-rs#98 merge
+commit bbd8f99136ded14ca56e286b35c6ce1ad6c4efc6, archive SHA-256
+faeee548c55cb75d8b415a805a37f57f73dc19fdb1a81d99f4dccb7caa6f404f (twice fetched,
+byte-identical). The merged rs#94 archive above still feeds the
 `core-acceptance` adapter unchanged. The gate requires:
 
 - the candidate core's own handler (rs `crates/server-stats/tests/oracle.cjs`, run on this HEAD)
