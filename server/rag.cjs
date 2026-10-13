@@ -162,6 +162,7 @@ async function probeEmbeddingSidecar(base, target) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: target.model, input }),
+      redirect: 'error', // an embeddings server never sends the text on to another address
       signal: ctrl.signal,
     });
     if (!res.ok) return false;
@@ -188,6 +189,7 @@ async function probeEmbeddingRouter(base, target) {
   try {
     const res = await fetch(`${base.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/models`, {
       headers: inferenceHeaders(),
+      redirect: 'error',
       signal: ctrl.signal,
     });
     if (!res.ok) return false;
@@ -306,6 +308,7 @@ async function embedOnce(target, input, signal) {
     method: 'POST',
     headers: target.baseUrl ? { 'Content-Type': 'application/json' } : inferenceHeaders(),
     body: JSON.stringify({ model: target.model, input }),
+    redirect: 'error', // the project text goes to the configured server only (cf. decision-endpoint.cjs)
     ...(signal ? { signal } : {}),
   });
   if (!res.ok) throw new Error(`embeddings ${res.status}: ${(await readCappedText(res, 64 * 1024)).text.slice(0, 120)}`);

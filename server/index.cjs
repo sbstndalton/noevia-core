@@ -217,6 +217,9 @@ const embeddingConfig = require('./embedding-config.cjs').install(require('./emb
 rag.init({ dataDir: DATA_DIR, inferenceUrl: INFERENCE_BASE, headersFn: () => inferenceHeaders(), userDataDirFn: workspaceStore.userDir,
   userActive: (userId) => !workspaceStore.isRemoved(userId), inferenceGuard: () => modelManager.enterInference?.() || (() => {}),
   embeddingConfig, listUserIds: () => authService.db.prepare('SELECT id FROM users').all().map((r) => r.id) });
+// An address the environment seeded must be on this network (embedding-address.cjs); one that is not
+// is logged and not used. Asynchronous (DNS), so it settles just after start-up, before the first re-index pass.
+require('./embedding-address.cjs').guardSeededAddresses(embeddingConfig);
 const embeddingMigration = require('./embedding-migration.cjs').createEmbeddingMigration({ config: embeddingConfig, rag });
 // A re-index under way also covers files indexed meanwhile; with none under way nothing runs.
 rag.onIndexed(() => { if (embeddingConfig.next()) embeddingMigration.kick(); });

@@ -53,7 +53,7 @@ const sameIdentity = (a, b) => !!a && !!b && identityOf(a) === identityOf(b);
 const sameTarget = (a, b) => sameIdentity(a, b) && (a.baseUrl || null) === (b.baseUrl || null);
 
 /** The targets the environment describes. An unknown profile is kept as given, so it fails closed later. */
-function seedFromEnv(env = process.env, fallbackModel = 'default') {
+function seedFromEnv(env = process.env, fallbackModel = 'default', log = () => {}) {
   const pick = (...keys) => keys.map((k) => String(env[k] ?? '').trim()).find(Boolean) || '';
   const active = {
     baseUrl: pick('EMBEDDING_BASE_URL') || null,
@@ -61,6 +61,9 @@ function seedFromEnv(env = process.env, fallbackModel = 'default') {
     profile: pick('EMBEDDING_PROFILE') || DEFAULT_PROFILE,
   };
   const nextModel = pick('EMBEDDING_NEXT_MODEL');
+  // A forgotten profile is not an error (nomic-v1 is the default), but for a model that needs the
+  // other framing it silently builds vectors from unframed text.
+  if (nextModel && !pick('EMBEDDING_NEXT_PROFILE')) log(`[embedding] EMBEDDING_NEXT_MODEL=${nextModel} is set without EMBEDDING_NEXT_PROFILE: using ${DEFAULT_PROFILE}, which sends text unframed. Set the profile if the model needs prompts (known: ${profileNames().join(', ')}).`);
   const next = nextModel ? {
     baseUrl: pick('EMBEDDING_NEXT_BASE_URL') || null,
     model: nextModel,
@@ -93,12 +96,15 @@ function readState(stateFile) {
  * @param {object} [o.env]            seed values (process.env)
  * @param {string|null} [o.stateFile] where runtime changes are saved; null keeps them in memory
  * @param {string} [o.fallbackModel]  model when the environment names none
+ * @param {(line:string) => void} [o.log]  seeding warnings
  */
-function createEmbeddingConfig({ env = process.env, stateFile = null, fallbackModel = 'default' } = {}) {
+function createEmbeddingConfig({ env = process.env, stateFile = null, fallbackModel = 'default', log = (line) => console.warn(line) } = {}) {
   const saved = readState(stateFile);
-  let state = saved || seedFromEnv(env, fallbackModel);
+  let state = saved || seedFromEnv(env, fallbackModel, log);
+  let locked = null; // set by refuseSeeded: changes are refused until the operator fixes the environment
   const source = saved ? 'saved' : 'environment';
   let version = 0;
+  let savedChange = false; // a change was written to stateFile (a refusal at startup is not)
   const listeners = new Set();
   const copy = (t) => (t ? { ...t } : null);
 
@@ -110,17 +116,19 @@ function createEmbeddingConfig({ env = process.env, stateFile = null, fallbackMo
     fs.renameSync(tmp, stateFile);
   }
   function change(next) {
+    if (locked) throw Object.assign(Error(locked), { status: 409, code: 'badState' });
     const before = state;
     state = next;
     try { persist(); } catch (err) { state = before; throw err; }
     version += 1;
+    savedChange = true;
     for (const fn of listeners) { try { fn(get()); } catch { /* a listener never blocks a change */ } }
     return get();
   }
   function get() {
-    return { active: copy(state.active), next: copy(state.next), previous: copy(state.previous), source: version || saved ? 'saved' : source, version };
+    return { active: copy(state.active), next: copy(state.next), previous: copy(state.previous), source: savedChange || saved ? 'saved' : source, version };
   }
-  return {
+  const api = {
     get,
     active: () => copy(state.active),
     next: () => copy(state.next),
@@ -135,9 +143,13 @@ function createEmbeddingConfig({ env = process.env, stateFile = null, fallbackMo
       return change({ ...state, next: t });
     },
     clearNext() { return change({ ...state, next: null }); },
-    /** next becomes active; the old active is kept as previous for rollback. */
-    switchToNext() {
+    /**
+     * next becomes active; the old active is kept as previous for rollback. `expected` (a target)
+     * is what the caller checked readiness for: if next is something else by now, nothing switches.
+     */
+    switchToNext(expected = null) {
       if (!state.next) throw Object.assign(Error('No re-index is under way.'), { status: 409, code: 'noNext' });
+      if (expected && !sameTarget(state.next, expected)) throw Object.assign(Error('The re-index target changed while the switch was being checked. Nothing was switched.'), { status: 409, code: 'nextChanged' });
       return change({ active: state.next, next: null, previous: state.active });
     },
     rollback() {
@@ -149,7 +161,22 @@ function createEmbeddingConfig({ env = process.env, stateFile = null, fallbackMo
       if (!state.previous) throw Object.assign(Error('There is no previous embedding model to remove.'), { status: 409, code: 'noPrevious' });
       return change({ ...state, previous: null });
     },
+    /**
+     * Startup guard (embedding-address.cjs): an address the environment seeded is not on this
+     * network. In memory only, nothing is saved. A refused next is dropped; a refused active turns
+     * embedding off (unknown profile: every embed call refuses) and locks changes, like a damaged
+     * saved file, because falling back to the inference engine would send it the same text.
+     */
+    refuseSeeded({ active = null, next = null } = {}) {
+      if (saved || version !== 0) return get();
+      if (next) state = { ...state, next: null };
+      if (active) { state = { ...state, active: { ...state.active, profile: 'unavailable' } }; locked = active; api.damaged = active; }
+      version += 1;
+      for (const fn of listeners) { try { fn(get()); } catch { /* a listener never blocks a change */ } }
+      return get();
+    },
   };
+  return api;
 }
 
 /**
@@ -160,7 +187,7 @@ function createEmbeddingConfig({ env = process.env, stateFile = null, fallbackMo
  */
 function loadEmbeddingConfig({ env = process.env, stateFile = null, log = (line) => console.error(line) } = {}) {
   try {
-    return createEmbeddingConfig({ env, stateFile });
+    return createEmbeddingConfig({ env, stateFile, log });
   } catch (err) {
     if (err?.code !== 'badState') throw err;
     log(`[embedding] ${err.message} Embeddings are off until then.`);

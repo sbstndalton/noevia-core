@@ -14,8 +14,10 @@
 // tenant's index with its own code, and no tenant's data passes through here.
 //
 // Local-first: a re-index sends every account's project text (and the Diary its entries) to the
-// target address, so a target must be on this network. A public address is refused (ssrf.cjs
-// isPublicUrl); cloud models are reached as chat providers, never as the embedding server.
+// target address, so a target must be on this network. The address is accepted only when it parses
+// and every address it resolves to is private (embedding-address.cjs); anything else, including a
+// name that does not resolve, is refused. Cloud models are reached as chat providers, never as the
+// embedding server.
 
 const PASS = Symbol('unhandled');
 const ACTIONS = new Set(['set-next', 'clear-next', 'switch', 'rollback', 'finish']);
@@ -30,8 +32,9 @@ const SCOPES = new Set(['all', 'projects', 'diary']);
  * @param {(url:string, init:object, timeoutMs?:number) => Promise<{ok:boolean,status:number,body:any}>} deps.fetchJson
  * @param {string} [deps.DIARY_BASE]
  * @param {() => object} [deps.diaryServiceHeaders]
+ * @param {(url:string) => Promise<{ok:boolean,reason?:string}>} [deps.checkAddress]
  */
-function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJson, DIARY_BASE = '', diaryServiceHeaders = () => ({ 'Content-Type': 'application/json' }), isPublicUrl = require('../ssrf.cjs').isPublicUrl }) {
+function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJson, DIARY_BASE = '', diaryServiceHeaders = () => ({ 'Content-Type': 'application/json' }), checkAddress = require('../embedding-address.cjs').checkEmbeddingAddress }) {
   const diaryUrl = DIARY_BASE ? `${String(DIARY_BASE).replace(/\/+$/, '')}/api/internal/embedding` : '';
 
   async function diary(method, body) {
@@ -76,8 +79,10 @@ function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJs
     if (action === 'set-next' && (!body.target || typeof body.target !== 'object')) return json(res, 400, { error: 'set-next needs a target { baseUrl, model, profile }' });
     if (action === 'set-next') {
       for (const address of [body.target.baseUrl, body.target.diaryBaseUrl]) {
-        if (typeof address === 'string' && address.trim() && await isPublicUrl(address.trim())) {
-          return json(res, 400, { error: 'The embeddings server must be on this network: it receives the text of every project and the Diary.', code: 'publicEndpoint' });
+        if (address == null || !String(address).trim()) continue; // empty: the inference engine
+        const verdict = await checkAddress(String(address).trim());
+        if (!verdict.ok) {
+          return json(res, 400, { error: `The embeddings server must be on this network: it receives the text of every project and the Diary (${verdict.reason}).`, code: 'publicEndpoint' });
         }
       }
     }

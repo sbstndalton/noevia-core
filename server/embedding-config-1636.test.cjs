@@ -9,6 +9,7 @@ const path = require('node:path');
 
 const { frame, profileNamed, DEFAULT_PROFILE } = require('./embedding-profile.cjs');
 const { createEmbeddingConfig, seedFromEnv, normalizeTarget } = require('./embedding-config.cjs');
+const { checkEmbeddingAddress, guardSeededAddresses } = require('./embedding-address.cjs');
 const { createEmbeddingRoutes } = require('./routes/embedding.cjs');
 
 const SAMPLE = ['Plain text.', '  spaced  ', 'title: looks like a prefix | text: but is content', '', 'Zeilen\nUmbruch'];
@@ -111,6 +112,17 @@ test('the sidecar delete guard and the keep-alongside list follow the installed 
 function fakeRes() {
   return { status: 0, body: null, headers: {}, setHeader(k, v) { this.headers[k] = v; } };
 }
+// Name resolution is the only thing faked: the address decision itself is the real one.
+const DNS = {
+  'embed-next': ['10.0.0.7'], embed: ['10.0.0.6'],
+  'public.example': ['93.184.216.34'], 'public.example.': ['93.184.216.34'],
+  'mixed.example': ['10.0.0.8', '93.184.216.34'], 'mixed6.example': ['::1', '2606:2800:220:1:248:1893:25c8:1946'],
+  'xn--bcher-kva.example': ['93.184.216.34'], 'private.example.': ['192.168.1.20'],
+};
+const fakeLookup = async (host) => {
+  if (!DNS[host]) throw Object.assign(Error(`getaddrinfo ENOTFOUND ${host}`), { code: 'ENOTFOUND' });
+  return DNS[host].map((address) => ({ address, family: address.includes(':') ? 6 : 4 }));
+};
 function routes({ migration, fetchCalls = [], diaryReply = { ok: true, status: 200, body: { active: { model: 'nomic-embed-text-v1' } } } } = {}) {
   const audits = [];
   const json = (res, status, body) => { res.status = status; res.body = body; return true; };
@@ -118,7 +130,7 @@ function routes({ migration, fetchCalls = [], diaryReply = { ok: true, status: 2
     json, readJson: async (req) => req.body, migration, authService: { audit: (...a) => audits.push(a) },
     fetchJson: async (url, init) => { fetchCalls.push({ url, init }); return diaryReply; },
     DIARY_BASE: 'http://diary:8010', diaryServiceHeaders: () => ({ 'Content-Type': 'application/json', Authorization: 'Bearer service' }),
-    isPublicUrl: async (url) => /public\.example/.test(url),
+    checkAddress: (url) => checkEmbeddingAddress(url, { lookup: fakeLookup }),
   });
   return { handler, audits, fetchCalls };
 }
@@ -177,7 +189,18 @@ test('a public embeddings address is refused before anything is sent (local-firs
   const calls = [];
   const migration = { status: () => ({}), setNext: (t) => { calls.push(t); return {}; } };
   const { handler, fetchCalls } = routes({ migration });
-  for (const target of [{ model: 'm', baseUrl: 'https://public.example/v1' }, { model: 'm', baseUrl: 'http://embed-next:8080/v1', diaryBaseUrl: 'https://public.example/v1' }]) {
+  for (const target of [
+    { model: 'm', baseUrl: 'https://public.example/v1' },
+    { model: 'm', baseUrl: 'http://embed-next:8080/v1', diaryBaseUrl: 'https://public.example/v1' },
+    // The old check asked "is it public" and let every one of these through:
+    { model: 'm', baseUrl: 'http://public.example./v1' }, // trailing dot
+    { model: 'm', baseUrl: 'http://xn--bcher-kva.example/v1' }, // internationalised name
+    { model: 'm', baseUrl: 'http://no-such-host.example/v1' }, // does not resolve
+    { model: 'm', baseUrl: 'http://mixed.example/v1' }, // one private and one public answer
+    { model: 'm', baseUrl: 'http://embed-next:8080/v1', diaryBaseUrl: 'http://mixed6.example/v1' },
+    { model: 'm', baseUrl: 'http://[2606:2800:220:1:248:1893:25c8:1946]/v1' },
+    { model: 'm', baseUrl: 'not a url' },
+  ]) {
     const res = fakeRes();
     await handler({ method: 'POST', body: { action: 'set-next', target } }, res, { path: '/api/embedding', authn: admin });
     assert.equal(res.status, 400);
@@ -185,4 +208,110 @@ test('a public embeddings address is refused before anything is sent (local-firs
   }
   assert.deepEqual(calls, []);
   assert.deepEqual(fetchCalls, [], 'the Diary is not asked either');
+});
+
+test('an accepted embeddings address goes through the route to both halves', async () => {
+  const calls = [];
+  const migration = { status: () => ({}), setNext: (t) => { calls.push(t); return {}; } };
+  const { handler, fetchCalls } = routes({ migration });
+  const res = fakeRes();
+  await handler({ method: 'POST', body: { action: 'set-next', target: { model: 'm', baseUrl: 'http://private.example./v1', diaryBaseUrl: 'http://127.0.0.1:8081/v1' } } }, res, { path: '/api/embedding', authn: admin });
+  assert.equal(res.status, 200);
+  assert.equal(calls.length, 1);
+  assert.equal(fetchCalls.length, 1);
+});
+
+// ── the address decision itself (embedding-address.cjs) ───────────────────────────────────────
+
+test('the real resolver path: private literals, localhost and a compose name pass; public and unresolvable names are refused', async () => {
+  // No injected lookup here: literals need none, `localhost` is the hosts file, `.invalid` never resolves.
+  for (const ok of ['http://127.0.0.1:8080/v1', 'http://10.1.2.3/v1', 'http://192.168.0.5:8081', 'http://172.20.0.9/v1', 'http://[::1]:8080/v1', 'http://localhost:8080/v1', 'https://localhost/v1']) {
+    assert.deepEqual(await checkEmbeddingAddress(ok), { ok: true }, ok);
+  }
+  for (const bad of ['http://8.8.8.8/v1', 'https://93.184.216.34:8443/v1', 'http://[2001:4860:4860::8888]/v1', 'http://[2606:4700:4700::1111]:8080/v1',
+    'http://no-such-name.invalid/v1', 'http://no-such-name.invalid./v1', 'ftp://127.0.0.1/', 'http://user:pw@127.0.0.1/', 'file:///etc/passwd', 'http:///', '', 'embed-next:8080']) {
+    const r = await checkEmbeddingAddress(bad);
+    assert.equal(r.ok, false, bad);
+    assert.ok(r.reason, bad);
+  }
+});
+
+test('a name is accepted only when every answer is private, and the resolver gets the host exactly as written', async () => {
+  const asked = [];
+  const lookup = async (host, opts) => { asked.push([host, opts.all]); return fakeLookup(host); };
+  assert.deepEqual(await checkEmbeddingAddress('http://embed-next:8080/v1', { lookup }), { ok: true });
+  assert.deepEqual(await checkEmbeddingAddress('http://private.example./v1', { lookup }), { ok: true }, 'a trailing dot is a name like another');
+  assert.equal((await checkEmbeddingAddress('http://public.example./v1', { lookup })).ok, false);
+  assert.equal((await checkEmbeddingAddress('http://mixed.example/v1', { lookup })).ok, false);
+  assert.equal((await checkEmbeddingAddress('http://mixed6.example/v1', { lookup })).ok, false);
+  assert.equal((await checkEmbeddingAddress('http://xn--bcher-kva.example/v1', { lookup })).ok, false);
+  assert.equal((await checkEmbeddingAddress('http://empty.example/v1', { lookup: async () => [] })).ok, false, 'no answer at all');
+  assert.equal((await checkEmbeddingAddress('http://odd.example/v1', { lookup: async () => [{ address: 'not-an-address' }] })).ok, false);
+  assert.equal((await checkEmbeddingAddress('http://slow.example/v1', { lookup: async () => { throw new Error('boom'); } })).ok, false);
+  assert.deepEqual(asked.slice(0, 2), [['embed-next', true], ['private.example.', true]]);
+});
+
+test('addresses the environment seeded are checked at start-up: refused ones are logged and not used, nothing is saved', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'embcfg-'));
+  const stateFile = path.join(dir, 'embedding-config.json');
+  const logs = [];
+  const log = (line) => logs.push(line);
+  const config = createEmbeddingConfig({ stateFile, log, env: { EMBEDDING_MODEL: 'nomic-embed-text-v1', EMBEDDING_BASE_URL: 'http://127.0.0.1:8080/v1',
+    EMBEDDING_NEXT_MODEL: 'embeddinggemma-2', EMBEDDING_NEXT_PROFILE: 'embeddinggemma-2', EMBEDDING_NEXT_BASE_URL: 'http://8.8.8.8:8080/v1' } });
+  assert.ok(config.next(), 'seeded first');
+  await guardSeededAddresses(config, { log });
+  assert.equal(config.next(), null, 'the public next is not used');
+  assert.equal(config.active().profile, 'nomic-v1', 'a private active address is left alone');
+  assert.equal(config.get().source, 'environment');
+  assert.equal(fs.existsSync(stateFile), false);
+  assert.match(logs.join('\n'), /EMBEDDING_NEXT_BASE_URL http:\/\/8\.8\.8\.8:8080\/v1 refused/);
+  assert.equal(config.damaged, undefined);
+  // The operator can still set a good next afterwards.
+  config.setNext({ model: 'embeddinggemma-2', profile: 'embeddinggemma-2', baseUrl: 'http://127.0.0.1:8081/v1' });
+  assert.equal(config.next().baseUrl, 'http://127.0.0.1:8081/v1');
+});
+
+test('a public EMBEDDING_BASE_URL turns embedding off instead of crashing or falling back to the engine', async () => {
+  const logs = [];
+  const log = (line) => logs.push(line);
+  const config = createEmbeddingConfig({ log, env: { EMBEDDING_MODEL: 'nomic-embed-text-v1', EMBEDDING_BASE_URL: 'http://[2001:4860:4860::8888]/v1' } });
+  await guardSeededAddresses(config, { log });
+  assert.throws(() => frame(config.active().profile, ['x']), /Unknown embedding profile/, 'every embed call refuses');
+  assert.match(config.damaged, /EMBEDDING_BASE_URL .* refused/);
+  assert.throws(() => config.setNext({ model: 'm' }), (e) => e.code === 'badState');
+  assert.match(logs.join('\n'), /must be on this network/);
+  // A guard that cannot decide (its check throws) never crashes start-up.
+  const other = createEmbeddingConfig({ log, env: { EMBEDDING_BASE_URL: 'http://127.0.0.1:8080/v1' } });
+  await guardSeededAddresses(other, { log, check: async () => { throw new Error('boom'); } });
+  assert.equal(other.active().profile, 'nomic-v1');
+  // A saved configuration was checked when it was set: the guard leaves it alone.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'embcfg-'));
+  const stateFile = path.join(dir, 'embedding-config.json');
+  fs.writeFileSync(stateFile, JSON.stringify({ version: 1, active: { model: 'm', profile: 'nomic-v1', baseUrl: 'http://8.8.8.8/v1' }, next: null, previous: null }));
+  const savedConfig = createEmbeddingConfig({ stateFile, log, env: {} });
+  await guardSeededAddresses(savedConfig, { log });
+  assert.equal(savedConfig.active().profile, 'nomic-v1');
+});
+
+test('a forgotten EMBEDDING_NEXT_PROFILE is warned about, with no change of behaviour', () => {
+  const logs = [];
+  const seeded = seedFromEnv({ EMBEDDING_NEXT_MODEL: 'embeddinggemma-2' }, 'default', (line) => logs.push(line));
+  assert.equal(seeded.next.profile, 'nomic-v1');
+  assert.equal(logs.length, 1);
+  assert.match(logs[0], /EMBEDDING_NEXT_MODEL=embeddinggemma-2 is set without EMBEDDING_NEXT_PROFILE/);
+  seedFromEnv({ EMBEDDING_NEXT_MODEL: 'embeddinggemma-2', EMBEDDING_NEXT_PROFILE: 'embeddinggemma-2' }, 'default', (line) => logs.push(line));
+  seedFromEnv({}, 'default', (line) => logs.push(line));
+  assert.equal(logs.length, 1, 'no warning when the profile is set or no next model is');
+});
+
+test('switching is only for the next that was checked', () => {
+  const c = createEmbeddingConfig({ env: { EMBEDDING_MODEL: 'nomic-embed-text-v1' } });
+  c.setNext({ model: 'embeddinggemma-2', profile: 'embeddinggemma-2' });
+  const checked = c.next();
+  c.setNext({ model: 'other-model', profile: 'embeddinggemma-2' });
+  assert.throws(() => c.switchToNext(checked), (e) => e.code === 'nextChanged' && e.status === 409);
+  assert.equal(c.active().model, 'nomic-embed-text-v1');
+  assert.equal(c.next().model, 'other-model');
+  c.switchToNext(c.next());
+  assert.equal(c.active().model, 'other-model');
 });

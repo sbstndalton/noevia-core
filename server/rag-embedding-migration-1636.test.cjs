@@ -49,17 +49,18 @@ const USER_B = '22222222-2222-4222-8222-222222222222';
 
 function freshRag() { delete require.cache[require.resolve('./rag.cjs')]; return require('./rag.cjs'); }
 
-async function setup({ active, next = null, users = [USER_A], removed = [], refuse = null } = {}) {
+async function setup({ active, next = null, users = [USER_A], removed = [], refuse = null, baseUrl = null, batch = null, onPause = null } = {}) {
   const server = await startServer({ refuse });
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rag-1636-'));
-  const env = { EMBEDDING_BASE_URL: server.url, EMBEDDING_MODEL: active?.model || 'nomic-test', EMBEDDING_PROFILE: active?.profile || '' };
+  const env = { EMBEDDING_BASE_URL: baseUrl || server.url, EMBEDDING_MODEL: active?.model || 'nomic-test', EMBEDDING_PROFILE: active?.profile || '' };
   if (next) Object.assign(env, { EMBEDDING_NEXT_MODEL: next.model, EMBEDDING_NEXT_PROFILE: next.profile, EMBEDDING_NEXT_BASE_URL: server.url });
   const config = createEmbeddingConfig({ env, stateFile: path.join(dir, 'embedding-config.json') });
   const rag = freshRag();
   rag.init({ dataDir: dir, inferenceUrl: 'http://engine.invalid', embeddingConfig: config,
     userDataDirFn: (id) => path.join(dir, 'users', id), listUserIds: () => users, userActive: (id) => !removed.includes(id) });
   const pauses = [];
-  const migration = createEmbeddingMigration({ config, rag, env: { EMBEDDING_REINDEX_DUTY: '0.5', EMBEDDING_REINDEX_MIN_PAUSE_MS: '0' }, sleep: async (ms) => { pauses.push(ms); }, log: () => {} });
+  const migration = createEmbeddingMigration({ config, rag, env: { EMBEDDING_REINDEX_DUTY: '0.5', EMBEDDING_REINDEX_MIN_PAUSE_MS: '0', ...(batch ? { EMBEDDING_REINDEX_BATCH: String(batch) } : {}) },
+    sleep: async (ms) => { pauses.push(ms); await onPause?.(ms, pauses.length); }, log: () => {} });
   return { server, dir, config, rag, migration, pauses, done: () => { migration.stop(); server.close(); } };
 }
 
@@ -124,7 +125,7 @@ dbTest('re-index without downtime: next fills beside active, switch is atomic, r
 
     // Switching before a re-index has covered every project is refused.
     s.migration.setNext(next);
-    await assert.rejects(s.migration.switchToNext(), (e) => e.code === 'notReady' || e.code === undefined);
+    await assert.rejects(s.migration.switchToNext(), (e) => e.code === 'notReady' && e.status === 409);
     // While the next model is being built, search still uses the active model only.
     s.server.seen.length = 0;
     { const [hit] = await s.rag.searchProject('p1', 'banana', USER_A); assert.ok(only(hit.body, 'banana'), hit.body.slice(0, 40)); }
@@ -153,7 +154,7 @@ dbTest('re-index without downtime: next fills beside active, switch is atomic, r
     { const [hit] = await s.rag.searchProject('p1', 'apple', USER_A); assert.ok(only(hit.body, 'apple'), hit.body.slice(0, 40)); }
     assert.deepEqual(s.server.seen.map((x) => [x.model, x.input]), [['nomic-test', ['apple']]], 'the old vectors serve again at once');
 
-    await s.migration.switchToNext().catch(() => {}); // nothing is next after a rollback
+    await assert.rejects(s.migration.switchToNext(), (e) => e.code === 'noNext' && e.status === 409); // nothing is next after a rollback
     assert.equal(s.config.next(), null);
     s.migration.finish(); // drops the rolled-away gemma vectors
     const db = openDb(s.dir, USER_A, 'p1');
@@ -230,5 +231,136 @@ dbTest('a chunk the new server refuses is skipped, the rest of the file is fille
     await assert.rejects(s.migration.switchToNext(), (e) => e.code === 'notReady' && e.coverage.ready === false);
     await s.migration.switchToNext({ force: true });
     assert.equal(s.config.active().model, 'gemma-test');
+  } finally { s.done(); }
+});
+
+const slotModels = (db) => db.prepare("SELECT value FROM vec_meta WHERE key LIKE 'slot:%'").all().map((r) => JSON.parse(r.value).model).sort();
+
+dbTest('an embeddings server that redirects gets the text no further: the request fails and nothing reaches the other address', async () => {
+  const sink = await startServer();
+  const hops = [];
+  const redirector = http.createServer((req, res) => {
+    hops.push(req.url);
+    res.statusCode = 307; // a 307 keeps the method and the body: the worst case for an SSRF-style bounce
+    res.setHeader('Location', `${sink.url.replace(/\/v1$/, '')}${req.url}`);
+    res.end();
+  });
+  await new Promise((resolve) => redirector.listen(0, '127.0.0.1', resolve));
+  const redirectUrl = `http://127.0.0.1:${redirector.address().port}/v1`;
+  const s = await setup({ baseUrl: redirectUrl });
+  try {
+    await assert.rejects(s.rag.embed(['project text that must stay here'], { target: { baseUrl: redirectUrl, model: 'm', profile: 'nomic-v1' } }));
+    assert.equal(hops.length, 1, 'the first server was asked once');
+    assert.deepEqual(sink.seen, [], 'the second server saw nothing');
+    // The health probe of the active sidecar follows the same rule.
+    assert.equal(await s.rag.retrievalStatus(), 'degraded');
+    assert.deepEqual(sink.seen, []);
+    // So does the router probe (no dedicated address).
+    await assert.rejects(s.rag.embed(['text'], { target: { baseUrl: null, model: 'm', profile: 'nomic-v1' } }), 'the engine (unreachable here) is not followed anywhere either');
+  } finally { s.done(); redirector.close(); sink.close(); }
+});
+
+dbTest('the fill is paced: busy at most the duty share of the wall time (fake clock)', async () => {
+  for (const duty of [0.5, 0.25]) {
+    const clock = { t: 0 };
+    const cycles = []; // { busy, pause } per batch that was followed by a pause
+    const busyMs = [200, 400, 100, 300, 200, 200];
+    let n = 0;
+    const rag = {
+      listIndexes: () => [{ userId: USER_A, projectId: 'p1' }],
+      fillMissing: async () => { const busy = busyMs[n++]; clock.t += busy; cycles.push({ busy, pause: 0 }); return { attempted: 1, embedded: 1, refused: [], remaining: busyMs.length - n }; },
+    };
+    const config = createEmbeddingConfig({ env: { EMBEDDING_MODEL: 'a' } });
+    const migration = createEmbeddingMigration({ config, rag, env: { EMBEDDING_REINDEX_DUTY: String(duty), EMBEDDING_REINDEX_MIN_PAUSE_MS: '0' },
+      now: () => clock.t, sleep: async (ms) => { clock.t += ms; cycles.at(-1).pause = ms; }, log: () => {} });
+    await migration.kick();
+    const paced = cycles.filter((c) => c.pause > 0);
+    assert.equal(cycles.length, busyMs.length);
+    assert.equal(paced.length, busyMs.length - 1, 'a pause after every batch but the last');
+    for (const c of paced) assert.ok(c.busy / (c.busy + c.pause) <= duty + 1e-9, `batch of ${c.busy} ms then ${c.pause} ms at duty ${duty}`);
+    const busy = paced.reduce((a, c) => a + c.busy, 0);
+    const wall = paced.reduce((a, c) => a + c.busy + c.pause, 0);
+    assert.ok(busy / wall <= duty + 1e-9, `busy ratio ${busy / wall} at duty ${duty}`);
+    migration.stop();
+  }
+});
+
+dbTest('clearing the next model mid-fill stops the fill, drops the partial vectors and leaves the active model serving', async () => {
+  const s = await setup({ batch: 1, onPause: async (_ms, count) => { if (count === 1) s.migration.clearNext(); } });
+  try {
+    await s.rag.indexProjectFile('p1', 'notes.md', LARGE, USER_A);
+    s.migration.setNext({ baseUrl: s.server.url, model: 'gemma-test', profile: 'embeddinggemma-2' });
+    await s.migration.kick();
+    assert.equal(s.pauses.length, 1, 'the fill stopped at the first pause, with chunks still to do');
+    assert.equal(s.server.seen.filter((x) => /gemma/.test(x.model)).length, 1, 'one gemma batch (of one chunk) was ever sent');
+    assert.equal(s.config.next(), null);
+    assert.equal(s.config.active().model, 'nomic-test');
+    const db = openDb(s.dir, USER_A, 'p1');
+    assert.deepEqual(slotModels(db), ['nomic-test'], 'the partly built slot is gone');
+    db.close();
+    s.server.seen.length = 0;
+    const [hit] = await s.rag.searchProject('p1', 'banana', USER_A);
+    assert.ok(only(hit.body, 'banana'), hit.body.slice(0, 40));
+    assert.deepEqual(s.server.seen.map((x) => [x.model, x.input]), [['nomic-test', ['banana']]]);
+  } finally { s.done(); }
+});
+
+dbTest('a switch is for the next that was checked: if next changed during the parity check, nothing switches', async () => {
+  const s = await setup();
+  const other = await startServer();
+  try {
+    await s.rag.indexProjectFile('p1', 'notes.md', LARGE, USER_A);
+    const sameModelElsewhere = { baseUrl: other.url, model: 'nomic-test', profile: 'nomic-v1' };
+    s.config.setNext(sameModelElsewhere);
+    let swapped = false;
+    const racing = createEmbeddingMigration({ config: s.config, env: { EMBEDDING_REINDEX_MIN_PAUSE_MS: '0' }, sleep: async () => {}, log: () => {},
+      rag: { ...s.rag, embed: async (...args) => {
+        if (!swapped) { swapped = true; s.config.setNext({ baseUrl: s.server.url, model: 'gemma-test', profile: 'embeddinggemma-2' }); } // an administrator picks another model meanwhile
+        return s.rag.embed(...args);
+      } } });
+    await assert.rejects(racing.switchToNext(), (e) => e.code === 'nextChanged' && e.status === 409);
+    assert.equal(s.config.active().model, 'nomic-test');
+    assert.equal(s.config.active().baseUrl, s.server.url.replace(/\/+$/, ''), 'the endpoint did not move');
+    assert.equal(s.config.next().model, 'gemma-test', 'the newer choice is untouched');
+    assert.equal(s.config.previous(), null);
+    racing.stop();
+  } finally { s.done(); other.close(); }
+});
+
+dbTest('switching drops the vectors of the rollback target it displaces; a rollback drops a partly built next', async () => {
+  const s = await setup();
+  try {
+    await s.rag.indexProjectFile('p1', 'notes.md', LARGE, USER_A);
+    const gemma = { baseUrl: s.server.url, model: 'gemma-test', profile: 'embeddinggemma-2' };
+    const gemmaB = { baseUrl: s.server.url, model: 'gemma-test-b', profile: 'embeddinggemma-2' };
+    s.migration.setNext(gemma);
+    await s.migration.kick();
+    await s.migration.switchToNext(); // active gemma-test, previous nomic-test
+    const db = openDb(s.dir, USER_A, 'p1');
+    try {
+      assert.deepEqual(slotModels(db), ['gemma-test', 'nomic-test']);
+
+      // A rollback leaves no partly built next behind.
+      s.migration.setNext(gemmaB);
+      await s.migration.kick();
+      assert.deepEqual(slotModels(db), ['gemma-test', 'gemma-test-b', 'nomic-test']);
+      s.migration.rollback(); // active nomic-test, previous gemma-test, next abandoned
+      assert.equal(s.config.active().model, 'nomic-test');
+      assert.equal(s.config.next(), null);
+      assert.deepEqual(slotModels(db), ['gemma-test', 'nomic-test'], 'gemma-test-b was only half built and is dropped');
+
+      // Going forward again: the older previous (gemma-test) is displaced when nomic-test's successor takes over.
+      s.migration.setNext(gemmaB);
+      await s.migration.kick();
+      await s.migration.switchToNext(); // active gemma-test-b, previous nomic-test; gemma-test displaced
+      assert.equal(s.config.previous().model, 'nomic-test');
+      assert.deepEqual(slotModels(db), ['gemma-test-b', 'nomic-test'], 'the displaced target no longer holds vectors');
+      assert.equal(db.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE name LIKE 'vecmap_%'").get().n, 1);
+    } finally { db.close(); }
+    // Rolling back to the target that is kept still works at once.
+    s.migration.rollback();
+    s.server.seen.length = 0;
+    const [hit] = await s.rag.searchProject('p1', 'apple', USER_A);
+    assert.ok(only(hit.body, 'apple'), hit.body.slice(0, 40));
   } finally { s.done(); }
 });

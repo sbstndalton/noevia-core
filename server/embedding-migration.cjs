@@ -9,9 +9,12 @@
 //                    query and index run reads the new target). Refused until next covers every
 //                    index unless forced, and, when only the endpoint changes, until the new
 //                    endpoint gives the same vectors as the old one. The old target stays as
-//                    `previous` with its vectors, for rollback.
+//                    `previous` with its vectors, for rollback; a `previous` it displaces (one
+//                    never finished) loses its vectors. The switch is for the `next` that was
+//                    checked: if next changed meanwhile, nothing switches (nextChanged).
 //   rollback()       previous becomes active again (its slot is still there; vectors for files
-//                    indexed since the switch are filled in by the background pass).
+//                    indexed since the switch are filled in by the background pass). A next that
+//                    was still being built is abandoned and loses its partial vectors.
 //   finish()         drop previous and its vectors.
 //   clearNext()      abandon a re-index (its partial vectors are dropped).
 //
@@ -179,6 +182,7 @@ function createEmbeddingMigration({ config, rag, env = process.env, sleep = (ms)
     async switchToNext({ force = false } = {}) {
       const c = config.get();
       if (!c.next) throw Object.assign(Error('No re-index is under way.'), { status: 409, code: 'noNext' });
+      const checked = c.next; // what the checks below are about; the parity check awaits the network
       if (sameIdentity(c.next, c.active)) {
         // Same model and profile on another endpoint: the stored vectors stay valid only if the
         // new endpoint really gives the same vectors.
@@ -188,13 +192,19 @@ function createEmbeddingMigration({ config, rag, env = process.env, sleep = (ms)
         const cov = coverageOf(c.next);
         if (!cov.ready) throw Object.assign(Error('The new model has not finished indexing every project yet.'), { status: 409, code: 'notReady', coverage: cov });
       }
-      config.switchToNext();
+      const displaced = config.previous();
+      const after = config.switchToNext(checked);
+      // An older rollback target is displaced by the new one: its vectors would never be read again.
+      dropIfOrphaned(displaced, after);
       log(`[embedding] switched to ${c.next.profile}/${c.next.model}${force ? ' (forced)' : ''}; previous ${c.active.profile}/${c.active.model} kept for rollback`);
       kick();
       return status();
     },
     rollback() {
+      const before = config.get();
       const c = config.rollback();
+      // The re-index that was under way is abandoned by a rollback: no partly built slot stays behind.
+      dropIfOrphaned(before.next, c);
       log(`[embedding] rolled back to ${c.active.profile}/${c.active.model}`);
       kick();
       return status();
@@ -210,6 +220,11 @@ function createEmbeddingMigration({ config, rag, env = process.env, sleep = (ms)
     },
     stop() { stopped = true; if (retryTimer) clearTimeout(retryTimer); retryTimer = null; return running; },
   };
+
+  // Drops `target`'s vectors unless the configuration `now` still holds that model and profile.
+  function dropIfOrphaned(target, now) {
+    if (target && ![now.active, now.next, now.previous].some((t) => sameIdentity(t, target))) dropEverywhere(target);
+  }
 
   function dropEverywhere(target) {
     for (const entry of rag.listIndexes()) {
