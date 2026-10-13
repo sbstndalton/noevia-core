@@ -176,7 +176,7 @@ test('checkLogin never throws and classifies statuses', async () => {
 function sourceStatus() {
   const exportsObject = {};
   vm.runInNewContext(ts.transpileModule(fs.readFileSync(path.join(__dirname, '../src/source-status.ts'), 'utf8'), {
-    compilerOptions: { module: ts.ModuleKind.CommonJS },
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
   }).outputText, { exports: exportsObject });
   return exportsObject;
 }
