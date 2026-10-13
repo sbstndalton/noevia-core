@@ -449,7 +449,9 @@ function createChatHandler({
       const readable = require('./instruction-skills.cjs').sources(project);
       // #552: the chunks that went into the prompt, reported to the browser as a `sources` event.
       filesBlock = await rag.filesContext(project.id, readable, message, currentWorkspace().userId,
-        (placed) => { replySources = require('./chat-sources.cjs').buildSources(placed, readable); partialReads = require('./source-coverage.cjs').partialSources(readable, placed); }, { attached: chatAttachments });
+        // #1513 counts what the prompt holds (`injected`), not only the reported sources: an unnamed file head
+        // is in the prompt but not a source chip (#1457), and was told to the model as "none of it" read.
+        (placed, injected) => { replySources = require('./chat-sources.cjs').buildSources(placed, readable); partialReads = require('./source-coverage.cjs').partialSources(readable, Array.isArray(injected) ? injected : placed); }, { attached: chatAttachments });
     }
 
     const sysParts = [];

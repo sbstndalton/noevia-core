@@ -606,13 +606,16 @@ async function filesContext(projectId, files, query, userId, onSources, { attach
 
   const notices = files.map(f => documentNotice(f) || (f.attachment?.reason ? `${quoteName(f.name)}: ${f.attachment.reason}` : '')).filter(Boolean);
   const parts = [];
-  // What is placed in the prompt, in order, for the caller's optional onSources (#552).
+  // What is placed in the prompt, in order, for the caller's optional onSources (#552): `placed` is what
+  // the reply reports as its sources (#1457: a whole file or a file head only when the question names it),
+  // `injected` is everything the prompt holds, which is what a coverage check must count (#1513).
   const placed = [];
+  const injected = [];
   if (ragAvailable() && large.length > 0) {
     const hits = await searchProject(projectId, query, userId);
     if (hits.length > 0) {
       const permitted = new Set(files.map(f => f.name));
-      for (const h of hits) if (permitted.has(h.file)) { parts.push(frameUntrusted('excerpt', h.file, h.body)); placed.push({ file: h.file, body: h.body, score: h.score, kind: 'excerpt' }); }
+      for (const h of hits) if (permitted.has(h.file)) { parts.push(frameUntrusted('excerpt', h.file, h.body)); const e = { file: h.file, body: h.body, score: h.score, kind: 'excerpt' }; placed.push(e); injected.push(e); }
     }
   }
   // Whole small files (and, without hits, the head of each large file) are
@@ -625,11 +628,11 @@ async function filesContext(projectId, files, query, userId, onSources, { attach
   const omitted = [];
   for (const c of candidates) {
     // #1457: injected either way, but reported as a source only when the question names it.
-    if (c.text.length <= budget) { parts.push(c.text); budget -= c.text.length; if (questionNames(c.f.name)) placed.push({ file: c.f.name, body: c.body, kind: 'file' }); }
+    if (c.text.length <= budget) { parts.push(c.text); budget -= c.text.length; const e = { file: c.f.name, body: c.body, kind: 'file' }; injected.push(e); if (questionNames(c.f.name)) placed.push(e); }
     else omitted.push(c.f.name);
   }
   if (omitted.length) manifest += ` ${omitted.length} more file${omitted.length === 1 ? '' : 's'} not included (prompt size limit): ${quotedNames(omitted)}.`;
-  if (typeof onSources === 'function') { try { onSources(placed); } catch { /* a reporting hook never breaks the prompt */ } }
+  if (typeof onSources === 'function') { try { onSources(placed, injected); } catch { /* a reporting hook never breaks the prompt */ } }
   const coverage = 'Source completeness: ' + (notices.join('\n') || 'Legacy text sources have no page completeness metadata.') + '\nContext may contain excerpts only. Use read_project_file with PDF startPage/endPage and offset for pages beyond the summary. Do not treat missing excerpts or failed/partial sources as evidence of absence.';
   return parts.length ? [manifest, coverage, ...parts].join('\n\n') : [manifest, coverage].join("\n");
 }

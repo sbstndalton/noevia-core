@@ -15,7 +15,7 @@ const number = (n) => Number(n).toLocaleString('en-GB');
 /**
  * Sources of which this reply read only part.
  * @param {object[]} files   the readable project sources ({ name, content })
- * @param {object[]} placed  what filesContext put in the prompt ({ file, body }), as onSources reports it
+ * @param {object[]} placed  what filesContext put in the prompt ({ file, body }): the second argument it gives onSources
  * @returns {{ name: string, length: number, read: number }[]}
  */
 function partialSources(files, placed) {

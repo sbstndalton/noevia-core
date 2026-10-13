@@ -65,6 +65,17 @@ test('#1457: a whole file the question does not name is injected but not reporte
   assert.equal(placed.length, 0, 'no source chip for a file the question did not name');
 });
 
+test('#1457/#1513: an unnamed file head is not a reported source but is reported as injected', async () => {
+  const files = [{ name: 'small.md', content: 'tiny note' }, { name: 'big.txt', content: 'Z'.repeat(30000) }];
+  let placed = null, injected = null;
+  const text = await load([], false).filesContext('p', files, 'Is HERON-9001 anywhere?', 't', (p, i) => { placed = p; injected = i; });
+  assert.match(text, /label="big\.txt"/, 'the head of the large file is in the prompt');
+  assert.equal(placed.length, 0, 'neither file is named, so neither is a source chip');
+  assert.deepEqual(Array.from(injected, (e) => [e.file, e.kind, e.body.length]), [['small.md', 'file', 9], ['big.txt', 'file', 24000]]);
+  const { partialSources } = require('./source-coverage.cjs');
+  assert.deepEqual(partialSources(files, injected), [{ name: 'big.txt', length: 30000, read: 24000 }], 'the head counts as read');
+});
+
 test('without retrieval the fallback heads that reach the prompt are reported; omitted files are not', async () => {
   const files = [{ name: 'big.txt', content: 'Z'.repeat(5000) }, { name: 'huge.txt', content: 'Y'.repeat(5000) }];
   let placed = null;
