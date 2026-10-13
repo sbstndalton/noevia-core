@@ -126,6 +126,12 @@ test('automaticBoxesFor: a URL is fetched only from a short one-line message, ne
   const email = 'Hi Sam,\nplease find the synthetic invoice at https://example.com/invoice/123 before Friday.\nThanks,\nAlex';
   assert.deepEqual(automaticBoxesFor(email), []);
   assert.equal(wantsWeb(email), false);
+  // #1550 review: a word like "latest" inside the pasted text does not let its link be fetched.
+  const latest = 'Hi Sam,\nyour latest synthetic invoice is at https://example.com/i/123\nThanks';
+  assert.deepEqual(automaticBoxesFor(latest), []);
+  assert.equal(wantsWeb(latest), false);
+  // Asking for the web by name still adds it.
+  assert.equal(wantsWeb(`${latest}\nPlease search the web for this sender.`), true);
   assert.equal(wantsWeb(`Summarise ${'this synthetic page in detail '.repeat(6)}https://example.com/x`), false, 'a long message with a URL is not fetched');
 });
 

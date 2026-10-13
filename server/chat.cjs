@@ -389,7 +389,8 @@ function createChatHandler({
     const requestToolboxes = (automaticAdded = []) => {
       const base = require('./toolboxes-permitted.cjs').selectedToolboxIds({ project, defaultToolboxes: DEFAULT_TOOLBOXES, connectorBoxes: CONNECTOR_BOXES, connected: connectedBoxes(chatUser) });
       const added = automaticAdded.filter((id) => !base.includes(id));
-      const selectedBoxes = require('./tools-mode.cjs').orderWithAdditions([...base, ...added], added, automaticHead);
+      // With nothing added (Manual, or an Automatic turn that needs nothing) the list keeps its own order.
+      const selectedBoxes = added.length ? require('./tools-mode.cjs').orderWithAdditions([...base, ...added], added, automaticHead) : base;
       // Per-turn overrides from the composer catalogue (#237): only boxes this server already offers
       // may be added, never a connector box; the OAuth filter below and the write gate still apply.
       if (Array.isArray(body.turnToolboxes)) {

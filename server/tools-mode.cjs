@@ -114,8 +114,13 @@ const bare = (words) => new RegExp(`\\b(?:${words})\\b`, 'i');
 function wantsWeb(message) {
   const text = typeof message === 'string' ? message.slice(0, 4000) : '';
   if (!text.trim()) return false;
+  // A link inside pasted text (an email, a long multi-line message) is never fetched on a word like
+  // "latest" alone: the gate prefetches a URL first and without a length limit, so only an explicit
+  // request to use the web adds Web search there (#1550 review).
+  const hasUrl = URL_RE.test(text), shortSearch = require('./tool-gate.cjs').prefetchableSearch(text);
+  if (hasUrl && !shortSearch) return EXPLICIT_WEB_RE.test(text);
   if (EXPLICIT_WEB_RE.test(text) || WEB_RE.test(text)) return true;
-  return URL_RE.test(text) && require('./tool-gate.cjs').prefetchableSearch(text);
+  return hasUrl && shortSearch;
 }
 
 /** The box ids a message plainly needs, most specific first. Pure; the caller checks availability. */
