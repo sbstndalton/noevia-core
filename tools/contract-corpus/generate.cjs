@@ -14,6 +14,8 @@
 // finish if any synthetic secret value reached the corpus.
 //
 // No model is loaded, no real Diary is called: the mocks answer every model and Diary request.
+// The chat prompt's date line states mocks.cjs CORPUS_NOW (NOEVIA_CONTRACT_FIXED_NOW), not today, so the
+// corpus does not change with the day it is recorded or replayed on.
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
