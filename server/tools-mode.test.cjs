@@ -233,3 +233,10 @@ test('createAutomaticToolsReady: a Nextcloud box needs the account\'s own connec
   assert.equal(ready({ id: 'local-user' })({ server: 'synthetic-search' }), true, 'a box on another server needs nothing from the account');
   assert.deepEqual(reads, [], 'and the storage is not read for it');
 });
+
+test('#1646: isPrivateDataBox is an allow-list: only core, web and offline-reference boxes may go to a hybrid cloud route', () => {
+  const tm = require('./tools-mode.cjs');
+  for (const id of ['core', 'web-search', 'web-crawl', 'offline-wikipedia']) assert.equal(tm.isPrivateDataBox(id), false, id);
+  for (const id of ['nextcloud-files', 'nextcloud-mail', 'project-docs', 'gdrive', 'diary', 'a-box-added-later', '', undefined]) assert.equal(tm.isPrivateDataBox(id), true, String(id));
+  assert.ok(tm.PRIVATE_CORE_TOOLS.has('read_project_file') && !tm.PRIVATE_CORE_TOOLS.has('get_current_time'));
+});

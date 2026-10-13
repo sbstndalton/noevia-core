@@ -32,13 +32,16 @@ function partialSources(files, placed) {
   return out;
 }
 
+// #1646: the sentence a hybrid cloud route without a grant removes (read_project_file is not offered there).
+const READ_FILE_HINT = ' read_project_file with an offset can read more of a file.';
+
 /** The system-text note for the model. Empty when every source was read in full. */
 function coverageNote(partial) {
   if (!Array.isArray(partial) || !partial.length) return '';
   // A synced file's name is not ours to trust: quoted and escaped, so a quote or a newline in it cannot start
   // a line of its own in the system text (#1588).
   const parts = partial.map((p) => `${quoteName(p.name)} is ${number(p.length)} characters long and this reply read ${p.read ? `only ${number(p.read)} characters of it (excerpts or the start)` : 'none of it (it was not included)'}`);
-  return `Source text was truncated for this reply: ${parts.join('; ')}. The rest of each file was NOT read. Do not say that some text is absent from a file, or answer "no", from the part you read; say which part you read. read_project_file with an offset can read more of a file.`;
+  return `Source text was truncated for this reply: ${parts.join('; ')}. The rest of each file was NOT read. Do not say that some text is absent from a file, or answer "no", from the part you read; say which part you read.${READ_FILE_HINT}`;
 }
 
 /** The warning the user sees with the reply, in the same terms as the note. Empty when nothing was cut. */
@@ -47,4 +50,4 @@ function coverageWarning(partial) {
   return partial.map((p) => `Only part of "${p.name}" was read for this reply (${number(p.read)} of ${number(p.length)} characters); answers about the rest may be wrong.`).join(' ');
 }
 
-module.exports = { partialSources, coverageNote, coverageWarning, WHOLE_MAX };
+module.exports = { partialSources, coverageNote, coverageWarning, WHOLE_MAX, READ_FILE_HINT };
