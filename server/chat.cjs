@@ -143,6 +143,10 @@ function normalizeReplayHistory(mapped, newMessage) {
 // #1553: a reply whose chat template cannot take tools is told so in the request itself. Without this the model
 // said no search tool existed, or wrote search results it never had. The note is ours and holds no tool output.
 const TOOLS_OFF_MODEL_NOTE = 'No tools can run in this reply: this model\'s chat template cannot use them. If the person asks for a web search, a file, a live lookup or any other tool, say so in one line at the start. Do not write results, sources, excerpts or simulated output for it.';
+// #1646: the prompt lines that send the model to read_project_file, kept in one place so a cloud route without a grant
+// (where that tool is not offered) can reword them. The sources' coverage line lives in rag.cjs.
+const SKILL_INDEX_LEAD = 'Available skills (load the full file with the read_project_file tool when a task matches; do not guess their contents):';
+const SKILL_INDEX_LEAD_NO_READER = 'Available skills (their files cannot be loaded in this reply; do not guess their contents):';
 function withSystemNote(messages, note) {
   const at = messages.findIndex((m) => m?.role === 'system' && typeof m.content === 'string');
   if (at < 0) return [{ role: 'system', content: note }, ...messages];
@@ -508,7 +512,7 @@ function createChatHandler({
       const skills = skillsIndexFor(project);
       if (skills.length) {
         sysParts.push(
-          `Available skills (load the full file with the read_project_file tool when a task matches; do not guess their contents):\n` +
+          `${SKILL_INDEX_LEAD}\n` +
             require('./skill-index.cjs').formatSkillIndex(skills),
         );
         // L1 up front when one skill clearly matches this message, so a small model does not have
@@ -776,9 +780,11 @@ function createChatHandler({
           send({ type: 'route_remembered', ...patch });
         }
         routeTarget = { route: decided.route, reason: decided.reason, ...(decided.reason === 'check-unavailable' && decided.cause ? { detail: decided.cause } : {}), cloud: settings.cloud, row: decided.route === 'cloud' ? cloudRow : null,
-          // #1646: a hybrid cloud route with no per-chat allowCloud grant (a remembered "Send to cloud" counts as one).
-          // The router read the conversation only, so this turn is never given a box that reads private data.
-          hybridUngranted: settings.mode === 'hybrid' && decided.route === 'cloud' && !(flags.allowCloud === true || decided.remember === 'cloud') };
+          // #1646: a hybrid cloud route with no grant. A grant is the chat's allowCloud, a remembered "Send to cloud", or
+          // the person's one-off "Send to cloud" on the sensitive card (that turn only). The router read the conversation
+          // only, so an ungranted turn is never given a box that reads private data.
+          hybridUngranted: settings.mode === 'hybrid' && decided.route === 'cloud'
+            && !(flags.allowCloud === true || decided.remember === 'cloud' || decided.reason === 'user-choice') };
       }
     }
     // #779 F2: on a cloud route chosen by routing modes (hybrid and cloud alike: the check is
@@ -920,11 +926,22 @@ function createChatHandler({
       return true;
     };
     const automaticTools = toolModes.toolsModeOf(project) === 'auto' && project?.id !== diaryExtras?.PROJECT_ID;
+    // A private box that is only connected (Drive) or defaulted (Project documents) is not a reason to leave the
+    // cloud: it is stripped below, and the turn goes local only when THIS turn needs one. It needs one when the person
+    // picked a private box for the turn, when Automatic would add one for the message, or when the tool gate would
+    // use one of the tools the project carries (it picks only from the tools it is shown, so it is shown all of them).
     if (cloudUngranted() && !body.compactOnly) {
-      const carried = requestToolboxes().filter(toolModes.isPrivateDataBox);
-      const wanted = carried.length || !automaticTools ? carried
-        : toolModes.automaticAdditions({ message, base: requestToolboxes(), boxes: allToolboxes(), connectorBoxes: CONNECTOR_BOXES,
+      const carriedIds = requestToolboxes();
+      let wanted = Array.isArray(body.turnToolboxes) ? carriedIds.filter((id) => body.turnToolboxes.includes(id) && toolModes.isPrivateDataBox(id)) : [];
+      if (!wanted.length && automaticTools) {
+        wanted = toolModes.automaticAdditions({ message, base: carriedIds, boxes: allToolboxes(), connectorBoxes: CONNECTOR_BOXES,
           isWriteTool, ready: automaticToolsReady(chatUser), privateData: true }).filter(toolModes.isPrivateDataBox);
+      }
+      if (!wanted.length && toolGate && carriedIds.some(toolModes.isPrivateDataBox)) {
+        const everything = resolveTools({ ...project, toolsMode: 'manual', toolboxes: carriedIds }, model, (name) => toolPolicy.mode(chatUser?.id, name, isWriteTool(name)) === 'block');
+        const wouldUse = await toolGate.evaluate(message, everything.tools, ...(chatFrame ? [steering.gateBias(chatFrame)] : []));
+        if (wouldUse && wouldUse.decision !== 'none' && isPrivateTool(wouldUse.decision.tool)) wanted = [wouldUse.decision.tool];
+      }
       if (wanted.length) rerouteLocalForPrivateTools();
     }
     const automaticLocal = !externalProvider && routeTarget?.route !== 'cloud' && provider?.id === DEFAULT_PROVIDER_ID;
@@ -941,6 +958,12 @@ function createChatHandler({
     if (cloudUngranted()) {
       for (let k = selectedBoxes.length - 1; k >= 0; k--) if (toolModes.isPrivateDataBox(selectedBoxes[k])) { selectedBoxes.splice(k, 1); privateStripped = true; }
       if (project?.files?.length && selectedBoxes.includes('core')) privateStripped = true; // read_project_file is taken out below
+      // The prompt must not send the model to a tool it does not have (the skills index, the sources' coverage line).
+      const dropReader = (text) => (typeof text === 'string' ? text
+        .replace(SKILL_INDEX_LEAD, SKILL_INDEX_LEAD_NO_READER)
+        .replace(require('./rag.cjs').READ_FILE_HINT, '') : text);
+      sys = dropReader(sys);
+      wire = wire.map((m) => (typeof m.content === 'string' ? { ...m, content: dropReader(m.content) } : m));
     }
     automaticAdded = automaticAdded.filter((id) => selectedBoxes.includes(id));
     if (automaticAdded.length) console.log(`[tools] Automatic added ${automaticAdded.join(', ')} for this message`);

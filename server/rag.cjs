@@ -633,7 +633,7 @@ async function filesContext(projectId, files, query, userId, onSources, { attach
   }
   if (omitted.length) manifest += ` ${omitted.length} more file${omitted.length === 1 ? '' : 's'} not included (prompt size limit): ${quotedNames(omitted)}.`;
   if (typeof onSources === 'function') { try { onSources(placed, injected); } catch { /* a reporting hook never breaks the prompt */ } }
-  const coverage = 'Source completeness: ' + (notices.join('\n') || 'Legacy text sources have no page completeness metadata.') + '\nContext may contain excerpts only. Use read_project_file with PDF startPage/endPage and offset for pages beyond the summary. Do not treat missing excerpts or failed/partial sources as evidence of absence.';
+  const coverage = 'Source completeness: ' + (notices.join('\n') || 'Legacy text sources have no page completeness metadata.') + '\nContext may contain excerpts only.' + READ_FILE_HINT + ' Do not treat missing excerpts or failed/partial sources as evidence of absence.';
   return parts.length ? [manifest, coverage, ...parts].join('\n\n') : [manifest, coverage].join("\n");
 }
 
@@ -645,4 +645,6 @@ function embedModel() { return EMBED_MODEL; }
 // How many per-file entries the process is tracking; for tests and diagnostics.
 const trackedFileState = () => ({ queues: fileQueues.size, generations: fileGenerations.size, versions: fileVersions.size });
 
-module.exports = { init, trackedFileState, indexProjectFile, deleteProjectFile, searchProject, filesContext, chunkText, ragAvailable, retrievalStatus, embed, embedModel, rerankPool };
+// #1646: the sentence a hybrid cloud route without a grant removes (read_project_file is not offered there).
+const READ_FILE_HINT = ' Use read_project_file with PDF startPage/endPage and offset for pages beyond the summary.';
+module.exports = { READ_FILE_HINT, init, trackedFileState, indexProjectFile, deleteProjectFile, searchProject, filesContext, chunkText, ragAvailable, retrievalStatus, embed, embedModel, rerankPool };
