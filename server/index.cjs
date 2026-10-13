@@ -861,7 +861,8 @@ const { handleChat } = require('./chat.cjs').createChatHandler({
   // #769: tainted sensitive arguments of a write always get their own approval card.
   provenancePolicy: { enabled: () => features.enabled('provenancePolicy') },
   // #778: routing modes. The setting is the signed-in account's own; the sensitivity check is the
-  // router role through the decision service (cloud forbidden), failing closed to "ask".
+  // router role through the decision service (cloud forbidden), failing closed to "ask". Its verdict
+  // counts only from a model on the qualified list (#1647, decision-qualification.cjs; none today).
   routingModes: {
     enabled: () => features.enabled('routingModes'),
     // #1007: a chat's or project's own override (project.routingMode) replaces the mode and the

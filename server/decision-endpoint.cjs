@@ -1,6 +1,7 @@
 'use strict';
 // Operator-configured private decision service; independent of answering-provider credentials.
 const { isIP } = require('node:net');
+const { identityOf } = require('./decision-qualification.cjs');
 function configuration(env = process.env) {
   try {
     const url = new URL(env.COWORK_DECISION_URL);
@@ -115,7 +116,11 @@ function createDecisionEndpoint({ env=process.env, fetchImpl=globalThis.fetch, h
       // logit backend read (scores[selected]); for two options a 0.6 share is a 0.2 margin over the
       // runner-up. It is NOT a calibrated probability of being right (calibrated:false), and a
       // `confidence` field in the reply is ignored: only the validated scores decide it.
-      return {selected:result.selected,scores:result.scores,confidence:result.scores[result.selected],metadata:{calibrated:false,model}};
+      // #1647: the identity the service reports (model id plus a content revision of the served weights),
+      // validated, so the sensitivity check can tell whether this model qualified to clear a turn for
+      // cloud (decision-qualification.cjs). Absent or malformed: no identity, so never qualified.
+      const identity=identityOf(result);
+      return {selected:result.selected,scores:result.scores,confidence:result.scores[result.selected],metadata:{calibrated:false,model,...(identity?{identity}:{})}};
     }
   };
 }
