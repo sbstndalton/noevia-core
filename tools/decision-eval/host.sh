@@ -13,7 +13,7 @@
 #   host.sh stop                stop the container (models stay on disk)
 #   host.sh du                  disk used by EVAL_DIR
 #
-# Resource caps: CPU only (no device passed), --cpus 4, --memory 5g with no swap, bound to
+# Resource caps: CPU only (no device passed), --cpus CPUS (default 4, at most 4), --memory 5g, bound to
 # 127.0.0.1, its own bridge network, a bearer key required. OLLAYA_MAX_LOADED_MODELS=1.
 set -euo pipefail
 EVAL_DIR=${EVAL_DIR:-/mnt/docker/appdata/cowork/eval/decisions}
@@ -22,6 +22,7 @@ NAME=${NAME:-noevia-eval-decisions}
 NET=${NET:-noevia-eval-decisions}
 PORT=${PORT:-11535}
 MIN_AVAILABLE_GB=${MIN_AVAILABLE_GB:-8}
+CPUS=${CPUS:-4} # 1-4; the live Laya service is capped at 2, so 2 gives a like-for-like latency
 URL="http://127.0.0.1:$PORT"
 
 key() { cat "$EVAL_DIR/run/api-key"; }
@@ -40,15 +41,16 @@ case "${1:-}" in
     ;;
   start)
     mode=${2:?online or offline}
+    case "$CPUS" in 1|2|3|4) ;; *) echo "CPUS must be 1-4" >&2; exit 2 ;; esac
     extra=()
     if [ "$mode" = offline ]; then extra=(-e OLLAYA_REGISTRY=http://127.0.0.1:9 -e OLLAYA_HF_ENDPOINT=http://127.0.0.1:9); fi
     docker rm -f "$NAME" >/dev/null 2>&1 || true
     docker run -d --name "$NAME" --label noevia.eval=1639 \
       --network "$NET" -p "127.0.0.1:$PORT:11435" \
-      --cpus 4 --memory 5g --memory-swap 5g --pids-limit 512 \
+      --cpus "$CPUS" --memory 5g --memory-swap 5g --pids-limit 512 \
       --cap-drop ALL --security-opt no-new-privileges \
       --env-file "$EVAL_DIR/run/env" \
-      -e OLLAYA_DEVICE=cpu -e OLLAYA_THREADS=4 -e OLLAYA_MAX_LOADED_MODELS=1 -e OLLAYA_KEEP_ALIVE=-1 \
+      -e OLLAYA_DEVICE=cpu -e OLLAYA_THREADS="$CPUS" -e OLLAYA_MAX_LOADED_MODELS=1 -e OLLAYA_KEEP_ALIVE=-1 \
       "${extra[@]}" \
       -v "$EVAL_DIR/models:/home/ollaya/.ollaya" \
       "$IMAGE" >/dev/null
