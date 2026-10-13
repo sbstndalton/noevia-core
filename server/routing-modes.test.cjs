@@ -10,6 +10,14 @@ const { createDecisions } = require('./decision/index.cjs');
 const { createApprovals } = require('./approvals.cjs');
 const { createApprovalRoutes } = require('./routes/approvals.cjs');
 
+// #1647: the sensitivity check's mechanics below run against a synthetic model on a test-only qualified
+// list. The shipped list (no model qualified) and the gate itself: sensitivity-qualification-1647.test.cjs.
+const SYN_IDENTITY = Object.freeze({ model: 'synthetic/sensitivity-test', revision: 'a'.repeat(40) });
+const SYN_QUALIFIED = [{ ...SYN_IDENTITY, evidence: { set: 'synthetic', sensitiveRecall: 1, measured: '2026-10-13' } }];
+const withIdentity = (r) => (r && typeof r === 'object' ? { ...r, metadata: { ...(r.metadata || {}), identity: SYN_IDENTITY } } : r);
+const qualifiedSensitivity = ({ decide, ...opts }) => rm.createSensitivity({ qualified: SYN_QUALIFIED, ...opts,
+  decide: typeof decide === 'function' ? async (r) => withIdentity(await decide(r)) : decide });
+
 // A valid synthetic IBAN (checksum computed below), a Luhn-valid test card number, a key shape.
 const SYN_IBAN = (() => { const bban = '370400440532013000'; for (let c = 2; c < 99; c++) { const v = `DE${String(c).padStart(2, '0')}${bban}`; if (rm.ibanValid(v)) return v; } return null; })();
 const SYN_CARD = '4111 1111 1111 1111';
@@ -112,7 +120,7 @@ test('routerChunks: by default a max-size turn is ONE chunk with the message sta
 test('sensitivity: a default max-size turn makes exactly 1 decide call; setting 3 makes 3', async () => {
   const big = { message: 'M'.repeat(400000), system: 'S'.repeat(400000), history: Array.from({ length: 200 }, (_, i) => ({ role: 'user', content: `h${i} `.repeat(2000) })) };
   const calls = [];
-  const check = rm.createSensitivity({ decide: async (r) => { calls.push(r.context.stateText); return { selected: 'not_sensitive', scores: { not_sensitive: 0.9 }, confidence: 0.9 }; } });
+  const check = qualifiedSensitivity({ decide: async (r) => { calls.push(r.context.stateText); return { selected: 'not_sensitive', scores: { not_sensitive: 0.9 }, confidence: 0.9 }; } });
   assert.deepEqual(await check(rm.routerChunks(big, { maxChunks: rm.routerMaxChunks({}) })), { flagged: false, flag: null });
   assert.equal(calls.length, 1);
   assert.ok(calls[0].startsWith('Message:\nM') && /h199 /.test(calls[0]));
@@ -123,7 +131,7 @@ test('sensitivity: a default max-size turn makes exactly 1 decide call; setting 
 
 test('sensitivity: no further chunk is sent once the deadline budget is spent, and that fails closed', async () => {
   const calls = [];
-  const check = rm.createSensitivity({ deadlineMs: () => 300, decide: (r) => { calls.push(r.constraints.deadlineMs); return new Promise((res) => setTimeout(() => res({ selected: 'not_sensitive', scores: { not_sensitive: 0.9 }, confidence: 0.9 }), 200)); } });
+  const check = qualifiedSensitivity({ deadlineMs: () => 300, decide: (r) => { calls.push(r.constraints.deadlineMs); return new Promise((res) => setTimeout(() => res({ selected: 'not_sensitive', scores: { not_sensitive: 0.9 }, confidence: 0.9 }), 200)); } });
   assert.deepEqual(await check(['a', 'b', 'c', 'd']), { flagged: true, flag: 'unavailable', cause: 'deadline' });
   assert.equal(calls.length, 2, 'the third chunk is never sent');
   assert.ok(calls[1] < 300, 'the second call only gets what is left');
@@ -132,7 +140,7 @@ test('sensitivity: no further chunk is sent once the deadline budget is spent, a
 test('sensitivity over chunks: chunks are asked one at a time; any sensitive or failed chunk flags the turn', async () => {
   const answer = (sel) => ({ selected: sel, scores: { [sel]: 0.9 }, confidence: 0.9 });
   const seen = [];
-  const byText = (map) => rm.createSensitivity({ decide: async (r) => { seen.push(r.context.stateText); const v = map(r.context.stateText); if (v instanceof Error) throw v; return answer(v); } });
+  const byText = (map) => qualifiedSensitivity({ decide: async (r) => { seen.push(r.context.stateText); const v = map(r.context.stateText); if (v instanceof Error) throw v; return answer(v); } });
   assert.deepEqual(await byText(() => 'not_sensitive')(['a', 'b', 'c', 'd']), { flagged: false, flag: null });
   assert.deepEqual(seen.sort(), ['a', 'b', 'c', 'd']);
   assert.deepEqual(await byText((t) => (t === 'c' ? 'sensitive' : 'not_sensitive'))(['a', 'b', 'c', 'd']), { flagged: true, flag: 'router' });
@@ -143,7 +151,7 @@ test('sensitivity over chunks: chunks are asked one at a time; any sensitive or 
   assert.deepEqual(await byText((t) => (t === 'a' ? 'sensitive' : 'not_sensitive'))(['a', 'b']), { flagged: true, flag: 'router' });
   assert.deepEqual(seen, ['a']);
   // A backend that ignores the deadline is cut off by the overall one, and that fails closed.
-  const hung = rm.createSensitivity({ deadlineMs: () => 100, decide: () => new Promise(() => {}) });
+  const hung = qualifiedSensitivity({ deadlineMs: () => 100, decide: () => new Promise(() => {}) });
   assert.deepEqual(await hung(['a']), { flagged: true, flag: 'unavailable', cause: 'deadline' });
 });
 
@@ -167,23 +175,23 @@ const layer = (decide) => createDecisions({ backends: { b: backend(decide) }, ch
 
 test('sensitivity: answers inside the options are used; the request forbids cloud', async () => {
   const seen = [];
-  const sensitive = rm.createSensitivity({ decide: async (r) => { seen.push(r); return layer(async () => ({ selected: 'sensitive', scores: { sensitive: 0.9, not_sensitive: 0.1 }, confidence: 0.9 }))(r); } });
+  const sensitive = qualifiedSensitivity({ decide: async (r) => { seen.push(r); return layer(async () => ({ selected: 'sensitive', scores: { sensitive: 0.9, not_sensitive: 0.1 }, confidence: 0.9 }))(r); } });
   assert.deepEqual(await sensitive('text'), { flagged: true, flag: 'router' });
   assert.equal(seen[0].context.cloud, 'forbidden');
   assert.deepEqual(seen[0].options.map((o) => o.id), ['sensitive', 'not_sensitive']);
-  const clear = rm.createSensitivity({ decide: layer(async () => ({ selected: 'not_sensitive', scores: { sensitive: 0.1, not_sensitive: 0.9 }, confidence: 0.9 })) });
+  const clear = qualifiedSensitivity({ decide: layer(async () => ({ selected: 'not_sensitive', scores: { sensitive: 0.1, not_sensitive: 0.9 }, confidence: 0.9 })) });
   assert.deepEqual(await clear('text'), { flagged: false, flag: null });
 });
 
 test('sensitivity fails closed: error, timeout, unavailable, low confidence, outside the options', async () => {
   const cases = {
-    error: rm.createSensitivity({ decide: layer(async () => { throw Error('boom'); }) }),
-    thrown: rm.createSensitivity({ decide: () => { throw Error('Decision service unavailable'); } }),
-    unavailable: rm.createSensitivity({ decide: undefined }),
-    timeout: rm.createSensitivity({ deadlineMs: () => 100, decide: layer(() => new Promise((r) => setTimeout(() => r({ selected: 'not_sensitive', scores: { not_sensitive: 1 } }), 400))) }),
-    lowConfidence: rm.createSensitivity({ decide: layer(async () => ({ selected: 'not_sensitive', scores: { sensitive: 0.45, not_sensitive: 0.55 }, confidence: 0.55 })) }),
-    outside: rm.createSensitivity({ decide: layer(async () => ({ selected: 'maybe', scores: { maybe: 1 } })) }),
-    nullAnswer: rm.createSensitivity({ decide: async () => ({ selected: 'not_sensitive', scores: {}, source: 'fallback' }) }),
+    error: qualifiedSensitivity({ decide: layer(async () => { throw Error('boom'); }) }),
+    thrown: qualifiedSensitivity({ decide: () => { throw Error('Decision service unavailable'); } }),
+    unavailable: qualifiedSensitivity({ decide: undefined }),
+    timeout: qualifiedSensitivity({ deadlineMs: () => 100, decide: layer(() => new Promise((r) => setTimeout(() => r({ selected: 'not_sensitive', scores: { not_sensitive: 1 } }), 400))) }),
+    lowConfidence: qualifiedSensitivity({ decide: layer(async () => ({ selected: 'not_sensitive', scores: { sensitive: 0.45, not_sensitive: 0.55 }, confidence: 0.55 })) }),
+    outside: qualifiedSensitivity({ decide: layer(async () => ({ selected: 'maybe', scores: { maybe: 1 } })) }),
+    nullAnswer: qualifiedSensitivity({ decide: async () => ({ selected: 'not_sensitive', scores: {}, source: 'fallback' }) }),
   };
   const causes = { error: 'exception', thrown: 'no-service', unavailable: 'no-service', timeout: 'deadline', lowConfidence: 'low-confidence', outside: 'invalid-result', nullAnswer: 'no-answer' };
   for (const [name, check] of Object.entries(cases)) {
@@ -706,7 +714,7 @@ test('logs and the decision log hold codes only, never content', async (t) => {
     assert.ok(r.consoleLines.some((l) => /^\[routing\] mode=hybrid route=(local|cloud) reason=user-choice flag=secret$/.test(l)));
   }
   const seen = [];
-  const check = rm.createSensitivity({ decide: async () => { throw Error(secretMessage); }, log: (e) => seen.push(e) });
+  const check = qualifiedSensitivity({ decide: async () => { throw Error(secretMessage); }, log: (e) => seen.push(e) });
   await check(secretMessage);
   assert.equal(JSON.stringify(seen).includes('Synthetic'), false);
 });
@@ -829,7 +837,7 @@ test('#1526: a health question raises the card even when the check cannot answer
 test('#1438: the cause of a check that could not answer is kept by resolveRoute and by a real createSensitivity', async () => {
   const never = async () => { throw Error('must not ask'); };
   // A decision call that throws the deadline error: createSensitivity turns it into a cause code.
-  const check = rm.createSensitivity({ decide: () => { throw Object.assign(Error('deadline passed'), { deadline: true }); } });
+  const check = qualifiedSensitivity({ decide: () => { throw Object.assign(Error('deadline passed'), { deadline: true }); } });
   assert.deepEqual(await check('text'), { flagged: true, flag: 'unavailable', cause: 'deadline' });
   assert.deepEqual(
     await rm.resolveRoute({ mode: 'hybrid', hasCloud: true, check: () => check('text'), ask: never }),
@@ -880,9 +888,10 @@ async function decisionServiceCheck(t, reply, { log = () => {}, seen = [] } = {}
   const settings = require('./decision-settings.cjs').createDecisionSettings({ store: { get: (k) => kv.get(k), set: (k, v) => kv.set(k, v) }, env: {} });
   settings.save({ url: `http://127.0.0.1:${server.address().port}`, timeoutMs: 1500 }, 'admin');
   const decisions = createDecisions({ backends: { configured: settings.backend() }, chains: { 'routing.sensitivity': ['configured'] } });
-  return rm.createSensitivity({ decide: decisions.decide, log });
+  return rm.createSensitivity({ decide: decisions.decide, log, qualified: SYN_QUALIFIED });
 }
-const layaReply = (selected, sensitive) => ({ selected, scores: { sensitive, not_sensitive: Math.round((1 - sensitive) * 100) / 100 }, model: 'convaiinnovations/laya', calibrated: false });
+// Laya's reply shape, from a synthetic model that reports its identity (#1647) and is on the test-only list.
+const layaReply = (selected, sensitive) => ({ selected, scores: { sensitive, not_sensitive: Math.round((1 - sensitive) * 100) / 100 }, model: SYN_IDENTITY.model, model_revision: SYN_IDENTITY.revision, calibrated: false });
 
 test('#1640: through the real decision service, "sensitive" at 0.97 shows the card and "not sensitive" at 0.97 goes to cloud', async (t) => {
   const message = 'Synthetic test: Ada (fictional) keeps her made-up account numbers in a notebook.';
@@ -992,13 +1001,13 @@ test('#1640 review: createSensitivity does not ask about a partial input, and a 
   let asked = 0;
   const decide = async () => { asked += 1; return { selected: 'not_sensitive', scores: { sensitive: 0.1, not_sensitive: 0.9 }, confidence: 0.9 }; };
   const logs = [];
-  const check = rm.createSensitivity({ decide, log: (e) => logs.push(e) });
+  const check = qualifiedSensitivity({ decide, log: (e) => logs.push(e) });
   assert.deepEqual(await check({ chunks: ['a'], complete: false }), { flagged: true, flag: 'unavailable', cause: 'partial' });
   assert.deepEqual(await check({ chunks: ['a'] }), { flagged: true, flag: 'unavailable', cause: 'partial' }, 'no complete:true is partial');
   assert.equal(asked, 0);
   assert.equal(logs[0].cause, 'partial');
   // More chunks than the check may ask about is partial too.
-  const capped = rm.createSensitivity({ decide, maxChunks: 1 });
+  const capped = qualifiedSensitivity({ decide, maxChunks: 1 });
   assert.deepEqual(await capped({ chunks: ['a', 'b'], complete: true }), { flagged: true, flag: 'unavailable', cause: 'partial' });
   assert.deepEqual(await check({ chunks: ['a'], complete: true }), { flagged: false, flag: null });
   assert.deepEqual(await check({ chunks: [], complete: true }), { flagged: true, flag: 'unavailable', cause: 'no-input' });

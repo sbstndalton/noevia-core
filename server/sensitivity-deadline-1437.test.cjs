@@ -5,14 +5,17 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const rm = require('./routing-modes.cjs');
 const { createDecisions } = require('./decision/index.cjs');
+// #1647: these run against a synthetic model on a test-only qualified list (the gate: sensitivity-qualification-1647.test.cjs).
+const SYN_IDENTITY = { model: 'synthetic/sensitivity-test', revision: 'a'.repeat(40) };
+const SYN_QUALIFIED = [{ ...SYN_IDENTITY, evidence: { set: 'synthetic', sensitiveRecall: 1, measured: '2026-10-13' } }];
 
 test('#1437: the sensitivity check has a named 2000 ms deadline (the owner-approved Laya ceiling)', async () => {
   assert.equal(rm.SENSITIVITY_DEADLINE_MS, 2000);
   const deadlines = [];
   const check = rm.createSensitivity({ decide: async (request) => {
     deadlines.push(request.constraints.deadlineMs);
-    return { selected: 'not_sensitive', scores: { not_sensitive: 1 }, confidence: 1 };
-  } });
+    return { selected: 'not_sensitive', scores: { not_sensitive: 1 }, confidence: 1, metadata: { identity: SYN_IDENTITY } };
+  }, qualified: SYN_QUALIFIED });
   assert.deepEqual(await check('synthetic'), { flagged: false, flag: null });
   assert.ok(deadlines[0] <= 2000 && deadlines[0] > 1900, `deadline was ${deadlines[0]}`);
 });
@@ -21,7 +24,7 @@ test('#1437: each sensitivity decision logs its outcome, latency and cause code,
   const logs = [];
   const check = rm.createSensitivity({
     decide: async () => ({ selected: null, scores: {}, source: 'fallback', metadata: { fellBack: 'no-backend-answered', cause: 'http-503' } }),
-    log: (entry) => logs.push(entry),
+    log: (entry) => logs.push(entry), qualified: SYN_QUALIFIED,
   });
   assert.deepEqual(await check('SYNTHETIC-PRIVATE-TEXT'), { flagged: true, flag: 'unavailable', cause: 'http-503' });
   assert.equal(logs.length, 1);
