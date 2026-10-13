@@ -210,8 +210,20 @@ function arrayProxy(field) {
     getOwnPropertyDescriptor() { return { enumerable: true, configurable: true }; },
   });
 }
+// #1636/#1638: the one embedding configuration (endpoint, model, profile), seeded from the environment
+// and saved beside the data once changed through /api/embedding (embedding-migration.cjs).
+const embeddingConfig = require('./embedding-config.cjs').install(require('./embedding-config.cjs').loadEmbeddingConfig({
+  env: process.env, stateFile: path.join(DATA_DIR, 'embedding-config.json') }));
 rag.init({ dataDir: DATA_DIR, inferenceUrl: INFERENCE_BASE, headersFn: () => inferenceHeaders(), userDataDirFn: workspaceStore.userDir,
-  userActive: (userId) => !workspaceStore.isRemoved(userId), inferenceGuard: () => modelManager.enterInference?.() || (() => {}) });
+  userActive: (userId) => !workspaceStore.isRemoved(userId), inferenceGuard: () => modelManager.enterInference?.() || (() => {}),
+  embeddingConfig, listUserIds: () => authService.db.prepare('SELECT id FROM users').all().map((r) => r.id) });
+// An address the environment seeded must be on this network (embedding-address.cjs); one that is not
+// is logged and not used. Asynchronous (DNS), so it settles just after start-up, before the first re-index pass.
+require('./embedding-address.cjs').guardSeededAddresses(embeddingConfig);
+const embeddingMigration = require('./embedding-migration.cjs').createEmbeddingMigration({ config: embeddingConfig, rag });
+// A re-index under way also covers files indexed meanwhile; with none under way nothing runs.
+rag.onIndexed(() => { if (embeddingConfig.next()) embeddingMigration.kick(); });
+if (embeddingConfig.next()) setTimeout(() => embeddingMigration.kick(), 30000).unref();
 
 // User-created projects; the earlier fixed demo spaces were removed.
 // spaces were deleted per user request — projects are user-created only.
@@ -408,11 +420,11 @@ const connectorRoutes = require('./routes/connectors.cjs').createConnectorRoutes
 // Account-level connectors are not a project choice: they join every chat of an account that
 // connected them, and never appear in a project's toolbox picker.
 // Skill auto-loading shares the router's switch and embedding model (chat-skill-routing.cjs).
-const chatSkillRouter = require('./chat-skill-routing.cjs').createChatSkillRouter({ enabled: () => features.enabled('toolRouter'), embed: (texts) => rag.embed(texts) });
+const chatSkillRouter = require('./chat-skill-routing.cjs').createChatSkillRouter({ enabled: () => features.enabled('toolRouter'), embed: (texts, opts) => rag.embed(texts, opts), embedIdentity: () => rag.embeddingIdentity() });
 // Roadmap E: narrows each message's toolboxes to the matching ones when features.toolRouter is on.
 const chatToolRouter = require('./chat-tool-routing.cjs').createChatToolRouter({
-  enabled: () => features.enabled('toolRouter'), boxes: () => allToolboxes(), embed: (texts) => rag.embed(texts),
-  embedModel: () => rag.embedModel(),
+  enabled: () => features.enabled('toolRouter'), boxes: () => allToolboxes(), embed: (texts, opts) => rag.embed(texts, opts),
+  embedModel: () => rag.embeddingIdentity(),
 });
 
 // Endpoint-scoped probes expire, so repairing a model or its projector does
@@ -989,6 +1001,8 @@ const reasoningSettingsRoutes = require('./routes/reasoning-settings.cjs').creat
 // precedence live in sampling-presets.cjs; this only toggles whether chat.cjs applies a preset.
 const samplingSettingsRoutes = require('./routes/sampling-settings.cjs').createSamplingSettingsRoutes({ json, readBody, authService });
 // GET /api/health: the default provider, the Diary sidecar and retrieval (routes/health.cjs).
+// The embedding model of retrieval, for administrators (routes/embedding.cjs, #1636).
+const embeddingRoutes = require('./routes/embedding.cjs').createEmbeddingRoutes({ json, readJson, migration: embeddingMigration, authService, fetchJson, DIARY_BASE, diaryServiceHeaders: diary.serviceHeaders });
 const healthRoutes = require('./routes/health.cjs').createHealthRoutes({ json, fetchJson, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, DIARY_BASE, diaryHeaders, authService, rag });
 // GET /api/ready (#297): unauthenticated, mounted before the session gate below alongside the
 // sign-in routes. isReady is set once startup wiring under require.main finishes (see below).
@@ -1104,6 +1118,7 @@ async function handleRequestScoped(req, res) {
     if (await samplingSettingsRoutes(req, res, { path: p, authn, url })) return;
 
     if (await healthRoutes(req, res, { path: p, authn })) return;
+    if (await embeddingRoutes(req, res, { path: p, authn })) return;
 
     if (await modelRoutes(req, res, { path: p, authn, url })) return;
 

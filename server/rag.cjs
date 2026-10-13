@@ -17,26 +17,36 @@ const { frameUntrusted } = require('./prompt-framing.cjs');
 const { notice: documentNotice } = require('./document-sources.cjs');
 const { readCappedText, readCappedJson } = require('./http.cjs');
 const { quoteName, quotedNames } = require('./quoted-name.cjs');
+const { frame } = require('./embedding-profile.cjs');
+const { createEmbeddingConfig } = require('./embedding-config.cjs');
+const slots = require('./vector-slots.cjs');
 
 // Injected by init() from index.cjs (keeps this module testable standalone).
 let RAG_DIR = null;
-let EMBED_MODEL = 'default';
+// #1636: endpoint, model and profile come from the one embedding configuration (embedding-config.cjs):
+// the active target embeds queries and new chunks; a re-index fills the next target's slot
+// (embedding-migration.cjs). A target without baseUrl embeds on the inference engine; one with a
+// baseUrl (e.g. a CPU-only llama-server, so retrieval never evicts the chat model on a single-slot
+// engine) never receives the inference credentials.
+let embeddingConfig = createEmbeddingConfig({ env: {} });
 let inferenceBase = null;
-// Optional separate embeddings endpoint (e.g. a CPU-only llama-server) so retrieval never
-// evicts the chat model on a single-slot engine. Inference credentials are not sent there.
-let embeddingBase = null;
 let inferenceHeaders = () => ({ 'Content-Type': 'application/json' });
 let dataDirForUser = null;
+let listUserIds = () => [];
 let userActive = () => true;
 let enterInference = () => () => {};
+// #1636: told after each index run, so a re-index under way also covers newly indexed files.
+let afterIndex = () => {};
+function onIndexed(fn) { afterIndex = typeof fn === 'function' ? fn : () => {}; }
 
-function init({ dataDir, embedModel, inferenceUrl, headersFn, userDataDirFn, userActive: userActiveFn, inferenceGuard }) {
+function init({ dataDir, embedModel, inferenceUrl, headersFn, userDataDirFn, userActive: userActiveFn, inferenceGuard, embeddingConfig: config, listUserIds: listUsers }) {
   RAG_DIR = process.env.RAG_DIR || path.join(dataDir, 'rag');
   dataDirForUser = userDataDirFn || null;
   userActive = userActiveFn || (() => true);
-  EMBED_MODEL = process.env.EMBEDDING_MODEL || process.env.EMBED_MODEL || embedModel || EMBED_MODEL;
+  listUserIds = listUsers || (() => []);
+  // Without an injected configuration (tests, tools) the environment seeds one held in memory.
+  embeddingConfig = config || createEmbeddingConfig({ env: process.env, fallbackModel: embedModel || 'default' });
   inferenceBase = inferenceUrl;
-  embeddingBase = (process.env.EMBEDDING_BASE_URL || '').trim() || null;
   if (headersFn) inferenceHeaders = headersFn;
   if (inferenceGuard) enterInference = inferenceGuard;
   initRerank();
@@ -143,14 +153,16 @@ const HELD_BY_MAINTENANCE = Symbol('retrieval-probe-held-by-maintenance');
 // A dedicated embedding sidecar (EMBEDDING_BASE_URL set) is not the shared inference router: it
 // never holds the router's maintenance gate, and a tiny synthetic embedding request there cannot
 // load or evict the chat model. Safe to call directly, with no inference guard at all.
-async function probeEmbeddingSidecar(base) {
+async function probeEmbeddingSidecar(base, target) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), RETRIEVAL_PROBE_TIMEOUT_MS);
   try {
+    const input = frame(target.profile, RETRIEVAL_PROBE_TEXT, { kind: 'query' });
     const res = await fetch(`${base.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/embeddings`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: EMBED_MODEL, input: RETRIEVAL_PROBE_TEXT }),
+      body: JSON.stringify({ model: target.model, input }),
+      redirect: 'error', // an embeddings server never sends the text on to another address
       signal: ctrl.signal,
     });
     if (!res.ok) return false;
@@ -171,18 +183,19 @@ async function probeEmbeddingSidecar(base) {
 // chat model is loaded — every TTL window, triggered by nothing more than a health poll (e.g.
 // someone with Settings open). GET /v1/models is side-effect-free and answers the same question:
 // is EMBED_MODEL actually available there right now.
-async function probeEmbeddingRouter(base) {
+async function probeEmbeddingRouter(base, target) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), RETRIEVAL_PROBE_TIMEOUT_MS);
   try {
     const res = await fetch(`${base.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/models`, {
       headers: inferenceHeaders(),
+      redirect: 'error',
       signal: ctrl.signal,
     });
     if (!res.ok) return false;
     const body = await readCappedJson(res, 2 * 1024 * 1024);
     const ids = Array.isArray(body?.data) ? body.data.map((m) => m?.id) : [];
-    return ids.includes(EMBED_MODEL);
+    return ids.includes(target.model);
   } catch {
     return false;
   } finally {
@@ -191,7 +204,10 @@ async function probeEmbeddingRouter(base) {
 }
 
 async function probeEmbeddingEndpoint() {
-  if (embeddingBase) return probeEmbeddingSidecar(embeddingBase);
+  const target = embeddingConfig.active();
+  // An unknown profile cannot embed anything correctly: retrieval is degraded, not available.
+  try { frame(target.profile, [], {}); } catch { return false; }
+  if (target.baseUrl) return probeEmbeddingSidecar(target.baseUrl, target);
   if (!inferenceBase) return false;
   // The router's maintenance gate (autotune, preset apply) is a "a human is mid-change" signal,
   // never an outage — reporting 'degraded' every time someone tunes the model would be a false
@@ -203,7 +219,7 @@ async function probeEmbeddingEndpoint() {
     return HELD_BY_MAINTENANCE;
   }
   try {
-    return await probeEmbeddingRouter(inferenceBase);
+    return await probeEmbeddingRouter(inferenceBase, target);
   } finally {
     leave();
   }
@@ -281,18 +297,18 @@ function hash(text) {
   return crypto.createHash('sha256').update(text).digest('hex');
 }
 
-function serializeF32(vec) {
-  return Buffer.from(new Float32Array(vec).buffer);
-}
+const serializeF32 = slots.serializeF32;
 
-async function embedOnce(texts, signal) {
+// `input` is already framed for the target's profile.
+async function embedOnce(target, input, signal) {
   const leave=enterInference();
   try {
-  const base = embeddingBase || inferenceBase;
+  const base = target.baseUrl || inferenceBase;
   const res = await fetch(`${base.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/embeddings`, {
     method: 'POST',
-    headers: embeddingBase ? { 'Content-Type': 'application/json' } : inferenceHeaders(),
-    body: JSON.stringify({ model: EMBED_MODEL, input: texts }),
+    headers: target.baseUrl ? { 'Content-Type': 'application/json' } : inferenceHeaders(),
+    body: JSON.stringify({ model: target.model, input }),
+    redirect: 'error', // the project text goes to the configured server only (cf. decision-endpoint.cjs)
     ...(signal ? { signal } : {}),
   });
   if (!res.ok) throw new Error(`embeddings ${res.status}: ${(await readCappedText(res, 64 * 1024)).text.slice(0, 120)}`);
@@ -302,24 +318,37 @@ async function embedOnce(texts, signal) {
   } finally {leave();}
 }
 
-// Optional { signal } (#760): aborts the embeddings request, including the per-text fallback.
-async function embed(texts, { signal } = {}) {
-  if (!texts.length) return [];
-  if (texts.length === 1) {
-    const items = await embedOnce(texts, signal);
+async function embedFramed(target, input, signal) {
+  if (!input.length) return [];
+  if (input.length === 1) {
+    const items = await embedOnce(target, input, signal);
     if (items.length !== 1 || !items[0]?.embedding) throw new Error('embeddings returned no vector');
     return [items[0].embedding];
   }
   // Some OpenAI-compatible providers answer a multi-input batch with an empty data array —
-  // fall back to one call per text (cheap on local hardware).
-  const items = await embedOnce(texts, signal);
-  if (items.length === texts.length && items.every((it) => it?.embedding)) {
-    return items.map((it) => it.embedding);
+  // fall back to one call per text (cheap on local hardware). Order follows `index` when given.
+  const items = await embedOnce(target, input, signal);
+  if (items.length === input.length && items.every((it) => it?.embedding)) {
+    const ordered = items.every((it) => Number.isInteger(it.index)) ? [...items].sort((a, b) => a.index - b.index) : items;
+    return ordered.map((it) => it.embedding);
   }
   const out = [];
-  for (const t of texts) out.push(...(await embed([t], { signal })));
+  for (const t of input) out.push(...(await embedFramed(target, [t], signal)));
   return out;
 }
+
+// Optional { signal } (#760): aborts the embeddings request, including the per-text fallback.
+// #1636: `kind` ('query' | 'document' | 'similarity', or one per text) and `titles` (documents)
+// frame the texts for the target's profile (embedding-profile.cjs); `target` defaults to the
+// active one. Under the default nomic-v1 profile the texts are sent unchanged, as before.
+async function embed(texts, { signal, kind = 'document', titles = null, target = null } = {}) {
+  if (!texts.length) return [];
+  const t = target || embeddingConfig.active();
+  return embedFramed(t, frame(t.profile, texts, { kind, titles }), signal);
+}
+
+// A project file's title for the document framing: its own name (the last path segment).
+const titleOf = (fileName) => String(fileName || '').split('/').pop();
 
 function openIndex(projectId, userId) {
   // Queued indexing may begin after account deletion. Refuse the directory
@@ -347,31 +376,26 @@ function openIndex(projectId, userId) {
     `);
     // Which version of the file (sha256 of its full text) a chunk was cut from (#122). Older
     // indexes gain the column empty; those rows are simply unversioned until re-indexed.
-    if (!db.prepare('PRAGMA table_info(chunks)').all().some((c) => c.name === 'version')) db.exec('ALTER TABLE chunks ADD COLUMN version TEXT');
-    let dim = null;
-    const row = db.prepare("SELECT value FROM vec_meta WHERE key='dim'").get();
-    if (row) dim = Number(row.value);
-    return { db, dim };
+    const columns = db.prepare('PRAGMA table_info(chunks)').all();
+    if (!columns.some((c) => c.name === 'version')) db.exec('ALTER TABLE chunks ADD COLUMN version TEXT');
+    // #1636: 1 marks a small file stored whole for direct injection (never embedded). Older rows are
+    // NULL; vector-slots.cjs recognises those by shape (a file's only chunk, at most 2400 characters).
+    if (!columns.some((c) => c.name === 'direct')) db.exec('ALTER TABLE chunks ADD COLUMN direct INTEGER');
+    // #1636: vectors live in per-model slots; `slot` is the active model's (null until it has one).
+    const active = embeddingConfig.active();
+    slots.adoptLegacy(db, active);
+    return { db, active, slot: slots.findSlot(db, active) };
   } catch (err) {
     console.warn(`[rag] index unavailable for ${projectId} (${err.message}) — falling back to direct injection`);
     return null;
   }
 }
 
-function ensureVecTable(index, dim) {
-  index.db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS vec_items USING vec0(chunk_id INTEGER PRIMARY KEY, embedding float[${dim}])`);
-  index.db.prepare("INSERT OR REPLACE INTO vec_meta (key, value) VALUES ('dim', ?)").run(String(dim));
-  index.dim = dim;
-}
-
-// Remove one file's chunks AND their vectors. chunks.id is INTEGER PRIMARY KEY, so SQLite
-// reuses freed ids: a vector left behind would join to whatever chunk takes its id next.
-// Callers run this inside a transaction with whatever replaces the file.
+// Remove one file's chunks AND their vectors, in every model's slot. chunks.id is INTEGER PRIMARY
+// KEY, so SQLite reuses freed ids: a vector left behind would join to whatever chunk takes its id
+// next. Callers run this inside a transaction with whatever replaces the file.
 function dropFileRows(index, fileName) {
-  if (index.dim) {
-    const del = index.db.prepare('DELETE FROM vec_items WHERE chunk_id = ?');
-    for (const { id } of index.db.prepare('SELECT id FROM chunks WHERE file = ?').all(fileName)) del.run(id);
-  }
+  slots.dropChunks(index.db, index.db.prepare('SELECT id FROM chunks WHERE file = ?').all(fileName).map((r) => r.id));
   index.db.prepare('DELETE FROM chunks WHERE file = ?').run(fileName);
 }
 
@@ -401,40 +425,36 @@ function pruneFileState(key, outcome) {
 }
 const bumpGeneration = (key) => { const g = (fileGenerations.get(key) || 0) + 1; fileGenerations.set(key, g); return g; };
 
-async function embedBatchAndStore(index, rows, isCurrent = () => true) {
-  let dim = index.dim;
+// Embeds rows ({ id, file, body, hash }) with `target` and stores them in its slot (created on the
+// first vector). The slot is re-read inside the write, and a row is written only while its chunk
+// still holds the text that was embedded, so a concurrent re-index or delete never gets a vector
+// attached to different text. Returns how many vectors were stored.
+async function embedRowsInto(index, target, rows, { isCurrent = () => true, batchSize = 8, signal } = {}) {
   let embedded = 0;
-  // NOTE: prepare the vec_items statements only AFTER ensureVecTable() has run
-  // — better-sqlite3 validates at prepare time and would throw
-  // "no such table: vec_items" otherwise. Also, vec0 rejects a *bound*
-  // parameter as the primary key, so chunk_id is inlined into the SQL (it is
-  // always an integer from our own chunks table — no injection surface).
-  let del = index.dim ? index.db.prepare('DELETE FROM vec_items WHERE chunk_id = ?') : null;
-  for (let i = 0; i < rows.length; i += 8) {
+  for (let i = 0; i < rows.length; i += batchSize) {
     if (!isCurrent()) break;
-    const batch = rows.slice(i, i + 8);
-    const vectors = await embed(batch.map((r) => r.body));
+    const batch = rows.slice(i, i + batchSize);
+    const vectors = await embed(batch.map((r) => r.body), { kind: 'document', titles: batch.map((r) => titleOf(r.file)), target, signal });
     // A newer run (or a delete) replaced these chunks while we were embedding: writing now
     // would attach vectors to ids that no longer mean this text.
     if (!isCurrent()) break;
-    if (!dim) {
-      dim = vectors[0].length;
-      ensureVecTable(index, dim);
-      del = index.db.prepare('DELETE FROM vec_items WHERE chunk_id = ?');
+    const still = index.db.prepare('SELECT 1 FROM chunks WHERE id = ? AND content_hash = ?');
+    const stored = index.db.transaction(() => {
+      const slot = slots.ensureSlot(index.db, target, vectors[0].length);
+      const items = batch.map((r, j) => ({ id: r.id, hash: r.hash, vector: vectors[j] }))
+        .filter((r) => still.get(r.id, r.hash) && Array.isArray(r.vector) && r.vector.length === slot.dim);
+      slots.writeVectors(index.db, slot, items);
+      return { slot, n: items.length };
+    })();
+    if (stored.n < batch.length && vectors.some((v) => v?.length !== stored.slot.dim)) {
+      console.warn(`[rag] ${target.model} returned ${vectors[0]?.length}-wide vectors but its slot holds ${stored.slot.dim}; skipped`);
     }
-    const tx = index.db.transaction((items) => {
-      for (const r of items) {
-        del.run(r.id);
-        index.db
-          .prepare(`INSERT INTO vec_items (chunk_id, embedding) VALUES (${Number(r.id)}, ?)`)
-          .run(serializeF32(r.vector));
-      }
-    });
-    tx(batch.map((r, j) => ({ id: r.id, vector: vectors[j] })));
-    embedded += batch.length;
+    if (index.active && slots.slotId(target) === slots.slotId(index.active)) index.slot = stored.slot;
+    embedded += stored.n;
   }
   return embedded;
 }
+const embedBatchAndStore = (index, rows, isCurrent) => embedRowsInto(index, index.active, rows, { isCurrent });
 
 // Index (or re-index) one project file. Returns counts for logging; throws on
 // hard failures is deliberately avoided — callers log the result.
@@ -459,6 +479,7 @@ function indexProjectFile(projectId, fileName, text, userId) {
     if (fileQueues.get(key) !== tail) return; // a newer run is queued behind this one
     fileQueues.delete(key);
     pruneFileState(key, outcome);
+    try { afterIndex(); } catch { /* a hook never breaks indexing */ }
   });
   return run;
 }
@@ -473,7 +494,7 @@ async function indexProjectFileNow(projectId, fileName, text, userId, isCurrent,
       index.db.transaction(() => {
         dropFileRows(index, fileName);
         index.db
-          .prepare('INSERT INTO chunks (file, chunk_no, body, content_hash, version) VALUES (?, 0, ?, ?, ?)')
+          .prepare('INSERT INTO chunks (file, chunk_no, body, content_hash, version, direct) VALUES (?, 0, ?, ?, ?, 1)')
           .run(fileName, text, hash(text), version);
       })();
       return { ok: true, stored: 1, embedded: 0, direct: true };
@@ -490,10 +511,10 @@ async function indexProjectFileNow(projectId, fileName, text, userId, isCurrent,
       seen.add(h);
       unique.push(body);
     }
-    const ins = index.db.prepare('INSERT INTO chunks (file, chunk_no, body, content_hash, version) VALUES (?, ?, ?, ?, ?)');
+    const ins = index.db.prepare('INSERT INTO chunks (file, chunk_no, body, content_hash, version, direct) VALUES (?, ?, ?, ?, ?, 0)');
     const rows = index.db.transaction(() => {
       dropFileRows(index, fileName);
-      return unique.map((body, i) => ({ id: Number(ins.run(fileName, i, body, hash(body), version).lastInsertRowid), body }));
+      return unique.map((body, i) => { const h = hash(body); return { id: Number(ins.run(fileName, i, body, h, version).lastInsertRowid), file: fileName, body, hash: h }; });
     })();
     let embedded = 0;
     try {
@@ -550,15 +571,19 @@ function isCurrentVersion(projectId, fileName, userId, version) {
 // failure — chat falls back to direct injection of small files.
 async function searchProject(projectId, query, userId) {
   const index = openIndex(projectId, userId);
-  if (!index || !index.dim) return [];
+  if (!index) return [];
+  // #1636: only the active model's slot is searched, with a query embedded by that same model.
+  // No slot yet (a re-index has not reached this project) means no vector search, never another
+  // model's vectors.
+  if (!index.slot) { index.db.close(); return []; }
   try {
-    const [qvec] = await embed([query]);
-    if (!qvec || qvec.length !== index.dim) return [];
+    const [qvec] = await embed([query], { kind: 'query', target: index.active });
+    if (!qvec || qvec.length !== index.slot.dim) return [];
     const qbuf = serializeF32(qvec);
     const rows = index.db
       .prepare(
         `SELECT c.file, c.chunk_no, c.body, c.version, 1.0 - vec_distance_cosine(v.embedding, ?) AS score
-         FROM vec_items v JOIN chunks c ON c.id = v.chunk_id
+         FROM ${slots.joinSql(index.slot)}
          WHERE 1.0 - vec_distance_cosine(v.embedding, ?) >= ?
          ORDER BY score DESC
          LIMIT ?`
@@ -573,6 +598,80 @@ async function searchProject(projectId, query, userId) {
   } finally {
     index.db.close();
   }
+}
+
+// ── #1636 re-index support (embedding-migration.cjs drives it) ───────────────────────────────
+// Every project index file this process owns: the shared RAG_DIR (no tenant) and each active
+// account's own rag directory. Each entry is processed on its own; nothing is copied between them.
+function listIndexes() {
+  const out = [];
+  const scan = (dir, userId) => {
+    let names = [];
+    try { names = fs.readdirSync(dir); } catch { return; }
+    for (const name of names) {
+      const m = /^(.+)\.db$/.exec(name);
+      if (m && !name.startsWith('.')) out.push({ userId, projectId: m[1] });
+    }
+  };
+  if (RAG_DIR) scan(RAG_DIR, null);
+  if (dataDirForUser) {
+    let ids = [];
+    try { ids = listUserIds() || []; } catch { ids = []; }
+    for (const userId of ids) {
+      if (!userActive(userId)) continue;
+      let dir; try { dir = path.join(dataDirForUser(userId), 'rag'); } catch { continue; }
+      scan(dir, userId);
+    }
+  }
+  return out;
+}
+
+function withIndex(entry, fn) {
+  if (!ragAvailable()) return null;
+  const index = openIndex(entry.projectId, entry.userId);
+  if (!index) return null;
+  const close = () => { try { index.db.close(); } catch { /* already closed */ } };
+  let result;
+  try { result = fn(index); } catch (err) { close(); throw err; }
+  if (result && typeof result.then === 'function') return result.finally(close);
+  close();
+  return result;
+}
+
+/** { chunks, vectors } of `target`'s slot in one index file, or null when it cannot be opened. */
+function indexCoverage(entry, target) {
+  return withIndex(entry, (index) => slots.coverage(index.db, slots.findSlot(index.db, target)));
+}
+
+/**
+ * Embeds up to `limit` chunks of one index file that have no current vector for `target`, skipping
+ * the ids in `exclude`. A batch the server refuses is retried one chunk at a time, so one chunk it
+ * cannot embed does not hold back the rest; those ids come back in `refused`.
+ * Returns { embedded, attempted, refused, remaining } (remaining: chunks still without a vector).
+ */
+function fillMissing(entry, target, { limit = 4, signal, isCurrent = () => true, exclude = [] } = {}) {
+  return withIndex(entry, async (index) => {
+    const rows = slots.missingChunks(index.db, slots.findSlot(index.db, target), limit, exclude);
+    let embedded = 0;
+    const refused = [];
+    if (rows.length) {
+      try {
+        embedded = await embedRowsInto(index, target, rows, { isCurrent, batchSize: limit, signal });
+      } catch (err) {
+        if (signal?.aborted) throw err;
+        for (const row of rows) {
+          try { embedded += await embedRowsInto(index, target, [row], { isCurrent, batchSize: 1, signal }); } catch { refused.push(row.id); }
+        }
+      }
+    }
+    const left = slots.coverage(index.db, slots.findSlot(index.db, target));
+    return { embedded, attempted: rows.length, refused, remaining: left.chunks - left.vectors };
+  });
+}
+
+/** Drops `target`'s slot from one index file. */
+function dropIndexSlot(entry, target) {
+  return withIndex(entry, (index) => index.db.transaction(() => slots.dropSlot(index.db, target))());
 }
 
 // The files-context for one chat message: retrieved chunks when the index has
@@ -637,14 +736,16 @@ async function filesContext(projectId, files, query, userId, onSources, { attach
   return parts.length ? [manifest, coverage, ...parts].join('\n\n') : [manifest, coverage].join("\n");
 }
 
-// Which model embed() is currently using. Callers that CACHE vectors need this
-// in their key: a vector outlives a change to EMBEDDING_MODEL, and a stale one
-// of the wrong dimensionality scores silently rather than failing.
-function embedModel() { return EMBED_MODEL; }
+// Which model embed() is currently using. Callers that CACHE vectors need the identity in their
+// key: a vector outlives a change of model or profile, and a stale one scores silently rather than
+// failing.
+function embedModel() { return embeddingConfig.active().model; }
+function embeddingIdentity() { const t = embeddingConfig.active(); return `${t.profile}\u0000${t.model}`; }
+function getEmbeddingConfig() { return embeddingConfig; }
 
 // How many per-file entries the process is tracking; for tests and diagnostics.
 const trackedFileState = () => ({ queues: fileQueues.size, generations: fileGenerations.size, versions: fileVersions.size });
 
 // #1646: the sentence a hybrid cloud route without a grant removes (read_project_file is not offered there).
 const READ_FILE_HINT = ' Use read_project_file with PDF startPage/endPage and offset for pages beyond the summary.';
-module.exports = { READ_FILE_HINT, init, trackedFileState, indexProjectFile, deleteProjectFile, searchProject, filesContext, chunkText, ragAvailable, retrievalStatus, embed, embedModel, rerankPool };
+module.exports = { READ_FILE_HINT, init, trackedFileState, indexProjectFile, deleteProjectFile, searchProject, filesContext, chunkText, ragAvailable, retrievalStatus, embed, embedModel, embeddingIdentity, embeddingConfig: getEmbeddingConfig, onIndexed, listIndexes, indexCoverage, fillMissing, dropIndexSlot, rerankPool };
