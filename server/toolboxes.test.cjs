@@ -138,6 +138,9 @@ test('the executor runs built-ins itself and hands MCP tools on with the project
   assert.match(await t.executeToolCall(null, 'get_current_time', '{}'), /^Current time: .* \| ISO: /);
   assert.match(await t.executeToolCall(null, 'get_current_time', '{"timezone":"Europe/Berlin"}'), /\(Europe\/Berlin\)/);
   assert.match(await t.executeToolCall(null, 'get_current_time', '{"timezone":"Mars/Olympus"}'), /^ERROR: unknown IANA timezone/);
+  const longZone = await t.executeToolCall(null, 'get_current_time', JSON.stringify({ timezone: 'Z'.repeat(500) }));
+  assert.match(longZone, /^ERROR: unknown IANA timezone/);
+  assert.ok(longZone.length < 120, 'the echoed zone is capped');
   assert.match(await t.executeToolCall(null, 'read_project_file', 'not json'), /^ERROR: tool arguments were not valid JSON/);
   assert.match(await t.executeToolCall(null, 'get_current_time', 'null'), /^ERROR: tool arguments must be a JSON object/);
   assert.match(await t.executeToolCall(null, 'get_current_time', '42'), /^ERROR: tool arguments must be a JSON object/);

@@ -21,7 +21,7 @@ async function run(t, body, extra = {}) {
   res.writeHead = () => {}; res.write = (line) => events.push(JSON.parse(line.slice(6))); res.end = () => { res.writableEnded = true; res.emit('finish'); };
   const requests = [];
   const fetch = async (url, init) => { requests.push({ url: String(url), body: JSON.parse(init.body) }); return streamOk(); };
-  const project = { id: 'fixture-project', name: 'Synthetic', model: 'answer-model', routing: extra.routing || 'manual', assets: [], files: [] };
+  const project = { id: 'fixture-project', name: 'Synthetic', model: 'answer-model', routing: extra.routing || 'manual', assets: [], files: [], ...extra.project };
   const { handleChat } = createChatHandler({
     modelManager: { enabled: true, props: async () => ({ ok: false, status: 404 }), health: async () => ({ ok: true, body: { all_models_loaded: [{ model_name: 'answer-model', loaded: true, backend_alive: true, recipe_options: { ctx_size: 32768 } }] } }) },
     reasoningEffort: require('./reasoning-effort.cjs'), authService: { audit() {} }, crypto: require('node:crypto'), path, fs, fetch,
@@ -88,11 +88,13 @@ test('#1644: the router never reads the server date block, but still reads the r
     chunkChars: () => 1000, maxChunks: () => 1, log() {}, awaitChoice: async () => ({ choice: 'local' }),
   };
   const roles = { fast: 'answer-model', smart: 'answer-model' };
-  const r = await run(t, { message: 'Synthetic question' }, { routing: 'auto', deps: { routingModes: rm, autoRoles: () => roles, getProvider: (id) => ({ id, baseUrl: 'http://default.invalid' }) } });
+  const r = await run(t, { message: 'Synthetic question' }, { routing: 'auto', project: { instructions: 'ROUTER-MARKER synthetic project instructions' }, deps: { routingModes: rm, autoRoles: () => roles, getProvider: (id) => ({ id, baseUrl: 'http://default.invalid' }) } });
   assert.ok(r.requests.length >= 1, 'the turn went on locally');
   assert.equal(seen.length, 1);
   const text = seen[0].chunks.join('');
   assert.doesNotMatch(text, /Today is|Calendar facts|answer from the results of your tools/, 'no date block in the router input');
   assert.match(systemText(r), /Today is/, 'the model still gets the date block');
   assert.match(text, /Synthetic question/);
+  assert.match(systemText(r), /ROUTER-MARKER/, 'the fixture project instructions reach the model');
+  assert.match(text, /ROUTER-MARKER/, 'the router still reads the rest of the system text');
 });

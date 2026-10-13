@@ -399,17 +399,18 @@ function createToolboxes({
     if (name === 'get_current_time') {
       const tz = typeof args.timezone === 'string' && args.timezone ? args.timezone : undefined;
       const now = new Date();
+      let formatted;
       try {
-        const formatted = tz
+        formatted = tz
           ? new Intl.DateTimeFormat('en-GB', { timeZone: tz, dateStyle: 'full', timeStyle: 'long' }).format(now)
           : now.toString();
-        // #1603/#1602: the calendar facts for that zone's date, computed (ISO week, day of year, days left), so the
-        // model neither derives them (week 41 for week 42) nor re-counts them for minutes.
-        const ct = require('./current-time-part.cjs');
-        return `Current time: ${formatted}${tz ? ` (${tz})` : ''} | ISO: ${now.toISOString()} | ${ct.factsLine(ct.calendarFacts(now, tz || ct.serverTimeZone()))}`;
       } catch {
-        return fail(`ERROR: unknown IANA timezone "${tz}"`);
+        return fail(`ERROR: unknown IANA timezone "${String(tz).slice(0, 64)}"`);
       }
+      // #1603/#1602: the calendar facts for that zone's date, computed (ISO week, day of year, days left), so the
+      // model neither derives them (week 41 for week 42) nor re-counts them for minutes. The zone is already valid here.
+      const ct = require('./current-time-part.cjs');
+      return `Current time: ${formatted}${tz ? ` (${tz})` : ''} | ISO: ${now.toISOString()} | ${ct.factsLine(ct.calendarFacts(now, tz || ct.serverTimeZone()))}`;
     }
     if (name === 'read_project_file') {
       // The stored name, or a unique trailing part of it (#642): one resolver shared with the
