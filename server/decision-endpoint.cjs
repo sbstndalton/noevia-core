@@ -8,7 +8,7 @@ function configuration(env = process.env) {
     if (url.protocol !== 'http:' || url.username || url.password || url.search || url.hash || url.pathname !== '/' ||
       !(h === 'laya' || h === 'localhost' || (isIP(h) === 4 && (/^(127|10)\./.test(h) || /^192\.168\./.test(h) || /^172\.(1[6-9]|2\d|3[01])\./.test(h))))) throw Error();
     return { baseUrl:url.origin, reason:null };
-  } catch { return { reason:'Connect a private decision service with COWORK_DECISION_URL, then restart Noevia.' }; }
+  } catch { return { reason:'Connect a private decision service, then restart noevia.' }; }
 }
 // A failure with a short text-free cause code (decision/index.cjs causeOf) for the decision log.
 const failure=(reason,message)=>Object.assign(Error(message),{reason});

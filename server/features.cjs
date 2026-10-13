@@ -28,15 +28,15 @@ function codeSandboxReason(env = process.env) {
 }
 
 const REGISTRY = Object.freeze({
-  stepSupervision: { env: 'NOEVIA_FEATURE_STEP_SUPERVISION', experimental: true, unavailable: env => require('./decision-endpoint.cjs').configuration(env).reason, label: 'Step supervision', description: 'Let a decision provider advise whether to continue, verify tool results or pause for review between chat steps. Keeps existing behavior if unavailable. Approvals and execution limits still apply.' },
-  systemOneRouting: { env: 'NOEVIA_FEATURE_SYSTEM_ONE_ROUTING', experimental: true, unavailable: env => require('./system-one-router.cjs').configuration(env).reason, label: 'System-One routing', description: 'Use the configured decision service to choose Fast, Smart or Code for new Auto-routed messages. Falls back to the current router when unavailable. Manual model choices are unchanged.' },
-  toolGate: { env: 'NOEVIA_FEATURE_TOOL_GATE', experimental: true, unavailable: env => require('./decision-endpoint.cjs').configuration(env).reason, label: 'Tool gate', description: 'Let the decision service decide when a message needs a tool, then pre-run read-only tools or require the model to call one. Writes still go through the approval card.' },
+  stepSupervision: { env: 'NOEVIA_FEATURE_STEP_SUPERVISION', experimental: true, unavailable: env => require('./decision-endpoint.cjs').configuration(env).reason, label: 'Step checks', description: 'Let a decision provider advise whether to continue, verify tool results or pause for review between chat steps. Keeps existing behavior if unavailable. Approvals and execution limits still apply.' },
+  systemOneRouting: { env: 'NOEVIA_FEATURE_SYSTEM_ONE_ROUTING', experimental: true, unavailable: env => require('./system-one-router.cjs').configuration(env).reason, label: 'Routing decisions', description: 'Use the configured decision service to choose Fast, Smart or Code for new Auto-routed messages. Falls back to the current router when unavailable. Manual model choices are unchanged.' },
+  toolGate: { env: 'NOEVIA_FEATURE_TOOL_GATE', experimental: true, unavailable: env => require('./decision-endpoint.cjs').configuration(env).reason, label: 'Tool checks', description: 'Let the decision service decide when a message needs a tool, then pre-run read-only tools or require the model to call one. Writes still go through the approval card.' },
   previews: { env: 'NOEVIA_FEATURE_PREVIEWS', label: 'Preview surfaces', description: 'Show the unbuilt Scheduled, Plugins, Explore and Code previews.' },
-  diaryMcpWrite: { env: 'NOEVIA_FEATURE_DIARY_MCP_WRITE', restart: true, label: 'Diary append tool', description: 'Offer an approval-gated, append-only Diary tool through the in-app MCP server.' },
+  diaryMcpWrite: { env: 'NOEVIA_FEATURE_DIARY_MCP_WRITE', restart: true, label: 'Add to Diary', description: 'Let the assistant add new entries to your Diary, and only after you approve each one. It cannot change or delete what is already there.' },
   deepResearch: { env: 'NOEVIA_FEATURE_DEEP_RESEARCH', label: 'Deep research', description: 'Administrators can run bounded research jobs that save a cited report to a project.' },
   offsiteBackup: { env: 'NOEVIA_FEATURE_OFFSITE_BACKUP', label: 'Backups', description: 'Nightly encrypted copies of the whole server, to a folder mirrored to Google Drive or to an S3-compatible target.' },
-  toolRouter: { env: 'NOEVIA_FEATURE_TOOL_ROUTER', label: 'Tool routing', description: "Send only the project's toolboxes that match each message (needs an embedding model); falls back to all of them." },
-  codeHarness: { env: 'NOEVIA_FEATURE_CODE_HARNESS', label: 'Code mode', description: 'Administrators can run a coding harness in a per-task git worktree, with every write through the approval card.' },
+  toolRouter: { env: 'NOEVIA_FEATURE_TOOL_ROUTER', label: 'Tool routing', description: "Send only the project's toolboxes that match each message (needs a search model); falls back to all of them." },
+  codeHarness: { env: 'NOEVIA_FEATURE_CODE_HARNESS', label: 'Code mode', description: 'Administrators can run a coding assistant on a separate copy of the code for each task, with every change going through the approval card.' },
   // Renamed from astraReview (2026-09-29). The old stored setting is still migrated once on read
   // and the old name is still accepted on the admin API (`legacy`, see createFeatures). The old
   // NOEVIA_FEATURE_ASTRA_REVIEW env var is no longer read.
@@ -52,7 +52,7 @@ const REGISTRY = Object.freeze({
   // Chat framing phase 1 (#737): suggest a project, kind, tags and related chats for a new chat. Off by default.
   chatFraming: { env: 'NOEVIA_FEATURE_CHAT_FRAMING', experimental: true, unavailable: env => require('./decision-endpoint.cjs').configuration(env).reason, label: 'Chat framing', description: 'Suggest a frame for a new chat from its first message: one of your projects, a kind (search, action, idea, question or code), an existing tag and related chats. You accept, edit or dismiss each suggestion before it is applied; an accepted frame shapes the answers in that chat. Without the decision service, chats get no frame.' },
   // Chat framing phase 4 (#740): the reasoner role condenses a pre-run read into a task packet. Needs chatFraming.
-  framingReasoner: { env: 'NOEVIA_FEATURE_FRAMING_REASONER', experimental: true, unavailable: env => require('./decision-endpoint.cjs').configuration(env).reason, label: 'Framing reasoner', description: 'In chats framed as a lookup or a request to get something done, the reasoner model (Settings, framing roles) condenses what a pre-run read-only tool returned into a short, checked task packet for the answer. Needs Chat framing and the tool gate. Whenever the reasoner is not set, does not fit the memory budget, is too slow or returns something invalid, the answer gets the full tool result as before. Writes still go through the approval card.' },
+  framingReasoner: { env: 'NOEVIA_FEATURE_FRAMING_REASONER', experimental: true, unavailable: env => require('./decision-endpoint.cjs').configuration(env).reason, label: 'Short tool summaries', description: 'For a lookup or a request to get something done, a model condenses what a read-only tool returned into a short, checked summary for the answer. It needs Chat framing and tool checks. If no summary model is set, it does not fit the memory budget, it is too slow or it returns something invalid, the answer gets the full tool result as before. Writes still go through the approval card.' },
   // Chat framing phase 6 (#742): linked chats' brain summaries in the system prompt. Needs chatFraming.
   brainContext: { env: 'NOEVIA_FEATURE_BRAIN_CONTEXT', experimental: true, label: 'Brain context', description: 'In a chat with an accepted frame, add short summaries ("brains") of up to three chats it links to, so the answer can build on them without reading the whole earlier conversations. Brains are written by the framing reasoner when a mirrored chat goes idle. The total length is an admin setting. Needs Chat framing.' },
   // #769: the hard injection boundary. Only adds approval cards; never removes one.
@@ -79,10 +79,11 @@ function unavailableId(name, reason) {
   if (name === 'codePipeline' || name === 'codeMerge') return /CODE_HARNESS_ENDPOINT/.test(reason) ? 'codeSandbox' : null;
   // The decision-service experiments (#624): unset URL, not yet set up in Settings, or System-One's own URL.
   if (name === 'stepSupervision' || name === 'toolGate' || name === 'systemOneRouting') {
-    if (/COWORK_DECISION_URL/.test(reason)) return 'decisionUrl';
+    // #1489/#1499: the reasons no longer name the COWORK_* variables, so they are matched by their words.
+    if (/^Connect a private decision service\b/.test(reason)) return 'decisionUrl';
     if (/Set up the decision service/.test(reason)) return 'decisionSetup';
     if (/does not support choice decisions/.test(reason)) return 'decisionUnsupported';
-    if (/COWORK_SYSTEM_ONE_URL/.test(reason)) return 'systemOneUrl';
+    if (/dedicated local decision-model endpoint/.test(reason)) return 'systemOneUrl';
   }
   return null;
 }

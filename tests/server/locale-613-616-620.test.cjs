@@ -107,7 +107,20 @@ test('#613 the hardware and overview tabs go through describeBackendError', () =
   assert.match(hardware, /describeBackendError\(t, b\.probe_error\)/);
   assert.doesNotMatch(hardware, /error: b\.stats\.error \?\? ''/);
   const overview = fs.readFileSync(path.join(SRC, 'components/models/OverviewTab.tsx'), 'utf8');
-  assert.match(overview, /describeBackendError\(t, b\.probe_error\)/);
+  // #1545 moves the Recover panel's Model loader lines into loaderLines, which is handed
+  // describeBackendError for an engine's probe error; check the source hands it over and the helper uses it.
+  // Until that web change lands, the panel words the probe error itself.
+  if (!fs.existsSync(path.join(SRC, 'components/models/loader-lines.ts'))) { assert.match(overview, /describeBackendError\(t, b\.probe_error\)/); return; }
+  assert.match(overview, /loaderLines\(t, backends, unhealthy, \((\w+)\) => describeBackendError\(t, \1\)\)/);
+  const { loaderLines } = load('components/models/loader-lines');
+  const de = tFor('de-DE');
+  const raw = JSON.parse(fs.readFileSync(path.join(__dirname, '../fixtures/model-manager-backend-notes.json'), 'utf8')).notes[0];
+  const down = { name: 'cowork-llama-1', status: 'unhealthy', loaded_model: null, probe_error: raw, last_restart_error: null };
+  const up = { name: 'cowork-embed-1', status: 'running', loaded_model: 'm.gguf', probe_error: null, last_restart_error: null };
+  const lines = loaderLines(de, [up, down], [down], (e) => describeBackendError(de, e));
+  assert.deepEqual(lines.map((l) => l.text), [`${de('mm.recover.engineIndex', { index: 2 })}: ${describeBackendError(de, raw)}`]);
+  assert.notEqual(describeBackendError(de, raw), raw, 'the probe error is worded, not shown raw');
+  assert.doesNotMatch(lines[0].text, /cowork-/, 'no internal service name');
 });
 
 test('#616 route descriptions come from the catalogue by role id; scores use the locale decimal separator', () => {

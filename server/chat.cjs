@@ -1827,8 +1827,8 @@ function createChatHandler({
         paused = true;
         const n = appliedWrites.length;
         send({ type: 'paused', reason: 'supervision', applied: n,
-          text: n ? `${n === 1 ? '1 change was' : `${n} changes were`} saved. Step supervision paused this reply before any further steps.`
-            : 'Step supervision paused this reply before any further steps. Nothing was changed.' });
+          text: n ? `${n === 1 ? '1 change was' : `${n} changes were`} saved. Step checks paused this reply before any further steps.`
+            : 'Step checks paused this reply before any further steps. Nothing was changed.' });
         break;
       }
     }

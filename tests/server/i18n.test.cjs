@@ -23,7 +23,9 @@ const FILES={'de-DE':'DE_DE','es-ES':'ES_ES','fr-FR':'FR_FR','it-IT':'IT_IT','nb
 // (settings/index.ts etc., what the real view's chunk does), and the component(s) allowed to pull
 // its strings into their own chunk.
 const SEGMENT_DEFS={
-  settings:{suffix:'SETTINGS',owners:/^components\/(SettingsShell|ProviderForm|ChatGptConnect|connectors\/)/},
+  // ArchivedChats (#1503) is on the first screen and names the Settings section it links to, so it
+  // loads the segment on demand with a dynamic import (checked below), never a static one.
+  settings:{suffix:'SETTINGS',owners:/^components\/(SettingsShell|ProviderForm|ChatGptConnect|connectors\/|data\/ArchivedChats$)/},
   // Diary's and Projects' child components rely on their lazy entry (DiaryView, ProjectsView)
   // having already registered the segment, rather than each importing it themselves.
   projects:{suffix:'PROJECTS',owners:/^components\/ProjectsView$/},
@@ -331,6 +333,11 @@ test('no key is defined in more than one segment, and the base catalogue module 
     const users=[];(function walk(d){for(const f of fs.readdirSync(d)){const p=path.join(d,f);if(fs.statSync(p).isDirectory()){if(f!=='i18n')walk(p);}else if(/\.tsx?$/.test(f)&&new RegExp(`i18n/${s}['"/]`).test(fs.readFileSync(p,'utf8')))users.push(path.relative(path.join(__dirname,'../../src'),p).replace(/\.tsx?$/,'').replace(/\\/g,'/'));}})(path.join(__dirname,'../../src'));
     for(const u of users)assert.match(u,SEGMENT_DEFS[s].owners,`${u} pulls the ${s} strings into its chunk`);
   }
+  // ArchivedChats is an eager module, so if it loads the settings strings it does so on demand: a static
+  // import would put the whole segment in the first-load bundle.
+  const archived=fs.readFileSync(path.join(__dirname,'../../src/components/data/ArchivedChats.tsx'),'utf8');
+  assert.doesNotMatch(archived,/^import[^;]*i18n\/settings['"]/m,'ArchivedChats imports the settings strings statically');
+  if(/i18n\/settings['"]/.test(archived))assert.match(archived,/import\('\.\.\/\.\.\/i18n\/settings'\)/,'ArchivedChats loads the settings strings on demand');
 });
 
 // Generic version of the Settings-specific lifecycle test below, run once per lazy segment with a
@@ -395,7 +402,7 @@ test('Settings search matches English keywords as well as the translated ones',(
 // ── Model manager segment (#293) ────────────────────────────────────────────────────────────────
 // Every module in the ModelManagerPage lazy chunk that renders text. ModelManagerPage registers
 // the segment; the rest are only reachable through it (checked below).
-const MODELS_MODULES=['components/models/ModelManagerPage.tsx','components/models/ModelsSettings.tsx','components/models/RoutingModeSection.tsx','components/models/ModelCombobox.tsx','components/models/sections.ts','components/models/OverviewTab.tsx','components/models/LibraryTab.tsx','components/models/DownloadTab.tsx','components/models/ConfigureTab.tsx','components/models/GuidedOptimize.tsx','components/models/HardwareTab.tsx','components/models/BenchmarksTab.tsx','components/models/AutoTune.tsx','components/models/EvidenceList.tsx','components/models/TimeChart.tsx','components/models/mm-text.ts','components/models/backend-errors.ts','components/models/register.ts','components/NativeCalibration.tsx','components/MtpControl.tsx','components/SamplingPresetsControl.tsx']
+const MODELS_MODULES=['components/models/ModelManagerPage.tsx','components/models/ModelsSettings.tsx','components/models/RoutingModeSection.tsx','components/models/ModelCombobox.tsx','components/models/sections.ts','components/models/OverviewTab.tsx','components/models/LibraryTab.tsx','components/models/DownloadTab.tsx','components/models/ConfigureTab.tsx','components/models/GuidedOptimize.tsx','components/models/HardwareTab.tsx','components/models/BenchmarksTab.tsx','components/models/AutoTune.tsx','components/models/EvidenceList.tsx','components/models/TimeChart.tsx','components/models/mm-text.ts','components/models/backend-errors.ts','components/models/loader-lines.ts','components/models/register.ts','components/NativeCalibration.tsx','components/MtpControl.tsx','components/SamplingPresetsControl.tsx']
   // A module added on the web side (ModelCombobox, #1009) is listed before that web change lands.
   .filter((f)=>fs.existsSync(path.join(__dirname,'../../src',f)));
 const SRC=path.join(__dirname,'../../src');
@@ -440,8 +447,13 @@ test('the model manager modules are reached only through the lazy ModelManagerPa
   same(base,[],'mm.* keys in the base catalogue');
 });
 
+// live-engine-note.ts (#1485) is a pure helper of SettingsView's Service status, so it is in the Settings
+// chunk only while SettingsView is its sole importer (checked below).
+const SETTINGS_STATUS_FILES=['components/SettingsView.tsx','components/McpStatus.tsx','components/DiaryConnectors.tsx','live-engine-note.ts']
+  // A module added on the web side (live-engine-note, #1485) is listed before that web change lands.
+  .filter((f)=>fs.existsSync(path.join(__dirname,'../../src',f)));
 test('Diary & storage and Service status use only Settings-segment or base keys, and all of them exist',()=>{
-  for(const file of ['components/SettingsView.tsx','components/McpStatus.tsx','components/DiaryConnectors.tsx']){
+  for(const file of SETTINGS_STATUS_FILES){
     const used=[...keysUsedIn(file)].filter(k=>/^(diarySettings|serviceStatus|settings|models)\./.test(k));
     const missing=used.filter(k=>!inBase(k)&&!inSegment('settings',k));
     same(missing,[],`${file} uses keys the Settings segment lacks: ${missing.join(', ')}`);
@@ -449,9 +461,13 @@ test('Diary & storage and Service status use only Settings-segment or base keys,
   // Nothing outside the Settings chunk may cite these (StoragePicker and DiarySharing also render
   // in the Diary view and the setup wizard, where the Settings segment is not registered).
   for(const file of srcFiles()){
-    if(['components/SettingsView.tsx','components/McpStatus.tsx','components/DiaryConnectors.tsx'].includes(file))continue;
+    if(SETTINGS_STATUS_FILES.includes(file))continue;
     const used=[...keysUsedIn(file)].filter(k=>/^(diarySettings|serviceStatus)\./.test(k));
     same(used,[],`${file} uses Diary & storage / Service status keys outside the Settings chunk`);
+  }
+  if(SETTINGS_STATUS_FILES.includes('live-engine-note.ts')){
+    const noteImporters=srcFiles().filter(f=>/from '(?:\.\.?\/)+live-engine-note'/.test(fs.readFileSync(path.join(SRC,f),'utf8')));
+    same(noteImporters,['components/SettingsView.tsx'],'live-engine-note is imported only by SettingsView');
   }
 });
 
@@ -608,7 +624,7 @@ test('the #624 strings exist in every locale, in that locale’s words and with 
   const keys=Object.keys({...EN,...Object.assign({},...SEGMENT_NAMES.map(s=>ENSEG[s]))}).filter(k=>/^(code\.(task\.(plan|output|result)|network|meta\.limitations|review|sidebar|active)|chat\.(approval|effort|statusId)|gdrive\.msg|features\.unavailable\.decision|features\.unavailable\.systemOne|decision\.msg)\./.test(k));
   assert.ok(keys.length>=80,`found ${keys.length} keys`);
   // Words that read the same in English and the locale, by nature.
-  const SAME=new Set(['code.review.severity.blocker:de-DE']);
+  const SAME=new Set(['code.review.severity.blocker:de-DE','chat.effort.value.default:nb-NO','chat.effort.value.default:sv-SE']);
   const en={...EN,...Object.assign({},...SEGMENT_NAMES.map(s=>ENSEG[s]))};
   for(const l of Object.keys(FILES))for(const k of keys){
     const text=core.translate(l,k);

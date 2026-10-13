@@ -94,7 +94,10 @@ test('toolGate is experimental, off by default and unavailable until the decisio
   const off = make({ env: {} });
   const info = off.describe().find((f) => f.name === 'toolGate');
   assert.equal(info.experimental, true); assert.equal(info.enabled, false); assert.equal(info.env, 'NOEVIA_FEATURE_TOOL_GATE');
-  assert.match(info.unavailable, /COWORK_DECISION_URL/);
+  // #1489/#1499: the reason says what to do in plain words and names no COWORK_* variable.
+  assert.equal(info.unavailable, 'Connect a private decision service, then restart noevia.');
+  assert.equal(info.unavailableId, 'decisionUrl');
+  assert.doesNotMatch(info.unavailable, /COWORK_|NOEVIA_/);
   assert.equal(off.enabled('toolGate'), false);
   const pinned = make({ env: { NOEVIA_FEATURE_TOOL_GATE: 'true', COWORK_DECISION_URL: 'http://laya:8040' } });
   assert.equal(pinned.enabled('toolGate'), true);
@@ -160,10 +163,14 @@ test('the reasons a feature is unavailable carry a stable id where the server ow
   assert.equal(unavailableId('nativeClientAuth', 'Needs TRUST_PROXY on so sign-in limits can tell clients apart.'), 'trustProxy');
   assert.equal(unavailableId('toolGate', 'Some new reason nobody wrote an id for.'), null, 'an unknown reason has no id and stays English');
   // #624: the decision-service reasons carry ids too, whichever experiment shows them.
-  const url = 'Connect a private decision service with COWORK_DECISION_URL, then restart Noevia.';
+  // The reasons as the server really writes them, so a rewording cannot leave its id behind (#1499).
+  const url = require('./decision-endpoint.cjs').configuration({}).reason;
+  const systemOne = require('./system-one-router.cjs').configuration({}).reason;
+  for (const reason of [url, systemOne]) assert.doesNotMatch(reason, /COWORK_|NOEVIA_/, 'no operator variable names (#1489)');
   for (const name of ['stepSupervision', 'toolGate', 'systemOneRouting']) assert.equal(unavailableId(name, url), 'decisionUrl');
   assert.equal(unavailableId('toolGate', 'Set up the decision service below before enabling this experiment.'), 'decisionSetup');
-  assert.equal(unavailableId('systemOneRouting', 'Not configured. Set COWORK_SYSTEM_ONE_URL to a dedicated local llama.cpp decision-model endpoint, then restart the app.'), 'systemOneUrl');
+  assert.equal(unavailableId('systemOneRouting', systemOne), 'systemOneUrl');
+  assert.equal(unavailableId('toolGate', systemOne), 'systemOneUrl');
   assert.equal(unavailableId('previews', url), null, 'only the decision-service experiments use these ids');
   const info = createFeatures({ env: {}, store: memoryStore() }).describe();
   assert.equal(info.find(f => f.id === 'nativeClientAuth').unavailableId, 'trustProxy');

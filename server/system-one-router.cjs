@@ -6,7 +6,7 @@ const { llamaLogitBackend } = require('./decision/backends.cjs');
 // Operator configuration only. No browser-supplied endpoint, model loading or downloads.
 // A dedicated private endpoint avoids silently changing the loaded answering model.
 function configuration(env = process.env) {
-  const reason = 'Not configured. Set COWORK_SYSTEM_ONE_URL to a dedicated local llama.cpp decision-model endpoint, then restart the app.';
+  const reason = 'Not configured. The operator needs to point it at a dedicated local decision-model endpoint, then restart noevia.';
   try {
     const url = new URL(env.COWORK_SYSTEM_ONE_URL);
     const host = url.hostname.replace(/^\[|\]$/g, '');
