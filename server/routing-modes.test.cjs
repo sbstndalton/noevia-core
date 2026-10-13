@@ -478,9 +478,9 @@ test('#1646: a box a turn picks, or one Automatic would add for the message, sen
 
 test('#1646: the check unavailable (503, timeout, low confidence) keeps a private-data turn local too', async (t) => {
   const failing = [
-    ['503', rm.createSensitivity({ decide: async () => { throw Object.assign(Error('decision service unavailable'), { status: 503 }); } })],
-    ['timeout', rm.createSensitivity({ decide: () => new Promise(() => {}), deadlineMs: () => 100 })],
-    ['low confidence', rm.createSensitivity({ decide: async () => ({ selected: 'not_sensitive', scores: { sensitive: 0.4, not_sensitive: 0.6 }, confidence: 0.5, source: 'model' }) })],
+    ['503', qualifiedSensitivity({ decide: async () => { throw Object.assign(Error('decision service unavailable'), { status: 503 }); } })],
+    ['timeout', qualifiedSensitivity({ decide: () => new Promise(() => {}), deadlineMs: () => 100 })],
+    ['low confidence', qualifiedSensitivity({ decide: async () => ({ selected: 'not_sensitive', scores: { sensitive: 0.4, not_sensitive: 0.6 }, confidence: 0.5, source: 'model' }) })],
   ];
   for (const [label, sensitivity] of failing) {
     const r = await run(t, { flag: true, settings: HYBRID, message: 'Summarize my latest letter.', project: { toolboxes: ['nextcloud-files'] }, toolBoxes: FILES_BOX,
