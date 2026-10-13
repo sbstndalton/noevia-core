@@ -117,3 +117,17 @@ test('markdown has one row per model in each table and names the weakest languag
   assert.deepEqual(s.weakLanguages(a), ['de 0.0%', 'fr 100.0%']);
   assert.equal(md.split('\n').filter((l) => l.startsWith('| m |')).length, 3);
 });
+
+test('one temperature refit on a held-out split cools an overconfident model and leaves the argmax alone', () => {
+  // Says 0.95 every time but is right 60% of the time: the fitted T is above 1 and ECE falls.
+  const rows = [...Array(400)].map((_, i) => {
+    const right = i % 5 < 3;
+    return rec({ id: `r${i}`, label: 'fast', selected: right ? 'fast' : 'smart', scores: right ? { fast: 0.95, smart: 0.05 } : { fast: 0.05, smart: 0.95 } });
+  });
+  const r = s.temperatureRefit(rows);
+  assert.ok(r.calibrationN > 150 && r.evaluationN > 150, JSON.stringify(r));
+  assert.ok(r.temperature > 1, `T ${r.temperature}`);
+  assert.ok(r.eceBefore > 0.3 && r.eceAfter < 0.1, JSON.stringify(r));
+  assert.ok(s.summarize(rows).calibrationRefit.eceAfter < 0.1);
+  assert.equal(s.temperatureRefit([rec({ ok: false })]), null);
+});

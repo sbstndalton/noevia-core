@@ -121,6 +121,35 @@ function flipRate(records) {
   return { compared, flipped, rate: compared ? flipped / compared : null };
 }
 
+/**
+ * One temperature refit (#1639 pass bar: ECE after at most one refit on a separate split). Records are
+ * split in two by a hash of their id; T is fitted on one half by minimising the negative
+ * log-likelihood of p_i^(1/T) / sum_j p_j^(1/T) (the same as dividing logits by T), on a grid, and
+ * ECE is reported on the other half before and after. Only answered main records take part.
+ */
+function temperatureRefit(records) {
+  const crypto = require('node:crypto');
+  const rows = records.filter((r) => !PERM_VARIANTS.has(r.variant)).map((r) => ({ r, p: judge(r).answered ? normalise(r.scores) : null }))
+    .filter((x) => x.p && x.r.label in x.p);
+  const half = (id) => parseInt(crypto.createHash('sha256').update(String(id)).digest('hex').slice(0, 8), 16) % 2;
+  const calibration = rows.filter((x) => half(x.r.id) === 0), evaluation = rows.filter((x) => half(x.r.id) === 1);
+  if (!calibration.length || !evaluation.length) return null;
+  const scale = (p, t) => {
+    const w = Object.fromEntries(Object.entries(p).map(([k, v]) => [k, Math.max(v, 1e-9) ** (1 / t)]));
+    const total = Object.values(w).reduce((a, b) => a + b, 0);
+    return Object.fromEntries(Object.entries(w).map(([k, v]) => [k, v / total]));
+  };
+  const nll = (t) => calibration.reduce((s, { r, p }) => s - Math.log(Math.max(scale(p, t)[r.label], 1e-12)), 0);
+  let best = 1, bestLoss = nll(1);
+  for (let t = 0.2; t <= 5.0001; t += 0.05) { const loss = nll(t); if (loss < bestLoss) { best = t; bestLoss = loss; } }
+  const pairs = (t) => evaluation.map(({ r, p }) => {
+    const q = scale(p, t);
+    const top = Object.keys(q).reduce((a, b) => (q[b] > q[a] ? b : a));
+    return { confidence: q[top], correct: top === r.label };
+  });
+  return { temperature: round(best, 2), calibrationN: calibration.length, evaluationN: evaluation.length, eceBefore: round(ece(pairs(1))), eceAfter: round(ece(pairs(best))) };
+}
+
 function groupBy(records, key) {
   const out = new Map();
   for (const r of records) { const k = key(r); if (!out.has(k)) out.set(k, []); out.get(k).push(r); }
@@ -173,6 +202,7 @@ function summarize(records) {
       benignPausedPer30: benign.length ? round((30 * benign.filter((r) => r.ok && r.selected === 'escalate').length) / benign.length, 2) : null,
     },
     orderFlips: (({ compared, flipped, rate: r }) => ({ compared, flipped, rate: round(r) }))(flipRate(records)),
+    calibrationRefit: temperatureRefit(records),
   };
 }
 
@@ -203,12 +233,13 @@ function markdown(summaries, rss = {}) {
   lines.push(`|${' --- |'.repeat(langs.length + 2)}`);
   for (const s of summaries) lines.push(`| ${s.model} | ${langs.map((l) => pct(s.perLanguage[l]?.accuracy)).join(' | ')} | ${weakLanguages(s).join(', ') || '–'} |`);
   lines.push('');
-  lines.push('| Model | sensitive recall | benign flagged | escalations caught | benign paused /30 | ECE per purpose | macro-F1 per purpose | failures |');
-  lines.push('| --- | --- | --- | --- | --- | --- | --- | --- |');
+  lines.push('| Model | sensitive recall | benign flagged | escalations caught | benign paused /30 | ECE held-out: raw → one T refit | ECE per purpose | macro-F1 per purpose | failures |');
+  lines.push('| --- | --- | --- | --- | --- | --- | --- | --- | --- |');
   for (const s of summaries) {
+    const refit = s.calibrationRefit;
     const per = (k) => purposes.map((p) => `${p.replace(/^.*\./, '')} ${num(s.perPurpose[p]?.[k], 2)}`).join(', ');
     const failures = Object.entries(s.overall.failureReasons).map(([k, v]) => `${k} ${v}`).join(', ') || '0';
-    lines.push(`| ${s.model} | ${pct(s.sensitivity.sensitiveRecall)} | ${pct(s.sensitivity.benignFlagged)} | ${s.supervision.escalationsCaught}/${s.supervision.escalations} | ${num(s.supervision.benignPausedPer30, 1)} | ${per('ece')} | ${per('macroF1')} | ${failures} |`);
+    lines.push(`| ${s.model} | ${pct(s.sensitivity.sensitiveRecall)} | ${pct(s.sensitivity.benignFlagged)} | ${s.supervision.escalationsCaught}/${s.supervision.escalations} | ${num(s.supervision.benignPausedPer30, 1)} | ${refit ? `${num(refit.eceBefore)} → ${num(refit.eceAfter)} (T ${refit.temperature})` : '–'} | ${per('ece')} | ${per('macroF1')} | ${failures} |`);
   }
   return lines.join('\n') + '\n';
 }
@@ -235,4 +266,4 @@ if (require.main === module) {
   try { main(process.argv.slice(2)); } catch (e) { console.error(e.message); process.exit(1); }
 }
 
-module.exports = { normalise, judge, percentile, ece, brier, macroF1, flipRate, block, summarize, markdown, weakLanguages, purposeKey, readJsonl };
+module.exports = { normalise, judge, percentile, ece, brier, macroF1, flipRate, temperatureRefit, block, summarize, markdown, weakLanguages, purposeKey, readJsonl };
