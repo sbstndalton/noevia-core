@@ -62,3 +62,12 @@ test('#1550: in Automatic there is no list to tick, so the notes point at the co
   assert.doesNotMatch(web, /\+ > Tools/);
   assert.equal(toolRouteNotes({ message: 'What is the latest Rust version?', offered: ['web-search'], onServer: ALL, automatic: true }), '');
 });
+
+test('#1550: in Automatic the web note follows the Automatic web rule, and a cloud model is told Nextcloud stays local', () => {
+  assert.equal(toolRouteNotes({ message: 'What is the current through a 10 ohm resistor?', offered: ['core'], onServer: ALL, automatic: true }), '',
+    'a physics question gets no "cannot verify" note');
+  assert.match(toolRouteNotes({ message: 'What is the current through a 10 ohm resistor?', offered: ['core'], onServer: ALL }), /Web search is off/,
+    'Manual keeps the wider time-sensitive rule');
+  const cloud = toolRouteNotes({ message: 'List my Nextcloud folders', offered: ['core'], onServer: ALL, automatic: true, localModel: false });
+  assert.match(cloud, /Nextcloud Files is not available in this chat \(your own files are only offered to a local model/);
+});

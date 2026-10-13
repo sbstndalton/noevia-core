@@ -64,7 +64,10 @@ const REASONS = {
 /** A project's own toolbox list. Tools: Automatic (#1006, toolsMode 'auto') is the operator
  *  default, which tool routing then narrows per message; Manual (or no mode, as before) is the
  *  hand-picked list, falling back to the default for a project predating toolboxes. Never more
- *  than one of those two lists, so Automatic cannot add a write the default does not offer. */
+ *  than one of those two lists. This is the BASE of a turn only: in Automatic, chat.cjs then adds the
+ *  boxes a message plainly needs (#1550, tools-mode.cjs automaticAdditions: offered boxes with a read
+ *  tool, user-data boxes only for a local model), so an Automatic turn can carry writes the default
+ *  does not offer. Each such write stops at the approval card per call, even under "Allow for this chat". */
 function projectToolboxIdsJs(project, defaultToolboxes) {
   if (project && project.toolsMode === 'auto') {
     // The Project documents box (read-only) that project-docs-default.cjs added on the first upload
