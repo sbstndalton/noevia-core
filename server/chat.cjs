@@ -143,6 +143,10 @@ function normalizeReplayHistory(mapped, newMessage) {
 // #1553: a reply whose chat template cannot take tools is told so in the request itself. Without this the model
 // said no search tool existed, or wrote search results it never had. The note is ours and holds no tool output.
 const TOOLS_OFF_MODEL_NOTE = 'No tools can run in this reply: this model\'s chat template cannot use them. If the person asks for a web search, a file, a live lookup or any other tool, say so in one line at the start. Do not write results, sources, excerpts or simulated output for it.';
+// #1646: the prompt lines that send the model to read_project_file, kept in one place so a cloud route without a grant
+// (where that tool is not offered) can reword them. The sources' coverage line lives in rag.cjs.
+const SKILL_INDEX_LEAD = 'Available skills (load the full file with the read_project_file tool when a task matches; do not guess their contents):';
+const SKILL_INDEX_LEAD_NO_READER = 'Available skills (their files cannot be loaded in this reply; do not guess their contents):';
 function withSystemNote(messages, note) {
   const at = messages.findIndex((m) => m?.role === 'system' && typeof m.content === 'string');
   if (at < 0) return [{ role: 'system', content: note }, ...messages];
@@ -509,7 +513,7 @@ function createChatHandler({
       const skills = skillsIndexFor(project);
       if (skills.length) {
         sysParts.push(
-          `Available skills (load the full file with the read_project_file tool when a task matches; do not guess their contents):\n` +
+          `${SKILL_INDEX_LEAD}\n` +
             require('./skill-index.cjs').formatSkillIndex(skills),
         );
         // L1 up front when one skill clearly matches this message, so a small model does not have
@@ -779,7 +783,12 @@ function createChatHandler({
           try { routingModes.setChatFlags(listProjectId, chatId, patch); } catch { /* the client saves it too */ }
           send({ type: 'route_remembered', ...patch });
         }
-        routeTarget = { route: decided.route, reason: decided.reason, ...(decided.reason === 'check-unavailable' && decided.cause ? { detail: decided.cause } : {}), cloud: settings.cloud, row: decided.route === 'cloud' ? cloudRow : null };
+        routeTarget = { route: decided.route, reason: decided.reason, ...(decided.reason === 'check-unavailable' && decided.cause ? { detail: decided.cause } : {}), cloud: settings.cloud, row: decided.route === 'cloud' ? cloudRow : null,
+          // #1646: a hybrid cloud route with no grant. A grant is the chat's allowCloud, a remembered "Send to cloud", or
+          // the person's one-off "Send to cloud" on the sensitive card (that turn only). The router read the conversation
+          // only, so an ungranted turn is never given a box that reads private data.
+          hybridUngranted: settings.mode === 'hybrid' && decided.route === 'cloud'
+            && !(flags.allowCloud === true || decided.remember === 'cloud' || decided.reason === 'user-choice') };
       }
     }
     // #779 F2: on a cloud route chosen by routing modes (hybrid and cloud alike: the check is
@@ -797,11 +806,11 @@ function createChatHandler({
       console.log(`[routing] tool result held from cloud flag=${hit}`);
       return true;
     };
-    const provider = routeTarget?.row ? { ...routeTarget.row, external: true } : getProvider(wantsAuto ? DEFAULT_PROVIDER_ID : projectProvider || DEFAULT_PROVIDER_ID);
+    let provider = routeTarget?.row ? { ...routeTarget.row, external: true } : getProvider(wantsAuto ? DEFAULT_PROVIDER_ID : projectProvider || DEFAULT_PROVIDER_ID);
     // External providers (#447, provider-egress.cjs): Diary text never goes to one, and a
     // ChatGPT connection is private to the account that made it and needs the feature flag.
     const egress = require('./provider-egress.cjs');
-    const externalProvider = egress.isExternalProvider(provider);
+    let externalProvider = egress.isExternalProvider(provider);
     // #815: linked chats' brains never reach an external provider or a cloud route; fail closed by
     // dropping the block before anything below reads `sys` or `wire`. Local requests are unchanged.
     if (brainBlock && (externalProvider || routeTarget?.route === 'cloud' || provider?.id !== DEFAULT_PROVIDER_ID)) {
@@ -811,12 +820,15 @@ function createChatHandler({
     }
     const egressRefused = egress.egressRefusal({ provider, spaceId, projectId: project?.id, diaryProjectId: diaryExtras.PROJECT_ID });
     if (egressRefused) return json(res, 409, { error: egressRefused });
-    const chatgptProvider = require('./chatgpt-oauth.cjs').isChatGptProvider(provider);
+    let chatgptProvider = require('./chatgpt-oauth.cjs').isChatGptProvider(provider);
     // Rule 4 (#452): storage tools never reach the Diary folder through an external provider.
     // The stream-guard schema check (#516) inside evaluateToolCall runs for every provider,
     // local/default included, ahead of those external-only rules; it is off by default.
-    const egressToolRefusal = (userId, name, rawArgs) => egress.evaluateToolCall({ provider, toolName: name, rawArgs,
-      storage: userId && typeof authService?.getStorage === 'function' ? authService.getStorage(userId) : null });
+    const egressToolRefusal = (userId, name, rawArgs) => (cloudUngranted() && isPrivateTool(name)
+      // #1646: backstop for the offering rules below: a private-data tool never runs for an ungranted cloud route.
+      ? `ERROR: ${name} reads private data and is not available while this chat answers through a cloud model. It was not run. Do not retry it; tell the user they can switch this chat to a local model.`
+      : egress.evaluateToolCall({ provider, toolName: name, rawArgs,
+        storage: userId && typeof authService?.getStorage === 'function' ? authService.getStorage(userId) : null }));
     let providerFetch = fetch;
     if (chatgptProvider) {
       if (!chatgptOAuth || !chatgptEnabled()) return json(res, 409, { error: 'Sign in with ChatGPT is turned off on this server. Choose another provider in the model popup.' });
@@ -897,7 +909,49 @@ function createChatHandler({
     // for an external provider (ChatGPT, a member's cloud provider) or a cloud route. Web search and offline
     // Wikipedia hold no user data and may be added for any provider.
     const toolModes = require('./tools-mode.cjs');
+    // #1646: the router role read the conversation, not what a tool would fetch later, and a tool result is
+    // screened by the regex pre-rule alone. So on a hybrid cloud route with no allowCloud grant no box that
+    // reads private data (storage, Nextcloud, Drive, project sources, any box off the allow-list) is offered;
+    // a turn that would carry one, from its project, its own picks or what Automatic would add for the
+    // message, goes local instead, with the reason in routing.detail. Web search results stay as they are.
+    const cloudUngranted = () => routeTarget?.route === 'cloud' && routeTarget.hybridUngranted === true;
+    const isPrivateTool = (name) => toolModes.PRIVATE_CORE_TOOLS.has(name)
+      || allToolboxes().some((b) => toolModes.isPrivateDataBox(b.id) && (b.tools || []).some((t) => t?.function?.name === name));
+    const rerouteLocalForPrivateTools = () => {
+      const roles = autoRoles();
+      const localModel = roles && (roles[routedRole] || roles.smart || roles.fast || roles.code);
+      if (!wantsAuto || !localModel) return false; // no local model: the boxes are stripped below and the turn stays on its route
+      routeTarget = { route: 'local', reason: 'sensitive-rule', detail: 'private-tools', cloud: routeTarget.cloud, row: null };
+      provider = getProvider(DEFAULT_PROVIDER_ID);
+      externalProvider = egress.isExternalProvider(provider);
+      // Everything derived from the cloud provider goes with it: a ChatGPT connection's fetch would accept the local
+      // /chat/completions URL and post it to the cloud. The headers, URL and approval checks are built from `provider` later.
+      chatgptProvider = false;
+      providerFetch = fetch;
+      model = localModel;
+      try { routingModes.log({ mode: 'hybrid', route: 'local', reason: 'sensitive-rule', flag: 'private-tools' }); } catch { /* codes only */ }
+      console.log('[routing] mode=hybrid route=local reason=sensitive-rule flag=private-tools');
+      return true;
+    };
     const automaticTools = toolModes.toolsModeOf(project) === 'auto' && project?.id !== diaryExtras?.PROJECT_ID;
+    // A private box that is only connected (Drive) or defaulted (Project documents) is not a reason to leave the
+    // cloud: it is stripped below, and the turn goes local only when THIS turn needs one. It needs one when the person
+    // picked a private box for the turn, when Automatic would add one for the message, or when the tool gate would
+    // use one of the tools the project carries (it picks only from the tools it is shown, so it is shown all of them).
+    if (cloudUngranted() && !body.compactOnly) {
+      const carriedIds = requestToolboxes();
+      let wanted = Array.isArray(body.turnToolboxes) ? carriedIds.filter((id) => body.turnToolboxes.includes(id) && toolModes.isPrivateDataBox(id)) : [];
+      if (!wanted.length && automaticTools) {
+        wanted = toolModes.automaticAdditions({ message, base: carriedIds, boxes: allToolboxes(), connectorBoxes: CONNECTOR_BOXES,
+          isWriteTool, ready: automaticToolsReady(chatUser), privateData: true }).filter(toolModes.isPrivateDataBox);
+      }
+      if (!wanted.length && toolGate && carriedIds.some(toolModes.isPrivateDataBox)) {
+        const everything = resolveTools({ ...project, toolsMode: 'manual', toolboxes: carriedIds }, model, (name) => toolPolicy.mode(chatUser?.id, name, isWriteTool(name)) === 'block');
+        const wouldUse = await toolGate.evaluate(message, everything.tools, ...(chatFrame ? [steering.gateBias(chatFrame)] : []));
+        if (wouldUse && wouldUse.decision !== 'none' && isPrivateTool(wouldUse.decision.tool)) wanted = [wouldUse.decision.tool];
+      }
+      if (wanted.length) rerouteLocalForPrivateTools();
+    }
     const automaticLocal = !externalProvider && routeTarget?.route !== 'cloud' && provider?.id === DEFAULT_PROVIDER_ID;
     let automaticAdded = [];
     if (automaticTools && !body.compactOnly) {
@@ -907,6 +961,19 @@ function createChatHandler({
     const selectedBoxes = requestToolboxes(automaticAdded);
     // Rule 2 of provider-egress.cjs: private tools (the Diary) are not offered through an external provider.
     egress.stripPrivateToolboxes(selectedBoxes, provider);
+    // #1646: still on an ungranted cloud route (no local model to move to): no private-data box is offered.
+    let privateStripped = false;
+    if (cloudUngranted()) {
+      for (let k = selectedBoxes.length - 1; k >= 0; k--) if (toolModes.isPrivateDataBox(selectedBoxes[k])) { selectedBoxes.splice(k, 1); privateStripped = true; }
+      if (project?.files?.length && selectedBoxes.includes('core')) privateStripped = true; // read_project_file is taken out below
+      // The prompt must not send the model to a tool it does not have (the skills index, the sources' coverage line).
+      const dropReader = (text) => (typeof text === 'string' ? text
+        .replace(SKILL_INDEX_LEAD, SKILL_INDEX_LEAD_NO_READER)
+        .replace(require('./rag.cjs').READ_FILE_HINT, '')
+        .replace(require('./source-coverage.cjs').READ_FILE_HINT, '') : text);
+      sys = dropReader(sys);
+      wire = wire.map((m) => (typeof m.content === 'string' ? { ...m, content: dropReader(m.content) } : m));
+    }
     automaticAdded = automaticAdded.filter((id) => selectedBoxes.includes(id));
     if (automaticAdded.length) console.log(`[tools] Automatic added ${automaticAdded.join(', ')} for this message`);
     let routing = await chatToolRouter.select(selectedBoxes, message);
@@ -927,7 +994,7 @@ function createChatHandler({
     }
     if (routing.routed) console.log(`[tools] routed ${selectedBoxes.length} toolboxes to ${routing.ids.join(', ')}`);
     // A tool the account blocked is never offered, so the model cannot even ask for it.
-    const blocked = (name) => toolPolicy.mode(chatUser?.id, name, isWriteTool(name)) === 'block';
+    const blocked = (name) => toolPolicy.mode(chatUser?.id, name, isWriteTool(name)) === 'block' || (cloudUngranted() && toolModes.PRIVATE_CORE_TOOLS.has(name));
     // The ids are already this request's selection (Automatic included), so resolve exactly them: resolveTools reads
     // an Automatic project's list as the default set and would otherwise drop connectors, turn boxes and additions.
     const asSelection = (ids) => ({ ...project, toolsMode: 'manual', toolboxes: ids });
@@ -1387,6 +1454,8 @@ function createChatHandler({
     // template cannot take tools at all, where "answer with the Files tools" would contradict the tools-off notice
     // (#1586). Empty for most chats.
     let routeNoteText = '';
+    // #1646: the cloud model is told, so it does not invent file contents it was never given.
+    if (cloudUngranted() && privateStripped) roundMessages = withSystemNote(roundMessages, "Tools that read the person's own files, Nextcloud or Google Drive are not available in this reply. If the task needs them, say so and suggest switching this chat to a local model. Do not guess at file contents.");
     if (!templateToolsOff) {
       const names = new Set(activeTools.map((tool) => tool.function?.name));
       const boxes = allToolboxes();
