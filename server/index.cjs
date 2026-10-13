@@ -378,6 +378,10 @@ const {
 // The per-turn permitted-tools view is cached for 30 s; every write that changes what it shows
 // (a tool permission, a project's toolbox selection) clears it so the picker is never stale (#796).
 const permittedToolsCache = require('./toolboxes-permitted.cjs').createTtlCache({ ttlMs: 30000 });
+const { nextcloudStorageConnected } = require('./tools-mode.cjs');
+// #1550: whether Automatic may add a box for this account (a Nextcloud box needs its own usable connection).
+const automaticToolsReady = require('./tools-mode.cjs').createAutomaticToolsReady({
+  getStorage: (userId) => authService.getStorage(userId, true), originAllowed: (url) => mcpCredentialOriginAllowed(url) });
 const connectorRoutes = require('./routes/connectors.cjs').createConnectorRoutes({
   onPolicyChange: () => permittedToolsCache.clear(),
   accounts: driveAccounts, driveTools, policy: toolPolicy, offsite: offsiteBackup, isWrite: (name) => isWriteTool(name), json, readBody: (req) => readJson(req),
@@ -386,7 +390,7 @@ const connectorRoutes = require('./routes/connectors.cjs').createConnectorRoutes
   nextcloud: {
     state(user) {
       const storage = authService.getStorage(user.id, true);
-      const connected = ['nextcloud', 'webdav'].includes(storage.kind) && !!storage.username && !!storage.secret;
+      const connected = nextcloudStorageConnected(storage);
       if (!MCP_SERVERS.some((sv) => sv.auth === 'nextcloud')) {
         return { configured: false, state: 'not-configured', message: 'This server has no Nextcloud MCP server configured, so there are no Nextcloud tools to offer.' };
       }
@@ -877,7 +881,7 @@ const { handleChat } = require('./chat.cjs').createChatHandler({
     chats: () => [...Array.from(FREE_CHATS), ...PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)).flatMap((proj) => proj.chats || [])],
     read: (chatId) => chatBrainLib.readBrain(currentWorkspace().dir, chatId) },
   DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall,
-  oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse,
+  oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse, automaticToolsReady,
   // #917: which of the signed-in workspace's lists holds a chat id ('free', a project id, or null).
   chatListHolder,
   chatgptOAuth, chatgptEnabled: () => features.enabled('chatgptOAuth'),

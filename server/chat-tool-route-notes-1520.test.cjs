@@ -50,9 +50,26 @@ test('#1520: a Nextcloud request with Nextcloud Files off reaches the model with
   assert.match(sys, /Do not use another storage's tools in its place/);
 });
 
+// A project with its own list is Manual: Web search unticked there is a choice the note points back to.
+const MANUAL_PROJECT = { id: 'fixture-project', model: 'answer-model', assets: [], toolsMode: 'manual', toolboxes: ['core'] };
+
 test('#1521: a latest-version question with Web search off reaches the model with the cannot-verify note', async (t) => {
-  const sys = await systemTextFor(t, 'What is the latest stable version of the Rust compiler?', { onServer: [{ id: 'web-search' }, { id: 'core' }] });
+  const sys = await systemTextFor(t, 'What is the latest stable version of the Rust compiler?', { onServer: [{ id: 'web-search' }, { id: 'core' }],
+    overrides: { getProject: () => MANUAL_PROJECT } });
   assert.match(sys, /Web search is off for this chat, so you cannot check current information/);
+});
+
+test('#1550: in Automatic, a Web search that could not be added is not blamed on a tick the user cannot see', async (t) => {
+  // The fixture project has no list of its own, so it is Automatic; its Web search box has no tool to offer.
+  const sys = await systemTextFor(t, 'What is the latest stable version of the Rust compiler?', { onServer: [{ id: 'web-search' }, { id: 'core' }] });
+  assert.match(sys, /Web search could not be used for this message/);
+  assert.doesNotMatch(sys, /\+ > Tools/);
+});
+
+test('#1550: in Automatic, a named Nextcloud that is not usable points at the connection, not at + > Tools', async (t) => {
+  const sys = await systemTextFor(t, 'List the folders at the top of my Nextcloud files (names only).');
+  assert.match(sys, /named Nextcloud Files, but Nextcloud Files is not available in this chat \(connect it under Settings > Connectors/);
+  assert.doesNotMatch(sys, /\+ > Tools/);
 });
 
 test('an ordinary message gets no route note in its system text', async (t) => {
