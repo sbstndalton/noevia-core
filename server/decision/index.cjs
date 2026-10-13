@@ -61,8 +61,11 @@ function createDecisions({ backends, chains = {}, log = () => {}, now = Date.now
       const invalid = invalidResult(request, result, opts);
       if (onDiagnostic) onDiagnostic({ purpose: request.purpose, backend: id, ok: !invalid, reason: invalid ? `invalid: ${invalid}` : null, diagnostics: result?.metadata?.diagnostics ?? null });
       if (invalid) { cause = 'invalid-result'; log({ purpose: request.purpose, backend: id, failed: `invalid: ${invalid}` }); continue; }
+      // `confidence` is the selected option's share of the backend's scores (the decision service
+      // derives it from its validated probability map, #1640; the logit backend from its readout
+      // ratio), uncalibrated. A backend that gives no finite number (null, '0.9') fails this bound.
       const min = request.constraints.minConfidence;
-      if (typeof min === 'number' && request.kind !== 'rank' && !(result.confidence >= min)) {
+      if (typeof min === 'number' && request.kind !== 'rank' && !(Number.isFinite(result.confidence) && result.confidence >= min)) {
         return done(request, withReason(fallback(), 'low-confidence'), { backend: id, confidence: result.confidence });
       }
       return done(request, { ...result, source: id, metadata: { ...(result.metadata || {}), latencyMs: now() - started } });

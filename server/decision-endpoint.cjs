@@ -108,7 +108,14 @@ function createDecisionEndpoint({ env=process.env, fetchImpl=globalThis.fetch, h
         ids.some(id=>id!==result.selected && result.scores[id]>=result.scores[result.selected])) throw failure('invalid-result','Invalid decision result');
       // Only expose a known model identifier, never arbitrary service-provided text or URLs.
       const model = result.model === 'convaiinnovations/laya' ? result.model : null;
-      return {selected:result.selected,scores:result.scores,confidence:null,metadata:{calibrated:false,model}};
+      // #1640: `confidence` is the winning option's share of the service's probability map (Laya's
+      // `probabilities`, checked above: one per option, each in [0,1], summing to 1, the selected one
+      // the strict maximum). It was null, so decide()'s minConfidence bound (the sensitivity check's
+      // 0.6) threw every answer away. It is the same number the tool gate, the load advisor and the
+      // logit backend read (scores[selected]); for two options a 0.6 share is a 0.2 margin over the
+      // runner-up. It is NOT a calibrated probability of being right (calibrated:false), and a
+      // `confidence` field in the reply is ignored: only the validated scores decide it.
+      return {selected:result.selected,scores:result.scores,confidence:result.scores[result.selected],metadata:{calibrated:false,model}};
     }
   };
 }

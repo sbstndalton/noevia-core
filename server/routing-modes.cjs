@@ -295,13 +295,27 @@ function fairShares(needs, budget) {
  * prompt, RAG, memory) and the attachment names. When everything does not fit, each section gets a
  * fair share (an empty or short section gives its unused room to the others), so neither history
  * nor attachments is ever dropped for a long message. What does not fit is still covered by the
- * deterministic pre-rules, which the caller runs over the whole text first.
+ * deterministic pre-rules, which the caller runs over the whole text first. `complete` is false when
+ * anything was dropped or cut: the sensitivity check then may not clear the turn for cloud (#1640).
+ * @returns {{ chunks: string[], complete: boolean }}
  */
-function routerChunks({ message, system, history, attachments }, { chunkChars = ROUTER_CHUNK_CHARS, maxChunks = ROUTER_MAX_CHUNKS } = {}) {
+function routerInput({ message, system, history, attachments }, { chunkChars = ROUTER_CHUNK_CHARS, maxChunks = ROUTER_MAX_CHUNKS } = {}) {
   const size = Math.max(200, Math.min(ROUTER_CHUNK_CHARS * 4, Math.floor(Number(chunkChars) || ROUTER_CHUNK_CHARS)));
   const count = Math.max(1, Math.min(MAX_CHUNKS_CAP, Math.floor(Number(maxChunks) || ROUTER_MAX_CHUNKS)));
-  const hist = (Array.isArray(history) ? history : []).slice(-40).reverse()
-    .map((h) => (h ? `${h.role}: ${textOf(h.content).slice(0, size * count)}` : '')).filter((t) => t.length > 2).join('\n');
+  // #1640 review: whether the router saw ALL of what a cloud route would send. Every section below is
+  // sent: the message, every history entry (chat.cjs sends all of mappedHistory), the context (the
+  // system prompt without the linked-chat brains, plus a free chat's attached-file text) and the
+  // attachment names (named in notes to an external provider). Any of it dropped or cut: not complete.
+  let complete = true;
+  const entries = (Array.isArray(history) ? history : []).filter(Boolean);
+  if (entries.length > 40) complete = false;
+  const hist = entries.slice(-40).reverse().map((h) => {
+    // An applied write's target and arguments are sent with it (chat.cjs appliedToolNote).
+    const extra = [typeof h.target === 'string' && h.target ? `target: ${h.target}` : '', typeof h.args === 'string' && h.args ? `arguments: ${h.args}` : ''].filter(Boolean).join('\n');
+    const text = extra ? `${textOf(h.content)}\n${extra}` : textOf(h.content);
+    if (text.length > size * count) complete = false;
+    return `${h.role}: ${text.slice(0, size * count)}`;
+  }).filter((t) => t.length > 2).join('\n');
   const names = (Array.isArray(attachments) ? attachments : []).filter((n) => typeof n === 'string' && n).join(', ');
   const sections = [
     ['Message', String(message || '')],
@@ -309,16 +323,21 @@ function routerChunks({ message, system, history, attachments }, { chunkChars = 
     ['Context', String(system || '')],
     ['Attachments', names],
   ].filter(([, text]) => text.trim());
-  if (!sections.length) return [];
+  if (!sections.length) return { chunks: [], complete };
   const SEP = '\n\n';
   // Labels, the separators between sections and a little slack are paid for before the shares.
   const overhead = sections.reduce((n, [label]) => n + label.length + 2, 0) + SEP.length * (sections.length - 1);
   const shares = fairShares(sections.map(([, text]) => text.length), size * count - overhead);
+  if (sections.some(([, text], i) => shares[i] < text.length)) complete = false;
   const whole = sections.map(([label, text], i) => `${label}:\n${text.slice(0, shares[i])}`).join(SEP);
   const chunks = [];
   for (let at = 0; at < whole.length && chunks.length < count; at += size) chunks.push(whole.slice(at, at + size));
-  return chunks;
+  if (chunks.join('').length < whole.length) complete = false;
+  return { chunks, complete };
 }
+
+/** routerInput's chunks only (the sensitivity check is then told nothing about coverage). */
+function routerChunks(input, opts) { return routerInput(input, opts).chunks; }
 
 // ── The router role ─────────────────────────────────────────────────────────
 
@@ -340,6 +359,10 @@ const OPTIONS = Object.freeze([
 // Laya deadlines; the admin deadline field (decision-settings, 100-2000 ms) does not govern this check.
 const SENSITIVITY_DEADLINE_MS = 2000;
 function createSensitivity({ decide, deadlineMs = () => SENSITIVITY_DEADLINE_MS, minConfidence = 0.6, maxChunks = MAX_CHUNKS_CAP, log = () => {} }) {
+  // #1640: an answer counts only with a numeric confidence at the bound (the selected option's share,
+  // decision-endpoint.cjs). A missing, non-numeric or low one fails closed alike: a "not sensitive"
+  // nobody vouched for must never unlock cloud. decide() applies the same bound; this does not rely on it.
+  const vouched = (result) => Number.isFinite(result?.confidence) && result.confidence >= minConfidence;
   // A short code for why the check could not answer (never message or model text).
   const causeOfFailure = (result, error) => {
     if (error) return /unavailable|no decision service/i.test(String(error.message || '')) ? 'no-service' : error.deadline ? 'deadline' : 'error';
@@ -347,7 +370,8 @@ function createSensitivity({ decide, deadlineMs = () => SENSITIVITY_DEADLINE_MS,
     if (meta.fellBack === 'low-confidence') return 'low-confidence';
     if (meta.fellBack === 'deadline' || meta.cause === 'deadline') return 'deadline';
     if (typeof meta.cause === 'string' && /^[a-z][a-z0-9-]{0,39}$/.test(meta.cause)) return meta.cause;
-    return typeof result?.confidence === 'number' && result.confidence < minConfidence ? 'low-confidence' : 'no-answer';
+    const answered = result && result.source !== 'fallback' && OPTIONS.some((o) => o.id === result.selected);
+    return answered && !vouched(result) ? 'low-confidence' : 'no-answer';
   };
   async function one(text, deadline) {
     let result, error = null;
@@ -359,11 +383,21 @@ function createSensitivity({ decide, deadlineMs = () => SENSITIVITY_DEADLINE_MS,
         constraints: { deadlineMs: deadline, minConfidence }, fallback: { selected: null, scores: {} } });
     } catch (e) { result = null; error = e || Error('error'); }
     const answered = result && result.source !== 'fallback' && OPTIONS.some((o) => o.id === result.selected);
-    const confident = answered && (typeof result.confidence !== 'number' || result.confidence >= minConfidence);
+    const confident = answered && vouched(result);
     return !confident ? { verdict: 'unavailable', cause: causeOfFailure(result, error) } : { verdict: result.selected === 'sensitive' ? 'router' : null };
   }
   return async function check(input) {
-    const list = (Array.isArray(input) ? input : [input]).map((t) => String(t || '')).filter(Boolean).slice(0, Math.max(1, maxChunks));
+    // #1640 review: routerInput's { chunks, complete }. A check that cannot see everything a cloud
+    // route would send may not clear it, so a partial input is not asked at all: the turn stays local
+    // with no card, like any check that could not answer (#1421). Without `complete: true`, partial.
+    const covered = input && typeof input === 'object' && !Array.isArray(input) ? input : null;
+    if (covered) input = Array.isArray(covered.chunks) ? covered.chunks : [];
+    const given = (Array.isArray(input) ? input : [input]).map((t) => String(t || '')).filter(Boolean);
+    const list = given.slice(0, Math.max(1, maxChunks));
+    if (covered && (covered.complete !== true || list.length < given.length) && list.length) {
+      try { log({ verdict: 'unavailable', fellBack: true, cause: 'partial', chunks: list.length, deadlineMs: 0, latencyMs: 0 }); } catch { /* codes only */ }
+      return { flagged: true, flag: 'unavailable', cause: 'partial' };
+    }
     const deadline = Math.max(100, Number(deadlineMs()) || SENSITIVITY_DEADLINE_MS);
     const started = Date.now();
     let verdicts;
@@ -455,5 +489,5 @@ function decisionCodes(entry) {
 }
 
 module.exports = { rustOwned, MODES, WHEN_SENSITIVE, OPTIONS, FILE, ALLOWED_KEY, normalize, read, write, validate, allowedModes, setAllowedModes,
-  effectiveMode, projectOverride, withProjectOverride, preRule, hasDiaryContent, routerChunks, chunkCharsFor, ROUTER_CHUNK_CHARS, ROUTER_MAX_CHUNKS, routerMaxChunks, createSensitivity, resolveRoute, chatFlags, cloudModel, ibanValid, luhn,
+  effectiveMode, projectOverride, withProjectOverride, preRule, hasDiaryContent, routerChunks, routerInput, chunkCharsFor, ROUTER_CHUNK_CHARS, ROUTER_MAX_CHUNKS, routerMaxChunks, createSensitivity, resolveRoute, chatFlags, cloudModel, ibanValid, luhn,
   SENSITIVITY_DEADLINE_MS, decisionCodes };

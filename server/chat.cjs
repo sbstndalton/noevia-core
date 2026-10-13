@@ -749,8 +749,9 @@ function createChatHandler({
           hardLocal, forceLocal: flags.forceLocal, allowCloud: flags.allowCloud,
           // #779 F4: the current message first, so the 400k scan limit can never cut it off.
           preFlag: settings.mode === 'hybrid' ? (rm.preRule(message) || rm.preRule(attachmentNames.join('\n')) || rm.preRule(sentText)) : null,
-          // #779 F1: the router reads bounded chunks sized to the decision service's real budget.
-          check: () => routingModes.sensitivity(rm.routerChunks({ message, system: routerSystem, history: mappedHistory, attachments: attachmentNames },
+          // #779 F1: the router reads bounded chunks sized to the decision service's real budget. #1640
+          // review: with whether they hold everything a cloud route sends; if not, the check cannot clear it.
+          check: () => routingModes.sensitivity(rm.routerInput({ message, system: routerSystem, history: mappedHistory, attachments: attachmentNames },
             { chunkChars: typeof routingModes.chunkChars === 'function' ? routingModes.chunkChars() : undefined,
               maxChunks: typeof routingModes.maxChunks === 'function' ? routingModes.maxChunks() : undefined })),
           ask: async (flag) => {
