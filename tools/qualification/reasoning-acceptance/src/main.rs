@@ -7,9 +7,9 @@ use std::{
     process::{Command, ExitCode},
     time::{SystemTime, UNIX_EPOCH},
 };
-const FIXTURE: &str = "f59155d9effbed083e911326bd74187613a7025c";
-const RS_REF: &str = "c90210ee5be06024b2a4b477e60db188247aba33";
-const ARCHIVE: &str = "a5c04fc61927ce9fd0e4425f6aa6923bfaa40f14bbe06b136b120197682b2411";
+const FIXTURE: &str = "83064ce1bc9baddb51e1054327db2a4aac2c54d1";
+const RS_REF: &str = "e7f746d8f510dee1cf11aa06200a8f2a975a79f7";
+const ARCHIVE: &str = "2cb576495a77146a350e4f028e9e083b782aaad79813b8211856ee09c74978e5";
 const TEMPLATES: [(&str, &str); 3] = [
     (
         "input",
