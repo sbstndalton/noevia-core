@@ -816,7 +816,7 @@ function createChatHandler({
     }
     const egressRefused = egress.egressRefusal({ provider, spaceId, projectId: project?.id, diaryProjectId: diaryExtras.PROJECT_ID });
     if (egressRefused) return json(res, 409, { error: egressRefused });
-    const chatgptProvider = require('./chatgpt-oauth.cjs').isChatGptProvider(provider);
+    let chatgptProvider = require('./chatgpt-oauth.cjs').isChatGptProvider(provider);
     // Rule 4 (#452): storage tools never reach the Diary folder through an external provider.
     // The stream-guard schema check (#516) inside evaluateToolCall runs for every provider,
     // local/default included, ahead of those external-only rules; it is off by default.
@@ -920,6 +920,10 @@ function createChatHandler({
       routeTarget = { route: 'local', reason: 'sensitive-rule', detail: 'private-tools', cloud: routeTarget.cloud, row: null };
       provider = getProvider(DEFAULT_PROVIDER_ID);
       externalProvider = egress.isExternalProvider(provider);
+      // Everything derived from the cloud provider goes with it: a ChatGPT connection's fetch would accept the local
+      // /chat/completions URL and post it to the cloud. The headers, URL and approval checks are built from `provider` later.
+      chatgptProvider = false;
+      providerFetch = fetch;
       model = localModel;
       try { routingModes.log({ mode: 'hybrid', route: 'local', reason: 'sensitive-rule', flag: 'private-tools' }); } catch { /* codes only */ }
       console.log('[routing] mode=hybrid route=local reason=sensitive-rule flag=private-tools');
@@ -961,7 +965,8 @@ function createChatHandler({
       // The prompt must not send the model to a tool it does not have (the skills index, the sources' coverage line).
       const dropReader = (text) => (typeof text === 'string' ? text
         .replace(SKILL_INDEX_LEAD, SKILL_INDEX_LEAD_NO_READER)
-        .replace(require('./rag.cjs').READ_FILE_HINT, '') : text);
+        .replace(require('./rag.cjs').READ_FILE_HINT, '')
+        .replace(require('./source-coverage.cjs').READ_FILE_HINT, '') : text);
       sys = dropReader(sys);
       wire = wire.map((m) => (typeof m.content === 'string' ? { ...m, content: dropReader(m.content) } : m));
     }

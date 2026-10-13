@@ -228,9 +228,10 @@ test('resolveRoute: each mode, force-local, hard bans, remembered and the answer
 const LOCAL = 'http://local.invalid', CLOUD = 'http://cloud.invalid';
 const sse = (...frames) => ({ ok: true, status: 200, body: (async function* () { for (const f of frames) yield Buffer.from(`data: ${JSON.stringify(f)}\n\n`); })() });
 const fnTool = (name) => ({ type: 'function', function: { name, description: 'Synthetic tool', parameters: { type: 'object', properties: {} } } });
-const PROVIDERS = { default: { id: 'default', baseUrl: LOCAL }, 'cloud-x': { id: 'cloud-x', baseUrl: CLOUD, label: 'Synthetic cloud', shared: true } };
+const PROVIDERS = { default: { id: 'default', baseUrl: LOCAL }, 'cloud-x': { id: 'cloud-x', baseUrl: CLOUD, label: 'Synthetic cloud', shared: true },
+  'cloud-gpt': { id: 'cloud-gpt', kind: 'chatgpt-oauth', baseUrl: 'http://chatgpt.invalid', label: 'Synthetic ChatGPT' } };
 
-async function run(t, { freeChatId = null, ragOverride = null, flag, settings = null, chat = {}, project: projectOver = {}, message = 'Tell me about synthetic widgets', history = [], verdict = 'clear', answer = null, approvals = null, userId = 'synthetic-user', withRouting = true, toolResult = null, brainContext = null, localRoles = { fast: 'local-fast', smart: 'local-smart' }, sensitivity = null, toolBoxes = null, toolName = 'synthetic_read', historyCap = 20, turnToolboxes = undefined, offerAll = false, gateTool = null, connected = [], defaultToolboxes = [], skillsIndex = [] }) {
+async function run(t, { freeChatId = null, ragOverride = null, flag, settings = null, chat = {}, project: projectOver = {}, message = 'Tell me about synthetic widgets', history = [], verdict = 'clear', answer = null, approvals = null, userId = 'synthetic-user', withRouting = true, toolResult = null, brainContext = null, localRoles = { fast: 'local-fast', smart: 'local-smart' }, sensitivity = null, toolBoxes = null, toolName = 'synthetic_read', historyCap = 20, turnToolboxes = undefined, offerAll = false, gateTool = null, connected = [], defaultToolboxes = [], skillsIndex = [], chatgptOAuth = null }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-routing-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const events = [], calls = [], logs = [], flagsSet = [], errors = [];
   const res = new EventEmitter();
@@ -285,6 +286,7 @@ async function run(t, { freeChatId = null, ragOverride = null, flag, settings = 
       gateCalls.push(offered.map((x) => x.function.name));
       return offered.some((x) => x.function.name === gateTool) ? { decision: { tool: gateTool, mode: 'require' }, source: 'rule' } : { decision: 'none', source: 'none' };
     } } } : {}),
+    ...(chatgptOAuth ? { chatgptOAuth, chatgptEnabled: () => true } : {}),
     ...(brainContext ? { chatFramingEnabled: () => true, brainContext } : {}),
     ...(withRouting ? { routingModes: {
       enabled: () => flag === true,
@@ -301,7 +303,7 @@ async function run(t, { freeChatId = null, ragOverride = null, flag, settings = 
   const consoleLines = [];
   console.log = (...a) => consoleLines.push(a.join(' ')); console.warn = (...a) => consoleLines.push(a.join(' ')); console.info = (...a) => consoleLines.push(a.join(' '));
   try {
-    await handleChat({}, res, freeChatId ? { spaceId: 'free', chatId: freeChatId, message, history } : { projectId: 'fixture-project', chatId: 'fixture-chat', message, history, ...(turnToolboxes ? { turnToolboxes } : {}) });
+    await handleChat({}, res, freeChatId ? { spaceId: 'free', chatId: freeChatId, message, history } : { projectId: 'fixture-project', chatId: 'fixture-chat', message, history, ...(turnToolboxes ? { turnToolboxes } : {}) }, ...(chatgptOAuth ? [{ user: { id: userId, role: 'member' } }] : []));
   } finally { console.log = origLog; console.warn = origWarn; console.info = origInfo; }
   const upstream = calls.filter((c) => c.url);
   const meta = events.find((e) => e.type === 'meta');
@@ -545,6 +547,24 @@ test('#1646: the project-file reader is taken out of a cloud route and stays on 
   assert.doesNotMatch(JSON.stringify(local.upstream[0].body.messages), /not available in this reply/);
 });
 
+test('#1646: a ChatGPT cloud provider is left behind with the route: a private-tool turn never reaches its fetch, even with an unreadable catalogue', async (t) => {
+  const chatgptCalls = [];
+  // Like fetchFor: accepts any /chat/completions URL (an unreadable catalogue lets the request go ahead) and sends it to the cloud.
+  const chatgptOAuth = { status: () => ({ state: 'connected' }),
+    fetchFor: () => async (url, init) => { chatgptCalls.push({ url: String(url), body: JSON.parse(init.body) }); return sse({ choices: [{ delta: { content: 'from the cloud' } }] }); } };
+  const settings = { mode: 'hybrid', cloud: { providerId: 'cloud-gpt', smart: 'gpt-smart', fast: 'gpt-fast' } };
+  const r = await run(t, { flag: true, settings, verdict: 'clear', message: 'Summarize my latest letter.', project: { toolboxes: ['nextcloud-files'] },
+    toolBoxes: FILES_BOX, toolName: 'files_read_synthetic', toolResult: LETTER, gateTool: 'files_read_synthetic', chatgptOAuth });
+  assertPrivateToolsStayLocal(r, 'chatgpt cloud');
+  assert.equal(chatgptCalls.length, 0, 'nothing went through the ChatGPT fetch');
+  assert.ok(r.upstream.every((u) => u.url.startsWith(LOCAL)));
+  // And the same provider on a turn that stays on the cloud does use it.
+  const stays = await run(t, { flag: true, settings, verdict: 'clear', message: 'Tell me about synthetic widgets', chatgptOAuth });
+  assert.deepEqual(stays.meta.routing, { route: 'cloud', reason: 'mode' });
+  assert.equal(chatgptCalls.length, 1);
+  assert.equal(stays.upstream.length, 0, 'the plain fetch was not used');
+});
+
 test('#1646: a one-off "Send to cloud" on the sensitive card is a grant for that turn: the private box is offered', async (t) => {
   const r = await run(t, { flag: true, settings: HYBRID, verdict: 'sensitive', answer: { choice: 'cloud' }, message: 'Summarize my latest letter.',
     project: { toolboxes: ['nextcloud-files'] }, toolBoxes: FILES_BOX, toolName: 'files_read_synthetic', toolResult: LETTER, gateTool: 'files_read_synthetic' });
@@ -561,19 +581,21 @@ test('#1646: a one-off "Send to cloud" on the sensitive card is a grant for that
 
 test('#1646: where the project-file reader is taken out, the prompt no longer sends the model to it', async (t) => {
   const hint = require('./rag.cjs').READ_FILE_HINT;
-  const ragOverride = { filesContext: async (_p, _f, _q, _u, onSources) => { onSources([]); return `Sources (1): "notes.md"\nSource completeness: none.\nContext may contain excerpts only.${hint} Do not guess.`; } };
+  const ragOverride = { filesContext: async (_p, _f, _q, _u, onSources) => { onSources([], [{ file: 'notes.md', body: 'x'.repeat(100), kind: 'file' }]); return `Sources (1): "notes.md"\nSource completeness: none.\nContext may contain excerpts only.${hint} Do not guess.`; } };
   const skillsIndex = [{ file: 'skills/a.md', name: 'A', description: 'd', version: '1' }];
-  const common = { flag: true, message: 'Tell me about synthetic widgets', ragOverride, skillsIndex, project: { toolboxes: ['core'], files: [{ name: 'notes.md', content: 'synthetic' }] },
+  const common = { flag: true, message: 'Tell me about synthetic widgets', ragOverride, skillsIndex, project: { toolboxes: ['core'], files: [{ name: 'notes.md', content: 'x'.repeat(5000) }] },
     toolBoxes: [{ id: 'core', tools: ['get_current_time', 'read_project_file'] }] };
   const text = (r) => JSON.stringify(r.upstream[0].body.messages);
   const cloud = await run(t, { ...common, settings: HYBRID });
   assert.deepEqual(cloud.meta.routing, { route: 'cloud', reason: 'mode' });
   assert.match(text(cloud), /Context may contain excerpts only\. Do not guess/);
   assert.match(text(cloud), /Available skills \(their files cannot be loaded in this reply/);
-  assert.equal(/read_project_file/.test(text(cloud)), false, 'neither the skills index nor the coverage line names the reader');
+  assert.match(text(cloud), /Source text was truncated for this reply.*say which part you read\./, 'the truncation note is still there');
+  assert.equal(/read_project_file/.test(text(cloud)), false, 'neither the skills index, the coverage line nor the truncation note names the reader');
   const local = await run(t, { ...common, settings: { ...HYBRID, mode: 'local' } });
   assert.match(text(local), /Use read_project_file with PDF startPage/);
   assert.match(text(local), /load the full file with the read_project_file tool/);
+  assert.match(text(local), /read_project_file with an offset can read more of a file/);
 });
 
 test('the card: Send to cloud goes to cloud; Keep local stays local', async (t) => {
