@@ -18,22 +18,24 @@ function cosine(a, b) {
 }
 const skillText = (s) => `${s.name}: ${s.description}`.slice(0, 1000);
 
-function createChatSkillRouter({ enabled, embed, threshold = 0.5, margin = 0.03, cacheMax = 200 }) {
+// #1636: `embedIdentity` (rag.embeddingIdentity: profile and model) keys the cache, so a vector made
+// by one embedding model is never compared with a message embedded by another.
+function createChatSkillRouter({ enabled, embed, embedIdentity = () => '', threshold = 0.5, margin = 0.03, cacheMax = 200 }) {
   const cache = new Map();
   async function select(skills, message) {
     const rows = (Array.isArray(skills) ? skills : []).filter((s) => s && s.valid !== false && s.content && s.description);
     if (!enabled() || !rows.length || !String(message || '').trim()) return { loaded: [], reason: 'off or nothing to load' };
     let taskEmbedding, vectors;
     try {
-      const keyed = rows.map((s) => ({ s, key: crypto.createHash('sha256').update(skillText(s)).digest('hex') }));
+      const keyed = rows.map((s) => ({ s, key: crypto.createHash('sha256').update(`${embedIdentity()}\u0000${skillText(s)}`).digest('hex') }));
       const missing = keyed.filter((r) => !cache.has(r.key));
       if (missing.length) {
-        const out = await embed(missing.map((r) => skillText(r.s)));
+        const out = await embed(missing.map((r) => skillText(r.s)), { kind: 'document' });
         missing.forEach((r, i) => cache.set(r.key, out[i]));
         while (cache.size > cacheMax) cache.delete(cache.keys().next().value);
       }
       vectors = keyed.map((r) => cache.get(r.key));
-      [taskEmbedding] = await embed([String(message).slice(0, MESSAGE_CHARS)]);
+      [taskEmbedding] = await embed([String(message).slice(0, MESSAGE_CHARS)], { kind: 'query' });
     } catch (error) {
       return { loaded: [], reason: `embeddings unavailable: ${error.message}` };
     }
