@@ -38,3 +38,20 @@ budget fields; missing preload, wrong candidate SHA and altered immutable templa
 must decisively fail their specific assertions. Missing dependency/startup failure
 cannot qualify those negative controls. Existing usage/sampling/OCR inputs and
 WASM040738 remain intact. Owner flags remain default off.
+
+# Native engine statistics front qualification (#1650)
+
+`stats-front.yml` qualifies Node's half of GET /api/stats moving to the Rust front
+(`statsRustOwned` in `server/routes/models.cjs`). Its native source is noevia-rs#98
+(pinned by commit and twice-fetched codeload archive SHA-256; re-pinned to the rs merge commit
+once rs#98 merges, before this gate's PR merges). The merged rs#94 archive above still feeds the
+`core-acceptance` adapter unchanged. The gate requires:
+
+- the candidate core's own handler (rs `crates/server-stats/tests/oracle.cjs`, run on this HEAD)
+  to give every committed native case's exact status and body;
+- the native crate and front tests;
+- the full corpus replay through the front with `NOEVIA_RUST_AUTH=1 NOEVIA_RUST_STATS=1`;
+- the omission control: with the front's switch removed but Node confirmed, every GET /api/stats
+  is 503 while native setup still answers 201, and nothing else differs.
+
+No production runtime change or release pin; the switch stays off.
