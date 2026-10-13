@@ -1,0 +1,90 @@
+{
+ "en": [
+  ["search","Find me reviews of the new electric bikes from this year."],
+  ["search","Look up the opening times of the swimming pool in my town."],
+  ["search","What are the best-rated pizza places near the central station?"],
+  ["search","Find the train connections from Hamburg to Copenhagen on Friday."],
+  ["search","I need sources on the history of the printing press for a school project."],
+  ["search","Find out which supermarkets sell gluten-free bread around here."],
+  ["action","Send a reminder to the team that the meeting moved to 3 pm."],
+  ["action","Add 'buy batteries' to my shopping list."],
+  ["action","Rename the project folder to 'Garden 2026'."],
+  ["action","Create a calendar event for the dentist next Tuesday at 9."],
+  ["action","Delete the duplicate photos from the holiday album."],
+  ["action","Email the landlord that the heating is broken again."],
+  ["idea","Let's brainstorm names for a podcast about urban gardening."],
+  ["idea","I'm thinking about starting a small pottery business. Help me explore the idea."],
+  ["idea","Give me some wild ideas for a themed birthday party for a nine-year-old."],
+  ["idea","What could a weekend workshop about repairing clothes look like?"],
+  ["idea","I want to write a novel set on a generation ship; let's develop the world together."],
+  ["idea","Help me come up with ways to make our team retrospectives more fun."],
+  ["question","Why do cats purr?"],
+  ["question","How does a heat pump work?"],
+  ["question","What's the difference between a crocodile and an alligator?"],
+  ["question","Can you explain what a mortgage offset account is?"],
+  ["question","Why is the Dead Sea so salty?"],
+  ["question","How do noise-cancelling headphones work?"],
+  ["code","Why does my Python script say 'list index out of range'?"],
+  ["code","Write a bash loop that renames every .jpeg file to .jpg."],
+  ["code","My React app shows a blank page after building for production."],
+  ["code","How do I add an index to a PostgreSQL table without locking it?"],
+  ["code","Refactor this JavaScript function to use async/await instead of callbacks."],
+  ["code","What does 'segmentation fault (core dumped)' mean in C?"]
+ ],
+ "de": [
+  ["search","Such mir Bewertungen für Pizzerien in der Nähe vom Hauptbahnhof."],
+  ["action","Schick dem Team eine Erinnerung, dass das Meeting auf 15 Uhr verschoben ist."],
+  ["idea","Lass uns Namen für einen Podcast über Stadtgärten sammeln."],
+  ["question","Warum schnurren Katzen?"],
+  ["code","Warum meldet mein Python-Skript „list index out of range“?"]
+ ],
+ "fr": [
+  ["search","Trouve-moi les horaires de la piscine municipale."],
+  ["action","Ajoute « acheter des piles » à ma liste de courses."],
+  ["idea","J'aimerais lancer un petit atelier de poterie, aide-moi à explorer l'idée."],
+  ["question","Comment fonctionne une pompe à chaleur ?"],
+  ["code","Mon application React affiche une page blanche après le build de production."]
+ ],
+ "es": [
+  ["search","Busca las conexiones de tren de Madrid a Valencia para el viernes."],
+  ["action","Crea un evento en el calendario para el dentista el martes a las 9."],
+  ["idea","Dame ideas locas para una fiesta de cumpleaños temática para una niña de nueve años."],
+  ["question","¿Por qué el mar Muerto es tan salado?"],
+  ["code","Escribe un bucle en bash que cambie la extensión .jpeg a .jpg."]
+ ],
+ "it": [
+  ["search","Trova recensioni delle nuove bici elettriche di quest'anno."],
+  ["action","Cancella le foto doppie dall'album delle vacanze."],
+  ["idea","Vorrei scrivere un romanzo ambientato su una nave generazionale: sviluppiamo il mondo insieme."],
+  ["question","Che differenza c'è tra un coccodrillo e un alligatore?"],
+  ["code","Come aggiungo un indice a una tabella PostgreSQL senza bloccarla?"]
+ ],
+ "nb": [
+  ["search","Finn togforbindelser fra Oslo til Trondheim på fredag."],
+  ["action","Send en e-post til utleieren om at varmen er i ustand igjen."],
+  ["idea","Hjelp meg å finne på måter å gjøre teamets retrospektiver morsommere på."],
+  ["question","Hvordan virker støydempende hodetelefoner?"],
+  ["code","Hva betyr «segmentation fault (core dumped)» i C?"]
+ ],
+ "nl": [
+  ["search","Zoek welke supermarkten hier glutenvrij brood verkopen."],
+  ["action","Hernoem de projectmap naar 'Tuin 2026'."],
+  ["idea","Hoe zou een weekendworkshop over kleding repareren eruit kunnen zien?"],
+  ["question","Waarom spinnen katten?"],
+  ["code","Herschrijf deze JavaScript-functie met async/await in plaats van callbacks."]
+ ],
+ "pt": [
+  ["search","Procure fontes sobre a história da imprensa para um trabalho escolar."],
+  ["action","Adicione 'comprar pilhas' à minha lista de compras."],
+  ["idea","Vamos pensar em nomes para um podcast sobre hortas urbanas."],
+  ["question","Como funciona uma bomba de calor?"],
+  ["code","Por que meu script Python diz 'list index out of range'?"]
+ ],
+ "sv": [
+  ["search","Hitta öppettiderna för simhallen i min stad."],
+  ["action","Skapa en kalenderhändelse för tandläkaren på tisdag klockan 9."],
+  ["idea","Jag funderar på att starta ett litet keramikföretag. Hjälp mig att utforska idén."],
+  ["question","Varför är Döda havet så salt?"],
+  ["code","Min React-app visar en tom sida efter produktionsbygget."]
+ ]
+}

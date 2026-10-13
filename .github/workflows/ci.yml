@@ -153,6 +153,8 @@ jobs:
       # server/tool-result-reduce.cjs, so it must not drift. Needs ripgrep.
       - run: sudo apt-get update && sudo apt-get install -y ripgrep
       - run: node --test tools/repo-index/*.test.cjs
+      # #1639: the decision-model eval harness (adapter, runner, scorer, request capture through the real callers).
+      - run: node --test tools/decision-eval/*.test.cjs
       # Full-Rust migration M0: boot the real server on a throwaway synthetic data dir (mock model
       # and Diary, outbound connections refused) with NOEVIA_CONTRACT_RECORD set, drive the web
       # client's paths, and fail if a secret reached the corpus. The corpus is the artifact
