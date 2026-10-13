@@ -34,7 +34,7 @@ function withTimeout(promise, ms, label) {
 }
 
 /**
- * @param {{ enabled: () => boolean, boxes: () => object[], embed: (texts: string[]) => Promise<number[][]>,
+ * @param {{ enabled: () => boolean, boxes: () => object[], embed: (texts: string[], opts?: { kind: string }) => Promise<number[][]>,
  *           embedModel?: () => string, topK?: number, threshold?: number, cacheMax?: number,
  *           timeoutMs?: number }} deps
  */
@@ -42,14 +42,14 @@ function createChatToolRouter({ enabled, boxes, embed, embedModel = () => '', to
   const cache = new Map(); // sha256(model + box text) -> embedding
 
   async function boxEmbeddings(rows) {
-    // The model is part of the key. Without it, changing EMBEDDING_MODEL keeps
-    // serving vectors of the old dimensionality, and cosine() silently
-    // truncates to the shorter of the two and returns a meaningless score
-    // instead of failing.
+    // The model (#1636: with its profile, rag.embeddingIdentity) is part of the key. Without it,
+    // changing the embedding model keeps serving vectors of the old dimensionality, and cosine()
+    // silently truncates to the shorter of the two and returns a meaningless score instead of failing.
+    // Box texts are the searched side ('document'); the message is the query (#1636).
     const keyed = rows.map((box) => ({ box, key: crypto.createHash('sha256').update(`${embedModel()}\u0000${boxText(box)}`).digest('hex') }));
     const missing = keyed.filter((row) => !cache.has(row.key));
     if (missing.length) {
-      const vectors = await withTimeout(embed(missing.map((row) => boxText(row.box))), timeoutMs, 'toolbox embedding');
+      const vectors = await withTimeout(embed(missing.map((row) => boxText(row.box)), { kind: 'document' }), timeoutMs, 'toolbox embedding');
       missing.forEach((row, i) => cache.set(row.key, vectors[i]));
       while (cache.size > cacheMax) cache.delete(cache.keys().next().value);
     }
@@ -66,7 +66,7 @@ function createChatToolRouter({ enabled, boxes, embed, embedModel = () => '', to
     let ranked, taskEmbedding;
     try {
       ranked = await boxEmbeddings(rows);
-      [taskEmbedding] = await withTimeout(embed([String(message || '').slice(0, MESSAGE_CHARS)]), timeoutMs, 'message embedding');
+      [taskEmbedding] = await withTimeout(embed([String(message || '').slice(0, MESSAGE_CHARS)], { kind: 'query' }), timeoutMs, 'message embedding');
     } catch (error) {
       return keep(`embeddings unavailable: ${error.message}`);
     }

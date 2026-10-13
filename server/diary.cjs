@@ -159,7 +159,17 @@ function createDiary({ fs, path, fetchJson, DIARY_BASE, DIARY_TOKEN, DIARY_TENAN
     write:(id,body)=>callDiaryFile(id,'/file','PUT',body),
   };
 
-  return { diaryHeaders, tenantHeaders, withStorageCredential, diaryFetchJson, corpusSource, callDiaryFile, connectorFiles };
+  /**
+   * Bearer only, no tenant and no storage: for the sidecar's service-wide internal endpoints
+   * (#1636 /api/internal/embedding), which act on every tenant's index and never on one tenant's data.
+   */
+  function serviceHeaders() {
+    const h = { 'Content-Type': 'application/json' };
+    if (DIARY_TOKEN) h.Authorization = `Bearer ${DIARY_TOKEN}`;
+    return h;
+  }
+
+  return { diaryHeaders, tenantHeaders, serviceHeaders, withStorageCredential, diaryFetchJson, corpusSource, callDiaryFile, connectorFiles };
 }
 
 module.exports = { createDiary };
