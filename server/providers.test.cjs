@@ -40,10 +40,21 @@ test('getProvider resolves the legacy alias and falls back to the default', () =
 
 test('keys are masked for the client and become bearer headers for the provider', () => {
   const { registry } = fixture();
-  assert.equal(registry.maskKey('sk-teamteamteam1234'), 'sk-…1234');
-  assert.equal(registry.maskKey('short'), '…hort');
+  assert.equal(registry.maskKey('sk-teamteamteam1234'), '…1234');
+  assert.equal(registry.maskKey('short'), '••••');
   assert.equal(registry.maskKey('local'), null);
   assert.equal(registry.maskKey(''), null);
+  assert.equal(registry.maskKey(undefined), null);
+  // #1482: a vendor prefix or any leading character never reaches the client, whatever the key family.
+  for (const key of ['nvapi-SYNTHETICKEYBODY0042', 'sk-proj-SYNTHETICBODYABCD9876', 'SYNTHETICKEY0123456789']) {
+    const masked = registry.maskKey(key);
+    assert.equal(masked, `…${key.slice(-4)}`);
+    assert.ok(!masked.includes(key.slice(0, -4)), 'no character before the last four is shown');
+  }
+  // Keys under 12 characters show no characters at all: four of eight or eleven is too much of the key.
+  assert.equal(registry.maskKey('abcd1234'), '••••');
+  assert.equal(registry.maskKey('abcdefghijk'), '••••');
+  assert.equal(registry.maskKey('abcdefghijkl'), '…ijkl');
   assert.deepEqual(registry.providerHeaders({ apiKey: 'sk-1' }, { Accept: 'text/event-stream' }), { 'Content-Type': 'application/json', Accept: 'text/event-stream', Authorization: 'Bearer sk-1' });
   assert.deepEqual(registry.providerHeaders({ apiKey: 'local' }), { 'Content-Type': 'application/json' });
 });

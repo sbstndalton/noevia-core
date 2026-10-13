@@ -1,4 +1,6 @@
 'use strict';
+const { createSharedRead } = require('./short-read.cjs');
+const MODEL_READ_TTL_MS = 2000;
 // ── Models: what the engine serves, the auto-router roles, the manager service ──
 // The model manager adapter itself is model-manager.cjs; this module is what
 // index.cjs built on top of it: the installed list with its loaded state and
@@ -135,13 +137,14 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
   }
 
   async function ensureModelLoaded(name) {
-    const installed = await modelsInstalled();
+    const installed = await modelsInstalledFresh();
     const m = installed.find((x) => x.name === name);
     if (!m) throw new Error(`model not installed: ${name}`);
     if (m.missingFile) throw new Error(`model file missing: ${name}`);
     if (m.servedElsewhere) throw new Error(`model runs in its own service: ${name}`);
     if (!m.loaded) {
       const result = await modelManager.load(name);
+      invalidateModelReads();
       if (!result.ok) throw new Error(`model could not load: ${name}`);
     }
   }
@@ -186,7 +189,15 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
     return Array.isArray(files) && files.length ? files : null;
   }
 
-  async function modelsInstalled() {
+  // #1461: the installed list costs several model-manager calls (and one probe per loaded model), and every
+  // page load asks for it. Reads share one answer for MODEL_READ_TTL_MS; any model or role write drops it
+  // (invalidateModelReads). Decisions that must see the engine as it is now use modelsInstalledFresh().
+  const degradedLists = new WeakSet();
+  const installedRead = createSharedRead(() => modelsInstalledFresh(), MODEL_READ_TTL_MS, (list) => !degradedLists.has(list));
+  function modelsInstalled() { return installedRead.get(); }
+  function invalidateModelReads() { installedRead.clear(); }
+
+  async function modelsInstalledFresh() {
     modelManager.requireEnabled();
     const [list, health] = await Promise.allSettled([
       modelManager.listModels(),
@@ -218,6 +229,7 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
     }
     const sidecarUp = (m) => isSidecarModel(m.id || m.model_name, env) && sidecarLoaded.has(m.id || m.model_name);
     const scan = rows.some((m) => m.source === 'preset') ? await folderScanFiles().catch(() => null) : null;
+    const degradedScan = rows.some((m) => m.source === 'preset') && !scan;
     // The loader's file for a row, joined by the section name or model id the scan reports (never by
     // guessing from file names). The router's /v1/models carries no size and meta only for the loaded
     // model, so the scan is where an unloaded model's size and shape come from.
@@ -256,6 +268,8 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
         shape: fileFor(m.id || m.model_name)?.shape || null,
         loaded: loadedNames.has(m.id || m.model_name) || sidecarUp(m),
         labels: Array.isArray(m.labels) ? m.labels : [],
+        // #1179: the explicit system kind (`role = laya`), so the web does not match names.
+        system: isSystem(m),
         mtp: require('./mtp.cjs').capability(m),
         maxContext: m.max_context_window || null,
         suggested: !!m.suggested,
@@ -278,6 +292,9 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
       const firstLoaded = installed.find((m) => m.loaded && !m.labels.some(label => /^(embedding|embeddings|rerank|reranking|reranker)$/i.test(label)));
       if (firstLoaded) LAST_LOADED_MODEL = firstLoaded.name;
     }
+    // A list built without the folder scan it needs (the scan failed or timed out) has missing sizes and
+    // missing-file flags. It is served, but never kept for the next reader (#1088 retry).
+    if (degradedScan) degradedLists.add(installed);
     return installed;
   }
 
@@ -296,7 +313,7 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
   return {
     managerFetch, modelScanCache, refreshModelScan, lastLoadedModel, clearLastLoadedModel,
     autoRoles, setAutoRoles, clearRoleReferences, ensureModelLoaded, ensureRolesLoaded,
-    servedCatalogue, modelsInstalled, deriveUserModelName,
+    servedCatalogue, modelsInstalled, modelsInstalledFresh, invalidateModelReads, deriveUserModelName,
   };
 }
 

@@ -7,7 +7,7 @@ const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
 const { createDiaryRoutes } = require('./diary.cjs');
 
-function fixture({ dir = '/nowhere', diaryOn = true, limited = false, connectorLimited = false, admin = false, reply, clientAddress, addressesTrusted, rateLimitedKeys, log } = {}) {
+function fixture({ dir = '/nowhere', diaryOn = true, limited = false, connectorLimited = false, admin = false, reply, clientAddress, addressesTrusted, rateLimitedKeys, log, storageLatch } = {}) {
   const sent = [], fetched = [], audits = [], headers = [];
   const rateKeys = [];
   const credentials = [{ id: 'a'.repeat(32), name: 'Claude Diary' }];
@@ -17,11 +17,11 @@ function fixture({ dir = '/nowhere', diaryOn = true, limited = false, connectorL
     readJson: require('../http.cjs').readJson,
     fetchJson: async (url, init) => { fetched.push({ url, init }); return reply ? reply(url, init) : { ok: true, status: 200, body: { ok: true } }; },
     DIARY_BASE: 'http://diary:8010',
-    authService: { diaryEnabled: () => diaryOn, audit: (...args) => audits.push(args) },
+    authService: { diaryEnabled: () => diaryOn, audit: (...args) => audits.push(args), getStorage: () => ({ kind: 'nextcloud', baseUrl: 'https://cloud.example/dav', username: 'ada', secret: 'synthetic-pw' }) },
     currentWorkspace: () => ({ userId: 'u1', dir }),
     rateLimited: () => limited,
     connectorRate: { rateLimited: (key, limit) => { rateKeys.push(key); return rateLimitedKeys ? rateLimitedKeys.has(key) : connectorLimited; } },
-    clientAddress, addressesTrusted,
+    clientAddress, addressesTrusted, storageLatch,
     diaryConnectors: {
       verify: (token) => (token === 'good' ? { id: credentials[0].id, userId: 'u1' } : null),
       list: () => credentials, create: (userId, name) => ({ id: 'b'.repeat(32), name, userId }), revoke: (userId, id) => id === credentials[0].id,
@@ -273,4 +273,61 @@ test('#1422 POST /api/diary/exchanges dismisses an uncertain or failed exchange 
   const off = fixture({ dir, diaryOn: false });
   await off.call('diary', 'POST', '/api/diary/exchanges', { action: 'dismiss', day: '2026-10-12', id: 'exchange-1422-synthetic-a' });
   assert.deepEqual(off.sent.pop(), { status: 404, body: { error: 'Diary add-on is disabled' } });
+});
+
+test('#1589: the storage status says when a refused login is holding automatic storage calls', async () => {
+  const { createStorageLatch } = require('../storage-latch.cjs');
+  let now = 1_000_000;
+  const storageLatch = createStorageLatch({ now: () => now });
+  const conn = { kind: 'nextcloud', baseUrl: 'https://cloud.example/dav', username: 'ada', secret: 'synthetic-pw' };
+  const f = fixture({ storageLatch, reply: () => ({ ok: true, status: 200, body: { backup: 'idle' } }) });
+  await f.call('diary', 'GET', '/api/diary/storage-status');
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { backup: 'idle' } }, 'nothing is added while nothing is held');
+  storageLatch.note('u1', conn, { kind: 'login' });
+  await f.call('diary', 'GET', '/api/diary/storage-status');
+  const shown = f.sent.pop();
+  assert.equal(shown.body.backup, 'idle');
+  assert.deepEqual(shown.body.automaticStorage, { held: true, kind: 'login', nextAttemptAt: now + 15 * 60 * 1000 });
+  // Reading the status never lets a probe through.
+  now += 16 * 60 * 1000;
+  await f.call('diary', 'GET', '/api/diary/storage-status');
+  assert.equal(f.sent.pop().body.automaticStorage.held, true);
+});
+
+// The sidecar's storage-status tells whether an account is kept in the app ('managed') or on the storage server ('legacy').
+const listingReply = (mode) => (url) => (String(url).endsWith('/api/storage-status')
+  ? (mode ? { ok: true, status: 200, body: { mode } } : { ok: false, status: 500, body: { detail: 'down' } })
+  : { ok: true, status: 200, body: { files: [] } });
+const RETRY = { search: '?path=Notes', reqHeaders: { 'x-cowork-storage-retry': '1' } };
+const heldFixture = (mode) => {
+  const { createStorageLatch } = require('../storage-latch.cjs');
+  const storageLatch = createStorageLatch({ now: () => 0 });
+  const conn = { kind: 'nextcloud', baseUrl: 'https://cloud.example/dav', username: 'ada', secret: 'synthetic-pw' };
+  const f = fixture({ storageLatch, reply: listingReply(mode) });
+  storageLatch.note('u1', conn, { kind: 'login' });
+  return { f, storageLatch, conn };
+};
+
+test('#1589: an explicit Retry that works ends the hold; an automatic read that works does not', async () => {
+  const { f, storageLatch, conn } = heldFixture('legacy');
+  await f.call('diary', 'GET', '/api/diary/files', undefined, { search: '?path=Notes' });
+  assert.notEqual(storageLatch.status('u1', conn), null, 'an automatic read proves nothing');
+  await f.call('diary', 'GET', '/api/diary/files', undefined, RETRY);
+  assert.equal(storageLatch.status('u1', conn), null, 'the person pressed Retry and the storage server answered');
+});
+
+test('#1607: a Retry listing that the sidecar answered from its own database (managed mode) does not end the hold', async () => {
+  const { f, storageLatch, conn } = heldFixture('managed');
+  await f.call('diary', 'GET', '/api/diary/files', undefined, RETRY);
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { files: [] } }, 'the listing itself is still returned');
+  assert.notEqual(storageLatch.status('u1', conn), null, 'a local answer says nothing about the saved login');
+  await f.call('diary', 'POST', '/api/diary/file', { path: 'a.md' }, RETRY);
+  assert.notEqual(storageLatch.status('u1', conn), null, 'nor does a local file read');
+});
+
+test('#1607: when the sidecar cannot say which kind of account it is, the hold stays', async () => {
+  const { f, storageLatch, conn } = heldFixture(null);
+  await f.call('diary', 'GET', '/api/diary/files', undefined, RETRY);
+  assert.equal(f.sent.pop().status, 200);
+  assert.notEqual(storageLatch.status('u1', conn), null);
 });

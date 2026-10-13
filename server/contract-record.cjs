@@ -2,6 +2,8 @@
 // HTTP contract recorder (full-Rust migration M0). Opt-in: NOEVIA_CONTRACT_RECORD=<dir> makes the
 // UI listener write one JSON file per request/response pair into <dir>; unset, `fromEnv` returns
 // null and index.cjs serves with the handler unchanged (no wrapper, no listeners, no copies).
+// Its test-only companion, NOEVIA_CONTRACT_FIXED_NOW (server/current-time-part.cjs), pins the day the
+// chat prompt's date line states; tools/contract-corpus sets it for recording and replay alike.
 //
 // A recorded exchange is a contract for noevia-rs tools/replay, not a log, so nothing secret or
 // run-specific may be written:

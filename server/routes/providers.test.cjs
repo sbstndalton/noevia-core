@@ -6,8 +6,9 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
 const { createProviderRoutes } = require('./providers.cjs');
+const { createProviderRegistry } = require('../providers.cjs');
 
-function fixture({ probe = async () => ({ ok: true, status: 200, body: { data: [{ id: 'm-a' }, { id: 'm-b' }, {}] } }) } = {}) {
+function fixture({ probe = async () => ({ ok: true, status: 200, body: { data: [{ id: 'm-a' }, { id: 'm-b' }, {}] } }), maskKey = (k) => (k && k !== 'local' ? `…${k.slice(-4)}` : null) } = {}) {
   const sent = [];
   const providers = [{ id: 'default', label: 'Local', baseUrl: 'http://engine', apiKey: 'local' }, { id: 'shared-1', label: 'Team', baseUrl: 'https://t.example', apiKey: 'sk-teamteam1234', shared: true }];
   const projects = [{ id: 'p1', provider: 'shared-1', model: 'shared-only-model' }, { id: 'p2', provider: 'default', model: 'local-model' }];
@@ -24,7 +25,7 @@ function fixture({ probe = async () => ({ ok: true, status: 200, body: { data: [
     saveProjects: () => { saved.projects += 1; },
     registry: {
       saveProviders: () => { saved.private += 1; }, saveSharedProviders: () => { saved.shared += 1; },
-      maskKey: (k) => (k && k !== 'local' ? `…${k.slice(-4)}` : null),
+      maskKey,
     },
   });
   const call = (method, path, body, role = 'member') => {
@@ -120,4 +121,21 @@ test('the listing marks a provider on a trial-terms host (NVIDIA Build) as exter
   assert.equal(body.providers.find((p) => p.id === 'nv').external, true);
   assert.equal(body.providers.find((p) => p.id === 'default').external, undefined);
   assert.equal(body.providers.find((p) => p.id === 'shared-1').external, undefined);
+});
+
+test('#1482: with the real masker, neither the listing nor a save reply carries more than the last four characters', async () => {
+  const realMask = createProviderRegistry({ currentWorkspace: () => ({}), PROVIDERS: [], DEFAULT_PROVIDER_ID: 'default' }).maskKey;
+  const f = fixture({ maskKey: realMask });
+  f.providers.push({ id: 'nv', label: 'NVIDIA Build (free trial)', baseUrl: 'https://integrate.api.nvidia.com/v1', apiKey: 'nvapi-SYNTHETICKEYBODY0042' });
+  await f.call('GET', '/api/providers');
+  const listed = JSON.stringify(f.sent.pop().body);
+  assert.ok(!listed.includes('nvapi'), 'the vendor prefix is not sent');
+  assert.ok(!listed.includes('SYNTHETIC'), 'the key body is not sent');
+  assert.ok(listed.includes('"apiKeyMasked":"…0042"'), 'the last four characters are');
+  await f.call('POST', '/api/providers', { label: 'Mine', baseUrl: 'https://approved.example', apiKey: 'sk-proj-SYNTHETICBODYABCD9876' });
+  const saved = f.sent.pop();
+  assert.equal(saved.status, 200);
+  const reply = JSON.stringify(saved.body);
+  assert.ok(!reply.includes('sk-proj') && !reply.includes('SYNTHETIC'), 'the save reply carries no more than the masked form');
+  assert.equal(saved.body.apiKeyMasked, '…9876');
 });

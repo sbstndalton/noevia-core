@@ -65,17 +65,23 @@ test('every status id the server sends has a catalogue key in every locale', () 
   const ids = new Set();
   const chat = read('server/chat.cjs'), ctx = read('server/chat-context.cjs');
   for (const m of chat.matchAll(/type: 'status', id: (?:[^'?]*\? )?'(\w+)'(?: : '(\w+)')?/g)) { ids.add(m[1]); if (m[2]) ids.add(m[2]); }
-  for (const m of ctx.matchAll(/onStatus\('[^']*','(\w+)'\)/g)) ids.add(m[1]);
+  // #1449: the loading line's text is built by loadingStatus() and carries a detail object after the id.
+  for (const m of ctx.matchAll(/onStatus\((?:'[^']*'|\w+\([^()]*\)),\s*'(\w+)'\s*[,)]/g)) ids.add(m[1]);
   assert.deepEqual([...ids].sort(), ['compactingOlder', 'compactingTools', 'generating', 'loadingLongContext', 'loadingModel', 'preparing', 'readingImages']);
   for (const id of ids) for (const l of ['en-GB', ...Object.keys(FILES)]) assert.ok(has(l, `chat.statusId.${id}`), `${l} chat.statusId.${id}`);
   // The English catalogue text is the text the server sends, so an older client and a newer one read the same.
   const en = tFor('en-GB');
-  for (const [id, text] of [['generating', 'Generating response…'], ['preparing', 'Preparing response…'], ['loadingModel', 'Loading the selected model and checking its context allocation…'],
+  for (const [id, text] of [['generating', 'Generating response…'], ['preparing', 'Preparing response…'],
     ['compactingTools', 'Compacting context before the next tool step… Your full transcript stays available.'], ['compactingOlder', 'Compacting older messages… Your full transcript stays available.'],
     ['loadingLongContext', 'Loading the high-context profile — switching models may take a moment…']]) {
     assert.equal(en(`chat.statusId.${id}`), text, id);
     assert.ok(chat.includes(text) || ctx.includes(text), `the server still sends "${text}"`);
   }
+  // #1449: the server's loading line names the model (and the routed role and a measured wait when it has
+  // them); the catalogue line, which a client shows for the id, is that sentence without the name.
+  const { loadingStatus } = require('../../server/chat-context.cjs');
+  assert.equal(en('chat.statusId.loadingModel'), 'Loading the selected model and checking its context allocation…');
+  assert.equal(loadingStatus('synthetic-model', null, null).replace(' synthetic-model', ''), en('chat.statusId.loadingModel'));
 });
 
 test('every Drive copy message id the server names has a catalogue key with the params it sends', () => {

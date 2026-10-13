@@ -27,6 +27,22 @@ const skip = (!have && process.env.REAL_GGUF_HEADERS_REQUIRED !== '1' && 'real G
   || (!fs.existsSync(wasmFile) && process.env.DAV_PARSE_WASM_REQUIRED !== '1' && 'dav-parse.wasm not built');
 const manifest = have ? JSON.parse(fs.readFileSync(manifestFile, 'utf8')) : [];
 
+// #1195, always run (no fetched fixtures needed): a header that ends past the bytes given is refused
+// by the reader, so a head-only parse proves the key/value block ends inside the head.
+test('a key/value block that runs past the bytes given is refused, not read as zeros', () => {
+  const gen = require('./gguf-fixture-lib.cjs');
+  const buf = gen.gguf([gen.arch('llama'), gen.kv('llama.block_count', gen.S(gen.T.u32, 4))]);
+  const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'gguf-bound-'));
+  try {
+    const whole = path.join(dir2, 'whole.gguf'), cut = path.join(dir2, 'cut.gguf');
+    fs.writeFileSync(whole, buf);
+    assert.deepStrictEqual(summarize(readGguf(whole)).blockCount, 4);
+    fs.writeFileSync(cut, buf.subarray(0, buf.length - 3));
+    assert.throws(() => readGguf(cut), /Unexpected end of GGUF header/);
+  } finally { fs.rmSync(dir2, { recursive: true, force: true }); }
+});
+
+
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gguf-real-'));
 test.after(() => fs.rmSync(dir, { recursive: true, force: true }));
 
@@ -40,6 +56,11 @@ for (const entry of manifest) {
     fs.writeFileSync(file, fs.readFileSync(path.join(DIR, `${entry.name}.head`)));
     fs.truncateSync(file, entry.totalSize); // sparse: the size the module sees is the real one
     const want = summarize(readGguf(file));
+    // #1195: the key/value block must end inside the head bytes. Parsing the head alone (no sparse zeros
+    // after it) must give the same summary; a header longer than the head fails to parse here.
+    const headOnly = path.join(dir, `${entry.name}.head.gguf`);
+    fs.writeFileSync(headOnly, fs.readFileSync(path.join(DIR, `${entry.name}.head`)));
+    assert.deepStrictEqual(summarize(readGguf(headOnly)), want, 'the key/value block ends within the head bytes');
     let rounds = 0, sent = 0, widest = 0;
     const spy = { ...davParseWasm, ggufSummary: (size, segs) => {
       rounds++;

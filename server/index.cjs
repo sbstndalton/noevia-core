@@ -852,12 +852,14 @@ const { handleChat } = require('./chat.cjs').createChatHandler({
     // sensitive handling; an administrator's allowed list still applies to the result.
     settings: (project) => { const rm = require('./routing-modes.cjs'); const s = rm.withProjectOverride(rm.read(currentWorkspace().dir), project); return { ...s, mode: rm.effectiveMode(s, rm.allowedModes(require('./features.cjs').settingsStore(authService.db))) }; },
     sensitivity: require('./routing-modes.cjs').createSensitivity({
-      deadlineMs: () => decisionSettings.get().timeoutMs,
+      // #1437: a named 2 s deadline (routing-modes.cjs), and the decision layer's own log (outcome, cause, latency) is kept.
+      deadlineMs: () => require('./routing-modes.cjs').SENSITIVITY_DEADLINE_MS,
       log: (entry) => recordDecision('sensitivity', entry),
       decide: (request) => {
         const backend = decisionSettings.backend();
         if (!backend) throw Error('Decision service unavailable');
-        if (backend !== sensitivityBackend) { sensitivityBackend = backend; sensitivityDecisions = require('./decision/index.cjs').createDecisions({ backends: { configured: backend }, chains: { 'routing.sensitivity': ['configured'] } }); }
+        if (backend !== sensitivityBackend) { sensitivityBackend = backend; sensitivityDecisions = require('./decision/index.cjs').createDecisions({ backends: { configured: backend }, chains: { 'routing.sensitivity': ['configured'] },
+          log: (entry) => recordDecision('sensitivity-backend', require('./routing-modes.cjs').decisionCodes(entry)) }); }
         return sensitivityDecisions.decide(request);
       },
     }),
@@ -899,7 +901,10 @@ const chatRoutes = require('./routes/chat.cjs').createChatRoutes({
 });
 
 // Projects, sources and uploads (routes/projects.cjs). Background source jobs re-enter the router.
+// #1429: one latch per process, shared by the project source refresh and the Diary backup worker.
+const storageLatch = require('./storage-latch.cjs').createStorageLatch();
 const projectRoutes = require('./routes/projects.cjs').createProjectRoutes({
+  storageLatch,
   json, readBody, readJson, requestScope, dispatch: (req, res) => handleRequestScoped(req, res), currentWorkspace, authService, storageClient, documents, documentSources, rag, fs, path,
   reasoningEffort, projectAppearance, diaryExtras, PROJECTS, DEFAULT_TOOLBOXES, sanitizeToolboxes, allToolboxes, getProvider, ensureRolesLoaded, servedCatalogue, DEFAULT_PROVIDER_ID, store: projectStore,
   onToolboxesChange: () => permittedToolsCache.clear(),
@@ -925,6 +930,7 @@ const diaryRoutes = require('./routes/diary.cjs').createDiaryRoutes({
   json, readBody, readJson, fetchJson, DIARY_BASE, authService, currentWorkspace, rateLimited: (userId) => llmRateLimited(userId), connectorRate, diaryConnectors, diary,
   clientAddress: (req) => require('./auth.cjs').clientAddress(req, process.env.TRUST_PROXY === 'true'),
   addressesTrusted: process.env.TRUST_PROXY === 'true',
+  storageLatch,
 });
 // Sign-in, the signed-in account and /api/admin/* (routes/auth.cjs). The open set is also the
 // router's own list of what a signed-out browser may call.
@@ -956,8 +962,11 @@ const authRoutes = require('./routes/auth.cjs').createAuthRoutes({
 });
 // The user's own storage connection: read, save, test, browse, one folder, the Nextcloud login flow
 // (routes/storage.cjs). fetch is resolved per call: tests swap the global at runtime.
+// #1431: pending Login Flow v2 sign-ins survive a web restart; the poll token is sealed with the credential key.
 const storageRoutes = require('./routes/storage.cjs').createStorageRoutes({ json, readJson, authService, storageClient, endpointApproved, fetch: (...args) => globalThis.fetch(...args), crypto,
+  flowStore: require('./nextcloud-flows.cjs').createNextcloudFlowStore({ file: path.join(DATA_DIR, 'nextcloud-login-flows.json'), secrets: secretStore }),
   storageReadsOwned: () => require('./features.cjs').rustStorageReadsOwned(process.env),
+  storageLatch,
 });
 // The human's answer to a pending write (routes/approvals.cjs); the gate itself is approvals.cjs.
 const approvalRoutes = require('./routes/approvals.cjs').createApprovalRoutes({ json, readBody, pendingApprovals, requestScope });
@@ -1031,6 +1040,10 @@ async function handleRequestScoped(req, res) {
   res.setHeader('Referrer-Policy', 'same-origin');
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");
+  // #1480: HSTS for six months, no includeSubDomains (nothing else on this host is known to need HTTP).
+  res.setHeader('Strict-Transport-Security', 'max-age=15552000');
+  // #1480: the browser features this app never calls are switched off for every page and API reply.
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=(), usb=(), serial=(), bluetooth=(), hid=(), midi=(), magnetometer=(), gyroscope=(), accelerometer=()');
 
   try {
     if ((req.method === 'GET' || req.method === 'HEAD') && publicPage(p)) {
@@ -1077,7 +1090,7 @@ async function handleRequestScoped(req, res) {
 
     if (await toolboxRoutes(req, res, { path: p, authn, url })) return;
 
-    if (await chatListRoutes(req, res, { path: p, authn })) return;
+    if (await chatListRoutes(req, res, { path: p, authn, url })) return;
 
     if (await providerRoutes(req, res, { path: p, authn, url })) return;
 
@@ -1151,7 +1164,7 @@ if (require.main === module) {
     const davServer = http.createServer(codeNetGuard.wrap((req, res) => handler(req, res).catch(() => res.destroy()), 'file-sharing'));
     davServer.requestTimeout = 60000; davServer.headersTimeout = 15000;
     davServer.setTimeout(60000, socket => socket.destroy());
-    davServer.listen(davConfig.port, HOST, () => console.log(`Diary file sharing listener on port ${davConfig.port}; scope ${davConfig.scope}; per-user opt-in required`));
+    davServer.listen(davConfig.port, davConfig.bindHost, () => console.log(`Diary file sharing listener on port ${davConfig.port}; scope ${davConfig.scope}; per-user opt-in required`));
   }
   // ── noevia's own MCP server ──────────────────────────────────────────
   //
@@ -1217,9 +1230,13 @@ if (require.main === module) {
   }
 
   offsiteBackup.schedule();
+  const readStorage = (userId) => authService.getStorage(userId, true);
   require('./diary-backup-worker.cjs').startDiaryBackupWorker({
     users: () => authService.listUsers(),
     enabled: id => authService.diaryEnabled(id),
+    // #1429: an account whose saved login was refused (or is throttled) gets no automatic backup
+    // until its credentials change or the backoff passes; it is not counted as a failure either.
+    suspended: user => storageLatch.suspendedFor(user.id, readStorage),
     // Default 30 s so an idle tenant does not build a new ManagedCorpusBackend every
     // 3 s; DIARY_BACKUP_WORKER_INTERVAL_MS keeps the old cadence available for tests.
     interval: Number(process.env.DIARY_BACKUP_WORKER_INTERVAL_MS) > 0 ? Number(process.env.DIARY_BACKUP_WORKER_INTERVAL_MS) : 30000,
@@ -1228,6 +1245,9 @@ if (require.main === module) {
       // always carries the storage secret (#292); every other call sends only its ref.
       const target = `${DIARY_BASE}/api/storage-backup`;
       const r = await fetchJson(target, { method: 'POST', headers: diaryHeaders('POST', target, { secret: true }) }, 300000);
+      // #1429: the Diary tags a refused login (424 storageLoginRejected) and a throttle (503 storageThrottled);
+      // either one holds this account's automatic calls (storage-latch.cjs) until the credentials change.
+      storageLatch.noteDiaryReply(user.id, readStorage, r.body, r.ok);
       if (!r.ok) throw new Error(`storage-backup failed: ${r.status}`);
       return r.body;
     }),

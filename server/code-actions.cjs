@@ -591,8 +591,17 @@ function hostsOf(command) {
   const words = [...segments.flat(), ...redirects, ...nested];
   const hosts = [];
   for (const word of words) {
-    for (const m of String(word).matchAll(/https?:\/\//gi)) {
-      const rest = String(word).slice(m.index).split(/\s/)[0];
+    const w = String(word);
+    const re = /https?:\/\//gi;
+    for (let m = re.exec(w); m; m = re.exec(w)) {
+      // noevia#1215: the host is decided by the authority alone. A special scheme skips any run of
+      // `/` and `\` after `//`, then the authority ends at the next `/`, `\`, `?`, `#` or whitespace.
+      // Parsing only that span (not the rest of the word, from every match) keeps this linear; the
+      // hostname is the same as parsing the whole word, which the old code did once per match.
+      let end = m.index + m[0].length;
+      while (end < w.length && (w[end] === '/' || w[end] === '\\')) end++;
+      while (end < w.length && !/[\s/\\?#]/.test(w[end])) end++;
+      const rest = w.slice(m.index, end);
       let host = '';
       try { host = new URL(rest).hostname.toLowerCase().replace(/^\[|\]$/g, ''); } catch { host = ''; }
       hosts.push(host);

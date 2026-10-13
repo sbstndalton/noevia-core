@@ -229,7 +229,7 @@ const LOCAL = 'http://local.invalid', CLOUD = 'http://cloud.invalid';
 const sse = (...frames) => ({ ok: true, status: 200, body: (async function* () { for (const f of frames) yield Buffer.from(`data: ${JSON.stringify(f)}\n\n`); })() });
 const PROVIDERS = { default: { id: 'default', baseUrl: LOCAL }, 'cloud-x': { id: 'cloud-x', baseUrl: CLOUD, label: 'Synthetic cloud', shared: true } };
 
-async function run(t, { freeChatId = null, ragOverride = null, flag, settings = null, chat = {}, project: projectOver = {}, message = 'Tell me about synthetic widgets', history = [], verdict = 'clear', answer = null, approvals = null, userId = 'synthetic-user', withRouting = true, toolResult = null, brainContext = null }) {
+async function run(t, { freeChatId = null, ragOverride = null, flag, settings = null, chat = {}, project: projectOver = {}, message = 'Tell me about synthetic widgets', history = [], verdict = 'clear', answer = null, approvals = null, userId = 'synthetic-user', withRouting = true, toolResult = null, brainContext = null, localRoles = { fast: 'local-fast', smart: 'local-smart' } }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-routing-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const events = [], calls = [], logs = [], flagsSet = [], errors = [];
   const res = new EventEmitter();
@@ -254,7 +254,9 @@ async function run(t, { freeChatId = null, ragOverride = null, flag, settings = 
     return sse({ choices: [{ delta: { content: 'ok' } }] });
   };
   const project = { id: freeChatId ? `cowork-chat-context-${freeChatId}` : 'fixture-project', name: 'Fixture', routing: 'auto', assets: [], chats: [{ id: 'fixture-chat', title: 't', updatedAt: 1, ...chat }], ...projectOver };
-  const verdicts = { clear: { flagged: false, flag: null }, sensitive: { flagged: true, flag: 'router' }, fail: { flagged: true, flag: 'unavailable' } };
+  // 'fail-cause' is a check that could not answer and says why, as createSensitivity reports it (#1438).
+  const verdicts = { clear: { flagged: false, flag: null }, sensitive: { flagged: true, flag: 'router' }, fail: { flagged: true, flag: 'unavailable' },
+    'fail-cause': { flagged: true, flag: 'unavailable', cause: 'deadline' } };
   const sensitivityCalls = [];
   const { handleChat } = require('./chat.cjs').createChatHandler({
     modelManager: { enabled: true, health: async () => ({ ok: true, body: { all_models_loaded: ['local-fast', 'local-smart'].map((n) => ({ model_name: n, loaded: true, recipe_options: { ctx_size: 32768 } })) } }) },
@@ -262,7 +264,7 @@ async function run(t, { freeChatId = null, ragOverride = null, flag, settings = 
     crypto: require('node:crypto'), path, fs, fetch, HISTORY_CAP: 20, DEFAULT_PROVIDER_ID: 'default', createToolExchange: require('./tool-exchange.cjs').createToolExchange,
     currentWorkspace: () => ({ userId, dir, assetDir: () => dir }),
     getProject: (id) => (id === project.id ? project : null),
-    skillsIndexFor: () => [], getProvider: (id) => PROVIDERS[id] || PROVIDERS.default, providerHeaders: () => ({}), autoRoles: () => ({ fast: 'local-fast', smart: 'local-smart' }),
+    skillsIndexFor: () => [], getProvider: (id) => PROVIDERS[id] || PROVIDERS.default, providerHeaders: () => ({}), autoRoles: () => localRoles,
     visionDescriptions: new Map(), visionProbe: async () => ({ supported: true }),
     chatSkillRouter: { select: async () => ({ loaded: [] }) }, oauthServerIds: () => new Set(), accountReady: () => false,
     chatToolRouter: { select: async (ids) => ({ ids, routed: false }) }, DEFAULT_TOOLBOXES: [], CONNECTOR_BOXES: new Set(), connectedBoxes: () => [],
@@ -569,4 +571,74 @@ test('hybrid routing: the sensitivity check reads the attached file text of a fr
   const r = await run(t, { flag: true, settings: HYBRID, freeChatId: 'c-synthetic', ragOverride, project: { files: [{ name: 'a.md', content: MARKER }] }, message: 'Summarize this file.' });
   assert.equal(r.sensitivityCalls.length, 1);
   assert.ok(r.sensitivityCalls[0].join('\n').includes(MARKER), 'the router saw the attached file text');
+});
+
+// ── #1526: a clear health or medical-diagnosis text is a pre-rule (synthetic examples only) ──
+test('preRule health (#1526): a diagnosis with a condition, or a personal health record, flags; ordinary text does not', () => {
+  for (const text of [
+    'Test only: what does a fictional diagnosis of hypertension mean?',
+    'Synthetic note: the doctor diagnosed the patient with asthma last week.',
+    'Synthetic chart: diagnosed with diabetes in 2019.',
+    'Their diagnosis is listed as depression in the synthetic report.',
+    'Please summarise my medical history for the synthetic clinic visit.',
+  ]) assert.equal(rm.preRule(text), 'health', text);
+  for (const text of [
+    'What is the capital of Norway?', 'Say hi in one word.',
+    'The network diagnosis tool found a DNS fault in the synthetic lab.',
+    'The engine diagnosis reports fault code P0301 on the synthetic car.',
+    'I was diagnosed with a flat tyre on the synthetic road.',
+    'Hypertension is a term that appears in this synthetic history book.',
+    'My prescription glasses frame is broken.',
+    'Describe the diagnostic chart for synthetic widgets.',
+  ]) assert.equal(rm.preRule(text), null, text);
+});
+
+test('preRule health (#1526) is linear on adversarial input', () => {
+  const cases = { diagnosis: 'diagnosis '.repeat(40000), diagnosisGap: 'diagnosis ' + 'a '.repeat(30000) + 'asthma',
+    record: 'my '.repeat(50000) + 'medical', recordSpaces: 'my' + ' '.repeat(200000) + 'medical record' };
+  for (const [name, text] of Object.entries(cases)) {
+    const t0 = performance.now(); rm.preRule(text); const ms = performance.now() - t0;
+    assert.ok(ms < 200, `${name} took ${ms.toFixed(1)} ms`);
+  }
+});
+
+test('#1526: a health question raises the card even when the check cannot answer, and the service is not asked first', async (t) => {
+  const r = await run(t, { flag: true, settings: HYBRID, verdict: 'fail', message: 'Test only: what does a fictional diagnosis of hypertension mean?', answer: { choice: 'local' } });
+  assert.equal(r.events.find((e) => e.type === 'route_pending')?.flag, 'health');
+  assert.equal(r.sensitivityCalls.length, 0, 'the pre-rule answers the question; the service is not asked');
+  assert.equal(r.upstream.some((u) => u.url.startsWith(CLOUD)), false, 'nothing reached the cloud');
+});
+
+// ── #1438 follow-ups to #1421 ────────────────────────────────────────────────
+test('#1438: the cause of a check that could not answer is kept by resolveRoute and by a real createSensitivity', async () => {
+  const never = async () => { throw Error('must not ask'); };
+  // A decision call that throws the deadline error: createSensitivity turns it into a cause code.
+  const check = rm.createSensitivity({ decide: () => { throw Object.assign(Error('deadline passed'), { deadline: true }); } });
+  assert.deepEqual(await check('text'), { flagged: true, flag: 'unavailable', cause: 'deadline' });
+  assert.deepEqual(
+    await rm.resolveRoute({ mode: 'hybrid', hasCloud: true, check: () => check('text'), ask: never }),
+    { route: 'local', reason: 'check-unavailable', flag: 'unavailable', cause: 'deadline' },
+  );
+  // A clear verdict carries no cause at all.
+  assert.deepEqual(
+    await rm.resolveRoute({ mode: 'hybrid', hasCloud: true, check: async () => ({ flagged: false, flag: null }), ask: never }),
+    { route: 'cloud', reason: 'mode' },
+  );
+});
+
+test('#1438: routing.detail reaches the reply meta through chat.cjs (the fixture verdict carries its cause)', async (t) => {
+  const r = await run(t, { flag: true, settings: HYBRID, message: 'Reply with the word ok.', verdict: 'fail-cause' });
+  assert.deepEqual(r.meta.routing, { route: 'local', reason: 'check-unavailable', detail: 'deadline' });
+  assert.equal(r.upstream.length, 1); assert.ok(r.upstream[0].url.startsWith(LOCAL), 'answered by the local model');
+  assert.equal(r.upstream.some((u) => u.url.startsWith(CLOUD)), false, 'nothing reached the cloud');
+});
+
+test('#1438: a check that could not answer, with no local model, is refused: 409, no card, zero upstream requests', async (t) => {
+  const r = await run(t, { flag: true, settings: HYBRID, message: 'Reply with the word ok.', verdict: 'fail-cause', localRoles: {} });
+  assert.equal(r.sensitivityCalls.length, 1, 'the check was asked once');
+  assert.equal(r.events.some((e) => e.type === 'route_pending'), false, 'no card for a check that could not answer');
+  assert.equal(r.upstream.length, 0, 'no model, local or cloud, was contacted');
+  assert.equal(r.errors.length, 1);
+  assert.equal(r.errors[0].status, 409);
+  assert.match(r.errors[0].body.error, /Nothing was sent/);
 });

@@ -60,11 +60,17 @@ async function startMocks() {
   return { inference, diary, close() { inference.close(); diary.close(); } };
 }
 
+// The day every corpus server's chat prompt states (#1573 date line, server/current-time-part.cjs): the
+// line is counted in the context meter, so a real clock would make a recorded corpus replay differently
+// on a day whose name is longer. Recording and replay (generate.cjs, serve.cjs, and noevia-rs
+// corpus-launcher / tools/front/replay-front.sh, which run them) all state this one instant.
+const CORPUS_NOW = '2026-10-12T12:00:00Z';
+
 /** The whole environment server/index.cjs gets: nothing is inherited but PATH. */
 function serverEnv({ port, dataDir, origin, mocks, record }) {
   const inferenceUrl = `http://127.0.0.1:${mocks.inference.address().port}`;
   return {
-    PATH: process.env.PATH, NODE_ENV: 'production', TZ: 'UTC', LANG: 'C.UTF-8',
+    PATH: process.env.PATH, NODE_ENV: 'production', TZ: 'UTC', LANG: 'C.UTF-8', NOEVIA_CONTRACT_FIXED_NOW: CORPUS_NOW,
     UI_PORT: String(port), UI_HOST: '127.0.0.1', UI_DATA_DIR: dataDir, PUBLIC_ORIGIN: origin,
     INFERENCE_BASE_URL: inferenceUrl, MODEL_MANAGER_KIND: 'none', MODEL_MANAGER_BASE_URL: inferenceUrl,
     DIARY_BASE_URL: `http://127.0.0.1:${mocks.diary.address().port}`, MODEL_LOADER_URL: '', MCP_SERVERS: '',
@@ -74,4 +80,4 @@ function serverEnv({ port, dataDir, origin, mocks, record }) {
   };
 }
 
-module.exports = { MODEL, SERVER, GUARD, startMocks, serverEnv, readBody };
+module.exports = { MODEL, SERVER, GUARD, CORPUS_NOW, startMocks, serverEnv, readBody };

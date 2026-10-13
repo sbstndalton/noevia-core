@@ -37,8 +37,33 @@ const PASSKEY_OPTIONS_PER_ADDRESS = 30;
 // entry is used: it is the value the trusted proxy appended, so a client
 // cannot spoof it via its own leftmost XFF entries. The header is only
 // consulted when trustProxy is on, and its value must parse as an IP.
-function clientAddress(req, trustProxy = false) {
+//
+// The Rust front (NOEVIA_FRONT=rust) answers for the address in X-Noevia-Client-Ip, with or without
+// TRUST_PROXY, and drops any copy the client sent (noevia-rs legacy_proxy.rs, #1245). Node believes
+// that header only from a loopback peer (the front is the only thing that reaches Node on loopback
+// in that deployment), only with NOEVIA_FRONT=rust, and only when the web supervisor confirmed that
+// this front strips client copies of it (NOEVIA_FRONT_CLIENT_IP=1, set when `noevia-server
+// --features` lists client-address-header; #1578). A front that predates the strip would forward a
+// client-chosen value from its own loopback peer, so version skew or an rs rollback fails closed:
+// the header is ignored and the socket (or TRUST_PROXY's XFF) decides. With NOEVIA_FRONT=node, or
+// from any other peer, the header is ignored too, so a client that reaches Node directly cannot
+// choose its address.
+const FRONT_CLIENT_ADDRESS = 'x-noevia-client-ip';
+function isLoopbackAddress(addr) {
+  const a = String(addr || '').toLowerCase().replace(/^::ffff:(?=\d+\.\d+\.\d+\.\d+$)/, '');
+  return a === '::1' || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(a);
+}
+function frontClientAddress(req, front) {
+  if (!front || !isLoopbackAddress(req.socket?.remoteAddress)) return null;
+  const v = req.headers?.[FRONT_CLIENT_ADDRESS];
+  const addr = typeof v === 'string' ? v.trim() : '';
+  return net.isIP(addr) ? addr : null;
+}
+
+function clientAddress(req, trustProxy = false, { front = process.env.NOEVIA_FRONT === 'rust' && process.env.NOEVIA_FRONT_CLIENT_IP === '1' } = {}) {
   const remote = String(req.socket?.remoteAddress || 'unknown');
+  const fromFront = frontClientAddress(req, front);
+  if (fromFront) return fromFront;
   if (!trustProxy) return remote;
   const forwarded = String(req.headers['x-forwarded-for'] || '');
   const entries = forwarded.split(',').map((s) => s.trim()).filter(Boolean);
@@ -517,6 +542,24 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
     return null;
   }
 
+  /** Settings -> Web address -> Earlier addresses (#1460). Drops one earlier address from sign-in,
+   *  the trusted origins and /.well-known/webauthn. Passkeys made under its host keep their RP ID,
+   *  so they stop working from the current address and their owners must register them again.
+   *  Returns { error, status } on refusal, or { error: null, removed, passkeysAffected } once saved. */
+  function removeEarlierOriginNow(next, actorId) {
+    const clean = String(next || '').trim().replace(/\/+$/, '');
+    if (clean && clean === origin) return { error: 'The current address cannot be removed from the earlier addresses.', status: 400 };
+    if (!clean || !previousOrigins.includes(clean)) return { error: 'That address is not one of the earlier addresses.', status: 404 };
+    previousOrigins = previousOrigins.filter((o) => o !== clean);
+    db.prepare("INSERT OR REPLACE INTO settings(key,value) VALUES('previous_origins',?)").run(JSON.stringify(previousOrigins));
+    // An address also listed by the environment keeps signing in; only the saved entry goes.
+    if (!additionalOrigins.includes(clean)) trustedOrigins.delete(clean);
+    let host = ''; try { host = new URL(clean).hostname; } catch { /* a stored entry that is not a URL matches no passkey */ }
+    const passkeysAffected = host ? db.prepare('SELECT count(*) AS n FROM passkeys WHERE rp_id=?').get(host).n : 0;
+    audit('settings.public_origin.earlier_removed', actorId, actorId, { origin: clean, passkeysAffected });
+    return { error: null, removed: clean, passkeysAffected };
+  }
+
   return {
     appPasswords: require('./app-passwords.cjs').createAppPasswords({ db, audit, rateLimited, guard }),
     /** The M3 single-writer guard (rust-auth.cjs), for the modules wired to this database. */
@@ -529,6 +572,8 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
      *  while the Rust front owns sign-in: it writes the address settings and freezes the
      *  passkeys' RP ID (rust-auth.cjs exemption). */
     changeOrigin(next, actorId) { refreshOrigin(); return guard.exempt(() => changeOriginNow(next, actorId)); },
+    /** Settings -> Web address -> remove an earlier address (#1460). Same Node-owned write as changeOrigin. */
+    removeEarlierOrigin(next, actorId) { refreshOrigin(); return guard.exempt(() => removeEarlierOriginNow(next, actorId)); },
     userCount, authenticate, csrfValid, originValid, publicUser, issueSession,
     // Exposed for the tool permission gate (step 16): every write tool call is
     // recorded here, so "what did the model actually do on my behalf" is
@@ -694,8 +739,14 @@ function createAuth({ dataDir, publicOrigin, rpId, legacyToken = '', legacyCompa
     // which row is "this device" so the client can show a real current/other state instead of an
     // unconditional dot. A legacy bearer-token caller (session: null) has no row of its own —
     // every session then reads as "other", which is correct: none of them is this request.
+    // #1483: a row past its absolute expiry, or idle longer than IDLE_MS, can never authenticate
+    // (authenticate refuses it), so it is not listed; where this process may write, it is also
+    // removed. `expiresAt` is the moment the session actually ends: the earlier of the absolute
+    // limit and the idle limit counted from its last use.
     listSessions(userId, currentId) {
-      return db.prepare('SELECT id_hash AS id,created_at AS createdAt,last_seen_at AS lastSeenAt,expires_at AS expiresAt,user_agent AS userAgent,ip FROM sessions WHERE user_id=? ORDER BY last_seen_at DESC').all(userId)
+      const now = Date.now();
+      if (!guard.enabled) db.prepare('DELETE FROM sessions WHERE user_id=? AND (expires_at<=? OR last_seen_at+?<=?)').run(userId, now, IDLE_MS, now);
+      return db.prepare('SELECT id_hash AS id,created_at AS createdAt,last_seen_at AS lastSeenAt,MIN(expires_at,last_seen_at+?) AS expiresAt,user_agent AS userAgent,ip FROM sessions WHERE user_id=? AND expires_at>? AND last_seen_at+?>? ORDER BY last_seen_at DESC').all(IDLE_MS, userId, now, IDLE_MS, now)
         .map((s) => ({ ...s, current: !!currentId && s.id === currentId }));
     },
     revokeSession(userId, id) { return db.prepare('DELETE FROM sessions WHERE id_hash=? AND user_id=?').run(id, userId).changes > 0; },

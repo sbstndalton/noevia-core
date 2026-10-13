@@ -327,6 +327,8 @@ function createProjectStore({
       routing: body.routing === 'manual' || body.routing === 'auto' ? body.routing : currentWorkspace()?.preferences?.defaultRouting === 'manual' ? 'manual' : 'auto',
       modes,
       toolboxes: sanitizeToolboxes(body.toolboxes) || [...defaultToolboxes()], // step 14: core only by default
+      // #1522: Automatic unless the request chose Manual. Without this the stored list alone reads as Manual.
+      toolsMode: require('./tools-mode.cjs').initialToolsMode(body),
       // (files normalization below is shared with the config route's RAG bookkeeping)
       chats: [],
       createdAt: Date.now(),
@@ -477,14 +479,17 @@ function createProjectStore({
     try {
       connection = authService.getStorage(currentWorkspace().userId, true);
     } catch {
-      return { folder: null, loginRejected: false };
+      return { folder: null, loginRejected: false, failure: null };
     }
-    if (!storageClient.isBrowsable(connection)) return { folder: null, loginRejected: false };
+    if (!storageClient.isBrowsable(connection)) return { folder: null, loginRejected: false, failure: null };
     try {
-      return { folder: await createProjectFolder(storageClient, connection, PROJECT_ROOT_FOLDER, project), loginRejected: false };
+      return { folder: await createProjectFolder(storageClient, connection, PROJECT_ROOT_FOLDER, project), loginRejected: false, failure: null };
     } catch (err) {
       console.warn(`[projects] could not create folder for project ${project.id}: ${String((err && err.message) || err)}`);
-      return { folder: null, loginRejected: typeof storageClient.refusedLogin === 'function' && storageClient.refusedLogin(err) };
+      // #1428: the failure kind rides along, so the caller says "throttled" or "timed out" rather than
+      // a generic failure; loginRejected stays for callers that only ask about the login.
+      const failure = typeof storageClient.storageFailure === 'function' ? storageClient.storageFailure(err) : null;
+      return { folder: null, loginRejected: typeof storageClient.refusedLogin === 'function' && storageClient.refusedLogin(err), failure };
     }
   }
 
@@ -601,7 +606,7 @@ function createProjectStore({
       let current = null;
       if (edit) {
         if (typeof expectName !== 'string' || !expectName) throw new Error('an edit must name the stored file it changes; nothing was saved');
-        current = (project.files || []).find((f) => f.name === expectName);
+        current = (project.files || []).find((f) => f && f.name === expectName);
         if (!current) throw new Error(`"${expectName}" is no longer in this project; nothing was saved`);
         if (expectContent !== undefined && String(current.content || '') !== expectContent) throw new Error(`"${expectName}" changed while this edit was being made; nothing was saved. Read it again and retry.`);
         // Same stored version as planned, and still fully read text: a sync that re-read the file
@@ -660,7 +665,7 @@ function createProjectStore({
       if (remote) project.sourceFolders = [...new Set([...(project.sourceFolders || []), project.projectFolder])];
       // A moved file (#687) leaves its plain-named copy behind in neither the list nor the index.
       if (adopt) rag.deleteProjectFile(project.id, expectName, currentWorkspace().userId);
-      project.files = [...(project.files || []).filter((f) => f.name !== file.name && !(adopt && f === current)), file];
+      project.files = [...(project.files || []).filter((f) => f && f.name !== file.name && !(adopt && f === current)), file];
       project.updatedAt = Date.now();
       indexSource(project, file);
       saveProjects(PROJECTS);

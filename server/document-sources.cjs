@@ -3,6 +3,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const documents = require('./documents.cjs');
+const { quoteName } = require('./quoted-name.cjs');
 const hash = value => crypto.createHash('sha256').update(value).digest('hex');
 
 // No shared cache: all bytes and derived versions live under the caller's
@@ -63,7 +64,7 @@ function problem(file) {
 function notice(file) {
   const d = file.document;
   if (!d) return '';
-  return `${file.name}: ${problem(file)}` +
+  return `${quoteName(file.name)}: ${problem(file)}` +
     `${d.version ? ' Source version ' + d.version : ''}${d.availableVersion ? '; text version ' + d.availableVersion : ''}` +
     `; index: ${d.indexing || 'unavailable'}.`;
 }

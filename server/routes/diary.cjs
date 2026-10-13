@@ -30,7 +30,7 @@ const PASS = Symbol('unhandled');
  * @param {object} deps.diary             diary.cjs: diaryHeaders, corpusSource, connectorFiles
  * @param {boolean} [deps.addressesTrusted]  TRUST_PROXY: only then is a client address a real, per-client key
  */
-function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, authService, currentWorkspace, rateLimited, connectorRate, diaryConnectors, diary, clientAddress = (req) => req.socket?.remoteAddress, addressesTrusted = false }) {
+function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, authService, currentWorkspace, rateLimited, connectorRate, diaryConnectors, diary, clientAddress = (req) => req.socket?.remoteAddress, addressesTrusted = false, storageLatch = null }) {
   const { diaryHeaders, corpusSource, connectorFiles } = diary;
   const log = diary.log || ((line) => console.info(line));
   // The connector bodies are JSON objects; `null`, an array or a number is a 400 (#786).
@@ -119,6 +119,13 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
       if (req.method !== (status ? 'GET' : 'POST')) return json(res, 405, { error: 'Method not allowed' });
       const body = status ? undefined : await readBody(req, 4096);
       const r = await diaryFetchJson(`${DIARY_BASE}/api/${status ? 'storage-status' : 'storage-import'}`, { method: req.method, body }, status ? 60000 : 300000);
+      // #1589: while a refused or throttled login holds this account's automatic storage calls (the backup
+      // among them), the status says so and when the next attempt is due, instead of looking healthy.
+      if (status && r.ok && r.body && typeof r.body === 'object' && !Array.isArray(r.body) && storageLatch) {
+        let held = null;
+        try { held = storageLatch.statusFor(authn.user.id, (id) => authService.getStorage(id, true)); } catch { held = null; }
+        if (held) return json(res, r.status, { ...r.body, automaticStorage: { held: true, kind: held.kind, nextAttemptAt: held.nextAttemptAt } });
+      }
       return json(res, r.status, r.ok ? r.body : { error: r.body?.detail || 'Diary storage request failed' });
     }
 
@@ -144,7 +151,22 @@ function createDiaryRoutes({ json, readBody, readJson, fetchJson, DIARY_BASE, au
       // account's id only: no path, no storage address, no credential.
       if (storageRetry) log(`[diary] forwarding X-Cowork-Storage-Retry: 1 (${req.method} ${p}, user ${authn.user.id})`);
       const r = await diaryFetchJson(`${DIARY_BASE}/api${suffix}`, { method: req.method, body, storageRetry }, local ? 600000 : 60000);
-      if (r.ok) return json(res, r.status, r.body);
+      if (r.ok) {
+        // #1589: an explicit Retry that works proves the saved login is good, so automatic calls resume.
+        // #1607: but only when the listing really went to the storage server. A Diary account kept in the app
+        // (managed mode) answers /files and /file from its own database and never contacts Nextcloud
+        // (diary/agent/app.py workspace_files -> ManagedCorpusBackend.list_dir), so that reply proves nothing
+        // about the saved login; the Diary's own storage-status tells which kind of account this is.
+        if (storageRetry && storageLatch) {
+          let reachedStorage = false;
+          try {
+            const st = await diaryFetchJson(`${DIARY_BASE}/api/storage-status`, { method: 'GET' }, 60000);
+            reachedStorage = !!(st.ok && st.body && st.body.mode === 'legacy');
+          } catch { /* unknown: the hold stays */ }
+          if (reachedStorage) { try { storageLatch.clear(authn.user.id); } catch { /* the hold stays */ } }
+        }
+        return json(res, r.status, r.body);
+      }
       // #849 / #1166: the sidecar tags a storage login the server refused (424 storageLoginRejected) and a
       // storage server that is throttling us (503 storageThrottled + Retry-After). The code and the wait
       // are passed on so the browser words them in the interface language. Nothing else is passed.

@@ -1,4 +1,5 @@
 'use strict';
+const net = require('net');
 // A dedicated listener has one operator-selected transport boundary. Per-user
 // opt-in never publishes a port or turns a LAN credential into a public one.
 function configuration(env = process.env, publicOrigin = '') {
@@ -16,7 +17,10 @@ function configuration(env = process.env, publicOrigin = '') {
   if (scope === 'lan' && publicOrigin && url.origin === new URL(publicOrigin).origin) throw Error('LAN DAV requires an authority separate from the public app origin');
   const proxyToken = env.COWORK_DAV_PROXY_TOKEN || '';
   if (url.protocol === 'https:' && !/^[a-f0-9]{64,128}$/.test(proxyToken)) throw Error('HTTPS DAV requires a 32-byte or longer hex COWORK_DAV_PROXY_TOKEN');
-  return { available: true, port, scope, origin: url.origin, host: url.host, cleartext: url.protocol === 'http:', proxyToken };
+  // Only an explicit COWORK_DAV_HOST is checked as an IP; UI_HOST keeps whatever form it always had.
+  if (env.COWORK_DAV_HOST && !net.isIP(env.COWORK_DAV_HOST)) throw Error('COWORK_DAV_HOST must be an IP address');
+  const bindHost = env.COWORK_DAV_HOST || env.UI_HOST || '0.0.0.0';
+  return { available: true, port, scope, origin: url.origin, host: url.host, bindHost, cleartext: url.protocol === 'http:', proxyToken };
 }
 function createDavSettings({ auth, config }) {
   auth.db.exec(`CREATE TABLE IF NOT EXISTS dav_settings(user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,

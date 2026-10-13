@@ -86,6 +86,7 @@ function portEgressRefusal(p, spaceId, projectId, diaryProjectId) {
   return null;
 }
 const PATH_KEY = /path|dir|folder|file|scope|source|destination|target|href|url|location|from|to$/i;
+const ID_ARG = /id(s)?$|^(item|node|uid|ref)s?$/i;
 const TREE_TOOL = /^nc_webdav_(?:search_files|find_by_name|find_by_type)$/;
 const recursiveArgs = (args) => Object.entries(args || {}).some(([k, v]) => /recurs|depth|deep/i.test(k) && v !== false && v !== 0 && v !== '0' && v !== 1 && v !== '1' && v !== null);
 function pathArguments(args, depth = 0, out = []) {
@@ -107,8 +108,17 @@ function portToolRefusal(p, name, rawArgs, s) {
   let args;
   try { args = typeof rawArgs === 'string' ? JSON.parse(rawArgs || '{}') : rawArgs || {}; } catch { return `ERROR: ${name} arguments could not be read, so it was not run.`; }
   const paths = pathArguments(args);
+  // #1213: mirrors provider-egress.cjs toolRefusalJs: an id-addressed call, or a path-less call
+  // other than the bare root listing, cannot be checked against the Diary folder.
+  const argKeys = Object.keys(args && typeof args === 'object' ? args : {});
+  if (argKeys.some((key) => ID_ARG.test(key))) {
+    return `ERROR: ${name} was not run: it addresses a file by id, which cannot be checked against the Diary folder, and Diary content is never sent to ${label}. Use a path outside the Diary, or a local model.`;
+  }
   const tree = TREE_TOOL.test(name) || recursiveArgs(args);
   if (tree && !paths.length) return `ERROR: ${name} needs a folder to search in when used with ${label}, so it was not run. Search a specific folder outside the Diary.`;
+  if (!paths.length && !(name === 'nc_webdav_list_directory' && argKeys.length === 0)) {
+    return `ERROR: ${name} was not run: it names no path, so the Diary folder cannot be ruled out, and Diary content is never sent to ${label}. Name a folder outside the Diary, or use a local model.`;
+  }
   const inside = `ERROR: ${name} was not run: that path is in the Diary folder, and Diary content is never sent to ${label}. Do not retry; tell the user to use a local model for Diary files.`;
   for (const value of paths) {
     if (value.length > 4096) return inside;

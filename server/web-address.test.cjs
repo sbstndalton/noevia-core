@@ -155,3 +155,64 @@ test('#796: a JSON body that is not an object is a 400, never a TypeError', asyn
   }
   assert.equal(auth.origin, 'https://cowork.example.test', 'nothing was saved');
 });
+
+// #1460: an earlier address that no longer resolves can be removed by an admin, and only that.
+test('an admin removes an earlier address: sign-in, related origins and the saved list drop it, and it stays removed after a restart', () => {
+  const dir = temp();
+  const auth = createAuth({ dataDir: dir, publicOrigin: 'https://cowork.example.test' });
+  assert.equal(auth.changeOrigin('https://noevia.example.test', 'u1'), null);
+  assert.deepEqual(auth.previousOrigins, ['https://cowork.example.test']);
+  const now = Date.now();
+  auth.db.prepare("INSERT INTO users(id,username,username_norm,display_name,role,password_hash,webauthn_user_id,created_at,updated_at) VALUES('u1','u1','u1','u1','admin','x','w',?,?)").run(now, now);
+  auth.db.prepare("INSERT INTO passkeys(id,user_id,name,public_key,webauthn_user_id,counter,device_type,backed_up,transports,created_at,rp_id) VALUES('old-key','u1','k',?,'w',0,'singleDevice',0,'[]',?,'cowork.example.test')").run(Buffer.from('k'), now);
+
+  assert.equal(auth.removeEarlierOrigin('https://cowork.example.test/', 'u1').error, null, 'trailing slash is tolerated');
+  const removed = auth.removeEarlierOrigin('https://cowork.example.test', 'u1');
+  assert.equal(removed.error, 'That address is not one of the earlier addresses.', 'removing it twice is a 404-class refusal');
+  assert.equal(removed.status, 404);
+  assert.deepEqual(auth.previousOrigins, []);
+  assert.equal(auth.originValid(req('https://cowork.example.test')), false, 'it no longer signs in');
+  assert.ok(auth.originValid(req('https://noevia.example.test')), 'the current address still does');
+  assert.deepEqual(auth.relatedOrigins(), ['https://noevia.example.test']);
+  assert.equal(auth.db.prepare("SELECT rp_id FROM passkeys WHERE id='old-key'").get().rp_id, 'cowork.example.test', 'the old passkey row is kept, not deleted');
+  const audit = auth.db.prepare("SELECT detail FROM audit_events WHERE action='settings.public_origin.earlier_removed'").get();
+  assert.deepEqual(JSON.parse(audit.detail), { origin: 'https://cowork.example.test', passkeysAffected: 1 });
+  auth.db.close();
+  const again = createAuth({ dataDir: dir, publicOrigin: 'https://cowork.example.test' });
+  assert.deepEqual(again.previousOrigins, [], 'still removed after a restart');
+  assert.equal(again.originValid(req('https://cowork.example.test')), false);
+  again.db.close();
+});
+
+test('the current address and unknown addresses cannot be removed, and the route is admin only', async () => {
+  const auth = createAuth({ dataDir: temp(), publicOrigin: 'https://cowork.example.test' });
+  auth.changeOrigin('https://noevia.example.test', 'u');
+  const current = auth.removeEarlierOrigin('https://noevia.example.test', 'u');
+  assert.equal(current.status, 400);
+  assert.match(current.error, /current address/);
+  assert.equal(auth.removeEarlierOrigin('https://evil.example.test', 'u').status, 404);
+  assert.equal(auth.removeEarlierOrigin('', 'u').status, 404);
+  assert.deepEqual(auth.previousOrigins, ['https://cowork.example.test'], 'nothing else was changed');
+
+  const out = {};
+  const json = (res, status, body) => { out.status = status; out.body = body; };
+  const route = (method, body, authn) => createWebAddressRoutes({ auth, json, readBody: async () => body, fetchImpl: async () => { throw Error('must not probe'); } })({ method }, {}, { path: '/api/admin/web-address/remove', authn });
+  const admin = { user: { id: 'a', role: 'admin' } };
+  assert.equal(await route('POST', { origin: 'https://cowork.example.test' }, { user: { id: 'm', role: 'member' } }), true);
+  assert.equal(out.status, 403);
+  assert.equal(await route('POST', { origin: 'https://cowork.example.test' }, null), true);
+  assert.equal(out.status, 403, 'signed out');
+  await route('GET', {}, admin);
+  assert.equal(out.status, 405);
+  for (const body of [null, 7, [1], {}, { origin: 3 }]) {
+    await route('POST', body, admin);
+    assert.equal(out.status, 400, JSON.stringify(body));
+  }
+  await route('POST', { origin: 'https://cowork.example.test' }, admin);
+  assert.equal(out.status, 200);
+  assert.equal(out.body.removed, 'https://cowork.example.test');
+  assert.equal(out.body.passkeysAffected, 0);
+  assert.deepEqual(out.body.previous, []);
+  assert.equal(out.body.origin, 'https://noevia.example.test');
+  auth.db.close();
+});

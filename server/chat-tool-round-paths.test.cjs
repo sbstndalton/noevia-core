@@ -10,10 +10,13 @@ const { createToolExchange } = require('./tool-exchange.cjs');
 const { createVisionProbe } = require('./vision.cjs');
 const { createStepSupervision } = require('./step-supervision.cjs');
 
-const toolCallFrame = { choices: [{ delta: { content: 'Preamble', tool_calls: [{ index: 0, id: 'call-fixture', function: { name: 'synthetic_write', arguments: '{}' } }] } }] };
+const toolCallFrame = (name) => ({ choices: [{ delta: { content: 'Preamble', tool_calls: [{ index: 0, id: 'call-fixture', function: { name, arguments: '{}' } }] } }] });
 const stream = (...frames) => ({ ok: true, body: (async function* () { for (const f of frames) yield Buffer.from('data: ' + JSON.stringify(f) + '\n\n'); })() });
-
-async function run(t, { second = 'text', toolThrows = false, stepSupervision = null, providerId = 'default', decision = 'approve_all' } = {}) {
+// readOnly: the one tool is a read (#1456). toolResult/passThrough: the result the model is given is the
+// tool's own text, not the 'reduced' stub (#1551). ctxSize: the loaded model's context allocation.
+async function run(t, { second = 'text', toolThrows = false, stepSupervision = null, providerId = 'default', decision = 'approve_all',
+  readOnly = false, toolResult = 'complete synthetic result', passThrough = false, ctxSize = 32768 } = {}) {
+  const toolName = readOnly ? 'synthetic_read' : 'synthetic_write';
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-tool-round-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const events = [], res = new EventEmitter();
   res.writeHead = () => {}; res.write = (line) => events.push(JSON.parse(line.slice(6))); res.end = () => { res.writableEnded = true; res.emit('finish'); };
@@ -22,13 +25,13 @@ async function run(t, { second = 'text', toolThrows = false, stepSupervision = n
   const baseUrl = `http://${providerId}.invalid`;
   const fetch = async (url, init) => {
     requests.push({ url: String(url), body: JSON.parse(init.body) });
-    if (requests.length === 1) return stream(toolCallFrame);
+    if (requests.length === 1) return stream(toolCallFrame(toolName));
     if (second === 'stream-error') return stream({ error: { message: 'synthetic provider overload' } });
     if (second === 'throw') throw Error('mock model died');
     return stream({ choices: [{ delta: { content: 'synthetic final answer' } }] });
   };
   const { handleChat } = createChatHandler({
-    modelManager: { enabled: true, health: async () => ({ ok: true, body: { all_models_loaded: [{ model_name: 'answer-model', loaded: true, recipe_options: { ctx_size: 32768 } }] } }) },
+    modelManager: { enabled: true, health: async () => ({ ok: true, body: { all_models_loaded: [{ model_name: 'answer-model', loaded: true, recipe_options: { ctx_size: ctxSize } }] } }) },
     reasoningEffort: require('./reasoning-effort.cjs'), authService: { audit() {} }, crypto: require('node:crypto'), path, fs, fetch,
     HISTORY_CAP: 20, DEFAULT_PROVIDER_ID: 'default', createToolExchange,
     currentWorkspace: () => ({ userId: 'synthetic-user', dir, assetDir: () => '/synthetic-only' }),
@@ -38,12 +41,12 @@ async function run(t, { second = 'text', toolThrows = false, stepSupervision = n
     chatSkillRouter: { select: async () => ({ loaded: [] }) }, oauthServerIds: () => new Set(), accountReady: () => true, mcpOAuth: { connected: () => false },
     chatToolRouter: { select: async (ids) => ({ ids, routed: false }) }, DEFAULT_TOOLBOXES: [], CONNECTOR_BOXES: new Set(['gdrive']), connectedBoxes: () => [],
     toolPolicy: { mode: (_user, _name, write) => (write ? 'ask' : 'allow') }, requestScope: { getStore: () => ({}) },
-    resolveTools: () => ({ tools: [{ type: 'function', function: { name: 'synthetic_write', parameters: { type: 'object' } } }], dropped: [] }), isWriteTool: () => true,
-    rag: { filesContext: async () => null }, prefill: { recordSample() {} }, reduceToolResult: () => ({ text: 'reduced' }), diaryExtras: require('./diary-extras.cjs'),
+    resolveTools: () => ({ tools: [{ type: 'function', function: { name: toolName, parameters: { type: 'object' } } }], dropped: [] }), isWriteTool: (name) => name === 'synthetic_write',
+    rag: { filesContext: async () => null }, prefill: { recordSample() {} }, reduceToolResult: (text) => ({ text: passThrough ? String(text) : 'reduced' }), diaryExtras: require('./diary-extras.cjs'),
     DIARY_BASE: 'http://fixture.invalid', TOOL_RESULT_CAP: 8000, json: () => {}, saveChats() {}, endpointApproved: () => true, diaryHeaders: () => ({}),
     lastLoadedModel: () => null, classifyFastOrSmart: async () => 'fast', servedCatalogue: async () => [], modelsInstalled: async () => [], missingRoles: () => [], staleRolesError: () => null,
     allToolboxes: () => [], chatWideApproved: () => false, recordUsage() {}, recordToolUse() {},
-    executeToolCall: async () => { executions++; if (toolThrows) throw Error('connection lost after write'); return 'complete synthetic result'; },
+    executeToolCall: async () => { executions++; if (toolThrows) throw Error('connection lost after write'); return toolResult; },
     awaitApproval: async (args) => { decisions.push(Object.keys(args).sort()); return decision === 'approve_all' ? 'approve' : decision; },
     stepSupervision,
   });
@@ -105,4 +108,35 @@ test('a thrown write still reaches step supervision once, and escalation stops b
   const r = await run(t, { toolThrows: true, stepSupervision: counting });
   assert.equal(r.executions, 1); assert.equal(r.requests.length, 1); assert.equal(calls, 1);
   assert.equal(r.events.find((x) => x.type === 'paused')?.reason, 'supervision');
+});
+
+// #1456: a read that changed nothing is stopped only by a confident verdict; a weak one lets the model answer.
+const scoredStop = (scores) => createStepSupervision({ enabled: () => true, provider: { decide: async () => ({ action: 'escalate', scores }) } });
+test('a read-only round pauses on a confident stop verdict and not on a weak one (#1456)', async (t) => {
+  const quiet = await run(t, { readOnly: true, stepSupervision: scoredStop({ continue: 0.3, verify: 0.3, escalate: 0.4 }) });
+  assert.equal(quiet.executions, 1); assert.equal(quiet.requests.length, 2, 'the model reads the result and answers');
+  assert.equal(quiet.events.some((e) => e.type === 'paused'), false);
+  assert.ok(quiet.events.some((e) => e.type === 'done')); assert.deepEqual(errors(quiet), []);
+  const stopped = await run(t, { readOnly: true, stepSupervision: scoredStop({ continue: 0.1, verify: 0.1, escalate: 0.8 }) });
+  assert.equal(stopped.executions, 1); assert.equal(stopped.requests.length, 1);
+  assert.equal(stopped.events.find((x) => x.type === 'paused')?.reason, 'supervision');
+});
+
+// #1551: a tool result too big for the context is shrunk (head and tail kept, marked), not an error.
+test('a tool result too big for a small context is shrunk and the reply goes on (#1551)', async (t) => {
+  const r = await run(t, { readOnly: true, passThrough: true, ctxSize: 4096, toolResult: 'synthetic line of text. '.repeat(600) });
+  assert.deepEqual(errors(r), [], JSON.stringify(errors(r)));
+  assert.equal(r.requests.length, 2, 'the model gets its one more round with the shrunk result');
+  const sent = r.requests[1].body.messages.at(-1);
+  assert.equal(sent.role, 'tool');
+  assert.match(sent.content, /^<untrusted kind="tool result"[^\n]*\n[\s\S]*\n\[truncated \d+ chars\]\n[\s\S]*\n<\/untrusted>$/);
+  assert.ok(r.events.some((e) => e.type === 'done'));
+});
+
+// #1551: the meter is sent again after a tool round, so it counts that round's tool output.
+test('the context meter is sent again after a tool round and counts its output (#1551)', async (t) => {
+  const r = await run(t, { readOnly: true, passThrough: true, toolResult: 'synthetic line of text. '.repeat(200) });
+  const meters = r.events.filter((e) => e.type === 'context');
+  assert.equal(meters.length, 2, 'one when the request is prepared, one after the tool round');
+  assert.ok(meters[1].used > meters[0].used + 1000, `${meters[0].used} -> ${meters[1].used}`);
 });

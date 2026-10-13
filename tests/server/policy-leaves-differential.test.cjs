@@ -168,6 +168,25 @@ test('fails closed: mode() blocks, set() writes nothing, auth stops without echo
   });
 });
 
+test('set(): a refusal with an unknown reason fails closed with a fixed message, never a 400 with none (#1109)', (t) => {
+  t.mock.method(console, 'warn', () => {});
+  const db = fakeDb(null);
+  for (const reply of [{ ok: false, reason: 'future_reason' }, { ok: false, reason: 'toString' }, { ok: false }, undefined, { ok: 'yes' }]) {
+    const policy = createToolPolicy({ db, wasmLoader: () => ({ toolPolicySet: () => reply }) });
+    assert.throws(() => policy.set('user-1', ['read_a'], 'ask', () => false), (e) => {
+      assert.equal(e.status, 500, JSON.stringify(reply));
+      assert.equal(e.message, 'The tool permission could not be checked.');
+      assert.equal(e.publicMessage, undefined);
+      return true;
+    });
+  }
+  assert.equal(db.writes.length, 0);
+  // The known refusals keep their 400 and public message.
+  const refusing = createToolPolicy({ db, wasmLoader: () => ({ toolPolicySet: () => ({ ok: false, reason: 'write' }) }) });
+  assert.throws(() => refusing.set('user-1', ['w'], 'allow', () => true), (e) => e.status === 400 && e.publicMessage === 'Writes always ask first, so they cannot be set to Always allow.');
+  assert.equal(db.writes.length, 0);
+});
+
 test('loader: refusals and shape checks never carry a token', { skip: skipWasm }, () => {
   const token = 'tok-'.repeat(20000); // over MAX_POLICY_UNITS
   assert.throws(() => davParseWasm.authTokens(token, '', undefined), (e) => e.reason === 'too_large' && !e.message.includes('tok-'));

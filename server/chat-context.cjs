@@ -20,24 +20,46 @@ function hostedLimit(provider) {
 }
 // `hosted` is the provider row for a non-default (hosted/custom) provider, or null for the local
 // default. The model-manager path ignores it entirely.
-async function resolveRuntimeLimit({manager,model,dir,scope,onStatus=()=>{},signal,assertActive,hosted=null}) {
+// #1449: the wait for a role change is the model load. Load times are measured in this process (the
+// last few per model); the status names a number only when one was measured, else it omits it.
+const LOAD_SAMPLES = 5;
+const loadSamples = new Map();
+function recordLoad(model, ms) {
+  if (!Number.isFinite(ms) || ms < 0) return;
+  loadSamples.set(model, [...(loadSamples.get(model) || []), ms].slice(-LOAD_SAMPLES));
+}
+/** Whole seconds from the median recent load of `model`, at least 1, or null when none was measured. */
+function expectedLoadSeconds(model) {
+  const list = loadSamples.get(model);
+  if (!list?.length) return null;
+  const sorted = [...list].sort((a, b) => a - b);
+  return Math.max(1, Math.round(sorted[Math.floor(sorted.length / 2)] / 1000));
+}
+function loadingStatus(model, role, seconds) {
+  const who = role ? `${model} for the ${role} role` : model;
+  return `Loading the selected model ${who} and checking its context allocation…${seconds ? ` Expected wait about ${seconds} s.` : ''}`;
+}
+async function resolveRuntimeLimit({manager,model,dir,scope,onStatus=()=>{},signal,assertActive,hosted=null,role=null}) {
   assertActive?.();
-  if (manager?.enabled) return resolveManagedLimit({manager,model,dir,scope,onStatus,signal,assertActive});
+  if (manager?.enabled) return resolveManagedLimit({manager,model,dir,scope,onStatus,signal,assertActive,role});
   if (hosted) return hostedLimit(hosted);
   return runtimeLimit(null,model);
 }
-async function resolveManagedLimit({manager,model,dir,scope,onStatus,signal,assertActive}) {
+async function resolveManagedLimit({manager,model,dir,scope,onStatus,signal,assertActive,role=null}) {
   signal?.throwIfAborted();
   let response=await manager.health();
   assertActive?.();
   if (!response.ok) throw Error('Could not read the model backend context. Try again when the backend is available.');
   let health=response.body;
   if (!health?.all_models_loaded?.some(m=>m.model_name===model && m.loaded && m.backend_alive!==false)) {
-    onStatus('Loading the selected model and checking its context allocation…','loadingModel');
+    const seconds=expectedLoadSeconds(model);
+    onStatus(loadingStatus(model,role,seconds),'loadingModel',{model,...(role?{role}:{}),...(seconds?{expectedSeconds:seconds}:{})});
     signal?.throwIfAborted();
+    const started=Date.now();
     const loaded=await manager.load(model,{},signal);
     assertActive?.();
     if (!loaded.ok) throw Error('The selected model could not load. Its context allocation was not changed.');
+    recordLoad(model,Date.now()-started);
     signal?.throwIfAborted();
     response=await manager.health();
     assertActive?.();
@@ -71,7 +93,7 @@ function applySummary(messages,state) {
 function measure(messages,tools,limit,source,model) {
  const system=messages.filter(m=>m.role==='system'), other=messages.filter(m=>m.role!=='system');
  const parts=[{name:'Messages & summary',tokens:other.reduce((n,m)=>n+tokens(m),0)}, {name:'Instructions, memory & sources',tokens:system.reduce((n,m)=>n+tokens(m),0)}, {name:'Tools',tokens:tools.length?tokens(tools):0}];
- const used=parts.reduce((n,p)=>n+p.tokens,0), reserve=Math.min(4096,Math.floor(limit*.25)), safety=Math.ceil(limit*.15);
+ const used=parts.reduce((n,p)=>n+p.tokens,0), reserve=require('./thinking-budget.cjs').outputBudget(limit), safety=Math.ceil(limit*.15);
  return {model,limit,limitSource:source,estimated:true,used,reserve,safety,parts,free:Math.max(0,limit-used-reserve-safety),threshold:limit-reserve-safety,updatedAt:Date.now()};
 }
 function biggestPart(parts) { return parts.reduce((a,b)=>b.tokens>a.tokens?b:a); }
@@ -106,14 +128,42 @@ function validToolGroups(messages) {
  }
  return expected.length===0;
 }
+// #1551: a tool result shortened to its head and tail, with a marker, when the turn cannot fit otherwise.
+// The untrusted frame (<untrusted ...> ... </untrusted>) stays on both ends, so it still wraps what is kept.
+const TOOL_RESULT_FLOOR=600;
+const UNTRUSTED_FRAME=/^(<untrusted\b[^\n]*\n)([\s\S]*)(\n<\/untrusted>)$/;
+const isHighSurrogate=code=>code>=0xd800&&code<=0xdbff, isLowSurrogate=code=>code>=0xdc00&&code<=0xdfff;
+function keepHeadAndTail(text,keep) {
+ const frame=UNTRUSTED_FRAME.exec(text);
+ const open=frame?frame[1]:'',close=frame?frame[3]:'',body=frame?frame[2]:text;
+ if(body.length<=keep) return text;
+ // 70% head, 30% tail; a cut never splits a surrogate pair.
+ let head=Math.ceil(keep*.7);if(isHighSurrogate(body.charCodeAt(head-1)))head--;
+ let from=body.length-(keep-head);if(isLowSurrogate(body.charCodeAt(from)))from++;
+ return `${open}${body.slice(0,head)}\n[truncated ${from-head} chars]\n${body.slice(from)}${close}`;
+}
+// Shrinks the largest tool results of a protected turn, to one common length, until the turn fits
+// `room` tokens beside the system messages. Null when even the floor does not fit. The input is never changed.
+function shrinkToolResults({system,tail,tools,limit,limitSource,model,room}) {
+ const fits=messages=>{const m=measure([...system,...messages],tools,limit,limitSource,model);return m.used+room<=m.threshold;};
+ const isToolText=m=>m?.role==='tool'&&typeof m.content==='string';
+ if(fits(tail)) return {tail,truncated:0};
+ const capAt=keep=>tail.map(m=>isToolText(m)&&m.content.length>keep?{...m,content:keepHeadAndTail(m.content,keep)}:m);
+ let low=TOOL_RESULT_FLOOR, high=Math.max(0,...tail.filter(isToolText).map(m=>m.content.length));
+ if(!fits(capAt(low))) return null;
+ while(low<high){const mid=Math.ceil((low+high)/2);if(fits(capAt(mid)))low=mid;else high=mid-1;}
+ const shrunk=capAt(low);
+ return {tail:shrunk,truncated:shrunk.filter((m,i)=>m!==tail[i]).length};
+}
 // Rebuild the model-facing projection between tool rounds. This is intentionally
 // transient: the authoritative transcript and the persisted cross-turn summary do
 // not contain an exchange until the turn has completed. The current user message
-// and every tool call/result after it stay byte-identical and tool groups remain
-// atomic; only older context may become a continuation summary.
+// and every tool call stay byte-identical and tool groups remain atomic. Only older
+// context may become a continuation summary; when nothing older can go, the newest
+// tool results are shortened instead (#1551, marked in place, frame kept).
 async function compactContinuation({messages,tools,limit,limitSource,model,summarize,onStatus=()=>{}}) {
  const before=measure(messages,tools,limit,limitSource,model);
- if(before.used<=before.threshold) return {messages,meter:before,compacted:false,covered:0};
+ if(before.used<=before.threshold) return {messages,meter:before,compacted:false,covered:0,truncated:0};
  let systemCount=0;while(messages[systemCount]?.role==='system')systemCount++;
  const system=messages.slice(0,systemCount),original=messages.slice(systemCount);
  if(messages.slice(systemCount).some(message=>message?.role==='system') || !validToolGroups(original)) {
@@ -122,13 +172,22 @@ async function compactContinuation({messages,tools,limit,limitSource,model,summa
  let protectedStart=-1;
  for(let i=original.length-1;i>=0;i--)if(original[i]?.role==='user'){protectedStart=i;break;}
  const compactable=protectedStart>0?original.slice(0,protectedStart):[];
- const protectedTail=protectedStart>=0?original.slice(protectedStart):original;
- if(!compactable.length) throw Error('Tool results filled the available context. Reduce the result size or choose a model with more context. No messages were deleted.');
+ const tailBefore=protectedStart>=0?original.slice(protectedStart):original;
  const summaryAllowance=Math.min(1800,Math.floor(limit*.2));
- const protectedMeter=measure([...system,...protectedTail],tools,limit,limitSource,model);
- if(protectedMeter.used+summaryAllowance>protectedMeter.threshold) {
+ // The current turn and its tool results must fit, with room for a summary only when there is something
+ // older to summarise. Oversized tool results are shortened before the turn is refused (#1551).
+ const shrunk=shrinkToolResults({system,tail:tailBefore,tools,limit,limitSource,model,room:compactable.length?summaryAllowance:0});
+ if(!shrunk) {
+  if(!compactable.length) throw Error('Tool results filled the available context. Reduce the result size or choose a model with more context. No messages were deleted.');
+  const protectedMeter=measure([...system,...tailBefore],tools,limit,limitSource,model);
   const biggest=biggestPart([...protectedMeter.parts,{name:'Summary allowance',tokens:summaryAllowance}]);
   throw Error(`Tool-loop context cannot fit because ${biggest.name.toLowerCase()} uses about ${biggest.tokens} tokens. Reduce it or choose a model with more context. No messages were deleted.`);
+ }
+ const protectedTail=shrunk.tail;
+ if(!compactable.length) {
+  // Nothing older to compact: the shortened turn is the whole request. No message was deleted.
+  const next=[...system,...protectedTail];
+  return {messages:next,meter:measure(next,tools,limit,limitSource,model),compacted:false,covered:0,truncated:shrunk.truncated};
  }
  onStatus('Compacting context before the next tool step… Your full transcript stays available.','compactingTools');
  const maxTokens=Math.min(1536,Math.floor(limit*.15));
@@ -147,7 +206,7 @@ async function compactContinuation({messages,tools,limit,limitSource,model,summa
  if(tokens(next)>=tokens(messages)) throw Error('Tool-loop compaction did not reduce the context. No messages were deleted.');
  const meter=measure(next,tools,limit,limitSource,model);
  if(meter.used>meter.threshold) throw Error('Tool-loop context is still too full after compaction. Reduce tool results or choose a model with more context. No messages were deleted.');
- return {messages:next,meter,compacted:true,covered:compactable.length};
+ return {messages:next,meter,compacted:true,covered:compactable.length,truncated:shrunk.truncated};
 }
 async function prepareUnlocked({dir,id,messages,tools,limit,limitSource,model,force=false,summarize,onStatus=()=>{},assertActive}) {
  assertActive?.();
@@ -193,15 +252,17 @@ async function prepareUnlocked({dir,id,messages,tools,limit,limitSource,model,fo
  return {messages:wire,meter,maxTokens:meter.reserve};
 }
 const CONTEXT_FULL_TEXT='The model ran out of context space. Compact this chat or reduce its sources before retrying.';
-const STREAM_FAILED_TEXT='The model stream failed. Partial output was preserved; check the backend before retrying.';
+// #1547: the "Partial output was preserved" sentence is only true when text was shown; the caller says so.
+const STREAM_FAILED_TEXT='The model stream failed. Check the backend before retrying.';
+const STREAM_FAILED_PARTIAL_TEXT='The model stream failed. Partial output was preserved; check the backend before retrying.';
 // #1002: the upstream's own reason, classified and sanitised by the Rust provider-error crate
 // (chat-template-caps.cjs), instead of one fixed sentence. `status` is the HTTP status (a stream
 // error has none: its own numeric code, else 500). If a single call cannot run Rust (a trap), the
 // generic stream-failed sentence is shown. The JS context-full regex is tests/server/oracle/chat-context.cjs.
-function providerError(value,status) {const text=typeof value==='string'?value:JSON.stringify(value);const code=Number.isInteger(status)?status:Number.isInteger(value?.code)?value.code:500;return require('./chat-template-caps.cjs').failureText(code,text)??STREAM_FAILED_TEXT;}
+function providerError(value,status,{partial=false}={}) {const text=typeof value==='string'?value:JSON.stringify(value);const code=Number.isInteger(status)?status:Number.isInteger(value?.code)?value.code:500;return require('./chat-template-caps.cjs').failureText(code,text,{partial})??(partial?STREAM_FAILED_PARTIAL_TEXT:STREAM_FAILED_TEXT);}
 const busy=new Set();
 async function prepare(options){const key=stateFile(options.dir,options.id);if(busy.has(key))throw Error('This chat is already preparing context. Wait for that request to finish.');busy.add(key);try{return await prepareUnlocked(options);}finally{busy.delete(key);}}
 // R1 measurement, opt-in with CONTEXT_LOG=1; never breaks a chat.
 function logRound({dir,assertActive,...entry}){if(process.env.CONTEXT_LOG!=='1')return;try{const log=require('./context-log.cjs');const record=log.record(entry);assertActive?.();log.append(dir,record);}catch(e){console.warn('[context-log] write failed:',e.message);}}
 function remove(dir,id){fs.rmSync(stateFile(dir,id),{force:true});}
-module.exports={logRound,remove,tokens,read,save,runtimeLimit,resolveRuntimeLimit,HOSTED_DEFAULT_LIMIT,applySummary,measure,prepare,compactContinuation,providerError,CONTEXT_FULL_TEXT,STREAM_FAILED_TEXT};
+module.exports={logRound,remove,tokens,read,save,runtimeLimit,resolveRuntimeLimit,recordLoad,expectedLoadSeconds,loadingStatus,HOSTED_DEFAULT_LIMIT,applySummary,measure,prepare,compactContinuation,providerError,CONTEXT_FULL_TEXT,STREAM_FAILED_TEXT,STREAM_FAILED_PARTIAL_TEXT};

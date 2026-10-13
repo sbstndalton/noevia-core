@@ -43,7 +43,7 @@ function load(hits, ragAvailable, extra = {}) {
   const src = fs.readFileSync(require.resolve('./rag.cjs'), 'utf8');
   const body = src.slice(src.indexOf('async function filesContext('), src.indexOf('\nmodule.exports'));
   const context = { DIRECT_INJECT_MAX: 2400, FILES_CONTEXT_MAX_CHARS: 120000, LARGE_FILE_HEAD: 24000, documentNotice: () => '',
-    frameUntrusted: require('./prompt-framing.cjs').frameUntrusted, ragAvailable: () => ragAvailable, searchProject: async () => hits, ...extra };
+    frameUntrusted: require('./prompt-framing.cjs').frameUntrusted, ...require('./quoted-name.cjs'), ragAvailable: () => ragAvailable, searchProject: async () => hits, ...extra };
   vm.createContext(context); vm.runInContext(body, context);
   return context;
 }
@@ -52,15 +52,34 @@ test('filesContext reports retrieved excerpts (with score) and whole small files
   const files = [{ name: 'small.md', content: 'tiny note' }, { name: 'big.txt', content: 'Z'.repeat(5000) }];
   let placed = null;
   const text = await load([{ file: 'big.txt', body: 'EXCERPT', score: 0.7 }, { file: 'gone.md', body: 'STALE', score: 0.9 }], true)
-    .filesContext('p', files, 'q', 'tenant', (p) => { placed = p; });
+    .filesContext('p', files, 'q small.md', 'tenant', (p) => { placed = p; });
   assert.deepEqual(Array.from(placed, (p) => [p.file, p.kind, p.score]), [['big.txt', 'excerpt', 0.7], ['small.md', 'file', undefined]]);
   assert.ok(!text.includes('STALE'));
+});
+
+test('#1457: a whole file the question does not name is injected but not reported as a source', async () => {
+  const files = [{ name: 'small.md', content: 'tiny note' }, { name: 'big.txt', content: 'Z'.repeat(5000) }];
+  let placed = null;
+  const text = await load([], false).filesContext('p', files, 'Name three colours of the rainbow', 'tenant', (p) => { placed = p; });
+  assert.match(text, /label="small\.md"/, 'still in the prompt');
+  assert.equal(placed.length, 0, 'no source chip for a file the question did not name');
+});
+
+test('#1457/#1513: an unnamed file head is not a reported source but is reported as injected', async () => {
+  const files = [{ name: 'small.md', content: 'tiny note' }, { name: 'big.txt', content: 'Z'.repeat(30000) }];
+  let placed = null, injected = null;
+  const text = await load([], false).filesContext('p', files, 'Is HERON-9001 anywhere?', 't', (p, i) => { placed = p; injected = i; });
+  assert.match(text, /label="big\.txt"/, 'the head of the large file is in the prompt');
+  assert.equal(placed.length, 0, 'neither file is named, so neither is a source chip');
+  assert.deepEqual(Array.from(injected, (e) => [e.file, e.kind, e.body.length]), [['small.md', 'file', 9], ['big.txt', 'file', 24000]]);
+  const { partialSources } = require('./source-coverage.cjs');
+  assert.deepEqual(partialSources(files, injected), [{ name: 'big.txt', length: 30000, read: 24000 }], 'the head counts as read');
 });
 
 test('without retrieval the fallback heads that reach the prompt are reported; omitted files are not', async () => {
   const files = [{ name: 'big.txt', content: 'Z'.repeat(5000) }, { name: 'huge.txt', content: 'Y'.repeat(5000) }];
   let placed = null;
-  await load([], false, { FILES_CONTEXT_MAX_CHARS: 5300 }).filesContext('p', files, 'q', 't', (p) => { placed = p; });
+  await load([], false, { FILES_CONTEXT_MAX_CHARS: 5300 }).filesContext('p', files, 'q big.txt huge.txt', 't', (p) => { placed = p; });
   assert.equal(placed.length, 1, 'the file that did not fit the prompt budget is not claimed as a source');
   assert.equal(placed[0].kind, 'file');
 });
@@ -68,4 +87,51 @@ test('without retrieval the fallback heads that reach the prompt are reported; o
 test('a throwing onSources hook never breaks the prompt', async () => {
   const text = await load([], false).filesContext('p', [{ name: 'a.md', content: 'x' }], 'q', 't', () => { throw new Error('boom'); });
   assert.match(text, /Sources attached/);
+});
+
+test('#1616: skill pins and sources inside stored alternatives are cleaned by the same rules as the turn itself', () => {
+  const pin = `skill_${'1'.repeat(32)}@${'e'.repeat(64)}`;
+  const long = 'z'.repeat(999);
+  const bad = { id: 'x', file: 'a.md', snippet: long, kind: 'weird', score: 'high', extra: 'drop' };
+  const [turn] = sanitizeHistory([{
+    role: 'user', content: 'q', skill: pin,
+    answers: [{ content: 'a1', sources: [bad], skill: pin }, { content: 'a2', sources: 'junk' }],
+    answer: 0,
+    branches: [
+      { content: 'v0', skill: { label: 'not a pin' }, sources: [bad], answers: [{ content: 'va', sources: [bad, { snippet: 'no file' }] }], answer: 0,
+        tail: [
+          { role: 'user', content: 't-u', skill: 'skill_1@2', sources: [bad] },
+          { role: 'assistant', content: 't-a', skill: pin, sources: [bad, { snippet: 'no file' }], answers: [{ content: 'ta1', sources: [bad] }], answer: 0 },
+        ] },
+      { content: 'v1', skill: pin, tail: [] },
+    ],
+    branch: 1,
+  }]);
+  assert.equal(turn.skill, pin);
+  assert.equal(turn.answers[0].sources.length, 1);
+  assert.equal(turn.answers[0].sources[0].snippet.length <= SNIPPET_MAX, true, 'answer sources are re-bounded');
+  assert.deepEqual(Object.keys(turn.answers[0].sources[0]).sort(), ['file', 'id', 'kind', 'snippet']);
+  assert.equal('skill' in turn.answers[0], false, 'a pin is never kept on an assistant reply');
+  assert.equal('sources' in turn.answers[1], false);
+  const [v0, v1] = turn.branches;
+  assert.equal('skill' in v0, false, 'a malformed pin on a version is dropped');
+  assert.equal('sources' in v0, false, 'sources are never kept on a user version');
+  assert.equal(v1.skill, pin, 'an exact pin on a version stays');
+  assert.equal(v0.answers[0].sources.length, 1);
+  assert.equal(v0.answers[0].sources[0].file, 'a.md');
+  const [tu, ta] = v0.tail;
+  assert.equal('skill' in tu, false);
+  assert.equal('sources' in tu, false);
+  assert.equal('skill' in ta, false);
+  assert.equal(ta.sources.length, 1);
+  assert.equal(ta.sources[0].snippet.length <= SNIPPET_MAX, true);
+  assert.equal(ta.answers[0].sources[0].snippet.length <= SNIPPET_MAX, true);
+});
+
+test('#1616: a tail without variants of its own is cleaned too, and a clean history is returned untouched', () => {
+  const pin = `skill_${'2'.repeat(32)}@${'d'.repeat(64)}`;
+  const [turn] = sanitizeHistory([{ role: 'user', content: 'q', branches: [{ content: 'v', tail: [{ role: 'user', content: 'u', skill: 'bad' }] }], branch: 0 }]);
+  assert.equal('skill' in turn.branches[0].tail[0], false);
+  const clean = { role: 'user', content: 'q', skill: pin, answers: [{ content: 'a' }], answer: 0, branches: [{ content: 'v', skill: pin, tail: [{ role: 'assistant', content: 'r' }] }], branch: 0 };
+  assert.equal(sanitizeHistory([clean])[0], clean);
 });

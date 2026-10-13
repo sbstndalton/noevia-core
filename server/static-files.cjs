@@ -73,7 +73,9 @@ function createStaticFiles(root) {
     return null;
   }
 
-  function send(req, res, filePath, urlPath) {
+  // `status` is 200 for a file or the shell; the app's not-found page is the shell sent as a 404
+  // (#1469), which skips the conditional-GET path because a 304 would drop the status.
+  function send(req, res, filePath, urlPath, status = 200) {
     const file = entry(filePath);
     const hashed = urlPath.startsWith('/assets/');
     const encoding = encodingFor(req, file);
@@ -88,14 +90,14 @@ function createStaticFiles(root) {
     };
     if (Object.keys(file.encoded).length) headers.Vary = 'Accept-Encoding';
     const tags = String(req.headers['if-none-match'] || '').split(',').map((t) => t.trim().replace(/^W\//, ''));
-    if (tags.includes(headers.ETag) || tags.includes('*')) {
+    if (status === 200 && (tags.includes(headers.ETag) || tags.includes('*'))) {
       res.writeHead(304, headers);
       return res.end();
     }
     const body = encoding ? file.encoded[encoding] : file.body;
     if (encoding) headers['Content-Encoding'] = encoding;
     headers['Content-Length'] = body.length;
-    res.writeHead(200, headers);
+    res.writeHead(status, headers);
     res.end(req.method === 'HEAD' ? undefined : body);
   }
 

@@ -145,6 +145,8 @@ const STORAGE_TOOL = /^nc_webdav_/;
 const TREE_TOOL = /^nc_webdav_(?:search_files|find_by_name|find_by_type)$/;
 const recursiveArgs = (args) => Object.entries(args || {}).some(([k, v]) => /recurs|depth|deep/i.test(k) && v !== false && v !== 0 && v !== '0' && v !== 1 && v !== '1' && v !== null);
 const PATH_KEY = /path|dir|folder|file|scope|source|destination|target|href|url|location|from|to$/i;
+// An argument that names a file, folder or comment by its numeric or opaque id (#1213).
+const ID_ARG = /id(s)?$|^(item|node|uid|ref)s?$/i;
 
 const MAX_PATH_UNITS = 4096;
 
@@ -206,9 +208,22 @@ function toolRefusalJs({ provider, toolName, rawArgs, storage }) {
   let args;
   try { args = typeof rawArgs === 'string' ? JSON.parse(rawArgs || '{}') : rawArgs || {}; } catch { return `ERROR: ${name} arguments could not be read, so it was not run.`; }
   const paths = pathArguments(args);
+  // #1213: the path check only sees path-like arguments. A call that addresses its file by id
+  // (fileId, id, a comment's file) or names no path at all (nc_webdav_list_favorites, which lists the
+  // account's favourites across every folder) cannot be checked against the Diary folder, so it is
+  // refused for an external provider. A path-less listing of the root stays allowed (names only).
+  const argKeys = Object.keys(args && typeof args === 'object' ? args : {});
+  if (argKeys.some((key) => ID_ARG.test(key))) {
+    return `ERROR: ${name} was not run: it addresses a file by id, which cannot be checked against the Diary folder, and Diary content is never sent to ${label}. Use a path outside the Diary, or a local model.`;
+  }
   const tree = TREE_TOOL.test(name) || recursiveArgs(args);
   // A search with no folder to search in would search the Diary too.
   if (tree && !paths.length) return `ERROR: ${name} needs a folder to search in when used with ${label}, so it was not run. Search a specific folder outside the Diary.`;
+  // The only path-less call allowed is the bare listing of the root: any other argument could be
+  // a file id under a name this check does not know.
+  if (!paths.length && !(name === 'nc_webdav_list_directory' && argKeys.length === 0)) {
+    return `ERROR: ${name} was not run: it names no path, so the Diary folder cannot be ruled out, and Diary content is never sent to ${label}. Name a folder outside the Diary, or use a local model.`;
+  }
   for (const value of paths) {
     // #1209: no real path is this long, and the URL regex below is quadratic in it. Refused as if
     // it were in the Diary folder (fail closed).

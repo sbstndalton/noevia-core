@@ -23,11 +23,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          ref=592d94a7dc6373d2adf188547c079d69b47f3d28
+          ref=c90210ee5be06024b2a4b477e60db188247aba33
           status=$(gh api "repos/sbstndalton/noevia-rs/compare/$ref...main" --jq .status)
           case "$status" in identical|ahead) ;; *) echo 'Acceptance source is not on merged main'; exit 1 ;; esac
           curl -fsSL "https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/$ref" -o "$RUNNER_TEMP/reasoning-rs.tgz"
-          echo "74be654e0f943b7ec43e3ac06099a3c39257f8f772b42636d49ea445eec382bb  $RUNNER_TEMP/reasoning-rs.tgz" | sha256sum -c -
+          echo "a5c04fc61927ce9fd0e4425f6aa6923bfaa40f14bbe06b136b120197682b2411  $RUNNER_TEMP/reasoning-rs.tgz" | sha256sum -c -
           mkdir rs
           tar -xzf "$RUNNER_TEMP/reasoning-rs.tgz" --strip-components=1 -C rs
           echo "CORE_ACCEPTANCE_RS=$GITHUB_WORKSPACE/rs" >> "$GITHUB_ENV"

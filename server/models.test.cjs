@@ -37,7 +37,7 @@ test('modelsInstalled hides hash duplicates, marks loaded models and remembers t
   assert.equal(f.service.lastLoadedModel(), null);
   const installed = await f.service.modelsInstalled();
   assert.deepEqual(installed.map((m) => m.name), ['embed-1', 'chat-7b', 'failed-x']);
-  assert.deepEqual(installed[1], { name: 'chat-7b', sizeGB: 4.3, loaded: true, labels: [], mtp: installed[1].mtp, maxContext: 8192, suggested: true, status: 'loaded', failed: false, canDelete: false, sidecarProtected: false, missingFile: false, servedElsewhere: false, shape: null, source: null });
+  assert.deepEqual(installed[1], { name: 'chat-7b', sizeGB: 4.3, loaded: true, labels: [], system: false, mtp: installed[1].mtp, maxContext: 8192, suggested: true, status: 'loaded', failed: false, canDelete: false, sidecarProtected: false, missingFile: false, servedElsewhere: false, shape: null, source: null });
   assert.equal(installed[0].sizeGB, 0.6);
   assert.equal(installed[2].status, 'failed');
   assert.equal(installed[2].failed, true);

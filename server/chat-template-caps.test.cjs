@@ -60,7 +60,9 @@ test('failureText shows the sanitised upstream reason, per kind', { skip: skipWa
   const leaky = caps.failureText(500, '{"error":"failed at http://10.1.2.3:8080/v1 key=sk-synthetic000000"}');
   assert.doesNotMatch(leaky, /10\.1\.2\.3|sk-synthetic|http:/);
   // Off: only this text change remains.
-  assert.equal(caps.failureText(422, '{"detail":"temperature must be <= 2"}'), 'The model provider refused the request: temperature must be <= 2. Partial output was preserved.');
+  // #1547: the preserved-output sentence only when text was shown for this reply.
+  assert.equal(caps.failureText(422, '{"detail":"temperature must be <= 2"}'), 'The model provider refused the request: temperature must be <= 2.');
+  assert.equal(caps.failureText(422, '{"detail":"temperature must be <= 2"}', { partial: true }), 'The model provider refused the request: temperature must be <= 2. Partial output was preserved.');
 });
 
 test('the tools gate reads /props once per model, caches, and treats unknown as allowed', { skip: skipWasm }, async () => {
@@ -266,4 +268,26 @@ test('the non-streaming fallback sends no tools when the template gate dropped t
   const fallback = e.bodies.filter((b) => b.stream === false);
   assert.ok(fallback.length >= 1);
   assert.ok(e.bodies.every((b) => b.tools === undefined && b.tool_choice === undefined));
+});
+
+// #1553: a reply whose template cannot take tools says so to the model too, so it does not claim the tool does
+// not exist or write results for it. A template that takes tools gets no such note.
+test('#1553 a template that cannot take tools: the model is told no tools run in this reply, and it is not sent any', { skip: skipWasm }, async (t) => {
+  davParseWasm.reset();
+  const e = engine(toolsRefused);
+  await chatWith(t, { fetch: e.fetch, props: async () => ({ ok: true, body: { chat_template: GEMMA3 } }) });
+  assert.equal(e.bodies.length, 1);
+  assert.equal(e.bodies[0].tools, undefined);
+  const system = e.bodies[0].messages.filter((m) => m.role === 'system').map((m) => m.content).join('\n');
+  assert.match(system, /No tools can run in this reply/);
+  assert.match(system, /Do not write results, sources, excerpts or simulated output/);
+});
+
+test('#1553 a template that takes tools: the request carries no tools note', { skip: skipWasm }, async (t) => {
+  davParseWasm.reset();
+  const e = engine(() => sse());
+  await chatWith(t, { fetch: e.fetch, props: async () => ({ ok: true, body: { chat_template: QWEN } }) });
+  assert.equal(e.bodies.length, 1);
+  assert.ok(e.bodies[0].tools, 'tools are sent');
+  assert.doesNotMatch(JSON.stringify(e.bodies[0].messages), /No tools can run in this reply/);
 });

@@ -16,6 +16,7 @@ const crypto = require('crypto');
 const { frameUntrusted } = require('./prompt-framing.cjs');
 const { notice: documentNotice } = require('./document-sources.cjs');
 const { readCappedText, readCappedJson } = require('./http.cjs');
+const { quoteName, quotedNames } = require('./quoted-name.cjs');
 
 // Injected by init() from index.cjs (keeps this module testable standalone).
 let RAG_DIR = null;
@@ -579,6 +580,18 @@ async function searchProject(projectId, query, userId) {
 // for anything <= DIRECT_INJECT_MAX). Never throws. `{ attached: true }` words it for a chat's own attachments.
 async function filesContext(projectId, files, query, userId, onSources, { attached = false } = {}) {
   if (!Array.isArray(files) || files.length === 0) return null;
+  // #1457: whether the question names a file, by its full stored name or its last path segment, as a
+  // whole token ("data.md" is not named by "mydata.md" or "data.md.bak"). Whole files are reported as
+  // sources only when named: every small file is injected whole whatever the question, so the prompt
+  // cannot say which of them an answer drew on, and naming the file is the one signal we have.
+  // (Defined inside the function, not beside it: unreadable-sources.test.cjs runs this body as a slice.)
+  const questionNames = (name) => {
+    const q = String(query || '').toLowerCase();
+    const escape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const whole = (s) => new RegExp(`(?<![a-z0-9_.\\-])${escape(s)}(?![a-z0-9_\\-]|\\.[a-z0-9])`);
+    const full = String(name).toLowerCase();
+    return whole(full).test(q) || whole(full.split('/').pop()).test(q);
+  };
   const small = files.filter((f) => String(f.content || '').length <= DIRECT_INJECT_MAX);
   const large = files.filter((f) => String(f.content || '').length > DIRECT_INJECT_MAX);
 
@@ -589,19 +602,20 @@ async function filesContext(projectId, files, query, userId, onSources, { attach
   // attached. The manifest costs a few tokens and settles it.
   // `attached`: a free chat's own attachments (#1441). They are the user's files for this chat, not a
   // project's knowledge, and are worded that way so a small model does not deny having them.
-  let manifest = `${attached ? 'The user attached these files to this chat' : 'Sources attached to this project'} (${files.length}): ${files
-    .map((f) => `"${f.name}"`)
-    .join(', ')}. Excerpts of the relevant ones follow; ask to read a file in full if you need more of it.`;
+  let manifest = `${attached ? 'The user attached these files to this chat' : 'Sources attached to this project'} (${files.length}): ${quotedNames(files.map((f) => f.name))}. Excerpts of the relevant ones follow; ask to read a file in full if you need more of it.`;
 
-  const notices = files.map(f => documentNotice(f) || (f.attachment?.reason ? `${f.name}: ${f.attachment.reason}` : '')).filter(Boolean);
+  const notices = files.map(f => documentNotice(f) || (f.attachment?.reason ? `${quoteName(f.name)}: ${f.attachment.reason}` : '')).filter(Boolean);
   const parts = [];
-  // What is placed in the prompt, in order, for the caller's optional onSources (#552).
+  // What is placed in the prompt, in order, for the caller's optional onSources (#552): `placed` is what
+  // the reply reports as its sources (#1457: a whole file or a file head only when the question names it),
+  // `injected` is everything the prompt holds, which is what a coverage check must count (#1513).
   const placed = [];
+  const injected = [];
   if (ragAvailable() && large.length > 0) {
     const hits = await searchProject(projectId, query, userId);
     if (hits.length > 0) {
       const permitted = new Set(files.map(f => f.name));
-      for (const h of hits) if (permitted.has(h.file)) { parts.push(frameUntrusted('excerpt', h.file, h.body)); placed.push({ file: h.file, body: h.body, score: h.score, kind: 'excerpt' }); }
+      for (const h of hits) if (permitted.has(h.file)) { parts.push(frameUntrusted('excerpt', h.file, h.body)); const e = { file: h.file, body: h.body, score: h.score, kind: 'excerpt' }; placed.push(e); injected.push(e); }
     }
   }
   // Whole small files (and, without hits, the head of each large file) are
@@ -613,11 +627,12 @@ async function filesContext(projectId, files, query, userId, onSources, { attach
   candidates.sort((a, b) => a.text.length - b.text.length);
   const omitted = [];
   for (const c of candidates) {
-    if (c.text.length <= budget) { parts.push(c.text); budget -= c.text.length; placed.push({ file: c.f.name, body: c.body, kind: 'file' }); }
+    // #1457: injected either way, but reported as a source only when the question names it.
+    if (c.text.length <= budget) { parts.push(c.text); budget -= c.text.length; const e = { file: c.f.name, body: c.body, kind: 'file' }; injected.push(e); if (questionNames(c.f.name)) placed.push(e); }
     else omitted.push(c.f.name);
   }
-  if (omitted.length) manifest += ` ${omitted.length} more file${omitted.length === 1 ? '' : 's'} not included (prompt size limit): ${omitted.map((n) => `"${n}"`).join(', ')}.`;
-  if (typeof onSources === 'function') { try { onSources(placed); } catch { /* a reporting hook never breaks the prompt */ } }
+  if (omitted.length) manifest += ` ${omitted.length} more file${omitted.length === 1 ? '' : 's'} not included (prompt size limit): ${quotedNames(omitted)}.`;
+  if (typeof onSources === 'function') { try { onSources(placed, injected); } catch { /* a reporting hook never breaks the prompt */ } }
   const coverage = 'Source completeness: ' + (notices.join('\n') || 'Legacy text sources have no page completeness metadata.') + '\nContext may contain excerpts only. Use read_project_file with PDF startPage/endPage and offset for pages beyond the summary. Do not treat missing excerpts or failed/partial sources as evidence of absence.';
   return parts.length ? [manifest, coverage, ...parts].join('\n\n') : [manifest, coverage].join("\n");
 }

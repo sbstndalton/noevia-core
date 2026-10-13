@@ -3,12 +3,14 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { normalizeReplayHistory } = require('./chat.cjs');
 
-test('merges adjacent user turns (errored/cancelled reply or two-device merge) with the new message', () => {
+test('adjacent user turns (an errored or cancelled reply) stay separate, the earlier ones marked abandoned (#1448)', () => {
   const result = normalizeReplayHistory(
     [{ role: 'user', content: 'first attempt' }, { role: 'user', content: 'retry' }],
     'new message',
   );
-  assert.deepEqual(result, [{ role: 'user', content: 'first attempt\n\nretry\n\nnew message' }]);
+  assert.deepEqual(result.map((m) => m.role), ['user', 'assistant', 'user', 'assistant', 'user']);
+  assert.deepEqual([result[0].content, result[2].content, result[4].content], ['first attempt', 'retry', 'new message']);
+  assert.match(result[1].content, /^\(No reply was kept for the message above/);
 });
 
 test('drops a leading assistant turn and merges the trailing pair', () => {
@@ -35,23 +37,23 @@ test('system messages, if present, pass through untouched', () => {
     [{ role: 'system', content: 'be nice' }, { role: 'user', content: 'hi' }],
     'again',
   );
-  assert.deepEqual(result, [
-    { role: 'system', content: 'be nice' },
-    { role: 'user', content: 'hi\n\nagain' },
-  ]);
+  assert.deepEqual(result.map((m) => m.role), ['system', 'user', 'assistant', 'user']);
+  assert.deepEqual([result[1].content, result[3].content], ['hi', 'again']);
+  assert.match(result[2].content, /^\(No reply was kept/);
 });
 
 test('with no history, only the new user message is emitted', () => {
   assert.deepEqual(normalizeReplayHistory([], 'solo'), [{ role: 'user', content: 'solo' }]);
 });
 
-test('compactOnly (no new message) still merges and drops a leading assistant turn', () => {
+test('compactOnly (no new message) drops a leading assistant turn and keeps abandoned prompts apart (#1448)', () => {
   const result = normalizeReplayHistory([
     { role: 'assistant', content: 'stray' },
     { role: 'user', content: 'a' },
     { role: 'user', content: 'b' },
   ]);
-  assert.deepEqual(result, [{ role: 'user', content: 'a\n\nb' }]);
+  assert.deepEqual(result.map((m) => m.role), ['user', 'assistant', 'user']);
+  assert.deepEqual([result[0].content, result[2].content], ['a', 'b']);
 });
 
 test('tool messages fold into the assistant turn they belong to, keeping alternation (#121)', () => {
@@ -74,5 +76,6 @@ test('an orphan tool message with no assistant turn to attach to is dropped (#12
     { role: 'user', content: 'q' },
     { role: 'tool', content: 'after user' },
   ], 'next');
-  assert.deepEqual(result, [{ role: 'user', content: 'q\n\nnext' }]);
+  assert.deepEqual(result.map((m) => m.role), ['user', 'assistant', 'user']);
+  assert.deepEqual([result[0].content, result[2].content], ['q', 'next'], 'the abandoned prompt is not merged (#1448)');
 });

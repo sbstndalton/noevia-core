@@ -106,7 +106,7 @@ test('a reload mid-reply keeps the user message and the partial reply (no write 
   assert.equal(history[1].toolCalls, undefined);
 });
 
-test('a reload while the model is still thinking keeps the turn as the Stopped placeholder', async (t) => {
+test('a reload while the model is still thinking keeps the thinking as an interrupted turn (#1507)', async (t) => {
   const h = harness(t);
   store(h.a, 'chat-679', [{ role: 'user', content: 'earlier' }, { role: 'assistant', content: 'earlier answer' }, USER]);
   h.state.turns.push([think('Let me consider'), DISCONNECT]);
@@ -114,8 +114,10 @@ test('a reload while the model is still thinking keeps the turn as the Stopped p
   const history = readStored(h.a, 'chat-679');
   assert.equal(history.length, 4);
   assert.deepEqual(history.slice(0, 3).map((e) => e.content), ['earlier', 'earlier answer', USER.content]);
-  assert.deepEqual({ role: history[3].role, content: history[3].content, model: history[3].model, reasoning: history[3].reasoning },
-    { role: 'assistant', content: '', model: 'Stopped', reasoning: undefined }, 'the language-neutral Stopped token (#634), which keeps Regenerate');
+  // #1507 changed this: the thinking written before the reload is kept (it is what the person saw),
+  // marked interrupted, so the reply is offered for Retry instead of reading as an empty "Stopped".
+  assert.deepEqual({ role: history[3].role, content: history[3].content, model: history[3].model, reasoning: history[3].reasoning, interrupted: history[3].interrupted },
+    { role: 'assistant', content: '', model: 'Stopped', reasoning: 'Let me consider', interrupted: true }, 'an interrupted turn keeps its thinking (#1507), still under the Stopped sender (#634)');
 });
 
 test('a reload after an approved write keeps its applied record and the "1 change was saved" note', async (t) => {
@@ -247,4 +249,23 @@ test('the record follows the stream the way the client does', () => {
   declined.observe({ type: 'paused', reason: 'declined', applied: 0, declined: ['synthetic_append', 'bad name"'] });
   assert.deepEqual(declined.assistantEntry().paused, { reason: 'declined', applied: 0, declined: ['synthetic_append'] });
   assert.equal(saveInterruptedTurn({ fs, workspace: null, chatId: 'x', message: 'm', entry: {} }), 'no-chat');
+});
+
+test('#1438: a saved interrupted turn keeps the cause of a check that could not answer, and nothing else', () => {
+  const kept = createTurnRecord();
+  kept.observe({ type: 'meta', route: 'local', routing: { route: 'local', reason: 'check-unavailable', detail: 'deadline' } });
+  kept.observe({ type: 'delta', text: 'Answer.' });
+  assert.deepEqual(kept.assistantEntry().routeTarget, { route: 'local', reason: 'check-unavailable', detail: 'deadline' });
+
+  // A cause only rides with check-unavailable, as the live reply's meta does.
+  const otherReason = createTurnRecord();
+  otherReason.observe({ type: 'meta', route: 'local', routing: { route: 'local', reason: 'mode', detail: 'deadline' } });
+  otherReason.observe({ type: 'delta', text: 'Answer.' });
+  assert.deepEqual(otherReason.assistantEntry().routeTarget, { route: 'local', reason: 'mode' });
+
+  // Only the badge's code shape is kept; anything else is dropped rather than stored.
+  const malformed = createTurnRecord();
+  malformed.observe({ type: 'meta', route: 'local', routing: { route: 'local', reason: 'check-unavailable', detail: 'Bad Cause!' } });
+  malformed.observe({ type: 'delta', text: 'Answer.' });
+  assert.deepEqual(malformed.assistantEntry().routeTarget, { route: 'local', reason: 'check-unavailable' });
 });

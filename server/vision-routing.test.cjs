@@ -10,7 +10,8 @@ const { createChatHandler } = require('./chat.cjs');
 const contextDir=fs.mkdtempSync(require('node:path').join(require('node:os').tmpdir(),'chat-handler-test-'));
 test.after(()=>fs.rmSync(contextDir,{recursive:true,force:true}));
 
-async function run({ visionModel, probeStatus = 200, descriptionStatus = 200, missingAsset = false, finishReason = 'stop', cache = new Map(), headers = {}, replacementBytes, userId = 'synthetic-user', projectId = 'fixture-project', native = false } = {}) {
+async function run({ visionModel, probeStatus = 200, descriptionStatus = 200, missingAsset = false, finishReason = 'stop', cache = new Map(), headers = {}, replacementBytes, userId = 'synthetic-user', projectId = 'fixture-project', native = false,
+  assets = [{ id: 'image-a', name: 'statement.png', mime: 'image/png' }, { id: 'image-b', name: 'copy.png', mime: 'image/png' }], files = [], turnImageIds, expectImages = true, message = 'Read the synthetic total' } = {}) {
   const events = [], requests = [], nativeCalls=[];let nativeLoaded=null;
   const res = new EventEmitter();
   res.writeHead = () => {};
@@ -20,7 +21,7 @@ async function run({ visionModel, probeStatus = 200, descriptionStatus = 200, mi
   const fetch = async (url, opts) => {
     assert.equal(url, 'http://fixture.invalid/v1/chat/completions');
     const body = JSON.parse(opts.body); requests.push(body);nativeLoaded=body.model;
-    if (!missingAsset) assert.ok(events.some(e => e.type === 'status' && /Reading image/.test(e.text)), 'image preparation must be visible before waiting for inference');
+    if (!missingAsset && expectImages) assert.ok(events.some(e => e.type === 'status' && /Reading image/.test(e.text)), 'image preparation must be visible before waiting for inference');
     if (body.stream) return { ok: true, body: (async function* () {
       yield Buffer.from('data: ' + JSON.stringify({ choices: [{ delta: { content: 'Synthetic answer' } }] }) + '\n\n');
     })() };
@@ -36,9 +37,7 @@ async function run({ visionModel, probeStatus = 200, descriptionStatus = 200, mi
     fs: { readFileSync: () => { if (missingAsset) throw new Error('missing fixture'); return bytes; } },
     HISTORY_CAP: 20, DEFAULT_PROVIDER_ID: 'default', createToolExchange,
     currentWorkspace: () => ({ userId, dir:contextDir, assetDir: () => '/synthetic-only' }),
-    getProject: () => ({ id: projectId, model: 'answer-model', assets: [
-      { id: 'image-a', name: 'statement.png', mime: 'image/png' }, { id: 'image-b', name: 'copy.png', mime: 'image/png' },
-    ] }),
+    getProject: () => ({ id: projectId, model: 'answer-model', assets, files }),
     skillsIndexFor: () => [], getProvider: () => ({ id: 'default', baseUrl: 'http://fixture.invalid' }),
     providerHeaders: () => headers, autoRoles: () => visionModel ? { vision: visionModel } : null,
     visionDescriptions: cache, visionProbe: createVisionProbe({ fetchImpl: fetch }),
@@ -60,7 +59,7 @@ async function run({ visionModel, probeStatus = 200, descriptionStatus = 200, mi
     allToolboxes: () => [], executeToolCall: async () => '', chatWideApproved: () => false, awaitApproval: async () => 'decline', recordUsage() {}, recordToolUse() {},
     ...context,
   });
-  await handleChat({}, res, { projectId: 'fixture-project', chatId: 'fixture-chat', message: 'Read the synthetic total' });
+  await handleChat({}, res, { projectId: 'fixture-project', chatId: 'fixture-chat', message, ...(turnImageIds === undefined ? {} : { turnImageIds }) });
   assert.ok(events.some(e => e.type === 'done'));
   return { events, requests, nativeCalls, answer: requests.find(r => r.stream) };
 }
@@ -119,4 +118,56 @@ test('description cache reuses exact inputs but isolates credential, content, us
 test('native one-model router can switch from vision description to answer context',async()=>{
  const out=await run({native:true,visionModel:'vision-model'});
  assert.match(out.answer.messages[0].content,/INV-2042 total 34.95/);assert.equal(out.answer.model,'answer-model');assert.ok(out.nativeCalls.some(url=>url.endsWith('/models/load')));assert.equal(out.events.find(e=>e.type==='context').limit,32768);
+});
+
+// #1512: text, CSV, JSON and DOCX attachments waited at "Reading image sources" because the PROJECT
+// held image sources, and every project image was described on every turn (cache keyed on the
+// question, so a new message is always a miss, and a vision model swap). A turn now names the image
+// sources it attaches (turnImageIds, like turnToolboxes); the others are named, never described.
+// Without the field nothing changes. Synthetic fixtures only.
+const CSV_FILE = [{ name: 'qa_sales.csv', content: 'item,qty\nsynthetic widget,3', attachment: { id: 'a'.repeat(64), state: 'ready', group: 'Text', bytes: 28 } }];
+const systemText = (out) => out.answer.messages.filter((m) => m.role === 'system').map((m) => m.content).join('\n');
+const noVisionWork = (out) => out.requests.filter((r) => !r.stream).length === 0;
+const readingImages = (out) => out.events.some((e) => e.type === 'status' && /Reading image/.test(e.text));
+
+test('#1512: a text or CSV attachment in a project with no image sources never enters the image step', async () => {
+  const out = await run({ assets: [], files: CSV_FILE, expectImages: false, message: 'Which item has the highest qty?' });
+  assert.ok(noVisionWork(out), 'no vision description and no image probe');
+  assert.equal(readingImages(out), false);
+  assert.ok(out.events.some((e) => e.type === 'status' && e.id === 'preparing'));
+});
+
+test('#1512: a text-only follow-up does not describe or send the project images when the turn names none', async () => {
+  const out = await run({ visionModel: 'vision-model', turnImageIds: [], expectImages: false, message: 'Summarise the synthetic report in one line.' });
+  assert.ok(noVisionWork(out), 'no description call and no probe for the project images');
+  assert.equal(readingImages(out), false);
+  assert.equal(JSON.stringify(out.answer).includes('data:image'), false);
+  assert.match(systemText(out), /image sources \("statement\.png", "copy\.png"\) that are not attached to this message/);
+});
+
+test('#1512: a turn that names one image describes only that image and names the other', async () => {
+  const out = await run({ visionModel: 'vision-model', turnImageIds: ['image-a'], message: 'Read the synthetic total' });
+  const described = out.requests.filter((r) => !r.stream && r.max_tokens !== 1);
+  assert.equal(described.length, 1);
+  assert.equal(described[0].messages[0].content.filter((c) => c.type === 'image_url').length, 1);
+  assert.match(out.answer.messages[0].content, /INV-2042 total 34\.95/);
+  assert.match(systemText(out), /image sources \("copy\.png"\) that are not attached/);
+});
+
+test('#1512: turnImageIds is a short list of image source ids; anything else is a 400', () => {
+  const { requestShapeError } = require('./chat-mode.cjs');
+  assert.equal(requestShapeError({ message: 'x' }), null, 'absent is unchanged');
+  assert.equal(requestShapeError({ turnImageIds: [] }), null);
+  assert.equal(requestShapeError({ turnImageIds: ['image-a'] }), null);
+  const tooMany = Array.from({ length: 13 }, (_, i) => `image-${i}`);
+  for (const bad of ['image-a', [1], [''], tooMany, ['x'.repeat(81)]]) {
+    assert.equal(requestShapeError({ turnImageIds: bad })?.status, 400, JSON.stringify(bad).slice(0, 60));
+  }
+});
+
+test('#1512: a CSV attached to a turn in a project that holds images does not enter the image step when the turn names none', async () => {
+  const out = await run({ visionModel: 'vision-model', files: CSV_FILE, turnImageIds: [], expectImages: false, message: 'Which item in the CSV has the highest qty?' });
+  assert.ok(noVisionWork(out), 'the project images are not described for a CSV question');
+  assert.equal(readingImages(out), false);
+  assert.equal(JSON.stringify(out.answer).includes('data:image'), false);
 });

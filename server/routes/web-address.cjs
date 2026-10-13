@@ -3,6 +3,11 @@
 // GET  /api/instance                 -> { id } (public; lets a new address prove it reaches this server)
 // GET  /api/admin/web-address        -> current address, where it came from, earlier addresses
 // POST /api/admin/web-address        -> { origin, force? } check that it reaches this server, then save
+// POST /api/admin/web-address/remove -> { origin } drop one earlier address (#1460). 200 with the
+//   refreshed view plus { removed, passkeysAffected }; 400 for the current address or a bad body;
+//   404 when the address is not an earlier one. Admin only; the session/CSRF gate in index.cjs
+//   covers every non-GET request before this route runs. Passkeys made under the removed host must
+//   be registered again.
 const { isJsonObject, readCappedJson } = require('../http.cjs');
 
 function createWebAddressRoutes({ auth, json, readBody, fetchImpl = fetch, timeoutMs = 8000 }) {
@@ -23,6 +28,15 @@ function createWebAddressRoutes({ auth, json, readBody, fetchImpl = fetch, timeo
     if (path === '/api/instance' && req.method === 'GET') return json(res, 200, { id: auth.instanceId }), true;
     // Related Origin Requests: lets a renamed site keep using passkeys made under the old name.
     if (path === '/.well-known/webauthn' && req.method === 'GET') return json(res, 200, { origins: auth.relatedOrigins() }), true;
+    if (path === '/api/admin/web-address/remove') {
+      if (!authn || authn.user.role !== 'admin') return json(res, 403, { error: 'Administrator required' }), true;
+      if (req.method !== 'POST') return json(res, 405, { error: 'method not allowed' }), true;
+      const body = await readBody(req).catch(() => ({}));
+      if (!isJsonObject(body) || typeof body.origin !== 'string') return json(res, 400, { error: 'Choose an earlier address to remove.' }), true;
+      const result = auth.removeEarlierOrigin(body.origin, authn.user.id);
+      if (result.error) return json(res, result.status || 400, { error: result.error }), true;
+      return json(res, 200, { ...view(), removed: result.removed, passkeysAffected: result.passkeysAffected }), true;
+    }
     if (path !== '/api/admin/web-address') return false;
     if (!authn || authn.user.role !== 'admin') return json(res, 403, { error: 'Administrator required' }), true;
     if (req.method === 'GET') return json(res, 200, view()), true;

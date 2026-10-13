@@ -2,6 +2,7 @@
 // wire shape or a successful generic probe does not prove reasoning support.
 const crypto = require('node:crypto');
 const { readCappedText, discardBody } = require('./http.cjs');
+const thinkingBudget = require('./thinking-budget.cjs');
 // Only the start of a provider's 4xx body is checked for the rejected parameter (#903).
 const ERROR_BODY_CAP = 64 * 1024;
 const EFFORTS = ['default', 'low', 'high'];
@@ -26,14 +27,17 @@ function documented(provider, model) {
 function budgetFieldFor(provider) {
   return provider?.capabilities?.tokenBudgetField === 'max_completion_tokens' ? 'max_completion_tokens' : 'max_tokens';
 }
-function nativeThinking(provider, model) {
-  // Only the configured local llama.cpp/Lemonade endpoint and documented Qwen3 templates.
+// The configured local llama.cpp/Lemonade endpoint, whatever model it serves.
+function localEngine(provider) {
   try {
     const normalize = value => new URL(value).href.replace(/\/+$/, '');
     return ['lemonade','llamacpp'].includes(process.env.MODEL_MANAGER_KIND) &&
-      normalize(provider.baseUrl) === normalize(process.env.INFERENCE_BASE_URL) &&
-      /(?:^|[/_])qwen3(?:\.5)?[-_]/i.test(model);
+      normalize(provider.baseUrl) === normalize(process.env.INFERENCE_BASE_URL);
   } catch { return false; }
+}
+function nativeThinking(provider, model) {
+  // Only the configured local llama.cpp/Lemonade endpoint and documented Qwen3 templates.
+  return localEngine(provider) && /(?:^|[/_])qwen3(?:\.5)?[-_]/i.test(model);
 }
 function modeFor(provider, model, effort) {
   return effort === 'default' ? 'off' : (documented(provider, model) || nativeThinking(provider, model)) && !rejected.has(capabilityKey(provider, model)) ? 'real' : 'hint';
@@ -47,14 +51,42 @@ function requestBody(body, effort, mode, provider) {
   return { ...body, messages: [{ role: 'system', content: HINTS[effort] }, ...body.messages],
     ...(effort === 'high' ? { [budgetField]: body[budgetField] || body.max_tokens || 8192 } : {}) };
 }
-async function requestWithEffort(fetcher, url, options, body, provider, model, effort, report) {
+// #1475/#1477: the request that asks for the answer after a thinking cut. Tools are dropped so the
+// reply must be text; thinking is switched off where the template has a native switch (Qwen3 on the
+// local engine), and otherwise the system note asks for the answer without further reasoning.
+function forcedAnswerBody(request, provider, model) {
+  const { tools, tool_choice, ...rest } = request;
+  const messages = Array.isArray(request.messages) ? request.messages : [];
+  // The note goes last, so the engine keeps the prompt it already cached and does not re-prefill from the
+  // start while the reply's idle clock runs (#1585). Joined to a trailing user turn when there is one, so a
+  // strict template still sees alternating roles.
+  const last = messages[messages.length - 1];
+  const withNote = last?.role === 'user' && typeof last.content === 'string'
+    ? [...messages.slice(0, -1), { ...last, content: `${last.content}\n\n${thinkingBudget.FORCED_ANSWER}` }]
+    : [...messages, { role: 'user', content: thinkingBudget.FORCED_ANSWER }];
+  const body = { ...rest, stream: true, messages: withNote };
+  // Thinking is switched off on the local engine whatever the model: a template without the switch ignores
+  // it (the other local callers send it the same way), and no model or file name decides here (#1585).
+  if (localEngine(provider)) body.chat_template_kwargs = { ...rest.chat_template_kwargs, enable_thinking: false };
+  return body;
+}
+// thinkingCap (tokens, or null for no cap) is set by chat.cjs for the local engine only. Only a
+// streamed reply can be cut; a non-streamed one is returned as the engine sent it.
+async function requestWithEffort(fetcher, url, options, body, provider, model, effort, report, thinkingCap = null) {
   const explicitBudget=!!(body.max_tokens || body.max_completion_tokens);
   if(body.max_tokens && budgetFieldFor(provider)==='max_completion_tokens'){body={...body,max_completion_tokens:body.max_tokens};delete body.max_tokens;}
   let mode = modeFor(provider, model, effort);
   const key = capabilityKey(provider,model);
+  // #1585: a cap of 0 means the output budget leaves no room to think (a context of about 4,100 tokens or
+  // less). A reply with no tools is asked for its answer directly, in one request, instead of being cut at its
+  // first reasoning token and sent again. One with tools stays uncapped: the forced answer would drop them.
+  const noRoomToThink = thinkingCap === 0 && body.stream === true;
+  const answerDirectly = noRoomToThink && !(Array.isArray(body.tools) && body.tools.length);
+  if (noRoomToThink) thinkingCap = answerDirectly ? 0 : null;
   const prepare = () => {
-    const value=requestBody(body,effort,mode,provider);
+    let value=requestBody(body,effort,mode,provider);
     if (mode === 'hint' && !explicitBudget && rejectedBudget.has(key)) {delete value.max_tokens;delete value.max_completion_tokens;}
+    if (answerDirectly) value=forcedAnswerBody(value,provider,model);
     return value;
   };
   let request=prepare();
@@ -75,8 +107,16 @@ async function requestWithEffort(fetcher, url, options, body, provider, model, e
       response=await fetcher(url,{...options,body:JSON.stringify(request)});
     }
   }
-  report({type:'meta',reasoning:mode,reasoningEffort:effort,outputBudget:request.max_completion_tokens || request.max_tokens});
-  return response;
+  let capped = response;
+  if (thinkingCap !== null && !answerDirectly && request.stream === true && response.ok && response.body) {
+    capped = thinkingBudget.capReasoning(response, {
+      cap: thinkingCap,
+      retry: () => fetcher(url, { ...options, body: JSON.stringify(forcedAnswerBody(request, provider, model)) }),
+      onCut: () => report({ type: 'warning', text: 'Thinking reached its budget, so the answer was written without further reasoning.' }),
+    });
+  }
+  report({type:'meta',reasoning:mode,reasoningEffort:effort,outputBudget:request.max_completion_tokens || request.max_tokens,...(thinkingCap !== null ? { thinkingCap } : {})});
+  return capped;
 }
 
-module.exports = { nativeThinking, validEffort, resolveEffort, modeFor, requestBody, requestWithEffort };
+module.exports = { nativeThinking, validEffort, resolveEffort, modeFor, requestBody, requestWithEffort, forcedAnswerBody };

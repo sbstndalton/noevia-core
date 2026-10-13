@@ -17,6 +17,7 @@
 
 const PASS = Symbol('unhandled');
 const { isJsonObject } = require('../http.cjs');
+const { createSharedRead } = require('../short-read.cjs');
 // File-path options of a models.ini section and every spelling llama-server accepts for them (#1235).
 const PATH_OPTION_ALIASES = Object.fromEntries([
   ['model', ['model', 'm', 'LLAMA_ARG_MODEL']],
@@ -51,8 +52,31 @@ function clientMessage(e, fallback) {
  * @param {() => object} deps.currentWorkspace
  * @param {object} deps.service   models.cjs
  */
+// The Rust front owns GET /api/routing-default only while NOEVIA_RUST_ROUTING_DEFAULT=1 and the
+// supervisor has confirmed it (NOEVIA_RUST_ROUTING_DEFAULT_CONFIRMED=1), under NOEVIA_RUST_AUTH
+// with NOEVIA_FRONT=rust (the same conditions as routes/reasoning-settings.cjs enabledFrom).
+function routingDefaultRustOwned(env) {
+  return env.NOEVIA_FRONT === 'rust' && env.NOEVIA_RUST_AUTH === '1' && env.NOEVIA_RUST_AUTH_CONFIRMED === '1'
+    && env.NOEVIA_RUST_ROUTING_DEFAULT === '1' && env.NOEVIA_RUST_ROUTING_DEFAULT_CONFIRMED === '1';
+}
 function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe, reportedTokenRate, missingRoles, currentWorkspace, service, inferenceBudget = null, sweepGuardOptions = {} }) {
   const { modelScanCache, refreshModelScan, autoRoles, setAutoRoles, ensureRolesLoaded, servedCatalogue, modelsInstalled, deriveUserModelName, lastLoadedModel, clearLastLoadedModel, clearRoleReferences } = service;
+  // #1461: the installed list is shared for a moment (service.modelsInstalled). A decision that must confirm
+  // the engine's state right now (a delete that checks the model exists, a load that checks it is not missing)
+  // asks for a fresh read instead.
+  const modelsInstalledNow = () => (service.modelsInstalledFresh || modelsInstalled)();
+  // #1461/#1508: /api/stats costs five model-manager calls and every open tab polls it; one answer is shared
+  // for a moment. Any write under the model paths drops it, with the installed list.
+  const statsRead = createSharedRead(async () => {
+    const [gen, sys, mtpHealth, mtpMetrics, mtpModels] = await Promise.allSettled([
+      modelManager.enabled ? modelManager.stats() : Promise.resolve({ ok: false }),
+      modelManager.enabled ? modelManager.systemStats() : Promise.resolve({ ok: false }),
+      modelManager.enabled ? modelManager.health() : Promise.resolve({ok:false}),
+      modelManager.enabled ? modelManager.metrics() : Promise.resolve({ok:false}),
+      modelManager.enabled ? modelManager.listModels() : Promise.resolve({ok:false}),
+    ]);
+    return { gen, sys, mtpHealth, mtpMetrics, mtpModels };
+  }, 2000);
   const loaderHeaders = () => ({ 'Content-Type': 'application/json', ...(env.MODEL_LOADER_TOKEN ? { 'X-Model-Loader-Token': env.MODEL_LOADER_TOKEN } : {}) });
   // #873: the throughput sweep holds the inference maintenance gate for as long as it runs.
   const sweepGuard = typeof modelManager.holdMaintenance === 'function' ? require('../benchmark-sweep-guard.cjs').createSweepGuard({
@@ -65,19 +89,18 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
   const sweepAdopted = sweepGuard && env.MODEL_LOADER_URL ? sweepGuard.adopt().catch(() => false) : Promise.resolve(false);
 
   async function handle(req, res, { path: p, authn, url }) {
+    // #1461: a write that can change what the shared reads report drops them first, so the next read is not older than the write.
+    if (!['GET', 'HEAD'].includes(req.method || 'GET') && /^\/api\/(models|model-manager|auto-roles)(\/|$)/.test(p)) {
+      statsRead.clear();
+      if (service.invalidateModelReads) service.invalidateModelReads();
+    }
     if (p.startsWith('/api/models/') && !['GET', 'HEAD'].includes(req.method || 'GET') && authn.user.role !== 'admin') {
       return json(res, 403, { error: 'administrator required' });
     }
 
     // ── Optional model-manager statistics.
     if (p === '/api/stats') {
-      const [gen, sys, mtpHealth, mtpMetrics, mtpModels] = await Promise.allSettled([
-        modelManager.enabled ? modelManager.stats() : Promise.resolve({ ok: false }),
-        modelManager.enabled ? modelManager.systemStats() : Promise.resolve({ ok: false }),
-        modelManager.enabled ? modelManager.health() : Promise.resolve({ok:false}),
-        modelManager.enabled ? modelManager.metrics() : Promise.resolve({ok:false}),
-        modelManager.enabled ? modelManager.listModels() : Promise.resolve({ok:false}),
-      ]);
+      const { gen, sys, mtpHealth, mtpMetrics, mtpModels } = await statsRead.get();
       const g = gen.status === 'fulfilled' && gen.value.ok ? gen.value.body : {};
       const s = sys.status === 'fulfilled' && sys.value.ok ? sys.value.body : {};
       return json(res, 200, {
@@ -101,6 +124,9 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
     // The default mode new projects start in, and (on request) a one-off switch of every existing
     // project of this user to it. Per workspace, so tenants never touch each other's projects.
     if (p === '/api/routing-default') {
+      // M6 (#1305): the Rust front answers GET under its confirmed switch. Node refuses that GET
+      // before any workspace work, so a confirmed front is the only reader; PUT stays Node's.
+      if (req.method === 'GET' && routingDefaultRustOwned(env)) return json(res, 503, { error: 'Routing default is owned by the Rust front.' });
       const ws = currentWorkspace();
       if (req.method === 'GET') return json(res, 200, { routing: ws.preferences?.defaultRouting === 'manual' ? 'manual' : 'auto' });
       if (req.method === 'PUT') {
@@ -549,7 +575,7 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
       // installed list cannot be read (engine unreachable) this check is skipped and the
       // delete below is attempted anyway, same as before this existence check existed.
       let installed = null;
-      try { installed = await modelsInstalled(); } catch { installed = null; }
+      try { installed = await modelsInstalledNow(); } catch { installed = null; }
       const entry = Array.isArray(installed) ? installed.find((m) => m.name === body.name) : null;
       if (Array.isArray(installed) && !entry) return json(res, 404, { error: `model not found: ${body.name}` });
       // Unload first: a loaded model can refuse deletion or leave its file locked. Tolerate
@@ -597,7 +623,7 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
         // #545: a preset whose GGUF is gone can only fail to load. Unloading it stays allowed.
         if (verb === 'load') {
           let installed = null;
-          try { installed = await modelsInstalled(); } catch { installed = null; }
+          try { installed = await modelsInstalledNow(); } catch { installed = null; }
           if (Array.isArray(installed) && installed.find((m) => m.name === body.name)?.missingFile) return json(res, 409, { error: MISSING_MODEL_FILE_REASON });
         }
         if (verb === 'load' && body.mtp !== undefined && modelManager.kind === 'llamacpp') return json(res,400,{error:'Use the native preset editor to configure speculative decoding.'});
@@ -645,4 +671,4 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
   return modelRoutes;
 }
 
-module.exports = { createModelRoutes };
+module.exports = { createModelRoutes, routingDefaultRustOwned };

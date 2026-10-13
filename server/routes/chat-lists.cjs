@@ -3,6 +3,8 @@
 //   GET  /api/workspace                    the projects and free chats, chats[] sanitized, after the
 //                                          delete-old-chats sweep has had its hourly chance to run
 //   GET  /api/chats/:id/context-window     the last context meter recorded for a chat
+//   GET  /api/chats/:id/export             one chat as a Markdown file (#1471)
+//   GET  /api/chats/search?q=              the chat ids whose message text holds q (#1450)
 //   GET/POST /api/freechats                the free-chat metas, merged against tombstones
 //   DELETE /api/freechats/:id
 //   GET/POST /api/chats/:id/history        the transcript, with a revision for optimistic saves
@@ -13,6 +15,9 @@
 // Blocks keep their original order and an unmatched method falls through as it did inline.
 
 const PASS = Symbol('unhandled');
+const { saveFailureReply } = require('../http.cjs');
+// #1450: the transcript search's bounds (one query reads at most this many chats).
+const SEARCH_MIN_QUERY = 2, SEARCH_MAX_QUERY = 200, SEARCH_MAX_CHATS = 500, SEARCH_MAX_RESULTS = 100;
 
 /**
  * @param {object} deps
@@ -46,7 +51,36 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
     retention.markSwept(dir);
   }
 
-  async function handle(req, res, { path: p, authn }) {
+  async function handle(req, res, { path: p, authn, url }) {
+    // #1450: the chats whose message text holds the query. Titles are matched in the client; this covers the
+    // transcripts, which the sidebar does not load. Only this person's own lists are read, and the scan is capped.
+    if (p === '/api/chats/search' && req.method === 'GET') {
+      const q = String(url?.searchParams?.get('q') ?? '').trim();
+      if (q.length > SEARCH_MAX_QUERY) return json(res, 400, { error: `Search for at most ${SEARCH_MAX_QUERY} characters.` });
+      if (q.length < SEARCH_MIN_QUERY) return json(res, 200, { chats: [], truncated: false });
+      const needle = q.toLowerCase();
+      const dir = currentWorkspace().dir, lists = require('../chat-lists.cjs');
+      const tombstones = lists.readTombstones(dir);
+      const candidates = [];
+      for (const chat of FREE_CHATS) if (chat && typeof chat.id === 'string') candidates.push(chat);
+      for (const project of PROJECTS) {
+        if (diaryExtras.internalProject(project)) continue;
+        for (const chat of project.chats || []) if (chat && typeof chat.id === 'string') candidates.push(chat);
+      }
+      const matches = [];
+      let scanned = 0, truncated = false;
+      for (const chat of candidates) {
+        if (tombstones.has(chat.id)) continue;
+        if (scanned >= SEARCH_MAX_CHATS) { truncated = true; break; }
+        scanned++;
+        const history = store.readHistory(chat.id) || [];
+        if (history.some((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string' && m.content.toLowerCase().includes(needle))) {
+          matches.push(chat.id);
+          if (matches.length >= SEARCH_MAX_RESULTS) { truncated = true; break; }
+        }
+      }
+      return json(res, 200, { chats: matches, truncated });
+    }
     if (p === '/api/workspace') {
       try { sweepRetention(); } catch (e) { console.warn('[retention] sweep failed:', e?.message || e); }
       // Attachments projects of chats deleted before #788 (only provably deleted ones; bounded).
@@ -68,17 +102,58 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
       return json(res,200,{meter:require('../chat-context.cjs').read(dir,id).meter||null});
     }
 
+    // #1471: one chat as a Markdown file, from the same writer as the conversation export (chat-export.cjs).
+    // Only a chat in this person's own lists can be read; a deleted or unknown id answers 404.
+    const exportMatch = p.match(/^\/api\/chats\/([^/]+)\/export$/);
+    if (exportMatch) {
+      if (req.method !== 'GET') return PASS;
+      const rawId = decodeChatId(exportMatch[1]);
+      if (rawId === null) return badChatId(res);
+      const lists = require('../chat-lists.cjs');
+      const spaceId = lists.safeChatId(rawId);
+      if (!spaceId) return json(res, 400, { error: 'invalid chat id' });
+      const dir = currentWorkspace().dir;
+      let chat = FREE_CHATS.find((c) => c && c.id === spaceId) || null;
+      if (!chat && !lists.readTombstones(dir).has(spaceId)) {
+        for (const project of PROJECTS) {
+          if (diaryExtras.internalProject(project)) continue;
+          const hit = (project.chats || []).find((c) => c && c.id === spaceId);
+          if (hit) { chat = hit; break; }
+        }
+      }
+      if (!chat || lists.readTombstones(dir).has(spaceId)) return json(res, 404, { error: 'This chat was not found.' });
+      const { chatMarkdown } = require('../chat-export.cjs');
+      const text = chatMarkdown(chat, store.readHistory(spaceId));
+      const name = `noevia-chat-${String(chat.title || 'untitled-chat').normalize('NFKD').replace(/[^\x20-\x7e]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'untitled-chat'}-${spaceId}.md`;
+      const body = Buffer.from(text, 'utf8');
+      res.writeHead(200, {
+        'Content-Type': 'text/markdown; charset=utf-8',
+        'Content-Length': body.length,
+        'Content-Disposition': `attachment; filename="${name}"`,
+        'Cache-Control': 'no-store',
+      });
+      res.end(body);
+      return true;
+    }
+
     // ── Free-chat metas (server-side so they survive browser switches) ──
     if (p === '/api/freechats') {
-      if (req.method === 'GET') return json(res, 200, { chats: FREE_CHATS });
+      if (req.method === 'GET') {
+        // #1420: the list is read before the status line goes out, so a broken store is a clean 500.
+        let chats;
+        try { chats = Array.from(FREE_CHATS); } catch { return json(res, 500, { error: 'could not read the free chats' }); }
+        return json(res, 200, { chats });
+      }
       if (req.method === 'POST') {
         // M4: the Rust front saves the free-chat list while NOEVIA_RUST_PROJECTS is on and the
         // supervisor confirmed that this front has the slice (rust-free-chats). The read stays.
         if (require('../rust-projects.cjs').refuseOwned(rustFreeChats, json, res)) return true;
         const raw = await readBody(req);
+        let body;
+        try { body = JSON.parse(raw); } catch { return json(res, 400, { error: 'invalid JSON' }); }
+        if (!body || typeof body !== 'object' || !Array.isArray(body.chats)) return json(res, 400, { error: 'chats array required' });
+        // #1419: only the reading of the request is a 400; a lock or disk failure below is 503/500.
         try {
-          const body = JSON.parse(raw);
-          if (!Array.isArray(body.chats)) return json(res, 400, { error: 'chats array required' });
           const nextFreeChats = body.chats
             .filter((c) => c && typeof c.id === 'string')
             .slice(0, require('../chat-lists.cjs').LIST_CAP)
@@ -108,8 +183,8 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
           // Ids a project holds were not saved here (#765): say so, so a stale tab refreshes.
           const skipped = lists.skippedElsewhere(nextFreeChats, elsewhere);
           return json(res, 200, skipped.length ? { ok: true, skipped } : { ok: true });
-        } catch {
-          return json(res, 400, { error: 'invalid JSON' });
+        } catch (e) {
+          return saveFailureReply(json, res, e, 'could not save the free chats; nothing was changed');
         }
       }
     }
@@ -154,7 +229,12 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
       const spaceId = require('../chat-lists.cjs').safeChatId(rawId);
       if (!spaceId) return json(res, 400, { error: 'invalid chat id' });
       const revisionOf = (history) => crypto.createHash('sha256').update(JSON.stringify(history)).digest('hex');
-      if (req.method === 'GET') { const history = readHistory(spaceId); return json(res, 200, { history, revision: revisionOf(history) }); }
+      // #1507: a reply the client lost (reload, restart) is offered as `partial`, an interrupted turn.
+      if (req.method === 'GET') {
+        const history = readHistory(spaceId);
+        const partial = require('../chat-partial.cjs').partialFor(currentWorkspace().dir, spaceId);
+        return json(res, 200, { history, revision: revisionOf(history), ...(partial ? { partial } : {}) });
+      }
       if (req.method === 'POST') {
         // A reply that finishes after its chat was deleted must not write the transcript back.
         if (require('../chat-lists.cjs').readTombstones(currentWorkspace().dir).has(spaceId)) return json(res, 410, { error: 'This chat was deleted.' });
@@ -173,6 +253,8 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
           }
           const next = Array.isArray(body.history) ? require('../chat-sources.cjs').sanitizeHistory(body.history.slice(-STORED_HISTORY_CAP)) : [];
           writeHistory(spaceId, next);
+          // #1507: a transcript saved by the client (not by a running reply) supersedes a saved partial.
+          require('../chat-partial.cjs').supersedePartial(currentWorkspace().dir, spaceId);
           return json(res, 200, { ok: true, revision: revisionOf(next) });
         } catch {
           return json(res, 400, { error: 'invalid JSON' });

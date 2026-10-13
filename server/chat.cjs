@@ -1,5 +1,8 @@
 'use strict';
 const { frameUntrusted } = require('./prompt-framing.cjs');
+// A file's name is not ours to trust (#1588, #1605, #1606): each is quoted and escaped by the one shared helper (quoted-name.cjs),
+// so a quote, a newline or a Unicode line break or bidi control in it cannot start a line of its own in the system text.
+const { quoteName, quotedNames } = require('./quoted-name.cjs');
 const provenance = require('./provenance-policy.cjs');
 const { isChatGenerationModel } = require('./chat-model-kind.cjs');
 const { isInAppBox } = require('./toolbox-flags.cjs');
@@ -14,10 +17,10 @@ const FALLBACK_REPLY_CAP = 16 * 1024 * 1024;
 const FALLBACK_REPORTED = Symbol('fallback failure already reported');
 // The text shown for a provider reply that failed: a mapped message, never the raw body (#918).
 // The ChatGPT adapter marks messages written for people (reconnect, usage limit); those show as they are.
-async function providerFailureText(response, chatgptProvider) {
+async function providerFailureText(response, chatgptProvider, partial = false) {
   const context = require('./chat-context.cjs');
   const detail = (await readCappedText(response, PROVIDER_ERROR_BODY_CAP).catch(() => ({ text: '' }))).text;
-  let msg = context.providerError(detail, Number.isInteger(response?.status) ? response.status : undefined);
+  let msg = context.providerError(detail, Number.isInteger(response?.status) ? response.status : undefined, { partial });
   if (chatgptProvider && response.headers?.get?.('x-noevia-provider-message') === '1') { try { msg = String(JSON.parse(detail).error.message).slice(0, 300) || msg; } catch { /* keep the generic text */ } }
   return msg;
 }
@@ -85,6 +88,10 @@ function declinedToolNote(entry) {
   const clipped = text.length > REPLAY_TOOL_RESULT_MAX ? `${text.slice(0, REPLAY_TOOL_RESULT_MAX)}…` : text;
   return `Not run earlier in this chat: the user did not approve ${name}, so it did not run and nothing was changed by it.\n${frameUntrusted('tool result', name, clipped)}`;
 }
+// #1448: a user message with no reply kept after it (stopped, failed or lost) is not an open request. The
+// model is told so by this note between it and the next turn, instead of the two being merged into one
+// user turn, which made the model answer the abandoned prompt again.
+const ABANDONED_TURN_NOTE = '(No reply was kept for the message above: it was stopped or failed before an answer. It is not an open request. Answer only the newest message unless the user asks about it.)';
 function normalizeReplayHistory(mapped, newMessage) {
   const out = [];
   // Applied changes with no turn before them (the first message was edited and re-run, #658
@@ -109,8 +116,11 @@ function normalizeReplayHistory(mapped, newMessage) {
       if (last && last.role === 'assistant') last.content = `${last.content}\n\n${foldToolMessage(entry)}`;
       continue;
     }
-    if (last && last.role === entry.role && (entry.role === 'user' || entry.role === 'assistant')) {
+    if (last && last.role === entry.role && entry.role === 'assistant') {
       last.content = `${last.content}\n\n${entry.content}`;
+    } else if (entry.role === 'user' && last && last.role === 'user') {
+      // #1448: the earlier prompt got no reply; it stays its own turn, marked as abandoned.
+      out.push({ role: 'assistant', content: ABANDONED_TURN_NOTE }, { ...entry });
     } else {
       out.push({ ...entry });
     }
@@ -120,13 +130,60 @@ function normalizeReplayHistory(mapped, newMessage) {
   while (out.length && out[0].role === 'assistant') out.shift();
   if (typeof newMessage === 'string') {
     const last = out[out.length - 1];
-    if (last && last.role === 'user') last.content = `${last.content}\n\n${newMessage}`;
-    else out.push({ role: 'user', content: newMessage });
+    // #1448: a history that ends on a prompt with no reply kept is abandoned; the new message is its own turn.
+    if (last && last.role === 'user') out.push({ role: 'assistant', content: ABANDONED_TURN_NOTE });
+    out.push({ role: 'user', content: newMessage });
   }
   if (leading.length && out[0] && out[0].role === 'user') {
     out[0] = { ...out[0], content: `${leading.join('\n\n')}\n\n${out[0].content}` };
   }
   return out;
+}
+
+// #1553: a reply whose chat template cannot take tools is told so in the request itself. Without this the model
+// said no search tool existed, or wrote search results it never had. The note is ours and holds no tool output.
+const TOOLS_OFF_MODEL_NOTE = 'No tools can run in this reply: this model\'s chat template cannot use them. If the person asks for a web search, a file, a live lookup or any other tool, say so in one line at the start. Do not write results, sources, excerpts or simulated output for it.';
+function withSystemNote(messages, note) {
+  const at = messages.findIndex((m) => m?.role === 'system' && typeof m.content === 'string');
+  if (at < 0) return [{ role: 'system', content: note }, ...messages];
+  return messages.map((m, i) => (i === at ? { ...m, content: `${m.content}\n\n${note}` } : m));
+}
+const withToolsOffNote = (messages) => withSystemNote(messages, TOOLS_OFF_MODEL_NOTE);
+function withoutSystemNote(messages, note) {
+  if (!note) return messages;
+  return messages.map((m) => (m?.role === 'system' && typeof m.content === 'string' && m.content.includes(`\n\n${note}`) ? { ...m, content: m.content.replace(`\n\n${note}`, '') } : m));
+}
+
+// #1574: a local reply that stops sending bytes after its first output is ended after `ms` with a named
+// error, instead of sitting until the browser gives up with "network error" minutes later. Nothing is
+// limited before the first output (a long prefill is not a stall), and `ms` of 0 limits nothing.
+const { isCutMark } = require('./thinking-budget.cjs');
+class StreamIdleError extends Error {
+  constructor(ms) { super(`no output for ${ms} ms`); this.name = 'StreamIdleError'; this.ms = ms; }
+}
+// `onIdle` runs the moment the limit passes, before the error is thrown: the caller uses it to abort the upstream
+// request, because closing the iterator cannot (return() queues behind the read that is still pending, #1584).
+async function* withIdleLimit(iterable, ms, onIdle = null) {
+  if (!(ms > 0)) { yield* iterable; return; }
+  const it = iterable[Symbol.asyncIterator]();
+  let started = false;
+  try {
+    for (;;) {
+      let timer = null;
+      const pending = it.next();
+      const next = started
+        ? await Promise.race([pending, new Promise((_, reject) => { timer = setTimeout(() => { try { onIdle?.(); } catch { /* best effort */ } reject(new StreamIdleError(ms)); }, ms); })]).finally(() => clearTimeout(timer))
+        : await pending;
+      if (next.done) return;
+      // The thinking cap's cut mark: a new request follows, which may re-prefill before it sends a byte, so the
+      // clock waits for its first output again (#1585).
+      started = !isCutMark(next.value);
+      yield next.value;
+    }
+  } finally {
+    // Closing the provider stream; not awaited, so a read that is still pending cannot hold the reply open.
+    try { it.return?.().catch?.(() => {}); } catch { /* already closed */ }
+  }
 }
 
 function createChatHandler({
@@ -162,6 +219,8 @@ function createChatHandler({
   routingModes = null,
   // #1441: how a turn waits for the project's file jobs still running; the wait is bounded.
   sourceJobs = require('./source-jobs.cjs'), sourceWaitMs = 30000,
+  // #1574: how long a local reply may go silent after its first output before it is ended (0 = no limit).
+  streamIdleMs = 120000,
 }) {
   const jsonOut = json;
   // Revoked Skill content in earlier turns (#546): one ledger per handler, cached in memory.
@@ -184,10 +243,12 @@ function createChatHandler({
       if (execution.record && execution.aborted?.()) {
         try {
           const outcome = require('./chat-interrupted-turn.cjs').saveInterruptedTurn({ fs, workspace: execution.workspace, chatId: body.chatId,
-            message: body.message, entry: execution.record.assistantEntry(), cap: STORED_HISTORY_CAP });
+            message: body.message, entry: execution.record.partialEntry() || execution.record.assistantEntry(), cap: STORED_HISTORY_CAP });
           if (outcome !== 'saved' && outcome !== 'not-last') console.log(`[chat] interrupted reply not kept: ${outcome}`);
         } catch (error) { console.warn('[chat] could not keep an interrupted reply:', error?.message || error); }
       }
+      // #1507: the reply has ended (completed, failed, or kept above), so its saved partial is cleared.
+      execution.partials?.finish();
       // A chat deleted while this reply ran leaves no context state (summaries hold conversation text).
       const id=typeof body?.chatId==='string'?require('./chat-lists.cjs').safeChatId(body.chatId):null;
       try{const dir=currentWorkspace().dir;if(id&&require('./chat-lists.cjs').readTombstones(dir).has(id))require('./chat-context.cjs').remove(dir,id);}catch{/* best effort */}
@@ -378,6 +439,8 @@ function createChatHandler({
     // injection (small files whole, big files capped) — the old behavior.
     let filesBlock = null;
     let replySources = [];
+    // #1513: sources of which this reply read only part (excerpts, the start, or nothing).
+    let partialReads = [];
     // #1441: a free chat's attachments live in a hidden shadow project. Its files are shown to the model
     // with the user's turn as "attached to this chat"; the shadow project's name and a "knowledge-file"
     // framing in the system message made a small model deny having them. Real projects are unchanged.
@@ -386,7 +449,9 @@ function createChatHandler({
       const readable = require('./instruction-skills.cjs').sources(project);
       // #552: the chunks that went into the prompt, reported to the browser as a `sources` event.
       filesBlock = await rag.filesContext(project.id, readable, message, currentWorkspace().userId,
-        (placed) => { replySources = require('./chat-sources.cjs').buildSources(placed, readable); }, { attached: chatAttachments });
+        // #1513 counts what the prompt holds (`injected`), not only the reported sources: an unnamed file head
+        // is in the prompt but not a source chip (#1457), and was told to the model as "none of it" read.
+        (placed, injected) => { replySources = require('./chat-sources.cjs').buildSources(placed, readable); partialReads = require('./source-coverage.cjs').partialSources(readable, Array.isArray(injected) ? injected : placed); }, { attached: chatAttachments });
     }
 
     const sysParts = [];
@@ -394,11 +459,14 @@ function createChatHandler({
     const accountSettings = require('./account-instructions.cjs').read(currentWorkspace().dir);
     const accountPart = require('./account-instructions.cjs').systemPart(accountSettings); // style, advanced controls and response language
     if (accountPart) sysParts.push(accountPart);
+    // #1573: today's date and the rule for time-sensitive answers, so a "latest" question is answered from the
+    // tool results, not from the model's training data. The day, not the time: see current-time-part.cjs.
+    sysParts.push(require('./current-time-part.cjs').systemPart());
     const accountMemory = require('./account-memory.cjs');
     const memoryPart = accountMemory.systemPart(accountMemory.read(currentWorkspace().dir), project?.memories);
     if (!project && memoryPart) sysParts.push(memoryPart);
     if (project) {
-      if (project.name && !chatAttachments) sysParts.push(`You are working inside the user's project "${project.name}".`);
+      if (project.name && !chatAttachments) sysParts.push(`You are working inside the user's project ${quoteName(project.name)}.`);
       if (project.goal) sysParts.push(`Project goal: ${project.goal}`);
       if (project.instructions) sysParts.push(`Project instructions (follow closely):\n${project.instructions}`);
       if (memoryPart) sysParts.push(memoryPart);
@@ -421,8 +489,10 @@ function createChatHandler({
         }
       }
       if (sourcesNotReady.length) {
-        sysParts.push(`The user just attached ${sourcesNotReady.map((f) => JSON.stringify(f.name)).join(', ')}, but ${sourcesNotReady.length === 1 ? 'it was' : 'they were'} not ${sourcesNotReady.every((f) => f.reason === 'failed') ? 'processed' : 'finished processing'} in time, so ${sourcesNotReady.length === 1 ? 'its' : 'their'} contents are not available to you for this message. Say so if asked about ${sourcesNotReady.length === 1 ? 'it' : 'them'}; do not guess at the contents.`);
+        sysParts.push(`The user just attached ${quotedNames(sourcesNotReady.map((f) => f.name))}, but ${sourcesNotReady.length === 1 ? 'it was' : 'they were'} not ${sourcesNotReady.every((f) => f.reason === 'failed') ? 'processed' : 'finished processing'} in time, so ${sourcesNotReady.length === 1 ? 'its' : 'their'} contents are not available to you for this message. Say so if asked about ${sourcesNotReady.length === 1 ? 'it' : 'them'}; do not guess at the contents.`);
       }
+      // #1513: a source only partly read for this reply is said so, with what was read.
+      { const coverageNote = require('./source-coverage.cjs').coverageNote(partialReads); if (coverageNote) sysParts.push(coverageNote); }
       // Skills index (L0): name+description only, always visible. The model
       // pulls the full SKILL.md body on demand via read_project_file (L1).
       const skills = skillsIndexFor(project);
@@ -459,6 +529,10 @@ function createChatHandler({
     const record = typeof body.chatId === 'string' && body.chatId && !spaceId?.startsWith('diary') && !body.compactOnly && chatWorkspace
       ? require('./chat-interrupted-turn.cjs').createTurnRecord() : null;
     if (record) Object.assign(execution, { record, workspace: chatWorkspace, aborted: () => chatSignal.signal.aborted });
+    // #1507: the partial reply is saved every few seconds, so a reload or a restart keeps what was written.
+    // (keyed by the same sanitised id the history route reads, so the two always agree.)
+    const partialId = record ? require('./chat-lists.cjs').safeChatId(body.chatId) : null;
+    if (partialId) execution.partials = require('./chat-partial.cjs').startPartialSaves({ dir: chatWorkspace.dir, chatId: partialId, record });
     // An error raised after the client left is the disconnect itself (an aborted compaction or
     // request), not a failed reply: the kept reply must not be dropped as failed (#679 review).
     const send = (obj) => { preparation?.event(obj); if (!(obj?.type === 'error' && chatSignal.signal.aborted)) record?.observe(obj); if (!res.destroyed && !chatSignal.signal.aborted) res.write(`data: ${JSON.stringify(obj)}\n\n`); };
@@ -505,7 +579,7 @@ function createChatHandler({
     // ── Ordinary space / project chat: routed via the project's provider ──
     // Unreadable text originals (#586) are not offered to the model at all, not even by name.
     const storedOnly = require('./source-readability.cjs').readable(project?.files).filter(f => f.attachment?.state === 'stored');
-    if (storedOnly.length) sysParts.push('These sources are stored only; their contents are NOT available to the model: ' + storedOnly.map(f => f.name).join(', ') + '. Do not claim to know their contents.');
+    if (storedOnly.length) sysParts.push('These sources are stored only; their contents are NOT available to the model: ' + quotedNames(storedOnly.map(f => f.name)) + '. Do not claim to know their contents.');
     // Chat framing (#739): a confirmed frame stored in the user's own lists steers the answer. The
     // request body's frame is never read. Flag off or no confirmed frame: nothing changes.
     const steering = require('./chat-frame-steering.cjs');
@@ -545,6 +619,8 @@ function createChatHandler({
     // The description is cached per image AND per question, because "what is in
     // this picture" and "what is the serial number in this picture" want
     // different descriptions of the same bytes.
+    // #1512: the wait for one description, named (a model swap for the vision role comes before it).
+    const VISION_DESCRIBE_TIMEOUT_MS = 180000;
     const describeImages = async (visionModel, baseUrl, headers, question) => {
       const key = crypto.createHash('sha256').update(JSON.stringify([currentWorkspace().userId, baseUrl, visionModel, project.id, headers, attachedImages, question])).digest('hex');
       const cached = visionDescriptions.get(key);
@@ -571,7 +647,7 @@ function createChatHandler({
             max_tokens: 4096,
             messages: [{ role: 'user', content: [{ type: 'text', text: prompt }, ...attachedImages] }],
           }),
-          signal: AbortSignal.any([chatSignal.signal, AbortSignal.timeout(180000)]),
+          signal: AbortSignal.any([chatSignal.signal, AbortSignal.timeout(VISION_DESCRIBE_TIMEOUT_MS)]),
           redirect: 'error',
         });
         if (!r.ok) {
@@ -599,12 +675,18 @@ function createChatHandler({
     // turn re-sends the same megabytes each message and crowds out the
     // conversation, and the model has already been told what it saw.
     const projectImages = project ? (project.assets || []) : [];
+    // #1512: a turn that names the image sources it attaches (turnImageIds, checked in chat-mode.cjs)
+    // sends only those. The project's other images are named to the model (below), never described
+    // or sent, so a text-only turn does no vision work. Without the field every project image rides
+    // along, as before.
+    const namedImageIds = Array.isArray(body.turnImageIds) ? new Set(body.turnImageIds) : null;
+    const unattachedImageNames = namedImageIds ? projectImages.filter((a) => !namedImageIds.has(a.id)).map((a) => a.name) : [];
     let attachedImages = [];
     const missingImages = [];
     const loadedImageNames = [];
     if (projectImages.length) {
       const dir = currentWorkspace().assetDir(project.id);
-      for (const asset of projectImages) {
+      for (const asset of projectImages.filter((a) => !namedImageIds || namedImageIds.has(a.id))) {
         try {
           const bytes = fs.readFileSync(path.join(dir, asset.id));
           loadedImageNames.push(asset.name);
@@ -789,6 +871,38 @@ function createChatHandler({
         return json(res, 409, { error: `${model} is an embedding, reranking or routing model and cannot answer chat messages — pick a chat model in the model popup.` });
       }
     }
+    // The tools this turn would offer, and the tool gate's verdict on them, are settled before the model is fixed:
+    // an Automatic turn whose gate says a tool is needed may move to a tool-capable role (#1550). The selection,
+    // routing, resolution and gate are the ones that used to run after the stream opened; nothing is sent here.
+    // Project and turn boxes with the Diary add-on and OAuth sign-in filters (requestToolboxes, above).
+    const selectedBoxes = requestToolboxes();
+    // Rule 2 of provider-egress.cjs: private tools (the Diary) are not offered through an external provider.
+    egress.stripPrivateToolboxes(selectedBoxes, provider);
+    const routing = await chatToolRouter.select(selectedBoxes, message);
+    if (routing.routed) console.log(`[tools] routed ${selectedBoxes.length} toolboxes to ${routing.ids.join(', ')}`);
+    // A tool the account blocked is never offered, so the model cannot even ask for it.
+    const blocked = (name) => toolPolicy.mode(chatUser?.id, name, isWriteTool(name)) === 'block';
+    const resolveFor = (m) => resolveTools({ ...project, toolboxes: routing.routed ? routing.ids : selectedBoxes }, m, blocked);
+    let resolved = resolveFor(model), resolvedFor = model;
+    // Tool gate (features.toolGate, tool-gate.cjs): runs on the tools this request really offers
+    // (after policy blocks and tool routing). Off, it returns 'none' without doing anything, and
+    // the request below is exactly what it was without the gate. It never picks a write.
+    const gate = toolGate && !body.compactOnly ? await toolGate.evaluate(message, resolved.tools, ...(chatFrame ? [steering.gateBias(chatFrame)] : [])) : null;
+    // #1550: only a turn the gate says needs a tool moves. Chit-chat, a gate that says no tool, and an unavailable
+    // gate (off, timed out, errored) keep the routed model; the template gate below then says the tools are off.
+    const toolModes = require('./tools-mode.cjs');
+    if (wantsAuto && !body.compactOnly && !routeTarget?.row && provider.id === DEFAULT_PROVIDER_ID && typeof modelManager?.props === 'function'
+      && toolModes.toolsModeOf(project) === 'auto' && toolModes.gateSaysToolNeeded(gate)) {
+      const moved = await toolModes.toolCapableRoute({ model, routedRole, roles: autoRoles(),
+        allowsTools: (m) => templateToolsGate.allowsTools(modelManager, m, chatSignal.signal) });
+      if (moved.rerouted) {
+        console.log(`[tools] ${model} cannot take tools; this Automatic turn needs a tool and goes to ${moved.role} (${moved.model})`);
+        model = moved.model;
+        routedRole = moved.role;
+        if (routingDecision) routingDecision = { ...routingDecision, effectiveRole: routedRole };
+        resolved = resolveFor(model); resolvedFor = model;
+      }
+    }
     // #1079: Context: High (the chat's or project's own choice) is served by the model's long-context
     // profile, `<model>-long` (Rust's long-profile decides); roles and the stored pick keep naming
     // the model. Local models only: a cloud model has no such profile. The engine keeps one chat
@@ -805,6 +919,8 @@ function createChatHandler({
         model = picked.model;
       }
     }
+    // The offered tools follow the answering model: the long-context profile above may have named its variant.
+    if (model !== resolvedFor) { resolved = resolveFor(model); resolvedFor = model; }
 
     // Accept both bare-host and conventional /v1-suffixed base URLs (cloud
     // providers like OpenRouter use https://host/api/v1).
@@ -856,15 +972,20 @@ function createChatHandler({
     // #1079: a switch to the long-context profile reloads the model; say so instead of "Preparing".
     if (contextSwitch && !attachedImages.length) send({ type: 'status', id: 'loadingLongContext', text: 'Loading the high-context profile — switching models may take a moment…' });
     else send({ type: 'status', id: attachedImages.length ? 'readingImages' : 'preparing', text: attachedImages.length ? 'Reading image sources — model loading and visual processing may take a moment…' : 'Preparing response…' });
-    let visionWarning = missingImages.length ? `Images were not read because their stored files are missing: ${missingImages.join(', ')}. Re-upload them.` : '';
+    let visionWarning = missingImages.length ? `Images were not read because their stored files are missing: ${quotedNames(missingImages)}. Re-upload them.` : '';
     if (visionWarning) wire = [{ role: 'system', content: visionWarning + ' Do not guess their contents.' }, ...wire];
     // Rule 3 of provider-egress.cjs: project images are not sent to an external provider on their own.
     if (externalProvider && attachedImages.length) {
       attachedImages = [];
       visionWarning += `${visionWarning ? ' ' : ''}Project images were not sent: images are never sent to ${provider.label || 'an external provider'} automatically.`;
-      const unsent = `This project has image sources (${loadedImageNames.join(', ')}) that were not sent to this external provider. Say so if asked about them; do not guess at their contents.`;
+      const unsent = `This project has image sources (${quotedNames(loadedImageNames)}) that were not sent to this external provider. Say so if asked about them; do not guess at their contents.`;
       wire = wire.map((m) => (m.role === 'system' ? { ...m, content: `${m.content}\n\n${unsent}` } : m));
       if (!sys) wire = [{ role: 'system', content: unsent }, ...wire];
+    }
+    // #1512: project images this turn does not attach are named, so the answer says so instead of guessing.
+    if (unattachedImageNames.length) {
+      const notAttached = `This project has image sources (${quotedNames(unattachedImageNames)}) that are not attached to this message. Say so if asked about them; do not guess at their contents.`;
+      wire = wire.some((m) => m.role === 'system') ? wire.map((m) => (m.role === 'system' ? { ...m, content: `${m.content}\n\n${notAttached}` } : m)) : [{ role: 'system', content: notAttached }, ...wire];
     }
     if (attachedImages.length && !body.compactOnly) {
       const roles = autoRoles();
@@ -898,7 +1019,7 @@ function createChatHandler({
           if (lastUser) {
             const text = typeof lastUser.content === 'string' ? lastUser.content : '';
             lastUser.content = [
-              { type: 'text', text: `${text}\n\n(Attached images: ${loadedImageNames.join(', ')})` },
+              { type: 'text', text: `${text}\n\n(Attached images: ${quotedNames(loadedImageNames)})` },
               ...attachedImages,
             ];
           }
@@ -908,7 +1029,7 @@ function createChatHandler({
           // like the images were read and found uninteresting.
           attachedImages = [];
           visionWarning += `${visionWarning ? ' ' : ''}Images were not read. ${vision.reason}`;
-          const blind = `This project has image sources (${loadedImageNames.join(', ')}) but image input is currently unavailable for ${model}: ${vision.reason}${visionModel ? '; the configured vision model also could not describe them' : ''}. Say so if asked about them; do not guess at their contents.`;
+          const blind = `This project has image sources (${quotedNames(loadedImageNames)}) but image input is currently unavailable for ${model}: ${vision.reason}${visionModel ? '; the configured vision model also could not describe them' : ''}. Say so if asked about them; do not guess at their contents.`;
           wire = wire.map((m) => (m.role === 'system' ? { ...m, content: `${m.content}\n\n${blind}` } : m));
           if (!sys) wire = [{ role: 'system', content: blind }, ...wire];
         }
@@ -917,7 +1038,7 @@ function createChatHandler({
 
     send({ type: 'status', id: 'generating', text: 'Generating response…' });
     const imageWarning = visionWarning;
-    const replyWarning = () => [imageWarning, revokedInHistory.length ? historyNote(revokedInHistory) : ''].filter(Boolean).join(' ');
+    const replyWarning = () => [imageWarning, revokedInHistory.length ? historyNote(revokedInHistory) : '', require('./source-coverage.cjs').coverageWarning(partialReads)].filter(Boolean).join(' ');
     if (replyWarning()) send({ type: 'warning', text: replyWarning() });
 
     // ── Tool rounds (Pi-style loop, master step 13): stream a completion; if
@@ -929,10 +1050,6 @@ function createChatHandler({
     // Resolve the project's toolboxes once for the whole exchange: every round
     // must offer the same list, or the model gets told a tool exists and then
     // punished for calling it.
-    // Project and turn boxes with the Diary add-on and OAuth sign-in filters (requestToolboxes, above).
-    const selectedBoxes = requestToolboxes();
-    // Rule 2 of provider-egress.cjs: private tools (the Diary) are not offered through an external provider.
-    egress.stripPrivateToolboxes(selectedBoxes, provider);
     // The provider can remove a box a skill requires (#272). A pinned skill then stops here, before
     // any model request; an automatically loaded one is taken back out of the prompt instead.
     if (pinnedSkill) {
@@ -944,11 +1061,6 @@ function createChatHandler({
       for (const s of autoSkills) loadedSkills.delete(s.file);
       autoSkills = [];
     }
-    const routing = await chatToolRouter.select(selectedBoxes, message);
-    if (routing.routed) console.log(`[tools] routed ${selectedBoxes.length} toolboxes to ${routing.ids.join(', ')}`);
-    // A tool the account blocked is never offered, so the model cannot even ask for it.
-    const blocked = (name) => toolPolicy.mode(chatUser?.id, name, isWriteTool(name)) === 'block';
-    const resolved = resolveTools({ ...project, toolboxes: routing.routed ? routing.ids : selectedBoxes }, model, blocked);
     let activeTools = resolved.tools;
     const allowedToolNames = new Set(activeTools.map((t) => t.function.name));
     // The MCP server each offered name came from (#865): every call goes to the server whose tool
@@ -975,10 +1087,6 @@ function createChatHandler({
       console.warn(`[tools] ${model}: ${resolved.tools.length} tools ~${resolved.estTokens} tok (cap ${resolved.cap}, budget ${resolved.budget}); dropped ${resolved.dropped.length}: ${resolved.dropped.join(', ')}`);
     }
     const runTool = createToolExchange({ allowed: allowedToolNames, isWrite: isWriteTool, signal: chatSignal.signal });
-    // Tool gate (features.toolGate, tool-gate.cjs): runs on the tools this request really offers
-    // (after policy blocks and tool routing). Off, it returns 'none' without doing anything, and
-    // the request below is exactly what it was without the gate. It never picks a write.
-    const gate = toolGate && !body.compactOnly ? await toolGate.evaluate(message, resolved.tools, ...(chatFrame ? [steering.gateBias(chatFrame)] : [])) : null;
     // In-flight revocation (#272): the loaded skills against the project as stored now. Once revoked
     // it stays revoked for the rest of the exchange: no further tool runs and no further model round
     // starts, and a round already streaming is cut off at its next check (at most once a second).
@@ -1089,8 +1197,10 @@ function createChatHandler({
       ({limit,limitSource}=await context.resolveRuntimeLimit({
         manager:provider.id===DEFAULT_PROVIDER_ID?modelManager:null,model,dir:chatWorkspace.dir,
         scope:require('node:crypto').createHash('sha256').update(JSON.stringify([provider.baseUrl,provider.apiKey,modelManager.baseUrl])).digest('hex'),
-        signal:chatSignal.signal,onStatus:(text,id)=>send({type:'status',text,...(id?{id}:{})}),
+        signal:chatSignal.signal,onStatus:(text,id,detail)=>send({type:'status',text,...(id?{id}:{}),...(detail?{detail}:{})}),
         assertActive:assertWorkspaceActive,
+        // #1449: the routed role (fast/smart/code) names the model that is loading.
+        role:routedRole||null,
         // #536: a hosted/custom provider's own context setting (or the hosted default); the local default is unchanged.
         hosted:provider.id===DEFAULT_PROVIDER_ID?null:provider,
       }));
@@ -1107,6 +1217,8 @@ function createChatHandler({
       send({type:'context',...prepared.meter});
     } catch(error) {send({type:'error',text:error.message});res.end();return;}
     if(body.compactOnly){send({type:'done',model});res.end();return;}
+    // #1475/#1477: the local engine's thinking cap for this effort, leaving the answer its room (thinking-budget.cjs).
+    const localThinkingCap = provider.id===DEFAULT_PROVIDER_ID ? require('./thinking-budget.cjs').thinkingCap(effort, prepared.maxTokens) : null;
     const reportRevocation = () => {
       if (!skillRevocation || skillRevocationReported) return;
       skillRevocationReported = true;
@@ -1201,6 +1313,9 @@ function createChatHandler({
     // Track final-answer content separately for each round. Reasoning may contain
     // internal planning or unfinished narration; it is never promoted to an answer.
     let roundHasContent = false;
+    // #1547: whether any answer text has been shown to the client for this reply (across rounds).
+    // Only then does a failure say that partial output was preserved.
+    let shownText = false;
     // Text streamed in a round that then calls tools is narration, not the answer.
     let roundContent = '';
     let roundReasoning = '';
@@ -1214,6 +1329,23 @@ function createChatHandler({
     if (templateGate && activeTools.length && !(await templateToolsGate.allowsTools(modelManager, model, chatSignal.signal))) {
       templateToolsOff = true;
       send({ type: 'warning', text: templateCaps.TOOLS_OFF_NOTICE });
+      roundMessages = withToolsOffNote(roundMessages);
+    }
+    // #1520 / #1521: a named storage connector's tools (or its absence), and Web search off for a time-sensitive
+    // question. Notes only; the tools offered and the gate are unchanged. Built from the tools this request really
+    // carries (after the external-provider strip, tool routing, policy blocks and the budget), and left out when the
+    // template cannot take tools at all, where "answer with the Files tools" would contradict the tools-off notice
+    // (#1586). Empty for most chats.
+    let routeNoteText = '';
+    if (!templateToolsOff) {
+      const names = new Set(activeTools.map((tool) => tool.function?.name));
+      const boxes = allToolboxes();
+      const offered = (routing.routed ? routing.ids : selectedBoxes).filter((id) => {
+        const tools = boxes.find((b) => b.id === id)?.tools;
+        return !Array.isArray(tools) || tools.some((tool) => names.has(tool.function?.name));
+      });
+      routeNoteText = require('./tool-route-notes.cjs').toolRouteNotes({ message, offered, onServer: boxes.map((b) => b.id) });
+      if (routeNoteText) roundMessages = withSystemNote(roundMessages, routeNoteText);
     }
     const requestTools = () => (!templateToolsOff && activeTools.length ? { tools: activeTools } : {});
     // tool_choice for the gate's required tool: the first model turn (and its one retry) only.
@@ -1254,25 +1386,32 @@ function createChatHandler({
       }
       context.logRound({dir:chatWorkspace.dir,chatId:contextId,model,limit,round,compacted:!!continuationCompactedAt||!!prepared.meter.compactedAt&&prepared.meter.compactedAt>=requestStartedAt,messages:roundMessages,tools:activeTools,assertActive:assertWorkspaceActive});
       const snapshot=context.read(chatWorkspace.dir,contextId);snapshot.meter={...roundBudget,historyCount:prepared.meter.historyCount,compactedAt:continuationCompactedAt||prepared.meter.compactedAt,covered:continuationCompactedAt?continuationCovered:prepared.meter.covered};context.save(chatWorkspace.dir,contextId,snapshot,assertWorkspaceActive);
+      // #1551: the meter counts this round's tool output, so it goes out after each tool round (and at the first
+      // round only if the messages changed since prepare). A compaction in this round already sent its own.
+      if(!roundCompacted&&(round>0||roundMessages!==prepared.messages))send({type:'context',...snapshot.meter});
       if (taint) { try { taint.ingestMessages(roundMessages); } catch { taintBroken = true; } }
       let upstream;
+      // #1584: this round's own abort, combined with the client's. A stalled local stream aborts it so the engine
+      // connection and slot are released instead of staying held behind the next "Try again".
+      const roundAbort = new AbortController();
+      const roundSignal = AbortSignal.any([chatSignal.signal, roundAbort.signal]);
       roundStartedAt = Date.now();
       roundFirstTokenMs = null;
       roundTimings = null;
       try {
         upstream = await reasoningEffort.requestWithEffort(providerFetch, upstreamUrl, {
-          method: 'POST', headers: upstreamHeaders, signal: chatSignal.signal, redirect: 'error',
+          method: 'POST', headers: upstreamHeaders, signal: roundSignal, redirect: 'error',
         }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:true,stream_options:{include_usage:true},
           ...sampling.params,
-          ...requestTools(), ...forceChoice(round)}, provider, model, effort, send);
+          ...requestTools(), ...forceChoice(round)}, provider, model, effort, send, localThinkingCap);
         // A server that rejects the named-function form of tool_choice gets the equivalent it does
         // accept: only that tool, and a call required.
         if (forceChoice(round).tool_choice && upstream.status >= 400 && upstream.status < 500 && /tool_choice/i.test((await readCappedText(upstream.clone(), PROVIDER_ERROR_BODY_CAP).catch(() => ({ text: '' }))).text)) {
           discardBody(upstream); // the rejected reply is replaced; close it
           upstream = await reasoningEffort.requestWithEffort(providerFetch, upstreamUrl, {
-            method: 'POST', headers: upstreamHeaders, signal: chatSignal.signal, redirect: 'error',
+            method: 'POST', headers: upstreamHeaders, signal: roundSignal, redirect: 'error',
           }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:true,stream_options:{include_usage:true},
-            ...sampling.params, tools:activeTools.filter((t) => t.function?.name === forcedTool), tool_choice:'required'}, provider, model, effort, send);
+            ...sampling.params, tools:activeTools.filter((t) => t.function?.name === forcedTool), tool_choice:'required'}, provider, model, effort, send, localThinkingCap);
         }
         // #1002: the engine refused the tools because of the model's chat template (llama.cpp could
         // not build a tool-call parser for it). Retry this round once without tools, and say so.
@@ -1282,10 +1421,11 @@ function createChatHandler({
             discardBody(upstream);
             templateToolsOff = true;
             send({ type: 'warning', text: templateCaps.TOOLS_RETRY_NOTICE });
+            roundMessages = withToolsOffNote(withoutSystemNote(roundMessages, routeNoteText));
             upstream = await reasoningEffort.requestWithEffort(providerFetch, upstreamUrl, {
-              method: 'POST', headers: upstreamHeaders, signal: chatSignal.signal, redirect: 'error',
+              method: 'POST', headers: upstreamHeaders, signal: roundSignal, redirect: 'error',
             }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:true,stream_options:{include_usage:true},
-              ...sampling.params}, provider, model, effort, send);
+              ...sampling.params}, provider, model, effort, send, localThinkingCap);
             // #1015: remembered only when dropping tools is what fixed it; a template that fails
             // either way is not marked, so the next chat still offers tools.
             if (upstream.ok) templateToolsGate.markUnsupported(model);
@@ -1303,6 +1443,7 @@ function createChatHandler({
       }
 
       const toolCalls = new Map(); // index -> {id, name, args}
+      let roundWrote = false; // #1456: a write tool was about to run this round (its escalation is always honoured)
       let sawAnything = false;
       roundReasoning = '';
       roundHasContent = false;
@@ -1312,7 +1453,7 @@ function createChatHandler({
       // (same pattern as the client-side reader in src/api.ts).
       let buffer = '';
       try {
-        for await (const chunk of upstream.body) {
+        for await (const chunk of withIdleLimit(upstream.body, provider.id === DEFAULT_PROVIDER_ID ? streamIdleMs : 0, () => roundAbort.abort())) {
           // Leaving the loop cancels the provider stream; checked at most once a second (#272).
           if (loadedSkills.size && Date.now() - skillCheckedAt >= 1000 && revokedSkills()) break;
           buffer += decoder.decode(chunk, { stream: true });
@@ -1326,7 +1467,7 @@ function createChatHandler({
             try {
               const evt = JSON.parse(payload);
               if(evt.choices?.[0]?.finish_reason==='length')send({type:'warning',text:'The model reached its thinking/answer token budget. This reply may be incomplete; try Low thinking or a narrower question.'});
-              if(evt.error){const text=chatgptProvider&&evt.error?.source==='chatgpt'&&typeof evt.error.message==='string'?evt.error.message.slice(0,300):context.providerError(evt.error);send({type:'error',text});res.end();return;}
+              if(evt.error){const text=chatgptProvider&&evt.error?.source==='chatgpt'&&typeof evt.error.message==='string'?evt.error.message.slice(0,300):context.providerError(evt.error,undefined,{partial:shownText});send({type:'error',text});res.end();return;}
               const delta = evt.choices?.[0]?.delta || {};
               const meaningfulToolFragment = Array.isArray(delta.tool_calls) && delta.tool_calls.some(tc => tc?.id || tc?.function?.name || tc?.function?.arguments);
               // Detect output before handling usage: a compact provider may put
@@ -1354,6 +1495,7 @@ function createChatHandler({
               if (delta.content) {
                 sawAnything = true;
                 roundHasContent = true;
+                shownText = true;
                 roundContent += delta.content;
                 send({ type: 'delta', text: delta.content });
               }
@@ -1372,7 +1514,8 @@ function createChatHandler({
                   // fragments made the client render one chip per delta, most
                   // of them nameless with partial args like `/T`. The client
                   // upserts on index and always sees the best-known state.
-                  send({ type: 'tool', index: toolOffset + i, name: slot.name, args: slot.args });
+                  // #1523: a complete search query is shown as the question (partial JSON is shown as it arrives).
+                  send({ type: 'tool', index: toolOffset + i, name: slot.name, args: require('./search-query.cjs').cleanSearchArgs(slot.name, slot.args) });
                 }
               }
             } catch {
@@ -1382,8 +1525,13 @@ function createChatHandler({
         }
       } catch (err) {
         if (chatSignal.signal.aborted) break; // client went away; stop quietly
+        // #1574: named, with the wait it ran into. Tools run only after a round's stream ends, so none ran.
+        if (err instanceof StreamIdleError) {
+          send({ type: 'error', text: `The model sent no output for ${Number((err.ms / 1000).toFixed(1))} s after it started, so the reply was ended. No tool ran for this step. Try again, or choose another model.` });
+          break;
+        }
         // Mapped text (#918): a stream that breaks mid-read must not show undici internals.
-        send({ type: 'error', text: context.providerError(String(err?.message || '')) });
+        send({ type: 'error', text: context.providerError(String(err?.message || ''), undefined, { partial: shownText }) });
         break;
       }
       // Cut off mid-stream by a revoked skill: keep what was already shown, request no tools.
@@ -1406,27 +1554,27 @@ function createChatHandler({
           roundTimings = null;
           const response = await reasoningEffort.requestWithEffort(providerFetch, upstreamUrl, {
             method:'POST',headers:upstreamHeaders,signal:AbortSignal.any([chatSignal.signal,AbortSignal.timeout(300000)]),redirect:'error',
-          }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:false,...sampling.params,...requestTools(),...forceChoice(round)}, provider, model, effort, send);
+          }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:false,...sampling.params,...requestTools(),...forceChoice(round)}, provider, model, effort, send, localThinkingCap);
           // Status first (#918): a 5xx HTML page is a provider failure, not a JSON parse error.
-          if (!response.ok) { send({ type: 'error', text: await providerFailureText(response, chatgptProvider) }); throw FALLBACK_REPORTED; }
+          if (!response.ok) { send({ type: 'error', text: await providerFailureText(response, chatgptProvider, shownText) }); throw FALLBACK_REPORTED; }
           const full = {ok:true,status:response.status,body:await readCappedJson(response,FALLBACK_REPLY_CAP)};
           require('./mtp.cjs').record(chatWorkspace?.userId,model,full.body?.timings);
           const msg = full.body?.choices?.[0]?.message;
           if (msg?.reasoning_content || msg?.content || (Array.isArray(msg?.tool_calls) && msg.tool_calls.length)) markFirstOutput();
           if (msg?.reasoning_content) { roundReasoning += msg.reasoning_content; send({ type: 'reasoning', text: msg.reasoning_content }); }
-          if (msg?.content) { roundHasContent = true; roundContent += msg.content; send({ type: 'delta', text: msg.content }); }
+          if (msg?.content) { roundHasContent = true; shownText = true; roundContent += msg.content; send({ type: 'delta', text: msg.content }); }
           if (Array.isArray(msg?.tool_calls)) {
             for (const tc of msg.tool_calls) {
               const index = toolCalls.size;
               toolCalls.set(index, { id: tc.id || `call-${index}`, name: tc.function?.name || '', args: tc.function?.arguments || '' });
-              send({ type: 'tool', index: toolOffset + index, name: tc.function?.name || '', args: tc.function?.arguments || '' });
+              send({ type: 'tool', index: toolOffset + index, name: tc.function?.name || '', args: require('./search-query.cjs').cleanSearchArgs(tc.function?.name || '', tc.function?.arguments || '') });
             }
           }
           reportRoundUsage(full.body?.usage, full.body?.timings);
           sawAnything = true;
         } catch (err) {
           // Mapped or fixed text (#918): never a V8 SyntaxError quoting the body, or undici internals.
-          if (err !== FALLBACK_REPORTED) send({ type: 'error', text: context.providerError(String(err?.message || '')) });
+          if (err !== FALLBACK_REPORTED) send({ type: 'error', text: context.providerError(String(err?.message || ''), undefined, { partial: shownText }) });
         }
       }
 
@@ -1451,6 +1599,8 @@ function createChatHandler({
       // cannot be fed back to the model), but they are still streamed to the
       // user instead of dangling.
       if (toolCalls.size > 0) {
+        // #1523: a search query is the question, not the request wrapper around it.
+        for (const tc of toolCalls.values()) tc.args = require('./search-query.cjs').cleanSearchArgs(tc.name, tc.args);
         if (roundContent.trim()) { send({ type: 'preamble', text: roundContent }); roundHasContent = false; }
         const assistantMsg = { role: 'assistant', content: null, tool_calls: [...toolCalls.entries()].map(([i, tc]) => ({ id: tc.id, type: 'function', function: { name: tc.name, arguments: tc.args } })) };
         roundMessages = [...roundMessages, assistantMsg];
@@ -1608,6 +1758,8 @@ function createChatHandler({
               }
             }
             markWriteAttempt();
+            // Set before the call, so a write that throws still counts as a round that wrote (#1456).
+            if (isWriteTool(tc.name)) roundWrote = true;
             const options = { chatKey, exchangeKey, routes: toolRoutes, ...(editTarget !== null ? { editTarget: editTargets.targetDigest(editTarget, editAccount) } : {}) };
             result = await executeToolCall(project, tc.name, tc.args, allowedToolNames, chatSignal.signal, outcome, options);
             ran = true;
@@ -1666,7 +1818,7 @@ function createChatHandler({
       if (skillRevocation) break; // revoked during this round's tools: no supervisor call, one error
       const supervised = await require('./step-supervision.cjs').superviseNextStep(
         spaceId?.startsWith('diary') ? null : stepSupervision,
-        { round, messages: roundMessages, signal: chatSignal.signal, goal: message });
+        { round, messages: roundMessages, signal: chatSignal.signal, goal: message, wrote: roundWrote });
       roundMessages = supervised.messages;
       if (supervised.pause) {
         // #658: the tool round before this checkpoint finished, and its writes are real. A pause
@@ -1709,4 +1861,4 @@ function createChatHandler({
   return { handleChat, handleChatInner };
 }
 
-module.exports = { createChatHandler, normalizeReplayHistory };
+module.exports = { createChatHandler, normalizeReplayHistory, withIdleLimit };

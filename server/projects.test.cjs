@@ -24,7 +24,7 @@ function fixture({ browsable = false, folderError = null } = {}) {
     reasoningEffort: { validEffort: (e) => ['default', 'low', 'high'].includes(e) },
     projectAppearance: (body) => (body.icon === 'bad' ? (() => { throw new Error('unknown icon'); })() : { icon: body.icon || 'folder' }),
     rag: { indexProjectFile: async (...args) => { indexed.push(args); return { ok: true, stored: 1, embedded: 1 }; }, deleteProjectFile: (...args) => deleted.push(args) },
-    storageClient: { isBrowsable: () => browsable, refusedLogin: require('./storage-client.cjs').refusedLogin },
+    storageClient: { isBrowsable: () => browsable, refusedLogin: require('./storage-client.cjs').refusedLogin, storageFailure: require('./storage-client.cjs').storageFailure },
     documentSources: { prune() {}, directory: () => path.join(dir, 'docs') },
     authService: { getStorage: () => ({ kind: browsable ? 'webdav' : 'local' }) },
     currentWorkspace: () => workspace,
@@ -71,14 +71,14 @@ test('with browsable storage a new project makes no storage folder until its fir
 test('#849: ensureProjectFolderDetailed says when storage refused the login, and ensureProjectFolder still just returns null', async () => {
   const rejected = fixture({ browsable: true, folderError: Object.assign(new Error('could not create "noevia projects" (401)'), { status: 502, upstream: 401 }) });
   const project = await rejected.store.createProject({ name: 'Trip' });
-  assert.deepEqual(await rejected.store.ensureProjectFolderDetailed(project), { folder: null, loginRejected: true });
+  assert.deepEqual(await rejected.store.ensureProjectFolderDetailed(project), { folder: null, loginRejected: true, failure: { kind: 'login' } });
   assert.equal(await rejected.store.ensureProjectFolder(project), null);
   const down = fixture({ browsable: true, folderError: Object.assign(new Error('could not create "noevia projects" (500)'), { status: 502, upstream: 500 }) });
-  assert.deepEqual(await down.store.ensureProjectFolderDetailed(await down.store.createProject({ name: 'Trip' })), { folder: null, loginRejected: false });
+  assert.deepEqual(await down.store.ensureProjectFolderDetailed(await down.store.createProject({ name: 'Trip' })), { folder: null, loginRejected: false, failure: null });
   const none = fixture({ browsable: false });
-  assert.deepEqual(await none.store.ensureProjectFolderDetailed(await none.store.createProject({ name: 'Trip' })), { folder: null, loginRejected: false });
+  assert.deepEqual(await none.store.ensureProjectFolderDetailed(await none.store.createProject({ name: 'Trip' })), { folder: null, loginRejected: false, failure: null });
   const ok = fixture({ browsable: true });
-  assert.deepEqual(await ok.store.ensureProjectFolderDetailed(await ok.store.createProject({ name: 'Trip' })), { folder: 'noevia projects/Trip', loginRejected: false });
+  assert.deepEqual(await ok.store.ensureProjectFolderDetailed(await ok.store.createProject({ name: 'Trip' })), { folder: 'noevia projects/Trip', loginRejected: false, failure: null });
 });
 
 test('chat metas are sanitized on read and deleting one leaves a tombstone and removes its transcript', async () => {
@@ -411,4 +411,16 @@ test('moveChat never moves a chat into a project it cannot live in, but in place
   assert.equal(old.chats[0].frame.kind, 'idea');
   assert.deepEqual(f.store.moveChat('in-old', chat.id, {}, () => true, chatDestination), { status: 200, from: old.id }, 'and the chat can be moved out');
   assert.deepEqual(f.store.moveChat('f1', chat.id, {}, () => true, chatDestination), { status: 200, from: null });
+});
+
+test('#1522: a new project starts on Automatic tools unless the request chose Manual', async () => {
+  const f = fixture();
+  const auto = await f.store.createProject({ name: 'Plan' });
+  assert.equal(auto.toolsMode, 'auto', 'the web sends no toolboxes or toolsMode: Automatic, not a Manual list');
+  assert.equal(require('./tools-mode.cjs').toolsModeOf(auto), 'auto');
+  const hand = await f.store.createProject({ name: 'Hand', toolboxes: ['core'] });
+  assert.equal(hand.toolsMode, 'manual', 'an explicit toolbox list is a hand pick');
+  assert.deepEqual(hand.toolboxes, ['core']);
+  assert.equal((await f.store.createProject({ name: 'Chosen', toolsMode: 'manual' })).toolsMode, 'manual');
+  assert.equal((await f.store.createProject({ name: 'Auto', toolsMode: 'auto', toolboxes: ['core'] })).toolsMode, 'auto');
 });

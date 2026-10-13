@@ -10,20 +10,25 @@ jobs:
     name: Required native sampling settings front contracts
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    env:
+      CORE_ACCEPTANCE_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
           path: core
       # Merged rs #72 acceptance tooling (#1308), not a runtime release pin.
       # Independently downloaded twice; byte-identical archive hash.
       - name: Fetch verified native sampling settings acceptance source
         run: |
           set -euo pipefail
-          curl -fsSL https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/cfb5196f23942450c115cd6cb9891949207a14e0 -o "$RUNNER_TEMP/sampling-rs.tgz"
-          echo "02b37158aa057069809a1fb4966ea93e00c6ba91dd73f11f66bad5e4d9e25d96  $RUNNER_TEMP/sampling-rs.tgz" | sha256sum -c -
+          curl -fsSL https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/c90210ee5be06024b2a4b477e60db188247aba33 -o "$RUNNER_TEMP/sampling-rs.tgz"
+          echo "a5c04fc61927ce9fd0e4425f6aa6923bfaa40f14bbe06b136b120197682b2411  $RUNNER_TEMP/sampling-rs.tgz" | sha256sum -c -
           mkdir rs
           tar -xzf "$RUNNER_TEMP/sampling-rs.tgz" --strip-components=1 -C rs
+          echo "CORE_ACCEPTANCE_RS=$GITHUB_WORKSPACE/rs" >> "$GITHUB_ENV"
+          echo "CORE_ACCEPTANCE_ARCHIVE=$RUNNER_TEMP/sampling-rs.tgz" >> "$GITHUB_ENV"
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 22
@@ -56,6 +61,18 @@ jobs:
           cargo test --locked -p noevia-server --test sampling_settings
           cargo test --locked -p noevia-server --lib sampling_
           cargo build --locked -p replay -p noevia-server
+      - name: Candidate-core acceptance seam (as reasoning-front)
+        run: |
+          set -euo pipefail
+          # corpus-launcher only serves the exact core.ref the corpus records; the merged
+          # core-acceptance adapter serves this candidate HEAD when it descends from it.
+          cargo build --locked --manifest-path core/tools/qualification/reasoning-acceptance/Cargo.toml
+          mkdir "$RUNNER_TEMP/acceptance-bin"
+          ln -s "$GITHUB_WORKSPACE/rs/target/debug/noevia-server" "$RUNNER_TEMP/acceptance-bin/noevia-server"
+          ln -s "$GITHUB_WORKSPACE/core/tools/qualification/reasoning-acceptance/target/debug/core-acceptance" "$RUNNER_TEMP/acceptance-bin/core-acceptance"
+          printf '%s\n' '#!/bin/sh' '# Explicit candidate-core acceptance seam; original RS launcher is untouched.' 'exec "$(dirname "$0")/core-acceptance" "$@"' > "$RUNNER_TEMP/acceptance-bin/corpus-launcher"
+          chmod +x "$RUNNER_TEMP/acceptance-bin/corpus-launcher"
+          echo "CORE_ACCEPTANCE_SHIM=$RUNNER_TEMP/acceptance-bin/corpus-launcher" >> "$GITHUB_ENV"
       - name: Full HTTP corpus through native auth and sampling settings
         working-directory: rs
         run: |
@@ -64,7 +81,7 @@ jobs:
           target/debug/replay run --corpus contracts/http/corpus --base http://127.0.0.1:18021 \
             --ignore-body hours --ignore-body peakHour/hour \
             --seed "$RUNNER_TEMP/seed" --work "$RUNNER_TEMP/sampling-positive" \
-            --server-cmd "exec env NOEVIA_RUST_AUTH=1 NOEVIA_RUST_SAMPLING_SETTINGS=1 sh '$GITHUB_WORKSPACE/rs/tools/front/replay-front.sh' '$GITHUB_WORKSPACE/core' '$GITHUB_WORKSPACE/rs/target/debug/noevia-server'" \
+            --server-cmd "exec env NOEVIA_RUST_AUTH=1 NOEVIA_RUST_SAMPLING_SETTINGS=1 sh '$GITHUB_WORKSPACE/rs/tools/front/replay-front.sh' '$GITHUB_WORKSPACE/core' '$RUNNER_TEMP/acceptance-bin/noevia-server'" \
             --report "$RUNNER_TEMP/sampling-positive.json"
       - name: Sampling omission refuses Node fallback with functional native identity
         working-directory: rs
@@ -73,7 +90,7 @@ jobs:
           if target/debug/replay run --corpus contracts/http/corpus --base http://127.0.0.1:18021 \
             --ignore-body hours --ignore-body peakHour/hour \
             --seed "$RUNNER_TEMP/seed" --work "$RUNNER_TEMP/sampling-control" \
-            --server-cmd "exec env NOEVIA_RUST_AUTH=1 NOEVIA_RUST_SAMPLING_SETTINGS=1 REPLAY_FRONT_CONTROL_NODE_ONLY_SAMPLING_SETTINGS=1 sh '$GITHUB_WORKSPACE/rs/tools/front/replay-front.sh' '$GITHUB_WORKSPACE/core' '$GITHUB_WORKSPACE/rs/target/debug/noevia-server'" \
+            --server-cmd "exec env NOEVIA_RUST_AUTH=1 NOEVIA_RUST_SAMPLING_SETTINGS=1 REPLAY_FRONT_CONTROL_NODE_ONLY_SAMPLING_SETTINGS=1 sh '$GITHUB_WORKSPACE/rs/tools/front/replay-front.sh' '$GITHUB_WORKSPACE/core' '$RUNNER_TEMP/acceptance-bin/noevia-server'" \
             --report "$RUNNER_TEMP/sampling-control.json"; then
             echo "::error::missing native sampling handler replayed successfully"; exit 1
           fi
