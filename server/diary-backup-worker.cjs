@@ -35,11 +35,13 @@ function startDiaryBackupWorker({ users, enabled, run, suspended = () => false, 
   }
 
   async function runUser(user, now) {
+    // The worker's own backoff comes first (#1615): `suspended` can hand this account's one storage probe to
+    // the caller, so asking it on a tick that will not call the Diary would use the probe for nothing.
+    const s = stateFor(user.id);
+    if (now < s.nextAt) return;
     // #1429: a suspended account is not called at all, and its backoff is left alone; the first
     // call after the suspension ends runs straight away.
     if (suspended(user)) return;
-    const s = stateFor(user.id);
-    if (now < s.nextAt) return;
     // A new window has started (we are actually calling `run` again): a fresh
     // failure in it may log once, even if the previous window already logged.
     s.loggedThisWindow = false;

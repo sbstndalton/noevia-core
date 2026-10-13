@@ -234,3 +234,48 @@ test('#1607: the strikes belong to the credentials: a throttle never carries the
   assert.equal(latch.status('u1', NEW).nextAttemptAt - now, 15 * 60_000, 'a fresh login starts at the base wait');
   assert.equal(latch.blocked('u2', CONN), null, 'another account has nothing');
 });
+
+test('#1615: a legacy account\'s worker ticks do not keep the storage probe; the projects caller gets it once, with the strikes kept', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_000_000 });
+  const latch = createStorageLatch({ now: () => Date.now() });
+  const read = () => CONN;
+  const runs = [];
+  latch.noteDiaryReply('u1', read, { code: 'storageLoginRejected' }, false);
+  const stop = startDiaryBackupWorker({
+    users: () => [{ id: 'u1' }],
+    enabled: () => true,
+    interval: 3000,
+    suspended: (user) => latch.suspendedFor(user.id, read),
+    run: async (user) => { runs.push(Date.now()); const reply = { mode: 'legacy' }; latch.noteDiaryReply(user.id, read, reply, true); return reply; },
+  });
+  const flush = async () => { for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r)); };
+  const tickFor = async (ms) => { for (let spent = 0; spent < ms; spent += 3000) { await t.mock.timers.tick(3000); await flush(); } };
+  await tickFor(15 * 60_000 - 3000);
+  assert.equal(runs.length, 0, 'held for the whole wait');
+  await tickFor(3000 * 3);
+  assert.ok(runs.length >= 1 && runs.length <= 2, 'the worker took the probe, and its own backoff (6 s) keeps the ticks in between away');
+  assert.equal(latch.blocked('u1', CONN), null, 'the projects refresh gets the probe');
+  assert.deepEqual(latch.blocked('u1', CONN), { kind: 'login' }, 'and only one caller does');
+  stop();
+  // The strikes survive: a refusal of that probe doubles the wait.
+  latch.noteDiaryReply('u1', read, { code: 'storageLoginRejected' }, false);
+  assert.equal(latch.status('u1', CONN).nextAttemptAt - Date.now(), 30 * 60_000);
+});
+
+test('#1615: a reply that tested nothing hands the probe back, keeps the strikes, and never shortens a hold still inside its wait', () => {
+  let now = 0;
+  const latch = createStorageLatch({ now: () => now });
+  const read = () => CONN;
+  latch.noteDiaryReply('u1', read, { code: 'storageLoginRejected' }, false);
+  now = 5 * 60_000;
+  latch.noteDiaryReply('u1', read, { mode: 'legacy' }, true); // no probe is out: the hold is untouched
+  assert.deepEqual(latch.blocked('u1', CONN), { kind: 'login' });
+  assert.equal(latch.status('u1', CONN).nextAttemptAt, 15 * 60_000);
+  now = 15 * 60_000;
+  assert.equal(latch.blocked('u1', CONN), null, 'probe taken');
+  latch.noteDiaryReply('u1', read, { mode: 'managed', backup: 'pending' }, true);
+  assert.equal(latch.status('u1', CONN).nextAttemptAt, now, 'handed back');
+  assert.equal(latch.blocked('u1', CONN), null, 'the next caller gets it');
+  latch.note('u1', CONN, { kind: 'login' });
+  assert.equal(latch.status('u1', CONN).nextAttemptAt - now, 30 * 60_000, 'the strikes were kept: a refused probe doubles');
+});

@@ -139,6 +139,20 @@ function createStorageLatch({ now = Date.now } = {}) {
     const failure = failureFromDiaryReply(reply);
     if (failure) note(userId, conn, failure);
     else if (ok && reply && typeof reply === 'object' && reply.storageContacted === true) clear(userId);
+    else giveBackProbe(userId, conn);
+  }
+
+  /** A reply that neither failed nor reached the storage server (a legacy account, no destination, a backup
+   *  that is not due, a run that could not be verified) tested nothing, so the probe that call took is handed
+   *  back: the login latch is due again at once, with its strikes and its hold intact, and the next automatic
+   *  caller (the project refresh) gets it instead of the backup worker taking it every tick (#1615). Only a
+   *  login latch whose probe is out is touched; a hold still inside its wait is never shortened. */
+  function giveBackProbe(userId, conn) {
+    const latch = latches.get(userId);
+    if (latch && latch.kind === 'login' && latch.probing && latch.fingerprint === fingerprintOf(conn)) {
+      latch.until = now();
+      latch.probing = false;
+    }
   }
 
   return { note, blocked, status, statusFor, clear, fingerprintOf, suspendedFor, noteDiaryReply };
