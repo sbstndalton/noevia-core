@@ -403,7 +403,10 @@ function createToolboxes({
         const formatted = tz
           ? new Intl.DateTimeFormat('en-GB', { timeZone: tz, dateStyle: 'full', timeStyle: 'long' }).format(now)
           : now.toString();
-        return `Current time: ${formatted}${tz ? ` (${tz})` : ''} | ISO: ${now.toISOString()}`;
+        // #1603/#1602: the calendar facts for that zone's date, computed (ISO week, day of year, days left), so the
+        // model neither derives them (week 41 for week 42) nor re-counts them for minutes.
+        const ct = require('./current-time-part.cjs');
+        return `Current time: ${formatted}${tz ? ` (${tz})` : ''} | ISO: ${now.toISOString()} | ${ct.factsLine(ct.calendarFacts(now, tz || ct.serverTimeZone()))}`;
       } catch {
         return fail(`ERROR: unknown IANA timezone "${tz}"`);
       }

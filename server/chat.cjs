@@ -471,7 +471,8 @@ function createChatHandler({
     if (accountPart) sysParts.push(accountPart);
     // #1573: today's date and the rule for time-sensitive answers, so a "latest" question is answered from the
     // tool results, not from the model's training data. The day, not the time: see current-time-part.cjs.
-    sysParts.push(require('./current-time-part.cjs').systemPart());
+    const timePart = require('./current-time-part.cjs').systemPart();
+    sysParts.push(timePart);
     const accountMemory = require('./account-memory.cjs');
     const memoryPart = accountMemory.systemPart(accountMemory.read(currentWorkspace().dir), project?.memories);
     if (!project && memoryPart) sysParts.push(memoryPart);
@@ -741,7 +742,10 @@ function createChatHandler({
         const sentText = [sysWithoutBrain, ...msgs.map((m) => (typeof m.content === 'string' ? m.content : ''))].join('\n');
         // #1441: the router reads what the model gets, including a free chat's attached files, which ride
         // with the user's turn rather than the system message.
-        const routerSystem = chatAttachments && filesBlock && !body.compactOnly ? [sysWithoutBrain, filesBlock].join('\n\n') : sysWithoutBrain;
+        // #1644: the server's date block (about 700 characters, no user data) is left out of what the router reads; it
+        // would use most of the 1,000-character chunk. The rest of the system text is still checked in full.
+        const routerBase = sysParts.filter((part) => part !== brainBlock && part !== timePart).join('\n\n');
+        const routerSystem = chatAttachments && filesBlock && !body.compactOnly ? [routerBase, filesBlock].join('\n\n') : routerBase;
         const attachmentNames = [...(project?.assets || []).map((a) => a.name), ...(project?.files || []).map((f) => f.name)].filter((n) => typeof n === 'string');
         const routeUserId = requestScope.getStore()?.workspace?.userId || null;
         const decided = await rm.resolveRoute({
