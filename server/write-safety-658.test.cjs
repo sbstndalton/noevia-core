@@ -113,7 +113,7 @@ test('a Retry after a failed reply that saved a change sends that change as done
   // The client's history for a Retry (src/applied-writes.ts) keeps the failed reply as the record
   // of the change it saved. The model is told it is done; the write is not run again.
   const exports = {};
-  vm.runInNewContext(ts.transpileModule(fs.readFileSync(path.join(__dirname, '../src/applied-writes.ts'), 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS } }).outputText, { exports, require: () => ({}) });
+  vm.runInNewContext(ts.transpileModule(fs.readFileSync(path.join(__dirname, '../src/applied-writes.ts'), 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText, { exports, require: () => ({}) });
   const failed = { id: 'r1', role: 'assistant', content: 'Request failed — synthetic outage', error: true,
     toolCalls: [{ name: 'synthetic_append', args: JSON.stringify(APPEND), status: 'done', applied: true, target: TARGET, result: `Appended 10 chars to "${TARGET}".` }] };
   const transcript = [{ id: 'u1', role: 'user', content: 'Add "Zusatz: 2" to qa-notes.md' }, failed];
@@ -149,7 +149,7 @@ test('a Retry after a failed reply that saved a change sends that change as done
 
 test('Edit and re-run keeps the records of changes the dropped replies saved, so the model is told they are done (#658 review)', async (t) => {
   const exports = {};
-  vm.runInNewContext(ts.transpileModule(fs.readFileSync(path.join(__dirname, '../src/applied-writes.ts'), 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS } }).outputText, { exports, require: () => ({}) });
+  vm.runInNewContext(ts.transpileModule(fs.readFileSync(path.join(__dirname, '../src/applied-writes.ts'), 'utf8'), { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText, { exports, require: () => ({}) });
   const saved = { name: 'synthetic_append', args: JSON.stringify(APPEND), status: 'done', applied: true, target: TARGET, result: 'Appended.' };
   const transcript = [
     { id: 'u1', role: 'user', content: 'Add "Zusatz: 2" to qa-notes.md' },
