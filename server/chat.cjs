@@ -142,6 +142,8 @@ function normalizeReplayHistory(mapped, newMessage) {
 
 // #1553: a reply whose chat template cannot take tools is told so in the request itself. Without this the model
 // said no search tool existed, or wrote search results it never had. The note is ours and holds no tool output.
+// #1604: appended to the system message of a turn routed to the Code role.
+const CODE_ROUTE_NOTE = 'For commands and code: before answering, check that it does exactly what was asked and nothing more (for example, when files are asked for, directories must not appear in the output). When asked why something can mislead or fail, name the concrete mechanism in one sentence.';
 const TOOLS_OFF_MODEL_NOTE = 'No tools can run in this reply: this model\'s chat template cannot use them. If the person asks for a web search, a file, a live lookup or any other tool, say so in one line at the start. Do not write results, sources, excerpts or simulated output for it.';
 // #1646: the prompt lines that send the model to read_project_file, kept in one place so a cloud route without a grant
 // (where that tool is not offered) can reword them. The sources' coverage line lives in rag.cjs.
@@ -1116,6 +1118,11 @@ function createChatHandler({
       const notAttached = `This project has image sources (${quotedNames(unattachedImageNames)}) that are not attached to this message. Say so if asked about them; do not guess at their contents.`;
       wire = wire.some((m) => m.role === 'system') ? wire.map((m) => (m.role === 'system' ? { ...m, content: `${m.content}\n\n${notAttached}` } : m)) : [{ role: 'system', content: notAttached }, ...wire];
     }
+    // #1604: a turn on the Code route gets a short correctness note for commands and code (a one-liner for
+    // "the 5 largest files" listed directories too, and the "why" named no mechanism).
+    if (routedRole === 'code' && !body.compactOnly) {
+      wire = wire.some((m) => m.role === 'system') ? wire.map((m) => (m.role === 'system' ? { ...m, content: `${m.content}\n\n${CODE_ROUTE_NOTE}` } : m)) : [{ role: 'system', content: CODE_ROUTE_NOTE }, ...wire];
+    }
     if (attachedImages.length && !body.compactOnly) {
       const roles = autoRoles();
       const visionModel = roles && roles.vision;
@@ -2009,4 +2016,4 @@ function createChatHandler({
   return { handleChat, handleChatInner };
 }
 
-module.exports = { createChatHandler, normalizeReplayHistory, withIdleLimit };
+module.exports = { createChatHandler, normalizeReplayHistory, withIdleLimit, CODE_ROUTE_NOTE };

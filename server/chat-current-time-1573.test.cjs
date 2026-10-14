@@ -112,3 +112,15 @@ test('#1587: the local default provider keeps the zone name', async (t) => {
   const r = await run(t, {});
   assert.match(systemText(r), /Today is [^\n]*\([A-Za-z_]+(?:\/[A-Za-z_+-]+)*\)\./);
 });
+
+// #1604: an Auto turn routed to Code gets the correctness note for commands; Fast and Smart do not.
+test('#1604: a turn routed to the Code role carries the command-correctness note', async (t) => {
+  const { CODE_ROUTE_NOTE } = require('./chat.cjs');
+  const auto = (role) => ({ routing: 'auto', project: { routing: 'auto' }, deps: { autoRoles: () => ({ fast: 'answer-model', smart: 'answer-model', code: 'answer-model' }), classifyFastOrSmart: async () => role } });
+  const code = await run(t, { message: 'Write a bash one-liner that lists the 5 largest files.' }, auto('code'));
+  assert.equal(code.requests.length, 1);
+  assert.ok(systemText(code).endsWith(CODE_ROUTE_NOTE), systemText(code).slice(-300));
+  assert.match(CODE_ROUTE_NOTE, /directories must not appear/);
+  const fast = await run(t, { message: 'Hello' }, auto('fast'));
+  assert.equal(systemText(fast).includes(CODE_ROUTE_NOTE), false);
+});
