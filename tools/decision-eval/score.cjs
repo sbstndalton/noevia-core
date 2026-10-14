@@ -10,7 +10,11 @@
 // 'perm1'/'perm2' (the same request with the options rotated, for the order-flip rate).
 // A record that is not ok (HTTP error, deadline, invalid answer) counts as wrong everywhere.
 //
-// Usage: node score.cjs --out report.json [--md report.md] [--rss rss.json] results-a.jsonl results-b.jsonl ...
+// --temperature T applies one fixed temperature to every record's scores first (p_i^(1/T),
+// renormalised; the same as dividing logits by T), as a serving adapter would with a model's fitted
+// T. The argmax, so accuracy, does not change; ECE, Brier and coverage at 0.6 do. Default 1 (raw).
+//
+// Usage: node score.cjs --out report.json [--md report.md] [--rss rss.json] [--temperature T] results-a.jsonl results-b.jsonl ...
 
 const fs = require('node:fs');
 
@@ -150,6 +154,21 @@ function temperatureRefit(records) {
   return { temperature: round(best, 2), calibrationN: calibration.length, evaluationN: evaluation.length, eceBefore: round(ece(pairs(1))), eceAfter: round(ece(pairs(best))) };
 }
 
+/** Scores as p_i^(1/t) renormalised (t = 1: unchanged). Non-usable scores are returned as they are. */
+function withTemperature(scores, t) {
+  const p = normalise(scores);
+  if (!p || t === 1) return scores;
+  const w = Object.fromEntries(Object.entries(p).map(([k, v]) => [k, Math.max(v, 1e-9) ** (1 / t)]));
+  const total = Object.values(w).reduce((a, b) => a + b, 0);
+  return Object.fromEntries(Object.entries(w).map(([k, v]) => [k, v / total]));
+}
+
+/** Records with one fixed temperature applied to their scores (see --temperature). */
+function applyTemperature(records, t = 1) {
+  if (!(Number.isFinite(t) && t > 0)) throw Error('temperature must be a positive number');
+  return t === 1 ? records : records.map((r) => (r.ok ? { ...r, scores: withTemperature(r.scores, t) } : r));
+}
+
 function groupBy(records, key) {
   const out = new Map();
   for (const r of records) { const k = key(r); if (!out.has(k)) out.set(k, []); out.get(k).push(r); }
@@ -252,13 +271,14 @@ function main(argv) {
   const args = { files: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === '--out' || a === '--md' || a === '--rss') args[a.slice(2)] = argv[++i];
+    if (a === '--out' || a === '--md' || a === '--rss' || a === '--temperature') args[a.slice(2)] = argv[++i];
     else args.files.push(a);
   }
   if (!args.files.length || !args.out) throw Error('usage: node score.cjs --out report.json [--md report.md] [--rss rss.json] results.jsonl...');
   const rss = args.rss ? JSON.parse(fs.readFileSync(args.rss, 'utf8')) : {};
-  const summaries = args.files.map((f) => summarize(readJsonl(f)));
-  fs.writeFileSync(args.out, JSON.stringify({ generatedAt: new Date().toISOString(), rss, summaries }, null, 2) + '\n');
+  const temperature = args.temperature === undefined ? 1 : Number(args.temperature);
+  const summaries = args.files.map((f) => summarize(applyTemperature(readJsonl(f), temperature)));
+  fs.writeFileSync(args.out, JSON.stringify({ generatedAt: new Date().toISOString(), temperature, rss, summaries }, null, 2) + '\n');
   if (args.md) fs.writeFileSync(args.md, markdown(summaries, rss));
 }
 
@@ -266,4 +286,4 @@ if (require.main === module) {
   try { main(process.argv.slice(2)); } catch (e) { console.error(e.message); process.exit(1); }
 }
 
-module.exports = { normalise, judge, percentile, ece, brier, macroF1, flipRate, temperatureRefit, block, summarize, markdown, weakLanguages, purposeKey, readJsonl };
+module.exports = { applyTemperature, withTemperature, normalise, judge, percentile, ece, brier, macroF1, flipRate, temperatureRefit, block, summarize, markdown, weakLanguages, purposeKey, readJsonl };

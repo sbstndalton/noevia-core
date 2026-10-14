@@ -178,8 +178,10 @@ function readoutOptions(offered, { boxes, readOnly, bias, limits }) {
     const rank = (t) => { const i = preferred.indexOf(toolName(t)); return i < 0 ? preferred.length : i; };
     readTools = readTools.map((t, i) => [t, i]).sort((a, b) => rank(a[0]) - rank(b[0]) || a[1] - b[1]).map(([t]) => t);
   }
-  const question = typeof bias?.hint === 'string' && bias.hint ? `${QUESTION} ${bias.hint.slice(0, 160)}` : QUESTION;
-  return { readTools, preferred, question, shape: () => shapeOptions(readTools, limits, boxes, question.length, preferred) };
+  const hint = typeof bias?.hint === 'string' && bias.hint ? bias.hint.slice(0, 160) : '';
+  const question = hint ? `${QUESTION} ${hint}` : QUESTION;
+  const budgetChars = BUDGET_QUESTION_CHARS + (hint ? 1 + hint.length : 0);
+  return { readTools, preferred, question, shape: () => shapeOptions(readTools, limits, boxes, budgetChars, preferred) };
 }
 
 /** readout's reading of a service answer that is not a fallback: { reason, confidence? } or
@@ -353,7 +355,19 @@ function createToolGate({ enabled, decide, boxes = DEFAULT_BOXES, isWriteTool, l
   return { evaluate, record };
 }
 
-const QUESTION = 'Which tool, if any, must the assistant call before answering this user message?';
+// #1639: wording tuned for Kev-0.8B on a seeded tuning split of tools/decision-eval's synthetic cases
+// (48.5% -> 69.1% there; the held-out result is on the issue). The old question's "must" made the model
+// answer "none" to nearly every message, and saying that the assistant on its own has no current news
+// and none of the user's data is what moved web search from 2/16 to 13/16.
+const QUESTION = 'Without tools the assistant knows no current news and nothing the user wrote or saved. Which tool does it need, if any?';
+// The option budget counts the question as 79 characters plus any hint, exactly as the Rust port does
+// (noevia-rs crates/tool-gate QUESTION.len(); TOOL_GATE_IMPL=wasm compares the shaped options, and
+// tests/fixtures/tool-gate.v1.json must stay byte-identical with the port's copy). So the options are the
+// ones shipped before #1639; only the question text changed. The question is 40 characters longer than
+// the budget assumes: the 360-character choice budget approximates Laya's 160-token option head at under
+// three characters per token, so a request stays inside the real budget (the live service accepted every
+// held-out request, #1639). Change this number only together with the port.
+const BUDGET_QUESTION_CHARS = 79;
 const NONE_ID = 'none';
 const MIN_LABEL_CHARS = 12;
 
@@ -365,7 +379,7 @@ const MIN_LABEL_CHARS = 12;
  * with a label of at least MIN_LABEL_CHARS; the service sees the id, so the label is the description
  * alone. "none" is always the last option. `trimmed` counts tools left out.
  */
-function shapeOptions(readTools, limits, boxes = DEFAULT_BOXES, questionChars = QUESTION.length, preferred = []) {
+function shapeOptions(readTools, limits, boxes = DEFAULT_BOXES, questionChars = BUDGET_QUESTION_CHARS, preferred = []) {
   const describe = (t) => String(t.function?.description || '').replace(/\s+/g, ' ').trim();
   if (!limits || !Number.isFinite(limits.maxOptions)) {
     const tools = readTools.slice(0, MAX_OPTIONS - 1);
@@ -472,6 +486,6 @@ function stricterDecision(js, port) {
   return { tool: js.tool, mode: 'require' };
 }
 
-module.exports = { createToolGate, shapeOptions, searchQuery, diaryMonth, publicUrlPattern, prefetchableSearch, DEFAULT_BOXES, DEFAULT_MIN_CONFIDENCE,
+module.exports = { createToolGate, shapeOptions, BUDGET_QUESTION_CHARS, searchQuery, diaryMonth, publicUrlPattern, prefetchableSearch, DEFAULT_BOXES, DEFAULT_MIN_CONFIDENCE,
   toolGateImpl, ruleDecisionWith, readoutOptions, readAnswer, toolProjection, offeredProjection, boxesProjection, limitsProjection,
   numberProjection, stricterDecision, QUESTION };

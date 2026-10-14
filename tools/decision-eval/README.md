@@ -11,6 +11,7 @@ Synthetic cases only: no chats, no Diary.
 | `adapter.cjs` | Our `{state, question, options}` to a TypeSafe `choice` question and back: renormalises the 4-decimal probabilities, takes the argmax, refuses an exact tie, and checks the result with core's five contract rules. |
 | `run.cjs` | Sends the requests one at a time to our contract (`--target laya`) or through the adapter (`--target ollaya`), records the raw scores and latency per request, resumes after a stop, and pauses when the idle gate closes. Dependency-free, so it runs with the host's Node. |
 | `score.cjs` | Scores the raw outputs itself (it does not need core's `confidence`, see #1640): accuracy, macro-F1, ECE (10 bins) and Brier on the selected option's probability, risk-coverage at 0.6, p50/p95/max latency and misses over 1.3 s and 1.8 s, per purpose, per language, sensitive recall, escalations caught, and the order-flip rate. Writes JSON and markdown tables. |
+| `split.cjs` | A fixed tuning/held-out split (phase A of #1639): stratified by purpose, language and label, seeded (mulberry32), about 60/40 by case; a case's `nocode`/`perm*` variants follow it. Wording is tuned on the tuning split only and measured on the held-out split. |
 | `gate.sh` | Read-only idle gate for the inference host (auto-tune, chat activity, engine activity, Coding jobs, available memory). |
 | `run-candidates.sh` | Runs every request against each candidate in turn, one loaded at a time, in a fresh offline container per candidate (so its memory peak is its own); gate and memory check before each load; resumable. |
 | `host.sh` | The one resource-capped evaluation container (CPU only, 4 CPUs, 5 GB, 127.0.0.1, its own network): setup, start, pull by digest, load with a memory check, peak memory, stop. |
@@ -20,6 +21,8 @@ node build-requests.cjs --out requests.jsonl --smoke 20 --smoke-out smoke.jsonl
 node run.cjs --requests requests.jsonl --out laya.jsonl --target laya --url http://<laya>:8040 --min-interval-ms 1000 --gate ./gate.sh
 node run.cjs --requests requests.jsonl --out decima.jsonl --target ollaya --url http://127.0.0.1:11535 --model decima:small --api-key-file <key> --warmup 3 --gate ./gate.sh
 node score.cjs --out report.json --md report.md --rss rss.json laya.jsonl decima.jsonl
+node split.cjs --requests requests.jsonl --seed 1639 --tune tune.jsonl --heldout heldout.jsonl
+node score.cjs --temperature 0.6 --out kev.json --md kev.md kev-heldout.jsonl   # a model's fitted T, as its adapter applies it
 ```
 
 `run.cjs` sends only to loopback or private IP literals (or `localhost`) unless `--allow-remote` is
