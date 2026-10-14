@@ -369,7 +369,8 @@ async function servedModels(target, { timeoutMs = 10000 } = {}) {
     // #1668: a llama.cpp router lists every preset with status.value; only a loaded one is served.
     // An unloaded preset would be loaded on demand, but nothing has proved it runs, and a switch
     // must never label vectors with a model the server has not actually loaded.
-    if (m?.status && typeof m.status === 'object' && 'value' in m.status && m.status.value !== 'loaded') continue;
+    // #1758: a sleeping model is served too: it ran, and the next request wakes it.
+    if (m?.status && typeof m.status === 'object' && 'value' in m.status && !['loaded', 'sleeping'].includes(m.status.value)) continue;
     if (typeof m?.id === 'string') ids.add(m.id);
     for (const a of Array.isArray(m?.aliases) ? m.aliases : []) if (typeof a === 'string') ids.add(a);
   }
@@ -431,8 +432,9 @@ async function embed(texts, { signal, kind = 'document', titles = null, target =
   return embedFramed(t, frame(t.profile, texts, { kind, titles }), signal);
 }
 
-// A project file's title for the document framing: its own name (the last path segment).
-const titleOf = (fileName) => String(fileName || '').split('/').pop();
+// #1636: project chunks are framed with the profile's untitled document prompt
+// (embeddinggemma-2: `title: none | text: …`), the same as the Diary's index. File names are not
+// sent: a name is not part of the chunk's text, and both indexes must use one framing.
 
 function openIndex(projectId, userId) {
   // Queued indexing may begin after account deletion. Refuse the directory
@@ -528,7 +530,7 @@ async function embedRowsInto(index, target, rows, { isCurrent = () => true, batc
   for (let i = 0; i < rows.length; i += batchSize) {
     if (!isCurrent()) break;
     const batch = rows.slice(i, i + batchSize);
-    const vectors = await embed(batch.map((r) => r.body), { kind: 'document', titles: batch.map((r) => titleOf(r.file)), target, signal });
+    const vectors = await embed(batch.map((r) => r.body), { kind: 'document', target, signal });
     // A newer run (or a delete) replaced these chunks while we were embedding: writing now
     // would attach vectors to ids that no longer mean this text.
     if (!isCurrent()) break;

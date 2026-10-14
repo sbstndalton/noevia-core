@@ -427,7 +427,7 @@ function createFullAutotuner({ request: engineRequest, rawModels: engineRawModel
       const held = await heldForeign(r.body.data, tuning);
       if (held.length) return 'Another client has ' + idList(held) + ' loaded.';
     }
-    for (const row of r.body.data) if (['loaded', 'loading'].includes(row.status?.value)) {
+    for (const row of r.body.data) if (['loaded', 'loading', 'sleeping'].includes(row.status?.value)) {
       asked.add(row.id);
       if (!restoring) check();
       const u = await request('/models/unload', { method: 'POST', body: JSON.stringify({ model: row.id }) }, 60000);

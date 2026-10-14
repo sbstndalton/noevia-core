@@ -293,3 +293,15 @@ test('#872 the manager reports a running calibration to the folder sync',async t
   release();await finished(manager);
   assert.equal(manager.tuningActive(),false);assert.equal(manager.maintenanceHeld(),false);
 });
+
+test('#1758 a sleeping model is asked to unload before calibration, so the wait for "all unloaded" ends',async t=>{
+  // A clock that always moves, so the unload wait ends (with an error) instead of spinning.
+  const f=fixture(t,{loadCap:131072,extra:{now:(()=>{let n=0;return ()=>(n+=1000);})()}});
+  f.router.status.other='sleeping';
+  const unloads=[];const calls=f.router.calls;
+  assert.equal((await f.manager.calibration.start('synthetic',{promptBudgetSeconds:60,confirmPause:true})).status,202);
+  const job=await finished(f.manager);
+  assert.doesNotMatch(String(job.error||''),/did not unload in time/);
+  assert.equal(f.router.status.other,'unloaded');
+  assert.ok(calls.includes('/models/unload'),unloads);
+});

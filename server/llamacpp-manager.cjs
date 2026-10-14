@@ -26,6 +26,15 @@ function keepAlongside(env = process.env) {
   return [...String(e || '').split('\u0000').filter((m) => m && m !== 'default'), ...(r ? [r] : [])];
 }
 
+// #1758: a model llama.cpp put to sleep (--sleep-idle-seconds) is available: its process is
+// running, and the next request wakes it (the router's is_running() counts it, so POST
+// /models/load answers 400 "already running"). Its weights are freed, so it is NOT resident for
+// the memory budget or the one-chat-model eviction, which keep counting only loaded/loading.
+const AVAILABLE_STATES = new Set(['loaded', 'sleeping']);
+// `model.status` (not `model?.`) keeps the old answer for a null row: the listing is invalid (#1650 corpus).
+const isAvailable = model => AVAILABLE_STATES.has(model.status?.value);
+const alreadyRunning = result => result?.status === 400 && /already running/i.test(JSON.stringify(result?.body ?? ''));
+
 function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig = {}, calibrationStatePath, calibrationOptions = {}, evidenceDir, autotuneStatePath, autotuneOptions = {}, presetWriter = null, unloadWait = {}, inferenceBudget = null, reloadStatePath = null, reloadGuard: reloadGuardOption = null }) {
   const base = String(baseUrl || '').replace(/\/+$/, '').replace(/\/v1$/, '');
   const url = new URL(base);
@@ -121,7 +130,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
       id: model.id,
       status: { value: model.status?.value || 'unknown', failed: model.status?.failed === true },
       source: model.source || null, can_remove: model.can_remove === true,
-      loaded: model.status?.value === 'loaded',
+      loaded: isAvailable(model),
       labels: nativeLabels(model),
       // Router metadata is an architecture ceiling, never a live allocation.
       max_context_window: Number.isFinite(model.meta?.n_ctx_train) ? model.meta.n_ctx_train : null,
@@ -133,7 +142,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     const response = await rawModels();
     if (!response.ok) return response;
     if (!Array.isArray(response.body?.data)) throw Error('Invalid llama.cpp model listing');
-    const loaded = response.body.data.filter(model => model.status?.value === 'loaded');
+    const loaded = response.body.data.filter(isAvailable);
     const models = [];
     // Bound concurrent router requests. autoload=false is essential: polling
     // must not evict an active model or wake an unloaded one on a small GPU.
@@ -143,7 +152,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
         try { props = await request('/props' + modelQuery(model.id)); } catch {}
         const context = props?.ok ? Number(props.body?.default_generation_settings?.n_ctx) : NaN;
         const slots = props?.ok ? Number(props.body?.total_slots) : NaN;
-        return { model_name: model.id, loaded: true, backend_alive: props?.ok === true,
+        return { model_name: model.id, loaded: true, ...(model.status?.value === 'sleeping' ? { sleeping: true } : {}), backend_alive: props?.ok === true,
           recipe_options: { native_profile: require('node:crypto').createHash('sha256').update(JSON.stringify([model.id,model.status?.args,model.meta])).digest('hex'), ...(Number.isSafeInteger(context) && context > 0 ? { ctx_size: context } : {}) },
           slots: Number.isSafeInteger(slots) && slots > 0 ? slots : null,
           engineVersion: props?.ok ? props.body?.build_info || null : null };
@@ -163,6 +172,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     if (refusal) throw Object.assign(admissionError(refusal.body.error), { code: refusal.body.code });
     const listing = await rawModels(signal);
     if (!listing.ok || !Array.isArray(listing.body?.data)) throw admissionError('Could not check loaded models before switching. Try again.');
+    const targetStatus = listing.body.data.find((m) => m.id === model)?.status?.value ?? null;
     const others = listing.body.data.filter((m) => m.id !== model && !keep.includes(m.id) && ['loaded', 'loading'].includes(m.status?.value));
     for (const m of others) {
       signal?.throwIfAborted();
@@ -186,9 +196,18 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
         delay = Math.min(delay * 2, 1000);
       }
     }
+    // The target's status as listed before any eviction (#1758: load() skips a sleeping one).
+    return { targetStatus };
   }
   async function makeRoomFor(model, keep = keepAlongside(), signal) {
-    return withAdmission(() => makeRoomForUnlocked(model, keep, signal), signal);
+    await withAdmission(() => makeRoomForUnlocked(model, keep, signal), signal);
+  }
+  const alreadyRunningLogged = new Set();
+  function logAlreadyRunning(model) {
+    if (alreadyRunningLogged.has(model)) return;
+    alreadyRunningLogged.add(model);
+    if (alreadyRunningLogged.size > 64) alreadyRunningLogged.delete(alreadyRunningLogged.values().next().value);
+    console.log('[llamacpp] ' + JSON.stringify({ event: 'load-already-running', model }));
   }
   async function load(model, options = {}, signal) {
     if (Object.keys(options).length) return unsupported('Runtime option changes; configure a native model preset');
@@ -196,13 +215,21 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     try {
       return await withAdmission(async () => {
         signal?.throwIfAborted();
-        try { await makeRoomForUnlocked(model, keepAlongside(), signal); }
+        let room;
+        try { room = await makeRoomForUnlocked(model, keepAlongside(), signal); }
         catch (error) {
           if (signal?.aborted) throw error;
           return {ok:false,status:error.status || 502,body:{error:error.publicMessage || 'Could not make room for the selected model.',...(error.code?{code:error.code}:{})}};
         }
         signal?.throwIfAborted();
-        const started=await post('/models/load', { model },120000,signal);
+        // #1758: never ask the router to load a sleeping model; the next request wakes it.
+        if(room?.targetStatus==='sleeping')return {ok:true,status:200,body:{success:true,sleeping:true}};
+        let started=await post('/models/load', { model },120000,signal);
+        // Woke or slept between the listing and the load: the router already runs it (#1758).
+        if(alreadyRunning(started)){
+          logAlreadyRunning(model);
+          started={ok:true,status:200,body:{success:true,alreadyRunning:true}};
+        }
         if(!started.ok)return started;
         // Native load acknowledges launch; readiness must be observed separately.
         const deadline=Date.now()+120000;
@@ -211,7 +238,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
           const listing=await rawModels(signal);
           if(!listing.ok)return listing;
           const entry=listing.body?.data?.find(m=>m.id===model);
-          if(entry?.status?.value==='loaded')return started;
+          if(entry&&isAvailable(entry))return started;
           if(!entry || entry.status?.failed || entry.status?.value==='unloaded')return {ok:false,status:502,body:{error:'The native model failed to become ready. Check its artifact and preset.'}};
           await new Promise(resolve=>setTimeout(resolve,200));
         }
@@ -507,7 +534,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     const rows = [];
     for (const m of listing.body.data) {
       const est = await footprint(m.id).catch(() => null);
-      rows.push({ model: m.id, loaded: m.status?.value === 'loaded', labels: nativeLabels(m),
+      rows.push({ model: m.id, loaded: m.status?.value === 'loaded', sleeping: m.status?.value === 'sleeping', labels: nativeLabels(m),
         system: isSystemModel(m.id, modelPathFromArgs(m.status?.args)), estimate: est,
         fits: est && budgetGib ? !est.cacheRamUnbounded && Number.isFinite(est.totalGib) && est.totalGib <= budgetGib : null });
     }

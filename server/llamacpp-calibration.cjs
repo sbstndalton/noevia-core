@@ -131,7 +131,7 @@ function createCalibrator(deps) {
       const held = live.length && foreignHeld ? await foreignHeld(models) : live.map(m => m.id);
       if (held.length) throw Error('Another client has a model loaded.');
     }
-    for (const m of models) if (m.id !== except && ['loaded', 'loading'].includes(m.status?.value)) { asked.add(m.id); await request('/models/unload', { method: 'POST', body: JSON.stringify({ model: m.id }) }, limits.unload).catch(() => {}); }
+    for (const m of models) if (m.id !== except && ['loaded', 'loading', 'sleeping'].includes(m.status?.value)) { asked.add(m.id); await request('/models/unload', { method: 'POST', body: JSON.stringify({ model: m.id }) }, limits.unload).catch(() => {}); }
     const deadline = now() + limits.unload;
     while (now() < deadline) {
       const rows = await listing();
