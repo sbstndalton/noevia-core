@@ -206,7 +206,7 @@ test('the model-manager delete proxy rejects a system model by its scanned key, 
     { key: 'k-synthetic', modelId: 'synthetic', sections: ['synthetic'] },
   ] } });
   await f.call('POST', '/api/model-manager/models/delete', { models: ['k-laya'] }, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'System routing model — not deleted' } });
+  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'System routing model — not deleted', errorId: 'systemModel', service: 'decision' } });
   assert.equal(f.fetched.length, 0, 'the model management service is never called for a blocked delete');
   await f.call('POST', '/api/model-manager/models/delete', { models: ['k-synthetic'] }, 'admin');
   assert.equal(f.sent.pop().status, 200, 'an ordinary model still deletes through the proxy');
@@ -225,7 +225,7 @@ test('#336: the model-manager delete proxy also refuses the configured embedding
     { key: 'k-synthetic', modelId: 'synthetic', sections: ['synthetic'] },
   ] } });
   await f.call('POST', '/api/model-manager/models/delete', { models: ['k-embed'] }, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 409, body: { error: 'A running sidecar (embedding or reranking) depends on this model — not deleted' } });
+  assert.deepEqual(f.sent.pop(), { status: 409, body: { error: 'A running sidecar (embedding or reranking) depends on this model — not deleted', errorId: 'modelInUse', service: 'embedding' } });
   assert.equal(f.fetched.length, 0, 'the model management service is never called for a blocked delete');
   await f.call('POST', '/api/model-manager/models/delete', { models: ['k-synthetic'] }, 'admin');
   assert.equal(f.sent.pop().status, 200, 'an ordinary model still deletes through the proxy');
@@ -281,21 +281,21 @@ test('the model-manager sections proxy rejects delete and rename of a Laya secti
     { key: 'k-synthetic', modelId: 'synthetic', sections: ['synthetic'] },
   ] } });
   await f.call('DELETE', '/api/model-manager/sections/laya_multilingual_f16', undefined, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'System routing model — not deleted' } });
+  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'System routing model — not deleted', errorId: 'systemModel', service: 'decision' } });
   assert.equal(f.fetched.length, 0, 'a blocked delete never reaches the model management service');
   f.scan.set('models', { at: Date.now(), body: { models: [
     { key: 'k-laya', modelId: 'laya_multilingual_f16', sections: ['laya_multilingual_f16'] },
     { key: 'k-synthetic', modelId: 'synthetic', sections: ['synthetic'] },
   ] } });
   await f.call('POST', '/api/model-manager/sections/laya_multilingual_f16/rename', { to: 'renamed' }, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'System routing model — not deleted' } });
+  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'System routing model — not deleted', errorId: 'systemModel', service: 'decision' } });
   assert.equal(f.fetched.length, 0, 'a blocked rename never reaches the model management service');
   // A cached scan section id that only resolves to Laya through its modelId is caught too.
   f.scan.set('models', { at: Date.now(), body: { models: [
     { key: 'k-router', modelId: 'router_a', sections: ['laya-router-section'] },
   ] } });
   await f.call('DELETE', '/api/model-manager/sections/laya-router-section', undefined, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'System routing model — not deleted' } });
+  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'System routing model — not deleted', errorId: 'systemModel', service: 'decision' } });
   assert.equal(f.fetched.length, 0);
   f.scan.set('models', { at: Date.now(), body: { models: [
     { key: 'k-synthetic', modelId: 'synthetic', sections: ['synthetic'] },
@@ -311,7 +311,7 @@ test('#336: the sections proxy refuses to delete the configured embedding model\
     { key: 'k-embed', modelId: 'nomic-embed-text-v1', sections: ['nomic-embed-text-v1'] },
   ] } });
   await f.call('DELETE', '/api/model-manager/sections/nomic-embed-text-v1', undefined, 'admin');
-  assert.deepEqual(f.sent.pop(), { status: 409, body: { error: 'A running sidecar (embedding or reranking) depends on this model — not deleted' } });
+  assert.deepEqual(f.sent.pop(), { status: 409, body: { error: 'A running sidecar (embedding or reranking) depends on this model — not deleted', errorId: 'modelInUse', service: 'embedding' } });
   assert.equal(f.fetched.length, 0, 'a blocked delete never reaches the model management service');
   // Rename is out of scope for this delete guard; it still forwards.
   f.scan.set('models', { at: Date.now(), body: { models: [

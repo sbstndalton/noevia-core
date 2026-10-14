@@ -128,8 +128,15 @@ const SYSTEM_MODEL_DELETE_REASON = 'System routing model — not deleted';
 // (rollback) models: each of them still has a server and stored vectors that depend on it.
 function sidecarModelNames(env = process.env) {
   const names = new Set();
-  const embedNames = [String(env.EMBEDDING_MODEL || env.EMBED_MODEL || '').trim(), String(env.EMBEDDING_NEXT_MODEL || '').trim(),
-    ...(require('./embedding-config.cjs').current()?.modelNames() || [])];
+  // #1660 review: the environment only seeds the embedding configuration (#1638). Once a saved
+  // configuration exists, it alone says which models still have vectors depending on them; an
+  // env-named model it no longer references (switched away and finished) is free to delete.
+  // Without a saved configuration the env names stay protected (#336).
+  const config = require('./embedding-config.cjs').current();
+  let saved = false;
+  try { saved = config?.get?.()?.source === 'saved'; } catch { saved = false; }
+  const embedNames = [...(saved ? [] : [String(env.EMBEDDING_MODEL || env.EMBED_MODEL || '').trim(), String(env.EMBEDDING_NEXT_MODEL || '').trim()]),
+    ...(config?.modelNames() || [])];
   for (const embed of embedNames) if (embed && embed.toLowerCase() !== 'default') names.add(embed);
   const rerankOn = /^(1|true|on)$/i.test(String(env.NOEVIA_FEATURE_RAG_RERANK || ''));
   const rerank = rerankOn ? String(env.RERANK_MODEL || '').trim() : '';

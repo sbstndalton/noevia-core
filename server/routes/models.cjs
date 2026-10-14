@@ -299,12 +299,15 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
         }
         if(keys.length){
           const blocked=keys.some(key=>{const entry=scanned.find(f=>f.key===key);return entry&&(isSystemModel(entry.modelId)||(entry.sections||[]).some(s=>isSystemModel(s)));});
-          if(blocked)return json(res,400,{error:SYSTEM_MODEL_DELETE_REASON});
+          if(blocked)return json(res,400,{error:SYSTEM_MODEL_DELETE_REASON,errorId:'systemModel',service:'decision'});
           // #336: the folder-scan delete removes files directly, bypassing the /api/models/delete
           // guard below entirely — without this, canDelete:false on the installed list (models.cjs)
           // is cosmetic, since the client falls back to this very endpoint whenever canDelete is false.
           const sidecarBlocked=keys.some(key=>{const entry=scanned.find(f=>f.key===key);return entry&&(isSidecarModel(entry.modelId,env)||(entry.sections||[]).some(s=>isSidecarModel(s,env)));});
-          if(sidecarBlocked)return json(res,409,{error:SIDECAR_MODEL_DELETE_REASON});
+          if(sidecarBlocked){
+            const held=keys.map(key=>scanned.find(f=>f.key===key)).filter(Boolean).flatMap(e=>[e.modelId,...(e.sections||[])]).find(n=>isSidecarModel(n,env));
+            return json(res,409,{error:SIDECAR_MODEL_DELETE_REASON,errorId:'modelInUse',service:sidecarServiceOf(held)});
+          }
         }
         deleteKeys=keys; deleteScanned=scanned;
       }
@@ -316,12 +319,12 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
         const scanned = modelScanCache.get('models')?.body?.models;
         const cachedEntry = Array.isArray(scanned) ? scanned.find(f => (f.sections||[]).includes(name)) : null;
         if (isSystemModel(name) || (cachedEntry && isSystemModel(cachedEntry.modelId))) {
-          return json(res,400,{error:SYSTEM_MODEL_DELETE_REASON});
+          return json(res,400,{error:SYSTEM_MODEL_DELETE_REASON,errorId:'systemModel',service:'decision'});
         }
         // Delete-only guard (#336): removing the section for a model a live sidecar depends on
         // leaves that sidecar pointed at nothing. Rename is left alone — out of scope here.
         if (method === 'DELETE' && (isSidecarModel(name, env) || (cachedEntry && isSidecarModel(cachedEntry.modelId, env)))) {
-          return json(res, 409, { error: SIDECAR_MODEL_DELETE_REASON });
+          return json(res, 409, { error: SIDECAR_MODEL_DELETE_REASON, errorId: 'modelInUse', service: sidecarServiceOf(isSidecarModel(name, env) ? name : cachedEntry.modelId) });
         }
         // #697: a section saved through the model manager replaces the whole section; refuse it when
         // the settings would not fit the inference memory budget, as the preset editor does.

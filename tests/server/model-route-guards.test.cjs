@@ -40,7 +40,7 @@ test('model-manager delete of Laya is refused even when the scan cache was just 
   await f.call('POST', '/api/models/unload', { name: 'x' }); // any /api/models write clears the cache
   assert.equal(f.scan.size, 0);
   await f.call('POST', '/api/model-manager/models/delete', { models: [LAYA_KEY] });
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'System routing model — not deleted' } });
+  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'System routing model — not deleted', errorId: 'systemModel', service: 'decision' } });
   assert.deepEqual(f.fetched.map(x => x.method), ['GET'], 'scanned first, never forwarded the delete');
 });
 
