@@ -241,7 +241,7 @@ function embeddingOff(target = null) {
   const service = require('./embedding-service.cjs').current();
   if (!service || !service.managed() || service.enabled()) return false;
   const t = target || embeddingConfig.active();
-  return !t || !t.baseUrl || t.baseUrl === service.baseUrl;
+  return !t || !t.baseUrl || service.isAt(t.baseUrl);
 }
 
 async function retrievalStatus() {

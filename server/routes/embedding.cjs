@@ -93,7 +93,7 @@ function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJs
   function servedSet(c) {
     const out = [];
     for (const t of [c.active, c.next, c.previous]) {
-      if (!t || (t.baseUrl || null) !== service.baseUrl || out.some((e) => e.model === t.model)) continue;
+      if (!t || !service.isAt(t.baseUrl) || out.some((e) => e.model === t.model)) continue;
       const file = service.fileOf(t.model);
       if (file) out.push({ model: t.model, file });
     }
@@ -121,9 +121,12 @@ function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJs
     if (c.next) return reply(409, { error: 'A re-index is already under way. Finish or cancel it first.', code: 'reindexUnderway' });
     const file = resolveFile ? await resolveFile(model).catch(() => null) : null;
     if (!file) return reply(404, { error: `${model} is not an installed model file.`, code: 'modelNotInstalled' });
-    const target = { baseUrl: service.baseUrl, model, profile: body.profile };
+    // Keep the address spelled as the active target has it (with or without /v1): the endpoint is
+    // part of the saved target, and the same server must not look like a move.
+    const address = c.active && service.isAt(c.active.baseUrl) ? c.active.baseUrl : service.baseUrl;
+    const target = { baseUrl: address, model, profile: body.profile };
     const fromOff = !service.enabled();
-    const activeOnService = c.active && (c.active.baseUrl || null) === service.baseUrl && !fromOff;
+    const activeOnService = c.active && service.isAt(c.active.baseUrl) && !fromOff;
     const keep = activeOnService ? servedSet({ active: c.active }) : [];
     if (keep.some((e) => e.model === model)) return reply(409, { error: `${model} is already the embedding model.`, code: 'alreadyActive' });
     try { await service.serve([...keep, { model, file }]); } catch (err) { return reply(err.status || 502, { error: err.message, code: err.code }); }
@@ -133,7 +136,7 @@ function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJs
     if (fromOff && c.active && sameTarget(c.active, { ...target, profile: target.profile || c.active.profile })) {
       return reply(200, { service: service.status(), projects: migration.status() });
     }
-    const r = await apply({ action: 'set-next', scope: 'all', target: { ...target, diaryBaseUrl: service.baseUrl } }, authn);
+    const r = await apply({ action: 'set-next', scope: 'all', target: { ...target, diaryBaseUrl: address } }, authn);
     return { status: r.status, body: { ...r.body, service: service.status() } };
   }
 

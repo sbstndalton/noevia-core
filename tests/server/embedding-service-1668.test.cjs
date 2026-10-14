@@ -142,7 +142,8 @@ function fakeRag(svcState) {
 }
 
 function harness(loader, { waitTimeoutMs = 10000 } = {}) {
-  const config = createEmbeddingConfig({ env: { EMBEDDING_MODEL: 'nomic-embed-text-v1', EMBEDDING_BASE_URL: SVC }, log: () => {} });
+  // Live spelling: the saved/seeded address carries /v1, the service address does not.
+  const config = createEmbeddingConfig({ env: { EMBEDDING_MODEL: 'nomic-embed-text-v1', EMBEDDING_BASE_URL: `${SVC}/v1` }, log: () => {} });
   const fr = fakeRag(loader.state);
   const migration = createEmbeddingMigration({ config, rag: fr, env: {}, sleep: async () => {}, log: () => {} });
   const diaryCalls = [];
@@ -172,9 +173,9 @@ test('switch: the service serves old + new, waits for the new alias, re-indexes 
     assert.equal(r.status, 200, JSON.stringify(r.body));
     assert.deepEqual(loader.state.puts[0], ['nomic-embed-text-v1', 'embeddinggemma-2'], 'the active model keeps serving search during the re-index');
     assert.equal(h.config.next().model, 'embeddinggemma-2');
-    assert.equal(h.config.next().baseUrl, SVC);
+    assert.equal(h.config.next().baseUrl, `${SVC}/v1`, 'the same server keeps the active target\'s spelling');
     const diarySetNext = h.diaryCalls.find((c) => c.action === 'set-next');
-    assert.equal(diarySetNext.target.base_url, SVC, 'the Diary gets the same known address (diaryEndpointRequired)');
+    assert.equal(diarySetNext.target.base_url, `${SVC}/v1`, 'the Diary gets the same known address (diaryEndpointRequired)');
     assert.equal(isSidecarModel('nomic-embed-text-v1', {}), true, 'still serving search: not deletable');
     assert.equal((await post(routes, { action: 'switch' })).status, 200);
     assert.equal(isSidecarModel('nomic-embed-text-v1', {}), true, 'kept for rollback until finish');
@@ -295,4 +296,12 @@ test('overview: a managed service offers every installed embedding model and "tu
   const member = modelAssignments({ installed, embedding, admin: false, service: { managed: true, enabled: true } }).services[0];
   assert.equal(member.canTurnOff, undefined);
   assert.equal(member.options, undefined);
+});
+
+test('addresses with and without /v1 or a trailing slash name the same service', () => {
+  const { sameAddress } = require('../../server/embedding-service.cjs');
+  assert.equal(sameAddress('http://embed:8080/v1', 'http://embed:8080'), true);
+  assert.equal(sameAddress('http://embed:8080/', 'http://embed:8080/v1/'), true);
+  assert.equal(sameAddress('http://embed-next:8080/v1', 'http://embed:8080'), false);
+  assert.equal(sameAddress(null, 'http://embed:8080'), false);
 });

@@ -19,6 +19,12 @@
 // `managed()` stays false and every caller keeps the pre-#1668 behaviour.
 
 const POLL_MS = 2000;
+
+/** Two embeddings addresses name the same server: trailing slashes and a trailing /v1 do not count. */
+function sameAddress(a, b) {
+  const n = (v) => String(v ?? '').trim().replace(/\/+$/, '').replace(/\/v1$/, '') || null;
+  return n(a) === n(b);
+}
 const STALE_MS = 15000;
 
 function createEmbeddingService({ env = process.env, fetchJson, now = Date.now, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), log = (line) => console.info(line) } = {}) {
@@ -48,6 +54,8 @@ function createEmbeddingService({ env = process.env, fetchJson, now = Date.now, 
 
   const api = {
     baseUrl,
+    /** True when `address` (a target's baseUrl) is this service. */
+    isAt: (address) => !!baseUrl && sameAddress(address, baseUrl),
     /** True once the model manager has said it manages the service. Sticky for this process. */
     managed: () => !!last,
     status: () => (last ? { ...last.body, stale: now() - last.at > STALE_MS, ...(lastError ? { lastError } : {}) } : null),
@@ -114,4 +122,4 @@ let installed = null;
 function install(service) { installed = service; return service; }
 function current() { return installed; }
 
-module.exports = { createEmbeddingService, resolveModelFile, install, current };
+module.exports = { createEmbeddingService, resolveModelFile, sameAddress, install, current };

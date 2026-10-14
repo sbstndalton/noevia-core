@@ -154,8 +154,7 @@ function sidecarModelNames(env = process.env) {
 function configNamesServedElsewhere(configNames, service) {
   const config = require('./embedding-config.cjs').current();
   const targets = config ? [config.active(), config.next(), config.previous()].filter(Boolean) : [];
-  const own = service.baseUrl;
-  return targets.filter((t) => (t.baseUrl || null) !== own && configNames.includes(t.model)).map((t) => t.model);
+  return targets.filter((t) => !service.isAt(t.baseUrl) && configNames.includes(t.model)).map((t) => t.model);
 }
 
 /** True when `name` is the configured embedding model or (feature-gated) reranker. */
