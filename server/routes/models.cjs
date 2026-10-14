@@ -103,21 +103,82 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
 
   // #1661: drop the models.ini section named `name` through the model management service. Never
   // throws; `removed` is true when a section was deleted, false when there was none or no service.
-  async function removePresetSection(name) {
-    if (!env.MODEL_LOADER_URL || !name) return { removed: false };
+  // #1695: with `onlyWithoutFile`, a section the service reports as having a file (hasFile not
+  // exactly false) is kept, so an automatic cleanup can never drop the settings of a file on disk.
+  async function presetSections() {
+    if (!env.MODEL_LOADER_URL) return null;
     const base = `${env.MODEL_LOADER_URL.replace(/\/+$/, '')}/api/v1/`;
     const headers = { 'Content-Type': 'application/json', ...(env.MODEL_LOADER_TOKEN ? { 'X-Model-Loader-Token': env.MODEL_LOADER_TOKEN } : {}) };
+    const listing = await fetchJson(`${base}sections`, { method: 'GET', headers }, 15000);
+    if (!listing?.ok || !Array.isArray(listing.body?.sections)) return null;
+    const sections = listing.body.sections.map((x) => (typeof x === 'string' ? { name: x } : { name: x?.name, hasFile: x?.hasFile }));
+    return { base, headers, sections, revision: listing.body?.revision };
+  }
+  async function removePresetSection(name, { onlyWithoutFile = false } = {}) {
+    if (!env.MODEL_LOADER_URL || !name) return { removed: false };
     try {
-      const listing = await fetchJson(`${base}sections`, { method: 'GET', headers }, 15000);
-      if (!listing?.ok) return { removed: false };
-      const names = Array.isArray(listing.body?.sections) ? listing.body.sections.map((x) => (typeof x === 'string' ? x : x?.name)) : null;
+      const listing = await presetSections();
+      if (!listing) return { removed: false };
       // Only a section the service lists: the name is never sent anywhere it does not name.
-      if (!names || !names.includes(name)) return { removed: false };
-      const revision = listing.body?.revision;
-      const q = revision ? `?baseRevision=${encodeURIComponent(revision)}` : '';
-      const del = await fetchJson(`${base}sections/${encodeURIComponent(name)}${q}`, { method: 'DELETE', headers }, 15000);
+      const section = listing.sections.find((x) => x.name === name);
+      if (!section) return { removed: false };
+      if (onlyWithoutFile && section.hasFile !== false) return { removed: false, hasFile: true };
+      const q = listing.revision ? `?baseRevision=${encodeURIComponent(listing.revision)}` : '';
+      const del = await fetchJson(`${listing.base}sections/${encodeURIComponent(name)}${q}`, { method: 'DELETE', headers: listing.headers }, 15000);
       return { removed: !!del?.ok };
     } catch { return { removed: false }; }
+  }
+  // #1695: the router reads models.ini only at start or on a reload, so a removed section stayed in
+  // its model list (and the card came back as "File missing") until the next restart. Ask it to
+  // re-read the file. A reload that would disturb a loaded model is refused by reloadPresets
+  // (it never unloads here); the list hides missing-file presets either way.
+  async function reloadRouterPresets() {
+    if (typeof modelManager.reloadPresets !== 'function') return false;
+    try { return !!(await modelManager.reloadPresets({ unload: false }))?.ok; } catch { return false; }
+  }
+
+  // #1695: remove the preset of every model whose file is gone. Idempotent: a second run finds
+  // nothing to do. A section is removed only when both noevia's folder scan (missingFile) and the
+  // model management service (hasFile: false) say its file is gone; Laya, sidecar models and
+  // presets served elsewhere are never touched.
+  // #1698: the folder scan and the service's hasFile both come from the same models folder, so they
+  // agree even when that folder is unavailable (a dropped share, a briefly empty mount). The prune
+  // therefore refuses, changing nothing, when the scan lists no model file at all or when more than
+  // half of the ordinary presets would go: that is the folder missing, not models deleted.
+  const SCAN_UNTRUSTED = 'The model folder looks unavailable, so nothing was removed.';
+  async function freshFolderScan() {
+    if (!env.MODEL_LOADER_URL) return null;
+    const headers = { 'Content-Type': 'application/json', ...(env.MODEL_LOADER_TOKEN ? { 'X-Model-Loader-Token': env.MODEL_LOADER_TOKEN } : {}) };
+    try {
+      const r = await fetchJson(`${env.MODEL_LOADER_URL.replace(/\/+$/, '')}/api/v1/models`, { method: 'GET', headers }, 15000);
+      return r?.ok && Array.isArray(r.body?.models) ? r.body.models : null;
+    } catch { return null; }
+  }
+  async function pruneMissingPresets() {
+    // A cached scan (possibly the glitch itself) must not drive a delete: drop it and the shared list.
+    modelScanCache.clear();
+    if (service.invalidateModelReads) service.invalidateModelReads();
+    const scan = await freshFolderScan();
+    if (!scan || scan.length === 0) return { ok: false, status: 409, code: 'scanUntrusted', error: SCAN_UNTRUSTED };
+    let installed;
+    try { installed = await modelsInstalledNow(); } catch { return { ok: false, status: 502, error: 'Could not list installed models.' }; }
+    const ordinary = (Array.isArray(installed) ? installed : [])
+      .filter((m) => m && m.system !== true && m.servedElsewhere !== true && !isSystemModel(m.name) && !isSidecarModel(m.name, env) && (m.source == null || m.source === 'preset'));
+    const candidates = ordinary.filter((m) => m.missingFile === true).map((m) => m.name);
+    if (candidates.length && candidates.length * 2 > ordinary.length) return { ok: false, status: 409, code: 'scanUntrusted', error: SCAN_UNTRUSTED, missing: candidates.length, presets: ordinary.length };
+    const removed = [], kept = [];
+    for (const name of candidates) {
+      const r = await removePresetSection(name, { onlyWithoutFile: true });
+      (r.removed ? removed : kept).push(name);
+    }
+    for (const name of removed) {
+      clearRoleReferences(name);
+      if (lastLoadedModel() === name) clearLastLoadedModel(name);
+      if (typeof modelManager.forgetIdentity === 'function') modelManager.forgetIdentity(name);
+    }
+    const reloaded = removed.length ? await reloadRouterPresets() : false;
+    if (removed.length) { modelScanCache.clear(); if (service.invalidateModelReads) service.invalidateModelReads(); }
+    return { ok: true, status: 200, removed, kept, reloaded };
   }
 
   async function handle(req, res, { path: p, authn, url }) {
@@ -567,6 +628,15 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       return json(res, 200, { ...modelAssignments({ installed, env, embedding, isSystem: (n) => isSystemModel(n), admin, served, service }), available: Array.isArray(installed) });
     }
 
+    // #1695: idempotent cleanup of presets whose model file is gone (the web runs it when the
+    // admin's list has any; a release may call it too). POST only, admin only (guarded above).
+    if (p === '/api/models/prune-missing') {
+      if (req.method !== 'POST') return json(res, 405, { error: 'method not allowed' });
+      if (!modelManager.enabled) return json(res, 404, { error: 'model management is disabled' });
+      const r = await pruneMissingPresets();
+      return json(res, r.status, r.ok ? { removed: r.removed, kept: r.kept, reloaded: r.reloaded } : { error: r.error, ...(r.code ? { code: r.code } : {}) });
+    }
+
     if (p === '/api/models/installed') {
       try {
         return json(res, 200, await modelsInstalled());
@@ -671,8 +741,11 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       const rolesCleared = clearRoleReferences(body.name);
       if (lastLoadedModel() === body.name) clearLastLoadedModel(body.name);
       if (typeof modelManager.forgetIdentity === 'function') modelManager.forgetIdentity(body.name);
+      // #1695: the router still lists a removed section until it re-reads models.ini.
+      const reloaded = preset.removed ? await reloadRouterPresets() : false;
       modelScanCache.clear();
-      return json(res, 200, { ok: true, unloaded, rolesCleared, presetRemoved: preset.removed });
+      if (service.invalidateModelReads) service.invalidateModelReads();
+      return json(res, 200, { ok: true, unloaded, rolesCleared, presetRemoved: preset.removed, ...(preset.removed ? { presetsReloaded: reloaded } : {}) });
     }
 
     for (const verb of ['load', 'unload']) {
