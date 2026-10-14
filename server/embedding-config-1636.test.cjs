@@ -445,7 +445,7 @@ test('set-next is refused when the embeddings server does not serve the target (
   const migration = { status: () => ({}), setNext: (t) => { calls.push(t); return {}; } };
   const { handler, fetchCalls } = routes({ migration, served: async () => ['nomic-embed-text-v1'] });
   const res = fakeRes();
-  await handler({ method: 'POST', body: { action: 'set-next', target: { model: 'embeddinggemma-2', profile: 'embeddinggemma-2', baseUrl: '' } } }, res, { path: '/api/embedding', authn: admin });
+  await handler({ method: 'POST', body: { action: 'set-next', scope: 'projects', target: { model: 'embeddinggemma-2', profile: 'embeddinggemma-2', baseUrl: '' } } }, res, { path: '/api/embedding', authn: admin });
   assert.equal(res.status, 409);
   assert.equal(res.body.code, 'modelNotServed');
   assert.deepEqual(res.body.served, ['nomic-embed-text-v1']);
@@ -458,12 +458,12 @@ test('set-next is refused when the served models cannot be read, and allowed whe
   const migration = { status: () => ({}), setNext: (t) => { calls.push(t); return {}; } };
   const down = routes({ migration, served: async () => { throw new Error('ECONNREFUSED'); } });
   const r1 = fakeRes();
-  await down.handler({ method: 'POST', body: { action: 'set-next', target: { model: 'embeddinggemma-2', baseUrl: '' } } }, r1, { path: '/api/embedding', authn: admin });
+  await down.handler({ method: 'POST', body: { action: 'set-next', scope: 'projects', target: { model: 'embeddinggemma-2', baseUrl: '' } } }, r1, { path: '/api/embedding', authn: admin });
   assert.equal(r1.status, 409);
   assert.equal(r1.body.code, 'endpointUnverified');
   const up = routes({ migration, served: async (t) => { assert.equal(t.baseUrl, null, 'empty address = the inference engine'); return ['nomic-embed-text-v1', 'embeddinggemma-2']; } });
   const r2 = fakeRes();
-  await up.handler({ method: 'POST', body: { action: 'set-next', target: { model: 'embeddinggemma-2', baseUrl: '' } } }, r2, { path: '/api/embedding', authn: admin });
+  await up.handler({ method: 'POST', body: { action: 'set-next', scope: 'projects', target: { model: 'embeddinggemma-2', baseUrl: '' } } }, r2, { path: '/api/embedding', authn: admin });
   assert.equal(r2.status, 200);
   assert.equal(calls.length, 1);
 });
