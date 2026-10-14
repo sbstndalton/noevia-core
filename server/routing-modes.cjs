@@ -23,7 +23,7 @@ const MODES = Object.freeze(['local', 'cloud', 'hybrid']);
 const WHEN_SENSITIVE = Object.freeze(['ask', 'local']);
 // Codes only, never text: a reply's reason is mode, user-choice, force-local, sensitive-rule,
 // fail-closed, check-unavailable (a check that could not answer, with a cause code in detail) or
-// remembered; a turn's flag (shown on the card) is diary, secret, iban, card, router or unavailable.
+// remembered; a turn's flag (shown on the card) is diary, secret, iban, card, health, router or unavailable.
 const ROLE_KEYS = Object.freeze(['fast', 'smart', 'code']);
 const MODEL_RE = /^[A-Za-z0-9._:/@+-]{1,200}$/;
 const PROVIDER_RE = /^[A-Za-z0-9_-]{1,80}$/;
@@ -221,8 +221,12 @@ function healthShaped(s) {
   return HEALTH_RECORD_RE.test(s);
 }
 
-/** The first rule a text trips, as a flag code, or null. Pure; bounded; linear in the text. */
-function preRule(text) {
+/**
+ * The first rule a text trips, as a flag code, or null. Pure; bounded; linear in the text.
+ * `health: false` (#1592) skips the health rule, for public text such as a web search result about a
+ * condition, which is not the user's data; secrets, IBANs and cards are always checked.
+ */
+function preRule(text, { health = true } = {}) {
   const s = String(text || '').slice(0, SCAN_LIMIT);
   if (SECRET_PATTERNS.some((re) => re.test(s)) || secretAssignment(s) || jwtShaped(s) || keyShaped(s)) return 'secret';
   for (const m of s.matchAll(IBAN_RE)) if (ibanValid(m[0])) return 'iban';
@@ -230,7 +234,7 @@ function preRule(text) {
     const digits = m[0].replace(/\D/g, '');
     if (digits.length >= 13 && digits.length <= 19 && luhn(digits)) return 'card';
   }
-  if (healthShaped(s)) return 'health';
+  if (health && healthShaped(s)) return 'health';
   return null;
 }
 

@@ -112,7 +112,9 @@ async function requestWithEffort(fetcher, url, options, body, provider, model, e
     capped = thinkingBudget.capReasoning(response, {
       cap: thinkingCap,
       retry: () => fetcher(url, { ...options, body: JSON.stringify(forcedAnswerBody(request, provider, model)) }),
-      onCut: () => report({ type: 'warning', text: 'Thinking reached its budget, so the answer was written without further reasoning.' }),
+      onCut: (reason) => report({ type: 'warning', text: reason === 'no-answer'
+        ? 'The model stopped after thinking without an answer, so the answer was requested again.'
+        : 'Thinking reached its budget, so the answer was written without further reasoning.' }),
     });
   }
   report({type:'meta',reasoning:mode,reasoningEffort:effort,outputBudget:request.max_completion_tokens || request.max_tokens,...(thinkingCap !== null ? { thinkingCap } : {})});
