@@ -126,17 +126,15 @@ const SYSTEM_MODEL_DELETE_REASON = 'System routing model — not deleted';
 // #1636: also the model a re-index is building (EMBEDDING_NEXT_MODEL) and, once the process's
 // embedding configuration (embedding-config.cjs) is installed, its active, next and previous
 // (rollback) models: each of them still has a server and stored vectors that depend on it.
+// #1660 review / #1668: the env names stay protected even after the saved embedding configuration
+// has switched away from them. The embed sidecar container is started from compose with a fixed
+// `-m <file> --alias <EMBEDDING_MODEL>`; it keeps loading that file whatever the saved configuration
+// says, so deleting it crash-loops the sidecar on its next restart (#336). A settings-driven sidecar
+// (#1668) is what would make the env name a seed only.
 function sidecarModelNames(env = process.env) {
   const names = new Set();
-  // #1660 review: the environment only seeds the embedding configuration (#1638). Once a saved
-  // configuration exists, it alone says which models still have vectors depending on them; an
-  // env-named model it no longer references (switched away and finished) is free to delete.
-  // Without a saved configuration the env names stay protected (#336).
-  const config = require('./embedding-config.cjs').current();
-  let saved = false;
-  try { saved = config?.get?.()?.source === 'saved'; } catch { saved = false; }
-  const embedNames = [...(saved ? [] : [String(env.EMBEDDING_MODEL || env.EMBED_MODEL || '').trim(), String(env.EMBEDDING_NEXT_MODEL || '').trim()]),
-    ...(config?.modelNames() || [])];
+  const embedNames = [String(env.EMBEDDING_MODEL || env.EMBED_MODEL || '').trim(), String(env.EMBEDDING_NEXT_MODEL || '').trim(),
+    ...(require('./embedding-config.cjs').current()?.modelNames() || [])];
   for (const embed of embedNames) if (embed && embed.toLowerCase() !== 'default') names.add(embed);
   const rerankOn = /^(1|true|on)$/i.test(String(env.NOEVIA_FEATURE_RAG_RERANK || ''));
   const rerank = rerankOn ? String(env.RERANK_MODEL || '').trim() : '';

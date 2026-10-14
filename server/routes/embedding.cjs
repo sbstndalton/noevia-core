@@ -34,7 +34,7 @@ const SCOPES = new Set(['all', 'projects', 'diary']);
  * @param {() => object} [deps.diaryServiceHeaders]
  * @param {(url:string) => Promise<{ok:boolean,reason?:string}>} [deps.checkAddress]
  */
-function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJson, DIARY_BASE = '', diaryServiceHeaders = () => ({ 'Content-Type': 'application/json' }), checkAddress = require('../embedding-address.cjs').checkEmbeddingAddress }) {
+function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJson, DIARY_BASE = '', diaryServiceHeaders = () => ({ 'Content-Type': 'application/json' }), checkAddress = require('../embedding-address.cjs').checkEmbeddingAddress, servedModels = (target) => require('../rag.cjs').servedModels(target) }) {
   const diaryUrl = DIARY_BASE ? `${String(DIARY_BASE).replace(/\/+$/, '')}/api/internal/embedding` : '';
 
   async function diary(method, body) {
@@ -85,6 +85,16 @@ function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJs
           return json(res, 400, { error: `The embeddings server must be on this network: it receives the text of every project and the Diary (${verdict.reason}).`, code: 'publicEndpoint' });
         }
       }
+    }
+    // #1660 review: the projects' embeddings server must really serve the target model. A
+    // single-model server embeds any name with its own model, so vectors would be stored under the
+    // wrong identity; refuse unless its /v1/models lists the target (no override: that is corrupt data).
+    if (action === 'set-next' && scope !== 'diary') {
+      const model = String(body.target.model || '').trim();
+      let ids = null;
+      try { ids = await servedModels({ baseUrl: String(body.target.baseUrl || '').trim() || null, model }); } catch { ids = null; }
+      if (!ids) return json(res, 409, { error: 'Could not confirm which models the embeddings server serves.', code: 'endpointUnverified' });
+      if (!ids.includes(model)) return json(res, 409, { error: `The embeddings server does not serve ${model.slice(0, 120)}.`, code: 'modelNotServed', served: ids.slice(0, 20) });
     }
     const out = {};
     if (scope !== 'diary') out.projects = await projects(action, body);

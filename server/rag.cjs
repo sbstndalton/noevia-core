@@ -318,6 +318,28 @@ async function embedOnce(target, input, signal) {
   } finally {leave();}
 }
 
+// #1660 review: the model ids an embeddings endpoint says it serves (GET /v1/models: `data[].id`,
+// plus llama-server `aliases` and Ollama-style `models[].name`), from the same address and with the
+// same headers embedOnce uses. A single-model llama-server answers /v1/embeddings for ANY model name
+// with its own vectors, so a target the endpoint does not list would be embedded by another model
+// and stored under the wrong identity. Throws when the listing cannot be read.
+async function servedModels(target) {
+  const base = (target && target.baseUrl) || inferenceBase;
+  if (!base) throw new Error('no embeddings address');
+  const res = await fetch(`${base.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/models`, {
+    method: 'GET', headers: target && target.baseUrl ? {} : inferenceHeaders(), redirect: 'error', signal: AbortSignal.timeout(10000),
+  });
+  if (!res.ok) throw new Error(`models ${res.status}`);
+  const body = await readCappedJson(res, 1024 * 1024);
+  const ids = new Set();
+  for (const m of Array.isArray(body?.data) ? body.data : []) {
+    if (typeof m?.id === 'string') ids.add(m.id);
+    for (const a of Array.isArray(m?.aliases) ? m.aliases : []) if (typeof a === 'string') ids.add(a);
+  }
+  for (const m of Array.isArray(body?.models) ? body.models : []) for (const k of ['name', 'model']) if (typeof m?.[k] === 'string') ids.add(m[k]);
+  return [...ids];
+}
+
 async function embedFramed(target, input, signal) {
   if (!input.length) return [];
   if (input.length === 1) {
@@ -748,4 +770,4 @@ const trackedFileState = () => ({ queues: fileQueues.size, generations: fileGene
 
 // #1646: the sentence a hybrid cloud route without a grant removes (read_project_file is not offered there).
 const READ_FILE_HINT = ' Use read_project_file with PDF startPage/endPage and offset for pages beyond the summary.';
-module.exports = { READ_FILE_HINT, init, trackedFileState, indexProjectFile, deleteProjectFile, searchProject, filesContext, chunkText, ragAvailable, retrievalStatus, embed, embedModel, embeddingIdentity, embeddingConfig: getEmbeddingConfig, onIndexed, listIndexes, indexCoverage, fillMissing, dropIndexSlot, rerankPool };
+module.exports = { READ_FILE_HINT, servedModels, init, trackedFileState, indexProjectFile, deleteProjectFile, searchProject, filesContext, chunkText, ragAvailable, retrievalStatus, embed, embedModel, embeddingIdentity, embeddingConfig: getEmbeddingConfig, onIndexed, listIndexes, indexCoverage, fillMissing, dropIndexSlot, rerankPool };

@@ -124,7 +124,7 @@ const fakeLookup = async (host) => {
   if (!DNS[host]) throw Object.assign(Error(`getaddrinfo ENOTFOUND ${host}`), { code: 'ENOTFOUND' });
   return DNS[host].map((address) => ({ address, family: address.includes(':') ? 6 : 4 }));
 };
-function routes({ migration, fetchCalls = [], diaryReply = { ok: true, status: 200, body: { active: { model: 'nomic-embed-text-v1' } } } } = {}) {
+function routes({ migration, fetchCalls = [], diaryReply = { ok: true, status: 200, body: { active: { model: 'nomic-embed-text-v1' } } }, served = async (t) => [t.model] } = {}) {
   const audits = [];
   const json = (res, status, body) => { res.status = status; res.body = body; return true; };
   const handler = createEmbeddingRoutes({
@@ -132,6 +132,7 @@ function routes({ migration, fetchCalls = [], diaryReply = { ok: true, status: 2
     fetchJson: async (url, init) => { fetchCalls.push({ url, init }); return diaryReply; },
     DIARY_BASE: 'http://diary:8010', diaryServiceHeaders: () => ({ 'Content-Type': 'application/json', Authorization: 'Bearer service' }),
     checkAddress: (url) => checkEmbeddingAddress(url, { lookup: fakeLookup }),
+    servedModels: served,
   });
   return { handler, audits, fetchCalls };
 }
@@ -435,4 +436,34 @@ test('an administrator choosing a next model while the seeded one is held back k
   g.dns.failing = 0;
   await g.scheduled.splice(0)[0].fn();
   assert.equal(g.config.next().model, 'chosen');
+});
+
+// ── #1660 review: set-next only for a model the embeddings server really serves ──────────────
+
+test('set-next is refused when the embeddings server does not serve the target (single-model sidecar)', async () => {
+  const calls = [];
+  const migration = { status: () => ({}), setNext: (t) => { calls.push(t); return {}; } };
+  const { handler, fetchCalls } = routes({ migration, served: async () => ['nomic-embed-text-v1'] });
+  const res = fakeRes();
+  await handler({ method: 'POST', body: { action: 'set-next', target: { model: 'embeddinggemma-2', profile: 'embeddinggemma-2', baseUrl: '' } } }, res, { path: '/api/embedding', authn: admin });
+  assert.equal(res.status, 409);
+  assert.equal(res.body.code, 'modelNotServed');
+  assert.deepEqual(res.body.served, ['nomic-embed-text-v1']);
+  assert.deepEqual(calls, [], 'no re-index started');
+  assert.deepEqual(fetchCalls, [], 'the Diary is not asked either');
+});
+
+test('set-next is refused when the served models cannot be read, and allowed when the target is listed', async () => {
+  const calls = [];
+  const migration = { status: () => ({}), setNext: (t) => { calls.push(t); return {}; } };
+  const down = routes({ migration, served: async () => { throw new Error('ECONNREFUSED'); } });
+  const r1 = fakeRes();
+  await down.handler({ method: 'POST', body: { action: 'set-next', target: { model: 'embeddinggemma-2', baseUrl: '' } } }, r1, { path: '/api/embedding', authn: admin });
+  assert.equal(r1.status, 409);
+  assert.equal(r1.body.code, 'endpointUnverified');
+  const up = routes({ migration, served: async (t) => { assert.equal(t.baseUrl, null, 'empty address = the inference engine'); return ['nomic-embed-text-v1', 'embeddinggemma-2']; } });
+  const r2 = fakeRes();
+  await up.handler({ method: 'POST', body: { action: 'set-next', target: { model: 'embeddinggemma-2', baseUrl: '' } } }, r2, { path: '/api/embedding', authn: admin });
+  assert.equal(r2.status, 200);
+  assert.equal(calls.length, 1);
 });
