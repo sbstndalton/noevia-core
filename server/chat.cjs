@@ -94,7 +94,7 @@ function declinedToolNote(entry) {
 // #1692: the lead of a turn that holds only the tool results of a reply that ended before its answer.
 const FAILED_REPLY_TOOLS_NOTE = '(The reply to the message above ended before its answer. These tool results came back for it and can be used.)';
 const ABANDONED_TURN_NOTE = '(No reply was kept for the message above: it was stopped or failed before an answer. It is not an open request. Answer only the newest message unless the user asks about it.)';
-function normalizeReplayHistory(mapped, newMessage) {
+function normalizeReplayHistory(mapped, newMessage, { carryOrphanTool = () => false } = {}) {
   const out = [];
   // Applied changes with no turn before them (the first message was edited and re-run, #658
   // review): strict templates need a user turn first, so they lead the first user turn instead.
@@ -118,7 +118,10 @@ function normalizeReplayHistory(mapped, newMessage) {
       if (last && last.role === 'assistant') last.content = `${last.content}\n\n${foldToolMessage(entry)}`;
       // #1692: a reply that failed before its answer keeps no text, but its tool results are still what the
       // follow-up asks about ("using what your search found..."). They are carried under a note of ours.
-      else if (last) out.push({ role: 'assistant', content: `${FAILED_REPLY_TOOLS_NOTE}\n\n${foldToolMessage(entry)}` });
+      // #1700: only a positively public tool's result (carryOrphanTool; nothing by default). A private read of a
+      // failed reply (notes, files, Drive, the project reader, an unknown tool) is dropped, so it can never reach
+      // a cloud model on the next turn.
+      else if (last && carryOrphanTool(entry.name)) out.push({ role: 'assistant', content: `${FAILED_REPLY_TOOLS_NOTE}\n\n${foldToolMessage(entry)}` });
       continue;
     }
     if (last && last.role === entry.role && entry.role === 'assistant') {
@@ -329,7 +332,7 @@ function createChatHandler({
     const appliedEntry = (h) => h.role === 'tool' && h.applied === true && typeof h.name === 'string' && typeof h.content === 'string';
     // A write the user did not approve (#666), kept so the next turn knows it did not run.
     const declinedEntry = (h) => h.role === 'tool' && h.declined === true && h.applied !== true && typeof h.name === 'string' && typeof h.content === 'string';
-    const mappedAll = (Array.isArray(history) ? history : [])
+    const mappedHistory = (Array.isArray(history) ? history : [])
       .filter((h) => h && ['user', 'assistant', 'tool', 'function'].includes(h.role) && ((typeof h.content === 'string' && h.content) || appliedEntry(h)))
       .slice(-HISTORY_CAP)
       .map((h) => appliedEntry(h)
@@ -337,16 +340,12 @@ function createChatHandler({
             ...(typeof h.target === 'string' ? { target: h.target } : {}), ...(typeof h.args === 'string' ? { args: h.args } : {}) }
         : declinedEntry(h) ? { role: 'tool', content: h.content, name: h.name, declined: true }
         : (h.role === 'tool' || h.role === 'function') && typeof h.name === 'string' ? { role: h.role, content: h.content, name: h.name } : { role: h.role, content: h.content });
-    // #1700: a plain tool result from an earlier reply (a failed reply's reads, #1692) is kept only when the tool is
-    // public (a search or Wikipedia tool, not offered by any private-data box). Anything else (notes, files, Drive,
-    // the project reader, a tool this server no longer knows) is dropped here, before any route is chosen, so it
-    // can never reach a cloud model. Applied and declined write entries keep their #658/#666 handling.
-    const mappedHistory = mappedAll.filter((h) => !((h.role === 'tool' || h.role === 'function') && h.applied !== true && h.declined !== true)
-      || require('./tools-mode.cjs').isPublicToolName(h.name, allToolboxes()));
+    // #1700: the tool results of a failed reply (#1692) are carried only for positively public tools.
+    const replayOptions = { carryOrphanTool: (name) => require('./tools-mode.cjs').isPublicToolName(name, allToolboxes()) };
     // Writes the client says already succeeded in this chat, for the repeat flag on approval cards.
     const recentWriteFps = new Set(mappedHistory.filter((h) => h.applied === true)
       .map((h) => require('./recent-writes.cjs').fingerprint(h.name, h.target, h.args)));
-    let msgs = body.compactOnly ? normalizeReplayHistory(mappedHistory) : normalizeReplayHistory(mappedHistory, message);
+    let msgs = body.compactOnly ? normalizeReplayHistory(mappedHistory, undefined, replayOptions) : normalizeReplayHistory(mappedHistory, message, replayOptions);
 
     // ── Project context: instructions + knowledge files prepend
     // the system message for every chat in the project.
@@ -386,7 +385,7 @@ function createChatHandler({
       const scrubbed = skillLedger.scrub({ dir: chatWorkspace.dir, project, messages: mappedHistory, chatId });
       if (scrubbed.removed.length) {
         revokedInHistory = scrubbed.removed;
-        msgs = body.compactOnly ? normalizeReplayHistory(scrubbed.messages) : normalizeReplayHistory(scrubbed.messages, message);
+        msgs = body.compactOnly ? normalizeReplayHistory(scrubbed.messages, undefined, replayOptions) : normalizeReplayHistory(scrubbed.messages, message, replayOptions);
         console.log(`[skills] removed revoked skill text from history: ${revokedInHistory.join(', ')}`);
       }
     }
@@ -985,8 +984,8 @@ function createChatHandler({
     let automaticAdded = [];
     if (automaticTools && !body.compactOnly) {
       // #1692: a follow-up keeps the public boxes (Web search, offline Wikipedia) the chat was already using.
-      // The unfiltered history: a private tool result dropped from the prompt (#1700) still stops the carry (#1702).
-      const carried = toolModes.carriedPublicBoxes({ history: mappedAll, boxes: allToolboxes() });
+      // A private tool result in recent history stops the carry (#1702), whether or not it is replayed.
+      const carried = toolModes.carriedPublicBoxes({ history: mappedHistory, boxes: allToolboxes() });
       automaticAdded = toolModes.automaticAdditions({ message, base: requestToolboxes(), boxes: allToolboxes(), connectorBoxes: CONNECTOR_BOXES,
         isWriteTool, ready: automaticToolsReady(chatUser), privateData: automaticLocal, carried });
     }
