@@ -1,5 +1,5 @@
 'use strict';
-const { isIP } = require('node:net');
+const { parseServiceUrl, serviceFetch } = require('./service-endpoint.cjs');
 const { createDecisions, CAUSE_RE } = require('./decision/index.cjs');
 const { llamaLogitBackend } = require('./decision/backends.cjs');
 
@@ -7,21 +7,16 @@ const { llamaLogitBackend } = require('./decision/backends.cjs');
 // A dedicated private endpoint avoids silently changing the loaded answering model.
 function configuration(env = process.env) {
   const reason = 'Not configured. The operator needs to point it at a dedicated local decision-model endpoint, then restart noevia.';
-  try {
-    const url = new URL(env.COWORK_SYSTEM_ONE_URL);
-    const host = url.hostname.replace(/^\[|\]$/g, '');
-    const privateHost = host === 'localhost' || host === '::1' || (isIP(host) === 4 &&
-      (/^(127|10)\./.test(host) || /^192\.168\./.test(host) || /^172\.(1[6-9]|2\d|3[01])\./.test(host)));
-    if (!privateHost || !['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash || !['/', '/v1', '/v1/'].includes(url.pathname)) return { reason };
-    return { baseUrl: url.origin, reason: null };
-  } catch { return { reason }; }
+  // #1755: the shared on-this-network rule (service-endpoint.cjs); names are checked when the request connects.
+  const parsed = parseServiceUrl(env.COWORK_SYSTEM_ONE_URL, { paths: ['/', '/v1', '/v1/'] });
+  return parsed.reason ? { reason } : { baseUrl: parsed.baseUrl, reason: null };
 }
 
 function createSystemOneRouter({ enabled, roles, fallback, env = process.env, backend, getBackend = null, getDeadlineMs = null, deadlineMs = 1500,
   log = (entry) => console.info('[system-one] route', JSON.stringify(entry)) }) {
   const config = configuration(env);
   const candidate = backend || (config.baseUrl ? llamaLogitBackend({ baseUrl: config.baseUrl,
-    fetchImpl: (url, init) => fetch(url, { ...init, redirect: 'error' }) }) : null);
+    fetchImpl: (url, init) => serviceFetch(url, { ...init, redirect: 'error' }) }) : null);
   let lastCandidate, decisions;
   function currentDecisions() {
     const current=getBackend ? (getBackend() || candidate) : candidate;

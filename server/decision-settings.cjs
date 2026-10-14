@@ -1,5 +1,6 @@
 'use strict';
 const {configuration,createDecisionEndpoint}=require('./decision-endpoint.cjs');
+const {checkServiceEndpoint,serviceFetch}=require('./service-endpoint.cjs');
 const KEY='decision:configuration';
 // What the private decision service (services/laya/server.py validate + worker budget) accepts, so
 // callers can shape a request it will not refuse with a 422 (#682). maxChoiceChars approximates the
@@ -36,7 +37,11 @@ function startupWarnings(env=process.env) {
     out.push(`[system-one] COWORK_DECISION_URL points at the host "kev", but COWORK_DECISION_MODEL (${env.COWORK_DECISION_MODEL ? JSON.stringify(String(env.COWORK_DECISION_MODEL).slice(0,64)) : 'unset'}) is not a Kev model; Laya-format requests will be sent and every decision will fail. Set COWORK_DECISION_MODEL=kev-0.8b.`);
   return out;
 }
-function createDecisionSettings({store,env=process.env,fetchImpl=globalThis.fetch,audit=()=>{},kinds=SERVICE_KINDS}) {
+// #1755: fetchImpl defaults to the on-this-network fetch (service-endpoint.cjs), which resolves a name
+// at connect time and refuses it unless every answer is on this network; `lookup` is the resolver the
+// connection test's up-front check uses (tests stub it).
+const invalidUrl=()=>Object.assign(Error('Use a private HTTP address such as http://192.168.1.20:8040, with no path, login or query string.'),{status:400,messageId:'invalidUrl'});
+function createDecisionSettings({store,env=process.env,fetchImpl=serviceFetch,lookup=undefined,audit=()=>{},kinds=SERVICE_KINDS}) {
   let saved;
   try { saved=JSON.parse(store.get(KEY)||'null'); } catch { saved={url:'',timeoutMs:1500}; }
   const get=()=>({...saved || {url:env.COWORK_DECISION_URL||'',timeoutMs:1500},source:saved?'admin':'deployment'});
@@ -44,7 +49,7 @@ function createDecisionSettings({store,env=process.env,fetchImpl=globalThis.fetc
     if(!value || typeof value.url!=='string' || !Number.isInteger(value.timeoutMs) || value.timeoutMs<100 || value.timeoutMs>2000)
       throw Object.assign(Error('Enter a private decision-service URL and a deadline from 100 to 2000 ms.'),{status:400,messageId:'invalidInput'});
     const parsed=configuration({COWORK_DECISION_URL:value.url.trim()});
-    if(parsed.reason) throw Object.assign(Error('Use a private HTTP address such as http://192.168.1.20:8040, with no path, login or query string.'),{status:400,messageId:'invalidUrl'});
+    if(parsed.reason) throw invalidUrl();
     return {url:parsed.baseUrl,timeoutMs:value.timeoutMs};
   }
   // #1639: the model behind the URL (decision-models.cjs) is the operator's COWORK_DECISION_MODEL, and
@@ -80,10 +85,14 @@ function createDecisionSettings({store,env=process.env,fetchImpl=globalThis.fetc
     return made;
   }
   // The backend for every decision purpose except the sensitivity check: route, tool gate, supervision, framing.
+  // #1753: the shared COWORK_DECISION_API_KEY belongs to COWORK_DECISION_URL. A URL an administrator saved in
+  // Settings gets it only when it is on the same host (the #1745 hostOf rule); another host gets no key.
   function backend() {
     const current=get();
     const config=configuration({COWORK_DECISION_URL:current.url});
-    return config.reason ? null : backendFor(config.baseUrl,modelFor(config.baseUrl));
+    if(config.reason) return null;
+    const sameHost=!!hostOf(config.baseUrl) && hostOf(config.baseUrl)===hostOf(env.COWORK_DECISION_URL);
+    return backendFor(config.baseUrl,modelFor(config.baseUrl),sameHost?env.COWORK_DECISION_API_KEY:null,'shared');
   }
   // #1639: the sensitivity check's backend. COWORK_SENSITIVITY_DECISION_URL unset or empty: backend(),
   // as before. Set: that service only (its model COWORK_SENSITIVITY_DECISION_MODEL, unset: Laya), so it
@@ -111,6 +120,10 @@ function createDecisionSettings({store,env=process.env,fetchImpl=globalThis.fetc
     save(value,actor) {const next=validate(value);store.set(KEY,JSON.stringify(next));saved=next;audit('decision.configure',actor,{url:next.url,timeoutMs:next.timeoutMs});return get();},
     async test(value) {
       const next=validate(value);
+      // #1755: a name is accepted only if every address it resolves to is on this network; say so plainly
+      // here instead of as "not ready". The request below is checked again at connect time.
+      const where=await checkServiceEndpoint(next.url,lookup?{lookup}:{});
+      if(!where.ok && !where.transient) throw invalidUrl();
       try {
         const response=await fetchImpl(next.url+'/health',{signal:AbortSignal.timeout(3000),redirect:'error'});
         if(!response.ok) throw Error();

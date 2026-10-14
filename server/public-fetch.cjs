@@ -126,53 +126,63 @@ function createPublicFetch({ isPublicAddress = (ip) => !isPrivateIp(ip), resolve
     if (net.isIP(host) && !isPublicAddress(host) && !(allowLoopbackLiteral && host === '127.0.0.1')) {
       throw refusal(`refused: ${host} is a private address`);
     }
-    const method = String(init.method || 'GET').toUpperCase();
-    const headers = new Headers(init.headers || {});
-    const body = requestBody(init.body, headers);
-    if (body) headers.set('content-length', String(body.length));
-    const outgoing = {};
-    headers.forEach((v, k) => { outgoing[k] = v; });
-    const signal = init.signal || undefined;
-    if (signal && signal.aborted) throw signal.reason ?? new DOMException('This operation was aborted', 'AbortError');
-
-    return new Promise((resolvePromise, reject) => {
-      const mod = url.protocol === 'https:' ? https : http;
-      const req = mod.request({
-        protocol: url.protocol, hostname: host, port: url.port || undefined,
-        path: `${url.pathname}${url.search}`, method, headers: outgoing,
-        lookup, agent: false, signal,
-      }, (res) => {
-        // Everything here runs in an http 'response' event: a throw would be an uncaught
-        // exception that takes the whole web process down, and the server on the other end is
-        // a stranger's. So any failure building the Response rejects this one request instead.
-        try {
-          const status = res.statusCode || 0;
-          if (REDIRECT_STATUSES.has(status) && init.redirect !== 'manual') {
-            throw new TypeError(`refused: redirect (${status}) from ${url.origin}`);
-          }
-          if (status < 200 || status > 599) throw new TypeError(`unexpected HTTP status ${status} from ${url.origin}`);
-          const responseHeaders = new Headers();
-          for (let i = 0; i + 1 < res.rawHeaders.length; i += 2) {
-            try { responseHeaders.append(res.rawHeaders[i], res.rawHeaders[i + 1]); } catch { /* an invalid header is dropped, as fetch does */ }
-          }
-          const empty = NULL_BODY_STATUSES.has(status) || method === 'HEAD';
-          // The reason phrase is kept only when Response would accept it: llhttp lets control
-          // characters through (`200 O\x01K`), and Response throws on them. Nothing reads it.
-          const reason = String(res.statusMessage || '');
-          const statusText = REASON_PHRASE_RE.test(reason) ? reason : '';
-          const response = new Response(empty ? null : Readable.toWeb(decoded(res)), { status, statusText, headers: responseHeaders });
-          if (empty) res.resume();
-          resolvePromise(response);
-        } catch (err) {
-          res.resume();
-          req.destroy();
-          reject(err);
-        }
-      });
-      req.on('error', reject);
-      if (body) req.end(body); else req.end();
-    });
+    return sendWithLookup(url, init, lookup);
   };
 }
 
-module.exports = { createPublicFetch, createPublicOnlyLookup };
+/**
+ * One request to `url` whose socket resolves names with `lookup` (the connect-time address check),
+ * as a WHATWG Response. Never follows a redirect: a 3xx rejects unless init.redirect is 'manual'.
+ * Shared with service-endpoint.cjs (#1755), which passes the on-this-network lookup instead.
+ */
+function sendWithLookup(url, init, lookup) {
+  const host = url.hostname.replace(/^\[|\]$/g, '');
+  const method = String(init.method || 'GET').toUpperCase();
+  const headers = new Headers(init.headers || {});
+  const body = requestBody(init.body, headers);
+  if (body) headers.set('content-length', String(body.length));
+  const outgoing = {};
+  headers.forEach((v, k) => { outgoing[k] = v; });
+  const signal = init.signal || undefined;
+  if (signal && signal.aborted) throw signal.reason ?? new DOMException('This operation was aborted', 'AbortError');
+
+  return new Promise((resolvePromise, reject) => {
+    const mod = url.protocol === 'https:' ? https : http;
+    const req = mod.request({
+      protocol: url.protocol, hostname: host, port: url.port || undefined,
+      path: `${url.pathname}${url.search}`, method, headers: outgoing,
+      lookup, agent: false, signal,
+    }, (res) => {
+      // Everything here runs in an http 'response' event: a throw would be an uncaught
+      // exception that takes the whole web process down, and the server on the other end is
+      // a stranger's. So any failure building the Response rejects this one request instead.
+      try {
+        const status = res.statusCode || 0;
+        if (REDIRECT_STATUSES.has(status) && init.redirect !== 'manual') {
+          throw new TypeError(`refused: redirect (${status}) from ${url.origin}`);
+        }
+        if (status < 200 || status > 599) throw new TypeError(`unexpected HTTP status ${status} from ${url.origin}`);
+        const responseHeaders = new Headers();
+        for (let i = 0; i + 1 < res.rawHeaders.length; i += 2) {
+          try { responseHeaders.append(res.rawHeaders[i], res.rawHeaders[i + 1]); } catch { /* an invalid header is dropped, as fetch does */ }
+        }
+        const empty = NULL_BODY_STATUSES.has(status) || method === 'HEAD';
+        // The reason phrase is kept only when Response would accept it: llhttp lets control
+        // characters through (`200 O\x01K`), and Response throws on them. Nothing reads it.
+        const reason = String(res.statusMessage || '');
+        const statusText = REASON_PHRASE_RE.test(reason) ? reason : '';
+        const response = new Response(empty ? null : Readable.toWeb(decoded(res)), { status, statusText, headers: responseHeaders });
+        if (empty) res.resume();
+        resolvePromise(response);
+      } catch (err) {
+        res.resume();
+        req.destroy();
+        reject(err);
+      }
+    });
+    req.on('error', reject);
+    if (body) req.end(body); else req.end();
+  });
+}
+
+module.exports = { createPublicFetch, createPublicOnlyLookup, sendWithLookup };
