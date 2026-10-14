@@ -21,7 +21,7 @@ function original(workspace, id, file) {
 function destinationFor(project, name, { connection, remotePath } = {}) {
   return remotePath || (connection ? `${project.projectFolder}/${classify(name)}/${name}` : name);
 }
-async function ingest(workspace, project, name, bytes, { connection, source, remotePath, progress = () => {}, storageImpl = storage, extractDocx = docx.extract, ifMatch, ifNoneMatch } = {}) {
+async function ingest(workspace, project, name, bytes, { connection, source, remotePath, progress = () => {}, storageImpl = storage, extractDocx = docx.extract, ifMatch, ifNoneMatch, created } = {}) {
   workspace.assertActive?.();
   validate(name, bytes);
   const group = classify(name), mime = bytes.length <= 8 * 1024 * 1024 ? images[path.extname(name).toLowerCase()] : undefined;
@@ -80,10 +80,20 @@ async function ingest(workspace, project, name, bytes, { connection, source, rem
     progress('Saving to Nextcloud / storage');
     await storageImpl.createFolder(connection, `${project.projectFolder}/${group}`);
     workspace.assertActive?.();
-    await (ifMatch !== undefined ? storageImpl.writeFile(connection, fullName, bytes, { ifMatch })
+    const written = await (ifMatch !== undefined ? storageImpl.writeFile(connection, fullName, bytes, { ifMatch })
       : ifNoneMatch !== undefined ? storageImpl.writeFile(connection, fullName, bytes, { ifNoneMatch })
       : storageImpl.writeFile(connection, fullName, bytes));
+    // #1664: only a create-only write made a file that nothing else owns yet; an edit or replace
+    // (If-Match / plain PUT) overwrote a recorded file, which a later failure must never delete.
+    if (ifNoneMatch === '*' && written && written.created === true && written.etag) {
+      const record = { connection, path: fullName, etag: written.etag, storageImpl };
+      if (created && typeof created === 'object') Object.assign(created, record);
+      try { return finish(); }
+      catch (err) { await discardCreated(record); if (created) delete created.etag; throw err; }
+    }
   }
+  return finish();
+  function finish() {
   workspace.assertActive?.();
   file.attachment = { id, bytes: bytes.length, group, state, ...(reason ? {reason} : {}), ...(reasonId ? {reasonId} : {}), ...(reasonParams ? {reasonParams} : {}), ...(readerVersion ? {readerVersion} : {}), ...(group === 'Images' && bytes.length > 8 * 1024 * 1024 ? { reason: 'Original stored; resize below 8 MB for model image input.', reasonId: 'imageTooLarge', reasonParams: undefined } : {}) };
   if (source || connection) file.source = source || project.projectFolder;
@@ -102,6 +112,24 @@ async function ingest(workspace, project, name, bytes, { connection, source, rem
     project.assets.push({ id: assetId, name, mime, bytes: bytes.length, sourceName: fullName, storagePath: file.source ? fullName : undefined });
   }
   return file;
+  }
+}
+/** #1664: remove a file a create-only write just made, after a later step failed, so the retry
+ *  does not meet a 409 and save a "(2)" copy. Conditional on the write's ETag (If-Match), so a file
+ *  edited since, or written by someone else, is kept. Best effort: never throws, so the caller's
+ *  original error is what surfaces. Takes the record ingest fills in through `created`. */
+async function discardCreated(record) {
+  if (!record || !record.connection || !record.path || !record.etag) return { deleted: false, reason: 'no-etag' };
+  const impl = record.storageImpl || storage;
+  if (typeof impl.discardWritten !== 'function') return { deleted: false, reason: 'unsupported' };
+  try {
+    const result = await impl.discardWritten(record.connection, record.path, record.etag);
+    if (!result || !result.deleted) console.warn(`[uploads] could not remove unrecorded upload "${record.path}" (${result?.reason || 'unknown'})`);
+    return result || { deleted: false };
+  } catch (err) {
+    console.warn(`[uploads] could not remove unrecorded upload "${record.path}": ${err?.message || err}`);
+    return { deleted: false, reason: 'error' };
+  }
 }
 // Image assets that left project.assets (replaced or their source removed). They are no longer
 // model input, but a chat transcript may still name one; such an asset keeps its bytes and stays
@@ -152,4 +180,4 @@ function prune(workspace, project) {
     for (const name of names) if (!referenced.has(name)) fs.rmSync(path.join(assetDir, name), { force: true });
   } else delete project.retiredAssets;
 }
-module.exports = { CAP, GROUPS, directory, classify, validate, destinationFor, ingest, original, prune };
+module.exports = { CAP, GROUPS, directory, classify, validate, destinationFor, ingest, discardCreated, original, prune };

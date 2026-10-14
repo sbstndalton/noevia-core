@@ -210,3 +210,31 @@ test('#1653: the storage write still comes after reading and keeps its If-Match 
   await uploads.ingest(workspace, project, 'fixture.docx', Buffer.from('synthetic'), { connection: {}, storageImpl, ifMatch: 'e1', extractDocx: async () => { order.push(['read']); return { text: 'Body', truncated: false }; } });
   assert.deepEqual(order, [['read'], ['write', { ifMatch: 'e1' }]]);
 });
+// #1664: a failure after a create-only write removes the just-written file (If-Match on its ETag) and
+// the original error surfaces; an If-Match edit or a plain replace never deletes.
+test('#1664: a failure after the create-only write discards that file with its ETag; the error still surfaces', async t => {
+  const { workspace, project } = setup(t);
+  const calls = [];
+  const storageImpl = { createFolder: async () => {}, writeFile: async (_c, p) => { calls.push(['write', p]); active = false; return { path: p, etag: '"e9"', created: true }; },
+    discardWritten: async (_c, p, etag) => { calls.push(['discard', p, etag]); throw new Error('cleanup also failed'); } };
+  let active = true;
+  workspace.assertActive = () => { if (!active) throw new Error('synthetic workspace closed'); };
+  const warn = console.warn; console.warn = () => {}; t.after(() => { console.warn = warn; });
+  const created = {};
+  await assert.rejects(uploads.ingest(workspace, project, 'fixture.md', Buffer.from('synthetic'), { connection: {}, storageImpl, ifNoneMatch: '*', created }), /synthetic workspace closed/);
+  assert.deepEqual(calls, [['write', 'projects/synthetic/Text/fixture.md'], ['discard', 'projects/synthetic/Text/fixture.md', '"e9"']]);
+  assert.equal(created.etag, undefined, 'already discarded, so a caller does not discard twice');
+});
+test('#1664: an If-Match edit or a plain replace that fails after the write never discards (a create-only one does)', async t => {
+  const warn = console.warn; console.warn = () => {}; t.after(() => { console.warn = warn; });
+  // The last case: a server that ignores If-None-Match overwrote the user's own file (204, created
+  // false); that file is never discarded.
+  for (const [opts, expected, created] of [[{ ifNoneMatch: '*' }, 1, true], [{ ifMatch: '"e1"' }, 0, true], [{}, 0, true], [{ ifNoneMatch: '*' }, 0, false]]) {
+    const { workspace, project } = setup(t);
+    let discards = 0, active = true;
+    const storageImpl = { createFolder: async () => {}, writeFile: async (_c, p) => { active = false; return { path: p, etag: '"e2"', created }; }, discardWritten: async () => { discards++; return { deleted: true }; } };
+    workspace.assertActive = () => { if (!active) throw new Error('synthetic workspace closed'); };
+    await assert.rejects(uploads.ingest(workspace, project, 'fixture.md', Buffer.from('synthetic'), { connection: {}, storageImpl, ...opts }), /synthetic workspace closed/);
+    assert.equal(discards, expected, JSON.stringify(opts));
+  }
+});

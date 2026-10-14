@@ -595,20 +595,31 @@ function createProjectRoutes({
             if (!project.projectFolder) return replyStorageFailure(res, folderFailure(made)) || json(res, 502, { error: 'Could not create the storage folder; retry.' });
           }
           let file;
-          try { file = await uploads.ingest(currentWorkspace(), project, name, bytes, { connection: remote, progress, ...(remote && !replace ? { ifNoneMatch: '*' } : {}) }); }
+          // #1664: filled by ingest only after a create-only write; any failure before the record is
+          // saved removes that file again (conditional on its ETag), so a retry is not a 409 / "(2)".
+          const created = {};
+          try { file = await uploads.ingest(currentWorkspace(), project, name, bytes, { connection: remote, progress, ...(remote && !replace ? { ifNoneMatch: '*', created } : {}) }); }
           catch (e) {
             if (!replace && remote && pathTaken(e)) return sourceExistsReply(res, name);
             if (replyStorageFailure(res, storageClient.storageFailure?.(e))) return; throw e;
           }
-          if(reduction){file.attachment.reduction=reduction;file.attachment.reason=[file.attachment.reason,reduction.note].filter(Boolean).join(' ');}
-          if (getProject(id) !== project) return json(res, 409, { error: 'Project removed during upload.' });
-          if (remote) project.sourceFolders = [...new Set([...(project.sourceFolders || []), project.projectFolder])];
-          project.files = [...(project.files || []).filter(f => f.name !== file.name), file];
-          project.updatedAt = Date.now();
-          progress('Indexing extracted text');
-          indexSource(project, file);
-          defaultProjectDocs(project, hadUploads);
-          saveProjects(PROJECTS);
+          let recorded = false;
+          const filesBefore = project.files;
+          try {
+            if(reduction){file.attachment.reduction=reduction;file.attachment.reason=[file.attachment.reason,reduction.note].filter(Boolean).join(' ');}
+            if (getProject(id) !== project) return json(res, 409, { error: 'Project removed during upload.' });
+            if (remote) project.sourceFolders = [...new Set([...(project.sourceFolders || []), project.projectFolder])];
+            project.files = [...(project.files || []).filter(f => f.name !== file.name), file];
+            project.updatedAt = Date.now();
+            progress('Indexing extracted text');
+            indexSource(project, file);
+            defaultProjectDocs(project, hadUploads);
+            saveProjects(PROJECTS);
+            recorded = true;
+          } finally {
+            // The unsaved record goes with the file, so the retry is not refused as a same-name source.
+            if (!recorded && created.etag && (await uploads.discardCreated(created)).deleted && project.files !== filesBefore) project.files = filesBefore;
+          }
           return json(res, 200, { name, path: file.name, bytes: bytes.length, document: file.document, attachment: file.attachment });
         });
       }
@@ -660,8 +671,9 @@ function createProjectRoutes({
           file = await documentSources.ingest(currentWorkspace(), id, name, bytes, previous);
           file.source = project.projectFolder;
         }
+        let written;
         try {
-          await (replace ? storageClient.writeFile(connection, name, bytes)
+          written = await (replace ? storageClient.writeFile(connection, name, bytes)
             : storageClient.writeFile(connection, name, bytes, { ifNoneMatch: '*' }));
         } catch (e) {
           if (!replace && pathTaken(e)) return sourceExistsReply(res, rawName);
@@ -669,9 +681,20 @@ function createProjectRoutes({
           return json(res, (e && e.status) || 502, { error: (e && e.message) || 'could not save the file' });
         }
         if (file) {
-          if (getProject(id) !== project || !project.sourceFolders.includes(file.source)) return json(res, 409, { error: 'Source changed; refresh again.' });
-          project.files = [...(project.files || []).filter(f => f.name !== name || f.source !== file.source), file];
-          indexSource(project, file); defaultProjectDocs(project, hadUploads); saveProjects(PROJECTS);
+          // #1664: a PDF needs its record; if that fails after a create-only write, remove the file again
+          // (If-Match on the write's ETag) so a retry is not a 409 / "(2)". A replace never deletes.
+          let recorded = false;
+          const filesBefore = project.files;
+          try {
+            if (getProject(id) !== project || !project.sourceFolders.includes(file.source)) return json(res, 409, { error: 'Source changed; refresh again.' });
+            project.files = [...(project.files || []).filter(f => f.name !== name || f.source !== file.source), file];
+            indexSource(project, file); defaultProjectDocs(project, hadUploads); saveProjects(PROJECTS);
+            recorded = true;
+          } finally {
+            if (!recorded && !replace && written?.created === true && written?.etag
+              && (await require('../uploads.cjs').discardCreated({ connection, path: name, etag: written.etag, storageImpl: storageClient })).deleted
+              && project.files !== filesBefore) project.files = filesBefore;
+          }
         }
         return json(res, 200, { name: rawName, path: `${project.projectFolder}/${rawName}`, bytes: bytes.length, document: file?.document });
       });
