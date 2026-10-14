@@ -123,5 +123,7 @@ test('assignment helpers', () => {
   assert.equal(embeddingProfileFor('nomic-embed-text-v1.5'), 'nomic-v1');
   const a = modelAssignments({ installed: [], env: { RERANK_MODEL: 'r' } });
   assert.equal(a.services.find((s) => s.id === 'reranker').state, 'off', 'reranking off when the feature is off');
+  const d = a.services.find((s) => s.id === 'decision');
+  assert.deepEqual([d.model, d.state], [null, 'missing'], 'a deleted Laya reads missing, not off or running');
   assert.equal(serviceUsing('r', { services: [{ id: 'reranker', model: 'r' }] }), 'reranker');
 });

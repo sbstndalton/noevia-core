@@ -52,7 +52,9 @@ function modelAssignments({ installed, env = {}, embedding = null, isSystem = ()
     ...(admin ? { options: list.filter((m) => !m.missingFile && isRerankModel(m)).map((m) => m.name) } : {}) });
 
   const laya = list.find((m) => m.system === true || isSystem(m.name));
-  services.push({ id: 'decision', model: laya ? laya.name : null, state: laya ? (laya.missingFile ? 'missing' : 'active') : 'off', canChange: false });
+  services.push({ id: 'decision', model: laya ? laya.name : null, // #1660 review: Auto always expects a decision model; with Laya deleted it falls back to keeping
+  // those turns on this server, so the row reads "missing", never "off" or "running".
+  state: laya && !laya.missingFile ? 'active' : 'missing', canChange: false });
 
   services.push({ id: 'ocr', model: null, state: String(env.OCR_BASE_URL || '').trim() ? 'active' : 'off', canChange: false });
   services.push({ id: 'documents', model: null, state: String(env.DOCLING_BASE_URL || '').trim() ? 'active' : 'off', canChange: false });
