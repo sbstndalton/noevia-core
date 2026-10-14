@@ -79,6 +79,9 @@ test('two long ids sharing their first 80 characters no longer share a folder ke
   assert.equal(projectFolderName(common + '-one'), projectFolderName(common + '-two'), 'the old key collided');
   for (const key of [a, b]) { assert.ok(key.length <= 80); assert.match(key, /^[^/\\]+$/); }
   assert.equal(projectFolderKey({ id: common + '-one' }), a, 'stable for the same id');
+  // Golden value, shared with noevia-web's storageFolderKeepsOldName test: changing the hash, its input or the
+  // 67/12 split would move every long-id folder, so it must fail here first.
+  assert.equal(projectFolderKey({ id: 'chat-context-'.padEnd(90, 'c') }), 'chat-context-cccccccccccccccccccccccccccccccccccccccccccccccccccccc-7912f25b6e6e');
   const s3 = {createFolder(){throw Error('must not call');}};
   assert.notEqual(await createProjectFolder(s3, { kind: 's3' }, 'projects', { id: common + '-one' }), await createProjectFolder(s3, { kind: 's3' }, 'projects', { id: common + '-two' }));
   assert.equal(reserveProjectFolder({ kind: 's3' }, 'projects', { id: common + '-one' }, []), `projects/${a}`);
