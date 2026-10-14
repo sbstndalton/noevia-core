@@ -40,6 +40,7 @@ function startupWarnings(env=process.env) {
 // #1755: fetchImpl defaults to the on-this-network fetch (service-endpoint.cjs), which resolves a name
 // at connect time and refuses it unless every answer is on this network; `lookup` is the resolver the
 // connection test's up-front check uses (tests stub it).
+const invalidUrl=()=>Object.assign(Error('Use a private HTTP address such as http://192.168.1.20:8040, with no path, login or query string.'),{status:400,messageId:'invalidUrl'});
 function createDecisionSettings({store,env=process.env,fetchImpl=serviceFetch,lookup=undefined,audit=()=>{},kinds=SERVICE_KINDS}) {
   let saved;
   try { saved=JSON.parse(store.get(KEY)||'null'); } catch { saved={url:'',timeoutMs:1500}; }
@@ -48,7 +49,7 @@ function createDecisionSettings({store,env=process.env,fetchImpl=serviceFetch,lo
     if(!value || typeof value.url!=='string' || !Number.isInteger(value.timeoutMs) || value.timeoutMs<100 || value.timeoutMs>2000)
       throw Object.assign(Error('Enter a private decision-service URL and a deadline from 100 to 2000 ms.'),{status:400,messageId:'invalidInput'});
     const parsed=configuration({COWORK_DECISION_URL:value.url.trim()});
-    if(parsed.reason) throw Object.assign(Error('Use a private HTTP address such as http://192.168.1.20:8040, with no path, login or query string.'),{status:400,messageId:'invalidUrl'});
+    if(parsed.reason) throw invalidUrl();
     return {url:parsed.baseUrl,timeoutMs:value.timeoutMs};
   }
   // #1639: the model behind the URL (decision-models.cjs) is the operator's COWORK_DECISION_MODEL, and
@@ -122,7 +123,7 @@ function createDecisionSettings({store,env=process.env,fetchImpl=serviceFetch,lo
       // #1755: a name is accepted only if every address it resolves to is on this network; say so plainly
       // here instead of as "not ready". The request below is checked again at connect time.
       const where=await checkServiceEndpoint(next.url,lookup?{lookup}:{});
-      if(!where.ok && !where.transient) throw Object.assign(Error('Use a private HTTP address such as http://192.168.1.20:8040, with no path, login or query string.'),{status:400,messageId:'invalidUrl'});
+      if(!where.ok && !where.transient) throw invalidUrl();
       try {
         const response=await fetchImpl(next.url+'/health',{signal:AbortSignal.timeout(3000),redirect:'error'});
         if(!response.ok) throw Error();
