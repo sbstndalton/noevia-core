@@ -65,7 +65,7 @@ test('/api/models/delete refuses a neutral id whose --model path is Laya', async
     deleteModel: async () => { deleted++; return { ok: true }; },
   } });
   await f.call('POST', '/api/models/delete', { name: 'router-a' });
-  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'System routing model — not deleted' } });
+  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'System routing model — not deleted', errorId: 'systemModel', service: 'decision' } });
   await f.call('POST', '/api/models/delete', { name: 'plain' });
   assert.equal(f.sent.pop().status, 200);
   assert.equal(deleted, 1);
