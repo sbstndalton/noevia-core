@@ -240,3 +240,40 @@ test('a cap of 0 with tools in the request is left uncapped, so the tools are ke
   assert.equal(sent.length, 1);
   assert.equal(sent[0].tools.length, 1);
 });
+
+// #1477 (live on ab1445b0): "What is 2 plus 2?" on a small local model thought for 5 s and the stream
+// ended with reasoning only, well under the cap. The answer is requested once, the same way as a cut.
+test('a reply that ends with reasoning and no answer asks for the answer once (#1477)', async () => {
+  const reasons = [];
+  let retries = 0;
+  const response = tb.capReasoning(upstream([thought('2 plus 2 is 4.'), sse({}), 'data: [DONE]\n\n']), {
+    cap: 512,
+    retry: async () => { retries++; return upstream([sse({ content: '4' }), 'data: [DONE]\n\n']); },
+    onCut: (reason) => reasons.push(reason),
+  });
+  const text = await drain(response);
+  assert.equal(retries, 1);
+  assert.deepEqual(reasons, ['no-answer']);
+  assert.match(text, /"content":"4"/);
+  assert.equal(text.split('data: [DONE]').length - 1, 1, 'the first stream\'s [DONE] is held back, only the answer\'s is sent');
+  assert.ok(text.indexOf('2 plus 2 is 4.') < text.indexOf('"content":"4"'));
+});
+
+test('a stream that closes without [DONE] after reasoning only also asks for the answer once (#1477)', async () => {
+  let retries = 0;
+  const response = tb.capReasoning(upstream([thought('thinking')]), {
+    cap: 512, retry: async () => { retries++; return upstream([thought('more'), 'data: [DONE]\n\n']); },
+  });
+  const text = await drain(response);
+  assert.equal(retries, 1, 'only one extra request, even when the forced reply has no answer either');
+  assert.match(text, /more/);
+});
+
+test('cap cuts report their reason, and a normal or tool reply never retries at the end (#1477)', async () => {
+  const reasons = [];
+  await drain(tb.capReasoning(upstream([thought(words(500))]), { cap: 10, retry: async () => upstream([sse({ content: 'x' })]), onCut: (r) => reasons.push(r) }));
+  assert.deepEqual(reasons, ['cap']);
+  await drain(tb.capReasoning(upstream([thought('a'), sse({ content: 'b' }), 'data: [DONE]\n\n']), { cap: 512, retry: async () => assert.fail('answered') }));
+  await drain(tb.capReasoning(upstream([sse({ tool_calls: [{ index: 0, id: 'c', function: { name: 'f', arguments: '{}' } }] }), 'data: [DONE]\n\n']), { cap: 512, retry: async () => assert.fail('tool call') }));
+  await drain(tb.capReasoning(upstream(['data: [DONE]\n\n']), { cap: 512, retry: async () => assert.fail('an empty reply with no reasoning is not this case') }));
+});
