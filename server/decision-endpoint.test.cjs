@@ -5,7 +5,8 @@ const env={COWORK_DECISION_URL:'http://laya:8040'};
 const input={goal:'synthetic task',outputs:[{role:'tool',content:'result'}]};
 const valid={selected:'verify',scores:{continue:0.1,verify:0.8,escalate:0.1}};
 test('private operator endpoint only; no credentials or remote origin accepted',()=>{
-  for(const url of ['https://api.openai.com','http://user:pass@laya:8040','http://laya:8040/?key=secret','http://169.254.169.254','http://example.com']) assert.ok(configuration({COWORK_DECISION_URL:url}).reason);
+  // #1755: names (api.openai.com, example.com) are refused by what they resolve to, at connect time (service-endpoint-1755.test.cjs).
+  for(const url of ['https://8.8.8.8','http://user:pass@laya:8040','http://laya:8040/?key=secret','http://169.254.169.254','http://0.0.0.0:8040','ftp://laya:8040']) assert.ok(configuration({COWORK_DECISION_URL:url}).reason);
   assert.equal(configuration(env).reason,null);
 });
 test('typed decision transport has no answering provider identity or credentials',async()=>{
@@ -99,7 +100,8 @@ test('#1639: a Kev answer that is tied, partial or not TypeSafe is refused; a ma
 });
 test('#1639: the private-address rule applies to a Kev endpoint as to Laya',()=>{
   assert.equal(configuration({COWORK_DECISION_URL:'http://kev:11435'}).baseUrl,'http://kev:11435');
-  for(const url of ['https://api.example.com','http://203.0.113.9:11435','http://kev:11435/v1','http://kev.example.com:11435','https://kev:11435']) assert.equal(createDecisionEndpoint({env:{COWORK_DECISION_URL:url,COWORK_DECISION_MODEL:'kev-0.8b'}}),null,url);
+  assert.equal(configuration({COWORK_DECISION_URL:'https://kev:11435'}).baseUrl,'https://kev:11435','#1755: https is allowed');
+  for(const url of ['https://1.1.1.1','http://203.0.113.9:11435','http://kev:11435/v1','http://kev:11435/#x','ftp://kev:11435']) assert.equal(createDecisionEndpoint({env:{COWORK_DECISION_URL:url,COWORK_DECISION_MODEL:'kev-0.8b'}}),null,url);
 });
 test('only a validated known model identity crosses the decision transport', async () => {
   for (const [model, expected] of [['convaiinnovations/laya', 'convaiinnovations/laya'], ['https://private.example/key', null]]) {
