@@ -65,26 +65,45 @@ function createEmbeddingMigration({ config, rag, env = process.env, sleep = (ms)
   let stopped = false;
   let retryTimer = null;
   const retryMs = Math.round(clamp(env.EMBEDDING_REINDEX_RETRY_MS, 60000, 1000, 3600000));
+  // #1672: how long a "served" answer for the next target is trusted while re-indexing. The server
+  // can be restarted with another model at any time; past this age it is asked again before more
+  // vectors go into the next slot (at the start of a pass and between batches).
+  const recheckMs = Math.round(clamp(env.EMBEDDING_NEXT_RECHECK_MS, 300000, 1000, 3600000));
 
   // #1660 review: a next model is indexed only once its embeddings server has been seen serving it
   // (embedding-served.cjs). setNext checks before saving; a next that came from elsewhere (seeded
   // from EMBEDDING_NEXT_MODEL at start-up, or saved before this check existed) is checked before
   // the first pass and held back, pending, until it is served. A switch always checks afresh.
-  const verified = new Set(); // keys of next targets seen served
+  const verified = new Map(); // key of a next target seen served -> when (now()) it was last seen
   let nextHeld = null; // { key, code, error } why the current next is not being indexed
   const keyOf = (t) => (t ? `${t.profile}\u0000${t.model}\u0000${t.baseUrl || ''}` : '');
   const check = (t) => checkServed(servedModels, t);
   const targets = () => { const c = config.get(); return [c.active, c.next && verified.has(keyOf(c.next)) ? c.next : null].filter(Boolean); };
+  const isNext = (t) => { const n = config.next(); return !!n && keyOf(n) === keyOf(t) && !sameTarget(t, config.active()); };
 
+  const fresh = (t) => verified.has(keyOf(t)) && now() - verified.get(keyOf(t)) < recheckMs;
+
+  // Returns true when the next target may be indexed now.
   async function gateNext() {
     const next = config.next();
-    if (!next || verified.has(keyOf(next))) return;
+    if (!next) return false;
+    if (fresh(next)) return true;
+    const wasVerified = verified.has(keyOf(next));
     const r = await check(next);
-    if (r.ok) { verified.add(keyOf(next)); if (nextHeld?.key === keyOf(next)) log(`[embedding] ${next.model} is served now; re-indexing.`); nextHeld = null; return; }
-    if (!sameTarget(config.next(), next)) return; // changed meanwhile: the next pass checks that one
+    if (r.ok) { verified.set(keyOf(next), now()); if (nextHeld?.key === keyOf(next)) log(`[embedding] ${next.model} is served now; re-indexing.`); nextHeld = null; return true; }
+    if (!sameTarget(config.next(), next)) return false; // changed meanwhile: the next pass checks that one
+    verified.delete(keyOf(next));
     const changed = nextHeld?.key !== keyOf(next) || nextHeld.code !== r.code;
     nextHeld = { key: keyOf(next), code: r.code, error: r.error };
-    if (changed) log(`[embedding] re-index to ${next.model} not started: ${r.error}`);
+    if (wasVerified && r.code === 'modelNotServed') {
+      // #1672: the server now serves another model, so vectors written since the last good check may
+      // be that model's. Drop the partial slot; it is rebuilt once the next model is served again.
+      log(`[embedding] the embeddings server no longer serves ${next.model}; re-index paused and its partial vectors dropped for a rebuild.`);
+      if (!sameIdentity(next, config.active()) && !sameIdentity(next, config.previous())) dropEverywhere(next);
+    } else if (wasVerified) {
+      log(`[embedding] re-index to ${next.model} paused: ${r.error}`);
+    } else if (changed) log(`[embedding] re-index to ${next.model} not started: ${r.error}`);
+    return false;
   }
 
   async function fillTarget(entry, target, version) {
@@ -92,6 +111,8 @@ function createEmbeddingMigration({ config, rag, env = process.env, sleep = (ms)
     const refused = new Set(); // chunks the server would not embed, skipped for the rest of this pass
     for (;;) {
       if (stopped || config.version() !== version) return { embedded, aborted: true };
+      // #1672: an old "served" answer is re-checked before more vectors go into the next slot.
+      if (isNext(target) && !fresh(target) && !(await gateNext())) return { embedded, held: true };
       const started = now();
       const r = await rag.fillMissing(entry, target, { limit: batch, exclude: refused, isCurrent: () => !stopped && config.version() === version });
       if (!r) return { embedded, unavailable: true };
@@ -194,7 +215,7 @@ function createEmbeddingMigration({ config, rag, env = process.env, sleep = (ms)
       if (config.damaged || sameTarget(t, config.active())) return config.setNext(t); // refuses: damaged file, or already active
       const r = await check(t);
       if (!r.ok) throw Object.assign(Error(r.error), { status: 409, code: r.code, ...(r.served ? { served: r.served } : {}) });
-      verified.add(keyOf(t));
+      verified.set(keyOf(t), now());
       const before = config.get();
       const c = config.setNext(t);
       // A different next replaces an abandoned one: its partial vectors go.
