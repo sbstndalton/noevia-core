@@ -141,14 +141,34 @@ function fakeRag(svcState) {
   };
 }
 
-function harness(loader, { waitTimeoutMs = 10000 } = {}) {
+/** A fake Diary sidecar: its own active/next/previous, moved by the actions web sends it. */
+function fakeDiary({ notReadyOnSwitch = false } = {}) {
+  const t = (model) => ({ base_url: `${SVC}/v1`, model, profile: model });
+  const state = { active: t('nomic-embed-text-v1'), next: null, previous: null };
+  const calls = [];
+  const handle = (body) => {
+    if (!body.action) return { ok: true, status: 200, body: { ...state } };
+    calls.push(body);
+    if (body.action === 'set-next') state.next = { ...body.target };
+    else if (body.action === 'clear-next') state.next = null;
+    else if (body.action === 'switch') {
+      if (notReadyOnSwitch) return { ok: false, status: 409, body: { error: 'The new model has not finished indexing every Diary file yet.', code: 'notReady' } };
+      if (state.next) { state.previous = state.active; state.active = state.next; state.next = null; }
+    } else if (body.action === 'finish') state.previous = null;
+    else if (body.action === 'rollback' && state.previous) { state.active = state.previous; state.previous = null; }
+    return { ok: true, status: 200, body: { ok: true } };
+  };
+  return { state, calls, handle };
+}
+
+function harness(loader, { waitTimeoutMs = 10000, diary = fakeDiary() } = {}) {
   // Live spelling: the saved/seeded address carries /v1, the service address does not.
   const config = createEmbeddingConfig({ env: { EMBEDDING_MODEL: 'nomic-embed-text-v1', EMBEDDING_BASE_URL: `${SVC}/v1` }, log: () => {} });
   const fr = fakeRag(loader.state);
   const migration = createEmbeddingMigration({ config, rag: fr, env: {}, sleep: async () => {}, log: () => {} });
-  const diaryCalls = [];
-  const fetchJson = async (url, init) => { diaryCalls.push(JSON.parse(init.body || '{}')); return { ok: true, status: 200, body: { ok: true } }; };
-  return { config, migration, diaryCalls, fr, routesFor: (svc) => createEmbeddingRoutes({
+  const diaryCalls = diary.calls;
+  const fetchJson = async (url, init) => diary.handle(JSON.parse(init.body || '{}'));
+  return { config, migration, diaryCalls, diary, fr, routesFor: (svc) => createEmbeddingRoutes({
     json: (res, status, body) => { res.status = status; res.body = body; return true; },
     readJson: async (req) => req.body, migration, authService: { audit: () => {} }, fetchJson, DIARY_BASE: 'http://diary:8000',
     checkAddress: async () => ({ ok: true }), servedModels: async () => loader.state.loaded,
@@ -196,6 +216,7 @@ test('switch refused when the service never reports the new alias loaded (identi
     const r = await post(h.routesFor(svc), { action: 'service-switch', model: 'embeddinggemma-2', profile: 'embeddinggemma-2' });
     assert.equal(r.status, 504);
     assert.equal(r.body.code, 'serviceNotLoaded');
+    assert.deepEqual(loader.state.puts.at(-1), ['nomic-embed-text-v1'], 'rolled back: the model that did not load is not left served');
     assert.equal(h.config.next(), null, 'no re-index under a model the server did not load');
     assert.equal(h.diaryCalls.length, 0);
   } finally { h.migration.stop(); }
@@ -304,4 +325,85 @@ test('addresses with and without /v1 or a trailing slash name the same service',
   assert.equal(sameAddress('http://embed:8080/', 'http://embed:8080/v1/'), true);
   assert.equal(sameAddress('http://embed-next:8080/v1', 'http://embed:8080'), false);
   assert.equal(sameAddress(null, 'http://embed:8080'), false);
+});
+
+// ── review fixes ──────────────────────────────────────────────────────────────────────────────
+
+test('finish keeps the Diary\'s model served while the Diary has not switched (notReady)', async () => {
+  const loader = fakeLoader();
+  const svc = await installService(loader);
+  const h = harness(loader, { diary: fakeDiary({ notReadyOnSwitch: true }) });
+  const routes = h.routesFor(svc);
+  try {
+    assert.equal((await post(routes, { action: 'service-switch', model: 'embeddinggemma-2', profile: 'embeddinggemma-2' })).status, 200);
+    const sw = await post(routes, { action: 'switch' });
+    assert.equal(sw.status, 207, JSON.stringify(sw.body));
+    const fin = await post(routes, { action: 'finish' });
+    assert.ok([200, 207].includes(fin.status), JSON.stringify(fin.body));
+    const last = loader.state.puts.at(-1);
+    assert.ok(last.includes('nomic-embed-text-v1'), `the Diary still searches with the old model: ${JSON.stringify(last)}`);
+    assert.ok(last.includes('embeddinggemma-2'));
+  } finally { h.migration.stop(); }
+});
+
+test('finish never shrinks the service when the Diary\'s state is unknown', async () => {
+  const loader = fakeLoader();
+  const svc = await installService(loader);
+  const diary = fakeDiary();
+  const h = harness(loader, { diary });
+  const routes = h.routesFor(svc);
+  try {
+    await post(routes, { action: 'service-switch', model: 'embeddinggemma-2', profile: 'embeddinggemma-2' });
+    await post(routes, { action: 'switch' });
+    const puts = loader.state.puts.length;
+    const handle = diary.handle;
+    diary.handle = (body) => (body.action ? handle(body) : { ok: false, status: 503, body: { error: 'down' } });
+    await post(routes, { action: 'finish', scope: 'projects' });
+    assert.equal(loader.state.puts.length, puts, 'no PUT: the old model may still serve the Diary');
+  } finally { h.migration.stop(); }
+});
+
+test('a timed-out switch from off turns the service back off', async () => {
+  const loader = fakeLoader({ models: [], loadOnServe: false });
+  const svc = await installService(loader);
+  const h = harness(loader, { waitTimeoutMs: 6000 });
+  try {
+    const r = await post(h.routesFor(svc), { action: 'service-switch', model: 'embeddinggemma-2', profile: 'embeddinggemma-2' });
+    assert.equal(r.status, 504);
+    assert.deepEqual(loader.state.puts, [['embeddinggemma-2'], []]);
+    assert.equal(svc.enabled(), false);
+  } finally { h.migration.stop(); }
+});
+
+test('service-switch is refused while the last switch still keeps its rollback model', async () => {
+  const loader = fakeLoader();
+  const svc = await installService(loader);
+  const h = harness(loader);
+  const routes = h.routesFor(svc);
+  try {
+    await post(routes, { action: 'service-switch', model: 'embeddinggemma-2', profile: 'embeddinggemma-2' });
+    assert.equal((await post(routes, { action: 'switch' })).status, 200);
+    const puts = loader.state.puts.length;
+    const r = await post(routes, { action: 'service-switch', model: 'nomic-embed-text-v1', profile: 'nomic-v1' });
+    assert.equal(r.status, 409);
+    assert.equal(r.body.code, 'finishFirst');
+    assert.equal(loader.state.puts.length, puts);
+  } finally { h.migration.stop(); }
+});
+
+test('concurrent service actions run one at a time and see each other\'s result', async () => {
+  const loader = fakeLoader();
+  const svc = await installService(loader);
+  const h = harness(loader);
+  const routes = h.routesFor(svc);
+  try {
+    const [a, b] = await Promise.all([
+      post(routes, { action: 'service-switch', model: 'embeddinggemma-2', profile: 'embeddinggemma-2' }),
+      post(routes, { action: 'service-off' }),
+    ]);
+    assert.equal(a.status, 200, JSON.stringify(a.body));
+    assert.equal(b.status, 409, 'off sees the re-index the switch started');
+    assert.equal(b.body.code, 'reindexUnderway');
+    assert.deepEqual(loader.state.puts, [['nomic-embed-text-v1', 'embeddinggemma-2']]);
+  } finally { h.migration.stop(); }
 });

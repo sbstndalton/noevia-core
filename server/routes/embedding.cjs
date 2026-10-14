@@ -86,27 +86,60 @@ function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJs
 
   const reply = (status, body) => ({ status, body });
 
-  // #1668: which models the embedding service must serve for the configuration `c`: every target
-  // (active, next, previous) that lives on the service, each with its file. A target whose file is
-  // not known (not installed any more) is left out; the service then cannot serve it, which the
-  // served-model check reports.
-  function servedSet(c) {
+  // #1668: which models the embedding service must serve for the projects' configuration `c` and
+  // the Diary's `d` (its status: targets carry base_url): every target that lives on the service,
+  // each with its file. Active and next models of either side come first; a rollback model only if
+  // there is room. A target whose file is not known (not installed any more) is left out; the
+  // service then cannot serve it, which the served-model check reports. null when the models in
+  // use do not fit the service: the caller must not shrink it then.
+  const addressOf = (t) => (t ? (t.baseUrl !== undefined ? t.baseUrl : t.base_url) : undefined);
+  function servedSet(c, d = null) {
     const out = [];
-    for (const t of [c.active, c.next, c.previous]) {
-      if (!t || !service.isAt(t.baseUrl) || out.some((e) => e.model === t.model)) continue;
+    const add = (t) => {
+      if (!t || !t.model || !service.isAt(addressOf(t)) || out.some((e) => e.model === t.model)) return true;
       const file = service.fileOf(t.model);
-      if (file) out.push({ model: t.model, file });
-    }
-    return out.slice(0, 2);
+      if (!file) return true;
+      out.push({ model: t.model, file });
+      return out.length <= 2;
+    };
+    for (const t of [c.active, d?.active, c.next, d?.next]) if (!add(t)) return null;
+    for (const t of [c.previous, d?.previous]) if (out.length < 2) add(t);
+    return out;
+  }
+
+  // The Diary's targets, or null when they cannot be known (not reachable, unexpected answer): a
+  // shrink then could drop a model the Diary still searches with. { active: null } when no Diary
+  // is configured here.
+  async function diaryTargets() {
+    if (!diaryUrl) return { active: null, next: null, previous: null };
+    const d = await diary('GET');
+    return d && !d.error && d.active && typeof d.active === 'object' ? d : null;
+  }
+
+  // #1668 review: service changes (switch, off, and the sync after finish/cancel/rollback) run one
+  // at a time; each re-reads the configuration once it holds the turn.
+  let turn = Promise.resolve();
+  function serialized(fn) {
+    const run = turn.then(fn, fn);
+    turn = run.catch(() => {});
+    return run;
   }
 
   async function syncService() {
-    if (!service?.managed() || !service.enabled()) return;
-    const want = servedSet(migration.status());
-    try { if (want.length) await service.serve(want); } catch { /* the next sync retries; delete stays guarded */ }
+    return serialized(async () => {
+      if (!service?.managed() || !service.enabled()) return;
+      const d = await diaryTargets();
+      if (!d) return; // the Diary may still use a model: keep serving what is served
+      const want = servedSet(migration.status(), d);
+      try { if (want && want.length) await service.serve(want); } catch { /* the next sync retries; delete stays guarded */ }
+    });
   }
 
-  async function serviceAction(action, body, authn) {
+  function serviceAction(action, body, authn) {
+    return serialized(() => serviceActionHeld(action, body, authn));
+  }
+
+  async function serviceActionHeld(action, body, authn) {
     if (!service?.managed()) return reply(409, { error: 'The embedding service is not managed by noevia on this server (see docs/deployment.md, #1668).', code: 'notManaged' });
     const c = migration.status();
     if (action === 'service-off') {
@@ -119,6 +152,8 @@ function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJs
     const model = String(body.model || '').trim();
     if (!model) return reply(400, { error: 'service-switch needs a model' });
     if (c.next) return reply(409, { error: 'A re-index is already under way. Finish or cancel it first.', code: 'reindexUnderway' });
+    // The rollback model of the last switch is still served; a new switch would drop it.
+    if (c.previous) return reply(409, { error: 'Finish the last embedding switch (or roll it back) before switching again.', code: 'finishFirst' });
     const file = resolveFile ? await resolveFile(model).catch(() => null) : null;
     if (!file) return reply(404, { error: `${model} is not an installed model file.`, code: 'modelNotInstalled' });
     // Keep the address spelled as the active target has it (with or without /v1): the endpoint is
@@ -127,11 +162,17 @@ function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJs
     const target = { baseUrl: address, model, profile: body.profile };
     const fromOff = !service.enabled();
     const activeOnService = c.active && service.isAt(c.active.baseUrl) && !fromOff;
-    const keep = activeOnService ? servedSet({ active: c.active }) : [];
+    const keep = activeOnService ? servedSet({ active: c.active }) || [] : [];
     if (keep.some((e) => e.model === model)) return reply(409, { error: `${model} is already the embedding model.`, code: 'alreadyActive' });
+    const before = fromOff ? [] : (service.status()?.models || []).filter((e) => e && e.model && e.file).map((e) => ({ model: e.model, file: e.file }));
     try { await service.serve([...keep, { model, file }]); } catch (err) { return reply(err.status || 502, { error: err.message, code: err.code }); }
     const loaded = await service.waitLoaded([model], { timeoutMs: waitTimeoutMs });
-    if (!loaded) return reply(504, { error: `The embedding service did not load ${model} in time. Nothing was re-indexed; try again or pick another model.`, code: 'serviceNotLoaded', service: service.status() });
+    if (!loaded) {
+      // Back to what was served (nothing, when embedding was off), so a model nothing uses is not
+      // left loaded, nor embedding left on.
+      try { await service.serve(before); } catch { /* status shows it; delete stays guarded */ }
+      return reply(504, { error: `The embedding service did not load ${model} in time. Nothing was re-indexed; try again or pick another model.`, code: 'serviceNotLoaded', service: service.status() });
+    }
     // Turning embedding back on with the model the stored vectors already belong to: nothing to re-index.
     if (fromOff && c.active && sameTarget(c.active, { ...target, profile: target.profile || c.active.profile })) {
       return reply(200, { service: service.status(), projects: migration.status() });
