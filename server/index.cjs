@@ -228,6 +228,26 @@ if (process.env.MODEL_LOADER_URL) { embeddingService.refresh(); setInterval(() =
 // A re-index under way also covers files indexed meanwhile; with none under way nothing runs.
 rag.onIndexed(() => { if (embeddingConfig.next()) embeddingMigration.kick(); });
 if (embeddingConfig.next()) setTimeout(() => embeddingMigration.kick(), 30000).unref();
+// #1726: multimodal RAG (NOEVIA_MULTIMODAL_RAG, off by default). On, the rate-limited media pass embeds
+// every project's images into its own index, starting shortly after boot (the backfill) and again after
+// each source change (projects.cjs) and every half hour (a model switch leaves the new slot without image
+// vectors). Off, it never runs and stored image vectors are left alone.
+{
+  const multimodal = require('./multimodal-rag.cjs');
+  const mediaBackfill = multimodal.install(multimodal.createMediaBackfill({
+    userIds: () => authService.db.prepare('SELECT id FROM users').all().map((r) => r.id).filter((id) => !workspaceStore.isRemoved(id)),
+    workspaceFor: (userId) => workspaceStore.get(userId),
+    documentDir: (workspace, projectId) => require('./document-sources.cjs').directory(workspace, projectId),
+    rag,
+    // The embeddings router serves at most two models: during a re-index both slots are text models.
+    paused: () => (embeddingConfig.next() ? 'a re-index is under way' : null),
+    release: () => rag.releaseMediaModel(),
+  }));
+  if (multimodal.enabled()) {
+    setTimeout(() => mediaBackfill.kick(), 45000).unref();
+    setInterval(() => mediaBackfill.kick(), 30 * 60 * 1000).unref();
+  }
+}
 
 // User-created projects; the earlier fixed demo spaces were removed.
 // spaces were deleted per user request — projects are user-created only.

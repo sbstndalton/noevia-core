@@ -7,6 +7,7 @@ const PAGE_CAP = 300;
 const ocr = require('./ocr.cjs');
 const docling = require('./docling.cjs');
 const native = require('./documents-native.cjs');
+const multimodal = require('./multimodal-rag.cjs');
 
 // Two extraction backends, chosen by configuration rather than by file:
 //
@@ -23,8 +24,11 @@ const native = require('./documents-native.cjs');
 // The version string is the cache key: switching backends re-extracts
 // everything, which is right, because the cached text came from a different
 // pipeline.
+// #1726: with multimodal RAG on, Docling also returns figures, so a document read without them is read
+// again (the suffix). Off, the version is exactly what it was.
+const FIGURES = docling.enabled() && multimodal.enabled();
 const EXTRACTOR_VERSION = docling.enabled()
-  ? 'docling-pages-v1:' + docling.VERSION
+  ? 'docling-pages-v1:' + docling.VERSION + (FIGURES ? ':figures-v1' : '')
   : 'native-pages-v2' + (process.env.OCR_BASE_URL ? ':' + ocr.VERSION : '');
 
 // What the UI and the upload routes will treat as an extractable document.
@@ -58,10 +62,10 @@ function assemble(pageTexts, totalPages, { retryable = false, error, extraTrunca
   return { text: readable ? full.slice(0, EXTRACT_CAP) : '', pages: totalPages, pageTexts, truncated, state, retryable, error };
 }
 
-async function extractWithDocling(name, bytes, extractDocument) {
+async function extractWithDocling(name, bytes, extractDocument, figures = false) {
   let body;
   try {
-    body = await extractDocument(name, bytes);
+    body = figures ? await extractDocument(name, bytes, { figures: true }) : await extractDocument(name, bytes);
   } catch (err) {
     // A permanent failure (unreadable, unsupported) is a 422 to the caller, so
     // the original is stored and labelled. Anything else is retryable and must
@@ -81,8 +85,40 @@ async function extractWithDocling(name, bytes, extractDocument) {
     number: Number(p.number), text: String(p.text || ''), status: String(p.status || 'failed'),
     method: p.method === 'pdfium' ? 'pdfium' : 'docling', truncated: !!p.truncated,
     ...(typeof p.reason === 'string' && /^[a-z-]{1,40}$/.test(p.reason) ? { reason: p.reason } : {}),
+    // #1726: the worker's scanned-page marker (sent only when figures were asked for).
+    ...(figures && p.ocr === true ? { ocr: true } : {}),
   }));
-  return assemble(pageTexts, Number(body.total) || pageTexts.length, { extraTruncated: !!body.truncatedPages });
+  const out = assemble(pageTexts, Number(body.total) || pageTexts.length, { extraTruncated: !!body.truncatedPages });
+  if (!figures) return out;
+  const found = parseFigures(body.figures, pageTexts);
+  return found.length ? { ...out, figures: found } : out;
+}
+
+// #1726: the figures a Docling reply carries, checked: at most FIGURE_CAP, each a PNG, JPEG or WebP whose
+// bytes are what its type says, at most FIGURE_BYTES, on a page of this document, never on a scanned
+// page (multimodal-rag.cjs scannedPage). Anything else is dropped, not trusted.
+const FIGURE_CAP = 64;
+const FIGURE_BYTES = 4 * 1024 * 1024;
+const FIGURE_TYPES = { 'image/png': { ext: 'png', magic: (b) => b.length > 8 && b.readUInt32BE(0) === 0x89504e47 },
+  'image/jpeg': { ext: 'jpg', magic: (b) => b.length > 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff },
+  'image/webp': { ext: 'webp', magic: (b) => b.length > 12 && b.toString('latin1', 0, 4) === 'RIFF' && b.toString('latin1', 8, 12) === 'WEBP' } };
+function parseFigures(list, pageTexts) {
+  if (!Array.isArray(list)) return [];
+  const pages = new Map(pageTexts.map((p) => [p.number, p]));
+  const out = [];
+  for (const f of list.slice(0, FIGURE_CAP)) {
+    const type = FIGURE_TYPES[f?.mime];
+    const page = Number(f?.page), index = Number(f?.index);
+    if (!type || !Number.isInteger(page) || !pages.has(page) || !Number.isInteger(index) || index < 0 || index > 999) continue;
+    if (multimodal.scannedPage(pages.get(page))) continue;
+    if (typeof f.data !== 'string' || f.data.length > Math.ceil(FIGURE_BYTES / 3) * 4 + 4) continue;
+    const bytes = Buffer.from(f.data, 'base64');
+    if (!bytes.length || bytes.length > FIGURE_BYTES || !type.magic(bytes)) continue;
+    out.push({ page, index, mime: f.mime, ext: type.ext, bytes,
+      ...(typeof f.caption === 'string' && f.caption.trim() ? { caption: f.caption.trim().slice(0, 300) } : {}),
+      ...(typeof f.text === 'string' && f.text.trim() ? { text: f.text.trim().slice(0, 4000) } : {}) });
+  }
+  return out;
 }
 
 // Preserve native text and add separately labelled OCR for image-bearing pages.
@@ -92,11 +128,12 @@ async function extractDocumentText(name, bytes, {
   doclingEnabled = docling.enabled(),
   extractDocument = docling.extractDocument,
   readPages = native.readInWorker,
+  figures = FIGURES,
 } = {}) {
   if (!isDocument(name, doclingEnabled)) {
     throw Object.assign(new Error(`not a supported document (${documentExtensions(doclingEnabled).join(', ')})`), { status: 400 });
   }
-  if (doclingEnabled) return extractWithDocling(name, bytes, extractDocument);
+  if (doclingEnabled) return extractWithDocling(name, bytes, extractDocument, figures);
   // pdf.js runs in a worker with a time and a heap limit (documents-native.cjs): a pathological
   // PDF stops itself, not the server. A limit is as final as an unreadable file.
   let numPages, pageTexts;

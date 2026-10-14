@@ -687,9 +687,13 @@ function createProjectStore({
   function indexSource(project, file) {
     const workspace = currentWorkspace();
     workspace.assertActive?.();
+    // #1726: with multimodal RAG on, the project's images (this source's, if it is one, or its figures)
+    // are reconciled by the rate-limited media pass; off, this is a no-op.
+    require('./multimodal-rag.cjs').sourceChanged(workspace.userId, project.id);
     if (require('./instruction-skills.cjs').inspect(file, project) || !file.content || require('./source-readability.cjs').isUnreadable(file)) {
       if (file.document) file.document.indexing = 'unavailable';
-      rag.deleteProjectFile(project.id, file.name, workspace.userId);
+      // #1726: a source with no text (an image) keeps its image vector; only its text rows go.
+      rag.deleteProjectFile(project.id, file.name, workspace.userId, { keepMedia: true });
       return;
     }
     if (file.document) file.document.indexing = 'pending';

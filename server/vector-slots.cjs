@@ -26,8 +26,10 @@ const MAP_RE = /^vecmap_[0-9a-f]{16}$/;
 // Chunks that get vectors. A small file is stored whole for direct injection and never embedded
 // (rag.cjs DIRECT_INJECT_MAX = 2400): `direct = 1`, or, in rows written before the column existed,
 // a file's only chunk of at most 2400 characters (a larger file always yields several chunks).
-const EMBEDDABLE = `NOT (COALESCE(c.direct, 0) = 1 OR (c.direct IS NULL AND LENGTH(c.body) <= 2400
-  AND (SELECT COUNT(*) FROM chunks c2 WHERE c2.file = c.file) = 1))`;
+// #1726: only text chunks. An image row (kind 'image') is embedded from its image by the media pass
+// (rag.cjs syncProjectMedia); embedding its label as text would store a wrong vector under its id.
+const EMBEDDABLE = `COALESCE(c.kind, 'text') = 'text' AND NOT (COALESCE(c.direct, 0) = 1 OR (c.direct IS NULL AND LENGTH(c.body) <= 2400
+  AND (SELECT COUNT(*) FROM chunks c2 WHERE c2.file = c.file AND COALESCE(c2.kind, 'text') = 'text') = 1))`;
 
 const slotId = (t) => crypto.createHash('sha256').update(`${t.profile}\u0000${t.model}`).digest('hex').slice(0, 16);
 
