@@ -25,7 +25,6 @@ function serviceOptions(options) {
 function createDecisionSettings({store,env=process.env,fetchImpl=globalThis.fetch,audit=()=>{},kinds=SERVICE_KINDS}) {
   let saved;
   try { saved=JSON.parse(store.get(KEY)||'null'); } catch { saved={url:'',timeoutMs:1500}; }
-  let cachedKey, cachedBackend;
   const get=()=>({...saved || {url:env.COWORK_DECISION_URL||'',timeoutMs:1500},source:saved?'admin':'deployment'});
   function validate(value) {
     if(!value || typeof value.url!=='string' || !Number.isInteger(value.timeoutMs) || value.timeoutMs<100 || value.timeoutMs>2000)
@@ -34,29 +33,54 @@ function createDecisionSettings({store,env=process.env,fetchImpl=globalThis.fetc
     if(parsed.reason) throw Object.assign(Error('Use a private HTTP address such as http://192.168.1.20:8040, with no path, login or query string.'),{status:400,messageId:'invalidUrl'});
     return {url:parsed.baseUrl,timeoutMs:value.timeoutMs};
   }
+  // #1639: the model behind the URL (decision-models.cjs) is the operator's COWORK_DECISION_MODEL, and
+  // it belongs to COWORK_DECISION_URL: an administrator who saved another URL in Settings gets the
+  // Laya profile there (unknown model), exactly as before #1639.
+  const envUrl=()=>{ const c=configuration({COWORK_DECISION_URL:env.COWORK_DECISION_URL}); return c.reason?null:c.baseUrl; };
+  const modelFor=(url)=>url && url===envUrl() ? env.COWORK_DECISION_MODEL : undefined;
+  const cache=new Map();
+  /** One backend per (url, model), so its lane and the callers' decision layers survive between chats. */
+  function backendFor(url,model) {
+    const config=configuration({COWORK_DECISION_URL:url});
+    if(config.reason) return null;
+    const key=JSON.stringify([config.baseUrl,model||'']);
+    if(cache.has(key)) return cache.get(key);
+    if(cache.size>=8) cache.clear(); // an administrator trying URLs in Settings does not grow this without bound
+    const endpoint=createDecisionEndpoint({env:{COWORK_DECISION_URL:config.baseUrl,
+      ...(model?{COWORK_DECISION_MODEL:model}:{}),
+      ...(env.COWORK_DECISION_API_KEY?{COWORK_DECISION_API_KEY:env.COWORK_DECISION_API_KEY}:{})},fetchImpl});
+    const made={id:'decision-service',supports:kind=>kinds.includes(kind),locality:'local',limits:SERVICE_LIMITS,
+      model:endpoint.model,wording:endpoint.wording,
+      async decide(request,opts) {
+        const options=request.options||[];
+        if(options.length<2 || options.length>SERVICE_LIMITS.maxOptions) throw Object.assign(Error('Option count outside the service limit'),{reason:'too-many-options'});
+        const {shaped,toCaller}=serviceOptions(options);
+        // #1437: the sensitivity check is served ahead of other decision calls in the Laya lane.
+        const result=await endpoint.choice({state:String(request.context?.stateText||'').slice(0,SERVICE_LIMITS.maxStateChars),
+          question:String(request.question||'').slice(0,SERVICE_LIMITS.maxQuestionChars),options:shaped},{...opts,urgent:request.purpose==='routing.sensitivity'});
+        return {...result,selected:toCaller.get(result.selected),scores:Object.fromEntries(Object.entries(result.scores).map(([id,v])=>[toCaller.get(id),v]))};
+      },
+      supervise:(...args)=>endpoint.decide(...args)};
+    cache.set(key,made);
+    return made;
+  }
+  // The backend for every decision purpose except the sensitivity check: route, tool gate, supervision, framing.
   function backend() {
     const current=get();
-    if(configuration({COWORK_DECISION_URL:current.url}).reason) return null;
-    const key=JSON.stringify(current);
-    if(key!==cachedKey) {
-      const endpoint=createDecisionEndpoint({env:{COWORK_DECISION_URL:current.url},fetchImpl});
-      cachedBackend={id:'decision-service',supports:kind=>kinds.includes(kind),locality:'local',limits:SERVICE_LIMITS,
-        async decide(request,opts) {
-          const options=request.options||[];
-          if(options.length<2 || options.length>SERVICE_LIMITS.maxOptions) throw Object.assign(Error('Option count outside the service limit'),{reason:'too-many-options'});
-          const {shaped,toCaller}=serviceOptions(options);
-          // #1437: the sensitivity check is served ahead of other decision calls in the Laya lane.
-          const result=await endpoint.choice({state:String(request.context?.stateText||'').slice(0,SERVICE_LIMITS.maxStateChars),
-            question:String(request.question||'').slice(0,SERVICE_LIMITS.maxQuestionChars),options:shaped},{...opts,urgent:request.purpose==='routing.sensitivity'});
-          return {...result,selected:toCaller.get(result.selected),scores:Object.fromEntries(Object.entries(result.scores).map(([id,v])=>[toCaller.get(id),v]))};
-        },
-        supervise:(...args)=>endpoint.decide(...args)};
-      cachedKey=key;
-    }
-    return cachedBackend;
+    const config=configuration({COWORK_DECISION_URL:current.url});
+    return config.reason ? null : backendFor(config.baseUrl,modelFor(config.baseUrl));
+  }
+  // #1639: the sensitivity check's backend. COWORK_SENSITIVITY_DECISION_URL unset or empty: backend(),
+  // as before. Set: that service only (its model COWORK_SENSITIVITY_DECISION_MODEL, unset: Laya), so it
+  // can stay on a model it was measured on while the others move. Set but not a private decision-service
+  // URL: none, so the check is unavailable and the turn stays local; it never falls back to the other service.
+  function sensitivityBackend() {
+    const url=typeof env.COWORK_SENSITIVITY_DECISION_URL==='string' ? env.COWORK_SENSITIVITY_DECISION_URL.trim() : '';
+    if(!url) return backend();
+    return backendFor(url,env.COWORK_SENSITIVITY_DECISION_MODEL||undefined);
   }
   return {
-    get, backend,
+    get, backend, sensitivityBackend,
     /** Why an experiment that needs `kind` decisions cannot run, or null. Without a kind: only
      *  whether a service is configured. */
     unavailable:(kind)=>{

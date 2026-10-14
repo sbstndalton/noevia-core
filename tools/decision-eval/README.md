@@ -17,7 +17,8 @@ Synthetic cases only: no chats, no Diary.
 | `host.sh` | The one resource-capped evaluation container (CPU only, 4 CPUs, 5 GB, 127.0.0.1, its own network): setup, start, pull by digest, load with a memory check, peak memory, stop. |
 
 ```sh
-node build-requests.cjs --out requests.jsonl --smoke 20 --smoke-out smoke.jsonl
+node build-requests.cjs --out requests.jsonl --smoke 20 --smoke-out smoke.jsonl           # Laya wording (production default)
+node build-requests.cjs --wording kev --out requests-kev.jsonl                                # Kev-0.8B wording (#1739)
 node run.cjs --requests requests.jsonl --out laya.jsonl --target laya --url http://<laya>:8040 --min-interval-ms 1000 --gate ./gate.sh
 node run.cjs --requests requests.jsonl --out decima.jsonl --target ollaya --url http://127.0.0.1:11535 --model decima:small --api-key-file <key> --warmup 3 --gate ./gate.sh
 node score.cjs --out report.json --md report.md --rss rss.json laya.jsonl decima.jsonl

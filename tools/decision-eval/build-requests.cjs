@@ -9,7 +9,11 @@
 // not have; they validate, they do not shape the body. For capturing only, they are replaced by
 // permissive ones (permissiveDecisionChecks), in this process only.
 //
-// Usage: node build-requests.cjs --out requests.jsonl [--cases dir] [--smoke 20 --smoke-out smoke.jsonl]
+// The wording is per decision model (server/decision-models.cjs): --wording laya (default; what
+// production sends to Laya or an unknown model) or kev (Kev-0.8B's). The bodies are always in our
+// contract; run.cjs --target ollaya converts them for a TypeSafe server, as production does.
+//
+// Usage: node build-requests.cjs --out requests.jsonl [--wording laya|kev] [--cases dir] [--smoke 20 --smoke-out smoke.jsonl]
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -66,7 +70,8 @@ function createCapture() {
 }
 
 /** The production callers wired to one capturing decision backend. */
-function createCallers() {
+function createCallers({ wording = 'laya' } = {}) {
+  if (!['laya', 'kev'].includes(wording)) throw Error(`unknown wording ${wording}`);
   permissiveDecisionChecks();
   const capture = createCapture();
   const { createDecisionSettings } = require(path.join(SERVER, 'decision-settings.cjs'));
@@ -96,8 +101,10 @@ function createCallers() {
     enabled: () => true, decide: (r) => framingLayer.decide(r), deadlineMs: () => 2000, log: () => {},
   });
   const supervision = require(path.join(SERVER, 'step-supervision.cjs')).createStepSupervision({
-    enabled: () => true, provider: { decide: (...a) => backend.supervise(...a) }, deadlineMs: 1500, getDeadlineMs: () => 2000, log: () => {},
+    enabled: () => true, provider: { decide: (...a) => (wording === 'laya' ? backend.supervise(...a) : supervising.decide(...a)) }, deadlineMs: 1500, getDeadlineMs: () => 2000, log: () => {},
   });
+  // The Kev wording on our contract (production sends it through the TypeSafe codec instead).
+  const supervising = createDecisionEndpoint({ env: { COWORK_DECISION_URL: CAPTURE_URL }, fetchImpl: capture.fetchImpl, wording });
   const endpoint = createDecisionEndpoint({ env: { COWORK_DECISION_URL: CAPTURE_URL }, fetchImpl: capture.fetchImpl });
   const advisor = require(path.join(SERVER, 'load-advisor.cjs')).createLoadAdvisor({
     endpoint, log: () => {},
@@ -121,7 +128,7 @@ function createCallers() {
     toolGate: (message, tools, writeTools) => {
       const gate = require(path.join(SERVER, 'tool-gate.cjs')).createToolGate({
         enabled: () => true, isWriteTool: (n) => writeTools.has(n), deadlineMs: () => 2000, env: {}, warn: () => {},
-        limits: () => backend.limits, unavailable: () => null, decide: (r) => gateLayer.decide(r), log: () => {},
+        limits: () => backend.limits, unavailable: () => null, decide: (r) => gateLayer.decide(r), log: () => {}, wording,
       });
       return one(() => gate.evaluate(message, tools));
     },
@@ -161,9 +168,9 @@ function loadCases(dir = CASES) {
 const rotate = (list, k) => list.slice(k).concat(list.slice(0, k));
 
 /** Builds every request record: { id, purpose, variant, lang, label, body }, plus what was skipped and why. */
-async function buildRequests(dir = CASES) {
+async function buildRequests(dir = CASES, { wording = 'laya' } = {}) {
   const { rows, gate } = loadCases(dir);
-  const callers = createCallers();
+  const callers = createCallers({ wording });
   const tools = gate.tools.map(({ write, ...t }) => t);
   const writeTools = new Set(gate.tools.filter((t) => t.write).map((t) => t.function.name));
   const records = [], skipped = [];
@@ -224,8 +231,8 @@ const toJsonl = (rows) => rows.map((r) => JSON.stringify(r)).join('\n') + '\n';
 async function main(argv) {
   const args = {};
   for (let i = 0; i < argv.length; i += 2) args[argv[i].replace(/^--/, '')] = argv[i + 1];
-  if (!args.out) throw Error('usage: node build-requests.cjs --out requests.jsonl [--cases dir] [--smoke N --smoke-out smoke.jsonl]');
-  const { records, skipped } = await buildRequests(args.cases || CASES);
+  if (!args.out) throw Error('usage: node build-requests.cjs --out requests.jsonl [--wording laya|kev] [--cases dir] [--smoke N --smoke-out smoke.jsonl]');
+  const { records, skipped } = await buildRequests(args.cases || CASES, { wording: args.wording || 'laya' });
   fs.writeFileSync(args.out, toJsonl(records));
   if (args.smoke) fs.writeFileSync(args['smoke-out'], toJsonl(smokeSubset(records, Number(args.smoke))));
   const counts = {};

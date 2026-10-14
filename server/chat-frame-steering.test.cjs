@@ -81,8 +81,8 @@ test('tool gate bias: idea forces nothing; search reorders and hints; action hin
   assert.match(search.question, /framed this chat as a lookup/);
   assert.match(action.question, /a tool is expected/);
   for (const r of asked) assert.equal(r.options.some((o) => o.id === 'nc_webdav_write_file'), false, 'never a write');
-  // #1639: the question tuned for Kev-0.8B; a frame hint is appended to it.
-  assert.equal(plain.question, "Without tools the assistant knows no current news and nothing the user wrote or saved. Which tool does it need, if any?");
+  // #1739: Laya's question (the gate's default wording) exactly as before #1639; a frame hint is appended to it.
+  assert.equal(plain.question, 'Which tool, if any, must the assistant call before answering this user message?');
   assert.ok(search.question.startsWith(`${plain.question} `));
 });
 

@@ -743,6 +743,8 @@ const toolGate = require('./tool-gate.cjs').createToolGate({
   // #682: what the service accepts (option count, label and token budget), and whether it can
   // answer `choice` at all; an unsupported service is reported once and in Settings.
   limits: () => decisionSettings.backend()?.limits || null,
+  // #1639: the question, labels and choice budget follow the model behind the service (decision-models.cjs).
+  wording: () => decisionSettings.backend()?.wording || 'laya',
   unavailable: () => decisionSettings.unavailable('choice'),
   decide: (request) => {
     const backend = decisionSettings.backend();
@@ -836,6 +838,9 @@ const chatVaultMirrorRoutes = require('./routes/chat-vault-mirror.cjs').createCh
   available: vaultMirrorAvailable, schedule: chatVaultMirror.schedule, audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) });
 // #682: a decision experiment switched on that cannot run (no service, or one without `choice`)
 // says so once at startup; Settings shows the same reason, and the chat path skips it silently.
+for (const [key, id] of [['COWORK_DECISION_MODEL', process.env.COWORK_DECISION_MODEL], ['COWORK_SENSITIVITY_DECISION_MODEL', process.env.COWORK_SENSITIVITY_DECISION_MODEL]]) {
+  if (!require('./decision-models.cjs').knownModel(id)) console.warn(`[system-one] ${key} names no known decision model; the Laya contract and wording are used.`);
+}
 for (const f of features.describe()) {
   if (['toolGate', 'stepSupervision', 'systemOneRouting', 'chatFraming'].includes(f.id) && f.enabled && f.unavailable) console.warn(`[system-one] ${f.id} is on but cannot run: ${f.unavailable}`);
 }
@@ -876,8 +881,9 @@ const { handleChat } = require('./chat.cjs').createChatHandler({
       // #1437: a named 2 s deadline (routing-modes.cjs), and the decision layer's own log (outcome, cause, latency) is kept.
       deadlineMs: () => require('./routing-modes.cjs').SENSITIVITY_DEADLINE_MS,
       log: (entry) => recordDecision('sensitivity', entry),
+      // #1639: its own service when COWORK_SENSITIVITY_DECISION_URL is set (decision-settings.cjs), else the shared one.
       decide: (request) => {
-        const backend = decisionSettings.backend();
+        const backend = decisionSettings.sensitivityBackend();
         if (!backend) throw Error('Decision service unavailable');
         if (backend !== sensitivityBackend) { sensitivityBackend = backend; sensitivityDecisions = require('./decision/index.cjs').createDecisions({ backends: { configured: backend }, chains: { 'routing.sensitivity': ['configured'] },
           log: (entry) => recordDecision('sensitivity-backend', require('./routing-modes.cjs').decisionCodes(entry)) }); }
@@ -885,7 +891,7 @@ const { handleChat } = require('./chat.cjs').createChatHandler({
       },
     }),
     // #779: each router input is cut to the decision service's real state budget.
-    chunkChars: () => require('./routing-modes.cjs').chunkCharsFor(decisionSettings.backend()),
+    chunkChars: () => require('./routing-modes.cjs').chunkCharsFor(decisionSettings.sensitivityBackend()),
     // Router calls per turn: 1 by default (Laya is single-worker), NOEVIA_ROUTER_CHUNKS 1-4.
     maxChunks: () => require('./routing-modes.cjs').routerMaxChunks(),
     awaitChoice: awaitRouteChoice,
