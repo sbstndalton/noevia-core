@@ -18,13 +18,13 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           path: core
-      # The native GET /api/stats source: the noevia-rs#98 merge commit on rs main. Downloaded twice;
+      # The native GET /api/stats source: the noevia-rs#99 merge commit on rs main (carries #98 and the core#93 corpus). Downloaded twice;
       # byte-identical archive hash.
       - name: Fetch verified native engine statistics source
         run: |
           set -euo pipefail
-          curl -fsSL https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/bbd8f99136ded14ca56e286b35c6ce1ad6c4efc6 -o "$RUNNER_TEMP/stats-rs.tgz"
-          echo "faeee548c55cb75d8b415a805a37f57f73dc19fdb1a81d99f4dccb7caa6f404f  $RUNNER_TEMP/stats-rs.tgz" | sha256sum -c -
+          curl -fsSL https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/e88e7fa4c39470dd02a385a30c5c353853555f79 -o "$RUNNER_TEMP/stats-rs.tgz"
+          echo "69203abfd0608040944d686a5d50d10cad9540fe73840dec0bf80d92e0493b11  $RUNNER_TEMP/stats-rs.tgz" | sha256sum -c -
           mkdir rs
           tar -xzf "$RUNNER_TEMP/stats-rs.tgz" --strip-components=1 -C rs
       # Merged rs #94 acceptance tooling (#1308/#1320): the core-acceptance adapter verifies this
@@ -32,8 +32,8 @@ jobs:
       - name: Fetch verified merged acceptance tooling
         run: |
           set -euo pipefail
-          curl -fsSL https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/e7f746d8f510dee1cf11aa06200a8f2a975a79f7 -o "$RUNNER_TEMP/accept-rs.tgz"
-          echo "2cb576495a77146a350e4f028e9e083b782aaad79813b8211856ee09c74978e5  $RUNNER_TEMP/accept-rs.tgz" | sha256sum -c -
+          curl -fsSL https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/e88e7fa4c39470dd02a385a30c5c353853555f79 -o "$RUNNER_TEMP/accept-rs.tgz"
+          echo "69203abfd0608040944d686a5d50d10cad9540fe73840dec0bf80d92e0493b11  $RUNNER_TEMP/accept-rs.tgz" | sha256sum -c -
           mkdir rs-accept
           tar -xzf "$RUNNER_TEMP/accept-rs.tgz" --strip-components=1 -C rs-accept
           echo "CORE_ACCEPTANCE_RS=$GITHUB_WORKSPACE/rs-accept" >> "$GITHUB_ENV"

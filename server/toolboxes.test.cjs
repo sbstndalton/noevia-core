@@ -119,11 +119,28 @@ test('an offered write wins a name collision and an unoffered read cannot declas
   assert.equal(hiddenRead.isWriteTool('unknown_tool'), true);
 });
 
+test('#1603: get_current_time also returns the computed calendar facts for the zone asked for', async (t) => {
+  const tools = build({ mcpBoxes: [] });
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-12-31T23:30:00Z') });
+  const tokyo = await tools.executeToolCall(null, 'get_current_time', '{"timezone":"Asia/Tokyo"}');
+  assert.match(tokyo, /\(Asia\/Tokyo\) \| ISO: 2026-12-31T23:30:00\.000Z \| Calendar facts, computed by the server/);
+  assert.match(tokyo, /ISO week 53 of 2026 \(the ISO year is not the calendar year 2027\)/);
+  assert.match(tokyo, /day 1 of 365 in 2027, 364 days left/);
+  const ny = await tools.executeToolCall(null, 'get_current_time', '{"timezone":"America/New_York"}');
+  assert.match(ny, /day 365 of 365 in 2026, 0 days left/);
+  t.mock.timers.setTime(Date.parse('2026-10-12T12:00:00Z'));
+  assert.match(await tools.executeToolCall(null, 'get_current_time', '{"timezone":"UTC"}'), /ISO week 42 of 2026/);
+  assert.match(await tools.executeToolCall(null, 'get_current_time', '{}'), /\| Calendar facts, computed by the server .*ISO week \d+ of \d{4}/);
+});
+
 test('the executor runs built-ins itself and hands MCP tools on with the project in scope', async () => {
   const t = build({ mcpBoxes: [box('nc', [tool('nc_notes_search_notes')])] });
   assert.match(await t.executeToolCall(null, 'get_current_time', '{}'), /^Current time: .* \| ISO: /);
   assert.match(await t.executeToolCall(null, 'get_current_time', '{"timezone":"Europe/Berlin"}'), /\(Europe\/Berlin\)/);
   assert.match(await t.executeToolCall(null, 'get_current_time', '{"timezone":"Mars/Olympus"}'), /^ERROR: unknown IANA timezone/);
+  const longZone = await t.executeToolCall(null, 'get_current_time', JSON.stringify({ timezone: 'Z'.repeat(500) }));
+  assert.match(longZone, /^ERROR: unknown IANA timezone/);
+  assert.ok(longZone.length < 120, 'the echoed zone is capped');
   assert.match(await t.executeToolCall(null, 'read_project_file', 'not json'), /^ERROR: tool arguments were not valid JSON/);
   assert.match(await t.executeToolCall(null, 'get_current_time', 'null'), /^ERROR: tool arguments must be a JSON object/);
   assert.match(await t.executeToolCall(null, 'get_current_time', '42'), /^ERROR: tool arguments must be a JSON object/);
