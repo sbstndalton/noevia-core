@@ -158,9 +158,10 @@ test('#1639: the harness captures the wording tuned for Kev-0.8B exactly as prod
     assert.deepEqual(r.body.options, [
       { id: 'fast', label: 'Greetings, thanks, or a one-line factual answer' },
       { id: 'smart', label: 'Explaining, comparing, planning, reasoning or writing more than a sentence' },
-      { id: 'code', label: 'Writing, fixing or explaining programming code, scripts, regex or software errors' }]);
+      { id: 'code', label: 'Anything involving programming code, regex, errors or software' }]);
   }
-  // Unchanged by #1639: sensitivity, framing and the load advisor.
+  // Unchanged by #1639: routing (a tuned Code label cost Laya-en, the rollback, 8 points on the held-out
+  // split for one case of Kev's), sensitivity, framing and the load advisor.
   for (const r of base('routing.sensitivity')) assert.equal(r.body.question, 'Does this content contain sensitive personal or confidential information?');
   for (const r of base('chat.frame.kind')) assert.equal(r.body.question, 'What kind of chat does this first message start?');
 });

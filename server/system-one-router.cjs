@@ -33,8 +33,7 @@ function createSystemOneRouter({ enabled, roles, fallback, env = process.env, ba
     const active = roles();
     const options = [{ id: 'fast', label: 'Greetings, thanks, or a one-line factual answer' },
       { id: 'smart', label: 'Explaining, comparing, planning, reasoning or writing more than a sentence' }];
-    // #1639: the Code label tuned for Kev-0.8B (code cases 27/43 -> 30/43 on the tuning split, Fast and Smart unchanged).
-    if (active?.code) options.push({ id: 'code', label: 'Writing, fixing or explaining programming code, scripts, regex or software errors' });
+    if (active?.code) options.push({ id: 'code', label: 'Anything involving programming code, regex, errors or software' });
     const offered = active?.fast && active?.smart ? options : [];
     const routing = enabled() ? currentDecisions() : null;
     if (!routing || !offered.length) {
