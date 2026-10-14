@@ -800,7 +800,9 @@ function createChatHandler({
     const holdForCloud = (name, text) => {
       if (cloudHold || routeTarget?.route !== 'cloud') return false;
       const rmod = require('./routing-modes.cjs');
-      const hit = /^diary[_-]/i.test(String(name || '')) ? 'diary' : rmod.preRule(String(text || ''));
+      // #1592: the health rule holds only a private-data tool's result (the user's own files or records); a
+      // public result such as a web search about a condition is not the user's data. Unknown tools count as private.
+      const hit = /^diary[_-]/i.test(String(name || '')) ? 'diary' : rmod.preRule(String(text || ''), { health: !isPublicTool(name) });
       if (!hit) return false;
       cloudHold = hit;
       try { routingModes.log({ mode: 'tool-result', route: 'held', reason: 'sensitive-rule', flag: hit }); } catch { /* codes only */ }
@@ -926,6 +928,9 @@ function createChatHandler({
     const cloudUngranted = () => routeTarget?.route === 'cloud' && routeTarget.hybridUngranted === true;
     const isPrivateTool = (name) => toolModes.PRIVATE_CORE_TOOLS.has(name)
       || allToolboxes().some((b) => toolModes.isPrivateDataBox(b.id) && (b.tools || []).some((t) => t?.function?.name === name));
+    // #1592: positively public: offered by a box that does not read private data, and not private anywhere else.
+    const isPublicTool = (name) => !isPrivateTool(name)
+      && allToolboxes().some((b) => !toolModes.isPrivateDataBox(b.id) && (b.tools || []).some((t) => t?.function?.name === name));
     const rerouteLocalForPrivateTools = () => {
       const roles = autoRoles();
       const localModel = roles && (roles[routedRole] || roles.smart || roles.fast || roles.code);

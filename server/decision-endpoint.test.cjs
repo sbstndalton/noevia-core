@@ -128,3 +128,15 @@ test('every endpoint made for one service URL shares its lane, and another URL h
   held.chat(); await first; await tick(); assert.deepEqual(sent,['chat','other','advisor']);
   held.advisor(); held.other(); await second; await other;
 });
+test('a caller that aborts between being granted the turn and sending sends nothing and frees the lane (#1592)',{timeout:2000},async()=>{
+  const {_test:{inTurn}}=require('./decision-endpoint.cjs');
+  const lane={busy:true,urgent:[],normal:[]};
+  const giver=new AbortController();
+  let runs=0;
+  const waiting=inTurn(lane,{signal:giver.signal},async()=>{ runs++; return 'sent'; },60000);
+  assert.equal(lane.normal.length,1);
+  lane.busy=false; lane.normal.shift()(); giver.abort(); // granted, then the caller gives up in the same tick
+  await assert.rejects(waiting,/unreachable/);
+  assert.equal(runs,0,'no exchange after the abort');
+  assert.equal(lane.busy,false,'the lane is released at once');
+});

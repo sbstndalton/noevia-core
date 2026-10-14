@@ -1014,3 +1014,32 @@ test('#1640 review: createSensitivity does not ask about a partial input, and a 
   assert.deepEqual(await check(['a']), { flagged: false, flag: null });
   assert.equal(asked, 2);
 });
+
+// #1592: a web search result about a condition is public text, not the user's data, so the health rule does not
+// hold it on a cloud route. The user's own files, and any tool not positively public, are still held for health.
+const HEALTH_TEXT = 'How diabetes is diagnosed: a fasting glucose test; diagnosis of type 2 diabetes needs two results.';
+test('#1592: the health rule does not hold a public web-search result on a cloud route; secrets still are', async (t) => {
+  const web = [{ id: 'web-search', tools: ['tavily_search'] }];
+  const r = await run(t, { flag: true, settings: { ...HYBRID, mode: 'cloud' }, message: 'How is diabetes diagnosed?', project: { toolboxes: ['web-search'] },
+    toolBoxes: web, toolName: 'tavily_search', toolResult: HEALTH_TEXT });
+  assert.equal(r.events.some((e) => e.type === 'paused'), false, JSON.stringify(r.events.find((e) => e.type === 'paused')));
+  assert.equal(r.upstream.length, 2); assert.ok(r.upstream[1].url.startsWith(CLOUD));
+  const secret = await run(t, { flag: true, settings: { ...HYBRID, mode: 'cloud' }, message: 'Search it', project: { toolboxes: ['web-search'] },
+    toolBoxes: web, toolName: 'tavily_search', toolResult: `Account on file: ${SYN_IBAN}` });
+  assert.equal(secret.events.find((e) => e.type === 'paused')?.flag, 'iban');
+});
+
+test('#1592: a private-data or unknown tool result with health text is still held from the cloud', async (t) => {
+  const own = await run(t, { flag: true, settings: HYBRID, message: 'Summarize my latest letter.', chat: { allowCloud: true }, project: { toolboxes: ['nextcloud-files'] },
+    toolBoxes: FILES_BOX, toolName: 'files_read_synthetic', toolResult: HEALTH_TEXT });
+  assert.equal(own.events.find((e) => e.type === 'paused')?.flag, 'health');
+  assert.equal(JSON.stringify(own.upstream).includes('fasting glucose'), false);
+  const unknown = await run(t, { flag: true, settings: { ...HYBRID, mode: 'cloud' }, toolResult: HEALTH_TEXT });
+  assert.equal(unknown.events.find((e) => e.type === 'paused')?.flag, 'health', 'a tool in no known box is not treated as public');
+});
+
+test('#1592: preRule skips only the health rule when asked', () => {
+  assert.equal(rm.preRule(HEALTH_TEXT), 'health');
+  assert.equal(rm.preRule(HEALTH_TEXT, { health: false }), null);
+  assert.equal(rm.preRule(`${HEALTH_TEXT} ${SYN_IBAN}`, { health: false }), 'iban');
+});

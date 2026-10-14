@@ -694,15 +694,21 @@ function createChatGptOAuth({ db, secrets, fetchImpl = (...args) => globalThis.f
       // other level) is either sent, when this model's published list offers it, or refused with
       // the levels it does offer. It is never dropped, which would answer at a level nobody chose.
       const asked = typeof body.reasoning_effort === 'string' ? body.reasoning_effort : null;
-      if (asked && asked !== 'default' && !BASIC_EFFORTS.includes(asked)) {
-        const offered = info?.levels;
-        if (!Array.isArray(offered) || !offered.includes(asked)) {
+      if (asked && asked !== 'default') {
+        // #1592: the basic levels are checked too, when this model publishes its levels; with no published
+        // list they go through as before. The refusal names the real cause: an unreadable list, or a model
+        // whose loaded entry lists no reasoning levels.
+        const offered = Array.isArray(info?.levels) && info.levels.length ? info.levels : null;
+        const basic = BASIC_EFFORTS.includes(asked);
+        if (offered ? !offered.includes(asked) : !basic) {
           const shown = asked.slice(0, 40);
-          return errorResponse(400, Array.isArray(offered) && offered.length
+          return errorResponse(400, offered
             ? `ChatGPT does not offer "${shown}" reasoning for ${model.slice(0, 80)}. It offers ${offered.join(', ')}, or Default.`
-            : `ChatGPT's model list could not be read, so "${shown}" reasoning cannot be checked for ${model.slice(0, 80)}. Choose Default, Low, Medium or High.`);
+            : info
+              ? `"${shown}" reasoning is not in your account's list for ${model.slice(0, 80)}. Choose Default, Low, Medium or High.`
+              : `ChatGPT's model list could not be read, so "${shown}" reasoning cannot be checked for ${model.slice(0, 80)}. Choose Default, Low, Medium or High.`);
         }
-        request.reasoning = { ...(request.reasoning || {}), effort: asked, summary: request.reasoning?.summary || 'auto' };
+        if (!basic) request.reasoning = { ...(request.reasoning || {}), effort: asked, summary: request.reasoning?.summary || 'auto' };
       }
       if (info) {
         // The model's own defaults, as the Codex client applies them (ModelInfo in
