@@ -22,6 +22,20 @@ function serviceOptions(options) {
   const shaped=options.map(o=>({id:toService.get(o.id),label:(String(o.label||'').replace(/\s+/g,' ').trim()||String(o.id)).slice(0,SERVICE_LIMITS.maxLabelChars)}));
   return {shaped,toCaller};
 }
+/** The lower-cased hostname of a decision-service URL, or '' (#1745). */
+function hostOf(url) {
+  try { return new URL(String(url||'').trim()).hostname.toLowerCase(); } catch { return ''; }
+}
+/** Startup warnings for a decision configuration that fails silently (#1745): a COWORK_DECISION_URL whose host
+ *  is `kev` with a COWORK_DECISION_MODEL that is not a Kev id sends Laya-format requests to Ollaya, which
+ *  answers every one of them with an invalid result. */
+function startupWarnings(env=process.env) {
+  const out=[];
+  const {profileFor}=require('./decision-models.cjs');
+  if(hostOf(env.COWORK_DECISION_URL)==='kev' && profileFor(env.COWORK_DECISION_MODEL).wording!=='kev')
+    out.push(`[system-one] COWORK_DECISION_URL points at the host "kev", but COWORK_DECISION_MODEL (${env.COWORK_DECISION_MODEL ? JSON.stringify(String(env.COWORK_DECISION_MODEL).slice(0,64)) : 'unset'}) is not a Kev model; Laya-format requests will be sent and every decision will fail. Set COWORK_DECISION_MODEL=kev-0.8b.`);
+  return out;
+}
 function createDecisionSettings({store,env=process.env,fetchImpl=globalThis.fetch,audit=()=>{},kinds=SERVICE_KINDS}) {
   let saved;
   try { saved=JSON.parse(store.get(KEY)||'null'); } catch { saved={url:'',timeoutMs:1500}; }
@@ -39,16 +53,17 @@ function createDecisionSettings({store,env=process.env,fetchImpl=globalThis.fetc
   const envUrl=()=>{ const c=configuration({COWORK_DECISION_URL:env.COWORK_DECISION_URL}); return c.reason?null:c.baseUrl; };
   const modelFor=(url)=>url && url===envUrl() ? env.COWORK_DECISION_MODEL : undefined;
   const cache=new Map();
-  /** One backend per (url, model), so its lane and the callers' decision layers survive between chats. */
-  function backendFor(url,model) {
+  /** One backend per (url, model, key source), so its lane and the callers' decision layers survive between chats.
+   *  `apiKey` is the bearer key for this URL only (#1745); none: no key is sent. */
+  function backendFor(url,model,apiKey=env.COWORK_DECISION_API_KEY,keySource='shared') {
     const config=configuration({COWORK_DECISION_URL:url});
     if(config.reason) return null;
-    const key=JSON.stringify([config.baseUrl,model||'']);
+    const key=JSON.stringify([config.baseUrl,model||'',apiKey?keySource:'']);
     if(cache.has(key)) return cache.get(key);
     if(cache.size>=8) cache.clear(); // an administrator trying URLs in Settings does not grow this without bound
     const endpoint=createDecisionEndpoint({env:{COWORK_DECISION_URL:config.baseUrl,
       ...(model?{COWORK_DECISION_MODEL:model}:{}),
-      ...(env.COWORK_DECISION_API_KEY?{COWORK_DECISION_API_KEY:env.COWORK_DECISION_API_KEY}:{})},fetchImpl});
+      ...(apiKey?{COWORK_DECISION_API_KEY:apiKey}:{})},fetchImpl});
     const made={id:'decision-service',supports:kind=>kinds.includes(kind),locality:'local',limits:SERVICE_LIMITS,
       model:endpoint.model,wording:endpoint.wording,
       async decide(request,opts) {
@@ -74,10 +89,15 @@ function createDecisionSettings({store,env=process.env,fetchImpl=globalThis.fetc
   // as before. Set: that service only (its model COWORK_SENSITIVITY_DECISION_MODEL, unset: Laya), so it
   // can stay on a model it was measured on while the others move. Set but not a private decision-service
   // URL: none, so the check is unavailable and the turn stays local; it never falls back to the other service.
+  // #1745: its key is COWORK_SENSITIVITY_DECISION_API_KEY. Unset, the shared COWORK_DECISION_API_KEY is sent only
+  // when the sensitivity URL is on the same host as COWORK_DECISION_URL; another host gets no key at all.
   function sensitivityBackend() {
     const url=typeof env.COWORK_SENSITIVITY_DECISION_URL==='string' ? env.COWORK_SENSITIVITY_DECISION_URL.trim() : '';
     if(!url) return backend();
-    return backendFor(url,env.COWORK_SENSITIVITY_DECISION_MODEL||undefined);
+    const own=typeof env.COWORK_SENSITIVITY_DECISION_API_KEY==='string' ? env.COWORK_SENSITIVITY_DECISION_API_KEY.trim() : '';
+    if(own) return backendFor(url,env.COWORK_SENSITIVITY_DECISION_MODEL||undefined,own,'sensitivity');
+    const sameHost=!!hostOf(url) && hostOf(url)===hostOf(env.COWORK_DECISION_URL);
+    return backendFor(url,env.COWORK_SENSITIVITY_DECISION_MODEL||undefined,sameHost?env.COWORK_DECISION_API_KEY:null,'shared');
   }
   return {
     get, backend, sensitivityBackend,
@@ -103,4 +123,4 @@ function createDecisionSettings({store,env=process.env,fetchImpl=globalThis.fetc
     },
   };
 }
-module.exports={createDecisionSettings,serviceOptions,SERVICE_LIMITS};
+module.exports={createDecisionSettings,serviceOptions,startupWarnings,hostOf,SERVICE_LIMITS};

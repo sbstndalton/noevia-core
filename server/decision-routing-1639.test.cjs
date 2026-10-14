@@ -91,3 +91,53 @@ test('the backend object is stable between calls, so the callers keep their deci
   assert.equal(settings.backend(), settings.backend());
   assert.equal(settings.sensitivityBackend(), settings.sensitivityBackend());
 });
+
+// #1745: the shared COWORK_DECISION_API_KEY belongs to COWORK_DECISION_URL's host. A sensitivity service on another
+// host gets COWORK_SENSITIVITY_DECISION_API_KEY, or no key at all.
+const SYNTHETIC_KEY = 'synthetic-shared-key';
+const SYNTHETIC_SENS_KEY = 'synthetic-sensitivity-key';
+async function sensitivityAuth(env) {
+  const { calls, fetchImpl } = recorder();
+  await createDecisionSettings({ store: memory(), env, fetchImpl }).sensitivityBackend().decide(request('routing.sensitivity'));
+  assert.equal(calls.length, 1);
+  return { url: calls[0].url, auth: calls[0].headers.Authorization };
+}
+const kevBoth = { COWORK_DECISION_URL: KEV, COWORK_DECISION_MODEL: 'kev-0.8b', COWORK_DECISION_API_KEY: SYNTHETIC_KEY, COWORK_SENSITIVITY_DECISION_MODEL: 'kev-0.8b' };
+
+test('a sensitivity service on another host never receives the shared decision key (#1745)', async () => {
+  const other = await sensitivityAuth({ ...kevBoth, COWORK_SENSITIVITY_DECISION_URL: 'http://192.168.1.30:11435' });
+  assert.equal(other.url, 'http://192.168.1.30:11435/v1/decisions');
+  assert.equal(other.auth, undefined, 'no key for another host');
+  const own = await sensitivityAuth({ ...kevBoth, COWORK_SENSITIVITY_DECISION_URL: 'http://192.168.1.30:11435', COWORK_SENSITIVITY_DECISION_API_KEY: SYNTHETIC_SENS_KEY });
+  assert.equal(own.auth, `Bearer ${SYNTHETIC_SENS_KEY}`, 'its own key when set');
+  const sameHost = await sensitivityAuth({ ...kevBoth, COWORK_SENSITIVITY_DECISION_URL: 'http://kev:11436' });
+  assert.equal(sameHost.auth, `Bearer ${SYNTHETIC_KEY}`, 'the same host keeps the shared key');
+  const shared = createDecisionSettings({ store: memory(), env: { ...kevBoth, COWORK_SENSITIVITY_DECISION_URL: 'http://192.168.1.30:11435' } });
+  const { calls, fetchImpl } = recorder();
+  await createDecisionSettings({ store: memory(), env: { ...kevBoth, COWORK_SENSITIVITY_DECISION_URL: 'http://192.168.1.30:11435' }, fetchImpl }).backend().decide(request('routing.route'));
+  assert.equal(calls[0].headers.Authorization, `Bearer ${SYNTHETIC_KEY}`, 'the shared backend still sends the shared key');
+  assert.notEqual(shared.backend(), shared.sensitivityBackend());
+});
+
+test('startup warns when COWORK_DECISION_URL is the kev host but the model is not Kev (#1745)', () => {
+  const { startupWarnings } = require('./decision-settings.cjs');
+  assert.equal(startupWarnings({ COWORK_DECISION_URL: KEV }).length, 1, 'model unset');
+  assert.match(startupWarnings({ COWORK_DECISION_URL: KEV, COWORK_DECISION_MODEL: 'laya' })[0], /not a Kev model/);
+  assert.deepEqual(startupWarnings({ COWORK_DECISION_URL: KEV, COWORK_DECISION_MODEL: 'kev-0.8b' }), []);
+  assert.deepEqual(startupWarnings({ COWORK_DECISION_URL: LAYA }), []);
+  assert.deepEqual(startupWarnings({}), []);
+  assert.match(require('node:fs').readFileSync(require('node:path').join(__dirname, 'index.cjs'), 'utf8'), /startupWarnings\(process\.env\)/, 'index.cjs logs them at startup');
+});
+
+test('a Settings-saved URL other than the deployment URL gets Laya wording while the deployment model is Kev (#1745)', async () => {
+  const env = { COWORK_DECISION_URL: KEV, COWORK_DECISION_MODEL: 'kev-0.8b', COWORK_DECISION_API_KEY: SYNTHETIC_KEY };
+  for (const savedUrl of [LAYA, 'http://kev:11436', 'http://192.168.1.20:8040']) {
+    const { calls, fetchImpl } = recorder();
+    const settings = createDecisionSettings({ store: memory({ url: savedUrl, timeoutMs: 1500 }), env, fetchImpl });
+    assert.equal(settings.get().source, 'admin');
+    assert.equal(settings.backend().wording, 'laya', savedUrl);
+    assert.equal(settings.backend().model, 'laya', savedUrl);
+    await settings.backend().decide(request('routing.route'));
+    assert.deepEqual(Object.keys(calls[0].body), ['state', 'question', 'options'], 'the Laya contract');
+  }
+});

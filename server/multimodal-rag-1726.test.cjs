@@ -420,3 +420,22 @@ test('#1737: the pause follows every request that embedded something, also acros
   await backfill.kick();
   assert.deepEqual(log, ['req:p1', 'sleep:1500', 'req:p2', 'sleep:1500', 'req:p3']);
 });
+
+// #1742: a pass that throws mid-walk still releases the image preset (try/finally), and the error still
+// reaches kick's log instead of being swallowed.
+test('the image preset is released when syncProjectMedia throws (#1742)', async () => {
+  for (const embedFirst of [true, false]) {
+    let n = 0, released = 0;
+    const logs = [];
+    const rag = { syncProjectMedia: async () => {
+      n += 1;
+      if (embedFirst && n === 1) return { ok: true, embedded: 1, pending: 2 };
+      throw new Error('synthetic sync failure');
+    } };
+    const backfill = multimodal.createMediaBackfill({ enabled: () => true, userIds: () => [USER], workspaceFor: () => ({ projects: [{ id: 'p1', files: [], assets: [] }], assetDir: () => '/x' }),
+      documentDir: () => '/x', rag, sleep: async () => {}, log: (line) => logs.push(line), release: async () => { released += 1; }, setTimer: () => 1, clearTimer: () => {} });
+    await backfill.kick();
+    assert.equal(released, 1, `release() runs once after a throw (embedded first: ${embedFirst})`);
+    assert.ok(logs.some((l) => /image backfill failed: synthetic sync failure/.test(l)));
+  }
+});

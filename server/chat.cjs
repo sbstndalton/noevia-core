@@ -717,7 +717,7 @@ function createChatHandler({
       if (cached && cached.until > Date.now()) return cached.text;
       // #697: the vision model is admitted to the shared engine (one model, memory budget) first;
       // a refusal falls back to handing the images to the answering model, as a failure does.
-      if (provider.id === DEFAULT_PROVIDER_ID && typeof modelManager.makeRoomFor === 'function') {
+      if (typeof modelManager.makeRoomFor === 'function') {
         try { await modelManager.makeRoomFor(visionModel, undefined, chatSignal.signal); }
         catch (err) { console.warn(`[vision] ${visionModel} not admitted: ${String(err?.code || err?.status || 'error')}`); return null; }
       }
@@ -1243,8 +1243,13 @@ function createChatHandler({
       // answering model could see for itself: it was chosen for this job, and
       // one model reading the image consistently beats whichever model the
       // router happened to pick reading it differently each turn.
-      if (visionModel) {
-        described = await describeImages(visionModel, provider.baseUrl, upstreamHeaders, message);
+      // #1741: the Vision role names a model on the local default provider, so the description runs there,
+      // with that provider's own address and headers, and only when this turn stays on the box (the #1735
+      // caption rule). An off-box turn gets no description: the answering model is handed the images itself
+      // below, if it can see them (an external provider already had them removed by rule 3).
+      const describeProvider = visionModel && !offBoxTurn({ externalProvider, routeTarget, provider, DEFAULT_PROVIDER_ID }) ? getProvider(DEFAULT_PROVIDER_ID) : null;
+      if (describeProvider && describeProvider.id === DEFAULT_PROVIDER_ID && !egress.isExternalProvider(describeProvider)) {
+        described = await describeImages(visionModel, describeProvider.baseUrl, providerHeaders(describeProvider), message);
       }
 
       if (described) {

@@ -301,26 +301,35 @@ function createMediaBackfill({ enabled: on = () => enabled(), userIds, workspace
     let ids = [];
     try { ids = userIds() || []; } catch { ids = []; }
     for (const userId of ids) order.push([userId, null]);
-    walk: for (const [userId, onlyProject] of order) {
-      if (stopped || !on()) break;
-      let workspace = null;
-      try { workspace = workspaceFor(userId); } catch { workspace = null; }
-      if (!workspace || workspace.revoked) continue;
-      for (const project of Array.isArray(workspace.projects) ? workspace.projects : []) {
-        if (!project || typeof project.id !== 'string' || diaryProject(project.id)) continue;
-        if (onlyProject && project.id !== onlyProject) continue;
-        const key = JSON.stringify([userId, project.id]);
-        if (visited.has(key)) continue;
-        visited.add(key);
-        const r = await syncProject(userId, workspace, project, totals);
-        if (r === 'stop') break walk;
-        if (r === false) break;
+    // #1742: the release runs however the walk ends, also when syncProjectMedia throws: the failing request
+    // may have loaded the image preset, and it is not held until the router unloads it on its own.
+    let threw = false;
+    try {
+      walk: for (const [userId, onlyProject] of order) {
+        if (stopped || !on()) break;
+        let workspace = null;
+        try { workspace = workspaceFor(userId); } catch { workspace = null; }
+        if (!workspace || workspace.revoked) continue;
+        for (const project of Array.isArray(workspace.projects) ? workspace.projects : []) {
+          if (!project || typeof project.id !== 'string' || diaryProject(project.id)) continue;
+          if (onlyProject && project.id !== onlyProject) continue;
+          const key = JSON.stringify([userId, project.id]);
+          if (visited.has(key)) continue;
+          visited.add(key);
+          const r = await syncProject(userId, workspace, project, totals);
+          if (r === 'stop') break walk;
+          if (r === false) break;
+        }
       }
+    } catch (err) {
+      threw = true;
+      throw err;
+    } finally {
+      delete totals.gap;
+      last = { at: Date.now(), ...totals };
+      // Also after a stop (a re-index that began mid-pass): the image preset is not held beside it.
+      if (totals.embedded || threw) { try { await release(); } catch { /* the router unloads it on its own later */ } }
     }
-    delete totals.gap;
-    last = { at: Date.now(), ...totals };
-    // Also after a stop (a re-index that began mid-pass): the image preset is not held beside it.
-    if (totals.embedded) { try { await release(); } catch { /* the router unloads it on its own later */ } }
     return totals;
   }
 
