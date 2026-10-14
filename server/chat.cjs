@@ -96,13 +96,15 @@ const FAILED_REPLY_TOOLS_NOTE = '(The reply to the message above ended before it
 const ABANDONED_TURN_NOTE = '(No reply was kept for the message above: it was stopped or failed before an answer. It is not an open request. Answer only the newest message unless the user asks about it.)';
 // #1703: a note for a client-sent applied write of a tool that is not positively public, on a route that leaves the
 // box. It says only that a change was made and with which tool; the target, arguments and result stay home.
-function appliedSummaryNote(entry) {
-  const name = typeof entry.name === 'string' && /^[\w.-]{1,80}$/.test(entry.name) ? entry.name : 'a tool';
+// #1704: the name is the client's; it is written only when it is a tool a server toolbox registers, so no other
+// text can ride out in it.
+function appliedSummaryNote(entry, knownTool = () => false) {
+  const name = typeof entry.name === 'string' && knownTool(entry.name) ? entry.name : 'a tool';
   return `Already done earlier in this chat: (a change was applied with ${name}). Do not run it again for the same change; if the user asks for it again, say it is already done unless they clearly want a second, separate change.`;
 }
 // #1703: a declined write on a route that leaves the box: our sentence only, never the client's content.
-function declinedSummaryNote(entry) {
-  const name = typeof entry.name === 'string' && /^[\w.-]{1,80}$/.test(entry.name) ? entry.name : 'a tool';
+function declinedSummaryNote(entry, knownTool = () => false) {
+  const name = typeof entry.name === 'string' && knownTool(entry.name) ? entry.name : 'a tool';
   return `Not run earlier in this chat: the user did not approve ${name}, so it did not run and nothing was changed by it.`;
 }
 // `offBox` (#1703): the request leaves this box (a cloud route, an external or non-default provider). Then the
@@ -110,10 +112,10 @@ function declinedSummaryNote(entry) {
 // (carryOrphanTool, decided by tool NAME from the server's toolboxes, never a client flag), an applied write of
 // any other tool becomes a content-free summary, and a declined entry carries no client content at all.
 // Local routes (offBox false) replay as before, so skills and local tools still see their history.
-function normalizeReplayHistory(mapped, newMessage, { carryOrphanTool = () => false, offBox = false } = {}) {
+function normalizeReplayHistory(mapped, newMessage, { carryOrphanTool = () => false, offBox = false, knownTool = () => false } = {}) {
   const out = [];
-  const appliedNote = (entry) => (offBox && !carryOrphanTool(entry.name) ? appliedSummaryNote(entry) : appliedToolNote(entry));
-  const declinedNote = (entry) => (offBox ? declinedSummaryNote(entry) : declinedToolNote(entry));
+  const appliedNote = (entry) => (offBox && !carryOrphanTool(entry.name) ? appliedSummaryNote(entry, knownTool) : appliedToolNote(entry));
+  const declinedNote = (entry) => (offBox ? declinedSummaryNote(entry, knownTool) : declinedToolNote(entry));
   // #1700: the carriers made below for a failed reply's results. Held here, not as a field on the message, so no
   // marker can leave this function.
   const orphanCarriers = new WeakSet();
@@ -376,7 +378,10 @@ function createChatHandler({
         : declinedEntry(h) ? { role: 'tool', content: h.content, name: h.name, declined: true }
         : (h.role === 'tool' || h.role === 'function') && typeof h.name === 'string' ? { role: h.role, content: h.content, name: h.name } : { role: h.role, content: h.content });
     // #1700: the tool results of a failed reply (#1692) are carried only for positively public tools.
-    const replayOptions = { carryOrphanTool: (name) => require('./tools-mode.cjs').isPublicToolName(name, allToolboxes()) };
+    const replayOptions = { carryOrphanTool: (name) => require('./tools-mode.cjs').isPublicToolName(name, allToolboxes()),
+      // #1704: a tool name some server toolbox registers (built-in or configured MCP), never a client's free text.
+      knownTool: (name) => typeof name === 'string' && (require('./tools-mode.cjs').PRIVATE_CORE_TOOLS.has(name)
+        || allToolboxes().some((b) => (b?.tools || []).some((t) => t?.function?.name === name))) };
     // Writes the client says already succeeded in this chat, for the repeat flag on approval cards.
     const recentWriteFps = new Set(mappedHistory.filter((h) => h.applied === true)
       .map((h) => require('./recent-writes.cjs').fingerprint(h.name, h.target, h.args)));
