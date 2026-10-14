@@ -47,7 +47,7 @@ test('#1661 a delete removes the files and the preset section, so the model leav
   await f.call('POST', '/api/models/delete', { name: 'plain' });
   const out = f.sent.pop();
   assert.equal(out.status, 200);
-  assert.deepEqual(out.body, { ok: true, unloaded: false, rolesCleared: ['fast'], presetRemoved: true });
+  assert.deepEqual(out.body, { ok: true, unloaded: false, rolesCleared: ['fast'], presetRemoved: true, presetsReloaded: false });
   assert.deepEqual(f.deleted, ['plain']);
   assert.deepEqual(f.presets(), ['orphan']);
   assert.ok(f.fetched.includes('DELETE sections/plain?baseRevision=r7'));
