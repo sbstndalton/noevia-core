@@ -31,7 +31,8 @@ function keepAlongside(env = process.env) {
 // /models/load answers 400 "already running"). Its weights are freed, so it is NOT resident for
 // the memory budget or the one-chat-model eviction, which keep counting only loaded/loading.
 const AVAILABLE_STATES = new Set(['loaded', 'sleeping']);
-const isAvailable = model => AVAILABLE_STATES.has(model?.status?.value);
+// `model.status` (not `model?.`) keeps the old answer for a null row: the listing is invalid (#1650 corpus).
+const isAvailable = model => AVAILABLE_STATES.has(model.status?.value);
 const alreadyRunning = result => result?.status === 400 && /already running/i.test(JSON.stringify(result?.body ?? ''));
 
 function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloadStatePath, fetchStream, autoconfig = {}, calibrationStatePath, calibrationOptions = {}, evidenceDir, autotuneStatePath, autotuneOptions = {}, presetWriter = null, unloadWait = {}, inferenceBudget = null, reloadStatePath = null, reloadGuard: reloadGuardOption = null }) {
@@ -237,7 +238,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
           const listing=await rawModels(signal);
           if(!listing.ok)return listing;
           const entry=listing.body?.data?.find(m=>m.id===model);
-          if(isAvailable(entry))return started;
+          if(entry&&isAvailable(entry))return started;
           if(!entry || entry.status?.failed || entry.status?.value==='unloaded')return {ok:false,status:502,body:{error:'The native model failed to become ready. Check its artifact and preset.'}};
           await new Promise(resolve=>setTimeout(resolve,200));
         }
