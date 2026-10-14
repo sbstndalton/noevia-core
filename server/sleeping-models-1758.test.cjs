@@ -109,9 +109,13 @@ test('#1758 the budget and eviction treat a sleeping model as not resident', asy
 
 test('#1758 the embedding fallback on the chat router counts a sleeping embedding model as served', async (t) => {
   const rag = require('./rag.cjs');
-  t.mock.method(globalThis, 'fetch', async () => new Response(JSON.stringify({ data: [
+  // #1760: servedModels uses rag.cjs's own connect-time-checked fetch, so the stub goes in through its seam.
+  const seen = [];
+  const previous = rag._test.setRagFetch(async (url) => { seen.push(String(url)); return new Response(JSON.stringify({ data: [
     { id: 'syn-embed', status: { value: 'sleeping' } }, { id: 'syn-cold', status: { value: 'unloaded' } }, { id: 'syn-up', status: { value: 'loaded' } },
-  ] }), { status: 200, headers: { 'content-type': 'application/json' } }));
+  ] }), { status: 200, headers: { 'content-type': 'application/json' } }); });
+  t.after(() => rag._test.setRagFetch(previous));
   const ids = await rag.servedModels({ baseUrl: 'http://synthetic-embed' });
+  assert.deepEqual(seen, ['http://synthetic-embed/v1/models']);
   assert.deepEqual(ids.sort(), ['syn-embed', 'syn-up']);
 });

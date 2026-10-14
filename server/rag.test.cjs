@@ -133,8 +133,7 @@ let embedCalls = 0;
 let embedFails = false;
 let embedGate = null; // when set, batch (multi-input) embedding calls wait on it
 let embedReached = null;
-const realFetch = global.fetch;
-global.fetch = async (url, options) => {
+const mockEmbedFetch = async (url, options) => {
   assert.match(String(url), /\/v1\/embeddings$/);
   embedCalls++;
   if (embedFails) return { ok: false, status: 503, text: async () => 'embedder down' };
@@ -142,7 +141,7 @@ global.fetch = async (url, options) => {
   if (embedGate && input.length > 1) { embedReached?.(); await embedGate; }
   return { ok: true, json: async () => ({ data: input.map((t) => ({ embedding: vectorFor(t) })) }) };
 };
-test.after(() => { global.fetch = realFetch; });
+rag._test.setRagFetch(mockEmbedFetch); // #1760: the embedding calls use rag.cjs's own fetch, not the global one
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-rag-test-'));
 test.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -430,13 +429,13 @@ test('a search while a newer version is being indexed never returns chunks of th
   const v2 = Array.from({ length: 20 }, (_, i) => `zebra passage ${i} ${'filler '.repeat(200)}`).join('\n\n');
   // Let v1's first embedding batch land, then hold its second batch: v1 is now partly
   // searchable and its run still owns the per-file queue.
-  const mockFetch = global.fetch;
+  const mockFetch = mockEmbedFetch;
   let batches = 0, release;
   const gate = new Promise((r) => { release = r; });
-  global.fetch = async (url, options) => {
+  rag._test.setRagFetch(async (url, options) => {
     if (JSON.parse(options.body).input.length > 1 && batches++ >= 1) await gate;
     return mockFetch(url, options);
-  };
+  });
   try {
     const first = rag.indexProjectFile('p-version', 'doc.txt', v1, null);
     while (batches < 2) await new Promise((r) => setImmediate(r));
@@ -454,7 +453,7 @@ test('a search while a newer version is being indexed never returns chunks of th
     // A delete retires every version at once.
     rag.deleteProjectFile('p-version', 'doc.txt', null);
     assert.deepEqual(await rag.searchProject('p-version', 'zebra', null), []);
-  } finally { global.fetch = mockFetch; release(); }
+  } finally { rag._test.setRagFetch(mockFetch); release(); }
 });
 
 test('#796: per-file generation and version entries are pruned once a file queue drains', async () => {

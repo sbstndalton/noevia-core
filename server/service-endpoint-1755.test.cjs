@@ -142,7 +142,13 @@ test('unspecified, multicast, metadata, query, fragment and login are refused; l
     'http://zero.lan:8040', 'http://multicast.lan:8040', 'http://metadata.lan', 'http://laya:8040/?k=v', 'http://laya:8040/#f', 'http://u:p@laya:8040', 'ftp://laya:8040']) {
     assert.equal((await helper().checkServiceEndpoint(url, { lookup })).ok, false, url);
   }
-  for (const url of ['http://169.254.10.20:8040', 'http://[fe80::1]:8040', 'http://[fd12:3456::7]:8040', 'http://[::1]:8040', 'http://127.0.0.1:8040']) {
+  for (const url of ['http://169.254.10.20:8040', 'http://[fe80::1]:8040']) {
+    // #1760: link-local is opt-in; the decision service passes it.
+    assert.equal((await helper().checkServiceEndpoint(url, { lookup })).ok, false, `${url} refused by default`);
+    assert.deepEqual(await helper().checkServiceEndpoint(url, { lookup, linkLocal: true }), { ok: true }, url);
+    assert.equal(configuration({ COWORK_DECISION_URL: url }).reason, null, `${url} accepted for the decision service`);
+  }
+  for (const url of ['http://[fd12:3456::7]:8040', 'http://[::1]:8040', 'http://127.0.0.1:8040']) {
     assert.deepEqual(await helper().checkServiceEndpoint(url, { lookup }), { ok: true }, url);
   }
   // Embeddings keep refusing link-local (#1636).
@@ -180,4 +186,48 @@ test('#1753: a decision URL saved in Settings on another host gets no shared key
   const deployment = create({ store: memory(), env });
   assert.ok(deployment.backend());
   assert.equal(seen.at(-1).COWORK_DECISION_API_KEY, 'synthetic-shared-key', 'the deployment URL keeps its key');
+});
+
+test('#1760: 100.100.100.200 (Alibaba Cloud metadata, inside 100.64.0.0/10) is refused; its neighbours are Tailscale', async () => {
+  for (const url of ['http://100.100.100.200', 'http://100.100.100.200:8040', 'http://[::ffff:100.100.100.200]:8040']) {
+    for (const linkLocal of [false, true]) {
+      const r = await helper().checkServiceEndpoint(url, { lookup, linkLocal });
+      assert.equal(r.ok, false, url);
+      assert.match(r.reason, /cloud metadata/, url);
+    }
+    assert.ok(configuration({ COWORK_DECISION_URL: url }).reason, url);
+    assert.ok(systemOneConfiguration({ COWORK_SYSTEM_ONE_URL: url }).reason, url);
+  }
+  assert.match(helper().whyNotLocal('100.100.100.200'), /cloud metadata/);
+  assert.equal(helper().whyNotLocal('100.100.100.201'), null);
+  assert.equal(helper().whyNotLocal('100.100.100.199'), null);
+  // A name that resolves to it is refused, before and at connect.
+  const table = { 'alibaba.lan': ['100.100.100.200'] };
+  assert.equal((await helper().checkServiceEndpoint('http://alibaba.lan:8040', { lookup: async (h) => table[h].map((address) => ({ address, family: 4 })) })).ok, false);
+  await assert.rejects(lookupVia(resolveFrom(table), 'alibaba.lan'), (e) => e.code === 'EPUBLICADDR');
+  await assert.rejects(helper().createServiceFetch({ resolve: resolveFrom(table) })('http://100.100.100.200/latest/meta-data'), /not on this network/);
+});
+
+test('#1760: link-local is off by default; System One and the sensitivity check refuse 169.254.x and fe80::', async () => {
+  const urls = ['http://169.254.10.20:8040', 'http://[fe80::1]:8040'];
+  for (const url of urls) {
+    assert.equal((await helper().checkServiceEndpoint(url, { lookup })).ok, false, url);
+    assert.ok(helper().parseServiceUrl(url).reason, url);
+    await assert.rejects(helper().serviceFetch(url + '/health'), /not on this network/, url);
+    await assert.rejects(helper().createServiceFetch()(url + '/health'), /not on this network/, url);
+    assert.ok(systemOneConfiguration({ COWORK_SYSTEM_ONE_URL: url }).reason, `System One refuses ${url}`);
+  }
+  // A name that resolves to link-local is refused at connect by the default lookup, accepted only with the opt-in.
+  await assert.rejects(lookupVia(resolveFrom({ 'll.lan': ['169.254.10.20'] }), 'll.lan'), (e) => e.code === 'EPUBLICADDR');
+  await assert.rejects(lookupVia(resolveFrom({ 'll6.lan': ['fe80::1'] }), 'll6.lan'), (e) => e.code === 'EPUBLICADDR');
+  // The sensitivity check: its own URL is refused, while the decision service's URL (the same) is kept.
+  for (const url of urls) {
+    const settings = createDecisionSettings({ store: memory(), env: { COWORK_DECISION_URL: url, COWORK_SENSITIVITY_DECISION_URL: url }, fetchImpl: async () => assert.fail('no request') });
+    assert.ok(settings.backend(), `the decision service keeps ${url}`);
+    assert.equal(settings.sensitivityBackend(), null, `the sensitivity check refuses ${url}`);
+    const only = createDecisionSettings({ store: memory(), env: { COWORK_DECISION_URL: 'http://laya:8040', COWORK_SENSITIVITY_DECISION_URL: url } });
+    assert.equal(only.sensitivityBackend(), null, `${url} as the sensitivity URL`);
+  }
+  // Without its own URL the sensitivity check uses the decision service, as before.
+  assert.ok(createDecisionSettings({ store: memory(), env: { COWORK_DECISION_URL: 'http://laya:8040' } }).sensitivityBackend());
 });

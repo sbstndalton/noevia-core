@@ -21,6 +21,27 @@ const { frame } = require('./embedding-profile.cjs');
 const { createEmbeddingConfig } = require('./embedding-config.cjs');
 const slots = require('./vector-slots.cjs');
 
+// #1760: every embedding and rerank request goes through the on-this-network fetch (service-endpoint.cjs),
+// which resolves a name itself and refuses the connection unless every answer is on this network and not
+// public by the Rust address check (ssrf.cjs). The address check when an address is SET (embedding-address.cjs)
+// cannot see a name that answers private then and public later (DNS rebinding); this one runs at connect.
+// Link-local is refused. A redirect is refused by it too. `setRagFetch` is the test seam.
+let netFetch = null;
+function ragFetch(input, init) {
+  if (!netFetch) netFetch = makeRagFetch();
+  return netFetch(input, init);
+}
+function makeRagFetch(extra = {}) {
+  const { createServiceFetch } = require('./service-endpoint.cjs');
+  return createServiceFetch({ linkLocal: false, addressesPublic: (a) => require('./ssrf.cjs').ssrfWasm().ssrfAddressesPublic(a), ...extra });
+}
+function setRagFetch(fn) { const prev = netFetch; netFetch = fn; return prev; }
+// The reranker's backend, built here so a test can drive it without a chat.
+function rerankBackend(baseUrl) {
+  const { llamaRerankBackend } = require('./decision/backends.cjs');
+  return llamaRerankBackend({ baseUrl, fetchImpl: (u, i) => ragFetch(u, { ...i, redirect: 'error' }), model: process.env.RERANK_MODEL || null, apiKey: process.env.RERANK_API_KEY || null /* #697: the inference key never goes to a reranker sidecar */ });
+}
+
 // Injected by init() from index.cjs (keeps this module testable standalone).
 let RAG_DIR = null;
 // #1636: endpoint, model and profile come from the one embedding configuration (embedding-config.cjs):
@@ -88,9 +109,8 @@ function initRerank() {
   if (!target.enabled) { rerank = null; return; }
   const baseUrl = target.baseUrl;
   const { createDecisions } = require('./decision/index.cjs');
-  const { llamaRerankBackend } = require('./decision/backends.cjs');
   const decisions = createDecisions({
-    backends: { 'llama-rerank': llamaRerankBackend({ baseUrl, model: process.env.RERANK_MODEL || null, apiKey: process.env.RERANK_API_KEY || null /* #697: the inference key never goes to a reranker sidecar */ }) },
+    backends: { 'llama-rerank': rerankBackend(baseUrl) },
     chains: { 'rag.rerank': ['llama-rerank'] },
     log: (e) => { if (e.failed || e.fellBack) console.warn('[rag] rerank', JSON.stringify(e)); },
   });
@@ -160,7 +180,7 @@ async function probeEmbeddingSidecar(base, target) {
   const timer = setTimeout(() => ctrl.abort(), RETRIEVAL_PROBE_TIMEOUT_MS);
   try {
     const input = frame(target.profile, RETRIEVAL_PROBE_TEXT, { kind: 'query' });
-    const res = await fetch(`${base.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/embeddings`, {
+    const res = await ragFetch(`${base.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/embeddings`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: target.model, input }),
@@ -189,7 +209,7 @@ async function probeEmbeddingRouter(base, target) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), RETRIEVAL_PROBE_TIMEOUT_MS);
   try {
-    const res = await fetch(`${base.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/models`, {
+    const res = await ragFetch(`${base.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/models`, {
       headers: inferenceHeaders(),
       redirect: 'error',
       signal: ctrl.signal,
@@ -316,7 +336,7 @@ async function embedOnce(target, input, signal) {
   const leave=enterInference();
   try {
   const base = target.baseUrl || inferenceBase;
-  const res = await fetch(`${base.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/embeddings`, {
+  const res = await ragFetch(`${base.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/embeddings`, {
     method: 'POST',
     headers: target.baseUrl ? { 'Content-Type': 'application/json' } : inferenceHeaders(),
     body: JSON.stringify({ model: target.model, input }),
@@ -339,7 +359,7 @@ async function servedModels(target, { timeoutMs = 10000 } = {}) {
   const base = (target && target.baseUrl) || inferenceBase;
   if (!base) throw new Error('no embeddings address');
   // An explicit address never receives the inference credentials (as embedOnce).
-  const res = await fetch(`${base.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/models`, {
+  const res = await ragFetch(`${base.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/models`, {
     method: 'GET', headers: target && target.baseUrl ? {} : inferenceHeaders(), redirect: 'error', signal: AbortSignal.timeout(timeoutMs),
   });
   if (!res.ok) throw new Error(`models ${res.status}`);
@@ -775,7 +795,7 @@ async function embedMediaOnce(target, model, parts, signal) {
   try {
     const base = target.baseUrl || inferenceBase;
     if (!base) throw new Error('no embeddings address');
-    const res = await fetch(`${base.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/embeddings`, {
+    const res = await ragFetch(`${base.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/embeddings`, {
       method: 'POST',
       headers: target.baseUrl ? { 'Content-Type': 'application/json' } : inferenceHeaders(),
       body: JSON.stringify({ model, input: parts.map((part) => ({ content: [part] })), encoding_format: 'float' }),
@@ -885,7 +905,7 @@ async function releaseMediaModel() {
   const service = require('./embedding-service.cjs').current();
   if (!alias || alias === target.model || !target.baseUrl || !service || !service.isAt(target.baseUrl)) return false;
   try {
-    const res = await fetch(`${target.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')}/models/unload`, {
+    const res = await ragFetch(`${target.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')}/models/unload`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: alias }), redirect: 'error', signal: AbortSignal.timeout(10000),
     });
     return res.ok;
@@ -1085,4 +1105,4 @@ const trackedFileState = () => ({ queues: fileQueues.size, generations: fileGene
 
 // #1646: the sentence a hybrid cloud route without a grant removes (read_project_file is not offered there).
 const READ_FILE_HINT = ' Use read_project_file with PDF startPage/endPage and offset for pages beyond the summary.';
-module.exports = { searchProjectWithImages, syncProjectMedia, releaseMediaModel, readCaption, writeCaption, mediaModelFor, embeddingOff, READ_FILE_HINT, servedModels, servedModelsCached, init, trackedFileState, indexProjectFile, deleteProjectFile, searchProject, filesContext, chunkText, ragAvailable, retrievalStatus, embed, embedModel, embeddingIdentity, embeddingConfig: getEmbeddingConfig, onIndexed, listIndexes, indexCoverage, fillMissing, dropIndexSlot, rerankPool };
+module.exports = { _test: { setRagFetch, makeRagFetch, rerankBackend }, searchProjectWithImages, syncProjectMedia, releaseMediaModel, readCaption, writeCaption, mediaModelFor, embeddingOff, READ_FILE_HINT, servedModels, servedModelsCached, init, trackedFileState, indexProjectFile, deleteProjectFile, searchProject, filesContext, chunkText, ragAvailable, retrievalStatus, embed, embedModel, embeddingIdentity, embeddingConfig: getEmbeddingConfig, onIndexed, listIndexes, indexCoverage, fillMissing, dropIndexSlot, rerankPool };

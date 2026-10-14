@@ -3,13 +3,15 @@
 const { identityOf } = require('./decision-qualification.cjs');
 const { profileFor, tempered } = require('./decision-models.cjs');
 const { toTypeSafe, fromTypeSafe } = require('./decision-typesafe.cjs');
-const { parseServiceUrl, serviceFetch } = require('./service-endpoint.cjs');
+const { parseServiceUrl, serviceFetch, decisionServiceFetch } = require('./service-endpoint.cjs');
 // #1755: any service on this network (service-endpoint.cjs): a Docker service name such as `laya` or
 // `kev` (#1639), a LAN or Tailscale address, or a name that resolves only to such addresses; http or
 // https, no path, login, query or fragment. A name is judged by what it resolves to when the request
 // connects (serviceFetch), not here.
-function configuration(env = process.env) {
-  const parsed = parseServiceUrl(env.COWORK_DECISION_URL);
+// #1760: link-local (169.254/16, fe80::/10) is off in service-endpoint.cjs unless a caller opts in. The decision
+// service (Laya/Kev) does; the sensitivity check's endpoint passes linkLocal:false.
+function configuration(env = process.env, { linkLocal = true } = {}) {
+  const parsed = parseServiceUrl(env.COWORK_DECISION_URL, { linkLocal });
   return parsed.reason ? { reason:'Connect a private decision service, then restart noevia.' } : { baseUrl:parsed.baseUrl, reason:null };
 }
 // A failure with a short text-free cause code (decision/index.cjs causeOf) for the decision log.
@@ -108,8 +110,8 @@ const KEY_RE=/^[\x21-\x7e]{1,256}$/;
 /** `env.COWORK_DECISION_MODEL` names the model behind the URL (decision-models.cjs; unset or unknown:
  *  Laya, exactly as before #1639). `wording` overrides only the wording, for the eval harness, which
  *  captures our contract's bodies for either wording. */
-function createDecisionEndpoint({ env=process.env, fetchImpl=serviceFetch, holdMaxMs=SLOT_HOLD_MAX_MS, wording=null }={}) {
-  const config=configuration(env);
+function createDecisionEndpoint({ env=process.env, linkLocal=true, fetchImpl=linkLocal?decisionServiceFetch:serviceFetch, holdMaxMs=SLOT_HOLD_MAX_MS, wording=null }={}) {
+  const config=configuration(env,{linkLocal});
   if (config.reason) return null;
   const lane=laneFor(config.baseUrl);
   const profile=profileFor(env.COWORK_DECISION_MODEL);

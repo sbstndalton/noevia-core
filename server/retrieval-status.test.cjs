@@ -41,6 +41,7 @@ test.afterEach(() => {
 
 function initFresh(overrides = {}) {
   const rag = freshRag();
+  rag._test.setRagFetch((...a) => global.fetch(...a)); // #1760: the probes use rag.cjs's own fetch; these tests stub the global one
   rag.init({ dataDir: os.tmpdir(), embedModel: 'probe-model', inferenceUrl: 'http://router.invalid', ...overrides });
   return rag;
 }

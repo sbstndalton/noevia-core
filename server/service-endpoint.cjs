@@ -6,7 +6,7 @@
 // The rule, one place for every caller:
 //  - http or https; no login, query string or fragment (each caller says which paths it takes);
 //  - an IP literal must be on this network: loopback, RFC 1918, Tailscale CGNAT 100.64.0.0/10, IPv6
-//    ULA fc00::/7 and, where the caller allows it, link-local (IPv4 169.254/16, IPv6 fe80::/10). Never
+//    ULA fc00::/7 and, where the caller opts in (default: not), link-local (IPv4 169.254/16, IPv6 fe80::/10). Never
 //    public, unspecified (0.0.0.0, ::), multicast, broadcast, reserved or documentation ranges, the
 //    IPv6 forms that carry another address (v4-compatible, NAT64, Teredo), or a cloud metadata address;
 //  - a name (a single-label Docker service name such as `laya`, or `rock5b.local`, `pi5.lan`,
@@ -28,7 +28,8 @@ const net = require('node:net');
 
 const LOOKUP_TIMEOUT_MS = 5000;
 // Instance-metadata addresses, refused even where link-local / ULA is allowed.
-const METADATA = new Set(['169.254.169.254', 'fd00:ec2:0:0:0:0:0:254']);
+// 100.100.100.200 is Alibaba Cloud's, inside the Tailscale range 100.64.0.0/10 (#1760).
+const METADATA = new Set(['169.254.169.254', '100.100.100.200', 'fd00:ec2:0:0:0:0:0:254']);
 
 // Only an extra check, when a caller passes one (embedding-address.cjs passes the Rust port's).
 const defaultAddressesPublic = null;
@@ -49,6 +50,7 @@ function inLocalRange(ip) {
 
 function deniedV4([a, b, c, d], linkLocal) {
   if (a === 0) return 'the unspecified address';
+  if (METADATA.has(`${a}.${b}.${c}.${d}`)) return 'a cloud metadata address';
   if (a === 169 && b === 254) return !linkLocal ? 'a link-local address' : (c === 169 && d === 254) ? 'a cloud metadata address' : null;
   if (a >= 224) return a === 255 && b === 255 ? 'the broadcast address' : a < 240 ? 'a multicast address' : 'a reserved address';
   if (a === 192 && b === 0 && (c === 0 || c === 2)) return 'a reserved address';
@@ -75,7 +77,7 @@ function hextets(ip) {
 }
 
 /** Why `ip` is not a host on this network although it is not public, or null.
- *  `linkLocal`: whether 169.254/16 and fe80::/10 count as this network (default: no). */
+ *  `linkLocal`: whether 169.254/16 and fe80::/10 count as this network (default: no; a caller that needs it says so, #1760). */
 function deniedAddress(ip, { linkLocal = false } = {}) {
   if (net.isIPv4(ip)) return deniedV4(ip.split('.').map(Number), linkLocal);
   const h = hextets(ip);
@@ -117,7 +119,7 @@ const hostOfUrl = (url) => url.hostname.replace(/^\[|\]$/g, '');
  *   paths: the pathnames this caller accepts (null: any path).
  * @returns {{ url: URL, host: string, isName: boolean, baseUrl: string, reason: null } | { reason: string }}
  */
-function parseServiceUrl(raw, { paths = ['/'], linkLocal = true, addressesPublic = defaultAddressesPublic } = {}) {
+function parseServiceUrl(raw, { paths = ['/'], linkLocal = false, addressesPublic = defaultAddressesPublic } = {}) {
   let url;
   try { url = new URL(String(raw ?? '').trim()); } catch { return { reason: 'not a URL' }; }
   if (!['http:', 'https:'].includes(url.protocol)) return { reason: 'not an http(s) URL' };
@@ -166,7 +168,7 @@ function whyAnswersNotLocal(host, addresses, opts) {
  * @returns {Promise<{ ok: true } | { ok: false, reason: string, transient: boolean }>}
  *   transient: the name did not resolve (this time); everything else is a permanent refusal.
  */
-async function checkServiceEndpoint(raw, { lookup = dns.promises.lookup, paths = ['/'], linkLocal = true, addressesPublic = defaultAddressesPublic } = {}) {
+async function checkServiceEndpoint(raw, { lookup = dns.promises.lookup, paths = ['/'], linkLocal = false, addressesPublic = defaultAddressesPublic } = {}) {
   const parsed = parseServiceUrl(raw, { paths, linkLocal, addressesPublic });
   if (parsed.reason) return { ok: false, reason: parsed.reason, transient: false };
   if (!parsed.isName) return { ok: true };
@@ -185,7 +187,7 @@ function refusal(message) { return Object.assign(new Error(message), { code: 'EP
  * A `lookup` for net/http/tls that resolves as usual and refuses the connection unless EVERY answer is
  * on this network. Accepts both shapes net uses (`all: true`, and the single-address form).
  */
-function createServiceLookup({ resolve = dns.lookup, linkLocal = true, addressesPublic = defaultAddressesPublic } = {}) {
+function createServiceLookup({ resolve = dns.lookup, linkLocal = false, addressesPublic = defaultAddressesPublic } = {}) {
   return function serviceLookup(hostname, options, callback) {
     if (typeof options === 'function') { callback = options; options = {}; }
     const opts = typeof options === 'number' ? { family: options } : { ...(options || {}) };
@@ -207,7 +209,7 @@ function createServiceLookup({ resolve = dns.lookup, linkLocal = true, addresses
  * A fetch that can only reach hosts on this network, decided at connect time. Returns a WHATWG
  * Response; never follows a redirect. `resolve` is injected in tests to simulate DNS.
  */
-function createServiceFetch({ resolve = dns.lookup, linkLocal = true, addressesPublic = defaultAddressesPublic } = {}) {
+function createServiceFetch({ resolve = dns.lookup, linkLocal = false, addressesPublic = defaultAddressesPublic } = {}) {
   const lookup = createServiceLookup({ resolve, linkLocal, addressesPublic });
   return async function serviceFetch(input, init = {}) {
     const url = new URL(String(input));
@@ -222,8 +224,10 @@ function createServiceFetch({ resolve = dns.lookup, linkLocal = true, addressesP
   };
 }
 
-let shared;
-/** The process-wide service fetch (real DNS). */
+let shared, sharedLinkLocal;
+/** The process-wide service fetch (real DNS), link-local refused. */
 function serviceFetch(input, init) { return (shared || (shared = createServiceFetch()))(input, init); }
+/** The same, for the one caller that opts in to link-local: the decision service (Laya/Kev). */
+function decisionServiceFetch(input, init) { return (sharedLinkLocal || (sharedLinkLocal = createServiceFetch({ linkLocal: true })))(input, init); }
 
-module.exports = { parseServiceUrl, checkServiceEndpoint, createServiceLookup, createServiceFetch, serviceFetch, deniedAddress, whyNotLocal };
+module.exports = { parseServiceUrl, checkServiceEndpoint, createServiceLookup, createServiceFetch, serviceFetch, decisionServiceFetch, deniedAddress, whyNotLocal };
