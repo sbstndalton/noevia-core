@@ -51,7 +51,10 @@ function headerSafeName(name) {
   return safe.length > 200 ? safe.slice(-200) : safe;
 }
 
-async function extractDocument(name, bytes, { url = process.env.DOCLING_BASE_URL, fetchImpl = fetch } = {}) {
+// #1726: `figures` asks the worker for the document's figures (images) as well, and for a per-page `ocr`
+// marker (the page had no text layer, so its text came from OCR). Only sent while NOEVIA_MULTIMODAL_RAG
+// is on (documents.cjs); without the header the worker answers exactly as before.
+async function extractDocument(name, bytes, { url = process.env.DOCLING_BASE_URL, fetchImpl = fetch, figures = false } = {}) {
   if (!url) throw new Error('Document extraction is not configured.');
   const response = await fetchImpl(`${url.replace(/\/+$/, '')}/extract`, {
     method: 'POST',
@@ -61,7 +64,7 @@ async function extractDocument(name, bytes, { url = process.env.DOCLING_BASE_URL
     // ("Documents/Tax Return 2024/W-2.pdf"), so send the last segment. Sending the whole path
     // made every document in a folder fail with HTTP 400 while a bare filename worked, which
     // is why a synthetic test did not catch it (2026-09-21).
-    headers: { 'Content-Type': 'application/octet-stream', 'X-Document-Name': headerSafeName(documentName(name)) },
+    headers: { 'Content-Type': 'application/octet-stream', 'X-Document-Name': headerSafeName(documentName(name)), ...(figures ? { 'X-Document-Figures': '1' } : {}) },
     body: bytes,
     // Measured on DaServer (2 CPUs, CPU-only torch), not assumed:
     //   scanned prose, OCR   3.4 s/page

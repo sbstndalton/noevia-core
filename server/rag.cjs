@@ -445,6 +445,11 @@ function openIndex(projectId, userId) {
     // #1636: 1 marks a small file stored whole for direct injection (never embedded). Older rows are
     // NULL; vector-slots.cjs recognises those by shape (a file's only chunk, at most 2400 characters).
     if (!columns.some((c) => c.name === 'direct')) db.exec('ALTER TABLE chunks ADD COLUMN direct INTEGER');
+    // #1726: what a row holds. NULL (every row before #1726) and 'text' are text chunks; 'image' is an
+    // image source or document figure (multimodal-rag.cjs), whose vector sits in the same slot as the
+    // text vectors and whose `body` is only its label. `meta` is that row's JSON (source, page, figure).
+    if (!columns.some((c) => c.name === 'kind')) db.exec('ALTER TABLE chunks ADD COLUMN kind TEXT');
+    if (!columns.some((c) => c.name === 'meta')) db.exec('ALTER TABLE chunks ADD COLUMN meta TEXT');
     // #1636: vectors live in per-model slots; `slot` is the active model's (null until it has one).
     const active = embeddingConfig.active();
     slots.adoptLegacy(db, active);
@@ -458,10 +463,15 @@ function openIndex(projectId, userId) {
 // Remove one file's chunks AND their vectors, in every model's slot. chunks.id is INTEGER PRIMARY
 // KEY, so SQLite reuses freed ids: a vector left behind would join to whatever chunk takes its id
 // next. Callers run this inside a transaction with whatever replaces the file.
-function dropFileRows(index, fileName) {
-  slots.dropChunks(index.db, index.db.prepare('SELECT id FROM chunks WHERE file = ?').all(fileName).map((r) => r.id));
-  index.db.prepare('DELETE FROM chunks WHERE file = ?').run(fileName);
+// #1726: `textOnly` leaves the file's image rows (a document's figures, an image source's own vector)
+// alone: re-cutting a file's text is not a change of its images, which the media pass reconciles.
+function dropFileRows(index, fileName, { textOnly = false } = {}) {
+  const which = textOnly ? ` AND ${TEXT_ROW}` : '';
+  slots.dropChunks(index.db, index.db.prepare(`SELECT id FROM chunks WHERE file = ?${which}`).all(fileName).map((r) => r.id));
+  index.db.prepare(`DELETE FROM chunks WHERE file = ?${which}`).run(fileName);
 }
+// #1726: a text chunk (every row written before the kind column existed is one).
+const TEXT_ROW = "COALESCE(kind, 'text') = 'text'";
 
 // Per project+tenant+file: runs are chained so two index runs never interleave, and every
 // index or delete bumps a generation so a superseded run stops before writing anything more.
@@ -556,7 +566,7 @@ async function indexProjectFileNow(projectId, fileName, text, userId, isCurrent,
     if (text.length <= DIRECT_INJECT_MAX) {
       // Small file: stored for the record, injected directly by handleChat.
       index.db.transaction(() => {
-        dropFileRows(index, fileName);
+        dropFileRows(index, fileName, { textOnly: true });
         index.db
           .prepare('INSERT INTO chunks (file, chunk_no, body, content_hash, version, direct) VALUES (?, 0, ?, ?, ?, 1)')
           .run(fileName, text, hash(text), version);
@@ -577,7 +587,7 @@ async function indexProjectFileNow(projectId, fileName, text, userId, isCurrent,
     }
     const ins = index.db.prepare('INSERT INTO chunks (file, chunk_no, body, content_hash, version, direct) VALUES (?, ?, ?, ?, ?, 0)');
     const rows = index.db.transaction(() => {
-      dropFileRows(index, fileName);
+      dropFileRows(index, fileName, { textOnly: true });
       return unique.map((body, i) => { const h = hash(body); return { id: Number(ins.run(fileName, i, body, h, version).lastInsertRowid), file: fileName, body, hash: h }; });
     })();
     let embedded = 0;
@@ -592,8 +602,9 @@ async function indexProjectFileNow(projectId, fileName, text, userId, isCurrent,
   }
 }
 
-// Drop one file's chunks (called when a file is removed from a project).
-function deleteProjectFile(projectId, fileName, userId) {
+// Drop one file's chunks (called when a file is removed from a project). #1726: `keepMedia` drops
+// only its text (a source that has no text, such as an image, keeps its image vector).
+function deleteProjectFile(projectId, fileName, userId, { keepMedia = false } = {}) {
   // Supersede any index run still embedding this file, so it cannot write vectors afterwards.
   const key = fileKey(projectId, fileName, userId);
   bumpGeneration(key);
@@ -612,7 +623,7 @@ function deleteProjectFile(projectId, fileName, userId) {
     return;
   }
   try {
-    index.db.transaction(() => dropFileRows(index, fileName))();
+    index.db.transaction(() => dropFileRows(index, fileName, { textOnly: keepMedia }))();
     if (fileVersions.get(key) === null) fileVersions.delete(key);
     // With no run queued the delete's generation bump has nothing left to supersede; a queued
     // run still needs it to see that it is stale, and its drain prunes the key.
@@ -633,6 +644,9 @@ function isCurrentVersion(projectId, fileName, userId, version) {
 
 // Top-K chunks for a query, this project's index only. Empty array on any
 // failure — chat falls back to direct injection of small files.
+// #1726: text chunks only. Image rows (multimodal-rag.cjs) are never returned here, whatever the flag:
+// every caller of this function (chat excerpts, the project search tool, Deep Research) reads `body`
+// as text. searchProjectWithImages is the one search that also returns images.
 async function searchProject(projectId, query, userId) {
   const index = openIndex(projectId, userId);
   if (!index) return [];
@@ -643,25 +657,269 @@ async function searchProject(projectId, query, userId) {
   try {
     const [qvec] = await embed([query], { kind: 'query', target: index.active });
     if (!qvec || qvec.length !== index.slot.dim) return [];
-    const qbuf = serializeF32(qvec);
-    const rows = index.db
-      .prepare(
-        `SELECT c.file, c.chunk_no, c.body, c.version, 1.0 - vec_distance_cosine(v.embedding, ?) AS score
-         FROM ${slots.joinSql(index.slot)}
-         WHERE 1.0 - vec_distance_cosine(v.embedding, ?) >= ?
-         ORDER BY score DESC
-         LIMIT ?`
-      )
-      .all(qbuf, qbuf, MIN_SCORE, (rerank ? rerank.pool : TOP_K) * 4);
-    const hits = rows.filter((r) => isCurrentVersion(projectId, r.file, userId, r.version)).slice(0, rerank ? rerank.pool : TOP_K).map((r) => ({ file: r.file, body: r.body, score: Math.round(r.score * 1000) / 1000 }));
-    if (!rerank) return hits;
-    return await rerankPool({ query, pool: hits, decisions: rerank.decisions, keep: rerank.keep, deadlineMs: rerank.deadlineMs });
+    return await textHits(index, serializeF32(qvec), projectId, query, userId);
   } catch (err) {
     console.warn(`[rag] search failed for ${projectId}: ${err.message}`);
     return [];
   } finally {
     index.db.close();
   }
+}
+
+// The text side of a search: cosine pool, version filter, then the optional reranker. Unchanged by #1726
+// apart from the kind filter, which matches every row of an index that holds no image rows.
+async function textHits(index, qbuf, projectId, query, userId) {
+  const rows = index.db
+    .prepare(
+      `SELECT c.file, c.chunk_no, c.body, c.version, 1.0 - vec_distance_cosine(v.embedding, ?) AS score
+       FROM ${slots.joinSql(index.slot)}
+       WHERE 1.0 - vec_distance_cosine(v.embedding, ?) >= ? AND COALESCE(c.kind, 'text') = 'text'
+       ORDER BY score DESC
+       LIMIT ?`
+    )
+    .all(qbuf, qbuf, MIN_SCORE, (rerank ? rerank.pool : TOP_K) * 4);
+  const hits = rows.filter((r) => isCurrentVersion(projectId, r.file, userId, r.version)).slice(0, rerank ? rerank.pool : TOP_K).map((r) => ({ file: r.file, body: r.body, score: Math.round(r.score * 1000) / 1000 }));
+  if (!rerank) return hits;
+  return rerankPool({ query, pool: hits, decisions: rerank.decisions, keep: rerank.keep, deadlineMs: rerank.deadlineMs });
+}
+
+// #1726: one query vector against the text AND the image vectors of this project's index (they share the
+// active model's slot, so they share one vector space). The merge rule:
+//   - text hits are exactly searchProject's: same pool, MIN_SCORE, TOP_K, version filter and, when on, the
+//     reranker. Images never displace a text hit.
+//   - image hits cannot be scored by a reranker (it reads text), so they bypass it and keep their cosine
+//     score: at most RAG_IMAGE_TOP_K (default 2) of them, each at or above RAG_IMAGE_MIN_SCORE (default
+//     MIN_SCORE), best first. They are added beside the text hits, never counted against them.
+// `indexed` lists the image rows that have a current vector (their meta), so the caller knows which
+// images retrieval can see at all; an image without one is not "not relevant", just not indexed yet.
+// Never throws: { text: [], images: [], indexed: [] } on any failure.
+async function searchProjectWithImages(projectId, query, userId) {
+  const empty = { text: [], images: [], indexed: [] };
+  const index = openIndex(projectId, userId);
+  if (!index) return empty;
+  if (!index.slot) { index.db.close(); return empty; }
+  try {
+    const [qvec] = await embed([query], { kind: 'query', target: index.active });
+    if (!qvec || qvec.length !== index.slot.dim) return empty;
+    const qbuf = serializeF32(qvec);
+    const text = await textHits(index, qbuf, projectId, query, userId);
+    const join = slots.joinSql(index.slot);
+    const indexed = index.db.prepare(`SELECT c.file, c.meta FROM ${join} WHERE c.kind = 'image'`).all().map(mediaRow).filter(Boolean);
+    const images = index.db
+      .prepare(
+        `SELECT c.file, c.body, c.content_hash, c.meta, 1.0 - vec_distance_cosine(v.embedding, ?) AS score
+         FROM ${join}
+         WHERE c.kind = 'image' AND 1.0 - vec_distance_cosine(v.embedding, ?) >= ?
+         ORDER BY score DESC
+         LIMIT ?`
+      )
+      .all(qbuf, qbuf, IMAGE_MIN_SCORE, IMAGE_TOP_K)
+      .map((r) => { const m = mediaRow(r); return m && { ...m, label: r.body, hash: r.content_hash, score: Math.round(r.score * 1000) / 1000 }; })
+      .filter(Boolean);
+    return { text, images, indexed };
+  } catch (err) {
+    console.warn(`[rag] search failed for ${projectId}: ${err.message}`);
+    return empty;
+  } finally {
+    index.db.close();
+  }
+}
+const IMAGE_TOP_K = clampInt(process.env.RAG_IMAGE_TOP_K, 2, 0, 8);
+const IMAGE_MIN_SCORE = (() => { const n = Number(process.env.RAG_IMAGE_MIN_SCORE); return Number.isFinite(n) && n >= -1 && n <= 1 ? n : MIN_SCORE; })();
+// An image row as search results carry it: { file, kind, ...meta }. null when its meta is unreadable.
+function mediaRow(row) {
+  let meta;
+  try { meta = JSON.parse(row.meta || 'null'); } catch { return null; }
+  if (!meta || typeof meta !== 'object') return null;
+  return { file: row.file, kind: 'image', meta };
+}
+
+// ── #1726 media (image) rows ──────────────────────────────────────────────────────────────────
+// multimodal-rag.cjs decides WHICH images a project has (its image sources and the figures Docling
+// returned from its documents, never a scanned page) and when to embed them; this file stores them.
+// An image row is a chunks row with kind 'image': `file` is the source it belongs to, `content_hash`
+// 'img:' + sha256 of the image bytes, `body` its label (name, page, caption), `meta` its JSON. Its
+// vector is written into the ACTIVE model's slot, the same vec0 table as the text vectors, by the same
+// model (with its image projector), so a text query finds it by content.
+
+/**
+ * The model name an image is embedded under for `target`, or null when no image projector is known to
+ * be there. A model-manager-run embedding service lists each served model's projector alias (#1726,
+ * noevia-rs model-manager: `<model>.vision`); a service it does not run answers images under
+ * EMBEDDING_IMAGE_MODEL, else under the text model's own name (a llama-server started with --mmproj).
+ */
+function mediaModelFor(target) {
+  const service = require('./embedding-service.cjs').current();
+  if (service && service.managed() && (!target.baseUrl || service.isAt(target.baseUrl))) {
+    const vision = service.status()?.vision;
+    const hit = Array.isArray(vision) ? vision.find((v) => v && v.model === target.model && typeof v.alias === 'string') : null;
+    return hit ? hit.alias : null;
+  }
+  const named = String(process.env.EMBEDDING_IMAGE_MODEL || '').trim();
+  return named || target.model;
+}
+
+/**
+ * One request to the embeddings server for media `parts` (one OpenAI-style content part per item, e.g.
+ * { type: 'image_url', image_url: { url: 'data:image/png;base64,...' } }). llama.cpp's /v1/embeddings
+ * accepts an `input` entry of the form { content: [parts] } for a model loaded with --mmproj
+ * (tools/server/README.md at b11610, "/v1/embeddings"; server-context.cpp tokenize_oai_content_array).
+ * EmbeddingGemma 2 takes images with no prompt prefix (its model card), so nothing is framed.
+ */
+async function embedMediaOnce(target, model, parts, signal) {
+  const leave = enterInference();
+  try {
+    const base = target.baseUrl || inferenceBase;
+    if (!base) throw new Error('no embeddings address');
+    const res = await fetch(`${base.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/embeddings`, {
+      method: 'POST',
+      headers: target.baseUrl ? { 'Content-Type': 'application/json' } : inferenceHeaders(),
+      body: JSON.stringify({ model, input: parts.map((part) => ({ content: [part] })), encoding_format: 'float' }),
+      redirect: 'error', // the image goes to the configured embeddings server only
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(MEDIA_EMBED_TIMEOUT_MS)]) : AbortSignal.timeout(MEDIA_EMBED_TIMEOUT_MS),
+    });
+    if (!res.ok) throw Object.assign(new Error(`embeddings ${res.status}: ${(await readCappedText(res, 64 * 1024)).text.slice(0, 120)}`), { status: res.status });
+    const body = await readCappedJson(res, 4 * 1024 * 1024);
+    const items = Array.isArray(body?.data) ? body.data : [];
+    if (items.length !== parts.length || !items.every((it) => Array.isArray(it?.embedding))) throw new Error('embeddings returned no vector for the image');
+    const ordered = items.every((it) => Number.isInteger(it.index)) ? [...items].sort((a, b) => a.index - b.index) : items;
+    return ordered.map((it) => it.embedding);
+  } finally { leave(); }
+}
+const MEDIA_EMBED_TIMEOUT_MS = clampInt(process.env.RAG_MEDIA_EMBED_TIMEOUT_MS, 120000, 5000, 600000);
+
+/**
+ * Brings one project index's image rows in line with `items` (multimodal-rag.cjs mediaItems) and
+ * embeds at most `limit` of the ones still without a vector in the active slot.
+ *   items: [{ file, hash ('img:<sha256>'), label, meta, part: () => content part | null }]
+ * Rows no item names any more are removed with their vectors and their cached caption. Returns
+ * { ok, embedded, pending, removed, failed, reason }: `pending` is how many images still have no
+ * vector, so the caller (the rate-limited backfill) knows whether to come back. Never throws.
+ */
+async function syncProjectMedia(projectId, userId, items, { limit = 1, signal, embedParts = null } = {}) {
+  const index = openIndex(projectId, userId);
+  if (!index) return { ok: false, reason: 'rag-unavailable', embedded: 0, pending: 0, removed: 0 };
+  try {
+    const target = index.active;
+    const profile = require('./embedding-profile.cjs').profileNamed(target.profile);
+    if (!profile || !Array.isArray(profile.media) || !profile.media.includes('image')) return { ok: false, reason: 'profile-has-no-images', embedded: 0, pending: 0, removed: 0 };
+    const wanted = new Map();
+    for (const it of Array.isArray(items) ? items : []) {
+      if (!it || typeof it.file !== 'string' || !/^img:[0-9a-f]{64}$/.test(String(it.hash || ''))) continue;
+      const key = JSON.stringify([it.file, it.hash]);
+      if (!wanted.has(key)) wanted.set(key, it);
+    }
+    const existing = index.db.prepare("SELECT id, file, content_hash FROM chunks WHERE kind = 'image'").all();
+    const have = new Set(existing.map((r) => JSON.stringify([r.file, r.content_hash])));
+    const stale = existing.filter((r) => !wanted.has(JSON.stringify([r.file, r.content_hash])));
+    index.db.transaction(() => {
+      if (stale.length) {
+        slots.dropChunks(index.db, stale.map((r) => r.id));
+        const del = index.db.prepare('DELETE FROM chunks WHERE id = ?');
+        for (const r of stale) del.run(r.id);
+      }
+      const ins = index.db.prepare("INSERT INTO chunks (file, chunk_no, body, content_hash, version, direct, kind, meta) VALUES (?, ?, ?, ?, NULL, 0, 'image', ?)");
+      let n = 0;
+      for (const [key, it] of wanted) if (!have.has(key)) ins.run(it.file, n++, String(it.label || it.file).slice(0, 500), it.hash, JSON.stringify(it.meta || {}));
+      dropOrphanCaptions(index.db);
+    })();
+    const slot = slots.findSlot(index.db, target);
+    const missingSql = slot && slot.map
+      ? `SELECT c.id, c.file, c.content_hash AS hash FROM chunks c LEFT JOIN ${slot.map} m ON m.chunk_id = c.id AND m.content_hash = c.content_hash WHERE c.kind = 'image' AND m.chunk_id IS NULL ORDER BY c.id`
+      : "SELECT c.id, c.file, c.content_hash AS hash FROM chunks c WHERE c.kind = 'image' ORDER BY c.id";
+    const missing = index.db.prepare(missingSql).all();
+    const model = mediaModelFor(target);
+    if (!missing.length) return { ok: true, embedded: 0, pending: 0, removed: stale.length };
+    if (!model) return { ok: false, reason: 'no-image-projector', embedded: 0, pending: missing.length, removed: stale.length };
+    if (embeddingOff(target)) return { ok: false, reason: 'embedding-off', embedded: 0, pending: missing.length, removed: stale.length };
+    let embedded = 0;
+    const failed = [];
+    // At most `limit` embedding requests; an image that cannot be read is skipped (and reported), so it
+    // never holds back the ones after it.
+    for (const row of missing) {
+      if (embedded + failed.filter((f) => f.reason === 'width').length >= Math.max(1, limit)) break;
+      const it = wanted.get(JSON.stringify([row.file, row.hash]));
+      let part = null;
+      try { part = it && typeof it.part === 'function' ? it.part() : null; } catch { part = null; }
+      if (!part) { failed.push({ file: row.file, reason: 'unreadable' }); continue; }
+      let vector;
+      try {
+        [vector] = await (embedParts || ((p) => embedMediaOnce(target, model, p, signal)))([part]);
+      } catch (err) {
+        if (signal?.aborted) throw err;
+        return { ok: false, reason: 'embed-failed', error: String(err?.message || err).slice(0, 200), status: err?.status, embedded, pending: missing.length - embedded, removed: stale.length, failed };
+      }
+      const wrote = index.db.transaction(() => {
+        if (!index.db.prepare('SELECT 1 FROM chunks WHERE id = ? AND content_hash = ?').get(row.id, row.hash)) return 0;
+        if (!Array.isArray(vector) || !vector.length) return 0;
+        const s2 = slots.ensureSlot(index.db, target, vector.length);
+        if (vector.length !== s2.dim) return 0;
+        slots.writeVectors(index.db, s2, [{ id: row.id, hash: row.hash, vector }]);
+        return 1;
+      })();
+      if (!wrote) failed.push({ file: row.file, reason: 'width' });
+      embedded += wrote;
+    }
+    return { ok: true, embedded, pending: Math.max(0, missing.length - embedded - failed.length), removed: stale.length, failed };
+  } catch (err) {
+    if (signal?.aborted) throw err;
+    console.warn(`[rag] media sync failed for ${projectId}: ${err.message}`);
+    return { ok: false, reason: 'error', embedded: 0, pending: 0, removed: 0 };
+  } finally {
+    index.db.close();
+  }
+}
+
+/**
+ * #1726: after a backfill pass, unload the image preset (`<model>.vision`) from a model-manager-run
+ * embedding router, so its projector is held only while images are being embedded. Best effort;
+ * never the text model, never a server the model manager does not run.
+ */
+async function releaseMediaModel() {
+  const target = embeddingConfig.active();
+  const alias = mediaModelFor(target);
+  const service = require('./embedding-service.cjs').current();
+  if (!alias || alias === target.model || !target.baseUrl || !service || !service.isAt(target.baseUrl)) return false;
+  try {
+    const res = await fetch(`${target.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')}/models/unload`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: alias }), redirect: 'error', signal: AbortSignal.timeout(10000),
+    });
+    return res.ok;
+  } catch { return false; }
+}
+
+// #1726: one caption per image, cached in the project's own index beside the image's rows and keyed by
+// the image bytes' hash, so it is made once and made again only when the image changes. Removed when no
+// image row of the index uses that hash any more.
+function ensureCaptions(db) {
+  db.exec('CREATE TABLE IF NOT EXISTS media_captions (content_hash TEXT PRIMARY KEY, caption TEXT NOT NULL, model TEXT, created_at TEXT NOT NULL DEFAULT (datetime(\'now\')))');
+}
+function dropOrphanCaptions(db) {
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'media_captions'").get()) return;
+  db.prepare("DELETE FROM media_captions WHERE content_hash NOT IN (SELECT content_hash FROM chunks WHERE kind = 'image')").run();
+}
+/** The cached caption { caption, model } for an image of this project, or null. Never throws. */
+function readCaption(projectId, userId, contentHash) {
+  if (!ragAvailable()) return null;
+  const index = openIndex(projectId, userId);
+  if (!index) return null;
+  try {
+    if (!index.db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'media_captions'").get()) return null;
+    const row = index.db.prepare('SELECT caption, model FROM media_captions WHERE content_hash = ?').get(String(contentHash));
+    return row ? { caption: row.caption, model: row.model || null } : null;
+  } catch { return null; } finally { index.db.close(); }
+}
+/** Stores a caption for an image this index holds. Returns false (nothing stored) for any other hash. */
+function writeCaption(projectId, userId, contentHash, caption, model) {
+  if (!ragAvailable()) return false;
+  const index = openIndex(projectId, userId);
+  if (!index) return false;
+  try {
+    if (!index.db.prepare("SELECT 1 FROM chunks WHERE kind = 'image' AND content_hash = ?").get(String(contentHash))) return false;
+    ensureCaptions(index.db);
+    index.db.prepare('INSERT OR REPLACE INTO media_captions (content_hash, caption, model) VALUES (?, ?, ?)').run(String(contentHash), String(caption).slice(0, 4000), model ? String(model).slice(0, 200) : null);
+    return true;
+  } catch { return false; } finally { index.db.close(); }
 }
 
 // ── #1636 re-index support (embedding-migration.cjs drives it) ───────────────────────────────
@@ -741,7 +999,11 @@ function dropIndexSlot(entry, target) {
 // The files-context for one chat message: retrieved chunks when the index has
 // vectors, otherwise the verbatim small files (old behavior, still the path
 // for anything <= DIRECT_INJECT_MAX). Never throws. `{ attached: true }` words it for a chat's own attachments.
-async function filesContext(projectId, files, query, userId, onSources, { attached = false } = {}) {
+// #1726: `images: true` (only when NOEVIA_MULTIMODAL_RAG is on, decided by chat.cjs) also searches the
+// project's image vectors with the same query vector and hands the permitted image hits, plus which
+// images are indexed at all, to `onImages({ hits, indexed })`. They are never put into the returned text:
+// what the model gets for an image is decided at answer time (multimodal-rag.cjs answerImages).
+async function filesContext(projectId, files, query, userId, onSources, { attached = false, images = false, onImages = null } = {}) {
   if (!Array.isArray(files) || files.length === 0) return null;
   // #1457: whether the question names a file, by its full stored name or its last path segment, as a
   // whole token ("data.md" is not named by "mydata.md" or "data.md.bak"). Whole files are reported as
@@ -774,8 +1036,15 @@ async function filesContext(projectId, files, query, userId, onSources, { attach
   // `injected` is everything the prompt holds, which is what a coverage check must count (#1513).
   const placed = [];
   const injected = [];
-  if (ragAvailable() && large.length > 0) {
-    const hits = await searchProject(projectId, query, userId);
+  const withImages = images === true && typeof onImages === 'function';
+  if (ragAvailable() && (large.length > 0 || withImages)) {
+    let hits;
+    if (withImages) {
+      const found = await searchProjectWithImages(projectId, query, userId);
+      const named = new Set(files.map(f => f.name));
+      try { onImages({ hits: found.images.filter(h => named.has(h.file)), indexed: found.indexed.filter(h => named.has(h.file)) }); } catch { /* a reporting hook never breaks the prompt */ }
+      hits = large.length > 0 ? found.text : [];
+    } else hits = await searchProject(projectId, query, userId);
     if (hits.length > 0) {
       const permitted = new Set(files.map(f => f.name));
       for (const h of hits) if (permitted.has(h.file)) { parts.push(frameUntrusted('excerpt', h.file, h.body)); const e = { file: h.file, body: h.body, score: h.score, kind: 'excerpt' }; placed.push(e); injected.push(e); }
@@ -812,4 +1081,4 @@ const trackedFileState = () => ({ queues: fileQueues.size, generations: fileGene
 
 // #1646: the sentence a hybrid cloud route without a grant removes (read_project_file is not offered there).
 const READ_FILE_HINT = ' Use read_project_file with PDF startPage/endPage and offset for pages beyond the summary.';
-module.exports = { embeddingOff, READ_FILE_HINT, servedModels, servedModelsCached, init, trackedFileState, indexProjectFile, deleteProjectFile, searchProject, filesContext, chunkText, ragAvailable, retrievalStatus, embed, embedModel, embeddingIdentity, embeddingConfig: getEmbeddingConfig, onIndexed, listIndexes, indexCoverage, fillMissing, dropIndexSlot, rerankPool };
+module.exports = { searchProjectWithImages, syncProjectMedia, releaseMediaModel, readCaption, writeCaption, mediaModelFor, embeddingOff, READ_FILE_HINT, servedModels, servedModelsCached, init, trackedFileState, indexProjectFile, deleteProjectFile, searchProject, filesContext, chunkText, ragAvailable, retrievalStatus, embed, embedModel, embeddingIdentity, embeddingConfig: getEmbeddingConfig, onIndexed, listIndexes, indexCoverage, fillMissing, dropIndexSlot, rerankPool };

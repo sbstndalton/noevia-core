@@ -35,6 +35,16 @@ async function ingest(workspace, projectId, name, bytes, previous) {
   try { out = JSON.parse(fs.readFileSync(resultFile, 'utf8')); if (out.retryable) throw new Error('retry OCR'); } catch {
     try { out = await documents.extractDocumentText(name, bytes); }
     catch (err) { out = { text: '', pages: 0, pageTexts: [], state: 'failed', truncated: false, retryable: !!err.retryable, error: err.message }; }
+    // #1726: figures (multimodal RAG on, Docling) are stored as their own content-addressed files beside
+    // this version's record, which keeps only where they are: <version>.fig<index>.<ext>.
+    if (Array.isArray(out.figures)) {
+      out = { ...out, figures: out.figures.map((f) => {
+        const file = `${version}.fig${f.index}.${f.ext}`;
+        const full = versionPath(workspace, projectId, version, `.fig${f.index}.${f.ext}`);
+        if (!fs.existsSync(full)) writeOnce(workspace, full, f.bytes);
+        return { page: f.page, index: f.index, file, hash: hash(f.bytes), ...(f.caption ? { caption: f.caption } : {}), ...(f.text ? { text: f.text } : {}) };
+      }) };
+    }
     writeOnce(workspace, resultFile, JSON.stringify(out));
   }
   workspace.assertActive?.();
@@ -97,6 +107,8 @@ function prune(workspace, project) {
     for (const key of [d.version, d.availableVersion]) if (key) keep.add(key + '.json');
     for (const key of [d.byteHash, d.availableByteHash]) if (key) keep.add(key + '.pdf');
   }
-  for (const name of fs.readdirSync(dir)) if (!keep.has(name)) fs.rmSync(path.join(dir, name), { force: true });
+  // #1726: a kept version's figure files (<version>.fig<n>.<ext>) are kept with it.
+  const keptFigure = (name) => /^[a-f0-9]{64}\.fig\d{1,3}\.(png|jpg|webp)$/.test(name) && keep.has(name.slice(0, 64) + '.json');
+  for (const name of fs.readdirSync(dir)) if (!keep.has(name) && !keptFigure(name)) fs.rmSync(path.join(dir, name), { force: true });
 }
 module.exports = { ingest, failed, notice, readPages, readOriginal, directory, prune, problem };

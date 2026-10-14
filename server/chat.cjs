@@ -276,6 +276,9 @@ function createChatHandler({
   sourceJobs = require('./source-jobs.cjs'), sourceWaitMs = 30000,
   // #1574: how long a local reply may go silent after its first output before it is ended (0 = no limit).
   streamIdleMs = 120000,
+  // #1726: multimodal RAG (NOEVIA_MULTIMODAL_RAG). Off: nothing below changes.
+  multimodalEnabled = () => require('./multimodal-rag.cjs').enabled(),
+  documentDir = (workspace, projectId) => require('./document-sources.cjs').directory(workspace, projectId),
 }) {
   const jsonOut = json;
   // Revoked Skill content in earlier turns (#546): one ledger per handler, cached in memory.
@@ -517,13 +520,18 @@ function createChatHandler({
     // with the user's turn as "attached to this chat"; the shadow project's name and a "knowledge-file"
     // framing in the system message made a small model deny having them. Real projects are unchanged.
     const chatAttachments = !!project && String(project.id).startsWith('cowork-chat-context-');
+    // #1726: with multimodal RAG on, the same retrieval also returns the project's relevant images (and
+    // which images it can see at all); what the model gets for them is decided once the route is known.
+    const multimodal = !!project && !body.compactOnly && multimodalEnabled() === true ? require('./multimodal-rag.cjs') : null;
+    let imageRetrieval = null; // { hits, indexed } when multimodal retrieval ran
     if (project && Array.isArray(project.files) && project.files.length) {
       const readable = require('./instruction-skills.cjs').sources(project);
       // #552: the chunks that went into the prompt, reported to the browser as a `sources` event.
       filesBlock = await rag.filesContext(project.id, readable, message, currentWorkspace().userId,
         // #1513 counts what the prompt holds (`injected`), not only the reported sources: an unnamed file head
         // is in the prompt but not a source chip (#1457), and was told to the model as "none of it" read.
-        (placed, injected) => { replySources = require('./chat-sources.cjs').buildSources(placed, readable); partialReads = require('./source-coverage.cjs').partialSources(readable, Array.isArray(injected) ? injected : placed); }, { attached: chatAttachments });
+        (placed, injected) => { replySources = require('./chat-sources.cjs').buildSources(placed, readable); partialReads = require('./source-coverage.cjs').partialSources(readable, Array.isArray(injected) ? injected : placed); },
+        multimodal ? { attached: chatAttachments, images: true, onImages: (found) => { imageRetrieval = found; } } : { attached: chatAttachments });
     }
 
     const sysParts = [];
@@ -752,8 +760,32 @@ function createChatHandler({
     // sends only those. The project's other images are named to the model (below), never described
     // or sent, so a text-only turn does no vision work. Without the field every project image rides
     // along, as before.
-    const namedImageIds = Array.isArray(body.turnImageIds) ? new Set(body.turnImageIds) : null;
-    const unattachedImageNames = namedImageIds ? projectImages.filter((a) => !namedImageIds.has(a.id)).map((a) => a.name) : [];
+    // #1726: with multimodal RAG on (and no explicit turnImageIds), an image retrieval can see is sent only
+    // when retrieved for this question (or named in it), through the answer-time path below; an image it
+    // cannot see yet (no vector) rides along as before.
+    let assetPlan = null;
+    if (multimodal && imageRetrieval && !Array.isArray(body.turnImageIds)) {
+      assetPlan = multimodal.assetPlan(projectImages, imageRetrieval);
+      const q = String(message || '').toLowerCase();
+      for (const a of projectImages) if (assetPlan.indexed.has(a.id) && a.name && q.includes(String(a.name).toLowerCase())) assetPlan.retrieved.add(a.id);
+    }
+    const namedImageIds = Array.isArray(body.turnImageIds) ? new Set(body.turnImageIds) : assetPlan ? assetPlan.rideAlong : null;
+    const unattachedImageNames = namedImageIds ? projectImages.filter((a) => !namedImageIds.has(a.id) && !(assetPlan && assetPlan.retrieved.has(a.id))).map((a) => a.name) : [];
+    // The retrieved images (image sources and document figures) as they are now; a hit whose source is
+    // gone or changed since it was indexed is dropped. An image this turn already attaches is not repeated.
+    let retrievedImages = [];
+    if (multimodal && imageRetrieval) {
+      const byAsset = new Map();
+      for (const h of imageRetrieval.hits) if (h?.meta?.assetId) byAsset.set(h.meta.assetId, h);
+      const hits = [...imageRetrieval.hits];
+      if (assetPlan) for (const id of assetPlan.retrieved) if (!byAsset.has(id)) { const h = imageRetrieval.indexed.find((x) => x?.meta?.assetId === id); if (h) hits.push({ ...h, hash: `img:${(project.files || []).find((f) => f && f.name === h.file)?.attachment?.id}` }); }
+      const seen = new Set();
+      for (const h of hits) {
+        if (h?.meta?.assetId && namedImageIds && namedImageIds.has(h.meta.assetId)) continue;
+        const r = multimodal.resolveHit(currentWorkspace(), project, h, { documentDir: (id) => documentDir(currentWorkspace(), id), fsImpl: fs });
+        if (r && !seen.has(r.hash)) { seen.add(r.hash); retrievedImages.push(r); }
+      }
+    }
     let attachedImages = [];
     const missingImages = [];
     const loadedImageNames = [];
@@ -1170,8 +1202,9 @@ function createChatHandler({
     if (replySources.length && !body.compactOnly) send({ type: 'sources', sources: replySources });
     send({ type: 'telemetry', phase: 'waiting', model });
     // #1079: a switch to the long-context profile reloads the model; say so instead of "Preparing".
-    if (contextSwitch && !attachedImages.length) send({ type: 'status', id: 'loadingLongContext', text: 'Loading the high-context profile — switching models may take a moment…' });
-    else send({ type: 'status', id: attachedImages.length ? 'readingImages' : 'preparing', text: attachedImages.length ? 'Reading image sources — model loading and visual processing may take a moment…' : 'Preparing response…' });
+    const readingImages = attachedImages.length || retrievedImages.length;
+    if (contextSwitch && !readingImages) send({ type: 'status', id: 'loadingLongContext', text: 'Loading the high-context profile — switching models may take a moment…' });
+    else send({ type: 'status', id: readingImages ? 'readingImages' : 'preparing', text: readingImages ? 'Reading image sources — model loading and visual processing may take a moment…' : 'Preparing response…' });
     let visionWarning = missingImages.length ? `Images were not read because their stored files are missing: ${quotedNames(missingImages)}. Re-upload them.` : '';
     if (visionWarning) wire = [{ role: 'system', content: visionWarning + ' Do not guess their contents.' }, ...wire];
     // Rule 3 of provider-egress.cjs: project images are not sent to an external provider on their own.
@@ -1241,6 +1274,61 @@ function createChatHandler({
       }
     }
 
+    // #1726: retrieved images. On a cloud route nothing derived from them is sent (their names only); a
+    // local model that can see gets the images; one that cannot gets their own text, else a cached caption
+    // by the Vision role model, else their names, said plainly (multimodal-rag.cjs answerImages).
+    if (multimodal && retrievedImages.length) {
+      const roles = autoRoles();
+      const visionModel = roles && roles.vision;
+      const uid = currentWorkspace().userId;
+      const captionImage = (image) => {
+        if (!visionModel) return null;
+        return multimodal.captionOnce(JSON.stringify([uid, project.id, image.hash]), {
+          read: () => (typeof rag.readCaption === 'function' ? rag.readCaption(project.id, uid, image.hash) : null),
+          write: (caption, by) => { if (typeof rag.writeCaption === 'function') rag.writeCaption(project.id, uid, image.hash, caption, by); },
+          generate: async () => {
+            if (provider.id === DEFAULT_PROVIDER_ID && typeof modelManager.makeRoomFor === 'function') {
+              try { await modelManager.makeRoomFor(visionModel, undefined, chatSignal.signal); }
+              catch (err) { console.warn(`[vision] ${visionModel} not admitted for a caption: ${String(err?.code || err?.status || 'error')}`); return null; }
+            }
+            let bytes;
+            try { bytes = image.bytes(); } catch { return null; }
+            try {
+              const r = await fetch(`${String(provider.baseUrl).replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json', ...upstreamHeaders }, redirect: 'error',
+                body: JSON.stringify({ model: visionModel, max_tokens: 1024, messages: [{ role: 'user', content: [
+                  { type: 'text', text: 'Describe this image in detail, so someone who cannot see it can answer questions about it. Transcribe any text exactly, including numbers, labels and headings. If text is unclear, say so rather than guessing.' },
+                  require('./multimodal-rag.cjs').MODALITIES.image.part(image.mime, bytes)] }] }),
+                signal: AbortSignal.any([chatSignal.signal, AbortSignal.timeout(VISION_DESCRIBE_TIMEOUT_MS)]),
+              });
+              if (!r.ok) { console.warn(`[vision] ${visionModel} could not caption (${r.status})`); return null; }
+              const out = await readCappedJson(r, 4 * 1024 * 1024);
+              const text = String(out?.choices?.[0]?.message?.content || '').trim();
+              if (!text || out?.choices?.[0]?.finish_reason === 'length') return null;
+              return { caption: text, model: visionModel };
+            } catch (err) { console.warn(`[vision] caption failed: ${String((err && err.message) || err)}`); return null; }
+          },
+        });
+      };
+      const decided = await multimodal.answerImages({
+        images: retrievedImages, external: externalProvider, providerLabel: provider.label || 'an external provider',
+        canSee: async () => (await visionProbe(provider.baseUrl, upstreamHeaders, model)).supported, caption: captionImage, hasVisionRole: !!visionModel, frame: frameUntrusted,
+      });
+      if (decided.notes.length) {
+        const note = decided.notes.join('\n\n');
+        wire = wire.some((m) => m.role === 'system') ? wire.map((m) => (m.role === 'system' ? { ...m, content: `${m.content}\n\n${note}` } : m)) : [{ role: 'system', content: note }, ...wire];
+      }
+      if (decided.parts.length) {
+        const lastUser = [...wire].reverse().find((m) => m.role === 'user');
+        if (lastUser) {
+          const label = `(Retrieved images: ${quotedNames(decided.sent)})`;
+          lastUser.content = Array.isArray(lastUser.content)
+            ? [...lastUser.content, { type: 'text', text: label }, ...decided.parts]
+            : [{ type: 'text', text: `${typeof lastUser.content === 'string' ? lastUser.content : ''}\n\n${label}` }, ...decided.parts];
+        }
+      }
+      if (decided.warning) visionWarning += `${visionWarning ? ' ' : ''}${decided.warning}`;
+    }
     send({ type: 'status', id: 'generating', text: 'Generating response…' });
     const imageWarning = visionWarning;
     const replyWarning = () => [imageWarning, revokedInHistory.length ? historyNote(revokedInHistory) : '', require('./source-coverage.cjs').coverageWarning(partialReads)].filter(Boolean).join(' ');

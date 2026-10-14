@@ -33,6 +33,10 @@ const PROFILES = Object.freeze({
   }),
   'embeddinggemma-2': Object.freeze({
     id: 'embeddinggemma-2',
+    // #1726: the media this model embeds into the same space as text (with its image projector,
+    // mmproj). Media inputs take no prompt prefix (model card: "Prefixes apply to text only").
+    // Audio and video are in the model too; they are not wired up yet (multimodal-rag.cjs MODALITIES).
+    media: Object.freeze(['image']),
     format: (text, kind, title) => {
       if (kind === 'query') return `task: search result | query: ${text}`;
       if (kind === 'similarity') return `task: sentence similarity | query: ${text}`;
