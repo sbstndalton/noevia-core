@@ -124,14 +124,15 @@ const fakeLookup = async (host) => {
   if (!DNS[host]) throw Object.assign(Error(`getaddrinfo ENOTFOUND ${host}`), { code: 'ENOTFOUND' });
   return DNS[host].map((address) => ({ address, family: address.includes(':') ? 6 : 4 }));
 };
-function routes({ migration, fetchCalls = [], diaryReply = { ok: true, status: 200, body: { active: { model: 'nomic-embed-text-v1' } } } } = {}) {
+function routes({ migration, fetchCalls = [], diaryReply = { ok: true, status: 200, body: { active: { model: 'nomic-embed-text-v1' } } }, served = async (t) => [t.model], checkAddress = (url) => checkEmbeddingAddress(url, { lookup: fakeLookup }) } = {}) {
   const audits = [];
   const json = (res, status, body) => { res.status = status; res.body = body; return true; };
   const handler = createEmbeddingRoutes({
     json, readJson: async (req) => req.body, migration, authService: { audit: (...a) => audits.push(a) },
     fetchJson: async (url, init) => { fetchCalls.push({ url, init }); return diaryReply; },
     DIARY_BASE: 'http://diary:8010', diaryServiceHeaders: () => ({ 'Content-Type': 'application/json', Authorization: 'Bearer service' }),
-    checkAddress: (url) => checkEmbeddingAddress(url, { lookup: fakeLookup }),
+    checkAddress,
+    servedModels: served,
   });
   return { handler, audits, fetchCalls };
 }
@@ -435,4 +436,97 @@ test('an administrator choosing a next model while the seeded one is held back k
   g.dns.failing = 0;
   await g.scheduled.splice(0)[0].fn();
   assert.equal(g.config.next().model, 'chosen');
+});
+
+// ── #1660 review: set-next only for a model the embeddings server really serves ──────────────
+
+test('set-next is refused when the embeddings server does not serve the target (single-model sidecar)', async () => {
+  const calls = [];
+  const migration = { status: () => ({}), setNext: (t) => { calls.push(t); return {}; } };
+  const { handler, fetchCalls } = routes({ migration, served: async () => ['nomic-embed-text-v1'] });
+  const res = fakeRes();
+  await handler({ method: 'POST', body: { action: 'set-next', scope: 'projects', target: { model: 'embeddinggemma-2', profile: 'embeddinggemma-2', baseUrl: '' } } }, res, { path: '/api/embedding', authn: admin });
+  assert.equal(res.status, 409);
+  assert.equal(res.body.code, 'modelNotServed');
+  assert.deepEqual(res.body.served, ['nomic-embed-text-v1']);
+  assert.deepEqual(calls, [], 'no re-index started');
+  assert.deepEqual(fetchCalls, [], 'the Diary is not asked either');
+});
+
+test('set-next is refused when the served models cannot be read, and allowed when the target is listed', async () => {
+  const calls = [];
+  const migration = { status: () => ({}), setNext: (t) => { calls.push(t); return {}; } };
+  const down = routes({ migration, served: async () => { throw new Error('ECONNREFUSED'); } });
+  const r1 = fakeRes();
+  await down.handler({ method: 'POST', body: { action: 'set-next', scope: 'projects', target: { model: 'embeddinggemma-2', baseUrl: '' } } }, r1, { path: '/api/embedding', authn: admin });
+  assert.equal(r1.status, 409);
+  assert.equal(r1.body.code, 'endpointUnverified');
+  const up = routes({ migration, served: async (t) => { assert.equal(t.baseUrl, null, 'empty address = the inference engine'); return ['nomic-embed-text-v1', 'embeddinggemma-2']; } });
+  const r2 = fakeRes();
+  await up.handler({ method: 'POST', body: { action: 'set-next', scope: 'projects', target: { model: 'embeddinggemma-2', baseUrl: '' } } }, r2, { path: '/api/embedding', authn: admin });
+  assert.equal(r2.status, 200);
+  assert.equal(calls.length, 1);
+});
+
+test('#1660 review: the Diary\'s embeddings server is checked too (scope diary, and diaryBaseUrl for scope all)', async () => {
+  const calls = [];
+  const migration = { status: () => ({}), setNext: async (t) => { calls.push(t); return {}; } };
+  // Only the Diary's own server lacks the model.
+  const anyAddress = async () => ({ ok: true }); // the address rule is tested above; this is about the served check
+  const servedBy = { 'http://embed-a:8080/v1': ['embeddinggemma-2'], 'http://embed-d:8080/v1': ['nomic-embed-text-v1'] };
+  const asked = [];
+  const served = async (t) => { asked.push(t.baseUrl); return servedBy[t.baseUrl] || []; };
+  const all = routes({ migration, served, checkAddress: anyAddress });
+  const r1 = fakeRes();
+  await all.handler({ method: 'POST', body: { action: 'set-next', scope: 'all', target: { model: 'embeddinggemma-2', baseUrl: 'http://embed-a:8080/v1', diaryBaseUrl: 'http://embed-d:8080/v1' } } }, r1, { path: '/api/embedding', authn: admin });
+  assert.equal(r1.status, 409);
+  assert.equal(r1.body.code, 'modelNotServed');
+  assert.deepEqual(asked, ['http://embed-a:8080/v1', 'http://embed-d:8080/v1']);
+  assert.deepEqual(calls, [], 'the projects side did not start either');
+  assert.deepEqual(all.fetchCalls, [], 'the Diary was not asked');
+
+  asked.length = 0;
+  const diaryOnly = routes({ migration, served, checkAddress: anyAddress });
+  const r2 = fakeRes();
+  await diaryOnly.handler({ method: 'POST', body: { action: 'set-next', scope: 'diary', target: { model: 'embeddinggemma-2', baseUrl: 'http://embed-a:8080/v1', diaryBaseUrl: 'http://embed-d:8080/v1' } } }, r2, { path: '/api/embedding', authn: admin });
+  assert.equal(r2.status, 409, 'scope diary is checked');
+  assert.deepEqual(asked, ['http://embed-d:8080/v1'], 'only the Diary\'s address');
+  assert.deepEqual(diaryOnly.fetchCalls, []);
+
+  // No diaryBaseUrl: the Diary gets baseUrl, asked once.
+  asked.length = 0;
+  const same = routes({ migration, served, checkAddress: anyAddress });
+  const r3 = fakeRes();
+  await same.handler({ method: 'POST', body: { action: 'set-next', scope: 'all', target: { model: 'embeddinggemma-2', baseUrl: 'http://embed-a:8080/v1' } } }, r3, { path: '/api/embedding', authn: admin });
+  assert.equal(r3.status, 200);
+  assert.deepEqual(asked, ['http://embed-a:8080/v1']);
+  assert.equal(calls.length, 1);
+  assert.equal(same.fetchCalls.length, 1);
+  // No address at all: the Diary would resolve its own default server, which cannot be checked here.
+  for (const scope of ['all', 'diary']) {
+    asked.length = 0; calls.length = 0;
+    const none = routes({ migration, served, checkAddress: anyAddress });
+    const r4 = fakeRes();
+    await none.handler({ method: 'POST', body: { action: 'set-next', scope, target: { model: 'embeddinggemma-2' } } }, r4, { path: '/api/embedding', authn: admin });
+    assert.equal(r4.status, 409, scope);
+    assert.equal(r4.body.code, 'diaryEndpointRequired');
+    assert.deepEqual(calls, [], 'the projects side did not start');
+    assert.deepEqual(none.fetchCalls, [], 'the Diary was not asked');
+  }
+});
+
+test('#1660 review: echoed served ids are trimmed to 120 characters, and a migration refusal reaches the reply', async () => {
+  const long = 'x'.repeat(400);
+  const migration = { status: () => ({}), setNext: async () => { throw Object.assign(Error('The embeddings server does not serve m.'), { status: 409, code: 'modelNotServed', served: ['a'] }); } };
+  const { handler } = routes({ migration, served: async () => [long, 'other'] });
+  const res = fakeRes();
+  await handler({ method: 'POST', body: { action: 'set-next', scope: 'projects', target: { model: 'embeddinggemma-2', baseUrl: '' } } }, res, { path: '/api/embedding', authn: admin });
+  assert.equal(res.status, 409);
+  assert.deepEqual(res.body.served.map((s) => s.length), [120, 5]);
+  const ok = routes({ migration, served: async (t) => [t.model] });
+  const r2 = fakeRes();
+  await ok.handler({ method: 'POST', body: { action: 'set-next', scope: 'projects', target: { model: 'embeddinggemma-2', baseUrl: '' } } }, r2, { path: '/api/embedding', authn: admin });
+  assert.equal(r2.status, 409);
+  assert.equal(r2.body.projects.code, 'modelNotServed');
+  assert.deepEqual(r2.body.projects.served, ['a']);
 });

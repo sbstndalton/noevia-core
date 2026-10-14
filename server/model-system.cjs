@@ -126,6 +126,11 @@ const SYSTEM_MODEL_DELETE_REASON = 'System routing model — not deleted';
 // #1636: also the model a re-index is building (EMBEDDING_NEXT_MODEL) and, once the process's
 // embedding configuration (embedding-config.cjs) is installed, its active, next and previous
 // (rollback) models: each of them still has a server and stored vectors that depend on it.
+// #1660 review / #1668: the env names stay protected even after the saved embedding configuration
+// has switched away from them. The embed sidecar container is started from compose with a fixed
+// `-m <file> --alias <EMBEDDING_MODEL>`; it keeps loading that file whatever the saved configuration
+// says, so deleting it crash-loops the sidecar on its next restart (#336). A settings-driven sidecar
+// (#1668) is what would make the env name a seed only.
 function sidecarModelNames(env = process.env) {
   const names = new Set();
   const embedNames = [String(env.EMBEDDING_MODEL || env.EMBED_MODEL || '').trim(), String(env.EMBEDDING_NEXT_MODEL || '').trim(),

@@ -19,6 +19,8 @@
 // name that does not resolve, is refused. Cloud models are reached as chat providers, never as the
 // embedding server.
 
+const { checkServed } = require('../embedding-served.cjs');
+
 const PASS = Symbol('unhandled');
 const ACTIONS = new Set(['set-next', 'clear-next', 'switch', 'rollback', 'finish']);
 const SCOPES = new Set(['all', 'projects', 'diary']);
@@ -34,7 +36,7 @@ const SCOPES = new Set(['all', 'projects', 'diary']);
  * @param {() => object} [deps.diaryServiceHeaders]
  * @param {(url:string) => Promise<{ok:boolean,reason?:string}>} [deps.checkAddress]
  */
-function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJson, DIARY_BASE = '', diaryServiceHeaders = () => ({ 'Content-Type': 'application/json' }), checkAddress = require('../embedding-address.cjs').checkEmbeddingAddress }) {
+function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJson, DIARY_BASE = '', diaryServiceHeaders = () => ({ 'Content-Type': 'application/json' }), checkAddress = require('../embedding-address.cjs').checkEmbeddingAddress, servedModels = (target) => require('../rag.cjs').servedModels(target) }) {
   const diaryUrl = DIARY_BASE ? `${String(DIARY_BASE).replace(/\/+$/, '')}/api/internal/embedding` : '';
 
   async function diary(method, body) {
@@ -50,13 +52,13 @@ function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJs
 
   async function projects(action, body) {
     try {
-      if (action === 'set-next') return migration.setNext(body.target);
+      if (action === 'set-next') return await migration.setNext(body.target);
       if (action === 'clear-next') return migration.clearNext();
       if (action === 'switch') return await migration.switchToNext({ force: body.force === true });
       if (action === 'rollback') return migration.rollback();
       return migration.finish();
     } catch (err) {
-      return { error: String(err?.message || err).slice(0, 300), status: err?.status || 500, ...(err?.code ? { code: err.code } : {}), ...(err?.coverage ? { coverage: err.coverage } : {}), ...(err?.parity ? { parity: err.parity } : {}) };
+      return { error: String(err?.message || err).slice(0, 300), status: err?.status || 500, ...(err?.code ? { code: err.code } : {}), ...(err?.coverage ? { coverage: err.coverage } : {}), ...(err?.parity ? { parity: err.parity } : {}), ...(err?.served ? { served: err.served } : {}) };
     }
   }
 
@@ -84,6 +86,30 @@ function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJs
         if (!verdict.ok) {
           return json(res, 400, { error: `The embeddings server must be on this network: it receives the text of every project and the Diary (${verdict.reason}).`, code: 'publicEndpoint' });
         }
+      }
+    }
+    // #1660 review: every embeddings server this choice reaches must really serve the target model.
+    // A single-model server embeds any name with its own model, so vectors would be stored under the
+    // wrong identity; refuse unless its /v1/models lists the target (no override: that is corrupt
+    // data). The projects use target.baseUrl, the Diary target.diaryBaseUrl ?? target.baseUrl (as
+    // sent below); each different address is asked, before anything changes on either side. The
+    // migration layer checks the projects' side again (it also guards switch and start-up).
+    if (action === 'set-next') {
+      const model = String(body.target.model || '').trim();
+      const addr = (v) => String(v ?? '').trim() || null;
+      const addresses = new Set();
+      if (scope !== 'diary') addresses.add(addr(body.target.baseUrl));
+      if (scope !== 'projects') {
+        const diaryAddress = addr(body.target.diaryBaseUrl ?? body.target.baseUrl);
+        // With no address the Diary is sent base_url '' and resolves its own default server, which
+        // this check cannot see: probing web's engine instead could approve a model the Diary's
+        // server does not serve. Fail closed; the admin names the Diary's server explicitly.
+        if (!diaryAddress) return json(res, 409, { error: 'Name the Diary\'s embeddings server so noevia can check it serves this model.', code: 'diaryEndpointRequired' });
+        addresses.add(diaryAddress);
+      }
+      for (const baseUrl of addresses) {
+        const r = await checkServed(servedModels, { baseUrl, model });
+        if (!r.ok) return json(res, 409, { error: r.error, code: r.code, ...(r.served ? { served: r.served } : {}) });
       }
     }
     const out = {};

@@ -66,7 +66,7 @@ function statsRustOwned(env) {
   return env.NOEVIA_FRONT === 'rust' && env.NOEVIA_RUST_AUTH === '1' && env.NOEVIA_RUST_AUTH_CONFIRMED === '1'
     && env.NOEVIA_RUST_STATS === '1' && env.NOEVIA_RUST_STATS_CONFIRMED === '1';
 }
-function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe, reportedTokenRate, missingRoles, currentWorkspace, service, inferenceBudget = null, sweepGuardOptions = {} }) {
+function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag.cjs').servedModelsCached(target), json, readBody, readJson, fetchJson, env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe, reportedTokenRate, missingRoles, currentWorkspace, service, inferenceBudget = null, sweepGuardOptions = {} }) {
   const { modelScanCache, refreshModelScan, autoRoles, setAutoRoles, ensureRolesLoaded, servedCatalogue, modelsInstalled, deriveUserModelName, lastLoadedModel, clearLastLoadedModel, clearRoleReferences } = service;
   // #1461: the installed list is shared for a moment (service.modelsInstalled). A decision that must confirm
   // the engine's state right now (a delete that checks the model exists, a load that checks it is not missing)
@@ -299,12 +299,15 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
         }
         if(keys.length){
           const blocked=keys.some(key=>{const entry=scanned.find(f=>f.key===key);return entry&&(isSystemModel(entry.modelId)||(entry.sections||[]).some(s=>isSystemModel(s)));});
-          if(blocked)return json(res,400,{error:SYSTEM_MODEL_DELETE_REASON});
+          if(blocked)return json(res,400,{error:SYSTEM_MODEL_DELETE_REASON,errorId:'systemModel',service:'decision'});
           // #336: the folder-scan delete removes files directly, bypassing the /api/models/delete
           // guard below entirely — without this, canDelete:false on the installed list (models.cjs)
           // is cosmetic, since the client falls back to this very endpoint whenever canDelete is false.
           const sidecarBlocked=keys.some(key=>{const entry=scanned.find(f=>f.key===key);return entry&&(isSidecarModel(entry.modelId,env)||(entry.sections||[]).some(s=>isSidecarModel(s,env)));});
-          if(sidecarBlocked)return json(res,409,{error:SIDECAR_MODEL_DELETE_REASON});
+          if(sidecarBlocked){
+            const held=keys.map(key=>scanned.find(f=>f.key===key)).filter(Boolean).flatMap(e=>[e.modelId,...(e.sections||[])]).find(n=>isSidecarModel(n,env));
+            return json(res,409,{error:SIDECAR_MODEL_DELETE_REASON,errorId:'modelInUse',service:sidecarServiceOf(held)});
+          }
         }
         deleteKeys=keys; deleteScanned=scanned;
       }
@@ -316,12 +319,12 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
         const scanned = modelScanCache.get('models')?.body?.models;
         const cachedEntry = Array.isArray(scanned) ? scanned.find(f => (f.sections||[]).includes(name)) : null;
         if (isSystemModel(name) || (cachedEntry && isSystemModel(cachedEntry.modelId))) {
-          return json(res,400,{error:SYSTEM_MODEL_DELETE_REASON});
+          return json(res,400,{error:SYSTEM_MODEL_DELETE_REASON,errorId:'systemModel',service:'decision'});
         }
         // Delete-only guard (#336): removing the section for a model a live sidecar depends on
         // leaves that sidecar pointed at nothing. Rename is left alone — out of scope here.
         if (method === 'DELETE' && (isSidecarModel(name, env) || (cachedEntry && isSidecarModel(cachedEntry.modelId, env)))) {
-          return json(res, 409, { error: SIDECAR_MODEL_DELETE_REASON });
+          return json(res, 409, { error: SIDECAR_MODEL_DELETE_REASON, errorId: 'modelInUse', service: sidecarServiceOf(isSidecarModel(name, env) ? name : cachedEntry.modelId) });
         }
         // #697: a section saved through the model manager replaces the whole section; refuse it when
         // the settings would not fit the inference memory budget, as the preset editor does.
@@ -553,7 +556,14 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
       let embedding = null;
       try { embedding = require('../embedding-config.cjs').current()?.get() || null; } catch { embedding = null; }
       const { modelAssignments } = require('../model-assignments.cjs');
-      return json(res, 200, { ...modelAssignments({ installed, env, embedding, isSystem: (n) => isSystemModel(n), admin: authn.user.role === 'admin' }), available: Array.isArray(installed) });
+      const admin = authn.user.role === 'admin';
+      // Which models the active embeddings server serves (admins only: members get no switch, and
+      // never cause a probe). Cached per address with a short timeout (rag.servedModelsCached);
+      // null = unknown. Advisory only: set-next checks the server itself.
+      let served = null;
+      if (admin) { try { served = await servedEmbeddingModels({ baseUrl: embedding?.active?.baseUrl || null }); } catch { served = null; } }
+      if (!Array.isArray(served)) served = null;
+      return json(res, 200, { ...modelAssignments({ installed, env, embedding, isSystem: (n) => isSystemModel(n), admin, served }), available: Array.isArray(installed) });
     }
 
     if (p === '/api/models/installed') {

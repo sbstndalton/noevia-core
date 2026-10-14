@@ -54,6 +54,8 @@ function init({ dataDir, embedModel, inferenceUrl, headersFn, userDataDirFn, use
   // last readiness probe found — never serve a cached verdict from before the reconfiguration.
   retrievalProbeCache = null;
   retrievalProbeInFlight = null;
+  servedCache = new Map();
+  servedInFlight = new Map();
 }
 // Chunk sizing starts from diary-companion's shape (subsection-scale bodies).
 // ~1200 chars with a 150-char overlap keeps chunks coherent.
@@ -316,6 +318,53 @@ async function embedOnce(target, input, signal) {
   const body = await readCappedJson(res, 16 * 1024 * 1024);
   return Array.isArray(body?.data) ? body.data : [];
   } finally {leave();}
+}
+
+// #1660 review: the model ids an embeddings endpoint says it serves (GET /v1/models: `data[].id`,
+// plus llama-server `aliases` and Ollama-style `models[].name`), from the same address and with the
+// same headers embedOnce uses. A single-model llama-server answers /v1/embeddings for ANY model name
+// with its own vectors, so a target the endpoint does not list would be embedded by another model
+// and stored under the wrong identity. Throws when the listing cannot be read.
+async function servedModels(target, { timeoutMs = 10000 } = {}) {
+  const base = (target && target.baseUrl) || inferenceBase;
+  if (!base) throw new Error('no embeddings address');
+  // An explicit address never receives the inference credentials (as embedOnce).
+  const res = await fetch(`${base.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/models`, {
+    method: 'GET', headers: target && target.baseUrl ? {} : inferenceHeaders(), redirect: 'error', signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!res.ok) throw new Error(`models ${res.status}`);
+  const body = await readCappedJson(res, SERVED_MODELS_MAX_BYTES);
+  const ids = new Set();
+  for (const m of Array.isArray(body?.data) ? body.data : []) {
+    if (typeof m?.id === 'string') ids.add(m.id);
+    for (const a of Array.isArray(m?.aliases) ? m.aliases : []) if (typeof a === 'string') ids.add(a);
+  }
+  for (const m of Array.isArray(body?.models) ? body.models : []) for (const k of ['name', 'model']) if (typeof m?.[k] === 'string') ids.add(m[k]);
+  return [...ids];
+}
+
+// #1660 review: the Models page's view of servedModels. Shared per address for SERVED_CACHE_TTL_MS
+// (a failure for SERVED_CACHE_FAIL_TTL_MS), one request in flight per address, and a short timeout
+// so the page never waits long. Never throws: null means unknown. A switch never uses this (it asks
+// servedModels itself, so it never acts on a stale or unverified answer).
+const SERVED_MODELS_MAX_BYTES = 1024 * 1024;
+const SERVED_CACHE_TTL_MS = 45000;
+const SERVED_CACHE_FAIL_TTL_MS = 10000;
+const SERVED_CACHE_TIMEOUT_MS = 2000;
+let servedCache = new Map(); // key -> { ids: string[]|null, at }
+let servedInFlight = new Map(); // key -> Promise<string[]|null>
+function servedModelsCached(target) {
+  const explicit = (target && target.baseUrl) || null;
+  const key = explicit ? `url:${explicit}` : `engine:${inferenceBase || ''}`;
+  const hit = servedCache.get(key);
+  if (hit && Date.now() - hit.at < (hit.ids ? SERVED_CACHE_TTL_MS : SERVED_CACHE_FAIL_TTL_MS)) return Promise.resolve(hit.ids);
+  if (servedInFlight.has(key)) return servedInFlight.get(key);
+  const cache = servedCache, inFlight = servedInFlight; // an init() in between starts fresh maps
+  const p = servedModels({ baseUrl: explicit }, { timeoutMs: SERVED_CACHE_TIMEOUT_MS })
+    .catch(() => null)
+    .then((ids) => { cache.set(key, { ids, at: Date.now() }); inFlight.delete(key); return ids; });
+  inFlight.set(key, p);
+  return p;
 }
 
 async function embedFramed(target, input, signal) {
@@ -748,4 +797,4 @@ const trackedFileState = () => ({ queues: fileQueues.size, generations: fileGene
 
 // #1646: the sentence a hybrid cloud route without a grant removes (read_project_file is not offered there).
 const READ_FILE_HINT = ' Use read_project_file with PDF startPage/endPage and offset for pages beyond the summary.';
-module.exports = { READ_FILE_HINT, init, trackedFileState, indexProjectFile, deleteProjectFile, searchProject, filesContext, chunkText, ragAvailable, retrievalStatus, embed, embedModel, embeddingIdentity, embeddingConfig: getEmbeddingConfig, onIndexed, listIndexes, indexCoverage, fillMissing, dropIndexSlot, rerankPool };
+module.exports = { READ_FILE_HINT, servedModels, servedModelsCached, init, trackedFileState, indexProjectFile, deleteProjectFile, searchProject, filesContext, chunkText, ragAvailable, retrievalStatus, embed, embedModel, embeddingIdentity, embeddingConfig: getEmbeddingConfig, onIndexed, listIndexes, indexCoverage, fillMissing, dropIndexSlot, rerankPool };

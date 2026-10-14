@@ -24,7 +24,8 @@
 // time and, after each batch, a pause so that the pass is busy at most `duty` of the wall time
 // (EMBEDDING_REINDEX_DUTY, default 0.5; the embed sidecar also serves queries in parallel slots).
 
-const { sameIdentity, sameTarget } = require('./embedding-config.cjs');
+const { sameIdentity, sameTarget, normalizeTarget } = require('./embedding-config.cjs');
+const { checkServed } = require('./embedding-served.cjs');
 
 // Fixed synthetic strings for the same-model endpoint check: never user content.
 const PARITY_SAMPLE = [
@@ -53,7 +54,8 @@ function clamp(v, dflt, lo, hi) { const n = Number(v); return Number.isFinite(n)
  * @param {() => number} [deps.now]
  * @param {(line:string) => void} [deps.log]
  */
-function createEmbeddingMigration({ config, rag, env = process.env, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = Date.now, log = (line) => console.info(line) }) {
+function createEmbeddingMigration({ config, rag, env = process.env, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = Date.now, log = (line) => console.info(line),
+  servedModels = typeof rag?.servedModels === 'function' ? (t) => rag.servedModels(t) : null }) {
   const duty = clamp(env.EMBEDDING_REINDEX_DUTY, 0.5, 0.05, 1);
   const batch = Math.round(clamp(env.EMBEDDING_REINDEX_BATCH, 4, 1, 16));
   const minPauseMs = Math.round(clamp(env.EMBEDDING_REINDEX_MIN_PAUSE_MS, 50, 0, 60000));
@@ -64,7 +66,26 @@ function createEmbeddingMigration({ config, rag, env = process.env, sleep = (ms)
   let retryTimer = null;
   const retryMs = Math.round(clamp(env.EMBEDDING_REINDEX_RETRY_MS, 60000, 1000, 3600000));
 
-  const targets = () => { const c = config.get(); return [c.active, c.next].filter(Boolean); };
+  // #1660 review: a next model is indexed only once its embeddings server has been seen serving it
+  // (embedding-served.cjs). setNext checks before saving; a next that came from elsewhere (seeded
+  // from EMBEDDING_NEXT_MODEL at start-up, or saved before this check existed) is checked before
+  // the first pass and held back, pending, until it is served. A switch always checks afresh.
+  const verified = new Set(); // keys of next targets seen served
+  let nextHeld = null; // { key, code, error } why the current next is not being indexed
+  const keyOf = (t) => (t ? `${t.profile}\u0000${t.model}\u0000${t.baseUrl || ''}` : '');
+  const check = (t) => checkServed(servedModels, t);
+  const targets = () => { const c = config.get(); return [c.active, c.next && verified.has(keyOf(c.next)) ? c.next : null].filter(Boolean); };
+
+  async function gateNext() {
+    const next = config.next();
+    if (!next || verified.has(keyOf(next))) return;
+    const r = await check(next);
+    if (r.ok) { verified.add(keyOf(next)); if (nextHeld?.key === keyOf(next)) log(`[embedding] ${next.model} is served now; re-indexing.`); nextHeld = null; return; }
+    if (!sameTarget(config.next(), next)) return; // changed meanwhile: the next pass checks that one
+    const changed = nextHeld?.key !== keyOf(next) || nextHeld.code !== r.code;
+    nextHeld = { key: keyOf(next), code: r.code, error: r.error };
+    if (changed) log(`[embedding] re-index to ${next.model} not started: ${r.error}`);
+  }
 
   async function fillTarget(entry, target, version) {
     let embedded = 0;
@@ -113,12 +134,13 @@ function createEmbeddingMigration({ config, rag, env = process.env, sleep = (ms)
     running = (async () => {
       do {
         again = false;
+        await gateNext().catch(() => {});
         const r = await pass().catch((err) => ({ embedded: 0, failed: 1, error: String(err?.message || err) }));
         lastPass = { at: now(), ...r };
         if (r.embedded || r.failed) log(`[embedding] re-index pass: ${r.embedded} vectors stored, ${r.failed} index file(s) incomplete${r.error ? ` (${r.error})` : ''}`);
         // While a re-index is under way, an incomplete pass (server restarting, file locked) is
         // retried later rather than left waiting for the next upload.
-        if (r.failed && config.next() && !stopped && !retryTimer) {
+        if ((r.failed || (nextHeld && nextHeld.key === keyOf(config.next()))) && config.next() && !stopped && !retryTimer) {
           retryTimer = setTimeout(() => { retryTimer = null; kick(); }, retryMs);
           retryTimer.unref?.();
         }
@@ -151,6 +173,8 @@ function createEmbeddingMigration({ config, rag, env = process.env, sleep = (ms)
     return {
       active: c.active, next: c.next, previous: c.previous, source: c.source,
       coverage: { active: coverageOf(c.active), next: coverageOf(c.next) },
+      ...(c.next ? { nextServed: verified.has(keyOf(c.next)) ? true : nextHeld?.key === keyOf(c.next) ? false : null } : {}),
+      ...(c.next && nextHeld?.key === keyOf(c.next) ? { nextHeld: { code: nextHeld.code, error: nextHeld.error } } : {}),
       running: !!running, lastPass, duty, batch, ...(config.damaged ? { damaged: config.damaged } : {}),
     };
   }
@@ -165,9 +189,14 @@ function createEmbeddingMigration({ config, rag, env = process.env, sleep = (ms)
   return {
     status,
     kick,
-    setNext(target) {
+    async setNext(target) {
+      const t = normalizeTarget(target);
+      if (config.damaged || sameTarget(t, config.active())) return config.setNext(t); // refuses: damaged file, or already active
+      const r = await check(t);
+      if (!r.ok) throw Object.assign(Error(r.error), { status: 409, code: r.code, ...(r.served ? { served: r.served } : {}) });
+      verified.add(keyOf(t));
       const before = config.get();
-      const c = config.setNext(target);
+      const c = config.setNext(t);
       // A different next replaces an abandoned one: its partial vectors go.
       if (before.next && !sameIdentity(before.next, c.next) && !sameIdentity(before.next, c.active) && !sameIdentity(before.next, c.previous)) dropEverywhere(before.next);
       kick();
@@ -183,6 +212,9 @@ function createEmbeddingMigration({ config, rag, env = process.env, sleep = (ms)
       const c = config.get();
       if (!c.next) throw Object.assign(Error('No re-index is under way.'), { status: 409, code: 'noNext' });
       const checked = c.next; // what the checks below are about; the parity check awaits the network
+      // Never switch to a model the server does not serve, forced or not: its vectors would be another model's.
+      const served = await check(checked);
+      if (!served.ok) throw Object.assign(Error(served.error), { status: 409, code: served.code, ...(served.served ? { served: served.served } : {}) });
       if (sameIdentity(c.next, c.active)) {
         // Same model and profile on another endpoint: the stored vectors stay valid only if the
         // new endpoint really gives the same vectors.
