@@ -819,6 +819,14 @@ function createChatHandler({
       wire = sys ? [{ role: 'system', content: sys }, ...msgs] : msgs;
       brainBlock = '';
     }
+    // #1587: a provider off this box gets the day without the server's time-zone name (where the server is).
+    if (externalProvider || routeTarget?.route === 'cloud' || provider?.id !== DEFAULT_PROVIDER_ID) {
+      const zoneless = require('./current-time-part.cjs').systemPart(undefined, undefined, { zoneName: false });
+      if (wire[0]?.role === 'system' && typeof wire[0].content === 'string' && wire[0].content.includes(timePart)) {
+        sys = sys.replace(timePart, () => zoneless);
+        wire = [{ ...wire[0], content: wire[0].content.replace(timePart, () => zoneless) }, ...wire.slice(1)];
+      }
+    }
     const egressRefused = egress.egressRefusal({ provider, spaceId, projectId: project?.id, diaryProjectId: diaryExtras.PROJECT_ID });
     if (egressRefused) return json(res, 409, { error: egressRefused });
     let chatgptProvider = require('./chatgpt-oauth.cjs').isChatGptProvider(provider);
@@ -1502,6 +1510,8 @@ function createChatHandler({
         try {
           const continuation=await context.compactContinuation({messages:roundMessages,tools:activeTools,limit,limitSource,model,summarize:summarizeContext,onStatus:(text,id)=>send({type:'status',text,...(id?{id}:{})})});
           roundMessages=continuation.messages;roundBudget=continuation.meter;roundCompacted=continuation.compacted;
+          // #1587: an answer resting on a shortened tool result says so (#1551 shortens instead of failing).
+          if(continuation.truncated>0)send({type:'warning',text:`${continuation.truncated===1?'A tool result was':`${continuation.truncated} tool results were`} shortened to fit this model's context, so the answer may rest on part of the output.`});
           if(roundCompacted){continuationCompactedAt=Date.now();continuationCovered=continuation.covered;send({type:'context',...roundBudget,historyCount:prepared.meter.historyCount,compactedAt:continuationCompactedAt,covered:continuationCovered});}
         } catch(error) {send({type:'error',text:error.message});break;}
       }

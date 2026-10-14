@@ -86,13 +86,17 @@ function factsLine(f) {
   return `Calendar facts, computed by the server (use them as given, do not recount): ${week} (weeks run Monday to Sunday; ISO week 1 of ${f.isoYear} began Monday ${f.isoWeek1Starts}); day ${f.dayOfYear} of ${f.daysInYear} in ${f.year}, ${f.daysLeftInYear} days left; the year ends on 31 December.`;
 }
 
-/** The system-prompt part for `now` in `timeZone` (the server's by default). An unknown zone falls back to UTC. */
-function systemPart(now = currentNow(), timeZone = serverTimeZone()) {
+/**
+ * The system-prompt part for `now` in `timeZone` (the server's by default). An unknown zone falls back to UTC.
+ * `zoneName: false` (#1587, a provider off this box) states the day in that zone without naming it: the zone
+ * name says where the server is, and the cloud model does not need it to answer from dated results.
+ */
+function systemPart(now = currentNow(), timeZone = serverTimeZone(), { zoneName = true } = {}) {
   const dayIn = (zone) => new Intl.DateTimeFormat('en-GB', { timeZone: zone, dateStyle: 'full' }).format(now);
   let zone = timeZone, day;
   try { day = dayIn(zone); } catch { zone = 'UTC'; day = dayIn(zone); }
   return [
-    `Today is ${day} (${zone}).`,
+    zoneName ? `Today is ${day} (${zone}).` : `Today is ${day}.`,
     factsLine(calendarFacts(now, zone)),
     'For time-sensitive questions (the latest version, a current price or rate, news, schedules, or anything the user calls "latest" or "today"), answer from the results of your tools, not from memory: your training data has a cutoff, so what you remember may be out of date.',
     'Give the dates that the results state. If the results conflict with what you already know, prefer the results. If the results do not answer the question, say so.',

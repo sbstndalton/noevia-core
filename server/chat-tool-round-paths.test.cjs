@@ -131,6 +131,13 @@ test('a tool result too big for a small context is shrunk and the reply goes on 
   assert.equal(sent.role, 'tool');
   assert.match(sent.content, /^<untrusted kind="tool result"[^\n]*\n[\s\S]*\n\[truncated \d+ chars\]\n[\s\S]*\n<\/untrusted>$/);
   assert.ok(r.events.some((e) => e.type === 'done'));
+  // #1587: the person is told the answer rests on a shortened result.
+  assert.ok(r.events.some((e) => e.type === 'warning' && /A tool result was shortened to fit this model's context/.test(e.text)), JSON.stringify(r.events.filter((e) => e.type === 'warning')));
+});
+
+test('a tool result that fits gives no shortened-result warning (#1587)', async (t) => {
+  const r = await run(t, { readOnly: true, passThrough: true });
+  assert.ok(!r.events.some((e) => e.type === 'warning' && /shortened to fit/.test(e.text)));
 });
 
 // #1551: the meter is sent again after a tool round, so it counts that round's tool output.
