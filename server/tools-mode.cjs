@@ -176,14 +176,49 @@ function automaticEligible(box, { connectorBoxes, isWriteTool, ready, privateDat
  *   model is local (no external provider, no cloud route, the default provider).
  * @returns {string[]}
  */
-function automaticAdditions({ message, base = [], boxes, connectorBoxes, isWriteTool, ready = () => true, privateData = false, max = MAX_ADDED }) {
+function automaticAdditions({ message, base = [], boxes, connectorBoxes, isWriteTool, ready = () => true, privateData = false, max = MAX_ADDED, carried = [] }) {
   const have = new Set(base);
   const byId = new Map((Array.isArray(boxes) ? boxes : []).filter((b) => b && typeof b.id === 'string').map((b) => [b.id, b]));
   const out = [];
-  for (const id of automaticBoxesFor(message)) {
+  const own = automaticBoxesFor(message);
+  // #1692: public boxes the chat already used keep going on a follow-up, after the message's own boxes. Never
+  // beside a Nextcloud box the message itself asks for (the same rule as automaticBoxesFor: no private text to
+  // a search service on a guess).
+  const keep = own.some((id) => id.startsWith('nextcloud-')) ? [] : (Array.isArray(carried) ? carried : []).filter((id) => PUBLIC_BOXES.has(id));
+  for (const id of [...own, ...keep]) {
     if (out.length >= max) break;
     if (have.has(id) || out.includes(id) || !byId.has(id)) continue;
     if (automaticEligible(byId.get(id), { connectorBoxes, isWriteTool, ready, privateData })) out.push(id);
+  }
+  return out;
+}
+
+// #1692: how far back a follow-up looks for the public boxes the chat was using.
+const CARRY_USER_TURNS = 3;
+/**
+ * #1692: the public boxes (PUBLIC_BOXES) an Automatic chat was using in its recent turns, so a follow-up such as
+ * "using what your search found, how many days ago was that?" keeps Web search on the same route. Read from the
+ * last CARRY_USER_TURNS user messages (what automaticBoxesFor would have added for them) and from tool results the
+ * client sent back (`{ role: 'tool', name }`, matched to the box that offers that tool). Only public boxes are
+ * carried: a box with the user's own data still needs this message to ask for it.
+ *
+ * @param {{ history: Array<{ role: string, content?: string, name?: string }>, boxes: object[] }} input
+ * @returns {string[]}
+ */
+function carriedPublicBoxes({ history, boxes }) {
+  const list = Array.isArray(history) ? history : [];
+  const out = [];
+  const add = (id) => { if (PUBLIC_BOXES.has(id) && !out.includes(id)) out.push(id); };
+  let users = 0;
+  for (let i = list.length - 1; i >= 0 && users < CARRY_USER_TURNS; i--) {
+    const h = list[i];
+    if (!h || typeof h !== 'object') continue;
+    if (h.role === 'user' && typeof h.content === 'string') { users++; for (const id of automaticBoxesFor(h.content)) add(id); }
+    else if ((h.role === 'tool' || h.role === 'function') && typeof h.name === 'string') {
+      for (const b of Array.isArray(boxes) ? boxes : []) {
+        if (b && (b.tools || []).some((t) => t?.function?.name === h.name)) add(b.id);
+      }
+    }
   }
   return out;
 }
@@ -231,6 +266,6 @@ function createAutomaticToolsReady({ getStorage, originAllowed }) {
 }
 
 module.exports = { toolsModeOf, initialToolsMode, gateSaysToolNeeded, toolCapableRoute, FALLBACK_ROLES,
-  automaticBoxesFor, automaticEligible, automaticAdditions, orderWithAdditions, wantsWeb, MAX_ADDED, PUBLIC_BOXES,
+  automaticBoxesFor, automaticEligible, automaticAdditions, carriedPublicBoxes, CARRY_USER_TURNS, orderWithAdditions, wantsWeb, MAX_ADDED, PUBLIC_BOXES,
   CLOUD_SAFE_BOXES, PRIVATE_CORE_TOOLS, HEALTH_PUBLIC_BOXES, isPrivateDataBox,
   nextcloudStorageConnected, createAutomaticToolsReady };

@@ -91,6 +91,8 @@ function declinedToolNote(entry) {
 // #1448: a user message with no reply kept after it (stopped, failed or lost) is not an open request. The
 // model is told so by this note between it and the next turn, instead of the two being merged into one
 // user turn, which made the model answer the abandoned prompt again.
+// #1692: the lead of a turn that holds only the tool results of a reply that ended before its answer.
+const FAILED_REPLY_TOOLS_NOTE = '(The reply to the message above ended before its answer. These tool results came back for it and can be used.)';
 const ABANDONED_TURN_NOTE = '(No reply was kept for the message above: it was stopped or failed before an answer. It is not an open request. Answer only the newest message unless the user asks about it.)';
 function normalizeReplayHistory(mapped, newMessage) {
   const out = [];
@@ -114,6 +116,9 @@ function normalizeReplayHistory(mapped, newMessage) {
     }
     if (entry.role === 'tool' || entry.role === 'function') {
       if (last && last.role === 'assistant') last.content = `${last.content}\n\n${foldToolMessage(entry)}`;
+      // #1692: a reply that failed before its answer keeps no text, but its tool results are still what the
+      // follow-up asks about ("using what your search found..."). They are carried under a note of ours.
+      else if (last) out.push({ role: 'assistant', content: `${FAILED_REPLY_TOOLS_NOTE}\n\n${foldToolMessage(entry)}` });
       continue;
     }
     if (last && last.role === entry.role && entry.role === 'assistant') {
@@ -165,6 +170,7 @@ function withoutSystemNote(messages, note) {
 // limited before the first output (a long prefill is not a stall), and `ms` of 0 limits nothing.
 const { isCutMark } = require('./thinking-budget.cjs');
 const announcedAction = require('./announced-action.cjs');
+const finalAnswer = require('./final-answer.cjs');
 class StreamIdleError extends Error {
   constructor(ms) { super(`no output for ${ms} ms`); this.name = 'StreamIdleError'; this.ms = ms; }
 }
@@ -973,8 +979,10 @@ function createChatHandler({
     const automaticLocal = !externalProvider && routeTarget?.route !== 'cloud' && provider?.id === DEFAULT_PROVIDER_ID;
     let automaticAdded = [];
     if (automaticTools && !body.compactOnly) {
+      // #1692: a follow-up keeps the public boxes (Web search, offline Wikipedia) the chat was already using.
+      const carried = toolModes.carriedPublicBoxes({ history: mappedHistory, boxes: allToolboxes() });
       automaticAdded = toolModes.automaticAdditions({ message, base: requestToolboxes(), boxes: allToolboxes(), connectorBoxes: CONNECTOR_BOXES,
-        isWriteTool, ready: automaticToolsReady(chatUser), privateData: automaticLocal });
+        isWriteTool, ready: automaticToolsReady(chatUser), privateData: automaticLocal, carried });
     }
     const selectedBoxes = requestToolboxes(automaticAdded);
     // Rule 2 of provider-egress.cjs: private tools (the Diary) are not offered through an external provider.
@@ -1505,7 +1513,11 @@ function createChatHandler({
       }
     }
     let announcedRetried = false; // #1552: one retry per reply for an announced but uncalled tool
-    for (let round = 0; round < 3 && !chatSignal.signal.aborted && !cloudHold; round++) {
+    // #1693: tools ran but the reply has no answer yet (the last round spent on a tool call, or a round after tool
+    // results that wrote only reasoning). One more round, with no tools, asks for the final answer.
+    let finalPass = false;
+    const gatheredSources = []; // #1693: links from successful tool results, for the fallback when no answer comes
+    for (let round = 0; round < (finalPass ? 4 : 3) && !chatSignal.signal.aborted && !cloudHold; round++) {
       if (nextToolRoutes) { toolRoutes = new Map([...toolRoutes, ...nextToolRoutes]); nextToolRoutes = null; }
       if (revokedSkills()) break; // a loaded skill was disabled or changed: no further model round
       // #546: a Skill disabled while this request was being prepared (routing, RAG, vision,
@@ -1548,10 +1560,10 @@ function createChatHandler({
           method: 'POST', headers: upstreamHeaders, signal: roundSignal, redirect: 'error',
         }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:true,stream_options:{include_usage:true},
           ...sampling.params,
-          ...requestTools(), ...forceChoice(round)}, provider, model, effort, send, localThinkingCap);
+          ...(finalPass ? {} : { ...requestTools(), ...forceChoice(round) })}, provider, model, effort, send, localThinkingCap);
         // A server that rejects the named-function form of tool_choice gets the equivalent it does
         // accept: only that tool, and a call required.
-        if (forceChoice(round).tool_choice && upstream.status >= 400 && upstream.status < 500 && /tool_choice/i.test((await readCappedText(upstream.clone(), PROVIDER_ERROR_BODY_CAP).catch(() => ({ text: '' }))).text)) {
+        if (!finalPass && forceChoice(round).tool_choice && upstream.status >= 400 && upstream.status < 500 && /tool_choice/i.test((await readCappedText(upstream.clone(), PROVIDER_ERROR_BODY_CAP).catch(() => ({ text: '' }))).text)) {
           discardBody(upstream); // the rejected reply is replaced; close it
           upstream = await reasoningEffort.requestWithEffort(providerFetch, upstreamUrl, {
             method: 'POST', headers: upstreamHeaders, signal: roundSignal, redirect: 'error',
@@ -1560,7 +1572,7 @@ function createChatHandler({
         }
         // #1002: the engine refused the tools because of the model's chat template (llama.cpp could
         // not build a tool-call parser for it). Retry this round once without tools, and say so.
-        if (templateGate && !templateToolsOff && activeTools.length && upstream.status >= 400) {
+        if (!finalPass && templateGate && !templateToolsOff && activeTools.length && upstream.status >= 400) {
           const detail = (await readCappedText(upstream.clone(), PROVIDER_ERROR_BODY_CAP).catch(() => ({ text: '' }))).text;
           if (templateCaps.toolsRefused(upstream.status, detail)) {
             discardBody(upstream);
@@ -1747,6 +1759,13 @@ function createChatHandler({
         roundHasContent = false; roundContent = ''; roundReasoning = '';
         round--;
         continue;
+      }
+
+      // #1693: the final-answer round offers no tools; a call it writes anyway is not run.
+      if (finalPass && toolCalls.size > 0) {
+        for (const [toolIndex, tc] of toolCalls) send({ type: 'tool_result', index: toolOffset + toolIndex, name: tc.name, text: 'Not run: this step only writes the final answer.', notRun: true });
+        toolOffset += Math.max(...toolCalls.keys()) + 1;
+        toolCalls.clear();
       }
 
       // Execute each requested tool and append assistant tool_calls + results.
@@ -1953,7 +1972,10 @@ function createChatHandler({
             ...(notApprovedResults.has(result) ? { declined: true } : {}), ...(notRunResults.has(result) ? { notRun: true } : {}) });
           roundMessages.push({ role: 'tool', tool_call_id: tc.id, content: framedResult });
           holdForCloud(tc.name, result);
-          if (outcome.failed !== true && !/^ERROR\b/.test(String(result))) noteSkillRead(tc.args, result);
+          if (outcome.failed !== true && !/^ERROR\b/.test(String(result))) {
+            noteSkillRead(tc.args, result);
+            for (const url of finalAnswer.sourceLinks(result)) if (!gatheredSources.includes(url)) gatheredSources.push(url);
+          }
         }
       }
 
@@ -1971,7 +1993,15 @@ function createChatHandler({
         break;
       }
       if (cloudHold) break; // #779 F2: a held tool result never goes on to the cloud model
-      if (round === 2 || toolCalls.size === 0) break; // last round or no tools requested
+      // #1693: tool results came back, but no answer: the last round was spent on a tool call, or a round after
+      // the results wrote only reasoning. One bounded no-tools round asks for the final answer from them.
+      if (!finalPass && !chatSignal.signal.aborted && finalAnswer.needsFinalPass({ round, toolCalls: toolCalls.size, hasContent: roundHasContent })) {
+        finalPass = true;
+        roundMessages = [...roundMessages, { role: 'user', content: finalAnswer.FINAL_ANSWER_NOTE }];
+        roundHasContent = false; roundContent = '';
+        continue;
+      }
+      if (finalPass || round === 2 || toolCalls.size === 0) break; // last round or no tools requested
       if (skillRevocation) break; // revoked during this round's tools: no supervisor call, one error
       const supervised = await require('./step-supervision.cjs').superviseNextStep(
         spaceId?.startsWith('diary') ? null : stepSupervision,
@@ -1999,7 +2029,11 @@ function createChatHandler({
       send({ type: 'paused', reason: 'sensitive-tool-result', flag: cloudHold, applied: appliedWrites.length,
         text: 'A tool result looks sensitive and was not sent to the cloud model. Switch this chat to local or resend.' });
     }
-    if (!paused && !roundHasContent && roundReasoning.trim()) {
+    if (!paused && !roundHasContent && finalPass) {
+      // #1693: the final-answer round wrote no answer either. The links the tools returned are kept, instead of an
+      // error that dropped them; the reasoning stays in the thinking panel.
+      send({ type: 'delta', text: finalAnswer.fallbackText({ sources: gatheredSources }) });
+    } else if (!paused && !roundHasContent && roundReasoning.trim()) {
       send({ type: 'delta', text: '\n\nThe model returned reasoning without a final answer. Try again or choose another model.' });
     }
     send({ type: 'telemetry', phase: 'complete', model, timeToFirstToken: exchangeFirstTokenMs === null ? null : exchangeFirstTokenMs / 1000 });
@@ -2018,4 +2052,4 @@ function createChatHandler({
   return { handleChat, handleChatInner };
 }
 
-module.exports = { createChatHandler, normalizeReplayHistory, withIdleLimit, CODE_ROUTE_NOTE };
+module.exports = { createChatHandler, normalizeReplayHistory, withIdleLimit, CODE_ROUTE_NOTE, FAILED_REPLY_TOOLS_NOTE };

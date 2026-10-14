@@ -187,7 +187,7 @@ async function rpc(baseUrl, session, body, { headers = {}, timeoutMs = 30000, no
       const detail = await readBodyCapped(res, controller).catch(() => '');
       // The snippet is for logs/operators only; `httpStatus` lets the chat
       // path hand the model a neutral message instead of the server's body.
-      throw Object.assign(new Error(`MCP ${res.status}: ${detail.slice(0, 200)}`), { httpStatus: res.status });
+      throw Object.assign(new Error(`MCP ${res.status}: ${detail.slice(0, 200)}`), { httpStatus: res.status, retryAfter: res.headers.get('retry-after') });
     }
     // Notifications have no id and the server answers 202 with an empty body.
     if (notify) return null;
