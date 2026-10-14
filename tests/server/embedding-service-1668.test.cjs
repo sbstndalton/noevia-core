@@ -555,3 +555,52 @@ for (const base of ['', null]) {
     } finally { h.migration.stop(); }
   });
 }
+
+// ── #1686: an address-less Diary target is reported as such, not as "finish the switch" ─────
+
+test('#1686 projects on Z, Diary on X at its default server: switching to Y is refused with diaryAddressUnknown', async () => {
+  // X is served (its file known) but the Diary names no address for it.
+  const X = { model: 'diary-default-embed', file: 'diary-default-embed/diary-default-embed-Q8_0.gguf' };
+  const loader = fakeLoader({ models: [NOMIC, X], installed: [NOMIC, GEMMA, X] });
+  const svc = await installService(loader);
+  const diary = fakeDiary();
+  diary.state.active = { base_url: null, model: X.model, profile: 'nomic-v1' };
+  const h = harness(loader, { diary });
+  try {
+    loader.state.puts.length = 0;
+    const r = await post(h.routesFor(svc), { action: 'service-switch', model: 'embeddinggemma-2', profile: 'embeddinggemma-2' });
+    assert.equal(r.status, 409, JSON.stringify(r.body));
+    assert.equal(r.body.code, 'diaryAddressUnknown');
+    assert.match(r.body.error, /explicit embeddings address/);
+    assert.deepEqual(loader.state.puts, []);
+  } finally { h.migration.stop(); }
+});
+
+test('#1686 a real two-model overflow on the service is still tooManyModels', async () => {
+  const THIRD = { model: 'third-embed', file: 'third-embed/third-embed-Q8_0.gguf' };
+  const loader = fakeLoader({ models: [NOMIC, GEMMA], installed: [NOMIC, GEMMA, THIRD] });
+  const svc = await installService(loader);
+  const diary = fakeDiary();
+  diary.state.active = { base_url: `${SVC}/v1`, model: 'embeddinggemma-2', profile: 'embeddinggemma-2' };
+  const h = harness(loader, { diary });
+  try {
+    const r = await post(h.routesFor(svc), { action: 'service-switch', model: THIRD.model, profile: 'nomic-v1' });
+    assert.equal(r.status, 409, JSON.stringify(r.body));
+    assert.equal(r.body.code, 'tooManyModels');
+  } finally { h.migration.stop(); }
+});
+
+// ── #1687: the Diary always reports an active target; a reply without one stays unknown ──────
+
+test('#1687 a configured Diary answering active: null is not taken as known-empty (the Diary never sends that)', async () => {
+  const loader = fakeLoader();
+  const svc = await installService(loader);
+  const diary = fakeDiary();
+  diary.handle = () => ({ ok: true, status: 200, body: { active: null, next: null, previous: null } });
+  const h = harness(loader, { diary });
+  try {
+    assert.equal((await post(h.routesFor(svc), { action: 'service-off' })).body.code, 'diaryUnknown');
+    assert.equal((await post(h.routesFor(svc), { action: 'service-switch', model: 'embeddinggemma-2', profile: 'embeddinggemma-2' })).body.code, 'diaryUnknown');
+    assert.deepEqual(loader.state.puts, []);
+  } finally { h.migration.stop(); }
+});
