@@ -3,7 +3,8 @@
 // its text (the active embedding model with its image projector), so a text question finds an image by
 // what it shows. What the chat model then gets for a retrieved image is decided per answer:
 //
-//   cloud route (an external provider)  nothing derived from the image: its name only. Rule 3 of
+//   off-box turn (#1735: an external or  nothing derived from the image: its name only. Captions
+//   non-default provider, a cloud route) are made only by the local default provider, on-box turns only. Rule 3 of
 //                                        provider-egress.cjs (project images are never sent to an
 //                                        external provider automatically), extended to the text read
 //                                        from an image, which the route check never read.
@@ -61,6 +62,13 @@ const FIGURE_MIMES = Object.freeze({ png: 'image/png', jpg: 'image/jpeg', webp: 
 function scannedPage(page) {
   if (!page || typeof page !== 'object') return false;
   return page.ocr === true || page.status === 'ocr' || /\bocr\b/.test(String(page.method || ''));
+}
+
+// #1736: Diary images are never embedded, captioned or cached: the Diary extras project, and the context
+// project of a Diary chat (diary-extras.cjs chatProjectId of a diary-* chat id).
+function diaryProject(projectId) {
+  const id = String(projectId || '');
+  return id === require('./diary-extras.cjs').PROJECT_ID || /^cowork-chat-context-diary[-_]/i.test(id);
 }
 
 function baseName(name) { return String(name || '').split('/').pop(); }
@@ -265,20 +273,25 @@ function createMediaBackfill({ enabled: on = () => enabled(), userIds, workspace
     const items = mediaItems(workspace, project, { documentDir: (id) => documentDir(workspace, id) });
     for (;;) {
       if (stopped || !on()) return false;
+      // Rate limit (#1737): a pause after every request that embedded something, also across projects.
+      if (totals.gap) { await sleep(intervalMs); totals.gap = false; if (stopped || !on()) return false; }
+      // #1737: a re-index can start mid-pass; check before every request, not once per pass.
+      let hold = null;
+      try { hold = paused(); } catch { hold = null; }
+      if (hold) { totals.reason = String(hold); return 'stop'; }
       const r = await rag.syncProjectMedia(project.id, userId, items, { limit: 1 });
       totals.embedded += r.embedded || 0;
+      if (r.embedded) totals.gap = true;
       if (!r.ok) {
         if (r.reason === 'embed-failed' || r.reason === 'no-image-projector' || r.reason === 'embedding-off') { totals.reason = r.reason; totals.error = r.error; totals.pending += r.pending || 0; return 'stop'; }
         return true; // index unavailable or a profile without images: nothing to do here
       }
       if (!r.pending || !r.embedded) { totals.pending += r.pending || 0; return true; }
-      // Rate limit: one image per request, then a pause before the next request.
-      await sleep(intervalMs);
     }
   }
 
   async function pass() {
-    const totals = { embedded: 0, pending: 0, reason: null, error: null };
+    const totals = { embedded: 0, pending: 0, reason: null, error: null, gap: false };
     let hold = null;
     try { hold = paused(); } catch { hold = null; }
     if (hold) { totals.reason = String(hold); last = { at: Date.now(), ...totals }; return totals; }
@@ -288,23 +301,25 @@ function createMediaBackfill({ enabled: on = () => enabled(), userIds, workspace
     let ids = [];
     try { ids = userIds() || []; } catch { ids = []; }
     for (const userId of ids) order.push([userId, null]);
-    for (const [userId, onlyProject] of order) {
+    walk: for (const [userId, onlyProject] of order) {
       if (stopped || !on()) break;
       let workspace = null;
       try { workspace = workspaceFor(userId); } catch { workspace = null; }
       if (!workspace || workspace.revoked) continue;
       for (const project of Array.isArray(workspace.projects) ? workspace.projects : []) {
-        if (!project || typeof project.id !== 'string') continue;
+        if (!project || typeof project.id !== 'string' || diaryProject(project.id)) continue;
         if (onlyProject && project.id !== onlyProject) continue;
         const key = JSON.stringify([userId, project.id]);
         if (visited.has(key)) continue;
         visited.add(key);
         const r = await syncProject(userId, workspace, project, totals);
-        if (r === 'stop') { last = { at: Date.now(), ...totals }; return totals; }
+        if (r === 'stop') break walk;
         if (r === false) break;
       }
     }
+    delete totals.gap;
     last = { at: Date.now(), ...totals };
+    // Also after a stop (a re-index that began mid-pass): the image preset is not held beside it.
     if (totals.embedded) { try { await release(); } catch { /* the router unloads it on its own later */ } }
     return totals;
   }
@@ -353,4 +368,4 @@ function sourceChanged(userId, projectId) {
   try { installed.schedule(userId, projectId); } catch { /* never breaks the caller */ }
 }
 
-module.exports = { FLAG, MODALITIES, enabled, scannedPage, mediaItems, resolveHit, assetPlan, captionOnce, answerImages, createMediaBackfill, install, current, sourceChanged, sha256 };
+module.exports = { FLAG, MODALITIES, enabled, scannedPage, mediaItems, resolveHit, assetPlan, captionOnce, answerImages, diaryProject, createMediaBackfill, install, current, sourceChanged, sha256 };

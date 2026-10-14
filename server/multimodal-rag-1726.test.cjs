@@ -52,14 +52,16 @@ function startServer({ refuseImages = false } = {}) {
 
 function freshRag() { delete require.cache[require.resolve('./rag.cjs')]; return require('./rag.cjs'); }
 
-async function setup({ profile = 'embeddinggemma-2', refuseImages = false } = {}) {
+async function setup({ profile = 'embeddinggemma-2', refuseImages = false, imageModel = 'gemma-test' } = {}) {
+  // #1738: without the model manager, only a named image model (EMBEDDING_IMAGE_MODEL) is used for images.
+  if (imageModel) process.env.EMBEDDING_IMAGE_MODEL = imageModel; else delete process.env.EMBEDDING_IMAGE_MODEL;
   const server = await startServer({ refuseImages });
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rag-1726-'));
   const config = createEmbeddingConfig({ env: { EMBEDDING_BASE_URL: server.url, EMBEDDING_MODEL: 'gemma-test', EMBEDDING_PROFILE: profile }, stateFile: path.join(dir, 'embedding-config.json') });
   const rag = freshRag();
   rag.init({ dataDir: dir, inferenceUrl: 'http://engine.invalid', embeddingConfig: config,
     userDataDirFn: (id) => path.join(dir, 'users', id), listUserIds: () => [USER], userActive: () => true });
-  return { server, dir, rag, done: () => server.close() };
+  return { server, dir, rag, done: () => { delete process.env.EMBEDDING_IMAGE_MODEL; server.close(); } };
 }
 
 // A workspace with one project: two image sources (apple, banana) and a document whose Docling record
@@ -371,4 +373,50 @@ test('the backfill waits while a re-index is under way, and releases the image p
     release: async () => { released += 1; }, sleep: async () => {}, log: () => {} });
   await free.kick();
   assert.equal(calls, 1); assert.equal(released, 1);
+});
+
+dbTest('#1738: without the model manager or EMBEDDING_IMAGE_MODEL, images report no-image-projector and nothing is sent', async () => {
+  const s = await setup({ imageModel: null });
+  try {
+    const f = workspaceFixture(s.dir);
+    const r = await syncAll(s.rag, f.ws, f.project, f.docDir);
+    assert.equal(r.ok, false); assert.equal(r.reason, 'no-image-projector'); assert.equal(r.pending, 3);
+    assert.deepEqual(imageInputs(s.server.seen), [], 'no image request with the text model name');
+  } finally { s.done(); }
+});
+
+test('#1736: the backfill never embeds a Diary project (the extras project or a Diary chat context project)', async () => {
+  const seen = [];
+  const rag = { syncProjectMedia: async (projectId) => { seen.push(projectId); return { ok: true, embedded: 0, pending: 0 }; } };
+  const diaryId = require('./diary-extras.cjs').PROJECT_ID;
+  const ws = { projects: [{ id: diaryId }, { id: 'cowork-chat-context-diary-extra-synthetic' }, { id: 'p-ordinary' }], assetDir: () => '/synthetic-only' };
+  const backfill = multimodal.createMediaBackfill({ enabled: () => true, userIds: () => [USER], workspaceFor: () => ws, documentDir: () => '/synthetic-only', rag,
+    sleep: async () => {}, log: () => {} });
+  await backfill.kick();
+  assert.deepEqual(seen, ['p-ordinary']);
+});
+
+test('#1737: a re-index that starts mid-pass stops the backfill before its next request, and the preset is released', async () => {
+  let reindex = false, released = 0;
+  const seen = [];
+  const rag = { syncProjectMedia: async (projectId) => { seen.push(projectId); reindex = true; return { ok: true, embedded: 1, pending: 0 }; } };
+  const ws = { projects: [{ id: 'p1' }, { id: 'p2' }, { id: 'p3' }], assetDir: () => '/synthetic-only' };
+  const backfill = multimodal.createMediaBackfill({ enabled: () => true, userIds: () => [USER], workspaceFor: () => ws, documentDir: () => '/synthetic-only', rag,
+    paused: () => (reindex ? 'a re-index is under way' : null), release: async () => { released += 1; },
+    sleep: async () => {}, log: () => {}, setTimer: () => 1, clearTimer: () => {} });
+  await backfill.kick();
+  assert.deepEqual(seen, ['p1'], 'no image request once the re-index began');
+  assert.equal(released, 1, 'the image preset is not held beside the re-index');
+  assert.equal(backfill.status().last.reason, 'a re-index is under way');
+  backfill.stop();
+});
+
+test('#1737: the pause follows every request that embedded something, also across projects', async () => {
+  const log = [];
+  const rag = { syncProjectMedia: async (projectId) => { log.push(`req:${projectId}`); return { ok: true, embedded: 1, pending: 0 }; } };
+  const ws = { projects: [{ id: 'p1' }, { id: 'p2' }, { id: 'p3' }], assetDir: () => '/synthetic-only' };
+  const backfill = multimodal.createMediaBackfill({ enabled: () => true, userIds: () => [USER], workspaceFor: () => ws, documentDir: () => '/synthetic-only', rag,
+    sleep: async (ms) => { log.push(`sleep:${ms}`); }, log: () => {}, env: { NOEVIA_MULTIMODAL_RAG_INTERVAL_MS: '1500' } });
+  await backfill.kick();
+  assert.deepEqual(log, ['req:p1', 'sleep:1500', 'req:p2', 'sleep:1500', 'req:p3']);
 });

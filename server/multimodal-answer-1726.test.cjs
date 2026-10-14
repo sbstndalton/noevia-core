@@ -22,21 +22,22 @@ const APPLE = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x
 const BANANA = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from('synthetic banana picture')]);
 const b64 = (b) => b.toString('base64');
 
-async function run({ flag = true, probeStatus = 200, visionModel = null, appleText = '', external = false, captions = new Map(), message = 'What fruit is in the picture?' } = {}) {
+async function run({ flag = true, probeStatus = 200, visionModel = null, appleText = '', external = false, captions = new Map(), message = 'What fruit is in the picture?', providerId = 'default', cloudRoute = false, projectId = 'fixture-project', spaceId } = {}) {
   const events = [], requests = [];
   const res = new EventEmitter();
   res.writeHead = () => {};
   res.write = (line) => events.push(JSON.parse(line.slice(6)));
   res.end = () => { res.writableEnded = true; res.emit('finish'); };
+  const urls = [];
   const fetch = async (url, opts) => {
-    assert.equal(url, 'http://fixture.invalid/v1/chat/completions');
-    const body = JSON.parse(opts.body); requests.push(body);
+    assert.match(url, /^http:\/\/(fixture|lan|cloud)\.invalid\/v1\/chat\/completions$/);
+    const body = JSON.parse(opts.body); requests.push(body); urls.push(url);
     if (body.stream) return { ok: true, body: (async function* () { yield Buffer.from('data: ' + JSON.stringify({ choices: [{ delta: { content: 'Synthetic answer' } }] }) + '\n\n'); })() };
     if (body.max_tokens === 1) return new Response(probeStatus === 200 ? '{}' : 'provide the mmproj', { status: probeStatus });
     assert.equal(body.model, visionModel);
     return new Response(JSON.stringify({ choices: [{ finish_reason: 'stop', message: { content: 'Caption: one red apple on a plate.' } }] }), { status: 200 });
   };
-  const project = { id: 'fixture-project', model: 'answer-model',
+  const project = { id: projectId, model: 'answer-model', ...(providerId !== 'default' ? { provider: providerId } : {}), ...(cloudRoute ? { routing: 'auto', model: undefined } : {}),
     assets: [{ id: 'img-apple', name: 'fruit.png', mime: 'image/png', bytes: APPLE.length, sourceName: 'fruit.png' },
       { id: 'img-banana', name: 'yellow.png', mime: 'image/png', bytes: BANANA.length, sourceName: 'yellow.png' }],
     files: [{ name: 'fruit.png', content: appleText, attachment: { id: sha(APPLE), group: 'Images', state: 'vision' } },
@@ -65,18 +66,23 @@ async function run({ flag = true, probeStatus = 200, visionModel = null, appleTe
     HISTORY_CAP: 20, DEFAULT_PROVIDER_ID: 'default', createToolExchange,
     currentWorkspace: () => ({ userId: 'synthetic-user', dir: contextDir, assetDir: () => '/synthetic-only' }),
     getProject: () => project, skillsIndexFor: () => [],
-    getProvider: () => ({ id: 'default', baseUrl: 'http://fixture.invalid', ...(external ? { external: true, label: 'Synthetic Cloud' } : {}) }),
-    providerHeaders: () => ({}), autoRoles: () => (visionModel ? { vision: visionModel } : null),
+    getProvider: (id) => (id === 'cloud-fixture' ? { id, baseUrl: 'http://cloud.invalid', label: 'Synthetic Cloud' }
+      : id && id !== 'default' ? { id, baseUrl: 'http://lan.invalid', label: 'Synthetic LAN box' }
+        : { id: 'default', baseUrl: 'http://fixture.invalid', ...(external ? { external: true, label: 'Synthetic Cloud' } : {}) }),
+    providerHeaders: () => ({}),
+    autoRoles: () => (cloudRoute ? { fast: 'answer-model', smart: 'answer-model', ...(visionModel ? { vision: visionModel } : {}) } : visionModel ? { vision: visionModel } : null),
+    ...(cloudRoute ? { routingModes: { enabled: () => true, settings: () => ({ mode: 'cloud', whenSensitive: 'local', cloud: { providerId: 'cloud-fixture', smart: 'cloud-model' } }),
+      sensitivity: async () => ({ flagged: false }), chunkChars: () => 1000, maxChunks: () => 1, log() {}, awaitChoice: async () => ({ choice: 'cloud' }) } } : {}),
     visionDescriptions: new Map(), visionProbe: createVisionProbe({ fetchImpl: fetch }),
     chatSkillRouter: { select: async () => ({ loaded: [] }) }, oauthServerIds: () => new Set(), accountReady: () => true, mcpOAuth: { connected: () => false }, chatToolRouter: { select: async (ids) => ({ ids, routed: false }) }, DEFAULT_TOOLBOXES: [],
     CONNECTOR_BOXES: new Set(['gdrive']), connectedBoxes: () => [], toolPolicy: { mode: (_user, _name, write) => (write ? 'ask' : 'allow') }, requestScope: { getStore: () => ({}) },
     resolveTools: () => ({ tools: [], dropped: [] }), isWriteTool: () => true,
     multimodalEnabled: () => flag,
   });
-  await handleChat({}, res, { projectId: 'fixture-project', chatId: 'fixture-chat', message });
+  await handleChat({}, res, { projectId, chatId: 'fixture-chat', message, ...(spaceId ? { spaceId } : {}) });
   assert.ok(events.some((e) => e.type === 'done'), JSON.stringify(events.filter((e) => e.type === 'error')));
   const answer = requests.find((r) => r.stream);
-  return { events, requests, answer, filesContextCalls, captionWrites,
+  return { events, requests, urls, answer, filesContextCalls, captionWrites,
     system: answer.messages.filter((m) => m.role === 'system').map((m) => m.content).join('\n'),
     images: (answer.messages.at(-1).content || []).filter?.((c) => c.type === 'image_url') || [],
     captionRequests: requests.filter((r) => !r.stream && r.max_tokens !== 1).length,
@@ -136,4 +142,50 @@ test('flag off: no image retrieval is asked for and every project image rides al
   assert.deepEqual(out.filesContextCalls, [{ attached: false }], 'filesContext is called exactly as before #1726');
   assert.equal(out.images.length, 2, 'both project images ride along, as before');
   assert.ok(!/not attached/.test(out.system));
+});
+
+// #1735: the off-box rule is the one the rest of chat.cjs uses (#815/#1703), not only `external`.
+const PRIVATE_CAPTION = 'CACHED-PRIVATE-CAPTION';
+const offBoxSetup = () => ({ visionModel: 'vision-model', appleText: 'PRIVATE-OCR-TEXT',
+  captions: new Map([[JSON.stringify(['synthetic-user', 'fixture-project', `img:${sha(APPLE)}`]), { caption: PRIVATE_CAPTION, model: 'v' }]]) });
+function assertNothingImageDerived(out, label) {
+  const sent = JSON.stringify(out.requests);
+  assert.ok(!sent.includes('data:image'), `${label}: no image bytes`);
+  assert.ok(!sent.includes(b64(APPLE)), `${label}: no image bytes`);
+  assert.ok(!sent.includes('PRIVATE-OCR-TEXT'), `${label}: no text read from the image`);
+  assert.ok(!sent.includes(PRIVATE_CAPTION), `${label}: no cached caption`);
+  assert.equal(out.captionRequests, 0, `${label}: no caption request`);
+  assert.deepEqual(out.captionWrites, [], `${label}: nothing captioned`);
+  assert.match(out.system, /"fruit\.png"[\s\S]*were not sent/, `${label}: the file name only`);
+}
+
+test('#1735: a non-default provider without `external` gets nothing derived from an image, and no caption is made', async () => {
+  const out = await run({ ...offBoxSetup(), providerId: 'lan-fixture', probeStatus: 200 });
+  assert.ok(out.urls.every((u) => u.startsWith('http://lan.invalid/')), 'only the answering request, to the LAN box');
+  assertNothingImageDerived(out, 'non-default provider');
+  const noText = await run({ providerId: 'lan-fixture', probeStatus: 500, visionModel: 'vision-model' });
+  assert.equal(noText.captionRequests, 0, 'no caption, not even to the answering provider');
+  assert.ok(!JSON.stringify(noText.requests).includes('data:image'));
+});
+
+test('#1735: a Router turn that resolves to the cloud gets nothing derived from an image, and no caption is made', async () => {
+  const out = await run({ ...offBoxSetup(), cloudRoute: true, probeStatus: 200 });
+  assert.equal(out.answer.model, 'cloud-model', 'the turn went to the cloud route');
+  assertNothingImageDerived(out, 'cloud route');
+});
+
+test('#1735: on the box, captions are made by the local default provider only', async () => {
+  const out = await run({ probeStatus: 500, visionModel: 'vision-model' });
+  assert.equal(out.captionRequests, 1);
+  assert.ok(out.urls.every((u) => u.startsWith('http://fixture.invalid/')));
+});
+
+test('#1736: Diary images are never retrieved, embedded, captioned or cached', async () => {
+  const diaryId = require('./diary-extras.cjs').PROJECT_ID;
+  for (const projectId of [diaryId, 'cowork-chat-context-diary-extra-synthetic']) {
+    const out = await run({ projectId, probeStatus: 500 });
+    assert.ok(out.filesContextCalls.every((o) => !o || !o.images), `${projectId}: no image retrieval`);
+    assert.equal(out.captionRequests, 0, `${projectId}: no caption`);
+    assert.deepEqual(out.captionWrites, [], `${projectId}: nothing written to media_captions`);
+  }
 });

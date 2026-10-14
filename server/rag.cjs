@@ -755,8 +755,10 @@ function mediaModelFor(target) {
     const hit = Array.isArray(vision) ? vision.find((v) => v && v.model === target.model && typeof v.alias === 'string') : null;
     return hit ? hit.alias : null;
   }
+  // #1738: without the model manager, only a named image model is known to take images; the text model's own
+  // name would fail every retry on a text-only server, so report no-image-projector instead.
   const named = String(process.env.EMBEDDING_IMAGE_MODEL || '').trim();
-  return named || target.model;
+  return named || null;
 }
 
 /**

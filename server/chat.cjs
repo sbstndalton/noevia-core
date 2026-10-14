@@ -36,6 +36,12 @@ async function providerFailureText(response, chatgptProvider, partial = false) {
 // without booting the server. The upstream call itself is
 // reasoningEffort.requestWithEffort; the SSE parsing is inline below.
 
+// #815/#1703/#1735: a turn is off-box when its request leaves this box: an external provider, a cloud route,
+// or any provider other than the local default one. One rule for every site that filters what may leave.
+function offBoxTurn({ externalProvider, routeTarget, provider, DEFAULT_PROVIDER_ID }) {
+  return !!(externalProvider || routeTarget?.route === 'cloud' || provider?.id !== DEFAULT_PROVIDER_ID);
+}
+
 /**
  * @param {object} deps  see the destructuring: modules, constants, the auth and model services,
  *   the request scope, the project/provider/history accessors, the toolbox and MCP seams, and
@@ -522,7 +528,10 @@ function createChatHandler({
     const chatAttachments = !!project && String(project.id).startsWith('cowork-chat-context-');
     // #1726: with multimodal RAG on, the same retrieval also returns the project's relevant images (and
     // which images it can see at all); what the model gets for them is decided once the route is known.
-    const multimodal = !!project && !body.compactOnly && multimodalEnabled() === true ? require('./multimodal-rag.cjs') : null;
+    // #1736: never for the Diary (its extras project, a Diary chat's context project or a Diary space): Diary
+    // images are not embedded, captioned or cached.
+    const multimodal = !!project && !body.compactOnly && !(typeof spaceId === 'string' && spaceId.startsWith('diary'))
+      && !require('./multimodal-rag.cjs').diaryProject(project.id) && multimodalEnabled() === true ? require('./multimodal-rag.cjs') : null;
     let imageRetrieval = null; // { hits, indexed } when multimodal retrieval ran
     if (project && Array.isArray(project.files) && project.files.length) {
       const readable = require('./instruction-skills.cjs').sources(project);
@@ -905,13 +914,13 @@ function createChatHandler({
     let externalProvider = egress.isExternalProvider(provider);
     // #815: linked chats' brains never reach an external provider or a cloud route; fail closed by
     // dropping the block before anything below reads `sys` or `wire`. Local requests are unchanged.
-    if (brainBlock && (externalProvider || routeTarget?.route === 'cloud' || provider?.id !== DEFAULT_PROVIDER_ID)) {
+    if (brainBlock && offBoxTurn({ externalProvider, routeTarget, provider, DEFAULT_PROVIDER_ID })) {
       sys = sysWithoutBrain;
       wire = sys ? [{ role: 'system', content: sys }, ...msgs] : msgs;
       brainBlock = '';
     }
     // #1587: a provider off this box gets the day without the server's time-zone name (where the server is).
-    if (externalProvider || routeTarget?.route === 'cloud' || provider?.id !== DEFAULT_PROVIDER_ID) {
+    if (offBoxTurn({ externalProvider, routeTarget, provider, DEFAULT_PROVIDER_ID })) {
       const zoneless = require('./current-time-part.cjs').systemPart(undefined, undefined, { zoneName: false });
       if (wire[0]?.role === 'system' && typeof wire[0].content === 'string' && wire[0].content.includes(timePart)) {
         sys = sys.replace(timePart, () => zoneless);
@@ -1056,7 +1065,7 @@ function createChatHandler({
       }
       if (wanted.length) rerouteLocalForPrivateTools();
     }
-    const automaticLocal = !externalProvider && routeTarget?.route !== 'cloud' && provider?.id === DEFAULT_PROVIDER_ID;
+    const automaticLocal = !offBoxTurn({ externalProvider, routeTarget, provider, DEFAULT_PROVIDER_ID });
     let automaticAdded = [];
     if (automaticTools && !body.compactOnly) {
       // #1692: a follow-up keeps the public boxes (Web search, offline Wikipedia) the chat was already using.
@@ -1071,7 +1080,7 @@ function createChatHandler({
     // #1703: the route is settled. When the request leaves the box (the #815 rule: an external provider, a cloud route
     // or any provider other than the local one), the replayed history is rebuilt with the off-box filter. The current
     // message keeps what was added to it (the attached files block); the system part of `wire` is kept as built.
-    if (externalProvider || routeTarget?.route === 'cloud' || provider?.id !== DEFAULT_PROVIDER_ID) {
+    if (offBoxTurn({ externalProvider, routeTarget, provider, DEFAULT_PROVIDER_ID })) {
       const head = wire.slice(0, wire.length - msgs.length);
       const filtered = normalizeReplayHistory(replaySource, body.compactOnly ? undefined : message, { ...replayOptions, offBox: true });
       if (!body.compactOnly && filtered.length && msgs.length) filtered[filtered.length - 1] = msgs[msgs.length - 1];
@@ -1281,21 +1290,25 @@ function createChatHandler({
       const roles = autoRoles();
       const visionModel = roles && roles.vision;
       const uid = currentWorkspace().userId;
+      // #1735: the route is final here. Off the box, nothing derived from an image is sent (names only), and
+      // captions are made only by the local default provider, never by the answering one.
+      const offBox = offBoxTurn({ externalProvider, routeTarget, provider, DEFAULT_PROVIDER_ID });
+      const captionProvider = offBox ? null : getProvider(DEFAULT_PROVIDER_ID);
       const captionImage = (image) => {
-        if (!visionModel) return null;
+        if (!visionModel || offBox || !captionProvider || captionProvider.id !== DEFAULT_PROVIDER_ID || egress.isExternalProvider(captionProvider)) return null;
         return multimodal.captionOnce(JSON.stringify([uid, project.id, image.hash]), {
           read: () => (typeof rag.readCaption === 'function' ? rag.readCaption(project.id, uid, image.hash) : null),
           write: (caption, by) => { if (typeof rag.writeCaption === 'function') rag.writeCaption(project.id, uid, image.hash, caption, by); },
           generate: async () => {
-            if (provider.id === DEFAULT_PROVIDER_ID && typeof modelManager.makeRoomFor === 'function') {
+            if (typeof modelManager.makeRoomFor === 'function') {
               try { await modelManager.makeRoomFor(visionModel, undefined, chatSignal.signal); }
               catch (err) { console.warn(`[vision] ${visionModel} not admitted for a caption: ${String(err?.code || err?.status || 'error')}`); return null; }
             }
             let bytes;
             try { bytes = image.bytes(); } catch { return null; }
             try {
-              const r = await fetch(`${String(provider.baseUrl).replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`, {
-                method: 'POST', headers: { 'Content-Type': 'application/json', ...upstreamHeaders }, redirect: 'error',
+              const r = await fetch(`${String(captionProvider.baseUrl).replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json', ...providerHeaders(captionProvider) }, redirect: 'error',
                 body: JSON.stringify({ model: visionModel, max_tokens: 1024, messages: [{ role: 'user', content: [
                   { type: 'text', text: 'Describe this image in detail, so someone who cannot see it can answer questions about it. Transcribe any text exactly, including numbers, labels and headings. If text is unclear, say so rather than guessing.' },
                   require('./multimodal-rag.cjs').MODALITIES.image.part(image.mime, bytes)] }] }),
@@ -1311,7 +1324,7 @@ function createChatHandler({
         });
       };
       const decided = await multimodal.answerImages({
-        images: retrievedImages, external: externalProvider, providerLabel: provider.label || 'an external provider',
+        images: retrievedImages, external: offBox, providerLabel: provider.label || 'an external provider',
         canSee: async () => (await visionProbe(provider.baseUrl, upstreamHeaders, model)).supported, caption: captionImage, hasVisionRole: !!visionModel, frame: frameUntrusted,
       });
       if (decided.notes.length) {
