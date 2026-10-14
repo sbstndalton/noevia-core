@@ -142,7 +142,8 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
     if (!m) throw new Error(`model not installed: ${name}`);
     if (m.missingFile) throw new Error(`model file missing: ${name}`);
     if (m.servedElsewhere) throw new Error(`model runs in its own service: ${name}`);
-    if (!m.loaded) {
+    // #1758: a sleeping model is running; a request wakes it, and the router refuses a load.
+    if (!m.loaded && m.status !== 'sleeping') {
       const result = await modelManager.load(name);
       invalidateModelReads();
       if (!result.ok) throw new Error(`model could not load: ${name}`);
