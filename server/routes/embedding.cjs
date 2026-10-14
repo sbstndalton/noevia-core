@@ -93,10 +93,17 @@ function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJs
   // service then cannot serve it, which the served-model check reports. null when the models in
   // use do not fit the service: the caller must not shrink it then.
   const addressOf = (t) => (t ? (t.baseUrl !== undefined ? t.baseUrl : t.base_url) : undefined);
-  function servedSet(c, d = null) {
+  // #1683: a Diary target without an address (base_url '' or null) uses the Diary's own default
+  // server, which web cannot see (the Diary's environment, e.g. LLM_EMBED_BASE_URL or its chat
+  // engine, is not web's). It may be the embedding service, so keep its model (the safe direction:
+  // dropping it could stop the Diary's search).
+  const diaryDefault = (t) => !String(addressOf(t) ?? '').trim();
+  function servedSet(c, d = null, { diaryDefaults = true } = {}) {
     const out = [];
+    const diarySide = new Set([d?.active, d?.next, d?.previous].filter(Boolean));
+    const onService = (t) => service.isAt(addressOf(t)) || (diaryDefaults && diarySide.has(t) && diaryDefault(t));
     const add = (t) => {
-      if (!t || !t.model || !service.isAt(addressOf(t)) || out.some((e) => e.model === t.model)) return true;
+      if (!t || !t.model || !onService(t) || out.some((e) => e.model === t.model)) return true;
       const file = service.fileOf(t.model);
       if (!file) return true;
       out.push({ model: t.model, file });
@@ -107,6 +114,9 @@ function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJs
     return out;
   }
 
+  // #1687: the Diary's GET always reports an active target (its configuration falls back to the
+  // environment's, or an 'unavailable' one when its saved file is damaged), so a reply without
+  // one is not a Diary this code knows: it stays unknown.
   // The Diary's targets, or null when they cannot be known (not reachable, unexpected answer): a
   // shrink then could drop a model the Diary still searches with. { active: null } when no Diary
   // is configured here.
@@ -146,6 +156,11 @@ function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJs
       if (c.next) return reply(409, { error: 'A re-index is under way. Cancel it before turning embedding off.', code: 'reindexUnderway' });
       // #1676: the last switch's rollback model is still served and its vectors kept.
       if (c.previous) return reply(409, { error: 'Finish the last embedding switch (or roll it back) before turning embedding off.', code: 'finishFirst' });
+      // #1681: the Diary's half of a switch counts too: off would stop its re-index or drop the
+      // model its rollback needs. Unknown Diary state (configured but not answering) refuses.
+      const d = await diaryTargets();
+      if (!d) return reply(409, { error: 'The Diary\'s embedding settings could not be read, so turning embedding off could stop a switch it has under way. Try again when the Diary answers.', code: 'diaryUnknown' });
+      if (d.next || d.previous) return reply(409, { error: 'The Diary has not finished its embedding switch. Finish it (or roll it back) before turning embedding off.', code: 'finishFirst' });
       try { await service.serve([]); } catch (err) { return reply(err.status || 502, { error: err.message, code: err.code }); }
       authService.audit?.('embedding.service-off', authn.user.id, null, {});
       return reply(200, { service: service.status() });
@@ -171,6 +186,11 @@ function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJs
       const d = await diaryTargets();
       if (!d) return reply(409, { error: 'The Diary\'s embedding settings could not be read, so the switch could drop a model it still uses. Try again when the Diary answers.', code: 'diaryUnknown' });
       keep = servedSet(c, d);
+      // #1686: when only a Diary target on its default server (no address) pushes the set past
+      // two, finishing a switch would not help: the Diary needs an explicit address.
+      const known = servedSet(c, d, { diaryDefaults: false });
+      const overflows = (set) => !set || set.length + (set.some((e) => e.model === model) ? 0 : 1) > 2;
+      if (overflows(keep) && !overflows(known)) return reply(409, { error: 'The Diary uses its default embedding server, so noevia cannot tell whether it shares the embedding service. Give the Diary an explicit embeddings address in Settings, then switch again.', code: 'diaryAddressUnknown' });
       if (!keep) return reply(409, { error: 'The embedding service already serves two models in use. Finish or cancel the switch under way first.', code: 'tooManyModels' });
     }
     if (keep.some((e) => e.model === model)) return reply(409, { error: `${model} is already the embedding model.`, code: 'alreadyActive' });
