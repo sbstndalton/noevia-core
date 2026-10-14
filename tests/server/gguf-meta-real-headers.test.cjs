@@ -51,7 +51,8 @@ test('the fixtures are present when required', () => {
 });
 
 // Each fetched header must be the pinned file: revision and total size match tools/fetch-real-gguf-headers.cjs.
-test('every manifest entry matches its pinned source', () => {
+// Only with fetched fixtures: the image build copies tests/ but not tools/.
+test('every manifest entry matches its pinned source', { skip: !have && 'real GGUF headers not fetched' }, () => {
   const { SOURCES } = require('../../tools/fetch-real-gguf-headers.cjs');
   for (const entry of manifest) {
     const pin = SOURCES.find((s) => s.name === entry.name);
