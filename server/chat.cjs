@@ -96,6 +96,9 @@ const FAILED_REPLY_TOOLS_NOTE = '(The reply to the message above ended before it
 const ABANDONED_TURN_NOTE = '(No reply was kept for the message above: it was stopped or failed before an answer. It is not an open request. Answer only the newest message unless the user asks about it.)';
 function normalizeReplayHistory(mapped, newMessage, { carryOrphanTool = () => false } = {}) {
   const out = [];
+  // #1700: the carriers made below for a failed reply's results. Held here, not as a field on the message, so no
+  // marker can leave this function.
+  const orphanCarriers = new WeakSet();
   // Applied changes with no turn before them (the first message was edited and re-run, #658
   // review): strict templates need a user turn first, so they lead the first user turn instead.
   const leading = [];
@@ -115,13 +118,24 @@ function normalizeReplayHistory(mapped, newMessage, { carryOrphanTool = () => fa
       continue;
     }
     if (entry.role === 'tool' || entry.role === 'function') {
+      // #1700 re-review: a turn that only carries a failed reply's results (an orphan carrier) takes further results
+      // of that reply under the same rule as the first one: public tools only. A private read after a public one
+      // would otherwise fold straight into the carrier and reach the model.
+      if (last && last.role === 'assistant' && orphanCarriers.has(last)) {
+        if (carryOrphanTool(entry.name)) last.content = `${last.content}\n\n${foldToolMessage(entry)}`;
+        continue;
+      }
       if (last && last.role === 'assistant') last.content = `${last.content}\n\n${foldToolMessage(entry)}`;
       // #1692: a reply that failed before its answer keeps no text, but its tool results are still what the
       // follow-up asks about ("using what your search found..."). They are carried under a note of ours.
       // #1700: only a positively public tool's result (carryOrphanTool; nothing by default). A private read of a
       // failed reply (notes, files, Drive, the project reader, an unknown tool) is dropped, so it can never reach
       // a cloud model on the next turn.
-      else if (last && carryOrphanTool(entry.name)) out.push({ role: 'assistant', content: `${FAILED_REPLY_TOOLS_NOTE}\n\n${foldToolMessage(entry)}` });
+      else if (last && carryOrphanTool(entry.name)) {
+        const carrier = { role: 'assistant', content: `${FAILED_REPLY_TOOLS_NOTE}\n\n${foldToolMessage(entry)}` };
+        orphanCarriers.add(carrier);
+        out.push(carrier);
+      }
       continue;
     }
     if (last && last.role === entry.role && entry.role === 'assistant') {

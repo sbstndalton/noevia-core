@@ -249,3 +249,27 @@ test('#1700: tool_result marks a public tool public, and never a private one', a
   const nc = results.find((e) => e.name === 'nc_notes_search_notes');
   if (nc) assert.equal(nc.public, undefined);
 });
+
+test('#1700 re-review: a private result after a public one in a failed reply is not folded into the carrier', () => {
+  const { normalizeReplayHistory } = require('./chat.cjs');
+  const carry = { carryOrphanTool: (name) => name === 'public_search' };
+  const pub = { role: 'tool', name: 'public_search', content: 'SYNTHETIC-PUBLIC-1' };
+  const priv = { role: 'tool', name: 'private_notes', content: 'SYNTHETIC-PRIVATE-2' };
+  for (const order of [[pub, priv], [priv, pub]]) {
+    const out = normalizeReplayHistory([{ role: 'user', content: 'q' }, ...order], 'next', carry);
+    const text = JSON.stringify(out);
+    assert.doesNotMatch(text, /SYNTHETIC-PRIVATE-2/);
+    assert.match(text, /SYNTHETIC-PUBLIC-1/);
+    assert.ok(out.every((m) => Object.keys(m).every((k) => k === 'role' || k === 'content')), 'no internal marker leaves');
+  }
+  // A result attached to a real reply is unchanged (out of scope here).
+  const answered = normalizeReplayHistory([{ role: 'user', content: 'q' }, { role: 'assistant', content: 'a' }, priv], 'next', carry);
+  assert.match(JSON.stringify(answered), /SYNTHETIC-PRIVATE-2/);
+});
+
+test('#1700 re-review: on a cloud route, [search, notes] from a failed reply sends the search result only', async (t) => {
+  const history = [{ role: 'user', content: 'Find it.' }, { role: 'tool', name: 'tavily_search', content: 'SYNTHETIC-PUBLIC-77' }, { role: 'tool', name: 'nc_notes_search_notes', content: 'SYNTHETIC-PRIVATE-88' }];
+  const r = await run(t, { message: 'And?', provider: MEMBER_CLOUD, project: ON_CLOUD, history });
+  for (const req of r.requests) assert.doesNotMatch(JSON.stringify(req.body), /SYNTHETIC-PRIVATE-88/);
+  assert.match(JSON.stringify(r.requests[0].body), /SYNTHETIC-PUBLIC-77/);
+});
