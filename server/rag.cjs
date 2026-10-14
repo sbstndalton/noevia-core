@@ -38,6 +38,9 @@ function makeRagFetch(extra = {}) {
   return createServiceFetch({ linkLocal: false, addressesPublic: (a) => require('./ssrf.cjs').ssrfWasm().ssrfAddressesPublic(a), ...extra });
 }
 function setRagFetch(fn) { const prev = netFetch; netFetch = fn; return prev; }
+// #1762: the test seam (setRagFetch swaps the on-this-network fetch) is only exported under the test runner,
+// so production code cannot reach it (same rule as provider-egress.cjs).
+const testSeam = process.env.NODE_TEST_CONTEXT || process.env.NODE_ENV === 'test' ? { _test: { setRagFetch, makeRagFetch, rerankBackend } } : {};
 // The reranker's backend, built here so a test can drive it without a chat.
 function rerankBackend(baseUrl) {
   const { llamaRerankBackend } = require('./decision/backends.cjs');
@@ -1107,7 +1110,4 @@ const trackedFileState = () => ({ queues: fileQueues.size, generations: fileGene
 
 // #1646: the sentence a hybrid cloud route without a grant removes (read_project_file is not offered there).
 const READ_FILE_HINT = ' Use read_project_file with PDF startPage/endPage and offset for pages beyond the summary.';
-// #1762: the test seam (setRagFetch swaps the on-this-network fetch) is only exported under the test runner,
-// so production code cannot reach it (same rule as provider-egress.cjs).
-const testSeam = process.env.NODE_TEST_CONTEXT || process.env.NODE_ENV === 'test' ? { _test: { setRagFetch, makeRagFetch, rerankBackend } } : {};
 module.exports = { ...testSeam, searchProjectWithImages, syncProjectMedia, releaseMediaModel, readCaption, writeCaption, mediaModelFor, embeddingOff, READ_FILE_HINT, servedModels, servedModelsCached, init, trackedFileState, indexProjectFile, deleteProjectFile, searchProject, filesContext, chunkText, ragAvailable, retrievalStatus, embed, embedModel, embeddingIdentity, embeddingConfig: getEmbeddingConfig, onIndexed, listIndexes, indexCoverage, fillMissing, dropIndexSlot, rerankPool };
