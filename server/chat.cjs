@@ -329,7 +329,7 @@ function createChatHandler({
     const appliedEntry = (h) => h.role === 'tool' && h.applied === true && typeof h.name === 'string' && typeof h.content === 'string';
     // A write the user did not approve (#666), kept so the next turn knows it did not run.
     const declinedEntry = (h) => h.role === 'tool' && h.declined === true && h.applied !== true && typeof h.name === 'string' && typeof h.content === 'string';
-    const mappedHistory = (Array.isArray(history) ? history : [])
+    const mappedAll = (Array.isArray(history) ? history : [])
       .filter((h) => h && ['user', 'assistant', 'tool', 'function'].includes(h.role) && ((typeof h.content === 'string' && h.content) || appliedEntry(h)))
       .slice(-HISTORY_CAP)
       .map((h) => appliedEntry(h)
@@ -337,6 +337,12 @@ function createChatHandler({
             ...(typeof h.target === 'string' ? { target: h.target } : {}), ...(typeof h.args === 'string' ? { args: h.args } : {}) }
         : declinedEntry(h) ? { role: 'tool', content: h.content, name: h.name, declined: true }
         : (h.role === 'tool' || h.role === 'function') && typeof h.name === 'string' ? { role: h.role, content: h.content, name: h.name } : { role: h.role, content: h.content });
+    // #1700: a plain tool result from an earlier reply (a failed reply's reads, #1692) is kept only when the tool is
+    // public (a search or Wikipedia tool, not offered by any private-data box). Anything else (notes, files, Drive,
+    // the project reader, a tool this server no longer knows) is dropped here, before any route is chosen, so it
+    // can never reach a cloud model. Applied and declined write entries keep their #658/#666 handling.
+    const mappedHistory = mappedAll.filter((h) => !((h.role === 'tool' || h.role === 'function') && h.applied !== true && h.declined !== true)
+      || require('./tools-mode.cjs').isPublicToolName(h.name, allToolboxes()));
     // Writes the client says already succeeded in this chat, for the repeat flag on approval cards.
     const recentWriteFps = new Set(mappedHistory.filter((h) => h.applied === true)
       .map((h) => require('./recent-writes.cjs').fingerprint(h.name, h.target, h.args)));
@@ -939,8 +945,7 @@ function createChatHandler({
     // #1592: positively public: offered by a box that does not read private data, and not private anywhere else.
     // Positively public for the health rule: offered by a search or Wikipedia box (not web-crawl, see
     // HEALTH_PUBLIC_BOXES) and not by any private-data box.
-    const isPublicTool = (name) => !isPrivateTool(name)
-      && allToolboxes().some((b) => toolModes.HEALTH_PUBLIC_BOXES.has(b.id) && (b.tools || []).some((t) => t?.function?.name === name));
+    const isPublicTool = (name) => toolModes.isPublicToolName(name, allToolboxes());
     const rerouteLocalForPrivateTools = () => {
       const roles = autoRoles();
       const localModel = roles && (roles[routedRole] || roles.smart || roles.fast || roles.code);
@@ -980,7 +985,8 @@ function createChatHandler({
     let automaticAdded = [];
     if (automaticTools && !body.compactOnly) {
       // #1692: a follow-up keeps the public boxes (Web search, offline Wikipedia) the chat was already using.
-      const carried = toolModes.carriedPublicBoxes({ history: mappedHistory, boxes: allToolboxes() });
+      // The unfiltered history: a private tool result dropped from the prompt (#1700) still stops the carry (#1702).
+      const carried = toolModes.carriedPublicBoxes({ history: mappedAll, boxes: allToolboxes() });
       automaticAdded = toolModes.automaticAdditions({ message, base: requestToolboxes(), boxes: allToolboxes(), connectorBoxes: CONNECTOR_BOXES,
         isWriteTool, ready: automaticToolsReady(chatUser), privateData: automaticLocal, carried });
     }
@@ -1969,7 +1975,9 @@ function createChatHandler({
           }
           send({ type: 'tool_result', index: toolOffset + toolIndex, name: tc.name, text: result.slice(0, 300),
             ...(applied ? { applied: true } : {}), ...(applied && cardTarget !== null ? { target: cardTarget } : {}),
-            ...(notApprovedResults.has(result) ? { declined: true } : {}), ...(notRunResults.has(result) ? { notRun: true } : {}) });
+            ...(notApprovedResults.has(result) ? { declined: true } : {}), ...(notRunResults.has(result) ? { notRun: true } : {}),
+            // #1700: a positively public tool (search, Wikipedia). Only these may be resent by the client after a failed reply.
+            ...(!applied && isPublicTool(tc.name) ? { public: true } : {}) });
           roundMessages.push({ role: 'tool', tool_call_id: tc.id, content: framedResult });
           holdForCloud(tc.name, result);
           if (outcome.failed !== true && !/^ERROR\b/.test(String(result))) {

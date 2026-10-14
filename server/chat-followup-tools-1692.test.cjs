@@ -202,3 +202,50 @@ test('#1693: a reply with no tools that writes only reasoning keeps the existing
   assert.ok(!r.requests.some(hasFinalNote), 'no final-answer round without tool results');
   assert.match(r.events.filter((e) => e.type === 'delta').map((e) => e.text).join(''), /reasoning without a final answer/);
 });
+
+// ── Review fixes (#1700, #1702) ─────────────────────────────────────────────
+
+const MEMBER_CLOUD = { id: 'member-cloud', label: 'Synthetic cloud', baseUrl: 'https://cloud.example.invalid', external: true };
+const ON_CLOUD = { ...AUTO_PROJECT, routing: 'manual', provider: MEMBER_CLOUD.id, model: 'synthetic-cloud-model' };
+const failedWith = (name, content) => [{ role: 'user', content: 'Find it for me.' }, { role: 'tool', name, content }];
+
+for (const [name, secret] of [['nc_notes_search_notes', 'SYNTHETIC-PRIVATE-NOTE-7731'], ['read_project_file', 'SYNTHETIC-PRIVATE-FILE-4402'], ['unknown_tool', 'SYNTHETIC-UNKNOWN-9910']]) {
+  test(`#1700: a failed reply's ${name} result never reaches a cloud model on the next turn`, async (t) => {
+    const r = await run(t, { message: 'And what did that say?', provider: MEMBER_CLOUD, project: ON_CLOUD, history: failedWith(name, secret) });
+    assert.ok(r.requests.length >= 1);
+    for (const req of r.requests) assert.doesNotMatch(JSON.stringify(req.body), new RegExp(secret), 'the private result is not in the upstream body');
+  });
+}
+
+test('#1700: a failed reply\'s public search result is still carried, on a cloud route too', async (t) => {
+  const r = await run(t, { message: 'And when was that?', provider: MEMBER_CLOUD, project: ON_CLOUD, history: failedWith('tavily_search', 'SYNTHETIC-PUBLIC-RESULT-5150') });
+  assert.match(JSON.stringify(r.requests[0].body), /SYNTHETIC-PUBLIC-RESULT-5150/);
+});
+
+test('#1702: Web search is not carried when recent history has a private tool result', async (t) => {
+  const history = [{ role: 'user', content: FIRST }, { role: 'assistant', content: 'Rust.' }, { role: 'user', content: 'Search my notes too.' }, { role: 'tool', name: 'nc_notes_search_notes', content: 'synthetic note' }];
+  const r = await run(t, { message: FOLLOW_UP, history });
+  assert.ok(!r.tools.includes('tavily_search'), `no carry beside private results (got ${r.tools.join(', ')})`);
+});
+
+test('#1702: Web search is not carried when the turn already has a Nextcloud box', async (t) => {
+  const project = { ...AUTO_PROJECT, toolsMode: 'manual', toolboxes: ['core', 'nextcloud-notes'] };
+  const history = [{ role: 'user', content: FIRST }, { role: 'assistant', content: 'Rust.' }];
+  // Manual never carries (Automatic only); the pure rule covers an Automatic turn whose base holds a Nextcloud box.
+  const r = await run(t, { message: FOLLOW_UP, history, project });
+  assert.ok(!r.tools.includes('tavily_search'));
+  const toolModes = require('./tools-mode.cjs');
+  const added = toolModes.automaticAdditions({ message: FOLLOW_UP, base: ['core', 'nextcloud-notes'], boxes: [WEB, NC_NOTES], connectorBoxes: new Set(), isWriteTool: () => false, carried: ['web-search'] });
+  assert.deepEqual(added, []);
+  const control = toolModes.automaticAdditions({ message: FOLLOW_UP, base: ['core'], boxes: [WEB, NC_NOTES], connectorBoxes: new Set(), isWriteTool: () => false, carried: ['web-search'] });
+  assert.deepEqual(control, ['web-search']);
+});
+
+test('#1700: tool_result marks a public tool public, and never a private one', async (t) => {
+  const replies = [callFrame('tavily_search', 'c1', { query: 'rust' }), callFrame('nc_notes_search_notes', 'c2', { query: 'x' })];
+  const r = await run(t, { message: 'Search my notes and the web for the synthetic thing.', gateOn: false, replies });
+  const results = r.events.filter((e) => e.type === 'tool_result');
+  assert.equal(results.find((e) => e.name === 'tavily_search')?.public, true);
+  const nc = results.find((e) => e.name === 'nc_notes_search_notes');
+  if (nc) assert.equal(nc.public, undefined);
+});

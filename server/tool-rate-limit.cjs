@@ -9,7 +9,7 @@
 const BASE_MS = 15000;
 const MAX_MS = 5 * 60 * 1000;
 // A tool result that reports a rate limit in its text (an MCP `isError` result rather than an HTTP status).
-const RATE_LIMIT_TEXT = /\b429\b|\brate[\s-]?limit(?:ed|ing)?\b|\btoo many requests\b|\bquota (?:exceeded|exhausted)\b|\busage limit\b/i;
+const RATE_LIMIT_TEXT = /\b(?:HTTP|status(?:\s+code)?)[\s:]*429\b|\brate[\s-]?limit(?:ed|ing)?\b|\btoo many requests\b|\bquota (?:exceeded|exhausted)\b|\busage limit\b/i;
 
 function isRateLimitedText(text) { return RATE_LIMIT_TEXT.test(String(text || '').slice(0, 2000)); }
 
@@ -24,16 +24,22 @@ function parseRetryAfter(value, now = Date.now()) {
 
 function createToolRateLimit({ now = () => Date.now(), baseMs = BASE_MS, maxMs = MAX_MS } = {}) {
   const state = new Map(); // key -> { until, strikes }
+  // #1701: entries whose wait ended more than one maximum wait ago are pruned (every key, on every lookup), so the
+  // map holds only keys still waiting or recently throttled. Until then a key keeps its strike count, so a provider
+  // that answers 429 again right after a wait gets the doubled one.
+  const prune = (at) => { for (const [key, s] of state) if (at - s.until > maxMs) state.delete(key); };
+  const remaining = (key) => {
+    const at = now();
+    prune(at);
+    const s = state.get(key);
+    return s && s.until > at ? s.until - at : 0;
+  };
   return {
     /** ms left before this key may call again (0: go ahead). */
-    remaining(key) {
-      const s = state.get(key);
-      if (!s) return 0;
-      const left = s.until - now();
-      return left > 0 ? left : 0;
-    },
+    remaining,
     /** A 429 for this key; returns the wait in ms. */
     hit(key, retryAfterMs = null) {
+      remaining(key);
       const prev = state.get(key);
       const strikes = (prev ? prev.strikes : 0) + 1;
       const backoff = Math.min(maxMs, baseMs * 2 ** (strikes - 1));
@@ -42,6 +48,8 @@ function createToolRateLimit({ now = () => Date.now(), baseMs = BASE_MS, maxMs =
       return wait;
     },
     clear(key) { state.delete(key); },
+    /** Entries held (tests). */
+    size() { return state.size; },
   };
 }
 

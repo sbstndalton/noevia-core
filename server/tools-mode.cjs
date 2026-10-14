@@ -116,6 +116,14 @@ const PRIVATE_CORE_TOOLS = new Set(['read_project_file']);
 // offline Wikipedia are public reference text. web-crawl is NOT here: a fetched page can be the user's
 // own document behind a share link, so its results keep the health rule (#1647: when in doubt, stay local).
 const HEALTH_PUBLIC_BOXES = new Set(['web-search', 'offline-wikipedia']);
+/** #1592/#1700: positively public: offered by a search or Wikipedia box (HEALTH_PUBLIC_BOXES), and not the project
+ *  reader or a tool of any private-data box. An unknown name, or a non-string, is not public. */
+function isPublicToolName(name, boxes) {
+  if (typeof name !== 'string' || !name || PRIVATE_CORE_TOOLS.has(name)) return false;
+  const list = Array.isArray(boxes) ? boxes : [];
+  const offers = (b) => !!b && (b.tools || []).some((t) => t?.function?.name === name);
+  return !list.some((b) => b && isPrivateDataBox(b.id) && offers(b)) && list.some((b) => b && HEALTH_PUBLIC_BOXES.has(b.id) && offers(b));
+}
 /** Whether a toolbox may be offered to a hybrid cloud route that has no per-chat allowCloud grant. */
 function isPrivateDataBox(id) { return !CLOUD_SAFE_BOXES.has(id); }
 
@@ -184,7 +192,9 @@ function automaticAdditions({ message, base = [], boxes, connectorBoxes, isWrite
   // #1692: public boxes the chat already used keep going on a follow-up, after the message's own boxes. Never
   // beside a Nextcloud box the message itself asks for (the same rule as automaticBoxesFor: no private text to
   // a search service on a guess).
-  const keep = own.some((id) => id.startsWith('nextcloud-')) ? [] : (Array.isArray(carried) ? carried : []).filter((id) => PUBLIC_BOXES.has(id));
+  // #1702: nor when the turn already carries a Nextcloud box (a project or connector selection).
+  const privateTurn = own.some((id) => id.startsWith('nextcloud-')) || base.some((id) => typeof id === 'string' && id.startsWith('nextcloud-'));
+  const keep = privateTurn ? [] : (Array.isArray(carried) ? carried : []).filter((id) => PUBLIC_BOXES.has(id));
   for (const id of [...own, ...keep]) {
     if (out.length >= max) break;
     if (have.has(id) || out.includes(id) || !byId.has(id)) continue;
@@ -213,8 +223,15 @@ function carriedPublicBoxes({ history, boxes }) {
   for (let i = list.length - 1; i >= 0 && users < CARRY_USER_TURNS; i--) {
     const h = list[i];
     if (!h || typeof h !== 'object') continue;
-    if (h.role === 'user' && typeof h.content === 'string') { users++; for (const id of automaticBoxesFor(h.content)) add(id); }
-    else if ((h.role === 'tool' || h.role === 'function') && typeof h.name === 'string') {
+    if (h.role === 'user' && typeof h.content === 'string') {
+      users++;
+      const ids = automaticBoxesFor(h.content);
+      // #1702: a recent turn about the user's own Nextcloud data: nothing is carried (no note text to a search).
+      if (ids.some((id) => id.startsWith('nextcloud-'))) return [];
+      for (const id of ids) add(id);
+    } else if (h.role === 'tool' || h.role === 'function') {
+      // #1702: a recent private tool result (any tool that is not positively public, writes included): no carry.
+      if (!isPublicToolName(h.name, boxes)) return [];
       for (const b of Array.isArray(boxes) ? boxes : []) {
         if (b && (b.tools || []).some((t) => t?.function?.name === h.name)) add(b.id);
       }
@@ -267,5 +284,5 @@ function createAutomaticToolsReady({ getStorage, originAllowed }) {
 
 module.exports = { toolsModeOf, initialToolsMode, gateSaysToolNeeded, toolCapableRoute, FALLBACK_ROLES,
   automaticBoxesFor, automaticEligible, automaticAdditions, carriedPublicBoxes, CARRY_USER_TURNS, orderWithAdditions, wantsWeb, MAX_ADDED, PUBLIC_BOXES,
-  CLOUD_SAFE_BOXES, PRIVATE_CORE_TOOLS, HEALTH_PUBLIC_BOXES, isPrivateDataBox,
+  CLOUD_SAFE_BOXES, PRIVATE_CORE_TOOLS, HEALTH_PUBLIC_BOXES, isPrivateDataBox, isPublicToolName,
   nextcloudStorageConnected, createAutomaticToolsReady };

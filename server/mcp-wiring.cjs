@@ -94,6 +94,7 @@ function createMcpWiring({
   toolRateLimit = require('./tool-rate-limit.cjs').createToolRateLimit(),
 }) {
   const rateLimit = require('./tool-rate-limit.cjs');
+  const PER_USER_AUTH = new Set(['nextcloud', 'personal', 'oauth']);
   const MCP_SERVERS = servers;
   if (publicFetch && typeof mcp.withFetch !== 'function') throw new TypeError('publicFetch needs an MCP client with withFetch');
   const publicMcp = publicFetch ? mcp.withFetch(publicFetch) : null;
@@ -483,9 +484,9 @@ function createMcpWiring({
     }
 
     if (server.directory && !(await directoryUrlAllowed(server.url))) return `ERROR: ${name} was not run: its server's address no longer resolves to a public host.`;
-    // #1693: a provider that answered 429 is not called again inside its wait. Per server, and per account for a
-    // server whose key is the account's own.
-    const rateKey = `${server.id}\u0000${server.auth === 'personal' || server.auth === 'oauth' ? String(scope.getStore()?.authn?.user?.id || '') : ''}`;
+    // #1693: a provider that answered 429 is not called again inside its wait. Per server, and per account for every
+    // server that sends the account's own credentials (#1701: nextcloud too), so one account never pauses another.
+    const rateKey = `${server.id}\u0000${PER_USER_AUTH.has(server.auth) ? String(scope.getStore()?.authn?.user?.id || '') : ''}`;
     const coolingMs = toolRateLimit.remaining(rateKey);
     if (coolingMs > 0) return rateLimit.coolingDownText(name, coolingMs);
     try {

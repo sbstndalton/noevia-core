@@ -28,8 +28,8 @@ function build({ auth = 'bearer', answer }) {
     bindBoxes: ({ manifest, perServer }) => manifest.map((m) => ({ id: m.id, tools: [...(perServer.get(m.server) || new Map()).values()].map((e) => e.tool), server: m.server })),
     directoryMcp: { asServers: () => [], headersFor: () => ({}), userHeadersFor: (uid) => ({ 'X-Key': `key-${uid}` }), hasUserKey: () => true },
     mcpOAuth: { connected: () => false, tokenFor: async () => null },
-    directoryUrlAllowed: async () => true, credentialOriginAllowed: () => false,
-    scope, storageFor: () => ({ kind: 'local' }), isWriteTool: () => false,
+    directoryUrlAllowed: async () => true, credentialOriginAllowed: () => true,
+    scope, storageFor: (uid) => ({ kind: 'nextcloud', username: `synthetic-${uid}`, secret: 'synthetic-secret', baseUrl: 'https://cloud.example.invalid' }), isWriteTool: () => false,
     internal: { mintToken: () => 'cap' }, internalKey: 'k', reduceToolResult: (text) => ({ text, reduced: false }),
     env: { SYNTH_TOKEN: 'synthetic' }, logger: { log() {}, warn() {} },
     toolRateLimit: createToolRateLimit({ now: () => clock }),
@@ -88,6 +88,7 @@ test('#1693: a per-account key in backoff does not pause another account', async
 
 test('#1693: rate-limit helpers', () => {
   assert.equal(isRateLimitedText('HTTP 429 Too Many Requests'), true);
+  assert.equal(isRateLimitedText('Too Many Requests'), true);
   assert.equal(isRateLimitedText('usage limit reached for this key'), true);
   assert.equal(isRateLimitedText('Rust 1.99.0 released'), false);
   assert.equal(parseRetryAfter('3'), 3000);
@@ -95,4 +96,31 @@ test('#1693: rate-limit helpers', () => {
   const rl = createToolRateLimit({ now: () => 0 });
   for (let i = 0; i < 20; i++) rl.hit('k');
   assert.equal(rl.remaining('k'), MAX_MS, 'the backoff is capped');
+});
+
+test('#1701: a Nextcloud-credential server is throttled per account: one account never pauses another', async () => {
+  const b = build({ auth: 'nextcloud', answer: () => LIMITED });
+  await b.wiring.discoverMcpTools();
+  assert.match(await b.call('user-a'), /was rate limited by its provider/);
+  assert.match(await b.call('user-a'), /was not called/);
+  assert.match(await b.call('user-b'), /was rate limited by its provider/, 'user-b is called with its own credentials');
+  assert.equal(b.calls.length, 2);
+});
+
+test('#1701: a bare 429 in a tool error is not a rate limit; HTTP 429 or status 429 is', () => {
+  assert.equal(isRateLimitedText('ERROR: note 429 not found'), false);
+  assert.equal(isRateLimitedText('ERROR from tool: issue #429 is closed'), false);
+  assert.equal(isRateLimitedText('Request failed with status code 429'), true);
+  assert.equal(isRateLimitedText('upstream answered HTTP 429'), true);
+  assert.equal(isRateLimitedText('status 429'), true);
+});
+
+test('#1701: expired entries are pruned', () => {
+  let clock = 0;
+  const rl = createToolRateLimit({ now: () => clock });
+  rl.hit('a'); rl.hit('b');
+  assert.equal(rl.size(), 2);
+  clock = BASE_MS + MAX_MS + 1;
+  assert.equal(rl.remaining('a'), 0);
+  assert.equal(rl.size(), 0, 'both stale keys are gone, not only the one looked up');
 });
