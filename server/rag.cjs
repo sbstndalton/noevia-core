@@ -349,7 +349,8 @@ async function servedModels(target, { timeoutMs = 10000 } = {}) {
     // #1668: a llama.cpp router lists every preset with status.value; only a loaded one is served.
     // An unloaded preset would be loaded on demand, but nothing has proved it runs, and a switch
     // must never label vectors with a model the server has not actually loaded.
-    if (m?.status && typeof m.status === 'object' && 'value' in m.status && m.status.value !== 'loaded') continue;
+    // #1758: a sleeping model is served too: it ran, and the next request wakes it.
+    if (m?.status && typeof m.status === 'object' && 'value' in m.status && !['loaded', 'sleeping'].includes(m.status.value)) continue;
     if (typeof m?.id === 'string') ids.add(m.id);
     for (const a of Array.isArray(m?.aliases) ? m.aliases : []) if (typeof a === 'string') ids.add(a);
   }
