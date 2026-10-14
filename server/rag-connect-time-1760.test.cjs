@@ -7,6 +7,24 @@ const assert = require('node:assert/strict');
 const http = require('node:http');
 const os = require('node:os');
 
+// tests/hermetic-network.cjs refuses any socket to a NAME, before node's own lookup would run. So, outside it, this
+// does what net does with a `lookup` option: resolve the name through the lookup the request passed (the one under
+// test), then connect to the address that answered; a refusal destroys the socket with that error.
+const net = require('node:net');
+const innerConnect = net.Socket.prototype.connect;
+net.Socket.prototype.connect = function (...args) {
+  const first = Array.isArray(args[0]) ? args[0][0] : args[0];
+  if (first && typeof first === 'object' && typeof first.lookup === 'function' && /\.rebind\.lan$/.test(first.host || '')) {
+    first.lookup(first.host, { all: true }, (err, list) => {
+      if (err) return this.destroy(err);
+      innerConnect.call(this, { ...first, host: list[0].address, lookup: undefined });
+    });
+    return this;
+  }
+  return innerConnect.apply(this, args);
+};
+test.after(() => { net.Socket.prototype.connect = innerConnect; });
+
 function freshRag() { delete require.cache[require.resolve('./rag.cjs')]; return require('./rag.cjs'); }
 
 // The Rust port is not loaded here: "public" is anything that is not the fixture's loopback address.

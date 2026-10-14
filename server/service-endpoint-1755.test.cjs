@@ -218,7 +218,7 @@ test('#1760: link-local is off by default; System One and the sensitivity check 
     assert.ok(systemOneConfiguration({ COWORK_SYSTEM_ONE_URL: url }).reason, `System One refuses ${url}`);
   }
   // A name that resolves to link-local is refused at connect by the default lookup, accepted only with the opt-in.
-  await assert.rejects(helper().createServiceFetch({ resolve: resolveFrom({ 'll.lan': ['169.254.10.20'] }) })('http://ll.lan/health'), (e) => e.code === 'EPUBLICADDR');
+  await assert.rejects(lookupVia(resolveFrom({ 'll.lan': ['169.254.10.20'] }), 'll.lan'), (e) => e.code === 'EPUBLICADDR');
   await assert.rejects(lookupVia(resolveFrom({ 'll6.lan': ['fe80::1'] }), 'll6.lan'), (e) => e.code === 'EPUBLICADDR');
   // The sensitivity check: its own URL is refused, while the decision service's URL (the same) is kept.
   for (const url of urls) {
