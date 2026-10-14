@@ -861,6 +861,8 @@ const chatVaultMirrorRoutes = require('./routes/chat-vault-mirror.cjs').createCh
 for (const [key, id] of [['COWORK_DECISION_MODEL', process.env.COWORK_DECISION_MODEL], ['COWORK_SENSITIVITY_DECISION_MODEL', process.env.COWORK_SENSITIVITY_DECISION_MODEL]]) {
   if (!require('./decision-models.cjs').knownModel(id)) console.warn(`[system-one] ${key} names no known decision model; the Laya contract and wording are used.`);
 }
+// #1745: a Kev host behind COWORK_DECISION_URL with a non-Kev model fails every decision; say so once.
+for (const line of require('./decision-settings.cjs').startupWarnings(process.env)) console.warn(line);
 for (const f of features.describe()) {
   if (['toolGate', 'stepSupervision', 'systemOneRouting', 'chatFraming'].includes(f.id) && f.enabled && f.unavailable) console.warn(`[system-one] ${f.id} is on but cannot run: ${f.unavailable}`);
 }

@@ -11,16 +11,16 @@ const contextDir=fs.mkdtempSync(require('node:path').join(require('node:os').tmp
 test.after(()=>fs.rmSync(contextDir,{recursive:true,force:true}));
 
 async function run({ visionModel, probeStatus = 200, descriptionStatus = 200, missingAsset = false, finishReason = 'stop', cache = new Map(), headers = {}, replacementBytes, userId = 'synthetic-user', projectId = 'fixture-project', native = false,
-  assets = [{ id: 'image-a', name: 'statement.png', mime: 'image/png' }, { id: 'image-b', name: 'copy.png', mime: 'image/png' }], files = [], turnImageIds, expectImages = true, message = 'Read the synthetic total' } = {}) {
-  const events = [], requests = [], nativeCalls=[];let nativeLoaded=null;
+  assets = [{ id: 'image-a', name: 'statement.png', mime: 'image/png' }, { id: 'image-b', name: 'copy.png', mime: 'image/png' }], files = [], turnImageIds, expectImages = true, message = 'Read the synthetic total', projectProviderId, history } = {}) {
+  const events = [], requests = [], urls = [], nativeCalls=[];let nativeLoaded=null;
   const res = new EventEmitter();
   res.writeHead = () => {};
   res.write = line => events.push(JSON.parse(line.slice(6)));
   res.end = () => { res.writableEnded = true; res.emit('finish'); };
   const bytes = replacementBytes || fs.readFileSync(path.join(__dirname, 'fixtures/documents/statement.png'));
   const fetch = async (url, opts) => {
-    assert.equal(url, 'http://fixture.invalid/v1/chat/completions');
-    const body = JSON.parse(opts.body); requests.push(body);nativeLoaded=body.model;
+    assert.ok(['http://fixture.invalid/v1/chat/completions', 'http://second.invalid/v1/chat/completions'].includes(url), url);
+    const body = JSON.parse(opts.body); requests.push(body); urls.push({ url, model: body.model, headers: opts.headers });nativeLoaded=body.model;
     if (!missingAsset && expectImages) assert.ok(events.some(e => e.type === 'status' && /Reading image/.test(e.text)), 'image preparation must be visible before waiting for inference');
     if (body.stream) return { ok: true, body: (async function* () {
       yield Buffer.from('data: ' + JSON.stringify({ choices: [{ delta: { content: 'Synthetic answer' } }] }) + '\n\n');
@@ -37,9 +37,9 @@ async function run({ visionModel, probeStatus = 200, descriptionStatus = 200, mi
     fs: { readFileSync: () => { if (missingAsset) throw new Error('missing fixture'); return bytes; } },
     HISTORY_CAP: 20, DEFAULT_PROVIDER_ID: 'default', createToolExchange,
     currentWorkspace: () => ({ userId, dir:contextDir, assetDir: () => '/synthetic-only' }),
-    getProject: () => ({ id: projectId, model: 'answer-model', assets, files }),
-    skillsIndexFor: () => [], getProvider: () => ({ id: 'default', baseUrl: 'http://fixture.invalid' }),
-    providerHeaders: () => headers, autoRoles: () => visionModel ? { vision: visionModel } : null,
+    getProject: () => ({ id: projectId, model: 'answer-model', assets, files, ...(projectProviderId ? { provider: projectProviderId } : {}) }),
+    skillsIndexFor: () => [], getProvider: (id) => (id && id !== 'default' ? { id, shared: true, label: 'Second engine', baseUrl: 'http://second.invalid' } : { id: 'default', baseUrl: 'http://fixture.invalid' }),
+    providerHeaders: (p) => (p && p.id !== 'default' ? { Authorization: 'Bearer second-key' } : headers), autoRoles: () => visionModel ? { vision: visionModel } : null,
     visionDescriptions: cache, visionProbe: createVisionProbe({ fetchImpl: fetch }),
     chatSkillRouter: { select: async () => ({ loaded: [] }) }, oauthServerIds: () => new Set(), accountReady: () => true, mcpOAuth: { connected: () => false }, chatToolRouter: { select: async (ids) => ({ ids, routed: false }) }, DEFAULT_TOOLBOXES: [],
     CONNECTOR_BOXES: new Set(['gdrive']), connectedBoxes: () => [], toolPolicy: { mode: (_user, _name, write) => (write ? 'ask' : 'allow') }, requestScope: { getStore: () => ({}) },
@@ -59,9 +59,9 @@ async function run({ visionModel, probeStatus = 200, descriptionStatus = 200, mi
     allToolboxes: () => [], executeToolCall: async () => '', chatWideApproved: () => false, awaitApproval: async () => 'decline', recordUsage() {}, recordToolUse() {},
     ...context,
   });
-  await handleChat({}, res, { projectId: 'fixture-project', chatId: 'fixture-chat', message, ...(turnImageIds === undefined ? {} : { turnImageIds }) });
+  await handleChat({}, res, { projectId: 'fixture-project', chatId: 'fixture-chat', message, ...(history ? { history } : {}), ...(turnImageIds === undefined ? {} : { turnImageIds }) });
   assert.ok(events.some(e => e.type === 'done'));
-  return { events, requests, nativeCalls, answer: requests.find(r => r.stream) };
+  return { events, requests, urls, nativeCalls, answer: requests.find(r => r.stream) };
 }
 
 test('image rejection explains mmproj, omits bytes and tells answering model not to guess', async () => {
@@ -170,4 +170,42 @@ test('#1512: a CSV attached to a turn in a project that holds images does not en
   assert.ok(noVisionWork(out), 'the project images are not described for a CSV question');
   assert.equal(readingImages(out), false);
   assert.equal(JSON.stringify(out.answer).includes('data:image'), false);
+});
+
+// #1741: the Vision role model lives on the local default provider. A turn answered by another provider must
+// not send the images to that provider's address under the local Vision model's name; with no description,
+// the answering model gets the images itself if it can see them.
+test('a non-default answering provider gets no image description call (#1741)', async () => {
+  const out = await run({ visionModel: 'vision-model', projectProviderId: 'second' });
+  const describe = out.urls.filter((u) => u.model === 'vision-model');
+  assert.deepEqual(describe, [], 'no description request may be made on an off-box turn');
+  assert.equal(out.urls.some((u) => u.url.startsWith('http://fixture.invalid')), false, 'the default provider is not called either');
+  assert.ok(out.urls.every((u) => u.headers.Authorization === 'Bearer second-key'));
+  assert.equal(out.answer.messages.at(-1).content.filter((c) => c.type === 'image_url').length, 2, 'the answering model sees the images natively');
+});
+
+test('the description runs on the default provider with its own headers on an on-box turn (#1741)', async () => {
+  const out = await run({ visionModel: 'vision-model', headers: { 'X-Local': 'default-only' } });
+  const describe = out.urls.filter((u) => u.model === 'vision-model');
+  assert.equal(describe.length, 1);
+  assert.equal(describe[0].url, 'http://fixture.invalid/v1/chat/completions');
+  assert.equal(describe[0].headers['X-Local'], 'default-only');
+});
+
+// #1742(b): image-derived text (the Vision description, a retrieved image's caption) is put only into the
+// outgoing request's system message; it is never streamed to the client, and the server keeps no history of
+// its own (the replay is built from the client's stored transcript). So an on-box turn's description cannot
+// come back in a later off-box replay.
+test('no image-derived text reaches an off-box replay of an on-box image turn (#1742)', async () => {
+  const DERIVED = 'INV-2042';
+  const first = await run({ visionModel: 'vision-model' });
+  assert.ok(JSON.stringify(first.answer).includes(DERIVED), 'the on-box answer got the description');
+  assert.equal(JSON.stringify(first.events).includes(DERIVED), false, 'no event carries the description to the client');
+  // What the client stores for that turn: its own message and the streamed reply text.
+  const reply = first.events.filter((e) => e.type === 'delta').map((e) => e.text).join('');
+  const history = [{ role: 'user', content: 'Read the synthetic total' }, { role: 'assistant', content: reply }];
+  const second = await run({ visionModel: 'vision-model', projectProviderId: 'second', history, message: 'And the date?', turnImageIds: [], expectImages: false });
+  assert.equal(second.urls.some((u) => u.model === 'vision-model'), false);
+  assert.equal(JSON.stringify(second.answer).includes(DERIVED), false, 'the off-box replay carries no image-derived text');
+  assert.equal(JSON.stringify(second.answer).includes('Fixture image'), false);
 });
