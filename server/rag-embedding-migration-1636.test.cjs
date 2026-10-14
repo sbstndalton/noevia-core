@@ -27,10 +27,12 @@ function vectorFor(model, text) {
   const v = WORDS.map((w) => (t.split(w).length - 1) + 0.01);
   return /gemma/.test(model) ? v.reverse() : v;
 }
-function startServer({ refuse = null } = {}) {
+function startServer({ refuse = null, serves = ['nomic-test', 'gemma-test', 'gemma-test-b'] } = {}) {
   const seen = [];
   const srv = http.createServer(async (req, res) => {
     let raw = ''; for await (const c of req) raw += c;
+    // #1660 review: what the server says it serves (a set-next or switch checks it first).
+    if (req.method === 'GET' && req.url === '/v1/models') { res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify({ data: serves.map((id) => ({ id })) })); return; }
     const body = JSON.parse(raw);
     seen.push({ url: req.url, model: body.model, input: body.input, auth: req.headers.authorization || null });
     if (refuse && body.input.some((t) => refuse(body.model, t))) { res.statusCode = 400; res.end('{"error":"input is too large to process"}'); return; }
@@ -124,7 +126,7 @@ dbTest('re-index without downtime: next fills beside active, switch is atomic, r
     const next = { baseUrl: s.server.url, model: 'gemma-test', profile: 'embeddinggemma-2' };
 
     // Switching before a re-index has covered every project is refused.
-    s.migration.setNext(next);
+    await s.migration.setNext(next);
     await assert.rejects(s.migration.switchToNext(), (e) => e.code === 'notReady' && e.status === 409);
     // While the next model is being built, search still uses the active model only.
     s.server.seen.length = 0;
@@ -169,7 +171,7 @@ dbTest('a vector never outlives the text it was made from (chunk ids are reused)
   try {
     await s.rag.indexProjectFile('p1', 'notes.md', LARGE, USER_A);
     const next = { baseUrl: s.server.url, model: 'gemma-test', profile: 'embeddinggemma-2' };
-    s.migration.setNext(next);
+    await s.migration.setNext(next);
     await s.migration.kick();
     // Rewrite the file: its chunks are dropped and new ones take the freed ids.
     const changed = [para('delta'), para('echo'), para('foxtrot')].join('\n\n');
@@ -192,7 +194,7 @@ dbTest('tenants: each account is re-embedded inside its own index files; removed
     const removedDir = path.join(s.dir, 'users', '33333333-3333-4333-8333-333333333333', 'rag');
     fs.mkdirSync(removedDir, { recursive: true });
     assert.equal(s.rag.listIndexes().length, 2, 'only active accounts are listed');
-    s.migration.setNext({ baseUrl: s.server.url, model: 'gemma-test', profile: 'embeddinggemma-2' });
+    await s.migration.setNext({ baseUrl: s.server.url, model: 'gemma-test', profile: 'embeddinggemma-2' });
     await s.migration.kick();
     await s.migration.switchToNext();
     const a = await s.rag.searchProject('shared-name', 'hotel', USER_A);
@@ -208,7 +210,7 @@ dbTest('an endpoint move of the same model is checked for identical vectors befo
   const other = await startServer();
   try {
     await s.rag.indexProjectFile('p1', 'notes.md', LARGE, USER_A);
-    s.migration.setNext({ baseUrl: other.url, model: 'nomic-test', profile: 'nomic-v1' });
+    await s.migration.setNext({ baseUrl: other.url, model: 'nomic-test', profile: 'nomic-v1' });
     await s.migration.switchToNext();
     assert.equal(s.config.active().baseUrl, other.url.replace(/\/+$/, ''));
     assert.ok(other.seen.length >= 1, 'the parity sample went to the new address');
@@ -222,7 +224,7 @@ dbTest('a chunk the new server refuses is skipped, the rest of the file is fille
   const s = await setup({ refuse: (model, text) => /gemma/.test(model) && /banana/.test(text) && !/query:/.test(text) });
   try {
     await s.rag.indexProjectFile('p1', 'notes.md', LARGE, USER_A);
-    s.migration.setNext({ baseUrl: s.server.url, model: 'gemma-test', profile: 'embeddinggemma-2' });
+    await s.migration.setNext({ baseUrl: s.server.url, model: 'gemma-test', profile: 'embeddinggemma-2' });
     await s.migration.kick();
     const st = s.migration.status();
     assert.ok(st.lastPass.refused >= 1, 'the refused chunk is reported');
@@ -306,7 +308,7 @@ dbTest('clearing the next model mid-fill stops the fill, drops the partial vecto
   const s = await setup({ batch: 1, onPause: async (_ms, count) => { if (count === 1) s.migration.clearNext(); } });
   try {
     await s.rag.indexProjectFile('p1', 'notes.md', LARGE, USER_A);
-    s.migration.setNext({ baseUrl: s.server.url, model: 'gemma-test', profile: 'embeddinggemma-2' });
+    await s.migration.setNext({ baseUrl: s.server.url, model: 'gemma-test', profile: 'embeddinggemma-2' });
     await s.migration.kick();
     assert.equal(s.pauses.length, 1, 'the fill stopped at the first pause, with chunks still to do');
     assert.equal(s.server.seen.filter((x) => /gemma/.test(x.model)).length, 1, 'one gemma batch (of one chunk) was ever sent');
@@ -350,7 +352,7 @@ dbTest('switching drops the vectors of the rollback target it displaces; a rollb
     await s.rag.indexProjectFile('p1', 'notes.md', LARGE, USER_A);
     const gemma = { baseUrl: s.server.url, model: 'gemma-test', profile: 'embeddinggemma-2' };
     const gemmaB = { baseUrl: s.server.url, model: 'gemma-test-b', profile: 'embeddinggemma-2' };
-    s.migration.setNext(gemma);
+    await s.migration.setNext(gemma);
     await s.migration.kick();
     await s.migration.switchToNext(); // active gemma-test, previous nomic-test
     const db = openDb(s.dir, USER_A, 'p1');
@@ -358,7 +360,7 @@ dbTest('switching drops the vectors of the rollback target it displaces; a rollb
       assert.deepEqual(slotModels(db), ['gemma-test', 'nomic-test']);
 
       // A rollback leaves no partly built next behind.
-      s.migration.setNext(gemmaB);
+      await s.migration.setNext(gemmaB);
       await s.migration.kick();
       assert.deepEqual(slotModels(db), ['gemma-test', 'gemma-test-b', 'nomic-test']);
       s.migration.rollback(); // active nomic-test, previous gemma-test, next abandoned
@@ -367,7 +369,7 @@ dbTest('switching drops the vectors of the rollback target it displaces; a rollb
       assert.deepEqual(slotModels(db), ['gemma-test', 'nomic-test'], 'gemma-test-b was only half built and is dropped');
 
       // Going forward again: the older previous (gemma-test) is displaced when nomic-test's successor takes over.
-      s.migration.setNext(gemmaB);
+      await s.migration.setNext(gemmaB);
       await s.migration.kick();
       await s.migration.switchToNext(); // active gemma-test-b, previous nomic-test; gemma-test displaced
       assert.equal(s.config.previous().model, 'nomic-test');

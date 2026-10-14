@@ -66,7 +66,7 @@ function statsRustOwned(env) {
   return env.NOEVIA_FRONT === 'rust' && env.NOEVIA_RUST_AUTH === '1' && env.NOEVIA_RUST_AUTH_CONFIRMED === '1'
     && env.NOEVIA_RUST_STATS === '1' && env.NOEVIA_RUST_STATS_CONFIRMED === '1';
 }
-function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag.cjs').servedModels(target), json, readBody, readJson, fetchJson, env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe, reportedTokenRate, missingRoles, currentWorkspace, service, inferenceBudget = null, sweepGuardOptions = {} }) {
+function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag.cjs').servedModelsCached(target), json, readBody, readJson, fetchJson, env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe, reportedTokenRate, missingRoles, currentWorkspace, service, inferenceBudget = null, sweepGuardOptions = {} }) {
   const { modelScanCache, refreshModelScan, autoRoles, setAutoRoles, ensureRolesLoaded, servedCatalogue, modelsInstalled, deriveUserModelName, lastLoadedModel, clearLastLoadedModel, clearRoleReferences } = service;
   // #1461: the installed list is shared for a moment (service.modelsInstalled). A decision that must confirm
   // the engine's state right now (a delete that checks the model exists, a load that checks it is not missing)
@@ -557,9 +557,12 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       try { embedding = require('../embedding-config.cjs').current()?.get() || null; } catch { embedding = null; }
       const { modelAssignments } = require('../model-assignments.cjs');
       const admin = authn.user.role === 'admin';
-      // Which models the active embeddings server serves (admins only: members get no switch).
+      // Which models the active embeddings server serves (admins only: members get no switch, and
+      // never cause a probe). Cached per address with a short timeout (rag.servedModelsCached);
+      // null = unknown. Advisory only: set-next checks the server itself.
       let served = null;
       if (admin) { try { served = await servedEmbeddingModels({ baseUrl: embedding?.active?.baseUrl || null }); } catch { served = null; } }
+      if (!Array.isArray(served)) served = null;
       return json(res, 200, { ...modelAssignments({ installed, env, embedding, isSystem: (n) => isSystemModel(n), admin, served }), available: Array.isArray(installed) });
     }
 

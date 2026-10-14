@@ -137,5 +137,26 @@ test('#1660 review: an embedding option is marked served only when the embedding
   assert.deepEqual(embed.options.map((o) => [o.model, o.served]), [['embeddinggemma-2', true], ['bge-m3', false]]);
   const down = routes({ installed, env: { EMBEDDING_MODEL: 'nomic-embed-text-v1' }, served: async () => { throw new Error('down'); } });
   await down.call('GET', '/api/models/assignments');
-  assert.ok(down.sent.pop().body.services.find((s) => s.id === 'embedding').options.every((o) => o.served === false), 'unreadable: nothing is offered');
+  assert.ok(down.sent.pop().body.services.find((s) => s.id === 'embedding').options.every((o) => o.served === null), 'unreadable: unknown, not "not served"');
+});
+
+test('#1660 review: served is matched like a switch (name:latest, case) and members never cause a probe', async () => {
+  const installed = [{ name: 'nomic-embed-text-v1', labels: ['embeddings'] }, { name: 'embeddinggemma-2', labels: ['embeddings'] }, { name: 'bge-m3', labels: ['embeddings'] }];
+  let probes = 0;
+  const served = async () => { probes += 1; return ['nomic-embed-text-v1', 'EmbeddingGemma-2:latest']; };
+  const a = routes({ installed, env: { EMBEDDING_MODEL: 'nomic-embed-text-v1' }, served });
+  await a.call('GET', '/api/models/assignments');
+  const embed = a.sent.pop().body.services.find((s) => s.id === 'embedding');
+  assert.deepEqual(embed.options.map((o) => [o.model, o.served]), [['embeddinggemma-2', true], ['bge-m3', false]]);
+  assert.equal(probes, 1);
+  const m = routes({ installed, env: { EMBEDDING_MODEL: 'nomic-embed-text-v1' }, served, role: 'member' });
+  await m.call('GET', '/api/models/assignments');
+  const member = m.sent.pop();
+  assert.equal(member.status, 200);
+  assert.equal(member.body.services.find((s) => s.id === 'embedding').options, undefined, 'members get no options');
+  assert.equal(probes, 1, 'a member never triggers the embeddings server probe');
+  // A non-list answer (a broken stub) reads unknown.
+  const odd = routes({ installed, env: { EMBEDDING_MODEL: 'nomic-embed-text-v1' }, served: async () => ({ data: [] }) });
+  await odd.call('GET', '/api/models/assignments');
+  assert.ok(odd.sent.pop().body.services.find((s) => s.id === 'embedding').options.every((o) => o.served === null));
 });

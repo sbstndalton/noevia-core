@@ -19,6 +19,8 @@
 // name that does not resolve, is refused. Cloud models are reached as chat providers, never as the
 // embedding server.
 
+const { checkServed } = require('../embedding-served.cjs');
+
 const PASS = Symbol('unhandled');
 const ACTIONS = new Set(['set-next', 'clear-next', 'switch', 'rollback', 'finish']);
 const SCOPES = new Set(['all', 'projects', 'diary']);
@@ -50,13 +52,13 @@ function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJs
 
   async function projects(action, body) {
     try {
-      if (action === 'set-next') return migration.setNext(body.target);
+      if (action === 'set-next') return await migration.setNext(body.target);
       if (action === 'clear-next') return migration.clearNext();
       if (action === 'switch') return await migration.switchToNext({ force: body.force === true });
       if (action === 'rollback') return migration.rollback();
       return migration.finish();
     } catch (err) {
-      return { error: String(err?.message || err).slice(0, 300), status: err?.status || 500, ...(err?.code ? { code: err.code } : {}), ...(err?.coverage ? { coverage: err.coverage } : {}), ...(err?.parity ? { parity: err.parity } : {}) };
+      return { error: String(err?.message || err).slice(0, 300), status: err?.status || 500, ...(err?.code ? { code: err.code } : {}), ...(err?.coverage ? { coverage: err.coverage } : {}), ...(err?.parity ? { parity: err.parity } : {}), ...(err?.served ? { served: err.served } : {}) };
     }
   }
 
@@ -86,15 +88,22 @@ function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJs
         }
       }
     }
-    // #1660 review: the projects' embeddings server must really serve the target model. A
-    // single-model server embeds any name with its own model, so vectors would be stored under the
-    // wrong identity; refuse unless its /v1/models lists the target (no override: that is corrupt data).
-    if (action === 'set-next' && scope !== 'diary') {
+    // #1660 review: every embeddings server this choice reaches must really serve the target model.
+    // A single-model server embeds any name with its own model, so vectors would be stored under the
+    // wrong identity; refuse unless its /v1/models lists the target (no override: that is corrupt
+    // data). The projects use target.baseUrl, the Diary target.diaryBaseUrl ?? target.baseUrl (as
+    // sent below); each different address is asked, before anything changes on either side. The
+    // migration layer checks the projects' side again (it also guards switch and start-up).
+    if (action === 'set-next') {
       const model = String(body.target.model || '').trim();
-      let ids = null;
-      try { ids = await servedModels({ baseUrl: String(body.target.baseUrl || '').trim() || null, model }); } catch { ids = null; }
-      if (!ids) return json(res, 409, { error: 'Could not confirm which models the embeddings server serves.', code: 'endpointUnverified' });
-      if (!ids.includes(model)) return json(res, 409, { error: `The embeddings server does not serve ${model.slice(0, 120)}.`, code: 'modelNotServed', served: ids.slice(0, 20) });
+      const addr = (v) => String(v ?? '').trim() || null;
+      const addresses = new Set();
+      if (scope !== 'diary') addresses.add(addr(body.target.baseUrl));
+      if (scope !== 'projects') addresses.add(addr(body.target.diaryBaseUrl ?? body.target.baseUrl));
+      for (const baseUrl of addresses) {
+        const r = await checkServed(servedModels, { baseUrl, model });
+        if (!r.ok) return json(res, 409, { error: r.error, code: r.code, ...(r.served ? { served: r.served } : {}) });
+      }
     }
     const out = {};
     if (scope !== 'diary') out.projects = await projects(action, body);

@@ -29,3 +29,20 @@ test('a model neither the env nor the saved configuration names is not protected
   config.install(fake('saved', 'embeddinggemma-2'));
   assert.equal(isSidecarModel('some-other-embedder', env), false);
 });
+
+test('a real saved configuration switched away from the env model (and reloaded) STILL protects the env-named model', () => {
+  const fs = require('node:fs'); const os = require('node:os'); const path = require('node:path');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'seed-1660-'));
+  const stateFile = path.join(dir, 'embedding-config.json');
+  try {
+    const first = config.createEmbeddingConfig({ env, stateFile, log: () => {} });
+    first.setNext({ model: 'embeddinggemma-2', profile: 'embeddinggemma-2' });
+    first.switchToNext();
+    first.finish(); // nomic is no longer active, next or previous in the saved configuration
+    const reloaded = config.createEmbeddingConfig({ env, stateFile, log: () => {} });
+    assert.deepEqual([reloaded.get().source, reloaded.active().model, reloaded.previous()], ['saved', 'embeddinggemma-2', null]);
+    config.install(reloaded);
+    assert.equal(isSidecarModel('nomic-embed-text-v1', env), true, 'the compose-started sidecar still loads the env model');
+    assert.equal(isSidecarModel('embeddinggemma-2', env), true);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
