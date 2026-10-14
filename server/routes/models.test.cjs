@@ -784,6 +784,19 @@ test('the inference budget is read with each model\'s estimate and saved by an a
   assert.deepEqual(engineDown.sent.pop().body, { budgetGib: 12, source: 'deployment', minGib: 2, maxGib: 25, models: null, estimateError: 'engine' });
 });
 
+// #1708: a model whose file was deleted is left out of the budget table, like the Models tab (#1695).
+test('#1708 the inference budget leaves out models whose file is missing', async () => {
+  const inferenceBudget = { get: () => ({ budgetGib: 12, source: 'deployment', minGib: 2, maxGib: 25 }) };
+  const rows = [{ model: 'chat-syn', loaded: true, fits: true, estimate: { totalGib: 6.2 } }, { model: 'gone-chat', loaded: false, fits: null, estimate: null }, { model: 'gone-rerank', loaded: false, fits: null, estimate: null }, { model: 'unlisted', loaded: false, fits: null, estimate: null }];
+  const installed = [{ name: 'chat-syn', loaded: true, missingFile: false }, { name: 'gone-chat', missingFile: true }, { name: 'gone-rerank', missingFile: true }];
+  const f = fixture({ inferenceBudget, modelsInstalled: async () => installed, manager: { inferenceEstimates: async () => ({ ok: true, status: 200, body: { budgetGib: 12, models: rows } }) } });
+  await f.call('GET', '/api/models/inference-budget', undefined, 'admin');
+  assert.deepEqual(f.sent.pop().body.models.map((m) => m.model), ['chat-syn', 'unlisted']);
+  const listDown = fixture({ inferenceBudget, modelsInstalled: async () => { throw new Error('down'); }, manager: { inferenceEstimates: async () => ({ ok: true, status: 200, body: { budgetGib: 12, models: rows } }) } });
+  await listDown.call('GET', '/api/models/inference-budget', undefined, 'admin');
+  assert.equal(listDown.sent.pop().body.models.length, 4, 'an unreadable installed list leaves every row');
+});
+
 test('a benchmark of an over-budget model is refused before the model manager loads it', async () => {
   const refusal = { error: 'big needs about 30 GiB to load', code: 'inference_budget', budgetGib: 12 };
   const f = fixture({ env: { MODEL_LOADER_URL: 'http://loader' }, catalogue: [{ name: 'small' }, { name: 'big' }],
