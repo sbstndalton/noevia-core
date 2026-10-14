@@ -21,7 +21,7 @@ const PASS = Symbol('unhandled');
  * @param {string} deps.DIARY_BASE
  * @param {() => object} deps.diaryHeaders
  * @param {{ diaryEnabled: (userId:string) => boolean }} deps.authService
- * @param {{ ragAvailable: () => boolean, retrievalStatus: () => Promise<'available'|'degraded'|'unavailable'> }} deps.rag
+ * @param {{ ragAvailable: () => boolean, retrievalStatus: () => Promise<'available'|'degraded'|'off'|'unavailable'> }} deps.rag
  */
 function createHealthRoutes({ json, fetchJson, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, DIARY_BASE, diaryHeaders, authService, rag }) {
   async function handle(req, res, { path: p, authn }) {
@@ -45,6 +45,7 @@ function createHealthRoutes({ json, fetchJson, getProvider, providerHeaders, DEF
         ragAvailable: rag.ragAvailable(),
         // Tri-state (#340): 'available' | 'degraded' (index installed, embedding endpoint
         // unreachable — small files and source excerpts still reach the model) | 'unavailable'.
+        // #1668: 'off' when an administrator turned the embedding service off.
         retrieval: retrieval.status === 'fulfilled' ? retrieval.value : 'unavailable',
       });
     }
