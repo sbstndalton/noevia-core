@@ -44,6 +44,9 @@ function takeTurn(lane,{signal,urgent}){
  *  caller's abort rejects the caller at once but leaves the lane held until the exchange settles. */
 async function inTurn(lane,{signal,urgent=false},run,holdMaxMs){
   const release=await takeTurn(lane,{signal,urgent});
+  // #1592: a caller that aborted after its turn was granted, before this line ran, sends nothing: the lane
+  // goes to the next request at once instead of being held up to the cap for a decision nobody reads.
+  if(signal?.aborted){ release(); throw abandoned(); }
   const hold=new AbortController();
   const cap=setTimeout(()=>hold.abort(),holdMaxMs);
   const sent=run(hold.signal).finally(()=>{ clearTimeout(cap); release(); });
@@ -124,4 +127,4 @@ function createDecisionEndpoint({ env=process.env, fetchImpl=globalThis.fetch, h
     }
   };
 }
-module.exports={configuration,createDecisionEndpoint,SLOT_HOLD_MAX_MS};
+module.exports={configuration,createDecisionEndpoint,SLOT_HOLD_MAX_MS,_test:{inTurn}};

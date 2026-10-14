@@ -50,6 +50,18 @@ test('the fixtures are present when required', () => {
   if (process.env.REAL_GGUF_HEADERS_REQUIRED === '1') assert.ok(manifest.length >= 3);
 });
 
+// Each fetched header must be the pinned file: revision and total size match tools/fetch-real-gguf-headers.cjs.
+// Only with fetched fixtures: the image build copies tests/ but not tools/.
+test('every manifest entry matches its pinned source', { skip: !have && 'real GGUF headers not fetched' }, () => {
+  const { SOURCES } = require('../../tools/fetch-real-gguf-headers.cjs');
+  for (const entry of manifest) {
+    const pin = SOURCES.find((s) => s.name === entry.name);
+    assert.ok(pin, `${entry.name} is a pinned source`);
+    assert.equal(entry.revision, pin.revision, `${entry.name} revision`);
+    assert.equal(entry.totalSize, pin.size, `${entry.name} totalSize`);
+  }
+});
+
 for (const entry of manifest) {
   test(`${entry.name}: the real header is not refused by the byte budget and equals the JS summary`, { skip }, (t) => {
     const file = path.join(dir, `${entry.name}.gguf`);

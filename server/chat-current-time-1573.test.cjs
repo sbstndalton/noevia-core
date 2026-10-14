@@ -98,3 +98,29 @@ test('#1644: the router never reads the server date block, but still reads the r
   assert.match(systemText(r), /ROUTER-MARKER/, 'the fixture project instructions reach the model');
   assert.match(text, /ROUTER-MARKER/, 'the router still reads the rest of the system text');
 });
+
+// #1587: the zone name says where the server is; a provider off this box gets the day without it.
+test('#1587: a non-default provider gets the date line without the server time-zone name', async (t) => {
+  const r = await run(t, {}, { project: { provider: 'cloud-fixture' }, deps: { getProvider: (id) => ({ id, baseUrl: `http://${id}.invalid` }) } });
+  assert.equal(r.requests.length, 1);
+  assert.match(systemText(r), /Today is [A-Z][a-z]+, \d{1,2} [A-Z][a-z]+ \d{4}\.\n/);
+  assert.doesNotMatch(systemText(r), /Today is [^\n]*\(/, 'no zone name in parentheses');
+  assert.match(systemText(r), /Calendar facts, computed by the server/, 'the rest of the date block is unchanged');
+});
+
+test('#1587: the local default provider keeps the zone name', async (t) => {
+  const r = await run(t, {});
+  assert.match(systemText(r), /Today is [^\n]*\([A-Za-z_]+(?:\/[A-Za-z_+-]+)*\)\./);
+});
+
+// #1604: an Auto turn routed to Code gets the correctness note for commands; Fast and Smart do not.
+test('#1604: a turn routed to the Code role carries the command-correctness note', async (t) => {
+  const { CODE_ROUTE_NOTE } = require('./chat.cjs');
+  const auto = (role) => ({ routing: 'auto', project: { routing: 'auto' }, deps: { autoRoles: () => ({ fast: 'answer-model', smart: 'answer-model', code: 'answer-model' }), classifyFastOrSmart: async () => role } });
+  const code = await run(t, { message: 'Write a bash one-liner that lists the 5 largest files.' }, auto('code'));
+  assert.equal(code.requests.length, 1);
+  assert.ok(systemText(code).endsWith(CODE_ROUTE_NOTE), systemText(code).slice(-300));
+  assert.match(CODE_ROUTE_NOTE, /directories must not appear/);
+  const fast = await run(t, { message: 'Hello' }, auto('fast'));
+  assert.equal(systemText(fast).includes(CODE_ROUTE_NOTE), false);
+});

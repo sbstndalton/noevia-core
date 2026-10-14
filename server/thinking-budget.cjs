@@ -51,13 +51,14 @@ function readerOf(body) {
  * Wraps a streamed chat response. It passes through until the reasoning in it passes `cap` tokens
  * while it has no answer or tool text yet; then the upstream is cancelled, `onCut` runs, `retry()`
  * (a Promise<Response> for the forced-answer request) is streamed in its place, and a failed retry
- * errors the stream rather than ending it quietly.
+ * errors the stream rather than ending it quietly. A stream that ends (or sends [DONE]) with
+ * reasoning only is treated the same way once (#1477); `onCut(reason)` gets 'cap' or 'no-answer'.
  */
 function capReasoning(response, { cap, retry, onCut = () => {} }) {
   const limitChars = cap * CHARS_PER_TOKEN;
   const decoder = new TextDecoder();
   let reader = readerOf(response.body);
-  let buffer = '', reasoningChars = 0, answered = false, forced = false;
+  let buffer = '', reasoningChars = 0, answered = false, forced = false, ended = false;
 
   // Reads the complete SSE lines in `value`; true when this chunk takes the reasoning past the cap.
   function overCap(value) {
@@ -67,6 +68,7 @@ function capReasoning(response, { cap, retry, onCut = () => {} }) {
       const line = buffer.slice(0, at).trim();
       buffer = buffer.slice(at + 1);
       if (!line.startsWith('data:')) continue;
+      if (line.slice(5).trim() === '[DONE]') { ended = true; continue; }
       let delta;
       try { delta = JSON.parse(line.slice(5).trim())?.choices?.[0]?.delta; } catch { continue; }
       if (!delta) continue;
@@ -91,13 +93,36 @@ function capReasoning(response, { cap, retry, onCut = () => {} }) {
         }
         let read;
         try { read = await reader.read(); } catch (error) { controller.error(error); return; }
-        if (read.done) { controller.close(); return; }
-        if (forced || !overCap(read.value)) { controller.enqueue(read.value); return; }
-        forced = true;
-        await reader.cancel().catch(() => {});
-        onCut();
-        retryDue = true;
-        controller.enqueue(CUT_MARK);
+        // #1477: a stream that ends with reasoning and no answer or tool call (a small model can
+        // stop after a few seconds of thought, far under its cap) gets the same one forced answer.
+        const reasoningOnly = () => !forced && !answered && reasoningChars > 0;
+        if (read.done) {
+          if (!reasoningOnly()) { controller.close(); return; }
+          forced = true; onCut('no-answer'); retryDue = true; controller.enqueue(CUT_MARK); return;
+        }
+        if (forced) { controller.enqueue(read.value); return; }
+        if (overCap(read.value)) {
+          forced = true;
+          await reader.cancel().catch(() => {});
+          onCut('cap');
+          retryDue = true;
+          controller.enqueue(CUT_MARK);
+          return;
+        }
+        if (ended && reasoningOnly()) {
+          // The [DONE] of a reasoning-only reply is held back, so the reader does not stop before
+          // the answer: everything before it is passed on, then the answer is requested.
+          const text = decoder.decode(read.value);
+          const at = text.search(/^data:\s*\[DONE\]/m);
+          if (at > 0) controller.enqueue(new TextEncoder().encode(text.slice(0, at)));
+          forced = true;
+          await reader.cancel().catch(() => {});
+          onCut('no-answer');
+          retryDue = true;
+          controller.enqueue(CUT_MARK);
+          return;
+        }
+        controller.enqueue(read.value);
         return;
       }
     },
