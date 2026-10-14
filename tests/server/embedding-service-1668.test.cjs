@@ -481,3 +481,77 @@ test('#1679 a Diary-only finish also syncs the service, so the old model leaves 
     assert.deepEqual(loader.state.puts.at(-1), ['embeddinggemma-2'], 'the Diary finish dropped nomic from the service');
   } finally { h.migration.stop(); }
 });
+
+// ── #1681: off waits for the Diary's half of a switch too ─────────────────────────────────────
+
+test('#1681 turning off is refused while the Diary is still mid-switch, even when projects finished', async () => {
+  const loader = fakeLoader();
+  const svc = await installService(loader);
+  const diary = fakeDiary({ notReadyOnSwitch: true });
+  const h = harness(loader, { diary });
+  const routes = h.routesFor(svc);
+  try {
+    assert.equal((await post(routes, { action: 'service-switch', model: 'embeddinggemma-2', profile: 'embeddinggemma-2' })).status, 200);
+    await post(routes, { action: 'switch' }); // projects switch; the Diary is not ready yet
+    assert.equal((await post(routes, { action: 'finish', scope: 'projects' })).status, 200);
+    assert.equal(h.config.next(), null);
+    assert.equal(h.config.previous(), null, 'the projects side is finished');
+    assert.ok(diary.state.next, 'the Diary still has its next target');
+    const putsBefore = loader.state.puts.length;
+    const r = await post(routes, { action: 'service-off' });
+    assert.equal(r.status, 409, JSON.stringify(r.body));
+    assert.equal(r.body.code, 'finishFirst');
+    assert.equal(loader.state.puts.length, putsBefore, 'the service was not stopped');
+    // The Diary finished the switch but keeps its rollback target: still refused.
+    diary.state.previous = diary.state.active; diary.state.active = diary.state.next; diary.state.next = null;
+    assert.equal((await post(routes, { action: 'service-off' })).body.code, 'finishFirst');
+    diary.state.previous = null;
+    assert.equal((await post(routes, { action: 'service-off' })).status, 200);
+    assert.deepEqual(loader.state.puts.at(-1), []);
+  } finally { h.migration.stop(); }
+});
+
+test('#1681 turning off is refused when the configured Diary cannot be read', async () => {
+  const loader = fakeLoader();
+  const svc = await installService(loader);
+  const diary = fakeDiary();
+  diary.handle = () => ({ ok: false, status: 502, body: { error: 'down' } });
+  const h = harness(loader, { diary });
+  try {
+    const r = await post(h.routesFor(svc), { action: 'service-off' });
+    assert.equal(r.status, 409, JSON.stringify(r.body));
+    assert.equal(r.body.code, 'diaryUnknown');
+    assert.deepEqual(loader.state.puts, []);
+  } finally { h.migration.stop(); }
+});
+
+test('#1681 with no Diary configured, turning off is not blocked by it', async () => {
+  const loader = fakeLoader();
+  const svc = await installService(loader);
+  const config = createEmbeddingConfig({ env: { EMBEDDING_MODEL: 'nomic-embed-text-v1', EMBEDDING_BASE_URL: `${SVC}/v1` }, log: () => {} });
+  const migration = createEmbeddingMigration({ config, rag: fakeRag(loader.state), env: {}, sleep: async () => {}, log: () => {} });
+  const routes = createEmbeddingRoutes({ json: (res, status, body) => { res.status = status; res.body = body; return true; }, readJson: async (req) => req.body, migration, authService: { audit: () => {} },
+    fetchJson: async () => { throw new Error('no Diary here'); }, service: svc });
+  try {
+    const r = await post(routes, { action: 'service-off' });
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    assert.deepEqual(loader.state.puts.at(-1), []);
+  } finally { migration.stop(); }
+});
+
+// ── #1683: a Diary target on its default server may be the service ────────────────────────────
+
+for (const base of ['', null]) {
+  test(`#1683 a Diary target with base_url ${JSON.stringify(base)} (its default server) keeps its model on the service`, async () => {
+    const loader = fakeLoader({ models: [NOMIC, GEMMA] });
+    const svc = await installService(loader);
+    const diary = fakeDiary();
+    diary.state.active = { base_url: base, model: 'embeddinggemma-2', profile: 'embeddinggemma-2' };
+    const h = harness(loader, { diary });
+    try {
+      const r = await post(h.routesFor(svc), { action: 'clear-next', scope: 'projects' }); // any sync
+      assert.equal(r.status, 200, JSON.stringify(r.body));
+      assert.deepEqual(loader.state.puts.at(-1), ['nomic-embed-text-v1', 'embeddinggemma-2'], 'the Diary\'s default-server model stays served');
+    } finally { h.migration.stop(); }
+  });
+}
