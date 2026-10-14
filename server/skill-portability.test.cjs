@@ -571,3 +571,20 @@ test('skill-history (#546 review): at the cap, versions still enabled are evicte
     assert.deepEqual(kept, ['a', 'c', 'd'], 'the oldest enabled version went, the revoked one stayed');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('history (#546, #1704): on a cloud provider neither a revoked skill nor a private tool entry reaches the request', async (t) => {
+  const dir = account(t);
+  const fixture = project({ content: body({ text: A_TEXT }) });
+  const readOut = skills.read(fixture, fixture.files[0], fixture);
+  const turn1 = await run(t, { fixture, dir, router: noRouter, rounds: [{ tool: 'read_project_file', args: { name: FILE } }, { content: echo }], onExecute: (name) => (name === 'read_project_file' ? readOut : null) });
+  assert.equal(errorOf(turn1), undefined);
+  disable(fixture);
+  const cloud = { id: 'cloud-x', label: 'Synthetic cloud', baseUrl: 'https://cloud.example.invalid', external: true };
+  fixture.provider = cloud.id;
+  const history = [...readHistory(readOut), { role: 'tool', name: 'nc_notes_search_notes', content: 'SYNTHETIC-NOTES-1704' }];
+  const turn2 = await run(t, { fixture, dir, provider: cloud, router: noRouter, reqBody: { message: 'second synthetic question', history } });
+  assert.equal(turn2.requests.length, 1);
+  const all = JSON.stringify(turn2.requests[0].messages);
+  for (const marker of [...A_MARKERS, 'SYNTHETIC-NOTES-1704']) assert.equal(all.includes(marker), false, `no "${marker}" upstream`);
+  assert.match(all, /was disabled or changed/);
+});

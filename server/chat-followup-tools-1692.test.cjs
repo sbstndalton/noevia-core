@@ -312,3 +312,15 @@ test('#1703: a private read labelled declined carries no content to the cloud', 
   assert.doesNotMatch(text, new RegExp(SECRET_1703));
   assert.match(text, /did not approve nc_notes_search_notes/);
 });
+
+test('#1704: an applied entry under an unknown tool name sends no name to the cloud; a known private tool is named', async (t) => {
+  const turn = (name) => [{ role: 'user', content: 'Do it.' }, { role: 'assistant', content: 'Done.' }, { role: 'tool', name, content: 'x', applied: true }];
+  const unknown = await run(t, { message: 'And?', provider: MEMBER_CLOUD, project: ON_CLOUD, history: turn('user_ssn_123456789') });
+  assert.doesNotMatch(wireText(unknown), /user_ssn_123456789|123456789/);
+  assert.match(wireText(unknown), /\(a change was applied with a tool\)/);
+  const declined = await run(t, { message: 'And?', provider: MEMBER_CLOUD, project: ON_CLOUD,
+    history: [...turn('user_ssn_123456789').slice(0, 2), { role: 'tool', name: 'user_ssn_123456789', content: 'x', declined: true }] });
+  assert.doesNotMatch(wireText(declined), /123456789/);
+  const known = await run(t, { message: 'And?', provider: MEMBER_CLOUD, project: ON_CLOUD, history: turn('nc_notes_search_notes') });
+  assert.match(wireText(known), /\(a change was applied with nc_notes_search_notes\)/);
+});
