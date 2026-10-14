@@ -75,6 +75,9 @@ function createEmbeddingMigration({ config, rag, env = process.env, sleep = (ms)
   // from EMBEDDING_NEXT_MODEL at start-up, or saved before this check existed) is checked before
   // the first pass and held back, pending, until it is served. A switch always checks afresh.
   const verified = new Map(); // key of a next target seen served -> when (now()) it was last seen
+  // #1672: next targets that had vectors written since their last good check. Kept apart from
+  // `verified` (which a transient check failure clears) so a later modelNotServed still drops them.
+  const writtenSince = new Set();
   let nextHeld = null; // { key, code, error } why the current next is not being indexed
   const keyOf = (t) => (t ? `${t.profile}\u0000${t.model}\u0000${t.baseUrl || ''}` : '');
   const check = (t) => checkServed(servedModels, t);
@@ -90,12 +93,14 @@ function createEmbeddingMigration({ config, rag, env = process.env, sleep = (ms)
     if (fresh(next)) return true;
     const wasVerified = verified.has(keyOf(next));
     const r = await check(next);
-    if (r.ok) { verified.set(keyOf(next), now()); if (nextHeld?.key === keyOf(next)) log(`[embedding] ${next.model} is served now; re-indexing.`); nextHeld = null; return true; }
+    if (r.ok) { verified.set(keyOf(next), now()); writtenSince.delete(keyOf(next)); if (nextHeld?.key === keyOf(next)) log(`[embedding] ${next.model} is served now; re-indexing.`); nextHeld = null; return true; }
     if (!sameTarget(config.next(), next)) return false; // changed meanwhile: the next pass checks that one
     verified.delete(keyOf(next));
     const changed = nextHeld?.key !== keyOf(next) || nextHeld.code !== r.code;
     nextHeld = { key: keyOf(next), code: r.code, error: r.error };
-    if (wasVerified && r.code === 'modelNotServed') {
+    const written = writtenSince.has(keyOf(next));
+    if ((wasVerified || written) && r.code === 'modelNotServed') {
+      writtenSince.delete(keyOf(next));
       // #1672: the server now serves another model, so vectors written since the last good check may
       // be that model's. Drop the partial slot; it is rebuilt once the next model is served again.
       log(`[embedding] the embeddings server no longer serves ${next.model}; re-index paused and its partial vectors dropped for a rebuild.`);
@@ -117,6 +122,7 @@ function createEmbeddingMigration({ config, rag, env = process.env, sleep = (ms)
       const r = await rag.fillMissing(entry, target, { limit: batch, exclude: refused, isCurrent: () => !stopped && config.version() === version });
       if (!r) return { embedded, unavailable: true };
       embedded += r.embedded;
+      if (r.embedded && isNext(target)) writtenSince.add(keyOf(target));
       for (const id of r.refused || []) refused.add(id);
       if (!r.attempted || r.remaining === 0) return { embedded, refused: refused.size };
       // Nothing stored and nothing newly refused (e.g. the server returned the wrong width): do not spin.
@@ -280,6 +286,7 @@ function createEmbeddingMigration({ config, rag, env = process.env, sleep = (ms)
   }
 
   function dropEverywhere(target) {
+    writtenSince.delete(keyOf(target));
     for (const entry of rag.listIndexes()) {
       try { rag.dropIndexSlot(entry, target); } catch (err) { log(`[embedding] could not drop ${target.model} from an index (${err.message})`); }
     }

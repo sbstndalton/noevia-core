@@ -73,3 +73,26 @@ test('strict mode still reports active and finished jobs exactly as list() does'
     assert.deepEqual(jobs.list({ strict: true }), jobs.list());
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('a journal with no readable events (0 bytes, or one torn line) is unknown in strict mode', () => {
+  for (const body of ['', '{"job":"x","seq":1,']) {
+    const dir = tmp();
+    try {
+      const jobs = createJobs({ dir });
+      jobs.create({ kind: 'code' });
+      fs.writeFileSync(path.join(dir, 'jobs', '00000000-0000-4000-8000-000000000000.jsonl'), body);
+      assert.throws(() => jobs.list({ strict: true, active: true }), unknown, JSON.stringify(body));
+      assert.equal(jobs.list().length, 1, 'the lenient list still skips it');
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  }
+});
+
+test('a .jsonl whose name is not a job id (e.g. a 0-byte x.jsonl) is unknown in strict mode', () => {
+  const dir = tmp();
+  try {
+    const jobs = createJobs({ dir });
+    jobs.create({ kind: 'code' });
+    fs.writeFileSync(path.join(dir, 'jobs', 'x.jsonl'), '');
+    assert.throws(() => jobs.list({ strict: true }), unknown);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});

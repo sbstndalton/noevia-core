@@ -413,6 +413,7 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
     for (const d of entries) {
       if (!d.name.endsWith('.jsonl')) continue;
       if (!d.isFile()) refuse('a job journal that is not a regular file');
+      if (!/^[0-9a-f-]{36}$/.test(d.name.slice(0, -6))) refuse('a job journal whose name is not a job id');
       out.push(d.name.slice(0, -6));
     }
     return out;
@@ -423,6 +424,13 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
       const { job, unreadable } = getSafe(id);
       if (unreadable && strict) throw Object.assign(Error('Job state unknown: an unreadable job journal'), { code: 'JOBS_UNKNOWN', status: 503 });
       if (unreadable) { out.push({ id, status: 'unreadable' }); continue; }
+      if (!job && strict) {
+        // #1391: a journal that exists but yields no events (0 bytes, or one torn line) is unknown
+        // state, not "no job". Only a journal removed since the directory read is skipped.
+        let exists = true;
+        try { fs.statSync(file(id)); } catch (e) { if (e.code === 'ENOENT') exists = false; }
+        if (exists) throw Object.assign(Error('Job state unknown: a job journal with no readable events'), { code: 'JOBS_UNKNOWN', status: 503 });
+      }
       if (!job) continue;
       if ((projectId === undefined || job.projectId === projectId) && (!kind || job.kind === kind) && (active === undefined || active === !TERMINAL.has(job.status))) out.push(job);
     }

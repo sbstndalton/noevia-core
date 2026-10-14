@@ -99,3 +99,26 @@ test('a recent check is trusted: no probe per pass inside the recheck interval',
     assert.equal(h.rag.probes, probes + 1, 'probed again once the interval passed');
   } finally { h.m.stop(); }
 });
+
+test('a batch written after a model swap, then a transient check failure, then modelNotServed: the slot is dropped', async () => {
+  const h = harness({ recheckMs: '1500' });
+  try {
+    await h.m.setNext({ model: 'embeddinggemma-2', profile: 'embeddinggemma-2', baseUrl: 'http://embed:8080/v1' });
+    await h.m.kick();
+    // Swap lands right after a check passed: the next batch is written while another model is served.
+    h.filled.length = 0; h.dropped.length = 0;
+    h.rag.onBatch = () => { h.rag.served = new Error('ECONNRESET'); h.rag.onBatch = null; };
+    h.more(5);
+    h.advance(10_000);
+    await h.m.kick();
+    assert.ok(h.filled.length >= 1, 'a batch was written since the last good check');
+    assert.deepEqual(h.dropped, [], 'a transient failure alone keeps the slot');
+    assert.equal(h.m.status().nextHeld.code, 'endpointUnverified');
+    // The server comes back serving another model: the batch written since the last good check is suspect.
+    h.rag.served = ['nomic-embed-text-v1', 'bge-m3'];
+    h.advance(10_000);
+    await h.m.kick();
+    assert.deepEqual(h.dropped, ['embeddinggemma-2']);
+    assert.equal(h.m.status().nextHeld.code, 'modelNotServed');
+  } finally { h.m.stop(); }
+});
