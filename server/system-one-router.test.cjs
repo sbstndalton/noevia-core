@@ -42,7 +42,7 @@ test('Code is offered only with a configured Code role', async () => {
   assert.equal(await router.classify('debug'), 'code');
 });
 test('private dedicated endpoint required; no credentials, public URL or redirect target config', () => {
-  for (const value of [undefined, 'https://example.com', 'http://10.0.0.1/?key=x', 'http://user:pass@127.0.0.1', 'http://127.0.0.1/path'])
+  for (const value of [undefined, 'https://8.8.8.8', 'http://224.0.0.1/', 'http://10.0.0.1/?key=x', 'http://user:pass@127.0.0.1', 'http://127.0.0.1/path'])
     assert.ok(configuration({ COWORK_SYSTEM_ONE_URL: value }).reason);
   assert.equal(configuration({ COWORK_SYSTEM_ONE_URL:'http://127.0.0.1:9999/v1' }).baseUrl, 'http://127.0.0.1:9999');
 });

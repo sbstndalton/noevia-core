@@ -1,19 +1,16 @@
 'use strict';
 // Operator-configured private decision service; independent of answering-provider credentials.
-const { isIP } = require('node:net');
 const { identityOf } = require('./decision-qualification.cjs');
 const { profileFor, tempered } = require('./decision-models.cjs');
 const { toTypeSafe, fromTypeSafe } = require('./decision-typesafe.cjs');
-// #1639: 'kev' is the Kev-0.8B decision container's alias on the same internal network as 'laya'
-// (docs/kev-cutover.md in the deploy repo); the rule is otherwise unchanged: private, plain HTTP, no path.
+const { parseServiceUrl, serviceFetch } = require('./service-endpoint.cjs');
+// #1755: any service on this network (service-endpoint.cjs): a Docker service name such as `laya` or
+// `kev` (#1639), a LAN or Tailscale address, or a name that resolves only to such addresses; http or
+// https, no path, login, query or fragment. A name is judged by what it resolves to when the request
+// connects (serviceFetch), not here.
 function configuration(env = process.env) {
-  try {
-    const url = new URL(env.COWORK_DECISION_URL);
-    const h=url.hostname;
-    if (url.protocol !== 'http:' || url.username || url.password || url.search || url.hash || url.pathname !== '/' ||
-      !(h === 'laya' || h === 'kev' || h === 'localhost' || (isIP(h) === 4 && (/^(127|10)\./.test(h) || /^192\.168\./.test(h) || /^172\.(1[6-9]|2\d|3[01])\./.test(h))))) throw Error();
-    return { baseUrl:url.origin, reason:null };
-  } catch { return { reason:'Connect a private decision service, then restart noevia.' }; }
+  const parsed = parseServiceUrl(env.COWORK_DECISION_URL);
+  return parsed.reason ? { reason:'Connect a private decision service, then restart noevia.' } : { baseUrl:parsed.baseUrl, reason:null };
 }
 // A failure with a short text-free cause code (decision/index.cjs causeOf) for the decision log.
 const failure=(reason,message)=>Object.assign(Error(message),{reason});
@@ -111,7 +108,7 @@ const KEY_RE=/^[\x21-\x7e]{1,256}$/;
 /** `env.COWORK_DECISION_MODEL` names the model behind the URL (decision-models.cjs; unset or unknown:
  *  Laya, exactly as before #1639). `wording` overrides only the wording, for the eval harness, which
  *  captures our contract's bodies for either wording. */
-function createDecisionEndpoint({ env=process.env, fetchImpl=globalThis.fetch, holdMaxMs=SLOT_HOLD_MAX_MS, wording=null }={}) {
+function createDecisionEndpoint({ env=process.env, fetchImpl=serviceFetch, holdMaxMs=SLOT_HOLD_MAX_MS, wording=null }={}) {
   const config=configuration(env);
   if (config.reason) return null;
   const lane=laneFor(config.baseUrl);

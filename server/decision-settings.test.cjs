@@ -19,7 +19,7 @@ test('saving shared settings unlocks both experiments immediately and persists r
 });
 test('invalid settings leave active configuration intact',()=>{
   const {settings}=fixture();settings.save({url:'http://laya:8040',timeoutMs:1500},'admin');
-  for(const value of [{url:'http://public.example',timeoutMs:500},{url:'http://laya:8040',timeoutMs:9999},{url:'http://laya:8040/?key=secret',timeoutMs:500}])assert.throws(()=>settings.save(value,'admin'));
+  for(const value of [{url:'http://93.184.216.34',timeoutMs:500},{url:'http://laya:8040',timeoutMs:9999},{url:'http://laya:8040/?key=secret',timeoutMs:500}])assert.throws(()=>settings.save(value,'admin'));
   assert.equal(settings.get().url,'http://laya:8040');
 });
 test('connection test uses health only, rejects redirects/not-ready and never saves drafts',async()=>{
@@ -39,12 +39,12 @@ test('test results and refusals carry a stable message id, in the body and in th
   assert.equal((await settings.test({url:'http://laya:8040',timeoutMs:500})).messageId,'ready');
   await assert.rejects(fixture(async()=>Response.json({ready:false})).settings.test({url:'http://laya:8040',timeoutMs:500}),e=>e.status===502&&e.messageId==='notReady');
   assert.throws(()=>settings.save({url:'http://laya:8040',timeoutMs:9999},'admin'),e=>e.messageId==='invalidInput');
-  assert.throws(()=>settings.save({url:'http://public.example',timeoutMs:500},'admin'),e=>e.messageId==='invalidUrl');
+  assert.throws(()=>settings.save({url:'http://93.184.216.34',timeoutMs:500},'admin'),e=>e.messageId==='invalidUrl');
   const route=createFeatureRoutes({features,decisionSettings:settings,json:(res,status,body)=>Object.assign(res,{status,body}),readJson:async req=>req.body});
   const admin={user:{id:'admin',role:'admin'}};
   let res={};await route({method:'POST',body:{url:'http://laya:8040',timeoutMs:500}},res,{path:'/api/admin/decision-settings/test',authn:admin});
   assert.equal(res.body.messageId,'ready');assert.match(res.body.message,/ready/);
-  res={};await route({method:'PUT',body:{url:'http://public.example',timeoutMs:500}},res,{path:'/api/admin/decision-settings',authn:admin});
+  res={};await route({method:'PUT',body:{url:'http://93.184.216.34',timeoutMs:500}},res,{path:'/api/admin/decision-settings',authn:admin});
   assert.equal(res.status,400);assert.equal(res.body.errorId,'invalidUrl');assert.match(res.body.error,/private HTTP address/,'the English stays for older clients');
   // #1499: the example address the refusal suggests is one this service accepts.
   const example=res.body.error.match(/https?:\/\/[^\s,]+/)[0];
