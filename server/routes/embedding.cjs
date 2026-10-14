@@ -99,7 +99,14 @@ function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJs
       const addr = (v) => String(v ?? '').trim() || null;
       const addresses = new Set();
       if (scope !== 'diary') addresses.add(addr(body.target.baseUrl));
-      if (scope !== 'projects') addresses.add(addr(body.target.diaryBaseUrl ?? body.target.baseUrl));
+      if (scope !== 'projects') {
+        const diaryAddress = addr(body.target.diaryBaseUrl ?? body.target.baseUrl);
+        // With no address the Diary is sent base_url '' and resolves its own default server, which
+        // this check cannot see: probing web's engine instead could approve a model the Diary's
+        // server does not serve. Fail closed; the admin names the Diary's server explicitly.
+        if (!diaryAddress) return json(res, 409, { error: 'Name the Diary\'s embeddings server so noevia can check it serves this model.', code: 'diaryEndpointRequired' });
+        addresses.add(diaryAddress);
+      }
       for (const baseUrl of addresses) {
         const r = await checkServed(servedModels, { baseUrl, model });
         if (!r.ok) return json(res, 409, { error: r.error, code: r.code, ...(r.served ? { served: r.served } : {}) });

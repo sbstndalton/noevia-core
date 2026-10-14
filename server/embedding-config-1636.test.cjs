@@ -502,6 +502,17 @@ test('#1660 review: the Diary\'s embeddings server is checked too (scope diary, 
   assert.deepEqual(asked, ['http://embed-a:8080/v1']);
   assert.equal(calls.length, 1);
   assert.equal(same.fetchCalls.length, 1);
+  // No address at all: the Diary would resolve its own default server, which cannot be checked here.
+  for (const scope of ['all', 'diary']) {
+    asked.length = 0; calls.length = 0;
+    const none = routes({ migration, served, checkAddress: anyAddress });
+    const r4 = fakeRes();
+    await none.handler({ method: 'POST', body: { action: 'set-next', scope, target: { model: 'embeddinggemma-2' } } }, r4, { path: '/api/embedding', authn: admin });
+    assert.equal(r4.status, 409, scope);
+    assert.equal(r4.body.code, 'diaryEndpointRequired');
+    assert.deepEqual(calls, [], 'the projects side did not start');
+    assert.deepEqual(none.fetchCalls, [], 'the Diary was not asked');
+  }
 });
 
 test('#1660 review: echoed served ids are trimmed to 120 characters, and a migration refusal reaches the reply', async () => {
