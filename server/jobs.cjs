@@ -398,11 +398,39 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
       return { unreadable: true };
     }
   }
-  function list({ projectId, kind, active } = {}) {
+  // #1391: the enumeration a release idle gate can trust. Only an absent jobs directory is "no
+  // jobs"; anything else that cannot be read exactly (an unreadable, symlinked or non-directory
+  // root, a journal that is not a regular file, more than `cap` entries) is refused, never empty.
+  function strictIds(cap) {
+    const refuse = (why) => { throw Object.assign(Error(`Job state unknown: ${why}`), { code: 'JOBS_UNKNOWN', status: 503 }); };
+    let st;
+    try { st = fs.lstatSync(root); } catch (e) { if (e.code === 'ENOENT') return []; refuse(`jobs directory (${e.code || 'error'})`); }
+    if (!st.isDirectory()) refuse('the jobs path is not a plain directory');
+    let entries;
+    try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch (e) { refuse(`jobs directory (${e.code || 'error'})`); }
+    if (entries.length > cap) refuse(`more than ${cap} entries`);
     const out = [];
-    for (const id of ids()) {
+    for (const d of entries) {
+      if (!d.name.endsWith('.jsonl')) continue;
+      if (!d.isFile()) refuse('a job journal that is not a regular file');
+      if (!/^[0-9a-f-]{36}$/.test(d.name.slice(0, -6))) refuse('a job journal whose name is not a job id');
+      out.push(d.name.slice(0, -6));
+    }
+    return out;
+  }
+  function list({ projectId, kind, active, strict = false, cap = 4096 } = {}) {
+    const out = [];
+    for (const id of strict ? strictIds(cap) : ids()) {
       const { job, unreadable } = getSafe(id);
+      if (unreadable && strict) throw Object.assign(Error('Job state unknown: an unreadable job journal'), { code: 'JOBS_UNKNOWN', status: 503 });
       if (unreadable) { out.push({ id, status: 'unreadable' }); continue; }
+      if (!job && strict) {
+        // #1391: a journal that exists but yields no events (0 bytes, or one torn line) is unknown
+        // state, not "no job". Only a journal removed since the directory read is skipped.
+        let exists = true;
+        try { fs.statSync(file(id)); } catch (e) { if (e.code === 'ENOENT') exists = false; }
+        if (exists) throw Object.assign(Error('Job state unknown: a job journal with no readable events'), { code: 'JOBS_UNKNOWN', status: 503 });
+      }
       if (!job) continue;
       if ((projectId === undefined || job.projectId === projectId) && (!kind || job.kind === kind) && (active === undefined || active === !TERMINAL.has(job.status))) out.push(job);
     }

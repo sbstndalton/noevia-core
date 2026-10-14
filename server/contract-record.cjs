@@ -57,7 +57,19 @@ const ENV_SECRET = /KEY|TOKEN|SECRET|PASSWORD|PASS$|CREDENTIAL|COOKIE/i;
 
 function idLike(s) {
   // A letter and a digit: `proj-1791600933849-w10hvg`, a UUID; not `127.0.0.1` or a count.
-  return s.length >= 8 && /\d/.test(s) && /[A-Za-z]/.test(s) && /^[A-Za-z0-9_.:-]+$/.test(s);
+  if (s.length >= 8 && /\d/.test(s) && /[A-Za-z]/.test(s) && /^[A-Za-z0-9_.:-]+$/.test(s)) return true;
+  return randomBase64url(s);
+}
+
+// #1671: random bytes in base64url can lack a digit (16 bytes: about 2% of the time), so a long
+// base64url value is an id unless it reads as a name: lower-kebab/snake (`synthetic-member`) or
+// camelCase made of word-like parts (`systemOneRouting`). Measured: 7 in 20 million random 16-byte
+// ids take a name's shape, against about 1 in 40 before.
+function randomBase64url(s) {
+  if (s.length < 16 || !/^[A-Za-z0-9_-]+$/.test(s)) return false;
+  if (/^[a-z][a-z0-9]*([-_][a-z0-9]+)*$/.test(s)) return false;
+  const camel = /^[a-z]{2,}(?:[A-Z][a-z]{2,})+$/.test(s) && s.split(/(?=[A-Z])/).every((w) => /[aeiouy]/i.test(w));
+  return !camel;
 }
 
 function isRandomish(s) {
