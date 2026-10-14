@@ -91,7 +91,10 @@ function createMcpWiring({
   // it is retried after these steps, one per consecutive failed discovery, instead of after the whole
   // discoveryTtlMs. The last step holds. Capped at discoveryTtlMs.
   discoveryRetryMs = [5000, 15000, 45000, 120000],
+  toolRateLimit = require('./tool-rate-limit.cjs').createToolRateLimit(),
 }) {
+  const rateLimit = require('./tool-rate-limit.cjs');
+  const PER_USER_AUTH = new Set(['nextcloud', 'personal', 'oauth']);
   const MCP_SERVERS = servers;
   if (publicFetch && typeof mcp.withFetch !== 'function') throw new TypeError('publicFetch needs an MCP client with withFetch');
   const publicMcp = publicFetch ? mcp.withFetch(publicFetch) : null;
@@ -481,6 +484,11 @@ function createMcpWiring({
     }
 
     if (server.directory && !(await directoryUrlAllowed(server.url))) return `ERROR: ${name} was not run: its server's address no longer resolves to a public host.`;
+    // #1693: a provider that answered 429 is not called again inside its wait. Per server, and per account for every
+    // server that sends the account's own credentials (#1701: nextcloud too), so one account never pauses another.
+    const rateKey = `${server.id}\u0000${PER_USER_AUTH.has(server.auth) ? String(scope.getStore()?.authn?.user?.id || '') : ''}`;
+    const coolingMs = toolRateLimit.remaining(rateKey);
+    if (coolingMs > 0) return rateLimit.coolingDownText(name, coolingMs);
     try {
       const transport = transportFor(server);
       const { session } = await transport.connect(server.url, auth, undefined, signal);
@@ -493,6 +501,11 @@ function createMcpWiring({
         await transport.disconnect(server.url, session, auth, undefined, signal);
       }
       const text = mcp.resultToText(result);
+      if (result && result.isError && rateLimit.isRateLimitedText(text)) {
+        logger.warn(`[mcp] ${name} rate limited (tool error)`);
+        return rateLimit.rateLimitedText(name, toolRateLimit.hit(rateKey));
+      }
+      if (!result || !result.isError) toolRateLimit.clear(rateKey);
       if (!text) return '(the tool returned no output)';
       // Was a blind `slice(0, cap)`. A listing from the Nextcloud box is an
       // array of near-identical objects, so most of what that slice spent the
@@ -508,6 +521,10 @@ function createMcpWiring({
       // An HTTP failure carries the server's response body in its message; that
       // is third-party text, so it goes to the log and the model gets a
       // neutral line with the status only.
+      if (err && err.httpStatus === 429) {
+        logger.warn(`[mcp] ${name} rate limited (HTTP 429)`);
+        return rateLimit.rateLimitedText(name, toolRateLimit.hit(rateKey, rateLimit.parseRetryAfter(err.retryAfter)));
+      }
       if (err && Number.isInteger(err.httpStatus)) {
         logger.warn(`[mcp] ${name} failed: ${String(err.message).slice(0, 300)}`);
         return `ERROR calling ${name}: tool call failed (HTTP ${err.httpStatus})`;

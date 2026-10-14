@@ -295,7 +295,8 @@ for(const fallback of [false,true])test(`reasoning-only output stays separate fr
 test('reasoning-only tool continuation preserves completed tool results without promoting narration',async()=>{
  const f=fixture({reasoningOnly:true,rounds:[[call('read1','read','{}')],[]]});await f.run();
  assert.equal(f.executions.length,1);assert.ok(f.events.some(e=>e.type==='tool_result'));
- assert.ok(f.events.some(e=>e.type==='delta'&&e.text.includes('without a final answer')));
+ // #1693: after tool results, a reasoning-only reply gets one no-tools final-answer round, then a fallback (not the bare error).
+ assert.ok(f.events.some(e=>e.type==='delta'&&e.text.includes('did not write a final answer')));
  assert.ok(!f.events.some(e=>e.type==='delta'&&e.text.includes('Synthetic internal plan')));
 });
 
