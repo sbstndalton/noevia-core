@@ -1,6 +1,6 @@
 'use strict';
 const {configuration,createDecisionEndpoint}=require('./decision-endpoint.cjs');
-const {checkServiceEndpoint,serviceFetch}=require('./service-endpoint.cjs');
+const {checkServiceEndpoint,serviceFetch,decisionServiceFetch}=require('./service-endpoint.cjs');
 const KEY='decision:configuration';
 // What the private decision service (services/laya/server.py validate + worker budget) accepts, so
 // callers can shape a request it will not refuse with a 422 (#682). maxChoiceChars approximates the
@@ -41,7 +41,7 @@ function startupWarnings(env=process.env) {
 // at connect time and refuses it unless every answer is on this network; `lookup` is the resolver the
 // connection test's up-front check uses (tests stub it).
 const invalidUrl=()=>Object.assign(Error('Use a private HTTP address such as http://192.168.1.20:8040, with no path, login or query string.'),{status:400,messageId:'invalidUrl'});
-function createDecisionSettings({store,env=process.env,fetchImpl=serviceFetch,lookup=undefined,audit=()=>{},kinds=SERVICE_KINDS}) {
+function createDecisionSettings({store,env=process.env,fetchImpl=decisionServiceFetch,sensitivityFetchImpl=(fetchImpl===decisionServiceFetch?serviceFetch:fetchImpl),lookup=undefined,audit=()=>{},kinds=SERVICE_KINDS}) {
   let saved;
   try { saved=JSON.parse(store.get(KEY)||'null'); } catch { saved={url:'',timeoutMs:1500}; }
   const get=()=>({...saved || {url:env.COWORK_DECISION_URL||'',timeoutMs:1500},source:saved?'admin':'deployment'});
@@ -60,15 +60,15 @@ function createDecisionSettings({store,env=process.env,fetchImpl=serviceFetch,lo
   const cache=new Map();
   /** One backend per (url, model, key source), so its lane and the callers' decision layers survive between chats.
    *  `apiKey` is the bearer key for this URL only (#1745); none: no key is sent. */
-  function backendFor(url,model,apiKey=env.COWORK_DECISION_API_KEY,keySource='shared') {
-    const config=configuration({COWORK_DECISION_URL:url});
+  function backendFor(url,model,apiKey=env.COWORK_DECISION_API_KEY,keySource='shared',linkLocal=true) {
+    const config=configuration({COWORK_DECISION_URL:url},{linkLocal});
     if(config.reason) return null;
-    const key=JSON.stringify([config.baseUrl,model||'',apiKey?keySource:'']);
+    const key=JSON.stringify([config.baseUrl,model||'',apiKey?keySource:'',linkLocal]);
     if(cache.has(key)) return cache.get(key);
     if(cache.size>=8) cache.clear(); // an administrator trying URLs in Settings does not grow this without bound
     const endpoint=createDecisionEndpoint({env:{COWORK_DECISION_URL:config.baseUrl,
       ...(model?{COWORK_DECISION_MODEL:model}:{}),
-      ...(apiKey?{COWORK_DECISION_API_KEY:apiKey}:{})},fetchImpl});
+      ...(apiKey?{COWORK_DECISION_API_KEY:apiKey}:{})},linkLocal,fetchImpl:linkLocal?fetchImpl:sensitivityFetchImpl});
     const made={id:'decision-service',supports:kind=>kinds.includes(kind),locality:'local',limits:SERVICE_LIMITS,
       model:endpoint.model,wording:endpoint.wording,
       async decide(request,opts) {
@@ -104,9 +104,9 @@ function createDecisionSettings({store,env=process.env,fetchImpl=serviceFetch,lo
     const url=typeof env.COWORK_SENSITIVITY_DECISION_URL==='string' ? env.COWORK_SENSITIVITY_DECISION_URL.trim() : '';
     if(!url) return backend();
     const own=typeof env.COWORK_SENSITIVITY_DECISION_API_KEY==='string' ? env.COWORK_SENSITIVITY_DECISION_API_KEY.trim() : '';
-    if(own) return backendFor(url,env.COWORK_SENSITIVITY_DECISION_MODEL||undefined,own,'sensitivity');
+    if(own) return backendFor(url,env.COWORK_SENSITIVITY_DECISION_MODEL||undefined,own,'sensitivity',false);
     const sameHost=!!hostOf(url) && hostOf(url)===hostOf(env.COWORK_DECISION_URL);
-    return backendFor(url,env.COWORK_SENSITIVITY_DECISION_MODEL||undefined,sameHost?env.COWORK_DECISION_API_KEY:null,'shared');
+    return backendFor(url,env.COWORK_SENSITIVITY_DECISION_MODEL||undefined,sameHost?env.COWORK_DECISION_API_KEY:null,'shared',false);
   }
   return {
     get, backend, sensitivityBackend,
@@ -122,7 +122,7 @@ function createDecisionSettings({store,env=process.env,fetchImpl=serviceFetch,lo
       const next=validate(value);
       // #1755: a name is accepted only if every address it resolves to is on this network; say so plainly
       // here instead of as "not ready". The request below is checked again at connect time.
-      const where=await checkServiceEndpoint(next.url,lookup?{lookup}:{});
+      const where=await checkServiceEndpoint(next.url,{linkLocal:true,...(lookup?{lookup}:{})});
       if(!where.ok && !where.transient) throw invalidUrl();
       try {
         const response=await fetchImpl(next.url+'/health',{signal:AbortSignal.timeout(3000),redirect:'error'});
