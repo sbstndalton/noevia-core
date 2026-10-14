@@ -444,7 +444,9 @@ async function writeFile(conn, rawPath, bytes, { ifMatch, ifNoneMatch } = {}) {
   // The ETag of what was just written (#1664), so a caller that fails afterwards can remove exactly
   // this version with discardWritten. '' when the server sends none (cleanup is then skipped).
   const etag = String(response.headers?.get?.('etag') || response.headers?.get?.('oc-etag') || '').trim();
-  return { path, etag: /[\r\n]/.test(etag) ? '' : etag };
+  // `created` only for 201: a server that ignores If-None-Match (generic WebDAV, nginx dav) answers
+  // an overwrite of the user's existing file with 200/204, and that file must never be discarded.
+  return { path, etag: /[\r\n]/.test(etag) ? '' : etag, created: response.status === 201 };
 }
 
 /** Best-effort removal of a file this process has just created with a create-only write (#1664),

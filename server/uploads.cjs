@@ -85,7 +85,7 @@ async function ingest(workspace, project, name, bytes, { connection, source, rem
       : storageImpl.writeFile(connection, fullName, bytes));
     // #1664: only a create-only write made a file that nothing else owns yet; an edit or replace
     // (If-Match / plain PUT) overwrote a recorded file, which a later failure must never delete.
-    if (ifNoneMatch === '*' && written && written.etag) {
+    if (ifNoneMatch === '*' && written && written.created === true && written.etag) {
       const record = { connection, path: fullName, etag: written.etag, storageImpl };
       if (created && typeof created === 'object') Object.assign(created, record);
       try { return finish(); }

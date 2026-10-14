@@ -691,7 +691,7 @@ function createProjectRoutes({
             indexSource(project, file); defaultProjectDocs(project, hadUploads); saveProjects(PROJECTS);
             recorded = true;
           } finally {
-            if (!recorded && !replace && written?.etag
+            if (!recorded && !replace && written?.created === true && written?.etag
               && (await require('../uploads.cjs').discardCreated({ connection, path: name, etag: written.etag, storageImpl: storageClient })).deleted
               && project.files !== filesBefore) project.files = filesBefore;
           }
