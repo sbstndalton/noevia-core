@@ -162,6 +162,7 @@ function withoutSystemNote(messages, note) {
 // error, instead of sitting until the browser gives up with "network error" minutes later. Nothing is
 // limited before the first output (a long prefill is not a stall), and `ms` of 0 limits nothing.
 const { isCutMark } = require('./thinking-budget.cjs');
+const announcedAction = require('./announced-action.cjs');
 class StreamIdleError extends Error {
   constructor(ms) { super(`no output for ${ms} ms`); this.name = 'StreamIdleError'; this.ms = ms; }
 }
@@ -1481,6 +1482,7 @@ function createChatHandler({
         else toolGate.record('prefetch.failed', { tool: gate.decision.tool });
       }
     }
+    let announcedRetried = false; // #1552: one retry per reply for an announced but uncalled tool
     for (let round = 0; round < 3 && !chatSignal.signal.aborted && !cloudHold; round++) {
       if (nextToolRoutes) { toolRoutes = new Map([...toolRoutes, ...nextToolRoutes]); nextToolRoutes = null; }
       if (revokedSkills()) break; // a loaded skill was disabled or changed: no further model round
@@ -1709,6 +1711,18 @@ function createChatHandler({
           continue;
         }
         toolGate.record('gate.miss', { tool: forcedTool });
+      }
+
+      // #1552: tools were offered and the reply ended on a promise ("I will read the full file...") with no
+      // call. One more try, with what it wrote kept as narration and a note that nothing was read.
+      if (!forceChoice(round).tool_choice && toolCalls.size === 0 && sawAnything && !announcedRetried && round < 2
+        && requestTools().tools && !chatSignal.signal.aborted && announcedAction.announcesToolAction(roundContent)) {
+        announcedRetried = true;
+        send({ type: 'preamble', text: roundContent });
+        roundMessages = [...roundMessages, { role: 'assistant', content: roundContent }, { role: 'user', content: announcedAction.ANNOUNCED_NOTE }];
+        roundHasContent = false; roundContent = ''; roundReasoning = '';
+        round--;
+        continue;
       }
 
       // Execute each requested tool and append assistant tool_calls + results.
