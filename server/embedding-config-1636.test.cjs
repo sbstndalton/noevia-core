@@ -530,3 +530,25 @@ test('#1660 review: echoed served ids are trimmed to 120 characters, and a migra
   assert.equal(r2.body.projects.code, 'modelNotServed');
   assert.deepEqual(r2.body.projects.served, ['a']);
 });
+
+test('#1762: a public effective embeddings URL (including the INFERENCE_BASE_URL fallback) logs a start-up warning', async () => {
+  const { warnPublicEmbeddingUrl } = require('./embedding-address.cjs');
+  const run = async (env, inferenceBase, check) => { const logs = []; const warned = await warnPublicEmbeddingUrl({ env, inferenceBase, check, log: (l) => logs.push(l) }); return { warned, logs }; };
+  const check = async (u) => (/8\.8\.8\.8/.test(u) ? { ok: false, reason: 'a public address', transient: false } : /pending/.test(u) ? { ok: false, reason: 'did not resolve', transient: true } : { ok: true });
+  // No embeddings URL: the fallback is the inference URL.
+  let r = await run({}, 'http://8.8.8.8:8080', check);
+  assert.equal(r.warned, true);
+  assert.match(r.logs.join(''), /INFERENCE_BASE_URL, the fallback\) http:\/\/8\.8\.8\.8:8080 .*local-only/);
+  // A set embeddings URL wins over the inference one, in either variable.
+  r = await run({ EMBEDDING_SERVICE_URL: 'http://8.8.8.8/v1' }, 'http://llama:8080', check);
+  assert.match(r.logs.join(''), /EMBEDDING_SERVICE_URL/);
+  r = await run({ EMBEDDING_BASE_URL: 'http://8.8.8.8/v1' }, 'http://llama:8080', check);
+  assert.match(r.logs.join(''), /EMBEDDING_BASE_URL/);
+  // Local, unresolved-yet, and a throwing check stay silent and never throw.
+  assert.equal((await run({}, 'http://embed:8080', check)).warned, false);
+  assert.equal((await run({}, 'http://pending:8080', check)).warned, false);
+  assert.equal((await run({}, 'http://x', async () => { throw new Error('boom'); })).warned, false);
+  // The real check (Rust port, literal address) agrees.
+  assert.equal((await run({}, 'http://8.8.8.8:8080')).warned, true);
+  assert.equal((await run({}, 'http://127.0.0.1:8080')).warned, false);
+});
