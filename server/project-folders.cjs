@@ -9,9 +9,19 @@ function projectFolderName(name) {
   return String(name || '').replace(/[\x00-\x1f\x7f/\\:*?"<>|]/g, '-')
     .replace(/\s+/g, ' ').trim().replace(/^\.+|[.\s]+$/g, '').slice(0, 80).replace(/[.\s]+$/g, '') || 'Untitled project';
 }
-/** The folder key of a project: its id (the name only when there is no id, which a stored project never lacks). */
+const crypto = require('node:crypto');
+const KEY_MAX = 80, KEY_HASH = 12;
+/** The folder key of a project: its id (the name only when there is no id, which a stored project never lacks).
+ *  An id that fits in 80 characters keeps exactly the key it always had, so nothing already allocated moves.
+ *  A longer one used to be cut at 80, which made two long ids with a common start share one folder (#1653);
+ *  it now ends in a hash of the whole id, so the key stays 80 characters and stays unique to it. */
 function projectFolderKey(project) {
-  return projectFolderName(project.id || project.name);
+  const raw = String(project.id || project.name || '');
+  const key = projectFolderName(raw);
+  const whole = raw.replace(/[\x00-\x1f\x7f/\\:*?"<>|]/g, '-').replace(/\s+/g, ' ').trim().replace(/^\.+|[.\s]+$/g, '');
+  if (whole.length <= KEY_MAX) return key;
+  const digest = crypto.createHash('sha256').update(raw).digest('hex').slice(0, KEY_HASH);
+  return `${whole.slice(0, KEY_MAX - KEY_HASH - 1).replace(/[.\s]+$/g, '')}-${digest}`;
 }
 const allocations = new WeakMap();
 function createProjectFolder(storage, connection, root, project) {
@@ -29,7 +39,8 @@ async function allocateFolder(storage, connection, root, project) {
   const name = projectFolderKey(project);
   // S3 has no atomic directory creation. The id is unique, so the prefix is too;
   // adopting a pre-existing prefix could mix unrelated projects' documents.
-  if (connection.kind === 's3') return `${root}/${name}`;
+  // A reservation made before #1653 used the old (truncated) key; a stored path is never recomputed.
+  if (connection.kind === 's3') return project.reservedFolder || `${root}/${name}`;
   await storage.createFolder(connection, root);
   // The path reserved when the project was created (reserveProjectFolder). MKCOL still decides:
   // if something else took it meanwhile, fall through to the next free name.

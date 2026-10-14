@@ -181,3 +181,32 @@ test('every reason the server writes carries a stable id the browser can transla
   // The English sentence stays alongside the id for API clients that do not translate.
   assert.match(binary.attachment.reason, /not readable as text/);
 });
+
+// #1653: a failure while reading a document must not leave an unrecorded file in remote storage.
+// The retry would meet a 409 against it and the client would save a "(2)" copy beside it.
+test('#1653: a PDF whose extraction throws leaves nothing written to storage; the retry writes once, create-only', async t => {
+  const documents = require('./documents.cjs');
+  const { workspace, project } = setup(t);
+  const writes = [];
+  const storageImpl = { createFolder: async () => ({}), writeFile: async (_c, p, b, opts) => { writes.push([p, opts]); } };
+  const original = documents.extractDocumentText;
+  t.after(() => { documents.extractDocumentText = original; });
+  documents.extractDocumentText = async () => ({ text: 'Synthetic body', pages: 1, pageTexts: [{ number: 1, status: 'native', text: 'Synthetic body' }], state: 'ready', truncated: false });
+  // Reading the PDF writes its derived text under project-documents; make that impossible (a full disk, a bad mount).
+  fs.writeFileSync(path.join(workspace.dir, 'project-documents'), 'not a directory');
+  const bytes = Buffer.from('%PDF-1.4 synthetic');
+  await assert.rejects(uploads.ingest(workspace, project, 'fixture.pdf', bytes, { connection: {}, storageImpl, ifNoneMatch: '*' }));
+  assert.deepEqual(writes, [], 'nothing was written to storage');
+  assert.equal(project.files.length, 0);
+  fs.rmSync(path.join(workspace.dir, 'project-documents'));
+  const file = await uploads.ingest(workspace, project, 'fixture.pdf', bytes, { connection: {}, storageImpl, ifNoneMatch: '*' });
+  assert.equal(file.document.state, 'ready');
+  assert.deepEqual(writes, [['projects/synthetic/Documents/fixture.pdf', { ifNoneMatch: '*' }]], 'one create-only write, after the read');
+});
+test('#1653: the storage write still comes after reading and keeps its If-Match for an edit', async t => {
+  const { workspace, project } = setup(t);
+  const order = [];
+  const storageImpl = { createFolder: async () => {}, writeFile: async (_c, p, b, opts) => order.push(['write', opts]) };
+  await uploads.ingest(workspace, project, 'fixture.docx', Buffer.from('synthetic'), { connection: {}, storageImpl, ifMatch: 'e1', extractDocx: async () => { order.push(['read']); return { text: 'Body', truncated: false }; } });
+  assert.deepEqual(order, [['read'], ['write', { ifMatch: 'e1' }]]);
+});

@@ -29,14 +29,6 @@ async function ingest(workspace, project, name, bytes, { connection, source, rem
   const previous = (project.files || []).find(f => f.name === fullName);
   if (!previous && (project.files || []).length >= 60) throw Object.assign(new Error('A project holds at most 60 sources.'), { status: 400 });
   if (mime && !previous && (project.assets || []).length >= 12) throw Object.assign(new Error('A project holds at most 12 vision images.'), { status: 400 });
-  if (connection && !remotePath) {
-    progress('Saving to Nextcloud / storage');
-    await storageImpl.createFolder(connection, `${project.projectFolder}/${group}`);
-    workspace.assertActive?.();
-    await (ifMatch !== undefined ? storageImpl.writeFile(connection, fullName, bytes, { ifMatch })
-      : ifNoneMatch !== undefined ? storageImpl.writeFile(connection, fullName, bytes, { ifNoneMatch })
-      : storageImpl.writeFile(connection, fullName, bytes));
-  }
   workspace.assertActive?.();
   progress('Saving original');
   const id = hash(bytes), dir = directory(workspace, project.id);
@@ -76,6 +68,22 @@ async function ingest(workspace, project, name, bytes, { connection, source, rem
       reason = 'This file is not readable as text — it looks like binary data despite its extension. The original is kept.';
     }
   } else if (mime) state = 'vision';
+  // The remote write comes LAST among the steps that can fail (#1653). Extraction (PDF text/OCR, DOCX) only
+  // reads `bytes`, so running it first means a failure there leaves nothing in storage: before, the file was
+  // written first and a throw while reading it left an unrecorded remote file that a retry then met as a 409.
+  // The If-None-Match / If-Match guarantee is untouched: the PUT is still conditional and still the only write.
+  // The extraction result is cached by content, so a retry or a lost 409 race does not redo the OCR.
+  // Limit: a server that ignores If-None-Match (a generic WebDAV such as nginx dav; Nextcloud honours it) would
+  // overwrite a file that is in storage but not yet synced. There is no safe client-side fix: a PROPFIND
+  // before the PUT only narrows the window, and noevia does not hold a lock on someone else's storage.
+  if (connection && !remotePath) {
+    progress('Saving to Nextcloud / storage');
+    await storageImpl.createFolder(connection, `${project.projectFolder}/${group}`);
+    workspace.assertActive?.();
+    await (ifMatch !== undefined ? storageImpl.writeFile(connection, fullName, bytes, { ifMatch })
+      : ifNoneMatch !== undefined ? storageImpl.writeFile(connection, fullName, bytes, { ifNoneMatch })
+      : storageImpl.writeFile(connection, fullName, bytes));
+  }
   workspace.assertActive?.();
   file.attachment = { id, bytes: bytes.length, group, state, ...(reason ? {reason} : {}), ...(reasonId ? {reasonId} : {}), ...(reasonParams ? {reasonParams} : {}), ...(readerVersion ? {readerVersion} : {}), ...(group === 'Images' && bytes.length > 8 * 1024 * 1024 ? { reason: 'Original stored; resize below 8 MB for model image input.', reasonId: 'imageTooLarge', reasonParams: undefined } : {}) };
   if (source || connection) file.source = source || project.projectFolder;
