@@ -25,7 +25,9 @@ const slots = require('./vector-slots.cjs');
 // which resolves a name itself and refuses the connection unless every answer is on this network and not
 // public by the Rust address check (ssrf.cjs). The address check when an address is SET (embedding-address.cjs)
 // cannot see a name that answers private then and public later (DNS rebinding); this one runs at connect.
-// Link-local is refused. A redirect is refused by it too. `setRagFetch` is the test seam.
+// Link-local is refused. A redirect is refused by it too. `setRagFetch` is the test seam (exported only under tests).
+// Embeddings are LOCAL-ONLY (local-first policy): with no EMBEDDING_SERVICE_URL / EMBEDDING_BASE_URL they fall back to
+// INFERENCE_BASE_URL, so pointing that at a public API makes every embedding fail closed; index.cjs warns at start-up (#1762).
 let netFetch = null;
 function ragFetch(input, init) {
   if (!netFetch) netFetch = makeRagFetch();
@@ -36,6 +38,9 @@ function makeRagFetch(extra = {}) {
   return createServiceFetch({ linkLocal: false, addressesPublic: (a) => require('./ssrf.cjs').ssrfWasm().ssrfAddressesPublic(a), ...extra });
 }
 function setRagFetch(fn) { const prev = netFetch; netFetch = fn; return prev; }
+// #1762: the test seam (setRagFetch swaps the on-this-network fetch) is only exported under the test runner,
+// so production code cannot reach it (same rule as provider-egress.cjs).
+const testSeam = process.env.NODE_TEST_CONTEXT || process.env.NODE_ENV === 'test' ? { _test: { setRagFetch, makeRagFetch, rerankBackend } } : {};
 // The reranker's backend, built here so a test can drive it without a chat.
 function rerankBackend(baseUrl) {
   const { llamaRerankBackend } = require('./decision/backends.cjs');
@@ -1105,4 +1110,4 @@ const trackedFileState = () => ({ queues: fileQueues.size, generations: fileGene
 
 // #1646: the sentence a hybrid cloud route without a grant removes (read_project_file is not offered there).
 const READ_FILE_HINT = ' Use read_project_file with PDF startPage/endPage and offset for pages beyond the summary.';
-module.exports = { _test: { setRagFetch, makeRagFetch, rerankBackend }, searchProjectWithImages, syncProjectMedia, releaseMediaModel, readCaption, writeCaption, mediaModelFor, embeddingOff, READ_FILE_HINT, servedModels, servedModelsCached, init, trackedFileState, indexProjectFile, deleteProjectFile, searchProject, filesContext, chunkText, ragAvailable, retrievalStatus, embed, embedModel, embeddingIdentity, embeddingConfig: getEmbeddingConfig, onIndexed, listIndexes, indexCoverage, fillMissing, dropIndexSlot, rerankPool };
+module.exports = { ...testSeam, searchProjectWithImages, syncProjectMedia, releaseMediaModel, readCaption, writeCaption, mediaModelFor, embeddingOff, READ_FILE_HINT, servedModels, servedModelsCached, init, trackedFileState, indexProjectFile, deleteProjectFile, searchProject, filesContext, chunkText, ragAvailable, retrievalStatus, embed, embedModel, embeddingIdentity, embeddingConfig: getEmbeddingConfig, onIndexed, listIndexes, indexCoverage, fillMissing, dropIndexSlot, rerankPool };

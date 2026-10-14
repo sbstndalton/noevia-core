@@ -220,6 +220,8 @@ rag.init({ dataDir: DATA_DIR, inferenceUrl: INFERENCE_BASE, headersFn: () => inf
 // An address the environment seeded must be on this network (embedding-address.cjs); one that is not
 // is logged and not used. Asynchronous (DNS), so it settles just after start-up, before the first re-index pass.
 require('./embedding-address.cjs').guardSeededAddresses(embeddingConfig);
+// #1762: embeddings are local-only; say so at start-up if the address they would use (the inference one when no embeddings URL is set) is public.
+require('./embedding-address.cjs').warnPublicEmbeddingUrl({ inferenceBase: INFERENCE_BASE });
 const embeddingMigration = require('./embedding-migration.cjs').createEmbeddingMigration({ config: embeddingConfig, rag });
 // #1668: the embedding service as the model manager runs it (which models cowork-embed serves, or
 // off). Refreshed in the background so the delete guard (model-system.cjs) follows it.

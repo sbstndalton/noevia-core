@@ -91,4 +91,24 @@ async function guardSeededAddresses(config, { check = checkEmbeddingAddress, log
   } catch (err) { log(`[embedding] could not check the seeded embeddings address (${String(err?.message || err).slice(0, 120)})`); }
 }
 
-module.exports = { checkEmbeddingAddress, guardSeededAddresses, deniedAddress };
+/**
+ * #1762: embeddings are local-only (local-first policy). With no EMBEDDING_SERVICE_URL / EMBEDDING_BASE_URL they
+ * use INFERENCE_BASE_URL, and every embedding, model listing and media request goes through the on-this-network
+ * fetch (rag.cjs), so a public address there fails closed and, without this line, silently. Logs one warning at
+ * start-up when the effective URL is public (a name that merely does not resolve yet is not warned about).
+ * Never throws and never changes what is used.
+ */
+async function warnPublicEmbeddingUrl({ env = process.env, inferenceBase, check = checkEmbeddingAddress, log = (line) => console.warn(line) } = {}) {
+  try {
+    const pick = (k) => String(env[k] || '').trim();
+    const named = pick('EMBEDDING_SERVICE_URL') ? 'EMBEDDING_SERVICE_URL' : pick('EMBEDDING_BASE_URL') ? 'EMBEDDING_BASE_URL' : null;
+    const url = named ? pick(named) : String(inferenceBase || '').trim();
+    if (!url) return false;
+    const r = await check(url);
+    if (r.ok || r.transient) return false;
+    log(`[embedding] WARNING: the effective embeddings URL (${named || 'INFERENCE_BASE_URL, the fallback'}) ${url} is not on this network: ${r.reason}. Embeddings are local-only, so embedding, model listing and media requests will be refused. Point EMBEDDING_SERVICE_URL at a local embeddings server.`);
+    return true;
+  } catch { return false; }
+}
+
+module.exports = { warnPublicEmbeddingUrl, checkEmbeddingAddress, guardSeededAddresses, deniedAddress };
