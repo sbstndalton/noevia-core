@@ -13,88 +13,20 @@
 // the fetches in rag.cjs also refuse redirects.
 
 const dns = require('node:dns');
-const net = require('node:net');
+const { checkServiceEndpoint, deniedAddress: serviceDenied } = require('./service-endpoint.cjs');
 const { ssrfWasm } = require('./ssrf.cjs');
 
-const LOOKUP_TIMEOUT_MS = 5000;
 // A start-up check that cannot get an answer (a resolver that is not up yet, a compose service that
 // is still starting) is retried for about half a minute, then re-checked every minute; only a
 // public answer or a malformed address is a permanent refusal.
 const RETRY_DELAYS_MS = [1000, 2000, 4000, 8000, 15000];
 const RECHECK_MS = 60000;
 
-/** A permanent refusal. */
-function refuse(reason) { return { ok: false, reason, transient: false }; }
-/** The name could not be resolved (yet): recoverable. */
-function unresolved(reason) { return { ok: false, reason, transient: true }; }
-
-// Addresses ssrf.cjs isPrivateIp calls "private" (it means: not a public one) but that name no host
-// on this network: unspecified, link-local, multicast, reserved and documentation ranges, and the
-// IPv6 forms that carry another address (v4-compatible, NAT64, Teredo). Loopback, RFC 1918, ULA and
-// 100.64.0.0/10 (Tailscale) stay allowed.
-function deniedV4([a, b, c]) {
-  if (a === 0) return 'the unspecified address';
-  if (a === 169 && b === 254) return 'a link-local address';
-  if (a >= 224) return a === 255 && b === 255 ? 'the broadcast address' : a < 240 ? 'a multicast address' : 'a reserved address';
-  if (a === 192 && b === 0 && (c === 0 || c === 2)) return 'a reserved address';
-  if ((a === 198 && b === 51 && c === 100) || (a === 203 && b === 0 && c === 113)) return 'a documentation address';
-  return null;
-}
-
-function hextets(ip) {
-  const text = ip.split('%')[0];
-  const dotted = text.match(/^(.*:)(\d+\.\d+\.\d+\.\d+)$/);
-  let head = text;
-  if (dotted) {
-    const q = dotted[2].split('.').map(Number);
-    head = `${dotted[1]}${((q[0] << 8) | q[1]).toString(16)}:${((q[2] << 8) | q[3]).toString(16)}`;
-  }
-  const [left, right, extra] = head.split('::');
-  if (extra !== undefined) return null;
-  const a = left ? left.split(':') : [];
-  const b = right ? right.split(':') : [];
-  const fill = right === undefined ? 0 : 8 - a.length - b.length;
-  if (right === undefined ? a.length !== 8 : fill < 1) return null;
-  const all = [...a, ...Array(fill).fill('0'), ...b].map((h) => parseInt(h, 16));
-  return all.length === 8 && all.every((h) => Number.isInteger(h) && h >= 0 && h <= 0xffff) ? all : null;
-}
-
-/** Why `ip` cannot be an address on this network although it is not public, or a reason string. */
-function deniedAddress(ip) {
-  if (net.isIPv4(ip)) return deniedV4(ip.split('.').map(Number));
-  const h = hextets(ip);
-  if (!h) return 'not an address';
-  const mapped = h.slice(0, 5).every((x) => x === 0) && h[5] === 0xffff;
-  if (mapped) return deniedV4([h[6] >> 8, h[6] & 255, h[7] >> 8, h[7] & 255]);
-  if (h.slice(0, 7).every((x) => x === 0)) return h[7] === 1 ? null : h[7] === 0 ? 'the unspecified address' : 'a reserved address'; // ::1 is loopback
-  if (h.slice(0, 6).every((x) => x === 0)) return 'a reserved address'; // ::a.b.c.d, v4-compatible
-  if ((h[0] & 0xffc0) === 0xfe80) return 'a link-local address';
-  if ((h[0] & 0xff00) === 0xff00) return 'a multicast address';
-  if (h[0] === 0x64 && h[1] === 0xff9b) return 'a reserved address'; // NAT64
-  if (h[0] === 0x2001 && (h[1] === 0 || h[1] === 0xdb8)) return 'a reserved address'; // Teredo, documentation
-  if (h[0] === 0x100 && h.slice(1, 4).every((x) => x === 0)) return 'a reserved address'; // discard-only
-  return null;
-}
-
-/** null when `ip` is an address on this network, else why not. The policy module is asked
- *  directly: ssrf.cjs isPrivateIp turns a trap into "private", which is the wrong way round here. */
-function whyNotLocal(ip, addressesPublic) {
-  let isPublic;
-  try { isPublic = addressesPublic([ip]); } catch { return 'the address policy could not decide'; }
-  if (isPublic) return 'a public address';
-  return deniedAddress(ip);
-}
-
-async function resolveAll(host, lookup) {
-  let timer;
-  try {
-    const answers = await Promise.race([
-      lookup(host, { all: true, verbatim: true }),
-      new Promise((_, reject) => { timer = setTimeout(() => reject(Error('lookup timed out')), LOOKUP_TIMEOUT_MS); timer.unref?.(); }),
-    ]);
-    return (Array.isArray(answers) ? answers : [answers]).map((a) => a?.address);
-  } finally { clearTimeout(timer); }
-}
+// #1755: the address rule is the shared one (service-endpoint.cjs), with link-local refused: an
+// embeddings server is never reached at 169.254/16 or fe80::/10 (cloud metadata lives there).
+// Loopback, RFC 1918, ULA and 100.64.0.0/10 (Tailscale) stay allowed; any path is accepted.
+/** Why `ip` cannot be an address on this network although it is not public, or null. */
+const deniedAddress = (ip) => serviceDenied(ip, { linkLocal: false });
 
 /**
  * @param {string} rawUrl
@@ -105,24 +37,8 @@ async function resolveAll(host, lookup) {
  *   transient: the name did not resolve (this time); everything else is a permanent refusal.
  */
 async function checkEmbeddingAddress(rawUrl, { lookup = dns.promises.lookup, addressesPublic = (a) => ssrfWasm().ssrfAddressesPublic(a) } = {}) {
-  let url;
-  try { url = new URL(String(rawUrl)); } catch { return refuse('not a URL'); }
-  if (!['http:', 'https:'].includes(url.protocol)) return refuse('not an http(s) URL');
-  if (url.username || url.password) return refuse('credentials in the URL');
-  const host = url.hostname.replace(/^\[|\]$/g, '');
-  if (!host) return refuse('no host');
-  let addresses;
-  if (net.isIP(host)) addresses = [host];
-  else {
-    try { addresses = await resolveAll(host, lookup); } catch (err) { return unresolved(`the name does not resolve (${String(err?.code || err?.message || err).slice(0, 60)})`); }
-  }
-  if (!addresses.length) return unresolved('the name does not resolve');
-  if (addresses.some((a) => typeof a !== 'string' || !net.isIP(a))) return refuse('the name resolves to something that is not an address');
-  for (const a of addresses) {
-    const why = whyNotLocal(a, addressesPublic);
-    if (why) return refuse(`${host} is not on this network (${a} is ${why})`);
-  }
-  return { ok: true };
+  // The Rust port (ssrf.cjs) is asked too, as before #1755: both must agree the address is not public.
+  return checkServiceEndpoint(rawUrl, { lookup, paths: null, linkLocal: false, addressesPublic });
 }
 
 /**

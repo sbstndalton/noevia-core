@@ -193,9 +193,10 @@ test('the description runs on the default provider with its own headers on an on
 });
 
 // #1742(b): image-derived text (the Vision description, a retrieved image's caption) is put only into the
-// outgoing request's system message; it is never streamed to the client, and the server keeps no history of
-// its own (the replay is built from the client's stored transcript). So an on-box turn's description cannot
-// come back in a later off-box replay.
+// outgoing request's system message; it is never streamed to the client, and the server keeps only a
+// compaction summary of user and assistant text, never system notes (chat-context.cjs; the replay is built
+// from the client's stored transcript). So an on-box turn's description cannot come back in a later
+// off-box replay. What the assistant itself wrote is transcript text, though (next test, #1753).
 test('no image-derived text reaches an off-box replay of an on-box image turn (#1742)', async () => {
   const DERIVED = 'INV-2042';
   const first = await run({ visionModel: 'vision-model' });
@@ -208,4 +209,14 @@ test('no image-derived text reaches an off-box replay of an on-box image turn (#
   assert.equal(second.urls.some((u) => u.model === 'vision-model'), false);
   assert.equal(JSON.stringify(second.answer).includes(DERIVED), false, 'the off-box replay carries no image-derived text');
   assert.equal(JSON.stringify(second.answer).includes('Fixture image'), false);
+});
+
+// #1753: an assistant reply that restates image content is user-visible transcript text, not a system note,
+// so it is replayed like any other assistant text under the #1703 rules for client-sent history.
+test('an assistant reply that restates image content is replayed as transcript text (#1753)', async () => {
+  const history = [{ role: 'user', content: 'Read the synthetic total' }, { role: 'assistant', content: 'The synthetic total is INV-2042.' }];
+  const second = await run({ visionModel: 'vision-model', projectProviderId: 'second', history, message: 'And the date?', turnImageIds: [], expectImages: false });
+  assert.equal(second.urls.some((u) => u.model === 'vision-model'), false);
+  assert.ok(JSON.stringify(second.answer).includes('The synthetic total is INV-2042.'), 'the assistant text is replayed');
+  assert.equal(JSON.stringify(second.answer).includes('Fixture image'), false, 'no system-note image text rides along');
 });

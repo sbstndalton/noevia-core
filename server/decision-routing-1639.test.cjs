@@ -65,7 +65,8 @@ test('per-model T: Kev scores are tempered at 0.45, Laya scores are not', async 
 });
 
 test('a set override that is not a private decision-service URL disables sensitivity; it never falls back to the shared service', () => {
-  for (const url of ['https://cloud.example.com', 'http://203.0.113.7:8040', 'http://laya:8040/path', 'http://user:pw@laya:8040', 'garbage']) {
+  // #1755: a name (https://cloud.example.com) is judged at connect time (service-endpoint-1755.test.cjs).
+  for (const url of ['http://8.8.8.8:8040', 'http://203.0.113.7:8040', 'http://laya:8040/path', 'http://user:pw@laya:8040', 'garbage']) {
     const settings = createDecisionSettings({ store: memory(), env: { COWORK_DECISION_URL: KEV, COWORK_DECISION_MODEL: 'kev-0.8b', COWORK_SENSITIVITY_DECISION_URL: url } });
     assert.ok(settings.backend(), url);
     assert.equal(settings.sensitivityBackend(), null, url);
