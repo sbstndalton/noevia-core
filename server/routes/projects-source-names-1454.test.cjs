@@ -36,6 +36,7 @@ async function dav(t, initial = {}) {
 }
 
 function fixture(t, { baseUrl, project, remote = true }) {
+  const documentSources = {};
   const sent = [];
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-1454-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -52,7 +53,7 @@ function fixture(t, { baseUrl, project, remote = true }) {
     requestScope: new AsyncLocalStorage(), dispatch: async () => {},
     currentWorkspace: () => ({ dir, userId: 'u1', assertActive() {}, ragDir: () => path.join(dir, 'rag'), assetDir: () => path.join(dir, 'assets') }),
     authService: { diaryEnabled: () => true, getStorage: () => remote ? { kind: 'webdav', baseUrl, username: 'alice', secret: 'synthetic-secret' } : { kind: 'local' } },
-    storageClient, documents: { isDocument: (n) => /\.pdf$/i.test(n) }, documentSources: {}, rag: { deleteProjectFile() {}, indexProjectFile: async () => ({}) },
+    storageClient, documents: { isDocument: (n) => /\.pdf$/i.test(n) }, documentSources, rag: { deleteProjectFile() {}, indexProjectFile: async () => ({}) },
     fs, path, reasoningEffort: {}, projectAppearance: () => ({}),
     diaryExtras: { PROJECT_ID: 'diary-extras', chatProjectId: (id) => id, newProject: () => ({}) },
     PROJECTS: projects, DEFAULT_TOOLBOXES: ['core'], sanitizeToolboxes: (b) => b, getProvider: () => ({}), ensureRolesLoaded() {},
@@ -65,7 +66,7 @@ function fixture(t, { baseUrl, project, remote = true }) {
     await routes(req, {}, { path: url, authn: { user: { id: 'u1', role: 'member' } }, url: new URL(`http://localhost${url}`) });
     return sent.at(-1);
   };
-  return { upload, sent, project };
+  return { upload, sent, project, documentSources };
 }
 const note = (text, extra = {}) => ({ name: 'report.md', organized: true, dataBase64: Buffer.from(text).toString('base64'), ...extra });
 const existingSource = () => ({ name: `${FOLDER}/Text/report.md`, content: 'old', source: FOLDER, attachment: { id: 'a'.repeat(64), bytes: 3, group: 'Text', state: 'ready' } });
@@ -145,4 +146,17 @@ test('#1454: the document route refuses a PDF whose name an upload already has, 
   assert.equal(r.status, 409);
   assert.equal(r.body.code, 'sourceExists');
   assert.equal(f.project.files[0], old);
+});
+
+test('#1653: the plain storage upload reads a PDF before writing it, so a failed read leaves no orphan in storage', async (t) => {
+  const d = await dav(t, {});
+  const f = fixture(t, { baseUrl: d.baseUrl, project: proj([]) });
+  // fixture() wires an empty documentSources; a read that throws is exactly what must not strand a file.
+  f.documentSources.ingest = async () => { throw new Error('synthetic read failure'); };
+  await assert.rejects(f.upload(note('%PDF-1.4 synthetic', { organized: false, name: 'scan.pdf' })), /synthetic read failure/);
+  assert.deepEqual([...d.files.keys()], [], 'nothing was written to storage');
+  f.documentSources.ingest = async (_w, _id, name) => ({ name, content: 'text', document: { state: 'ready' } });
+  const r = await f.upload(note('%PDF-1.4 synthetic', { organized: false, name: 'scan.pdf' }));
+  assert.equal(r.status, 200);
+  assert.equal(d.files.get(`${FOLDER}/scan.pdf`), '%PDF-1.4 synthetic');
 });
