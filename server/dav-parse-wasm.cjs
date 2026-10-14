@@ -1207,9 +1207,17 @@ function ggufValue(v, depth = 0) {
 }
 /** Check a summary reply's shape and revive its numbers (exported for tests). */
 function ggufSummaryReply(s) {
-  if (!exactKeys(s, GGUF_SUMMARY_KEYS)) throw new DavParseError('gguf summary has unexpected keys', 'reply');
+  // #1708: parameterCount (#1197) is present exactly when the JS summary has one, and comes first as
+  // there. Refusing it made every real header (all have tensors) unreadable on the Rust path.
+  const counted = !!s && typeof s === 'object' && Object.hasOwn(s, 'parameterCount');
+  if (!exactKeys(s, counted ? ['parameterCount', ...GGUF_SUMMARY_KEYS] : GGUF_SUMMARY_KEYS)) throw new DavParseError('gguf summary has unexpected keys', 'reply');
   if (typeof s.arch !== 'string' || typeof s.name !== 'string' || typeof s.hasChatTemplate !== 'boolean') throw new DavParseError('gguf summary has unexpected types', 'reply');
   const out = {};
+  if (counted) {
+    const n = s.parameterCount === null ? undefined : ggufNumber(s.parameterCount);
+    if (typeof n !== 'number' || !Number.isFinite(n) || !(n > 0)) throw new DavParseError('gguf summary has an unexpected parameterCount', 'reply');
+    out.parameterCount = n;
+  }
   for (const k of GGUF_SUMMARY_KEYS) {
     if (k === 'arch' || k === 'name' || k === 'hasChatTemplate') out[k] = s[k];
     else if (GGUF_RAW_KEYS.has(k)) out[k] = ggufValue(s[k]);

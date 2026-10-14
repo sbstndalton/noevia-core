@@ -581,6 +581,12 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
         try{const r=await modelManager.inferenceEstimates();if(r.ok)models=r.body.models;else estimateError='engine';}
         catch(e){estimateError='engine';clientMessage(e,'');}
       }
+      // #1708: a model whose file was deleted is not in the budget table, as in the Models tab (#1695):
+      // the same installed list decides. An unreadable list leaves the rows as they are.
+      if(Array.isArray(models)){
+        let installed=null;try{installed=await modelsInstalled();}catch{installed=null;}
+        if(Array.isArray(installed)){const gone=new Set(installed.filter(m=>m?.missingFile===true).map(m=>m.name));models=models.filter(m=>!gone.has(m?.model));}
+      }
       return json(res,200,{...inferenceBudget.get(),models,...(estimateError?{estimateError}:{})});
     }
 
