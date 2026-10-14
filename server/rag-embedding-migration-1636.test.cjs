@@ -92,11 +92,14 @@ dbTest('default profile: the wire carries the raw chunk and query text, exactly 
   } finally { s.done(); }
 });
 
-dbTest('embeddinggemma-2 profile: documents carry their file title, queries the search prefix', async () => {
+dbTest('embeddinggemma-2 profile: documents are framed title: none (never the file name), queries the search prefix', async () => {
   const s = await setup({ active: { model: 'gemma-test', profile: 'embeddinggemma-2' } });
   try {
     await s.rag.indexProjectFile('p1', 'folder/Recipes.md', LARGE, USER_A);
-    for (const text of s.server.seen.flatMap((x) => x.input)) assert.ok(text.startsWith('title: Recipes.md | text: '), text.slice(0, 40));
+    for (const text of s.server.seen.flatMap((x) => x.input)) {
+      assert.ok(text.startsWith('title: none | text: '), text.slice(0, 40));
+      assert.ok(!text.includes('Recipes'), 'the file name is not sent');
+    }
     s.server.seen.length = 0;
     const hits = await s.rag.searchProject('p1', 'cherry', USER_A);
     assert.deepEqual(s.server.seen[0].input, ['task: search result | query: cherry']);

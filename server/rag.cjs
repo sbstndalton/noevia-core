@@ -411,8 +411,9 @@ async function embed(texts, { signal, kind = 'document', titles = null, target =
   return embedFramed(t, frame(t.profile, texts, { kind, titles }), signal);
 }
 
-// A project file's title for the document framing: its own name (the last path segment).
-const titleOf = (fileName) => String(fileName || '').split('/').pop();
+// #1636: project chunks are framed with the profile's untitled document prompt
+// (embeddinggemma-2: `title: none | text: …`), the same as the Diary's index. File names are not
+// sent: a name is not part of the chunk's text, and both indexes must use one framing.
 
 function openIndex(projectId, userId) {
   // Queued indexing may begin after account deletion. Refuse the directory
@@ -508,7 +509,7 @@ async function embedRowsInto(index, target, rows, { isCurrent = () => true, batc
   for (let i = 0; i < rows.length; i += batchSize) {
     if (!isCurrent()) break;
     const batch = rows.slice(i, i + batchSize);
-    const vectors = await embed(batch.map((r) => r.body), { kind: 'document', titles: batch.map((r) => titleOf(r.file)), target, signal });
+    const vectors = await embed(batch.map((r) => r.body), { kind: 'document', target, signal });
     // A newer run (or a delete) replaced these chunks while we were embedding: writing now
     // would attach vectors to ids that no longer mean this text.
     if (!isCurrent()) break;
