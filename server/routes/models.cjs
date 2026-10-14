@@ -141,12 +141,31 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
   // nothing to do. A section is removed only when both noevia's folder scan (missingFile) and the
   // model management service (hasFile: false) say its file is gone; Laya, sidecar models and
   // presets served elsewhere are never touched.
+  // #1698: the folder scan and the service's hasFile both come from the same models folder, so they
+  // agree even when that folder is unavailable (a dropped share, a briefly empty mount). The prune
+  // therefore refuses, changing nothing, when the scan lists no model file at all or when more than
+  // half of the ordinary presets would go: that is the folder missing, not models deleted.
+  const SCAN_UNTRUSTED = 'The model folder looks unavailable, so nothing was removed.';
+  async function freshFolderScan() {
+    if (!env.MODEL_LOADER_URL) return null;
+    const headers = { 'Content-Type': 'application/json', ...(env.MODEL_LOADER_TOKEN ? { 'X-Model-Loader-Token': env.MODEL_LOADER_TOKEN } : {}) };
+    try {
+      const r = await fetchJson(`${env.MODEL_LOADER_URL.replace(/\/+$/, '')}/api/v1/models`, { method: 'GET', headers }, 15000);
+      return r?.ok && Array.isArray(r.body?.models) ? r.body.models : null;
+    } catch { return null; }
+  }
   async function pruneMissingPresets() {
+    // A cached scan (possibly the glitch itself) must not drive a delete: drop it and the shared list.
+    modelScanCache.clear();
+    if (service.invalidateModelReads) service.invalidateModelReads();
+    const scan = await freshFolderScan();
+    if (!scan || scan.length === 0) return { ok: false, status: 409, code: 'scanUntrusted', error: SCAN_UNTRUSTED };
     let installed;
     try { installed = await modelsInstalledNow(); } catch { return { ok: false, status: 502, error: 'Could not list installed models.' }; }
-    const candidates = (Array.isArray(installed) ? installed : [])
-      .filter((m) => m && m.missingFile === true && m.system !== true && m.servedElsewhere !== true && !isSystemModel(m.name) && !isSidecarModel(m.name, env))
-      .map((m) => m.name);
+    const ordinary = (Array.isArray(installed) ? installed : [])
+      .filter((m) => m && m.system !== true && m.servedElsewhere !== true && !isSystemModel(m.name) && !isSidecarModel(m.name, env) && (m.source == null || m.source === 'preset'));
+    const candidates = ordinary.filter((m) => m.missingFile === true).map((m) => m.name);
+    if (candidates.length && candidates.length * 2 > ordinary.length) return { ok: false, status: 409, code: 'scanUntrusted', error: SCAN_UNTRUSTED, missing: candidates.length, presets: ordinary.length };
     const removed = [], kept = [];
     for (const name of candidates) {
       const r = await removePresetSection(name, { onlyWithoutFile: true });
@@ -615,7 +634,7 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       if (req.method !== 'POST') return json(res, 405, { error: 'method not allowed' });
       if (!modelManager.enabled) return json(res, 404, { error: 'model management is disabled' });
       const r = await pruneMissingPresets();
-      return json(res, r.status, r.ok ? { removed: r.removed, kept: r.kept, reloaded: r.reloaded } : { error: r.error });
+      return json(res, r.status, r.ok ? { removed: r.removed, kept: r.kept, reloaded: r.reloaded } : { error: r.error, ...(r.code ? { code: r.code } : {}) });
     }
 
     if (p === '/api/models/installed') {
