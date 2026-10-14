@@ -221,6 +221,10 @@ rag.init({ dataDir: DATA_DIR, inferenceUrl: INFERENCE_BASE, headersFn: () => inf
 // is logged and not used. Asynchronous (DNS), so it settles just after start-up, before the first re-index pass.
 require('./embedding-address.cjs').guardSeededAddresses(embeddingConfig);
 const embeddingMigration = require('./embedding-migration.cjs').createEmbeddingMigration({ config: embeddingConfig, rag });
+// #1668: the embedding service as the model manager runs it (which models cowork-embed serves, or
+// off). Refreshed in the background so the delete guard (model-system.cjs) follows it.
+const embeddingService = require('./embedding-service.cjs').install(require('./embedding-service.cjs').createEmbeddingService({ env: process.env, fetchJson }));
+if (process.env.MODEL_LOADER_URL) { embeddingService.refresh(); setInterval(() => embeddingService.refresh(), 10000).unref(); }
 // A re-index under way also covers files indexed meanwhile; with none under way nothing runs.
 rag.onIndexed(() => { if (embeddingConfig.next()) embeddingMigration.kick(); });
 if (embeddingConfig.next()) setTimeout(() => embeddingMigration.kick(), 30000).unref();
@@ -1003,7 +1007,8 @@ const reasoningSettingsRoutes = require('./routes/reasoning-settings.cjs').creat
 const samplingSettingsRoutes = require('./routes/sampling-settings.cjs').createSamplingSettingsRoutes({ json, readBody, authService });
 // GET /api/health: the default provider, the Diary sidecar and retrieval (routes/health.cjs).
 // The embedding model of retrieval, for administrators (routes/embedding.cjs, #1636).
-const embeddingRoutes = require('./routes/embedding.cjs').createEmbeddingRoutes({ json, readJson, migration: embeddingMigration, authService, fetchJson, DIARY_BASE, diaryServiceHeaders: diary.serviceHeaders });
+const embeddingRoutes = require('./routes/embedding.cjs').createEmbeddingRoutes({ json, readJson, migration: embeddingMigration, authService, fetchJson, DIARY_BASE, diaryServiceHeaders: diary.serviceHeaders,
+  service: embeddingService, resolveFile: (model) => require('./embedding-service.cjs').resolveModelFile({ env: process.env, fetchJson, model }) });
 const healthRoutes = require('./routes/health.cjs').createHealthRoutes({ json, fetchJson, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, DIARY_BASE, diaryHeaders, authService, rag });
 // GET /api/ready (#297): unauthenticated, mounted before the session gate below alongside the
 // sign-in routes. isReady is set once startup wiring under require.main finishes (see below).

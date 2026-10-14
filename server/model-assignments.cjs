@@ -11,6 +11,8 @@ const { servesModel } = require('./embedding-served.cjs');
 //
 // state ids: 'active' | 'switching' (a re-index to `next` is under way) | 'missing' (the
 // configured model is not installed) | 'off' (the service is not configured or turned off).
+// #1668: `managed` marks an embedding service noevia runs itself (embedding-service.cjs): switching
+// loads the model first, and `canTurnOff` offers "Turn embedding off".
 
 const truthy = (v) => /^(1|true|on)$/i.test(String(v || '').trim());
 
@@ -27,7 +29,7 @@ const isRerankModel = (m) => (m.labels || []).some((l) => /^rerank/i.test(l)) ||
  *           env: object, embedding: {active?:{model:string,profile:string}|null,next?:{model:string}|null,coverage?:object}|null,
  *           isSystem: (name:string) => boolean, admin: boolean }} input
  */
-function modelAssignments({ installed, env = {}, embedding = null, isSystem = () => false, admin = false, served = null }) {
+function modelAssignments({ installed, env = {}, embedding = null, isSystem = () => false, admin = false, served = null, service = null }) {
   const list = Array.isArray(installed) ? installed : [];
   const byName = new Map(list.map((m) => [m.name, m]));
   const stateOf = (model) => {
@@ -45,10 +47,18 @@ function modelAssignments({ installed, env = {}, embedding = null, isSystem = ()
     // #1660 review: true/false = the embeddings server's /v1/models does / does not list it
     // (embedding-served.cjs matching); null = unknown (not asked, or it could not be read).
     served: Array.isArray(served) ? servesModel(served, m.name) : null }));
-  const embedState = next ? 'switching' : stateOf(active);
-  services.push({ id: 'embedding', model: active, state: active && active.toLowerCase() === 'default' ? 'active' : embedState,
+  // #1668: when noevia manages the embedding service, any installed embedding model can be chosen
+  // (the service loads it before anything is re-indexed), and the admin can turn embedding off.
+  const managed = !!service && service.managed === true;
+  const serviceOff = managed && service.enabled === false;
+  const embedState = next ? 'switching' : serviceOff ? 'off' : stateOf(active);
+  const options = managed ? embedOptions.map((o) => ({ ...o, served: true })) : embedOptions;
+  services.push({ id: 'embedding', model: active, state: !serviceOff && active && active.toLowerCase() === 'default' ? 'active' : embedState,
     ...(next ? { next, ready: embedding?.coverage?.next?.ready === true } : {}),
-    canChange: admin && !!embedding, ...(admin ? { options: embedOptions, baseUrl: embedding?.active?.baseUrl ?? null } : {}) });
+    ...(managed ? { managed: true } : {}),
+    canChange: admin && !!embedding,
+    ...(admin && managed ? { canTurnOff: !serviceOff && !next } : {}),
+    ...(admin ? { options: serviceOff ? list.filter((m) => !m.missingFile && isEmbeddingModel(m)).map((m) => ({ model: m.name, profile: embeddingProfileFor(m.name), served: true })) : options, baseUrl: embedding?.active?.baseUrl ?? null } : {}) });
 
   const rerankOn = truthy(env.NOEVIA_FEATURE_RAG_RERANK);
   const rerank = String(env.RERANK_MODEL || '').trim() || null;

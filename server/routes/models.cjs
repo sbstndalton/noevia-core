@@ -563,7 +563,8 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       let served = null;
       if (admin) { try { served = await servedEmbeddingModels({ baseUrl: embedding?.active?.baseUrl || null }); } catch { served = null; } }
       if (!Array.isArray(served)) served = null;
-      return json(res, 200, { ...modelAssignments({ installed, env, embedding, isSystem: (n) => isSystemModel(n), admin, served }), available: Array.isArray(installed) });
+      const service = require('../embedding-service.cjs').current()?.status() || null;
+      return json(res, 200, { ...modelAssignments({ installed, env, embedding, isSystem: (n) => isSystemModel(n), admin, served, service }), available: Array.isArray(installed) });
     }
 
     if (p === '/api/models/installed') {

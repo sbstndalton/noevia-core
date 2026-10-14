@@ -235,8 +235,18 @@ async function probeEmbeddingEndpoint() {
 //   'available'   — the probe found the embedder answering (sidecar) or the embed model listed
 //                    (router) within the timeout.
 // Never throws; never issues more than one live probe per RETRIEVAL_PROBE_TTL_MS window.
+// #1668: the admin turned the embedding service off (embedding-service.cjs). Search says so
+// instead of probing a stopped container; small files and excerpts still reach the model.
+function embeddingOff(target = null) {
+  const service = require('./embedding-service.cjs').current();
+  if (!service || !service.managed() || service.enabled()) return false;
+  const t = target || embeddingConfig.active();
+  return !t || !t.baseUrl || t.baseUrl === service.baseUrl;
+}
+
 async function retrievalStatus() {
   if (!ragAvailable()) return 'unavailable';
+  if (embeddingOff()) return 'off';
   const now = Date.now();
   if (retrievalProbeCache && now - retrievalProbeCache.at < RETRIEVAL_PROBE_TTL_MS) {
     return retrievalProbeCache.status;
@@ -336,6 +346,10 @@ async function servedModels(target, { timeoutMs = 10000 } = {}) {
   const body = await readCappedJson(res, SERVED_MODELS_MAX_BYTES);
   const ids = new Set();
   for (const m of Array.isArray(body?.data) ? body.data : []) {
+    // #1668: a llama.cpp router lists every preset with status.value; only a loaded one is served.
+    // An unloaded preset would be loaded on demand, but nothing has proved it runs, and a switch
+    // must never label vectors with a model the server has not actually loaded.
+    if (m?.status && typeof m.status === 'object' && 'value' in m.status && m.status.value !== 'loaded') continue;
     if (typeof m?.id === 'string') ids.add(m.id);
     for (const a of Array.isArray(m?.aliases) ? m.aliases : []) if (typeof a === 'string') ids.add(a);
   }
@@ -393,6 +407,7 @@ async function embedFramed(target, input, signal) {
 async function embed(texts, { signal, kind = 'document', titles = null, target = null } = {}) {
   if (!texts.length) return [];
   const t = target || embeddingConfig.active();
+  if (embeddingOff(t)) throw Object.assign(new Error('Embedding is turned off.'), { code: 'embeddingOff' });
   return embedFramed(t, frame(t.profile, texts, { kind, titles }), signal);
 }
 
@@ -797,4 +812,4 @@ const trackedFileState = () => ({ queues: fileQueues.size, generations: fileGene
 
 // #1646: the sentence a hybrid cloud route without a grant removes (read_project_file is not offered there).
 const READ_FILE_HINT = ' Use read_project_file with PDF startPage/endPage and offset for pages beyond the summary.';
-module.exports = { READ_FILE_HINT, servedModels, servedModelsCached, init, trackedFileState, indexProjectFile, deleteProjectFile, searchProject, filesContext, chunkText, ragAvailable, retrievalStatus, embed, embedModel, embeddingIdentity, embeddingConfig: getEmbeddingConfig, onIndexed, listIndexes, indexCoverage, fillMissing, dropIndexSlot, rerankPool };
+module.exports = { embeddingOff, READ_FILE_HINT, servedModels, servedModelsCached, init, trackedFileState, indexProjectFile, deleteProjectFile, searchProject, filesContext, chunkText, ragAvailable, retrievalStatus, embed, embedModel, embeddingIdentity, embeddingConfig: getEmbeddingConfig, onIndexed, listIndexes, indexCoverage, fillMissing, dropIndexSlot, rerankPool };

@@ -21,8 +21,11 @@
 
 const { checkServed } = require('../embedding-served.cjs');
 
+const { sameTarget } = require('../embedding-config.cjs');
+
 const PASS = Symbol('unhandled');
-const ACTIONS = new Set(['set-next', 'clear-next', 'switch', 'rollback', 'finish']);
+const ACTIONS = new Set(['set-next', 'clear-next', 'switch', 'rollback', 'finish', 'service-switch', 'service-off']);
+const SERVICE_ACTIONS = new Set(['service-switch', 'service-off']);
 const SCOPES = new Set(['all', 'projects', 'diary']);
 
 /**
@@ -36,7 +39,7 @@ const SCOPES = new Set(['all', 'projects', 'diary']);
  * @param {() => object} [deps.diaryServiceHeaders]
  * @param {(url:string) => Promise<{ok:boolean,reason?:string}>} [deps.checkAddress]
  */
-function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJson, DIARY_BASE = '', diaryServiceHeaders = () => ({ 'Content-Type': 'application/json' }), checkAddress = require('../embedding-address.cjs').checkEmbeddingAddress, servedModels = (target) => require('../rag.cjs').servedModels(target) }) {
+function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJson, DIARY_BASE = '', diaryServiceHeaders = () => ({ 'Content-Type': 'application/json' }), checkAddress = require('../embedding-address.cjs').checkEmbeddingAddress, servedModels = (target) => require('../rag.cjs').servedModels(target), service = null, resolveFile = null, waitTimeoutMs = 180000 }) {
   const diaryUrl = DIARY_BASE ? `${String(DIARY_BASE).replace(/\/+$/, '')}/api/internal/embedding` : '';
 
   async function diary(method, body) {
@@ -68,23 +71,85 @@ function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJs
     if (!authn?.user) return json(res, 401, { error: 'Sign in required' });
     if (authn.user.role !== 'admin') return json(res, 403, { error: 'Administrator required' });
     if (req.method === 'GET') {
-      return json(res, 200, { projects: migration.status(), diary: await diary('GET') });
+      if (service) await service.refresh();
+      return json(res, 200, { projects: migration.status(), diary: await diary('GET'), ...(service?.managed() ? { service: service.status() } : {}) });
     }
     if (req.method !== 'POST') return json(res, 405, { error: 'Method not allowed' });
     let body;
     try { body = await readJson(req); } catch { return json(res, 400, { error: 'invalid JSON' }); }
     if (!body || typeof body !== 'object' || Array.isArray(body)) return json(res, 400, { error: 'A JSON object is required' });
     const action = String(body.action || '');
-    const scope = String(body.scope || 'all');
     if (!ACTIONS.has(action)) return json(res, 400, { error: `action must be one of ${[...ACTIONS].join(', ')}` });
-    if (!SCOPES.has(scope)) return json(res, 400, { error: 'scope must be all, projects or diary' });
-    if (action === 'set-next' && (!body.target || typeof body.target !== 'object')) return json(res, 400, { error: 'set-next needs a target { baseUrl, model, profile }' });
+    const r = await apply(body, authn);
+    return json(res, r.status, r.body);
+  }
+
+  const reply = (status, body) => ({ status, body });
+
+  // #1668: which models the embedding service must serve for the configuration `c`: every target
+  // (active, next, previous) that lives on the service, each with its file. A target whose file is
+  // not known (not installed any more) is left out; the service then cannot serve it, which the
+  // served-model check reports.
+  function servedSet(c) {
+    const out = [];
+    for (const t of [c.active, c.next, c.previous]) {
+      if (!t || (t.baseUrl || null) !== service.baseUrl || out.some((e) => e.model === t.model)) continue;
+      const file = service.fileOf(t.model);
+      if (file) out.push({ model: t.model, file });
+    }
+    return out.slice(0, 2);
+  }
+
+  async function syncService() {
+    if (!service?.managed() || !service.enabled()) return;
+    const want = servedSet(migration.status());
+    try { if (want.length) await service.serve(want); } catch { /* the next sync retries; delete stays guarded */ }
+  }
+
+  async function serviceAction(action, body, authn) {
+    if (!service?.managed()) return reply(409, { error: 'The embedding service is not managed by noevia on this server (see docs/deployment.md, #1668).', code: 'notManaged' });
+    const c = migration.status();
+    if (action === 'service-off') {
+      if (c.next) return reply(409, { error: 'A re-index is under way. Cancel it before turning embedding off.', code: 'reindexUnderway' });
+      try { await service.serve([]); } catch (err) { return reply(err.status || 502, { error: err.message, code: err.code }); }
+      authService.audit?.('embedding.service-off', authn.user.id, null, {});
+      return reply(200, { service: service.status() });
+    }
+    // service-switch: { model, profile }
+    const model = String(body.model || '').trim();
+    if (!model) return reply(400, { error: 'service-switch needs a model' });
+    if (c.next) return reply(409, { error: 'A re-index is already under way. Finish or cancel it first.', code: 'reindexUnderway' });
+    const file = resolveFile ? await resolveFile(model).catch(() => null) : null;
+    if (!file) return reply(404, { error: `${model} is not an installed model file.`, code: 'modelNotInstalled' });
+    const target = { baseUrl: service.baseUrl, model, profile: body.profile };
+    const fromOff = !service.enabled();
+    const activeOnService = c.active && (c.active.baseUrl || null) === service.baseUrl && !fromOff;
+    const keep = activeOnService ? servedSet({ active: c.active }) : [];
+    if (keep.some((e) => e.model === model)) return reply(409, { error: `${model} is already the embedding model.`, code: 'alreadyActive' });
+    try { await service.serve([...keep, { model, file }]); } catch (err) { return reply(err.status || 502, { error: err.message, code: err.code }); }
+    const loaded = await service.waitLoaded([model], { timeoutMs: waitTimeoutMs });
+    if (!loaded) return reply(504, { error: `The embedding service did not load ${model} in time. Nothing was re-indexed; try again or pick another model.`, code: 'serviceNotLoaded', service: service.status() });
+    // Turning embedding back on with the model the stored vectors already belong to: nothing to re-index.
+    if (fromOff && c.active && sameTarget(c.active, { ...target, profile: target.profile || c.active.profile })) {
+      return reply(200, { service: service.status(), projects: migration.status() });
+    }
+    const r = await apply({ action: 'set-next', scope: 'all', target: { ...target, diaryBaseUrl: service.baseUrl } }, authn);
+    return { status: r.status, body: { ...r.body, service: service.status() } };
+  }
+
+  async function apply(body, authn) {
+    const action = String(body.action || '');
+    const scope = String(body.scope || 'all');
+    if (!ACTIONS.has(action)) return reply(400, { error: `action must be one of ${[...ACTIONS].join(', ')}` });
+    if (SERVICE_ACTIONS.has(action)) return serviceAction(action, body, authn);
+    if (!SCOPES.has(scope)) return reply(400, { error: 'scope must be all, projects or diary' });
+    if (action === 'set-next' && (!body.target || typeof body.target !== 'object')) return reply(400, { error: 'set-next needs a target { baseUrl, model, profile }' });
     if (action === 'set-next') {
       for (const address of [body.target.baseUrl, body.target.diaryBaseUrl]) {
         if (address == null || !String(address).trim()) continue; // empty: the inference engine
         const verdict = await checkAddress(String(address).trim());
         if (!verdict.ok) {
-          return json(res, 400, { error: `The embeddings server must be on this network: it receives the text of every project and the Diary (${verdict.reason}).`, code: 'publicEndpoint' });
+          return reply(400, { error: `The embeddings server must be on this network: it receives the text of every project and the Diary (${verdict.reason}).`, code: 'publicEndpoint' });
         }
       }
     }
@@ -104,12 +169,12 @@ function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJs
         // With no address the Diary is sent base_url '' and resolves its own default server, which
         // this check cannot see: probing web's engine instead could approve a model the Diary's
         // server does not serve. Fail closed; the admin names the Diary's server explicitly.
-        if (!diaryAddress) return json(res, 409, { error: 'Name the Diary\'s embeddings server so noevia can check it serves this model.', code: 'diaryEndpointRequired' });
+        if (!diaryAddress) return reply(409, { error: 'Name the Diary\'s embeddings server so noevia can check it serves this model.', code: 'diaryEndpointRequired' });
         addresses.add(diaryAddress);
       }
       for (const baseUrl of addresses) {
         const r = await checkServed(servedModels, { baseUrl, model });
-        if (!r.ok) return json(res, 409, { error: r.error, code: r.code, ...(r.served ? { served: r.served } : {}) });
+        if (!r.ok) return reply(409, { error: r.error, code: r.code, ...(r.served ? { served: r.served } : {}) });
       }
     }
     const out = {};
@@ -122,9 +187,12 @@ function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJs
       scope, model: body.target?.model || null, profile: body.target?.profile || null, force: body.force === true,
       projects: out.projects ? (out.projects.error ? 'refused' : 'ok') : 'skipped', diary: out.diary ? (out.diary.error ? 'refused' : 'ok') : 'skipped',
     });
+    // #1668: after a finish, cancel or rollback the service serves only what is still configured,
+    // so the model that left becomes deletable once the router has dropped it.
+    if (['finish', 'clear-next', 'rollback', 'switch'].includes(action) && out.projects && !out.projects.error) await syncService();
     const failed = [out.projects, out.diary].filter(Boolean).filter((r) => r.error);
     const status = failed.length === 0 ? 200 : failed.length === [out.projects, out.diary].filter(Boolean).length ? (failed[0].status && failed[0].status >= 400 && failed[0].status < 600 ? failed[0].status : 502) : 207;
-    return json(res, status, out);
+    return { status, body: out };
   }
 
   return async function embeddingRoutes(req, res, ctx) {
