@@ -171,15 +171,18 @@ function ruleDecisionWith(message, offered, { boxes, readOnly, now }) {
 /** readout's options before the service is asked: the offered read-only tools (#739: a confirmed
  *  "search" frame puts the offered web and project-search tools first, so they survive option
  *  trimming; only reorders what is offered, nothing is added), the question, and shapeOptions. */
-function readoutOptions(offered, { boxes, readOnly, bias, limits }) {
+function readoutOptions(offered, { boxes, readOnly, bias, limits, wording = 'laya' }) {
   let readTools = [...offered.values()].filter((t) => readOnly(toolName(t)));
   const preferred = Array.isArray(bias?.prefer) ? bias.prefer.flatMap((k) => boxes[k] || []) : [];
   if (preferred.length) {
     const rank = (t) => { const i = preferred.indexOf(toolName(t)); return i < 0 ? preferred.length : i; };
     readTools = readTools.map((t, i) => [t, i]).sort((a, b) => rank(a[0]) - rank(b[0]) || a[1] - b[1]).map(([t]) => t);
   }
-  const question = typeof bias?.hint === 'string' && bias.hint ? `${QUESTION} ${bias.hint.slice(0, 160)}` : QUESTION;
-  return { readTools, preferred, question, shape: () => shapeOptions(readTools, limits, boxes, question.length, preferred) };
+  const hint = typeof bias?.hint === 'string' && bias.hint ? bias.hint.slice(0, 160) : '';
+  const base = questionFor(wording);
+  const question = hint ? `${base} ${hint}` : base;
+  const budgetChars = BUDGET_QUESTION_CHARS + (hint ? 1 + hint.length : 0);
+  return { readTools, preferred, question, shape: () => shapeOptions(readTools, limits, boxes, budgetChars, preferred) };
 }
 
 /** readout's reading of a service answer that is not a fallback: { reason, confidence? } or
@@ -204,7 +207,7 @@ function readAnswer(result, message, offered, { boxes, readOnly, now, minConfide
  *   log: text-free entries only (tool names, source, mode, confidence, timings, never the message).
  */
 function createToolGate({ enabled, decide, boxes = DEFAULT_BOXES, isWriteTool, log = () => {}, now = Date.now,
-  minConfidence = DEFAULT_MIN_CONFIDENCE, deadlineMs = DEFAULT_DEADLINE_MS, limits = null, unavailable = () => null,
+  minConfidence = DEFAULT_MIN_CONFIDENCE, deadlineMs = DEFAULT_DEADLINE_MS, limits = null, unavailable = () => null, wording = 'laya',
   warn = (line) => console.warn(line), env = process.env, wasmLoader = defaultLoader }) {
   const value = (v) => (typeof v === 'function' ? v() : v);
   const safeLog = (entry) => { try { log(entry); } catch { /* logging never breaks a chat */ } };
@@ -223,8 +226,12 @@ function createToolGate({ enabled, decide, boxes = DEFAULT_BOXES, isWriteTool, l
   const ruleDecision = (message, offered) => ruleDecisionWith(message, offered, { boxes, readOnly, now });
 
   async function readout(message, offered, bias, impl) {
-    const lim = value(limits);
-    const { readTools, question, shape } = readoutOptions(offered, { boxes, readOnly, bias, limits: lim });
+    // #1639: the wording of the model behind the service; only the Kev question is longer than the port
+    // counts, so only it lowers the choice budget (Laya: the limits as given, as before #1639).
+    let words = 'laya';
+    try { words = value(wording) === 'kev' ? 'kev' : 'laya'; } catch { /* unknown: Laya's */ }
+    const lim = budgetLimits(value(limits), questionFor(words));
+    const { readTools, question, shape } = readoutOptions(offered, { boxes, readOnly, bias, limits: lim, wording: words });
     if (!readTools.length) return { reason: 'no-read-tools' };
     const blocked = stage2Blocked();
     if (blocked) return { reason: blocked };
@@ -353,7 +360,23 @@ function createToolGate({ enabled, decide, boxes = DEFAULT_BOXES, isWriteTool, l
   return { evaluate, record };
 }
 
+// The Stage 2 question, per decision model (#1639, decision-models.cjs `wording`). 'laya' is the one
+// every release before #1639 sent, kept byte-identical for Laya and any unknown model (#1739).
+// 'kev' was tuned for Kev-0.8B on a seeded tuning split of tools/decision-eval's synthetic cases (48.5%
+// -> 69.1% there; held-out results on #1639): the Laya question's "must" made Kev answer "none" to
+// nearly every message, and saying that the assistant on its own has no current news and none of the
+// user's data moved web search from 2/16 to 13/16. With Laya it cost English tool-gate accuracy.
 const QUESTION = 'Which tool, if any, must the assistant call before answering this user message?';
+const KEV_QUESTION = 'Without tools the assistant knows no current news and nothing the user wrote or saved. Which tool does it need, if any?';
+const questionFor = (wording) => (wording === 'kev' ? KEV_QUESTION : QUESTION);
+// The Rust port (noevia-rs crates/tool-gate; TOOL_GATE_IMPL=wasm compares the shaped options) counts the
+// question as 79 characters plus any hint, the length of QUESTION, and tests/fixtures/tool-gate.v1.json
+// must stay byte-identical with the port's copy. So shapeOptions and readoutOptions still count
+// BUDGET_QUESTION_CHARS, and with the longer Kev question the gate itself (budgetLimits) lowers the
+// choice budget it gives both sides by the extra characters. Both then shape the same options, and
+// question plus options stay within maxChoiceChars (Laya's option-head budget). Change this number
+// only together with the port.
+const BUDGET_QUESTION_CHARS = 79;
 const NONE_ID = 'none';
 const MIN_LABEL_CHARS = 12;
 
@@ -365,7 +388,7 @@ const MIN_LABEL_CHARS = 12;
  * with a label of at least MIN_LABEL_CHARS; the service sees the id, so the label is the description
  * alone. "none" is always the last option. `trimmed` counts tools left out.
  */
-function shapeOptions(readTools, limits, boxes = DEFAULT_BOXES, questionChars = QUESTION.length, preferred = []) {
+function shapeOptions(readTools, limits, boxes = DEFAULT_BOXES, questionChars = BUDGET_QUESTION_CHARS, preferred = []) {
   const describe = (t) => String(t.function?.description || '').replace(/\s+/g, ' ').trim();
   if (!limits || !Number.isFinite(limits.maxOptions)) {
     const tools = readTools.slice(0, MAX_OPTIONS - 1);
@@ -387,6 +410,16 @@ function shapeOptions(readTools, limits, boxes = DEFAULT_BOXES, questionChars = 
     }
     tools = tools.slice(0, -1);
   }
+}
+
+/** #1639: `limits` with the choice budget lowered by the characters `question` has beyond what the port
+ *  counts, so question plus options fit maxChoiceChars and the port, given the same limits, shapes the
+ *  same options. A question no longer than that (Laya's), no limits, or no finite choice budget: the
+ *  limits object itself, unchanged. The cut does not depend on maxOptions (#1740). */
+function budgetLimits(limits, question = KEV_QUESTION) {
+  const excess = String(question).length - BUDGET_QUESTION_CHARS;
+  if (!limits || excess <= 0 || !Number.isFinite(Number(limits.maxChoiceChars))) return limits;
+  return { ...limits, maxChoiceChars: Number(limits.maxChoiceChars) - excess };
 }
 
 /** Lower bound of the selected option's readout interval if reported, else its share/confidence. */
@@ -472,6 +505,6 @@ function stricterDecision(js, port) {
   return { tool: js.tool, mode: 'require' };
 }
 
-module.exports = { createToolGate, shapeOptions, searchQuery, diaryMonth, publicUrlPattern, prefetchableSearch, DEFAULT_BOXES, DEFAULT_MIN_CONFIDENCE,
+module.exports = { createToolGate, shapeOptions, BUDGET_QUESTION_CHARS, budgetLimits, searchQuery, diaryMonth, publicUrlPattern, prefetchableSearch, DEFAULT_BOXES, DEFAULT_MIN_CONFIDENCE,
   toolGateImpl, ruleDecisionWith, readoutOptions, readAnswer, toolProjection, offeredProjection, boxesProjection, limitsProjection,
-  numberProjection, stricterDecision, QUESTION };
+  numberProjection, stricterDecision, QUESTION, KEV_QUESTION, questionFor };

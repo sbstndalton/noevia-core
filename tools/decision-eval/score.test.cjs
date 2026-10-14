@@ -131,3 +131,16 @@ test('one temperature refit on a held-out split cools an overconfident model and
   assert.ok(s.summarize(rows).calibrationRefit.eceAfter < 0.1);
   assert.equal(s.temperatureRefit([rec({ ok: false })]), null);
 });
+
+test('--temperature: a fixed T sharpens or flattens scores, keeps the argmax, and leaves failed records alone', () => {
+  const rows = [rec({ scores: { fast: 0.6, smart: 0.4 } }), rec({ id: 'y', ok: false, selected: null, scores: null })];
+  const sharp = s.applyTemperature(rows, 0.5);
+  // 0.6^2 / (0.6^2 + 0.4^2) = 0.36 / 0.52
+  close(sharp[0].scores.fast, 0.36 / 0.52);
+  assert.equal(sharp[1], rows[1]);
+  assert.equal(s.applyTemperature(rows, 1), rows);
+  assert.equal(s.judge(sharp[0]).correct, s.judge(rows[0]).correct);
+  assert.ok(s.applyTemperature(rows, 2)[0].scores.fast < 0.6);
+  assert.throws(() => s.applyTemperature(rows, 0), /positive/);
+  assert.throws(() => s.applyTemperature(rows, NaN), /positive/);
+});

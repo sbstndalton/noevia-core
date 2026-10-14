@@ -175,3 +175,69 @@ test('a long adversarial message is linear under the switch (the JS strip is qua
   assert.ok(Date.now() - portStart < 10_000);
   assert.equal(port.decision.mode, 'prefetch');
 });
+
+// #1740: the lowered choice budget (#1639) is exercised through the gate itself: service limits from
+// decision-settings (SERVICE_LIMITS, what production passes as `limits`), a frame hint, and both
+// wordings. With the Kev question the gate lowers maxChoiceChars by 40 for the JS shaping AND the port
+// (confirmOptions); a one-sided change would turn every Stage 2 answer into impl-mismatch here.
+test('#1740: service limits plus a hint, both wordings: the port shapes the options the JS sends, so the answer is used', { skip: skipWasm }, async () => {
+  const { SERVICE_LIMITS } = require('../../server/decision-settings.cjs');
+  const rand = mulberry32(0x1740);
+  const pick = (l) => l[Math.floor(rand() * l.length)];
+  const NAMES = ['tavily_extract', 'web_fetch', 'tavily_search', 'web_search', 'wikipedia_search', 'diary_read_month', 'diary_list_months',
+    'nc_webdav_search_files', 'project_search', 'synthetic_reader_a', 'synthetic_reader_b', 'Web-Fetch', 'notes.lookup'];
+  const HINTS = [null, 'The user framed this chat as a lookup.', 'h'.repeat(300), 'A tool is expected for this action.'];
+  const sizes = { laya: new Set(), kev: new Set() };
+  let asked = 0;
+  for (let n = 0; n < 400; n++) {
+    const names = [...new Set(Array.from({ length: 1 + Math.floor(rand() * 10) }, () => pick(NAMES)))];
+    const tools = names.map((name) => ({ type: 'function', function: { name, description: `${name} reads synthetic data. `.repeat(1 + Math.floor(rand() * 8)), parameters: { properties: {} } } }));
+    const hint = pick(HINTS);
+    const bias = { prefer: rand() < 0.5 ? ['search'] : [], ...(hint ? { hint } : {}) };
+    const wording = n % 2 ? 'kev' : 'laya';
+    const selected = pick([...names, 'none']);
+    const run = async (impl) => {
+      const requests = [];
+      const gate = tg.createToolGate({ enabled: () => true, isWriteTool: () => false, now: () => 0, boxes: tg.DEFAULT_BOXES, unavailable: () => null,
+        limits: () => SERVICE_LIMITS, wording, env: { TOOL_GATE_IMPL: impl }, log: () => {}, warn: () => {},
+        decide: async (r) => { requests.push(r); return { selected, scores: { [selected]: 0.9 }, confidence: 0.9 }; } });
+      // A message no rule answers, so Stage 2 runs.
+      return { out: await gate.evaluate('Please take care of the synthetic thing', tools, bias), requests };
+    };
+    const js = await run('js');
+    const sw = await quietly(() => run('wasm'));
+    const label = JSON.stringify({ n, wording, names, hint: hint && hint.length });
+    assert.equal(js.requests.length, 1, label);
+    assert.deepEqual(sw.requests, js.requests, `the port agreed on the options, so the same request was sent: ${label}`);
+    assert.deepEqual(sw.out.decision, js.out.decision, label);
+    const req = js.requests[0];
+    assert.equal(req.question.startsWith(tg.questionFor(wording)), true, label);
+    const chars = req.question.length + req.options.reduce((s, o) => s + o.id.length + o.label.length + 2, 0);
+    assert.ok(chars <= SERVICE_LIMITS.maxChoiceChars, `${chars} chars: ${label}`);
+    sizes[wording].add(req.options.map((o) => o.label.length).join());
+    asked++;
+  }
+  assert.equal(asked, 400);
+  assert.ok(sizes.laya.size > 20 && sizes.kev.size > 20, 'varied trimming in both wordings');
+});
+
+test('#1740: the port given the gate\'s limits shapes exactly what readoutOptions shapes, for both questions', { skip: skipWasm }, () => {
+  const { SERVICE_LIMITS } = require('../../server/decision-settings.cjs');
+  const tool = (name, d) => ({ type: 'function', function: { name, description: d, parameters: { properties: {} } } });
+  const offered = new Map([tool('tavily_search', 'Search the web for current facts and news.'), tool('tavily_extract', 'Read the text of a web page from its URL.'),
+    tool('diary_read_month', "Read the user's own diary entries for a month."), tool('nc_webdav_search_files', "Find the user's own stored files and documents.")].map((t) => [t.function.name, t]));
+  const seen = {};
+  for (const wording of ['laya', 'kev']) {
+    for (const hint of [null, 'The user framed this chat as a lookup.']) {
+      const lim = tg.budgetLimits(SERVICE_LIMITS, tg.questionFor(wording));
+      const js = tg.readoutOptions(offered, { boxes: tg.DEFAULT_BOXES, readOnly: () => true, bias: hint ? { hint } : null, limits: lim, wording }).shape();
+      const port = davParseWasm.toolGateOptions(tg.offeredProjection(offered, () => true), null, hint, tg.limitsProjection(lim), tg.boxesProjection(tg.DEFAULT_BOXES));
+      assert.deepEqual({ trimmed: port.trimmed, options: port.options.map((o) => ({ id: o.id, label: o.label })) }, js, `${wording} ${hint}`);
+      seen[`${wording} ${hint ? 'hint' : '-'}`] = Math.max(...js.options.slice(0, -1).map((o) => o.label.length));
+    }
+  }
+  // The longest label: 44 with Laya's question (main), 34 with Kev's (40 characters less over 4 tools).
+  assert.equal(seen['laya -'], 44);
+  assert.equal(seen['kev -'], 34);
+  assert.ok(seen['kev hint'] < seen['laya hint']);
+});
