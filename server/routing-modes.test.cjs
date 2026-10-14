@@ -1051,3 +1051,20 @@ test('#1592: preRule skips only the health rule when asked', () => {
   assert.equal(rm.preRule(HEALTH_TEXT, { health: false }), null);
   assert.equal(rm.preRule(`${HEALTH_TEXT} ${SYN_IBAN}`, { health: false }), 'iban');
 });
+
+// #1703: a client-sent private tool entry after an assistant reply never leaves the box on a routed cloud turn.
+// Routing and the Diary check still read the unfiltered history, so a Diary chat stays local and keeps its history.
+test('#1703: a routed cloud turn drops a private tool entry from the replayed history; local keeps it, Diary stays local', async (t) => {
+  const SECRET = 'SYNTHETIC-NOTES-SECRET-1703';
+  const history = [{ role: 'user', content: 'q' }, { role: 'assistant', content: 'a' }, { role: 'tool', name: 'nc_notes_search_notes', content: SECRET }];
+  const cloud = await run(t, { flag: true, settings: { ...HYBRID, mode: 'cloud' }, history });
+  assert.ok(cloud.upstream[0].url.startsWith(CLOUD));
+  assert.equal(JSON.stringify(cloud.upstream[0].body).includes(SECRET), false, 'the Notes content is absent upstream on cloud');
+  const local = await run(t, { flag: true, settings: { ...HYBRID, mode: 'local' }, history });
+  assert.ok(local.upstream[0].url.startsWith(LOCAL));
+  assert.ok(JSON.stringify(local.upstream[0].body).includes(SECRET), 'a local route replays it as before');
+  const diary = await run(t, { flag: true, settings: { ...HYBRID, mode: 'cloud' }, chat: { allowCloud: true },
+    history: [...history, { role: 'tool', name: 'diary_search', content: 'synthetic diary text' }] });
+  assert.ok(diary.upstream[0].url.startsWith(LOCAL)); assert.deepEqual(diary.meta.routing, { route: 'local', reason: 'sensitive-rule' });
+  assert.ok(JSON.stringify(diary.upstream[0].body).includes(SECRET), 'the Diary chat kept local keeps its history');
+});

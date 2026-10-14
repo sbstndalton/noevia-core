@@ -94,8 +94,26 @@ function declinedToolNote(entry) {
 // #1692: the lead of a turn that holds only the tool results of a reply that ended before its answer.
 const FAILED_REPLY_TOOLS_NOTE = '(The reply to the message above ended before its answer. These tool results came back for it and can be used.)';
 const ABANDONED_TURN_NOTE = '(No reply was kept for the message above: it was stopped or failed before an answer. It is not an open request. Answer only the newest message unless the user asks about it.)';
-function normalizeReplayHistory(mapped, newMessage, { carryOrphanTool = () => false } = {}) {
+// #1703: a note for a client-sent applied write of a tool that is not positively public, on a route that leaves the
+// box. It says only that a change was made and with which tool; the target, arguments and result stay home.
+function appliedSummaryNote(entry) {
+  const name = typeof entry.name === 'string' && /^[\w.-]{1,80}$/.test(entry.name) ? entry.name : 'a tool';
+  return `Already done earlier in this chat: (a change was applied with ${name}). Do not run it again for the same change; if the user asks for it again, say it is already done unless they clearly want a second, separate change.`;
+}
+// #1703: a declined write on a route that leaves the box: our sentence only, never the client's content.
+function declinedSummaryNote(entry) {
+  const name = typeof entry.name === 'string' && /^[\w.-]{1,80}$/.test(entry.name) ? entry.name : 'a tool';
+  return `Not run earlier in this chat: the user did not approve ${name}, so it did not run and nothing was changed by it.`;
+}
+// `offBox` (#1703): the request leaves this box (a cloud route, an external or non-default provider). Then the
+// history is only what a client may not smuggle out: a tool entry is replayed only for a positively public tool
+// (carryOrphanTool, decided by tool NAME from the server's toolboxes, never a client flag), an applied write of
+// any other tool becomes a content-free summary, and a declined entry carries no client content at all.
+// Local routes (offBox false) replay as before, so skills and local tools still see their history.
+function normalizeReplayHistory(mapped, newMessage, { carryOrphanTool = () => false, offBox = false } = {}) {
   const out = [];
+  const appliedNote = (entry) => (offBox && !carryOrphanTool(entry.name) ? appliedSummaryNote(entry) : appliedToolNote(entry));
+  const declinedNote = (entry) => (offBox ? declinedSummaryNote(entry) : declinedToolNote(entry));
   // #1700: the carriers made below for a failed reply's results. Held here, not as a field on the message, so no
   // marker can leave this function.
   const orphanCarriers = new WeakSet();
@@ -106,15 +124,15 @@ function normalizeReplayHistory(mapped, newMessage, { carryOrphanTool = () => fa
     const last = out[out.length - 1];
     if ((entry.role === 'tool' || entry.role === 'function') && entry.applied === true) {
       // A reply that failed or paused has no assistant text of its own to attach to.
-      if (last && last.role === 'assistant') last.content = `${last.content}\n\n${appliedToolNote(entry)}`;
-      else if (last) out.push({ role: 'assistant', content: appliedToolNote(entry) });
-      else leading.push(appliedToolNote(entry));
+      if (last && last.role === 'assistant') last.content = `${last.content}\n\n${appliedNote(entry)}`;
+      else if (last) out.push({ role: 'assistant', content: appliedNote(entry) });
+      else leading.push(appliedNote(entry));
       continue;
     }
     if ((entry.role === 'tool' || entry.role === 'function') && entry.declined === true) {
       // The declined reply has no text of its own either (#666): the note stands in for it.
-      if (last && last.role === 'assistant') last.content = `${last.content}\n\n${declinedToolNote(entry)}`;
-      else if (last) out.push({ role: 'assistant', content: declinedToolNote(entry) });
+      if (last && last.role === 'assistant') last.content = `${last.content}\n\n${declinedNote(entry)}`;
+      else if (last) out.push({ role: 'assistant', content: declinedNote(entry) });
       continue;
     }
     if (entry.role === 'tool' || entry.role === 'function') {
@@ -125,7 +143,10 @@ function normalizeReplayHistory(mapped, newMessage, { carryOrphanTool = () => fa
         if (carryOrphanTool(entry.name)) last.content = `${last.content}\n\n${foldToolMessage(entry)}`;
         continue;
       }
-      if (last && last.role === 'assistant') last.content = `${last.content}\n\n${foldToolMessage(entry)}`;
+      if (last && last.role === 'assistant') {
+        // #1703: off the box, a tool entry after an assistant reply is replayed only for a positively public tool.
+        if (!offBox || carryOrphanTool(entry.name)) last.content = `${last.content}\n\n${foldToolMessage(entry)}`;
+      }
       // #1692: a reply that failed before its answer keeps no text, but its tool results are still what the
       // follow-up asks about ("using what your search found..."). They are carried under a note of ours.
       // #1700: only a positively public tool's result (carryOrphanTool; nothing by default). A private read of a
@@ -360,6 +381,9 @@ function createChatHandler({
     const recentWriteFps = new Set(mappedHistory.filter((h) => h.applied === true)
       .map((h) => require('./recent-writes.cjs').fingerprint(h.name, h.target, h.args)));
     let msgs = body.compactOnly ? normalizeReplayHistory(mappedHistory, undefined, replayOptions) : normalizeReplayHistory(mappedHistory, message, replayOptions);
+    // #1703: the history the replay was built from (the skill scrub below may replace it), so a route that leaves the
+    // box can rebuild it filtered. Routing and the Diary checks keep reading the unfiltered mappedHistory.
+    let replaySource = mappedHistory;
 
     // ── Project context: instructions + knowledge files prepend
     // the system message for every chat in the project.
@@ -400,6 +424,7 @@ function createChatHandler({
       if (scrubbed.removed.length) {
         revokedInHistory = scrubbed.removed;
         msgs = body.compactOnly ? normalizeReplayHistory(scrubbed.messages, undefined, replayOptions) : normalizeReplayHistory(scrubbed.messages, message, replayOptions);
+        replaySource = scrubbed.messages;
         console.log(`[skills] removed revoked skill text from history: ${revokedInHistory.join(', ')}`);
       }
     }
@@ -1006,6 +1031,16 @@ function createChatHandler({
     const selectedBoxes = requestToolboxes(automaticAdded);
     // Rule 2 of provider-egress.cjs: private tools (the Diary) are not offered through an external provider.
     egress.stripPrivateToolboxes(selectedBoxes, provider);
+    // #1703: the route is settled. When the request leaves the box (the #815 rule: an external provider, a cloud route
+    // or any provider other than the local one), the replayed history is rebuilt with the off-box filter. The current
+    // message keeps what was added to it (the attached files block); the system part of `wire` is kept as built.
+    if (externalProvider || routeTarget?.route === 'cloud' || provider?.id !== DEFAULT_PROVIDER_ID) {
+      const head = wire.slice(0, wire.length - msgs.length);
+      const filtered = normalizeReplayHistory(replaySource, body.compactOnly ? undefined : message, { ...replayOptions, offBox: true });
+      if (!body.compactOnly && filtered.length && msgs.length) filtered[filtered.length - 1] = msgs[msgs.length - 1];
+      msgs = filtered;
+      wire = [...head, ...msgs];
+    }
     // #1646: still on an ungranted cloud route (no local model to move to): no private-data box is offered.
     let privateStripped = false;
     if (cloudUngranted()) {

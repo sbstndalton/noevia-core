@@ -273,3 +273,42 @@ test('#1700 re-review: on a cloud route, [search, notes] from a failed reply sen
   for (const req of r.requests) assert.doesNotMatch(JSON.stringify(req.body), /SYNTHETIC-PRIVATE-88/);
   assert.match(JSON.stringify(r.requests[0].body), /SYNTHETIC-PUBLIC-77/);
 });
+
+// ── #1703: client-sent history on a route that leaves the box ──────────────
+
+const SECRET_1703 = 'SYNTHETIC-PRIVATE-1703';
+const LOCAL_MANUAL = { ...MANUAL_PROJECT, routing: 'manual' };
+
+test('#1703: a private tool entry after an assistant reply is absent upstream on a cloud provider, present locally', async (t) => {
+  const history = [{ role: 'user', content: 'Find my note.' }, { role: 'assistant', content: 'Here it is.' }, { role: 'tool', name: 'nc_notes_search_notes', content: SECRET_1703 }];
+  const cloud = await run(t, { message: 'And?', provider: MEMBER_CLOUD, project: ON_CLOUD, history });
+  assert.ok(cloud.requests[0].url.startsWith('https://cloud.example.invalid'));
+  assert.doesNotMatch(wireText(cloud), new RegExp(SECRET_1703));
+  assert.match(wireText(cloud), /Here it is\./, 'the assistant reply itself is kept');
+  const local = await run(t, { message: 'And?', project: LOCAL_MANUAL, history });
+  assert.match(wireText(local), new RegExp(SECRET_1703), 'a local route replays it as before');
+  // A public tool's entry still goes to the cloud.
+  const pub = await run(t, { message: 'And?', provider: MEMBER_CLOUD, project: ON_CLOUD,
+    history: [...history.slice(0, 2), { role: 'tool', name: 'tavily_search', content: 'SYNTHETIC-PUBLIC-1703' }] });
+  assert.match(wireText(pub), /SYNTHETIC-PUBLIC-1703/);
+});
+
+test('#1703: a private read labelled applied reaches the cloud only as a content-free summary', async (t) => {
+  const entry = { role: 'tool', name: 'nc_notes_search_notes', content: SECRET_1703, applied: true, target: `notes/${SECRET_1703}`, args: `{"q":"${SECRET_1703}"}` };
+  for (const history of [[{ role: 'user', content: 'Find my note.' }, { role: 'assistant', content: 'Done.' }, entry], [entry, { role: 'user', content: 'Find my note.' }, { role: 'assistant', content: 'Done.' }]]) {
+    const cloud = await run(t, { message: 'And?', provider: MEMBER_CLOUD, project: ON_CLOUD, history });
+    const text = wireText(cloud);
+    assert.doesNotMatch(text, new RegExp(SECRET_1703));
+    assert.match(text, /\(a change was applied with nc_notes_search_notes\)/);
+  }
+  const local = await run(t, { message: 'And?', project: LOCAL_MANUAL, history: [{ role: 'user', content: 'Find my note.' }, { role: 'assistant', content: 'Done.' }, entry] });
+  assert.match(wireText(local), new RegExp(SECRET_1703), '#658 replay is unchanged locally');
+});
+
+test('#1703: a private read labelled declined carries no content to the cloud', async (t) => {
+  const history = [{ role: 'user', content: 'Find my note.' }, { role: 'assistant', content: 'Asked.' }, { role: 'tool', name: 'nc_notes_search_notes', content: SECRET_1703, declined: true }];
+  const cloud = await run(t, { message: 'And?', provider: MEMBER_CLOUD, project: ON_CLOUD, history });
+  const text = wireText(cloud);
+  assert.doesNotMatch(text, new RegExp(SECRET_1703));
+  assert.match(text, /did not approve nc_notes_search_notes/);
+});
