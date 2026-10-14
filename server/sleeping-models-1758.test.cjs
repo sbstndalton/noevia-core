@@ -54,6 +54,15 @@ test('#1758 manager.load of a sleeping model succeeds without POST /models/load'
   assert.deepEqual(loads(calls), []);
 });
 
+test('#1758 load() skips the POST for a sleeping target while a different model is loaded', async () => {
+  const { manager, calls, states } = router({ 'syn-other': 'loaded', 'syn-chat': 'sleeping' }, { loadReply: () => ({ ok: false, status: 400, body: { error: 'model is already running' } }) });
+  const r = await manager.load('syn-chat');
+  assert.equal(r.ok, true);
+  assert.deepEqual(loads(calls), [], 'no POST /models/load for the sleeping target');
+  assert.deepEqual(calls.filter((c) => c.startsWith('POST /models/unload')), ['POST /models/unload syn-other'], 'the other chat model still makes room');
+  assert.equal(states['syn-chat'], 'sleeping');
+});
+
 test('#1758 a 400 "already running" from /models/load is success, logged once', async (t) => {
   // The listing says unloaded, but the model woke (another client) before the load arrived.
   const states = { 'syn-chat': 'unloaded' };

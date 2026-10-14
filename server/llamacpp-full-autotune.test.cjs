@@ -2091,3 +2091,14 @@ test('noevia#1133: the KV ceilings are planned with the JS estimate, so the Rust
   assert.deepEqual(kv.value.candidates.map(c => [c.kv, c.ceiling]), [['bf16', 12288], ['q8_0', 24576]]);
   assert.equal(kv.value.kv, 'q8_0');
 });
+
+test('#1758 a model that went to sleep during auto-tune is unloaded before the next profile write', async t => {
+  // The tuned model idles into `sleeping` after its first measurement (llama.cpp --sleep-idle-seconds).
+  let slept = false;
+  const f = fixture(t, { unloadPolls: 1, onChat: ({ status }) => { if (!slept) { slept = true; queueMicrotask(() => { status.synthetic = 'sleeping'; }); } } });
+  await f.manager.autotune.start('synthetic', { confirmPause: true });
+  const j = await finished(f.manager);
+  assert.ok(slept);
+  assert.doesNotMatch(String(j.error || ''), /Timed out waiting for router unload/);
+  assert.equal(j.status, 'passed', j.error);
+});
