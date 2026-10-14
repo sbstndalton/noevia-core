@@ -38,11 +38,28 @@ test('every server-registered feature has a translatable label and description (
   for (const k of Object.keys(EN_SETTINGS).filter((k) => k.startsWith('features.item.'))) assert.ok(ids.has(k.split('.')[2]), `${k} names no registered feature`);
 });
 
+// #1580: these two descriptions changed in step with noevia-web's catalogue. While only one of the two
+// PRs has merged, the other repo's main still carries the earlier English; that one earlier wording is
+// accepted for these rows only, so neither PR waits on the other. Remove once both are on main.
+const EARLIER_1580 = {
+  previews: 'Show the unbuilt Scheduled, Plugins, Explore and Code previews.',
+  kiwix: 'A read-only lookup tool backed by an internal kiwix-serve.',
+};
+
 test('the English catalogue says what the server registry says, apart from spelling (#618)', () => {
   const spell = (s) => s.replace(/behaviour/g, 'behavior');
   for (const [id, spec] of Object.entries(REGISTRY)) {
     assert.equal(spell(EN_SETTINGS[`features.item.${id}.label`]), spec.label, id);
-    assert.equal(spell(EN_SETTINGS[`features.item.${id}.description`]), spec.description, id);
+    const en = spell(EN_SETTINGS[`features.item.${id}.description`]);
+    if (en === EARLIER_1580[id]) continue;
+    assert.equal(en, spec.description, id);
+  }
+});
+
+test('#1580 the registry describes features without build status or internal component names', () => {
+  for (const [id, spec] of Object.entries(REGISTRY)) {
+    assert.doesNotMatch(spec.description, /unbuilt|not built|kiwix-serve/i, id);
+    assert.doesNotMatch(spec.description, /\b[A-Z][A-Z0-9]*_[A-Z0-9_]+\b/, `${id} names a variable`);
   }
 });
 
