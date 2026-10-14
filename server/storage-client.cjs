@@ -441,7 +441,37 @@ async function writeFile(conn, rawPath, bytes, { ifMatch, ifNoneMatch } = {}) {
   if (!response.ok) {
     throw Object.assign(new Error(`could not write "${path}" (${response.status})`), { status: response.status === 409 ? 400 : 502, upstream: response.status });
   }
-  return { path };
+  // The ETag of what was just written (#1664), so a caller that fails afterwards can remove exactly
+  // this version with discardWritten. '' when the server sends none (cleanup is then skipped).
+  const etag = String(response.headers?.get?.('etag') || response.headers?.get?.('oc-etag') || '').trim();
+  return { path, etag: /[\r\n]/.test(etag) ? '' : etag };
+}
+
+/** Best-effort removal of a file this process has just created with a create-only write (#1664),
+ *  when a later step of the same upload failed and the file is therefore unrecorded. The DELETE
+ *  always carries If-Match with the ETag the PUT returned, so a file that someone else wrote, or one
+ *  that was edited since, is refused (412) and kept. Without an ETag nothing is deleted: an
+ *  unconditional DELETE could remove another writer's file. S3 is skipped: noevia cannot write to
+ *  S3 (writeFile refuses it), so there is never a created object to remove, and there is no signed
+ *  conditional DELETE here. Never throws; returns { deleted, reason? }. Not retried: a lost
+ *  response then a retry would only meet a 404/412. */
+async function discardWritten(conn, rawPath, etag) {
+  try {
+    const path = safeRelativePath(rawPath);
+    if (!path) return { deleted: false, reason: 'invalid-path' };
+    if (connectionKind(conn) === 's3') return { deleted: false, reason: 's3' };
+    if (typeof etag !== 'string' || !etag || /[\r\n]/.test(etag)) return { deleted: false, reason: 'no-etag' };
+    const response = await fetch(davUrl(conn, path), {
+      method: 'DELETE',
+      headers: davHeaders(conn, { 'If-Match': quoteEtag(etag) }),
+      signal: AbortSignal.timeout(30000),
+      redirect: 'error',
+    });
+    if (response.ok) return { deleted: true };
+    return { deleted: false, reason: response.status === 412 ? 'changed' : response.status === 404 ? 'missing' : `status-${response.status}` };
+  } catch (err) {
+    return { deleted: false, reason: 'error', error: err };
+  }
 }
 
 /** Delete one file. Deliberately refuses a directory path: removing a file
@@ -567,4 +597,4 @@ async function fileVersion(conn, rawPath) {
   return { exists: true, etag: /[\r\n]/.test(etag) ? '' : etag };
 }
 
-module.exports = { checkLogin, refusedLogin, storageFailure, removeEmptyFolder, listFiles, readTextFile, readBinaryFile, writeFile, fileVersion, deleteFile, createFolder, isBrowsable, safeRelativePath, elementTexts, TEXT_EXTENSIONS, READ_CAP };
+module.exports = { checkLogin, refusedLogin, storageFailure, removeEmptyFolder, listFiles, readTextFile, readBinaryFile, writeFile, discardWritten, fileVersion, deleteFile, createFolder, isBrowsable, safeRelativePath, elementTexts, TEXT_EXTENSIONS, READ_CAP };
