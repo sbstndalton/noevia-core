@@ -8,8 +8,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 const FIXTURE: &str = "d7ed7dd9bdd006166b4083abfac0c8ec09428a38";
-const RS_REF: &str = "e88e7fa4c39470dd02a385a30c5c353853555f79";
-const ARCHIVE: &str = "69203abfd0608040944d686a5d50d10cad9540fe73840dec0bf80d92e0493b11";
+const RS_REF: &str = "7dc9bb4ad11be0d446f9f139e26fdbc4616daf43";
+const ARCHIVE: &str = "f7e833b245af05a97d307b69afce17fa90ccab0447b30acf14999f2e69ba435b";
 const TEMPLATES: [(&str, &str); 3] = [
     (
         "input",

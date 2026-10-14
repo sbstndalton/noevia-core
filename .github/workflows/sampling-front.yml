@@ -23,8 +23,8 @@ jobs:
       - name: Fetch verified native sampling settings acceptance source
         run: |
           set -euo pipefail
-          curl -fsSL https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/e88e7fa4c39470dd02a385a30c5c353853555f79 -o "$RUNNER_TEMP/sampling-rs.tgz"
-          echo "69203abfd0608040944d686a5d50d10cad9540fe73840dec0bf80d92e0493b11  $RUNNER_TEMP/sampling-rs.tgz" | sha256sum -c -
+          curl -fsSL https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/7dc9bb4ad11be0d446f9f139e26fdbc4616daf43 -o "$RUNNER_TEMP/sampling-rs.tgz"
+          echo "f7e833b245af05a97d307b69afce17fa90ccab0447b30acf14999f2e69ba435b  $RUNNER_TEMP/sampling-rs.tgz" | sha256sum -c -
           mkdir rs
           tar -xzf "$RUNNER_TEMP/sampling-rs.tgz" --strip-components=1 -C rs
           echo "CORE_ACCEPTANCE_RS=$GITHUB_WORKSPACE/rs" >> "$GITHUB_ENV"
