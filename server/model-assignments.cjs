@@ -26,7 +26,7 @@ const isRerankModel = (m) => (m.labels || []).some((l) => /^rerank/i.test(l)) ||
  *           env: object, embedding: {active?:{model:string,profile:string}|null,next?:{model:string}|null,coverage?:object}|null,
  *           isSystem: (name:string) => boolean, admin: boolean }} input
  */
-function modelAssignments({ installed, env = {}, embedding = null, isSystem = () => false, admin = false }) {
+function modelAssignments({ installed, env = {}, embedding = null, isSystem = () => false, admin = false, served = null }) {
   const list = Array.isArray(installed) ? installed : [];
   const byName = new Map(list.map((m) => [m.name, m]));
   const stateOf = (model) => {
@@ -40,7 +40,10 @@ function modelAssignments({ installed, env = {}, embedding = null, isSystem = ()
 
   const active = embedding?.active?.model || String(env.EMBEDDING_MODEL || env.EMBED_MODEL || '').trim() || null;
   const next = embedding?.next?.model || null;
-  const embedOptions = list.filter((m) => !m.missingFile && isEmbeddingModel(m) && m.name !== active).map((m) => ({ model: m.name, profile: embeddingProfileFor(m.name) }));
+  const embedOptions = list.filter((m) => !m.missingFile && isEmbeddingModel(m) && m.name !== active).map((m) => ({ model: m.name, profile: embeddingProfileFor(m.name),
+    // #1660 review: offered for a switch only when the embeddings server really serves it (/v1/models);
+    // false when it does not or that could not be read (null).
+    served: Array.isArray(served) && served.includes(m.name) }));
   const embedState = next ? 'switching' : stateOf(active);
   services.push({ id: 'embedding', model: active, state: active && active.toLowerCase() === 'default' ? 'active' : embedState,
     ...(next ? { next, ready: embedding?.coverage?.next?.ready === true } : {}),
