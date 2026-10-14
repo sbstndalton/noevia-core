@@ -416,3 +416,68 @@ test('an unconfigured Diary is reported with code notConfigured, so web can tell
     assert.equal(r.body.diary.code, 'notConfigured');
   } finally { migration.stop(); }
 });
+
+// ── re-review #1675 #1676 #1679 ───────────────────────────────────────────────────────────────
+
+const BGE = { model: 'bge-small', file: 'bge-small/bge-small-Q8_0.gguf' };
+
+test('#1675 service-switch keeps the Diary\'s active model: a third model that does not fit is refused, B is never dropped', async () => {
+  // Projects active A (nomic), Diary active B (gemma), both on the service; switch to C.
+  const loader = fakeLoader({ models: [NOMIC, GEMMA], installed: [NOMIC, GEMMA, BGE] });
+  const svc = await installService(loader);
+  const diary = fakeDiary();
+  diary.state.active = { base_url: `${SVC}/v1`, model: 'embeddinggemma-2', profile: 'embeddinggemma-2' };
+  const h = harness(loader, { diary });
+  try {
+    const r = await post(h.routesFor(svc), { action: 'service-switch', model: 'bge-small', profile: 'nomic-v1' });
+    assert.equal(r.status, 409, JSON.stringify(r.body));
+    assert.deepEqual(loader.state.puts, [], 'nothing was served without the Diary\'s model');
+    assert.equal(h.config.next(), null);
+  } finally { h.migration.stop(); }
+});
+
+test('#1675 service-switch is refused when the Diary\'s targets cannot be read', async () => {
+  const loader = fakeLoader();
+  const svc = await installService(loader);
+  const diary = fakeDiary();
+  diary.handle = () => ({ ok: false, status: 502, body: { error: 'down' } });
+  const h = harness(loader, { diary });
+  try {
+    const r = await post(h.routesFor(svc), { action: 'service-switch', model: 'embeddinggemma-2', profile: 'embeddinggemma-2' });
+    assert.equal(r.status, 409, JSON.stringify(r.body));
+    assert.equal(r.body.code, 'diaryUnknown');
+    assert.deepEqual(loader.state.puts, []);
+  } finally { h.migration.stop(); }
+});
+
+test('#1676 turning off is refused while the last switch is not finished (its rollback model is still served)', async () => {
+  const loader = fakeLoader();
+  const svc = await installService(loader);
+  const h = harness(loader);
+  const routes = h.routesFor(svc);
+  try {
+    assert.equal((await post(routes, { action: 'service-switch', model: 'embeddinggemma-2', profile: 'embeddinggemma-2' })).status, 200);
+    assert.equal((await post(routes, { action: 'switch' })).status, 200);
+    assert.ok(h.config.previous(), 'a rollback target exists');
+    const r = await post(routes, { action: 'service-off' });
+    assert.equal(r.status, 409);
+    assert.equal(r.body.code, 'finishFirst');
+    assert.notDeepEqual(loader.state.puts.at(-1), []);
+  } finally { h.migration.stop(); }
+});
+
+test('#1679 a Diary-only finish also syncs the service, so the old model leaves it', async () => {
+  const loader = fakeLoader();
+  const svc = await installService(loader);
+  const h = harness(loader);
+  const routes = h.routesFor(svc);
+  try {
+    assert.equal((await post(routes, { action: 'service-switch', model: 'embeddinggemma-2', profile: 'embeddinggemma-2' })).status, 200);
+    assert.equal((await post(routes, { action: 'switch' })).status, 200);
+    assert.equal((await post(routes, { action: 'finish', scope: 'projects' })).status, 200);
+    assert.deepEqual(loader.state.puts.at(-1), ['embeddinggemma-2', 'nomic-embed-text-v1'], 'the Diary still has nomic for rollback');
+    const r = await post(routes, { action: 'finish', scope: 'diary' });
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    assert.deepEqual(loader.state.puts.at(-1), ['embeddinggemma-2'], 'the Diary finish dropped nomic from the service');
+  } finally { h.migration.stop(); }
+});

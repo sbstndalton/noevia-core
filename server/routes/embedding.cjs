@@ -144,6 +144,8 @@ function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJs
     const c = migration.status();
     if (action === 'service-off') {
       if (c.next) return reply(409, { error: 'A re-index is under way. Cancel it before turning embedding off.', code: 'reindexUnderway' });
+      // #1676: the last switch's rollback model is still served and its vectors kept.
+      if (c.previous) return reply(409, { error: 'Finish the last embedding switch (or roll it back) before turning embedding off.', code: 'finishFirst' });
       try { await service.serve([]); } catch (err) { return reply(err.status || 502, { error: err.message, code: err.code }); }
       authService.audit?.('embedding.service-off', authn.user.id, null, {});
       return reply(200, { service: service.status() });
@@ -162,8 +164,17 @@ function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJs
     const target = { baseUrl: address, model, profile: body.profile };
     const fromOff = !service.enabled();
     const activeOnService = c.active && service.isAt(c.active.baseUrl) && !fromOff;
-    const keep = activeOnService ? servedSet({ active: c.active }) || [] : [];
+    // #1675: keep everything either side (projects and the Diary) still uses on the service. If the
+    // Diary's targets cannot be read, a shrink could drop the model it searches with: refuse.
+    let keep = [];
+    if (activeOnService) {
+      const d = await diaryTargets();
+      if (!d) return reply(409, { error: 'The Diary\'s embedding settings could not be read, so the switch could drop a model it still uses. Try again when the Diary answers.', code: 'diaryUnknown' });
+      keep = servedSet(c, d);
+      if (!keep) return reply(409, { error: 'The embedding service already serves two models in use. Finish or cancel the switch under way first.', code: 'tooManyModels' });
+    }
     if (keep.some((e) => e.model === model)) return reply(409, { error: `${model} is already the embedding model.`, code: 'alreadyActive' });
+    if (keep.length + 1 > 2) return reply(409, { error: `Projects and the Diary use ${keep.map((e) => e.model).join(' and ')}; the embedding service serves at most two models. Finish or roll back the other switch first.`, code: 'tooManyModels' });
     const before = fromOff ? [] : (service.status()?.models || []).filter((e) => e && e.model && e.file).map((e) => ({ model: e.model, file: e.file }));
     try { await service.serve([...keep, { model, file }]); } catch (err) { return reply(err.status || 502, { error: err.message, code: err.code }); }
     const loaded = await service.waitLoaded([model], { timeoutMs: waitTimeoutMs });
@@ -233,7 +244,8 @@ function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJs
     });
     // #1668: after a finish, cancel or rollback the service serves only what is still configured,
     // so the model that left becomes deletable once the router has dropped it.
-    if (['finish', 'clear-next', 'rollback', 'switch'].includes(action) && out.projects && !out.projects.error) await syncService();
+    // #1679: either side's change counts (a scope=diary finish frees a model too).
+    if (['finish', 'clear-next', 'rollback', 'switch'].includes(action) && [out.projects, out.diary].some((r) => r && !r.error)) await syncService();
     const failed = [out.projects, out.diary].filter(Boolean).filter((r) => r.error);
     const status = failed.length === 0 ? 200 : failed.length === [out.projects, out.diary].filter(Boolean).length ? (failed[0].status && failed[0].status >= 400 && failed[0].status < 600 ? failed[0].status : 502) : 207;
     return { status, body: out };
