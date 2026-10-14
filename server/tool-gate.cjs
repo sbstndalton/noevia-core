@@ -225,7 +225,7 @@ function createToolGate({ enabled, decide, boxes = DEFAULT_BOXES, isWriteTool, l
   const ruleDecision = (message, offered) => ruleDecisionWith(message, offered, { boxes, readOnly, now });
 
   async function readout(message, offered, bias, impl) {
-    const lim = value(limits);
+    const lim = budgetLimits(value(limits));
     const { readTools, question, shape } = readoutOptions(offered, { boxes, readOnly, bias, limits: lim });
     if (!readTools.length) return { reason: 'no-read-tools' };
     const blocked = stage2Blocked();
@@ -360,13 +360,13 @@ function createToolGate({ enabled, decide, boxes = DEFAULT_BOXES, isWriteTool, l
 // answer "none" to nearly every message, and saying that the assistant on its own has no current news
 // and none of the user's data is what moved web search from 2/16 to 13/16.
 const QUESTION = 'Without tools the assistant knows no current news and nothing the user wrote or saved. Which tool does it need, if any?';
-// The option budget counts the question as 79 characters plus any hint, exactly as the Rust port does
-// (noevia-rs crates/tool-gate QUESTION.len(); TOOL_GATE_IMPL=wasm compares the shaped options, and
-// tests/fixtures/tool-gate.v1.json must stay byte-identical with the port's copy). So the options are the
-// ones shipped before #1639; only the question text changed. The question is 40 characters longer than
-// the budget assumes: the 360-character choice budget approximates Laya's 160-token option head at under
-// three characters per token, so a request stays inside the real budget (the live service accepted every
-// held-out request, #1639). Change this number only together with the port.
+// The Rust port (noevia-rs crates/tool-gate; TOOL_GATE_IMPL=wasm compares the shaped options) counts the
+// question as 79 characters plus any hint, the length of the question before #1639, and
+// tests/fixtures/tool-gate.v1.json must stay byte-identical with the port's copy. So shapeOptions and
+// readoutOptions still count BUDGET_QUESTION_CHARS, and the gate itself (budgetLimits) lowers the choice
+// budget it gives both sides by the characters the question has beyond that. Both then shape the same
+// options, and question plus options stay within maxChoiceChars (Laya's option-head budget). Change this
+// number only together with the port.
 const BUDGET_QUESTION_CHARS = 79;
 const NONE_ID = 'none';
 const MIN_LABEL_CHARS = 12;
@@ -401,6 +401,14 @@ function shapeOptions(readTools, limits, boxes = DEFAULT_BOXES, questionChars = 
     }
     tools = tools.slice(0, -1);
   }
+}
+
+/** #1639: `limits` with the choice budget lowered by the characters QUESTION has beyond what the port
+ *  counts, so question plus options fit maxChoiceChars and the port, given the same limits, shapes the
+ *  same options. No limits, or no finite choice budget: unchanged. */
+function budgetLimits(limits) {
+  if (!limits || !Number.isFinite(limits.maxOptions) || !Number.isFinite(Number(limits.maxChoiceChars))) return limits;
+  return { ...limits, maxChoiceChars: Number(limits.maxChoiceChars) - (QUESTION.length - BUDGET_QUESTION_CHARS) };
 }
 
 /** Lower bound of the selected option's readout interval if reported, else its share/confidence. */
@@ -486,6 +494,6 @@ function stricterDecision(js, port) {
   return { tool: js.tool, mode: 'require' };
 }
 
-module.exports = { createToolGate, shapeOptions, BUDGET_QUESTION_CHARS, searchQuery, diaryMonth, publicUrlPattern, prefetchableSearch, DEFAULT_BOXES, DEFAULT_MIN_CONFIDENCE,
+module.exports = { createToolGate, shapeOptions, BUDGET_QUESTION_CHARS, budgetLimits, searchQuery, diaryMonth, publicUrlPattern, prefetchableSearch, DEFAULT_BOXES, DEFAULT_MIN_CONFIDENCE,
   toolGateImpl, ruleDecisionWith, readoutOptions, readAnswer, toolProjection, offeredProjection, boxesProjection, limitsProjection,
   numberProjection, stricterDecision, QUESTION };

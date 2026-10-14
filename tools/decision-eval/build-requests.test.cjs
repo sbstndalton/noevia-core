@@ -136,12 +136,13 @@ test('#1639: the harness captures the wording tuned for Kev-0.8B exactly as prod
   const ep = require(path.join(SERVER, 'decision-endpoint.cjs'));
   for (const r of base('tool.gate')) assert.equal(r.body.question, tg.QUESTION, r.id);
   assert.equal(tg.QUESTION, 'Without tools the assistant knows no current news and nothing the user wrote or saved. Which tool does it need, if any?');
-  // The tool gate's options are the ones shipped before #1639 (the Rust port compares them).
+  // The tool gate's options: shaped in a choice budget lowered by the longer question (budgetLimits), so
+  // the labels are cut to 34 characters for this tool set (44 before #1639), then trimmed on the wire.
   assert.deepEqual(base('tool.gate')[0].body.options, [
-    { id: 'tavily_extract', label: 'Read the text of a web page from its URL.' },
-    { id: 'tavily_search', label: 'Search the web for current facts and news.' },
-    { id: 'diary_read_month', label: "Read the user's own diary entries for a mont" },
-    { id: 'nc_webdav_search_files', label: "Find the user's own stored files and documen" },
+    { id: 'tavily_extract', label: 'Read the text of a web page from i' },
+    { id: 'tavily_search', label: 'Search the web for current facts a' },
+    { id: 'diary_read_month', label: "Read the user's own diary entries" }, // decision-settings trims the label
+    { id: 'nc_webdav_search_files', label: "Find the user's own stored files a" },
     { id: 'none', label: 'No tool: answer directly' },
   ]);
   for (const r of base('step.supervise')) {

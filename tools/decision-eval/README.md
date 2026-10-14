@@ -33,5 +33,5 @@ published on 127.0.0.1. Use a `--internal` network for a hard block.
 
 Limits: the sensitivity state carries a short synthetic stand-in for the system prompt (production's
 `Context` section is the real one, usually longer); supervision states are first-round, read-only
-rounds; the tool gate offers one fixed set of four read tools, so its labels are cut to 44 characters
+rounds; the tool gate offers one fixed set of four read tools, so its labels are cut to 34 characters (44 before #1639's longer question)
 as production would cut them for that set.
