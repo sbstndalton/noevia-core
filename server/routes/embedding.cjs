@@ -43,7 +43,7 @@ function createEmbeddingRoutes({ json, readJson, migration, authService, fetchJs
   const diaryUrl = DIARY_BASE ? `${String(DIARY_BASE).replace(/\/+$/, '')}/api/internal/embedding` : '';
 
   async function diary(method, body) {
-    if (!diaryUrl) return { error: 'The Diary sidecar is not configured.' };
+    if (!diaryUrl) return { error: 'The Diary sidecar is not configured.', code: 'notConfigured' };
     try {
       const r = await fetchJson(diaryUrl, { method, headers: diaryServiceHeaders(), ...(body ? { body: JSON.stringify(body) } : {}) }, 15000);
       if (r.ok) return r.body;

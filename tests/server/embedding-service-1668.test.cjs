@@ -407,3 +407,12 @@ test('concurrent service actions run one at a time and see each other\'s result'
     assert.deepEqual(loader.state.puts, [['nomic-embed-text-v1', 'embeddinggemma-2']]);
   } finally { h.migration.stop(); }
 });
+
+test('an unconfigured Diary is reported with code notConfigured, so web can tell it from a refusal', async () => {
+  const { migration } = harness(fakeLoader());
+  try {
+    const routes = createEmbeddingRoutes({ json: (res, status, body) => { res.status = status; res.body = body; return true; }, readJson: async (req) => req.body, migration, authService: {}, fetchJson: async () => { throw Error('unused'); } });
+    const r = await post(routes, { action: 'clear-next' });
+    assert.equal(r.body.diary.code, 'notConfigured');
+  } finally { migration.stop(); }
+});
