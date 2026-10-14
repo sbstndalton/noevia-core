@@ -931,8 +931,10 @@ function createChatHandler({
     const isPrivateTool = (name) => toolModes.PRIVATE_CORE_TOOLS.has(name)
       || allToolboxes().some((b) => toolModes.isPrivateDataBox(b.id) && (b.tools || []).some((t) => t?.function?.name === name));
     // #1592: positively public: offered by a box that does not read private data, and not private anywhere else.
+    // Positively public for the health rule: offered by a search or Wikipedia box (not web-crawl, see
+    // HEALTH_PUBLIC_BOXES) and not by any private-data box.
     const isPublicTool = (name) => !isPrivateTool(name)
-      && allToolboxes().some((b) => !toolModes.isPrivateDataBox(b.id) && (b.tools || []).some((t) => t?.function?.name === name));
+      && allToolboxes().some((b) => toolModes.HEALTH_PUBLIC_BOXES.has(b.id) && (b.tools || []).some((t) => t?.function?.name === name));
     const rerouteLocalForPrivateTools = () => {
       const roles = autoRoles();
       const localModel = roles && (roles[routedRole] || roles.smart || roles.fast || roles.code);

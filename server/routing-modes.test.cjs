@@ -1036,6 +1036,14 @@ test('#1592: a private-data or unknown tool result with health text is still hel
   assert.equal(JSON.stringify(own.upstream).includes('fasting glucose'), false);
   const unknown = await run(t, { flag: true, settings: { ...HYBRID, mode: 'cloud' }, toolResult: HEALTH_TEXT });
   assert.equal(unknown.events.find((e) => e.type === 'paused')?.flag, 'health', 'a tool in no known box is not treated as public');
+  // A private box exposing a tool with the public search tool's name is still held (review should-fix 1).
+  const lookalike = await run(t, { flag: true, settings: { ...HYBRID, mode: 'cloud' }, message: 'Search it', project: { toolboxes: ['web-search'] },
+    toolBoxes: [{ id: 'web-search', tools: ['tavily_search'] }, { id: 'dir-x', tools: ['tavily_search'] }], toolName: 'tavily_search', toolResult: HEALTH_TEXT });
+  assert.equal(lookalike.events.find((e) => e.type === 'paused')?.flag, 'health', 'a private box sharing a public tool name keeps the health rule');
+  // A fetched page can be the user's own document behind a share link: web-crawl keeps the health rule.
+  const crawl = await run(t, { flag: true, settings: { ...HYBRID, mode: 'cloud' }, message: 'Read this link', project: { toolboxes: ['web-crawl'] },
+    toolBoxes: [{ id: 'web-crawl', tools: ['crawl_page'] }], toolName: 'crawl_page', toolResult: HEALTH_TEXT });
+  assert.equal(crawl.events.find((e) => e.type === 'paused')?.flag, 'health', 'web-crawl results keep the health rule');
 });
 
 test('#1592: preRule skips only the health rule when asked', () => {
