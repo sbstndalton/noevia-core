@@ -398,10 +398,30 @@ function createJobs({ dir, now = Date.now, retainMs = 7 * 86400000, maxJobs = 20
       return { unreadable: true };
     }
   }
-  function list({ projectId, kind, active } = {}) {
+  // #1391: the enumeration a release idle gate can trust. Only an absent jobs directory is "no
+  // jobs"; anything else that cannot be read exactly (an unreadable, symlinked or non-directory
+  // root, a journal that is not a regular file, more than `cap` entries) is refused, never empty.
+  function strictIds(cap) {
+    const refuse = (why) => { throw Object.assign(Error(`Job state unknown: ${why}`), { code: 'JOBS_UNKNOWN', status: 503 }); };
+    let st;
+    try { st = fs.lstatSync(root); } catch (e) { if (e.code === 'ENOENT') return []; refuse(`jobs directory (${e.code || 'error'})`); }
+    if (!st.isDirectory()) refuse('the jobs path is not a plain directory');
+    let entries;
+    try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch (e) { refuse(`jobs directory (${e.code || 'error'})`); }
+    if (entries.length > cap) refuse(`more than ${cap} entries`);
     const out = [];
-    for (const id of ids()) {
+    for (const d of entries) {
+      if (!d.name.endsWith('.jsonl')) continue;
+      if (!d.isFile()) refuse('a job journal that is not a regular file');
+      out.push(d.name.slice(0, -6));
+    }
+    return out;
+  }
+  function list({ projectId, kind, active, strict = false, cap = 4096 } = {}) {
+    const out = [];
+    for (const id of strict ? strictIds(cap) : ids()) {
       const { job, unreadable } = getSafe(id);
+      if (unreadable && strict) throw Object.assign(Error('Job state unknown: an unreadable job journal'), { code: 'JOBS_UNKNOWN', status: 503 });
       if (unreadable) { out.push({ id, status: 'unreadable' }); continue; }
       if (!job) continue;
       if ((projectId === undefined || job.projectId === projectId) && (!kind || job.kind === kind) && (active === undefined || active === !TERMINAL.has(job.status))) out.push(job);
