@@ -671,3 +671,27 @@ test('#1311: when the model list cannot be read, an explicit level that needs it
   assert.match((await r.json()).error.message, /could not be read, so "ultra" reasoning cannot be checked.*Default, Low, Medium or High/);
   assert.equal(f.fake.seen.responses.length, before);
 });
+
+// #1592: a basic level is checked against a published list too, and a model whose loaded entry has no
+// levels is refused for that reason, not as an unreadable list.
+test('#1592: a basic level the model does not publish is refused; a model without levels says so', async (t) => {
+  const f = make(t);
+  await connect(f);
+  f.fake.state.catalogue = { models: [
+    { slug: 'gpt-basic', default_reasoning_level: 'medium', supported_reasoning_levels: [{ effort: 'low' }, { effort: 'medium' }] },
+    { slug: 'gpt-nolevels', default_reasoning_level: 'medium' },
+  ] };
+  const before = f.fake.seen.responses.length;
+  let r = await post(f, { model: 'gpt-basic', reasoning_effort: 'high' });
+  assert.equal(r.status, 400);
+  assert.match((await r.json()).error.message, /does not offer "high" reasoning for gpt-basic\. It offers low, medium, or Default/);
+  r = await post(f, { model: 'gpt-nolevels', reasoning_effort: 'xhigh' });
+  assert.equal(r.status, 400);
+  const message = (await r.json()).error.message;
+  assert.match(message, /"xhigh" reasoning is not in your account's list for gpt-nolevels/);
+  assert.doesNotMatch(message, /could not be read/);
+  assert.equal(f.fake.seen.responses.length, before, 'nothing refused reached ChatGPT');
+  r = await post(f, { model: 'gpt-nolevels', reasoning_effort: 'high' });
+  assert.equal(r.status, 200, 'with no published list a basic level goes through as before');
+  assert.equal(lastSent(f).reasoning.effort, 'high');
+});

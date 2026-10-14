@@ -142,6 +142,8 @@ function normalizeReplayHistory(mapped, newMessage) {
 
 // #1553: a reply whose chat template cannot take tools is told so in the request itself. Without this the model
 // said no search tool existed, or wrote search results it never had. The note is ours and holds no tool output.
+// #1604: appended to the system message of a turn routed to the Code role.
+const CODE_ROUTE_NOTE = 'For commands and code: before answering, check that it does exactly what was asked and nothing more (for example, when files are asked for, directories must not appear in the output). When asked why something can mislead or fail, name the concrete mechanism in one sentence.';
 const TOOLS_OFF_MODEL_NOTE = 'No tools can run in this reply: this model\'s chat template cannot use them. If the person asks for a web search, a file, a live lookup or any other tool, say so in one line at the start. Do not write results, sources, excerpts or simulated output for it.';
 // #1646: the prompt lines that send the model to read_project_file, kept in one place so a cloud route without a grant
 // (where that tool is not offered) can reword them. The sources' coverage line lives in rag.cjs.
@@ -162,6 +164,7 @@ function withoutSystemNote(messages, note) {
 // error, instead of sitting until the browser gives up with "network error" minutes later. Nothing is
 // limited before the first output (a long prefill is not a stall), and `ms` of 0 limits nothing.
 const { isCutMark } = require('./thinking-budget.cjs');
+const announcedAction = require('./announced-action.cjs');
 class StreamIdleError extends Error {
   constructor(ms) { super(`no output for ${ms} ms`); this.name = 'StreamIdleError'; this.ms = ms; }
 }
@@ -799,7 +802,9 @@ function createChatHandler({
     const holdForCloud = (name, text) => {
       if (cloudHold || routeTarget?.route !== 'cloud') return false;
       const rmod = require('./routing-modes.cjs');
-      const hit = /^diary[_-]/i.test(String(name || '')) ? 'diary' : rmod.preRule(String(text || ''));
+      // #1592: the health rule holds only a private-data tool's result (the user's own files or records); a
+      // public result such as a web search about a condition is not the user's data. Unknown tools count as private.
+      const hit = /^diary[_-]/i.test(String(name || '')) ? 'diary' : rmod.preRule(String(text || ''), { health: !isPublicTool(name) });
       if (!hit) return false;
       cloudHold = hit;
       try { routingModes.log({ mode: 'tool-result', route: 'held', reason: 'sensitive-rule', flag: hit }); } catch { /* codes only */ }
@@ -817,6 +822,14 @@ function createChatHandler({
       sys = sysWithoutBrain;
       wire = sys ? [{ role: 'system', content: sys }, ...msgs] : msgs;
       brainBlock = '';
+    }
+    // #1587: a provider off this box gets the day without the server's time-zone name (where the server is).
+    if (externalProvider || routeTarget?.route === 'cloud' || provider?.id !== DEFAULT_PROVIDER_ID) {
+      const zoneless = require('./current-time-part.cjs').systemPart(undefined, undefined, { zoneName: false });
+      if (wire[0]?.role === 'system' && typeof wire[0].content === 'string' && wire[0].content.includes(timePart)) {
+        sys = sys.replace(timePart, () => zoneless);
+        wire = [{ ...wire[0], content: wire[0].content.replace(timePart, () => zoneless) }, ...wire.slice(1)];
+      }
     }
     const egressRefused = egress.egressRefusal({ provider, spaceId, projectId: project?.id, diaryProjectId: diaryExtras.PROJECT_ID });
     if (egressRefused) return json(res, 409, { error: egressRefused });
@@ -917,6 +930,11 @@ function createChatHandler({
     const cloudUngranted = () => routeTarget?.route === 'cloud' && routeTarget.hybridUngranted === true;
     const isPrivateTool = (name) => toolModes.PRIVATE_CORE_TOOLS.has(name)
       || allToolboxes().some((b) => toolModes.isPrivateDataBox(b.id) && (b.tools || []).some((t) => t?.function?.name === name));
+    // #1592: positively public: offered by a box that does not read private data, and not private anywhere else.
+    // Positively public for the health rule: offered by a search or Wikipedia box (not web-crawl, see
+    // HEALTH_PUBLIC_BOXES) and not by any private-data box.
+    const isPublicTool = (name) => !isPrivateTool(name)
+      && allToolboxes().some((b) => toolModes.HEALTH_PUBLIC_BOXES.has(b.id) && (b.tools || []).some((t) => t?.function?.name === name));
     const rerouteLocalForPrivateTools = () => {
       const roles = autoRoles();
       const localModel = roles && (roles[routedRole] || roles.smart || roles.fast || roles.code);
@@ -1101,6 +1119,11 @@ function createChatHandler({
     if (unattachedImageNames.length) {
       const notAttached = `This project has image sources (${quotedNames(unattachedImageNames)}) that are not attached to this message. Say so if asked about them; do not guess at their contents.`;
       wire = wire.some((m) => m.role === 'system') ? wire.map((m) => (m.role === 'system' ? { ...m, content: `${m.content}\n\n${notAttached}` } : m)) : [{ role: 'system', content: notAttached }, ...wire];
+    }
+    // #1604: a turn on the Code route gets a short correctness note for commands and code (a one-liner for
+    // "the 5 largest files" listed directories too, and the "why" named no mechanism).
+    if (routedRole === 'code' && !body.compactOnly) {
+      wire = wire.some((m) => m.role === 'system') ? wire.map((m) => (m.role === 'system' ? { ...m, content: `${m.content}\n\n${CODE_ROUTE_NOTE}` } : m)) : [{ role: 'system', content: CODE_ROUTE_NOTE }, ...wire];
     }
     if (attachedImages.length && !body.compactOnly) {
       const roles = autoRoles();
@@ -1481,6 +1504,7 @@ function createChatHandler({
         else toolGate.record('prefetch.failed', { tool: gate.decision.tool });
       }
     }
+    let announcedRetried = false; // #1552: one retry per reply for an announced but uncalled tool
     for (let round = 0; round < 3 && !chatSignal.signal.aborted && !cloudHold; round++) {
       if (nextToolRoutes) { toolRoutes = new Map([...toolRoutes, ...nextToolRoutes]); nextToolRoutes = null; }
       if (revokedSkills()) break; // a loaded skill was disabled or changed: no further model round
@@ -1500,6 +1524,8 @@ function createChatHandler({
         try {
           const continuation=await context.compactContinuation({messages:roundMessages,tools:activeTools,limit,limitSource,model,summarize:summarizeContext,onStatus:(text,id)=>send({type:'status',text,...(id?{id}:{})})});
           roundMessages=continuation.messages;roundBudget=continuation.meter;roundCompacted=continuation.compacted;
+          // #1587: an answer resting on a shortened tool result says so (#1551 shortens instead of failing).
+          if(continuation.truncated>0)send({type:'warning',text:`${continuation.truncated===1?'A tool result was':`${continuation.truncated} tool results were`} shortened to fit this model's context, so the answer may rest on part of the output.`});
           if(roundCompacted){continuationCompactedAt=Date.now();continuationCovered=continuation.covered;send({type:'context',...roundBudget,historyCount:prepared.meter.historyCount,compactedAt:continuationCompactedAt,covered:continuationCovered});}
         } catch(error) {send({type:'error',text:error.message});break;}
       }
@@ -1709,6 +1735,18 @@ function createChatHandler({
           continue;
         }
         toolGate.record('gate.miss', { tool: forcedTool });
+      }
+
+      // #1552: tools were offered and the reply ended on a promise ("I will read the full file...") with no
+      // call. One more try, with what it wrote kept as narration and a note that nothing was read.
+      if (!forceChoice(round).tool_choice && toolCalls.size === 0 && sawAnything && !announcedRetried && round < 2
+        && requestTools().tools && !chatSignal.signal.aborted && announcedAction.announcesToolAction(roundContent)) {
+        announcedRetried = true;
+        send({ type: 'preamble', text: roundContent });
+        roundMessages = [...roundMessages, { role: 'assistant', content: roundContent }, { role: 'user', content: announcedAction.ANNOUNCED_NOTE }];
+        roundHasContent = false; roundContent = ''; roundReasoning = '';
+        round--;
+        continue;
       }
 
       // Execute each requested tool and append assistant tool_calls + results.
@@ -1980,4 +2018,4 @@ function createChatHandler({
   return { handleChat, handleChatInner };
 }
 
-module.exports = { createChatHandler, normalizeReplayHistory, withIdleLimit };
+module.exports = { createChatHandler, normalizeReplayHistory, withIdleLimit, CODE_ROUTE_NOTE };

@@ -112,6 +112,10 @@ const PUBLIC_BOXES = new Set(['web-search', 'offline-wikipedia']);
 // the project-file reader; the reader is private-data and is taken out of it (PRIVATE_CORE_TOOLS).
 const CLOUD_SAFE_BOXES = new Set(['core', 'web-search', 'web-crawl', 'offline-wikipedia']);
 const PRIVATE_CORE_TOOLS = new Set(['read_project_file']);
+// #1592 review: boxes whose results the health pre-rule may skip on a cloud route: search results and
+// offline Wikipedia are public reference text. web-crawl is NOT here: a fetched page can be the user's
+// own document behind a share link, so its results keep the health rule (#1647: when in doubt, stay local).
+const HEALTH_PUBLIC_BOXES = new Set(['web-search', 'offline-wikipedia']);
 /** Whether a toolbox may be offered to a hybrid cloud route that has no per-chat allowCloud grant. */
 function isPrivateDataBox(id) { return !CLOUD_SAFE_BOXES.has(id); }
 
@@ -228,5 +232,5 @@ function createAutomaticToolsReady({ getStorage, originAllowed }) {
 
 module.exports = { toolsModeOf, initialToolsMode, gateSaysToolNeeded, toolCapableRoute, FALLBACK_ROLES,
   automaticBoxesFor, automaticEligible, automaticAdditions, orderWithAdditions, wantsWeb, MAX_ADDED, PUBLIC_BOXES,
-  CLOUD_SAFE_BOXES, PRIVATE_CORE_TOOLS, isPrivateDataBox,
+  CLOUD_SAFE_BOXES, PRIVATE_CORE_TOOLS, HEALTH_PUBLIC_BOXES, isPrivateDataBox,
   nextcloudStorageConnected, createAutomaticToolsReady };

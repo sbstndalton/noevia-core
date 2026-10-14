@@ -195,3 +195,13 @@ test('every day from 1990 to 2060 agrees with an independent method (week of 4 J
     assert.deepEqual([f.isoYear, f.isoWeek], [isoYear, week], date.toISOString().slice(0, 10));
   }
 });
+
+test('#1587: zoneName false states the same day without naming the zone', () => {
+  const now = new Date('2026-10-12T23:30:00Z');
+  const named = require('./current-time-part.cjs').systemPart(now, 'Pacific/Auckland');
+  const bare = require('./current-time-part.cjs').systemPart(now, 'Pacific/Auckland', { zoneName: false });
+  assert.match(named, /^Today is Tuesday, 13 October 2026 \(Pacific\/Auckland\)\./);
+  assert.match(bare, /^Today is Tuesday, 13 October 2026\.\n/);
+  assert.ok(!bare.includes('Auckland'));
+  assert.equal(bare.split('\n').slice(1).join('\n'), named.split('\n').slice(1).join('\n'));
+});
