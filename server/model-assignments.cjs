@@ -62,7 +62,10 @@ function modelAssignments({ installed, env = {}, embedding = null, isSystem = ()
 
   const rerankOn = truthy(env.NOEVIA_FEATURE_RAG_RERANK);
   const rerank = String(env.RERANK_MODEL || '').trim() || null;
-  services.push({ id: 'reranker', model: rerank, state: rerankOn ? stateOf(rerank) : 'off', canChange: false,
+  // #1695: a configured reranker whose file is gone reads "missing" even while reranking is
+  // switched off, so the row never says just "Off" for a model that no longer exists.
+  const rerankState = rerank && list.length && stateOf(rerank) === 'missing' ? 'missing' : rerankOn ? stateOf(rerank) : 'off';
+  services.push({ id: 'reranker', model: rerank, state: rerankState, canChange: false,
     ...(admin ? { options: list.filter((m) => !m.missingFile && isRerankModel(m)).map((m) => m.name) } : {}) });
 
   const laya = list.find((m) => m.system === true || isSystem(m.name));
