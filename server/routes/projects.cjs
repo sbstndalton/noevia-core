@@ -650,22 +650,27 @@ function createProjectRoutes({
         saveProjects(PROJECTS);
         const replace = body.replace === true;
         if (!replace && (project.files || []).some(f => f.name === `${project.projectFolder}/${rawName}`)) return sourceExistsReply(res, rawName);
+        // #1653: a PDF is read BEFORE the write, so a failure while reading leaves nothing in storage (an
+        // unrecorded remote file would make the retry meet a 409 and the client save a "(2)" copy). The PUT stays
+        // create-only (If-None-Match), so no-overwrite is unchanged; the read is cached by content, so a 409 costs nothing twice.
+        const name = `${project.projectFolder}/${rawName}`;
+        let file;
+        if (documents.isDocument(rawName)) {
+          const previous = (project.files || []).find(f => f.name === name && f.source === project.projectFolder);
+          file = await documentSources.ingest(currentWorkspace(), id, name, bytes, previous);
+          file.source = project.projectFolder;
+        }
         try {
-          await (replace ? storageClient.writeFile(connection, `${project.projectFolder}/${rawName}`, bytes)
-            : storageClient.writeFile(connection, `${project.projectFolder}/${rawName}`, bytes, { ifNoneMatch: '*' }));
+          await (replace ? storageClient.writeFile(connection, name, bytes)
+            : storageClient.writeFile(connection, name, bytes, { ifNoneMatch: '*' }));
         } catch (e) {
           if (!replace && pathTaken(e)) return sourceExistsReply(res, rawName);
           if (replyStorageFailure(res, storageClient.storageFailure?.(e))) return;
           return json(res, (e && e.status) || 502, { error: (e && e.message) || 'could not save the file' });
         }
-        let file;
-        if (documents.isDocument(rawName)) {
-          const name = `${project.projectFolder}/${rawName}`;
-          const previous = project.files.find(f => f.name === name && f.source === project.projectFolder);
-          file = await documentSources.ingest(currentWorkspace(), id, name, bytes, previous);
-          file.source = project.projectFolder;
+        if (file) {
           if (getProject(id) !== project || !project.sourceFolders.includes(file.source)) return json(res, 409, { error: 'Source changed; refresh again.' });
-          project.files = [...project.files.filter(f => f.name !== name || f.source !== file.source), file];
+          project.files = [...(project.files || []).filter(f => f.name !== name || f.source !== file.source), file];
           indexSource(project, file); defaultProjectDocs(project, hadUploads); saveProjects(PROJECTS);
         }
         return json(res, 200, { name: rawName, path: `${project.projectFolder}/${rawName}`, bytes: bytes.length, document: file?.document });

@@ -63,3 +63,32 @@ test('reserved folders are distinct without creating anything, and the first upl
   // A legacy reservation made from the old name is still honoured: stored paths are never recomputed.
   assert.equal(await createProjectFolder(storage, { kind: 'webdav' }, 'root', { id: 'd', name: 'Design', reservedFolder: 'root/Design' }), 'root/Design');
 });
+
+test('ids that fit in 80 characters keep exactly the folder key they always had (#1653)', () => {
+  const { projectFolderKey } = require('../../server/project-folders.cjs');
+  for (const id of ['proj-123-abc', 'a', 'x'.repeat(80), '../a/b', 'with space.and.dots', 'Q4: plan?']) {
+    assert.equal(projectFolderKey({ id, name: 'N' }), projectFolderName(id), `${id} is unchanged`);
+  }
+  assert.equal(projectFolderKey({ name: 'No id yet' }), 'No id yet');
+});
+test('two long ids sharing their first 80 characters no longer share a folder key (#1653)', async () => {
+  const { projectFolderKey } = require('../../server/project-folders.cjs');
+  const common = 'chat-context-'.padEnd(80, 'c');
+  const a = projectFolderKey({ id: common + '-one' }), b = projectFolderKey({ id: common + '-two' });
+  assert.notEqual(a, b);
+  assert.equal(projectFolderName(common + '-one'), projectFolderName(common + '-two'), 'the old key collided');
+  for (const key of [a, b]) { assert.ok(key.length <= 80); assert.match(key, /^[^/\\]+$/); }
+  assert.equal(projectFolderKey({ id: common + '-one' }), a, 'stable for the same id');
+  // Golden value, shared with noevia-web's storageFolderKeepsOldName test: changing the hash, its input or the
+  // 67/12 split would move every long-id folder, so it must fail here first.
+  assert.equal(projectFolderKey({ id: 'chat-context-'.padEnd(90, 'c') }), 'chat-context-cccccccccccccccccccccccccccccccccccccccccccccccccccccc-7912f25b6e6e');
+  const s3 = {createFolder(){throw Error('must not call');}};
+  assert.notEqual(await createProjectFolder(s3, { kind: 's3' }, 'projects', { id: common + '-one' }), await createProjectFolder(s3, { kind: 's3' }, 'projects', { id: common + '-two' }));
+  assert.equal(reserveProjectFolder({ kind: 's3' }, 'projects', { id: common + '-one' }, []), `projects/${a}`);
+});
+test('an S3 project reserved under the old truncated key keeps that prefix on its first upload (#1653)', async () => {
+  const common = 'chat-context-'.padEnd(80, 'c');
+  const s3 = {createFolder(){throw Error('must not call');}};
+  const legacy = `projects/${projectFolderName(common + '-one')}`;
+  assert.equal(await createProjectFolder(s3, { kind: 's3' }, 'projects', { id: common + '-one', reservedFolder: legacy }), legacy);
+});
