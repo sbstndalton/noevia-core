@@ -3,8 +3,10 @@
 // model-backed service; the chat roles come from /api/auto-roles beside it. Pure: the route
 // passes the installed list, the environment and the embedding configuration in.
 //
-// Members see the same names read-only. Nothing here names an environment variable or an
-// address: a service is described by its model and a state id the client words.
+// Members see the same names read-only. Nothing here names an environment variable, and no
+// address reaches a member: a service is described by its model and a state id the client words.
+// The one address sent is the embedding service's, to admins only, because switching the
+// embedding model (embedding settings 'set-next') needs it.
 //
 // state ids: 'active' | 'switching' (a re-index to `next` is under way) | 'missing' (the
 // configured model is not installed) | 'off' (the service is not configured or turned off).

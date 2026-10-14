@@ -111,7 +111,8 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
       const listing = await fetchJson(`${base}sections`, { method: 'GET', headers }, 15000);
       if (!listing?.ok) return { removed: false };
       const names = Array.isArray(listing.body?.sections) ? listing.body.sections.map((x) => (typeof x === 'string' ? x : x?.name)) : null;
-      if (names && !names.includes(name)) return { removed: false };
+      // Only a section the service lists: the name is never sent anywhere it does not name.
+      if (!names || !names.includes(name)) return { removed: false };
       const revision = listing.body?.revision;
       const q = revision ? `?baseRevision=${encodeURIComponent(revision)}` : '';
       const del = await fetchJson(`${base}sections/${encodeURIComponent(name)}${q}`, { method: 'DELETE', headers }, 15000);
@@ -647,7 +648,10 @@ function createModelRoutes({ json, readBody, readJson, fetchJson, env, modelMana
       // the card came back as "File missing". Remove the preset section through the model
       // management service as well. A preset whose file is already gone has nothing for the
       // engine to delete, so removing its section alone is a successful delete.
-      const preset = await removePresetSection(body.name);
+      // Only once the file is gone (or was already missing): a refused engine delete must keep the
+      // section, or the file stays on disk with its settings lost and no card to retry from.
+      const fileGone = r.ok || entry?.missingFile === true;
+      const preset = fileGone ? await removePresetSection(body.name) : { removed: false };
       const engineOk = r.ok || (entry?.missingFile === true && preset.removed);
       if (!engineOk) return json(res, 502, { error: `delete failed: ${r.status}`, unloaded });
       // The model is gone: drop every auto-role that pointed at it, the shared "last loaded

@@ -65,6 +65,9 @@ test('an engine failure on a model whose file exists is still a failure', async 
   const f = routes({ installed: [{ name: 'plain', labels: [] }], routerDelete: { ok: false, status: 500 } });
   await f.call('POST', '/api/models/delete', { name: 'plain' });
   assert.equal(f.sent.pop().status, 502);
+  // The file is still there, so its settings stay too: the card remains and the delete can be retried.
+  assert.deepEqual(f.presets(), ['plain', 'orphan']);
+  assert.ok(!f.fetched.some((x) => x.startsWith('DELETE sections/')), 'no section delete after a refused engine delete');
 });
 
 test('#1660 Laya is refused without confirmSystem and deleted with it', async () => {
