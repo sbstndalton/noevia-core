@@ -76,3 +76,16 @@ test('#1788: effortForRoute lowers only a Fast route, and never raises', () => {
   assert.equal(reasoningEffort.effortForRoute('low', 'fast'), 'low');
   for (const role of ['smart', 'code', null, undefined]) for (const e of ['high', 'default', 'low']) assert.equal(reasoningEffort.effortForRoute(e, role), e);
 });
+
+// Review of core#119: only the account default is lowered. A project's own effort is an explicit choice and wins.
+test('#1788: a project set to High keeps High on a Fast route', async (t) => {
+  const { request, effort } = await turn(t, { route: 'fast', project: { routing: 'auto', reasoningEffort: 'high' }, globalEffort: 'default' });
+  assert.equal(request.model, 'synthetic-fast');
+  assert.equal(effort, 'high');
+  assert.equal(request.messages[0].content, reasoningEffort.HINTS.high);
+});
+
+test('#1788: a project set to Standard (default) keeps it on a Fast route', async (t) => {
+  const { effort } = await turn(t, { route: 'fast', project: { routing: 'auto', reasoningEffort: 'default' }, globalEffort: 'high' });
+  assert.notEqual(effort, 'low');
+});

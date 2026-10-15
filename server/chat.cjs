@@ -1171,10 +1171,11 @@ function createChatHandler({
     // providers like OpenRouter use https://host/api/v1).
     const upstreamUrl = `${provider.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`;
     const upstreamHeaders = providerHeaders(provider);
-    // #1788: an Automatic turn routed Fast (after any move to a tool-capable role above) runs at Low.
-    const effort = reasoningEffort.effortForRoute(
-      reasoningEffort.resolveEffort(project, authService?.db?.prepare("SELECT value FROM settings WHERE key='reasoning_effort_default'").get()?.value),
-      wantsAuto ? routedRole : null);
+    // #1788: an Automatic turn routed Fast (after any move to a tool-capable role above) runs at Low, but only when the
+    // effort is the account default: a project's own reasoningEffort is an explicit choice and is kept.
+    const resolvedEffort = reasoningEffort.resolveEffort(project, authService?.db?.prepare("SELECT value FROM settings WHERE key='reasoning_effort_default'").get()?.value);
+    const effort = reasoningEffort.validEffort(project?.reasoningEffort) ? resolvedEffort
+      : reasoningEffort.effortForRoute(resolvedEffort, wantsAuto ? routedRole : null);
     // Task-aware sampling presets (issue #194): applied only when the operator has not turned
     // the feature off and the project has no explicit sampling override for the key in
     // question. `routedRole` (fast/smart/code) is the auto-router's existing signal; a manual
