@@ -430,9 +430,7 @@ function createChatHandler({
     if (projectId && spaceId !== 'diary') {
       project = getProject(projectId);
       if (!project && body.projectId) return json(res, 404, { error: 'no such project' });
-      if (project && body.projectId && !require('./project-modes.cjs').enabled(project, 'chat')) {
-        return json(res, 409, { error: `${project.name} is not enabled for Chat. Turn Chat on in the project's settings.` });
-      }
+      // #1576: every project takes chats; there is no project-level Chat switch any more.
     }
 
     let autoSkills = [];

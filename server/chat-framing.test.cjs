@@ -239,15 +239,15 @@ test('route: a burst over the per-user budget gets 429 rate-limited without call
   assert.equal((await call('u-b')).status, 200, 'another user has their own budget');
 });
 
-test('the suggest list never offers a Code-only, Cowork-only or archived project (#810)', async () => {
+test('the suggest list offers every live project, including once Code- or Cowork-only ones, never an archived one (#810, #1576)', async () => {
   const offered = [];
   const { decide, seen } = stubDecide({ 'chat.frame.kind': 'question', 'chat.frame.project': (r) => { offered.push(...r.options.map((o) => o.id)); return 'p-code'; }, 'chat.frame.tag': NONE });
   const mixed = [...projects, { id: 'p-code', name: 'Garden code', modes: ['code'] }, { id: 'p-cowork', name: 'Garden cowork', modes: ['cowork'] },
     { id: 'p-old', name: 'Garden archive', modes: ['chat'], archived: true }, { id: 'p-both', name: 'Garden both', modes: ['chat', 'code'] }];
   const { frame } = await make(decide).suggest({ message: 'Tomato garden plans', projects: mixed, chats });
   assert.ok(seen.length > 0);
-  assert.deepEqual(offered.filter((id) => id !== NONE).sort(), ['p-both', 'p-garden', 'p-tax']);
-  assert.equal(frame.projectId, null, 'an answer naming a refused project is outside the options');
+  assert.deepEqual(offered.filter((id) => id !== NONE).sort(), ['p-both', 'p-code', 'p-cowork', 'p-garden', 'p-tax']);
+  assert.equal(frame.projectId, 'p-code', 'a once Code-only project is a valid answer now');
 });
 
 test('suggest embeds at most 64 project names and 64 tags, most used tags first (#816)', async () => {

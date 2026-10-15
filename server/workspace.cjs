@@ -167,6 +167,13 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { rustProjects 
     for (const project of projects) if (project.provider === 'lemonade') project.provider = defaultProvider.id;
     let modesMigrated = false;
     for (const project of projects) if (require('./project-modes.cjs').migrate(project)) modesMigrated = true;
+    // #1576: projects.json is copied aside before the modes migration is written back (a stored
+    // Cowork- or Code-only project gains Chat; nothing else changes). Same backup folder as #1806.
+    if (modesMigrated && !loadCorrupt) {
+      // Without a backup the file is not rewritten now; the migration still applies in memory and
+      // reaches disk with the next ordinary save, by which time the person has changed something.
+      try { sourceText.backupProjectsFile(dir, '1576'); } catch (e) { modesMigrated = false; console.warn('[projects] could not back up projects.json before the #1576 migration:', e.message); }
+    }
     // #1806: inline source text from before is moved to its files (backup first); see source-text.cjs.
     const textMigrated = sourceText.migrateOnLoad(dir, projects);
     const workspace = {
