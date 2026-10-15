@@ -41,6 +41,9 @@ async function main() {
   // noevia#1368: the list/read slice, confirmed separately.
   if (process.env.NOEVIA_RUST_STORAGE_BROWSE === '1') Object.assign(env, { NOEVIA_RUST_STORAGE_BROWSE: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_STORAGE_BROWSE_CONFIRMED: process.env.NOEVIA_RUST_STORAGE_BROWSE_CONFIRMED === '1' ? '1' : '' });
   if (process.env.NOEVIA_RUST_STORAGE_READS === '1') Object.assign(env, { NOEVIA_RUST_STORAGE_READS: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_STORAGE_READS_CONFIRMED: process.env.NOEVIA_RUST_STORAGE_READS_CONFIRMED === '1' ? '1' : '' });
+  // M6 ChatGPT connection status (noevia#1373): GET /api/providers/chatgpt is refused only once the
+  // front's rust-chatgpt-status is confirmed (features.cjs rustChatgptStatusOwned).
+  if (process.env.NOEVIA_RUST_CHATGPT_STATUS === '1') Object.assign(env, { NOEVIA_RUST_CHATGPT_STATUS: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_CHATGPT_STATUS_CONFIRMED: process.env.NOEVIA_RUST_CHATGPT_STATUS_CONFIRMED === '1' ? '1' : '' });
   const child = spawn(process.execPath, ['--require', GUARD, SERVER], { env, stdio: ['ignore', 'ignore', 'pipe'] });
   // Server warnings go to stderr, minus the first-run setup code (the replayer reads it from the
   // data dir; a log is no place for it, synthetic or not).
