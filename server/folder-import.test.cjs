@@ -51,7 +51,7 @@ test('#1805: the plan accepts readable files, says why each other one is skipped
   ];
   const r = planFor(entries, { env: { FOLDER_IMPORT_MAX_FILES: '2' } });
   assert.match(r.importId, /^[a-f0-9]{32}$/);
-  assert.deepEqual(r.limits, { maxFiles: 2, maxBytes: contract.maxBytes, projectSources: 60, projectDocuments: 60, projectImages: 12 });
+  assert.deepEqual(r.limits, { maxFiles: 2, maxBytes: contract.maxBytes, projectSources: 1000, projectDocuments: 200, projectImages: 12 });
   assert.deepEqual(r.accepted.map((a) => a.path), ['a/deep/er/notes.md', 'a/readme.md']);
   const why = Object.fromEntries(r.skipped.map((s) => [s.path, s.code]));
   assert.deepEqual(why, {
@@ -69,7 +69,7 @@ test('#1805: the plan marks a file unchanged by content hash, counts a changed o
   const r = planFor([{ path: 'a.md', size: 4, sha256: sha('same') }, { path: 'b.md', size: 3, sha256: sha('new') }, { path: 'c.md', size: 3, sha256: sha('c') }], { files });
   assert.deepEqual(r.unchanged, [{ path: 'a.md' }]);
   assert.deepEqual(r.accepted.map((a) => [a.path, a.change]), [['b.md', 'changed'], ['c.md', 'new']]);
-  const full = Array.from({ length: 60 }, (_, i) => ({ name: `P/f${i}.md`, attachment: { id: sha(String(i)) } }));
+  const full = Array.from({ length: contract.projectLimits.sources }, (_, i) => ({ name: `P/f${i}.md`, attachment: { id: sha(String(i)) } }));
   const capped = planFor([{ path: 'f1.md', size: 3, sha256: sha('changed') }, { path: 'new.md', size: 3 }], { files: full });
   assert.deepEqual(capped.accepted.map((a) => a.path), ['f1.md'], 'an update still fits a full project');
   assert.deepEqual(capped.skipped.map((s) => [s.path, s.code]), [['new.md', 'projectLimit']]);

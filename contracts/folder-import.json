@@ -12,7 +12,7 @@
     ".pdf", ".docx",
     ".png", ".jpg", ".jpeg", ".webp", ".gif"
   ],
-  "projectLimits": { "sources": 60, "documents": 60, "images": 12 },
+  "projectLimits": { "sources": 1000, "documents": 200, "images": 12 },
   "maxBytes": 104857600,
   "maxDepth": 16,
   "maxFolders": 400

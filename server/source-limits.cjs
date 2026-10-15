@@ -6,10 +6,10 @@
 //   PROJECT_DOCUMENT_LIMIT  of those, documents (PDF, DOCX and the other document types)
 //   PROJECT_IMAGE_LIMIT     of those, images that are model input
 //
-// Defaults (contracts/folder-import.json `projectLimits`) keep today's behaviour: 60 / 60 / 12.
-// Raising the source limit is safe only once source text leaves projects.json: at 1000 sources of
-// the 200k-character per-source maximum the file is ~180 MB and each save ~480 ms (measured for
-// #1805). Read per call so a test, or an owner's env change plus restart, takes effect.
+// Defaults (contracts/folder-import.json `projectLimits`): 1000 / 200 / 12. They were 60 / 60 / 12
+// until #1806 moved source text out of projects.json (source-text.cjs): with the text inline, 1000
+// sources of the 200k-character per-source maximum made the file ~180 MB and each save ~480 ms
+// (measured for #1805). Read per call so a test, or an owner's env change plus restart, takes effect.
 
 const contract = require('../contracts/folder-import.json');
 

@@ -1074,8 +1074,15 @@ async function filesContext(projectId, files, query, userId, onSources, { attach
     const full = String(name).toLowerCase();
     return whole(full).test(q) || whole(full.split('/').pop()).test(q);
   };
-  const small = files.filter((f) => String(f.content || '').length <= DIRECT_INJECT_MAX);
-  const large = files.filter((f) => String(f.content || '').length > DIRECT_INJECT_MAX);
+  // #1806: a source whose text is in its own file (source-text.cjs) has its length saved beside the
+  // pointer, so sorting small from large does not read every large text. (Inline, not
+  // source-text.cjs textLength: the tests run this body as a slice.)
+  const lengthOf = (f) => {
+    const d = f && Object.getOwnPropertyDescriptor(f, 'content');
+    return d && typeof d.get === 'function' && /^[0-9a-f]{64}$/.test(String(f.textRef)) && Number.isSafeInteger(f.chars) ? f.chars : String((f && f.content) || '').length;
+  };
+  const small = files.filter((f) => lengthOf(f) <= DIRECT_INJECT_MAX);
+  const large = files.filter((f) => lengthOf(f) > DIRECT_INJECT_MAX);
 
   // Name every source, always. Retrieval injects excerpts of the large files
   // chosen for THIS question, so a question about the sources themselves —
