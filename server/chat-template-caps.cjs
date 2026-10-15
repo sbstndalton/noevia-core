@@ -69,13 +69,18 @@ function failureText(status, text, { partial = false } = {}) {
  *  from this machine's engine and from other machines: the key is scope + model as served. No scope: the model
  *  name alone, as before. `manager` is anything with props(model) (a machine's is chat-machines.cjs propsSource). */
 function createToolsGate({ ttlMs = 10 * 60 * 1000, unknownTtlMs = 30 * 1000, max = 64, now = Date.now } = {}) {
+  // #1855: this machine's verdicts and the Inference machines' are bounded apart, so a burst of machine models cannot evict
+  // the local ones (and the reverse). No scope: the local map, exactly as before.
   const cache = new Map();
+  const machineCache = new Map();
+  const cacheFor = (key) => (key.includes('\u0000') ? machineCache : cache);
   // #1018: one /props lookup per model at a time; concurrent misses share it.
   const inflight = new Map();
   const remember = (model, sendTools, ttl) => {
-    cache.delete(model);
-    cache.set(model, { sendTools, until: now() + ttl });
-    while (cache.size > max) cache.delete(cache.keys().next().value);
+    const c = cacheFor(model);
+    c.delete(model);
+    c.set(model, { sendTools, until: now() + ttl });
+    while (c.size > max) c.delete(c.keys().next().value);
   };
   const keyOf = (model, scope) => (scope ? `${scope}\u0000${model}` : model);
   async function lookup(manager, model, key) {
@@ -94,7 +99,7 @@ function createToolsGate({ ttlMs = 10 * 60 * 1000, unknownTtlMs = 30 * 1000, max
    *  keeps running for the others. */
   async function allowsTools(manager, model, signal, scope) {
     const key = keyOf(model, scope);
-    const hit = cache.get(key);
+    const hit = cacheFor(key).get(key);
     if (hit && now() < hit.until) return hit.sendTools;
     let p = inflight.get(key);
     if (!p) {
@@ -110,8 +115,10 @@ function createToolsGate({ ttlMs = 10 * 60 * 1000, unknownTtlMs = 30 * 1000, max
   return {
     allowsTools,
     markUnsupported: (model, scope) => remember(keyOf(model, scope), false, ttlMs),
-    forget: (model, scope) => cache.delete(keyOf(model, scope)),
-    size: () => cache.size,
+    forget: (model, scope) => { const k = keyOf(model, scope); return cacheFor(k).delete(k); },
+    size: () => cache.size + machineCache.size,
+    localSize: () => cache.size,
+    machineSize: () => machineCache.size,
   };
 }
 

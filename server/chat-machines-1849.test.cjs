@@ -362,3 +362,21 @@ test('#1850 default: a local turn with tools asks this machine\'s engine exactly
   assert.equal(shape(after), shape(before));
   assert.ok(Array.isArray(localChats(after)[0].body.tools));
 });
+
+test('#1855 Manual: an unreadable local catalogue keeps the pick local instead of sending it to a machine', async () => {
+  const cm = await machinesFor({ assign: [{ service: 'chatSmart', port: 8080, model: REMOTE_MODEL }] });
+  assert.equal(await cm.manualTarget(REMOTE_MODEL, async () => { throw new Error('synthetic catalogue failure'); }), null);
+  assert.equal(await cm.manualTarget(REMOTE_MODEL, () => { throw new Error('synthetic'); }), null);
+  assert.equal((await cm.manualTarget(REMOTE_MODEL, async () => [{ name: 'synthetic-other' }]))?.model, REMOTE_MODEL, 'a readable catalogue without the name still routes to the machine');
+});
+
+test('#1855 classifier: a message the rules send to Smart stays Smart when Fast\'s machine is down; an undecided one goes to Fast', async () => {
+  const cm = await machinesFor({ assign: [{ service: 'chatFast', port: await closedPort(), model: REMOTE_MODEL }] });
+  const calls = [], admitted = [], records = [];
+  const r = router({ machine: cm, calls, admitted, records });
+  assert.equal(await r.classify('QA-SYNTH-1855 please debug this function'), 'smart');
+  assert.equal(await r.classify('QA-SYNTH-1855 ' + 'long '.repeat(130)), 'smart');
+  assert.deepEqual([calls.length, records.length], [0, 0], 'the rules decided: no machine call, nothing recorded as skipped');
+  assert.equal(await r.classify('QA-SYNTH-1855 hi there'), 'fast');
+  assert.deepEqual(records, [{ selected: 'fast', fellBack: 'classifier-skipped', cause: 'machine-unreachable' }]);
+});

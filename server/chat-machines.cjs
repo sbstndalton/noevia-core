@@ -226,7 +226,8 @@ function createChatMachines({ machines, health = null, fetchImpl = defaultServic
     const match = CHAT_ROLES.map((role) => remote[role]).find((t) => t && t.model === model);
     if (!match) return null;
     let rows = null;
-    try { rows = typeof catalogue === 'function' ? await catalogue() : catalogue; } catch { rows = null; }
+    // #1855: an unreadable local catalogue cannot say the pick is not here: it stays local.
+    try { rows = typeof catalogue === 'function' ? await catalogue() : catalogue; } catch { return null; }
     if (Array.isArray(rows) && rows.some((m) => m && m.name === model)) return null;
     return match;
   }

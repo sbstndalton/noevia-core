@@ -1046,3 +1046,14 @@ test('#1849 GET /api/auto-roles lists the models chat roles\' machines serve; no
   await broken.call('GET', '/api/auto-roles');
   assert.deepEqual(broken.sent.pop(), before, 'an unreadable machine list never breaks the roles answer');
 });
+
+test('#1855 GET /api/auto-roles leaves out machine models the served local catalogue lists (the router\'s own source)', async () => {
+  const local = { model: 'm', machine: { id: 'mach-1', name: 'Synthetic Pi' }, roles: ['fast'] };
+  const remote = { model: 'synthetic-remote', machine: { id: 'mach-1', name: 'Synthetic Pi' }, roles: ['smart'] };
+  const f = fixture({ initialRoles: { fast: 'm', smart: 'm' }, catalogue: [{ name: 'm' }], modelsInstalled: async () => [{ name: 'synthetic-remote', loaded: false }], machineModels: () => [local, remote] });
+  await f.call('GET', '/api/auto-roles');
+  assert.deepEqual(f.sent.pop().body.machineModels, [remote], 'served names go local; the installed list is not the source');
+  const all = fixture({ initialRoles: { fast: 'm', smart: 'm' }, catalogue: [{ name: 'm' }], machineModels: () => [local] });
+  await all.call('GET', '/api/auto-roles');
+  assert.equal('machineModels' in all.sent.pop().body, false, 'nothing left to list: no key, as with no machine');
+});
