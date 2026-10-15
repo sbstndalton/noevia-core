@@ -49,6 +49,11 @@ test('#1818 D1: a write failing on the 3rd text leaves no source switched, and a
   fs.fsyncSync = (fd) => { log.push(fdPath.get(fd)); return orig.fsyncSync(fd); };
   try { assert.equal(sourceText.externalize(dir, projects), 4); } finally { Object.assign(fs, orig); }
   assert.ok(log.includes(pdir), 'the folder holding the earlier renames is fsynced on the retry');
+  // #1819: the project folder was created by the failed call; its entry in project-sources/ (and
+  // that folder's in the workspace) is fsynced on the retry too, deepest first.
+  const order = [pdir, path.join(dir, 'project-sources'), dir].map((d) => log.indexOf(d));
+  assert.ok(order.every((i) => i >= 0), `every folder up to the workspace is fsynced on the retry (${JSON.stringify(log)})`);
+  assert.deepEqual([...order].sort((x, y) => x - y), order, 'deepest first');
   for (const [i, f] of projects[0].files.entries()) { assert.equal(f.textRef, sha(texts[i])); assert.equal(f.content, texts[i]); }
   fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -132,5 +137,43 @@ test('#1818 D2: collecting a text clears its flag', () => {
   sourceText.collect(dir, [{ id: 'p1', files: [] }], { graceMs: 0 });
   assert.ok(!fs.existsSync(file), 'collected');
   assert.equal(sourceText.textMissing(a), false);
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('#1819: a write during the scan\'s check wins: the re-uploaded text is not flagged', async () => {
+  const dir = scratch('race');
+  const projects = [{ id: 'p1', files: [{ name: 'a.md', content: 'alpha synthetic' }] }];
+  sourceText.externalize(dir, projects);
+  const a = projects[0].files[0];
+  const file = path.join(dir, 'project-sources', 'p1', `${sha('alpha synthetic')}.txt`);
+  fs.rmSync(file);
+  const orig = fs.promises.access;
+  let raced = false;
+  // The scan's check sees the file gone; while it awaits, the text is uploaded again.
+  fs.promises.access = async (p, ...rest) => {
+    const r = orig.call(fs.promises, p, ...rest);
+    await r.catch(() => {});
+    if (p === file && !raced) { raced = true; projects[0].files.push({ name: 'a-again.md', content: 'alpha synthetic' }); sourceText.externalize(dir, projects); }
+    return r;
+  };
+  try { sourceText.meta(a); await sourceText.scanSettled(dir); } finally { fs.promises.access = orig; }
+  assert.ok(raced, 'the write ran during the scan');
+  assert.ok(fs.existsSync(file));
+  assert.equal(sourceText.textMissing(a), false, 'the stale check does not flag the text written since');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('#1819: removing a project folder drops its missing flags', async () => {
+  const dir = scratch('drop');
+  const projects = [{ id: 'p1', files: [{ name: 'a.md', content: 'alpha synthetic' }] }];
+  sourceText.externalize(dir, projects);
+  const a = projects[0].files[0];
+  fs.rmSync(path.join(dir, 'project-sources', 'p1', `${sha('alpha synthetic')}.txt`));
+  sourceText.meta(a);
+  await sourceText.scanSettled(dir);
+  assert.equal(sourceText.textMissing(a), true);
+  sourceText.collect(dir, [{ id: 'other', files: [] }], { graceMs: 0 });
+  assert.ok(!fs.existsSync(path.join(dir, 'project-sources', 'p1')), 'the project folder is removed');
+  assert.equal(sourceText.textMissing(a), false, 'its flag is dropped');
   fs.rmSync(dir, { recursive: true, force: true });
 });

@@ -102,13 +102,14 @@ test('#1815: a save fsyncs each text file before its rename and each folder once
   assert.ok(firstDirSync > lastRename, 'folders are fsynced after every rename (and externalize returns only after)');
   for (const t of texts) assert.equal(fs.readFileSync(path.join(pdir, `${sha(t)}.txt`), 'utf8'), t);
 
-  // A second save of new text in the existing folder: one file fsync, one folder fsync.
+  // A second save of new text in the existing folder: one file fsync, then each folder up to the
+  // workspace once (#1819: a folder that already exists may be one a failed save created).
   log.length = 0;
   projects[0].files.push({ name: '3.md', content: 'four synthetic' });
   fs.openSync = (p, ...rest) => { const fd = orig.openSync(p, ...rest); fdPath.set(fd, String(p)); return fd; };
   fs.fsyncSync = (fd) => { log.push(['fsync', fdPath.get(fd)]); return orig.fsyncSync(fd); };
   try { sourceText.externalize(dir, projects); } finally { Object.assign(fs, orig); }
-  assert.deepEqual(log.map(([, p]) => (p.endsWith('.tmp') ? 'file' : p)), ['file', pdir]);
+  assert.deepEqual(log.map(([, p]) => (p.endsWith('.tmp') ? 'file' : p)), ['file', pdir, path.join(dir, 'project-sources'), dir]);
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -145,7 +146,7 @@ test('#1815/#1818: textMissingNow sees a deleted file even when its text was cac
   const file = path.join(dir, 'project-sources', 'p1', `${sha('cached synthetic')}.txt`);
   fs.rmSync(file);
   assert.equal(sourceText.textMissingNow(a), true);
-    assert.equal(sourceText.meta(a).textRef, sha('cached synthetic'), 'the pointer is kept');
+  assert.equal(sourceText.meta(a).textRef, sha('cached synthetic'), 'the pointer is kept');
   assert.equal(sourceText.textMissingNow(b), false);
   fs.writeFileSync(file, 'cached synthetic');
   assert.equal(sourceText.textMissingNow(a), false);

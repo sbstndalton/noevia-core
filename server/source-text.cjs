@@ -115,8 +115,12 @@ function writeText(wsDir, projectId, ref, text, pendingDirs = null) {
     if (st.isFile() && st.size === bytes.length && refOf(fs.readFileSync(file, 'utf8')) === ref) {
       // #1818: the file may be one an earlier, failed save renamed into place without fsyncing its
       // folder; the folder is fsynced again before projects.json can point at it.
-      if (pendingDirs) pendingDirs.add(dir); else fsyncPath(dir);
-      unreadable.delete(missingKey(wsDir, projectId, ref));
+      // #1819: with every folder up to the workspace, since the project folder itself may be one
+      // that failed save created without fsyncing its entry in project-sources/.
+      const dirs = pendingDirs || new Set();
+      addChain(wsDir, dir, dirs);
+      if (!pendingDirs) flushDirs(dirs);
+      written(wsDir, projectId, ref);
       return;
     }
   } catch { /* absent: written below */ }
@@ -129,10 +133,32 @@ function writeText(wsDir, projectId, ref, text, pendingDirs = null) {
   dirs.add(dir);
   // A folder just created is itself a new entry in its parent(s): those are made durable too.
   if (created) { const top = path.dirname(created); for (let d = dir; d !== top && d !== path.dirname(d);) { d = path.dirname(d); dirs.add(d); } }
+  // #1819: in a batch, always every folder up to the workspace: a retry after a failed save that
+  // created the project folder finds it already there (`created` undefined) but its entry in
+  // project-sources/ (and that one's in the workspace) may never have been fsynced.
+  if (pendingDirs) addChain(wsDir, dir, dirs);
   if (!pendingDirs) flushDirs(dirs);
   cache.delete(file);
-  // #1818: written again (a re-upload, a refresh): no longer missing.
-  unreadable.delete(missingKey(wsDir, projectId, ref));
+  written(wsDir, projectId, ref);
+}
+
+/** Adds `dir` and every folder above it up to and including `wsDir` to `dirs`. */
+function addChain(wsDir, dir, dirs) {
+  const top = path.resolve(wsDir);
+  for (let d = path.resolve(dir); ; d = path.dirname(d)) {
+    dirs.add(d);
+    if (d === top || d === path.dirname(d)) break;
+  }
+}
+
+// #1819: a write generation per text key, so a background scan that started before a write never
+// flags the text that write just put back.
+const generation = new Map();
+/** #1818: written again (a re-upload, a refresh): no longer missing, and any scan in flight is stale. */
+function written(wsDir, projectId, ref) {
+  const key = missingKey(wsDir, projectId, ref);
+  generation.set(key, (generation.get(key) || 0) + 1);
+  unreadable.delete(key);
 }
 
 /** fsyncs each folder of `dirs` once, deepest first (a new folder's entries before its parent's
@@ -298,7 +324,13 @@ function collect(wsDir, projects, { now = Date.now(), graceMs = graceDefault } =
       if (ref) unreadable.delete(missingKey(wsDir, d, ref)); // #1818: gone on purpose, nothing to flag
       left -= 1;
     }
-    if (!refs && left === 0) fs.rmSync(dir, { recursive: true, force: true });
+    if (!refs && left === 0) {
+      fs.rmSync(dir, { recursive: true, force: true });
+      // #1819: the project's folder is gone: nothing under it can be reported missing any more.
+      const prefix = missingKey(wsDir, d, '');
+      for (const k of [...unreadable]) if (k.startsWith(prefix)) unreadable.delete(k);
+      for (const k of [...generation.keys()]) if (k.startsWith(prefix)) generation.delete(k);
+    }
   }
 }
 
@@ -375,8 +407,11 @@ function noteForScan(wsDir, key, full) {
     st.at = Date.now();
     st.running = (async () => {
       for (const [k, f] of batch) {
+        const gen = generation.get(k) || 0;
         try { await fs.promises.access(f, fs.constants.R_OK); unreadable.delete(k); }
         catch (e) {
+          // A write since the check started (a re-upload) wins: its file is there now.
+          if ((generation.get(k) || 0) !== gen) continue;
           if (e && (e.code === 'ENOENT' || e.code === 'EACCES' || e.code === 'ENOTDIR' || e.code === 'EPERM')) {
             unreadable.add(k);
             if (cache.has(f)) { cached -= cache.get(f).length; cache.delete(f); }
@@ -452,5 +487,5 @@ module.exports = {
   DIR, refOf, projectDir, readText, readTextStrict, writeText, attachFile, attachAll, externalize, collect, migrateOnLoad,
   hasInline, isExternal, textLength, cloneFile, sameText, meta, inlineAll, headerNamesSkill,
   textMissing, textMissingNow, scanSettled, SCAN_MS, _setScanMs(ms) { scanMs = ms; }, beginSourceWork, whileSourceWork, sourceWorkInFlight, flushDirs,
-  _cache: { clear() { cache.clear(); cached = 0; warned.clear(); unreadable.clear(); unreferencedSince.clear(); inFlight.clear(); scans.clear(); pendingScans.clear(); scanMs = SCAN_MS; } }, GRACE_MS, _setGraceMs(ms) { graceDefault = ms; },
+  _cache: { clear() { cache.clear(); cached = 0; warned.clear(); unreadable.clear(); unreferencedSince.clear(); inFlight.clear(); scans.clear(); pendingScans.clear(); generation.clear(); scanMs = SCAN_MS; } }, GRACE_MS, _setGraceMs(ms) { graceDefault = ms; },
 };
