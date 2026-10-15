@@ -116,7 +116,13 @@ function createChatFraming({ enabled, decide, embed = null, roles = () => ({}), 
     try { const v = await embed(texts, { signal, kind: texts.map((_, i) => (i === 0 ? 'query' : 'document')) }); return Array.isArray(v) && v.length === texts.length ? v : null; } catch { return null; }
   }
 
-  async function run({ message, projects, chats, chatId, started, budget, signal }) {
+  // #1775: the kind is the only answer a frame needs, so it goes to the decision service first and
+  // alone, in parallel with the embedding call (which does not use the decision service). Project and
+  // tag follow only once the kind is known, with whatever budget is left. Fired all at once after the
+  // embedding, the three framing calls plus the chat turn's route and tool-gate calls shared a 2-CPU
+  // decision model, so the kind took longer than its budget and almost every suggest fell back.
+  // `partial` keeps the kind (and related chats) so a deadline during project/tag still frames.
+  async function run({ message, projects, chats, chatId, started, budget, signal, partial }) {
     const text = String(message || '').slice(0, 1000);
     const routerModel = roles()?.framingRouterModel || '';
     const left = () => Math.max(1, budget - (now() - started));
@@ -128,26 +134,30 @@ function createChatFraming({ enabled, decide, embed = null, roles = () => ({}), 
       .slice(0, EMBED_PROJECTS);
     // One embedding call: the message, the related-chat pool, then project names and tags for pre-ranking.
     const texts = [text, ...pool.map((c) => c.title), ...ownProjects.map((p) => p.name), ...tags];
-    const vectors = await embedAll(texts, signal);
-    if (signal.aborted) return { frame: null, reason: 'deadline' };
+    const kindPromise = choose('chat.frame.kind', 'What kind of chat does this first message start?', KINDS.map((id) => ({ id, label: KIND_LABELS[id] })), text, left(), routerModel, signal)
+      .then((kind) => { partial.kind = kind; return kind; });
+    const [vectors, kind] = await Promise.all([embedAll(texts, signal), kindPromise]);
+    if (!kind) return { frame: null, reason: signal.aborted ? 'deadline' : 'no-kind' };
     const sim = (i) => (vectors ? cosine(vectors[0], vectors[i]) : 0);
     const links = vectors ? pool.map((c, i) => ({ id: c.id, score: sim(1 + i) })).filter((r) => r.score >= RELATED_MIN)
       .sort((a, b) => b.score - a.score).slice(0, RELATED_MAX).map((r) => r.id) : [];
+    partial.links = links;
     const rank = (items, offset) => items.map((item, i) => ({ item, score: sim(offset + i), i }))
       .sort((a, b) => b.score - a.score || a.i - b.i).slice(0, MAX_OPTIONS - 1).map((r) => r.item);
     const projectOptions = rank(ownProjects, 1 + pool.length).map((p) => ({ id: p.id, label: p.name }));
     const tagOptions = rank(tags, 1 + pool.length + ownProjects.length).map((t) => ({ id: t, label: `#${t}` }));
     const none = { id: NONE, label: 'None of these' };
 
-    const [kind, projectId, tag] = await Promise.all([
-      choose('chat.frame.kind', 'What kind of chat does this first message start?', KINDS.map((id) => ({ id, label: KIND_LABELS[id] })), text, left(), routerModel, signal),
+    if (signal.aborted) return { frame: frameOf(partial), reason: null };
+    const [projectId, tag] = await Promise.all([
       projectOptions.length ? choose('chat.frame.project', 'Which of the user\'s projects does this chat belong to?', [...projectOptions, none], text, left(), routerModel, signal) : null,
       tagOptions.length ? choose('chat.frame.tag', 'Which existing tag fits this chat best?', [...tagOptions, none], text, left(), routerModel, signal) : null,
     ]);
-    if (!kind) return { frame: null, reason: 'no-kind' };
-    return { frame: normalizeFrame({ kind, projectId: projectId && projectId !== NONE ? projectId : null,
-      tags: tag && tag !== NONE ? [tag] : [], links, confirmed: false, source: 'suggested' }), reason: null };
+    return { frame: frameOf({ kind, links, projectId, tag }), reason: null };
   }
+
+  const frameOf = ({ kind, links = [], projectId = null, tag = null }) => normalizeFrame({ kind,
+    projectId: projectId && projectId !== NONE ? projectId : null, tags: tag && tag !== NONE ? [tag] : [], links, confirmed: false, source: 'suggested' });
 
   /** The suggested frame for a chat's first message: { frame, reason }; frame is null on any failure. */
   async function suggest({ message, projects = [], chats = [], chatId = null } = {}) {
@@ -155,9 +165,13 @@ function createChatFraming({ enabled, decide, embed = null, roles = () => ({}), 
     if (typeof message !== 'string' || !message.trim()) return { frame: null, reason: 'empty' };
     const started = now();
     const budget = Number(deadlineMs()) > 0 ? Number(deadlineMs()) : DEFAULT_DEADLINE_MS;
+    const partial = { kind: null, links: [] };
     let out;
-    try { out = await withDeadline((signal) => run({ message, projects, chats, chatId, started, budget, signal }), budget); }
-    catch (error) { out = { frame: null, reason: error?.deadline ? 'deadline' : 'error' }; }
+    try { out = await withDeadline((signal) => run({ message, projects, chats, chatId, started, budget, signal, partial }), budget); }
+    catch (error) {
+      // A deadline after the kind arrived still frames (no project or tag); an error never does.
+      out = error?.deadline && partial.kind ? { frame: frameOf(partial), reason: null } : { frame: null, reason: error?.deadline ? 'deadline' : 'error' };
+    }
     log({ purpose: 'chat.frame', framed: !!out.frame, kind: out.frame?.kind || null, fellBack: out.reason, ms: now() - started });
     return out;
   }

@@ -86,7 +86,13 @@ test('fails open: disabled, empty, backend error, deadline and no backend all gi
   assert.ok(Date.now() - t0 < 450, 'returns at the deadline');
   assert.deepEqual(await make(async () => { throw Error('Decision service unavailable'); }).suggest({ message: 'x' }), { frame: null, reason: 'error' });
   const hanging = make(ok.decide, { embed: () => new Promise(() => {}), deadlineMs: () => 50 });
-  assert.deepEqual(await hanging.suggest({ message: 'x', projects, chats }), { frame: null, reason: 'deadline' });
+  // #1775: the kind does not wait for the embedding, so a hung embed still frames, without links.
+  const hung = await hanging.suggest({ message: 'x', projects, chats });
+  assert.equal(hung.reason, null);
+  assert.equal(hung.frame.kind, 'question');
+  assert.deepEqual(hung.frame.links, []);
+  const hangingBoth = make(async () => new Promise(() => {}), { embed: () => new Promise(() => {}), deadlineMs: () => 50 });
+  assert.deepEqual(await hangingBoth.suggest({ message: 'x', projects, chats }), { frame: null, reason: 'deadline' });
 });
 
 test('embedding failure still frames, without related chats', async () => {
@@ -183,12 +189,14 @@ test('at the deadline the embed and decide calls get an aborted signal', async (
 });
 
 test('a decision is not started once the deadline has aborted the call', async () => {
-  let decided = 0;
+  // #1775: the kind starts at once (alongside the embedding); project and tag never start after the deadline.
+  const started = [];
   const slowEmbed = (texts, { signal }) => new Promise((resolve) => signal.addEventListener('abort', () => resolve(texts.map(vec))));
-  const out = await make(async () => { decided++; return { selected: 'question' }; }, { embed: slowEmbed, deadlineMs: () => 30 }).suggest({ message: 'Tomato', projects, chats });
+  const kindAfterAbort = (r, { signal }) => new Promise((resolve) => signal.addEventListener('abort', () => resolve({ selected: r.purpose === 'chat.frame.kind' ? null : 'p-garden' })));
+  const out = await make(async (r, o) => { started.push(r.purpose); return kindAfterAbort(r, o); }, { embed: slowEmbed, deadlineMs: () => 30 }).suggest({ message: 'Tomato', projects, chats });
   assert.equal(out.reason, 'deadline');
   await new Promise((r) => setTimeout(r, 20));
-  assert.equal(decided, 0);
+  assert.deepEqual(started, ['chat.frame.kind']);
 });
 
 test('flag off: no embed or decide call at all', async () => {
@@ -242,4 +250,67 @@ test('suggest embeds at most 64 project names and 64 tags, most used tags first 
   assert.ok(inputs[0].includes('popular'), 'the most used tag is kept');
   const tagRequest = seen.find((r) => r.purpose === 'chat.frame.tag');
   assert.equal(tagRequest.options[0].id, 'popular');
+});
+
+// #1775: a fake decision model that shares its CPU between concurrent requests (processor sharing),
+// like Kev on 2 threads: each request needs `workMs` of the whole model alone; n at once each run at 1/n.
+function sharedCpuBackend({ workMs = 450 } = {}) {
+  const active = new Set();
+  let last = Date.now(), timer = null;
+  const advance = () => { const t = Date.now(), dt = t - last; last = t; for (const job of active) job.left -= dt / active.size; };
+  const schedule = () => {
+    clearTimeout(timer);
+    for (const job of [...active]) if (job.left <= 0.5) { active.delete(job); job.done(); }
+    if (!active.size) return;
+    const next = Math.min(...[...active].map((j) => j.left)) * active.size;
+    timer = setTimeout(() => { advance(); schedule(); }, Math.max(1, Math.ceil(next)));
+  };
+  const run = (signal) => new Promise((resolve, reject) => {
+    advance();
+    const job = { left: workMs, done: resolve };
+    signal?.addEventListener('abort', () => { advance(); active.delete(job); schedule(); reject(Error('aborted')); }, { once: true });
+    active.add(job); schedule();
+  });
+  const answers = { 'chat.frame.kind': 'question', 'chat.frame.project': 'p-garden', 'chat.frame.tag': 'plants', 'model.route': 'fast', 'tool.gate': 'none' };
+  const finished = {};
+  const backend = { id: 'kev', locality: 'local', supports: () => true,
+    async decide(request, { signal } = {}) {
+      await run(signal);
+      finished[request.purpose] = Date.now();
+      return { selected: answers[request.purpose], scores: { [answers[request.purpose]]: 0.9 }, confidence: 0.9 };
+    } };
+  const purposes = Object.keys(answers);
+  return { finished, decisions: createDecisions({ log: (e) => process.env.DBG && console.log(JSON.stringify(e)), backends: { kev: backend }, chains: Object.fromEntries(purposes.map((p) => [p, ['kev']])) }) };
+}
+
+test('#1775 timing: framing frames within the deadline while the chat turn shares the decision model', async () => {
+  // The 2026-10-15 turn: framing starts, the route decision arrives ~150 ms later, the tool gate after
+  // the route. Embedding (its own server) takes ~300 ms. Deadline 2000 ms (decision timeoutMs).
+  const { decisions, finished } = sharedCpuBackend({ workMs: 450 });
+  const slowEmbed = async (texts) => { await new Promise((r) => setTimeout(r, 300)); return texts.map(vec); };
+  const framing = createChatFraming({ enabled: () => true, decide: decisions.decide, embed: slowEmbed, deadlineMs: () => 2000 });
+  const option = (id) => ({ id, label: id });
+  const turn = (async () => {
+    await new Promise((r) => setTimeout(r, 150));
+    await decisions.decide({ kind: 'choice', purpose: 'model.route', question: 'q', options: ['fast', 'smart', 'code'].map(option), context: { cloud: 'forbidden' }, constraints: { deadlineMs: 2000 }, fallback: { selected: null, scores: {} } });
+    await decisions.decide({ kind: 'choice', purpose: 'tool.gate', question: 'q', options: ['none', 'web'].map(option), context: { cloud: 'forbidden' }, constraints: { deadlineMs: 2000 }, fallback: { selected: null, scores: {} } });
+  })();
+  const t0 = Date.now();
+  const out = await framing.suggest({ message: 'Why is my tomato plant wilting?', projects, chats });
+  const ms = Date.now() - t0;
+  await turn;
+  assert.equal(out.reason, null, `framing fell back (${out.reason}) after ${ms} ms`);
+  assert.equal(out.frame.kind, 'question');
+  assert.ok(finished['chat.frame.kind'] - t0 < 1200, `kind answered in ${finished['chat.frame.kind'] - t0} ms`);
+  assert.ok(ms <= 2100, `suggest took ${ms} ms`); // project/tag may use the rest of the budget; the kind is kept
+});
+
+test('#1775: a deadline during project/tag keeps the kind (and related chats)', async () => {
+  const decide = async (r) => {
+    if (r.purpose !== 'chat.frame.kind') await new Promise(() => {});
+    return { source: 'stub', selected: 'idea', scores: {} };
+  };
+  const out = await make(decide, { deadlineMs: () => 150 }).suggest({ message: 'tomato garden', projects, chats, chatId: 'new' });
+  assert.equal(out.reason, null);
+  assert.deepEqual(out.frame, { projectId: null, kind: 'idea', tags: [], links: ['c1'], confirmed: false, source: 'suggested' });
 });
