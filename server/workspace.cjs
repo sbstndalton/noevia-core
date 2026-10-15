@@ -166,14 +166,20 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { rustProjects 
     for (const project of projects) if (project && Array.isArray(project.files)) project.files = project.files.filter((f) => f && typeof f === 'object');
     for (const project of projects) if (project.provider === 'lemonade') project.provider = defaultProvider.id;
     let modesMigrated = false;
-    for (const project of projects) if (require('./project-modes.cjs').migrate(project)) modesMigrated = true;
+    // #1839: what a project's `modes` was before the #1576 migration, kept until the backup exists.
+    const modesHeld = new Map();
+    for (const project of projects) {
+      const had = project && Array.isArray(project.modes) ? project.modes : undefined;
+      if (require('./project-modes.cjs').migrate(project)) { modesMigrated = true; modesHeld.set(project, { had, now: project.modes.slice() }); }
+    }
     // #1576: projects.json is copied aside before the modes migration is written back (a stored
     // Cowork- or Code-only project gains Chat; nothing else changes). Same backup folder as #1806.
     if (modesMigrated && !loadCorrupt) {
-      // Without a backup the file is not rewritten now; the migration still applies in memory and
-      // reaches disk with the next ordinary save, by which time the person has changed something.
-      try { sourceText.backupProjectsFile(dir, '1576'); } catch (e) { modesMigrated = false; console.warn('[projects] could not back up projects.json before the #1576 migration:', e.message); }
-    }
+      // Without a backup the file is not rewritten now, and no later save (this load's #1806 one
+      // included) writes the migrated `modes` either: saveProjects() retries the backup and, until
+      // it succeeds, writes the original `modes`. The migration still applies in memory.
+      try { sourceText.backupProjectsFile(dir, '1576'); modesHeld.clear(); } catch (e) { modesMigrated = false; console.warn('[projects] could not back up projects.json before the #1576 migration:', e.message); }
+    } else modesHeld.clear();
     // #1806: inline source text from before is moved to its files (backup first); see source-text.cjs.
     const textMigrated = sourceText.migrateOnLoad(dir, projects);
     const workspace = {
@@ -198,6 +204,24 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { rustProjects 
         this.assertActive();
         // #1806: new or changed source text goes to its file first, so projects.json never points
         // at a text that is not on disk; text no source points at any more is removed after.
+        // #1839: while the #1576 backup is missing the migrated `modes` stay off the disk.
+        let restoreModes = () => {};
+        if (modesHeld.size) {
+          let backedUp = false;
+          try { sourceText.backupProjectsFile(dir, '1576'); backedUp = true; } catch (e) { console.warn('[projects] could not back up projects.json before the #1576 migration:', e.message); }
+          if (backedUp) modesHeld.clear();
+          else {
+            const reverted = [];
+            for (const [project, { had, now }] of modesHeld) {
+              const same = Array.isArray(project.modes) && project.modes.length === now.length && project.modes.every((m, i) => m === now[i]);
+              if (!same || !this.projects.includes(project)) continue;
+              if (had === undefined) delete project.modes; else project.modes = had;
+              reverted.push([project, now]);
+            }
+            restoreModes = () => { for (const [project, now] of reverted) project.modes = now; };
+          }
+        }
+        try {
         sourceText.externalize(dir, this.projects);
         // The collection runs right after the write, under the same flock when projects.json is
         // shared with the Rust front, and never after a corrupt load or over an empty list.
@@ -207,6 +231,7 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { rustProjects 
         };
         if (projectsFile) projectsFile.save(this.projects, gc);
         else { atomicJson(path.join(dir, 'projects.json'), { projects: this.projects }); gc(this.projects); }
+        } finally { restoreModes(); }
       },
       saveProviders() {
         this.assertActive();
