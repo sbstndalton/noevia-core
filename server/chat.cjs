@@ -1010,6 +1010,7 @@ function createChatHandler({
     let model = (project && project.model) || null;
     let routedRole = null;
     let routingDecision = null;
+    let routePreload = null; // #1863
     if (wantsAuto) {
       const savedRoles = autoRoles();
       if (!savedRoles) {
@@ -1025,6 +1026,16 @@ function createChatHandler({
       const creativeGone = missing.some((m) => m.role === 'creative');
       const staleRoles = staleRolesError(missing.filter((m) => m.role !== 'creative'));
       if (staleRoles) return json(res, 409, { error: staleRoles });
+      // #1863: when every role this turn could end on names the same local model, load it beside the decision.
+      if (!routeTarget?.row && !body.compactOnly && provider.id === DEFAULT_PROVIDER_ID && modelManager.enabled) {
+        const preload = require('./route-preload.cjs');
+        const target = preload.preloadTarget({ roles: savedRoles, remoteRole: (role) => chatMachines?.target(role) || null,
+          hasImages: attachedImages.length > 0 || retrievedImages.length > 0 || msgs.some((m) => typeof m.content !== 'string'),
+          contextHigh: require('./long-profile.cjs').normalizeProfile(project?.contextProfile) === 'high' });
+        if (target) routePreload = await preload.startPreload({ manager: modelManager, model: target, signal: chatSignal.signal, busy: engineBusy, log: (line) => console.log(line) });
+        // An early answer (an error before the model is used) stops waiting on it; the router's own load goes on.
+        if (routePreload) res.once('finish', () => routePreload.cancel());
+      }
       const classification = await classifyFastOrSmart(message); // fail-open inside
       routedRole = typeof classification === 'string' ? classification : classification.role;
       routingDecision = typeof classification === 'string' ? null : classification.routingDecision;
@@ -1625,6 +1636,14 @@ function createChatHandler({
     try {
       // Native engine: free the GPU of any other chat model before this one loads (it holds two
       // models so the embedding model can stay beside the chat model; two chat models do not fit).
+      // #1863: a pre-load for another model (the turn moved after all) is not needed; one for this model is
+      // awaited here (makeRoomFor queues behind it anyway) with the usual loading status.
+      if(routePreload&&routePreload.model!==model)routePreload.cancel();
+      else if(routePreload&&routePreload.pending()){
+        const seconds=context.expectedLoadSeconds(model);
+        send({type:'status',text:context.loadingStatus(model,routedRole||null,seconds),id:'loadingModel',detail:{model,...(routedRole?{role:routedRole}:{}),...(seconds?{expectedSeconds:seconds}:{})}});
+        await routePreload.settled;
+      }
       if(provider.id===DEFAULT_PROVIDER_ID&&typeof modelManager.makeRoomFor==='function')await modelManager.makeRoomFor(model,undefined,chatSignal.signal);
       ({limit,limitSource}=await context.resolveRuntimeLimit({
         manager:provider.id===DEFAULT_PROVIDER_ID?modelManager:null,model,dir:chatWorkspace.dir,
