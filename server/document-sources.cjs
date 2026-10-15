@@ -54,7 +54,9 @@ async function ingest(workspace, projectId, name, bytes, previous, { ocrBudget }
     // #1864/#1865: a record stored before the completion pass existed (or one that stopped for a passing
     // reason) gets it now, once: the pages past the old 300-page window and an OCR retry of its incomplete
     // pages. Only such records do anything here; the rest come back with the marker and nothing else.
-    if (out.completion !== documents.COMPLETION) {
+    // #1867: and a completed record whose OCR was refused only for the file's size, when the worker may
+    // now take it (completeDocument asks the worker and returns the record unchanged when it still cannot).
+    if (out.completion !== documents.COMPLETION || documents.reopenable(out)) {
       try {
         const completed = await documents.completeDocument(name, bytes, out, ocrBudget ? { ocrBudget } : undefined);
         if (completed !== out) { out = storeFigures(completed); writeOnce(workspace, resultFile, JSON.stringify(out)); }

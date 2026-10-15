@@ -124,23 +124,35 @@ const DOCLING_REPLY_CAP = 32 * 1024 * 1024;
 // #1864: whether the worker reads page ranges, from its /health (`"ranges": true` since #1864). Asked
 // before any ranged request, because a worker from before #1864 ignores X-Document-Pages and would
 // convert the whole first window again only for the reply to be thrown away. true, false, or null when
-// the worker could not be asked. A definite answer is kept for a minute.
-let rangesCache = { at: 0, url: null, value: null };
-async function rangesSupported(options = {}) {
+// the worker could not be asked. #1882: with `bytes`, false when the file is over the worker's advertised
+// `rangedMaxBytes` (it would refuse every range with 400). Positive and negative answers are kept
+// CAPABILITY_TTL_MS.
+const CAPABILITY_TTL_MS = 5 * 60_000;
+let rangesCache = { at: 0, url: null, value: undefined };
+async function rangesHealth(options) {
   const target = workers.resolve('documents');
   const url = options.url === undefined ? target.url : options.url;
   const fetchImpl = options.fetchImpl || (options.url === undefined ? target.fetch : fetch);
   if (!url) return null;
   const now = Date.now();
-  if (!options.fresh && rangesCache.url === url && rangesCache.value !== null && now - rangesCache.at < 60_000) return rangesCache.value;
+  if (!options.fresh && rangesCache.url === url && rangesCache.value !== undefined && now - rangesCache.at < CAPABILITY_TTL_MS) return rangesCache.value;
+  let value = null;
   try {
     const response = await fetchImpl(`${url.replace(/\/+$/, '')}/health`, { method: 'GET', redirect: 'error', signal: AbortSignal.timeout(10_000) });
-    if (!response.ok) return null;
-    const body = await readCappedJson(response, 64 * 1024);
-    const value = body?.ranges === true;
-    rangesCache = { at: now, url, value };
-    return value;
-  } catch { return null; }
+    if (response.ok) {
+      const body = await readCappedJson(response, 64 * 1024);
+      value = { ranges: body?.ranges === true,
+        ...(Number.isSafeInteger(body?.rangedMaxBytes) && body.rangedMaxBytes > 0 ? { rangedMaxBytes: body.rangedMaxBytes } : {}) };
+    }
+  } catch { value = null; }
+  rangesCache = { at: now, url, value };
+  return value;
+}
+async function rangesSupported(options = {}) {
+  const health = await rangesHealth(options);
+  if (!health) return null;
+  if (!health.ranges) return false;
+  return !(Number.isSafeInteger(options.bytes) && health.rangedMaxBytes && options.bytes > health.rangedMaxBytes);
 }
 
-module.exports = { extractDocument, rangesSupported, supports, enabled, documentName, headerSafeName, VERSION, FORMATS };
+module.exports = { CAPABILITY_TTL_MS, extractDocument, rangesSupported, supports, enabled, documentName, headerSafeName, VERSION, FORMATS };

@@ -266,7 +266,7 @@ test('#1865: without an OCR worker the page says the retry is unavailable; past 
   const many = Array.from({ length: 25 }, (_, i) => i + 1);
   const ocr = fakeOcr(() => '');
   const capped = await documents.extractDocumentText('form.pdf', syntheticPdf({ pages: 2 }), docling(fakeDocling({ total: 25, degraded: many }), { ocrEnabled: true, extractPages: ocr.extractPages }));
-  assert.deepEqual(ocr.calls.map((c) => c.pages.length), [10, 10]);
+  assert.deepEqual(ocr.calls.map((c) => c.pages.length), [3, 3, 3, 3, 3, 3, 2], "#1882: RETRY_BATCH (3) pages per request, RETRY_PAGE_CAP in all");
   assert.equal(capped.pageTexts.filter((p) => p.retry?.outcome === 'empty').length, documents.RETRY_PAGE_CAP);
   assert.equal(capped.pageTexts.filter((p) => p.retry?.outcome === 'skipped').length, 25 - documents.RETRY_PAGE_CAP);
 });
