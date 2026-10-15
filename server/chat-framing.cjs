@@ -26,6 +26,9 @@ const RELATED_MIN = 0.5, RELATED_MAX = 3, RELATED_POOL = 50;
 // tags (most used first) are embedded; a user with thousands of tags still makes one small request.
 const EMBED_PROJECTS = 64, EMBED_TAGS = 64;
 const DEFAULT_DEADLINE_MS = 1500;
+// #1778: once the kind has answered, a still-running embedding gets this much longer (never past the
+// deadline) before the frame is returned kind-only, so a hung embedding cannot hold a frame hostage.
+const EMBED_GRACE_MS = 250;
 const SOURCES = new Set(['suggested', 'user']);
 
 const cleanTag = (t) => (typeof t === 'string' ? t.trim().replace(/^#+/, '').replace(/\s+/g, '-').slice(0, MAX_TAG_CHARS) : '');
@@ -136,8 +139,15 @@ function createChatFraming({ enabled, decide, embed = null, roles = () => ({}), 
     const texts = [text, ...pool.map((c) => c.title), ...ownProjects.map((p) => p.name), ...tags];
     const kindPromise = choose('chat.frame.kind', 'What kind of chat does this first message start?', KINDS.map((id) => ({ id, label: KIND_LABELS[id] })), text, left(), routerModel, signal)
       .then((kind) => { partial.kind = kind; return kind; });
-    const [vectors, kind] = await Promise.all([embedAll(texts, signal), kindPromise]);
+    const embedding = embedAll(texts, signal);
+    const kind = await kindPromise;
     if (!kind) return { frame: null, reason: signal.aborted ? 'deadline' : 'no-kind' };
+    let graceTimer;
+    const TIMED_OUT = Symbol('embed-grace');
+    const vectors = await Promise.race([embedding, new Promise((resolve) => { graceTimer = setTimeout(() => resolve(TIMED_OUT), Math.min(EMBED_GRACE_MS, left())); })])
+      .finally(() => clearTimeout(graceTimer));
+    // The embedding is still hung: the kind alone is the frame (no related chats, no pre-ranked project/tag).
+    if (vectors === TIMED_OUT) return { frame: frameOf(partial), reason: null };
     const sim = (i) => (vectors ? cosine(vectors[0], vectors[i]) : 0);
     const links = vectors ? pool.map((c, i) => ({ id: c.id, score: sim(1 + i) })).filter((r) => r.score >= RELATED_MIN)
       .sort((a, b) => b.score - a.score).slice(0, RELATED_MAX).map((r) => r.id) : [];
@@ -149,10 +159,16 @@ function createChatFraming({ enabled, decide, embed = null, roles = () => ({}), 
     const none = { id: NONE, label: 'None of these' };
 
     if (signal.aborted) return { frame: frameOf(partial), reason: null };
-    const [projectId, tag] = await Promise.all([
-      projectOptions.length ? choose('chat.frame.project', 'Which of the user\'s projects does this chat belong to?', [...projectOptions, none], text, left(), routerModel, signal) : null,
-      tagOptions.length ? choose('chat.frame.tag', 'Which existing tag fits this chat best?', [...tagOptions, none], text, left(), routerModel, signal) : null,
-    ]);
+    let projectId, tag;
+    try {
+      [projectId, tag] = await Promise.all([
+        projectOptions.length ? choose('chat.frame.project', 'Which of the user\'s projects does this chat belong to?', [...projectOptions, none], text, left(), routerModel, signal) : null,
+        tagOptions.length ? choose('chat.frame.tag', 'Which existing tag fits this chat best?', [...tagOptions, none], text, left(), routerModel, signal) : null,
+      ]);
+    } catch {
+      // #1778: the kind already answered; a failing project/tag decision keeps it, as the deadline does.
+      return { frame: frameOf(partial), reason: null };
+    }
     return { frame: frameOf({ kind, links, projectId, tag }), reason: null };
   }
 

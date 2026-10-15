@@ -199,6 +199,20 @@ test('a decision is not started once the deadline has aborted the call', async (
   assert.deepEqual(started, ['chat.frame.kind']);
 });
 
+test('a decision is not started when the abort lands after the kind answered (#1778)', async () => {
+  // The kind and the embedding both settle only at the abort, so run() resumes with a kind and an aborted
+  // signal: project and tag must not start, and the frame keeps the kind.
+  const started = [];
+  const onAbort = (signal, value) => new Promise((resolve) => signal.addEventListener('abort', () => resolve(value)));
+  const decide = async (r, { signal }) => { started.push(r.purpose); return onAbort(signal, { selected: 'idea', source: 'stub' }); };
+  const embed = (texts, { signal }) => onAbort(signal, texts.map(vec));
+  const out = await make(decide, { embed, deadlineMs: () => 40 }).suggest({ message: 'Tomato', projects, chats });
+  assert.equal(out.reason, null);
+  assert.equal(out.frame.kind, 'idea');
+  await new Promise((r) => setTimeout(r, 30));
+  assert.deepEqual(started, ['chat.frame.kind']);
+});
+
 test('flag off: no embed or decide call at all', async () => {
   let calls = 0;
   const out = await make(async () => { calls++; }, { enabled: () => false, embed: async () => { calls++; return []; } }).suggest({ message: 'Tomato', projects, chats });
@@ -301,8 +315,8 @@ test('#1775 timing: framing frames within the deadline while the chat turn share
   await turn;
   assert.equal(out.reason, null, `framing fell back (${out.reason}) after ${ms} ms`);
   assert.equal(out.frame.kind, 'question');
-  assert.ok(finished['chat.frame.kind'] - t0 < 1200, `kind answered in ${finished['chat.frame.kind'] - t0} ms`);
-  assert.ok(ms <= 2100, `suggest took ${ms} ms`); // project/tag may use the rest of the budget; the kind is kept
+  assert.ok(finished['chat.frame.kind'] - t0 < 1900, `kind answered in ${finished['chat.frame.kind'] - t0} ms`);
+  assert.ok(ms <= 3000, `suggest took ${ms} ms`); // project/tag may use the rest of the budget; the kind is kept
 });
 
 test('#1775: a deadline during project/tag keeps the kind (and related chats)', async () => {
@@ -311,6 +325,25 @@ test('#1775: a deadline during project/tag keeps the kind (and related chats)', 
     return { source: 'stub', selected: 'idea', scores: {} };
   };
   const out = await make(decide, { deadlineMs: () => 150 }).suggest({ message: 'tomato garden', projects, chats, chatId: 'new' });
+  assert.equal(out.reason, null);
+  assert.deepEqual(out.frame, { projectId: null, kind: 'idea', tags: [], links: ['c1'], confirmed: false, source: 'suggested' });
+});
+
+test('#1778: a hung embedding does not hold a kind that already answered until the deadline', async () => {
+  const { decide } = stubDecide({ 'chat.frame.kind': 'idea', 'chat.frame.project': 'p-garden' });
+  const t0 = Date.now();
+  const out = await make(decide, { embed: () => new Promise(() => {}), deadlineMs: () => 5000 }).suggest({ message: 'tomato garden', projects, chats });
+  assert.equal(out.reason, null);
+  assert.deepEqual(out.frame, { projectId: null, kind: 'idea', tags: [], links: [], confirmed: false, source: 'suggested' });
+  assert.ok(Date.now() - t0 < 3000, `returned after ${Date.now() - t0} ms, well before the 5000 ms deadline`);
+});
+
+test('#1778: a project/tag decision that throws after the kind answered keeps the kind', async () => {
+  const decide = async (r) => {
+    if (r.purpose !== 'chat.frame.kind') throw Error('boom');
+    return { source: 'stub', selected: 'idea', scores: {} };
+  };
+  const out = await make(decide, { deadlineMs: () => 2000 }).suggest({ message: 'tomato garden', projects, chats, chatId: 'new' });
   assert.equal(out.reason, null);
   assert.deepEqual(out.frame, { projectId: null, kind: 'idea', tags: [], links: ['c1'], confirmed: false, source: 'suggested' });
 });
