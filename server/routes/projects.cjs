@@ -127,6 +127,9 @@ function createProjectRoutes({
     && require('../project-docs-default.cjs').applyProjectDocsDefault(project, {
       offered: (id) => allToolboxes().some((b) => b.id === id), defaults: DEFAULT_TOOLBOXES || ['core'], hadUploads });
 
+  // #1815: the workspace folder source work is registered under (none when unknown: no registration).
+  const sourceWorkDir = () => { try { return (typeof currentWorkspace === 'function' && currentWorkspace()?.dir) || null; } catch { return null; } };
+
   async function handle(req, res, { path: p, authn, url }) {
     // Opt-in asynchronous source processing; the synchronous API remains compatible.
     const sourceJob = p.match(/^\/api\/projects\/([^/]+)\/source-jobs\/([^/]+)$/);
@@ -637,7 +640,8 @@ function createProjectRoutes({
         }
         // Validate the filename before contacting the document processor.
         uploads.validate(inputName, inputBytes.subarray(0,1));
-        return await withSourceLock(project, async () => {
+        // #1815: a folder import file holds no source-text collection in this workspace while it runs.
+        return await sourceText.whileSourceWork(folderImport && sourceWorkDir(), () => withSourceLock(project, async () => {
           if (getProject(id) !== project) return json(res, 409, { error: 'Project changed; retry.' });
           const hadUploads = hasUploads(project); // #659: the box is added only when uploads first appear
           const connection = authService.getStorage(authn.user.id, true);
@@ -699,7 +703,7 @@ function createProjectRoutes({
             if (!recorded && created.etag && (await uploads.discardCreated(created)).deleted && project.files !== filesBefore) project.files = filesBefore;
           }
           return json(res, 200, { name, path: file.name, bytes: bytes.length, document: file.document, attachment: file.attachment });
-        });
+        }));
       }
       if (!isText && !documents.isDocument(rawName)) {
         return json(res, 400, { error: `${rawName} is not a supported source (text file or PDF).` });
@@ -796,6 +800,9 @@ function createProjectRoutes({
       const file = (project.files || []).find((f) => f && f.name === name);
       if (!file) return json(res, 404, { error: 'no such source' });
       const content = typeof file.content === 'string' ? file.content : '';
+      // #1815: a text file that is gone or unreadable is a 404 with its own code, never an empty 200.
+      // The source and its pointer are kept; re-uploading or refreshing it writes the text again.
+      if (sourceText.textMissing(file)) return json(res, 404, { error: 'The text of this source is missing. Re-upload or refresh it.', code: 'SOURCE_TEXT_MISSING', name: file.name });
       return json(res, 200, { name: file.name, content, chars: content.length });
     }
 
@@ -928,7 +935,8 @@ function createProjectRoutes({
       if (!project) return json(res, 404, { error: 'no such project' });
       const hold = automaticHold(authn, req);
       if (hold) return holdReply(res, hold);
-      return await withSourceLock(project, async () => {
+      // #1815: no source-text collection in this workspace while the sync runs.
+      return await sourceText.whileSourceWork(sourceWorkDir(), () => withSourceLock(project, async () => {
         if (getProject(id) !== project) return json(res, 409, { error: 'Project changed; retry.' });
         const hadUploads = hasUploads(project); // #659: the box is added only when uploads first appear
         const connection = authService.getStorage(authn.user.id, true);
@@ -1091,7 +1099,7 @@ function createProjectRoutes({
           files: project.files.map((f) => ({ name: f.name, source: f.source || null, bytes: sourceText.textLength(f), document: f.document })),
           skipped,
         });
-      });
+      }));
     }
 
     const chatDel = p.match(/^\/api\/projects\/([^/]+)\/chats\/([^/]+)$/);
