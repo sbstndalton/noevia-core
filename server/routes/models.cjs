@@ -247,9 +247,16 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
         // #1840: a role on an Inference machine is not expected in this machine's catalogue.
         // #1849: the models chat roles' machines serve, for the Manual list (labelled with the machine). Left out when
         // nothing is on a machine, so that answer is exactly what it was.
+        // #1855: a name this machine's served catalogue lists is answered here (the router's own test), so it is left out
+        // of the list; the web shows exactly this.
+        const catalogue = await servedCatalogue();
         let onMachines = [];
         try { onMachines = machineModels() || []; } catch { onMachines = []; }
-        return json(res, 200, { configured: !!roles, roles: roles || null, missing: missingRoles(localRoles(roles), await servedCatalogue()), ...(onMachines.length ? { machineModels: onMachines } : {}) });
+        if (onMachines.length) {
+          const served = new Set((Array.isArray(catalogue) ? catalogue : []).map((m) => m?.name));
+          onMachines = onMachines.filter((r) => !served.has(r?.model));
+        }
+        return json(res, 200, { configured: !!roles, roles: roles || null, missing: missingRoles(localRoles(roles), catalogue), ...(onMachines.length ? { machineModels: onMachines } : {}) });
       }
       if (req.method === 'PUT') {
         const raw = await readBody(req);
