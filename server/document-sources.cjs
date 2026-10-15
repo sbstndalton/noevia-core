@@ -103,6 +103,10 @@ function notes(file) {
   if (!d) return [];
   const out = [];
   if (d.stoppedAt) out.push({ id: 'stoppedAtPage', params: { page: d.stoppedAt.page, limit: d.stoppedAt.limit, ...(d.stoppedAt.error ? { reason: d.stoppedAt.error } : {}) } });
+  // #1868: the text past the 200,000-character head is still being added to search (document-backfill.cjs).
+  if (d.searchable && d.searchable.version === d.availableVersion && d.searchable.complete === false && Number.isInteger(d.searchable.page)) {
+    out.push({ id: 'searchableToPage', params: { page: d.searchable.page } });
+  }
   const pages = Array.isArray(d.pageStatus) ? d.pageStatus : [];
   const by = (outcome) => pages.filter(p => p.retry?.outcome === outcome);
   const failedBy = new Map();
@@ -123,6 +127,7 @@ function noteText(n) {
     case 'ocrRetryEmpty': return `pages ${p.pages}: OCR retry found no text`;
     case 'ocrRetryUnavailable': return `pages ${p.pages}: OCR retry unavailable (no OCR service is configured)`;
     case 'ocrRetryLimit': return `pages ${p.pages}: not retried (OCR retry limit of ${documents.RETRY_PAGE_CAP} pages)`;
+    case 'searchableToPage': return `searchable up to page ${p.page} so far; later pages are still being indexed`;
     case 'ocrRetryRecovered': return `pages ${p.pages}: recovered by an OCR retry; verify numbers against the original`;
     default: return '';
   }

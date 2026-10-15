@@ -779,8 +779,77 @@ function createProjectStore({
     });
   }
 
+  // #1869: the #1864/#1865 completion pass, once, for a document uploaded with no storage connection (it is
+  // never read again otherwise), from its stored original, within `ocrBudget` (the backfill's, the sync path's
+  // size). Runs in the owner's scope under the project's source lock. Only a record without the completion
+  // marker is worked on; `document.completionSweep` = the version that needs nothing more (its record parsed
+  // and finished, or COMPLETION_TRIES passes spent on it), so it is never looked at again. A record the budget
+  // left unfinished keeps no marker and goes on in the next pass.
+  // #1881: a record that cannot be read, or a transient (retryable) one, is skipped, never marked finished; a pass
+  // the OCR or extraction service being unreachable cut short does not count as a try; an original whose size is
+  // not recorded is measured on disk, and one over the upload limit is refused unread.
+  // Returns { status: 'complete' (nothing to do) | 'completed' | 'deferred' | 'retry' | 'failed' | 'missing' |
+  // 'skipped' | 'changed', unreachable? }.
+  const COMPLETION_TRIES = 6;
+  async function completeUploadedDocument(project, file, { ocrBudget } = {}) {
+    return withSourceLock(project, async () => {
+      const workspace = currentWorkspace();
+      const live = () => getProject(project.id) === project && (project.files || []).includes(file) && !!file.document;
+      if (!live() || file.source) return { status: 'changed' };
+      const documents = require('./documents.cjs');
+      const d = file.document;
+      const version = d.version;
+      const dir = documentSources.directory(workspace, project.id);
+      const readRecord = () => { try { return JSON.parse(fs.readFileSync(path.join(dir, `${version}.json`), 'utf8')); } catch { return null; } };
+      const finished = (r) => r.completion === documents.COMPLETION || !Array.isArray(r.pageTexts) || !r.pageTexts.length;
+      const mark = (extra = {}) => { Object.assign(d, { completionSweep: version }, extra); delete d.completionTries; saveProjects(PROJECTS); };
+      const before = readRecord();
+      if (!before || before.retryable) return { status: 'skipped' }; // unreadable or transient: next pass
+      if (finished(before)) { mark(); return { status: 'complete' }; }
+      if (d.extractor !== documents.EXTRACTOR_VERSION) return { status: 'changed' };
+      // The original's size: as recorded, else measured; never NaN into the lock, never over the upload limit.
+      let size = Number(d.bytes);
+      if (!(Number.isSafeInteger(size) && size > 0)) {
+        try { size = fs.statSync(path.join(dir, `${d.byteHash}.pdf`)).size; } catch { mark(); return { status: 'missing' }; }
+      }
+      if (size > require('./source-limits.cjs').documentLimits().readBytes) { mark(); return { status: 'failed', error: 'the original is larger than the upload limit' }; }
+      const read = await require('./large-document-lock.cjs').ifLarge(size, async () => {
+        let bytes;
+        try { bytes = documentSources.readOriginal(workspace, project.id, file); } catch { return null; }
+        return documentSources.ingest(workspace, project.id, file.name, bytes, file, ocrBudget ? { ocrBudget } : undefined);
+      }, d.byteHash);
+      if (!read) { mark(); return { status: 'missing' }; }
+      if (!live() || file.document !== d) return { status: 'changed' };
+      const after = readRecord();
+      const done = !!after && !after.retryable && finished(after);
+      // A stop for a passing reason (a worker busy or unreachable): completeDocument retries it on a later read
+      // (bounded by its own RETRY_ATTEMPTS), and it is not one of this document's tries.
+      const passing = !!after && ((after.pageTexts || []).some((p) => p?.retry?.outcome === 'failed' && p.retry.again === true)
+        || (after.stoppedAt?.limit === 'error' && after.completion !== documents.COMPLETION));
+      const failedRead = read.document.version !== version || (read.document.state === 'failed' && d.state !== 'failed');
+      const unreachable = failedRead ? documentSources.serviceDown(read.document.error) : passing;
+      const tries = (Number(d.completionTries) || 0) + (unreachable ? 0 : 1);
+      const marks = done || tries >= COMPLETION_TRIES ? { completionSweep: version } : (tries ? { completionTries: tries } : {});
+      if (failedRead) {
+        // Not this record (the extractor changed meanwhile) or a failure: the current text stays.
+        Object.assign(d, marks); if (marks.completionSweep) delete d.completionTries; saveProjects(PROJECTS);
+        return { status: documentSources.retryable(workspace, project.id, read.document.version) ? 'retry' : 'failed', unreachable, error: read.document.error };
+      }
+      const keep = {};
+      // The search coverage is not kept: the record changed, so the backfill looks at its tail again.
+      for (const k of ['figureSweep', 'completionTries']) if (d[k] !== undefined) keep[k] = d[k];
+      if (marks.completionSweep) delete keep.completionTries;
+      const updated = { ...file, content: read.content, document: { ...read.document, ...keep, ...marks } };
+      const textChanged = String(read.content || '') !== String(file.content || '');
+      project.files = project.files.map((f) => (f === file ? updated : f));
+      if (textChanged) indexSource(project, updated);
+      saveProjects(PROJECTS);
+      return { status: done ? 'completed' : unreachable ? 'retry' : 'deferred', ...(unreachable ? { unreachable: true } : {}) };
+    });
+  }
+
   return {
-    refreshDocumentFigures,
+    refreshDocumentFigures, completeUploadedDocument,
     saveProjects, getProject, sanitizeChats, loadChats, saveChats, chatIdsElsewhere, deleteChat, moveChat, purgeProjectChats, saveFreeChats, deleteFreeChat, setChatFlags, setChatTitle, chatAutoNamed, createProject,
     deleteProject, removeChatAttachments, removeOrphanChatContexts,
     historyPath, readHistory, writeHistory,
