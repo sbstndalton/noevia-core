@@ -32,6 +32,37 @@ function buildSources(entries, files) {
   return out;
 }
 
+// #1793: a whole file injected into the prompt (every small file is, whatever the question) is reported
+// only when the question names it (#1457), so an answer that quoted an unnamed knowledge file showed no
+// source at all. After the reply, such a file counts as used when the answer carries something
+// distinctive from it that the question did not: a token with a digit ("ORCHID-42", "INV-2042", "34.95")
+// or a run of four words. A reply that merely shares common words ("red, orange, yellow") adds nothing,
+// so #1457 (every project file listed under every answer) stays fixed. Bounded: a capped slice of each text.
+const ATTRIBUTE_MAX = 24000;
+const words = (text) => String(text || '').slice(0, ATTRIBUTE_MAX).toLowerCase().match(/[\p{L}\p{N}]+(?:[-.][\p{L}\p{N}]+)*/gu) || [];
+function marks(text) {
+  const list = words(text);
+  const tokens = new Set(list.filter((w) => w.length >= 4 && /\p{N}/u.test(w) && (/\p{L}/u.test(w) || w.length >= 5)));
+  const runs = new Set();
+  for (let i = 0; i + 4 <= list.length; i++) runs.add(list.slice(i, i + 4).join(' '));
+  return { tokens, runs };
+}
+/** The injected whole-file entries (not already in `placed`) the answer drew on, in prompt order. */
+function usedInjected(injected, placed, answer, question) {
+  if (!String(answer || '').trim()) return [];
+  const already = new Set((Array.isArray(placed) ? placed : []).map((e) => e && e.file));
+  const said = marks(answer), asked = marks(question);
+  const out = [];
+  for (const e of Array.isArray(injected) ? injected : []) {
+    if (!e || e.kind !== 'file' || already.has(e.file)) continue;
+    const from = marks(e.body);
+    const hit = [...from.tokens].some((t) => said.tokens.has(t) && !asked.tokens.has(t))
+      || [...from.runs].some((r) => said.runs.has(r) && !asked.runs.has(r));
+    if (hit) { out.push(e); already.add(e.file); }
+  }
+  return out;
+}
+
 // A transcript save may carry `sources` on an assistant turn. It is client-supplied, so it is
 // re-bounded here; anything that is not the exact shape is dropped rather than stored.
 function sanitizeStored(list) {
@@ -74,4 +105,4 @@ function sanitizeHistory(history) {
   });
 }
 
-module.exports = { MAX_SOURCES, SNIPPET_MAX, STORED_PIN, buildSources, sanitizeStored, sanitizePin, sanitizeHistory };
+module.exports = { MAX_SOURCES, SNIPPET_MAX, STORED_PIN, buildSources, usedInjected, sanitizeStored, sanitizePin, sanitizeHistory };
