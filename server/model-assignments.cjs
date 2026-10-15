@@ -70,9 +70,13 @@ function modelAssignments({ installed, env = {}, embedding = null, isSystem = ()
   const rerank = String(env.RERANK_MODEL || '').trim() || null;
   // #1695: a configured reranker whose file is gone reads "missing" even while reranking is
   // switched off, so the row never says just "Off" for a model that no longer exists.
-  const rerankState = rerank && list.length && stateOf(rerank) === 'missing' ? 'missing' : rerankOn ? stateOf(rerank) : 'off';
+  // #1665: a TEI reranker (RERANK_BACKEND=tei) is served by its own sidecar, not from the installed
+  // GGUF list, so its name is never "missing" from that list and there is nothing to pick from it.
+  const teiRerank = String(env.RERANK_BACKEND || '').trim().toLowerCase() === 'tei';
+  const rerankState = teiRerank ? (rerankOn ? 'active' : 'off')
+    : rerank && list.length && stateOf(rerank) === 'missing' ? 'missing' : rerankOn ? stateOf(rerank) : 'off';
   services.push({ id: 'reranker', model: rerank, state: rerankState, canChange: false,
-    ...(admin ? { options: list.filter((m) => !m.missingFile && isRerankModel(m)).map((m) => m.name) } : {}) });
+    ...(admin ? { options: teiRerank ? [] : list.filter((m) => !m.missingFile && isRerankModel(m)).map((m) => m.name) } : {}) });
 
   // #1796: the decision service and the sensitivity check are what decision-settings.cjs sends to (the
   // shared URL from Settings or COWORK_DECISION_URL, with COWORK_DECISION_MODEL), never an installed

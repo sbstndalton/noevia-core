@@ -400,9 +400,21 @@ test('the optional reranker sidecar is CPU-only, bounded and off the engine', ()
   const root = path.resolve(__dirname, '../../..');
   const text = fs.readFileSync(path.join(root, 'compose.rerank.yaml'), 'utf8');
   const service = text.split(/^\s{2}rerank:$/m)[1].split(/^\s{2}\w[\w-]*:$/m)[0];
+  assert.doesNotMatch(service, /devices:/, 'no GPU device');
+  assert.doesNotMatch(service, /^\s{4}ports:/m, 'no published ports');
+  if (/text-embeddings-inference/.test(service)) {
+    // #1665: the TEI CPU sidecar (gte-multilingual int8), pinned by digest, read-only model, 2 CPUs, 2 GiB.
+    assert.match(service, /text-embeddings-inference:cpu-[\d.]+@sha256:[0-9a-f]{64}/);
+    assert.match(service, /mem_limit: \$\{RERANK_MEMORY_LIMIT:-2g\}/);
+    assert.match(service, /cpus: \$\{RERANK_CPUS:-2\}/);
+    assert.match(service, /:\/model\/onnx\/model\.onnx:ro/);
+    assert.match(text, /RERANK_BACKEND: \$\{RERANK_BACKEND:-tei\}/);
+    assert.match(text, /RERANK_BASE_URL: \$\{RERANK_BASE_URL:-http:\/\/rerank:8080\}/);
+    return;
+  }
+  // The earlier llama.cpp sidecar (pinned noevia commits before #1665).
   for (const flag of ['"--device"', '"none"', '"--reranking"']) assert.ok(service.includes(flag), flag);
   assert.match(service, /mem_limit: \$\{RERANK_MEMORY_LIMIT:-1536m\}/);
-  assert.doesNotMatch(service, /devices:/, 'no GPU device');
   assert.match(text, /RERANK_BASE_URL: http:\/\/rerank:8080\/v1/);
 });
 

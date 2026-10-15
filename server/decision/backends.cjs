@@ -46,6 +46,46 @@ function llamaRerankBackend({ baseUrl, model = null, apiKey = null, fetchImpl = 
 }
 
 /**
+ * #1665: Hugging Face text-embeddings-inference (TEI) `POST /rerank` with a cross-encoder (the
+ * gte-multilingual-reranker-base int8 sidecar in compose.rerank.yaml). Request `{ query, texts,
+ * truncate, raw_scores }`, answer `[{ index, score }]`, the shape the #1665 eval harness used.
+ * Scores rank only. A partial, duplicated or malformed answer throws, so the caller falls back.
+ */
+function teiRerankBackend({ baseUrl, apiKey = null, fetchImpl = globalThis.fetch, maxDocChars = 4000 }) {
+  const url = `${String(baseUrl).replace(/\/+$/, '').replace(/\/v1$/, '')}/rerank`;
+  return {
+    id: 'tei-rerank', locality: 'local',
+    supports: (kind) => kind === 'rank',
+    async decide(request, { signal } = {}) {
+      const texts = request.items.map((item) => String(item.label ?? '').slice(0, maxDocChars));
+      // The decision layer's deadline signal aborts the request, so a timed-out rerank stops.
+      const r = await fetchImpl(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}) },
+        body: JSON.stringify({ query: String(request.question), texts, truncate: true, raw_scores: false }),
+        ...(signal ? { signal } : {}),
+      });
+      if (!r.ok) throw Error(`rerank ${r.status}`);
+      const body = await readCappedJson(r, 4 * 1024 * 1024);
+      if (!Array.isArray(body)) throw Error('rerank returned a malformed result');
+      // Exactly one row per item: any extra, missing, repeated, non-integer or out-of-range index throws.
+      if (body.length !== request.items.length) throw Error('rerank returned a partial result');
+      const scores = {};
+      for (const row of body) {
+        const index = row?.index;
+        if (!Number.isInteger(index) || index < 0 || index >= request.items.length) throw Error('rerank returned an invalid index');
+        const id = request.items[index].id;
+        if (id in scores) throw Error('rerank returned a repeated index');
+        if (!Number.isFinite(row.score)) throw Error('rerank returned an invalid score');
+        scores[id] = row.score;
+      }
+      if (Object.keys(scores).length !== request.items.length) throw Error('rerank returned a partial result');
+      return { selected: order(scores), scores, confidence: null, metadata: { calibrated: false } };
+    },
+  };
+}
+
+/**
  * Option readout on a local llama.cpp server (pinned: llama.cpp b29c606e2; docs/research/system-one
  * doc 13 §13.10–13.11). The prompt lists the permitted options as single-letter labels.
  *
@@ -211,4 +251,4 @@ function llamaLogitBackend({ baseUrl, fetchImpl = globalThis.fetch, nProbs = 50,
 
 const order = (scores) => Object.keys(scores).sort((a, b) => scores[b] - scores[a] || a.localeCompare(b));
 
-module.exports = { embedBackend, llamaRerankBackend, llamaLogitBackend };
+module.exports = { embedBackend, llamaRerankBackend, teiRerankBackend, llamaLogitBackend };
