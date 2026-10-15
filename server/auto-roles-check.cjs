@@ -24,7 +24,7 @@ const NOT_CHAT = /^(embedding|embeddings|rerank|reranking|reranker)$/i;
 function creativeMoveIsFree(roles, routedRole, installed) {
   if (!roles?.creative || !Array.isArray(installed)) return false;
   if (roles[routedRole] === roles.creative) return true;
-  const loaded = installed.filter((m) => m && m.loaded && !(m.labels || []).some((l) => NOT_CHAT.test(l))).map((m) => m.name);
+  const loaded = installed.filter((m) => m && m.loaded && !m.system && !m.servedElsewhere && !m.sidecarProtected && !(m.labels || []).some((l) => NOT_CHAT.test(l))).map((m) => m.name);
   return loaded.length === 0 || loaded.includes(roles.creative);
 }
 
