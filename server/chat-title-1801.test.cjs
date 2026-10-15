@@ -90,3 +90,48 @@ test('#1801: a meta both sides changed keeps both changes; a field both changed 
   const theirs = [{ id: 'a', title: 'T', updatedAt: 2, preview: 'p-theirs' }];
   assert.deepEqual(mergeIdListForTest(ours, base, theirs), [{ id: 'a', title: 'Mine', updatedAt: 2, preview: 'p-mine' }]);
 });
+
+// #1801 review: the per-field merge applies to every id-keyed list of a project (assets, retiredAssets,
+// chats). Kept on purpose: the Rust front re-reads projects.json under the lock and changes only the
+// fields it serves, so what is on disk is exactly its change; per field, neither side's edit is lost.
+const P = (fields) => ({ id: 'p1', name: 'P', ...fields });
+const mergeProject = (ours, base, disk) => {
+  const { merge } = require('./rust-projects.cjs');
+  const baseMap = new Map([['p1', JSON.stringify(base)]]);
+  return merge([ours], baseMap, [disk]).result[0];
+};
+
+test('#1801 review: an asset changed on both sides keeps both changes (assets and retiredAssets)', () => {
+  const base = P({ assets: [{ id: 'a1', name: 'scan.png', status: 'pending' }], retiredAssets: [{ id: 'r1', name: 'old.png', note: '' }] });
+  const ours = P({ assets: [{ id: 'a1', name: 'renamed.png', status: 'pending' }], retiredAssets: [{ id: 'r1', name: 'old.png', note: 'kept' }] });
+  const disk = P({ assets: [{ id: 'a1', name: 'scan.png', status: 'indexed' }], retiredAssets: [{ id: 'r1', name: 'old.png', note: '', retiredAt: 7 }] });
+  const out = mergeProject(ours, base, disk);
+  assert.deepEqual(out.assets, [{ id: 'a1', name: 'renamed.png', status: 'indexed' }]);
+  assert.deepEqual(out.retiredAssets, [{ id: 'r1', name: 'old.png', note: 'kept', retiredAt: 7 }]);
+});
+
+test('#1801 review: a chat the front archived keeps the archive and the title saved here', () => {
+  const base = P({ chats: [{ id: 'c1', title: DERIVED, updatedAt: T0 }] });
+  const ours = P({ chats: [{ id: 'c1', title: 'Picnic Plan', updatedAt: T0 }] });
+  const disk = P({ chats: [{ id: 'c1', title: DERIVED, updatedAt: T0, archived: true }] });
+  assert.deepEqual(mergeProject(ours, base, disk).chats, [{ id: 'c1', title: 'Picnic Plan', updatedAt: T0, archived: true }]);
+  // Un-archived here while the front changed the preview: both stand.
+  const base2 = P({ chats: [{ id: 'c1', title: 'T', archived: true, preview: 'p0' }] });
+  const ours2 = P({ chats: [{ id: 'c1', title: 'T', preview: 'p0' }] });
+  const disk2 = P({ chats: [{ id: 'c1', title: 'T', archived: true, preview: 'p1' }] });
+  assert.deepEqual(mergeProject(ours2, base2, disk2).chats, [{ id: 'c1', title: 'T', preview: 'p1' }]);
+});
+
+test('#1801 review: a deleted entry stays deleted on either side, even if the other side changed it', () => {
+  const base = P({ chats: [{ id: 'c1', title: 'one' }, { id: 'c2', title: 'two' }, { id: 'c3', title: 'three' }] });
+  const ours = P({ chats: [{ id: 'c1', title: 'one, edited here' }, { id: 'c3', title: 'three, edited here' }] }); // c2 deleted here
+  const disk = P({ chats: [{ id: 'c1', title: 'one', preview: 'front' }, { id: 'c2', title: 'two, edited there' }] }); // c3 deleted there
+  assert.deepEqual(mergeProject(ours, base, disk).chats, [{ id: 'c1', title: 'one, edited here', preview: 'front' }]);
+});
+
+test('#1801 review: the same field changed on both sides is this process\'s; the other side\'s other fields stay', () => {
+  const base = P({ chats: [{ id: 'c1', title: 'T', updatedAt: 1, preview: 'p0' }] });
+  const ours = P({ chats: [{ id: 'c1', title: 'Here', updatedAt: 1, preview: 'p0' }] });
+  const disk = P({ chats: [{ id: 'c1', title: 'There', updatedAt: 2, preview: 'p1' }] });
+  assert.deepEqual(mergeProject(ours, base, disk).chats, [{ id: 'c1', title: 'Here', updatedAt: 2, preview: 'p1' }]);
+});

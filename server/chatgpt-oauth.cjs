@@ -772,12 +772,16 @@ function createChatGptOAuth({ db, secrets, fetchImpl = (...args) => globalThis.f
   async function catalogueEntry(userId, { refresh = false } = {}) {
     const cached = models.get(userId);
     const fresh = cached && cached.until > now();
-    const throttled = !!(refresh && fresh && now() - (modelRefreshes.get(userId) || 0) < MODEL_REFRESH_GAP_MS);
+    // The gap counts every refresh attempt, including ones that failed (network, timeout, 401,
+    // a provider message), so a held-down Refresh cannot hammer the provider on errors either.
+    const throttled = !!(refresh && now() - (modelRefreshes.get(userId) ?? -Infinity) < MODEL_REFRESH_GAP_MS);
     if (fresh && (!refresh || throttled)) {
       if (cached.ids) return { ids: cached.ids, cached: true, fetchedAt: cached.fetchedAt, throttled };
       throw fail(cached.error, 502);
     }
-    if (refresh) {
+    // Throttled with nothing usable cached: join the refresh still in flight, else refuse.
+    if (throttled && modelFlights.get(userId)?.gen !== catalogueEpoch(userId)) throw fail('The ChatGPT model list was refreshed a moment ago. Try again in a few seconds.', 429);
+    if (refresh && !throttled) {
       modelRefreshes.set(userId, now());
       while (modelRefreshes.size > 1000) modelRefreshes.delete(modelRefreshes.keys().next().value);
     }
@@ -801,7 +805,13 @@ function createChatGptOAuth({ db, secrets, fetchImpl = (...args) => globalThis.f
     // A disconnect or reconnect (possibly another ChatGPT account) while this fetch was in flight bumps the generation: the
     // result then belongs to no one and is not cached.
     const current = () => catalogueEpoch(userId) === gen;
-    const remember = (error) => { if (current()) models.set(userId, { until: now() + MODEL_FAILURE_CACHE_MS, ids: null, error }); return fail(error, 502); };
+    // A failure never replaces a good list that is still fresh (a failed refresh): plain reads keep
+    // the last good list and only the refreshing call sees the error.
+    const remember = (error) => {
+      const prior = models.get(userId);
+      if (current() && !(prior?.ids && prior.until > now())) models.set(userId, { until: now() + MODEL_FAILURE_CACHE_MS, ids: null, error });
+      return fail(error, 502);
+    };
     if (!r.ok) throw remember(upstreamMessage(text, r.status));
     let parsed = null;
     try { parsed = JSON.parse(text); } catch { parsed = null; }

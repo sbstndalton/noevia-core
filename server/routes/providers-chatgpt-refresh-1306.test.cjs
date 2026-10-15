@@ -32,6 +32,7 @@ function fixture(t) {
       upstream.fetches += 1;
       const slugs = upstream.slugs.slice();
       if (upstream.gate) await upstream.gate;
+      if (upstream.throws) throw new TypeError('fetch failed');
       if (upstream.down) return reply({ detail: 'down' }, 503);
       return reply({ models: slugs.map((slug) => ({ slug })) });
     }
@@ -160,4 +161,43 @@ test('#1306 accounts are isolated, and a disconnect during a refresh leaves no c
   const other = await b.call('GET', '/api/providers/chatgpt/models');
   assert.deepEqual(ids(other), ['gpt-synthetic-a']);
   assert.equal(other.body.cached, true);
+});
+
+test('#1306 review: failing refreshes are throttled too (provider error and network error)', async (t) => {
+  const f = fixture(t);
+  await signIn(f, 'user-a');
+  const a = f.routesFor('user-a');
+  f.upstream.down = true;
+  assert.equal((await a.call('GET', '/api/providers/chatgpt/models?refresh=1')).status, 502);
+  for (let i = 0; i < 5; i++) assert.equal((await a.call('GET', '/api/providers/chatgpt/models?refresh=1')).status, 502, 'remembered failure, no new fetch');
+  assert.equal(f.upstream.fetches, 1);
+  f.upstream.down = false; f.upstream.throws = true;
+  f.clock.t += 61_000; // past the remembered failure: nothing cached at all
+  assert.equal((await a.call('GET', '/api/providers/chatgpt/models?refresh=1')).status, 502);
+  assert.equal(f.upstream.fetches, 2);
+  for (let i = 0; i < 5; i++) {
+    const r = await a.call('GET', '/api/providers/chatgpt/models?refresh=1');
+    assert.notEqual(r.status, 200);
+  }
+  assert.equal(f.upstream.fetches, 2, 'a network failure is not remembered, but the 10 s gap still holds');
+  f.upstream.throws = false;
+  f.clock.t += MODEL_REFRESH_GAP_MS + 1;
+  assert.equal((await a.call('GET', '/api/providers/chatgpt/models?refresh=1')).status, 200);
+  assert.equal(f.upstream.fetches, 3);
+});
+
+test('#1306 review: a failed refresh keeps the last good list for plain reads; only the refresh sees the error', async (t) => {
+  const f = fixture(t);
+  await signIn(f, 'user-a');
+  const a = f.routesFor('user-a');
+  const fetchedAt = f.clock.t;
+  assert.deepEqual(ids(await a.call('GET', '/api/providers/chatgpt/models')), ['gpt-synthetic-a']);
+  for (const mode of ['down', 'throws']) {
+    f.upstream.down = mode === 'down'; f.upstream.throws = mode === 'throws';
+    f.clock.t += MODEL_REFRESH_GAP_MS + 1;
+    assert.equal((await a.call('GET', '/api/providers/chatgpt/models?refresh=1')).status, 502, `${mode}: the refresh fails`);
+    const plain = await a.call('GET', '/api/providers/chatgpt/models');
+    assert.equal(plain.status, 200, `${mode}: plain read still served`);
+    assert.deepEqual(plain.body, { models: ['gpt-synthetic-a'], cached: true, fetchedAt });
+  }
 });

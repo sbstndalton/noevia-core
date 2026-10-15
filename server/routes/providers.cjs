@@ -147,7 +147,7 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
     if (chatgpt.isChatGptProvider(row)) {
       if (!chatgptOn() || row.shared) return json(res, 404, { error: 'Sign in with ChatGPT is turned off on this server.' });
       try { return json(res, 200, await chatgptModels(userId, url)); }
-      catch (e) { return json(res, 502, { error: e.status ? e.message : 'ChatGPT did not list its models.' }); }
+      catch (e) { return json(res, e.status === 401 || e.status === 429 ? e.status : 502, { error: e.status ? e.message : 'ChatGPT did not list its models.' }); }
     }
     if (!/^https?:\/\//.test(String(row.baseUrl || ''))) return json(res, 400, { error: 'this provider has no address' });
     // A member's own row passed this guard when it was saved; checking again keeps a later policy
