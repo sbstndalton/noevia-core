@@ -131,7 +131,7 @@ test('#1665: backend selection, default address and unknown values', () => {
 
 test('#1665: the TEI backend refuses an out-of-range index', async () => {
   const backend = teiRerankBackend({ baseUrl: 'http://rerank:8080', fetchImpl: async () => ({ ok: true, json: async () => [{ index: 0, score: 1 }, { index: 5, score: 2 }] }) });
-  await assert.rejects(backend.decide({ question: 'q', items: [{ id: 'a', label: 'x' }, { id: 'b', label: 'y' }] }), /partial/);
+  await assert.rejects(backend.decide({ question: 'q', items: [{ id: 'a', label: 'x' }, { id: 'b', label: 'y' }] }), /invalid index/);
 });
 
 test('#1665: the Models page shows a TEI reranker as active or off, never missing from the GGUF list', () => {
@@ -141,4 +141,33 @@ test('#1665: the Models page shows a TEI reranker as active or off, never missin
     { id: 'reranker', model: 'gte-multilingual-reranker-base', state: 'active', canChange: false, options: [] });
   assert.equal(row({ RERANK_BACKEND: 'tei', RERANK_MODEL: 'gte-multilingual-reranker-base' }).state, 'off');
   assert.equal(row({ NOEVIA_FEATURE_RAG_RERANK: 'true', RERANK_MODEL: 'gte-multilingual-reranker-base' }).state, 'missing', 'llama.cpp keeps the #1695 rule');
+});
+
+test('#1665 review: extra, repeated, out-of-range or non-integer indices are refused', async () => {
+  const items = [{ id: 'a', label: 'x' }, { id: 'b', label: 'y' }];
+  const replies = {
+    'repeated extra row [0,1,1]': [0, 1, 1].map((index) => ({ index, score: 1 })),
+    'out-of-range extra row [0,1,5]': [0, 1, 5].map((index) => ({ index, score: 1 })),
+    'repeated [0,0]': [{ index: 0, score: 1 }, { index: 0, score: 2 }],
+    'non-integer [0,1.5]': [{ index: 0, score: 1 }, { index: 1.5, score: 2 }],
+    'negative [0,-1]': [{ index: 0, score: 1 }, { index: -1, score: 2 }],
+  };
+  for (const [name, reply] of Object.entries(replies)) {
+    const backend = teiRerankBackend({ baseUrl: 'http://rerank:8080', fetchImpl: async () => ({ ok: true, json: async () => reply }) });
+    await assert.rejects(backend.decide({ question: 'q', items }), /partial|invalid|repeated/, name);
+  }
+});
+
+test('#1665 review: the deadline signal reaches the TEI request and aborts it', async (t) => {
+  const tei = await fakeTei(t, { delayMs: 2000 });
+  let aborted = false;
+  const backend = teiRerankBackend({ baseUrl: tei.url, fetchImpl: (u, init) => { init.signal?.addEventListener('abort', () => { aborted = true; }); return fetch(u, init); } });
+  const { createDecisions } = require('./decision/index.cjs');
+  const d = createDecisions({ backends: { [backend.id]: backend }, chains: { 'rag.rerank': [backend.id] } });
+  const started = Date.now();
+  const hits = await rerankPool({ query: 'q', pool, decisions: d, keep: 3, deadlineMs: 150 });
+  assert.deepEqual(hits.map((h) => h.body), cosineTop6);
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(aborted, true, 'the timed-out request was aborted');
+  assert.ok(Date.now() - started < 1500);
 });

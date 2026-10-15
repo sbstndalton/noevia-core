@@ -56,20 +56,28 @@ function teiRerankBackend({ baseUrl, apiKey = null, fetchImpl = globalThis.fetch
   return {
     id: 'tei-rerank', locality: 'local',
     supports: (kind) => kind === 'rank',
-    async decide(request) {
+    async decide(request, { signal } = {}) {
       const texts = request.items.map((item) => String(item.label ?? '').slice(0, maxDocChars));
+      // The decision layer's deadline signal aborts the request, so a timed-out rerank stops.
       const r = await fetchImpl(url, {
         method: 'POST',
         headers: { 'content-type': 'application/json', ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}) },
         body: JSON.stringify({ query: String(request.question), texts, truncate: true, raw_scores: false }),
+        ...(signal ? { signal } : {}),
       });
       if (!r.ok) throw Error(`rerank ${r.status}`);
       const body = await readCappedJson(r, 4 * 1024 * 1024);
-      const rows = Array.isArray(body) ? body : [];
+      if (!Array.isArray(body)) throw Error('rerank returned a malformed result');
+      // Exactly one row per item: any extra, missing, repeated, non-integer or out-of-range index throws.
+      if (body.length !== request.items.length) throw Error('rerank returned a partial result');
       const scores = {};
-      for (const row of rows) {
-        const item = Number.isInteger(row?.index) ? request.items[row.index] : undefined;
-        if (item && Number.isFinite(row.score) && !(item.id in scores)) scores[item.id] = row.score;
+      for (const row of body) {
+        const index = row?.index;
+        if (!Number.isInteger(index) || index < 0 || index >= request.items.length) throw Error('rerank returned an invalid index');
+        const id = request.items[index].id;
+        if (id in scores) throw Error('rerank returned a repeated index');
+        if (!Number.isFinite(row.score)) throw Error('rerank returned an invalid score');
+        scores[id] = row.score;
       }
       if (Object.keys(scores).length !== request.items.length) throw Error('rerank returned a partial result');
       return { selected: order(scores), scores, confidence: null, metadata: { calibrated: false } };
