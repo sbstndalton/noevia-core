@@ -137,35 +137,51 @@ test('#1864 (Docling): a large PDF is never sent whole; it is read range by rang
   assert.ok(out.text.includes('SYN-DOC-60'));
 });
 
-test('#1864 (Docling): a worker without page ranges is not sent a large PDF; the document waits for the update', async () => {
+test('#1864 (Docling): a worker without page ranges is never sent a large PDF; it is read here, range by range', async () => {
   const fake = fakeDocling({ total: 60, ranges: false });
-  const out = await documents.extractDocumentText('large.pdf', big, docling(fake));
+  const reader = countingReader();
+  const out = await documents.extractDocumentText('large.pdf', big, docling(fake, { readPages: reader.readPages }));
   assert.deepEqual(fake.calls, []);
-  assert.equal(out.state, 'failed');
-  assert.equal(out.retryable, true);
-  assert.match(out.error, /larger than 25 MB.*updated document extraction service/);
+  assert.deepEqual(reader.calls, [{ first: 1, cap: 25 }, { first: 26, cap: 25 }, { first: 51, cap: 10 }]);
+  assert.equal(out.state, 'ready');
+  assert.equal(out.pageTexts.length, 60);
+  assert.ok(out.pageTexts.every((p) => p.method === 'native'));
+  assert.ok(out.text.includes('SYN-PAGE-60 '));
+  assert.equal(out.completion, documents.COMPLETION);
 });
 
 test('#1864 (Docling): a small PDF is read whole as before, and pages past 300 follow in ranges', async () => {
-  const small = syntheticPdf({ pages: 2 });
+  const long = syntheticPdf({ pages: 340 });
   const fake = fakeDocling({ total: 340 });
-  const out = await documents.extractDocumentText('long.pdf', small, docling(fake));
+  const out = await documents.extractDocumentText('long.pdf', long, docling(fake));
   assert.deepEqual(fake.calls, ['whole', '301-325', '326-340']);
   assert.equal(out.pageTexts.length, 340);
   assert.equal(out.state, 'ready');
-  // An old worker: the first window is kept, the stop is stated, and the result is NOT marked complete,
-  // so it resumes after the worker is updated, without the old worker converting anything again.
+  // A worker without ranges (today's sidecars): the first window comes from Docling as always, and the
+  // pages past 300 are read here instead of the document stopping at 300.
   const old = fakeDocling({ total: 340, ranges: false });
-  const partial = await documents.extractDocumentText('long.pdf', small, docling(old));
+  const reader = countingReader();
+  const rest = await documents.extractDocumentText('long.pdf', long, docling(old, { readPages: reader.readPages }));
   assert.deepEqual(old.calls, ['whole']);
-  assert.equal(partial.state, 'partial');
-  assert.deepEqual(partial.stoppedAt, { page: 300, limit: 'extractor' });
-  assert.equal(partial.completion, undefined);
-  const updated = fakeDocling({ total: 340 });
-  const resumed = await documents.completeDocument('long.pdf', small, partial, docling(updated));
-  assert.deepEqual(updated.calls, ['301-325', '326-340']);
-  assert.equal(resumed.state, 'ready');
-  assert.equal(resumed.completion, documents.COMPLETION);
+  assert.deepEqual(reader.calls, [{ first: 301, cap: 25 }, { first: 326, cap: 15 }]);
+  assert.equal(rest.state, 'ready');
+  assert.equal(rest.pageTexts.length, 340);
+  assert.equal(rest.pageTexts[299].method, 'docling');
+  assert.equal(rest.pageTexts[300].method, 'native');
+  assert.ok(rest.text.length > 0 && rest.pageTexts[339].text.includes('SYN-PAGE-340 '));
+  assert.equal(rest.stoppedAt, undefined);
+});
+
+test('#1864: OCR is never sent a PDF larger than it accepts; the pages say why', async () => {
+  let asked = 0;
+  const extractPages = async () => { asked++; return []; };
+  const first = { text: '[Page 1]\nx', pages: 2, state: 'partial', truncated: false, retryable: false,
+    pageTexts: [{ number: 1, text: 'x', status: 'native', method: 'native' }, { number: 2, text: '', status: 'ocr-needed', method: 'native' }] };
+  const out = await documents.completeDocument('large.pdf', big, first, nativeOnly({ ocrEnabled: true, extractPages, env: {} }));
+  assert.equal(asked, 0);
+  assert.deepEqual(out.pageTexts[1].retry, { outcome: 'failed', error: 'the PDF is larger than the OCR service accepts (25 MB)' });
+  assert.equal(out.state, 'partial');
+  assert.equal(out.completion, documents.COMPLETION);
 });
 
 test('#1864 (Docling): an extractor error part-way stops with the page and the reason, keeping what was read', async () => {

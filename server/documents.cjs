@@ -11,10 +11,14 @@ const native = require('./documents-native.cjs');
 const multimodal = require('./multimodal-rag.cjs');
 const sourceLimits = require('./source-limits.cjs');
 
-// #1864: the most one whole-document request to a sidecar may carry (their LIMIT, 25 MiB). A larger PDF
-// is read in page ranges from the start; a smaller one is read exactly as before, and only the pages past
-// the first window (PAGE_CAP) are read in ranges afterwards.
+// #1864: the most one request to a sidecar may carry today (their LIMIT, 25 MiB; services/docling and
+// services/ocr, Python and native alike). A larger PDF is read in page ranges from the start: through
+// Docling when its /health says it reads ranges (`"ranges": true`), otherwise with the pdf.js reader here,
+// a range per worker. A smaller PDF is read exactly as before; only its pages past the first window
+// (PAGE_CAP) follow in ranges, the same way. OCR is never sent a body over OCR_MAX_BYTES.
 const WHOLE_BYTES = 25 * 1024 * 1024;
+const OCR_MAX_BYTES = 25 * 1024 * 1024;
+const OCR_TOO_LARGE = 'This PDF is larger than the OCR service accepts (25 MB), so its image-bearing pages were not sent to OCR; their own text layer was read.';
 // #1864/#1865: the pass that reads the pages past the first window and retries incomplete pages with OCR.
 // It runs once per stored result: a result carries this marker once it has run, whatever came of it, so
 // it is never repeated for the same bytes and extractor version. A result stored before this existed has
@@ -24,7 +28,9 @@ const COMPLETION = 'ranges-ocr-retry-v1';
 // #1865: a page left in one of these states after the first pass is retried alone through the local OCR
 // worker, finer than the first pass. 'blank' is not: Docling cannot tell an empty page from an unread one,
 // and OCRing every blank page of every document is not a bounded retry. 'truncated' hit a cap, not a gap.
-const RETRY_STATUSES = new Set(['degraded', 'failed', 'unreadable']);
+// 'ocr-needed' is an image-bearing page the first pass could not send to OCR (over its page cap, or the
+// file too large for the worker): it is retried the same way, and says so when it cannot be.
+const RETRY_STATUSES = new Set(['degraded', 'failed', 'unreadable', 'ocr-needed']);
 const RETRY_PAGE_CAP = 20;     // pages retried per document; the rest say so
 const RETRY_BATCH = 10;        // pages per OCR request
 const RETRY_DPI = 400;         // the first pass renders at 300 dpi
@@ -108,16 +114,11 @@ function doclingPages(body, figures) {
   }));
 }
 
-async function extractWithDocling(name, bytes, extractDocument, figures = false, rangePages = sourceLimits.documentLimits().rangePages, rangesSupported = docling.rangesSupported) {
-  // #1864: a PDF larger than one whole-document request is read from its first range; the rest follows
-  // in completeDocument. Anything else is one request, exactly as before.
+async function extractWithDocling(name, bytes, extractDocument, figures = false, rangePages = sourceLimits.documentLimits().rangePages) {
+  // #1864: a PDF larger than one whole-document request is read from its first range (the caller has
+  // checked that the worker reads ranges); the rest follows in completeDocument. Anything else is one
+  // request, exactly as before.
   const ranged = bytes.length > WHOLE_BYTES && /\.pdf$/i.test(String(name || ''));
-  // A worker that does not read ranges would refuse the body (or convert the wrong pages): ask first, and
-  // say what is needed. Retryable, so the document is read once the worker is updated.
-  if (ranged && await rangesSupported() === false) {
-    return { ...assemble([], 0, { retryable: true }), state: 'failed',
-      error: 'This PDF is larger than 25 MB. Reading it page by page needs the updated document extraction service; it will be read after that update.' };
-  }
   const options = { ...(figures ? { figures: true } : {}), ...(ranged ? { pages: [1, rangePages] } : {}) };
   let body;
   try {
@@ -173,6 +174,8 @@ function parseFigures(list, pageTexts) {
  *  sent; `remaining` is what the text caps still allow. Returns what happened, for the document's error. */
 async function ocrNativePages(bytes, candidates, { extractPages, remaining, cap }) {
   let retryable = false, ocrError, ocrErrorId;
+  // #1864: never sent a body the worker refuses; final, not retryable (the bytes will not shrink).
+  if (bytes.length > OCR_MAX_BYTES) return { retryable: false, ocrError: OCR_TOO_LARGE, ocrErrorId: 'ocrTooLarge', remaining, sent: 0 };
   const chosen = candidates.slice(0, Math.max(0, cap));
   if (chosen.length) {
     try {
@@ -215,7 +218,12 @@ async function extractDocumentText(name, bytes, {
   }
   const deps = { ocrEnabled, extractPages, doclingEnabled, extractDocument, readPages, figures, env, rangesSupported, waits };
   const limits = sourceLimits.documentLimits(env);
-  if (doclingEnabled) return completeDocument(name, bytes, await extractWithDocling(name, bytes, extractDocument, figures, limits.rangePages, rangesSupported), deps);
+  // #1864: a PDF too large for one Docling request goes to Docling only if it reads page ranges; otherwise
+  // it is read here, range by range, rather than refused.
+  const large = bytes.length > WHOLE_BYTES && /\.pdf$/i.test(String(name || ''));
+  if (doclingEnabled && (!large || await rangesSupported() === true)) {
+    return completeDocument(name, bytes, await extractWithDocling(name, bytes, extractDocument, figures, limits.rangePages), deps);
+  }
   // pdf.js runs in a worker with a time and a heap limit (documents-native.cjs): a pathological
   // PDF stops itself, not the server. A limit is as final as an unreadable file.
   // #1864: a PDF larger than WHOLE_BYTES reads its first range here (each range is its own worker, with
@@ -233,6 +241,7 @@ async function extractDocumentText(name, bytes, {
   const ocrResult = ocrEnabled && candidates.length
     ? await ocrNativePages(bytes, candidates, { extractPages, remaining: TOTAL_TEXT_CAP - textLength(pageTexts), cap: 50 })
     : { retryable: false, sent: 0 };
+  // An image-bearing page of a PDF too large for the OCR worker stays 'ocr-needed', and the document says why.
   const { retryable, ocrError, ocrErrorId } = ocrResult;
   const assembled = assemble(pageTexts, numPages, { retryable });
   // errorId (#607) is the stable id of the message when noevia wrote it, so the browser can show it
@@ -294,22 +303,17 @@ async function completeDocument(name, bytes, out, deps = {}) {
   // 1. #1864: the pages past what the first pass read, a range at a time.
   const last = Math.min(total, limits.pages);
   let next = pageTexts.length + 1, used = textLength(pageTexts);
-  if (doclingEnabled && next <= last) {
-    const supported = await rangesSupported();
-    if (supported !== true) {
-      stoppedAt = supported === false ? { page: next - 1, limit: 'extractor' }
-        : { page: next - 1, limit: 'error', error: 'Document extraction is unavailable.' };
-      passing = true;
-      next = last + 1;
-    }
-  }
+  // Docling reads the ranges when its worker says it can; otherwise (and for a document read here in the
+  // first place) the pdf.js reader does, a range per worker. Per page, `method` says which.
+  let viaDocling = doclingEnabled && next <= last && pageTexts.some((p) => p.method !== 'native' && p.method !== 'native+ocr')
+    && await rangesSupported() === true;
   while (next <= last) {
     if (used >= limits.text) { stoppedAt = { page: next - 1, limit: 'text' }; break; }
     const end = Math.min(last, next + limits.rangePages - 1);
     const budget = limits.text - used;
     let got;
     try {
-      if (doclingEnabled) {
+      if (viaDocling) {
         const body = await patiently(() => extractDocument(name, bytes, { pages: [next, end], ...(figures ? { figures: true } : {}) }), waits);
         got = doclingPages(body, figures);
         if (figures) {
@@ -329,15 +333,16 @@ async function completeDocument(name, bytes, out, deps = {}) {
         }
       }
     } catch (err) {
-      const message = err?.code === 'no-ranges' ? undefined : String(err?.limit ? nativeFailure(err) : err?.message || err).slice(0, 200);
-      stoppedAt = { page: next - 1, limit: err?.code === 'no-ranges' ? 'extractor' : 'error', ...(message ? { error: message } : {}) };
-      passing = err?.code === 'no-ranges' || isPassing(err);
+      // A worker that said it reads ranges but did not: the rest is read here instead.
+      if (viaDocling && err?.code === 'no-ranges') { viaDocling = false; continue; }
+      stoppedAt = { page: next - 1, limit: 'error', error: String(err?.limit ? nativeFailure(err) : err?.message || err).slice(0, 200) };
+      passing = isPassing(err);
       break;
     }
     // Only this range's pages, in order and without gaps: a page the reply left out is a failed page.
     const byNumber = new Map(got.filter((p) => p.number >= next && p.number <= end).map((p) => [p.number, p]));
     for (let n = next; n <= end; n++) {
-      const page = byNumber.get(n) || { number: n, text: '', status: 'failed', method: doclingEnabled ? 'docling' : 'native' };
+      const page = byNumber.get(n) || { number: n, text: '', status: 'failed', method: viaDocling ? 'docling' : 'native' };
       const room = limits.text - used;
       if (page.text && page.text.length > room) { page.text = page.text.slice(0, Math.max(0, room)); page.truncated = true; page.status = 'truncated'; }
       used += page.text ? page.text.length : 0;
@@ -369,6 +374,10 @@ async function retryIncompletePages(bytes, pages, { ocrEnabled, extractPages, ro
   const candidates = pages.filter((p) => RETRY_STATUSES.has(p.status) && (!p.retry || retryDue(p)));
   if (!candidates.length) return;
   if (!ocrEnabled) { for (const p of candidates) p.retry = { outcome: 'unavailable' }; return; }
+  if (bytes.length > OCR_MAX_BYTES) {
+    for (const p of candidates) p.retry = { outcome: 'failed', error: 'the PDF is larger than the OCR service accepts (25 MB)' };
+    return;
+  }
   // Pages already tried once count against the cap too, so the cap holds across reads.
   const tried = pages.filter((p) => p.retry && p.retry.outcome !== 'skipped' && p.retry.outcome !== 'unavailable' && !candidates.includes(p)).length;
   const chosen = candidates.slice(0, Math.max(0, RETRY_PAGE_CAP - tried));
@@ -410,4 +419,4 @@ async function retryIncompletePages(bytes, pages, { ocrEnabled, extractPages, ro
 
 // A test may pin the version (multimodal-followups-1770-1772.test.cjs assigns it); production never does.
 let versionOverride = null;
-module.exports = { isDocument, documentExtensions, extractDocumentText, completeDocument, COMPLETION, WHOLE_BYTES, RETRY_PAGE_CAP, RETRY_DPI, RETRY_ATTEMPTS, DOCUMENT_EXTENSIONS, EXTRACT_CAP, get EXTRACTOR_VERSION() { return versionOverride ?? extractorVersion(); }, set EXTRACTOR_VERSION(v) { versionOverride = v; }, PAGE_CAP, TOTAL_TEXT_CAP };
+module.exports = { isDocument, documentExtensions, extractDocumentText, completeDocument, COMPLETION, WHOLE_BYTES, RETRY_PAGE_CAP, RETRY_DPI, RETRY_ATTEMPTS, OCR_MAX_BYTES, DOCUMENT_EXTENSIONS, EXTRACT_CAP, get EXTRACTOR_VERSION() { return versionOverride ?? extractorVersion(); }, set EXTRACTOR_VERSION(v) { versionOverride = v; }, PAGE_CAP, TOTAL_TEXT_CAP };

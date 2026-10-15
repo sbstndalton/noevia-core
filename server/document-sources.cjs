@@ -76,14 +76,13 @@ function retryRecord(r) {
   const outcome = RETRY_OUTCOMES.has(r?.outcome) ? r.outcome : 'failed';
   return { outcome, ...(outcome === 'failed' && r.error ? { error: String(r.error).slice(0, 200) } : {}) };
 }
-// #1864: where reading stopped and why: the page limit, the text limit, an extractor too old for page
-// ranges, or an error while reading a range.
-const STOP_LIMITS = new Set(['pages', 'text', 'extractor', 'error']);
+// #1864: where reading stopped and why: the page limit, the text limit, or an error while reading a range.
+const STOP_LIMITS = new Set(['pages', 'text', 'error']);
 function stoppedRecord(s) {
   const limit = STOP_LIMITS.has(s?.limit) ? s.limit : 'error';
   return { page: Math.max(0, Number(s?.page) || 0), limit, ...(limit === 'error' && s.error ? { error: String(s.error).slice(0, 200) } : {}) };
 }
-const STOP_WORDS = { pages: 'page limit', text: 'text limit', extractor: 'the document extraction service needs an update to read page ranges', error: 'read error' };
+const STOP_WORDS = { pages: 'page limit', text: 'text limit', error: 'read error' };
 const pageList = (pages) => pages.slice(0, 20).map(p => p.number).join(', ') + (pages.length > 20 ? '…' : '');
 
 /**
