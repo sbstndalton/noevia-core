@@ -101,8 +101,12 @@ function fsyncPath(p, flags = 'r') {
 
 /** Writes the text durably: temp file, fsync, rename, fsync of the folder. A file already there is
  *  kept only when it is exactly this text (same size, same hash); a zero-length, torn or otherwise
- *  different file is rewritten. */
-function writeText(wsDir, projectId, ref, text) {
+ *  different file is rewritten.
+ *  #1815: with `pendingDirs` (a Set), the folder fsync is not done here: the folders to fsync are
+ *  added to the set and the caller fsyncs each once (flushDirs) before it commits projects.json.
+ *  The file's own data is still fsynced before its rename, so the order stays: data durable, then
+ *  the rename, then (batched) the folder entry, then projects.json. */
+function writeText(wsDir, projectId, ref, text, pendingDirs = null) {
   const dir = projectDir(wsDir, projectId);
   const file = path.join(dir, `${ref}.txt`);
   const bytes = Buffer.from(text, 'utf8');
@@ -110,13 +114,24 @@ function writeText(wsDir, projectId, ref, text) {
     const st = fs.statSync(file);
     if (st.isFile() && st.size === bytes.length && refOf(fs.readFileSync(file, 'utf8')) === ref) return;
   } catch { /* absent: written below */ }
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const created = fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const tmp = `${file}.${process.pid}.tmp`;
   const fd = fs.openSync(tmp, 'w', 0o600);
   try { fs.writeSync(fd, bytes); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
   fs.renameSync(tmp, file);
-  fsyncPath(dir);
+  const dirs = pendingDirs || new Set();
+  dirs.add(dir);
+  // A folder just created is itself a new entry in its parent(s): those are made durable too.
+  if (created) { const top = path.dirname(created); for (let d = dir; d !== top && d !== path.dirname(d);) { d = path.dirname(d); dirs.add(d); } }
+  if (!pendingDirs) flushDirs(dirs);
   cache.delete(file);
+}
+
+/** fsyncs each folder of `dirs` once, deepest first (a new folder's entries before its parent's
+ *  entry for it), then empties the set. */
+function flushDirs(dirs) {
+  for (const d of [...dirs].sort((a, b) => b.length - a.length)) fsyncPath(d);
+  dirs.clear();
 }
 
 const isAccessor = (f) => { const d = Object.getOwnPropertyDescriptor(f, 'content'); return !!d && typeof d.get === 'function'; };
@@ -172,6 +187,9 @@ function attachAll(wsDir, projects) {
  *  how many sources moved. */
 function externalize(wsDir, projects) {
   let moved = 0;
+  // #1815: every text file is written (and its data fsynced) first; each folder is fsynced once at
+  // the end, before this returns, so before the caller writes projects.json.
+  const pendingDirs = new Set();
   for (const p of projects || []) {
     if (!p || typeof p.id !== 'string') continue;
     for (const f of filesOf(p)) {
@@ -186,7 +204,7 @@ function externalize(wsDir, projects) {
         continue;
       }
       const ref = refOf(text);
-      writeText(wsDir, p.id, ref, text);
+      writeText(wsDir, p.id, ref, text, pendingDirs);
       delete f.content;
       f.textRef = ref;
       f.chars = text.length;
@@ -195,17 +213,45 @@ function externalize(wsDir, projects) {
       moved += 1;
     }
   }
+  flushDirs(pendingDirs);
   return moved;
 }
 
 /** Removes text files no source of `projects` points at, and the folders of projects that are gone. */
 // A text file no source points at is removed only once it has stayed unreferenced for GRACE_MS
 // across saves: a handler that awaited (a folder sync, an upload) may still hold a source object
-// pointing at it and put that back in the list. Requests are bounded well below this.
-const GRACE_MS = 30 * 60 * 1000;
+// pointing at it and put that back in the list. #1815: 24 hours (a long folder sync with document
+// conversion can hold sources for a long time; the disk cost of keeping a text a day is negligible),
+// and no collection at all while a folder import or attached-folder sync runs in that workspace.
+const GRACE_MS = 24 * 60 * 60 * 1000;
 let graceDefault = GRACE_MS;
 const unreferencedSince = new Map();
+
+// #1815: folder imports and attached-folder syncs in flight, per workspace folder (this process).
+const inFlight = new Map();
+const wsKey = (wsDir) => path.resolve(String(wsDir));
+/** Registers source work in flight for `wsDir`; returns the function that ends it (idempotent). */
+function beginSourceWork(wsDir) {
+  const key = wsKey(wsDir);
+  inFlight.set(key, (inFlight.get(key) || 0) + 1);
+  let done = false;
+  return () => {
+    if (done) return;
+    done = true;
+    const n = (inFlight.get(key) || 1) - 1;
+    if (n > 0) inFlight.set(key, n); else inFlight.delete(key);
+  };
+}
+/** Runs `fn` with source work registered for `wsDir` (no registration when `wsDir` is falsy). */
+async function whileSourceWork(wsDir, fn) {
+  if (!wsDir) return fn();
+  const end = beginSourceWork(wsDir);
+  try { return await fn(); } finally { end(); }
+}
+const sourceWorkInFlight = (wsDir) => (inFlight.get(wsKey(wsDir)) || 0) > 0;
+
 function collect(wsDir, projects, { now = Date.now(), graceMs = graceDefault } = {}) {
+  if (sourceWorkInFlight(wsDir)) return;
   const root = path.join(wsDir, DIR);
   let dirs;
   try { dirs = fs.readdirSync(root); } catch { return; }
@@ -270,12 +316,30 @@ function migrateOnLoad(wsDir, projects) {
   return true;
 }
 
-/** A source as the client gets it in a list: metadata only, never the text. */
+/** #1815: whether `file` points at a text file that is gone or cannot be read. Its pointer is kept
+ *  (nothing is dropped or rewritten); this only reports it. A source with inline text is never missing. */
+function textMissing(file) {
+  if (!isExternal(file)) return false;
+  const from = origin.get(file);
+  if (!from) return false;
+  const full = path.join(projectDir(from.wsDir, from.projectId), `${file.textRef}.txt`);
+  const key = missingKey(from.wsDir, from.projectId, file.textRef);
+  // The file itself is checked even when its text is cached: a cached copy must not hide a deletion.
+  try { fs.accessSync(full, fs.constants.R_OK); }
+  catch { unreadable.add(key); if (cache.has(full)) { cached -= cache.get(full).length; cache.delete(full); } return true; }
+  // Readable now; one that failed before (a restore since) is read once to be sure, which clears it.
+  if (unreadable.has(key)) { readText(from.wsDir, from.projectId, file.textRef); return unreadable.has(key); }
+  return false;
+}
+
+/** A source as the client gets it in a list: metadata only, never the text; `textMissing: true`
+ *  when its text file is gone or unreadable (#1815). */
 function meta(file) {
   if (!file || typeof file !== 'object') return file;
   const out = {};
-  for (const k of Object.keys(file)) if (k !== 'content') out[k] = file[k];
+  for (const k of Object.keys(file)) if (k !== 'content' && k !== 'textMissing') out[k] = file[k];
   if (!REF.test(String(out.textRef)) && typeof file.content === 'string') out.chars = file.content.length;
+  if (textMissing(file)) out.textMissing = true;
   return out;
 }
 
@@ -315,5 +379,6 @@ if (require.main === module) {
 module.exports = {
   DIR, refOf, projectDir, readText, readTextStrict, writeText, attachFile, attachAll, externalize, collect, migrateOnLoad,
   hasInline, isExternal, textLength, cloneFile, sameText, meta, inlineAll, headerNamesSkill,
-  _cache: { clear() { cache.clear(); cached = 0; warned.clear(); unreadable.clear(); unreferencedSince.clear(); } }, GRACE_MS, _setGraceMs(ms) { graceDefault = ms; },
+  textMissing, beginSourceWork, whileSourceWork, sourceWorkInFlight, flushDirs,
+  _cache: { clear() { cache.clear(); cached = 0; warned.clear(); unreadable.clear(); unreferencedSince.clear(); inFlight.clear(); } }, GRACE_MS, _setGraceMs(ms) { graceDefault = ms; },
 };

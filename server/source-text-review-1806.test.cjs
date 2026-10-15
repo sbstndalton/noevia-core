@@ -104,7 +104,9 @@ test('review 4: a text is fsynced before its rename and the folder after; a zero
   fs.fsyncSync = (fd) => { events.push(['fsync', fs.fstatSync(fd).isDirectory() ? 'dir' : 'file']); return real.fsync(fd); };
   fs.renameSync = (a, b) => { events.push(['rename']); return real.rename(a, b); };
   try { sourceText.writeText(root, 'p1', sha(A), A); } finally { fs.fsyncSync = real.fsync; fs.renameSync = real.rename; }
-  assert.deepEqual(events, [['fsync', 'file'], ['rename'], ['fsync', 'dir']]);
+  // #1815: the folders just created (project-sources/p1, project-sources, the workspace) are each
+  // fsynced too, after the rename and deepest first.
+  assert.deepEqual(events, [['fsync', 'file'], ['rename'], ['fsync', 'dir'], ['fsync', 'dir'], ['fsync', 'dir']]);
   const f = path.join(root, 'project-sources', 'p1', `${sha(A)}.txt`);
   for (const bad of ['', 'alpha synthetic tex!', 'x']) {
     fs.writeFileSync(f, bad);
