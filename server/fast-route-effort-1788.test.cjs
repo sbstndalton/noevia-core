@@ -16,7 +16,12 @@ const reasoningEffort = require('./reasoning-effort.cjs');
 let ROLES = { fast: 'synthetic-fast', smart: 'synthetic-smart' };
 const catalogue = [{ name: 'synthetic-fast' }, { name: 'synthetic-smart' }, { name: 'synthetic-manual' }, { name: 'qwen3.5-9b-synthetic-fast' }];
 
-async function turn(t, { route, project = { routing: 'auto' }, globalEffort = 'high' }) {
+async function turn(t, { route, project = { routing: 'auto' }, globalEffort = 'high', local = true }) {
+  // The default provider is the local llama.cpp engine unless a case says otherwise (reasoning-effort.cjs localEngine).
+  const saved = { kind: process.env.MODEL_MANAGER_KIND, base: process.env.INFERENCE_BASE_URL };
+  if (local) { process.env.MODEL_MANAGER_KIND = 'llamacpp'; process.env.INFERENCE_BASE_URL = 'http://default.invalid'; }
+  else { delete process.env.MODEL_MANAGER_KIND; delete process.env.INFERENCE_BASE_URL; }
+  t.after(() => { for (const [k, v] of [['MODEL_MANAGER_KIND', saved.kind], ['INFERENCE_BASE_URL', saved.base]]) if (v === undefined) delete process.env[k]; else process.env[k] = v; });
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-1788-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const events = [], requests = [];
   const res = new EventEmitter(); res.writeHead = () => {}; res.end = () => { res.writableEnded = true; res.emit('finish'); };
@@ -76,11 +81,15 @@ test('#1788 reopen: Smart, explicit picks and an explicit project effort keep th
   }
 });
 
+test('#1788 review: the switch is only sent to the local llama.cpp engine, not to a default provider elsewhere', async (t) => {
+  const { request, effort } = await turn(t, { route: 'fast', local: false });
+  assert.equal(effort, 'low', 'still Low on a Fast route');
+  assert.equal(request.chat_template_kwargs, undefined, 'no template switch for an engine that is not the local one');
+});
+
 test('#1788 reopen: a Qwen3.5 Fast role on the local engine also gets enable_thinking false', async (t) => {
-  const saved = { kind: process.env.MODEL_MANAGER_KIND, base: process.env.INFERENCE_BASE_URL };
-  process.env.MODEL_MANAGER_KIND = 'llamacpp'; process.env.INFERENCE_BASE_URL = 'http://default.invalid';
   const roles = ROLES; ROLES = { fast: 'qwen3.5-9b-synthetic-fast', smart: 'synthetic-smart' };
-  t.after(() => { ROLES = roles; for (const [k, v] of [['MODEL_MANAGER_KIND', saved.kind], ['INFERENCE_BASE_URL', saved.base]]) if (v === undefined) delete process.env[k]; else process.env[k] = v; });
+  t.after(() => { ROLES = roles; });
   const { request } = await turn(t, { route: 'fast' });
   assert.equal(request.model, 'qwen3.5-9b-synthetic-fast');
   assert.equal(request.chat_template_kwargs?.enable_thinking, false, 'native-thinking path keeps it off as well');

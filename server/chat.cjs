@@ -293,6 +293,8 @@ function createChatHandler({
   const jsonOut = json;
   // #1785: whether the local engine has other work now. /api/chat holds one inference request in the gate (index.cjs),
   // so this turn counts as one. A manager without the signal (or one that throws) is not called busy.
+  // #1785 review: at most chatTitleLib.MAX_ATTEMPTS title requests per chat (per account), then that chat stops asking.
+  const titleAttempts = chatTitleLib.createAttemptCounter();
   const engineBusy = () => { try { return typeof modelManager?.inferenceBusy === 'function' && modelManager.inferenceBusy(1) === true; } catch { return false; } };
   // Revoked Skill content in earlier turns (#546): one ledger per handler, cached in memory.
   const skillLedger = skillHistory || require('./skill-history.cjs').createSkillHistory({ fs, path });
@@ -1204,7 +1206,7 @@ function createChatHandler({
     // template switch the describe call uses (enable_thinking: false; gemma-4 and Qwen3/3.5 templates read it, others
     // ignore it). An explicit project effort, Smart, Code and explicit picks keep their thinking.
     const fastThinkingOff = reasoningEffort.fastRouteThinkingOff({ auto: wantsAuto, routedRole, projectEffort: project?.reasoningEffort })
-      && provider.id === DEFAULT_PROVIDER_ID;
+      && provider.id === DEFAULT_PROVIDER_ID && typeof reasoningEffort.localEngine === 'function' && reasoningEffort.localEngine(provider);
     const thinkingOffFields = fastThinkingOff ? { chat_template_kwargs: { enable_thinking: false } } : {};
     // Task-aware sampling presets (issue #194): applied only when the operator has not turned
     // the feature off and the project has no explicit sampling override for the key in
@@ -2281,6 +2283,7 @@ function createChatHandler({
     const titleChatId = typeof body.chatId === 'string' ? body.chatId : '';
     const titleListId = body.projectId && project ? project.id : null;
     const firstMessage = chatTitleLib.firstUserMessage(history, message);
+    const titleAttemptKey = `${chatWorkspace?.userId ?? ''}\u0000${titleListId ?? ''}\u0000${titleChatId}`;
     const titleDue = () => {
       if (chatTitleLib.firstReply(history)) return true;
       try { return typeof chatTitles.autoNamed === 'function' && chatTitles.autoNamed(titleListId, titleChatId, firstMessage) === true; } catch { return false; }
@@ -2288,7 +2291,8 @@ function createChatHandler({
     if (chatTitles && !paused && roundHasContent && roundContent.trim() && titleChatId
       && !body.compactOnly && !(typeof spaceId === 'string' && spaceId.startsWith('diary')) && project?.id !== diaryExtras?.PROJECT_ID
       && provider.id === DEFAULT_PROVIDER_ID && !offBoxTurn({ externalProvider, routeTarget, provider, DEFAULT_PROVIDER_ID })
-      && titleDue() && !engineBusy()) {
+      && titleDue() && titleAttempts.allowed(titleAttemptKey) && !engineBusy()) {
+      titleAttempts.record(titleAttemptKey);
       const title = await chatTitleLib.generateTitle({ fetch, url: upstreamUrl, headers: upstreamHeaders, model, message, reply: roundContent,
         signal: chatSignal.signal, readJson: readCappedJson });
       if (chatSignal.signal.aborted) return;

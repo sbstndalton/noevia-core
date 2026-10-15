@@ -39,7 +39,7 @@ test('#1785: cleanTitle keeps a short title and drops wrappers, thinking and jun
   assert.equal(titles.cleanTitle(null), null);
 });
 
-async function turn(t, { history = [], provider = { id: 'default', baseUrl: 'http://default.invalid' }, project = {}, titleReply = 'Friendly Greeting', titleStatus = 200, wired = true, busy, autoNamed, message = FIRST } = {}) {
+async function turn(t, { history = [], provider = { id: 'default', baseUrl: 'http://default.invalid' }, project = {}, titleReply = 'Friendly Greeting', titleStatus = 200, wired = true, busy, autoNamed, message = FIRST, repeat = 1, userFor = () => 'synthetic-user' } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-1785-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const events = [], requests = [], saved = [], busyCalls = [], autoNamedCalls = [];
   const res = new EventEmitter(); res.writeHead = () => {}; res.end = () => { res.writableEnded = true; res.emit('finish'); };
@@ -50,11 +50,12 @@ async function turn(t, { history = [], provider = { id: 'default', baseUrl: 'htt
     if (body.stream === false) return new Response(JSON.stringify({ choices: [{ message: { content: titleReply } }] }), { status: titleStatus });
     return { ok: true, status: 200, body: (async function* () { yield Buffer.from(`data: ${JSON.stringify({ choices: [{ delta: { content: 'Hello there.' } }] })}\n\n`); })() };
   };
+  let currentUser = userFor(0);
   const { handleChat } = createChatHandler({
     modelManager: { enabled: true, ...(busy === undefined ? {} : { inferenceBusy: (own) => { busyCalls.push(own); return busy; } }), health: async () => ({ ok: true, body: { all_models_loaded: [{ model_name: 'answer-model', loaded: true, recipe_options: { ctx_size: 32768 } }] } }) },
     reasoningEffort: require('./reasoning-effort.cjs'), authService: { audit() {} }, crypto: require('node:crypto'), path, fs, fetch,
     HISTORY_CAP: 20, DEFAULT_PROVIDER_ID: 'default', createToolExchange,
-    currentWorkspace: () => ({ userId: 'synthetic-user', dir, assetDir: () => '/synthetic-only' }),
+    currentWorkspace: () => ({ userId: currentUser, dir, assetDir: () => '/synthetic-only' }),
     getProject: () => ({ id: 'fixture-project', model: 'answer-model', assets: [], ...project }),
     skillsIndexFor: () => [], getProvider: () => provider, providerHeaders: () => ({}), autoRoles: () => null,
     visionDescriptions: new Map(), visionProbe: createVisionProbe({ fetchImpl: fetch }),
@@ -68,7 +69,7 @@ async function turn(t, { history = [], provider = { id: 'default', baseUrl: 'htt
     ...(wired ? { chatTitles: { save: (...args) => { saved.push(args); return true; },
       ...(autoNamed === undefined ? {} : { autoNamed: (...args) => { autoNamedCalls.push(args); return typeof autoNamed === 'function' ? autoNamed(...args) : autoNamed; } }) } } : {}),
   });
-  await handleChat({}, res, { projectId: 'fixture-project', chatId: 'fixture-chat', message, history });
+  for (let i = 0; i < repeat; i++) { currentUser = userFor(i); await handleChat({}, res, { projectId: 'fixture-project', chatId: 'fixture-chat', message, history }); }
   return { events, requests, saved, busyCalls, autoNamedCalls, titleRequests: requests.filter((r) => r.body.stream === false) };
 }
 
@@ -228,4 +229,23 @@ test('#1785 reopen: firstUserMessage is the chat\'s first user turn, or this mes
   assert.equal(titles.firstUserMessage(STOPPED_FIRST, FOLLOW_UP), FIRST);
   assert.equal(titles.firstUserMessage([], FOLLOW_UP), FOLLOW_UP);
   assert.equal(titles.firstUserMessage(undefined, FOLLOW_UP), FOLLOW_UP);
+});
+
+test('#1785 review: a chat whose title keeps failing stops asking after three attempts', async (t) => {
+  const { titleRequests, events } = await turn(t, { history: STOPPED_FIRST, message: FOLLOW_UP, autoNamed: true, titleReply: '', repeat: 5 });
+  assert.equal(titles.MAX_ATTEMPTS, 3);
+  assert.equal(titleRequests.length, 3, 'five completed replies, three title requests');
+  assert.equal(events.filter((e) => e.type === 'done').length, 5, 'every reply still ends normally');
+});
+
+test('#1785 review: the attempt cap is per account: another account\'s chat with the same id still gets its tries', async (t) => {
+  const { titleRequests } = await turn(t, { history: STOPPED_FIRST, message: FOLLOW_UP, autoNamed: true, titleReply: '', repeat: 6, userFor: (i) => (i < 3 ? 'alice' : 'bob') });
+  assert.equal(titleRequests.length, 6, 'alice used her three, bob still has three');
+});
+
+test('#1785 review: createAttemptCounter allows max tries per key and stays bounded', () => {
+  const c = titles.createAttemptCounter({ max: 2, maxChats: 2 });
+  assert.equal(c.allowed('a'), true); c.record('a'); assert.equal(c.allowed('a'), true); c.record('a'); assert.equal(c.allowed('a'), false);
+  c.record('b'); c.record('c');
+  assert.equal(c.allowed('a'), true, 'the oldest key is forgotten once more than maxChats are tracked');
 });

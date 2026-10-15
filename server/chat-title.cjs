@@ -61,6 +61,26 @@ function firstUserMessage(history, message) {
   return first ? first.content : String(message ?? '');
 }
 
+/** #1785 review: the most title requests one chat gets. A chat whose title keeps failing stops asking after this. */
+const MAX_ATTEMPTS = 3;
+
+/**
+ * Title attempts per chat, in memory (bounded; a restart forgets them, which only allows a few more tries).
+ * Keyed by the caller with the account, so one account's chats never count against another's.
+ */
+function createAttemptCounter({ max = MAX_ATTEMPTS, maxChats = 2000 } = {}) {
+  const counts = new Map();
+  return {
+    allowed(key) { return (counts.get(key) || 0) < max; },
+    record(key) {
+      const n = (counts.get(key) || 0) + 1;
+      counts.delete(key); counts.set(key, n);
+      while (counts.size > maxChats) counts.delete(counts.keys().next().value);
+      return n;
+    },
+  };
+}
+
 /** A model's answer reduced to a usable title, or null. */
 function cleanTitle(raw) {
   if (typeof raw !== 'string') return null;
@@ -120,4 +140,4 @@ async function generateTitle({ fetch, url, headers = {}, model, message, reply, 
   }
 }
 
-module.exports = { firstUserMessage, derivedTitle, isDerivedTitle, firstReply, cleanTitle, titleMessages, generateTitle, TITLE_SYSTEM, TITLE_MAX, CHAT_TITLE_MAX };
+module.exports = { firstUserMessage, createAttemptCounter, MAX_ATTEMPTS, derivedTitle, isDerivedTitle, firstReply, cleanTitle, titleMessages, generateTitle, TITLE_SYSTEM, TITLE_MAX, CHAT_TITLE_MAX };

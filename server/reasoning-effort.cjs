@@ -138,4 +138,4 @@ async function requestWithEffort(fetcher, url, options, body, provider, model, e
   return capped;
 }
 
-module.exports = { HINTS, nativeThinking, validEffort, resolveEffort, effortForRoute, fastRouteThinkingOff, modeFor, requestBody, requestWithEffort, forcedAnswerBody };
+module.exports = { HINTS, localEngine, nativeThinking, validEffort, resolveEffort, effortForRoute, fastRouteThinkingOff, modeFor, requestBody, requestWithEffort, forcedAnswerBody };
