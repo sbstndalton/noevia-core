@@ -20,6 +20,13 @@
 //    GGUF ignores `model` and would answer with it) fails the turn too, `machineWrongModel` (#1851): /v1/models and
 //    /props are read beside the health result, in the same ~30 s cache. Only the optional Creative role falls back, as #1816 does for a missing Creative model.
 //
+// #1849: the same machine, under the same rules, also answers a Manual pick of the model it serves (manualTarget;
+// a name this machine's catalogue lists stays here), the auto-router classifier when Fast is on a machine
+// (auto-router.cjs) and Deep Research when Smart is (research-model.cjs). The Code pipeline and its sandbox harness
+// stay on this machine's engine (the role engine's residency lock and the sandbox network are this machine's).
+// #1850: the template tools gate reads a machine model's chat template from that machine's /props (propsSource) and
+// keeps its verdict per machine + model; a tools refusal is retried without tools, as on this machine.
+//
 // With nothing assigned, target() is null for every role and the chat handler does exactly what it did before.
 
 const { serviceFetch: defaultServiceFetch } = require('./service-endpoint.cjs');
@@ -29,6 +36,8 @@ const CHAT_ROLES = Object.freeze(Object.keys(ROLE_LABEL));
 const MODELS_TIMEOUT_MS = 5000;
 const PROPS_TIMEOUT_MS = 2500;
 const MODELS_BODY_CAP = 256 * 1024;
+// A /props answer carries the whole chat template (#1850 reads it for the tools gate).
+const PROPS_BODY_CAP = 1024 * 1024;
 const MAX_MODELS = 200;
 const CONTEXT_MIN = 2048, CONTEXT_MAX = 2000000;
 // A llama-server that does not say its context gets the local engine's conservative floor, not the hosted default.
@@ -205,6 +214,58 @@ function createChatMachines({ machines, health = null, fetchImpl = defaultServic
     return modelsAt(m.address, n, m.name);
   }
 
+  /**
+   * #1849: a Manual pick names a model. When a chat role's machine serves exactly that name and this machine's
+   * catalogue does not list it, the pick runs on that machine (the same request rules as an Automatic turn). A name
+   * this machine lists stays here: the Manual list shows one row per name, and that row is this machine's.
+   * `catalogue` is a thunk, read only when some role is on a machine (nothing assigned: no read, no change).
+   */
+  async function manualTarget(model, catalogue) {
+    if (typeof model !== 'string' || !model) return null;
+    const remote = remoteRoles();
+    const match = CHAT_ROLES.map((role) => remote[role]).find((t) => t && t.model === model);
+    if (!match) return null;
+    let rows = null;
+    try { rows = typeof catalogue === 'function' ? await catalogue() : catalogue; } catch { rows = null; }
+    if (Array.isArray(rows) && rows.some((m) => m && m.name === model)) return null;
+    return match;
+  }
+
+  /** #1849: the models chat roles' machines serve, one row per machine and model, for the Manual list. */
+  function machineModels() {
+    const out = [];
+    for (const [role, t] of Object.entries(remoteRoles())) {
+      const row = out.find((r) => r.model === t.model && r.machine.id === t.machine.id);
+      if (row) row.roles.push(role);
+      else out.push({ model: t.model, machine: { id: t.machine.id, name: t.machine.name }, roles: [role] });
+    }
+    return out;
+  }
+
+  /**
+   * #1850: the template tools gate's source for a model on a machine: that machine's llama-server /props (its
+   * `chat_template`), read through the on-this-network fetch, shaped like the model manager's props() answer.
+   */
+  function propsSource(t) {
+    return {
+      props: async (model) => {
+        const r = await machineFetch(`${t.baseUrl}/props?model=${encodeURIComponent(model)}`, { method: 'GET', signal: AbortSignal.timeout(PROPS_TIMEOUT_MS) });
+        if (!r.ok) { try { await r.body?.cancel?.(); } catch { /* nothing */ } return { ok: false, status: r.status }; }
+        return { ok: true, status: r.status, body: JSON.parse(await readCapped(r, PROPS_BODY_CAP)) };
+      },
+    };
+  }
+
+  /** #1849: a small JSON request to a machine (the router classifier): { ok, status, body } like http.cjs fetchJson. */
+  async function fetchJson(url, init = {}, timeoutMs = 15000) {
+    const r = await machineFetch(url, { ...init, signal: init.signal ? AbortSignal.any([init.signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs) });
+    let text;
+    try { text = await readCapped(r, MODELS_BODY_CAP); } catch { return { ok: false, status: r.status, error: 'response too large' }; }
+    let body;
+    try { body = JSON.parse(text); } catch { body = text; }
+    return { ok: r.ok, status: r.status, body };
+  }
+
   let probe = null;
   /** The image probe for a model on a machine, through the same on-this-network fetch. */
   function visionProbe(baseUrl, headers, model) {
@@ -215,7 +276,7 @@ function createChatMachines({ machines, health = null, fetchImpl = defaultServic
     return probe(baseUrl, headers, model);
   }
 
-  return { target, remoteRoles, effectiveRoles, localRoles, ready, provider, contextTokens, connectError, listModels, modelsAt, visionProbe, fetch: machineFetch, label: (role) => ROLE_LABEL[role] || role };
+  return { target, remoteRoles, effectiveRoles, localRoles, ready, provider, contextTokens, connectError, listModels, modelsAt, visionProbe, manualTarget, machineModels, propsSource, fetchJson, fetch: machineFetch, label: (role) => ROLE_LABEL[role] || role };
 }
 
 module.exports = { createChatMachines, modelIds, ROLE_LABEL, CHAT_ROLES };

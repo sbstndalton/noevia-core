@@ -1137,12 +1137,17 @@ function createChatHandler({
     // tools, through the on-this-network fetch, with no key and nothing loaded or unloaded on this machine (the provider
     // is not the default one, so every local-engine step below skips it). A machine that is not answering fails the
     // turn, said plainly; it never falls back to another model.
-    const machineTarget = wantsAuto && chatMachines && !routeTarget?.row && provider.id === DEFAULT_PROVIDER_ID && routedRole ? chatMachines.target(routedRole) : null;
+    let machineTarget = wantsAuto && chatMachines && !routeTarget?.row && provider.id === DEFAULT_PROVIDER_ID && routedRole ? chatMachines.target(routedRole) : null;
+    // #1849: a Manual pick of a model a chat role's machine serves (and this machine's catalogue does not list) runs on
+    // that machine, under the same rules. The catalogue is read only when some role is on a machine.
+    if (!machineTarget && !wantsAuto && chatMachines && !routeTarget?.row && provider.id === DEFAULT_PROVIDER_ID) {
+      machineTarget = await chatMachines.manualTarget(model, servedCatalogue);
+    }
     if (machineTarget) {
       const ready = await chatMachines.ready(machineTarget);
       if (!ready.ok) {
         const code = ready.code || 'machineUnreachable'; // #1851: or machineWrongModel
-        console.warn(`[machines] ${routedRole} role's machine is ${ready.state}; the turn is not sent`);
+        console.warn(`[machines] ${routedRole || machineTarget.role} role's machine is ${ready.state}; the turn is not sent`);
         if (earlyStream) { send({ type: 'error', code, text: ready.error }); res.end(); return; }
         return json(res, 503, { error: ready.error, code });
       }
@@ -1751,9 +1756,13 @@ function createChatHandler({
     let forcedTool = null, gateRetried = false;
     // #1002: a native-engine model whose chat template cannot take
     // tools is sent none (nor tool_choice), and the user is told once. Unknown templates keep them.
-    const templateGate = provider.id === DEFAULT_PROVIDER_ID && typeof modelManager?.props === 'function';
+    // #1850: a model on an Inference machine gets the same gate, read from that machine's /props and kept per machine
+    // (scope `machine:<id>` + the model as served), so one machine's verdict never applies to another or to this one.
+    const templateGate = (provider.id === DEFAULT_PROVIDER_ID && typeof modelManager?.props === 'function') || !!(provider.machine && machineTarget);
+    const templateSource = provider.machine && machineTarget ? chatMachines.propsSource(machineTarget) : modelManager;
+    const templateScope = provider.machine && machineTarget ? provider.id : undefined;
     let templateToolsOff = false;
-    if (templateGate && activeTools.length && !(await templateToolsGate.allowsTools(modelManager, model, chatSignal.signal))) {
+    if (templateGate && activeTools.length && !(await templateToolsGate.allowsTools(templateSource, model, chatSignal.signal, templateScope))) {
       templateToolsOff = true;
       send({ type: 'warning', text: templateCaps.TOOLS_OFF_NOTICE });
       roundMessages = withToolsOffNote(roundMessages);
@@ -1866,7 +1875,7 @@ function createChatHandler({
               ...sampling.params,...thinkingOffFields}, provider, model, effort, send, localThinkingCap);
             // #1015: remembered only when dropping tools is what fixed it; a template that fails
             // either way is not marked, so the next chat still offers tools.
-            if (upstream.ok) templateToolsGate.markUnsupported(model);
+            if (upstream.ok) templateToolsGate.markUnsupported(model, templateScope);
           }
         }
       } catch (err) {

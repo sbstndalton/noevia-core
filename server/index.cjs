@@ -656,6 +656,9 @@ const usageRoutes = require('./routes/usage.cjs').createUsageRoutes({
 });
 
 // ── Deep research (D12): module in research-service.cjs, routes in routes/research.cjs ──
+// The model a research step asks and its one completion (research-model.cjs); #1849: Smart on an Inference machine runs there.
+const researchEngine = require('./research-model.cjs').createResearchModel({ autoRoles, lastLoadedModel, chatMachines, getProvider, DEFAULT_PROVIDER_ID,
+  providerHeaders, fetch: (...args) => fetch(...args), modelManager, admitEngineModel, readCappedJson });
 const researchRoutes = require('./routes/research.cjs').createResearchRoutes({
   features, getProject, workspace: () => currentWorkspace(), json, readJson,
   available: () => {
@@ -668,23 +671,7 @@ const researchRoutes = require('./routes/research.cjs').createResearchRoutes({
     saveFile: (project, name, text) => writeProjectTextFile(project, name, text),
     getProject,
     tools: (workspace, project) => ({
-      complete: async (messages, { signal, maxTokens }) => {
-        const provider = getProvider(DEFAULT_PROVIDER_ID), model = researchModel(project);
-        // Same maintenance gate as chat and RAG: tuning/calibration must not share the engine.
-        let leave;
-        try { leave = modelManager.enterInference?.() || (() => {}); }
-        catch (e) { throw Object.assign(e, { publicMessage: e.publicMessage || (e.status === 503 ? e.message : 'The model is busy. Try again shortly.') }); }
-        try {
-        await admitEngineModel(model, signal);
-        const r = await fetch(`${provider.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`, { method: 'POST', redirect: 'error',
-          headers: providerHeaders(provider, { 'Content-Type': 'application/json' }), signal: AbortSignal.any([signal, AbortSignal.timeout(120000)]),
-          body: JSON.stringify({ model, stream: false, max_tokens: maxTokens, messages }) });
-        if (!r.ok) throw Object.assign(Error(`The model provider answered ${r.status}.`), { publicMessage: `The model provider answered ${r.status}.` });
-        const choice = (await readCappedJson(r, 4 * 1024 * 1024)).choices?.[0];
-        if (choice?.finish_reason === 'length') throw Object.assign(Error('A research step was cut off by the output limit.'), { publicMessage: 'A research step was cut off by the output limit.' });
-        return String(choice?.message?.content || '');
-        } finally { leave(); }
-      },
+      complete: (messages, options) => researchEngine.complete(project, messages, options),
       // The operator's own search server, even if a directory server offers the same name (#865);
       // with none, research fails rather than reaching a directory server (#891).
       search: async (query) => require('./routes/research.cjs').parseSearchResults(await executeOperatorToolCall('tavily_search', { query, max_results: 5 })),
@@ -700,7 +687,7 @@ const researchRoutes = require('./routes/research.cjs').createResearchRoutes({
   }),
 });
 function researchModel(project) {
-  return autoRoles()?.smart || project?.model || lastLoadedModel() || null;
+  return researchEngine.model(project);
 }
 
 // noevia's own capabilities, offered over the same MCP path as everything
@@ -781,6 +768,7 @@ const autoRouter = require('./auto-router.cjs').createAutoRouter({
   fetchJson: (url, init, timeoutMs) => fetchJson(url, init, timeoutMs),
   admit: (model) => classifierAdmission(model),
   record: (entry) => recordDecision('route', entry),
+  machine: chatMachines, // #1849: Fast on an Inference machine classifies there
 });
 const { heuristicWantsSmart, heuristicWantsCode, classifierVerdict, CLASSIFIER_MAX_TOKENS } = autoRouter;
 // Text-free decision record in the state directory: docker logs do not survive a deploy.
@@ -1015,6 +1003,7 @@ const providerRoutes = require('./routes/providers.cjs').createProviderRoutes({
 const modelRoutes = require('./routes/models.cjs').createModelRoutes({
   json, readBody, readJson, fetchJson, env: process.env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe: engineVisionProbe, reportedTokenRate, missingRoles, currentWorkspace, service: modelService, inferenceBudget, decisionSettings, rerankSettings,
   localRoles: (roles) => chatMachines.localRoles(roles),
+  machineModels: () => chatMachines.machineModels(), // #1849
 });
 // ── Routing ────────────────────────────────────────────────────────────────
 

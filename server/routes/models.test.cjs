@@ -14,7 +14,7 @@ function makeWorkspace(autoRoles = null) {
   return { autoRoles, saves: 0, saveAutoRoles() { this.saves += 1; } };
 }
 
-function fixture({ env = {}, enabled = true, kind = 'llamacpp', manager = {}, workspace = { userId: 'u1' }, catalogue = [{ name: 'm' }], servedCatalogue = async () => catalogue, modelsInstalled = async () => [{ name: 'm', loaded: true }], initialRoles = null, initialLastLoaded = null, otherWorkspaces = [], inferenceBudget = null, sweepGuardOptions, fetchReply = null } = {}) {
+function fixture({ env = {}, enabled = true, kind = 'llamacpp', manager = {}, workspace = { userId: 'u1' }, catalogue = [{ name: 'm' }], servedCatalogue = async () => catalogue, modelsInstalled = async () => [{ name: 'm', loaded: true }], initialRoles = null, initialLastLoaded = null, otherWorkspaces = [], inferenceBudget = null, sweepGuardOptions, fetchReply = null, machineModels = undefined } = {}) {
   const sent = [], headers = [], fetched = [];
   const scan = new Map();
   let refreshes = 0;
@@ -48,7 +48,7 @@ function fixture({ env = {}, enabled = true, kind = 'llamacpp', manager = {}, wo
     readBody: async (req) => { let s = ''; for await (const c of req) s += c; return s; },
     readJson: async (req) => { let s = ''; for await (const c of req) s += c; return s ? JSON.parse(s) : {}; },
     fetchJson: async (url, init) => { fetched.push({ url, init }); return fetchReply ? fetchReply(url, init) : { ok: true, status: 200, body: { models: ['a'] } }; },
-    env, modelManager, inferenceBudget, sweepGuardOptions,
+    env, modelManager, inferenceBudget, sweepGuardOptions, ...(machineModels ? { machineModels } : {}),
     getProvider: () => ({ baseUrl: 'http://engine', apiKey: 'local' }), providerHeaders: () => ({}), DEFAULT_PROVIDER_ID: 'default',
     createVisionProbe: () => async () => ({ supported: true }),
     reportedTokenRate: (g) => g.tokens_per_second ?? null,
@@ -1029,4 +1029,20 @@ test('#1461 /api/stats keeps the tenant-scoped tokens figure per request, not in
   assert.equal(statsCalls, 1);
   assert.equal(f.sent.length, 2);
   assert.equal(f.sent[0].body.tokensPerSecond, f.sent[1].body.tokensPerSecond);
+});
+
+test('#1849 GET /api/auto-roles lists the models chat roles\' machines serve; nothing on a machine leaves the answer as it was', async () => {
+  const plain = fixture({ initialRoles: { fast: 'm', smart: 'm' } });
+  await plain.call('GET', '/api/auto-roles');
+  const before = plain.sent.pop();
+  const none = fixture({ initialRoles: { fast: 'm', smart: 'm' }, machineModels: () => [] });
+  await none.call('GET', '/api/auto-roles');
+  assert.deepEqual(none.sent.pop(), before, 'no machineModels key when nothing is on a machine');
+  const row = { model: 'synthetic-remote', machine: { id: 'mach-1', name: 'Synthetic Pi' }, roles: ['smart'] };
+  const some = fixture({ initialRoles: { fast: 'm', smart: 'm' }, machineModels: () => [row] });
+  await some.call('GET', '/api/auto-roles');
+  assert.deepEqual(some.sent.pop(), { ...before, body: { ...before.body, machineModels: [row] } });
+  const broken = fixture({ initialRoles: { fast: 'm', smart: 'm' }, machineModels: () => { throw Error('synthetic'); } });
+  await broken.call('GET', '/api/auto-roles');
+  assert.deepEqual(broken.sent.pop(), before, 'an unreadable machine list never breaks the roles answer');
 });
