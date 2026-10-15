@@ -72,3 +72,28 @@ test('an already migrated workspace is not rewritten or backed up again (#1576)'
     assert.deepEqual(backups1576(w.dir), []);
   } finally { fs.rmSync(w.root, { recursive: true, force: true }); }
 });
+
+test('a failed #1576 backup keeps the migrated modes off the disk, through the #1806 save too, until a backup succeeds (#1839)', () => {
+  const sourceText = require('./source-text.cjs');
+  const real = sourceText.backupProjectsFile;
+  const w = workspaceWith([{ id: 'cw', name: 'Synthetic', modes: ['cowork'], files: [{ id: 'f', name: 'a.txt', content: 'inline text' }] }, { id: 'old', name: 'Old' }]);
+  try {
+    sourceText.backupProjectsFile = (dir, tag = '1806') => { if (tag === '1576') throw new Error('disk full (synthetic)'); return real(dir, tag); };
+    const ws = w.store.get(w.user);
+    assert.deepEqual(ws.projects.map((p) => p.modes), [['chat', 'cowork'], ['chat']], 'the migration still applies in memory');
+    let disk = JSON.parse(fs.readFileSync(w.file, 'utf8')).projects;
+    assert.ok(disk[0].files[0].textRef, 'the #1806 save did run');
+    assert.deepEqual(disk[0].modes, ['cowork'], 'original modes stay on disk after the load save');
+    assert.equal(disk[1].modes, undefined);
+    assert.deepEqual(backups1576(w.dir), []);
+    ws.projects[1].name = 'Renamed'; ws.saveProjects();
+    disk = JSON.parse(fs.readFileSync(w.file, 'utf8')).projects;
+    assert.equal(disk[1].name, 'Renamed'); assert.deepEqual(disk[0].modes, ['cowork']);
+    assert.deepEqual(ws.projects.map((p) => p.modes), [['chat', 'cowork'], ['chat']], 'memory is unchanged by a held save');
+    sourceText.backupProjectsFile = real;
+    ws.saveProjects();
+    disk = JSON.parse(fs.readFileSync(w.file, 'utf8')).projects;
+    assert.deepEqual(disk.map((p) => p.modes), [['chat', 'cowork'], ['chat']], 'written once a backup exists');
+    assert.equal(backups1576(w.dir).length, 1);
+  } finally { sourceText.backupProjectsFile = real; fs.rmSync(w.root, { recursive: true, force: true }); }
+});
