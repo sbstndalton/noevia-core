@@ -684,6 +684,7 @@ function isCurrentVersion(projectId, fileName, userId, version) {
 // every caller of this function (chat excerpts, the project search tool, Deep Research) reads `body`
 // as text. searchProjectWithImages is the one search that also returns images.
 async function searchProject(projectId, query, userId) {
+  if (!indexExists(projectId, userId)) return []; // #1776: a read never creates an index
   const index = openIndex(projectId, userId);
   if (!index) return [];
   // #1636: only the active model's slot is searched, with a query embedded by that same model.
@@ -731,6 +732,7 @@ async function textHits(index, qbuf, projectId, query, userId) {
 // Never throws: { text: [], images: [], indexed: [] } on any failure.
 async function searchProjectWithImages(projectId, query, userId) {
   const empty = { text: [], images: [], indexed: [] };
+  if (!indexExists(projectId, userId)) return empty; // #1776: a read never creates an index
   const index = openIndex(projectId, userId);
   if (!index) return empty;
   if (!index.slot) { index.db.close(); return empty; }
@@ -950,7 +952,7 @@ function dropOrphanCaptions(db) {
 }
 /** The cached caption { caption, model } for an image of this project, or null. Never throws. */
 function readCaption(projectId, userId, contentHash) {
-  if (!ragAvailable()) return null;
+  if (!ragAvailable() || !indexExists(projectId, userId)) return null; // #1776: a read never creates an index
   const index = openIndex(projectId, userId);
   if (!index) return null;
   try {
@@ -961,7 +963,7 @@ function readCaption(projectId, userId, contentHash) {
 }
 /** Stores a caption for an image this index holds. Returns false (nothing stored) for any other hash. */
 function writeCaption(projectId, userId, contentHash, caption, model) {
-  if (!ragAvailable()) return false;
+  if (!ragAvailable() || !indexExists(projectId, userId)) return false; // #1776: captions belong to existing image rows
   const index = openIndex(projectId, userId);
   if (!index) return false;
   try {
@@ -999,7 +1001,7 @@ function listIndexes() {
 }
 
 function withIndex(entry, fn) {
-  if (!ragAvailable()) return null;
+  if (!ragAvailable() || !indexExists(entry.projectId, entry.userId)) return null; // #1776: entries name existing files; never create one
   const index = openIndex(entry.projectId, entry.userId);
   if (!index) return null;
   const close = () => { try { index.db.close(); } catch { /* already closed */ } };
