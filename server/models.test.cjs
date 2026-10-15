@@ -142,6 +142,19 @@ test('roles are saved with vision and code optional, and the warm-up loads only 
   await assert.rejects(f.service.ensureModelLoaded('ghost'), /model not installed: ghost/);
 });
 
+test('#1816 the warm-up skips Creative unless it is also the Fast or Smart model', async () => {
+  const f = fixture({ models: [{ id: 'fast' }, { id: 'smart' }, { id: 'poet' }], loaded: [] });
+  f.service.setAutoRoles({ fast: 'fast', smart: 'smart', creative: 'poet' });
+  f.service.ensureRolesLoaded();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual(f.calls.filter((c) => c[0] === 'load'), [['load', 'fast'], ['load', 'smart']], 'a separate Creative model is not warmed');
+  const g = fixture({ models: [{ id: 'fast' }, { id: 'smart' }], loaded: ['smart'] });
+  g.service.setAutoRoles({ fast: 'fast', smart: 'smart', creative: 'smart' });
+  g.service.ensureRolesLoaded();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual(g.calls.filter((c) => c[0] === 'load'), [['load', 'fast']], 'a shared Creative model adds no extra load');
+});
+
 test('with native routing the warm-up is a no-op', async () => {
   const f = fixture({ routing: true, models: [{ id: 'smart' }] });
   f.service.setAutoRoles({ fast: 'smart', smart: 'smart' });

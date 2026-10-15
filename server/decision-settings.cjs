@@ -62,7 +62,8 @@ function createDecisionSettings({store,env=process.env,fetchImpl=decisionService
     if(parsed.reason) throw invalidUrl();
     // #1666: '' / absent = automatic. Anything else must name a known profile: a typo is refused here rather than
     // silently sent as Laya (unknown ids in COWORK_DECISION_MODEL keep falling back to Laya, as before).
-    const raw=value.model===undefined || value.model===null ? '' : value.model;
+    // #1816: a PUT without `model` keeps the saved one (an older tab or a script sending {url,timeoutMs}); only '' / null clear it.
+    const raw=value.model===undefined ? (typeof saved?.model==='string' ? saved.model : '') : value.model===null ? '' : value.model;
     const model=typeof raw==='string' ? raw.trim().toLowerCase() : null;
     if(model===null || (model && !Object.prototype.hasOwnProperty.call(PROFILES,model)))
       throw Object.assign(Error('Choose a decision model from the list, or automatic.'),{status:400,messageId:'invalidModel'});

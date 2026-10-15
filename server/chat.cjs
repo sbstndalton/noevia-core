@@ -991,7 +991,12 @@ function createChatHandler({
       if (!roles) {
         return json(res, 400, { error: 'Auto routing is not configured yet — pick Fast and Smart models in the model popup first.' });
       }
-      const staleRoles = staleRolesError(missingRoles(roles, await servedCatalogue()));
+      const catalogue = await servedCatalogue();
+      // #1816: the Creative role is optional polish; a missing Creative preset never fails an Automatic turn. It is left
+      // out of the stale check and the router's pick stands.
+      const missing = missingRoles(roles, catalogue);
+      const creativeGone = missing.some((m) => m.role === 'creative');
+      const staleRoles = staleRolesError(missing.filter((m) => m.role !== 'creative'));
       if (staleRoles) return json(res, 409, { error: staleRoles });
       const classification = await classifyFastOrSmart(message); // fail-open inside
       routedRole = typeof classification === 'string' ? classification : classification.role;
@@ -1001,7 +1006,11 @@ function createChatHandler({
       if (!roles[routedRole]) routedRole = roles.smart ? 'smart' : 'fast';
       // #1667: a prompt the sampling classifier marks creative goes to the Creative role when one is assigned (local
       // route only: a cloud route keeps its own model). Unassigned, the router's pick stands with creative sampling.
-      if (!routeTarget?.row && require('./sampling-presets.cjs').creativeRoute({ routedRole, message, roles })) routedRole = 'creative';
+      // #1816: the budget is one chat model at a time, so this move happens only when it costs no swap: the Creative model is
+      // already loaded, or nothing is. If the router's pick is the loaded one, it stays (with creative sampling). An
+      // unreadable loaded state keeps the router's pick too.
+      if (!routeTarget?.row && !creativeGone && require('./sampling-presets.cjs').creativeRoute({ routedRole, message, roles })
+        && require('./auto-roles-check.cjs').creativeMoveIsFree(roles, routedRole, catalogue)) routedRole = 'creative';
       model = routeTarget?.row ? require('./routing-modes.cjs').cloudModel(routeTarget.cloud, routedRole) : roles[routedRole];
       if (routingDecision) routingDecision = { ...routingDecision, effectiveRole: routedRole };
       recordResend(body.resend, { auto: true, role: routedRole, status: routingDecision?.status || null });
