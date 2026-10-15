@@ -35,3 +35,17 @@ test('actual corpus child keeps the confirmed storage metadata refusal and drops
     assert.deepEqual(sent,expected?{status:503,body:RUST_STORAGE_READS_REFUSAL}:null);
   }
 });
+
+test('actual corpus child keeps the confirmed storage browse refusal and drops unconfirmed ownership (#1368)',async()=>{
+  const {rustStorageBrowseOwned}=require('./features.cjs');
+  const auth={NOEVIA_RUST_AUTH:'1',NOEVIA_RUST_AUTH_CONFIRMED:'1'};
+  for(const [flags,expected]of [
+    [{...auth,NOEVIA_RUST_STORAGE_BROWSE:'1',NOEVIA_RUST_STORAGE_BROWSE_CONFIRMED:'1'},true],
+    [{...auth,NOEVIA_RUST_STORAGE_BROWSE:'1'},false],
+    [{...auth,NOEVIA_RUST_STORAGE_BROWSE_CONFIRMED:'1'},false],
+    [{NOEVIA_RUST_STORAGE_BROWSE:'1',NOEVIA_RUST_STORAGE_BROWSE_CONFIRMED:'1'},false],
+  ]) {
+    const env=await childEnv(flags);
+    assert.equal(rustStorageBrowseOwned(env),expected,JSON.stringify(flags));
+  }
+});

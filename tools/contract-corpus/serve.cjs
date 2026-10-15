@@ -38,6 +38,8 @@ async function main() {
   if (process.env.NOEVIA_RUST_EXPORT === '1') Object.assign(env, { NOEVIA_RUST_EXPORT: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_EXPORT_CONFIRMED: process.env.NOEVIA_RUST_EXPORT_CONFIRMED === '1' ? '1' : '' });
   // M4 connected-storage metadata (noevia#1368): GET /api/integrations/storage is refused only once
   // the front's rust-storage-reads is confirmed (features.cjs rustStorageReadsOwned).
+  // noevia#1368: the list/read slice, confirmed separately.
+  if (process.env.NOEVIA_RUST_STORAGE_BROWSE === '1') Object.assign(env, { NOEVIA_RUST_STORAGE_BROWSE: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_STORAGE_BROWSE_CONFIRMED: process.env.NOEVIA_RUST_STORAGE_BROWSE_CONFIRMED === '1' ? '1' : '' });
   if (process.env.NOEVIA_RUST_STORAGE_READS === '1') Object.assign(env, { NOEVIA_RUST_STORAGE_READS: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_STORAGE_READS_CONFIRMED: process.env.NOEVIA_RUST_STORAGE_READS_CONFIRMED === '1' ? '1' : '' });
   const child = spawn(process.execPath, ['--require', GUARD, SERVER], { env, stdio: ['ignore', 'ignore', 'pipe'] });
   // Server warnings go to stderr, minus the first-run setup code (the replayer reads it from the
