@@ -1,5 +1,6 @@
 'use strict';
 const { readCappedJson } = require('./http.cjs');
+const workers = require('./document-workers.cjs');
 // Client for the private Docling worker (services/docling). Only the
 // operator-configured worker receives bytes, never a model or a cloud API —
 // same rule as ocr.cjs, and the same shape, deliberately.
@@ -24,7 +25,8 @@ function supports(name) {
   return !!match && FORMATS.has(match[0].toLowerCase());
 }
 
-function enabled() { return !!process.env.DOCLING_BASE_URL; }
+// #1841: a machine Docling is assigned to counts, else DOCLING_BASE_URL (document-workers.cjs).
+function enabled() { return workers.configured('documents'); }
 
 /** The last path segment, which is all the worker needs and all it will accept. */
 function documentName(name) {
@@ -54,7 +56,11 @@ function headerSafeName(name) {
 // #1726: `figures` asks the worker for the document's figures (images) as well, and for a per-page `ocr`
 // marker (the page had no text layer, so its text came from OCR). Only sent while NOEVIA_MULTIMODAL_RAG
 // is on (documents.cjs); without the header the worker answers exactly as before.
-async function extractDocument(name, bytes, { url = process.env.DOCLING_BASE_URL, fetchImpl = fetch, figures = false } = {}) {
+async function extractDocument(name, bytes, options = {}) {
+  const { figures = false } = options;
+  const target = workers.resolve('documents');
+  const url = options.url === undefined ? target.url : options.url;
+  const fetchImpl = options.fetchImpl || (options.url === undefined ? target.fetch : fetch);
   if (!url) throw new Error('Document extraction is not configured.');
   const response = await fetchImpl(`${url.replace(/\/+$/, '')}/extract`, {
     method: 'POST',

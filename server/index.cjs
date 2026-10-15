@@ -129,7 +129,9 @@ const inferenceMachines = require('./inference-machines.cjs').createInferenceMac
 const machineHealth = require('./machine-health.cjs').createMachineHealth();
 // #1840: chat roles (Fast, Smart, Code, Creative) and Vision on an Inference machine (chat-machines.cjs).
 const chatMachines = require('./chat-machines.cjs').createChatMachines({ machines: inferenceMachines, health: machineHealth });
-const decisionSettings = require('./decision-settings.cjs').createDecisionSettings({ store: require('./features.cjs').settingsStore(authService.db), audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail), machineUrl: () => inferenceMachines.urlFor('decision') });
+const decisionSettings = require('./decision-settings.cjs').createDecisionSettings({ store: require('./features.cjs').settingsStore(authService.db), audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail), machineUrl: () => inferenceMachines.urlFor('decision'), sensitivityMachineUrl: () => inferenceMachines.urlFor('sensitivity') });
+// #1841: OCR and Docling read their address from the same registry (document-workers.cjs), the environment being the fallback.
+require('./document-workers.cjs').useMachines((kind) => inferenceMachines.urlFor(kind));
 // #1665: the reranker's on/off and model, saved in Settings over the deployment's RERANK_* environment.
 const rerankSettings = require('./rerank-settings.cjs').install(require('./rerank-settings.cjs').createRerankSettings({ store: require('./features.cjs').settingsStore(authService.db), audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail), onChange: () => rag.reloadRerank(),
   machine: () => { const url = inferenceMachines.urlFor('reranker'); return url ? { url, protocol: inferenceMachines.rerankProtocol() } : null; } }));
@@ -1086,6 +1088,11 @@ const inferenceMachineRoutes = require('./routes/inference-machines.cjs').create
   health: machineHealth, chatMachines,
   effective: {
     decision: () => { const c = require('./decision-endpoint.cjs').configuration({ COWORK_DECISION_URL: decisionSettings.get().url }); return c.reason ? null : c.baseUrl; },
+    // #1844: its own address (a machine, else COWORK_SENSITIVITY_DECISION_URL), or null while it is shared with the decision service.
+    sensitivity: () => inferenceMachines.urlFor('sensitivity') || (() => { const c = require('./decision-endpoint.cjs').configuration({ COWORK_DECISION_URL: String(process.env.COWORK_SENSITIVITY_DECISION_URL || '').trim() }, { linkLocal: false }); return c.reason ? null : c.baseUrl; })(),
+    // #1841: a machine, else OCR_BASE_URL / DOCLING_BASE_URL.
+    ocr: () => require('./document-workers.cjs').resolve('ocr').url || null,
+    documents: () => require('./document-workers.cjs').resolve('documents').url || null,
     embedding: () => require('./embedding-config.cjs').current()?.active()?.baseUrl || null,
     reranker: () => { const t = require('./rerank-target.cjs').rerankTarget(rerankSettings.effectiveEnv()); return t.enabled ? t.baseUrl : null; },
   } });

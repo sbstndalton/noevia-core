@@ -39,8 +39,10 @@ function createInferenceMachineRoutes({ json, readJson, machines, health, effect
   const effectiveUrl = (service) => { if (SERVICES[service]?.mode === 'chat') return chatUrl(service); try { return effective[service] ? effective[service]() || null : null; } catch { return null; } };
 
   async function healthOf(view) {
+    // #1841/#1844: OCR, Docling and the sensitivity check are probed the same way (GET /health at their origin); the sensitivity
+    // check, like the workers, is reached with link-local refused, so it does not use the decision service's link-local probe.
     const chat = Object.keys(SERVICES).filter((id) => SERVICES[id].mode === 'chat' && chatUrl(id));
-    const targets = ['decision', 'embedding', 'reranker', ...chat].map((service) => ({ service, url: effectiveUrl(service), decision: service === 'decision' }));
+    const targets = ['decision', 'sensitivity', 'embedding', 'reranker', 'ocr', 'documents', ...chat].map((service) => ({ service, url: effectiveUrl(service), decision: service === 'decision' }));
     const services = await health.check(targets);
     const out = {};
     for (const m of view.machines) out[m.id] = machineState(m.services.map((s) => services[s]));
