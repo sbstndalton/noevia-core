@@ -210,15 +210,17 @@ function createToolboxes({
   // Log the fallback→measured switch once per model, not once per request.
   const announcedMeasured = new Set();
 
-  function toolTokenBudgetFor(model) {
+  // #1854: `scope` (`machine:<id>`) reads the prefill measured on that Inference machine, not this machine's.
+  function toolTokenBudgetFor(model, scope) {
     // Measured, if we have watched enough real traffic for this model. This is
     // the honest answer: a budget in tokens derived from how fast THIS model on
     // THIS hardware actually reads, rather than from what its filename says.
-    const measured = prefill.budgetFor(model, TOOL_PREFILL_TARGET_MS);
+    const measured = scope ? prefill.budgetFor(model, TOOL_PREFILL_TARGET_MS, scope) : prefill.budgetFor(model, TOOL_PREFILL_TARGET_MS);
     if (measured) {
-      if (!announcedMeasured.has(model)) {
-        announcedMeasured.add(model);
-        const rate = Math.round(prefill.rateFor(model) * 1000);
+      const announced = scope ? `${scope}\u0000${model}` : model;
+      if (!announcedMeasured.has(announced)) {
+        announcedMeasured.add(announced);
+        const rate = Math.round((scope ? prefill.rateFor(model, scope) : prefill.rateFor(model)) * 1000);
         console.log(`[prefill] ${model}: measured ~${rate} tok/s; tool budget is now ${measured} tokens for a ${TOOL_PREFILL_TARGET_MS}ms target (was a filename guess)`);
       }
       // Clamped so a freak measurement cannot hand a small model the whole
@@ -239,7 +241,7 @@ function createToolboxes({
   // goes away, and that must degrade to fewer tools, not to a broken chat. Over
   // the cap the list is truncated, but never silently: the dropped names come
   // back so the caller can log them.
-  function resolveTools(project, model, skip = () => false) {
+  function resolveTools(project, model, skip = () => false, { measureScope } = {}) {
     // An absent key means a project predating toolboxes: fall back to core so
     // upgrading does not silently disarm existing projects. An empty ARRAY is a
     // deliberate choice — the operator unticked every box — and must be honoured,
@@ -270,7 +272,7 @@ function createToolboxes({
     // when the budget runs out — a stable, explainable rule beats picking the
     // cheapest tools and silently reshaping what the model can do.
     const cap = toolCapFor(model);
-    const budget = toolTokenBudgetFor(model);
+    const budget = toolTokenBudgetFor(model, measureScope);
     const tools = [];
     const dropped = [];
     // Enabling tool calling at all costs a fixed preamble, so it is charged once

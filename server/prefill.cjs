@@ -35,6 +35,10 @@ const SAMPLE_TTL_MS = 24 * 60 * 60 * 1000;
 
 // model -> Map(bucket -> { ttftMs, tokens, at })
 const samples = new Map();
+// #1854: a model on an Inference machine is measured under its machine's scope (`machine:<id>`), so its prefill rate
+// never stands in for this machine's model of the same name (or the reverse). No scope: the plain model key, as before.
+const SCOPE_SEP = '\u0000';
+const keyOf = (model, scope) => (scope ? `${scope}${SCOPE_SEP}${model}` : model);
 
 function bucketOf(tokens) {
   return Math.round(tokens / BUCKET_TOKENS) * BUCKET_TOKENS;
@@ -42,7 +46,8 @@ function bucketOf(tokens) {
 
 // Record one observation. Called from the chat stream; must never throw into
 // the response path, so callers are not expected to guard it.
-function recordSample(model, promptTokens, ttftMs) {
+function recordSample(model, promptTokens, ttftMs, scope) {
+  if (model && scope) model = keyOf(model, scope);
   if (!model || !Number.isFinite(promptTokens) || !Number.isFinite(ttftMs)) return;
   if (promptTokens <= 0 || ttftMs <= 0) return;
   if (ttftMs > 120000) return; // absurd: a stall or a very cold load, not prefill
@@ -75,8 +80,8 @@ function freshSamples(model) {
 // tool-calling preamble, the template) cancels in the difference, which is
 // exactly what we want — the budget question is marginal cost per extra tool
 // token, not the intercept.
-function rateFor(model) {
-  const s = freshSamples(model);
+function rateFor(model, scope) {
+  const s = freshSamples(keyOf(model, scope));
   if (s.length < 2) return null;
   const lo = s[0];
   const hi = s[s.length - 1];
@@ -89,8 +94,8 @@ function rateFor(model) {
 
 // The measured token budget for a latency target, or null when unmeasured so
 // the caller can fall back to its heuristic.
-function budgetFor(model, targetMs) {
-  const rate = rateFor(model);
+function budgetFor(model, targetMs, scope) {
+  const rate = rateFor(model, scope);
   if (!rate) return null;
   return Math.round(rate * targetMs);
 }
@@ -98,6 +103,7 @@ function budgetFor(model, targetMs) {
 function stats() {
   const out = {};
   for (const model of samples.keys()) {
+    if (model.includes(SCOPE_SEP)) continue; // this machine's models only (the toolbox page's numbers)
     const s = freshSamples(model);
     const rate = rateFor(model);
     out[model] = {

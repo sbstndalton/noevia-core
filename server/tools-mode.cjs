@@ -42,16 +42,19 @@ const FALLBACK_ROLES = ['smart', 'code', 'fast'];
  * template gate allows); otherwise move the turn to the first tool-capable role model.
  *
  * @param {{ model: string, routedRole: string|null, roles: Record<string, string|null|undefined>,
- *           allowsTools: (model: string) => Promise<boolean> }} input
+ *           allowsTools: (model: string, role: string|null) => Promise<boolean>,
+ *           hostOf?: (role: string|null) => string }} input  #1854: `hostOf` names where a role runs ('local' or
+ *   `machine:<id>`); omitted, every role is here, as before.
  * @returns {Promise<{ rerouted: boolean, model: string, role: string|null }>} `rerouted: false` keeps
  *   the routed model; the caller's template gate then sends the "answers without tools" notice.
  */
-async function toolCapableRoute({ model, routedRole, roles = {}, allowsTools }) {
-  if (await allowsTools(model)) return { rerouted: false, model, role: routedRole };
+async function toolCapableRoute({ model, routedRole, roles = {}, allowsTools, hostOf = () => '' }) {
+  if (await allowsTools(model, routedRole)) return { rerouted: false, model, role: routedRole };
   for (const role of FALLBACK_ROLES) {
     const candidate = roles[role];
-    if (!candidate || role === routedRole || candidate === model) continue;
-    if (await allowsTools(candidate)) return { rerouted: true, model: candidate, role };
+    // #1854: the same name on another machine is another server (its own template and verdict), so it is a candidate.
+    if (!candidate || role === routedRole || (candidate === model && hostOf(role) === hostOf(routedRole))) continue;
+    if (await allowsTools(candidate, role)) return { rerouted: true, model: candidate, role };
   }
   return { rerouted: false, model, role: routedRole };
 }
