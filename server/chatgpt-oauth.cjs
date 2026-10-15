@@ -44,6 +44,7 @@ const MAX_PENDING_PER_USER = 3;
 const REFRESH_MARGIN_MS = 5 * 60 * 1000;
 const MODEL_CACHE_MS = 5 * 60 * 1000;
 const MODEL_FAILURE_CACHE_MS = 60 * 1000;
+const MODEL_REFRESH_GAP_MS = 10 * 1000; // #1306: explicit refreshes closer than this are served from the cache
 const START_WINDOW_MS = 10 * 60 * 1000;
 const MAX_STARTS_PER_WINDOW = 5;
 const TIMEOUT_MS = 15000;
@@ -465,7 +466,17 @@ function createChatGptOAuth({ db, secrets, fetchImpl = (...args) => globalThis.f
   // (openai/codex codex-rs/login/src/device_code_auth.rs @985cf47: usercode L63-70 and L167-175,
   // token poll L107-131, redirect_uri L206; code exchange as a form, oauth/client.rs L58-67).
   const pending = new Map(); // loginId -> { userId, deviceAuthId, userCode, interval, expires, nextPollAt, polling, cancelled, generation }
-  const models = new Map(); // userId -> { until, ids }: the account's model catalogue (ids null = unavailable)
+  const models = new Map(); // userId -> { until, ids, fetchedAt }: the account's model catalogue (ids null = unavailable)
+  const modelFlights = new Map(); // userId -> { gen, promise }: the one catalogue fetch in flight (#1306)
+  const modelRefreshes = new Map(); // userId -> time of the last explicit refresh (#1306 throttle)
+  const catalogueEpochs = new Map(); // userId -> number, bumped on connect/disconnect: a fetch in flight then caches nothing
+  const catalogueEpoch = (userId) => catalogueEpochs.get(userId) || 0;
+  const resetCatalogue = (userId) => {
+    catalogueEpochs.set(userId, catalogueEpoch(userId) + 1);
+    models.delete(userId);
+    modelFlights.delete(userId);
+    modelRefreshes.delete(userId);
+  };
   const generations = new Map(); // userId -> number, bumped by disconnect: an exchange in flight must not reconnect
   const starts = new Map(); // userId -> start timestamps (rate limit)
   const generation = (userId) => generations.get(userId) || 0;
@@ -535,7 +546,7 @@ function createChatGptOAuth({ db, secrets, fetchImpl = (...args) => globalThis.f
       // Checked after the exchange and before the (synchronous) write: nothing can slip in between.
       if (abandoned()) { audit('chatgpt.oauth.cancelled', userId, {}); return { state: 'cancelled' }; }
       write(userId, { ...tokens, connectedAt: now() });
-      models.delete(userId);
+      resetCatalogue(userId);
       audit('chatgpt.oauth.connect', userId, { plan: tokens.plan || undefined });
       return { state: 'connected', account: { email: maskEmail(tokens.email), plan: tokens.plan } };
     } finally {
@@ -623,14 +634,14 @@ function createChatGptOAuth({ db, secrets, fetchImpl = (...args) => globalThis.f
     bump(userId);
     db.prepare('DELETE FROM chatgpt_oauth_tokens WHERE user_id=?').run(String(userId));
     dropPending(userId);
-    models.delete(userId);
+    resetCatalogue(userId);
     audit('chatgpt.oauth.disconnect', String(userId), {});
   }
   function forgetUser(userId) {
     bump(userId);
     db.prepare('DELETE FROM chatgpt_oauth_tokens WHERE user_id=?').run(String(userId));
     dropPending(userId);
-    models.delete(userId);
+    resetCatalogue(userId);
     starts.delete(userId);
   }
 
@@ -748,15 +759,59 @@ function createChatGptOAuth({ db, secrets, fetchImpl = (...args) => globalThis.f
   async function listModels(userId) {
     return (await modelCatalogue(userId)).map((m) => m.slug);
   }
+  /** #1306: the picker's view of the catalogue. `refresh` bypasses the cache (and a remembered
+   *  failure) unless this account refreshed within MODEL_REFRESH_GAP_MS, in which case the cached
+   *  list is served and marked throttled. Concurrent fetches for one account share one request. */
+  async function modelList(userId, { refresh = false } = {}) {
+    const out = await catalogueEntry(userId, { refresh });
+    return { models: out.ids.map((m) => m.slug), cached: out.cached, fetchedAt: out.fetchedAt, ...(out.throttled ? { throttled: true } : {}) };
+  }
   async function modelCatalogue(userId) {
+    return (await catalogueEntry(userId)).ids;
+  }
+  async function catalogueEntry(userId, { refresh = false } = {}) {
     const cached = models.get(userId);
-    if (cached && cached.until > now()) { if (cached.ids) return cached.ids; throw fail(cached.error, 502); }
+    const fresh = cached && cached.until > now();
+    // The gap counts every refresh attempt, including ones that failed (network, timeout, 401,
+    // a provider message), so a held-down Refresh cannot hammer the provider on errors either.
+    const throttled = !!(refresh && now() - (modelRefreshes.get(userId) ?? -Infinity) < MODEL_REFRESH_GAP_MS);
+    if (fresh && (!refresh || throttled)) {
+      if (cached.ids) return { ids: cached.ids, cached: true, fetchedAt: cached.fetchedAt, throttled };
+      throw fail(cached.error, 502);
+    }
+    // Throttled with nothing usable cached: join the refresh still in flight, else refuse.
+    if (throttled && modelFlights.get(userId)?.gen !== catalogueEpoch(userId)) throw fail('The ChatGPT model list was refreshed a moment ago. Try again in a few seconds.', 429);
+    if (refresh && !throttled) {
+      modelRefreshes.set(userId, now());
+      while (modelRefreshes.size > 1000) modelRefreshes.delete(modelRefreshes.keys().next().value);
+    }
+    const gen = catalogueEpoch(userId);
+    let flight = modelFlights.get(userId);
+    if (!flight || flight.gen !== gen) {
+      const entry = { gen, promise: null };
+      entry.promise = fetchCatalogue(userId, gen).finally(() => { if (modelFlights.get(userId) === entry) modelFlights.delete(userId); });
+      modelFlights.set(userId, entry);
+      flight = entry;
+    }
+    const { ids, fetchedAt } = await flight.promise;
+    return { ids, cached: false, fetchedAt, throttled: false };
+  }
+  async function fetchCatalogue(userId, gen) {
     const r = await authorised(userId, (t) => fetchImpl(`${codexBase}/models?client_version=${encodeURIComponent(cfg.codexClientVersion)}`, {
       method: 'GET', redirect: 'error', signal: AbortSignal.timeout(TIMEOUT_MS), headers: upstreamHeaders(t, 'application/json'),
     }));
     const text = (await readCappedText(r, 2 * 1024 * 1024).catch(() => ({ text: '' }))).text;
     if (r.headers.get('x-noevia-provider-message') === '1') { let m = ''; try { m = JSON.parse(text).error.message; } catch { /* fallthrough */ } throw fail(m || MESSAGES.reconnect, r.status); }
-    const remember = (error) => { models.set(userId, { until: now() + MODEL_FAILURE_CACHE_MS, ids: null, error }); return fail(error, 502); };
+    // A disconnect or reconnect (possibly another ChatGPT account) while this fetch was in flight bumps the generation: the
+    // result then belongs to no one and is not cached.
+    const current = () => catalogueEpoch(userId) === gen;
+    // A failure never replaces a good list that is still fresh (a failed refresh): plain reads keep
+    // the last good list and only the refreshing call sees the error.
+    const remember = (error) => {
+      const prior = models.get(userId);
+      if (current() && !(prior?.ids && prior.until > now())) models.set(userId, { until: now() + MODEL_FAILURE_CACHE_MS, ids: null, error });
+      return fail(error, 502);
+    };
     if (!r.ok) throw remember(upstreamMessage(text, r.status));
     let parsed = null;
     try { parsed = JSON.parse(text); } catch { parsed = null; }
@@ -768,11 +823,12 @@ function createChatGptOAuth({ db, secrets, fetchImpl = (...args) => globalThis.f
         // #1311: the levels this model publishes (null when the list is absent), so an explicit choice is checked.
         levels: Array.isArray(m.supported_reasoning_levels) ? m.supported_reasoning_levels.map((l) => word(record(l) ? l.effort : null)).filter(Boolean).slice(0, 12) : null })).slice(0, 50);
     if (!ids.length) throw remember('ChatGPT returned no models for this account.');
-    models.set(userId, { until: now() + MODEL_CACHE_MS, ids });
-    return ids;
+    const fetchedAt = now();
+    if (current()) models.set(userId, { until: fetchedAt + MODEL_CACHE_MS, ids, fetchedAt });
+    return { ids, fetchedAt };
   }
 
-  return { startDeviceLogin, pollDeviceLogin, cancelDeviceLogin, status, disconnect, forgetUser, session, fetchFor, listModels };
+  return { startDeviceLogin, pollDeviceLogin, cancelDeviceLogin, status, disconnect, forgetUser, session, fetchFor, listModels, modelList };
 }
 
 /** The private provider row that points chats at this account. No credential lives in it. */

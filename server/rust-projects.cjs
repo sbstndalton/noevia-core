@@ -39,8 +39,9 @@
 //     between two reads is merged per top-level field (this process's value where it changed the
 //     field), so a chat save does not drop an image Rust added meanwhile. The id-keyed lists
 //     (assets, retiredAssets, chats) are merged per item: additions from both sides, removals since
-//     the base from either side, an item both changed is this process's (so a chat meta the front
-//     saved survives a move or delete of another chat here, and a delete here is not undone). Any other field
+//     the base from either side, an item both changed merged per field like a project (#1801: a
+//     title saved here keeps the updatedAt and preview the front saved meanwhile; a chat meta the
+//     front saved survives a move or delete of another chat here, and a delete here is not undone). Any other field
 //     changed on both sides is last-writer-wins. Every request start re-reads the file
 //     when its (ino, size, mtime) changed, refreshing unchanged projects in place, so a handler
 //     holding a project object still sees the current one.
@@ -54,7 +55,7 @@
 // re-reads it at each request start when its (ino, size, mtime) changed, and saves under the lock:
 // when the file still holds what this process last read or wrote, its list as it is; otherwise
 // the chat metas are merged per item against that base (mergeIdList: additions from both sides,
-// removals since the base from either side, a meta both changed is this process's), newest first
+// removals since the base from either side, a meta both changed merged per field, #1801), newest first
 // as mergeChats orders them, at most LIST_CAP. A file that is not a JSON array on either side is
 // not merged: the other side's value is taken (refresh) or replaced (save), as before.
 // DELETE /api/freechats/{id} stays Node's: it also removes the chat's transcript, context meter,
@@ -132,6 +133,7 @@ function withFileLock(file, fn, { flockBin = 'flock' } = {}) {
 const idOf = (p) => (p && typeof p === 'object' && typeof p.id === 'string' ? p.id : null);
 const own = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+const plain = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const blank = (v) => v === undefined || (Array.isArray(v) ? v.length === 0 : v !== null && typeof v === 'object' && Object.keys(v).length === 0);
 // Node normalises absent lists in memory after a save (uploads.prune: `project.assets =
 // (project.assets || []).filter(...)` runs after the config route's save). An absent field turned
@@ -145,8 +147,8 @@ const listOrNull = (v) => (v === undefined || v === null ? [] : Array.isArray(v)
 
 /** The id-keyed three-way merge of one list: disk order, items new here appended. An item removed
  *  since `base` on either side is gone (even if the other side changed it); one added on either
- *  side is kept; one both have is the disk's unless this process changed it. Items without a
- *  string id are the disk's. */
+ *  side is kept; one both have is the disk's unless this process changed it, and one both changed
+ *  is merged per field (mergeFields, #1801). Items without a string id are the disk's. */
 function mergeIdList(ours, base, theirs) {
   const map = (l) => { const m = new Map(); for (const x of l) { const id = idOf(x); if (id !== null && !m.has(id)) m.set(id, x); } return m; };
   const o = map(ours); const b = map(base);
@@ -158,7 +160,12 @@ function mergeIdList(ours, base, theirs) {
     placed.add(id);
     if (!o.has(id)) { if (!b.has(id)) out.push(t); continue; } // added there / removed here
     const mine = o.get(id);
-    out.push(b.has(id) && same(mine, b.get(id)) ? t : mine);
+    if (!b.has(id)) { out.push(mine); continue; } // added on both sides: this process's
+    if (same(mine, b.get(id))) { out.push(t); continue; } // changed only there (or not at all)
+    // #1801: changed on both sides: per field, this process's value where it changed the field and
+    // the disk's otherwise, so a generated title saved here keeps the updatedAt and preview the
+    // front saved meanwhile. Non-object items stay this process's.
+    out.push(plain(mine) && plain(t) && plain(b.get(id)) ? mergeFields(mine, JSON.stringify(b.get(id)), t) : mine);
   }
   for (const x of ours) {
     const id = idOf(x);

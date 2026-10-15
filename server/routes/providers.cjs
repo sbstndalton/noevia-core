@@ -13,7 +13,7 @@
 //   POST   /api/providers/chatgpt/device       start a device-code sign-in -> { loginId, userCode, verificationUrl }
 //   POST   /api/providers/chatgpt/device/poll  { loginId } -> pending | connected | expired
 //   POST   /api/providers/chatgpt/device/cancel { loginId }
-//   GET    /api/providers/chatgpt/models       the account's model ids
+//   GET    /api/providers/chatgpt/models[?refresh=1]  the account's model ids, cached/fetchedAt (#1306)
 //   DELETE /api/providers/chatgpt              disconnect: tokens deleted, the provider row removed
 // A connection is always the signed-in account's own private provider, never shared.
 //
@@ -82,7 +82,7 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
     if (changed) saveProjects(PROJECTS);
   }
 
-  async function handleChatGpt(req, res, p, authn) {
+  async function handleChatGpt(req, res, p, authn, url) {
     // The main router's auth/browser gate has already run. Never execute Node
     // status when a selected native GET reaches this mount through a failed front.
     if (p === '/api/providers/chatgpt' && req.method === 'GET' && chatgptStatusOwned()) {
@@ -114,13 +114,21 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
         return json(res, 200, { ok: chatgptOAuth.cancelDeviceLogin(userId, String(body?.loginId || '')) });
       }
       if (p === '/api/providers/chatgpt/models' && req.method === 'GET') {
-        return json(res, 200, { models: await chatgptOAuth.listModels(userId) });
+        return json(res, 200, await chatgptModels(userId, url));
       }
     } catch (e) {
       // Messages from chatgpt-oauth.cjs are written for people and carry no credential.
       return json(res, e.status && e.status < 600 ? e.status : 502, { error: e.status ? e.message : 'ChatGPT sign-in failed.' });
     }
     return json(res, 405, { error: 'method not allowed' });
+  }
+
+  // #1306: ?refresh=1 reaches the account's catalogue (bounded there: one fetch in flight per
+  // account, refreshes closer than its gap served from the cache and marked throttled).
+  async function chatgptModels(userId, url) {
+    const refresh = url?.searchParams?.get('refresh') === '1';
+    if (typeof chatgptOAuth.modelList === 'function') return chatgptOAuth.modelList(userId, { refresh });
+    return { models: await chatgptOAuth.listModels(userId), cached: false };
   }
 
   // #1009: a stored provider's model list for the routing pickers. Keyed by account, provider id and
@@ -138,8 +146,8 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
     const refresh = url?.searchParams?.get('refresh') === '1';
     if (chatgpt.isChatGptProvider(row)) {
       if (!chatgptOn() || row.shared) return json(res, 404, { error: 'Sign in with ChatGPT is turned off on this server.' });
-      try { return json(res, 200, { models: await chatgptOAuth.listModels(userId), cached: false }); }
-      catch (e) { return json(res, 502, { error: e.status ? e.message : 'ChatGPT did not list its models.' }); }
+      try { return json(res, 200, await chatgptModels(userId, url)); }
+      catch (e) { return json(res, e.status === 401 || e.status === 429 ? e.status : 502, { error: e.status ? e.message : 'ChatGPT did not list its models.' }); }
     }
     if (!/^https?:\/\//.test(String(row.baseUrl || ''))) return json(res, 400, { error: 'this provider has no address' });
     // A member's own row passed this guard when it was saved; checking again keeps a later policy
@@ -224,7 +232,7 @@ function createProviderRoutes({ json, readBody, readJson, fetchJson, endpointApp
       try { id = decodeURIComponent(listMatch[1]); } catch { return json(res, 400, { error: 'no such provider' }); }
       return providerModels(req, res, id, authn, url);
     }
-    if (p === '/api/providers/chatgpt' || p.startsWith('/api/providers/chatgpt/')) return handleChatGpt(req, res, p, authn);
+    if (p === '/api/providers/chatgpt' || p.startsWith('/api/providers/chatgpt/')) return handleChatGpt(req, res, p, authn, url);
     // ── Provider registry (step 9): list / connect / remove. GET never returns
     // a saved apiKey in plaintext — masked, e.g. sk-…last4.
     if (p === '/api/providers' && req.method === 'GET') {
