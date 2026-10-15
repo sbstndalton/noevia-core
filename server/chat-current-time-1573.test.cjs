@@ -44,10 +44,9 @@ async function run(t, body, extra = {}) {
   return { events, requests };
 }
 
-const systemText = (r) => {
-  const sys = r.requests[0].body.messages.find((m) => m.role === 'system');
-  return typeof sys?.content === 'string' ? sys.content : '';
-};
+// Every system message: an effort hint (reasoning-effort.cjs, e.g. Low on a Fast route, #1788) is its own system message.
+const systemText = (r) => r.requests[0].body.messages
+  .filter((m) => m.role === 'system' && typeof m.content === 'string').map((m) => m.content).join('\n');
 
 test('#1573: an ordinary chat turn states today and the rule for time-sensitive answers', async (t) => {
   const r = await run(t, {});

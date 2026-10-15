@@ -18,6 +18,13 @@ function validEffort(value) { return EFFORTS.includes(value); }
 function resolveEffort(project, globalDefault) {
   return validEffort(project?.reasoningEffort) ? project.reasoningEffort : validEffort(globalDefault) ? globalDefault : 'default';
 }
+// #1788 (after #1475): the decision service routes a turn Fast when it judges it simple ("Say hello"). The account's
+// default effort used to apply anyway, so a greeting got the High hint and its thinking cap and thought for ~19 s.
+// An Automatic turn routed Fast runs at Low (its hint and its cap); Smart, Code and non-Automatic turns keep theirs.
+// It only ever lowers.
+function effortForRoute(effort, routedRole) {
+  return routedRole === 'fast' && effort !== 'low' ? 'low' : effort;
+}
 function capabilityKey(provider, model) {
   // Credential digest prevents one tenant's rejection from changing another's
   // behavior, without retaining plaintext credentials in capability keys.
@@ -126,4 +133,4 @@ async function requestWithEffort(fetcher, url, options, body, provider, model, e
   return capped;
 }
 
-module.exports = { HINTS, nativeThinking, validEffort, resolveEffort, modeFor, requestBody, requestWithEffort, forcedAnswerBody };
+module.exports = { HINTS, nativeThinking, validEffort, resolveEffort, effortForRoute, modeFor, requestBody, requestWithEffort, forcedAnswerBody };
