@@ -76,7 +76,7 @@ test('unverified output-budget rejection falls back once without breaking hint c
  const p={id:'budget-fixture',baseUrl:'http://fixture.invalid',capabilities:{}},requests=[];
  const response=await requestWithEffort(async(_,options)=>{requests.push(JSON.parse(options.body));return requests.length===1?new Response('max_tokens unsupported',{status:400}):new Response('{}');},p.baseUrl,{},body,p,'synthetic','high',()=>{});
  assert.equal(response.status,200);assert.equal(requests.length,2);assert.equal(requests[1].max_tokens,undefined);
- assert.equal(requests[1].messages[0].content,'Think through this step by step before answering.');
+ assert.equal(requests[1].messages[0].content,require('./reasoning-effort.cjs').HINTS.high);
 });
 
 

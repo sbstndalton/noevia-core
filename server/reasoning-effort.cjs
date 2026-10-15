@@ -8,7 +8,12 @@ const ERROR_BODY_CAP = 64 * 1024;
 const EFFORTS = ['default', 'low', 'high'];
 const rejected = new Set();
 const rejectedBudget = new Set();
-const HINTS = { low: 'Answer directly and concisely; skip step-by-step reasoning.', high: 'Think through this step by step before answering.' };
+// #1787: the high hint used to say "Think through this step by step before answering." A model that already thinks in
+// reasoning_content (gemma on the local engine) then also wrote its working into the reply: a "Reasoning:" heading,
+// "Wait, let me re-calculate" and a first line its own working contradicted. High asks for care, and the reply is the
+// answer only; real thinking stays in the thinking panel.
+const HINTS = Object.freeze({ low: 'Answer directly and concisely; skip step-by-step reasoning.',
+  high: 'Work this out carefully and check it before you reply. Then give the final answer only: do not show your working, a "Reasoning:" section, or corrections such as "Wait, let me re-calculate".' });
 function validEffort(value) { return EFFORTS.includes(value); }
 function resolveEffort(project, globalDefault) {
   return validEffort(project?.reasoningEffort) ? project.reasoningEffort : validEffort(globalDefault) ? globalDefault : 'default';
@@ -121,4 +126,4 @@ async function requestWithEffort(fetcher, url, options, body, provider, model, e
   return capped;
 }
 
-module.exports = { nativeThinking, validEffort, resolveEffort, modeFor, requestBody, requestWithEffort, forcedAnswerBody };
+module.exports = { HINTS, nativeThinking, validEffort, resolveEffort, modeFor, requestBody, requestWithEffort, forcedAnswerBody };
