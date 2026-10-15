@@ -1284,6 +1284,8 @@ async function handleRequest(req,res) {
   try {if(inference && modelManager.enterInference)leave=modelManager.enterInference();}
   catch(error){return json(res,error.status||503,{error:error.message});}
   if(leave){res.once('finish',leave);res.once('close',leave);}
+  // #1881: while a chat or Diary turn runs, the long-document backfill makes no embed request (rag.cjs foreground).
+  if(inference){const fg=rag.foreground();res.once('finish',fg);res.once('close',fg);}
   try {return await handleRequestInner(req,res);}finally{if(leave && (res.writableEnded||res.destroyed))leave();}
 }
 

@@ -25,17 +25,28 @@ const WORDS = ['alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot', 'golf', 
 const vectorFor = (text) => { const t = String(text).toLowerCase(); return WORDS.map((w) => (t.split(w).length - 1) + 0.01); };
 
 // The embeddings endpoint, faked at rag.cjs's fetch seam: nothing leaves the process.
+// `state.delayMs`: each request takes that long, one at a time (a single-slot embed service);
+// `state.narrow(text)`: answer that text with a vector of the wrong width.
 function fakeEmbedder() {
   const seen = [];
-  const state = { fail: false };
+  const log = []; // { kind: 'start' | 'end', input, at }
+  const state = { fail: false, delayMs: 0, narrow: null };
+  let line = Promise.resolve();
   const fetch = async (url, init = {}) => {
     if (!String(url).endsWith('/v1/embeddings')) return new Response(JSON.stringify({ data: [{ id: 'fake-embed' }] }), { status: 200, headers: { 'Content-Type': 'application/json' } });
     const body = JSON.parse(init.body);
     seen.push(body.input);
+    const turn = line.then(async () => {
+      log.push({ kind: 'start', input: body.input });
+      if (state.delayMs) await new Promise((r) => setTimeout(r, state.delayMs));
+      log.push({ kind: 'end', input: body.input });
+    });
+    line = turn.catch(() => {});
+    await turn;
     if (state.fail) return new Response('{"error":"busy"}', { status: 503 });
-    return new Response(JSON.stringify({ data: body.input.map((text, index) => ({ index, embedding: vectorFor(text) })) }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    return new Response(JSON.stringify({ data: body.input.map((text, index) => ({ index, embedding: state.narrow && state.narrow(text) ? [1, 2] : vectorFor(text) })) }), { status: 200, headers: { 'Content-Type': 'application/json' } });
   };
-  return { seen, state, fetch, url: 'http://embed.invalid/v1', close: () => {} };
+  return { seen, log, state, fetch, url: 'http://embed.invalid/v1', close: () => {} };
 }
 
 function freshRag() { delete require.cache[require.resolve('./rag.cjs')]; return require('./rag.cjs'); }
@@ -380,4 +391,170 @@ test('#1869: completeUploadedDocument runs the stored record\'s completion once,
     assert.equal((await store.completeUploadedDocument(project, done, { ocrBudget: { remaining: 40 } })).status, 'complete');
     assert.equal(budgets.length, n);
   } finally { documents.completeDocument = realComplete; documents.extractDocumentText = realExtract; fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ── #1881 review ─────────────────────────────────────────────────────────────────────────────────
+
+dbTest('#1881: a record that cannot be read is skipped this pass, never marked complete, and indexed once readable', async () => {
+  const s = await setup();
+  try {
+    const { record, content } = longDocument();
+    await s.rag.indexProjectFile('p-long', 'long.pdf', content, USER);
+    const file = docFile('long.pdf', content);
+    const ws = workspaceWith(s.dir, [file], {});
+    const f = makeBackfill(s, ws, { PROJECT_TAIL_EMBED_PER_PASS: '8' });
+    const recordPath = path.join(ws.documentDir(), `${V1}.json`);
+    let t = await f.b.kick();
+    assert.equal(t.skipped, 1); assert.equal(t.embedded, 0);
+    assert.equal(file.document.searchable, undefined, 'a missing record says nothing about the tail');
+    fs.writeFileSync(recordPath, JSON.stringify(record).slice(0, 5000)); // mid-write: not JSON
+    t = await f.b.kick();
+    assert.equal(t.skipped, 1);
+    assert.equal(file.document.searchable, undefined);
+    fs.writeFileSync(recordPath, JSON.stringify(record));
+    t = await f.b.kick();
+    assert.equal(t.embedded, 8, 'readable again: the tail is indexed');
+    assert.equal(file.document.searchable.complete, false);
+  } finally { s.done(); }
+});
+
+dbTest('#1881: only a window of pages is chunked per call, never the whole text', async () => {
+  const s = await setup();
+  try {
+    const { record, content } = longDocument();
+    await s.rag.indexProjectFile('p-long', 'long.pdf', content, USER);
+    const file = docFile('long.pdf', content);
+    const ws = workspaceWith(s.dir, [file], { [V1]: record });
+    const sizes = [];
+    const spy = { ...s.rag, chunkText: (text) => { sizes.push(String(text).length); return s.rag.chunkText(text); } };
+    const f = makeBackfill({ ...s, rag: spy }, ws, { PROJECT_TAIL_EMBED_PER_PASS: '8', PROJECT_TAIL_EMBED_BATCH: '8' });
+    await f.b.kick();
+    assert.ok(sizes.length >= 1);
+    assert.ok(Math.max(...sizes) < 20 * 1200, `largest chunked text ${Math.max(...sizes)} characters`);
+    // Later passes resume at the coverage page, not at the head.
+    const coverage = file.document.searchable.page;
+    sizes.length = 0;
+    await f.b.kick();
+    assert.ok(file.document.searchable.page > coverage || file.document.searchable.complete);
+    assert.ok(Math.max(...sizes) < 20 * 1200);
+  } finally { s.done(); }
+});
+
+dbTest('#1881: a chat query waits behind at most one small tail request, and the backfill stops for it', async () => {
+  const s = await setup();
+  try {
+    const { record, content } = longDocument({ needle: 85 });
+    await s.rag.indexProjectFile('p-long', 'long.pdf', content, USER);
+    const file = docFile('long.pdf', content);
+    const ws = workspaceWith(s.dir, [file], { [V1]: record });
+    const f = makeBackfill(s, ws, { PROJECT_TAIL_EMBED_PER_PASS: '48', PROJECT_TAIL_EMBED_BATCH: '8' });
+    s.server.state.delayMs = 30;
+    s.server.log.length = 0;
+    const pass = f.b.kick();
+    // Wait (bounded) until the first tail request is being served, then ask a question.
+    const deadline = Date.now() + 5000;
+    while (!s.server.log.some((e) => e.kind === 'start') && Date.now() < deadline) await new Promise((r) => setTimeout(r, 2));
+    const asked = s.server.log.length;
+    const started = Date.now();
+    const hits = s.rag.searchProject('p-long', 'charlie', USER);
+    await hits;
+    const waited = Date.now() - started;
+    const totals = await pass;
+    const before = s.server.log.slice(asked).findIndex((e) => e.kind === 'start' && e.input.length === 1 && e.input[0] === 'charlie');
+    assert.ok(before >= 0, 'the query reached the embedder');
+    const ahead = s.server.log.slice(asked, asked + before).filter((e) => e.kind === 'start');
+    assert.ok(ahead.length <= 1, `tail requests served before the query: ${ahead.length}`);
+    for (const e of s.server.log.filter((x) => x.kind === 'start' && x.input[0] !== 'charlie')) assert.ok(e.input.length <= 4, 'tail requests carry at most 4 texts');
+    assert.ok(waited < 30 * 2 + 200, `query waited ${waited} ms`);
+    assert.equal(totals.reason, 'chat in flight', 'the pass stopped for the query');
+    assert.ok(totals.embedded < 48);
+  } finally { s.done(); }
+});
+
+dbTest('#1881: a window that stores no vector counts against the allowance and backs the document off', async () => {
+  const s = await setup();
+  try {
+    const { record, content } = longDocument();
+    await s.rag.indexProjectFile('p-long', 'long.pdf', content, USER);
+    const file = docFile('long.pdf', content);
+    const ws = workspaceWith(s.dir, [file], { [V1]: record });
+    const f = makeBackfill(s, ws, { PROJECT_TAIL_EMBED_PER_PASS: '8', PROJECT_TAIL_EMBED_BATCH: '8' });
+    s.server.state.narrow = () => true; // every vector has the wrong width
+    const n0 = s.server.seen.length;
+    const t1 = await f.b.kick();
+    assert.equal(t1.embedded, 0);
+    assert.equal(s.server.seen.length - n0, 2, 'one call of 8 chunks (two requests of 4), then it stops');
+    const n1 = s.server.seen.length;
+    await f.b.kick();
+    assert.equal(s.server.seen.length, n1, 'backed off: not tried again every pass');
+    s.server.state.narrow = null;
+    f.advance(3600_000 + 1);
+    assert.ok((await f.b.kick()).embedded > 0, 'tried again after the back-off');
+  } finally { s.done(); }
+});
+
+test('#1881: default budgets are the lowered ones, with their own duty', () => {
+  const d = backfill.settings({});
+  assert.deepEqual({ perPass: d.perPass, perHour: d.perHour, perDocument: d.perDocument, batch: d.batch, duty: d.duty }, { perPass: 48, perHour: 480, perDocument: 24, batch: 8, duty: 0.25 });
+  assert.equal(backfill.settings({ EMBEDDING_REINDEX_DUTY: '0.9' }).duty, 0.25, 'the re-index duty is not the backfill\'s');
+});
+
+function uploadStore(dir, project) {
+  const documentSources = require('./document-sources.cjs');
+  const workspace = { assetDir: (id) => path.join(dir, 'assets', id), dir: path.join(dir, 'ws'), userId: USER, projects: [project], saveProjects: () => {} };
+  const store = require('./projects.cjs').createProjectStore({ fs, path, documentSources, storageClient: {},
+    rag: { indexProjectFile: async () => ({ ok: true, stored: 1, embedded: 1 }), deleteProjectFile: () => {} },
+    authService: { getStorage: () => ({}) }, currentWorkspace: () => workspace, PROJECTS: [project],
+    reasoningEffort: {}, projectAppearance: () => ({}), FREE_CHATS: [], sanitizeToolboxes: () => null, defaultToolboxes: () => [], PROJECT_ROOT_FOLDER: 'fixture-root',
+    createProjectFolder: async () => null, projectSweep: { afterDelete: async () => {} } });
+  return { store, workspace, documentSources };
+}
+
+test('#1881: completeUploadedDocument skips an unreadable or transient record, sizes a missing `bytes` on disk, and does not count an unreachable OCR as a try', async () => {
+  const realComplete = documents.completeDocument;
+  const realExtract = documents.extractDocumentText;
+  const realRead = process.env.PROJECT_DOCUMENT_READ_BYTES;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-1881-'));
+  const project = { id: 'proj-up', files: [] };
+  const { store, workspace, documentSources } = uploadStore(dir, project);
+  const page = (n, status = 'native', text = `Synthetic upload page ${n}.`, extra = {}) => ({ number: n, status, method: 'native', text, ...extra });
+  try {
+    documents.extractDocumentText = async () => ({ text: '[Page 1]\nSynthetic upload page 1.', pages: 2, pageTexts: [page(1), page(2, 'failed', '')], state: 'partial', truncated: false });
+    const up = await documentSources.ingest(workspace, project.id, 'u.pdf', Buffer.from('%PDF-1.4 synthetic 1881'), undefined);
+    project.files = [up];
+    const recordPath = path.join(documentSources.directory(workspace, project.id), `${up.document.version}.json`);
+    const good = fs.readFileSync(recordPath, 'utf8');
+    let calls = 0;
+    documents.completeDocument = async (_n, _b, out) => { calls += 1; return { ...out, pageTexts: [page(1), page(2, 'failed', '', { retry: { outcome: 'failed', error: 'OCR service unavailable', attempts: 1, again: true } })], completion: undefined }; };
+
+    fs.writeFileSync(recordPath, '{"pages":'); // unreadable
+    assert.equal((await store.completeUploadedDocument(project, up, { ocrBudget: { remaining: 40 } })).status, 'skipped');
+    fs.writeFileSync(recordPath, JSON.stringify({ ...JSON.parse(good), retryable: true })); // transient
+    assert.equal((await store.completeUploadedDocument(project, up, { ocrBudget: { remaining: 40 } })).status, 'skipped');
+    assert.equal(up.document.completionSweep, undefined, 'never marked finished on a failed read');
+    assert.equal(calls, 0);
+    fs.writeFileSync(recordPath, good);
+
+    // `bytes` missing: measured on disk, and an original over the upload limit is refused unread.
+    delete up.document.bytes;
+    process.env.PROJECT_DOCUMENT_READ_BYTES = '10';
+    const big = await store.completeUploadedDocument(project, up, { ocrBudget: { remaining: 40 } });
+    assert.equal(big.status, 'failed'); assert.equal(calls, 0);
+    assert.equal(up.document.completionSweep, up.document.version);
+    delete up.document.completionSweep;
+    if (realRead === undefined) delete process.env.PROJECT_DOCUMENT_READ_BYTES; else process.env.PROJECT_DOCUMENT_READ_BYTES = realRead;
+
+    // OCR unreachable: a retry, not a try.
+    const r = await store.completeUploadedDocument(project, up, { ocrBudget: { remaining: 40 } });
+    assert.equal(calls, 1);
+    assert.equal(r.status, 'retry'); assert.equal(r.unreachable, true);
+    const now = project.files[0];
+    assert.equal(now.document.completionTries, undefined, 'an unreachable service does not burn a try');
+    assert.equal(now.document.completionSweep, undefined);
+    assert.equal(backfill.uploadCandidate(now, documents.EXTRACTOR_VERSION), true);
+  } finally {
+    documents.completeDocument = realComplete; documents.extractDocumentText = realExtract;
+    if (realRead === undefined) delete process.env.PROJECT_DOCUMENT_READ_BYTES; else process.env.PROJECT_DOCUMENT_READ_BYTES = realRead;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
