@@ -83,3 +83,11 @@ test('#1816 a PUT without model keeps the saved decision model; only "" or null 
   settings.save({url:'http://laya:8040',timeoutMs:1000,model:''},'admin');
   assert.equal('model' in settings.get(),false,'empty string clears');
 });
+test('#1817 a saved model that is no longer a profile is automatic on a PUT that omits model',()=>{
+  const {store,settings}=fixture();
+  store.set('decision:configuration',JSON.stringify({url:'http://laya:8040',timeoutMs:900,model:'removed-profile'}));
+  const again=createDecisionSettings({store,env:{}});
+  const out=again.save({url:'http://laya:8040',timeoutMs:1000},'admin');
+  assert.equal('model' in again.get(),false);
+  assert.throws(()=>again.save({url:'http://laya:8040',timeoutMs:1000,model:'removed-profile'},'admin'),{status:400});
+});

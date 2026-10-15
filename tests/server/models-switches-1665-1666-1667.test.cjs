@@ -289,3 +289,17 @@ test('#1667 deleting the Creative model clears only that optional role', () => {
   assert.deepEqual(service.clearRoleReferences('c'), ['creative']);
   assert.deepEqual(ws.autoRoles, { fast: 'f', smart: 's' });
 });
+
+test('#1817 turning reranking off with a saved choice that is no longer offered succeeds, and keeps the choice', () => {
+  const env = { ...TEI_ENV, RERANK_LLAMACPP_BASE_URL: 'http://10.0.0.7:8091' };
+  const store = memStore();
+  createRerankSettings({ store, env }).save({ enabled: true, choice: 'llamacpp:synthetic-reranker-q8' }, 'a', INSTALLED);
+  const later = createRerankSettings({ store, env });
+  const gone = INSTALLED.map((m) => (m.name === 'synthetic-reranker-q8' ? { ...m, missingFile: true } : m));
+  const off = later.save({ enabled: false, choice: 'llamacpp:synthetic-reranker-q8' }, 'a', gone);
+  assert.equal(off.enabled, false);
+  assert.equal(off.choice, 'llamacpp:synthetic-reranker-q8');
+  assert.equal(later.save({ enabled: false, choice: 'llamacpp:synthetic-reranker-q8' }, 'a', null).enabled, false, 'even with the catalogue unreadable');
+  assert.throws(() => later.save({ enabled: true, choice: 'llamacpp:synthetic-reranker-q8' }, 'a', gone), { messageId: 'unknownReranker' });
+  assert.throws(() => later.save({ enabled: false, choice: 'llamacpp:other-gone' }, 'a', gone), { messageId: 'unknownReranker' });
+});
