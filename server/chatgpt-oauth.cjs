@@ -93,6 +93,16 @@ function maskEmail(email) {
   return `${name.slice(0, 1)}…@${domain}`.slice(0, 120);
 }
 
+/** The account's plan as sent to the browser (#1373). What is stored is the id token's
+ *  `chatgpt_plan_type` claim, a short identifier such as "plus" or "team". Only that shape is sent:
+ *  any other value (an object, an array, a number, a longer or odd string from an older or edited
+ *  row) is null, so nothing else stored beside the tokens can be echoed. The Rust front's native
+ *  status (noevia-rs server-chatgpt-status) applies the same rule. */
+const PLAN_PATTERN = /^[A-Za-z0-9_.-]{1,40}$/;
+function publicPlan(plan) {
+  return typeof plan === 'string' && PLAN_PATTERN.test(plan) ? plan : null;
+}
+
 /** The token endpoint's answer, reduced to what is stored. `previous` keeps a refresh token that a refresh did not rotate. */
 function tokensFrom(payload, { now, previous = null }) {
   const p = record(payload);
@@ -548,7 +558,7 @@ function createChatGptOAuth({ db, secrets, fetchImpl = (...args) => globalThis.f
       write(userId, { ...tokens, connectedAt: now() });
       resetCatalogue(userId);
       audit('chatgpt.oauth.connect', userId, { plan: tokens.plan || undefined });
-      return { state: 'connected', account: { email: maskEmail(tokens.email), plan: tokens.plan } };
+      return { state: 'connected', account: { email: maskEmail(tokens.email), plan: publicPlan(tokens.plan) } };
     } finally {
       p.polling = false;
     }
@@ -628,7 +638,7 @@ function createChatGptOAuth({ db, secrets, fetchImpl = (...args) => globalThis.f
     const row = read(userId);
     if (!row) return { state: 'disconnected' };
     if (row.state !== 'connected' || !row.data) return { state: 'reconnect' };
-    return { state: 'connected', account: { email: maskEmail(row.data.email), plan: row.data.plan || null } };
+    return { state: 'connected', account: { email: maskEmail(row.data.email), plan: publicPlan(row.data.plan) } };
   }
   function disconnect(userId) {
     bump(userId);
@@ -837,4 +847,4 @@ function providerRow() {
 }
 const isChatGptProvider = (provider) => !!provider && provider.kind === KIND;
 
-module.exports = { KIND, PROVIDER_ID, DEFAULTS, createChatGptOAuth, providerRow, isChatGptProvider, toResponsesRequest, chatParts, maskEmail, accountIdFrom };
+module.exports = { KIND, PROVIDER_ID, DEFAULTS, createChatGptOAuth, providerRow, isChatGptProvider, toResponsesRequest, chatParts, maskEmail, publicPlan, accountIdFrom };
