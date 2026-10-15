@@ -24,18 +24,25 @@ function router(states) {
     const u = new URL(url), method = String(options.method || 'GET').toUpperCase();
     const body = options.body ? JSON.parse(options.body) : {};
     calls.push(`${method} ${u.pathname}${body.model ? ' ' + body.model : ''}`);
-    if (u.pathname === '/models' && method === 'GET') return { ok: true, status: 200, body: { data: Object.entries(states).map(([id, value]) => ({ id, status: { value } })) } };
+    if (u.pathname === '/models' && method === 'GET') return { ok: true, status: 200, body: { data: Object.entries(states).map(([id, value]) => ({ id, status: { value: value === 'killing' ? 'loading' : value } })) } };
     if (u.pathname === '/props') return { ok: true, status: 200, body: { default_generation_settings: { n_ctx: 16384 }, total_slots: 1 } };
     if (u.pathname === '/models/load') { states[body.model] = 'loading'; setTimeout(() => { if (states[body.model] === 'loading') states[body.model] = 'loaded'; }, LOAD_MS); return { ok: true, status: 200, body: { success: true } }; }
     // Each unload records the state the model was in: 'loaded' would mean a model that could be in use.
-    if (u.pathname === '/models/unload') { unloads.push({ model: body.model, was: states[body.model] }); states[body.model] = 'unloaded'; return { ok: true, status: 200, body: { success: true } }; }
+    // llama.cpp b11610 (server_models::unload): a loading model is accepted and force-killed; the monitor marks it
+    // unloaded a moment later. A model that is not running answers 400 "model is not running".
+    if (u.pathname === '/models/unload') {
+      unloads.push({ model: body.model, was: states[body.model] });
+      if (!['loaded', 'loading', 'sleeping'].includes(states[body.model])) return { ok: false, status: 400, body: { error: { message: 'model is not running' } } };
+      if (states[body.model] === 'loading') { states[body.model] = 'killing'; setTimeout(() => { states[body.model] = 'unloaded'; }, 50); return { ok: true, status: 200, body: { success: true } }; }
+      states[body.model] = 'unloaded'; return { ok: true, status: 200, body: { success: true } };
+    }
     return { ok: true, status: 200, body: {} };
   };
   const manager = createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic-router/v1', fetchJson, fetchStream: async () => ({ ok: false }) });
   return { manager, calls, states, unloads, loads: () => calls.filter((c) => c.startsWith('POST /models/load')) };
 }
 
-async function turn(t, { roles, states, project = { routing: 'auto' }, routingModes = null, chatMachines = null, decisionMs = DECISION_MS, route = 'fast', message = 'QA-SYNTH-1863 Say hello.', codeTasks = [], mode }) {
+async function turn(t, { roles, states, project = { routing: 'auto' }, routingModes = null, chatMachines = null, decisionMs = DECISION_MS, route = 'fast', message = 'QA-SYNTH-1863 Say hello.', codeTasks = [], mode, stopDuringDecision = false }) {
   const saved = { kind: process.env.MODEL_MANAGER_KIND, base: process.env.INFERENCE_BASE_URL };
   process.env.MODEL_MANAGER_KIND = 'llamacpp'; process.env.INFERENCE_BASE_URL = 'http://default.invalid';
   t.after(() => { for (const [k, v] of [['MODEL_MANAGER_KIND', saved.kind], ['INFERENCE_BASE_URL', saved.base]]) if (v === undefined) delete process.env[k]; else process.env[k] = v; });
@@ -70,14 +77,14 @@ async function turn(t, { roles, states, project = { routing: 'auto' }, routingMo
     DIARY_BASE: 'http://fixture.invalid', TOOL_RESULT_CAP: 8000, json: (_res, status, body) => { replied = { status, body }; }, saveChats() {}, endpointApproved: () => true, diaryHeaders: () => ({}),
     lastLoadedModel: () => null,
     // The fake decision service: answers Fast after decisionMs.
-    classifyFastOrSmart: async () => { await sleep(decisionMs); return route; }, codeTasksFor: () => codeTasks,
+    classifyFastOrSmart: async () => { await sleep(decisionMs); if (stopDuringDecision) res.emit('close'); return route; }, codeTasksFor: () => codeTasks,
     servedCatalogue: async () => rows, modelsInstalled: async () => rows,
     missingRoles: require('./auto-roles-check.cjs').missingRoles, staleRolesError: require('./auto-roles-check.cjs').staleRolesError,
     allToolboxes: () => [{ id: 'core', tools: [] }], chatWideApproved: () => false, recordUsage() {}, recordToolUse() {},
     executeToolCall: async () => 'synthetic result', awaitApproval: async () => 'approve',
   });
   await handleChat({}, res, { projectId: 'fixture-project', chatId: 'fixture-chat', message, ...(mode ? { mode } : {}) });
-  return { events, upstream, engine, firstToken, replied, errors: events.filter((e) => e.type === 'error') };
+  return { events, upstream, engine, firstToken, replied, res, errors: events.filter((e) => e.type === 'error') };
 }
 
 test('#1863 preloadTarget: one local model for every role, nothing else', () => {
@@ -231,4 +238,89 @@ test('#1863 owner shape, wrong guess with a fast decision: the pre-load is cance
   // Without the cancel the swap would wait for the rest of the 600 ms load: about 100 + 600 + 600.
   assert.ok(out.firstToken < 100 + LOAD_MS + 400, `${out.firstToken} ms vs today ${100 + LOAD_MS} ms`);
   console.log(`[1863] wrong-guess (fast decision) TTFT ${out.firstToken} ms (today ${100 + LOAD_MS} ms)`);
+});
+
+test('#1863 D1 makeRoomFor: a loading evictee the engine accepts (force-kill) or refuses never fails the turn', async () => {
+  // Accepts while loading (b11610's real answer): the model leaves; the Code model's room is made.
+  {
+    const engine = router({ 'synthetic-shared-12b': 'loading', 'synthetic-coder-9b': 'unloaded' });
+    await engine.manager.makeRoomFor('synthetic-coder-9b', []);
+    assert.deepEqual(engine.unloads, [{ model: 'synthetic-shared-12b', was: 'loading' }]);
+    assert.equal(engine.states['synthetic-shared-12b'], 'unloaded');
+  }
+  // Refuses while loading (defensive): wait until it is loaded, then unload it.
+  {
+    const states = { 'synthetic-shared-12b': 'loading', 'synthetic-coder-9b': 'unloaded' };
+    const calls = [];
+    const fetchJson = async (url, options = {}) => {
+      const u = new URL(url), method = String(options.method || 'GET').toUpperCase(), body = options.body ? JSON.parse(options.body) : {};
+      if (u.pathname === '/models' && method === 'GET') return { ok: true, status: 200, body: { data: Object.entries(states).map(([id, value]) => ({ id, status: { value } })) } };
+      if (u.pathname === '/models/unload') {
+        calls.push(states[body.model]);
+        if (states[body.model] === 'loading') { setTimeout(() => { states[body.model] = 'loaded'; }, 150); return { ok: false, status: 409, body: { error: 'still loading' } }; }
+        states[body.model] = 'unloaded'; return { ok: true, status: 200, body: { success: true } };
+      }
+      return { ok: true, status: 200, body: {} };
+    };
+    const manager = createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic-router/v1', fetchJson, fetchStream: async () => ({ ok: false }) });
+    await manager.makeRoomFor('synthetic-coder-9b', []);
+    assert.deepEqual(calls, ['loading', 'loaded'], 'refused while loading, unloaded once loaded');
+    assert.equal(states['synthetic-shared-12b'], 'unloaded');
+  }
+  // Refused and gone (400 "not running" after it died): room is made, nothing else is asked.
+  {
+    const states = { 'synthetic-shared-12b': 'loading', 'synthetic-coder-9b': 'unloaded' };
+    const fetchJson = async (url, options = {}) => {
+      const u = new URL(url), method = String(options.method || 'GET').toUpperCase();
+      if (u.pathname === '/models' && method === 'GET') return { ok: true, status: 200, body: { data: Object.entries(states).map(([id, value]) => ({ id, status: { value } })) } };
+      if (u.pathname === '/models/unload') { states['synthetic-shared-12b'] = 'unloaded'; return { ok: false, status: 400, body: { error: { message: 'model is not running' } } }; }
+      return { ok: true, status: 200, body: {} };
+    };
+    const manager = createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic-router/v1', fetchJson, fetchStream: async () => ({ ok: false }) });
+    await manager.makeRoomFor('synthetic-coder-9b', []);
+  }
+  // A loaded (possibly in use) model that refuses still fails as before: only a loading evictee is waited for.
+  {
+    const fetchJson = async (url, options = {}) => {
+      const u = new URL(url), method = String(options.method || 'GET').toUpperCase();
+      if (u.pathname === '/models' && method === 'GET') return { ok: true, status: 200, body: { data: [{ id: 'synthetic-shared-12b', status: { value: 'loaded' } }, { id: 'synthetic-coder-9b', status: { value: 'unloaded' } }] } };
+      if (u.pathname === '/models/unload') return { ok: false, status: 409, body: {} };
+      return { ok: true, status: 200, body: {} };
+    };
+    const manager = createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic-router/v1', fetchJson, fetchStream: async () => ({ ok: false }) });
+    await assert.rejects(manager.makeRoomFor('synthetic-coder-9b', []), /could not be unloaded/);
+  }
+});
+
+test('#1863 D2 a turn stopped during the decision unloads its unused pre-load once loaded', async (t) => {
+  const out = await turn(t, { roles: OWNER, states: ownerStates(), stopDuringDecision: true });
+  assert.equal(out.upstream.length, 0, 'the stopped turn sent nothing');
+  const deadline = Date.now() + 5000;
+  while (!out.engine.unloads.length && Date.now() < deadline) await sleep(50);
+  assert.deepEqual(out.engine.unloads, [{ model: 'synthetic-shared-12b', was: 'loaded' }], 'unloaded after its load finished');
+});
+
+test('#1863 D2 releaseIfUnused leaves the model when another turn is running or it was used', async () => {
+  const engine = router({ 'synthetic-one': 'unloaded' });
+  const p = await startPreload({ manager: engine.manager, model: 'synthetic-one' });
+  await sleep(50); // the load request is out, as it is once a turn ends after its decision
+  assert.equal(await p.releaseIfUnused({ idle: () => false, settleMs: 10 }), false, 'another turn in flight');
+  assert.equal(engine.states['synthetic-one'], 'loaded');
+  assert.deepEqual(engine.unloads, []);
+  const engine2 = router({ 'synthetic-one': 'unloaded' });
+  const q = await startPreload({ manager: engine2.manager, model: 'synthetic-one' });
+  q.use();
+  assert.equal(await q.releaseIfUnused({ idle: () => true, settleMs: 10 }), false, 'the turn used it');
+  assert.deepEqual(engine2.unloads, []);
+});
+
+test('#1863 D3 the code check (project read) is skipped when the roles already rule a pre-load out', () => {
+  let reads = 0;
+  const likelyCode = () => { reads++; return false; };
+  assert.equal(preloadTarget({ roles: TWO, likelyCode }), null);
+  assert.equal(preloadTarget({ roles: { ...ONE, creative: 'synthetic-poet' }, likelyCode }), null);
+  assert.equal(preloadTarget({ roles: ONE, likelyCode }), 'synthetic-one', 'Code unset: nothing to check');
+  assert.equal(reads, 0);
+  assert.equal(preloadTarget({ roles: OWNER, likelyCode }), 'synthetic-shared-12b');
+  assert.equal(reads, 1);
 });

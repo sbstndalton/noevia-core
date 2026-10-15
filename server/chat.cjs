@@ -306,7 +306,16 @@ function createChatHandler({
   // Revoked Skill content in earlier turns (#546): one ledger per handler, cached in memory.
   const skillLedger = skillHistory || require('./skill-history.cjs').createSkillHistory({ fs, path });
   const writesDone = recentWrites || require('./recent-writes.cjs').createRecentWrites();
+  // #1863 D2: chat turns in flight in this process, so an unused pre-load is never unloaded under another turn.
+  let turnsInFlight = 0;
   async function handleChat(req, res, body, authn) {
+    turnsInFlight++;
+    let counted = true;
+    const uncount = () => { if (counted) { counted = false; turnsInFlight--; } };
+    res.once('finish', uncount); res.once('close', uncount);
+    try { return await handleChatTurn(req, res, body, authn); } finally { if (res.writableEnded || res.destroyed) uncount(); }
+  }
+  async function handleChatTurn(req, res, body, authn) {
     let preparation;
     const execution = {};
     if(body?.spaceId==='diary-extras'&&body.recoveryId){
@@ -1039,10 +1048,18 @@ function createChatHandler({
           hasImages: attachedImages.length > 0 || retrievedImages.length > 0 || msgs.some((m) => typeof m.content !== 'string'),
           contextHigh: require('./long-profile.cjs').normalizeProfile(project?.contextProfile) === 'high',
           // The auto-router's own code rule, a project with Code context, or a Task turn: Code may answer.
-          likelyCode: heuristicWantsCode(message) || body.mode === 'cowork' || codeProject(project) });
+          likelyCode: () => heuristicWantsCode(message) || body.mode === 'cowork' || codeProject(project) });
         if (target) routePreload = await preload.startPreload({ manager: modelManager, model: target, signal: chatSignal.signal, busy: engineBusy, log: (line) => console.log(line) });
         // An early answer (an error before the model is used) stops waiting on it; the router's own load goes on.
-        if (routePreload) res.once('finish', () => routePreload.cancel());
+        // #1863 D2: a turn that ends before it uses the pre-load (an error answer, or Stop) unloads it once loaded,
+        // when no other chat turn is running or waiting and the engine is idle.
+        if (routePreload) {
+          const preloaded = routePreload;
+          let ended = false;
+          const onEnd = () => { if (ended) return; ended = true;
+            void preloaded.releaseIfUnused({ idle: () => turnsInFlight === 0 && !(typeof modelManager.inferenceBusy === 'function' && modelManager.inferenceBusy(0)) }); };
+          res.once('finish', onEnd); res.once('close', onEnd);
+        }
       }
       const classification = await classifyFastOrSmart(message); // fail-open inside
       routedRole = typeof classification === 'string' ? classification : classification.role;
@@ -1061,7 +1078,7 @@ function createChatHandler({
       if (routingDecision) routingDecision = { ...routingDecision, effectiveRole: routedRole };
       recordResend(body.resend, { auto: true, role: routedRole, status: routingDecision?.status || null });
       // #1863: a wrong guess (Code, or another model) stops waiting on the pre-load now, so the swap is not held up.
-      if (routePreload && routePreload.model !== model) routePreload.cancel();
+      if (routePreload && routePreload.model !== model) { if (!chatSignal.signal.aborted) routePreload.use(); routePreload.cancel(); } // its makeRoomFor evicts it
     } else if (!model && provider.id === DEFAULT_PROVIDER_ID && modelManager.enabled) {
       // No hardcoded model name: default to whatever the manager reports as loaded.
       try {
@@ -1648,6 +1665,7 @@ function createChatHandler({
       // models so the embedding model can stay beside the chat model; two chat models do not fit).
       // #1863: a pre-load for another model (the turn moved after all) is not needed; one for this model is
       // awaited here (makeRoomFor queues behind it anyway) with the usual loading status.
+      if(routePreload&&!chatSignal.signal.aborted)routePreload.use(); // a stopped turn leaves it to releaseIfUnused
       if(routePreload&&routePreload.model!==model)routePreload.cancel();
       else if(routePreload&&routePreload.pending()){
         const seconds=context.expectedLoadSeconds(model);

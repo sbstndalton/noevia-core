@@ -28,8 +28,9 @@ function preloadTarget({ roles, remoteRole = () => null, hasImages = false, cont
   const model = roles.fast || roles.smart;
   if (!model || (roles.fast && roles.smart && roles.fast !== roles.smart)) return null;
   if (roles.creative && roles.creative !== model) return null;
-  if (roles.code && roles.code !== model && likelyCode) return null;
   for (const role of PRELOAD_ROLES) if (roles[role] && remoteRole(role)) return null;
+  // Last, and only when Code is another model: `likelyCode` may be a function that reads the project (#1863 D3).
+  if (roles.code && roles.code !== model && (typeof likelyCode === 'function' ? likelyCode() : likelyCode)) return null;
   return model;
 }
 
@@ -50,6 +51,10 @@ async function startPreload({ manager, model, signal, busy = () => false, log = 
     // Anything else resident or arriving (a chat model, a decision model on the engine, the embedding model): a
     // load would evict it or contend with it. Skip; the turn's own load decides as before.
     if (rows.some((m) => m.id !== model && (m.loaded || ['loaded', 'loading', 'sleeping'].includes(m.status?.value)))) return null;
+    // This "nothing else loaded" listing is read outside the admission lock, so it can be stale by now. The busy()
+    // re-check is what makes it safe: a load or swap that started since is a pending admission, and a generation in
+    // flight is an active inference, so either makes busy() true and nothing is pre-loaded. (A model that loaded and
+    // went idle in between is evicted by load() exactly as any other load would evict an idle model.)
     if (signal?.aborted || busy()) return null;
     const controller = new AbortController();
     const onAbort = () => controller.abort(signal.reason);
@@ -62,7 +67,36 @@ async function startPreload({ manager, model, signal, busy = () => false, log = 
       .then((r) => { log(`[preload] ${model}: ${r?.ok ? 'ready' : 'not loaded (' + (r?.status || '?') + ')'} after ${Date.now() - started} ms`); return r?.ok === true; },
         () => false)
       .finally(() => { done = true; signal?.removeEventListener('abort', onAbort); });
-    return { model, pending: () => !done, settled, cancel: () => controller.abort(new Error('preload not needed')) };
+    let used = false, released = false;
+    const cancel = () => controller.abort(new Error('preload not needed'));
+    /**
+     * #1863 D2: the turn ended before it used the pre-load (an error, or Stop). Once the engine has finished
+     * loading it, unload it, so it does not sit resident until the idle unload; only when `idle()` says no other
+     * turn is running or waiting and the engine has no other work. Never throws.
+     */
+    const releaseIfUnused = async ({ idle = () => false, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), settleMs = 1000, waitMs = 120000 } = {}) => {
+      if (used || released) return false;
+      released = true;
+      cancel();
+      try {
+        await settled;
+        // The router goes on loading after a cancel: wait (bounded) until it is loaded or gone.
+        const deadline = Date.now() + waitMs;
+        let status = null;
+        for (;;) {
+          await sleep(settleMs);
+          if (used) return false;
+          const listing = await manager.listModels();
+          status = listing?.ok && Array.isArray(listing.body?.data) ? listing.body.data.find((m) => m.id === model)?.status?.value ?? null : null;
+          if (status !== 'loading' || Date.now() >= deadline) break;
+        }
+        if (status !== 'loaded' || used || !idle() || typeof manager.unload !== 'function') return false;
+        const r = await manager.unload(model);
+        log(`[preload] ${model}: unused by its turn, ${r?.ok ? 'unloaded' : 'left loaded'}`);
+        return r?.ok === true;
+      } catch { return false; }
+    };
+    return { model, pending: () => !done, settled, cancel, use: () => { used = true; }, releaseIfUnused };
   } catch {
     return null;
   }
