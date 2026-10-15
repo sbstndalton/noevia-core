@@ -108,7 +108,8 @@ test('#1662 GET /api/models/assignments: admins get options, members a read-only
   assert.deepEqual([by.embedding.model, by.embedding.state], ['nomic-embed-text-v1', 'active']);
   assert.deepEqual(by.embedding.options, [{ model: 'embeddinggemma-2', profile: 'embeddinggemma-2', served: false }], 'the nomic-only sidecar does not serve embeddinggemma-2');
   assert.deepEqual([by.reranker.model, by.reranker.state], ['qwen3-reranker', 'missing']);
-  assert.deepEqual([by.decision.model, by.decision.state], ['laya_multilingual_f16', 'active']);
+  // #1796: the Decision row follows the decision service configuration, not an installed Laya preset.
+  assert.deepEqual([by.decision.model, by.decision.state], [null, 'off']);
   assert.equal(by.ocr.state, 'active');
   assert.equal(by.documents.state, 'off');
   assert.ok(!JSON.stringify(a.body).includes('ocr.invalid'), 'no service address is sent');
@@ -125,7 +126,9 @@ test('assignment helpers', () => {
   const a = modelAssignments({ installed: [], env: { RERANK_MODEL: 'r' } });
   assert.equal(a.services.find((s) => s.id === 'reranker').state, 'off', 'reranking off when the feature is off');
   const d = a.services.find((s) => s.id === 'decision');
-  assert.deepEqual([d.model, d.state], [null, 'missing'], 'a deleted Laya reads missing, not off or running');
+  assert.deepEqual([d.model, d.state], [null, 'off'], '#1796: no decision service configured reads off, whatever is installed');
+  const kev = modelAssignments({ installed: [], env: { COWORK_DECISION_URL: 'http://kev:11435', COWORK_DECISION_MODEL: 'kev-0.8b' } }).services.find((s) => s.id === 'decision');
+  assert.deepEqual([kev.model, kev.state], ['kev-0.8b', 'active']);
   assert.equal(serviceUsing('r', { services: [{ id: 'reranker', model: 'r' }] }), 'reranker');
 });
 

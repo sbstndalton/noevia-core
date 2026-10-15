@@ -10,7 +10,8 @@ const { servesModel } = require('./embedding-served.cjs');
 // embedding model (embedding settings 'set-next') needs it.
 //
 // state ids: 'active' | 'switching' (a re-index to `next` is under way) | 'missing' (the
-// configured model is not installed) | 'off' (the service is not configured or turned off).
+// configured model is not installed) | 'off' (the service is not configured or turned off) |
+// 'unloaded' (#1795: embedding only, the configured model is installed but not loaded).
 // #1668: `managed` marks an embedding service noevia runs itself (embedding-service.cjs): switching
 // loads the model first, and `canTurnOff` offers "Turn embedding off".
 
@@ -29,7 +30,7 @@ const isRerankModel = (m) => (m.labels || []).some((l) => /^rerank/i.test(l)) ||
  *           env: object, embedding: {active?:{model:string,profile:string}|null,next?:{model:string}|null,coverage?:object}|null,
  *           isSystem: (name:string) => boolean, admin: boolean }} input
  */
-function modelAssignments({ installed, env = {}, embedding = null, isSystem = () => false, admin = false, served = null, service = null }) {
+function modelAssignments({ installed, env = {}, embedding = null, isSystem = () => false, admin = false, served = null, service = null, decision = null }) {
   const list = Array.isArray(installed) ? installed : [];
   const byName = new Map(list.map((m) => [m.name, m]));
   const stateOf = (model) => {
@@ -53,7 +54,12 @@ function modelAssignments({ installed, env = {}, embedding = null, isSystem = ()
   const serviceOff = managed && service.enabled === false;
   const embedState = next ? 'switching' : serviceOff ? 'off' : stateOf(active);
   const options = managed ? embedOptions.map((o) => ({ ...o, served: true })) : embedOptions;
-  services.push({ id: 'embedding', model: active, state: !serviceOff && active && active.toLowerCase() === 'default' ? 'active' : embedState,
+  // #1795: the row and the model's card below it read the same fact. A configured embedding model whose
+  // card says it is not loaded (the installed list's `loaded`, which follows the embedding service,
+  // models.cjs) reads "unloaded" here too, never "Running" over an "Unloaded" card.
+  const activeEntry = active ? byName.get(active) : null;
+  const notLoaded = embedState === 'active' && !!activeEntry && !activeEntry.missingFile && !activeEntry.servedElsewhere && activeEntry.loaded === false;
+  services.push({ id: 'embedding', model: active, state: !serviceOff && active && active.toLowerCase() === 'default' ? 'active' : notLoaded ? 'unloaded' : embedState,
     ...(next ? { next, ready: embedding?.coverage?.next?.ready === true } : {}),
     ...(managed ? { managed: true } : {}),
     canChange: admin && !!embedding,
@@ -72,10 +78,13 @@ function modelAssignments({ installed, env = {}, embedding = null, isSystem = ()
   services.push({ id: 'reranker', model: rerank, state: rerankState, canChange: false,
     ...(admin ? { options: teiRerank ? [] : list.filter((m) => !m.missingFile && isRerankModel(m)).map((m) => m.name) } : {}) });
 
-  const laya = list.find((m) => m.system === true || isSystem(m.name));
-  services.push({ id: 'decision', model: laya ? laya.name : null, // #1660 review: Auto always expects a decision model; with Laya deleted it falls back to keeping
-  // those turns on this server, so the row reads "missing", never "off" or "running".
-  state: laya && !laya.missingFile ? 'active' : 'missing', canChange: false });
+  // #1796: the decision service and the sensitivity check are what decision-settings.cjs sends to (the
+  // shared URL from Settings or COWORK_DECISION_URL, with COWORK_DECISION_MODEL), never an installed
+  // preset marked as Laya: that stale entry said laya_multilingual_f16 while every decision went to Kev.
+  const { describeDecision } = require('./decision-settings.cjs');
+  const d = decision || describeDecision(env);
+  services.push({ id: 'decision', model: d.decision.model, state: d.decision.state, canChange: false, ...(admin ? { source: d.decision.source } : {}) });
+  services.push({ id: 'sensitivity', model: d.sensitivity.model, state: d.sensitivity.state, canChange: false, shared: d.sensitivity.shared === true });
 
   services.push({ id: 'ocr', model: null, state: String(env.OCR_BASE_URL || '').trim() ? 'active' : 'off', canChange: false });
   services.push({ id: 'documents', model: null, state: String(env.DOCLING_BASE_URL || '').trim() ? 'active' : 'off', canChange: false });

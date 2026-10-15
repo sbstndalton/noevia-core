@@ -228,6 +228,17 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
         for (const id of b.loaded_model.split(',').map((x) => x.trim()).filter(Boolean)) sidecarLoaded.add(id);
       }
     }
+    // #1795: since #1668 the model manager runs the embedding service itself and reports, under each
+    // model's own name (the alias it serves it as), which ones its router has loaded. That report is the
+    // service's own word; the backend probe above may not list the managed container at all, which left
+    // the in-use embedding model's card "Unloaded" under a "Running" row. A stale report adds nothing.
+    try {
+      const embedService = require('./embedding-service.cjs').current();
+      const st = embedService?.managed() ? embedService.status() : null;
+      if (st && !st.stale && st.enabled !== false && Array.isArray(st.running?.loaded)) {
+        for (const id of st.running.loaded) if (typeof id === 'string' && id) sidecarLoaded.add(id);
+      }
+    } catch { /* no embedding service in this process */ }
     const sidecarUp = (m) => isSidecarModel(m.id || m.model_name, env) && sidecarLoaded.has(m.id || m.model_name);
     const scan = rows.some((m) => m.source === 'preset') ? await folderScanFiles().catch(() => null) : null;
     const degradedScan = rows.some((m) => m.source === 'preset') && !scan;

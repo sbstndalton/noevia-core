@@ -993,7 +993,7 @@ const providerRoutes = require('./routes/providers.cjs').createProviderRoutes({
 });
 // Statistics, the auto-router roles, the model manager proxy and /api/models/* (routes/models.cjs).
 const modelRoutes = require('./routes/models.cjs').createModelRoutes({
-  json, readBody, readJson, fetchJson, env: process.env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe: engineVisionProbe, reportedTokenRate, missingRoles, currentWorkspace, service: modelService, inferenceBudget,
+  json, readBody, readJson, fetchJson, env: process.env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe: engineVisionProbe, reportedTokenRate, missingRoles, currentWorkspace, service: modelService, inferenceBudget, decisionSettings,
 });
 // ── Routing ────────────────────────────────────────────────────────────────
 

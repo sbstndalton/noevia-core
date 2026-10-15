@@ -252,6 +252,7 @@ function settingsStore(db) {
       ? db.prepare("SELECT CASE WHEN typeof(value)='text' AND value IN ('true','false') THEN value ELSE NULL END AS value FROM settings WHERE key=?").get(key)?.value
       : db.prepare('SELECT value FROM settings WHERE key=?').get(key)?.value,
     set: (key, value) => db.prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)').run(key, value),
+    delete: (key) => db.prepare('DELETE FROM settings WHERE key=?').run(key),
   };
 }
 
