@@ -802,7 +802,7 @@ function createProjectRoutes({
       const content = typeof file.content === 'string' ? file.content : '';
       // #1815: a text file that is gone or unreadable is a 404 with its own code, never an empty 200.
       // The source and its pointer are kept; re-uploading or refreshing it writes the text again.
-      if (sourceText.textMissing(file)) return json(res, 404, { error: 'The text of this source is missing. Re-upload or refresh it.', code: 'SOURCE_TEXT_MISSING', name: file.name });
+      if (sourceText.textMissingNow(file)) return json(res, 404, { error: 'The text of this source is missing. Re-upload or refresh it.', code: 'SOURCE_TEXT_MISSING', name: file.name });
       return json(res, 200, { name: file.name, content, chars: content.length });
     }
 

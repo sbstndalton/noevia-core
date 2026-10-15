@@ -21,6 +21,7 @@ process.env.EMBEDDING_BASE_URL = 'http://127.0.0.1:9'; // nothing listens: index
 const sha = (s) => crypto.createHash('sha256').update(s, 'utf8').digest('hex');
 
 let handleRequest;
+const sourceText = require('./source-text.cjs');
 test.after(() => fs.rmSync(testDataDir, { recursive: true, force: true }));
 
 async function request(url, { method = 'GET', headers = {}, body = '' } = {}) {
@@ -58,7 +59,7 @@ function textFile(ref) {
   for (const u of fs.readdirSync(users)) {
     const root = path.join(users, u, 'project-sources');
     if (!fs.existsSync(root)) continue;
-    for (const p of fs.readdirSync(root)) { const f = path.join(root, p, `${ref}.txt`); if (fs.existsSync(f)) return { file: f, projectsJson: path.join(users, u, 'projects.json') }; }
+    for (const p of fs.readdirSync(root)) { const f = path.join(root, p, `${ref}.txt`); if (fs.existsSync(f)) return { file: f, projectsJson: path.join(users, u, 'projects.json'), workspace: path.join(users, u) }; }
   }
   return null;
 }
@@ -76,6 +77,9 @@ test('#1815: a source whose text file is deleted is listed with textMissing and 
   const before = fs.readFileSync(lost.projectsJson, 'utf8');
   fs.rmSync(lost.file);
 
+  // #1818: the list itself does no file check; its first load starts a background scan.
+  await request('/api/workspace', { headers: { cookie } });
+  await sourceText.scanSettled(lost.workspace);
   const listed = JSON.parse((await request('/api/workspace', { headers: { cookie } })).text).projects.find((p) => p.id === id);
   const byName = Object.fromEntries(listed.files.map((f) => [f.name, f]));
   assert.equal(byName['gone.md'].textMissing, true, 'the deleted text is reported');
@@ -92,11 +96,25 @@ test('#1815: a source whose text file is deleted is listed with textMissing and 
   assert.equal(fs.readFileSync(lost.projectsJson, 'utf8'), before, 'projects.json is not rewritten by reading');
   assert.ok(JSON.parse(before).projects.find((p) => p.id === id).files.some((f) => f.textRef === sha(GONE)));
 
-  // The text comes back (a restore): the flag goes away and the text is served again.
+  // The text comes back (a restore): the text is served again (checked on the file), which clears the flag.
   fs.writeFileSync(lost.file, GONE, { mode: 0o600 });
-  const again = JSON.parse((await request('/api/workspace', { headers: { cookie } })).text).projects.find((p) => p.id === id);
-  assert.equal('textMissing' in again.files.find((f) => f.name === 'gone.md'), false);
   const served = await request(textUrl(id, 'gone.md'), { headers: { cookie } });
   assert.deepEqual([served.status, JSON.parse(served.text).content], [200, GONE]);
+  const again = JSON.parse((await request('/api/workspace', { headers: { cookie } })).text).projects.find((p) => p.id === id);
+  assert.equal('textMissing' in again.files.find((f) => f.name === 'gone.md'), false);
 });
 
+
+test('#1818: GET /api/workspace makes no sync stat or access call on any source text', async () => {
+  const texts = Array.from({ length: 20 }, (_, i) => `Synthetic hot-path text ${i} (#1818).`);
+  const created = await request('/api/projects', { method: 'POST', headers: mutation(),
+    body: JSON.stringify({ name: 'Synthetic 1818', files: texts.map((t, i) => ({ name: `${i}.md`, content: t })) }) });
+  assert.equal(created.status, 200, created.text);
+  const orig = { accessSync: fs.accessSync, statSync: fs.statSync, lstatSync: fs.lstatSync, existsSync: fs.existsSync };
+  const hits = [];
+  for (const k of Object.keys(orig)) fs[k] = (p, ...a) => { hits.push([k, String(p)]); return orig[k](p, ...a); };
+  let listed;
+  try { listed = await request('/api/workspace', { headers: { cookie } }); } finally { Object.assign(fs, orig); }
+  assert.equal(listed.status, 200);
+  assert.deepEqual(hits.filter(([k, p]) => k === 'accessSync' || p.includes('project-sources')), [], 'no per-source sync check');
+});
