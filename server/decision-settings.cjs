@@ -113,13 +113,15 @@ function createDecisionSettings({store,env=process.env,fetchImpl=decisionService
   // The backend for every decision purpose except the sensitivity check: route, tool gate, supervision, framing.
   // #1753: the shared COWORK_DECISION_API_KEY belongs to COWORK_DECISION_URL. A URL an administrator saved in
   // Settings gets it only when it is on the same host (the #1745 hostOf rule); another host gets no key.
+  // #1845: an address that comes from an Inference machine is connected to with link-local refused (linkLocal=false), so a
+  // DNS re-point of the machine's name to 169.254.x fails at connect time. The saved URL and env paths keep linkLocal=true.
   function backend() {
     const current=get();
     const config=configuration({COWORK_DECISION_URL:current.url});
     if(config.reason) return null;
     const sameHost=!!hostOf(config.baseUrl) && hostOf(config.baseUrl)===hostOf(env.COWORK_DECISION_URL);
     // #1666: a model chosen in Settings wins; automatic keeps the #1639 rule (modelFor).
-    return backendFor(config.baseUrl,current.model||modelFor(config.baseUrl),sameHost?env.COWORK_DECISION_API_KEY:null,'shared');
+    return backendFor(config.baseUrl,current.model||modelFor(config.baseUrl),sameHost?env.COWORK_DECISION_API_KEY:null,'shared',current.source!=='machine');
   }
   // #1639: the sensitivity check's backend. COWORK_SENSITIVITY_DECISION_URL unset or empty: backend(),
   // as before. Set: that service only (its model COWORK_SENSITIVITY_DECISION_MODEL, unset: Laya), so it
