@@ -16,6 +16,9 @@ const CONNECTORS = [
   { label: 'Google Drive', boxId: 'gdrive', prefix: 'drive_', named: /\bgoogle\s+drive\b|\bmy\s+drive\b|\bthe\s+drive\b/i },
 ];
 const WEB_BOX = 'web-search';
+// #1786: words that make a message about the person's own stored files. Without one (and with no connector named),
+// a message the tool gate judged to need no tool is not a reason to search storage.
+const ABOUT_FILES = /\b(files?|folders?|documents?|docs?|pdfs?|spreadsheets?|sheets?|slides?|notes?|attachments?|uploads?|uploaded|saved|stored|drive|nextcloud|webdav|dav)\b/i;
 const TIME_SENSITIVE = /\b(latest|newest|current(?:ly)?|today|tonight|right now|this (?:week|month|year)|as of|up[- ]to[- ]date|recent(?:ly)?|news|weather|exchange rate|stock price)\b/i;
 
 /**
@@ -28,9 +31,10 @@ const TIME_SENSITIVE = /\b(latest|newest|current(?:ly)?|today|tonight|right now|
  *   Its web note follows the Automatic web rule (tools-mode.cjs automaticBoxesFor), not the wider TIME_SENSITIVE.
  * @param {boolean} [input.localModel]       Automatic only: the answering model is local. Nextcloud is never added
  *   for a cloud model, so that is what the note says then.
+ * @param {boolean} [input.gateNone]         #1786: the tool gate ran on this request and picked no tool.
  * @returns {string} the note for the system text, or '' when none applies
  */
-function toolRouteNotes({ message, offered, onServer, automatic = false, localModel = true }) {
+function toolRouteNotes({ message, offered, onServer, automatic = false, localModel = true, gateNone = false }) {
   const text = typeof message === 'string' ? message : '';
   const on = new Set(offered || []);
   const exists = new Set(onServer || []);
@@ -50,6 +54,12 @@ function toolRouteNotes({ message, offered, onServer, automatic = false, localMo
   if (notes.length && onConnectors.length) {
     notes.push(`Connectors in this chat, and the tools that belong to each: ${onConnectors.map((c) => `${c.label} (${c.prefix}* tools)`).join('; ')}. Tools from one connector do not read another's files.`);
   }
+  // #1786: a storage connector is offered (a connected Drive is on every Automatic turn), the gate picked no tool,
+  // and the message names no connector and does not talk about files. A small model still searched Drive for a QA
+  // tag in a packing-list request and then refused. It keeps the tools (the gate can be wrong), but is told plainly.
+  if (gateNone === true && onConnectors.length && !notes.length && !ABOUT_FILES.test(text)) {
+    notes.push(`This message does not ask about the person's stored files, so answer it directly from what you know: do not search ${onConnectors.map((c) => c.label).join(' or ')} for it. A label, code or ID in the message (such as a ticket number or a test tag) is not a file to look up. Use those tools only if the person asks about a file or folder of theirs.`);
+  }
   const needsWeb = automatic ? require('./tools-mode.cjs').automaticBoxesFor(text).includes(WEB_BOX) : TIME_SENSITIVE.test(text);
   if (!on.has(WEB_BOX) && needsWeb) {
     notes.push(exists.has(WEB_BOX) && !automatic
@@ -61,4 +71,4 @@ function toolRouteNotes({ message, offered, onServer, automatic = false, localMo
   return notes.join(' ');
 }
 
-module.exports = { toolRouteNotes, CONNECTORS, TIME_SENSITIVE };
+module.exports = { toolRouteNotes, CONNECTORS, TIME_SENSITIVE, ABOUT_FILES };

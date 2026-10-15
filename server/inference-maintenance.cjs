@@ -41,6 +41,8 @@ function createMaintenanceGate() {
     holdWhenIdle,
     // Read-only: whether a calibration, auto-tune model or preset write holds the gate (#872).
     held: () => maintenance,
+    // Read-only: inference requests in flight (#1785: the chat title skips a busy engine).
+    active: () => active,
   };
 }
 module.exports={createMaintenanceGate};
