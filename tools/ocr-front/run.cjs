@@ -132,8 +132,11 @@ async function scenario(front, mode, workerBase, fixtures, root, calls) {
     const project = workspace.projects.find(item => item.id === id);
     assert.ok(project, 'synthetic project must be present in its tenant workspace');
     const files = project.files; assert.ok(Array.isArray(files));
-    assert.ok(files.find(file => file.name === 'body.docx')?.content.includes('SYNTHETIC DOCX REF 1271'));
-    assert.ok(files.find(file => file.name === large.path)?.content.includes('SYNTHETIC NATIVE TEXT FOR REDUCTION'));
+    // #1806: the workspace lists sources without their text; each text is read per source.
+    assert.ok(files.every(file => !('content' in file)), 'the workspace carries no source text');
+    const text = async name => (await admin.call('GET', `${route}/sources/text?name=${encodeURIComponent(name)}`)).content;
+    assert.ok(files.some(file => file.name === 'body.docx') && (await text('body.docx')).includes('SYNTHETIC DOCX REF 1271'));
+    assert.ok(files.some(file => file.name === large.path) && (await text(large.path)).includes('SYNTHETIC NATIVE TEXT FOR REDUCTION'));
     const invite = await admin.call('POST', '/api/admin/invitations', { role: 'member' }, 201);
     await member.call('POST', '/api/auth/invitations/accept', { token: invite.token, username: 'synthetic-member', displayName: 'Synthetic Member', password: 'synthetic-member-1271-password', diaryEnabled: false }, 201);
     const before = calls.length;
