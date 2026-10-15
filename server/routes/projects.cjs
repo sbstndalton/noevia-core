@@ -12,7 +12,7 @@
 const IMAGE_MIME = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
 const IMAGE_UPLOAD_CAP = 8 * 1024 * 1024;
 const DOCUMENT_UPLOAD_CAP = 25 * 1024 * 1024;
-const MAX_PROJECT_IMAGES = 12;
+const sourceLimits = require('../source-limits.cjs');
 // Shared with projects.cjs's createProject and the create/edit dialogs (src/project-limits.ts,
 // #398) so a name is capped identically everywhere it can be set.
 const { nameMaxLength: PROJECT_NAME_MAX_LENGTH } = require('../../contracts/project-limits.json');
@@ -251,7 +251,8 @@ function createProjectRoutes({
       const inspected = skills.inspect(file, project);
       if (!inspected?.valid) return json(res, 422, { error: `This skill cannot be used as a project skill: ${inspected?.error || 'no skill frontmatter'}` });
       const files = Array.isArray(project.files) ? project.files : [];
-      if (files.filter((f) => !f.source).length >= 60 && !files.some((f) => f.name === file.name)) return json(res, 409, { error: 'This project already has the maximum of 60 files.' });
+      const full = !files.some((f) => f.name === file.name) && sourceLimits.refusal(files, file.name);
+      if (full) return json(res, 409, { error: full.message, code: full.code });
       project.files = [...files.filter((f) => f.name !== file.name), file];
       if (project.instructionSkills) delete project.instructionSkills[file.name]; // a replaced skill needs review again
       skills.reconcile(project);
@@ -394,7 +395,7 @@ function createProjectRoutes({
         const fromFolders = prevFiles.filter((f) => f && f.source);
         const uploads = patch.files
           .filter((f) => f && typeof f.name === 'string' && typeof f.content === 'string' && !f.source)
-          .slice(0, Math.max(0, 60 - fromFolders.length))
+          .slice(0, Math.max(0, sourceLimits.limits().sources - fromFolders.length))
           .map((f) => {
             const existing = prevFiles.find(p => !p.source && p.name === f.name);
             return existing?.document || existing?.attachment ? existing : {
@@ -549,6 +550,42 @@ function createProjectRoutes({
       } catch (err) { return json(res, err.status || 422, { error: err.status ? err.message : 'Saved document data is unavailable; upload or refresh again.' }); }
     }
 
+    // #1805: plan a folder import. The client sends the folder's manifest (relative path, size,
+    // SHA-256 of each file); the answer says which files will be uploaded, which are unchanged since
+    // the last import (same content at the same path) and which are skipped and why, and opens an
+    // import id that only the accepted paths can be uploaded under. Nothing is written here.
+    const folderPlan = p.match(/^\/api\/projects\/([^/]+)\/folder-import\/plan$/);
+    if (folderPlan && req.method === 'POST') {
+      const id = decodeURIComponent(folderPlan[1]);
+      const project = getProject(id);
+      if (!project) return json(res, 404, { error: 'no such project' });
+      // Never the Diary or a free chat's attachment context: those are not projects a person imports into.
+      if (id === diaryExtras?.PROJECT_ID || (typeof diaryExtras?.internalProject === 'function' && diaryExtras.internalProject(project))) {
+        return json(res, 400, { error: 'Folders can be imported into a project only.' });
+      }
+      let body;
+      try { body = await readJson(req, 4 * 1024 * 1024); }
+      catch (e) { return json(res, e.status === 413 ? 413 : 400, { error: e.status === 413 ? 'That folder lists too many files to import at once.' : 'invalid JSON' }); }
+      if (!isJsonObject(body)) return json(res, 400, { error: 'request body must be a JSON object' });
+      const folderImport = require('../folder-import.cjs');
+      const uploads = require('../uploads.cjs');
+      const connection = authService.getStorage(authn.user.id, true);
+      const remote = storageClient.isBrowsable(connection);
+      const destination = (rel) => {
+        const slash = rel.lastIndexOf('/');
+        const name = rel.slice(slash + 1), folderPath = slash > 0 ? rel.slice(0, slash) : '';
+        if (remote && !project.projectFolder) return '';
+        return uploads.destinationFor(project, name, { connection: remote ? connection : null, folderPath });
+      };
+      const perFileCap = (rel) => (/\.pdf$/i.test(rel) ? require('../pdf-reduce.cjs').INPUT_CAP : uploads.CAP);
+      try {
+        return json(res, 200, folderImport.plan({ userId: authn.user.id, project, entries: body.entries, destination, perFileCap }));
+      } catch (e) {
+        if (e.status === 400 || e.status === 429) return json(res, e.status, { error: e.message });
+        throw e;
+      }
+    }
+
     // Upload a file into the project's own folder. Text and PDFs both land as
     // real files in the user's storage; the sync that follows converts them
     // into sources, so there is exactly one path from a file to a source
@@ -571,8 +608,27 @@ function createProjectRoutes({
       const isText = storageClient.TEXT_EXTENSIONS.has((rawName.slice(rawName.lastIndexOf('.')) || '').toLowerCase());
       if (body.organized === true) {
         const uploads = require('../uploads.cjs');
-        const inputName = String(body.name || '');
+        let inputName = String(body.name || '');
         const inputBytes = Buffer.from(String(body.dataBase64 || ''), 'base64');
+        // #1805: a file of a folder import carries its path inside the folder and the import's id.
+        // Only a path that import's plan accepted is taken (the caps hold here, not only in the
+        // browser); it is stored under that path inside its type group, and an unchanged file
+        // (same content hash at the same path) is left as it is.
+        const folderImport = body.relativePath === undefined ? null : require('../folder-import.cjs');
+        let folderPath = '', importRel = '';
+        if (folderImport) {
+          try { importRel = folderImport.relativePath(body.relativePath); }
+          catch (e) { return json(res, 400, { error: e.message, code: 'invalidPath' }); }
+          const why = folderImport.skipReason(importRel);
+          if (why) return json(res, 400, { error: folderImport.REASONS[why.code], code: why.code });
+          // The ticket holds the size the plan accepted for this path and the import's running byte
+          // total, so a manifest that declared 1 byte cannot carry a 60 MB body past the caps.
+          const refused = folderImport.admit(body.importId, authn.user.id, id, importRel, inputBytes.length);
+          if (refused) return json(res, refused.status, { error: refused.error, code: refused.code });
+          const slash = importRel.lastIndexOf('/');
+          inputName = importRel.slice(slash + 1);
+          folderPath = slash > 0 ? importRel.slice(0, slash) : '';
+        }
         // Validate the filename before contacting the document processor.
         uploads.validate(inputName, inputBytes.subarray(0,1));
         return await withSourceLock(project, async () => {
@@ -581,10 +637,22 @@ function createProjectRoutes({
           const connection = authService.getStorage(authn.user.id, true);
           const remote = storageClient.isBrowsable(connection) ? connection : null;
           const progress = requestScope.getStore()?.sourceProgress || (() => {});
-          const replace = body.replace === true;
+          // A folder import updates the file at its path: re-importing a folder never makes a "(2)" copy.
+          const replace = body.replace === true || !!folderImport;
           // #1454: refuse before any work when the name is taken; checked again for a reduced file's new name.
-          const exists = (n) => (project.files || []).some(f => f.name === (remote && project.projectFolder ? uploads.destinationFor(project, n, { connection: remote }) : remote ? null : n));
+          const destinationOf = (n) => (remote && project.projectFolder ? uploads.destinationFor(project, n, { connection: remote, folderPath }) : remote ? null : uploads.destinationFor(project, n, { folderPath }));
+          const exists = (n) => (project.files || []).some(f => f.name === destinationOf(n));
           if (!replace && exists(inputName)) return sourceExistsReply(res, inputName);
+          if (folderImport) {
+            const dest = destinationOf(inputName);
+            const clash = dest && (project.files || []).find(f => f.name !== dest && folderImport.foldKey(f.name) === folderImport.foldKey(dest));
+            if (clash) return json(res, 409, { error: folderImport.REASONS.caseCollision, code: 'caseCollision', existing: clash.name });
+            const previous = (project.files || []).find(f => f.name === dest);
+            if (previous?.attachment?.id && previous.attachment.id === require('node:crypto').createHash('sha256').update(inputBytes).digest('hex')) {
+              folderImport.consume(body.importId, importRel, inputBytes.length);
+              return json(res, 200, { name: inputName, path: previous.name, bytes: inputBytes.length, unchanged: true, attachment: previous.attachment, document: previous.document });
+            }
+          }
           const {name,bytes,reduction} = await require('../pdf-reduce.cjs').prepare(inputName,inputBytes,{progress});
           uploads.validate(name,bytes);
           if (!replace && name !== inputName && exists(name)) return sourceExistsReply(res, name);
@@ -598,10 +666,13 @@ function createProjectRoutes({
           // #1664: filled by ingest only after a create-only write; any failure before the record is
           // saved removes that file again (conditional on its ETag), so a retry is not a 409 / "(2)".
           const created = {};
-          try { file = await uploads.ingest(currentWorkspace(), project, name, bytes, { connection: remote, progress, ...(remote && !replace ? { ifNoneMatch: '*', created } : {}) }); }
+          try { file = await uploads.ingest(currentWorkspace(), project, name, bytes, { connection: remote, progress, folderPath, ...(remote && !replace ? { ifNoneMatch: '*', created } : {}) }); }
           catch (e) {
             if (!replace && remote && pathTaken(e)) return sourceExistsReply(res, name);
-            if (replyStorageFailure(res, storageClient.storageFailure?.(e))) return; throw e;
+            if (replyStorageFailure(res, storageClient.storageFailure?.(e))) return;
+            // A project limit (source-limits.cjs) is the person's answer, with its code, not a server error.
+            if (e && e.status === 400 && e.code) return json(res, 400, { error: e.message, code: e.code });
+            throw e;
           }
           let recorded = false;
           const filesBefore = project.files;
@@ -616,6 +687,7 @@ function createProjectRoutes({
             defaultProjectDocs(project, hadUploads);
             saveProjects(PROJECTS);
             recorded = true;
+            if (folderImport) folderImport.consume(body.importId, importRel, inputBytes.length);
           } finally {
             // The unsaved record goes with the file, so the retry is not refused as a same-name source.
             if (!recorded && created.etag && (await uploads.discardCreated(created)).deleted && project.files !== filesBefore) project.files = filesBefore;
@@ -781,8 +853,8 @@ function createProjectRoutes({
         return json(res, 413, { error: `That image is ${Math.round(bytes.length / 1024)} KB, over the ${Math.round(IMAGE_UPLOAD_CAP / (1024 * 1024))} MB limit.` });
       }
       const assets = Array.isArray(project.assets) ? project.assets : [];
-      if (assets.length >= MAX_PROJECT_IMAGES) {
-        return json(res, 400, { error: `A project holds at most ${MAX_PROJECT_IMAGES} images.` });
+      if (assets.length >= sourceLimits.limits().images) {
+        return json(res, 400, { error: `A project holds at most ${sourceLimits.limits().images} images.` });
       }
       const assetId = `img-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
       currentWorkspace().assertActive?.();
@@ -839,7 +911,8 @@ function createProjectRoutes({
         const connection = authService.getStorage(authn.user.id, true);
         const fromFolders = [];
         const skipped = [];
-        const LIMIT_REASON = '60-source project limit reached; this file was not read.';
+        const SOURCE_LIMIT = sourceLimits.limits().sources;
+        const LIMIT_REASON = `${SOURCE_LIMIT}-source project limit reached; this file was not read.`;
         if (storageClient.isBrowsable(connection) && (project.assets || []).some(a => !a.sourceName)) {
           if (!project.projectFolder) project.projectFolder = await ensureProjectFolder(project);
           if (project.projectFolder) {
@@ -862,8 +935,12 @@ function createProjectRoutes({
         if (folders.length && !storageClient.isBrowsable(connection)) return json(res, 400, { error: 'no browsable storage connection is configured' });
         // Room left for the folders being re-read: every source that is NOT
         // from one of them (uploads, images just moved into storage, files of
-        // other attached folders) stays, so it counts against the 60 cap.
-        const sourceLimit = Math.max(0, 60 - (project.files || []).filter(f => !f.source || !folders.includes(f.source)).length);
+        // other attached folders) stays, so it counts against the source limit (and documents against theirs).
+        const kept = (project.files || []).filter(f => !f.source || !folders.includes(f.source));
+        const sourceLimit = Math.max(0, SOURCE_LIMIT - kept.length);
+        const DOCUMENT_LIMIT = sourceLimits.limits().documents;
+        const documentRoom = Math.max(0, DOCUMENT_LIMIT - sourceLimits.counts(kept).documents);
+        let documentsRead = 0;
 
         // #1429: a refused or throttled login stops every further storage call in this refresh; the
         // rest of the folders and files keep what they had and say why, with no more attempts made.
@@ -881,9 +958,28 @@ function createProjectRoutes({
             skipped.push({ folder, reason: halted.reason, code: halted.code, retained: previous.some(f => !!f.content) });
             continue;
           }
+          // #1805: every subfolder is read, not only the top level: breadth-first, skipping the shared
+          // system/hidden names (contracts/folder-import.json), bounded by depth and folder count, and
+          // leaving a subfolder that is itself attached to its own entry so no file is synced twice.
+          // A subfolder whose listing fails keeps its previous sources and says so. The source limit
+          // below still bounds what is read.
+          const folderImport = require('../folder-import.cjs');
           let entries;
           try {
-            entries = await storageClient.listFiles(connection, folder);
+            const tree = await folderImport.listTree((dir) => (halted ? Promise.reject(new Error(halted.reason)) : storageClient.listFiles(connection, dir)), folder, {
+              exclude: new Set(folders.filter((other) => other !== folder && other.startsWith(`${folder}/`))),
+              onDirError: (dir, err) => {
+                haltFor(err);
+                fromFolders.push(...(project.files || []).filter(f => f.source === folder && f.name.startsWith(dir + '/')));
+                skipped.push({ folder, file: dir, reason: halted ? halted.reason : 'Could not read this subfolder; previous sources retained.', code: halted ? halted.code : storageCode(err), retained: true });
+              },
+            });
+            entries = tree.files;
+            for (const cut of tree.limited) {
+              fromFolders.push(...(project.files || []).filter(f => f.source === folder && f.name.startsWith(cut.path + '/')));
+              skipped.push({ folder, file: cut.path, code: cut.code, retained: true,
+                reason: cut.code === 'depthLimit' ? `Folders more than ${folderImport.contract.maxDepth} levels deep are not read.` : `Only the first ${folderImport.contract.maxFolders} subfolders are read.` });
+            }
             storageLatch.clear(authn.user.id);
           } catch (e) {
             haltFor(e);
@@ -893,16 +989,7 @@ function createProjectRoutes({
             skipped.push({ folder, reason, code: storageCode(e), retained: previous.some(f => !!f.content) });
             continue;
           }
-          if (folder === project.projectFolder) {
-            for (const entry of [...entries]) {
-              if (entry.isDir && require('../uploads.cjs').GROUPS.includes(entry.name)) {
-                try { entries.push(...await storageClient.listFiles(connection, entry.path)); }
-                catch (err) { haltFor(err); fromFolders.push(...(project.files || []).filter(f => f.source === folder && f.name.startsWith(entry.path + '/'))); skipped.push({ folder, file: entry.path, reason: 'Could not refresh this category; previous sources retained.', retained: true }); }
-              }
-            }
-          }
           for (const entry of entries) {
-            if (entry.isDir) continue; // one level: recursing could pull a whole drive in
             const ext = (entry.ext || '').toLowerCase();
             const isText = storageClient.TEXT_EXTENSIONS.has(ext);
             const isDoc = documents.isDocument(entry.name);
@@ -910,6 +997,10 @@ function createProjectRoutes({
             const managed = folder === project.projectFolder && require('../uploads.cjs').GROUPS.some(g => entry.path.startsWith(`${folder}/${g}/`));
             if (!isText && !isDoc && !isDocx && !managed) continue;
             if (fromFolders.length >= sourceLimit) { skipped.push({ folder, file: entry.path, reason: LIMIT_REASON, code: 'limit', retained: false }); continue; } // a cap, so one big folder cannot blow up a project
+            if ((isDoc || isDocx || (managed && sourceLimits.kindOf(entry.name) === 'document')) && documentsRead >= documentRoom) {
+              skipped.push({ folder, file: entry.path, reason: `${DOCUMENT_LIMIT}-document project limit reached; this file was not read.`, code: 'documentLimit', retained: false }); continue;
+            }
+            if (isDoc || isDocx || (managed && sourceLimits.kindOf(entry.name) === 'document')) documentsRead += 1;
             const previous = (project.files || []).find((f) => f.source === folder && f.name === entry.path);
             if (halted) {
               if (isDoc) fromFolders.push({ ...documentSources.failed(previous, entry.path, halted.reason), source: folder });
@@ -953,7 +1044,7 @@ function createProjectRoutes({
         const synced = fromFolders.filter((f) => currentFolders.has(f.source));
         // Existing uploads and other folders' sources are never dropped here;
         // only newly synced files beyond the cap are, and each is reported.
-        const room = Math.max(0, 60 - uploaded.length - untouched.length);
+        const room = Math.max(0, SOURCE_LIMIT - uploaded.length - untouched.length);
         for (const f of synced.slice(room)) skipped.push({ folder: f.source, file: f.name, reason: LIMIT_REASON, code: 'limit', retained: false });
         project.files = [...uploaded, ...untouched, ...synced.slice(0, room)];
         require('../uploads.cjs').prune(currentWorkspace(), project);
@@ -998,4 +1089,4 @@ function createProjectRoutes({
   };
 }
 
-module.exports = { createProjectRoutes, DOCUMENT_UPLOAD_CAP, IMAGE_UPLOAD_CAP, IMAGE_MIME, MAX_PROJECT_IMAGES };
+module.exports = { createProjectRoutes, DOCUMENT_UPLOAD_CAP, IMAGE_UPLOAD_CAP, IMAGE_MIME, get MAX_PROJECT_IMAGES() { return sourceLimits.limits().images; } };
