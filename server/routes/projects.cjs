@@ -13,6 +13,7 @@ const IMAGE_MIME = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif'
 const IMAGE_UPLOAD_CAP = 8 * 1024 * 1024;
 const DOCUMENT_UPLOAD_CAP = 25 * 1024 * 1024;
 const sourceLimits = require('../source-limits.cjs');
+const sourceText = require('../source-text.cjs');
 // Shared with projects.cjs's createProject and the create/edit dialogs (src/project-limits.ts,
 // #398) so a name is capped identically everywhere it can be set.
 const { nameMaxLength: PROJECT_NAME_MAX_LENGTH } = require('../../contracts/project-limits.json');
@@ -393,11 +394,16 @@ function createProjectRoutes({
         // folder-derived ones would silently detach every synced source (or,
         // if the client echoed them back with empty content, blank them).
         const fromFolders = prevFiles.filter((f) => f && f.source);
+        // #1806: the client lists sources without their text (GET /api/workspace sends metadata
+        // only), so an entry with no `content` names an upload this project already holds, kept as
+        // it is; an entry with no `content` and no such upload is dropped.
         const uploads = patch.files
-          .filter((f) => f && typeof f.name === 'string' && typeof f.content === 'string' && !f.source)
+          .filter((f) => f && typeof f.name === 'string' && !f.source && (typeof f.content === 'string'
+            || (f.content === undefined && prevFiles.some(p => !p.source && p.name === f.name))))
           .slice(0, Math.max(0, sourceLimits.limits().sources - fromFolders.length))
           .map((f) => {
             const existing = prevFiles.find(p => !p.source && p.name === f.name);
+            if (f.content === undefined) return existing;
             return existing?.document || existing?.attachment ? existing : {
               name: f.name.slice(0, 200), content: f.content.slice(0, 200000),
               // Preserve published provenance only while the exact copied bytes survive.
@@ -416,7 +422,7 @@ function createProjectRoutes({
         }
         for (const next of project.files) {
           const prev = prevByName.get(next.name);
-          if (!prev || prev.content !== next.content) {
+          if (!prev || !sourceText.sameText(prev, next)) {
             indexSource(project, next);
           }
         }
@@ -776,6 +782,23 @@ function createProjectRoutes({
     // from the user's storage, not merely from the project, so it is confined
     // to the project's OWN folder: a source pulled from a folder the user
     // attached for reading must never be deletable from here.
+    // #1806: one source's text, on demand. Lists (GET /api/workspace) carry metadata only. The same
+    // scope as every project route: the signed-in user's own workspace, and only a project the
+    // workspace list shows (never an internal one); an unknown project or source is a 404.
+    const sourceTextRoute = p.match(/^\/api\/projects\/([^/]+)\/sources\/text$/);
+    if (sourceTextRoute && req.method === 'GET') {
+      const id = decodeURIComponent(sourceTextRoute[1]);
+      const project = getProject(id);
+      const internal = !!project && (typeof diaryExtras?.internalProject === 'function' && diaryExtras.internalProject(project));
+      if (!project || internal) return json(res, 404, { error: 'no such project' });
+      const name = url.searchParams.get('name');
+      if (!name) return json(res, 400, { error: 'a source name is required' });
+      const file = (project.files || []).find((f) => f && f.name === name);
+      if (!file) return json(res, 404, { error: 'no such source' });
+      const content = typeof file.content === 'string' ? file.content : '';
+      return json(res, 200, { name: file.name, content, chars: content.length });
+    }
+
     const projFileDel = p.match(/^\/api\/projects\/([^/]+)\/files$/);
     if (projFileDel && req.method === 'DELETE') {
       const id = decodeURIComponent(projFileDel[1]);
@@ -955,7 +978,7 @@ function createProjectRoutes({
           if (halted) {
             const previous = (project.files || []).filter(f => f.source === folder);
             fromFolders.push(...previous.map(f => documents.isDocument(f.name) ? { ...documentSources.failed(f, f.name, halted.reason), source: folder } : f));
-            skipped.push({ folder, reason: halted.reason, code: halted.code, retained: previous.some(f => !!f.content) });
+            skipped.push({ folder, reason: halted.reason, code: halted.code, retained: previous.some(f => sourceText.textLength(f) > 0) });
             continue;
           }
           // #1805: every subfolder is read, not only the top level: breadth-first, skipping the shared
@@ -986,7 +1009,7 @@ function createProjectRoutes({
             const reason = storageReason(e, 'could not list folder');
             const previous = (project.files || []).filter(f => f.source === folder);
             fromFolders.push(...previous.map(f => documents.isDocument(f.name) ? { ...documentSources.failed(f, f.name, reason), source: folder } : f));
-            skipped.push({ folder, reason, code: storageCode(e), retained: previous.some(f => !!f.content) });
+            skipped.push({ folder, reason, code: storageCode(e), retained: previous.some(f => sourceText.textLength(f) > 0) });
             continue;
           }
           for (const entry of entries) {
@@ -1005,7 +1028,7 @@ function createProjectRoutes({
             if (halted) {
               if (isDoc) fromFolders.push({ ...documentSources.failed(previous, entry.path, halted.reason), source: folder });
               else if (previous) fromFolders.push(previous);
-              skipped.push({ folder, file: entry.path, reason: halted.reason, code: halted.code, retained: !!previous?.content });
+              skipped.push({ folder, file: entry.path, reason: halted.reason, code: halted.code, retained: !!previous && sourceText.textLength(previous) > 0 });
               continue;
             }
             try {
@@ -1030,7 +1053,7 @@ function createProjectRoutes({
               const reason = storageReason(e, 'could not read');
               if (isDoc) fromFolders.push({ ...documentSources.failed(previous, entry.path, reason), source: folder });
               else if (previous) fromFolders.push(previous);
-              skipped.push({ folder, file: entry.path, reason, code: storageCode(e), retained: !!previous?.content });
+              skipped.push({ folder, file: entry.path, reason, code: storageCode(e), retained: !!previous && sourceText.textLength(previous) > 0 });
             }
           }
         }
@@ -1060,12 +1083,12 @@ function createProjectRoutes({
         }
         for (const next of project.files) {
           const before = prevByName.get(next.name);
-          if (!before || before.content !== next.content || (next.document && ['pending', 'failed', 'unavailable', 'partial'].includes(next.document.indexing))) {
+          if (!before || !sourceText.sameText(before, next) || (next.document && ['pending', 'failed', 'unavailable', 'partial'].includes(next.document.indexing))) {
             indexSource(project, next);
           }
         }
         return json(res, 200, {
-          files: project.files.map((f) => ({ name: f.name, source: f.source || null, bytes: f.content.length, document: f.document })),
+          files: project.files.map((f) => ({ name: f.name, source: f.source || null, bytes: sourceText.textLength(f), document: f.document })),
           skipped,
         });
       });

@@ -340,8 +340,9 @@ function createProjectsFile(file, { atomicJson, warn = console.warn, lock = with
       state.stamp = read.stamp;
       return true;
     },
-    /** saveProjects: the merge, written under the lock. */
-    save(localArray) {
+    /** saveProjects: the merge, written under the lock. `afterWrite(result)` runs still holding it
+     *  (#1806: the source-text collection, so it sees exactly what was written). */
+    save(localArray, afterWrite = null) {
       lock(file, () => {
         const read = readProjectsFile(file);
         if (read.corrupt) {
@@ -354,6 +355,7 @@ function createProjectsFile(file, { atomicJson, warn = console.warn, lock = with
         }
         rebase(localArray);
         state.stamp = stampOf(statOrNull(file));
+        if (afterWrite) afterWrite(localArray);
       });
     },
   };

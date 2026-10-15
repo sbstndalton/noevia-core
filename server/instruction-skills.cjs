@@ -1,5 +1,6 @@
 'use strict';
 const crypto = require('node:crypto');
+const sourceText = require('./source-text.cjs');
 const { formatSkillIndex } = require('./skill-index.cjs');
 const MAX_BODY = 32768;
 const hash = content => crypto.createHash('sha256').update(String(content || '')).digest('hex');
@@ -8,12 +9,20 @@ const owns = (obj, key) => Object.prototype.hasOwnProperty.call(obj || {}, key);
 function isFrontMatterSkill(file, header) {
   return /(?:^|\/)SKILL\.md$/i.test(file.name) || (!!header && /^(?:name|description)\s*:/im.test(header[1]));
 }
+// #1806: whether a file is a skill candidate by its name or front matter. A source whose text is in
+// its own file (source-text.cjs) answers from its saved `skillHeader` flag, so neither a save
+// (reconcile) nor the per-turn source list reads every source's text; noevia-rs
+// crates/server-projects skills.rs applies the same rule to projects.json.
+function looksLikeSkill(file) {
+  if (sourceText.isExternal(file)) return /(?:^|\/)SKILL\.md$/i.test(file.name) || file.skillHeader === true;
+  return isFrontMatterSkill(file, /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(String(file.content || '')));
+}
 
 function inspect(file, project = {}) {
+  const candidate = looksLikeSkill(file) || owns(project.instructionSkills, file.name);
+  if (!candidate) return null;
   const content = String(file.content || '');
   const header = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(content);
-  const candidate = isFrontMatterSkill(file, header) || owns(project.instructionSkills, file.name);
-  if (!candidate) return null;
   const result = { file: file.name, hash: hash(content), content, valid: false, error: '', name: '', description: '', version: '', requires: [] };
   try {
     if (!/\.md$/i.test(file.name)) throw Error('Instruction skills must be Markdown files.');
@@ -194,14 +203,12 @@ function reconcile(project) {
   const before = JSON.stringify(project.instructionSkills || {});
   const next = Object.create(null);
   for (const file of project.files || []) {
-    const content = String(file.content || '');
-    const header = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(content);
     const existing = owns(project.instructionSkills, file.name) ? project.instructionSkills[file.name] : null;
     // Keep tracking a file that structurally still looks like a skill, or one that was
     // already confirmed (reviewed/enabled at least once). A file only ever auto-flagged
     // as a candidate by the (now-corrected) front-matter test, and never confirmed, is
     // released here if it no longer matches - this undoes stale mis-detections.
-    if (isFrontMatterSkill(file, header) || existing?.reviewedHash) next[file.name] = existing || { enabled: false, reviewedHash: null };
+    if (looksLikeSkill(file) || existing?.reviewedHash) next[file.name] = existing || { enabled: false, reviewedHash: null };
   }
   project.instructionSkills = next;
   return before !== JSON.stringify(next);
@@ -239,5 +246,12 @@ function read(project, file, current = project, offset = 0, cap = 8000) {
   const full = offset === 0 && end === file.content.length;
   return `${full ? 'Loaded instruction skill ' : prefix}${heading}${file.content.slice(offset, end)}${end < file.content.length ? suffix + end + '.' : ''}`;
 }
-function snapshot(project) { return structuredClone(project); }
+// #1806: a source whose text is in its own file is copied as metadata that still reads the text
+// on demand (the text file never changes), so pinning a turn's project does not read every source.
+function snapshot(project) {
+  if (!project || !Array.isArray(project.files)) return structuredClone(project);
+  const copy = structuredClone({ ...project, files: [] });
+  copy.files = project.files.map((f) => sourceText.cloneFile(f));
+  return copy;
+}
 module.exports = { snapshot, inspect, list, listForClient, enabled, sources, reconcile, setSelection, read, hash, skillId, manifests, assets, resolve, parsePin, resolvePinned, unmetRequirements, revoked, pinActive, MAX_BODY };

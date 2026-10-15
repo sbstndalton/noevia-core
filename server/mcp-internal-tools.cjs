@@ -141,7 +141,8 @@ function createInternalTools(ports) {
         if (!files.length) return 'This project has no files attached.';
         return clip('Pass a name exactly as shown (or just its file name, when unique) to project_read_file.\n' + files.map((f) => {
           const kind = f.source ? `from folder ${f.source}` : f.document ? 'document' : 'text';
-          const size = typeof f.content === 'string' ? `${f.content.length} chars` : 'no readable text';
+          // #1806: the saved length of a text in its own file; the text is not read to list it.
+          const size = require('./source-text.cjs').isExternal(f) || typeof f.content === 'string' ? `${require('./source-text.cjs').textLength(f)} chars` : 'no readable text';
           return `${f.name} — ${kind}, ${size}`;
         }).join('\n'));
       },

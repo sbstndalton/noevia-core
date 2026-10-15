@@ -490,6 +490,13 @@ async function createTestProject(name, extra = {}) {
   return JSON.parse(result.text);
 }
 
+// #1806: GET /api/workspace lists sources without their text; this reads one source's text.
+async function sourceText(projectId, name) {
+  const r = await request(`/api/projects/${encodeURIComponent(projectId)}/sources/text?name=${encodeURIComponent(name)}`, { headers: { cookie } });
+  assert.equal(r.status, 200, r.text);
+  return JSON.parse(r.text).content;
+}
+
 async function workspaceProject(id) {
   const result = await request('/api/workspace', { headers: { cookie } });
   return JSON.parse(result.text).projects.find((p) => p.id === id);
@@ -619,7 +626,7 @@ test('DAV HTTP listing failures retain attached project sources and cached origi
       listingStatuses.set(folder, status); deleted.length = 0;
       const result = await sync();
       assert.deepEqual((await workspaceProject(project.id)).files, before.files, `HTTP ${status} at ${folder} must retain exact sources`);
-      assert.deepEqual(result.files.map(f => [f.name, f.bytes]), before.files.map(f => [f.name, f.content.length]));
+      assert.deepEqual(result.files.map(f => [f.name, f.bytes]), before.files.map(f => [f.name, f.chars]));
       assert.deepEqual((await workspaceProject(project.id)).sourceFolders, before.sourceFolders);
       assert.ok(result.skipped.some(s => (s.folder === folder || s.file === folder) && s.retained === true));
       assert.deepEqual(deleted, [], 'failed listing must not delete RAG entries');
@@ -628,7 +635,7 @@ test('DAV HTTP listing failures retain attached project sources and cached origi
     }
     bodies[original.name] = 'recovered remote bytes';
     const recovered = await sync(); assert.deepEqual(recovered.skipped, []);
-    assert.equal((await workspaceProject(project.id)).files.find(f => f.name === original.name).content, 'recovered remote bytes');
+    assert.equal(await sourceText(project.id, original.name), 'recovered remote bytes');
     tree.SyntheticLinked = []; deleted.length = 0;
     const empty = await sync(); assert.deepEqual(empty.skipped, []);
     const afterEmpty = await workspaceProject(project.id);
@@ -660,7 +667,7 @@ test('uploads work without remote storage and gain a folder after connecting it'
     assert.equal(project.projectFolder, undefined);
     const result = await request(`/api/projects/${project.id}/upload`, { method: 'POST', headers: mutationHeaders(), body: JSON.stringify({ name: 'local.txt', dataBase64: Buffer.from('local knowledge').toString('base64') }) });
     assert.equal(result.status, 200, result.text);
-    assert.equal((await workspaceProject(project.id)).files[0].content, 'local knowledge');
+    assert.equal(await sourceText(project.id, (await workspaceProject(project.id)).files[0].name), 'local knowledge');
   } finally { client.isBrowsable = browsable; }
   const result = await request(`/api/projects/${project.id}/upload`, { method: 'POST', headers: mutationHeaders(), body: JSON.stringify({ name: 'remote.txt', dataBase64: Buffer.from('remote knowledge').toString('base64') }) });
   assert.equal(result.status, 200, result.text);
@@ -707,7 +714,9 @@ test('an in-flight sync preserves concurrent uploads and does not restore detach
     await config({ sourceFolders: [], files: [{ name: 'during.txt', content: 'uploaded while syncing' }] });
     release();
     assert.equal((await syncing).status, 200);
-    assert.deepEqual((await workspaceProject(project.id)).files, [{ name: 'during.txt', content: 'uploaded while syncing' }]);
+    const files = (await workspaceProject(project.id)).files;
+    assert.deepEqual(files.map((f) => [f.name, f.chars, 'content' in f]), [['during.txt', 'uploaded while syncing'.length, false]]);
+    assert.equal(await sourceText(project.id, 'during.txt'), 'uploaded while syncing');
   } finally { release(); client.listFiles = list; }
 });
 
@@ -719,6 +728,13 @@ test('base64 overhead does not reject images below the advertised 8 MB cap', asy
 });
 
 test('folder sync counts other sources against the 60 cap and reports every file it leaves out', async () => {
+  // #1806 raised the default to 1000; the counting is the same at any cap.
+  const savedLimit = process.env.PROJECT_SOURCE_LIMIT;
+  process.env.PROJECT_SOURCE_LIMIT = '60';
+  try { await sourceCapCase(); } finally { if (savedLimit === undefined) delete process.env.PROJECT_SOURCE_LIMIT; else process.env.PROJECT_SOURCE_LIMIT = savedLimit; }
+});
+
+async function sourceCapCase() {
   const project = await createTestProject('Source cap');
   const uploads = Array.from({ length: 10 }, (_, i) => ({ name: `upload-${i}.txt`, content: `upload ${i}` }));
   await request(`/api/projects/${project.id}/config`, { method: 'POST', headers: mutationHeaders(), body: JSON.stringify({ files: uploads, sourceFolders: ['Synthetic/A', 'Synthetic/B'] }) });
@@ -771,7 +787,7 @@ test('folder sync counts other sources against the 60 cap and reports every file
     assert.ok(deleted.every((n) => !kept.has(n)));
     assert.equal(first.files.length, 60);
   } finally { release?.(); client.listFiles = saved.list; client.readTextFile = saved.read; rag.deleteProjectFile = saved.del; }
-});
+}
 
 // ── #845: S3 listing decoding and pagination (mocked fetch) ──────────────────
 

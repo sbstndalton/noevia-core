@@ -1341,6 +1341,9 @@ if (require.main === module) {
   process.on('unhandledRejection', (reason) => {
     console.error('[noevia] unhandled promise rejection:', reason?.stack || reason);
   });
+  // #1806: inline source text moves to per-source files before the first request (workspace.cjs).
+  try { workspaceStore.migrateSourceText(authService.listUsers().map((u) => u.id)); }
+  catch (e) { console.warn('[sources] startup migration skipped:', e?.message || e); }
   server.listen(PORT, HOST, () => {
     processReady = true;
     console.log(`cowork-ui listening on http://${HOST}:${PORT} (inference: ${INFERENCE_BASE}, manager: ${modelManager.kind}, diary: ${DIARY_BASE}, mcp: ${mcpWiring.enabled() ? MCP_SERVERS.map((sv) => sv.id).join('+') : 'disabled'})`);
