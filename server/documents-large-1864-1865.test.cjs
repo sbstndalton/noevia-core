@@ -394,6 +394,27 @@ test('#1871: one sync spends at most its OCR budget across documents; the rest c
   assert.equal(ocr.calls.reduce((n, x) => n + x.pages.length, 0), 4);
 });
 
+test('#1878: pages the OCR budget defers are logged as counts only, one line per document', async () => {
+  const ocr = fakeOcr(() => 'SYN-OCR');
+  const budget = documents.ocrBudget({ PROJECT_SYNC_OCR_PAGES: '3' });
+  const deps = (b) => docling(fakeDocling({ total: 2, degraded: [1, 2] }), { ocrEnabled: true, extractPages: ocr.extractPages, ocrBudget: b });
+  const lines = [];
+  const orig = console.log; console.log = (...a) => lines.push(a.join(' '));
+  const before = { ...documents.ocrDeferrals };
+  try {
+    await documents.extractDocumentText('QA-SYNTH-secret-a.pdf', syntheticPdf({ pages: 2 }), deps(budget));
+    await documents.extractDocumentText('QA-SYNTH-secret-b.pdf', syntheticPdf({ pages: 2 }), deps(budget));
+    await documents.extractDocumentText('QA-SYNTH-secret-c.pdf', syntheticPdf({ pages: 2 }), deps(budget));
+  } finally { console.log = orig; }
+  const mine = lines.filter((l) => l.includes('OCR budget deferred'));
+  assert.equal(mine.length, 2, 'b (one page) and c (two pages) were deferred; a was not');
+  assert.match(mine[0], /pagesDeferred=1 documentsDeferred=1 syncPagesDeferred=1 syncDocumentsDeferred=1/);
+  assert.match(mine[1], /pagesDeferred=2 documentsDeferred=1 syncPagesDeferred=3 syncDocumentsDeferred=2/);
+  for (const l of mine) assert.doesNotMatch(l, /QA-SYNTH|\.pdf|SYN-OCR/);
+  assert.equal(documents.ocrDeferrals.pages - before.pages, 3);
+  assert.equal(documents.ocrDeferrals.documents - before.documents, 2);
+});
+
 test('#1871: reading resumes after the highest page read, and a gap below it is a failed page', async () => {
   const pdf = syntheticPdf({ pages: 6 });
   const reader = countingReader();

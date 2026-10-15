@@ -221,7 +221,7 @@ async function extractDocumentText(name, bytes, {
   }
   const deps = { ocrEnabled, extractPages, doclingEnabled, extractDocument, readPages, figures, env, rangesSupported, waits, ocrBudget };
   // #1871: a large document is read under the process-wide lock (a no-op when the caller already holds it).
-  return largeLock.ifLarge(bytes.length, () => extractUnlocked(name, bytes, deps));
+  return largeLock.ifLarge(bytes.length, () => extractUnlocked(name, bytes, deps), () => byteRef(bytes));
 }
 
 async function extractUnlocked(name, bytes, deps) {
@@ -303,7 +303,7 @@ async function patiently(fn, waits = BUSY_WAITS_MS) {
 async function completeDocument(name, bytes, out, deps = {}) {
   if (!out || out.completion === COMPLETION || out.retryable || !Array.isArray(out.pageTexts) || !out.pageTexts.length) return out;
   if (!/\.pdf$/i.test(String(name || ''))) return { ...out, completion: COMPLETION };
-  return largeLock.ifLarge(bytes.length, () => completeUnlocked(name, bytes, out, deps));
+  return largeLock.ifLarge(bytes.length, () => completeUnlocked(name, bytes, out, deps), () => byteRef(bytes));
 }
 
 async function completeUnlocked(name, bytes, out, deps) {
@@ -398,6 +398,22 @@ async function completeUnlocked(name, bytes, out, deps) {
     ...(foundFigures && foundFigures.length ? { figures: foundFigures } : {}) };
 }
 
+// #1878: pages the OCR budget pushed to the next sync. One content-free line per document (counts only,
+// plus the running totals of the sync whose budget it is); cumulative counts for a release watch.
+// The document's identity for a log line: its content hash, taken only if a line is written, never its name.
+const byteRef = (bytes) => require('node:crypto').createHash('sha256').update(bytes).digest('hex');
+const ocrDeferrals = { pages: 0, documents: 0 };
+function noteOcrDeferral(budget, pages) {
+  ocrDeferrals.pages += pages; ocrDeferrals.documents += 1;
+  let sync = '';
+  if (budget && typeof budget === 'object') {
+    budget.deferredPages = (Number(budget.deferredPages) || 0) + pages;
+    budget.deferredDocuments = (Number(budget.deferredDocuments) || 0) + 1;
+    sync = ` syncPagesDeferred=${budget.deferredPages} syncDocumentsDeferred=${budget.deferredDocuments}`;
+  }
+  console.log(`[documents] OCR budget deferred pages to the next sync: pagesDeferred=${pages} documentsDeferred=1${sync}`);
+}
+
 /** #1865: retry `pages` left incomplete, at most RETRY_PAGE_CAP of them, in place. Each gets `retry`:
  *  recovered (its OCR text is merged and the page counts as read), empty, failed (with the reason),
  *  unavailable (no OCR worker is configured) or skipped (over the page cap). Never repeated: a page that
@@ -426,6 +442,7 @@ async function retryIncompletePages(bytes, pages, { ocrEnabled, extractPages, ro
   const chosen = capped.slice(0, allowed);
   if (ocrBudget) ocrBudget.remaining = Math.max(0, (Number(ocrBudget.remaining) || 0) - chosen.length);
   const deferred = chosen.length < capped.length;
+  if (deferred) noteOcrDeferral(ocrBudget, capped.length - chosen.length);
   for (let i = 0; i < chosen.length; i += RETRY_BATCH) {
     const batch = chosen.slice(i, i + RETRY_BATCH);
     let results;
@@ -464,4 +481,4 @@ async function retryIncompletePages(bytes, pages, { ocrEnabled, extractPages, ro
 
 // A test may pin the version (multimodal-followups-1770-1772.test.cjs assigns it); production never does.
 let versionOverride = null;
-module.exports = { isDocument, documentExtensions, extractDocumentText, completeDocument, ocrBudget, COMPLETION, WHOLE_BYTES, RETRY_PAGE_CAP, RETRY_DPI, RETRY_ATTEMPTS, OCR_MAX_BYTES, DOCUMENT_EXTENSIONS, EXTRACT_CAP, get EXTRACTOR_VERSION() { return versionOverride ?? extractorVersion(); }, set EXTRACTOR_VERSION(v) { versionOverride = v; }, PAGE_CAP, TOTAL_TEXT_CAP };
+module.exports = { ocrDeferrals, isDocument, documentExtensions, extractDocumentText, completeDocument, ocrBudget, COMPLETION, WHOLE_BYTES, RETRY_PAGE_CAP, RETRY_DPI, RETRY_ATTEMPTS, OCR_MAX_BYTES, DOCUMENT_EXTENSIONS, EXTRACT_CAP, get EXTRACTOR_VERSION() { return versionOverride ?? extractorVersion(); }, set EXTRACTOR_VERSION(v) { versionOverride = v; }, PAGE_CAP, TOTAL_TEXT_CAP };

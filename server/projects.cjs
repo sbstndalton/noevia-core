@@ -756,7 +756,7 @@ function createProjectStore({
         let bytes;
         try { bytes = documentSources.readOriginal(workspace, project.id, file); } catch { return null; }
         return documentSources.ingest(workspace, project.id, file.name, bytes, file);
-      });
+      }, file.document.byteHash);
       if (!read) { mark(); return { status: 'missing' }; }
       const next = read;
       if (!live() || file.document.version !== tried) return { status: 'changed' };
