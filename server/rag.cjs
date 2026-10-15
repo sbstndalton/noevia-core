@@ -441,6 +441,15 @@ async function embed(texts, { signal, kind = 'document', titles = null, target =
 // (embeddinggemma-2: `title: none | text: …`), the same as the Diary's index. File names are not
 // sent: a name is not part of the chunk's text, and both indexes must use one framing.
 
+// Where a project's index lives: the account's own data directory, else the shared RAG_DIR.
+function indexDir(userId) {
+  return userId && dataDirForUser ? path.join(dataDirForUser(userId), 'rag') : RAG_DIR;
+}
+/** #1771: whether this project already has an index file. Creates nothing (no directory, no file). */
+function indexExists(projectId, userId) {
+  try { return fs.existsSync(path.join(indexDir(userId), `${projectId}.db`)); } catch { return false; }
+}
+
 function openIndex(projectId, userId) {
   // Queued indexing may begin after account deletion. Refuse the directory
   // creation before opening SQLite, including for detached index promises.
@@ -448,7 +457,7 @@ function openIndex(projectId, userId) {
   const { Database, sqliteVec } = loadDeps();
   if (!Database || !sqliteVec) return null;
   try {
-    const ragDir = userId && dataDirForUser ? path.join(dataDirForUser(userId), 'rag') : RAG_DIR;
+    const ragDir = indexDir(userId);
     fs.mkdirSync(ragDir, { recursive: true });
     const db = new Database(path.join(ragDir, `${projectId}.db`));
     db.pragma('journal_mode = WAL');
@@ -826,6 +835,12 @@ const MEDIA_EMBED_TIMEOUT_MS = clampInt(process.env.RAG_MEDIA_EMBED_TIMEOUT_MS, 
  * vector, so the caller (the rate-limited backfill) knows whether to come back. Never throws.
  */
 async function syncProjectMedia(projectId, userId, items, { limit = 1, signal, embedParts = null } = {}) {
+  // #1771: a project with no image and no index has nothing to reconcile. Opening its index would
+  // create an empty SQLite file (and the rag directory) for every project of every account on every
+  // pass, so return before openIndex. A project that already has an index is still opened: its
+  // stale image rows must go when its last image does.
+  const anyItem = Array.isArray(items) && items.some((it) => it && typeof it.file === 'string' && /^img:[0-9a-f]{64}$/.test(String(it.hash || '')));
+  if (!anyItem && !indexExists(projectId, userId)) return { ok: true, reason: 'no-index', embedded: 0, pending: 0, removed: 0 };
   const index = openIndex(projectId, userId);
   if (!index) return { ok: false, reason: 'rag-unavailable', embedded: 0, pending: 0, removed: 0 };
   try {
@@ -904,17 +919,23 @@ async function syncProjectMedia(projectId, userId, items, { limit = 1, signal, e
  * embedding router, so its projector is held only while images are being embedded. Best effort;
  * never the text model, never a server the model manager does not run.
  */
+// #1772: returns { released, alias, status?, evicted? } (or { released: false, skipped } when there is no
+// separate image preset to unload). `evicted`: the router answered that the preset was not running, so
+// it had already been unloaded by the router's own LRU eviction before the pass ended, which happens
+// when the router holds fewer models than the saved text models plus the image preset (--models-max).
 async function releaseMediaModel() {
   const target = embeddingConfig.active();
   const alias = mediaModelFor(target);
   const service = require('./embedding-service.cjs').current();
-  if (!alias || alias === target.model || !target.baseUrl || !service || !service.isAt(target.baseUrl)) return false;
+  if (!alias || alias === target.model || !target.baseUrl || !service || !service.isAt(target.baseUrl)) return { released: false, skipped: true };
   try {
     const res = await ragFetch(`${target.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')}/models/unload`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: alias }), redirect: 'error', signal: AbortSignal.timeout(10000),
     });
-    return res.ok;
-  } catch { return false; }
+    if (res.ok) return { released: true, alias };
+    const text = (await readCappedText(res, 4096).catch(() => ({ text: '' }))).text;
+    return { released: false, alias, status: res.status, evicted: /not (running|loaded)/i.test(text) };
+  } catch (err) { return { released: false, alias, error: String(err?.message || err).slice(0, 120) }; }
 }
 
 // #1726: one caption per image, cached in the project's own index beside the image's rows and keyed by

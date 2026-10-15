@@ -258,7 +258,7 @@ async function answerImages({ images, external, providerLabel = 'an external pro
  *       embedded images (unloads the image preset, so the projector is held only while it is used).
  */
 function createMediaBackfill({ enabled: on = () => enabled(), userIds, workspaceFor, documentDir, rag, paused = () => null, release = async () => {}, sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
-  log = (line) => console.info(line), env = process.env, setTimer = (fn, ms) => { const t = setTimeout(fn, ms); t.unref?.(); return t; }, clearTimer = clearTimeout } = {}) {
+  log = (line) => console.info(line), env = process.env, gate = (_name, fn) => exclusive(_name, fn), setTimer = (fn, ms) => { const t = setTimeout(fn, ms); t.unref?.(); return t; }, clearTimer = clearTimeout } = {}) {
   const num = (v, d, lo, hi) => { const n = Number(v); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, Math.round(n))) : d; };
   const intervalMs = num(env.NOEVIA_MULTIMODAL_RAG_INTERVAL_MS, 2000, 0, 600000);
   const retryMs = num(env.NOEVIA_MULTIMODAL_RAG_RETRY_MS, 300000, 1000, 86400000);
@@ -328,7 +328,17 @@ function createMediaBackfill({ enabled: on = () => enabled(), userIds, workspace
       delete totals.gap;
       last = { at: Date.now(), ...totals };
       // Also after a stop (a re-index that began mid-pass): the image preset is not held beside it.
-      if (totals.embedded || threw) { try { await release(); } catch { /* the router unloads it on its own later */ } }
+      // #1772: say how the image preset left. An explicit unload is the expected end; "evicted" means the
+      // router had already dropped it to make room for a text model (too few --models-max slots).
+      if (totals.embedded || threw) {
+        let r = null;
+        try { r = await release(); } catch { r = null; }
+        if (r && typeof r === 'object' && !r.skipped) {
+          if (r.released) log(`[media] unloaded ${r.alias} after the pass`);
+          else if (r.evicted) log(`[media] ${r.alias} was already unloaded by the embeddings router's eviction, not by noevia: the router needs a slot for each served text model plus the image preset (--models-max)`);
+          else log(`[media] could not unload ${r.alias || 'the image preset'} (${r.status || r.error || 'no answer'}); the router unloads it on its own later`);
+        }
+      }
     }
     return totals;
   }
@@ -339,7 +349,7 @@ function createMediaBackfill({ enabled: on = () => enabled(), userIds, workspace
     if (retry) { clearTimer(retry); retry = null; }
     running = (async () => {
       try {
-        const totals = await pass();
+        const totals = await gate('image pass', pass);
         if (totals.reason) {
           log(`[media] image backfill paused (${totals.reason}${totals.error ? `: ${totals.error}` : ''}); ${totals.pending} image(s) wait, retrying in ${Math.round(retryMs / 1000)} s`);
           retry = setTimer(() => { retry = null; kick(); }, retryMs);
@@ -368,6 +378,18 @@ function createMediaBackfill({ enabled: on = () => enabled(), userIds, workspace
   };
 }
 
+// #1770 review: one media job at a time per process. The image pass (loads `.vision`) and the figure sweep
+// (Docling) each run inside exclusive(), so neither starts while the other runs; a pass queued meanwhile
+// starts when the running one ends. `name` is only for status.
+let gateTail = Promise.resolve();
+let gateHolder = null;
+function exclusive(name, fn) {
+  const run = gateTail.then(async () => { gateHolder = name; try { return await fn(); } finally { gateHolder = null; } });
+  gateTail = run.catch(() => {});
+  return run;
+}
+const exclusiveHolder = () => gateHolder;
+
 let installed = null;
 function install(backfill) { installed = backfill; return backfill; }
 function current() { return installed; }
@@ -377,4 +399,4 @@ function sourceChanged(userId, projectId) {
   try { installed.schedule(userId, projectId); } catch { /* never breaks the caller */ }
 }
 
-module.exports = { FLAG, MODALITIES, enabled, scannedPage, mediaItems, resolveHit, assetPlan, captionOnce, answerImages, diaryProject, createMediaBackfill, install, current, sourceChanged, sha256 };
+module.exports = { exclusive, exclusiveHolder, FLAG, MODALITIES, enabled, scannedPage, mediaItems, resolveHit, assetPlan, captionOnce, answerImages, diaryProject, createMediaBackfill, install, current, sourceChanged, sha256 };

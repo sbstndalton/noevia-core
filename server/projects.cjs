@@ -712,7 +712,42 @@ function createProjectStore({
     });
   }
 
+  // #1770: read one existing document again from its stored original so it gains figures (figure-sweep.cjs).
+  // Runs in the owner's scope under the project's source lock. The record is replaced only by a readable
+  // result; a failure keeps the current text and marks this version tried (document.figureSweep), except a
+  // transient one (Docling unreachable: the stored result says retryable), which the next pass tries again.
+  async function refreshDocumentFigures(project, file) {
+    return withSourceLock(project, async () => {
+      const workspace = currentWorkspace();
+      const live = () => getProject(project.id) === project && (project.files || []).includes(file) && !!file.document;
+      if (!live()) return { status: 'changed' };
+      const tried = file.document.version;
+      const mark = () => { file.document.figureSweep = tried; saveProjects(PROJECTS); };
+      let bytes;
+      try { bytes = documentSources.readOriginal(workspace, project.id, file); } catch { mark(); return { status: 'missing' }; }
+      const next = await documentSources.ingest(workspace, project.id, file.name, bytes, file);
+      if (!live() || file.document.version !== tried) return { status: 'changed' };
+      if (next.document.state === 'failed' || next.document.stale) {
+        if (documentSources.retryable(workspace, project.id, next.document.version)) {
+          return { status: 'retry', unreachable: documentSources.serviceDown(next.document.error), error: next.document.error };
+        }
+        mark();
+        return { status: 'failed', error: next.document.error };
+      }
+      // Review of #116: the new reading replaces the current one only when it is no worse: a state at
+      // least as good (ready > partial), non-empty text, and at least as many readable pages. Otherwise
+      // the current text stays and this version is marked tried, so a worse reading never wins later.
+      if (!documentSources.noWorse(file.document, next.document, next.content)) { mark(); return { status: 'worse' }; }
+      const updated = { ...file, content: next.content, document: next.document };
+      project.files = project.files.map((f) => (f === file ? updated : f));
+      indexSource(project, updated);
+      saveProjects(PROJECTS);
+      return { status: 'refreshed' };
+    });
+  }
+
   return {
+    refreshDocumentFigures,
     saveProjects, getProject, sanitizeChats, loadChats, saveChats, chatIdsElsewhere, deleteChat, moveChat, purgeProjectChats, saveFreeChats, deleteFreeChat, setChatFlags, createProject,
     deleteProject, removeChatAttachments, removeOrphanChatContexts,
     historyPath, readHistory, writeHistory,

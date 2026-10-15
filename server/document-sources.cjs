@@ -111,4 +111,24 @@ function prune(workspace, project) {
   const keptFigure = (name) => /^[a-f0-9]{64}\.fig\d{1,3}\.(png|jpg|webp)$/.test(name) && keep.has(name.slice(0, 64) + '.json');
   for (const name of fs.readdirSync(dir)) if (!keep.has(name) && !keptFigure(name)) fs.rmSync(path.join(dir, name), { force: true });
 }
-module.exports = { ingest, failed, notice, readPages, readOriginal, directory, prune, problem };
+// #1770: whether the stored result for `version` is a transient failure (it is read again next time).
+function retryable(workspace, projectId, version) {
+  try { return !!JSON.parse(fs.readFileSync(versionPath(workspace, projectId, version, '.json'), 'utf8')).retryable; } catch { return false; }
+}
+// #1770: a transient failure that says the extraction service itself is down or busy (not this document).
+// A timeout or abort is NOT an outage: one large document can time out while the service is fine, so the
+// sweep defers that document and goes on (figure-sweep.cjs ends a pass only after consecutive timeouts).
+function serviceDown(error) {
+  const e = String(error || '');
+  if (/timed? ?out|timeout|aborted|AbortError/i.test(e)) return false;
+  return /busy|unavailable|not configured|fetch failed|ECONNREFUSED|ECONNRESET|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH/i.test(e);
+}
+// #1770 review: whether a new extraction is at least as good as the current one.
+const STATE_RANK = { failed: 0, partial: 1, ready: 2 };
+const readablePages = (d) => (Array.isArray(d?.pageStatus) ? d.pageStatus : []).filter((p) => ['native', 'ocr', 'degraded'].includes(p?.status)).length;
+function noWorse(current, next, nextText) {
+  if (!String(nextText || '').trim()) return false;
+  if ((STATE_RANK[next?.state] ?? 0) < (STATE_RANK[current?.state] ?? 0)) return false;
+  return readablePages(next) >= readablePages(current);
+}
+module.exports = { retryable, serviceDown, noWorse, ingest, failed, notice, readPages, readOriginal, directory, prune, problem };
