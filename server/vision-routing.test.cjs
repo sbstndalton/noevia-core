@@ -11,7 +11,7 @@ const contextDir=fs.mkdtempSync(require('node:path').join(require('node:os').tmp
 test.after(()=>fs.rmSync(contextDir,{recursive:true,force:true}));
 
 async function run({ visionModel, probeStatus = 200, descriptionStatus = 200, missingAsset = false, finishReason = 'stop', cache = new Map(), headers = {}, replacementBytes, userId = 'synthetic-user', projectId = 'fixture-project', native = false,
-  assets = [{ id: 'image-a', name: 'statement.png', mime: 'image/png' }, { id: 'image-b', name: 'copy.png', mime: 'image/png' }], files = [], turnImageIds, expectImages = true, message = 'Read the synthetic total', projectProviderId, history } = {}) {
+  assets = [{ id: 'image-a', name: 'statement.png', mime: 'image/png' }, { id: 'image-b', name: 'copy.png', mime: 'image/png' }], files = [], turnImageIds, expectImages = true, message = 'Read the synthetic total', projectProviderId, history, describeHang = false, stageMs, makeRoomFor } = {}) {
   const events = [], requests = [], urls = [], nativeCalls=[];let nativeLoaded=null;
   const res = new EventEmitter();
   res.writeHead = () => {};
@@ -27,6 +27,7 @@ async function run({ visionModel, probeStatus = 200, descriptionStatus = 200, mi
     })() };
     if (body.max_tokens === 1) return new Response(probeStatus === 200 ? '{}' : 'provide the mmproj', { status: probeStatus });
     assert.equal(body.model, visionModel);
+    if (describeHang) return new Promise((_, reject) => { opts.signal.addEventListener('abort', () => reject(opts.signal.reason), { once: true }); });
     return new Response(JSON.stringify({ choices: [{ finish_reason: finishReason, message: { content: 'Fixture image: invoice INV-2042 total 34.95' } }] }), { status: descriptionStatus });
   };
   const context = {
@@ -45,6 +46,7 @@ async function run({ visionModel, probeStatus = 200, descriptionStatus = 200, mi
     CONNECTOR_BOXES: new Set(['gdrive']), connectedBoxes: () => [], toolPolicy: { mode: (_user, _name, write) => (write ? 'ask' : 'allow') }, requestScope: { getStore: () => ({}) },
     resolveTools: () => ({ tools: [], dropped: [] }), isWriteTool: () => true,
   };
+  if (makeRoomFor) context.modelManager = { ...context.modelManager, makeRoomFor };
   if(native)context.modelManager=require('./model-manager.cjs').createModelManager({kind:'llamacpp',baseUrl:'http://fixture.invalid',fetchJson:async(url,options)=>{
     nativeCalls.push(url);
     if(url.endsWith('/models/load'))nativeLoaded=JSON.parse(options.body).model;
@@ -57,6 +59,7 @@ async function run({ visionModel, probeStatus = 200, descriptionStatus = 200, mi
     DIARY_BASE: 'http://fixture.invalid', TOOL_RESULT_CAP: 8000, json: () => {}, saveChats() {}, endpointApproved: () => true, diaryHeaders: () => ({}),
     lastLoadedModel: () => null, classifyFastOrSmart: async () => 'fast', servedCatalogue: async () => [], modelsInstalled: async () => [], missingRoles: () => [], staleRolesError: () => null,
     allToolboxes: () => [], executeToolCall: async () => '', chatWideApproved: () => false, awaitApproval: async () => 'decline', recordUsage() {}, recordToolUse() {},
+    ...(stageMs === undefined ? {} : { visionStageTimeoutMs: stageMs }),
     ...context,
   });
   await handleChat({}, res, { projectId: 'fixture-project', chatId: 'fixture-chat', message, ...(history ? { history } : {}), ...(turnImageIds === undefined ? {} : { turnImageIds }) });
@@ -88,7 +91,10 @@ test('failed description falls back to direct vision or an explicit unavailable 
   for (const probeStatus of [200, 500]) {
     const out = await run({ visionModel: 'vision-model', descriptionStatus: 500, probeStatus });
     assert.equal(JSON.stringify(out.answer).includes('data:image'), probeStatus === 200);
-    assert.equal(out.events.some(e => e.type === 'warning'), probeStatus !== 200);
+    // #1790: the failed description is said on the reply either way; without image input it also says the images were not read.
+    const warning = out.events.find(e => e.type === 'warning');
+    assert.match(warning.text, /vision model \(vision-model\) could not describe it/);
+    assert.equal(/Images were not read/.test(warning.text), probeStatus !== 200);
   }
 });
 
@@ -219,4 +225,33 @@ test('an assistant reply that restates image content is replayed as transcript t
   assert.equal(second.urls.some((u) => u.model === 'vision-model'), false);
   assert.ok(JSON.stringify(second.answer).includes('The synthetic total is INV-2042.'), 'the assistant text is replayed');
   assert.equal(JSON.stringify(second.answer).includes('Fixture image'), false, 'no system-note image text rides along');
+});
+
+// #1790: an attached PNG sat at "Reading image sources" for minutes. Live logs: the Vision role model (a Qwen3.5
+// with thinking on) generated hidden reasoning at ~18 tokens/s against max_tokens 4096 until the 180 s abort, then
+// the chat swapped back. The describe call now turns thinking off with a smaller budget, the whole step (swap and
+// reply) has one hard deadline, and a miss is told to the user before the answering model takes the image.
+test('#1790: the describe call asks for no thinking and a bounded description', async () => {
+  const out = await run({ visionModel: 'vision-model' });
+  const describe = out.requests.find((r) => !r.stream && r.max_tokens !== 1);
+  assert.deepEqual(describe.chat_template_kwargs, { enable_thinking: false });
+  assert.ok(describe.max_tokens <= 1536, `max_tokens ${describe.max_tokens}`);
+});
+
+test('#1790: a describe that never answers ends at the stage deadline, says so, and the answer still comes', async () => {
+  const started = Date.now();
+  const out = await run({ visionModel: 'vision-model', describeHang: true, stageMs: 50 });
+  assert.ok(Date.now() - started < 5000, 'bounded by the stage deadline');
+  assert.ok(out.answer, 'the answering model was still asked');
+  assert.equal(out.answer.messages.at(-1).content.filter((c) => c.type === 'image_url').length, 2, 'images handed to the answering model');
+  assert.match(out.events.find((e) => e.type === 'warning').text, /vision model \(vision-model\) did not finish within/);
+  assert.ok(out.events.some((e) => e.type === 'status' && e.id === 'readingImages' && /did not finish/.test(e.text)), 'the wait moves on visibly');
+});
+
+test('#1790: a model swap that never completes is bounded by the same deadline', async () => {
+  const makeRoomFor = (model, _keep, signal) => model !== 'vision-model' ? Promise.resolve()
+    : new Promise((_, reject) => { signal.addEventListener('abort', () => reject(signal.reason), { once: true }); });
+  const out = await run({ visionModel: 'vision-model', stageMs: 50, makeRoomFor });
+  assert.ok(out.answer);
+  assert.match(out.events.find((e) => e.type === 'warning').text, /did not finish within/);
 });

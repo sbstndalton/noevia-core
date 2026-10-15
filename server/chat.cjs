@@ -280,7 +280,7 @@ function createChatHandler({
   // setChatFlags(projectId, chatId, patch), log(entry) }. Not wired or flag off: nothing changes.
   routingModes = null,
   // #1441: how a turn waits for the project's file jobs still running; the wait is bounded.
-  sourceJobs = require('./source-jobs.cjs'), sourceWaitMs = 30000,
+  sourceJobs = require('./source-jobs.cjs'), sourceWaitMs = 30000, visionStageTimeoutMs = 120000,
   // #1574: how long a local reply may go silent after its first output before it is ended (0 = no limit).
   streamIdleMs = 120000,
   // #1785: { save(projectId|null, chatId, title, firstMessage) } stores a generated title over the derived one only
@@ -529,6 +529,8 @@ function createChatHandler({
     let replySources = [];
     // #1513: sources of which this reply read only part (excerpts, the start, or nothing).
     let partialReads = [];
+    // #1793: what retrieval placed and injected, and the files it read from, for the attribution after the reply.
+    let placedEntries = [], injectedEntries = [], readableFiles = [];
     // #1441: a free chat's attachments live in a hidden shadow project. Its files are shown to the model
     // with the user's turn as "attached to this chat"; the shadow project's name and a "knowledge-file"
     // framing in the system message made a small model deny having them. Real projects are unchanged.
@@ -546,7 +548,8 @@ function createChatHandler({
       filesBlock = await rag.filesContext(project.id, readable, message, currentWorkspace().userId,
         // #1513 counts what the prompt holds (`injected`), not only the reported sources: an unnamed file head
         // is in the prompt but not a source chip (#1457), and was told to the model as "none of it" read.
-        (placed, injected) => { replySources = require('./chat-sources.cjs').buildSources(placed, readable); partialReads = require('./source-coverage.cjs').partialSources(readable, Array.isArray(injected) ? injected : placed); },
+        (placed, injected) => { placedEntries = Array.isArray(placed) ? placed : []; injectedEntries = Array.isArray(injected) ? injected : []; readableFiles = readable;
+          replySources = require('./chat-sources.cjs').buildSources(placed, readable); partialReads = require('./source-coverage.cjs').partialSources(readable, Array.isArray(injected) ? injected : placed); },
         multimodal ? { attached: chatAttachments, images: true, onImages: (found) => { imageRetrieval = found; } } : { attached: chatAttachments });
     }
 
@@ -718,15 +721,28 @@ function createChatHandler({
     // different descriptions of the same bytes.
     // #1512: the wait for one description, named (a model swap for the vision role comes before it).
     const VISION_DESCRIBE_TIMEOUT_MS = 180000;
+    // #1790: the whole describe step (the swap to the vision model AND its reply) has one hard deadline. The
+    // live hang was a thinking vision model (Qwen3.5 with --reasoning on) spending the 4096-token budget on
+    // hidden reasoning at ~18 tokens/s: no answer before the 180 s abort, then a second swap back. A
+    // description is now asked for without thinking and with a smaller budget, and a miss is said to the user.
+    const VISION_STAGE_TIMEOUT_MS = visionStageTimeoutMs;
+    const VISION_DESCRIBE_MAX_TOKENS = 1536;
+    let describeFailure = null; // 'timeout' | 'failed' once a describe attempt did not produce text
     const describeImages = async (visionModel, baseUrl, headers, question) => {
       const key = crypto.createHash('sha256').update(JSON.stringify([currentWorkspace().userId, baseUrl, visionModel, project.id, headers, attachedImages, question])).digest('hex');
       const cached = visionDescriptions.get(key);
       if (cached && cached.until > Date.now()) return cached.text;
+      const stageTimeout = AbortSignal.timeout(VISION_STAGE_TIMEOUT_MS);
+      const stageSignal = AbortSignal.any([chatSignal.signal, stageTimeout]);
       // #697: the vision model is admitted to the shared engine (one model, memory budget) first;
       // a refusal falls back to handing the images to the answering model, as a failure does.
       if (typeof modelManager.makeRoomFor === 'function') {
-        try { await modelManager.makeRoomFor(visionModel, undefined, chatSignal.signal); }
-        catch (err) { console.warn(`[vision] ${visionModel} not admitted: ${String(err?.code || err?.status || 'error')}`); return null; }
+        try { await modelManager.makeRoomFor(visionModel, undefined, stageSignal); }
+        catch (err) {
+          describeFailure = stageTimeout.aborted ? 'timeout' : 'failed';
+          console.warn(`[vision] ${visionModel} not admitted: ${stageTimeout.aborted ? 'timeout' : String(err?.code || err?.status || 'error')}`);
+          return null;
+        }
       }
       const url = `${String(baseUrl).replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`;
       const prompt = [
@@ -741,19 +757,22 @@ function createChatHandler({
           headers: { 'Content-Type': 'application/json', ...headers },
           body: JSON.stringify({
             model: visionModel,
-            max_tokens: 4096,
+            max_tokens: VISION_DESCRIBE_MAX_TOKENS,
+            // The description is the answer; a thinking template would spend the budget before writing it.
+            chat_template_kwargs: { enable_thinking: false },
             messages: [{ role: 'user', content: [{ type: 'text', text: prompt }, ...attachedImages] }],
           }),
-          signal: AbortSignal.any([chatSignal.signal, AbortSignal.timeout(VISION_DESCRIBE_TIMEOUT_MS)]),
+          signal: AbortSignal.any([stageSignal, AbortSignal.timeout(VISION_DESCRIBE_TIMEOUT_MS)]),
           redirect: 'error',
         });
         if (!r.ok) {
+          describeFailure = 'failed';
           console.warn(`[vision] ${visionModel} could not describe (${r.status})`);
           return null;
         }
         const body = await readCappedJson(r, 4 * 1024 * 1024);
         const text = String(body?.choices?.[0]?.message?.content || '').trim();
-        if (!text || body?.choices?.[0]?.finish_reason === 'length') return null;
+        if (!text || body?.choices?.[0]?.finish_reason === 'length') { describeFailure = 'failed'; return null; }
         visionDescriptions.set(key, { text, until: Date.now() + 300000 });
         // Bounded: descriptions are large and a long session must not grow
         // without limit.
@@ -762,7 +781,8 @@ function createChatHandler({
         }
         return text;
       } catch (err) {
-        console.warn(`[vision] describe failed: ${String((err && err.message) || err)}`);
+        describeFailure = stageTimeout.aborted ? 'timeout' : 'failed';
+        console.warn(`[vision] describe failed: ${stageTimeout.aborted ? `no description within ${VISION_STAGE_TIMEOUT_MS / 1000} s` : String((err && err.message) || err)}`);
         return null;
       }
     };
@@ -1263,6 +1283,12 @@ function createChatHandler({
         described = await describeImages(visionModel, describeProvider.baseUrl, providerHeaders(describeProvider), message);
       }
 
+      // #1790: a description that did not come is said on the reply, and the wait moves on visibly.
+      if (!described && describeFailure && !chatSignal.signal.aborted) {
+        const why = describeFailure === 'timeout' ? `did not finish within ${VISION_STAGE_TIMEOUT_MS / 1000} seconds` : 'could not describe it';
+        visionWarning += `${visionWarning ? ' ' : ''}The vision model (${visionModel}) ${why}, so ${model} was given the image directly if it can read images.`;
+        send({ type: 'status', id: 'readingImages', text: `The vision model ${why}. Trying ${model} with the image instead…` });
+      }
       if (described) {
         const note = frameUntrusted('image description', `${loadedImageNames.join(', ')} by ${visionModel}`, described);
         wire = wire.map((m) => (m.role === 'system' ? { ...m, content: `${m.content}\n\n${note}` } : m));
@@ -1325,7 +1351,7 @@ function createChatHandler({
             try {
               const r = await fetch(`${String(captionProvider.baseUrl).replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`, {
                 method: 'POST', headers: { 'Content-Type': 'application/json', ...providerHeaders(captionProvider) }, redirect: 'error',
-                body: JSON.stringify({ model: visionModel, max_tokens: 1024, messages: [{ role: 'user', content: [
+                body: JSON.stringify({ model: visionModel, max_tokens: 1024, chat_template_kwargs: { enable_thinking: false }, messages: [{ role: 'user', content: [
                   { type: 'text', text: 'Describe this image in detail, so someone who cannot see it can answer questions about it. Transcribe any text exactly, including numbers, labels and headings. If text is unclear, say so rather than guessing.' },
                   require('./multimodal-rag.cjs').MODALITIES.image.part(image.mime, bytes)] }] }),
                 signal: AbortSignal.any([chatSignal.signal, AbortSignal.timeout(VISION_DESCRIBE_TIMEOUT_MS)]),
@@ -2208,6 +2234,16 @@ function createChatHandler({
       paused = true;
       send({ type: 'paused', reason: 'sensitive-tool-result', flag: cloudHold, applied: appliedWrites.length,
         text: 'A tool result looks sensitive and was not sent to the cloud model. Switch this chat to local or resend.' });
+    }
+    // #1793: a knowledge file injected whole and not named by the question is a source too once the answer
+    // quotes something distinctive from it; the reply's sources are re-sent with it (the last event wins).
+    if (!body.compactOnly && roundHasContent && injectedEntries.length) {
+      const chatSources = require('./chat-sources.cjs');
+      const used = chatSources.usedInjected(injectedEntries, placedEntries, roundContent, message);
+      if (used.length) {
+        const sources = chatSources.buildSources([...placedEntries, ...used], readableFiles);
+        if (sources.length > replySources.length) { replySources = sources; send({ type: 'sources', sources }); }
+      }
     }
     if (!paused && !roundHasContent && finalPass) {
       // #1693: the final-answer round wrote no answer either. The links the tools returned are kept, instead of an
