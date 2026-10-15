@@ -43,12 +43,12 @@ function setRagFetch(fn) { const prev = netFetch; netFetch = fn; return prev; }
 const testSeam = process.env.NODE_TEST_CONTEXT || process.env.NODE_ENV === 'test' ? { _test: { setRagFetch, makeRagFetch, rerankBackend, rerankState: () => rerank } } : {};
 // The reranker's backend, built here so a test can drive it without a chat. #1665: `backend` is
 // rerank-target.cjs's 'llamacpp' (POST /v1/rerank) or 'tei' (POST /rerank); both go through ragFetch.
-function rerankBackend(baseUrl, backend = 'llamacpp') {
+function rerankBackend(baseUrl, backend = 'llamacpp', model = process.env.RERANK_MODEL || null) {
   const { llamaRerankBackend, teiRerankBackend } = require('./decision/backends.cjs');
   const fetchImpl = (u, i) => ragFetch(u, { ...i, redirect: 'error' });
   const apiKey = process.env.RERANK_API_KEY || null; /* #697: the inference key never goes to a reranker sidecar */
   if (backend === 'tei') return teiRerankBackend({ baseUrl, fetchImpl, apiKey });
-  return llamaRerankBackend({ baseUrl, fetchImpl, model: process.env.RERANK_MODEL || null, apiKey });
+  return llamaRerankBackend({ baseUrl, fetchImpl, model: model || null, apiKey });
 }
 
 // Injected by init() from index.cjs (keeps this module testable standalone).
@@ -111,14 +111,24 @@ const MIN_SCORE = 0.3;
 // to 12: on DaServer's GPU 12 chunks rerank in ~2 s vs ~3.9 s for 24, and 12->6 scored 89% vs 86%.
 const RERANK_POOL_MAX = 24;
 let rerank = null; // { decisions, pool, keep, deadlineMs }
+// #1665: the environment the reranker is configured from. The deployment's by default; index.cjs points it at
+// rerank-settings.cjs (the admin's saved switch over the deployment's) and calls reloadRerank() after a change.
+let rerankEnv = () => process.env;
+function configureRerank(envFn) {
+  rerankEnv = typeof envFn === 'function' ? envFn : () => process.env;
+  initRerank();
+}
+function reloadRerank() { initRerank(); }
 function initRerank() {
   // #697: never on the shared inference engine unless the operator allows it (rerank-target.cjs).
-  const target = require('./rerank-target.cjs').rerankTarget(process.env);
+  let env;
+  try { env = rerankEnv() || process.env; } catch { env = process.env; }
+  const target = require('./rerank-target.cjs').rerankTarget(env);
   if (target.reason) console.warn('[rag] rerank off:', target.reason);
   if (!target.enabled) { rerank = null; return; }
   const baseUrl = target.baseUrl;
   const { createDecisions } = require('./decision/index.cjs');
-  const backend = rerankBackend(baseUrl, target.backend);
+  const backend = rerankBackend(baseUrl, target.backend, target.model);
   const decisions = createDecisions({
     backends: { [backend.id]: backend },
     chains: { 'rag.rerank': [backend.id] },
@@ -1138,4 +1148,4 @@ const trackedFileState = () => ({ queues: fileQueues.size, generations: fileGene
 
 // #1646: the sentence a hybrid cloud route without a grant removes (read_project_file is not offered there).
 const READ_FILE_HINT = ' Use read_project_file with PDF startPage/endPage and offset for pages beyond the summary.';
-module.exports = { ...testSeam, searchProjectWithImages, syncProjectMedia, releaseMediaModel, readCaption, writeCaption, mediaModelFor, embeddingOff, READ_FILE_HINT, servedModels, servedModelsCached, init, trackedFileState, indexProjectFile, deleteProjectFile, searchProject, filesContext, chunkText, ragAvailable, retrievalStatus, embed, embedModel, embeddingIdentity, embeddingConfig: getEmbeddingConfig, onIndexed, listIndexes, indexCoverage, fillMissing, dropIndexSlot, rerankPool };
+module.exports = { ...testSeam, searchProjectWithImages, syncProjectMedia, releaseMediaModel, readCaption, writeCaption, mediaModelFor, embeddingOff, READ_FILE_HINT, servedModels, servedModelsCached, init, trackedFileState, indexProjectFile, deleteProjectFile, searchProject, filesContext, chunkText, ragAvailable, retrievalStatus, embed, embedModel, embeddingIdentity, embeddingConfig: getEmbeddingConfig, onIndexed, listIndexes, indexCoverage, fillMissing, dropIndexSlot, rerankPool, configureRerank, reloadRerank };

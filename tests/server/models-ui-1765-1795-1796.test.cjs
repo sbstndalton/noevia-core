@@ -36,7 +36,8 @@ test('#1765 DELETE forgets the saved URL: the deployment URL, its model and sour
   assert.equal(f.settings.backend().model, 'laya', 'a URL saved in Settings gets the Laya profile');
   const res = await f.call('DELETE');
   assert.equal(res.status, 200);
-  assert.deepEqual(res.body, { url: 'http://kev:11435', timeoutMs: 1500, source: 'deployment' });
+  // #1666: the reply also lists the choosable decision models and the deployment's (no address beyond the URL).
+  assert.deepEqual(res.body, { url: 'http://kev:11435', timeoutMs: 1500, model: '', source: 'deployment', models: ['laya', 'kev-0.8b'], deploymentModel: 'kev-0.8b' });
   assert.equal(f.map.has('decision:configuration'), false, 'the stored key is removed, not overwritten');
   assert.equal(f.settings.backend().model, 'kev-0.8b', 'decisions go to the deployment model again');
   assert.deepEqual(f.audits.at(-1), ['decision.reset', 'admin', { hadSaved: true }]);
