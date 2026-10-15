@@ -112,7 +112,17 @@ function writeText(wsDir, projectId, ref, text, pendingDirs = null) {
   const bytes = Buffer.from(text, 'utf8');
   try {
     const st = fs.statSync(file);
-    if (st.isFile() && st.size === bytes.length && refOf(fs.readFileSync(file, 'utf8')) === ref) return;
+    if (st.isFile() && st.size === bytes.length && refOf(fs.readFileSync(file, 'utf8')) === ref) {
+      // #1818: the file may be one an earlier, failed save renamed into place without fsyncing its
+      // folder; the folder is fsynced again before projects.json can point at it.
+      // #1819: with every folder up to the workspace, since the project folder itself may be one
+      // that failed save created without fsyncing its entry in project-sources/.
+      const dirs = pendingDirs || new Set();
+      addChain(wsDir, dir, dirs);
+      if (!pendingDirs) flushDirs(dirs);
+      written(wsDir, projectId, ref);
+      return;
+    }
   } catch { /* absent: written below */ }
   const created = fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const tmp = `${file}.${process.pid}.tmp`;
@@ -123,8 +133,32 @@ function writeText(wsDir, projectId, ref, text, pendingDirs = null) {
   dirs.add(dir);
   // A folder just created is itself a new entry in its parent(s): those are made durable too.
   if (created) { const top = path.dirname(created); for (let d = dir; d !== top && d !== path.dirname(d);) { d = path.dirname(d); dirs.add(d); } }
+  // #1819: in a batch, always every folder up to the workspace: a retry after a failed save that
+  // created the project folder finds it already there (`created` undefined) but its entry in
+  // project-sources/ (and that one's in the workspace) may never have been fsynced.
+  if (pendingDirs) addChain(wsDir, dir, dirs);
   if (!pendingDirs) flushDirs(dirs);
   cache.delete(file);
+  written(wsDir, projectId, ref);
+}
+
+/** Adds `dir` and every folder above it up to and including `wsDir` to `dirs`. */
+function addChain(wsDir, dir, dirs) {
+  const top = path.resolve(wsDir);
+  for (let d = path.resolve(dir); ; d = path.dirname(d)) {
+    dirs.add(d);
+    if (d === top || d === path.dirname(d)) break;
+  }
+}
+
+// #1819: a write generation per text key, so a background scan that started before a write never
+// flags the text that write just put back.
+const generation = new Map();
+/** #1818: written again (a re-upload, a refresh): no longer missing, and any scan in flight is stale. */
+function written(wsDir, projectId, ref) {
+  const key = missingKey(wsDir, projectId, ref);
+  generation.set(key, (generation.get(key) || 0) + 1);
+  unreadable.delete(key);
 }
 
 /** fsyncs each folder of `dirs` once, deepest first (a new folder's entries before its parent's
@@ -186,10 +220,15 @@ function attachAll(wsDir, projects) {
 /** Moves every plain string `content` to its file (written first), leaving the pointer. Returns
  *  how many sources moved. */
 function externalize(wsDir, projects) {
-  let moved = 0;
   // #1815: every text file is written (and its data fsynced) first; each folder is fsynced once at
   // the end, before this returns, so before the caller writes projects.json.
+  // #1818: a source is switched to its pointer in memory only after that fsync. If a write or a
+  // fsync throws (ENOSPC, EIO), no source of this call has been switched: each still holds its text
+  // as a plain value, so no projects.json (this save aborts; a later one runs externalize again)
+  // can carry a pointer whose folder entry was not made durable. A retry finds the file already
+  // there and fsyncs its folder again (writeText) before switching.
   const pendingDirs = new Set();
+  const done = [];
   for (const p of projects || []) {
     if (!p || typeof p.id !== 'string') continue;
     for (const f of filesOf(p)) {
@@ -205,16 +244,20 @@ function externalize(wsDir, projects) {
       }
       const ref = refOf(text);
       writeText(wsDir, p.id, ref, text, pendingDirs);
-      delete f.content;
-      f.textRef = ref;
-      f.chars = text.length;
-      if (headerNamesSkill(text)) f.skillHeader = true; else delete f.skillHeader;
-      attachFile(f, wsDir, p.id);
-      moved += 1;
+      done.push([f, p.id, ref, text]);
     }
   }
   flushDirs(pendingDirs);
-  return moved;
+  for (const [f, projectId, ref, text] of done) {
+    // A handler may have changed the text again meanwhile only if it ran in between; nothing awaits
+    // here, so `f.content` is still `text`.
+    delete f.content;
+    f.textRef = ref;
+    f.chars = text.length;
+    if (headerNamesSkill(text)) f.skillHeader = true; else delete f.skillHeader;
+    attachFile(f, wsDir, projectId);
+  }
+  return done.length;
 }
 
 /** Removes text files no source of `projects` points at, and the folders of projects that are gone. */
@@ -278,9 +321,16 @@ function collect(wsDir, projects, { now = Date.now(), graceMs = graceDefault } =
       if (now - since < graceMs) continue;
       fs.rmSync(full, { force: true });
       unreferencedSince.delete(full);
+      if (ref) unreadable.delete(missingKey(wsDir, d, ref)); // #1818: gone on purpose, nothing to flag
       left -= 1;
     }
-    if (!refs && left === 0) fs.rmSync(dir, { recursive: true, force: true });
+    if (!refs && left === 0) {
+      fs.rmSync(dir, { recursive: true, force: true });
+      // #1819: the project's folder is gone: nothing under it can be reported missing any more.
+      const prefix = missingKey(wsDir, d, '');
+      for (const k of [...unreadable]) if (k.startsWith(prefix)) unreadable.delete(k);
+      for (const k of [...generation.keys()]) if (k.startsWith(prefix)) generation.delete(k);
+    }
   }
 }
 
@@ -316,9 +366,10 @@ function migrateOnLoad(wsDir, projects) {
   return true;
 }
 
-/** #1815: whether `file` points at a text file that is gone or cannot be read. Its pointer is kept
- *  (nothing is dropped or rewritten); this only reports it. A source with inline text is never missing. */
-function textMissing(file) {
+/** #1815: whether `file` points at a text file that is gone or cannot be read, checked on the file
+ *  itself now (one sync call; used by the sources/text route). Its pointer is kept (nothing is
+ *  dropped or rewritten); this only reports it. A source with inline text is never missing. */
+function textMissingNow(file) {
   if (!isExternal(file)) return false;
   const from = origin.get(file);
   if (!from) return false;
@@ -330,6 +381,62 @@ function textMissing(file) {
   // Readable now; one that failed before (a restore since) is read once to be sure, which clears it.
   if (unreadable.has(key)) { readText(from.wsDir, from.projectId, file.textRef); return unreadable.has(key); }
   return false;
+}
+
+// #1818: the list (GET /api/workspace) never touches the disk per source. It reports what is known:
+// the `unreadable` set, filled when a read fails and by a background async scan of the sources a
+// list showed, run on the first list of a workspace and then at most every SCAN_MS; cleared when a
+// text is written again, read again, or collected. Unknown (not scanned yet) is not flagged.
+const SCAN_MS = 3 * 60 * 1000;
+let scanMs = SCAN_MS;
+const scans = new Map(); // workspace -> { at, running: Promise|null, seen: Map<key, [full, cacheKey]> }
+const pendingScans = new Set();
+
+/** Remembers `full` for the workspace's next scan, and starts one (async, after this tick) when due. */
+function noteForScan(wsDir, key, full) {
+  const ws = wsKey(wsDir);
+  let st = scans.get(ws);
+  if (!st) { st = { at: -Infinity, running: null, seen: new Map() }; scans.set(ws, st); }
+  if (st.running || Date.now() - st.at < scanMs) return;
+  st.seen.set(key, full);
+  if (pendingScans.has(ws)) return;
+  pendingScans.add(ws);
+  setImmediate(() => {
+    pendingScans.delete(ws);
+    const batch = st.seen; st.seen = new Map();
+    st.at = Date.now();
+    st.running = (async () => {
+      for (const [k, f] of batch) {
+        const gen = generation.get(k) || 0;
+        try { await fs.promises.access(f, fs.constants.R_OK); unreadable.delete(k); }
+        catch (e) {
+          // A write since the check started (a re-upload) wins: its file is there now.
+          if ((generation.get(k) || 0) !== gen) continue;
+          if (e && (e.code === 'ENOENT' || e.code === 'EACCES' || e.code === 'ENOTDIR' || e.code === 'EPERM')) {
+            unreadable.add(k);
+            if (cache.has(f)) { cached -= cache.get(f).length; cache.delete(f); }
+          }
+        }
+      }
+    })().catch(() => {}).finally(() => { st.running = null; });
+  });
+}
+
+/** Whether `file`'s text is known to be missing, without any filesystem call (the list's check). */
+function textMissing(file) {
+  if (!isExternal(file)) return false;
+  const from = origin.get(file);
+  if (!from) return false;
+  const key = missingKey(from.wsDir, from.projectId, file.textRef);
+  noteForScan(from.wsDir, key, path.join(projectDir(from.wsDir, from.projectId), `${file.textRef}.txt`));
+  return unreadable.has(key);
+}
+
+/** Resolves when the workspace's scan (started or about to start) is done. For tests. */
+async function scanSettled(wsDir) {
+  await new Promise((r) => setImmediate(r));
+  const st = scans.get(wsKey(wsDir));
+  if (st && st.running) await st.running;
 }
 
 /** A source as the client gets it in a list: metadata only, never the text; `textMissing: true`
@@ -379,6 +486,6 @@ if (require.main === module) {
 module.exports = {
   DIR, refOf, projectDir, readText, readTextStrict, writeText, attachFile, attachAll, externalize, collect, migrateOnLoad,
   hasInline, isExternal, textLength, cloneFile, sameText, meta, inlineAll, headerNamesSkill,
-  textMissing, beginSourceWork, whileSourceWork, sourceWorkInFlight, flushDirs,
-  _cache: { clear() { cache.clear(); cached = 0; warned.clear(); unreadable.clear(); unreferencedSince.clear(); inFlight.clear(); } }, GRACE_MS, _setGraceMs(ms) { graceDefault = ms; },
+  textMissing, textMissingNow, scanSettled, SCAN_MS, _setScanMs(ms) { scanMs = ms; }, beginSourceWork, whileSourceWork, sourceWorkInFlight, flushDirs,
+  _cache: { clear() { cache.clear(); cached = 0; warned.clear(); unreadable.clear(); unreferencedSince.clear(); inFlight.clear(); scans.clear(); pendingScans.clear(); generation.clear(); scanMs = SCAN_MS; } }, GRACE_MS, _setGraceMs(ms) { graceDefault = ms; },
 };
