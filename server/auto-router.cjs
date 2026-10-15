@@ -10,7 +10,12 @@
 /** @param {{roles: () => object|null, provider: () => object, headers: (p: object) => object,
  *           fetchJson: (url: string, init: object, timeoutMs: number) => Promise<object>,
  *           log?: object}} deps */
-function createAutoRouter({ roles, provider, headers, fetchJson, log = console, admit = null, record = () => {} }) {
+// #1849: `machine` (chat-machines.cjs: { target, ready, fetchJson }) sends the classifier to the Fast role's Inference
+// machine when Fast is on one: the model that machine serves, no local key, no admission (nothing is loaded here),
+// the on-this-network fetch with no redirects. A machine that is not answering, or serves another model, skips the
+// classifier as an over-budget engine does: the rules default to fast, and the Fast turn then says what is wrong.
+// Fast here (or no `machine`): exactly as before.
+function createAutoRouter({ roles, provider, headers, fetchJson, log = console, admit = null, record = () => {}, machine = null }) {
 
   function heuristicWantsSmart(message) {
     const m = String(message);
@@ -106,7 +111,18 @@ function createAutoRouter({ roles, provider, headers, fetchJson, log = console, 
     // never a reason to swap models: when its model is not the resident one (or would not fit),
     // the rules above have already had their say and the message goes to fast, without any
     // request to the engine. `admit` answers null to proceed or { cause } to skip.
-    if (admit) {
+    let remote = null;
+    if (machine) { try { remote = machine.target('fast') || null; } catch { remote = null; } }
+    if (remote) {
+      let ready;
+      try { ready = await machine.ready(remote); } catch { ready = { ok: false, code: 'machineUnreachable' }; }
+      if (!ready?.ok) {
+        const cause = ready?.code === 'machineWrongModel' ? 'machine-wrong-model' : 'machine-unreachable';
+        try { record({ selected: 'fast', fellBack: 'classifier-skipped', cause }); } catch { /* text-free log only */ }
+        log.log(`[router] classifier skipped (${cause}), rules default to fast`);
+        return 'fast';
+      }
+    } else if (admit) {
       let blocked;
       try { blocked = await admit(active.fast); } catch { blocked = { cause: 'admission-error' }; }
       if (blocked) {
@@ -117,15 +133,15 @@ function createAutoRouter({ roles, provider, headers, fetchJson, log = console, 
       }
     }
     try {
-      const defaultProvider = provider();
-      const url = `${defaultProvider.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`;
+      const defaultProvider = remote ? null : provider();
+      const url = remote ? `${remote.baseUrl}/v1/chat/completions` : `${defaultProvider.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`;
       const call = (suppressThinking) =>
-        fetchJson(
+        (remote ? machine.fetchJson : fetchJson)(
           url,
           {
             method: 'POST',
-            headers: headers(defaultProvider),
-            body: classifierBody(active.fast, message, suppressThinking, withCode),
+            headers: remote ? { 'Content-Type': 'application/json' } : headers(defaultProvider),
+            body: classifierBody(remote ? remote.model : active.fast, message, suppressThinking, withCode),
           },
           20000,
         );
