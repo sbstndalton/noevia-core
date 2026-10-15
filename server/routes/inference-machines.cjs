@@ -18,7 +18,7 @@
 // The effective address of each service (what it reaches now, from this registry, the service's own
 // saved setting or the deployment's environment) goes to administrators only.
 
-const { machineState } = require('../machine-health.cjs');
+const { machineState, machineReason } = require('../machine-health.cjs');
 const { SERVICES } = require('../inference-machines.cjs');
 
 const PASS = Symbol('unhandled');
@@ -32,8 +32,10 @@ const ACTIONS = new Set(['add', 'update', 'remove', 'assign']);
  * @param {object} deps.machines            inference-machines.cjs instance
  * @param {object} deps.health              machine-health.cjs instance
  * @param {Record<string, () => (string|null)>} [deps.effective]  where decision, embedding and reranker reach now
+ * @param {Record<string, (url:string) => (object|null)>} [deps.authHeaders]  #1856: the headers the real client sends to that same address (decision, sensitivity); null/{} when none
+ * @param {() => ({url:string, path:string, headers?:object}|null)} [deps.engine]  #1856: what to ask of this machine's own inference engine / model loader
  */
-function createInferenceMachineRoutes({ json, readJson, machines, health, effective = {}, chatMachines = null }) {
+function createInferenceMachineRoutes({ json, readJson, machines, health, effective = {}, chatMachines = null, authHeaders = {}, engine = null }) {
   // #1840: a chat role on a machine reaches that machine's server; on this machine it has no address of its own here.
   const chatUrl = (service) => { const role = SERVICES[service]?.mode === 'chat' ? SERVICES[service].role : null; const t = role && machines.chatTarget ? machines.chatTarget(role) : null; return t ? t.baseUrl : null; };
   const effectiveUrl = (service) => { if (SERVICES[service]?.mode === 'chat') return chatUrl(service); try { return effective[service] ? effective[service]() || null : null; } catch { return null; } };
@@ -42,11 +44,22 @@ function createInferenceMachineRoutes({ json, readJson, machines, health, effect
     // #1841/#1844: OCR, Docling and the sensitivity check are probed the same way (GET /health at their origin); the sensitivity
     // check, like the workers, is reached with link-local refused, so it does not use the decision service's link-local probe.
     const chat = Object.keys(SERVICES).filter((id) => SERVICES[id].mode === 'chat' && chatUrl(id));
-    const targets = ['decision', 'sensitivity', 'embedding', 'reranker', 'ocr', 'documents', ...chat].map((service) => ({ service, url: effectiveUrl(service), decision: service === 'decision' }));
+    const headersFor = (service, url) => { try { return url && authHeaders[service] ? authHeaders[service](url) || null : null; } catch { return null; } };
+    const targets = ['decision', 'sensitivity', 'embedding', 'reranker', 'ocr', 'documents', ...chat].map((service) => { const url = effectiveUrl(service); return { service, url, decision: service === 'decision', headers: headersFor(service, url) }; });
+    // #1856: this machine's own engine is probed where the app really reaches it (the model loader, else the default provider), not at a guessed /health.
+    let local = null;
+    try { local = engine ? engine() : null; } catch { local = null; }
+    if (local?.url) targets.push({ service: 'engine', url: local.url, path: local.path, headers: local.headers || null });
     const services = await health.check(targets);
-    const out = {};
-    for (const m of view.machines) out[m.id] = machineState(m.services.map((s) => services[s]));
-    return { services, machines: out };
+    const out = {}, reasons = {};
+    for (const m of view.machines) {
+      const list = m.services.map((s) => services[s]);
+      if (m.id === 'local' && services.engine) list.push(services.engine);
+      out[m.id] = machineState(list);
+      const why = machineReason(list);
+      if (why) reasons[m.id] = why;
+    }
+    return { services, machines: out, reasons };
   }
 
   function withUrls(view) {
