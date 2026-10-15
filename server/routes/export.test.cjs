@@ -3,16 +3,16 @@
 // clear message and is neither audited nor sent (#867). Synthetic histories only.
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createExportRoutes } = require('./export.cjs');
+const { createExportRoutes, exportRustOwned } = require('./export.cjs');
 const { MAX_EXPORT_ENTRIES } = require('../chat-export.cjs');
 
-function run({ freeChats, readHistory = () => [{ role: 'user', content: 'hello' }], method = 'GET', authn = { user: { id: 'u1' } } }) {
+function run({ freeChats, readHistory = () => [{ role: 'user', content: 'hello' }], method = 'GET', authn = { user: { id: 'u1' } }, env = {} }) {
   const audits = [], res = { headers: null, ended: null, status: null, body: null };
   res.writeHead = (status, headers) => { res.status = status; res.headers = headers; };
   res.end = (data) => { res.ended = data; };
   const routes = createExportRoutes({
     json: (r, status, body) => { r.status = status; r.body = body; }, workspace: () => ({ freeChats, projects: [] }), readHistory,
-    audit: (...a) => audits.push(a), now: () => Date.UTC(2026, 9, 5),
+    audit: (...a) => audits.push(a), now: () => Date.UTC(2026, 9, 5), env,
   });
   return routes({ method }, res, { path: '/api/export/conversations', authn }).then((handled) => ({ handled, res, audits }));
 }
@@ -46,4 +46,40 @@ test('an unexpected failure is not disguised as 413', async () => {
 test('sign-in and method checks still come first', async () => {
   assert.equal((await run({ freeChats: [], authn: null })).res.status, 401);
   assert.equal((await run({ freeChats: [], method: 'POST' })).res.status, 405);
+});
+
+// #1315: behind a front confirmed to answer the export itself, Node refuses the GET it should never
+// see, before anything is read or audited; every partial confirmation leaves it answering.
+const OWNED = {
+  NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_AUTH_CONFIRMED: '1',
+  NOEVIA_RUST_PROJECTS: '1', NOEVIA_RUST_PROJECTS_CONFIRMED: '1', NOEVIA_RUST_FREE_CHATS_CONFIRMED: '1',
+  NOEVIA_RUST_EXPORT: '1', NOEVIA_RUST_EXPORT_CONFIRMED: '1',
+};
+
+test('a confirmed Rust export is refused here: 503, nothing read, no audit', async () => {
+  let reads = 0;
+  const { handled, res, audits } = await run({ freeChats: [{ id: 'c-1', title: 'x' }], readHistory: () => { reads++; return []; }, env: OWNED });
+  assert.equal(handled, true);
+  assert.equal(res.status, 503);
+  assert.deepEqual(res.body, { error: 'Conversation export is owned by the Rust front.' });
+  assert.equal(res.ended, null);
+  assert.equal(reads, 0);
+  assert.equal(audits.length, 0);
+  // Sign-in and method answers are unchanged.
+  assert.equal((await run({ freeChats: [], authn: null, env: OWNED })).res.status, 401);
+  assert.equal((await run({ freeChats: [], method: 'POST', env: OWNED })).res.status, 405);
+  assert.equal(exportRustOwned(OWNED), true);
+});
+
+test('without every confirmation Node keeps answering the export', async () => {
+  for (const key of Object.keys(OWNED)) {
+    for (const value of [undefined, '0', 'true']) {
+      const env = { ...OWNED, [key]: value };
+      if (key === 'NOEVIA_FRONT' && value === undefined) env.NOEVIA_FRONT = 'node';
+      assert.equal(exportRustOwned(env), false, `${key}=${value}`);
+      const { res } = await run({ freeChats: [{ id: 'c-1', title: 'One' }], env });
+      assert.equal(res.status, 200, `${key}=${value}`);
+    }
+  }
+  assert.equal(exportRustOwned({}), false);
 });

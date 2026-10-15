@@ -34,6 +34,8 @@ async function main() {
   if (process.env.NOEVIA_RUST_ROUTING_MODE === '1') Object.assign(env, { NOEVIA_RUST_ROUTING_MODE: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_ROUTING_MODE_CONFIRMED: process.env.NOEVIA_RUST_ROUTING_MODE_CONFIRMED === '1' ? '1' : '' });
   // M6 engine statistics (#1650): GET /api/stats is refused only once the front's rust-stats is confirmed.
   if (process.env.NOEVIA_RUST_STATS === '1') Object.assign(env, { NOEVIA_RUST_STATS: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_STATS_CONFIRMED: process.env.NOEVIA_RUST_STATS_CONFIRMED === '1' ? '1' : '' });
+  // M4 conversation export (#1315): the GET is refused only once the front's rust-export is confirmed.
+  if (process.env.NOEVIA_RUST_EXPORT === '1') Object.assign(env, { NOEVIA_RUST_EXPORT: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_EXPORT_CONFIRMED: process.env.NOEVIA_RUST_EXPORT_CONFIRMED === '1' ? '1' : '' });
   // M4 connected-storage metadata (noevia#1368): GET /api/integrations/storage is refused only once
   // the front's rust-storage-reads is confirmed (features.cjs rustStorageReadsOwned).
   if (process.env.NOEVIA_RUST_STORAGE_READS === '1') Object.assign(env, { NOEVIA_RUST_STORAGE_READS: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_STORAGE_READS_CONFIRMED: process.env.NOEVIA_RUST_STORAGE_READS_CONFIRMED === '1' ? '1' : '' });
