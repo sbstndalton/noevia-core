@@ -1076,6 +1076,19 @@ const embeddingRoutes = require('./routes/embedding.cjs').createEmbeddingRoutes(
 // Settings → Inference machines (routes/inference-machines.cjs, #1638), administrators only.
 const inferenceMachineRoutes = require('./routes/inference-machines.cjs').createInferenceMachineRoutes({ json, readJson, machines: inferenceMachines,
   health: machineHealth, chatMachines,
+  // #1856: the same key the decision client sends, to its own host only (backend().baseUrl must be the probed origin).
+  authHeaders: {
+    decision: (url) => { const b = decisionSettings.backend(); return b?.baseUrl && new URL(b.baseUrl).origin === new URL(url).origin ? b.healthHeaders : null; },
+    sensitivity: (url) => { const b = decisionSettings.sensitivityBackend(); return b?.baseUrl && new URL(b.baseUrl).origin === new URL(url).origin ? b.healthHeaders : null; },
+  },
+  // #1856: this machine's own engine: the model loader models.cjs asks (/api/v1/models, its token), else the default provider (/v1/models, its key).
+  engine: () => {
+    const loader = String(process.env.MODEL_LOADER_URL || '').trim();
+    if (loader) { try { const u = new URL(loader); return { url: u.origin, path: `${u.pathname.replace(/\/+$/, '')}/api/v1/models`, headers: process.env.MODEL_LOADER_TOKEN ? { 'X-Model-Loader-Token': process.env.MODEL_LOADER_TOKEN } : null }; } catch { return null; } }
+    const p = getProvider(DEFAULT_PROVIDER_ID);
+    if (!p?.baseUrl) return null;
+    try { const u = new URL(String(p.baseUrl).replace(/\/+$/, '').replace(/\/v1$/, '')); const h = providerHeaders(p); const auth = h?.Authorization ? { Authorization: h.Authorization } : null; return { url: u.origin, path: `${u.pathname.replace(/\/+$/, '')}/v1/models`, headers: auth }; } catch { return null; }
+  },
   effective: {
     decision: () => { const c = require('./decision-endpoint.cjs').configuration({ COWORK_DECISION_URL: decisionSettings.get().url }); return c.reason ? null : c.baseUrl; },
     // #1844: its own address (a machine, else COWORK_SENSITIVITY_DECISION_URL), or null while it is shared with the decision service.

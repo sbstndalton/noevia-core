@@ -121,6 +121,8 @@ function createDecisionEndpoint({ env=process.env, linkLocal=true, fetchImpl=lin
   const headers=key ? {'Content-Type':'application/json',Authorization:`Bearer ${key}`} : {'Content-Type':'application/json'};
   return {
     model:profile.id, wording:wording||profile.wording,
+    /** #1856: what a health probe sends to this endpoint's own host: the same bearer key the client sends, or nothing. */
+    healthHeaders:key?{Authorization:`Bearer ${key}`}:{}, baseUrl:config.baseUrl,
     async decide(input,{signal}={}) {
       const state=JSON.stringify({goal:input.goal.slice(0,300),outputs:input.outputs.slice(-3).map(o=>({role:o.role,content:o.content.slice(-150)}))});
       const result=await this.choice({state,question:words.question,options:words.options.map(o=>({...o}))}, {signal});

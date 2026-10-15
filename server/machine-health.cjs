@@ -8,39 +8,52 @@
 //   - only on request (GET /api/models/machines?health=1), never on a timer.
 // Every probe goes through the on-this-network fetch (service-endpoint.cjs): a name that now
 // resolves to a public address is refused at connect time and reads "unreachable".
-// States: 'up' (2xx), 'down' (it answered, not 2xx; `reason` http-NNN), 'unreachable' (no answer).
+// States: 'up' (2xx; also 401/403 when no key applies: reason 'needs-auth', the service is there and wants a login),
+// 'down' (it answered, not 2xx; `reason` http-NNN; also a 401/403 to a key we sent), 'unreachable' (no answer; `reason`
+// refused / timeout / not-found / not-on-this-network / network).
+// #1856: a target may carry `headers` (the key the real client sends to that same host, nothing else) and a `path`.
 
 const { serviceFetch, decisionServiceFetch } = require('./service-endpoint.cjs');
 
 /** The health URL of a service base URL: /health at its origin (llama-server, TEI and the decision service all answer it). */
-function healthUrl(base) {
+function healthUrl(base, path = '/health') {
   try {
     const u = new URL(String(base || '').trim());
     if (!['http:', 'https:'].includes(u.protocol)) return null;
-    return `${u.protocol}//${u.host}/health`;
+    return `${u.protocol}//${u.host}${path}`;
   } catch { return null; }
 }
 
 function createMachineHealth({ fetchImpl = serviceFetch, decisionFetchImpl = decisionServiceFetch, ttlMs = 30000, timeoutMs = 2500, maxEntries = 32, now = Date.now } = {}) {
   const cache = new Map(); // url -> { at, result } | { pending }
 
-  async function probeOnce(url, fetcher) {
+  async function probeOnce(url, fetcher, headers) {
+    const sent = !!(headers && Object.keys(headers).length);
     try {
-      const r = await fetcher(url, { method: 'GET', redirect: 'error', signal: AbortSignal.timeout(timeoutMs) });
+      const r = await fetcher(url, { method: 'GET', redirect: 'error', signal: AbortSignal.timeout(timeoutMs), ...(sent ? { headers } : {}) });
       try { await r.body?.cancel?.(); } catch { /* nothing to read */ }
-      return r.ok ? { state: 'up' } : { state: 'down', reason: `http-${Number(r.status) || 0}` };
+      const status = Number(r.status) || 0;
+      if (r.ok) return { state: 'up' };
+      // It answered and wants a login: it is there. Only a key we sent and it refused is a fault.
+      if ((status === 401 || status === 403) && !sent) return { state: 'up', reason: 'needs-auth' };
+      return { state: 'down', reason: `http-${status}` };
     } catch (err) {
-      return { state: 'unreachable', reason: err?.code === 'EPUBLICADDR' ? 'not-on-this-network' : err?.name === 'TimeoutError' || err?.name === 'AbortError' ? 'timeout' : 'network' };
+      const code = err?.code || err?.cause?.code;
+      const reason = code === 'EPUBLICADDR' ? 'not-on-this-network'
+        : code === 'ECONNREFUSED' ? 'refused'
+          : err?.name === 'TimeoutError' || err?.name === 'AbortError' || code === 'ETIMEDOUT' || code === 'UND_ERR_CONNECT_TIMEOUT' ? 'timeout'
+            : code === 'ENOTFOUND' || code === 'EAI_AGAIN' ? 'not-found' : 'network';
+      return { state: 'unreachable', reason };
     }
   }
 
-  function probe(base, { decision = false } = {}) {
-    const url = healthUrl(base);
+  function probe(base, { decision = false, headers = null, path = '/health' } = {}) {
+    const url = healthUrl(base, path);
     if (!url) return Promise.resolve({ state: 'unknown' });
     const hit = cache.get(url);
     if (hit?.pending) return hit.pending;
     if (hit && now() - hit.at < ttlMs) return Promise.resolve(hit.result);
-    const pending = probeOnce(url, decision ? decisionFetchImpl : fetchImpl).then((result) => {
+    const pending = probeOnce(url, decision ? decisionFetchImpl : fetchImpl, headers).then((result) => {
       const out = { ...result, checkedAt: new Date(now()).toISOString() };
       cache.delete(url);
       cache.set(url, { at: now(), result: out });
@@ -72,13 +85,13 @@ function createMachineHealth({ fetchImpl = serviceFetch, decisionFetchImpl = dec
   }
 
   /**
-   * @param {{service:string, url:string|null, decision?:boolean}[]} targets
+   * @param {{service:string, url:string|null, decision?:boolean, headers?:object, path?:string}[]} targets
    * @returns {Promise<Record<string, {state:string, reason?:string, checkedAt?:string}>>}
    */
   async function check(targets) {
     const out = {};
     await Promise.all(targets.map(async (t) => {
-      out[t.service] = t.url ? await probe(t.url, { decision: !!t.decision }) : { state: 'unknown' };
+      out[t.service] = t.url ? await probe(t.url, { decision: !!t.decision, headers: t.headers || null, path: t.path || '/health' }) : { state: 'unknown' };
     }));
     return out;
   }
@@ -95,4 +108,11 @@ function machineState(states) {
   return 'up';
 }
 
-module.exports = { createMachineHealth, machineState, healthUrl };
+/** #1856: the reason of the worst probed service on a machine (unreachable, then down), or '' when it is healthy. */
+function machineReason(states) {
+  const list = states.filter((s) => s && s.state !== 'unknown');
+  const worst = list.find((s) => s.state === 'unreachable') || list.find((s) => s.state === 'down');
+  return worst?.reason || '';
+}
+
+module.exports = { createMachineHealth, machineState, machineReason, healthUrl };

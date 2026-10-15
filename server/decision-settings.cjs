@@ -98,7 +98,7 @@ function createDecisionSettings({store,env=process.env,fetchImpl=decisionService
     const endpoint=createDecisionEndpoint({env:{COWORK_DECISION_URL:config.baseUrl,
       ...(model?{COWORK_DECISION_MODEL:model}:{}),
       ...(apiKey?{COWORK_DECISION_API_KEY:apiKey}:{})},linkLocal,fetchImpl:linkLocal?fetchImpl:sensitivityFetchImpl});
-    const made={id:'decision-service',supports:kind=>kinds.includes(kind),locality:'local',limits:SERVICE_LIMITS,
+    const made={id:'decision-service',healthHeaders:endpoint.healthHeaders,baseUrl:endpoint.baseUrl,supports:kind=>kinds.includes(kind),locality:'local',limits:SERVICE_LIMITS,
       model:endpoint.model,wording:endpoint.wording,
       async decide(request,opts) {
         const options=request.options||[];
