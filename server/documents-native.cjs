@@ -28,17 +28,37 @@ const QUEUE_WAIT_MS = 30_000;
 const MAX_IMAGE_PIXELS = 64 * 1024 * 1024;
 
 /** The walk itself: native text per page, image-bearing pages flagged for OCR. */
-async function readNativePages(bytes, { pageCap, pageTextCap, totalTextCap }) {
+// #1864: `firstPage` starts the walk there, so a large PDF is read as a series of page ranges, each in
+// its own worker with its own time and memory limits. Without it the walk is what it always was.
+async function readNativePages(bytes, { pageCap, pageTextCap, totalTextCap, firstPage = 1 }) {
   const { getDocumentProxy, getResolvedPDFJS } = require('unpdf');
   let pdf;
   try {
-    pdf = await getDocumentProxy(new Uint8Array(bytes), { maxImageSize: MAX_IMAGE_PIXELS, isEvalSupported: false });
+    // #1871: a view over shared memory (the one copy of a large PDF that all its range workers share) is not
+    // copied: pdf.js asks for the byte ranges it needs through a range transport and gets copies of just
+    // those, so a range read holds the parts of the file it parses, not a whole copy. Anything else is read
+    // whole, as before.
+    const shared = bytes instanceof Uint8Array && typeof SharedArrayBuffer !== 'undefined' && bytes.buffer instanceof SharedArrayBuffer;
+    if (shared) {
+      const pdfjs = await getResolvedPDFJS();
+      const length = bytes.byteLength;
+      const transport = new pdfjs.PDFDataRangeTransport(length, bytes.slice(0, Math.min(length, 65536)));
+      transport.requestDataRange = (begin, end) => {
+        const from = Math.max(0, begin), to = Math.min(length, end);
+        queueMicrotask(() => transport.onDataRange(from, bytes.slice(from, to)));
+      };
+      pdf = await pdfjs.getDocument({ range: transport, length, disableAutoFetch: true, disableStream: true,
+        maxImageSize: MAX_IMAGE_PIXELS, isEvalSupported: false }).promise;
+    } else {
+      pdf = await getDocumentProxy(new Uint8Array(bytes), { maxImageSize: MAX_IMAGE_PIXELS, isEvalSupported: false });
+    }
     const { OPS } = await getResolvedPDFJS();
     const imageOps = new Set(Object.entries(OPS).filter(([name]) => /paint.*Image|paintImageMask/.test(name)).map(([, value]) => value));
     const markOps = new Set(Object.entries(OPS).filter(([name]) => /^(stroke|fill|eoFill|shadingFill|paint)/.test(name)).map(([, value]) => value));
     const pageTexts = [];
     let remaining = totalTextCap;
-    for (let number = 1; number <= Math.min(pdf.numPages, pageCap); number++) {
+    const first = Number.isSafeInteger(firstPage) && firstPage > 0 ? firstPage : 1;
+    for (let number = first; number <= Math.min(pdf.numPages, first + pageCap - 1); number++) {
       const page = await pdf.getPage(number);
       try {
         const content = await page.getTextContent();
@@ -85,12 +105,15 @@ function createReader({ maxPending = MAX_PENDING, maxPendingBytes = MAX_PENDING_
   function runWorker(bytes, { timeLimitMs = TIME_LIMIT_MS, heapLimitMb = HEAP_LIMIT_MB, growthLimitMb = GROWTH_LIMIT_MB,
     script = __filename, rss = () => process.memoryUsage.rss(), ...caps }) {
     return new Promise((resolve, reject) => {
-      // The caller's Buffer may be a slice of a shared pool. Transfer only this private copy.
-      const copy = copyBytes(bytes);
+      // #1871: bytes in shared memory (sharedBytes below) are handed to the worker as they are, not copied:
+      // the range reads of one large PDF share one copy. Anything else: the caller's Buffer may be a slice
+      // of a shared pool, so transfer only a private copy, made AFTER the baseline so it counts as growth.
+      const shared = typeof SharedArrayBuffer !== 'undefined' && bytes instanceof Uint8Array && bytes.buffer instanceof SharedArrayBuffer;
       const baseline = rss();
+      const copy = shared ? bytes : copyBytes(bytes);
       const worker = makeWorker(script, {
         workerData: { noeviaPdfWorker: true, bytes: copy, caps },
-        transferList: [copy.buffer],
+        transferList: shared ? [] : [copy.buffer],
         resourceLimits: { maxOldGenerationSizeMb: heapLimitMb, maxYoungGenerationSizeMb: Math.min(64, heapLimitMb) },
         // Nothing from the server's environment is the parser's business. pdf.js's own warnings
         // still reach the server log through the inherited stdout/stderr.
@@ -150,10 +173,20 @@ function createReader({ maxPending = MAX_PENDING, maxPendingBytes = MAX_PENDING_
 
 const readInWorker = createReader();
 
+// #1871: one shared-memory copy of a document's bytes, made once and reused by every range read of it.
+const sharedCopies = new WeakMap();
+function sharedBytes(bytes) {
+  if (typeof SharedArrayBuffer === 'undefined') return bytes;
+  if (bytes instanceof Uint8Array && bytes.buffer instanceof SharedArrayBuffer) return bytes;
+  let view = sharedCopies.get(bytes);
+  if (!view) { view = new Uint8Array(new SharedArrayBuffer(bytes.byteLength)); view.set(bytes); sharedCopies.set(bytes, view); }
+  return view;
+}
+
 if (!isMainThread && workerData && workerData.noeviaPdfWorker) {
   readNativePages(workerData.bytes, workerData.caps)
     .then((result) => parentPort.postMessage({ ok: true, result }))
     .catch((err) => parentPort.postMessage({ ok: false, message: String(err && err.message || err) }));
 }
 
-module.exports = { readInWorker, readNativePages, createReader, TIME_LIMIT_MS, HEAP_LIMIT_MB, GROWTH_LIMIT_MB, MAX_PENDING, MAX_PENDING_BYTES, QUEUE_WAIT_MS };
+module.exports = { readInWorker, sharedBytes, readNativePages, createReader, TIME_LIMIT_MS, HEAP_LIMIT_MB, GROWTH_LIMIT_MB, MAX_PENDING, MAX_PENDING_BYTES, QUEUE_WAIT_MS };

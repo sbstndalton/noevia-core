@@ -359,9 +359,12 @@ async function createFolder(conn, rawPath) {
  *  (a PDF). No extension gate here: the caller decides what it can parse, and
  *  the cap is larger because a document compresses to text far smaller than
  *  its own size. */
+// #1864: `timeoutMs` (default 30 s) bounds the whole read, body included; a caller raising `cap` for a
+// large document raises it with the size.
 async function readBinaryFile(conn, rawPath, opts) {
   const scoped = !!(opts && opts.scope === 'corpus');
   const cap = (opts && opts.cap) || 25 * 1024 * 1024;
+  const timeoutMs = opts && Number.isSafeInteger(opts.timeoutMs) && opts.timeoutMs > 0 ? opts.timeoutMs : 30000;
   const path = safeRelativePath(rawPath);
   if (!path) throw Object.assign(new Error('invalid path'), { status: 400 });
   const s3 = connectionKind(conn) === 's3';
@@ -370,7 +373,7 @@ async function readBinaryFile(conn, rawPath, opts) {
   const response = await withRetry(() => fetch(url, {
     method: 'GET',
     headers: s3 ? signS3Request('GET', url, '', conn.username || '', conn.secret || '', { region: normalizeS3Region(conn.region) }) : davHeaders(conn, {}),
-    signal: AbortSignal.timeout(30000),
+    signal: AbortSignal.timeout(timeoutMs),
     redirect: 'error',
   }));
   if (!response.ok) {
@@ -383,18 +386,28 @@ async function readBinaryFile(conn, rawPath, opts) {
   }
   if (!response.body) return Buffer.alloc(0);
   const reader = response.body.getReader();
+  // #1871: with a declared length the bytes go straight into one buffer of that size, so a large file is
+  // never held twice (the chunks and their concatenation). Without one, chunks are joined at the end.
+  const declaredLength = Number(response.headers.get('content-length'));
+  // A large one (over 25 MiB, a PDF read in page ranges) is placed in shared memory, which the page-range
+  // workers then read in place (documents-native.cjs sharedBytes): one copy of the file in all.
+  const into = !(Number.isSafeInteger(declaredLength) && declaredLength > 0) ? null
+    : declaredLength > 25 * 1024 * 1024 && typeof SharedArrayBuffer !== 'undefined' ? Buffer.from(new SharedArrayBuffer(declaredLength))
+    : Buffer.allocUnsafe(declaredLength);
   const chunks = [];
   let size = 0;
   try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
+      if (size + value.byteLength > cap) { await reader.cancel(); throw tooLarge(); }
+      if (into && size + value.byteLength <= into.length) into.set(value, size);
+      else chunks.push(Buffer.from(value));
       size += value.byteLength;
-      if (size > cap) { await reader.cancel(); throw tooLarge(); }
-      chunks.push(Buffer.from(value));
     }
   } finally { reader.releaseLock(); }
-  return Buffer.concat(chunks, size);
+  if (into && !chunks.length) return size === into.length ? into : into.subarray(0, size);
+  return Buffer.concat(into ? [into.subarray(0, Math.min(size, into.length)), ...chunks] : chunks, size);
 }
 
 /** Write one file, creating or replacing it. Used for a project's own folder,
