@@ -474,7 +474,10 @@ function createProjectStore({
   function ownsFile(project, target) {
     if (!project || typeof target !== 'string' || !target) return false;
     if (require('./storage-client.cjs').safeRelativePath(target) !== target) return false;
-    if ((project.files || []).some(f => f.name === target && f.attachment && f.source === project.projectFolder && require('./uploads.cjs').GROUPS.some(g => target.startsWith(`${project.projectFolder}/${g}/`) && !target.slice(`${project.projectFolder}/${g}/`.length).includes('/')))) return true;
+    // A file noevia itself stored in one of its type groups, including a folder import's nested path
+    // (#1805: `<group>/docs/api/auth.md`). It must be a recorded source by that exact canonical name;
+    // the canonical check above already refused `.`/`..` segments.
+    if ((project.files || []).some(f => f.name === target && f.attachment && f.source === project.projectFolder && require('./uploads.cjs').GROUPS.some(g => target.startsWith(`${project.projectFolder}/${g}/`) && target.length > `${project.projectFolder}/${g}/`.length))) return true;
     const folders = [
       ...(project.projectFolder ? [project.projectFolder] : []),
       ...(Array.isArray(project.sourceFolders) ? project.sourceFolders : []),

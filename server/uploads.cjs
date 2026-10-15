@@ -18,14 +18,17 @@ function original(workspace, id, file) {
 }
 /** The name ingest stores an upload under: its storage path with a connection, else the plain name.
  *  Exported so an in-place edit can check, before writing, that this is the file it means (#648). */
-function destinationFor(project, name, { connection, remotePath } = {}) {
-  return remotePath || (connection ? `${project.projectFolder}/${classify(name)}/${name}` : name);
+/** #1805: `folderPath` is the folder a folder import found the file in (`docs/api`), kept inside the
+ *  type group so two same-named files in different subfolders never meet. Canonical (folder-import.cjs). */
+function destinationFor(project, name, { connection, remotePath, folderPath } = {}) {
+  const rel = folderPath ? `${folderPath}/${name}` : name;
+  return remotePath || (connection ? `${project.projectFolder}/${classify(name)}/${rel}` : rel);
 }
-async function ingest(workspace, project, name, bytes, { connection, source, remotePath, progress = () => {}, storageImpl = storage, extractDocx = docx.extract, ifMatch, ifNoneMatch, created } = {}) {
+async function ingest(workspace, project, name, bytes, { connection, source, remotePath, folderPath, progress = () => {}, storageImpl = storage, extractDocx = docx.extract, ifMatch, ifNoneMatch, created } = {}) {
   workspace.assertActive?.();
   validate(name, bytes);
   const group = classify(name), mime = bytes.length <= 8 * 1024 * 1024 ? images[path.extname(name).toLowerCase()] : undefined;
-  const fullName = destinationFor(project, name, { connection, remotePath });
+  const fullName = destinationFor(project, name, { connection, remotePath, folderPath });
   const previous = (project.files || []).find(f => f.name === fullName);
   if (!previous && (project.files || []).length >= 60) throw Object.assign(new Error('A project holds at most 60 sources.'), { status: 400 });
   if (mime && !previous && (project.assets || []).length >= 12) throw Object.assign(new Error('A project holds at most 12 vision images.'), { status: 400 });
@@ -79,6 +82,11 @@ async function ingest(workspace, project, name, bytes, { connection, source, rem
   if (connection && !remotePath) {
     progress('Saving to Nextcloud / storage');
     await storageImpl.createFolder(connection, `${project.projectFolder}/${group}`);
+    // #1805: each level of a folder import's subfolder, outermost first (MKCOL needs the parent).
+    if (folderPath && connection.kind !== 's3') {
+      let at = `${project.projectFolder}/${group}`;
+      for (const segment of folderPath.split('/')) { at += `/${segment}`; await storageImpl.createFolder(connection, at); }
+    }
     workspace.assertActive?.();
     const written = await (ifMatch !== undefined ? storageImpl.writeFile(connection, fullName, bytes, { ifMatch })
       : ifNoneMatch !== undefined ? storageImpl.writeFile(connection, fullName, bytes, { ifNoneMatch })

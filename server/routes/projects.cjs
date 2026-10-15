@@ -549,6 +549,42 @@ function createProjectRoutes({
       } catch (err) { return json(res, err.status || 422, { error: err.status ? err.message : 'Saved document data is unavailable; upload or refresh again.' }); }
     }
 
+    // #1805: plan a folder import. The client sends the folder's manifest (relative path, size,
+    // SHA-256 of each file); the answer says which files will be uploaded, which are unchanged since
+    // the last import (same content at the same path) and which are skipped and why, and opens an
+    // import id that only the accepted paths can be uploaded under. Nothing is written here.
+    const folderPlan = p.match(/^\/api\/projects\/([^/]+)\/folder-import\/plan$/);
+    if (folderPlan && req.method === 'POST') {
+      const id = decodeURIComponent(folderPlan[1]);
+      const project = getProject(id);
+      if (!project) return json(res, 404, { error: 'no such project' });
+      // Never the Diary or a free chat's attachment context: those are not projects a person imports into.
+      if (id === diaryExtras?.PROJECT_ID || (typeof diaryExtras?.internalProject === 'function' && diaryExtras.internalProject(project))) {
+        return json(res, 400, { error: 'Folders can be imported into a project only.' });
+      }
+      let body;
+      try { body = await readJson(req, 4 * 1024 * 1024); }
+      catch (e) { return json(res, e.status === 413 ? 413 : 400, { error: e.status === 413 ? 'That folder lists too many files to import at once.' : 'invalid JSON' }); }
+      if (!isJsonObject(body)) return json(res, 400, { error: 'request body must be a JSON object' });
+      const folderImport = require('../folder-import.cjs');
+      const uploads = require('../uploads.cjs');
+      const connection = authService.getStorage(authn.user.id, true);
+      const remote = storageClient.isBrowsable(connection);
+      const destination = (rel) => {
+        const slash = rel.lastIndexOf('/');
+        const name = rel.slice(slash + 1), folderPath = slash > 0 ? rel.slice(0, slash) : '';
+        if (remote && !project.projectFolder) return '';
+        return uploads.destinationFor(project, name, { connection: remote ? connection : null, folderPath });
+      };
+      const perFileCap = (rel) => (/\.pdf$/i.test(rel) ? require('../pdf-reduce.cjs').INPUT_CAP : uploads.CAP);
+      try {
+        return json(res, 200, folderImport.plan({ userId: authn.user.id, project, entries: body.entries, destination, perFileCap }));
+      } catch (e) {
+        if (e.status === 400) return json(res, 400, { error: e.message });
+        throw e;
+      }
+    }
+
     // Upload a file into the project's own folder. Text and PDFs both land as
     // real files in the user's storage; the sync that follows converts them
     // into sources, so there is exactly one path from a file to a source
@@ -571,8 +607,26 @@ function createProjectRoutes({
       const isText = storageClient.TEXT_EXTENSIONS.has((rawName.slice(rawName.lastIndexOf('.')) || '').toLowerCase());
       if (body.organized === true) {
         const uploads = require('../uploads.cjs');
-        const inputName = String(body.name || '');
+        let inputName = String(body.name || '');
         const inputBytes = Buffer.from(String(body.dataBase64 || ''), 'base64');
+        // #1805: a file of a folder import carries its path inside the folder and the import's id.
+        // Only a path that import's plan accepted is taken (the caps hold here, not only in the
+        // browser); it is stored under that path inside its type group, and an unchanged file
+        // (same content hash at the same path) is left as it is.
+        const folderImport = body.relativePath === undefined ? null : require('../folder-import.cjs');
+        let folderPath = '', importRel = '';
+        if (folderImport) {
+          try { importRel = folderImport.relativePath(body.relativePath); }
+          catch (e) { return json(res, 400, { error: e.message, code: 'invalidPath' }); }
+          const why = folderImport.skipReason(importRel);
+          if (why) return json(res, 400, { error: folderImport.REASONS[why.code], code: why.code });
+          if (!folderImport.allowed(body.importId, authn.user.id, id, importRel)) {
+            return json(res, 409, { error: 'This file is not part of the current folder import, or the import expired. Import the folder again.', code: 'importNotPlanned' });
+          }
+          const slash = importRel.lastIndexOf('/');
+          inputName = importRel.slice(slash + 1);
+          folderPath = slash > 0 ? importRel.slice(0, slash) : '';
+        }
         // Validate the filename before contacting the document processor.
         uploads.validate(inputName, inputBytes.subarray(0,1));
         return await withSourceLock(project, async () => {
@@ -581,10 +635,19 @@ function createProjectRoutes({
           const connection = authService.getStorage(authn.user.id, true);
           const remote = storageClient.isBrowsable(connection) ? connection : null;
           const progress = requestScope.getStore()?.sourceProgress || (() => {});
-          const replace = body.replace === true;
+          // A folder import updates the file at its path: re-importing a folder never makes a "(2)" copy.
+          const replace = body.replace === true || !!folderImport;
           // #1454: refuse before any work when the name is taken; checked again for a reduced file's new name.
-          const exists = (n) => (project.files || []).some(f => f.name === (remote && project.projectFolder ? uploads.destinationFor(project, n, { connection: remote }) : remote ? null : n));
+          const destinationOf = (n) => (remote && project.projectFolder ? uploads.destinationFor(project, n, { connection: remote, folderPath }) : remote ? null : uploads.destinationFor(project, n, { folderPath }));
+          const exists = (n) => (project.files || []).some(f => f.name === destinationOf(n));
           if (!replace && exists(inputName)) return sourceExistsReply(res, inputName);
+          if (folderImport) {
+            const previous = (project.files || []).find(f => f.name === destinationOf(inputName));
+            if (previous?.attachment?.id && previous.attachment.id === require('node:crypto').createHash('sha256').update(inputBytes).digest('hex')) {
+              folderImport.consume(body.importId, importRel);
+              return json(res, 200, { name: inputName, path: previous.name, bytes: inputBytes.length, unchanged: true, attachment: previous.attachment, document: previous.document });
+            }
+          }
           const {name,bytes,reduction} = await require('../pdf-reduce.cjs').prepare(inputName,inputBytes,{progress});
           uploads.validate(name,bytes);
           if (!replace && name !== inputName && exists(name)) return sourceExistsReply(res, name);
@@ -598,7 +661,7 @@ function createProjectRoutes({
           // #1664: filled by ingest only after a create-only write; any failure before the record is
           // saved removes that file again (conditional on its ETag), so a retry is not a 409 / "(2)".
           const created = {};
-          try { file = await uploads.ingest(currentWorkspace(), project, name, bytes, { connection: remote, progress, ...(remote && !replace ? { ifNoneMatch: '*', created } : {}) }); }
+          try { file = await uploads.ingest(currentWorkspace(), project, name, bytes, { connection: remote, progress, folderPath, ...(remote && !replace ? { ifNoneMatch: '*', created } : {}) }); }
           catch (e) {
             if (!replace && remote && pathTaken(e)) return sourceExistsReply(res, name);
             if (replyStorageFailure(res, storageClient.storageFailure?.(e))) return; throw e;
@@ -616,6 +679,7 @@ function createProjectRoutes({
             defaultProjectDocs(project, hadUploads);
             saveProjects(PROJECTS);
             recorded = true;
+            if (folderImport) folderImport.consume(body.importId, importRel);
           } finally {
             // The unsaved record goes with the file, so the retry is not refused as a same-name source.
             if (!recorded && created.etag && (await uploads.discardCreated(created)).deleted && project.files !== filesBefore) project.files = filesBefore;
@@ -881,9 +945,28 @@ function createProjectRoutes({
             skipped.push({ folder, reason: halted.reason, code: halted.code, retained: previous.some(f => !!f.content) });
             continue;
           }
+          // #1805: every subfolder is read, not only the top level: breadth-first, skipping the shared
+          // system/hidden names (contracts/folder-import.json), bounded by depth and folder count, and
+          // leaving a subfolder that is itself attached to its own entry so no file is synced twice.
+          // A subfolder whose listing fails keeps its previous sources and says so. The 60-source cap
+          // below still bounds what is read.
+          const folderImport = require('../folder-import.cjs');
           let entries;
           try {
-            entries = await storageClient.listFiles(connection, folder);
+            const tree = await folderImport.listTree((dir) => (halted ? Promise.reject(new Error(halted.reason)) : storageClient.listFiles(connection, dir)), folder, {
+              exclude: new Set(folders.filter((other) => other !== folder && other.startsWith(`${folder}/`))),
+              onDirError: (dir, err) => {
+                haltFor(err);
+                fromFolders.push(...(project.files || []).filter(f => f.source === folder && f.name.startsWith(dir + '/')));
+                skipped.push({ folder, file: dir, reason: halted ? halted.reason : 'Could not read this subfolder; previous sources retained.', code: halted ? halted.code : storageCode(err), retained: true });
+              },
+            });
+            entries = tree.files;
+            for (const cut of tree.limited) {
+              fromFolders.push(...(project.files || []).filter(f => f.source === folder && f.name.startsWith(cut.path + '/')));
+              skipped.push({ folder, file: cut.path, code: cut.code, retained: true,
+                reason: cut.code === 'depthLimit' ? `Folders more than ${folderImport.contract.maxDepth} levels deep are not read.` : `Only the first ${folderImport.contract.maxFolders} subfolders are read.` });
+            }
             storageLatch.clear(authn.user.id);
           } catch (e) {
             haltFor(e);
@@ -893,16 +976,7 @@ function createProjectRoutes({
             skipped.push({ folder, reason, code: storageCode(e), retained: previous.some(f => !!f.content) });
             continue;
           }
-          if (folder === project.projectFolder) {
-            for (const entry of [...entries]) {
-              if (entry.isDir && require('../uploads.cjs').GROUPS.includes(entry.name)) {
-                try { entries.push(...await storageClient.listFiles(connection, entry.path)); }
-                catch (err) { haltFor(err); fromFolders.push(...(project.files || []).filter(f => f.source === folder && f.name.startsWith(entry.path + '/'))); skipped.push({ folder, file: entry.path, reason: 'Could not refresh this category; previous sources retained.', retained: true }); }
-              }
-            }
-          }
           for (const entry of entries) {
-            if (entry.isDir) continue; // one level: recursing could pull a whole drive in
             const ext = (entry.ext || '').toLowerCase();
             const isText = storageClient.TEXT_EXTENSIONS.has(ext);
             const isDoc = documents.isDocument(entry.name);

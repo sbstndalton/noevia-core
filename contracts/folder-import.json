@@ -1,0 +1,19 @@
+{
+  "$comment": "#1805 folder import: the one list of names skipped at any depth, the file types a folder import reads, and the default caps. noevia-core owns it; noevia-web keeps a byte-identical pinned copy. The caps are defaults: FOLDER_IMPORT_MAX_FILES and FOLDER_IMPORT_MAX_BYTES override them on the server, which sends the values in force with every plan.",
+  "skipNames": [
+    ".git", ".hg", ".svn", ".DS_Store", ".AppleDouble", ".Spotlight-V100", ".Trashes", ".fseventsd",
+    "node_modules", "bower_components", "__pycache__", ".venv", "venv", ".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    ".cache", ".next", ".nuxt", ".idea", ".vscode", "dist", "build", "Thumbs.db", "desktop.ini", "$RECYCLE.BIN", "System Volume Information"
+  ],
+  "skipHidden": true,
+  "readableExtensions": [
+    ".txt", ".md", ".markdown", ".json", ".csv", ".yml", ".yaml",
+    ".ts", ".tsx", ".js", ".jsx", ".py", ".sh", ".html", ".css",
+    ".pdf", ".docx",
+    ".png", ".jpg", ".jpeg", ".webp", ".gif"
+  ],
+  "maxFiles": 60,
+  "maxBytes": 104857600,
+  "maxDepth": 16,
+  "maxFolders": 400
+}
