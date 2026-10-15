@@ -6,6 +6,7 @@ const TOTAL_TEXT_CAP = 2_000_000;
 const PAGE_CAP = 300;
 const ocr = require('./ocr.cjs');
 const docling = require('./docling.cjs');
+const workers = require('./document-workers.cjs');
 const native = require('./documents-native.cjs');
 const multimodal = require('./multimodal-rag.cjs');
 
@@ -26,10 +27,12 @@ const multimodal = require('./multimodal-rag.cjs');
 // pipeline.
 // #1726: with multimodal RAG on, Docling also returns figures, so a document read without them is read
 // again (the suffix). Off, the version is exactly what it was.
-const FIGURES = docling.enabled() && multimodal.enabled();
-const EXTRACTOR_VERSION = docling.enabled()
-  ? 'docling-pages-v1:' + docling.VERSION + (FIGURES ? ':figures-v1' : '')
-  : 'native-pages-v2' + (process.env.OCR_BASE_URL ? ':' + ocr.VERSION : '');
+// #1841: read at call time, not at load, because Settings → Inference machines can assign OCR or Docling to a
+// machine while the process runs. Nothing assigned: the same values the environment gave at load.
+const figuresOn = () => docling.enabled() && multimodal.enabled();
+const extractorVersion = () => docling.enabled()
+  ? 'docling-pages-v1:' + docling.VERSION + (figuresOn() ? ':figures-v1' : '')
+  : 'native-pages-v2' + (workers.configured('ocr') ? ':' + ocr.VERSION : '');
 
 // What the UI and the upload routes will treat as an extractable document.
 // This is the set that actually gets read — a format outside it is stored
@@ -123,12 +126,12 @@ function parseFigures(list, pageTexts) {
 
 // Preserve native text and add separately labelled OCR for image-bearing pages.
 async function extractDocumentText(name, bytes, {
-  ocrEnabled = !!process.env.OCR_BASE_URL,
+  ocrEnabled = workers.configured('ocr'),
   extractPages = ocr.extractPages,
   doclingEnabled = docling.enabled(),
   extractDocument = docling.extractDocument,
   readPages = native.readInWorker,
-  figures = FIGURES,
+  figures = figuresOn(),
 } = {}) {
   if (!isDocument(name, doclingEnabled)) {
     throw Object.assign(new Error(`not a supported document (${documentExtensions(doclingEnabled).join(', ')})`), { status: 400 });
@@ -177,4 +180,6 @@ async function extractDocumentText(name, bytes, {
   return { ...assembled, error: ocrError || (noText ? (ocrEnabled ? 'No readable text was recovered by OCR; try a clearer scan or an unlocked original.' : 'No readable native text. Scanned or image-based content needs OCR; OCR is not installed.') : undefined),
     ...(ocrError ? (ocrErrorId ? { errorId: ocrErrorId } : {}) : noText ? { errorId: ocrEnabled ? 'noOcrText' : 'noNativeText' } : {}) };
 }
-module.exports = { isDocument, documentExtensions, extractDocumentText, DOCUMENT_EXTENSIONS, EXTRACT_CAP, EXTRACTOR_VERSION, PAGE_CAP, TOTAL_TEXT_CAP };
+// A test may pin the version (multimodal-followups-1770-1772.test.cjs assigns it); production never does.
+let versionOverride = null;
+module.exports = { isDocument, documentExtensions, extractDocumentText, DOCUMENT_EXTENSIONS, EXTRACT_CAP, get EXTRACTOR_VERSION() { return versionOverride ?? extractorVersion(); }, set EXTRACTOR_VERSION(v) { versionOverride = v; }, PAGE_CAP, TOTAL_TEXT_CAP };
