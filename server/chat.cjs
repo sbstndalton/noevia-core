@@ -248,7 +248,7 @@ async function* withIdleLimit(iterable, ms, onIdle = null) {
 }
 
 function createChatHandler({
-  stepSupervision = null, chatMachines = null, fs, path, crypto, fetch, codeTasksFor = () => [], reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, diaryStorageRetry = (send) => send(true), autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, toolGate = null, chatFramingEnabled = () => false, freeChats = () => [], framingReasoner = null, reasoningTraces = null, brainContext = null, DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse, chatListHolder = () => undefined,
+  stepSupervision = null, chatMachines = null, fs, path, crypto, fetch, codeTasksFor = () => [], heuristicWantsCode = require('./auto-router.cjs').createAutoRouter({}).heuristicWantsCode, reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, diaryStorageRetry = (send) => send(true), autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, toolGate = null, chatFramingEnabled = () => false, freeChats = () => [], framingReasoner = null, reasoningTraces = null, brainContext = null, DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse, chatListHolder = () => undefined,
   // #1550: per request, whether a box Automatic may add is usable by this account (its Nextcloud connection, for one).
   automaticToolsReady = () => () => true,
   chatgptOAuth = null, chatgptEnabled = () => false, skillHistory = null,
@@ -292,6 +292,12 @@ function createChatHandler({
   documentDir = (workspace, projectId) => require('./document-sources.cjs').directory(workspace, projectId),
 }) {
   const jsonOut = json;
+  // #1863: a project that shares Code context into chat, or holds Code tasks (read defensively: never fails a turn).
+  const codeProject = (project) => {
+    if (!project) return false;
+    try { if (require('./shared-context.cjs').read(project).chat) return true; } catch { /* unreadable: not code */ }
+    try { return (codeTasksFor(project) || []).length > 0; } catch { return false; }
+  };
   // #1785: whether the local engine has other work now. /api/chat holds one inference request in the gate (index.cjs),
   // so this turn counts as one. A manager without the signal (or one that throws) is not called busy.
   // #1785 review: at most chatTitleLib.MAX_ATTEMPTS title requests per chat (per account), then that chat stops asking.
@@ -300,7 +306,16 @@ function createChatHandler({
   // Revoked Skill content in earlier turns (#546): one ledger per handler, cached in memory.
   const skillLedger = skillHistory || require('./skill-history.cjs').createSkillHistory({ fs, path });
   const writesDone = recentWrites || require('./recent-writes.cjs').createRecentWrites();
+  // #1863 D2: chat turns in flight in this process, so an unused pre-load is never unloaded under another turn.
+  let turnsInFlight = 0;
   async function handleChat(req, res, body, authn) {
+    turnsInFlight++;
+    let counted = true;
+    const uncount = () => { if (counted) { counted = false; turnsInFlight--; } };
+    res.once('finish', uncount); res.once('close', uncount);
+    try { return await handleChatTurn(req, res, body, authn); } finally { if (res.writableEnded || res.destroyed) uncount(); }
+  }
+  async function handleChatTurn(req, res, body, authn) {
     let preparation;
     const execution = {};
     if(body?.spaceId==='diary-extras'&&body.recoveryId){
@@ -1010,6 +1025,7 @@ function createChatHandler({
     let model = (project && project.model) || null;
     let routedRole = null;
     let routingDecision = null;
+    let routePreload = null; // #1863
     if (wantsAuto) {
       const savedRoles = autoRoles();
       if (!savedRoles) {
@@ -1025,6 +1041,26 @@ function createChatHandler({
       const creativeGone = missing.some((m) => m.role === 'creative');
       const staleRoles = staleRolesError(missing.filter((m) => m.role !== 'creative'));
       if (staleRoles) return json(res, 409, { error: staleRoles });
+      // #1863: when every role this turn could end on names the same local model, load it beside the decision.
+      if (!routeTarget?.row && !body.compactOnly && provider.id === DEFAULT_PROVIDER_ID && modelManager.enabled) {
+        const preload = require('./route-preload.cjs');
+        const target = preload.preloadTarget({ roles: savedRoles, remoteRole: (role) => chatMachines?.target(role) || null,
+          hasImages: attachedImages.length > 0 || retrievedImages.length > 0 || msgs.some((m) => typeof m.content !== 'string'),
+          contextHigh: require('./long-profile.cjs').normalizeProfile(project?.contextProfile) === 'high',
+          // The auto-router's own code rule, a project with Code context, or a Task turn: Code may answer.
+          likelyCode: () => heuristicWantsCode(message) || body.mode === 'cowork' || codeProject(project) });
+        if (target) routePreload = await preload.startPreload({ manager: modelManager, model: target, signal: chatSignal.signal, busy: engineBusy, log: (line) => console.log(line) });
+        // An early answer (an error before the model is used) stops waiting on it; the router's own load goes on.
+        // #1863 D2: a turn that ends before it uses the pre-load (an error answer, or Stop) unloads it once loaded,
+        // when no other chat turn is running or waiting and the engine is idle.
+        if (routePreload) {
+          const preloaded = routePreload;
+          let ended = false;
+          const onEnd = () => { if (ended) return; ended = true;
+            void preloaded.releaseIfUnused({ idle: () => turnsInFlight === 0 && !(typeof modelManager.inferenceBusy === 'function' && modelManager.inferenceBusy(0)) }); };
+          res.once('finish', onEnd); res.once('close', onEnd);
+        }
+      }
       const classification = await classifyFastOrSmart(message); // fail-open inside
       routedRole = typeof classification === 'string' ? classification : classification.role;
       routingDecision = typeof classification === 'string' ? null : classification.routingDecision;
@@ -1041,6 +1077,8 @@ function createChatHandler({
       model = routeTarget?.row ? require('./routing-modes.cjs').cloudModel(routeTarget.cloud, routedRole) : roles[routedRole];
       if (routingDecision) routingDecision = { ...routingDecision, effectiveRole: routedRole };
       recordResend(body.resend, { auto: true, role: routedRole, status: routingDecision?.status || null });
+      // #1863: a wrong guess (Code, or another model) stops waiting on the pre-load now, so the swap is not held up.
+      if (routePreload && routePreload.model !== model) { if (!chatSignal.signal.aborted) routePreload.use(); routePreload.cancel(); } // its makeRoomFor evicts it
     } else if (!model && provider.id === DEFAULT_PROVIDER_ID && modelManager.enabled) {
       // No hardcoded model name: default to whatever the manager reports as loaded.
       try {
@@ -1625,6 +1663,15 @@ function createChatHandler({
     try {
       // Native engine: free the GPU of any other chat model before this one loads (it holds two
       // models so the embedding model can stay beside the chat model; two chat models do not fit).
+      // #1863: a pre-load for another model (the turn moved after all) is not needed; one for this model is
+      // awaited here (makeRoomFor queues behind it anyway) with the usual loading status.
+      if(routePreload&&!chatSignal.signal.aborted)routePreload.use(); // a stopped turn leaves it to releaseIfUnused
+      if(routePreload&&routePreload.model!==model)routePreload.cancel();
+      else if(routePreload&&routePreload.pending()){
+        const seconds=context.expectedLoadSeconds(model);
+        send({type:'status',text:context.loadingStatus(model,routedRole||null,seconds),id:'loadingModel',detail:{model,...(routedRole?{role:routedRole}:{}),...(seconds?{expectedSeconds:seconds}:{})}});
+        await routePreload.settled;
+      }
       if(provider.id===DEFAULT_PROVIDER_ID&&typeof modelManager.makeRoomFor==='function')await modelManager.makeRoomFor(model,undefined,chatSignal.signal);
       ({limit,limitSource}=await context.resolveRuntimeLimit({
         manager:provider.id===DEFAULT_PROVIDER_ID?modelManager:null,model,dir:chatWorkspace.dir,
