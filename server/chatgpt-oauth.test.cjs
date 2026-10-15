@@ -44,7 +44,7 @@ function fakeOpenAI() {
         state.onExchange?.();
         if (state.exchangeGate) await state.exchangeGate;
         const n = state.logins;
-        const id = state.fedRampToken ? jwt({ 'https://api.openai.com/auth': { chatgpt_account_id: 'acct-F', chatgpt_account_is_fedramp: true } }) : idToken('acct-A');
+        const id = state.fedRampToken ? jwt({ 'https://api.openai.com/auth': { chatgpt_account_id: 'acct-F', chatgpt_account_is_fedramp: true } }) : idToken('acct-A', undefined, 'planClaim' in state ? state.planClaim : 'plus');
         return json({ access_token: n === 1 ? 'AT-1' : `AT-L${n}`, refresh_token: n === 1 ? 'RT-1' : `RT-L${n}`, id_token: id, expires_in: 3600 });
       }
       if (b.grant_type === 'refresh_token') {
@@ -159,6 +159,19 @@ test('status sends only a short plan identifier; credential-looking keys inside 
   }
   assert.equal(chatgpt.publicPlan('plus'), 'plus');
   assert.equal(chatgpt.publicPlan({ type: 'plus' }), null);
+});
+
+test('the connect audit row carries only a short plan identifier, never an object or credential-like plan (#1838)', async (t) => {
+  for (const [claim, expected] of [['plus', 'plus'], [{ type: 'plus', access_token: 'AT-LEAK' }, undefined], ['sk-LEAK plan with spaces', undefined], ['sk-LEAK"}', undefined], [['plus'], undefined]]) {
+    const f = make(t);
+    f.fake.state.planClaim = claim;
+    const { done } = await connect(f);
+    assert.equal(done.state, 'connected');
+    const row = f.audits.find((a) => a.a === 'chatgpt.oauth.connect');
+    assert.ok(row, 'connect was audited');
+    assert.deepEqual(row.d, { plan: expected }, JSON.stringify(claim));
+    assert.equal(/LEAK|spaces/.test(JSON.stringify(f.audits)), false, JSON.stringify(claim));
+  }
 });
 
 test('tenant isolation: user B has no session, cannot use A’s token, and a copied ciphertext does not open for B', async (t) => {

@@ -557,7 +557,7 @@ function createChatGptOAuth({ db, secrets, fetchImpl = (...args) => globalThis.f
       if (abandoned()) { audit('chatgpt.oauth.cancelled', userId, {}); return { state: 'cancelled' }; }
       write(userId, { ...tokens, connectedAt: now() });
       resetCatalogue(userId);
-      audit('chatgpt.oauth.connect', userId, { plan: tokens.plan || undefined });
+      audit('chatgpt.oauth.connect', userId, { plan: publicPlan(tokens.plan) || undefined });
       return { state: 'connected', account: { email: maskEmail(tokens.email), plan: publicPlan(tokens.plan) } };
     } finally {
       p.polling = false;

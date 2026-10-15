@@ -340,13 +340,13 @@ const hasInline = (projects) => (projects || []).some((p) => filesOf(p).some((f)
 }));
 
 /** The backup migrateOnLoad keeps (see the header), or null when there is no projects.json. */
-function backupProjectsFile(wsDir) {
+function backupProjectsFile(wsDir, tag = '1806') {
   const file = path.join(wsDir, 'projects.json');
   let bytes;
   try { bytes = fs.readFileSync(file); } catch { return null; }
   const dir = path.join(wsDir, 'migration-backups');
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const target = path.join(dir, `projects-pre-1806-${crypto.createHash('sha256').update(bytes).digest('hex').slice(0, 16)}.json`);
+  const target = path.join(dir, `projects-pre-${tag}-${crypto.createHash('sha256').update(bytes).digest('hex').slice(0, 16)}.json`);
   if (!fs.existsSync(target)) {
     const tmp = `${target}.${process.pid}.tmp`;
     fs.writeFileSync(tmp, bytes, { mode: 0o600 });
@@ -484,7 +484,7 @@ if (require.main === module) {
 }
 
 module.exports = {
-  DIR, refOf, projectDir, readText, readTextStrict, writeText, attachFile, attachAll, externalize, collect, migrateOnLoad,
+  DIR, backupProjectsFile, refOf, projectDir, readText, readTextStrict, writeText, attachFile, attachAll, externalize, collect, migrateOnLoad,
   hasInline, isExternal, textLength, cloneFile, sameText, meta, inlineAll, headerNamesSkill,
   textMissing, textMissingNow, scanSettled, SCAN_MS, _setScanMs(ms) { scanMs = ms; }, beginSourceWork, whileSourceWork, sourceWorkInFlight, flushDirs,
   _cache: { clear() { cache.clear(); cached = 0; warned.clear(); unreadable.clear(); unreferencedSince.clear(); inFlight.clear(); scans.clear(); pendingScans.clear(); generation.clear(); scanMs = SCAN_MS; } }, GRACE_MS, _setGraceMs(ms) { graceDefault = ms; },
