@@ -25,4 +25,33 @@ async function extractPages(bytes, pages, options = {}) {
   if (!Array.isArray(body.pages)) throw new Error('Invalid OCR response; refresh to retry.');
   return body.pages;
 }
-module.exports = { extractPages, VERSION };
+// #1867: what the worker reads, from its /health: `{ maxBytes, dpis }` when it says `"ranges": true` (it
+// renders only the asked pages of a body up to maxBytes, and X-OCR-DPI is one of dpis); `{}` for a worker
+// from before that (25 MB, 300 dpi only); null when it could not be asked. A definite answer is kept for a
+// minute. A core that never asks keeps sending at most 25 MB, so old and new versions interoperate.
+const LEGACY_MAX_BYTES = 25 * 1024 * 1024;
+let capabilitiesCache = { at: 0, url: null, value: null };
+async function capabilities(options = {}) {
+  const target = workers.resolve('ocr');
+  const url = options.url === undefined ? target.url : options.url;
+  const fetchImpl = options.fetchImpl || (options.url === undefined ? target.fetch : fetch);
+  if (!url) return null;
+  const now = Date.now();
+  if (!options.fresh && capabilitiesCache.url === url && capabilitiesCache.value !== null && now - capabilitiesCache.at < 60_000) return capabilitiesCache.value;
+  try {
+    const response = await fetchImpl(`${url.replace(/\/+$/, '')}/health`, { method: 'GET', redirect: 'error', signal: AbortSignal.timeout(10_000) });
+    if (!response.ok) return null;
+    const body = await readCappedJson(response, 64 * 1024);
+    const value = body?.ranges === true
+      ? { ...(Number.isSafeInteger(body.maxBytes) && body.maxBytes > 0 ? { maxBytes: body.maxBytes } : {}),
+        ...(Array.isArray(body.dpis) ? { dpis: body.dpis.filter((d) => Number.isSafeInteger(d)) } : {}) }
+      : {};
+    capabilitiesCache = { at: now, url, value };
+    return value;
+  } catch { return null; }
+}
+/** The largest body the worker takes (never below the 25 MB every worker accepts), from `capabilities`. */
+const maxBytesOf = (caps) => Math.max(LEGACY_MAX_BYTES, Number.isSafeInteger(caps?.maxBytes) ? caps.maxBytes : 0);
+/** Whether the worker really renders at `dpi` (an older one ignores X-OCR-DPI and renders at 300). */
+const rendersAt = (caps, dpi) => Array.isArray(caps?.dpis) && caps.dpis.includes(dpi);
+module.exports = { extractPages, capabilities, maxBytesOf, rendersAt, LEGACY_MAX_BYTES, VERSION };
