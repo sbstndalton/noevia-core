@@ -30,8 +30,9 @@ async function ingest(workspace, project, name, bytes, { connection, source, rem
   const group = classify(name), mime = bytes.length <= 8 * 1024 * 1024 ? images[path.extname(name).toLowerCase()] : undefined;
   const fullName = destinationFor(project, name, { connection, remotePath, folderPath });
   const previous = (project.files || []).find(f => f.name === fullName);
-  if (!previous && (project.files || []).length >= 60) throw Object.assign(new Error('A project holds at most 60 sources.'), { status: 400 });
-  if (mime && !previous && (project.assets || []).length >= 12) throw Object.assign(new Error('A project holds at most 12 vision images.'), { status: 400 });
+  // #1805: one place for the project limits (source-limits.cjs, env-configurable).
+  const full = !previous && require('./source-limits.cjs').refusal(project.files, name, { imagesHeld: mime ? (project.assets || []).length : 0 });
+  if (full) throw Object.assign(new Error(full.message), { status: 400, code: full.code });
   workspace.assertActive?.();
   progress('Saving original');
   const id = hash(bytes), dir = directory(workspace, project.id);

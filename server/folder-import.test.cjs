@@ -33,14 +33,15 @@ test('#1805: one shared skip list, at any depth, plus hidden names and unreadabl
 });
 
 test('#1805: caps come from the env, falling back to the contract; a bad value falls back too', () => {
-  assert.deepEqual(fi.limits({}), { maxFiles: contract.maxFiles, maxBytes: contract.maxBytes, maxDepth: contract.maxDepth, maxFolders: contract.maxFolders });
+  assert.deepEqual(fi.limits({}), { maxFiles: contract.projectLimits.sources, maxBytes: contract.maxBytes, maxDepth: contract.maxDepth, maxFolders: contract.maxFolders });
+  assert.equal(fi.limits({ PROJECT_SOURCE_LIMIT: '1000' }).maxFiles, 1000, 'the import cap follows the project source limit');
   assert.equal(fi.limits({ FOLDER_IMPORT_MAX_FILES: '5' }).maxFiles, 5);
   assert.equal(fi.limits({ FOLDER_IMPORT_MAX_BYTES: '1024' }).maxBytes, 1024);
-  for (const bad of ['0', '-3', 'lots', '1.5']) assert.equal(fi.limits({ FOLDER_IMPORT_MAX_FILES: bad }).maxFiles, contract.maxFiles, bad);
+  for (const bad of ['0', '-3', 'lots', '1.5']) assert.equal(fi.limits({ FOLDER_IMPORT_MAX_FILES: bad }).maxFiles, contract.projectLimits.sources, bad);
 });
 
 const sha = (c) => require('node:crypto').createHash('sha256').update(c).digest('hex');
-const planFor = (entries, { files = [], env = {}, userId = 'u1' } = {}) => fi.plan({ userId, project: { id: 'p1', files }, entries, destination: (rel) => `P/${rel}`, perFileCap: () => 25 * 1024 * 1024, env });
+const planFor = (entries, { files = [], assets = [], env = {}, userId = 'u1' } = {}) => fi.plan({ userId, project: { id: 'p1', files, assets }, entries, destination: (rel) => `P/${rel}`, perFileCap: () => 25 * 1024 * 1024, env });
 
 test('#1805: the plan accepts readable files, says why each other one is skipped, and enforces the caps in order', () => {
   const entries = [
@@ -50,7 +51,7 @@ test('#1805: the plan accepts readable files, says why each other one is skipped
   ];
   const r = planFor(entries, { env: { FOLDER_IMPORT_MAX_FILES: '2' } });
   assert.match(r.importId, /^[a-f0-9]{32}$/);
-  assert.deepEqual(r.limits, { maxFiles: 2, maxBytes: contract.maxBytes });
+  assert.deepEqual(r.limits, { maxFiles: 2, maxBytes: contract.maxBytes, projectSources: 60, projectDocuments: 60, projectImages: 12 });
   assert.deepEqual(r.accepted.map((a) => a.path), ['a/deep/er/notes.md', 'a/readme.md']);
   const why = Object.fromEntries(r.skipped.map((s) => [s.path, s.code]));
   assert.deepEqual(why, {
@@ -74,15 +75,49 @@ test('#1805: the plan marks a file unchanged by content hash, counts a changed o
   assert.deepEqual(capped.skipped.map((s) => [s.path, s.code]), [['new.md', 'projectLimit']]);
 });
 
-test('#1805: a ticket admits only its own accepted paths, for its own person and project, once', () => {
-  const r = planFor([{ path: 'a/x.md', size: 3 }, { path: 'tool.exe', size: 3 }]);
-  assert.equal(fi.allowed(r.importId, 'u1', 'p1', 'a/x.md'), true);
-  assert.equal(fi.allowed(r.importId, 'u2', 'p1', 'a/x.md'), false, 'another person');
-  assert.equal(fi.allowed(r.importId, 'u1', 'p2', 'a/x.md'), false, 'another project');
-  assert.equal(fi.allowed(r.importId, 'u1', 'p1', 'tool.exe'), false, 'a skipped path');
-  assert.equal(fi.allowed('nope', 'u1', 'p1', 'a/x.md'), false, 'an unknown import');
-  fi.consume(r.importId, 'a/x.md');
-  assert.equal(fi.allowed(r.importId, 'u1', 'p1', 'a/x.md'), false, 'used once');
+test('#1805: a ticket admits only its own accepted paths, for its own person and project, once, up to the declared size', () => {
+  const r = planFor([{ path: 'a/x.md', size: 3 }, { path: 'a/y.md', size: 5 }, { path: 'tool.exe', size: 3 }]);
+  assert.equal(fi.admit(r.importId, 'u1', 'p1', 'a/x.md', 3), null);
+  assert.equal(fi.admit(r.importId, 'u2', 'p1', 'a/x.md', 3).code, 'importNotPlanned', 'another person');
+  assert.equal(fi.admit(r.importId, 'u1', 'p2', 'a/x.md', 3).code, 'importNotPlanned', 'another project');
+  assert.equal(fi.admit(r.importId, 'u1', 'p1', 'tool.exe', 3).code, 'importNotPlanned', 'a skipped path');
+  assert.equal(fi.admit('nope', 'u1', 'p1', 'a/x.md', 3).code, 'importNotPlanned', 'an unknown import');
+  assert.equal(fi.admit(r.importId, 'u1', 'p1', 'a/x.md', 4).code, 'sizeMismatch', 'more bytes than declared');
+  fi.consume(r.importId, 'a/x.md', 3);
+  assert.equal(fi.admit(r.importId, 'u1', 'p1', 'a/x.md', 3).code, 'importNotPlanned', 'used once');
+  // The running total holds even if a ticket's room shrank (a cap lowered under an open import).
+  fi._tickets.get(r.importId).maxBytes = 6;
+  assert.equal(fi.admit(r.importId, 'u1', 'p1', 'a/y.md', 5).code, 'sizeLimit', 'the running byte total is enforced');
+});
+
+test('#1805: one person opening many imports retires only their own oldest, never another person\'s', () => {
+  const mine = planFor([{ path: 'a.md', size: 1 }], { userId: 'alice' });
+  const theirs = [];
+  for (let i = 0; i < 100; i++) theirs.push(planFor([{ path: 'b.md', size: 1 }], { userId: 'mallory' }).importId);
+  assert.equal(fi.admit(mine.importId, 'alice', 'p1', 'a.md', 1), null, 'alice\'s import survives');
+  const open = theirs.filter((id) => fi._tickets.has(id));
+  assert.deepEqual(open, theirs.slice(-fi.TICKETS_PER_USER), 'mallory keeps only their newest');
+});
+
+test('#1805: images count against the image limit, documents against theirs, all against the source limit', () => {
+  const assets = Array.from({ length: 12 }, (_, i) => ({ id: `img-${i}` }));
+  const img = planFor([{ path: 'pics/a.png', size: 10 }, { path: 'pics/huge.png', size: 9 * 1024 * 1024 }, { path: 'notes.md', size: 3 }], { assets });
+  assert.deepEqual(img.skipped.map((s) => [s.path, s.code, s.max]), [['pics/a.png', 'imageLimit', 12]]);
+  assert.deepEqual(img.accepted.map((a) => a.path), ['notes.md', 'pics/huge.png'], 'an image too large to be model input takes no image slot');
+  const docs = planFor([{ path: 'a.pdf', size: 3 }, { path: 'b.docx', size: 3 }, { path: 'c.md', size: 3 }], { env: { PROJECT_DOCUMENT_LIMIT: '1' } });
+  assert.deepEqual(docs.skipped.map((s) => [s.path, s.code]), [['b.docx', 'documentLimit']]);
+  const many = planFor(Array.from({ length: 5 }, (_, i) => ({ path: `f${i}.md`, size: 1 })), { env: { PROJECT_SOURCE_LIMIT: '3' } });
+  assert.deepEqual(many.accepted.length, 3);
+  assert.equal(many.limits.maxFiles, 3);
+});
+
+test('#1805: paths are NFC, and a path that differs only in case from another in the import or the project is refused', () => {
+  assert.equal(fi.relativePath('cafe\u0301/note.md'), 'caf\u00e9/note.md');
+  const r = planFor([{ path: 'docs/Readme.md', size: 1 }, { path: 'docs/readme.md', size: 1 }, { path: 'cafe\u0301.md', size: 1 }, { path: 'caf\u00e9.md', size: 1 }]);
+  assert.deepEqual(r.accepted.map((a) => a.path), ['caf\u00e9.md', 'docs/Readme.md']);
+  assert.deepEqual(r.skipped.map((s) => [s.path, s.code]).sort(), [['caf\u00e9.md', 'duplicate'], ['docs/readme.md', 'caseCollision']]);
+  const existing = planFor([{ path: 'README.md', size: 1 }], { files: [{ name: 'P/readme.md', attachment: { id: 'x' } }] });
+  assert.deepEqual(existing.skipped.map((s) => [s.path, s.code, s.existing]), [['README.md', 'caseCollision', 'P/readme.md']]);
 });
 
 test('#1805: listTree walks every subfolder breadth-first, skips the shared names, leaves nested attached folders out and stops at the bounds', async () => {

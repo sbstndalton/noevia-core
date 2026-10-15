@@ -291,3 +291,48 @@ test('#1805: a subfolder that cannot be listed keeps its previous sources and is
   assert.ok(names.some(([n, c]) => n === 'Shared/Team/b/two.md' && c === 'two v1'), 'the unreadable subfolder kept its previous source: ' + JSON.stringify(names));
   assert.ok(r.body.skipped.some((s) => s.file === 'Shared/Team/b' && s.retained), JSON.stringify(r.body.skipped));
 });
+
+test('#1805 review: a manifest that declares 1 byte cannot carry a larger body; nothing is written', async (t) => {
+  const d = await dav(t);
+  d.dirs.add('noevia projects'); d.dirs.add(FOLDER);
+  const f = fixture(t, { baseUrl: d.baseUrl, project: proj() });
+  const plan = await f.post('folder-import/plan', { entries: [{ path: 'big.md', size: 1 }] });
+  assert.deepEqual(plan.body.accepted.map((a) => [a.path, a.size]), [['big.md', 1]]);
+  const r = await f.send(plan.body.importId, 'big.md', 'x'.repeat(4096));
+  assert.equal(r.status, 413, JSON.stringify(r.body));
+  assert.equal(r.body.code, 'sizeMismatch');
+  assert.equal(d.files.size, 0);
+  assert.deepEqual(f.project.files, []);
+  assert.equal((await f.send(plan.body.importId, 'big.md', 'x')).status, 200, 'the declared size still goes through');
+});
+
+test('#1805 review: an upload whose path differs only in case from an existing source is refused', async (t) => {
+  const d = await dav(t);
+  d.dirs.add('noevia projects'); d.dirs.add(FOLDER);
+  const f = fixture(t, { baseUrl: d.baseUrl, project: proj() });
+  const stale = (await f.planOf({ 'docs/README.md': 'two' })).body; // planned while nothing clashed
+  await f.importFolder({ 'docs/readme.md': 'one' });
+  const plan = (await f.planOf({ 'docs/README.md': 'two' })).body;
+  assert.deepEqual(plan.skipped.map((s) => s.code), ['caseCollision'], 'the plan refuses it now');
+  const r = await f.send(stale.importId, 'docs/README.md', 'two');
+  assert.equal(r.status, 409, JSON.stringify(r.body));
+  assert.equal(r.body.code, 'caseCollision');
+  assert.deepEqual([...d.files.keys()], [`${FOLDER}/Text/docs/readme.md`]);
+});
+
+test('#1805 review: the project source limit is one env-configurable value the upload path honours', async (t) => {
+  const d = await dav(t);
+  d.dirs.add('noevia projects'); d.dirs.add(FOLDER);
+  const f = fixture(t, { baseUrl: d.baseUrl, project: proj() });
+  process.env.PROJECT_SOURCE_LIMIT = '2';
+  t.after(() => { delete process.env.PROJECT_SOURCE_LIMIT; });
+  const { plan } = await f.importFolder({ 'a.md': 'A', 'b.md': 'B', 'c.md': 'C' });
+  assert.equal(plan.limits.projectSources, 2);
+  assert.equal(plan.limits.maxFiles, 2, 'the import cap follows the source limit');
+  assert.deepEqual(plan.skipped.map((s) => [s.path, s.code]), [['c.md', 'fileLimit']]);
+  const over = await f.post('upload', { name: 'd.md', organized: true, dataBase64: Buffer.from('D').toString('base64') });
+  assert.equal(over.status, 400);
+  assert.equal(over.body.code, 'projectLimit');
+  assert.match(over.body.error, /at most 2 sources/);
+  assert.equal(f.project.files.length, 2);
+});
