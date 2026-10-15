@@ -1199,6 +1199,13 @@ function createChatHandler({
     const resolvedEffort = reasoningEffort.resolveEffort(project, authService?.db?.prepare("SELECT value FROM settings WHERE key='reasoning_effort_default'").get()?.value);
     const effort = reasoningEffort.validEffort(project?.reasoningEffort) ? resolvedEffort
       : reasoningEffort.effortForRoute(resolvedEffort, wantsAuto ? routedRole : null);
+    // #1788 reopen: Low still let gemma-4 think for ~28 s on "hi" (about 11 tok/s: even the 512-token cap is ~45 s). An
+    // Automatic turn routed Fast at the account-default effort runs with thinking OFF on the local engine, through the
+    // template switch the describe call uses (enable_thinking: false; gemma-4 and Qwen3/3.5 templates read it, others
+    // ignore it). An explicit project effort, Smart, Code and explicit picks keep their thinking.
+    const fastThinkingOff = reasoningEffort.fastRouteThinkingOff({ auto: wantsAuto, routedRole, projectEffort: project?.reasoningEffort })
+      && provider.id === DEFAULT_PROVIDER_ID;
+    const thinkingOffFields = fastThinkingOff ? { chat_template_kwargs: { enable_thinking: false } } : {};
     // Task-aware sampling presets (issue #194): applied only when the operator has not turned
     // the feature off and the project has no explicit sampling override for the key in
     // question. `routedRole` (fast/smart/code) is the auto-router's existing signal; a manual
@@ -1568,7 +1575,7 @@ function createChatHandler({
     } catch(error) {send({type:'error',text:error.message});res.end();return;}
     if(body.compactOnly){send({type:'done',model});res.end();return;}
     // #1475/#1477: the local engine's thinking cap for this effort, leaving the answer its room (thinking-budget.cjs).
-    const localThinkingCap = provider.id===DEFAULT_PROVIDER_ID ? require('./thinking-budget.cjs').thinkingCap(effort, prepared.maxTokens) : null;
+    const localThinkingCap = provider.id===DEFAULT_PROVIDER_ID && !fastThinkingOff ? require('./thinking-budget.cjs').thinkingCap(effort, prepared.maxTokens) : null;
     const reportRevocation = () => {
       if (!skillRevocation || skillRevocationReported) return;
       skillRevocationReported = true;
@@ -1763,7 +1770,7 @@ function createChatHandler({
         upstream = await reasoningEffort.requestWithEffort(providerFetch, upstreamUrl, {
           method: 'POST', headers: upstreamHeaders, signal: roundSignal, redirect: 'error',
         }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:true,stream_options:{include_usage:true},
-          ...sampling.params,
+          ...sampling.params, ...thinkingOffFields,
           ...(finalPass ? {} : { ...requestTools(), ...forceChoice(round) })}, provider, model, effort, send, localThinkingCap);
         // A server that rejects the named-function form of tool_choice gets the equivalent it does
         // accept: only that tool, and a call required.
@@ -1772,7 +1779,7 @@ function createChatHandler({
           upstream = await reasoningEffort.requestWithEffort(providerFetch, upstreamUrl, {
             method: 'POST', headers: upstreamHeaders, signal: roundSignal, redirect: 'error',
           }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:true,stream_options:{include_usage:true},
-            ...sampling.params, tools:activeTools.filter((t) => t.function?.name === forcedTool), tool_choice:'required'}, provider, model, effort, send, localThinkingCap);
+            ...sampling.params,...thinkingOffFields, tools:activeTools.filter((t) => t.function?.name === forcedTool), tool_choice:'required'}, provider, model, effort, send, localThinkingCap);
         }
         // #1002: the engine refused the tools because of the model's chat template (llama.cpp could
         // not build a tool-call parser for it). Retry this round once without tools, and say so.
@@ -1786,7 +1793,7 @@ function createChatHandler({
             upstream = await reasoningEffort.requestWithEffort(providerFetch, upstreamUrl, {
               method: 'POST', headers: upstreamHeaders, signal: roundSignal, redirect: 'error',
             }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:true,stream_options:{include_usage:true},
-              ...sampling.params}, provider, model, effort, send, localThinkingCap);
+              ...sampling.params,...thinkingOffFields}, provider, model, effort, send, localThinkingCap);
             // #1015: remembered only when dropping tools is what fixed it; a template that fails
             // either way is not marked, so the next chat still offers tools.
             if (upstream.ok) templateToolsGate.markUnsupported(model);
@@ -1915,7 +1922,7 @@ function createChatHandler({
           roundTimings = null;
           const response = await reasoningEffort.requestWithEffort(providerFetch, upstreamUrl, {
             method:'POST',headers:upstreamHeaders,signal:AbortSignal.any([chatSignal.signal,AbortSignal.timeout(300000)]),redirect:'error',
-          }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:false,...sampling.params,...requestTools(),...forceChoice(round)}, provider, model, effort, send, localThinkingCap);
+          }, {model,max_tokens:prepared.maxTokens,messages:roundMessages,stream:false,...sampling.params,...thinkingOffFields,...requestTools(),...forceChoice(round)}, provider, model, effort, send, localThinkingCap);
           // Status first (#918): a 5xx HTML page is a provider failure, not a JSON parse error.
           if (!response.ok) { send({ type: 'error', text: await providerFailureText(response, chatgptProvider, shownText) }); throw FALLBACK_REPORTED; }
           const full = {ok:true,status:response.status,body:await readCappedJson(response,FALLBACK_REPLY_CAP)};
@@ -2268,16 +2275,26 @@ function createChatHandler({
     // It runs after `done`, so it never holds the reply's completion; the client reads every event until the connection
     // closes (web api.ts streamChat) and still adopts it (web#58). Skipped while the engine is busy: other inference in
     // flight (this turn holds one request in the gate, index.cjs), a held maintenance gate or a pending model load/swap.
-    if (chatTitles && !paused && roundHasContent && roundContent.trim() && typeof body.chatId === 'string' && body.chatId
+    // Reopen: the first COMPLETED reply names the chat, not only turn 1. A chat whose first reply was stopped (it is in
+    // the history as an assistant turn) still carries the title derived from its FIRST message, so a later completed
+    // reply asks for a title while the store says it is still auto-named. A rename wins (no longer derived).
+    const titleChatId = typeof body.chatId === 'string' ? body.chatId : '';
+    const titleListId = body.projectId && project ? project.id : null;
+    const firstMessage = chatTitleLib.firstUserMessage(history, message);
+    const titleDue = () => {
+      if (chatTitleLib.firstReply(history)) return true;
+      try { return typeof chatTitles.autoNamed === 'function' && chatTitles.autoNamed(titleListId, titleChatId, firstMessage) === true; } catch { return false; }
+    };
+    if (chatTitles && !paused && roundHasContent && roundContent.trim() && titleChatId
       && !body.compactOnly && !(typeof spaceId === 'string' && spaceId.startsWith('diary')) && project?.id !== diaryExtras?.PROJECT_ID
       && provider.id === DEFAULT_PROVIDER_ID && !offBoxTurn({ externalProvider, routeTarget, provider, DEFAULT_PROVIDER_ID })
-      && chatTitleLib.firstReply(history) && !engineBusy()) {
+      && titleDue() && !engineBusy()) {
       const title = await chatTitleLib.generateTitle({ fetch, url: upstreamUrl, headers: upstreamHeaders, model, message, reply: roundContent,
         signal: chatSignal.signal, readJson: readCappedJson });
       if (chatSignal.signal.aborted) return;
       if (title) {
-        send({ type: 'title', chatId: body.chatId, title });
-        try { chatTitles.save(body.projectId && project ? project.id : null, body.chatId, title, message); } catch { /* the client saves it too */ }
+        send({ type: 'title', chatId: titleChatId, title });
+        try { chatTitles.save(titleListId, titleChatId, title, firstMessage); } catch { /* the client saves it too */ }
       }
     }
     res.end();

@@ -54,6 +54,13 @@ function firstReply(history) {
   return !(Array.isArray(history) && history.some((h) => h && h.role === 'assistant'));
 }
 
+/** The chat's first user message: the first user turn of the history this turn was sent with, or this turn's
+ *  own message when there is none. A derived title is derived from it, whichever turn is answering now. */
+function firstUserMessage(history, message) {
+  const first = Array.isArray(history) ? history.find((h) => h && h.role === 'user' && typeof h.content === 'string') : null;
+  return first ? first.content : String(message ?? '');
+}
+
 /** A model's answer reduced to a usable title, or null. */
 function cleanTitle(raw) {
   if (typeof raw !== 'string') return null;
@@ -113,4 +120,4 @@ async function generateTitle({ fetch, url, headers = {}, model, message, reply, 
   }
 }
 
-module.exports = { derivedTitle, isDerivedTitle, firstReply, cleanTitle, titleMessages, generateTitle, TITLE_SYSTEM, TITLE_MAX, CHAT_TITLE_MAX };
+module.exports = { firstUserMessage, derivedTitle, isDerivedTitle, firstReply, cleanTitle, titleMessages, generateTitle, TITLE_SYSTEM, TITLE_MAX, CHAT_TITLE_MAX };

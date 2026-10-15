@@ -39,9 +39,9 @@ test('#1785: cleanTitle keeps a short title and drops wrappers, thinking and jun
   assert.equal(titles.cleanTitle(null), null);
 });
 
-async function turn(t, { history = [], provider = { id: 'default', baseUrl: 'http://default.invalid' }, project = {}, titleReply = 'Friendly Greeting', titleStatus = 200, wired = true, busy } = {}) {
+async function turn(t, { history = [], provider = { id: 'default', baseUrl: 'http://default.invalid' }, project = {}, titleReply = 'Friendly Greeting', titleStatus = 200, wired = true, busy, autoNamed, message = FIRST } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-1785-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const events = [], requests = [], saved = [], busyCalls = [];
+  const events = [], requests = [], saved = [], busyCalls = [], autoNamedCalls = [];
   const res = new EventEmitter(); res.writeHead = () => {}; res.end = () => { res.writableEnded = true; res.emit('finish'); };
   res.write = (chunk) => { for (const line of String(chunk).split('\n')) if (line.startsWith('data:')) { try { events.push(JSON.parse(line.slice(5))); } catch { /* not json */ } } };
   const fetch = async (url, init) => {
@@ -65,10 +65,11 @@ async function turn(t, { history = [], provider = { id: 'default', baseUrl: 'htt
     DIARY_BASE: 'http://fixture.invalid', TOOL_RESULT_CAP: 8000, json: () => {}, saveChats() {}, endpointApproved: () => true, diaryHeaders: () => ({}),
     lastLoadedModel: () => null, classifyFastOrSmart: async () => 'fast', servedCatalogue: async () => [], modelsInstalled: async () => [], missingRoles: () => [], staleRolesError: () => null,
     allToolboxes: () => [{ id: 'core' }], chatWideApproved: () => false, recordUsage() {}, recordToolUse() {}, executeToolCall: async () => 'unused', awaitApproval: async () => 'approve',
-    ...(wired ? { chatTitles: { save: (...args) => { saved.push(args); return true; } } } : {}),
+    ...(wired ? { chatTitles: { save: (...args) => { saved.push(args); return true; },
+      ...(autoNamed === undefined ? {} : { autoNamed: (...args) => { autoNamedCalls.push(args); return typeof autoNamed === 'function' ? autoNamed(...args) : autoNamed; } }) } } : {}),
   });
-  await handleChat({}, res, { projectId: 'fixture-project', chatId: 'fixture-chat', message: FIRST, history });
-  return { events, requests, saved, busyCalls, titleRequests: requests.filter((r) => r.body.stream === false) };
+  await handleChat({}, res, { projectId: 'fixture-project', chatId: 'fixture-chat', message, history });
+  return { events, requests, saved, busyCalls, autoNamedCalls, titleRequests: requests.filter((r) => r.body.stream === false) };
 }
 
 test('#1785: after the first local reply the model is asked for a title, the client gets it and it is saved', async (t) => {
@@ -171,4 +172,60 @@ test('#1785: the maintenance gate reports the inference requests in flight (infe
   assert.equal(gate.active(), 2);
   leaveA(); leaveB();
   assert.equal(gate.active(), 0);
+});
+
+// Reopen (live recheck of b84758dc): a chat whose FIRST reply was stopped kept its raw prompt as its title, even after a
+// later follow-up reply completed. The title is due after the first COMPLETED reply, while the chat is still auto-named.
+const FOLLOW_UP = 'QA-SYNTH-2 now list three synthetic facts.';
+const STOPPED_FIRST = [{ role: 'user', content: FIRST }, { role: 'assistant', content: 'Hel' }];
+
+test('#1785 reopen: after a stopped first reply, the next completed reply names the chat (derived from the FIRST message)', async (t) => {
+  const { events, titleRequests, saved, autoNamedCalls } = await turn(t, { history: STOPPED_FIRST, message: FOLLOW_UP, autoNamed: true });
+  assert.equal(titleRequests.length, 1, 'one title request on the follow-up');
+  assert.deepEqual(autoNamedCalls, [['fixture-project', 'fixture-chat', FIRST]], 'auto-named is judged against the first message');
+  assert.deepEqual(events.find((e) => e.type === 'title'), { type: 'title', chatId: 'fixture-chat', title: 'Friendly Greeting' });
+  assert.deepEqual(saved, [['fixture-project', 'fixture-chat', 'Friendly Greeting', FIRST]], 'saved over the title derived from the first message');
+});
+
+test('#1785 reopen: a renamed chat, or one already named, is never asked again', async (t) => {
+  const { titleRequests, events } = await turn(t, { history: STOPPED_FIRST, message: FOLLOW_UP, autoNamed: false });
+  assert.equal(titleRequests.length, 0);
+  assert.equal(events.some((e) => e.type === 'title'), false);
+  const throws = await turn(t, { history: STOPPED_FIRST, message: FOLLOW_UP, autoNamed: () => { throw new Error('store down'); } });
+  assert.equal(throws.titleRequests.length, 0, 'a store that cannot answer is not called auto-named');
+  assert.ok(throws.events.some((e) => e.type === 'done'));
+});
+
+test('#1785 reopen: the later-turn title keeps every other rule: off-box, Diary and busy get none', async (t) => {
+  const offBox = await turn(t, { history: STOPPED_FIRST, message: FOLLOW_UP, autoNamed: true, provider: { id: 'hosted-fixture', baseUrl: 'https://hosted.invalid' }, project: { provider: 'hosted-fixture' } });
+  assert.equal(offBox.titleRequests.length, 0, 'off-box');
+  const busy = await turn(t, { history: STOPPED_FIRST, message: FOLLOW_UP, autoNamed: true, busy: true });
+  assert.equal(busy.titleRequests.length, 0, 'busy');
+  const diary = await turn(t, { history: STOPPED_FIRST, message: FOLLOW_UP, autoNamed: true, project: { id: require('./diary-extras.cjs').PROJECT_ID } });
+  assert.equal(diary.titleRequests.length, 0, 'the Diary');
+});
+
+test('#1785 reopen: chatAutoNamed reads the signed-in workspace: derived or missing is auto-named, a rename is not', () => {
+  const { createProjectStore } = require('./projects.cjs');
+  const ws = { userId: 'alice', dir: fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-1785-auto-')), projects: [{ id: 'p1', chats: [{ id: 'c1', title: FIRST }, { id: 'c2', title: 'Named by me' }] }], freeChats: [{ id: 'f1', title: titles.derivedTitle(FIRST) }],
+    saveProjects() {}, saveFreeChats() {} };
+  const store = createProjectStore({ fs, path, reasoningEffort: { validEffort: () => true }, projectAppearance: () => ({}), rag: {}, storageClient: { isBrowsable: () => false },
+    documentSources: {}, authService: {}, currentWorkspace: () => ws, PROJECTS: ws.projects, FREE_CHATS: ws.freeChats,
+    sanitizeToolboxes: (b) => b, defaultToolboxes: () => ['core'], PROJECT_ROOT_FOLDER: 'root', createProjectFolder: async () => null, projectSweep: { afterDelete: async () => {} } });
+  try {
+    assert.equal(store.chatAutoNamed('p1', 'c1', FIRST), true);
+    assert.equal(store.chatAutoNamed('p1', 'c2', FIRST), false, 'a rename wins');
+    assert.equal(store.chatAutoNamed(null, 'f1', FIRST), true);
+    assert.equal(store.chatAutoNamed(null, 'f1', FOLLOW_UP), false, 'judged against the first message only');
+    assert.equal(store.chatAutoNamed(null, 'not-saved-yet', FIRST), true, 'a meta not saved yet is still auto-named');
+    // setChatTitle with the first message replaces the derived title after a later turn.
+    assert.equal(store.setChatTitle('p1', 'c1', 'Friendly Greeting', FIRST), true);
+    assert.equal(store.chatAutoNamed('p1', 'c1', FIRST), false, 'named once, never asked again');
+  } finally { fs.rmSync(ws.dir, { recursive: true, force: true }); }
+});
+
+test('#1785 reopen: firstUserMessage is the chat\'s first user turn, or this message', () => {
+  assert.equal(titles.firstUserMessage(STOPPED_FIRST, FOLLOW_UP), FIRST);
+  assert.equal(titles.firstUserMessage([], FOLLOW_UP), FOLLOW_UP);
+  assert.equal(titles.firstUserMessage(undefined, FOLLOW_UP), FOLLOW_UP);
 });
