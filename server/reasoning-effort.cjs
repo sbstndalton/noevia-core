@@ -52,9 +52,14 @@ function localEngine(provider) {
       normalize(provider.baseUrl) === normalize(process.env.INFERENCE_BASE_URL);
   } catch { return false; }
 }
+// #1854: a model on an Inference machine whose own /props template reads `enable_thinking` (measured per machine +
+// model, chat-machines.cjs). Never this machine's engine, and never a model or file name.
+function machineThinkingSwitch(provider) {
+  return provider?.machine?.thinkingSwitch === true;
+}
 function nativeThinking(provider, model) {
-  // Only the configured local llama.cpp/Lemonade endpoint and documented Qwen3 templates.
-  return localEngine(provider) && /(?:^|[/_])qwen3(?:\.5)?[-_]/i.test(model);
+  // Only the configured local llama.cpp/Lemonade endpoint and documented Qwen3 templates, or a machine that has the switch.
+  return (localEngine(provider) && /(?:^|[/_])qwen3(?:\.5)?[-_]/i.test(model)) || machineThinkingSwitch(provider);
 }
 function modeFor(provider, model, effort) {
   return effort === 'default' ? 'off' : (documented(provider, model) || nativeThinking(provider, model)) && !rejected.has(capabilityKey(provider, model)) ? 'real' : 'hint';
@@ -84,7 +89,7 @@ function forcedAnswerBody(request, provider, model) {
   const body = { ...rest, stream: true, messages: withNote };
   // Thinking is switched off on the local engine whatever the model: a template without the switch ignores
   // it (the other local callers send it the same way), and no model or file name decides here (#1585).
-  if (localEngine(provider)) body.chat_template_kwargs = { ...rest.chat_template_kwargs, enable_thinking: false };
+  if (localEngine(provider) || machineThinkingSwitch(provider)) body.chat_template_kwargs = { ...rest.chat_template_kwargs, enable_thinking: false };
   return body;
 }
 // thinkingCap (tokens, or null for no cap) is set by chat.cjs for the local engine only. Only a
@@ -138,4 +143,4 @@ async function requestWithEffort(fetcher, url, options, body, provider, model, e
   return capped;
 }
 
-module.exports = { HINTS, localEngine, nativeThinking, validEffort, resolveEffort, effortForRoute, fastRouteThinkingOff, modeFor, requestBody, requestWithEffort, forcedAnswerBody };
+module.exports = { HINTS, localEngine, machineThinkingSwitch, nativeThinking, validEffort, resolveEffort, effortForRoute, fastRouteThinkingOff, modeFor, requestBody, requestWithEffort, forcedAnswerBody };

@@ -65,7 +65,17 @@ function createInferenceMachineRoutes({ json, readJson, machines, health, effect
         if (bad) failing[m.id] = bad;
       }
     }
-    return { services, machines: out, reasons, failing };
+    // #1854: what each chat role's machine measured for its model (context, thinking switch, image input), from the
+    // same cached /props read the turns use; only for a role whose machine answers. Nothing on a machine: no key.
+    const measured = {};
+    if (chatMachines && typeof chatMachines.measurements === 'function') {
+      await Promise.all(chat.filter((id) => services[id]?.state === 'up').map(async (id) => {
+        const t = machines.chatTarget(SERVICES[id].role);
+        if (!t) return;
+        try { measured[id] = await chatMachines.measurements(t); } catch { /* not shown */ }
+      }));
+    }
+    return { services, machines: out, reasons, failing, ...(Object.keys(measured).length ? { measured } : {}) };
   }
 
   function withUrls(view) {

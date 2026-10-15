@@ -1189,7 +1189,9 @@ function createChatHandler({
         if (earlyStream) { send({ type: 'error', code, text: ready.error }); res.end(); return; }
         return json(res, 503, { error: ready.error, code });
       }
-      provider = chatMachines.provider(machineTarget, { contextTokens: await chatMachines.contextTokens(machineTarget, chatSignal.signal) });
+      // #1854: the row carries what this machine's /props says (context, thinking switch), cached per machine + model.
+      provider = typeof chatMachines.measuredProvider === 'function' ? await chatMachines.measuredProvider(machineTarget)
+        : chatMachines.provider(machineTarget, { contextTokens: await chatMachines.contextTokens(machineTarget, chatSignal.signal) });
       externalProvider = false;
       chatgptProvider = false;
       providerFetch = chatMachines.fetch;
@@ -1254,7 +1256,10 @@ function createChatHandler({
     // The ids are already this request's selection (Automatic included), so resolve exactly them: resolveTools reads
     // an Automatic project's list as the default set and would otherwise drop connectors, turn boxes and additions.
     const asSelection = (ids) => ({ ...project, toolsMode: 'manual', toolboxes: ids });
-    const resolveFor = (m) => resolveTools(asSelection(routing.routed ? routing.ids : selectedBoxes), m, blocked);
+    // #1854: a model on a machine is budgeted by the prefill measured on that machine (provider is read at call time,
+    // after any #1550 move); a model here passes exactly the three arguments it always did.
+    const measuredOn = () => (provider.machine ? [{ measureScope: provider.id }] : []);
+    const resolveFor = (m) => resolveTools(asSelection(routing.routed ? routing.ids : selectedBoxes), m, blocked, ...measuredOn());
     let resolved = resolveFor(model), resolvedFor = model;
     // Tool gate (features.toolGate, tool-gate.cjs): runs on the tools this request really offers
     // (after policy blocks and tool routing). Off, it returns 'none' without doing anything, and
@@ -1262,13 +1267,50 @@ function createChatHandler({
     const gate = toolGate && !body.compactOnly ? await toolGate.evaluate(message, resolved.tools, ...(chatFrame ? [steering.gateBias(chatFrame)] : [])) : null;
     // #1550: only a turn the gate says needs a tool moves. Chit-chat, a gate that says no tool, and an unavailable
     // gate (off, timed out, errored) keep the routed model; the template gate below then says the tools are off.
-    if (wantsAuto && !body.compactOnly && !routeTarget?.row && provider.id === DEFAULT_PROVIDER_ID && typeof modelManager?.props === 'function'
+    // #1854: the routed role may be on an Inference machine, and the candidates may be: each is checked where it runs.
+    // A role on a machine is a candidate only when that machine answers and serves its model (ready(): the same health
+    // and served-model rules as a turn routed there) and its own /props template takes tools (the #1850 verdict, kept
+    // per machine + model). A role here is checked against this machine's engine, as before. Nothing on a machine:
+    // the candidates, the checks and the outcome are exactly what they were.
+    const routedOnMachine = !!(provider.machine && machineTarget && wantsAuto && machineTarget.role === routedRole);
+    const localToolsGate = typeof modelManager?.props === 'function';
+    if (wantsAuto && !body.compactOnly && !routeTarget?.row && ((provider.id === DEFAULT_PROVIDER_ID && localToolsGate) || routedOnMachine)
       && toolModes.toolsModeOf(project) === 'auto' && toolModes.gateSaysToolNeeded(gate)) {
-      // #1840: only roles this machine's engine serves are candidates (a role on an Inference machine is not measured here).
-      const moved = await toolModes.toolCapableRoute({ model, routedRole, roles: chatMachines ? chatMachines.localRoles(autoRoles()) : autoRoles(),
-        allowsTools: (m) => templateToolsGate.allowsTools(modelManager, m, chatSignal.signal) });
+      const remoteFor = (role) => (role === routedRole ? (routedOnMachine ? machineTarget : null) : chatMachines ? chatMachines.target(role) : null);
+      const anyRemote = !!chatMachines && (routedOnMachine || Object.keys(chatMachines.remoteRoles()).length > 0);
+      const moved = anyRemote
+        ? await toolModes.toolCapableRoute({ model, routedRole, roles: chatMachines.effectiveRoles(autoRoles()),
+          hostOf: (role) => { const t = remoteFor(role); return t ? `machine:${t.machine.id}` : 'local'; },
+          allowsTools: async (m, role) => {
+            const t = remoteFor(role);
+            if (!t) return localToolsGate && templateToolsGate.allowsTools(modelManager, m, chatSignal.signal);
+            if (t !== machineTarget && !(await chatMachines.ready(t)).ok) {
+              console.warn(`[tools] the ${role} role's machine is not ready; it is not a tool-capable candidate`);
+              return false;
+            }
+            return templateToolsGate.allowsTools(chatMachines.propsSource(t), t.model, chatSignal.signal, `machine:${t.machine.id}`);
+          } })
+        : await toolModes.toolCapableRoute({ model, routedRole, roles: chatMachines ? chatMachines.localRoles(autoRoles()) : autoRoles(),
+          allowsTools: (m) => templateToolsGate.allowsTools(modelManager, m, chatSignal.signal) });
       if (moved.rerouted) {
-        console.log(`[tools] ${model} cannot take tools; this Automatic turn needs a tool and goes to ${moved.role} (${moved.model})`);
+        const to = anyRemote ? remoteFor(moved.role) : null;
+        console.log(`[tools] ${model} cannot take tools; this Automatic turn needs a tool and goes to ${moved.role} (${moved.model}${to ? ` on ${to.machine.name}` : ''})`);
+        if (to) {
+          // Onto a machine: its provider row, fetch and measured context, as a turn routed there gets them.
+          provider = typeof chatMachines.measuredProvider === 'function' ? await chatMachines.measuredProvider(to)
+            : chatMachines.provider(to, { contextTokens: await chatMachines.contextTokens(to, chatSignal.signal) });
+          externalProvider = false;
+          chatgptProvider = false;
+          providerFetch = chatMachines.fetch;
+          machineTarget = to;
+        } else if (provider.machine) {
+          // Back to this machine's engine: the local provider and fetch, as an Automatic turn routed here has.
+          provider = getProvider(DEFAULT_PROVIDER_ID);
+          externalProvider = egress.isExternalProvider(provider);
+          chatgptProvider = false;
+          providerFetch = fetch;
+          machineTarget = null;
+        }
         model = moved.model;
         routedRole = moved.role;
         if (routingDecision) routingDecision = { ...routingDecision, effectiveRole: routedRole };
@@ -1414,7 +1456,9 @@ function createChatHandler({
       } else {
         // No vision role, or the description failed. Fall back to handing the
         // images to the answering model directly, if it can read them at all.
-        const vision = await (provider.machine ? chatMachines.visionProbe : visionProbe)(provider.baseUrl, upstreamHeaders, model);
+        // #1854: a model on a machine: that machine's /props modalities, else the probe through its fetch (per machine).
+        const vision = provider.machine && machineTarget && typeof chatMachines.visionFor === 'function' ? await chatMachines.visionFor(machineTarget, upstreamHeaders)
+          : await (provider.machine ? chatMachines.visionProbe : visionProbe)(provider.baseUrl, upstreamHeaders, model);
         // A projector error is a capability result for this configuration; an unreachable
         // engine or timeout is not, so it records nothing.
         if (provider.id === DEFAULT_PROVIDER_ID && modelManager.recordEvidence && (vision.supported || /projector|mmproj/i.test(vision.reason || ''))) {
@@ -1487,7 +1531,8 @@ function createChatHandler({
       };
       const decided = await multimodal.answerImages({
         images: retrievedImages, external: offBox, providerLabel: provider.label || 'an external provider',
-        canSee: async () => (await (provider.machine ? chatMachines.visionProbe : visionProbe)(provider.baseUrl, upstreamHeaders, model)).supported, caption: captionImage, hasVisionRole: !!visionModel, frame: frameUntrusted,
+        canSee: async () => (provider.machine && machineTarget && typeof chatMachines.visionFor === 'function' ? await chatMachines.visionFor(machineTarget, upstreamHeaders)
+          : await (provider.machine ? chatMachines.visionProbe : visionProbe)(provider.baseUrl, upstreamHeaders, model)).supported, caption: captionImage, hasVisionRole: !!visionModel, frame: frameUntrusted,
       });
       if (decided.notes.length) {
         const note = decided.notes.join('\n\n');
@@ -1777,7 +1822,7 @@ function createChatHandler({
       }
       // One free observation of (prompt size -> time to first token), per
       // upstream round. It is not the user-visible end-to-end first-token time.
-      if (roundFirstTokenMs !== null && roundFirstTokenMs > 0 && prompt !== null && prompt > 0) prefill.recordSample(model, prompt, roundFirstTokenMs);
+      if (roundFirstTokenMs !== null && roundFirstTokenMs > 0 && prompt !== null && prompt > 0) prefill.recordSample(model, prompt, roundFirstTokenMs, ...(provider.machine ? [provider.id] : []));
       send({
         type: 'usage', phase: 'streaming', model,
         promptTokens: exchangeUsage.hasPrompt ? exchangeUsage.prompt : null,
@@ -2123,7 +2168,7 @@ function createChatHandler({
             let reply = 'All of this project\'s tools are already available.';
             if (!widened) {
               widened = true;
-              const fullResolved = resolveTools(asSelection(selectedBoxes), model, blocked);
+              const fullResolved = resolveTools(asSelection(selectedBoxes), model, blocked, ...measuredOn());
               const full = fullResolved.tools;
               activeTools = full;
               for (const t of full) allowedToolNames.add(t.function.name);

@@ -27,6 +27,12 @@
 // harness reaches it only through web's relay (code-machine.cjs), never by a route of its own.
 // #1850: the template tools gate reads a machine model's chat template from that machine's /props (propsSource) and
 // keeps its verdict per machine + model; a tools refusal is retried without tools, as on this machine.
+// #1854: what is measured for a model on a machine is measured from that machine and kept per machine + served model,
+// never mixed with this machine's numbers for a model of the same name: the context (/props n_ctx), whether its
+// template has a thinking switch (`enable_thinking` in /props chat_template), whether it reads images (/props
+// modalities.vision, else the image probe through the machine fetch) and the prefill rate (chat.cjs scopes it).
+// Auto-tune, presets, the #1079 long-context profiles and speculative-decoding evidence are this machine's engine's;
+// they are not measured on machines (measurements() says so, and the Settings page shows it).
 //
 // With nothing assigned, target() is null for every role and the chat handler does exactly what it did before.
 
@@ -43,6 +49,21 @@ const MAX_MODELS = 200;
 const CONTEXT_MIN = 2048, CONTEXT_MAX = 2000000;
 // A llama-server that does not say its context gets the local engine's conservative floor, not the hosted default.
 const CONTEXT_FALLBACK = 8192;
+
+// #1854: the measurements that belong to this machine's engine and are never taken on (or copied to) another machine.
+const NOT_MEASURED_ON_MACHINES = Object.freeze(['autotune', 'speculativeDecoding', 'longContextProfile', 'presets']);
+
+/** #1854: a llama-server /props body's facts: { contextTokens, thinking, vision }, each null when it does not say. */
+function propsFactsOf(body) {
+  const n = Number(body?.default_generation_settings?.n_ctx);
+  const template = body?.chat_template;
+  const vision = body?.modalities && typeof body.modalities.vision === 'boolean' ? body.modalities.vision : null;
+  return {
+    contextTokens: Number.isInteger(n) && n >= CONTEXT_MIN && n <= CONTEXT_MAX ? n : null,
+    thinking: typeof template === 'string' && template ? /\benable_thinking\b/.test(template) : null,
+    vision,
+  };
+}
 
 const fail = (status, code, message, extra = {}) => Object.assign(Error(message), { status, code, ...extra });
 
@@ -123,15 +144,22 @@ function createChatMachines({ machines, health = null, fetchImpl = defaultServic
    */
   async function facts(t) {
     const load = async (prev) => {
-      const out = { models: prev?.models ?? null, contextTokens: prev?.contextTokens ?? null };
+      const out = { models: prev?.models ?? null, contextTokens: prev?.contextTokens ?? null, thinking: prev?.thinking ?? null, vision: prev?.vision ?? null };
       await Promise.all([
         modelsAt(t.machine.address, t.port).then((ids) => { out.models = ids; }, () => {}),
-        propsContext(t).then((n) => { if (n) out.contextTokens = n; }, () => {}),
+        // #1854: one /props read gives the context, the thinking switch and the image modality.
+        propsFacts(t).then((p) => {
+          if (!p) return;
+          if (p.contextTokens) out.contextTokens = p.contextTokens;
+          if (p.thinking !== null) out.thinking = p.thinking;
+          if (p.vision !== null) out.vision = p.vision;
+        }, () => {}),
       ]);
       return out;
     };
+    // The key names the machine's address, port and the model as served: two machines (or this one) never share it.
     if (!health || typeof health.remember !== 'function') return load(null);
-    return (await health.remember(`${t.baseUrl}#facts#${t.model}`, load)) || { models: null, contextTokens: null };
+    return (await health.remember(`${t.baseUrl}#facts#${t.model}`, load)) || { models: null, contextTokens: null, thinking: null, vision: null };
   }
 
   const unreachableText = (t, detail) => `${ROLE_LABEL[t.role]} model’s machine (${t.machine.name}) is unreachable${detail ? `: ${detail}` : ''}. Check that it is on and serving ${t.model} on port ${t.port}, or move the ${ROLE_LABEL[t.role]} role back to this machine in Settings → Inference machines.`;
@@ -163,15 +191,25 @@ function createChatMachines({ machines, health = null, fetchImpl = defaultServic
     return (await facts(t)).contextTokens || CONTEXT_FALLBACK;
   }
 
-  async function propsContext(t) {
+  /**
+   * The machine's own /props for the model: { contextTokens, thinking, vision } (each null when the server does not
+   * say). `thinking`: the chat template reads `enable_thinking` (the switch the local engine's Qwen3/gemma-4 templates
+   * have); `vision`: llama-server's modalities.vision. Bounded: one GET, PROPS_TIMEOUT_MS, PROPS_BODY_CAP.
+   */
+  async function propsFacts(t) {
     const r = await machineFetch(`${t.baseUrl}/props?model=${encodeURIComponent(t.model)}`, { method: 'GET', signal: AbortSignal.timeout(PROPS_TIMEOUT_MS) });
     if (!r.ok) { try { await r.body?.cancel?.(); } catch { /* nothing */ } return null; }
-    const n = Number(JSON.parse(await readCapped(r, MODELS_BODY_CAP))?.default_generation_settings?.n_ctx);
-    return Number.isInteger(n) && n >= CONTEXT_MIN && n <= CONTEXT_MAX ? n : null;
+    return propsFactsOf(JSON.parse(await readCapped(r, PROPS_BODY_CAP)));
+  }
+
+  /** #1854: what the machine measured for the role's model (cached with its health); the engine-only ones are named. */
+  async function measurements(t) {
+    const f = await facts(t);
+    return { contextTokens: f.contextTokens ?? null, thinking: f.thinking ?? null, vision: f.vision ?? null, notMeasured: NOT_MEASURED_ON_MACHINES };
   }
 
   /** The provider row a turn uses for the role on its machine. */
-  function provider(t, { contextTokens: ctx } = {}) {
+  function provider(t, { contextTokens: ctx, thinking = null } = {}) {
     return {
       id: `machine:${t.machine.id}`,
       label: `${ROLE_LABEL[t.role]} model’s machine (${t.machine.name})`,
@@ -179,8 +217,14 @@ function createChatMachines({ machines, health = null, fetchImpl = defaultServic
       apiKey: '',
       shared: true,
       ...(ctx ? { contextTokens: ctx } : {}),
-      machine: { id: t.machine.id, name: t.machine.name, role: t.role, port: t.port, model: t.model },
+      machine: { id: t.machine.id, name: t.machine.name, role: t.role, port: t.port, model: t.model, ...(thinking === true ? { thinkingSwitch: true } : {}) },
     };
+  }
+
+  /** #1854: the provider row with this machine's measured context and thinking switch (both from its /props, cached). */
+  async function measuredProvider(t) {
+    const f = await facts(t);
+    return provider(t, { contextTokens: f.contextTokens || CONTEXT_FALLBACK, thinking: f.thinking });
   }
 
   /** "The machine did not answer" for a request that failed at the socket. */
@@ -278,7 +322,20 @@ function createChatMachines({ machines, health = null, fetchImpl = defaultServic
     return probe(baseUrl, headers, model);
   }
 
-  return { target, remoteRoles, effectiveRoles, localRoles, ready, provider, contextTokens, connectError, listModels, modelsAt, visionProbe, manualTarget, machineModels, propsSource, fetchJson, fetch: machineFetch, label: (role) => ROLE_LABEL[role] || role };
+  /**
+   * #1854: whether the role's model on its machine reads images. The machine's /props modalities (cached with its
+   * health) answers when it says; a server that does not say gets the image probe through the machine fetch, whose
+   * cache is keyed by the machine's address. Nothing is recorded in this machine's model evidence.
+   */
+  async function visionFor(t, headers = {}) {
+    let f = null;
+    try { f = await facts(t); } catch { f = null; }
+    if (f?.vision === true) return { supported: true, reason: 'the machine reports image input' };
+    if (f?.vision === false) return { supported: false, reason: 'the machine reports no image input for this model' };
+    return visionProbe(`${t.baseUrl}/v1`, headers, t.model);
+  }
+
+  return { target, remoteRoles, effectiveRoles, localRoles, ready, provider, measuredProvider, measurements, visionFor, contextTokens, connectError, listModels, modelsAt, visionProbe, manualTarget, machineModels, propsSource, fetchJson, fetch: machineFetch, label: (role) => ROLE_LABEL[role] || role };
 }
 
-module.exports = { createChatMachines, modelIds, ROLE_LABEL, CHAT_ROLES };
+module.exports = { createChatMachines, modelIds, propsFactsOf, NOT_MEASURED_ON_MACHINES, ROLE_LABEL, CHAT_ROLES };
