@@ -34,3 +34,16 @@ test('the chat error names the role, the model and where to fix it', () => {
   assert.match(message, /gone/);
   assert.match(message, /Models & routing/);
 });
+
+test('#1817: a running system or sidecar row is not a chat model, so nothing-loaded still frees the Creative move', () => {
+  const { creativeMoveIsFree } = require('./auto-roles-check.cjs');
+  const roles = { fast: 'a', creative: 'c' };
+  const rows = [
+    { name: 'laya', loaded: true, labels: [], system: true },
+    { name: 'side', loaded: true, labels: [], servedElsewhere: true },
+    { name: 'emb', loaded: true, labels: [], sidecarProtected: true },
+    { name: 'c', loaded: false, labels: [] },
+  ];
+  assert.equal(creativeMoveIsFree(roles, 'smart', rows), true);
+  assert.equal(creativeMoveIsFree(roles, 'smart', [...rows, { name: 'chat', loaded: true, labels: [] }]), false);
+});

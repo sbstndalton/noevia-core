@@ -76,7 +76,9 @@ function createRerankSettings({ store, env = process.env, audit = () => {}, onCh
     const current = get(installed);
     const choice = value.choice === undefined ? current.choice : value.choice === null ? null : value.choice.trim();
     const known = options(installed);
-    if (choice && !known.some((o) => o.id === choice)) {
+    // #1817: turning off while keeping the saved choice (even one no longer offered) must always succeed.
+    const keepsSaved = value.enabled === false && choice === current.choice;
+    if (choice && !keepsSaved && !known.some((o) => o.id === choice)) {
       // A llama.cpp preset cannot be checked while the catalogue is unreadable; say so instead of "unknown".
       if (choice.startsWith('llamacpp:') && !Array.isArray(installed)) throw fail('The installed models could not be read. Try again in a moment.', 'catalogueUnavailable', 503);
       throw fail('That reranker is not available on this server.', 'unknownReranker');
