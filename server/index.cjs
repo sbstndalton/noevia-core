@@ -245,9 +245,25 @@ if (embeddingConfig.next()) setTimeout(() => embeddingMigration.kick(), 30000).u
     paused: () => (embeddingConfig.next() ? 'a re-index is under way' : null),
     release: () => rag.releaseMediaModel(),
   }));
+  // #1770: documents read before the flag was on are read again once for figures (figure-sweep.cjs), paced
+  // like the re-index and held while one runs; each re-read schedules that project's media pass.
+  const figureSweep = require('./figure-sweep.cjs').createFigureSweep({
+    extractorVersion: () => require('./documents.cjs').EXTRACTOR_VERSION,
+    userIds: () => authService.db.prepare('SELECT id FROM users').all().map((r) => r.id).filter((id) => !workspaceStore.isRemoved(id)),
+    workspaceFor: (userId) => workspaceStore.get(userId),
+    documentDir: (workspace, projectId) => require('./document-sources.cjs').directory(workspace, projectId),
+    runAs: (userId, fn) => {
+      const user = authService.publicUser(authService.db.prepare('SELECT * FROM users WHERE id=?').get(userId));
+      return requestScope.run({ workspace: workspaceStore.get(userId), authn: { user, legacy: false } }, fn);
+    },
+    refresh: (project, file) => projectStore.refreshDocumentFigures(project, file),
+    paused: () => (embeddingConfig.next() ? 'a re-index is under way' : null),
+  });
   if (multimodal.enabled()) {
     setTimeout(() => mediaBackfill.kick(), 45000).unref();
     setInterval(() => mediaBackfill.kick(), 30 * 60 * 1000).unref();
+    setTimeout(() => figureSweep.kick(), 60000).unref();
+    setInterval(() => figureSweep.kick(), 30 * 60 * 1000).unref();
   }
 }
 

@@ -328,7 +328,17 @@ function createMediaBackfill({ enabled: on = () => enabled(), userIds, workspace
       delete totals.gap;
       last = { at: Date.now(), ...totals };
       // Also after a stop (a re-index that began mid-pass): the image preset is not held beside it.
-      if (totals.embedded || threw) { try { await release(); } catch { /* the router unloads it on its own later */ } }
+      // #1772: say how the image preset left. An explicit unload is the expected end; "evicted" means the
+      // router had already dropped it to make room for a text model (too few --models-max slots).
+      if (totals.embedded || threw) {
+        let r = null;
+        try { r = await release(); } catch { r = null; }
+        if (r && typeof r === 'object' && !r.skipped) {
+          if (r.released) log(`[media] unloaded ${r.alias} after the pass`);
+          else if (r.evicted) log(`[media] ${r.alias} was already unloaded by the embeddings router's eviction, not by noevia: the router needs a slot for each served text model plus the image preset (--models-max)`);
+          else log(`[media] could not unload ${r.alias || 'the image preset'} (${r.status || r.error || 'no answer'}); the router unloads it on its own later`);
+        }
+      }
     }
     return totals;
   }

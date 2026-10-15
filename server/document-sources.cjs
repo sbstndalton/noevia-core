@@ -111,4 +111,8 @@ function prune(workspace, project) {
   const keptFigure = (name) => /^[a-f0-9]{64}\.fig\d{1,3}\.(png|jpg|webp)$/.test(name) && keep.has(name.slice(0, 64) + '.json');
   for (const name of fs.readdirSync(dir)) if (!keep.has(name) && !keptFigure(name)) fs.rmSync(path.join(dir, name), { force: true });
 }
-module.exports = { ingest, failed, notice, readPages, readOriginal, directory, prune, problem };
+// #1770: whether the stored result for `version` is a transient failure (it is read again next time).
+function retryable(workspace, projectId, version) {
+  try { return !!JSON.parse(fs.readFileSync(versionPath(workspace, projectId, version, '.json'), 'utf8')).retryable; } catch { return false; }
+}
+module.exports = { retryable, ingest, failed, notice, readPages, readOriginal, directory, prune, problem };
