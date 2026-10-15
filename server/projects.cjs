@@ -751,9 +751,14 @@ function createProjectStore({
       if (!live()) return { status: 'changed' };
       const tried = file.document.version;
       const mark = () => { file.document.figureSweep = tried; saveProjects(PROJECTS); };
-      let bytes;
-      try { bytes = documentSources.readOriginal(workspace, project.id, file); } catch { mark(); return { status: 'missing' }; }
-      const next = await documentSources.ingest(workspace, project.id, file.name, bytes, file);
+      // #1871: a large original is read under the process-wide large-document lock, read through extraction.
+      const read = await require('./large-document-lock.cjs').ifLarge(Number(file.document.bytes), async () => {
+        let bytes;
+        try { bytes = documentSources.readOriginal(workspace, project.id, file); } catch { return null; }
+        return documentSources.ingest(workspace, project.id, file.name, bytes, file);
+      });
+      if (!read) { mark(); return { status: 'missing' }; }
+      const next = read;
       if (!live() || file.document.version !== tried) return { status: 'changed' };
       if (next.document.state === 'failed' || next.document.stale) {
         if (documentSources.retryable(workspace, project.id, next.document.version)) {

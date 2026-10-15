@@ -31,13 +31,14 @@ function limits(env = process.env) {
 // #1864: how much of ONE document is read. File size no longer decides whether a PDF is read: it is
 // read in page ranges, and the ceilings below bound the work and the result instead.
 //
-//   PROJECT_DOCUMENT_READ_BYTES   the largest PDF read from storage (default 256 MiB). PDF bytes cannot be
-//                                 streamed page by page (the cross-reference table is at the end), so the
-//                                 whole file is held while it is read. 256 MiB is ten times the old 25 MiB
-//                                 gate, and also the sidecars' ranged-request ceiling (services/docling,
-//                                 services/ocr). On DaServer (#697: no swap, the iGPU takes its memory from
-//                                 system RAM) the web process then holds at most ~2x this transiently (the
-//                                 buffer plus the reader's private copy), never a multiple per page.
+//   PROJECT_DOCUMENT_READ_BYTES   the largest PDF read from storage (default 96 MiB, #1871). PDF bytes cannot
+//                                 be streamed page by page (the cross-reference table is at the end), so the
+//                                 whole file is held while it is read: once, in shared memory that the page-
+//                                 range workers read in place, and one such document at a time process-wide
+//                                 (large-document-lock.cjs). 96 MiB is nearly four times the old 25 MiB gate
+//                                 and stays within the PDF reader's pending-bytes bound (MAX_PENDING_BYTES,
+//                                 100 MiB). On DaServer (#697: no swap, the iGPU takes its memory from system
+//                                 RAM) the measured peak growth for a 90 MiB PDF is in noevia-core#149.
 //   PROJECT_DOCUMENT_PAGE_LIMIT   pages read per document (default 1000). Docling's measured worst case is
 //                                 10.9 s per table-heavy page and 3.4 s per scanned page on DaServer's 2
 //                                 CPUs, so 1000 pages is ~1 to 3 hours of one slot; past that the document
@@ -47,8 +48,11 @@ function limits(env = process.env) {
 //                                 8 M characters keep it ~16 MB at worst.
 //   PROJECT_DOCUMENT_RANGE_PAGES  pages per extraction request past the first window (default 25): the unit
 //                                 that bounds time (25 x 10.9 s ~ 4.5 min) and peak memory per request.
+//   PROJECT_SYNC_OCR_PAGES        OCR retry pages one source sync may spend across all its documents
+//                                 (default 40, #1871): the first sync after an update must not hold the single
+//                                 OCR slot for hours. A document left over keeps going on later syncs.
 // Read per call (an env change plus restart, or a test, takes effect). A non-positive value is ignored.
-const DOCUMENT_DEFAULTS = Object.freeze({ readBytes: 256 * 1024 * 1024, pages: 1000, text: 8_000_000, rangePages: 25 });
+const DOCUMENT_DEFAULTS = Object.freeze({ readBytes: 96 * 1024 * 1024, pages: 1000, text: 8_000_000, rangePages: 25, syncOcrPages: 40 });
 function documentLimits(env = process.env) {
   const d = DOCUMENT_DEFAULTS;
   return {
@@ -57,6 +61,7 @@ function documentLimits(env = process.env) {
     text: positiveInt(env.PROJECT_DOCUMENT_TEXT_LIMIT, d.text),
     // More than 200 pages per request would undo the point of ranges (and the sidecars refuse it).
     rangePages: Math.min(200, positiveInt(env.PROJECT_DOCUMENT_RANGE_PAGES, d.rangePages)),
+    syncOcrPages: positiveInt(env.PROJECT_SYNC_OCR_PAGES, d.syncOcrPages),
   };
 }
 

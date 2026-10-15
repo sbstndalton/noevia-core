@@ -386,18 +386,28 @@ async function readBinaryFile(conn, rawPath, opts) {
   }
   if (!response.body) return Buffer.alloc(0);
   const reader = response.body.getReader();
+  // #1871: with a declared length the bytes go straight into one buffer of that size, so a large file is
+  // never held twice (the chunks and their concatenation). Without one, chunks are joined at the end.
+  const declaredLength = Number(response.headers.get('content-length'));
+  // A large one (over 25 MiB, a PDF read in page ranges) is placed in shared memory, which the page-range
+  // workers then read in place (documents-native.cjs sharedBytes): one copy of the file in all.
+  const into = !(Number.isSafeInteger(declaredLength) && declaredLength > 0) ? null
+    : declaredLength > 25 * 1024 * 1024 && typeof SharedArrayBuffer !== 'undefined' ? Buffer.from(new SharedArrayBuffer(declaredLength))
+    : Buffer.allocUnsafe(declaredLength);
   const chunks = [];
   let size = 0;
   try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
+      if (size + value.byteLength > cap) { await reader.cancel(); throw tooLarge(); }
+      if (into && size + value.byteLength <= into.length) into.set(value, size);
+      else chunks.push(Buffer.from(value));
       size += value.byteLength;
-      if (size > cap) { await reader.cancel(); throw tooLarge(); }
-      chunks.push(Buffer.from(value));
     }
   } finally { reader.releaseLock(); }
-  return Buffer.concat(chunks, size);
+  if (into && !chunks.length) return size === into.length ? into : into.subarray(0, size);
+  return Buffer.concat(into ? [into.subarray(0, Math.min(size, into.length)), ...chunks] : chunks, size);
 }
 
 /** Write one file, creating or replacing it. Used for a project's own folder,

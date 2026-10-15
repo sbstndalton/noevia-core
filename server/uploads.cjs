@@ -24,7 +24,7 @@ function destinationFor(project, name, { connection, remotePath, folderPath } = 
   const rel = folderPath ? `${folderPath}/${name}` : name;
   return remotePath || (connection ? `${project.projectFolder}/${classify(name)}/${rel}` : rel);
 }
-async function ingest(workspace, project, name, bytes, { connection, source, remotePath, folderPath, progress = () => {}, storageImpl = storage, extractDocx = docx.extract, ifMatch, ifNoneMatch, created } = {}) {
+async function ingest(workspace, project, name, bytes, { connection, source, remotePath, folderPath, progress = () => {}, storageImpl = storage, extractDocx = docx.extract, ifMatch, ifNoneMatch, created, ocrBudget } = {}) {
   workspace.assertActive?.();
   // #1864: a PDF synced from storage (remotePath) is not an upload: its size is bounded by
   // PROJECT_DOCUMENT_READ_BYTES when it is read, and it is extracted in page ranges. The upload checks
@@ -48,7 +48,7 @@ async function ingest(workspace, project, name, bytes, { connection, source, rem
   let state = 'stored', reason, reasonId, reasonParams, readerVersion;
   if (documents.isDocument(name)) {
     progress('Extracting PDF text / OCR');
-    file = await sources.ingest(workspace, project.id, fullName, bytes, previous);
+    file = await sources.ingest(workspace, project.id, fullName, bytes, previous, ocrBudget ? { ocrBudget } : undefined);
     state = file.document.state;
   } else if (/\.docx$/i.test(name)) {
     progress('Reading DOCX body text and tables');

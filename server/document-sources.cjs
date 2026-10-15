@@ -19,12 +19,18 @@ function writeOnce(workspace, file, bytes) {
   workspace.assertActive?.();
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const temp = file + '.' + crypto.randomUUID() + '.tmp';
-  fs.writeFileSync(temp, bytes, { mode: 0o600 });
-  // Content-addressed files are immutable. Atomic rename avoids partially
-  // written cache entries when another exchange reads the same version.
+  // Atomic rename avoids partially written cache entries when another exchange reads the same version.
+  // #1871: a result record is also rewritten in place now (the completion pass), so it is made durable
+  // before it replaces the old one: the temp file is fsynced, renamed over, and the directory fsynced. A
+  // crash leaves the old record or the new one, never a torn one. Writers of one project's records are
+  // already serialised by the project's source lock (projects.cjs withSourceLock).
+  const fd = fs.openSync(temp, 'w', 0o600);
+  try { fs.writeFileSync(fd, bytes); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
   fs.renameSync(temp, file);
+  try { const dir = fs.openSync(path.dirname(file), 'r'); try { fs.fsyncSync(dir); } finally { fs.closeSync(dir); } } catch { /* a platform without directory fsync */ }
 }
-async function ingest(workspace, projectId, name, bytes, previous) {
+// #1871: `ocrBudget` (documents.ocrBudget) is the OCR retry allowance of the sync this read belongs to.
+async function ingest(workspace, projectId, name, bytes, previous, { ocrBudget } = {}) {
   workspace.assertActive?.();
   const byteHash = hash(bytes);
   const version = hash(byteHash + ':' + documents.EXTRACTOR_VERSION);
@@ -50,12 +56,12 @@ async function ingest(workspace, projectId, name, bytes, previous) {
     // pages. Only such records do anything here; the rest come back with the marker and nothing else.
     if (out.completion !== documents.COMPLETION) {
       try {
-        const completed = await documents.completeDocument(name, bytes, out);
+        const completed = await documents.completeDocument(name, bytes, out, ocrBudget ? { ocrBudget } : undefined);
         if (completed !== out) { out = storeFigures(completed); writeOnce(workspace, resultFile, JSON.stringify(out)); }
       } catch (err) { console.warn('[documents] completing a stored result failed:', String(err?.message || err).slice(0, 200)); }
     }
   } else {
-    try { out = await documents.extractDocumentText(name, bytes); }
+    try { out = ocrBudget ? await documents.extractDocumentText(name, bytes, { ocrBudget }) : await documents.extractDocumentText(name, bytes); }
     catch (err) { out = { text: '', pages: 0, pageTexts: [], state: 'failed', truncated: false, retryable: !!err.retryable, error: err.message }; }
     out = storeFigures(out);
     writeOnce(workspace, resultFile, JSON.stringify(out));

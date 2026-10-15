@@ -104,10 +104,12 @@ test('#1864: past the text ceiling the document stops at the page that reached i
 });
 
 test('#1864: the limits follow the source-limits pattern (env overrides, bad values ignored)', () => {
-  assert.deepEqual(sourceLimits.documentLimits({}), { readBytes: 256 * MiB, pages: 1000, text: 8_000_000, rangePages: 25 });
-  assert.deepEqual(sourceLimits.documentLimits({ PROJECT_DOCUMENT_READ_BYTES: '1048576', PROJECT_DOCUMENT_PAGE_LIMIT: '-3', PROJECT_DOCUMENT_TEXT_LIMIT: 'x', PROJECT_DOCUMENT_RANGE_PAGES: '5000' }),
-    { readBytes: MiB, pages: 1000, text: 8_000_000, rangePages: 200 });
-  assert.ok(sourceLimits.documentLimits({}).readBytes >= 10 * 25 * MiB);
+  assert.deepEqual(sourceLimits.documentLimits({}), { readBytes: 96 * MiB, pages: 1000, text: 8_000_000, rangePages: 25, syncOcrPages: 40 });
+  assert.deepEqual(sourceLimits.documentLimits({ PROJECT_DOCUMENT_READ_BYTES: '1048576', PROJECT_DOCUMENT_PAGE_LIMIT: '-3', PROJECT_DOCUMENT_TEXT_LIMIT: 'x', PROJECT_DOCUMENT_RANGE_PAGES: '5000', PROJECT_SYNC_OCR_PAGES: '7' }),
+    { readBytes: MiB, pages: 1000, text: 8_000_000, rangePages: 200, syncOcrPages: 7 });
+  // #1871: within the PDF reader's pending-bytes bound, and still far above the old 25 MiB gate.
+  assert.ok(sourceLimits.documentLimits({}).readBytes <= native.MAX_PENDING_BYTES);
+  assert.ok(sourceLimits.documentLimits({}).readBytes > 3 * 25 * MiB);
 });
 
 // A fake Docling worker: `pages` total, page text SYN-DOC-<n>, honouring X-Document-Pages like the worker
@@ -269,11 +271,29 @@ test('#1865: without an OCR worker the page says the retry is unavailable; past 
   assert.equal(capped.pageTexts.filter((p) => p.retry?.outcome === 'skipped').length, 25 - documents.RETRY_PAGE_CAP);
 });
 
-test('#1865 (native, real pdf.js): a scanned page OCR could not read at 300 dpi is retried at 400 dpi and merged', async () => {
+test('#1871: a page the first pass already sent to OCR is not retried at the same resolution (until #1867)', async () => {
   const scanned = fs.readFileSync(path.join(__dirname, 'fixtures/documents/scanned.pdf'));
-  const ocr = fakeOcr((_n, options) => (options.dpi === 400 ? 'SCAN-P2 INV-2042 total 34.95' : ''));
+  const ocr = fakeOcr(() => '');
   const out = await documents.extractDocumentText('scanned.pdf', scanned, nativeOnly({ ocrEnabled: true, extractPages: ocr.extractPages, env: {} }));
-  assert.deepEqual(ocr.calls, [{ pages: [1], dpi: undefined }, { pages: [1], dpi: 400 }]);
+  assert.deepEqual(ocr.calls, [{ pages: [1], dpi: undefined }], 'one OCR pass, no second identical one');
+  assert.equal(out.pageTexts[0].status, 'unreadable');
+  assert.equal(out.pageTexts[0].retry, undefined);
+  assert.equal(out.completion, documents.COMPLETION);
+  // A result stored before the mark existed: an unreadable pdf.js page with OCR on was OCRed already.
+  const { ocrSent, ...old } = out.pageTexts[0];
+  const again = await documents.completeDocument('scanned.pdf', scanned, { ...out, completion: undefined, pageTexts: [old] }, nativeOnly({ ocrEnabled: true, extractPages: ocr.extractPages, env: {} }));
+  assert.equal(ocr.calls.length, 1);
+  assert.equal(again.pageTexts[0].retry, undefined);
+});
+
+test('#1865 (native, real pdf.js): a page the first pass could not send to OCR is retried and merged', async () => {
+  const scanned = fs.readFileSync(path.join(__dirname, 'fixtures/documents/scanned.pdf'));
+  // The first pass without OCR leaves the scanned page 'ocr-needed'; with OCR on later, it is retried.
+  const first = await documents.extractDocumentText('scanned.pdf', scanned, nativeOnly({ env: {} }));
+  const ocr = fakeOcr(() => 'SCAN-P2 INV-2042 total 34.95');
+  const out = await documents.completeDocument('scanned.pdf', scanned, { ...first, completion: undefined, pageTexts: first.pageTexts.map(({ retry, ...p }) => p) },
+    nativeOnly({ ocrEnabled: true, extractPages: ocr.extractPages, env: {} }));
+  assert.deepEqual(ocr.calls, [{ pages: [1], dpi: 400 }]);
   assert.equal(out.pageTexts[0].status, 'ocr');
   assert.equal(out.pageTexts[0].retry.outcome, 'recovered');
   assert.equal(out.state, 'ready');
@@ -348,4 +368,105 @@ test('#1864: the source record and its problem line say where reading stopped', 
     assert.deepEqual(documentSources.problemNotes(file).notes, [{ id: 'stoppedAtPage', params: { page: 30, limit: 'pages' } }]);
     assert.doesNotMatch(documentSources.problemNotes(file).reasonBase, /stopped at page/);
   } finally { documents.extractDocumentText = realExtract; }
+});
+
+// ── #1871 review fixes ───────────────────────────────────────────────────────────────────────────
+
+test('#1871: one sync spends at most its OCR budget across documents; the rest continue on a later sync', async () => {
+  const ocr = fakeOcr(() => 'SYN-OCR');
+  const budget = documents.ocrBudget({ PROJECT_SYNC_OCR_PAGES: '3' });
+  assert.deepEqual(budget, { remaining: 3 });
+  const deps = (b) => docling(fakeDocling({ total: 2, degraded: [1, 2] }), { ocrEnabled: true, extractPages: ocr.extractPages, ocrBudget: b });
+  const a = await documents.extractDocumentText('a.pdf', syntheticPdf({ pages: 2 }), deps(budget));
+  const b = await documents.extractDocumentText('b.pdf', syntheticPdf({ pages: 2 }), deps(budget));
+  assert.equal(ocr.calls.reduce((n, c) => n + c.pages.length, 0), 3, 'three pages in all');
+  assert.equal(budget.remaining, 0);
+  assert.equal(a.completion, documents.COMPLETION);
+  assert.equal(b.completion, undefined, 'b has a page left, so it stays open');
+  assert.deepEqual(b.pageTexts.map((p) => p.retry?.outcome), ['recovered', undefined]);
+  const c = await documents.extractDocumentText('c.pdf', syntheticPdf({ pages: 2 }), deps(budget));
+  assert.equal(ocr.calls.reduce((n, x) => n + x.pages.length, 0), 3, 'an exhausted budget sends nothing');
+  assert.equal(c.completion, undefined);
+  // The next sync, a new budget: b finishes, and is not retried again after that.
+  const next = await documents.completeDocument('b.pdf', Buffer.from('x'), b, deps(documents.ocrBudget({ PROJECT_SYNC_OCR_PAGES: '3' })));
+  assert.deepEqual(next.pageTexts.map((p) => p.retry?.outcome), ['recovered', 'recovered']);
+  assert.equal(next.completion, documents.COMPLETION);
+  assert.equal(ocr.calls.reduce((n, x) => n + x.pages.length, 0), 4);
+});
+
+test('#1871: reading resumes after the highest page read, and a gap below it is a failed page', async () => {
+  const pdf = syntheticPdf({ pages: 6 });
+  const reader = countingReader();
+  const stored = { text: '', pages: 6, state: 'partial', truncated: true, retryable: false,
+    pageTexts: [1, 2, 4].map((n) => ({ number: n, text: `SYN-PAGE-${n}`, status: 'native', method: 'native' })) };
+  const out = await documents.completeDocument('gap.pdf', pdf, stored, nativeOnly({ readPages: reader.readPages, env: {} }));
+  assert.deepEqual(reader.calls, [{ first: 5, cap: 2 }]);
+  assert.deepEqual(out.pageTexts.map((p) => [p.number, p.status]), [[1, 'native'], [2, 'native'], [3, 'failed'], [4, 'native'], [5, 'native'], [6, 'native']]);
+  assert.equal(out.state, 'partial');
+});
+
+test('#1871: a range stopped by a busy worker is resumed at most RETRY_ATTEMPTS times, then the stop is stored', async () => {
+  let asked = 0;
+  const fake = fakeDocling({ total: 340 });
+  const extractDocument = async (name, bytes, options) => {
+    if (options?.pages) { asked++; throw Object.assign(new Error('Document extraction is busy; refresh to retry.'), { status: 503 }); }
+    return fake.extractDocument(name, bytes, options);
+  };
+  const deps = docling(fake, { extractDocument });
+  let out = await documents.extractDocumentText('long.pdf', syntheticPdf({ pages: 2 }), deps);
+  assert.equal(out.completion, undefined);
+  assert.equal(out.rangeAttempts, 1);
+  for (let read = 0; read < 5; read++) out = await documents.completeDocument('long.pdf', Buffer.from('x'), out, deps);
+  assert.equal(out.rangeAttempts, documents.RETRY_ATTEMPTS);
+  assert.equal(out.completion, documents.COMPLETION);
+  assert.deepEqual(out.stoppedAt, { page: 300, limit: 'error', error: 'Document extraction is busy; refresh to retry.' });
+  assert.equal(asked, 3 * documents.RETRY_ATTEMPTS, 'three asks per attempt, three attempts');
+});
+
+test('#1871: large documents are read one at a time process-wide; small ones are not held up', async () => {
+  let active = 0, most = 0, smallDone = false;
+  const readPages = async (bytes, options) => {
+    active++; most = Math.max(most, active);
+    await new Promise((r) => setTimeout(r, 30));
+    active--;
+    return native.readInWorker(bytes, options);
+  };
+  const deps = nativeOnly({ readPages, env: { PROJECT_DOCUMENT_RANGE_PAGES: '30' } });
+  const both = Promise.all([documents.extractDocumentText('a.pdf', big, deps), documents.extractDocumentText('b.pdf', big, deps)]);
+  const small = documents.extractDocumentText('s.pdf', syntheticPdf({ pages: 1 }), nativeOnly({ env: {} })).then(() => { smallDone = true; });
+  await small;
+  const [a, b] = await both;
+  assert.equal(most, 1, 'never two large reads at once');
+  assert.ok(smallDone);
+  assert.equal(a.state, 'ready'); assert.equal(b.state, 'ready');
+});
+
+test('#1871: a 90 MiB PDF read from storage and extracted peaks under 2x its size in RSS growth', async () => {
+  const storage = require('./storage-client.cjs');
+  const pdf = syntheticPdf({ pages: 60, padding: 90 * MiB });
+  const realFetch = global.fetch;
+  global.fetch = async () => new Response(new ReadableStream({
+    // Views of the source, not copies: only the read itself should count.
+    start(controller) { for (let at = 0; at < pdf.length; at += MiB) controller.enqueue(pdf.subarray(at, Math.min(pdf.length, at + MiB))); controller.close(); },
+  }), { headers: { 'content-length': String(pdf.length) } });
+  global.gc?.();
+  const before = process.memoryUsage.rss();
+  let peak = before;
+  const watch = setInterval(() => { peak = Math.max(peak, process.memoryUsage.rss()); }, 10);
+  let out;
+  try {
+    const conn = { kind: 's3', baseUrl: 'http://fixture.invalid', bucket: 'bucket', corpusRoot: '', username: '', secret: '' };
+    const bytes = await storage.readBinaryFile(conn, 'big.pdf', { cap: 96 * MiB });
+    assert.ok(bytes.buffer instanceof SharedArrayBuffer, 'a large read lands in shared memory');
+    out = await documents.extractDocumentText('big.pdf', bytes, nativeOnly({ env: {} }));
+  } finally { clearInterval(watch); global.fetch = realFetch; }
+  const growth = (peak - before) / MiB, size = pdf.length / MiB;
+  console.log(`[#1871 memory] ${size.toFixed(0)} MiB PDF read from storage, 60 pages in 3 ranges: peak RSS growth ${growth.toFixed(0)} MiB (${(growth / size).toFixed(2)}x)`);
+  assert.equal(out.state, 'ready');
+  assert.equal(out.pageTexts.length, 60);
+  // Linux (DaServer, CI) maps an allocation this large fresh each time, so a range worker's full-length
+  // pdf.js buffer stays unresident except for the chunks it reads. macOS's allocator re-zeroes a cached
+  // large block on reuse, which makes every range after the first touch it all; there the bound is looser.
+  const bound = process.platform === 'linux' ? 2 : 3.5;
+  assert.ok(growth <= bound * size, `peak growth ${growth.toFixed(0)} MiB is within ${bound}x the ${size.toFixed(0)} MiB file`);
 });

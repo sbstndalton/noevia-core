@@ -23,6 +23,7 @@ function documentReadOptions(path) {
   return { cap, timeoutMs: 30000 + Math.ceil(cap / (1024 * 1024)) * 1000 };
 }
 const sourceLimits = require('../source-limits.cjs');
+const largeDocuments = require('../large-document-lock.cjs');
 const sourceText = require('../source-text.cjs');
 // Shared with projects.cjs's createProject and the create/edit dialogs (src/project-limits.ts,
 // #398) so a name is capped identically everywhere it can be set.
@@ -982,6 +983,8 @@ function createProjectRoutes({
         const DOCUMENT_LIMIT = sourceLimits.limits().documents;
         const documentRoom = Math.max(0, DOCUMENT_LIMIT - sourceLimits.counts(kept).documents);
         let documentsRead = 0;
+        // #1871: the OCR retry pages this sync may spend, across all its documents (PROJECT_SYNC_OCR_PAGES).
+        const syncOcrBudget = require('../documents.cjs').ocrBudget();
 
         // #1429: a refused or throttled login stops every further storage call in this refresh; the
         // rest of the folders and files keep what they had and say why, with no more attempts made.
@@ -1051,15 +1054,21 @@ function createProjectRoutes({
             }
             try {
               if (managed || isDocx) {
-                const bytes = await storageClient.readBinaryFile(connection, entry.path, documentReadOptions(entry.path));
-                const file = await require('../uploads.cjs').ingest(currentWorkspace(), project, entry.name, bytes, { source: folder, remotePath: entry.path, progress: requestScope.getStore()?.sourceProgress });
+                // #1871: a PDF that is (or may be) over 25 MiB holds the process-wide large-document lock from
+                // its storage read to the end of its extraction.
+                const file = await largeDocuments.ifLarge(documentReadOptions(entry.path) ? entry.size : 0, async () => {
+                  const bytes = await storageClient.readBinaryFile(connection, entry.path, documentReadOptions(entry.path));
+                  return require('../uploads.cjs').ingest(currentWorkspace(), project, entry.name, bytes, { source: folder, remotePath: entry.path, progress: requestScope.getStore()?.sourceProgress, ocrBudget: syncOcrBudget });
+                });
                 fromFolders.push(file);
                 if (file.document && file.document.state !== 'ready') skipped.push({ folder, file: entry.path, reason: documentSources.problem(file), ...documentSources.problemNotes(file), retained: file.document.stale });
               } else if (isDoc) {
                 // A document is converted to text here, so a PDF in an attached
                 // folder becomes a readable source rather than being skipped.
-                const bytes = await storageClient.readBinaryFile(connection, entry.path, documentReadOptions(entry.path));
-                const file = await documentSources.ingest(currentWorkspace(), id, entry.path, bytes, previous);
+                const file = await largeDocuments.ifLarge(documentReadOptions(entry.path) ? entry.size : 0, async () => {
+                  const bytes = await storageClient.readBinaryFile(connection, entry.path, documentReadOptions(entry.path));
+                  return documentSources.ingest(currentWorkspace(), id, entry.path, bytes, previous, { ocrBudget: syncOcrBudget });
+                });
                 fromFolders.push({ ...file, source: folder });
                 if (file.document.state !== 'ready') skipped.push({ folder, file: entry.path, reason: documentSources.problem(file), ...documentSources.problemNotes(file), retained: file.document.stale });
               } else {
