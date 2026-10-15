@@ -186,3 +186,86 @@ test('#1867: a small PDF never asks the worker what it accepts; the default requ
   assert.deepEqual(fake.calls.map(({ pages, dpi }) => ({ pages, dpi })), [{ pages: [1], dpi: undefined }]);
   assert.equal(out.state, 'ready');
 });
+
+// ── #1882: review follow-ups ─────────────────────────────────────────────────────────────────────
+test('#1882: the first-pass OCR of a file over 25 MiB spends the sync budget and resumes on a later sync', async () => {
+  const fake = fakeOcr((n) => (n === 2 ? 'SYN-SCANNED-ROW REF-2042' : ''));
+  const spent = { remaining: 0 };
+  const out = await documents.extractDocumentText('large.pdf', big, native({ extractPages: fake.extractPages, ocrCapabilities: async () => NEW_WORKER, ocrBudget: spent }));
+  assert.deepEqual(fake.calls, [], 'no budget left: nothing sent');
+  assert.equal(out.pageTexts[1].status, 'ocr-needed');
+  assert.equal(out.completion, undefined, 'left open for a later sync');
+  assert.notEqual(out.errorId, 'ocrPageLimit');
+  const later = { remaining: 40 };
+  const done = await documents.completeDocument('large.pdf', big, out, native({ extractPages: fake.extractPages, ocrCapabilities: async () => NEW_WORKER, ocrBudget: later }));
+  assert.equal(fake.calls.length, 1);
+  assert.equal(later.remaining, 39);
+  assert.equal(done.pageTexts[1].retry.outcome, 'recovered');
+  assert.equal(done.completion, documents.COMPLETION);
+  // With budget the first pass sends at once and spends it.
+  const budget = { remaining: 40 };
+  const fresh = fakeOcr((n) => (n === 2 ? 'SYN-SCANNED-ROW' : ''));
+  await documents.extractDocumentText('large.pdf', big, native({ extractPages: fresh.extractPages, ocrCapabilities: async () => NEW_WORKER, ocrBudget: budget }));
+  assert.deepEqual(fresh.calls.map((c) => c.pages), [[2]]);
+  assert.equal(budget.remaining, 39);
+});
+
+test('#1882: 400-dpi retries go in small batches with a timeout scaled to the batch, and a timeout is not final', async () => {
+  const pages = Array.from({ length: 7 }, (_, i) => ({ number: i + 1, text: 'x', status: 'degraded', method: 'docling' }));
+  const first = { text: 'x', pages: 7, state: 'partial', truncated: false, retryable: false, pageTexts: pages };
+  const seen = [];
+  const extractPages = async (_b, numbers, options) => { seen.push({ numbers: [...numbers], dpi: options.dpi, timeoutMs: options.timeoutMs }); return numbers.map((n) => ({ number: n, text: 'SYN' })); };
+  await documents.completeDocument('form.pdf', Buffer.from('%PDF-1.4 synthetic'), first, { doclingEnabled: false, ocrEnabled: true, extractPages, waits: [0, 0], env: {}, ocrCapabilities: async () => NEW_WORKER });
+  assert.deepEqual(seen.map((c) => c.numbers.length), [3, 3, 1]);
+  assert.ok(seen.every((c) => c.dpi === 400 && c.timeoutMs === documents.retryTimeoutMs(c.numbers.length)));
+  assert.ok(documents.retryTimeoutMs(3) >= 600_000, 'never below the worker’s own 600 s budget');
+  assert.ok(documents.retryTimeoutMs(1) < documents.retryTimeoutMs(3));
+  const timedOut = await documents.completeDocument('form.pdf', Buffer.from('%PDF-1.4 synthetic'), { ...first, pageTexts: pages.slice(0, 1).map((p) => ({ ...p })) },
+    { doclingEnabled: false, ocrEnabled: true, waits: [0, 0], env: {}, ocrCapabilities: async () => NEW_WORKER,
+      extractPages: async () => { throw Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' }); } });
+  assert.equal(timedOut.pageTexts[0].retry.again, true, 'tried again on a later read');
+  assert.equal(timedOut.completion, undefined);
+});
+
+test('#1882: core never asks for 600 dpi', async () => {
+  const headers = [];
+  const fetchImpl = async (_url, options) => { headers.push(options.headers['X-OCR-DPI']); return new Response(JSON.stringify({ pages: [] })); };
+  for (const dpi of [600, 400, undefined]) await ocr.extractPages(Buffer.from('x'), [1], { url: 'http://ocr.invalid', fetchImpl, dpi });
+  assert.deepEqual(headers, [undefined, '400', undefined]);
+});
+
+test('#1882: capability answers, positive and negative, are cached for minutes', async () => {
+  let asked = 0;
+  const down = async () => { asked++; throw new Error('ECONNREFUSED'); };
+  assert.equal(await ocr.capabilities({ url: 'http://ocr-down.invalid', fetchImpl: down }), null);
+  assert.equal(await ocr.capabilities({ url: 'http://ocr-down.invalid', fetchImpl: down }), null);
+  assert.equal(asked, 1, 'a failed /health is not asked again every sync');
+  const old = async () => { asked++; return new Response(JSON.stringify({ service: 'ocr' })); };
+  assert.deepEqual(await ocr.capabilities({ url: 'http://ocr-old.invalid', fetchImpl: old }), {});
+  assert.deepEqual(await ocr.capabilities({ url: 'http://ocr-old.invalid', fetchImpl: old }), {});
+  assert.equal(asked, 2);
+  assert.ok(ocr.CAPABILITY_TTL_MS >= 3 * 60_000);
+  const docling = require('./docling.cjs');
+  let doclingAsked = 0;
+  const gone = async () => { doclingAsked++; return new Response('', { status: 503 }); };
+  assert.equal(await docling.rangesSupported({ url: 'http://docling-down.invalid', fetchImpl: gone }), null);
+  assert.equal(await docling.rangesSupported({ url: 'http://docling-down.invalid', fetchImpl: gone }), null);
+  assert.equal(doclingAsked, 1);
+});
+
+test('#1882: a ranged body is never sent above Docling’s advertised rangedMaxBytes', async () => {
+  const docling = require('./docling.cjs');
+  const health = async () => new Response(JSON.stringify({ service: 'docling', ranges: true, rangedMaxBytes: 30 * MiB }));
+  const opts = (bytes) => ({ url: 'http://docling-cap.invalid', fetchImpl: health, fresh: true, bytes });
+  assert.equal(await docling.rangesSupported(opts(29 * MiB)), true);
+  assert.equal(await docling.rangesSupported(opts(31 * MiB)), false);
+  assert.equal(await docling.rangesSupported({ url: 'http://docling-cap.invalid', fetchImpl: health, fresh: true }), true);
+  // documents asks with the file's size, and reads a file over the cap here instead of through Docling.
+  const asked = [];
+  let sent = 0;
+  const out = await documents.extractDocumentText('large.pdf', big, { doclingEnabled: true, ocrEnabled: false, waits: [0, 0], env: {},
+    rangesSupported: async (o) => { asked.push(o?.bytes); return false; }, extractDocument: async () => { sent++; return {}; } });
+  assert.deepEqual(asked, [big.length]);
+  assert.equal(sent, 0);
+  assert.equal(out.pageTexts[0].status, 'native');
+});

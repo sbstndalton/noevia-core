@@ -46,9 +46,13 @@ const COMPLETION = 'ranges-ocr-retry-v1';
 // file too large for the worker): it is retried the same way, and says so when it cannot be.
 const RETRY_STATUSES = new Set(['degraded', 'failed', 'unreadable', 'ocr-needed']);
 const RETRY_PAGE_CAP = 20;     // pages retried per document; the rest say so
-const RETRY_BATCH = 10;        // pages per OCR request
+// #1882: pages per OCR retry request. A real 400-dpi render plus OCR of a dense page takes up to the
+// worker's 120 s steps; 3 pages keep a request well inside the worker's own 600 s budget.
+const RETRY_BATCH = 3;
 const RETRY_DPI = 400;         // the first pass renders at 300 dpi
-const RETRY_TIMEOUT_MS = 300_000; // per OCR request; the whole pass is at most two of them
+// #1882: per OCR retry request, scaled to the batch and never below the worker's own 600 s document
+// budget, so core does not give up on a request the worker is still answering.
+const retryTimeoutMs = (pages) => Math.min(610_000, Math.max(330_000, 30_000 + pages * 240_000));
 const BUSY_WAITS_MS = [5_000, 15_000]; // a busy worker (one slot) is asked again this often, then given up
 // A retry that failed for a passing reason (the worker busy, unreachable, too old for the request) is
 // tried again on a later read, up to this many attempts per page in all. Any other outcome is final.
@@ -186,12 +190,18 @@ function parseFigures(list, pageTexts) {
 
 /** OCR for the native pass's image-bearing pages, merged into `pages` in place. At most `cap` pages are
  *  sent; `remaining` is what the text caps still allow. Returns what happened, for the document's error. */
-async function ocrNativePages(bytes, candidates, { extractPages, remaining, cap, maxBytes = OCR_MAX_BYTES }) {
+async function ocrNativePages(bytes, candidates, { extractPages, remaining, cap, maxBytes = OCR_MAX_BYTES, ocrBudget }) {
   let retryable = false, ocrError, ocrErrorId;
   // #1864: never sent a body the worker refuses; final, not retryable (the bytes will not shrink). A worker
   // that later accepts it re-opens the result (#1867, reopenable).
   if (bytes.length > maxBytes) return { retryable: false, ocrError: ocrTooLarge(maxBytes), ocrErrorId: 'ocrTooLarge', remaining, sent: 0 };
-  const chosen = candidates.slice(0, Math.max(0, cap));
+  // #1882: a file over 25 MiB spends the sync's OCR budget (like the retries) so several large scans do not
+  // hold the single OCR slot in one sync; the pages left over stay 'ocr-needed' and the completion pass
+  // defers them to later syncs. A small file is sent exactly as before.
+  const budgeted = ocrBudget && bytes.length > OCR_MAX_BYTES;
+  const allowed = budgeted ? Math.min(cap, Math.max(0, Number(ocrBudget.remaining) || 0)) : cap;
+  const chosen = candidates.slice(0, Math.max(0, allowed));
+  if (budgeted) ocrBudget.remaining = Math.max(0, (Number(ocrBudget.remaining) || 0) - chosen.length);
   if (chosen.length) {
     try {
       for (const p of chosen) p.ocrSent = true; // #1871: not retried at the same resolution (see retry)
@@ -211,7 +221,7 @@ async function ocrNativePages(bytes, candidates, { extractPages, remaining, cap,
       }
     } catch (err) { retryable = true; ocrError = String(err.message || err).slice(0, 300); ocrErrorId = undefined; }
   }
-  if (candidates.length > chosen.length) { ocrError = 'OCR limited to 50 image-bearing pages per document.'; ocrErrorId = 'ocrPageLimit'; }
+  if (candidates.length > Math.max(0, cap)) { ocrError = 'OCR limited to 50 image-bearing pages per document.'; ocrErrorId = 'ocrPageLimit'; }
   return { retryable, ocrError, ocrErrorId, remaining, sent: chosen.length };
 }
 
@@ -245,7 +255,7 @@ async function extractUnlocked(name, bytes, deps) {
   // #1864: a PDF too large for one Docling request goes to Docling only if it reads page ranges; otherwise
   // it is read here, range by range, rather than refused.
   const large = bytes.length > WHOLE_BYTES && /\.pdf$/i.test(String(name || ''));
-  if (doclingEnabled && (!large || await rangesSupported() === true)) {
+  if (doclingEnabled && (!large || await rangesSupported({ bytes: bytes.length }) === true)) {
     return completeDocument(name, bytes, await extractWithDocling(name, bytes, extractDocument, figures, limits.rangePages), deps);
   }
   // pdf.js runs in a worker with a time and a heap limit (documents-native.cjs): a pathological
@@ -265,7 +275,7 @@ async function extractUnlocked(name, bytes, deps) {
   // #1867: the worker is asked what it accepts only when the file is over what every worker accepts.
   const maxBytes = ocrEnabled && candidates.length && bytes.length > OCR_MAX_BYTES ? ocr.maxBytesOf(await capabilitiesOf(ocrCapabilities)) : OCR_MAX_BYTES;
   const ocrResult = ocrEnabled && candidates.length
-    ? await ocrNativePages(bytes, candidates, { extractPages, remaining: TOTAL_TEXT_CAP - textLength(pageTexts), cap: 50, maxBytes })
+    ? await ocrNativePages(bytes, candidates, { extractPages, remaining: TOTAL_TEXT_CAP - textLength(pageTexts), cap: 50, maxBytes, ocrBudget: deps.ocrBudget })
     : { retryable: false, sent: 0 };
   // An image-bearing page of a PDF too large for the OCR worker stays 'ocr-needed', and the document says why.
   const { retryable, ocrError, ocrErrorId } = ocrResult;
@@ -359,7 +369,7 @@ async function completeUnlocked(name, bytes, out, deps) {
   // Docling reads the ranges when its worker says it can; otherwise (and for a document read here in the
   // first place) the pdf.js reader does, a range per worker. Per page, `method` says which.
   let viaDocling = doclingEnabled && next <= last && pageTexts.some((p) => p.method !== 'native' && p.method !== 'native+ocr')
-    && await rangesSupported() === true;
+    && await rangesSupported({ bytes: bytes.length }) === true;
   while (!reopened && next <= last) {
     if (used >= limits.text) { stoppedAt = { page: next - 1, limit: 'text' }; break; }
     const end = Math.min(last, next + limits.rangePages - 1);
@@ -380,7 +390,7 @@ async function completeUnlocked(name, bytes, out, deps) {
         got = read.pageTexts;
         const candidates = got.filter(p => ['ocr-needed', 'unreadable'].includes(p.status));
         if (ocrEnabled && candidates.length) {
-          const r = await ocrNativePages(bytes, candidates, { extractPages, remaining: budget - textLength(got), cap: 50 - ocrSent, maxBytes: await ocrLimit() });
+          const r = await ocrNativePages(bytes, candidates, { extractPages, remaining: budget - textLength(got), cap: 50 - ocrSent, maxBytes: await ocrLimit(), ocrBudget });
           ocrSent += r.sent;
           if (r.ocrError) { ocrError = r.ocrError; ocrErrorId = r.ocrErrorId; }
         }
@@ -480,11 +490,14 @@ async function retryIncompletePages(bytes, pages, { ocrEnabled, extractPages, ro
     const batch = chosen.slice(i, i + RETRY_BATCH);
     let results;
     try {
-      results = await patiently(() => extractPages(bytes, batch.map((p) => p.number), { dpi: RETRY_DPI, timeoutMs: RETRY_TIMEOUT_MS }), waits);
+      results = await patiently(() => extractPages(bytes, batch.map((p) => p.number), { dpi: RETRY_DPI, timeoutMs: retryTimeoutMs(batch.length) }), waits);
       if (!Array.isArray(results)) throw new Error('Invalid OCR response.');
     } catch (err) {
-      const reason = /timeout|aborted/i.test(String(err?.name || '') + String(err?.message || '')) ? 'OCR took too long' : String(err?.message || err).slice(0, 200);
-      const passingFailure = isPassing(err);
+      const timedOut = /timeout|aborted/i.test(String(err?.name || '') + String(err?.message || ''));
+      const reason = timedOut ? 'OCR took too long' : String(err?.message || err).slice(0, 200);
+      // #1882: core giving up on a whole batch says nothing about one page: it is tried again on a later
+      // read (bounded by RETRY_ATTEMPTS), not marked final.
+      const passingFailure = isPassing(err) || timedOut;
       for (const p of batch) {
         const attempts = (Number(p.retry?.attempts) || 0) + 1;
         p.retry = { outcome: 'failed', dpi: RETRY_DPI, error: reason, attempts, ...(passingFailure && attempts < RETRY_ATTEMPTS ? { again: true } : {}) };
@@ -514,4 +527,4 @@ async function retryIncompletePages(bytes, pages, { ocrEnabled, extractPages, ro
 
 // A test may pin the version (multimodal-followups-1770-1772.test.cjs assigns it); production never does.
 let versionOverride = null;
-module.exports = { ocrDeferrals, isDocument, documentExtensions, extractDocumentText, completeDocument, ocrBudget, COMPLETION, WHOLE_BYTES, RETRY_PAGE_CAP, RETRY_DPI, RETRY_ATTEMPTS, OCR_MAX_BYTES, reopenable, DOCUMENT_EXTENSIONS, EXTRACT_CAP, get EXTRACTOR_VERSION() { return versionOverride ?? extractorVersion(); }, set EXTRACTOR_VERSION(v) { versionOverride = v; }, PAGE_CAP, TOTAL_TEXT_CAP };
+module.exports = { ocrDeferrals, isDocument, documentExtensions, extractDocumentText, completeDocument, ocrBudget, COMPLETION, WHOLE_BYTES, RETRY_PAGE_CAP, RETRY_DPI, RETRY_ATTEMPTS, RETRY_BATCH, retryTimeoutMs, OCR_MAX_BYTES, reopenable, DOCUMENT_EXTENSIONS, EXTRACT_CAP, get EXTRACTOR_VERSION() { return versionOverride ?? extractorVersion(); }, set EXTRACTOR_VERSION(v) { versionOverride = v; }, PAGE_CAP, TOTAL_TEXT_CAP };
