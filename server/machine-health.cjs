@@ -27,7 +27,14 @@ function healthUrl(base, path = '/health') {
 function createMachineHealth({ fetchImpl = serviceFetch, decisionFetchImpl = decisionServiceFetch, ttlMs = 30000, timeoutMs = 2500, maxEntries = 32, now = Date.now } = {}) {
   const cache = new Map(); // url -> { at, result } | { pending }
 
-  async function probeOnce(url, fetcher, headers) {
+  async function probeOnce(url, fetcher, headers, fallbackUrl = null) {
+    const first = await probeUrl(url, fetcher, headers);
+    // #1861: an OpenAI-style server (Kev) has no /health; a 404 there says "no such path", not "down". Ask the path its client uses.
+    if (fallbackUrl && first.state === 'down' && first.reason === 'http-404') return probeUrl(fallbackUrl, fetcher, headers);
+    return first;
+  }
+
+  async function probeUrl(url, fetcher, headers) {
     const sent = !!(headers && Object.keys(headers).length);
     try {
       const r = await fetcher(url, { method: 'GET', redirect: 'error', signal: AbortSignal.timeout(timeoutMs), ...(sent ? { headers } : {}) });
@@ -47,13 +54,14 @@ function createMachineHealth({ fetchImpl = serviceFetch, decisionFetchImpl = dec
     }
   }
 
-  function probe(base, { decision = false, headers = null, path = '/health' } = {}) {
+  function probe(base, { decision = false, headers = null, path = '/health', fallbackPath = null } = {}) {
     const url = healthUrl(base, path);
+    const fallbackUrl = fallbackPath ? healthUrl(base, fallbackPath) : null;
     if (!url) return Promise.resolve({ state: 'unknown' });
     const hit = cache.get(url);
     if (hit?.pending) return hit.pending;
     if (hit && now() - hit.at < ttlMs) return Promise.resolve(hit.result);
-    const pending = probeOnce(url, decision ? decisionFetchImpl : fetchImpl, headers).then((result) => {
+    const pending = probeOnce(url, decision ? decisionFetchImpl : fetchImpl, headers, fallbackUrl).then((result) => {
       const out = { ...result, checkedAt: new Date(now()).toISOString() };
       cache.delete(url);
       cache.set(url, { at: now(), result: out });
@@ -91,7 +99,7 @@ function createMachineHealth({ fetchImpl = serviceFetch, decisionFetchImpl = dec
   async function check(targets) {
     const out = {};
     await Promise.all(targets.map(async (t) => {
-      out[t.service] = t.url ? await probe(t.url, { decision: !!t.decision, headers: t.headers || null, path: t.path || '/health' }) : { state: 'unknown' };
+      out[t.service] = t.url ? await probe(t.url, { decision: !!t.decision, headers: t.headers || null, path: t.path || '/health', fallbackPath: t.fallbackPath || null }) : { state: 'unknown' };
     }));
     return out;
   }
@@ -108,6 +116,12 @@ function machineState(states) {
   return 'up';
 }
 
+/** #1861: the service behind machineReason (same pick), so a degraded machine can name it. */
+function machineFailing(entries) {
+  const list = entries.filter((e) => e && e.result && e.result.state !== 'unknown');
+  return (list.find((e) => e.result.state === 'unreachable') || list.find((e) => e.result.state === 'down'))?.service || '';
+}
+
 /** #1856: the reason of the worst probed service on a machine (unreachable, then down), or '' when it is healthy. */
 function machineReason(states) {
   const list = states.filter((s) => s && s.state !== 'unknown');
@@ -115,4 +129,4 @@ function machineReason(states) {
   return worst?.reason || '';
 }
 
-module.exports = { createMachineHealth, machineState, machineReason, healthUrl };
+module.exports = { createMachineHealth, machineState, machineReason, machineFailing, healthUrl };
