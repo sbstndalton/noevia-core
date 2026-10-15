@@ -999,6 +999,9 @@ function createChatHandler({
       // A verdict with no model behind it falls back to smart rather than sending an
       // empty model name upstream.
       if (!roles[routedRole]) routedRole = roles.smart ? 'smart' : 'fast';
+      // #1667: a prompt the sampling classifier marks creative goes to the Creative role when one is assigned (local
+      // route only: a cloud route keeps its own model). Unassigned, the router's pick stands with creative sampling.
+      if (!routeTarget?.row && require('./sampling-presets.cjs').creativeRoute({ routedRole, message, roles })) routedRole = 'creative';
       model = routeTarget?.row ? require('./routing-modes.cjs').cloudModel(routeTarget.cloud, routedRole) : roles[routedRole];
       if (routingDecision) routingDecision = { ...routingDecision, effectiveRole: routedRole };
       recordResend(body.resend, { auto: true, role: routedRole, status: routingDecision?.status || null });

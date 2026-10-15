@@ -1,7 +1,7 @@
 'use strict';
 // The model routes (models.cjs holds what they compute):
 //   /api/stats                  engine and system statistics
-//   /api/auto-roles             the Fast/Smart/Vision/Code role→model config
+//   /api/auto-roles             the Fast/Smart/Vision/Code/Creative role→model config
 //   /api/model-manager/*        proxy to the model management service, administrators only,
 //                               with the folder scan served from the last result
 //   /api/models/*               presets, evidence, autotune, calibration, hardware, the
@@ -66,7 +66,7 @@ function statsRustOwned(env) {
   return env.NOEVIA_FRONT === 'rust' && env.NOEVIA_RUST_AUTH === '1' && env.NOEVIA_RUST_AUTH_CONFIRMED === '1'
     && env.NOEVIA_RUST_STATS === '1' && env.NOEVIA_RUST_STATS_CONFIRMED === '1';
 }
-function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag.cjs').servedModelsCached(target), json, readBody, readJson, fetchJson, env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe, reportedTokenRate, missingRoles, currentWorkspace, service, inferenceBudget = null, sweepGuardOptions = {}, decisionSettings = null }) {
+function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag.cjs').servedModelsCached(target), json, readBody, readJson, fetchJson, env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe, reportedTokenRate, missingRoles, currentWorkspace, service, inferenceBudget = null, sweepGuardOptions = {}, decisionSettings = null, rerankSettings = null }) {
   const { modelScanCache, refreshModelScan, autoRoles, setAutoRoles, ensureRolesLoaded, servedCatalogue, modelsInstalled, deriveUserModelName, lastLoadedModel, clearLastLoadedModel, clearRoleReferences } = service;
   // #1461: the installed list is shared for a moment (service.modelsInstalled). A decision that must confirm
   // the engine's state right now (a delete that checks the model exists, a load that checks it is not missing)
@@ -259,13 +259,15 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
         const smart = typeof body.smart === 'string' ? body.smart.trim() : '';
         const vision = typeof body.vision === 'string' ? body.vision.trim() : '';
         const code = typeof body.code === 'string' ? body.code.trim() : '';
+        // #1667: optional, like code and vision. An older client that omits the field keeps the saved one.
+        const creative = typeof body.creative === 'string' ? body.creative.trim() : body.creative === undefined ? (autoRoles()?.creative || '') : '';
         if (!fast || !smart) return json(res, 400, { error: 'both fast and smart model names are required' });
         // Names must resolve to installed models, or a bad id would keep producing repeated
         // load-warning log lines forever (ensureRolesLoaded retries every save/warm-up). Skip
         // the check only when the catalogue itself cannot be read (engine unreachable): saving
         // is still allowed, since the alternative is a member/admin locked out of the page.
         const catalogue = await servedCatalogue();
-        const named = { fast, smart, ...(vision ? { vision } : {}), ...(code ? { code } : {}) };
+        const named = { fast, smart, ...(vision ? { vision } : {}), ...(code ? { code } : {}), ...(creative ? { creative } : {}) };
         if (Array.isArray(catalogue)) {
           const known = new Set(catalogue.map((m) => m.name));
           const bad = Object.entries(named).filter(([, name]) => !known.has(name)).map(([, name]) => name);
@@ -283,14 +285,14 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
         // reported as vision-capable (ModelsSettings.tsx), but the server accepts any chat model
         // here so a hand-written /api/auto-roles call from a working setup never breaks.
         const { nonChatAliases } = require('../chat-model-kind.cjs');
-        const textRoles = { fast, smart, ...(vision ? { vision } : {}), ...(code ? { code } : {}) };
+        const textRoles = { fast, smart, ...(vision ? { vision } : {}), ...(code ? { code } : {}), ...(creative ? { creative } : {}) };
         const nonChat = new Set(nonChatAliases(Object.values(textRoles), catalogue));
         const badRole = Object.entries(textRoles).find(([, name]) => nonChat.has(name));
         if (badRole) {
           const [role, model] = badRole;
           return json(res, 400, { error: `The ${role} role needs a chat model; ${model} is an embedding, reranking or routing model.` });
         }
-        setAutoRoles({ fast, smart, vision, code });
+        setAutoRoles({ fast, smart, vision, code, ...(creative ? { creative } : {}) });
         // Loading models for the shared engine is an administrative action: a member's save is
         // stored per workspace like anyone else's, but only an admin's save may warm models up
         // (native routing stays on demand either way; see ensureRolesLoaded above it).
@@ -631,7 +633,30 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
       if (admin) { try { served = await servedEmbeddingModels({ baseUrl: embedding?.active?.baseUrl || null }); } catch { served = null; } }
       if (!Array.isArray(served)) served = null;
       const service = require('../embedding-service.cjs').current()?.status() || null;
-      return json(res, 200, { ...modelAssignments({ installed, env, embedding, isSystem: (n) => isSystemModel(n), admin, served, service, decision: decisionSettings ? decisionSettings.describe() : null }), available: Array.isArray(installed) });
+      return json(res, 200, { ...modelAssignments({ installed, env, embedding, isSystem: (n) => isSystemModel(n), admin, served, service, decision: decisionSettings ? decisionSettings.describe() : null, rerank: rerankSettings }), available: Array.isArray(installed) });
+    }
+
+    // #1665: the reranker's runtime switch. Administrators only, for reading too (the options name what this
+    // server can rerank with); CSRF/origin run before routes. GET -> { enabled, choice, source, options };
+    // PUT { enabled, choice? } saves (audited, applies at once); DELETE or PUT { reset: true } returns to the
+    // deployment's configuration. No address is ever sent: a choice is an id the server maps to its address.
+    if (p === '/api/models/reranker') {
+      if (authn.user.role !== 'admin') return json(res, 403, { error: 'administrator required' });
+      if (!rerankSettings) return json(res, 503, { error: 'Reranker settings are unavailable.' });
+      if (!['GET', 'PUT', 'DELETE'].includes(req.method || 'GET')) return json(res, 405, { error: 'method not allowed' });
+      let installed = null;
+      try { installed = await modelsInstalled(); } catch { installed = null; }
+      if (!Array.isArray(installed)) installed = null;
+      try {
+        if (req.method === 'GET') return json(res, 200, rerankSettings.get(installed));
+        if (req.method === 'DELETE') return json(res, 200, rerankSettings.reset(authn.user.id, installed));
+        let body;
+        try { body = await readJson(req); } catch { return json(res, 400, { error: 'invalid JSON', errorId: 'invalidInput' }); }
+        if (isJsonObject(body) && body.reset === true) return json(res, 200, rerankSettings.reset(authn.user.id, installed));
+        return json(res, 200, rerankSettings.save(body, authn.user.id, installed));
+      } catch (error) {
+        return json(res, error.status || 400, { error: error.status ? error.message : 'Invalid reranker settings', ...(error.messageId ? { errorId: error.messageId } : {}) });
+      }
     }
 
     // #1695: idempotent cleanup of presets whose model file is gone (the web runs it when the

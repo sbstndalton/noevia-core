@@ -113,7 +113,7 @@ test('decision-service reasons, test messages and refusals have a key in every l
   assert.ok(settings.includes(core.translate('en-GB', 'features.unavailable.decisionSetup')));
   assert.ok(router.includes(core.translate('en-GB', 'features.unavailable.systemOneUrl')));
   const messageIds = [...settings.matchAll(/messageId:'(\w+)'/g)].map((m) => m[1]).sort();
-  assert.deepEqual(messageIds, ['invalidInput', 'invalidUrl', 'notReady', 'ready']);
+  assert.deepEqual(messageIds, ['invalidInput', 'invalidModel', 'invalidUrl', 'notReady', 'ready']);
   for (const id of messageIds) {
     for (const l of ['en-GB', ...Object.keys(FILES)]) assert.ok(has(l, `decision.msg.${id}`), `${l} decision.msg.${id}`);
     assert.ok(settings.includes(core.translate('en-GB', `decision.msg.${id}`)), `the server's English for ${id} is the catalogue's`);

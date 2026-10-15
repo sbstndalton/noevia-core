@@ -86,12 +86,14 @@ test('#1796 the Decision row is Kev from the deployment, Sensitivity is Laya; a 
   const installed = [{ name: 'laya_multilingual_f16', labels: [], system: true, servedElsewhere: true }];
   const a = modelAssignments({ installed, env: KEV_ENV, admin: true, isSystem: () => true });
   const by = Object.fromEntries(a.services.map((s) => [s.id, s]));
-  assert.deepEqual(by.decision, { id: 'decision', model: 'kev-0.8b', state: 'active', canChange: false, source: 'deployment' });
+  // #1666: admins also get the choosable decision model ids and the deployment's own.
+  assert.deepEqual(by.decision, { id: 'decision', model: 'kev-0.8b', state: 'active', canChange: false, source: 'deployment', models: ['laya', 'kev-0.8b'], deploymentModel: 'kev-0.8b' });
   assert.deepEqual(by.sensitivity, { id: 'sensitivity', model: 'laya', state: 'active', canChange: false, shared: false });
   assert.ok(!JSON.stringify(a).includes('laya_multilingual_f16'), 'the stale preset name is gone from the rows');
   assert.ok(!JSON.stringify(a).includes('kev:11435') && !JSON.stringify(a).includes('laya:8040'), 'no address is sent');
   const member = modelAssignments({ installed, env: KEV_ENV, admin: false });
   assert.equal('source' in member.services.find((s) => s.id === 'decision'), false, 'members do not see where it is set');
+  assert.equal('models' in member.services.find((s) => s.id === 'decision'), false, 'members get no choices');
 });
 
 test('#1796 describeDecision: shared sensitivity, a URL saved in Settings, nothing set up, an unusable sensitivity URL', () => {

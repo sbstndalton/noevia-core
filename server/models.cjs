@@ -83,6 +83,8 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
     const roles = { fast: String(next.fast), smart: String(next.smart) };
     if (next.vision) roles.vision = String(next.vision);
     if (next.code) roles.code = String(next.code);
+    // #1667: optional too; unset, creative prompts keep the model the router picks (with creative sampling).
+    if (next.creative) roles.creative = String(next.creative);
     currentWorkspace().autoRoles = roles;
     currentWorkspace().saveAutoRoles();
   }
@@ -101,10 +103,10 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
     if (!roles) return null;
     const next = { ...roles };
     const cleared = [];
-    for (const role of ['fast', 'smart', 'vision', 'code']) {
+    for (const role of ['fast', 'smart', 'vision', 'code', 'creative']) {
       if (next[role] !== name) continue;
       cleared.push(role);
-      if (role === 'vision' || role === 'code') { delete next[role]; continue; }
+      if (role === 'vision' || role === 'code' || role === 'creative') { delete next[role]; continue; }
       const fallback = role === 'fast' ? 'smart' : 'fast';
       next[role] = next[fallback] && next[fallback] !== name ? next[fallback] : '';
     }
@@ -156,7 +158,7 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
     const roles = autoRoles();
     if (!roles) return;
     void (async () => {
-      for (const role of ['fast', 'smart', 'vision', 'code']) {
+      for (const role of ['fast', 'smart', 'vision', 'code', 'creative']) {
         if (!roles[role]) continue;
         try {
           await ensureModelLoaded(roles[role]);

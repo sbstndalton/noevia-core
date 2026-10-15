@@ -36,10 +36,25 @@ const CREATIVE_RE = /\b(write|compose|draft)\s+(a|an|some)?\s*(short\s+)?(story|
  */
 function classifyTaskForSampling({ routedRole, message } = {}) {
   const text = typeof message === 'string' ? message : '';
+  // #1667: a turn already routed to the Creative role was put there by this classifier.
+  if (routedRole === 'creative') return 'creative';
   if (routedRole !== 'code' && CREATIVE_RE.test(text)) return 'creative';
   if (routedRole === 'code') return 'coding';
   if (routedRole === 'smart') return 'reasoning';
   return 'general';
+}
+
+/**
+ * #1667: the Creative chat role. An Automatic turn the sampling classifier marks creative goes to the
+ * Creative role's model when one is assigned; otherwise (no Creative model, or a code turn) the router's
+ * pick stands and only the creative sampling preset applies, exactly as before. Callers use this for
+ * Automatic turns only, so an explicit model pick (a project's or the user's) never moves.
+ * @param {{ routedRole?: string|null, message?: string, roles?: object|null }} args
+ * @returns {string|null} 'creative' when the turn moves to the Creative role, else null.
+ */
+function creativeRoute({ routedRole = null, message = '', roles = null } = {}) {
+  if (!roles || typeof roles.creative !== 'string' || !roles.creative) return null;
+  return classifyTaskForSampling({ routedRole, message }) === 'creative' ? 'creative' : null;
 }
 
 /** True if the value is a finite, in-range number for that sampling key. */
@@ -82,4 +97,4 @@ function selectSamplingParams({ routedRole = null, message = '', explicit = null
   return { params, presetId, source, version: PRESETS_VERSION };
 }
 
-module.exports = { PRESETS, PRESETS_VERSION, SAMPLING_KEYS, classifyTaskForSampling, sanitizeExplicitSampling, validSamplingValue, selectSamplingParams };
+module.exports = { PRESETS, PRESETS_VERSION, SAMPLING_KEYS, classifyTaskForSampling, creativeRoute, sanitizeExplicitSampling, validSamplingValue, selectSamplingParams };

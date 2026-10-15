@@ -30,7 +30,7 @@ const isRerankModel = (m) => (m.labels || []).some((l) => /^rerank/i.test(l)) ||
  *           env: object, embedding: {active?:{model:string,profile:string}|null,next?:{model:string}|null,coverage?:object}|null,
  *           isSystem: (name:string) => boolean, admin: boolean }} input
  */
-function modelAssignments({ installed, env = {}, embedding = null, isSystem = () => false, admin = false, served = null, service = null, decision = null }) {
+function modelAssignments({ installed, env = {}, embedding = null, isSystem = () => false, admin = false, served = null, service = null, decision = null, rerank = null }) {
   const list = Array.isArray(installed) ? installed : [];
   const byName = new Map(list.map((m) => [m.name, m]));
   const stateOf = (model) => {
@@ -66,24 +66,35 @@ function modelAssignments({ installed, env = {}, embedding = null, isSystem = ()
     ...(admin && managed ? { canTurnOff: !serviceOff && !next } : {}),
     ...(admin ? { options: serviceOff ? list.filter((m) => !m.missingFile && isEmbeddingModel(m)).map((m) => ({ model: m.name, profile: embeddingProfileFor(m.name), served: true })) : options, baseUrl: embedding?.active?.baseUrl ?? null } : {}) });
 
-  const rerankOn = truthy(env.NOEVIA_FEATURE_RAG_RERANK);
-  const rerank = String(env.RERANK_MODEL || '').trim() || null;
+  // #1665: `rerank` is rerank-settings.cjs; its effective environment (the admin's saved switch over the
+  // deployment's) is what retrieval uses, so the row reads it too. Without it: the deployment's, as before.
+  const renv = rerank && typeof rerank.effectiveEnv === 'function' ? rerank.effectiveEnv() : env;
+  const rerankOn = truthy(renv.NOEVIA_FEATURE_RAG_RERANK);
+  const rerankModel = String(renv.RERANK_MODEL || '').trim() || null;
   // #1695: a configured reranker whose file is gone reads "missing" even while reranking is
   // switched off, so the row never says just "Off" for a model that no longer exists.
   // #1665: a TEI reranker (RERANK_BACKEND=tei) is served by its own sidecar, not from the installed
   // GGUF list, so its name is never "missing" from that list and there is nothing to pick from it.
-  const teiRerank = String(env.RERANK_BACKEND || '').trim().toLowerCase() === 'tei';
+  const teiRerank = String(renv.RERANK_BACKEND || '').trim().toLowerCase() === 'tei';
   const rerankState = teiRerank ? (rerankOn ? 'active' : 'off')
-    : rerank && list.length && stateOf(rerank) === 'missing' ? 'missing' : rerankOn ? stateOf(rerank) : 'off';
-  services.push({ id: 'reranker', model: rerank, state: rerankState, canChange: false,
-    ...(admin ? { options: teiRerank ? [] : list.filter((m) => !m.missingFile && isRerankModel(m)).map((m) => m.name) } : {}) });
+    : rerankModel && list.length && stateOf(rerankModel) === 'missing' ? 'missing' : rerankOn ? stateOf(rerankModel) : 'off';
+  // #1665: admins get the runtime switch: `enabled`, the chosen id, where it comes from and the choices
+  // ({ id, backend, model }; never an address). `options` stays the plain installed names (#1695 wording).
+  const switchable = rerank ? rerank.get(Array.isArray(installed) ? installed : null) : null;
+  services.push({ id: 'reranker', model: rerankModel, state: rerankState, canChange: admin && !!switchable,
+    ...(admin ? { options: teiRerank ? [] : list.filter((m) => !m.missingFile && isRerankModel(m)).map((m) => m.name) } : {}),
+    ...(admin && switchable ? { enabled: switchable.enabled, choice: switchable.choice, source: switchable.source, choices: switchable.options } : {}) });
 
   // #1796: the decision service and the sensitivity check are what decision-settings.cjs sends to (the
   // shared URL from Settings or COWORK_DECISION_URL, with COWORK_DECISION_MODEL), never an installed
   // preset marked as Laya: that stale entry said laya_multilingual_f16 while every decision went to Kev.
   const { describeDecision } = require('./decision-settings.cjs');
   const d = decision || describeDecision(env);
-  services.push({ id: 'decision', model: d.decision.model, state: d.decision.state, canChange: false, ...(admin ? { source: d.decision.source } : {}) });
+  // #1666: admins also get the decision model ids they can choose in Decision service setup and the deployment's own.
+  const { DECISION_MODELS } = require('./decision-settings.cjs');
+  const { profileFor } = require('./decision-models.cjs');
+  services.push({ id: 'decision', model: d.decision.model, state: d.decision.state, canChange: false, ...(admin ? { source: d.decision.source, ...(d.decision.modelSource ? { modelSource: d.decision.modelSource } : {}),
+    models: [...DECISION_MODELS], deploymentModel: profileFor(env.COWORK_DECISION_MODEL).id } : {}) });
   services.push({ id: 'sensitivity', model: d.sensitivity.model, state: d.sensitivity.state, canChange: false, shared: d.sensitivity.shared === true });
 
   services.push({ id: 'ocr', model: null, state: String(env.OCR_BASE_URL || '').trim() ? 'active' : 'off', canChange: false });
