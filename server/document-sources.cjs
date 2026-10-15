@@ -116,8 +116,12 @@ function retryable(workspace, projectId, version) {
   try { return !!JSON.parse(fs.readFileSync(versionPath(workspace, projectId, version, '.json'), 'utf8')).retryable; } catch { return false; }
 }
 // #1770: a transient failure that says the extraction service itself is down or busy (not this document).
+// A timeout or abort is NOT an outage: one large document can time out while the service is fine, so the
+// sweep defers that document and goes on (figure-sweep.cjs ends a pass only after consecutive timeouts).
 function serviceDown(error) {
-  return /busy|unavailable|not configured|fetch failed|ECONNREFUSED|ECONNRESET|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH|timed? ?out|timeout|aborted/i.test(String(error || ''));
+  const e = String(error || '');
+  if (/timed? ?out|timeout|aborted|AbortError/i.test(e)) return false;
+  return /busy|unavailable|not configured|fetch failed|ECONNREFUSED|ECONNRESET|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH/i.test(e);
 }
 // #1770 review: whether a new extraction is at least as good as the current one.
 const STATE_RANK = { failed: 0, partial: 1, ready: 2 };

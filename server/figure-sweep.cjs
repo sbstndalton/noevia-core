@@ -98,6 +98,7 @@ function createFigureSweep({ enabled = () => multimodal.enabled(), extractorVers
     try { ids = userIds() || []; } catch { ids = []; }
     let done = 0;
     let gap = false;
+    let timeouts = 0;
     walk: for (const userId of ids) {
       let workspace = null;
       try { workspace = workspaceFor(userId); } catch { workspace = null; }
@@ -118,9 +119,14 @@ function createFigureSweep({ enabled = () => multimodal.enabled(), extractorVers
           // A transient failure of this one document is skipped (not marked: the next pass tries it again);
           // only the extraction service itself being down or busy ends the pass.
           if (status === 'retry' && r.unreachable) { totals.reason = `document extraction is unavailable${r.error ? `: ${r.error}` : ''}`; break walk; }
-          if (status === 'retry') { totals.deferred += 1; done += 1; gap = true; }
-          else if (status === 'refreshed') { totals.refreshed += 1; done += 1; gap = true; }
+          if (status === 'retry') {
+            totals.deferred += 1; done += 1; gap = true;
+            // Two timeouts in a row look like a struggling service rather than one large document: end the pass.
+            timeouts = /timed? ?out|timeout|aborted|AbortError/i.test(String(r.error || '')) ? timeouts + 1 : 0;
+            if (timeouts >= 2) { totals.reason = `document extraction timed out twice in a row${r.error ? `: ${r.error}` : ''}`; break walk; }
+          } else if (status === 'refreshed') { totals.refreshed += 1; done += 1; gap = true; }
           else if (status === 'failed' || status === 'missing' || status === 'worse') { totals.failed += 1; done += 1; gap = true; }
+          if (status !== 'retry') timeouts = 0;
           if (gap) {
             gap = false;
             const busy = Math.max(0, now() - started);

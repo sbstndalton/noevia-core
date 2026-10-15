@@ -332,3 +332,25 @@ test('#1770: refreshDocumentFigures re-reads the stored original, keeps text on 
     assert.equal(sweepMod.needsFigures(older, null), false);
   } finally { documents.extractDocumentText = realExtract; documents.EXTRACTOR_VERSION = realVersion; }
 });
+
+test('#1770 re-review: a document that times out is deferred and later documents are still swept', async () => {
+  const documentSources = require('./document-sources.cjs');
+  const timeoutError = 'Document extraction unavailable: The operation was aborted due to timeout';
+  // What projects.cjs refreshDocumentFigures returns for a retryable failure.
+  const f = sweepFixture({ refreshImpl: async (_p, file) => {
+    if (file.name === 'a.pdf') return { status: 'retry', unreachable: documentSources.serviceDown(timeoutError), error: timeoutError };
+    file.document = { ...file.document, extractor: 'docling-pages-v1:d1:figures-v1' };
+    return { status: 'refreshed' };
+  } });
+  const t = await f.sweep.kick();
+  assert.equal(t.reason, null);
+  assert.equal(t.deferred, 1);
+  assert.deepEqual(f.calls.filter((c) => c[0] !== 'runAs'), [['proj-1', 'a.pdf'], ['proj-1', 'b.pdf']]);
+  // Outages still end the pass.
+  for (const e of ['fetch failed: ECONNREFUSED', 'getaddrinfo ENOTFOUND docling', 'Document extraction is busy; refresh to retry.']) assert.equal(documentSources.serviceDown(e), true, e);
+  // Two timeouts in a row end the pass.
+  const g = sweepFixture({ refreshImpl: async () => ({ status: 'retry', unreachable: false, error: 'request timed out' }) });
+  const t2 = await g.sweep.kick();
+  assert.match(t2.reason, /timed out twice/);
+  assert.equal(g.calls.filter((c) => c[0] !== 'runAs').length, 2);
+});
