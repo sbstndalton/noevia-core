@@ -100,7 +100,7 @@ test('flag on: sign-in adds a private, external row for that account only; nothi
   const row = list.body.providers.find((p) => p.id === 'chatgpt-oauth');
   assert.deepEqual(row, { id: 'chatgpt-oauth', label: 'ChatGPT', baseUrl: chatgpt.DEFAULTS.codexBaseUrl, apiKeyMasked: null, isDefault: false, managed: false, shared: false, defaultModel: undefined, kind: 'chatgpt-oauth', external: true, connection: 'connected' });
   for (const reply of [start, done, status, list]) assert.equal(/AT-secret|RT-secret|DAID|acct-synthetic/.test(JSON.stringify(reply.body)), false);
-  assert.deepEqual((await a.call('GET', '/api/providers/chatgpt/models')).body, { models: ['gpt-synthetic'] });
+  assert.deepEqual((await a.call('GET', '/api/providers/chatgpt/models')).body, { models: ['gpt-synthetic'], cached: false, fetchedAt: f.clock.t });
 
   // user B: separate workspace, no row, not connected, cannot finish A's login.
   const b = f.routesFor('user-b');
