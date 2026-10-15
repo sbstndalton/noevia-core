@@ -291,6 +291,9 @@ function createChatHandler({
   documentDir = (workspace, projectId) => require('./document-sources.cjs').directory(workspace, projectId),
 }) {
   const jsonOut = json;
+  // #1785: whether the local engine has other work now. /api/chat holds one inference request in the gate (index.cjs),
+  // so this turn counts as one. A manager without the signal (or one that throws) is not called busy.
+  const engineBusy = () => { try { return typeof modelManager?.inferenceBusy === 'function' && modelManager.inferenceBusy(1) === true; } catch { return false; } };
   // Revoked Skill content in earlier turns (#546): one ledger per handler, cached in memory.
   const skillLedger = skillHistory || require('./skill-history.cjs').createSkillHistory({ fs, path });
   const writesDone = recentWrites || require('./recent-writes.cjs').createRecentWrites();
@@ -2213,21 +2216,6 @@ function createChatHandler({
     } else if (!paused && !roundHasContent && roundReasoning.trim()) {
       send({ type: 'delta', text: '\n\nThe model returned reasoning without a final answer. Try again or choose another model.' });
     }
-    // #1785: after a chat's first reply, a short title from the local model that just answered. Never on an off-box
-    // turn (offBoxTurn): the message and the reply go nowhere for it. Saved only over the title derived from the first
-    // message; the client adopts it from the `title` event. Bounded and failure-free (chat-title.cjs).
-    if (chatTitles && !paused && roundHasContent && roundContent.trim() && typeof body.chatId === 'string' && body.chatId
-      && !body.compactOnly && !(typeof spaceId === 'string' && spaceId.startsWith('diary')) && project?.id !== diaryExtras?.PROJECT_ID
-      && provider.id === DEFAULT_PROVIDER_ID && !offBoxTurn({ externalProvider, routeTarget, provider, DEFAULT_PROVIDER_ID })
-      && chatTitleLib.firstReply(history)) {
-      const title = await chatTitleLib.generateTitle({ fetch, url: upstreamUrl, headers: upstreamHeaders, model, message, reply: roundContent,
-        signal: chatSignal.signal, readJson: readCappedJson });
-      if (chatSignal.signal.aborted) return;
-      if (title) {
-        send({ type: 'title', chatId: body.chatId, title });
-        try { chatTitles.save(body.projectId && project ? project.id : null, body.chatId, title, message); } catch { /* the client saves it too */ }
-      }
-    }
     send({ type: 'telemetry', phase: 'complete', model, timeToFirstToken: exchangeFirstTokenMs === null ? null : exchangeFirstTokenMs / 1000 });
     if (reasonerTrace && reasoningTraces && chatWorkspace?.dir) {
       // #740: the person's own opt-in, in their own workspace dir. Packet, answer length, timings only.
@@ -2238,6 +2226,24 @@ function createChatHandler({
       catch { /* a trace never changes the reply */ }
     }
     send({ type: 'done', model });
+    // #1785: after a chat's first reply, a short title from the local model that just answered. Never on an off-box
+    // turn (offBoxTurn): the message and the reply go nowhere for it. Saved only over the title derived from the first
+    // message; the client adopts it from the `title` event. Bounded and failure-free (chat-title.cjs).
+    // It runs after `done`, so it never holds the reply's completion; the client reads every event until the connection
+    // closes (web api.ts streamChat) and still adopts it (web#58). Skipped while the engine is busy: other inference in
+    // flight (this turn holds one request in the gate, index.cjs), a held maintenance gate or a pending model load/swap.
+    if (chatTitles && !paused && roundHasContent && roundContent.trim() && typeof body.chatId === 'string' && body.chatId
+      && !body.compactOnly && !(typeof spaceId === 'string' && spaceId.startsWith('diary')) && project?.id !== diaryExtras?.PROJECT_ID
+      && provider.id === DEFAULT_PROVIDER_ID && !offBoxTurn({ externalProvider, routeTarget, provider, DEFAULT_PROVIDER_ID })
+      && chatTitleLib.firstReply(history) && !engineBusy()) {
+      const title = await chatTitleLib.generateTitle({ fetch, url: upstreamUrl, headers: upstreamHeaders, model, message, reply: roundContent,
+        signal: chatSignal.signal, readJson: readCappedJson });
+      if (chatSignal.signal.aborted) return;
+      if (title) {
+        send({ type: 'title', chatId: body.chatId, title });
+        try { chatTitles.save(body.projectId && project ? project.id : null, body.chatId, title, message); } catch { /* the client saves it too */ }
+      }
+    }
     res.end();
   }
 

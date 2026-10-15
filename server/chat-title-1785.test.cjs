@@ -39,9 +39,9 @@ test('#1785: cleanTitle keeps a short title and drops wrappers, thinking and jun
   assert.equal(titles.cleanTitle(null), null);
 });
 
-async function turn(t, { history = [], provider = { id: 'default', baseUrl: 'http://default.invalid' }, project = {}, titleReply = 'Friendly Greeting', titleStatus = 200, wired = true } = {}) {
+async function turn(t, { history = [], provider = { id: 'default', baseUrl: 'http://default.invalid' }, project = {}, titleReply = 'Friendly Greeting', titleStatus = 200, wired = true, busy } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-1785-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  const events = [], requests = [], saved = [];
+  const events = [], requests = [], saved = [], busyCalls = [];
   const res = new EventEmitter(); res.writeHead = () => {}; res.end = () => { res.writableEnded = true; res.emit('finish'); };
   res.write = (chunk) => { for (const line of String(chunk).split('\n')) if (line.startsWith('data:')) { try { events.push(JSON.parse(line.slice(5))); } catch { /* not json */ } } };
   const fetch = async (url, init) => {
@@ -51,7 +51,7 @@ async function turn(t, { history = [], provider = { id: 'default', baseUrl: 'htt
     return { ok: true, status: 200, body: (async function* () { yield Buffer.from(`data: ${JSON.stringify({ choices: [{ delta: { content: 'Hello there.' } }] })}\n\n`); })() };
   };
   const { handleChat } = createChatHandler({
-    modelManager: { enabled: true, health: async () => ({ ok: true, body: { all_models_loaded: [{ model_name: 'answer-model', loaded: true, recipe_options: { ctx_size: 32768 } }] } }) },
+    modelManager: { enabled: true, ...(busy === undefined ? {} : { inferenceBusy: (own) => { busyCalls.push(own); return busy; } }), health: async () => ({ ok: true, body: { all_models_loaded: [{ model_name: 'answer-model', loaded: true, recipe_options: { ctx_size: 32768 } }] } }) },
     reasoningEffort: require('./reasoning-effort.cjs'), authService: { audit() {} }, crypto: require('node:crypto'), path, fs, fetch,
     HISTORY_CAP: 20, DEFAULT_PROVIDER_ID: 'default', createToolExchange,
     currentWorkspace: () => ({ userId: 'synthetic-user', dir, assetDir: () => '/synthetic-only' }),
@@ -68,7 +68,7 @@ async function turn(t, { history = [], provider = { id: 'default', baseUrl: 'htt
     ...(wired ? { chatTitles: { save: (...args) => { saved.push(args); return true; } } } : {}),
   });
   await handleChat({}, res, { projectId: 'fixture-project', chatId: 'fixture-chat', message: FIRST, history });
-  return { events, requests, saved, titleRequests: requests.filter((r) => r.body.stream === false) };
+  return { events, requests, saved, busyCalls, titleRequests: requests.filter((r) => r.body.stream === false) };
 }
 
 test('#1785: after the first local reply the model is asked for a title, the client gets it and it is saved', async (t) => {
@@ -84,8 +84,12 @@ test('#1785: after the first local reply the model is asked for a title, the cli
   const titleEvent = events.find((e) => e.type === 'title');
   assert.deepEqual(titleEvent, { type: 'title', chatId: 'fixture-chat', title: 'Friendly Greeting' });
   assert.deepEqual(saved, [['fixture-project', 'fixture-chat', 'Friendly Greeting', FIRST]]);
+  // Review of core#119: the title call no longer holds the reply's completion. The client reads every event until
+  // the connection closes (web api.ts streamChat), so a title after done is still adopted (web#58).
   const order = events.map((e) => e.type);
-  assert.ok(order.indexOf('title') < order.indexOf('done'), 'the title arrives before done');
+  assert.ok(order.indexOf('telemetry') >= 0 && order.lastIndexOf('telemetry') < order.indexOf('done'), 'telemetry complete before done');
+  assert.ok(order.indexOf('done') < order.indexOf('title'), 'the title comes after done');
+  assert.equal(order[order.length - 1], 'title');
 });
 
 test('#1785: an off-box turn never sends the conversation anywhere for a title', async (t) => {
@@ -145,4 +149,26 @@ test('#1785: setChatTitle replaces only a derived title, in the signed-in worksp
     assert.equal(store.setChatTitle(null, 'f1', '   ', FIRST), false);
     assert.equal(bob.freeChats[0].title, FIRST, "another account's chat with the same id is untouched");
   } finally { for (const w of [alice, bob]) fs.rmSync(w.dir, { recursive: true, force: true }); }
+});
+
+test('#1785: a busy server (other inference, a pending load, maintenance) skips the title request', async (t) => {
+  const { titleRequests, events, busyCalls } = await turn(t, { busy: true });
+  assert.equal(titleRequests.length, 0);
+  assert.equal(events.some((e) => e.type === 'title'), false);
+  assert.ok(events.some((e) => e.type === 'done'));
+  assert.deepEqual(busyCalls, [1], 'asked once, counting this turn as its own one request');
+  const idle = await turn(t, { busy: false });
+  assert.equal(idle.titleRequests.length, 1);
+});
+
+test('#1785: the maintenance gate reports the inference requests in flight (inferenceBusy reads it)', () => {
+  const { createMaintenanceGate } = require('./inference-maintenance.cjs');
+  const gate = createMaintenanceGate();
+  assert.equal(gate.active(), 0);
+  const leaveA = gate.enter();
+  assert.equal(gate.active(), 1);
+  const leaveB = gate.enter();
+  assert.equal(gate.active(), 2);
+  leaveA(); leaveB();
+  assert.equal(gate.active(), 0);
 });
