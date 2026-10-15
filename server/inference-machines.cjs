@@ -22,8 +22,11 @@
 //   embedding  through the #1636 re-index only (embedding-migration.cjs via POST /api/embedding): its
 //              machine is derived from the active embedding target, never saved here, so the stored
 //              vectors and the endpoint can never disagree. assign() refuses it with the target to re-index to.
-//   chat roles (fast, smart, code) and vision: this machine only for now (chat goes through the
-//              engine's single provider and its memory budget); refused elsewhere (#1840).
+//   chat roles (fast, smart, code, creative) and vision  (#1840): runtime, through chat-machines.cjs. The
+//              assignment names the port of the machine's OpenAI-compatible server (llama.cpp) and the
+//              model it serves for the role (from its /v1/models; never a file name). A role on a machine
+//              is not loaded on this machine's engine and does not count against its memory budget. The
+//              role's own pick in Models & routing is kept, and used again when the role moves back here.
 //   sensitivity runtime (#1844): the sensitivity check's own decision service. decision-settings.cjs sensitivityBackend()
 //              reads urlFor('sensitivity') before COWORK_SENSITIVITY_DECISION_URL; unassigned and with no URL of its own it
 //              is shared with 'decision' and follows it. Link-local refused at connect time, and no key of another host.
@@ -42,10 +45,11 @@ const NAME_RE = /^[^\u0000-\u001f\u007f]{1,60}$/;
 
 /** Every part of noevia a machine can be named for, and how it moves. */
 const SERVICES = Object.freeze({
-  chatFast: { mode: 'local' },
-  chatSmart: { mode: 'local' },
-  chatCode: { mode: 'local' },
-  vision: { mode: 'local' },
+  chatFast: { mode: 'chat', role: 'fast' },
+  chatSmart: { mode: 'chat', role: 'smart' },
+  chatCode: { mode: 'chat', role: 'code' },
+  chatCreative: { mode: 'chat', role: 'creative' },
+  vision: { mode: 'chat', role: 'vision' },
   decision: { mode: 'runtime' },
   sensitivity: { mode: 'runtime' },
   embedding: { mode: 'reindex' },
@@ -56,6 +60,11 @@ const SERVICES = Object.freeze({
 const WORKERS = new Set(['ocr', 'documents']);
 const SERVICE_IDS = Object.freeze(Object.keys(SERVICES));
 const RERANK_PROTOCOLS = new Set(['tei', 'llamacpp']);
+/** #1840: the chat role -> its service id. */
+const CHAT_ROLE_SERVICE = Object.freeze(Object.fromEntries(Object.entries(SERVICES).filter(([, d]) => d.mode === 'chat').map(([id, d]) => [d.role, id])));
+const MODEL_RE = /^[^\u0000-\u001f\u007f]{1,200}$/;
+/** A model name as the machine serves it, or null. */
+const cleanModel = (raw) => { const m = typeof raw === 'string' ? raw.trim() : ''; return MODEL_RE.test(m) ? m : null; };
 
 const fail = (status, code, message, extra = {}) => Object.assign(Error(message), { status, code, ...extra });
 
@@ -110,8 +119,12 @@ function readState(store, log) {
     const ids = new Set(machines.map((m) => m.id));
     const assignments = {};
     for (const [service, a] of Object.entries(s.assignments)) {
-      if (!SERVICES[service] || SERVICES[service].mode !== 'runtime' || !a || !ids.has(a.machine) || !Number.isInteger(a.port)) continue;
-      assignments[service] = { machine: a.machine, port: a.port, ...(service === 'reranker' ? { protocol: RERANK_PROTOCOLS.has(a.protocol) ? a.protocol : 'tei' } : {}) };
+      const mode = SERVICES[service]?.mode;
+      if ((mode !== 'runtime' && mode !== 'chat') || !a || !ids.has(a.machine) || !Number.isInteger(a.port)) continue;
+      // A chat role without a model it can name stays on this machine.
+      if (mode === 'chat' && !cleanModel(a.model)) continue;
+      assignments[service] = { machine: a.machine, port: a.port, ...(service === 'reranker' ? { protocol: RERANK_PROTOCOLS.has(a.protocol) ? a.protocol : 'tei' } : {}),
+        ...(mode === 'chat' ? { model: cleanModel(a.model) } : {}) };
     }
     return { version: 1, machines, assignments };
   } catch (err) {
@@ -173,6 +186,18 @@ function createInferenceMachines({ store, audit = () => {}, lookup, embeddingAct
     const a = SERVICES[service]?.mode === 'runtime' ? state.assignments[service] : null;
     const m = a ? machineById(a.machine) : null;
     return m ? serviceUrl(m.address, a.port) : null;
+  }
+
+  /**
+   * #1840: where a chat role runs when it is on another machine, or null (this machine: unchanged).
+   * @param {string} role  'fast' | 'smart' | 'code' | 'creative' | 'vision'
+   * @returns {{ role:string, service:string, machine:{id:string,name:string,address:string}, port:number, model:string, baseUrl:string }|null}
+   */
+  function chatTarget(role) {
+    const service = CHAT_ROLE_SERVICE[role];
+    const a = service ? state.assignments[service] : null;
+    const m = a ? machineById(a.machine) : null;
+    return m && a.model ? { role, service, machine: { id: m.id, name: m.name, address: m.address }, port: a.port, model: a.model, baseUrl: serviceUrl(m.address, a.port) } : null;
   }
 
   /** #1665: the wire protocol of a reranker assigned to a machine ('tei' | 'llamacpp'), or null. */
@@ -259,9 +284,8 @@ function createInferenceMachines({ store, audit = () => {}, lookup, embeddingAct
     if (machineId !== LOCAL_ID && !machine) throw fail(404, 'unknownMachine', 'That machine is not on the list.');
     // #1847: assigning a machine must never switch a worker on: that changes the extractor version and re-reads every document.
     if (WORKERS.has(service) && machine && !workerOn(service)) throw fail(409, 'workerNotEnabled', 'Turn this service on in the deployment first; assigning a machine does not switch it on.');
-    if (def.mode === 'local' && machine) throw fail(409, 'localOnly', 'Chat models stay on this machine for now.');
     if (def.mode === 'deployment' && machine) throw fail(409, 'setByDeployment', 'This service’s address is set by the deployment.');
-    if (def.mode === 'local' || def.mode === 'deployment') return view(); // already on this machine: nothing to do
+    if (def.mode === 'deployment') return view(); // already on this machine: nothing to do
     if (def.mode === 'reindex') {
       let active = null;
       try { active = embeddingActive(); } catch { active = null; }
@@ -279,17 +303,22 @@ function createInferenceMachines({ store, audit = () => {}, lookup, embeddingAct
       protocol = body.protocol === undefined ? (state.assignments.reranker?.protocol || 'tei') : String(body.protocol);
       if (!RERANK_PROTOCOLS.has(protocol)) throw fail(400, 'invalidProtocol', 'Choose how the reranker answers: tei or llamacpp.');
     }
+    let model;
+    if (def.mode === 'chat' && machine) {
+      model = cleanModel(body.model);
+      if (!model) throw fail(400, 'invalidModel', 'Choose the model this machine serves for the role.');
+    }
     const assignments = { ...state.assignments };
     const before = assignments[service] || null;
-    if (machine) assignments[service] = { machine: machine.id, port, ...(protocol ? { protocol } : {}) };
+    if (machine) assignments[service] = { machine: machine.id, port, ...(protocol ? { protocol } : {}), ...(model ? { model } : {}) };
     else delete assignments[service];
     save({ ...state, assignments });
-    audit('machines.assign', actor, { service, machine: machine ? machine.id : LOCAL_ID, ...(port ? { port } : {}), ...(protocol ? { protocol } : {}), from: before ? before.machine : LOCAL_ID });
+    audit('machines.assign', actor, { service, machine: machine ? machine.id : LOCAL_ID, ...(port ? { port } : {}), ...(protocol ? { protocol } : {}), ...(model ? { model } : {}), from: before ? before.machine : LOCAL_ID });
     onChange(service);
     return view();
   }
 
-  return { view, add, update, remove, assign, urlFor, assignmentOf, rerankProtocol, embeddingMachine, machine: machineById };
+  return { view, add, update, remove, assign, urlFor, chatTarget, assignmentOf, rerankProtocol, embeddingMachine, machine: machineById };
 }
 
-module.exports = { createInferenceMachines, normalizeAddress, serviceUrl, addressOf, SERVICES, SERVICE_IDS, LOCAL_ID, KEY };
+module.exports = { createInferenceMachines, normalizeAddress, serviceUrl, addressOf, cleanModel, SERVICES, SERVICE_IDS, CHAT_ROLE_SERVICE, LOCAL_ID, KEY };

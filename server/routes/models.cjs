@@ -66,7 +66,7 @@ function statsRustOwned(env) {
   return env.NOEVIA_FRONT === 'rust' && env.NOEVIA_RUST_AUTH === '1' && env.NOEVIA_RUST_AUTH_CONFIRMED === '1'
     && env.NOEVIA_RUST_STATS === '1' && env.NOEVIA_RUST_STATS_CONFIRMED === '1';
 }
-function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag.cjs').servedModelsCached(target), json, readBody, readJson, fetchJson, env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe, reportedTokenRate, missingRoles, currentWorkspace, service, inferenceBudget = null, sweepGuardOptions = {}, decisionSettings = null, rerankSettings = null }) {
+function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag.cjs').servedModelsCached(target), json, readBody, readJson, fetchJson, env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe, reportedTokenRate, missingRoles, currentWorkspace, service, inferenceBudget = null, sweepGuardOptions = {}, decisionSettings = null, rerankSettings = null, localRoles = (roles) => roles }) {
   const { modelScanCache, refreshModelScan, autoRoles, setAutoRoles, ensureRolesLoaded, servedCatalogue, modelsInstalled, deriveUserModelName, lastLoadedModel, clearLastLoadedModel, clearRoleReferences } = service;
   // #1461: the installed list is shared for a moment (service.modelsInstalled). A decision that must confirm
   // the engine's state right now (a delete that checks the model exists, a load that checks it is not missing)
@@ -244,7 +244,8 @@ function createModelRoutes({ servedEmbeddingModels = (target) => require('../rag
     if (p === '/api/auto-roles') {
       if (req.method === 'GET') {
         const roles = autoRoles();
-        return json(res, 200, { configured: !!roles, roles: roles || null, missing: missingRoles(roles, await servedCatalogue()) });
+        // #1840: a role on an Inference machine is not expected in this machine's catalogue.
+        return json(res, 200, { configured: !!roles, roles: roles || null, missing: missingRoles(localRoles(roles), await servedCatalogue()) });
       }
       if (req.method === 'PUT') {
         const raw = await readBody(req);

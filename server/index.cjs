@@ -125,6 +125,10 @@ const inferenceMachines = require('./inference-machines.cjs').createInferenceMac
   embeddingActive: () => require('./embedding-config.cjs').current()?.active() || null,
   localEmbeddingUrl: () => require('./embedding-service.cjs').current()?.baseUrl || String(process.env.EMBEDDING_BASE_URL || '').trim() || null,
   onChange: (service) => { if (service === 'reranker') rag.reloadRerank(); } });
+// #1638/#1840: one health-probe cache for the Settings page and the chat turns of roles on a machine.
+const machineHealth = require('./machine-health.cjs').createMachineHealth();
+// #1840: chat roles (Fast, Smart, Code, Creative) and Vision on an Inference machine (chat-machines.cjs).
+const chatMachines = require('./chat-machines.cjs').createChatMachines({ machines: inferenceMachines, health: machineHealth });
 const decisionSettings = require('./decision-settings.cjs').createDecisionSettings({ store: require('./features.cjs').settingsStore(authService.db), audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail), machineUrl: () => inferenceMachines.urlFor('decision'), sensitivityMachineUrl: () => inferenceMachines.urlFor('sensitivity') });
 // #1841: OCR and Docling read their address from the same registry (document-workers.cjs), the environment being the fallback.
 require('./document-workers.cjs').useMachines((kind) => inferenceMachines.urlFor(kind));
@@ -378,6 +382,7 @@ const modelService = require('./models.cjs').createModelService({
   // Auto-roles are per workspace: a deleted model's role reference must be cleared out of
   // every workspace's config, not just whichever one happened to make the delete request.
   listWorkspaces: () => authService.listUsers().map((u) => workspaceStore.get(u.id)),
+  roleOnMachine: (role) => !!chatMachines.target(role),
 });
 const { autoRoles, ensureRolesLoaded, servedCatalogue, modelsInstalled, lastLoadedModel } = modelService;
 
@@ -913,6 +918,7 @@ const { handleChat } = require('./chat.cjs').createChatHandler({
     provider: {decide:(...args)=>{const backend=decisionSettings.backend();if(!backend)throw Error('Decision service unavailable');return backend.supervise(...args);}}, deadlineMs:1500,
   }),
   recordOutcome: (entry) => recordDecision('outcome', entry),
+  chatMachines,
   codeTasksFor: (project) => codeService.list(currentWorkspace(), project),
   // fetch is resolved per call, not captured: tests and QA swap the global at runtime.
   fs, path, crypto, fetch: (...args) => globalThis.fetch(...args), reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult,
@@ -1007,6 +1013,7 @@ const providerRoutes = require('./routes/providers.cjs').createProviderRoutes({
 // Statistics, the auto-router roles, the model manager proxy and /api/models/* (routes/models.cjs).
 const modelRoutes = require('./routes/models.cjs').createModelRoutes({
   json, readBody, readJson, fetchJson, env: process.env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe: engineVisionProbe, reportedTokenRate, missingRoles, currentWorkspace, service: modelService, inferenceBudget, decisionSettings, rerankSettings,
+  localRoles: (roles) => chatMachines.localRoles(roles),
 });
 // ── Routing ────────────────────────────────────────────────────────────────
 
@@ -1078,7 +1085,7 @@ const embeddingRoutes = require('./routes/embedding.cjs').createEmbeddingRoutes(
   service: embeddingService, resolveFile: (model) => require('./embedding-service.cjs').resolveModelFile({ env: process.env, fetchJson, model }) });
 // Settings → Inference machines (routes/inference-machines.cjs, #1638), administrators only.
 const inferenceMachineRoutes = require('./routes/inference-machines.cjs').createInferenceMachineRoutes({ json, readJson, machines: inferenceMachines,
-  health: require('./machine-health.cjs').createMachineHealth(),
+  health: machineHealth, chatMachines,
   effective: {
     decision: () => { const c = require('./decision-endpoint.cjs').configuration({ COWORK_DECISION_URL: decisionSettings.get().url }); return c.reason ? null : c.baseUrl; },
     // #1844: its own address (a machine, else COWORK_SENSITIVITY_DECISION_URL), or null while it is shared with the decision service.
