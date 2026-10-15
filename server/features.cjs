@@ -105,6 +105,20 @@ function rustStorageReadsOwned(env = process.env) {
     && require('./rust-auth.cjs').enabledFrom(env, () => {});
 }
 
+// sbstndalton/noevia#1368: the connected-storage list (GET /api/integrations/storage/files[/…]) and
+// text read (POST /api/integrations/storage/file), owned by the Rust front only once the supervisor
+// has confirmed the front lists rust-storage-browse.
+function rustStorageBrowseOwned(env = process.env) {
+  return env.NOEVIA_RUST_STORAGE_BROWSE === '1'
+    && env.NOEVIA_RUST_STORAGE_BROWSE_CONFIRMED === '1'
+    && require('./rust-auth.cjs').enabledFrom(env, () => {});
+}
+
+const RUST_STORAGE_BROWSE_REFUSAL = Object.freeze({
+  error: 'Storage browsing is owned by the Rust front.',
+  code: 'RUST_STORAGE_BROWSE_OWNED',
+});
+
 const RUST_STORAGE_READS_REFUSAL = Object.freeze({
   error: 'Storage metadata reads are owned by the Rust front.',
   code: 'RUST_STORAGE_READS_OWNED',
@@ -256,4 +270,4 @@ function settingsStore(db) {
   };
 }
 
-module.exports = { browserRuntimeReason, codeSandboxReason, unavailableId, REGISTRY, createFeatures, settingsStore, parseEnv, migrateLegacySetting, rustChatgptStatusOwned, rustStorageReadsOwned, refuseRustStorageRead, RUST_STORAGE_READS_REFUSAL };
+module.exports = { browserRuntimeReason, codeSandboxReason, unavailableId, REGISTRY, createFeatures, settingsStore, parseEnv, migrateLegacySetting, rustChatgptStatusOwned, rustStorageReadsOwned, refuseRustStorageRead, RUST_STORAGE_READS_REFUSAL, rustStorageBrowseOwned, RUST_STORAGE_BROWSE_REFUSAL };

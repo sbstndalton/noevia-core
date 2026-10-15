@@ -3,7 +3,7 @@
 const { normalizeS3Region, S3_REGION_RE } = require('../s3-region.cjs');
 const { checkLogin } = require('../storage-client.cjs');
 const { requireJsonObject, readCappedJson } = require('../http.cjs');
-const { RUST_STORAGE_READS_REFUSAL } = require('../features.cjs');
+const { RUST_STORAGE_READS_REFUSAL, RUST_STORAGE_BROWSE_REFUSAL } = require('../features.cjs');
 // A Nextcloud login-flow reply is a few hundred bytes; a server that streams more is refused (#902).
 const NEXTCLOUD_REPLY_CAP = 64 * 1024;
 // The user's own storage connection (Settings → Diary & storage): read and save it, test it,
@@ -88,8 +88,9 @@ const PASS = Symbol('unhandled');
  * @param {(...args) => Promise<Response>} deps.fetch     resolved per call so tests can swap the global
  * @param {{ randomUUID: () => string }} deps.crypto
  * @param {() => boolean} [deps.storageReadsOwned] confirmed deployment owner; defaults off
+ * @param {() => boolean} [deps.storageBrowseOwned] confirmed owner of the list/read (#1368); defaults off
  */
-function createStorageRoutes({ json, readJson: readAnyJson, authService, storageClient, endpointApproved, fetch, crypto, storageReadsOwned = () => false, flowStore, storageLatch = null }) {
+function createStorageRoutes({ json, readJson: readAnyJson, authService, storageClient, endpointApproved, fetch, crypto, storageReadsOwned = () => false, storageBrowseOwned = () => false, flowStore, storageLatch = null }) {
   // Every body these routes read is a JSON object; `null`, an array or a number is a 400 (#786).
   const readJson = requireJsonObject(readAnyJson);
   // #1431: the pending sign-ins. index.cjs passes the persisted, sealed store; without one (tests) they
@@ -119,6 +120,8 @@ function createStorageRoutes({ json, readJson: readAnyJson, authService, storage
     // server-side and never returned to the client.
     const storageBrowse = p.match(/^\/api\/integrations\/storage\/files(?:\/(.*))?$/);
     if (storageBrowse && req.method === 'GET') {
+      // The Rust front answers this once confirmed; Node must not read or reseal the row.
+      if (storageBrowseOwned()) return json(res, 503, RUST_STORAGE_BROWSE_REFUSAL);
       const connection = authService.getStorage(authn.user.id, true);
       if (!storageClient.isBrowsable(connection)) return json(res, 400, { error: 'no browsable storage connected (local storage needs no browsing — upload files directly)' });
       // Defense in depth: also guard connections saved before the save-time
@@ -152,6 +155,7 @@ function createStorageRoutes({ json, readJson: readAnyJson, authService, storage
 
     const storageRead = p.match(/^\/api\/integrations\/storage\/file$/);
     if (storageRead && req.method === 'POST') {
+      if (storageBrowseOwned()) return json(res, 503, RUST_STORAGE_BROWSE_REFUSAL);
       const body = await readJson(req);
       const connection = authService.getStorage(authn.user.id, true);
       if (!storageClient.isBrowsable(connection)) return json(res, 400, { error: 'no browsable storage connected' });

@@ -8,7 +8,7 @@ const assert = require('node:assert/strict');
 const { Readable } = require('node:stream');
 const { createStorageRoutes, STORAGE_PRIVATE_URL_ERROR, nextcloudServerRoot } = require('./storage.cjs');
 
-function fixture({ storage = { kind: 'local' }, browsable = false, approved = () => true, network = async () => ({ ok: true, status: 200, json: async () => ({}) }), storageReadsOwned, storageLatch } = {}) {
+function fixture({ storage = { kind: 'local' }, browsable = false, approved = () => true, network = async () => ({ ok: true, status: 200, json: async () => ({}) }), storageReadsOwned, storageBrowseOwned, storageLatch } = {}) {
   const sent = [], saved = [], requests = [], storageReads = [];
   const routes = createStorageRoutes({
     json: (res, status, body) => { sent.push({ status, body }); },
@@ -23,7 +23,7 @@ function fixture({ storage = { kind: 'local' }, browsable = false, approved = ()
     endpointApproved: (authn, url) => approved(authn, url),
     fetch: async (url, init) => { requests.push({ url, init }); return network(url, init); },
     crypto: { randomUUID: () => 'flow-1' },
-    storageReadsOwned, storageLatch,
+    storageReadsOwned, storageBrowseOwned, storageLatch,
   });
   const call = (method, path, body, userId = 'u1') => {
     const req = Readable.from(body === undefined ? [] : [Buffer.from(JSON.stringify(body))]);
@@ -508,4 +508,38 @@ test('#1589: saving a login the server accepted ends the hold, and an unchecked 
   await unchecked.call('PUT', '/api/integrations/storage', { kind: 'webdav', baseUrl: HELD.baseUrl, username: HELD.username, secret: HELD.secret });
   assert.equal(unchecked.sent.pop().body.warningCode, 'storageUnverified');
   assert.equal(unchecked.isHeld(), true, 'the server was not reached, so the login is still unproven');
+});
+
+test('confirmed storage browse ownership refuses the list and the read before any collaborator (#1368)', async () => {
+  const { RUST_STORAGE_BROWSE_REFUSAL } = require('../features.cjs');
+  const poison = () => assert.fail('owned storage browse touched a collaborator');
+  for (const [method, path] of [['GET', '/api/integrations/storage/files'], ['GET', '/api/integrations/storage/files/docs/a'], ['POST', '/api/integrations/storage/file']]) {
+    const sent = [];
+    const routes = createStorageRoutes({
+      json: (_res, status, body) => sent.push({ status, body }), readJson: poison,
+      authService: new Proxy({}, { get: poison }), storageClient: new Proxy({}, { get: poison }),
+      endpointApproved: poison, fetch: poison, crypto: new Proxy({}, { get: poison }),
+      storageBrowseOwned: () => true,
+    });
+    assert.equal(await routes({ method }, {}, { path, authn: { user: { id: 'u1', role: 'member' } } }), true);
+    assert.deepEqual(sent, [{ status: 503, body: RUST_STORAGE_BROWSE_REFUSAL }], `${method} ${path}`);
+  }
+});
+
+test('storage browse ownership leaves metadata, folder creation and other methods to Node (#1368)', async () => {
+  const owned = fixture({ storageBrowseOwned: () => true, browsable: true });
+  await owned.call('GET', '/api/integrations/storage');
+  assert.deepEqual(owned.storageReads, [['u1', undefined]]);
+  for (const [method, path] of [['POST', '/api/integrations/storage/files'], ['GET', '/api/integrations/storage/file']]) {
+    assert.equal(await owned.call(method, path), false, `${method} ${path}`);
+  }
+});
+
+test('storage browse ownership needs the switch, the confirmation and native auth (#1368)', () => {
+  const { rustStorageBrowseOwned } = require('../features.cjs');
+  const on = { NOEVIA_RUST_STORAGE_BROWSE: '1', NOEVIA_RUST_STORAGE_BROWSE_CONFIRMED: '1', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_AUTH_CONFIRMED: '1', NOEVIA_FRONT: 'rust' };
+  assert.equal(rustStorageBrowseOwned(on), true);
+  for (const key of Object.keys(on)) {
+    assert.equal(rustStorageBrowseOwned({ ...on, [key]: '' }), false, key);
+  }
 });
