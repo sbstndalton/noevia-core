@@ -117,7 +117,7 @@ dbTest('#1772: releaseMediaModel unloads only the .vision alias and tells an evi
 // ── #1770 ────────────────────────────────────────────────────────────────────────────────────────
 const V = (c) => c.repeat(64);
 function docFile(name, { extractor = 'docling-pages-v1:d1', version = V('a'), byteHash = V('b'), ...rest } = {}) {
-  return { name, content: 'synthetic text', document: { version, byteHash, availableVersion: version, extractor, state: 'complete', ...rest } };
+  return { name, content: 'synthetic text', document: { version, byteHash, availableVersion: version, extractor, state: 'ready', ...rest } };
 }
 function sweepFixture({ flag = true, extractor = 'docling-pages-v1:d1:figures-v1', records = {}, refreshImpl, env = {}, paused = () => null } = {}) {
   const calls = [];
@@ -182,13 +182,69 @@ test('#1770: bounded per pass; a failure is tried once per version; a transient 
   assert.equal((await failing.sweep.kick()).failed, 2);
   assert.equal((await failing.sweep.kick()).failed, 0, 'not tried again at the same version');
 
-  // Transient: nothing marked, the pass stops at the first one, the next pass tries again.
-  const transient = sweepFixture({ refreshImpl: async () => ({ status: 'retry', error: 'docling unreachable' }) });
-  const t3 = await transient.sweep.kick();
-  assert.match(t3.reason, /docling unreachable/);
-  assert.equal(transient.calls.filter((c) => c[0] !== 'runAs').length, 1);
-  await transient.sweep.kick();
-  assert.equal(transient.calls.filter((c) => c[0] !== 'runAs').length, 2);
+  // Docling itself unreachable: nothing marked, the pass stops at the first one, the next pass tries again.
+  const down = sweepFixture({ refreshImpl: async () => ({ status: 'retry', unreachable: true, error: 'Document extraction is busy' }) });
+  const t3 = await down.sweep.kick();
+  assert.match(t3.reason, /extraction is unavailable: Document extraction is busy/);
+  assert.equal(down.calls.filter((c) => c[0] !== 'runAs').length, 1);
+  await down.sweep.kick();
+  assert.equal(down.calls.filter((c) => c[0] !== 'runAs').length, 2);
+});
+
+test('#1770 review: one document with a transient failure is skipped and counted; later documents are still read', async () => {
+  const f = sweepFixture({ refreshImpl: async (_p, file) => {
+    if (file.name === 'a.pdf') return { status: 'retry', unreachable: false, error: 'Invalid extraction response' };
+    file.document = { ...file.document, extractor: 'docling-pages-v1:d1:figures-v1' };
+    return { status: 'refreshed' };
+  } });
+  const t = await f.sweep.kick();
+  assert.equal(t.reason, null);
+  assert.equal(t.deferred, 1);
+  assert.equal(t.refreshed, 1);
+  assert.deepEqual(f.calls.filter((c) => c[0] !== 'runAs'), [['proj-1', 'a.pdf'], ['proj-1', 'b.pdf']], 'b.pdf is read although a.pdf failed first');
+  const again = await f.sweep.kick();
+  assert.equal(again.deferred, 1, 'a.pdf (not marked) is tried again on the next pass');
+});
+
+test('#1770 review: the sweep and the image pass never run at the same time; an image pass scheduled mid-sweep starts after it', async () => {
+  const events = [];
+  let release;
+  const blocker = new Promise((r) => { release = r; });
+  const f = sweepFixture({ refreshImpl: async (_p, file) => {
+    events.push(`sweep:start:${file.name}`);
+    if (file.name === 'a.pdf') {
+      backfill.schedule(USER, 'proj-1'); // what indexSource -> sourceChanged does
+      await new Promise((r) => setImmediate(r));
+      await blocker;
+    }
+    file.document = { ...file.document, extractor: 'docling-pages-v1:d1:figures-v1' };
+    events.push(`sweep:end:${file.name}`);
+    return { status: 'refreshed' };
+  } });
+  const workspace = { userId: USER, projects: [{ id: 'proj-1', files: [], assets: [] }] };
+  const rag = { syncProjectMedia: async () => { events.push('image-pass'); return { ok: true, embedded: 0, pending: 0 }; } };
+  const backfill = multimodal.createMediaBackfill({ enabled: () => true, userIds: () => [USER], workspaceFor: () => workspace, documentDir: () => '/nonexistent',
+    rag, sleep: async () => {}, log: () => {}, setTimer: () => 1, clearTimer: () => {} });
+  const sweeping = f.sweep.kick();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.ok(!events.includes('image-pass'), 'the image pass waits while the sweep runs');
+  release();
+  await sweeping;
+  await backfill.idle();
+  assert.ok(events.indexOf('image-pass') > events.lastIndexOf('sweep:end:b.pdf'), events.join(','));
+  // And the other way round: a sweep kicked while an image pass runs starts after it.
+  const order = [];
+  let open;
+  const held = new Promise((r) => { open = r; });
+  const p1 = multimodal.exclusive('image pass', async () => { order.push('image:start'); await held; order.push('image:end'); });
+  const g = sweepFixture({ refreshImpl: async () => { order.push('sweep'); return { status: 'failed' }; } });
+  const p2 = g.sweep.kick();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.deepEqual(order, ['image:start']);
+  open();
+  await Promise.all([p1, p2]);
+  assert.equal(order[1], 'image:end');
+  assert.equal(order[2], 'sweep');
 });
 
 test('#1770: holds while a re-index is under way', async () => {
@@ -217,7 +273,7 @@ test('#1770: refreshDocumentFigures re-reads the stored original, keeps text on 
   documents.extractDocumentText = async () => {
     if (mode === 'down') return { text: '', pages: 0, pageTexts: [], state: 'failed', truncated: false, retryable: true, error: 'docling unreachable' };
     if (mode === 'broken') return { text: '', pages: 0, pageTexts: [], state: 'failed', truncated: false, retryable: false, error: 'unreadable' };
-    return { text: '[Page 1]\nSynthetic', pages: 1, pageTexts: [{ number: 1, status: 'native', text: 'Synthetic' }], state: 'complete', truncated: false,
+    return { text: '[Page 1]\nSynthetic', pages: 1, pageTexts: [{ number: 1, status: 'native', text: 'Synthetic' }], state: 'ready', truncated: false,
       ...(mode === 'figures' ? { figures: [{ page: 1, index: 0, ext: 'png', bytes: Buffer.from('synthetic figure') }] } : {}) };
   };
   try {
@@ -242,14 +298,35 @@ test('#1770: refreshDocumentFigures re-reads the stored original, keeps text on 
     assert.deepEqual(indexed, ['r.pdf']);
     assert.equal(sweepMod.needsFigures(updated, record), false, 'not a candidate again');
 
+    // Review of #116: a reading that is worse than the current one never replaces it, and the version is marked tried.
+    const savedExtract = documents.extractDocumentText;
+    const worse = async (name, result) => {
+      documents.extractDocumentText = savedExtract;
+      documents.EXTRACTOR_VERSION = 'docling-pages-v1:w-' + name;
+      const good = await documentSources.ingest(workspace, project.id, name, Buffer.from('%PDF-1.4 ' + name), undefined);
+      project.files = [...project.files, good];
+      documents.EXTRACTOR_VERSION = 'docling-pages-v1:w-' + name + ':figures-v1';
+      documents.extractDocumentText = async () => result;
+      const r = await store.refreshDocumentFigures(project, good);
+      assert.equal(r.status, 'worse', name);
+      assert.ok(project.files.includes(good), `${name}: the current record stays`);
+      assert.equal(good.content, '[Page 1]\nSynthetic');
+      assert.equal(good.document.figureSweep, good.document.version);
+    };
+    await worse('partial.pdf', { text: '[Page 1]\nSyn', pages: 1, pageTexts: [{ number: 1, status: 'degraded', text: 'Syn' }], state: 'partial', truncated: false, figures: [] });
+    await worse('empty.pdf', { text: '', pages: 1, pageTexts: [{ number: 1, status: 'blank', text: '' }], state: 'ready', truncated: false });
+    await worse('fewer.pdf', { text: 'x', pages: 1, pageTexts: [], state: 'ready', truncated: false });
+    documents.extractDocumentText = savedExtract;
+
     // A permanent failure at a new version keeps the text and marks that version tried.
     documents.EXTRACTOR_VERSION = 'docling-pages-v1:d2';
     const older = await documentSources.ingest(workspace, project.id, 'q.pdf', Buffer.from('%PDF-1.4 other'), undefined);
     project.files = [...project.files, older];
+    const olderIndex = project.files.length - 1;
     documents.EXTRACTOR_VERSION = 'docling-pages-v1:d2:figures-v1';
     mode = 'broken';
     assert.equal((await store.refreshDocumentFigures(project, older)).status, 'failed');
-    assert.equal(project.files[1], older);
+    assert.equal(project.files[olderIndex], older);
     assert.equal(older.content, '[Page 1]\nSynthetic');
     assert.equal(older.document.figureSweep, older.document.version);
     assert.equal(sweepMod.needsFigures(older, null), false);

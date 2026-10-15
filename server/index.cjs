@@ -265,6 +265,11 @@ if (embeddingConfig.next()) setTimeout(() => embeddingMigration.kick(), 30000).u
     setTimeout(() => figureSweep.kick(), 60000).unref();
     setInterval(() => figureSweep.kick(), 30 * 60 * 1000).unref();
   }
+  // #1770 review: on shutdown no new document or image is started. The once-listener is gone after it
+  // runs, so the re-sent signal ends the process the default way.
+  for (const signal of ['SIGTERM', 'SIGINT']) {
+    process.once(signal, () => { figureSweep.stop(); mediaBackfill.stop(); process.kill(process.pid, signal); });
+  }
 }
 
 // User-created projects; the earlier fixed demo spaces were removed.

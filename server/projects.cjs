@@ -728,10 +728,16 @@ function createProjectStore({
       const next = await documentSources.ingest(workspace, project.id, file.name, bytes, file);
       if (!live() || file.document.version !== tried) return { status: 'changed' };
       if (next.document.state === 'failed' || next.document.stale) {
-        if (documentSources.retryable(workspace, project.id, next.document.version)) return { status: 'retry', error: next.document.error };
+        if (documentSources.retryable(workspace, project.id, next.document.version)) {
+          return { status: 'retry', unreachable: documentSources.serviceDown(next.document.error), error: next.document.error };
+        }
         mark();
         return { status: 'failed', error: next.document.error };
       }
+      // Review of #116: the new reading replaces the current one only when it is no worse: a state at
+      // least as good (ready > partial), non-empty text, and at least as many readable pages. Otherwise
+      // the current text stays and this version is marked tried, so a worse reading never wins later.
+      if (!documentSources.noWorse(file.document, next.document, next.content)) { mark(); return { status: 'worse' }; }
       const updated = { ...file, content: next.content, document: next.document };
       project.files = project.files.map((f) => (f === file ? updated : f));
       indexSource(project, updated);

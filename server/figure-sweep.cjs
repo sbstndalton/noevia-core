@@ -19,6 +19,13 @@
 //                                    EMBEDDING_REINDEX_DUTY of the wall time (the re-index duty, default
 //                                    0.5), never shorter than NOEVIA_MULTIMODAL_RAG_INTERVAL_MS (the media
 //                                    pass's pause, default 2 s); it holds while a re-index is under way.
+//                                    The duty is the ONLY pacing: the sweep does not watch chat traffic and
+//                                    does not yield to a chat beyond it (a document's extraction, once
+//                                    started, runs to the end). Docling runs on CPU beside the chat engine.
+//   one media job at a time          the sweep and the image pass share multimodal-rag.cjs exclusive(): a
+//                                    pass of either waits for the other, so Docling and the `.vision`
+//                                    preset are never loaded for noevia at the same time. An image pass
+//                                    scheduled by a re-read (sourceChanged) starts after the sweep ends.
 //   bounded                          at most NOEVIA_MULTIMODAL_FIGURE_SWEEP_MAX documents per pass (10).
 //   never Diary projects (#1736)     the Diary extras project and Diary chat contexts are skipped.
 //   never scanned documents          a document whose readable pages all came from OCR has no figure
@@ -69,7 +76,7 @@ function scannedOnly(record) {
  *   paused()                       reason | null (a re-index is under way)
  */
 function createFigureSweep({ enabled = () => multimodal.enabled(), extractorVersion, userIds, workspaceFor, documentDir, runAs, refresh,
-  paused = () => null, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = Date.now, log = (line) => console.info(line), env = process.env, fsImpl = fs } = {}) {
+  paused = () => null, gate = multimodal.exclusive, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = Date.now, log = (line) => console.info(line), env = process.env, fsImpl = fs } = {}) {
   const num = (v, d, lo, hi) => { const n = Number(v); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : d; };
   const duty = num(env.EMBEDDING_REINDEX_DUTY, 0.5, 0.05, 1);
   const minPauseMs = Math.round(num(env.NOEVIA_MULTIMODAL_RAG_INTERVAL_MS, 2000, 0, 600000));
@@ -85,7 +92,7 @@ function createFigureSweep({ enabled = () => multimodal.enabled(), extractorVers
   }
 
   async function pass() {
-    const totals = { refreshed: 0, failed: 0, skipped: 0, remaining: 0, reason: null };
+    const totals = { refreshed: 0, failed: 0, deferred: 0, skipped: 0, remaining: 0, reason: null };
     if (!on()) return totals;
     let ids = [];
     try { ids = userIds() || []; } catch { ids = []; }
@@ -108,9 +115,12 @@ function createFigureSweep({ enabled = () => multimodal.enabled(), extractorVers
           let r;
           try { r = await runAs(userId, () => refresh(project, file)); } catch (err) { r = { status: 'failed', error: String(err?.message || err).slice(0, 200) }; }
           const status = r?.status;
-          if (status === 'retry') { totals.reason = `a document could not be read now${r.error ? `: ${r.error}` : ''}`; break walk; }
-          if (status === 'refreshed') { totals.refreshed += 1; done += 1; gap = true; }
-          else if (status === 'failed' || status === 'missing') { totals.failed += 1; done += 1; gap = true; }
+          // A transient failure of this one document is skipped (not marked: the next pass tries it again);
+          // only the extraction service itself being down or busy ends the pass.
+          if (status === 'retry' && r.unreachable) { totals.reason = `document extraction is unavailable${r.error ? `: ${r.error}` : ''}`; break walk; }
+          if (status === 'retry') { totals.deferred += 1; done += 1; gap = true; }
+          else if (status === 'refreshed') { totals.refreshed += 1; done += 1; gap = true; }
+          else if (status === 'failed' || status === 'missing' || status === 'worse') { totals.failed += 1; done += 1; gap = true; }
           if (gap) {
             gap = false;
             const busy = Math.max(0, now() - started);
@@ -127,10 +137,10 @@ function createFigureSweep({ enabled = () => multimodal.enabled(), extractorVers
     if (running) return running;
     running = (async () => {
       try {
-        const totals = await pass();
+        const totals = await gate('figure sweep', pass);
         last = { at: Date.now(), ...totals };
         if (totals.refreshed || totals.failed || totals.reason) {
-          log(`[media] figure sweep: ${totals.refreshed} document(s) read again for figures, ${totals.failed} could not be${totals.remaining ? `, ${totals.remaining} wait for the next pass` : ''}${totals.reason ? ` (held: ${totals.reason})` : ''}`);
+          log(`[media] figure sweep: ${totals.refreshed} document(s) read again for figures, ${totals.failed} could not be${totals.deferred ? `, ${totals.deferred} deferred` : ''}${totals.remaining ? `, ${totals.remaining} wait for the next pass` : ''}${totals.reason ? ` (held: ${totals.reason})` : ''}`);
         }
         return totals;
       } catch (err) {
