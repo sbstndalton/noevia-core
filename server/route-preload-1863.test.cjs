@@ -19,22 +19,23 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** A llama.cpp router whose loads take LOAD_MS. `states`: { id: status }. */
 function router(states) {
-  const calls = [];
+  const calls = [], unloads = [];
   const fetchJson = async (url, options = {}) => {
     const u = new URL(url), method = String(options.method || 'GET').toUpperCase();
     const body = options.body ? JSON.parse(options.body) : {};
     calls.push(`${method} ${u.pathname}${body.model ? ' ' + body.model : ''}`);
     if (u.pathname === '/models' && method === 'GET') return { ok: true, status: 200, body: { data: Object.entries(states).map(([id, value]) => ({ id, status: { value } })) } };
     if (u.pathname === '/props') return { ok: true, status: 200, body: { default_generation_settings: { n_ctx: 16384 }, total_slots: 1 } };
-    if (u.pathname === '/models/load') { states[body.model] = 'loading'; setTimeout(() => { states[body.model] = 'loaded'; }, LOAD_MS); return { ok: true, status: 200, body: { success: true } }; }
-    if (u.pathname === '/models/unload') { states[body.model] = 'unloaded'; return { ok: true, status: 200, body: { success: true } }; }
+    if (u.pathname === '/models/load') { states[body.model] = 'loading'; setTimeout(() => { if (states[body.model] === 'loading') states[body.model] = 'loaded'; }, LOAD_MS); return { ok: true, status: 200, body: { success: true } }; }
+    // Each unload records the state the model was in: 'loaded' would mean a model that could be in use.
+    if (u.pathname === '/models/unload') { unloads.push({ model: body.model, was: states[body.model] }); states[body.model] = 'unloaded'; return { ok: true, status: 200, body: { success: true } }; }
     return { ok: true, status: 200, body: {} };
   };
   const manager = createModelManager({ kind: 'llamacpp', baseUrl: 'http://synthetic-router/v1', fetchJson, fetchStream: async () => ({ ok: false }) });
-  return { manager, calls, states, loads: () => calls.filter((c) => c.startsWith('POST /models/load')) };
+  return { manager, calls, states, unloads, loads: () => calls.filter((c) => c.startsWith('POST /models/load')) };
 }
 
-async function turn(t, { roles, states, project = { routing: 'auto' }, routingModes = null, chatMachines = null, decisionMs = DECISION_MS }) {
+async function turn(t, { roles, states, project = { routing: 'auto' }, routingModes = null, chatMachines = null, decisionMs = DECISION_MS, route = 'fast', message = 'QA-SYNTH-1863 Say hello.', codeTasks = [], mode }) {
   const saved = { kind: process.env.MODEL_MANAGER_KIND, base: process.env.INFERENCE_BASE_URL };
   process.env.MODEL_MANAGER_KIND = 'llamacpp'; process.env.INFERENCE_BASE_URL = 'http://default.invalid';
   t.after(() => { for (const [k, v] of [['MODEL_MANAGER_KIND', saved.kind], ['INFERENCE_BASE_URL', saved.base]]) if (v === undefined) delete process.env[k]; else process.env[k] = v; });
@@ -69,13 +70,13 @@ async function turn(t, { roles, states, project = { routing: 'auto' }, routingMo
     DIARY_BASE: 'http://fixture.invalid', TOOL_RESULT_CAP: 8000, json: (_res, status, body) => { replied = { status, body }; }, saveChats() {}, endpointApproved: () => true, diaryHeaders: () => ({}),
     lastLoadedModel: () => null,
     // The fake decision service: answers Fast after decisionMs.
-    classifyFastOrSmart: async () => { await sleep(decisionMs); return 'fast'; },
+    classifyFastOrSmart: async () => { await sleep(decisionMs); return route; }, codeTasksFor: () => codeTasks,
     servedCatalogue: async () => rows, modelsInstalled: async () => rows,
     missingRoles: require('./auto-roles-check.cjs').missingRoles, staleRolesError: require('./auto-roles-check.cjs').staleRolesError,
     allToolboxes: () => [{ id: 'core', tools: [] }], chatWideApproved: () => false, recordUsage() {}, recordToolUse() {},
     executeToolCall: async () => 'synthetic result', awaitApproval: async () => 'approve',
   });
-  await handleChat({}, res, { projectId: 'fixture-project', chatId: 'fixture-chat', message: 'QA-SYNTH-1863 Say hello.' });
+  await handleChat({}, res, { projectId: 'fixture-project', chatId: 'fixture-chat', message, ...(mode ? { mode } : {}) });
   return { events, upstream, engine, firstToken, replied, errors: events.filter((e) => e.type === 'error') };
 }
 
@@ -84,7 +85,10 @@ test('#1863 preloadTarget: one local model for every role, nothing else', () => 
   assert.equal(preloadTarget({ roles: { fast: 'synthetic-one' } }), 'synthetic-one');
   assert.equal(preloadTarget({ roles: { ...ONE, code: 'synthetic-one', creative: 'synthetic-one', vision: 'synthetic-eye' } }), 'synthetic-one', 'Vision is not a turn route');
   assert.equal(preloadTarget({ roles: TWO }), null, 'the decision could pick either model');
-  assert.equal(preloadTarget({ roles: { ...ONE, code: 'synthetic-coder' } }), null, 'the Code route is another model');
+  assert.equal(preloadTarget({ roles: { ...ONE, code: 'synthetic-coder' } }), 'synthetic-one', 'a separate Code model: pre-load unless the turn looks like code');
+  assert.equal(preloadTarget({ roles: { ...ONE, code: 'synthetic-coder' }, likelyCode: true }), null, 'the turn looks like code');
+  assert.equal(preloadTarget({ roles: { ...ONE, code: 'synthetic-one' }, likelyCode: true }), 'synthetic-one', 'Code on the same model swaps nothing');
+  assert.equal(preloadTarget({ roles: { fast: 'synthetic-one', smart: 'synthetic-one', code: 'synthetic-coder' }, remoteRole: (r) => (r === 'code' ? {} : null) }), null, 'any role on a machine');
   assert.equal(preloadTarget({ roles: { ...ONE, creative: 'synthetic-poet' } }), null, 'the Creative move is another model');
   assert.equal(preloadTarget({ roles: ONE, remoteRole: (r) => (r === 'smart' ? { model: 'x' } : null) }), null, 'a role on a machine');
   assert.equal(preloadTarget({ roles: ONE, hasImages: true }), null);
@@ -171,4 +175,60 @@ test('#1863 a cloud route (routing modes): no pre-load, the local engine is neve
   assert.deepEqual(out.errors, []);
   assert.ok(out.upstream.some((r) => r.url.startsWith('http://cloud.invalid')), 'answered by the cloud route');
   assert.equal(out.engine.calls.length, 0, 'the local engine was not even listed');
+});
+
+// The owner's role shape: Fast and Smart share one model, Code is another, Creative unset.
+const OWNER = { fast: 'synthetic-shared-12b', smart: 'synthetic-shared-12b', code: 'synthetic-coder-9b' };
+const ownerStates = () => ({ 'synthetic-shared-12b': 'unloaded', 'synthetic-coder-9b': 'unloaded' });
+const chatModel = (out) => out.upstream.find((r) => r.url.includes('/chat/completions'))?.body.model;
+
+test('#1863 owner shape: a plain turn pre-loads the shared Fast/Smart model, TTFT about max(load, decision)', async (t) => {
+  const out = await turn(t, { roles: OWNER, states: ownerStates() });
+  assert.deepEqual(out.errors, []);
+  assert.deepEqual(out.engine.loads(), ['POST /models/load synthetic-shared-12b']);
+  assert.deepEqual(out.engine.unloads, []);
+  assert.equal(chatModel(out), 'synthetic-shared-12b');
+  assert.ok(out.firstToken < LOAD_MS + DECISION_MS - 150, `overlapped: ${out.firstToken} ms`);
+});
+
+test('#1863 owner shape: the code rule (a fenced block), a Code project or a Task turn never pre-loads', async (t) => {
+  for (const [opts, why] of [
+    [{ message: 'QA-SYNTH-1863 fix this\n```js\nlet a = 1\n```', route: 'code' }, 'fenced code'],
+    [{ message: 'QA-SYNTH-1863\ndiff --git a/x b/x', route: 'code' }, 'a diff'],
+    [{ codeTasks: [{ id: 'synthetic-task' }], route: 'code' }, 'a project with Code tasks'],
+    [{ project: { routing: 'auto', sharedContext: { chat: true } }, route: 'code' }, 'a project sharing Code context'],
+  ]) {
+    const out = await turn(t, { roles: OWNER, states: ownerStates(), ...opts });
+    assert.deepEqual(out.errors, [], why);
+    assert.deepEqual(out.engine.loads(), ['POST /models/load synthetic-coder-9b'], `${why}: only the Code model loads, as today`);
+    assert.deepEqual(out.engine.unloads, [], why);
+    assert.equal(chatModel(out), 'synthetic-coder-9b', why);
+  }
+  assert.equal(preloadTarget({ roles: OWNER, likelyCode: true }), null, 'a Task (cowork) turn is likelyCode');
+});
+
+test('#1863 owner shape, wrong guess: the decision picks Code after a pre-load started', async (t) => {
+  // Today: decision then one Code load, about DECISION_MS + LOAD_MS.
+  const out = await turn(t, { roles: OWNER, states: ownerStates(), route: 'code' });
+  assert.deepEqual(out.errors, []);
+  assert.equal(chatModel(out), 'synthetic-coder-9b', 'the turn still gets its Code model');
+  assert.deepEqual(out.engine.loads(), ['POST /models/load synthetic-shared-12b', 'POST /models/load synthetic-coder-9b']);
+  // The only unload is the pre-loaded shared model, which nothing used: no request ever went to it.
+  assert.deepEqual(out.engine.unloads.map((u) => u.model), ['synthetic-shared-12b']);
+  assert.equal(out.upstream.some((r) => r.body?.model === 'synthetic-shared-12b'), false, 'the unloaded model was never in use');
+  assert.equal(out.engine.states['synthetic-shared-12b'], 'unloaded');
+  // Cancelled at the decision, so the swap does not wait for the rest of the shared model's load.
+  assert.ok(out.firstToken < DECISION_MS + LOAD_MS + 350, `wrong guess costs about today's time: ${out.firstToken} ms vs ${DECISION_MS + LOAD_MS} ms`);
+  console.log(`[1863] wrong-guess TTFT ${out.firstToken} ms (today ${DECISION_MS + LOAD_MS} ms + poll granularity)`);
+});
+
+test('#1863 owner shape, wrong guess with a fast decision: the pre-load is cancelled mid-load, the swap does not wait for it', async (t) => {
+  const out = await turn(t, { roles: OWNER, states: ownerStates(), route: 'code', decisionMs: 100 });
+  assert.deepEqual(out.errors, []);
+  assert.equal(chatModel(out), 'synthetic-coder-9b');
+  assert.deepEqual(out.engine.unloads, [{ model: 'synthetic-shared-12b', was: 'loading' }], 'only the unused, still-loading pre-load');
+  assert.equal(out.upstream.some((r) => r.body?.model === 'synthetic-shared-12b'), false);
+  // Without the cancel the swap would wait for the rest of the 600 ms load: about 100 + 600 + 600.
+  assert.ok(out.firstToken < 100 + LOAD_MS + 400, `${out.firstToken} ms vs today ${100 + LOAD_MS} ms`);
+  console.log(`[1863] wrong-guess (fast decision) TTFT ${out.firstToken} ms (today ${100 + LOAD_MS} ms)`);
 });

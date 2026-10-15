@@ -909,6 +909,7 @@ const { handleChat } = require('./chat.cjs').createChatHandler({
   recordOutcome: (entry) => recordDecision('outcome', entry),
   chatMachines,
   codeTasksFor: (project) => codeService.list(currentWorkspace(), project),
+  heuristicWantsCode, // #1863: the auto-router's code rule, read before a pre-load
   // fetch is resolved per call, not captured: tests and QA swap the global at runtime.
   fs, path, crypto, fetch: (...args) => globalThis.fetch(...args), reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult,
   HISTORY_CAP, STORED_HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP,

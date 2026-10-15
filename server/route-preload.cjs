@@ -9,31 +9,28 @@
 //
 // Conservative on purpose. No pre-load (the turn is exactly as before) when:
 //  - the turn is not a local Automatic turn (Manual, another provider, a cloud route from routing modes);
-//  - any chat role (fast, smart, code, creative) is on an Inference machine, or the assigned roles name more
-//    than one model (the decision, the Creative move, the tool reroute or the Code route could pick another
-//    model, and a pre-load would then cost a swap);
+//  - Fast and Smart name different models, Creative names another model, or any assigned chat role is on an
+//    Inference machine (the decision, the Creative move or the tool reroute could pick another model);
+//  - a Code role names another model and the turn looks like code: the auto-router's own code rule
+//    (heuristicWantsCode: a fenced block or a diff), a project with Code context, or a Task (cowork) turn;
 //  - the turn carries images (the Vision role may load first) or asks for a long-context profile (another row);
 //  - the engine has other work (inferenceBusy: a generation, a load or a swap) or any other model is loaded or
 //    loading (a pre-load would evict it, possibly mid-generation or mid-decision);
 //  - the model is already loaded or sleeping (nothing to gain).
-// The load itself is the manager's own load(): the admission lock, the inference memory budget (#697) and the
-// GTT-aware budget all apply as for any load. A refused or failed pre-load is ignored; the turn's own load later
-// runs exactly as before and reports the real error. A turn that ends on another model aborts the pre-load.
-
+// A wrong guess (the decision still picks Code) cancels the pre-load as soon as the route is known: the turn stops
+// waiting on it and its own makeRoomFor unloads the half-loaded, unused model before loading the Code model, as it
+// unloads any idle model today. Nothing in use is ever unloaded, since a pre-load only starts on an empty engine.
 const PRELOAD_ROLES = Object.freeze(['fast', 'smart', 'code', 'creative']);
 
-/** The one local model every assignable chat role names, or null when a pre-load is not safe. */
-function preloadTarget({ roles, remoteRole = () => null, hasImages = false, contextHigh = false } = {}) {
+/** The shared Fast/Smart local model when a pre-load is safe for this turn, or null. */
+function preloadTarget({ roles, remoteRole = () => null, hasImages = false, contextHigh = false, likelyCode = false } = {}) {
   if (!roles || hasImages || contextHigh) return null;
-  const models = new Set();
-  for (const role of PRELOAD_ROLES) {
-    const model = roles[role];
-    if (!model) continue;
-    if (remoteRole(role)) return null;
-    models.add(model);
-  }
-  if (models.size !== 1 || !roles.fast && !roles.smart) return null;
-  return [...models][0];
+  const model = roles.fast || roles.smart;
+  if (!model || (roles.fast && roles.smart && roles.fast !== roles.smart)) return null;
+  if (roles.creative && roles.creative !== model) return null;
+  if (roles.code && roles.code !== model && likelyCode) return null;
+  for (const role of PRELOAD_ROLES) if (roles[role] && remoteRole(role)) return null;
+  return model;
 }
 
 /**
