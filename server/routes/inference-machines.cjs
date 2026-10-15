@@ -18,7 +18,7 @@
 // The effective address of each service (what it reaches now, from this registry, the service's own
 // saved setting or the deployment's environment) goes to administrators only.
 
-const { machineState, machineReason } = require('../machine-health.cjs');
+const { machineState, machineReason, machineFailing } = require('../machine-health.cjs');
 const { SERVICES } = require('../inference-machines.cjs');
 
 const PASS = Symbol('unhandled');
@@ -45,21 +45,27 @@ function createInferenceMachineRoutes({ json, readJson, machines, health, effect
     // check, like the workers, is reached with link-local refused, so it does not use the decision service's link-local probe.
     const chat = Object.keys(SERVICES).filter((id) => SERVICES[id].mode === 'chat' && chatUrl(id));
     const headersFor = (service, url) => { try { return url && authHeaders[service] ? authHeaders[service](url) || null : null; } catch { return null; } };
-    const targets = ['decision', 'sensitivity', 'embedding', 'reranker', 'ocr', 'documents', ...chat].map((service) => { const url = effectiveUrl(service); return { service, url, decision: service === 'decision', headers: headersFor(service, url) }; });
+    const targets = ['decision', 'sensitivity', 'embedding', 'reranker', 'ocr', 'documents', ...chat].map((service) => { const url = effectiveUrl(service); return { service, url, decision: service === 'decision', headers: headersFor(service, url), ...(service === 'decision' || service === 'sensitivity' ? { fallbackPath: '/v1/models' } : {}) }; });
     // #1856: this machine's own engine is probed where the app really reaches it (the model loader, else the default provider), not at a guessed /health.
     let local = null;
     try { local = engine ? engine() : null; } catch { local = null; }
     if (local?.url) targets.push({ service: 'engine', url: local.url, path: local.path, headers: local.headers || null });
     const services = await health.check(targets);
-    const out = {}, reasons = {};
+    const out = {}, reasons = {}, failing = {};
     for (const m of view.machines) {
       const list = m.services.map((s) => services[s]);
       if (m.id === 'local' && services.engine) list.push(services.engine);
       out[m.id] = machineState(list);
       const why = machineReason(list);
-      if (why) reasons[m.id] = why;
+      if (why) {
+        reasons[m.id] = why;
+        const names = m.services.map((id) => ({ service: id, result: services[id] }));
+        if (m.id === 'local' && services.engine) names.push({ service: 'engine', result: services.engine });
+        const bad = machineFailing(names);
+        if (bad) failing[m.id] = bad;
+      }
     }
-    return { services, machines: out, reasons };
+    return { services, machines: out, reasons, failing };
   }
 
   function withUrls(view) {
