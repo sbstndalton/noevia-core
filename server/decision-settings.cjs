@@ -118,6 +118,19 @@ function createDecisionSettings({store,env=process.env,fetchImpl=decisionService
       return null;
     },
     save(value,actor) {const next=validate(value);store.set(KEY,JSON.stringify(next));saved=next;audit('decision.configure',actor,{url:next.url,timeoutMs:next.timeoutMs});return get();},
+    /** #1765: forgets the URL and deadline saved in Settings, so COWORK_DECISION_URL (and its key and model)
+     *  applies again. Audited, also when nothing was saved, so the log shows every attempt. */
+    reset(actor) {
+      const had=!!saved;
+      if(typeof store.delete==='function') store.delete(KEY); else store.set(KEY,'null');
+      saved=null;
+      audit('decision.reset',actor,{hadSaved:had});
+      return get();
+    },
+    /** #1796: what Settings → Models shows for the decision service and the sensitivity check: the model id
+     *  each one is sent as (decision-models.cjs), whether it is set up, and where the shared URL comes from.
+     *  Never an address or a key, so members may see it. */
+    describe() { return describeDecision(env,get()); },
     async test(value) {
       const next=validate(value);
       // #1755: a name is accepted only if every address it resolves to is on this network; say so plainly
@@ -136,4 +149,26 @@ function createDecisionSettings({store,env=process.env,fetchImpl=decisionService
     },
   };
 }
-module.exports={createDecisionSettings,serviceOptions,startupWarnings,hostOf,SERVICE_LIMITS};
+/** #1796: the decision rows of Settings → Models, from the shared configuration `current` ({url, source})
+ *  and the environment. `model` is the id the requests are shaped for: COWORK_DECISION_MODEL when the URL
+ *  is the deployment's own, the Laya profile otherwise (exactly what backend() sends). The sensitivity
+ *  check is `shared` unless COWORK_SENSITIVITY_DECISION_URL names its own service. */
+function describeDecision(env=process.env,current=null) {
+  const {profileFor}=require('./decision-models.cjs');
+  const cur=current || {url:env.COWORK_DECISION_URL||'',source:'deployment'};
+  const modelName=(id)=>{ const raw=typeof id==='string'?id.trim():''; return raw && raw.length<=64 ? raw : profileFor(raw).id; };
+  const shared=configuration({COWORK_DECISION_URL:cur.url});
+  const envConfig=configuration({COWORK_DECISION_URL:env.COWORK_DECISION_URL});
+  const sameAsEnv=!shared.reason && !envConfig.reason && shared.baseUrl===envConfig.baseUrl;
+  const decision=shared.reason ? {model:null,state:'off',source:cur.source}
+    : {model:modelName(sameAsEnv?env.COWORK_DECISION_MODEL:undefined),state:'active',source:cur.source};
+  const ownUrl=typeof env.COWORK_SENSITIVITY_DECISION_URL==='string' ? env.COWORK_SENSITIVITY_DECISION_URL.trim() : '';
+  let sensitivity;
+  if(!ownUrl) sensitivity={model:decision.model,state:decision.state,shared:true};
+  else {
+    const own=configuration({COWORK_DECISION_URL:ownUrl},{linkLocal:false});
+    sensitivity=own.reason ? {model:null,state:'off',shared:false} : {model:modelName(env.COWORK_SENSITIVITY_DECISION_MODEL),state:'active',shared:false};
+  }
+  return {decision,sensitivity};
+}
+module.exports={createDecisionSettings,describeDecision,serviceOptions,startupWarnings,hostOf,SERVICE_LIMITS};
