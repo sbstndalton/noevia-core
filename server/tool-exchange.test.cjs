@@ -281,7 +281,7 @@ for (const fallback of [false,true]) test(`high hints reach every real handler t
     // #1477: the output budget is a quarter of the context, at most 8,192 (thinking-budget.outputBudget); this fixture's context is 32,768.
     assert.equal(request.max_tokens,8192);
     assert.equal(request.reasoning_effort,undefined);
-    assert.equal(request.messages[0].content,'Think through this step by step before answering.');
+    assert.equal(request.messages[0].content,require('./reasoning-effort.cjs').HINTS.high);
   }
 });
 

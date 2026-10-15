@@ -38,6 +38,7 @@ async function providerFailureText(response, chatgptProvider, partial = false) {
 
 // #815/#1703/#1735: a turn is off-box when its request leaves this box: an external provider, a cloud route,
 // or any provider other than the local default one. One rule for every site that filters what may leave.
+const chatTitleLib = require('./chat-title.cjs');
 function offBoxTurn({ externalProvider, routeTarget, provider, DEFAULT_PROVIDER_ID }) {
   return !!(externalProvider || routeTarget?.route === 'cloud' || provider?.id !== DEFAULT_PROVIDER_ID);
 }
@@ -282,11 +283,17 @@ function createChatHandler({
   sourceJobs = require('./source-jobs.cjs'), sourceWaitMs = 30000, visionStageTimeoutMs = 120000,
   // #1574: how long a local reply may go silent after its first output before it is ended (0 = no limit).
   streamIdleMs = 120000,
+  // #1785: { save(projectId|null, chatId, title, firstMessage) } stores a generated title over the derived one only
+  // (projects.cjs setChatTitle). Not wired: no title is generated.
+  chatTitles = null,
   // #1726: multimodal RAG (NOEVIA_MULTIMODAL_RAG). Off: nothing below changes.
   multimodalEnabled = () => require('./multimodal-rag.cjs').enabled(),
   documentDir = (workspace, projectId) => require('./document-sources.cjs').directory(workspace, projectId),
 }) {
   const jsonOut = json;
+  // #1785: whether the local engine has other work now. /api/chat holds one inference request in the gate (index.cjs),
+  // so this turn counts as one. A manager without the signal (or one that throws) is not called busy.
+  const engineBusy = () => { try { return typeof modelManager?.inferenceBusy === 'function' && modelManager.inferenceBusy(1) === true; } catch { return false; } };
   // Revoked Skill content in earlier turns (#546): one ledger per handler, cached in memory.
   const skillLedger = skillHistory || require('./skill-history.cjs').createSkillHistory({ fs, path });
   const writesDone = recentWrites || require('./recent-writes.cjs').createRecentWrites();
@@ -1187,7 +1194,11 @@ function createChatHandler({
     // providers like OpenRouter use https://host/api/v1).
     const upstreamUrl = `${provider.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`;
     const upstreamHeaders = providerHeaders(provider);
-    const effort = reasoningEffort.resolveEffort(project, authService?.db?.prepare("SELECT value FROM settings WHERE key='reasoning_effort_default'").get()?.value);
+    // #1788: an Automatic turn routed Fast (after any move to a tool-capable role above) runs at Low, but only when the
+    // effort is the account default: a project's own reasoningEffort is an explicit choice and is kept.
+    const resolvedEffort = reasoningEffort.resolveEffort(project, authService?.db?.prepare("SELECT value FROM settings WHERE key='reasoning_effort_default'").get()?.value);
+    const effort = reasoningEffort.validEffort(project?.reasoningEffort) ? resolvedEffort
+      : reasoningEffort.effortForRoute(resolvedEffort, wantsAuto ? routedRole : null);
     // Task-aware sampling presets (issue #194): applied only when the operator has not turned
     // the feature off and the project has no explicit sampling override for the key in
     // question. `routedRole` (fast/smart/code) is the auto-router's existing signal; a manual
@@ -1685,7 +1696,9 @@ function createChatHandler({
         const tools = boxes.find((b) => b.id === id)?.tools;
         return !Array.isArray(tools) || tools.some((tool) => names.has(tool.function?.name));
       });
-      routeNoteText = require('./tool-route-notes.cjs').toolRouteNotes({ message, offered, onServer: boxes.map((b) => b.id), automatic: automaticTools, localModel: automaticLocal });
+      routeNoteText = require('./tool-route-notes.cjs').toolRouteNotes({ message, offered, onServer: boxes.map((b) => b.id), automatic: automaticTools, localModel: automaticLocal,
+        // #1786: the gate ran on these tools and picked none.
+        gateNone: !!gate && gate.decision === 'none' });
       if (routeNoteText) roundMessages = withSystemNote(roundMessages, routeNoteText);
     }
     const requestTools = () => (!templateToolsOff && activeTools.length ? { tools: activeTools } : {});
@@ -2249,6 +2262,24 @@ function createChatHandler({
       catch { /* a trace never changes the reply */ }
     }
     send({ type: 'done', model });
+    // #1785: after a chat's first reply, a short title from the local model that just answered. Never on an off-box
+    // turn (offBoxTurn): the message and the reply go nowhere for it. Saved only over the title derived from the first
+    // message; the client adopts it from the `title` event. Bounded and failure-free (chat-title.cjs).
+    // It runs after `done`, so it never holds the reply's completion; the client reads every event until the connection
+    // closes (web api.ts streamChat) and still adopts it (web#58). Skipped while the engine is busy: other inference in
+    // flight (this turn holds one request in the gate, index.cjs), a held maintenance gate or a pending model load/swap.
+    if (chatTitles && !paused && roundHasContent && roundContent.trim() && typeof body.chatId === 'string' && body.chatId
+      && !body.compactOnly && !(typeof spaceId === 'string' && spaceId.startsWith('diary')) && project?.id !== diaryExtras?.PROJECT_ID
+      && provider.id === DEFAULT_PROVIDER_ID && !offBoxTurn({ externalProvider, routeTarget, provider, DEFAULT_PROVIDER_ID })
+      && chatTitleLib.firstReply(history) && !engineBusy()) {
+      const title = await chatTitleLib.generateTitle({ fetch, url: upstreamUrl, headers: upstreamHeaders, model, message, reply: roundContent,
+        signal: chatSignal.signal, readJson: readCappedJson });
+      if (chatSignal.signal.aborted) return;
+      if (title) {
+        send({ type: 'title', chatId: body.chatId, title });
+        try { chatTitles.save(body.projectId && project ? project.id : null, body.chatId, title, message); } catch { /* the client saves it too */ }
+      }
+    }
     res.end();
   }
 

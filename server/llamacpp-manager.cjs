@@ -93,8 +93,11 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
   async function mutate(fn) {const leave=maintenance.enter();try{return await fn();}finally{leave();}}
   // Serialize only admission/eviction, never the inference that follows it.
   let admission = Promise.resolve();
+  // #1785: admissions (model loads and swaps) queued or running, for inferenceBusy.
+  let admissionsPending = 0;
   async function withAdmission(work, signal) {
     signal?.throwIfAborted();
+    admissionsPending++;
     const previous = admission;
     let release;
     admission = new Promise(resolve => { release = resolve; });
@@ -114,6 +117,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
       // An aborted waiter returns promptly, but its queue slot remains behind the previous
       // operation until that operation finishes; later admissions cannot overtake it.
       if (acquired) release(); else void previous.then(release);
+      admissionsPending--;
     }
   }
   // #1079: which rows are a model and its `<model>-long` profile (Rust's pairing; none on failure).
@@ -719,6 +723,9 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     withAdmission,
     close:tracker.close,
     enterInference: maintenance.enter,
+    // #1785: read-only. Busy when the maintenance gate is held, more inference requests than the caller's own `own`
+    // are in flight, or a model load/swap is queued or running. Optional work (a chat title) checks it and skips.
+    inferenceBusy: (own = 0) => maintenance.held() || (typeof maintenance.active === 'function' && maintenance.active() > own) || admissionsPending > 0,
     // #872: read-only views for writers outside this process's gate (the model folder sync):
     // the gate itself, or any calibration/auto-tune job still running (auto-tune releases the
     // gate between models but still restores settings by revision).

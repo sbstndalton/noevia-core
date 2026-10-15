@@ -149,6 +149,8 @@ test('empty SSE fallback refuses redirects and reconstructs split SSE lines', as
   let calls = 0;
   t.mock.method(global, 'fetch', async (_url, opts) => {
     assert.equal(opts.redirect, 'error');
+    // #1785: the title request after a first reply is its own call, not part of the stream and its fallback.
+    if (JSON.parse(opts.body).messages?.[0]?.content === require('./chat-title.cjs').TITLE_SYSTEM) return Response.json({choices:[{message:{content:'Stream Test'}}]});
     calls++;
     return calls === 1 ? new Response('') : Response.json({choices:[{message:{content:'fallback answer'}}]});
   });

@@ -944,6 +944,8 @@ const { handleChat } = require('./chat.cjs').createChatHandler({
     // projects.cjs: reads the lists again first (sbstndalton/noevia#1426).
     setChatFlags: (projectId, chatId, patch) => projectStore.setChatFlags(projectId, chatId, patch),
   },
+  // #1785: a generated title is saved in the signed-in user's own lists, over the derived title only.
+  chatTitles: { save: (projectId, chatId, title, firstMessage) => projectStore.setChatTitle(projectId, chatId, title, firstMessage) },
   // #742: linked chats' brains, read from the signed-in user's own workspace and lists only.
   brainContext: { enabled: () => features.enabled('brainContext') && features.enabled('chatFraming'), maxChars: () => framingSettings.get().brainContextChars,
     chats: () => [...Array.from(FREE_CHATS), ...PROJECTS.filter((proj) => !diaryExtras.internalProject(proj)).flatMap((proj) => proj.chats || [])],
