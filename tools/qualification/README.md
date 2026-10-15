@@ -9,11 +9,11 @@ Historical #1212 negative control uses rs main-before-fix `68d8fbce93309ea30bca9
 # Candidate native reasoning qualification (#1320)
 
 `reasoning-front.yml` adds one required gate to the existing six. Its immutable
-merged Rust input is 2fe1a15b4112e2c0a581745701a4c533cd3e414e (noevia-rs#109, core#120 exchange 35, #1792),
-archive SHA256 246c1a87cfc0390f09199087431e1be90a029b77e339744b311f57638a910289.
-Its corpus records core cb865f4baf9f788e0aa0df90d935c0ea0de0a512 (contracts/http/core.ref,
+merged Rust input is fa8661143c9b3b55f5e7d111ff458254424ddb42 (noevia-rs#112, core#126 corpus, #1806),
+archive SHA256 9d011cb54e46479b729723a9482e79131d87ed2df0092728b41b3f33112716a6.
+Its corpus records core 885e625cddd1af99e23d892505f4e1eeb87608db (contracts/http/core.ref,
 recorded with NOEVIA_CONTRACT_FIXED_NOW); the candidate core is separately the exact
-workflow checkout HEAD, clean and descended from cb865f4. The launch template at c90210ee
+workflow checkout HEAD, clean and descended from 885e625. The launch template at c90210ee
 carries the launcher's `__PROMPTS_OVERRIDE__` slot, which the adapter fills with nothing,
 as the merged launcher does outside its prompts modes. Earlier input: 592d94a7, archive
 74be654e, corpus core 641917e2.
@@ -42,9 +42,9 @@ WASM040738 remain intact. Owner flags remain default off.
 # Native engine statistics front qualification (#1650)
 
 `stats-front.yml` qualifies Node's half of GET /api/stats moving to the Rust front
-(`statsRustOwned` in `server/routes/models.cjs`). Its native source is the noevia-rs#109 merge
-commit 2fe1a15b4112e2c0a581745701a4c533cd3e414e (carries #98 and the core#120 corpus), archive SHA-256
-246c1a87cfc0390f09199087431e1be90a029b77e339744b311f57638a910289 (twice fetched,
+(`statsRustOwned` in `server/routes/models.cjs`). Its native source is the noevia-rs#112 merge
+commit fa8661143c9b3b55f5e7d111ff458254424ddb42 (carries #98 and the core#126 corpus), archive SHA-256
+9d011cb54e46479b729723a9482e79131d87ed2df0092728b41b3f33112716a6 (twice fetched,
 byte-identical). The same archive still feeds the
 `core-acceptance` adapter unchanged. The gate requires:
 

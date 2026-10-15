@@ -22,7 +22,7 @@ function partialSources(files, placed) {
   if (!Array.isArray(files) || !Array.isArray(placed)) return [];
   const out = [];
   for (const f of files) {
-    const length = String((f && f.content) || '').length;
+    const length = require('./source-text.cjs').textLength(f); // #1806: no read of a text in its file
     if (length <= WHOLE_MAX) continue;
     let read = 0;
     for (const p of placed) if (p && p.file === f.name) read += String(p.body || '').length;

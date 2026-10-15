@@ -88,7 +88,9 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
       // PROJECTS is served raw everywhere else; here it crosses to the client,
       // so chats[] must be sanitized exactly as loadChats does.
       return json(res, 200, {
-        projects: PROJECTS.filter(proj => !diaryExtras.internalProject(proj)).map((proj) => ({ ...proj, chats: sanitizeChats(proj.chats) })),
+        // #1806: sources as metadata only; a source's text is GET /api/projects/{id}/sources/text.
+        projects: PROJECTS.filter(proj => !diaryExtras.internalProject(proj)).map((proj) => ({ ...proj, chats: sanitizeChats(proj.chats),
+          ...(Array.isArray(proj.files) ? { files: proj.files.map(require('../source-text.cjs').meta) } : {}) })),
         freeChats: sanitizeChats(FREE_CHATS),
       });
     }

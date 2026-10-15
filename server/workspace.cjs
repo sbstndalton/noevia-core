@@ -2,6 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const sourceText = require('./source-text.cjs');
 
 function readJson(file, fallback) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return fallback; }
@@ -128,8 +129,26 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { rustProjects 
     }
 
     const dir = userDir(userId); fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-    const projectsFile = rustProjects ? require('./rust-projects.cjs').createProjectsFile(path.join(dir, 'projects.json'), { atomicJson }) : null;
-    const projects = projectsFile ? projectsFile.load() : readJson(path.join(dir, 'projects.json'), { projects: [] }).projects || [];
+    const sharedProjectsFile = rustProjects ? require('./rust-projects.cjs').createProjectsFile(path.join(dir, 'projects.json'), { atomicJson }) : null;
+    // #1806: a project's sources come back from projects.json as metadata; their text is read from
+    // its own file on demand (source-text.cjs). What the other writer's changes bring in is given
+    // the same reader.
+    const projectsFile = sharedProjectsFile && Object.assign(Object.create(sharedProjectsFile), {
+      refresh(list) { const changed = sharedProjectsFile.refresh(list); if (changed) sourceText.attachAll(dir, list); return changed; },
+      save(list, afterWrite) { sharedProjectsFile.save(list, afterWrite); sourceText.attachAll(dir, list); },
+    });
+    // #1806 review: a projects.json that exists but does not parse loads as an empty list. Its
+    // sources' text files must survive that: the source-text collection is off for this
+    // workspace (until a restart reads a good file), and never runs over an empty list.
+    const projectsPath = path.join(dir, 'projects.json');
+    let loadCorrupt = false;
+    if (fs.existsSync(projectsPath)) {
+      try { const v = JSON.parse(fs.readFileSync(projectsPath, 'utf8')); loadCorrupt = !v || typeof v !== 'object' || (v.projects != null && !Array.isArray(v.projects)); }
+      catch { loadCorrupt = true; }
+      if (loadCorrupt) console.warn('[sources] projects.json did not load; unused source text will not be removed until it does');
+    }
+    const loaded = projectsFile ? projectsFile.load() : (readJson(path.join(dir, 'projects.json'), { projects: [] }) || {}).projects;
+    const projects = Array.isArray(loaded) ? loaded : [];
     const freeChatsFile = rustFreeChats ? require('./rust-projects.cjs').createFreeChatsFile(path.join(dir, 'free-chats.json'), { atomicJson }) : null;
     const providerFile = path.join(dir, 'providers.json');
     const savedProviders = readJson(providerFile, { providers: [] }).providers || [];
@@ -148,6 +167,8 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { rustProjects 
     for (const project of projects) if (project.provider === 'lemonade') project.provider = defaultProvider.id;
     let modesMigrated = false;
     for (const project of projects) if (require('./project-modes.cjs').migrate(project)) modesMigrated = true;
+    // #1806: inline source text from before is moved to its files (backup first); see source-text.cjs.
+    const textMigrated = sourceText.migrateOnLoad(dir, projects);
     const workspace = {
       userId, dir, projects,
       projectsFile,
@@ -168,8 +189,17 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { rustProjects 
       preferences: readJson(path.join(dir, 'preferences.json'), {}) || {},
       saveProjects() {
         this.assertActive();
-        if (projectsFile) projectsFile.save(this.projects);
-        else atomicJson(path.join(dir, 'projects.json'), { projects: this.projects });
+        // #1806: new or changed source text goes to its file first, so projects.json never points
+        // at a text that is not on disk; text no source points at any more is removed after.
+        sourceText.externalize(dir, this.projects);
+        // The collection runs right after the write, under the same flock when projects.json is
+        // shared with the Rust front, and never after a corrupt load or over an empty list.
+        const gc = (list) => {
+          if (loadCorrupt || !Array.isArray(list) || list.length === 0) return;
+          try { sourceText.collect(dir, list); } catch (e) { console.warn('[sources] could not remove unused source text:', e.message); }
+        };
+        if (projectsFile) projectsFile.save(this.projects, gc);
+        else { atomicJson(path.join(dir, 'projects.json'), { projects: this.projects }); gc(this.projects); }
       },
       saveProviders() {
         this.assertActive();
@@ -251,7 +281,7 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { rustProjects 
     workspace.providers = mergeProviders(workspace.privateProviders);
     cache.set(userId, workspace);
     if (needsEncryption) workspace.saveProviders();
-    if (modesMigrated) workspace.saveProjects();
+    if (modesMigrated || textMigrated) workspace.saveProjects();
     return workspace;
   }
 
@@ -263,7 +293,23 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { rustProjects 
     cache.delete(userId);
     fs.rmSync(dir, { recursive: true, force: true });
   }
-  return { get, remove, claimLegacy, userDir, isRemoved: (userId) => removed.has(userId) };
+  // #1806: at startup, every workspace whose projects.json still holds source text inline is loaded,
+  // which moves the text to its files (source-text.cjs migrateOnLoad, backup first) before the
+  // first request, and before the Rust front reads the file. Returns the user ids migrated.
+  function migrateSourceText(userIds) {
+    const done = [];
+    for (const userId of userIds) {
+      try {
+        if (removed.has(userId) || cache.has(userId)) continue;
+        const projects = readJson(path.join(userDir(userId), 'projects.json'), { projects: [] }).projects;
+        if (!Array.isArray(projects) || !sourceText.hasInline(projects)) continue;
+        get(userId);
+        done.push(userId);
+      } catch (e) { console.warn(`[sources] could not move source text out of projects.json for ${userId}: ${e.message}`); }
+    }
+    return done;
+  }
+  return { get, remove, claimLegacy, userDir, migrateSourceText, isRemoved: (userId) => removed.has(userId) };
 }
 
 module.exports = { createWorkspaceStore, atomicJson };
