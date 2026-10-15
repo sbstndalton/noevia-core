@@ -12,9 +12,11 @@
 // (service-endpoint.cjs serviceFetch): a name is resolved at connect time and refused unless every answer
 // is on this network, link-local included, and a redirect is never followed. Neither worker is sent a
 // token: the requests carry only the document and its content type, so no local credential can reach
-// another host (document-workers.test.cjs pins the headers).
+// another host (document-workers-1841.test.cjs pins the headers).
 const { serviceFetch } = require('./service-endpoint.cjs');
 
+// The machine state below is module-level, set once by index.cjs: a worker thread or child process loads its own
+// copy of this module with no machines, so it would silently read the environment only. Pass the resolved url in.
 const ENV = Object.freeze({ ocr: 'OCR_BASE_URL', documents: 'DOCLING_BASE_URL' });
 let machineUrl = () => null;
 

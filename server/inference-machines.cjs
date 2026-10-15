@@ -53,6 +53,7 @@ const SERVICES = Object.freeze({
   ocr: { mode: 'runtime' },
   documents: { mode: 'runtime' },
 });
+const WORKERS = new Set(['ocr', 'documents']);
 const SERVICE_IDS = Object.freeze(Object.keys(SERVICES));
 const RERANK_PROTOCOLS = new Set(['tei', 'llamacpp']);
 
@@ -127,9 +128,10 @@ function readState(store, log) {
  * @param {Function} [o.lookup]                       DNS lookup for the save-time check (tests stub it)
  * @param {() => ({baseUrl?:string|null, model:string, profile:string}|null)} [o.embeddingActive]  the active embedding target
  * @param {() => string|null} [o.localEmbeddingUrl]   where embeddings run on this machine (the deployment's address), or null
+ * @param {(service:string) => boolean} [o.workerEnabled]  whether the OCR / Docling worker is switched on by the deployment (its env URL is set)
  * @param {(service:string) => void} [o.onChange]     called after a change that moves `service` (or every service on a machine)
  */
-function createInferenceMachines({ store, audit = () => {}, lookup, embeddingActive = () => null, localEmbeddingUrl = () => null, onChange = () => {}, log = (line) => console.warn(line) } = {}) {
+function createInferenceMachines({ store, audit = () => {}, lookup, embeddingActive = () => null, localEmbeddingUrl = () => null, workerEnabled = (service) => !!String(process.env[service === 'ocr' ? 'OCR_BASE_URL' : 'DOCLING_BASE_URL'] || '').trim(), onChange = () => {}, log = (line) => console.warn(line) } = {}) {
   let state = readState(store, log);
   const machineById = (id) => state.machines.find((m) => m.id === id) || null;
 
@@ -156,6 +158,8 @@ function createInferenceMachines({ store, audit = () => {}, lookup, embeddingAct
     } catch { /* fall through */ }
     return { machine: 'other', port: portOf(url), url };
   }
+
+  const workerOn = (id) => { try { return !!workerEnabled(id); } catch { return false; } };
 
   /** Where `service` is now: { machine, port?, protocol? }. */
   function assignmentOf(service) {
@@ -184,7 +188,8 @@ function createInferenceMachines({ store, audit = () => {}, lookup, embeddingAct
         { id: LOCAL_ID, builtIn: true, name: null, address: null, services: servicesOn(LOCAL_ID) },
         ...state.machines.map((m) => ({ id: m.id, name: m.name, address: m.address, ...(m.unresolved ? { unresolved: true } : {}), services: servicesOn(m.id) })),
       ],
-      services: SERVICE_IDS.map((id) => ({ id, mode: SERVICES[id].mode, ...assignmentOf(id) })),
+      // #1847: OCR and Docling are switched on by the deployment only; `enabled: false` tells the page there is nothing to move.
+      services: SERVICE_IDS.map((id) => ({ id, mode: SERVICES[id].mode, ...assignmentOf(id), ...(WORKERS.has(id) ? { enabled: workerOn(id) } : {}) })),
     };
   }
 
@@ -252,6 +257,8 @@ function createInferenceMachines({ store, audit = () => {}, lookup, embeddingAct
     const machineId = String(body?.machine || '');
     const machine = machineId === LOCAL_ID ? null : machineById(machineId);
     if (machineId !== LOCAL_ID && !machine) throw fail(404, 'unknownMachine', 'That machine is not on the list.');
+    // #1847: assigning a machine must never switch a worker on: that changes the extractor version and re-reads every document.
+    if (WORKERS.has(service) && machine && !workerOn(service)) throw fail(409, 'workerNotEnabled', 'Turn this service on in the deployment first; assigning a machine does not switch it on.');
     if (def.mode === 'local' && machine) throw fail(409, 'localOnly', 'Chat models stay on this machine for now.');
     if (def.mode === 'deployment' && machine) throw fail(409, 'setByDeployment', 'This service’s address is set by the deployment.');
     if (def.mode === 'local' || def.mode === 'deployment') return view(); // already on this machine: nothing to do

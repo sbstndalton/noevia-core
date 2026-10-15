@@ -76,13 +76,36 @@ test('assignment overrides the environment; unassigning falls back to it', async
     assert.equal(workers.resolve('ocr').url, 'http://ocr:8030');
     assert.equal(workers.resolve('ocr').fetch, globalThis.fetch);
   });
-  // Assigned with nothing in the environment: the worker counts as configured.
+});
+
+test('#1847: a worker the deployment has not switched on cannot be assigned; assign/unassign never changes EXTRACTOR_VERSION', async () => {
+  const machines = registry();
+  workers.useMachines((kind) => machines.urlFor(kind));
+  const { machine } = await machines.add({ name: 'Pi 5', address: 'pi5.lan' }, 'admin');
+  const documents = require('./documents.cjs');
   await withEnv({ OCR_BASE_URL: undefined, DOCLING_BASE_URL: undefined }, async () => {
-    assert.equal(docling.enabled(), true);
-    assert.equal(workers.configured('ocr'), false);
-    machines.assign({ service: 'ocr', machine: machine.id, port: 8030 }, 'admin');
-    assert.equal(workers.configured('ocr'), true);
+    const before = documents.EXTRACTOR_VERSION;
+    for (const service of ['ocr', 'documents']) {
+      assert.throws(() => machines.assign({ service, machine: machine.id, port: 8030 }, 'admin'), (e) => e.status === 409 && e.code === 'workerNotEnabled');
+      assert.equal(machines.urlFor(service), null);
+      assert.equal(machines.view().services.find((x) => x.id === service).enabled, false);
+      machines.assign({ service, machine: 'local' }, 'admin'); // staying here is always allowed
+    }
+    assert.equal(docling.enabled(), false);
+    assert.equal(documents.EXTRACTOR_VERSION, before);
   });
+  for (const env of [{ OCR_BASE_URL: 'http://ocr:8030', DOCLING_BASE_URL: undefined }, { OCR_BASE_URL: undefined, DOCLING_BASE_URL: 'http://docling:8031' }, { OCR_BASE_URL: 'http://ocr:8030', DOCLING_BASE_URL: 'http://docling:8031' }]) {
+    await withEnv(env, async () => {
+      const before = documents.EXTRACTOR_VERSION;
+      for (const service of ['ocr', 'documents'].filter((x) => (x === 'ocr' ? env.OCR_BASE_URL : env.DOCLING_BASE_URL))) {
+        assert.equal(machines.view().services.find((x) => x.id === service).enabled, true);
+        machines.assign({ service, machine: machine.id, port: 8030 }, 'admin');
+        assert.equal(documents.EXTRACTOR_VERSION, before, 'assigned');
+        machines.assign({ service, machine: 'local' }, 'admin');
+        assert.equal(documents.EXTRACTOR_VERSION, before, 'unassigned');
+      }
+    });
+  }
 });
 
 test('a public or link-local machine cannot be added, and services cannot be assigned to a missing one', async () => {
