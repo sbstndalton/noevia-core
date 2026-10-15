@@ -21,7 +21,12 @@ function keepAlongside(env = process.env) {
   const config = require('./embedding-config.cjs').current();
   const onEngine = config ? [config.active(), config.next()].filter((t) => t && !t.baseUrl).map((t) => t.model) : null;
   const e = onEngine ? onEngine.join('\u0000') : (String(env.EMBEDDING_BASE_URL || '').trim() ? '' : (env.EMBEDDING_MODEL || env.EMBED_MODEL || ''));
-  const target = require('./rerank-target.cjs').rerankTarget(env);
+  // #1638: the reranker's effective configuration (its Settings switch and inference machine) once installed: a
+  // reranker assigned to another machine is not on this engine, so it is not kept beside the chat model.
+  const rerankSettings = require('./rerank-settings.cjs').current();
+  let renv = env;
+  if (rerankSettings && env === process.env) { try { renv = rerankSettings.effectiveEnv() || env; } catch { renv = env; } }
+  const target = require('./rerank-target.cjs').rerankTarget(renv);
   const r = target.enabled && target.shared ? target.model || '' : '';
   return [...String(e || '').split('\u0000').filter((m) => m && m !== 'default'), ...(r ? [r] : [])];
 }

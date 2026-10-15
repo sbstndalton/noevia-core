@@ -31,14 +31,29 @@ function endpoints(env) {
   return { tei: tei || null, llamacpp: llamacpp || null, teiModel };
 }
 
-function createRerankSettings({ store, env = process.env, audit = () => {}, onChange = () => {} }) {
+/** The host of a URL, lower-cased, or ''. */
+const hostOf = (value) => { try { return new URL(String(value || '').trim()).hostname.toLowerCase(); } catch { return ''; } };
+
+// #1638: `machine` is where Settings → Inference machines puts the reranker: () => { url, protocol } or null while it
+// is on this machine. Assigned, the machine's address replaces the deployment's for that protocol (so the choices are
+// what that machine can serve), and RERANK_API_KEY, which belongs to the deployment's reranker, is only sent when the
+// machine is the same host as RERANK_BASE_URL (the #1753 rule of decision-settings.cjs).
+function createRerankSettings({ store, env = process.env, audit = () => {}, onChange = () => {}, machine = () => null }) {
+  const onMachine = () => { try { const m = machine(); return m && typeof m.url === 'string' && m.url ? { url: m.url, protocol: m.protocol === 'llamacpp' ? 'llamacpp' : 'tei' } : null; } catch { return null; } };
+  /** The deployment's endpoints, with an assigned machine's address over them. */
+  function endpointsNow() {
+    const ep = endpoints(env);
+    const m = onMachine();
+    if (!m) return ep;
+    return { ...ep, tei: m.protocol === 'tei' ? m.url : null, llamacpp: m.protocol === 'llamacpp' ? m.url : null };
+  }
   let saved;
   try { saved = JSON.parse(store.get(KEY) || 'null'); } catch { saved = null; }
   if (saved && (typeof saved.enabled !== 'boolean' || (saved.choice !== null && typeof saved.choice !== 'string'))) saved = null;
 
   /** Choosable rerankers ({ id, backend, model }); `installed` null = the catalogue could not be read. */
   function options(installed) {
-    const ep = endpoints(env);
+    const ep = endpointsNow();
     const out = [];
     if (ep.tei) out.push({ id: 'tei', backend: 'tei', model: ep.teiModel });
     if (ep.llamacpp && Array.isArray(installed)) {
@@ -48,16 +63,25 @@ function createRerankSettings({ store, env = process.env, audit = () => {}, onCh
   }
   /** The choice id the deployment's own environment amounts to, or null. */
   function deploymentChoice() {
-    const backend = rerankBackendName(env);
+    const m = onMachine();
+    const backend = m ? m.protocol : rerankBackendName(env);
     if (backend === 'tei') return 'tei';
     const model = trim(env.RERANK_MODEL);
     return backend === 'llamacpp' && model ? `llamacpp:${model}` : null;
   }
   /** The environment rerankTarget() and the reranker backend read: the deployment's, with a saved choice over it. */
   function effectiveEnv() {
-    if (!saved) return env;
-    const ep = endpoints(env);
-    const out = { ...env, NOEVIA_FEATURE_RAG_RERANK: saved.enabled ? 'true' : 'false' };
+    const m = onMachine();
+    if (!saved && !m) return env;
+    const ep = endpointsNow();
+    const out = { ...env };
+    if (m) {
+      // Nothing saved: the deployment's switch and model, at the machine's address.
+      Object.assign(out, { RERANK_BACKEND: m.protocol, RERANK_BASE_URL: m.url, ...(m.protocol === 'tei' ? { RERANK_MODEL: ep.teiModel } : {}) });
+      if (hostOf(m.url) !== hostOf(env.RERANK_BASE_URL)) out.RERANK_API_KEY = '';
+    }
+    if (!saved) return out;
+    out.NOEVIA_FEATURE_RAG_RERANK = saved.enabled ? 'true' : 'false';
     const choice = saved.choice;
     if (choice === 'tei' && ep.tei) Object.assign(out, { RERANK_BACKEND: 'tei', RERANK_BASE_URL: ep.tei, RERANK_MODEL: ep.teiModel });
     else if (choice && choice.startsWith('llamacpp:') && ep.llamacpp) Object.assign(out, { RERANK_BACKEND: 'llamacpp', RERANK_BASE_URL: ep.llamacpp, RERANK_MODEL: choice.slice('llamacpp:'.length) });
@@ -104,4 +128,10 @@ function createRerankSettings({ store, env = process.env, audit = () => {}, onCh
   return { get, save, reset, options, effectiveEnv, source: () => (saved ? 'admin' : 'deployment') };
 }
 
-module.exports = { createRerankSettings, endpoints, DEFAULT_TEI_MODEL, KEY };
+// The process's reranker settings, for modules that are not handed them (llamacpp-manager.cjs keepAlongside: a
+// reranker on another machine is not resident on this engine, #1638). Set once by index.cjs.
+let installed = null;
+function install(settings) { installed = settings; return settings; }
+function current() { return installed; }
+
+module.exports = { createRerankSettings, endpoints, DEFAULT_TEI_MODEL, KEY, install, current };

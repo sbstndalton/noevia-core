@@ -43,10 +43,12 @@ function setRagFetch(fn) { const prev = netFetch; netFetch = fn; return prev; }
 const testSeam = process.env.NODE_TEST_CONTEXT || process.env.NODE_ENV === 'test' ? { _test: { setRagFetch, makeRagFetch, rerankBackend, rerankState: () => rerank } } : {};
 // The reranker's backend, built here so a test can drive it without a chat. #1665: `backend` is
 // rerank-target.cjs's 'llamacpp' (POST /v1/rerank) or 'tei' (POST /rerank); both go through ragFetch.
-function rerankBackend(baseUrl, backend = 'llamacpp', model = process.env.RERANK_MODEL || null) {
+// #1638: `apiKey` comes from the reranker's effective environment (rerank-settings.cjs), which drops RERANK_API_KEY
+// for a reranker on another machine than the deployment's.
+function rerankBackend(baseUrl, backend = 'llamacpp', model = process.env.RERANK_MODEL || null, apiKey = process.env.RERANK_API_KEY || null) {
   const { llamaRerankBackend, teiRerankBackend } = require('./decision/backends.cjs');
   const fetchImpl = (u, i) => ragFetch(u, { ...i, redirect: 'error' });
-  const apiKey = process.env.RERANK_API_KEY || null; /* #697: the inference key never goes to a reranker sidecar */
+  /* #697: the inference key never goes to a reranker sidecar */
   if (backend === 'tei') return teiRerankBackend({ baseUrl, fetchImpl, apiKey });
   return llamaRerankBackend({ baseUrl, fetchImpl, model: model || null, apiKey });
 }
@@ -128,7 +130,7 @@ function initRerank() {
   if (!target.enabled) { rerank = null; return; }
   const baseUrl = target.baseUrl;
   const { createDecisions } = require('./decision/index.cjs');
-  const backend = rerankBackend(baseUrl, target.backend, target.model);
+  const backend = rerankBackend(baseUrl, target.backend, target.model, Object.prototype.hasOwnProperty.call(env, 'RERANK_API_KEY') ? env.RERANK_API_KEY || null : process.env.RERANK_API_KEY || null);
   const decisions = createDecisions({
     backends: { [backend.id]: backend },
     chains: { 'rag.rerank': [backend.id] },
