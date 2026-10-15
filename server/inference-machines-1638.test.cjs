@@ -73,6 +73,8 @@ test('decision: an assignment overrides the saved URL and COWORK_DECISION_URL; t
   assert.equal(settings.get().source, 'machine');
   assert.equal(settings.get().timeoutMs, 1500);
   assert.equal(settings.describe().decision.state, 'active');
+  // #1845: the clients that switch on `source` (web Decision setup note, Models row note) get 'machine' on both reads.
+  assert.equal(settings.describe().decision.source, 'machine');
   // Another host: the deployment's shared key is not sent there (#1753 rule).
   const sent = [];
   const keyed = createDecisionSettings({ store: memoryStore(), env, machineUrl: () => machines.urlFor('decision'),
@@ -88,6 +90,32 @@ test('decision: an assignment overrides the saved URL and COWORK_DECISION_URL; t
     { service: 'decision', machine: machine.id, port: 8040, from: 'local' },
     { service: 'decision', machine: 'local', from: machine.id },
   ]);
+});
+
+test('decision: a machine name that DNS later re-points to 169.254.x is refused at connect time and nothing is sent (#1845)', async () => {
+  const { createServiceFetch } = require('./service-endpoint.cjs');
+  const { machines } = registry();
+  const { machine } = await machines.add({ name: 'Pi 5', address: 'pi5.lan' }, 'admin');
+  machines.assign({ service: 'decision', machine: machine.id, port: 8040 }, 'admin');
+  // The name now resolves to a link-local address (it was 192.168.1.50 when saved).
+  const resolve = (host, _opts, cb) => cb(null, [{ address: '169.254.10.10', family: 4 }]);
+  const wire = [];
+  const spy = (inner) => (url, init) => { wire.push(String(url)); return inner(url, init); };
+  const settings = createDecisionSettings({ store: memoryStore(), env: {}, machineUrl: () => machines.urlFor('decision'),
+    fetchImpl: async () => assert.fail('the link-local-allowed fetch must not carry machine traffic'),
+    sensitivityFetchImpl: spy(createServiceFetch({ resolve, linkLocal: false })) });
+  assert.equal(settings.get().source, 'machine');
+  const sendWith = (s) => s.backend().decide({ question: 'q', options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }] });
+  await assert.rejects(sendWith(settings), (e) => !/selected/.test(String(e.message)) && e.reason !== 'too-many-options');
+  assert.equal(wire.length, 1, 'the connect was attempted through the link-local-refusing fetch');
+  // The same address saved as a URL (not a machine) keeps the link-local-allowed path.
+  const saved = [];
+  const own = createDecisionSettings({ store: memoryStore({ 'decision:configuration': JSON.stringify({ url: 'http://169.254.10.10:8040', timeoutMs: 1500 }) }), env: {},
+    fetchImpl: async (url) => { saved.push(String(url)); return new Response(JSON.stringify({ selected: 'a', scores: { a: 0.9, b: 0.1 } })); },
+    sensitivityFetchImpl: async () => assert.fail('saved URL must not use the machine path') });
+  assert.equal(own.get().source, 'admin');
+  await sendWith(own);
+  assert.equal(saved.length, 1);
 });
 
 test('reranker: an assignment moves the address and drops the deployment key on another host; env is the fallback', async () => {
