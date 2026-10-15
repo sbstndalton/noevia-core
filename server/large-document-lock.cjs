@@ -19,12 +19,24 @@
 // the next sync). A holder is never force-released (that would let two large documents overlap), but a
 // hold longer than HOLD_WARN_MS logs one line, without any document content.
 const { AsyncLocalStorage } = require('node:async_hooks');
+const crypto = require('node:crypto');
 
 const LARGE_BYTES = 25 * 1024 * 1024;
 const ACQUIRE_WAIT_MS = 2 * 60 * 1000;
 const HOLD_WARN_MS = 30 * 60 * 1000;
 const holder = new AsyncLocalStorage();
 let tail = Promise.resolve();
+let outstanding = 0; // acquires queued or holding, so a new one knows whether it will have to wait
+// #1878: cumulative counts since start, for tests and a release watch. Counts only, no content.
+const counters = { acquires: 0, waited: 0, waitMsTotal: 0, busy: 0 };
+
+/** #1878: a short, one-way tag of a document reference (its id), so a log line can be matched across
+ *  lines without carrying the id or the file name. */
+const refHash = (ref) => {
+  let value = ref;
+  try { if (typeof value === 'function') value = value(); } catch { value = null; }
+  return value == null || value === '' ? 'none' : crypto.createHash('sha256').update(String(value)).digest('hex').slice(0, 8);
+};
 
 const positive = (value, fallback) => { const n = Number(value); return Number.isFinite(n) && n > 0 ? n : fallback; };
 const acquireWaitMs = () => positive(process.env.LARGE_DOCUMENT_ACQUIRE_WAIT_MS, ACQUIRE_WAIT_MS);
@@ -34,7 +46,11 @@ const busy = () => Object.assign(new Error('Large-document processing is busy; r
 
 /** Wait for the lock (queued behind any holder, first come first served) and return its `release`.
  *  Rejects with a busy error after the acquire wait, leaving the queue intact for those behind. */
-async function acquire() {
+async function acquire(ref) {
+  const mustWait = outstanding > 0;
+  const waitStart = Date.now();
+  outstanding += 1;
+  counters.acquires += 1;
   let release;
   const previous = tail;
   const mine = new Promise((resolve) => { release = resolve; });
@@ -45,22 +61,29 @@ async function acquire() {
   clearTimeout(timer);
   if (!got) {
     // Not taking it: pass the turn on as soon as the holder ahead lets go, so the queue behind still moves.
-    previous.then(release);
+    previous.then(() => { outstanding -= 1; release(); });
+    counters.busy += 1; counters.waited += 1; counters.waitMsTotal += Date.now() - waitStart;
+    console.warn(`[large-document-lock] gave up waiting: doc=${refHash(ref)} waitedMs=${Date.now() - waitStart} outcome=busy`);
     throw busy();
+  }
+  if (mustWait) {
+    const waitedMs = Date.now() - waitStart;
+    counters.waited += 1; counters.waitMsTotal += waitedMs;
+    console.log(`[large-document-lock] acquired after waiting: doc=${refHash(ref)} waitedMs=${waitedMs}`);
   }
   const startedAt = Date.now();
   const warn = setTimeout(() => {
-    console.warn(`[large-document-lock] held for over ${Math.round((Date.now() - startedAt) / 60000)} minutes; still running`);
+    console.warn(`[large-document-lock] held for over ${Math.round((Date.now() - startedAt) / 60000)} minutes; still running: doc=${refHash(ref)}`);
   }, holdWarnMs());
   warn.unref?.();
   let released = false;
-  return () => { if (released) return; released = true; clearTimeout(warn); release(); };
+  return () => { if (released) return; released = true; outstanding -= 1; clearTimeout(warn); release(); };
 }
 
 /** Run `fn` holding the lock. */
-async function withLargeDocument(fn) {
+async function withLargeDocument(fn, ref) {
   if (holder.getStore()) return fn();
-  const release = await acquire();
+  const release = await acquire(ref);
   try { return await holder.run(true, fn); } finally { release(); }
 }
 
@@ -74,7 +97,7 @@ const detached = (fn) => holder.exit(fn);
 const isLarge = (size) => !(Number.isFinite(size) && size >= 0 && size <= LARGE_BYTES);
 
 /** `fn` under the lock when `size` says the document is large or does not say; else as it is. */
-const ifLarge = (size, fn) => (isLarge(size) ? withLargeDocument(fn) : fn());
+const ifLarge = (size, fn, ref) => (isLarge(size) ? withLargeDocument(fn, ref) : fn());
 
 const held = () => !!holder.getStore();
 
@@ -85,15 +108,15 @@ const held = () => !!holder.getStore();
  * before any of the body is read, when the length is over 25 MiB or missing. `read(beforeBody)` returns the
  * bytes; `use(bytes)` runs while the lock is still held.
  */
-async function readThenUse(listedSize, read, use) {
-  if (isLarge(listedSize) || held()) return ifLarge(listedSize, async () => use(await read(undefined)));
+async function readThenUse(listedSize, read, use, ref) {
+  if (isLarge(listedSize) || held()) return ifLarge(listedSize, async () => use(await read(undefined)), ref);
   let release = null;
   try {
     const bytes = await read(async (contentLength) => {
-      if (isLarge(contentLength)) release = await acquire();
+      if (isLarge(contentLength)) release = await acquire(ref);
     });
     return await (release ? holding(() => use(bytes)) : use(bytes));
   } finally { if (release) release(); }
 }
 
-module.exports = { withLargeDocument, ifLarge, isLarge, held, acquire, holding, detached, readThenUse, LARGE_BYTES, ACQUIRE_WAIT_MS, HOLD_WARN_MS };
+module.exports = { counters, refHash, withLargeDocument, ifLarge, isLarge, held, acquire, holding, detached, readThenUse, LARGE_BYTES, ACQUIRE_WAIT_MS, HOLD_WARN_MS };

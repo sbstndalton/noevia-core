@@ -175,3 +175,40 @@ test('#1872: bytes much smaller than the declared size are copied out of the ove
   assert.equal(most.length, 29 * MiB);
   assert.equal(most.buffer.byteLength, 30 * MiB);
 });
+
+// #1878: a wait and a deferral each leave one content-free line (hash, counts), never a name or text.
+test('#1878: an acquire that had to wait logs one line with the wait and a hash, and no name', async () => {
+  const lines = [];
+  const orig = console.log; console.log = (...a) => lines.push(a.join(' '));
+  try {
+    const first = await lock.acquire('synthetic-doc-id-1');
+    const second = lock.acquire('QA-SYNTH-secret-name.pdf');
+    await sleep(40);
+    first();
+    (await second)();
+  } finally { console.log = orig; }
+  const mine = lines.filter((l) => l.includes('[large-document-lock]'));
+  assert.equal(mine.length, 1, 'only the waiting acquire logs');
+  assert.match(mine[0], /doc=[0-9a-f]{8} waitedMs=\d+/);
+  assert.ok(Number(/waitedMs=(\d+)/.exec(mine[0])[1]) >= 30);
+  assert.doesNotMatch(mine[0], /QA-SYNTH|synthetic-doc|\.pdf/);
+});
+
+test('#1878: an acquire that finds the lock free logs nothing', async () => {
+  const lines = [];
+  const orig = console.log; console.log = (...a) => lines.push(a.join(' '));
+  try { (await lock.acquire('x'))(); } finally { console.log = orig; }
+  assert.deepEqual(lines, []);
+});
+
+test('#1878: giving up on the wait logs the busy outcome with a hash only', () => withEnv({ LARGE_DOCUMENT_ACQUIRE_WAIT_MS: '40' }, async () => {
+  const lines = [];
+  const orig = console.warn; console.warn = (...a) => lines.push(a.join(' '));
+  const holderRelease = await lock.acquire('holder');
+  try {
+    await assert.rejects(lock.acquire('QA-SYNTH-secret-name.pdf'), { code: 'large-document-busy' });
+  } finally { console.warn = orig; holderRelease(); }
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /outcome=busy/);
+  assert.doesNotMatch(lines[0], /QA-SYNTH|\.pdf/);
+}));
