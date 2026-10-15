@@ -39,8 +39,9 @@ async function providerFailureText(response, chatgptProvider, partial = false) {
 // #815/#1703/#1735: a turn is off-box when its request leaves this box: an external provider, a cloud route,
 // or any provider other than the local default one. One rule for every site that filters what may leave.
 const chatTitleLib = require('./chat-title.cjs');
+// #1840: a chat role on one of the owner's Inference machines (chat-machines.cjs, LAN/Tailscale only) stays on this network.
 function offBoxTurn({ externalProvider, routeTarget, provider, DEFAULT_PROVIDER_ID }) {
-  return !!(externalProvider || routeTarget?.route === 'cloud' || provider?.id !== DEFAULT_PROVIDER_ID);
+  return !!(externalProvider || routeTarget?.route === 'cloud' || (provider?.id !== DEFAULT_PROVIDER_ID && !provider?.machine));
 }
 
 /**
@@ -247,7 +248,7 @@ async function* withIdleLimit(iterable, ms, onIdle = null) {
 }
 
 function createChatHandler({
-  stepSupervision = null, fs, path, crypto, fetch, codeTasksFor = () => [], reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, diaryStorageRetry = (send) => send(true), autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, toolGate = null, chatFramingEnabled = () => false, freeChats = () => [], framingReasoner = null, reasoningTraces = null, brainContext = null, DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse, chatListHolder = () => undefined,
+  stepSupervision = null, chatMachines = null, fs, path, crypto, fetch, codeTasksFor = () => [], reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult, HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP, authService, toolPolicy, modelManager, requestScope, currentWorkspace, json, getProject, getProvider, providerHeaders, saveChats, endpointApproved, diaryHeaders, diaryStorageRetry = (send) => send(true), autoRoles, lastLoadedModel, classifyFastOrSmart, servedCatalogue, modelsInstalled, missingRoles, staleRolesError, visionProbe, visionDescriptions, skillsIndexFor, chatSkillRouter, chatToolRouter, toolGate = null, chatFramingEnabled = () => false, freeChats = () => [], framingReasoner = null, reasoningTraces = null, brainContext = null, DEFAULT_TOOLBOXES, CONNECTOR_BOXES, connectedBoxes, allToolboxes, resolveTools, isWriteTool, executeToolCall, oauthServerIds, accountReady, chatWideApproved, awaitApproval, recordUsage, recordToolUse, chatListHolder = () => undefined,
   // #1550: per request, whether a box Automatic may add is usable by this account (its Nextcloud connection, for one).
   automaticToolsReady = () => () => true,
   chatgptOAuth = null, chatgptEnabled = () => false, skillHistory = null,
@@ -727,8 +728,9 @@ function createChatHandler({
     // description is now asked for without thinking and with a smaller budget, and a miss is said to the user.
     const VISION_STAGE_TIMEOUT_MS = visionStageTimeoutMs;
     const VISION_DESCRIBE_MAX_TOKENS = 1536;
-    let describeFailure = null; // 'timeout' | 'failed' once a describe attempt did not produce text
-    const describeImages = async (visionModel, baseUrl, headers, question) => {
+    let describeFailure = null; // 'timeout' | 'failed' | 'unreachable' (#1840) once a describe attempt did not produce text
+    let describeUnreachable = '';
+    const describeImages = async (visionModel, baseUrl, headers, question, onMachine = null) => {
       const key = crypto.createHash('sha256').update(JSON.stringify([currentWorkspace().userId, baseUrl, visionModel, project.id, headers, attachedImages, question])).digest('hex');
       const cached = visionDescriptions.get(key);
       if (cached && cached.until > Date.now()) return cached.text;
@@ -736,7 +738,11 @@ function createChatHandler({
       const stageSignal = AbortSignal.any([chatSignal.signal, stageTimeout]);
       // #697: the vision model is admitted to the shared engine (one model, memory budget) first;
       // a refusal falls back to handing the images to the answering model, as a failure does.
-      if (typeof modelManager.makeRoomFor === 'function') {
+      // #1840: a Vision role on an Inference machine loads nothing here; it must answer its health check instead.
+      if (onMachine) {
+        const ready = await chatMachines.ready(onMachine);
+        if (!ready.ok) { describeFailure = 'unreachable'; describeUnreachable = ready.error; return null; }
+      } else if (typeof modelManager.makeRoomFor === 'function') {
         try { await modelManager.makeRoomFor(visionModel, undefined, stageSignal); }
         catch (err) {
           describeFailure = stageTimeout.aborted ? 'timeout' : 'failed';
@@ -752,7 +758,7 @@ function createChatHandler({
         `The question that will be asked is: ${question.slice(0, 500)}`,
       ].join(' ');
       try {
-        const r = await fetch(url, {
+        const r = await (onMachine ? chatMachines.fetch : fetch)(url, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...headers },
           body: JSON.stringify({
@@ -781,7 +787,8 @@ function createChatHandler({
         }
         return text;
       } catch (err) {
-        describeFailure = stageTimeout.aborted ? 'timeout' : 'failed';
+        describeFailure = stageTimeout.aborted ? 'timeout' : onMachine ? 'unreachable' : 'failed';
+        if (onMachine && !stageTimeout.aborted) describeUnreachable = chatMachines.connectError(onMachine, err);
         console.warn(`[vision] describe failed: ${stageTimeout.aborted ? `no description within ${VISION_STAGE_TIMEOUT_MS / 1000} s` : String((err && err.message) || err)}`);
         return null;
       }
@@ -981,18 +988,37 @@ function createChatHandler({
       providerFetch = chatgptOAuth.fetchFor(ownerId, { conversation: chatId || spaceId || null });
     }
 
+    // #1816/#1840: whether a creative turn moves to the Creative role. On this machine: only when it costs no model swap.
+    // On an Inference machine: no local swap at all, so only when that machine answers; an unreachable one keeps the
+    // router's pick (Creative is optional, the #1816 fallback). A routed role on a machine has nothing loaded here.
+    const creativeMoveAllowed = async (roles, routed, catalogue) => {
+      const check = require('./auto-roles-check.cjs');
+      const creativeRemote = chatMachines?.target('creative');
+      if (!creativeRemote) {
+        if (!chatMachines?.target(routed)) return check.creativeMoveIsFree(roles, routed, catalogue);
+        const { [routed]: _remote, ...rest } = roles;
+        return check.creativeMoveIsFree(rest, routed, catalogue);
+      }
+      if (roles[routed] === roles.creative && chatMachines.target(routed)?.machine.id === creativeRemote.machine.id) return true;
+      const r = await chatMachines.ready(creativeRemote);
+      if (!r.ok) console.warn(`[machines] the Creative role's machine is not answering; this turn keeps the ${routed} role`);
+      return r.ok;
+    };
     let model = (project && project.model) || null;
     let routedRole = null;
     let routingDecision = null;
     if (wantsAuto) {
-      const roles = autoRoles();
-      if (!roles) {
+      const savedRoles = autoRoles();
+      if (!savedRoles) {
         return json(res, 400, { error: 'Auto routing is not configured yet — pick Fast and Smart models in the model popup first.' });
       }
+      // #1840: a role on an Inference machine names the model that machine serves, and is not checked against this
+      // machine's catalogue. Nothing assigned: both are the saved roles, unchanged.
+      const roles = chatMachines && !routeTarget?.row ? chatMachines.effectiveRoles(savedRoles) : savedRoles;
       const catalogue = await servedCatalogue();
       // #1816: the Creative role is optional polish; a missing Creative preset never fails an Automatic turn. It is left
       // out of the stale check and the router's pick stands.
-      const missing = missingRoles(roles, catalogue);
+      const missing = missingRoles(chatMachines && !routeTarget?.row ? chatMachines.localRoles(savedRoles) : savedRoles, catalogue);
       const creativeGone = missing.some((m) => m.role === 'creative');
       const staleRoles = staleRolesError(missing.filter((m) => m.role !== 'creative'));
       if (staleRoles) return json(res, 409, { error: staleRoles });
@@ -1008,7 +1034,7 @@ function createChatHandler({
       // already loaded, or nothing is. If the router's pick is the loaded one, it stays (with creative sampling). An
       // unreadable loaded state keeps the router's pick too.
       if (!routeTarget?.row && !creativeGone && require('./sampling-presets.cjs').creativeRoute({ routedRole, message, roles })
-        && require('./auto-roles-check.cjs').creativeMoveIsFree(roles, routedRole, catalogue)) routedRole = 'creative';
+        && await creativeMoveAllowed(roles, routedRole, catalogue)) routedRole = 'creative';
       model = routeTarget?.row ? require('./routing-modes.cjs').cloudModel(routeTarget.cloud, routedRole) : roles[routedRole];
       if (routingDecision) routingDecision = { ...routingDecision, effectiveRole: routedRole };
       recordResend(body.resend, { auto: true, role: routedRole, status: routingDecision?.status || null });
@@ -1104,6 +1130,24 @@ function createChatHandler({
       }
       if (wanted.length) rerouteLocalForPrivateTools();
     }
+    // #1840: an Automatic turn whose role runs on an Inference machine is answered there: same request, streaming and
+    // tools, through the on-this-network fetch, with no key and nothing loaded or unloaded on this machine (the provider
+    // is not the default one, so every local-engine step below skips it). A machine that is not answering fails the
+    // turn, said plainly; it never falls back to another model.
+    const machineTarget = wantsAuto && chatMachines && !routeTarget?.row && provider.id === DEFAULT_PROVIDER_ID && routedRole ? chatMachines.target(routedRole) : null;
+    if (machineTarget) {
+      const ready = await chatMachines.ready(machineTarget);
+      if (!ready.ok) {
+        console.warn(`[machines] ${routedRole} role's machine is ${ready.state}; the turn is not sent`);
+        if (earlyStream) { send({ type: 'error', code: 'machineUnreachable', text: ready.error }); res.end(); return; }
+        return json(res, 503, { error: ready.error, code: 'machineUnreachable' });
+      }
+      provider = chatMachines.provider(machineTarget, { contextTokens: await chatMachines.contextTokens(machineTarget, chatSignal.signal) });
+      externalProvider = false;
+      chatgptProvider = false;
+      providerFetch = chatMachines.fetch;
+      model = machineTarget.model;
+    }
     const automaticLocal = !offBoxTurn({ externalProvider, routeTarget, provider, DEFAULT_PROVIDER_ID });
     let automaticAdded = [];
     if (automaticTools && !body.compactOnly) {
@@ -1173,7 +1217,8 @@ function createChatHandler({
     // gate (off, timed out, errored) keep the routed model; the template gate below then says the tools are off.
     if (wantsAuto && !body.compactOnly && !routeTarget?.row && provider.id === DEFAULT_PROVIDER_ID && typeof modelManager?.props === 'function'
       && toolModes.toolsModeOf(project) === 'auto' && toolModes.gateSaysToolNeeded(gate)) {
-      const moved = await toolModes.toolCapableRoute({ model, routedRole, roles: autoRoles(),
+      // #1840: only roles this machine's engine serves are candidates (a role on an Inference machine is not measured here).
+      const moved = await toolModes.toolCapableRoute({ model, routedRole, roles: chatMachines ? chatMachines.localRoles(autoRoles()) : autoRoles(),
         allowsTools: (m) => templateToolsGate.allowsTools(modelManager, m, chatSignal.signal) });
       if (moved.rerouted) {
         console.log(`[tools] ${model} cannot take tools; this Automatic turn needs a tool and goes to ${moved.role} (${moved.model})`);
@@ -1216,7 +1261,7 @@ function createChatHandler({
     // template switch the describe call uses (enable_thinking: false; gemma-4 and Qwen3/3.5 templates read it, others
     // ignore it). An explicit project effort, Smart, Code and explicit picks keep their thinking.
     const fastThinkingOff = reasoningEffort.fastRouteThinkingOff({ auto: wantsAuto, routedRole, projectEffort: project?.reasoningEffort })
-      && provider.id === DEFAULT_PROVIDER_ID && typeof reasoningEffort.localEngine === 'function' && reasoningEffort.localEngine(provider);
+      && ((provider.id === DEFAULT_PROVIDER_ID && typeof reasoningEffort.localEngine === 'function' && reasoningEffort.localEngine(provider)) || !!provider.machine);
     const thinkingOffFields = fastThinkingOff ? { chat_template_kwargs: { enable_thinking: false } } : {};
     // Task-aware sampling presets (issue #194): applied only when the operator has not turned
     // the feature off and the project has no explicit sampling override for the key in
@@ -1286,7 +1331,9 @@ function createChatHandler({
     }
     if (attachedImages.length && !body.compactOnly) {
       const roles = autoRoles();
-      const visionModel = roles && roles.vision;
+      // #1840: a Vision role on an Inference machine names the model that machine serves, and describes there.
+      const visionRemote = chatMachines?.target('vision') || null;
+      const visionModel = visionRemote ? visionRemote.model : roles && roles.vision;
       let described = null;
 
       // A configured vision model always does the looking, even when the
@@ -1298,13 +1345,17 @@ function createChatHandler({
       // caption rule). An off-box turn gets no description: the answering model is handed the images itself
       // below, if it can see them (an external provider already had them removed by rule 3).
       const describeProvider = visionModel && !offBoxTurn({ externalProvider, routeTarget, provider, DEFAULT_PROVIDER_ID }) ? getProvider(DEFAULT_PROVIDER_ID) : null;
-      if (describeProvider && describeProvider.id === DEFAULT_PROVIDER_ID && !egress.isExternalProvider(describeProvider)) {
+      if (describeProvider && visionRemote) {
+        const onMachine = chatMachines.provider(visionRemote);
+        described = await describeImages(visionModel, onMachine.baseUrl, providerHeaders(onMachine), message, visionRemote);
+      } else if (describeProvider && describeProvider.id === DEFAULT_PROVIDER_ID && !egress.isExternalProvider(describeProvider)) {
         described = await describeImages(visionModel, describeProvider.baseUrl, providerHeaders(describeProvider), message);
       }
 
       // #1790: a description that did not come is said on the reply, and the wait moves on visibly.
       if (!described && describeFailure && !chatSignal.signal.aborted) {
-        const why = describeFailure === 'timeout' ? `did not finish within ${VISION_STAGE_TIMEOUT_MS / 1000} seconds` : 'could not describe it';
+        const why = describeFailure === 'timeout' ? `did not finish within ${VISION_STAGE_TIMEOUT_MS / 1000} seconds`
+          : describeFailure === 'unreachable' ? `could not describe it: ${describeUnreachable || 'its machine is unreachable'}` : 'could not describe it';
         visionWarning += `${visionWarning ? ' ' : ''}The vision model (${visionModel}) ${why}, so ${model} was given the image directly if it can read images.`;
         send({ type: 'status', id: 'readingImages', text: `The vision model ${why}. Trying ${model} with the image instead…` });
       }
@@ -1316,7 +1367,7 @@ function createChatHandler({
       } else {
         // No vision role, or the description failed. Fall back to handing the
         // images to the answering model directly, if it can read them at all.
-        const vision = await visionProbe(provider.baseUrl, upstreamHeaders, model);
+        const vision = await (provider.machine ? chatMachines.visionProbe : visionProbe)(provider.baseUrl, upstreamHeaders, model);
         // A projector error is a capability result for this configuration; an unreachable
         // engine or timeout is not, so it records nothing.
         if (provider.id === DEFAULT_PROVIDER_ID && modelManager.recordEvidence && (vision.supported || /projector|mmproj/i.test(vision.reason || ''))) {
@@ -1349,26 +1400,29 @@ function createChatHandler({
     // by the Vision role model, else their names, said plainly (multimodal-rag.cjs answerImages).
     if (multimodal && retrievedImages.length) {
       const roles = autoRoles();
-      const visionModel = roles && roles.vision;
+      const captionRemote = chatMachines?.target('vision') || null; // #1840
+      const visionModel = captionRemote ? captionRemote.model : roles && roles.vision;
       const uid = currentWorkspace().userId;
       // #1735: the route is final here. Off the box, nothing derived from an image is sent (names only), and
       // captions are made only by the local default provider, never by the answering one.
       const offBox = offBoxTurn({ externalProvider, routeTarget, provider, DEFAULT_PROVIDER_ID });
-      const captionProvider = offBox ? null : getProvider(DEFAULT_PROVIDER_ID);
+      const captionProvider = offBox ? null : captionRemote ? chatMachines.provider(captionRemote) : getProvider(DEFAULT_PROVIDER_ID);
       const captionImage = (image) => {
-        if (!visionModel || offBox || !captionProvider || captionProvider.id !== DEFAULT_PROVIDER_ID || egress.isExternalProvider(captionProvider)) return null;
+        if (!visionModel || offBox || !captionProvider || (captionProvider.id !== DEFAULT_PROVIDER_ID && !captionRemote) || egress.isExternalProvider(captionProvider)) return null;
         return multimodal.captionOnce(JSON.stringify([uid, project.id, image.hash]), {
           read: () => (typeof rag.readCaption === 'function' ? rag.readCaption(project.id, uid, image.hash) : null),
           write: (caption, by) => { if (typeof rag.writeCaption === 'function') rag.writeCaption(project.id, uid, image.hash, caption, by); },
           generate: async () => {
-            if (typeof modelManager.makeRoomFor === 'function') {
+            if (captionRemote) {
+              if (!(await chatMachines.ready(captionRemote)).ok) { console.warn('[vision] the Vision role\'s machine is not answering; no caption'); return null; }
+            } else if (typeof modelManager.makeRoomFor === 'function') {
               try { await modelManager.makeRoomFor(visionModel, undefined, chatSignal.signal); }
               catch (err) { console.warn(`[vision] ${visionModel} not admitted for a caption: ${String(err?.code || err?.status || 'error')}`); return null; }
             }
             let bytes;
             try { bytes = image.bytes(); } catch { return null; }
             try {
-              const r = await fetch(`${String(captionProvider.baseUrl).replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`, {
+              const r = await (captionRemote ? chatMachines.fetch : fetch)(`${String(captionProvider.baseUrl).replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`, {
                 method: 'POST', headers: { 'Content-Type': 'application/json', ...providerHeaders(captionProvider) }, redirect: 'error',
                 body: JSON.stringify({ model: visionModel, max_tokens: 1024, chat_template_kwargs: { enable_thinking: false }, messages: [{ role: 'user', content: [
                   { type: 'text', text: 'Describe this image in detail, so someone who cannot see it can answer questions about it. Transcribe any text exactly, including numbers, labels and headings. If text is unclear, say so rather than guessing.' },
@@ -1386,7 +1440,7 @@ function createChatHandler({
       };
       const decided = await multimodal.answerImages({
         images: retrievedImages, external: offBox, providerLabel: provider.label || 'an external provider',
-        canSee: async () => (await visionProbe(provider.baseUrl, upstreamHeaders, model)).supported, caption: captionImage, hasVisionRole: !!visionModel, frame: frameUntrusted,
+        canSee: async () => (await (provider.machine ? chatMachines.visionProbe : visionProbe)(provider.baseUrl, upstreamHeaders, model)).supported, caption: captionImage, hasVisionRole: !!visionModel, frame: frameUntrusted,
       });
       if (decided.notes.length) {
         const note = decided.notes.join('\n\n');
@@ -1814,7 +1868,7 @@ function createChatHandler({
       } catch (err) {
         if (chatSignal.signal.aborted) break; // client went away; stop quietly
 
-        send({ type: 'error', text: `${provider.label} unreachable: ${err.message}` });
+        send(provider.machine ? { type: 'error', code: 'machineUnreachable', text: chatMachines.connectError(machineTarget, err) } : { type: 'error', text: `${provider.label} unreachable: ${err.message}` });
         break;
       }
       if (!upstream.ok || !upstream.body) {
@@ -1833,7 +1887,7 @@ function createChatHandler({
       // (same pattern as the client-side reader in src/api.ts).
       let buffer = '';
       try {
-        for await (const chunk of withIdleLimit(upstream.body, provider.id === DEFAULT_PROVIDER_ID ? streamIdleMs : 0, () => roundAbort.abort())) {
+        for await (const chunk of withIdleLimit(upstream.body, provider.id === DEFAULT_PROVIDER_ID || provider.machine ? streamIdleMs : 0, () => roundAbort.abort())) {
           // Leaving the loop cancels the provider stream; checked at most once a second (#272).
           if (loadedSkills.size && Date.now() - skillCheckedAt >= 1000 && revokedSkills()) break;
           buffer += decoder.decode(chunk, { stream: true });
@@ -2300,10 +2354,10 @@ function createChatHandler({
     };
     if (chatTitles && !paused && roundHasContent && roundContent.trim() && titleChatId
       && !body.compactOnly && !(typeof spaceId === 'string' && spaceId.startsWith('diary')) && project?.id !== diaryExtras?.PROJECT_ID
-      && provider.id === DEFAULT_PROVIDER_ID && !offBoxTurn({ externalProvider, routeTarget, provider, DEFAULT_PROVIDER_ID })
-      && titleDue() && titleAttempts.allowed(titleAttemptKey) && !engineBusy()) {
+      && (provider.id === DEFAULT_PROVIDER_ID || provider.machine) && !offBoxTurn({ externalProvider, routeTarget, provider, DEFAULT_PROVIDER_ID })
+      && titleDue() && titleAttempts.allowed(titleAttemptKey) && (provider.machine || !engineBusy())) {
       titleAttempts.record(titleAttemptKey);
-      const title = await chatTitleLib.generateTitle({ fetch, url: upstreamUrl, headers: upstreamHeaders, model, message, reply: roundContent,
+      const title = await chatTitleLib.generateTitle({ fetch: provider.machine ? providerFetch : fetch, url: upstreamUrl, headers: upstreamHeaders, model, message, reply: roundContent,
         signal: chatSignal.signal, readJson: readCappedJson });
       if (chatSignal.signal.aborted) return;
       if (title) {

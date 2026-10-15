@@ -33,7 +33,7 @@ test('default: every service is on this machine and nothing is overridden', () =
   const v = machines.view();
   assert.deepEqual(v.machines.map((m) => m.id), ['local']);
   assert.equal(v.machines[0].builtIn, true);
-  assert.deepEqual(v.machines[0].services, ['chatFast', 'chatSmart', 'chatCode', 'vision', 'decision', 'embedding', 'reranker', 'ocr']);
+  assert.deepEqual(v.machines[0].services, ['chatFast', 'chatSmart', 'chatCode', 'chatCreative', 'vision', 'decision', 'embedding', 'reranker', 'ocr']);
   assert.ok(v.services.every((s) => s.machine === 'local'));
   for (const s of ['decision', 'reranker', 'embedding']) assert.equal(machines.urlFor(s), null);
 });
@@ -180,10 +180,10 @@ test('embeddings move only through the re-index: assign answers the target, the 
   assert.equal(machines.assignmentOf('embedding').machine, 'local');
 });
 
-test('chat roles and vision stay on this machine; OCR is set by the deployment', async () => {
+test('chat roles and vision move only with a model (#1840); OCR is set by the deployment', async () => {
   const { machines } = registry();
   const { machine } = await machines.add({ name: 'Pi 5', address: '192.168.1.50' }, 'admin');
-  for (const service of ['chatFast', 'chatSmart', 'chatCode', 'vision']) assert.throws(() => machines.assign({ service, machine: machine.id, port: 8080 }, 'admin'), (err) => err.code === 'localOnly');
+  for (const service of ['chatFast', 'chatSmart', 'chatCode', 'chatCreative', 'vision']) assert.throws(() => machines.assign({ service, machine: machine.id, port: 8080 }, 'admin'), (err) => err.code === 'invalidModel');
   assert.throws(() => machines.assign({ service: 'ocr', machine: machine.id, port: 8080 }, 'admin'), (err) => err.code === 'setByDeployment');
   assert.throws(() => machines.assign({ service: 'nope', machine: 'local' }, 'admin'), (err) => err.code === 'unknownService');
   assert.throws(() => machines.assign({ service: 'decision', machine: 'm_missing', port: 1 }, 'admin'), (err) => err.status === 404);

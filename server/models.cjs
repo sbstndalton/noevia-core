@@ -20,7 +20,8 @@ const MODEL_READ_TTL_MS = 2000;
  */
 const { isSidecarModel, isSystemModel, modelPathFromArgs } = require('./model-system.cjs');
 
-function createModelService({ fetchJson, env, modelManager, currentWorkspace, listWorkspaces }) {
+// #1840: `roleOnMachine(role)` is true for a chat role served by an Inference machine; it is never warmed here.
+function createModelService({ fetchJson, env, modelManager, currentWorkspace, listWorkspaces, roleOnMachine = () => false }) {
   // One call to the model management service, with its token. Same path the proxy route uses.
   function managerFetch(rest, method = 'GET') {
     return fetchJson(`${env.MODEL_LOADER_URL.replace(/\/+$/, '')}/api/v1/${rest}`,
@@ -160,6 +161,8 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
     void (async () => {
       for (const role of ['fast', 'smart', 'vision', 'code', 'creative']) {
         if (!roles[role]) continue;
+        // #1840: a role on an Inference machine is served there; loading it here would spend this machine's budget.
+        if (roleOnMachine(role)) continue;
         // #1816: one chat model at a time; warming Creative would evict the model the router mostly picks. Only a Creative
         // model that is also the Fast or Smart model is warmed (it is already loaded through that role).
         if (role === 'creative' && roles.creative !== roles.fast && roles.creative !== roles.smart) continue;
