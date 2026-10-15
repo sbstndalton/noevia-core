@@ -384,6 +384,14 @@ async function readBinaryFile(conn, rawPath, opts) {
     await response.body?.cancel();
     throw tooLarge();
   }
+  // #1872: `beforeBody(contentLength)` runs once the headers are in and before any of the body is read
+  // (contentLength is null when the response does not say), so a caller can take a lock that depends on the
+  // real size rather than the listed one. If it throws the body is dropped unread and the error is passed on.
+  if (opts && typeof opts.beforeBody === 'function') {
+    const header = response.headers.get('content-length');
+    const length = header !== null && header !== '' && Number.isSafeInteger(Number(header)) && Number(header) >= 0 ? Number(header) : null;
+    try { await opts.beforeBody(length); } catch (err) { await response.body?.cancel().catch(() => {}); throw err; }
+  }
   if (!response.body) return Buffer.alloc(0);
   const reader = response.body.getReader();
   // #1871: with a declared length the bytes go straight into one buffer of that size, so a large file is
@@ -406,7 +414,13 @@ async function readBinaryFile(conn, rawPath, opts) {
       size += value.byteLength;
     }
   } finally { reader.releaseLock(); }
-  if (into && !chunks.length) return size === into.length ? into : into.subarray(0, size);
+  if (into && !chunks.length) {
+    if (size === into.length) return into;
+    // #1872: far less arrived than was declared: copy the real bytes out so the oversized (shared) buffer
+    // is not kept alive behind a subarray.
+    if (size < into.length / 2) return Buffer.from(into.subarray(0, size));
+    return into.subarray(0, size);
+  }
   return Buffer.concat(into ? [into.subarray(0, Math.min(size, into.length)), ...chunks] : chunks, size);
 }
 
