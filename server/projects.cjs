@@ -245,6 +245,23 @@ function createProjectStore({
     return true;
   }
 
+  // #1785: a title generated after the chat's first reply. Same re-read as setChatFlags; the title is changed only
+  // while the stored one is still derived from the first message (or missing), so a name the person gave wins.
+  function setChatTitle(projectId, chatId, title, firstMessage) {
+    if (typeof title !== 'string' || !title.trim()) return false;
+    const workspace = currentWorkspace();
+    const projectsChanged = workspace.projectsFile ? workspace.projectsFile.refresh(workspace.projects) : false;
+    const freeChanged = workspace.freeChatsFile ? workspace.freeChatsFile.refresh(workspace) : false;
+    if (projectsChanged || freeChanged) onProjectsChanged(workspace.userId);
+    const list = projectId ? getProject(projectId)?.chats : FREE_CHATS;
+    const meta = Array.isArray(list) ? list.find((c) => c && c.id === chatId) : null;
+    const chatTitle = require('./chat-title.cjs');
+    if (!meta || !chatTitle.isDerivedTitle(meta.title, firstMessage)) return false;
+    meta.title = title.trim().slice(0, chatTitle.TITLE_MAX);
+    if (projectId) saveProjects(PROJECTS); else saveFreeChats(FREE_CHATS);
+    return true;
+  }
+
   function saveFreeChats(list) {
     currentWorkspace().freeChats = Array.from(list);
     currentWorkspace().saveFreeChats();
@@ -748,7 +765,7 @@ function createProjectStore({
 
   return {
     refreshDocumentFigures,
-    saveProjects, getProject, sanitizeChats, loadChats, saveChats, chatIdsElsewhere, deleteChat, moveChat, purgeProjectChats, saveFreeChats, deleteFreeChat, setChatFlags, createProject,
+    saveProjects, getProject, sanitizeChats, loadChats, saveChats, chatIdsElsewhere, deleteChat, moveChat, purgeProjectChats, saveFreeChats, deleteFreeChat, setChatFlags, setChatTitle, createProject,
     deleteProject, removeChatAttachments, removeOrphanChatContexts,
     historyPath, readHistory, writeHistory,
     ownsFile, ensureProjectFolder, ensureProjectFolderDetailed, withSourceLock, pruneDocuments, writeProjectTextFile, sweepDeletedProject, indexSource,

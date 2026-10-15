@@ -38,6 +38,7 @@ async function providerFailureText(response, chatgptProvider, partial = false) {
 
 // #815/#1703/#1735: a turn is off-box when its request leaves this box: an external provider, a cloud route,
 // or any provider other than the local default one. One rule for every site that filters what may leave.
+const chatTitleLib = require('./chat-title.cjs');
 function offBoxTurn({ externalProvider, routeTarget, provider, DEFAULT_PROVIDER_ID }) {
   return !!(externalProvider || routeTarget?.route === 'cloud' || provider?.id !== DEFAULT_PROVIDER_ID);
 }
@@ -282,6 +283,9 @@ function createChatHandler({
   sourceJobs = require('./source-jobs.cjs'), sourceWaitMs = 30000,
   // #1574: how long a local reply may go silent after its first output before it is ended (0 = no limit).
   streamIdleMs = 120000,
+  // #1785: { save(projectId|null, chatId, title, firstMessage) } stores a generated title over the derived one only
+  // (projects.cjs setChatTitle). Not wired: no title is generated.
+  chatTitles = null,
   // #1726: multimodal RAG (NOEVIA_MULTIMODAL_RAG). Off: nothing below changes.
   multimodalEnabled = () => require('./multimodal-rag.cjs').enabled(),
   documentDir = (workspace, projectId) => require('./document-sources.cjs').directory(workspace, projectId),
@@ -2207,6 +2211,21 @@ function createChatHandler({
       send({ type: 'delta', text: finalAnswer.fallbackText({ sources: gatheredSources }) });
     } else if (!paused && !roundHasContent && roundReasoning.trim()) {
       send({ type: 'delta', text: '\n\nThe model returned reasoning without a final answer. Try again or choose another model.' });
+    }
+    // #1785: after a chat's first reply, a short title from the local model that just answered. Never on an off-box
+    // turn (offBoxTurn): the message and the reply go nowhere for it. Saved only over the title derived from the first
+    // message; the client adopts it from the `title` event. Bounded and failure-free (chat-title.cjs).
+    if (chatTitles && !paused && roundHasContent && roundContent.trim() && typeof body.chatId === 'string' && body.chatId
+      && !body.compactOnly && !(typeof spaceId === 'string' && spaceId.startsWith('diary')) && project?.id !== diaryExtras?.PROJECT_ID
+      && provider.id === DEFAULT_PROVIDER_ID && !offBoxTurn({ externalProvider, routeTarget, provider, DEFAULT_PROVIDER_ID })
+      && chatTitleLib.firstReply(history)) {
+      const title = await chatTitleLib.generateTitle({ fetch, url: upstreamUrl, headers: upstreamHeaders, model, message, reply: roundContent,
+        signal: chatSignal.signal, readJson: readCappedJson });
+      if (chatSignal.signal.aborted) return;
+      if (title) {
+        send({ type: 'title', chatId: body.chatId, title });
+        try { chatTitles.save(body.projectId && project ? project.id : null, body.chatId, title, message); } catch { /* the client saves it too */ }
+      }
     }
     send({ type: 'telemetry', phase: 'complete', model, timeToFirstToken: exchangeFirstTokenMs === null ? null : exchangeFirstTokenMs / 1000 });
     if (reasonerTrace && reasoningTraces && chatWorkspace?.dir) {
