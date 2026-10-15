@@ -289,6 +289,25 @@ if (embeddingConfig.next()) setTimeout(() => embeddingMigration.kick(), 30000).u
   }
 }
 
+// #1868/#1869: long documents gain their text past the 200,000-character head in the search index, and
+// uploads made with no storage connection get the completion pass, both paced in the background
+// (document-backfill.cjs) and held while a re-index is under way.
+{
+  const documentBackfill = require('./document-backfill.cjs').createDocumentBackfill({
+    rag,
+    userIds: () => authService.db.prepare('SELECT id FROM users').all().map((r) => r.id).filter((id) => !workspaceStore.isRemoved(id)),
+    workspaceFor: (userId) => workspaceStore.get(userId),
+    documentDir: (workspace, projectId) => require('./document-sources.cjs').directory(workspace, projectId),
+    runAs: (userId, fn) => {
+      const user = authService.publicUser(authService.db.prepare('SELECT * FROM users WHERE id=?').get(userId));
+      return requestScope.run({ workspace: workspaceStore.get(userId), authn: { user, legacy: false } }, fn);
+    },
+    completeUpload: (project, file, options) => projectStore.completeUploadedDocument(project, file, options),
+    paused: () => (embeddingConfig.next() ? 'a re-index is under way' : null),
+  });
+  documentBackfill.start(); // unref'd timers: never holds the process open
+}
+
 // User-created projects; the earlier fixed demo spaces were removed.
 // spaces were deleted per user request — projects are user-created only.
 // Each project: goal/description, custom instructions,

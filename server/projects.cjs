@@ -779,8 +779,56 @@ function createProjectStore({
     });
   }
 
+  // #1869: the #1864/#1865 completion pass, once, for a document uploaded with no storage connection (it is
+  // never read again otherwise), from its stored original, within `ocrBudget` (the backfill's, the sync path's
+  // size). Runs in the owner's scope under the project's source lock. Only a record without the completion
+  // marker is worked on; `document.completionSweep` = the version that needs nothing more (finished, or
+  // COMPLETION_TRIES passes spent on it), so it is never looked at again. A record the budget left unfinished
+  // keeps no marker and goes on in the next pass. Returns { status: 'complete' (nothing to do) | 'completed' |
+  // 'deferred' | 'retry' | 'failed' | 'missing' | 'changed' }.
+  const COMPLETION_TRIES = 6;
+  async function completeUploadedDocument(project, file, { ocrBudget } = {}) {
+    return withSourceLock(project, async () => {
+      const workspace = currentWorkspace();
+      const live = () => getProject(project.id) === project && (project.files || []).includes(file) && !!file.document;
+      if (!live() || file.source) return { status: 'changed' };
+      const documents = require('./documents.cjs');
+      const d = file.document;
+      const version = d.version;
+      const recordFile = () => path.join(documentSources.directory(workspace, project.id), `${version}.json`);
+      const readRecord = () => { try { return JSON.parse(fs.readFileSync(recordFile(), 'utf8')); } catch { return null; } };
+      const finished = (r) => !r || r.retryable || r.completion === documents.COMPLETION || !Array.isArray(r.pageTexts) || !r.pageTexts.length;
+      if (finished(readRecord())) { d.completionSweep = version; delete d.completionTries; saveProjects(PROJECTS); return { status: 'complete' }; }
+      if (d.extractor !== documents.EXTRACTOR_VERSION) return { status: 'changed' };
+      const tries = (Number(d.completionTries) || 0) + 1;
+      const read = await require('./large-document-lock.cjs').ifLarge(Number(d.bytes), async () => {
+        let bytes;
+        try { bytes = documentSources.readOriginal(workspace, project.id, file); } catch { return null; }
+        return documentSources.ingest(workspace, project.id, file.name, bytes, file, ocrBudget ? { ocrBudget } : undefined);
+      }, d.byteHash);
+      if (!read) { d.completionSweep = version; delete d.completionTries; saveProjects(PROJECTS); return { status: 'missing' }; }
+      if (!live() || file.document !== d) return { status: 'changed' };
+      const done = finished(readRecord());
+      const marks = done || tries >= COMPLETION_TRIES ? { completionSweep: version } : { completionTries: tries };
+      if (read.document.version !== version || (read.document.state === 'failed' && d.state !== 'failed')) {
+        // Not this record (the extractor changed meanwhile) or a failure: the current text stays.
+        Object.assign(d, marks); if (marks.completionSweep) delete d.completionTries; saveProjects(PROJECTS);
+        return { status: documentSources.retryable(workspace, project.id, read.document.version) ? 'retry' : 'failed', unreachable: documentSources.serviceDown(read.document.error), error: read.document.error };
+      }
+      const keep = {};
+      // The search coverage is not kept: the record changed, so the backfill looks at its tail again.
+      for (const k of ['figureSweep']) if (d[k] !== undefined) keep[k] = d[k];
+      const updated = { ...file, content: read.content, document: { ...read.document, ...keep, ...marks } };
+      const textChanged = String(read.content || '') !== String(file.content || '');
+      project.files = project.files.map((f) => (f === file ? updated : f));
+      if (textChanged) indexSource(project, updated);
+      saveProjects(PROJECTS);
+      return { status: done ? 'completed' : 'deferred' };
+    });
+  }
+
   return {
-    refreshDocumentFigures,
+    refreshDocumentFigures, completeUploadedDocument,
     saveProjects, getProject, sanitizeChats, loadChats, saveChats, chatIdsElsewhere, deleteChat, moveChat, purgeProjectChats, saveFreeChats, deleteFreeChat, setChatFlags, setChatTitle, chatAutoNamed, createProject,
     deleteProject, removeChatAttachments, removeOrphanChatContexts,
     historyPath, readHistory, writeHistory,

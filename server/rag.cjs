@@ -518,11 +518,18 @@ function openIndex(projectId, userId) {
 // next. Callers run this inside a transaction with whatever replaces the file.
 // #1726: `textOnly` leaves the file's image rows (a document's figures, an image source's own vector)
 // alone: re-cutting a file's text is not a change of its images, which the media pass reconciles.
-function dropFileRows(index, fileName, { textOnly = false } = {}) {
-  const which = textOnly ? ` AND ${TEXT_ROW}` : '';
-  slots.dropChunks(index.db, index.db.prepare(`SELECT id FROM chunks WHERE file = ?${which}`).all(fileName).map((r) => r.id));
-  index.db.prepare(`DELETE FROM chunks WHERE file = ?${which}`).run(fileName);
+// #1868: `keepTailOf` (a version) also leaves the file's tail rows cut from that same version: a re-index
+// of unchanged text keeps the pages past the head it already has (appendFileTail), instead of embedding them again.
+function dropFileRows(index, fileName, { textOnly = false, keepTailOf = null } = {}) {
+  let which = textOnly ? ` AND ${TEXT_ROW}` : '';
+  const args = [fileName];
+  if (keepTailOf) { which += ` AND NOT (${TAIL_ROW} AND version IS ?)`; args.push(keepTailOf); }
+  slots.dropChunks(index.db, index.db.prepare(`SELECT id FROM chunks WHERE file = ?${which}`).all(...args).map((r) => r.id));
+  index.db.prepare(`DELETE FROM chunks WHERE file = ?${which}`).run(...args);
 }
+// #1868: a text chunk cut from the page store past the head of a long document (appendFileTail). Its `meta`
+// is {"tail":1,"page":N}; every other text row has no meta.
+const TAIL_ROW = `COALESCE(meta, '') LIKE '{"tail":1,%'`;
 // #1726: a text chunk (every row written before the kind column existed is one).
 const TEXT_ROW = "COALESCE(kind, 'text') = 'text'";
 
@@ -640,7 +647,12 @@ async function indexProjectFileNow(projectId, fileName, text, userId, isCurrent,
     }
     const ins = index.db.prepare('INSERT INTO chunks (file, chunk_no, body, content_hash, version, direct) VALUES (?, ?, ?, ?, ?, 0)');
     const rows = index.db.transaction(() => {
-      dropFileRows(index, fileName, { textOnly: true });
+      // #1868: the tail of this same text stays (a tail chunk is never one of the head's, see appendFileTail;
+      // one that is now is dropped so the head keeps its row). Without tail rows this is exactly as before.
+      dropFileRows(index, fileName, { textOnly: true, keepTailOf: version });
+      const clash = index.db.prepare(`SELECT id FROM chunks WHERE file = ? AND content_hash = ? AND ${TAIL_ROW}`);
+      const clashing = unique.map((body) => clash.get(fileName, hash(body))?.id).filter((id) => id != null);
+      if (clashing.length) { slots.dropChunks(index.db, clashing); for (const id of clashing) index.db.prepare('DELETE FROM chunks WHERE id = ?').run(id); }
       return unique.map((body, i) => { const h = hash(body); return { id: Number(ins.run(fileName, i, body, h, version).lastInsertRowid), file: fileName, body, hash: h }; });
     })();
     let embedded = 0;
@@ -650,6 +662,110 @@ async function indexProjectFileNow(projectId, fileName, text, userId, isCurrent,
       console.warn(`[rag] embedding failed for ${projectId}/${fileName} (${err.message}) — text stored, vectors pending`);
     }
     return { ok: true, stored: rows.length, embedded };
+  } finally {
+    index.db.close();
+  }
+}
+
+// #1868: the pages of a long document past its head. `indexProjectFile` indexes a source's text, which for a
+// document is its first EXTRACT_CAP (200,000) characters; the page store holds up to PROJECT_DOCUMENT_TEXT_LIMIT.
+// This appends the rest, cut by the same chunker (document-backfill.cjs tailChunks), as extra rows of the same
+// file and the same version as its head, at most `limit` chunks embedded per call, so a caller with a budget
+// (the paced backfill) decides how much embedding one document gets at a time. Leftover chunks are appended on
+// a later call; nothing is re-cut or re-embedded that is already there.
+//
+//   tail      [{ body, page }] in document order: chunkText of the full page-store text. A chunk the head
+//             already has (same text) is skipped, so the head rows are never touched.
+//   headText  the source text the head was indexed from. Nothing is appended unless the index holds the head of
+//             exactly this text (and no re-index of the file is waiting), so a tail never joins another version.
+//
+// Rows: chunks with meta {"tail":1,"page":N}, the head's version, no `direct`. Search, the version filter, the
+// #1636 re-index (fillMissing) and delete treat them as any text chunk. Tail rows no longer in `tail` (the record
+// changed) are dropped with their vectors. Runs in the file's queue, after any index run of it.
+// Returns { ok, reason?, embedded, inserted, pending, searchableTo, complete } where `searchableTo` is the last
+// page before the first tail chunk without a vector, and `complete` says every tail chunk has one.
+function appendFileTail(projectId, fileName, headText, tail, userId, { limit = 16, signal } = {}) {
+  const key = fileKey(projectId, fileName, userId);
+  const prior = fileQueues.get(key) || null;
+  const generation = fileGenerations.get(key);
+  const run = (prior || Promise.resolve(null)).then(() => appendFileTailNow(projectId, fileName, String(headText), Array.isArray(tail) ? tail : [], userId, {
+    limit, signal, isCurrent: () => fileGenerations.get(key) === generation && (!userId || userActive(userId)) && !signal?.aborted,
+  }));
+  // The queue resolves to the outcome of the last INDEX run, which decides what pruneFileState may forget.
+  const tailP = Promise.all([prior || Promise.resolve(null), run.catch(() => null)]).then(([outcome]) => outcome);
+  fileQueues.set(key, tailP);
+  tailP.then((outcome) => {
+    if (fileQueues.get(key) !== tailP) return;
+    fileQueues.delete(key);
+    if (prior) pruneFileState(key, outcome);
+  });
+  return run;
+}
+
+const pageOf = (body) => { const m = /^\[Page (\d+)\]/.exec(String(body)); return m ? Number(m[1]) : 0; };
+
+async function appendFileTailNow(projectId, fileName, headText, tail, userId, { limit, signal, isCurrent }) {
+  const none = (reason) => ({ ok: false, reason, embedded: 0, inserted: 0, pending: null, searchableTo: null, complete: false });
+  if (!isCurrent()) return none('superseded');
+  if (!indexExists(projectId, userId)) return none('no-index'); // #1776: never creates an index
+  const index = openIndex(projectId, userId);
+  if (!index) return none('rag-unavailable');
+  try {
+    const version = hash(headText);
+    const key = fileKey(projectId, fileName, userId);
+    if (fileVersions.has(key) && fileVersions.get(key) !== version) return none('reindex-pending');
+    const head = index.db.prepare(`SELECT version, COUNT(*) AS n FROM chunks WHERE file = ? AND ${TEXT_ROW} AND NOT ${TAIL_ROW} GROUP BY version`).all(fileName);
+    if (head.length !== 1 || head[0].version !== version || headText.length <= DIRECT_INJECT_MAX) return none('head-not-indexed');
+    if (embeddingOff(index.active)) return none('embedding-off');
+    const headHashes = new Set(index.db.prepare(`SELECT content_hash FROM chunks WHERE file = ? AND ${TEXT_ROW} AND NOT ${TAIL_ROW}`).all(fileName).map((r) => r.content_hash));
+    const wanted = [];
+    const seen = new Set();
+    for (const t of tail) {
+      const body = String(t?.body || '');
+      if (!body) continue;
+      const h = hash(body);
+      if (seen.has(h) || headHashes.has(h)) continue;
+      seen.add(h);
+      wanted.push({ body, hash: h, page: Number.isInteger(t.page) && t.page > 0 ? t.page : pageOf(body) });
+    }
+    const vectored = () => {
+      const slot = slots.findSlot(index.db, index.active);
+      return new Set(slot ? index.db.prepare(`SELECT c.id FROM ${slots.joinSql(slot)} WHERE c.file = ? AND ${TAIL_ROW}`).all(fileName).map((r) => r.id) : []);
+    };
+    const max = Math.max(0, Math.floor(Number(limit) || 0));
+    const rows = index.db.transaction(() => {
+      // Tail rows this record no longer yields (or cut from another version) go, with their vectors.
+      const stale = index.db.prepare(`SELECT id, content_hash, version FROM chunks WHERE file = ? AND ${TAIL_ROW}`).all(fileName)
+        .filter((r) => r.version !== version || !seen.has(r.content_hash)).map((r) => r.id);
+      if (stale.length) { slots.dropChunks(index.db, stale); const del = index.db.prepare('DELETE FROM chunks WHERE id = ?'); for (const id of stale) del.run(id); }
+      const present = new Map(index.db.prepare(`SELECT id, content_hash FROM chunks WHERE file = ? AND ${TAIL_ROW}`).all(fileName).map((r) => [r.content_hash, r.id]));
+      const have = vectored();
+      const out = [];
+      // First the rows already appended whose embedding failed earlier, then new rows, in document order.
+      for (const w of wanted) { if (out.length >= max) break; const id = present.get(w.hash); if (id != null && !have.has(id)) out.push({ id, file: fileName, body: w.body, hash: w.hash }); }
+      let next = (index.db.prepare('SELECT MAX(chunk_no) AS n FROM chunks WHERE file = ?').get(fileName).n ?? -1) + 1;
+      const ins = index.db.prepare('INSERT INTO chunks (file, chunk_no, body, content_hash, version, direct, meta) VALUES (?, ?, ?, ?, ?, 0, ?)');
+      for (const w of wanted) {
+        if (out.length >= max) break;
+        if (present.has(w.hash)) continue;
+        const id = Number(ins.run(fileName, next++, w.body, w.hash, version, JSON.stringify({ tail: 1, page: w.page })).lastInsertRowid);
+        present.set(w.hash, id);
+        out.push({ id, file: fileName, body: w.body, hash: w.hash, fresh: true });
+      }
+      return out;
+    })();
+    const inserted = rows.filter((r) => r.fresh).length;
+    let embedded = 0, error = null;
+    if (rows.length) {
+      try { embedded = await embedRowsInto(index, index.active, rows, { isCurrent, batchSize: 8, signal }); }
+      catch (err) { if (signal?.aborted) throw err; error = String(err?.message || err).slice(0, 200); }
+    }
+    const have = vectored();
+    const ids = new Map(index.db.prepare(`SELECT id, content_hash FROM chunks WHERE file = ? AND ${TAIL_ROW}`).all(fileName).map((r) => [r.content_hash, r.id]));
+    const firstMissing = wanted.find((w) => !have.has(ids.get(w.hash)));
+    const pending = wanted.filter((w) => !have.has(ids.get(w.hash))).length;
+    const searchableTo = firstMissing ? Math.max(0, firstMissing.page - 1) : (wanted.length ? wanted[wanted.length - 1].page : null);
+    return { ok: !error, ...(error ? { reason: 'embed-failed', error } : {}), embedded, inserted, attempted: rows.length, pending, searchableTo, complete: !firstMissing };
   } finally {
     index.db.close();
   }
@@ -1157,4 +1273,4 @@ const trackedFileState = () => ({ queues: fileQueues.size, generations: fileGene
 
 // #1646: the sentence a hybrid cloud route without a grant removes (read_project_file is not offered there).
 const READ_FILE_HINT = ' Use read_project_file with PDF startPage/endPage and offset for pages beyond the summary.';
-module.exports = { ...testSeam, searchProjectWithImages, syncProjectMedia, releaseMediaModel, readCaption, writeCaption, mediaModelFor, embeddingOff, READ_FILE_HINT, servedModels, servedModelsCached, init, trackedFileState, indexProjectFile, deleteProjectFile, searchProject, filesContext, chunkText, ragAvailable, retrievalStatus, embed, embedModel, embeddingIdentity, embeddingConfig: getEmbeddingConfig, onIndexed, listIndexes, indexCoverage, fillMissing, dropIndexSlot, rerankPool, configureRerank, reloadRerank };
+module.exports = { ...testSeam, appendFileTail, searchProjectWithImages, syncProjectMedia, releaseMediaModel, readCaption, writeCaption, mediaModelFor, embeddingOff, READ_FILE_HINT, servedModels, servedModelsCached, init, trackedFileState, indexProjectFile, deleteProjectFile, searchProject, filesContext, chunkText, ragAvailable, retrievalStatus, embed, embedModel, embeddingIdentity, embeddingConfig: getEmbeddingConfig, onIndexed, listIndexes, indexCoverage, fillMissing, dropIndexSlot, rerankPool, configureRerank, reloadRerank };
