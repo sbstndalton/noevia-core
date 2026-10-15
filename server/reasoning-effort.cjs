@@ -25,6 +25,11 @@ function resolveEffort(project, globalDefault) {
 function effortForRoute(effort, routedRole) {
   return routedRole === 'fast' && effort !== 'low' ? 'low' : effort;
 }
+// #1788 reopen: an Automatic turn routed Fast whose effort is the account default (no explicit project effort) runs
+// with thinking off, not only at Low: Low's hint and cap still left ~28 s of thinking on a greeting.
+function fastRouteThinkingOff({ auto, routedRole, projectEffort }) {
+  return auto === true && routedRole === 'fast' && !validEffort(projectEffort);
+}
 function capabilityKey(provider, model) {
   // Credential digest prevents one tenant's rejection from changing another's
   // behavior, without retaining plaintext credentials in capability keys.
@@ -133,4 +138,4 @@ async function requestWithEffort(fetcher, url, options, body, provider, model, e
   return capped;
 }
 
-module.exports = { HINTS, nativeThinking, validEffort, resolveEffort, effortForRoute, modeFor, requestBody, requestWithEffort, forcedAnswerBody };
+module.exports = { HINTS, localEngine, nativeThinking, validEffort, resolveEffort, effortForRoute, fastRouteThinkingOff, modeFor, requestBody, requestWithEffort, forcedAnswerBody };

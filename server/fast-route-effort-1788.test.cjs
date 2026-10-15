@@ -13,10 +13,15 @@ const { createToolExchange } = require('./tool-exchange.cjs');
 const { createVisionProbe } = require('./vision.cjs');
 const reasoningEffort = require('./reasoning-effort.cjs');
 
-const ROLES = { fast: 'synthetic-fast', smart: 'synthetic-smart' };
-const catalogue = [{ name: 'synthetic-fast' }, { name: 'synthetic-smart' }, { name: 'synthetic-manual' }];
+let ROLES = { fast: 'synthetic-fast', smart: 'synthetic-smart' };
+const catalogue = [{ name: 'synthetic-fast' }, { name: 'synthetic-smart' }, { name: 'synthetic-manual' }, { name: 'qwen3.5-9b-synthetic-fast' }];
 
-async function turn(t, { route, project = { routing: 'auto' }, globalEffort = 'high' }) {
+async function turn(t, { route, project = { routing: 'auto' }, globalEffort = 'high', local = true }) {
+  // The default provider is the local llama.cpp engine unless a case says otherwise (reasoning-effort.cjs localEngine).
+  const saved = { kind: process.env.MODEL_MANAGER_KIND, base: process.env.INFERENCE_BASE_URL };
+  if (local) { process.env.MODEL_MANAGER_KIND = 'llamacpp'; process.env.INFERENCE_BASE_URL = 'http://default.invalid'; }
+  else { delete process.env.MODEL_MANAGER_KIND; delete process.env.INFERENCE_BASE_URL; }
+  t.after(() => { for (const [k, v] of [['MODEL_MANAGER_KIND', saved.kind], ['INFERENCE_BASE_URL', saved.base]]) if (v === undefined) delete process.env[k]; else process.env[k] = v; });
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-1788-')); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const events = [], requests = [];
   const res = new EventEmitter(); res.writeHead = () => {}; res.end = () => { res.writableEnded = true; res.emit('finish'); };
@@ -48,12 +53,65 @@ async function turn(t, { route, project = { routing: 'auto' }, globalEffort = 'h
   return { request: requests[0], effort: meta?.reasoningEffort, thinkingCap: meta?.thinkingCap };
 }
 
-test('#1788: an Automatic turn routed Fast runs at Low, not at the High default', async (t) => {
+test('#1788: an Automatic turn routed Fast runs at Low with thinking OFF, not at the High default', async (t) => {
   const { request, effort, thinkingCap } = await turn(t, { route: 'fast' });
   assert.equal(request.model, 'synthetic-fast');
   assert.equal(effort, 'low');
-  assert.equal(thinkingCap, 512);
   assert.equal(request.messages[0].content, reasoningEffort.HINTS.low);
+  // Reopen (b84758dc): Low's 512-token cap still meant ~28-45 s of thinking at 11 tok/s on "hi". Thinking is switched off.
+  assert.deepEqual(request.chat_template_kwargs, { enable_thinking: false }, 'the outgoing request has thinking disabled');
+  assert.equal(thinkingCap, undefined, 'no thinking cap: there is no thinking to cut');
+});
+
+test('#1788 reopen: a Fast turn at the Standard (default) account effort also runs with thinking off', async (t) => {
+  const { request } = await turn(t, { route: 'fast', globalEffort: 'default' });
+  assert.deepEqual(request.chat_template_kwargs, { enable_thinking: false });
+});
+
+test('#1788 reopen: Smart, explicit picks and an explicit project effort keep their thinking (no switch sent)', async (t) => {
+  for (const [label, opts] of [
+    ['smart', { route: 'smart' }],
+    ['manual pick', { route: 'fast', project: { routing: 'manual', model: 'synthetic-manual' } }],
+    ['project high', { route: 'fast', project: { routing: 'auto', reasoningEffort: 'high' }, globalEffort: 'default' }],
+    ['project low', { route: 'fast', project: { routing: 'auto', reasoningEffort: 'low' }, globalEffort: 'high' }],
+    ['project default', { route: 'fast', project: { routing: 'auto', reasoningEffort: 'default' }, globalEffort: 'high' }],
+  ]) {
+    const { request } = await turn(t, opts);
+    assert.equal(request.chat_template_kwargs?.enable_thinking === false, false, `${label}: thinking is not switched off`);
+  }
+});
+
+test('#1788 review: the switch is only sent to the local llama.cpp engine, not to a default provider elsewhere', async (t) => {
+  const { request, effort } = await turn(t, { route: 'fast', local: false });
+  assert.equal(effort, 'low', 'still Low on a Fast route');
+  assert.equal(request.chat_template_kwargs, undefined, 'no template switch for an engine that is not the local one');
+});
+
+test('#1788 reopen: a Qwen3.5 Fast role on the local engine also gets enable_thinking false', async (t) => {
+  const roles = ROLES; ROLES = { fast: 'qwen3.5-9b-synthetic-fast', smart: 'synthetic-smart' };
+  t.after(() => { ROLES = roles; });
+  const { request } = await turn(t, { route: 'fast' });
+  assert.equal(request.model, 'qwen3.5-9b-synthetic-fast');
+  assert.equal(request.chat_template_kwargs?.enable_thinking, false, 'native-thinking path keeps it off as well');
+});
+
+test('#1788 reopen: fastRouteThinkingOff is only Automatic + Fast + no explicit project effort', () => {
+  assert.equal(reasoningEffort.fastRouteThinkingOff({ auto: true, routedRole: 'fast', projectEffort: undefined }), true);
+  assert.equal(reasoningEffort.fastRouteThinkingOff({ auto: true, routedRole: 'fast', projectEffort: 'nonsense' }), true, 'an invalid stored value is not a choice');
+  for (const e of ['low', 'high', 'default']) assert.equal(reasoningEffort.fastRouteThinkingOff({ auto: true, routedRole: 'fast', projectEffort: e }), false);
+  for (const role of ['smart', 'code', null, undefined]) assert.equal(reasoningEffort.fastRouteThinkingOff({ auto: true, routedRole: role }), false);
+  assert.equal(reasoningEffort.fastRouteThinkingOff({ auto: false, routedRole: 'fast' }), false);
+});
+
+test('#1788 reopen: the gemma-4 and Qwen3 templates turn thinking off on enable_thinking false (llama.cpp defaults it on)', () => {
+  const dir = path.join(__dirname, '../tests/fixtures/chat-templates');
+  for (const f of ['google-gemma-4-31B-it.jinja', 'google-gemma-4-31B-it-interleaved.jinja']) {
+    const tpl = fs.readFileSync(path.join(dir, f), 'utf8');
+    assert.match(tpl, /if enable_thinking is defined and enable_thinking -%}\s*\{\{- '<\|think\|>/, `${f}: <|think|> only when enable_thinking is true`);
+    assert.match(tpl, /if not enable_thinking \| default\(false\) -%}\s*\{\{- '<\|channel>thought\\n<channel\|>'/, `${f}: an empty thought channel when it is false`);
+  }
+  const qwen = fs.readFileSync(path.join(dir, 'Qwen-Qwen3-0.6B.jinja'), 'utf8');
+  assert.match(qwen, /enable_thinking is defined and enable_thinking is false %}\s*\{\{- '<think>\\n\\n<\/think>\\n\\n' }}/);
 });
 
 test('#1788: an Automatic turn routed Smart keeps High', async (t) => {

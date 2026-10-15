@@ -262,6 +262,14 @@ function createProjectStore({
     return true;
   }
 
+  // #1785: whether a chat still carries the title derived from its first message (or has no saved meta yet), so a
+  // generated title may still replace it. A chat whose first reply was stopped stays auto-named until a reply completes.
+  function chatAutoNamed(projectId, chatId, firstMessage) {
+    const list = projectId ? getProject(projectId)?.chats : FREE_CHATS;
+    const meta = Array.isArray(list) ? list.find((c) => c && c.id === chatId) : null;
+    return !meta || require('./chat-title.cjs').isDerivedTitle(meta.title, firstMessage);
+  }
+
   function saveFreeChats(list) {
     currentWorkspace().freeChats = Array.from(list);
     currentWorkspace().saveFreeChats();
@@ -765,7 +773,7 @@ function createProjectStore({
 
   return {
     refreshDocumentFigures,
-    saveProjects, getProject, sanitizeChats, loadChats, saveChats, chatIdsElsewhere, deleteChat, moveChat, purgeProjectChats, saveFreeChats, deleteFreeChat, setChatFlags, setChatTitle, createProject,
+    saveProjects, getProject, sanitizeChats, loadChats, saveChats, chatIdsElsewhere, deleteChat, moveChat, purgeProjectChats, saveFreeChats, deleteFreeChat, setChatFlags, setChatTitle, chatAutoNamed, createProject,
     deleteProject, removeChatAttachments, removeOrphanChatContexts,
     historyPath, readHistory, writeHistory,
     ownsFile, ensureProjectFolder, ensureProjectFolderDetailed, withSourceLock, pruneDocuments, writeProjectTextFile, sweepDeletedProject, indexSource,
