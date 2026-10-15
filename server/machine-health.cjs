@@ -52,6 +52,26 @@ function createMachineHealth({ fetchImpl = serviceFetch, decisionFetchImpl = dec
   }
 
   /**
+   * #1851: extra facts about a service (the models it serves, its context) kept beside its health result: the same
+   * cache, TTL, one-in-flight rule and size cap. `load(previous)` resolves the new value and must not throw; it gets
+   * the last known value so a failed read can keep it instead of losing it. Resolves the value (undefined: never known).
+   */
+  function remember(key, load) {
+    const hit = cache.get(key);
+    if (hit?.pending) return hit.pending;
+    if (hit && now() - hit.at < ttlMs) return Promise.resolve(hit.value);
+    const last = hit?.value;
+    const pending = Promise.resolve().then(() => load(last)).catch(() => last).then((value) => {
+      cache.delete(key);
+      cache.set(key, { at: now(), value });
+      while (cache.size > maxEntries) cache.delete(cache.keys().next().value);
+      return value;
+    });
+    cache.set(key, { pending, value: last });
+    return pending;
+  }
+
+  /**
    * @param {{service:string, url:string|null, decision?:boolean}[]} targets
    * @returns {Promise<Record<string, {state:string, reason?:string, checkedAt?:string}>>}
    */
@@ -63,7 +83,7 @@ function createMachineHealth({ fetchImpl = serviceFetch, decisionFetchImpl = dec
     return out;
   }
 
-  return { check, probe, clear: () => cache.clear() };
+  return { check, probe, remember, clear: () => cache.clear() };
 }
 
 /** A machine's state from its services' states: the worst one ('idle' when nothing on it is probed). */

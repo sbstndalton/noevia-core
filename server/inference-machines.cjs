@@ -124,7 +124,7 @@ function readState(store, log) {
       // A chat role without a model it can name stays on this machine.
       if (mode === 'chat' && !cleanModel(a.model)) continue;
       assignments[service] = { machine: a.machine, port: a.port, ...(service === 'reranker' ? { protocol: RERANK_PROTOCOLS.has(a.protocol) ? a.protocol : 'tei' } : {}),
-        ...(mode === 'chat' ? { model: cleanModel(a.model) } : {}) };
+        ...(mode === 'chat' ? { model: cleanModel(a.model) } : {}), ...(mode === 'chat' && a.needsConfirm === true ? { needsConfirm: true } : {}) };
     }
     return { version: 1, machines, assignments };
   } catch (err) {
@@ -142,9 +142,10 @@ function readState(store, log) {
  * @param {() => ({baseUrl?:string|null, model:string, profile:string}|null)} [o.embeddingActive]  the active embedding target
  * @param {() => string|null} [o.localEmbeddingUrl]   where embeddings run on this machine (the deployment's address), or null
  * @param {(service:string) => boolean} [o.workerEnabled]  whether the OCR / Docling worker is switched on by the deployment (its env URL is set)
+ * @param {(address:string, port:number) => Promise<string[]>} [o.modelsAt]  #1851: the models the server at an address serves (/v1/models); used to re-check chat assignments when a machine's address changes
  * @param {(service:string) => void} [o.onChange]     called after a change that moves `service` (or every service on a machine)
  */
-function createInferenceMachines({ store, audit = () => {}, lookup, embeddingActive = () => null, localEmbeddingUrl = () => null, workerEnabled = (service) => !!String(process.env[service === 'ocr' ? 'OCR_BASE_URL' : 'DOCLING_BASE_URL'] || '').trim(), onChange = () => {}, log = (line) => console.warn(line) } = {}) {
+function createInferenceMachines({ store, audit = () => {}, lookup, embeddingActive = () => null, localEmbeddingUrl = () => null, workerEnabled = (service) => !!String(process.env[service === 'ocr' ? 'OCR_BASE_URL' : 'DOCLING_BASE_URL'] || '').trim(), onChange = () => {}, modelsAt = null, log = (line) => console.warn(line) } = {}) {
   let state = readState(store, log);
   const machineById = (id) => state.machines.find((m) => m.id === id) || null;
 
@@ -197,7 +198,7 @@ function createInferenceMachines({ store, audit = () => {}, lookup, embeddingAct
     const service = CHAT_ROLE_SERVICE[role];
     const a = service ? state.assignments[service] : null;
     const m = a ? machineById(a.machine) : null;
-    return m && a.model ? { role, service, machine: { id: m.id, name: m.name, address: m.address }, port: a.port, model: a.model, baseUrl: serviceUrl(m.address, a.port) } : null;
+    return m && a.model ? { role, service, machine: { id: m.id, name: m.name, address: m.address }, port: a.port, model: a.model, baseUrl: serviceUrl(m.address, a.port), ...(a.needsConfirm ? { needsConfirm: true } : {}) } : null;
   }
 
   /** #1665: the wire protocol of a reranker assigned to a machine ('tei' | 'llamacpp'), or null. */
@@ -250,6 +251,17 @@ function createInferenceMachines({ store, audit = () => {}, lookup, embeddingAct
     const address = body.address === undefined ? current.address : normalizeAddress(body.address);
     const moved = address.toLowerCase() !== current.address.toLowerCase();
     const unresolved = moved ? await checkAddress(address) : !!current.unresolved;
+    // #1851: a chat role keeps the model it was saved with, but the server now at the new address may serve another. Ask it
+    // (the on-this-network fetch, bounded) for each chat assignment here; a model it no longer lists marks the assignment
+    // `needsConfirm`. The mark changes nothing by itself: the turn check (chat-machines.cjs ready) already fails a turn
+    // whose model is not served; the mark is what Settings shows ("confirm the model"), and saving the assignment again clears it.
+    const recheck = new Set();
+    if (moved && typeof modelsAt === 'function') {
+      const chatHere = Object.entries(state.assignments).filter(([s, a]) => a.machine === current.id && SERVICES[s]?.mode === 'chat');
+      await Promise.all(chatHere.map(async ([service, a]) => {
+        try { if (!(await modelsAt(address, a.port)).includes(a.model)) recheck.add(service); } catch { /* not answering now: the turn check says so; nothing to confirm yet */ }
+      }));
+    }
     // Re-read after the lookup: another request may have changed the list meanwhile.
     const again = machineById(current.id);
     if (!again) throw fail(404, 'unknownMachine', 'That machine is not on the list.');
@@ -258,8 +270,13 @@ function createInferenceMachines({ store, audit = () => {}, lookup, embeddingAct
     // Embeddings follow their address only through a re-index; a new address under them would orphan it.
     if (moved && embeddingMachine().machine === current.id) throw fail(409, 'embeddingOnMachine', 'Embeddings run on this machine. Move them to another machine first, then change its address.');
     const machine = { id: current.id, name, address, ...(unresolved ? { unresolved: true } : {}) };
-    save({ ...state, machines: state.machines.map((m) => (m.id === current.id ? machine : m)) });
-    audit('machines.update', actor, { id: machine.id, name, address, moved, unresolved });
+    const assignments = { ...state.assignments };
+    for (const service of Object.keys(assignments)) {
+      if (assignments[service].machine !== current.id || SERVICES[service]?.mode !== 'chat') continue;
+      if (moved) { const { needsConfirm: _old, ...rest } = assignments[service]; assignments[service] = recheck.has(service) ? { ...rest, needsConfirm: true } : rest; }
+    }
+    save({ ...state, machines: state.machines.map((m) => (m.id === current.id ? machine : m)), assignments });
+    audit('machines.update', actor, { id: machine.id, name, address, moved, unresolved, ...(recheck.size ? { needsConfirm: [...recheck] } : {}) });
     if (moved) for (const s of Object.keys(state.assignments)) if (state.assignments[s].machine === current.id) onChange(s);
     return { machine, ...view() };
   }

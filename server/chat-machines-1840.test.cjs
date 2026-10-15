@@ -319,3 +319,90 @@ test('#1840 route: lists a machine\'s models, assigns only a served model, admin
   assert.equal((await call('GET', { query: `?models=${machine.id}&port=${fake.port}`, role: 'member' })).status, 403);
   assert.equal((await call('POST', { role: 'member', body: { action: 'assign', service: 'chatFast', machine: 'local' } })).status, 403);
 });
+
+// sbstndalton/noevia#1851: the served model is checked on each turn (through the health cache), /props is cached with
+// it, and an address change re-checks the model.
+test('#1851 the machine now serves another model: the turn fails with machineWrongModel and no request is sent', async (t) => {
+  const served = [REMOTE_MODEL];
+  const fake = await fakeServer(t, { models: served });
+  const { machines } = await machinesWith({ assign: [{ service: 'chatFast', port: fake.port, model: REMOTE_MODEL }] });
+  let now = 0;
+  const cm = createChatMachines({ machines, health: createMachineHealth({ now: () => now }) });
+  const ok = await turn(t, { chatMachines: cm });
+  assert.equal(ok.errors.length, 0);
+  assert.equal(fake.chats().length, 1);
+  served[0] = 'synthetic-other-gguf'; // llama-server restarted with a different GGUF
+  now += 31000; // the cached answer has expired
+  const bad = await turn(t, { chatMachines: cm });
+  assert.equal(bad.replied?.status, 503);
+  assert.equal(bad.replied.body.code, 'machineWrongModel');
+  assert.match(bad.replied.body.error, /^The Fast machine \(Synthetic Pi\) serves synthetic-other-gguf, not synthetic-remote-fast\./);
+  assert.equal(fake.chats().length, 1, 'the second turn was never sent');
+  assert.equal(bad.localRequests.length, 0);
+});
+
+test('#1851 inside the TTL there is one /v1/models and one /props for many turns; after it, one more', async (t) => {
+  const fake = await fakeServer(t);
+  const { machines } = await machinesWith({ assign: [{ service: 'chatFast', port: fake.port, model: REMOTE_MODEL }] });
+  let now = 0;
+  const cm = createChatMachines({ machines, health: createMachineHealth({ now: () => now }) });
+  const count = (prefix) => fake.seen.filter((s) => s.url.startsWith(prefix)).length;
+  for (let i = 0; i < 3; i++) await turn(t, { chatMachines: cm });
+  assert.equal(count('/v1/models'), 1);
+  assert.equal(count('/props'), 1);
+  assert.equal(count('/health'), 1);
+  assert.equal(fake.chats().length, 3);
+  now += 31000;
+  await turn(t, { chatMachines: cm });
+  assert.equal(count('/v1/models'), 2);
+  assert.equal(count('/props'), 2);
+});
+
+test('#1851 /props: the last known context is kept when a later read fails; 8192 only when nothing was ever known', async (t) => {
+  const { machines, machine } = await machinesWith({});
+  let now = 0, propsUp = true, n = 0;
+  const fetchImpl = async (url) => {
+    const u = new URL(url);
+    if (u.pathname === '/health') return new Response('{}', { status: 200 });
+    if (u.pathname === '/v1/models') return new Response(JSON.stringify({ data: [{ id: 'm1' }] }), { status: 200 });
+    if (!propsUp) return new Response('no', { status: 500 });
+    n++;
+    return new Response(JSON.stringify({ default_generation_settings: { n_ctx: 32768 } }), { status: 200 });
+  };
+  const target = (port) => ({ role: 'fast', machine: { id: machine.id, name: 'Synthetic Pi', address: machine.address }, port, model: 'm1', baseUrl: `${machine.address}:${port}` });
+  const cm = createChatMachines({ machines, fetchImpl, health: createMachineHealth({ now: () => now }) });
+  assert.equal(await cm.contextTokens(target(9001)), 32768);
+  assert.equal(await cm.contextTokens(target(9001)), 32768);
+  assert.equal(n, 1, 'cached with the health result');
+  propsUp = false; now += 31000;
+  assert.equal(await cm.contextTokens(target(9001)), 32768, 'last known value reused');
+  assert.equal(await cm.contextTokens(target(9002)), 8192, 'never known: the floor');
+});
+
+test('#1851 changing a machine address marks a chat assignment whose model the new address does not serve', async () => {
+  const lookups = { 'http://10.0.0.5': ['other-model'], 'http://10.0.0.6': ['synthetic-remote-fast', 'x'] };
+  const machines = createInferenceMachines({ store: memoryStore(), log: () => {}, modelsAt: async (address) => lookups[address] });
+  const { machine } = await machines.add({ name: 'Synthetic Pi', address: '10.0.0.4' }, 'admin');
+  machines.assign({ service: 'chatFast', machine: machine.id, port: 8080, model: REMOTE_MODEL }, 'admin');
+  machines.assign({ service: 'chatSmart', machine: machine.id, port: 8081, model: REMOTE_MODEL }, 'admin');
+  await machines.update({ id: machine.id, address: '10.0.0.5' }, 'admin');
+  assert.equal(machines.chatTarget('fast').needsConfirm, true);
+  assert.equal(machines.view().services.find((s) => s.id === 'chatFast').needsConfirm, true);
+  // A rename does not re-check; a move to a server that serves it clears the mark; assigning again clears it too.
+  await machines.update({ id: machine.id, name: 'Renamed Pi' }, 'admin');
+  assert.equal(machines.chatTarget('fast').needsConfirm, true);
+  await machines.update({ id: machine.id, address: '10.0.0.6' }, 'admin');
+  assert.equal(machines.chatTarget('fast').needsConfirm, undefined);
+  await machines.update({ id: machine.id, address: '10.0.0.5' }, 'admin');
+  assert.equal(machines.chatTarget('smart').needsConfirm, true);
+  machines.assign({ service: 'chatSmart', machine: machine.id, port: 8081, model: 'other-model' }, 'admin');
+  assert.equal(machines.chatTarget('smart').needsConfirm, undefined);
+});
+
+test('#1851 an address change to a machine that is not answering marks nothing (the turn check says it is unreachable)', async () => {
+  const machines = createInferenceMachines({ store: memoryStore(), log: () => {}, modelsAt: async () => { throw Error('down'); } });
+  const { machine } = await machines.add({ name: 'Synthetic Pi', address: '10.0.0.4' }, 'admin');
+  machines.assign({ service: 'chatFast', machine: machine.id, port: 8080, model: REMOTE_MODEL }, 'admin');
+  await machines.update({ id: machine.id, address: '10.0.0.5' }, 'admin');
+  assert.equal(machines.chatTarget('fast').needsConfirm, undefined);
+});
