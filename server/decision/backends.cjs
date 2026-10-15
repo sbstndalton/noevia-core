@@ -46,6 +46,38 @@ function llamaRerankBackend({ baseUrl, model = null, apiKey = null, fetchImpl = 
 }
 
 /**
+ * #1665: Hugging Face text-embeddings-inference (TEI) `POST /rerank` with a cross-encoder (the
+ * gte-multilingual-reranker-base int8 sidecar in compose.rerank.yaml). Request `{ query, texts,
+ * truncate, raw_scores }`, answer `[{ index, score }]`, the shape the #1665 eval harness used.
+ * Scores rank only. A partial, duplicated or malformed answer throws, so the caller falls back.
+ */
+function teiRerankBackend({ baseUrl, apiKey = null, fetchImpl = globalThis.fetch, maxDocChars = 4000 }) {
+  const url = `${String(baseUrl).replace(/\/+$/, '').replace(/\/v1$/, '')}/rerank`;
+  return {
+    id: 'tei-rerank', locality: 'local',
+    supports: (kind) => kind === 'rank',
+    async decide(request) {
+      const texts = request.items.map((item) => String(item.label ?? '').slice(0, maxDocChars));
+      const r = await fetchImpl(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}) },
+        body: JSON.stringify({ query: String(request.question), texts, truncate: true, raw_scores: false }),
+      });
+      if (!r.ok) throw Error(`rerank ${r.status}`);
+      const body = await readCappedJson(r, 4 * 1024 * 1024);
+      const rows = Array.isArray(body) ? body : [];
+      const scores = {};
+      for (const row of rows) {
+        const item = Number.isInteger(row?.index) ? request.items[row.index] : undefined;
+        if (item && Number.isFinite(row.score) && !(item.id in scores)) scores[item.id] = row.score;
+      }
+      if (Object.keys(scores).length !== request.items.length) throw Error('rerank returned a partial result');
+      return { selected: order(scores), scores, confidence: null, metadata: { calibrated: false } };
+    },
+  };
+}
+
+/**
  * Option readout on a local llama.cpp server (pinned: llama.cpp b29c606e2; docs/research/system-one
  * doc 13 §13.10–13.11). The prompt lists the permitted options as single-letter labels.
  *
@@ -211,4 +243,4 @@ function llamaLogitBackend({ baseUrl, fetchImpl = globalThis.fetch, nProbs = 50,
 
 const order = (scores) => Object.keys(scores).sort((a, b) => scores[b] - scores[a] || a.localeCompare(b));
 
-module.exports = { embedBackend, llamaRerankBackend, llamaLogitBackend };
+module.exports = { embedBackend, llamaRerankBackend, teiRerankBackend, llamaLogitBackend };

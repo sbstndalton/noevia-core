@@ -40,11 +40,15 @@ function makeRagFetch(extra = {}) {
 function setRagFetch(fn) { const prev = netFetch; netFetch = fn; return prev; }
 // #1762: the test seam (setRagFetch swaps the on-this-network fetch) is only exported under the test runner,
 // so production code cannot reach it (same rule as provider-egress.cjs).
-const testSeam = process.env.NODE_TEST_CONTEXT || process.env.NODE_ENV === 'test' ? { _test: { setRagFetch, makeRagFetch, rerankBackend } } : {};
-// The reranker's backend, built here so a test can drive it without a chat.
-function rerankBackend(baseUrl) {
-  const { llamaRerankBackend } = require('./decision/backends.cjs');
-  return llamaRerankBackend({ baseUrl, fetchImpl: (u, i) => ragFetch(u, { ...i, redirect: 'error' }), model: process.env.RERANK_MODEL || null, apiKey: process.env.RERANK_API_KEY || null /* #697: the inference key never goes to a reranker sidecar */ });
+const testSeam = process.env.NODE_TEST_CONTEXT || process.env.NODE_ENV === 'test' ? { _test: { setRagFetch, makeRagFetch, rerankBackend, rerankState: () => rerank } } : {};
+// The reranker's backend, built here so a test can drive it without a chat. #1665: `backend` is
+// rerank-target.cjs's 'llamacpp' (POST /v1/rerank) or 'tei' (POST /rerank); both go through ragFetch.
+function rerankBackend(baseUrl, backend = 'llamacpp') {
+  const { llamaRerankBackend, teiRerankBackend } = require('./decision/backends.cjs');
+  const fetchImpl = (u, i) => ragFetch(u, { ...i, redirect: 'error' });
+  const apiKey = process.env.RERANK_API_KEY || null; /* #697: the inference key never goes to a reranker sidecar */
+  if (backend === 'tei') return teiRerankBackend({ baseUrl, fetchImpl, apiKey });
+  return llamaRerankBackend({ baseUrl, fetchImpl, model: process.env.RERANK_MODEL || null, apiKey });
 }
 
 // Injected by init() from index.cjs (keeps this module testable standalone).
@@ -114,12 +118,13 @@ function initRerank() {
   if (!target.enabled) { rerank = null; return; }
   const baseUrl = target.baseUrl;
   const { createDecisions } = require('./decision/index.cjs');
+  const backend = rerankBackend(baseUrl, target.backend);
   const decisions = createDecisions({
-    backends: { 'llama-rerank': rerankBackend(baseUrl) },
-    chains: { 'rag.rerank': ['llama-rerank'] },
+    backends: { [backend.id]: backend },
+    chains: { 'rag.rerank': [backend.id] },
     log: (e) => { if (e.failed || e.fellBack) console.warn('[rag] rerank', JSON.stringify(e)); },
   });
-  rerank = { decisions, pool: clampInt(process.env.RAG_RERANK_POOL, 12, TOP_K, RERANK_POOL_MAX), keep: clampInt(process.env.RAG_RERANK_KEEP, 6, 1, RERANK_POOL_MAX), deadlineMs: clampInt(process.env.RAG_RERANK_DEADLINE_MS, 3000, 100, 30000) };
+  rerank = { backend: target.backend, decisions, pool: clampInt(process.env.RAG_RERANK_POOL, 12, TOP_K, RERANK_POOL_MAX), keep: clampInt(process.env.RAG_RERANK_KEEP, 6, 1, RERANK_POOL_MAX), deadlineMs: clampInt(process.env.RAG_RERANK_DEADLINE_MS, 3000, 100, 30000) };
 }
 function clampInt(v, dflt, lo, hi) { const n = parseInt(v, 10); return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : dflt; }
 
