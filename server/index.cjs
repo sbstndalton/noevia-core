@@ -552,7 +552,16 @@ require('./code-tool-schemas.cjs').useExecutorGuard(() => features.enabled('exec
 // model inside that same lock. A client outside this process can still race the router.
 // The same role engine runs the Code pipeline's Planner, review and Auditor (#705).
 const codeRoleLog = (entry) => console.log('[code]', JSON.stringify(entry));
+// #1853: the Code role (or Smart, its fallback) on an Inference machine: every stage of a Code task runs on
+// that machine's model (code-machine.cjs). The role engine, Planner and reviewer call it through chatMachines;
+// the sandbox Executor reaches it only through web's relay on the code network (CODE_ENGINE_RELAY_PORT).
+// Nothing assigned: codeMachineTarget() is null and every endpoint below is exactly what it was.
+const codeMachineTarget = () => require('./code-machine.cjs').codeTargetFrom(chatMachines, autoRoles);
+const codeEngineRelay = require('./code-machine.cjs').startEngineRelayFromEnv(process.env, { chatMachines, target: codeMachineTarget,
+  log: (entry) => console.log('[code-relay]', JSON.stringify(entry)) });
 const codeRoleEndpoint = () => {
+  const remote = codeMachineTarget();
+  if (remote) return { baseUrl: `${remote.baseUrl}/v1`, apiKey: null, model: remote.model, external: false, provider: chatMachines.provider(remote), machine: remote };
   const provider = getProvider(DEFAULT_PROVIDER_ID);
   const base = String(provider?.baseUrl || '').replace(/\/+$/, '');
   return {
@@ -563,7 +572,7 @@ const codeRoleEndpoint = () => {
     provider,
   };
 };
-const codeRoleEngine = require('./role-engine.cjs').createRoleEngine({ fetch: (...args) => globalThis.fetch(...args), log: codeRoleLog, engine: codeRoleEndpoint,
+const codeRoleEngine = require('./role-engine.cjs').createRoleEngine({ fetch: (...args) => globalThis.fetch(...args), log: codeRoleLog, engine: codeRoleEndpoint, machines: chatMachines,
   keep: () => [...require('./model-system.cjs').sidecarModelNames(process.env)],
   admission: typeof modelManager.withAdmission === 'function' ? (work, signal) => modelManager.withAdmission(work, signal) : null,
   // #697: never pin or call a model that would not fit the inference memory budget.
@@ -572,7 +581,7 @@ const codeReview = require('./code-review.cjs').createPlannerReview({
   enabled: () => features.enabled('plannerReview'),
   log: codeRoleLog,
   // #697: both paths admit the model within the inference memory budget before any request.
-  provider: require('./code-review.cjs').createEngineReviewer({ fetch: (...args) => globalThis.fetch(...args), log: codeRoleLog, engine: codeRoleEndpoint, admit: (model, signal) => admitEngineModel(model, signal) }),
+  provider: require('./code-review.cjs').createEngineReviewer({ fetch: (...args) => globalThis.fetch(...args), log: codeRoleLog, engine: codeRoleEndpoint, admit: (model, signal) => admitEngineModel(model, signal), machines: chatMachines }),
   roleEngine: codeRoleEngine,
 });
 // The Code pipeline (#705, code-pipeline.cjs, which holds the task-lifecycle authority): offered as
@@ -582,7 +591,7 @@ const codeReview = require('./code-review.cjs').createPlannerReview({
 const { createCodePipeline } = require('./code-pipeline.cjs');
 const codeVerify = require('./code-pipeline-verify.cjs').createVerifyAdapter(require('./code-verify.cjs').createCodeVerify({ log: codeRoleLog }));
 const codePlanner = require('./planner-plan.cjs').createPlannerPlan({ enabled: () => features.enabled('constrainedPlanDecoding'), engine: codeRoleEndpoint, log: codeRoleLog,
-  admit: (model, signal) => admitEngineModel(model, signal) });
+  admit: (model, signal) => admitEngineModel(model, signal), machines: chatMachines });
 const codeService = require('./code-service.cjs').createCodeService({
   repos: process.env.CODE_REPOS,
   // The egress proxy (D15) is the only way a task reaches the internet, and only to the domains
@@ -595,6 +604,9 @@ const codeService = require('./code-service.cjs').createCodeService({
   // exists because the sandbox may reach the engine by a different name than the web
   // container does — it is on an internal network of its own.
   engine: () => {
+    // #1853: on a machine, the harness is given the relay (its URL now, its per-run token at start).
+    const remote = codeMachineTarget();
+    if (remote) return { baseUrl: codeEngineRelay.url, apiKey: null, model: remote.model, relay: codeEngineRelay.relay };
     const provider = getProvider(DEFAULT_PROVIDER_ID);
     const base = (process.env.CODE_ENGINE_URL || provider?.baseUrl || '').replace(/\/+$/, '');
     return {
@@ -613,16 +625,18 @@ const codeService = require('./code-service.cjs').createCodeService({
   review: codeReview,
   // #1062: the agent reaches the engine from the sandbox, outside the gate; a task holds the gate's
   // inference lease while it runs, and none starts while auto-tune or calibration is active.
+  // #1853: a task whose Code role is on a machine does not use this machine's engine: no lease, no pause.
   inference: typeof modelManager.enterInference === 'function' ? {
-    enter: () => modelManager.enterInference(),
-    paused: () => modelManager.tuningActive?.() === true,
+    enter: () => (codeMachineTarget() ? () => {} : modelManager.enterInference()),
+    paused: () => !codeMachineTarget() && modelManager.tuningActive?.() === true,
   } : null,
   pipeline: {
     enabled: () => features.enabled('codeHarness') && features.enabled('codePipeline'),
     create: ({ jobs, workspaces, harness, askApproval }) => createCodePipeline({ jobs, workspaces, harness, askApproval,
       roleEngine: codeRoleEngine, planner: codePlanner, review: codeReview, verify: codeVerify,
       merge: () => features.enabled('codeMerge'), constrain: () => features.enabled('constrainedPlanDecoding'),
-      engineKey: () => codeRoleEndpoint().apiKey, log: codeRoleLog }),
+      // #1853: this machine's key is what the leak guard refuses, wherever the Code role runs.
+      engineKey: () => getProvider(DEFAULT_PROVIDER_ID)?.apiKey || null, log: codeRoleLog }),
   },
 });
 const codeRoutes = require('./routes/code.cjs').createCodeRoutes({

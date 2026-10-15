@@ -261,7 +261,9 @@ function createCodePipeline({ jobs, workspaces, harness, roleEngine = null, plan
         try {
           await within('implement', limits.implement, (signal) => harness.runExecutor({ ...ctx, signal }, state.handle, {
             prompt: brief, label: String(prompt), connect, model: session.model || model, harness: harnessId, capabilities, domains,
-            sandboxKind, promptPreparation: 'planner', context: '', guarded: settings.guarded }));
+            sandboxKind, promptPreparation: 'planner', context: '', guarded: settings.guarded,
+            // #1853: the machine the task's model was pinned on (null: here); the Executor must run there too.
+            ...(session.machine !== undefined ? { machine: session.machine } : {}) }));
         } catch (error) {
           if (error instanceof Blocked || error instanceof Cancelled) throw error;
           throw new Blocked(`The coding agent stopped: ${String(error?.publicMessage || error?.message || error).slice(0, 300)}`);
