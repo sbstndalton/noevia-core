@@ -18,22 +18,22 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           path: core
-      # The native GET /api/stats source: the noevia-rs#99 merge commit on rs main (carries #98 and the core#93 corpus). Downloaded twice;
+      # The native GET /api/stats source: the noevia-rs#109 merge commit on rs main (carries #98 and the core#120 corpus, #1792). Downloaded twice;
       # byte-identical archive hash.
       - name: Fetch verified native engine statistics source
         run: |
           set -euo pipefail
-          curl -fsSL https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/7dc9bb4ad11be0d446f9f139e26fdbc4616daf43 -o "$RUNNER_TEMP/stats-rs.tgz"
-          echo "f7e833b245af05a97d307b69afce17fa90ccab0447b30acf14999f2e69ba435b  $RUNNER_TEMP/stats-rs.tgz" | sha256sum -c -
+          curl -fsSL https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/2fe1a15b4112e2c0a581745701a4c533cd3e414e -o "$RUNNER_TEMP/stats-rs.tgz"
+          echo "246c1a87cfc0390f09199087431e1be90a029b77e339744b311f57638a910289  $RUNNER_TEMP/stats-rs.tgz" | sha256sum -c -
           mkdir rs
           tar -xzf "$RUNNER_TEMP/stats-rs.tgz" --strip-components=1 -C rs
-      # Merged rs #94 acceptance tooling (#1308/#1320): the core-acceptance adapter verifies this
+      # Merged rs #94 acceptance tooling (#1308/#1320), at the noevia-rs#109 merge commit: the core-acceptance adapter verifies this
       # exact archive and reads its launch templates; not a runtime release pin.
       - name: Fetch verified merged acceptance tooling
         run: |
           set -euo pipefail
-          curl -fsSL https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/7dc9bb4ad11be0d446f9f139e26fdbc4616daf43 -o "$RUNNER_TEMP/accept-rs.tgz"
-          echo "f7e833b245af05a97d307b69afce17fa90ccab0447b30acf14999f2e69ba435b  $RUNNER_TEMP/accept-rs.tgz" | sha256sum -c -
+          curl -fsSL https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/2fe1a15b4112e2c0a581745701a4c533cd3e414e -o "$RUNNER_TEMP/accept-rs.tgz"
+          echo "246c1a87cfc0390f09199087431e1be90a029b77e339744b311f57638a910289  $RUNNER_TEMP/accept-rs.tgz" | sha256sum -c -
           mkdir rs-accept
           tar -xzf "$RUNNER_TEMP/accept-rs.tgz" --strip-components=1 -C rs-accept
           echo "CORE_ACCEPTANCE_RS=$GITHUB_WORKSPACE/rs-accept" >> "$GITHUB_ENV"

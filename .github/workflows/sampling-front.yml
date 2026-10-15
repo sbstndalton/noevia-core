@@ -18,13 +18,13 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           path: core
-      # Merged rs #72 acceptance tooling (#1308), not a runtime release pin.
+      # Merged rs #72 acceptance tooling (#1308) at the noevia-rs#109 merge commit (core#120 corpus, #1792), not a runtime release pin.
       # Independently downloaded twice; byte-identical archive hash.
       - name: Fetch verified native sampling settings acceptance source
         run: |
           set -euo pipefail
-          curl -fsSL https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/7dc9bb4ad11be0d446f9f139e26fdbc4616daf43 -o "$RUNNER_TEMP/sampling-rs.tgz"
-          echo "f7e833b245af05a97d307b69afce17fa90ccab0447b30acf14999f2e69ba435b  $RUNNER_TEMP/sampling-rs.tgz" | sha256sum -c -
+          curl -fsSL https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/2fe1a15b4112e2c0a581745701a4c533cd3e414e -o "$RUNNER_TEMP/sampling-rs.tgz"
+          echo "246c1a87cfc0390f09199087431e1be90a029b77e339744b311f57638a910289  $RUNNER_TEMP/sampling-rs.tgz" | sha256sum -c -
           mkdir rs
           tar -xzf "$RUNNER_TEMP/sampling-rs.tgz" --strip-components=1 -C rs
           echo "CORE_ACCEPTANCE_RS=$GITHUB_WORKSPACE/rs" >> "$GITHUB_ENV"

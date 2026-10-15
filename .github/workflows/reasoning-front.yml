@@ -18,16 +18,17 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           path: core
+      # The noevia-rs#109 merge commit on rs main (core#120 corpus, #1792); archive downloaded twice, byte-identical.
       - name: Fetch immutable merged reasoning acceptance source
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          ref=7dc9bb4ad11be0d446f9f139e26fdbc4616daf43
+          ref=2fe1a15b4112e2c0a581745701a4c533cd3e414e
           status=$(gh api "repos/sbstndalton/noevia-rs/compare/$ref...main" --jq .status)
           case "$status" in identical|ahead) ;; *) echo 'Acceptance source is not on merged main'; exit 1 ;; esac
           curl -fsSL "https://codeload.github.com/sbstndalton/noevia-rs/tar.gz/$ref" -o "$RUNNER_TEMP/reasoning-rs.tgz"
-          echo "f7e833b245af05a97d307b69afce17fa90ccab0447b30acf14999f2e69ba435b  $RUNNER_TEMP/reasoning-rs.tgz" | sha256sum -c -
+          echo "246c1a87cfc0390f09199087431e1be90a029b77e339744b311f57638a910289  $RUNNER_TEMP/reasoning-rs.tgz" | sha256sum -c -
           mkdir rs
           tar -xzf "$RUNNER_TEMP/reasoning-rs.tgz" --strip-components=1 -C rs
           echo "CORE_ACCEPTANCE_RS=$GITHUB_WORKSPACE/rs" >> "$GITHUB_ENV"
