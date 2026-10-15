@@ -124,6 +124,7 @@ const authService = createAuth({
 const inferenceMachines = require('./inference-machines.cjs').createInferenceMachines({ store: require('./features.cjs').settingsStore(authService.db), audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail),
   embeddingActive: () => require('./embedding-config.cjs').current()?.active() || null,
   localEmbeddingUrl: () => require('./embedding-service.cjs').current()?.baseUrl || String(process.env.EMBEDDING_BASE_URL || '').trim() || null,
+  modelsAt: (address, port) => chatMachines.modelsAt(address, port), // #1851 (chatMachines is built just below)
   onChange: (service) => { if (service === 'reranker') rag.reloadRerank(); } });
 // #1638/#1840: one health-probe cache for the Settings page and the chat turns of roles on a machine.
 const machineHealth = require('./machine-health.cjs').createMachineHealth();

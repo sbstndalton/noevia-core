@@ -16,7 +16,9 @@
 //    public address is refused, and a redirect is never followed.
 //  - health is the #1638 probe cache (machine-health.cjs): a role whose machine is not answering fails the
 //    turn with "<Role> model’s machine (<name>) is unreachable" instead of quietly answering with another
-//    model. Only the optional Creative role falls back, as #1816 does for a missing Creative model.
+//    model. A machine that answers but no longer serves the assigned model (a llama-server restarted with another
+//    GGUF ignores `model` and would answer with it) fails the turn too, `machineWrongModel` (#1851): /v1/models and
+//    /props are read beside the health result, in the same ~30 s cache. Only the optional Creative role falls back, as #1816 does for a missing Creative model.
 //
 // With nothing assigned, target() is null for every role and the chat handler does exactly what it did before.
 
@@ -104,29 +106,58 @@ function createChatMachines({ machines, health = null, fetchImpl = defaultServic
     return out;
   }
 
-  const unreachableText = (t, detail) => `${ROLE_LABEL[t.role]} model’s machine (${t.machine.name}) is unreachable${detail ? `: ${detail}` : ''}. Check that it is on and serving ${t.model} on port ${t.port}, or move the ${ROLE_LABEL[t.role]} role back to this machine in Settings → Inference machines.`;
+  /**
+   * #1851: what the machine's server says about itself, kept beside its health result (the shared ~30 s cache):
+   * the models it serves (/v1/models) and the context it runs the model with (/props). A read that fails keeps the
+   * last known value; `models` / `contextTokens` are null only when nothing has ever been read.
+   */
+  async function facts(t) {
+    const load = async (prev) => {
+      const out = { models: prev?.models ?? null, contextTokens: prev?.contextTokens ?? null };
+      await Promise.all([
+        modelsAt(t.machine.address, t.port).then((ids) => { out.models = ids; }, () => {}),
+        propsContext(t).then((n) => { if (n) out.contextTokens = n; }, () => {}),
+      ]);
+      return out;
+    };
+    if (!health || typeof health.remember !== 'function') return load(null);
+    return (await health.remember(`${t.baseUrl}#facts#${t.model}`, load)) || { models: null, contextTokens: null };
+  }
 
-  /** Whether the role's machine answers its health check (the shared, cached probe). */
+  const unreachableText = (t, detail) => `${ROLE_LABEL[t.role]} model’s machine (${t.machine.name}) is unreachable${detail ? `: ${detail}` : ''}. Check that it is on and serving ${t.model} on port ${t.port}, or move the ${ROLE_LABEL[t.role]} role back to this machine in Settings → Inference machines.`;
+  const wrongModelText = (t, served) => `The ${ROLE_LABEL[t.role]} machine (${t.machine.name}) serves ${served.slice(0, 3).join(', ') || 'no model'}${served.length > 3 ? ' and more' : ''}, not ${t.model}. Start ${t.model} on port ${t.port}, or choose the model it serves for the ${ROLE_LABEL[t.role]} role in Settings → Inference machines.`;
+
+  /**
+   * Whether the role's machine can take the turn: it answers its health check AND serves the assigned model (both
+   * through the shared, cached probe, so a busy chat makes no extra request inside the TTL). A server whose models
+   * cannot be read at all is not blamed for the wrong one; the request itself then says what is wrong.
+   * { ok:true } | { ok:false, state, code:'machineUnreachable'|'machineWrongModel', error }
+   */
   async function ready(t) {
     if (!t) return { ok: true };
     if (!health || typeof health.probe !== 'function') return { ok: true };
     let r;
     try { r = await health.probe(t.baseUrl); } catch { r = { state: 'unreachable', reason: 'network' }; }
-    if (r?.state === 'up') return { ok: true };
-    const detail = r?.reason === 'not-on-this-network' ? 'its address is not on this network'
-      : r?.state === 'down' ? `it answered ${String(r.reason || '').replace(/^http-/, 'HTTP ')}`.trim() : r?.reason === 'timeout' ? 'no answer in time' : '';
-    return { ok: false, state: r?.state || 'unreachable', error: unreachableText(t, detail) };
+    if (r?.state !== 'up') {
+      const detail = r?.reason === 'not-on-this-network' ? 'its address is not on this network'
+        : r?.state === 'down' ? `it answered ${String(r.reason || '').replace(/^http-/, 'HTTP ')}`.trim() : r?.reason === 'timeout' ? 'no answer in time' : '';
+      return { ok: false, state: r?.state || 'unreachable', code: 'machineUnreachable', error: unreachableText(t, detail) };
+    }
+    const f = await facts(t);
+    if (Array.isArray(f.models) && !f.models.includes(t.model)) return { ok: false, state: 'wrongModel', code: 'machineWrongModel', error: wrongModelText(t, f.models) };
+    return { ok: true };
   }
 
-  /** The context the machine's server runs the model with (llama-server /props), or the conservative floor. */
-  async function contextTokens(t, signal) {
-    try {
-      const r = await machineFetch(`${t.baseUrl}/props?model=${encodeURIComponent(t.model)}`, { method: 'GET', signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(PROPS_TIMEOUT_MS)]) : AbortSignal.timeout(PROPS_TIMEOUT_MS) });
-      if (!r.ok) { try { await r.body?.cancel?.(); } catch { /* nothing */ } return CONTEXT_FALLBACK; }
-      const body = JSON.parse(await readCapped(r, MODELS_BODY_CAP));
-      const n = Number(body?.default_generation_settings?.n_ctx ?? body?.n_ctx);
-      return Number.isInteger(n) && n >= CONTEXT_MIN && n <= CONTEXT_MAX ? n : CONTEXT_FALLBACK;
-    } catch { return CONTEXT_FALLBACK; }
+  /** The context the machine's server runs the model with (llama-server /props): cached, the last known on failure, else the floor. */
+  async function contextTokens(t) {
+    return (await facts(t)).contextTokens || CONTEXT_FALLBACK;
+  }
+
+  async function propsContext(t) {
+    const r = await machineFetch(`${t.baseUrl}/props?model=${encodeURIComponent(t.model)}`, { method: 'GET', signal: AbortSignal.timeout(PROPS_TIMEOUT_MS) });
+    if (!r.ok) { try { await r.body?.cancel?.(); } catch { /* nothing */ } return null; }
+    const n = Number(JSON.parse(await readCapped(r, MODELS_BODY_CAP))?.default_generation_settings?.n_ctx);
+    return Number.isInteger(n) && n >= CONTEXT_MIN && n <= CONTEXT_MAX ? n : null;
   }
 
   /** The provider row a turn uses for the role on its machine. */
@@ -150,23 +181,28 @@ function createChatMachines({ machines, health = null, fetchImpl = defaultServic
     return unreachableText(t, why);
   }
 
+  /** The models the server at `address`:`port` lists (/v1/models). Throws a status error the Settings route shows. */
+  async function modelsAt(address, port, name = address) {
+    let r;
+    try {
+      r = await machineFetch(`${address}:${port}/v1/models`, { method: 'GET', signal: AbortSignal.timeout(MODELS_TIMEOUT_MS) });
+    } catch (err) {
+      throw fail(502, err?.code === 'EPUBLICADDR' ? 'publicAddress' : 'machineUnreachable',
+        err?.code === 'EPUBLICADDR' ? 'Machines must be on this network (a LAN or Tailscale address).' : `${name} did not answer on port ${port}.`);
+    }
+    if (!r.ok) { try { await r.body?.cancel?.(); } catch { /* nothing */ } throw fail(502, 'machineUnreachable', `${name} answered HTTP ${r.status} on port ${port}; it does not look like an OpenAI-compatible server.`); }
+    let body;
+    try { body = JSON.parse(await readCapped(r, MODELS_BODY_CAP)); } catch { throw fail(502, 'machineUnreachable', `${name} did not list its models on port ${port}.`); }
+    return modelIds(body);
+  }
+
   /** The models a machine's server lists at `port` (its /v1/models), for the Settings picker and the assign check. */
   async function listModels(machineId, port) {
     const m = machines?.machine?.(String(machineId || ''));
     if (!m) throw fail(404, 'unknownMachine', 'That machine is not on the list.');
     const n = typeof port === 'string' && /^\d+$/.test(port.trim()) ? Number(port) : port;
     if (!Number.isInteger(n) || n < 1 || n > 65535) throw fail(400, 'invalidPort', 'Enter the service’s port, a number from 1 to 65535.');
-    let r;
-    try {
-      r = await machineFetch(`${m.address}:${n}/v1/models`, { method: 'GET', signal: AbortSignal.timeout(MODELS_TIMEOUT_MS) });
-    } catch (err) {
-      throw fail(502, err?.code === 'EPUBLICADDR' ? 'publicAddress' : 'machineUnreachable',
-        err?.code === 'EPUBLICADDR' ? 'Machines must be on this network (a LAN or Tailscale address).' : `${m.name} did not answer on port ${n}.`);
-    }
-    if (!r.ok) { try { await r.body?.cancel?.(); } catch { /* nothing */ } throw fail(502, 'machineUnreachable', `${m.name} answered HTTP ${r.status} on port ${n}; it does not look like an OpenAI-compatible server.`); }
-    let body;
-    try { body = JSON.parse(await readCapped(r, MODELS_BODY_CAP)); } catch { throw fail(502, 'machineUnreachable', `${m.name} did not list its models on port ${n}.`); }
-    return modelIds(body);
+    return modelsAt(m.address, n, m.name);
   }
 
   let probe = null;
@@ -179,7 +215,7 @@ function createChatMachines({ machines, health = null, fetchImpl = defaultServic
     return probe(baseUrl, headers, model);
   }
 
-  return { target, remoteRoles, effectiveRoles, localRoles, ready, provider, contextTokens, connectError, listModels, visionProbe, fetch: machineFetch, label: (role) => ROLE_LABEL[role] || role };
+  return { target, remoteRoles, effectiveRoles, localRoles, ready, provider, contextTokens, connectError, listModels, modelsAt, visionProbe, fetch: machineFetch, label: (role) => ROLE_LABEL[role] || role };
 }
 
 module.exports = { createChatMachines, modelIds, ROLE_LABEL, CHAT_ROLES };

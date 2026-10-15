@@ -994,6 +994,9 @@ function createChatHandler({
     const creativeMoveAllowed = async (roles, routed, catalogue) => {
       const check = require('./auto-roles-check.cjs');
       const creativeRemote = chatMachines?.target('creative');
+      // #1816 rule, kept on purpose: with the routed role on a machine and Creative local, the routed role is taken out
+      // of `roles` first, so the engine looks empty to creativeMoveIsFree and the turn may load Creative here. The
+      // routed role's model is not resident on this machine, so that load swaps nothing out.
       if (!creativeRemote) {
         if (!chatMachines?.target(routed)) return check.creativeMoveIsFree(roles, routed, catalogue);
         const { [routed]: _remote, ...rest } = roles;
@@ -1138,9 +1141,10 @@ function createChatHandler({
     if (machineTarget) {
       const ready = await chatMachines.ready(machineTarget);
       if (!ready.ok) {
+        const code = ready.code || 'machineUnreachable'; // #1851: or machineWrongModel
         console.warn(`[machines] ${routedRole} role's machine is ${ready.state}; the turn is not sent`);
-        if (earlyStream) { send({ type: 'error', code: 'machineUnreachable', text: ready.error }); res.end(); return; }
-        return json(res, 503, { error: ready.error, code: 'machineUnreachable' });
+        if (earlyStream) { send({ type: 'error', code, text: ready.error }); res.end(); return; }
+        return json(res, 503, { error: ready.error, code });
       }
       provider = chatMachines.provider(machineTarget, { contextTokens: await chatMachines.contextTokens(machineTarget, chatSignal.signal) });
       externalProvider = false;
