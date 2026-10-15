@@ -231,8 +231,11 @@ function healthShaped(s) {
 // (a short prefix, a dash, 24+ letters and digits), so attaching any file, a PNG included, flagged the turn
 // as "a password or key". Image bytes as a base64 data URI are not a secret either. Both are blanked before
 // the scan; only the path segment form is blanked (the chat id grammar, then "/"), so prose is untouched.
-const CHAT_CONTEXT_SEGMENT_RE = /\bcowork-chat-context-[A-Za-z0-9_-]{1,100}\//g;
-const DATA_URI_RE = /\bdata:[a-z]{1,20}\/[a-z0-9.+-]{1,60};base64,[A-Za-z0-9+/]+={0,2}/gi;
+// The chat id is exactly what core and web mint: c-<Date.now()>-<Math.random().toString(36).slice(2, 8)> (the suffix
+// is at most six characters and can be shorter). Anything else after the prefix is scanned like any text.
+const CHAT_CONTEXT_SEGMENT_RE = /\bcowork-chat-context-c-\d{10,16}-[a-z0-9]{1,8}\//g;
+// Only the image types noevia stores; a data URI of any other type (application/json, text/plain) is scanned.
+const DATA_URI_RE = /\bdata:image\/(?:png|jpeg|webp|gif);base64,[A-Za-z0-9+/]+={0,2}/gi;
 function withoutNoeviaData(s) {
   return s.replace(CHAT_CONTEXT_SEGMENT_RE, 'chat/').replace(DATA_URI_RE, '[image]');
 }
