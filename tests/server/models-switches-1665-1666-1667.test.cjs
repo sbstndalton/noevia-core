@@ -205,11 +205,14 @@ function decisionFixture(env = KEV_ENV) {
   return { store, audits, settings, call };
 }
 
-test('#1666 nothing chosen: the deployment model applies, and GET lists the choosable models', async () => {
+test('#1666 nothing chosen: the deployment model applies, the GET reply keeps its recorded shape, admins get the choices on the row', async () => {
   const f = decisionFixture();
   const got = await f.call('GET');
-  assert.deepEqual(got.body, { url: 'http://kev:11435', timeoutMs: 1500, model: '', source: 'deployment', models: ['laya', 'kev-0.8b'], deploymentModel: 'kev-0.8b' });
+  assert.deepEqual(got.body, { url: 'http://kev:11435', timeoutMs: 1500, source: 'deployment' }, 'unchanged (the HTTP contract corpus)');
   assert.deepEqual([f.settings.backend().model, f.settings.backend().wording], ['kev-0.8b', 'kev']);
+  const row = modelAssignments({ installed: [], env: KEV_ENV, admin: true, decision: f.settings.describe() }).services.find((s) => s.id === 'decision');
+  assert.deepEqual([row.models, row.deploymentModel], [['laya', 'kev-0.8b'], 'kev-0.8b']);
+  assert.equal('models' in modelAssignments({ installed: [], env: KEV_ENV, admin: false }).services.find((s) => s.id === 'decision'), false);
 });
 
 test('#1666 choosing a model is an admin save next to the URL: requests and wording follow it, audited', async () => {
@@ -252,12 +255,12 @@ test('#1666 reset forgets the chosen model with the URL; a saved record from bef
   const f = decisionFixture();
   await f.call('PUT', { url: 'http://kev:11435', timeoutMs: 1500, model: 'laya' });
   const reset = await f.call('DELETE');
-  assert.deepEqual([reset.body.model, reset.body.source], ['', 'deployment']);
+  assert.deepEqual([reset.body.model, reset.body.source], [undefined, 'deployment']);
   assert.equal(f.settings.backend().model, 'kev-0.8b');
   const store = memStore();
   store.set('decision:configuration', JSON.stringify({ url: 'http://kev:11435', timeoutMs: 1200 }));
   const old = createDecisionSettings({ store, env: KEV_ENV });
-  assert.deepEqual([old.get().model, old.backend().model], ['', 'kev-0.8b']);
+  assert.deepEqual([old.get().model, old.backend().model], [undefined, 'kev-0.8b']);
 });
 
 // ── #1667 ───────────────────────────────────────────────────────────────────────────────────────

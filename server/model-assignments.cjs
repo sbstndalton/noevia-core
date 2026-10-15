@@ -90,7 +90,11 @@ function modelAssignments({ installed, env = {}, embedding = null, isSystem = ()
   // preset marked as Laya: that stale entry said laya_multilingual_f16 while every decision went to Kev.
   const { describeDecision } = require('./decision-settings.cjs');
   const d = decision || describeDecision(env);
-  services.push({ id: 'decision', model: d.decision.model, state: d.decision.state, canChange: false, ...(admin ? { source: d.decision.source, ...(d.decision.modelSource ? { modelSource: d.decision.modelSource } : {}) } : {}) });
+  // #1666: admins also get the decision model ids they can choose in Decision service setup and the deployment's own.
+  const { DECISION_MODELS } = require('./decision-settings.cjs');
+  const { profileFor } = require('./decision-models.cjs');
+  services.push({ id: 'decision', model: d.decision.model, state: d.decision.state, canChange: false, ...(admin ? { source: d.decision.source, ...(d.decision.modelSource ? { modelSource: d.decision.modelSource } : {}),
+    models: [...DECISION_MODELS], deploymentModel: profileFor(env.COWORK_DECISION_MODEL).id } : {}) });
   services.push({ id: 'sensitivity', model: d.sensitivity.model, state: d.sensitivity.state, canChange: false, shared: d.sensitivity.shared === true });
 
   services.push({ id: 'ocr', model: null, state: String(env.OCR_BASE_URL || '').trim() ? 'active' : 'off', canChange: false });

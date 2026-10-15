@@ -3,6 +3,8 @@ const {configuration,createDecisionEndpoint}=require('./decision-endpoint.cjs');
 const {checkServiceEndpoint,serviceFetch,decisionServiceFetch}=require('./service-endpoint.cjs');
 const KEY='decision:configuration';
 const {PROFILES,profileFor}=require('./decision-models.cjs');
+/** #1666: the decision model ids an administrator can choose. */
+const DECISION_MODELS=Object.freeze(Object.keys(PROFILES));
 // What the private decision service (services/laya/server.py validate + worker budget) accepts, so
 // callers can shape a request it will not refuse with a 422 (#682). maxChoiceChars approximates the
 // model's option-head token budget (192 tokens minus 32: 160 for question, ids and labels) at under three
@@ -45,13 +47,13 @@ const invalidUrl=()=>Object.assign(Error('Use a private HTTP address such as htt
 function createDecisionSettings({store,env=process.env,fetchImpl=decisionServiceFetch,sensitivityFetchImpl=(fetchImpl===decisionServiceFetch?serviceFetch:fetchImpl),lookup=undefined,audit=()=>{},kinds=SERVICE_KINDS}) {
   let saved;
   try { saved=JSON.parse(store.get(KEY)||'null'); } catch { saved={url:'',timeoutMs:1500}; }
-  // #1666: `model` is the decision model the administrator chose in Settings ('' = automatic: the deployment's
-  // COWORK_DECISION_MODEL when the URL is the deployment's own, Laya otherwise, exactly as before). `models` lists
-  // the ids that can be chosen, `deploymentModel` the id the deployment would send (never an address).
+  // #1666: `model` is the decision model the administrator chose in Settings, present only when one was chosen (absent =
+  // automatic: the deployment's COWORK_DECISION_MODEL when the URL is the deployment's own, Laya otherwise, exactly as
+  // before). The reply is otherwise unchanged (the recorded HTTP contract corpus); the choosable ids are on the admin's
+  // Decision row of /api/models/assignments.
   const get=()=>{
     const base=saved || {url:env.COWORK_DECISION_URL||'',timeoutMs:1500};
-    return {url:base.url,timeoutMs:base.timeoutMs,model:typeof base.model==='string'?base.model:'',source:saved?'admin':'deployment',
-      models:Object.keys(PROFILES),deploymentModel:profileFor(env.COWORK_DECISION_MODEL).id};
+    return {url:base.url,timeoutMs:base.timeoutMs,...(typeof base.model==='string'&&base.model?{model:base.model}:{}),source:saved?'admin':'deployment'};
   };
   function validate(value) {
     if(!value || typeof value.url!=='string' || !Number.isInteger(value.timeoutMs) || value.timeoutMs<100 || value.timeoutMs>2000)
@@ -63,7 +65,7 @@ function createDecisionSettings({store,env=process.env,fetchImpl=decisionService
     const raw=value.model===undefined || value.model===null ? '' : value.model;
     const model=typeof raw==='string' ? raw.trim().toLowerCase() : null;
     if(model===null || (model && !Object.prototype.hasOwnProperty.call(PROFILES,model)))
-      throw Object.assign(Error(`Choose a decision model: ${Object.keys(PROFILES).join(', ')}, or automatic.`),{status:400,messageId:'invalidModel'});
+      throw Object.assign(Error('Choose a decision model from the list, or automatic.'),{status:400,messageId:'invalidModel'});
     return {url:parsed.baseUrl,timeoutMs:value.timeoutMs,...(model?{model}:{})};
   }
   // #1639: the model behind the URL (decision-models.cjs) is the operator's COWORK_DECISION_MODEL, and
@@ -187,4 +189,4 @@ function describeDecision(env=process.env,current=null) {
   }
   return {decision,sensitivity};
 }
-module.exports={createDecisionSettings,describeDecision,serviceOptions,startupWarnings,hostOf,SERVICE_LIMITS};
+module.exports={createDecisionSettings,describeDecision,serviceOptions,startupWarnings,hostOf,SERVICE_LIMITS,DECISION_MODELS};
