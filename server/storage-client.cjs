@@ -359,9 +359,12 @@ async function createFolder(conn, rawPath) {
  *  (a PDF). No extension gate here: the caller decides what it can parse, and
  *  the cap is larger because a document compresses to text far smaller than
  *  its own size. */
+// #1864: `timeoutMs` (default 30 s) bounds the whole read, body included; a caller raising `cap` for a
+// large document raises it with the size.
 async function readBinaryFile(conn, rawPath, opts) {
   const scoped = !!(opts && opts.scope === 'corpus');
   const cap = (opts && opts.cap) || 25 * 1024 * 1024;
+  const timeoutMs = opts && Number.isSafeInteger(opts.timeoutMs) && opts.timeoutMs > 0 ? opts.timeoutMs : 30000;
   const path = safeRelativePath(rawPath);
   if (!path) throw Object.assign(new Error('invalid path'), { status: 400 });
   const s3 = connectionKind(conn) === 's3';
@@ -370,7 +373,7 @@ async function readBinaryFile(conn, rawPath, opts) {
   const response = await withRetry(() => fetch(url, {
     method: 'GET',
     headers: s3 ? signS3Request('GET', url, '', conn.username || '', conn.secret || '', { region: normalizeS3Region(conn.region) }) : davHeaders(conn, {}),
-    signal: AbortSignal.timeout(30000),
+    signal: AbortSignal.timeout(timeoutMs),
     redirect: 'error',
   }));
   if (!response.ok) {

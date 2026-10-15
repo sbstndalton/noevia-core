@@ -26,7 +26,12 @@ function destinationFor(project, name, { connection, remotePath, folderPath } = 
 }
 async function ingest(workspace, project, name, bytes, { connection, source, remotePath, folderPath, progress = () => {}, storageImpl = storage, extractDocx = docx.extract, ifMatch, ifNoneMatch, created } = {}) {
   workspace.assertActive?.();
-  validate(name, bytes);
+  // #1864: a PDF synced from storage (remotePath) is not an upload: its size is bounded by
+  // PROJECT_DOCUMENT_READ_BYTES when it is read, and it is extracted in page ranges. The upload checks
+  // (name, type, content) still run, on its first 25 MB; everything else keeps the upload cap.
+  const syncedPdf = !!remotePath && /\.pdf$/i.test(name) && bytes.length > CAP
+    && bytes.length <= require('./source-limits.cjs').documentLimits().readBytes;
+  validate(name, syncedPdf ? bytes.subarray(0, CAP) : bytes);
   const group = classify(name), mime = bytes.length <= 8 * 1024 * 1024 ? images[path.extname(name).toLowerCase()] : undefined;
   const fullName = destinationFor(project, name, { connection, remotePath, folderPath });
   const previous = (project.files || []).find(f => f.name === fullName);

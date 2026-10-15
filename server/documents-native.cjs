@@ -28,7 +28,9 @@ const QUEUE_WAIT_MS = 30_000;
 const MAX_IMAGE_PIXELS = 64 * 1024 * 1024;
 
 /** The walk itself: native text per page, image-bearing pages flagged for OCR. */
-async function readNativePages(bytes, { pageCap, pageTextCap, totalTextCap }) {
+// #1864: `firstPage` starts the walk there, so a large PDF is read as a series of page ranges, each in
+// its own worker with its own time and memory limits. Without it the walk is what it always was.
+async function readNativePages(bytes, { pageCap, pageTextCap, totalTextCap, firstPage = 1 }) {
   const { getDocumentProxy, getResolvedPDFJS } = require('unpdf');
   let pdf;
   try {
@@ -38,7 +40,8 @@ async function readNativePages(bytes, { pageCap, pageTextCap, totalTextCap }) {
     const markOps = new Set(Object.entries(OPS).filter(([name]) => /^(stroke|fill|eoFill|shadingFill|paint)/.test(name)).map(([, value]) => value));
     const pageTexts = [];
     let remaining = totalTextCap;
-    for (let number = 1; number <= Math.min(pdf.numPages, pageCap); number++) {
+    const first = Number.isSafeInteger(firstPage) && firstPage > 0 ? firstPage : 1;
+    for (let number = first; number <= Math.min(pdf.numPages, first + pageCap - 1); number++) {
       const page = await pdf.getPage(number);
       try {
         const content = await page.getTextContent();

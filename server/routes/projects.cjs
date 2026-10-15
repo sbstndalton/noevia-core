@@ -12,6 +12,16 @@
 const IMAGE_MIME = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
 const IMAGE_UPLOAD_CAP = 8 * 1024 * 1024;
 const DOCUMENT_UPLOAD_CAP = 25 * 1024 * 1024;
+// #1864: a PDF read from storage (an attached folder, or the project's own synced folder) is not refused
+// for its size alone: it is read up to PROJECT_DOCUMENT_READ_BYTES (source-limits.cjs) and extracted in page
+// ranges. The 25 MB cap above stays for uploads, where it bounds an HTTP body the browser sends. Other
+// types keep the storage client's 25 MB read cap. The read timeout grows with the cap (30 s plus a second
+// per MiB), since a quarter-gigabyte file does not arrive in 30 s.
+function documentReadOptions(path) {
+  if (!/\.pdf$/i.test(String(path || ''))) return undefined;
+  const cap = sourceLimits.documentLimits().readBytes;
+  return { cap, timeoutMs: 30000 + Math.ceil(cap / (1024 * 1024)) * 1000 };
+}
 const sourceLimits = require('../source-limits.cjs');
 const sourceText = require('../source-text.cjs');
 // Shared with projects.cjs's createProject and the create/edit dialogs (src/project-limits.ts,
@@ -1041,17 +1051,17 @@ function createProjectRoutes({
             }
             try {
               if (managed || isDocx) {
-                const bytes = await storageClient.readBinaryFile(connection, entry.path);
+                const bytes = await storageClient.readBinaryFile(connection, entry.path, documentReadOptions(entry.path));
                 const file = await require('../uploads.cjs').ingest(currentWorkspace(), project, entry.name, bytes, { source: folder, remotePath: entry.path, progress: requestScope.getStore()?.sourceProgress });
                 fromFolders.push(file);
-                if (file.document && file.document.state !== 'ready') skipped.push({ folder, file: entry.path, reason: documentSources.problem(file), retained: file.document.stale });
+                if (file.document && file.document.state !== 'ready') skipped.push({ folder, file: entry.path, reason: documentSources.problem(file), ...documentSources.problemNotes(file), retained: file.document.stale });
               } else if (isDoc) {
                 // A document is converted to text here, so a PDF in an attached
                 // folder becomes a readable source rather than being skipped.
-                const bytes = await storageClient.readBinaryFile(connection, entry.path);
+                const bytes = await storageClient.readBinaryFile(connection, entry.path, documentReadOptions(entry.path));
                 const file = await documentSources.ingest(currentWorkspace(), id, entry.path, bytes, previous);
                 fromFolders.push({ ...file, source: folder });
-                if (file.document.state !== 'ready') skipped.push({ folder, file: entry.path, reason: documentSources.problem(file), retained: file.document.stale });
+                if (file.document.state !== 'ready') skipped.push({ folder, file: entry.path, reason: documentSources.problem(file), ...documentSources.problemNotes(file), retained: file.document.stale });
               } else {
                 const file = await storageClient.readTextFile(connection, entry.path);
                 fromFolders.push({ name: entry.path, content: file.content, source: folder });
