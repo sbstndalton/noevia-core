@@ -24,7 +24,11 @@
 //              vectors and the endpoint can never disagree. assign() refuses it with the target to re-index to.
 //   chat roles (fast, smart, code) and vision: this machine only for now (chat goes through the
 //              engine's single provider and its memory budget); refused elsewhere (#1840).
-//   ocr        set by the deployment (OCR_BASE_URL), shown read-only (#1841).
+//   sensitivity runtime (#1844): the sensitivity check's own decision service. decision-settings.cjs sensitivityBackend()
+//              reads urlFor('sensitivity') before COWORK_SENSITIVITY_DECISION_URL; unassigned and with no URL of its own it
+//              is shared with 'decision' and follows it. Link-local refused at connect time, and no key of another host.
+//   ocr, documents  runtime (#1841): OCR (OCR_BASE_URL) and Docling (DOCLING_BASE_URL) via document-workers.cjs, the
+//              environment being the fallback; reached through the on-this-network fetch.
 //
 // Persistence: the settings store (key inference:machines), every change audited.
 
@@ -43,9 +47,11 @@ const SERVICES = Object.freeze({
   chatCode: { mode: 'local' },
   vision: { mode: 'local' },
   decision: { mode: 'runtime' },
+  sensitivity: { mode: 'runtime' },
   embedding: { mode: 'reindex' },
   reranker: { mode: 'runtime' },
-  ocr: { mode: 'deployment' },
+  ocr: { mode: 'runtime' },
+  documents: { mode: 'runtime' },
 });
 const SERVICE_IDS = Object.freeze(Object.keys(SERVICES));
 const RERANK_PROTOCOLS = new Set(['tei', 'llamacpp']);

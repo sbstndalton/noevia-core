@@ -97,8 +97,10 @@ function modelAssignments({ installed, env = {}, embedding = null, isSystem = ()
     models: [...DECISION_MODELS], deploymentModel: profileFor(env.COWORK_DECISION_MODEL).id } : {}) });
   services.push({ id: 'sensitivity', model: d.sensitivity.model, state: d.sensitivity.state, canChange: false, shared: d.sensitivity.shared === true });
 
-  services.push({ id: 'ocr', model: null, state: String(env.OCR_BASE_URL || '').trim() ? 'active' : 'off', canChange: false });
-  services.push({ id: 'documents', model: null, state: String(env.DOCLING_BASE_URL || '').trim() ? 'active' : 'off', canChange: false });
+  // #1841: a worker assigned to a machine on Settings → Inference machines counts as set up.
+  const workers = require('./document-workers.cjs');
+  services.push({ id: 'ocr', model: null, state: String(env.OCR_BASE_URL || '').trim() || workers.assigned('ocr') ? 'active' : 'off', canChange: false });
+  services.push({ id: 'documents', model: null, state: String(env.DOCLING_BASE_URL || '').trim() || workers.assigned('documents') ? 'active' : 'off', canChange: false });
 
   return { admin, services };
 }

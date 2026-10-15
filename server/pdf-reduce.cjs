@@ -17,7 +17,11 @@ async function readCappedJson(response,limit=RESPONSE_CAP){
 }
 // The worker's overall reduce budget (REDUCE_DEADLINE_SECONDS in services/ocr/pdf_reduce.py, 160 s)
 // must stay below this 180 s abort, or the worker keeps the single OCR slot after the web gives up (#914).
-async function prepare(name,bytes,{progress=()=>{},url=process.env.OCR_BASE_URL,fetchImpl=fetch}={}){
+async function prepare(name,bytes,options={}){
+ // #1841: the machine OCR is assigned to, else OCR_BASE_URL (document-workers.cjs).
+ const {progress=()=>{}}=options, target=require('./document-workers.cjs').resolve('ocr');
+ const url=options.url===undefined?target.url:options.url;
+ const fetchImpl=options.fetchImpl||(options.url===undefined?target.fetch:fetch);
  if(bytes.length<=OUTPUT_CAP)return {name,bytes};
  if(!/\.pdf$/i.test(name) || bytes.length>INPUT_CAP)throw Object.assign(Error('Files are limited to 25 MB; PDFs up to 60 MB can be reduced automatically.'),{status:413});
  if(!bytes.subarray(0,5).equals(Buffer.from('%PDF-')))throw Object.assign(Error('This file is not a PDF.'),{status:400});
