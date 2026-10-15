@@ -383,4 +383,4 @@ function estimateFootprint(args, { wasmLoader = defaultLoader } = {}) {
 }
 
 module.exports = { isPromptCacheFree, suggest, suggestJs, estimateInputs, estimateInputsJs, estimateFootprint, estimateFootprintJs, AutoconfigImplError,
-  suggestionIsConservative, footprintIsConservative, inputsAreConservative, cacheRamMibOf, kvCacheBytes, parseMemoryLimit, CTX_CANDIDATES, KV_TYPE_BYTES, LLAMA_CACHE_RAM_DEFAULT_MIB };
+  suggestionIsConservative, footprintIsConservative, inputsAreConservative, cacheRamMibOf, kvCacheBytes, parseMemoryLimit, CTX_CANDIDATES, KV_TYPE_BYTES, LLAMA_CACHE_RAM_DEFAULT_MIB, IMAGE_MAX_TOKENS };

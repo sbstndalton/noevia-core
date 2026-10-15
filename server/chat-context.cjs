@@ -1,7 +1,12 @@
 'use strict';
 const fs = require('node:fs'), path = require('node:path'), crypto = require('node:crypto');
 // Deliberately conservative estimate; never present this as tokenizer output.
-const tokens = value => { let images=0;const text=typeof value==='string'?value:JSON.stringify(value??'',(key,item)=>{if(key==='image_url'){images++;return '[image]';}return item;});return Math.ceil(Buffer.byteLength(text,'utf8')/3)+12+images*4096; };
+// #1792: one image costs the engine at most its --image-max-tokens budget (llamacpp-autoconfig.cjs IMAGE_MAX_TOKENS,
+// 1024; gemma caps it lower still), not 4096. At 4096 a single picture took a third of a 12k window, so an
+// image turn at about 7.8k of 12.3k was refused as "still too full after compaction". The bytes (base64) are
+// never counted as text: the replacer swaps each image_url for a placeholder.
+const IMAGE_TOKENS = 1024;
+const tokens = value => { let images=0;const text=typeof value==='string'?value:JSON.stringify(value??'',(key,item)=>{if(key==='image_url'){images++;return '[image]';}return item;});return Math.ceil(Buffer.byteLength(text,'utf8')/3)+12+images*IMAGE_TOKENS; };
 const fingerprint = value => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
 function stateFile(dir, id) { return path.join(dir, 'context-' + fingerprint(String(id)) + '.json'); }
 function read(dir, id) { try { return JSON.parse(fs.readFileSync(stateFile(dir,id),'utf8')); } catch { return {}; } }
@@ -217,9 +222,17 @@ async function prepareUnlocked({dir,id,messages,tools,limit,limitSource,model,fo
  if(force || meter.used>meter.threshold) {
   // Keep two recent exchanges intact; never split a user/assistant exchange.
   let cut=Math.max(0,original.length-4);while(cut>0 && original[cut]?.role!=='user')cut--;
+  const summaryAllowance=Math.min(1800,Math.floor(limit*.2));
+  // #1792: when two exchanges do not fit beside a summary (a small window, a long tool answer, an image), keep
+  // only the latest one, the current turn, and summarise the rest. Before, a short chat on a 12k model had no
+  // older messages to compact at all and every next turn failed as "still too full after compaction".
+  if(!force) {
+   const fits=c=>measure([...system,...original.slice(c)],tools,limit,limitSource,model).used+summaryAllowance<=meter.threshold;
+   let latest=original.length-1;while(latest>0 && original[latest]?.role!=='user')latest--;
+   if(latest>cut && latest>applied.covered && !fits(cut) && fits(latest)) cut=latest;
+  }
   if(cut>applied.covered) {
    const protectedTail=original.slice(cut);
-   const summaryAllowance=Math.min(1800,Math.floor(limit*.2));
    const protectedMeter=measure([...system,...protectedTail],tools,limit,limitSource,model);
    if(protectedMeter.used+summaryAllowance>protectedMeter.threshold) {
     const biggest=biggestPart([...protectedMeter.parts,{name:'Summary allowance',tokens:summaryAllowance}]);
@@ -265,4 +278,4 @@ async function prepare(options){const key=stateFile(options.dir,options.id);if(b
 // R1 measurement, opt-in with CONTEXT_LOG=1; never breaks a chat.
 function logRound({dir,assertActive,...entry}){if(process.env.CONTEXT_LOG!=='1')return;try{const log=require('./context-log.cjs');const record=log.record(entry);assertActive?.();log.append(dir,record);}catch(e){console.warn('[context-log] write failed:',e.message);}}
 function remove(dir,id){fs.rmSync(stateFile(dir,id),{force:true});}
-module.exports={logRound,remove,tokens,read,save,runtimeLimit,resolveRuntimeLimit,recordLoad,expectedLoadSeconds,loadingStatus,HOSTED_DEFAULT_LIMIT,applySummary,measure,prepare,compactContinuation,providerError,CONTEXT_FULL_TEXT,STREAM_FAILED_TEXT,STREAM_FAILED_PARTIAL_TEXT};
+module.exports={IMAGE_TOKENS,logRound,remove,tokens,read,save,runtimeLimit,resolveRuntimeLimit,recordLoad,expectedLoadSeconds,loadingStatus,HOSTED_DEFAULT_LIMIT,applySummary,measure,prepare,compactContinuation,providerError,CONTEXT_FULL_TEXT,STREAM_FAILED_TEXT,STREAM_FAILED_PARTIAL_TEXT};
