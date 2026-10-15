@@ -323,10 +323,10 @@ function textMissing(file) {
   const from = origin.get(file);
   if (!from) return false;
   const full = path.join(projectDir(from.wsDir, from.projectId), `${file.textRef}.txt`);
-  if (cache.has(full)) return false;
   const key = missingKey(from.wsDir, from.projectId, file.textRef);
+  // The file itself is checked even when its text is cached: a cached copy must not hide a deletion.
   try { fs.accessSync(full, fs.constants.R_OK); }
-  catch { unreadable.add(key); return true; }
+  catch { unreadable.add(key); if (cache.has(full)) { cached -= cache.get(full).length; cache.delete(full); } return true; }
   // Readable now; one that failed before (a restore since) is read once to be sure, which clears it.
   if (unreadable.has(key)) { readText(from.wsDir, from.projectId, file.textRef); return unreadable.has(key); }
   return false;
