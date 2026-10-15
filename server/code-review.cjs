@@ -185,19 +185,28 @@ function createPlannerReview({ enabled = () => false, provider = null, roleEngin
  * from the web container's point of view. An external provider is refused: the diff is repository
  * content, and Planner review is for the local model only.
  */
-function createEngineReviewer({ engine, fetch = (...args) => globalThis.fetch(...args), log = () => {}, admit = null }) {
+function createEngineReviewer({ engine, fetch = (...args) => globalThis.fetch(...args), log = () => {}, admit = null, machines = null }) {
   return {
     async review({ instructions, context, schema, correction = null }, { signal } = {}) {
       const endpoint = engine() || {};
       if (endpoint.external === true) throw Error('Planner review runs only on a local model.');
       if (!endpoint.baseUrl) throw Error('No engine is configured.');
+      // #1853: the Code role on an Inference machine: ready() + served model, the on-this-network fetch, no
+      // key, nothing admitted here.
+      const onMachine = !!endpoint.machine;
+      if (onMachine) {
+        if (!machines || typeof machines.fetch !== 'function') throw Error('This server cannot reach the Code role’s machine.');
+        const ready = await machines.ready(endpoint.machine);
+        if (!ready.ok) throw Error(String(ready.error));
+      }
       // #697: admitted to the shared engine (one model, memory budget) before any request.
-      if (admit) await admit(endpoint.model, signal);
+      if (admit && !onMachine) await admit(endpoint.model, signal);
       const messages = [{ role: 'system', content: instructions }, { role: 'user', content: context }];
       // The correction names only the violation (stream-guard.cjs): no meta-prompt, no history.
       if (correction) messages.push({ role: 'user', content: `That answer was not a valid verdict: ${JSON.stringify(correction.violation || {})}. Answer again with only the JSON verdict.` });
       const url = `${String(endpoint.baseUrl).replace(/\/+$/, '')}/chat/completions`;
-      const headers = { 'Content-Type': 'application/json', ...(endpoint.apiKey ? { Authorization: `Bearer ${endpoint.apiKey}` } : {}) };
+      const headers = { 'Content-Type': 'application/json', ...(!onMachine && endpoint.apiKey ? { Authorization: `Bearer ${endpoint.apiKey}` } : {}) };
+      const transport = onMachine ? machines.fetch : fetch;
       // Same rule as the Planner's plan (#517): the schema goes only to a provider that declares
       // jsonSchemaParam; otherwise the prompt and readVerdict() carry it. An engine 400/422/501 retries
       // once without it (the shared helper in plan-constrained-decoding.cjs, text-free log entry).
@@ -205,7 +214,7 @@ function createEngineReviewer({ engine, fetch = (...args) => globalThis.fetch(..
         ? { applied: true, mode: 'json_schema', reason: null, fields: { response_format: { type: 'json_schema', json_schema: { name: 'planner_review', strict: true, schema } } } }
         : { fields: {}, applied: false, mode: null, reason: 'provider_unsupported' };
       const send = async (payload) => {
-        const response = await fetch(url, { method: 'POST', signal, headers, body: JSON.stringify(payload) });
+        const response = await transport(url, { method: 'POST', signal, headers, body: JSON.stringify(payload) });
         if (!response.ok) return { ok: false, status: response.status };
         return { ok: true, status: response.status, body: await readCappedJson(response, 4 * 1024 * 1024) };
       };
