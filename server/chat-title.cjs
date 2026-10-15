@@ -12,6 +12,8 @@
 // offBoxTurn) get no generated title: the message and the reply are never sent anywhere for it. A
 // failure, a timeout or an unusable answer leaves the derived title as it was. Nothing here throws.
 
+const { readCappedJson } = require('./http.cjs');
+
 /** The longest title the client derives from a first message (web src/chat-title.ts CHAT_TITLE_MAX). */
 const CHAT_TITLE_MAX = 80;
 /** The longest generated title kept. */
@@ -104,7 +106,7 @@ async function generateTitle({ fetch, url, headers = {}, model, message, reply, 
         chat_template_kwargs: { enable_thinking: false }, messages: titleMessages(message, reply) }),
     });
     if (!response || !response.ok) return null;
-    const body = typeof readJson === 'function' ? await readJson(response, REPLY_BYTES_CAP) : await response.json();
+    const body = await (typeof readJson === 'function' ? readJson : readCappedJson)(response, REPLY_BYTES_CAP);
     return cleanTitle(body?.choices?.[0]?.message?.content);
   } catch {
     return null;
