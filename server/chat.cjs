@@ -1659,7 +1659,9 @@ function createChatHandler({
         const tools = boxes.find((b) => b.id === id)?.tools;
         return !Array.isArray(tools) || tools.some((tool) => names.has(tool.function?.name));
       });
-      routeNoteText = require('./tool-route-notes.cjs').toolRouteNotes({ message, offered, onServer: boxes.map((b) => b.id), automatic: automaticTools, localModel: automaticLocal });
+      routeNoteText = require('./tool-route-notes.cjs').toolRouteNotes({ message, offered, onServer: boxes.map((b) => b.id), automatic: automaticTools, localModel: automaticLocal,
+        // #1786: the gate ran on these tools and picked none.
+        gateNone: !!gate && gate.decision === 'none' });
       if (routeNoteText) roundMessages = withSystemNote(roundMessages, routeNoteText);
     }
     const requestTools = () => (!templateToolsOff && activeTools.length ? { tools: activeTools } : {});
