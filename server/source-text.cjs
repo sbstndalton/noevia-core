@@ -28,9 +28,11 @@
 // a rerun repeats the same steps from the inline copy still on disk.
 //
 // Rollback: code from before #1806 reads `content` only, so it would see every migrated source as
-// empty (it keeps the textRef fields it does not know). To go back, stop the server and either
+// empty (it keeps the textRef fields it does not know). To go back, stop the Node server AND the Rust
+// front (noevia-server, which writes projects.json under NOEVIA_RUST_PROJECTS), then either
 //   node server/source-text.cjs inline <workspace dir>
-// which writes the text back into projects.json (after its own backup), or restore the newest
+// which reads every text strictly first (a missing or mismatched file aborts before anything is
+// written), takes the projects.json flock, and writes the text back after its own backup; or restore the newest
 // migration-backups/projects-pre-1806-*.json over projects.json (sources added since are lost).
 
 const fs = require('fs');
@@ -58,6 +60,23 @@ function remember(file, text) {
   for (const [k, v] of cache) { if (cached <= CACHE_MAX_CHARS) break; cache.delete(k); cached -= v.length; }
 }
 const warned = new Set();
+// Text files a read failed for, `<dir>|<project>|<ref>`. A source copied from such a read (a spread,
+// documentSources.failed) carries '' with the old textRef; externalize keeps that pointer rather than
+// saving '' over it (#1806 review), so a text that comes back (a restore) is found again.
+const unreadable = new Set();
+const missingKey = (wsDir, projectId, ref) => `${wsDir}|${safeId(projectId)}|${ref}`;
+
+/** The text, read strictly: throws when the file is missing, unreadable or not the text the
+ *  pointer names (the rollback must never write a guess). */
+function readTextStrict(wsDir, projectId, ref) {
+  if (!REF.test(String(ref))) throw Object.assign(new Error(`invalid text pointer ${String(ref).slice(0, 80)}`), { code: 'SOURCE_TEXT_INVALID' });
+  const file = path.join(projectDir(wsDir, projectId), `${ref}.txt`);
+  const text = fs.readFileSync(file, 'utf8');
+  if (refOf(text) !== ref) throw Object.assign(new Error(`${file} does not hold the text its pointer names`), { code: 'SOURCE_TEXT_MISMATCH' });
+  return text;
+}
+
+/** The text for a reader: '' when it cannot be read (logged once, and remembered so a save keeps the pointer). */
 function readText(wsDir, projectId, ref) {
   if (!REF.test(String(ref))) return '';
   const file = path.join(projectDir(wsDir, projectId), `${ref}.txt`);
@@ -66,21 +85,38 @@ function readText(wsDir, projectId, ref) {
   let text;
   try { text = fs.readFileSync(file, 'utf8'); }
   catch (e) {
-    if (!warned.has(file)) { warned.add(file); console.warn(`[sources] text of a source is missing (${e.code || e.message}); it reads as empty`); }
+    unreadable.add(missingKey(wsDir, projectId, ref));
+    if (!warned.has(file)) { warned.add(file); console.warn(`[sources] text of a source is missing (${e.code || e.message}); it reads as empty and its pointer is kept`); }
     return '';
   }
+  unreadable.delete(missingKey(wsDir, projectId, ref));
   remember(file, text);
   return text;
 }
 
+function fsyncPath(p, flags = 'r') {
+  const fd = fs.openSync(p, flags);
+  try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+}
+
+/** Writes the text durably: temp file, fsync, rename, fsync of the folder. A file already there is
+ *  kept only when it is exactly this text (same size, same hash); a zero-length, torn or otherwise
+ *  different file is rewritten. */
 function writeText(wsDir, projectId, ref, text) {
   const dir = projectDir(wsDir, projectId);
   const file = path.join(dir, `${ref}.txt`);
-  if (fs.existsSync(file)) return;
+  const bytes = Buffer.from(text, 'utf8');
+  try {
+    const st = fs.statSync(file);
+    if (st.isFile() && st.size === bytes.length && refOf(fs.readFileSync(file, 'utf8')) === ref) return;
+  } catch { /* absent: written below */ }
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, text, { mode: 0o600 });
+  const fd = fs.openSync(tmp, 'w', 0o600);
+  try { fs.writeSync(fd, bytes); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
   fs.renameSync(tmp, file);
+  fsyncPath(dir);
+  cache.delete(file);
 }
 
 const isAccessor = (f) => { const d = Object.getOwnPropertyDescriptor(f, 'content'); return !!d && typeof d.get === 'function'; };
@@ -143,6 +179,12 @@ function externalize(wsDir, projects) {
       const d = Object.getOwnPropertyDescriptor(f, 'content');
       if (!d || !('value' in d) || typeof d.value !== 'string') continue;
       const text = d.value;
+      if (text === '' && REF.test(String(f.textRef)) && unreadable.has(missingKey(wsDir, p.id, f.textRef))) {
+        // A copy of a source whose text could not be read: keep its pointer, never save '' over it.
+        delete f.content;
+        attachFile(f, wsDir, p.id);
+        continue;
+      }
       const ref = refOf(text);
       writeText(wsDir, p.id, ref, text);
       delete f.content;
@@ -157,7 +199,13 @@ function externalize(wsDir, projects) {
 }
 
 /** Removes text files no source of `projects` points at, and the folders of projects that are gone. */
-function collect(wsDir, projects) {
+// A text file no source points at is removed only once it has stayed unreferenced for GRACE_MS
+// across saves: a handler that awaited (a folder sync, an upload) may still hold a source object
+// pointing at it and put that back in the list. Requests are bounded well below this.
+const GRACE_MS = 30 * 60 * 1000;
+let graceDefault = GRACE_MS;
+const unreferencedSince = new Map();
+function collect(wsDir, projects, { now = Date.now(), graceMs = graceDefault } = {}) {
   const root = path.join(wsDir, DIR);
   let dirs;
   try { dirs = fs.readdirSync(root); } catch { return; }
@@ -172,14 +220,21 @@ function collect(wsDir, projects) {
   for (const d of dirs) {
     const dir = path.join(root, d);
     const refs = live.get(d);
-    if (!refs) { fs.rmSync(dir, { recursive: true, force: true }); continue; }
     let names;
     try { names = fs.readdirSync(dir); } catch { continue; }
+    let left = names.length;
     for (const n of names) {
+      const full = path.join(dir, n);
       const ref = n.endsWith('.txt') ? n.slice(0, -4) : null;
-      if (ref && refs.has(ref)) continue;
-      fs.rmSync(path.join(dir, n), { force: true });
+      if (ref && refs && refs.has(ref)) { unreferencedSince.delete(full); continue; }
+      let since = unreferencedSince.get(full);
+      if (since === undefined) { since = now; unreferencedSince.set(full, now); }
+      if (now - since < graceMs) continue;
+      fs.rmSync(full, { force: true });
+      unreferencedSince.delete(full);
+      left -= 1;
     }
+    if (!refs && left === 0) fs.rmSync(dir, { recursive: true, force: true });
   }
 }
 
@@ -225,20 +280,29 @@ function meta(file) {
 }
 
 /** Rollback (see the header): projects.json with every text back inline. Server stopped. */
-function inlineAll(wsDir) {
+function inlineAll(wsDir, { lock = require('./rust-projects.cjs').withFileLock } = {}) {
   const file = path.join(wsDir, 'projects.json');
-  const data = JSON.parse(fs.readFileSync(file, 'utf8'));
-  backupProjectsFile(wsDir);
   let n = 0;
-  for (const p of data.projects || []) for (const f of filesOf(p)) {
-    if (!f || !REF.test(String(f.textRef))) continue;
-    f.content = readText(wsDir, p.id, f.textRef);
-    delete f.textRef; delete f.chars; delete f.skillHeader;
-    n += 1;
-  }
-  const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 0o600 });
-  fs.renameSync(tmp, file);
+  // Under the same flock as every projects.json writer (rust-projects.cjs), in case a writer is
+  // still running despite the instructions (stop Node and the Rust front first).
+  lock(file, () => {
+    const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+    // Every text is read, strictly, before anything is written: one missing, unreadable or
+    // mismatched file aborts the run with projects.json and the backups untouched.
+    const texts = [];
+    for (const p of data.projects || []) for (const f of filesOf(p)) {
+      if (!f || f.textRef === undefined) continue;
+      try { texts.push([f, readTextStrict(wsDir, p.id, f.textRef)]); }
+      catch (e) { throw Object.assign(new Error(`rollback aborted, nothing written: the text of "${f.name}" in project ${p.id} cannot be read (${e.code || ''} ${e.message})`), { code: 'ROLLBACK_ABORTED' }); }
+    }
+    backupProjectsFile(wsDir);
+    for (const [f, text] of texts) { f.content = text; delete f.textRef; delete f.chars; delete f.skillHeader; n += 1; }
+    const tmp = `${file}.${process.pid}.tmp`;
+    const fd = fs.openSync(tmp, 'w', 0o600);
+    try { fs.writeSync(fd, JSON.stringify(data, null, 2)); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    fs.renameSync(tmp, file);
+    fsyncPath(wsDir);
+  });
   return n;
 }
 
@@ -249,7 +313,7 @@ if (require.main === module) {
 }
 
 module.exports = {
-  DIR, refOf, projectDir, readText, writeText, attachFile, attachAll, externalize, collect, migrateOnLoad,
+  DIR, refOf, projectDir, readText, readTextStrict, writeText, attachFile, attachAll, externalize, collect, migrateOnLoad,
   hasInline, isExternal, textLength, cloneFile, sameText, meta, inlineAll, headerNamesSkill,
-  _cache: { clear() { cache.clear(); cached = 0; warned.clear(); } },
+  _cache: { clear() { cache.clear(); cached = 0; warned.clear(); unreadable.clear(); unreferencedSince.clear(); } }, GRACE_MS, _setGraceMs(ms) { graceDefault = ms; },
 };

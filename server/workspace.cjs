@@ -135,9 +135,20 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { rustProjects 
     // the same reader.
     const projectsFile = sharedProjectsFile && Object.assign(Object.create(sharedProjectsFile), {
       refresh(list) { const changed = sharedProjectsFile.refresh(list); if (changed) sourceText.attachAll(dir, list); return changed; },
-      save(list) { sharedProjectsFile.save(list); sourceText.attachAll(dir, list); },
+      save(list, afterWrite) { sharedProjectsFile.save(list, afterWrite); sourceText.attachAll(dir, list); },
     });
-    const projects = projectsFile ? projectsFile.load() : readJson(path.join(dir, 'projects.json'), { projects: [] }).projects || [];
+    // #1806 review: a projects.json that exists but does not parse loads as an empty list. Its
+    // sources' text files must survive that: the source-text collection is off for this
+    // workspace (until a restart reads a good file), and never runs over an empty list.
+    const projectsPath = path.join(dir, 'projects.json');
+    let loadCorrupt = false;
+    if (fs.existsSync(projectsPath)) {
+      try { const v = JSON.parse(fs.readFileSync(projectsPath, 'utf8')); loadCorrupt = !v || typeof v !== 'object' || (v.projects != null && !Array.isArray(v.projects)); }
+      catch { loadCorrupt = true; }
+      if (loadCorrupt) console.warn('[sources] projects.json did not load; unused source text will not be removed until it does');
+    }
+    const loaded = projectsFile ? projectsFile.load() : (readJson(path.join(dir, 'projects.json'), { projects: [] }) || {}).projects;
+    const projects = Array.isArray(loaded) ? loaded : [];
     const freeChatsFile = rustFreeChats ? require('./rust-projects.cjs').createFreeChatsFile(path.join(dir, 'free-chats.json'), { atomicJson }) : null;
     const providerFile = path.join(dir, 'providers.json');
     const savedProviders = readJson(providerFile, { providers: [] }).providers || [];
@@ -181,9 +192,14 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { rustProjects 
         // #1806: new or changed source text goes to its file first, so projects.json never points
         // at a text that is not on disk; text no source points at any more is removed after.
         sourceText.externalize(dir, this.projects);
-        if (projectsFile) projectsFile.save(this.projects);
-        else atomicJson(path.join(dir, 'projects.json'), { projects: this.projects });
-        try { sourceText.collect(dir, this.projects); } catch (e) { console.warn('[sources] could not remove unused source text:', e.message); }
+        // The collection runs right after the write, under the same flock when projects.json is
+        // shared with the Rust front, and never after a corrupt load or over an empty list.
+        const gc = (list) => {
+          if (loadCorrupt || !Array.isArray(list) || list.length === 0) return;
+          try { sourceText.collect(dir, list); } catch (e) { console.warn('[sources] could not remove unused source text:', e.message); }
+        };
+        if (projectsFile) projectsFile.save(this.projects, gc);
+        else { atomicJson(path.join(dir, 'projects.json'), { projects: this.projects }); gc(this.projects); }
       },
       saveProviders() {
         this.assertActive();

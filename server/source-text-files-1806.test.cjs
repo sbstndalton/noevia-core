@@ -17,6 +17,9 @@ const sourceText = new Proxy({}, { get: (_t, k) => {
 } });
 const skills = require('./instruction-skills.cjs');
 
+// Collection grace off by default here; the grace itself has its own test below.
+try { require('./source-text.cjs')._setGraceMs(0); } catch { /* main: no module */ }
+
 const USER = '11111111-2222-4333-8444-555555555555';
 const DEFAULT = { id: 'local', label: 'Local', baseUrl: 'http://127.0.0.1:1', apiKey: '' };
 const sha = (s) => crypto.createHash('sha256').update(s, 'utf8').digest('hex');
