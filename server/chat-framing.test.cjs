@@ -347,3 +347,19 @@ test('#1778: a project/tag decision that throws after the kind answered keeps th
   assert.equal(out.reason, null);
   assert.deepEqual(out.frame, { projectId: null, kind: 'idea', tags: [], links: ['c1'], confirmed: false, source: 'suggested' });
 });
+
+test('#1778: the kind-only early return aborts the hung embedding request', async () => {
+  const { decide } = stubDecide({ 'chat.frame.kind': 'idea' });
+  let embedSignal = null;
+  const embed = (texts, { signal }) => { embedSignal = signal; return new Promise(() => {}); };
+  const out = await make(decide, { embed, deadlineMs: () => 5000 }).suggest({ message: 'tomato garden', projects, chats });
+  assert.equal(out.frame.kind, 'idea');
+  assert.equal(embedSignal.aborted, true, 'the embedding request was told to stop');
+});
+
+test('#1778: a project/tag error that is not a deadline is logged once', async () => {
+  const logged = [];
+  const decide = async (r) => { if (r.purpose !== 'chat.frame.kind') throw Error('boom'); return { source: 'stub', selected: 'idea', scores: {} }; };
+  await make(decide, { deadlineMs: () => 2000, log: (e) => logged.push(e) }).suggest({ message: 'tomato garden', projects, chats });
+  assert.equal(logged.filter((e) => e.failed === 'project-tag').length, 1);
+});

@@ -139,14 +139,20 @@ function createChatFraming({ enabled, decide, embed = null, roles = () => ({}), 
     const texts = [text, ...pool.map((c) => c.title), ...ownProjects.map((p) => p.name), ...tags];
     const kindPromise = choose('chat.frame.kind', 'What kind of chat does this first message start?', KINDS.map((id) => ({ id, label: KIND_LABELS[id] })), text, left(), routerModel, signal)
       .then((kind) => { partial.kind = kind; return kind; });
-    const embedding = embedAll(texts, signal);
+    // #1778: the embedding gets its own controller (aborted with the call's) so an early kind-only return
+    // cancels a hung embedding request instead of leaving it running.
+    const embedCtl = new AbortController();
+    signal.addEventListener('abort', () => embedCtl.abort(), { once: true });
+    const embedding = embedAll(texts, embedCtl.signal);
     const kind = await kindPromise;
+    if (!kind) embedCtl.abort();
     if (!kind) return { frame: null, reason: signal.aborted ? 'deadline' : 'no-kind' };
     let graceTimer;
     const TIMED_OUT = Symbol('embed-grace');
     const vectors = await Promise.race([embedding, new Promise((resolve) => { graceTimer = setTimeout(() => resolve(TIMED_OUT), Math.min(EMBED_GRACE_MS, left())); })])
       .finally(() => clearTimeout(graceTimer));
     // The embedding is still hung: the kind alone is the frame (no related chats, no pre-ranked project/tag).
+    if (vectors === TIMED_OUT) embedCtl.abort();
     if (vectors === TIMED_OUT) return { frame: frameOf(partial), reason: null };
     const sim = (i) => (vectors ? cosine(vectors[0], vectors[i]) : 0);
     const links = vectors ? pool.map((c, i) => ({ id: c.id, score: sim(1 + i) })).filter((r) => r.score >= RELATED_MIN)
@@ -165,7 +171,8 @@ function createChatFraming({ enabled, decide, embed = null, roles = () => ({}), 
         projectOptions.length ? choose('chat.frame.project', 'Which of the user\'s projects does this chat belong to?', [...projectOptions, none], text, left(), routerModel, signal) : null,
         tagOptions.length ? choose('chat.frame.tag', 'Which existing tag fits this chat best?', [...tagOptions, none], text, left(), routerModel, signal) : null,
       ]);
-    } catch {
+    } catch (error) {
+      if (!error?.deadline && !signal.aborted) log({ purpose: 'chat.frame', failed: 'project-tag', error: String(error?.message || error).slice(0, 200) });
       // #1778: the kind already answered; a failing project/tag decision keeps it, as the deadline does.
       return { frame: frameOf(partial), reason: null };
     }
