@@ -379,3 +379,89 @@ test('startEngineRelayFromEnv: unset is no relay; set binds the code-network nam
   assert.equal(bound.server.address().address, '127.0.0.1');
   await new Promise((r) => bound.server.close(r));
 });
+
+// ---- #1876 relay hardening ----
+const { bindProblem } = require('./code-machine.cjs');
+const net = require('node:net');
+const T1876 = { machine: { id: 'm1', name: 'Synthetic' }, baseUrl: 'http://synthetic.invalid', model: 'synthetic-model' };
+
+test('#1876 a bind failure (port in use) does not crash web: relay off, tasks refuse machineRelayOff', async (t) => {
+  const blocker = http.createServer(); await new Promise((r) => blocker.listen(0, '127.0.0.1', r)); t.after(() => new Promise((r) => blocker.close(r)));
+  const logs = [];
+  const r = startEngineRelayFromEnv({ CODE_ENGINE_RELAY_PORT: String(blocker.address().port), CODE_ENGINE_RELAY_BIND: '127.0.0.1' },
+    { target: () => T1876, chatMachines: { ready: async () => ({ ok: true }) }, log: (e) => logs.push(e) });
+  assert.ok(r.url);
+  const deadline = Date.now() + 5000;
+  while (!logs.some((l) => l.event === 'relay.bind_failed') && Date.now() < deadline) await new Promise((x) => setTimeout(x, 20));
+  assert.ok(logs.some((l) => l.event === 'relay.bind_failed'));
+  assert.equal(r.url, null);
+  await assert.rejects(r.relay.open({ taskId: 'x' }), (e) => e.code === 'machineRelayOff');
+  assert.equal(r.server.listening, false);
+});
+
+test('#1876 CODE_ENGINE_RELAY_BIND is validated: unspecified, empty, non-IP and foreign addresses keep the relay off', async () => {
+  for (const bad of ['0.0.0.0', '::', '', '  ', 'egress', 'not-an-ip', '203.0.113.9']) {
+    const logs = [];
+    const r = startEngineRelayFromEnv({ CODE_ENGINE_RELAY_PORT: '18961', CODE_ENGINE_RELAY_BIND: bad }, { target: () => T1876, log: (e) => logs.push(e) });
+    await new Promise((x) => setTimeout(x, 50));
+    assert.ok(logs.some((l) => l.event === 'relay.bind_rejected'), JSON.stringify(bad));
+    assert.equal(r.url, null, JSON.stringify(bad));
+    assert.equal(r.server.listening, false);
+  }
+  assert.equal(bindProblem('127.0.0.1'), null);
+  assert.equal(bindProblem('10.9.9.9', () => ({ eth0: [{ address: '10.9.9.9' }] })), null);
+  assert.match(bindProblem('10.9.9.8', () => ({ eth0: [{ address: '10.9.9.9' }] })), /interface/);
+});
+
+test('#1876 close() aborts the lease’s in-flight upstream requests', async (t) => {
+  let upstreamAborted = false;
+  const chatMachines = { ready: async () => ({ ok: true }), connectError: () => 'x',
+    fetch: async (_u, init) => {
+      const enc = new TextEncoder();
+      const body = new ReadableStream({ start(c) { c.enqueue(enc.encode('data: 1\n\n')); init.signal.addEventListener('abort', () => { upstreamAborted = true; c.error(new Error('aborted')); }); } });
+      return new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+    } };
+  const relay = createEngineRelay({ chatMachines, target: () => T1876, url: 'http://unused.invalid/v1' });
+  const s = http.createServer((q, p) => { relay.handle(q, p); });
+  await new Promise((r) => s.listen(0, '127.0.0.1', r)); t.after(() => new Promise((r) => { s.closeAllConnections(); s.close(r); }));
+  const lease = await relay.open({ taskId: 'abort-1' });
+  const res = await fetch(`http://127.0.0.1:${s.address().port}/v1/chat/completions`, { method: 'POST', headers: { Authorization: `Bearer ${lease.token}` }, body: '{"stream":true}' });
+  const reader = res.body.getReader();
+  await reader.read();
+  const t0 = Date.now();
+  lease.close();
+  await Promise.race([reader.read().catch(() => ({ done: true })), new Promise((_, rej) => setTimeout(() => rej(Error('not cut')), 1000))]);
+  assert.ok(Date.now() - t0 < 1000);
+  assert.ok(upstreamAborted);
+});
+
+test('#1876 a token-less slowloris is dropped and a token-less flood holds no task slots', async (t) => {
+  const relay = createEngineRelay({ chatMachines: { ready: async () => ({ ok: true }) }, target: () => T1876, url: 'http://unused.invalid/v1', maxConcurrent: 1 });
+  const lease = await relay.open({ taskId: 'slots-1' });
+  const logs = [];
+  const r = startEngineRelayFromEnv({ CODE_ENGINE_RELAY_PORT: '18962', CODE_ENGINE_RELAY_BIND: '127.0.0.1' },
+    { target: () => T1876, chatMachines: { ready: async () => ({ ok: true }) }, log: (e) => logs.push(e), limits: { headersTimeout: 300, requestTimeout: 1000, connectionsCheckingInterval: 50, maxConnections: 8 } });
+  await new Promise((x) => r.server.once('listening', x));
+  t.after(() => new Promise((x) => { r.server.closeAllConnections(); r.server.close(x); }));
+  assert.equal(r.server.maxConnections, 8);
+  const sock = net.connect(18962, '127.0.0.1');
+  await new Promise((x) => sock.once('connect', x));
+  sock.resume(); sock.write('POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n'); // never finishes the headers
+  const closed = new Promise((x) => { sock.on('close', x); sock.on('error', () => {}); });
+  await Promise.race([closed, new Promise((_, rej) => setTimeout(() => rej(Error('slowloris kept')), 3000))]);
+  // Token-less POSTs with a body that never completes: refused 401 and no lease slot taken.
+  const open = await Promise.all([1, 2, 3].map(async () => {
+    const s2 = net.connect(18962, '127.0.0.1'); await new Promise((x) => s2.once('connect', x));
+    s2.on('error', () => {}); s2.write('POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n{');
+    return s2;
+  }));
+  await new Promise((x) => setTimeout(x, 100));
+  for (const s2 of open) s2.destroy();
+  // The (separately handled) task still has its single slot free.
+  const direct = http.createServer((q, p) => { relay.handle(q, p); });
+  await new Promise((x) => direct.listen(0, '127.0.0.1', x)); t.after(() => new Promise((x) => { direct.closeAllConnections(); direct.close(x); }));
+  const m = await fetch(`http://127.0.0.1:${direct.address().port}/v1/models`, { headers: { Authorization: `Bearer ${lease.token}` } });
+  assert.equal(m.status, 200);
+  assert.equal(relay.active(), 1);
+  lease.close();
+});

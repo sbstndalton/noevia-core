@@ -27,10 +27,29 @@
 const crypto = require('node:crypto');
 const http = require('node:http');
 const dns = require('node:dns');
+const net = require('node:net');
+const os = require('node:os');
 
 const BODY_CAP = 16 * 1024 * 1024;
 const MAX_CONCURRENT_PER_TASK = 4;
 const REQUEST_TIMEOUT_MS = 30 * 60_000;
+// Server limits (#1876): the sandbox is on the same network as the relay, so slow or token-less
+// connections must not pin it. requestTimeout bounds receiving a whole request (a 16 MiB body is ~2 min
+// even at 1 MB/s); it does not limit the streamed response.
+const SERVER_LIMITS = { headersTimeout: 10_000, requestTimeout: 120_000, keepAliveTimeout: 5_000, maxConnections: 32, connectionsCheckingInterval: 1_000 };
+
+/** Why `address` may not be the relay's bind address, or null when it is one of web's own interface addresses. */
+function bindProblem(address, interfaces = () => os.networkInterfaces()) {
+  const a = String(address ?? '').trim();
+  if (!a) return 'is empty';
+  if (!net.isIP(a)) return 'is not an IP address';
+  if (/^(0\.0\.0\.0|(0*:)+0*|::)$/.test(a)) return 'would listen on every interface';
+  let own = [];
+  try { own = Object.values(interfaces() || {}).flat().map((i) => i?.address); } catch { own = []; }
+  const norm = (x) => String(x).toLowerCase().replace(/%.*$/, '');
+  if (!own.some((x) => x && norm(x) === norm(a))) return 'is not one of this machine\'s interface addresses';
+  return null;
+}
 
 /** The machine a Code task runs on, or null (this machine). */
 function codeTargetFrom(chatMachines, autoRoles) {
@@ -60,6 +79,7 @@ const jsonError = (res, status, message, code) => {
  */
 function createEngineRelay({ chatMachines, target, url = null, log = () => {}, bodyCap = BODY_CAP, maxConcurrent = MAX_CONCURRENT_PER_TASK, requestTimeoutMs = REQUEST_TIMEOUT_MS }) {
   const leases = new Map(); // sha256(token) -> lease
+  let relayUrl = url; // mutable: a failed bind turns the relay off
   const record = (entry) => { try { log(entry); } catch { /* never changes the outcome */ } };
   const hash = (token) => crypto.createHash('sha256').update(String(token)).digest('hex');
   const current = () => { try { return target() || null; } catch { return null; } };
@@ -72,7 +92,7 @@ function createEngineRelay({ chatMachines, target, url = null, log = () => {}, b
     const refuse = (code, text) => Object.assign(Error(text), { code, publicMessage: text });
     const t = current();
     if (!t) throw refuse('model_mismatch', 'The Code role moved back to this machine while the task was starting, and one task runs on one model. Start the task again.');
-    if (!url) throw refuse('machineRelayOff', `The Code role runs on ${t.machine.name}, but the sandbox has no route to it: web needs CODE_ENGINE_RELAY_PORT (see the code-sandbox override). The task was not started.`);
+    if (!relayUrl) throw refuse('machineRelayOff', `The Code role runs on ${t.machine.name}, but the sandbox has no route to it: web needs CODE_ENGINE_RELAY_PORT (see the code-sandbox override). The task was not started.`);
     if (expect !== undefined && expect !== targetKey(t)) throw refuse('model_mismatch', 'The Code role moved to another machine or model during this task, and one task runs on one model. Start the task again.');
     if (model && model !== t.model) throw refuse('model_mismatch', `This task names ${model}, but the Code role runs ${t.model} on ${t.machine.name}. One task runs on one model.`);
     const ready = await chatMachines.ready(t);
@@ -81,11 +101,13 @@ function createEngineRelay({ chatMachines, target, url = null, log = () => {}, b
     try { contextTokens = typeof chatMachines.contextTokens === 'function' ? await chatMachines.contextTokens(t) : null; } catch { contextTokens = null; }
     const token = `ncr_${crypto.randomBytes(24).toString('base64url')}`;
     const key = hash(token);
-    leases.set(key, { taskId, target: t, key: targetKey(t), active: 0 });
+    const lease = { taskId, target: t, key: targetKey(t), active: 0, controllers: new Set() };
+    leases.set(key, lease);
     record({ event: 'relay.opened', taskId, machine: t.machine.id });
     let closed = false;
-    return { baseUrl: url, token, model: t.model, contextTokens, target: t,
-      close: () => { if (closed) return; closed = true; leases.delete(key); record({ event: 'relay.closed', taskId }); } };
+    return { baseUrl: relayUrl, token, model: t.model, contextTokens, target: t,
+      close: () => { if (closed) return; closed = true; leases.delete(key);
+        for (const c of [...lease.controllers]) { try { c.abort(); } catch { /* gone */ } } record({ event: 'relay.closed', taskId }); } };
   }
 
   function leaseOf(req) {
@@ -114,6 +136,9 @@ function createEngineRelay({ chatMachines, target, url = null, log = () => {}, b
     if (lease.active >= maxConcurrent) { req.resume(); return jsonError(res, 429, 'Too many model requests from this task at once.'); }
     lease.active += 1;
     const controller = new AbortController();
+    lease.controllers.add(controller);
+    // Aborted (client gone, or the lease closed): cut the sandbox's connection too, whatever phase we are in.
+    controller.signal.addEventListener('abort', () => { if (!res.writableEnded) { try { res.destroy(); } catch { /* gone */ } } }, { once: true });
     const onClose = () => { if (!res.writableEnded) controller.abort(); };
     res.on('close', onClose);
     try {
@@ -157,11 +182,12 @@ function createEngineRelay({ chatMachines, target, url = null, log = () => {}, b
       return undefined;
     } finally {
       lease.active -= 1;
+      lease.controllers.delete(controller);
       res.off('close', onClose);
     }
   }
 
-  return { open, handle, active: () => leases.size };
+  return { open, handle, active: () => leases.size, disable: () => { relayUrl = null; }, get url() { return relayUrl; } };
 }
 
 /**
@@ -169,7 +195,7 @@ function createEngineRelay({ chatMachines, target, url = null, log = () => {}, b
  * no relay (and a task whose Code role is on a machine refuses to start with a clear reason). Returns
  * `{ relay, url, server }`.
  */
-function startEngineRelayFromEnv(env, { chatMachines, target, log = () => {}, lookup = (h) => dns.promises.lookup(h), listen = true } = {}) {
+function startEngineRelayFromEnv(env, { chatMachines, target, log = () => {}, lookup = (h) => dns.promises.lookup(h), listen = true, interfaces = () => os.networkInterfaces(), limits = {} } = {}) {
   const port = Number(env.CODE_ENGINE_RELAY_PORT);
   const on = Number.isInteger(port) && port > 0 && port <= 65535;
   const host = String(env.CODE_ENGINE_RELAY_HOST || env.CODE_EGRESS_HOST || 'egress').trim();
@@ -177,14 +203,31 @@ function startEngineRelayFromEnv(env, { chatMachines, target, log = () => {}, lo
   const url = on ? `http://${host}:${port}/v1` : null;
   const relay = createEngineRelay({ chatMachines, target, url, log });
   if (!on || !listen) return { relay, url, server: null };
-  const server = http.createServer((req, res) => { relay.handle(req, res).catch(() => jsonError(res, 500, 'The relay failed.')); });
-  server.on('error', (err) => { log({ event: 'relay.bind_failed', error: String(err?.message || err) }); throw err; });
+  const lim = { ...SERVER_LIMITS, ...limits };
+  const server = http.createServer({ headersTimeout: lim.headersTimeout, requestTimeout: lim.requestTimeout, keepAliveTimeout: lim.keepAliveTimeout, connectionsCheckingInterval: lim.connectionsCheckingInterval },
+    (req, res) => { relay.handle(req, res).catch(() => jsonError(res, 500, 'The relay failed.')); });
+  server.maxConnections = lim.maxConnections;
+  // Never crash web: a relay that cannot bind is off, and Machine Code tasks refuse with machineRelayOff.
+  let off = false;
+  const turnOff = (event, extra) => {
+    if (off) return; off = true;
+    relay.disable();
+    log({ event, port, ...extra });
+    try { server.close(); } catch { /* not listening */ }
+  };
+  server.on('error', (err) => turnOff('relay.bind_failed', { error: String(err?.message || err) }));
   // Only web's code-network address: never all interfaces. A name that does not resolve binds loopback,
   // which the sandbox cannot reach (fail closed), as the egress proxy does.
-  Promise.resolve(env.CODE_ENGINE_RELAY_BIND ? { address: String(env.CODE_ENGINE_RELAY_BIND).trim() } : lookup(host))
+  Promise.resolve(env.CODE_ENGINE_RELAY_BIND !== undefined ? { address: String(env.CODE_ENGINE_RELAY_BIND).trim(), explicit: true } : lookup(host))
     .catch((err) => { log({ event: 'relay.bind_fallback_loopback', host, reason: String(err?.message || err) }); return { address: '127.0.0.1' }; })
-    .then(({ address }) => server.listen(port, address, () => log({ event: 'relay.listening', bind: address, port })));
-  return { relay, url, server };
+    .then(({ address }) => {
+      const problem = bindProblem(address, interfaces);
+      if (problem) return turnOff('relay.bind_rejected', { bind: String(address ?? ''), reason: problem });
+      server.listen(port, address, () => log({ event: 'relay.listening', bind: address, port }));
+      return undefined;
+    })
+    .catch((err) => turnOff('relay.bind_failed', { error: String(err?.message || err) }));
+  return { relay, get url() { return relay.url; }, server };
 }
 
-module.exports = { codeTargetFrom, targetKey, createEngineRelay, startEngineRelayFromEnv, BODY_CAP };
+module.exports = { codeTargetFrom, targetKey, createEngineRelay, startEngineRelayFromEnv, bindProblem, BODY_CAP, SERVER_LIMITS };
