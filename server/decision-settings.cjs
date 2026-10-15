@@ -2,6 +2,9 @@
 const {configuration,createDecisionEndpoint}=require('./decision-endpoint.cjs');
 const {checkServiceEndpoint,serviceFetch,decisionServiceFetch}=require('./service-endpoint.cjs');
 const KEY='decision:configuration';
+const {PROFILES,profileFor}=require('./decision-models.cjs');
+/** #1666: the decision model ids an administrator can choose. */
+const DECISION_MODELS=Object.freeze(Object.keys(PROFILES));
 // What the private decision service (services/laya/server.py validate + worker budget) accepts, so
 // callers can shape a request it will not refuse with a 422 (#682). maxChoiceChars approximates the
 // model's option-head token budget (192 tokens minus 32: 160 for question, ids and labels) at under three
@@ -44,13 +47,27 @@ const invalidUrl=()=>Object.assign(Error('Use a private HTTP address such as htt
 function createDecisionSettings({store,env=process.env,fetchImpl=decisionServiceFetch,sensitivityFetchImpl=(fetchImpl===decisionServiceFetch?serviceFetch:fetchImpl),lookup=undefined,audit=()=>{},kinds=SERVICE_KINDS}) {
   let saved;
   try { saved=JSON.parse(store.get(KEY)||'null'); } catch { saved={url:'',timeoutMs:1500}; }
-  const get=()=>({...saved || {url:env.COWORK_DECISION_URL||'',timeoutMs:1500},source:saved?'admin':'deployment'});
+  // #1666: `model` is the decision model the administrator chose in Settings, present only when one was chosen (absent =
+  // automatic: the deployment's COWORK_DECISION_MODEL when the URL is the deployment's own, Laya otherwise, exactly as
+  // before). The reply is otherwise unchanged (the recorded HTTP contract corpus); the choosable ids are on the admin's
+  // Decision row of /api/models/assignments.
+  const get=()=>{
+    const base=saved || {url:env.COWORK_DECISION_URL||'',timeoutMs:1500};
+    return {url:base.url,timeoutMs:base.timeoutMs,...(typeof base.model==='string'&&base.model?{model:base.model}:{}),source:saved?'admin':'deployment'};
+  };
   function validate(value) {
     if(!value || typeof value.url!=='string' || !Number.isInteger(value.timeoutMs) || value.timeoutMs<100 || value.timeoutMs>2000)
       throw Object.assign(Error('Enter a private decision-service URL and a deadline from 100 to 2000 ms.'),{status:400,messageId:'invalidInput'});
     const parsed=configuration({COWORK_DECISION_URL:value.url.trim()});
     if(parsed.reason) throw invalidUrl();
-    return {url:parsed.baseUrl,timeoutMs:value.timeoutMs};
+    // #1666: '' / absent = automatic. Anything else must name a known profile: a typo is refused here rather than
+    // silently sent as Laya (unknown ids in COWORK_DECISION_MODEL keep falling back to Laya, as before).
+    // #1816: a PUT without `model` keeps the saved one (an older tab or a script sending {url,timeoutMs}); only '' / null clear it.
+    const raw=value.model===undefined ? (typeof saved?.model==='string' ? saved.model : '') : value.model===null ? '' : value.model;
+    const model=typeof raw==='string' ? raw.trim().toLowerCase() : null;
+    if(model===null || (model && !Object.prototype.hasOwnProperty.call(PROFILES,model)))
+      throw Object.assign(Error('Choose a decision model from the list, or automatic.'),{status:400,messageId:'invalidModel'});
+    return {url:parsed.baseUrl,timeoutMs:value.timeoutMs,...(model?{model}:{})};
   }
   // #1639: the model behind the URL (decision-models.cjs) is the operator's COWORK_DECISION_MODEL, and
   // it belongs to COWORK_DECISION_URL: an administrator who saved another URL in Settings gets the
@@ -92,7 +109,8 @@ function createDecisionSettings({store,env=process.env,fetchImpl=decisionService
     const config=configuration({COWORK_DECISION_URL:current.url});
     if(config.reason) return null;
     const sameHost=!!hostOf(config.baseUrl) && hostOf(config.baseUrl)===hostOf(env.COWORK_DECISION_URL);
-    return backendFor(config.baseUrl,modelFor(config.baseUrl),sameHost?env.COWORK_DECISION_API_KEY:null,'shared');
+    // #1666: a model chosen in Settings wins; automatic keeps the #1639 rule (modelFor).
+    return backendFor(config.baseUrl,current.model||modelFor(config.baseUrl),sameHost?env.COWORK_DECISION_API_KEY:null,'shared');
   }
   // #1639: the sensitivity check's backend. COWORK_SENSITIVITY_DECISION_URL unset or empty: backend(),
   // as before. Set: that service only (its model COWORK_SENSITIVITY_DECISION_MODEL, unset: Laya), so it
@@ -117,7 +135,7 @@ function createDecisionSettings({store,env=process.env,fetchImpl=decisionService
       if(typeof kind==='string' && !kinds.includes(kind)) return `The configured decision service does not support ${kind} decisions, so this experiment cannot run.`;
       return null;
     },
-    save(value,actor) {const next=validate(value);store.set(KEY,JSON.stringify(next));saved=next;audit('decision.configure',actor,{url:next.url,timeoutMs:next.timeoutMs});return get();},
+    save(value,actor) {const next=validate(value);store.set(KEY,JSON.stringify(next));saved=next;audit('decision.configure',actor,{url:next.url,timeoutMs:next.timeoutMs,model:next.model||'auto'});return get();},
     /** #1765: forgets the URL and deadline saved in Settings, so COWORK_DECISION_URL (and its key and model)
      *  applies again. Audited, also when nothing was saved, so the log shows every attempt. */
     reset(actor) {
@@ -154,14 +172,15 @@ function createDecisionSettings({store,env=process.env,fetchImpl=decisionService
  *  is the deployment's own, the Laya profile otherwise (exactly what backend() sends). The sensitivity
  *  check is `shared` unless COWORK_SENSITIVITY_DECISION_URL names its own service. */
 function describeDecision(env=process.env,current=null) {
-  const {profileFor}=require('./decision-models.cjs');
   const cur=current || {url:env.COWORK_DECISION_URL||'',source:'deployment'};
   const modelName=(id)=>{ const raw=typeof id==='string'?id.trim():''; return raw && raw.length<=64 ? raw : profileFor(raw).id; };
   const shared=configuration({COWORK_DECISION_URL:cur.url});
   const envConfig=configuration({COWORK_DECISION_URL:env.COWORK_DECISION_URL});
   const sameAsEnv=!shared.reason && !envConfig.reason && shared.baseUrl===envConfig.baseUrl;
+  // #1666: a model chosen in Settings (cur.model) is what backend() sends, so it is what the row names.
+  const chosen=typeof cur.model==='string' && cur.model ? cur.model : '';
   const decision=shared.reason ? {model:null,state:'off',source:cur.source}
-    : {model:modelName(sameAsEnv?env.COWORK_DECISION_MODEL:undefined),state:'active',source:cur.source};
+    : {model:chosen?profileFor(chosen).id:modelName(sameAsEnv?env.COWORK_DECISION_MODEL:undefined),state:'active',source:cur.source,...(chosen?{modelSource:'admin'}:{})};
   const ownUrl=typeof env.COWORK_SENSITIVITY_DECISION_URL==='string' ? env.COWORK_SENSITIVITY_DECISION_URL.trim() : '';
   let sensitivity;
   if(!ownUrl) sensitivity={model:decision.model,state:decision.state,shared:true};
@@ -171,4 +190,4 @@ function describeDecision(env=process.env,current=null) {
   }
   return {decision,sensitivity};
 }
-module.exports={createDecisionSettings,describeDecision,serviceOptions,startupWarnings,hostOf,SERVICE_LIMITS};
+module.exports={createDecisionSettings,describeDecision,serviceOptions,startupWarnings,hostOf,SERVICE_LIMITS,DECISION_MODELS};

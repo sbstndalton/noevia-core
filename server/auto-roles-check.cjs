@@ -1,7 +1,7 @@
 // Auto routing stores model names, and presets change underneath them. A role pointing at a model
 // the engine no longer serves would fail every Auto turn with an upstream error, so the chat route
 // and the settings page check the roles against the served catalogue first.
-const LABELS = { fast: 'Fast', smart: 'Smart', vision: 'Vision', code: 'Code' };
+const LABELS = { fast: 'Fast', smart: 'Smart', vision: 'Vision', code: 'Code', creative: 'Creative' };
 
 /** Roles whose model is not in `installed`. An unknown catalogue (null) never reports anything. */
 function missingRoles(roles, installed) {
@@ -17,4 +17,15 @@ function staleRolesError(missing) {
   return `Auto routing uses models that are no longer installed: ${list}. Choose new ones in Settings → Models & routing.`;
 }
 
-module.exports = { missingRoles, staleRolesError };
+const NOT_CHAT = /^(embedding|embeddings|rerank|reranking|reranker)$/i;
+
+/** #1816: true when moving a creative turn to the Creative model costs no model swap: the Creative model is loaded, or no
+ *  chat model is. Unknown loaded state (no catalogue) keeps the router's pick, so this is false. */
+function creativeMoveIsFree(roles, routedRole, installed) {
+  if (!roles?.creative || !Array.isArray(installed)) return false;
+  if (roles[routedRole] === roles.creative) return true;
+  const loaded = installed.filter((m) => m && m.loaded && !(m.labels || []).some((l) => NOT_CHAT.test(l))).map((m) => m.name);
+  return loaded.length === 0 || loaded.includes(roles.creative);
+}
+
+module.exports = { missingRoles, staleRolesError, creativeMoveIsFree };
