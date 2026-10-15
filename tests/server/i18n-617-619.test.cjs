@@ -113,8 +113,9 @@ for (const locale of Object.keys(FILES)) {
 }
 
 test('the interface locale, not the browser, chooses the words: German and French read differently (#617, #618)', () => {
-  assert.equal(base('de-DE')['code.picker.open'], 'Code öffnen');
-  assert.equal(base('fr-FR')['code.picker.open'], 'Ouvrir Code');
+  // #1576 replaced the picker's "Open Code" button with "Start task"; its list label is unchanged.
+  assert.equal(base('de-DE')['code.picker.listLabel'], 'Projekte mit Code-Zugriff');
+  assert.equal(base('fr-FR')['code.picker.listLabel'], 'Projets avec accès à Code');
   assert.equal(settings('de-DE')['webAddress.earlier'], 'Frühere Adressen');
   assert.equal(settings('fr-FR')['webAddress.earlier'], 'Anciennes adresses');
   assert.equal(settings('fr-FR')['features.item.previews.label'], 'Surfaces en aperçu');

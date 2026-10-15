@@ -211,18 +211,15 @@ test('auto-accept chat frames is a per-user preference, off by default (#738, #7
   assert.deepEqual(await get(), prefs(false, true));
 });
 
-test('the move never puts a chat into a Code-only or archived project; moving out still works (#810)', async () => {
+test('the move never puts a chat into an archived project; a once Code-only project takes it (#810, #1576)', async () => {
   const code = JSON.parse((await post('/api/projects', { name: 'Synthetic code only', modes: ['code'] })).text);
   const archived = JSON.parse((await post('/api/projects', { name: 'Synthetic archived' })).text);
   assert.equal((await post(`/api/projects/${archived.id}/config`, { archived: true })).status, 200);
-  const chatProject = JSON.parse((await post('/api/projects', { name: 'Synthetic chat project' })).text);
   await post('/api/freechats', { chats: [meta('c-810')] });
-  for (const target of [code, archived]) {
-    const refused = await post('/api/chats/c-810/move', { projectId: target.id, frame: frame({ projectId: target.id }) });
-    assert.equal(refused.status, 404, target.name);
-    assert.ok(await freeMeta('c-810'), `${target.name}: still in the free list`);
-  }
-  assert.equal((await post('/api/chats/c-810/move', { projectId: chatProject.id })).status, 200, 'a Chat-mode project still receives it');
+  const refused = await post('/api/chats/c-810/move', { projectId: archived.id, frame: frame({ projectId: archived.id }) });
+  assert.equal(refused.status, 404);
+  assert.ok(await freeMeta('c-810'), 'still in the free list');
+  assert.equal((await post('/api/chats/c-810/move', { projectId: code.id })).status, 200, 'a project saved as Code-only now receives it');
 });
 
 test('a malformed chat id in the URL is a 400, not a server error (#812)', async () => {
