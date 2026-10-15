@@ -119,9 +119,16 @@ const authService = createAuth({
     .map((s) => s.trim())
     .filter(Boolean),
 });
-const decisionSettings = require('./decision-settings.cjs').createDecisionSettings({ store: require('./features.cjs').settingsStore(authService.db), audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail) });
+// #1638: Settings → Inference machines: which machine each service runs on (default: all on this one). The decision
+// service and the reranker read their address from it; embeddings move only through the #1636 re-index.
+const inferenceMachines = require('./inference-machines.cjs').createInferenceMachines({ store: require('./features.cjs').settingsStore(authService.db), audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail),
+  embeddingActive: () => require('./embedding-config.cjs').current()?.active() || null,
+  localEmbeddingUrl: () => require('./embedding-service.cjs').current()?.baseUrl || String(process.env.EMBEDDING_BASE_URL || '').trim() || null,
+  onChange: (service) => { if (service === 'reranker') rag.reloadRerank(); } });
+const decisionSettings = require('./decision-settings.cjs').createDecisionSettings({ store: require('./features.cjs').settingsStore(authService.db), audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail), machineUrl: () => inferenceMachines.urlFor('decision') });
 // #1665: the reranker's on/off and model, saved in Settings over the deployment's RERANK_* environment.
-const rerankSettings = require('./rerank-settings.cjs').createRerankSettings({ store: require('./features.cjs').settingsStore(authService.db), audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail), onChange: () => rag.reloadRerank() });
+const rerankSettings = require('./rerank-settings.cjs').install(require('./rerank-settings.cjs').createRerankSettings({ store: require('./features.cjs').settingsStore(authService.db), audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail), onChange: () => rag.reloadRerank(),
+  machine: () => { const url = inferenceMachines.urlFor('reranker'); return url ? { url, protocol: inferenceMachines.rerankProtocol() } : null; } }));
 // #697: the inference memory budget (admin setting; INFERENCE_MEMORY_BUDGET_GIB is its initial value).
 const inferenceBudget = require('./inference-budget.cjs').createInferenceBudget({ store: require('./features.cjs').settingsStore(authService.db), audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail) });
 const features = require('./features.cjs').createFeatures({ store: require('./features.cjs').settingsStore(authService.db), audit: (action, actor, detail) => authService.audit(action, actor, actor, detail),
@@ -1067,6 +1074,14 @@ const samplingSettingsRoutes = require('./routes/sampling-settings.cjs').createS
 // The embedding model of retrieval, for administrators (routes/embedding.cjs, #1636).
 const embeddingRoutes = require('./routes/embedding.cjs').createEmbeddingRoutes({ json, readJson, migration: embeddingMigration, authService, fetchJson, DIARY_BASE, diaryServiceHeaders: diary.serviceHeaders,
   service: embeddingService, resolveFile: (model) => require('./embedding-service.cjs').resolveModelFile({ env: process.env, fetchJson, model }) });
+// Settings → Inference machines (routes/inference-machines.cjs, #1638), administrators only.
+const inferenceMachineRoutes = require('./routes/inference-machines.cjs').createInferenceMachineRoutes({ json, readJson, machines: inferenceMachines,
+  health: require('./machine-health.cjs').createMachineHealth(),
+  effective: {
+    decision: () => { const c = require('./decision-endpoint.cjs').configuration({ COWORK_DECISION_URL: decisionSettings.get().url }); return c.reason ? null : c.baseUrl; },
+    embedding: () => require('./embedding-config.cjs').current()?.active()?.baseUrl || null,
+    reranker: () => { const t = require('./rerank-target.cjs').rerankTarget(rerankSettings.effectiveEnv()); return t.enabled ? t.baseUrl : null; },
+  } });
 const healthRoutes = require('./routes/health.cjs').createHealthRoutes({ json, fetchJson, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, DIARY_BASE, diaryHeaders, authService, rag });
 // GET /api/ready (#297): unauthenticated, mounted before the session gate below alongside the
 // sign-in routes. isReady is set once startup wiring under require.main finishes (see below).
@@ -1183,6 +1198,7 @@ async function handleRequestScoped(req, res) {
 
     if (await healthRoutes(req, res, { path: p, authn })) return;
     if (await embeddingRoutes(req, res, { path: p, authn })) return;
+    if (await inferenceMachineRoutes(req, res, { path: p, authn, url })) return;
 
     if (await modelRoutes(req, res, { path: p, authn, url })) return;
 

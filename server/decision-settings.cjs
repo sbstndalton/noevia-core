@@ -44,16 +44,22 @@ function startupWarnings(env=process.env) {
 // at connect time and refuses it unless every answer is on this network; `lookup` is the resolver the
 // connection test's up-front check uses (tests stub it).
 const invalidUrl=()=>Object.assign(Error('Use a private HTTP address such as http://192.168.1.20:8040, with no path, login or query string.'),{status:400,messageId:'invalidUrl'});
-function createDecisionSettings({store,env=process.env,fetchImpl=decisionServiceFetch,sensitivityFetchImpl=(fetchImpl===decisionServiceFetch?serviceFetch:fetchImpl),lookup=undefined,audit=()=>{},kinds=SERVICE_KINDS}) {
+// #1638: `machineUrl` is the address of the machine Settings → Inference machines puts the decision service on
+// (inference-machines.cjs urlFor('decision')), or null while it is on this machine. It wins over the URL saved here
+// and COWORK_DECISION_URL; the deadline and the model chosen here still apply. A machine is another host, so the
+// shared COWORK_DECISION_API_KEY is never sent there (backend()'s #1753 same-host rule).
+function createDecisionSettings({store,env=process.env,fetchImpl=decisionServiceFetch,sensitivityFetchImpl=(fetchImpl===decisionServiceFetch?serviceFetch:fetchImpl),lookup=undefined,audit=()=>{},kinds=SERVICE_KINDS,machineUrl=()=>null}) {
   let saved;
   try { saved=JSON.parse(store.get(KEY)||'null'); } catch { saved={url:'',timeoutMs:1500}; }
   // #1666: `model` is the decision model the administrator chose in Settings, present only when one was chosen (absent =
   // automatic: the deployment's COWORK_DECISION_MODEL when the URL is the deployment's own, Laya otherwise, exactly as
   // before). The reply is otherwise unchanged (the recorded HTTP contract corpus); the choosable ids are on the admin's
   // Decision row of /api/models/assignments.
+  const onMachine=()=>{ try { const u=machineUrl(); return typeof u==='string'&&u?u:null; } catch { return null; } };
   const get=()=>{
     const base=saved || {url:env.COWORK_DECISION_URL||'',timeoutMs:1500};
-    return {url:base.url,timeoutMs:base.timeoutMs,...(typeof base.model==='string'&&base.model?{model:base.model}:{}),source:saved?'admin':'deployment'};
+    const machine=onMachine();
+    return {url:machine||base.url,timeoutMs:base.timeoutMs,...(typeof base.model==='string'&&base.model?{model:base.model}:{}),source:machine?'machine':saved?'admin':'deployment'};
   };
   function validate(value) {
     if(!value || typeof value.url!=='string' || !Number.isInteger(value.timeoutMs) || value.timeoutMs<100 || value.timeoutMs>2000)
