@@ -70,3 +70,16 @@ test('only admins can read, save or test decision settings',async()=>{
   }
   const res={};await route({method:'PUT',body:{url:'http://laya:8040',timeoutMs:500}},res,{path:'/api/admin/decision-settings',authn:{user:{id:'admin',role:'admin'}}});assert.equal(res.status,200);
 });
+test('#1816 a PUT without model keeps the saved decision model; only "" or null clear it',()=>{
+  const {store,settings}=fixture();
+  settings.save({url:'http://laya:8040',timeoutMs:900,model:'kev-0.8b'},'admin');
+  assert.equal(settings.get().model,'kev-0.8b');
+  settings.save({url:'http://laya:8040',timeoutMs:1000},'admin');
+  assert.equal(settings.get().model,'kev-0.8b','absent model keeps the choice');
+  assert.equal(createDecisionSettings({store,env:{}}).get().model,'kev-0.8b','and it is persisted');
+  settings.save({url:'http://laya:8040',timeoutMs:1000,model:null},'admin');
+  assert.equal('model' in settings.get(),false,'null clears; GET shape has no model key');
+  settings.save({url:'http://laya:8040',timeoutMs:1000,model:'kev-0.8b'},'admin');
+  settings.save({url:'http://laya:8040',timeoutMs:1000,model:''},'admin');
+  assert.equal('model' in settings.get(),false,'empty string clears');
+});

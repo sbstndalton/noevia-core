@@ -160,6 +160,9 @@ function createModelService({ fetchJson, env, modelManager, currentWorkspace, li
     void (async () => {
       for (const role of ['fast', 'smart', 'vision', 'code', 'creative']) {
         if (!roles[role]) continue;
+        // #1816: one chat model at a time; warming Creative would evict the model the router mostly picks. Only a Creative
+        // model that is also the Fast or Smart model is warmed (it is already loaded through that role).
+        if (role === 'creative' && roles.creative !== roles.fast && roles.creative !== roles.smart) continue;
         try {
           await ensureModelLoaded(roles[role]);
         } catch (err) {

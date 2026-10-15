@@ -16,7 +16,7 @@ const { missingRoles, staleRolesError } = require('./auto-roles-check.cjs');
 let ROLES = { fast: 'synthetic-fast', smart: 'synthetic-smart' };
 const catalogue = [{ name: 'synthetic-fast' }, { name: 'synthetic-smart' }, { name: 'synthetic-manual' }, { name: 'synthetic-creative' }];
 
-async function turn(t, { route, project = { routing: 'auto' }, globalEffort = 'default', local = true, message, roles = ROLES }) {
+async function turn(t, { rows = catalogue, realMissing = false, route, project = { routing: 'auto' }, globalEffort = 'default', local = true, message, roles = ROLES }) {
   // The default provider is the local llama.cpp engine unless a case says otherwise (reasoning-effort.cjs localEngine).
   const saved = { kind: process.env.MODEL_MANAGER_KIND, base: process.env.INFERENCE_BASE_URL };
   if (local) { process.env.MODEL_MANAGER_KIND = 'llamacpp'; process.env.INFERENCE_BASE_URL = 'http://default.invalid'; }
@@ -45,7 +45,7 @@ async function turn(t, { route, project = { routing: 'auto' }, globalEffort = 'd
     toolPolicy: { mode: () => 'allow' }, requestScope: { getStore: () => ({}) }, resolveTools: () => ({ tools: [], dropped: [] }), isWriteTool: () => false,
     rag: { filesContext: async () => null }, prefill: { recordSample() {} }, reduceToolResult: () => ({ text: 'reduced' }), diaryExtras: require('./diary-extras.cjs'),
     DIARY_BASE: 'http://fixture.invalid', TOOL_RESULT_CAP: 8000, json: () => {}, saveChats() {}, endpointApproved: () => true, diaryHeaders: () => ({}),
-    lastLoadedModel: () => null, classifyFastOrSmart: async () => route, servedCatalogue: async () => catalogue, modelsInstalled: async () => catalogue, missingRoles: () => [], staleRolesError: () => null,
+    lastLoadedModel: () => null, classifyFastOrSmart: async () => route, servedCatalogue: async () => rows, modelsInstalled: async () => rows, missingRoles: realMissing ? missingRoles : () => [], staleRolesError: realMissing ? staleRolesError : () => null,
     allToolboxes: () => [{ id: 'core' }], chatWideApproved: () => false, recordUsage() {}, recordToolUse() {}, executeToolCall: async () => 'unused', awaitApproval: async () => 'approve',
   });
   await handleChat({}, res, { projectId: 'fixture-project', chatId: 'fixture-chat', message });
@@ -112,4 +112,39 @@ test('#1667 a Creative model that is no longer installed is reported like the ot
   const missing = missingRoles({ ...WITH_CREATIVE, creative: 'gone-creative' }, catalogue);
   assert.deepEqual(missing, [{ role: 'creative', model: 'gone-creative' }]);
   assert.match(staleRolesError(missing), /Creative \(gone-creative\)/);
+});
+
+const loadedRows = (...names) => catalogue.map((m) => ({ ...m, loaded: names.includes(m.name) }));
+
+test('#1816 routing: no swap for a creative prompt when the router pick is loaded and Creative is not', async (t) => {
+  const { request, meta } = await turn(t, { route: 'smart', message: CREATIVE, roles: WITH_CREATIVE, rows: loadedRows('synthetic-smart') });
+  assert.equal(request.model, 'synthetic-smart', 'the loaded router pick stays');
+  assert.equal(meta.route, 'smart');
+  assert.equal(request.temperature, PRESETS.creative.temperature, 'still with creative sampling');
+});
+
+test('#1816 routing: the move to Creative happens when Creative is loaded, or nothing is, and an embedding does not count', async (t) => {
+  for (const rows of [loadedRows('synthetic-creative'), loadedRows(), loadedRows('synthetic-creative', 'synthetic-smart')]) {
+    const { request, meta } = await turn(t, { route: 'smart', message: CREATIVE, roles: WITH_CREATIVE, rows });
+    assert.equal(request.model, 'synthetic-creative');
+    assert.equal(meta.route, 'creative');
+  }
+  const withEmbedding = [...loadedRows(), { name: 'synthetic-embed', labels: ['embedding'], loaded: true }];
+  assert.equal((await turn(t, { route: 'smart', message: CREATIVE, roles: WITH_CREATIVE, rows: withEmbedding })).request.model, 'synthetic-creative');
+});
+
+test('#1816 routing: an unreadable loaded state keeps the router pick', async (t) => {
+  const { request } = await turn(t, { route: 'smart', message: CREATIVE, roles: WITH_CREATIVE, rows: null });
+  assert.equal(request.model, 'synthetic-smart');
+});
+
+test('#1816 routing: a missing Creative preset neither 409s the turn nor moves it', async (t) => {
+  const rows = catalogue.filter((m) => m.name !== 'synthetic-creative');
+  const { request, meta } = await turn(t, { route: 'smart', message: CREATIVE, roles: WITH_CREATIVE, rows, realMissing: true });
+  assert.ok(request, 'the turn was sent upstream, not refused');
+  assert.equal(request.model, 'synthetic-smart');
+  assert.equal(meta.route, 'smart');
+  assert.equal(request.temperature, PRESETS.creative.temperature);
+  const gone = await turn(t, { route: 'smart', message: PLAIN, roles: { ...WITH_CREATIVE, smart: 'gone-smart' }, rows, realMissing: true });
+  assert.equal(gone.request, undefined, 'a missing Fast or Smart model still stops the turn');
 });
