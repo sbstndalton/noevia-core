@@ -226,8 +226,18 @@ function healthShaped(s) {
  * `health: false` (#1592) skips the health rule, for public text such as a web search result about a
  * condition, which is not the user's data; secrets, IBANs and cards are always checked.
  */
+// #1791: text noevia itself puts around the user's content is not the user's secret. A free chat's files live
+// under its hidden project's folder, "cowork-chat-context-<chat id>/", and that path segment is key-shaped
+// (a short prefix, a dash, 24+ letters and digits), so attaching any file, a PNG included, flagged the turn
+// as "a password or key". Image bytes as a base64 data URI are not a secret either. Both are blanked before
+// the scan; only the path segment form is blanked (the chat id grammar, then "/"), so prose is untouched.
+const CHAT_CONTEXT_SEGMENT_RE = /\bcowork-chat-context-[A-Za-z0-9_-]{1,100}\//g;
+const DATA_URI_RE = /\bdata:[a-z]{1,20}\/[a-z0-9.+-]{1,60};base64,[A-Za-z0-9+/]+={0,2}/gi;
+function withoutNoeviaData(s) {
+  return s.replace(CHAT_CONTEXT_SEGMENT_RE, 'chat/').replace(DATA_URI_RE, '[image]');
+}
 function preRule(text, { health = true } = {}) {
-  const s = String(text || '').slice(0, SCAN_LIMIT);
+  const s = withoutNoeviaData(String(text || '').slice(0, SCAN_LIMIT));
   if (SECRET_PATTERNS.some((re) => re.test(s)) || secretAssignment(s) || jwtShaped(s) || keyShaped(s)) return 'secret';
   for (const m of s.matchAll(IBAN_RE)) if (ibanValid(m[0])) return 'iban';
   for (const m of s.matchAll(CARD_RE)) {
