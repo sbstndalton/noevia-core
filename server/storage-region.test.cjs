@@ -20,8 +20,14 @@ function authFixture(t) {
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const secrets = createSecretStore(root);
   const auth = createAuth({ dataDir: root, publicOrigin: 'https://noevia.example.test', secrets });
-  const addUser = (id) => auth.db.prepare(`INSERT INTO users(id,username,username_norm,display_name,role,password_hash,webauthn_user_id,created_at,updated_at)
-    VALUES(?,?,?,?,'member','x',?,0,0)`).run(id, id, id, id, `w-${id}`);
+  // The accounts are the Rust front's (#1071): users are written through the front's own connection.
+  const addUser = (id) => {
+    const front = new (require('better-sqlite3'))(path.join(root, 'cowork.db'));
+    try {
+      front.prepare(`INSERT INTO users(id,username,username_norm,display_name,role,password_hash,webauthn_user_id,created_at,updated_at)
+        VALUES(?,?,?,?,'member','x',?,0,0)`).run(id, id, id, id, `w-${id}`);
+    } finally { front.close(); }
+  };
   return { root, secrets, auth, addUser };
 }
 

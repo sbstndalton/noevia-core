@@ -9,151 +9,87 @@ const { createAuth } = require('./auth.cjs');
 const { createSecretStore } = require('./secrets.cjs');
 const { createWorkspaceStore } = require('./workspace.cjs');
 
-function request() { return { headers: { origin: 'https://cowork.example.test', 'user-agent': 'test' }, socket: { remoteAddress: '127.0.0.1' } }; }
-function response() { return { headers: {}, setHeader(k, v) { this.headers[k] = v; } }; }
+// Sign-in, invitations, recovery, disabling an account and first-run setup are the Rust front's
+// (sbstndalton/noevia#1071; noevia-rs crates/server-account). The accounts and their tokens are
+// written here through a separate connection, as the front writes them; what is tested is what
+// stays Node's: deleting an account, the origin check, and per-account workspaces.
+const Database = require('better-sqlite3');
+const { seedAccount } = require('../tests/server/seed-account.cjs');
+const asFront = (root, fn) => { const db = new Database(path.join(root, 'cowork.db')); try { return fn(db); } finally { db.close(); } };
 
-async function deletionFixture(t) {
+function deletionFixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cowork-delete-admin-'));
   const auth = createAuth({ dataDir: root, publicOrigin: 'https://cowork.example.test' });
   t.after(() => { auth.db.close(); fs.rmSync(root, { recursive: true, force: true }); });
-  const password = 'synthetic account deletion password';
-  const first = await auth.setup(request(), response(), { setupCode: fs.readFileSync(path.join(root, 'first-run-setup-code'), 'utf8').trim(), publicOrigin: 'https://cowork.example.test', username: 'first', password });
-  const firstId = first.body.user.id;
-  const second = await auth.acceptInvite(request(), response(), { token: auth.createInvite(firstId, 'admin').token, username: 'second', password });
-  return { auth, firstId, secondId: second.body.user.id, password };
+  const firstId = seedAccount(root, { username: 'first' }).id;
+  const secondId = seedAccount(root, { username: 'second' }).id;
+  return { root, auth, firstId, secondId };
 }
 
-test('deleting an administrator revokes issued invite/recovery tokens but preserves other users and audit history', async t => {
-  const { auth, firstId, secondId, password } = await deletionFixture(t);
-  const invitation = auth.createInvite(secondId);
-  const recovery = auth.createRecovery(secondId, firstId);
+test('deleting an administrator revokes issued invite/recovery tokens but preserves other users and audit history', t => {
+  const { root, auth, firstId, secondId } = deletionFixture(t);
+  const now = Date.now();
+  asFront(root, (db) => {
+    db.prepare('INSERT INTO invitations(token_hash,created_by,role,expires_at,created_at) VALUES(?,?,?,?,?)').run('synthetic-invite', secondId, 'member', now + 86400000, now);
+    db.prepare('INSERT INTO recoveries(token_hash,user_id,created_by,expires_at,created_at) VALUES(?,?,?,?,?)').run('synthetic-recovery', firstId, secondId, now + 3600000, now);
+    db.prepare("INSERT INTO audit_events(actor_user_id,target_user_id,action,detail,created_at) VALUES(?,NULL,'invite.create','{}',?)").run(secondId, now);
+  });
   assert.equal(auth.deleteUser(firstId, secondId, 'wrong-name'), false);
   assert.equal(auth.deleteUser(firstId, secondId, 'second'), true);
   assert.deepEqual(auth.listUsers().map(u => u.id), [firstId]);
-  assert.equal((await auth.acceptInvite(request(), response(), { token: invitation.token, username: 'third', password })).status, 400);
-  assert.equal(await auth.completeRecovery({ token: recovery.token, password }), false);
+  assert.equal(auth.db.prepare('SELECT count(*) AS n FROM invitations').get().n, 0, 'the invitation it issued is revoked');
+  assert.equal(auth.db.prepare('SELECT count(*) AS n FROM recoveries').get().n, 0, 'the recovery link it issued is revoked');
   assert.equal(auth.db.prepare('SELECT count(*) AS n FROM sessions WHERE user_id=?').get(secondId).n, 0);
+  assert.equal(auth.db.prepare('SELECT count(*) AS n FROM sessions WHERE user_id=?').get(firstId).n, 1, 'the other account keeps its session');
   assert.ok(auth.db.prepare("SELECT 1 FROM audit_events WHERE actor_user_id=? AND action='invite.create'").get(secondId));
   assert.ok(auth.db.prepare("SELECT 1 FROM audit_events WHERE target_user_id=? AND action='user.delete'").get(secondId));
 });
 
-test('disabling an administrator revokes their still-open invitations, not just their sessions', async t => {
-  const { auth, firstId, secondId, password } = await deletionFixture(t);
-  const invitation = auth.createInvite(secondId);
-  auth.setDisabled(firstId, secondId, true);
-  assert.equal((await auth.acceptInvite(request(), response(), { token: invitation.token, username: 'third', password })).status, 400);
-});
-
-test('a disabled administrator cannot make deletion of the last active administrator safe', async t => {
-  const { auth, firstId, secondId } = await deletionFixture(t);
-  auth.setDisabled(firstId, secondId, true);
+test('a disabled administrator cannot make deletion of the last active administrator safe', t => {
+  const { root, auth, firstId, secondId } = deletionFixture(t);
+  asFront(root, (db) => db.prepare('UPDATE users SET disabled_at=? WHERE id=?').run(Date.now(), secondId));
   assert.throws(() => auth.deleteUser(firstId, firstId, 'first'), /last active administrator/);
   assert.equal(auth.listUsers().length, 2);
   assert.equal(auth.deleteUser(firstId, secondId, 'second'), true);
   assert.throws(() => auth.deleteUser(firstId, firstId, 'first'), /last active administrator/);
 });
 
-test('bootstrap, password login, invitations, and workspace isolation', async (t) => {
+test('the Diary preference is read per account, and workspaces are isolated', (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cowork-system-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const secrets = createSecretStore(root);
   const auth = createAuth({ dataDir: root, publicOrigin: 'https://cowork.example.test', rpId: 'cowork.example.test', secrets });
-  const setupCode = fs.readFileSync(path.join(root, 'first-run-setup-code'), 'utf8').trim();
-  const setupRes = response();
-  const setup = await auth.setup(request(), setupRes, { setupCode, publicOrigin: 'https://cowork.example.test', username: 'Owner', displayName: 'Owner', password: 'correct horse battery staple', diaryEnabled: true });
-  assert.equal(setup.status, 201); assert.equal(setup.body.user.role, 'admin');
-  assert.equal(setup.body.user.diaryEnabled, true);
-  assert.equal(fs.existsSync(path.join(root, 'first-run-setup-code')), false);
-  assert.doesNotMatch(auth.db.prepare('SELECT password_hash FROM users').get().password_hash, /correct horse/);
-  const login = await auth.passwordLogin(request(), response(), { username: 'owner', password: 'correct horse battery staple' });
-  assert.equal(login.status, 200);
-  const registration = await auth.registrationOptions(setup.body.user.id);
-  assert.ok(registration.options.challenge); assert.ok(registration.challengeToken);
-
-  const invitation = auth.createInvite(setup.body.user.id, 'member');
-  const member = await auth.acceptInvite(request(), response(), { token: invitation.token, username: 'member', displayName: 'Member', password: 'another correct horse battery', diaryEnabled: false });
-  assert.equal(member.status, 201);
-  assert.equal(member.body.user.diaryEnabled, false);
-  assert.deepEqual(auth.setDiaryEnabled(member.body.user.id, true), { diaryEnabled: true });
-  assert.equal(auth.diaryEnabled(member.body.user.id), true);
+  t.after(() => auth.db.close());
+  const owner = seedAccount(root, { username: 'Owner', diaryEnabled: true });
+  const member = seedAccount(root, { username: 'member', role: 'member', diaryEnabled: false });
+  assert.equal(auth.diaryEnabled(owner.id), true);
+  assert.equal(auth.diaryEnabled(member.id), false);
+  assert.deepEqual(auth.listUsers().map((u) => [u.username, u.role]), [['Owner', 'admin'], ['member', 'member']]);
   const store = createWorkspaceStore(root, { id: 'default', label: 'Default', baseUrl: 'http://localhost', apiKey: '' }, secrets);
-  const ownerSpace = store.get(setup.body.user.id); const memberSpace = store.get(member.body.user.id);
+  const ownerSpace = store.get(owner.id); const memberSpace = store.get(member.id);
   ownerSpace.projects.push({ id: 'private-project', name: 'Private' }); ownerSpace.saveProjects();
   assert.equal(memberSpace.projects.length, 0);
   assert.notEqual(ownerSpace.dir, memberSpace.dir);
 });
 
-test('additionalOrigins allows password login from a second origin (e.g. a LAN IP) without weakening the primary cookie', async () => {
-  // Regression for: password login 403s with "origin not allowed" when a
-  // deployment is reachable from both a Cloudflare Tunnel hostname (the
-  // configured publicOrigin) and a bare LAN IP.
+test('additionalOrigins lets a second origin (e.g. a LAN IP) pass the origin check without trusting any other', () => {
+  // Regression for: password login 403s with "origin not allowed" when a deployment is reachable
+  // from both a Cloudflare Tunnel hostname (the configured publicOrigin) and a bare LAN IP. Node's
+  // routes still check the Origin of every signed-in write with the same rule.
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cowork-multi-origin-'));
-  const secrets = createSecretStore(root);
   const auth = createAuth({
     dataDir: root,
     publicOrigin: 'https://cowork.example.test',
     rpId: 'cowork.example.test',
-    secrets,
+    secrets: createSecretStore(root),
     additionalOrigins: ['http://10.0.0.5:8021'],
   });
-  const setupCode = fs.readFileSync(path.join(root, 'first-run-setup-code'), 'utf8').trim();
-  const setup = await auth.setup(request(), response(), {
-    setupCode, publicOrigin: 'https://cowork.example.test', username: 'Owner', displayName: 'Owner',
-    password: 'correct horse battery staple', diaryEnabled: false,
-  });
-  assert.equal(setup.status, 201);
-
-  const untrustedReq = { headers: { origin: 'http://evil.example.test', 'user-agent': 'test' }, socket: { remoteAddress: '127.0.0.1' } };
-  assert.equal(auth.originValid(untrustedReq), false);
-
-  const lanReq = { headers: { origin: 'http://10.0.0.5:8021', 'user-agent': 'test' }, socket: { remoteAddress: '10.0.0.5' } };
-  assert.equal(auth.originValid(lanReq), true);
-  const lanRes = response();
-  const lanLogin = await auth.passwordLogin(lanReq, lanRes, { username: 'owner', password: 'correct horse battery staple' });
-  assert.equal(lanLogin.status, 200);
-  // Plain-HTTP trusted origin must not get a Secure cookie, or the browser drops it.
-  assert.ok(lanRes.headers['Set-Cookie'].every((c) => !c.includes('; Secure')));
-
-  const tunnelRes = response();
-  const tunnelLogin = await auth.passwordLogin(request(), tunnelRes, { username: 'owner', password: 'correct horse battery staple' });
-  assert.equal(tunnelLogin.status, 200);
-  // The primary HTTPS origin keeps Secure as before.
-  assert.ok(tunnelRes.headers['Set-Cookie'].every((c) => c.includes('; Secure')));
-
-  fs.rmSync(root, { recursive: true, force: true });
-});
-
-test('setup() accepts private-network http origins so first-run works at a bare LAN IP', async (t) => {
-  // Regression for: "pull the container, load the host's LAN IP, set up there"
-  // failed at account creation because setup() only accepted https:// or
-  // http://localhost. A private-network address is now accepted (the wizard
-  // warns that passkeys will not work there); a public http:// domain is not.
-  const cases = [
-    { origin: 'http://10.0.0.5:8021', status: 201, why: 'private LAN IP' },
-    { origin: 'http://192.168.1.20:8021', status: 201, why: 'private LAN IP (192.168/16)' },
-    { origin: 'http://172.16.4.4:8021', status: 201, why: 'private LAN IP (172.16/12)' },
-    { origin: 'http://myserver:8021', status: 201, why: 'bare LAN hostname' },
-    { origin: 'http://localhost:8021', status: 201, why: 'loopback (regression check)' },
-    { origin: 'https://cowork.example.test', status: 201, why: 'public https' },
-    { origin: 'http://example.com', status: 400, why: 'public http domain' },
-    { origin: 'http://172.32.0.1:8021', status: 400, why: 'public IP outside 172.16/12' },
-    { origin: 'ftp://myserver', status: 400, why: 'non-http scheme' },
-    { origin: 'not a url', status: 400, why: 'unparseable' },
-  ];
-  for (const { origin, status, why } of cases) {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cowork-origin-'));
-    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-    // The server boots with a valid configured origin; what is under test is
-    // the origin the wizard submits, so only the setup body varies.
-    const auth = createAuth({ dataDir: root, publicOrigin: 'http://localhost:8021', secrets: createSecretStore(root) });
-    const setupCode = fs.readFileSync(path.join(root, 'first-run-setup-code'), 'utf8').trim();
-    const result = await auth.setup(request(), response(), {
-      setupCode, publicOrigin: origin, username: 'Owner', displayName: 'Owner',
-      password: 'correct horse battery staple', diaryEnabled: false,
-    });
-    assert.equal(result.status, status, `${why}: ${origin}`);
-    if (status === 201) assert.equal(auth.origin, origin);
-  }
+  try {
+    const from = (origin) => ({ headers: { origin, 'user-agent': 'test' }, socket: { remoteAddress: '127.0.0.1' } });
+    assert.equal(auth.originValid(from('http://evil.example.test')), false);
+    assert.equal(auth.originValid(from('http://10.0.0.5:8021')), true);
+    assert.equal(auth.originValid(from('https://cowork.example.test')), true);
+  } finally { auth.db.close(); fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 test('provider secrets are encrypted on disk and decrypt for their owner', () => {
@@ -164,24 +100,4 @@ test('provider secrets are encrypted on disk and decrypt for their owner', () =>
   const raw = fs.readFileSync(path.join(workspace.dir, 'providers.json'), 'utf8');
   assert.doesNotMatch(raw, /super-secret-key/); assert.match(raw, /enc:v1:/);
   fs.rmSync(root, { recursive: true, force: true });
-});
-
-test('appearance stays account-owned and survives reopening the database', async t => {
-  const root=fs.mkdtempSync(path.join(os.tmpdir(),'cowork-appearance-'));
-  const auth=createAuth({dataDir:root,publicOrigin:'https://cowork.example.test'});
-  t.after(()=>{auth.db.close();fs.rmSync(root,{recursive:true,force:true});});
-  const owner=await auth.setup(request(),response(),{setupCode:fs.readFileSync(path.join(root,'first-run-setup-code'),'utf8').trim(),publicOrigin:'https://cowork.example.test',username:'owner',password:'synthetic appearance test password'});
-  const ownerId=owner.body.user.id;
-  const other=await auth.acceptInvite(request(),response(),{token:auth.createInvite(ownerId).token,username:'other',password:'synthetic other test password'});
-  const otherId=other.body.user.id;
-  const value={theme:'dark',light:'sage',dark:'iris'};
-  assert.equal(auth.getAppearance(ownerId),null);
-  auth.setAppearance(ownerId,value);
-  assert.equal(auth.getAppearance(otherId),null);
-  auth.setAppearance(otherId,{theme:'light',light:'warm',dark:'neutral'});
-  assert.throws(()=>auth.setAppearance(ownerId,{...value,dark:'invalid'}));
-  const reopened=createAuth({dataDir:root,publicOrigin:'https://cowork.example.test'});
-  assert.deepEqual(reopened.getAppearance(ownerId),value);
-  assert.equal(reopened.getAppearance(otherId).dark,'neutral');
-  reopened.db.close();
 });

@@ -60,13 +60,10 @@ async function request(url, { method = 'GET', headers = {}, body = '' } = {}) {
   };
 }
 
-test.before(async () => {
-  const setupCode = fs.readFileSync(path.join(testDataDir, 'first-run-setup-code'), 'utf8').trim();
-  const response = await request('/api/setup/complete', {
-    method: 'POST', headers: { origin: 'http://localhost' },
-    body: JSON.stringify({ setupCode, publicOrigin: 'http://localhost', username: 'admin', displayName: 'Admin', password: 'correct horse battery staple' }),
-  });
-  assert.equal(response.status, 201);
+let adminId = '';
+test.before(() => {
+  // First-run setup is the Rust front's (#1071): the administrator the legacy bearer acts as is seeded.
+  ({ id: adminId } = require('../tests/server/seed-account.cjs').seedAccount(testDataDir, { username: 'admin', displayName: 'Admin', publicOrigin: 'http://localhost' }));
 });
 
 test('rejects API requests without a token', async () => {
@@ -174,7 +171,8 @@ test('large authenticated request is bounded before JSON parsing', async () => {
 
 test('diary file routes require auth and forward conflicts without losing the error', async (t) => {
   assert.equal((await request('/api/diary/files')).status, 401);
-  assert.equal((await request('/api/profile/features', { method: 'PUT', headers: adminHeaders, body: JSON.stringify({diaryEnabled:true}) })).status, 200);
+  // The Diary preference is written by the Rust front (#1071).
+  require('../tests/server/seed-account.cjs').setUserFeatures(testDataDir, adminId, { diaryEnabled: true });
   t.mock.method(globalThis, 'fetch', async (url, opts) => {
     assert.match(String(url), /\/api\/file$/);
     assert.ok(opts.headers['X-Cowork-User-ID']);
@@ -195,28 +193,4 @@ test('diary forwards browser date and selected day to the pipeline', async (t) =
   assert.match(r.text, /"type":"reasoning","text":"Synthetic provider reasoning"/);
 });
 
-test('profile name and Diary preference persist through real authenticated routes', async () => {
-  const before = JSON.parse((await request('/api/profile', {headers:adminHeaders})).text).user;
-  try {
-    assert.equal((await request('/api/profile', {method:'PATCH',headers:adminHeaders,body:JSON.stringify({displayName:'Synthetic Settings Review'})})).status,200);
-    for (const enabled of [false,true]) {
-      assert.equal((await request('/api/profile/features', {method:'PUT',headers:adminHeaders,body:JSON.stringify({diaryEnabled:enabled})})).status,200);
-      const saved = JSON.parse((await request('/api/profile', {headers:adminHeaders})).text).user;
-      assert.equal(saved.displayName,'Synthetic Settings Review');
-      assert.equal(saved.diaryEnabled,enabled);
-    }
-    assert.equal((await request('/api/profile', {method:'PATCH',body:JSON.stringify({displayName:'Denied'})})).status,401);
-  } finally {
-    await request('/api/profile',{method:'PATCH',headers:adminHeaders,body:JSON.stringify({displayName:before.displayName})});
-    await request('/api/profile/features',{method:'PUT',headers:adminHeaders,body:JSON.stringify({diaryEnabled:before.diaryEnabled})});
-  }
-});
-
-test('appearance API persists both mode palettes and rejects invalid or unauthenticated writes',async()=>{
-  const value={theme:'light',light:'sage',dark:'iris'};
-  assert.equal((await request('/api/profile/appearance',{method:'PUT',body:JSON.stringify(value)})).status,401);
-  assert.equal((await request('/api/profile/appearance',{method:'PUT',headers:adminHeaders,body:JSON.stringify(value)})).status,200);
-  assert.deepEqual(JSON.parse((await request('/api/profile/appearance',{headers:adminHeaders})).text),value);
-  assert.equal((await request('/api/profile/appearance',{method:'PUT',headers:adminHeaders,body:JSON.stringify({...value,light:'bogus'})})).status,400);
-  assert.deepEqual(JSON.parse((await request('/api/profile/appearance',{headers:adminHeaders})).text),value);
-});
+// The profile, the Diary preference and appearance are the Rust front's (#1071; noevia-rs crates/server-account).

@@ -3,6 +3,8 @@
 // #231): which events may raise a browser notification, how the composer sends, and the locale
 // used for dates and numbers. Stored per user beside projects.json, like the other account-*.cjs
 // records. Browser notification *permission* stays per device; only the event choices live here.
+// The Rust front reads and writes them (/api/account/preferences, sbstndalton/noevia#1071); the
+// names and the reader stay here for the web client's parity tests.
 const fs = require('node:fs');
 const path = require('node:path');
 
@@ -16,8 +18,6 @@ const LOCALES = ['system', 'en-GB', 'en-US', 'de-DE', 'es-ES', 'fr-FR', 'it-IT',
 function defaults() {
   return { notifications: Object.fromEntries(NOTIFICATION_EVENTS.map((e) => [e, true])), sendKey: 'enter', locale: 'system', updatedAt: null };
 }
-
-function readable(message, status = 400) { return Object.assign(Error(message), { publicMessage: message, status }); }
 
 function normalise(data) {
   const out = defaults();
@@ -35,33 +35,4 @@ function read(dir) {
   try { return normalise(JSON.parse(fs.readFileSync(path.join(dir, FILE), 'utf8'))); } catch { return defaults(); }
 }
 
-/** A partial patch: fields left out keep their saved value. Unknown values are refused, not coerced. */
-function write(dir, patch, now = Date.now()) {
-  if (!patch || typeof patch !== 'object' || Array.isArray(patch)) throw readable('Send preferences as an object.');
-  const next = read(dir);
-  if (patch.notifications !== undefined) {
-    if (!patch.notifications || typeof patch.notifications !== 'object') throw readable('Send notification choices as an object.');
-    for (const [event, on] of Object.entries(patch.notifications)) {
-      if (!NOTIFICATION_EVENTS.includes(event)) throw readable(`Unknown notification event: ${event}.`);
-      if (typeof on !== 'boolean') throw readable(`${event} must be true or false.`);
-      next.notifications[event] = on;
-    }
-  }
-  if (patch.sendKey !== undefined) {
-    if (!SEND_KEYS.includes(patch.sendKey)) throw readable('Choose enter or mod-enter to send.');
-    next.sendKey = patch.sendKey;
-  }
-  if (patch.locale !== undefined) {
-    if (!LOCALES.includes(patch.locale)) throw readable('That format is not available.');
-    next.locale = patch.locale;
-  }
-  next.updatedAt = now;
-  fs.mkdirSync(dir, { recursive: true });
-  const file = path.join(dir, FILE);
-  const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(next), { mode: 0o600 });
-  fs.renameSync(tmp, file);
-  return next;
-}
-
-module.exports = { read, write, defaults, NOTIFICATION_EVENTS, SEND_KEYS, LOCALES };
+module.exports = { read, defaults, NOTIFICATION_EVENTS, SEND_KEYS, LOCALES };

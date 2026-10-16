@@ -231,31 +231,12 @@ function memberHeaders() {
 
 const adminHeaders = { authorization: 'Bearer test-cowork-token', origin: 'http://localhost' };
 
-test.before(async () => {
-  const setupCode = fs.readFileSync(path.join(testDataDir, 'first-run-setup-code'), 'utf8').trim();
-  const response = await request('/api/setup/complete', {
-    method: 'POST', headers: { origin: 'http://localhost' },
-    body: JSON.stringify({ setupCode, publicOrigin: 'http://localhost', username: 'admin', displayName: 'Admin', password: 'correct horse battery staple' }),
-  });
-  assert.equal(response.status, 201);
-
-  // Create + sign in a member through an invitation.
-  const invite = await request('/api/admin/invitations', {
-    method: 'POST', headers: adminHeaders,
-    body: JSON.stringify({ role: 'member' }),
-  });
-  assert.equal(invite.status, 201);
-  const { token } = JSON.parse(invite.text);
-  const accepted = await request('/api/auth/invitations/accept', {
-    method: 'POST', headers: { origin: 'http://localhost' },
-    body: JSON.stringify({ token, username: 'member', displayName: 'Member', password: 'grumpy engineers count beans' }),
-  });
-  assert.equal(accepted.status, 201);
-  const cookies = accepted.headers['Set-Cookie'].map((c) => c.split(';')[0]);
-  memberCookie = cookies.filter((c) => c.startsWith('cowork_session=') || c.startsWith('cowork_csrf=')).join('; ');
-  memberCsrf = JSON.parse(accepted.text).csrfToken;
-  assert.ok(memberCookie.includes('cowork_session='));
-  assert.ok(memberCsrf);
+test.before(() => {
+  // Sign-in is the Rust front's (#1071): the admin (legacy bearer, LEGACY_AUTH_COMPAT) and a signed-in
+  // member are seeded directly.
+  const { seedAccount } = require('../tests/server/seed-account.cjs');
+  seedAccount(testDataDir, { username: 'admin', displayName: 'Admin', publicOrigin: 'http://localhost' });
+  ({ cookie: memberCookie, csrf: memberCsrf } = seedAccount(testDataDir, { username: 'member', displayName: 'Member', role: 'member' }));
 });
 
 test('member cannot register a private-range provider', async () => {
