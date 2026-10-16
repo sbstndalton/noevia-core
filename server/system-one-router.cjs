@@ -35,7 +35,7 @@ function clearlySimple(message) {
   return !words || Number(words[1]) <= 400;
 }
 
-function createSystemOneRouter({ enabled, roles, fallback, env = process.env, backend, getBackend = null, getDeadlineMs = null, deadlineMs = 1500,
+function createSystemOneRouter({ enabled, roles, fallback, env = process.env, backend, getBackend = null, getDeadlineMs = null, deadlineMs = 1500, precheck = true,
   log = (entry) => console.info('[system-one] route', JSON.stringify(entry)) }) {
   const config = configuration(env);
   const candidate = backend || (config.baseUrl ? llamaLogitBackend({ baseUrl: config.baseUrl,
@@ -60,7 +60,7 @@ function createSystemOneRouter({ enabled, roles, fallback, env = process.env, ba
         backend: 'legacy', model: null, calibrated: false, latencyMs: null, status: 'fallback',
         fallbackReason: !enabled() ? 'disabled' : !routing ? 'no-backend' : 'missing-roles', fallbackCause: null } };
     }
-    if (clearlySimple(message)) {
+    if (precheck && clearlySimple(message)) {
       log({ selected: 'fast', options: options.length, margin: null, ms: 0, fellBack: null, cause: null, precheck: true });
       return { role: 'fast', routingDecision: { offered, scores: {}, selectedRole: 'fast', effectiveRole: 'fast',
         backend: 'legacy', model: null, calibrated: false, latencyMs: 0, status: 'accepted', fallbackReason: null, fallbackCause: null } };
