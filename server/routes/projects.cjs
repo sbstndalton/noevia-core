@@ -77,7 +77,7 @@ function createProjectRoutes({
 }) {
   const { refuseOwned } = require('../rust-projects.cjs');
   const {
-    getProject, saveProjects, createProject, deleteProject, pruneDocuments, withSourceLock, ensureProjectFolder, indexSource, ownsFile,
+    getProject, saveProjects, createProject, deleteProject, whenSaved = (fn) => fn(), pruneDocuments, withSourceLock, ensureProjectFolder, indexSource, ownsFile,
     loadChats, saveChats, deleteChat,
   } = store;
   // #849: a rejected storage login is its own answer, not "could not create the folder". The
@@ -222,7 +222,11 @@ function createProjectRoutes({
     if (projMatch && req.method === 'DELETE') {
       // The whole cleanup (record, local uploads/documents/assets, RAG index, chats, empty-dir
       // sweep) lives in the store so a deleted chat's attachments project shares it (#788).
-      if (!deleteProject(decodeURIComponent(projMatch[1]))) return json(res, 404, { error: 'no such project' });
+      // #1914: awaited, so a failed save answers its error and nothing of the project is removed.
+      let removed;
+      try { removed = await deleteProject(decodeURIComponent(projMatch[1])); }
+      catch (e) { if (e && e.status && e.status < 500 && e.status !== 410) throw e; return saveFailureReply(json, res, e, 'could not delete the project; nothing was changed'); }
+      if (!removed) return json(res, 404, { error: 'no such project' });
       return json(res, 200, { ok: true });
     }
 
@@ -282,6 +286,7 @@ function createProjectRoutes({
     }
     const projCfg = p.match(/^\/api\/projects\/([^/]+)\/config$/);
     if (projCfg && req.method === 'POST') {
+      let dropIndexAfterSave = null;
       const id = decodeURIComponent(projCfg[1]);
       const raw = await readBody(req);
       let patch;
@@ -436,9 +441,9 @@ function createProjectRoutes({
         const prevByName = new Map(prevFiles.map((f) => [f.name, f]));
         const nextNames = new Set(project.files.map((f) => f.name));
         project.assets = (project.assets || []).filter(a => !a.sourceName || nextNames.has(a.sourceName));
-        for (const prev of prevFiles) {
-          if (!nextNames.has(prev.name)) rag.deleteProjectFile(id, prev.name, currentWorkspace().userId);
-        }
+        // #1914: the index entries of removed files go once the list without them is on disk.
+        const goneNames = prevFiles.filter((prev) => !nextNames.has(prev.name)).map((prev) => prev.name);
+        if (goneNames.length) dropIndexAfterSave = () => { const userId = currentWorkspace().userId; for (const name of goneNames) rag.deleteProjectFile(id, name, userId); };
         for (const next of project.files) {
           const prev = prevByName.get(next.name);
           if (!prev || !sourceText.sameText(prev, next)) {
@@ -459,6 +464,7 @@ function createProjectRoutes({
       if (patch.reasoningEffort === null) delete storedProject.reasoningEffort;
       saveProjects(PROJECTS);
       pruneDocuments(storedProject);
+      if (dropIndexAfterSave) Promise.resolve().then(() => whenSaved(dropIndexAfterSave)).catch(() => { /* not saved: kept */ });
       return json(res, 200, { ok: true });
     }
 
@@ -848,10 +854,17 @@ function createProjectRoutes({
           return json(res, (e && e.status) || 502, { error: (e && e.message) || 'could not delete the file' });
         }
         project.files = (project.files || []).filter((f) => f.name !== target);
-        pruneDocuments(project);
-        require('../uploads.cjs').prune(currentWorkspace(), project);
         saveProjects(PROJECTS);
-        rag.deleteProjectFile(id, target, currentWorkspace().userId);
+        // #1914: its upload original, document pages, assets and index entries go only once the
+        // list without it is on disk; the lists that cleanup trims are saved after it.
+        try {
+          await whenSaved(() => {
+            pruneDocuments(project);
+            require('../uploads.cjs').prune(currentWorkspace(), project);
+            rag.deleteProjectFile(id, target, currentWorkspace().userId);
+          });
+        } catch (e) { return saveFailureReply(json, res, e, 'could not remove the file from the project; nothing was changed'); }
+        saveProjects(PROJECTS);
         return json(res, 200, { ok: true, path: target });
       });
     }
@@ -1144,9 +1157,9 @@ function createProjectRoutes({
         // are gone, re-index the ones that arrived or changed.
         const prevByName = new Map(prev.map((f) => [f.name, f]));
         const nextNames = new Set(project.files.map((f) => f.name));
-        for (const old of prev) {
-          if (!nextNames.has(old.name)) rag.deleteProjectFile(id, old.name, currentWorkspace().userId);
-        }
+        // #1914: once the list without them is on disk.
+        const goneNames = prev.filter((old) => !nextNames.has(old.name)).map((old) => old.name);
+        if (goneNames.length) { const userId = currentWorkspace().userId; Promise.resolve().then(() => whenSaved(() => { for (const name of goneNames) rag.deleteProjectFile(id, name, userId); })).catch(() => { /* not saved: kept */ }); }
         for (const next of project.files) {
           const before = prevByName.get(next.name);
           if (!before || !sourceText.sameText(before, next) || (next.document && ['pending', 'failed', 'unavailable', 'partial'].includes(next.document.indexing))) {
@@ -1168,7 +1181,10 @@ function createProjectRoutes({
       const { decodePathPart } = require('../http.cjs');
       const projectId = decodePathPart(chatDel[1]), chatId = decodePathPart(chatDel[2]);
       if (projectId === null || chatId === null) return json(res, 400, { error: 'invalid chat id' });
-      const removed = deleteChat(projectId, chatId);
+      // #1914: awaited, so a failed save answers its error and the transcript is kept.
+      let removed;
+      try { removed = await deleteChat(projectId, chatId); }
+      catch (e) { if (e && e.status && e.status < 500 && e.status !== 410) throw e; return saveFailureReply(json, res, e, 'could not delete the chat; nothing was changed'); }
       return json(res, removed ? 200 : 404, removed ? { ok: true } : { error: 'no such chat' });
     }
 

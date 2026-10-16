@@ -88,6 +88,14 @@ function createClient({ port, token, fetchImpl = globalThis.fetch, timeoutMs = T
   };
 }
 
+/** The client from the supervisor's environment (enabledFrom held), and the secret taken out of
+ *  `env` at once (#1916), so no child process, error report or env dump can carry it on. */
+function clientFromEnv(env = process.env, options = {}) {
+  const token = String(env.NOEVIA_PROJECT_STORE_TOKEN || '');
+  delete env.NOEVIA_PROJECT_STORE_TOKEN;
+  return createClient({ port: Number(env.NOEVIA_PROJECT_STORE_PORT), token, ...options });
+}
+
 /** One workspace's saves, run one at a time in the order they were asked for (a chat's move saves
  *  the free list before the project, #1410), each file's not-yet-started save shared by the
  *  callers that ask again meanwhile (it saves the latest state). `pending()`: a promise for every
@@ -153,4 +161,4 @@ function holdForStoreSaves(res, saves) {
   };
 }
 
-module.exports = { enabledFrom, createClient, createQueue, busy, failureReply, holdForStoreSaves, MAX_ATTEMPTS, TIMEOUT_MS };
+module.exports = { enabledFrom, createClient, clientFromEnv, createQueue, busy, failureReply, holdForStoreSaves, MAX_ATTEMPTS, TIMEOUT_MS };

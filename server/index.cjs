@@ -104,8 +104,8 @@ const RUST_FREE_CHATS = RUST_PROJECTS && require('./rust-projects.cjs').freeChat
 const RUST_PROJECT_WRITES = RUST_PROJECTS && require('./rust-projects.cjs').projectWritesEnabledFrom(process.env);
 // sbstndalton/noevia#1264: both files written through the Rust front's internal store, not under flock.
 const PROJECT_STORE = RUST_FREE_CHATS && require('./project-store-client.cjs').enabledFrom(process.env)
-  ? require('./project-store-client.cjs').createClient({ port: Number(process.env.NOEVIA_PROJECT_STORE_PORT), token: process.env.NOEVIA_PROJECT_STORE_TOKEN })
-  : null;
+  ? require('./project-store-client.cjs').clientFromEnv(process.env)
+  : (delete process.env.NOEVIA_PROJECT_STORE_TOKEN, null); // #1916: never kept, used or not
 const authService = createAuth({
   rustAuth,
   dataDir: DATA_DIR,

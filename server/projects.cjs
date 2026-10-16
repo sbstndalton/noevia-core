@@ -47,7 +47,26 @@ function createProjectStore({
     currentWorkspace().assertActive?.();
     for (const project of projects) require("./instruction-skills.cjs").reconcile(project);
     currentWorkspace().projects = Array.from(projects);
-    currentWorkspace().saveProjects();
+    return currentWorkspace().saveProjects();
+  }
+
+  // #1914: what may only happen once the list change before it is on disk (a history file, a RAG
+  // index, a document's originals removed). Through the Rust project store a save is written later;
+  // `fn` then runs once every save of this workspace asked so far is written, and not at all if one
+  // failed (the promise rejects with that failure; memory is read again from disk). Without the
+  // store, or with nothing in flight, it runs now, as before.
+  function whenSaved(fn) {
+    const workspace = currentWorkspace();
+    const pending = workspace.pendingStoreWrites ? workspace.pendingStoreWrites() : null;
+    const failed = () => (workspace.storeFailed ? workspace.storeFailed() : null);
+    if (!pending) { const f = failed(); if (f) return Promise.reject(f); return fn(); }
+    return pending.then(() => { const f = failed(); if (f) throw f; return fn(); });
+  }
+  /** whenSaved for a step whose caller does not wait: a skipped step is logged, never thrown. */
+  function afterSaved(fn, what) {
+    let r;
+    try { r = whenSaved(fn); } catch (err) { console.warn(`[projects] ${what} failed:`, err.message); return; }
+    if (r && typeof r.then === 'function') r.catch((err) => console.warn(`[projects] ${what} skipped: the list change was not saved (${err.message})`));
   }
 
   function getProject(id) {
@@ -116,18 +135,8 @@ function createProjectStore({
     const before = (p.chats || []).length;
     p.chats = (p.chats || []).filter((c) => c.id !== chatId);
     if (p.chats.length === before) return false;
-    require('./chat-lists.cjs').addTombstone(currentWorkspace().dir, chatId);
-    saveProjects(PROJECTS);
-    removeChatBrain(currentWorkspace().dir, chatId);
-    try {
-      require('./chat-context.cjs').remove(currentWorkspace().dir,chatId);
-      fs.unlinkSync(currentWorkspace().historyPath(chatId));
-    } catch {
-      /* no history file — fine */
-    }
     // A chat that started free and was moved here (#738) keeps its attachments project (#788).
-    removeChatAttachments(chatId);
-    return true;
+    return removeChatAfterSave(chatId, () => saveProjects(PROJECTS));
   }
 
   // ── A free chat's hidden attachments project (#788) ──────────────────────
@@ -142,8 +151,9 @@ function createProjectStore({
   function removeChatAttachments(chatId) {
     const id = require('./diary-extras.cjs').chatProjectId(chatId);
     if (!id || !PROJECTS.some((p) => p && p.id === id)) return false;
-    try { return deleteProject(id, { purgeChats: false }); }
-    catch (err) { console.warn(`[projects] could not remove the attachments of deleted chat ${chatId}: ${String((err && err.message) || err)}`); return false; }
+    const warn = (err) => { console.warn(`[projects] could not remove the attachments of deleted chat ${chatId}: ${String((err && err.message) || err)}`); return false; };
+    try { const r = deleteProject(id, { purgeChats: false }); return r && typeof r.then === 'function' ? r.catch(warn) : r; }
+    catch (err) { return warn(err); }
   }
 
   // Attachments projects left behind by chats deleted before #788. Orphan-ness is proven only by
@@ -233,15 +243,36 @@ function createProjectStore({
   // itself first saved there), so both coordinated files are read again first and only the flags
   // are changed on what is on disk now (sbstndalton/noevia#1426).
   function setChatFlags(projectId, chatId, patch) {
-    const workspace = currentWorkspace();
+    return applyChatMeta(projectId, chatId, (meta) => { Object.assign(meta, patch); return true; });
+  }
+
+  // #1426/#1785/#1917: a chat turn's change to one meta (its routing flags, its generated title),
+  // made after the turn's long wait: both coordinated files are read again first and only that meta
+  // changes. The turn streams, so it cannot be told a save failed: through the Rust project store
+  // the change is applied to the live view of the account (`current()`: a view dropped after a
+  // failed save is replaced by one read from disk) and, if its save fails, applied once more to
+  // the view read again after that failure. `change(meta)` returns whether it changed the meta.
+  function applyChatMeta(projectId, chatId, change, retried = false) {
+    const held = currentWorkspace();
+    const workspace = typeof held.current === 'function' ? held.current() : held;
     const projectsChanged = workspace.projectsFile ? workspace.projectsFile.refresh(workspace.projects) : false;
     const freeChanged = workspace.freeChatsFile ? workspace.freeChatsFile.refresh(workspace) : false;
     if (projectsChanged || freeChanged) onProjectsChanged(workspace.userId);
-    const list = projectId ? getProject(projectId)?.chats : FREE_CHATS;
+    const project = projectId ? (workspace.projects || []).find((p) => p && p.id === projectId) : null;
+    if (project && workspace === held) getProject(projectId); // its self-heal, as before
+    const list = projectId ? project?.chats : workspace.freeChats;
     const meta = Array.isArray(list) ? list.find((c) => c && c.id === chatId) : null;
-    if (!meta) return false;
-    Object.assign(meta, patch);
-    if (projectId) saveProjects(PROJECTS); else saveFreeChats(FREE_CHATS);
+    if (!meta || !change(meta)) return false;
+    let saved;
+    if (projectId) { for (const p of workspace.projects) require('./instruction-skills.cjs').reconcile(p); saved = workspace.saveProjects(); }
+    else saved = workspace.saveFreeChats();
+    if (saved && typeof saved.then === 'function' && !retried) {
+      saved.catch(() => {
+        const fresh = typeof workspace.current === 'function' ? workspace.current() : workspace;
+        // The held view's current() is now the one read again: the retry applies there.
+        if (fresh !== workspace) applyChatMeta(projectId, chatId, change, true);
+      });
+    }
     return true;
   }
 
@@ -249,17 +280,12 @@ function createProjectStore({
   // while the stored one is still derived from the first message (or missing), so a name the person gave wins.
   function setChatTitle(projectId, chatId, title, firstMessage) {
     if (typeof title !== 'string' || !title.trim()) return false;
-    const workspace = currentWorkspace();
-    const projectsChanged = workspace.projectsFile ? workspace.projectsFile.refresh(workspace.projects) : false;
-    const freeChanged = workspace.freeChatsFile ? workspace.freeChatsFile.refresh(workspace) : false;
-    if (projectsChanged || freeChanged) onProjectsChanged(workspace.userId);
-    const list = projectId ? getProject(projectId)?.chats : FREE_CHATS;
-    const meta = Array.isArray(list) ? list.find((c) => c && c.id === chatId) : null;
     const chatTitle = require('./chat-title.cjs');
-    if (!meta || !chatTitle.isDerivedTitle(meta.title, firstMessage)) return false;
-    meta.title = title.trim().slice(0, chatTitle.TITLE_MAX);
-    if (projectId) saveProjects(PROJECTS); else saveFreeChats(FREE_CHATS);
-    return true;
+    return applyChatMeta(projectId, chatId, (meta) => {
+      if (!chatTitle.isDerivedTitle(meta.title, firstMessage)) return false;
+      meta.title = title.trim().slice(0, chatTitle.TITLE_MAX);
+      return true;
+    });
   }
 
   // #1785: whether a chat still carries the title derived from its first message (or has no saved meta yet), so a
@@ -280,17 +306,32 @@ function createProjectStore({
     const filtered = Array.from(FREE_CHATS).filter((c) => c.id !== chatId);
     FREE_CHATS.splice(0, FREE_CHATS.length, ...filtered);
     if (FREE_CHATS.length === before) return false;
-    require('./chat-lists.cjs').addTombstone(currentWorkspace().dir, chatId);
-    saveFreeChats(FREE_CHATS);
-    removeChatBrain(currentWorkspace().dir, chatId);
-    try {
-      require('./chat-context.cjs').remove(currentWorkspace().dir,chatId);
-      fs.unlinkSync(currentWorkspace().historyPath(chatId));
-    } catch {
-      /* no history file — fine */
-    }
-    removeChatAttachments(chatId);
-    return true;
+    return removeChatAfterSave(chatId, () => saveFreeChats(FREE_CHATS));
+  }
+
+  // A chat delete: tombstone first (#554: a stale tab cannot bring it back meanwhile), then the list
+  // save, and only once that is written (#1914) the transcript, context meter, brain note and
+  // attachments project. A failed save takes the tombstone back, removes nothing and rejects.
+  // Returns true, or a promise for it through the Rust project store.
+  function removeChatAfterSave(chatId, save) {
+    const workspace = currentWorkspace();
+    const lists = require('./chat-lists.cjs');
+    lists.addTombstone(workspace.dir, chatId);
+    try { save(); } catch (err) { try { lists.removeTombstone(workspace.dir, chatId); } catch { /* best effort */ } throw err; }
+    const done = whenSaved(() => {
+      removeChatBrain(workspace.dir, chatId);
+      try {
+        require('./chat-context.cjs').remove(workspace.dir, chatId);
+        fs.unlinkSync(workspace.historyPath(chatId));
+      } catch {
+        /* no history file — fine */
+      }
+      const attachments = removeChatAttachments(chatId);
+      if (attachments && typeof attachments.then === 'function') return attachments.then(() => true, () => true);
+      return true;
+    });
+    if (!done || typeof done.then !== 'function') return done;
+    return done.catch((err) => { try { lists.removeTombstone(workspace.dir, chatId); } catch { /* best effort */ } throw err; });
   }
 
   // Project DELETE (moved here from routes/projects.cjs so a chat's attachments project, #788, is
@@ -306,16 +347,22 @@ function createProjectStore({
     const keptProjects = Array.from(PROJECTS).filter((pr) => pr.id !== id);
     PROJECTS.splice(0, PROJECTS.length, ...keptProjects);
     if (PROJECTS.length === before) return false;
-    if (removedProject) pruneDocuments(removedProject);
     saveProjects(PROJECTS);
-    // Drop the project's RAG index too (best-effort).
-    try {
-      for (const suffix of ['.db', '.db-wal', '.db-shm']) {
-        fs.rmSync(path.join(currentWorkspace().ragDir(), `${id}${suffix}`), { force: true });
-      }
-    } catch { /* best effort */ }
-    if (removedProject) { if (purgeChats) purgeProjectChats(removedProject); sweepDeletedProject(removedProject); }
-    return true;
+    // #1914: its documents, RAG index and chats go only once the removal is on disk. Returns true,
+    // or a promise for it through the Rust project store (rejecting, with nothing removed, when
+    // the save failed).
+    const workspace = currentWorkspace();
+    return whenSaved(() => {
+      if (removedProject) pruneDocuments(removedProject);
+      // Drop the project's RAG index too (best-effort).
+      try {
+        for (const suffix of ['.db', '.db-wal', '.db-shm']) {
+          fs.rmSync(path.join(workspace.ragDir(), `${id}${suffix}`), { force: true });
+        }
+      } catch { /* best effort */ }
+      if (removedProject) { if (purgeChats) purgeProjectChats(removedProject); sweepDeletedProject(removedProject); }
+      return true;
+    });
   }
 
   // Creates, saves and indexes a project from a create request body. Throws { status: 400 } on
@@ -554,7 +601,11 @@ function createProjectStore({
       }
     }
   }
+  // #1914: removes files only once the list they are pruned against is on disk (whenSaved).
   function pruneDocuments(project) {
+    afterSaved(() => pruneDocumentsNow(project), `document cleanup for ${project && project.id}`);
+  }
+  function pruneDocumentsNow(project) {
     if (sourceOperations.has(sourceLockKey(project))) return;
     const workspace = currentWorkspace();
     // The live record for this id, not the (possibly superseded) object the caller held: a
@@ -692,11 +743,12 @@ function createProjectStore({
       if (getProject(project.id) !== project) throw new Error('the project was removed while writing; the project list was not changed');
       if (remote) project.sourceFolders = [...new Set([...(project.sourceFolders || []), project.projectFolder])];
       // A moved file (#687) leaves its plain-named copy behind in neither the list nor the index.
-      if (adopt) rag.deleteProjectFile(project.id, expectName, currentWorkspace().userId);
       project.files = [...(project.files || []).filter((f) => f && f.name !== file.name && !(adopt && f === current)), file];
       project.updatedAt = Date.now();
       indexSource(project, file);
       saveProjects(PROJECTS);
+      // #1914: the plain copy's index entries go once the list without it is on disk.
+      if (adopt) { const userId = currentWorkspace().userId; afterSaved(() => rag.deleteProjectFile(project.id, expectName, userId), 'index cleanup'); }
       return file;
     });
   }
@@ -725,18 +777,26 @@ function createProjectStore({
       return;
     }
     if (file.document) file.document.indexing = 'pending';
+    // #1917: the indexing outcome is recorded on the live view of the account: the one held, or,
+    // when a failed store save dropped it meanwhile, the one read again from disk (same project
+    // and file, by id and name).
+    const mark = (state) => {
+      const live = typeof workspace.current === 'function' ? workspace.current() : workspace;
+      if (live.revoked) return;
+      const p = live === workspace ? (workspace.projects.includes(project) ? project : null) : (live.projects || []).find((x) => x && x.id === project.id);
+      const f = !p ? null : live === workspace ? (project.files.includes(file) ? file : null) : (p.files || []).find((x) => x && x.name === file.name);
+      if (!f || !f.document) return;
+      f.document.indexing = state;
+      try { const saved = live.saveProjects(); if (saved && typeof saved.catch === 'function') saved.catch(() => { /* logged by the workspace; the next pass retries */ }); }
+      catch (err) { console.warn('[documents] could not save index state:', err.message); }
+    };
     rag.indexProjectFile(project.id, file.name, file.content, workspace.userId).then(result => {
       if (workspace.revoked) return;
-      if (!workspace.projects.includes(project) || !project.files.includes(file) || !file.document) return;
-      file.document.indexing = !result?.ok ? 'unavailable' : result.direct ? 'direct' : result.embedded < result.stored ? 'partial' : 'ready';
-      workspace.saveProjects();
+      mark(!result?.ok ? 'unavailable' : result.direct ? 'direct' : result.embedded < result.stored ? 'partial' : 'ready');
     }).catch((error) => {
       if (workspace.revoked) return;
       console.warn(`[documents] indexing ${project.id}/${file.name} failed:`, error?.stack || error);
-      if (workspace.projects.includes(project) && project.files.includes(file) && file.document) {
-        file.document.indexing = 'failed';
-        try { workspace.saveProjects(); } catch (err) { console.warn('[documents] could not save index state:', err.message); }
-      }
+      mark('failed');
     });
   }
 
@@ -850,7 +910,7 @@ function createProjectStore({
 
   return {
     refreshDocumentFigures, completeUploadedDocument,
-    saveProjects, getProject, sanitizeChats, loadChats, saveChats, chatIdsElsewhere, deleteChat, moveChat, purgeProjectChats, saveFreeChats, deleteFreeChat, setChatFlags, setChatTitle, chatAutoNamed, createProject,
+    saveProjects, whenSaved, getProject, sanitizeChats, loadChats, saveChats, chatIdsElsewhere, deleteChat, moveChat, purgeProjectChats, saveFreeChats, deleteFreeChat, setChatFlags, setChatTitle, chatAutoNamed, createProject,
     deleteProject, removeChatAttachments, removeOrphanChatContexts,
     historyPath, readHistory, writeHistory,
     ownsFile, ensureProjectFolder, ensureProjectFolderDetailed, withSourceLock, pruneDocuments, writeProjectTextFile, sweepDeletedProject, indexSource,

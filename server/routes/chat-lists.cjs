@@ -195,7 +195,10 @@ function createChatListRoutes({ json, readBody, currentWorkspace, PROJECTS, FREE
     if (freeDel && req.method === 'DELETE') {
       const id = decodeChatId(freeDel[1]);
       if (id === null) return badChatId(res);
-      const removed = deleteFreeChat(id);
+      // #1914: awaited, so a failed save answers its error and the transcript is kept.
+      let removed;
+      try { removed = await deleteFreeChat(id); }
+      catch (e) { if (e && e.status && e.status < 500 && e.status !== 410) throw e; return saveFailureReply(json, res, e, 'could not delete the chat; nothing was changed'); }
       return json(res, removed ? 200 : 404, removed ? { ok: true } : { error: 'no such chat' });
     }
 

@@ -203,6 +203,11 @@ function createWorkspaceStore(rootDir, defaultProvider, secrets, { rustProjects 
       revoked: false,
       /** #1264: the project-store saves still in flight (a promise), or null. */
       pendingStoreWrites() { return storeQueue ? storeQueue.pending() : null; },
+      /** #1264: the error of a store save that failed on this view (it is then dropped), or null. */
+      storeFailed() { return (remote && remote.failed) || null; },
+      /** #1917: the live view of this account: this one, or, once this one was dropped after a
+       *  failed save, the one read again from disk. For writers that hold a view across awaits. */
+      current() { return cache.get(userId) === this || !remote || !remote.failed ? this : get(userId); },
       /** #1264: a store save this workspace made: reported, and on failure the workspace is
        *  invalidated (see the header). Background writers get the rejection logged; they retry on
        *  their next pass against the re-read files. */

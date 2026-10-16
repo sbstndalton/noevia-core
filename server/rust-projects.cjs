@@ -416,6 +416,10 @@ function createProjectsFile(file, { atomicJson, warn = console.warn, lock = with
     const { MAX_ATTEMPTS, busy } = require('./project-store-client.cjs');
     // A save before this one failed: this view holds a change the disk does not, so it never writes.
     if (remote.failed) throw remote.failed;
+    try { return await attempts(); }
+    // #1915: marked here, synchronously, before any other queued save of this view can start.
+    catch (e) { remote.failed = remote.failed || e; throw e; }
+    async function attempts() {
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
       const snap = await remote.client.read(remote.user, 'projects.json');
       const disk = parseProjectsText(snap.text);
@@ -439,6 +443,7 @@ function createProjectsFile(file, { atomicJson, warn = console.warn, lock = with
       return;
     }
     throw busy();
+    }
   }
 }
 
@@ -552,6 +557,10 @@ function createFreeChatsFile(file, { atomicJson, warn = console.warn, lock = wit
     const { MAX_ATTEMPTS, busy } = require('./project-store-client.cjs');
     // A save before this one failed: this view holds a change the disk does not, so it never writes.
     if (remote.failed) throw remote.failed;
+    try { return await attempts(); }
+    // #1915: marked here, synchronously, before any other queued save of this view can start.
+    catch (e) { remote.failed = remote.failed || e; throw e; }
+    async function attempts() {
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
       const snap = await remote.client.read(remote.user, 'free-chats.json');
       let disk; let invalid = false;
@@ -574,6 +583,7 @@ function createFreeChatsFile(file, { atomicJson, warn = console.warn, lock = wit
       return;
     }
     throw busy();
+    }
   }
 }
 
