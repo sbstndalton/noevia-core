@@ -17,23 +17,31 @@ const T0 = 1_800_000_000_000;
 const T1 = T0 + 60_000;
 
 const atomicJson = (file, value) => { const tmp = `${file}.${process.pid}.tmp`; fs.writeFileSync(tmp, JSON.stringify(value)); fs.renameSync(tmp, file); };
-const noLock = (file, fn) => fn();
+// #1264: the coordinated files are written through the Rust project store (a stand-in here).
+const { remoteFor } = require('../tests/server/project-store-stub.cjs');
 
-function setup(t, { coordinated }) {
+function setup(t, { coordinated, afterRead = null }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'noevia-1801-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const freeFile = path.join(dir, 'free-chats.json');
   const projectsFile = path.join(dir, 'projects.json');
   atomicJson(freeFile, [{ id: 'f1', title: DERIVED, updatedAt: T0, preview: 'older line' }]);
   atomicJson(projectsFile, { projects: [{ id: 'p1', name: 'P', chats: [{ id: 'c1', title: DERIVED, updatedAt: T0, preview: 'older line' }] }] });
-  const free = coordinated ? rustProjects.createFreeChatsFile(freeFile, { atomicJson, lock: noLock }) : null;
-  const proj = coordinated ? rustProjects.createProjectsFile(projectsFile, { atomicJson, lock: noLock }) : null;
+  const remote = coordinated ? remoteFor(dir) : null;
+  if (remote && afterRead) {
+    // The other writer lands between this save's read of the store and its write.
+    const read = remote.client.read;
+    remote.client.read = async (user, file) => { const r = await read(user, file); afterRead(file); return r; };
+  }
+  const free = coordinated ? rustProjects.createFreeChatsFile(freeFile, { remote }) : null;
+  const proj = coordinated ? rustProjects.createProjectsFile(projectsFile, { remote }) : null;
+  const saves = [];
   const ws = {
     userId: 'synthetic-user', dir, freeChatsFile: free, projectsFile: proj ? { refresh: (l) => proj.refresh(l), save: (l) => proj.save(l) } : null,
     projects: proj ? proj.load() : JSON.parse(fs.readFileSync(projectsFile, 'utf8')).projects,
     freeChats: free ? free.load() : JSON.parse(fs.readFileSync(freeFile, 'utf8')),
-    saveProjects() { if (proj) proj.save(this.projects); else atomicJson(projectsFile, { projects: this.projects }); },
-    saveFreeChats() { if (free) free.save(this); else atomicJson(freeFile, this.freeChats); },
+    saveProjects() { if (proj) saves.push(proj.save(this.projects)); else atomicJson(projectsFile, { projects: this.projects }); },
+    saveFreeChats() { if (free) saves.push(free.save(this)); else atomicJson(freeFile, this.freeChats); },
   };
   const view = (field) => new Proxy([], {
     get(_t, prop) { const v = ws[field][prop]; return typeof v === 'function' ? v.bind(ws[field]) : v; },
@@ -48,10 +56,10 @@ function setup(t, { coordinated }) {
     free: () => JSON.parse(fs.readFileSync(freeFile, 'utf8')).find((c) => c.id === 'f1'),
     project: () => JSON.parse(fs.readFileSync(projectsFile, 'utf8')).projects[0].chats.find((c) => c.id === 'c1'),
   };
-  return { ws, store, disk, freeFile, projectsFile };
+  return { ws, store, disk, freeFile, projectsFile, flush: () => Promise.all(saves) };
 }
 
-test('#1801: setChatTitle changes only the title; updatedAt and preview survive, including a front save that lands mid-save', (t) => {
+test('#1801: setChatTitle changes only the title; updatedAt and preview survive, including a front save that lands mid-save', async (t) => {
   // Controls (these held before the fix): Node-owned lists, and a front save before the re-read.
   const plainLists = setup(t, { coordinated: false });
   plainLists.ws.freeChats[0].updatedAt = T1; plainLists.ws.freeChats[0].preview = 'latest line';
@@ -66,18 +74,22 @@ test('#1801: setChatTitle changes only the title; updatedAt and preview survive,
   atomicJson(before.projectsFile, { projects: [{ id: 'p1', name: 'P', chats: [{ id: 'c1', title: DERIVED, updatedAt: T1, preview: 'latest line' }] }] });
   assert.equal(before.store.setChatTitle(null, 'f1', 'Picnic Plan', FIRST), true);
   assert.equal(before.store.setChatTitle('p1', 'c1', 'Picnic Plan', FIRST), true);
+  await before.flush();
   assert.deepEqual(before.disk.free(), { id: 'f1', title: 'Picnic Plan', updatedAt: T1, preview: 'latest line' });
   assert.deepEqual(before.disk.project(), { id: 'c1', title: 'Picnic Plan', updatedAt: T1, preview: 'latest line' });
 
   // The bug: the front's write lands after setChatTitle re-read the lists but before its locked save
   // reads them; the meta changed on both sides was replaced whole by this process's stale copy.
-  const f = setup(t, { coordinated: true });
-  const freeSave = f.ws.saveFreeChats.bind(f.ws);
-  f.ws.saveFreeChats = function () { atomicJson(f.freeFile, [{ id: 'f1', title: DERIVED, updatedAt: T1, preview: 'latest line' }]); return freeSave(); };
-  const projSave = f.ws.saveProjects.bind(f.ws);
-  f.ws.saveProjects = function () { atomicJson(f.projectsFile, { projects: [{ id: 'p1', name: 'P', chats: [{ id: 'c1', title: DERIVED, updatedAt: T1, preview: 'latest line' }] }] }); return projSave(); };
+  const front = { 'free-chats.json': true, 'projects.json': true };
+  const f = setup(t, { coordinated: true, afterRead: (file) => {
+    if (!front[file]) return;
+    front[file] = false;
+    if (file === 'free-chats.json') atomicJson(f.freeFile, [{ id: 'f1', title: DERIVED, updatedAt: T1, preview: 'latest line' }]);
+    else atomicJson(f.projectsFile, { projects: [{ id: 'p1', name: 'P', chats: [{ id: 'c1', title: DERIVED, updatedAt: T1, preview: 'latest line' }] }] });
+  } });
   assert.equal(f.store.setChatTitle(null, 'f1', 'Picnic Plan', FIRST), true);
   assert.equal(f.store.setChatTitle('p1', 'c1', 'Picnic Plan', FIRST), true);
+  await f.flush();
   assert.deepEqual(f.disk.free(), { id: 'f1', title: 'Picnic Plan', updatedAt: T1, preview: 'latest line' });
   assert.deepEqual(f.disk.project(), { id: 'c1', title: 'Picnic Plan', updatedAt: T1, preview: 'latest line' });
   assert.deepEqual(f.ws.freeChats[0], { id: 'f1', title: 'Picnic Plan', updatedAt: T1, preview: 'latest line' }, 'this process sees the merged meta too');

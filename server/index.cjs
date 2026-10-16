@@ -103,6 +103,12 @@ const RUST_FREE_CHATS = RUST_PROJECTS && require('./rust-projects.cjs').freeChat
 // sbstndalton/noevia#1264: the project writes ported to the front, on their own confirmed switch.
 const RUST_PROJECT_WRITES = RUST_PROJECTS && require('./rust-projects.cjs').projectWritesEnabledFrom(process.env);
 // sbstndalton/noevia#1264: both files written through the Rust front's internal store, not under flock.
+if (RUST_PROJECTS && !(RUST_FREE_CHATS && require('./project-store-client.cjs').enabledFrom(process.env))) {
+  // #1264: Node no longer locks or writes projects.json itself; with the front sharing it, every
+  // save must go through the front's store.
+  console.error('NOEVIA_RUST_PROJECTS=1 needs the confirmed free-chat slice and NOEVIA_RUST_PROJECT_STORE=1 (confirmed): Node writes projects.json only through the Rust project store.');
+  process.exit(2);
+}
 const PROJECT_STORE = RUST_FREE_CHATS && require('./project-store-client.cjs').enabledFrom(process.env)
   ? require('./project-store-client.cjs').clientFromEnv(process.env)
   : (delete process.env.NOEVIA_PROJECT_STORE_TOKEN, null); // #1916: never kept, used or not

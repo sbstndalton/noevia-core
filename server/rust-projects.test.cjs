@@ -10,6 +10,10 @@ const path = require('node:path');
 const { spawnSync, spawn } = require('node:child_process');
 const rp = require('./rust-projects.cjs');
 const { atomicJson, createWorkspaceStore } = require('./workspace.cjs');
+// #1264: the coordinated files are written only through the Rust project store; this stand-in has
+// its protocol (a compare-and-swap) over the same files.
+const { createStubStore, remoteFor } = require('../tests/server/project-store-stub.cjs');
+const storeWith = (root, opts) => createWorkspaceStore(root, DEFAULT, null, { rustFreeChats: true, projectStore: createStubStore(root), ...opts });
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'rust-projects-test-'));
 const USER = '11111111-2222-4333-8444-555555555555';
@@ -18,7 +22,7 @@ const write = (file, projects) => atomicJson(file, { projects });
 const own = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
 const read = (file) => JSON.parse(fs.readFileSync(file, 'utf8')).projects;
 
-test('the switch needs the M3 switch confirmed, NOEVIA_FRONT=rust and its own confirmation', () => {
+test('the switch needs the M3 switch confirmed, NOEVIA_FRONT=rust and its own confirmation', async () => {
   const warned = [];
   const warn = (m) => warned.push(m);
   const full = { NOEVIA_RUST_PROJECTS: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_AUTH_CONFIRMED: '1', NOEVIA_RUST_PROJECTS_CONFIRMED: '1' };
@@ -34,7 +38,7 @@ test('the switch needs the M3 switch confirmed, NOEVIA_FRONT=rust and its own co
   assert.equal(warned.length, 5);
 });
 
-test('the chat-list slice needs the switch and its own confirmation, and is silent without it (#1409)', () => {
+test('the chat-list slice needs the switch and its own confirmation, and is silent without it (#1409)', async () => {
   const warned = [];
   const warn = (m) => warned.push(m);
   const full = { NOEVIA_RUST_PROJECTS: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_AUTH_CONFIRMED: '1', NOEVIA_RUST_PROJECTS_CONFIRMED: '1' };
@@ -48,7 +52,7 @@ test('the chat-list slice needs the switch and its own confirmation, and is sile
   }
 });
 
-test('the free-chat slice needs the switch and its own confirmation, and is silent without it', () => {
+test('the free-chat slice needs the switch and its own confirmation, and is silent without it', async () => {
   const warned = [];
   const warn = (m) => warned.push(m);
   const full = { NOEVIA_RUST_PROJECTS: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_AUTH_CONFIRMED: '1', NOEVIA_RUST_PROJECTS_CONFIRMED: '1' };
@@ -66,7 +70,7 @@ test('the free-chat slice needs the switch and its own confirmation, and is sile
   assert.equal(rp.FREE_LIST_CAP, require('./chat-lists.cjs').LIST_CAP);
 });
 
-test('#1264: the project-writes slices need the projects switch, their own switch and confirmation', () => {
+test('#1264: the project-writes slices need the projects switch, their own switch and confirmation', async () => {
   const warned = [];
   const warn = (m) => warned.push(m);
   const full = { NOEVIA_RUST_PROJECTS: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_AUTH_CONFIRMED: '1', NOEVIA_RUST_PROJECTS_CONFIRMED: '1' };
@@ -86,71 +90,7 @@ test('#1264: the project-writes slices need the projects switch, their own switc
   for (const r of rp.PROJECT_WRITE_ROUTES) assert.equal(rp.OWNED_ROUTES.has(r), false, `${r} is not NOEVIA_RUST_PROJECTS's`);
 });
 
-// flock(1) is util-linux (the web image, CI); without it (a Mac) the lock tests are skipped.
-const NO_FLOCK = spawnSync('flock', ['--version']).error ? 'flock(1) not on PATH' : false;
-const RP = JSON.stringify(path.join(__dirname, 'rust-projects.cjs'));
-const exitOf = (c) => new Promise((resolve) => c.on('exit', (code, sig) => resolve(sig || code)));
-
-test('the lock is exclusive, released after the write and after a throw; the file is long-lived', { skip: NO_FLOCK }, () => {
-  const dir = tmp(); const file = path.join(dir, 'projects.json');
-  const out = rp.withFileLock(file, () => {
-    assert.equal((fs.statSync(file + '.lock').mode & 0o777), 0o600);
-    // Held: another descriptor (as another process would) cannot take it.
-    assert.equal(spawnSync('flock', ['-n', file + '.lock', 'true']).status, 1);
-    return 7;
-  });
-  assert.equal(out, 7);
-  assert.ok(fs.existsSync(file + '.lock'), 'never unlinked');
-  assert.equal(spawnSync('flock', ['-n', file + '.lock', 'true']).status, 0, 'released');
-  assert.throws(() => rp.withFileLock(file, () => { throw new Error('boom'); }), /boom/);
-  assert.equal(spawnSync('flock', ['-n', file + '.lock', 'true']).status, 0, 'released after a throw');
-});
-
-test('a held lock makes a writer wait LOCK_WAIT_MS, then answer 503 PROJECTS_BUSY; no flock(1) is a 500', { skip: NO_FLOCK }, async () => {
-  const dir = tmp(); const file = path.join(dir, 'projects.json');
-  const holder = spawn('flock', ['-x', file + '.lock', 'sleep', '30'], { stdio: 'ignore' });
-  try {
-    const until = Date.now() + 5000;
-    while (spawnSync('flock', ['-n', file + '.lock', 'true']).status === 0) { assert.ok(Date.now() < until); await new Promise((r) => setTimeout(r, 10)); }
-    const t0 = Date.now();
-    assert.throws(() => rp.withFileLock(file, () => 1), (e) => e.status === 503 && e.code === 'PROJECTS_BUSY');
-    const waited = Date.now() - t0;
-    assert.ok(waited >= rp.LOCK_WAIT_MS - 100 && waited < rp.LOCK_WAIT_MS + 2000, `waited ${waited} ms`);
-  } finally { holder.kill('SIGKILL'); await exitOf(holder); }
-  assert.throws(() => rp.withFileLock(file, () => 1, { flockBin: path.join(dir, 'no-such-flock') }), (e) => e.status === 500 && e.code === 'PROJECTS_LOCK_UNAVAILABLE');
-});
-
-test('a holder that is killed mid-hold releases the lock with its descriptor', { skip: NO_FLOCK }, async () => {
-  const dir = tmp(); const file = path.join(dir, 'projects.json');
-  const script = `require(${RP}).withFileLock(process.argv[1], () => { require('fs').writeFileSync(process.argv[1] + '.held', ''); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 60000); });`;
-  const c = spawn(process.execPath, ['-e', script, file], { stdio: 'inherit' });
-  const until = Date.now() + 10000;
-  while (!fs.existsSync(file + '.held')) { assert.ok(Date.now() < until, 'holder never held'); await new Promise((r) => setTimeout(r, 10)); }
-  assert.equal(spawnSync('flock', ['-n', file + '.lock', 'true']).status, 1, 'held while alive');
-  c.kill('SIGKILL');
-  assert.equal(await exitOf(c), 'SIGKILL');
-  const t0 = Date.now();
-  assert.equal(rp.withFileLock(file, () => 2), 2);
-  assert.ok(Date.now() - t0 < 1000, 'no staleness wait');
-});
-
-test('N processes incrementing under the lock are never both inside and lose no update', { skip: NO_FLOCK }, async () => {
-  const dir = tmp(); const file = path.join(dir, 'counter.json');
-  fs.writeFileSync(file, JSON.stringify({ n: 0 }));
-  const script = `
-    const fs = require('fs'); const rp = require(${RP}); const f = process.argv[1];
-    for (let i = 0; i < 100; i++) rp.withFileLock(f, () => {
-      fs.mkdirSync(f + '.inside'); // EEXIST: two inside
-      const v = JSON.parse(fs.readFileSync(f, 'utf8')); v.n += 1;
-      fs.writeFileSync(f + '.' + process.pid + '.tmp', JSON.stringify(v)); fs.renameSync(f + '.' + process.pid + '.tmp', f);
-      fs.rmdirSync(f + '.inside');
-    });`;
-  const runs = [0, 1, 2, 3].map(() => exitOf(spawn(process.execPath, ['-e', script, file], { stdio: 'inherit' })));
-  assert.deepEqual(await Promise.all(runs), [0, 0, 0, 0]);
-  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).n, 400);
-});
-
-test('merge: assets and retiredAssets are merged per id (adds union, removals from either side)', () => {
+test('merge: assets and retiredAssets are merged per id (adds union, removals from either side)', async () => {
   const p = (assets, extra = {}) => ({ id: 'p', name: 'P', ...extra, ...(assets ? { assets: assets.map((id) => (typeof id === 'string' ? { id } : id)) } : {}) });
   const run = (base, disk, node) => rp.merge([node], new Map([['p', JSON.stringify(base)]]), [disk]).result[0];
   const ids = (x, k = 'assets') => (x[k] || []).map((a) => a.id);
@@ -170,7 +110,7 @@ test('merge: assets and retiredAssets are merged per id (adds union, removals fr
   assert.equal(gone.name, 'Q');
 });
 
-test('merge: changes on either side survive, a project both changed is merged per field', () => {
+test('merge: changes on either side survive, a project both changed is merged per field', async () => {
   const a = { id: 'a', name: 'A', chats: [] };
   const b = { id: 'b', name: 'B', assets: [] };
   const base = new Map([['a', JSON.stringify(a)], ['b', JSON.stringify(b)]]);
@@ -188,7 +128,7 @@ test('merge: changes on either side survive, a project both changed is merged pe
   assert.deepEqual(removed, [{ id: 'a', chats: [], x: 1 }]);
 });
 
-test('merge: a list Node only normalised after its save ([] for a missing one) does not beat the other writer', () => {
+test('merge: a list Node only normalised after its save ([] for a missing one) does not beat the other writer', async () => {
   // The config route saves, then pruneDocuments sets project.assets = (project.assets || []).filter(...):
   // [] in memory, absent on disk. Meanwhile the front adds images.
   const saved = { id: 'a', name: 'A', chats: [] };
@@ -203,23 +143,23 @@ test('merge: a list Node only normalised after its save ([] for a missing one) d
   assert.deepEqual(rp.merge(local, base, [{ ...saved, name: 'B' }]).result[0], { id: 'a', name: 'B', chats: [], assets: [], retired: {} });
 });
 
-test('the coordinated file: a post-save normalisation, then the front adds images, then a refresh and a save keep them', () => {
+test('the coordinated file: a post-save normalisation, then the front adds images, then a refresh and a save keep them', async () => {
   const dir = tmp(); const file = path.join(dir, 'projects.json');
-  const pf = rp.createProjectsFile(file, { atomicJson, warn: () => {} });
+  const pf = rp.createProjectsFile(file, { remote: remoteFor(path.dirname(file)), warn: () => {} });
   const projects = pf.load();
   projects.push({ id: 'p', name: 'P', chats: [] });
-  pf.save(projects);
+  await pf.save(projects);
   projects[0].assets = (projects[0].assets || []).filter(() => true); // uploads.prune after the save
   write(file, [{ id: 'p', name: 'P', chats: [], assets: [{ id: 'img-1' }] }]);
   pf.refresh(projects);
   assert.deepEqual(projects[0].assets, [{ id: 'img-1' }]);
   write(file, [{ id: 'p', name: 'P', chats: [], assets: [{ id: 'img-1' }, { id: 'img-2' }] }]);
   projects[0].chats.push({ id: 'c' });
-  pf.save(projects);
+  await pf.save(projects);
   assert.deepEqual(read(file)[0], { id: 'p', name: 'P', chats: [{ id: 'c' }], assets: [{ id: 'img-1' }, { id: 'img-2' }] });
 });
 
-test('merge: deletes and creations on either side, and where new projects go', () => {
+test('merge: deletes and creations on either side, and where new projects go', async () => {
   const p = (id) => ({ id, name: id });
   const base = new Map(['a', 'b', 'c'].map((id) => [id, JSON.stringify(p(id))]));
   // Here: b deleted, n1 created first (createProject unshifts), n2 after c. There: c deleted, r1 created.
@@ -233,10 +173,10 @@ test('merge: deletes and creations on either side, and where new projects go', (
   assert.deepEqual(rp.merge([{ x: 1 }], new Map(), [{ y: 2 }, p('a'), p('a')]).result, [{ y: 2 }, p('a')]);
 });
 
-test('the coordinated file: refresh takes in the other writer in place; save merges under the lock', () => {
+test('the coordinated file: refresh takes in the other writer in place; save merges through the store', async () => {
   const dir = tmp(); const file = path.join(dir, 'projects.json');
   write(file, [{ id: 'a', name: 'A', chats: [] }, { id: 'b', name: 'B' }]);
-  const pf = rp.createProjectsFile(file, { atomicJson, warn: () => {} });
+  const pf = rp.createProjectsFile(file, { remote: remoteFor(path.dirname(file)), warn: () => {} });
   const projects = pf.load();
   const heldA = projects[0];
   assert.equal(pf.refresh(projects), false, 'unchanged file: nothing to do');
@@ -248,38 +188,37 @@ test('the coordinated file: refresh takes in the other writer in place; save mer
   // A long request changes a's chats; meanwhile the front removes the image and renames b.
   heldA.chats = [{ id: 'chat-1', title: 'Hi' }];
   write(file, [{ id: 'a', name: 'A', chats: [], assets: [] }, { id: 'b', name: 'B renamed' }]);
-  pf.save(projects);
+  await pf.save(projects);
   assert.deepEqual(read(file), [{ id: 'a', name: 'A', chats: [{ id: 'chat-1', title: 'Hi' }], assets: [] }, { id: 'b', name: 'B renamed' }]);
   assert.equal(projects[0], heldA);
   assert.equal(projects[1].name, 'B renamed');
-  assert.ok(fs.existsSync(file + '.lock'), 'the lock file is long-lived');
   assert.equal(pf.refresh(projects), false, 'its own write is not taken for the other writer');
   // The bytes are atomicJson's: JSON.stringify(value, null, 2).
   assert.equal(fs.readFileSync(file, 'utf8'), JSON.stringify({ projects: read(file) }, null, 2));
 });
 
-test('an unreadable file: the view is kept, and the next save replaces the file', () => {
+test('an unreadable file: the view is kept, and the next save replaces the file', async () => {
   const dir = tmp(); const file = path.join(dir, 'projects.json');
   write(file, [{ id: 'a' }]);
   const warned = [];
-  const pf = rp.createProjectsFile(file, { atomicJson, warn: (m) => warned.push(m) });
+  const pf = rp.createProjectsFile(file, { remote: remoteFor(path.dirname(file)), warn: (m) => warned.push(m) });
   const projects = pf.load();
   fs.writeFileSync(file, '{"projects": [');
   assert.equal(pf.refresh(projects), false);
   assert.deepEqual(projects, [{ id: 'a' }]);
-  pf.save(projects);
+  await pf.save(projects);
   assert.deepEqual(read(file), [{ id: 'a' }]);
   assert.equal(warned.length, 1);
-  const missing = rp.createProjectsFile(path.join(dir, 'none.json'), { atomicJson });
+  const missing = rp.createProjectsFile(path.join(dir, 'none.json'), { remote: remoteFor(dir) });
   assert.deepEqual(missing.load(), []);
 });
 
-test('the workspace store with rustProjects: requests see the other writer, saves keep its changes', () => {
+test('the workspace store with rustProjects: requests see the other writer, saves keep its changes', async () => {
   const root = tmp();
-  const store = createWorkspaceStore(root, DEFAULT, null, { rustProjects: true });
+  const store = storeWith(root, { rustProjects: true });
   const ws = store.get(USER);
   ws.projects.push({ id: 'p1', name: 'One', modes: ['chat'], chats: [] });
-  ws.saveProjects();
+  await ws.saveProjects();
   const file = path.join(ws.dir, 'projects.json');
   const disk = read(file);
   disk[0].assets = [{ id: 'img-a', name: 'x.png', mime: 'image/png', bytes: 1 }];
@@ -290,35 +229,35 @@ test('the workspace store with rustProjects: requests see the other writer, save
   ws.projects[0].chats.push({ id: 'chat-1' });
   disk[0].assets = [];
   write(file, disk);
-  ws.saveProjects();
+  await ws.saveProjects();
   assert.deepEqual(read(file)[0], { id: 'p1', name: 'One', modes: ['chat'], chats: [{ id: 'chat-1' }], assets: [] });
   // Off: Node writes its own view, as before (the change on disk is overwritten).
   const plain = createWorkspaceStore(tmp(), DEFAULT, null);
   const w2 = plain.get(USER);
-  w2.projects.push({ id: 'q', modes: ['chat'] }); w2.saveProjects();
+  w2.projects.push({ id: 'q', modes: ['chat'] }); await w2.saveProjects();
   const f2 = path.join(w2.dir, 'projects.json');
   write(f2, [{ id: 'q', modes: ['chat'], assets: [1] }]);
-  plain.get(USER).saveProjects();
+  await plain.get(USER).saveProjects();
   assert.deepEqual(read(f2), [{ id: 'q', modes: ['chat'] }]);
 });
 
-test('uploads.prune (a writer after an await) filters the lists as on disk now, and the save keeps them', () => {
+test('uploads.prune (a writer after an await) filters the lists as on disk now, and the save keeps them', async () => {
   const uploads = require('./uploads.cjs');
-  const store = createWorkspaceStore(tmp(), DEFAULT, null, { rustProjects: true });
+  const store = storeWith(tmp(), { rustProjects: true });
   const ws = store.get(USER);
   ws.projects.push({ id: 'p1', name: 'One', modes: ['chat'], chats: [], files: [] });
-  ws.saveProjects();
+  await ws.saveProjects();
   const project = ws.projects[0];
   const file = path.join(ws.dir, 'projects.json');
   // The front adds an image after this request's start (no store.get in between).
   write(file, [{ ...read(file)[0], assets: [{ id: 'img-rust', name: 'r.png', mime: 'image/png', bytes: 1 }] }]);
   uploads.prune(ws, project);
   assert.deepEqual(project.assets.map((a) => a.id), ['img-rust'], 'refreshed before filtering');
-  ws.saveProjects();
+  await ws.saveProjects();
   assert.deepEqual(read(file)[0].assets.map((a) => a.id), ['img-rust']);
 });
 
-test("Node's copies of the Rust-owned writes answer 503 only while the switch is on", () => {
+test("Node's copies of the Rust-owned writes answer 503 only while the switch is on", async () => {
   const sent = [];
   const json = (res, status, body) => sent.push([status, body]);
   assert.equal(rp.refuseOwned(false, json, {}), false);
@@ -333,31 +272,31 @@ test("Node's copies of the Rust-owned writes answer 503 only while the switch is
   assert.equal(String(r.stdout), 'false');
 });
 
-test('chat metas are merged per item: a list the front saved survives a move or delete here, and the delete stands', () => {
-  const store = createWorkspaceStore(tmp(), DEFAULT, null, { rustProjects: true });
+test('chat metas are merged per item: a list the front saved survives a move or delete here, and the delete stands', async () => {
+  const store = storeWith(tmp(), { rustProjects: true });
   const ws = store.get(USER);
   ws.projects.push({ id: 'p1', name: 'One', modes: ['chat'], chats: [{ id: 'keep', title: 'K' }, { id: 'gone', title: 'G' }] });
-  ws.saveProjects();
+  await ws.saveProjects();
   const file = path.join(ws.dir, 'projects.json');
   // This request (no refresh since its start) deletes a chat; meanwhile the front saved a new one
   // and retitled another.
   ws.projects[0].chats = ws.projects[0].chats.filter((c) => c.id !== 'gone');
   write(file, [{ ...read(file)[0], chats: [{ id: 'new', title: 'N' }, { id: 'keep', title: 'K2' }, { id: 'gone', title: 'G' }] }]);
-  ws.saveProjects();
+  await ws.saveProjects();
   assert.deepEqual(read(file)[0].chats, [{ id: 'new', title: 'N' }, { id: 'keep', title: 'K2' }]);
   // Both changed one meta: this process's wins; both added: both kept.
   ws.projects[0].chats = [...ws.projects[0].chats.map((c) => (c.id === 'new' ? { ...c, title: 'mine' } : c)), { id: 'local', title: 'L' }];
   write(file, [{ ...read(file)[0], chats: [...read(file)[0].chats.map((c) => (c.id === 'new' ? { ...c, title: 'theirs' } : c)), { id: 'front', title: 'F' }] }]);
-  ws.saveProjects();
+  await ws.saveProjects();
   assert.deepEqual(read(file)[0].chats.map((c) => [c.id, c.title]), [['new', 'mine'], ['keep', 'K2'], ['front', 'F'], ['local', 'L']]);
 });
 
-test('a request start that takes in the front\'s change says so once; Node\'s own saves do not', () => {
+test('a request start that takes in the front\'s change says so once; Node\'s own saves do not', async () => {
   const changed = [];
-  const store = createWorkspaceStore(tmp(), DEFAULT, null, { rustProjects: true, onProjectsChanged: (id) => changed.push(id) });
+  const store = storeWith(tmp(), { rustProjects: true, onProjectsChanged: (id) => changed.push(id) });
   const ws = store.get(USER);
   ws.projects.push({ id: 'p1', name: 'One', modes: ['chat'], chats: [] });
-  ws.saveProjects();
+  await ws.saveProjects();
   store.get(USER);
   assert.deepEqual(changed, []);
   const file = path.join(ws.dir, 'projects.json');
@@ -369,7 +308,7 @@ test('a request start that takes in the front\'s change says so once; Node\'s ow
   const off = [];
   const plain = createWorkspaceStore(tmp(), DEFAULT, null, { onProjectsChanged: (id) => off.push(id) });
   const w2 = plain.get(USER);
-  w2.projects.push({ id: 'q', modes: ['chat'] }); w2.saveProjects();
+  w2.projects.push({ id: 'q', modes: ['chat'] }); await w2.saveProjects();
   write(path.join(w2.dir, 'projects.json'), [{ id: 'q', modes: ['chat'], chats: [] }]);
   plain.get(USER);
   assert.deepEqual(off, []);
@@ -380,7 +319,7 @@ const freeFile = (dir) => path.join(dir, 'free-chats.json');
 const readFree = (file) => JSON.parse(fs.readFileSync(file, 'utf8'));
 const meta = (id, updatedAt, extra = {}) => ({ id, title: id, updatedAt, preview: '', pinned: false, archived: false, ...extra });
 
-test('free chats, merged: additions from both sides, removals from either, a meta both changed is ours, newest first, capped', () => {
+test('free chats, merged: additions from both sides, removals from either, a meta both changed is ours, newest first, capped', async () => {
   const base = [meta('a', 5), meta('b', 4), meta('c', 3)];
   // Here: b removed, a retitled, n added. There: c removed, a and b retitled, r added.
   const ours = [meta('n', 9), meta('a', 5, { title: 'ours' }), meta('c', 3)];
@@ -393,10 +332,10 @@ test('free chats, merged: additions from both sides, removals from either, a met
   assert.equal(rp.mergeFreeChats(many, [], [meta('t', 5000)])[0].id, 't');
 });
 
-test('the coordinated free list: refresh takes in the front in place; an unchanged save keeps this order; a stale one merges', { skip: NO_FLOCK }, () => {
+test('the coordinated free list: refresh takes in the front in place; an unchanged save keeps this order; a stale one merges', async () => {
   const dir = tmp(); const file = freeFile(dir);
   atomicJson(file, [meta('a', 2), meta('b', 1)]);
-  const ff = rp.createFreeChatsFile(file, { atomicJson, warn: () => {} });
+  const ff = rp.createFreeChatsFile(file, { remote: remoteFor(path.dirname(file)), warn: () => {} });
   const ws = { freeChats: ff.load() };
   const held = ws.freeChats;
   assert.equal(ff.refresh(ws), false, 'unchanged file: nothing to do');
@@ -408,25 +347,24 @@ test('the coordinated free list: refresh takes in the front in place; an unchang
   assert.equal(ff.refresh(ws), false);
   // Nobody else wrote: this process's list is written as it is (its order too).
   ws.freeChats.splice(0, ws.freeChats.length, meta('b', 1), meta('a', 2));
-  ff.save(ws);
+  await ff.save(ws);
   assert.deepEqual(readFree(file).map((c) => c.id), ['b', 'a']);
   assert.equal(ff.refresh(ws), false, 'its own write is not taken for the other writer');
   // A delete here (a) while the front saved a new meta (g) and retitled b: both stand.
   ws.freeChats.splice(0, ws.freeChats.length, ...ws.freeChats.filter((c) => c.id !== 'a'));
   atomicJson(file, [meta('g', 9), meta('b', 1, { title: 'B2' }), meta('a', 2)]);
-  ff.save(ws);
+  await ff.save(ws);
   assert.deepEqual(readFree(file).map((c) => [c.id, c.title]), [['g', 'g'], ['b', 'B2']]);
   assert.deepEqual(ws.freeChats.map((c) => c.id), ['g', 'b'], 'this view is what was written');
   // Bytes are atomicJson's.
   assert.equal(fs.readFileSync(file, 'utf8'), JSON.stringify(readFree(file), null, 2));
-  assert.ok(fs.existsSync(file + '.lock'), 'the lock file is long-lived');
 });
 
-test('the coordinated free list: unsaved changes here survive a refresh; an unreadable file is kept until the next save', { skip: NO_FLOCK }, () => {
+test('the coordinated free list: unsaved changes here survive a refresh; an unreadable file is kept until the next save', async () => {
   const dir = tmp(); const file = freeFile(dir);
   atomicJson(file, [meta('a', 1)]);
   const warned = [];
-  const ff = rp.createFreeChatsFile(file, { atomicJson, warn: (m) => warned.push(m) });
+  const ff = rp.createFreeChatsFile(file, { remote: remoteFor(path.dirname(file)), warn: (m) => warned.push(m) });
   const ws = { freeChats: ff.load() };
   ws.freeChats.push(meta('local', 5)); // a failed save left this here
   atomicJson(file, [meta('a', 1), meta('front', 3)]);
@@ -435,31 +373,31 @@ test('the coordinated free list: unsaved changes here survive a refresh; an unre
   fs.writeFileSync(file, '[{');
   assert.equal(ff.refresh(ws), false);
   assert.deepEqual(ws.freeChats.map((c) => c.id), ['local', 'front', 'a']);
-  ff.save(ws);
+  await ff.save(ws);
   assert.deepEqual(readFree(file).map((c) => c.id), ['local', 'front', 'a']);
   assert.equal(warned.length, 1);
   // A file that holds no list is read as Node's readJson reads it, and taken as it is.
   const odd = path.join(dir, 'odd.json');
   fs.writeFileSync(odd, '{"a":1}');
-  const f2 = rp.createFreeChatsFile(odd, { atomicJson });
+  const f2 = rp.createFreeChatsFile(odd, { remote: remoteFor(path.dirname(odd))  });
   const w2 = { freeChats: f2.load() };
   assert.deepEqual(w2.freeChats, { a: 1 });
   fs.writeFileSync(odd, '[{"id":"x"}]');
   fs.utimesSync(odd, new Date(), new Date(Date.now() + 5000));
   assert.equal(f2.refresh(w2), true);
   assert.deepEqual(w2.freeChats, [{ id: 'x' }]);
-  assert.deepEqual(rp.createFreeChatsFile(path.join(dir, 'none.json'), { atomicJson }).load(), []);
+  assert.deepEqual(rp.createFreeChatsFile(path.join(dir, 'none.json'), { remote: remoteFor(dir) }).load(), []);
   fs.writeFileSync(path.join(dir, 'bad.json'), 'nope');
-  assert.deepEqual(rp.createFreeChatsFile(path.join(dir, 'bad.json'), { atomicJson }).load(), []);
+  assert.deepEqual(rp.createFreeChatsFile(path.join(dir, 'bad.json'), { remote: remoteFor(dir) }).load(), []);
 });
 
-test('the workspace store with rustFreeChats: a request sees the front, says so once, and a delete here keeps the front\'s save', { skip: NO_FLOCK }, () => {
+test('the workspace store with rustFreeChats: a request sees the front, says so once, and a delete here keeps the front\'s save', async () => {
   const changed = [];
-  const store = createWorkspaceStore(tmp(), DEFAULT, null, { rustProjects: true, rustFreeChats: true, onProjectsChanged: (id) => changed.push(id) });
+  const store = storeWith(tmp(), { rustProjects: true, rustFreeChats: true, onProjectsChanged: (id) => changed.push(id) });
   const ws = store.get(USER);
   assert.ok(ws.freeChatsFile);
   ws.freeChats = [meta('keep', 2), meta('gone', 1)];
-  ws.saveFreeChats();
+  await ws.saveFreeChats();
   store.get(USER);
   assert.deepEqual(changed, [], "Node's own save is not news");
   const file = freeFile(ws.dir);
@@ -470,27 +408,18 @@ test('the workspace store with rustFreeChats: a request sees the front, says so 
   // A delete here (no refresh since it started) while the front saved again.
   ws.freeChats = ws.freeChats.filter((c) => c.id !== 'gone');
   atomicJson(file, [meta('front2', 4), ...readFree(file)]);
-  ws.saveFreeChats();
+  await ws.saveFreeChats();
   assert.deepEqual(readFree(file).map((c) => c.id), ['front2', 'front', 'keep']);
-  // Without the slice (the switch alone): Node writes its own view, as before.
-  const plain = createWorkspaceStore(tmp(), DEFAULT, null, { rustProjects: true });
-  const w2 = plain.get(USER);
-  assert.equal(w2.freeChatsFile, null);
-  w2.freeChats = [meta('q', 1)]; w2.saveFreeChats();
-  atomicJson(freeFile(w2.dir), [meta('other', 2), meta('q', 1)]);
-  plain.get(USER).saveFreeChats();
-  assert.deepEqual(readFree(freeFile(w2.dir)).map((c) => c.id), ['q']);
-  assert.ok(!fs.existsSync(freeFile(w2.dir) + '.lock'));
 });
 
-test('moveChat and deleteFreeChat through the coordinated free list keep a meta the front saved meanwhile', { skip: NO_FLOCK }, () => {
+test('moveChat and deleteFreeChat through the coordinated free list keep a meta the front saved meanwhile', async () => {
   const { createProjectStore } = require('./projects.cjs');
-  const store = createWorkspaceStore(tmp(), DEFAULT, null, { rustProjects: true, rustFreeChats: true });
+  const store = storeWith(tmp(), { rustProjects: true, rustFreeChats: true });
   const ws = store.get(USER);
   ws.projects.push({ id: 'p1', name: 'One', modes: ['chat'], chats: [] });
-  ws.saveProjects();
+  await ws.saveProjects();
   ws.freeChats = [meta('f1', 2), meta('f2', 1)];
-  ws.saveFreeChats();
+  await ws.saveFreeChats();
   const proxy = (field) => new Proxy([], {
     get(_t, prop) { const v = ws[field][prop]; return typeof v === 'function' ? v.bind(ws[field]) : v; },
     set(_t, prop, v) { ws[field][prop] = v; return true; },
@@ -502,23 +431,25 @@ test('moveChat and deleteFreeChat through the coordinated free list keep a meta 
   // The front saves a new free chat after this request started; the request moves f1 into p1.
   atomicJson(file, [meta('front', 5), ...readFree(file)]);
   assert.equal(projects.moveChat('f1', 'p1').status, 200);
+  await ws.pendingStoreWrites();
   assert.deepEqual(readFree(file).map((c) => c.id), ['front', 'f2']);
   assert.deepEqual(read(path.join(ws.dir, 'projects.json'))[0].chats.map((c) => c.id), ['f1']);
   // Again for a delete.
   atomicJson(file, [meta('front2', 6), ...readFree(file)]);
-  assert.equal(projects.deleteFreeChat('f2'), true);
+  assert.equal(await projects.deleteFreeChat('f2'), true); // #1914: resolves once the save is written
+  await ws.pendingStoreWrites();
   assert.deepEqual(readFree(file).map((c) => c.id), ['front2', 'front']);
 });
 
-test('setChatFlags reads both lists again first: a meta the front retitled during the turn keeps its title and gets the flags (sbstndalton/noevia#1426)', { skip: NO_FLOCK }, () => {
+test('setChatFlags reads both lists again first: a meta the front retitled during the turn keeps its title and gets the flags (sbstndalton/noevia#1426)', async () => {
   const { createProjectStore } = require('./projects.cjs');
   const changed = [];
-  const store = createWorkspaceStore(tmp(), DEFAULT, null, { rustProjects: true, rustFreeChats: true });
+  const store = storeWith(tmp(), { rustProjects: true, rustFreeChats: true });
   const ws = store.get(USER);
   ws.projects.push({ id: 'p1', name: 'One', modes: ['chat'], chats: [meta('c1', 1)] });
-  ws.saveProjects();
+  await ws.saveProjects();
   ws.freeChats = [meta('f1', 2)];
-  ws.saveFreeChats();
+  await ws.saveFreeChats();
   const proxy = (field) => new Proxy([], {
     get(_t, prop) { const v = ws[field][prop]; return typeof v === 'function' ? v.bind(ws[field]) : v; },
     set(_t, prop, v) { ws[field][prop] = v; return true; },
@@ -530,7 +461,9 @@ test('setChatFlags reads both lists again first: a meta the front retitled durin
   // While the turn waited for its route choice, the front retitled f1 and saved a new chat n1.
   atomicJson(free, [{ ...meta('f1', 9), title: 'Retitled' }, meta('n1', 8)]);
   assert.equal(projects.setChatFlags(null, 'n1', { allowCloud: true }), true, 'a chat the front first saved during the turn');
+  await ws.pendingStoreWrites();
   assert.equal(projects.setChatFlags(null, 'f1', { forceLocal: true }), true);
+  await ws.pendingStoreWrites();
   const saved = readFree(free);
   assert.deepEqual(saved.map((c) => [c.id, c.title, c.forceLocal, c.allowCloud]), [['f1', 'Retitled', true, undefined], ['n1', meta('n1', 8).title, undefined, true]]);
   // The same for a project's chat list.
@@ -538,8 +471,10 @@ test('setChatFlags reads both lists again first: a meta the front retitled durin
   onDisk[0].chats = [{ ...meta('c1', 9), title: 'Retitled' }];
   atomicJson(projectsJson, { projects: onDisk });
   assert.equal(projects.setChatFlags('p1', 'c1', { forceLocal: false }), true);
+  await ws.pendingStoreWrites();
   const chat = read(projectsJson)[0].chats[0];
   assert.deepEqual([chat.id, chat.title, chat.forceLocal], ['c1', 'Retitled', false]);
   assert.deepEqual(changed, [USER, USER], 'each refresh that took in the front nudged the mirror once');
   assert.equal(projects.setChatFlags(null, 'missing', { forceLocal: true }), false);
+  await ws.pendingStoreWrites();
 });
