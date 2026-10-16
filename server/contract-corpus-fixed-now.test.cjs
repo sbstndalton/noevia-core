@@ -27,8 +27,12 @@ test('serve.cjs hands the fixed instant to the server it spawns, and a caller ca
   const serve = path.join(__dirname, '../tools/contract-corpus/serve.cjs');
   await vm.runInNewContext(fs.readFileSync(serve, 'utf8'), {
     require: (name) => name === 'node:child_process' ? { spawn: (_bin, _args, options) => { captured = options.env; return child; } } : name === './mocks.cjs' ? { ...mocks, startMocks: async () => fakeMocks } : require(name),
-    process: { argv: [process.execPath, serve], env: { UI_DATA_DIR: '/synthetic/corpus', UI_PORT: '18021', NOEVIA_CONTRACT_FIXED_NOW: '2030-01-01T00:00:00Z' }, execPath: process.execPath, on: () => {}, exit: () => { throw Error('unexpected launcher exit'); } }, console,
+    process: { argv: [process.execPath, serve], env: { UI_DATA_DIR: '/synthetic/corpus', UI_PORT: '18021', NOEVIA_CONTRACT_FIXED_NOW: '2030-01-01T00:00:00Z', NOEVIA_PROJECT_STORE_PORT: '19003', NOEVIA_PROJECT_STORE_TOKEN: 'synthetic-store-token-'.padEnd(64, 'x') }, execPath: process.execPath, on: () => {}, exit: () => { throw Error('unexpected launcher exit'); } }, console,
   }, { filename: 'tools/contract-corpus/serve.cjs' });
   assert.ok(captured);
   assert.equal(captured.NOEVIA_CONTRACT_FIXED_NOW, '2026-10-12T12:00:00Z');
+  // sbstndalton/noevia#1071: the project store the harness hands over reaches Node, and its port is
+  // one the outbound guard lets Node reach.
+  assert.equal(captured.NOEVIA_PROJECT_STORE_PORT, '19003');
+  assert.equal(captured.NOEVIA_CORPUS_ALLOWED_PORTS, '19001,19002,19003');
 });
