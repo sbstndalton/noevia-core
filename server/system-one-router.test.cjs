@@ -126,3 +126,32 @@ test('#1070: an accepted or unrouted decision has no fallback cause', async () =
     log: () => {}, backend: { supports: () => true, locality: 'local', decide: async () => ({ selected: 'fast', scores: { fast: 0.7, smart: 0.3 } }) } });
   assert.equal((await ok.classifyWithDetails('x')).routingDecision.fallbackCause, null);
 });
+test('#1901: clearly simple short asks go Fast with no decision call; reasoning asks still reach the decision service', async () => {
+  const { clearlySimple } = require('./system-one-router.cjs');
+  const h = harness(); h.enable(true);
+  for (const m of ['count to twenty', 'Write a 4-line poem about autumn', 'Write a 300-word story about a cat',
+    'Write a short story about a robot', 'Write a limerick about a dog', 'Tell me a short joke', 'List five fruits'])
+    assert.equal(await h.router.classify(m), 'fast', m);
+  assert.deepEqual(h.counts(), [0, 0]);
+  for (const m of ['Explain how vaccines train the immune system', 'Write a 2000-word story about a cat',
+    'Write a poem and explain why it rhymes', 'List the steps to debug this function', 'Plan a 3-day trip to Rome',
+    'Write a short story\nabout a robot', 'hi', ''])
+    assert.equal(clearlySimple(m), false, JSON.stringify(m));
+  assert.equal(await h.router.classify('Compare TCP and UDP'), 'smart');
+  assert.deepEqual(h.counts(), [1, 0]);
+  const d = await h.router.classifyWithDetails('count to ten');
+  assert.equal(d.routingDecision.status, 'accepted'); assert.equal(d.routingDecision.selectedRole, 'fast');
+});
+test('#1901: Kev gets route labels that name short simple tasks Fast; Laya keeps its measured labels', async () => {
+  const { ROUTE_LABELS } = require('./system-one-router.cjs');
+  for (const wording of ['kev', 'laya', undefined]) {
+    let seen;
+    const router = createSystemOneRouter({ enabled: () => true, roles: () => ({ fast: 'a', smart: 'b' }), fallback: async () => 'fast', log: () => {},
+      backend: { wording, supports: () => true, locality: 'local', decide: async (r) => { seen = r.options; return { selected: 'fast', scores: { fast: 0.9, smart: 0.1 } }; } } });
+    await router.classify('What is the capital of France?');
+    const want = ROUTE_LABELS[wording] || ROUTE_LABELS.laya;
+    assert.deepEqual(seen.map(o => o.label), [want.fast, want.smart]);
+  }
+  assert.equal(ROUTE_LABELS.laya.fast, 'Greetings, thanks, or a one-line factual answer');
+  assert.match(ROUTE_LABELS.kev.fast, /short poem/);
+});
