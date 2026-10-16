@@ -22,6 +22,7 @@ function documentReadOptions(path) {
   const cap = sourceLimits.documentLimits().readBytes;
   return { cap, timeoutMs: 30000 + Math.ceil(cap / (1024 * 1024)) * 1000 };
 }
+const { isDeepStrictEqual } = require('node:util');
 const sourceLimits = require('../source-limits.cjs');
 const largeDocuments = require('../large-document-lock.cjs');
 const sourceText = require('../source-text.cjs');
@@ -441,6 +442,9 @@ function createProjectRoutes({
           }
         }
       }
+      // #1886: a patch that leaves every field as stored (the client's "Refresh from storage" used to
+      // re-send the folder list) is a read: no write, no timestamp bump, no store lock.
+      if (isDeepStrictEqual(project, storedProject)) return json(res, 200, { ok: true, unchanged: true });
       project.updatedAt = Date.now();
       Object.assign(storedProject, project);
       if (clearSampling) delete storedProject.sampling;
