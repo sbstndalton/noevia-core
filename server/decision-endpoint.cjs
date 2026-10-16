@@ -68,7 +68,10 @@ async function exchange(fetchImpl,url,body,signal,headers={'Content-Type':'appli
   try {
     response=await fetchImpl(url,{method:'POST',redirect:'error',signal,
       headers,body});
-  } catch (error) { throw failure(error?.name==='AbortError' ? 'aborted' : 'network','Decision endpoint unreachable'); }
+  } catch (error) {
+    const code=error?.code||error?.cause?.code;
+    throw Object.assign(failure(error?.name==='AbortError' ? 'aborted' : 'network','Decision endpoint unreachable'),{transient:TRANSIENT_CODES.has(code)});
+  }
   // The status is the whole diagnosis for the Laya service: 422 is a request it refused
   // (shape or token budget), 503 a worker that missed its deadline or is reloading (#682).
   if(!response.ok) throw failure(`http-${Number(response.status)||0}`,'Decision endpoint unavailable');
@@ -87,12 +90,15 @@ async function exchange(fetchImpl,url,body,signal,headers={'Content-Type':'appli
 }
 // #1751: one transient connect failure (a kept-alive socket the service had already closed, a reset while connecting)
 // came back as 'network' ("unreachable") while the service was healthy; three repeats answered in ~0.5 s. Such a
-// failure gets exactly one immediate retry, inside the same lane turn and the caller's deadline. Only 'network' (no
-// response at all) is retried: a status, a bad body or an abort is the answer.
+// failure gets exactly one immediate retry, inside the same lane turn and the caller's deadline. Only a transient
+// 'network' failure (no response at all) is retried: a status, a bad body, a refusal or an abort is the answer.
+// Only a dropped or refused socket is transient; a policy refusal (EPUBLICADDR, link-local, #1845), a name that does
+// not resolve or a TLS error is the answer, and its connect is never repeated.
+const TRANSIENT_CODES=new Set(['ECONNRESET','ECONNREFUSED','EPIPE','ECONNABORTED','UND_ERR_SOCKET','UND_ERR_CLOSED']);
 async function sendOnce(fetchImpl,url,body,holdSignal,headers,callerSignal){
   try { return await exchange(fetchImpl,url,body,holdSignal,headers); }
   catch (error) {
-    if(error?.reason!=='network' || holdSignal?.aborted || callerSignal?.aborted) throw error;
+    if(error?.reason!=='network' || !error.transient || holdSignal?.aborted || callerSignal?.aborted) throw error;
     return exchange(fetchImpl,url,body,holdSignal,headers);
   }
 }
