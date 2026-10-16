@@ -77,7 +77,7 @@ function routeFixture({ engine, authHeaders }) {
 }
 
 test('route: Kev answering 401 with no key is up; this machine probes the model loader it uses, with its token', async () => {
-  const f = routeFixture({ engine: () => ({ url: 'http://loader:9000', path: '/api/v1/models', headers: { 'X-Model-Loader-Token': 't' } }), authHeaders: {} });
+  const f = routeFixture({ engine: () => ({ url: 'http://loader:9000', path: '/api/v1/health', headers: { 'X-Model-Loader-Token': 't' } }), authHeaders: {} });
   await f.call();
   const h = f.sent[0].body.health;
   assert.equal(h.services.decision.state, 'up');
@@ -85,7 +85,7 @@ test('route: Kev answering 401 with no key is up; this machine probes the model 
   assert.equal(h.machines.local, 'up');
   assert.deepEqual(h.reasons, {});
   const engineProbe = f.probes.find((p) => p.url.includes('loader'));
-  assert.equal(engineProbe.url, 'http://loader:9000/api/v1/models');
+  assert.equal(engineProbe.url, 'http://loader:9000/api/v1/health');
   assert.deepEqual(engineProbe.headers, { 'X-Model-Loader-Token': 't' });
 });
 
@@ -159,4 +159,41 @@ test('#1861: route reads Kev healthy via /v1/models and names the failing servic
   const bad = mk(500); await bad.call();
   assert.equal(bad.sent[0].health.machines.local, 'down');
   assert.deepEqual([bad.sent[0].health.reasons.local, bad.sent[0].health.failing.local], ['http-500', 'decision']);
+});
+
+// #1894: the model loader's /api/v1/models takes ~3 s (it enumerates models); its /api/v1/health answers in ms.
+// A real loader-like server with a slow /models and a fast /health must read Healthy for "This machine".
+test('#1894: a loader with a slow /models and a fast /health reads up through the engine dep of server/index.cjs', async () => {
+  const loader = await fakeServer((req, res) => {
+    if (req.headers['x-model-loader-token'] !== 'tok') { res.statusCode = 401; return res.end(); }
+    if (req.url === '/api/v1/health') return res.end('{}');
+    if (req.url === '/api/v1/models') return setTimeout(() => res.end('[]'), 3000).unref();
+    res.statusCode = 404; res.end();
+  });
+  const saved = { url: process.env.MODEL_LOADER_URL, token: process.env.MODEL_LOADER_TOKEN };
+  try {
+    process.env.MODEL_LOADER_URL = loader.base; process.env.MODEL_LOADER_TOKEN = 'tok';
+    const { localEngineTarget } = require('./local-engine-target.cjs');
+    const f = (() => {
+      const sent = [];
+      const routes = createInferenceMachineRoutes({
+        json: (res, status, body) => { sent.push(body); return true; }, readJson: async () => ({}),
+        machines: { view: () => ({ machines: [{ id: 'local', builtIn: true, services: ['chatFast'] }], services: [] }), chatTarget: () => null },
+        health: realHealth(), effective: {}, authHeaders: {}, engine: () => localEngineTarget({ env: process.env, getProvider: () => null, providerHeaders: () => null, defaultProviderId: 'x' }) });
+      return { sent, call: () => routes({ method: 'GET' }, { setHeader() {} }, { path: '/api/models/machines', authn: { user: { id: 'a', role: 'admin' } }, url: new URL('http://x/api/models/machines?health=1') }) };
+    })();
+    const t0 = Date.now();
+    await f.call();
+    assert.ok(Date.now() - t0 < 2000, 'the probe did not wait for /models');
+    assert.equal(f.sent[0].health.services.engine.state, 'up');
+    assert.equal(f.sent[0].health.machines.local, 'up');
+    assert.deepEqual(loader.hits.map((h) => h.url), ['/api/v1/health']);
+    // no loader: the default provider's /v1/models is still the fallback
+    delete process.env.MODEL_LOADER_URL;
+    const t = localEngineTarget({ env: process.env, getProvider: () => ({ baseUrl: 'http://llama:8080/v1' }), providerHeaders: () => ({ Authorization: 'Bearer k' }), defaultProviderId: 'x' });
+    assert.deepEqual(t, { url: 'http://llama:8080', path: '/v1/models', headers: { Authorization: 'Bearer k' } });
+  } finally {
+    for (const [k, v] of [['MODEL_LOADER_URL', saved.url], ['MODEL_LOADER_TOKEN', saved.token]]) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    loader.close();
+  }
 });

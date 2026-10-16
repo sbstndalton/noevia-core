@@ -754,6 +754,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     withAdmission,
     close:tracker.close,
     enterInference: maintenance.enter,
+    enterInferenceWithin: maintenance.enterWithin,
     // #1785: read-only. Busy when the maintenance gate is held, more inference requests than the caller's own `own`
     // are in flight, or a model load/swap is queued or running. Optional work (a chat title) checks it and skips.
     inferenceBusy: (own = 0) => maintenance.held() || (typeof maintenance.active === 'function' && maintenance.active() > own) || admissionsPending > 0,
