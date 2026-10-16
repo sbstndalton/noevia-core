@@ -376,7 +376,10 @@ async function embedPhase(ds, outDir, base, opt) {
   }
   const nrm = (v) => { let n = 0; for (const x of v) n += x * x; n = Math.sqrt(n) || 1; return v.map((x) => x / n); };
   const qTexts = ds.queries.map((q) => qp + q.text);
+  const qCache = path.join(outDir, 'qvec.json'); // per-arm runs reuse the query vectors (same model + framing only)
+  if (fs.existsSync(qCache)) { const c = JSON.parse(fs.readFileSync(qCache, 'utf8')); if (c.model === model && c.qp === qp) for (const [t, v] of c.vec) vec.set(t, v); }
   await embedTexts(qTexts);
+  fs.writeFileSync(qCache, JSON.stringify({ model, qp, vec: qTexts.map((t) => [t, vec.get(t)]) }));
   const dim = vec.get(qTexts[0]).length; stats.dim = dim;
   if (opt.dim && +opt.dim !== dim) throw new Error(`embedding dim ${dim} != expected ${opt.dim}`);
   for (const arm of arms) {
@@ -395,7 +398,10 @@ async function embedPhase(ds, outDir, base, opt) {
     console.log('embedded arm', arm, JSON.stringify(stats.perArm[arm]));
   }
   stats.totalSec = +((Date.now() - t00) / 1000).toFixed(1);
-  fs.writeFileSync(path.join(outDir, 'embed.meta.json'), JSON.stringify(stats, null, 1));
+  const mf = path.join(outDir, 'embed.meta.json'); // merged across per-arm invocations
+  if (fs.existsSync(mf)) { const o = JSON.parse(fs.readFileSync(mf, 'utf8')); if (o.model === stats.model) { stats.perArm = { ...o.perArm, ...stats.perArm }; stats.requests += o.requests; stats.refused = [...o.refused, ...stats.refused]; stats.pausedMs += o.pausedMs; stats.retries += o.retries; stats.totalSec = +(stats.totalSec + o.totalSec).toFixed(1); stats.texts += o.texts; } }
+  if (opt.fbase) stats.fbase = arg(opt, 'fbase', 'D');
+  fs.writeFileSync(mf, JSON.stringify(stats, null, 1));
   console.log('embed done: requests', stats.requests, 'texts', stats.texts, 'dim', dim, 'model', model, 'refused', stats.refused.length);
 }
 
@@ -412,6 +418,7 @@ async function rerankPhase(ds, outDir, url, opt) {
     for (const q of ds.queries) {
       if (budget && (Date.now() - t00) / 1000 > budget) { stopped = true; break; }
       if (fs.existsSync(path.join(outDir, 'ABORT'))) { stopped = true; break; }
+      try { await waitPause(outDir, 15 * 60 * 1000); } catch { stopped = true; break; }
       const pool = pools[q.id]; let order = pool.map(([i]) => i); let err = null; let ms = 0;
       if (pool.length > 1) {
         const t0 = process.hrtime.bigint();
@@ -422,7 +429,9 @@ async function rerankPhase(ds, outDir, url, opt) {
     }
     fs.closeSync(out); meta.arms[arm] = { done, stopped }; console.log('reranked arm', arm, done + '/' + ds.queries.length, stopped ? '(stopped)' : '');
   }
-  fs.writeFileSync(path.join(outDir, 'rerank.meta.json'), JSON.stringify(meta, null, 1));
+  const mf = path.join(outDir, 'rerank.meta.json'); // merged across per-arm invocations
+  if (fs.existsSync(mf)) meta.arms = { ...JSON.parse(fs.readFileSync(mf, 'utf8')).arms, ...meta.arms };
+  fs.writeFileSync(mf, JSON.stringify(meta, null, 1));
 }
 
 // ------------------------------------------------------------------ scoring (same metric definitions as #1665 harness2.cjs)
@@ -440,6 +449,12 @@ function metrics(items) {
   return { n, gold1: f(g1), gold1_ci95: wilson(g1, n), gold3: f(g3), gold6: f(g6), gold6_ci95: wilson(g6, n), ndcg6: +(nd / n).toFixed(3), mrr: +(mrr / n).toFixed(3) };
 }
 function firstGold(order, chunks, q) { return order.slice(0, KEEP).findIndex((i) => chunks[i].doc === q.doc && hasGold(chunks[i].body, q.gold)); }
+/** The arm with the best cosine result: gold@6, then nDCG@6, then MRR, then fewer chunks. */
+function bestCosine(res, arms) {
+  const c = arms.filter((a) => res.arms[a]).map((a) => ({ a, m: res.arms[a].cosine.all, n: res.arms[a].stats.chunks }));
+  c.sort((x, y) => y.m.gold6 - x.m.gold6 || y.m.ndcg6 - x.m.ndcg6 || y.m.mrr - x.m.mrr || x.n - y.n);
+  return c.length ? c[0].a : null;
+}
 function score(ds, outDir) {
   const em = JSON.parse(fs.readFileSync(path.join(outDir, 'embed.meta.json'), 'utf8'));
   const Q = Object.fromEntries(ds.queries.map((q) => [q.id, q]));
@@ -468,17 +483,26 @@ function score(ds, outDir) {
       a.rerank = { ...groups(rrItems), keptTokMean: keptTok(rrItems), latency: { n: rows.length, errors: rows.length - ok.length, firstError: (rows.find((r) => r.err) || {}).err || null, p50: pct(ms, 50), p95: pct(ms, 95), max: ms.length ? Math.max(...ms) : null, over3s: ms.filter((x) => x > DEADLINE_MS).length, meanTokSent: Math.round(ok.reduce((s, r) => s + r.tokSent, 0) / (ok.length || 1)) } };
       a.rerankWithDeadline = groups(effItems);
       const L = a.rerank.latency;
-      lines.push(row(`${arm} rerank`, a.rerank.all, `${String(poolRecall).padStart(6)}  ${String(st.chunks).padStart(6)} ${String(st.meanTok).padStart(7)} ${String(a.rerank.keptTokMean).padStart(7)}  ${L.p50}/${L.p95}  ${L.over3s}${L.errors ? ' err ' + L.errors : ''}`));
+      a.rerank.exceedsDeadline = L.p50 != null && L.p50 > DEADLINE_MS; // production would fall back to cosine for most queries
+      lines.push(row(`${arm} rerank`, a.rerank.all, `${String(poolRecall).padStart(6)}  ${String(st.chunks).padStart(6)} ${String(st.meanTok).padStart(7)} ${String(a.rerank.keptTokMean).padStart(7)}  ${L.p50}/${L.p95}  ${L.over3s}${L.errors ? ' err ' + L.errors : ''}${a.rerank.exceedsDeadline ? '  EXCEEDS 3 s PRODUCTION DEADLINE' : ''}`));
+      lines.push(row(`${arm} rr+deadline`, a.rerankWithDeadline.all, '(what production returns: cosine when rerank > 3 s)'));
+    }
+    for (const g of ['en', 'crossLingual', 'straddlesPage', 'hasTwin']) {
+      lines.push(row(`  ${arm} cos ${g}`.slice(0, 16), a.cosine[g], ''));
+      if (a.rerank) lines.push(row(`  ${arm} rr ${g}`.slice(0, 16), a.rerank[g], ''));
     }
     res.arms[arm] = a;
   }
+  res.bestCosineOfCDE = bestCosine(res, ['C', 'D', 'E']);
+  if (em.fbase) res.fbase = em.fbase;
+  lines.push(`best cosine of C/D/E: ${res.bestCosineOfCDE}${em.fbase ? '; F built on ' + em.fbase : ''}`);
   fs.writeFileSync(path.join(outDir, 'scores.json'), JSON.stringify(res, null, 1));
   fs.writeFileSync(path.join(outDir, 'scores.txt'), lines.join('\n') + '\n');
   console.log(lines.join('\n'));
   return res;
 }
 
-module.exports = { chunkTextCurrent, chunkSentenceSnapped, chunkTokenWindows, chunkArm, chunkCorpus, chunkStats, joinPages, packSentences, sentenceSpans, hasGold, norm, generate, metrics, score, embedPhase, rerankPhase, ARMS };
+module.exports = { bestCosine, chunkTextCurrent, chunkSentenceSnapped, chunkTokenWindows, chunkArm, chunkCorpus, chunkStats, joinPages, packSentences, sentenceSpans, hasGold, norm, generate, metrics, score, embedPhase, rerankPhase, ARMS };
 
 if (require.main === module) {
   const [, , mode, ...rest] = process.argv;
@@ -496,6 +520,7 @@ if (require.main === module) {
     } else if (mode === 'embed') await embedPhase(load(pos[0]), pos[1], pos[2], opt);
     else if (mode === 'rerank') await rerankPhase(load(pos[0]), pos[1], pos[2], opt);
     else if (mode === 'score') score(load(pos[0]), pos[1]);
+    else if (mode === 'bestcos') { const res = score(load(pos[0]), pos[1]); fs.writeFileSync(path.join(pos[1], 'fbase.txt'), String(res.bestCosineOfCDE || '')); }
     else throw new Error('mode: gen | chunk | embed | rerank | score');
   })().catch((e) => { console.error('FATAL', e && e.message); process.exit(1); });
 }

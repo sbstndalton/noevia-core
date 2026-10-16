@@ -158,3 +158,30 @@ test('rerank past the 3 s deadline is scored as the cosine fallback production w
     assert.deepEqual(res.arms.C.rerankWithDeadline.all, res.arms.C.cosine.all);
   } finally { f.srv.close(); fs.rmSync(out, { recursive: true, force: true }); }
 });
+
+test('per-arm runs: query vectors cached, meta merged, best cosine of C/D/E picked for F', async () => {
+  const f = await fakeServer(); const out = tmp();
+  try {
+    const small = E.generate({ docs: 2, queries: 4, pages: 3, seed: 5 });
+    for (const arm of ['C', 'D', 'E']) await E.embedPhase(small, out, f.url + '/v1', { arms: arm, gapMs: '0' });
+    const queryInputs = f.calls.inputs;
+    await E.embedPhase(small, out, f.url + '/v1', { arms: 'A', gapMs: '0' });
+    const aChunks = JSON.parse(fs.readFileSync(path.join(out, 'chunks-A.json'), 'utf8')).length;
+    assert.ok(f.calls.inputs - queryInputs <= aChunks, 'queries not re-embedded');
+    let res = E.score(small, out);
+    assert.deepEqual(Object.keys(res.arms).sort(), ['A', 'C', 'D', 'E']);
+    assert.ok(['C', 'D', 'E'].includes(res.bestCosineOfCDE));
+    await E.embedPhase(small, out, f.url + '/v1', { arms: 'F', fbase: res.bestCosineOfCDE, gapMs: '0' });
+    await E.rerankPhase(small, out, f.url, { arms: 'A' }); await E.rerankPhase(small, out, f.url, { arms: 'F' });
+    assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(path.join(out, 'rerank.meta.json'), 'utf8')).arms).sort(), ['A', 'F']);
+    res = E.score(small, out);
+    assert.equal(res.fbase, res.bestCosineOfCDE); assert.ok(res.arms.F.rerank && res.arms.A.rerank);
+    assert.equal(typeof res.arms.A.cosine.straddlesPage.n, 'number');
+  } finally { f.srv.close(); fs.rmSync(out, { recursive: true, force: true }); }
+});
+
+test('bestCosine prefers gold@6, then nDCG@6, MRR, fewer chunks', () => {
+  const mk = (g6, nd, mrr, n) => ({ cosine: { all: { gold6: g6, ndcg6: nd, mrr } }, stats: { chunks: n } });
+  assert.equal(E.bestCosine({ arms: { C: mk(90, 0.7, 0.6, 500), D: mk(90, 0.8, 0.6, 260), E: mk(80, 0.9, 0.9, 180) } }, ['C', 'D', 'E']), 'D');
+  assert.equal(E.bestCosine({ arms: { C: mk(90, 0.8, 0.6, 500), D: mk(90, 0.8, 0.6, 260) } }, ['C', 'D', 'E']), 'D');
+});
