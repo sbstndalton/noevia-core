@@ -3,6 +3,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const documents = require('./documents.cjs');
+const largeDocuments = require('./large-document-lock.cjs');
 const { quoteName } = require('./quoted-name.cjs');
 const hash = value => crypto.createHash('sha256').update(value).digest('hex');
 
@@ -30,7 +31,11 @@ function writeOnce(workspace, file, bytes) {
   try { const dir = fs.openSync(path.dirname(file), 'r'); try { fs.fsyncSync(dir); } finally { fs.closeSync(dir); } } catch { /* a platform without directory fsync */ }
 }
 // #1871: `ocrBudget` (documents.ocrBudget) is the OCR retry allowance of the sync this read belongs to.
-async function ingest(workspace, projectId, name, bytes, previous, { ocrBudget } = {}) {
+// #1885 follow-up: `onOutcome(kind)` (optional) is told what this read came to, content-free, for the
+// sync's log line: 'extracted' (a new extraction), 'reopened' (a stored result completed or reopened),
+// or 'unchanged' (the stored result reused as it was).
+async function ingest(workspace, projectId, name, bytes, previous, { ocrBudget, onOutcome } = {}) {
+  const outcome = (kind) => { try { onOutcome?.(kind); } catch { /* a log counter never fails a read */ } };
   workspace.assertActive?.();
   const byteHash = hash(bytes);
   const version = hash(byteHash + ':' + documents.EXTRACTOR_VERSION);
@@ -59,10 +64,12 @@ async function ingest(workspace, projectId, name, bytes, previous, { ocrBudget }
     if (out.completion !== documents.COMPLETION || documents.reopenable(out)) {
       try {
         const completed = await documents.completeDocument(name, bytes, out, ocrBudget ? { ocrBudget } : undefined);
-        if (completed !== out) { out = storeFigures(completed); writeOnce(workspace, resultFile, JSON.stringify(out)); }
-      } catch (err) { console.warn('[documents] completing a stored result failed:', String(err?.message || err).slice(0, 200)); }
-    }
+        if (completed !== out) { out = storeFigures(completed); writeOnce(workspace, resultFile, JSON.stringify(out)); outcome('reopened'); }
+        else outcome('unchanged');
+      } catch (err) { outcome('unchanged'); console.warn('[documents] completing a stored result failed:', String(err?.message || err).slice(0, 200)); }
+    } else outcome('unchanged');
   } else {
+    outcome('extracted');
     try { out = ocrBudget ? await documents.extractDocumentText(name, bytes, { ocrBudget }) : await documents.extractDocumentText(name, bytes); }
     catch (err) { out = { text: '', pages: 0, pageTexts: [], state: 'failed', truncated: false, retryable: !!err.retryable, error: err.message }; }
     out = storeFigures(out);
@@ -77,6 +84,35 @@ async function ingest(workspace, projectId, name, bytes, previous, { ocrBudget }
       pageStatus: out.pageTexts.map(p => ({ number: p.number, status: p.status, ...(p.reason ? { reason: p.reason } : {}), ...(p.retry ? { retry: retryRecord(p.retry) } : {}) })),
       ...(out.stoppedAt ? { stoppedAt: stoppedRecord(out.stoppedAt) } : {}),
       error: out.error, ...(out.errorId ? { errorId: out.errorId } : {}), indexing: stale || previous?.document?.availableVersion === availableVersion ? previous?.document?.indexing || 'unavailable' : 'pending' } };
+}
+/**
+ * #1885 follow-up: a sync whose storage read of a document failed (a large file whose body did not arrive in
+ * time, say) never reached ingest, so a stored result that is reopenable (documents.reopenable: OCR refused
+ * for size, or the #1885 shared-memory upload failure) was never reopened, and every later sync failed the
+ * same way. When the previous version's own original and result are stored here, that result is reopened
+ * from the stored original instead: once (a reopened result is marked complete and no longer matches),
+ * under the large-document lock (completeDocument takes it for a large file) and within the sync's OCR
+ * budget. Returns ingest's record for that version, or null when there is nothing to reopen. The storage
+ * file itself was not read, so the caller still reports the refresh as failed.
+ */
+async function reopenStored(workspace, projectId, name, previous, options = {}) {
+  const d = previous?.document;
+  if (!d || !/^[a-f0-9]{64}$/.test(d.version || '') || !/^[a-f0-9]{64}$/.test(d.byteHash || '')) return null;
+  // The version is keyed by the extractor, so a record from an older extractor is re-read in full on a
+  // successful read instead; it is not reopened here.
+  if (d.version !== hash(d.byteHash + ':' + documents.EXTRACTOR_VERSION)) return null;
+  let stored;
+  try { stored = JSON.parse(fs.readFileSync(versionPath(workspace, projectId, d.version, '.json'), 'utf8')); } catch { return null; }
+  if (!stored || stored.retryable || !documents.reopenable(stored)) return null;
+  const original = versionPath(workspace, projectId, d.byteHash, '.pdf');
+  if (!fs.existsSync(original)) return null;
+  // The original is read from disk under the lock too, so a large file is in memory only while it is held.
+  const size = (() => { try { return fs.statSync(original).size; } catch { return undefined; } })();
+  return largeDocuments.ifLarge(size, async () => {
+    const bytes = fs.readFileSync(original);
+    if (hash(bytes) !== d.byteHash) return null;
+    return ingest(workspace, projectId, name, bytes, previous, options);
+  }, () => d.byteHash);
 }
 // #1865: what a page's OCR retry came to, as the source record keeps it.
 const RETRY_OUTCOMES = new Set(['recovered', 'empty', 'failed', 'unavailable', 'skipped']);
@@ -216,4 +252,4 @@ function noWorse(current, next, nextText) {
   if ((STATE_RANK[next?.state] ?? 0) < (STATE_RANK[current?.state] ?? 0)) return false;
   return readablePages(next) >= readablePages(current);
 }
-module.exports = { retryable, serviceDown, noWorse, ingest, failed, notice, readPages, readOriginal, directory, prune, problem, notes, noteText, problemNotes };
+module.exports = { retryable, serviceDown, noWorse, ingest, reopenStored, failed, notice, readPages, readOriginal, directory, prune, problem, notes, noteText, problemNotes };

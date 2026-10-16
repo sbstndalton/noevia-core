@@ -413,6 +413,10 @@ async function readBinaryFile(conn, rawPath, opts) {
       else chunks.push(Buffer.from(value));
       size += value.byteLength;
     }
+  } catch (err) {
+    // #1885 follow-up: the timeout can fire while the body is still arriving (a large file over a slow
+    // link), after fetch itself resolved; it is the same storage timeout, worded and coded as one.
+    throw transportError(err);
   } finally { reader.releaseLock(); }
   if (into && !chunks.length) {
     if (size === into.length) return into;
