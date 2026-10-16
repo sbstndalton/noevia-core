@@ -24,9 +24,14 @@ function destinationFor(project, name, { connection, remotePath, folderPath } = 
   const rel = folderPath ? `${folderPath}/${name}` : name;
   return remotePath || (connection ? `${project.projectFolder}/${classify(name)}/${rel}` : rel);
 }
-async function ingest(workspace, project, name, bytes, { connection, source, remotePath, folderPath, progress = () => {}, storageImpl = storage, extractDocx = docx.extract, ifMatch, ifNoneMatch, created } = {}) {
+async function ingest(workspace, project, name, bytes, { connection, source, remotePath, folderPath, progress = () => {}, storageImpl = storage, extractDocx = docx.extract, ifMatch, ifNoneMatch, created, ocrBudget } = {}) {
   workspace.assertActive?.();
-  validate(name, bytes);
+  // #1864: a PDF synced from storage (remotePath) is not an upload: its size is bounded by
+  // PROJECT_DOCUMENT_READ_BYTES when it is read, and it is extracted in page ranges. The upload checks
+  // (name, type, content) still run, on its first 25 MB; everything else keeps the upload cap.
+  const syncedPdf = !!remotePath && /\.pdf$/i.test(name) && bytes.length > CAP
+    && bytes.length <= require('./source-limits.cjs').documentLimits().readBytes;
+  validate(name, syncedPdf ? bytes.subarray(0, CAP) : bytes);
   const group = classify(name), mime = bytes.length <= 8 * 1024 * 1024 ? images[path.extname(name).toLowerCase()] : undefined;
   const fullName = destinationFor(project, name, { connection, remotePath, folderPath });
   const previous = (project.files || []).find(f => f.name === fullName);
@@ -43,7 +48,7 @@ async function ingest(workspace, project, name, bytes, { connection, source, rem
   let state = 'stored', reason, reasonId, reasonParams, readerVersion;
   if (documents.isDocument(name)) {
     progress('Extracting PDF text / OCR');
-    file = await sources.ingest(workspace, project.id, fullName, bytes, previous);
+    file = await sources.ingest(workspace, project.id, fullName, bytes, previous, ocrBudget ? { ocrBudget } : undefined);
     state = file.document.state;
   } else if (/\.docx$/i.test(name)) {
     progress('Reading DOCX body text and tables');

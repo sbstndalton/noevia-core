@@ -14,7 +14,7 @@ function makeWorkspace(autoRoles = null) {
   return { autoRoles, saves: 0, saveAutoRoles() { this.saves += 1; } };
 }
 
-function fixture({ env = {}, enabled = true, kind = 'llamacpp', manager = {}, workspace = { userId: 'u1' }, catalogue = [{ name: 'm' }], servedCatalogue = async () => catalogue, modelsInstalled = async () => [{ name: 'm', loaded: true }], initialRoles = null, initialLastLoaded = null, otherWorkspaces = [], inferenceBudget = null, sweepGuardOptions, fetchReply = null } = {}) {
+function fixture({ env = {}, enabled = true, kind = 'llamacpp', manager = {}, workspace = { userId: 'u1' }, catalogue = [{ name: 'm' }], servedCatalogue = async () => catalogue, modelsInstalled = async () => [{ name: 'm', loaded: true }], initialRoles = null, initialLastLoaded = null, otherWorkspaces = [], inferenceBudget = null, idleUnload = null, sweepGuardOptions, fetchReply = null, machineModels = undefined } = {}) {
   const sent = [], headers = [], fetched = [];
   const scan = new Map();
   let refreshes = 0;
@@ -48,7 +48,7 @@ function fixture({ env = {}, enabled = true, kind = 'llamacpp', manager = {}, wo
     readBody: async (req) => { let s = ''; for await (const c of req) s += c; return s; },
     readJson: async (req) => { let s = ''; for await (const c of req) s += c; return s ? JSON.parse(s) : {}; },
     fetchJson: async (url, init) => { fetched.push({ url, init }); return fetchReply ? fetchReply(url, init) : { ok: true, status: 200, body: { models: ['a'] } }; },
-    env, modelManager, inferenceBudget, sweepGuardOptions,
+    env, modelManager, inferenceBudget, idleUnload, sweepGuardOptions, ...(machineModels ? { machineModels } : {}),
     getProvider: () => ({ baseUrl: 'http://engine', apiKey: 'local' }), providerHeaders: () => ({}), DEFAULT_PROVIDER_ID: 'default',
     createVisionProbe: () => async () => ({ supported: true }),
     reportedTokenRate: (g) => g.tokens_per_second ?? null,
@@ -784,6 +784,34 @@ test('the inference budget is read with each model\'s estimate and saved by an a
   assert.deepEqual(engineDown.sent.pop().body, { budgetGib: 12, source: 'deployment', minGib: 2, maxGib: 25, models: null, estimateError: 'engine' });
 });
 
+// noevia#1863: the idle unload time is an administrator setting.
+test('#1863 the idle unload time is read and saved by administrators only', async () => {
+  const saved = [];
+  const idleUnload = { get: async () => ({ seconds: 1800, source: 'default' }),
+    save: async (body, actor) => { if (body.seconds === 60) throw Object.assign(Error('Choose Never or a time from 5 minutes to 24 hours.'), { status: 400, errorId: 'idleUnloadInvalid', minSeconds: 300, maxSeconds: 86400 }); saved.push([body, actor]); return { seconds: body.seconds, source: 'setting', apply: { state: 'applied' } }; } };
+  const f = fixture({ idleUnload });
+  for (const [method, body] of [['GET'], ['PUT', { seconds: 3600 }]]) {
+    await f.call(method, '/api/models/idle-unload', body);
+    assert.equal(f.sent.pop().status, 403, `members cannot ${method}`);
+  }
+  assert.deepEqual(saved, []);
+  await f.call('GET', '/api/models/idle-unload', undefined, 'admin');
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { seconds: 1800, source: 'default' } });
+  assert.ok(f.headers.some(([k, v]) => k === 'Cache-Control' && v === 'no-store'));
+  await f.call('PUT', '/api/models/idle-unload', { seconds: 3600 }, 'admin');
+  assert.deepEqual(f.sent.pop(), { status: 200, body: { seconds: 3600, source: 'setting', apply: { state: 'applied' } } });
+  assert.deepEqual(saved, [[{ seconds: 3600 }, 'u1']]);
+  await f.call('PUT', '/api/models/idle-unload', { seconds: 60 }, 'admin');
+  assert.deepEqual(f.sent.pop(), { status: 400, body: { error: 'Choose Never or a time from 5 minutes to 24 hours.', errorId: 'idleUnloadInvalid', minSeconds: 300, maxSeconds: 86400 } });
+  await f.call('PUT', '/api/models/idle-unload', '{bad', 'admin');
+  assert.equal(f.sent.pop().status, 400);
+  await f.call('DELETE', '/api/models/idle-unload', undefined, 'admin');
+  assert.equal(f.sent.pop().status, 405);
+  const none = fixture();
+  await none.call('GET', '/api/models/idle-unload', undefined, 'admin');
+  assert.equal(none.sent.pop().status, 404);
+});
+
 // #1708: a model whose file was deleted is left out of the budget table, like the Models tab (#1695).
 test('#1708 the inference budget leaves out models whose file is missing', async () => {
   const inferenceBudget = { get: () => ({ budgetGib: 12, source: 'deployment', minGib: 2, maxGib: 25 }) };
@@ -1029,4 +1057,31 @@ test('#1461 /api/stats keeps the tenant-scoped tokens figure per request, not in
   assert.equal(statsCalls, 1);
   assert.equal(f.sent.length, 2);
   assert.equal(f.sent[0].body.tokensPerSecond, f.sent[1].body.tokensPerSecond);
+});
+
+test('#1849 GET /api/auto-roles lists the models chat roles\' machines serve; nothing on a machine leaves the answer as it was', async () => {
+  const plain = fixture({ initialRoles: { fast: 'm', smart: 'm' } });
+  await plain.call('GET', '/api/auto-roles');
+  const before = plain.sent.pop();
+  const none = fixture({ initialRoles: { fast: 'm', smart: 'm' }, machineModels: () => [] });
+  await none.call('GET', '/api/auto-roles');
+  assert.deepEqual(none.sent.pop(), before, 'no machineModels key when nothing is on a machine');
+  const row = { model: 'synthetic-remote', machine: { id: 'mach-1', name: 'Synthetic Pi' }, roles: ['smart'] };
+  const some = fixture({ initialRoles: { fast: 'm', smart: 'm' }, machineModels: () => [row] });
+  await some.call('GET', '/api/auto-roles');
+  assert.deepEqual(some.sent.pop(), { ...before, body: { ...before.body, machineModels: [row] } });
+  const broken = fixture({ initialRoles: { fast: 'm', smart: 'm' }, machineModels: () => { throw Error('synthetic'); } });
+  await broken.call('GET', '/api/auto-roles');
+  assert.deepEqual(broken.sent.pop(), before, 'an unreadable machine list never breaks the roles answer');
+});
+
+test('#1855 GET /api/auto-roles leaves out machine models the served local catalogue lists (the router\'s own source)', async () => {
+  const local = { model: 'm', machine: { id: 'mach-1', name: 'Synthetic Pi' }, roles: ['fast'] };
+  const remote = { model: 'synthetic-remote', machine: { id: 'mach-1', name: 'Synthetic Pi' }, roles: ['smart'] };
+  const f = fixture({ initialRoles: { fast: 'm', smart: 'm' }, catalogue: [{ name: 'm' }], modelsInstalled: async () => [{ name: 'synthetic-remote', loaded: false }], machineModels: () => [local, remote] });
+  await f.call('GET', '/api/auto-roles');
+  assert.deepEqual(f.sent.pop().body.machineModels, [remote], 'served names go local; the installed list is not the source');
+  const all = fixture({ initialRoles: { fast: 'm', smart: 'm' }, catalogue: [{ name: 'm' }], machineModels: () => [local] });
+  await all.call('GET', '/api/auto-roles');
+  assert.equal('machineModels' in all.sent.pop().body, false, 'nothing left to list: no key, as with no machine');
 });

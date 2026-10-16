@@ -81,29 +81,25 @@ const realFetch = global.fetch;
 test.before(() => { global.fetch = async () => { throw new Error('Unexpected network in project modes route test'); }; });
 test.after(() => { global.fetch = realFetch; });
 
-test('projects default to Chat, accept valid modes and reject invalid ones', async () => {
+test('projects are Chat projects; an old client sending modes is accepted, normalised, and garbage is refused (#1576)', async () => {
   const plain = JSON.parse((await post('/api/projects', { name: 'Synthetic default' })).text);
   assert.deepEqual(plain.modes, ['chat']);
   const code = JSON.parse((await post('/api/projects', { name: 'Synthetic C++', modes: ['code'] })).text);
-  assert.deepEqual(code.modes, ['code']);
-  assert.equal((await post('/api/projects', { name: 'Bad', modes: [] })).status, 400);
+  assert.deepEqual(code.modes, ['chat', 'code']);
+  const empty = await post('/api/projects', { name: 'Synthetic empty', modes: [] });
+  assert.equal(empty.status, 200);
+  assert.deepEqual(JSON.parse(empty.text).modes, ['chat']);
   assert.equal((await post('/api/projects', { name: 'Bad', modes: ['voice'] })).status, 400);
-  const patched = await post(`/api/projects/${plain.id}/config`, { modes: ['code', 'chat', 'cowork'] });
+  const patched = await post(`/api/projects/${plain.id}/config`, { modes: ['code', 'cowork'] });
   assert.equal(patched.status, 200);
   const workspace = JSON.parse((await request('/api/workspace', { headers: mutationHeaders() })).text);
   assert.deepEqual(workspace.projects.find((p) => p.id === plain.id).modes, ['chat', 'cowork', 'code']);
-  assert.equal((await post(`/api/projects/${plain.id}/config`, { modes: [] })).status, 400);
-  assert.deepEqual(JSON.parse((await request('/api/workspace', { headers: mutationHeaders() })).text).projects.find((p) => p.id === plain.id).modes, ['chat', 'cowork', 'code']);
+  assert.equal((await post(`/api/projects/${plain.id}/config`, { modes: 'chat' })).status, 400);
 });
 
-test('a project not enabled for Chat refuses chat before any inference call', async () => {
+test('a project once saved without Chat no longer refuses chat turns (#1576)', async () => {
   const code = JSON.parse((await post('/api/projects', { name: 'Synthetic code only', modes: ['code'] })).text);
-  let calls = 0; const previous = global.fetch;
-  global.fetch = async () => { calls++; throw new Error('no inference expected'); };
-  try {
-    const reply = await post('/api/chat', { spaceId: 'project', projectId: code.id, message: 'hello', history: [] });
-    assert.equal(reply.status, 409);
-    assert.match(JSON.parse(reply.text).error, /not enabled for Chat/);
-    assert.equal(calls, 0);
-  } finally { global.fetch = previous; }
+  const reply = await post('/api/chat', { spaceId: 'project', projectId: code.id, message: 'hello', history: [] });
+  assert.notEqual(reply.status, 409, reply.text);
+  assert.doesNotMatch(reply.text, /not enabled for Chat/);
 });

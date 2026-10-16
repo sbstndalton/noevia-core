@@ -61,6 +61,14 @@ function createReloadGuard({ stateFile = null, check = (req) => require('./dav-p
     },
     forget() { baseline = null; persist(); },
     known: () => !!baseline,
+    /** noevia#1863: the models.ini text the router last read, when that is still knowable: the
+     *  baseline of noevia's last reload, while the router's own view is unchanged since. A router
+     *  that re-read on its own (restart, another client) makes it unknown (null). */
+    routerText(rows) {
+      if (!baseline) return null;
+      const view = engineView(rows);
+      return view !== null && view === baseline.view ? baseline.text : null;
+    },
     /** May the router reload `currentText` now without unloading any of `loadedIds`? */
     verdict(currentText, rows, loadedIds) {
       if (!baseline) return { safe: false, reason: 'unknown' };

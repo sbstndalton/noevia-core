@@ -47,6 +47,13 @@
 // event) plus our own wall-clock figures go into a log entry per attempt. No model text, no engine
 // message and no prompt text is ever logged. `call()` never throws: any failure is
 // `{ ok: false, code, reason }`.
+//
+// #1853: an endpoint with `machine` (the Code role on an Inference machine, code-machine.cjs) is another
+// machine's llama-server. There is no router listing and no local lock there, so its pin rule is its own:
+// `machines.ready(t)` (health + the #1851 served-model check, with the #1840 "unreachable" / "wrong model"
+// text) instead of residency; no admission, no inference budget; every request through `machines.fetch`
+// (serviceFetch: on this network only, link-local and redirects refused) with no API key. A task pinned on
+// one target refuses a call once the role points elsewhere (or back here), and vice versa: one model per task.
 const crypto = require('node:crypto');
 const { readCappedJson } = require('./http.cjs');
 const { runGuardedStream, GuardAbortError, CorrectionFailedError } = require('./stream-guard.cjs');
@@ -215,8 +222,9 @@ async function* sseDeltas(response, m, now) {
  * embedding/reranking sidecars). `admission` serialises the residency check with the send (the
  * model manager's withAdmission); without one, they run back to back unlocked.
  */
-function createRoleEngine({ engine, fetch = (url, init) => globalThis.fetch(url, init), loadedModels = null, keep = () => [], admission = null, budgetRefusal = null, roleDefaults = {}, log = () => {}, now = () => Date.now() }) {
+function createRoleEngine({ engine, fetch = (url, init) => globalThis.fetch(url, init), loadedModels = null, keep = () => [], admission = null, budgetRefusal = null, roleDefaults = {}, log = () => {}, now = () => Date.now(), machines = null }) {
   if (typeof engine !== 'function') throw Error('createRoleEngine needs engine()');
+  const machineKey = (endpoint) => (endpoint?.machine ? `${endpoint.machine.machine?.id}|${endpoint.machine.baseUrl}|${endpoint.machine.model}` : null);
   const admit = typeof admission === 'function' ? admission : (work) => work();
   const keepIds = () => { try { const k = keep(); return Array.isArray(k) ? k.filter((x) => typeof x === 'string') : []; } catch { return []; } };
   const budgetFor = (role) => ({ ...FALLBACK_DEFAULTS, ...(ROLE_DEFAULTS[role] || {}), ...((roleDefaults && roleDefaults[role]) || {}) });
@@ -259,6 +267,7 @@ function createRoleEngine({ engine, fetch = (url, init) => globalThis.fetch(url,
       try { endpoint = engine() || {}; } catch { endpoint = {}; }
       if (endpoint.external === true) return fail('external', 'The task pipeline runs only on a local model.');
       if (!endpoint.baseUrl) return fail('unavailable', 'No model is configured for the task pipeline.');
+      if (endpoint.machine) return pinOnMachine({ taskId, model, thinking, roles, signal, endpoint });
       let loaded;
       try { loaded = await admit(() => readLoaded(endpoint), signal || undefined); }
       catch (error) {
@@ -281,9 +290,28 @@ function createRoleEngine({ engine, fetch = (url, init) => globalThis.fetch(url,
         return fail('over_budget', String(refused.error || 'The model does not fit the inference memory budget.'));
       }
       record({ event: 'role.pinned', taskId, model: wanted, thinking, cold: !loaded.includes(wanted) });
-      return { ok: /** @type {true} */ (true), session: makeSession({ taskId, model: wanted, thinking, roles: [...roles] }) };
+      return { ok: /** @type {true} */ (true), session: makeSession({ taskId, model: wanted, thinking, roles: [...roles], machine: null }) };
     },
   };
+
+  /** #1853: pin on the Code role's machine: ready() and the served model, never residency, admission or budget. */
+  async function pinOnMachine({ taskId, model, thinking, roles, signal, endpoint }) {
+    const t = endpoint.machine;
+    if (!machines || typeof machines.ready !== 'function' || typeof machines.fetch !== 'function') return fail('unavailable', 'This server cannot reach the Code role’s machine.');
+    if (typeof model === 'string' && model && model !== t.model) {
+      record({ event: 'role.model_refused', taskId, stage: 'pin', machine: true });
+      return fail('model_mismatch', `This task names ${model}, but the Code role runs ${t.model} on ${t.machine?.name || 'its machine'}. One task runs on one model.`);
+    }
+    let ready;
+    try { ready = await machines.ready(t); } catch { ready = { ok: false, code: 'machineUnreachable', error: `The Code role’s machine (${t.machine?.name || ''}) is unreachable.` }; }
+    if (signal?.aborted) return fail('aborted', 'The task was cancelled.');
+    if (!ready.ok) {
+      record({ event: 'role.pin_failed', taskId, code: ready.code || 'machineUnreachable' });
+      return fail(ready.code || 'machineUnreachable', String(ready.error || 'The Code role’s machine is unreachable.'));
+    }
+    record({ event: 'role.pinned', taskId, model: t.model, thinking, machine: true });
+    return { ok: /** @type {true} */ (true), session: makeSession({ taskId, model: t.model, thinking, roles: [...roles], machine: machineKey(endpoint) }) };
+  }
 
   /** @param {{ taskId: string, model: string, thinking: boolean, roles: string[] }} pin */
   function makeSession(pin) {
@@ -299,6 +327,8 @@ function createRoleEngine({ engine, fetch = (url, init) => globalThis.fetch(url,
     return Object.freeze({
       taskId: pin.taskId,
       model: pin.model,
+      /** #1853: the machine target this task is pinned to (null: this machine's engine). */
+      machine: pin.machine,
       thinking: pin.thinking,
       roles: Object.freeze([...pin.roles]),
       /** Text-free timing entries of every attempt so far (copies). */
@@ -322,6 +352,17 @@ function createRoleEngine({ engine, fetch = (url, init) => globalThis.fetch(url,
         try { endpoint = engine() || {}; } catch { endpoint = {}; }
         if (endpoint.external === true) return fail('external', 'The task pipeline runs only on a local model.');
         if (!endpoint.baseUrl) return fail('unavailable', 'No model is configured for the task pipeline.');
+        // #1853: one model per task: a task pinned here never calls a machine, and the other way round.
+        const onMachine = !!endpoint.machine;
+        if (machineKey(endpoint) !== pin.machine) {
+          record({ event: 'role.model_refused', taskId: pin.taskId, role, stage: 'call', machine: onMachine });
+          return fail('model_mismatch', 'The Code role moved to another machine or model during this task. This step was not sent, because one task runs on one model.');
+        }
+        if (onMachine) {
+          let ready;
+          try { ready = await machines.ready(endpoint.machine); } catch { ready = { ok: false, code: 'machineUnreachable', error: 'The Code role’s machine is unreachable.' }; }
+          if (!ready.ok) return fail(ready.code || 'machineUnreachable', String(ready.error || 'The Code role’s machine is unreachable.'));
+        }
 
         let dossier, fields;
         try {
@@ -343,9 +384,14 @@ function createRoleEngine({ engine, fetch = (url, init) => globalThis.fetch(url,
         let constraint = schemaConstraint({ enabled: constrain === true, provider: endpoint.provider || null, model: pin.model, thinking: pin.thinking, schema, name: schemaName });
         let outcome = { applied: false, mode: null, reason: constraint.reason, fallback: false };
         const url = `${base(endpoint)}/chat/completions`;
-        const headers = headersFor(endpoint);
+        // #1853: a machine never gets this machine's key.
+        const headers = onMachine ? { 'Content-Type': 'application/json' } : headersFor(endpoint);
+        const transport = onMachine ? machines.fetch : fetch;
+        let connectFailed = null;
         const send = async (payload, attemptSignal) => {
-          const response = await fetch(url, { method: 'POST', redirect: 'error', signal: attemptSignal, headers, body: JSON.stringify(payload) });
+          let response;
+          try { response = await transport(url, { method: 'POST', redirect: 'error', signal: attemptSignal, headers, body: JSON.stringify(payload) }); }
+          catch (err) { if (onMachine && !attemptSignal?.aborted) connectFailed = err; throw err; }
           if (!response.ok) { try { await response.body?.cancel?.(); } catch { /* ignore */ } return { ok: false, status: response.status }; }
           return { ok: true, status: response.status, body: response };
         };
@@ -361,14 +407,21 @@ function createRoleEngine({ engine, fetch = (url, init) => globalThis.fetch(url,
                 temperature: 0, max_tokens: maxTokens, chat_template_kwargs: { enable_thinking: pin.thinking },
               };
               const m = { start: now(), bytes: 0, deltas: 0, reasoningDeltas: 0, firstDeltaMs: null, complete: false, timings: {} };
-              // #697: checked again per call: the budget, or the model's preset, may have changed.
-              const refused = budgetRefusal ? await Promise.resolve().then(() => budgetRefusal(pin.model)).catch(() => null) : null;
-              if (refused) throw Object.assign(Error('over budget'), { code: 'inference_budget', publicMessage: String(refused.error || '') });
-              // One admission: the residency check and the send (until the engine answers headers).
-              const r = await admit(async () => {
-                await assertResident(endpoint, role);
-                return requestPlanArtifact({ payload, constraint, log: (e) => record({ ...e, taskId: pin.taskId, role }), send: (p) => send(p, attemptSignal) });
-              }, attemptSignal);
+              const ask = () => requestPlanArtifact({ payload, constraint, log: (e) => record({ ...e, taskId: pin.taskId, role }), send: (p) => send(p, attemptSignal) });
+              let r;
+              if (onMachine) {
+                // #1853: a machine's model is not this machine's budget, residency or lock.
+                r = await ask();
+              } else {
+                // #697: checked again per call: the budget, or the model's preset, may have changed.
+                const refused = budgetRefusal ? await Promise.resolve().then(() => budgetRefusal(pin.model)).catch(() => null) : null;
+                if (refused) throw Object.assign(Error('over budget'), { code: 'inference_budget', publicMessage: String(refused.error || '') });
+                // One admission: the residency check and the send (until the engine answers headers).
+                r = await admit(async () => {
+                  await assertResident(endpoint, role);
+                  return ask();
+                }, attemptSignal);
+              }
               // A rejection is final for this call: the correction does not ask for the schema again.
               if (r.constraint.fallback) { outcome = r.constraint; constraint = { fields: {}, applied: false, mode: null, reason: r.constraint.reason }; }
               else if (!outcome.fallback) outcome = r.constraint;
@@ -395,6 +448,11 @@ function createRoleEngine({ engine, fetch = (url, init) => globalThis.fetch(url,
           // #697: the pinned model would not fit the inference memory budget; nothing was sent.
           if (error?.code === 'inference_budget' || error?.code === 'inference_budget_unloaded') return { ...fail('over_budget', String(error.publicMessage || 'The model does not fit the inference memory budget, so this step was not sent.')), constraint: outcome };
           if (error?.code === 'router_unavailable') return { ...fail('router_unavailable', 'The model router could not say which model is loaded, so this step was not sent.'), constraint: outcome };
+          // #1853: the machine did not answer at the socket: the #1840 "unreachable" text, not a generic one.
+          if (onMachine && connectFailed && typeof machines.connectError === 'function') {
+            record({ event: 'role.call_failed', taskId: pin.taskId, role, status: null, code: 'machineUnreachable' });
+            return { ...fail('machineUnreachable', String(machines.connectError(endpoint.machine, connectFailed))), constraint: outcome };
+          }
           record({ event: 'role.call_failed', taskId: pin.taskId, role, status: Number.isInteger(error?.status) ? error.status : null, code: ['no_stream', 'engine_error'].includes(error?.code) ? error.code : 'transport' });
           return { ...fail('error', 'The model could not be reached.'), constraint: outcome };
         }

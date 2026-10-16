@@ -9,7 +9,7 @@
 // chat still carries the title derived from its first message, so a name the person gave it always wins.
 //
 // Off-box turns (an external provider, a cloud route, any provider other than the local one: chat.cjs
-// offBoxTurn) get no generated title: the message and the reply are never sent anywhere for it. A
+// offBoxTurn; a chat role on one of the owner's Inference machines is not off-box, #1840) get no generated title: the message and the reply are never sent anywhere for it. A
 // failure, a timeout or an unusable answer leaves the derived title as it was. Nothing here throws.
 
 const { readCappedJson } = require('./http.cjs');

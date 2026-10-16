@@ -12,7 +12,19 @@
 const IMAGE_MIME = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
 const IMAGE_UPLOAD_CAP = 8 * 1024 * 1024;
 const DOCUMENT_UPLOAD_CAP = 25 * 1024 * 1024;
+// #1864: a PDF read from storage (an attached folder, or the project's own synced folder) is not refused
+// for its size alone: it is read up to PROJECT_DOCUMENT_READ_BYTES (source-limits.cjs) and extracted in page
+// ranges. The 25 MB cap above stays for uploads, where it bounds an HTTP body the browser sends. Other
+// types keep the storage client's 25 MB read cap. The read timeout grows with the cap (30 s plus a second
+// per MiB), since a quarter-gigabyte file does not arrive in 30 s.
+function documentReadOptions(path) {
+  if (!/\.pdf$/i.test(String(path || ''))) return undefined;
+  const cap = sourceLimits.documentLimits().readBytes;
+  return { cap, timeoutMs: 30000 + Math.ceil(cap / (1024 * 1024)) * 1000 };
+}
+const { isDeepStrictEqual } = require('node:util');
 const sourceLimits = require('../source-limits.cjs');
+const largeDocuments = require('../large-document-lock.cjs');
 const sourceText = require('../source-text.cjs');
 // Shared with projects.cjs's createProject and the create/edit dialogs (src/project-limits.ts,
 // #398) so a name is capped identically everywhere it can be set.
@@ -430,6 +442,9 @@ function createProjectRoutes({
           }
         }
       }
+      // #1886: a patch that leaves every field as stored (the client's "Refresh from storage" used to
+      // re-send the folder list) is a read: no write, no timestamp bump, no store lock.
+      if (isDeepStrictEqual(project, storedProject)) return json(res, 200, { ok: true, unchanged: true });
       project.updatedAt = Date.now();
       Object.assign(storedProject, project);
       if (clearSampling) delete storedProject.sampling;
@@ -936,8 +951,22 @@ function createProjectRoutes({
       const hold = automaticHold(authn, req);
       if (hold) return holdReply(res, hold);
       // #1815: no source-text collection in this workspace while the sync runs.
+      // #1885 follow-up: one content-free line per sync: counts and a short tag of the project, never a
+      // file name, folder or text. `seen` counts the files read or attempted; `ingested` those read from
+      // storage; of those, `reopened` were stored results completed or reopened, `unchanged` reused as they
+      // were; `reopenedStored` were reopened from the stored original after the storage read failed.
+      const startedAt = Date.now();
+      const stats = { seen: 0, ingested: 0, extracted: 0, reopened: 0, unchanged: 0, reopenedStored: 0, errors: 0, skipped: 0 };
+      const onOutcome = (kind) => { if (kind in stats) stats[kind] += 1; };
+      let logged = false;
+      const logSync = (status) => {
+        if (logged) return;
+        logged = true;
+        console.log(`[sources] sync project=${largeDocuments.refHash(id)} status=${status} ` +
+          Object.entries(stats).map(([k, v]) => `${k}=${v}`).join(' ') + ` ms=${Date.now() - startedAt}`);
+      };
       return await sourceText.whileSourceWork(sourceWorkDir(), () => withSourceLock(project, async () => {
-        if (getProject(id) !== project) return json(res, 409, { error: 'Project changed; retry.' });
+        if (getProject(id) !== project) { logSync(409); return json(res, 409, { error: 'Project changed; retry.' }); }
         const hadUploads = hasUploads(project); // #659: the box is added only when uploads first appear
         const connection = authService.getStorage(authn.user.id, true);
         const fromFolders = [];
@@ -963,7 +992,7 @@ function createProjectRoutes({
           }
         }
         const folders = Array.isArray(project.sourceFolders) ? project.sourceFolders : [];
-        if (folders.length && !storageClient.isBrowsable(connection)) return json(res, 400, { error: 'no browsable storage connection is configured' });
+        if (folders.length && !storageClient.isBrowsable(connection)) { logSync(400); return json(res, 400, { error: 'no browsable storage connection is configured' }); }
         // Room left for the folders being re-read: every source that is NOT
         // from one of them (uploads, images just moved into storage, files of
         // other attached folders) stays, so it counts against the source limit (and documents against theirs).
@@ -972,6 +1001,8 @@ function createProjectRoutes({
         const DOCUMENT_LIMIT = sourceLimits.limits().documents;
         const documentRoom = Math.max(0, DOCUMENT_LIMIT - sourceLimits.counts(kept).documents);
         let documentsRead = 0;
+        // #1871: the OCR retry pages this sync may spend, across all its documents (PROJECT_SYNC_OCR_PAGES).
+        const syncOcrBudget = require('../documents.cjs').ocrBudget();
 
         // #1429: a refused or throttled login stops every further storage call in this refresh; the
         // rest of the folders and files keep what they had and say why, with no more attempts made.
@@ -1033,6 +1064,7 @@ function createProjectRoutes({
             }
             if (isDoc || isDocx || (managed && sourceLimits.kindOf(entry.name) === 'document')) documentsRead += 1;
             const previous = (project.files || []).find((f) => f.source === folder && f.name === entry.path);
+            stats.seen += 1;
             if (halted) {
               if (isDoc) fromFolders.push({ ...documentSources.failed(previous, entry.path, halted.reason), source: folder });
               else if (previous) fromFolders.push(previous);
@@ -1041,31 +1073,53 @@ function createProjectRoutes({
             }
             try {
               if (managed || isDocx) {
-                const bytes = await storageClient.readBinaryFile(connection, entry.path);
-                const file = await require('../uploads.cjs').ingest(currentWorkspace(), project, entry.name, bytes, { source: folder, remotePath: entry.path, progress: requestScope.getStore()?.sourceProgress });
+                // #1871: a PDF that is (or may be) over 25 MiB holds the process-wide large-document lock from
+                // its storage read to the end of its extraction.
+                // #1872: the listed size is not trusted: the response's own Content-Length decides too, before the body.
+                const file = await largeDocuments.readThenUse(documentReadOptions(entry.path) ? entry.size : 0,
+                  (beforeBody) => storageClient.readBinaryFile(connection, entry.path, { ...documentReadOptions(entry.path), ...(documentReadOptions(entry.path) ? { beforeBody } : {}) }),
+                  (bytes) => require('../uploads.cjs').ingest(currentWorkspace(), project, entry.name, bytes, { source: folder, remotePath: entry.path, progress: requestScope.getStore()?.sourceProgress, ocrBudget: syncOcrBudget }));
                 fromFolders.push(file);
-                if (file.document && file.document.state !== 'ready') skipped.push({ folder, file: entry.path, reason: documentSources.problem(file), retained: file.document.stale });
+                if (file.document && file.document.state !== 'ready') skipped.push({ folder, file: entry.path, reason: documentSources.problem(file), ...documentSources.problemNotes(file), retained: file.document.stale });
               } else if (isDoc) {
                 // A document is converted to text here, so a PDF in an attached
                 // folder becomes a readable source rather than being skipped.
-                const bytes = await storageClient.readBinaryFile(connection, entry.path);
-                const file = await documentSources.ingest(currentWorkspace(), id, entry.path, bytes, previous);
+                const file = await largeDocuments.readThenUse(documentReadOptions(entry.path) ? entry.size : 0,
+                  (beforeBody) => storageClient.readBinaryFile(connection, entry.path, { ...documentReadOptions(entry.path), ...(documentReadOptions(entry.path) ? { beforeBody } : {}) }),
+                  (bytes) => documentSources.ingest(currentWorkspace(), id, entry.path, bytes, previous, { ocrBudget: syncOcrBudget, onOutcome }));
                 fromFolders.push({ ...file, source: folder });
-                if (file.document.state !== 'ready') skipped.push({ folder, file: entry.path, reason: documentSources.problem(file), retained: file.document.stale });
+                if (file.document.state !== 'ready') skipped.push({ folder, file: entry.path, reason: documentSources.problem(file), ...documentSources.problemNotes(file), retained: file.document.stale });
               } else {
                 const file = await storageClient.readTextFile(connection, entry.path);
                 fromFolders.push({ name: entry.path, content: file.content, source: folder });
               }
+              stats.ingested += 1;
             } catch (e) {
+              stats.errors += 1;
               haltFor(e);
               const reason = storageReason(e, 'could not read');
+              // #1885 follow-up: the read failed, so ingest (and its reopen) never ran. A previous result that is
+              // reopenable is reopened from its stored original instead (documentSources.reopenStored: once, under
+              // the large-document lock, within this sync's OCR budget). The refresh is still reported as failed.
+              let reopened = null;
+              if (isDoc && !managed && !isDocx && !halted && e?.code !== 'large-document-busy' && previous?.document) {
+                try {
+                  reopened = await documentSources.reopenStored(currentWorkspace(), id, entry.path, previous, { ocrBudget: syncOcrBudget, onOutcome: (kind) => { if (kind === 'reopened') stats.reopenedStored += 1; } });
+                } catch (err) { console.warn(`[sources] reopening a stored result failed: project=${largeDocuments.refHash(id)} (${String(err?.name || 'Error').slice(0, 40)})`); }
+              }
+              if (reopened) {
+                const file = { ...reopened, source: folder, document: { ...reopened.document, state: 'failed', stale: !!reopened.content, error: reason } };
+                fromFolders.push(file);
+                skipped.push({ folder, file: entry.path, reason: documentSources.problem(file), ...documentSources.problemNotes(file), code: storageCode(e), retained: !!file.content });
+                continue;
+              }
               if (isDoc) fromFolders.push({ ...documentSources.failed(previous, entry.path, reason), source: folder });
               else if (previous) fromFolders.push(previous);
               skipped.push({ folder, file: entry.path, reason, code: storageCode(e), retained: !!previous && sourceText.textLength(previous) > 0 });
             }
           }
         }
-        if (getProject(id) !== project) return json(res, 409, { error: 'Project changed; retry.' });
+        if (getProject(id) !== project) { logSync(409); return json(res, 409, { error: 'Project changed; retry.' }); }
         const prev = Array.isArray(project.files) ? project.files : [];
         // An upload or folder edit may have completed while storage was being
         // read. Preserve current uploads and never reattach a detached folder.
@@ -1095,11 +1149,13 @@ function createProjectRoutes({
             indexSource(project, next);
           }
         }
+        stats.skipped = skipped.length;
+        logSync(200);
         return json(res, 200, {
           files: project.files.map((f) => ({ name: f.name, source: f.source || null, bytes: sourceText.textLength(f), document: f.document })),
           skipped,
         });
-      }));
+      })).catch((err) => { stats.errors += 1; logSync('error'); throw err; });
     }
 
     const chatDel = p.match(/^\/api\/projects\/([^/]+)\/chats\/([^/]+)$/);

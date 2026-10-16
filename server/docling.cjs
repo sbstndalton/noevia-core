@@ -1,5 +1,7 @@
 'use strict';
 const { readCappedJson } = require('./http.cjs');
+const workers = require('./document-workers.cjs');
+const { uploadInit } = require('./upload-body.cjs');
 // Client for the private Docling worker (services/docling). Only the
 // operator-configured worker receives bytes, never a model or a cloud API —
 // same rule as ocr.cjs, and the same shape, deliberately.
@@ -24,7 +26,8 @@ function supports(name) {
   return !!match && FORMATS.has(match[0].toLowerCase());
 }
 
-function enabled() { return !!process.env.DOCLING_BASE_URL; }
+// #1841: a machine Docling is assigned to counts, else DOCLING_BASE_URL (document-workers.cjs).
+function enabled() { return workers.configured('documents'); }
 
 /** The last path segment, which is all the worker needs and all it will accept. */
 function documentName(name) {
@@ -54,9 +57,18 @@ function headerSafeName(name) {
 // #1726: `figures` asks the worker for the document's figures (images) as well, and for a per-page `ocr`
 // marker (the page had no text layer, so its text came from OCR). Only sent while NOEVIA_MULTIMODAL_RAG
 // is on (documents.cjs); without the header the worker answers exactly as before.
-async function extractDocument(name, bytes, { url = process.env.DOCLING_BASE_URL, fetchImpl = fetch, figures = false } = {}) {
+// #1864: `pages: [first, last]` asks for those pages only (X-Document-Pages), which is how a large PDF is
+// read range by range; the reply's `total` is still the whole document's page count. A reply holding a
+// page outside the range came from a worker that ignores the header (an image from before #1864): that
+// is an error with `code: 'no-ranges'`, never a result. Without `pages` the request is exactly as before.
+async function extractDocument(name, bytes, options = {}) {
+  const { figures = false } = options;
+  const range = rangeOf(options.pages);
+  const target = workers.resolve('documents');
+  const url = options.url === undefined ? target.url : options.url;
+  const fetchImpl = options.fetchImpl || (options.url === undefined ? target.fetch : fetch);
   if (!url) throw new Error('Document extraction is not configured.');
-  const response = await fetchImpl(`${url.replace(/\/+$/, '')}/extract`, {
+  const response = await fetchImpl(`${url.replace(/\/+$/, '')}/extract`, uploadInit(bytes, {
     method: 'POST',
     redirect: 'error',
     // The worker reads the suffix and nothing else, and refuses a name that could be a path —
@@ -64,8 +76,9 @@ async function extractDocument(name, bytes, { url = process.env.DOCLING_BASE_URL
     // ("Documents/Tax Return 2024/W-2.pdf"), so send the last segment. Sending the whole path
     // made every document in a folder fail with HTTP 400 while a bare filename worked, which
     // is why a synthetic test did not catch it (2026-09-21).
-    headers: { 'Content-Type': 'application/octet-stream', 'X-Document-Name': headerSafeName(documentName(name)), ...(figures ? { 'X-Document-Figures': '1' } : {}) },
-    body: bytes,
+    headers: { 'Content-Type': 'application/octet-stream', 'X-Document-Name': headerSafeName(documentName(name)), ...(figures ? { 'X-Document-Figures': '1' } : {}),
+      ...(range ? { 'X-Document-Pages': `${range[0]}-${range[1]}` } : {}) },
+    // #1885: a SAB-backed read goes as a sized stream (upload-body.cjs).
     // Measured on DaServer (2 CPUs, CPU-only torch), not assumed:
     //   scanned prose, OCR   3.4 s/page
     //   table-heavy native   10.9 s/page  <- TableFormer, not OCR, is the cost
@@ -74,12 +87,14 @@ async function extractDocument(name, bytes, { url = process.env.DOCLING_BASE_URL
     // covered barely a fifth of that and would abort a large document the
     // worker was still successfully converting, which surfaces as a retryable
     // failure and then fails again identically on retry.
-    signal: AbortSignal.timeout(3900000),
-  });
+    // A range is bounded by its own length instead (#1864): two minutes plus a minute a page, five
+    // times the measured worst case per page, and never more than the whole-document limit.
+    signal: AbortSignal.timeout(range ? Math.min(3900000, 120000 + (range[1] - range[0] + 1) * 60000) : 3900000),
+  }));
   if (!response.ok) {
     // 503 and 415 are the two a user can act on, so they say something useful;
     // everything else is a retry.
-    if (response.status === 503) throw new Error('Document extraction is busy; refresh to retry.');
+    if (response.status === 503) throw Object.assign(new Error('Document extraction is busy; refresh to retry.'), { status: 503 });
     // A 400 means noevia sent something the worker refuses — a bug on this side, not a broken
     // document. Named as that rather than as an outage, but deliberately NOT permanent: a
     // cached refusal would outlive the fix, and the fix is what should heal it.
@@ -92,9 +107,53 @@ async function extractDocument(name, bytes, { url = process.env.DOCLING_BASE_URL
   // text plus per-page metadata; 32 MB is far above that (#920).
   const body = await readCappedJson(response, DOCLING_REPLY_CAP).catch((e) => { throw e?.code === 'too_large' ? new Error('Invalid extraction response; refresh to retry.') : e; });
   if (!body || !Array.isArray(body.pages)) throw new Error('Invalid extraction response; refresh to retry.');
+  if (range && body.pages.some((p) => !(Number(p?.number) >= range[0] && Number(p?.number) <= range[1]))) {
+    throw Object.assign(new Error('The document extractor does not read page ranges yet; update the docling service.'), { code: 'no-ranges' });
+  }
   return body;
+}
+
+/** [first, last] for a valid page range, else null. */
+function rangeOf(pages) {
+  if (!Array.isArray(pages) || pages.length !== 2) return null;
+  const [first, last] = pages.map(Number);
+  return Number.isSafeInteger(first) && Number.isSafeInteger(last) && first >= 1 && last >= first && last - first < 200 ? [first, last] : null;
 }
 
 const DOCLING_REPLY_CAP = 32 * 1024 * 1024;
 
-module.exports = { extractDocument, supports, enabled, documentName, headerSafeName, VERSION, FORMATS };
+// #1864: whether the worker reads page ranges, from its /health (`"ranges": true` since #1864). Asked
+// before any ranged request, because a worker from before #1864 ignores X-Document-Pages and would
+// convert the whole first window again only for the reply to be thrown away. true, false, or null when
+// the worker could not be asked. #1882: with `bytes`, false when the file is over the worker's advertised
+// `rangedMaxBytes` (it would refuse every range with 400). Positive and negative answers are kept
+// CAPABILITY_TTL_MS.
+const CAPABILITY_TTL_MS = 5 * 60_000;
+let rangesCache = { at: 0, url: null, value: undefined };
+async function rangesHealth(options) {
+  const target = workers.resolve('documents');
+  const url = options.url === undefined ? target.url : options.url;
+  const fetchImpl = options.fetchImpl || (options.url === undefined ? target.fetch : fetch);
+  if (!url) return null;
+  const now = Date.now();
+  if (!options.fresh && rangesCache.url === url && rangesCache.value !== undefined && now - rangesCache.at < CAPABILITY_TTL_MS) return rangesCache.value;
+  let value = null;
+  try {
+    const response = await fetchImpl(`${url.replace(/\/+$/, '')}/health`, { method: 'GET', redirect: 'error', signal: AbortSignal.timeout(10_000) });
+    if (response.ok) {
+      const body = await readCappedJson(response, 64 * 1024);
+      value = { ranges: body?.ranges === true,
+        ...(Number.isSafeInteger(body?.rangedMaxBytes) && body.rangedMaxBytes > 0 ? { rangedMaxBytes: body.rangedMaxBytes } : {}) };
+    }
+  } catch { value = null; }
+  rangesCache = { at: now, url, value };
+  return value;
+}
+async function rangesSupported(options = {}) {
+  const health = await rangesHealth(options);
+  if (!health) return null;
+  if (!health.ranges) return false;
+  return !(Number.isSafeInteger(options.bytes) && health.rangedMaxBytes && options.bytes > health.rangedMaxBytes);
+}
+
+module.exports = { CAPABILITY_TTL_MS, extractDocument, rangesSupported, supports, enabled, documentName, headerSafeName, VERSION, FORMATS };

@@ -21,7 +21,12 @@ function keepAlongside(env = process.env) {
   const config = require('./embedding-config.cjs').current();
   const onEngine = config ? [config.active(), config.next()].filter((t) => t && !t.baseUrl).map((t) => t.model) : null;
   const e = onEngine ? onEngine.join('\u0000') : (String(env.EMBEDDING_BASE_URL || '').trim() ? '' : (env.EMBEDDING_MODEL || env.EMBED_MODEL || ''));
-  const target = require('./rerank-target.cjs').rerankTarget(env);
+  // #1638: the reranker's effective configuration (its Settings switch and inference machine) once installed: a
+  // reranker assigned to another machine is not on this engine, so it is not kept beside the chat model.
+  const rerankSettings = require('./rerank-settings.cjs').current();
+  let renv = env;
+  if (rerankSettings && env === process.env) { try { renv = rerankSettings.effectiveEnv() || env; } catch { renv = env; } }
+  const target = require('./rerank-target.cjs').rerankTarget(renv);
   const r = target.enabled && target.shared ? target.model || '' : '';
   return [...String(e || '').split('\u0000').filter((m) => m && m !== 'default'), ...(r ? [r] : [])];
 }
@@ -168,6 +173,26 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
   // The engine runs one model at a time (compose --models-max, #697); on a multi-slot engine the
   // small models in keepAlongside() may stay, but two chat models never share it.
   const admissionError = message => Object.assign(Error(message), { status: 409, publicMessage: message });
+  // #1863: after a refused unload of a loading model, poll /models (≤ unloadWait.loadingTimeoutMs, 30 s) until it is
+  // gone (true) or loaded, then unload it once more (true when that is accepted). False: still there at the deadline.
+  async function settleLoadingEvictee(id, signal) {
+    const timeoutMs = Math.min(unloadWait.loadingTimeoutMs ?? 30000, 30000), sleep = unloadWait.sleep || (ms => new Promise(resolve => setTimeout(resolve, ms)));
+    const deadline = Date.now() + timeoutMs;
+    let delay = 100;
+    while (Date.now() < deadline) {
+      signal?.throwIfAborted();
+      await sleep(delay);
+      delay = Math.min(delay * 2, 1000);
+      const listing = await rawModels(signal);
+      if (!listing.ok || !Array.isArray(listing.body?.data)) continue;
+      const status = listing.body.data.find((m) => m.id === id)?.status?.value;
+      if (!['loaded', 'loading', 'sleeping'].includes(status)) return true;
+      if (status === 'loading') continue;
+      const again = await post('/models/unload', { model: id }, 60000, signal);
+      if (again.ok) return true;
+    }
+    return false;
+  }
   async function makeRoomForUnlocked(model, keep, signal) {
     // #1068: a restored models.ini the router has not re-read yet is re-read before this model loads.
     await autotuner?.flushReload?.(model);
@@ -181,7 +206,13 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     for (const m of others) {
       signal?.throwIfAborted();
       const result = await post('/models/unload', { model: m.id }, 60000, signal);
-      if (!result.ok) throw admissionError('Another model could not be unloaded. Try again when it is idle.');
+      if (result.ok) continue;
+      // #1863: a model still loading (an unused pre-load, say). llama.cpp b11610 (tools/server/server-models.cpp,
+      // server_models::unload) accepts that unload and force-kills the loading process; it answers 400 "model is not
+      // running" only once the model has already left. A refusal here therefore never fails the turn: wait, bounded,
+      // until the model is loaded (then unload it) or gone.
+      if (m.status?.value === 'loading' && await settleLoadingEvictee(m.id, signal)) continue;
+      throw admissionError('Another model could not be unloaded. Try again when it is idle.');
     }
     if (others.length) {
       // The router acknowledges /models/unload before the process has exited, so the listing can
@@ -723,6 +754,7 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     withAdmission,
     close:tracker.close,
     enterInference: maintenance.enter,
+    enterInferenceWithin: maintenance.enterWithin,
     // #1785: read-only. Busy when the maintenance gate is held, more inference requests than the caller's own `own`
     // are in flight, or a model load/swap is queued or running. Optional work (a chat title) checks it and skips.
     inferenceBusy: (own = 0) => maintenance.held() || (typeof maintenance.active === 'function' && maintenance.active() > own) || admissionsPending > 0,
@@ -750,6 +782,8 @@ function createLlamaCppManager({ baseUrl, apiKey, fetchJson, presetPath, downloa
     quarantine,
     sizingBudgetGib,
     reloadPresets,
+    // noevia#1863: the models.ini text the router is known to run on, or null when unknowable.
+    async presetsInRouter(){try{const l=await rawModels();return l.ok&&Array.isArray(l.body?.data)?reloadGuard.routerText(l.body.data):null;}catch{return null;}},
     evidence, recordEvidence, importEvidence,
     calibration: calibrator ? { start: calibrator.start, cancel: calibrator.cancel, status: calibrator.status, recover: calibrator.recover } : null,
     autotune: autotuner ? { start: autotuner.start, resume: autotuner.resume, cancel: autotuner.cancel, status: autotuner.status, setSettings: autotuner.setSettings, recover: autotuner.recover, untuned: autotuner.untuned } : null,

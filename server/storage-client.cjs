@@ -359,9 +359,12 @@ async function createFolder(conn, rawPath) {
  *  (a PDF). No extension gate here: the caller decides what it can parse, and
  *  the cap is larger because a document compresses to text far smaller than
  *  its own size. */
+// #1864: `timeoutMs` (default 30 s) bounds the whole read, body included; a caller raising `cap` for a
+// large document raises it with the size.
 async function readBinaryFile(conn, rawPath, opts) {
   const scoped = !!(opts && opts.scope === 'corpus');
   const cap = (opts && opts.cap) || 25 * 1024 * 1024;
+  const timeoutMs = opts && Number.isSafeInteger(opts.timeoutMs) && opts.timeoutMs > 0 ? opts.timeoutMs : 30000;
   const path = safeRelativePath(rawPath);
   if (!path) throw Object.assign(new Error('invalid path'), { status: 400 });
   const s3 = connectionKind(conn) === 's3';
@@ -370,7 +373,7 @@ async function readBinaryFile(conn, rawPath, opts) {
   const response = await withRetry(() => fetch(url, {
     method: 'GET',
     headers: s3 ? signS3Request('GET', url, '', conn.username || '', conn.secret || '', { region: normalizeS3Region(conn.region) }) : davHeaders(conn, {}),
-    signal: AbortSignal.timeout(30000),
+    signal: AbortSignal.timeout(timeoutMs),
     redirect: 'error',
   }));
   if (!response.ok) {
@@ -381,20 +384,48 @@ async function readBinaryFile(conn, rawPath, opts) {
     await response.body?.cancel();
     throw tooLarge();
   }
+  // #1872: `beforeBody(contentLength)` runs once the headers are in and before any of the body is read
+  // (contentLength is null when the response does not say), so a caller can take a lock that depends on the
+  // real size rather than the listed one. If it throws the body is dropped unread and the error is passed on.
+  if (opts && typeof opts.beforeBody === 'function') {
+    const header = response.headers.get('content-length');
+    const length = header !== null && header !== '' && Number.isSafeInteger(Number(header)) && Number(header) >= 0 ? Number(header) : null;
+    try { await opts.beforeBody(length); } catch (err) { await response.body?.cancel().catch(() => {}); throw err; }
+  }
   if (!response.body) return Buffer.alloc(0);
   const reader = response.body.getReader();
+  // #1871: with a declared length the bytes go straight into one buffer of that size, so a large file is
+  // never held twice (the chunks and their concatenation). Without one, chunks are joined at the end.
+  const declaredLength = Number(response.headers.get('content-length'));
+  // A large one (over 25 MiB, a PDF read in page ranges) is placed in shared memory, which the page-range
+  // workers then read in place (documents-native.cjs sharedBytes): one copy of the file in all.
+  const into = !(Number.isSafeInteger(declaredLength) && declaredLength > 0) ? null
+    : declaredLength > 25 * 1024 * 1024 && typeof SharedArrayBuffer !== 'undefined' ? Buffer.from(new SharedArrayBuffer(declaredLength))
+    : Buffer.allocUnsafe(declaredLength);
   const chunks = [];
   let size = 0;
   try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
+      if (size + value.byteLength > cap) { await reader.cancel(); throw tooLarge(); }
+      if (into && size + value.byteLength <= into.length) into.set(value, size);
+      else chunks.push(Buffer.from(value));
       size += value.byteLength;
-      if (size > cap) { await reader.cancel(); throw tooLarge(); }
-      chunks.push(Buffer.from(value));
     }
+  } catch (err) {
+    // #1885 follow-up: the timeout can fire while the body is still arriving (a large file over a slow
+    // link), after fetch itself resolved; it is the same storage timeout, worded and coded as one.
+    throw transportError(err);
   } finally { reader.releaseLock(); }
-  return Buffer.concat(chunks, size);
+  if (into && !chunks.length) {
+    if (size === into.length) return into;
+    // #1872: far less arrived than was declared: copy the real bytes out so the oversized (shared) buffer
+    // is not kept alive behind a subarray.
+    if (size < into.length / 2) return Buffer.from(into.subarray(0, size));
+    return into.subarray(0, size);
+  }
+  return Buffer.concat(into ? [into.subarray(0, Math.min(size, into.length)), ...chunks] : chunks, size);
 }
 
 /** Write one file, creating or replacing it. Used for a project's own folder,
@@ -424,13 +455,13 @@ async function writeFile(conn, rawPath, bytes, { ifMatch, ifNoneMatch } = {}) {
   const conditional = !!ifMatch || ifNoneMatch === '*';
   let response;
   try {
-    response = await withRetry(() => fetch(davUrl(conn, path), {
+    // #1885: a re-written large read is SAB-backed; a fresh stream per attempt.
+    response = await withRetry(() => fetch(davUrl(conn, path), require('./upload-body.cjs').uploadInit(bytes, {
       method: 'PUT',
       headers: davHeaders(conn, { 'Content-Type': 'application/octet-stream', ...(ifMatch ? { 'If-Match': quoteEtag(ifMatch) } : {}), ...(ifNoneMatch === '*' ? { 'If-None-Match': '*' } : {}) }),
-      body: bytes,
       signal: AbortSignal.timeout(60000),
       redirect: 'error',
-    }), { once: conditional });
+    })), { once: conditional });
   } catch (err) {
     if (!conditional) throw err;
     throw Object.assign(new Error(`the connection to storage failed while writing "${path}"; it may or may not have been saved`), { status: 502, code: 'unknown' });

@@ -94,7 +94,9 @@ test('isUnreadableSource mirrors the server predicate (#586)', () => {
 test('Sources lists unreadable originals apart from Text and leaves them out of the count (#586)', () => {
   const src = fs.readFileSync(path.join(__dirname, '../../src/components/ProjectView.tsx'), 'utf8');
   assert.match(src, /const readableFiles = project\.files\.filter\(\(f\) => !isUnreadableSource\(f\)\)/);
-  assert.match(src, /const sourceCount = readableFiles\.length/);
+  // #1879: the header count comes from sourceCounts() (readable files plus earlier image uploads); the
+  // older inline form is accepted so this test passes on either side of the web change.
+  assert.match(src, /const sourceCount = (readableFiles\.length|sourceCounts\(project\)\.counted)/);
   assert.match(src, /readableFiles\.filter\(f => fileGroup\(f\) === group\)/);
   assert.match(src, /unreadableFiles\.map\(renderFile\)/);
 });

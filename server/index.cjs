@@ -119,9 +119,26 @@ const authService = createAuth({
     .map((s) => s.trim())
     .filter(Boolean),
 });
-const decisionSettings = require('./decision-settings.cjs').createDecisionSettings({ store: require('./features.cjs').settingsStore(authService.db), audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail) });
+// #1638: Settings → Inference machines: which machine each service runs on (default: all on this one). The decision
+// service and the reranker read their address from it; embeddings move only through the #1636 re-index.
+const inferenceMachines = require('./inference-machines.cjs').createInferenceMachines({ store: require('./features.cjs').settingsStore(authService.db), audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail),
+  embeddingActive: () => require('./embedding-config.cjs').current()?.active() || null,
+  localEmbeddingUrl: () => require('./embedding-service.cjs').current()?.baseUrl || String(process.env.EMBEDDING_BASE_URL || '').trim() || null,
+  modelsAt: (address, port) => chatMachines.modelsAt(address, port), // #1851 (chatMachines is built just below)
+  onChange: (service) => { if (service === 'reranker') rag.reloadRerank(); } });
+// #1638/#1840: one health-probe cache for the Settings page and the chat turns of roles on a machine.
+const machineHealth = require('./machine-health.cjs').createMachineHealth();
+// #1840: chat roles (Fast, Smart, Code, Creative) and Vision on an Inference machine (chat-machines.cjs).
+const chatMachines = require('./chat-machines.cjs').createChatMachines({ machines: inferenceMachines, health: machineHealth });
+// #1880: an administrator-started measurement of a chat role's model on its machine (nothing on this machine changes).
+const machineTune = require('./machine-tune.cjs').createMachineTune({ machines: inferenceMachines, chatMachines, store: require('./features.cjs').settingsStore(authService.db),
+  audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail) });
+const decisionSettings = require('./decision-settings.cjs').createDecisionSettings({ store: require('./features.cjs').settingsStore(authService.db), audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail), machineUrl: () => inferenceMachines.urlFor('decision'), sensitivityMachineUrl: () => inferenceMachines.urlFor('sensitivity') });
+// #1841: OCR and Docling read their address from the same registry (document-workers.cjs), the environment being the fallback.
+require('./document-workers.cjs').useMachines((kind) => inferenceMachines.urlFor(kind));
 // #1665: the reranker's on/off and model, saved in Settings over the deployment's RERANK_* environment.
-const rerankSettings = require('./rerank-settings.cjs').createRerankSettings({ store: require('./features.cjs').settingsStore(authService.db), audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail), onChange: () => rag.reloadRerank() });
+const rerankSettings = require('./rerank-settings.cjs').install(require('./rerank-settings.cjs').createRerankSettings({ store: require('./features.cjs').settingsStore(authService.db), audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail), onChange: () => rag.reloadRerank(),
+  machine: () => { const url = inferenceMachines.urlFor('reranker'); return url ? { url, protocol: inferenceMachines.rerankProtocol() } : null; } }));
 // #697: the inference memory budget (admin setting; INFERENCE_MEMORY_BUDGET_GIB is its initial value).
 const inferenceBudget = require('./inference-budget.cjs').createInferenceBudget({ store: require('./features.cjs').settingsStore(authService.db), audit: (action,actor,detail)=>authService.audit(action,actor,actor,detail) });
 const features = require('./features.cjs').createFeatures({ store: require('./features.cjs').settingsStore(authService.db), audit: (action, actor, detail) => authService.audit(action, actor, actor, detail),
@@ -275,6 +292,25 @@ if (embeddingConfig.next()) setTimeout(() => embeddingMigration.kick(), 30000).u
   }
 }
 
+// #1868/#1869: long documents gain their text past the 200,000-character head in the search index, and
+// uploads made with no storage connection get the completion pass, both paced in the background
+// (document-backfill.cjs) and held while a re-index is under way.
+{
+  const documentBackfill = require('./document-backfill.cjs').createDocumentBackfill({
+    rag,
+    userIds: () => authService.db.prepare('SELECT id FROM users').all().map((r) => r.id).filter((id) => !workspaceStore.isRemoved(id)),
+    workspaceFor: (userId) => workspaceStore.get(userId),
+    documentDir: (workspace, projectId) => require('./document-sources.cjs').directory(workspace, projectId),
+    runAs: (userId, fn) => {
+      const user = authService.publicUser(authService.db.prepare('SELECT * FROM users WHERE id=?').get(userId));
+      return requestScope.run({ workspace: workspaceStore.get(userId), authn: { user, legacy: false } }, fn);
+    },
+    completeUpload: (project, file, options) => projectStore.completeUploadedDocument(project, file, options),
+    paused: () => (embeddingConfig.next() ? 'a re-index is under way' : null),
+  });
+  documentBackfill.start(); // unref'd timers: never holds the process open
+}
+
 // User-created projects; the earlier fixed demo spaces were removed.
 // spaces were deleted per user request — projects are user-created only.
 // Each project: goal/description, custom instructions,
@@ -327,6 +363,11 @@ const modelManager = createModelManager({
 });
 // #697 runtime safety net: unload the engine's models when measured inference memory stays
 // above the budget by more than INFERENCE_BUDGET_OVERSHOOT_PCT (default 10). Native engine only.
+// noevia#1863: the chat-model idle unload time (admin setting, stored by the model manager).
+const idleUnload = process.env.MODEL_LOADER_URL ? require('./idle-unload-setting.cjs').createIdleUnloadSetting({ env: process.env, fetchJson,
+  reloadPresets: (o) => modelManager.reloadPresets ? modelManager.reloadPresets(o) : { ok: false },
+  presetsInRouter: () => modelManager.presetsInRouter ? modelManager.presetsInRouter() : null,
+  audit: (action, actor, detail) => authService.audit(action, actor, actor, detail) }) : null;
 const inferenceBudgetWatch = modelManager.kind === 'llamacpp' ? (() => {
   const watch = require('./inference-budget-watch.cjs');
   const files = watch.gpuMemoryFiles(process.env);
@@ -369,6 +410,7 @@ const modelService = require('./models.cjs').createModelService({
   // Auto-roles are per workspace: a deleted model's role reference must be cleared out of
   // every workspace's config, not just whichever one happened to make the delete request.
   listWorkspaces: () => authService.listUsers().map((u) => workspaceStore.get(u.id)),
+  roleOnMachine: (role) => !!chatMachines.target(role),
 });
 const { autoRoles, ensureRolesLoaded, servedCatalogue, modelsInstalled, lastLoadedModel } = modelService;
 
@@ -537,7 +579,16 @@ require('./code-tool-schemas.cjs').useExecutorGuard(() => features.enabled('exec
 // model inside that same lock. A client outside this process can still race the router.
 // The same role engine runs the Code pipeline's Planner, review and Auditor (#705).
 const codeRoleLog = (entry) => console.log('[code]', JSON.stringify(entry));
+// #1853: the Code role (or Smart, its fallback) on an Inference machine: every stage of a Code task runs on
+// that machine's model (code-machine.cjs). The role engine, Planner and reviewer call it through chatMachines;
+// the sandbox Executor reaches it only through web's relay on the code network (CODE_ENGINE_RELAY_PORT).
+// Nothing assigned: codeMachineTarget() is null and every endpoint below is exactly what it was.
+const codeMachineTarget = () => require('./code-machine.cjs').codeTargetFrom(chatMachines, autoRoles);
+const codeEngineRelay = require('./code-machine.cjs').startEngineRelayFromEnv(process.env, { chatMachines, target: codeMachineTarget,
+  log: (entry) => console.log('[code-relay]', JSON.stringify(entry)) });
 const codeRoleEndpoint = () => {
+  const remote = codeMachineTarget();
+  if (remote) return { baseUrl: `${remote.baseUrl}/v1`, apiKey: null, model: remote.model, external: false, provider: chatMachines.provider(remote), machine: remote };
   const provider = getProvider(DEFAULT_PROVIDER_ID);
   const base = String(provider?.baseUrl || '').replace(/\/+$/, '');
   return {
@@ -548,7 +599,7 @@ const codeRoleEndpoint = () => {
     provider,
   };
 };
-const codeRoleEngine = require('./role-engine.cjs').createRoleEngine({ fetch: (...args) => globalThis.fetch(...args), log: codeRoleLog, engine: codeRoleEndpoint,
+const codeRoleEngine = require('./role-engine.cjs').createRoleEngine({ fetch: (...args) => globalThis.fetch(...args), log: codeRoleLog, engine: codeRoleEndpoint, machines: chatMachines,
   keep: () => [...require('./model-system.cjs').sidecarModelNames(process.env)],
   admission: typeof modelManager.withAdmission === 'function' ? (work, signal) => modelManager.withAdmission(work, signal) : null,
   // #697: never pin or call a model that would not fit the inference memory budget.
@@ -557,7 +608,7 @@ const codeReview = require('./code-review.cjs').createPlannerReview({
   enabled: () => features.enabled('plannerReview'),
   log: codeRoleLog,
   // #697: both paths admit the model within the inference memory budget before any request.
-  provider: require('./code-review.cjs').createEngineReviewer({ fetch: (...args) => globalThis.fetch(...args), log: codeRoleLog, engine: codeRoleEndpoint, admit: (model, signal) => admitEngineModel(model, signal) }),
+  provider: require('./code-review.cjs').createEngineReviewer({ fetch: (...args) => globalThis.fetch(...args), log: codeRoleLog, engine: codeRoleEndpoint, admit: (model, signal) => admitEngineModel(model, signal), machines: chatMachines }),
   roleEngine: codeRoleEngine,
 });
 // The Code pipeline (#705, code-pipeline.cjs, which holds the task-lifecycle authority): offered as
@@ -567,7 +618,7 @@ const codeReview = require('./code-review.cjs').createPlannerReview({
 const { createCodePipeline } = require('./code-pipeline.cjs');
 const codeVerify = require('./code-pipeline-verify.cjs').createVerifyAdapter(require('./code-verify.cjs').createCodeVerify({ log: codeRoleLog }));
 const codePlanner = require('./planner-plan.cjs').createPlannerPlan({ enabled: () => features.enabled('constrainedPlanDecoding'), engine: codeRoleEndpoint, log: codeRoleLog,
-  admit: (model, signal) => admitEngineModel(model, signal) });
+  admit: (model, signal) => admitEngineModel(model, signal), machines: chatMachines });
 const codeService = require('./code-service.cjs').createCodeService({
   repos: process.env.CODE_REPOS,
   // The egress proxy (D15) is the only way a task reaches the internet, and only to the domains
@@ -580,6 +631,9 @@ const codeService = require('./code-service.cjs').createCodeService({
   // exists because the sandbox may reach the engine by a different name than the web
   // container does — it is on an internal network of its own.
   engine: () => {
+    // #1853: on a machine, the harness is given the relay (its URL now, its per-run token at start).
+    const remote = codeMachineTarget();
+    if (remote) return { baseUrl: codeEngineRelay.url, apiKey: null, model: remote.model, relay: codeEngineRelay.relay };
     const provider = getProvider(DEFAULT_PROVIDER_ID);
     const base = (process.env.CODE_ENGINE_URL || provider?.baseUrl || '').replace(/\/+$/, '');
     return {
@@ -598,16 +652,18 @@ const codeService = require('./code-service.cjs').createCodeService({
   review: codeReview,
   // #1062: the agent reaches the engine from the sandbox, outside the gate; a task holds the gate's
   // inference lease while it runs, and none starts while auto-tune or calibration is active.
+  // #1853: a task whose Code role is on a machine does not use this machine's engine: no lease, no pause.
   inference: typeof modelManager.enterInference === 'function' ? {
-    enter: () => modelManager.enterInference(),
-    paused: () => modelManager.tuningActive?.() === true,
+    enter: () => (codeMachineTarget() ? () => {} : modelManager.enterInference()),
+    paused: () => !codeMachineTarget() && modelManager.tuningActive?.() === true,
   } : null,
   pipeline: {
     enabled: () => features.enabled('codeHarness') && features.enabled('codePipeline'),
     create: ({ jobs, workspaces, harness, askApproval }) => createCodePipeline({ jobs, workspaces, harness, askApproval,
       roleEngine: codeRoleEngine, planner: codePlanner, review: codeReview, verify: codeVerify,
       merge: () => features.enabled('codeMerge'), constrain: () => features.enabled('constrainedPlanDecoding'),
-      engineKey: () => codeRoleEndpoint().apiKey, log: codeRoleLog }),
+      // #1853: this machine's key is what the leak guard refuses, wherever the Code role runs.
+      engineKey: () => getProvider(DEFAULT_PROVIDER_ID)?.apiKey || null, log: codeRoleLog }),
   },
 });
 const codeRoutes = require('./routes/code.cjs').createCodeRoutes({
@@ -641,6 +697,9 @@ const usageRoutes = require('./routes/usage.cjs').createUsageRoutes({
 });
 
 // ── Deep research (D12): module in research-service.cjs, routes in routes/research.cjs ──
+// The model a research step asks and its one completion (research-model.cjs); #1849: Smart on an Inference machine runs there.
+const researchEngine = require('./research-model.cjs').createResearchModel({ autoRoles, lastLoadedModel, chatMachines, getProvider, DEFAULT_PROVIDER_ID,
+  providerHeaders, fetch: (...args) => fetch(...args), modelManager, admitEngineModel, readCappedJson });
 const researchRoutes = require('./routes/research.cjs').createResearchRoutes({
   features, getProject, workspace: () => currentWorkspace(), json, readJson,
   available: () => {
@@ -653,23 +712,7 @@ const researchRoutes = require('./routes/research.cjs').createResearchRoutes({
     saveFile: (project, name, text) => writeProjectTextFile(project, name, text),
     getProject,
     tools: (workspace, project) => ({
-      complete: async (messages, { signal, maxTokens }) => {
-        const provider = getProvider(DEFAULT_PROVIDER_ID), model = researchModel(project);
-        // Same maintenance gate as chat and RAG: tuning/calibration must not share the engine.
-        let leave;
-        try { leave = modelManager.enterInference?.() || (() => {}); }
-        catch (e) { throw Object.assign(e, { publicMessage: e.publicMessage || (e.status === 503 ? e.message : 'The model is busy. Try again shortly.') }); }
-        try {
-        await admitEngineModel(model, signal);
-        const r = await fetch(`${provider.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')}/v1/chat/completions`, { method: 'POST', redirect: 'error',
-          headers: providerHeaders(provider, { 'Content-Type': 'application/json' }), signal: AbortSignal.any([signal, AbortSignal.timeout(120000)]),
-          body: JSON.stringify({ model, stream: false, max_tokens: maxTokens, messages }) });
-        if (!r.ok) throw Object.assign(Error(`The model provider answered ${r.status}.`), { publicMessage: `The model provider answered ${r.status}.` });
-        const choice = (await readCappedJson(r, 4 * 1024 * 1024)).choices?.[0];
-        if (choice?.finish_reason === 'length') throw Object.assign(Error('A research step was cut off by the output limit.'), { publicMessage: 'A research step was cut off by the output limit.' });
-        return String(choice?.message?.content || '');
-        } finally { leave(); }
-      },
+      complete: (messages, options) => researchEngine.complete(project, messages, options),
       // The operator's own search server, even if a directory server offers the same name (#865);
       // with none, research fails rather than reaching a directory server (#891).
       search: async (query) => require('./routes/research.cjs').parseSearchResults(await executeOperatorToolCall('tavily_search', { query, max_results: 5 })),
@@ -685,7 +728,7 @@ const researchRoutes = require('./routes/research.cjs').createResearchRoutes({
   }),
 });
 function researchModel(project) {
-  return autoRoles()?.smart || project?.model || lastLoadedModel() || null;
+  return researchEngine.model(project);
 }
 
 // noevia's own capabilities, offered over the same MCP path as everything
@@ -766,6 +809,7 @@ const autoRouter = require('./auto-router.cjs').createAutoRouter({
   fetchJson: (url, init, timeoutMs) => fetchJson(url, init, timeoutMs),
   admit: (model) => classifierAdmission(model),
   record: (entry) => recordDecision('route', entry),
+  machine: chatMachines, // #1849: Fast on an Inference machine classifies there
 });
 const { heuristicWantsSmart, heuristicWantsCode, classifierVerdict, CLASSIFIER_MAX_TOKENS } = autoRouter;
 // Text-free decision record in the state directory: docker logs do not survive a deploy.
@@ -904,7 +948,9 @@ const { handleChat } = require('./chat.cjs').createChatHandler({
     provider: {decide:(...args)=>{const backend=decisionSettings.backend();if(!backend)throw Error('Decision service unavailable');return backend.supervise(...args);}}, deadlineMs:1500,
   }),
   recordOutcome: (entry) => recordDecision('outcome', entry),
+  chatMachines,
   codeTasksFor: (project) => codeService.list(currentWorkspace(), project),
+  heuristicWantsCode, // #1863: the auto-router's code rule, read before a pre-load
   // fetch is resolved per call, not captured: tests and QA swap the global at runtime.
   fs, path, crypto, fetch: (...args) => globalThis.fetch(...args), reasoningEffort, diaryExtras, createToolExchange, rag, prefill, reduceToolResult,
   HISTORY_CAP, STORED_HISTORY_CAP, DEFAULT_PROVIDER_ID, DIARY_BASE, TOOL_RESULT_CAP,
@@ -997,7 +1043,9 @@ const providerRoutes = require('./routes/providers.cjs').createProviderRoutes({
 });
 // Statistics, the auto-router roles, the model manager proxy and /api/models/* (routes/models.cjs).
 const modelRoutes = require('./routes/models.cjs').createModelRoutes({
-  json, readBody, readJson, fetchJson, env: process.env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe: engineVisionProbe, reportedTokenRate, missingRoles, currentWorkspace, service: modelService, inferenceBudget, decisionSettings, rerankSettings,
+  json, readBody, readJson, fetchJson, env: process.env, modelManager, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, createVisionProbe: engineVisionProbe, reportedTokenRate, missingRoles, currentWorkspace, service: modelService, inferenceBudget, idleUnload, decisionSettings, rerankSettings,
+  localRoles: (roles) => chatMachines.localRoles(roles),
+  machineModels: () => chatMachines.machineModels(), // #1849
 });
 // ── Routing ────────────────────────────────────────────────────────────────
 
@@ -1067,6 +1115,26 @@ const samplingSettingsRoutes = require('./routes/sampling-settings.cjs').createS
 // The embedding model of retrieval, for administrators (routes/embedding.cjs, #1636).
 const embeddingRoutes = require('./routes/embedding.cjs').createEmbeddingRoutes({ json, readJson, migration: embeddingMigration, authService, fetchJson, DIARY_BASE, diaryServiceHeaders: diary.serviceHeaders,
   service: embeddingService, resolveFile: (model) => require('./embedding-service.cjs').resolveModelFile({ env: process.env, fetchJson, model }) });
+// Settings → Inference machines (routes/inference-machines.cjs, #1638), administrators only.
+const inferenceMachineRoutes = require('./routes/inference-machines.cjs').createInferenceMachineRoutes({ json, readJson, machines: inferenceMachines,
+  health: machineHealth, chatMachines, machineTune,
+  // #1856: the same key the decision client sends, to its own host only (backend().baseUrl must be the probed origin).
+  authHeaders: {
+    decision: (url) => { const b = decisionSettings.backend(); return b?.baseUrl && new URL(b.baseUrl).origin === new URL(url).origin ? b.healthHeaders : null; },
+    sensitivity: (url) => { const b = decisionSettings.sensitivityBackend(); return b?.baseUrl && new URL(b.baseUrl).origin === new URL(url).origin ? b.healthHeaders : null; },
+  },
+  // #1856/#1894: this machine's own engine: the model loader's /api/v1/health (its token), else the default provider (/v1/models, its key).
+  engine: () => require('./local-engine-target.cjs').localEngineTarget({ env: process.env, getProvider, providerHeaders, defaultProviderId: DEFAULT_PROVIDER_ID }),
+  effective: {
+    decision: () => { const c = require('./decision-endpoint.cjs').configuration({ COWORK_DECISION_URL: decisionSettings.get().url }); return c.reason ? null : c.baseUrl; },
+    // #1844: its own address (a machine, else COWORK_SENSITIVITY_DECISION_URL), or null while it is shared with the decision service.
+    sensitivity: () => inferenceMachines.urlFor('sensitivity') || (() => { const c = require('./decision-endpoint.cjs').configuration({ COWORK_DECISION_URL: String(process.env.COWORK_SENSITIVITY_DECISION_URL || '').trim() }, { linkLocal: false }); return c.reason ? null : c.baseUrl; })(),
+    // #1841: a machine, else OCR_BASE_URL / DOCLING_BASE_URL.
+    ocr: () => require('./document-workers.cjs').resolve('ocr').url || null,
+    documents: () => require('./document-workers.cjs').resolve('documents').url || null,
+    embedding: () => require('./embedding-config.cjs').current()?.active()?.baseUrl || null,
+    reranker: () => { const t = require('./rerank-target.cjs').rerankTarget(rerankSettings.effectiveEnv()); return t.enabled ? t.baseUrl : null; },
+  } });
 const healthRoutes = require('./routes/health.cjs').createHealthRoutes({ json, fetchJson, getProvider, providerHeaders, DEFAULT_PROVIDER_ID, DIARY_BASE, diaryHeaders, authService, rag });
 // GET /api/ready (#297): unauthenticated, mounted before the session gate below alongside the
 // sign-in routes. isReady is set once startup wiring under require.main finishes (see below).
@@ -1183,6 +1251,7 @@ async function handleRequestScoped(req, res) {
 
     if (await healthRoutes(req, res, { path: p, authn })) return;
     if (await embeddingRoutes(req, res, { path: p, authn })) return;
+    if (await inferenceMachineRoutes(req, res, { path: p, authn, url })) return;
 
     if (await modelRoutes(req, res, { path: p, authn, url })) return;
 
@@ -1199,6 +1268,7 @@ async function handleRequestScoped(req, res) {
     } else {
       const failure = errorResponse(err);
       if (failure.status >= 500) console.error('[request] unhandled error:', err);
+      if (failure.status === 503 && p === '/api/chat') require('./chat-admission.cjs').log503('internal');
       json(res, failure.status, failure.body);
     }
   }
@@ -1214,9 +1284,18 @@ async function handleRequest(req,res) {
   if (pathname.startsWith('/api/')) res.setHeader('X-Noevia-API', '1');
   const inference=req.method!=='GET' && (pathname==='/api/chat' || pathname.startsWith('/api/diary/'));
   let leave;
-  try {if(inference && modelManager.enterInference)leave=modelManager.enterInference();}
-  catch(error){return json(res,error.status||503,{error:error.message});}
+  // #1896: a chat turn waits a moment (<= 3 s) for a briefly held gate, then answers a retryable 503 and logs its reason.
+  const chatAdmission=require('./chat-admission.cjs');
+  const aborted=new AbortController();res.once('close',()=>aborted.abort());
+  try {if(inference)leave=await chatAdmission.enterChatInference(modelManager,{signal:aborted.signal});}
+  catch(error){
+    const status=error.status||503;
+    if(pathname==='/api/chat'&&status===503){chatAdmission.log503('maintenance');res.setHeader('Retry-After','3');return json(res,503,chatAdmission.refusalBody(error));}
+    return json(res,status,{error:error.message});
+  }
   if(leave){res.once('finish',leave);res.once('close',leave);}
+  // #1881: while a chat or Diary turn runs, the long-document backfill makes no embed request (rag.cjs foreground).
+  if(inference){const fg=rag.foreground();res.once('finish',fg);res.once('close',fg);}
   try {return await handleRequestInner(req,res);}finally{if(leave && (res.writableEnded||res.destroyed))leave();}
 }
 

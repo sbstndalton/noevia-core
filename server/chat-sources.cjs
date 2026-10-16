@@ -12,8 +12,19 @@ function snippetOf(text) {
   return flat.length > SNIPPET_MAX ? flat.slice(0, SNIPPET_MAX - 1).trimEnd() + '…' : flat;
 }
 
-function shape(id, file, body, kind, score) {
+// #1866: a document chunk starts with the "[Page N]" marker the extractor wrote (rag.chunkText keeps it on
+// every chunk, so chunks already indexed carry it too). It is the one page fact retrieval has; report it as a
+// number so a citation can say "page 4" without the browser parsing the snippet. Only a leading marker counts.
+const PAGE_MAX = 100000;
+function pageOf(body) {
+  const m = /^\s*\[Page (\d{1,6})\](?:\n|$)/.exec(String(body || '').slice(0, 40));
+  return m ? validPage(Number(m[1])) : undefined;
+}
+function validPage(n) { return Number.isInteger(n) && n >= 1 && n <= PAGE_MAX ? n : undefined; }
+
+function shape(id, file, body, kind, score, page) {
   const item = { id: String(id || file).slice(0, NAME_MAX), file: String(file).slice(0, NAME_MAX), snippet: snippetOf(body), kind: kind === 'excerpt' ? 'excerpt' : 'file' };
+  if (kind === 'excerpt' && validPage(page) !== undefined) item.page = page;
   if (typeof score === 'number' && Number.isFinite(score)) item.score = Math.round(score * 1000) / 1000;
   return item;
 }
@@ -27,7 +38,7 @@ function buildSources(entries, files) {
     if (out.length >= MAX_SOURCES) break;
     const f = e && byName.get(e.file);
     if (!f) continue;
-    out.push(shape(f.attachment && f.attachment.id, f.name, e.body, e.kind, e.score));
+    out.push(shape(f.attachment && f.attachment.id, f.name, e.body, e.kind, e.score, e.kind === 'excerpt' ? pageOf(e.body) : undefined));
   }
   return out;
 }
@@ -71,7 +82,7 @@ function sanitizeStored(list) {
   for (const s of list) {
     if (out.length >= MAX_SOURCES) break;
     if (!s || typeof s.file !== 'string' || !s.file) continue;
-    out.push(shape(typeof s.id === 'string' ? s.id : '', s.file, s.snippet, s.kind, s.score));
+    out.push(shape(typeof s.id === 'string' ? s.id : '', s.file, s.snippet, s.kind, s.score, s.page));
   }
   return out.length ? out : undefined;
 }

@@ -44,16 +44,25 @@ function startupWarnings(env=process.env) {
 // at connect time and refuses it unless every answer is on this network; `lookup` is the resolver the
 // connection test's up-front check uses (tests stub it).
 const invalidUrl=()=>Object.assign(Error('Use a private HTTP address such as http://192.168.1.20:8040, with no path, login or query string.'),{status:400,messageId:'invalidUrl'});
-function createDecisionSettings({store,env=process.env,fetchImpl=decisionServiceFetch,sensitivityFetchImpl=(fetchImpl===decisionServiceFetch?serviceFetch:fetchImpl),lookup=undefined,audit=()=>{},kinds=SERVICE_KINDS}) {
+// #1638: `machineUrl` is the address of the machine Settings → Inference machines puts the decision service on
+// (inference-machines.cjs urlFor('decision')), or null while it is on this machine. It wins over the URL saved here
+// and COWORK_DECISION_URL; the deadline and the model chosen here still apply. A machine is another host, so the
+// shared COWORK_DECISION_API_KEY is never sent there (backend()'s #1753 same-host rule).
+// #1844: `sensitivityMachineUrl` is the same for the sensitivity check's own entry on that page
+// (inference-machines.cjs urlFor('sensitivity')); see sensitivityBackend().
+function createDecisionSettings({store,env=process.env,fetchImpl=decisionServiceFetch,sensitivityFetchImpl=(fetchImpl===decisionServiceFetch?serviceFetch:fetchImpl),lookup=undefined,audit=()=>{},kinds=SERVICE_KINDS,machineUrl=()=>null,sensitivityMachineUrl=()=>null}) {
   let saved;
   try { saved=JSON.parse(store.get(KEY)||'null'); } catch { saved={url:'',timeoutMs:1500}; }
   // #1666: `model` is the decision model the administrator chose in Settings, present only when one was chosen (absent =
   // automatic: the deployment's COWORK_DECISION_MODEL when the URL is the deployment's own, Laya otherwise, exactly as
   // before). The reply is otherwise unchanged (the recorded HTTP contract corpus); the choosable ids are on the admin's
   // Decision row of /api/models/assignments.
+  const onMachine=()=>{ try { const u=machineUrl(); return typeof u==='string'&&u?u:null; } catch { return null; } };
+  const sensitivityOnMachine=()=>{ try { const u=sensitivityMachineUrl(); return typeof u==='string'&&u?u:null; } catch { return null; } };
   const get=()=>{
     const base=saved || {url:env.COWORK_DECISION_URL||'',timeoutMs:1500};
-    return {url:base.url,timeoutMs:base.timeoutMs,...(typeof base.model==='string'&&base.model?{model:base.model}:{}),source:saved?'admin':'deployment'};
+    const machine=onMachine();
+    return {url:machine||base.url,timeoutMs:base.timeoutMs,...(typeof base.model==='string'&&base.model?{model:base.model}:{}),source:machine?'machine':saved?'admin':'deployment'};
   };
   function validate(value) {
     if(!value || typeof value.url!=='string' || !Number.isInteger(value.timeoutMs) || value.timeoutMs<100 || value.timeoutMs>2000)
@@ -89,7 +98,7 @@ function createDecisionSettings({store,env=process.env,fetchImpl=decisionService
     const endpoint=createDecisionEndpoint({env:{COWORK_DECISION_URL:config.baseUrl,
       ...(model?{COWORK_DECISION_MODEL:model}:{}),
       ...(apiKey?{COWORK_DECISION_API_KEY:apiKey}:{})},linkLocal,fetchImpl:linkLocal?fetchImpl:sensitivityFetchImpl});
-    const made={id:'decision-service',supports:kind=>kinds.includes(kind),locality:'local',limits:SERVICE_LIMITS,
+    const made={id:'decision-service',healthHeaders:endpoint.healthHeaders,baseUrl:endpoint.baseUrl,supports:kind=>kinds.includes(kind),locality:'local',limits:SERVICE_LIMITS,
       model:endpoint.model,wording:endpoint.wording,
       async decide(request,opts) {
         const options=request.options||[];
@@ -107,13 +116,15 @@ function createDecisionSettings({store,env=process.env,fetchImpl=decisionService
   // The backend for every decision purpose except the sensitivity check: route, tool gate, supervision, framing.
   // #1753: the shared COWORK_DECISION_API_KEY belongs to COWORK_DECISION_URL. A URL an administrator saved in
   // Settings gets it only when it is on the same host (the #1745 hostOf rule); another host gets no key.
+  // #1845: an address that comes from an Inference machine is connected to with link-local refused (linkLocal=false), so a
+  // DNS re-point of the machine's name to 169.254.x fails at connect time. The saved URL and env paths keep linkLocal=true.
   function backend() {
     const current=get();
     const config=configuration({COWORK_DECISION_URL:current.url});
     if(config.reason) return null;
     const sameHost=!!hostOf(config.baseUrl) && hostOf(config.baseUrl)===hostOf(env.COWORK_DECISION_URL);
     // #1666: a model chosen in Settings wins; automatic keeps the #1639 rule (modelFor).
-    return backendFor(config.baseUrl,current.model||modelFor(config.baseUrl),sameHost?env.COWORK_DECISION_API_KEY:null,'shared');
+    return backendFor(config.baseUrl,current.model||modelFor(config.baseUrl),sameHost?env.COWORK_DECISION_API_KEY:null,'shared',current.source!=='machine');
   }
   // #1639: the sensitivity check's backend. COWORK_SENSITIVITY_DECISION_URL unset or empty: backend(),
   // as before. Set: that service only (its model COWORK_SENSITIVITY_DECISION_MODEL, unset: Laya), so it
@@ -121,7 +132,22 @@ function createDecisionSettings({store,env=process.env,fetchImpl=decisionService
   // URL: none, so the check is unavailable and the turn stays local; it never falls back to the other service.
   // #1745: its key is COWORK_SENSITIVITY_DECISION_API_KEY. Unset, the shared COWORK_DECISION_API_KEY is sent only
   // when the sensitivity URL is on the same host as COWORK_DECISION_URL; another host gets no key at all.
+  // #1844: an address from Settings → Inference machines wins over COWORK_SENSITIVITY_DECISION_URL and over sharing.
+  // It is connected to with link-local refused (like every machine address, #1845) and gets a key only for its own
+  // host: the sensitivity key if that is the host of COWORK_SENSITIVITY_DECISION_URL, else the shared key if that is
+  // the host of COWORK_DECISION_URL, else none. The model is COWORK_SENSITIVITY_DECISION_MODEL (unset: Laya).
   function sensitivityBackend() {
+    const machine=sensitivityOnMachine();
+    if(machine) {
+      const config=configuration({COWORK_DECISION_URL:machine},{linkLocal:false});
+      if(config.reason) return null;
+      const host=hostOf(config.baseUrl);
+      const ownUrl=typeof env.COWORK_SENSITIVITY_DECISION_URL==='string' ? env.COWORK_SENSITIVITY_DECISION_URL.trim() : '';
+      const own=typeof env.COWORK_SENSITIVITY_DECISION_API_KEY==='string' ? env.COWORK_SENSITIVITY_DECISION_API_KEY.trim() : '';
+      if(own && ownUrl && host===hostOf(ownUrl)) return backendFor(config.baseUrl,env.COWORK_SENSITIVITY_DECISION_MODEL||undefined,own,'sensitivity',false);
+      const sameHost=!!host && host===hostOf(env.COWORK_DECISION_URL);
+      return backendFor(config.baseUrl,env.COWORK_SENSITIVITY_DECISION_MODEL||undefined,sameHost?env.COWORK_DECISION_API_KEY:null,'shared',false);
+    }
     const url=typeof env.COWORK_SENSITIVITY_DECISION_URL==='string' ? env.COWORK_SENSITIVITY_DECISION_URL.trim() : '';
     if(!url) return backend();
     const own=typeof env.COWORK_SENSITIVITY_DECISION_API_KEY==='string' ? env.COWORK_SENSITIVITY_DECISION_API_KEY.trim() : '';
@@ -151,7 +177,7 @@ function createDecisionSettings({store,env=process.env,fetchImpl=decisionService
     /** #1796: what Settings → Models shows for the decision service and the sensitivity check: the model id
      *  each one is sent as (decision-models.cjs), whether it is set up, and where the shared URL comes from.
      *  Never an address or a key, so members may see it. */
-    describe() { return describeDecision(env,get()); },
+    describe() { return describeDecision(env,get(),sensitivityOnMachine()); },
     async test(value) {
       const next=validate(value);
       // #1755: a name is accepted only if every address it resolves to is on this network; say so plainly
@@ -174,7 +200,7 @@ function createDecisionSettings({store,env=process.env,fetchImpl=decisionService
  *  and the environment. `model` is the id the requests are shaped for: COWORK_DECISION_MODEL when the URL
  *  is the deployment's own, the Laya profile otherwise (exactly what backend() sends). The sensitivity
  *  check is `shared` unless COWORK_SENSITIVITY_DECISION_URL names its own service. */
-function describeDecision(env=process.env,current=null) {
+function describeDecision(env=process.env,current=null,sensitivityMachine=null) {
   const cur=current || {url:env.COWORK_DECISION_URL||'',source:'deployment'};
   const modelName=(id)=>{ const raw=typeof id==='string'?id.trim():''; return raw && raw.length<=64 ? raw : profileFor(raw).id; };
   const shared=configuration({COWORK_DECISION_URL:cur.url});
@@ -186,7 +212,10 @@ function describeDecision(env=process.env,current=null) {
     : {model:chosen?profileFor(chosen).id:modelName(sameAsEnv?env.COWORK_DECISION_MODEL:undefined),state:'active',source:cur.source,...(chosen?{modelSource:'admin'}:{})};
   const ownUrl=typeof env.COWORK_SENSITIVITY_DECISION_URL==='string' ? env.COWORK_SENSITIVITY_DECISION_URL.trim() : '';
   let sensitivity;
-  if(!ownUrl) sensitivity={model:decision.model,state:decision.state,shared:true};
+  if(sensitivityMachine) {
+    const own=configuration({COWORK_DECISION_URL:sensitivityMachine},{linkLocal:false});
+    sensitivity=own.reason ? {model:null,state:'off',shared:false} : {model:modelName(env.COWORK_SENSITIVITY_DECISION_MODEL),state:'active',shared:false};
+  } else if(!ownUrl) sensitivity={model:decision.model,state:decision.state,shared:true};
   else {
     const own=configuration({COWORK_DECISION_URL:ownUrl},{linkLocal:false});
     sensitivity=own.reason ? {model:null,state:'off',shared:false} : {model:modelName(env.COWORK_SENSITIVITY_DECISION_MODEL),state:'active',shared:false};

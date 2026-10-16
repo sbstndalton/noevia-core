@@ -92,8 +92,11 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
    * called in its checkpoint (the person's request, not a brief built from it).
    */
   async function runExecutor(ctx, handle, { prompt, label = prompt, connect, model = null, harness = 'opencode', capabilities = [],
-    domains = [], sandboxKind = 'spawn', promptPreparation = 'direct', context = '', guarded = false }) {
+    domains = [], sandboxKind = 'spawn', promptPreparation = 'direct', context = '', guarded = false, machine = undefined }) {
     const { taskId, workspace, grant } = handle;
+    // #1853: the Code role on an Inference machine: the agent reaches it only through web's relay
+    // (code-machine.cjs), with a token that lives as long as this run.
+    let relayLease = null;
     const title = String(label).slice(0, 120);
     let sessionEnd = null;
     // Set once the run has something to report, so the `finally` below knows whether a
@@ -104,7 +107,15 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
     try {
       // A task that named no model runs on whatever this deployment loads, and the identity
       // records the model that actually ran rather than the absence of a choice.
-      const endpoint = engine();
+      let endpoint = engine();
+      if (endpoint?.relay) {
+        relayLease = await endpoint.relay.open({ taskId, model, expect: machine });
+        endpoint = { ...endpoint, baseUrl: relayLease.baseUrl, apiKey: relayLease.token, model: relayLease.model,
+          ...(relayLease.contextTokens ? { contextTokens: relayLease.contextTokens } : {}) };
+      } else if (machine) {
+        // Pinned on a machine (the pipeline's Planner), but the role is back here: one task, one model.
+        throw Object.assign(Error('The Code role moved back to this machine during this task, and one task runs on one model. Start the task again.'), { code: 'model_mismatch' });
+      }
       const chosen = model || endpoint.model || null;
       // Guarded, the guard can stop the agent on its own (too many malformed calls): that is
       // this signal, joined to the job's own so a cancel still stops it the usual way.
@@ -173,6 +184,7 @@ function createCodeHarness({ jobs, workspaces, egress = null, askApproval, now =
       // Whatever happened, the task stops being able to reach anything, and no approval it
       // raised is left waiting to be answered into an action.
       sessionEnd?.();
+      relayLease?.close();
       const releasedWorkspace = releaseRun(handle);
       // The corrected checkpoint: release() reads the branch back from the SOURCE repository,
       // after any WIP auto-commit and after ownership is handed back to noevia, so this never

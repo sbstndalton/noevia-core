@@ -135,3 +135,32 @@ test('#1616: a tail without variants of its own is cleaned too, and a clean hist
   const clean = { role: 'user', content: 'q', skill: pin, answers: [{ content: 'a' }], answer: 0, branches: [{ content: 'v', skill: pin, tail: [{ role: 'assistant', content: 'r' }] }], branch: 0 };
   assert.equal(sanitizeHistory([clean])[0], clean);
 });
+
+test('an excerpt cut from a document page reports that page (#1866)', () => {
+  const files = [{ name: 'report.pdf', content: '' }, { name: 'notes.md', content: '' }];
+  const out = buildSources([
+    { file: 'report.pdf', body: '[Page 7]\nSynthetic quarterly figures.', kind: 'excerpt', score: 0.8 },
+    { file: 'report.pdf', body: 'No marker here. [Page 9] mid-text is not a page.', kind: 'excerpt' },
+    { file: 'notes.md', body: '[Page 3]\nA whole file is not a page citation.', kind: 'file' },
+    { file: 'report.pdf', body: '[Page 0]\nout of range', kind: 'excerpt' },
+    { file: 'report.pdf', body: '[Page 99999999]\ntoo many digits', kind: 'excerpt' },
+  ], files);
+  assert.equal(out[0].page, 7);
+  assert.match(out[0].snippet, /Synthetic quarterly figures/);
+  assert.equal('page' in out[1], false);
+  assert.equal('page' in out[2], false);
+  assert.equal('page' in out[3], false);
+  assert.equal('page' in out[4], false);
+});
+
+test('a stored page survives only as a plain page number on an excerpt (#1866)', () => {
+  const stored = sanitizeStored([
+    { file: 'a.pdf', snippet: 's', kind: 'excerpt', page: 4 },
+    { file: 'b.pdf', snippet: 's', kind: 'excerpt', page: '4' },
+    { file: 'c.pdf', snippet: 's', kind: 'excerpt', page: 2.5 },
+    { file: 'd.pdf', snippet: 's', kind: 'excerpt', page: -1 },
+    { file: 'e.pdf', snippet: 's', kind: 'file', page: 4 },
+  ]);
+  assert.equal(stored[0].page, 4);
+  for (const s of stored.slice(1)) assert.equal('page' in s, false);
+});

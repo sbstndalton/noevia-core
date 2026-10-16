@@ -64,37 +64,47 @@ function failureText(status, text, { partial = false } = {}) {
 
 /** Per-model "may this request carry tools" answers from the engine's /props. Unknown (props
  *  unreachable, no template, module failure) means yes: the behaviour before this change, with
- *  the reactive retry as the safety net. */
+ *  the reactive retry as the safety net.
+ *  #1850: an optional `scope` (an Inference machine's provider id, `machine:<id>`) keeps a machine's answer apart
+ *  from this machine's engine and from other machines: the key is scope + model as served. No scope: the model
+ *  name alone, as before. `manager` is anything with props(model) (a machine's is chat-machines.cjs propsSource). */
 function createToolsGate({ ttlMs = 10 * 60 * 1000, unknownTtlMs = 30 * 1000, max = 64, now = Date.now } = {}) {
+  // #1855: this machine's verdicts and the Inference machines' are bounded apart, so a burst of machine models cannot evict
+  // the local ones (and the reverse). No scope: the local map, exactly as before.
   const cache = new Map();
+  const machineCache = new Map();
+  const cacheFor = (key) => (key.includes('\u0000') ? machineCache : cache);
   // #1018: one /props lookup per model at a time; concurrent misses share it.
   const inflight = new Map();
   const remember = (model, sendTools, ttl) => {
-    cache.delete(model);
-    cache.set(model, { sendTools, until: now() + ttl });
-    while (cache.size > max) cache.delete(cache.keys().next().value);
+    const c = cacheFor(model);
+    c.delete(model);
+    c.set(model, { sendTools, until: now() + ttl });
+    while (c.size > max) c.delete(c.keys().next().value);
   };
-  async function lookup(manager, model) {
+  const keyOf = (model, scope) => (scope ? `${scope}\u0000${model}` : model);
+  async function lookup(manager, model, key) {
     let template = null;
     try {
       const r = await manager.props(model);
       if (r?.ok && typeof r.body?.chat_template === 'string') template = r.body.chat_template;
     } catch { /* unknown */ }
-    if (template === null) { remember(model, true, unknownTtlMs); return true; }
+    if (template === null) { remember(key, true, unknownTtlMs); return true; }
     let sendTools = true;
-    try { sendTools = davParseWasm.templateCaps(template).sendTools; } catch { remember(model, true, unknownTtlMs); return true; }
-    remember(model, sendTools, ttlMs);
+    try { sendTools = davParseWasm.templateCaps(template).sendTools; } catch { remember(key, true, unknownTtlMs); return true; }
+    remember(key, sendTools, ttlMs);
     return sendTools;
   }
   /** `signal` (the chat's) ends this caller's wait, as unknown (tools allowed); a shared lookup
    *  keeps running for the others. */
-  async function allowsTools(manager, model, signal) {
-    const hit = cache.get(model);
+  async function allowsTools(manager, model, signal, scope) {
+    const key = keyOf(model, scope);
+    const hit = cacheFor(key).get(key);
     if (hit && now() < hit.until) return hit.sendTools;
-    let p = inflight.get(model);
+    let p = inflight.get(key);
     if (!p) {
-      p = lookup(manager, model).finally(() => inflight.delete(model));
-      inflight.set(model, p);
+      p = lookup(manager, model, key).finally(() => inflight.delete(key));
+      inflight.set(key, p);
     }
     if (!signal) return p;
     if (signal.aborted) return true;
@@ -104,9 +114,11 @@ function createToolsGate({ ttlMs = 10 * 60 * 1000, unknownTtlMs = 30 * 1000, max
   }
   return {
     allowsTools,
-    markUnsupported: (model) => remember(model, false, ttlMs),
-    forget: (model) => cache.delete(model),
-    size: () => cache.size,
+    markUnsupported: (model, scope) => remember(keyOf(model, scope), false, ttlMs),
+    forget: (model, scope) => { const k = keyOf(model, scope); return cacheFor(k).delete(k); },
+    size: () => cache.size + machineCache.size,
+    localSize: () => cache.size,
+    machineSize: () => machineCache.size,
   };
 }
 

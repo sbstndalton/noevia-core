@@ -62,7 +62,12 @@ function harness(remote = false) {
     createFolder: async () => {},
     writeFile: async (_conn, name, bytes) => stored.set(name, bytes),
     listFiles: async () => [...stored.keys()].map(p => ({ name: p.split('/').pop(), path: p, ext: '.pdf' })),
-    readBinaryFile: async (_conn, name) => stored.get(name),
+    // As storage-client.cjs readBinaryFile: over the caller's cap (default 25 MiB) is a 413 (#1864).
+    readBinaryFile: async (_conn, name, opts) => {
+      const bytes = stored.get(name), cap = (opts && opts.cap) || 25 * 1024 * 1024;
+      if (bytes && bytes.length > cap) throw Object.assign(new Error(`file exceeds the ${cap} byte limit`), { status: 413 });
+      return bytes;
+    },
     deleteFile: async (_conn, name) => stored.delete(name),
   };
   currentStorage = storageClient;
@@ -322,4 +327,50 @@ test('#577: with Docling live, text-like types stay on the plain-text path and S
       assert.equal(r.body.attachment.state, 'ready', name);
     }
   } finally { if (prev === undefined) delete process.env.DOCLING_BASE_URL; else process.env.DOCLING_BASE_URL = prev; }
+});
+
+// #1864: a large PDF that arrives through storage (an attached folder, or the project's own synced
+// folder) is read and indexed, not skipped for its size. Synthetic: a text page plus padding.
+function largeSyntheticPdf(marker, padding) {
+  const content = `BT /F1 12 Tf 72 720 Td (${marker}) Tj ET`;
+  const objects = ['<< /Type /Catalog /Pages 2 0 R >>', '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>',
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>', `<< /Length ${content.length} >>\nstream\n${content}\nendstream`];
+  const parts = [Buffer.from('%PDF-1.4\n')]; let size = parts[0].length; const offsets = [];
+  const push = (b) => { parts.push(b); size += b.length; };
+  objects.forEach((o, i) => { offsets.push(size); push(Buffer.from(`${i + 1} 0 obj\n${o}\nendobj\n`)); });
+  offsets.push(size); push(Buffer.from(`6 0 obj\n<< /Length ${padding} >>\nstream\n`)); push(Buffer.alloc(padding, 0x41)); push(Buffer.from('\nendstream\nendobj\n'));
+  const xref = size;
+  push(Buffer.from(`xref\n0 7\n0000000000 65535 f \n${offsets.map(n => String(n).padStart(10, '0') + ' 00000 n \n').join('')}trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`));
+  return Buffer.concat(parts);
+}
+
+test('#1864: a PDF over 25 MiB in an attached or synced folder is read and indexed, not skipped for its size', async () => {
+  const h = harness(true);
+  const attached = largeSyntheticPdf('SYN-LARGE-ATTACHED', 26 * 1024 * 1024);
+  const managed = largeSyntheticPdf('SYN-LARGE-MANAGED', 26 * 1024 * 1024);
+  h.stored.set('fixture/Finance/large.pdf', attached);
+  h.stored.set('fixture/Documents/large-synced.pdf', managed);
+  const out = await h.sync();
+  assert.equal(out.status, 200);
+  assert.deepEqual(out.body.skipped.filter(s => /byte limit/.test(s.reason)), [], 'no file skipped for its byte size');
+  const a = h.project.files.find(f => f.name === 'fixture/Finance/large.pdf');
+  const m = h.project.files.find(f => f.name === 'fixture/Documents/large-synced.pdf');
+  assert.equal(a.document.state, 'ready'); assert.match(a.content, /SYN-LARGE-ATTACHED/);
+  assert.equal(m.document.state, 'ready'); assert.match(m.content, /SYN-LARGE-MANAGED/);
+  // Uploads keep their HTTP body cap (a separate concern): same bytes, refused with 413.
+  assert.equal((await h.upload('large-upload.pdf', attached)).status, 413);
+});
+
+test('#1864: a PDF over PROJECT_DOCUMENT_READ_BYTES is listed as failed with the reason, never silently dropped', async () => {
+  const h = harness(true);
+  h.stored.set('fixture/huge.pdf', largeSyntheticPdf('SYN-HUGE', 2 * 1024 * 1024));
+  const saved = process.env.PROJECT_DOCUMENT_READ_BYTES;
+  process.env.PROJECT_DOCUMENT_READ_BYTES = String(1024 * 1024);
+  try {
+    const out = await h.sync();
+    const file = h.project.files.find(f => f.name === 'fixture/huge.pdf');
+    assert.equal(file.document.state, 'failed');
+    assert.match(out.body.skipped.find(s => s.file === 'fixture/huge.pdf').reason, /1048576 byte limit/);
+  } finally { if (saved === undefined) delete process.env.PROJECT_DOCUMENT_READ_BYTES; else process.env.PROJECT_DOCUMENT_READ_BYTES = saved; }
 });

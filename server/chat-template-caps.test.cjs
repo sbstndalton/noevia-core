@@ -291,3 +291,25 @@ test('#1553 a template that takes tools: the request carries no tools note', { s
   assert.ok(e.bodies[0].tools, 'tools are sent');
   assert.doesNotMatch(JSON.stringify(e.bodies[0].messages), /No tools can run in this reply/);
 });
+
+test('#1855: machine verdicts are bounded apart from local ones and cannot evict them', async () => {
+  const gate = caps.createToolsGate({ max: 3 });
+  const never = { props: async () => { throw new Error('a cached verdict must not be read again'); } };
+  gate.markUnsupported('synthetic-local');
+  for (let i = 0; i < 10; i++) gate.markUnsupported(`synthetic-m${i}`, 'machine:a');
+  assert.equal(gate.localSize(), 1, 'the local verdict is still there');
+  assert.equal(gate.machineSize(), 3, 'machine entries are bounded on their own');
+  assert.equal(await gate.allowsTools(never, 'synthetic-local'), false);
+  // And the reverse: local churn leaves a machine verdict alone.
+  for (let i = 0; i < 10; i++) gate.markUnsupported(`synthetic-l${i}`);
+  assert.equal(await gate.allowsTools(never, 'synthetic-m9', undefined, 'machine:a'), false);
+  gate.forget('synthetic-m9', 'machine:a');
+  assert.equal(gate.machineSize(), 2);
+});
+
+test('#1855 default: with no scope the gate caches and evicts exactly as before', () => {
+  const gate = caps.createToolsGate({ max: 2 });
+  for (const m of ['a', 'b', 'c']) gate.markUnsupported(m);
+  assert.equal(gate.size(), 2);
+  assert.equal(gate.machineSize(), 0);
+});
