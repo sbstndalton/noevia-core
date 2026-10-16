@@ -66,6 +66,26 @@ test('the free-chat slice needs the switch and its own confirmation, and is sile
   assert.equal(rp.FREE_LIST_CAP, require('./chat-lists.cjs').LIST_CAP);
 });
 
+test('#1264: the project-writes slices need the projects switch, their own switch and confirmation', () => {
+  const warned = [];
+  const warn = (m) => warned.push(m);
+  const full = { NOEVIA_RUST_PROJECTS: '1', NOEVIA_FRONT: 'rust', NOEVIA_RUST_AUTH: '1', NOEVIA_RUST_AUTH_CONFIRMED: '1', NOEVIA_RUST_PROJECTS_CONFIRMED: '1' };
+  const on = { ...full, NOEVIA_RUST_PROJECT_WRITES: '1', NOEVIA_RUST_PROJECT_WRITES_CONFIRMED: '1' };
+  assert.equal(rp.projectWritesEnabledFrom(on, warn), true);
+  // Live today: the projects switch and every other slice confirmed, this switch off.
+  assert.equal(rp.projectWritesEnabledFrom({ ...full, NOEVIA_RUST_PROJECT_CHATS_CONFIRMED: '1', NOEVIA_RUST_FREE_CHATS_CONFIRMED: '1', NOEVIA_RUST_PROJECT_WRITES_CONFIRMED: '1' }, warn), false);
+  assert.equal(warned.length, 0, 'off is not a misconfiguration');
+  for (const v of ['0', 'true', ' 1', '']) assert.equal(rp.projectWritesEnabledFrom({ ...on, NOEVIA_RUST_PROJECT_WRITES: v }, warn), false, v);
+  assert.equal(rp.projectWritesEnabledFrom({ ...on, NOEVIA_RUST_PROJECT_WRITES_CONFIRMED: '' }, warn), false);
+  assert.match(warned.at(-1), /NOEVIA_RUST_PROJECT_WRITES_CONFIRMED/);
+  for (const drop of ['NOEVIA_RUST_PROJECTS', 'NOEVIA_FRONT', 'NOEVIA_RUST_AUTH', 'NOEVIA_RUST_AUTH_CONFIRMED', 'NOEVIA_RUST_PROJECTS_CONFIRMED']) {
+    const env = { ...on }; delete env[drop];
+    assert.equal(rp.projectWritesEnabledFrom(env, () => {}), false, drop);
+  }
+  assert.deepEqual([...rp.PROJECT_WRITE_ROUTES], ['GET /api/chats/{chatId}/context', 'POST /api/chats/{chatId}/context']);
+  for (const r of rp.PROJECT_WRITE_ROUTES) assert.equal(rp.OWNED_ROUTES.has(r), false, `${r} is not NOEVIA_RUST_PROJECTS's`);
+});
+
 // flock(1) is util-linux (the web image, CI); without it (a Mac) the lock tests are skipped.
 const NO_FLOCK = spawnSync('flock', ['--version']).error ? 'flock(1) not on PATH' : false;
 const RP = JSON.stringify(path.join(__dirname, 'rust-projects.cjs'));
