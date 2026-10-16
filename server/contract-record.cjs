@@ -55,7 +55,14 @@ const SECRET_HEADERS = new Set(['authorization', 'proxy-authorization', 'x-csrf-
 const REQUEST_HEADERS = /^(content-type|accept|user-agent|x-csrf-token|cookie|origin|authorization|x-cowork-.*|x-noevia-.*|last-event-id|if-none-match|range)$/;
 const ENV_SECRET = /KEY|TOKEN|SECRET|PASSWORD|PASS$|CREDENTIAL|COOKIE/i;
 
+// #1900: project image ids are `img-<Date.now() in base36>-<Math.random() in base36>`; both parts can
+// be all letters (about 1 run in 100), which the letter-and-digit rule below misses. The id then
+// stayed literal in one recording and became `<id:N>` in another, so every later id was numbered one
+// apart and the byte-compared double recording (and the noevia-rs replay) failed.
+const GENERATED_IMAGE_ID = /^img-[0-9a-z]{6,9}-[0-9a-z]{1,8}$/;
+
 function idLike(s) {
+  if (GENERATED_IMAGE_ID.test(s)) return true;
   // A letter and a digit: `proj-1791600933849-w10hvg`, a UUID; not `127.0.0.1` or a count.
   if (s.length >= 8 && /\d/.test(s) && /[A-Za-z]/.test(s) && /^[A-Za-z0-9_.:-]+$/.test(s)) return true;
   return randomBase64url(s);
